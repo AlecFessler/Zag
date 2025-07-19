@@ -7,6 +7,8 @@ MBFLAGS    equ MBALIGN | MEMINFO     ; multiboot header flags
 MAGIC      equ 0x1BADB002            ; multiboot header magic number
 MBCHECKSUM equ -(MAGIC + MBFLAGS)    ; multiboot checksum
 
+PAGEFLAGS  equ 0x03
+
 section .multiboot
 align 4
     dd MAGIC
@@ -42,8 +44,8 @@ _start:
 section .data
 gdt:                              ; global descriptor table
     dq 0x0000000000000000         ; null descriptor
-    dq 0x00AF9A000000FFFF         ; 64-bit code segment 0x08
-    dq 0x00AF92000000FFFF         ; 64-bit data segment 0x10
+    dq 0x00AF9B000000FFFF         ; 64-bit code segment 0x08
+    dq 0x00AF93000000FFFF         ; 64-bit data segment 0x10
 gdt_end:
 
 gdt_descriptor:
@@ -52,11 +54,11 @@ gdt_descriptor:
 
 align 4096
 pml4:                             ; page map level 4
-    dq pdpt | 0x03                ; Present | Writable
+    dq pdpt + PAGEFLAGS           ; Present | Writable
 
 align 4096
 pdpt:                             ; page directory pointer table
-    dq pd | 0x03                  ; Present | Writable
+    dq pd + PAGEFLAGS             ; Present | Writable
 
 align 4096
 pd:                               ; page directory

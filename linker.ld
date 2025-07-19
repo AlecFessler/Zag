@@ -1,7 +1,7 @@
 ENTRY(_start)
 
 SECTIONS {
-    . = 2M;
+    . = 1M;
 
     .text : ALIGN(4K) {
         KEEP(*(.multiboot))
