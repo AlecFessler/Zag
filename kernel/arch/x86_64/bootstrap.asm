@@ -18,6 +18,10 @@ align 4
 section .text
 _start:
     cli
+
+    mov edi, eax                  ; save magic
+    mov esi, ebx                  ; save multiboot info
+
     xor eax, eax
     mov esp, stack_top
 
@@ -81,6 +85,7 @@ long_mode_entry:
 
     mov rsp, stack_top
 
+    ; multiboot magic and info should still be in edi and esi unless something clobbers them
     extern kmain
     call kmain
 
