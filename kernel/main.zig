@@ -1,11 +1,14 @@
 const std = @import("std");
 
-const bootalloc = @import("memory/bootalloc.zig");
-const BootAllocator = bootalloc.BootAllocator;
+const bootalloc = @import("memory/boot_allocator.zig");
 const console = @import("console.zig");
 const multiboot = @import("arch/x86_64/multiboot.zig");
+const regionalloc = @import("memory/region_allocator.zig");
+
+const BootAllocator = bootalloc.BootAllocator;
 const MultibootInfo = multiboot.MultibootInfo;
 const MemoryRegionType = multiboot.MemoryRegionType;
+const RegionAllocator = regionalloc.RegionAllocator;
 
 export fn kmain(magic: u32, info_ptr: u32) callconv(.C) void {
     console.initialize(.LightGray, .Black);
@@ -17,13 +20,12 @@ export fn kmain(magic: u32, info_ptr: u32) callconv(.C) void {
         }
     }
 
-    const info: *const MultibootInfo = @ptrFromInt(info_ptr);
-    multiboot.parseMemoryMap(info, printRegion);
+    var region_allocator = RegionAllocator.init();
 
-    var boot_allocator = BootAllocator.init();
-    const slice = boot_allocator.alloc(4096, 16);
-    @memset(slice, 10);
-    console.print("Element {}\n", .{slice[0]});
+    const info: *const MultibootInfo = @ptrFromInt(info_ptr);
+    multiboot.parseMemoryMap(info, RegionAllocator.append_region, &region_allocator);
+
+    console.print("Available regions {}\n", .{region_allocator.counts[@intFromEnum(MemoryRegionType.Available)]});
 
     while (true) {
         asm volatile ("hlt");

@@ -17,7 +17,7 @@ pub const BootAllocator = struct {
         };
     }
 
-    pub fn alloc(self: *BootAllocator, size: usize, alignment: usize) []u8 {
+    pub fn alloc(self: *BootAllocator, size: usize, alignment: usize) [*]anyopaque {
         const aligned = std.mem.alignForward(usize, self.free_addr, alignment);
         const new_end = aligned + size;
 
@@ -27,7 +27,6 @@ pub const BootAllocator = struct {
 
         self.free_addr = new_end;
 
-        const ptr: [*]u8 = @ptrFromInt(aligned);
-        return ptr[0..size];
+        return @ptrFromInt(aligned);
     }
 };
