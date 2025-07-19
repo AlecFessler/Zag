@@ -44,8 +44,8 @@ _start:
 section .data
 gdt:                              ; global descriptor table
     dq 0x0000000000000000         ; null descriptor
-    dq 0x00AF9B000000FFFF         ; 64-bit code segment 0x08
-    dq 0x00AF93000000FFFF         ; 64-bit data segment 0x10
+    dq 0x00AF9A000000FFFF         ; 64-bit code segment 0x08
+    dq 0x00AF92000000FFFF         ; 64-bit data segment 0x10
 gdt_end:
 
 gdt_descriptor:
