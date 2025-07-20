@@ -5,9 +5,6 @@
 
 const std = @import("std");
 
-// NOTE: DEBUG
-const console = @import("../console.zig");
-
 const Allocator = @import("allocator.zig").Allocator;
 
 extern const _kernel_end: u8;
@@ -17,7 +14,7 @@ pub const BootAllocator = struct {
     free_addr: usize,
     end_addr: usize,
 
-    pub fn init() BootAllocator {
+    pub fn init(self: *BootAllocator) void {
         const end_addr = 0x200000;
         const free_addr = @intFromPtr(&_kernel_end);
         const ptr: [*]u8 = @ptrFromInt(free_addr);
@@ -25,21 +22,17 @@ pub const BootAllocator = struct {
         const slice = ptr[0..free_size];
         @memset(slice, 0);
 
-        var self = BootAllocator{
+        self.* = BootAllocator{
             .allocator = undefined,
             .free_addr = free_addr,
             .end_addr = end_addr,
         };
 
-        self.allocator = Allocator.init(&self, BootAllocator.alloc);
-        return self;
+        self.allocator = Allocator.init(self, BootAllocator.alloc);
     }
 
     fn alloc(ctx: *anyopaque, size: usize, alignment: usize) [*]u8 {
         std.debug.assert(std.mem.isAligned(size, 8));
-
-        // NOTE: DEBUG
-        console.print("Allocating {} bytes\n", .{size});
 
         const self: *BootAllocator = @alignCast(@ptrCast(ctx));
 

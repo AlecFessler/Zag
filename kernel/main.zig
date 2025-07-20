@@ -20,7 +20,9 @@ export fn kmain(magic: u32, info_ptr: u32) callconv(.C) void {
         }
     }
 
-    var boot_allocator = BootAllocator.init();
+    var boot_allocator: BootAllocator = undefined;
+    boot_allocator.init();
+
     var region_allocator = RegionAllocator.init(&boot_allocator.allocator);
     const info: *const MultibootInfo = @ptrFromInt(info_ptr);
     multiboot.parseMemoryMap(info, RegionAllocator.append_region, &region_allocator);
