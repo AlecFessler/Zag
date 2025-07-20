@@ -1,44 +1,130 @@
+//! Multiboot v1 definitions and utilities for `x86_64` kernels.
+//!
+//! This module provides definitions for working with bootloader-provided information
+//! in accordance with the Multiboot Specification v1, specifically targeting the `x86_64`
+//! architecture. It includes structures for parsing bootloader metadata, enumerating
+//! memory regions, and classifying memory types.
+//!
+//! This is typically used during early kernel initialization to inspect the memory map
+//! and retrieve configuration data provided by the bootloader.
+
+/// Represents the Multiboot information structure provided by a compliant bootloader
+/// according to the Multiboot Specification v1. This structure is located at the address
+/// passed in the `info_ptr` argument to the kernel entry point. It contains a variety of
+/// boot-related metadata including memory size, boot device, loaded modules, and more.
+/// Fields must be interpreted based on the flags value.
 pub const MultibootInfo = packed struct {
-    flags: u32, // flags indicating valid fields
-    mem_lower: u32, // amount of lower memory (below 1 MB) in KB
-    mem_upper: u32, // amount of upper memory (above 1 MB) in KB
-    boot_dev: u32, // boot device (BIOS disk device)
-    cmdline: u32, // pointer to the command line string
-    mods_count: u32, // number of modules loaded
-    mods_addr: u32, // pointer to the first module structure
-    syms_0: u32, // symbol table information (deprecated)
-    syms_1: u32, // symbol table information (deprecated)
-    syms_2: u32, // symbol table information (deprecated)
-    syms_3: u32, // symbol table information (deprecated)
-    mmap_len: u32, // size of the memory map
-    mmap_addr: u32, // pointer the memory map
-    drives_len: u32, // size of the BIOS drive information
-    drives_addr: u32, // pointer to the BIOS drive information
-    config_table: u32, // pointer to the ROM configuration table
-    boot_loader: u32, // pointer to the bootloader name string
-    apm_table: u32, // pointer to the apm (Advanced Power Management)
-    vbe_ctl_info: u32, // VBE (VESA BIOS Extensions) control information
-    vbe_mode_info: u32, // VBE mode information
-    vbe_mode: u16, // VBE mode number
-    vbe_interface_seg: u16, // VBE interface segment
-    vbe_interface_off: u16, // VBE interface offset
-    vbe_interface_len: u16, // VBE interface length
+    /// Flags indicating which fields are valid.
+    flags: u32,
+
+    /// Amount of lower memory (below 1 MB), in kilobytes.
+    mem_lower: u32,
+
+    /// Amount of upper memory (above 1 MB), in kilobytes.
+    mem_upper: u32,
+
+    /// BIOS boot device the OS was loaded from.
+    boot_dev: u32,
+
+    /// Physical address of the kernel command line string.
+    cmdline: u32,
+
+    /// Number of modules loaded alongside the kernel.
+    mods_count: u32,
+
+    /// Physical address of the first module structure.
+    mods_addr: u32,
+
+    /// Symbol table fields (deprecated; used only with a.out kernels).
+    syms_0: u32,
+    syms_1: u32,
+    syms_2: u32,
+    syms_3: u32,
+
+    /// Size of the memory map provided by the bootloader.
+    mmap_len: u32,
+
+    /// Physical address of the memory map entries.
+    mmap_addr: u32,
+
+    /// Size of the BIOS drive info buffer.
+    drives_len: u32,
+
+    /// Physical address of the BIOS drive info buffer.
+    drives_addr: u32,
+
+    /// Physical address of the ROM configuration table.
+    config_table: u32,
+
+    /// Physical address of a null-terminated string naming the bootloader.
+    boot_loader: u32,
+
+    /// Physical address of the APM (Advanced Power Management) table.
+    apm_table: u32,
+
+    /// Physical address of the VBE control information.
+    vbe_ctl_info: u32,
+
+    /// Physical address of the VBE mode information.
+    vbe_mode_info: u32,
+
+    /// Current VBE mode.
+    vbe_mode: u16,
+
+    /// VBE interface segment.
+    vbe_interface_seg: u16,
+
+    /// VBE interface offset.
+    vbe_interface_off: u16,
+
+    /// Length of the VBE interface.
+    vbe_interface_len: u16,
 };
 
+/// Represents a single entry in the memory map provided by a Multiboot v1-compliant bootloader.
+/// These entries are found at the physical address given by `mmap_addr` in the `MultibootInfo`
+/// struct, and the full memory map spans `mmap_len` bytes. The memory map may be unaligned based
+/// on what Zig expects, but it is still valid.
+///
+/// Each entry describes a contiguous region of physical memory, including its starting address,
+/// length in bytes, and usage type.
 pub const MultibootMmapEntry = packed struct {
+    /// Size of the entry, excluding the `size` field itself.
     size: u32,
+
+    /// Starting physical address of the memory region.
     addr: u64,
+
+    /// Length of the memory region in bytes.
     len: u64,
+
+    /// Type of memory region, where 1 indicates usable memory and higher values indicate reserved
+    /// or special-purpose regions. This is offset by 1 when converted to `MemoryRegionType`.
     type: u32,
 };
 
+/// Represents the type of a physical memory region as described by the Multiboot v1 memory map.
+/// These correspond to the values provided in the `type` field of `MultibootMmapEntry`,
+/// but note that the parser subtracts 1 so the enum starts at 0 for use as an array index.
+///
+/// This enum is used to classify memory regions according to their availability or reserved purpose.
 pub const MemoryRegionType = enum(u32) {
+    /// Usable RAM available for general-purpose allocation.
     Available,
+
+    /// Reserved memory that must not be used by the kernel or applications.
     Reserved,
-    AcpiReclaimable, // possibly can be used after parsing ACPI tables
-    AcpiNvs, // non-volatile sleep memory, unavailable
+
+    /// Reclaimable memory, usable after ACPI tables are parsed.
+    AcpiReclaimable,
+
+    /// Non-volatile memory used for sleep states (ACPI NVS), not available for use.
+    AcpiNvs,
+
+    /// Memory region containing errors or defects, must not be used.
     BadMem,
 
+    /// Returns a human-readable string representation of the memory region type.
     pub fn toString(self: @This()) []const u8 {
         return switch (self) {
             .Available => "Available",
@@ -50,6 +136,18 @@ pub const MemoryRegionType = enum(u32) {
     }
 };
 
+/// Iterates over the memory map provided in the given `MultibootInfo` structure and invokes the
+/// caller-supplied `callback` for each memory region.
+///
+/// The memory map is parsed entry-by-entry, with special care taken to handle potentially
+/// unaligned entries (Multiboot v1 makes no guarantees about alignment). Each region is
+/// described by a `MultibootMmapEntry`, and the raw `type` field is adjusted by subtracting 1
+/// to convert it to the corresponding `MemoryRegionType` value.
+///
+/// - `info`: Pointer to the Multiboot information structure passed by the bootloader.
+/// - `callback`: A function called for each memory region. Receives a context pointer, the
+///    region's physical start address, size in bytes, and type.
+/// - `ctx`: An opaque pointer passed through to the callback, for user-defined context.
 pub fn parseMemoryMap(
     info: *const MultibootInfo,
     callback: fn (
@@ -63,11 +161,10 @@ pub fn parseMemoryMap(
     const mmap_end: u64 = info.mmap_addr + info.mmap_len;
     var mmap_ptr: u64 = info.mmap_addr;
     while (mmap_ptr < mmap_end) {
-        // align entry to 1 to prevent kernel panic from unexpected alignment
-        // since multiboot makes no guarantees about mmap entry alignment
+        // Align to 1 byte because Multiboot v1 does not guarantee alignment of mmap entries.
         const entry: *align(1) const MultibootMmapEntry = @ptrFromInt(mmap_ptr);
 
-        // subtract 1 from type so the type enum can start from 0 and be used as an index
+        // Convert type field (starting at 1 in Multiboot) to our enum (starting at 0).
         callback(
             ctx,
             entry.addr,
