@@ -1,3 +1,8 @@
+//! Kernel entry point and early initialization routines.
+//!
+//! This module defines `kmain`, the entry point for Multiboot v1, and the kernel's panic handler.
+//! It sets up memory allocators, page tables, and basic console output before entering idle state.
+
 const std = @import("std");
 
 const bootalloc = @import("memory/boot_allocator.zig");
@@ -10,6 +15,13 @@ const MultibootInfo = multiboot.MultibootInfo;
 const MemoryRegionType = multiboot.MemoryRegionType;
 const RegionAllocator = regionalloc.RegionAllocator;
 
+/// Kernel entry point for Multiboot v1 bootloaders.
+///
+/// - `magic`: Magic number passed by the bootloader. Should be `0x2BADB002` for Multiboot v1.
+/// - `info_ptr`: Physical address of the `MultibootInfo` structure.
+///
+/// For now, this function assumes a Multiboot v1-compliant environment and performs basic
+/// setup of early memory allocators and page tables before halting.
 export fn kmain(
     magic: u32,
     info_ptr: u32,
@@ -44,7 +56,7 @@ export fn kmain(
         console.print("Base: {}, Len: {}, Page size: {}\n", .{
             mapped.start,
             len,
-            mapped.page_size.size(),
+            @intFromEnum(mapped.page_size),
         });
     }
 
@@ -53,6 +65,10 @@ export fn kmain(
     }
 }
 
+/// Called on unrecoverable errors to display a panic message and halt the system.
+///
+/// Displays the provided message in white-on-blue and halts the CPU indefinitely.
+/// Used in place of `std.debug.panic` in a freestanding kernel environment.
 pub fn panic(
     msg: []const u8,
     error_return_trace: ?*std.builtin.StackTrace,
