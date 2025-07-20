@@ -66,7 +66,7 @@ pdpt:                             ; page directory pointer table
 
 align 4096
 pd:                               ; page directory
-    dq 0x00000083                 ; Present | Writable | 2 MiB page
+    dq 0x00000083                 ; Present | Writable | 0-2 MiB page
 
 section .bss
 align 16

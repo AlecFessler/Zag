@@ -50,15 +50,30 @@ pub const MemoryRegionType = enum(u32) {
     }
 };
 
-pub fn parseMemoryMap(info: *const MultibootInfo, callback: fn (ctx: *anyopaque, addr: u64, len: u64, region_type: MemoryRegionType) void, ctx: *anyopaque) void {
+pub fn parseMemoryMap(
+    info: *const MultibootInfo,
+    callback: fn (
+        ctx: *anyopaque,
+        addr: u64,
+        len: u64,
+        region_type: MemoryRegionType,
+    ) void,
+    ctx: *anyopaque,
+) void {
     const mmap_end: u64 = info.mmap_addr + info.mmap_len;
     var mmap_ptr: u64 = info.mmap_addr;
     while (mmap_ptr < mmap_end) {
         // align entry to 1 to prevent kernel panic from unexpected alignment
         // since multiboot makes no guarantees about mmap entry alignment
         const entry: *align(1) const MultibootMmapEntry = @ptrFromInt(mmap_ptr);
+
         // subtract 1 from type so the type enum can start from 0 and be used as an index
-        callback(ctx, entry.addr, entry.len, @enumFromInt(entry.type - 1));
+        callback(
+            ctx,
+            entry.addr,
+            entry.len,
+            @enumFromInt(entry.type - 1),
+        );
         mmap_ptr += entry.size + @sizeOf(u32);
     }
 }

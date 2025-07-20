@@ -15,7 +15,7 @@ pub const BootAllocator = struct {
     end_addr: usize,
 
     pub fn init(self: *BootAllocator) void {
-        const end_addr = 0x200000;
+        const end_addr = 0x200000; // 2MiB identity mapped memory
         const free_addr = @intFromPtr(&_kernel_end);
         const ptr: [*]u8 = @ptrFromInt(free_addr);
         const free_size = end_addr - free_addr;
@@ -28,15 +28,26 @@ pub const BootAllocator = struct {
             .end_addr = end_addr,
         };
 
-        self.allocator = Allocator.init(self, BootAllocator.alloc);
+        self.allocator = Allocator.init(
+            self,
+            BootAllocator.alloc,
+        );
     }
 
-    fn alloc(ctx: *anyopaque, size: usize, alignment: usize) [*]u8 {
-        std.debug.assert(std.mem.isAligned(size, 8));
+    fn alloc(
+        ctx: *anyopaque,
+        size: usize,
+        alignment: usize,
+    ) [*]u8 {
+        std.debug.assert(size % 8 == 0);
 
         const self: *BootAllocator = @alignCast(@ptrCast(ctx));
 
-        const aligned = std.mem.alignForward(usize, self.free_addr, alignment);
+        const aligned = std.mem.alignForward(
+            usize,
+            self.free_addr,
+            alignment,
+        );
         const new_end = aligned + size;
 
         if (new_end > self.end_addr) {

@@ -32,7 +32,10 @@ var column: usize = 0;
 var color: u8 = 0;
 var buffer: [*]volatile VgaChar = @ptrFromInt(0xB8000);
 
-pub fn initialize(foreground: VgaColor, background: VgaColor) void {
+pub fn initialize(
+    foreground: VgaColor,
+    background: VgaColor,
+) void {
     clear();
     setColor(foreground, background);
 }
@@ -44,16 +47,33 @@ pub fn clear() void {
     column = 0;
 }
 
-pub fn setColor(foreground: VgaColor, background: VgaColor) void {
+pub fn setColor(
+    foreground: VgaColor,
+    background: VgaColor,
+) void {
     color = makeColor(foreground, background);
 }
 
-pub fn print(comptime format: []const u8, args: anytype) void {
-    const w = Writer(void, error{}, printCallback){ .context = {} };
-    fmt.format(w, format, args) catch unreachable;
+pub fn print(
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const w = Writer(
+        void,
+        error{},
+        printCallback,
+    ){ .context = {} };
+    fmt.format(
+        w,
+        format,
+        args,
+    ) catch unreachable;
 }
 
-fn printCallback(_: void, string: []const u8) error{}!usize {
+fn printCallback(
+    _: void,
+    string: []const u8,
+) error{}!usize {
     for (string) |c| {
         if (c == '\n') {
             column = 0;
@@ -90,10 +110,16 @@ fn scroll() void {
     }
 }
 
-fn makeColor(foreground: VgaColor, background: VgaColor) u8 {
+fn makeColor(
+    foreground: VgaColor,
+    background: VgaColor,
+) u8 {
     return @intFromEnum(foreground) | (@intFromEnum(background) << 4);
 }
 
-fn makeEntry(c: u8, entry_color: u8) VgaChar {
+fn makeEntry(
+    c: u8,
+    entry_color: u8,
+) VgaChar {
     return c | (@as(VgaChar, entry_color) << 8);
 }

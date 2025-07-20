@@ -1,33 +1,43 @@
 const std = @import("std");
 
-// NOTE: DEBUG
-const console = @import("../console.zig");
-
 const allocator_interface = @import("allocator.zig");
 const multiboot = @import("../arch/x86_64/multiboot.zig");
 const paging = @import("paging.zig");
 
 const Allocator = allocator_interface.Allocator;
 const MemoryRegionType = multiboot.MemoryRegionType;
+const PageSize = paging.PageSize;
 
-const num_region_types = @typeInfo(MemoryRegionType).@"enum".fields.len;
-const max_regions = 32;
-const page_size = 4096;
-
+const MAX_REGIONS = 32;
 const MemoryRegion = struct {
     addr: u64,
     len: u64,
     region_type: MemoryRegionType,
 };
 
+const MAX_MAPPED = 8;
+/// Start and end are virtual addresses
+const MappedRegion = struct {
+    start: usize,
+    end: usize, // exclusive
+    page_size: paging.PageSize,
+};
+
 pub const RegionAllocator = struct {
-    /// Only regions with the .Available type will be allocated, but all regions are tracked
-    regions: [max_regions]MemoryRegion,
-    count: usize = 0,
     allocator: *Allocator,
+    region_count: usize = 0,
+    regions: [MAX_REGIONS]MemoryRegion,
+    mapped_count: usize = 0,
+    mapped: [MAX_MAPPED]MappedRegion,
 
     pub fn init(allocator: *Allocator) RegionAllocator {
-        return RegionAllocator{ .regions = undefined, .count = 0, .allocator = allocator };
+        return RegionAllocator{
+            .allocator = allocator,
+            .region_count = 0,
+            .regions = undefined,
+            .mapped_count = 0,
+            .mapped = undefined,
+        };
     }
 
     /// This interface must match the multiboot.parseMemoryMap callback function interface.
@@ -35,32 +45,72 @@ pub const RegionAllocator = struct {
     /// in between calls to this function, or else the allocations this makes will not be contiguous.
     /// This allocation restriction starts as soon as this is struct is initialized as it grabs the
     /// base the allocator will pass on the next allocation by requesting a 0 size allocation.
-    pub fn append_region(ctx: *anyopaque, addr: u64, len: u64, region_type: MemoryRegionType) void {
+    pub fn append_region(
+        ctx: *anyopaque,
+        addr: u64,
+        len: u64,
+        region_type: MemoryRegionType,
+    ) void {
         const self: *RegionAllocator = @alignCast(@ptrCast(ctx));
 
-        self.regions[self.count] = MemoryRegion{
+        self.regions[self.region_count] = MemoryRegion{
             .addr = addr,
             .len = len,
             .region_type = region_type,
         };
-        self.count += 1;
+        self.region_count += 1;
+        std.debug.assert(self.region_count <= MAX_REGIONS);
     }
 
-    pub fn initialize_page_tables(self: *RegionAllocator, base_vaddr: usize) void {
-        const pml4 = self.allocator.alloc(page_size, page_size);
-        for (self.regions) |region| {
-            const region_end = region.addr + region.len;
-            var paddr = region.addr;
-            var vaddr = base_vaddr + region.addr;
-            const rw: paging.RW = if (region.region_type == .Available) .ReadWrite else .Readonly;
+    pub fn initialize_page_tables(
+        self: *RegionAllocator,
+        base_vaddr: usize,
+    ) void {
+        const pml4 = self.allocator.alloc(
+            PageSize.Page4K.size(),
+            PageSize.Page4K.size(),
+        );
 
-            // NOTE: DEBUG
-            console.print("Mapping region: addr {}, len {}, type {s}\n", .{ region.addr, region.len, region.region_type.toString() });
+        for (0..self.region_count) |region_idx| {
+            const region = self.regions[region_idx];
+            if (region.region_type != .Available) continue;
+            if (region.len < PageSize.Page4K.size()) continue;
 
-            while (paddr < region_end) {
-                paging.mapPage(@alignCast(@ptrCast(pml4)), paddr, vaddr, rw, .Supervisor, self.allocator);
-                paddr += page_size;
-                vaddr += page_size;
+            const page_size: PageSize = if (region.len >= PageSize.Page2M.size()) PageSize.Page2M else PageSize.Page4K;
+            const page_bytes = page_size.size();
+
+            const start = std.mem.alignForward(
+                usize,
+                region.addr,
+                page_bytes,
+            );
+            const end = std.mem.alignBackward(
+                usize,
+                region.addr + region.len,
+                page_bytes,
+            );
+
+            self.mapped[self.mapped_count] = MappedRegion{
+                .start = start,
+                .end = end,
+                .page_size = page_size,
+            };
+            self.mapped_count += 1;
+            std.debug.assert(self.mapped_count <= MAX_MAPPED);
+
+            var paddr: usize = start;
+            while (paddr < end) {
+                const vaddr = paddr + base_vaddr;
+                paging.mapPage(
+                    @alignCast(@ptrCast(pml4)),
+                    paddr,
+                    vaddr,
+                    .ReadWrite,
+                    .Supervisor,
+                    page_size,
+                    self.allocator,
+                );
+                paddr += page_bytes;
             }
         }
     }
