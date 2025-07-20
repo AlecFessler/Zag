@@ -20,20 +20,17 @@ export fn kmain(magic: u32, info_ptr: u32) callconv(.C) void {
         }
     }
 
-    var region_allocator = RegionAllocator.init();
-
+    var boot_allocator = BootAllocator.init();
+    var region_allocator = RegionAllocator.init(&boot_allocator.allocator);
     const info: *const MultibootInfo = @ptrFromInt(info_ptr);
     multiboot.parseMemoryMap(info, RegionAllocator.append_region, &region_allocator);
 
-    console.print("Available regions {}\n", .{region_allocator.counts[@intFromEnum(MemoryRegionType.Available)]});
+    const base_vaddr = 0xFFFF800000000000;
+    region_allocator.initialize_page_tables(base_vaddr);
 
     while (true) {
         asm volatile ("hlt");
     }
-}
-
-fn printRegion(addr: u64, len: u64, region_type: MemoryRegionType) void {
-    console.print("Region entry, addr: {}, len: {}, type: {s}\n", .{ addr, len, region_type.toString() });
 }
 
 pub fn panic(msg: []const u8, error_return_trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {

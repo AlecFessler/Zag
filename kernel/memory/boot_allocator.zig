@@ -5,19 +5,38 @@
 
 const std = @import("std");
 
+const Allocator = @import("allocator.zig").Allocator;
+
 extern const _kernel_end: u8;
 
 pub const BootAllocator = struct {
+    allocator: Allocator,
     free_addr: usize,
-    end_addr: usize = 0x200000,
+    end_addr: usize,
 
     pub fn init() BootAllocator {
-        return BootAllocator{
-            .free_addr = @intFromPtr(&_kernel_end),
+        const end_addr = 0x200000;
+        const free_addr = @intFromPtr(&_kernel_end);
+        const ptr: [*]u8 = @ptrFromInt(free_addr);
+        const free_size = end_addr - free_addr;
+        const slice = ptr[0..free_size];
+        @memset(slice, 0);
+
+        var self = BootAllocator{
+            .allocator = undefined,
+            .free_addr = free_addr,
+            .end_addr = end_addr,
         };
+
+        self.allocator = Allocator.init(&self, BootAllocator.alloc);
+        return self;
     }
 
-    pub fn alloc(self: *BootAllocator, size: usize, alignment: usize) [*]anyopaque {
+    fn alloc(ctx: *anyopaque, size: usize, alignment: usize) [*]u8 {
+        std.debug.assert(std.mem.isAligned(size, 8));
+
+        const self: *BootAllocator = @alignCast(@ptrCast(ctx));
+
         const aligned = std.mem.alignForward(usize, self.free_addr, alignment);
         const new_end = aligned + size;
 
