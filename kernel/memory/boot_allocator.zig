@@ -5,6 +5,9 @@
 
 const std = @import("std");
 
+// NOTE: DEBUG
+const console = @import("../console.zig");
+
 const Allocator = @import("allocator.zig").Allocator;
 
 extern const _kernel_end: u8;
@@ -34,6 +37,9 @@ pub const BootAllocator = struct {
 
     fn alloc(ctx: *anyopaque, size: usize, alignment: usize) [*]u8 {
         std.debug.assert(std.mem.isAligned(size, 8));
+
+        // NOTE: DEBUG
+        console.print("Allocating {} bytes\n", .{size});
 
         const self: *BootAllocator = @alignCast(@ptrCast(ctx));
 

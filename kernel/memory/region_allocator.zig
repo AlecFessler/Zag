@@ -11,6 +11,7 @@ const Allocator = allocator_interface.Allocator;
 const MemoryRegionType = multiboot.MemoryRegionType;
 
 const num_region_types = @typeInfo(MemoryRegionType).@"enum".fields.len;
+const max_regions = 32;
 const page_size = 4096;
 
 const MemoryRegion = struct {
@@ -21,13 +22,12 @@ const MemoryRegion = struct {
 
 pub const RegionAllocator = struct {
     /// Only regions with the .Available type will be allocated, but all regions are tracked
-    regions: [*]MemoryRegion,
+    regions: [max_regions]MemoryRegion,
     count: usize = 0,
     allocator: *Allocator,
 
     pub fn init(allocator: *Allocator) RegionAllocator {
-        const base: [*]MemoryRegion = @alignCast(@ptrCast(allocator.alloc(0, @alignOf(MemoryRegion))));
-        return RegionAllocator{ .regions = base, .count = 0, .allocator = allocator };
+        return RegionAllocator{ .regions = undefined, .count = 0, .allocator = allocator };
     }
 
     /// This interface must match the multiboot.parseMemoryMap callback function interface.
@@ -38,9 +38,7 @@ pub const RegionAllocator = struct {
     pub fn append_region(ctx: *anyopaque, addr: u64, len: u64, region_type: MemoryRegionType) void {
         const self: *RegionAllocator = @alignCast(@ptrCast(ctx));
 
-        const new_region: *MemoryRegion = @alignCast(@ptrCast(self.allocator.alloc(@sizeOf(MemoryRegion), @alignOf(MemoryRegion))));
-
-        new_region.* = MemoryRegion{
+        self.regions[self.count] = MemoryRegion{
             .addr = addr,
             .len = len,
             .region_type = region_type,
@@ -50,13 +48,14 @@ pub const RegionAllocator = struct {
 
     pub fn initialize_page_tables(self: *RegionAllocator, base_vaddr: usize) void {
         const pml4 = self.allocator.alloc(page_size, page_size);
-        for (self.regions[0..self.count]) |*region| {
+        for (self.regions) |region| {
             const region_end = region.addr + region.len;
             var paddr = region.addr;
             var vaddr = base_vaddr + region.addr;
             const rw: paging.RW = if (region.region_type == .Available) .ReadWrite else .Readonly;
 
-            console.print("Mapping region: addr {}, len {}\n", .{ region.addr, region.len });
+            // NOTE: DEBUG
+            console.print("Mapping region: addr {}, len {}, type {s}\n", .{ region.addr, region.len, region.region_type.toString() });
 
             while (paddr < region_end) {
                 paging.mapPage(@alignCast(@ptrCast(pml4)), paddr, vaddr, rw, .Supervisor, self.allocator);
