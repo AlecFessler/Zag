@@ -166,6 +166,17 @@ pub const RegionAllocator = struct {
             paddr += page_bytes;
         }
 
+        // map the VGA text buffer for console use
+        paging.mapPage(
+            @alignCast(@ptrCast(pml4)),
+            0xB8000,
+            0xB8000,
+            .ReadWrite,
+            .Supervisor,
+            PageSize.Page4K,
+            self.allocator,
+        );
+
         const boot_allocator: *BootAllocator = @alignCast(@ptrCast(self.allocator.ctx));
         self.mapped_start = std.mem.alignForward(
             usize,
@@ -173,6 +184,8 @@ pub const RegionAllocator = struct {
             page_bytes,
         );
         self.mapped_end = end;
+
+        paging.write_cr3(@alignCast(@ptrCast(pml4)));
     }
 
     /// Allocates memory using a simple bump allocator strategy.

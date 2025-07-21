@@ -168,6 +168,27 @@ pub fn read_cr3() usize {
     return value;
 }
 
+/// Loads the CR3 register with the physical address of a new PML4 table.
+///
+/// This function switches the active page table by writing the physical address of
+/// the provided `pml4` into the CR3 register. The CPU will then use the new page
+/// hierarchy for all virtual-to-physical address translations.
+///
+/// The caller must ensure the provided PML4 is fully initialized and resides in
+/// identity-mapped memory prior to calling this function. This function should be
+/// called exactly once during early initialization, after all required mappings
+/// have been installed.
+///
+/// - `pml4`: A pointer to the top-level page table (PML4), located in physical memory.
+pub fn write_cr3(pml4: [*]PageEntry) void {
+    const phys_addr: usize = @intFromPtr(pml4);
+    asm volatile ("mov %[value], %%cr3"
+        :
+        : [value] "r" (phys_addr),
+        : "memory"
+    );
+}
+
 /// Maps a single physical page into the virtual address space using the provided PML4 table.
 ///
 /// This function constructs the full 4-level page table hierarchy if necessary, allocating

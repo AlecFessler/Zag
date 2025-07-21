@@ -47,7 +47,8 @@ export fn kmain(
         &region_allocator,
     );
 
-    const base_vaddr = 0xFFFF800000000000;
+    const base_vaddr = 0;
+    //const base_vaddr = 0xFFFF800000000000;
     region_allocator.initializePageTables(base_vaddr);
 
     const size = region_allocator.mapped_end - region_allocator.mapped_start;
