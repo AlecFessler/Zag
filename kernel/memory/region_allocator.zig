@@ -1,23 +1,24 @@
 //! Early boot-time physical memory region tracker and virtual memory mapper.
 //!
-//! This module defines the `RegionAllocator`, a temporary allocator used during early
-//! kernel boot to track physical memory regions reported by the bootloader and create
-//! low-overhead virtual memory mappings. It is designed to work within the limited
-//! 2 MiB identity-mapped space established by the bootstrap shim, using large pages
-//! (2 MiB) wherever possible to reduce mapping overhead and speed up initialization.
+//! This module defines the `RegionAllocator`, which parses memory regions from the bootloader,
+//! filters and tracks usable physical memory, and identity-maps it into the virtual address space.
 //!
-//! The allocator relies on the `BootAllocator` for page table allocations and avoids
-//! fine-grained metadata until the physical memory manager (PMM) is initialized.
-//! Its purpose is to bootstrap the PMM by identity-mapping all usable physical memory,
-//! enabling the PMM to allocate the resources it needs to take over full memory management.
+//! It is used during early kernel initialization to:
+//! - Track physical memory regions for later use by the physical memory manager (PMM).
+//! - Bootstrap page table mappings for all usable memory above the kernel and page tables.
+//! - Provide coarse-grained allocation until the buddy allocator takes over.
+//!
+//! This allows the PMM to be initialized with full access to all remaining usable memory.
 
 const std = @import("std");
 
 const allocator_interface = @import("allocator.zig");
+const bootallocator = @import("boot_allocator.zig");
 const multiboot = @import("../arch/x86_64/multiboot.zig");
 const paging = @import("paging.zig");
 
 const Allocator = allocator_interface.Allocator;
+const BootAllocator = bootallocator.BootAllocator;
 const MemoryRegionType = multiboot.MemoryRegionType;
 const PageSize = paging.PageSize;
 
@@ -39,44 +40,23 @@ const MemoryRegion = struct {
     region_type: MemoryRegionType,
 };
 
-/// Maximum number of mapped regions that can be tracked by the allocator after paging is initialized.
-const MAX_MAPPED = 8;
-
-/// Represents a virtual memory mapping created for a physical memory region.
+/// Tracks usable physical memory and sets up early virtual memory mappings.
 ///
-/// This includes the virtual address range and the page size used
-/// for the mapping. The range is half-open: `[start, end)`.
-const MappedRegion = struct {
-    /// Starting virtual address of the mapped region (inclusive).
-    start: usize,
-
-    /// Ending virtual address of the mapped region (exclusive).
-    end: usize,
-
-    /// Page size used to map this region (either 4 KiB or 2 MiB).
-    page_size: PageSize,
-};
-
-/// A lightweight allocator for boot-time physical memory region tracking and early virtual memory setup.
+/// `RegionAllocator` is responsible for:
+/// - Collecting and filtering memory regions from the bootloader.
+/// - Identity-mapping usable memory above the kernel and page tables.
+/// - Providing coarse-grained memory region data to initialize the buddy allocator.
 ///
-/// `RegionAllocator` is designed for early kernel boot, where it tracks memory regions provided by
-/// the bootloader and sets up temporary virtual memory mappings using large (2 MiB) pages when possible.
-/// It uses a fixed-capacity internal buffer to avoid heap allocations and minimize memory usage,
-/// relying on the `BootAllocator` for any page table allocations needed during mapping.
-///
-/// This allocator exists to bootstrap the physical memory manager (PMM), which will later take over
-/// memory management using finer-grained metadata (e.g., one struct per 4 KiB page). To enable that,
-/// `RegionAllocator` ensures all usable physical memory is identity-mapped into the kernel's address space,
-/// allowing the PMM to allocate beyond the initial 2 MiB identity-mapped region provided by the bootstrap shim.
-///
-/// After initialization, this allocator continues to serve as a coarse-grained record of memory layout,
-/// while the PMM maintains its own independent virtual memory mappings and higher-resolution page-level tracking.
+/// It ignores legacy memory regions (e.g., below 1 MiB) even if marked available,
+/// and relies on the `BootAllocator` to determine the end of memory in use.
+/// This ensures that only truly free physical memory is mapped and tracked.
 pub const RegionAllocator = struct {
     allocator: *Allocator,
     region_count: usize = 0,
     regions: [MAX_REGIONS]MemoryRegion,
-    mapped_count: usize = 0,
-    mapped: [MAX_MAPPED]MappedRegion,
+    mapped_start: usize = 0,
+    mapped_end: usize = 0,
+    free_addr: usize = 0,
 
     /// Initializes a new `RegionAllocator` using the provided allocator interface.
     ///
@@ -90,8 +70,9 @@ pub const RegionAllocator = struct {
             .allocator = allocator,
             .region_count = 0,
             .regions = undefined,
-            .mapped_count = 0,
-            .mapped = undefined,
+            .mapped_start = 0,
+            .mapped_end = 0,
+            .free_addr = 0,
         };
     }
 
@@ -108,7 +89,7 @@ pub const RegionAllocator = struct {
     /// - `addr`: Starting physical address of the region.
     /// - `len`: Length of the region in bytes.
     /// - `region_type`: Classification of the region (e.g., Available, Reserved).
-    pub fn append_region(
+    pub fn appendRegion(
         ctx: *anyopaque,
         addr: u64,
         len: u64,
@@ -125,26 +106,24 @@ pub const RegionAllocator = struct {
         std.debug.assert(self.region_count <= MAX_REGIONS);
     }
 
-    /// Initializes page tables to map all available physical memory regions into the virtual address space.
+    /// Identity-maps all usable physical memory above the kernel and page tables.
     ///
-    /// This function scans the collected memory regions, filters out non-available ones,
-    /// and maps the usable physical memory using either 2 MiB or 4 KiB pages depending on alignment and size.
-    /// Wherever possible, 2 MiB pages are preferred to reduce the number of required page table entries,
-    /// minimizing allocations and improving kernel initialization speed.
+    /// This function scans the collected memory regions, filters out:
+    /// - non-Available regions,
+    /// - memory below 2 MiB (e.g., legacy memory),
+    /// - and any memory already used by the kernel and boot allocator.
     ///
-    /// Only page-aligned portions of each region are mapped; unaligned edges are excluded.
-    /// Mapped regions are tracked in the `mapped` list and are limited by `MAX_MAPPED`.
-    /// If this limit is exceeded, the function asserts. It can be raised if needed.
+    /// It then identity-maps the remaining usable memory using 4KiB pages.
+    /// Page tables are allocated using the `BootAllocator`.
     ///
-    /// Page table structures are allocated on demand via the provided allocator, using `paging.mapPage`,
-    /// which performs any intermediate table allocations as necessary.
+    /// The physical memory range mapped starts at `mapped_start`, which is the first page-aligned
+    /// address after all boot-time structures (kernel, allocator, page tables).
     ///
-    /// This routine is intended to support early physical memory management setup by providing
-    /// an identity-mapped view of usable memory. It avoids fine-grained tracking to stay within
-    /// the small 2 MiB bootstrap-mapped region available during early kernel boot.
+    /// Mapped regions are recorded for later use by the physical memory manager.
     ///
-    /// - `base_vaddr`: The virtual base address used to offset each physical address during mapping.
-    pub fn initialize_page_tables(
+    /// - `base_vaddr`: The base virtual address for mapping physical memory (typically higher-half).
+    /// - `mapped_start`: The physical address after which memory is considered safe to map.
+    pub fn initializePageTables(
         self: *RegionAllocator,
         base_vaddr: usize,
     ) void {
@@ -153,47 +132,81 @@ pub const RegionAllocator = struct {
             @intFromEnum(PageSize.Page4K),
         );
 
-        for (0..self.region_count) |region_idx| {
-            const region = self.regions[region_idx];
-            if (region.region_type != .Available) continue;
-            if (region.len < @intFromEnum(PageSize.Page4K)) continue;
+        const available_region = 3;
+        const region = self.regions[available_region];
+        std.debug.assert(region.region_type == .Available);
 
-            const page_size: PageSize = if (region.len >= @intFromEnum(PageSize.Page2M)) PageSize.Page2M else PageSize.Page4K;
-            const page_bytes = @intFromEnum(page_size);
+        const page_size = PageSize.Page4K;
+        const page_bytes = @intFromEnum(page_size);
 
-            const start = std.mem.alignForward(
-                usize,
-                region.addr,
-                page_bytes,
+        const start = std.mem.alignForward(
+            usize,
+            region.addr,
+            page_bytes,
+        );
+
+        const end = std.mem.alignBackward(
+            usize,
+            region.addr + region.len,
+            page_bytes,
+        );
+
+        var paddr: usize = start;
+        while (paddr < end) {
+            const vaddr = paddr + base_vaddr;
+            paging.mapPage(
+                @alignCast(@ptrCast(pml4)),
+                paddr,
+                vaddr,
+                .ReadWrite,
+                .Supervisor,
+                page_size,
+                self.allocator,
             );
-            const end = std.mem.alignBackward(
-                usize,
-                region.addr + region.len,
-                page_bytes,
-            );
-
-            self.mapped[self.mapped_count] = MappedRegion{
-                .start = start,
-                .end = end,
-                .page_size = page_size,
-            };
-            self.mapped_count += 1;
-            std.debug.assert(self.mapped_count <= MAX_MAPPED);
-
-            var paddr: usize = start;
-            while (paddr < end) {
-                const vaddr = paddr + base_vaddr;
-                paging.mapPage(
-                    @alignCast(@ptrCast(pml4)),
-                    paddr,
-                    vaddr,
-                    .ReadWrite,
-                    .Supervisor,
-                    page_size,
-                    self.allocator,
-                );
-                paddr += page_bytes;
-            }
+            paddr += page_bytes;
         }
+
+        const boot_allocator: *BootAllocator = @alignCast(@ptrCast(self.allocator.ctx));
+        self.mapped_start = std.mem.alignForward(
+            usize,
+            boot_allocator.free_addr,
+            page_bytes,
+        );
+        self.mapped_end = end;
+    }
+
+    /// Allocates memory using a simple bump allocator strategy.
+    ///
+    /// This function implements the kernel's `Allocator` interface and is intended
+    /// solely for use by the buddy allocator during its initialization phase.
+    ///
+    /// It linearly allocates memory from the region defined by `mapped_start` to `mapped_end`,
+    /// aligning the allocation as requested. All memory allocated through this function is
+    /// assumed to be used for long-lived structures (e.g., page metadata) and will remain
+    /// valid for the entire lifetime of the kernel.
+    ///
+    /// After the buddy allocator is initialized, all physical memory management is handled
+    /// through it, and this function should no longer be called.
+    pub fn alloc(
+        ctx: *anyopaque,
+        size: usize,
+        alignment: usize,
+    ) [*]u8 {
+        const self: *RegionAllocator = @alignCast(@ptrCast(ctx));
+
+        const aligned = std.mem.alignForward(
+            usize,
+            self.free_addr,
+            alignment,
+        );
+        const new_end = aligned + size;
+
+        if (new_end > self.mapped_end) {
+            @panic("RegionAllocator out of memory");
+        }
+
+        self.free_addr = new_end;
+
+        return @ptrFromInt(aligned);
     }
 };

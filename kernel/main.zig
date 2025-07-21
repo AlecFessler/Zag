@@ -35,30 +35,30 @@ export fn kmain(
         }
     }
 
+    const info: *const MultibootInfo = @ptrFromInt(info_ptr);
+
     var boot_allocator: BootAllocator = undefined;
     boot_allocator.init();
-
     var region_allocator = RegionAllocator.init(&boot_allocator.allocator);
-    const info: *const MultibootInfo = @ptrFromInt(info_ptr);
+
     multiboot.parseMemoryMap(
         info,
-        RegionAllocator.append_region,
+        RegionAllocator.appendRegion,
         &region_allocator,
     );
 
     const base_vaddr = 0xFFFF800000000000;
-    region_allocator.initialize_page_tables(base_vaddr);
+    region_allocator.initializePageTables(base_vaddr);
 
-    console.print("Mapped memory:\n", .{});
-    for (0..region_allocator.mapped_count) |i| {
-        const mapped = region_allocator.mapped[i];
-        const len = mapped.end - mapped.start;
-        console.print("Base: {}, Len: {}, Page size: {}\n", .{
-            mapped.start,
-            len,
-            @intFromEnum(mapped.page_size),
-        });
-    }
+    const size = region_allocator.mapped_end - region_allocator.mapped_start;
+    const sizeM = size / (1024 * 1024);
+    const pages = size / 4096;
+    console.print("Mapped memory start: {} end: {}, size: {}M, pages: {}\n", .{
+        region_allocator.mapped_start,
+        region_allocator.mapped_end,
+        sizeM,
+        pages,
+    });
 
     while (true) {
         asm volatile ("hlt");

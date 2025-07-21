@@ -1,2 +1,0 @@
-const PhysMemMgr = struct {};
-
