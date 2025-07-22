@@ -136,41 +136,36 @@ pub const MemoryRegionType = enum(u32) {
     }
 };
 
-/// Iterates over the memory map provided in the given `MultibootInfo` structure and invokes the
-/// caller-supplied `callback` for each memory region.
+pub const MAX_REGIONS = 32;
+
+/// Represents a physical memory region reported by the bootloader.
 ///
-/// The memory map is parsed entry-by-entry, with special care taken to handle potentially
-/// unaligned entries (Multiboot v1 makes no guarantees about alignment). Each region is
-/// described by a `MultibootMmapEntry`, and the raw `type` field is adjusted by subtracting 1
-/// to convert it to the corresponding `MemoryRegionType` value.
-///
-/// - `info`: Pointer to the Multiboot information structure passed by the bootloader.
-/// - `callback`: A function called for each memory region. Receives a context pointer, the
-///    region's physical start address, size in bytes, and type.
-/// - `ctx`: An opaque pointer passed through to the callback, for user-defined context.
-pub fn parseMemoryMap(
-    info: *const MultibootInfo,
-    callback: fn (
-        ctx: *anyopaque,
-        addr: u64,
-        len: u64,
-        region_type: MemoryRegionType,
-    ) void,
-    ctx: *anyopaque,
-) void {
+/// Each region includes a base physical address, a length in bytes,
+/// and a classification via `MemoryRegionType` (e.g., Available, Reserved).
+pub const MemoryRegion = struct {
+    /// Starting physical address of the region.
+    addr: u64,
+
+    /// Length of the region in bytes.
+    len: u64,
+
+    /// Type of region (e.g., usable, reserved, ACPI reclaimable).
+    region_type: MemoryRegionType,
+};
+
+pub fn parseMemoryMap(info: *const MultibootInfo, regions: *[MAX_REGIONS]MemoryRegion) []MemoryRegion {
     const mmap_end: u64 = info.mmap_addr + info.mmap_len;
     var mmap_ptr: u64 = info.mmap_addr;
-    while (mmap_ptr < mmap_end) {
+    var i: usize = 0;
+    while (mmap_ptr < mmap_end) : (i += 1) {
         // Align to 1 byte because Multiboot v1 does not guarantee alignment of mmap entries.
         const entry: *align(1) const MultibootMmapEntry = @ptrFromInt(mmap_ptr);
-
-        // Convert type field (starting at 1 in Multiboot) to our enum (starting at 0).
-        callback(
-            ctx,
-            entry.addr,
-            entry.len,
-            @enumFromInt(entry.type - 1),
-        );
+        regions[i] = .{
+            .addr = entry.addr,
+            .len = entry.len,
+            .region_type = @enumFromInt(entry.type - 1),
+        };
         mmap_ptr += entry.size + @sizeOf(u32);
     }
+    return regions[0..i];
 }

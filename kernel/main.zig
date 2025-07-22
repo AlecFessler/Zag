@@ -6,19 +6,19 @@ const std = @import("std");
 
 const console = @import("console.zig");
 const bumpalloc = @import("memory/bump_allocator.zig");
-const memoryregionmap = @import("memory/memory_region_map.zig");
 const multiboot = @import("arch/x86_64/multiboot.zig");
 const physmemmgr = @import("memory/physical_memory_manager.zig");
 const virtmemmgr = @import("memory/virtual_memory_manager.zig");
 
 const BumpAllocator = bumpalloc.BumpAllocator;
-const MemoryRegionMap = memoryregionmap.MemoryRegionMap;
+const MemoryRegion = multiboot.MemoryRegion;
 const MemoryRegionType = multiboot.MemoryRegionType;
 const MultibootInfo = multiboot.MultibootInfo;
 const PhysicalMemoryManager = physmemmgr.PhysicalMemoryManager;
 const VirtualMemoryManager = virtmemmgr.VirtualMemoryManager;
 
 extern const _kernel_end: u8;
+
 /// Kernel entry point for Multiboot v1 bootloaders.
 ///
 /// - `magic`: Magic number passed by the bootloader. Should be `0x2BADB002` for Multiboot v1.
@@ -40,19 +40,15 @@ export fn kmain(
     }
 
     const info: *const MultibootInfo = @ptrFromInt(info_ptr);
+    var memory_regions_array: [multiboot.MAX_REGIONS]MemoryRegion = undefined;
+    const memory_regions: []MemoryRegion = multiboot.parseMemoryMap(info, &memory_regions_array);
+    const available_region = memory_regions[3];
 
-    var memory_region_map = MemoryRegionMap.init();
-    multiboot.parseMemoryMap(
-        info,
-        MemoryRegionMap.appendRegion,
-        &memory_region_map,
+    const kernel_end = @intFromPtr(&_kernel_end);
+    var bump_allocator = BumpAllocator.init(
+        kernel_end,
+        available_region.addr + available_region.len,
     );
-
-    const available_region = memory_region_map.regions[3];
-    const region_start = @intFromPtr(&_kernel_end);
-    const region_end = available_region.addr + available_region.len;
-
-    var bump_allocator = BumpAllocator.init(region_start, region_end);
     var bump_alloc_iface = bump_allocator.allocator();
 
     var pmm = PhysicalMemoryManager.init(&bump_alloc_iface);
@@ -61,21 +57,18 @@ export fn kmain(
     var vmm = VirtualMemoryManager.init(&pmm_alloc_iface);
     var vmm_alloc_iface = vmm.allocator();
 
-    defer vmm_alloc_iface.deinit();
-
-    const addr = vmm_alloc_iface.alloc(4096, 4096) catch @panic("alloc failed");
+    const addr = vmm_alloc_iface.alloc(4096, 4096) catch @panic("alloc failed\n");
     const iaddr = @intFromPtr(addr);
 
-    std.debug.assert(iaddr >= region_start);
-    std.debug.assert(iaddr < region_end);
+    std.debug.assert(iaddr >= kernel_end);
+    std.debug.assert(iaddr < available_region.addr + available_region.len);
     std.debug.assert(std.mem.isAligned(iaddr, 4096));
 
-    const size = region_end - region_start;
-    const sizeM = size / (1024 * 1024);
-    const pages = size / 4096;
+    const sizeM = available_region.len / (1024 * 1024);
+    const pages = available_region.len / 4096;
     console.print("Mapped memory start: {} end: {}, size: {}M, pages: {}\n", .{
-        region_start,
-        region_end,
+        kernel_end,
+        available_region.addr + available_region.len,
         sizeM,
         pages,
     });
