@@ -18,23 +18,17 @@ pub const VirtualMemoryManager = struct {
             .vtable = &.{
                 .alloc = alloc,
                 .free = free,
-                .deinit = deinit,
             },
         };
     }
 
-    fn alloc(ctx: *anyopaque, n: usize, alignment: usize) AllocationError![*]u8 {
+    fn alloc(ctx: *anyopaque, bytes: usize, alignment: usize) AllocationError![*]u8 {
         const self: *VirtualMemoryManager = @alignCast(@ptrCast(ctx));
-        return self.backing_allocator.alloc(n, alignment);
+        return self.backing_allocator.alloc(bytes, alignment);
     }
 
     fn free(ctx: *anyopaque, addr: usize) void {
         const self: *VirtualMemoryManager = @alignCast(@ptrCast(ctx));
         self.backing_allocator.free(addr);
-    }
-
-    fn deinit(ctx: *anyopaque) void {
-        const self: *VirtualMemoryManager = @alignCast(@ptrCast(ctx));
-        self.backing_allocator.deinit();
     }
 };

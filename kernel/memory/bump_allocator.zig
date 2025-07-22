@@ -26,16 +26,15 @@ pub const BumpAllocator = struct {
             .vtable = &.{
                 .alloc = alloc,
                 .free = free,
-                .deinit = deinit,
             },
         };
     }
 
-    fn alloc(ctx: *anyopaque, n: usize, alignment: usize) AllocationError![*]u8 {
+    fn alloc(ctx: *anyopaque, bytes: usize, alignment: usize) AllocationError![*]u8 {
         const self: *BumpAllocator = @alignCast(@ptrCast(ctx));
 
         const aligned = std.mem.alignForward(usize, self.free_addr, alignment);
-        const free_addr = aligned + n;
+        const free_addr = aligned + bytes;
 
         if (free_addr > self.end_addr) {
             return AllocationError.OutOfMemory;
@@ -48,9 +47,5 @@ pub const BumpAllocator = struct {
     fn free(ctx: *anyopaque, addr: usize) void {
         _ = ctx;
         _ = addr;
-    }
-
-    fn deinit(ctx: *anyopaque) void {
-        _ = ctx;
     }
 };
