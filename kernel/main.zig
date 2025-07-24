@@ -7,6 +7,7 @@ const std = @import("std");
 const console = @import("console.zig");
 const bumpalloc = @import("memory/bump_allocator.zig");
 const multiboot = @import("arch/x86_64/multiboot.zig");
+const paging = @import("memory/paging.zig");
 const physmemmgr = @import("memory/physical_memory_manager.zig");
 const virtmemmgr = @import("memory/virtual_memory_manager.zig");
 
@@ -14,6 +15,7 @@ const BumpAllocator = bumpalloc.BumpAllocator;
 const MemoryRegion = multiboot.MemoryRegion;
 const MemoryRegionType = multiboot.MemoryRegionType;
 const MultibootInfo = multiboot.MultibootInfo;
+const PageMem = paging.PageMem;
 const PhysicalMemoryManager = physmemmgr.PhysicalMemoryManager;
 const VirtualMemoryManager = virtmemmgr.VirtualMemoryManager;
 
@@ -57,12 +59,15 @@ export fn kmain(
     var vmm = VirtualMemoryManager.init(&pmm_alloc_iface);
     var vmm_alloc_iface = vmm.allocator();
 
-    const addr = vmm_alloc_iface.alloc(4096, 4096) catch @panic("alloc failed\n");
-    const iaddr = @intFromPtr(addr);
+    const slice = vmm_alloc_iface.alloc(
+        PageMem(.Page4K),
+        t,
+    ) catch @panic("alloc failed\n");
+    const addr = @intFromPtr(slice.ptr);
 
-    std.debug.assert(iaddr >= kernel_end);
-    std.debug.assert(iaddr < available_region.addr + available_region.len);
-    std.debug.assert(std.mem.isAligned(iaddr, 4096));
+    std.debug.assert(addr >= kernel_end);
+    std.debug.assert(addr < available_region.addr + available_region.len);
+    std.debug.assert(std.mem.isAligned(addr, 4096));
 
     const sizeM = available_region.len / (1024 * 1024);
     const pages = available_region.len / 4096;

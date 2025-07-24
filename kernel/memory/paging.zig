@@ -15,9 +15,6 @@
 
 const std = @import("std");
 
-const allocator_interface = @import("allocator.zig");
-const Allocator = allocator_interface.Allocator;
-
 /// Represents supported page sizes for virtual memory mapping on x86_64.
 ///
 /// Used to determine alignment and page table hierarchy level during page mapping.
@@ -31,6 +28,15 @@ pub const PageSize = enum(usize) {
     /// 1 GiB page (huge page, skips two levels of page tables).
     Page1G = 1 * 1024 * 1024 * 1024,
 };
+
+/// Used for passing to std.mem.Allocator.alloc to easily specify
+/// the size and alignment requirements of a page
+pub fn PageMem(comptime page_size: PageSize) type {
+    const size_bytes = @intFromEnum(page_size);
+    return struct {
+        mem: [size_bytes]u8 align(size_bytes),
+    };
+}
 
 /// Page-level read/write permission flag for a page table entry.
 pub const RW = enum(u1) {
@@ -109,18 +115,6 @@ const PageEntry = packed struct {
 
     /// No-execute bit (bit 63), if supported by the CPU.
     nx: bool,
-
-    /// Returns the physical address encoded in this entry.
-    pub fn getPaddr(self: *PageEntry) u40 {
-        return @as(u40, self.addr) << @intFromEnum(PageLevelShift.PT);
-    }
-
-    /// Sets the physical address in this entry.
-    ///
-    /// The value is shifted to match the upper bits of the page table format (bits 12–51).
-    pub fn setPaddr(self: *PageEntry, addr: u40) void {
-        self.addr = @as(u40, addr >> @intFromEnum(PageLevelShift.PT));
-    }
 };
 
 comptime {
@@ -222,7 +216,7 @@ pub fn mapPage(
     rw: RW,
     user: User,
     page_size: PageSize,
-    allocator: *Allocator,
+    allocator: *std.mem.Allocator,
 ) void {
     std.debug.assert(std.mem.isAligned(
         paddr,
@@ -256,7 +250,7 @@ pub fn mapPage(
 
     var pdpt_entry = &pml4[pml4_idx];
     if (!pdpt_entry.present) {
-        const new_pdpt: [*]PDPTEntry = @alignCast(@ptrCast(allocator.alloc(
+        const new_pdpt: [*]PDPTEntry = @alignCast(@ptrCast(allocator.alignedAlloc(
             @intFromEnum(PageSize.Page4K),
             @intFromEnum(PageSize.Page4K),
         )));
@@ -265,14 +259,14 @@ pub fn mapPage(
             new_pdpt,
         )));
     }
-    const pdpt: [*]PDPTEntry = @ptrFromInt(pdpt_entry.getPaddr());
+    const pdpt: [*]PDPTEntry = @ptrFromInt(pdpt_entry.addr);
 
     // Map directly in PDPT for 1GiB pages
     if (page_size == .Page1G) {
         var entry = &pdpt[pdpt_idx];
         entry.* = flags;
         entry.huge_page = true;
-        entry.setPaddr(@intCast(paddr));
+        entry.addr = @intCast(paddr);
         return;
     }
 
@@ -285,14 +279,14 @@ pub fn mapPage(
         pd_entry.* = flags;
         pd_entry.setPaddr(@intCast(@intFromPtr(new_pd)));
     }
-    const pd: [*]PDEntry = @ptrFromInt(pd_entry.getPaddr());
+    const pd: [*]PDEntry = @ptrFromInt(pd_entry.addr);
 
     // map directly in PD for 2MiB pages
     if (page_size == .Page2M) {
         var entry = &pd[pd_idx];
         entry.* = flags;
         entry.huge_page = true;
-        entry.setPaddr(@intCast(paddr));
+        entry.addr = @intCast(paddr);
         return;
     }
 
@@ -304,10 +298,10 @@ pub fn mapPage(
             @intFromEnum(PageSize.Page4K),
         )));
         pt_entry.* = flags;
-        pt_entry.setPaddr(@intCast(@intFromPtr(new_pt)));
+        pt_entry.addr = @intCast(@intFromPtr(new_pt));
     }
-    const pt: [*]PTEntry = @ptrFromInt(pt_entry.getPaddr());
+    const pt: [*]PTEntry = @ptrFromInt(pt_entry.addr);
 
     pt[pt_idx] = flags;
-    pt[pt_idx].setPaddr(@intCast(paddr));
+    pt[pt_idx].addr = @intCast(paddr);
 }

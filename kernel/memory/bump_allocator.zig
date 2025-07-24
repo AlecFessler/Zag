@@ -1,10 +1,5 @@
 const std = @import("std");
 
-const allocator_interface = @import("allocator.zig");
-
-const Allocator = allocator_interface.Allocator;
-const AllocationError = allocator_interface.AllocationError;
-
 pub const BumpAllocator = struct {
     start_addr: usize,
     free_addr: usize,
@@ -20,32 +15,84 @@ pub const BumpAllocator = struct {
         };
     }
 
-    pub fn allocator(self: *BumpAllocator) Allocator {
+    pub fn allocator(self: *BumpAllocator) std.mem.Allocator {
         return .{
-            .ctx = self,
+            .ptr = self,
             .vtable = &.{
                 .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
                 .free = free,
             },
         };
     }
 
-    fn alloc(ctx: *anyopaque, bytes: usize, alignment: usize) AllocationError![*]u8 {
-        const self: *BumpAllocator = @alignCast(@ptrCast(ctx));
+    fn alloc(
+        ptr: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        _ = ret_addr;
+        const self: *BumpAllocator = @alignCast(@ptrCast(ptr));
 
-        const aligned = std.mem.alignForward(usize, self.free_addr, alignment);
-        const free_addr = aligned + bytes;
+        const aligned = std.mem.alignForward(
+            usize,
+            self.free_addr,
+            alignment.toByteUnits(),
+        );
+        const free_addr = aligned + len;
 
         if (free_addr > self.end_addr) {
-            return AllocationError.OutOfMemory;
+            return null;
         }
 
         self.free_addr = free_addr;
         return @ptrFromInt(aligned);
     }
 
-    fn free(ctx: *anyopaque, addr: usize) void {
-        _ = ctx;
-        _ = addr;
+    // no op
+    fn resize(
+        ptr: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
+        _ = ptr;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        return false;
+    }
+
+    // no op
+    fn remap(
+        ptr: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        _ = ptr;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        return null;
+    }
+
+    // no op
+    fn free(
+        ptr: *anyopaque,
+        buf: []u8,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) void {
+        _ = ptr;
+        _ = buf;
+        _ = alignment;
+        _ = ret_addr;
     }
 };
