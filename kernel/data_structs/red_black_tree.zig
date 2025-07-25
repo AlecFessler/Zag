@@ -1,186 +1,266 @@
 const std = @import("std");
 
 pub const DataStructError = error{
-    Duplicate,
-    NotFound,
+Duplicate,
+NotFound,
 };
 
 pub fn RedBlackTree(
-    comptime T: type,
-    comptime cmpFn: fn (T, T) std.math.Order,
-    comptime duplicateIsError: bool,
+comptime T: type,
+comptime cmpFn: fn (T, T) std.math.Order,
+comptime duplicateIsError: bool,
 ) type {
-    return struct {
-        const Self = @This();
+return struct {
+const Self = @This();
 
-        allocator: *std.mem.Allocator,
-        root: ?*Node,
+allocator: *std.mem.Allocator,
+root: ?*Node,
 
-        const Color = enum {
-            Red,
-            Black,
+const Color = enum {    
+    Red,    
+    Black,    
+};    
 
-            fn flip(c: Color) Color {
-                return switch (c) {
-                    .Red => .Black,
-                    .Black => .Red,
-                };
-            }
-        };
+const Direction = enum {    
+    left,    
+    right,    
 
-        const Direction = enum {
-            left,
-            right,
+    fn opposite(d: Direction) Direction {    
+        return @enumFromInt(1 - @intFromEnum(d));    
+    }    
+};    
 
-            fn flip(d: Direction) Direction {
-                return @enumFromInt(1 - @intFromEnum(d));
-            }
-        };
+const Node = struct {    
+    color: Color,    
+    children: [2]?*Node,    
+    parent: ?*Node,    
+    data: T,    
 
-        const Node = struct {
-            color: Color,
-            child: [2]?*Node,
-            data: T,
+    fn create(allocator: *std.mem.Allocator, data: T) !*Node {    
+        const ptr = allocator.create(Node);    
+        ptr.* = .{    
+            .color = .Red,    
+            .children = .{    
+                null,    
+                null,    
+            },    
+            .parent = null,    
+            .data = data,    
+        };    
+        return ptr;    
+    }    
 
-            fn create(allocator: *std.mem.Allocator, data: T) !*Node {
-                const ptr = allocator.create(Node);
-                ptr.* = .{
-                    .color = .Red,
-                    .child = .{
-                        null,
-                        null,
-                    },
-                    .data = data,
-                };
-                return ptr;
-            }
+    fn destroy(self: *Node, allocator: *std.mem.Allocator) void {    
+        allocator.destroy(self);    
+    }    
 
-            fn destroy(self: *Node, allocator: *std.mem.Allocator) void {
-                allocator.destroy(self);
-            }
-        };
+    fn sibling(self: *Node) ?*Node {    
+        if (self.parent) |p| {    
+            return if (self == p.children[.left]) p.children[.right] else p.children[.left];    
+        }    
+        return null;    
+    }    
 
-        pub fn init(allocator: *std.mem.Allocator) Self {
-            return .{
-                .allocator = allocator,
-                .root = null,
-            };
-        }
+    fn uncle(self: *Node) ?*Node {    
+        if (self.parent) |p| {    
+            return p.sibling();    
+        }    
+        return null;    
+    }    
 
-        pub fn deinit(self: *Self) void {
-            self.deinitRecursive(self.root);
-        }
+    fn grandparent(self: *Node) ?*Node {    
+        if (self.parent) |p| {    
+            if (p.parent) |gp| {    
+                return gp;    
+            }    
+        }    
+        return null;    
+    }    
+};    
 
-        fn deinitRecursive(self: *Self, node: ?*Node) void {
-            if (node) |n| {
-                self.deinitRecursive(n.child[.left]);
-                self.deinitRecursive(n.child[.right]);
-                n.destroy(self.allocator);
-            }
-        }
+pub fn init(allocator: *std.mem.Allocator) Self {    
+    return .{    
+        .allocator = allocator,    
+        .root = null,    
+    };    
+}    
 
-        pub fn contains(self: *Self, data: T) bool {
-            return containsRecursive(self.root, data);
-        }
+pub fn deinit(self: *Self) void {    
+    var current = self.root;    
+    var prev: ?*Node = null;    
+    var next: ?*Node = null;    
+    while (current) : ({    
+        prev = current;    
+        current = next;    
+    }) {    
+        const prevIsParent = current.parent != null and prev == current.parent;    
+        const prevIsLeft = current.children[.left] != null and prev == current.children[.left];    
 
-        fn containsRecursive(node: ?*Node, data: T) bool {
-            if (node) |n| {
-                switch (cmpFn(data, n.data)) {
-                    .lt => return containsRecursive(n.child[.left], data),
-                    .gt => return containsRecursive(n.child[.right], data),
-                    .eq => return true,
-                }
-            }
-            return false;
-        }
+        if (prevIsParent) {    
+            if (current.children[.left]) |left| {    
+                next = left;    
+                continue;    
+            } else if (current.children[.right]) |right| {    
+                next = right;    
+                continue;    
+            }    
+        } else if (prevIsLeft) {    
+            if (current.children[.right]) |right| {    
+                next = right;    
+                continue;    
+            }    
+        }    
 
-        pub fn insert(self: *Self, data: T) !void {
-            self.root = try self.insertRecursive(self.root, data);
-            self.root.color = .Black;
-        }
+        next = current.parent;    
+        current.destroy(self.allocator);    
+    }    
+}    
 
-        fn insertRecursive(self: *Self, node: ?*Node, data: T) !*Node {
-            if (node) |n| {
-                var d: Direction = undefined;
-                switch (cmpFn(data, n.data)) {
-                    .lt => d = .left,
-                    .gt => d = .right,
-                    .eq => {
-                        if (duplicateIsError) return DataStructError.Duplicate;
-                        d = .left;
-                    },
-                }
-                n.child[d] = try insertRecursive(n.child[d], data);
+pub fn contains(self: *Self, data: T) bool {    
+    var current = self.root;    
 
-                return insertFix(n, d);
-            }
+    while (current) |node| {    
+        switch (cmpFn(data, node.data)) {    
+            .eq => return true,    
+            .lt => current = node.children[.left],    
+            .gt => current = node.children[.right],    
+        }    
+    }    
 
-            return try Node.create(self.allocator, data);
-        }
+    return false;    
+}    
 
-        fn insertFix(node: *Node, d: Direction) *Node {
-            const child = node.child[d];
-            const sibling = node.child[d.flip()];
+pub fn insert(self: *Self, data: T) !void {    
+    if (self.root) |root| {    
+        var current: ?*Node = root;    
+        var parent: ?*Node = null;    
 
-            const child_red = child != null and child.?.color == .Red;
-            const sibling_red = sibling != null and sibling.?.color == .Red;
+        while (current) |c| {    
+            parent = c;    
+            switch (cmpFn(data, c.data)) {    
+                .lt => current = c.children[.left],    
+                .gt => current = c.children[.right],    
+                .eq => {    
+                    if (duplicateIsError) return DataStructError.Duplicate;    
+                    current = c.children[.left];    
+                },    
+            }    
+        }    
 
-            if (child_red) {
-                if (sibling_red) {
-                    const straight = child.?.child[d];
-                    const zigzag = child.?.child[d.flip()];
+        const node = try Node.create(self.alloctor, data);    
+        if (parent) |p| {    
+            node.parent = p;    
+            if (cmpFn(data, p.data) == .lt) {    
+                p.children[.left] = node;    
+            } else {    
+                p.children[.right] = node;    
+            }    
 
-                    const straight_red = straight != null and straight.?.color == .Red;
-                    const zigzag_red = zigzag != null and zigzag.?.color == .Red;
+            if (p.color == .Red) {    
+                self.insertFix(node);    
+            }    
+        }    
+    } else {    
+        const node = try Node.create(self.allocator, data);    
+        node.color = .Black;    
+        self.root = node;    
+    }    
+}    
 
-                    if (straight_red or zigzag_red) node.color = node.color.flip();
-                } else {
-                    const straight = child.?.child[d];
-                    const zigzag = child.?.child[d.flip()];
+fn insertFix(self: *Self, node: *Node) void {
+}    
 
-                    const straight_red = straight != null and straight.?.color == .Red;
-                    const zigzag_red = zigzag != null and zigzag.?.color == .Red;
+pub fn remove(self: *Self, data: T) !void {    
+    var target: ?*Node = self.root;    
 
-                    if (straight_red) {
-                        node = rotate(node, d.flip());
-                    } else if (zigzag_red) {
-                        node = doubleRotate(node, d.flip());
-                    }
-                }
-            }
+    while (target) |t| {    
+        switch (cmpFn(data, t.data)) {    
+            .lt => target = t.children[.left],    
+            .gt => target = t.children[.right],    
+            .eq => break,    
+        }    
+    } else return DataStructError.NotFound;    
 
-            return node;
-        }
+    if (target.?.children[.left] != null and target.?.children[.right] != null) {    
+        var successor = target.children[.right].?;    
+        while (successor.children[.left]) |left| {    
+            successor = left;    
+        }    
+        target.item = successor.item;    
+        target = successor;    
+    }    
 
-        pub fn remove(self: *Self, data: T) !void {
-            const fixed = false;
-            self.root = removeRecursive(self.root, data, &fixed);
-            if (self.root) |r| r.color = .Black;
-        }
+    const replacement = target.children[.left] orelse target.children[.right];    
+    if (replacement) |r| r.parent = target.parent;    
 
-        fn removeRecursive(node: ?*Node, data: T, fixed: *bool) *Node {
-            // TODO:
-        }
+    if (target.parent) |p| {    
+        if (target == p.children[.left]) {    
+            p.children[.left] = replacement;    
+        } else {    
+            p.children[.right] = replacement;    
+        }    
+    } else {    
+        self.root = replacement;    
+    }    
 
-        fn removeFix(node: *Node, d: Direction, fixed: *bool) *Node {
-            // TODO:
-        }
+    if (target.color == .Black) {    
+        self.removeFix(replacement, target.parent);    
+    }    
 
-        fn rotate(pivot: *Node, d: Direction) *Node {
-            const temp = pivot.child[d.flip()];
-            pivot.child[d.flip()] = temp.child[d];
-            temp.child[d] = pivot;
+    target.destroy(self.allocator);    
+}    
 
-            temp.color = pivot.color;
-            pivot.color = .Red;
+fn removeFix(self: *Self, node: ?*Node, parent: ?*Node) void {}    
 
-            return temp;
-        }
+fn rotateLeft(self: *Self, pivot: *Node) void {    
+    const new_root = pivot.children[.right].?;    
 
-        fn doubleRotate(node: *Node, d: Direction) *Node {
-            const flipped = d.flip();
-            node.child[flipped] = rotate(node.child[flipped], flipped);
-            return rotate(node, d);
-        }
-    };
+    pivot.children[.right] = new_root.children[.left];    
+    if (new_root.children[.left]) |subtree| {    
+        subtree.parent = pivot;    
+    }    
+
+    new_root.parent = pivot.parent;    
+
+    if (pivot.parent) |p| {    
+        if (pivot == p.children[.left]) {    
+            p.children[.left] = new_root;    
+        } else {    
+            p.children[.right] = new_root;    
+        }    
+    } else {    
+        self.root = new_root;    
+    }    
+
+    new_root.children[.left] = pivot;    
+    pivot.parent = new_root;    
+}    
+
+fn rotateRight(self: *Self, pivot: *Node) void {    
+    const new_root = pivot.children[.left].?;    
+
+    pivot.children[.left] = new_root.children[.right];    
+    if (new_root.children[.right]) |subtree| {    
+        subtree.parent = pivot;    
+    }    
+
+    new_root.parent = pivot.parent;    
+
+    if (pivot.parent) |p| {    
+        if (pivot == p.children[.left]) {    
+            p.children[.left] = new_root;    
+        } else {    
+            p.children[.right] = new_root;    
+        }    
+    } else {    
+        self.root = new_root;    
+    }    
+
+    new_root.children[.right] = pivot;    
+    pivot.parent = new_root;    
 }
+
+};
+
+}
+
