@@ -44,7 +44,7 @@ pub fn RedBlackTree(
             data: T,
 
             fn create(allocator: *std.mem.Allocator, data: T) !*Node {
-                const ptr = allocator.create(Node);
+                const ptr = try allocator.create(Node);
                 ptr.* = .{
                     .color = .Red,
                     .children = .{
@@ -100,7 +100,7 @@ pub fn RedBlackTree(
             };
         }
 
-        fn deinit(self: *Self) void {
+        pub fn deinit(self: *Self) void {
             var current = self.root;
             var prev: ?*Node = null;
             var next: ?*Node = null;
@@ -229,13 +229,13 @@ pub fn RedBlackTree(
 
             const one_child_at_most = target.getChild(.left) == null or target.getChild(.right) == null;
             if (one_child_at_most) {
-                const non_null_child = if (target.getChild(.left) == null) .right else .left;
+                const non_null_child = if (target.getChild(.left) == null) Direction.right else Direction.left;
                 const replacement = target.getChild(non_null_child);
 
                 if (target == self.root) {
                     self.root = replacement;
                 } else {
-                    const dir_from_parent = if (target == parent.getChild(.left)) .left else .right;
+                    const dir_from_parent = if (target == parent.getChild(.left)) Direction.left else Direction.right;
                     parent.setChild(replacement, dir_from_parent);
                     if (replacement) |r| r.parent = parent;
                 }
@@ -360,4 +360,58 @@ pub fn RedBlackTree(
             pivot.parent = new_parent;
         }
     };
+}
+
+// for test cases
+fn i32Order(a: i32, b: i32) std.math.Order {
+    return std.math.order(a, b);
+}
+
+test "insert and contains" {
+    var allocator = std.testing.allocator;
+    var tree = RedBlackTree(i32, i32Order, false).init(&allocator);
+    defer tree.deinit();
+
+    try tree.insert(42);
+    try std.testing.expect(tree.contains(42));
+}
+
+test "insert then remove and not contains" {
+    var allocator = std.testing.allocator;
+    var tree = RedBlackTree(i32, i32Order, false).init(&allocator);
+    defer tree.deinit();
+
+    try tree.insert(7);
+    try std.testing.expect(tree.contains(7));
+    try tree.remove(7);
+    try std.testing.expect(!tree.contains(7));
+}
+
+test "insert duplicate returns error if configured" {
+    var allocator = std.testing.allocator;
+    var tree = RedBlackTree(i32, i32Order, true).init(&allocator);
+    defer tree.deinit();
+
+    try tree.insert(99);
+    const err = tree.insert(99);
+    try std.testing.expectError(error.Duplicate, err);
+}
+
+test "remove nonexistent value returns error" {
+    var allocator = std.testing.allocator;
+    var tree = RedBlackTree(i32, i32Order, false).init(&allocator);
+    defer tree.deinit();
+
+    const err = tree.remove(1234);
+    try std.testing.expectError(error.NotFound, err);
+}
+
+test "insert many and deinit without leaks" {
+    var allocator = std.testing.allocator;
+    var tree = RedBlackTree(i32, i32Order, false).init(&allocator);
+    defer tree.deinit();
+
+    for (0..1000) |i| {
+        try tree.insert(@intCast(i));
+    }
 }
