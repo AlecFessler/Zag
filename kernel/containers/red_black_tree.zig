@@ -22,8 +22,8 @@ pub fn RedBlackTree(
 
             fn flip(c: Color) Color {
                 return switch (c) {
-                    .Red => .Black,
-                    .Black => .Red,
+                    Color.Red => Color.Black,
+                    Color.Black => Color.Red,
                 };
             }
         };
@@ -46,7 +46,7 @@ pub fn RedBlackTree(
             fn create(allocator: *std.mem.Allocator, data: T) !*Node {
                 const ptr = try allocator.create(Node);
                 ptr.* = .{
-                    .color = .Red,
+                    .color = Color.Red,
                     .children = .{
                         null,
                         null,
@@ -71,7 +71,7 @@ pub fn RedBlackTree(
 
             fn getSibling(self: *Node) ?*Node {
                 if (self.parent) |p| {
-                    return if (self == p.getChild(.left)) p.getChild(.right) else p.getChild(.left);
+                    return if (self == p.getChild(Direction.left)) p.getChild(Direction.right) else p.getChild(Direction.left);
                 }
                 return null;
             }
@@ -104,30 +104,30 @@ pub fn RedBlackTree(
             var current = self.root;
             var prev: ?*Node = null;
             var next: ?*Node = null;
-            while (current) : ({
+            while (current) |c| : ({
                 prev = current;
                 current = next;
             }) {
-                const prevIsParent = current.parent != null and prev == current.parent;
-                const prevIsLeft = current.getChild(.left) != null and prev == current.getChild(.left);
+                const prevIsParent = c.parent != null and prev == c.parent;
+                const prevIsLeft = c.getChild(Direction.left) != null and prev == c.getChild(Direction.left);
 
                 if (prevIsParent) {
-                    if (current.getChild(.left)) |left| {
+                    if (c.getChild(Direction.left)) |left| {
                         next = left;
                         continue;
-                    } else if (current.getChild(.right)) |right| {
+                    } else if (c.getChild(Direction.right)) |right| {
                         next = right;
                         continue;
                     }
                 } else if (prevIsLeft) {
-                    if (current.getChild(.right)) |right| {
+                    if (c.getChild(Direction.right)) |right| {
                         next = right;
                         continue;
                     }
                 }
 
-                next = current.parent;
-                current.destroy(self.allocator);
+                next = c.parent;
+                c.destroy(self.allocator);
             }
         }
 
@@ -137,8 +137,8 @@ pub fn RedBlackTree(
             while (current) |node| {
                 switch (cmpFn(data, node.data)) {
                     .eq => return true,
-                    .lt => current = node.getChild(.left),
-                    .gt => current = node.getChild(.right),
+                    .lt => current = node.getChild(Direction.left),
+                    .gt => current = node.getChild(Direction.right),
                 }
             }
 
@@ -153,11 +153,11 @@ pub fn RedBlackTree(
                 while (current) |c| {
                     parent = c;
                     switch (cmpFn(data, c.data)) {
-                        .lt => current = c.getChild(.left),
-                        .gt => current = c.getChild(.right),
+                        .lt => current = c.getChild(Direction.left),
+                        .gt => current = c.getChild(Direction.right),
                         .eq => {
                             if (duplicateIsError) return ContainerError.Duplicate;
-                            current = c.getChild(.left);
+                            current = c.getChild(Direction.left);
                         },
                     }
                 }
@@ -166,49 +166,49 @@ pub fn RedBlackTree(
                 if (parent) |p| {
                     node.parent = p;
                     if (cmpFn(data, p.data) == .lt) {
-                        p.setChild(node, .left);
+                        p.setChild(node, Direction.left);
                     } else {
-                        p.setChild(node, .right);
+                        p.setChild(node, Direction.right);
                     }
 
-                    if (p.color == .Red) {
+                    if (p.color == Color.Red) {
                         self.insertFix(node);
                     }
                 }
             } else {
                 const node = try Node.create(self.allocator, data);
-                node.color = .Black;
+                node.color = Color.Black;
                 self.root = node;
             }
         }
 
         fn insertFix(self: *Self, node: *Node) void {
-            while (node.parent) |p| {
-                if (p.color == .Black) break;
+            var current = node;
+            while (current.parent) |p| {
+                if (p.color == Color.Black) break;
 
-                var gp = node.getGrandparent() orelse unreachable;
-                const uncle = node.getUncle();
+                var gp = current.getGrandparent() orelse unreachable;
+                const uncle = current.getUncle();
 
-                const d = if (p == gp.getChild(.left)) .left else .right;
+                const d = if (p == gp.getChild(Direction.left)) Direction.left else Direction.right;
                 if (uncle) |u| {
-                    if (u.color == .Black) break;
-                    p.color = .Black;
-                    u.color = .Black;
-                    gp.color = .Red;
-                    node = gp;
+                    if (u.color == Color.Black) break;
+                    p.color = Color.Black;
+                    u.color = Color.Black;
+                    gp.color = Color.Red;
+                    current = gp;
                 } else {
-                    if (node == p.getChild(d.flip())) {
+                    if (current == p.getChild(d.flip())) {
                         self.rotate(p, d);
-                        node = p;
-                        p = node.parent.?; // rotation means we are not the root
+                        current = p;
                     }
-                    p.color = .Black;
-                    gp.color = .Red;
+                    p.color = Color.Black;
+                    gp.color = Color.Red;
                     self.rotate(gp, d.flip());
                 }
             }
 
-            self.root.?.color = .Black;
+            self.root.?.color = Color.Black;
         }
 
         pub fn remove(self: *Self, data: T) !void {
@@ -217,8 +217,8 @@ pub fn RedBlackTree(
 
             while (current) |c| {
                 switch (cmpFn(data, c.data)) {
-                    .lt => current = c.getChild(.left),
-                    .gt => current = c.getChild(.right),
+                    .lt => current = c.getChild(Direction.left),
+                    .gt => current = c.getChild(Direction.right),
                     .eq => break,
                 }
                 parent = c;
@@ -227,52 +227,52 @@ pub fn RedBlackTree(
             if (current == null) return ContainerError.NotFound;
             var target = current.?;
 
-            const one_child_at_most = target.getChild(.left) == null or target.getChild(.right) == null;
+            const one_child_at_most = target.getChild(Direction.left) == null or target.getChild(Direction.right) == null;
             if (one_child_at_most) {
-                const non_null_child = if (target.getChild(.left) == null) Direction.right else Direction.left;
+                const non_null_child = if (target.getChild(Direction.left) == null) Direction.right else Direction.left;
                 const replacement = target.getChild(non_null_child);
 
                 if (target == self.root) {
                     self.root = replacement;
                 } else {
-                    const dir_from_parent = if (target == parent.getChild(.left)) Direction.left else Direction.right;
-                    parent.setChild(replacement, dir_from_parent);
+                    const dir_from_parent = if (target == parent.?.getChild(Direction.left)) Direction.left else Direction.right;
+                    parent.?.setChild(replacement, dir_from_parent);
                     if (replacement) |r| r.parent = parent;
                 }
 
-                if (target.color == .Black) {
+                if (target.color == Color.Black) {
                     if (replacement) |r| {
-                        if (r.color == .Red) r.color = .Black;
-                    } else {
-                        self.removeFix(parent);
+                        if (r.color == Color.Red) r.color = Color.Black;
+                    } else if (parent != null) {
+                        self.removeFix(parent.?);
                     }
                 }
 
                 target.destroy(self.allocator);
             } else {
                 parent = null;
-                var successor: *Node = target.getChild(.right).?;
+                var successor: *Node = target.getChild(Direction.right).?;
 
-                while (successor.getChild(.left)) |left| {
+                while (successor.getChild(Direction.left)) |left| {
                     parent = successor;
                     successor = left;
                 }
 
-                const replacement = successor.getChild(.right);
+                const replacement = successor.getChild(Direction.right);
 
                 if (parent) |p| {
-                    p.setChild(replacement, .left);
+                    p.setChild(replacement, Direction.left);
                 } else {
-                    target.setChild(replacement, .right);
+                    target.setChild(replacement, Direction.right);
                 }
 
                 if (replacement) |right| {
                     right.parent = parent orelse target;
                 }
 
-                if (successor.color == .Black) {
+                if (successor.color == Color.Black) {
                     if (replacement) |r| {
-                        if (r.color == .Red) r.color = .Black;
+                        if (r.color == Color.Red) r.color = Color.Black;
                     } else {
                         self.removeFix(parent orelse target);
                     }
@@ -287,54 +287,55 @@ pub fn RedBlackTree(
             self: *Self,
             node: *Node,
         ) void {
-            while (node != self.root) {
-                const sibling_opt = node.getSibling();
+            var current = node;
+            while (current != self.root) {
+                const sibling_opt = current.getSibling();
                 if (sibling_opt == null) break;
 
                 const sibling = sibling_opt.?;
-                const parent = node.parent;
-                const which_child: Direction = if (node == parent.getChild(.left)) .left else .right;
+                const parent = current.parent;
+                const which_child: Direction = if (current == parent.?.getChild(Direction.left)) Direction.left else Direction.right;
 
-                if (sibling.color == .Red) {
-                    self.rotate(node, which_child);
-                    sibling.color = .Black;
-                    parent.color = .Red;
+                if (sibling.color == Color.Red) {
+                    self.rotate(current, which_child);
+                    sibling.color = Color.Black;
+                    parent.?.color = Color.Red;
                     continue;
                 } else {
                     const near = sibling.getChild(which_child);
                     const far = sibling.getChild(which_child.flip());
                     const both_present = near != null and far != null;
-                    const far_red = if (far) |f| f.color == .Red else false;
-                    const near_red = if (near) |n| n.color == .Red else false;
+                    const far_red = if (far) |f| f.color == Color.Red else false;
+                    const near_red = if (near) |n| n.color == Color.Red else false;
 
                     if (both_present) {
-                        const both_black = near.?.color == .Black and far.?.color == .Black;
+                        const both_black = near.?.color == Color.Black and far.?.color == Color.Black;
                         if (both_black) {
-                            sibling.color = .Red;
-                            if (parent.color == .Red) {
-                                parent.color = .Black;
+                            sibling.color = Color.Red;
+                            if (parent.?.color == Color.Red) {
+                                parent.?.color = Color.Black;
                                 break;
                             }
-                            node = node.parent;
+                            current = current.parent orelse break;
                             continue;
                         }
                     } else if (far_red) {
                         if (near_red) {
-                            sibling.color = .Red;
-                            near.?.color = .Black;
+                            sibling.color = Color.Red;
+                            near.?.color = Color.Black;
                             self.rotate(sibling, which_child.flip());
                             continue;
                         }
-                        sibling.color = parent.color;
-                        parent.color = .Black;
-                        far.?.color = .Black;
-                        self.rotate(parent, which_child);
+                        sibling.color = parent.?.color;
+                        parent.?.color = Color.Black;
+                        far.?.color = Color.Black;
+                        self.rotate(parent.?, which_child);
                         break;
                     }
                 }
             }
 
-            if (self.root) |r| r.color = .Black;
+            if (self.root) |r| r.color = Color.Black;
         }
 
         fn rotate(
@@ -359,10 +360,117 @@ pub fn RedBlackTree(
             new_parent.setChild(pivot, d);
             pivot.parent = new_parent;
         }
+
+        /// helper function so that test cases can access T typed Node
+        fn expectSameTree(a: ?*Node, b: ?*Node) !void {
+            if (a == null or b == null) {
+                try std.testing.expect(a == b);
+                return;
+            }
+            try std.testing.expectEqual(a.?.data, b.?.data);
+            try std.testing.expectEqual(a.?.color, b.?.color);
+            try expectSameTree(a.?.getChild(.left), b.?.getChild(.left));
+            try expectSameTree(a.?.getChild(.right), b.?.getChild(.right));
+        }
+
+        /// helper function so that test cases can create T typed Node
+        fn testCreateNode(allocator: *std.mem.Allocator) !*Node {
+            return Node.create(allocator, 0);
+        }
+
+        /// helper function so that test cases can destroy T typed node
+        fn testDestroyNode(node: *Node, allocator: *std.mem.Allocator) void {
+            Node.destroy(node, allocator);
+        }
+
+        /// helper function to validate red black tree invariants
+        fn validateRedBlackTree(
+            node: ?*Node,
+            min_val: ?i32,
+            max_val: ?i32,
+        ) struct {
+            valid: bool,
+            black_height: i32,
+        } {
+            if (node == null) {
+                return .{
+                    .valid = true,
+                    .black_height = 1,
+                };
+            }
+
+            const n = node.?;
+
+            // Check BST property
+            if (min_val) |min| {
+                if (n.data <= min) return .{
+                    .valid = false,
+                    .black_height = 0,
+                };
+            }
+            if (max_val) |max| {
+                if (n.data >= max) return .{
+                    .valid = false,
+                    .black_height = 0,
+                };
+            }
+
+            // Invariant 4: Red nodes have black children
+            if (n.color == .Red) {
+                if (n.getChild(.left)) |left| {
+                    if (left.color == .Red) {
+                        return .{
+                            .valid = false,
+                            .black_height = 0,
+                        };
+                    }
+                }
+                if (n.getChild(.right)) |right| {
+                    if (right.color == .Red) {
+                        return .{
+                            .valid = false,
+                            .black_height = 0,
+                        };
+                    }
+                }
+            }
+
+            const left_result = validateRedBlackTree(
+                n.getChild(.left),
+                min_val,
+                n.data,
+            );
+            const right_result = validateRedBlackTree(
+                n.getChild(.right),
+                n.data,
+                max_val,
+            );
+
+            if (!left_result.valid or !right_result.valid) {
+                return .{
+                    .valid = false,
+                    .black_height = 0,
+                };
+            }
+
+            // Invariant 5: All paths have same black height
+            if (left_result.black_height != right_result.black_height) {
+                return .{
+                    .valid = false,
+                    .black_height = 0,
+                };
+            }
+
+            const black_contribution: i32 = if (n.color == .Black) 1 else 0;
+            return .{
+                .valid = true,
+                .black_height = left_result.black_height + black_contribution,
+            };
+        }
     };
 }
 
-// for test cases
+// test case comparator
 fn i32Order(a: i32, b: i32) std.math.Order {
     return std.math.order(a, b);
 }
@@ -413,5 +521,567 @@ test "insert many and deinit without leaks" {
 
     for (0..1000) |i| {
         try tree.insert(@intCast(i));
+    }
+}
+
+test "insertFix case 1: recoloring when uncle is red" {
+    const Tree = RedBlackTree(i32, i32Order, false);
+
+    var allocator = std.testing.allocator;
+
+    const gp = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(gp, &allocator);
+    const parent = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(parent, &allocator);
+    const uncle = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(uncle, &allocator);
+    const new_node = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(new_node, &allocator);
+
+    const gp_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(gp_expected, &allocator);
+    const parent_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(parent_expected, &allocator);
+    const uncle_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(uncle_expected, &allocator);
+    const new_node_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(new_node_expected, &allocator);
+
+    gp.* = .{
+        .data = 10,
+        .color = .Black,
+        .children = .{ parent, uncle },
+        .parent = null,
+    };
+    parent.* = .{
+        .data = 5,
+        .color = .Red,
+        .children = .{ new_node, null },
+        .parent = gp,
+    };
+    uncle.* = .{
+        .data = 15,
+        .color = .Red,
+        .children = .{ null, null },
+        .parent = gp,
+    };
+    new_node.* = .{
+        .data = 2,
+        .color = .Red,
+        .children = .{ null, null },
+        .parent = parent,
+    };
+
+    gp_expected.* = .{
+        .data = 10,
+        .color = .Black,
+        .children = .{ parent_expected, uncle_expected },
+        .parent = null,
+    };
+    parent_expected.* = .{
+        .data = 5,
+        .color = .Black,
+        .children = .{ new_node_expected, null },
+        .parent = gp_expected,
+    };
+    uncle_expected.* = .{
+        .data = 15,
+        .color = .Black,
+        .children = .{ null, null },
+        .parent = gp_expected,
+    };
+    new_node_expected.* = .{
+        .data = 2,
+        .color = .Red,
+        .children = .{ null, null },
+        .parent = parent_expected,
+    };
+
+    var tree = Tree.init(&allocator);
+    tree.root = gp;
+
+    tree.insertFix(new_node);
+
+    try Tree.expectSameTree(tree.root, gp_expected);
+}
+
+test "insertFix case 2a: triangle (rotate parent)" {
+    const Tree = RedBlackTree(i32, i32Order, false);
+
+    var allocator = std.testing.allocator;
+
+    const grand = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(grand, &allocator);
+    const parent = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(parent, &allocator);
+    const new_node = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(new_node, &allocator);
+
+    const grand_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(grand_expected, &allocator);
+    const left_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(left_expected, &allocator);
+    const right_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(right_expected, &allocator);
+
+    grand.* = .{
+        .data = 10,
+        .color = .Black,
+        .children = .{ parent, null },
+        .parent = null,
+    };
+    parent.* = .{
+        .data = 5,
+        .color = .Red,
+        .children = .{ null, new_node },
+        .parent = grand,
+    };
+    new_node.* = .{
+        .data = 7,
+        .color = .Red,
+        .children = .{ null, null },
+        .parent = parent,
+    };
+
+    grand_expected.* = .{
+        .data = 7,
+        .color = .Black,
+        .children = .{ left_expected, right_expected },
+        .parent = null,
+    };
+    left_expected.* = .{
+        .data = 5,
+        .color = .Red,
+        .children = .{ null, null },
+        .parent = grand_expected,
+    };
+    right_expected.* = .{
+        .data = 10,
+        .color = .Red,
+        .children = .{ null, null },
+        .parent = grand_expected,
+    };
+
+    var tree = Tree.init(&allocator);
+    tree.root = grand;
+
+    tree.insertFix(new_node);
+
+    try Tree.expectSameTree(tree.root, grand_expected);
+}
+
+test "insertFix case 2b: line (rotate grandparent)" {
+    const Tree = RedBlackTree(i32, i32Order, false);
+
+    var allocator = std.testing.allocator;
+
+    const grand = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(grand, &allocator);
+    const parent = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(parent, &allocator);
+    const new_node = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(new_node, &allocator);
+
+    const root_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(root_expected, &allocator);
+    const left_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(left_expected, &allocator);
+    const right_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(right_expected, &allocator);
+
+    grand.* = .{
+        .data = 10,
+        .color = .Black,
+        .children = .{ parent, null },
+        .parent = null,
+    };
+    parent.* = .{
+        .data = 5,
+        .color = .Red,
+        .children = .{ new_node, null },
+        .parent = grand,
+    };
+    new_node.* = .{
+        .data = 2,
+        .color = .Red,
+        .children = .{ null, null },
+        .parent = parent,
+    };
+
+    root_expected.* = .{
+        .data = 5,
+        .color = .Black,
+        .children = .{ left_expected, right_expected },
+        .parent = null,
+    };
+    left_expected.* = .{
+        .data = 2,
+        .color = .Red,
+        .children = .{ null, null },
+        .parent = root_expected,
+    };
+    right_expected.* = .{
+        .data = 10,
+        .color = .Red,
+        .children = .{ null, null },
+        .parent = root_expected,
+    };
+
+    var tree = Tree.init(&allocator);
+    tree.root = grand;
+
+    tree.insertFix(new_node);
+
+    try Tree.expectSameTree(tree.root, root_expected);
+}
+
+test "removeFix case 1: red sibling" {
+    const Tree = RedBlackTree(i32, i32Order, false);
+    var allocator = std.testing.allocator;
+
+    const parent = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(parent, &allocator);
+    const node = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(node, &allocator);
+    const sibling = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(sibling, &allocator);
+
+    const parent_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(parent_expected, &allocator);
+    const node_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(node_expected, &allocator);
+    const sibling_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(sibling_expected, &allocator);
+
+    parent.* = .{
+        .data = 10,
+        .color = .Black,
+        .children = .{ node, sibling },
+        .parent = null,
+    };
+    node.* = .{
+        .data = 5,
+        .color = .Black,
+        .children = .{ null, null },
+        .parent = parent,
+    };
+    sibling.* = .{
+        .data = 15,
+        .color = .Red,
+        .children = .{ null, null },
+        .parent = parent,
+    };
+
+    parent_expected.* = .{
+        .data = 10,
+        .color = .Red,
+        .children = .{ node_expected, sibling_expected },
+        .parent = null,
+    };
+    node_expected.* = .{
+        .data = 5,
+        .color = .Black,
+        .children = .{ null, null },
+        .parent = parent_expected,
+    };
+    sibling_expected.* = .{
+        .data = 15,
+        .color = .Black,
+        .children = .{ null, null },
+        .parent = parent_expected,
+    };
+
+    var tree = Tree.init(&allocator);
+    tree.root = parent;
+
+    tree.removeFix(node);
+
+    try Tree.expectSameTree(tree.root, parent_expected);
+}
+
+test "removeFix case 2: black sibling, red far child" {
+    const Tree = RedBlackTree(i32, i32Order, false);
+    var allocator = std.testing.allocator;
+
+    const parent = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(parent, &allocator);
+    const node = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(node, &allocator);
+    const sibling = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(sibling, &allocator);
+    const far = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(far, &allocator);
+
+    const parent_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(parent_expected, &allocator);
+    const node_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(node_expected, &allocator);
+    const sibling_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(sibling_expected, &allocator);
+    const far_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(far_expected, &allocator);
+
+    parent.* = .{
+        .data = 10,
+        .color = .Black,
+        .children = .{ node, sibling },
+        .parent = null,
+    };
+    node.* = .{
+        .data = 5,
+        .color = .Black,
+        .children = .{ null, null },
+        .parent = parent,
+    };
+    sibling.* = .{
+        .data = 15,
+        .color = .Black,
+        .children = .{ null, far },
+        .parent = parent,
+    };
+    far.* = .{
+        .data = 20,
+        .color = .Red,
+        .children = .{ null, null },
+        .parent = sibling,
+    };
+
+    parent_expected.* = .{
+        .data = 15,
+        .color = .Black,
+        .children = .{ parent_expected, far_expected },
+        .parent = null,
+    };
+    parent_expected.children[0] = node_expected;
+    parent_expected.children[1] = far_expected;
+    node_expected.* = .{
+        .data = 10,
+        .color = .Black,
+        .children = .{ node_expected, null },
+        .parent = parent_expected,
+    };
+    node_expected.children[0] = node_expected;
+    sibling_expected.* = .{
+        .data = 15,
+        .color = .Black,
+        .children = .{ null, far_expected },
+        .parent = parent_expected,
+    };
+    far_expected.* = .{
+        .data = 20,
+        .color = .Black,
+        .children = .{ null, null },
+        .parent = sibling_expected,
+    };
+
+    var tree = Tree.init(&allocator);
+    tree.root = parent;
+
+    tree.removeFix(node);
+
+    try Tree.expectSameTree(tree.root, parent_expected);
+}
+
+test "removeFix case 3: black sibling, red near child" {
+    const Tree = RedBlackTree(i32, i32Order, false);
+    var allocator = std.testing.allocator;
+
+    const parent = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(parent, &allocator);
+    const node = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(node, &allocator);
+    const sibling = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(sibling, &allocator);
+    const near = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(near, &allocator);
+
+    const parent_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(parent_expected, &allocator);
+    const node_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(node_expected, &allocator);
+    const sibling_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(sibling_expected, &allocator);
+    const near_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(near_expected, &allocator);
+
+    parent.* = .{
+        .data = 10,
+        .color = .Black,
+        .children = .{ node, sibling },
+        .parent = null,
+    };
+    node.* = .{
+        .data = 5,
+        .color = .Black,
+        .children = .{ null, null },
+        .parent = parent,
+    };
+    sibling.* = .{
+        .data = 15,
+        .color = .Black,
+        .children = .{ near, null },
+        .parent = parent,
+    };
+    near.* = .{
+        .data = 12,
+        .color = .Red,
+        .children = .{ null, null },
+        .parent = sibling,
+    };
+
+    sibling_expected.* = .{
+        .data = 12,
+        .color = .Black,
+        .children = .{ null, sibling_expected },
+        .parent = parent_expected,
+    };
+    sibling_expected.children[1] = sibling_expected;
+    parent_expected.* = .{
+        .data = 10,
+        .color = .Black,
+        .children = .{ node_expected, sibling_expected },
+        .parent = null,
+    };
+    node_expected.* = .{
+        .data = 5,
+        .color = .Black,
+        .children = .{ null, null },
+        .parent = parent_expected,
+    };
+
+    var tree = Tree.init(&allocator);
+    tree.root = parent;
+
+    tree.removeFix(node);
+
+    try Tree.expectSameTree(tree.root, parent_expected);
+}
+
+test "removeFix case 4: black sibling, black children" {
+    const Tree = RedBlackTree(i32, i32Order, false);
+    var allocator = std.testing.allocator;
+
+    const parent = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(parent, &allocator);
+    const node = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(node, &allocator);
+    const sibling = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(sibling, &allocator);
+
+    const parent_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(parent_expected, &allocator);
+    const node_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(node_expected, &allocator);
+    const sibling_expected = try Tree.testCreateNode(&allocator);
+    defer Tree.testDestroyNode(sibling_expected, &allocator);
+
+    parent.* = .{
+        .data = 10,
+        .color = .Black,
+        .children = .{ node, sibling },
+        .parent = null,
+    };
+    node.* = .{
+        .data = 5,
+        .color = .Black,
+        .children = .{ null, null },
+        .parent = parent,
+    };
+    sibling.* = .{
+        .data = 15,
+        .color = .Black,
+        .children = .{ null, null },
+        .parent = parent,
+    };
+
+    parent_expected.* = .{
+        .data = 10,
+        .color = .Black,
+        .children = .{ node_expected, sibling_expected },
+        .parent = null,
+    };
+    node_expected.* = .{
+        .data = 5,
+        .color = .Black,
+        .children = .{ null, null },
+        .parent = parent_expected,
+    };
+    sibling_expected.* = .{
+        .data = 15,
+        .color = .Red,
+        .children = .{ null, null },
+        .parent = parent_expected,
+    };
+
+    var tree = Tree.init(&allocator);
+    tree.root = parent;
+
+    tree.removeFix(node);
+
+    try Tree.expectSameTree(tree.root, parent_expected);
+}
+
+test "insert remove insert cycles maintain red-black tree invariants" {
+    var allocator = std.testing.allocator;
+
+    const Tree = RedBlackTree(i32, i32Order, false);
+
+    var tree = Tree.init(&allocator);
+    defer tree.deinit();
+
+    // Insert initial batch
+    const initial_values = [_]i32{ 10, 5, 15, 3, 7, 12, 18, 1, 4, 6, 8, 11, 13, 16, 20 };
+    for (initial_values) |val| {
+        try tree.insert(val);
+    }
+
+    // Remove some nodes
+    const to_remove_1 = [_]i32{ 3, 15, 8, 1 };
+    for (to_remove_1) |val| {
+        try tree.remove(val);
+    }
+
+    // Insert more nodes
+    const to_insert_2 = [_]i32{ 2, 9, 14, 17, 25, 30 };
+    for (to_insert_2) |val| {
+        try tree.insert(val);
+    }
+
+    // Remove more nodes
+    const to_remove_2 = [_]i32{ 7, 12, 20, 2 };
+    for (to_remove_2) |val| {
+        try tree.remove(val);
+    }
+
+    // Final insert batch
+    const to_insert_3 = [_]i32{ 22, 26, 35, 40, 45 };
+    for (to_insert_3) |val| {
+        try tree.insert(val);
+    }
+
+    // Validate red-black tree invariants
+    if (tree.root) |root| {
+        // Invariant 1: Root is black
+        try std.testing.expect(root.color == .Black);
+
+        // Validate all invariants
+        const result = Tree.validateRedBlackTree(
+            root,
+            null,
+            null,
+        );
+        try std.testing.expect(result.valid);
+    }
+
+    // Verify expected elements are present
+    const expected_present = [_]i32{ 10, 5, 4, 6, 11, 13, 16, 18, 9, 14, 17, 25, 30, 26, 22, 35, 40, 45 };
+    for (expected_present) |val| {
+        try std.testing.expect(tree.contains(val));
+    }
+
+    // Verify removed elements are not present
+    const expected_absent = [_]i32{ 3, 15, 8, 1, 7, 12, 20, 2 };
+    for (expected_absent) |val| {
+        try std.testing.expect(!tree.contains(val));
     }
 }
