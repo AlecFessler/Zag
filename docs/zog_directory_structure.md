@@ -1,20 +1,20 @@
-# 🗂️ Zog Project Directory Structure
+# 🗂️ Zag Project Directory Structure
 
-This document explains the structure and naming conventions of the Zog kernel project.
+This document explains the structure and naming conventions of the Zag kernel project.
 
 ---
 
 ## Root-Level Layout
 
 ```
-Zog/
+Zag/
 ├── build.zig         # Zig build script for building the kernel and ISO
 ├── linker.ld         # Linker script used to control kernel memory layout
 ├── docs/             # Project documentation (like this file)
 ├── iso/              # Build output for bootable ISO image
 ├── kernel/           # Kernel source code
 ├── zig-out/          # Zig's default build output directory
-├── Zog.iso        # Final bootable ISO (copied here from `iso/`)
+├── Zag.iso        # Final bootable ISO (copied here from `iso/`)
 ```
 
 ---
