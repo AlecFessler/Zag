@@ -4,10 +4,10 @@
 
 const std = @import("std");
 
-const console = @import("console.zig");
+const console = @import("arch/x86_64/vga.zig");
 const bumpalloc = @import("memory/bump_allocator.zig");
-const multiboot = @import("arch/x86_64/multiboot.zig");
-const paging = @import("memory/paging.zig");
+const multiboot = @import("boot/grub/multiboot.zig");
+const paging = @import("arch/x86_64/paging.zig");
 const physmemmgr = @import("memory/physical_memory_manager.zig");
 const virtmemmgr = @import("memory/virtual_memory_manager.zig");
 

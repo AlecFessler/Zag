@@ -53,7 +53,7 @@ pub fn build(b: *std.Build) void {
 
     const iso = b.addSystemCommand(&[_][]const u8{
         "grub-mkrescue", "-o",
-        "KosmOS.iso",    "iso/",
+        "Zog.iso",       "iso/",
     });
 
     const iso_step = b.step("iso", "Create bootable ISO");
@@ -63,7 +63,7 @@ pub fn build(b: *std.Build) void {
     const vm_cmd = b.addSystemCommand(&[_][]const u8{
         "qemu-system-x86_64",
         "-cdrom",
-        "KosmOS.iso",
+        "Zog.iso",
     });
 
     const vm_step = b.step("boot", "Run in QEMU");
