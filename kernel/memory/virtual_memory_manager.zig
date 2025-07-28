@@ -1,5 +1,6 @@
 const std = @import("std");
 
+/// Delegating allocator. Requires a backing allocator, can also act as a backing allocator.
 pub const VirtualMemoryManager = struct {
     backing_allocator: *std.mem.Allocator,
 

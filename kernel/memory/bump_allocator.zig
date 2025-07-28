@@ -1,5 +1,6 @@
 const std = @import("std");
 
+/// Owning allocator. Manages a contiguous address space, does not take a backing allocator, can act as a backing allocator;
 pub const BumpAllocator = struct {
     start_addr: usize,
     free_addr: usize,
