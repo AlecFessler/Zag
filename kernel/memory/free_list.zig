@@ -16,7 +16,7 @@ pub fn FreeList(comptime T: type) type {
         }
 
         pub fn push(self: *Self, item: *T) void {
-            @memset(std.mem.asBytes(item), 0);
+            @memset(std.mem.asBytes(item.*), 0);
             const node: *FreeNode = @alignCast(@ptrCast(item));
             node.next = self.next;
             self.next = node;
@@ -25,7 +25,7 @@ pub fn FreeList(comptime T: type) type {
         pub fn pop(self: *Self) ?*T {
             const next = self.next orelse return null;
             self.next = next.next;
-            @memset(std.mem.asBytes(next), 0);
+            @memset(std.mem.asBytes(next.*), 0);
             return @ptrCast(next);
         }
     };
