@@ -71,6 +71,8 @@ pub fn RedBlackTree(
 
             fn getSibling(self: *Node) ?*Node {
                 if (self.parent) |p| {
+                    std.debug.assert(p.getChild(.left) == self or p.getChild(.right) == self);
+
                     return if (self == p.getChild(Direction.left)) p.getChild(Direction.right) else p.getChild(Direction.left);
                 }
                 return null;
@@ -86,6 +88,9 @@ pub fn RedBlackTree(
             fn getGrandparent(self: *Node) ?*Node {
                 if (self.parent) |p| {
                     if (p.parent) |gp| {
+                        std.debug.assert(gp.getChild(.left) == p or gp.getChild(.right) == p);
+                        std.debug.assert(p.getChild(.left) == self or p.getChild(.right) == self);
+
                         return gp;
                     }
                 }
@@ -375,6 +380,8 @@ pub fn RedBlackTree(
             new_parent.parent = pivot.parent;
 
             if (pivot.parent) |p| {
+                std.debug.assert(p.getChild(.left) == pivot or p.getChild(.right) == pivot);
+
                 const pivot_direction = if (p.getChild(Direction.left) == pivot) Direction.left else Direction.right;
                 p.setChild(new_parent, pivot_direction);
             } else {
