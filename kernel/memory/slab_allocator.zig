@@ -36,6 +36,11 @@ pub fn SlabAllocator(
         free_list: FreeList,
         backing_allocator: *std.mem.Allocator,
 
+        /// #Assertions: none.
+        /// Fewer than 2: parameter invariants are enforced at the SlabAllocator comptime gate
+        /// (stack_bootstrap/stack_size/allocation_chunk_size). Prepopulation failures propagate via
+        /// `try` (local and sufficient). Counting or validating freelist population here would be
+        /// non-local duplication of FreeList guarantees and adds little signal beyond unit tests.
         pub fn init(backing_allocator: *std.mem.Allocator) !Self {
             var self: Self = .{
                 .allocations = if (DBG) 0,
@@ -57,6 +62,10 @@ pub fn SlabAllocator(
             return self;
         }
 
+        /// #Assertions: leak guard — `allocations == 0` ensures no outstanding slabs at teardown
+        /// Fewer than 2: the key invariant (no leaks) is already asserted via `allocations`.
+        /// Additional lifetime or structural checks (e.g. double deinit or stack membership scans)
+        /// are either benign or non-local and belong in tests.
         pub fn deinit(self: *Self) void {
             if (DBG) std.debug.assert(self.allocations == 0);
 
@@ -77,6 +86,8 @@ pub fn SlabAllocator(
             }
         }
 
+        /// #Assertions: none.
+        /// Fewer than 2: stack path bounds are tautological (the branch condition is `stack_idx < stack_size`), and freelist correctness/zeroization are FreeList concerns. OOM is surfaced via the error return, not an assertion. Ownership/origin misuse is better detected at `destroy` time.
         pub fn create(self: *Self) !*T {
             if (stack_bootstrap and self.stack_idx < stack_size) {
                 const slab = &self.stack_array[self.stack_idx];
@@ -96,9 +107,14 @@ pub fn SlabAllocator(
             }
         }
 
+        /// #Assertions:
+        /// 1) Allocation underflow guard — `allocations >= 0` (detects counter drift and some double frees).
+        /// 2) Immediate double-free tripwire — compare `slab` against the freelist head and assert inequality;
+        ///    this catches the most common repeat-free case at O(1) and much closer to the misuse.
         pub fn destroy(self: *Self, slab: *T) void {
             if (DBG) self.allocations -= 1;
             if (DBG) std.debug.assert(self.allocations >= 0);
+            std.debug.assert(slab != self.free_list.next);
             self.free_list.push(slab);
         }
     };
