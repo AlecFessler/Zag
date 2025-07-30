@@ -36,11 +36,6 @@ pub fn SlabAllocator(
         free_list: FreeList,
         backing_allocator: *std.mem.Allocator,
 
-        /// #Assertions: none.
-        /// Fewer than 2: parameter invariants are enforced at the SlabAllocator comptime gate
-        /// (stack_bootstrap/stack_size/allocation_chunk_size). Prepopulation failures propagate via
-        /// `try` (local and sufficient). Counting or validating freelist population here would be
-        /// non-local duplication of FreeList guarantees and adds little signal beyond unit tests.
         pub fn init(backing_allocator: *std.mem.Allocator) !Self {
             var self: Self = .{
                 .allocations = if (DBG) 0,
@@ -62,10 +57,6 @@ pub fn SlabAllocator(
             return self;
         }
 
-        /// #Assertions: leak guard — `allocations == 0` ensures no outstanding slabs at teardown
-        /// Fewer than 2: the key invariant (no leaks) is already asserted via `allocations`.
-        /// Additional lifetime or structural checks (e.g. double deinit or stack membership scans)
-        /// are either benign or non-local and belong in tests.
         pub fn deinit(self: *Self) void {
             if (DBG) std.debug.assert(self.allocations == 0);
 
@@ -86,35 +77,98 @@ pub fn SlabAllocator(
             }
         }
 
-        /// #Assertions: none.
-        /// Fewer than 2: stack path bounds are tautological (the branch condition is `stack_idx < stack_size`), and freelist correctness/zeroization are FreeList concerns. OOM is surfaced via the error return, not an assertion. Ownership/origin misuse is better detected at `destroy` time.
-        pub fn create(self: *Self) !*T {
+        pub fn allocator(self: *Self) std.mem.Allocator {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .alloc = alloc,
+                    .resize = resize,
+                    .remap = remap,
+                    .free = free,
+                },
+            };
+        }
+
+        fn alloc(
+            ptr: *anyopaque,
+            len: usize,
+            alignment: std.mem.Alignment,
+            ret_addr: usize,
+        ) ?[*]u8 {
+            _ = ret_addr;
+
+            std.debug.assert(alignment.toByteUnits() == @as(usize, @intCast(@alignOf(T))));
+            std.debug.assert(len == @as(usize, @intCast(@sizeOf(T))));
+
+            const self: *Self = @alignCast(@ptrCast(ptr));
+
             if (stack_bootstrap and self.stack_idx < stack_size) {
                 const slab = &self.stack_array[self.stack_idx];
                 self.stack_idx += 1;
                 if (DBG) self.allocations += 1;
-                return slab;
+                return @ptrCast(slab);
             }
 
             const maybe_slab = self.free_list.pop();
             if (maybe_slab) |slab| {
                 if (DBG) self.allocations += 1;
-                return slab;
+                return @ptrCast(slab);
             } else {
-                const new_slab = try self.backing_allocator.create(T);
+                const new_slab = self.backing_allocator.create(T) catch return null;
                 if (DBG) self.allocations += 1;
-                return new_slab;
+                return @ptrCast(new_slab);
             }
         }
 
-        /// #Assertions:
-        /// 1) Allocation underflow guard — `allocations >= 0` (detects counter drift and some double frees).
-        /// 2) Immediate double-free tripwire — compare `slab` against the freelist head and assert inequality;
-        ///    this catches the most common repeat-free case at O(1) and much closer to the misuse.
-        pub fn destroy(self: *Self, slab: *T) void {
+        // no op
+        fn resize(
+            ptr: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            new_len: usize,
+            ret_addr: usize,
+        ) bool {
+            _ = ptr;
+            _ = memory;
+            _ = alignment;
+            _ = new_len;
+            _ = ret_addr;
+            return false;
+        }
+
+        // no op
+        fn remap(
+            ptr: *anyopaque,
+            memory: []u8,
+            alignment: std.mem.Alignment,
+            new_len: usize,
+            ret_addr: usize,
+        ) ?[*]u8 {
+            _ = ptr;
+            _ = memory;
+            _ = alignment;
+            _ = new_len;
+            _ = ret_addr;
+            return null;
+        }
+
+        fn free(
+            ptr: *anyopaque,
+            buf: []u8,
+            alignment: std.mem.Alignment,
+            ret_addr: usize,
+        ) void {
+            _ = alignment;
+            _ = ret_addr;
+            const self: *Self = @alignCast(@ptrCast(ptr));
+            const slab: *T = @alignCast(@ptrCast(buf.ptr));
+
             if (DBG) self.allocations -= 1;
             if (DBG) std.debug.assert(self.allocations >= 0);
-            std.debug.assert(slab != self.free_list.next);
+            if (DBG and self.free_list.next != null) {
+                std.debug.assert(slab != @as(*T, @ptrCast(self.free_list.next.?)));
+            }
+
             self.free_list.push(slab);
         }
     };
@@ -133,21 +187,22 @@ test "stack exhaustion and transition" {
         8,
     ).init(&test_allocator);
     defer slab_allocator.deinit();
+    const allocator = slab_allocator.allocator();
 
     var stack_objs: [stack_size]*TestType = undefined;
     for (0..stack_size) |i| {
-        const obj = try slab_allocator.create();
+        const obj = try allocator.create(TestType);
         obj.* = .{ .data = i, .pad = 0 };
         stack_objs[i] = obj;
     }
 
     try std.testing.expect(slab_allocator.free_list.next == null);
 
-    const heap_obj = try slab_allocator.create();
+    const heap_obj = try allocator.create(TestType);
     heap_obj.* = .{ .data = 999, .pad = 0 };
 
-    for (stack_objs) |ptr| slab_allocator.destroy(ptr);
-    slab_allocator.destroy(heap_obj);
+    for (stack_objs) |ptr| allocator.destroy(ptr);
+    allocator.destroy(heap_obj);
 }
 
 test "stack bootstrap stress test" {
@@ -160,6 +215,7 @@ test "stack bootstrap stress test" {
         16,
     ).init(&test_allocator);
     defer slab_allocator.deinit();
+    const allocator = slab_allocator.allocator();
 
     const stack_start = @intFromPtr(&slab_allocator.stack_array[0]);
     const stack_end = stack_start + stack_size * @sizeOf(TestType);
@@ -175,7 +231,7 @@ test "stack bootstrap stress test" {
     var objs: [100]*TestType = undefined;
 
     for (0..100) |i| {
-        const obj = try slab_allocator.create();
+        const obj = try allocator.create(TestType);
         obj.* = .{ .data = i, .pad = 0 };
         objs[i] = obj;
 
@@ -189,7 +245,7 @@ test "stack bootstrap stress test" {
     try std.testing.expect(stack_count == stack_size);
     try std.testing.expect(heap_count == 100 - stack_size);
 
-    for (objs) |ptr| slab_allocator.destroy(ptr);
+    for (objs) |ptr| allocator.destroy(ptr);
 }
 
 test "allocation failure with exhausted stack" {
@@ -202,10 +258,11 @@ test "allocation failure with exhausted stack" {
         8,
     ).init(&test_allocator);
     defer slab_allocator.deinit();
+    const allocator = slab_allocator.allocator();
 
     var stack_objs: [stack_size]*TestType = undefined;
     for (0..stack_size) |i| {
-        const obj = try slab_allocator.create();
+        const obj = try allocator.create(TestType);
         stack_objs[i] = obj;
     }
 
@@ -216,12 +273,12 @@ test "allocation failure with exhausted stack" {
     var failing_alloc = failing_allocator.allocator();
     slab_allocator.backing_allocator = &failing_alloc;
 
-    const result = slab_allocator.create();
+    const result = allocator.create(TestType);
     try std.testing.expect(result == error.OutOfMemory);
 
     slab_allocator.backing_allocator = &test_allocator;
 
-    for (stack_objs) |ptr| slab_allocator.destroy(ptr);
+    for (stack_objs) |ptr| allocator.destroy(ptr);
 }
 
 test "basic create destroy cycle" {
@@ -233,27 +290,28 @@ test "basic create destroy cycle" {
         16,
     ).init(&test_allocator);
     defer slab_allocator.deinit();
+    const allocator = slab_allocator.allocator();
 
-    const obj1 = try slab_allocator.create();
+    const obj1 = try allocator.create(TestType);
     obj1.* = .{ .data = 42, .pad = 0 };
 
-    const obj2 = try slab_allocator.create();
+    const obj2 = try allocator.create(TestType);
     obj2.* = .{ .data = 84, .pad = 0 };
 
     try std.testing.expect(obj1.data == 42);
     try std.testing.expect(obj2.data == 84);
 
-    slab_allocator.destroy(obj1);
-    slab_allocator.destroy(obj2);
+    allocator.destroy(obj1);
+    allocator.destroy(obj2);
 
-    const obj3 = try slab_allocator.create();
-    const obj4 = try slab_allocator.create();
+    const obj3 = try allocator.create(TestType);
+    const obj4 = try allocator.create(TestType);
 
     try std.testing.expect(obj3 == obj2);
     try std.testing.expect(obj4 == obj1);
 
-    slab_allocator.destroy(obj3);
-    slab_allocator.destroy(obj4);
+    allocator.destroy(obj3);
+    allocator.destroy(obj4);
 }
 
 test "initial freelist population" {
@@ -265,21 +323,22 @@ test "initial freelist population" {
         5,
     ).init(&test_allocator);
     defer slab_allocator.deinit();
+    const allocator = slab_allocator.allocator();
 
     var objs: [6]*TestType = undefined;
 
     for (0..5) |i| {
-        const obj = try slab_allocator.create();
+        const obj = try allocator.create(TestType);
         obj.* = .{ .data = i, .pad = 0 };
         objs[i] = obj;
     }
 
     try std.testing.expect(slab_allocator.free_list.next == null);
 
-    objs[5] = try slab_allocator.create();
+    objs[5] = try allocator.create(TestType);
     objs[5].* = .{ .data = 999, .pad = 0 };
 
-    for (objs) |ptr| slab_allocator.destroy(ptr);
+    for (objs) |ptr| allocator.destroy(ptr);
 }
 
 test "memory leak detection" {
@@ -291,14 +350,15 @@ test "memory leak detection" {
         32,
     ).init(&test_allocator);
     defer slab_allocator.deinit();
+    const allocator = slab_allocator.allocator();
 
     var objs: [200]*TestType = undefined;
     for (0..200) |i| {
-        const obj = try slab_allocator.create();
+        const obj = try allocator.create(TestType);
         obj.* = .{ .data = i, .pad = 0 };
         objs[i] = obj;
         try std.testing.expect(obj.data == i);
     }
 
-    for (objs) |ptr| slab_allocator.destroy(ptr);
+    for (objs) |ptr| allocator.destroy(ptr);
 }
