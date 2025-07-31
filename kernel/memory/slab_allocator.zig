@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const freelist = @import("free_list.zig");
+const stack_free_list = @import("stack_free_list.zig");
 
 const DBG = builtin.mode == .Debug;
 
@@ -21,7 +21,7 @@ pub fn SlabAllocator(
 
     return struct {
         const Self = @This();
-        const FreeList = freelist.FreeList(T);
+        const FreeList = stack_free_list.StackFreeList(T);
 
         /// Verifies that all allocated memory is returned before deinit is called on this.
         /// This is necessary because if this were to not be the case, we could handle it by
@@ -174,7 +174,7 @@ pub fn SlabAllocator(
     };
 }
 
-// Large enough for FreeList type requirements
+// Large enough for StackFreeList type requirements
 const TestType = struct { data: u64, pad: u64 };
 
 test "stack exhaustion and transition" {

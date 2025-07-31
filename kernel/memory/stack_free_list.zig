@@ -4,7 +4,7 @@ const builtin = @import("builtin");
 const DBG = builtin.mode == .Debug;
 const DBG_MAGIC = 0x0DEAD2A6DEAD2A60;
 
-pub fn FreeList(comptime T: type) type {
+pub fn StackFreeList(comptime T: type) type {
     return struct {
         const Self = @This();
 
@@ -23,8 +23,6 @@ pub fn FreeList(comptime T: type) type {
             if (!DBG) std.debug.assert(@sizeOf(FreeNode) == @sizeOf(?*FreeNode));
         }
 
-        /// #Assertions: `@alignCast` enforces overlay alignment (non-trivial). Debug canary is written here; asserting the write would be silly.
-        /// Fewer than 2: head-dup/scan checks are either trivial (local equality) or non-local (membership/cycles).
         pub fn push(self: *Self, item: *T) void {
             zeroItem(@ptrCast(item));
             const node: *FreeNode = @alignCast(@ptrCast(item));
@@ -33,8 +31,6 @@ pub fn FreeList(comptime T: type) type {
             self.next = node;
         }
 
-        /// #Assertions: Debug canary equality guards UAF/corruption at reuse.
-        /// Fewer than 2: extra checks here (verifying the wipe) are low-value; list scans are better suited for test cases.
         pub fn pop(self: *Self) ?*T {
             const item = self.next orelse return null;
             if (DBG) std.debug.assert(item.dbg_magic == DBG_MAGIC);
@@ -43,8 +39,6 @@ pub fn FreeList(comptime T: type) type {
             return @ptrCast(item);
         }
 
-        /// #Assertions: none. Pointer validity/alignment are enforced by the callers
-        /// (`@alignCast` in push). Verifying the wipe is low-value.
         fn zeroItem(item: *T) void {
             const raw: [*]u8 = @ptrCast(item);
             const len = @sizeOf(T);
@@ -56,12 +50,12 @@ pub fn FreeList(comptime T: type) type {
 const TestType = struct { data: u64, pad: u64 };
 
 test "pop returns null when empty" {
-    var freelist = FreeList(TestType){};
+    var freelist = StackFreeList(TestType){};
     try std.testing.expect(freelist.pop() == null);
 }
 
 test "push pop returns original" {
-    var freelist = FreeList(TestType){};
+    var freelist = StackFreeList(TestType){};
     var value = TestType{ .data = 42, .pad = 0 };
 
     freelist.push(&value);
@@ -72,7 +66,7 @@ test "push pop returns original" {
 }
 
 test "push push pop pop returns LIFO order" {
-    var freelist = FreeList(TestType){};
+    var freelist = StackFreeList(TestType){};
     var value1 = TestType{ .data = 1, .pad = 0 };
     var value2 = TestType{ .data = 2, .pad = 0 };
 
@@ -93,7 +87,7 @@ test "works with larger types" {
         pad: u64,
     };
 
-    var freelist = FreeList(LargeType){};
+    var freelist = StackFreeList(LargeType){};
     var item1 = LargeType{ .data = [_]u8{1} ** 16, .pad = 0 };
     var item2 = LargeType{ .data = [_]u8{2} ** 16, .pad = 0 };
 
@@ -106,7 +100,7 @@ test "works with larger types" {
 }
 
 test "mixed push pop operations" {
-    var freelist = FreeList(TestType){};
+    var freelist = StackFreeList(TestType){};
     var values: [5]TestType = .{
         .{ .data = 10, .pad = 0 },
         .{ .data = 20, .pad = 0 },
@@ -132,7 +126,7 @@ test "mixed push pop operations" {
 }
 
 test "push with debug canary validated in walk" {
-    var freelist = FreeList(TestType){};
+    var freelist = StackFreeList(TestType){};
     var values: [5]TestType = .{
         .{ .data = 1, .pad = 0 },
         .{ .data = 2, .pad = 0 },
@@ -155,7 +149,7 @@ test "push with debug canary validated in walk" {
 }
 
 test "interleaved stack and heap push/pop" {
-    var freelist = FreeList(TestType){};
+    var freelist = StackFreeList(TestType){};
     var stack_items: [2]TestType = .{
         .{ .data = 1, .pad = 0 },
         .{ .data = 2, .pad = 0 },
