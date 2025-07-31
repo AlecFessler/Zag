@@ -91,7 +91,7 @@ pub const BuddyAllocator = struct {
             // check if this order needs more slots than order 10 did due to leftover bytes.
             // order 10 will not enter this branch because leftover bytes is defined
             // as total bytes mod order 10 block size
-            if (leftover_bytes > block_size) {
+            if (leftover_bytes >= block_size) {
                 const num_extra = leftover_bytes / block_size;
                 alloc_size += num_extra;
 
