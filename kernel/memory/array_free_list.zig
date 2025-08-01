@@ -38,6 +38,16 @@ pub fn ArrayFreeList(comptime T: type) type {
             self.top -= 1;
             return item;
         }
+
+        pub fn peek(self: *Self) ?T {
+            std.debug.assert(self.top < self.array.len);
+            if (self.top == -1) return null;
+
+            // casting a negative isize to usize would overflow the slice
+            // and it's assumed to always be greater than 0 here
+            std.debug.assert(self.top >= 0);
+            return self.array[@intCast(self.top)];
+        }
     };
 }
 
@@ -107,4 +117,26 @@ test "mixed push pop operations" {
     try std.testing.expect(freelist.pop().? == values[3]);
     try std.testing.expect(freelist.pop().? == values[0]);
     try std.testing.expect(freelist.pop() == null);
+}
+
+test "peek returns top element without popping" {
+    const allocator = std.testing.allocator;
+    const slice = try allocator.alloc(usize, 2);
+    defer allocator.free(slice);
+    var freelist = ArrayFreeList(usize).init(slice);
+
+    try std.testing.expect(freelist.peek() == null);
+
+    freelist.push(123);
+    try std.testing.expect(freelist.peek().? == 123);
+    try std.testing.expect(freelist.peek().? == 123);
+
+    freelist.push(456);
+    try std.testing.expect(freelist.peek().? == 456);
+
+    try std.testing.expect(freelist.pop().? == 456);
+    try std.testing.expect(freelist.peek().? == 123);
+
+    _ = freelist.pop();
+    try std.testing.expect(freelist.peek() == null);
 }
