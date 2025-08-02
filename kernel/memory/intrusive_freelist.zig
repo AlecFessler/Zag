@@ -14,7 +14,7 @@ pub fn IntrusiveFreeList(comptime T: type) type {
 
     return struct {
         const Self = @This();
-        const FreeList = fl.FreeList(T);
+        pub const FreeList = fl.FreeList(T);
 
         next: ?*FreeNode = null,
 
