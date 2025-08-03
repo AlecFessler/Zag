@@ -44,7 +44,7 @@ pub fn Intrusive2WayFreeList(comptime T: type) type {
             self.head = addr.next;
             addr.prev = null;
             zeroItem(@ptrCast(addr));
-            return @ptrCast(addr);
+            return @alignCast(@ptrCast(addr));
         }
 
         /// This function primarily exists for use by the buddy allocator

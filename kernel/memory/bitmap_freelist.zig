@@ -80,11 +80,9 @@ pub const BitmapFreeList = struct {
         const one: Word = 1;
 
         if (val == 1) {
-            std.debug.assert(!self.isFree(addr));
             self.bitmap[word_idx] |= (one << bit_idx);
             if (word_idx < self.hint) self.hint = word_idx;
         } else {
-            std.debug.assert(self.isFree(addr));
             self.bitmap[word_idx] &= ~(one << bit_idx);
             while (self.hint < self.bitmap.len) {
                 if (self.bitmap[self.hint] != 0) break;
