@@ -19,13 +19,13 @@ pub fn Intrusive2WayFreeList(comptime T: type) type {
             /// dbg magic helps detect use after free in the assertion in pop()
             /// by ensuring that nodes are not written to while in the free list
             dbg_magic: if (DBG) u64 else void,
-            next: ?*FreeNode align(@alignOf(ValType)),
-            prev: ?*FreeNode align(@alignOf(ValType)),
+            next: ?*FreeNode = null,
+            prev: ?*FreeNode = null,
         };
 
         comptime {
             std.debug.assert(@sizeOf(ValType) >= @sizeOf(FreeNode));
-            std.debug.assert(@alignOf(ValType) == @alignOf(FreeNode));
+            std.debug.assert(@alignOf(ValType) >= @alignOf(FreeNode));
         }
 
         pub fn push(self: *Self, addr: T) void {
