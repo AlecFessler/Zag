@@ -1,8 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const fl = @import("freelist.zig");
-
 const DBG = builtin.mode == .Debug;
 const DBG_MAGIC = 0x0DEAD2A6DEAD2A60;
 
@@ -14,7 +12,6 @@ pub fn IntrusiveFreeList(comptime T: type) type {
 
     return struct {
         const Self = @This();
-        pub const FreeList = fl.FreeList(T);
 
         next: ?*FreeNode = null,
 
@@ -30,28 +27,7 @@ pub fn IntrusiveFreeList(comptime T: type) type {
             std.debug.assert(@alignOf(ValType) == @alignOf(FreeNode));
         }
 
-        pub fn freelist(self: *Self) FreeList {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .getNextFree = pop,
-                    .setFree = push,
-                    .isFree = isFree,
-                },
-            };
-        }
-
-        fn pop(ptr: *anyopaque) ?[*]u8 {
-            var self: *Self = @alignCast(@ptrCast(ptr));
-            const addr = self.next orelse return null;
-            if (DBG) std.debug.assert(addr.dbg_magic == DBG_MAGIC);
-            self.next = addr.next;
-            zeroItem(@ptrCast(addr));
-            return @ptrCast(addr);
-        }
-
-        fn push(ptr: *anyopaque, addr: [*]u8) void {
-            var self: *Self = @alignCast(@ptrCast(ptr));
+        fn push(self: *Self, addr: T) void {
             zeroItem(@ptrCast(addr));
             const node: *FreeNode = @alignCast(@ptrCast(addr));
             if (DBG) node.dbg_magic = DBG_MAGIC;
@@ -59,12 +35,12 @@ pub fn IntrusiveFreeList(comptime T: type) type {
             self.next = node;
         }
 
-        fn isFree(ptr: *anyopaque, addr: [*]u8) bool {
-            // this is not implemeneted because it's an O(n) operation to search
-            // if you need to do this operation, consider the bitmap freelist
-            _ = ptr;
-            _ = addr;
-            unreachable;
+        fn pop(self: *Self) ?T {
+            const addr = self.next orelse return null;
+            if (DBG) std.debug.assert(addr.dbg_magic == DBG_MAGIC);
+            self.next = addr.next;
+            zeroItem(@ptrCast(addr));
+            return @ptrCast(addr);
         }
 
         fn zeroItem(item: [*]u8) void {
@@ -77,41 +53,36 @@ pub fn IntrusiveFreeList(comptime T: type) type {
 const TestType = struct { data: u64, pad: u64 };
 
 test "pop returns null when empty" {
-    var stack = IntrusiveFreeList(*TestType){};
-    var free_list = stack.freelist();
-
-    try std.testing.expect(free_list.getNextFree() == null);
+    const FreeList = IntrusiveFreeList(*TestType);
+    var freelist = FreeList{};
+    try std.testing.expect(freelist.pop() == null);
 }
 
 test "push pop returns original" {
-    var stack = IntrusiveFreeList(*TestType){};
-    var free_list = stack.freelist();
-
+    const FreeList = IntrusiveFreeList(*TestType);
+    var freelist = FreeList{};
     var value = TestType{ .data = 42, .pad = 0 };
 
-    free_list.setFree(&value);
-    const result = free_list.getNextFree().?;
-
+    freelist.push(&value);
+    const result = freelist.pop().?;
     try std.testing.expect(result == &value);
-    try std.testing.expect(free_list.getNextFree() == null);
+    try std.testing.expect(freelist.pop() == null);
 }
 
 test "push push pop pop returns LIFO order" {
-    var stack = IntrusiveFreeList(*TestType){};
-    var free_list = stack.freelist();
-
+    const FreeList = IntrusiveFreeList(*TestType);
+    var freelist = FreeList{};
     var value1 = TestType{ .data = 1, .pad = 0 };
     var value2 = TestType{ .data = 2, .pad = 0 };
 
-    free_list.setFree(&value1);
-    free_list.setFree(&value2);
+    freelist.push(&value1);
+    freelist.push(&value2);
 
-    const first = free_list.getNextFree().?;
-    const second = free_list.getNextFree().?;
-
+    const first = freelist.pop().?;
+    const second = freelist.pop().?;
     try std.testing.expect(first == &value2);
     try std.testing.expect(second == &value1);
-    try std.testing.expect(free_list.getNextFree() == null);
+    try std.testing.expect(freelist.pop() == null);
 }
 
 test "works with larger types" {
@@ -120,24 +91,22 @@ test "works with larger types" {
         pad: u64,
     };
 
-    var stack = IntrusiveFreeList(*LargeType){};
-    var free_list = stack.freelist();
-
+    const FreeList = IntrusiveFreeList(*LargeType);
+    var freelist = FreeList{};
     var item1 = LargeType{ .data = [_]u8{1} ** 16, .pad = 0 };
     var item2 = LargeType{ .data = [_]u8{2} ** 16, .pad = 0 };
 
-    free_list.setFree(&item1);
-    free_list.setFree(&item2);
+    freelist.push(&item1);
+    freelist.push(&item2);
 
-    try std.testing.expect(free_list.getNextFree() == &item2);
-    try std.testing.expect(free_list.getNextFree() == &item1);
-    try std.testing.expect(free_list.getNextFree() == null);
+    try std.testing.expect(freelist.pop() == &item2);
+    try std.testing.expect(freelist.pop() == &item1);
+    try std.testing.expect(freelist.pop() == null);
 }
 
 test "mixed push pop operations" {
-    var stack = IntrusiveFreeList(*TestType){};
-    var free_list = stack.freelist();
-
+    const FreeList = IntrusiveFreeList(*TestType);
+    var freelist = FreeList{};
     var values: [5]TestType = .{
         .{ .data = 10, .pad = 0 },
         .{ .data = 20, .pad = 0 },
@@ -146,26 +115,25 @@ test "mixed push pop operations" {
         .{ .data = 50, .pad = 0 },
     };
 
-    free_list.setFree(&values[0]);
-    free_list.setFree(&values[1]);
-    free_list.setFree(&values[2]);
+    freelist.push(&values[0]);
+    freelist.push(&values[1]);
+    freelist.push(&values[2]);
 
-    try std.testing.expect(free_list.getNextFree().? == &values[2]);
-    try std.testing.expect(free_list.getNextFree().? == &values[1]);
+    try std.testing.expect(freelist.pop().? == &values[2]);
+    try std.testing.expect(freelist.pop().? == &values[1]);
 
-    free_list.setFree(&values[3]);
-    free_list.setFree(&values[4]);
+    freelist.push(&values[3]);
+    freelist.push(&values[4]);
 
-    try std.testing.expect(free_list.getNextFree().? == &values[4]);
-    try std.testing.expect(free_list.getNextFree().? == &values[3]);
-    try std.testing.expect(free_list.getNextFree().? == &values[0]);
-    try std.testing.expect(free_list.getNextFree() == null);
+    try std.testing.expect(freelist.pop().? == &values[4]);
+    try std.testing.expect(freelist.pop().? == &values[3]);
+    try std.testing.expect(freelist.pop().? == &values[0]);
+    try std.testing.expect(freelist.pop() == null);
 }
 
 test "push with debug canary validated in walk" {
-    var stack = IntrusiveFreeList(*TestType){};
-    var free_list = stack.freelist();
-
+    const FreeList = IntrusiveFreeList(*TestType);
+    var freelist = FreeList{};
     var values: [5]TestType = .{
         .{ .data = 1, .pad = 0 },
         .{ .data = 2, .pad = 0 },
@@ -175,12 +143,12 @@ test "push with debug canary validated in walk" {
     };
 
     inline for (0..5) |i| {
-        free_list.setFree(&values[i]);
+        freelist.push(&values[i]);
 
-        if (@import("builtin").mode == .Debug) {
-            var node = stack.next;
+        if (DBG) {
+            var node = freelist.next;
             while (node) |n| {
-                std.debug.assert(n.dbg_magic == 0x0DEAD2A6DEAD2A60);
+                std.debug.assert(n.dbg_magic == DBG_MAGIC);
                 node = n.next;
             }
         }
@@ -188,8 +156,8 @@ test "push with debug canary validated in walk" {
 }
 
 test "interleaved stack and heap push/pop" {
-    var stack = IntrusiveFreeList(*TestType){};
-    var free_list = stack.freelist();
+    const FreeList = IntrusiveFreeList(*TestType);
+    var freelist = FreeList{};
 
     var stack_items: [2]TestType = .{
         .{ .data = 1, .pad = 0 },
@@ -202,16 +170,16 @@ test "interleaved stack and heap push/pop" {
     heap_item1.* = .{ .data = 3, .pad = 0 };
     heap_item2.* = .{ .data = 4, .pad = 0 };
 
-    free_list.setFree(&stack_items[0]);
-    free_list.setFree(heap_item1);
-    free_list.setFree(&stack_items[1]);
-    free_list.setFree(heap_item2);
+    freelist.push(&stack_items[0]);
+    freelist.push(heap_item1);
+    freelist.push(&stack_items[1]);
+    freelist.push(heap_item2);
 
-    try std.testing.expect(free_list.getNextFree() == heap_item2);
-    try std.testing.expect(free_list.getNextFree() == &stack_items[1]);
-    try std.testing.expect(free_list.getNextFree() == heap_item1);
-    try std.testing.expect(free_list.getNextFree() == &stack_items[0]);
-    try std.testing.expect(free_list.getNextFree() == null);
+    try std.testing.expect(freelist.pop().? == heap_item2);
+    try std.testing.expect(freelist.pop().? == &stack_items[1]);
+    try std.testing.expect(freelist.pop().? == heap_item1);
+    try std.testing.expect(freelist.pop().? == &stack_items[0]);
+    try std.testing.expect(freelist.pop() == null);
 
     allocator.destroy(heap_item1);
     allocator.destroy(heap_item2);

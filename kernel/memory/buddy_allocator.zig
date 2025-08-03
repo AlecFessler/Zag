@@ -1,18 +1,18 @@
 const std = @import("std");
 
-const array_free_list = @import("array_free_list.zig");
+const bitmap_freelist = @import("bitmap_freelist.zig");
+
+const BitmapFreeList = bitmap_freelist.BitmapFreeList;
 
 const PAGE_SIZE = 4096;
 
-const FreeList = array_free_list.ArrayFreeList(usize);
-
-const Page = packed struct {
-    available: bool,
-    order: u7,
+const PagePairOrders = packed struct {
+    even: u4,
+    odd: u4,
 };
 
 comptime {
-    std.debug.assert(@sizeOf(Page) == 1);
+    std.debug.assert(@sizeOf(PagePairOrders) == 1);
 }
 
 const NUM_ORDERS = 11;
@@ -29,8 +29,8 @@ pub const BuddyAllocator = struct {
     end_addr: usize,
     /// Not a backing allocator, this is only used to allocate and free the page struct array
     allocator: *std.mem.Allocator,
-    pages: []Page,
-    free_lists: [NUM_ORDERS]FreeList,
+    page_pair_orders: []PagePairOrders,
+    freelists: [NUM_ORDERS]BitmapFreeList,
 
     pub fn init(
         self: *BuddyAllocator,
@@ -39,7 +39,6 @@ pub const BuddyAllocator = struct {
         allocator: *std.mem.Allocator,
     ) !void {
         std.debug.assert(end_addr > start_addr);
-
         const aligned_start = std.mem.alignForward(
             usize,
             start_addr,
@@ -50,7 +49,6 @@ pub const BuddyAllocator = struct {
             end_addr,
             PAGE_SIZE,
         );
-
         std.debug.assert(aligned_end > aligned_start);
 
         self.start_addr = aligned_start;
@@ -59,45 +57,41 @@ pub const BuddyAllocator = struct {
 
         const total_bytes = aligned_end - aligned_start;
         const num_pages = total_bytes / PAGE_SIZE;
+        const num_pairs = num_pages / 2;
 
-        self.pages = try allocator.alloc(Page, num_pages);
-        errdefer allocator.free(self.pages);
-        const zero_init: Page = .{
-            .available = false,
-            .order = 0,
-        };
-        @memset(self.pages, zero_init);
+        self.page_pair_orders = try allocator.alloc(PagePairOrders, num_pairs);
+        errdefer allocator.free(self.page_pair_orders);
 
-        // initializing with as many order 10 blocks as possible
-        var leftover_bytes = total_bytes % ORDERS[10];
-        const boundary = total_bytes - leftover_bytes;
-        const order_slices_size = boundary / PAGE_SIZE;
-
-        var current_addr: usize = 0;
+        var current_addr = start_addr;
         var decrement: isize = 10;
         while (decrement >= 0) : (decrement -= 1) {
             const order: usize = @intCast(decrement);
-            var num_extra: usize = 0;
             const block_size = ORDERS[order];
 
-            if (leftover_bytes > block_size) {
-                num_extra = leftover_bytes / block_size;
-                leftover_bytes = leftover_bytes % block_size;
-            }
-
-            const slice = try allocator.alloc(
-                usize,
-                order_slices_size + num_extra,
+            const num_bits = total_bytes / block_size;
+            const initially_free = false;
+            self.freelists[order] = try BitmapFreeList.init(
+                start_addr,
+                block_size,
+                num_bits,
+                initially_free,
+                allocator,
             );
-            errdefer allocator.free(slice);
-            self.free_lists[order] = FreeList.init(slice);
+            errdefer self.freelist[order].deinit();
 
             while (total_bytes - current_addr >= block_size) : (current_addr += block_size) {
-                const idx = current_addr / PAGE_SIZE;
-                self.pages[idx] = .{
-                    .available = true,
-                    .order = @intCast(order),
-                };
+                const freelist = self.freelists[order].freelist();
+                freelist.setFree(current_addr);
+
+                const page_idx = current_addr / PAGE_SIZE;
+                const pair_idx = page_idx / 2;
+                const is_odd = page_idx % 2 == 1;
+
+                if (is_odd) {
+                    self.page_pair_orders[pair_idx].odd = @intCast(order);
+                } else {
+                    self.page_pair_orders[pair_idx].even = @intCast(order);
+                }
             }
 
             std.debug.assert(current_addr <= total_bytes);
@@ -107,30 +101,10 @@ pub const BuddyAllocator = struct {
     }
 
     pub fn deinit(self: *BuddyAllocator) void {
-        self.allocator.free(self.pages);
-        for (&self.free_lists) |*free_list| {
-            self.allocator.free(free_list.array);
+        self.allocator.free(self.page_pair_orders);
+        for (&self.freelists) |*freelist| {
+            freelist.deinit();
         }
-    }
-
-    fn recursiveSplit(self: *BuddyAllocator, order: u7) ?usize {
-        std.debug.assert(order < 11);
-
-        const maybe_addr = self.free_lists[order].pop() orelse blk: {
-            if (order == 10) return null;
-            break :blk self.recursiveSplit(order + 1);
-        };
-
-        if (maybe_addr) |addr| {
-            const buddy = addr ^ ORDERS[order];
-            const buddy_idx = buddy / PAGE_SIZE;
-            self.pages[buddy_idx] = .{
-                .available = true,
-                .order = order,
-            };
-
-            return addr;
-        } else return null;
     }
 
     // fn recursive merge
@@ -139,17 +113,15 @@ pub const BuddyAllocator = struct {
 };
 
 test "buddy allocator initializes expected pages and orders correctly" {
-    // create an address space that will have 10 order 10 blocks,
-    // and then 1 more block for each order except 5
+    const start_addr = 0x400000;
     var total_size: usize = 10 * ORDERS[10];
+    const end_addr = start_addr + total_size;
     const skip_order: usize = 5;
     for (0..NUM_ORDERS - 1) |i| {
         if (i == skip_order) continue;
         total_size += ORDERS[i];
     }
 
-    const start_addr = 0;
-    const end_addr = total_size;
     var allocator = std.testing.allocator;
     var buddy: BuddyAllocator = undefined;
     try buddy.init(
@@ -161,7 +133,7 @@ test "buddy allocator initializes expected pages and orders correctly" {
 
     const expected = [_]struct {
         page_index: usize,
-        order: u7,
+        order: u4,
     }{
         .{ .page_index = 0, .order = 10 },
         .{ .page_index = 1024, .order = 10 },
@@ -185,22 +157,39 @@ test "buddy allocator initializes expected pages and orders correctly" {
     };
 
     for (expected) |entry| {
-        const page = buddy.pages[entry.page_index];
-        try std.testing.expect(page.available);
-        try std.testing.expectEqual(entry.order, page.order);
+        const addr = entry.page_index * PAGE_SIZE;
+        const pair_idx = entry.page_index / 2;
+        const is_odd = entry.page_index % 2 == 1;
+
+        const freelist = buddy.freelists[entry.order].freelist();
+        try std.testing.expect(freelist.isFree(addr));
+
+        if (is_odd) {
+            try std.testing.expectEqual(entry.order, buddy.page_pair_orders[pair_idx].odd);
+        } else {
+            try std.testing.expectEqual(entry.order, buddy.page_pair_orders[pair_idx].even);
+        }
     }
 
-    for (buddy.pages, 0..) |page, i| {
+    const total_pages = total_size / PAGE_SIZE;
+    for (0..total_pages) |page_idx| {
+        const addr = page_idx * PAGE_SIZE;
         var is_expected = false;
+        var expected_order: u4 = 0;
+
         for (expected) |entry| {
-            if (entry.page_index == i) {
+            if (entry.page_index == page_idx) {
                 is_expected = true;
+                expected_order = entry.order;
                 break;
             }
         }
+
         if (!is_expected) {
-            try std.testing.expect(!page.available);
-            try std.testing.expectEqual(@as(u7, 0), page.order);
+            for (0..NUM_ORDERS) |order| {
+                const freelist = buddy.freelists[order].freelist();
+                try std.testing.expect(!freelist.isFree(addr));
+            }
         }
     }
 }

@@ -49,6 +49,13 @@ pub fn SlabAllocator(
         /// Stores a header for every allocation permanently so they can be individually tracked and freed in deinit
         alloc_headers: ?*AllocHeader = null,
 
+        /// This must take a freelist directly because the function that returns the FreeList struct
+        /// takes a pointer to the implementation struct, so this must live in it's final stack frame
+        /// at the time .freelist() is called and captures the pointer.
+        ///
+        /// This function must not ever make any allocations to preserve the property that
+        /// the stack bootstrap flag enables this to be initialized and used some number of
+        /// times without every making a heap allocation.
         pub fn init(
             freelist: FreeList,
             backing_allocator: *std.mem.Allocator,
@@ -71,9 +78,11 @@ pub fn SlabAllocator(
                 }
 
                 const alloc_header = try self.backing_allocator.create(AllocHeader);
-                alloc_header.ptr = slice.ptr;
-                alloc_header.len = slice.len;
-                alloc_header.next = self.alloc_headers;
+                alloc_header.* = .{
+                    .ptr = slice.ptr,
+                    .len = slice.len,
+                    .next = self.alloc_headers,
+                };
                 self.alloc_headers = alloc_header;
             }
 
@@ -134,9 +143,11 @@ pub fn SlabAllocator(
                     self.backing_allocator.free(slice);
                     return null;
                 };
-                alloc_header.ptr = slice.ptr;
-                alloc_header.len = slice.len;
-                alloc_header.next = self.alloc_headers;
+                alloc_header.* = .{
+                    .ptr = slice.ptr,
+                    .len = slice.len,
+                    .next = self.alloc_headers,
+                };
                 self.alloc_headers = alloc_header;
 
                 const new_slab = &slice[0];
