@@ -28,7 +28,7 @@ pub fn Intrusive2WayFreeList(comptime T: type) type {
             std.debug.assert(@alignOf(ValType) == @alignOf(FreeNode));
         }
 
-        fn push(self: *Self, addr: T) void {
+        pub fn push(self: *Self, addr: T) void {
             zeroItem(@ptrCast(addr));
             const node: *FreeNode = @alignCast(@ptrCast(addr));
             if (DBG) node.dbg_magic = DBG_MAGIC;
@@ -38,7 +38,7 @@ pub fn Intrusive2WayFreeList(comptime T: type) type {
             self.head = node;
         }
 
-        fn pop(self: *Self) ?T {
+        pub fn pop(self: *Self) ?T {
             const addr = self.head orelse return null;
             if (DBG) std.debug.assert(addr.dbg_magic == DBG_MAGIC);
             self.head = addr.next;
@@ -52,7 +52,7 @@ pub fn Intrusive2WayFreeList(comptime T: type) type {
         /// This enables O(1) popping of arbitrary elements from the freelist.
         /// Trying to pop a node that isn't in the list will blow up in debug
         /// builds, but is undefined behavior in release builds.
-        fn pop_specific(self: *Self, addr: T) ?T {
+        pub fn pop_specific(self: *Self, addr: T) ?T {
             const node: *FreeNode = @alignCast(@ptrCast(addr));
             if (DBG) std.debug.assert(node.dbg_magic == DBG_MAGIC);
 

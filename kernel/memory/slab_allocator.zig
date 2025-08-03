@@ -1,14 +1,13 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const fl = @import("intrusive_freelist.zig");
+const intrusive_freelist = @import("intrusive_freelist.zig");
 
 const DBG = builtin.mode == .Debug;
 
 /// Top level allocator. Requires a backing allocator, does not provide a std.mem.Allocator interface.
 pub fn SlabAllocator(
     comptime T: type,
-    comptime FreeList: type,
     comptime stack_bootstrap: bool,
     comptime stack_size: usize,
     comptime allocation_chunk_size: usize,
@@ -31,6 +30,7 @@ pub fn SlabAllocator(
 
     return struct {
         const Self = @This();
+        const IntrusiveFreeList = intrusive_freelist.IntrusiveFreeList(*T);
 
         /// Verifies that all allocated memory is returned before deinit is called on this.
         /// This is necessary because if this were to not be the case, we could handle it by
@@ -40,41 +40,32 @@ pub fn SlabAllocator(
 
         backing_allocator: *std.mem.Allocator,
 
-        /// The stack array is intended to allow for things like the vmm's rbt to allocate nodes for initial allocations so the vmm can do the necessary bookkeeping while avoiding a circular dependency where the rbt allocator eventually depends on the vmm itself to serve an allocation.
+        /// The stack array is intended to allow for things like the vmm's rbt to allocate nodes
+        /// for initial allocations so the vmm can do the necessary bookkeeping while avoiding a
+        /// circular dependency where the rbt allocator eventually depends on the vmm itself to serve an allocation.
         stack_array: if (stack_bootstrap) [stack_size]T else void,
         stack_idx: if (stack_bootstrap) usize else void,
 
-        freelist: FreeList,
+        freelist: IntrusiveFreeList = .{},
 
         /// Stores a header for every allocation permanently so they can be individually tracked and freed in deinit
         alloc_headers: ?*AllocHeader = null,
 
-        /// This must take a freelist directly because the function that returns the FreeList struct
-        /// takes a pointer to the implementation struct, so this must live in it's final stack frame
-        /// at the time .freelist() is called and captures the pointer.
-        ///
-        /// This function must not ever make any allocations to preserve the property that
-        /// the stack bootstrap flag enables this to be initialized and used some number of
-        /// times without every making a heap allocation.
         pub fn init(
-            freelist: FreeList,
             backing_allocator: *std.mem.Allocator,
         ) !Self {
             var self: Self = .{
                 .allocations = if (DBG) 0,
-
                 .stack_array = if (stack_bootstrap) [_]T{std.mem.zeroes(T)} ** stack_size,
                 .stack_idx = if (stack_bootstrap) 0,
-
                 .backing_allocator = backing_allocator,
-                .freelist = freelist,
             };
 
             if (!stack_bootstrap) {
                 const slice = try self.backing_allocator.alloc(T, allocation_chunk_size);
                 errdefer self.backing_allocator.free(slice);
                 for (slice) |*slab| {
-                    self.freelist.setFree(slab);
+                    self.freelist.push(slab);
                 }
 
                 const alloc_header = try self.backing_allocator.create(AllocHeader);
@@ -132,7 +123,7 @@ pub fn SlabAllocator(
                 return @ptrCast(slab);
             }
 
-            const maybe_slab = self.freelist.getNextFree();
+            const maybe_slab = self.freelist.pop();
             if (maybe_slab) |slab| {
                 if (DBG) self.allocations += 1;
                 return @ptrCast(slab);
@@ -152,7 +143,7 @@ pub fn SlabAllocator(
 
                 const new_slab = &slice[0];
                 for (slice[1..]) |*slab| {
-                    self.freelist.setFree(slab);
+                    self.freelist.push(slab);
                 }
 
                 if (DBG) self.allocations += 1;
@@ -206,37 +197,28 @@ pub fn SlabAllocator(
             if (DBG) self.allocations -= 1;
             if (DBG) std.debug.assert(self.allocations >= 0);
 
-            self.freelist.setFree(slab);
+            self.freelist.push(slab);
         }
     };
 }
 
-// Large enough for StackFreeList type requirements
 const TestType = struct { data: u64, pad: u64 };
 
 test "stack exhaustion and transition" {
-    const IntrusiveFreeList = fl.IntrusiveFreeList(*TestType);
-    const FreeList = IntrusiveFreeList.FreeList;
-    var freelist: IntrusiveFreeList = .{};
-
     const stack_bootstrap = true;
     const stack_size = 4;
     const allocation_chunk_size = 8;
 
     var test_allocator = std.testing.allocator;
-    const freelist_iface = freelist.freelist();
 
     var slab_allocator = try SlabAllocator(
         TestType,
-        FreeList,
         stack_bootstrap,
         stack_size,
         allocation_chunk_size,
-    ).init(
-        freelist_iface,
-        &test_allocator,
-    );
+    ).init(&test_allocator);
     defer slab_allocator.deinit();
+
     const allocator = slab_allocator.allocator();
 
     var stack_objs: [stack_size]*TestType = undefined;
@@ -254,28 +236,20 @@ test "stack exhaustion and transition" {
 }
 
 test "stack bootstrap stress test" {
-    const IntrusiveFreeList = fl.IntrusiveFreeList(*TestType);
-    const FreeList = IntrusiveFreeList.FreeList;
-    var freelist: IntrusiveFreeList = .{};
-
     const stack_bootstrap = true;
     const stack_size = 4;
     const allocation_chunk_size = 16;
 
     var test_allocator = std.testing.allocator;
-    const freelist_iface = freelist.freelist();
 
     var slab_allocator = try SlabAllocator(
         TestType,
-        FreeList,
         stack_bootstrap,
         stack_size,
         allocation_chunk_size,
-    ).init(
-        freelist_iface,
-        &test_allocator,
-    );
+    ).init(&test_allocator);
     defer slab_allocator.deinit();
+
     const allocator = slab_allocator.allocator();
 
     const stack_start = @intFromPtr(&slab_allocator.stack_array[0]);
@@ -310,28 +284,20 @@ test "stack bootstrap stress test" {
 }
 
 test "allocation failure with exhausted stack" {
-    const IntrusiveFreeList = fl.IntrusiveFreeList(*TestType);
-    const FreeList = IntrusiveFreeList.FreeList;
-    var freelist: IntrusiveFreeList = .{};
-
     const stack_bootstrap = true;
     const stack_size = 3;
     const allocation_chunk_size = 8;
 
     var test_allocator = std.testing.allocator;
-    const freelist_iface = freelist.freelist();
 
     var slab_allocator = try SlabAllocator(
         TestType,
-        FreeList,
         stack_bootstrap,
         stack_size,
         allocation_chunk_size,
-    ).init(
-        freelist_iface,
-        &test_allocator,
-    );
+    ).init(&test_allocator);
     defer slab_allocator.deinit();
+
     const allocator = slab_allocator.allocator();
 
     var stack_objs: [stack_size]*TestType = undefined;
@@ -356,28 +322,20 @@ test "allocation failure with exhausted stack" {
 }
 
 test "basic create destroy cycle" {
-    const IntrusiveFreeList = fl.IntrusiveFreeList(*TestType);
-    const FreeList = IntrusiveFreeList.FreeList;
-    var freelist: IntrusiveFreeList = .{};
-
     const stack_bootstrap = false;
     const stack_size = 0;
     const allocation_chunk_size = 16;
 
     var test_allocator = std.testing.allocator;
-    const freelist_iface = freelist.freelist();
 
     var slab_allocator = try SlabAllocator(
         TestType,
-        FreeList,
         stack_bootstrap,
         stack_size,
         allocation_chunk_size,
-    ).init(
-        freelist_iface,
-        &test_allocator,
-    );
+    ).init(&test_allocator);
     defer slab_allocator.deinit();
+
     const allocator = slab_allocator.allocator();
 
     const obj1 = try allocator.create(TestType);
@@ -403,28 +361,20 @@ test "basic create destroy cycle" {
 }
 
 test "initial freelist population" {
-    const IntrusiveFreeList = fl.IntrusiveFreeList(*TestType);
-    const FreeList = IntrusiveFreeList.FreeList;
-    var freelist: IntrusiveFreeList = .{};
-
     const stack_bootstrap = false;
     const stack_size = 0;
     const allocation_chunk_size = 5;
 
     var test_allocator = std.testing.allocator;
-    const freelist_iface = freelist.freelist();
 
     var slab_allocator = try SlabAllocator(
         TestType,
-        FreeList,
         stack_bootstrap,
         stack_size,
         allocation_chunk_size,
-    ).init(
-        freelist_iface,
-        &test_allocator,
-    );
+    ).init(&test_allocator);
     defer slab_allocator.deinit();
+
     const allocator = slab_allocator.allocator();
 
     var objs: [6]*TestType = undefined;
@@ -442,28 +392,20 @@ test "initial freelist population" {
 }
 
 test "memory leak detection" {
-    const IntrusiveFreeList = fl.IntrusiveFreeList(*TestType);
-    const FreeList = IntrusiveFreeList.FreeList;
-    var freelist: IntrusiveFreeList = .{};
-
     const stack_bootstrap = false;
     const stack_size = 0;
     const allocation_chunk_size = 32;
 
     var test_allocator = std.testing.allocator;
-    const freelist_iface = freelist.freelist();
 
     var slab_allocator = try SlabAllocator(
         TestType,
-        FreeList,
         stack_bootstrap,
         stack_size,
         allocation_chunk_size,
-    ).init(
-        freelist_iface,
-        &test_allocator,
-    );
+    ).init(&test_allocator);
     defer slab_allocator.deinit();
+
     const allocator = slab_allocator.allocator();
 
     var objs: [200]*TestType = undefined;

@@ -14,7 +14,7 @@ pub fn StackFreeList(comptime T: type) type {
             };
         }
 
-        fn pop(self: *Self) ?T {
+        pub fn pop(self: *Self) ?T {
             std.debug.assert(self.top < self.stack.len);
             if (self.top == -1) return null;
 
@@ -24,7 +24,7 @@ pub fn StackFreeList(comptime T: type) type {
             return addr;
         }
 
-        fn push(self: *Self, addr: T) void {
+        pub fn push(self: *Self, addr: T) void {
             std.debug.assert(self.top >= -1);
             if (self.top + 1 < self.stack.len) {
                 self.top += 1;

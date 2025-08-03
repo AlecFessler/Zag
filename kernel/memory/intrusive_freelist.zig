@@ -27,7 +27,7 @@ pub fn IntrusiveFreeList(comptime T: type) type {
             std.debug.assert(@alignOf(ValType) == @alignOf(FreeNode));
         }
 
-        fn push(self: *Self, addr: T) void {
+        pub fn push(self: *Self, addr: T) void {
             zeroItem(@ptrCast(addr));
             const node: *FreeNode = @alignCast(@ptrCast(addr));
             if (DBG) node.dbg_magic = DBG_MAGIC;
@@ -35,7 +35,7 @@ pub fn IntrusiveFreeList(comptime T: type) type {
             self.next = node;
         }
 
-        fn pop(self: *Self) ?T {
+        pub fn pop(self: *Self) ?T {
             const addr = self.next orelse return null;
             if (DBG) std.debug.assert(addr.dbg_magic == DBG_MAGIC);
             self.next = addr.next;

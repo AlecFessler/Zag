@@ -48,7 +48,7 @@ pub const BitmapFreeList = struct {
         self.allocator.free(self.bitmap);
     }
 
-    fn getNextFree(self: *BitmapFreeList) ?usize {
+    pub fn getNextFree(self: *BitmapFreeList) ?usize {
         if (self.hint == self.bitmap.len) return null;
 
         const next_free_word = self.bitmap[self.hint];
