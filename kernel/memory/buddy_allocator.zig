@@ -14,7 +14,8 @@ const ORDERS = blk: {
     break :blk arr;
 };
 
-/// Just used to give the intrusive freelist a size and alignment
+/// Used to give the intrusive freelist a size and alignment
+/// and to specify the allocation type for std.mem.Allocator.alloc()
 const Page = struct {
     bytes: [PAGE_SIZE]u8 align(PAGE_SIZE),
 
@@ -42,7 +43,7 @@ pub const BuddyAllocator = struct {
     end_addr: usize,
 
     /// Not a backing allocator, this is only used to allocate and free the page orders and bitmap
-    allocator: *std.mem.Allocator,
+    init_allocator: *std.mem.Allocator,
 
     page_pair_orders: []PagePairOrders = undefined,
     bitmap: BitmapFreeList = undefined,
@@ -51,7 +52,7 @@ pub const BuddyAllocator = struct {
     pub fn init(
         start_addr: usize,
         end_addr: usize,
-        allocator: *std.mem.Allocator,
+        init_allocator: *std.mem.Allocator,
     ) !BuddyAllocator {
         std.debug.assert(end_addr > start_addr);
         const aligned_start = std.mem.alignForward(
@@ -69,7 +70,7 @@ pub const BuddyAllocator = struct {
         var self: BuddyAllocator = .{
             .start_addr = aligned_start,
             .end_addr = aligned_end,
-            .allocator = allocator,
+            .init_allocator = init_allocator,
         };
 
         const total_bytes = aligned_end - aligned_start;
@@ -82,12 +83,12 @@ pub const BuddyAllocator = struct {
             PAGE_SIZE,
             num_pages,
             initially_free,
-            allocator,
+            init_allocator,
         );
         errdefer self.bitmap.deinit();
 
-        self.page_pair_orders = try allocator.alloc(PagePairOrders, num_pairs);
-        errdefer allocator.free(self.page_pair_orders);
+        self.page_pair_orders = try init_allocator.alloc(PagePairOrders, num_pairs);
+        errdefer init_allocator.free(self.page_pair_orders);
 
         var current_addr = aligned_start;
         var decrement: isize = 10;
@@ -107,8 +108,20 @@ pub const BuddyAllocator = struct {
     }
 
     pub fn deinit(self: *BuddyAllocator) void {
-        self.allocator.free(self.page_pair_orders);
+        self.init_allocator.free(self.page_pair_orders);
         self.bitmap.deinit();
+    }
+
+    pub fn allocator(self: *BuddyAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
     }
 
     /// Intended to be called by alloc if the current order's freelist
@@ -117,7 +130,7 @@ pub const BuddyAllocator = struct {
     fn recursiveSplit(self: *BuddyAllocator, order: u4) ?usize {
         std.debug.assert(order < 11);
 
-        const addr_ptr = self.freelists[order].pop() orelse blk: {
+        const addr_ptr = self.freelists[order].pop() orelse {
             if (order == 10) return null;
             const recursive_addr = self.recursiveSplit(order + 1) orelse return null;
 
@@ -126,7 +139,8 @@ pub const BuddyAllocator = struct {
             self.bitmap.setBit(buddy, 1);
             self.freelists[order].push(@ptrFromInt(buddy));
 
-            break :blk @as(*Page, @ptrFromInt(recursive_addr));
+            self.setOrder(recursive_addr, order);
+            return recursive_addr;
         };
 
         return @intFromPtr(addr_ptr);
@@ -134,21 +148,26 @@ pub const BuddyAllocator = struct {
 
     /// Intended to be called in free every time a block is returned
     /// so that coalescing can be performed if possible
-    fn recursiveMerge(self: *BuddyAllocator, addr: usize) void {
+    fn recursiveMerge(self: *BuddyAllocator, addr: usize) struct { addr: usize, order: u4 } {
         const order = self.getOrder(addr);
         const buddy = addr ^ ORDERS[order];
-
-        if (self.bitmap.isFree(buddy)) {
+        const is_buddy_free = self.bitmap.isFree(buddy);
+        if (is_buddy_free) {
             const buddy_order = self.getOrder(buddy);
             if (buddy_order == order) {
                 const lower_half = @min(addr, buddy);
                 const upper_half = @max(addr, buddy);
 
-                self.setOrder(lower_half, order + 1);
+                self.bitmap.setBit(lower_half, 0);
                 self.bitmap.setBit(upper_half, 0);
-                self.recursiveMerge(lower_half);
+                _ = self.freelists[order].pop_specific(@ptrFromInt(buddy));
+                self.setOrder(lower_half, order + 1);
+
+                return self.recursiveMerge(lower_half);
             }
         }
+
+        return .{ .addr = addr, .order = order };
     }
 
     fn getOrder(self: *BuddyAllocator, addr: usize) u4 {
@@ -173,7 +192,73 @@ pub const BuddyAllocator = struct {
         }
     }
 
-    // allocator and interface
+    fn alloc(
+        ptr: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        _ = alignment;
+        _ = ret_addr;
+        std.debug.assert(len % PAGE_SIZE == 0);
+        const self: *BuddyAllocator = @alignCast(@ptrCast(ptr));
+
+        const num_pages = len / PAGE_SIZE;
+        const order: u4 = @intCast(@ctz(@as(u32, @intCast(num_pages))));
+        std.debug.assert(order < 11);
+
+        const addr = self.recursiveSplit(order) orelse return null;
+        self.bitmap.setBit(addr, 0);
+        return @ptrFromInt(addr);
+    }
+
+    // no op
+    fn resize(
+        ptr: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) bool {
+        _ = ptr;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        unreachable;
+    }
+
+    // no op
+    fn remap(
+        ptr: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        ret_addr: usize,
+    ) ?[*]u8 {
+        _ = ptr;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        unreachable;
+    }
+
+    // no op
+    fn free(
+        ptr: *anyopaque,
+        buf: []u8,
+        alignment: std.mem.Alignment,
+        ret_addr: usize,
+    ) void {
+        _ = alignment;
+        _ = ret_addr;
+        const self: *BuddyAllocator = @alignCast(@ptrCast(ptr));
+        const addr = @intFromPtr(buf.ptr);
+        const result = self.recursiveMerge(addr);
+        self.bitmap.setBit(result.addr, 1);
+        self.freelists[result.order].push(@ptrFromInt(result.addr));
+    }
 };
 
 test "buddy allocator initializes expected pages and orders correctly" {
@@ -279,71 +364,131 @@ test "buddy allocator init fails with failing allocator" {
 test "recursiveSplit splits larger blocks into smaller ones" {
     var allocator = std.testing.allocator;
 
-    const memory = try allocator.alignedAlloc(u8, PAGE_SIZE, 28 * 1024);
+    const memory = try allocator.alignedAlloc(u8, PAGE_SIZE, ORDERS[1]);
     defer allocator.free(memory);
 
     const start_addr = @intFromPtr(memory.ptr);
-    const end_addr = start_addr + 28 * 1024;
+    const end_addr = start_addr + ORDERS[1];
 
     var buddy = try BuddyAllocator.init(start_addr, end_addr, &allocator);
     defer buddy.deinit();
 
-    try std.testing.expect(buddy.freelists[2].head != null);
     try std.testing.expect(buddy.freelists[1].head != null);
-    try std.testing.expect(buddy.freelists[0].head != null);
-    try std.testing.expect(buddy.freelists[3].head == null);
-
-    const addr1 = buddy.recursiveSplit(0);
-    try std.testing.expect(addr1 != null);
-
     try std.testing.expect(buddy.freelists[0].head == null);
-
-    const addr2 = buddy.recursiveSplit(0);
-    try std.testing.expect(addr2 != null);
-
-    try std.testing.expect(buddy.freelists[0].head != null);
-    try std.testing.expect(buddy.freelists[1].head == null);
-
-    try std.testing.expect(addr1.? != addr2.?);
-    try std.testing.expect(addr1.? % PAGE_SIZE == 0);
-    try std.testing.expect(addr2.? % PAGE_SIZE == 0);
-}
-
-test "recursiveMerge coalesces adjacent buddies" {
-    var allocator = std.testing.allocator;
-
-    const memory = try allocator.alignedAlloc(u8, PAGE_SIZE, 2 * ORDERS[1]);
-    defer allocator.free(memory);
-
-    const start_addr = @intFromPtr(memory.ptr);
-    const end_addr = start_addr + 2 * ORDERS[1];
-
-    var buddy = try BuddyAllocator.init(start_addr, end_addr, &allocator);
-    defer buddy.deinit();
-
-    try std.testing.expect(buddy.freelists[1].head != null);
-    try std.testing.expect(buddy.freelists[2].head == null);
 
     const addr1 = buddy.recursiveSplit(0).?;
-    const addr3 = buddy.recursiveSplit(0).?;
+
+    try std.testing.expectEqual(@as(u4, 0), buddy.getOrder(addr1));
+
+    try std.testing.expect(buddy.freelists[0].head != null);
+    try std.testing.expect(buddy.freelists[1].head == null);
+
+    const addr2 = buddy.recursiveSplit(0).?;
+    try std.testing.expectEqual(@as(u4, 0), buddy.getOrder(addr2));
 
     try std.testing.expect(buddy.freelists[0].head == null);
-    try std.testing.expect(buddy.freelists[1].head == null);
-    try std.testing.expect(buddy.freelists[2].head == null);
+
+    const diff = if (addr2 > addr1) addr2 - addr1 else addr1 - addr2;
+    try std.testing.expectEqual(ORDERS[0], diff);
+}
+
+test "recursiveMerge coalesces adjacent buddies and returns final state" {
+    var allocator = std.testing.allocator;
+
+    const memory = try allocator.alignedAlloc(u8, PAGE_SIZE, ORDERS[1]);
+    defer allocator.free(memory);
+
+    const start_addr = @intFromPtr(memory.ptr);
+    const end_addr = start_addr + ORDERS[1];
+
+    var buddy = try BuddyAllocator.init(start_addr, end_addr, &allocator);
+    defer buddy.deinit();
+
+    const addr1 = buddy.recursiveSplit(0).?;
+    const addr2 = buddy.recursiveSplit(0).?;
+
+    try std.testing.expect(buddy.getOrder(addr1) == 0);
+    try std.testing.expect(buddy.getOrder(addr2) == 0);
 
     buddy.bitmap.setBit(addr1, 1);
-    buddy.recursiveMerge(addr1);
+    buddy.freelists[0].push(@ptrFromInt(addr1));
 
-    try std.testing.expect(buddy.freelists[1].head != null);
+    buddy.bitmap.setBit(addr2, 1);
+    const result = buddy.recursiveMerge(addr2);
 
-    buddy.bitmap.setBit(addr3, 1);
-    buddy.recursiveMerge(addr3);
+    const expected_lower = @min(addr1, addr2);
+    try std.testing.expectEqual(expected_lower, result.addr);
+    try std.testing.expectEqual(@as(u4, 1), result.order);
+}
 
-    const order1_addr = @intFromPtr(buddy.freelists[1].pop().?);
-    buddy.bitmap.setBit(order1_addr, 1);
-    buddy.recursiveMerge(order1_addr);
+test "alloc and free work together" {
+    var test_allocator = std.testing.allocator;
 
-    try std.testing.expect(buddy.freelists[2].head != null);
-    try std.testing.expect(buddy.freelists[1].head == null);
-    try std.testing.expect(buddy.freelists[0].head == null);
+    const memory = try test_allocator.alignedAlloc(u8, PAGE_SIZE, ORDERS[3]);
+    defer test_allocator.free(memory);
+
+    const start_addr = @intFromPtr(memory.ptr);
+    const end_addr = start_addr + ORDERS[3];
+
+    var buddy = try BuddyAllocator.init(
+        start_addr,
+        end_addr,
+        &test_allocator,
+    );
+    defer buddy.deinit();
+
+    var allocator = buddy.allocator();
+
+    const ptr1 = try allocator.alloc(u8, ORDERS[1]);
+    try std.testing.expectEqual(@as(usize, ORDERS[1]), ptr1.len);
+
+    const ptr2 = try allocator.alloc(u8, ORDERS[0]);
+    try std.testing.expectEqual(@as(usize, ORDERS[0]), ptr2.len);
+
+    allocator.free(ptr1);
+    allocator.free(ptr2);
+
+    try std.testing.expect(buddy.freelists[3].head != null);
+}
+
+test "complex allocation and deallocation with state verification" {
+    var test_allocator = std.testing.allocator;
+
+    const total_size: usize = ORDERS[1];
+
+    const memory = try test_allocator.alignedAlloc(u8, PAGE_SIZE, total_size);
+    defer test_allocator.free(memory);
+
+    const start_addr = @intFromPtr(memory.ptr);
+    const end_addr = start_addr + total_size;
+
+    var buddy = try BuddyAllocator.init(start_addr, end_addr, &test_allocator);
+    defer buddy.deinit();
+
+    var allocator = buddy.allocator();
+
+    const ptr1 = try allocator.alloc(u8, ORDERS[0]);
+    const addr1 = @intFromPtr(ptr1.ptr);
+
+    const ptr2 = try allocator.alloc(u8, ORDERS[0]);
+    const addr2 = @intFromPtr(ptr2.ptr);
+
+    const buddy_diff = if (addr2 > addr1) addr2 - addr1 else addr1 - addr2;
+    try std.testing.expectEqual(ORDERS[0], buddy_diff);
+
+    const order1 = buddy.getOrder(addr1);
+    const order2 = buddy.getOrder(addr2);
+    try std.testing.expectEqual(@as(u4, 0), order1);
+    try std.testing.expectEqual(@as(u4, 0), order2);
+
+    const buddy1 = addr1 ^ ORDERS[0];
+    const buddy2 = addr2 ^ ORDERS[0];
+    try std.testing.expect(buddy1 == addr2 or buddy2 == addr1);
+
+    allocator.free(ptr1);
+    allocator.free(ptr2);
+
+    const final_ptr = try allocator.alloc(u8, total_size);
+    try std.testing.expectEqual(total_size, final_ptr.len);
+    allocator.free(final_ptr);
 }

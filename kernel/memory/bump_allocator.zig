@@ -65,7 +65,7 @@ pub const BumpAllocator = struct {
         _ = alignment;
         _ = new_len;
         _ = ret_addr;
-        return false;
+        unreachable;
     }
 
     // no op
@@ -81,7 +81,7 @@ pub const BumpAllocator = struct {
         _ = alignment;
         _ = new_len;
         _ = ret_addr;
-        return null;
+        unreachable;
     }
 
     // no op
@@ -95,5 +95,6 @@ pub const BumpAllocator = struct {
         _ = buf;
         _ = alignment;
         _ = ret_addr;
+        unreachable;
     }
 };

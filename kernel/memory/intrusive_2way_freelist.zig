@@ -73,7 +73,7 @@ pub fn Intrusive2WayFreeList(comptime T: type) type {
             }
 
             zeroItem(@ptrCast(node));
-            return @ptrCast(node);
+            return @alignCast(@ptrCast(node));
         }
 
         fn zeroItem(item: [*]u8) void {
