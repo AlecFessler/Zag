@@ -160,7 +160,7 @@ pub const BuddyAllocator = struct {
 
                 self.bitmap.setBit(lower_half, 0);
                 self.bitmap.setBit(upper_half, 0);
-                _ = self.freelists[order].pop_specific(@ptrFromInt(buddy));
+                _ = self.freelists[order].pop_specific(@ptrFromInt(upper_half));
                 self.setOrder(lower_half, order + 1);
 
                 return self.recursiveMerge(lower_half);
@@ -204,7 +204,7 @@ pub const BuddyAllocator = struct {
         const self: *BuddyAllocator = @alignCast(@ptrCast(ptr));
 
         const num_pages = len / PAGE_SIZE;
-        const order: u4 = @intCast(@ctz(@as(u32, @intCast(num_pages))));
+        const order: u4 = @intCast(@ctz(num_pages));
         std.debug.assert(order < 11);
 
         const addr = self.recursiveSplit(order) orelse return null;
