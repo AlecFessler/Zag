@@ -13,7 +13,7 @@ pub fn RedBlackTree(
     return struct {
         const Self = @This();
 
-        allocator: *std.mem.Allocator,
+        allocator: std.mem.Allocator,
         root: ?*Node,
 
         const Color = enum {
@@ -43,7 +43,7 @@ pub fn RedBlackTree(
             parent: ?*Node,
             data: T,
 
-            fn create(allocator: *std.mem.Allocator, data: T) !*Node {
+            fn create(allocator: std.mem.Allocator, data: T) !*Node {
                 const ptr = try allocator.create(Node);
                 ptr.* = .{
                     .color = Color.Red,
@@ -57,7 +57,7 @@ pub fn RedBlackTree(
                 return ptr;
             }
 
-            fn destroy(self: *Node, allocator: *std.mem.Allocator) void {
+            fn destroy(self: *Node, allocator: std.mem.Allocator) void {
                 allocator.destroy(self);
             }
 
@@ -98,7 +98,7 @@ pub fn RedBlackTree(
             }
         };
 
-        pub fn init(allocator: *std.mem.Allocator) Self {
+        pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .allocator = allocator,
                 .root = null,
@@ -405,12 +405,12 @@ pub fn RedBlackTree(
         }
 
         /// helper function so that test cases can create T typed Node
-        fn testCreateNode(allocator: *std.mem.Allocator) !*Node {
+        fn testCreateNode(allocator: std.mem.Allocator) !*Node {
             return Node.create(allocator, 0);
         }
 
         /// helper function so that test cases can destroy T typed node
-        fn testDestroyNode(node: *Node, allocator: *std.mem.Allocator) void {
+        fn testDestroyNode(node: *Node, allocator: std.mem.Allocator) void {
             Node.destroy(node, allocator);
         }
 
@@ -509,8 +509,8 @@ fn i32Order(a: i32, b: i32) std.math.Order {
 }
 
 test "insert and contains" {
-    var allocator = std.testing.allocator;
-    var tree = RedBlackTree(i32, i32Order, false).init(&allocator);
+    const allocator = std.testing.allocator;
+    var tree = RedBlackTree(i32, i32Order, false).init(allocator);
     defer tree.deinit();
 
     try tree.insert(42);
@@ -518,8 +518,8 @@ test "insert and contains" {
 }
 
 test "insert then remove and not contains" {
-    var allocator = std.testing.allocator;
-    var tree = RedBlackTree(i32, i32Order, false).init(&allocator);
+    const allocator = std.testing.allocator;
+    var tree = RedBlackTree(i32, i32Order, false).init(allocator);
     defer tree.deinit();
 
     try tree.insert(7);
@@ -529,8 +529,8 @@ test "insert then remove and not contains" {
 }
 
 test "insert duplicate returns error if configured" {
-    var allocator = std.testing.allocator;
-    var tree = RedBlackTree(i32, i32Order, true).init(&allocator);
+    const allocator = std.testing.allocator;
+    var tree = RedBlackTree(i32, i32Order, true).init(allocator);
     defer tree.deinit();
 
     try tree.insert(99);
@@ -539,8 +539,8 @@ test "insert duplicate returns error if configured" {
 }
 
 test "remove nonexistent value returns error" {
-    var allocator = std.testing.allocator;
-    var tree = RedBlackTree(i32, i32Order, false).init(&allocator);
+    const allocator = std.testing.allocator;
+    var tree = RedBlackTree(i32, i32Order, false).init(allocator);
     defer tree.deinit();
 
     const err = tree.remove(1234);
@@ -548,8 +548,8 @@ test "remove nonexistent value returns error" {
 }
 
 test "insert many and deinit without leaks" {
-    var allocator = std.testing.allocator;
-    var tree = RedBlackTree(i32, i32Order, false).init(&allocator);
+    const allocator = std.testing.allocator;
+    var tree = RedBlackTree(i32, i32Order, false).init(allocator);
     defer tree.deinit();
 
     for (0..1000) |i| {
@@ -560,25 +560,25 @@ test "insert many and deinit without leaks" {
 test "insertFix case 1: recoloring when uncle is red" {
     const Tree = RedBlackTree(i32, i32Order, false);
 
-    var allocator = std.testing.allocator;
+    const allocator = std.testing.allocator;
 
-    const gp = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(gp, &allocator);
-    const parent = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(parent, &allocator);
-    const uncle = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(uncle, &allocator);
-    const new_node = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(new_node, &allocator);
+    const gp = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(gp, allocator);
+    const parent = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(parent, allocator);
+    const uncle = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(uncle, allocator);
+    const new_node = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(new_node, allocator);
 
-    const gp_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(gp_expected, &allocator);
-    const parent_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(parent_expected, &allocator);
-    const uncle_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(uncle_expected, &allocator);
-    const new_node_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(new_node_expected, &allocator);
+    const gp_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(gp_expected, allocator);
+    const parent_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(parent_expected, allocator);
+    const uncle_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(uncle_expected, allocator);
+    const new_node_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(new_node_expected, allocator);
 
     gp.* = .{
         .data = 10,
@@ -630,7 +630,7 @@ test "insertFix case 1: recoloring when uncle is red" {
         .parent = parent_expected,
     };
 
-    var tree = Tree.init(&allocator);
+    var tree = Tree.init(allocator);
     tree.root = gp;
 
     tree.insertFix(new_node);
@@ -641,21 +641,21 @@ test "insertFix case 1: recoloring when uncle is red" {
 test "insertFix case 2a: triangle (rotate parent)" {
     const Tree = RedBlackTree(i32, i32Order, false);
 
-    var allocator = std.testing.allocator;
+    const allocator = std.testing.allocator;
 
-    const grand = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(grand, &allocator);
-    const parent = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(parent, &allocator);
-    const new_node = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(new_node, &allocator);
+    const grand = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(grand, allocator);
+    const parent = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(parent, allocator);
+    const new_node = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(new_node, allocator);
 
-    const grand_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(grand_expected, &allocator);
-    const left_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(left_expected, &allocator);
-    const right_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(right_expected, &allocator);
+    const grand_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(grand_expected, allocator);
+    const left_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(left_expected, allocator);
+    const right_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(right_expected, allocator);
 
     grand.* = .{
         .data = 10,
@@ -695,7 +695,7 @@ test "insertFix case 2a: triangle (rotate parent)" {
         .parent = grand_expected,
     };
 
-    var tree = Tree.init(&allocator);
+    var tree = Tree.init(allocator);
     tree.root = grand;
 
     tree.insertFix(new_node);
@@ -706,21 +706,21 @@ test "insertFix case 2a: triangle (rotate parent)" {
 test "insertFix case 2b: line (rotate grandparent)" {
     const Tree = RedBlackTree(i32, i32Order, false);
 
-    var allocator = std.testing.allocator;
+    const allocator = std.testing.allocator;
 
-    const grand = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(grand, &allocator);
-    const parent = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(parent, &allocator);
-    const new_node = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(new_node, &allocator);
+    const grand = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(grand, allocator);
+    const parent = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(parent, allocator);
+    const new_node = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(new_node, allocator);
 
-    const root_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(root_expected, &allocator);
-    const left_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(left_expected, &allocator);
-    const right_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(right_expected, &allocator);
+    const root_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(root_expected, allocator);
+    const left_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(left_expected, allocator);
+    const right_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(right_expected, allocator);
 
     grand.* = .{
         .data = 10,
@@ -760,7 +760,7 @@ test "insertFix case 2b: line (rotate grandparent)" {
         .parent = root_expected,
     };
 
-    var tree = Tree.init(&allocator);
+    var tree = Tree.init(allocator);
     tree.root = grand;
 
     tree.insertFix(new_node);
@@ -770,21 +770,21 @@ test "insertFix case 2b: line (rotate grandparent)" {
 
 test "removeFix case 1: red sibling" {
     const Tree = RedBlackTree(i32, i32Order, false);
-    var allocator = std.testing.allocator;
+    const allocator = std.testing.allocator;
 
-    const parent = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(parent, &allocator);
-    const node = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(node, &allocator);
-    const sibling = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(sibling, &allocator);
+    const parent = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(parent, allocator);
+    const node = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(node, allocator);
+    const sibling = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(sibling, allocator);
 
-    const new_root = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(new_root, &allocator);
-    const left_of_root = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(left_of_root, &allocator);
-    const left_of_left = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(left_of_left, &allocator);
+    const new_root = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(new_root, allocator);
+    const left_of_root = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(left_of_root, allocator);
+    const left_of_left = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(left_of_left, allocator);
 
     parent.* = .{
         .data = 10,
@@ -824,7 +824,7 @@ test "removeFix case 1: red sibling" {
         .parent = left_of_root,
     };
 
-    var tree = Tree.init(&allocator);
+    var tree = Tree.init(allocator);
     tree.root = parent;
 
     tree.removeFix(node);
@@ -834,25 +834,25 @@ test "removeFix case 1: red sibling" {
 
 test "removeFix case 2: black sibling, red far child" {
     const Tree = RedBlackTree(i32, i32Order, false);
-    var allocator = std.testing.allocator;
+    const allocator = std.testing.allocator;
 
-    const parent = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(parent, &allocator);
-    const node = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(node, &allocator);
-    const sibling = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(sibling, &allocator);
-    const far = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(far, &allocator);
+    const parent = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(parent, allocator);
+    const node = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(node, allocator);
+    const sibling = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(sibling, allocator);
+    const far = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(far, allocator);
 
-    const new_root = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(new_root, &allocator);
-    const left = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(left, &allocator);
-    const far_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(far_expected, &allocator);
-    const node_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(node_expected, &allocator);
+    const new_root = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(new_root, allocator);
+    const left = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(left, allocator);
+    const far_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(far_expected, allocator);
+    const node_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(node_expected, allocator);
 
     parent.* = .{
         .data = 10,
@@ -904,7 +904,7 @@ test "removeFix case 2: black sibling, red far child" {
         .parent = new_root,
     };
 
-    var tree = Tree.init(&allocator);
+    var tree = Tree.init(allocator);
     tree.root = parent;
 
     tree.removeFix(node);
@@ -914,25 +914,25 @@ test "removeFix case 2: black sibling, red far child" {
 
 test "removeFix case 3: black sibling, red near child" {
     const Tree = RedBlackTree(i32, i32Order, false);
-    var allocator = std.testing.allocator;
+    const allocator = std.testing.allocator;
 
-    const parent = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(parent, &allocator);
-    const node = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(node, &allocator);
-    const sibling = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(sibling, &allocator);
-    const near = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(near, &allocator);
+    const parent = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(parent, allocator);
+    const node = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(node, allocator);
+    const sibling = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(sibling, allocator);
+    const near = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(near, allocator);
 
-    const parent_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(parent_expected, &allocator);
-    const node_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(node_expected, &allocator);
-    const near_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(near_expected, &allocator);
-    const sibling_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(sibling_expected, &allocator);
+    const parent_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(parent_expected, allocator);
+    const node_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(node_expected, allocator);
+    const near_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(near_expected, allocator);
+    const sibling_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(sibling_expected, allocator);
 
     parent.* = .{
         .data = 10,
@@ -984,7 +984,7 @@ test "removeFix case 3: black sibling, red near child" {
         .parent = near_expected,
     };
 
-    var tree = Tree.init(&allocator);
+    var tree = Tree.init(allocator);
     tree.root = parent;
 
     tree.removeFix(node);
@@ -994,21 +994,21 @@ test "removeFix case 3: black sibling, red near child" {
 
 test "removeFix case 4: black sibling, black children" {
     const Tree = RedBlackTree(i32, i32Order, false);
-    var allocator = std.testing.allocator;
+    const allocator = std.testing.allocator;
 
-    const parent = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(parent, &allocator);
-    const node = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(node, &allocator);
-    const sibling = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(sibling, &allocator);
+    const parent = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(parent, allocator);
+    const node = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(node, allocator);
+    const sibling = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(sibling, allocator);
 
-    const parent_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(parent_expected, &allocator);
-    const node_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(node_expected, &allocator);
-    const sibling_expected = try Tree.testCreateNode(&allocator);
-    defer Tree.testDestroyNode(sibling_expected, &allocator);
+    const parent_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(parent_expected, allocator);
+    const node_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(node_expected, allocator);
+    const sibling_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(sibling_expected, allocator);
 
     parent.* = .{
         .data = 10,
@@ -1048,7 +1048,7 @@ test "removeFix case 4: black sibling, black children" {
         .parent = parent_expected,
     };
 
-    var tree = Tree.init(&allocator);
+    var tree = Tree.init(allocator);
     tree.root = parent;
 
     tree.removeFix(node);
@@ -1057,11 +1057,11 @@ test "removeFix case 4: black sibling, black children" {
 }
 
 test "insert remove insert cycles maintain red-black tree invariants" {
-    var allocator = std.testing.allocator;
+    const allocator = std.testing.allocator;
 
     const Tree = RedBlackTree(i32, i32Order, false);
 
-    var tree = Tree.init(&allocator);
+    var tree = Tree.init(allocator);
     defer tree.deinit();
 
     const initial_values = [_]i32{ 10, 5, 15, 3, 7, 12, 18, 1, 4, 6, 8, 11, 13, 16, 20 };

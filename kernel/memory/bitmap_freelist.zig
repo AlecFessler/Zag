@@ -13,14 +13,14 @@ pub fn BitmapFreeList(
         hint: if (using_getNextFree) usize else void =
             if (using_getNextFree) 0,
         bitmap: []Word,
-        allocator: *std.mem.Allocator,
+        allocator: std.mem.Allocator,
 
         pub fn init(
             base_addr: usize,
             block_size: usize,
             num_bits: usize,
             initially_free: bool,
-            allocator: *std.mem.Allocator,
+            allocator: std.mem.Allocator,
         ) !Self {
             const bitmap_size = try std.math.divCeil(
                 usize,
@@ -112,13 +112,13 @@ pub fn BitmapFreeList(
 }
 
 test "setBit sets expected bit and updates hint backward" {
-    var allocator = std.testing.allocator;
+    const allocator = std.testing.allocator;
     var freelist = try BitmapFreeList(true).init(
         0x1000,
         0x1000,
         5,
         true,
-        &allocator,
+        allocator,
     );
     defer freelist.deinit();
 
@@ -135,13 +135,13 @@ test "setBit sets expected bit and updates hint backward" {
 }
 
 test "isFree correctly identifies free blocks" {
-    var allocator = std.testing.allocator;
+    const allocator = std.testing.allocator;
     var freelist = try BitmapFreeList(true).init(
         0x1000,
         0x1000,
         5,
         true,
-        &allocator,
+        allocator,
     );
     defer freelist.deinit();
 
@@ -156,13 +156,13 @@ test "isFree correctly identifies free blocks" {
 }
 
 test "interleaved alloc/free correctly tracks hint" {
-    var allocator = std.testing.allocator;
+    const allocator = std.testing.allocator;
     var freelist = try BitmapFreeList(true).init(
         0x1000,
         0x1000,
         5,
         true,
-        &allocator,
+        allocator,
     );
     defer freelist.deinit();
 
@@ -185,7 +185,7 @@ test "interleaved alloc/free correctly tracks hint" {
 }
 
 test "extra bits in bitmap word are zeroed on init" {
-    var allocator = std.testing.allocator;
+    const allocator = std.testing.allocator;
     const num_bits = word_bit_size - 4;
 
     var freelist = try BitmapFreeList(true).init(
@@ -193,7 +193,7 @@ test "extra bits in bitmap word are zeroed on init" {
         0x1000,
         num_bits,
         true,
-        &allocator,
+        allocator,
     );
     defer freelist.deinit();
 
@@ -205,13 +205,13 @@ test "extra bits in bitmap word are zeroed on init" {
 }
 
 test "setBit clears a bit and advances hint when needed" {
-    var allocator = std.testing.allocator;
+    const allocator = std.testing.allocator;
     var freelist = try BitmapFreeList(true).init(
         0x1000,
         0x1000,
         3,
         false,
-        &allocator,
+        allocator,
     );
     defer freelist.deinit();
 
@@ -229,17 +229,16 @@ test "setBit clears a bit and advances hint when needed" {
 }
 
 test "bitmap without getNextFree support works for basic operations" {
-    var allocator = std.testing.allocator;
+    const allocator = std.testing.allocator;
     var freelist = try BitmapFreeList(false).init(
         0x1000,
         0x1000,
         5,
         true,
-        &allocator,
+        allocator,
     );
     defer freelist.deinit();
 
-    // Should work fine
     try std.testing.expect(freelist.isFree(0x1000));
     freelist.setBit(0x1000, 0);
     try std.testing.expect(!freelist.isFree(0x1000));

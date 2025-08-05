@@ -45,7 +45,7 @@ pub const BuddyAllocator = struct {
     end_addr: usize,
 
     /// Not a backing allocator, this is only used to allocate and free the page orders and bitmap
-    init_allocator: *std.mem.Allocator,
+    init_allocator: std.mem.Allocator,
 
     page_pair_orders: []PagePairOrders = undefined,
     bitmap: BitmapFreeList = undefined,
@@ -54,7 +54,7 @@ pub const BuddyAllocator = struct {
     pub fn init(
         start_addr: usize,
         end_addr: usize,
-        init_allocator: *std.mem.Allocator,
+        init_allocator: std.mem.Allocator,
     ) !BuddyAllocator {
         std.debug.assert(end_addr > start_addr);
         const aligned_start = std.mem.alignForward(
@@ -360,7 +360,7 @@ fn checkAllocationFailure(buddy_alloc: *BuddyAllocator, order: u4) !void {
 }
 
 test "buddy allocator initializes expected pages and orders correctly" {
-    var allocator = std.testing.allocator;
+    const allocator = std.testing.allocator;
 
     var total_size: usize = 10 * ORDERS[10];
     const skip_order: usize = 5;
@@ -378,7 +378,7 @@ test "buddy allocator initializes expected pages and orders correctly" {
     var buddy = try BuddyAllocator.init(
         start_addr,
         end_addr,
-        &allocator,
+        allocator,
     );
     defer buddy.deinit();
 
@@ -440,7 +440,7 @@ test "buddy allocator initializes expected pages and orders correctly" {
 }
 
 test "buddy allocator init fails with failing allocator" {
-    var allocator = std.testing.failing_allocator;
+    const allocator = std.testing.failing_allocator;
 
     var test_allocator = std.testing.allocator;
     const memory = try test_allocator.alignedAlloc(u8, PAGE_SIZE, 5 * ORDERS[10]);
@@ -454,13 +454,13 @@ test "buddy allocator init fails with failing allocator" {
         BuddyAllocator.init(
             start_addr,
             end_addr,
-            &allocator,
+            allocator,
         ),
     );
 }
 
 test "recursiveSplit splits larger blocks into smaller ones" {
-    var allocator = std.testing.allocator;
+    const allocator = std.testing.allocator;
 
     const memory = try allocator.alignedAlloc(u8, PAGE_SIZE, ORDERS[1]);
     defer allocator.free(memory);
@@ -468,7 +468,11 @@ test "recursiveSplit splits larger blocks into smaller ones" {
     const start_addr = @intFromPtr(memory.ptr);
     const end_addr = start_addr + ORDERS[1];
 
-    var buddy = try BuddyAllocator.init(start_addr, end_addr, &allocator);
+    var buddy = try BuddyAllocator.init(
+        start_addr,
+        end_addr,
+        allocator,
+    );
     defer buddy.deinit();
 
     try std.testing.expect(buddy.freelists[1].head != null);
@@ -491,7 +495,7 @@ test "recursiveSplit splits larger blocks into smaller ones" {
 }
 
 test "recursiveMerge coalesces adjacent buddies and returns final state" {
-    var allocator = std.testing.allocator;
+    const allocator = std.testing.allocator;
 
     const memory = try allocator.alignedAlloc(u8, PAGE_SIZE, ORDERS[1]);
     defer allocator.free(memory);
@@ -499,7 +503,11 @@ test "recursiveMerge coalesces adjacent buddies and returns final state" {
     const start_addr = @intFromPtr(memory.ptr);
     const end_addr = start_addr + ORDERS[1];
 
-    var buddy = try BuddyAllocator.init(start_addr, end_addr, &allocator);
+    var buddy = try BuddyAllocator.init(
+        start_addr,
+        end_addr,
+        allocator,
+    );
     defer buddy.deinit();
 
     const addr1 = buddy.recursiveSplit(0).?;
@@ -529,7 +537,11 @@ test "out of bounds buddy handling - fragmentation recovery" {
     const start_addr = @intFromPtr(memory.ptr);
     const end_addr = start_addr + total_size;
 
-    var buddy = try BuddyAllocator.init(start_addr, end_addr, &test_allocator);
+    var buddy = try BuddyAllocator.init(
+        start_addr,
+        end_addr,
+        test_allocator,
+    );
     defer buddy.deinit();
 
     var allocator = buddy.allocator();
@@ -574,7 +586,11 @@ test "complex allocation and deallocation with state verification" {
     const start_addr = @intFromPtr(memory.ptr);
     const end_addr = start_addr + total_size;
 
-    var buddy = try BuddyAllocator.init(start_addr, end_addr, &test_allocator);
+    var buddy = try BuddyAllocator.init(
+        start_addr,
+        end_addr,
+        test_allocator,
+    );
     defer buddy.deinit();
 
     var allocator = buddy.allocator();

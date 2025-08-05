@@ -39,7 +39,7 @@ pub fn SlabAllocator(
         /// whoever made the allocation, or we could deinit anyway, but then it's leaked.
         allocations: if (DBG) i64 else void,
 
-        backing_allocator: *std.mem.Allocator,
+        backing_allocator: std.mem.Allocator,
 
         /// The stack array is intended to allow for things like the vmm's rbt to allocate nodes
         /// for initial allocations so the vmm can do the necessary bookkeeping while avoiding a
@@ -53,7 +53,7 @@ pub fn SlabAllocator(
         alloc_headers: ?*AllocHeader = null,
 
         pub fn init(
-            backing_allocator: *std.mem.Allocator,
+            backing_allocator: std.mem.Allocator,
         ) !Self {
             var self: Self = .{
                 .allocations = if (DBG) 0,
@@ -210,14 +210,14 @@ test "stack exhaustion and transition" {
     const stack_size = 4;
     const allocation_chunk_size = 8;
 
-    var test_allocator = std.testing.allocator;
+    const test_allocator = std.testing.allocator;
 
     var slab_allocator = try SlabAllocator(
         TestType,
         stack_bootstrap,
         stack_size,
         allocation_chunk_size,
-    ).init(&test_allocator);
+    ).init(test_allocator);
     defer slab_allocator.deinit();
 
     const allocator = slab_allocator.allocator();
@@ -241,14 +241,14 @@ test "stack bootstrap stress test" {
     const stack_size = 4;
     const allocation_chunk_size = 16;
 
-    var test_allocator = std.testing.allocator;
+    const test_allocator = std.testing.allocator;
 
     var slab_allocator = try SlabAllocator(
         TestType,
         stack_bootstrap,
         stack_size,
         allocation_chunk_size,
-    ).init(&test_allocator);
+    ).init(test_allocator);
     defer slab_allocator.deinit();
 
     const allocator = slab_allocator.allocator();
@@ -289,14 +289,14 @@ test "allocation failure with exhausted stack" {
     const stack_size = 3;
     const allocation_chunk_size = 8;
 
-    var test_allocator = std.testing.allocator;
+    const test_allocator = std.testing.allocator;
 
     var slab_allocator = try SlabAllocator(
         TestType,
         stack_bootstrap,
         stack_size,
         allocation_chunk_size,
-    ).init(&test_allocator);
+    ).init(test_allocator);
     defer slab_allocator.deinit();
 
     const allocator = slab_allocator.allocator();
@@ -311,13 +311,13 @@ test "allocation failure with exhausted stack" {
         std.testing.allocator,
         .{ .fail_index = 0 },
     );
-    var failing_alloc = failing_allocator.allocator();
-    slab_allocator.backing_allocator = &failing_alloc;
+    const failing_alloc = failing_allocator.allocator();
+    slab_allocator.backing_allocator = failing_alloc;
 
     const result = allocator.create(TestType);
     try std.testing.expect(result == error.OutOfMemory);
 
-    slab_allocator.backing_allocator = &test_allocator;
+    slab_allocator.backing_allocator = test_allocator;
 
     for (stack_objs) |ptr| allocator.destroy(ptr);
 }
@@ -327,14 +327,14 @@ test "basic create destroy cycle" {
     const stack_size = 0;
     const allocation_chunk_size = 16;
 
-    var test_allocator = std.testing.allocator;
+    const test_allocator = std.testing.allocator;
 
     var slab_allocator = try SlabAllocator(
         TestType,
         stack_bootstrap,
         stack_size,
         allocation_chunk_size,
-    ).init(&test_allocator);
+    ).init(test_allocator);
     defer slab_allocator.deinit();
 
     const allocator = slab_allocator.allocator();
@@ -366,14 +366,14 @@ test "memory leak detection" {
     const stack_size = 0;
     const allocation_chunk_size = 32;
 
-    var test_allocator = std.testing.allocator;
+    const test_allocator = std.testing.allocator;
 
     var slab_allocator = try SlabAllocator(
         TestType,
         stack_bootstrap,
         stack_size,
         allocation_chunk_size,
-    ).init(&test_allocator);
+    ).init(test_allocator);
     defer slab_allocator.deinit();
 
     const allocator = slab_allocator.allocator();

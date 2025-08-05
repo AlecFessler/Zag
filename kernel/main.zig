@@ -51,17 +51,17 @@ export fn kmain(
         kernel_end,
         available_region.addr + available_region.len,
     );
-    var bump_alloc_iface = bump_allocator.allocator();
+    const bump_alloc_iface = bump_allocator.allocator();
 
-    var pmm = PhysicalMemoryManager.init(&bump_alloc_iface);
-    var pmm_alloc_iface = pmm.allocator();
+    var pmm = PhysicalMemoryManager.init(bump_alloc_iface);
+    const pmm_alloc_iface = pmm.allocator();
 
-    var vmm = VirtualMemoryManager.init(&pmm_alloc_iface);
-    var vmm_alloc_iface = vmm.allocator();
+    var vmm = VirtualMemoryManager.init(pmm_alloc_iface);
+    const vmm_alloc_iface = vmm.allocator();
 
     const slice = vmm_alloc_iface.alloc(
         PageMem(.Page4K),
-        t,
+        1,
     ) catch @panic("alloc failed\n");
     const addr = @intFromPtr(slice.ptr);
 
