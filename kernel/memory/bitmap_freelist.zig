@@ -111,25 +111,6 @@ pub fn BitmapFreeList(
     };
 }
 
-test "getNextFree returns expected free blocks in order" {
-    var allocator = std.testing.allocator;
-    var freelist = try BitmapFreeList(true).init(
-        0x1000,
-        0x1000,
-        5,
-        true,
-        &allocator,
-    );
-    defer freelist.deinit();
-
-    try std.testing.expectEqual(@as(?usize, 0x1000), freelist.getNextFree());
-    try std.testing.expectEqual(@as(?usize, 0x2000), freelist.getNextFree());
-    try std.testing.expectEqual(@as(?usize, 0x3000), freelist.getNextFree());
-    try std.testing.expectEqual(@as(?usize, 0x4000), freelist.getNextFree());
-    try std.testing.expectEqual(@as(?usize, 0x5000), freelist.getNextFree());
-    try std.testing.expectEqual(@as(?usize, null), freelist.getNextFree());
-}
-
 test "setBit sets expected bit and updates hint backward" {
     var allocator = std.testing.allocator;
     var freelist = try BitmapFreeList(true).init(

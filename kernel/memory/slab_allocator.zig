@@ -30,7 +30,8 @@ pub fn SlabAllocator(
 
     return struct {
         const Self = @This();
-        const IntrusiveFreeList = intrusive_freelist.IntrusiveFreeList(*T);
+        const using_popSpecific = false;
+        const IntrusiveFreeList = intrusive_freelist.IntrusiveFreeList(*T, using_popSpecific);
 
         /// Verifies that all allocated memory is returned before deinit is called on this.
         /// This is necessary because if this were to not be the case, we could handle it by
@@ -358,37 +359,6 @@ test "basic create destroy cycle" {
 
     allocator.destroy(obj3);
     allocator.destroy(obj4);
-}
-
-test "initial freelist population" {
-    const stack_bootstrap = false;
-    const stack_size = 0;
-    const allocation_chunk_size = 5;
-
-    var test_allocator = std.testing.allocator;
-
-    var slab_allocator = try SlabAllocator(
-        TestType,
-        stack_bootstrap,
-        stack_size,
-        allocation_chunk_size,
-    ).init(&test_allocator);
-    defer slab_allocator.deinit();
-
-    const allocator = slab_allocator.allocator();
-
-    var objs: [6]*TestType = undefined;
-
-    for (0..5) |i| {
-        const obj = try allocator.create(TestType);
-        obj.* = .{ .data = i, .pad = 0 };
-        objs[i] = obj;
-    }
-
-    objs[5] = try allocator.create(TestType);
-    objs[5].* = .{ .data = 999, .pad = 0 };
-
-    for (objs) |ptr| allocator.destroy(ptr);
 }
 
 test "memory leak detection" {

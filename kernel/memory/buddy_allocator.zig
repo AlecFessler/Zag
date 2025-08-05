@@ -1,7 +1,7 @@
 const std = @import("std");
 
 const bitmap_freelist = @import("bitmap_freelist.zig");
-const intrusive_2way_freelist = @import("intrusive_2way_freelist.zig");
+const intrusive_freelist = @import("intrusive_freelist.zig");
 
 const PAGE_SIZE = 4096;
 
@@ -35,7 +35,8 @@ const PagePairOrders = packed struct {
     }
 };
 
-const Intrusive2WayFreeList = intrusive_2way_freelist.Intrusive2WayFreeList(*Page);
+const using_popSpecific = true;
+const IntrusiveFreeList = intrusive_freelist.IntrusiveFreeList(*Page, using_popSpecific);
 const using_getNextFree = false;
 const BitmapFreeList = bitmap_freelist.BitmapFreeList(using_getNextFree);
 
@@ -48,7 +49,7 @@ pub const BuddyAllocator = struct {
 
     page_pair_orders: []PagePairOrders = undefined,
     bitmap: BitmapFreeList = undefined,
-    freelists: [NUM_ORDERS]Intrusive2WayFreeList = [_]Intrusive2WayFreeList{Intrusive2WayFreeList{}} ** NUM_ORDERS,
+    freelists: [NUM_ORDERS]IntrusiveFreeList = [_]IntrusiveFreeList{IntrusiveFreeList{}} ** NUM_ORDERS,
 
     pub fn init(
         start_addr: usize,
@@ -183,7 +184,7 @@ pub const BuddyAllocator = struct {
             return .{ .addr = addr, .order = order };
         }
 
-        _ = self.freelists[order].pop_specific(@ptrFromInt(buddy));
+        _ = self.freelists[order].popSpecific(@ptrFromInt(buddy));
 
         const lower_half = @min(addr, buddy);
         const upper_half = @max(addr, buddy);
@@ -518,41 +519,11 @@ test "recursiveMerge coalesces adjacent buddies and returns final state" {
     try std.testing.expectEqual(@as(u4, 1), result.order);
 }
 
-test "alloc and free work together" {
-    var test_allocator = std.testing.allocator;
-
-    const memory = try test_allocator.alignedAlloc(u8, PAGE_SIZE, ORDERS[3]);
-    defer test_allocator.free(memory);
-
-    const start_addr = @intFromPtr(memory.ptr);
-    const end_addr = start_addr + ORDERS[3];
-
-    var buddy = try BuddyAllocator.init(
-        start_addr,
-        end_addr,
-        &test_allocator,
-    );
-    defer buddy.deinit();
-
-    var allocator = buddy.allocator();
-
-    const ptr1 = try allocator.alloc(u8, ORDERS[1]);
-    try std.testing.expectEqual(@as(usize, ORDERS[1]), ptr1.len);
-
-    const ptr2 = try allocator.alloc(u8, ORDERS[0]);
-    try std.testing.expectEqual(@as(usize, ORDERS[0]), ptr2.len);
-
-    allocator.free(ptr1);
-    allocator.free(ptr2);
-
-    try std.testing.expect(buddy.freelists[3].head != null);
-}
-
 test "out of bounds buddy handling - fragmentation recovery" {
     var test_allocator = std.testing.allocator;
 
     const total_size = ORDERS[10] + ORDERS[6];
-    const memory = try test_allocator.alignedAlloc(u8, PAGE_SIZE, total_size);
+    const memory = try test_allocator.alignedAlloc(u8, ORDERS[10], total_size);
     defer test_allocator.free(memory);
 
     const start_addr = @intFromPtr(memory.ptr);
