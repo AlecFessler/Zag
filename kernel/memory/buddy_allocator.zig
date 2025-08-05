@@ -36,7 +36,8 @@ const PagePairOrders = packed struct {
 };
 
 const Intrusive2WayFreeList = intrusive_2way_freelist.Intrusive2WayFreeList(*Page);
-const BitmapFreeList = bitmap_freelist.BitmapFreeList;
+const using_getNextFree = false;
+const BitmapFreeList = bitmap_freelist.BitmapFreeList(using_getNextFree);
 
 pub const BuddyAllocator = struct {
     start_addr: usize,
@@ -152,27 +153,18 @@ pub const BuddyAllocator = struct {
 
     /// Intended to be called in free every time a block is returned
     /// so that coalescing can be performed if possible
-    ///
-    /// In theory, the buddy out of bounds case only ever occurs at the end
-    /// because it's only the blocks initialized to an order < 10 that it
-    /// happens to, and since we initialize all of the order 10 blocks first,
-    /// there *should* only be smaller blocks that have buddies out of bounds
-    /// at the very end of the address space. As such, we should be able to only
-    /// check the upper bounds and assume the buddy is never outside of the lower
-    /// bounds. Assertions have been added to ensure I am proven wrong in the case
-    /// that I am in fact, an idiot.
     fn recursiveMerge(self: *BuddyAllocator, addr: usize) struct { addr: usize, order: u4 } {
         const order = self.getOrder(addr);
-        const buddy = addr ^ ORDERS[order];
+        if (order == 10) {
+            return .{ .addr = addr, .order = order };
+        }
 
-        std.debug.assert(buddy >= self.start_addr);
-        const buddy_out_of_bounds = buddy >= self.end_addr;
-        if (buddy_out_of_bounds and order < 10) {
+        const buddy = addr ^ ORDERS[order];
+        const buddy_out_of_bounds = buddy < self.start_addr or buddy >= self.end_addr;
+        if (buddy_out_of_bounds) {
             const next_size_addr = addr & ~ORDERS[order + 1];
             const next_size_end = next_size_addr + ORDERS[order + 1];
-
-            std.debug.assert(next_size_addr >= self.start_addr);
-            const next_size_within_bounds = next_size_end <= self.end_addr;
+            const next_size_within_bounds = next_size_addr >= self.start_addr and next_size_end <= self.end_addr;
             if (next_size_within_bounds) {
                 self.setOrder(next_size_addr, order + 1);
                 return self.recursiveMerge(next_size_addr);
