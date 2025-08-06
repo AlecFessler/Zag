@@ -34,20 +34,24 @@ pub fn IntrusiveFreeList(
         pub fn push(self: *Self, addr: T) void {
             zeroItem(@ptrCast(addr));
             const node: *FreeNode = @alignCast(@ptrCast(addr));
+
             if (DBG) node.dbg_magic = DBG_MAGIC;
             if (using_popSpecific) {
                 if (self.head) |head| head.prev = node;
                 node.prev = null;
             }
+
             node.next = self.head;
             self.head = node;
         }
 
         pub fn pop(self: *Self) ?T {
             const addr = self.head orelse return null;
+
             if (DBG) std.debug.assert(addr.dbg_magic == DBG_MAGIC);
-            self.head = addr.next;
             if (using_popSpecific) addr.prev = null;
+
+            self.head = addr.next;
             zeroItem(@ptrCast(addr));
             return @alignCast(@ptrCast(addr));
         }

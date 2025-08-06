@@ -40,6 +40,9 @@ const IntrusiveFreeList = intrusive_freelist.IntrusiveFreeList(*Page, using_popS
 const using_getNextFree = false;
 const BitmapFreeList = bitmap_freelist.BitmapFreeList(using_getNextFree);
 
+/// Return type for splitAllocation, a linked list of blocks of the requested order
+pub const FreeListBatch = intrusive_freelist.IntrusiveFreeList(*Page, !using_popSpecific);
+
 pub const BuddyAllocator = struct {
     start_addr: usize,
     end_addr: usize,
@@ -124,6 +127,33 @@ pub const BuddyAllocator = struct {
                 .free = free,
             },
         };
+    }
+
+    /// Takes an existing allocation of some order and splits it into
+    /// a linked list of smaller order blocks that can be individually
+    /// returned to the buddy allocator.
+    /// The purpose of this is to save on split merge calls when you want
+    /// to allocate a large number of some order of allocations, for example
+    /// when the pmm wants to reload a cpu's cache of single pages
+    pub fn splitAllocation(
+        self: *BuddyAllocator,
+        addr: usize,
+        split_order: u4,
+    ) FreeListBatch {
+        const order = self.getOrder(addr);
+        std.debug.assert(split_order < order);
+
+        var batch: FreeListBatch = .{};
+
+        var current_addr = addr;
+        const end_addr = addr + ORDERS[order];
+        const block_size = ORDERS[split_order];
+        while (current_addr < end_addr) : (current_addr += block_size) {
+            self.setOrder(current_addr, split_order);
+            batch.push(@ptrFromInt(current_addr));
+        }
+
+        return batch;
     }
 
     /// Intended to be called by alloc if the current order's freelist
@@ -570,6 +600,52 @@ test "out of bounds buddy handling - fragmentation recovery" {
     allocator.free(order_10_ptr);
     _ = allocations.remove(@intFromPtr(order_10_ptr.ptr));
     try validateState(&buddy, &allocations, 4);
+}
+
+test "split allocation handles order changes correctly" {
+    const test_allocator = std.testing.allocator;
+    const total_size: usize = 2 * ORDERS[10];
+    const memory = try test_allocator.alignedAlloc(u8, PAGE_SIZE, total_size);
+    defer test_allocator.free(memory);
+
+    const start_addr = @intFromPtr(memory.ptr);
+    const end_addr = start_addr + total_size;
+
+    var buddy = try BuddyAllocator.init(
+        start_addr,
+        end_addr,
+        test_allocator,
+    );
+    defer buddy.deinit();
+
+    var allocator = buddy.allocator();
+
+    var allocations = AllocationMap.init(test_allocator);
+    defer allocations.deinit();
+
+    var freelist: FreeListBatch = .{};
+
+    const allocation = try allocator.alloc(u8, ORDERS[10]);
+    try allocations.put(@intFromPtr(allocation.ptr), .{ .size = ORDERS[10], .order = 10 });
+    try validateState(&buddy, &allocations, 1);
+
+    _ = allocations.remove(@intFromPtr(allocation.ptr));
+    var split = buddy.splitAllocation(@intFromPtr(allocation.ptr), 0);
+    var count: usize = 0;
+    while (split.pop()) |page| {
+        count += 1;
+        freelist.push(page);
+        try allocations.put(@intFromPtr(page), .{ .size = ORDERS[0], .order = 0 });
+    }
+    try validateState(&buddy, &allocations, 2);
+    try std.testing.expect(count == 1024);
+
+    while (freelist.pop()) |page| {
+        _ = allocations.remove(@intFromPtr(page));
+        const page_slice: []u8 = @as([*]u8, @ptrCast(page))[0..PAGE_SIZE];
+        allocator.free(page_slice);
+        try validateState(&buddy, &allocations, 3);
+    }
 }
 
 test "complex allocation and deallocation with state verification" {
