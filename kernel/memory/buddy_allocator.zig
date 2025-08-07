@@ -43,6 +43,7 @@ const BitmapFreeList = bitmap_freelist.BitmapFreeList(using_getNextFree);
 /// Return type for splitAllocation, a linked list of blocks of the requested order
 pub const FreeListBatch = intrusive_freelist.IntrusiveFreeList(*Page, !using_popSpecific);
 
+/// Owning allocator. Manages a contiguous address space, does not take a backing allocator, can act as a backing allocator;
 pub const BuddyAllocator = struct {
     start_addr: usize,
     end_addr: usize,
