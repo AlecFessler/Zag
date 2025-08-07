@@ -37,7 +37,7 @@ pub fn RedBlackTree(
             }
         };
 
-        const Node = struct {
+        pub const Node = struct {
             color: Color,
             children: [2]?*Node,
             parent: ?*Node,
