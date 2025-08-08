@@ -227,7 +227,7 @@ pub fn RedBlackTree(
             self.root.?.color = Color.Black;
         }
 
-        pub fn remove(self: *Self, data: T) !void {
+        pub fn remove(self: *Self, data: T) !T {
             var parent: ?*Node = null;
             var current: ?*Node = self.root orelse return ContainerError.NotFound;
 
@@ -242,6 +242,7 @@ pub fn RedBlackTree(
 
             if (current == null) return ContainerError.NotFound;
             var target = current.?;
+            const removed = target.data;
 
             const one_child_at_most = target.getChild(Direction.left) == null or target.getChild(Direction.right) == null;
             if (one_child_at_most) {
@@ -297,6 +298,8 @@ pub fn RedBlackTree(
                 target.data = successor.data;
                 successor.destroy(self.allocator);
             }
+
+            return removed;
         }
 
         fn removeFix(
@@ -390,6 +393,35 @@ pub fn RedBlackTree(
 
             new_parent.setChild(pivot, d);
             pivot.parent = new_parent;
+        }
+
+        pub fn findNeighbors(self: *Self, data: T) struct {
+            lower: ?T,
+            upper: ?T,
+        } {
+            var current = self.root;
+            var lower: ?T = null;
+            var upper: ?T = null;
+
+            while (current) |node| {
+                switch (cmpFn(data, node.data)) {
+                    .lt => {
+                        upper = node.data;
+                        current = node.getChild(.left);
+                    },
+                    .gt => {
+                        lower = node.data;
+                        current = node.getChild(.right);
+                    },
+                    .eq => {
+                        lower = node.data;
+                        upper = node.data;
+                        break;
+                    },
+                }
+            }
+
+            return .{ .lower = lower, .upper = upper };
         }
 
         /// helper function so that test cases can access T typed Node
@@ -524,7 +556,7 @@ test "insert then remove and not contains" {
 
     try tree.insert(7);
     try std.testing.expect(tree.contains(7));
-    try tree.remove(7);
+    _ = try tree.remove(7);
     try std.testing.expect(!tree.contains(7));
 }
 
@@ -1071,7 +1103,7 @@ test "insert remove insert cycles maintain red-black tree invariants" {
 
     const to_remove_1 = [_]i32{ 3, 15, 8, 1 };
     for (to_remove_1) |val| {
-        try tree.remove(val);
+        _ = try tree.remove(val);
     }
 
     const to_insert_2 = [_]i32{ 2, 9, 14, 17, 25, 30 };
@@ -1081,7 +1113,7 @@ test "insert remove insert cycles maintain red-black tree invariants" {
 
     const to_remove_2 = [_]i32{ 7, 12, 20, 2 };
     for (to_remove_2) |val| {
-        try tree.remove(val);
+        _ = try tree.remove(val);
     }
 
     const to_insert_3 = [_]i32{ 22, 26, 35, 40, 45 };
@@ -1112,4 +1144,21 @@ test "insert remove insert cycles maintain red-black tree invariants" {
     for (expected_absent) |val| {
         try std.testing.expect(!tree.contains(val));
     }
+}
+
+test "findNeighbors returns correct lower and upper" {
+    const allocator = std.testing.allocator;
+    const Tree = RedBlackTree(i32, i32Order, false);
+    var tree = Tree.init(allocator);
+    defer tree.deinit();
+
+    try tree.insert(10);
+    try tree.insert(20);
+    try tree.insert(40);
+    try tree.insert(50);
+
+    const neighbors = tree.findNeighbors(30);
+
+    try std.testing.expectEqual(@as(?i32, 20), neighbors.lower);
+    try std.testing.expectEqual(@as(?i32, 40), neighbors.upper);
 }
