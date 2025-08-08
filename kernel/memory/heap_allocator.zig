@@ -1,57 +1,51 @@
 const std = @import("std");
 
-const rbt = @import("../containers.zig").RedBlackTree;
+const rbt = @import("red_black_tree.zig");
 const slab_allocator = @import("slab_allocator.zig");
+
+const FUZZY_REMOVE_MAGIC = 0xFFFF_FFFF_FFFF_FFFF;
 
 const TreeEntry = struct {
     addr: usize,
+    alignment: usize,
     len: usize,
 
-    fn allocCmpFn(first: TreeEntry, second: TreeEntry) std.math.Order {
-        return std.math.order(first.addr, second.addr);
+    fn addrCmpFn(target: TreeEntry, other: TreeEntry) std.math.Order {
+        return std.math.order(target.addr, other.addr);
     }
 
-    /// The free tree is sorted by length first for efficient best fit searches
-    /// and then by alignment second to ensure alignment requirements of
-    /// allocations are met
+    /// The free tree is sorted by length target for efficient best fit searches
+    /// and then by alignment other to ensure alignment requirements of
+    /// allocations are met and then lastly by address so that strict address
+    /// equality checks can be performed if the target address is not 2^64 - 1
     /// Length equality allows up to 20% extra space before it starts
     /// matching by alignment instead
-    fn freeCmpFn(first: TreeEntry, second: TreeEntry) std.math.Order {
+    fn freeCmpFn(target: TreeEntry, other: TreeEntry) std.math.Order {
         const slack_ratio = 5;
-        const slack_allowed = first.len / slack_ratio;
-        const max_len = first.len + slack_allowed;
+        const slack_allowed = target.len / slack_ratio;
+        const max_len = target.len + slack_allowed;
 
-        const len_same = first.len <= second.len and second.len < max_len;
-        const len_less = first.len < second.len;
-        const len_greater = first.len > second.len;
-
-        if (len_same) {
-            const first_align = @as(usize, 1) << @ctz(first.addr);
-            const second_align = @as(usize, 1) << @ctz(second.addr);
-
-            const align_same = first_align == second_align;
-            const align_less = first_align < second_align;
-            const align_greater = first_align > second_align;
-
-            if (align_same) {
-                return std.math.Order.eq;
-            } else if (align_less) {
-                return std.math.Order.lt;
-            } else if (align_greater) {
-                return std.math.Order.gt;
-            }
-        } else if (len_less) {
-            return std.math.Order.lt;
-        } else if (len_greater) {
-            return std.math.Order.gt;
+        const len_same = target.len <= other.len and other.len < max_len;
+        if (!len_same) {
+            return std.math.order(target.len, other.len);
         }
+
+        const align_order = std.math.order(target.alignment, other.alignment);
+        if (align_order != .eq) {
+            return align_order;
+        }
+
+        if (target.addr == FUZZY_REMOVE_MAGIC) {
+            return std.math.Order.eq;
+        }
+        return std.math.order(target.addr, other.addr);
     }
 };
 
 const duplicate_is_error = true;
-const AllocTree = rbt.RedBlackTree(
+const AddrTree = rbt.RedBlackTree(
     TreeEntry,
-    TreeEntry.allocCmpFn,
+    TreeEntry.addrCmpFn,
     duplicate_is_error,
 );
 const FreeTree = rbt.RedBlackTree(
@@ -73,29 +67,33 @@ const TreeAllocator = slab_allocator.SlabAllocator(
 /// Delegating allocator. Requires a backing allocator, can also act as a backing allocator.
 pub const HeapAllocator = struct {
     backing_allocator: std.mem.Allocator,
-    alloc_tree: AllocTree,
-    free_tree: FreeTree,
     tree_allocator: TreeAllocator,
+    alloc_addr_tree: AddrTree,
+    free_addr_tree: AddrTree,
+    free_tree: FreeTree,
 
     /// The backing allocator is used both by the slab allocator that the
     /// tree uses, and by the heap allocator itself when the tree doesn't
     /// contain a suitable best fit for a given allocation
     pub fn init(
         backing_allocator: std.mem.Allocator,
-    ) HeapAllocator {
-        const tree_allocator = TreeAllocator.init(backing_allocator);
-        const alloc_tree = AllocTree.init(tree_allocator.allocator());
+    ) !HeapAllocator {
+        var tree_allocator = try TreeAllocator.init(backing_allocator);
+        const alloc_addr_tree = AddrTree.init(tree_allocator.allocator());
+        const free_addr_tree = AddrTree.init(tree_allocator.allocator());
         const free_tree = FreeTree.init(tree_allocator.allocator());
         return .{
             .backing_allocator = backing_allocator,
-            .alloc_tree = alloc_tree,
-            .free_tree = free_tree,
             .tree_allocator = tree_allocator,
+            .alloc_addr_tree = alloc_addr_tree,
+            .free_addr_tree = free_addr_tree,
+            .free_tree = free_tree,
         };
     }
 
     pub fn deinit(self: *HeapAllocator) void {
-        self.alloc_tree.deinit();
+        self.alloc_addr_tree.deinit();
+        self.free_addr_tree.deinit();
         self.free_tree.deinit();
         self.tree_allocator.deinit();
         // for now this is assumed to use a bump allocator as a backing allocator
@@ -121,10 +119,11 @@ pub const HeapAllocator = struct {
         ret_addr: usize,
     ) ?[*]u8 {
         const self: *HeapAllocator = @alignCast(@ptrCast(ptr));
-        const best_fit = self.tree.remove(.{
+        const best_fit = self.free_tree.remove(.{
             // using alignment for addr is valid because it provides
             // the cmpFn with an address that has the required alignment
-            .addr = alignment,
+            .addr = FUZZY_REMOVE_MAGIC,
+            .alignment = alignment.toByteUnits(),
             .len = len,
         }) catch {
             const mem = self.backing_allocator.rawAlloc(
@@ -132,20 +131,28 @@ pub const HeapAllocator = struct {
                 alignment,
                 ret_addr,
             ) orelse return null;
-            self.alloc_tree.insert(.{
+            self.alloc_addr_tree.insert(.{
                 .addr = @intFromPtr(mem),
+                .alignment = alignment.toByteUnits(),
                 .len = len,
-            });
+            }) catch |e| switch (e) {
+                error.OutOfMemory => return null,
+                error.Duplicate => unreachable,
+                error.NotFound => unreachable,
+            };
             return mem;
         };
-        self.alloc_tree.insert(best_fit);
+        _ = self.free_addr_tree.remove(best_fit) catch unreachable;
+        self.alloc_addr_tree.insert(best_fit) catch |e| switch (e) {
+            error.OutOfMemory => return null,
+            error.Duplicate => unreachable,
+            error.NotFound => unreachable,
+        };
         return @ptrFromInt(best_fit.addr);
     }
 
     // no op
-    // intentionally left a no op because it would only be able
-    // to resize in place by up to the amount in slack that was
-    // left from an earlier larger allocation that was freed
+    // could potentially implement this using the findNeighbors tree operation
     fn resize(
         ptr: *anyopaque,
         memory: []u8,
@@ -189,12 +196,112 @@ pub const HeapAllocator = struct {
         _ = alignment;
         _ = ret_addr;
         const self: *HeapAllocator = @alignCast(@ptrCast(ptr));
-        const removed = self.alloc_tree.remove(.{
+        var freed = self.alloc_addr_tree.remove(.{
             .addr = @intFromPtr(buf.ptr),
-            .len = 0, // len doesn't matter for alloc tree comparison
+            .alignment = 0, // alignment doesn't matter for alloc tree comparison
+            .len = 0, // neither does len
         }) catch unreachable;
-        self.free_tree.insert(removed);
+
+        const neighbors = self.free_addr_tree.findNeighbors(freed);
+        const lower = neighbors.lower;
+        const upper = neighbors.upper;
+
+        const can_coalesce_lower = lower != null and lower.?.addr + lower.?.len == freed.addr;
+        const can_coalesce_upper = upper != null and freed.addr + freed.len == upper.?.addr;
+
+        if (!can_coalesce_lower and !can_coalesce_upper) {
+            freed.alignment = @as(usize, 1) << @intCast(@ctz(freed.addr));
+            self.free_tree.insert(freed) catch unreachable;
+            self.free_addr_tree.insert(freed) catch unreachable;
+            return;
+        }
+
+        if (can_coalesce_lower) {
+            freed.addr = lower.?.addr;
+            freed.alignment = lower.?.alignment;
+            freed.len = lower.?.len + freed.len;
+            _ = self.free_tree.remove(lower.?) catch unreachable;
+            _ = self.free_addr_tree.remove(lower.?) catch unreachable;
+        }
+
+        if (can_coalesce_upper) {
+            freed.len = freed.len + upper.?.len;
+            _ = self.free_tree.remove(upper.?) catch unreachable;
+            _ = self.free_addr_tree.remove(upper.?) catch unreachable;
+        }
+
+        self.free_tree.insert(freed) catch unreachable;
+        self.free_addr_tree.insert(freed) catch unreachable;
     }
 };
 
-// TODO: implement tests
+test "HeapAllocator integration: allocation, free, and coalescing behavior" {
+    const bump = @import("bump_allocator.zig");
+
+    const allocator = std.testing.allocator;
+
+    const backing_mem = try allocator.alloc(u8, 4096);
+    defer allocator.free(backing_mem);
+
+    var bump_alloc = bump.BumpAllocator.init(
+        @intFromPtr(backing_mem.ptr),
+        @intFromPtr(backing_mem.ptr) + backing_mem.len,
+    );
+
+    var heap = try HeapAllocator.init(bump_alloc.allocator());
+    defer heap.deinit();
+
+    const heap_allocator = heap.allocator();
+
+    const block_size = 64;
+    const first = try heap_allocator.alloc(u8, block_size);
+    try std.testing.expect(heap.alloc_addr_tree.contains(.{
+        .addr = @intFromPtr(first.ptr),
+        .alignment = 0,
+        .len = 0,
+    }));
+
+    heap_allocator.free(first);
+
+    try std.testing.expect(heap.free_tree.contains(.{
+        .addr = @intFromPtr(first.ptr),
+        .alignment = @as(usize, 1) << @intCast(@ctz(@intFromPtr(first.ptr))),
+        .len = block_size,
+    }));
+
+    try std.testing.expect(heap.free_addr_tree.contains(.{
+        .addr = @intFromPtr(first.ptr),
+        .alignment = 0,
+        .len = 0,
+    }));
+
+    const second = try heap_allocator.alloc(u8, block_size - 1);
+    try std.testing.expect(heap.alloc_addr_tree.contains(.{
+        .addr = @intFromPtr(second.ptr),
+        .alignment = 0,
+        .len = block_size,
+    }));
+
+    const third = try heap_allocator.alloc(u8, block_size);
+    const fourth = try heap_allocator.alloc(u8, block_size);
+
+    heap_allocator.free(second);
+    heap_allocator.free(fourth);
+
+    heap_allocator.free(third);
+
+    const merged_addr = @intFromPtr(first.ptr);
+    const merged_len = block_size * 3;
+
+    try std.testing.expect(heap.free_tree.contains(.{
+        .addr = merged_addr,
+        .alignment = @as(usize, 1) << @intCast(@ctz(merged_addr)),
+        .len = merged_len,
+    }));
+
+    try std.testing.expect(heap.free_addr_tree.contains(.{
+        .addr = merged_addr,
+        .alignment = 0,
+        .len = 0,
+    }));
+}
