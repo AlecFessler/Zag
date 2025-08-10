@@ -7,6 +7,7 @@ const DBG_MAGIC = 0x0DEAD2A6DEAD2A60;
 pub fn IntrusiveFreeList(
     comptime T: type,
     comptime using_popSpecific: bool,
+    comptime link_to_base: bool,
 ) type {
 
     // intrusive freelist expects writeable pointers
@@ -24,6 +25,7 @@ pub fn IntrusiveFreeList(
             dbg_magic: if (DBG) u64 else void,
             next: ?*FreeNode = null,
             prev: if (using_popSpecific) ?*FreeNode else void = if (using_popSpecific) null,
+            base: if (link_to_base) *Self else void,
         };
 
         comptime {
@@ -39,6 +41,9 @@ pub fn IntrusiveFreeList(
             if (using_popSpecific) {
                 if (self.head) |head| head.prev = node;
                 node.prev = null;
+            }
+            if (link_to_base) {
+                node.base = self;
             }
 
             node.next = self.head;
@@ -95,16 +100,18 @@ pub fn IntrusiveFreeList(
 }
 
 const TestType = struct {
-    pad1: u64,
-    pad2: u64,
+    pad1: usize,
+    pad2: usize,
     pad3: usize,
 };
 
 test "mixed push pop operations with prev validation" {
     const using_popSpecific = false;
+    const link_to_base = false;
     const FreeList = IntrusiveFreeList(
         *TestType,
         using_popSpecific,
+        link_to_base,
     );
     var freelist = FreeList{};
     var values: [5]TestType = .{
@@ -133,9 +140,11 @@ test "mixed push pop operations with prev validation" {
 
 test "popSpecific() works for start, middle, and end" {
     const using_popSpecific = true;
+    const link_to_base = false;
     const FreeList = IntrusiveFreeList(
         *TestType,
         using_popSpecific,
+        link_to_base,
     );
     const FreeNode = FreeList.FreeNode;
     var freelist = FreeList{};
