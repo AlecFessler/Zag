@@ -1,123 +1,117 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const native_endian = builtin.cpu.arch.endian();
 
-const rbt = @import("red_black_tree.zig");
-const slab_allocator = @import("slab_allocator.zig");
 const intrusive_freelist = @import("intrusive_freelist.zig");
+const rbt = @import("red_black_tree.zig");
+const slab_alloc = @import("slab_allocator.zig");
+const GRANULARITY = 8;
+const MAX_ALIGN = @bitSizeOf(u8) * GRANULARITY;
 
-/// Placed at the start of an allocation.
-/// May be some number of bytes away from
-/// the user pointer due to alignment requirements.
-const AllocHeader = packed struct {
+const AllocHeader = packed struct(u56) {
     is_free: bool,
-    alloc_len: u63,
-
-    comptime {
-        std.debug.assert(@sizeOf(AllocHeader == 8));
-    }
+    block_len: u48,
+    alignment: u7,
+    // 8 unused bits
 };
 
-/// Placed right before user pointer in an allocation
-/// to indicate how far back the alloc header is at.
-/// This is included in the len, so this is the offset
-/// from the user pointer backward.
-const AllocPadding = struct {
-    len: usize,
+/// Scaled down by granularity (8) to fit in a single byte.
+const AllocPadding = packed struct(u8) {
+    header_offset: u8,
 };
 
-/// Placed at the end of an allocation once it is free,
-/// indicates how far back the alloc header is at.
-const AllocFooter = struct {
-    header_addr: usize,
+const AllocFooter = packed struct(u48) {
+    header: u48,
+    // 16 unused bits
 };
 
-/// Only either the padding or footer will exist, as the padding is set
-/// upon allocation and the footer is set upon freeing.
-/// The max is used in case if the sizes are ever desynced.
-const METADATA_SIZE = @sizeOf(AllocHeader) + @max(@sizeOf(AllocFooter), @sizeOf(AllocPadding));
-
-/// This type is not meaningful in any sense other than
-/// to make a minimum size guarantee to the intrusive freelist.
+/// This type is meaningless other than to ensure
+/// the intrusive freelist freenode alignment and length
+/// is satisfied. The allocation header and footer are not
+/// factored into this size. The min len includes the alloc
+/// footer size to ensure there's space for it, but the bytes
+/// in the freelist entry exclude it so that it's not overwritten
+/// when the freelist zeroes out the memory to store it's own metadata.
+const FREELIST_ENTRY_LEN = @sizeOf(usize) * 4;
+const MIN_LEN = FREELIST_ENTRY_LEN + @sizeOf(AllocFooter);
+const MIN_ALIGN = @alignOf(usize);
 const FreelistEntry = struct {
-    bytes: [METADATA_SIZE + 1]u8,
+    bytes: [FREELIST_ENTRY_LEN]u8 align(MIN_ALIGN),
 };
 
-/// Used as the value of a red black tree keyed by length.
-///
-/// Using pop specific makes it doubly linked and allows
-/// for O(1) jumps to remove items without walking the tree
-/// or the list during coalescing.
-///
-/// Enabling link to base makes each node link back to the
-/// freelist itself, so we can check if we emptied it during
-/// popSpecific, allowing us to free the containing tree node
-/// by grabbing it with the @fieldParentPtr builtin.
+/// Using pop specific enables skipping the tree walk when removing freed
+/// tree entries during coalescing in free(). Enabling link to list enables
+/// jumping from the freelist entry to the freelist itself to check if popSpecific()
+/// removed the last entry, and from there @fieldParentPtr can jump to the tree
+/// entry itself to remove it with removeFromPtr() on the tree. The cost of these
+/// is an extra 16 bytes required on the minimum allocation length, but the benefit
+/// is you don't pay for two O(logn) tree walks if both adjacent blocks can be
+/// coalesced, instead it's 3 pointer dereferences per block coalesced.
 const using_popSpecific = true;
-const link_to_base = true;
+const link_to_list = true;
 const Freelist = intrusive_freelist.IntrusiveFreeList(
-    FreelistEntry,
+    *FreelistEntry,
     using_popSpecific,
-    link_to_base,
+    link_to_list,
 );
 
-/// Keyed by length, stores the max alignment of any entry
-/// in the freelist so that it can be skipped if it won't
-/// satisfy alignment requirements during an allocation.
+/// The tree is keyed by length, and duplicate length entries are
+/// pushed into the freelist.
 const TreeEntry = struct {
     bucket_len: usize,
-    max_align_in_bucket: usize,
     freelist: Freelist,
 
-    fn treeCmpFn(first: TreeEntry, second: TreeEntry) std.math.Order {
+    fn cmpFn(first: TreeEntry, second: TreeEntry) std.math.Order {
         return std.math.order(first.bucket_len, second.bucket_len);
-    }
-
-    fn makeKey(len: usize) TreeEntry {
-        return .{
-            .bucket_len = len,
-            .max_align_in_bucket = 0,
-            .freelist = .{},
-        };
     }
 };
 
-/// Stores entries keyed by length, and duplicate length
-/// entries are pushed into the freelist. As a result,
-/// any attempt to insert a duplicate is an error.
-const duplicate_is_error = true;
+// NOTE: Will need to add support for pushing to freelist on duplicate without using two tree walks,
+// maybe a callback could be added that runs when a duplicate key is discovered on insert.
+// The tree will also need a removeFromPtr() function implemented, so do this at the same time.
+const duplicate_is_error = false;
 const RedBlackTree = rbt.RedBlackTree(
     TreeEntry,
-    TreeEntry.treeCmpFn,
+    TreeEntry.cmpFn,
     duplicate_is_error,
 );
 
-/// Minimizes fragmentation from tree node allocations
-/// by batch allocating them in a contiguous slice.
 const stack_bootstrap = false;
 const stack_size = 0;
 const allocation_chunk_size = 64;
-pub const SlabAllocator = slab_allocator.SlabAllocator(
+pub const TreeAllocator = slab_alloc.SlabAllocator(
     RedBlackTree.Node,
     stack_bootstrap,
     stack_size,
     allocation_chunk_size,
 );
 
-pub const HeapAllocator = struct {
-    backing_allocator: std.mem.Allocator,
-    tree: RedBlackTree,
+const HeapAllocator = struct {
+    reserve_start: u48,
+    commit_end: u48,
+    reserve_end: u48,
+    free_tree: RedBlackTree,
 
+    /// Takes a contiguous virtual address space to own.
+    /// The tree allocator is made public so it can be initialized
+    /// by the caller, allowing them to specify the tree allocator's
+    /// backing allocator, and handle the potential error upon
+    /// initialization that the slab allocator can return.
     pub fn init(
-        backing_allocator: std.mem.Allocator,
-        tree_allocator: SlabAllocator,
+        reserve_start: u48,
+        reserve_end: u48,
+        tree_allocator: *TreeAllocator,
     ) HeapAllocator {
         return .{
-            .backing_allocator = backing_allocator,
-            .tree = RedBlackTree.init(tree_allocator.allocator()),
+            .reserve_start = reserve_start,
+            .commit_end = reserve_start,
+            .reserve_end = reserve_end,
+            .free_tree = RedBlackTree.init(tree_allocator.allocator()),
         };
     }
 
     pub fn deinit(self: *HeapAllocator) void {
-        self.tree.deinit();
+        self.free_tree.deinit();
     }
 
     pub fn allocator(self: *HeapAllocator) std.mem.Allocator {
@@ -138,19 +132,61 @@ pub const HeapAllocator = struct {
         alignment: std.mem.Alignment,
         ret_addr: usize,
     ) ?[*]u8 {
+        _ = ret_addr;
         const self: *HeapAllocator = @alignCast(@ptrCast(ptr));
+        std.debug.assert(alignment.toByteUnits() <= MAX_ALIGN);
+        std.debug.assert(std.mem.isAligned(self.commit_end, @alignOf(AllocHeader)));
 
-        const min_needed = len + METADATA_SIZE + alignment.toByteUnits();
-        const slack_allowed = min_needed / 4;
-        const max_allowed = min_needed + slack_allowed;
+        const user_len: u48 = @max(MIN_LEN, @as(u48, @intCast(len)));
+        const user_align: u48 = @max(MIN_ALIGN, @as(u48, @intCast(alignment.toByteUnits())));
 
-        const lower_bound = TreeEntry.makeKey(min_needed);
-        const upper_bound = TreeEntry.makeKey(max_allowed);
-        const block = self.tree.removeWithRange(lower_bound, upper_bound) catch |e| {
-            std.debug.assert(e != error.NotFound);
-            // allocate block, place header then padding, return user ptr
-        };
-        // place header then padding, return user ptr
+        var block_len: u48 = 0;
+
+        const header_offset = block_len;
+        block_len += @sizeOf(AllocHeader);
+
+        const user_block_offset = std.mem.alignForward(
+            u48,
+            block_len,
+            user_align,
+        );
+        block_len = user_block_offset + user_len;
+
+        const padding_offset = user_block_offset - @sizeOf(AllocPadding);
+
+        std.debug.print("Alloc Header Base {}\n", .{header_offset});
+        std.debug.print("Alloc Padding Base {}\n", .{padding_offset});
+        std.debug.print("Alloc User Block Base {}\n\n", .{user_block_offset});
+
+        if (self.commit_end + block_len > self.reserve_end) return null;
+        self.commit_end += block_len;
+
+        const block_base = self.commit_end - block_len;
+        const header_base = block_base + header_offset;
+        const padding_base = block_base + padding_offset;
+        const user_block_base = block_base + user_block_offset;
+
+        std.debug.print("Alloc Block Base {}\n", .{block_base});
+        std.debug.print("Alloc Header Base {}\n", .{header_base});
+        std.debug.print("Alloc Padding Base {}\n", .{padding_base});
+        std.debug.print("Alloc User Block Base {}\n\n", .{user_block_base});
+
+        var header: *AllocHeader = @ptrFromInt(header_base);
+        header.is_free = false;
+        header.block_len = user_len + @sizeOf(AllocFooter);
+        header.alignment = @ctz(header_base + @sizeOf(AllocHeader));
+
+        std.debug.print("Alloc User Block Len {}\n", .{user_len});
+        std.debug.print("Alloc Block Len {}\n", .{header.block_len});
+        std.debug.print("Alloc Max Alignment {}\n", .{header.alignment});
+
+        var padding: *AllocPadding = @ptrFromInt(padding_base);
+        padding.header_offset = @intCast(std.math.divExact(u48, user_block_base - header_base, GRANULARITY) catch unreachable);
+
+        std.debug.print("Alloc Padding Header Offset Unscaled {} Scaled {}\n\n", .{ padding.header_offset, padding.header_offset * GRANULARITY });
+
+        const user_ptr: [*]u8 = @ptrFromInt(user_block_base);
+        return user_ptr;
     }
 
     // no op
@@ -185,6 +221,7 @@ pub const HeapAllocator = struct {
         unreachable;
     }
 
+    // no op
     fn free(
         ptr: *anyopaque,
         buf: []u8,
@@ -194,5 +231,59 @@ pub const HeapAllocator = struct {
         _ = alignment;
         _ = ret_addr;
         const self: *HeapAllocator = @alignCast(@ptrCast(ptr));
+
+        const user_addr: u48 = @intCast(@intFromPtr(buf.ptr));
+        const padding_ptr: *AllocPadding = @ptrFromInt(user_addr - @sizeOf(AllocPadding));
+
+        const header_offset = padding_ptr.header_offset * GRANULARITY;
+        const header_ptr: *AllocHeader = @ptrFromInt(user_addr - header_offset);
+
+        const end_addr = @intFromPtr(header_ptr) + @sizeOf(AllocHeader) + header_ptr.block_len;
+        const footer_ptr: *AllocFooter = @ptrFromInt(end_addr - @sizeOf(AllocFooter));
+        footer_ptr.header = @intCast(@intFromPtr(header_ptr));
+
+        std.debug.print("Free Block Len {}\n", .{header_ptr.block_len});
+        std.debug.print("Free Block Alignment {}\n", .{header_ptr.alignment});
+        std.debug.print("Free Block State {}\n\n", .{header_ptr.is_free});
+
+        const freelist_entry: *FreelistEntry = @ptrFromInt(@intFromPtr(header_ptr) + @sizeOf(AllocHeader));
+        var freelist: Freelist = .{};
+        freelist.push(freelist_entry);
+
+        const tree_entry: TreeEntry = .{
+            .bucket_len = header_ptr.block_len,
+            .freelist = freelist,
+        };
+
+        self.free_tree.insert(tree_entry) catch unreachable;
     }
 };
+
+test "alloc wip" {
+    const testing_allocator = std.testing.allocator;
+    var tree_allocator = try TreeAllocator.init(testing_allocator);
+    defer tree_allocator.deinit();
+
+    const ten_pages = 10 * 4 * 1024;
+    const memory = try testing_allocator.alloc(u8, ten_pages);
+    defer testing_allocator.free(memory);
+
+    const reserve_start: u48 = @intCast(@intFromPtr(memory.ptr));
+    const reserve_end: u48 = reserve_start + @as(u48, @intCast(memory.len));
+
+    var heap_allocator = HeapAllocator.init(
+        reserve_start,
+        reserve_end,
+        &tree_allocator,
+    );
+    defer heap_allocator.deinit();
+
+    const allocator = heap_allocator.allocator();
+
+    const TestType = struct {
+        bytes: [8]u8 align(64),
+    };
+
+    const alloc = try allocator.alloc(TestType, 1);
+    allocator.free(alloc);
+}

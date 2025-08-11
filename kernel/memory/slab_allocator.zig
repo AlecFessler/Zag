@@ -31,7 +31,8 @@ pub fn SlabAllocator(
     return struct {
         const Self = @This();
         const using_popSpecific = false;
-        const IntrusiveFreeList = intrusive_freelist.IntrusiveFreeList(*T, using_popSpecific);
+        const link_to_list = false;
+        const IntrusiveFreeList = intrusive_freelist.IntrusiveFreeList(*T, using_popSpecific, link_to_list);
 
         /// Verifies that all allocated memory is returned before deinit is called on this.
         /// This is necessary because if this were to not be the case, we could handle it by

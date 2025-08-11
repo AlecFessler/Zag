@@ -28,7 +28,7 @@ pub fn RedBlackTree(
             }
         };
 
-        const Direction = enum {
+        pub const Direction = enum {
             left,
             right,
 
@@ -235,90 +235,6 @@ pub fn RedBlackTree(
                 switch (cmpFn(data, c.data)) {
                     .lt => current = c.getChild(Direction.left),
                     .gt => current = c.getChild(Direction.right),
-                    .eq => break,
-                }
-                parent = c;
-            }
-
-            if (current == null) return ContainerError.NotFound;
-            var target = current.?;
-            const removed = target.data;
-
-            const one_child_at_most = target.getChild(Direction.left) == null or target.getChild(Direction.right) == null;
-            if (one_child_at_most) {
-                const non_null_child = if (target.getChild(Direction.left) == null) Direction.right else Direction.left;
-                const replacement = target.getChild(non_null_child);
-
-                if (target == self.root) {
-                    self.root = replacement;
-                } else {
-                    const dir_from_parent = if (target == parent.?.getChild(Direction.left)) Direction.left else Direction.right;
-                    parent.?.setChild(replacement, dir_from_parent);
-                    if (replacement) |r| r.parent = parent;
-                }
-
-                if (target.color == Color.Black) {
-                    if (replacement) |r| {
-                        if (r.color == Color.Red) r.color = Color.Black;
-                    } else if (parent != null) {
-                        self.removeFix(parent.?);
-                    }
-                }
-
-                target.destroy(self.allocator);
-            } else {
-                parent = null;
-                var successor: *Node = target.getChild(Direction.right).?;
-
-                while (successor.getChild(Direction.left)) |left| {
-                    parent = successor;
-                    successor = left;
-                }
-
-                const replacement = successor.getChild(Direction.right);
-
-                if (parent) |p| {
-                    p.setChild(replacement, Direction.left);
-                } else {
-                    target.setChild(replacement, Direction.right);
-                }
-
-                if (replacement) |right| {
-                    right.parent = parent orelse target;
-                }
-
-                if (successor.color == Color.Black) {
-                    if (replacement) |r| {
-                        if (r.color == Color.Red) r.color = Color.Black;
-                    } else {
-                        self.removeFix(parent orelse target);
-                    }
-                }
-
-                target.data = successor.data;
-                successor.destroy(self.allocator);
-            }
-
-            return removed;
-        }
-
-        pub fn removeWithRange(
-            self: *Self,
-            lower_bound: T,
-            upper_bound: T,
-        ) !T {
-            var parent: ?*Node = null;
-            var current: ?*Node = self.root orelse return ContainerError.NotFound;
-
-            while (current) |c| {
-                switch (cmpFn(lower_bound, c.data)) {
-                    .lt => current = c.getChild(Direction.left),
-                    .gt => {
-                        switch (cmpFn(upper_bound, c.data)) {
-                            .gt => current = c.getChild(Direction.right),
-                            else => break,
-                        }
-                    },
                     .eq => break,
                 }
                 parent = c;
