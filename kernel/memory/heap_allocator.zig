@@ -130,122 +130,112 @@ pub const HeapAllocator = struct {
     ) ?[*]u8 {
         _ = ret_addr;
         const self: *HeapAllocator = @alignCast(@ptrCast(ptr));
+        const header_align: u48 = @alignOf(AllocHeader);
         std.debug.assert(alignment.toByteUnits() <= MAX_ALIGN);
-        std.debug.assert(std.mem.isAligned(self.commit_end, @alignOf(AllocHeader)));
+        std.debug.assert(std.mem.isAligned(self.commit_end, header_align));
 
         const user_len: u48 = @max(MIN_LEN, @as(u48, @intCast(len)));
         const user_align: u48 = @max(MIN_ALIGN, @as(u48, @intCast(alignment.toByteUnits())));
 
-        var block_len: u48 = 0;
+        var block_base: u48 = 0;
+        var user_block_base: u48 = 0;
+        var block_end: u48 = 0;
 
-        const header_offset = block_len;
-        block_len += @sizeOf(AllocHeader);
-
-        const user_block_offset = std.mem.alignForward(
-            u48,
-            block_len,
-            user_align,
-        );
-        block_len = user_block_offset + user_len;
-
-        const padding_offset = user_block_offset - @sizeOf(AllocPadding);
-
-        const bucket_len = block_len - @sizeOf(AllocHeader);
-        const lower_bound_len: TreeEntry = .{
-            .bucket_len = bucket_len,
-            .freelist = undefined,
-        };
-
-        var maybe_block_base: ?u48 = null;
+        const lower_bucket_len: usize = user_len;
         var maybe_current_entry: ?*RedBlackTree.Node = self.free_tree.root;
 
         while (maybe_current_entry) |entry| {
-            const lower_bound_cmp = TreeEntry.cmpFn(entry.data, lower_bound_len);
+            const cmp = TreeEntry.cmpFn(entry.data, .{ .bucket_len = lower_bucket_len, .freelist = undefined });
+            if (cmp != .lt) {
+                var fnode: ?*Freelist.FreeNode = entry.data.freelist.head;
+                while (fnode) |n| {
+                    const block_addr: u48 = @intCast(@intFromPtr(n));
+                    const header_addr: u48 = block_addr - @sizeOf(AllocHeader);
+                    const header: *AllocHeader = @ptrFromInt(header_addr);
+                    std.debug.assert(header.is_free);
 
-            const large_enough = lower_bound_cmp == .eq or lower_bound_cmp == .gt;
-            if (large_enough) {
-                var maybe_suitable_block: ?*FreelistEntry = null;
-                var maybe_freelist_entry: ?*Freelist.FreeNode = entry.data.freelist.head;
+                    const block_size = header.bucket_len;
+                    const aligned_user = std.mem.alignForward(u48, block_addr, user_align);
+                    const front_pad = aligned_user - block_addr;
+                    const body = user_len;
+                    const tail_pad = std.mem.alignForward(u48, block_addr + front_pad + body, header_align) - (block_addr + front_pad + body);
+                    const required = front_pad + body + tail_pad;
 
-                while (maybe_freelist_entry) |freelist_entry| {
-                    const block_addr: u48 = @intCast(@intFromPtr(freelist_entry));
-                    const block_header: *AllocHeader = @ptrFromInt(block_addr - @sizeOf(AllocHeader));
+                    if (required <= block_size) {
+                        _ = entry.data.freelist.popSpecific(@ptrFromInt(block_addr)).?;
+                        if (entry.data.freelist.head == null) {
+                            _ = self.free_tree.removeFromPtr(entry);
+                        }
 
-                    std.debug.assert(block_header.is_free);
+                        const required_bucket_len = required;
+                        const split_size = block_size - required_bucket_len;
+                        const block_end_addr = header_addr + @sizeOf(AllocHeader) + block_size;
+                        const split_needed = @sizeOf(AllocHeader) + @sizeOf(AllocPadding) + MIN_LEN;
 
-                    const block_size = block_header.bucket_len;
-                    const aligned_addr = std.mem.alignForward(
-                        u48,
-                        block_addr,
-                        user_align,
-                    );
-                    const size_lost = aligned_addr - block_addr;
-                    const aligned_size = block_size - size_lost;
+                        if (split_size >= split_needed) {
+                            const split_header_addr = header_addr + @sizeOf(AllocHeader) + required_bucket_len;
+                            const split_header: *AllocHeader = @ptrFromInt(split_header_addr);
+                            split_header.is_free = true;
+                            split_header.bucket_len = split_size - @sizeOf(AllocHeader);
+                            const split_entry_addr = split_header_addr + @sizeOf(AllocHeader);
+                            const split_entry: *FreelistEntry = @ptrFromInt(split_entry_addr);
+                            self.treeInsert(split_header.bucket_len, split_entry);
 
-                    const suitably_aligned = aligned_size >= user_len;
-                    if (!suitably_aligned) {
-                        maybe_freelist_entry = freelist_entry.next;
-                        continue;
+                            block_base = header_addr;
+                            user_block_base = aligned_user;
+                            block_end = split_header_addr;
+                        } else {
+                            block_base = header_addr;
+                            user_block_base = aligned_user;
+                            block_end = block_end_addr;
+                        }
+                        break;
                     }
 
-                    maybe_suitable_block = entry.data.freelist.popSpecific(@ptrFromInt(block_addr)).?;
-                    if (entry.data.freelist.head == null) {
-                        _ = self.free_tree.removeFromPtr(entry);
-                    }
-
-                    const split_header_addr = std.mem.alignForward(
-                        u48,
-                        aligned_addr + user_len,
-                        @alignOf(AllocHeader),
-                    );
-                    const block_end = block_addr + block_size;
-                    const split_size = block_end - split_header_addr;
-                    const needed_size = @sizeOf(AllocHeader) + @sizeOf(AllocPadding) + MIN_LEN;
-                    if (split_size >= needed_size) {
-                        const split_header: *AllocHeader = @ptrFromInt(split_header_addr);
-                        const split_freelist_entry_addr = split_header_addr + @sizeOf(AllocHeader);
-                        split_header.is_free = true;
-                        split_header.bucket_len = split_size - @sizeOf(AllocHeader);
-
-                        const split_freelist_entry: *FreelistEntry = @ptrFromInt(split_freelist_entry_addr);
-                        self.treeInsert(split_header.bucket_len, split_freelist_entry);
-                    }
-
-                    break;
+                    fnode = n.next;
                 }
-
-                if (maybe_suitable_block) |suitable_block| {
-                    const block_addr: u48 = @intCast(@intFromPtr(suitable_block));
-                    maybe_block_base = block_addr - @sizeOf(AllocHeader);
-                    break;
-                }
-
-                maybe_current_entry = entry.getChild(RedBlackTree.Direction.right);
+                if (block_end != 0) break;
+                maybe_current_entry = entry.getChild(.right);
                 continue;
             }
-
-            maybe_current_entry = entry.getChild(RedBlackTree.Direction.left);
+            maybe_current_entry = entry.getChild(.right);
         }
 
-        const block_base = blk: {
-            if (maybe_block_base) |base| {
-                break :blk base;
-            }
-            if (self.commit_end + block_len > self.reserve_end) return null;
-            const base = self.commit_end;
-            self.commit_end += block_len;
-            break :blk base;
-        };
+        if (block_end == 0) {
+            const header_base = self.commit_end;
+            const block_addr = header_base + @sizeOf(AllocHeader);
+            const aligned_user = std.mem.alignForward(
+                u48,
+                block_addr,
+                user_align,
+            );
+            const front_pad = aligned_user - block_addr;
+            const body = user_len;
+            const tail_pad = std.mem.alignForward(
+                u48,
+                block_addr + front_pad + body,
+                header_align,
+            ) - (block_addr + front_pad + body);
+            const required = front_pad + body + tail_pad;
 
-        const header_base = block_base + header_offset;
-        const padding_base = block_base + padding_offset;
-        const user_block_base = block_base + user_block_offset;
+            const end = header_base + @sizeOf(AllocHeader) + required;
+            if (end > self.reserve_end) return null;
 
-        var header: *AllocHeader = @ptrFromInt(header_base);
+            block_base = header_base;
+            user_block_base = aligned_user;
+            block_end = end;
+            self.commit_end = end;
+        }
+
+        const header_base = block_base;
+        const padding_base = user_block_base - @sizeOf(AllocPadding);
+        const bucket_len = block_end - header_base - @sizeOf(AllocHeader);
+
+        const header: *AllocHeader = @ptrFromInt(header_base);
         header.is_free = false;
         header.bucket_len = bucket_len;
 
-        var padding: *AllocPadding = @ptrFromInt(padding_base);
+        const padding: *AllocPadding = @ptrFromInt(padding_base);
         padding.header_offset = @intCast(std.math.divExact(
             u48,
             user_block_base - header_base,
@@ -311,11 +301,11 @@ pub const HeapAllocator = struct {
         const prefix_end_addr: u48 = @intCast(@intFromPtr(header_ptr) + @sizeOf(AllocHeader));
         const block_end_addr = prefix_end_addr + header_ptr.bucket_len;
 
-        var prev_header_addr: u48 = 0;
-        if (header_addr >= self.reserve_start + @sizeOf(AllocFooter)) {
+        const prev_header_within_bounds = header_addr >= self.reserve_start + @sizeOf(AllocFooter);
+        if (prev_header_within_bounds) {
             const prev_footer_addr: u48 = header_addr - @sizeOf(AllocFooter);
             const prev_footer: *AllocFooter = @ptrFromInt(prev_footer_addr);
-            prev_header_addr = prev_footer.header;
+            const prev_header_addr = prev_footer.header;
 
             const prev_precheck =
                 std.mem.isAligned(prev_header_addr, @alignOf(AllocHeader)) and

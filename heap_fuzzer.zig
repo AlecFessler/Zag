@@ -162,7 +162,7 @@ pub fn main() !void {
     var prng = std.Random.DefaultPrng.init(0);
     var rand = prng.random();
 
-    for (0..1_000_000) |_| {
+    for (0..1_000_000) |i| {
         const action: Action = blk: {
             if (allocations.items.len == 0) break :blk Action.alloc;
             if (allocations.items.len == ACTIVE_CAP) break :blk Action.free;
@@ -180,6 +180,13 @@ pub fn main() !void {
                     1,
                     MAX_ALLOC_LEN,
                 );
+
+                std.debug.print("Action {} - Alloc: type {s}, len {}\n", .{
+                    i,
+                    alloc_type.toString(),
+                    alloc_len,
+                });
+
                 const ptr = try AllocType.allocate(
                     alloc_type,
                     alloc_len,
@@ -190,6 +197,7 @@ pub fn main() !void {
                     .addr = @intFromPtr(ptr),
                     .len = alloc_len,
                 });
+
                 // validate state
                 // update fragmentation stats
             },
@@ -200,12 +208,20 @@ pub fn main() !void {
                     allocations.items.len - 1,
                 );
                 const target_handle = allocations.swapRemove(target_idx);
+
+                std.debug.print("Action {} - Free: type {s}, len {}\n", .{
+                    i,
+                    target_handle.alloc_type.toString(),
+                    target_handle.len,
+                });
+
                 AllocType.free(
                     target_handle.alloc_type,
                     target_handle.addr,
                     target_handle.len,
                     heap_iface,
                 );
+
                 // validate state
                 // update fragmentation stats
             },
