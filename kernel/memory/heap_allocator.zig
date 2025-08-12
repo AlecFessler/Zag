@@ -5,7 +5,7 @@ const rbt = @import("red_black_tree.zig");
 const slab_alloc = @import("slab_allocator.zig");
 
 const GRANULARITY = 8;
-const MAX_ALIGN = @sizeOf(u8) * GRANULARITY;
+const MAX_ALIGN = ((@as(usize, 1) << @bitSizeOf(u8)) - 1) * GRANULARITY;
 
 const AllocHeader = packed struct(u49) {
     is_free: bool,
