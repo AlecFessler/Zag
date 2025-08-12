@@ -81,7 +81,7 @@ pub const TreeAllocator = slab_alloc.SlabAllocator(
     allocation_chunk_size,
 );
 
-const HeapAllocator = struct {
+pub const HeapAllocator = struct {
     reserve_start: u48,
     commit_end: u48,
     reserve_end: u48,
@@ -97,6 +97,7 @@ const HeapAllocator = struct {
         reserve_end: u48,
         tree_allocator: *TreeAllocator,
     ) HeapAllocator {
+        std.debug.assert(std.mem.isAligned(reserve_start, @alignOf(AllocHeader)));
         return .{
             .reserve_start = reserve_start,
             .commit_end = reserve_start,
