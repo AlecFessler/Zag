@@ -155,10 +155,18 @@ pub const HeapAllocator = struct {
                     std.debug.assert(header.is_free);
 
                     const block_size = header.bucket_len;
-                    const aligned_user = std.mem.alignForward(u48, block_addr, user_align);
+                    const aligned_user = std.mem.alignForward(
+                        u48,
+                        block_addr,
+                        user_align,
+                    );
                     const front_pad = aligned_user - block_addr;
                     const body = user_len;
-                    const tail_pad = std.mem.alignForward(u48, block_addr + front_pad + body, header_align) - (block_addr + front_pad + body);
+                    const tail_pad = std.mem.alignForward(
+                        u48,
+                        block_addr + front_pad + body,
+                        header_align,
+                    ) - (block_addr + front_pad + body);
                     const required = front_pad + body + tail_pad;
 
                     if (required <= block_size) {
@@ -236,11 +244,13 @@ pub const HeapAllocator = struct {
         header.bucket_len = bucket_len;
 
         const padding: *AllocPadding = @ptrFromInt(padding_base);
-        padding.header_offset = @intCast(std.math.divExact(
+        const scaled = std.math.divExact(
             u48,
             user_block_base - header_base,
             GRANULARITY,
-        ) catch unreachable);
+        ) catch unreachable;
+        std.debug.assert(scaled <= std.math.maxInt(u8));
+        padding.header_offset = @intCast(scaled);
 
         const user_ptr: [*]u8 = @ptrFromInt(user_block_base);
         return user_ptr;
@@ -293,7 +303,7 @@ pub const HeapAllocator = struct {
         const padding_addr = user_addr - @sizeOf(AllocPadding);
         const padding_ptr: *AllocPadding = @ptrFromInt(padding_addr);
 
-        const unscaled_header_offset = padding_ptr.header_offset * GRANULARITY;
+        const unscaled_header_offset: u48 = @as(u48, padding_ptr.header_offset) * GRANULARITY;
         const header_addr = user_addr - unscaled_header_offset;
         var header_ptr: *AllocHeader = @ptrFromInt(header_addr);
         header_ptr.is_free = true;
