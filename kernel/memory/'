@@ -64,6 +64,8 @@ const TreeEntry = struct {
     }
 };
 
+// NOTE: Will need to add support for pushing to freelist on duplicate without using two tree walks,
+// maybe a callback could be added that runs when a duplicate key is discovered on insert.
 const duplicate_is_error = false;
 const RedBlackTree = rbt.RedBlackTree(
     TreeEntry,
@@ -149,6 +151,10 @@ const HeapAllocator = struct {
 
         const padding_offset = user_block_offset - @sizeOf(AllocPadding);
 
+        std.debug.print("Alloc Header Base {}\n", .{header_offset});
+        std.debug.print("Alloc Padding Base {}\n", .{padding_offset});
+        std.debug.print("Alloc User Block Base {}\n\n", .{user_block_offset});
+
         const bucket_len = block_len - @sizeOf(AllocHeader);
         const lower_bound_len: TreeEntry = .{
             .bucket_len = bucket_len,
@@ -158,6 +164,7 @@ const HeapAllocator = struct {
         var maybe_block_base: ?u48 = null;
         var maybe_current_entry: ?*RedBlackTree.Node = self.free_tree.root;
 
+        // walk the tree
         while (maybe_current_entry) |entry| {
             const lower_bound_cmp = TreeEntry.cmpFn(entry.data, lower_bound_len);
 
@@ -166,6 +173,7 @@ const HeapAllocator = struct {
                 var maybe_suitable_block: ?*FreelistEntry = null;
                 var maybe_freelist_entry: ?*Freelist.FreeNode = entry.data.freelist.head;
 
+                // walk the freelist
                 while (maybe_freelist_entry) |freelist_entry| {
                     const block_addr: u48 = @intCast(@intFromPtr(freelist_entry));
                     const block_header: *AllocHeader = @ptrFromInt(block_addr - @sizeOf(AllocHeader));
@@ -216,6 +224,7 @@ const HeapAllocator = struct {
                 if (maybe_suitable_block) |suitable_block| {
                     const block_addr: u48 = @intCast(@intFromPtr(suitable_block));
                     maybe_block_base = block_addr - @sizeOf(AllocHeader);
+                    std.debug.print("Found tree entry\n", .{});
                     break;
                 }
 
@@ -240,9 +249,17 @@ const HeapAllocator = struct {
         const padding_base = block_base + padding_offset;
         const user_block_base = block_base + user_block_offset;
 
+        std.debug.print("Alloc Block Base {}\n", .{block_base});
+        std.debug.print("Alloc Header Base {}\n", .{header_base});
+        std.debug.print("Alloc Padding Base {}\n", .{padding_base});
+        std.debug.print("Alloc User Block Base {}\n\n", .{user_block_base});
+
         var header: *AllocHeader = @ptrFromInt(header_base);
         header.is_free = false;
         header.bucket_len = bucket_len;
+
+        std.debug.print("Alloc User Block Len {}\n", .{user_len});
+        std.debug.print("Alloc Block Len {}\n", .{header.bucket_len});
 
         var padding: *AllocPadding = @ptrFromInt(padding_base);
         padding.header_offset = @intCast(std.math.divExact(
@@ -250,6 +267,8 @@ const HeapAllocator = struct {
             user_block_base - header_base,
             GRANULARITY,
         ) catch unreachable);
+
+        std.debug.print("Alloc Padding Header Offset Unscaled {} Scaled {}\n\n", .{ padding.header_offset, padding.header_offset * GRANULARITY });
 
         const user_ptr: [*]u8 = @ptrFromInt(user_block_base);
         return user_ptr;
@@ -307,68 +326,46 @@ const HeapAllocator = struct {
         var header_ptr: *AllocHeader = @ptrFromInt(header_addr);
         header_ptr.is_free = true;
 
-        const prefix_end_addr: u48 = @intCast(@intFromPtr(header_ptr) + @sizeOf(AllocHeader));
+        const prefix_end_addr = @intFromPtr(header_ptr) + @sizeOf(AllocHeader);
         const block_end_addr = prefix_end_addr + header_ptr.bucket_len;
 
-        var prev_header_addr: u48 = 0;
-        if (header_addr >= self.reserve_start + @sizeOf(AllocFooter)) {
-            const prev_footer_addr: u48 = header_addr - @sizeOf(AllocFooter);
+        std.debug.print("Free Block Len {}\n", .{header_ptr.bucket_len});
+        std.debug.print("Free Block State {}\n\n", .{header_ptr.is_free});
+
+        const prev_footer_addr = header_addr - @sizeOf(AllocFooter);
+        if (prev_footer_addr > self.reserve_start) {
             const prev_footer: *AllocFooter = @ptrFromInt(prev_footer_addr);
-            prev_header_addr = prev_footer.header;
-
-            const prev_precheck =
-                std.mem.isAligned(prev_header_addr, @alignOf(AllocHeader)) and
-                prev_header_addr >= self.reserve_start and
-                prev_header_addr + @sizeOf(AllocHeader) <= header_addr;
-
-            if (prev_precheck) {
-                const prev_header: *AllocHeader = @ptrFromInt(prev_header_addr);
-                const prev_can_merge =
-                    prev_header_addr + @sizeOf(AllocHeader) + prev_header.bucket_len == header_addr and
-                    prev_header.is_free;
-
-                if (prev_can_merge) {
-                    const prev_entry_addr: u48 = prev_header_addr + @sizeOf(AllocHeader);
-                    const prev_node: *Freelist.FreeNode = @ptrFromInt(prev_entry_addr);
-                    const prev_list: *Freelist = prev_node.base;
-
-                    _ = prev_list.popSpecific(@ptrCast(prev_node)).?;
-                    if (prev_list.head == null) {
-                        const prev_entry_ptr: *TreeEntry = @fieldParentPtr("freelist", prev_list);
-                        const prev_node_ptr: *RedBlackTree.Node = @fieldParentPtr("data", prev_entry_ptr);
-                        _ = self.free_tree.removeFromPtr(prev_node_ptr);
-                    }
-
-                    header_ptr = prev_header;
-                    header_ptr.bucket_len = block_end_addr - (prev_header_addr + @sizeOf(AllocHeader));
+            const prev_header: *AllocHeader = @ptrFromInt(prev_footer.header);
+            if (prev_header.is_free) {
+                const freelist_entry: *Freelist.FreeNode = @ptrFromInt(@intFromPtr(prev_header) + @sizeOf(AllocHeader));
+                const freelist: *Freelist = freelist_entry.base;
+                const popped = freelist.popSpecific(@ptrCast(freelist_entry));
+                std.debug.assert(popped != null);
+                if (freelist.head == null) {
+                    const tree_entry: *TreeEntry = @fieldParentPtr("freelist", freelist);
+                    const tree_node: *RedBlackTree.Node = @fieldParentPtr("data", tree_entry);
+                    self.free_tree.removeFromPtr(tree_node);
                 }
+                const coalesced_len = block_end_addr - header_addr;
+                header_ptr = prev_header;
+                prev_header.bucket_len += coalesced_len;
             }
         }
 
-        const next_header_addr: u48 = block_end_addr;
-        const next_precheck =
-            next_header_addr + @sizeOf(AllocHeader) <= self.reserve_end and
-            std.mem.isAligned(next_header_addr, @alignOf(AllocHeader));
-        if (next_precheck) {
-            const next_header: *AllocHeader = @ptrFromInt(next_header_addr);
-            const next_can_merge = next_header.is_free;
-
-            if (next_can_merge) {
-                const next_end: u48 = next_header_addr + @sizeOf(AllocHeader) + next_header.bucket_len;
-
-                const next_entry_addr: u48 = next_header_addr + @sizeOf(AllocHeader);
-                const next_node: *Freelist.FreeNode = @ptrFromInt(next_entry_addr);
-                const next_list: *Freelist = next_node.base;
-
-                _ = next_list.popSpecific(@ptrCast(next_node)).?;
-                if (next_list.head == null) {
-                    const next_entry_ptr: *TreeEntry = @fieldParentPtr("freelist", next_list);
-                    const next_node_ptr: *RedBlackTree.Node = @fieldParentPtr("data", next_entry_ptr);
-                    _ = self.free_tree.removeFromPtr(next_node_ptr);
+        const next_header_addr = block_end_addr;
+        if (next_header_addr < self.reserve_end) {
+            const next_header: *AllocHeader = @ptrFromInt(block_end_addr);
+            if (next_header.is_free) {
+                const freelist_entry: *Freelist.FreeNode = @ptrFromInt(next_header + @sizeOf(AllocHeader));
+                const freelist: *Freelist = freelist_entry.base;
+                const popped = freelist.popSpecific(@ptrCast(freelist_entry));
+                if (freelist.head == null) {
+                    const tree_entry: *TreeEntry = @fieldParentPtr("freelist", freelist);
+                    const tree_node: *RedBlackTree.Node = @fieldParentPtr("data", tree_entry);
+                    self.free_tree.removeFromPtr(tree_node);
                 }
-
-                const base_addr: u48 = @intCast(@intFromPtr(header_ptr));
-                header_ptr.bucket_len = next_end - (base_addr + @sizeOf(AllocHeader));
+                const coalesced_len = next_header.bucket_len + @sizeOf(AllocHeader);
+                header_ptr.bucket_len += coalesced_len;
             }
         }
 
@@ -394,11 +391,14 @@ const HeapAllocator = struct {
         var parent: ?*RedBlackTree.Node = null;
         var direction: RedBlackTree.Direction = .left;
 
-        const key: TreeEntry = .{ .bucket_len = bucket_len, .freelist = .{} };
+        var entry: TreeEntry = .{
+            .bucket_len = bucket_len,
+            .freelist = .{},
+        };
 
         while (current) |c| {
             parent = c;
-            switch (TreeEntry.cmpFn(key, c.data)) {
+            switch (TreeEntry.cmpFn(entry, c.data)) {
                 .lt => {
                     direction = .left;
                     current = c.getChild(.left);
@@ -414,12 +414,8 @@ const HeapAllocator = struct {
             }
         }
 
-        const new_node = self.free_tree.insertAtPtr(
-            parent,
-            direction,
-            .{ .bucket_len = bucket_len, .freelist = .{} },
-        ) catch unreachable;
-        new_node.data.freelist.push(freelist_entry);
+        entry.freelist.push(freelist_entry);
+        _ = self.free_tree.insertAtPtr(parent, direction, entry) catch unreachable;
     }
 };
 

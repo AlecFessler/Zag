@@ -19,7 +19,7 @@ pub fn IntrusiveFreeList(
 
         head: ?*FreeNode = null,
 
-        const FreeNode = struct {
+        pub const FreeNode = struct {
             /// dbg magic helps detect use after free in the assertion in pop()
             /// by ensuring that nodes are not written to while in the free list
             dbg_magic: if (DBG) u64 else void,
@@ -54,9 +54,13 @@ pub fn IntrusiveFreeList(
             const addr = self.head orelse return null;
 
             if (DBG) std.debug.assert(addr.dbg_magic == DBG_MAGIC);
-            if (using_popSpecific) addr.prev = null;
 
             self.head = addr.next;
+
+            if (using_popSpecific) {
+                if (self.head) |h| h.prev = null;
+            }
+
             zeroItem(@ptrCast(addr));
             return @alignCast(@ptrCast(addr));
         }
@@ -75,6 +79,7 @@ pub fn IntrusiveFreeList(
             const at_middle = node.prev != null and node.next != null;
             const at_start = node.prev == null and node.next != null;
             const at_end = node.prev != null and node.next == null;
+            const only_one = node.prev == null and node.next == null;
 
             if (at_middle) {
                 const prev = node.prev.?;
@@ -86,6 +91,9 @@ pub fn IntrusiveFreeList(
             } else if (at_end) {
                 const prev = node.prev.?;
                 prev.next = null;
+            } else if (only_one) {
+                std.debug.assert(self.head == node);
+                self.head = null;
             }
 
             zeroItem(@ptrCast(node));

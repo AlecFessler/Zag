@@ -61,7 +61,10 @@ pub fn RedBlackTree(
                 allocator.destroy(self);
             }
 
-            fn getChild(self: *Node, d: Direction) ?*Node {
+            /// Made pub so custom tree walking logic can be implemented
+            /// externally for composability with the tree for operations
+            /// that may not be generic enough to justify implementing here
+            pub fn getChild(self: *Node, d: Direction) ?*Node {
                 return self.children[@intFromEnum(d)];
             }
 
@@ -147,40 +150,55 @@ pub fn RedBlackTree(
         }
 
         pub fn insert(self: *Self, data: T) !void {
-            if (self.root) |root| {
-                var current: ?*Node = root;
-                var parent: ?*Node = null;
+            if (self.root == null) {
+                _ = try self.insertAtPtr(null, Direction.left, data);
+                return;
+            }
 
-                while (current) |c| {
-                    parent = c;
-                    switch (cmpFn(data, c.data)) {
-                        .lt => current = c.getChild(Direction.left),
-                        .gt => current = c.getChild(Direction.right),
-                        .eq => {
-                            if (duplicateIsError) return ContainerError.Duplicate;
-                            current = c.getChild(Direction.left);
-                        },
-                    }
+            var current: ?*Node = self.root.?;
+            var parent: ?*Node = null;
+            var dir: Direction = Direction.left;
+
+            while (current) |c| {
+                parent = c;
+                switch (cmpFn(data, c.data)) {
+                    .lt => {
+                        dir = Direction.left;
+                        current = c.getChild(Direction.left);
+                    },
+                    .gt => {
+                        dir = Direction.right;
+                        current = c.getChild(Direction.right);
+                    },
+                    .eq => {
+                        if (duplicateIsError) return ContainerError.Duplicate;
+                        dir = Direction.left;
+                        current = c.getChild(Direction.left);
+                    },
                 }
+            }
 
-                const node = try Node.create(self.allocator, data);
-                if (parent) |p| {
-                    node.parent = p;
-                    if (cmpFn(data, p.data) == .lt) {
-                        p.setChild(node, Direction.left);
-                    } else {
-                        p.setChild(node, Direction.right);
-                    }
+            _ = try self.insertAtPtr(parent.?, dir, data);
+        }
 
-                    if (p.color == Color.Red) {
-                        self.insertFix(node);
-                    }
+        pub fn insertAtPtr(self: *Self, parent: ?*Node, dir: Direction, data: T) !*Node {
+            const node = try Node.create(self.allocator, data);
+
+            if (parent) |p| {
+                std.debug.assert(p.getChild(dir) == null);
+
+                node.parent = p;
+                node.color = Color.Red;
+                p.setChild(node, dir);
+
+                if (p.color == Color.Red) {
+                    self.insertFix(node);
                 }
             } else {
-                const node = try Node.create(self.allocator, data);
                 node.color = Color.Black;
                 self.root = node;
             }
+            return node;
         }
 
         fn insertFix(self: *Self, node: *Node) void {
@@ -228,7 +246,6 @@ pub fn RedBlackTree(
         }
 
         pub fn remove(self: *Self, data: T) !T {
-            var parent: ?*Node = null;
             var current: ?*Node = self.root orelse return ContainerError.NotFound;
 
             while (current) |c| {
@@ -237,22 +254,30 @@ pub fn RedBlackTree(
                     .gt => current = c.getChild(Direction.right),
                     .eq => break,
                 }
-                parent = c;
             }
 
             if (current == null) return ContainerError.NotFound;
-            var target = current.?;
+            return self.removeFromPtr(current.?);
+        }
+
+        pub fn removeFromPtr(self: *Self, target: *Node) T {
+            var parent: ?*Node = target.parent;
             const removed = target.data;
 
-            const one_child_at_most = target.getChild(Direction.left) == null or target.getChild(Direction.right) == null;
+            const one_child_at_most =
+                (target.getChild(Direction.left) == null) or
+                (target.getChild(Direction.right) == null);
+
             if (one_child_at_most) {
-                const non_null_child = if (target.getChild(Direction.left) == null) Direction.right else Direction.left;
+                const non_null_child =
+                    if (target.getChild(Direction.left) == null) Direction.right else Direction.left;
                 const replacement = target.getChild(non_null_child);
 
                 if (target == self.root) {
                     self.root = replacement;
                 } else {
-                    const dir_from_parent = if (target == parent.?.getChild(Direction.left)) Direction.left else Direction.right;
+                    const dir_from_parent =
+                        if (target == parent.?.getChild(Direction.left)) Direction.left else Direction.right;
                     parent.?.setChild(replacement, dir_from_parent);
                     if (replacement) |r| r.parent = parent;
                 }
@@ -269,7 +294,6 @@ pub fn RedBlackTree(
             } else {
                 parent = null;
                 var successor: *Node = target.getChild(Direction.right).?;
-
                 while (successor.getChild(Direction.left)) |left| {
                     parent = successor;
                     successor = left;
