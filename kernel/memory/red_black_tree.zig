@@ -479,13 +479,30 @@ pub fn RedBlackTree(
             valid: bool,
             black_height: i32,
         } {
-            if (node == null) {
-                return .{
-                    .valid = true,
-                    .black_height = 1,
-                };
-            }
+            if (node == null) return .{ .valid = true, .black_height = 1 };
             const n = node.?;
+
+            // Root must have null parent on the top-level call
+            if (min_val == null and max_val == null) {
+                if (n.parent != null) return .{ .valid = false, .black_height = 0 };
+            }
+
+            // ---- Symmetry checks (both directions) ----
+            // Upward: if a parent exists, it must reference us as a child.
+            if (n.parent) |p| {
+                const parent_points_to_us =
+                    (p.getChild(.left) == n) or (p.getChild(.right) == n);
+                if (!parent_points_to_us)
+                    return .{ .valid = false, .black_height = 0 };
+            }
+
+            // Downward: any child must have us as its parent.
+            if (n.getChild(.left)) |l| {
+                if (l.parent != n) return .{ .valid = false, .black_height = 0 };
+            }
+            if (n.getChild(.right)) |r| {
+                if (r.parent != n) return .{ .valid = false, .black_height = 0 };
+            }
 
             // Invariant 2: BST property - left child < parent < right child
             if (min_val) |min| {
