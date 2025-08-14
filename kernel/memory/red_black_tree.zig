@@ -260,69 +260,86 @@ pub fn RedBlackTree(
             return self.removeFromPtr(current.?);
         }
 
-        pub fn removeFromPtr(self: *Self, target: *Node) T {
-            var parent: ?*Node = target.parent;
-            const removed = target.data;
+        pub fn removeFromPtr(self: *Self, target_node: *Node) T {
+            var parent_of_target: ?*Node = target_node.parent;
+            const removed_value = target_node.data;
 
-            const one_child_at_most =
-                (target.getChild(Direction.left) == null) or
-                (target.getChild(Direction.right) == null);
+            const has_at_most_one_child =
+                (target_node.getChild(.left) == null) or
+                (target_node.getChild(.right) == null);
 
-            if (one_child_at_most) {
-                const non_null_child =
-                    if (target.getChild(Direction.left) == null) Direction.right else Direction.left;
-                const replacement = target.getChild(non_null_child);
+            if (has_at_most_one_child) {
+                const non_null_direction: Direction =
+                    if (target_node.getChild(.left) == null) Direction.right else Direction.left;
+                const child_replacement = target_node.getChild(non_null_direction);
 
-                if (target == self.root) {
-                    self.root = replacement;
-                    if (replacement) |r| r.parent = null;
+                if (target_node == self.root) {
+                    self.root = child_replacement;
+                    if (child_replacement) |r| r.parent = null;
                 } else {
-                    const dir_from_parent =
-                        if (target == parent.?.getChild(Direction.left)) Direction.left else Direction.right;
+                    const direction_from_parent: Direction =
+                        if (target_node == parent_of_target.?.getChild(.left)) Direction.left else Direction.right;
 
-                    parent.?.setParentChildRelation(replacement, dir_from_parent);
+                    parent_of_target.?.setParentChildRelation(child_replacement, direction_from_parent);
 
-                    if (target.color == Color.Black) {
-                        if (replacement) |r| {
+                    if (target_node.color == Color.Black) {
+                        if (child_replacement) |r| {
                             if (r.color == Color.Red) r.color = Color.Black;
                         } else {
-                            self.removeFix(parent.?, dir_from_parent);
+                            self.removeFix(parent_of_target.?, direction_from_parent);
                         }
                     }
                 }
 
-                target.destroy(self.allocator);
+                target_node.destroy(self.allocator);
+                return removed_value;
             } else {
-                parent = null;
-                var successor: *Node = target.getChild(Direction.right).?;
-                while (successor.getChild(Direction.left)) |left| {
-                    parent = successor;
-                    successor = left;
+                var successor_node: *Node = target_node.getChild(.right).?;
+                var parent_of_successor: ?*Node = null;
+                while (successor_node.getChild(.left)) |left_child| {
+                    parent_of_successor = successor_node;
+                    successor_node = left_child;
                 }
 
-                const replacement = successor.getChild(Direction.right);
+                const original_color_of_successor = successor_node.color;
+                const replacement_subchild: ?*Node = successor_node.getChild(.right);
 
-                if (parent) |p| {
-                    p.setParentChildRelation(replacement, Direction.left);
+                if (parent_of_successor) |_| {
+                    parent_of_successor.?.setParentChildRelation(replacement_subchild, .left);
+                    successor_node.setParentChildRelation(target_node.getChild(.right), .right);
+                }
+
+                const parent_ptr = target_node.parent;
+                if (parent_ptr) |p| {
+                    const direction_to_target: Direction =
+                        if (p.getChild(.left) == target_node) Direction.left else Direction.right;
+                    p.setParentChildRelation(successor_node, direction_to_target);
                 } else {
-                    target.setParentChildRelation(replacement, Direction.right);
+                    self.root = successor_node;
+                    successor_node.parent = null;
                 }
 
-                if (successor.color == Color.Black) {
-                    if (replacement) |r| {
-                        if (r.color == Color.Red) r.color = Color.Black;
+                successor_node.setParentChildRelation(target_node.getChild(.left), .left);
+                successor_node.color = target_node.color;
+
+                target_node.destroy(self.allocator);
+
+                if (original_color_of_successor == .Black) {
+                    const double_black_parent: *Node = if (parent_of_successor) |pos| pos else successor_node;
+                    const double_black_side: Direction = if (parent_of_successor != null) Direction.left else Direction.right;
+                    if (replacement_subchild) |child| {
+                        if (child.color == .Red) {
+                            child.color = .Black;
+                        } else {
+                            self.removeFix(double_black_parent, double_black_side);
+                        }
                     } else {
-                        const pfix = parent orelse target;
-                        const which_child: Direction = if (parent != null) Direction.left else Direction.right;
-                        self.removeFix(pfix, which_child);
+                        self.removeFix(double_black_parent, double_black_side);
                     }
                 }
 
-                target.data = successor.data;
-                successor.destroy(self.allocator);
+                return removed_value;
             }
-
-            return removed;
         }
 
         fn removeFix(

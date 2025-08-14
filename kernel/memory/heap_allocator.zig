@@ -172,7 +172,6 @@ pub const HeapAllocator = struct {
                     if (required <= block_size) {
                         _ = entry.data.freelist.popSpecific(@ptrFromInt(block_addr)).?;
                         if (entry.data.freelist.head == null) {
-                            std.debug.print("HeapAllocator: removeFromPtr @ {x}, bucket_len = {}\n", .{ @intFromPtr(entry), entry.data.bucket_len });
                             _ = self.free_tree.removeFromPtr(entry);
                         }
 
@@ -338,7 +337,6 @@ pub const HeapAllocator = struct {
                     if (prev_list.head == null) {
                         const prev_entry_ptr: *TreeEntry = @fieldParentPtr("freelist", prev_list);
                         const prev_node_ptr: *RedBlackTree.Node = @fieldParentPtr("data", prev_entry_ptr);
-                        std.debug.print("HeapAllocator: removeFromPtr (prev merge) @ {x}, bucket_len = {}\n", .{ @intFromPtr(prev_node_ptr), prev_entry_ptr.bucket_len });
                         _ = self.free_tree.removeFromPtr(prev_node_ptr);
                     }
 
@@ -367,7 +365,6 @@ pub const HeapAllocator = struct {
                 if (next_list.head == null) {
                     const next_entry_ptr: *TreeEntry = @fieldParentPtr("freelist", next_list);
                     const next_node_ptr: *RedBlackTree.Node = @fieldParentPtr("data", next_entry_ptr);
-                    std.debug.print("HeapAllocator: removeFromPtr (next merge) @ {x}, bucket_len = {}\n", .{ @intFromPtr(next_node_ptr), next_entry_ptr.bucket_len });
                     _ = self.free_tree.removeFromPtr(next_node_ptr);
                 }
 
@@ -418,7 +415,6 @@ pub const HeapAllocator = struct {
             }
         }
 
-        std.debug.print("HeapAllocator: insertAtPtr parent = {x}, dir = {s}, bucket_len = {}, freelist_entry = {x}\n", .{ if (parent) |p| @intFromPtr(p) else 0, @tagName(direction), bucket_len, @intFromPtr(freelist_entry) });
         const new_node = self.free_tree.insertAtPtr(
             parent,
             direction,
