@@ -68,8 +68,9 @@ pub fn RedBlackTree(
                 return self.children[@intFromEnum(d)];
             }
 
-            fn setChild(self: *Node, child: ?*Node, d: Direction) void {
+            fn setParentChildRelation(self: *Node, child: ?*Node, d: Direction) void {
                 self.children[@intFromEnum(d)] = child;
+                if (child) |c| c.parent = self;
             }
 
             fn getSibling(self: *Node) ?*Node {
@@ -121,9 +122,9 @@ pub fn RedBlackTree(
 
                     if (parent) |p| {
                         if (p.getChild(Direction.left) == c) {
-                            p.setChild(null, Direction.left);
+                            p.setParentChildRelation(null, Direction.left);
                         } else {
-                            p.setChild(null, Direction.right);
+                            p.setParentChildRelation(null, Direction.right);
                         }
                     }
 
@@ -187,9 +188,8 @@ pub fn RedBlackTree(
             if (parent) |p| {
                 std.debug.assert(p.getChild(dir) == null);
 
-                node.parent = p;
                 node.color = Color.Red;
-                p.setChild(node, dir);
+                p.setParentChildRelation(node, dir);
 
                 if (p.color == Color.Red) {
                     self.insertFix(node);
@@ -275,11 +275,11 @@ pub fn RedBlackTree(
 
                 if (target == self.root) {
                     self.root = replacement;
+                    if (replacement) |r| r.parent = null;
                 } else {
                     const dir_from_parent =
                         if (target == parent.?.getChild(Direction.left)) Direction.left else Direction.right;
-                    parent.?.setChild(replacement, dir_from_parent);
-                    if (replacement) |r| r.parent = parent;
+                    parent.?.setParentChildRelation(replacement, dir_from_parent);
                 }
 
                 if (target.color == Color.Black) {
@@ -302,13 +302,9 @@ pub fn RedBlackTree(
                 const replacement = successor.getChild(Direction.right);
 
                 if (parent) |p| {
-                    p.setChild(replacement, Direction.left);
+                    p.setParentChildRelation(replacement, Direction.left);
                 } else {
-                    target.setChild(replacement, Direction.right);
-                }
-
-                if (replacement) |right| {
-                    right.parent = parent orelse target;
+                    target.setParentChildRelation(replacement, Direction.right);
                 }
 
                 if (successor.color == Color.Black) {
@@ -400,23 +396,18 @@ pub fn RedBlackTree(
         ) void {
             const new_parent = pivot.getChild(d.flip()).?;
 
-            pivot.setChild(new_parent.getChild(d), d.flip());
-            if (new_parent.getChild(d)) |subtree| {
-                subtree.parent = pivot;
-            }
-            new_parent.parent = pivot.parent;
+            pivot.setParentChildRelation(new_parent.getChild(d), d.flip());
 
+            new_parent.parent = pivot.parent;
             if (pivot.parent) |p| {
                 std.debug.assert(p.getChild(.left) == pivot or p.getChild(.right) == pivot);
-
                 const pivot_direction = if (p.getChild(Direction.left) == pivot) Direction.left else Direction.right;
-                p.setChild(new_parent, pivot_direction);
+                p.setParentChildRelation(new_parent, pivot_direction);
             } else {
                 self.root = new_parent;
             }
 
-            new_parent.setChild(pivot, d);
-            pivot.parent = new_parent;
+            new_parent.setParentChildRelation(pivot, d);
         }
 
         pub fn findNeighbors(self: *Self, data: T) struct {
@@ -471,10 +462,10 @@ pub fn RedBlackTree(
         }
 
         /// helper function to validate red black tree invariants
-        fn validateRedBlackTree(
+        pub fn validateRedBlackTree(
             node: ?*Node,
-            min_val: ?i32,
-            max_val: ?i32,
+            min_val: ?T,
+            max_val: ?T,
         ) struct {
             valid: bool,
             black_height: i32,
@@ -482,9 +473,38 @@ pub fn RedBlackTree(
             if (node == null) return .{ .valid = true, .black_height = 1 };
             const n = node.?;
 
+            const fail = struct {
+                fn dump(node_ptr: *Node, reason: []const u8) void {
+                    std.debug.print("\n[RBTree Validation Failed]\n", .{});
+                    std.debug.print("Reason: {s}\n", .{reason});
+                    std.debug.print("Node @ {x}\n", .{@intFromPtr(node_ptr)});
+                    std.debug.print("  data = {}\n", .{node_ptr.data});
+                    std.debug.print("  color = {s}\n", .{if (node_ptr.color == .Red) "Red" else "Black"});
+
+                    if (node_ptr.parent) |p| {
+                        std.debug.print("  parent @ {x}, data = {}\n", .{ @intFromPtr(p), p.data });
+                    } else {
+                        std.debug.print("  parent = null\n", .{});
+                    }
+                    if (node_ptr.getChild(.left)) |l| {
+                        std.debug.print("  left @ {x}, data = {}\n", .{ @intFromPtr(l), l.data });
+                    } else {
+                        std.debug.print("  left = null\n", .{});
+                    }
+                    if (node_ptr.getChild(.right)) |r| {
+                        std.debug.print("  right @ {x}, data = {}\n", .{ @intFromPtr(r), r.data });
+                    } else {
+                        std.debug.print("  right = null\n", .{});
+                    }
+                }
+            };
+
             // Root must have null parent on the top-level call
             if (min_val == null and max_val == null) {
-                if (n.parent != null) return .{ .valid = false, .black_height = 0 };
+                if (n.parent != null) {
+                    fail.dump(n, "Root has non-null parent");
+                    return .{ .valid = false, .black_height = 0 };
+                }
             }
 
             // ---- Symmetry checks (both directions) ----
@@ -492,79 +512,73 @@ pub fn RedBlackTree(
             if (n.parent) |p| {
                 const parent_points_to_us =
                     (p.getChild(.left) == n) or (p.getChild(.right) == n);
-                if (!parent_points_to_us)
+                if (!parent_points_to_us) {
+                    fail.dump(n, "Parent does not point to this node");
                     return .{ .valid = false, .black_height = 0 };
+                }
             }
 
             // Downward: any child must have us as its parent.
             if (n.getChild(.left)) |l| {
-                if (l.parent != n) return .{ .valid = false, .black_height = 0 };
+                if (l.parent != n) {
+                    fail.dump(n, "Left child's parent != this node");
+                    return .{ .valid = false, .black_height = 0 };
+                }
             }
             if (n.getChild(.right)) |r| {
-                if (r.parent != n) return .{ .valid = false, .black_height = 0 };
+                if (r.parent != n) {
+                    fail.dump(n, "Right child's parent != this node");
+                    return .{ .valid = false, .black_height = 0 };
+                }
             }
 
             // Invariant 2: BST property - left child < parent < right child
             if (min_val) |min| {
-                if (n.data <= min) return .{
-                    .valid = false,
-                    .black_height = 0,
-                };
+                // require n.data > min
+                if (cmpFn(n.data, min) != .gt) {
+                    fail.dump(n, "BST violation: data <= min bound");
+                    return .{ .valid = false, .black_height = 0 };
+                }
             }
             if (max_val) |max| {
-                if (n.data >= max) return .{
-                    .valid = false,
-                    .black_height = 0,
-                };
+                // require n.data < max
+                if (cmpFn(n.data, max) != .lt) {
+                    fail.dump(n, "BST violation: data >= max bound");
+                    return .{ .valid = false, .black_height = 0 };
+                }
             }
 
             // Invariant 3: All leaves (NIL nodes) are black
-            // (This is implicitly satisfied since our null nodes are considered black)
+            // (Implicitly satisfied since null nodes are considered black)
 
             // Invariant 4: Red nodes have black children (no two red nodes adjacent)
             if (n.color == .Red) {
                 if (n.getChild(.left)) |left| {
                     if (left.color == .Red) {
-                        return .{
-                            .valid = false,
-                            .black_height = 0,
-                        };
+                        fail.dump(n, "Red node has red left child");
+                        return .{ .valid = false, .black_height = 0 };
                     }
                 }
                 if (n.getChild(.right)) |right| {
                     if (right.color == .Red) {
-                        return .{
-                            .valid = false,
-                            .black_height = 0,
-                        };
+                        fail.dump(n, "Red node has red right child");
+                        return .{ .valid = false, .black_height = 0 };
                     }
                 }
             }
 
-            const left_result = validateRedBlackTree(
-                n.getChild(.left),
-                min_val,
-                n.data,
-            );
-            const right_result = validateRedBlackTree(
-                n.getChild(.right),
-                n.data,
-                max_val,
-            );
-            if (!left_result.valid or !right_result.valid) {
-                return .{
-                    .valid = false,
-                    .black_height = 0,
-                };
-            }
+            // Recurse on left and right subtrees
+            const left_result = validateRedBlackTree(n.getChild(.left), min_val, n.data);
+            if (!left_result.valid) return left_result;
+
+            const right_result = validateRedBlackTree(n.getChild(.right), n.data, max_val);
+            if (!right_result.valid) return right_result;
 
             // Invariant 5: All paths from any node to its descendant leaves contain
             // the same number of black nodes (black height property)
             if (left_result.black_height != right_result.black_height) {
-                return .{
-                    .valid = false,
-                    .black_height = 0,
-                };
+                fail.dump(n, "Black height mismatch between children");
+                return .{ .valid = false, .black_height = 0 };
             }
 
             const black_contribution: i32 = if (n.color == .Black) 1 else 0;

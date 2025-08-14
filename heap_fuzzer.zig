@@ -23,7 +23,6 @@ const AllocType = enum {
     U256,
     U512,
     U1024,
-    U2048,
 
     fn toString(alloc_type: AllocType) []const u8 {
         return switch (alloc_type) {
@@ -35,7 +34,6 @@ const AllocType = enum {
             .U256 => "u256",
             .U512 => "u512",
             .U1024 => "u1024",
-            .U2048 => "u2048",
         };
     }
 
@@ -71,10 +69,6 @@ const AllocType = enum {
             },
             .U1024 => {
                 const mem = try allocator.alloc(AlignedBlob(1024), len);
-                return @ptrCast(mem.ptr);
-            },
-            .U2048 => {
-                const mem = try allocator.alloc(AlignedBlob(2048), len);
                 return @ptrCast(mem.ptr);
             },
         };
@@ -114,10 +108,6 @@ const AllocType = enum {
             },
             .U1024 => {
                 const p: [*]AlignedBlob(1024) = @ptrFromInt(addr);
-                allocator.free(p[0..len]);
-            },
-            .U2048 => {
-                const p: [*]AlignedBlob(2048) = @ptrFromInt(addr);
                 allocator.free(p[0..len]);
             },
         }
@@ -198,8 +188,9 @@ pub fn main() !void {
                     .len = alloc_len,
                 });
 
-                // validate state
-                // update fragmentation stats
+                std.debug.assert(heap_allocator.validateState());
+
+                // update fragmentation stats (nyi)
             },
             .free => {
                 const target_idx = rand.intRangeAtMost(
@@ -222,8 +213,9 @@ pub fn main() !void {
                     heap_iface,
                 );
 
-                // validate state
-                // update fragmentation stats
+                std.debug.assert(heap_allocator.validateState());
+
+                // update fragmentation stats (nyi)
             },
         }
     }
