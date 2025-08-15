@@ -347,67 +347,74 @@ pub fn RedBlackTree(
             parent: *Node,
             which_child: Direction,
         ) void {
-            var p = parent;
-            var wc = which_child;
+            var current_parent = parent;
+            var deficit_side = which_child;
 
             while (true) {
-                if (p.getChild(wc) != null) break;
+                const deficit_node = current_parent.getChild(deficit_side);
 
-                const s_opt = p.getChild(wc.flip());
-                if (s_opt == null) {
-                    if (p.color == .Red) {
-                        p.color = Color.Black;
+                if (deficit_node) |node_with_deficit| {
+                    if (node_with_deficit.color == .Red) {
+                        node_with_deficit.color = .Black;
                         break;
                     }
-                    const gp_opt = p.parent;
-                    if (gp_opt == null) break;
-                    const gp = gp_opt.?;
-                    wc = if (p == gp.getChild(.left)) .left else .right;
-                    p = gp;
+                }
+
+                const sibling_opt = current_parent.getChild(deficit_side.flip());
+                if (sibling_opt == null) {
+                    if (current_parent.color == .Red) {
+                        current_parent.color = Color.Black;
+                        break;
+                    }
+                    const grand_opt = current_parent.parent;
+                    if (grand_opt == null) break;
+                    const grandparent = grand_opt.?;
+                    deficit_side = if (current_parent == grandparent.getChild(.left)) .left else .right;
+                    current_parent = grandparent;
                     continue;
                 }
 
-                const s = s_opt.?;
-                const near = s.getChild(wc);
-                const far = s.getChild(wc.flip());
+                const sibling = sibling_opt.?;
+                const near_child = sibling.getChild(deficit_side);
+                const far_child = sibling.getChild(deficit_side.flip());
 
-                if (s.color == Color.Red) {
-                    self.rotate(p, wc);
-                    s.color = Color.Black;
-                    p.color = Color.Red;
+                if (sibling.color == .Red) {
+                    self.rotate(current_parent, deficit_side);
+                    sibling.color = Color.Black;
+                    current_parent.color = Color.Red;
                     continue;
                 } else {
-                    const far_red = if (far) |f| f.color == Color.Red else false;
-                    const near_red = if (near) |n| n.color == Color.Red else false;
+                    const far_is_red = if (far_child) |f| f.color == .Red else false;
+                    const near_is_red = if (near_child) |n| n.color == .Red else false;
 
-                    if (!far_red and !near_red) {
-                        s.color = Color.Red;
-                        if (p.color == Color.Red) {
-                            p.color = Color.Black;
+                    if (!far_is_red and !near_is_red) {
+                        sibling.color = Color.Red;
+                        if (current_parent.color == .Red) {
+                            current_parent.color = Color.Black;
                             break;
                         }
-                        const gp_opt = p.parent;
-                        if (gp_opt == null) break;
-                        const gp = gp_opt.?;
-                        wc = if (p == gp.getChild(.left)) .left else .right;
-                        p = gp;
+                        const grand_opt = current_parent.parent;
+                        if (grand_opt == null) break;
+                        const grandparent = grand_opt.?;
+                        deficit_side = if (current_parent == grandparent.getChild(.left)) .left else .right;
+                        current_parent = grandparent;
                         continue;
-                    } else if (far_red) {
-                        s.color = p.color;
-                        p.color = Color.Black;
-                        far.?.color = Color.Black;
-                        self.rotate(p, wc);
+                    } else if (far_is_red) {
+                        sibling.color = current_parent.color;
+                        current_parent.color = Color.Black;
+                        far_child.?.color = Color.Black;
+                        self.rotate(current_parent, deficit_side);
                         break;
                     } else {
-                        s.color = Color.Red;
-                        near.?.color = Color.Black;
-                        self.rotate(s, wc.flip());
+                        sibling.color = Color.Red;
+                        near_child.?.color = Color.Black;
+                        self.rotate(sibling, deficit_side.flip());
                         continue;
                     }
                 }
             }
 
-            if (self.root) |r| r.color = Color.Black;
+            if (self.root) |root_node| root_node.color = Color.Black;
         }
 
         fn rotate(
