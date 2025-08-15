@@ -166,16 +166,16 @@ pub const BuddyAllocator = struct {
         return batch;
     }
 
-    /// Intended to be called by alloc if the current order's freelist
-    /// returned null on pop(), and assumes the caller is passing the
-    /// order that they want a block returned for
     fn recursiveSplit(self: *BuddyAllocator, order: u4) ?usize {
         const addr_ptr = self.freelists[order].pop() orelse {
             if (order == 10) return null;
-            const recursive_addr = self.recursiveSplit(order + 1) orelse return null;
+
+            const higher = order + 1;
+            const recursive_addr = self.recursiveSplit(higher) orelse return null;
 
             const rel = recursive_addr - self.start_addr;
             const buddy = self.start_addr + (rel ^ ORDERS[order]);
+
             if (self.start_addr <= buddy and buddy < self.end_addr) {
                 self.setOrder(buddy, order);
                 self.bitmap.setBit(buddy, 1);
@@ -186,27 +186,27 @@ pub const BuddyAllocator = struct {
             return recursive_addr;
         };
 
-        return @intFromPtr(addr_ptr);
+        const addr = @intFromPtr(addr_ptr);
+        return addr;
     }
 
-    /// Intended to be called in free every time a block is returned
-    /// so that coalescing can be performed if possible
     fn recursiveMerge(self: *BuddyAllocator, addr: usize) struct { addr: usize, order: u4 } {
         const order = self.getOrder(addr);
-        if (order == 10) {
-            return .{ .addr = addr, .order = order };
-        }
+        if (order == 10) return .{ .addr = addr, .order = order };
 
         const rel = addr - self.start_addr;
         const buddy = self.start_addr + (rel ^ ORDERS[order]);
         const buddy_out_of_bounds = buddy < self.start_addr or buddy >= self.end_addr;
+
         if (buddy_out_of_bounds) {
-            const next_rel = rel & ~ORDERS[order + 1];
+            const higher = order + 1;
+            const next_rel = rel & ~ORDERS[higher];
             const next_size_addr = self.start_addr + next_rel;
-            const next_size_end = next_size_addr + ORDERS[order + 1];
+            const next_size_end = next_size_addr + ORDERS[higher];
             const next_size_within_bounds = next_size_addr >= self.start_addr and next_size_end <= self.end_addr;
+
             if (next_size_within_bounds) {
-                self.setOrder(next_size_addr, order + 1);
+                self.setOrder(next_size_addr, higher);
                 return self.recursiveMerge(next_size_addr);
             }
 
@@ -223,7 +223,8 @@ pub const BuddyAllocator = struct {
             return .{ .addr = addr, .order = order };
         }
 
-        _ = self.freelists[order].popSpecific(@ptrFromInt(buddy));
+        const removed = self.freelists[order].popSpecific(@ptrFromInt(buddy));
+        std.debug.assert(removed != null);
 
         const lower_half = @min(addr, buddy);
         const upper_half = @max(addr, buddy);
@@ -231,7 +232,8 @@ pub const BuddyAllocator = struct {
         self.bitmap.setBit(lower_half, 0);
         self.bitmap.setBit(upper_half, 0);
 
-        self.setOrder(lower_half, order + 1);
+        const higher = order + 1;
+        self.setOrder(lower_half, higher);
         return self.recursiveMerge(lower_half);
     }
 
@@ -277,7 +279,6 @@ pub const BuddyAllocator = struct {
         return @ptrFromInt(addr);
     }
 
-    // no op
     fn resize(
         ptr: *anyopaque,
         memory: []u8,
@@ -293,7 +294,6 @@ pub const BuddyAllocator = struct {
         unreachable;
     }
 
-    // no op
     fn remap(
         ptr: *anyopaque,
         memory: []u8,
@@ -309,7 +309,6 @@ pub const BuddyAllocator = struct {
         unreachable;
     }
 
-    // no op
     fn free(
         ptr: *anyopaque,
         buf: []u8,
@@ -451,7 +450,7 @@ pub const BuddyAllocator = struct {
             }
         }
 
-        // Page-level scan (keeps your original logic, but with instrumentation).
+        // Page-level scan
         const total_pages = (end - start) / PAGE_SIZE;
         var page_idx: usize = 0;
         while (page_idx < total_pages) : (page_idx += 1) {
@@ -491,7 +490,7 @@ pub const BuddyAllocator = struct {
             // Buddy coalescing invariant: two free buddies of same order should not coexist.
             if (ord < (NUM_ORDERS - 1)) {
                 const size = ORDERS[ord];
-                const buddy = addr ^ size;
+                const buddy = start + (((addr - start) ^ size));
                 if (!(buddy < start or buddy >= end)) {
                     if (self.bitmap.isFree(buddy) and self.getOrder(buddy) == ord) {
                         return Helper.fail("coalescing missed: both buddies free at same order", .{

@@ -9,14 +9,10 @@ const ORDERS = blk: {
     break :blk arr;
 };
 
-const SEED = 1;
+const SEED = 0;
 const ACTIVE_CAP = 16_384;
-const ORDER10_BLOCKS = 512;
+const ORDER10_BLOCKS = 8;
 const POOL_SIZE = ORDER10_BLOCKS * ORDERS[10];
-
-fn AlignedBlob(comptime N: usize) type {
-    return struct { bytes: [N]u8 align(N) };
-}
 
 const AllocType = enum {
     const NUM_TYPES = @typeInfo(AllocType).@"enum".fields.len;
@@ -92,7 +88,7 @@ pub fn main() !void {
     var dbg_allocator = std.heap.DebugAllocator(.{}){};
     const backing_allocator = dbg_allocator.allocator();
 
-    const backing_mem = try backing_allocator.alignedAlloc(u8, PAGE_SIZE, POOL_SIZE);
+    const backing_mem = try backing_allocator.alignedAlloc(u8, ORDERS[10], POOL_SIZE);
     defer backing_allocator.free(backing_mem);
 
     const start_addr = @intFromPtr(backing_mem.ptr);
@@ -122,7 +118,13 @@ pub fn main() !void {
             .alloc => {
                 const alloc_type: AllocType = @enumFromInt(rand.intRangeAtMost(usize, 0, AllocType.NUM_TYPES - 1));
                 const size = alloc_type.size();
-                const ptr = try AllocType.allocate(alloc_type, buddy_iface);
+                const ptr = AllocType.allocate(alloc_type, buddy_iface) catch {
+                    std.debug.print(
+                        "Action {} - Alloc: type {s}, len {}, FAILED - Out of Memory\n",
+                        .{ i, alloc_type.toString(), size },
+                    );
+                    continue;
+                };
 
                 try handles.append(.{
                     .alloc_type = alloc_type,
@@ -140,12 +142,11 @@ pub fn main() !void {
                 );
 
                 std.debug.assert(buddy.validateState(&alloc_map));
-
-                // update fragmentation stats (nyi)
             },
             .free => {
                 const idx = rand.intRangeAtMost(usize, 0, handles.items.len - 1);
                 const h = handles.swapRemove(idx);
+                _ = alloc_map.remove(h.addr);
 
                 std.debug.print(
                     "Action {} - Free: type {s}, len {}, {x}\n",
@@ -156,8 +157,6 @@ pub fn main() !void {
                 _ = alloc_map.remove(h.addr);
 
                 std.debug.assert(buddy.validateState(&alloc_map));
-
-                // update fragmentation stats (nyi)
             },
         }
     }
