@@ -36,12 +36,21 @@ const PagePairOrders = packed struct {
 };
 
 const using_popSpecific = true;
-const IntrusiveFreeList = intrusive_freelist.IntrusiveFreeList(*Page, using_popSpecific);
+const link_to_list = false;
+const IntrusiveFreeList = intrusive_freelist.IntrusiveFreeList(
+    *Page,
+    using_popSpecific,
+    link_to_list,
+);
 const using_getNextFree = false;
 const BitmapFreeList = bitmap_freelist.BitmapFreeList(using_getNextFree);
 
 /// Return type for splitAllocation, a linked list of blocks of the requested order
-pub const FreeListBatch = intrusive_freelist.IntrusiveFreeList(*Page, !using_popSpecific);
+pub const FreeListBatch = intrusive_freelist.IntrusiveFreeList(
+    *Page,
+    !using_popSpecific,
+    link_to_list,
+);
 
 /// Owning allocator. Manages a contiguous address space, does not take a backing allocator, can act as a backing allocator;
 pub const BuddyAllocator = struct {
@@ -161,15 +170,12 @@ pub const BuddyAllocator = struct {
     /// returned null on pop(), and assumes the caller is passing the
     /// order that they want a block returned for
     fn recursiveSplit(self: *BuddyAllocator, order: u4) ?usize {
-        std.debug.assert(order < 11);
-
         const addr_ptr = self.freelists[order].pop() orelse {
             if (order == 10) return null;
             const recursive_addr = self.recursiveSplit(order + 1) orelse return null;
 
-            // since we're splitting a larger block, the buddy must be within bounds
-            // as it is the upper half of the block, so there's no need to range check
-            const buddy = recursive_addr ^ ORDERS[order];
+            const rel = recursive_addr - self.start_addr;
+            const buddy = self.start_addr + (rel ^ ORDERS[order]);
             if (self.start_addr <= buddy and buddy < self.end_addr) {
                 self.setOrder(buddy, order);
                 self.bitmap.setBit(buddy, 1);
@@ -191,10 +197,12 @@ pub const BuddyAllocator = struct {
             return .{ .addr = addr, .order = order };
         }
 
-        const buddy = addr ^ ORDERS[order];
+        const rel = addr - self.start_addr;
+        const buddy = self.start_addr + (rel ^ ORDERS[order]);
         const buddy_out_of_bounds = buddy < self.start_addr or buddy >= self.end_addr;
         if (buddy_out_of_bounds) {
-            const next_size_addr = addr & ~ORDERS[order + 1];
+            const next_rel = rel & ~ORDERS[order + 1];
+            const next_size_addr = self.start_addr + next_rel;
             const next_size_end = next_size_addr + ORDERS[order + 1];
             const next_size_within_bounds = next_size_addr >= self.start_addr and next_size_end <= self.end_addr;
             if (next_size_within_bounds) {
@@ -316,79 +324,196 @@ pub const BuddyAllocator = struct {
         self.bitmap.setBit(result.addr, 1);
         self.freelists[result.order].push(@ptrFromInt(result.addr));
     }
-};
 
-/// Helper type for use by test cases
-const AllocationMap = std.HashMap(
-    usize,
-    struct { size: usize, order: u4 },
-    std.hash_map.AutoContext(usize),
-    std.hash_map.default_max_load_percentage,
-);
+    /// Helper type for use by test cases
+    pub const AllocationMap = std.HashMap(
+        usize,
+        struct { size: usize, order: u4 },
+        std.hash_map.AutoContext(usize),
+        std.hash_map.default_max_load_percentage,
+    );
 
-/// Helper function for use by test cases
-fn validateState(
-    buddy_alloc: *BuddyAllocator,
-    allocations: *AllocationMap,
-    validations: usize,
-) !void {
-    // used to identify which call site a validation failed in during a unit test
-    // assuming you add debug print statements to make use of it
-    _ = validations;
-
-    const total_pages = (buddy_alloc.end_addr - buddy_alloc.start_addr) / PAGE_SIZE;
-    for (0..total_pages) |page_idx| {
-        const addr = buddy_alloc.start_addr + page_idx * PAGE_SIZE;
-        const order = buddy_alloc.getOrder(addr);
-        const is_free = buddy_alloc.bitmap.isFree(addr);
-
-        if (!is_free) {
-            // an page may not be free, but may not be allocated either, by being part of a larger block
-            if (!allocations.contains(addr)) continue;
-
-            if (allocations.get(addr)) |alloc_info| {
-                const num_pages = alloc_info.size / PAGE_SIZE;
-                const expected_order: u4 = @intCast(@ctz(num_pages));
-                // the order should match what's expected given the size of the allocation
-                try std.testing.expect(order == expected_order);
+    /// Helper function for use by test cases
+    pub fn validateState(self: *BuddyAllocator, allocations: *AllocationMap) bool {
+        const Helper = struct {
+            fn fail(reason: []const u8, ctx: struct {
+                start_addr: usize = 0,
+                end_addr: usize = 0,
+                page_size: usize = 0,
+                order: usize = 0,
+                addr: usize = 0,
+                end: usize = 0,
+                buddy: usize = 0,
+                expected_order: usize = 0,
+                extra_a: usize = 0,
+                extra_b: usize = 0,
+            }) bool {
+                std.debug.print(
+                    "\n[Buddy Validate Failed]\nreason={s}\nstart={x} end={x} page_size={d}\norder={d} addr={x} end={x} buddy={x} expected_order={d}\nextra_a={x} extra_b={x}\n",
+                    .{
+                        reason,
+                        ctx.start_addr,
+                        ctx.end_addr,
+                        ctx.page_size,
+                        ctx.order,
+                        ctx.addr,
+                        ctx.end,
+                        ctx.buddy,
+                        ctx.expected_order,
+                        ctx.extra_a,
+                        ctx.extra_b,
+                    },
+                );
+                return false;
             }
-            continue;
+
+            fn isAligned(x: usize, a: usize) bool {
+                return (x & (a - 1)) == 0;
+            }
+        };
+
+        const start = self.start_addr;
+        const end = self.end_addr;
+
+        if (!(end > start))
+            return Helper.fail("end_addr <= start_addr", .{ .start_addr = start, .end_addr = end });
+        if (!Helper.isAligned(start, PAGE_SIZE))
+            return Helper.fail("start_addr not PAGE_SIZE aligned", .{ .start_addr = start, .page_size = PAGE_SIZE });
+        if (!Helper.isAligned(end, PAGE_SIZE))
+            return Helper.fail("end_addr not PAGE_SIZE aligned", .{ .end_addr = end, .page_size = PAGE_SIZE });
+
+        // Collect every free block (base -> order) to (a) spot duplicates and
+        // (b) let page-scan cheaply verify membership.
+        var free_map = std.AutoHashMap(usize, u4).init(self.init_allocator);
+        defer free_map.deinit();
+
+        var order: usize = 0;
+        while (order < NUM_ORDERS) : (order += 1) {
+            const blk_size = ORDERS[order];
+            var node = self.freelists[order].head;
+
+            while (node) |n| {
+                const base = @intFromPtr(n);
+                const end_addr = base + blk_size;
+
+                if (base < start or end_addr > end)
+                    return Helper.fail("free block out of bounds", .{
+                        .start_addr = start,
+                        .end_addr = end,
+                        .order = order,
+                        .addr = base,
+                        .end = end_addr,
+                    });
+
+                if (!Helper.isAligned(base, PAGE_SIZE))
+                    return Helper.fail("free block not page aligned", .{
+                        .addr = base,
+                        .page_size = PAGE_SIZE,
+                        .order = order,
+                    });
+
+                // Free-list node must reflect "free" in bitmap and order table at the base page.
+                if (!self.bitmap.isFree(base))
+                    return Helper.fail("bitmap says allocated but in freelist", .{
+                        .addr = base,
+                        .order = order,
+                    });
+                if (self.getOrder(base) != order)
+                    return Helper.fail("getOrder(base) != freelist order", .{
+                        .addr = base,
+                        .order = order,
+                        .extra_a = self.getOrder(base),
+                    });
+
+                // No duplicate base addresses across all freelists.
+                if (free_map.contains(base))
+                    return Helper.fail("duplicate free node address across freelists", .{
+                        .addr = base,
+                        .order = order,
+                        .extra_a = free_map.get(base).?,
+                    });
+                free_map.put(base, @intCast(order)) catch
+                    return Helper.fail("OOM inserting into free_map", .{ .order = order });
+
+                // Interior pages of a free block must *not* be individually marked free.
+                var inner = base + PAGE_SIZE;
+                while (inner < end_addr) : (inner += PAGE_SIZE) {
+                    if (self.bitmap.isFree(inner))
+                        return Helper.fail("interior page of a free block marked free", .{
+                            .addr = inner,
+                            .order = order,
+                            .extra_a = base,
+                            .extra_b = end_addr,
+                        });
+                }
+
+                node = n.next;
+            }
         }
 
-        // address should not be allocated if the bitmap says its free
-        try std.testing.expect(!allocations.contains(addr));
+        // Page-level scan (keeps your original logic, but with instrumentation).
+        const total_pages = (end - start) / PAGE_SIZE;
+        var page_idx: usize = 0;
+        while (page_idx < total_pages) : (page_idx += 1) {
+            const addr = start + page_idx * PAGE_SIZE;
+            const ord: usize = self.getOrder(addr);
+            const is_free = self.bitmap.isFree(addr);
 
-        const maybe_freelist_head = buddy_alloc.freelists[order].head orelse return error.TestUnexpectedResult;
+            if (!is_free) {
+                // Not free: either allocated base, interior of a larger allocation,
+                // or interior of a free block (which should never be marked free anyway).
+                if (allocations.get(addr)) |info| {
+                    const num_pages = info.size / PAGE_SIZE;
+                    if (num_pages == 0 or (num_pages & (num_pages - 1)) != 0)
+                        return Helper.fail("allocation size not power-of-two pages", .{
+                            .addr = addr,
+                            .extra_a = info.size,
+                        });
+                    const expected: usize = @ctz(num_pages);
+                    if (ord != expected)
+                        return Helper.fail("allocated page order mismatch", .{
+                            .addr = addr,
+                            .order = ord,
+                            .expected_order = expected,
+                        });
+                }
+                continue;
+            }
 
-        var current = maybe_freelist_head;
-        var found = @intFromPtr(current) == addr;
-        while (current.next) |next| {
-            if (found) break;
-            found = @intFromPtr(next) == addr;
-            current = next;
+            // Bitmap says free: must not appear in allocations map.
+            if (allocations.contains(addr))
+                return Helper.fail("bitmap says free but recorded as allocated", .{ .addr = addr, .order = ord });
+
+            // Free page must be present as a freelist base (use free_map from pass 1).
+            if (!free_map.contains(addr))
+                return Helper.fail("free page not found in freelists", .{ .addr = addr, .order = ord });
+
+            // Buddy coalescing invariant: two free buddies of same order should not coexist.
+            if (ord < (NUM_ORDERS - 1)) {
+                const size = ORDERS[ord];
+                const buddy = addr ^ size;
+                if (!(buddy < start or buddy >= end)) {
+                    if (self.bitmap.isFree(buddy) and self.getOrder(buddy) == ord) {
+                        return Helper.fail("coalescing missed: both buddies free at same order", .{
+                            .addr = addr,
+                            .buddy = buddy,
+                            .order = ord,
+                        });
+                    }
+                }
+            }
         }
-        try std.testing.expect(found);
 
-        const buddy = addr ^ ORDERS[order];
-        if (buddy < buddy_alloc.start_addr or buddy >= buddy_alloc.end_addr) continue;
-
-        const buddy_is_free = buddy_alloc.bitmap.isFree(buddy);
-        if (!buddy_is_free) continue;
-
-        if (order == 10) continue;
-        const buddy_order = buddy_alloc.getOrder(buddy);
-        // if the buddy is free, the order should not match
-        // otherwise a merge was missed
-        try std.testing.expect(order != buddy_order);
+        return true;
     }
-}
 
-/// Helper function for use by test cases
-fn checkAllocationFailure(buddy_alloc: *BuddyAllocator, order: u4) !void {
-    for (order..NUM_ORDERS) |check_order| {
-        try std.testing.expect(buddy_alloc.freelists[check_order].head == null);
+    /// Helper function for use by test cases
+    fn checkAllocationFailure(buddy_alloc: *BuddyAllocator, order: u4) !void {
+        for (order..NUM_ORDERS) |check_order| {
+            try std.testing.expect(buddy_alloc.freelists[check_order].head == null);
+        }
     }
-}
+};
 
 test "buddy allocator initializes expected pages and orders correctly" {
     const allocator = std.testing.allocator;
@@ -576,31 +701,31 @@ test "out of bounds buddy handling - fragmentation recovery" {
     defer buddy.deinit();
 
     var allocator = buddy.allocator();
-    var allocations = AllocationMap.init(test_allocator);
+    var allocations = BuddyAllocator.AllocationMap.init(test_allocator);
     defer allocations.deinit();
 
-    try validateState(&buddy, &allocations, 0);
+    try std.testing.expect(buddy.validateState(&allocations));
 
     const order_10_ptr = try allocator.alloc(u8, ORDERS[10]);
     try allocations.put(@intFromPtr(order_10_ptr.ptr), .{ .size = ORDERS[10], .order = 10 });
-    try validateState(&buddy, &allocations, 1);
+    try std.testing.expect(buddy.validateState(&allocations));
 
     const order_4_ptr = try allocator.alloc(u8, ORDERS[4]);
     const order_4_addr = @intFromPtr(order_4_ptr.ptr);
     try allocations.put(order_4_addr, .{ .size = ORDERS[4], .order = 4 });
-    try validateState(&buddy, &allocations, 2);
+    try std.testing.expect(buddy.validateState(&allocations));
 
     try std.testing.expectEqual(@as(u4, 4), buddy.getOrder(order_4_addr));
 
     allocator.free(order_4_ptr);
     _ = allocations.remove(order_4_addr);
-    try validateState(&buddy, &allocations, 3);
+    try std.testing.expect(buddy.validateState(&allocations));
 
     try std.testing.expectEqual(@as(u4, 6), buddy.getOrder(order_4_addr));
 
     allocator.free(order_10_ptr);
     _ = allocations.remove(@intFromPtr(order_10_ptr.ptr));
-    try validateState(&buddy, &allocations, 4);
+    try std.testing.expect(buddy.validateState(&allocations));
 }
 
 test "split allocation handles order changes correctly" {
@@ -621,14 +746,14 @@ test "split allocation handles order changes correctly" {
 
     var allocator = buddy.allocator();
 
-    var allocations = AllocationMap.init(test_allocator);
+    var allocations = BuddyAllocator.AllocationMap.init(test_allocator);
     defer allocations.deinit();
 
     var freelist: FreeListBatch = .{};
 
     const allocation = try allocator.alloc(u8, ORDERS[10]);
     try allocations.put(@intFromPtr(allocation.ptr), .{ .size = ORDERS[10], .order = 10 });
-    try validateState(&buddy, &allocations, 1);
+    try std.testing.expect(buddy.validateState(&allocations));
 
     _ = allocations.remove(@intFromPtr(allocation.ptr));
     var split = buddy.splitAllocation(@intFromPtr(allocation.ptr), 0);
@@ -638,14 +763,14 @@ test "split allocation handles order changes correctly" {
         freelist.push(page);
         try allocations.put(@intFromPtr(page), .{ .size = ORDERS[0], .order = 0 });
     }
-    try validateState(&buddy, &allocations, 2);
+    try std.testing.expect(buddy.validateState(&allocations));
     try std.testing.expect(count == 1024);
 
     while (freelist.pop()) |page| {
         _ = allocations.remove(@intFromPtr(page));
         const page_slice: []u8 = @as([*]u8, @ptrCast(page))[0..PAGE_SIZE];
         allocator.free(page_slice);
-        try validateState(&buddy, &allocations, 3);
+        try std.testing.expect(buddy.validateState(&allocations));
     }
 }
 
@@ -672,63 +797,61 @@ test "complex allocation and deallocation with state verification" {
 
     var allocator = buddy.allocator();
 
-    var allocations = AllocationMap.init(test_allocator);
+    var allocations = BuddyAllocator.AllocationMap.init(test_allocator);
     defer allocations.deinit();
 
-    //NOTE: Manually increment validations by 1 for each call to make it searchable
-
     var validations: usize = 1;
-    try validateState(&buddy, &allocations, validations);
+    try std.testing.expect(buddy.validateState(&allocations) and (validations == validations));
 
     const ptr1 = try allocator.alloc(u8, ORDERS[skip_order]);
     try allocations.put(@intFromPtr(ptr1.ptr), .{ .size = ORDERS[skip_order], .order = skip_order });
     validations = 2;
-    try validateState(&buddy, &allocations, validations);
+    try std.testing.expect(buddy.validateState(&allocations) and (validations == validations));
 
     const ptr2 = try allocator.alloc(u8, ORDERS[4]);
     try allocations.put(@intFromPtr(ptr2.ptr), .{ .size = ORDERS[4], .order = 4 });
     validations = 3;
-    try validateState(&buddy, &allocations, validations);
+    try std.testing.expect(buddy.validateState(&allocations) and (validations == validations));
 
     const ptr3 = try allocator.alloc(u8, ORDERS[1]);
     try allocations.put(@intFromPtr(ptr3.ptr), .{ .size = ORDERS[1], .order = 1 });
     validations = 4;
-    try validateState(&buddy, &allocations, validations);
+    try std.testing.expect(buddy.validateState(&allocations) and (validations == validations));
 
     allocator.free(ptr1);
     _ = allocations.remove(@intFromPtr(ptr1.ptr));
     validations = 5;
-    try validateState(&buddy, &allocations, validations);
+    try std.testing.expect(buddy.validateState(&allocations) and (validations == validations));
 
     const ptr4 = try allocator.alloc(u8, ORDERS[6]);
     try allocations.put(@intFromPtr(ptr4.ptr), .{ .size = ORDERS[6], .order = 6 });
     validations = 6;
-    try validateState(&buddy, &allocations, validations);
+    try std.testing.expect(buddy.validateState(&allocations) and (validations == validations));
 
     allocator.free(ptr2);
     _ = allocations.remove(@intFromPtr(ptr2.ptr));
     validations = 7;
-    try validateState(&buddy, &allocations, validations);
+    try std.testing.expect(buddy.validateState(&allocations) and (validations == validations));
 
     allocator.free(ptr3);
     _ = allocations.remove(@intFromPtr(ptr3.ptr));
     validations = 8;
-    try validateState(&buddy, &allocations, validations);
+    try std.testing.expect(buddy.validateState(&allocations) and (validations == validations));
 
     allocator.free(ptr4);
     _ = allocations.remove(@intFromPtr(ptr4.ptr));
     validations = 9;
-    try validateState(&buddy, &allocations, validations);
+    try std.testing.expect(buddy.validateState(&allocations) and (validations == validations));
 
     var failed_allocation = false;
     for (0..100) |i| {
         if (allocator.alloc(u8, ORDERS[8])) |ptr| {
             try allocations.put(@intFromPtr(ptr.ptr), .{ .size = ORDERS[8], .order = 8 });
             validations = 10 + i;
-            try validateState(&buddy, &allocations, validations);
+            try std.testing.expect(buddy.validateState(&allocations) and (validations == validations));
         } else |_| {
             failed_allocation = true;
-            try checkAllocationFailure(&buddy, 8);
+            try buddy.checkAllocationFailure(8);
             break;
         }
     }
