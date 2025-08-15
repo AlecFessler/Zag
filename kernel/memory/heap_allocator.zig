@@ -144,7 +144,7 @@ pub const HeapAllocator = struct {
         const key = TreeEntry{ .bucket_len = user_len, .freelist = undefined };
         var node_opt: ?*RedBlackTree.Node = self.free_tree.root;
 
-        while (node_opt) |entry| : (node_opt = entry.getChild(.right)) {
+        outer: while (node_opt) |entry| : (node_opt = entry.getChild(.right)) {
             if (TreeEntry.cmpFn(entry.data, key) == .lt) continue;
 
             var fnode: ?*Freelist.FreeNode = entry.data.freelist.head;
@@ -184,6 +184,12 @@ pub const HeapAllocator = struct {
                     split_header.is_free = true;
                     split_header.bucket_len = split_size - @sizeOf(AllocHeader);
 
+                    const split_prefix_end = split_header_addr + @sizeOf(AllocHeader);
+                    const split_block_end = split_prefix_end + split_header.bucket_len;
+                    const split_footer_addr = split_block_end - @sizeOf(AllocFooter);
+                    const split_footer: *AllocFooter = @ptrFromInt(split_footer_addr);
+                    split_footer.header = split_header_addr;
+
                     const split_entry_addr = split_header_addr + @sizeOf(AllocHeader);
                     const split_entry: *FreelistEntry = @ptrFromInt(split_entry_addr);
                     self.treeInsert(split_header.bucket_len, split_entry);
@@ -195,7 +201,7 @@ pub const HeapAllocator = struct {
 
                 block_base = header_addr;
                 user_block_base = aligned_user;
-                break;
+                break :outer;
             }
         }
 
@@ -328,9 +334,10 @@ pub const HeapAllocator = struct {
         }
 
         merge_next: {
-            const next_header_addr: u48 = block_end_addr;
+            const current_header_addr: u48 = @intCast(@intFromPtr(header_ptr));
+            const next_header_addr: u48 = current_header_addr + @sizeOf(AllocHeader) + header_ptr.bucket_len;
             const next_precheck =
-                next_header_addr + @sizeOf(AllocHeader) <= self.reserve_end and
+                next_header_addr + @sizeOf(AllocHeader) <= self.commit_end and
                 std.mem.isAligned(next_header_addr, @alignOf(AllocHeader));
             if (!next_precheck) break :merge_next;
 
@@ -406,13 +413,357 @@ pub const HeapAllocator = struct {
     }
 
     /// Helper function for unit tests and fuzzer
-    pub fn validateState(self: *HeapAllocator) bool {
+    pub fn validateState(self: *HeapAllocator, tmp_alloc: std.mem.Allocator) bool {
         const tree_result = RedBlackTree.validateRedBlackTree(
             self.free_tree.root,
             null,
             null,
         );
         if (!tree_result.valid) return false;
+        const BlockInfo = struct {
+            header_addr: u48,
+            entry_addr: u48, // header + sizeof(AllocHeader)
+            end_addr: u48, // header + sizeof(AllocHeader) + bucket_len
+            bucket_len: u48,
+            is_free: bool,
+            found_in_tree: bool,
+        };
+
+        const BlockMap = std.HashMap(
+            usize,
+            BlockInfo,
+            std.hash_map.AutoContext(usize),
+            std.hash_map.default_max_load_percentage,
+        );
+
+        var blocks = BlockMap.init(tmp_alloc);
+        defer blocks.deinit();
+
+        const HSIZE: u48 = @sizeOf(AllocHeader);
+        const FSIZE: u48 = @sizeOf(AllocFooter);
+        const header_align: u48 = @alignOf(AllocHeader);
+
+        const Helper = struct {
+            fn fail(
+                reason: []const u8,
+                ctx: struct {
+                    reserve_start: u48 = 0,
+                    commit_end: u48 = 0,
+                    header_addr: u48 = 0,
+                    entry_addr: u48 = 0,
+                    end_addr: u48 = 0,
+                    bucket_len: u48 = 0,
+                    is_free: ?bool = null,
+                    extra_a: usize = 0,
+                    extra_b: usize = 0,
+                },
+            ) bool {
+                std.debug.print(
+                    "\n[Heap Validate Failed]\nreason={s}\nreserve_start={x} commit_end={x}\nheader={x} entry={x} end={x} len={d} is_free={any}\nextra_a={x} extra_b={x}\n",
+                    .{
+                        reason,
+                        ctx.reserve_start,
+                        ctx.commit_end,
+                        ctx.header_addr,
+                        ctx.entry_addr,
+                        ctx.end_addr,
+                        ctx.bucket_len,
+                        ctx.is_free,
+                        ctx.extra_a,
+                        ctx.extra_b,
+                    },
+                );
+                return false;
+            }
+
+            fn hdr(addr: u48) *AllocHeader {
+                return @ptrFromInt(addr);
+            }
+            fn ftr(addr: u48) *AllocFooter {
+                return @ptrFromInt(addr);
+            }
+        };
+
+        // Pass 1: linear memory sweep builds authoritative map
+        var cur: u48 = std.mem.alignForward(u48, self.reserve_start, header_align);
+
+        var prev_was_free = false;
+        while (cur < self.commit_end) {
+            if (cur + HSIZE > self.commit_end)
+                return Helper.fail("header beyond commit_end", .{
+                    .reserve_start = self.reserve_start,
+                    .commit_end = self.commit_end,
+                    .header_addr = cur,
+                });
+
+            const h = Helper.hdr(cur).*;
+
+            if (h.bucket_len < MIN_LEN)
+                return Helper.fail("bucket_len < MIN_LEN", .{
+                    .reserve_start = self.reserve_start,
+                    .commit_end = self.commit_end,
+                    .header_addr = cur,
+                    .bucket_len = h.bucket_len,
+                    .is_free = h.is_free,
+                });
+
+            const block_end: u48 = cur + HSIZE + h.bucket_len;
+            if (block_end > self.commit_end)
+                return Helper.fail("block end > commit_end", .{
+                    .reserve_start = self.reserve_start,
+                    .commit_end = self.commit_end,
+                    .header_addr = cur,
+                    .end_addr = block_end,
+                    .bucket_len = h.bucket_len,
+                    .is_free = h.is_free,
+                });
+
+            const footer_addr: u48 = block_end - FSIZE;
+            if (h.is_free) {
+                const ft = Helper.ftr(footer_addr).*;
+                if (ft.header != cur) {
+                    std.debug.print("[Heap Validate] extra footer mismatch context: header={x} footer_addr={x} ft.header={x} offset_from_header=+{x}\n", .{
+                        cur,
+                        footer_addr,
+                        ft.header,
+                        ft.header - cur,
+                    });
+                    return Helper.fail("free block footer does not backlink to header", .{
+                        .reserve_start = self.reserve_start,
+                        .commit_end = self.commit_end,
+                        .header_addr = cur,
+                        .end_addr = block_end,
+                        .bucket_len = h.bucket_len,
+                        .is_free = h.is_free,
+                        .extra_a = @intCast(ft.header),
+                    });
+                }
+            }
+
+            if (prev_was_free and h.is_free)
+                return Helper.fail("adjacent free blocks (coalescing invariant violated)", .{
+                    .reserve_start = self.reserve_start,
+                    .commit_end = self.commit_end,
+                    .header_addr = cur,
+                    .bucket_len = h.bucket_len,
+                    .is_free = h.is_free,
+                });
+
+            const entry_addr: u48 = cur + HSIZE;
+            const info = BlockInfo{
+                .header_addr = cur,
+                .entry_addr = entry_addr,
+                .end_addr = block_end,
+                .bucket_len = h.bucket_len,
+                .is_free = h.is_free,
+                .found_in_tree = false,
+            };
+
+            const prev = blocks.fetchPut(@intCast(cur), info) catch {
+                return Helper.fail("out of memory inserting into block map", .{
+                    .reserve_start = self.reserve_start,
+                    .commit_end = self.commit_end,
+                    .header_addr = cur,
+                    .bucket_len = h.bucket_len,
+                    .is_free = h.is_free,
+                });
+            };
+            if (prev != null)
+                return Helper.fail("duplicate header encountered in map", .{
+                    .reserve_start = self.reserve_start,
+                    .commit_end = self.commit_end,
+                    .header_addr = cur,
+                    .bucket_len = h.bucket_len,
+                    .is_free = h.is_free,
+                });
+
+            prev_was_free = h.is_free;
+
+            const next = std.mem.alignForward(u48, block_end, header_align);
+            if (next <= cur)
+                return Helper.fail("non-progressing linear walk", .{
+                    .reserve_start = self.reserve_start,
+                    .commit_end = self.commit_end,
+                    .header_addr = cur,
+                    .end_addr = block_end,
+                    .bucket_len = h.bucket_len,
+                    .is_free = h.is_free,
+                    .extra_a = next,
+                });
+            cur = next;
+        }
+
+        if (cur != self.commit_end)
+            return Helper.fail("walk did not end exactly at commit_end", .{
+                .reserve_start = self.reserve_start,
+                .commit_end = self.commit_end,
+                .extra_a = cur,
+            });
+
+        // Pass 2: tree+freelist walk, backlink & metadata checks, mark map
+        var stack: [64]?*RedBlackTree.Node = undefined;
+        var sp: usize = 0;
+
+        if (self.free_tree.root) |root| {
+            stack[sp] = root;
+            sp += 1;
+
+            while (sp > 0) {
+                sp -= 1;
+                const node = stack[sp].?;
+                const entry_ptr: *TreeEntry = &node.data;
+
+                var freenode = entry_ptr.freelist.head;
+                while (freenode) |fnode| {
+                    if (fnode.base != &entry_ptr.freelist)
+                        return Helper.fail("freelist entry .base mismatch", .{
+                            .reserve_start = self.reserve_start,
+                            .commit_end = self.commit_end,
+                            .entry_addr = @intCast(@intFromPtr(fnode)),
+                            .extra_a = @intFromPtr(fnode.base),
+                            .extra_b = @intFromPtr(&entry_ptr.freelist),
+                        });
+
+                    const list_ptr: *Freelist = fnode.base;
+                    const parent_entry: *TreeEntry = @fieldParentPtr("freelist", list_ptr);
+                    if (parent_entry != entry_ptr)
+                        return Helper.fail("freelist back-pointer does not map to current TreeEntry", .{
+                            .reserve_start = self.reserve_start,
+                            .commit_end = self.commit_end,
+                            .entry_addr = @intCast(@intFromPtr(fnode)),
+                            .extra_a = @intFromPtr(parent_entry),
+                            .extra_b = @intFromPtr(entry_ptr),
+                        });
+
+                    const entry_addr_u48: u48 = @intCast(@intFromPtr(fnode));
+                    const header_addr: u48 = entry_addr_u48 - HSIZE;
+
+                    if (header_addr < self.reserve_start or header_addr + HSIZE > self.commit_end)
+                        return Helper.fail("freelist-derived header out of bounds", .{
+                            .reserve_start = self.reserve_start,
+                            .commit_end = self.commit_end,
+                            .header_addr = header_addr,
+                            .entry_addr = entry_addr_u48,
+                        });
+
+                    const hptr = Helper.hdr(header_addr);
+                    if (!hptr.is_free)
+                        return Helper.fail("freelist points to non-free header", .{
+                            .reserve_start = self.reserve_start,
+                            .commit_end = self.commit_end,
+                            .header_addr = header_addr,
+                            .entry_addr = entry_addr_u48,
+                            .bucket_len = hptr.bucket_len,
+                            .is_free = hptr.is_free,
+                        });
+
+                    if (hptr.bucket_len != entry_ptr.bucket_len)
+                        return Helper.fail("tree node bucket_len != header bucket_len", .{
+                            .reserve_start = self.reserve_start,
+                            .commit_end = self.commit_end,
+                            .header_addr = header_addr,
+                            .entry_addr = entry_addr_u48,
+                            .bucket_len = hptr.bucket_len,
+                            .extra_a = entry_ptr.bucket_len,
+                        });
+
+                    const bend: u48 = header_addr + HSIZE + hptr.bucket_len;
+                    if (bend > self.commit_end)
+                        return Helper.fail("block end (from freelist) > commit_end", .{
+                            .reserve_start = self.reserve_start,
+                            .commit_end = self.commit_end,
+                            .header_addr = header_addr,
+                            .end_addr = bend,
+                            .bucket_len = hptr.bucket_len,
+                            .is_free = hptr.is_free,
+                        });
+
+                    const ft = Helper.ftr(bend - FSIZE).*;
+                    if (ft.header != header_addr)
+                        return Helper.fail("footer backlink mismatch (from freelist)", .{
+                            .reserve_start = self.reserve_start,
+                            .commit_end = self.commit_end,
+                            .header_addr = header_addr,
+                            .end_addr = bend,
+                            .bucket_len = hptr.bucket_len,
+                            .extra_a = @intCast(ft.header),
+                        });
+
+                    if (blocks.getPtr(@intCast(header_addr))) |bi| {
+                        if (!bi.is_free)
+                            return Helper.fail("map says allocated but listed in freelist", .{
+                                .reserve_start = self.reserve_start,
+                                .commit_end = self.commit_end,
+                                .header_addr = header_addr,
+                                .entry_addr = entry_addr_u48,
+                                .bucket_len = bi.bucket_len,
+                                .is_free = bi.is_free,
+                            });
+                        if (bi.entry_addr != entry_addr_u48)
+                            return Helper.fail("map entry_addr != freelist entry addr", .{
+                                .reserve_start = self.reserve_start,
+                                .commit_end = self.commit_end,
+                                .header_addr = header_addr,
+                                .entry_addr = entry_addr_u48,
+                                .extra_a = @intCast(bi.entry_addr),
+                            });
+                        if (bi.bucket_len != hptr.bucket_len)
+                            return Helper.fail("map bucket_len != header bucket_len", .{
+                                .reserve_start = self.reserve_start,
+                                .commit_end = self.commit_end,
+                                .header_addr = header_addr,
+                                .bucket_len = hptr.bucket_len,
+                                .extra_a = bi.bucket_len,
+                            });
+                        if (bi.end_addr != bend)
+                            return Helper.fail("map end_addr != computed end_addr", .{
+                                .reserve_start = self.reserve_start,
+                                .commit_end = self.commit_end,
+                                .header_addr = header_addr,
+                                .end_addr = bend,
+                                .extra_a = @intCast(bi.end_addr),
+                            });
+                        bi.found_in_tree = true;
+                    } else {
+                        return Helper.fail("free block in tree not found in map", .{
+                            .reserve_start = self.reserve_start,
+                            .commit_end = self.commit_end,
+                            .header_addr = header_addr,
+                            .entry_addr = entry_addr_u48,
+                            .bucket_len = hptr.bucket_len,
+                            .is_free = hptr.is_free,
+                        });
+                    }
+
+                    freenode = fnode.next;
+                }
+
+                if (node.getChild(.left)) |l| {
+                    std.debug.assert(sp < stack.len);
+                    stack[sp] = l;
+                    sp += 1;
+                }
+                if (node.getChild(.right)) |r| {
+                    std.debug.assert(sp < stack.len);
+                    stack[sp] = r;
+                    sp += 1;
+                }
+            }
+        }
+
+        // Pass 3: post-checks for orphans
+        var it = blocks.iterator();
+        while (it.next()) |kv| {
+            const bi = kv.value_ptr.*;
+            if (bi.is_free and !bi.found_in_tree) {
+                std.debug.print(
+                    "\n[Heap Validate] Orphan free block\nheader={x} entry={x} end={x} len={d}\n",
+                    .{ bi.header_addr, bi.entry_addr, bi.end_addr, bi.bucket_len },
+                );
+                return false;
+            }
+        }
+
         return true;
     }
 };
@@ -432,18 +783,27 @@ test "tree contains after free, then removed after re-alloc (exact fit)" {
     var heap_allocator = HeapAllocator.init(reserve_start, reserve_end, &tree_allocator);
     defer heap_allocator.deinit();
 
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
+
     const alloc = heap_allocator.allocator();
 
     const N: usize = 128;
 
     var buf = try alloc.alloc(u8, N);
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
+
     alloc.free(buf);
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
 
     const key: TreeEntry = .{ .bucket_len = N, .freelist = undefined };
     try std.testing.expect(heap_allocator.free_tree.contains(key));
 
     buf = try alloc.alloc(u8, N);
-    defer alloc.free(buf);
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
+    defer {
+        alloc.free(buf);
+        _ = heap_allocator.validateState(std.testing.allocator);
+    }
 
     try std.testing.expect(!heap_allocator.free_tree.contains(key));
 }
@@ -463,18 +823,27 @@ test "no-split re-alloc consumes the exact-size free block (tail too small to sp
     var heap_allocator = HeapAllocator.init(reserve_start, reserve_end, &tree_allocator);
     defer heap_allocator.deinit();
 
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
+
     const alloc = heap_allocator.allocator();
 
     const L1: usize = 256;
     const big = try alloc.alloc(u8, L1);
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
+
     alloc.free(big);
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
 
     const key_L1: TreeEntry = .{ .bucket_len = L1, .freelist = undefined };
     try std.testing.expect(heap_allocator.free_tree.contains(key_L1));
 
     const S: usize = 208;
     const small_nosplit = try alloc.alloc(u8, S);
-    defer alloc.free(small_nosplit);
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
+    defer {
+        alloc.free(small_nosplit);
+        _ = heap_allocator.validateState(std.testing.allocator);
+    }
 
     try std.testing.expect(!heap_allocator.free_tree.contains(key_L1));
 }
@@ -494,18 +863,27 @@ test "split path: re-alloc creates a tail block, tree contains tail bucket_len" 
     var heap_allocator = HeapAllocator.init(reserve_start, reserve_end, &tree_allocator);
     defer heap_allocator.deinit();
 
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
+
     const alloc = heap_allocator.allocator();
 
     const L1: usize = 256;
     const big = try alloc.alloc(u8, L1);
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
+
     alloc.free(big);
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
 
     const key_L1: TreeEntry = .{ .bucket_len = L1, .freelist = undefined };
     try std.testing.expect(heap_allocator.free_tree.contains(key_L1));
 
     const S: usize = 64;
     const small_split = try alloc.alloc(u8, S);
-    defer alloc.free(small_split);
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
+    defer {
+        alloc.free(small_split);
+        _ = heap_allocator.validateState(std.testing.allocator);
+    }
 
     const tail_bucket_len: usize = 184;
 
@@ -530,6 +908,8 @@ test "triple coalesce: free A, free C, then free B -> one big block" {
     var heap_allocator = HeapAllocator.init(reserve_start, reserve_end, &tree_allocator);
     defer heap_allocator.deinit();
 
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
+
     const alloc = heap_allocator.allocator();
 
     const A: usize = 128;
@@ -537,12 +917,22 @@ test "triple coalesce: free A, free C, then free B -> one big block" {
     const C: usize = 96;
 
     const a = try alloc.alloc(u8, A);
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
+
     const b = try alloc.alloc(u8, B);
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
+
     const c = try alloc.alloc(u8, C);
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
 
     alloc.free(a);
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
+
     alloc.free(c);
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
+
     alloc.free(b);
+    try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
 
     const HSIZE = @sizeOf(AllocHeader);
     const coalesced_len: usize = A + B + C + (2 * HSIZE);

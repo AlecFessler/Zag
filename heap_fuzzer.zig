@@ -2,6 +2,8 @@ const std = @import("std");
 
 const heap_alloc = @import("kernel/memory/heap_allocator.zig");
 
+const SEED = 0;
+
 const MAX_ALLOC_LEN = 1024;
 const HEAP_SIZE = 2 * 1024 * 1024 * 1024;
 const ACTIVE_CAP = 16_384;
@@ -149,7 +151,7 @@ pub fn main() !void {
     var allocations = std.ArrayList(AllocHandle).init(backing_allocator);
     defer allocations.deinit();
 
-    var prng = std.Random.DefaultPrng.init(0);
+    var prng = std.Random.DefaultPrng.init(SEED);
     var rand = prng.random();
 
     for (0..1_000_000) |i| {
@@ -171,12 +173,6 @@ pub fn main() !void {
                     MAX_ALLOC_LEN,
                 );
 
-                std.debug.print("Action {} - Alloc: type {s}, len {}\n", .{
-                    i,
-                    alloc_type.toString(),
-                    alloc_len,
-                });
-
                 const ptr = try AllocType.allocate(
                     alloc_type,
                     alloc_len,
@@ -188,7 +184,14 @@ pub fn main() !void {
                     .len = alloc_len,
                 });
 
-                std.debug.assert(heap_allocator.validateState());
+                std.debug.print("Action {} - Alloc: type {s}, len {}, ptr: {x}\n", .{
+                    i,
+                    alloc_type.toString(),
+                    alloc_len,
+                    @intFromPtr(ptr),
+                });
+
+                std.debug.assert(heap_allocator.validateState(backing_allocator));
 
                 // update fragmentation stats (nyi)
             },
@@ -200,10 +203,11 @@ pub fn main() !void {
                 );
                 const target_handle = allocations.swapRemove(target_idx);
 
-                std.debug.print("Action {} - Free: type {s}, len {}\n", .{
+                std.debug.print("Action {} - Free: type {s}, len {}, {x}\n", .{
                     i,
                     target_handle.alloc_type.toString(),
                     target_handle.len,
+                    target_handle.addr,
                 });
 
                 AllocType.free(
@@ -213,7 +217,7 @@ pub fn main() !void {
                     heap_iface,
                 );
 
-                std.debug.assert(heap_allocator.validateState());
+                std.debug.assert(heap_allocator.validateState(backing_allocator));
 
                 // update fragmentation stats (nyi)
             },
