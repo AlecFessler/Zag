@@ -129,8 +129,10 @@ pub const HeapAllocator = struct {
         ret_addr: usize,
     ) ?[*]u8 {
         _ = ret_addr;
+
         const self: *HeapAllocator = @alignCast(@ptrCast(ptr));
         const header_align: u48 = @alignOf(AllocHeader);
+
         std.debug.assert(alignment.toByteUnits() <= MAX_ALIGN);
         std.debug.assert(std.mem.isAligned(self.commit_end, header_align));
 
@@ -145,18 +147,22 @@ pub const HeapAllocator = struct {
         var node_opt: ?*RedBlackTree.Node = self.free_tree.root;
 
         outer: while (node_opt) |entry| : (node_opt = entry.getChild(.right)) {
-            if (TreeEntry.cmpFn(entry.data, key) == .lt) continue;
+            const cmp = TreeEntry.cmpFn(entry.data, key);
+            if (cmp == .lt) continue;
 
             var fnode: ?*Freelist.FreeNode = entry.data.freelist.head;
+
             while (fnode) |n| : (fnode = n.next) {
                 const block_addr: u48 = @intCast(@intFromPtr(n));
                 const header_addr: u48 = block_addr - @sizeOf(AllocHeader);
                 const header: *AllocHeader = @ptrFromInt(header_addr);
+
                 std.debug.assert(header.is_free);
 
                 const block_size = header.bucket_len;
+
                 const aligned_user = std.mem.alignForward(u48, block_addr, user_align);
-                const front_pad = aligned_user - block_addr + 8; // TODO: Make the padding u64
+                const front_pad = aligned_user - block_addr + 8;
                 std.debug.assert(front_pad > 0);
 
                 const body = user_len;
@@ -167,7 +173,9 @@ pub const HeapAllocator = struct {
                 ) - (block_addr + front_pad + body);
                 const required = front_pad + body + tail_pad;
 
-                if (required > block_size) continue;
+                if (required > block_size) {
+                    continue;
+                }
 
                 _ = entry.data.freelist.popSpecific(@ptrFromInt(block_addr)).?;
                 if (entry.data.freelist.head == null) {
@@ -180,6 +188,7 @@ pub const HeapAllocator = struct {
                 const split_needed = @sizeOf(AllocHeader) + @sizeOf(AllocPadding) + MIN_LEN;
 
                 const can_split = split_size >= split_needed;
+
                 if (can_split) {
                     const split_header_addr = header_addr + @sizeOf(AllocHeader) + required_bucket_len;
                     const split_header: *AllocHeader = @ptrFromInt(split_header_addr);
@@ -211,7 +220,7 @@ pub const HeapAllocator = struct {
             const header_base = self.commit_end;
             const block_addr = header_base + @sizeOf(AllocHeader);
             const aligned_user = std.mem.alignForward(u48, block_addr, user_align);
-            const front_pad = aligned_user - block_addr + 8; // TODO: Make the padding u64
+            const front_pad = aligned_user - block_addr + 8;
             std.debug.assert(front_pad > 0);
 
             const body = user_len;
@@ -223,7 +232,9 @@ pub const HeapAllocator = struct {
             const required = front_pad + body + tail_pad;
 
             const end = header_base + @sizeOf(AllocHeader) + required;
-            if (end > self.reserve_end) return null;
+            if (end > self.reserve_end) {
+                return null;
+            }
 
             block_base = header_base;
             user_block_base = aligned_user;
@@ -248,7 +259,6 @@ pub const HeapAllocator = struct {
         return user_ptr;
     }
 
-    // no op
     fn resize(
         ptr: *anyopaque,
         memory: []u8,
@@ -264,7 +274,6 @@ pub const HeapAllocator = struct {
         unreachable;
     }
 
-    // no op
     fn remap(
         ptr: *anyopaque,
         memory: []u8,
@@ -288,6 +297,7 @@ pub const HeapAllocator = struct {
     ) void {
         _ = alignment;
         _ = ret_addr;
+
         const self: *HeapAllocator = @alignCast(@ptrCast(ptr));
 
         const user_addr: u48 = @intCast(@intFromPtr(buf.ptr));
@@ -333,6 +343,11 @@ pub const HeapAllocator = struct {
                 _ = self.free_tree.removeFromPtr(prev_node_ptr);
             }
 
+            header_ptr.is_free = false;
+            const absorbed_footer_addr: u48 = block_end_addr - @sizeOf(AllocFooter);
+            const absorbed_footer_ptr: *AllocFooter = @ptrFromInt(absorbed_footer_addr);
+            absorbed_footer_ptr.header = 0;
+
             header_ptr = prev_header;
             header_ptr.bucket_len = block_end_addr - (prev_header_addr + @sizeOf(AllocHeader));
         }
@@ -361,6 +376,11 @@ pub const HeapAllocator = struct {
                 const next_node_ptr: *RedBlackTree.Node = @fieldParentPtr("data", next_entry_ptr);
                 _ = self.free_tree.removeFromPtr(next_node_ptr);
             }
+
+            next_header.is_free = false;
+            const absorbed_next_footer_addr: u48 = next_end - @sizeOf(AllocFooter);
+            const absorbed_next_footer_ptr: *AllocFooter = @ptrFromInt(absorbed_next_footer_addr);
+            absorbed_next_footer_ptr.header = 0;
 
             const base_addr: u48 = @intCast(@intFromPtr(header_ptr));
             header_ptr.bucket_len = next_end - (base_addr + @sizeOf(AllocHeader));
@@ -392,7 +412,9 @@ pub const HeapAllocator = struct {
 
         while (current) |c| {
             parent = c;
-            switch (TreeEntry.cmpFn(key, c.data)) {
+            const cmp = TreeEntry.cmpFn(key, c.data);
+
+            switch (cmp) {
                 .lt => {
                     direction = .left;
                     current = c.getChild(.left);
@@ -413,6 +435,7 @@ pub const HeapAllocator = struct {
             direction,
             .{ .bucket_len = bucket_len, .freelist = .{} },
         ) catch unreachable;
+
         new_node.data.freelist.push(freelist_entry);
     }
 

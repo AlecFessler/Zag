@@ -184,15 +184,16 @@ pub fn main() !void {
                     .len = alloc_len,
                 });
 
-                std.debug.print("Action {} - Alloc: type {s}, len {}, ptr: {x}, tree count {}\n", .{
+                const state = heap_allocator.validateState(backing_allocator);
+                std.debug.print("Action {} - Alloc: type {s}, len {}, ptr: {x}, tree count {}, state {}\n", .{
                     i,
                     alloc_type.toString(),
                     alloc_len,
                     @intFromPtr(ptr),
                     heap_allocator.free_tree.count,
+                    state,
                 });
-
-                std.debug.assert(heap_allocator.validateState(backing_allocator));
+                std.debug.assert(state);
             },
             .free => {
                 const target_idx = rand.intRangeAtMost(
@@ -202,14 +203,6 @@ pub fn main() !void {
                 );
                 const target_handle = allocations.swapRemove(target_idx);
 
-                std.debug.print("Action {} - Free: type {s}, len {}, addr {x}, tree count {}\n", .{
-                    i,
-                    target_handle.alloc_type.toString(),
-                    target_handle.len,
-                    target_handle.addr,
-                    heap_allocator.free_tree.count,
-                });
-
                 AllocType.free(
                     target_handle.alloc_type,
                     target_handle.addr,
@@ -217,7 +210,16 @@ pub fn main() !void {
                     heap_iface,
                 );
 
-                std.debug.assert(heap_allocator.validateState(backing_allocator));
+                const state = heap_allocator.validateState(backing_allocator);
+                std.debug.print("Action {} - Free: type {s}, len {}, addr {x}, tree count {}, state {}\n", .{
+                    i,
+                    target_handle.alloc_type.toString(),
+                    target_handle.len,
+                    target_handle.addr,
+                    heap_allocator.free_tree.count,
+                    state,
+                });
+                std.debug.assert(state);
             },
         }
     }

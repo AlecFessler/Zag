@@ -39,7 +39,9 @@ pub fn IntrusiveFreeList(
 
             if (DBG) node.dbg_magic = DBG_MAGIC;
             if (using_popSpecific) {
-                if (self.head) |head| head.prev = node;
+                if (self.head) |head| {
+                    head.prev = node;
+                }
                 node.prev = null;
             }
             if (link_to_base) {
@@ -51,29 +53,32 @@ pub fn IntrusiveFreeList(
         }
 
         pub fn pop(self: *Self) ?T {
-            const addr = self.head orelse return null;
+            const addr = self.head orelse {
+                return null;
+            };
 
             if (DBG) std.debug.assert(addr.dbg_magic == DBG_MAGIC);
 
             self.head = addr.next;
 
             if (using_popSpecific) {
-                if (self.head) |h| h.prev = null;
+                if (self.head) |h| {
+                    h.prev = null;
+                }
             }
 
             zeroItem(@ptrCast(addr));
             return @alignCast(@ptrCast(addr));
         }
 
-        /// This function primarily exists for use by the buddy allocator
-        /// when it computes the address of a buddy it knows is available.
-        /// This enables O(1) popping of arbitrary elements from the freelist.
-        /// Trying to pop a node that isn't in the list will blow up in debug
-        /// builds, but is undefined behavior in release builds.
         pub fn popSpecific(self: *Self, addr: T) ?T {
             if (!using_popSpecific) @compileError("must set using_popSpecific flag on the IntrusiveFreelist type to call popSpecific()");
 
             const node: *FreeNode = @alignCast(@ptrCast(addr));
+            if (link_to_base) {
+                _ = node.base;
+            }
+
             if (DBG) std.debug.assert(node.dbg_magic == DBG_MAGIC);
 
             const at_middle = node.prev != null and node.next != null;
