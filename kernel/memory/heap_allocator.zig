@@ -144,75 +144,110 @@ pub const HeapAllocator = struct {
         var block_end: u48 = 0;
 
         const key = TreeEntry{ .bucket_len = user_len, .freelist = undefined };
-        var node_opt: ?*RedBlackTree.Node = self.free_tree.root;
 
-        outer: while (node_opt) |entry| : (node_opt = entry.getChild(.right)) {
-            const cmp = TreeEntry.cmpFn(entry.data, key);
-            if (cmp == .lt) continue;
+        outer: {
+            var node_opt: ?*RedBlackTree.Node = self.free_tree.root;
+            var candidate: ?*RedBlackTree.Node = null;
 
-            var fnode: ?*Freelist.FreeNode = entry.data.freelist.head;
-
-            while (fnode) |n| : (fnode = n.next) {
-                const block_addr: u48 = @intCast(@intFromPtr(n));
-                const header_addr: u48 = block_addr - @sizeOf(AllocHeader);
-                const header: *AllocHeader = @ptrFromInt(header_addr);
-
-                std.debug.assert(header.is_free);
-
-                const block_size = header.bucket_len;
-
-                const aligned_user = std.mem.alignForward(u48, block_addr, user_align);
-                const front_pad = aligned_user - block_addr + 8;
-                std.debug.assert(front_pad > 0);
-
-                const body = user_len;
-                const tail_pad = std.mem.alignForward(
-                    u48,
-                    block_addr + front_pad + body,
-                    header_align,
-                ) - (block_addr + front_pad + body);
-                const required = front_pad + body + tail_pad;
-
-                if (required > block_size) {
-                    continue;
-                }
-
-                _ = entry.data.freelist.popSpecific(@ptrFromInt(block_addr)).?;
-                if (entry.data.freelist.head == null) {
-                    _ = self.free_tree.removeFromPtr(entry);
-                }
-
-                const required_bucket_len = required;
-                const split_size = block_size - required_bucket_len;
-                const block_end_addr = header_addr + @sizeOf(AllocHeader) + block_size;
-                const split_needed = @sizeOf(AllocHeader) + @sizeOf(AllocPadding) + MIN_LEN;
-
-                const can_split = split_size >= split_needed;
-
-                if (can_split) {
-                    const split_header_addr = header_addr + @sizeOf(AllocHeader) + required_bucket_len;
-                    const split_header: *AllocHeader = @ptrFromInt(split_header_addr);
-                    split_header.is_free = true;
-                    split_header.bucket_len = split_size - @sizeOf(AllocHeader);
-
-                    const split_prefix_end = split_header_addr + @sizeOf(AllocHeader);
-                    const split_block_end = split_prefix_end + split_header.bucket_len;
-                    const split_footer_addr = split_block_end - @sizeOf(AllocFooter);
-                    const split_footer: *AllocFooter = @ptrFromInt(split_footer_addr);
-                    split_footer.header = split_header_addr;
-
-                    const split_entry_addr = split_header_addr + @sizeOf(AllocHeader);
-                    const split_entry: *FreelistEntry = @ptrFromInt(split_entry_addr);
-                    self.treeInsert(split_header.bucket_len, split_entry);
-
-                    block_end = split_header_addr;
+            while (node_opt) |entry| {
+                const cmp = TreeEntry.cmpFn(entry.data, key);
+                if (cmp == .lt) {
+                    node_opt = entry.getChild(.right);
                 } else {
-                    block_end = block_end_addr;
+                    candidate = entry;
+                    node_opt = entry.getChild(.left);
+                }
+            }
+
+            var cur = candidate;
+
+            while (cur) |entry| {
+                var fnode: ?*Freelist.FreeNode = entry.data.freelist.head;
+
+                while (fnode) |n| : (fnode = n.next) {
+                    const block_addr: u48 = @intCast(@intFromPtr(n));
+                    const header_addr: u48 = block_addr - @sizeOf(AllocHeader);
+                    const header: *AllocHeader = @ptrFromInt(header_addr);
+
+                    std.debug.assert(header.is_free);
+
+                    const block_size = header.bucket_len;
+
+                    const aligned_user = std.mem.alignForward(u48, block_addr, user_align);
+                    const front_pad = aligned_user - block_addr + 8;
+                    std.debug.assert(front_pad > 0);
+
+                    const body = user_len;
+                    const tail_pad = std.mem.alignForward(
+                        u48,
+                        block_addr + front_pad + body,
+                        header_align,
+                    ) - (block_addr + front_pad + body);
+                    const required = front_pad + body + tail_pad;
+
+                    if (required > block_size) {
+                        continue;
+                    }
+
+                    _ = entry.data.freelist.popSpecific(@ptrFromInt(block_addr)).?;
+                    if (entry.data.freelist.head == null) {
+                        _ = self.free_tree.removeFromPtr(entry);
+                    }
+
+                    const required_bucket_len = required;
+                    const split_size = block_size - required_bucket_len;
+                    const block_end_addr = header_addr + @sizeOf(AllocHeader) + block_size;
+                    const split_needed = @sizeOf(AllocHeader) + @sizeOf(AllocPadding) + MIN_LEN;
+
+                    const can_split = split_size >= split_needed;
+
+                    if (can_split) {
+                        const split_header_addr = header_addr + @sizeOf(AllocHeader) + required_bucket_len;
+                        const split_header: *AllocHeader = @ptrFromInt(split_header_addr);
+                        split_header.is_free = true;
+                        split_header.bucket_len = split_size - @sizeOf(AllocHeader);
+
+                        const split_prefix_end = split_header_addr + @sizeOf(AllocHeader);
+                        const split_block_end = split_prefix_end + split_header.bucket_len;
+                        const split_footer_addr = split_block_end - @sizeOf(AllocFooter);
+                        const split_footer: *AllocFooter = @ptrFromInt(split_footer_addr);
+                        split_footer.header = split_header_addr;
+
+                        const split_entry_addr = split_header_addr + @sizeOf(AllocHeader);
+                        const split_entry: *FreelistEntry = @ptrFromInt(split_entry_addr);
+                        self.treeInsert(split_header.bucket_len, split_entry);
+
+                        block_end = split_header_addr;
+                    } else {
+                        block_end = block_end_addr;
+                    }
+
+                    block_base = header_addr;
+                    user_block_base = aligned_user;
+                    break :outer;
                 }
 
-                block_base = header_addr;
-                user_block_base = aligned_user;
-                break :outer;
+                if (entry.getChild(.right)) |r| {
+                    var x = r;
+                    while (x.getChild(.left)) |l| : (x = l) {}
+                    cur = x;
+                } else {
+                    var x = entry;
+                    var p = x.parent;
+                    var advanced = false;
+                    while (p) |pn| {
+                        if (x == pn.getChild(.left)) {
+                            cur = pn;
+                            advanced = true;
+                            break;
+                        }
+                        x = pn;
+                        p = pn.parent;
+                    }
+                    if (!advanced) {
+                        cur = null;
+                    }
+                }
             }
         }
 

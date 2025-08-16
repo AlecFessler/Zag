@@ -174,13 +174,28 @@ fn pinToCore(core: usize) !void {
 fn probeTreeDepth(heap: *heap_alloc.HeapAllocator, user_len: usize, user_align: usize) i32 {
     const header_align: u48 = @alignOf(heap_alloc.AllocHeader);
     const key = heap_alloc.TreeEntry{ .bucket_len = @intCast(user_len), .freelist = undefined };
-    var node_opt: ?*heap_alloc.RedBlackTree.Node = heap.free_tree.root;
+
     var depth: i32 = 0;
+    var node_opt: ?*heap_alloc.RedBlackTree.Node = heap.free_tree.root;
+    var candidate: ?*heap_alloc.RedBlackTree.Node = null;
+    var candidate_depth: i32 = -1;
 
-    while (node_opt) |entry| : (node_opt = entry.getChild(.right)) {
+    while (node_opt) |n| {
         depth += 1;
-        if (heap_alloc.TreeEntry.cmpFn(entry.data, key) == .lt) continue;
+        const ord = heap_alloc.TreeEntry.cmpFn(n.data, key);
+        if (ord == .lt) {
+            node_opt = n.getChild(.right);
+        } else {
+            candidate = n;
+            candidate_depth = depth;
+            node_opt = n.getChild(.left);
+        }
+    }
 
+    var cur = candidate;
+    var cur_depth = candidate_depth;
+
+    while (cur) |entry| {
         var fnode = entry.data.freelist.head;
         while (fnode) |n| : (fnode = n.next) {
             const block_addr: u48 = @intCast(@intFromPtr(n));
@@ -190,7 +205,7 @@ fn probeTreeDepth(heap: *heap_alloc.HeapAllocator, user_len: usize, user_align: 
 
             const block_size = header.bucket_len;
             const aligned_user = std.mem.alignForward(u48, block_addr, @intCast(user_align));
-            const front_pad = aligned_user - block_addr;
+            const front_pad = aligned_user - block_addr + 8;
             const body: u48 = @intCast(user_len);
             const tail_pad = std.mem.alignForward(
                 u48,
@@ -199,9 +214,40 @@ fn probeTreeDepth(heap: *heap_alloc.HeapAllocator, user_len: usize, user_align: 
             ) - (block_addr + front_pad + body);
             const required = front_pad + body + tail_pad;
 
-            if (required <= block_size) return depth;
+            if (required <= block_size) return cur_depth;
+        }
+
+        if (entry.getChild(.right)) |r| {
+            var x = r;
+            var d = cur_depth + 1;
+            while (x.getChild(.left)) |l| : (x = l) {
+                d += 1;
+            }
+            cur = x;
+            cur_depth = d;
+        } else {
+            var x = entry;
+            var d = cur_depth;
+            var p = x.parent;
+            var advanced = false;
+            while (p) |pn| {
+                if (x == pn.getChild(.left)) {
+                    cur = pn;
+                    cur_depth = d - 1;
+                    advanced = true;
+                    break;
+                }
+                x = pn;
+                d -= 1;
+                p = pn.parent;
+            }
+            if (!advanced) {
+                cur = null;
+                cur_depth = -1;
+            }
         }
     }
+
     return -1;
 }
 
@@ -228,7 +274,12 @@ pub fn main() !void {
     var prng = std.Random.DefaultPrng.init(SEED);
     var rand = prng.random();
 
-    std.debug.print("i,op,type,size,tree_count,from_tree,depth,cycles\n", .{});
+    var file = try std.fs.cwd().createFile("heap_latency.csv", .{ .truncate = true });
+    defer file.close();
+    var bw = std.io.bufferedWriter(file.writer());
+    const w = bw.writer();
+
+    try w.print("i,op,type,size,tree_count,from_tree,depth,cycles\n", .{});
 
     for (0..1_000_000) |i| {
         const action: Action = blk: {
@@ -256,18 +307,20 @@ pub fn main() !void {
                 const ptr = try AllocType.allocate(at, len, heap_iface);
                 const t1 = rdtsc();
 
+                const cycles = t1 - t0;
+
                 try allocations.append(
                     .{ .alloc_type = at, .addr = @intFromPtr(ptr), .len = len },
                 );
 
-                std.debug.print("{},alloc,{s},{},{},{},{},{}\n", .{
+                try w.print("{},alloc,{s},{},{},{},{},{}\n", .{
                     i,
                     at.toString(),
                     len,
                     heap_allocator.free_tree.count,
                     from_tree,
                     depth,
-                    t1 - t0,
+                    cycles,
                 });
             },
             .free => {
@@ -282,16 +335,20 @@ pub fn main() !void {
                 AllocType.free(h.alloc_type, h.addr, h.len, heap_iface);
                 const t1 = rdtsc();
 
-                std.debug.print("{},free,{s},{},{},{},{},{}\n", .{
+                const cycles = t1 - t0;
+
+                try w.print("{},free,{s},{},{},{},{},{}\n", .{
                     i,
                     h.alloc_type.toString(),
                     h.len,
                     heap_allocator.free_tree.count,
-                    0,
+                    false,
                     -1,
-                    t1 - t0,
+                    cycles,
                 });
             },
         }
     }
+
+    try bw.flush();
 }
