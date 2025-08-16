@@ -175,77 +175,62 @@ fn probeTreeDepth(heap: *heap_alloc.HeapAllocator, user_len: usize, user_align: 
     const header_align: u48 = @alignOf(heap_alloc.AllocHeader);
     const key = heap_alloc.TreeEntry{ .bucket_len = @intCast(user_len), .freelist = undefined };
 
-    var depth: i32 = 0;
     var node_opt: ?*heap_alloc.RedBlackTree.Node = heap.free_tree.root;
     var candidate: ?*heap_alloc.RedBlackTree.Node = null;
-    var candidate_depth: i32 = -1;
 
     while (node_opt) |n| {
-        depth += 1;
         const ord = heap_alloc.TreeEntry.cmpFn(n.data, key);
         if (ord == .lt) {
             node_opt = n.getChild(.right);
         } else {
             candidate = n;
-            candidate_depth = depth;
             node_opt = n.getChild(.left);
         }
     }
 
     var cur = candidate;
-    var cur_depth = candidate_depth;
+    var depth: i32 = 0;
 
-    while (cur) |entry| {
-        var fnode = entry.data.freelist.head;
-        while (fnode) |n| : (fnode = n.next) {
-            const block_addr: u48 = @intCast(@intFromPtr(n));
+    while (cur) |tree_entry| {
+        depth += 1;
+
+        var maybe_list_entry: ?*heap_alloc.Freelist.FreeNode = tree_entry.data.freelist.head;
+        while (maybe_list_entry) |list_entry| : (maybe_list_entry = list_entry.next) {
+            const block_addr: u48 = @intCast(@intFromPtr(list_entry));
             const header_addr: u48 = block_addr - @sizeOf(heap_alloc.AllocHeader);
             const header: *heap_alloc.AllocHeader = @ptrFromInt(header_addr);
             if (!header.is_free) continue;
 
-            const block_size = header.bucket_len;
             const aligned_user = std.mem.alignForward(u48, block_addr, @intCast(user_align));
-            const front_pad = aligned_user - block_addr + 8;
-            const body: u48 = @intCast(user_len);
-            const tail_pad = std.mem.alignForward(
-                u48,
-                block_addr + front_pad + body,
-                header_align,
-            ) - (block_addr + front_pad + body);
-            const required = front_pad + body + tail_pad;
+            const prefix_len = aligned_user - block_addr + 8;
 
-            if (required <= block_size) return cur_depth;
+            const postfix_len = std.mem.alignForward(
+                u48,
+                block_addr + prefix_len + @as(u48, @intCast(user_len)),
+                header_align,
+            ) - (block_addr + prefix_len + @as(u48, @intCast(user_len)));
+
+            const required_len = prefix_len + @as(u48, @intCast(user_len)) + postfix_len;
+            if (required_len <= header.bucket_len) return depth;
         }
 
-        if (entry.getChild(.right)) |r| {
-            var x = r;
-            var d = cur_depth + 1;
-            while (x.getChild(.left)) |l| : (x = l) {
-                d += 1;
-            }
-            cur = x;
-            cur_depth = d;
+        var succ: ?*heap_alloc.RedBlackTree.Node = null;
+        if (tree_entry.getChild(.right)) |r| {
+            var t = r;
+            while (t.getChild(.left)) |l| t = l;
+            succ = t;
         } else {
-            var x = entry;
-            var d = cur_depth;
-            var p = x.parent;
-            var advanced = false;
-            while (p) |pn| {
-                if (x == pn.getChild(.left)) {
-                    cur = pn;
-                    cur_depth = d - 1;
-                    advanced = true;
+            var p = tree_entry.parent;
+            var ch: *heap_alloc.RedBlackTree.Node = tree_entry;
+            while (p) |pp| : (p = pp.parent) {
+                if (pp.getChild(.left) == ch) {
+                    succ = pp;
                     break;
                 }
-                x = pn;
-                d -= 1;
-                p = pn.parent;
-            }
-            if (!advanced) {
-                cur = null;
-                cur_depth = -1;
+                ch = pp;
             }
         }
+        cur = succ;
     }
 
     return -1;
