@@ -15,6 +15,7 @@ pub fn RedBlackTree(
 
         allocator: std.mem.Allocator,
         root: ?*Node,
+        count: usize,
 
         const Color = enum {
             Red,
@@ -106,6 +107,7 @@ pub fn RedBlackTree(
             return .{
                 .allocator = allocator,
                 .root = null,
+                .count = 0,
             };
         }
 
@@ -198,6 +200,7 @@ pub fn RedBlackTree(
                 node.color = Color.Black;
                 self.root = node;
             }
+            self.count += 1;
             return node;
         }
 
@@ -261,6 +264,7 @@ pub fn RedBlackTree(
         }
 
         pub fn removeFromPtr(self: *Self, target_node: *Node) T {
+            self.count -= 1;
             var parent_of_target: ?*Node = target_node.parent;
             const removed_value = target_node.data;
 

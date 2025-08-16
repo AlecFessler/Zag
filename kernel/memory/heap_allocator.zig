@@ -7,7 +7,7 @@ const slab_alloc = @import("slab_allocator.zig");
 const GRANULARITY = 8;
 const MAX_ALIGN = ((@as(usize, 1) << @bitSizeOf(u8)) - 1) * GRANULARITY;
 
-const AllocHeader = packed struct(u49) {
+pub const AllocHeader = packed struct(u49) {
     is_free: bool,
     bucket_len: u48,
     // 15 unused bits
@@ -55,17 +55,17 @@ const Freelist = intrusive_freelist.IntrusiveFreeList(
 
 /// The tree is keyed by length, and duplicate length entries are
 /// pushed into the freelist.
-const TreeEntry = struct {
+pub const TreeEntry = struct {
     bucket_len: usize,
     freelist: Freelist,
 
-    fn cmpFn(first: TreeEntry, second: TreeEntry) std.math.Order {
+    pub fn cmpFn(first: TreeEntry, second: TreeEntry) std.math.Order {
         return std.math.order(first.bucket_len, second.bucket_len);
     }
 };
 
 const duplicate_is_error = false;
-const RedBlackTree = rbt.RedBlackTree(
+pub const RedBlackTree = rbt.RedBlackTree(
     TreeEntry,
     TreeEntry.cmpFn,
     duplicate_is_error,
@@ -156,7 +156,9 @@ pub const HeapAllocator = struct {
 
                 const block_size = header.bucket_len;
                 const aligned_user = std.mem.alignForward(u48, block_addr, user_align);
-                const front_pad = aligned_user - block_addr;
+                const front_pad = aligned_user - block_addr + 8; // TODO: Make the padding u64
+                std.debug.assert(front_pad > 0);
+
                 const body = user_len;
                 const tail_pad = std.mem.alignForward(
                     u48,
@@ -209,7 +211,9 @@ pub const HeapAllocator = struct {
             const header_base = self.commit_end;
             const block_addr = header_base + @sizeOf(AllocHeader);
             const aligned_user = std.mem.alignForward(u48, block_addr, user_align);
-            const front_pad = aligned_user - block_addr;
+            const front_pad = aligned_user - block_addr + 8; // TODO: Make the padding u64
+            std.debug.assert(front_pad > 0);
+
             const body = user_len;
             const tail_pad = std.mem.alignForward(
                 u48,
@@ -795,8 +799,8 @@ test "tree contains after free, then removed after re-alloc (exact fit)" {
     alloc.free(buf);
     try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
 
-    const key: TreeEntry = .{ .bucket_len = N, .freelist = undefined };
-    try std.testing.expect(heap_allocator.free_tree.contains(key));
+    const key_free: TreeEntry = .{ .bucket_len = N + 8, .freelist = undefined };
+    try std.testing.expect(heap_allocator.free_tree.contains(key_free));
 
     buf = try alloc.alloc(u8, N);
     try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
@@ -805,7 +809,7 @@ test "tree contains after free, then removed after re-alloc (exact fit)" {
         _ = heap_allocator.validateState(std.testing.allocator);
     }
 
-    try std.testing.expect(!heap_allocator.free_tree.contains(key));
+    try std.testing.expect(!heap_allocator.free_tree.contains(key_free));
 }
 
 test "no-split re-alloc consumes the exact-size free block (tail too small to split)" {
@@ -834,8 +838,8 @@ test "no-split re-alloc consumes the exact-size free block (tail too small to sp
     alloc.free(big);
     try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
 
-    const key_L1: TreeEntry = .{ .bucket_len = L1, .freelist = undefined };
-    try std.testing.expect(heap_allocator.free_tree.contains(key_L1));
+    const key_free: TreeEntry = .{ .bucket_len = L1 + 8, .freelist = undefined };
+    try std.testing.expect(heap_allocator.free_tree.contains(key_free));
 
     const S: usize = 208;
     const small_nosplit = try alloc.alloc(u8, S);
@@ -845,7 +849,7 @@ test "no-split re-alloc consumes the exact-size free block (tail too small to sp
         _ = heap_allocator.validateState(std.testing.allocator);
     }
 
-    try std.testing.expect(!heap_allocator.free_tree.contains(key_L1));
+    try std.testing.expect(!heap_allocator.free_tree.contains(key_free));
 }
 
 test "split path: re-alloc creates a tail block, tree contains tail bucket_len" {
@@ -874,8 +878,8 @@ test "split path: re-alloc creates a tail block, tree contains tail bucket_len" 
     alloc.free(big);
     try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
 
-    const key_L1: TreeEntry = .{ .bucket_len = L1, .freelist = undefined };
-    try std.testing.expect(heap_allocator.free_tree.contains(key_L1));
+    const key_free: TreeEntry = .{ .bucket_len = L1 + 8, .freelist = undefined };
+    try std.testing.expect(heap_allocator.free_tree.contains(key_free));
 
     const S: usize = 64;
     const small_split = try alloc.alloc(u8, S);
@@ -889,8 +893,7 @@ test "split path: re-alloc creates a tail block, tree contains tail bucket_len" 
 
     const key_tail: TreeEntry = .{ .bucket_len = tail_bucket_len, .freelist = undefined };
     try std.testing.expect(heap_allocator.free_tree.contains(key_tail));
-
-    try std.testing.expect(!heap_allocator.free_tree.contains(key_L1));
+    try std.testing.expect(!heap_allocator.free_tree.contains(key_free));
 }
 
 test "triple coalesce: free A, free C, then free B -> one big block" {
@@ -935,14 +938,14 @@ test "triple coalesce: free A, free C, then free B -> one big block" {
     try std.testing.expect(heap_allocator.validateState(std.testing.allocator));
 
     const HSIZE = @sizeOf(AllocHeader);
-    const coalesced_len: usize = A + B + C + (2 * HSIZE);
+    const coalesced_len: usize = A + B + C + (5 * HSIZE);
 
     const key_coalesced: TreeEntry = .{ .bucket_len = coalesced_len, .freelist = undefined };
     try std.testing.expect(heap_allocator.free_tree.contains(key_coalesced));
 
-    const key_A: TreeEntry = .{ .bucket_len = A, .freelist = undefined };
-    const key_B: TreeEntry = .{ .bucket_len = B, .freelist = undefined };
-    const key_C: TreeEntry = .{ .bucket_len = C, .freelist = undefined };
+    const key_A: TreeEntry = .{ .bucket_len = A + 8, .freelist = undefined };
+    const key_B: TreeEntry = .{ .bucket_len = B + 8, .freelist = undefined };
+    const key_C: TreeEntry = .{ .bucket_len = C + 8, .freelist = undefined };
     try std.testing.expect(!heap_allocator.free_tree.contains(key_A));
     try std.testing.expect(!heap_allocator.free_tree.contains(key_B));
     try std.testing.expect(!heap_allocator.free_tree.contains(key_C));

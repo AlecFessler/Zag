@@ -184,16 +184,15 @@ pub fn main() !void {
                     .len = alloc_len,
                 });
 
-                std.debug.print("Action {} - Alloc: type {s}, len {}, ptr: {x}\n", .{
+                std.debug.print("Action {} - Alloc: type {s}, len {}, ptr: {x}, tree count {}\n", .{
                     i,
                     alloc_type.toString(),
                     alloc_len,
                     @intFromPtr(ptr),
+                    heap_allocator.free_tree.count,
                 });
 
                 std.debug.assert(heap_allocator.validateState(backing_allocator));
-
-                // update fragmentation stats (nyi)
             },
             .free => {
                 const target_idx = rand.intRangeAtMost(
@@ -203,11 +202,12 @@ pub fn main() !void {
                 );
                 const target_handle = allocations.swapRemove(target_idx);
 
-                std.debug.print("Action {} - Free: type {s}, len {}, {x}\n", .{
+                std.debug.print("Action {} - Free: type {s}, len {}, addr {x}, tree count {}\n", .{
                     i,
                     target_handle.alloc_type.toString(),
                     target_handle.len,
                     target_handle.addr,
+                    heap_allocator.free_tree.count,
                 });
 
                 AllocType.free(
@@ -218,8 +218,6 @@ pub fn main() !void {
                 );
 
                 std.debug.assert(heap_allocator.validateState(backing_allocator));
-
-                // update fragmentation stats (nyi)
             },
         }
     }
