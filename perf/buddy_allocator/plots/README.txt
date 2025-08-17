@@ -1,0 +1,22 @@
+Generated buddy latency plots and summaries:
+ - README.txt
+ - alloc_corr.csv
+ - alloc_corr_heatmap.png
+ - alloc_cycles_by_splits_box.png
+ - alloc_cycles_cdf_logx.png
+ - alloc_cycles_cdf_zoom_logx.png
+ - alloc_cycles_hist.png
+ - alloc_cycles_hist_zoom.png
+ - alloc_cycles_over_time.png
+ - alloc_cycles_vs_size_logx.png
+ - alloc_cycles_vs_splits.png
+ - alloc_median_cycles_by_splits.png
+ - alloc_median_cycles_by_type.png
+ - free_cycles_cdf_logx.png
+ - free_cycles_cdf_zoom_logx.png
+ - free_cycles_hist.png
+ - free_cycles_hist_zoom.png
+ - free_cycles_over_time.png
+ - free_cycles_vs_size_logx.png
+ - free_median_cycles_by_type.png
+ - latency_summary.csv
