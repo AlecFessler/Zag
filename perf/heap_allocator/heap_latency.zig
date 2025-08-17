@@ -175,7 +175,7 @@ fn pinToCore(core: usize) !void {
 
 fn probeTreeDepth(heap: *heap_alloc.HeapAllocator, user_len: usize, user_align: usize) i32 {
     const header_align: u48 = @alignOf(heap_alloc.AllocHeader);
-    const key = heap_alloc.TreeEntry{ .bucket_len = @intCast(user_len), .freelist = undefined };
+    const key = heap_alloc.TreeEntry{ .bucket_size = @intCast(user_len), .freelist = undefined };
 
     var node_opt: ?*heap_alloc.RedBlackTree.Node = heap.free_tree.root;
     var candidate: ?*heap_alloc.RedBlackTree.Node = null;
@@ -213,7 +213,7 @@ fn probeTreeDepth(heap: *heap_alloc.HeapAllocator, user_len: usize, user_align: 
             ) - (block_addr + prefix_len + @as(u48, @intCast(user_len)));
 
             const required_len = prefix_len + @as(u48, @intCast(user_len)) + postfix_len;
-            if (required_len <= header.bucket_len) return depth;
+            if (required_len <= header.bucket_size) return depth;
         }
 
         var succ: ?*heap_alloc.RedBlackTree.Node = null;

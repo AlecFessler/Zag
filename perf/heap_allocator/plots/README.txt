@@ -10,9 +10,7 @@ Generated plots and summaries:
  - alloc_cycles_over_time.png
  - alloc_cycles_vs_size_logx.png
  - alloc_cycles_vs_tree_count.png
- - alloc_from_tree_cycles_vs_depth.png
  - alloc_from_tree_hist.png
- - alloc_from_tree_median_cycles_by_depth.png
  - alloc_median_cycles_by_type.png
  - alloc_not_from_tree_hist.png
  - free_cycles_cdf_logx.png
