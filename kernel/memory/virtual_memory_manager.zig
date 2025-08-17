@@ -36,6 +36,7 @@ pub const VirtualMemoryManager = struct {
         );
     }
 
+    // no op
     fn resize(
         ptr: *anyopaque,
         memory: []u8,
@@ -43,15 +44,15 @@ pub const VirtualMemoryManager = struct {
         new_len: usize,
         ret_addr: usize,
     ) bool {
-        const self: *VirtualMemoryManager = @alignCast(@ptrCast(ptr));
-        return self.backing_allocator.rawResize(
-            memory,
-            alignment,
-            new_len,
-            ret_addr,
-        );
+        _ = ptr;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        unreachable;
     }
 
+    // no op
     fn remap(
         ptr: *anyopaque,
         memory: []u8,
@@ -59,13 +60,12 @@ pub const VirtualMemoryManager = struct {
         new_len: usize,
         ret_addr: usize,
     ) ?[*]u8 {
-        const self: *VirtualMemoryManager = @alignCast(@ptrCast(ptr));
-        return self.backing_allocator.rawRemap(
-            memory,
-            alignment,
-            new_len,
-            ret_addr,
-        );
+        _ = ptr;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        unreachable;
     }
 
     fn free(

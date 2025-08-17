@@ -17,7 +17,7 @@ pub const AllocHeader = packed struct(u49) {
 const HEADER_SIZE = @sizeOf(AllocHeader);
 const HEADER_ALIGN = @alignOf(AllocHeader);
 
-const AllocPadding = packed struct(u48) {
+pub const AllocPadding = packed struct(u48) {
     header_offset: u48,
     // 16 unused bits
 };
@@ -28,7 +28,7 @@ const PADDING_ALIGN = @alignOf(AllocPadding);
 const PREFIX_SIZE = HEADER_SIZE + PADDING_SIZE;
 const PREFIX_ALIGN = HEADER_ALIGN;
 
-const AllocFooter = packed struct(u48) {
+pub const AllocFooter = packed struct(u48) {
     header: u48,
     // 16 unused bits
 };
@@ -523,7 +523,8 @@ pub const HeapAllocator = struct {
             const next_list: *Freelist = next_node.base;
 
             _ = next_list.popSpecific(@ptrCast(next_node)).?;
-            if (next_list.head == null) {
+            const next_list_is_now_empty = next_list.head == null;
+            if (next_list_is_now_empty) {
                 const next_entry_ptr: *TreeEntry = @fieldParentPtr("freelist", next_list);
                 const next_node_ptr: *RedBlackTree.Node = @fieldParentPtr("data", next_entry_ptr);
                 _ = self.free_tree.removeFromPtr(next_node_ptr);

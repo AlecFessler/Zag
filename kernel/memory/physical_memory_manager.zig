@@ -43,13 +43,12 @@ pub const PhysicalMemoryManager = struct {
         new_len: usize,
         ret_addr: usize,
     ) bool {
-        const self: *PhysicalMemoryManager = @alignCast(@ptrCast(ptr));
-        return self.backing_allocator.rawResize(
-            memory,
-            alignment,
-            new_len,
-            ret_addr,
-        );
+        _ = ptr;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        unreachable;
     }
 
     fn remap(
@@ -59,13 +58,12 @@ pub const PhysicalMemoryManager = struct {
         new_len: usize,
         ret_addr: usize,
     ) ?[*]u8 {
-        const self: *PhysicalMemoryManager = @alignCast(@ptrCast(ptr));
-        return self.backing_allocator.rawRemap(
-            memory,
-            alignment,
-            new_len,
-            ret_addr,
-        );
+        _ = ptr;
+        _ = memory;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        unreachable;
     }
 
     fn free(

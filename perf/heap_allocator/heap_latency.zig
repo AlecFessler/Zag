@@ -175,6 +175,13 @@ fn pinToCore(core: usize) !void {
 
 fn probeTreeDepth(heap: *heap_alloc.HeapAllocator, user_len: usize, user_align: usize) i32 {
     const header_align: u48 = @alignOf(heap_alloc.AllocHeader);
+    const footer_align: u48 = @alignOf(heap_alloc.AllocFooter);
+
+    const header_size: u48 = @sizeOf(heap_alloc.AllocHeader);
+    const padding_size: u48 = @sizeOf(heap_alloc.AllocPadding);
+    const prefix_size: u48 = header_size + padding_size;
+    const footer_size: u48 = @sizeOf(heap_alloc.AllocFooter);
+
     const key = heap_alloc.TreeEntry{ .bucket_size = @intCast(user_len), .freelist = undefined };
 
     var node_opt: ?*heap_alloc.RedBlackTree.Node = heap.free_tree.root;
@@ -198,22 +205,21 @@ fn probeTreeDepth(heap: *heap_alloc.HeapAllocator, user_len: usize, user_align: 
 
         var maybe_list_entry: ?*heap_alloc.Freelist.FreeNode = tree_entry.data.freelist.head;
         while (maybe_list_entry) |list_entry| : (maybe_list_entry = list_entry.next) {
-            const block_addr: u48 = @intCast(@intFromPtr(list_entry));
-            const header_addr: u48 = block_addr - @sizeOf(heap_alloc.AllocHeader);
-            const header: *heap_alloc.AllocHeader = @ptrFromInt(header_addr);
+            const entry_base: u48 = @intCast(@intFromPtr(list_entry));
+            const header_base: u48 = entry_base - prefix_size;
+            const header: *heap_alloc.AllocHeader = @ptrFromInt(header_base);
             if (!header.is_free) continue;
 
-            const aligned_user = std.mem.alignForward(u48, block_addr, @intCast(user_align));
-            const prefix_len = aligned_user - block_addr + 8;
+            const aligned_user: u48 = std.mem.alignForward(u48, entry_base, @intCast(user_align));
+            const user_end: u48 = aligned_user + @as(u48, @intCast(user_len));
 
-            const postfix_len = std.mem.alignForward(
-                u48,
-                block_addr + prefix_len + @as(u48, @intCast(user_len)),
-                header_align,
-            ) - (block_addr + prefix_len + @as(u48, @intCast(user_len)));
+            const footer_base: u48 = std.mem.alignForward(u48, user_end, footer_align);
+            const block_end: u48 = footer_base + footer_size;
+            std.debug.assert(std.mem.isAligned(block_end, header_align));
 
-            const required_len = prefix_len + @as(u48, @intCast(user_len)) + postfix_len;
-            if (required_len <= header.bucket_size) return depth;
+            const bucket_size: u48 = block_end - entry_base;
+
+            if (bucket_size <= header.bucket_size) return depth;
         }
 
         var succ: ?*heap_alloc.RedBlackTree.Node = null;
