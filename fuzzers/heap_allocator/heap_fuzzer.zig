@@ -1,6 +1,7 @@
 const std = @import("std");
 
-const heap_alloc = @import("kernel/memory/heap_allocator.zig");
+pub const Memory = @import("memory");
+const heap_alloc = Memory.HeapAllocator;
 
 const SEED = 0;
 

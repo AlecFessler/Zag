@@ -1,4 +1,7 @@
 .zig-cache/
 zig-out/
+*/zig-out/
+*/.zig-cache/
 *.iso
 iso/boot/kernel.elf
+perf/*/data/*.csv

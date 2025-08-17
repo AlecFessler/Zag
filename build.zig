@@ -33,6 +33,18 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
 
+    const memory_mod = b.addModule("memory", .{
+        .root_source_file = b.path("kernel/memory/memory.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const containers_mod = b.addModule("containers", .{
+        .root_source_file = b.path("kernel/containers/containers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const kernel = b.addExecutable(.{
         .name = "kernel.elf",
         .root_source_file = b.path("kernel/main.zig"),
@@ -40,6 +52,10 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .code_model = .kernel,
     });
+
+    kernel.root_module.addImport("memory", memory_mod);
+    kernel.root_module.addImport("containers", containers_mod);
+
     kernel.setLinkerScript(b.path("linker.ld"));
     kernel.addObjectFile(b.path("zig-out/obj/bootstrap.o"));
     kernel.step.dependOn(&bootstrap_obj.step);

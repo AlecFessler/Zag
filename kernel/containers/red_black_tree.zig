@@ -15,6 +15,7 @@ pub fn RedBlackTree(
 
         allocator: std.mem.Allocator,
         root: ?*Node,
+        count: usize,
 
         const Color = enum {
             Red,
@@ -28,7 +29,7 @@ pub fn RedBlackTree(
             }
         };
 
-        const Direction = enum {
+        pub const Direction = enum {
             left,
             right,
 
@@ -61,12 +62,16 @@ pub fn RedBlackTree(
                 allocator.destroy(self);
             }
 
-            fn getChild(self: *Node, d: Direction) ?*Node {
+            /// Made pub so custom tree walking logic can be implemented
+            /// externally for composability with the tree for operations
+            /// that may not be generic enough to justify implementing here
+            pub fn getChild(self: *Node, d: Direction) ?*Node {
                 return self.children[@intFromEnum(d)];
             }
 
-            fn setChild(self: *Node, child: ?*Node, d: Direction) void {
+            fn setParentChildRelation(self: *Node, child: ?*Node, d: Direction) void {
                 self.children[@intFromEnum(d)] = child;
+                if (child) |c| c.parent = self;
             }
 
             fn getSibling(self: *Node) ?*Node {
@@ -102,6 +107,7 @@ pub fn RedBlackTree(
             return .{
                 .allocator = allocator,
                 .root = null,
+                .count = 0,
             };
         }
 
@@ -118,9 +124,9 @@ pub fn RedBlackTree(
 
                     if (parent) |p| {
                         if (p.getChild(Direction.left) == c) {
-                            p.setChild(null, Direction.left);
+                            p.setParentChildRelation(null, Direction.left);
                         } else {
-                            p.setChild(null, Direction.right);
+                            p.setParentChildRelation(null, Direction.right);
                         }
                     }
 
@@ -147,40 +153,55 @@ pub fn RedBlackTree(
         }
 
         pub fn insert(self: *Self, data: T) !void {
-            if (self.root) |root| {
-                var current: ?*Node = root;
-                var parent: ?*Node = null;
+            if (self.root == null) {
+                _ = try self.insertAtPtr(null, Direction.left, data);
+                return;
+            }
 
-                while (current) |c| {
-                    parent = c;
-                    switch (cmpFn(data, c.data)) {
-                        .lt => current = c.getChild(Direction.left),
-                        .gt => current = c.getChild(Direction.right),
-                        .eq => {
-                            if (duplicateIsError) return ContainerError.Duplicate;
-                            current = c.getChild(Direction.left);
-                        },
-                    }
+            var current: ?*Node = self.root.?;
+            var parent: ?*Node = null;
+            var dir: Direction = Direction.left;
+
+            while (current) |c| {
+                parent = c;
+                switch (cmpFn(data, c.data)) {
+                    .lt => {
+                        dir = Direction.left;
+                        current = c.getChild(Direction.left);
+                    },
+                    .gt => {
+                        dir = Direction.right;
+                        current = c.getChild(Direction.right);
+                    },
+                    .eq => {
+                        if (duplicateIsError) return ContainerError.Duplicate;
+                        dir = Direction.left;
+                        current = c.getChild(Direction.left);
+                    },
                 }
+            }
 
-                const node = try Node.create(self.allocator, data);
-                if (parent) |p| {
-                    node.parent = p;
-                    if (cmpFn(data, p.data) == .lt) {
-                        p.setChild(node, Direction.left);
-                    } else {
-                        p.setChild(node, Direction.right);
-                    }
+            _ = try self.insertAtPtr(parent.?, dir, data);
+        }
 
-                    if (p.color == Color.Red) {
-                        self.insertFix(node);
-                    }
+        pub fn insertAtPtr(self: *Self, parent: ?*Node, dir: Direction, data: T) !*Node {
+            const node = try Node.create(self.allocator, data);
+
+            if (parent) |p| {
+                std.debug.assert(p.getChild(dir) == null);
+
+                node.color = Color.Red;
+                p.setParentChildRelation(node, dir);
+
+                if (p.color == Color.Red) {
+                    self.insertFix(node);
                 }
             } else {
-                const node = try Node.create(self.allocator, data);
                 node.color = Color.Black;
                 self.root = node;
             }
+            self.count += 1;
+            return node;
         }
 
         fn insertFix(self: *Self, node: *Node) void {
@@ -228,7 +249,6 @@ pub fn RedBlackTree(
         }
 
         pub fn remove(self: *Self, data: T) !T {
-            var parent: ?*Node = null;
             var current: ?*Node = self.root orelse return ContainerError.NotFound;
 
             while (current) |c| {
@@ -237,136 +257,168 @@ pub fn RedBlackTree(
                     .gt => current = c.getChild(Direction.right),
                     .eq => break,
                 }
-                parent = c;
             }
 
             if (current == null) return ContainerError.NotFound;
-            var target = current.?;
-            const removed = target.data;
+            return self.removeFromPtr(current.?);
+        }
 
-            const one_child_at_most = target.getChild(Direction.left) == null or target.getChild(Direction.right) == null;
-            if (one_child_at_most) {
-                const non_null_child = if (target.getChild(Direction.left) == null) Direction.right else Direction.left;
-                const replacement = target.getChild(non_null_child);
+        pub fn removeFromPtr(self: *Self, target_node: *Node) T {
+            self.count -= 1;
+            var parent_of_target: ?*Node = target_node.parent;
+            const removed_value = target_node.data;
 
-                if (target == self.root) {
-                    self.root = replacement;
+            const has_at_most_one_child =
+                (target_node.getChild(.left) == null) or
+                (target_node.getChild(.right) == null);
+
+            if (has_at_most_one_child) {
+                const non_null_direction: Direction =
+                    if (target_node.getChild(.left) == null) Direction.right else Direction.left;
+                const child_replacement = target_node.getChild(non_null_direction);
+
+                if (target_node == self.root) {
+                    self.root = child_replacement;
+                    if (child_replacement) |r| r.parent = null;
                 } else {
-                    const dir_from_parent = if (target == parent.?.getChild(Direction.left)) Direction.left else Direction.right;
-                    parent.?.setChild(replacement, dir_from_parent);
-                    if (replacement) |r| r.parent = parent;
-                }
+                    const direction_from_parent: Direction =
+                        if (target_node == parent_of_target.?.getChild(.left)) Direction.left else Direction.right;
 
-                if (target.color == Color.Black) {
-                    if (replacement) |r| {
-                        if (r.color == Color.Red) r.color = Color.Black;
-                    } else if (parent != null) {
-                        self.removeFix(parent.?);
+                    parent_of_target.?.setParentChildRelation(child_replacement, direction_from_parent);
+
+                    if (target_node.color == Color.Black) {
+                        if (child_replacement) |r| {
+                            if (r.color == Color.Red) r.color = Color.Black;
+                        } else {
+                            self.removeFix(parent_of_target.?, direction_from_parent);
+                        }
                     }
                 }
 
-                target.destroy(self.allocator);
+                target_node.destroy(self.allocator);
+                return removed_value;
             } else {
-                parent = null;
-                var successor: *Node = target.getChild(Direction.right).?;
-
-                while (successor.getChild(Direction.left)) |left| {
-                    parent = successor;
-                    successor = left;
+                var successor_node: *Node = target_node.getChild(.right).?;
+                var parent_of_successor: ?*Node = null;
+                while (successor_node.getChild(.left)) |left_child| {
+                    parent_of_successor = successor_node;
+                    successor_node = left_child;
                 }
 
-                const replacement = successor.getChild(Direction.right);
+                const original_color_of_successor = successor_node.color;
+                const replacement_subchild: ?*Node = successor_node.getChild(.right);
 
-                if (parent) |p| {
-                    p.setChild(replacement, Direction.left);
+                if (parent_of_successor) |_| {
+                    parent_of_successor.?.setParentChildRelation(replacement_subchild, .left);
+                    successor_node.setParentChildRelation(target_node.getChild(.right), .right);
+                }
+
+                const parent_ptr = target_node.parent;
+                if (parent_ptr) |p| {
+                    const direction_to_target: Direction =
+                        if (p.getChild(.left) == target_node) Direction.left else Direction.right;
+                    p.setParentChildRelation(successor_node, direction_to_target);
                 } else {
-                    target.setChild(replacement, Direction.right);
+                    self.root = successor_node;
+                    successor_node.parent = null;
                 }
 
-                if (replacement) |right| {
-                    right.parent = parent orelse target;
-                }
+                successor_node.setParentChildRelation(target_node.getChild(.left), .left);
+                successor_node.color = target_node.color;
 
-                if (successor.color == Color.Black) {
-                    if (replacement) |r| {
-                        if (r.color == Color.Red) r.color = Color.Black;
+                target_node.destroy(self.allocator);
+
+                if (original_color_of_successor == .Black) {
+                    const double_black_parent: *Node = if (parent_of_successor) |pos| pos else successor_node;
+                    const double_black_side: Direction = if (parent_of_successor != null) Direction.left else Direction.right;
+                    if (replacement_subchild) |child| {
+                        if (child.color == .Red) {
+                            child.color = .Black;
+                        } else {
+                            self.removeFix(double_black_parent, double_black_side);
+                        }
                     } else {
-                        self.removeFix(parent orelse target);
+                        self.removeFix(double_black_parent, double_black_side);
                     }
                 }
 
-                target.data = successor.data;
-                successor.destroy(self.allocator);
+                return removed_value;
             }
-
-            return removed;
         }
 
         fn removeFix(
             self: *Self,
-            node: *Node,
+            parent: *Node,
+            which_child: Direction,
         ) void {
-            var current = node;
-            while (current != self.root) {
-                const sibling_opt = current.getSibling();
-                if (sibling_opt == null) break;
+            var current_parent = parent;
+            var deficit_side = which_child;
+
+            while (true) {
+                const deficit_node = current_parent.getChild(deficit_side);
+
+                if (deficit_node) |node_with_deficit| {
+                    if (node_with_deficit.color == .Red) {
+                        node_with_deficit.color = .Black;
+                        break;
+                    }
+                }
+
+                const sibling_opt = current_parent.getChild(deficit_side.flip());
+                if (sibling_opt == null) {
+                    if (current_parent.color == .Red) {
+                        current_parent.color = Color.Black;
+                        break;
+                    }
+                    const grand_opt = current_parent.parent;
+                    if (grand_opt == null) break;
+                    const grandparent = grand_opt.?;
+                    deficit_side = if (current_parent == grandparent.getChild(.left)) .left else .right;
+                    current_parent = grandparent;
+                    continue;
+                }
 
                 const sibling = sibling_opt.?;
-                const parent = current.parent;
-                const which_child: Direction = if (current == parent.?.getChild(Direction.left)) Direction.left else Direction.right;
+                const near_child = sibling.getChild(deficit_side);
+                const far_child = sibling.getChild(deficit_side.flip());
 
-                if (sibling.color == Color.Red) {
-                    self.rotate(parent.?, which_child);
+                if (sibling.color == .Red) {
+                    self.rotate(current_parent, deficit_side);
                     sibling.color = Color.Black;
-                    parent.?.color = Color.Red;
+                    current_parent.color = Color.Red;
                     continue;
                 } else {
-                    const near = sibling.getChild(which_child);
-                    const far = sibling.getChild(which_child.flip());
-                    const both_present = near != null and far != null;
-                    const far_red = if (far) |f| f.color == Color.Red else false;
-                    const near_red = if (near) |n| n.color == Color.Red else false;
+                    const far_is_red = if (far_child) |f| f.color == .Red else false;
+                    const near_is_red = if (near_child) |n| n.color == .Red else false;
 
-                    if (both_present) {
-                        const both_black = near.?.color == Color.Black and far.?.color == Color.Black;
-                        if (both_black) {
-                            sibling.color = Color.Red;
-                            if (parent.?.color == Color.Red) {
-                                parent.?.color = Color.Black;
-                                break;
-                            }
-                            current = current.parent orelse break;
-                            continue;
-                        }
-                    } else if (far_red) {
-                        if (near_red) {
-                            sibling.color = Color.Red;
-                            near.?.color = Color.Black;
-                            self.rotate(sibling, which_child.flip());
-                        }
-                        sibling.color = parent.?.color;
-                        parent.?.color = Color.Black;
-                        far.?.color = Color.Black;
-                        self.rotate(parent.?, which_child);
-                        break;
-                    } else if (near_red) {
+                    if (!far_is_red and !near_is_red) {
                         sibling.color = Color.Red;
-                        near.?.color = Color.Black;
-                        self.rotate(sibling, which_child.flip());
+                        if (current_parent.color == .Red) {
+                            current_parent.color = Color.Black;
+                            break;
+                        }
+                        const grand_opt = current_parent.parent;
+                        if (grand_opt == null) break;
+                        const grandparent = grand_opt.?;
+                        deficit_side = if (current_parent == grandparent.getChild(.left)) .left else .right;
+                        current_parent = grandparent;
+                        continue;
+                    } else if (far_is_red) {
+                        sibling.color = current_parent.color;
+                        current_parent.color = Color.Black;
+                        far_child.?.color = Color.Black;
+                        self.rotate(current_parent, deficit_side);
                         break;
                     } else {
                         sibling.color = Color.Red;
-                        if (parent.?.color == Color.Red) {
-                            parent.?.color = Color.Black;
-                            break;
-                        }
-                        current = current.parent orelse break;
+                        near_child.?.color = Color.Black;
+                        self.rotate(sibling, deficit_side.flip());
                         continue;
                     }
                 }
             }
 
-            if (self.root) |r| r.color = Color.Black;
+            if (self.root) |root_node| root_node.color = Color.Black;
         }
 
         fn rotate(
@@ -376,23 +428,18 @@ pub fn RedBlackTree(
         ) void {
             const new_parent = pivot.getChild(d.flip()).?;
 
-            pivot.setChild(new_parent.getChild(d), d.flip());
-            if (new_parent.getChild(d)) |subtree| {
-                subtree.parent = pivot;
-            }
-            new_parent.parent = pivot.parent;
+            pivot.setParentChildRelation(new_parent.getChild(d), d.flip());
 
+            new_parent.parent = pivot.parent;
             if (pivot.parent) |p| {
                 std.debug.assert(p.getChild(.left) == pivot or p.getChild(.right) == pivot);
-
                 const pivot_direction = if (p.getChild(Direction.left) == pivot) Direction.left else Direction.right;
-                p.setChild(new_parent, pivot_direction);
+                p.setParentChildRelation(new_parent, pivot_direction);
             } else {
                 self.root = new_parent;
             }
 
-            new_parent.setChild(pivot, d);
-            pivot.parent = new_parent;
+            new_parent.setParentChildRelation(pivot, d);
         }
 
         pub fn findNeighbors(self: *Self, data: T) struct {
@@ -447,83 +494,123 @@ pub fn RedBlackTree(
         }
 
         /// helper function to validate red black tree invariants
-        fn validateRedBlackTree(
+        pub fn validateRedBlackTree(
             node: ?*Node,
-            min_val: ?i32,
-            max_val: ?i32,
+            min_val: ?T,
+            max_val: ?T,
         ) struct {
             valid: bool,
             black_height: i32,
         } {
-            if (node == null) {
-                return .{
-                    .valid = true,
-                    .black_height = 1,
-                };
-            }
+            if (node == null) return .{ .valid = true, .black_height = 1 };
             const n = node.?;
+
+            const fail = struct {
+                fn dump(node_ptr: *Node, reason: []const u8) void {
+                    std.debug.print("\n[RBTree Validation Failed]\n", .{});
+                    std.debug.print("Reason: {s}\n", .{reason});
+                    std.debug.print("Node @ {x}\n", .{@intFromPtr(node_ptr)});
+                    std.debug.print("  data = {}\n", .{node_ptr.data});
+                    std.debug.print("  color = {s}\n", .{if (node_ptr.color == .Red) "Red" else "Black"});
+
+                    if (node_ptr.parent) |p| {
+                        std.debug.print("  parent @ {x}, data = {}\n", .{ @intFromPtr(p), p.data });
+                    } else {
+                        std.debug.print("  parent = null\n", .{});
+                    }
+                    if (node_ptr.getChild(.left)) |l| {
+                        std.debug.print("  left @ {x}, data = {}\n", .{ @intFromPtr(l), l.data });
+                    } else {
+                        std.debug.print("  left = null\n", .{});
+                    }
+                    if (node_ptr.getChild(.right)) |r| {
+                        std.debug.print("  right @ {x}, data = {}\n", .{ @intFromPtr(r), r.data });
+                    } else {
+                        std.debug.print("  right = null\n", .{});
+                    }
+                }
+            };
+
+            // Root must have null parent on the top-level call
+            if (min_val == null and max_val == null) {
+                if (n.parent != null) {
+                    fail.dump(n, "Root has non-null parent");
+                    return .{ .valid = false, .black_height = 0 };
+                }
+            }
+
+            // ---- Symmetry checks (both directions) ----
+            // Upward: if a parent exists, it must reference us as a child.
+            if (n.parent) |p| {
+                const parent_points_to_us =
+                    (p.getChild(.left) == n) or (p.getChild(.right) == n);
+                if (!parent_points_to_us) {
+                    fail.dump(n, "Parent does not point to this node");
+                    return .{ .valid = false, .black_height = 0 };
+                }
+            }
+
+            // Downward: any child must have us as its parent.
+            if (n.getChild(.left)) |l| {
+                if (l.parent != n) {
+                    fail.dump(n, "Left child's parent != this node");
+                    return .{ .valid = false, .black_height = 0 };
+                }
+            }
+            if (n.getChild(.right)) |r| {
+                if (r.parent != n) {
+                    fail.dump(n, "Right child's parent != this node");
+                    return .{ .valid = false, .black_height = 0 };
+                }
+            }
 
             // Invariant 2: BST property - left child < parent < right child
             if (min_val) |min| {
-                if (n.data <= min) return .{
-                    .valid = false,
-                    .black_height = 0,
-                };
+                // require n.data > min
+                if (cmpFn(n.data, min) != .gt) {
+                    fail.dump(n, "BST violation: data <= min bound");
+                    return .{ .valid = false, .black_height = 0 };
+                }
             }
             if (max_val) |max| {
-                if (n.data >= max) return .{
-                    .valid = false,
-                    .black_height = 0,
-                };
+                // require n.data < max
+                if (cmpFn(n.data, max) != .lt) {
+                    fail.dump(n, "BST violation: data >= max bound");
+                    return .{ .valid = false, .black_height = 0 };
+                }
             }
 
             // Invariant 3: All leaves (NIL nodes) are black
-            // (This is implicitly satisfied since our null nodes are considered black)
+            // (Implicitly satisfied since null nodes are considered black)
 
             // Invariant 4: Red nodes have black children (no two red nodes adjacent)
             if (n.color == .Red) {
                 if (n.getChild(.left)) |left| {
                     if (left.color == .Red) {
-                        return .{
-                            .valid = false,
-                            .black_height = 0,
-                        };
+                        fail.dump(n, "Red node has red left child");
+                        return .{ .valid = false, .black_height = 0 };
                     }
                 }
                 if (n.getChild(.right)) |right| {
                     if (right.color == .Red) {
-                        return .{
-                            .valid = false,
-                            .black_height = 0,
-                        };
+                        fail.dump(n, "Red node has red right child");
+                        return .{ .valid = false, .black_height = 0 };
                     }
                 }
             }
 
-            const left_result = validateRedBlackTree(
-                n.getChild(.left),
-                min_val,
-                n.data,
-            );
-            const right_result = validateRedBlackTree(
-                n.getChild(.right),
-                n.data,
-                max_val,
-            );
-            if (!left_result.valid or !right_result.valid) {
-                return .{
-                    .valid = false,
-                    .black_height = 0,
-                };
-            }
+            // Recurse on left and right subtrees
+            const left_result = validateRedBlackTree(n.getChild(.left), min_val, n.data);
+            if (!left_result.valid) return left_result;
+
+            const right_result = validateRedBlackTree(n.getChild(.right), n.data, max_val);
+            if (!right_result.valid) return right_result;
 
             // Invariant 5: All paths from any node to its descendant leaves contain
             // the same number of black nodes (black height property)
             if (left_result.black_height != right_result.black_height) {
-                return .{
-                    .valid = false,
-                    .black_height = 0,
-                };
+                fail.dump(n, "Black height mismatch between children");
+                return .{ .valid = false, .black_height = 0 };
             }
 
             const black_contribution: i32 = if (n.color == .Black) 1 else 0;
@@ -806,8 +893,6 @@ test "removeFix case 1: red sibling" {
 
     const parent = try Tree.testCreateNode(allocator);
     defer Tree.testDestroyNode(parent, allocator);
-    const node = try Tree.testCreateNode(allocator);
-    defer Tree.testDestroyNode(node, allocator);
     const sibling = try Tree.testCreateNode(allocator);
     defer Tree.testDestroyNode(sibling, allocator);
 
@@ -815,20 +900,12 @@ test "removeFix case 1: red sibling" {
     defer Tree.testDestroyNode(new_root, allocator);
     const left_of_root = try Tree.testCreateNode(allocator);
     defer Tree.testDestroyNode(left_of_root, allocator);
-    const left_of_left = try Tree.testCreateNode(allocator);
-    defer Tree.testDestroyNode(left_of_left, allocator);
 
     parent.* = .{
         .data = 10,
         .color = .Black,
-        .children = .{ node, sibling },
+        .children = .{ null, sibling },
         .parent = null,
-    };
-    node.* = .{
-        .data = 5,
-        .color = .Black,
-        .children = .{ null, null },
-        .parent = parent,
     };
     sibling.* = .{
         .data = 15,
@@ -845,21 +922,15 @@ test "removeFix case 1: red sibling" {
     };
     left_of_root.* = .{
         .data = 10,
-        .color = .Red,
-        .children = .{ left_of_left, null },
-        .parent = new_root,
-    };
-    left_of_left.* = .{
-        .data = 5,
         .color = .Black,
         .children = .{ null, null },
-        .parent = left_of_root,
+        .parent = new_root,
     };
 
     var tree = Tree.init(allocator);
     tree.root = parent;
 
-    tree.removeFix(node);
+    tree.removeFix(parent, .left);
 
     try Tree.expectSameTree(tree.root, new_root);
 }
@@ -870,8 +941,6 @@ test "removeFix case 2: black sibling, red far child" {
 
     const parent = try Tree.testCreateNode(allocator);
     defer Tree.testDestroyNode(parent, allocator);
-    const node = try Tree.testCreateNode(allocator);
-    defer Tree.testDestroyNode(node, allocator);
     const sibling = try Tree.testCreateNode(allocator);
     defer Tree.testDestroyNode(sibling, allocator);
     const far = try Tree.testCreateNode(allocator);
@@ -883,20 +952,12 @@ test "removeFix case 2: black sibling, red far child" {
     defer Tree.testDestroyNode(left, allocator);
     const far_expected = try Tree.testCreateNode(allocator);
     defer Tree.testDestroyNode(far_expected, allocator);
-    const node_expected = try Tree.testCreateNode(allocator);
-    defer Tree.testDestroyNode(node_expected, allocator);
 
     parent.* = .{
         .data = 10,
         .color = .Black,
-        .children = .{ node, sibling },
+        .children = .{ null, sibling },
         .parent = null,
-    };
-    node.* = .{
-        .data = 5,
-        .color = .Black,
-        .children = .{ null, null },
-        .parent = parent,
     };
     sibling.* = .{
         .data = 15,
@@ -920,14 +981,8 @@ test "removeFix case 2: black sibling, red far child" {
     left.* = .{
         .data = 10,
         .color = .Black,
-        .children = .{ node_expected, null },
-        .parent = new_root,
-    };
-    node_expected.* = .{
-        .data = 5,
-        .color = .Black,
         .children = .{ null, null },
-        .parent = left,
+        .parent = new_root,
     };
     far_expected.* = .{
         .data = 20,
@@ -939,7 +994,7 @@ test "removeFix case 2: black sibling, red far child" {
     var tree = Tree.init(allocator);
     tree.root = parent;
 
-    tree.removeFix(node);
+    tree.removeFix(parent, .left);
 
     try Tree.expectSameTree(tree.root, new_root);
 }
@@ -950,33 +1005,23 @@ test "removeFix case 3: black sibling, red near child" {
 
     const parent = try Tree.testCreateNode(allocator);
     defer Tree.testDestroyNode(parent, allocator);
-    const node = try Tree.testCreateNode(allocator);
-    defer Tree.testDestroyNode(node, allocator);
     const sibling = try Tree.testCreateNode(allocator);
     defer Tree.testDestroyNode(sibling, allocator);
     const near = try Tree.testCreateNode(allocator);
     defer Tree.testDestroyNode(near, allocator);
 
-    const parent_expected = try Tree.testCreateNode(allocator);
-    defer Tree.testDestroyNode(parent_expected, allocator);
-    const node_expected = try Tree.testCreateNode(allocator);
-    defer Tree.testDestroyNode(node_expected, allocator);
-    const near_expected = try Tree.testCreateNode(allocator);
-    defer Tree.testDestroyNode(near_expected, allocator);
-    const sibling_expected = try Tree.testCreateNode(allocator);
-    defer Tree.testDestroyNode(sibling_expected, allocator);
+    const root_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(root_expected, allocator);
+    const left_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(left_expected, allocator);
+    const right_expected = try Tree.testCreateNode(allocator);
+    defer Tree.testDestroyNode(right_expected, allocator);
 
     parent.* = .{
         .data = 10,
         .color = .Black,
-        .children = .{ node, sibling },
+        .children = .{ null, sibling },
         .parent = null,
-    };
-    node.* = .{
-        .data = 5,
-        .color = .Black,
-        .children = .{ null, null },
-        .parent = parent,
     };
     sibling.* = .{
         .data = 15,
@@ -991,37 +1036,31 @@ test "removeFix case 3: black sibling, red near child" {
         .parent = sibling,
     };
 
-    parent_expected.* = .{
-        .data = 10,
-        .color = .Black,
-        .children = .{ node_expected, near_expected },
-        .parent = null,
-    };
-    node_expected.* = .{
-        .data = 5,
-        .color = .Black,
-        .children = .{ null, null },
-        .parent = parent_expected,
-    };
-    near_expected.* = .{
+    root_expected.* = .{
         .data = 12,
         .color = .Black,
-        .children = .{ null, sibling_expected },
-        .parent = parent_expected,
+        .children = .{ left_expected, right_expected },
+        .parent = null,
     };
-    sibling_expected.* = .{
-        .data = 15,
-        .color = .Red,
+    left_expected.* = .{
+        .data = 10,
+        .color = .Black,
         .children = .{ null, null },
-        .parent = near_expected,
+        .parent = root_expected,
+    };
+    right_expected.* = .{
+        .data = 15,
+        .color = .Black,
+        .children = .{ null, null },
+        .parent = root_expected,
     };
 
     var tree = Tree.init(allocator);
     tree.root = parent;
 
-    tree.removeFix(node);
+    tree.removeFix(parent, .left);
 
-    try Tree.expectSameTree(tree.root, parent_expected);
+    try Tree.expectSameTree(tree.root, root_expected);
 }
 
 test "removeFix case 4: black sibling, black children" {
@@ -1030,29 +1069,19 @@ test "removeFix case 4: black sibling, black children" {
 
     const parent = try Tree.testCreateNode(allocator);
     defer Tree.testDestroyNode(parent, allocator);
-    const node = try Tree.testCreateNode(allocator);
-    defer Tree.testDestroyNode(node, allocator);
     const sibling = try Tree.testCreateNode(allocator);
     defer Tree.testDestroyNode(sibling, allocator);
 
     const parent_expected = try Tree.testCreateNode(allocator);
     defer Tree.testDestroyNode(parent_expected, allocator);
-    const node_expected = try Tree.testCreateNode(allocator);
-    defer Tree.testDestroyNode(node_expected, allocator);
     const sibling_expected = try Tree.testCreateNode(allocator);
     defer Tree.testDestroyNode(sibling_expected, allocator);
 
     parent.* = .{
         .data = 10,
         .color = .Black,
-        .children = .{ node, sibling },
+        .children = .{ null, sibling },
         .parent = null,
-    };
-    node.* = .{
-        .data = 5,
-        .color = .Black,
-        .children = .{ null, null },
-        .parent = parent,
     };
     sibling.* = .{
         .data = 15,
@@ -1064,14 +1093,8 @@ test "removeFix case 4: black sibling, black children" {
     parent_expected.* = .{
         .data = 10,
         .color = .Black,
-        .children = .{ node_expected, sibling_expected },
+        .children = .{ null, sibling_expected },
         .parent = null,
-    };
-    node_expected.* = .{
-        .data = 5,
-        .color = .Black,
-        .children = .{ null, null },
-        .parent = parent_expected,
     };
     sibling_expected.* = .{
         .data = 15,
@@ -1083,7 +1106,7 @@ test "removeFix case 4: black sibling, black children" {
     var tree = Tree.init(allocator);
     tree.root = parent;
 
-    tree.removeFix(node);
+    tree.removeFix(parent, .left);
 
     try Tree.expectSameTree(tree.root, parent_expected);
 }

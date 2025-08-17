@@ -1,5 +1,7 @@
 const std = @import("std");
-const buddy_alloc = @import("kernel/memory/buddy_allocator.zig");
+
+const Memory = @import("memory");
+const buddy_alloc = Memory.BuddyAllocator;
 
 const PAGE_SIZE = 4096;
 const NUM_ORDERS = 11;

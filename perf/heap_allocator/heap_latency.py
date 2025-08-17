@@ -1,18 +1,31 @@
 #!/usr/bin/env python3
-import argparse
 import os
 import math
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
+DATA_FILE = "data/heap_latency.csv"
+PLOTS_DIR = "plots"
+ZOOM_Q = 0.99
+ZOOM_BINS = 200
+
 # -----------------------
 # I/O + utilities
 # -----------------------
 
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+def savefig(path: str, fig=None):
+    if fig is None:
+        fig = plt.gcf()
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+
 def read_data(path: str) -> pd.DataFrame:
     df = pd.read_csv(path)
-    # Normalize types
     df['op'] = df['op'].astype(str)
     df['type'] = df['type'].astype(str)
 
@@ -28,16 +41,6 @@ def read_data(path: str) -> pd.DataFrame:
     df['cycles'] = pd.to_numeric(df['cycles'], errors='coerce')
     df['i'] = pd.to_numeric(df['i'], errors='coerce')
     return df
-
-def ensure_dir(path: str):
-    os.makedirs(path, exist_ok=True)
-
-def savefig(path: str, fig=None):
-    if fig is None:
-        fig = plt.gcf()
-    fig.tight_layout()
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
 
 # -----------------------
 # Plot helpers
@@ -81,7 +84,6 @@ def hist(data, bins, xlabel, ylabel, title, out_path, logy=False, xlim=None):
 def boxplot(groups, labels, xlabel, ylabel, title, out_path):
     fig = plt.figure()
     ax = fig.add_subplot(111)
-    # matplotlib 3.9+: labels -> tick_labels
     ax.boxplot(groups, tick_labels=labels, showfliers=False)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
@@ -103,7 +105,6 @@ def heatmap_corr(df, title, out_path):
     return corr
 
 def ecdf(series: pd.Series):
-    """Return sorted values and their ECDF y-values (0..1]."""
     vals = np.sort(series.dropna().values)
     if len(vals) == 0:
         return vals, np.array([])
@@ -127,13 +128,21 @@ def plot_cdf(series, title, out_path, logx=False, xmax=None):
 
 def percentiles(series, qs=(0.5, 0.9, 0.95, 0.99, 0.999)):
     res = {}
+    s = series.dropna()
+    if s.empty:
+        for q in qs:
+            res[f"p{int(q*1000) if q<1 else int(q*100)}"] = float('nan')
+        res['min'] = res['max'] = res['mean'] = float('nan')
+        res['std'] = 0.0
+        res['count'] = 0
+        return res
     for q in qs:
-        res[f"p{int(q*1000) if q<1 else int(q*100)}"] = float(series.quantile(q))
-    res['min'] = float(series.min()) if len(series) else float('nan')
-    res['max'] = float(series.max()) if len(series) else float('nan')
-    res['mean'] = float(series.mean()) if len(series) else float('nan')
-    res['std'] = float(series.std(ddof=1)) if len(series) > 1 else 0.0
-    res['count'] = int(series.shape[0])
+        res[f"p{int(q*1000) if q<1 else int(q*100)}"] = float(s.quantile(q))
+    res['min'] = float(s.min())
+    res['max'] = float(s.max())
+    res['mean'] = float(s.mean())
+    res['std'] = float(s.std(ddof=1)) if len(s) > 1 else 0.0
+    res['count'] = int(s.shape[0])
     return res
 
 # -----------------------
@@ -141,55 +150,40 @@ def percentiles(series, qs=(0.5, 0.9, 0.95, 0.99, 0.999)):
 # -----------------------
 
 def main():
-    ap = argparse.ArgumentParser(description="Heap latency CSV analysis and plots")
-    ap.add_argument("csv_path", help="Path to heap_latency.csv")
-    ap.add_argument("--outdir", default="heap_plots", help="Output directory")
-    ap.add_argument("--zoom_q", type=float, default=0.99,
-                    help="Quantile for zoomed plots (e.g., 0.99 or 0.999)")
-    ap.add_argument("--zoom_bins", type=int, default=200,
-                    help="Bins for zoomed histograms")
-    args = ap.parse_args()
-
-    ensure_dir(args.outdir)
-    df = read_data(args.csv_path)
+    ensure_dir(PLOTS_DIR)
+    df = read_data(DATA_FILE)
 
     df_alloc = df[df['op'] == 'alloc'].copy()
     df_free  = df[df['op'] == 'free'].copy()
     df_alloc_tree = df_alloc[df_alloc['from_tree'] == True].copy()
 
-    # -----------------------
-    # Correlation (overall alloc only) – keep this, drop the redundant subset heatmap
-    # -----------------------
+    # Correlation (alloc only)
     if not df_alloc.empty:
         num_cols = ['size', 'tree_count', 'depth', 'cycles']
         corr_alloc = heatmap_corr(
             df_alloc[num_cols],
             "Alloc: correlation matrix",
-            os.path.join(args.outdir, "alloc_corr_heatmap.png")
+            os.path.join(PLOTS_DIR, "alloc_corr_heatmap.png")
         )
-        corr_alloc.to_csv(os.path.join(args.outdir, "alloc_corr.csv"))
+        corr_alloc.to_csv(os.path.join(PLOTS_DIR, "alloc_corr.csv"))
 
-    # -----------------------
     # Tree size vs cycles (alloc/free)
-    # -----------------------
     if not df_alloc.empty:
         scatter(
             df_alloc['tree_count'], df_alloc['cycles'],
             "tree_count", "cycles", "Alloc: cycles vs. tree_count",
-            os.path.join(args.outdir, "alloc_cycles_vs_tree_count.png"),
+            os.path.join(PLOTS_DIR, "alloc_cycles_vs_tree_count.png"),
             alpha=0.25
         )
     if not df_free.empty:
         scatter(
             df_free['tree_count'], df_free['cycles'],
             "tree_count", "cycles", "Free: cycles vs. tree_count",
-            os.path.join(args.outdir, "free_cycles_vs_tree_count.png"),
+            os.path.join(PLOTS_DIR, "free_cycles_vs_tree_count.png"),
             alpha=0.25
         )
 
-    # -----------------------
     # From-tree vs not (alloc only)
-    # -----------------------
     if not df_alloc.empty:
         g_tree  = df_alloc.loc[df_alloc['from_tree'] == True,  'cycles'].dropna()
         g_not   = df_alloc.loc[df_alloc['from_tree'] == False, 'cycles'].dropna()
@@ -197,32 +191,30 @@ def main():
             [g_tree, g_not],
             ["from_tree", "not_from_tree"],
             "alloc path", "cycles", "Alloc: cycles by from_tree",
-            os.path.join(args.outdir, "alloc_cycles_by_from_tree_box.png"),
+            os.path.join(PLOTS_DIR, "alloc_cycles_by_from_tree_box.png"),
         )
         hist(
             g_tree, bins=100,
             xlabel="cycles", ylabel="count",
             title="Alloc (from_tree): cycles histogram",
-            out_path=os.path.join(args.outdir, "alloc_from_tree_hist.png"),
+            out_path=os.path.join(PLOTS_DIR, "alloc_from_tree_hist.png"),
             logy=True
         )
         hist(
             g_not, bins=100,
             xlabel="cycles", ylabel="count",
             title="Alloc (not_from_tree): cycles histogram",
-            out_path=os.path.join(args.outdir, "alloc_not_from_tree_hist.png"),
+            out_path=os.path.join(PLOTS_DIR, "alloc_not_from_tree_hist.png"),
             logy=True
         )
 
-    # -----------------------
     # Depth vs cycles (alloc from_tree)
-    # -----------------------
     if not df_alloc_tree.empty:
         scatter(
             df_alloc_tree['depth'], df_alloc_tree['cycles'],
             "tree depth", "cycles",
             "Alloc (from_tree): cycles vs. tree depth",
-            os.path.join(args.outdir, "alloc_from_tree_cycles_vs_depth.png"),
+            os.path.join(PLOTS_DIR, "alloc_from_tree_cycles_vs_depth.png"),
             alpha=0.4
         )
         depth_stats = df_alloc_tree.groupby('depth')['cycles'].median().reset_index()
@@ -230,18 +222,16 @@ def main():
             depth_stats['depth'], depth_stats['cycles'],
             "tree depth", "median cycles",
             "Alloc (from_tree): median cycles by depth",
-            os.path.join(args.outdir, "alloc_from_tree_median_cycles_by_depth.png"),
+            os.path.join(PLOTS_DIR, "alloc_from_tree_median_cycles_by_depth.png"),
         )
 
-    # -----------------------
     # Size vs cycles (alloc/free)
-    # -----------------------
     if not df_alloc.empty:
         scatter(
             df_alloc['size'], df_alloc['cycles'],
             "allocation size (bytes)", "cycles",
             "Alloc: cycles vs. size (log-x)",
-            os.path.join(args.outdir, "alloc_cycles_vs_size_logx.png"),
+            os.path.join(PLOTS_DIR, "alloc_cycles_vs_size_logx.png"),
             xlog=True, alpha=0.25
         )
     if not df_free.empty:
@@ -249,61 +239,53 @@ def main():
             df_free['size'], df_free['cycles'],
             "size (bytes)", "cycles",
             "Free: cycles vs. size (log-x)",
-            os.path.join(args.outdir, "free_cycles_vs_size_logx.png"),
+            os.path.join(PLOTS_DIR, "free_cycles_vs_size_logx.png"),
             xlog=True, alpha=0.25
         )
 
-    # -----------------------
     # Over time (alloc/free)
-    # -----------------------
     if not df_alloc.empty:
         lineplot(
             df_alloc['i'], df_alloc['cycles'],
             "operation index (alloc)", "cycles",
             "Alloc: cycles over time",
-            os.path.join(args.outdir, "alloc_cycles_over_time.png"),
+            os.path.join(PLOTS_DIR, "alloc_cycles_over_time.png"),
         )
     if not df_free.empty:
         lineplot(
             df_free['i'], df_free['cycles'],
             "operation index (free)", "cycles",
             "Free: cycles over time",
-            os.path.join(args.outdir, "free_cycles_over_time.png"),
+            os.path.join(PLOTS_DIR, "free_cycles_over_time.png"),
         )
 
-    # -----------------------
     # Distributions: Hist + CDF (fixed + zoomed)
-    # -----------------------
     def do_distribution_plots(series, prefix):
         s = series.dropna()
         if s.empty:
             return
-        # Full-range histogram (log-y to show tails)
         hist(
             s, bins=200, xlabel="cycles", ylabel="count",
             title=f"{prefix}: cycles histogram",
-            out_path=os.path.join(args.outdir, f"{prefix.lower().replace(' ', '_')}_cycles_hist.png"),
+            out_path=os.path.join(PLOTS_DIR, f"{prefix.lower().replace(' ', '_')}_cycles_hist.png"),
             logy=True
         )
-        # Full-range CDF with log-x so you can see the body despite outliers
         plot_cdf(
             s, f"{prefix}: cycles CDF (log-x)",
-            os.path.join(args.outdir, f"{prefix.lower().replace(' ', '_')}_cycles_cdf_logx.png"),
+            os.path.join(PLOTS_DIR, f"{prefix.lower().replace(' ', '_')}_cycles_cdf_logx.png"),
             logx=True
         )
-        # Zoomed (≤ p_zoom) histogram + CDF to show the true “fast path” shape
-        p_zoom = s.quantile(args.zoom_q)
-        # Use a small safety margin to include the cutoff bin cleanly
+        p_zoom = s.quantile(ZOOM_Q)
         xmax = float(p_zoom) * 1.001 if np.isfinite(p_zoom) else None
         hist(
-            s[s <= p_zoom], bins=args.zoom_bins, xlabel="cycles", ylabel="count",
-            title=f"{prefix}: cycles histogram (≤ p{int(args.zoom_q*100)} zoom)",
-            out_path=os.path.join(args.outdir, f"{prefix.lower().replace(' ', '_')}_cycles_hist_zoom.png"),
+            s[s <= p_zoom], bins=ZOOM_BINS, xlabel="cycles", ylabel="count",
+            title=f"{prefix}: cycles histogram (≤ p{int(ZOOM_Q*100)} zoom)",
+            out_path=os.path.join(PLOTS_DIR, f"{prefix.lower().replace(' ', '_')}_cycles_hist_zoom.png"),
             logy=False, xlim=(0, xmax)
         )
         plot_cdf(
-            s[s <= p_zoom], f"{prefix}: cycles CDF (≤ p{int(args.zoom_q*100)} zoom, log-x)",
-            os.path.join(args.outdir, f"{prefix.lower().replace(' ', '_')}_cycles_cdf_zoom_logx.png"),
+            s[s <= p_zoom], f"{prefix}: cycles CDF (≤ p{int(ZOOM_Q*100)} zoom, log-x)",
+            os.path.join(PLOTS_DIR, f"{prefix.lower().replace(' ', '_')}_cycles_cdf_zoom_logx.png"),
             logx=True, xmax=xmax
         )
 
@@ -312,9 +294,7 @@ def main():
     if not df_free.empty:
         do_distribution_plots(df_free['cycles'], "Free")
 
-    # -----------------------
     # Per-type medians
-    # -----------------------
     if not df_alloc.empty:
         med_by_type_alloc = df_alloc.groupby('type')['cycles'].median().reindex(sorted(df_alloc['type'].unique()))
         fig = plt.figure()
@@ -323,7 +303,7 @@ def main():
         ax.set_xlabel("AllocType")
         ax.set_ylabel("median cycles")
         ax.set_title("Alloc: median cycles by AllocType")
-        savefig(os.path.join(args.outdir, "alloc_median_cycles_by_type.png"), fig)
+        savefig(os.path.join(PLOTS_DIR, "alloc_median_cycles_by_type.png"), fig)
 
     if not df_free.empty:
         med_by_type_free = df_free.groupby('type')['cycles'].median().reindex(sorted(df_free['type'].unique()))
@@ -333,14 +313,12 @@ def main():
         ax.set_xlabel("AllocType")
         ax.set_ylabel("median cycles")
         ax.set_title("Free: median cycles by AllocType")
-        savefig(os.path.join(args.outdir, "free_median_cycles_by_type.png"), fig)
+        savefig(os.path.join(PLOTS_DIR, "free_median_cycles_by_type.png"), fig)
 
-    # -----------------------
     # Tail summaries written to CSV (alloc/free + from_tree slices)
-    # -----------------------
     summaries = []
     def add_summary(tag, series):
-        s = percentiles(series.dropna())
+        s = percentiles(series)
         s['tag'] = tag
         summaries.append(s)
 
@@ -358,19 +336,15 @@ def main():
     if summaries:
         cols = ['tag','count','min','p500','p900','p950','p990','p999','mean','std','max']
         summ_df = pd.DataFrame(summaries)
-        # Make sure all columns exist (in case of tiny samples)
         for c in cols:
             if c not in summ_df.columns:
                 summ_df[c] = np.nan
         summ_df = summ_df[cols]
-        summ_df.to_csv(os.path.join(args.outdir, "latency_summary.csv"), index=False)
+        summ_df.to_csv(os.path.join(PLOTS_DIR, "latency_summary.csv"), index=False)
 
-    # -----------------------
-    # Simple index
-    # -----------------------
-    with open(os.path.join(args.outdir, "README.txt"), "w") as f:
+    with open(os.path.join(PLOTS_DIR, "README.txt"), "w") as f:
         f.write("Generated plots and summaries:\n")
-        for name in sorted(os.listdir(args.outdir)):
+        for name in sorted(os.listdir(PLOTS_DIR)):
             if name.endswith((".png", ".csv", ".txt")):
                 f.write(f" - {name}\n")
 

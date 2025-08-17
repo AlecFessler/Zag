@@ -1,6 +1,8 @@
 const std = @import("std");
-const heap_alloc = @import("kernel/memory/heap_allocator.zig");
 const libc = @cImport(@cInclude("sched.h"));
+
+const Memory = @import("memory");
+const heap_alloc = Memory.HeapAllocator;
 
 const SEED = 0;
 const MAX_ALLOC_LEN = 1024;
@@ -259,7 +261,7 @@ pub fn main() !void {
     var prng = std.Random.DefaultPrng.init(SEED);
     var rand = prng.random();
 
-    var file = try std.fs.cwd().createFile("heap_latency.csv", .{ .truncate = true });
+    var file = try std.fs.cwd().createFile("data/heap_latency.csv", .{ .truncate = true });
     defer file.close();
     var bw = std.io.bufferedWriter(file.writer());
     const w = bw.writer();

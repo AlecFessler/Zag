@@ -1,8 +1,9 @@
 const std = @import("std");
 
 const intrusive_freelist = @import("intrusive_freelist.zig");
-const rbt = @import("red_black_tree.zig");
 const slab_alloc = @import("slab_allocator.zig");
+const Containers = @import("containers");
+const rbt = Containers.RedBlackTree;
 
 const GRANULARITY = 8;
 const MAX_ALIGN = ((@as(usize, 1) << @bitSizeOf(u8)) - 1) * GRANULARITY;
