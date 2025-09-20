@@ -131,17 +131,19 @@ const AllocHandle = struct { alloc_type: AllocType, len: usize, addr: usize };
 const Action = enum { alloc, free };
 
 pub fn rdtsc() u64 {
-    var t: u64 = 0;
+    var lo: u32 = undefined;
+    var hi: u32 = undefined;
+
     asm volatile (
-        \\ lfence
-        \\ rdtsc
-        \\ shl $32, %rdx
-        \\ or %rdx, %rax
-        : [tsc] "={rax}" (t),
+        \\lfence
+        \\rdtsc
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
         :
-        : "rdx", "cc", "memory"
+        : .{ .cc = true, .memory = true }
     );
-    return t;
+
+    return (@as(u64, hi) << 32) | @as(u64, lo);
 }
 
 fn cpu_zero(set: *libc.cpu_set_t) void {
@@ -249,7 +251,11 @@ pub fn main() !void {
 
     var dbg_allocator = std.heap.DebugAllocator(.{}){};
     const backing_allocator = dbg_allocator.allocator();
-    const backing_mem = try backing_allocator.alignedAlloc(u8, @alignOf(u64), HEAP_SIZE);
+    const backing_mem = try backing_allocator.alignedAlloc(
+        u8,
+        std.mem.Alignment.fromByteUnits(@alignOf(u64)),
+        HEAP_SIZE,
+    );
     defer backing_allocator.free(backing_mem);
 
     const reserve_start: u48 = @intCast(@intFromPtr(backing_mem.ptr));
@@ -261,16 +267,18 @@ pub fn main() !void {
     defer heap_allocator.deinit();
     const heap_iface = heap_allocator.allocator();
 
-    var allocations = std.ArrayList(AllocHandle).init(backing_allocator);
-    defer allocations.deinit();
+    var allocations = std.ArrayListUnmanaged(AllocHandle){};
+    defer allocations.deinit(backing_allocator);
 
     var prng = std.Random.DefaultPrng.init(SEED);
     var rand = prng.random();
 
     var file = try std.fs.cwd().createFile("data/heap_latency.csv", .{ .truncate = true });
     defer file.close();
-    var bw = std.io.bufferedWriter(file.writer());
-    const w = bw.writer();
+
+    var write_buf: [64 * 1024]u8 = undefined;
+    var fw = file.writer(&write_buf);
+    const w: *std.Io.Writer = &fw.interface;
 
     try w.print("i,op,type,size,tree_count,from_tree,depth,cycles\n", .{});
 
@@ -302,9 +310,11 @@ pub fn main() !void {
 
                 const cycles = t1 - t0;
 
-                try allocations.append(
-                    .{ .alloc_type = at, .addr = @intFromPtr(ptr), .len = len },
-                );
+                try allocations.append(backing_allocator, .{
+                    .alloc_type = at,
+                    .addr = @intFromPtr(ptr),
+                    .len = len,
+                });
 
                 try w.print("{},alloc,{s},{},{},{},{},{}\n", .{
                     i,
@@ -343,5 +353,5 @@ pub fn main() !void {
         }
     }
 
-    try bw.flush();
+    try w.flush();
 }

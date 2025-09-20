@@ -84,17 +84,19 @@ const AllocHandle = struct { alloc_type: AllocType, addr: usize };
 const Action = enum { alloc, free };
 
 pub fn rdtsc() u64 {
-    var t: u64 = 0;
+    var lo: u32 = undefined;
+    var hi: u32 = undefined;
+
     asm volatile (
-        \\ lfence
-        \\ rdtsc
-        \\ shl $32, %rdx
-        \\ or %rdx, %rax
-        : [tsc] "={rax}" (t),
+        \\lfence
+        \\rdtsc
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
         :
-        : "rdx", "cc", "memory"
+        : .{ .cc = true, .memory = true }
     );
-    return t;
+
+    return (@as(u64, hi) << 32) | @as(u64, lo);
 }
 
 fn cpu_zero(set: *libc.cpu_set_t) void {
@@ -139,7 +141,7 @@ pub fn main() !void {
     var dbg_allocator = std.heap.DebugAllocator(.{}){};
     const backing_allocator = dbg_allocator.allocator();
 
-    const backing_mem = try backing_allocator.alignedAlloc(u8, ORDERS[10], POOL_SIZE);
+    const backing_mem = try backing_allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(ORDERS[10]), POOL_SIZE,);
     defer backing_allocator.free(backing_mem);
 
     const start_addr = @intFromPtr(backing_mem.ptr);
@@ -149,16 +151,18 @@ pub fn main() !void {
     defer buddy.deinit();
     const buddy_iface = buddy.allocator();
 
-    var handles = std.ArrayList(AllocHandle).init(backing_allocator);
-    defer handles.deinit();
+    var handles = std.ArrayListUnmanaged(AllocHandle){};
+    defer handles.deinit(backing_allocator);
 
     var prng = std.Random.DefaultPrng.init(SEED);
     var rand = prng.random();
 
     var file = try std.fs.cwd().createFile("data/buddy_latency.csv", .{ .truncate = true });
     defer file.close();
-    var bw = std.io.bufferedWriter(file.writer());
-    const w = bw.writer();
+
+    var buf: [64 * 1024]u8 = undefined;
+    var wr = file.writer(&buf);
+    const w: *std.Io.Writer = &wr.interface;
 
     try w.print("i,op,type,size,splits,cycles\n", .{});
 
@@ -182,7 +186,7 @@ pub fn main() !void {
                 const t1 = rdtsc();
                 const cycles = t1 - t0;
 
-                try handles.append(.{ .alloc_type = at, .addr = @intFromPtr(ptr) });
+                try handles.append(backing_allocator, .{ .alloc_type = at, .addr = @intFromPtr(ptr) });
 
                 try w.print("{},alloc,{s},{},{},{}\n", .{
                     i,
@@ -212,5 +216,5 @@ pub fn main() !void {
         }
     }
 
-    try bw.flush();
+    try w.flush();
 }

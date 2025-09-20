@@ -11,7 +11,7 @@ pub fn build(b: *std.Build) void {
         "nasm",        "-f", "elf64", "-o",
         obj_file_path, "",
     });
-    bootstrap_obj.addFileArg(b.path("kernel/arch/x86_64/bootstrap.asm"));
+    bootstrap_obj.addFileArg(b.path("kernel/arch/x86/bootstrap.asm"));
     bootstrap_obj.step.dependOn(&mkdir_obj.step);
 
     var disabled_features = std.Target.Cpu.Feature.Set.empty;
@@ -47,10 +47,12 @@ pub fn build(b: *std.Build) void {
 
     const kernel = b.addExecutable(.{
         .name = "kernel.elf",
-        .root_source_file = b.path("kernel/main.zig"),
-        .target = target,
-        .optimize = optimize,
-        .code_model = .kernel,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("kernel/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .code_model = .kernel,
+        }),
     });
 
     kernel.root_module.addImport("memory", memory_mod);

@@ -132,7 +132,11 @@ pub fn main() !void {
     var dbg_allocator = std.heap.DebugAllocator(.{}){};
     const backing_allocator = dbg_allocator.allocator();
 
-    const backing_mem = try backing_allocator.alignedAlloc(u8, @alignOf(u64), HEAP_SIZE);
+    const backing_mem = try backing_allocator.alignedAlloc(
+        u8,
+        std.mem.Alignment.fromByteUnits(@alignOf(u64)),
+        HEAP_SIZE,
+    );
     defer backing_allocator.free(backing_mem);
 
     const reserve_start: u48 = @intCast(@intFromPtr(backing_mem.ptr));
@@ -149,8 +153,8 @@ pub fn main() !void {
     defer heap_allocator.deinit();
     const heap_iface = heap_allocator.allocator();
 
-    var allocations = std.ArrayList(AllocHandle).init(backing_allocator);
-    defer allocations.deinit();
+    var allocations = std.ArrayListUnmanaged(AllocHandle){};
+    defer allocations.deinit(backing_allocator);
 
     var prng = std.Random.DefaultPrng.init(SEED);
     var rand = prng.random();
@@ -179,7 +183,7 @@ pub fn main() !void {
                     alloc_len,
                     heap_iface,
                 );
-                try allocations.append(.{
+                try allocations.append(backing_allocator, .{
                     .alloc_type = alloc_type,
                     .addr = @intFromPtr(ptr),
                     .len = alloc_len,

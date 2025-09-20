@@ -90,7 +90,11 @@ pub fn main() !void {
     var dbg_allocator = std.heap.DebugAllocator(.{}){};
     const backing_allocator = dbg_allocator.allocator();
 
-    const backing_mem = try backing_allocator.alignedAlloc(u8, ORDERS[10], POOL_SIZE);
+    const backing_mem = try backing_allocator.alignedAlloc(
+        u8,
+        std.mem.Alignment.fromByteUnits(ORDERS[10]),
+        POOL_SIZE,
+    );
     defer backing_allocator.free(backing_mem);
 
     const start_addr = @intFromPtr(backing_mem.ptr);
@@ -100,8 +104,8 @@ pub fn main() !void {
     defer buddy.deinit();
     const buddy_iface = buddy.allocator();
 
-    var handles = std.ArrayList(AllocHandle).init(backing_allocator);
-    defer handles.deinit();
+    var handles = std.ArrayListUnmanaged(AllocHandle){};
+    defer handles.deinit(backing_allocator);
 
     var alloc_map = buddy_alloc.BuddyAllocator.AllocationMap.init(backing_allocator);
     defer alloc_map.deinit();
@@ -128,7 +132,7 @@ pub fn main() !void {
                     continue;
                 };
 
-                try handles.append(.{
+                try handles.append(backing_allocator, .{
                     .alloc_type = alloc_type,
                     .addr = @intFromPtr(ptr),
                 });

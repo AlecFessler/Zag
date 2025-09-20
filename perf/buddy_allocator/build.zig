@@ -12,9 +12,11 @@ pub fn build(b: *std.Build) void {
 
     const exe = b.addExecutable(.{
         .name = "buddy_latency",
-        .root_source_file = b.path("buddy_latency.zig"),
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("buddy_latency.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
     });
     exe.root_module.addImport("memory", memory_mod);
     exe.linkLibC();
