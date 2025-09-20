@@ -14,15 +14,8 @@ pub fn build(b: *std.Build) void {
     bootstrap_obj.addFileArg(b.path("kernel/arch/x86/bootstrap.asm"));
     bootstrap_obj.step.dependOn(&mkdir_obj.step);
 
-    var disabled_features = std.Target.Cpu.Feature.Set.empty;
-    var enabled_features = std.Target.Cpu.Feature.Set.empty;
-
-    disabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.mmx));
-    disabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.sse));
-    disabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.sse2));
-    disabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.avx));
-    disabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.avx2));
-    enabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.soft_float));
+    const disabled_features = std.Target.Cpu.Feature.Set.empty;
+    const enabled_features = std.Target.Cpu.Feature.Set.empty;
 
     const target = b.resolveTargetQuery(.{
         .cpu_arch = std.Target.Cpu.Arch.x86_64,
@@ -45,6 +38,8 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // NOTE: Use llvm flag is temporary until 0.15.2 fixes the unrecognized symbols in linker script bug https://github.com/ziglang/zig/issues/25069
+    const use_llvm = b.option(bool, "use-llvm", "Force LLVM+LLD backend") orelse false;
     const kernel = b.addExecutable(.{
         .name = "kernel.elf",
         .root_module = b.createModule(.{
@@ -54,6 +49,11 @@ pub fn build(b: *std.Build) void {
             .code_model = .kernel,
         }),
     });
+
+    if (use_llvm) {
+        kernel.use_llvm = true;
+        kernel.use_lld = true;
+    }
 
     kernel.root_module.addImport("memory", memory_mod);
     kernel.root_module.addImport("containers", containers_mod);

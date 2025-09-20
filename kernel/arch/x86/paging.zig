@@ -179,7 +179,7 @@ pub fn write_cr3(pml4: [*]PageEntry) void {
     asm volatile ("mov %[value], %%cr3"
         :
         : [value] "r" (phys_addr),
-        : "memory"
+        : .{ .memory = true }
     );
 }
 
@@ -250,7 +250,7 @@ pub fn mapPage(
 
     var pdpt_entry = &pml4[pml4_idx];
     if (!pdpt_entry.present) {
-        const new_pdpt: [*]PDPTEntry = @alignCast(@ptrCast(allocator.alignedAlloc(
+        const new_pdpt: [*]PDPTEntry = @ptrCast(@alignCast(allocator.alignedAlloc(
             @intFromEnum(PageSize.Page4K),
             @intFromEnum(PageSize.Page4K),
         )));
@@ -272,7 +272,7 @@ pub fn mapPage(
 
     var pd_entry = &pdpt[pdpt_idx];
     if (!pd_entry.present) {
-        const new_pd: [*]PDEntry = @alignCast(@ptrCast(allocator.alloc(
+        const new_pd: [*]PDEntry = @ptrCast(@alignCast(allocator.alloc(
             @intFromEnum(PageSize.Page4K),
             @intFromEnum(PageSize.Page4K),
         )));
@@ -293,7 +293,7 @@ pub fn mapPage(
     // else 4KiB pages are mapped in PT
     var pt_entry = &pd[pd_idx];
     if (!pt_entry.present) {
-        const new_pt: [*]PTEntry = @alignCast(@ptrCast(allocator.alloc(
+        const new_pt: [*]PTEntry = @ptrCast(@alignCast(allocator.alloc(
             @intFromEnum(PageSize.Page4K),
             @intFromEnum(PageSize.Page4K),
         )));

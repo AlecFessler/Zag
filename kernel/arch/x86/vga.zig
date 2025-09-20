@@ -95,58 +95,38 @@ pub fn setColor(
 ///
 /// - `format`: A compile-time format string.
 /// - `args`: Arguments interpolated into the format string.
-pub fn print(
-    comptime format: []const u8,
-    args: anytype,
-) void {
-    const w = Writer(
-        void,
-        error{},
-        printCallback,
-    ){ .context = {} };
-    fmt.format(
-        w,
-        format,
-        args,
-    ) catch unreachable;
-}
+pub fn print(comptime format: []const u8, args: anytype) void {
+    var buf: [512]u8 = undefined;
 
-/// Internal callback used by the `print` function to write raw bytes to the VGA buffer.
-///
-/// Handles newlines, cursor wrapping, and scrolling. Characters are written directly to the
-/// buffer using the current global color. Called automatically by `std.fmt.format`.
-///
-/// Returns the number of bytes written.
-fn printCallback(
-    _: void,
-    string: []const u8,
-) error{}!usize {
-    for (string) |c| {
+    var fw: std.Io.Writer = std.Io.Writer.fixed(buf[0..]);
+
+    const w: *std.Io.Writer = &fw;
+    w.print(format, args) catch unreachable;
+    w.flush() catch unreachable;
+
+    const out = buf[0..fw.end];
+    for (out) |c| {
         if (c == '\n') {
             column = 0;
             row += 1;
         } else {
-            const index = row * VGA_WIDTH + column;
-            buffer[index] = makeEntry(c, color);
+            const i = row * VGA_WIDTH + column;
+            buffer[i] = makeEntry(c, color);
             column += 1;
         }
-
         if (column == VGA_WIDTH) {
             column = 0;
             row += 1;
         }
-
         if (row == VGA_HEIGHT) {
             scroll();
             row = VGA_HEIGHT - 1;
         }
     }
-    return string.len;
 }
 
 /// Scrolls the VGA text buffer up by one row, discarding the top line and clearing the bottom.
 ///
-/// This is called automatically by `printCallback` when output reaches the bottom of the screen.
 /// The bottom row is filled with blank spaces using the current color.
 fn scroll() void {
     for (0..VGA_HEIGHT - 1) |y| {

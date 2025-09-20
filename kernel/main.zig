@@ -31,7 +31,7 @@ extern const _kernel_end: u8;
 export fn kmain(
     magic: u32,
     info_ptr: u32,
-) callconv(.C) void {
+) callconv(.c) void {
     console.initialize(.LightGray, .Black);
 
     if (magic != 0x2BADB002) {
