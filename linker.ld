@@ -23,10 +23,6 @@ SECTIONS {
         *(.boot.data*)
     }
 
-    .boot.bss (NOLOAD) : AT(0) ALIGN(4K) {
-        *(.boot.bss*)
-    }
-
     . = KERNEL_VMA;
     __load_offset = KERNEL_LMA;
 

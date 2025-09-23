@@ -23,11 +23,10 @@ section .boot.text
 _start:
     cli
 
-    mov [saved_mb_magic], eax       ; save magic
-    mov [saved_mb_info], ebx        ; save multiboot info
+    mov [saved_mb_magic], eax
+    mov [saved_mb_info], ebx
 
     xor eax, eax
-    mov esp, boot_stack_top
 
     lgdt [gdt_descriptor]
 
@@ -93,28 +92,16 @@ pd_high:                           ; page directory
     dq 0x00200000 | PAGEFLAGS | PAGE_LG
     times 511 dq 0
 
-section .boot.bss nobits
-align 16
-resb 16384
-boot_stack_top:
-
 [BITS 64]
 section .boot.stub.text
 long_mode_stub:
-    mov ax, 0x10                  ; data segment selector
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
-    mov ss, ax
-
     mov rax, long_mode_entry
     jmp rax
 
 section .bss nobits
 align 16
 resb 16384
-hh_stack_top:
+stack_top:
 
 section .text
 extern kmain
@@ -127,7 +114,7 @@ long_mode_entry:
     mov gs, ax
     mov ss, ax
 
-    mov rsp, hh_stack_top
+    mov rsp, stack_top
 
     mov edi, dword [saved_mb_magic]
     mov esi, dword [saved_mb_info]
