@@ -26,8 +26,6 @@ _start:
     mov [saved_mb_magic], eax
     mov [saved_mb_info], ebx
 
-    xor eax, eax
-
     lgdt [gdt_descriptor]
 
     mov eax, cr4
@@ -62,35 +60,28 @@ gdt:                                ; global descriptor table
 gdt_end:
 
 gdt_descriptor:
-    dw gdt_end - gdt - 1            ; gdt size
+    dw gdt_end - gdt - 1
     dd gdt
 
 align 4096
-pml4:                              ; page map level 4
-    dq pdpt_low + PAGEFLAGS        ; pml4[0] lower half
-    times 510 dq 0                 ; zero up to index 510
-    dq pdpt_high + PAGEFLAGS       ; pml4[511] higher half
-
-align 4096
-pdpt_low:                          ; page directory pointer table
-    dq pd_low + PAGEFLAGS
-    times 511 dq 0
-
-align 4096
-pdpt_high:                         ; page directory pointer table
+pml4:
+    dq pdpt + PAGEFLAGS
     times 510 dq 0
-    dq pd_high + PAGEFLAGS
+    dq pdpt + PAGEFLAGS
+
+align 4096
+pdpt:
+    dq pd + PAGEFLAGS
+    times 509 dq 0
+    dq pd + PAGEFLAGS
     dq 0
 
 align 4096
-pd_low:                            ; page directory
+pd:
     dq 0x00000000 | PAGEFLAGS | PAGE_LG
-    times 511 dq 0
-
-align 4096
-pd_high:                           ; page directory
     dq 0x00200000 | PAGEFLAGS | PAGE_LG
-    times 511 dq 0
+    dq 0x00400000 | PAGEFLAGS | PAGE_LG
+    times 509 dq 0
 
 [BITS 64]
 section .boot.stub.text
@@ -114,12 +105,15 @@ long_mode_entry:
     mov gs, ax
     mov ss, ax
 
+    mov [pml4], qword 0
+    mov rax, cr3
+    mov cr3, rax
+
     mov rsp, stack_top
 
     mov edi, dword [saved_mb_magic]
     mov esi, dword [saved_mb_info]
 
-    ; multiboot magic and info should still be in edi and esi unless something clobbers them
     call kmain
 
 .hang:

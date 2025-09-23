@@ -1,8 +1,12 @@
 const std = @import("std");
 
+extern const _kernel_vma: u8;
+
+const VGA_BUFFER_PADDR = 0xB8000;
 const VGA_WIDTH = 80;
 const VGA_HEIGHT = 25;
 const VGA_SIZE = VGA_WIDTH * VGA_HEIGHT;
+const TEMP_BUFFER_SIZE = 256;
 
 pub const VgaColor = enum(u8) {
     Black,
@@ -23,17 +27,22 @@ pub const VgaColor = enum(u8) {
     White,
 };
 
-var row: usize = 0;
-var column: usize = 0;
+/// Kernel vma and by consequence, the vga text buffer pointer, are runtime known
+/// and thus are initialized in initialize()
+var buffer: [*]u16 = undefined;
+var row: u64 = 0;
+var column: u64 = 0;
 var color: u8 = 0;
+var kernel_vma: u64 = undefined;
 
 pub fn initialize(foreground: VgaColor, background: VgaColor) void {
+    kernel_vma = @intFromPtr(&_kernel_vma);
+    buffer = @ptrFromInt(VGA_BUFFER_PADDR + kernel_vma);
     setColor(foreground, background);
     clear();
 }
 
 pub fn clear() void {
-    const buffer: [*]volatile u16 = @ptrFromInt(0xB8000);
     const blank = makeEntry(' ', color);
     for (0..VGA_SIZE) |i| {
         buffer[i] = blank;
@@ -47,10 +56,9 @@ pub fn setColor(foreground: VgaColor, background: VgaColor) void {
 }
 
 pub fn print(comptime format: []const u8, args: anytype) void {
-    const buffer: [*]volatile u16 = @ptrFromInt(0xB8000);
-    var temp_buf: [256]u8 = undefined;
+    var temp_buffer: [TEMP_BUFFER_SIZE]u8 = undefined;
     const out = std.fmt.bufPrint(
-        temp_buf[0..],
+        temp_buffer[0..],
         format,
         args,
     ) catch @panic("Print would be truncated!");
@@ -77,7 +85,6 @@ pub fn print(comptime format: []const u8, args: anytype) void {
 }
 
 fn scroll() void {
-    const buffer: [*]volatile u16 = @ptrFromInt(0xB8000);
     for (0..VGA_HEIGHT - 1) |y| {
         for (0..VGA_WIDTH) |x| {
             buffer[y * VGA_WIDTH + x] = buffer[(y + 1) * VGA_WIDTH + x];
