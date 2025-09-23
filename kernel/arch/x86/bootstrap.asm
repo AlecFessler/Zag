@@ -105,14 +105,14 @@ long_mode_entry:
     mov gs, ax
     mov ss, ax
 
-    mov [pml4], qword 0
-    mov rax, cr3
-    mov cr3, rax
-
     mov rsp, stack_top
 
     mov edi, dword [saved_mb_magic]
     mov esi, dword [saved_mb_info]
+
+    mov [pml4], qword 0
+    mov rax, cr3
+    mov cr3, rax
 
     call kmain
 
