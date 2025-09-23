@@ -119,7 +119,6 @@ long_mode_entry:
     mov edi, dword [saved_mb_magic]
     mov esi, dword [saved_mb_info]
 
-    ; multiboot magic and info should still be in edi and esi unless something clobbers them
     call kmain
 
 .hang:
