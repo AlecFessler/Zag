@@ -1,13 +1,18 @@
 ENTRY(_start)
 
-KERNEL_VMA = 0xFFFFFFFF80000000;
-KERNEL_LMA = 0x00100000;
+BOOT_LMA = 0x00100000;
 
+KERNEL_VMA = 0xFFFFFFFF80000000;
+KERNEL_LMA = 0x00200000;
 SECTIONS {
-    . = KERNEL_LMA;
+    . = BOOT_LMA;
     .boot.text : ALIGN(4K) {
         KEEP(*(.multiboot))
         *(.boot.text*)
+    }
+
+    .boot.stub.text : ALIGN(4K) {
+        KEEP(*(.boot.stub.text*))
     }
 
     .boot.rodata : ALIGN(4K) {
@@ -18,28 +23,39 @@ SECTIONS {
         *(.boot.data*)
     }
 
-    __boot_load_end = LOADADDR(.boot.data) + SIZEOF(.boot.data);
-    PHYS_OFFSET = __boot_load_end - KERNEL_VMA;
-
     .boot.bss (NOLOAD) : AT(0) ALIGN(4K) {
         *(.boot.bss*)
     }
 
     . = KERNEL_VMA;
+    __load_offset = KERNEL_LMA;
 
-    .text : AT(ADDR(.text) + PHYS_OFFSET) ALIGN(4K) {
+    .text : AT(__load_offset) ALIGN(4K) {
         *(.text*)
     }
+    __load_offset += SIZEOF(.text);
 
-    .rodata : AT(ADDR(.rodata) + PHYS_OFFSET) ALIGN(4K) {
+    .rodata : AT(__load_offset) ALIGN(4K) {
         *(.rodata*)
     }
+    __load_offset += SIZEOF(.rodata);
 
-    .data : AT(ADDR(.data) + PHYS_OFFSET) ALIGN(4K) {
+    .eh_frame_hdr : AT(__load_offset) ALIGN(4) {
+        *(.eh_frame_hdr) *(.eh_frame_hdr.*)
+    }
+    __load_offset += SIZEOF(.eh_frame_hdr);
+
+    .eh_frame : AT(__load_offset) ALIGN(8) {
+        KEEP(*(.eh_frame)) *(.eh_frame.*)
+    }
+    __load_offset += SIZEOF(.eh_frame);
+
+    .data : AT(__load_offset) ALIGN(4K) {
         *(.data*)
     }
+    __load_offset += SIZEOF(.data);
 
-    .bss (NOLOAD) : AT(ADDR(.bss) + PHYS_OFFSET) ALIGN(4K) {
+    .bss (NOLOAD) : AT(__load_offset) ALIGN(4K) {
         *(COMMON)
         *(.bss*)
         PROVIDE(_kernel_end = .);

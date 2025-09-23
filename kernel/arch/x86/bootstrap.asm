@@ -23,19 +23,19 @@ section .boot.text
 _start:
     cli
 
-    mov edi, eax                    ; save magic
-    mov esi, ebx                    ; save multiboot info
+    mov [saved_mb_magic], eax       ; save magic
+    mov [saved_mb_info], ebx        ; save multiboot info
 
     xor eax, eax
     mov esp, boot_stack_top
 
-    lgdt [gdt_descriptor]           ; already physical base for gdt descriptor
+    lgdt [gdt_descriptor]
 
     mov eax, cr4
     or eax, 1 << 5                  ; set physical address extension bit (PAE)
     mov cr4, eax
 
-    mov eax, pml4                   ; use physical address of pml4
+    mov eax, pml4
     mov cr3, eax                    ; store page map level 4 into control register 3
 
     mov ecx, 0xC0000080             ; load extended feature enable register (EFER)
@@ -49,8 +49,13 @@ _start:
 
     jmp 0x08:long_mode_stub         ; reload code segment
 
-
 section .boot.data
+saved_mb_magic:
+    dd 0
+
+saved_mb_info:
+    dd 0
+
 gdt:                                ; global descriptor table
     dq 0x0000000000000000           ; null descriptor
     dq 0x00AF9A000000FFFF           ; 64-bit code segment 0x08
@@ -80,12 +85,12 @@ pdpt_high:                         ; page directory pointer table
 
 align 4096
 pd_low:                            ; page directory
-    dq 0 | PAGEFLAGS | PAGE_LG
+    dq 0x00000000 | PAGEFLAGS | PAGE_LG
     times 511 dq 0
 
 align 4096
 pd_high:                           ; page directory
-    dq 0 | PAGEFLAGS | PAGE_LG
+    dq 0x00200000 | PAGEFLAGS | PAGE_LG
     times 511 dq 0
 
 section .boot.bss nobits
@@ -94,7 +99,7 @@ resb 16384
 boot_stack_top:
 
 [BITS 64]
-section .boot.text
+section .boot.stub.text
 long_mode_stub:
     mov ax, 0x10                  ; data segment selector
     mov ds, ax
@@ -124,10 +129,8 @@ long_mode_entry:
 
     mov rsp, hh_stack_top
 
-    ; zero out the identity mapped page and invalidate it in the tlb
-    mov rax, pd_low
-    mov qword [rax], 0
-    invlpg [0]
+    mov edi, dword [saved_mb_magic]
+    mov esi, dword [saved_mb_info]
 
     ; multiboot magic and info should still be in edi and esi unless something clobbers them
     call kmain

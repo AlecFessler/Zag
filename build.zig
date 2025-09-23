@@ -14,8 +14,15 @@ pub fn build(b: *std.Build) void {
     bootstrap_obj.addFileArg(b.path("kernel/arch/x86/bootstrap.asm"));
     bootstrap_obj.step.dependOn(&mkdir_obj.step);
 
-    const disabled_features = std.Target.Cpu.Feature.Set.empty;
-    const enabled_features = std.Target.Cpu.Feature.Set.empty;
+    var disabled_features = std.Target.Cpu.Feature.Set.empty;
+    var enabled_features = std.Target.Cpu.Feature.Set.empty;
+
+    disabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.mmx));
+    disabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.sse));
+    disabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.sse2));
+    disabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.avx));
+    disabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.avx2));
+    enabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.soft_float));
 
     const target = b.resolveTargetQuery(.{
         .cpu_arch = std.Target.Cpu.Arch.x86_64,
