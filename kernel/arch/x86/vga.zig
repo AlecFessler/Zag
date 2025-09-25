@@ -29,7 +29,7 @@ pub const VgaColor = enum(u8) {
 
 /// Kernel vma and by consequence, the vga text buffer pointer, are runtime known
 /// and thus are initialized in initialize()
-var buffer: [*]u16 = undefined;
+var buffer: [*]volatile u16 = undefined;
 var row: u64 = 0;
 var column: u64 = 0;
 var color: u8 = 0;
