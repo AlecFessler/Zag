@@ -8,6 +8,11 @@
 //! This is typically used during early kernel initialization to inspect the memory map
 //! and retrieve configuration data provided by the bootloader.
 
+extern const _kernel_base_vaddr: u8;
+
+pub const MAGIC = 0x2BADB002;
+pub const MAX_REGIONS = 32;
+
 /// Represents the Multiboot information structure provided by a compliant bootloader
 /// according to the Multiboot Specification v1. This structure is located at the address
 /// passed in the `info_ptr` argument to the kernel entry point. It contains a variety of
@@ -35,11 +40,8 @@ pub const MultibootInfo = packed struct {
     /// Physical address of the first module structure.
     mods_addr: u32,
 
-    /// Symbol table fields (deprecated; used only with a.out kernels).
-    syms_0: u32,
-    syms_1: u32,
-    syms_2: u32,
-    syms_3: u32,
+    /// Elf section header data.
+    elf_sections: ElfSectionHeaderTable,
 
     /// Size of the memory map provided by the bootloader.
     mmap_len: u32,
@@ -79,6 +81,24 @@ pub const MultibootInfo = packed struct {
 
     /// Length of the VBE interface.
     vbe_interface_len: u16,
+};
+
+pub fn checkFlag(flags: u32, bit: u5) bool {
+    return 1 == (1 & (flags >> bit));
+}
+
+pub const Mod = packed struct {
+    start: u32,
+    end: u32,
+    cmdline: u32,
+    padding: u32,
+};
+
+pub const ElfSectionHeaderTable = packed struct {
+    num: u32,
+    size: u32,
+    addr: u32,
+    shndx: u32,
 };
 
 /// Represents a single entry in the memory map provided by a Multiboot v1-compliant bootloader.
@@ -136,8 +156,6 @@ pub const MemoryRegionType = enum(u32) {
     }
 };
 
-pub const MAX_REGIONS = 32;
-
 /// Represents a physical memory region reported by the bootloader.
 ///
 /// Each region includes a base physical address, a length in bytes,
@@ -154,8 +172,9 @@ pub const MemoryRegion = struct {
 };
 
 pub fn parseMemoryMap(info: *const MultibootInfo, regions: *[MAX_REGIONS]MemoryRegion) []MemoryRegion {
-    const mmap_end: u64 = info.mmap_addr + info.mmap_len;
-    var mmap_ptr: u64 = info.mmap_addr;
+    const kernel_base_vaddr = @intFromPtr(&_kernel_base_vaddr);
+    var mmap_ptr: u64 = info.mmap_addr + kernel_base_vaddr;
+    const mmap_end: u64 = mmap_ptr + info.mmap_len;
     var i: usize = 0;
     while (mmap_ptr < mmap_end) : (i += 1) {
         // Align to 1 byte because Multiboot v1 does not guarantee alignment of mmap entries.

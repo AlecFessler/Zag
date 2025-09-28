@@ -41,6 +41,6 @@ SECTIONS {
         *(COMMON)
         *(.bss*)
         PROVIDE(_kernel_end = .);
-        PROVIDE(_kernel_vma = KERNEL_VMA);
+        PROVIDE(_kernel_base_vaddr = KERNEL_VMA);
     }
 }

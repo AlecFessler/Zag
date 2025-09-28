@@ -2,11 +2,11 @@ const std = @import("std");
 
 /// Owning allocator. Manages a contiguous address space, does not take a backing allocator, can act as a backing allocator;
 pub const BumpAllocator = struct {
-    start_addr: usize,
-    free_addr: usize,
-    end_addr: usize,
+    start_addr: u64,
+    free_addr: u64,
+    end_addr: u64,
 
-    pub fn init(start_addr: usize, end_addr: usize) BumpAllocator {
+    pub fn init(start_addr: u64, end_addr: u64) BumpAllocator {
         std.debug.assert(end_addr > start_addr);
 
         return .{
@@ -30,15 +30,15 @@ pub const BumpAllocator = struct {
 
     fn alloc(
         ptr: *anyopaque,
-        len: usize,
+        len: u64,
         alignment: std.mem.Alignment,
-        ret_addr: usize,
+        ret_addr: u64,
     ) ?[*]u8 {
         _ = ret_addr;
         const self: *BumpAllocator = @alignCast(@ptrCast(ptr));
 
         const aligned = std.mem.alignForward(
-            usize,
+            u64,
             self.free_addr,
             alignment.toByteUnits(),
         );
@@ -57,8 +57,8 @@ pub const BumpAllocator = struct {
         ptr: *anyopaque,
         memory: []u8,
         alignment: std.mem.Alignment,
-        new_len: usize,
-        ret_addr: usize,
+        new_len: u64,
+        ret_addr: u64,
     ) bool {
         _ = ptr;
         _ = memory;
@@ -73,8 +73,8 @@ pub const BumpAllocator = struct {
         ptr: *anyopaque,
         memory: []u8,
         alignment: std.mem.Alignment,
-        new_len: usize,
-        ret_addr: usize,
+        new_len: u64,
+        ret_addr: u64,
     ) ?[*]u8 {
         _ = ptr;
         _ = memory;
@@ -89,7 +89,7 @@ pub const BumpAllocator = struct {
         ptr: *anyopaque,
         buf: []u8,
         alignment: std.mem.Alignment,
-        ret_addr: usize,
+        ret_addr: u64,
     ) void {
         _ = ptr;
         _ = buf;

@@ -33,18 +33,6 @@ pub fn build(b: *std.Build) void {
     });
     const optimize = b.standardOptimizeOption(.{});
 
-    const memory_mod = b.addModule("memory", .{
-        .root_source_file = b.path("kernel/memory/memory.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const containers_mod = b.addModule("containers", .{
-        .root_source_file = b.path("kernel/containers/containers.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
     // NOTE: Use llvm flag is temporary until 0.15.2 fixes the unrecognized symbols in linker script bug https://github.com/ziglang/zig/issues/25069
     const use_llvm = b.option(bool, "use-llvm", "Force LLVM+LLD backend") orelse false;
     const kernel = b.addExecutable(.{
@@ -62,8 +50,27 @@ pub fn build(b: *std.Build) void {
         kernel.use_lld = true;
     }
 
+    const memory_mod = b.addModule("memory", .{
+        .root_source_file = b.path("kernel/memory/memory.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const containers_mod = b.addModule("containers", .{
+        .root_source_file = b.path("kernel/containers/containers.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
+    const x86_mod = b.addModule("x86", .{
+        .root_source_file = b.path("kernel/arch/x86/x86.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     kernel.root_module.addImport("memory", memory_mod);
     kernel.root_module.addImport("containers", containers_mod);
+    kernel.root_module.addImport("x86", x86_mod);
 
     kernel.setLinkerScript(b.path("linker.ld"));
     kernel.addObjectFile(b.path("zig-out/obj/bootstrap.o"));

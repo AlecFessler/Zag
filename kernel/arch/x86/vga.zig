@@ -1,6 +1,6 @@
 const std = @import("std");
 
-extern const _kernel_vma: u8;
+extern const _kernel_base_vaddr: u8;
 
 const VGA_BUFFER_PADDR = 0xB8000;
 const VGA_WIDTH = 80;
@@ -33,11 +33,11 @@ var buffer: [*]volatile u16 = undefined;
 var row: u64 = 0;
 var column: u64 = 0;
 var color: u8 = 0;
-var kernel_vma: u64 = undefined;
+var kernel_base_vaddr: u64 = undefined;
 
 pub fn initialize(foreground: VgaColor, background: VgaColor) void {
-    kernel_vma = @intFromPtr(&_kernel_vma);
-    buffer = @ptrFromInt(VGA_BUFFER_PADDR + kernel_vma);
+    kernel_base_vaddr = @intFromPtr(&_kernel_base_vaddr);
+    buffer = @ptrFromInt(VGA_BUFFER_PADDR + kernel_base_vaddr);
     setColor(foreground, background);
     clear();
 }

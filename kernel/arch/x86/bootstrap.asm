@@ -110,7 +110,7 @@ long_mode_entry:
     mov edi, dword [saved_mb_magic]
     mov esi, dword [saved_mb_info]
 
-    mov [pml4], qword 0
+    mov qword [pml4], 0
     mov rax, cr3
     mov cr3, rax
 
