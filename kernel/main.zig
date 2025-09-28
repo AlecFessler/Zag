@@ -2,12 +2,14 @@ const std = @import("std");
 
 const memory = @import("memory");
 const bump_alloc = memory.BumpAllocator;
+const buddy_alloc = memory.BuddyAllocator;
 const x86 = @import("x86");
 const paging = x86.Paging;
 const vga = x86.Vga;
 const multiboot = @import("boot/grub/multiboot.zig");
 
 const BumpAllocator = bump_alloc.BumpAllocator;
+const BuddyAllocator = buddy_alloc.BuddyAllocator;
 
 extern const _kernel_base_vaddr: u8;
 extern const _kernel_end: u8;
@@ -99,6 +101,35 @@ export fn kmain(
         );
         current_paddr += page_size;
     }
+
+    const buddy_metadata_bytes = BuddyAllocator.requiredMemory(
+        bump_allocator.free_addr,
+        bump_allocator.end_addr,
+    );
+    const buddy_start_vaddr = std.mem.alignForward(
+        u64,
+        bump_allocator.free_addr + buddy_metadata_bytes,
+        page4K,
+    );
+    const buddy_end_vaddr = std.mem.alignBackward(
+        u64,
+        bump_allocator.end_addr,
+        page4K,
+    );
+    std.debug.assert(buddy_end_vaddr > buddy_start_vaddr);
+
+    const buddy_allocator: BuddyAllocator = BuddyAllocator.init(
+        buddy_start_vaddr,
+        buddy_end_vaddr,
+        bump_alloc_iface,
+    ) catch @panic("Failed to allocate memory for buddy allocator!");
+    std.debug.assert(bump_allocator.free_addr <= buddy_start_vaddr);
+
+    vga.print("Buddy start paddr {X} end paddr {X} free addr {X}\n", .{
+        buddy_allocator.start_addr,
+        buddy_allocator.end_addr,
+        bump_allocator.free_addr,
+    });
 
     while (true) {
         asm volatile ("hlt");

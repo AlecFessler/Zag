@@ -7,7 +7,7 @@ const PAGE_SIZE = 4096;
 
 const NUM_ORDERS = 11;
 const ORDERS = blk: {
-    var arr: [NUM_ORDERS]usize = undefined;
+    var arr: [NUM_ORDERS]u64 = undefined;
     for (0..NUM_ORDERS) |i| {
         arr[i] = (1 << i) * PAGE_SIZE;
     }
@@ -54,8 +54,8 @@ pub const FreeListBatch = intrusive_freelist.IntrusiveFreeList(
 
 /// Owning allocator. Manages a contiguous address space, does not take a backing allocator, can act as a backing allocator;
 pub const BuddyAllocator = struct {
-    start_addr: usize,
-    end_addr: usize,
+    start_addr: u64,
+    end_addr: u64,
 
     /// Not a backing allocator, this is only used to allocate and free the page orders and bitmap
     init_allocator: std.mem.Allocator,
@@ -64,19 +64,58 @@ pub const BuddyAllocator = struct {
     bitmap: BitmapFreeList = undefined,
     freelists: [NUM_ORDERS]IntrusiveFreeList = [_]IntrusiveFreeList{IntrusiveFreeList{}} ** NUM_ORDERS,
 
-    pub fn init(
-        start_addr: usize,
-        end_addr: usize,
-        init_allocator: std.mem.Allocator,
-    ) !BuddyAllocator {
-        std.debug.assert(end_addr > start_addr);
+    pub fn requiredMemory(
+        start_addr: u64,
+        end_addr: u64,
+    ) u64 {
         const aligned_start = std.mem.alignForward(
-            usize,
+            u64,
             start_addr,
             PAGE_SIZE,
         );
         const aligned_end = std.mem.alignBackward(
-            usize,
+            u64,
+            end_addr,
+            PAGE_SIZE,
+        );
+        std.debug.assert(aligned_end > aligned_start);
+
+        var n_pages = (aligned_end - aligned_start) / PAGE_SIZE;
+        var i: u32 = 0;
+        const loop_upper_bound = 3;
+        while (true) : (i += 1) {
+            if (i >= loop_upper_bound) {
+                @panic("Non exitting loop!");
+            }
+
+            const bitmap_words = (n_pages + bitmap_freelist.WORD_BIT_SIZE - 1) / bitmap_freelist.WORD_BIT_SIZE;
+            const bitmap_bytes = bitmap_words * @sizeOf(bitmap_freelist.Word);
+            const orders_bytes = (n_pages + 1) / 2;
+            const metadata_bytes = std.mem.alignForward(
+                u64,
+                bitmap_bytes + orders_bytes,
+                PAGE_SIZE,
+            );
+
+            const n2_pages = (aligned_end - (aligned_start + metadata_bytes)) / PAGE_SIZE;
+            if (n_pages == n2_pages) return metadata_bytes;
+            n_pages = n2_pages;
+        }
+    }
+
+    pub fn init(
+        start_addr: u64,
+        end_addr: u64,
+        init_allocator: std.mem.Allocator,
+    ) !BuddyAllocator {
+        std.debug.assert(end_addr > start_addr);
+        const aligned_start = std.mem.alignForward(
+            u64,
+            start_addr,
+            PAGE_SIZE,
+        );
+        const aligned_end = std.mem.alignBackward(
+            u64,
             end_addr,
             PAGE_SIZE,
         );
@@ -90,7 +129,7 @@ pub const BuddyAllocator = struct {
 
         const total_bytes = aligned_end - aligned_start;
         const num_pages = total_bytes / PAGE_SIZE;
-        const num_pairs = std.math.divCeil(usize, num_pages, 2) catch unreachable;
+        const num_pairs = std.math.divCeil(u64, num_pages, 2) catch unreachable;
 
         const initially_free = false;
         self.bitmap = try BitmapFreeList.init(
@@ -147,7 +186,7 @@ pub const BuddyAllocator = struct {
     /// when the pmm wants to reload a cpu's cache of single pages
     pub fn splitAllocation(
         self: *BuddyAllocator,
-        addr: usize,
+        addr: u64,
         split_order: u4,
     ) FreeListBatch {
         const order = self.getOrder(addr);
@@ -166,7 +205,7 @@ pub const BuddyAllocator = struct {
         return batch;
     }
 
-    fn recursiveSplit(self: *BuddyAllocator, order: u4) ?usize {
+    fn recursiveSplit(self: *BuddyAllocator, order: u4) ?u64 {
         const addr_ptr = self.freelists[order].pop() orelse {
             if (order == 10) return null;
 
@@ -190,7 +229,7 @@ pub const BuddyAllocator = struct {
         return addr;
     }
 
-    fn recursiveMerge(self: *BuddyAllocator, addr: usize) struct { addr: usize, order: u4 } {
+    fn recursiveMerge(self: *BuddyAllocator, addr: u64) struct { addr: u64, order: u4 } {
         const order = self.getOrder(addr);
         if (order == 10) return .{ .addr = addr, .order = order };
 
@@ -237,7 +276,7 @@ pub const BuddyAllocator = struct {
         return self.recursiveMerge(lower_half);
     }
 
-    fn getOrder(self: *BuddyAllocator, addr: usize) u4 {
+    fn getOrder(self: *BuddyAllocator, addr: u64) u4 {
         const page_idx = (addr - self.start_addr) / PAGE_SIZE;
         const pair_idx = page_idx / 2;
         const is_odd = page_idx % 2 == 1;
@@ -248,7 +287,7 @@ pub const BuddyAllocator = struct {
         }
     }
 
-    fn setOrder(self: *BuddyAllocator, addr: usize, order: u4) void {
+    fn setOrder(self: *BuddyAllocator, addr: u64, order: u4) void {
         const page_idx = (addr - self.start_addr) / PAGE_SIZE;
         const pair_idx = page_idx / 2;
         const is_odd = page_idx % 2 == 1;
@@ -261,9 +300,9 @@ pub const BuddyAllocator = struct {
 
     fn alloc(
         ptr: *anyopaque,
-        len: usize,
+        len: u64,
         alignment: std.mem.Alignment,
-        ret_addr: usize,
+        ret_addr: u64,
     ) ?[*]u8 {
         _ = alignment;
         _ = ret_addr;
@@ -283,8 +322,8 @@ pub const BuddyAllocator = struct {
         ptr: *anyopaque,
         memory: []u8,
         alignment: std.mem.Alignment,
-        new_len: usize,
-        ret_addr: usize,
+        new_len: u64,
+        ret_addr: u64,
     ) bool {
         _ = ptr;
         _ = memory;
@@ -298,8 +337,8 @@ pub const BuddyAllocator = struct {
         ptr: *anyopaque,
         memory: []u8,
         alignment: std.mem.Alignment,
-        new_len: usize,
-        ret_addr: usize,
+        new_len: u64,
+        ret_addr: u64,
     ) ?[*]u8 {
         _ = ptr;
         _ = memory;
@@ -313,7 +352,7 @@ pub const BuddyAllocator = struct {
         ptr: *anyopaque,
         buf: []u8,
         alignment: std.mem.Alignment,
-        ret_addr: usize,
+        ret_addr: u64,
     ) void {
         _ = alignment;
         _ = ret_addr;
@@ -326,9 +365,9 @@ pub const BuddyAllocator = struct {
 
     /// Helper type for use by test cases
     pub const AllocationMap = std.HashMap(
-        usize,
-        struct { size: usize, order: u4 },
-        std.hash_map.AutoContext(usize),
+        u64,
+        struct { size: u64, order: u4 },
+        std.hash_map.AutoContext(u64),
         std.hash_map.default_max_load_percentage,
     );
 
@@ -336,16 +375,16 @@ pub const BuddyAllocator = struct {
     pub fn validateState(self: *BuddyAllocator, allocations: *AllocationMap) bool {
         const Helper = struct {
             fn fail(reason: []const u8, ctx: struct {
-                start_addr: usize = 0,
-                end_addr: usize = 0,
-                page_size: usize = 0,
-                order: usize = 0,
-                addr: usize = 0,
-                end: usize = 0,
-                buddy: usize = 0,
-                expected_order: usize = 0,
-                extra_a: usize = 0,
-                extra_b: usize = 0,
+                start_addr: u64 = 0,
+                end_addr: u64 = 0,
+                page_size: u64 = 0,
+                order: u64 = 0,
+                addr: u64 = 0,
+                end: u64 = 0,
+                buddy: u64 = 0,
+                expected_order: u64 = 0,
+                extra_a: u64 = 0,
+                extra_b: u64 = 0,
             }) bool {
                 std.debug.print(
                     "\n[Buddy Validate Failed]\nreason={s}\nstart={x} end={x} page_size={d}\norder={d} addr={x} end={x} buddy={x} expected_order={d}\nextra_a={x} extra_b={x}\n",
@@ -366,7 +405,7 @@ pub const BuddyAllocator = struct {
                 return false;
             }
 
-            fn isAligned(x: usize, a: usize) bool {
+            fn isAligned(x: u64, a: u64) bool {
                 return (x & (a - 1)) == 0;
             }
         };
@@ -383,10 +422,10 @@ pub const BuddyAllocator = struct {
 
         // Collect every free block (base -> order) to (a) spot duplicates and
         // (b) let page-scan cheaply verify membership.
-        var free_map = std.AutoHashMap(usize, u4).init(self.init_allocator);
+        var free_map = std.AutoHashMap(u64, u4).init(self.init_allocator);
         defer free_map.deinit();
 
-        var order: usize = 0;
+        var order: u64 = 0;
         while (order < NUM_ORDERS) : (order += 1) {
             const blk_size = ORDERS[order];
             var node = self.freelists[order].head;
@@ -452,10 +491,10 @@ pub const BuddyAllocator = struct {
 
         // Page-level scan
         const total_pages = (end - start) / PAGE_SIZE;
-        var page_idx: usize = 0;
+        var page_idx: u64 = 0;
         while (page_idx < total_pages) : (page_idx += 1) {
             const addr = start + page_idx * PAGE_SIZE;
-            const ord: usize = self.getOrder(addr);
+            const ord: u64 = self.getOrder(addr);
             const is_free = self.bitmap.isFree(addr);
 
             if (!is_free) {
@@ -468,7 +507,7 @@ pub const BuddyAllocator = struct {
                             .addr = addr,
                             .extra_a = info.size,
                         });
-                    const expected: usize = @ctz(num_pages);
+                    const expected: u64 = @ctz(num_pages);
                     if (ord != expected)
                         return Helper.fail("allocated page order mismatch", .{
                             .addr = addr,
@@ -517,8 +556,8 @@ pub const BuddyAllocator = struct {
 test "buddy allocator initializes expected pages and orders correctly" {
     const allocator = std.testing.allocator;
 
-    var total_size: usize = 10 * ORDERS[10];
-    const skip_order: usize = 5;
+    var total_size: u64 = 10 * ORDERS[10];
+    const skip_order: u64 = 5;
     for (0..NUM_ORDERS - 1) |i| {
         if (i == skip_order) continue;
         total_size += ORDERS[i];
@@ -538,7 +577,7 @@ test "buddy allocator initializes expected pages and orders correctly" {
     defer buddy.deinit();
 
     const expected = [_]struct {
-        page_index: usize,
+        page_index: u64,
         order: u4,
     }{
         .{ .page_index = 0, .order = 10 },
@@ -729,7 +768,7 @@ test "out of bounds buddy handling - fragmentation recovery" {
 
 test "split allocation handles order changes correctly" {
     const test_allocator = std.testing.allocator;
-    const total_size: usize = 2 * ORDERS[10];
+    const total_size: u64 = 2 * ORDERS[10];
     const memory = try test_allocator.alignedAlloc(u8, PAGE_SIZE, total_size);
     defer test_allocator.free(memory);
 
@@ -756,7 +795,7 @@ test "split allocation handles order changes correctly" {
 
     _ = allocations.remove(@intFromPtr(allocation.ptr));
     var split = buddy.splitAllocation(@intFromPtr(allocation.ptr), 0);
-    var count: usize = 0;
+    var count: u64 = 0;
     while (split.pop()) |page| {
         count += 1;
         freelist.push(page);
@@ -775,8 +814,8 @@ test "split allocation handles order changes correctly" {
 
 test "complex allocation and deallocation with state verification" {
     var test_allocator = std.testing.allocator;
-    var total_size: usize = 10 * ORDERS[10];
-    const skip_order: usize = 7;
+    var total_size: u64 = 10 * ORDERS[10];
+    const skip_order: u64 = 7;
     for (0..NUM_ORDERS - 1) |i| {
         if (i == skip_order) continue;
         total_size += ORDERS[i];
@@ -799,7 +838,7 @@ test "complex allocation and deallocation with state verification" {
     var allocations = BuddyAllocator.AllocationMap.init(test_allocator);
     defer allocations.deinit();
 
-    var validations: usize = 1;
+    var validations: u64 = 1;
     try std.testing.expect(buddy.validateState(&allocations) and (validations == validations));
 
     const ptr1 = try allocator.alloc(u8, ORDERS[skip_order]);
