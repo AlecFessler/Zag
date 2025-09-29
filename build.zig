@@ -50,14 +50,14 @@ pub fn build(b: *std.Build) void {
         kernel.use_lld = true;
     }
 
-    const memory_mod = b.addModule("memory", .{
-        .root_source_file = b.path("kernel/memory/memory.zig"),
+    const containers_mod = b.addModule("containers", .{
+        .root_source_file = b.path("kernel/containers/containers.zig"),
         .target = target,
         .optimize = optimize,
     });
 
-    const containers_mod = b.addModule("containers", .{
-        .root_source_file = b.path("kernel/containers/containers.zig"),
+    const memory_mod = b.addModule("memory", .{
+        .root_source_file = b.path("kernel/memory/memory.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -67,6 +67,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+
+    memory_mod.addImport("containers", containers_mod);
+    containers_mod.addImport("memory", memory_mod);
 
     kernel.root_module.addImport("memory", memory_mod);
     kernel.root_module.addImport("containers", containers_mod);

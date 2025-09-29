@@ -1,13 +1,37 @@
 const std = @import("std");
 
+/// With the way allocators are planned to be used, there will be very few allocations made
+/// from the VMM itself, typically made upfront when allocators are initialized. Because of this,
+/// we just use a fixed size array of base + size fat pointers for simplicity and for the page fault
+/// handler to quickly check if a faulting address is valid
+const MAX_ALLOCATIONS = 16;
+
+pub const VmmAllocation = struct {
+    vaddr: u64,
+    size: u64,
+};
+
 /// Delegating allocator. Requires a backing allocator, can also act as a backing allocator.
 pub const VirtualMemoryManager = struct {
     backing_allocator: std.mem.Allocator,
+    vmm_allocations: [MAX_ALLOCATIONS]VmmAllocation = undefined,
+    vmm_allocations_idx: u32 = 0,
 
     pub fn init(backing_allocator: std.mem.Allocator) VirtualMemoryManager {
         return .{
             .backing_allocator = backing_allocator,
         };
+    }
+
+    pub fn isValidVaddr(self: *VirtualMemoryManager, vaddr: u64) bool {
+        for (0..self.vmm_allocations_idx) |i| {
+            const range_start = self.vmm_allocations[i].vaddr;
+            const range_end = range_start + self.vmm_allocations[i].size;
+            const gte_start = vaddr >= range_start;
+            const lt_end = vaddr < range_end;
+            if (gte_start and lt_end) return true;
+        }
+        return false;
     }
 
     pub fn allocator(self: *VirtualMemoryManager) std.mem.Allocator {
@@ -29,11 +53,18 @@ pub const VirtualMemoryManager = struct {
         ret_addr: usize,
     ) ?[*]u8 {
         const self: *VirtualMemoryManager = @alignCast(@ptrCast(ptr));
-        return self.backing_allocator.rawAlloc(
+        const maybe_vaddr = self.backing_allocator.rawAlloc(
             len,
             alignment,
             ret_addr,
         );
+        if (maybe_vaddr) |vaddr| {
+            const idx = self.vmm_allocations_idx;
+            self.vmm_allocations[idx].vaddr = @intFromPtr(vaddr);
+            self.vmm_allocations[idx].size = len;
+            self.vmm_allocations_idx += 1;
+        }
+        return maybe_vaddr;
     }
 
     // no op

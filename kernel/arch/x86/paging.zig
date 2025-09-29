@@ -4,7 +4,12 @@ const vga = @import("vga.zig");
 
 extern const _kernel_base_vaddr: u8;
 
-const PAGE_TABLE_SIZE = 512;
+pub const PAGE_TABLE_SIZE = 512;
+
+pub fn pml4SlotBase(slot: u9) u64 {
+    const raw: u64 = (@as(u64, slot) << 39);
+    return if ((raw & 1 << 47) != 0) (raw | 0xFFFF000000000000) else raw;
+}
 
 pub const PageSize = enum(u64) {
     Page4K = 4 * 1024,

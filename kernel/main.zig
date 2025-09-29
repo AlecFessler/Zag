@@ -3,16 +3,28 @@ const std = @import("std");
 const memory = @import("memory");
 const bump_alloc = memory.BumpAllocator;
 const buddy_alloc = memory.BuddyAllocator;
+const heap_alloc = memory.HeapAllocator;
+const pmm = memory.PhysicalMemoryManager;
+const vmm = memory.VirtualMemoryManager;
 const x86 = @import("x86");
 const paging = x86.Paging;
 const vga = x86.Vga;
+const interrupts = x86.Interrupts;
 const multiboot = @import("boot/grub/multiboot.zig");
 
 const BumpAllocator = bump_alloc.BumpAllocator;
 const BuddyAllocator = buddy_alloc.BuddyAllocator;
+const HeapAllocator = heap_alloc.HeapAllocator;
+const HeapTreeAllocator = heap_alloc.TreeAllocator;
+const PhysicalMemoryManager = pmm.PhysicalMemoryManager;
+const VirtualMemoryManager = vmm.VirtualMemoryManager;
 
 extern const _kernel_base_vaddr: u8;
 extern const _kernel_end: u8;
+
+const VMM_ADDR_SPACE_PML4_SLOT = 510;
+var virt_mem_mgr: VirtualMemoryManager = undefined;
+var phys_mem_mgr: PhysicalMemoryManager = undefined;
 
 export fn kmain(
     magic: u32,
@@ -20,12 +32,12 @@ export fn kmain(
 ) callconv(.c) void {
     vga.initialize(.White, .Black);
 
-    const kernel_base_vaddr: u64 = @intCast(@intFromPtr(&_kernel_base_vaddr));
-    const kernel_end: u64 = @intCast(@intFromPtr(&_kernel_end));
-
     if (magic != multiboot.MAGIC) {
         @panic("Not a multiboot compliant boot");
     }
+
+    const kernel_base_vaddr: u64 = @intCast(@intFromPtr(&_kernel_base_vaddr));
+    const kernel_end: u64 = @intCast(@intFromPtr(&_kernel_end));
 
     const mbi_vaddr: u64 = kernel_base_vaddr + mbi_paddr;
     const mbi: *const multiboot.MultibootInfo = @ptrFromInt(mbi_vaddr);
@@ -118,18 +130,79 @@ export fn kmain(
     );
     std.debug.assert(buddy_end_vaddr > buddy_start_vaddr);
 
-    const buddy_allocator: BuddyAllocator = BuddyAllocator.init(
+    var buddy_allocator: BuddyAllocator = BuddyAllocator.init(
         buddy_start_vaddr,
         buddy_end_vaddr,
         bump_alloc_iface,
     ) catch @panic("Failed to allocate memory for buddy allocator!");
     std.debug.assert(bump_allocator.free_addr <= buddy_start_vaddr);
+    const buddy_alloc_iface = buddy_allocator.allocator();
 
-    vga.print("Buddy start paddr {X} end paddr {X} free addr {X}\n", .{
-        buddy_allocator.start_addr,
-        buddy_allocator.end_addr,
-        bump_allocator.free_addr,
+    phys_mem_mgr = PhysicalMemoryManager.init(buddy_alloc_iface);
+
+    const page1G = @intFromEnum(paging.PageSize.Page1G);
+    const pml4_slot_size = page1G * paging.PAGE_TABLE_SIZE;
+    const vmm_start_vaddr = paging.pml4SlotBase(VMM_ADDR_SPACE_PML4_SLOT);
+    const vmm_end_vaddr = vmm_start_vaddr + pml4_slot_size;
+
+    var vmm_bump_allocator = BumpAllocator.init(vmm_start_vaddr, vmm_end_vaddr);
+    const vmm_bump_alloc_iface = vmm_bump_allocator.allocator();
+
+    virt_mem_mgr = VirtualMemoryManager.init(vmm_bump_alloc_iface);
+    const vmm_iface = virt_mem_mgr.allocator();
+
+    const heap_addr_space_size = pml4_slot_size / 2;
+    const heap_tree_addr_space_size = page1G;
+
+    const heap_addr_space_slice = vmm_iface.alloc(
+        u8,
+        heap_addr_space_size,
+    ) catch @panic("VMM doesn't have enough address space for heap allocator!");
+    const heap_tree_addr_space_slice = vmm_iface.alloc(
+        u8,
+        heap_tree_addr_space_size,
+    ) catch @panic("VMM Doesn't have enough address space for heap tree allocator!");
+
+    const heap_addr_space_start = @intFromPtr(heap_addr_space_slice.ptr);
+    const heap_addr_space_end = heap_addr_space_start + heap_addr_space_size;
+
+    const heap_tree_addr_space_start = @intFromPtr(heap_tree_addr_space_slice.ptr);
+    const heap_tree_addr_space_end = heap_tree_addr_space_start + heap_tree_addr_space_size;
+
+    vga.print("Heap addr space start {X} end {X} size {}\n", .{
+        heap_addr_space_start,
+        heap_addr_space_end,
+        heap_addr_space_size,
     });
+
+    vga.print("Heap tree addr space start {X} end {X} size {}\n", .{
+        heap_tree_addr_space_start,
+        heap_tree_addr_space_end,
+        heap_tree_addr_space_size,
+    });
+
+    //var heap_tree_allocator_backing = BumpAllocator.init(
+    //    heap_tree_addr_space_start,
+    //    heap_tree_addr_space_end,
+    //);
+    //const heap_tree_allocator_backing_iface = heap_tree_allocator_backing.allocator();
+
+    //var heap_tree_allocator = HeapTreeAllocator.init(
+    //    heap_tree_allocator_backing_iface,
+    //) catch @panic("Heap tree's backing allocator is OOM!");
+
+    //var heap_allocator = HeapAllocator.init(
+    //    @intCast(heap_addr_space_start),
+    //    @intCast(heap_addr_space_end),
+    //    &heap_tree_allocator,
+    //);
+    //const heap_alloc_iface = heap_allocator.allocator();
+
+    //const heap_buffer = heap_alloc_iface.alloc(u8, 10) catch @panic("Heap allocator OOM!");
+    //vga.print("Heap buffer ptr {X}", .{@intFromPtr(heap_buffer.ptr)});
+
+    //const is_valid_vaddr = virt_mem_mgr.isValidVaddr(@intFromPtr(heap_buffer.ptr));
+    //vga.print("Valid vaddr {}", .{is_valid_vaddr});
 
     while (true) {
         asm volatile ("hlt");
