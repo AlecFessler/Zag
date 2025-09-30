@@ -10,11 +10,11 @@ pub const SYSCALL_INT_VECTOR = 0x80;
 /// an error or not, so that a 0 error code can be pushed to
 /// the stack for those that do not, allowing for a single
 /// handler to route all interrupts through
-const PUSHES_ERR = [_]bool{
+const PUSHES_ERR = .{
     false, false, false, false, false, false, false, false,
     true,  false, true,  true,  true,  true,  false, false,
-    false, true,  false, false, false, false, false, false,
-    false, false, false, false, false, false, false, false,
+    false, true,  false, false, false, true,  false, false,
+    false, false, false, false, false, false, true,  false,
 };
 
 pub const EXCEPTION_STRS: [NUM_ISR_ENTRIES][]const u8 = .{
@@ -80,7 +80,7 @@ const IsrHandler = fn (*interrupts.InterruptContext) void;
 var isr_handlers: [NUM_ISR_ENTRIES]?IsrHandler = .{null} ** NUM_ISR_ENTRIES;
 var syscall_handler: ?IsrHandler = null;
 
-export fn isrDispatcher(ctx: *interrupts.InterruptContext) void {
+pub fn dispatchIsr(ctx: *interrupts.InterruptContext) void {
     std.debug.assert(ctx.int_num < NUM_ISR_ENTRIES or ctx.int_num == SYSCALL_INT_VECTOR);
 
     if (ctx.int_num == SYSCALL_INT_VECTOR) {
@@ -98,7 +98,7 @@ export fn isrDispatcher(ctx: *interrupts.InterruptContext) void {
     }
 }
 
-pub fn registerIsr(isr_num: u5, handler: IsrHandler) void {
+pub fn registerIsr(isr_num: u8, handler: IsrHandler) void {
     if (isr_num == SYSCALL_INT_VECTOR) {
         if (syscall_handler) |_| {
             @panic("Sycall handler already registered!\n");
@@ -117,11 +117,20 @@ pub fn registerIsr(isr_num: u5, handler: IsrHandler) void {
 pub fn init() void {
     for (0..NUM_ISR_ENTRIES) |i| {
         const int_stub = interrupts.getInterruptStub(i, PUSHES_ERR[i]);
+        const privilege = blk: {
+            switch (i) {
+                @intFromEnum(Exception.breakpoint_debug),
+                @intFromEnum(Exception.single_step_debug),
+                @intFromEnum(Exception.overflow),
+                => break :blk idt.PrivilegeLevel.ring_3,
+                else => idt.PrivilegeLevel.ring_0,
+            }
+        };
         idt.openInterruptGate(
             i,
             int_stub,
             0x08,
-            idt.PrivilegeLevel.ring_0,
+            privilege,
             idt.GateType.interrupt_gate,
         );
     }
@@ -133,7 +142,7 @@ pub fn init() void {
         SYSCALL_INT_VECTOR,
         int_stub,
         0x08,
-        idt.PrivilegeLevel.ring_0,
+        idt.PrivilegeLevel.ring_3,
         idt.GateType.interrupt_gate,
     );
 }

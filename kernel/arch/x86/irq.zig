@@ -10,7 +10,7 @@ const IrqHandler = fn (*interrupts.InterruptContext) void;
 
 var irq_handlers: [NUM_IRQ_ENTRIES]?IrqHandler = .{null} ** NUM_IRQ_ENTRIES;
 
-export fn isrDispatcher(ctx: *interrupts.InterruptContext) void {
+pub fn dispatchIrq(ctx: *interrupts.InterruptContext) void {
     // implement this once the pic driver is implemented
     _ = ctx;
     @panic("IRQ Dispatcher not yet implemented!\n");

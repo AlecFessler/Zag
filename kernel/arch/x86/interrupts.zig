@@ -3,15 +3,14 @@ const std = @import("std");
 const cpu = @import("cpu.zig");
 const idt = @import("idt.zig");
 const isr = @import("isr.zig");
+const irq = @import("irq.zig");
 
-extern fn isrDisptacher(ctx: *InterruptContext) void;
-extern fn irqDispatcher(ctx: *InterruptContext) void;
 
-export fn interruptDispatcher(ctx: *InterruptContext) void {
+export fn dispatchInterrupt(ctx: *InterruptContext) void {
     if (ctx.int_num < isr.NUM_ISR_ENTRIES or ctx.int_num == isr.SYSCALL_INT_VECTOR) {
-        isrDispatcher(ctx);
+        isr.dispatchIsr(ctx);
     } else {
-        irqDispatcher(ctx);
+        irq.dispatchIrq(ctx);
     }
 }
 
@@ -74,7 +73,7 @@ export fn interruptCommonStub() callconv(.Naked) void {
         "addq $16, %rsp\n\t"
         "iretq\n\t"
         :
-        : [dispatch] "r" (interruptDispatcher)
+        : [dispatch] "r" (dispatchInterrupt)
         :
     );
 }
