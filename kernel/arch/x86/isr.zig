@@ -130,12 +130,29 @@ pub fn registerIsr(isr_num: u8, handler: IsrHandler) void {
     }
 }
 
+fn divByZeroHandler(ctx: *interrupts.InterruptContext) void {
+    const cpl: u64 = ctx.cs & 3;
+    if (cpl == 0) {
+        @panic("Divide by zero in kernelspace!");
+    } else {
+        @panic("Divide by zero in userspace!");
+    }
+}
+
+fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
+    const cpl: u64 = ctx.cs & 3;
+    if (cpl == 0) {
+        @panic("Page fault in kernelspace!");
+    } else {
+        @panic("Page fault in userspace!");
+    }
+}
+
 pub fn init() void {
     for (0..NUM_ISR_ENTRIES) |i| {
         const privilege = switch (i) {
             @intFromEnum(Exception.breakpoint_debug),
             @intFromEnum(Exception.single_step_debug),
-            @intFromEnum(Exception.overflow),
             => idt.PrivilegeLevel.ring_3,
             else => idt.PrivilegeLevel.ring_0,
         };
@@ -160,13 +177,9 @@ pub fn init() void {
         @intFromEnum(Exception.divide_by_zero),
         divByZeroHandler,
     );
-}
 
-fn divByZeroHandler(ctx: *interrupts.InterruptContext) void {
-    const cpl: u64 = ctx.cs & 3;
-    if (cpl == 0) {
-        @panic("Divide by zero in kernelspace!");
-    } else {
-        @panic("Divide by zero in userspace");
-    }
+    registerIsr(
+        @intFromEnum(Exception.page_fault),
+        pageFaultHandler,
+    );
 }
