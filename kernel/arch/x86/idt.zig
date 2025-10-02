@@ -15,7 +15,7 @@ pub const PrivilegeLevel = enum(u2) {
     ring_3 = 0x3,
 };
 
-pub const interruptHandler = fn () callconv(.Naked) void;
+pub const interruptHandler = *const fn () callconv(.naked) void;
 
 const IDTEntry = packed struct {
     isr_base_low: u16,

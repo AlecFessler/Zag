@@ -10,7 +10,7 @@ pub const SYSCALL_INT_VECTOR = 0x80;
 /// an error or not, so that a 0 error code can be pushed to
 /// the stack for those that do not, allowing for a single
 /// handler to route all interrupts through
-const PUSHES_ERR = .{
+const PUSHES_ERR = [_]bool{
     false, false, false, false, false, false, false, false,
     true,  false, true,  true,  true,  true,  false, false,
     false, true,  false, false, false, true,  false, false,
@@ -75,7 +75,23 @@ pub const Exception = enum(u5) {
     security = 30,
 };
 
-const IsrHandler = fn (*interrupts.InterruptContext) void;
+const ISR_STUBS: [NUM_ISR_ENTRIES]idt.interruptHandler = blk: {
+    var arr: [NUM_ISR_ENTRIES]idt.interruptHandler = undefined;
+    for (0..NUM_ISR_ENTRIES) |i| {
+        arr[i] = interrupts.getInterruptStub(
+            @intCast(i),
+            PUSHES_ERR[i],
+        );
+    }
+    break :blk arr;
+};
+
+const SYSCALL_STUB: idt.interruptHandler = interrupts.getInterruptStub(
+    SYSCALL_INT_VECTOR,
+    false,
+);
+
+const IsrHandler = *const fn (*interrupts.InterruptContext) void;
 
 var isr_handlers: [NUM_ISR_ENTRIES]?IsrHandler = .{null} ** NUM_ISR_ENTRIES;
 var syscall_handler: ?IsrHandler = null;
@@ -116,33 +132,41 @@ pub fn registerIsr(isr_num: u8, handler: IsrHandler) void {
 
 pub fn init() void {
     for (0..NUM_ISR_ENTRIES) |i| {
-        const int_stub = interrupts.getInterruptStub(i, PUSHES_ERR[i]);
-        const privilege = blk: {
-            switch (i) {
-                @intFromEnum(Exception.breakpoint_debug),
-                @intFromEnum(Exception.single_step_debug),
-                @intFromEnum(Exception.overflow),
-                => break :blk idt.PrivilegeLevel.ring_3,
-                else => idt.PrivilegeLevel.ring_0,
-            }
+        const privilege = switch (i) {
+            @intFromEnum(Exception.breakpoint_debug),
+            @intFromEnum(Exception.single_step_debug),
+            @intFromEnum(Exception.overflow),
+            => idt.PrivilegeLevel.ring_3,
+            else => idt.PrivilegeLevel.ring_0,
         };
         idt.openInterruptGate(
-            i,
-            int_stub,
+            @intCast(i),
+            ISR_STUBS[i],
             0x08,
             privilege,
             idt.GateType.interrupt_gate,
         );
     }
-    const int_stub = interrupts.getInterruptStub(
-        SYSCALL_INT_VECTOR,
-        false,
-    );
+
     idt.openInterruptGate(
         SYSCALL_INT_VECTOR,
-        int_stub,
+        SYSCALL_STUB,
         0x08,
         idt.PrivilegeLevel.ring_3,
         idt.GateType.interrupt_gate,
     );
+
+    registerIsr(
+        @intFromEnum(Exception.divide_by_zero),
+        divByZeroHandler,
+    );
+}
+
+fn divByZeroHandler(ctx: *interrupts.InterruptContext) void {
+    const cpl: u64 = ctx.cs & 3;
+    if (cpl == 0) {
+        @panic("Divide by zero in kernelspace!");
+    } else {
+        @panic("Divide by zero in userspace");
+    }
 }

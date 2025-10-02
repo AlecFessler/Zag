@@ -9,6 +9,9 @@ const vmm = memory.VirtualMemoryManager;
 const x86 = @import("x86");
 const paging = x86.Paging;
 const vga = x86.Vga;
+const gdt = x86.Gdt;
+const idt = x86.Idt;
+const isr = x86.Isr;
 const interrupts = x86.Interrupts;
 const multiboot = @import("boot/grub/multiboot.zig");
 
@@ -27,6 +30,7 @@ var virt_mem_mgr: VirtualMemoryManager = undefined;
 var phys_mem_mgr: PhysicalMemoryManager = undefined;
 
 export fn kmain(
+    stack_top_vaddr: u64,
     magic: u32,
     mbi_paddr: u32,
 ) callconv(.c) void {
@@ -114,6 +118,19 @@ export fn kmain(
         current_paddr += page_size;
     }
 
+    const double_fault_stack_top = bump_alloc_iface.alloc(
+        paging.PageMem(paging.PageSize.Page4K),
+        1,
+    ) catch @panic("Kernel OOM!");
+    const double_fault_stack_top_vaddr = @intFromPtr(double_fault_stack_top.ptr);
+
+    gdt.init(
+        stack_top_vaddr,
+        double_fault_stack_top_vaddr,
+    );
+    idt.init();
+    isr.init();
+
     const buddy_metadata_bytes = BuddyAllocator.requiredMemory(
         bump_allocator.free_addr,
         bump_allocator.end_addr,
@@ -181,28 +198,28 @@ export fn kmain(
         heap_tree_addr_space_size,
     });
 
-    //var heap_tree_allocator_backing = BumpAllocator.init(
-    //    heap_tree_addr_space_start,
-    //    heap_tree_addr_space_end,
-    //);
-    //const heap_tree_allocator_backing_iface = heap_tree_allocator_backing.allocator();
+    var heap_tree_allocator_backing = BumpAllocator.init(
+        heap_tree_addr_space_start,
+        heap_tree_addr_space_end,
+    );
+    const heap_tree_allocator_backing_iface = heap_tree_allocator_backing.allocator();
 
-    //var heap_tree_allocator = HeapTreeAllocator.init(
-    //    heap_tree_allocator_backing_iface,
-    //) catch @panic("Heap tree's backing allocator is OOM!");
+    var heap_tree_allocator = HeapTreeAllocator.init(
+        heap_tree_allocator_backing_iface,
+    ) catch @panic("Heap tree's backing allocator is OOM!");
 
-    //var heap_allocator = HeapAllocator.init(
-    //    @intCast(heap_addr_space_start),
-    //    @intCast(heap_addr_space_end),
-    //    &heap_tree_allocator,
-    //);
-    //const heap_alloc_iface = heap_allocator.allocator();
+    var heap_allocator = HeapAllocator.init(
+        @intCast(heap_addr_space_start),
+        @intCast(heap_addr_space_end),
+        &heap_tree_allocator,
+    );
+    const heap_alloc_iface = heap_allocator.allocator();
 
-    //const heap_buffer = heap_alloc_iface.alloc(u8, 10) catch @panic("Heap allocator OOM!");
-    //vga.print("Heap buffer ptr {X}", .{@intFromPtr(heap_buffer.ptr)});
+    const heap_buffer = heap_alloc_iface.alloc(u8, 10) catch @panic("Heap allocator OOM!");
+    vga.print("Heap buffer ptr {X}", .{@intFromPtr(heap_buffer.ptr)});
 
-    //const is_valid_vaddr = virt_mem_mgr.isValidVaddr(@intFromPtr(heap_buffer.ptr));
-    //vga.print("Valid vaddr {}", .{is_valid_vaddr});
+    const is_valid_vaddr = virt_mem_mgr.isValidVaddr(@intFromPtr(heap_buffer.ptr));
+    vga.print("Valid vaddr {}", .{is_valid_vaddr});
 
     while (true) {
         asm volatile ("hlt");

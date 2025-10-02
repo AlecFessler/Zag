@@ -107,8 +107,9 @@ long_mode_entry:
 
     mov rsp, stack_top
 
-    mov edi, dword [saved_mb_magic]
-    mov esi, dword [saved_mb_info]
+    mov rdi, stack_top
+    mov esi, dword [saved_mb_magic]
+    mov edx, dword [saved_mb_info]
 
     mov qword [pml4], 0
     mov rax, cr3
