@@ -25,7 +25,7 @@ pub const InterruptContext = packed struct {
 };
 
 
-export fn interruptCommonStub() callconv(.naked) void {
+export fn commonInterruptStub() callconv(.naked) void {
     asm volatile (
         \\pushq %rax
         \\pushq %rcx
@@ -44,15 +44,10 @@ export fn interruptCommonStub() callconv(.naked) void {
         \\pushq %r15
         \\
         \\mov %rsp, %rdi
-        \\
-        \\mov %rsp, %r11
         \\andq $-16, %rsp
         \\subq $8, %rsp
-        \\
         \\call *%[dispatch]
-        \\
         \\addq $8, %rsp
-        \\mov %r11, %rsp
         \\
         \\popq %r15
         \\popq %r14
@@ -73,7 +68,7 @@ export fn interruptCommonStub() callconv(.naked) void {
         \\addq $16, %rsp
         \\iretq
         :
-        : [dispatch] "r" (dispatchInterrupt),
+        : [dispatch] "r" (dispatchInterrupt)
         : .{ .memory = true, .cc = true }
     );
 }
@@ -87,7 +82,7 @@ pub fn getInterruptStub(comptime int_num: u8, comptime pushes_err: bool) idt.int
                     \\jmp *%[common]
                     :
                     : [num] "r" (@as(usize, int_num)),
-                      [common] "r" (interruptCommonStub),
+                      [common] "r" (commonInterruptStub),
                 );
             } else {
                 asm volatile (
@@ -96,7 +91,7 @@ pub fn getInterruptStub(comptime int_num: u8, comptime pushes_err: bool) idt.int
                     \\jmp *%[common]
                     :
                     : [num] "r" (@as(usize, int_num)),
-                      [common] "r" (interruptCommonStub),
+                      [common] "r" (commonInterruptStub),
                 );
             }
         }

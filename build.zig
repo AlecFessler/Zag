@@ -70,6 +70,7 @@ pub fn build(b: *std.Build) void {
 
     memory_mod.addImport("containers", containers_mod);
     containers_mod.addImport("memory", memory_mod);
+    x86_mod.addImport("memory", memory_mod);
 
     kernel.root_module.addImport("memory", memory_mod);
     kernel.root_module.addImport("containers", containers_mod);

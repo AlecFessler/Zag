@@ -4,8 +4,8 @@ const memory = @import("memory");
 const bump_alloc = memory.BumpAllocator;
 const buddy_alloc = memory.BuddyAllocator;
 const heap_alloc = memory.HeapAllocator;
-const pmm = memory.PhysicalMemoryManager;
-const vmm = memory.VirtualMemoryManager;
+const pmm_mod = memory.PhysicalMemoryManager;
+const vmm_mod = memory.VirtualMemoryManager;
 const x86 = @import("x86");
 const paging = x86.Paging;
 const vga = x86.Vga;
@@ -19,15 +19,13 @@ const BumpAllocator = bump_alloc.BumpAllocator;
 const BuddyAllocator = buddy_alloc.BuddyAllocator;
 const HeapAllocator = heap_alloc.HeapAllocator;
 const HeapTreeAllocator = heap_alloc.TreeAllocator;
-const PhysicalMemoryManager = pmm.PhysicalMemoryManager;
-const VirtualMemoryManager = vmm.VirtualMemoryManager;
+const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
+const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
 
 extern const _kernel_base_vaddr: u8;
 extern const _kernel_end: u8;
 
 const VMM_ADDR_SPACE_PML4_SLOT = 510;
-var virt_mem_mgr: VirtualMemoryManager = undefined;
-var phys_mem_mgr: PhysicalMemoryManager = undefined;
 
 export fn kmain(
     stack_top_vaddr: u64,
@@ -155,7 +153,7 @@ export fn kmain(
     std.debug.assert(bump_allocator.free_addr <= buddy_start_vaddr);
     const buddy_alloc_iface = buddy_allocator.allocator();
 
-    phys_mem_mgr = PhysicalMemoryManager.init(buddy_alloc_iface);
+    pmm_mod.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
 
     const page1G = @intFromEnum(paging.PageSize.Page1G);
     const pml4_slot_size = page1G * paging.PAGE_TABLE_SIZE;
@@ -165,8 +163,8 @@ export fn kmain(
     var vmm_bump_allocator = BumpAllocator.init(vmm_start_vaddr, vmm_end_vaddr);
     const vmm_bump_alloc_iface = vmm_bump_allocator.allocator();
 
-    virt_mem_mgr = VirtualMemoryManager.init(vmm_bump_alloc_iface);
-    const vmm_iface = virt_mem_mgr.allocator();
+    vmm_mod.global_vmm = VirtualMemoryManager.init(vmm_bump_alloc_iface);
+    const vmm_iface = vmm_mod.global_vmm.?.allocator();
 
     const heap_addr_space_size = pml4_slot_size / 2;
     const heap_tree_addr_space_size = page1G;
@@ -217,9 +215,6 @@ export fn kmain(
 
     const heap_buffer = heap_alloc_iface.alloc(u8, 10) catch @panic("Heap allocator OOM!");
     vga.print("Heap buffer ptr {X}", .{@intFromPtr(heap_buffer.ptr)});
-
-    const is_valid_vaddr = virt_mem_mgr.isValidVaddr(@intFromPtr(heap_buffer.ptr));
-    vga.print("Valid vaddr {}", .{is_valid_vaddr});
 
     while (true) {
         asm volatile ("hlt");

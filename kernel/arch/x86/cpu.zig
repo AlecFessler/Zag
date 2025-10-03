@@ -23,3 +23,9 @@ pub fn read_cr2() u64 {
     );
     return v;
 }
+
+pub fn halt() noreturn {
+    while (true) {
+        asm volatile ("hlt");
+    }
+}

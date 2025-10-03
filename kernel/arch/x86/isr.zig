@@ -1,7 +1,19 @@
 const std = @import("std");
 
+const cpu = @import("cpu.zig");
 const idt = @import("idt.zig");
 const interrupts = @import("interrupts.zig");
+const paging = @import("paging.zig");
+const vga = @import("vga.zig");
+
+const memory = @import("memory");
+const pmm_mod = memory.PhysicalMemoryManager;
+const vmm_mod = memory.VirtualMemoryManager;
+
+const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
+const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
+
+extern const _kernel_base_vaddr: u8;
 
 pub const NUM_ISR_ENTRIES = 32;
 pub const SYSCALL_INT_VECTOR = 0x80;
@@ -140,11 +152,39 @@ fn divByZeroHandler(ctx: *interrupts.InterruptContext) void {
 }
 
 fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
+    if (pmm_mod.global_pmm == null) {
+        @panic("Page fault prior to pmm initialization!");
+    }
+    const kernel_base_vaddr: u64 = @intCast(@intFromPtr(&_kernel_base_vaddr));
+    const present = (ctx.err_code & 1) == 1;
     const cpl: u64 = ctx.cs & 3;
+    const faulting_vaddr = cpu.read_cr2();
+    const faulting_page_vaddr = std.mem.alignBackward(
+        u64,
+        faulting_vaddr,
+        @intFromEnum(paging.PageSize.Page4K),
+    );
     if (cpl == 0) {
-        @panic("Page fault in kernelspace!");
+        if (present) @panic("Invalid memory access in kernelspace!");
+        if (vmm_mod.global_vmm == null) {
+            @panic("Page fault prior to vmm initialization");
+        }
+        const pmm_iface = pmm_mod.global_pmm.?.allocator();
+        const page = pmm_iface.alloc(paging.PageMem(.Page4K), 1) catch @panic("PMM OOM!");
+        const phys_page_vaddr = @intFromPtr(page.ptr);
+        const phys_page_paddr = phys_page_vaddr - kernel_base_vaddr;
+        const pml4_vaddr = paging.read_cr3() + kernel_base_vaddr;
+        paging.mapPage(
+            @ptrFromInt(pml4_vaddr),
+            phys_page_paddr,
+            faulting_page_vaddr,
+            .ReadWrite,
+            .Supervisor,
+            .Page4K,
+            pmm_iface,
+        );
     } else {
-        @panic("Page fault in userspace!");
+        @panic("Userspace page fault handler not implemented!");
     }
 }
 
