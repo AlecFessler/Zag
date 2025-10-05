@@ -7,13 +7,14 @@ const heap_alloc = memory.HeapAllocator;
 const pmm_mod = memory.PhysicalMemoryManager;
 const vmm_mod = memory.VirtualMemoryManager;
 const x86 = @import("x86");
+const cpu = x86.Cpu;
 const paging = x86.Paging;
 const vga = x86.Vga;
 const gdt = x86.Gdt;
 const idt = x86.Idt;
 const isr = x86.Isr;
 const interrupts = x86.Interrupts;
-const multiboot = @import("boot/grub/multiboot.zig");
+const multiboot = x86.Multiboot;
 
 const BumpAllocator = bump_alloc.BumpAllocator;
 const BuddyAllocator = buddy_alloc.BuddyAllocator;
@@ -22,7 +23,6 @@ const HeapTreeAllocator = heap_alloc.TreeAllocator;
 const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
 const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
 
-extern const _kernel_base_vaddr: u8;
 extern const _kernel_end: u8;
 
 export fn kmain(
@@ -36,10 +36,6 @@ export fn kmain(
         @panic("Not a multiboot compliant boot");
     }
 
-    const kernel_base_vaddr: u64 = @intCast(@intFromPtr(&_kernel_base_vaddr));
-    const kernel_end: u64 = @intCast(@intFromPtr(&_kernel_end));
-
-    // Multiboot info comes in as a physical address; access it via physmap.
     const mbi_vaddr: u64 = paging.physToVirt(mbi_paddr);
     const mbi: *const multiboot.MultibootInfo = @ptrFromInt(mbi_vaddr);
 
@@ -48,9 +44,10 @@ export fn kmain(
     }
 
     var memory_regions_buffer: [multiboot.MAX_REGIONS]multiboot.MemoryRegion = undefined;
-    const memory_regions: []multiboot.MemoryRegion = multiboot.parseMemoryMap(mbi, &memory_regions_buffer);
-
-    const page4K = @intFromEnum(paging.PageSize.Page4K);
+    const memory_regions: []multiboot.MemoryRegion = multiboot.parseMemoryMap(
+        mbi,
+        &memory_regions_buffer,
+    );
 
     var max_end_paddr: u64 = 0;
     for (memory_regions) |region| {
@@ -58,12 +55,22 @@ export fn kmain(
         const end_paddr = region.addr + region.len;
         if (end_paddr > max_end_paddr) max_end_paddr = end_paddr;
     }
-
-    const kernel_end_paddr = kernel_end - kernel_base_vaddr;
     const region_end_vaddr = paging.physToVirt(max_end_paddr);
 
+    const kernel_end: u64 = @intCast(@intFromPtr(&_kernel_end));
+    const kernel_end_paddr = paging.virtToPhys(kernel_end);
+    const page4K = @intFromEnum(paging.PageSize.Page4K);
+    const page4k_align = std.mem.Alignment.fromByteUnits(page4K);
+
+    const useable_region_start_paddr = std.mem.alignForward(
+        u64,
+        kernel_end_paddr,
+        page4K,
+    );
+    const useable_region_start_vaddr = paging.physToVirt(useable_region_start_paddr);
+
     var bump_allocator = BumpAllocator.init(
-        paging.physToVirt(std.mem.alignForward(u64, kernel_end_paddr, page4K)),
+        useable_region_start_vaddr,
         region_end_vaddr,
     );
     const bump_alloc_iface = bump_allocator.allocator();
@@ -71,11 +78,23 @@ export fn kmain(
     for (memory_regions) |region| {
         if (region.region_type != multiboot.MemoryRegionType.Available) continue;
 
-        const start = std.mem.alignForward(u64, region.addr, page4K);
-        const end = std.mem.alignBackward(u64, region.addr + region.len, page4K);
-        if (end <= start) continue;
+        const start_paddr = std.mem.alignForward(
+            u64,
+            region.addr,
+            page4K,
+        );
+        const end_paddr = std.mem.alignBackward(
+            u64,
+            region.addr + region.len,
+            page4K,
+        );
+        if (end_paddr <= start_paddr) continue;
 
-        paging.mapRegion(start, end, bump_alloc_iface);
+        paging.physMapRegion(
+            start_paddr,
+            end_paddr,
+            bump_alloc_iface,
+        );
     }
 
     const double_fault_stack_top = bump_alloc_iface.alloc(
@@ -119,31 +138,28 @@ export fn kmain(
 
     const page1G = @intFromEnum(paging.PageSize.Page1G);
     const pml4_slot_size = page1G * paging.PAGE_TABLE_SIZE;
-    const vmm_start_vaddr = paging.pml4SlotBase(paging.VMM_ADDR_SPACE_PML4_SLOT);
+    const vmm_start_vaddr = paging.pml4SlotBase(@intFromEnum(paging.AddressSpace.kvmm));
     const vmm_end_vaddr = vmm_start_vaddr + pml4_slot_size;
 
-    var vmm_bump_allocator = BumpAllocator.init(vmm_start_vaddr, vmm_end_vaddr);
-    const vmm_bump_alloc_iface = vmm_bump_allocator.allocator();
-
-    vmm_mod.global_vmm = VirtualMemoryManager.init(vmm_bump_alloc_iface);
-    const vmm_iface = vmm_mod.global_vmm.?.allocator();
+    vmm_mod.global_vmm = VirtualMemoryManager.init(
+        vmm_start_vaddr,
+        vmm_end_vaddr,
+    );
+    var vmm = &vmm_mod.global_vmm.?;
 
     const heap_addr_space_size = pml4_slot_size / 2;
     const heap_tree_addr_space_size = page1G;
 
-    const heap_addr_space_slice = vmm_iface.alloc(
-        u8,
+    const heap_addr_space_start = vmm.reserve(
         heap_addr_space_size,
+        page4k_align,
     ) catch @panic("VMM doesn't have enough address space for heap allocator!");
-    const heap_tree_addr_space_slice = vmm_iface.alloc(
-        u8,
-        heap_tree_addr_space_size,
-    ) catch @panic("VMM Doesn't have enough address space for heap tree allocator!");
-
-    const heap_addr_space_start = @intFromPtr(heap_addr_space_slice.ptr);
     const heap_addr_space_end = heap_addr_space_start + heap_addr_space_size;
 
-    const heap_tree_addr_space_start = @intFromPtr(heap_tree_addr_space_slice.ptr);
+    const heap_tree_addr_space_start = vmm.reserve(
+        heap_tree_addr_space_size,
+        page4k_align,
+    ) catch @panic("VMM doesn't have enough address space for heap tree allocator!");
     const heap_tree_addr_space_end = heap_tree_addr_space_start + heap_tree_addr_space_size;
 
     vga.print("Heap addr space start {X} end {X} size {}\n", .{
@@ -151,7 +167,6 @@ export fn kmain(
         heap_addr_space_end,
         heap_addr_space_size,
     });
-
     vga.print("Heap tree addr space start {X} end {X} size {}\n", .{
         heap_tree_addr_space_start,
         heap_tree_addr_space_end,
@@ -178,9 +193,7 @@ export fn kmain(
     const heap_buffer = heap_alloc_iface.alloc(u8, 10) catch @panic("Heap allocator OOM!");
     vga.print("Heap buffer ptr {X}", .{@intFromPtr(heap_buffer.ptr)});
 
-    while (true) {
-        asm volatile ("hlt");
-    }
+    cpu.halt();
 }
 
 pub fn panic(
@@ -195,7 +208,5 @@ pub fn panic(
     } else {
         vga.print("KERNEL PANIC: {s}\n", .{msg});
     }
-    while (true) {
-        asm volatile ("hlt");
-    }
+    cpu.halt();
 }

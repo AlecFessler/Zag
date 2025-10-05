@@ -8,7 +8,7 @@
 //! This is typically used during early kernel initialization to inspect the memory map
 //! and retrieve configuration data provided by the bootloader.
 
-extern const _kernel_base_vaddr: u8;
+const paging = @import("paging.zig");
 
 pub const MAGIC = 0x2BADB002;
 pub const MAX_REGIONS = 32;
@@ -172,8 +172,7 @@ pub const MemoryRegion = struct {
 };
 
 pub fn parseMemoryMap(info: *const MultibootInfo, regions: *[MAX_REGIONS]MemoryRegion) []MemoryRegion {
-    const kernel_base_vaddr = @intFromPtr(&_kernel_base_vaddr);
-    var mmap_ptr: u64 = info.mmap_addr + kernel_base_vaddr;
+    var mmap_ptr: u64 = paging.physToVirt(info.mmap_addr);
     const mmap_end: u64 = mmap_ptr + info.mmap_len;
     var i: usize = 0;
     while (mmap_ptr < mmap_end) : (i += 1) {

@@ -29,7 +29,12 @@ const IDTEntry = packed struct {
     isr_base_mid: u16,
     isr_base_high: u32,
     _reserved1: u32 = 0,
+
 };
+
+comptime {
+    std.debug.assert(@sizeOf(IDTEntry) == 16);
+}
 
 const IDTPtr = packed struct {
     limit: u16,

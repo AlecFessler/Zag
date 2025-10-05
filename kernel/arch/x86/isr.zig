@@ -228,9 +228,11 @@ fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
 
     if (cpl == 0) {
         if (present) @panic("Invalid memory access in kernelspace!");
-
         if (vmm_mod.global_vmm == null) {
             @panic("Page fault prior to vmm initialization");
+        }
+        if (!vmm_mod.global_vmm.?.isValidVaddr(faulting_page_vaddr)) {
+            @panic("Invalid faulting address in kernel");
         }
 
         const pmm_iface = pmm_mod.global_pmm.?.allocator();

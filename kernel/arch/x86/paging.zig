@@ -4,24 +4,7 @@ const vga = @import("vga.zig");
 
 extern const _kernel_base_vaddr: u8;
 
-pub const PMM_ADDR_SPACE_PML4_SLOT = 510;
-pub const VMM_ADDR_SPACE_PML4_SLOT = 509;
-
 pub const PAGE_TABLE_SIZE = 512;
-
-pub fn pml4SlotBase(slot: u9) u64 {
-    const raw: u64 = (@as(u64, slot) << 39);
-    return if ((raw & 1 << 47) != 0) (raw | 0xFFFF000000000000) else raw;
-}
-
-pub fn physToVirt(paddr: u64) u64 {
-    return pml4SlotBase(PMM_ADDR_SPACE_PML4_SLOT) + paddr;
-}
-
-pub fn virtToPhys(vaddr: u64) u64 {
-    std.debug.assert(pml4_index(vaddr) == PMM_ADDR_SPACE_PML4_SLOT);
-    return vaddr - pml4SlotBase(PMM_ADDR_SPACE_PML4_SLOT);
-}
 
 pub const PageSize = enum(u64) {
     Page4K = 4 * 1024,
@@ -89,7 +72,28 @@ const PDPTEntry = PageEntry;
 const PDEntry = PageEntry;
 const PTEntry = PageEntry;
 
-fn pml4_index(vaddr: u64) u9 {
+pub const AddressSpace = enum(u9) {
+    pmm = 511,
+    kvmm = 510,
+    uvmm = 509,
+};
+
+pub fn pml4SlotBase(slot: u9) u64 {
+    const raw: u64 = (@as(u64, slot) << 39);
+    return if ((raw & 1 << 47) != 0) (raw | 0xFFFF000000000000) else raw;
+}
+
+pub fn physToVirt(paddr: u64) u64 {
+    const kernel_base_vaddr: u64 = @intCast(@intFromPtr(&_kernel_base_vaddr));
+    return paddr + kernel_base_vaddr;
+}
+
+pub fn virtToPhys(vaddr: u64) u64 {
+    const kernel_base_vaddr: u64 = @intCast(@intFromPtr(&_kernel_base_vaddr));
+    return vaddr - kernel_base_vaddr;
+}
+
+pub fn pml4_index(vaddr: u64) u9 {
     return @truncate(vaddr >> @intFromEnum(PageLevelShift.PML4));
 }
 
@@ -122,7 +126,7 @@ pub fn write_cr3(pml4: [*]PageEntry) void {
 }
 
 /// Maps a region with the fewest possible page entries by prefering larger pages
-pub fn mapRegion(
+pub fn physMapRegion(
     start_paddr: u64,
     end_paddr: u64,
     allocator: std.mem.Allocator,
@@ -136,10 +140,9 @@ pub fn mapRegion(
     std.debug.assert(std.mem.isAligned(end_paddr, page4K));
 
     const vaddr_start = physToVirt(start_paddr);
-    const vaddr_end   = physToVirt(end_paddr);
+
+    const vaddr_end = physToVirt(end_paddr);
     std.debug.assert(vaddr_end > vaddr_start);
-    std.debug.assert(pml4_index(vaddr_start) == PMM_ADDR_SPACE_PML4_SLOT);
-    std.debug.assert(pml4_index(vaddr_end - 1) == PMM_ADDR_SPACE_PML4_SLOT);
 
     const pml4_paddr = read_cr3() & ~@as(u64, 0xfff);
     const pml4_vaddr = physToVirt(pml4_paddr);
@@ -237,9 +240,13 @@ pub fn mapPage(
         ) catch @panic("Went OOM maping pages!");
         @memset(new_pdpt, default_flags);
         pdpt_entry.* = flags;
-        pdpt_entry.setPaddr(@intCast(virtToPhys(@intFromPtr(new_pdpt.ptr))));
+        pdpt_entry.setPaddr(@intCast(virtToPhys(
+            @intFromPtr(new_pdpt.ptr)
+        )));
     }
-    const pdpt: [*]PDPTEntry = @ptrFromInt(physToVirt(pdpt_entry.getPaddr()));
+    const pdpt: [*]PDPTEntry = @ptrFromInt(physToVirt(
+        pdpt_entry.getPaddr()
+    ));
 
     if (page_size == .Page1G) {
         var entry = &pdpt[pdpt_idx];
@@ -258,9 +265,13 @@ pub fn mapPage(
         ) catch @panic("Went OOM maping pages!");
         @memset(new_pd, default_flags);
         pd_entry.* = flags;
-        pd_entry.setPaddr(@intCast(virtToPhys(@intFromPtr(new_pd.ptr))));
+        pd_entry.setPaddr(@intCast(virtToPhys(
+            @intFromPtr(new_pd.ptr)
+        )));
     }
-    const pd: [*]PDEntry = @ptrFromInt(physToVirt(pd_entry.getPaddr()));
+    const pd: [*]PDEntry = @ptrFromInt(physToVirt(
+        pd_entry.getPaddr()
+    ));
 
     if (page_size == .Page2M) {
         var entry = &pd[pd_idx];
@@ -279,9 +290,13 @@ pub fn mapPage(
         ) catch @panic("Went OOM maping pages!");
         @memset(new_pt, default_flags);
         pt_entry.* = flags;
-        pt_entry.setPaddr(@intCast(virtToPhys(@intFromPtr(new_pt.ptr))));
+        pt_entry.setPaddr(@intCast(virtToPhys(
+            @intFromPtr(new_pt.ptr)
+        )));
     }
-    const pt: [*]PTEntry = @ptrFromInt(physToVirt(pt_entry.getPaddr()));
+    const pt: [*]PTEntry = @ptrFromInt(physToVirt(
+        pt_entry.getPaddr()
+    ));
 
     pt[pt_idx] = flags;
     pt[pt_idx].setPaddr(@intCast(paddr));

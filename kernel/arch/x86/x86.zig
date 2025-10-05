@@ -6,3 +6,4 @@ pub const Idt = @import("idt.zig");
 pub const Interrupts = @import("interrupts.zig");
 pub const Isr = @import("isr.zig");
 pub const Irq = @import("irq.zig");
+pub const Multiboot = @import("multiboot.zig");
