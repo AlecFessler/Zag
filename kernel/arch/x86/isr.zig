@@ -13,8 +13,6 @@ const vmm_mod = memory.VirtualMemoryManager;
 const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
 const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
 
-extern const _kernel_base_vaddr: u8;
-
 pub const NUM_ISR_ENTRIES = 32;
 pub const SYSCALL_INT_VECTOR = 0x80;
 
@@ -23,10 +21,73 @@ pub const SYSCALL_INT_VECTOR = 0x80;
 /// the stack for those that do not, allowing for a single
 /// handler to route all interrupts through
 const PUSHES_ERR = [_]bool{
-    false, false, false, false, false, false, false, false,
-    true,  false, true,  true,  true,  true,  false, false,
-    false, true,  false, false, false, true,  false, false,
-    false, false, false, false, false, false, true,  false,
+    //  0: #DE Divide Error
+    false,
+    //  1: #DB Debug Exception
+    false,
+    //  2: NMI Interrupt
+    false,
+    //  3: #BP Breakpoint
+    false,
+    //  4: #OF Overflow
+    false,
+    //  5: #BR BOUND Range Exceeded
+    false,
+    //  6: #UD Invalid Opcode
+    false,
+    //  7: #NM Device Not Available
+    false,
+
+    //  8: #DF Double Fault
+    true,
+    //  9: Coprocessor Segment Overrun
+    false,
+    // 10: #TS Invalid TSS
+    true,
+    // 11: #NP Segment Not Present
+    true,
+    // 12: #SS Stack Segment Fault
+    true,
+    // 13: #GP General Protection Fault
+    true,
+    // 14: #PF Page Fault
+    true,
+    // 15: #MF x87 FPU Floating-Point Error
+    false,
+
+    // 16: #AC Alignment Check
+    true,
+    // 17: #MC Machine Check
+    false,
+    // 18: #XM SIMD Floating-Point Exception
+    false,
+    // 19: #VE Virtualization Exception
+    false,
+    // 20: #CP Control Protection
+    true,
+    // 21: Reserved
+    false,
+    // 22: Reserved
+    false,
+    // 23: Reserved
+    false,
+
+    // 24: Reserved
+    false,
+    // 25: Reserved
+    false,
+    // 26: Reserved
+    false,
+    // 27: Reserved
+    false,
+    // 28: Reserved
+    false,
+    // 29: Reserved
+    false,
+    // 30: #SX Security Exception
+    true,
+    // 31: Reserved (Triple Fault)
+    false,
 };
 
 pub const EXCEPTION_STRS: [NUM_ISR_ENTRIES][]const u8 = .{
@@ -155,7 +216,7 @@ fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
     if (pmm_mod.global_pmm == null) {
         @panic("Page fault prior to pmm initialization!");
     }
-    const kernel_base_vaddr: u64 = @intCast(@intFromPtr(&_kernel_base_vaddr));
+
     const present = (ctx.err_code & 1) == 1;
     const cpl: u64 = ctx.cs & 3;
     const faulting_vaddr = cpu.read_cr2();
@@ -164,16 +225,22 @@ fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
         faulting_vaddr,
         @intFromEnum(paging.PageSize.Page4K),
     );
+
     if (cpl == 0) {
         if (present) @panic("Invalid memory access in kernelspace!");
+
         if (vmm_mod.global_vmm == null) {
             @panic("Page fault prior to vmm initialization");
         }
+
         const pmm_iface = pmm_mod.global_pmm.?.allocator();
         const page = pmm_iface.alloc(paging.PageMem(.Page4K), 1) catch @panic("PMM OOM!");
         const phys_page_vaddr = @intFromPtr(page.ptr);
-        const phys_page_paddr = phys_page_vaddr - kernel_base_vaddr;
-        const pml4_vaddr = paging.read_cr3() + kernel_base_vaddr;
+        const phys_page_paddr = paging.virtToPhys(phys_page_vaddr);
+
+        const pml4_paddr = paging.read_cr3() & ~@as(u64, 0xfff);
+        const pml4_vaddr = paging.physToVirt(pml4_paddr);
+
         paging.mapPage(
             @ptrFromInt(pml4_vaddr),
             phys_page_paddr,
@@ -183,6 +250,8 @@ fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
             .Page4K,
             pmm_iface,
         );
+
+        cpu.invlpg(faulting_page_vaddr);
     } else {
         @panic("Userspace page fault handler not implemented!");
     }

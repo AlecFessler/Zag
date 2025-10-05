@@ -1,4 +1,6 @@
 const std = @import("std");
+
+const cpu = @import("cpu.zig");
 const idt = @import("idt.zig");
 
 const GdtEntry = packed struct {
@@ -216,5 +218,6 @@ pub fn init(kernel_stack_top: u64, double_fault_stack_top: u64) void {
     gdt_ptr.base = @intFromPtr(&gdt_entries[0]);
 
     lgdt(&gdt_ptr);
+    cpu.reloadSegments();
     ltr(TSS_OFFSET);
 }

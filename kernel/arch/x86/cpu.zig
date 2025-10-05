@@ -29,3 +29,29 @@ pub fn halt() noreturn {
         asm volatile ("hlt");
     }
 }
+
+pub fn invlpg(vaddr: u64) void {
+    asm volatile (
+        \\invlpg (%[a])
+        :
+        : [a] "r" (vaddr)
+        : .{ .memory = true }
+    );
+}
+
+pub fn reloadSegments() void {
+    asm volatile (
+        \\pushq $0x08
+        \\leaq 1f(%%rip), %%rax
+        \\pushq %%rax
+        \\lretq
+        \\1:
+        \\mov $0x10, %%ax
+        \\mov %%ax, %%ds
+        \\mov %%ax, %%es
+        \\mov %%ax, %%ss
+        :
+        :
+        : .{ .memory = true }
+    );
+}

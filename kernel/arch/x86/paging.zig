@@ -4,11 +4,23 @@ const vga = @import("vga.zig");
 
 extern const _kernel_base_vaddr: u8;
 
+pub const PMM_ADDR_SPACE_PML4_SLOT = 510;
+pub const VMM_ADDR_SPACE_PML4_SLOT = 509;
+
 pub const PAGE_TABLE_SIZE = 512;
 
 pub fn pml4SlotBase(slot: u9) u64 {
     const raw: u64 = (@as(u64, slot) << 39);
     return if ((raw & 1 << 47) != 0) (raw | 0xFFFF000000000000) else raw;
+}
+
+pub fn physToVirt(paddr: u64) u64 {
+    return pml4SlotBase(PMM_ADDR_SPACE_PML4_SLOT) + paddr;
+}
+
+pub fn virtToPhys(vaddr: u64) u64 {
+    std.debug.assert(pml4_index(vaddr) == PMM_ADDR_SPACE_PML4_SLOT);
+    return vaddr - pml4SlotBase(PMM_ADDR_SPACE_PML4_SLOT);
 }
 
 pub const PageSize = enum(u64) {
@@ -109,6 +121,53 @@ pub fn write_cr3(pml4: [*]PageEntry) void {
         : .{ .memory = true });
 }
 
+/// Maps a region with the fewest possible page entries by prefering larger pages
+pub fn mapRegion(
+    start_paddr: u64,
+    end_paddr: u64,
+    allocator: std.mem.Allocator,
+) void {
+    const page4K = @intFromEnum(PageSize.Page4K);
+    const page2M = @intFromEnum(PageSize.Page2M);
+    const page1G = @intFromEnum(PageSize.Page1G);
+
+    std.debug.assert(end_paddr > start_paddr);
+    std.debug.assert(std.mem.isAligned(start_paddr, page4K));
+    std.debug.assert(std.mem.isAligned(end_paddr, page4K));
+
+    const vaddr_start = physToVirt(start_paddr);
+    const vaddr_end   = physToVirt(end_paddr);
+    std.debug.assert(vaddr_end > vaddr_start);
+    std.debug.assert(pml4_index(vaddr_start) == PMM_ADDR_SPACE_PML4_SLOT);
+    std.debug.assert(pml4_index(vaddr_end - 1) == PMM_ADDR_SPACE_PML4_SLOT);
+
+    const pml4_paddr = read_cr3() & ~@as(u64, 0xfff);
+    const pml4_vaddr = physToVirt(pml4_paddr);
+
+    var paddr = start_paddr;
+    while (paddr < end_paddr) {
+        const remaining = end_paddr - paddr;
+        const chosen_size: u64 = blk: {
+            if (std.mem.isAligned(paddr, page1G) and remaining >= page1G) break :blk page1G;
+            if (std.mem.isAligned(paddr, page2M) and remaining >= page2M) break :blk page2M;
+            break :blk page4K;
+        };
+        const size: PageSize = @enumFromInt(chosen_size);
+
+        mapPage(
+            @ptrFromInt(pml4_vaddr),
+            paddr,
+            physToVirt(paddr),
+            RW.ReadWrite,
+            User.Supervisor,
+            size,
+            allocator,
+        );
+
+        paddr += chosen_size;
+    }
+}
+
 pub fn mapPage(
     pml4: [*]PML4Entry,
     paddr: u64,
@@ -169,8 +228,6 @@ pub fn mapPage(
     std.debug.assert(pd_idx < 512);
     std.debug.assert(pt_idx < 512);
 
-    const kernel_base_vaddr = @intFromPtr(&_kernel_base_vaddr);
-
     var pdpt_entry = &pml4[pml4_idx];
     if (!pdpt_entry.present) {
         const new_pdpt: []align(PAGE_ALIGN.toByteUnits()) PDPTEntry = allocator.alignedAlloc(
@@ -180,15 +237,15 @@ pub fn mapPage(
         ) catch @panic("Went OOM maping pages!");
         @memset(new_pdpt, default_flags);
         pdpt_entry.* = flags;
-        pdpt_entry.setPaddr(@intCast(@intFromPtr(new_pdpt.ptr) - kernel_base_vaddr));
+        pdpt_entry.setPaddr(@intCast(virtToPhys(@intFromPtr(new_pdpt.ptr))));
     }
-    const pdpt: [*]PDPTEntry = @ptrFromInt(pdpt_entry.getPaddr() + kernel_base_vaddr);
+    const pdpt: [*]PDPTEntry = @ptrFromInt(physToVirt(pdpt_entry.getPaddr()));
 
     if (page_size == .Page1G) {
         var entry = &pdpt[pdpt_idx];
         entry.* = flags;
         entry.huge_page = true;
-        entry.addr = @intCast(paddr);
+        entry.setPaddr(paddr);
         return;
     }
 
@@ -201,15 +258,15 @@ pub fn mapPage(
         ) catch @panic("Went OOM maping pages!");
         @memset(new_pd, default_flags);
         pd_entry.* = flags;
-        pd_entry.setPaddr(@intCast(@intFromPtr(new_pd.ptr) - kernel_base_vaddr));
+        pd_entry.setPaddr(@intCast(virtToPhys(@intFromPtr(new_pd.ptr))));
     }
-    const pd: [*]PDEntry = @ptrFromInt(pd_entry.getPaddr() + kernel_base_vaddr);
+    const pd: [*]PDEntry = @ptrFromInt(physToVirt(pd_entry.getPaddr()));
 
     if (page_size == .Page2M) {
         var entry = &pd[pd_idx];
         entry.* = flags;
         entry.huge_page = true;
-        entry.addr = @intCast(paddr);
+        entry.setPaddr(paddr);
         return;
     }
 
@@ -222,9 +279,9 @@ pub fn mapPage(
         ) catch @panic("Went OOM maping pages!");
         @memset(new_pt, default_flags);
         pt_entry.* = flags;
-        pt_entry.setPaddr(@intCast(@intFromPtr(new_pt.ptr) - kernel_base_vaddr));
+        pt_entry.setPaddr(@intCast(virtToPhys(@intFromPtr(new_pt.ptr))));
     }
-    const pt: [*]PTEntry = @ptrFromInt(pt_entry.getPaddr() + kernel_base_vaddr);
+    const pt: [*]PTEntry = @ptrFromInt(physToVirt(pt_entry.getPaddr()));
 
     pt[pt_idx] = flags;
     pt[pt_idx].setPaddr(@intCast(paddr));

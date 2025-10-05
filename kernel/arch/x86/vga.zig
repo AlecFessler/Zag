@@ -1,6 +1,6 @@
 const std = @import("std");
 
-extern const _kernel_base_vaddr: u8;
+const paging = @import("paging.zig");
 
 const VGA_BUFFER_PADDR = 0xB8000;
 const VGA_WIDTH = 80;
@@ -27,17 +27,13 @@ pub const VgaColor = enum(u8) {
     White,
 };
 
-/// Kernel vma and by consequence, the vga text buffer pointer, are runtime known
-/// and thus are initialized in initialize()
 var buffer: [*]volatile u16 = undefined;
 var row: u64 = 0;
 var column: u64 = 0;
 var color: u8 = 0;
-var kernel_base_vaddr: u64 = undefined;
 
 pub fn initialize(foreground: VgaColor, background: VgaColor) void {
-    kernel_base_vaddr = @intFromPtr(&_kernel_base_vaddr);
-    buffer = @ptrFromInt(VGA_BUFFER_PADDR + kernel_base_vaddr);
+    buffer = @ptrFromInt(paging.physToVirt(VGA_BUFFER_PADDR));
     setColor(foreground, background);
     clear();
 }
@@ -57,11 +53,7 @@ pub fn setColor(foreground: VgaColor, background: VgaColor) void {
 
 pub fn print(comptime format: []const u8, args: anytype) void {
     var temp_buffer: [TEMP_BUFFER_SIZE]u8 = undefined;
-    const out = std.fmt.bufPrint(
-        temp_buffer[0..],
-        format,
-        args,
-    ) catch @panic("Print would be truncated!");
+    const out = std.fmt.bufPrint(temp_buffer[0..], format, args) catch @panic("Print would be truncated!");
     for (out) |c| {
         if (c == '\n') {
             column = 0;

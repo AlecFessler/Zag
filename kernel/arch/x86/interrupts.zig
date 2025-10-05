@@ -44,10 +44,15 @@ export fn commonInterruptStub() callconv(.naked) void {
         \\pushq %r15
         \\
         \\mov %rsp, %rdi
+        \\
+        \\mov %rsp, %r11
         \\andq $-16, %rsp
         \\subq $8, %rsp
+        \\
         \\call *%[dispatch]
+        \\
         \\addq $8, %rsp
+        \\mov %r11, %rsp
         \\
         \\popq %r15
         \\popq %r14
@@ -68,7 +73,7 @@ export fn commonInterruptStub() callconv(.naked) void {
         \\addq $16, %rsp
         \\iretq
         :
-        : [dispatch] "r" (dispatchInterrupt)
+        : [dispatch] "r" (dispatchInterrupt),
         : .{ .memory = true, .cc = true }
     );
 }

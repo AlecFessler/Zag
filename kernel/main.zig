@@ -25,8 +25,6 @@ const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
 extern const _kernel_base_vaddr: u8;
 extern const _kernel_end: u8;
 
-const VMM_ADDR_SPACE_PML4_SLOT = 510;
-
 export fn kmain(
     stack_top_vaddr: u64,
     magic: u32,
@@ -41,7 +39,8 @@ export fn kmain(
     const kernel_base_vaddr: u64 = @intCast(@intFromPtr(&_kernel_base_vaddr));
     const kernel_end: u64 = @intCast(@intFromPtr(&_kernel_end));
 
-    const mbi_vaddr: u64 = kernel_base_vaddr + mbi_paddr;
+    // Multiboot info comes in as a physical address; access it via physmap.
+    const mbi_vaddr: u64 = paging.physToVirt(mbi_paddr);
     const mbi: *const multiboot.MultibootInfo = @ptrFromInt(mbi_vaddr);
 
     if (!multiboot.checkFlag(mbi.flags, 6)) {
@@ -50,70 +49,33 @@ export fn kmain(
 
     var memory_regions_buffer: [multiboot.MAX_REGIONS]multiboot.MemoryRegion = undefined;
     const memory_regions: []multiboot.MemoryRegion = multiboot.parseMemoryMap(mbi, &memory_regions_buffer);
-    var largest_available_region: multiboot.MemoryRegion = .{
-        .addr = 0,
-        .len = 0,
-        .region_type = multiboot.MemoryRegionType.Available,
-    };
+
+    const page4K = @intFromEnum(paging.PageSize.Page4K);
+
+    var max_end_paddr: u64 = 0;
     for (memory_regions) |region| {
-        if (region.region_type != multiboot.MemoryRegionType.Available) {
-            continue;
-        }
-        if (region.len > largest_available_region.len) {
-            largest_available_region = region;
-        }
-    }
-    if (largest_available_region.len == 0) {
-        @panic("Failed to find suitable memory region in mmap!");
+        if (region.region_type != multiboot.MemoryRegionType.Available) continue;
+        const end_paddr = region.addr + region.len;
+        if (end_paddr > max_end_paddr) max_end_paddr = end_paddr;
     }
 
-    const region_end_paddr = largest_available_region.addr + largest_available_region.len;
-    const region_end_vaddr = region_end_paddr + kernel_base_vaddr;
-    const useable_region_start_paddr = kernel_end - kernel_base_vaddr;
-    const useable_region_start_vaddr = kernel_end;
+    const kernel_end_paddr = kernel_end - kernel_base_vaddr;
+    const region_end_vaddr = paging.physToVirt(max_end_paddr);
 
     var bump_allocator = BumpAllocator.init(
-        useable_region_start_vaddr,
+        paging.physToVirt(std.mem.alignForward(u64, kernel_end_paddr, page4K)),
         region_end_vaddr,
     );
     const bump_alloc_iface = bump_allocator.allocator();
 
-    const page4K = @intFromEnum(paging.PageSize.Page4K);
-    const page2M = @intFromEnum(paging.PageSize.Page2M);
-    const pml4_paddr = paging.read_cr3();
-    const pml4_vaddr = pml4_paddr + kernel_base_vaddr;
-    const aligned_end_paddr = std.mem.alignBackward(
-        u64,
-        region_end_paddr,
-        page4K,
-    );
-    var current_paddr = std.mem.alignForward(
-        u64,
-        useable_region_start_paddr,
-        page4K,
-    );
-    while (current_paddr < aligned_end_paddr) {
-        const page_size = blk: {
-            const remaining_bytes = aligned_end_paddr - current_paddr;
-            const page_2M_fits = std.mem.isAligned(current_paddr, page2M) and remaining_bytes >= page2M;
-            const page_4K_fits = std.mem.isAligned(current_paddr, page4K) and remaining_bytes >= page4K;
-            if (page_2M_fits) {
-                break :blk page2M;
-            } else if (page_4K_fits) {
-                break :blk page4K;
-            }
-            @panic("Invalid paddr alignment when initializing physmap!");
-        };
-        paging.mapPage(
-            @ptrFromInt(pml4_vaddr),
-            current_paddr,
-            current_paddr + kernel_base_vaddr,
-            paging.RW.ReadWrite,
-            paging.User.Supervisor,
-            @enumFromInt(page_size),
-            bump_alloc_iface,
-        );
-        current_paddr += page_size;
+    for (memory_regions) |region| {
+        if (region.region_type != multiboot.MemoryRegionType.Available) continue;
+
+        const start = std.mem.alignForward(u64, region.addr, page4K);
+        const end = std.mem.alignBackward(u64, region.addr + region.len, page4K);
+        if (end <= start) continue;
+
+        paging.mapRegion(start, end, bump_alloc_iface);
     }
 
     const double_fault_stack_top = bump_alloc_iface.alloc(
@@ -157,7 +119,7 @@ export fn kmain(
 
     const page1G = @intFromEnum(paging.PageSize.Page1G);
     const pml4_slot_size = page1G * paging.PAGE_TABLE_SIZE;
-    const vmm_start_vaddr = paging.pml4SlotBase(VMM_ADDR_SPACE_PML4_SLOT);
+    const vmm_start_vaddr = paging.pml4SlotBase(paging.VMM_ADDR_SPACE_PML4_SLOT);
     const vmm_end_vaddr = vmm_start_vaddr + pml4_slot_size;
 
     var vmm_bump_allocator = BumpAllocator.init(vmm_start_vaddr, vmm_end_vaddr);
