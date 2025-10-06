@@ -8,6 +8,8 @@
 //! This is typically used during early kernel initialization to inspect the memory map
 //! and retrieve configuration data provided by the bootloader.
 
+const std = @import("std");
+
 const paging = @import("paging.zig");
 
 pub const MAGIC = 0x2BADB002;
@@ -186,4 +188,74 @@ pub fn parseMemoryMap(info: *const MultibootInfo, regions: *[MAX_REGIONS]MemoryR
         mmap_ptr += entry.size + @sizeOf(u32);
     }
     return regions[0..i];
+}
+
+pub fn parseModules(info: *const MultibootInfo, wanted: []const u8) ?[]const u8 {
+
+    // Bit 3 => mods_count/mods_addr valid
+    if (!checkFlag(info.flags, 3) or info.mods_count == 0) return null;
+
+    const mods_base_v: usize = paging.physToVirt(info.mods_addr);
+    const mods: [*]align(1) const Mod = @ptrFromInt(mods_base_v);
+
+    var fallback_slice: ?[]const u8 = null;
+
+    var i: usize = 0;
+    while (i < info.mods_count) : (i += 1) {
+        const m = mods[i];
+
+        // Build [start,end) slice in *virtual* address space
+        const start_v: usize = paging.physToVirt(m.start);
+        const end_v: usize = paging.physToVirt(m.end); // end is exclusive per spec
+        if (end_v <= start_v) continue; // skip nonsense
+
+        const bytes: []const u8 = @as([*]const u8, @ptrFromInt(start_v))[0 .. end_v - start_v];
+
+        // 1) Prefer explicit name match if present (GRUB only sets this if you passed args)
+        var name: []const u8 = "";
+        if (m.cmdline != 0) {
+            const cstr: [*:0]const u8 = @ptrFromInt(paging.physToVirt(m.cmdline));
+            name = std.mem.span(cstr);
+            if (name.len != 0 and (std.mem.eql(u8, name, wanted) or std.mem.endsWith(u8, name, wanted))) {
+                return bytes;
+            }
+        }
+
+        // 2) Heuristic: does this buffer look like our symbol map? (e.g., "HEX SPACE NAME\n")
+        //    Check the first line only to avoid scanning big buffers.
+        //    Accept if: some hex digits, then space, then at least one non-space before '\n'.
+        var j: usize = 0;
+        var saw_hex = false;
+        while (j < bytes.len and bytes[j] != '\n') : (j += 1) {
+            const c = bytes[j];
+            if (!saw_hex) {
+                if ((c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F')) {
+                    saw_hex = true;
+                    continue;
+                }
+                // if first non-newline char isn't hex, bail on heuristic
+                break;
+            } else {
+                // once we hit a space, ensure at least one non-space follows before newline
+                if (c == ' ') {
+                    // peek one char ahead for a non-space until newline
+                    var k = j + 1;
+                    while (k < bytes.len and bytes[k] != '\n' and bytes[k] == ' ') : (k += 1) {}
+                    if (k < bytes.len and bytes[k] != '\n') {
+                        // looks like "HEX  NAME"
+                        if (fallback_slice == null) fallback_slice = bytes;
+                    }
+                    break;
+                }
+                // keep consuming hex or other chars; we only care about the first space transition
+            }
+        }
+
+        // 3) If there is only one module, take it as a fallback last
+        if (info.mods_count == 1) {
+            if (fallback_slice == null) fallback_slice = bytes;
+        }
+    }
+
+    return fallback_slice;
 }

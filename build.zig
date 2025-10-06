@@ -45,6 +45,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    kernel.root_module.omit_frame_pointer = false;
+
     if (use_llvm) {
         kernel.use_llvm = true;
         kernel.use_lld = true;
@@ -87,12 +89,22 @@ pub fn build(b: *std.Build) void {
     });
     copy_elf.step.dependOn(b.getInstallStep());
 
+    const gen_map_pipeline = b.addSystemCommand(&[_][]const u8{
+        "sh", "-c",
+        \\set -o pipefail
+        \\llvm-nm -P -n --defined-only zig-out/bin/kernel.elf \
+        \\| awk '$2 ~ /^[Tt]$/ { printf "%s %s\\n", $3, $1 }' \
+        \\> iso/boot/kernel.map
+    });
+    gen_map_pipeline.step.dependOn(&copy_elf.step);
+
     const iso = b.addSystemCommand(&[_][]const u8{
         "grub-mkrescue", "-o",
         "Zag.iso",       "iso/",
     });
 
     const iso_step = b.step("iso", "Create bootable ISO");
+    iso_step.dependOn(&gen_map_pipeline.step);
     iso_step.dependOn(&copy_elf.step);
     iso_step.dependOn(&iso.step);
 

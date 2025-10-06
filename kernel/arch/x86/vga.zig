@@ -6,7 +6,7 @@ const VGA_BUFFER_PADDR = 0xB8000;
 const VGA_WIDTH = 80;
 const VGA_HEIGHT = 25;
 const VGA_SIZE = VGA_WIDTH * VGA_HEIGHT;
-const TEMP_BUFFER_SIZE = 256;
+const TEMP_BUFFER_SIZE = 512;
 
 pub const VgaColor = enum(u8) {
     Black,

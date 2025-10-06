@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const panic_mod = @import("panic.zig");
 const memory = @import("memory");
 const bump_alloc = memory.BumpAllocator;
 const buddy_alloc = memory.BuddyAllocator;
@@ -24,6 +25,14 @@ const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
 const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
 
 extern const _kernel_end: u8;
+
+pub fn panic(
+    msg: []const u8,
+    error_return_trace: ?*std.builtin.StackTrace,
+    ret_addr: ?usize,
+) noreturn {
+    panic_mod.panic(msg, error_return_trace, ret_addr);
+}
 
 export fn kmain(
     stack_top_vaddr: u64,
@@ -74,6 +83,15 @@ export fn kmain(
         region_end_vaddr,
     );
     const bump_alloc_iface = bump_allocator.allocator();
+
+    if (multiboot.parseModules(mbi, "kernel.map")) |map_bytes| {
+        panic_mod.initSymbolsFromSlice(
+            map_bytes,
+            bump_alloc_iface,
+        ) catch @panic("Failed to initialize symbols map!");
+    } else {
+        @panic("Symbols map not found!");
+    }
 
     for (memory_regions) |region| {
         if (region.region_type != multiboot.MemoryRegionType.Available) continue;
@@ -162,17 +180,6 @@ export fn kmain(
     ) catch @panic("VMM doesn't have enough address space for heap tree allocator!");
     const heap_tree_addr_space_end = heap_tree_addr_space_start + heap_tree_addr_space_size;
 
-    vga.print("Heap addr space start {X} end {X} size {}\n", .{
-        heap_addr_space_start,
-        heap_addr_space_end,
-        heap_addr_space_size,
-    });
-    vga.print("Heap tree addr space start {X} end {X} size {}\n", .{
-        heap_tree_addr_space_start,
-        heap_tree_addr_space_end,
-        heap_tree_addr_space_size,
-    });
-
     var heap_tree_allocator_backing = BumpAllocator.init(
         heap_tree_addr_space_start,
         heap_tree_addr_space_end,
@@ -193,20 +200,5 @@ export fn kmain(
     const heap_buffer = heap_alloc_iface.alloc(u8, 10) catch @panic("Heap allocator OOM!");
     vga.print("Heap buffer ptr {X}", .{@intFromPtr(heap_buffer.ptr)});
 
-    cpu.halt();
-}
-
-pub fn panic(
-    msg: []const u8,
-    error_return_trace: ?*std.builtin.StackTrace,
-    ret_addr: ?usize,
-) noreturn {
-    _ = error_return_trace;
-    vga.setColor(.White, .Blue);
-    if (ret_addr) |ra| {
-        vga.print("KERNEL PANIC: {s}, ret_addr {X}\n", .{ msg, ra });
-    } else {
-        vga.print("KERNEL PANIC: {s}\n", .{msg});
-    }
     cpu.halt();
 }
