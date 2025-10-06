@@ -8,10 +8,9 @@ const slab_alloc = @import("slab_allocator.zig");
 const Containers = @import("containers");
 const rbt = Containers.RedBlackTree;
 
-// TODO: Find a better way to pack this
-pub const AllocHeader = packed struct(u65) {
+pub const AllocHeader = packed struct(u64) {
     is_free: bool,
-    bucket_size: u64,
+    bucket_size: u63,
 };
 
 const HEADER_SIZE = @sizeOf(AllocHeader);
@@ -194,7 +193,7 @@ pub const HeapAllocator = struct {
 
                     const split_header: *AllocHeader = @ptrFromInt(split_block_base);
                     split_header.is_free = true;
-                    split_header.bucket_size = split_bucket_size;
+                    split_header.bucket_size = @intCast(split_bucket_size);
 
                     const split_footer: *AllocFooter = @ptrFromInt(split_footer_base);
                     split_footer.header = split_block_base;
@@ -238,7 +237,7 @@ pub const HeapAllocator = struct {
 
         const header: *AllocHeader = @ptrFromInt(block_base);
         header.is_free = false;
-        header.bucket_size = bucket_size;
+        header.bucket_size = @intCast(bucket_size);
 
         const padding: *AllocPadding = @ptrFromInt(padding_base);
         const header_offset = user_block_base - block_base;
@@ -491,7 +490,7 @@ pub const HeapAllocator = struct {
             header_base = prev_footer.header;
             prev_footer.header = 0;
 
-            header.bucket_size = block_end - prev_entry_base;
+            header.bucket_size = @intCast(block_end - prev_entry_base);
         }
 
         merge_next: {
@@ -531,7 +530,7 @@ pub const HeapAllocator = struct {
             const absorbed_footer: *AllocFooter = @ptrFromInt(absorbed_footer_base);
             absorbed_footer.header = 0;
 
-            header.bucket_size = next_end - (header_base + PREFIX_SIZE);
+            header.bucket_size = @intCast(next_end - (header_base + PREFIX_SIZE));
         }
 
         const coalesced_prefix_end = header_base + PREFIX_SIZE;

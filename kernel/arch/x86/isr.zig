@@ -243,6 +243,8 @@ fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
         const pml4_paddr = paging.read_cr3() & ~@as(u64, 0xfff);
         const pml4_vaddr = paging.physToVirt(pml4_paddr);
 
+        std.debug.assert(paging.pml4_index(faulting_page_vaddr) == @intFromEnum(paging.AddressSpace.kvmm));
+
         paging.mapPage(
             @ptrFromInt(pml4_vaddr),
             phys_page_paddr,
@@ -254,6 +256,11 @@ fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
         );
 
         cpu.invlpg(faulting_page_vaddr);
+
+        vga.print("Mapped paddr {X} to vaddr {X}\n", .{
+            phys_page_paddr,
+            faulting_page_vaddr,
+        });
     } else {
         @panic("Userspace page fault handler not implemented!");
     }
