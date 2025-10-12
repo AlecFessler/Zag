@@ -10,6 +10,9 @@ const memory = @import("memory");
 const pmm_mod = memory.PhysicalMemoryManager;
 const vmm_mod = memory.VirtualMemoryManager;
 
+const VAddr = paging.VAddr;
+const PAddr = paging.PAddr;
+
 const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
 const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
 
@@ -220,11 +223,11 @@ fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
     const present = (ctx.err_code & 1) == 1;
     const cpl: u64 = ctx.cs & 3;
     const faulting_vaddr = cpu.read_cr2();
-    const faulting_page_vaddr = std.mem.alignBackward(
+    const faulting_page_vaddr = VAddr.fromInt(std.mem.alignBackward(
         u64,
-        faulting_vaddr,
+        faulting_vaddr.addr,
         @intFromEnum(paging.PageSize.Page4K),
-    );
+    ));
 
     if (cpl == 0) {
         if (present) @panic("Invalid memory access in kernelspace!");
@@ -232,35 +235,38 @@ fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
             @panic("Page fault prior to vmm initialization");
         }
         if (!vmm_mod.global_vmm.?.isValidVaddr(faulting_page_vaddr)) {
+            vga.print("Invalid faulting vaddr: {X}\n", .{faulting_vaddr.addr});
             @panic("Invalid faulting address in kernel");
         }
 
         const pmm_iface = pmm_mod.global_pmm.?.allocator();
         const page = pmm_iface.alloc(paging.PageMem(.Page4K), 1) catch @panic("PMM OOM!");
-        const phys_page_vaddr = @intFromPtr(page.ptr);
-        const phys_page_paddr = paging.virtToPhys(phys_page_vaddr);
+        const phys_page_vaddr = VAddr.fromInt(@intFromPtr(page.ptr));
+        const phys_page_paddr = PAddr.fromVAddr(phys_page_vaddr, .physmap);
 
-        const pml4_paddr = paging.read_cr3() & ~@as(u64, 0xfff);
-        const pml4_vaddr = paging.physToVirt(pml4_paddr);
+        const pml4_paddr = PAddr.fromInt(paging.read_cr3().addr & ~@as(u64, 0xfff));
+        const pml4_vaddr = VAddr.fromPAddr(pml4_paddr, .physmap);
 
         std.debug.assert(paging.pml4_index(faulting_page_vaddr) == @intFromEnum(paging.AddressSpace.kvmm));
 
+        vga.print("Mapping paddr {X} to vaddr {X}\n", .{
+            phys_page_paddr.addr,
+            faulting_page_vaddr.addr,
+        });
+
         paging.mapPage(
-            @ptrFromInt(pml4_vaddr),
+            @ptrFromInt(pml4_vaddr.addr),
             phys_page_paddr,
             faulting_page_vaddr,
             .ReadWrite,
+            true,
             .Supervisor,
             .Page4K,
+            .physmap,
             pmm_iface,
         );
 
         cpu.invlpg(faulting_page_vaddr);
-
-        vga.print("Mapped paddr {X} to vaddr {X}\n", .{
-            phys_page_paddr,
-            faulting_page_vaddr,
-        });
     } else {
         @panic("Userspace page fault handler not implemented!");
     }

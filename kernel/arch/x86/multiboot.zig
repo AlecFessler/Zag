@@ -11,6 +11,8 @@
 const std = @import("std");
 
 const paging = @import("paging.zig");
+const VAddr = paging.VAddr;
+const PAddr = paging.PAddr;
 
 pub const MAGIC = 0x2BADB002;
 pub const MAX_REGIONS = 32;
@@ -174,18 +176,19 @@ pub const MemoryRegion = struct {
 };
 
 pub fn parseMemoryMap(info: *const MultibootInfo, regions: *[MAX_REGIONS]MemoryRegion) []MemoryRegion {
-    var mmap_ptr: u64 = paging.physToVirt(info.mmap_addr);
-    const mmap_end: u64 = mmap_ptr + info.mmap_len;
-    var i: usize = 0;
-    while (mmap_ptr < mmap_end) : (i += 1) {
+    const mmap_paddr = PAddr.fromInt(info.mmap_addr);
+    var mmap_vaddr = VAddr.fromPAddr(mmap_paddr, .kernel);
+    const mmap_end_vaddr: VAddr = VAddr.fromInt(mmap_vaddr.addr + info.mmap_len);
+    var i: u64 = 0;
+    while (mmap_vaddr.addr < mmap_end_vaddr.addr) : (i += 1) {
         // Align to 1 byte because Multiboot v1 does not guarantee alignment of mmap entries.
-        const entry: *align(1) const MultibootMmapEntry = @ptrFromInt(mmap_ptr);
+        const entry = mmap_vaddr.getPtr(*align(1) const MultibootMmapEntry);
         regions[i] = .{
             .addr = entry.addr,
             .len = entry.len,
             .region_type = @enumFromInt(entry.type - 1),
         };
-        mmap_ptr += entry.size + @sizeOf(u32);
+        mmap_vaddr.addr += entry.size + @sizeOf(u32);
     }
     return regions[0..i];
 }
@@ -195,26 +198,31 @@ pub fn parseModules(info: *const MultibootInfo, wanted: []const u8) ?[]const u8 
     // Bit 3 => mods_count/mods_addr valid
     if (!checkFlag(info.flags, 3) or info.mods_count == 0) return null;
 
-    const mods_base_v: usize = paging.physToVirt(info.mods_addr);
-    const mods: [*]align(1) const Mod = @ptrFromInt(mods_base_v);
+    const mods_base_paddr = PAddr.fromInt(info.mods_addr);
+    const mods_base_vaddr = VAddr.fromPAddr(mods_base_paddr, .kernel);
+    const mods = mods_base_vaddr.getPtr([*]align(1) const Mod);
 
     var fallback_slice: ?[]const u8 = null;
 
-    var i: usize = 0;
+    var i: u64 = 0;
     while (i < info.mods_count) : (i += 1) {
         const m = mods[i];
 
         // Build [start,end) slice in *virtual* address space
-        const start_v: usize = paging.physToVirt(m.start);
-        const end_v: usize = paging.physToVirt(m.end); // end is exclusive per spec
-        if (end_v <= start_v) continue; // skip nonsense
+        const start_paddr = PAddr.fromInt(m.start);
+        const start_vaddr = VAddr.fromPAddr(start_paddr, .kernel);
+        const end_paddr = PAddr.fromInt(m.end);
+        const end_vaddr = VAddr.fromPAddr(end_paddr, .kernel);
+        if (end_vaddr.addr <= start_vaddr.addr) continue; // skip nonsense
 
-        const bytes: []const u8 = @as([*]const u8, @ptrFromInt(start_v))[0 .. end_v - start_v];
+        const bytes: []const u8 = @as([*]const u8, @ptrFromInt(start_vaddr.addr))[0 .. end_vaddr.addr - start_vaddr.addr];
 
         // 1) Prefer explicit name match if present (GRUB only sets this if you passed args)
         var name: []const u8 = "";
         if (m.cmdline != 0) {
-            const cstr: [*:0]const u8 = @ptrFromInt(paging.physToVirt(m.cmdline));
+            const cstr_paddr = PAddr.fromInt(m.cmdline);
+            const cstr_vaddr = VAddr.fromPAddr(cstr_paddr, .kernel);
+            const cstr = cstr_vaddr.getPtr([*:0]const u8);
             name = std.mem.span(cstr);
             if (name.len != 0 and (std.mem.eql(u8, name, wanted) or std.mem.endsWith(u8, name, wanted))) {
                 return bytes;
@@ -224,7 +232,7 @@ pub fn parseModules(info: *const MultibootInfo, wanted: []const u8) ?[]const u8 
         // 2) Heuristic: does this buffer look like our symbol map? (e.g., "HEX SPACE NAME\n")
         //    Check the first line only to avoid scanning big buffers.
         //    Accept if: some hex digits, then space, then at least one non-space before '\n'.
-        var j: usize = 0;
+        var j: u64 = 0;
         var saw_hex = false;
         while (j < bytes.len and bytes[j] != '\n') : (j += 1) {
             const c = bytes[j];

@@ -12,7 +12,7 @@ pub const PageSize = enum(u64) {
     Page1G = 1 * 1024 * 1024 * 1024,
 };
 
-const PAGE_ALIGN = std.mem.Alignment.fromByteUnits(@intFromEnum(PageSize.Page4K));
+pub const PAGE_ALIGN = std.mem.Alignment.fromByteUnits(@intFromEnum(PageSize.Page4K));
 
 pub fn PageMem(comptime page_size: PageSize) type {
     const size_bytes = @intFromEnum(page_size);
@@ -38,7 +38,7 @@ const PageLevelShift = enum(u6) {
     PT = 12,
 };
 
-const PageEntry = packed struct {
+pub const PageEntry = packed struct {
     present: bool,
     rw: RW,
     user: User,
@@ -53,13 +53,14 @@ const PageEntry = packed struct {
     reserved: u11,
     nx: bool,
 
-    pub fn setPaddr(self: *PageEntry, paddr: u64) void {
-        std.debug.assert(std.mem.isAligned(paddr, PAGE_ALIGN.toByteUnits()));
-        self.addr = @intCast(paddr >> 12);
+    pub fn setPAddr(self: *PageEntry, paddr: PAddr) void {
+        std.debug.assert(std.mem.isAligned(paddr.addr, PAGE_ALIGN.toByteUnits()));
+        self.addr = @intCast(paddr.addr >> 12);
     }
 
-    pub fn getPaddr(self: *const PageEntry) u64 {
-        return @as(u64, self.addr) << 12;
+    pub fn getPAddr(self: *const PageEntry) PAddr {
+        const addr = @as(u64, self.addr) << 12;
+        return PAddr.fromInt(addr);
     }
 };
 
@@ -73,141 +74,194 @@ const PDEntry = PageEntry;
 const PTEntry = PageEntry;
 
 pub const AddressSpace = enum(u9) {
-    pmm = 511,
+    /// Higher half direct mapping
+    /// Includes the physmap at pml4 base
+    /// And kernel text and data at _kernel_end linker symbol
+    hhdm = 511,
+    /// Kernel virtual memory mapping
+    /// Used by the kernel vmm for allocating address space to allocators
     kvmm = 510,
-    uvmm = 509,
 };
 
-pub fn pml4SlotBase(slot: u9) u64 {
+pub const HHDMType = enum {
+    kernel,
+    physmap,
+};
+
+pub const PAddr = struct {
+    addr: u64,
+
+    pub fn fromInt(addr: u64) PAddr {
+        return .{
+            .addr = addr,
+        };
+    }
+
+    pub fn fromVAddr(vaddr: VAddr, type_: HHDMType) PAddr {
+        const base_vaddr = switch (type_) {
+            .kernel => VAddr.fromInt(@intCast(@intFromPtr(&_kernel_base_vaddr))),
+            .physmap => pml4SlotBase(@intFromEnum(AddressSpace.hhdm)),
+        };
+        const phys = vaddr.addr - base_vaddr.addr;
+        return .{
+            .addr = phys,
+        };
+    }
+
+    pub fn getPtr(self: *const @This(), comptime type_: anytype) type_ {
+        return @ptrFromInt(self.addr);
+    }
+};
+
+pub const VAddr = struct {
+    addr: u64,
+
+    pub fn fromInt(addr: u64) VAddr {
+        return .{
+            .addr = addr,
+        };
+    }
+
+    pub fn fromPAddr(paddr: PAddr, type_: HHDMType) VAddr {
+        const base_vaddr = switch (type_) {
+            .kernel => VAddr.fromInt(@intCast(@intFromPtr(&_kernel_base_vaddr))),
+            .physmap => pml4SlotBase(@intFromEnum(AddressSpace.hhdm)),
+        };
+        const virt = paddr.addr + base_vaddr.addr;
+        return .{
+            .addr = virt,
+        };
+    }
+
+    pub fn getPtr(self: *const @This(), comptime type_: anytype) type_ {
+        return @ptrFromInt(self.addr);
+    }
+
+    pub fn remapHHDMType(self: *const @This(), from: HHDMType, to: HHDMType) VAddr {
+        std.debug.assert(from != to);
+        const paddr = PAddr.fromVAddr(self.*, from);
+        return VAddr.fromPAddr(paddr, to);
+    }
+};
+
+pub const default_flags = PageEntry{
+    .present = false,
+    .rw = .Readonly,
+    .user = .Supervisor,
+    .write_through = false,
+    .cache_disable = false,
+    .accessed = false,
+    .dirty = false,
+    .huge_page = false,
+    .global = false,
+    .ignored = 0,
+    .addr = 0,
+    .reserved = 0,
+    .nx = true,
+};
+
+pub fn pml4SlotBase(slot: u9) VAddr {
     const raw: u64 = (@as(u64, slot) << 39);
-    return if ((raw & 1 << 47) != 0) (raw | 0xFFFF000000000000) else raw;
+    const base = if ((raw & 1 << 47) != 0) (raw | 0xFFFF000000000000) else raw;
+    return VAddr.fromInt(base);
 }
 
-pub fn physToVirt(paddr: u64) u64 {
-    const kernel_base_vaddr: u64 = @intCast(@intFromPtr(&_kernel_base_vaddr));
-    return paddr + kernel_base_vaddr;
+pub fn pml4_index(vaddr: VAddr) u9 {
+    return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PML4));
 }
 
-pub fn virtToPhys(vaddr: u64) u64 {
-    const kernel_base_vaddr: u64 = @intCast(@intFromPtr(&_kernel_base_vaddr));
-    return vaddr - kernel_base_vaddr;
+fn pdpt_index(vaddr: VAddr) u9 {
+    return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PDPT));
 }
 
-pub fn pml4_index(vaddr: u64) u9 {
-    return @truncate(vaddr >> @intFromEnum(PageLevelShift.PML4));
+fn pd_index(vaddr: VAddr) u9 {
+    return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PD));
 }
 
-fn pdpt_index(vaddr: u64) u9 {
-    return @truncate(vaddr >> @intFromEnum(PageLevelShift.PDPT));
+fn pt_index(vaddr: VAddr) u9 {
+    return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PT));
 }
 
-fn pd_index(vaddr: u64) u9 {
-    return @truncate(vaddr >> @intFromEnum(PageLevelShift.PD));
-}
-
-fn pt_index(vaddr: u64) u9 {
-    return @truncate(vaddr >> @intFromEnum(PageLevelShift.PT));
-}
-
-pub fn read_cr3() u64 {
+pub fn read_cr3() PAddr {
     var value: u64 = 0;
     asm volatile ("mov %%cr3, %[out]"
         : [out] "=r" (value),
     );
-    return @intCast(value);
+    return PAddr.fromInt(value);
 }
 
-pub fn write_cr3(pml4: [*]PageEntry) void {
-    const phys_addr: u64 = @intFromPtr(pml4);
+pub fn write_cr3(pml4_paddr: PAddr) void {
     asm volatile ("mov %[value], %%cr3"
         :
-        : [value] "r" (phys_addr),
+        : [value] "r" (pml4_paddr.addr),
         : .{ .memory = true });
 }
 
 /// Maps a region with the fewest possible page entries by prefering larger pages
+/// Needs to use .kernel hhdm region since it runs as apart of creating the new page tables
 pub fn physMapRegion(
-    start_paddr: u64,
-    end_paddr: u64,
+    pml4_vaddr: VAddr,
+    start_paddr: PAddr,
+    end_paddr: PAddr,
     allocator: std.mem.Allocator,
 ) void {
     const page4K = @intFromEnum(PageSize.Page4K);
     const page2M = @intFromEnum(PageSize.Page2M);
     const page1G = @intFromEnum(PageSize.Page1G);
 
-    std.debug.assert(end_paddr > start_paddr);
-    std.debug.assert(std.mem.isAligned(start_paddr, page4K));
-    std.debug.assert(std.mem.isAligned(end_paddr, page4K));
-
-    const vaddr_start = physToVirt(start_paddr);
-
-    const vaddr_end = physToVirt(end_paddr);
-    std.debug.assert(vaddr_end > vaddr_start);
-
-    const pml4_paddr = read_cr3() & ~@as(u64, 0xfff);
-    const pml4_vaddr = physToVirt(pml4_paddr);
+    std.debug.assert(end_paddr.addr > start_paddr.addr);
+    std.debug.assert(std.mem.isAligned(start_paddr.addr, page4K));
+    std.debug.assert(std.mem.isAligned(end_paddr.addr, page4K));
 
     var paddr = start_paddr;
-    while (paddr < end_paddr) {
-        const remaining = end_paddr - paddr;
+    while (paddr.addr < end_paddr.addr) {
+        const vaddr = VAddr.fromPAddr(paddr, .physmap);
+        const remaining = end_paddr.addr - paddr.addr;
         const chosen_size: u64 = blk: {
-            if (std.mem.isAligned(paddr, page1G) and remaining >= page1G) break :blk page1G;
-            if (std.mem.isAligned(paddr, page2M) and remaining >= page2M) break :blk page2M;
+            if (std.mem.isAligned(paddr.addr, page1G) and remaining >= page1G) break :blk page1G;
+            if (std.mem.isAligned(paddr.addr, page2M) and remaining >= page2M) break :blk page2M;
             break :blk page4K;
         };
-        const size: PageSize = @enumFromInt(chosen_size);
 
         mapPage(
-            @ptrFromInt(pml4_vaddr),
+            @ptrFromInt(pml4_vaddr.addr),
             paddr,
-            physToVirt(paddr),
+            vaddr,
             RW.ReadWrite,
+            true,
             User.Supervisor,
-            size,
+            @enumFromInt(chosen_size),
+            .kernel,
             allocator,
         );
 
-        paddr += chosen_size;
+        paddr.addr += chosen_size;
     }
 }
 
 pub fn mapPage(
     pml4: [*]PML4Entry,
-    paddr: u64,
-    vaddr: u64,
+    paddr: PAddr,
+    vaddr: VAddr,
     rw: RW,
+    nx: bool,
     user: User,
     page_size: PageSize,
+    hhdm_type: HHDMType,
     allocator: std.mem.Allocator,
 ) void {
     std.debug.assert(std.mem.isAligned(
-        paddr,
+        paddr.addr,
         PAGE_ALIGN.toByteUnits(),
     ));
     std.debug.assert(std.mem.isAligned(
-        vaddr,
+        vaddr.addr,
         PAGE_ALIGN.toByteUnits(),
     ));
 
-    const default_flags = PageEntry{
-        .present = false,
-        .rw = rw,
-        .user = user,
-        .write_through = false,
-        .cache_disable = false,
-        .accessed = false,
-        .dirty = false,
-        .huge_page = false,
-        .global = false,
-        .ignored = 0,
-        .addr = 0,
-        .reserved = 0,
-        .nx = false,
-    };
-
     const flags = PageEntry{
         .present = true,
-        .rw = rw,
+        .rw = .ReadWrite,
         .user = user,
         .write_through = false,
         .cache_disable = false,
@@ -240,19 +294,20 @@ pub fn mapPage(
         ) catch @panic("Went OOM maping pages!");
         @memset(new_pdpt, default_flags);
         pdpt_entry.* = flags;
-        pdpt_entry.setPaddr(@intCast(virtToPhys(
-            @intFromPtr(new_pdpt.ptr)
-        )));
+        const new_pdpt_vaddr = VAddr.fromInt(@intFromPtr(new_pdpt.ptr));
+        const new_pdpt_paddr = PAddr.fromVAddr(new_pdpt_vaddr, hhdm_type);
+        pdpt_entry.setPAddr(new_pdpt_paddr);
     }
-    const pdpt: [*]PDPTEntry = @ptrFromInt(physToVirt(
-        pdpt_entry.getPaddr()
-    ));
+    const pdpt_entry_vaddr = VAddr.fromPAddr(pdpt_entry.getPAddr(), hhdm_type);
+    const pdpt = pdpt_entry_vaddr.getPtr([*]PDPTEntry);
 
     if (page_size == .Page1G) {
         var entry = &pdpt[pdpt_idx];
         entry.* = flags;
         entry.huge_page = true;
-        entry.setPaddr(paddr);
+        entry.rw = rw;
+        if (nx) entry.nx = true;
+        entry.setPAddr(paddr);
         return;
     }
 
@@ -265,19 +320,20 @@ pub fn mapPage(
         ) catch @panic("Went OOM maping pages!");
         @memset(new_pd, default_flags);
         pd_entry.* = flags;
-        pd_entry.setPaddr(@intCast(virtToPhys(
-            @intFromPtr(new_pd.ptr)
-        )));
+        const new_pd_vaddr = VAddr.fromInt(@intFromPtr(new_pd.ptr));
+        const new_pd_paddr = PAddr.fromVAddr(new_pd_vaddr, hhdm_type);
+        pd_entry.setPAddr(new_pd_paddr);
     }
-    const pd: [*]PDEntry = @ptrFromInt(physToVirt(
-        pd_entry.getPaddr()
-    ));
+    const pd_entry_vaddr = VAddr.fromPAddr(pd_entry.getPAddr(), hhdm_type);
+    const pd = pd_entry_vaddr.getPtr([*]PDEntry);
 
     if (page_size == .Page2M) {
         var entry = &pd[pd_idx];
         entry.* = flags;
         entry.huge_page = true;
-        entry.setPaddr(paddr);
+        entry.rw = rw;
+        if (nx) entry.nx = true;
+        entry.setPAddr(paddr);
         return;
     }
 
@@ -290,14 +346,15 @@ pub fn mapPage(
         ) catch @panic("Went OOM maping pages!");
         @memset(new_pt, default_flags);
         pt_entry.* = flags;
-        pt_entry.setPaddr(@intCast(virtToPhys(
-            @intFromPtr(new_pt.ptr)
-        )));
+        const new_pt_vaddr = VAddr.fromInt(@intFromPtr(new_pt.ptr));
+        const new_pt_paddr = PAddr.fromVAddr(new_pt_vaddr, hhdm_type);
+        pt_entry.setPAddr(new_pt_paddr);
     }
-    const pt: [*]PTEntry = @ptrFromInt(physToVirt(
-        pt_entry.getPaddr()
-    ));
+    const pt_entry_vaddr = VAddr.fromPAddr(pt_entry.getPAddr(), hhdm_type);
+    const pt = pt_entry_vaddr.getPtr([*]PTEntry);
 
     pt[pt_idx] = flags;
-    pt[pt_idx].setPaddr(@intCast(paddr));
+    pt[pt_idx].rw = rw;
+    if (nx) pt[pt_idx].nx = true;
+    pt[pt_idx].setPAddr(paddr);
 }

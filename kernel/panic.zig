@@ -34,10 +34,14 @@ const SymbolMap = struct {
         addr: u64,
         name: []const u8,
     ) !void {
-        try self.entries.append(self.alloc, .{
-            .addr = addr,
-            .name = name,
-        });
+        const name_copy = try self.alloc.dupe(u8, name);
+        try self.entries.append(
+            self.alloc,
+            .{
+                .addr = addr,
+                .name = name_copy,
+            },
+        );
     }
 
     fn find(
@@ -65,7 +69,7 @@ const SymbolMap = struct {
     }
 };
 
-var g_symmap: ?SymbolMap = null;
+pub var g_symmap: ?SymbolMap = null;
 
 pub fn initSymbolsFromSlice(
     map_bytes: []const u8,

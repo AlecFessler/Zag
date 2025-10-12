@@ -1,6 +1,8 @@
 const std = @import("std");
 
 const paging = @import("paging.zig");
+const PAddr = paging.PAddr;
+const VAddr = paging.VAddr;
 
 const VGA_BUFFER_PADDR = 0xB8000;
 const VGA_WIDTH = 80;
@@ -32,10 +34,15 @@ var row: u64 = 0;
 var column: u64 = 0;
 var color: u8 = 0;
 
-pub fn initialize(foreground: VgaColor, background: VgaColor) void {
-    buffer = @ptrFromInt(paging.physToVirt(VGA_BUFFER_PADDR));
+pub fn initialize(
+    foreground: VgaColor,
+    background: VgaColor,
+    hhdm_type: paging.HHDMType,
+) void {
+    const buffer_paddr = PAddr.fromInt(VGA_BUFFER_PADDR);
+    const buffer_vaddr = VAddr.fromPAddr(buffer_paddr, hhdm_type);
+    buffer = @ptrFromInt(buffer_vaddr.addr);
     setColor(foreground, background);
-    clear();
 }
 
 pub fn clear() void {

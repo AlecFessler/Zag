@@ -1,3 +1,7 @@
+const paging = @import("paging.zig");
+
+const VAddr = paging.VAddr;
+
 pub const Registers = packed struct {
     r15: u64,
     r14: u64,
@@ -16,12 +20,12 @@ pub const Registers = packed struct {
     rax: u64,
 };
 
-pub fn read_cr2() u64 {
-    var v: u64 = 0;
-    asm volatile ("mov %%cr2, %[v]"
-        : [v] "=r" (v),
+pub fn read_cr2() VAddr {
+    var addr: u64 = 0;
+    asm volatile ("mov %%cr2, %[addr]"
+        : [addr] "=r" (addr),
     );
-    return v;
+    return VAddr.fromInt(addr);
 }
 
 pub fn halt() noreturn {
@@ -30,11 +34,11 @@ pub fn halt() noreturn {
     }
 }
 
-pub fn invlpg(vaddr: u64) void {
+pub fn invlpg(vaddr: VAddr) void {
     asm volatile (
         \\invlpg (%[a])
         :
-        : [a] "r" (vaddr)
+        : [a] "r" (vaddr.addr)
         : .{ .memory = true }
     );
 }

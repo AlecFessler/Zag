@@ -2,6 +2,9 @@ const std = @import("std");
 
 const cpu = @import("cpu.zig");
 const idt = @import("idt.zig");
+const paging = @import("paging.zig");
+
+const VAddr = paging.VAddr;
 
 const GdtEntry = packed struct {
     limit_low: u16,
@@ -208,10 +211,9 @@ fn ltr(sel: u16) void {
         : .{});
 }
 
-pub fn init(kernel_stack_top: u64, double_fault_stack_top: u64) void {
+pub fn init(kernel_stack_top: VAddr) void {
     main_tss_entry = .{};
-    main_tss_entry.rsp0 = kernel_stack_top;
-    main_tss_entry.ist1 = double_fault_stack_top;
+    main_tss_entry.rsp0 = kernel_stack_top.addr;
 
     writeTssDescriptor(&main_tss_entry);
 

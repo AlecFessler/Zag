@@ -37,11 +37,12 @@ _start:
 
     mov ecx, 0xC0000080             ; load extended feature enable register (EFER)
     rdmsr                           ; read model specific register
-    or eax, 1 << 8                  ; set long mode enable (LME)
+    or eax, (1 << 8) | (1 << 11)    ; set long mode enable (LME) and no execute enable (NXE)
     wrmsr                           ; write model specific register
 
     mov eax, cr0
-    or eax, (1 << 0) | (1 << 31)    ; set paging enable (PG) and protection enable (PE) bits
+    ; set paging enable (PG), write protection (WP), and protection enable (PE) bits
+    or eax, (1 << 0) | (1 << 16) | (1 << 31)
     mov cr0, eax                    ; next instruction fetch enters long mode
 
     jmp 0x08:long_mode_stub         ; reload code segment

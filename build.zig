@@ -45,8 +45,6 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    kernel.root_module.omit_frame_pointer = false;
-
     if (use_llvm) {
         kernel.use_llvm = true;
         kernel.use_lld = true;
@@ -70,8 +68,23 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    memory_mod.addImport("containers", containers_mod);
+    kernel.root_module.omit_frame_pointer = false;
+    kernel.root_module.red_zone = false;
+
+    containers_mod.omit_frame_pointer = false;
+    containers_mod.red_zone = false;
+
+    memory_mod.omit_frame_pointer = false;
+    memory_mod.red_zone = false;
+
+    x86_mod.omit_frame_pointer = false;
+    x86_mod.red_zone = false;
+
     containers_mod.addImport("memory", memory_mod);
+
+    memory_mod.addImport("x86", x86_mod);
+    memory_mod.addImport("containers", containers_mod);
+
     x86_mod.addImport("memory", memory_mod);
 
     kernel.root_module.addImport("memory", memory_mod);

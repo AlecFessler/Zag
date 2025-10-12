@@ -23,7 +23,17 @@ const HeapAllocator = heap_alloc.HeapAllocator;
 const HeapTreeAllocator = heap_alloc.TreeAllocator;
 const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
 const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
+const VAddr = paging.VAddr;
+const PAddr = paging.PAddr;
 
+extern const _text_start: u8;
+extern const _text_end: u8;
+extern const _rodata_start: u8;
+extern const _rodata_end: u8;
+extern const _data_start: u8;
+extern const _data_end: u8;
+extern const _bss_start: u8;
+extern const _bss_end: u8;
 extern const _kernel_end: u8;
 
 pub fn panic(
@@ -37,16 +47,22 @@ pub fn panic(
 export fn kmain(
     stack_top_vaddr: u64,
     magic: u32,
-    mbi_paddr: u32,
+    mbi_addr: u32,
 ) callconv(.c) void {
-    vga.initialize(.White, .Black);
+    vga.initialize(.White, .Black, .kernel);
+    vga.clear();
 
     if (magic != multiboot.MAGIC) {
         @panic("Not a multiboot compliant boot");
     }
 
-    const mbi_vaddr: u64 = paging.physToVirt(mbi_paddr);
-    const mbi: *const multiboot.MultibootInfo = @ptrFromInt(mbi_vaddr);
+    gdt.init(VAddr.fromInt(stack_top_vaddr));
+    idt.init();
+    isr.init();
+
+    const mbi_paddr = PAddr.fromInt(@intCast(mbi_addr));
+    const mbi_vaddr = VAddr.fromPAddr(mbi_paddr, .kernel);
+    const mbi = mbi_vaddr.getPtr(*multiboot.MultibootInfo);
 
     if (!multiboot.checkFlag(mbi.flags, 6)) {
         @panic("Mmap_* are invalid!");
@@ -58,31 +74,30 @@ export fn kmain(
         &memory_regions_buffer,
     );
 
-    var max_end_paddr: u64 = 0;
-    for (memory_regions) |region| {
-        if (region.region_type != multiboot.MemoryRegionType.Available) continue;
-        const end_paddr = region.addr + region.len;
-        if (end_paddr > max_end_paddr) max_end_paddr = end_paddr;
-    }
-    const region_end_vaddr = paging.physToVirt(max_end_paddr);
-
-    const kernel_end: u64 = @intCast(@intFromPtr(&_kernel_end));
-    const kernel_end_paddr = paging.virtToPhys(kernel_end);
+    const kernel_end_vaddr = VAddr.fromInt(@intCast(@intFromPtr(&_kernel_end)));
     const page4K = @intFromEnum(paging.PageSize.Page4K);
-    const page4k_align = std.mem.Alignment.fromByteUnits(page4K);
 
-    const useable_region_start_paddr = std.mem.alignForward(
+    const useable_region_start_vaddr = VAddr.fromInt(std.mem.alignForward(
         u64,
-        kernel_end_paddr,
+        kernel_end_vaddr.addr,
         page4K,
-    );
-    const useable_region_start_vaddr = paging.physToVirt(useable_region_start_paddr);
+    ));
 
+    const already_mapped_region_end_paddr = PAddr.fromInt(0x600000);
+    const already_mapped_region_end_vaddr = VAddr.fromPAddr(already_mapped_region_end_paddr, .kernel);
+
+    // initially cap bump allocator memory out at what's already mapped
     var bump_allocator = BumpAllocator.init(
-        useable_region_start_vaddr,
-        region_end_vaddr,
+        useable_region_start_vaddr.addr,
+        already_mapped_region_end_vaddr.addr,
     );
     const bump_alloc_iface = bump_allocator.allocator();
+
+    // NOTE: DEBUG
+    vga.print("Init bump alloc: start vaddr {X} end vaddr {X}\n", .{
+        useable_region_start_vaddr.addr,
+        already_mapped_region_end_vaddr.addr,
+    });
 
     if (multiboot.parseModules(mbi, "kernel.map")) |map_bytes| {
         panic_mod.initSymbolsFromSlice(
@@ -93,71 +108,233 @@ export fn kmain(
         @panic("Symbols map not found!");
     }
 
+    const new_pml4_mem = bump_alloc_iface.alignedAlloc(
+        paging.PageEntry,
+        paging.PAGE_ALIGN,
+        paging.PAGE_TABLE_SIZE,
+    ) catch @panic("Bump allocator failed to allocate new pml4 table!");
+    @memset(new_pml4_mem, paging.default_flags);
+    const new_pml4_vaddr = VAddr.fromInt(@intFromPtr(new_pml4_mem.ptr));
+
+    const text_start = VAddr.fromInt(@intCast(@intFromPtr(&_text_start)));
+    const text_end = VAddr.fromInt(@intCast(@intFromPtr(&_text_end)));
+    const page_aligned_text_end = VAddr.fromInt(std.mem.alignForward(
+        u64,
+        text_end.addr,
+        page4K,
+    ));
+    const text_pages = (page_aligned_text_end.addr - text_start.addr) / page4K;
+    for (0..text_pages) |i| {
+        const page_vaddr = VAddr.fromInt(text_start.addr + i * page4K);
+        const page_paddr = PAddr.fromVAddr(page_vaddr, .kernel);
+        std.debug.assert(page_vaddr.addr < page_aligned_text_end.addr);
+        paging.mapPage(
+            @ptrFromInt(new_pml4_vaddr.addr),
+            page_paddr,
+            page_vaddr,
+            .Readonly,
+            false,
+            .Supervisor,
+            .Page4K,
+            .kernel,
+            bump_alloc_iface,
+        );
+    }
+    vga.print("Mapped text at start {X} end {X} pages {}\n", .{
+        text_start.addr,
+        page_aligned_text_end.addr,
+        text_pages,
+    });
+
+    // Everything from rodata start to data start is mapped as readonly
+    // because the linker places linker symbols in another section between this
+    // span that comes after rodata_end, so we resolve this by mapping the hole as readonly
+    const rodata_start = VAddr.fromInt(@intCast(@intFromPtr(&_rodata_start)));
+    const data_start = VAddr.fromInt(@intCast(@intFromPtr(&_data_start)));
+    const page_aligned_rodata_end = VAddr.fromInt(std.mem.alignForward(
+        u64,
+        data_start.addr,
+        page4K,
+    ));
+    const rodata_pages = (page_aligned_rodata_end.addr - rodata_start.addr) / page4K;
+    for (0..rodata_pages) |i| {
+        const page_vaddr = VAddr.fromInt(rodata_start.addr + i * page4K);
+        const page_paddr = PAddr.fromVAddr(page_vaddr, .kernel);
+        std.debug.assert(page_vaddr.addr < page_aligned_rodata_end.addr);
+        paging.mapPage(
+            @ptrFromInt(new_pml4_vaddr.addr),
+            page_paddr,
+            page_vaddr,
+            .Readonly,
+            true,
+            .Supervisor,
+            .Page4K,
+            .kernel,
+            bump_alloc_iface,
+        );
+    }
+    vga.print("Mapped rodata at start {X} end {X} pages {}\n", .{
+        rodata_start.addr,
+        page_aligned_rodata_end.addr,
+        rodata_pages,
+    });
+
+    const data_end = VAddr.fromInt(@intCast(@intFromPtr(&_data_end)));
+    const page_aligned_data_end = VAddr.fromInt(std.mem.alignForward(
+        u64,
+        data_end.addr,
+        page4K,
+    ));
+    const data_pages = (page_aligned_data_end.addr - data_start.addr) / page4K;
+    for (0..data_pages) |i| {
+        const page_vaddr = VAddr.fromInt(data_start.addr + i * page4K);
+        const page_paddr = PAddr.fromVAddr(page_vaddr, .kernel);
+        std.debug.assert(page_vaddr.addr < page_aligned_data_end.addr);
+        paging.mapPage(
+            @ptrFromInt(new_pml4_vaddr.addr),
+            page_paddr,
+            page_vaddr,
+            .ReadWrite,
+            true,
+            .Supervisor,
+            .Page4K,
+            .kernel,
+            bump_alloc_iface,
+        );
+    }
+    vga.print("Mapped data at start {X} end {X} pages {}\n", .{
+        data_start.addr,
+        page_aligned_data_end.addr,
+        rodata_pages,
+    });
+
+    const bss_start = VAddr.fromInt(@intCast(@intFromPtr(&_bss_start)));
+    const bss_end = VAddr.fromInt(@intCast(@intFromPtr(&_bss_end)));
+    const page_aligned_bss_end = VAddr.fromInt(std.mem.alignForward(
+        u64,
+        bss_end.addr,
+        page4K,
+    ));
+    const bss_pages = (page_aligned_bss_end.addr - bss_start.addr) / page4K;
+    for (0..bss_pages) |i| {
+        const page_vaddr = VAddr.fromInt(bss_start.addr + i * page4K);
+        const page_paddr = PAddr.fromVAddr(page_vaddr, .kernel);
+        std.debug.assert(page_vaddr.addr < page_aligned_bss_end.addr);
+        paging.mapPage(
+            @ptrFromInt(new_pml4_vaddr.addr),
+            page_paddr,
+            page_vaddr,
+            .ReadWrite,
+            true,
+            .Supervisor,
+            .Page4K,
+            .kernel,
+            bump_alloc_iface,
+        );
+    }
+    vga.print("Mapped bss at start {X} end {X} pages {}\n", .{
+        bss_start.addr,
+        page_aligned_bss_end.addr,
+        bss_pages,
+    });
+
+    var max_end_paddr = PAddr.fromInt(0);
     for (memory_regions) |region| {
         if (region.region_type != multiboot.MemoryRegionType.Available) continue;
 
-        const start_paddr = std.mem.alignForward(
+        const kernel_end_paddr = PAddr.fromVAddr(kernel_end_vaddr, .kernel);
+        const start_addr = if (kernel_end_paddr.addr > region.addr and kernel_end_paddr.addr < region.addr + region.len) kernel_end_paddr else PAddr.fromInt(region.addr);
+
+        const start_paddr = PAddr.fromInt(std.mem.alignForward(
             u64,
-            region.addr,
+            start_addr.addr,
             page4K,
-        );
-        const end_paddr = std.mem.alignBackward(
+        ));
+        const end_paddr = PAddr.fromInt(std.mem.alignBackward(
             u64,
             region.addr + region.len,
             page4K,
-        );
-        if (end_paddr <= start_paddr) continue;
+        ));
+        if (end_paddr.addr <= start_paddr.addr) continue;
+        if (end_paddr.addr > max_end_paddr.addr) max_end_paddr = end_paddr;
 
         paging.physMapRegion(
+            new_pml4_vaddr,
             start_paddr,
             end_paddr,
             bump_alloc_iface,
         );
+
+        // NOTE: DEBUG
+        vga.print("Phys mapped region: start paddr {X} end paddr {X}\n", .{
+            start_paddr.addr,
+            end_paddr.addr,
+        });
     }
 
-    const double_fault_stack_top = bump_alloc_iface.alloc(
-        paging.PageMem(paging.PageSize.Page4K),
-        1,
-    ) catch @panic("Kernel OOM!");
-    const double_fault_stack_top_vaddr = @intFromPtr(double_fault_stack_top.ptr);
-
-    gdt.init(
-        stack_top_vaddr,
-        double_fault_stack_top_vaddr,
+    const vga_paddr = PAddr.fromInt(0xB8000);
+    const vga_vaddr = VAddr.fromPAddr(vga_paddr, .physmap);
+    paging.mapPage(
+        @ptrFromInt(new_pml4_vaddr.addr),
+        vga_paddr,
+        vga_vaddr,
+        .ReadWrite,
+        true,
+        .Supervisor,
+        .Page4K,
+        .kernel,
+        bump_alloc_iface,
     );
-    idt.init();
-    isr.init();
+
+    // flush tlb
+    // after this point pmm and mmio should use .physmap for hhdm type instead of .kernel
+    const pml4_paddr = PAddr.fromVAddr(new_pml4_vaddr, .kernel);
+    paging.write_cr3(pml4_paddr);
+
+    // reinitialize vga module with text buffer remapped to physmap hhdm
+    vga.initialize(.White, .Black, .physmap);
+
+    // remap bump allocator address space to physmap
+    bump_allocator.start_addr = VAddr.fromInt(bump_allocator.start_addr).remapHHDMType(.kernel, .physmap).addr;
+    bump_allocator.free_addr = VAddr.fromInt(bump_allocator.free_addr).remapHHDMType(.kernel, .physmap).addr;
+    // expand bump allocator memory to newly mapped region
+    bump_allocator.end_addr = VAddr.fromPAddr(max_end_paddr, .physmap).addr;
 
     const buddy_metadata_bytes = BuddyAllocator.requiredMemory(
         bump_allocator.free_addr,
         bump_allocator.end_addr,
     );
-    const buddy_start_vaddr = std.mem.alignForward(
+    const buddy_start_vaddr = VAddr.fromInt(std.mem.alignForward(
         u64,
         bump_allocator.free_addr + buddy_metadata_bytes,
         page4K,
-    );
-    const buddy_end_vaddr = std.mem.alignBackward(
+    ));
+    const buddy_end_vaddr = VAddr.fromInt(std.mem.alignBackward(
         u64,
         bump_allocator.end_addr,
         page4K,
-    );
-    std.debug.assert(buddy_end_vaddr > buddy_start_vaddr);
+    ));
+    std.debug.assert(buddy_end_vaddr.addr > buddy_start_vaddr.addr);
 
     var buddy_allocator: BuddyAllocator = BuddyAllocator.init(
-        buddy_start_vaddr,
-        buddy_end_vaddr,
+        buddy_start_vaddr.addr,
+        buddy_end_vaddr.addr,
         bump_alloc_iface,
     ) catch @panic("Failed to allocate memory for buddy allocator!");
-    std.debug.assert(bump_allocator.free_addr <= buddy_start_vaddr);
     const buddy_alloc_iface = buddy_allocator.allocator();
+
+    // NOTE: DEBUG
+    vga.print("Init buddy alloc: start vaddr {X} end vaddr {X}\n", .{
+        buddy_start_vaddr.addr,
+        buddy_end_vaddr.addr,
+    });
 
     pmm_mod.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
 
     const page1G = @intFromEnum(paging.PageSize.Page1G);
     const pml4_slot_size = page1G * paging.PAGE_TABLE_SIZE;
     const vmm_start_vaddr = paging.pml4SlotBase(@intFromEnum(paging.AddressSpace.kvmm));
-    const vmm_end_vaddr = vmm_start_vaddr + pml4_slot_size;
+    const vmm_end_vaddr = VAddr.fromInt(vmm_start_vaddr.addr + pml4_slot_size);
 
     vmm_mod.global_vmm = VirtualMemoryManager.init(
         vmm_start_vaddr,
@@ -165,40 +342,24 @@ export fn kmain(
     );
     var vmm = &vmm_mod.global_vmm.?;
 
-    const heap_addr_space_size = pml4_slot_size / 2;
-    const heap_tree_addr_space_size = page1G;
+    // NOTE: DEBUG
+    vga.print("Init vmm: start vaddr {X} end vaddr {X}\n", .{
+        vmm_start_vaddr.addr,
+        vmm_end_vaddr.addr,
+    });
 
-    const heap_addr_space_start = vmm.reserve(
-        heap_addr_space_size,
-        page4k_align,
+    const vaddr_space_start = vmm.reserve(
+        page1G,
+        std.mem.Alignment.fromByteUnits(page4K),
     ) catch @panic("VMM doesn't have enough address space for heap allocator!");
-    const heap_addr_space_end = heap_addr_space_start + heap_addr_space_size;
 
-    const heap_tree_addr_space_start = vmm.reserve(
-        heap_tree_addr_space_size,
-        page4k_align,
-    ) catch @panic("VMM doesn't have enough address space for heap tree allocator!");
-    const heap_tree_addr_space_end = heap_tree_addr_space_start + heap_tree_addr_space_size;
+    const int_ptr: *u64 = @ptrFromInt(vaddr_space_start.addr);
+    int_ptr.* = 1;
+    vga.print("int ptr val {}\n", .{int_ptr.*});
 
-    var heap_tree_allocator_backing = BumpAllocator.init(
-        heap_tree_addr_space_start,
-        heap_tree_addr_space_end,
-    );
-    const heap_tree_allocator_backing_iface = heap_tree_allocator_backing.allocator();
-
-    var heap_tree_allocator = HeapTreeAllocator.init(
-        heap_tree_allocator_backing_iface,
-    ) catch @panic("Heap tree's backing allocator is OOM!");
-
-    var heap_allocator = HeapAllocator.init(
-        @intCast(heap_addr_space_start),
-        @intCast(heap_addr_space_end),
-        &heap_tree_allocator,
-    );
-    const heap_alloc_iface = heap_allocator.allocator();
-
-    const heap_buffer = heap_alloc_iface.alloc(u8, 10) catch @panic("Heap allocator OOM!");
-    vga.print("Heap buffer ptr {X}", .{@intFromPtr(heap_buffer.ptr)});
+    const int_ptr1: *u64 = @ptrFromInt(vaddr_space_start.addr + page4K);
+    int_ptr1.* = 2;
+    vga.print("int ptr 1 val {}\n", .{int_ptr1.*});
 
     cpu.halt();
 }

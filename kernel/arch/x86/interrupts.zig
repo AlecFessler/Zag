@@ -20,8 +20,8 @@ pub const InterruptContext = packed struct {
     rip: u64,
     cs: u64,
     rflags: u64,
-    rsp: u64, // only if privilege change
-    ss: u64, // only if privilege change
+    rsp: u64,
+    ss: u64,
 };
 
 
@@ -44,15 +44,7 @@ export fn commonInterruptStub() callconv(.naked) void {
         \\pushq %r15
         \\
         \\mov %rsp, %rdi
-        \\
-        \\mov %rsp, %r11
-        \\andq $-16, %rsp
-        \\subq $8, %rsp
-        \\
         \\call *%[dispatch]
-        \\
-        \\addq $8, %rsp
-        \\mov %r11, %rsp
         \\
         \\popq %r15
         \\popq %r14
