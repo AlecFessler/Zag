@@ -1,8 +1,5 @@
 const std = @import("std");
 
-const x86 = @import("x86");
-const vga = x86.Vga;
-
 const bitmap_freelist = @import("bitmap_freelist.zig");
 const intrusive_freelist = @import("intrusive_freelist.zig");
 
@@ -318,9 +315,6 @@ pub const BuddyAllocator = struct {
 
         const addr = self.recursiveSplit(order) orelse return null;
         self.bitmap.setBit(addr, 0);
-
-        // NOTE: DEBUG
-        vga.print("Buddy allocating paddr {X}\n", .{addr});
 
         return @ptrFromInt(addr);
     }

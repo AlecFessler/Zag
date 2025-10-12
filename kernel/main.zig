@@ -93,12 +93,9 @@ export fn kmain(
     );
     const bump_alloc_iface = bump_allocator.allocator();
 
-    // NOTE: DEBUG
-    vga.print("Init bump alloc: start vaddr {X} end vaddr {X}\n", .{
-        useable_region_start_vaddr.addr,
-        already_mapped_region_end_vaddr.addr,
-    });
-
+    // save paddrs to remap into new page tables
+    const symbol_map_start_kernel_vaddr = VAddr.fromInt(bump_allocator.free_addr);
+    const symbol_map_start_paddr = PAddr.fromVAddr(symbol_map_start_kernel_vaddr, .kernel);
     if (multiboot.parseModules(mbi, "kernel.map")) |map_bytes| {
         panic_mod.initSymbolsFromSlice(
             map_bytes,
@@ -107,6 +104,8 @@ export fn kmain(
     } else {
         @panic("Symbols map not found!");
     }
+    const symbol_map_end_kernel_vaddr = VAddr.fromInt(bump_allocator.free_addr);
+    const symbol_map_end_paddr = PAddr.fromVAddr(symbol_map_end_kernel_vaddr, .kernel);
 
     const new_pml4_mem = bump_alloc_iface.alignedAlloc(
         paging.PageEntry,
@@ -115,6 +114,32 @@ export fn kmain(
     ) catch @panic("Bump allocator failed to allocate new pml4 table!");
     @memset(new_pml4_mem, paging.default_flags);
     const new_pml4_vaddr = VAddr.fromInt(@intFromPtr(new_pml4_mem.ptr));
+
+    // map kernel symbol map into new pml4 at original kernel addresses to preserve internal arraylist pointers
+    var current_symbol_map_page_paddr = symbol_map_start_paddr;
+    std.debug.assert(std.mem.isAligned(
+        symbol_map_start_paddr.addr,
+        page4K,
+    ));
+    while (current_symbol_map_page_paddr.addr < symbol_map_end_paddr.addr) {
+        const current_symbol_map_page_vaddr = VAddr.fromPAddr(
+            current_symbol_map_page_paddr,
+            .kernel,
+        );
+        paging.mapPage(
+            @ptrFromInt(new_pml4_vaddr.addr),
+            current_symbol_map_page_paddr,
+            current_symbol_map_page_vaddr,
+            .Readonly,
+            false,
+            .Supervisor,
+            .Page4K,
+            .kernel,
+            bump_alloc_iface,
+        );
+
+        current_symbol_map_page_paddr.addr += page4K;
+    }
 
     const text_start = VAddr.fromInt(@intCast(@intFromPtr(&_text_start)));
     const text_end = VAddr.fromInt(@intCast(@intFromPtr(&_text_end)));
@@ -140,11 +165,6 @@ export fn kmain(
             bump_alloc_iface,
         );
     }
-    vga.print("Mapped text at start {X} end {X} pages {}\n", .{
-        text_start.addr,
-        page_aligned_text_end.addr,
-        text_pages,
-    });
 
     // Everything from rodata start to data start is mapped as readonly
     // because the linker places linker symbols in another section between this
@@ -173,11 +193,6 @@ export fn kmain(
             bump_alloc_iface,
         );
     }
-    vga.print("Mapped rodata at start {X} end {X} pages {}\n", .{
-        rodata_start.addr,
-        page_aligned_rodata_end.addr,
-        rodata_pages,
-    });
 
     const data_end = VAddr.fromInt(@intCast(@intFromPtr(&_data_end)));
     const page_aligned_data_end = VAddr.fromInt(std.mem.alignForward(
@@ -202,11 +217,6 @@ export fn kmain(
             bump_alloc_iface,
         );
     }
-    vga.print("Mapped data at start {X} end {X} pages {}\n", .{
-        data_start.addr,
-        page_aligned_data_end.addr,
-        rodata_pages,
-    });
 
     const bss_start = VAddr.fromInt(@intCast(@intFromPtr(&_bss_start)));
     const bss_end = VAddr.fromInt(@intCast(@intFromPtr(&_bss_end)));
@@ -232,11 +242,6 @@ export fn kmain(
             bump_alloc_iface,
         );
     }
-    vga.print("Mapped bss at start {X} end {X} pages {}\n", .{
-        bss_start.addr,
-        page_aligned_bss_end.addr,
-        bss_pages,
-    });
 
     var max_end_paddr = PAddr.fromInt(0);
     for (memory_regions) |region| {
@@ -264,12 +269,6 @@ export fn kmain(
             end_paddr,
             bump_alloc_iface,
         );
-
-        // NOTE: DEBUG
-        vga.print("Phys mapped region: start paddr {X} end paddr {X}\n", .{
-            start_paddr.addr,
-            end_paddr.addr,
-        });
     }
 
     const vga_paddr = PAddr.fromInt(0xB8000);
@@ -323,12 +322,6 @@ export fn kmain(
     ) catch @panic("Failed to allocate memory for buddy allocator!");
     const buddy_alloc_iface = buddy_allocator.allocator();
 
-    // NOTE: DEBUG
-    vga.print("Init buddy alloc: start vaddr {X} end vaddr {X}\n", .{
-        buddy_start_vaddr.addr,
-        buddy_end_vaddr.addr,
-    });
-
     pmm_mod.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
 
     const page1G = @intFromEnum(paging.PageSize.Page1G);
@@ -341,12 +334,6 @@ export fn kmain(
         vmm_end_vaddr,
     );
     var vmm = &vmm_mod.global_vmm.?;
-
-    // NOTE: DEBUG
-    vga.print("Init vmm: start vaddr {X} end vaddr {X}\n", .{
-        vmm_start_vaddr.addr,
-        vmm_end_vaddr.addr,
-    });
 
     const vaddr_space_start = vmm.reserve(
         page1G,

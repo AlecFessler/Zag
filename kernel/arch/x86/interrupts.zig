@@ -44,7 +44,7 @@ export fn commonInterruptStub() callconv(.naked) void {
         \\pushq %r15
         \\
         \\mov %rsp, %rdi
-        \\call *%[dispatch]
+        \\call dispatchInterrupt
         \\
         \\popq %r15
         \\popq %r14
@@ -65,7 +65,7 @@ export fn commonInterruptStub() callconv(.naked) void {
         \\addq $16, %rsp
         \\iretq
         :
-        : [dispatch] "r" (dispatchInterrupt),
+        :
         : .{ .memory = true, .cc = true }
     );
 }
@@ -76,19 +76,17 @@ pub fn getInterruptStub(comptime int_num: u8, comptime pushes_err: bool) idt.int
             if (pushes_err) {
                 asm volatile (
                     \\pushq %[num]
-                    \\jmp *%[common]
+                    \\jmp commonInterruptStub
                     :
-                    : [num] "r" (@as(usize, int_num)),
-                      [common] "r" (commonInterruptStub),
+                    : [num] "i" (@as(usize, int_num))
                 );
             } else {
                 asm volatile (
                     \\pushq $0
                     \\pushq %[num]
-                    \\jmp *%[common]
+                    \\jmp commonInterruptStub
                     :
-                    : [num] "r" (@as(usize, int_num)),
-                      [common] "r" (commonInterruptStub),
+                    : [num] "i" (@as(usize, int_num))
                 );
             }
         }

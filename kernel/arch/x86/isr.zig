@@ -247,13 +247,6 @@ fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
         const pml4_paddr = PAddr.fromInt(paging.read_cr3().addr & ~@as(u64, 0xfff));
         const pml4_vaddr = VAddr.fromPAddr(pml4_paddr, .physmap);
 
-        std.debug.assert(paging.pml4_index(faulting_page_vaddr) == @intFromEnum(paging.AddressSpace.kvmm));
-
-        vga.print("Mapping paddr {X} to vaddr {X}\n", .{
-            phys_page_paddr.addr,
-            faulting_page_vaddr.addr,
-        });
-
         paging.mapPage(
             @ptrFromInt(pml4_vaddr.addr),
             phys_page_paddr,
