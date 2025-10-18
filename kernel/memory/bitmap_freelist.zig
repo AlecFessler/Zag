@@ -1,6 +1,7 @@
 const std = @import("std");
 
-pub const Word = u64; // set here so different sizes can be profiled
+pub const Word = u64;
+
 pub const WORD_BIT_SIZE = @bitSizeOf(Word);
 
 pub fn BitmapFreeList(
@@ -61,7 +62,7 @@ pub fn BitmapFreeList(
 
             const first_free: u6 = @intCast(@ctz(next_free_word));
 
-            const one: u64 = 1; // fixed width integer type for left hand side of shift
+            const one: u64 = 1;
             self.bitmap[self.hint] &= ~(one << first_free);
             const bit_number = self.hint * WORD_BIT_SIZE + first_free;
 

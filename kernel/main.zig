@@ -1,40 +1,40 @@
-const std = @import("std");
-
-const panic_mod = @import("panic.zig");
 const memory = @import("memory");
+const panic_mod = @import("panic.zig");
+const std = @import("std");
+const x86 = @import("x86");
+
 const bump_alloc = memory.BumpAllocator;
 const buddy_alloc = memory.BuddyAllocator;
-const heap_alloc = memory.HeapAllocator;
-const pmm_mod = memory.PhysicalMemoryManager;
-const vmm_mod = memory.VirtualMemoryManager;
-const x86 = @import("x86");
 const cpu = x86.Cpu;
-const paging = x86.Paging;
-const vga = x86.Vga;
 const gdt = x86.Gdt;
+const heap_alloc = memory.HeapAllocator;
 const idt = x86.Idt;
-const isr = x86.Isr;
 const interrupts = x86.Interrupts;
+const isr = x86.Isr;
 const multiboot = x86.Multiboot;
+const paging = x86.Paging;
+const pmm_mod = memory.PhysicalMemoryManager;
+const vga = x86.Vga;
+const vmm_mod = memory.VirtualMemoryManager;
 
 const BumpAllocator = bump_alloc.BumpAllocator;
 const BuddyAllocator = buddy_alloc.BuddyAllocator;
 const HeapAllocator = heap_alloc.HeapAllocator;
 const HeapTreeAllocator = heap_alloc.TreeAllocator;
-const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
-const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
-const VAddr = paging.VAddr;
 const PAddr = paging.PAddr;
+const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
+const VAddr = paging.VAddr;
+const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
 
-extern const _text_start: u8;
-extern const _text_end: u8;
-extern const _rodata_start: u8;
-extern const _rodata_end: u8;
-extern const _data_start: u8;
-extern const _data_end: u8;
-extern const _bss_start: u8;
 extern const _bss_end: u8;
+extern const _bss_start: u8;
+extern const _data_end: u8;
+extern const _data_start: u8;
 extern const _kernel_end: u8;
+extern const _rodata_end: u8;
+extern const _rodata_start: u8;
+extern const _text_end: u8;
+extern const _text_start: u8;
 
 pub fn panic(
     msg: []const u8,

@@ -1,27 +1,19 @@
 const std = @import("std");
-
 const x86 = @import("x86");
+
 const paging = x86.Paging;
+
 const VAddr = paging.VAddr;
-
-/// Global kernel vmm primarily for use by page fault handler and initializing allocators
-pub var global_vmm: ?VirtualMemoryManager = null;
-
-/// With the way allocators are planned to be used, there will be very few allocations made
-/// from the VMM itself, typically made upfront when allocators are initialized. Because of this,
-/// we just use a fixed size array of base + size fat pointers for simplicity and for the page fault
-/// handler to quickly check if a faulting address is valid
-const MAX_RESERVATIONS = 16;
-
-pub const VmmAllocation = struct {
-    vaddr: VAddr,
-    size: u64,
-};
 
 pub const VmmErrors = error{
     TooManyReservations,
     OutOfAddressSpace,
     InvalidSize,
+};
+
+pub const VmmAllocation = struct {
+    vaddr: VAddr,
+    size: u64,
 };
 
 pub const VirtualMemoryManager = struct {
@@ -74,3 +66,7 @@ pub const VirtualMemoryManager = struct {
         return aligned;
     }
 };
+
+const MAX_RESERVATIONS = 16;
+
+pub var global_vmm: ?VirtualMemoryManager = null;

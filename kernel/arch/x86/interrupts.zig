@@ -1,17 +1,8 @@
-const std = @import("std");
-
 const cpu = @import("cpu.zig");
 const idt = @import("idt.zig");
-const isr = @import("isr.zig");
 const irq = @import("irq.zig");
-
-export fn dispatchInterrupt(ctx: *InterruptContext) void {
-    if (ctx.int_num < isr.NUM_ISR_ENTRIES or ctx.int_num == isr.SYSCALL_INT_VECTOR) {
-        isr.dispatchIsr(ctx);
-    } else {
-        irq.dispatchIrq(ctx);
-    }
-}
+const isr = @import("isr.zig");
+const std = @import("std");
 
 pub const InterruptContext = packed struct {
     regs: cpu.Registers,
@@ -24,6 +15,28 @@ pub const InterruptContext = packed struct {
     ss: u64,
 };
 
+pub fn getInterruptStub(comptime int_num: u8, comptime pushes_err: bool) idt.interruptHandler {
+    return struct {
+        fn stub() callconv(.naked) void {
+            if (pushes_err) {
+                asm volatile (
+                    \\pushq %[num]
+                    \\jmp commonInterruptStub
+                    :
+                    : [num] "i" (@as(usize, int_num))
+                );
+            } else {
+                asm volatile (
+                    \\pushq $0
+                    \\pushq %[num]
+                    \\jmp commonInterruptStub
+                    :
+                    : [num] "i" (@as(usize, int_num))
+                );
+            }
+        }
+    }.stub;
+}
 
 export fn commonInterruptStub() callconv(.naked) void {
     asm volatile (
@@ -70,25 +83,10 @@ export fn commonInterruptStub() callconv(.naked) void {
     );
 }
 
-pub fn getInterruptStub(comptime int_num: u8, comptime pushes_err: bool) idt.interruptHandler {
-    return struct {
-        fn stub() callconv(.naked) void {
-            if (pushes_err) {
-                asm volatile (
-                    \\pushq %[num]
-                    \\jmp commonInterruptStub
-                    :
-                    : [num] "i" (@as(usize, int_num))
-                );
-            } else {
-                asm volatile (
-                    \\pushq $0
-                    \\pushq %[num]
-                    \\jmp commonInterruptStub
-                    :
-                    : [num] "i" (@as(usize, int_num))
-                );
-            }
-        }
-    }.stub;
+export fn dispatchInterrupt(ctx: *InterruptContext) void {
+    if (ctx.int_num < isr.NUM_ISR_ENTRIES or ctx.int_num == isr.SYSCALL_INT_VECTOR) {
+        isr.dispatchIsr(ctx);
+    } else {
+        irq.dispatchIrq(ctx);
+    }
 }

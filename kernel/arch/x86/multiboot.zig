@@ -8,14 +8,44 @@
 //! This is typically used during early kernel initialization to inspect the memory map
 //! and retrieve configuration data provided by the bootloader.
 
+const paging = @import("paging.zig");
 const std = @import("std");
 
-const paging = @import("paging.zig");
-const VAddr = paging.VAddr;
 const PAddr = paging.PAddr;
+const VAddr = paging.VAddr;
 
-pub const MAGIC = 0x2BADB002;
-pub const MAX_REGIONS = 32;
+/// Represents the type of a physical memory region as described by the Multiboot v1 memory map.
+/// These correspond to the values provided in the `type` field of `MultibootMmapEntry`,
+/// but note that the parser subtracts 1 so the enum starts at 0 for use as an array index.
+///
+/// This enum is used to classify memory regions according to their availability or reserved purpose.
+pub const MemoryRegionType = enum(u32) {
+    /// Usable RAM available for general-purpose allocation.
+    Available,
+
+    /// Reserved memory that must not be used by the kernel or applications.
+    Reserved,
+
+    /// Reclaimable memory, usable after ACPI tables are parsed.
+    AcpiReclaimable,
+
+    /// Non-volatile memory used for sleep states (ACPI NVS), not available for use.
+    AcpiNvs,
+
+    /// Memory region containing errors or defects, must not be used.
+    BadMem,
+
+    /// Returns a human-readable string representation of the memory region type.
+    pub fn toString(self: @This()) []const u8 {
+        return switch (self) {
+            .Available => "Available",
+            .Reserved => "Reserved",
+            .AcpiReclaimable => "ACPI Reclaimable",
+            .AcpiNvs => "ACPI non-volatile sleep memory",
+            .BadMem => "Bad Memory",
+        };
+    }
+};
 
 /// Represents the Multiboot information structure provided by a compliant bootloader
 /// according to the Multiboot Specification v1. This structure is located at the address
@@ -87,9 +117,20 @@ pub const MultibootInfo = packed struct {
     vbe_interface_len: u16,
 };
 
-pub fn checkFlag(flags: u32, bit: u5) bool {
-    return 1 == (1 & (flags >> bit));
-}
+/// Represents a physical memory region reported by the bootloader.
+///
+/// Each region includes a base physical address, a length in bytes,
+/// and a classification via `MemoryRegionType` (e.g., Available, Reserved).
+pub const MemoryRegion = struct {
+    /// Starting physical address of the region.
+    addr: u64,
+
+    /// Length of the region in bytes.
+    len: u64,
+
+    /// Type of region (e.g., usable, reserved, ACPI reclaimable).
+    region_type: MemoryRegionType,
+};
 
 pub const Mod = packed struct {
     start: u32,
@@ -98,20 +139,6 @@ pub const Mod = packed struct {
     padding: u32,
 };
 
-pub const ElfSectionHeaderTable = packed struct {
-    num: u32,
-    size: u32,
-    addr: u32,
-    shndx: u32,
-};
-
-/// Represents a single entry in the memory map provided by a Multiboot v1-compliant bootloader.
-/// These entries are found at the physical address given by `mmap_addr` in the `MultibootInfo`
-/// struct, and the full memory map spans `mmap_len` bytes. The memory map may be unaligned based
-/// on what Zig expects, but it is still valid.
-///
-/// Each entry describes a contiguous region of physical memory, including its starting address,
-/// length in bytes, and usage type.
 pub const MultibootMmapEntry = packed struct {
     /// Size of the entry, excluding the `size` field itself.
     size: u32,
@@ -127,53 +154,19 @@ pub const MultibootMmapEntry = packed struct {
     type: u32,
 };
 
-/// Represents the type of a physical memory region as described by the Multiboot v1 memory map.
-/// These correspond to the values provided in the `type` field of `MultibootMmapEntry`,
-/// but note that the parser subtracts 1 so the enum starts at 0 for use as an array index.
-///
-/// This enum is used to classify memory regions according to their availability or reserved purpose.
-pub const MemoryRegionType = enum(u32) {
-    /// Usable RAM available for general-purpose allocation.
-    Available,
-
-    /// Reserved memory that must not be used by the kernel or applications.
-    Reserved,
-
-    /// Reclaimable memory, usable after ACPI tables are parsed.
-    AcpiReclaimable,
-
-    /// Non-volatile memory used for sleep states (ACPI NVS), not available for use.
-    AcpiNvs,
-
-    /// Memory region containing errors or defects, must not be used.
-    BadMem,
-
-    /// Returns a human-readable string representation of the memory region type.
-    pub fn toString(self: @This()) []const u8 {
-        return switch (self) {
-            .Available => "Available",
-            .Reserved => "Reserved",
-            .AcpiReclaimable => "ACPI Reclaimable",
-            .AcpiNvs => "ACPI non-volatile sleep memory",
-            .BadMem => "Bad Memory",
-        };
-    }
+pub const ElfSectionHeaderTable = packed struct {
+    num: u32,
+    size: u32,
+    addr: u32,
+    shndx: u32,
 };
 
-/// Represents a physical memory region reported by the bootloader.
-///
-/// Each region includes a base physical address, a length in bytes,
-/// and a classification via `MemoryRegionType` (e.g., Available, Reserved).
-pub const MemoryRegion = struct {
-    /// Starting physical address of the region.
-    addr: u64,
+pub const MAGIC = 0x2BADB002;
+pub const MAX_REGIONS = 32;
 
-    /// Length of the region in bytes.
-    len: u64,
-
-    /// Type of region (e.g., usable, reserved, ACPI reclaimable).
-    region_type: MemoryRegionType,
-};
+pub fn checkFlag(flags: u32, bit: u5) bool {
+    return 1 == (1 & (flags >> bit));
+}
 
 pub fn parseMemoryMap(info: *const MultibootInfo, regions: *[MAX_REGIONS]MemoryRegion) []MemoryRegion {
     const mmap_paddr = PAddr.fromInt(info.mmap_addr);
@@ -194,7 +187,6 @@ pub fn parseMemoryMap(info: *const MultibootInfo, regions: *[MAX_REGIONS]MemoryR
 }
 
 pub fn parseModules(info: *const MultibootInfo, wanted: []const u8) ?[]const u8 {
-
     // Bit 3 => mods_count/mods_addr valid
     if (!checkFlag(info.flags, 3) or info.mods_count == 0) return null;
 

@@ -1,28 +1,17 @@
-const std = @import("std");
-
+const interrupts = @import("interrupts.zig");
 const idt = @import("idt.zig");
 const isr = @import("isr.zig");
-const interrupts = @import("interrupts.zig");
-
-const NUM_IRQ_ENTRIES = 16;
+const std = @import("std");
 
 const IrqHandler = fn (*interrupts.InterruptContext) void;
+
+const NUM_IRQ_ENTRIES = 16;
 
 var irq_handlers: [NUM_IRQ_ENTRIES]?IrqHandler = .{null} ** NUM_IRQ_ENTRIES;
 
 pub fn dispatchIrq(ctx: *interrupts.InterruptContext) void {
-    // implement this once the pic driver is implemented
     _ = ctx;
     @panic("IRQ Dispatcher not yet implemented!\n");
-}
-
-pub fn registerIrq(irq_num: u4, handler: IrqHandler) void {
-    if (irq_handlers[irq_num]) |_| {
-        @panic("IRQ handler already registered!\n");
-    } else {
-        irq_handlers[irq_num] = handler;
-        // clear pic mask when implemented
-    }
 }
 
 pub fn init() void {
@@ -36,5 +25,13 @@ pub fn init() void {
             idt.PrivilegeLevel.ring_0,
             idt.GateType.interrupt_gate,
         );
+    }
+}
+
+pub fn registerIrq(irq_num: u4, handler: IrqHandler) void {
+    if (irq_handlers[irq_num]) |_| {
+        @panic("IRQ handler already registered!\n");
+    } else {
+        irq_handlers[irq_num] = handler;
     }
 }

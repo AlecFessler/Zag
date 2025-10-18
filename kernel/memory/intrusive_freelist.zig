@@ -1,5 +1,5 @@
-const std = @import("std");
 const builtin = @import("builtin");
+const std = @import("std");
 
 const DBG = builtin.mode == .Debug;
 const DBG_MAGIC = 0x0DEAD2A6DEAD2A60;

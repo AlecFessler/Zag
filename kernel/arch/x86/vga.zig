@@ -1,14 +1,14 @@
+const paging = @import("paging.zig");
 const std = @import("std");
 
-const paging = @import("paging.zig");
 const PAddr = paging.PAddr;
 const VAddr = paging.VAddr;
 
+const TEMP_BUFFER_SIZE = 512;
 const VGA_BUFFER_PADDR = 0xB8000;
-const VGA_WIDTH = 80;
 const VGA_HEIGHT = 25;
 const VGA_SIZE = VGA_WIDTH * VGA_HEIGHT;
-const TEMP_BUFFER_SIZE = 512;
+const VGA_WIDTH = 80;
 
 pub const VgaColor = enum(u8) {
     Black,
@@ -30,9 +30,18 @@ pub const VgaColor = enum(u8) {
 };
 
 var buffer: [*]volatile u16 = undefined;
-var row: u64 = 0;
-var column: u64 = 0;
 var color: u8 = 0;
+var column: u64 = 0;
+var row: u64 = 0;
+
+pub fn clear() void {
+    const blank = makeEntry(' ', color);
+    for (0..VGA_SIZE) |i| {
+        buffer[i] = blank;
+    }
+    row = 0;
+    column = 0;
+}
 
 pub fn initialize(
     foreground: VgaColor,
@@ -45,17 +54,12 @@ pub fn initialize(
     setColor(foreground, background);
 }
 
-pub fn clear() void {
-    const blank = makeEntry(' ', color);
-    for (0..VGA_SIZE) |i| {
-        buffer[i] = blank;
-    }
-    row = 0;
-    column = 0;
+pub fn makeColor(foreground: VgaColor, background: VgaColor) u8 {
+    return @intFromEnum(foreground) | (@intFromEnum(background) << 4);
 }
 
-pub fn setColor(foreground: VgaColor, background: VgaColor) void {
-    color = makeColor(foreground, background);
+pub fn makeEntry(c: u8, entry_color: u8) u16 {
+    return c | (@as(u16, entry_color) << 8);
 }
 
 pub fn print(comptime format: []const u8, args: anytype) void {
@@ -83,6 +87,10 @@ pub fn print(comptime format: []const u8, args: anytype) void {
     }
 }
 
+pub fn setColor(foreground: VgaColor, background: VgaColor) void {
+    color = makeColor(foreground, background);
+}
+
 fn scroll() void {
     for (0..VGA_HEIGHT - 1) |y| {
         for (0..VGA_WIDTH) |x| {
@@ -94,12 +102,4 @@ fn scroll() void {
     for (0..VGA_WIDTH) |x| {
         buffer[(VGA_HEIGHT - 1) * VGA_WIDTH + x] = blank;
     }
-}
-
-pub fn makeColor(foreground: VgaColor, background: VgaColor) u8 {
-    return @intFromEnum(foreground) | (@intFromEnum(background) << 4);
-}
-
-pub fn makeEntry(c: u8, entry_color: u8) u16 {
-    return c | (@as(u16, entry_color) << 8);
 }

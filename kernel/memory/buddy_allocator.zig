@@ -1,18 +1,6 @@
-const std = @import("std");
-
 const bitmap_freelist = @import("bitmap_freelist.zig");
 const intrusive_freelist = @import("intrusive_freelist.zig");
-
-const PAGE_SIZE = 4096;
-
-const NUM_ORDERS = 11;
-const ORDERS = blk: {
-    var arr: [NUM_ORDERS]u64 = undefined;
-    for (0..NUM_ORDERS) |i| {
-        arr[i] = (1 << i) * PAGE_SIZE;
-    }
-    break :blk arr;
-};
+const std = @import("std");
 
 /// Used to give the intrusive freelist a size and alignment
 /// and to specify the allocation type for std.mem.Allocator.alloc()
@@ -35,22 +23,35 @@ const PagePairOrders = packed struct {
     }
 };
 
+/// Return type for splitAllocation, a linked list of blocks of the requested order
 const using_popSpecific = true;
 const link_to_list = false;
-const IntrusiveFreeList = intrusive_freelist.IntrusiveFreeList(
-    *Page,
-    using_popSpecific,
-    link_to_list,
-);
-const using_getNextFree = false;
-const BitmapFreeList = bitmap_freelist.BitmapFreeList(using_getNextFree);
-
-/// Return type for splitAllocation, a linked list of blocks of the requested order
 pub const FreeListBatch = intrusive_freelist.IntrusiveFreeList(
     *Page,
     !using_popSpecific,
     link_to_list,
 );
+
+const using_getNextFree = false;
+const BitmapFreeList = bitmap_freelist.BitmapFreeList(using_getNextFree);
+
+const IntrusiveFreeList = intrusive_freelist.IntrusiveFreeList(
+    *Page,
+    using_popSpecific,
+    link_to_list,
+);
+
+const NUM_ORDERS = 11;
+
+const ORDERS = blk: {
+    var arr: [NUM_ORDERS]u64 = undefined;
+    for (0..NUM_ORDERS) |i| {
+        arr[i] = (1 << i) * PAGE_SIZE;
+    }
+    break :blk arr;
+};
+
+const PAGE_SIZE = 4096;
 
 /// Owning allocator. Manages a contiguous address space, does not take a backing allocator, can act as a backing allocator;
 pub const BuddyAllocator = struct {

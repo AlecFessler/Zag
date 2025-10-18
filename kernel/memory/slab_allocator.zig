@@ -1,7 +1,6 @@
-const std = @import("std");
 const builtin = @import("builtin");
-
 const intrusive_freelist = @import("intrusive_freelist.zig");
+const std = @import("std");
 
 const DBG = builtin.mode == .Debug;
 

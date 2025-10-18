@@ -1,82 +1,23 @@
-const std = @import("std");
 const builtin = @import("builtin");
-
-const DBG = builtin.mode == .Debug;
-
+const Containers = @import("containers");
 const intrusive_freelist = @import("intrusive_freelist.zig");
 const slab_alloc = @import("slab_allocator.zig");
-const Containers = @import("containers");
+const std = @import("std");
+
 const rbt = Containers.RedBlackTree;
+
+pub const AllocFooter = packed struct(u64) {
+    header: u64,
+};
 
 pub const AllocHeader = packed struct(u64) {
     is_free: bool,
     bucket_size: u63,
 };
 
-const HEADER_SIZE = @sizeOf(AllocHeader);
-const HEADER_ALIGN = @alignOf(AllocHeader);
-
 pub const AllocPadding = packed struct(u64) {
     header_offset: u64,
 };
-
-const PADDING_SIZE = @sizeOf(AllocPadding);
-const PADDING_ALIGN = @alignOf(AllocPadding);
-
-const PREFIX_SIZE = HEADER_SIZE + PADDING_SIZE;
-const PREFIX_ALIGN = HEADER_ALIGN;
-
-pub const AllocFooter = packed struct(u64) {
-    header: u64,
-};
-
-const FOOTER_SIZE = @sizeOf(AllocFooter);
-const FOOTER_ALIGN = @alignOf(AllocFooter);
-
-const FREELIST_ENTRY_ALIGN = @alignOf(u64);
-const FREELIST_ENTRY_SIZE = @sizeOf(usize) * 4;
-const FreelistEntry = struct {
-    bytes: [FREELIST_ENTRY_SIZE]u8 align(FREELIST_ENTRY_ALIGN),
-};
-
-const MIN_USER_SIZE = FREELIST_ENTRY_SIZE;
-const MIN_USER_ALIGN = FREELIST_ENTRY_ALIGN;
-
-const MIN_BLOCK_SIZE = PREFIX_SIZE + MIN_USER_SIZE + FOOTER_SIZE;
-
-const using_popSpecific = true;
-const link_to_list = true;
-pub const Freelist = intrusive_freelist.IntrusiveFreeList(
-    *FreelistEntry,
-    using_popSpecific,
-    link_to_list,
-);
-
-pub const TreeEntry = struct {
-    bucket_size: usize,
-    freelist: Freelist,
-
-    pub fn cmpFn(first: TreeEntry, second: TreeEntry) std.math.Order {
-        return std.math.order(first.bucket_size, second.bucket_size);
-    }
-};
-
-const duplicate_is_error = false;
-pub const RedBlackTree = rbt.RedBlackTree(
-    TreeEntry,
-    TreeEntry.cmpFn,
-    duplicate_is_error,
-);
-
-const stack_bootstrap = false;
-const stack_size = 0;
-const allocation_chunk_size = 64;
-pub const TreeAllocator = slab_alloc.SlabAllocator(
-    RedBlackTree.Node,
-    stack_bootstrap,
-    stack_size,
-    allocation_chunk_size,
-);
 
 pub const HeapAllocator = struct {
     reserve_start: u64,
@@ -167,7 +108,6 @@ pub const HeapAllocator = struct {
                     continue :list_walk;
                 }
 
-                // prefetch block's footer for either a potential split_block footer or the final footer write
                 const footer_ptr: *AllocFooter = @ptrFromInt(block_end - FOOTER_SIZE);
                 @prefetch(footer_ptr, .{});
 
@@ -280,16 +220,16 @@ pub const HeapAllocator = struct {
         user_size: u64,
         user_align: u64,
     ) struct {
-        u64, // block_base
-        u64, // user_block_base
-        u64, // block_end
-        u64, // bucket_size
+        u64,
+        u64,
+        u64,
+        u64,
     } {
         const block_base = freelist_entry_base - PREFIX_SIZE;
         std.debug.assert(std.mem.isAligned(
             block_base,
             HEADER_ALIGN,
-        )); // block base is header base
+        ));
 
         const user_block_base = std.mem.alignForward(u64, freelist_entry_base, user_align);
         const user_block_end = user_block_base + user_size;
@@ -300,7 +240,7 @@ pub const HeapAllocator = struct {
         std.debug.assert(std.mem.isAligned(
             block_end,
             HEADER_ALIGN,
-        )); // block end is next header base
+        ));
 
         const bucket_size = block_end - freelist_entry_base;
 
@@ -317,10 +257,10 @@ pub const HeapAllocator = struct {
         bucket_size: u64,
         split_size: u64,
     ) struct {
-        u64, // header base
-        u64, // entry base
-        u64, // footer base
-        u64, // bucket size
+        u64,
+        u64,
+        u64,
+        u64,
     } {
         std.debug.assert(split_size >= MIN_BLOCK_SIZE);
 
@@ -330,7 +270,6 @@ pub const HeapAllocator = struct {
             HEADER_ALIGN,
         ));
 
-        // prefetch for alloc to write split header and final footer
         const split_block_ptr: [*]u8 = @ptrFromInt(split_block_base);
         @prefetch(split_block_ptr, .{});
 
@@ -346,7 +285,7 @@ pub const HeapAllocator = struct {
         std.debug.assert(std.mem.isAligned(
             split_block_end,
             HEADER_ALIGN,
-        )); // block end is the base of the next header
+        ));
 
         const split_footer_base = split_block_end - FOOTER_SIZE;
         std.debug.assert(std.mem.isAligned(
@@ -440,7 +379,6 @@ pub const HeapAllocator = struct {
         const padding_base = user_base - PADDING_SIZE;
         const padding: *AllocPadding = @ptrFromInt(padding_base);
 
-        // Header and base will change if merge_prev occurs.
         var header_base = user_base - padding.header_offset;
         var header: *AllocHeader = @ptrFromInt(header_base);
         std.debug.assert(!header.is_free);
@@ -448,12 +386,10 @@ pub const HeapAllocator = struct {
 
         const block_end = header_base + PREFIX_SIZE + header.bucket_size;
 
-        // prefetch next_header_base for merge next
         const next_header_base: u64 = header_base + PREFIX_SIZE + header.bucket_size;
         const next_header: *AllocHeader = @ptrFromInt(next_header_base);
         @prefetch(next_header, .{});
 
-        // prefetch block footer for either zeroing in merge_next or writing as final footer
         const block_footer: *AllocFooter = @ptrFromInt(block_end - FOOTER_SIZE);
         @prefetch(block_footer, .{});
 
@@ -506,9 +442,8 @@ pub const HeapAllocator = struct {
             std.debug.assert(std.mem.isAligned(
                 next_end,
                 HEADER_ALIGN,
-            )); // next end is the following headers base
+            ));
 
-            // prefetch next footer for writing as final footer
             const footer_base = next_end - FOOTER_SIZE;
             const footer_ptr: *AllocFooter = @ptrFromInt(footer_base);
             @prefetch(footer_ptr, .{});
@@ -584,7 +519,6 @@ pub const HeapAllocator = struct {
         new_node.data.freelist.push(freelist_entry);
     }
 
-    /// Helper function for unit tests and fuzzer
     pub fn validateState(self: *HeapAllocator, tmp_alloc: std.mem.Allocator) bool {
         const tree_result = RedBlackTree.validateRedBlackTree(
             self.free_tree.root,
@@ -594,8 +528,8 @@ pub const HeapAllocator = struct {
         if (!tree_result.valid) return false;
         const BlockInfo = struct {
             header_addr: u64,
-            entry_addr: u64, // header + sizeof(AllocHeader)
-            end_addr: u64, // header + sizeof(AllocHeader) + bucket_size
+            entry_addr: u64,
+            end_addr: u64,
             bucket_size: u64,
             is_free: bool,
             found_in_tree: bool,
@@ -652,7 +586,6 @@ pub const HeapAllocator = struct {
             }
         };
 
-        // Pass 1: linear memory sweep builds authoritative map
         var cur: u64 = std.mem.alignForward(u64, self.reserve_start, HEADER_ALIGN);
 
         var prev_was_free = false;
@@ -768,7 +701,6 @@ pub const HeapAllocator = struct {
                 .extra_a = cur,
             });
 
-        // Pass 2: tree+freelist walk, backlink & metadata checks, mark map
         var stack: [64]?*RedBlackTree.Node = undefined;
         var sp: usize = 0;
 
@@ -919,7 +851,6 @@ pub const HeapAllocator = struct {
             }
         }
 
-        // Pass 3: post-checks for orphans
         var it = blocks.iterator();
         while (it.next()) |kv| {
             const bi = kv.value_ptr.*;
@@ -935,6 +866,66 @@ pub const HeapAllocator = struct {
         return true;
     }
 };
+
+pub const TreeEntry = struct {
+    bucket_size: usize,
+    freelist: Freelist,
+
+    pub fn cmpFn(first: TreeEntry, second: TreeEntry) std.math.Order {
+        return std.math.order(first.bucket_size, second.bucket_size);
+    }
+};
+
+const FreelistEntry = struct {
+    bytes: [FREELIST_ENTRY_SIZE]u8 align(FREELIST_ENTRY_ALIGN),
+};
+
+const using_popSpecific = true;
+const link_to_list = true;
+pub const Freelist = intrusive_freelist.IntrusiveFreeList(
+    *FreelistEntry,
+    using_popSpecific,
+    link_to_list,
+);
+
+const duplicate_is_error = false;
+pub const RedBlackTree = rbt.RedBlackTree(
+    TreeEntry,
+    TreeEntry.cmpFn,
+    duplicate_is_error,
+);
+
+const stack_bootstrap = false;
+const stack_size = 0;
+const allocation_chunk_size = 64;
+pub const TreeAllocator = slab_alloc.SlabAllocator(
+    RedBlackTree.Node,
+    stack_bootstrap,
+    stack_size,
+    allocation_chunk_size,
+);
+
+const DBG = builtin.mode == .Debug;
+
+const HEADER_SIZE = @sizeOf(AllocHeader);
+const HEADER_ALIGN = @alignOf(AllocHeader);
+
+const PADDING_SIZE = @sizeOf(AllocPadding);
+const PADDING_ALIGN = @alignOf(AllocPadding);
+
+const PREFIX_SIZE = HEADER_SIZE + PADDING_SIZE;
+const PREFIX_ALIGN = HEADER_ALIGN;
+
+const FOOTER_SIZE = @sizeOf(AllocFooter);
+const FOOTER_ALIGN = @alignOf(AllocFooter);
+
+const FREELIST_ENTRY_ALIGN = @alignOf(u64);
+const FREELIST_ENTRY_SIZE = @sizeOf(usize) * 4;
+
+const MIN_USER_SIZE = FREELIST_ENTRY_SIZE;
+const MIN_USER_ALIGN = FREELIST_ENTRY_ALIGN;
+
+const MIN_BLOCK_SIZE = PREFIX_SIZE + MIN_USER_SIZE + FOOTER_SIZE;
 
 test "tree contains after free, then removed after re-alloc (exact fit)" {
     const testing_allocator = std.testing.allocator;

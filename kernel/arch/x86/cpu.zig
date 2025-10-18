@@ -20,14 +20,6 @@ pub const Registers = packed struct {
     rax: u64,
 };
 
-pub fn read_cr2() VAddr {
-    var addr: u64 = 0;
-    asm volatile ("mov %%cr2, %[addr]"
-        : [addr] "=r" (addr),
-    );
-    return VAddr.fromInt(addr);
-}
-
 pub fn halt() noreturn {
     while (true) {
         asm volatile ("hlt");
@@ -41,6 +33,14 @@ pub fn invlpg(vaddr: VAddr) void {
         : [a] "r" (vaddr.addr)
         : .{ .memory = true }
     );
+}
+
+pub fn read_cr2() VAddr {
+    var addr: u64 = 0;
+    asm volatile ("mov %%cr2, %[addr]"
+        : [addr] "=r" (addr),
+    );
+    return VAddr.fromInt(addr);
 }
 
 pub fn reloadSegments() void {

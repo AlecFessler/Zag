@@ -1,9 +1,5 @@
 const std = @import("std");
 
-/// Global pmm for access primarily by page fault handler
-pub var global_pmm: ?PhysicalMemoryManager = null;
-
-/// Delegating allocator. Requires a backing allocator, can also act as a backing allocator.
 pub const PhysicalMemoryManager = struct {
     backing_allocator: std.mem.Allocator,
 
@@ -83,3 +79,6 @@ pub const PhysicalMemoryManager = struct {
         );
     }
 };
+
+/// Global pmm for access primarily by page fault handler
+pub var global_pmm: ?PhysicalMemoryManager = null;

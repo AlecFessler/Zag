@@ -1,9 +1,9 @@
 const std = @import("std");
-const builtin = std.builtin;
-
 const x86 = @import("x86");
-const vga = x86.Vga;
+
+const builtin = std.builtin;
 const cpu = x86.Cpu;
+const vga = x86.Vga;
 
 pub const PanicError = error{
     InvalidSymbolFile,
@@ -143,19 +143,6 @@ pub fn initSymbolsFromSlice(
     g_symmap = sm;
 }
 
-fn logAddr(pc: u64) void {
-    if (g_symmap) |sm| {
-        if (sm.find(pc)) |hit| {
-            const off = pc - hit.base;
-            vga.print("{X}: {s}+0x{X}\n", .{ pc, hit.name, off });
-            return;
-        }
-        vga.print("{X}: ?????\n", .{pc});
-        return;
-    }
-    vga.print("{X}: (no symbols)\n", .{pc});
-}
-
 pub fn panic(
     msg: []const u8,
     trace: ?*builtin.StackTrace,
@@ -182,4 +169,17 @@ pub fn panic(
     }
 
     cpu.halt();
+}
+
+fn logAddr(pc: u64) void {
+    if (g_symmap) |sm| {
+        if (sm.find(pc)) |hit| {
+            const off = pc - hit.base;
+            vga.print("{X}: {s}+0x{X}\n", .{ pc, hit.name, off });
+            return;
+        }
+        vga.print("{X}: ?????\n", .{pc});
+        return;
+    }
+    vga.print("{X}: (no symbols)\n", .{pc});
 }

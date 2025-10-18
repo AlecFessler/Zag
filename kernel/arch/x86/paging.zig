@@ -1,25 +1,26 @@
 const std = @import("std");
-
 const vga = @import("vga.zig");
 
-extern const _kernel_base_vaddr: u8;
+pub const AddressSpace = enum(u9) {
+    /// Higher half direct mapping
+    /// Includes the physmap at pml4 base
+    /// And kernel text and data at _kernel_end linker symbol
+    hhdm = 511,
+    /// Kernel virtual memory mapping
+    /// Used by the kernel vmm for allocating address space to allocators
+    kvmm = 510,
+};
 
-pub const PAGE_TABLE_SIZE = 512;
+pub const HHDMType = enum {
+    kernel,
+    physmap,
+};
 
 pub const PageSize = enum(u64) {
     Page4K = 4 * 1024,
     Page2M = 2 * 1024 * 1024,
     Page1G = 1 * 1024 * 1024 * 1024,
 };
-
-pub const PAGE_ALIGN = std.mem.Alignment.fromByteUnits(@intFromEnum(PageSize.Page4K));
-
-pub fn PageMem(comptime page_size: PageSize) type {
-    const size_bytes = @intFromEnum(page_size);
-    return struct {
-        mem: [size_bytes]u8 align(size_bytes),
-    };
-}
 
 pub const RW = enum(u1) {
     Readonly,
@@ -67,26 +68,6 @@ pub const PageEntry = packed struct {
 comptime {
     std.debug.assert(@sizeOf(PageEntry) == 8);
 }
-
-const PML4Entry = PageEntry;
-const PDPTEntry = PageEntry;
-const PDEntry = PageEntry;
-const PTEntry = PageEntry;
-
-pub const AddressSpace = enum(u9) {
-    /// Higher half direct mapping
-    /// Includes the physmap at pml4 base
-    /// And kernel text and data at _kernel_end linker symbol
-    hhdm = 511,
-    /// Kernel virtual memory mapping
-    /// Used by the kernel vmm for allocating address space to allocators
-    kvmm = 510,
-};
-
-pub const HHDMType = enum {
-    kernel,
-    physmap,
-};
 
 pub const PAddr = struct {
     addr: u64,
@@ -144,6 +125,11 @@ pub const VAddr = struct {
     }
 };
 
+const PML4Entry = PageEntry;
+const PDEntry = PageEntry;
+const PDPTEntry = PageEntry;
+const PTEntry = PageEntry;
+
 pub const default_flags = PageEntry{
     .present = false,
     .rw = .Readonly,
@@ -160,84 +146,11 @@ pub const default_flags = PageEntry{
     .nx = true,
 };
 
-pub fn pml4SlotBase(slot: u9) VAddr {
-    const raw: u64 = (@as(u64, slot) << 39);
-    const base = if ((raw & 1 << 47) != 0) (raw | 0xFFFF000000000000) else raw;
-    return VAddr.fromInt(base);
-}
+pub const PAGE_ALIGN = std.mem.Alignment.fromByteUnits(@intFromEnum(PageSize.Page4K));
 
-pub fn pml4_index(vaddr: VAddr) u9 {
-    return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PML4));
-}
+pub const PAGE_TABLE_SIZE = 512;
 
-fn pdpt_index(vaddr: VAddr) u9 {
-    return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PDPT));
-}
-
-fn pd_index(vaddr: VAddr) u9 {
-    return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PD));
-}
-
-fn pt_index(vaddr: VAddr) u9 {
-    return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PT));
-}
-
-pub fn read_cr3() PAddr {
-    var value: u64 = 0;
-    asm volatile ("mov %%cr3, %[out]"
-        : [out] "=r" (value),
-    );
-    return PAddr.fromInt(value);
-}
-
-pub fn write_cr3(pml4_paddr: PAddr) void {
-    asm volatile ("mov %[value], %%cr3"
-        :
-        : [value] "r" (pml4_paddr.addr),
-        : .{ .memory = true });
-}
-
-/// Maps a region with the fewest possible page entries by prefering larger pages
-/// Needs to use .kernel hhdm region since it runs as apart of creating the new page tables
-pub fn physMapRegion(
-    pml4_vaddr: VAddr,
-    start_paddr: PAddr,
-    end_paddr: PAddr,
-    allocator: std.mem.Allocator,
-) void {
-    const page4K = @intFromEnum(PageSize.Page4K);
-    const page2M = @intFromEnum(PageSize.Page2M);
-    const page1G = @intFromEnum(PageSize.Page1G);
-
-    std.debug.assert(end_paddr.addr > start_paddr.addr);
-    std.debug.assert(std.mem.isAligned(start_paddr.addr, page4K));
-    std.debug.assert(std.mem.isAligned(end_paddr.addr, page4K));
-
-    var paddr = start_paddr;
-    while (paddr.addr < end_paddr.addr) {
-        const vaddr = VAddr.fromPAddr(paddr, .physmap);
-        const remaining = end_paddr.addr - paddr.addr;
-        const chosen_size: u64 = blk: {
-            if (std.mem.isAligned(paddr.addr, page1G) and remaining >= page1G) break :blk page1G;
-            if (std.mem.isAligned(paddr.addr, page2M) and remaining >= page2M) break :blk page2M;
-            break :blk page4K;
-        };
-
-        mapPage(
-            @ptrFromInt(pml4_vaddr.addr),
-            paddr,
-            vaddr,
-            RW.ReadWrite,
-            true,
-            User.Supervisor,
-            @enumFromInt(chosen_size),
-            .kernel,
-            allocator,
-        );
-
-        paddr.addr += chosen_size;
-    }
-}
+extern const _kernel_base_vaddr: u8;
 
 pub fn mapPage(
     pml4: [*]PML4Entry,
@@ -357,4 +270,90 @@ pub fn mapPage(
     pt[pt_idx].rw = rw;
     if (nx) pt[pt_idx].nx = true;
     pt[pt_idx].setPAddr(paddr);
+}
+
+pub fn PageMem(comptime page_size: PageSize) type {
+    const size_bytes = @intFromEnum(page_size);
+    return struct {
+        mem: [size_bytes]u8 align(size_bytes),
+    };
+}
+
+pub fn pml4SlotBase(slot: u9) VAddr {
+    const raw: u64 = (@as(u64, slot) << 39);
+    const base = if ((raw & 1 << 47) != 0) (raw | 0xFFFF000000000000) else raw;
+    return VAddr.fromInt(base);
+}
+
+pub fn pml4_index(vaddr: VAddr) u9 {
+    return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PML4));
+}
+
+/// Maps a region with the fewest possible page entries by prefering larger pages
+/// Needs to use .kernel hhdm region since it runs as apart of creating the new page tables
+pub fn physMapRegion(
+    pml4_vaddr: VAddr,
+    start_paddr: PAddr,
+    end_paddr: PAddr,
+    allocator: std.mem.Allocator,
+) void {
+    const page4K = @intFromEnum(PageSize.Page4K);
+    const page2M = @intFromEnum(PageSize.Page2M);
+    const page1G = @intFromEnum(PageSize.Page1G);
+
+    std.debug.assert(end_paddr.addr > start_paddr.addr);
+    std.debug.assert(std.mem.isAligned(start_paddr.addr, page4K));
+    std.debug.assert(std.mem.isAligned(end_paddr.addr, page4K));
+
+    var paddr = start_paddr;
+    while (paddr.addr < end_paddr.addr) {
+        const vaddr = VAddr.fromPAddr(paddr, .physmap);
+        const remaining = end_paddr.addr - paddr.addr;
+        const chosen_size: u64 = blk: {
+            if (std.mem.isAligned(paddr.addr, page1G) and remaining >= page1G) break :blk page1G;
+            if (std.mem.isAligned(paddr.addr, page2M) and remaining >= page2M) break :blk page2M;
+            break :blk page4K;
+        };
+
+        mapPage(
+            @ptrFromInt(pml4_vaddr.addr),
+            paddr,
+            vaddr,
+            RW.ReadWrite,
+            true,
+            User.Supervisor,
+            @enumFromInt(chosen_size),
+            .kernel,
+            allocator,
+        );
+
+        paddr.addr += chosen_size;
+    }
+}
+
+pub fn read_cr3() PAddr {
+    var value: u64 = 0;
+    asm volatile ("mov %%cr3, %[out]"
+        : [out] "=r" (value),
+    );
+    return PAddr.fromInt(value);
+}
+
+pub fn write_cr3(pml4_paddr: PAddr) void {
+    asm volatile ("mov %[value], %%cr3"
+        :
+        : [value] "r" (pml4_paddr.addr),
+        : .{ .memory = true });
+}
+
+fn pd_index(vaddr: VAddr) u9 {
+    return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PD));
+}
+
+fn pdpt_index(vaddr: VAddr) u9 {
+    return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PDPT));
+}
+
+fn pt_index(vaddr: VAddr) u9 {
+    return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PT));
 }
