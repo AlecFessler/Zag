@@ -49,6 +49,31 @@ pub const Exception = enum(u5) {
 /// ISR handler function pointer signature.
 const IsrHandler = *const fn (*interrupts.InterruptContext) void;
 
+/// Page fault error code parser.
+const PFErrCode = struct {
+    present: bool, // bit 0
+    is_write: bool, // bit 1
+    from_user: bool, // bit 2
+    rsvd_violation: bool, // bit 3
+    instr_fetch: bool, // bit 4
+    pkey: bool, // bit 5
+    cet_shadow_stack: bool, // bit 6
+    sgx: bool, // bit 15
+
+    pub fn from(err: u64) PFErrCode {
+        return .{
+            .present = (err & 0x1) != 0,
+            .is_write = (err >> 1) & 1 == 1,
+            .from_user = (err >> 2) & 1 == 1,
+            .rsvd_violation = (err >> 3) & 1 == 1,
+            .instr_fetch = (err >> 4) & 1 == 1,
+            .pkey = (err >> 5) & 1 == 1,
+            .cet_shadow_stack = (err >> 6) & 1 == 1,
+            .sgx = (err >> 15) & 1 == 1,
+        };
+    }
+};
+
 /// Human-readable names aligned to `NUM_ISR_ENTRIES`.
 pub const EXCEPTION_STRS: [NUM_ISR_ENTRIES][]const u8 = .{
     "Divide by Zero",
@@ -304,9 +329,12 @@ fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
     if (pmm_mod.global_pmm == null) {
         @panic("Page fault prior to pmm initialization!");
     }
+    const pf_err = PFErrCode.from(ctx.err_code);
 
-    const present = (ctx.err_code & 1) == 1;
-    const cpl: u64 = ctx.cs & 3;
+    if (pf_err.rsvd_violation) @panic("Page tables have reserved bits set (RSVD).");
+    if (pf_err.instr_fetch) @panic("Execute fault (NX) at kernel address.");
+
+    const code_privilege_level: u64 = ctx.cs & 3;
     const faulting_vaddr = cpu.read_cr2();
     const faulting_page_vaddr = VAddr.fromInt(std.mem.alignBackward(
         u64,
@@ -314,8 +342,10 @@ fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
         @intFromEnum(paging.PageSize.Page4K),
     ));
 
-    if (cpl == 0) {
-        if (present) @panic("Invalid memory access in kernelspace!");
+    if (code_privilege_level == 0) {
+        if (pf_err.present) {
+            @panic("Invalid memory access in kernelspace!");
+        }
         if (vmm_mod.global_vmm == null) {
             @panic("Page fault prior to vmm initialization");
         }

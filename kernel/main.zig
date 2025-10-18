@@ -352,18 +352,36 @@ export fn kmain(
     );
     var vmm = &vmm_mod.global_vmm.?;
 
-    const vaddr_space_start = vmm.reserve(
-        page1G,
+    const heap_vaddr_space_start = vmm.reserve(
+        page1G * 256,
         std.mem.Alignment.fromByteUnits(page4K),
     ) catch @panic("VMM doesn't have enough address space for heap allocator!");
+    const heap_vaddr_space_end = VAddr.fromInt(heap_vaddr_space_start.addr + page1G * 256);
 
-    const int_ptr: *u64 = @ptrFromInt(vaddr_space_start.addr);
-    int_ptr.* = 1;
-    vga.print("int ptr val {}\n", .{int_ptr.*});
+    const heap_tree_vaddr_space_start = vmm.reserve(
+        page1G,
+        std.mem.Alignment.fromByteUnits(page4K),
+    ) catch @panic("VMM doesn't have enough address space for heap tree allocator!");
+    const heap_tree_vaddr_space_end = VAddr.fromInt(heap_tree_vaddr_space_start.addr + page1G);
 
-    const int_ptr1: *u64 = @ptrFromInt(vaddr_space_start.addr + page4K);
-    int_ptr1.* = 2;
-    vga.print("int ptr 1 val {}\n", .{int_ptr1.*});
+    var heap_tree_backing_allocator = BumpAllocator.init(
+        heap_tree_vaddr_space_start.addr,
+        heap_tree_vaddr_space_end.addr,
+    );
+    const heap_tree_backing_allocator_iface = heap_tree_backing_allocator.allocator();
+    var heap_tree_allocator = HeapTreeAllocator.init(
+        heap_tree_backing_allocator_iface,
+    ) catch @panic("Failed to initialize heap allocator's tree allocator!");
+
+    var heap_allocator = HeapAllocator.init(
+        heap_vaddr_space_start.addr,
+        heap_vaddr_space_end.addr,
+        &heap_tree_allocator,
+    );
+    const heap_allocator_iface = heap_allocator.allocator();
+
+    const slice = heap_allocator_iface.alloc(u8, 10) catch unreachable;
+    vga.print("Slice addr {X}", .{@intFromPtr(slice.ptr)});
 
     cpu.halt();
 }
