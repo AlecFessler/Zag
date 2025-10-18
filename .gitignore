@@ -1,4 +1,8 @@
 .zig-cache/
 zig-out/
+**/.zig-cache/
+**/zig-out/
 *.iso
 iso/boot/kernel.elf
+**/data/*.csv
+**/venv/
