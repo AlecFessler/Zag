@@ -1,10 +1,26 @@
+//! Generic red-black tree container.
+//!
+//! Provides an intrusive-style, allocator-backed red-black tree storing values of
+//! type `T` by value. Ordering is defined by a caller-supplied comparator returning
+//! `std.math.Order`. Duplicate handling is configurable at compile time.
+//!
+//! Operations: insert/remove/contains, neighbor search, and validation helpers.
+
 const std = @import("std");
 
+/// Errors returned by container operations.
 pub const ContainerError = error{
+    /// Insertion encountered an equal key when `duplicateIsError = true`.
     Duplicate,
+    /// Element not found for removal.
     NotFound,
 };
 
+/// Factory that produces a red-black tree type specialized for:
+/// - `T`: element type (stored by value)
+/// - `cmpFn`: strict total order comparator (a,b) → `.lt | .eq | .gt`
+/// - `duplicateIsError`: if true, inserting an equal key returns `error.Duplicate`;
+///   if false, equal keys are inserted on the left subtree and allowed to coexist.
 pub fn RedBlackTree(
     comptime T: type,
     comptime cmpFn: fn (T, T) std.math.Order,
@@ -13,14 +29,25 @@ pub fn RedBlackTree(
     return struct {
         const Self = @This();
 
+        /// Allocator used for node storage.
         allocator: std.mem.Allocator,
+        /// Root node pointer (null when empty).
         root: ?*Node,
+        /// Number of elements in the tree.
         count: usize,
 
+        /// Node color.
         const Color = enum {
             Red,
             Black,
 
+            /// Returns the opposite color.
+            ///
+            /// Arguments:
+            /// - `c`: color to flip.
+            ///
+            /// Returns:
+            /// - The opposite of `c`.
             fn flip(c: Color) Color {
                 return switch (c) {
                     Color.Red => Color.Black,
@@ -29,60 +56,116 @@ pub fn RedBlackTree(
             }
         };
 
+        /// Child side used by many helpers.
         pub const Direction = enum {
             left,
             right,
 
+            /// Returns the opposite side.
+            ///
+            /// Arguments:
+            /// - `d`: direction to flip.
+            ///
+            /// Returns:
+            /// - The opposite of `d`.
             fn flip(d: Direction) Direction {
                 return @enumFromInt(1 - @intFromEnum(d));
             }
         };
 
+        /// Tree node holding one `T` value.
         pub const Node = struct {
+            /// Red/black state.
             color: Color,
+            /// Child pointers `[left, right]`.
             children: [2]?*Node,
+            /// Parent pointer (null for root).
             parent: ?*Node,
+            /// Stored element.
             data: T,
 
+            /// Allocates and initializes a red node with `data`.
+            ///
+            /// Arguments:
+            /// - `allocator`: backing allocator for the node.
+            /// - `data`: element value to store.
+            ///
+            /// Returns:
+            /// - Pointer to the newly created `Node`.
+            ///
+            /// Errors:
+            /// - `std.mem.Allocator.Error` on allocation failure.
             fn create(allocator: std.mem.Allocator, data: T) !*Node {
                 const ptr = try allocator.create(Node);
                 ptr.* = .{
                     .color = Color.Red,
-                    .children = .{
-                        null,
-                        null,
-                    },
+                    .children = .{ null, null },
                     .parent = null,
                     .data = data,
                 };
                 return ptr;
             }
 
+            /// Destroys the node using `allocator`.
+            ///
+            /// Arguments:
+            /// - `self`: node to destroy.
+            /// - `allocator`: allocator that owns the node.
             fn destroy(self: *Node, allocator: std.mem.Allocator) void {
                 allocator.destroy(self);
             }
 
-            /// Made pub so custom tree walking logic can be implemented
-            /// externally for composability with the tree for operations
-            /// that may not be generic enough to justify implementing here
+            /// Reads a child pointer by direction.
+            ///
+            /// Arguments:
+            /// - `self`: node to inspect.
+            /// - `d`: which child to return.
+            ///
+            /// Returns:
+            /// - Child pointer (`?*Node`) for side `d`.
+            ///
+            /// Notes:
+            /// - Public to enable external traversals without exposing internals.
             pub fn getChild(self: *Node, d: Direction) ?*Node {
                 return self.children[@intFromEnum(d)];
             }
 
+            /// Sets parent↔child links atomically for `self` and `child`.
+            ///
+            /// Arguments:
+            /// - `self`: parent node whose child to set.
+            /// - `child`: child pointer (nullable).
+            /// - `d`: which side to set.
             fn setParentChildRelation(self: *Node, child: ?*Node, d: Direction) void {
                 self.children[@intFromEnum(d)] = child;
                 if (child) |c| c.parent = self;
             }
 
+            /// Returns the sibling node if any.
+            ///
+            /// Arguments:
+            /// - `self`: node whose sibling to fetch.
+            ///
+            /// Returns:
+            /// - Sibling pointer or `null` if none.
             fn getSibling(self: *Node) ?*Node {
                 if (self.parent) |p| {
                     std.debug.assert(p.getChild(.left) == self or p.getChild(.right) == self);
-
-                    return if (self == p.getChild(Direction.left)) p.getChild(Direction.right) else p.getChild(Direction.left);
+                    return if (self == p.getChild(Direction.left))
+                        p.getChild(Direction.right)
+                    else
+                        p.getChild(Direction.left);
                 }
                 return null;
             }
 
+            /// Returns the parent's sibling (uncle) if any.
+            ///
+            /// Arguments:
+            /// - `self`: node whose uncle to fetch.
+            ///
+            /// Returns:
+            /// - Uncle pointer or `null` if none.
             fn getUncle(self: *Node) ?*Node {
                 if (self.parent) |p| {
                     return p.getSibling();
@@ -90,12 +173,18 @@ pub fn RedBlackTree(
                 return null;
             }
 
+            /// Returns the grandparent if any.
+            ///
+            /// Arguments:
+            /// - `self`: node whose grandparent to fetch.
+            ///
+            /// Returns:
+            /// - Grandparent pointer or `null` if none.
             fn getGrandparent(self: *Node) ?*Node {
                 if (self.parent) |p| {
                     if (p.parent) |gp| {
                         std.debug.assert(gp.getChild(.left) == p or gp.getChild(.right) == p);
                         std.debug.assert(p.getChild(.left) == self or p.getChild(.right) == self);
-
                         return gp;
                     }
                 }
@@ -103,6 +192,13 @@ pub fn RedBlackTree(
             }
         };
 
+        /// Creates an empty tree using `allocator`.
+        ///
+        /// Arguments:
+        /// - `allocator`: backing allocator for node storage.
+        ///
+        /// Returns:
+        /// - New empty `Self`.
         pub fn init(allocator: std.mem.Allocator) Self {
             return .{
                 .allocator = allocator,
@@ -111,6 +207,13 @@ pub fn RedBlackTree(
             };
         }
 
+        /// Frees all nodes and resets the tree to empty.
+        ///
+        /// Arguments:
+        /// - `self`: tree to deinitialize.
+        ///
+        /// Notes:
+        /// - Complexity O(n). Traverses and destroys nodes without recursion.
         pub fn deinit(self: *Self) void {
             var current = self.root;
 
@@ -138,6 +241,14 @@ pub fn RedBlackTree(
             self.root = null;
         }
 
+        /// Returns true if an equal element exists.
+        ///
+        /// Arguments:
+        /// - `self`: tree to query.
+        /// - `data`: element to look up.
+        ///
+        /// Returns:
+        /// - `true` if an equal key exists, else `false`.
         pub fn contains(self: *Self, data: T) bool {
             var current = self.root;
 
@@ -152,6 +263,18 @@ pub fn RedBlackTree(
             return false;
         }
 
+        /// Inserts `data` according to `cmpFn`.
+        ///
+        /// Arguments:
+        /// - `self`: target tree.
+        /// - `data`: element to insert.
+        ///
+        /// Errors:
+        /// - `ContainerError.Duplicate` if equal key and `duplicateIsError = true`.
+        /// - `std.mem.Allocator.Error` on allocation failure.
+        ///
+        /// Notes:
+        /// - If `duplicateIsError = false`, equal keys go to the left subtree.
         pub fn insert(self: *Self, data: T) !void {
             if (self.root == null) {
                 _ = try self.insertAtPtr(null, Direction.left, data);
@@ -184,6 +307,19 @@ pub fn RedBlackTree(
             _ = try self.insertAtPtr(parent.?, dir, data);
         }
 
+        /// Inserts a new node as `parent`’s `dir` child and rebalances if needed.
+        ///
+        /// Arguments:
+        /// - `self`: target tree.
+        /// - `parent`: parent under which to insert (null => becomes root).
+        /// - `dir`: side under parent to place the node.
+        /// - `data`: element to store in the node.
+        ///
+        /// Returns:
+        /// - Pointer to the created node.
+        ///
+        /// Errors:
+        /// - `std.mem.Allocator.Error` on allocation failure.
         pub fn insertAtPtr(self: *Self, parent: ?*Node, dir: Direction, data: T) !*Node {
             const node = try Node.create(self.allocator, data);
 
@@ -204,6 +340,11 @@ pub fn RedBlackTree(
             return node;
         }
 
+        /// Restores red-black invariants after insertion.
+        ///
+        /// Arguments:
+        /// - `self`: target tree.
+        /// - `node`: recently inserted node to fix up from.
         fn insertFix(self: *Self, node: *Node) void {
             var current = node;
             while (current.parent) |p| {
@@ -248,6 +389,17 @@ pub fn RedBlackTree(
             self.root.?.color = Color.Black;
         }
 
+        /// Removes an element equal to `data` and returns the removed value.
+        ///
+        /// Arguments:
+        /// - `self`: target tree.
+        /// - `data`: element to remove (by equality under `cmpFn`).
+        ///
+        /// Returns:
+        /// - The removed value of type `T`.
+        ///
+        /// Errors:
+        /// - `ContainerError.NotFound` if no equal element exists.
         pub fn remove(self: *Self, data: T) !T {
             var current: ?*Node = self.root orelse return ContainerError.NotFound;
 
@@ -263,6 +415,17 @@ pub fn RedBlackTree(
             return self.removeFromPtr(current.?);
         }
 
+        /// Removes the node at `target_node` and returns its value.
+        ///
+        /// Arguments:
+        /// - `self`: target tree.
+        /// - `target_node`: node to remove (obtained via prior search/traversal).
+        ///
+        /// Returns:
+        /// - The removed value of type `T`.
+        ///
+        /// Notes:
+        /// - Rebalances as needed to maintain red-black invariants.
         pub fn removeFromPtr(self: *Self, target_node: *Node) T {
             self.count -= 1;
             var parent_of_target: ?*Node = target_node.parent;
@@ -346,6 +509,12 @@ pub fn RedBlackTree(
             }
         }
 
+        /// Restores invariants after deletion where a black-height deficit exists.
+        ///
+        /// Arguments:
+        /// - `self`: target tree.
+        /// - `parent`: parent at which the deficit is observed.
+        /// - `which_child`: side of the deficit under `parent`.
         fn removeFix(
             self: *Self,
             parent: *Node,
@@ -421,6 +590,12 @@ pub fn RedBlackTree(
             if (self.root) |root_node| root_node.color = Color.Black;
         }
 
+        /// Single rotation around `pivot`. Direction `d` identifies the deficit side.
+        ///
+        /// Arguments:
+        /// - `self`: target tree.
+        /// - `pivot`: node to rotate around.
+        /// - `d`: direction of deficit (determines left/right rotation).
         fn rotate(
             self: *Self,
             pivot: *Node,
@@ -442,6 +617,16 @@ pub fn RedBlackTree(
             new_parent.setParentChildRelation(pivot, d);
         }
 
+        /// Finds neighbors of `data` in the order defined by `cmpFn`.
+        ///
+        /// Arguments:
+        /// - `self`: tree to query.
+        /// - `data`: key to search around.
+        ///
+        /// Returns:
+        /// - `{ lower, upper }` where:
+        ///   - `lower` is the greatest element ≤ `data` (predecessor or equal)
+        ///   - `upper` is the least element ≥ `data` (successor or equal)
         pub fn findNeighbors(self: *Self, data: T) struct {
             lower: ?T,
             upper: ?T,
@@ -471,7 +656,14 @@ pub fn RedBlackTree(
             return .{ .lower = lower, .upper = upper };
         }
 
-        /// helper function so that test cases can access T typed Node
+        /// Test helper: asserts structural and value equality between two subtrees.
+        ///
+        /// Arguments:
+        /// - `a`: left subtree root.
+        /// - `b`: right subtree root.
+        ///
+        /// Errors:
+        /// - Propagates `std.testing.expect*` errors on mismatch.
         fn expectSameTree(a: ?*Node, b: ?*Node) !void {
             if (a == null or b == null) {
                 try std.testing.expect(a == b);
@@ -483,17 +675,42 @@ pub fn RedBlackTree(
             try expectSameTree(a.?.getChild(.right), b.?.getChild(.right));
         }
 
-        /// helper function so that test cases can create T typed Node
+        /// Test helper: allocate a node with `data = 0` (when `T` is integer-like).
+        ///
+        /// Arguments:
+        /// - `allocator`: allocator for the node.
+        ///
+        /// Returns:
+        /// - Pointer to the created `Node`.
+        ///
+        /// Errors:
+        /// - `std.mem.Allocator.Error` on allocation failure.
         fn testCreateNode(allocator: std.mem.Allocator) !*Node {
             return Node.create(allocator, 0);
         }
 
-        /// helper function so that test cases can destroy T typed node
+        /// Test helper: destroy a node created by `testCreateNode`.
+        ///
+        /// Arguments:
+        /// - `node`: node to destroy.
+        /// - `allocator`: allocator that owns the node.
         fn testDestroyNode(node: *Node, allocator: std.mem.Allocator) void {
             Node.destroy(node, allocator);
         }
 
-        /// helper function to validate red black tree invariants
+        /// Validates red-black invariants and returns `(valid, black_height)`.
+        ///
+        /// Arguments:
+        /// - `node`: subtree root to validate (null = leaf).
+        /// - `min_val`: strict lower bound (exclusive) for BST ordering, or null.
+        /// - `max_val`: strict upper bound (exclusive) for BST ordering, or null.
+        ///
+        /// Returns:
+        /// - `{ valid: bool, black_height: i32 }` where `black_height` is the
+        ///   number of black nodes on any path to leaves (including leaf nil).
+        ///
+        /// Notes:
+        /// - On failure, logs a diagnostic dump of the offending node.
         pub fn validateRedBlackTree(
             node: ?*Node,
             min_val: ?T,
@@ -564,26 +781,21 @@ pub fn RedBlackTree(
                 }
             }
 
-            // Invariant 2: BST property - left child < parent < right child
+            // Invariant: BST property
             if (min_val) |min| {
-                // require n.data > min
                 if (cmpFn(n.data, min) != .gt) {
                     fail.dump(n, "BST violation: data <= min bound");
                     return .{ .valid = false, .black_height = 0 };
                 }
             }
             if (max_val) |max| {
-                // require n.data < max
                 if (cmpFn(n.data, max) != .lt) {
                     fail.dump(n, "BST violation: data >= max bound");
                     return .{ .valid = false, .black_height = 0 };
                 }
             }
 
-            // Invariant 3: All leaves (NIL nodes) are black
-            // (Implicitly satisfied since null nodes are considered black)
-
-            // Invariant 4: Red nodes have black children (no two red nodes adjacent)
+            // Invariant: red node never has a red child
             if (n.color == .Red) {
                 if (n.getChild(.left)) |left| {
                     if (left.color == .Red) {
@@ -599,15 +811,14 @@ pub fn RedBlackTree(
                 }
             }
 
-            // Recurse on left and right subtrees
+            // Recurse
             const left_result = validateRedBlackTree(n.getChild(.left), min_val, n.data);
             if (!left_result.valid) return left_result;
 
             const right_result = validateRedBlackTree(n.getChild(.right), n.data, max_val);
             if (!right_result.valid) return right_result;
 
-            // Invariant 5: All paths from any node to its descendant leaves contain
-            // the same number of black nodes (black height property)
+            // Invariant: equal black height on all descendant paths
             if (left_result.black_height != right_result.black_height) {
                 fail.dump(n, "Black height mismatch between children");
                 return .{ .valid = false, .black_height = 0 };

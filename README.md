@@ -78,11 +78,10 @@ Within each category:
 1. **Visibility Priority:** `pub` declarations always come before non-`pub` in their category.
 2. **Name Ordering:** Case-insensitive ASCII sort of the declaration name.
 3. **Stable Sort:** Preserve relative order for identical names or ambiguous cases.
-4. **No Comments or Reformatting:** Reordering must not alter semantics or add commentary.
-5. **Spacing:** Use one blank line between categories for readability.
-6. **Extern Declarations:** `extern const` and `extern var` belong to **Constants** and **Variables**, respectively.
-7. **Inline vs Regular Functions:** Inline helpers go in the **Inline Functions** category, not mixed with normal functions.
-8. **Entry Points:** All boot or main entry functions go at the end of the file, always last.
+4. **Spacing:** Use one blank line between categories for readability.
+5. **Extern Declarations:** `extern const` and `extern var` belong to **Constants** and **Variables**, respectively.
+6. **Inline vs Regular Functions:** Inline helpers go in the **Inline Functions** category, not mixed with normal functions.
+7. **Entry Points:** All boot or main entry functions go at the end of the file, always last with the exception of tests.
 
 ---
 

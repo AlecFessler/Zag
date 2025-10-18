@@ -1,3 +1,9 @@
+//! Memory module entry point.
+//!
+//! Provides import access to all core kernel memory allocators and managers,
+//! including physical, virtual, and heap subsystems. Serves as the canonical
+//! import surface for kernel memory infrastructure.
+
 pub const BitmapFreelist = @import("bitmap_freelist.zig");
 pub const BuddyAllocator = @import("buddy_allocator.zig");
 pub const BumpAllocator = @import("bump_allocator.zig");

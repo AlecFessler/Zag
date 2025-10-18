@@ -1,3 +1,8 @@
+//! Kernel bootstrap module for Zag.
+//!
+//! Contains the early entrypoint `kmain` used by the Multiboot bootloader
+//! and the kernel-level panic function.
+
 const memory = @import("memory");
 const panic_mod = @import("panic.zig");
 const std = @import("std");
@@ -36,6 +41,12 @@ extern const _rodata_start: u8;
 extern const _text_end: u8;
 extern const _text_start: u8;
 
+/// Triggers a kernel panic and halts execution.
+///
+/// Arguments:
+/// - `msg`: description of the failure
+/// - `error_return_trace`: optional Zig stack trace
+/// - `ret_addr`: optional return address for context
 pub fn panic(
     msg: []const u8,
     error_return_trace: ?*std.builtin.StackTrace,
@@ -44,6 +55,12 @@ pub fn panic(
     panic_mod.panic(msg, error_return_trace, ret_addr);
 }
 
+/// Kernel entry point called by the Multiboot bootloader.
+///
+/// Arguments:
+/// - `stack_top_vaddr`: virtual address of the stack top
+/// - `magic`: multiboot magic number (must equal `multiboot.MAGIC`)
+/// - `mbi_addr`: physical address of the multiboot information structure
 export fn kmain(
     stack_top_vaddr: u64,
     magic: u32,

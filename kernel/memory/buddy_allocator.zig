@@ -1,9 +1,15 @@
+//! Buddy allocator managing page-aligned power-of-two blocks.
+//!
+//! Owns a contiguous address range and sub-divides/coalesces pages across
+//! 2^N orders. Backed by a bitmap (free = 1) plus per-order intrusive free
+//! lists and a compact per-pair order table for O(1) order lookups.
+
 const bitmap_freelist = @import("bitmap_freelist.zig");
 const intrusive_freelist = @import("intrusive_freelist.zig");
 const std = @import("std");
 
-/// Used to give the intrusive freelist a size and alignment
-/// and to specify the allocation type for std.mem.Allocator.alloc()
+/// Page object used only to give the intrusive free list a size/alignment and
+/// to act as the allocation unit for the buddy allocator (4 KiB).
 pub const Page = struct {
     bytes: [PAGE_SIZE]u8 align(PAGE_SIZE),
 
@@ -13,7 +19,8 @@ pub const Page = struct {
     }
 };
 
-/// Keeps track of the order for 2 pages using the minimal number of bits
+/// Per-2-page metadata storing the current order of the even/odd page.
+/// Keeps order state in 1 byte per pair.
 const PagePairOrders = packed struct {
     even: u4,
     odd: u4,
@@ -23,7 +30,8 @@ const PagePairOrders = packed struct {
     }
 };
 
-/// Return type for splitAllocation, a linked list of blocks of the requested order
+/// Return type for `splitAllocation`: a linked-list batch of blocks at a
+/// single order, allowing callers to push them back individually later.
 const using_popSpecific = true;
 const link_to_list = false;
 pub const FreeListBatch = intrusive_freelist.IntrusiveFreeList(
@@ -32,17 +40,21 @@ pub const FreeListBatch = intrusive_freelist.IntrusiveFreeList(
     link_to_list,
 );
 
+/// Bitmap free list backing the page state (1 = free, 0 = allocated).
 const using_getNextFree = false;
 const BitmapFreeList = bitmap_freelist.BitmapFreeList(using_getNextFree);
 
+/// Per-order intrusive free list of block bases.
 const IntrusiveFreeList = intrusive_freelist.IntrusiveFreeList(
     *Page,
     using_popSpecific,
     link_to_list,
 );
 
+/// Number of buddy orders supported (0..10 → 1,2,4,...,1024 pages).
 const NUM_ORDERS = 11;
 
+/// Size in bytes for each order, indexed by order.
 const ORDERS = blk: {
     var arr: [NUM_ORDERS]u64 = undefined;
     for (0..NUM_ORDERS) |i| {
@@ -51,34 +63,45 @@ const ORDERS = blk: {
     break :blk arr;
 };
 
+/// Page size in bytes (4 KiB).
 const PAGE_SIZE = 4096;
 
-/// Owning allocator. Manages a contiguous address space, does not take a backing allocator, can act as a backing allocator;
+/// Owning allocator for a contiguous, page-aligned address range.
+///
+/// Does not require a backing allocator for data blocks (only for metadata
+/// during initialization). Exposes a `std.mem.Allocator` interface returning
+/// page-multiple, power-of-two allocations.
 pub const BuddyAllocator = struct {
+    /// Start of managed region (inclusive), PAGE_SIZE-aligned.
     start_addr: u64,
+    /// End of managed region (exclusive), PAGE_SIZE-aligned.
     end_addr: u64,
 
-    /// Not a backing allocator, this is only used to allocate and free the page orders and bitmap
+    /// Used only to allocate metadata (bitmap + order table) at init time.
     init_allocator: std.mem.Allocator,
 
+    /// Order table (one byte per pair of pages).
     page_pair_orders: []PagePairOrders = undefined,
+    /// Free = 1, allocated = 0.
     bitmap: BitmapFreeList = undefined,
+    /// Per-order intrusive free lists for block bases.
     freelists: [NUM_ORDERS]IntrusiveFreeList = [_]IntrusiveFreeList{IntrusiveFreeList{}} ** NUM_ORDERS,
 
+    /// Computes the metadata footprint (bytes) needed to manage `[start_addr, end_addr)`,
+    /// accounting for the fact that metadata itself consumes pages.
+    ///
+    /// Arguments:
+    /// - `start_addr`: start of candidate region (may be unaligned).
+    /// - `end_addr`: end of candidate region (may be unaligned).
+    ///
+    /// Returns:
+    /// - Number of bytes to reserve for metadata so the remaining data region is stable.
     pub fn requiredMemory(
         start_addr: u64,
         end_addr: u64,
     ) u64 {
-        const aligned_start = std.mem.alignForward(
-            u64,
-            start_addr,
-            PAGE_SIZE,
-        );
-        const aligned_end = std.mem.alignBackward(
-            u64,
-            end_addr,
-            PAGE_SIZE,
-        );
+        const aligned_start = std.mem.alignForward(u64, start_addr, PAGE_SIZE);
+        const aligned_end = std.mem.alignBackward(u64, end_addr, PAGE_SIZE);
         std.debug.assert(aligned_end > aligned_start);
 
         var n_pages = (aligned_end - aligned_start) / PAGE_SIZE;
@@ -92,11 +115,7 @@ pub const BuddyAllocator = struct {
             const bitmap_words = (n_pages + bitmap_freelist.WORD_BIT_SIZE - 1) / bitmap_freelist.WORD_BIT_SIZE;
             const bitmap_bytes = bitmap_words * @sizeOf(bitmap_freelist.Word);
             const orders_bytes = (n_pages + 1) / 2;
-            const metadata_bytes = std.mem.alignForward(
-                u64,
-                bitmap_bytes + orders_bytes,
-                PAGE_SIZE,
-            );
+            const metadata_bytes = std.mem.alignForward(u64, bitmap_bytes + orders_bytes, PAGE_SIZE);
 
             const n2_pages = (aligned_end - (aligned_start + metadata_bytes)) / PAGE_SIZE;
             if (n_pages == n2_pages) return metadata_bytes;
@@ -104,22 +123,23 @@ pub const BuddyAllocator = struct {
         }
     }
 
+    /// Initializes a buddy allocator managing `[start_addr, end_addr)`.
+    ///
+    /// Arguments:
+    /// - `start_addr`: start (rounded up to PAGE_SIZE).
+    /// - `end_addr`: end (rounded down to PAGE_SIZE).
+    /// - `init_allocator`: used to allocate internal metadata (bitmap/order table).
+    ///
+    /// Returns:
+    /// - A fully initialized `BuddyAllocator` with freelists seeded by descending orders.
     pub fn init(
         start_addr: u64,
         end_addr: u64,
         init_allocator: std.mem.Allocator,
     ) !BuddyAllocator {
         std.debug.assert(end_addr > start_addr);
-        const aligned_start = std.mem.alignForward(
-            u64,
-            start_addr,
-            PAGE_SIZE,
-        );
-        const aligned_end = std.mem.alignBackward(
-            u64,
-            end_addr,
-            PAGE_SIZE,
-        );
+        const aligned_start = std.mem.alignForward(u64, start_addr, PAGE_SIZE);
+        const aligned_end = std.mem.alignBackward(u64, end_addr, PAGE_SIZE);
         std.debug.assert(aligned_end > aligned_start);
 
         var self: BuddyAllocator = .{
@@ -162,11 +182,26 @@ pub const BuddyAllocator = struct {
         return self;
     }
 
+    /// Releases internal metadata buffers (bitmap and order table).
+    ///
+    /// Arguments:
+    /// - `self`: allocator instance.
     pub fn deinit(self: *BuddyAllocator) void {
         self.init_allocator.free(self.page_pair_orders);
         self.bitmap.deinit();
     }
 
+    /// Returns a `std.mem.Allocator` interface backed by this buddy allocator.
+    ///
+    /// Arguments:
+    /// - `self`: allocator instance.
+    ///
+    /// Returns:
+    /// - A `std.mem.Allocator` whose `alloc`/`free` map to this buddy allocator.
+    ///   `resize` and `remap` are unsupported (trap).
+    ///
+    /// Notes:
+    /// - Allocation sizes must be multiples of PAGE_SIZE; alignment is ignored.
     pub fn allocator(self: *BuddyAllocator) std.mem.Allocator {
         return .{
             .ptr = self,
@@ -179,12 +214,16 @@ pub const BuddyAllocator = struct {
         };
     }
 
-    /// Takes an existing allocation of some order and splits it into
-    /// a linked list of smaller order blocks that can be individually
-    /// returned to the buddy allocator.
-    /// The purpose of this is to save on split merge calls when you want
-    /// to allocate a large number of some order of allocations, for example
-    /// when the pmm wants to reload a cpu's cache of single pages
+    /// Splits a large allocation at `addr` (of order `getOrder(addr)`) into
+    /// blocks of `split_order` and returns them as a batch list.
+    ///
+    /// Arguments:
+    /// - `self`: allocator instance.
+    /// - `addr`: base address of an existing allocation.
+    /// - `split_order`: target smaller order to split into (must be < current).
+    ///
+    /// Returns:
+    /// - `FreeListBatch` whose nodes are `*Page` pointers covering the original range.
     pub fn splitAllocation(
         self: *BuddyAllocator,
         addr: u64,
@@ -206,6 +245,15 @@ pub const BuddyAllocator = struct {
         return batch;
     }
 
+    /// Recursively obtains a block base address of `order`, splitting a higher-order
+    /// block if necessary.
+    ///
+    /// Arguments:
+    /// - `self`: allocator instance.
+    /// - `order`: desired order (0..10).
+    ///
+    /// Returns:
+    /// - Base address of an available block, or `null` if none exist.
     fn recursiveSplit(self: *BuddyAllocator, order: u4) ?u64 {
         const addr_ptr = self.freelists[order].pop() orelse {
             if (order == 10) return null;
@@ -230,6 +278,15 @@ pub const BuddyAllocator = struct {
         return addr;
     }
 
+    /// Recursively merges a free block with its buddy while possible, returning
+    /// the final merged base address and order.
+    ///
+    /// Arguments:
+    /// - `self`: allocator instance.
+    /// - `addr`: base address of a free block.
+    ///
+    /// Returns:
+    /// - `{ addr, order }` describing the coalesced block that should be enqueued.
     fn recursiveMerge(self: *BuddyAllocator, addr: u64) struct { addr: u64, order: u4 } {
         const order = self.getOrder(addr);
         if (order == 10) return .{ .addr = addr, .order = order };
@@ -277,6 +334,14 @@ pub const BuddyAllocator = struct {
         return self.recursiveMerge(lower_half);
     }
 
+    /// Returns the order (0..10) recorded for the page that begins at `addr`.
+    ///
+    /// Arguments:
+    /// - `self`: allocator instance.
+    /// - `addr`: page-aligned address within the managed region.
+    ///
+    /// Returns:
+    /// - The current order associated with that page base.
     fn getOrder(self: *BuddyAllocator, addr: u64) u4 {
         const page_idx = (addr - self.start_addr) / PAGE_SIZE;
         const pair_idx = page_idx / 2;
@@ -288,6 +353,12 @@ pub const BuddyAllocator = struct {
         }
     }
 
+    /// Records `order` for the page that begins at `addr`.
+    ///
+    /// Arguments:
+    /// - `self`: allocator instance.
+    /// - `addr`: page-aligned address within the managed region.
+    /// - `order`: value to store (0..10).
     fn setOrder(self: *BuddyAllocator, addr: u64, order: u4) void {
         const page_idx = (addr - self.start_addr) / PAGE_SIZE;
         const pair_idx = page_idx / 2;
@@ -299,6 +370,16 @@ pub const BuddyAllocator = struct {
         }
     }
 
+    /// `std.mem.Allocator.alloc` entry point.
+    ///
+    /// Arguments:
+    /// - `ptr`: opaque pointer to the `BuddyAllocator` (provided by vtable).
+    /// - `len`: requested size in bytes (must be a multiple of PAGE_SIZE).
+    /// - `alignment`: ignored (blocks are page-aligned).
+    /// - `ret_addr`: caller return address for diagnostics (unused).
+    ///
+    /// Returns:
+    /// - Pointer to `len` bytes on success, or `null` if no suitable block exists.
     fn alloc(
         ptr: *anyopaque,
         len: u64,
@@ -320,6 +401,9 @@ pub const BuddyAllocator = struct {
         return @ptrFromInt(addr);
     }
 
+    /// `std.mem.Allocator.resize` entry point (unsupported).
+    ///
+    /// Always traps; the buddy allocator does not support in-place growth/shrink.
     fn resize(
         ptr: *anyopaque,
         memory: []u8,
@@ -335,6 +419,9 @@ pub const BuddyAllocator = struct {
         unreachable;
     }
 
+    /// `std.mem.Allocator.remap` entry point (unsupported).
+    ///
+    /// Always traps; the buddy allocator does not support remapping.
     fn remap(
         ptr: *anyopaque,
         memory: []u8,
@@ -350,6 +437,13 @@ pub const BuddyAllocator = struct {
         unreachable;
     }
 
+    /// `std.mem.Allocator.free` entry point.
+    ///
+    /// Arguments:
+    /// - `ptr`: opaque pointer to the `BuddyAllocator` (provided by vtable).
+    /// - `buf`: slice previously returned by `alloc`.
+    /// - `alignment`: ignored.
+    /// - `ret_addr`: caller return address for diagnostics (unused).
     fn free(
         ptr: *anyopaque,
         buf: []u8,
@@ -365,7 +459,8 @@ pub const BuddyAllocator = struct {
         self.freelists[result.order].push(@ptrFromInt(result.addr));
     }
 
-    /// Helper type for use by test cases
+    /// Helper map type used in tests to record active allocations:
+    /// key = base address, value = `{ size, order }`.
     pub const AllocationMap = std.HashMap(
         u64,
         struct { size: u64, order: u4 },
@@ -373,7 +468,14 @@ pub const BuddyAllocator = struct {
         std.hash_map.default_max_load_percentage,
     );
 
-    /// Helper function for use by test cases
+    /// Validates the allocator state against recorded allocations.
+    ///
+    /// Arguments:
+    /// - `self`: allocator instance.
+    /// - `allocations`: map of active allocations keyed by base address.
+    ///
+    /// Returns:
+    /// - `true` if all invariants hold; `false` after logging a diagnostic dump.
     pub fn validateState(self: *BuddyAllocator, allocations: *AllocationMap) bool {
         const Helper = struct {
             fn fail(reason: []const u8, ctx: struct {
@@ -547,7 +649,15 @@ pub const BuddyAllocator = struct {
         return true;
     }
 
-    /// Helper function for use by test cases
+    /// Test helper: asserts that after trying to allocate `order`, all freelists
+    /// at `order` and above are empty (i.e., allocation must fail).
+    ///
+    /// Arguments:
+    /// - `buddy_alloc`: allocator under test.
+    /// - `order`: order to check (0..10).
+    ///
+    /// Errors:
+    /// - Returns `error` from `std.testing.expect` if any freelist is non-empty.
     fn checkAllocationFailure(buddy_alloc: *BuddyAllocator, order: u4) !void {
         for (order..NUM_ORDERS) |check_order| {
             try std.testing.expect(buddy_alloc.freelists[check_order].head == null);

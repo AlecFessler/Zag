@@ -1,12 +1,30 @@
+//! Stack-based freelist for fixed-capacity slices.
+//!
+//! Simple LIFO pool backed by a caller-provided slice of `T`. Useful for very
+//! hot paths where you want predictable O(1) push/pop with no allocation.
+//!
+//! Notes:
+//! - Capacity is fixed by the provided slice length.
+//! - `top` starts at `-1` (empty), grows toward `stack.len - 1`.
+
 const std = @import("std");
 
+/// Factory: returns a freelist type specialized for `T`.
 pub fn StackFreeList(comptime T: type) type {
     return struct {
         const Self = @This();
 
+        /// Backing storage and current top index (`-1` when empty).
         stack: []T,
         top: isize,
 
+        /// Initializes the freelist over `slice`.
+        ///
+        /// Arguments:
+        /// - `slice`: backing storage; its length is the fixed capacity.
+        ///
+        /// Returns:
+        /// - A `Self` with `top = -1` (empty).
         pub fn init(slice: []T) Self {
             return .{
                 .stack = slice,
@@ -14,6 +32,13 @@ pub fn StackFreeList(comptime T: type) type {
             };
         }
 
+        /// Pops the most-recently pushed item.
+        ///
+        /// Arguments:
+        /// - `self`: freelist instance.
+        ///
+        /// Returns:
+        /// - `T` on success, or `null` if the list is empty.
         pub fn pop(self: *Self) ?T {
             std.debug.assert(self.top < self.stack.len);
             if (self.top == -1) return null;
@@ -24,6 +49,14 @@ pub fn StackFreeList(comptime T: type) type {
             return addr;
         }
 
+        /// Pushes an item onto the stack if capacity remains.
+        ///
+        /// Arguments:
+        /// - `self`: freelist instance.
+        /// - `addr`: value to push.
+        ///
+        /// Notes:
+        /// - If already at capacity, `top` is not advanced.
         pub fn push(self: *Self, addr: T) void {
             std.debug.assert(self.top >= -1);
             if (self.top + 1 < self.stack.len) {

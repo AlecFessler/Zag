@@ -1,3 +1,10 @@
+//! CPU exception ISRs, syscall vector, and page-fault handling.
+//!
+//! Installs CPU exception gates (0..31), exposes a syscall vector (0x80),
+//! registers a couple of default handlers, and routes all entries through the
+//! common naked stub. Includes a minimal kernel page-fault handler that
+//! demand-maps a fresh page for valid kernel VAddrs.
+
 const cpu = @import("cpu.zig");
 const idt = @import("idt.zig");
 const interrupts = @import("interrupts.zig");
@@ -14,6 +21,7 @@ const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
 const VAddr = paging.VAddr;
 const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
 
+/// Architectural exception vectors (subset shown explicitly).
 pub const Exception = enum(u5) {
     divide_by_zero = 0,
     single_step_debug = 1,
@@ -38,8 +46,10 @@ pub const Exception = enum(u5) {
     security = 30,
 };
 
+/// ISR handler function pointer signature.
 const IsrHandler = *const fn (*interrupts.InterruptContext) void;
 
+/// Human-readable names aligned to `NUM_ISR_ENTRIES`.
 pub const EXCEPTION_STRS: [NUM_ISR_ENTRIES][]const u8 = .{
     "Divide by Zero",
     "Single Step (Debugger)",
@@ -74,13 +84,16 @@ pub const EXCEPTION_STRS: [NUM_ISR_ENTRIES][]const u8 = .{
     "Triple Fault",
 };
 
+/// Count of CPU exception vectors we install (0..31).
 pub const NUM_ISR_ENTRIES = 32;
+
+/// Syscall interrupt vector (user-invocable).
 pub const SYSCALL_INT_VECTOR = 0x80;
 
-/// Table to map whether a given ISR is expected to return
-/// an error or not, so that a 0 error code can be pushed to
-/// the stack for those that do not, allowing for a single
-/// handler to route all interrupts through
+/// Table marking which exceptions push an error code (true) versus not (false).
+///
+/// Used to generate per-vector stubs that synthesize a 0 error code when the
+/// CPU does not push one, so the dispatcher can use a single stack layout.
 const PUSHES_ERR = [_]bool{
     //  0: #DE Divide Error
     false,
@@ -151,6 +164,7 @@ const PUSHES_ERR = [_]bool{
     false,
 };
 
+/// Per-vector ISR stubs (0..31) generated to match `InterruptContext`.
 const ISR_STUBS: [NUM_ISR_ENTRIES]idt.interruptHandler = blk: {
     var arr: [NUM_ISR_ENTRIES]idt.interruptHandler = undefined;
     for (0..NUM_ISR_ENTRIES) |i| {
@@ -162,14 +176,22 @@ const ISR_STUBS: [NUM_ISR_ENTRIES]idt.interruptHandler = blk: {
     break :blk arr;
 };
 
+/// Syscall stub used by vector `SYSCALL_INT_VECTOR`.
 const SYSCALL_STUB: idt.interruptHandler = interrupts.getInterruptStub(
     SYSCALL_INT_VECTOR,
     false,
 );
 
+/// Optional handlers for exception vectors (null = unregistered).
 var isr_handlers: [NUM_ISR_ENTRIES]?IsrHandler = .{null} ** NUM_ISR_ENTRIES;
+
+/// Optional syscall handler.
 var syscall_handler: ?IsrHandler = null;
 
+/// Routes an ISR or syscall to a registered handler, or panics if missing.
+///
+/// Arguments:
+/// - `ctx`: pointer to the interrupt context from the common stub.
 pub fn dispatchIsr(ctx: *interrupts.InterruptContext) void {
     std.debug.assert(ctx.int_num < NUM_ISR_ENTRIES or ctx.int_num == SYSCALL_INT_VECTOR);
 
@@ -188,6 +210,9 @@ pub fn dispatchIsr(ctx: *interrupts.InterruptContext) void {
     }
 }
 
+/// Installs IDT gates for exception vectors and the syscall vector.
+///
+/// Also registers default handlers for divide-by-zero and page-fault.
 pub fn init() void {
     for (0..NUM_ISR_ENTRIES) |i| {
         const privilege = switch (i) {
@@ -224,6 +249,15 @@ pub fn init() void {
     );
 }
 
+/// Registers an ISR or syscall handler.
+///
+/// Panics if already registered.
+/// - For `SYSCALL_INT_VECTOR`, sets `syscall_handler`.
+/// - Otherwise fills `isr_handlers[isr_num]`.
+///
+/// Arguments:
+/// - `isr_num`: exception vector (0..31) or `SYSCALL_INT_VECTOR`
+/// - `handler`: function pointer to invoke on dispatch
 pub fn registerIsr(isr_num: u8, handler: IsrHandler) void {
     if (isr_num == SYSCALL_INT_VECTOR) {
         if (syscall_handler) |_| {
@@ -240,6 +274,10 @@ pub fn registerIsr(isr_num: u8, handler: IsrHandler) void {
     }
 }
 
+/// Default handler: distinguishes kernel/user divide-by-zero and panics.
+///
+/// Arguments:
+/// - `ctx`: interrupt context from the common stub
 fn divByZeroHandler(ctx: *interrupts.InterruptContext) void {
     const cpl: u64 = ctx.cs & 3;
     if (cpl == 0) {
@@ -249,6 +287,19 @@ fn divByZeroHandler(ctx: *interrupts.InterruptContext) void {
     }
 }
 
+/// Kernel page-fault handler: demand-maps a 4KiB page for valid kernel VAddrs.
+///
+/// Steps:
+/// - Reject faults before PMM/VMM init.
+/// - Validate that the faulting address lies within a reserved kernel VMM
+///   region; panic if not.
+/// - Allocate a physical page from the PMM and map it RW at the faulting page.
+/// - Invalidate the single TLB entry (`invlpg`).
+///
+/// Userspace faults are not implemented and will panic.
+///
+/// Arguments:
+/// - `ctx`: interrupt context from the common stub
 fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
     if (pmm_mod.global_pmm == null) {
         @panic("Page fault prior to pmm initialization!");
