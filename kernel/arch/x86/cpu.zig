@@ -85,3 +85,21 @@ pub fn reloadSegments() void {
         : .{ .memory = true }
     );
 }
+
+pub fn setWriteProtect(enable: bool) void {
+    var cr0: u64 = 0;
+    asm volatile ("mov %%cr0, %[out]"
+        : [out] "=r" (cr0),
+    );
+    const wp_bit: u64 = 1 << 16;
+    if (enable) {
+        cr0 |= wp_bit;
+    } else {
+        cr0 &= ~wp_bit;
+    }
+    asm volatile ("mov %[in], %%cr0"
+        :
+        : [in] "r" (cr0)
+        : .{ .memory = true });
+}
+

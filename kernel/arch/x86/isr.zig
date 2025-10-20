@@ -11,7 +11,6 @@ const interrupts = @import("interrupts.zig");
 const memory = @import("memory");
 const paging = @import("paging.zig");
 const std = @import("std");
-const vga = @import("vga.zig");
 
 const pmm_mod = memory.PhysicalMemoryManager;
 const vmm_mod = memory.VirtualMemoryManager;
@@ -350,7 +349,6 @@ fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
             @panic("Page fault prior to vmm initialization");
         }
         if (!vmm_mod.global_vmm.?.isValidVaddr(faulting_page_vaddr)) {
-            vga.print("Invalid faulting vaddr: {X}\n", .{faulting_vaddr.addr});
             @panic("Invalid faulting address in kernel");
         }
 

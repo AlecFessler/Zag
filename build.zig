@@ -1,133 +1,157 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const obj_dir_path = b.pathJoin(&.{ b.install_prefix, "obj" });
-    const mkdir_obj = b.addSystemCommand(&[_][]const u8{
-        "mkdir", "-p", obj_dir_path,
-    });
+    const s_log_level = b.option(
+        []const u8,
+        "log_level",
+        "log_level",
+    ) orelse "info";
+    const log_level: std.log.Level = b: {
+        break :b if (std.mem.eql(u8, s_log_level, "debug"))
+            .debug
+        else if (std.mem.eql(u8, s_log_level, "info"))
+            .info
+        else if (std.mem.eql(u8, s_log_level, "warn"))
+            .warn
+        else if (std.mem.eql(u8, s_log_level, "error"))
+            .err
+        else
+            @panic("Invalid log level");
+    };
 
-    const obj_file_path = b.pathJoin(&.{ obj_dir_path, "bootstrap.o" });
-    const bootstrap_obj = b.addSystemCommand(&[_][]const u8{
-        "nasm",        "-f", "elf64", "-o",
-        obj_file_path, "",
-    });
-    bootstrap_obj.addFileArg(b.path("kernel/arch/x86/bootstrap.asm"));
-    bootstrap_obj.step.dependOn(&mkdir_obj.step);
+    const options = b.addOptions();
+    options.addOption(std.log.Level, "log_level", log_level);
 
-    var disabled_features = std.Target.Cpu.Feature.Set.empty;
-    var enabled_features = std.Target.Cpu.Feature.Set.empty;
-
-    disabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.mmx));
-    disabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.sse));
-    disabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.sse2));
-    disabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.avx));
-    disabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.avx2));
-    enabled_features.addFeature(@intFromEnum(std.Target.x86.Feature.soft_float));
-
-    const target = b.resolveTargetQuery(.{
-        .cpu_arch = std.Target.Cpu.Arch.x86_64,
-        .os_tag = std.Target.Os.Tag.freestanding,
-        .abi = std.Target.Abi.none,
-        .cpu_features_sub = disabled_features,
-        .cpu_features_add = enabled_features,
-    });
     const optimize = b.standardOptimizeOption(.{});
+    const out_dir_name = "img";
 
-    // NOTE: Use llvm flag is temporary until 0.15.2 fixes the unrecognized symbols in linker script bug https://github.com/ziglang/zig/issues/25069
+    const loader = b.addExecutable(.{
+        .name = "BOOTX64.EFI",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("uefi/main.zig"),
+            .target = b.resolveTargetQuery(.{
+                .cpu_arch = .x86_64,
+                .os_tag = .uefi,
+            }),
+            .optimize = optimize,
+        }),
+        .linkage = .static,
+    });
+    b.installArtifact(loader);
+
+    loader.root_module.addOptions("option", options);
+
+    const install_loader = b.addInstallFile(
+        loader.getEmittedBin(),
+        b.fmt("{s}/efi/boot/{s}", .{
+            out_dir_name,
+            loader.name,
+        }),
+    );
+    install_loader.step.dependOn(&loader.step);
+    b.getInstallStep().dependOn(&install_loader.step);
+
     const use_llvm = b.option(bool, "use-llvm", "Force LLVM+LLD backend") orelse false;
     const kernel = b.addExecutable(.{
         .name = "kernel.elf",
         .root_module = b.createModule(.{
             .root_source_file = b.path("kernel/main.zig"),
-            .target = target,
+            .target = b.resolveTargetQuery(.{
+                .cpu_arch = .x86_64,
+                .os_tag = .freestanding,
+                .ofmt = .elf,
+            }),
             .optimize = optimize,
             .code_model = .kernel,
         }),
+        .linkage = .static,
     });
-
     if (use_llvm) {
         kernel.use_llvm = true;
         kernel.use_lld = true;
     }
-
-    const containers_mod = b.addModule("containers", .{
-        .root_source_file = b.path("kernel/containers/containers.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const memory_mod = b.addModule("memory", .{
-        .root_source_file = b.path("kernel/memory/memory.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const x86_mod = b.addModule("x86", .{
-        .root_source_file = b.path("kernel/arch/x86/x86.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
+    kernel.entry = .{ .symbol_name = "kEntry" };
     kernel.root_module.omit_frame_pointer = false;
     kernel.root_module.red_zone = false;
-
-    containers_mod.omit_frame_pointer = false;
-    containers_mod.red_zone = false;
-
-    memory_mod.omit_frame_pointer = false;
-    memory_mod.red_zone = false;
-
-    x86_mod.omit_frame_pointer = false;
-    x86_mod.red_zone = false;
-
-    containers_mod.addImport("memory", memory_mod);
-
-    memory_mod.addImport("x86", x86_mod);
-    memory_mod.addImport("containers", containers_mod);
-
-    x86_mod.addImport("memory", memory_mod);
-
-    kernel.root_module.addImport("memory", memory_mod);
-    kernel.root_module.addImport("containers", containers_mod);
-    kernel.root_module.addImport("x86", x86_mod);
-
-    kernel.setLinkerScript(b.path("linker.ld"));
-    kernel.addObjectFile(b.path("zig-out/obj/bootstrap.o"));
-    kernel.step.dependOn(&bootstrap_obj.step);
-
+    kernel.setLinkerScript(b.path("kernel/linker.ld"));
     b.installArtifact(kernel);
 
-    const copy_elf = b.addSystemCommand(&[_][]const u8{
-        "cp", "zig-out/bin/kernel.elf", "iso/boot/kernel.elf",
-    });
-    copy_elf.step.dependOn(b.getInstallStep());
+    const install_kernel = b.addInstallFile(
+        kernel.getEmittedBin(),
+        b.fmt("{s}/{s}", .{
+            out_dir_name,
+            kernel.name,
+        }),
+    );
+    install_kernel.step.dependOn(&kernel.step);
+    b.getInstallStep().dependOn(&install_kernel.step);
 
-    const gen_map_pipeline = b.addSystemCommand(&[_][]const u8{
-        "sh", "-c",
+    const nm_out = "zig-out/kernel.map";
+    const gen_map = b.addSystemCommand(&[_][]const u8{
+        "sh", "-lc",
         \\set -o pipefail
         \\llvm-nm -P -n --defined-only zig-out/bin/kernel.elf \
         \\| awk '$2 ~ /^[Tt]$/ { printf "%s %s\\n", $3, $1 }' \
-        \\> iso/boot/kernel.map
+        \\> zig-out/kernel.map
     });
-    gen_map_pipeline.step.dependOn(&copy_elf.step);
+    gen_map.step.dependOn(&kernel.step);
+    const install_map = b.addInstallFile(
+        b.path(nm_out),
+        b.fmt("{s}/kernel.map", .{out_dir_name}),
+    );
+    install_map.step.dependOn(&gen_map.step);
+    b.getInstallStep().dependOn(&install_map.step);
 
-    const iso = b.addSystemCommand(&[_][]const u8{
-        "grub-mkrescue", "-o",
-        "Zag.iso",       "iso/",
+    // All module's root files (named after the containing dir)
+    // should be imported into kernel/main.zig, and then all
+    // modules root files can be imported under @import("zag")
+    const zag_mod = b.addModule("zag", .{
+        .root_source_file = b.path("kernel/main.zig"),
+        .target = b.resolveTargetQuery(.{
+            .cpu_arch = .x86_64,
+            .os_tag = .freestanding,
+        }),
+        .optimize = optimize,
+    });
+    zag_mod.omit_frame_pointer = false;
+    zag_mod.red_zone = false;
+
+    const x86_mod = b.addModule("x86", .{
+        .root_source_file = b.path("kernel/arch/x86/x86.zig"),
     });
 
-    const iso_step = b.step("iso", "Create bootable ISO");
-    iso_step.dependOn(&gen_map_pipeline.step);
-    iso_step.dependOn(&copy_elf.step);
-    iso_step.dependOn(&iso.step);
+    const defs_mod = b.addModule("boot_defs", .{
+        .root_source_file = b.path("uefi/defs.zig"),
+    });
 
-    const vm_cmd = b.addSystemCommand(&[_][]const u8{
+    loader.root_module.addImport("x86", x86_mod);
+    zag_mod.addImport("boot_defs", defs_mod);
+    kernel.root_module.addImport("zag", zag_mod);
+    kernel.root_module.addImport("boot_defs", defs_mod);
+
+    const qemu_args = [_][]const u8{
         "qemu-system-x86_64",
-        "-cdrom",
-        "Zag.iso",
-    });
+        "-m",
+        "512M",
+        "-bios",
+        "/usr/share/ovmf/x64/OVMF.4m.fd",
+        "-drive",
+        b.fmt("file=fat:rw:{s}/{s},format=raw", .{
+            b.install_path,
+            out_dir_name,
+        }),
+        "-nographic",
+        "-serial",
+        "mon:stdio",
+        "-no-reboot",
+        "-enable-kvm",
+        "-cpu",
+        "host",
+        "-s",
+    };
+    const qemu_cmd = b.addSystemCommand(&qemu_args);
+    qemu_cmd.step.dependOn(b.getInstallStep());
 
-    const vm_step = b.step("boot", "Run in QEMU");
-    vm_step.dependOn(iso_step);
-    vm_step.dependOn(&vm_cmd.step);
+    const run_qemu_cmd = b.step("run", "Run QEMU");
+    run_qemu_cmd.dependOn(&qemu_cmd.step);
 }
