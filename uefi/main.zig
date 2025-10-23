@@ -12,8 +12,6 @@ const uefi = std.os.uefi;
 
 pub const std_options = log_mod.default_log_options;
 
-const Addr = elf.Elf64_Addr;
-
 pub fn main() uefi.Status {
     log_mod.init(uefi.system_table.con_out.?) catch return .aborted;
     const log = std.log.scoped(.loader);
@@ -22,18 +20,16 @@ pub fn main() uefi.Status {
         log.err("Failed to get boot services!", .{});
         return .aborted;
     };
-    log.info("Got boot services.", .{});
 
     const pages_slice = boot_services.allocatePages(
         .any,
-        .boot_services_data,
+        .loader_data,
         1,
     ) catch {
         log.err("Failed to allocate page for new pml4", .{});
         return .aborted;
     };
     const page = &pages_slice[0];
-    log.info("Allocated page for new pml4.", .{});
 
     const page4K = @intFromEnum(paging.PageSize.Page4K);
 
@@ -43,7 +39,6 @@ pub fn main() uefi.Status {
     @memcpy(page, pml4_slice);
     const new_pml4_paddr = paging.PAddr.fromInt(@intFromPtr(page));
     paging.write_cr3(new_pml4_paddr);
-    log.info("Made pml4 writeable.", .{});
 
     const loaded_image = boot_services.handleProtocol(
         uefi.protocol.LoadedImage,
@@ -55,7 +50,6 @@ pub fn main() uefi.Status {
         log.err("Failed to get loaded image protocol", .{});
         return .aborted;
     };
-    log.info("Got load image protocol", .{});
 
     if (loaded_image.device_handle == null) {
         log.err("Loaded image doesn't contain device handle", .{});
@@ -72,19 +66,16 @@ pub fn main() uefi.Status {
         log.err("Failed to get simple file system protocol", .{});
         return .aborted;
     };
-    log.info("Got file system protocol", .{});
 
     const root_dir: *uefi.protocol.File = fs.openVolume() catch |err| {
         log.err("Failed to open volume: {}", .{err});
         return .aborted;
     };
-    log.info("Opened root volume", .{});
 
     const kernel_file = file_mod.openFile(
         root_dir,
         "kernel.elf",
     ) catch return .aborted;
-    log.info("Opened kernel elf file", .{});
 
     var header_size: u64 = @sizeOf(elf.Elf64_Ehdr);
     var header_buffer = boot_services.allocatePool(
@@ -94,20 +85,17 @@ pub fn main() uefi.Status {
         log.err("Failed to allocate ELF header buffer: {}", .{err});
         return .aborted;
     };
-    log.info("Allocated buffer for kernel elf header", .{});
 
     header_size = kernel_file.read(header_buffer) catch |err| {
         log.err("Failed to read kernel ELF header: {}", .{err});
         return .aborted;
     };
-    log.info("Read kernel elf header", .{});
 
     var reader = std.Io.Reader.fixed(header_buffer[0..header_size]);
     const elf_header = elf.Header.read(&reader) catch |err| {
         log.err("Failed to parse kernel ELF header: {}", .{err});
         return .aborted;
     };
-    log.info("Parsed kernel elf header", .{});
 
     const phdr_size = elf_header.phentsize * elf_header.phnum;
     const file_prefix_size = elf_header.phoff + phdr_size;
@@ -133,7 +121,6 @@ pub fn main() uefi.Status {
     }
 
     var iter = elf_header.iterateProgramHeadersBuffer(prefix_buffer);
-    log.info("Parsing kernel elf program headers", .{});
 
     var page_allocator = alloc_mod.PageAllocator.init(
         boot_services,
@@ -154,15 +141,23 @@ pub fn main() uefi.Status {
 
         const start_vaddr = phdr.p_vaddr;
         const end_vaddr = start_vaddr + phdr.p_memsz;
-        const start_paddr = phdr.p_paddr;
 
         var vaddr = start_vaddr;
-        var paddr = start_paddr;
 
         while (vaddr < end_vaddr) {
+            const backing_page_slice = boot_services.allocatePages(
+                .any,
+                .loader_data,
+                1,
+            ) catch {
+                log.err("Failed to allocate page for new pml4", .{});
+                return .aborted;
+            };
+            // This should always be a paddr if all UEFI firmware identity maps memory??
+            const backing_page_paddr = @intFromPtr(&backing_page_slice[0]);
             paging.mapPage(
                 @ptrFromInt(new_pml4_paddr.addr),
-                paging.PAddr.fromInt(paddr),
+                paging.PAddr.fromInt(backing_page_paddr),
                 paging.VAddr.fromInt(vaddr),
                 if (writeable) .ReadWrite else .Readonly,
                 not_executeable,
@@ -173,7 +168,6 @@ pub fn main() uefi.Status {
             );
 
             vaddr += page4K;
-            paddr += page4K;
         }
 
         kernel_file.setPosition(phdr.p_offset) catch |err| {
@@ -211,7 +205,6 @@ pub fn main() uefi.Status {
             @memset(segment_slice, 0);
         }
     }
-    log.info("Mapped Zag kernel sections into memory", .{});
 
     const map_file = file_mod.openFile(
         root_dir,
@@ -276,13 +269,12 @@ pub fn main() uefi.Status {
 
     const mmap_pages_slice = boot_services.allocatePages(
         .any,
-        .boot_services_data,
+        .loader_data,
         4,
     ) catch {
         log.err("Failed to allocate pages for memory map", .{});
         return .aborted;
     };
-    log.info("Allocated pages for memory map.", .{});
 
     const mmap_pages_bytes = (@as([*]u8, @ptrCast(mmap_pages_slice.ptr)))[0 .. page4K * 4];
     const mmap_buf: []align(@alignOf(uefi.tables.MemoryDescriptor)) u8 = @alignCast(mmap_pages_bytes);
@@ -292,7 +284,23 @@ pub fn main() uefi.Status {
         return .aborted;
     };
 
-    log.info("Exiting boot services.", .{});
+    var map_iter = defs.MemoryDescriptorIterator.new(.{
+        .buffer_size = map.info.len,
+        .descriptors = @alignCast(@ptrCast(mmap_buf.ptr)),
+        .map_key = map.info.key,
+        .map_size = map.info.len,
+        .descriptor_size = map.info.descriptor_size,
+        .descriptor_version = map.info.descriptor_version,
+    });
+
+    while (map_iter.next()) |md| {
+        log.debug("  0x{X:0>16} - 0x{X:0>16} : {s}", .{
+            md.physical_start,
+            md.physical_start + md.number_of_pages * page4K,
+            @tagName(md.type),
+        });
+    }
+
     boot_services.exitBootServices(
         uefi.handle,
         map.info.key,
@@ -326,8 +334,8 @@ pub fn main() uefi.Status {
     };
 
     const KEntryType = fn (defs.BootInfo) noreturn;
-    const kentry: *KEntryType = @ptrFromInt(elf_header.entry);
+    const kEntry: *KEntryType = @ptrFromInt(elf_header.entry);
 
-    kentry(boot_info);
+    kEntry(boot_info);
     unreachable;
 }

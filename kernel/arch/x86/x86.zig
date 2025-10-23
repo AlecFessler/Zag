@@ -13,3 +13,4 @@ pub const Interrupts = @import("interrupts.zig");
 pub const Irq = @import("irq.zig");
 pub const Isr = @import("isr.zig");
 pub const Paging = @import("paging.zig");
+pub const Serial = @import("serial.zig");

@@ -4,6 +4,7 @@ pub const x86 = @import("arch/x86/x86.zig");
 
 const boot_defs = @import("boot_defs");
 const cpu = x86.Cpu;
+const serial = x86.Serial;
 
 extern const __stackguard_lower: [*]const u8;
 
@@ -21,5 +22,7 @@ export fn kEntry(boot_info: boot_defs.BootInfo) noreturn {
 
 fn kMain(boot_info: boot_defs.BootInfo) !void {
     _ = boot_info;
+    serial.init(.com1, 115200);
+    serial.print("Hello from Zag!\n", .{});
     cpu.halt();
 }
