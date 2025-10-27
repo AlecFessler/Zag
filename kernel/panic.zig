@@ -10,6 +10,8 @@ const builtin = std.builtin;
 const cpu = zag.x86.Cpu;
 const serial = zag.x86.Serial;
 
+const VAddr = zag.x86.Paging.VAddr;
+
 /// Errors emitted by the symbol utilities.
 pub const PanicError = error{
     /// The provided symbol file/slice is malformed or empty.
@@ -207,20 +209,7 @@ pub fn initSymbolsFromSlice(
     g_symmap = sm;
 }
 
-/// Prints a kernel panic message and a best-effort backtrace, then halts.
-///
-/// Arguments:
-/// - `msg`: description of the failure.
-/// - `trace`: optional Zig stack trace (unused in this variant).
-/// - `ret_addr`: optional return address to highlight in the log.
-///
-/// Returns:
-/// - Never returns (`noreturn`).
-pub fn panic(
-    msg: []const u8,
-    trace: ?*builtin.StackTrace,
-    ret_addr: ?u64,
-) noreturn {
+pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
     @branchHint(.cold);
     _ = trace;
 
@@ -232,23 +221,22 @@ pub fn panic(
     }
 
     const first = @returnAddress();
-    var last: u64 = 0;
     var it = std.debug.StackIterator.init(first, null);
-    while (it.next()) |pc| {
-        if (pc == 0 or pc == last) continue;
+    var last_pc: u64 = 0;
+    var frames: usize = 0;
+
+    while (frames < 64) : (frames += 1) {
+        const pc = it.next() orelse break;
+        if (pc == 0) break;
         logAddr(pc);
-        last = pc;
+        last_pc = pc;
     }
 
-    cpu.halt();
+    zag.x86.Cpu.halt();
 }
 
-/// Logs `pc` with symbol+offset if available; otherwise prints a placeholder.
-///
-/// Arguments:
-/// - `pc`: program counter to resolve and print.
 fn logAddr(pc: u64) void {
-    if (g_symmap) |sm| {
+    if (zag.panic.g_symmap) |sm| {
         if (sm.find(pc)) |hit| {
             const off = pc - hit.base;
             serial.print("{X}: {s}+0x{X}\n", .{ pc, hit.name, off });

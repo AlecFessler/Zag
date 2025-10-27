@@ -42,6 +42,7 @@ pub fn panic(
 export fn kEntry(boot_info: boot_defs.BootInfo) callconv(.{ .x86_64_sysv = .{} }) noreturn {
     asm volatile (
         \\movq %[new_stack], %%rsp
+        \\movq %%rsp, %%rbp
         :
         : [new_stack] "r" (@intFromPtr(&__stackguard_lower) - 0x10),
     );
@@ -121,6 +122,8 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     const ksyms_bytes: []const u8 = boot_info.ksyms.ptr[0..boot_info.ksyms.len];
     try zag.panic.initSymbolsFromSlice(ksyms_bytes, bump_alloc_iface.?);
 
+    paging.dropIdentityMap();
+
     const buddy_alloc_required_bytes = BuddyAllocator.requiredMemory(
         bump_allocator.free_addr,
         bump_allocator.end_addr,
@@ -135,7 +138,9 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         bump_allocator.end_addr,
         PAGE4K,
     ));
-    std.debug.assert(buddy_alloc_start_virt.addr < buddy_alloc_end_virt.addr);
+    if (buddy_alloc_start_virt.addr < buddy_alloc_end_virt.addr) {
+        @panic("Invalid start and end addresses for pmm's buddy allocator!");
+    }
 
     var buddy_allocator: BuddyAllocator = try BuddyAllocator.init(
         buddy_alloc_start_virt.addr,
@@ -143,11 +148,9 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         bump_alloc_iface.?,
     );
     const buddy_alloc_iface = buddy_allocator.allocator();
+    bump_alloc_iface = null;
 
     pmm_mod.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
-
-    paging.dropIdentityMap();
-    bump_alloc_iface = null;
 
     const vmm_start_virt = paging.pml4SlotBase(@intFromEnum(paging.AddressSpace.kvmm));
     const vmm_end_virt = VAddr.fromInt(vmm_start_virt.addr + PAGE1G * paging.PAGE_TABLE_SIZE);
@@ -176,11 +179,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         &heap_tree_allocator,
     );
     const heap_allocator_iface = heap_allocator.allocator();
+    _ = heap_allocator_iface;
 
-    const slice = heap_allocator_iface.alloc(u8, 10) catch unreachable;
-    serial.print("Slice addr {X}\n", .{@intFromPtr(slice.ptr)});
-
-    @panic("ruh roh");
-
-    //cpu.halt();
+    cpu.halt();
 }
