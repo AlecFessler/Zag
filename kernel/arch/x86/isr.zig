@@ -342,7 +342,6 @@ fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
         faulting_vaddr.addr,
         @intFromEnum(paging.PageSize.Page4K),
     ));
-    serial.print("Faulting address {X}\n", .{faulting_page_vaddr.addr});
 
     if (code_privilege_level == 0) {
         if (pf_err.present) {

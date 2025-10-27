@@ -58,11 +58,6 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     idt.init();
     isr.init();
 
-    serial.print("Ksyms ptr {X} len {}\n", .{
-        @intFromPtr(boot_info.ksyms.ptr),
-        boot_info.ksyms.len,
-    });
-
     var mmap_entries_array: [boot_defs.MAX_MMAP_ENTRIES]boot_defs.MMapEntry = undefined;
     const mmap = boot_defs.collapseMmap(
         &boot_info.mmap,
@@ -138,7 +133,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         bump_allocator.end_addr,
         PAGE4K,
     ));
-    if (buddy_alloc_start_virt.addr < buddy_alloc_end_virt.addr) {
+    if (buddy_alloc_start_virt.addr >= buddy_alloc_end_virt.addr) {
         @panic("Invalid start and end addresses for pmm's buddy allocator!");
     }
 
