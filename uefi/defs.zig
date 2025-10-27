@@ -1,47 +1,79 @@
 const std = @import("std");
+const mmap = @import("mmap.zig");
 
 const uefi = std.os.uefi;
 
 pub const BootInfo = extern struct {
-    mmap: MemoryMap,
+    mmap: mmap.MMap,
     ksyms: extern struct {
         ptr: [*]const u8,
         len: u64,
     },
 };
 
-pub const MemoryMap = extern struct {
-    buffer_size: u64,
-    descriptors: [*]uefi.tables.MemoryDescriptor,
-    map_size: u64,
-    map_key: uefi.tables.MemoryMapKey,
-    descriptor_size: u64,
-    descriptor_version: u32,
+pub const MMapEntry = struct {
+    start_paddr: u64,
+    num_pages: u64,
+    type: MMapEntryType,
 };
 
-pub const MemoryDescriptorIterator = struct {
-    const Self = @This();
+pub const MMapEntryType = enum {
+    free,
+    reserved,
+};
 
-    descriptors: [*]uefi.tables.MemoryDescriptor,
-    current: *uefi.tables.MemoryDescriptor,
-    descriptor_size: u64,
-    total_size: u64,
+pub const MAX_MMAP_ENTRIES = 256;
 
-    pub fn new(map: MemoryMap) Self {
-        return Self{
-            .descriptors = map.descriptors,
-            .current = @ptrCast(map.descriptors),
-            .descriptor_size = map.descriptor_size,
-            .total_size = map.map_size,
+pub fn collapseMmap(
+    map: *const mmap.MMap,
+    mmap_entries: *[MAX_MMAP_ENTRIES]MMapEntry,
+) []MMapEntry {
+    var descriptor: *uefi.tables.MemoryDescriptor = @ptrCast(map.mmap);
+    var idx: u64 = 0;
+
+    mmap_entries[idx].start_paddr = descriptor.physical_start;
+    mmap_entries[idx].num_pages = descriptor.number_of_pages;
+    mmap_entries[idx].type = switch (descriptor.type) {
+        .conventional_memory,
+        .loader_code,
+        .loader_data,
+        .boot_services_code,
+        .boot_services_data,
+        => .free,
+        else => .reserved,
+    };
+
+    for (1..map.num_descriptors) |i| {
+        descriptor = @ptrFromInt(i * map.descriptor_size + @intFromPtr(map.mmap));
+        const t: MMapEntryType = switch (descriptor.type) {
+            .conventional_memory,
+            .loader_code,
+            .loader_data,
+            .boot_services_code,
+            .boot_services_data,
+            => .free,
+            else => .reserved,
         };
+
+        const same_type = (t == mmap_entries[idx].type);
+        const prev_end = mmap_entries[idx].start_paddr + mmap_entries[idx].num_pages * 4096;
+        const contiguous = (descriptor.physical_start == prev_end);
+
+        if (same_type and contiguous) {
+            mmap_entries[idx].num_pages += descriptor.number_of_pages;
+            continue;
+        }
+
+        idx += 1;
+        std.debug.assert(idx < 256);
+
+        mmap_entries[idx].start_paddr = descriptor.physical_start;
+        mmap_entries[idx].num_pages = descriptor.number_of_pages;
+        mmap_entries[idx].type = t;
     }
 
-    pub fn next(self: *Self) ?*uefi.tables.MemoryDescriptor {
-        if (@intFromPtr(self.current) >= @intFromPtr(self.descriptors) + self.total_size) {
-            return null;
-        }
-        const md = self.current;
-        self.current = @ptrFromInt(@intFromPtr(self.current) + self.descriptor_size);
-        return md;
-    }
-};
+    idx += 1;
+    std.debug.assert(idx < 256);
+
+    return mmap_entries[0..idx];
+}

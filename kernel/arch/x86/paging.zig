@@ -8,19 +8,14 @@ const std = @import("std");
 
 /// Top-level virtual address slots (PML4 indices) we reserve.
 pub const AddressSpace = enum(u9) {
-    /// Higher-half direct map: physmap at PML4=511 and kernel text/data
-    /// relative to `kernel_base_vaddr`.
+    /// Higher-half direct map: physmap at PML4=511
     hhdm = 511,
     /// Kernel virtual memory area reserved for the VMM (allocator address space).
     kvmm = 510,
 };
 
 /// Which HHDM base to use when translating between `PAddr` and `VAddr`.
-/// kernel and physmap will never overlap because physmap is initialized
-/// starting just after the kernel's end in memory
 pub const HHDMType = enum {
-    /// Kernel-linked base
-    kernel,
     /// Physmap base (direct map of physical memory).
     physmap,
     /// Identity mapping for use by uefi bootloader
@@ -99,7 +94,6 @@ pub const PAddr = struct {
     /// Translates a virtual address to physical using an HHDM base.
     pub fn fromVAddr(vaddr: VAddr, type_: HHDMType) PAddr {
         const base_vaddr = switch (type_) {
-            .kernel  => VAddr.fromInt(KERNEL_BASE_VADDR),
             .physmap => pml4SlotBase(@intFromEnum(AddressSpace.hhdm)),
             .identity => VAddr.fromInt(0),
         };
@@ -125,7 +119,6 @@ pub const VAddr = struct {
     /// Translates a physical address to virtual using an HHDM base.
     pub fn fromPAddr(paddr: PAddr, type_: HHDMType) VAddr {
         const base_vaddr = switch (type_) {
-            .kernel  => VAddr.fromInt(KERNEL_BASE_VADDR),
             .physmap => pml4SlotBase(@intFromEnum(AddressSpace.hhdm)),
             .identity => VAddr.fromInt(0),
         };
@@ -138,7 +131,7 @@ pub const VAddr = struct {
         return @ptrFromInt(self.addr);
     }
 
-    /// Converts between kernel/physmap HHDM bases (via physical).
+    /// Converts between identity/physmap HHDM bases (via physical).
     pub fn remapHHDMType(self: *const @This(), from: HHDMType, to: HHDMType) VAddr {
         std.debug.assert(from != to);
         const paddr = PAddr.fromVAddr(self.*, from);
@@ -167,8 +160,6 @@ pub const default_flags = PageEntry{
     .reserved = 0,
     .nx = true,
 };
-
-pub const KERNEL_BASE_VADDR = 0xFFFFFFFF80000000;
 
 /// Required alignment for page tables and 4KiB pages.
 pub const PAGE_ALIGN = std.mem.Alignment.fromByteUnits(@intFromEnum(PageSize.Page4K));
@@ -314,8 +305,7 @@ pub fn pml4_index(vaddr: VAddr) u9 {
 
 /// Identity-maps a physical range into the physmap with the fewest entries.
 ///
-/// Chooses 1GiB/2MiB/4KiB pages based on alignment/remaining size. Must be
-/// called while using the `.kernel` HHDM for newly allocated tables.
+/// Chooses 1GiB/2MiB/4KiB pages based on alignment/remaining size.
 pub fn physMapRegion(
     pml4_vaddr: VAddr,
     start_paddr: PAddr,
@@ -348,7 +338,7 @@ pub fn physMapRegion(
             true,
             User.Supervisor,
             @enumFromInt(chosen_size),
-            .kernel,
+            .identity,
             allocator,
         );
 

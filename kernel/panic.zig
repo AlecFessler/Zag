@@ -1,14 +1,14 @@
 //! Symbol map and kernel panic utilities.
 //!
 //! Provides a compact symbol table for address-to-name lookups during panics
-//! and a minimal panic routine that prints a backtrace via VGA.
+//! and a minimal panic routine that prints a backtrace via serial.
 
 const std = @import("std");
-const x86 = @import("x86");
+const zag = @import("zag.zig");
 
 const builtin = std.builtin;
-const cpu = x86.Cpu;
-const vga = x86.Vga;
+const cpu = zag.x86.Cpu;
+const serial = zag.x86.Serial;
 
 /// Errors emitted by the symbol utilities.
 pub const PanicError = error{
@@ -223,13 +223,12 @@ pub fn panic(
 ) noreturn {
     @branchHint(.cold);
     _ = trace;
-    vga.setColor(.White, .Blue);
 
     if (ret_addr) |ra| {
-        vga.print("KERNEL PANIC: {s} (ret_addr {X})\n", .{ msg, ra });
+        serial.print("KERNEL PANIC: {s} (ret_addr {X})\n", .{ msg, ra });
         logAddr(ra);
     } else {
-        vga.print("KERNEL PANIC: {s}\n", .{msg});
+        serial.print("KERNEL PANIC: {s}\n", .{msg});
     }
 
     const first = @returnAddress();
@@ -252,11 +251,11 @@ fn logAddr(pc: u64) void {
     if (g_symmap) |sm| {
         if (sm.find(pc)) |hit| {
             const off = pc - hit.base;
-            vga.print("{X}: {s}+0x{X}\n", .{ pc, hit.name, off });
+            serial.print("{X}: {s}+0x{X}\n", .{ pc, hit.name, off });
             return;
         }
-        vga.print("{X}: ?????\n", .{pc});
+        serial.print("{X}: ?????\n", .{pc});
         return;
     }
-    vga.print("{X}: (no symbols)\n", .{pc});
+    serial.print("{X}: (no symbols)\n", .{pc});
 }

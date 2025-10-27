@@ -1,5 +1,6 @@
 const std = @import("std");
-const defs = @import("defs.zig");
+const defs_mod = @import("defs.zig");
+const mmap_mod = @import("mmap.zig");
 const file_mod = @import("file.zig");
 const log_mod = @import("log.zig");
 const alloc_mod = @import("boot_allocator.zig");
@@ -12,6 +13,8 @@ const uefi = std.os.uefi;
 
 pub const std_options = log_mod.default_log_options;
 
+const KEntryType = fn (defs_mod.BootInfo) callconv(.{ .x86_64_sysv = .{} }) noreturn;
+
 pub fn main() uefi.Status {
     log_mod.init(uefi.system_table.con_out.?) catch return .aborted;
     const log = std.log.scoped(.loader);
@@ -23,7 +26,7 @@ pub fn main() uefi.Status {
 
     const pages_slice = boot_services.allocatePages(
         .any,
-        .loader_data,
+        .reserved_memory_type,
         1,
     ) catch {
         log.err("Failed to allocate page for new pml4", .{});
@@ -72,89 +75,155 @@ pub fn main() uefi.Status {
         return .aborted;
     };
 
-    const kernel_file = file_mod.openFile(
+    const kentry_addr = loadKernel(
+        boot_services,
         root_dir,
-        "kernel.elf",
-    ) catch return .aborted;
+        new_pml4_paddr,
+    ) orelse return .aborted;
 
-    var header_size: u64 = @sizeOf(elf.Elf64_Ehdr);
-    var header_buffer = boot_services.allocatePool(
-        .loader_data,
-        header_size,
-    ) catch |err| {
-        log.err("Failed to allocate ELF header buffer: {}", .{err});
+    const ksyms_bytes = loadKsymsMap(
+        boot_services,
+        root_dir,
+    ) orelse return .aborted;
+
+    root_dir.close() catch |err| {
+        log.err("Failed to close root volume: {}", .{err});
         return .aborted;
     };
 
+    var mmap = mmap_mod.getMmap(boot_services) orelse return .aborted;
+    boot_services.exitBootServices(
+        uefi.handle,
+        mmap.key,
+    ) catch {
+        mmap = mmap_mod.getMmap(boot_services) orelse return .aborted;
+        boot_services.exitBootServices(
+            uefi.handle,
+            mmap.key,
+        ) catch |err| {
+            log.err("Failed to exit boot services: {}", .{err});
+            return .aborted;
+        };
+    };
+
+    const boot_info = defs_mod.BootInfo{
+        .mmap = mmap,
+        .ksyms = .{
+            .ptr = ksyms_bytes.ptr,
+            .len = ksyms_bytes.len,
+        },
+    };
+
+    const kEntry: *KEntryType = @ptrFromInt(kentry_addr);
+
+    kEntry(boot_info);
+    unreachable;
+}
+
+// Load kernel.elf, map all PT_LOAD segments, and return the ELF entry address.
+// On error, logs and returns null.
+//
+// Assumes:
+// - `new_pml4_paddr` is the active PML4 you want to map into (already written to CR3).
+// - We’re running under UEFI boot services and can allocate pages/pools.
+// - We can open files via `file_mod` and `root_dir` points to the volume root.
+pub fn loadKernel(
+    boot_services: *uefi.tables.BootServices,
+    root_dir: *uefi.protocol.File,
+    new_pml4_paddr: paging.PAddr,
+) ?elf.Elf64_Addr {
+    const log = std.log.scoped(.kernel_loader);
+
+    const kernel_file = file_mod.openFile(root_dir, "kernel.elf") catch {
+        return null;
+    };
+    defer {
+        kernel_file.close() catch |cerr| {
+            log.err("Failed to close kernel ELF file: {}", .{cerr});
+        };
+    }
+
+    var header_size: usize = @sizeOf(elf.Elf64_Ehdr);
+    var header_buffer = boot_services.allocatePool(.loader_data, header_size) catch |err| {
+        log.err("Failed to allocate ELF header buffer: {}", .{err});
+        return null;
+    };
+    defer {
+        boot_services.freePool(@ptrCast(header_buffer.ptr)) catch |ferr| {
+            log.err("Failed to free memory for kernel ELF header: {}", .{ferr});
+        };
+    }
+
     header_size = kernel_file.read(header_buffer) catch |err| {
         log.err("Failed to read kernel ELF header: {}", .{err});
-        return .aborted;
+        return null;
     };
 
     var reader = std.Io.Reader.fixed(header_buffer[0..header_size]);
     const elf_header = elf.Header.read(&reader) catch |err| {
         log.err("Failed to parse kernel ELF header: {}", .{err});
-        return .aborted;
+        return null;
     };
 
-    const phdr_size = elf_header.phentsize * elf_header.phnum;
-    const file_prefix_size = elf_header.phoff + phdr_size;
-    const prefix_buffer = boot_services.allocatePool(
-        .loader_data,
-        file_prefix_size,
-    ) catch {
+    const phdr_size: usize = elf_header.phentsize * elf_header.phnum;
+    const file_prefix_size: usize = @intCast(elf_header.phoff + phdr_size);
+
+    const prefix_buffer = boot_services.allocatePool(.loader_data, file_prefix_size) catch {
         log.err("Failed to allocate ELF prefix buffer", .{});
-        return .aborted;
+        return null;
     };
+    defer {
+        boot_services.freePool(@ptrCast(prefix_buffer.ptr)) catch |ferr| {
+            log.err("Failed to free ELF prefix buffer: {}", .{ferr});
+        };
+    }
 
     kernel_file.setPosition(0) catch {
         log.err("Failed to seek to 0", .{});
-        return .aborted;
+        return null;
     };
     const got_prefix = kernel_file.read(prefix_buffer) catch {
         log.err("Failed to read ELF prefix", .{});
-        return .aborted;
+        return null;
     };
     if (got_prefix != file_prefix_size) {
         log.err("Short read of ELF prefix: got {} expected {}", .{ got_prefix, file_prefix_size });
-        return .aborted;
+        return null;
     }
 
     var iter = elf_header.iterateProgramHeadersBuffer(prefix_buffer);
 
     var page_allocator = alloc_mod.PageAllocator.init(
         boot_services,
-        .loader_data,
+        .reserved_memory_type,
     );
     const page_alloc_iface = page_allocator.allocator();
+
+    const page4K: u64 = @intFromEnum(paging.PageSize.Page4K);
 
     while (true) {
         const phdr = iter.next() catch |err| {
             if (err == error.EndOfStream) break;
             log.err("PHDR iter error: {}", .{err});
-            return .aborted;
+            return null;
         } orelse break;
         if (phdr.p_type != elf.PT_LOAD) continue;
 
         const writeable = (phdr.p_flags & elf.PF_W) != 0;
         const not_executeable = (phdr.p_flags & elf.PF_X) == 0;
 
-        const start_vaddr = phdr.p_vaddr;
-        const end_vaddr = start_vaddr + phdr.p_memsz;
+        const start_vaddr: u64 = phdr.p_vaddr;
+        const end_vaddr: u64 = start_vaddr + phdr.p_memsz;
 
         var vaddr = start_vaddr;
-
         while (vaddr < end_vaddr) {
-            const backing_page_slice = boot_services.allocatePages(
-                .any,
-                .loader_data,
-                1,
-            ) catch {
-                log.err("Failed to allocate page for new pml4", .{});
-                return .aborted;
+            const backing_page_slice = boot_services.allocatePages(.any, .reserved_memory_type, 1) catch {
+                log.err("Failed to allocate backing page for segment", .{});
+                return null;
             };
-            // This should always be a paddr if all UEFI firmware identity maps memory??
+
             const backing_page_paddr = @intFromPtr(&backing_page_slice[0]);
+
             paging.mapPage(
                 @ptrFromInt(new_pml4_paddr.addr),
                 paging.PAddr.fromInt(backing_page_paddr),
@@ -171,13 +240,10 @@ pub fn main() uefi.Status {
         }
 
         kernel_file.setPosition(phdr.p_offset) catch |err| {
-            log.err("Failed to read kernel segment into memory: {}", .{err});
-            return .aborted;
+            log.err("Failed to position for kernel segment: {}", .{err});
+            return null;
         };
 
-        // disable and then reenable the write protect bit when copying
-        // data from file into memory to temporarily bypass the text and rodata
-        // sections being mapped with the correct readonly permissions
         cpu.setWriteProtect(false);
         defer cpu.setWriteProtect(true);
 
@@ -187,155 +253,88 @@ pub fn main() uefi.Status {
             const segment_slice = segment[copied..phdr.p_filesz];
             const chunk = kernel_file.read(segment_slice) catch |err| {
                 log.err("Failed to read kernel segment into memory: {}", .{err});
-                return .aborted;
+                return null;
             };
             if (chunk == 0) {
-                log.err("Short read while loading segment: copied {} of {}", .{
-                    copied,
-                    phdr.p_filesz,
-                });
-                return .aborted;
+                log.err("Short read while loading segment: copied {} of {}", .{ copied, phdr.p_filesz });
+                return null;
             }
             copied += chunk;
         }
 
-        // zero the bss section tail
         if (phdr.p_memsz > phdr.p_filesz) {
             const segment_slice = segment[phdr.p_filesz..phdr.p_memsz];
             @memset(segment_slice, 0);
         }
     }
 
-    const map_file = file_mod.openFile(
-        root_dir,
-        "kernel.map",
-    ) catch |err| {
-        log.err("Failed to open kernel.map: {}", .{err});
-        return .aborted;
-    };
+    return elf_header.entry;
+}
 
-    const info_size = map_file.getInfoSize(.file) catch |err| {
+/// Load `kernel.map` into a reserved UEFI pool and return its bytes.
+///
+/// Params:
+/// - `boot_services`: UEFI boot services pointer
+/// - `root_dir`: already-opened root volume
+///
+/// Returns:
+/// - `[]u8` slice of the file contents on success
+/// - `null` on failure (errors are logged here)
+fn loadKsymsMap(
+    boot_services: *uefi.tables.BootServices,
+    root_dir: *uefi.protocol.File,
+) ?[]u8 {
+    const log = std.log.scoped(.ksyms_loader);
+
+    const ksyms_file = file_mod.openFile(root_dir, "kernel.map") catch |err| {
+        log.err("Failed to open kernel.map: {}", .{err});
+        return null;
+    };
+    defer {
+        ksyms_file.close() catch |cerr| {
+            log.err("Failed to close kernel.map: {}", .{cerr});
+        };
+    }
+
+    const info_size = ksyms_file.getInfoSize(.file) catch |err| {
         log.err("Failed to stat size of kernel.map: {}", .{err});
-        return .aborted;
+        return null;
     };
 
     const info_bytes = boot_services.allocatePool(.loader_data, info_size) catch |err| {
         log.err("Failed to alloc File.Info buffer: {}", .{err});
-        return .aborted;
+        return null;
     };
+    defer {
+        boot_services.freePool(@ptrCast(info_bytes.ptr)) catch |ferr| {
+            log.err("Failed to free File.Info buffer: {}", .{ferr});
+        };
+    }
 
-    const map_file_info = map_file.getInfo(.file, info_bytes[0..info_size]) catch |err| {
+    const info = ksyms_file.getInfo(.file, info_bytes[0..info_size]) catch |err| {
         log.err("Failed to get file info for kernel.map: {}", .{err});
-        return .aborted;
+        return null;
     };
 
-    const map_buf = boot_services.allocatePool(.loader_data, map_file_info.file_size) catch |err| {
+    const map_size: usize = @intCast(info.file_size);
+
+    const map_buf = boot_services.allocatePool(.reserved_memory_type, map_size) catch |err| {
         log.err("Failed to alloc buffer for kernel.map: {}", .{err});
-        return .aborted;
+        return null;
     };
 
     var read_total: usize = 0;
-    while (read_total < map_file_info.file_size) {
-        const chunk = map_file.read(map_buf[read_total..map_file_info.file_size]) catch |err| {
+    while (read_total < map_size) {
+        const chunk = ksyms_file.read(map_buf[read_total..map_size]) catch |err| {
             log.err("Failed to read kernel.map: {}", .{err});
-            return .aborted;
+            return null;
         };
         if (chunk == 0) {
             log.err("Short read on kernel.map: got {}", .{read_total});
-            return .aborted;
+            return null;
         }
         read_total += chunk;
     }
 
-    map_file.close() catch |err| {
-        log.err("Failed to close kernel.map: {}", .{err});
-        return .aborted;
-    };
-
-    boot_services.freePool(@ptrCast(header_buffer.ptr)) catch |err| {
-        log.err("Failed to free memory for kernel ELF header: {}", .{err});
-        return .aborted;
-    };
-
-    kernel_file.close() catch |err| {
-        log.err("Failed to close kernel ELF file: {}", .{err});
-        return .aborted;
-    };
-
-    root_dir.close() catch |err| {
-        log.err("Failed to close root volume: {}", .{err});
-        return .aborted;
-    };
-
-    const mmap_pages_slice = boot_services.allocatePages(
-        .any,
-        .loader_data,
-        4,
-    ) catch {
-        log.err("Failed to allocate pages for memory map", .{});
-        return .aborted;
-    };
-
-    const mmap_pages_bytes = (@as([*]u8, @ptrCast(mmap_pages_slice.ptr)))[0 .. page4K * 4];
-    const mmap_buf: []align(@alignOf(uefi.tables.MemoryDescriptor)) u8 = @alignCast(mmap_pages_bytes);
-
-    var map = boot_services.getMemoryMap(mmap_buf) catch |err| {
-        log.err("Failed to get memory map: {}", .{err});
-        return .aborted;
-    };
-
-    var map_iter = defs.MemoryDescriptorIterator.new(.{
-        .buffer_size = map.info.len,
-        .descriptors = @alignCast(@ptrCast(mmap_buf.ptr)),
-        .map_key = map.info.key,
-        .map_size = map.info.len,
-        .descriptor_size = map.info.descriptor_size,
-        .descriptor_version = map.info.descriptor_version,
-    });
-
-    while (map_iter.next()) |md| {
-        log.debug("  0x{X:0>16} - 0x{X:0>16} : {s}", .{
-            md.physical_start,
-            md.physical_start + md.number_of_pages * page4K,
-            @tagName(md.type),
-        });
-    }
-
-    boot_services.exitBootServices(
-        uefi.handle,
-        map.info.key,
-    ) catch {
-        map = boot_services.getMemoryMap(mmap_buf) catch |err| {
-            log.err("Failed to get memory map: {}", .{err});
-            return .aborted;
-        };
-        boot_services.exitBootServices(
-            uefi.handle,
-            map.info.key,
-        ) catch |err| {
-            log.err("Failed to exit boot services: {}", .{err});
-            return .aborted;
-        };
-    };
-
-    const boot_info = defs.BootInfo{
-        .mmap = .{
-            .buffer_size = mmap_buf.len,
-            .descriptors = @alignCast(@ptrCast(mmap_buf.ptr)),
-            .map_key = map.info.key,
-            .map_size = map.info.len,
-            .descriptor_size = map.info.descriptor_size,
-            .descriptor_version = map.info.descriptor_version,
-        },
-        .ksyms = .{
-            .ptr = map_buf.ptr,
-            .len = map_file_info.file_size,
-        },
-    };
-
-    const KEntryType = fn (defs.BootInfo) noreturn;
-    const kEntry: *KEntryType = @ptrFromInt(elf_header.entry);
-
-    kEntry(boot_info);
-    unreachable;
+    return map_buf[0..map_size];
 }

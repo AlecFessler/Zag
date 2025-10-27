@@ -103,10 +103,10 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&install_map.step);
 
     // All module's root files (named after the containing dir)
-    // should be imported into kernel/main.zig, and then all
+    // should be imported into kernel/zag.zig, and then all
     // modules root files can be imported under @import("zag")
     const zag_mod = b.addModule("zag", .{
-        .root_source_file = b.path("kernel/main.zig"),
+        .root_source_file = b.path("kernel/zag.zig"),
         .target = b.resolveTargetQuery(.{
             .cpu_arch = .x86_64,
             .os_tag = .freestanding,
@@ -115,6 +115,7 @@ pub fn build(b: *std.Build) void {
     });
     zag_mod.omit_frame_pointer = false;
     zag_mod.red_zone = false;
+    zag_mod.addImport("zag", zag_mod);
 
     const x86_mod = b.addModule("x86", .{
         .root_source_file = b.path("kernel/arch/x86/x86.zig"),

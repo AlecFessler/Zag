@@ -5,9 +5,9 @@
 //! handing out stable VAs for subsystems (heaps, stacks, mappings).
 
 const std = @import("std");
-const x86 = @import("x86");
+const zag = @import("zag");
 
-const paging = x86.Paging;
+const paging = zag.x86.Paging;
 
 const VAddr = paging.VAddr;
 
