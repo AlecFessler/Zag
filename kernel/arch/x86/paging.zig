@@ -9,13 +9,13 @@ const std = @import("std");
 /// Top-level virtual address slots (PML4 indices) we reserve.
 pub const AddressSpace = enum(u9) {
     /// Higher-half direct map: physmap at PML4=511
-    hhdm = 511,
+    physmap = 511,
     /// Kernel virtual memory area reserved for the VMM (allocator address space).
     kvmm = 510,
 };
 
-/// Which HHDM base to use when translating between `PAddr` and `VAddr`.
-pub const HHDMType = enum {
+/// Which base to use when translating between `PAddr` and `VAddr`.
+pub const MappingType = enum {
     /// Physmap base (direct map of physical memory).
     physmap,
     /// Identity mapping for use by uefi bootloader
@@ -91,10 +91,10 @@ pub const PAddr = struct {
         return .{ .addr = addr };
     }
 
-    /// Translates a virtual address to physical using an HHDM base.
-    pub fn fromVAddr(vaddr: VAddr, type_: HHDMType) PAddr {
+    /// Translates a virtual address to physical using an base.
+    pub fn fromVAddr(vaddr: VAddr, type_: MappingType) PAddr {
         const base_vaddr = switch (type_) {
-            .physmap => pml4SlotBase(@intFromEnum(AddressSpace.hhdm)),
+            .physmap => pml4SlotBase(@intFromEnum(AddressSpace.physmap)),
             .identity => VAddr.fromInt(0),
         };
         const phys = vaddr.addr - base_vaddr.addr;
@@ -116,10 +116,10 @@ pub const VAddr = struct {
         return .{ .addr = addr };
     }
 
-    /// Translates a physical address to virtual using an HHDM base.
-    pub fn fromPAddr(paddr: PAddr, type_: HHDMType) VAddr {
+    /// Translates a physical address to virtual using a base.
+    pub fn fromPAddr(paddr: PAddr, type_: MappingType) VAddr {
         const base_vaddr = switch (type_) {
-            .physmap => pml4SlotBase(@intFromEnum(AddressSpace.hhdm)),
+            .physmap => pml4SlotBase(@intFromEnum(AddressSpace.physmap)),
             .identity => VAddr.fromInt(0),
         };
         const virt = paddr.addr + base_vaddr.addr;
@@ -131,8 +131,8 @@ pub const VAddr = struct {
         return @ptrFromInt(self.addr);
     }
 
-    /// Converts between identity/physmap HHDM bases (via physical).
-    pub fn remapHHDMType(self: *const @This(), from: HHDMType, to: HHDMType) VAddr {
+    /// Converts between identity/physmap bases (via physical).
+    pub fn remapMappingType(self: *const @This(), from: MappingType, to: MappingType) VAddr {
         std.debug.assert(from != to);
         const paddr = PAddr.fromVAddr(self.*, from);
         return VAddr.fromPAddr(paddr, to);
@@ -167,11 +167,23 @@ pub const PAGE_ALIGN = std.mem.Alignment.fromByteUnits(@intFromEnum(PageSize.Pag
 /// Entries per page table.
 pub const PAGE_TABLE_SIZE = 512;
 
+pub fn dropIdentityMap() void {
+    const cr3 = read_cr3();
+    const pml4_paddr = PAddr.fromInt(cr3.addr & ~@as(u64, 0xfff));
+    const pml4_vaddr = VAddr.fromPAddr(pml4_paddr, .identity);
+    const pml4 = pml4_vaddr.getPtr([*]PML4Entry);
+
+    for(0..256) |i| {
+        pml4[i] = default_flags;
+    }
+
+    write_cr3(pml4_paddr);
+}
 
 /// Maps a single page (4KiB/2MiB/1GiB) at `vaddr` → `paddr`.
 ///
 /// Allocates intermediate tables on demand using `allocator`. Honors `rw`,
-/// `nx`, and `user`. `hhdm_type` decides how newly allocated tables are
+/// `nx`, and `user`. `mapping_type` decides how newly allocated tables are
 /// translated into physical addresses.
 ///
 /// Preconditions:
@@ -185,7 +197,7 @@ pub fn mapPage(
     nx: bool,
     user: User,
     page_size: PageSize,
-    hhdm_type: HHDMType,
+    mapping_type: MappingType,
     allocator: std.mem.Allocator,
 ) void {
     std.debug.assert(std.mem.isAligned(paddr.addr, PAGE_ALIGN.toByteUnits()));
@@ -225,10 +237,10 @@ pub fn mapPage(
         @memset(new_pdpt, default_flags);
         pdpt_entry.* = flags;
         const new_pdpt_vaddr = VAddr.fromInt(@intFromPtr(new_pdpt.ptr));
-        const new_pdpt_paddr = PAddr.fromVAddr(new_pdpt_vaddr, hhdm_type);
+        const new_pdpt_paddr = PAddr.fromVAddr(new_pdpt_vaddr, mapping_type);
         pdpt_entry.setPAddr(new_pdpt_paddr);
     }
-    const pdpt_entry_vaddr = VAddr.fromPAddr(pdpt_entry.getPAddr(), hhdm_type);
+    const pdpt_entry_vaddr = VAddr.fromPAddr(pdpt_entry.getPAddr(), mapping_type);
     const pdpt = pdpt_entry_vaddr.getPtr([*]PDPTEntry);
 
     if (page_size == .Page1G) {
@@ -249,10 +261,10 @@ pub fn mapPage(
         @memset(new_pd, default_flags);
         pd_entry.* = flags;
         const new_pd_vaddr = VAddr.fromInt(@intFromPtr(new_pd.ptr));
-        const new_pd_paddr = PAddr.fromVAddr(new_pd_vaddr, hhdm_type);
+        const new_pd_paddr = PAddr.fromVAddr(new_pd_vaddr, mapping_type);
         pd_entry.setPAddr(new_pd_paddr);
     }
-    const pd_entry_vaddr = VAddr.fromPAddr(pd_entry.getPAddr(), hhdm_type);
+    const pd_entry_vaddr = VAddr.fromPAddr(pd_entry.getPAddr(), mapping_type);
     const pd = pd_entry_vaddr.getPtr([*]PDEntry);
 
     if (page_size == .Page2M) {
@@ -273,10 +285,10 @@ pub fn mapPage(
         @memset(new_pt, default_flags);
         pt_entry.* = flags;
         const new_pt_vaddr = VAddr.fromInt(@intFromPtr(new_pt.ptr));
-        const new_pt_paddr = PAddr.fromVAddr(new_pt_vaddr, hhdm_type);
+        const new_pt_paddr = PAddr.fromVAddr(new_pt_vaddr, mapping_type);
         pt_entry.setPAddr(new_pt_paddr);
     }
-    const pt_entry_vaddr = VAddr.fromPAddr(pt_entry.getPAddr(), hhdm_type);
+    const pt_entry_vaddr = VAddr.fromPAddr(pt_entry.getPAddr(), mapping_type);
     const pt = pt_entry_vaddr.getPtr([*]PTEntry);
 
     pt[pt_idx] = flags;

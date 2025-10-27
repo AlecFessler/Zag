@@ -63,7 +63,6 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         &mmap_entries_array,
     );
 
-    // find largest contiguous free region for pmm
     var largest_free_region = boot_defs.MMapEntry{
         .start_paddr = 0,
         .num_pages = 0,
@@ -82,18 +81,32 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         bump_alloc_start_phys.addr,
         bump_alloc_end_phys.addr,
     );
-    const bump_alloc_iface = bump_allocator.allocator();
+    var bump_alloc_iface: ?std.mem.Allocator = bump_allocator.allocator();
 
     const ksyms_bytes: []const u8 = boot_info.ksyms.ptr[0..boot_info.ksyms.len];
-    try zag.panic.initSymbolsFromSlice(ksyms_bytes, bump_alloc_iface);
+    try zag.panic.initSymbolsFromSlice(ksyms_bytes, bump_alloc_iface.?);
 
-    const pml4_paddr = paging.read_cr3();
+    const pml4_paddr = PAddr.fromInt(paging.read_cr3().addr & ~@as(u64, 0xfff));
     const pml4_vaddr = VAddr.fromPAddr(pml4_paddr, .identity);
+
+    // pml4 page will need to be physmapped (higher half direect mapping) for page fault handler
+    paging.mapPage(
+        @ptrFromInt(pml4_vaddr.addr),
+        pml4_paddr,
+        VAddr.fromPAddr(pml4_paddr, .physmap),
+        .ReadWrite,
+        true,
+        .Supervisor,
+        .Page4K,
+        .identity,
+        bump_alloc_iface.?,
+    );
+
     paging.physMapRegion(
         pml4_vaddr,
         bump_alloc_start_phys,
         bump_alloc_end_phys,
-        bump_alloc_iface,
+        bump_alloc_iface.?,
     );
 
     const buddy_alloc_required_bytes = BuddyAllocator.requiredMemory(
@@ -114,55 +127,38 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     const buddy_alloc_start_virt = VAddr.fromPAddr(buddy_alloc_start_phys, .physmap);
     const buddy_alloc_end_virt = VAddr.fromPAddr(buddy_alloc_end_phys, .physmap);
 
-    var buddy_allocator: BuddyAllocator = BuddyAllocator.init(
+    var buddy_allocator: BuddyAllocator = try BuddyAllocator.init(
         buddy_alloc_start_virt.addr,
         buddy_alloc_end_virt.addr,
-        bump_alloc_iface,
-    ) catch @panic("Failed to allocate memory for buddy allocator!");
+        bump_alloc_iface.?,
+    );
     const buddy_alloc_iface = buddy_allocator.allocator();
 
     pmm_mod.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
 
-    // should drop identity mappings at this point
+    paging.dropIdentityMap();
+    bump_alloc_iface = null;
 
-    const pml4_slot_size = PAGE1G * paging.PAGE_TABLE_SIZE;
-    const vmm_start_vaddr = paging.pml4SlotBase(@intFromEnum(paging.AddressSpace.kvmm));
-    const vmm_end_vaddr = VAddr.fromInt(vmm_start_vaddr.addr + pml4_slot_size);
-
+    const vmm_start_virt = paging.pml4SlotBase(@intFromEnum(paging.AddressSpace.kvmm));
+    const vmm_end_virt = VAddr.fromInt(vmm_start_virt.addr + PAGE1G * paging.PAGE_TABLE_SIZE);
     vmm_mod.global_vmm = VirtualMemoryManager.init(
-        vmm_start_vaddr,
-        vmm_end_vaddr,
+        vmm_start_virt,
+        vmm_end_virt,
     );
     var vmm = &vmm_mod.global_vmm.?;
 
-    const heap_vaddr_space_start = vmm.reserve(
-        PAGE1G * 256,
-        std.mem.Alignment.fromByteUnits(PAGE4K),
-    ) catch @panic("VMM doesn't have enough address space for heap allocator!");
+    const heap_vaddr_space_start = try vmm.reserve(PAGE1G * 256, std.mem.Alignment.fromByteUnits(PAGE4K));
     const heap_vaddr_space_end = VAddr.fromInt(heap_vaddr_space_start.addr + PAGE1G * 256);
-    serial.print("heap vaddr start {X} end {X}\n", .{
-        heap_vaddr_space_start.addr,
-        heap_vaddr_space_end.addr,
-    });
 
-    const heap_tree_vaddr_space_start = vmm.reserve(
-        PAGE1G,
-        std.mem.Alignment.fromByteUnits(PAGE4K),
-    ) catch @panic("VMM doesn't have enough address space for heap tree allocator!");
+    const heap_tree_vaddr_space_start = try vmm.reserve(PAGE1G, std.mem.Alignment.fromByteUnits(PAGE4K));
     const heap_tree_vaddr_space_end = VAddr.fromInt(heap_tree_vaddr_space_start.addr + PAGE1G);
-    serial.print("heap vaddr start {X} end {X}\n", .{
-        heap_tree_vaddr_space_start.addr,
-        heap_tree_vaddr_space_end.addr,
-    });
 
     var heap_tree_backing_allocator = BumpAllocator.init(
         heap_tree_vaddr_space_start.addr,
         heap_tree_vaddr_space_end.addr,
     );
     const heap_tree_backing_allocator_iface = heap_tree_backing_allocator.allocator();
-    var heap_tree_allocator = HeapTreeAllocator.init(
-        heap_tree_backing_allocator_iface,
-    ) catch @panic("Failed to initialize heap allocator's tree allocator!");
+    var heap_tree_allocator = try HeapTreeAllocator.init(heap_tree_backing_allocator_iface);
 
     var heap_allocator = HeapAllocator.init(
         heap_vaddr_space_start.addr,
@@ -176,3 +172,5 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
 
     cpu.halt();
 }
+
+fn initPmm() void {}
