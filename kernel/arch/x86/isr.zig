@@ -359,11 +359,9 @@ fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
         const page = pmm_iface.alloc(paging.PageMem(.Page4K), 1) catch @panic("PMM OOM!");
         const phys_page_vaddr = VAddr.fromInt(@intFromPtr(page.ptr));
         const phys_page_paddr = PAddr.fromVAddr(phys_page_vaddr, .physmap);
-        serial.print("Phys page vaddr {X}\n", .{phys_page_vaddr.addr});
 
         const pml4_paddr = PAddr.fromInt(paging.read_cr3().addr & ~@as(u64, 0xfff));
         const pml4_vaddr = VAddr.fromPAddr(pml4_paddr, .physmap);
-        serial.print("Pml4 vaddr {X}\n", .{phys_page_vaddr.addr});
 
         paging.mapPage(
             @ptrFromInt(pml4_vaddr.addr),

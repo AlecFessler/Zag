@@ -57,6 +57,11 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     idt.init();
     isr.init();
 
+    serial.print("Ksyms ptr {X} len {}\n", .{
+        @intFromPtr(boot_info.ksyms.ptr),
+        boot_info.ksyms.len,
+    });
+
     var mmap_entries_array: [boot_defs.MAX_MMAP_ENTRIES]boot_defs.MMapEntry = undefined;
     const mmap = boot_defs.collapseMmap(
         &boot_info.mmap,
@@ -83,9 +88,6 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     );
     var bump_alloc_iface: ?std.mem.Allocator = bump_allocator.allocator();
 
-    const ksyms_bytes: []const u8 = boot_info.ksyms.ptr[0..boot_info.ksyms.len];
-    try zag.panic.initSymbolsFromSlice(ksyms_bytes, bump_alloc_iface.?);
-
     const pml4_paddr = PAddr.fromInt(paging.read_cr3().addr & ~@as(u64, 0xfff));
     const pml4_vaddr = VAddr.fromPAddr(pml4_paddr, .identity);
 
@@ -109,23 +111,31 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         bump_alloc_iface.?,
     );
 
+    const bump_alloc_start_virt = VAddr.fromPAddr(bump_alloc_start_phys, .physmap);
+    const bump_alloc_free_virt = VAddr.fromPAddr(PAddr.fromInt(bump_allocator.free_addr), .physmap);
+    const bump_alloc_end_virt = VAddr.fromPAddr(bump_alloc_end_phys, .physmap);
+    bump_allocator.start_addr = bump_alloc_start_virt.addr;
+    bump_allocator.free_addr = bump_alloc_free_virt.addr;
+    bump_allocator.end_addr = bump_alloc_end_virt.addr;
+
+    const ksyms_bytes: []const u8 = boot_info.ksyms.ptr[0..boot_info.ksyms.len];
+    try zag.panic.initSymbolsFromSlice(ksyms_bytes, bump_alloc_iface.?);
+
     const buddy_alloc_required_bytes = BuddyAllocator.requiredMemory(
         bump_allocator.free_addr,
         bump_allocator.end_addr,
     );
-    const buddy_alloc_start_phys = PAddr.fromInt(std.mem.alignForward(
+    const buddy_alloc_start_virt = VAddr.fromInt(std.mem.alignForward(
         u64,
         bump_allocator.free_addr + buddy_alloc_required_bytes,
         PAGE4K,
     ));
-    const buddy_alloc_end_phys = PAddr.fromInt(std.mem.alignBackward(
+    const buddy_alloc_end_virt = VAddr.fromInt(std.mem.alignBackward(
         u64,
         bump_allocator.end_addr,
         PAGE4K,
     ));
-    std.debug.assert(buddy_alloc_start_phys.addr < buddy_alloc_end_phys.addr);
-    const buddy_alloc_start_virt = VAddr.fromPAddr(buddy_alloc_start_phys, .physmap);
-    const buddy_alloc_end_virt = VAddr.fromPAddr(buddy_alloc_end_phys, .physmap);
+    std.debug.assert(buddy_alloc_start_virt.addr < buddy_alloc_end_virt.addr);
 
     var buddy_allocator: BuddyAllocator = try BuddyAllocator.init(
         buddy_alloc_start_virt.addr,
@@ -168,9 +178,9 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     const heap_allocator_iface = heap_allocator.allocator();
 
     const slice = heap_allocator_iface.alloc(u8, 10) catch unreachable;
-    serial.print("Slice addr {X}", .{@intFromPtr(slice.ptr)});
+    serial.print("Slice addr {X}\n", .{@intFromPtr(slice.ptr)});
 
-    cpu.halt();
+    @panic("ruh roh");
+
+    //cpu.halt();
 }
-
-fn initPmm() void {}
