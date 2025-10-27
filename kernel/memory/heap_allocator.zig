@@ -29,12 +29,12 @@
 //! - Tree nodes are supplied by a slab-backed `TreeAllocator`.
 
 const builtin = @import("builtin");
-const Containers = @import("containers");
 const intrusive_freelist = @import("intrusive_freelist.zig");
 const slab_alloc = @import("slab_allocator.zig");
 const std = @import("std");
+const zag = @import("zag");
 
-const rbt = Containers.RedBlackTree;
+const rbt = zag.containers.RedBlackTree;
 
 /// Footer stored at the end of every block.
 ///

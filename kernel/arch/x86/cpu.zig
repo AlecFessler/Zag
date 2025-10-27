@@ -39,6 +39,26 @@ pub fn halt() noreturn {
     }
 }
 
+pub fn inb(port: u16) u8 {
+    return asm volatile (
+        \\inb %[port], %[ret]
+        : [ret] "={al}" (-> u8),
+        : [port] "{dx}" (port),
+    );
+}
+
+pub fn outb(
+    value: u8,
+    port: u16,
+) void {
+    asm volatile (
+        \\outb %[value], %[port]
+        :
+        : [value] "{al}" (value),
+          [port] "{dx}" (port),
+    );
+}
+
 /// Invalidates the TLB entry for `vaddr`.
 ///
 /// Arguments:
@@ -47,9 +67,8 @@ pub fn invlpg(vaddr: VAddr) void {
     asm volatile (
         \\invlpg (%[a])
         :
-        : [a] "r" (vaddr.addr)
-        : .{ .memory = true }
-    );
+        : [a] "r" (vaddr.addr),
+        : .{ .memory = true });
 }
 
 /// Reads `cr2` and returns the last page-fault linear address.
@@ -80,8 +99,22 @@ pub fn reloadSegments() void {
         \\mov %%ax, %%ds
         \\mov %%ax, %%es
         \\mov %%ax, %%ss
-        :
-        :
-        : .{ .memory = true }
+        ::: .{ .memory = true });
+}
+
+pub fn setWriteProtect(enable: bool) void {
+    var cr0: u64 = 0;
+    asm volatile ("mov %%cr0, %[out]"
+        : [out] "=r" (cr0),
     );
+    const wp_bit: u64 = 1 << 16;
+    if (enable) {
+        cr0 |= wp_bit;
+    } else {
+        cr0 &= ~wp_bit;
+    }
+    asm volatile ("mov %[in], %%cr0"
+        :
+        : [in] "r" (cr0),
+        : .{ .memory = true });
 }

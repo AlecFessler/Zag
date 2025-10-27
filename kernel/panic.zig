@@ -1,14 +1,16 @@
 //! Symbol map and kernel panic utilities.
 //!
 //! Provides a compact symbol table for address-to-name lookups during panics
-//! and a minimal panic routine that prints a backtrace via VGA.
+//! and a minimal panic routine that prints a backtrace via serial.
 
 const std = @import("std");
-const x86 = @import("x86");
+const zag = @import("zag.zig");
 
 const builtin = std.builtin;
-const cpu = x86.Cpu;
-const vga = x86.Vga;
+const cpu = zag.x86.Cpu;
+const serial = zag.x86.Serial;
+
+const VAddr = zag.x86.Paging.VAddr;
 
 /// Errors emitted by the symbol utilities.
 pub const PanicError = error{
@@ -207,56 +209,41 @@ pub fn initSymbolsFromSlice(
     g_symmap = sm;
 }
 
-/// Prints a kernel panic message and a best-effort backtrace, then halts.
-///
-/// Arguments:
-/// - `msg`: description of the failure.
-/// - `trace`: optional Zig stack trace (unused in this variant).
-/// - `ret_addr`: optional return address to highlight in the log.
-///
-/// Returns:
-/// - Never returns (`noreturn`).
-pub fn panic(
-    msg: []const u8,
-    trace: ?*builtin.StackTrace,
-    ret_addr: ?u64,
-) noreturn {
+pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
     @branchHint(.cold);
     _ = trace;
-    vga.setColor(.White, .Blue);
 
     if (ret_addr) |ra| {
-        vga.print("KERNEL PANIC: {s} (ret_addr {X})\n", .{ msg, ra });
+        serial.print("KERNEL PANIC: {s} (ret_addr {X})\n", .{ msg, ra });
         logAddr(ra);
     } else {
-        vga.print("KERNEL PANIC: {s}\n", .{msg});
+        serial.print("KERNEL PANIC: {s}\n", .{msg});
     }
 
     const first = @returnAddress();
-    var last: u64 = 0;
     var it = std.debug.StackIterator.init(first, null);
-    while (it.next()) |pc| {
-        if (pc == 0 or pc == last) continue;
+    var last_pc: u64 = 0;
+    var frames: usize = 0;
+
+    while (frames < 64) : (frames += 1) {
+        const pc = it.next() orelse break;
+        if (pc == 0) break;
         logAddr(pc);
-        last = pc;
+        last_pc = pc;
     }
 
-    cpu.halt();
+    zag.x86.Cpu.halt();
 }
 
-/// Logs `pc` with symbol+offset if available; otherwise prints a placeholder.
-///
-/// Arguments:
-/// - `pc`: program counter to resolve and print.
 fn logAddr(pc: u64) void {
-    if (g_symmap) |sm| {
+    if (zag.panic.g_symmap) |sm| {
         if (sm.find(pc)) |hit| {
             const off = pc - hit.base;
-            vga.print("{X}: {s}+0x{X}\n", .{ pc, hit.name, off });
+            serial.print("{X}: {s}+0x{X}\n", .{ pc, hit.name, off });
             return;
         }
-        vga.print("{X}: ?????\n", .{pc});
+        serial.print("{X}: ?????\n", .{pc});
         return;
     }
-    vga.print("{X}: (no symbols)\n", .{pc});
+    serial.print("{X}: (no symbols)\n", .{pc});
 }
