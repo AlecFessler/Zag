@@ -171,7 +171,7 @@ pub fn IntrusiveFreeList(
         /// Arguments:
         /// - `item`: byte pointer to the start of the element payload.
         fn zeroItem(item: [*]u8) void {
-            const len = @sizeOf(ValType);
+            const len = @sizeOf(FreeNode);
             @memset(item[0..len], 0);
         }
     };
