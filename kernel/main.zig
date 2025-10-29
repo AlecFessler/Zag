@@ -10,6 +10,7 @@ const serial = zag.x86.Serial;
 const paging = zag.x86.Paging;
 const pmm_mod = zag.memory.PhysicalMemoryManager;
 const vmm_mod = zag.memory.VirtualMemoryManager;
+const range = zag.math.range;
 
 const BuddyAllocator = zag.memory.BuddyAllocator.BuddyAllocator;
 const BumpAllocator = zag.memory.BumpAllocator.BumpAllocator;
@@ -19,6 +20,7 @@ const PAddr = paging.PAddr;
 const VAddr = paging.VAddr;
 const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
 const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
+const Range = range.Range;
 
 const PAGE4K = @intFromEnum(paging.PageSize.Page4K);
 const PAGE1G = @intFromEnum(paging.PageSize.Page1G);
@@ -64,18 +66,33 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         &mmap_entries_array,
     );
 
+    var smallest_addr_region = boot_defs.MMapEntry{
+        .start_paddr = std.math.maxInt(u64),
+        .num_pages = 0,
+        .type = .free,
+    };
+    var largest_addr_free_region = boot_defs.MMapEntry{
+        .start_paddr = 0,
+        .num_pages = 0,
+        .type = .free,
+    };
     var largest_free_region = boot_defs.MMapEntry{
         .start_paddr = 0,
         .num_pages = 0,
         .type = .free,
     };
     for (mmap) |entry| {
+        if (entry.start_paddr < smallest_addr_region.start_paddr) {
+            smallest_addr_region = entry;
+        }
+        if (entry.type == .free and entry.start_paddr > largest_addr_free_region.start_paddr) {
+            largest_addr_free_region = entry;
+        }
         if (entry.type == .free and entry.num_pages > largest_free_region.num_pages) {
             largest_free_region = entry;
         }
     }
 
-    // early boot identity mapped bump allocator
     const bump_alloc_start_phys = PAddr.fromInt(largest_free_region.start_paddr);
     const bump_alloc_end_phys = PAddr.fromInt(largest_free_region.start_paddr + largest_free_region.num_pages * PAGE4K);
     var bump_allocator = BumpAllocator.init(
@@ -87,7 +104,6 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     const pml4_paddr = PAddr.fromInt(paging.read_cr3().addr & ~@as(u64, 0xfff));
     const pml4_vaddr = VAddr.fromPAddr(pml4_paddr, .identity);
 
-    // pml4 page will need to be physmapped (higher half direect mapping) for page fault handler
     paging.mapPage(
         @ptrFromInt(pml4_vaddr.addr),
         pml4_paddr,
@@ -100,12 +116,19 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         bump_alloc_iface.?,
     );
 
-    paging.physMapRegion(
-        pml4_vaddr,
-        bump_alloc_start_phys,
-        bump_alloc_end_phys,
-        bump_alloc_iface.?,
-    );
+    for (mmap) |entry| {
+        if (entry.type != .free) continue;
+        const entry_range: Range = .{
+            .start = entry.start_paddr,
+            .end = entry.start_paddr + entry.num_pages * PAGE4K,
+        };
+        paging.physMapRegion(
+            pml4_vaddr,
+            PAddr.fromInt(entry_range.start),
+            PAddr.fromInt(entry_range.end),
+            bump_alloc_iface.?,
+        );
+    }
 
     const bump_alloc_start_virt = VAddr.fromPAddr(bump_alloc_start_phys, .physmap);
     const bump_alloc_free_virt = VAddr.fromPAddr(PAddr.fromInt(bump_allocator.free_addr), .physmap);
@@ -119,31 +142,78 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
 
     paging.dropIdentityMap();
 
-    const buddy_alloc_required_bytes = BuddyAllocator.requiredMemory(
-        bump_allocator.free_addr,
-        bump_allocator.end_addr,
+    const buddy_alloc_start_virt = VAddr.fromPAddr(
+        PAddr.fromInt(std.mem.alignForward(
+            u64,
+            smallest_addr_region.start_paddr,
+            PAGE4K,
+        )),
+        .physmap,
     );
-    const buddy_alloc_start_virt = VAddr.fromInt(std.mem.alignForward(
-        u64,
-        bump_allocator.free_addr + buddy_alloc_required_bytes,
-        PAGE4K,
-    ));
-    const buddy_alloc_end_virt = VAddr.fromInt(std.mem.alignBackward(
-        u64,
-        bump_allocator.end_addr,
-        PAGE4K,
-    ));
-    if (buddy_alloc_start_virt.addr >= buddy_alloc_end_virt.addr) {
-        @panic("Invalid start and end addresses for pmm's buddy allocator!");
-    }
-
-    var buddy_allocator: BuddyAllocator = try BuddyAllocator.init(
+    const buddy_alloc_end_virt = VAddr.fromPAddr(
+        PAddr.fromInt(std.mem.alignBackward(
+            u64,
+            largest_addr_free_region.start_paddr + largest_addr_free_region.num_pages * PAGE4K,
+            PAGE4K,
+        )),
+        .physmap,
+    );
+    var buddy_allocator = try BuddyAllocator.init(
         buddy_alloc_start_virt.addr,
         buddy_alloc_end_virt.addr,
         bump_alloc_iface.?,
     );
     const buddy_alloc_iface = buddy_allocator.allocator();
     bump_alloc_iface = null;
+
+    for (mmap) |entry| {
+        if (entry.type != .free) continue;
+
+        const entry_start_virt = VAddr.fromPAddr(
+            PAddr.fromInt(entry.start_paddr),
+            .physmap,
+        );
+        const entry_end_virt = VAddr.fromPAddr(
+            PAddr.fromInt(entry.start_paddr + entry.num_pages * PAGE4K),
+            .physmap,
+        );
+        const entry_range: Range = .{
+            .start = entry_start_virt.addr,
+            .end = entry_end_virt.addr,
+        };
+
+        const bump_alloc_range: Range = .{
+            .start = bump_allocator.start_addr,
+            .end = bump_allocator.free_addr,
+        };
+
+        const null_page_start_virt = VAddr.fromPAddr(
+            PAddr.fromInt(0),
+            .physmap,
+        );
+        const null_page_end_virt = VAddr.fromPAddr(
+            PAddr.fromInt(PAGE4K),
+            .physmap,
+        );
+        const null_page_range: Range = .{
+            .start = null_page_start_virt.addr,
+            .end = null_page_end_virt.addr,
+        };
+
+        var useable_range: Range = undefined;
+        if (entry_range.overlapsWith(bump_alloc_range)) {
+            useable_range = entry_range.removeOverlap(bump_alloc_range);
+        } else if (entry_range.overlapsWith(null_page_range)) {
+            useable_range = entry_range.removeOverlap(null_page_range);
+        } else {
+            useable_range = entry_range;
+        }
+
+        buddy_allocator.addRegion(
+            useable_range.start,
+            useable_range.end,
+        );
+    }
 
     pmm_mod.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
 
