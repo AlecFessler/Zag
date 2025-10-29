@@ -87,6 +87,9 @@ const AllocHandle = struct {
 const Action = enum { alloc, free };
 
 pub fn main() !void {
+    var prng = std.Random.DefaultPrng.init(SEED);
+    var rand = prng.random();
+
     var dbg_allocator = std.heap.DebugAllocator(.{}){};
     const backing_allocator = dbg_allocator.allocator();
 
@@ -104,14 +107,51 @@ pub fn main() !void {
     defer buddy.deinit();
     const buddy_iface = buddy.allocator();
 
+    var current_addr = start_addr;
+    var remaining_size = end_addr - start_addr;
+    var last_was_reserved = false;
+
+    while (remaining_size >= ORDERS[10]) {
+        const block_order = rand.intRangeAtMost(u4, 0, NUM_ORDERS - 1);
+        const block_size = ORDERS[block_order];
+        const num_blocks = rand.intRangeAtMost(u8, 1, 5);
+
+        if (block_size * num_blocks > remaining_size) {
+            continue;
+        }
+
+        const region_end = current_addr + (block_size * num_blocks);
+
+        if (!last_was_reserved) {
+            std.debug.print("Creating block: order {}, size {}, num_blocks {}, from {x} to {x} available\n", .{
+                block_order,
+                block_size,
+                num_blocks,
+                current_addr,
+                region_end,
+            });
+            buddy.addRegion(current_addr, region_end);
+        } else {
+            std.debug.print("Creating block: order {}, size {}, num_blocks {}, from {x} to {x} reserved\n", .{
+                block_order,
+                block_size,
+                num_blocks,
+                current_addr,
+                region_end,
+            });
+        }
+
+        last_was_reserved = !last_was_reserved;
+
+        current_addr = region_end;
+        remaining_size -= (block_size * num_blocks);
+    }
+
     var handles = std.ArrayListUnmanaged(AllocHandle){};
     defer handles.deinit(backing_allocator);
 
     var alloc_map = buddy_alloc.BuddyAllocator.AllocationMap.init(backing_allocator);
     defer alloc_map.deinit();
-
-    var prng = std.Random.DefaultPrng.init(SEED);
-    var rand = prng.random();
 
     for (0..1_000_000) |i| {
         const action: Action = blk: {
