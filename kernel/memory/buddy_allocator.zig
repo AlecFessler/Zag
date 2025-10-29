@@ -87,42 +87,6 @@ pub const BuddyAllocator = struct {
     /// Per-order intrusive free lists for block bases.
     freelists: [NUM_ORDERS]IntrusiveFreeList = [_]IntrusiveFreeList{IntrusiveFreeList{}} ** NUM_ORDERS,
 
-    /// Computes the metadata footprint (bytes) needed to manage `[start_addr, end_addr)`,
-    /// accounting for the fact that metadata itself consumes pages.
-    ///
-    /// Arguments:
-    /// - `start_addr`: start of candidate region (may be unaligned).
-    /// - `end_addr`: end of candidate region (may be unaligned).
-    ///
-    /// Returns:
-    /// - Number of bytes to reserve for metadata so the remaining data region is stable.
-    pub fn requiredMemory(
-        start_addr: u64,
-        end_addr: u64,
-    ) u64 {
-        const aligned_start = std.mem.alignForward(u64, start_addr, PAGE_SIZE);
-        const aligned_end = std.mem.alignBackward(u64, end_addr, PAGE_SIZE);
-        std.debug.assert(aligned_end > aligned_start);
-
-        var n_pages = (aligned_end - aligned_start) / PAGE_SIZE;
-        var i: u32 = 0;
-        const loop_upper_bound = 3;
-        while (true) : (i += 1) {
-            if (i >= loop_upper_bound) {
-                @panic("Non exitting loop!");
-            }
-
-            const bitmap_words = (n_pages + bitmap_freelist.WORD_BIT_SIZE - 1) / bitmap_freelist.WORD_BIT_SIZE;
-            const bitmap_bytes = bitmap_words * @sizeOf(bitmap_freelist.Word);
-            const orders_bytes = (n_pages + 1) / 2;
-            const metadata_bytes = std.mem.alignForward(u64, bitmap_bytes + orders_bytes, PAGE_SIZE);
-
-            const n2_pages = (aligned_end - (aligned_start + metadata_bytes)) / PAGE_SIZE;
-            if (n_pages == n2_pages) return metadata_bytes;
-            n_pages = n2_pages;
-        }
-    }
-
     /// Initializes a buddy allocator managing `[start_addr, end_addr)`.
     ///
     /// Arguments:
