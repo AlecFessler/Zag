@@ -27,17 +27,7 @@ pub fn getMmap(
         &descriptor_size,
         &descriptor_version,
     );
-    switch (status) {
-        .buffer_too_small => log.debug("Need {d} bytes for mmap", .{
-            mmap_size,
-        }),
-        else => {
-            log.err("Expected buffer_too_small but got {s}", .{
-                @tagName(status),
-            });
-            return null;
-        },
-    }
+    if (status != .buffer_too_small) return null;
 
     // account for the buffer allocation changing the map
     mmap_size += 2 * descriptor_size;
@@ -47,18 +37,7 @@ pub fn getMmap(
         mmap_size,
         @ptrCast(&mmap),
     );
-    switch (status) {
-        .success => log.debug("Allocated {d} bytes for memory map at 0x{X}", .{
-            mmap_size,
-            @intFromPtr(mmap.?),
-        }),
-        else => {
-            log.err("Expected success from allocatePool but got {s}", .{
-                @tagName(status),
-            });
-            return null;
-        },
-    }
+    if (status != .success) return null;
 
     status = boot_services._getMemoryMap(
         &mmap_size,

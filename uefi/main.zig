@@ -91,6 +91,8 @@ pub fn main() uefi.Status {
         return .aborted;
     };
 
+    const xsdp_paddr = defs_mod.findXSDP() catch return .aborted;
+
     var mmap = mmap_mod.getMmap(boot_services) orelse return .aborted;
     boot_services.exitBootServices(
         uefi.handle,
@@ -107,6 +109,7 @@ pub fn main() uefi.Status {
     };
 
     const boot_info = defs_mod.BootInfo{
+        .xsdp_paddr = xsdp_paddr,
         .mmap = mmap,
         .ksyms = .{
             .ptr = ksyms_bytes.ptr,

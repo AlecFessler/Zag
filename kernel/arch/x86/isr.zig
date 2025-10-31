@@ -327,9 +327,6 @@ fn divByZeroHandler(ctx: *interrupts.InterruptContext) void {
 /// Arguments:
 /// - `ctx`: interrupt context from the common stub
 fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
-    if (pmm_mod.global_pmm == null) {
-        @panic("Page fault prior to pmm initialization!");
-    }
     const pf_err = PFErrCode.from(ctx.err_code);
 
     if (pf_err.rsvd_violation) @panic("Page tables have reserved bits set (RSVD).");
@@ -343,6 +340,9 @@ fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
         @intFromEnum(paging.PageSize.Page4K),
     ));
 
+    if (pmm_mod.global_pmm == null) {
+        @panic("Page fault prior to pmm initialization!");
+    }
     if (code_privilege_level == 0) {
         if (pf_err.present) {
             @panic("Invalid memory access in kernelspace!");

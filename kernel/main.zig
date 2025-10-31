@@ -2,6 +2,7 @@ const std = @import("std");
 const zag = @import("zag");
 const boot_defs = @import("boot_defs");
 
+const acpi = zag.x86.Acpi;
 const cpu = zag.x86.Cpu;
 const gdt = zag.x86.Gdt;
 const idt = zag.x86.Idt;
@@ -117,7 +118,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     );
 
     for (mmap) |entry| {
-        if (entry.type != .free) continue;
+        if (entry.type != .free and entry.type != .acpi) continue;
         const entry_range: Range = .{
             .start = entry.start_paddr,
             .end = entry.start_paddr + entry.num_pages * PAGE4K,
@@ -140,6 +141,9 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     const ksyms_bytes: []const u8 = boot_info.ksyms.ptr[0..boot_info.ksyms.len];
     try zag.panic.initSymbolsFromSlice(ksyms_bytes, bump_alloc_iface.?);
 
+    const xsdp_phys = PAddr.fromInt(boot_info.xsdp_paddr);
+
+    // boot_info is identity mapped, so none of its fields can be accessed after this point
     paging.dropIdentityMap();
 
     const buddy_alloc_start_virt = VAddr.fromPAddr(
@@ -245,6 +249,9 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     );
     const heap_allocator_iface = heap_allocator.allocator();
     _ = heap_allocator_iface;
+
+    const xsdp_virt = VAddr.fromPAddr(xsdp_phys, .physmap);
+    acpi.validateXSDP(xsdp_virt) catch @panic("Invalid xsdp");
 
     cpu.halt();
 }

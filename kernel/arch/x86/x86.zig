@@ -6,6 +6,7 @@
 //! This module exists to simplify higher-level imports such as `@import("x86")`,
 //! exposing all key components under one unified namespace for clarity and consistency.
 
+pub const Acpi = @import("acpi.zig");
 pub const Cpu = @import("cpu.zig");
 pub const Gdt = @import("gdt.zig");
 pub const Idt = @import("idt.zig");

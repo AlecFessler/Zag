@@ -2,8 +2,12 @@ const std = @import("std");
 const mmap = @import("mmap.zig");
 
 const uefi = std.os.uefi;
+const Guid = uefi.Guid;
+const SystemTable = uefi.tables.SystemTable;
+const ConfigurationTable = uefi.tables.ConfigurationTable;
 
 pub const BootInfo = extern struct {
+    xsdp_paddr: u64,
     mmap: mmap.MMap,
     ksyms: extern struct {
         ptr: [*]const u8,
@@ -18,6 +22,7 @@ pub const MMapEntry = struct {
 };
 
 pub const MMapEntryType = enum {
+    acpi,
     free,
     reserved,
 };
@@ -40,6 +45,7 @@ pub fn collapseMmap(
         .boot_services_code,
         .boot_services_data,
         => .free,
+        .acpi_reclaim_memory => .acpi,
         else => .reserved,
     };
 
@@ -52,6 +58,7 @@ pub fn collapseMmap(
             .boot_services_code,
             .boot_services_data,
             => .free,
+            .acpi_reclaim_memory => .acpi,
             else => .reserved,
         };
 
@@ -76,4 +83,25 @@ pub fn collapseMmap(
     std.debug.assert(idx < 256);
 
     return mmap_entries[0..idx];
+}
+
+fn guidEq(a: Guid, b: Guid) bool {
+    return a.time_low == b.time_low and a.time_mid == b.time_mid and a.time_high_and_version == b.time_high_and_version and a.clock_seq_high_and_reserved == b.clock_seq_high_and_reserved and a.clock_seq_low == b.clock_seq_low and std.mem.eql(
+        u8,
+        &a.node,
+        &b.node,
+    );
+}
+
+pub fn findXSDP() !u64 {
+    for (0..uefi.system_table.number_of_table_entries) |i| {
+        const ct = uefi.system_table.configuration_table[i];
+        if (guidEq(
+            ct.vendor_guid,
+            ConfigurationTable.acpi_20_table_guid,
+        )) {
+            return @intFromPtr(ct.vendor_table);
+        }
+    }
+    return uefi.Error.Aborted;
 }
