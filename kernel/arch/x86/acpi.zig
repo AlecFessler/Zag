@@ -285,3 +285,151 @@ pub const Madt = extern struct {
         return base[0..n];
     }
 };
+
+pub const SratType = enum(u8) {
+    proc_apic_affinity = 0,
+    mem_affinity = 1,
+    proc_x2apic_affinity = 2,
+};
+
+pub const ProcApicAffinity = extern struct {
+    proximity_domain_lo: u8,
+    apic_id: u8,
+    flags: u32,
+    local_sapic_eid: u8,
+    proximity_domain_hi: [3]u8,
+    clock_domain: u32,
+};
+
+pub const MemAffinity = extern struct {
+    proximity_domain: u32,
+    _rsvd0: u16 = 0,
+    base_addr: u64,
+    length: u64,
+    _rsvd1: u32 = 0,
+    flags: u32,
+    _rsvd2: u64 = 0,
+};
+
+pub const ProcX2ApicAffinity = extern struct {
+    _rsvd0: u16 = 0,
+    proximity_domain: u32,
+    x2apic_id: u32,
+    flags: u32,
+    clock_domain: u32,
+};
+
+pub const AnySrat = union(SratType) {
+    proc_apic_affinity: ProcApicAffinity,
+    mem_affinity: MemAffinity,
+    proc_x2apic_affinity: ProcX2ApicAffinity,
+};
+
+pub fn decodeSrat(e: Srat.Entry) AnySrat {
+    const p = e.bytes[2..];
+    return switch (@as(SratType, @enumFromInt(e.header.kind))) {
+        .proc_apic_affinity => .{
+            .proc_apic_affinity = .{
+                .proximity_domain_lo = p[0],
+                .apic_id = p[1],
+                .flags = std.mem.readInt(u32, @ptrCast(p.ptr + 2), .little),
+                .local_sapic_eid = p[6],
+                .proximity_domain_hi = .{ p[7], p[8], p[9] },
+                .clock_domain = std.mem.readInt(u32, @ptrCast(p.ptr + 10), .little),
+            },
+        },
+        .mem_affinity => .{
+            .mem_affinity = .{
+                .proximity_domain = std.mem.readInt(u32, @ptrCast(p.ptr + 0), .little),
+                .base_addr = std.mem.readInt(u64, @ptrCast(p.ptr + 6), .little),
+                .length = std.mem.readInt(u64, @ptrCast(p.ptr + 14), .little),
+                .flags = std.mem.readInt(u32, @ptrCast(p.ptr + 30), .little),
+            },
+        },
+        .proc_x2apic_affinity => .{
+            .proc_x2apic_affinity = .{
+                .proximity_domain = std.mem.readInt(u32, @ptrCast(p.ptr + 2), .little),
+                .x2apic_id = std.mem.readInt(u32, @ptrCast(p.ptr + 6), .little),
+                .flags = std.mem.readInt(u32, @ptrCast(p.ptr + 10), .little),
+                .clock_domain = std.mem.readInt(u32, @ptrCast(p.ptr + 14), .little),
+            },
+        },
+    };
+}
+
+pub const Srat = extern struct {
+    signature: [4]u8,
+    length: u32,
+    revision: u8,
+    checksum: u8,
+    oem_id: [6]u8,
+    oem_table_id: [8]u8,
+    oem_revision: u32,
+    creator_id: u32,
+    creator_revision: u32,
+    reserved: u32,
+
+    pub fn fromVAddr(srat_virt: VAddr) *Srat {
+        @setRuntimeSafety(false);
+        return @ptrFromInt(srat_virt.addr);
+    }
+
+    pub fn validate(self: *const Srat) !void {
+        if (!std.mem.eql(u8, &self.signature, "SRAT")) {
+            return validationError.InvalidSignature;
+        }
+
+        var sum: u8 = 0;
+        for (self.asBytes(self.length)) |b| {
+            sum +%= b;
+        }
+        if (sum != 0) {
+            return validationError.InvalidChecksum;
+        }
+    }
+
+    pub const EntryHeader = extern struct {
+        kind: u8,
+        length: u8,
+    };
+
+    pub const Entry = struct {
+        header: EntryHeader,
+        bytes: []const u8,
+    };
+
+    pub const Iterator = struct {
+        srat: *const Srat,
+        off: u64,
+
+        pub fn init(s: *const Srat) Iterator {
+            return .{
+                .srat = s,
+                .off = 36 + 4,
+            };
+        }
+
+        pub fn next(self: *Iterator) ?Entry {
+            if (self.off >= self.srat.length) return null;
+            const bytes = self.srat.asBytes(self.srat.length);
+            const hdr: *align(1) const EntryHeader = @ptrCast(bytes.ptr + self.off);
+            const start = self.off;
+            const len = hdr.length;
+            if (len < 2 or start + len > self.srat.length) return null;
+            self.off += len;
+            return .{
+                .header = hdr.*,
+                .bytes = bytes[start .. start + len],
+            };
+        }
+    };
+
+    pub fn iter(self: *const Srat) Iterator {
+        return Iterator.init(self);
+    }
+
+    fn asBytes(self: *const Srat, n: u64) []const u8 {
+        const base: [*]const u8 = @ptrCast(self);
+        return base[0..n];
+    }
+};

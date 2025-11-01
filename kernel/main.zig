@@ -318,37 +318,32 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         const sdt_phys = PAddr.fromInt(sdt_paddr);
         const sdt_virt = VAddr.fromPAddr(sdt_phys, .physmap);
         const sdt = acpi.Sdt.fromVAddr(sdt_virt);
-        if (!std.mem.eql(
-            u8,
-            &sdt.signature,
-            "APIC",
-        )) continue;
 
-        const madt = acpi.Madt.fromVAddr(sdt_virt);
-        try madt.validate();
-        var madt_iter = madt.iter();
-        while (madt_iter.next()) |e| {
-            const entry = acpi.decodeMadt(e);
-            switch (entry) {
-                .local_apic => |x| serial.print("cpu {d} apic_id {d} flags {x}\n", .{
-                    x.processor_uid,
-                    x.apic_id,
-                    x.flags,
-                }),
-                .ioapic => |x| serial.print("ioapic id {d} addr {x} gsi_base {d}\n", .{
-                    x.ioapic_id,
-                    x.ioapic_addr,
-                    x.gsi_base,
-                }),
-                .iso => |x| serial.print("iso bus {d} src {d} -> gsi {d}\n", .{
-                    x.bus,
-                    x.src,
-                    x.gsi,
-                }),
-                .lapic_nmi => |_| {},
-                .lapic_addr_override => |x| serial.print("lapic override {x}\n", .{
-                    x.addr,
-                }),
+        if (std.mem.eql(u8, &sdt.signature, "APIC")) {
+            const madt = acpi.Madt.fromVAddr(sdt_virt);
+            try madt.validate();
+            var madt_iter = madt.iter();
+            while (madt_iter.next()) |e| {
+                const entry = acpi.decodeMadt(e);
+                switch (entry) {
+                    .local_apic => |x| serial.print("cpu {d} apic_id {d} flags {x}\n", .{
+                        x.processor_uid,
+                        x.apic_id,
+                        x.flags,
+                    }),
+                    .ioapic => |x| serial.print("ioapic id {d} addr {x} gsi_base {d}\n", .{
+                        x.ioapic_id,
+                        x.ioapic_addr,
+                        x.gsi_base,
+                    }),
+                    .iso => |x| serial.print("iso bus {d} src {d} -> gsi {d}\n", .{
+                        x.bus,
+                        x.src,
+                        x.gsi,
+                    }),
+                    .lapic_nmi => |_| {},
+                    .lapic_addr_override => |x| serial.print("lapic override {x}\n", .{x.addr}),
+                }
             }
         }
     }
