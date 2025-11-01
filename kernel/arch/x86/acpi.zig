@@ -1,6 +1,6 @@
-const std = @import("std");
 const paging = @import("paging.zig");
 const serial = @import("serial.zig");
+const std = @import("std");
 
 const VAddr = paging.VAddr;
 

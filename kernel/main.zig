@@ -1,30 +1,30 @@
+const boot_defs = @import("boot_defs");
 const std = @import("std");
 const zag = @import("zag");
-const boot_defs = @import("boot_defs");
 
 const acpi = zag.x86.Acpi;
 const cpu = zag.x86.Cpu;
 const gdt = zag.x86.Gdt;
 const idt = zag.x86.Idt;
 const isr = zag.x86.Isr;
-const serial = zag.x86.Serial;
 const paging = zag.x86.Paging;
 const pmm_mod = zag.memory.PhysicalMemoryManager;
-const vmm_mod = zag.memory.VirtualMemoryManager;
 const range = zag.math.range;
+const serial = zag.x86.Serial;
+const vmm_mod = zag.memory.VirtualMemoryManager;
 
 const BuddyAllocator = zag.memory.BuddyAllocator.BuddyAllocator;
 const BumpAllocator = zag.memory.BumpAllocator.BumpAllocator;
 const HeapAllocator = zag.memory.HeapAllocator.HeapAllocator;
 const HeapTreeAllocator = zag.memory.HeapAllocator.TreeAllocator;
 const PAddr = paging.PAddr;
-const VAddr = paging.VAddr;
 const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
-const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
 const Range = range.Range;
+const VAddr = paging.VAddr;
+const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
 
-const PAGE4K = @intFromEnum(paging.PageSize.Page4K);
 const PAGE1G = @intFromEnum(paging.PageSize.Page1G);
+const PAGE4K = @intFromEnum(paging.PageSize.Page4K);
 
 extern const __stackguard_lower: [*]const u8;
 

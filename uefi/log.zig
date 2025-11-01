@@ -1,5 +1,6 @@
-const std = @import("std");
 const option = @import("option");
+const std = @import("std");
+
 const uefi = std.os.uefi;
 
 pub const default_log_options = std.Options{

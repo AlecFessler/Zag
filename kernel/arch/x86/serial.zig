@@ -1,5 +1,5 @@
-const std = @import("std");
 const cpu = @import("cpu.zig");
+const std = @import("std");
 
 pub const Ports = enum(u16) {
     com1 = 0x3F8,

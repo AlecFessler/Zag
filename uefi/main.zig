@@ -1,19 +1,19 @@
-const std = @import("std");
+const alloc_mod = @import("boot_allocator.zig");
 const defs_mod = @import("defs.zig");
-const mmap_mod = @import("mmap.zig");
 const file_mod = @import("file.zig");
 const log_mod = @import("log.zig");
-const alloc_mod = @import("boot_allocator.zig");
+const mmap_mod = @import("mmap.zig");
+const std = @import("std");
 const x86 = @import("x86");
 
+const cpu = x86.Cpu;
 const elf = std.elf;
 const paging = x86.Paging;
-const cpu = x86.Cpu;
 const uefi = std.os.uefi;
 
-pub const std_options = log_mod.default_log_options;
-
 const KEntryType = fn (defs_mod.BootInfo) callconv(.{ .x86_64_sysv = .{} }) noreturn;
+
+pub const std_options = log_mod.default_log_options;
 
 pub fn main() uefi.Status {
     log_mod.init(uefi.system_table.con_out.?) catch return .aborted;
@@ -123,14 +123,7 @@ pub fn main() uefi.Status {
     unreachable;
 }
 
-// Load kernel.elf, map all PT_LOAD segments, and return the ELF entry address.
-// On error, logs and returns null.
-//
-// Assumes:
-// - `new_pml4_paddr` is the active PML4 you want to map into (already written to CR3).
-// - We’re running under UEFI boot services and can allocate pages/pools.
-// - We can open files via `file_mod` and `root_dir` points to the volume root.
-pub fn loadKernel(
+fn loadKernel(
     boot_services: *uefi.tables.BootServices,
     root_dir: *uefi.protocol.File,
     new_pml4_paddr: paging.PAddr,
@@ -141,8 +134,8 @@ pub fn loadKernel(
         return null;
     };
     defer {
-        kernel_file.close() catch |cerr| {
-            log.err("Failed to close kernel ELF file: {}", .{cerr});
+        kernel_file.close() catch |err| {
+            log.err("Failed to close kernel ELF file: {}", .{err});
         };
     }
 

@@ -49,6 +49,31 @@ const PageLevelShift = enum(u6) {
     PT   = 12,
 };
 
+/// Physical address wrapper (bytes).
+pub const PAddr = struct {
+    addr: u64,
+
+    /// Constructs from a raw integer.
+    pub fn fromInt(addr: u64) PAddr {
+        return .{ .addr = addr };
+    }
+
+    /// Translates a virtual address to physical using an base.
+    pub fn fromVAddr(vaddr: VAddr, type_: MappingType) PAddr {
+        const base_vaddr = switch (type_) {
+            .physmap => pml4SlotBase(@intFromEnum(AddressSpace.physmap)),
+            .identity => VAddr.fromInt(0),
+        };
+        const phys = vaddr.addr - base_vaddr.addr;
+        return .{ .addr = phys };
+    }
+
+    /// Reinterprets the address as a pointer to `type_`.
+    pub fn getPtr(self: *const @This(), comptime type_: anytype) type_ {
+        return @ptrFromInt(self.addr);
+    }
+};
+
 /// Hardware page-table entry (works for all levels).
 pub const PageEntry = packed struct {
     present: bool,
@@ -82,31 +107,6 @@ comptime {
     std.debug.assert(@sizeOf(PageEntry) == 8);
 }
 
-/// Physical address wrapper (bytes).
-pub const PAddr = struct {
-    addr: u64,
-
-    /// Constructs from a raw integer.
-    pub fn fromInt(addr: u64) PAddr {
-        return .{ .addr = addr };
-    }
-
-    /// Translates a virtual address to physical using an base.
-    pub fn fromVAddr(vaddr: VAddr, type_: MappingType) PAddr {
-        const base_vaddr = switch (type_) {
-            .physmap => pml4SlotBase(@intFromEnum(AddressSpace.physmap)),
-            .identity => VAddr.fromInt(0),
-        };
-        const phys = vaddr.addr - base_vaddr.addr;
-        return .{ .addr = phys };
-    }
-
-    /// Reinterprets the address as a pointer to `type_`.
-    pub fn getPtr(self: *const @This(), comptime type_: anytype) type_ {
-        return @ptrFromInt(self.addr);
-    }
-};
-
 /// Virtual address wrapper (bytes).
 pub const VAddr = struct {
     addr: u64,
@@ -130,18 +130,11 @@ pub const VAddr = struct {
     pub fn getPtr(self: *const @This(), comptime type_: anytype) type_ {
         return @ptrFromInt(self.addr);
     }
-
-    /// Converts between identity/physmap bases (via physical).
-    pub fn remapMappingType(self: *const @This(), from: MappingType, to: MappingType) VAddr {
-        std.debug.assert(from != to);
-        const paddr = PAddr.fromVAddr(self.*, from);
-        return VAddr.fromPAddr(paddr, to);
-    }
 };
 
-const PML4Entry  = PageEntry;
 const PDEntry    = PageEntry;
 const PDPTEntry  = PageEntry;
+const PML4Entry  = PageEntry;
 const PTEntry    = PageEntry;
 
 /// Zeroed entry template used for freshly allocated tables.
@@ -303,18 +296,6 @@ pub fn PageMem(comptime page_size: PageSize) type {
     return struct { mem: [size_bytes]u8 align(size_bytes) };
 }
 
-/// Virtual base address for a PML4 slot (sign-extended canonical form).
-pub fn pml4SlotBase(slot: u9) VAddr {
-    const raw: u64 = (@as(u64, slot) << 39);
-    const base = if ((raw & 1 << 47) != 0) (raw | 0xFFFF000000000000) else raw;
-    return VAddr.fromInt(base);
-}
-
-/// PML4 index for `vaddr`.
-pub fn pml4_index(vaddr: VAddr) u9 {
-    return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PML4));
-}
-
 /// Identity-maps a physical range into the physmap with the fewest entries.
 ///
 /// Chooses 1GiB/2MiB/4KiB pages based on alignment/remaining size.
@@ -356,6 +337,18 @@ pub fn physMapRegion(
 
         paddr.addr += chosen_size;
     }
+}
+
+/// PML4 index for `vaddr`.
+pub fn pml4_index(vaddr: VAddr) u9 {
+    return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PML4));
+}
+
+/// Virtual base address for a PML4 slot (sign-extended canonical form).
+pub fn pml4SlotBase(slot: u9) VAddr {
+    const raw: u64 = (@as(u64, slot) << 39);
+    const base = if ((raw & 1 << 47) != 0) (raw | 0xFFFF000000000000) else raw;
+    return VAddr.fromInt(base);
 }
 
 /// Reads CR3 (PML4 physical address plus flags).

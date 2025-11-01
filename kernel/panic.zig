@@ -10,9 +10,6 @@ const builtin = std.builtin;
 const cpu = zag.x86.Cpu;
 const serial = zag.x86.Serial;
 
-const VAddr = zag.x86.Paging.VAddr;
-
-/// Errors emitted by the symbol utilities.
 pub const PanicError = error{
     /// The provided symbol file/slice is malformed or empty.
     InvalidSymbolFile,
@@ -27,10 +24,6 @@ const MapEntry = struct {
 };
 
 /// Compact symbol map supporting binary search by program counter.
-///
-/// Invariants:
-/// - `entries.items` are kept sorted by `addr` ascending.
-/// - Names are allocator-owned copies and freed in `deinit`.
 const SymbolMap = struct {
     /// Allocator owning `entries` and name copies.
     alloc: std.mem.Allocator,
@@ -120,20 +113,10 @@ const SymbolMap = struct {
     }
 };
 
-/// Global symbol map used by `panic`/`logAddr` for backtraces.
+const VAddr = zag.x86.Paging.VAddr;
+
 pub var g_symmap: ?SymbolMap = null;
 
-/// Parses a simple `addr<space>name\n` symbol list and installs `g_symmap`.
-///
-/// Arguments:
-/// - `map_bytes`: symbol list where each entry is `<hex-addr><space><name>\n`,
-///   with newline encoded as the two-byte sequence `\`n`.
-/// - `alloc`: allocator used for `SymbolMap` entries and name copies.
-///
-/// Errors:
-/// - `PanicError.InvalidSymbolFile` if the slice has zero entries or a malformed line.
-/// - `std.mem.Allocator.Error` on allocation failure.
-/// - `std.fmt.ParseIntError` if any address fails to parse as hex.
 pub fn initSymbolsFromSlice(
     map_bytes: []const u8,
     alloc: std.mem.Allocator,

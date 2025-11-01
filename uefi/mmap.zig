@@ -1,7 +1,6 @@
 const std = @import("std");
-const uefi = std.os.uefi;
 
-const log = std.log.scoped(.mmap);
+const uefi = std.os.uefi;
 
 pub const MMap = extern struct {
     key: uefi.tables.MemoryMapKey,
@@ -10,6 +9,8 @@ pub const MMap = extern struct {
     descriptor_size: u64,
     num_descriptors: u64,
 };
+
+const log = std.log.scoped(.mmap);
 
 pub fn getMmap(
     boot_services: *uefi.tables.BootServices,
@@ -29,7 +30,6 @@ pub fn getMmap(
     );
     if (status != .buffer_too_small) return null;
 
-    // account for the buffer allocation changing the map
     mmap_size += 2 * descriptor_size;
 
     status = boot_services._allocatePool(
