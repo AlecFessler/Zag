@@ -322,6 +322,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         if (std.mem.eql(u8, &sdt.signature, "APIC")) {
             const madt = acpi.Madt.fromVAddr(sdt_virt);
             try madt.validate();
+            var lapic_base: u64 = @as(u64, madt.lapic_addr);
             var madt_iter = madt.iter();
             while (madt_iter.next()) |e| {
                 const entry = acpi.decodeMadt(e);
@@ -342,7 +343,9 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
                         x.gsi,
                     }),
                     .lapic_nmi => |_| {},
-                    .lapic_addr_override => |x| serial.print("lapic override {x}\n", .{x.addr}),
+                    .lapic_addr_override => |x| {
+                        lapic_base = x.addr;
+                    },
                 }
             }
         }
