@@ -93,6 +93,7 @@ export fn kEntry(boot_info: boot_defs.BootInfo) callconv(.{ .x86_64_sysv = .{} }
 /// - `!void`: on error, propagation to `kEntry` results in a panic.
 fn kMain(boot_info: boot_defs.BootInfo) !void {
     serial.init(.com1, 115200);
+    serial.print("Booting Zag kernel...\n", .{});
     gdt.init(VAddr.fromInt(@intFromPtr(&__stackguard_lower)));
     idt.init();
     isr.init();
@@ -284,10 +285,73 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         &heap_tree_allocator,
     );
     const heap_allocator_iface = heap_allocator.allocator();
-    _ = heap_allocator_iface;
+
+    const brand_str = try cpu.getBrandString(heap_allocator_iface);
+    const vendor_str = try cpu.getVendorString(heap_allocator_iface);
+    serial.print("Processor Model: {s}\nVendor String: {s}\n", .{
+        brand_str,
+        vendor_str,
+    });
+
+    const feat = cpu.cpuid(.basic_features, 0);
+    if (!cpu.hasFeatureEdx(feat.edx, .lapic)) @panic("Local APIC not present");
+    if (!cpu.hasFeatureEcx(feat.ecx, .x2apic)) @panic("x2APIC not supported");
+    if (!cpu.hasFeatureEcx(feat.ecx, .tsc_deadline)) @panic("TSC-deadline not supported");
+
+    const max_ext = cpu.cpuid(.ext_max, 0).eax;
+    if (max_ext < @intFromEnum(cpu.CpuidLeaf.ext_max)) @panic("Invariant TSC not supported");
+
+    const pwr = cpu.cpuid(.ext_power, 0);
+    if (!cpu.hasPowerFeatureEdx(pwr.edx, .constant_tsc)) @panic("Invariant TSC not supported");
 
     const xsdp_virt = VAddr.fromPAddr(xsdp_phys, .physmap);
-    acpi.validateXSDP(xsdp_virt) catch @panic("Invalid xsdp");
+    const xsdp = acpi.Xsdp.fromVAddr(xsdp_virt);
+    try xsdp.validate();
+
+    const xsdt_phys = PAddr.fromInt(xsdp.xsdt_paddr);
+    const xsdt_virt = VAddr.fromPAddr(xsdt_phys, .physmap);
+    const xsdt = acpi.Xsdt.fromVAddr(xsdt_virt);
+    try xsdt.validate();
+
+    var xsdt_iter = xsdt.iter();
+    while (xsdt_iter.next()) |sdt_paddr| {
+        const sdt_phys = PAddr.fromInt(sdt_paddr);
+        const sdt_virt = VAddr.fromPAddr(sdt_phys, .physmap);
+        const sdt = acpi.Sdt.fromVAddr(sdt_virt);
+        if (!std.mem.eql(
+            u8,
+            &sdt.signature,
+            "APIC",
+        )) continue;
+
+        const madt = acpi.Madt.fromVAddr(sdt_virt);
+        try madt.validate();
+        var madt_iter = madt.iter();
+        while (madt_iter.next()) |e| {
+            const entry = acpi.decodeMadt(e);
+            switch (entry) {
+                .local_apic => |x| serial.print("cpu {d} apic_id {d} flags {x}\n", .{
+                    x.processor_uid,
+                    x.apic_id,
+                    x.flags,
+                }),
+                .ioapic => |x| serial.print("ioapic id {d} addr {x} gsi_base {d}\n", .{
+                    x.ioapic_id,
+                    x.ioapic_addr,
+                    x.gsi_base,
+                }),
+                .iso => |x| serial.print("iso bus {d} src {d} -> gsi {d}\n", .{
+                    x.bus,
+                    x.src,
+                    x.gsi,
+                }),
+                .lapic_nmi => |_| {},
+                .lapic_addr_override => |x| serial.print("lapic override {x}\n", .{
+                    x.addr,
+                }),
+            }
+        }
+    }
 
     cpu.halt();
 }

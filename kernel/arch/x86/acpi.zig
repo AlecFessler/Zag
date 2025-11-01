@@ -11,44 +11,277 @@ const std = @import("std");
 const VAddr = paging.VAddr;
 
 /// Errors that may occur while validating the XSDP.
-const xsdpError = error{
+const validationError = error{
     InvalidSignature,
     InvalidSize,
     InvalidChecksum,
 };
 
-/// Validates the ACPI XSDP (RSDP) structure at the provided virtual address.
-///
-/// Performs three checks:
-/// 1. Signature matches `"RSD PTR "`
-/// 2. Reported structure length is at least 36 bytes
-/// 3. Entire structure checksum modulo 256 is zero
-///
-/// Arguments:
-/// - `xsdp_virt`: virtual address where the XSDP/RSDP resides (physmap).
-///
-/// Returns:
-/// - `void` on success.
-/// - `xsdpError.InvalidSignature` if the signature does not match.
-/// - `xsdpError.InvalidSize` if the structure length is too small.
-/// - `xsdpError.InvalidChecksum` if the checksum does not validate.
-pub fn validateXSDP(xsdp_virt: VAddr) !void {
-    const xsdp_bytes: [*]const u8 = @ptrFromInt(xsdp_virt.addr);
+pub const Xsdp = extern struct {
+    signature: [8]u8,
+    checksum20: u8,
+    oem_id: [6]u8,
+    revision: u8,
+    rsdt_paddr: u32,
+    length: u32,
+    xsdt_paddr: u64,
+    checksum_ext: u8,
+    reserved: [3]u8,
 
-    if (!std.mem.eql(
-        u8,
-        xsdp_bytes[0..8],
-        "RSD PTR ",
-    )) return xsdpError.InvalidSignature;
+    pub fn fromVAddr(xsdp_virt: VAddr) *Xsdp {
+        @setRuntimeSafety(false);
+        return @ptrFromInt(xsdp_virt.addr);
+    }
 
-    const len = std.mem.readInt(
-        u32,
-        xsdp_bytes[20..24],
-        .little,
-    );
-    if (len < 36) return xsdpError.InvalidSize;
+    pub fn asBytes(self: *const Xsdp, n: u64) []const u8 {
+        const base: [*]const u8 = @ptrCast(self);
+        return base[0..n];
+    }
 
-    var sum: u8 = 0;
-    for (xsdp_bytes[0..len]) |b| sum +%= b;
-    if (sum != 0) return xsdpError.InvalidChecksum;
+    pub fn validate(self: *const Xsdp) !void {
+        if (!std.mem.eql(u8, &self.signature, "RSD PTR ")) {
+            return validationError.InvalidSignature;
+        }
+
+        if (self.length < 36) {
+            return validationError.InvalidSize;
+        }
+
+        var sum: u8 = 0;
+        for (self.asBytes(self.length)) |b| {
+            sum +%= b;
+        }
+        if (sum != 0) {
+            return validationError.InvalidChecksum;
+        }
+    }
+};
+
+pub const Xsdt = extern struct {
+    signature: [4]u8,
+    length: u32,
+    revision: u8,
+    checksum: u8,
+    oem_id: [6]u8,
+    oem_table_id: [8]u8,
+    oem_revision: u32,
+    creator_id: u32,
+    creator_revision: u32,
+    entries_base: u64,
+
+    pub fn fromVAddr(xsdt_virt: VAddr) *Xsdt {
+        @setRuntimeSafety(false);
+        return @ptrFromInt(xsdt_virt.addr);
+    }
+
+    pub fn validate(self: *const Xsdt) !void {
+        if (!std.mem.eql(u8, &self.signature, "XSDT")) {
+            return validationError.InvalidSignature;
+        }
+
+        var sum: u8 = 0;
+        for (self.asBytes(self.length)) |b| sum +%= b;
+        if (sum != 0) return validationError.InvalidChecksum;
+    }
+
+    pub const Iterator = struct {
+        xsdt: *const Xsdt,
+        off: u64,
+
+        pub fn init(x: *const Xsdt) Iterator {
+            return .{
+                .xsdt = x,
+                .off = 36,
+            };
+        }
+
+        pub fn next(self: *Iterator) ?u64 {
+            if (self.off + 8 > self.xsdt.length) return null;
+            const bytes = self.xsdt.asBytes(self.xsdt.length);
+            const paddr = std.mem.readInt(u64, @ptrCast(bytes.ptr + self.off), .little);
+            self.off += 8;
+            return paddr;
+        }
+    };
+
+    pub fn iter(self: *const Xsdt) Iterator {
+        return Iterator.init(self);
+    }
+
+    fn asBytes(self: *const Xsdt, n: u64) []const u8 {
+        const base: [*]const u8 = @ptrCast(self);
+        return base[0..n];
+    }
+};
+
+pub const Sdt = extern struct {
+    signature: [4]u8,
+    length: u32,
+    revision: u8,
+    checksum: u8,
+    oem_id: [6]u8,
+    oem_table_id: [8]u8,
+    oem_revision: u32,
+    creator_id: u32,
+    creator_revision: u32,
+
+    pub fn fromVAddr(sdt_virt: VAddr) *const Sdt {
+        @setRuntimeSafety(false);
+        return @ptrFromInt(sdt_virt.addr);
+    }
+};
+
+pub const MadtType = enum(u8) {
+    local_apic = 0,
+    ioapic = 1,
+    iso = 2,
+    lapic_nmi = 4,
+    lapic_addr_override = 5,
+};
+
+pub const LocalApic = extern struct {
+    processor_uid: u8,
+    apic_id: u8,
+    flags: u32,
+};
+
+pub const IoApic = extern struct {
+    ioapic_id: u8,
+    _rsvd: u8 = 0,
+    ioapic_addr: u32,
+    gsi_base: u32,
+};
+
+pub const Iso = extern struct {
+    bus: u8,
+    src: u8,
+    gsi: u32,
+    flags: u16,
+};
+
+pub const LapicAddrOverride = extern struct {
+    _rsvd: u16 = 0,
+    addr: u64,
+};
+
+pub const AnyMadt = union(MadtType) {
+    local_apic: LocalApic,
+    ioapic: IoApic,
+    iso: Iso,
+    lapic_nmi: []const u8,
+    lapic_addr_override: LapicAddrOverride,
+};
+
+pub fn decodeMadt(e: Madt.Entry) AnyMadt {
+    const p = e.bytes[2..];
+    return switch (@as(MadtType, @enumFromInt(e.header.kind))) {
+        .local_apic => .{
+            .local_apic = .{
+                .processor_uid = p[0],
+                .apic_id = p[1],
+                .flags = std.mem.readInt(u32, @ptrCast(p.ptr + 2), .little),
+            },
+        },
+        .ioapic => .{
+            .ioapic = .{
+                .ioapic_id = p[0],
+                .ioapic_addr = std.mem.readInt(u32, @ptrCast(p.ptr + 2), .little),
+                .gsi_base = std.mem.readInt(u32, @ptrCast(p.ptr + 6), .little),
+            },
+        },
+        .iso => .{
+            .iso = .{
+                .bus = p[0],
+                .src = p[1],
+                .gsi = std.mem.readInt(u32, @ptrCast(p.ptr + 2), .little),
+                .flags = std.mem.readInt(u16, @ptrCast(p.ptr + 6), .little),
+            },
+        },
+        .lapic_nmi => .{
+            .lapic_nmi = e.bytes,
+        },
+        .lapic_addr_override => .{
+            .lapic_addr_override = .{
+                .addr = std.mem.readInt(u64, @ptrCast(p.ptr + 2), .little),
+            },
+        },
+    };
 }
+
+pub const Madt = extern struct {
+    signature: [4]u8,
+    length: u32,
+    revision: u8,
+    checksum: u8,
+    oem_id: [6]u8,
+    oem_table_id: [8]u8,
+    oem_revision: u32,
+    creator_id: u32,
+    creator_revision: u32,
+    lapic_addr: u32,
+    flags: u32,
+
+    pub fn fromVAddr(madt_virt: VAddr) *Madt {
+        @setRuntimeSafety(false);
+        return @ptrFromInt(madt_virt.addr);
+    }
+
+    pub fn validate(self: *const Madt) !void {
+        if (!std.mem.eql(u8, &self.signature, "APIC")) {
+            return validationError.InvalidSignature;
+        }
+
+        var sum: u8 = 0;
+        for (self.asBytes(self.length)) |b| {
+            sum +%= b;
+        }
+        if (sum != 0) {
+            return validationError.InvalidChecksum;
+        }
+    }
+
+    pub const EntryHeader = extern struct {
+        kind: u8,
+        length: u8,
+    };
+
+    pub const Entry = struct {
+        header: EntryHeader,
+        bytes: []const u8,
+    };
+
+    pub const Iterator = struct {
+        madt: *const Madt,
+        off: u64,
+
+        pub fn init(m: *const Madt) Iterator {
+            return .{
+                .madt = m,
+                .off = 36 + 8,
+            };
+        }
+
+        pub fn next(self: *Iterator) ?Entry {
+            if (self.off >= self.madt.length) return null;
+            const bytes = self.madt.asBytes(self.madt.length);
+            const hdr: *align(1) const EntryHeader = @ptrCast(bytes.ptr + self.off);
+            const start = self.off;
+            const len = hdr.length;
+            if (len < 2 or start + len > self.madt.length) return null;
+            self.off += len;
+            return .{
+                .header = hdr.*,
+                .bytes = bytes[start .. start + len],
+            };
+        }
+    };
+
+    pub fn iter(self: *const Madt) Iterator {
+        return Iterator.init(self);
+    }
+
+    fn asBytes(self: *const Madt, n: u64) []const u8 {
+        const base: [*]const u8 = @ptrCast(self);
+        return base[0..n];
+    }
+};

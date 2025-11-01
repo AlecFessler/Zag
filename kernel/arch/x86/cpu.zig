@@ -5,6 +5,8 @@
 //! selectors after GDT setup. All functions assume CPL0 (ring 0).
 
 const paging = @import("paging.zig");
+const serial = @import("serial.zig");
+const std = @import("std");
 
 const VAddr = paging.VAddr;
 
@@ -29,6 +31,237 @@ pub const Registers = packed struct {
     rcx: u64,
     rax: u64,
 };
+
+/// ECX feature bits returned from CPUID leaf `0x1:ECX`.
+///
+/// These bits describe CPU capabilities such as AVX, AES-NI, SSE4.1/2, etc.
+pub const CpuidFeatureEcx = enum(u32) {
+    sse3 = 1 << 0, // Supplemental SSE3
+    pclmul = 1 << 1, // Carryless multiply
+    dtes64 = 1 << 2, // 64-bit debug store
+    monitor = 1 << 3, // MONITOR/MWAIT instructions
+    ds_cpl = 1 << 4, // CPL-qualified debug store
+    vmx = 1 << 5, // Hardware virtualization
+    smx = 1 << 6, // Safer mode extensions
+    est = 1 << 7, // Enhanced SpeedStep
+    tm2 = 1 << 8, // Thermal monitor 2
+    ssse3 = 1 << 9, // Supplemental SSE3
+    cid = 1 << 10, // Context ID
+    sdbg = 1 << 11, // Silicon debug
+    fma = 1 << 12, // Fused multiply-add
+    cx16 = 1 << 13, // CMPXCHG16B instruction
+    xtpr = 1 << 14, // xTPR update control
+    pdcm = 1 << 15, // Perf/Debug capability MSR
+    pcid = 1 << 17, // Process-context identifiers
+    dca = 1 << 18, // Direct Cache Access
+    sse4_1 = 1 << 19, // SSE4.1: adds dot-product, blend ops, rounding control
+    sse4_2 = 1 << 20, // SSE4.2: adds string compare/CRC instructions
+    x2apic = 1 << 21, // x2APIC mode support
+    movbe = 1 << 22, // Big-endian byte load/store
+    popcnt = 1 << 23, // POPCNT instruction
+    tsc_deadline = 1 << 24, // TSC deadline mode in local APIC timer
+    aes = 1 << 25, // AES-NI instructions
+    xsave = 1 << 26, // XSAVE/XRSTOR
+    osxsave = 1 << 27, // OS has enabled XSAVE in CR4
+    avx = 1 << 28, // Advanced Vector Extensions
+    f16c = 1 << 29, // Half-precision float conversion
+    rdrand = 1 << 30, // Hardware RNG
+    hypervisor = 1 << 31, // Running under a hypervisor
+};
+
+/// EDX feature bits returned from CPUID leaf `0x1:EDX`.
+///
+/// Covers foundational CPU features: FPU, RDTSC, SSE, APIC presence, etc.
+pub const CpuidFeatureEdx = enum(u32) {
+    fpu = 1 << 0, // x87 FPU
+    vme = 1 << 1, // Virtual 8086 extensions
+    de = 1 << 2, // Debugging extensions
+    pse = 1 << 3, // Page Size Extension
+    tsc = 1 << 4, // Time Stamp Counter
+    msr = 1 << 5, // Model Specific Registers
+    pae = 1 << 6, // Physical Address Extension
+    mce = 1 << 7, // Machine Check Exception
+    cx8 = 1 << 8, // CMPXCHG8B
+    lapic = 1 << 9, // Local APIC present
+    sep = 1 << 11, // SYSENTER/SYSEXIT
+    mtrr = 1 << 12, // Memory Type Range Registers
+    pge = 1 << 13, // Global pages
+    mca = 1 << 14, // Machine Check Architecture
+    cmov = 1 << 15, // CMOV instruction
+    pat = 1 << 16, // Page Attribute Table
+    pse36 = 1 << 17, // 36-bit PSE
+    psn = 1 << 18, // Processor serial number
+    clflush = 1 << 19, // CLFLUSH instruction
+    ds = 1 << 21, // Debug store
+    acpi = 1 << 22, // Thermal/APIC extensions
+    mmx = 1 << 23, // MMX: early SIMD integer ops
+    fxsr = 1 << 24, // FXSAVE/FXRSTOR: fast FPU/SSE context save/restore
+    sse = 1 << 25, // SSE: 128-bit SIMD floating-point
+    sse2 = 1 << 26, // SSE2: expands SSE to cover integer ops
+    ss = 1 << 27, // Self-snoop
+    htt = 1 << 28, // Hyperthreading / multiple logical CPUs
+    tm = 1 << 29, // Thermal Monitor
+    ia64 = 1 << 30, // IA-64
+    pbe = 1 << 31, // Pending Break Enable
+};
+
+pub const CpuidPowerEdx = enum(u32) {
+    ts              = 1 << 0, // Temperature sensor available
+    fid             = 1 << 1, // Frequency ID control
+    vid             = 1 << 2, // Voltage ID control
+    ttp             = 1 << 3, // Thermal Trip
+    tm              = 1 << 4, // Hardware Thermal Management
+    stc             = 1 << 5, // Software Thermal Control
+    step_100mhz     = 1 << 6, // 100 MHz bus multiplier capability
+    hwp             = 1 << 7, // Hardware P-State
+    constant_tsc    = 1 << 8, // Invariant TSC
+};
+
+pub const CpuidLeaf = enum(u32) {
+    basic_max       = 0x00000000,
+    basic_features  = 0x00000001,
+    ext_max         = 0x80000000,
+    brand_0         = 0x80000002,
+    brand_1         = 0x80000003,
+    brand_2         = 0x80000004,
+    ext_power       = 0x80000007,
+};
+
+/// Checks whether a given ECX CPUID feature bit is present.
+///
+/// Arguments:
+/// - `reg`: value returned from CPUID leaf `0x1:ECX`.
+/// - `feat`: desired feature.
+///
+/// Returns:
+/// - `true` if present, `false` otherwise.
+pub fn hasFeatureEcx(
+    reg: u32,
+    feat: CpuidFeatureEcx,
+) bool {
+    return (reg & @intFromEnum(feat)) != 0;
+}
+
+/// Checks whether a given EDX CPUID feature bit is present.
+///
+/// Arguments:
+/// - `reg`: value returned from CPUID leaf `0x1:EDX`.
+/// - `feat`: desired feature from `CpuidFeatureEdx`.
+///
+/// Returns:
+/// - `true` if the feature bit is set, `false` otherwise.
+pub fn hasFeatureEdx(
+    reg: u32,
+    feat: CpuidFeatureEdx,
+) bool {
+    return (reg & @intFromEnum(feat)) != 0;
+}
+
+/// Checks whether an extended (power/TSC) EDX CPUID feature bit is present.
+///
+/// This is used with CPUID leaf `0x80000007:EDX`, which reports advanced
+/// power management and TSC behavior, including the invariant TSC bit.
+///
+/// Arguments:
+/// - `reg`: value returned from CPUID leaf `0x80000007:EDX`.
+/// - `feat`: desired feature from `CpuidPowerEdx`.
+///
+/// Returns:
+/// - `true` if the feature bit is set, `false` otherwise.
+pub fn hasPowerFeatureEdx(
+    reg: u32,
+    feat: CpuidPowerEdx,
+) bool {
+    return (reg & @intFromEnum(feat)) != 0;
+}
+
+/// Executes the CPUID instruction with the provided input registers.
+///
+/// Arguments:
+/// - `eax`: value loaded into EAX before executing `cpuid`.
+/// - `ecx`: value loaded into ECX before executing `cpuid`.
+///
+/// Returns:
+/// - Struct with the post-instruction register values:
+///   - `eax`: EAX after `cpuid`
+///   - `ebx`: EBX after `cpuid`
+///   - `ecx`: ECX after `cpuid`
+///   - `edx`: EDX after `cpuid`
+pub fn cpuid(eax: CpuidLeaf, ecx: u32) struct {
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
+} {
+    var a = @intFromEnum(eax);
+    var b: u32 = 0;
+    var c = ecx;
+    var d: u32 = 0;
+    asm volatile ("cpuid"
+        : [a] "={eax}" (a),
+          [b] "={ebx}" (b),
+          [c] "={ecx}" (c),
+          [d] "={edx}" (d),
+        : [in_a] "{eax}" (@intFromEnum(eax)),
+          [in_c] "{ecx}" (ecx),
+    );
+    return .{ .eax = a, .ebx = b, .ecx = c, .edx = d };
+}
+
+/// Returns the CPU vendor identification string (12 bytes, no NUL terminator).
+///
+/// Arguments:
+/// - `allocator`: allocator used to return the vendor string buffer.
+///
+/// Returns:
+/// - `[]u8` of length 12 containing the vendor ID assembled as EBX||EDX||ECX.
+///   Caller owns the buffer and must free it.
+pub fn getVendorString(allocator: std.mem.Allocator) ![]u8 {
+    const r = cpuid(.basic_max, 0);
+    var out = try allocator.alloc(u8, 12);
+
+    const b: [4]u8 = @bitCast(r.ebx);
+    const d: [4]u8 = @bitCast(r.edx);
+    const c: [4]u8 = @bitCast(r.ecx);
+
+    @memcpy(out[0..4], &b);
+    @memcpy(out[4..8], &d);
+    @memcpy(out[8..12], &c);
+
+    return out;
+}
+
+/// Returns the CPU brand string (48 bytes, no NUL terminator).
+///
+/// Arguments:
+/// - `allocator`: allocator used to return the brand string buffer.
+///
+/// Returns:
+/// - `[]u8` of length 48 built from CPUID leaves `0x80000002..4`.
+///   Caller owns the buffer and must free it. Content/spacing is vendor-defined.
+pub fn getBrandString(allocator: std.mem.Allocator) ![]u8 {
+    var out = try allocator.alloc(u8, 48);
+    var i: usize = 0;
+    var leaf: u32 = @intFromEnum(CpuidLeaf.brand_0);
+
+    while (leaf <= @intFromEnum(CpuidLeaf.brand_2)) {
+        const r = cpuid(@enumFromInt(leaf), 0);
+
+        const a: [4]u8 = @bitCast(r.eax);
+        const b: [4]u8 = @bitCast(r.ebx);
+        const c: [4]u8 = @bitCast(r.ecx);
+        const d: [4]u8 = @bitCast(r.edx);
+
+        @memcpy(out[i..i+4], &a);
+        @memcpy(out[i+4..i+8], &b);
+        @memcpy(out[i+8..i+12], &c);
+        @memcpy(out[i+12..i+16], &d);
+
+        i += 16;
+        leaf += 1;
+    }
+    return out;
+}
 
 /// Halts the CPU in a tight loop (low-power wait until interrupt).
 ///
@@ -136,4 +369,27 @@ pub fn setWriteProtect(enable: bool) void {
         :
         : [in] "r" (cr0),
         : .{ .memory = true });
+}
+
+pub fn rdmsr(msr: u32) u64 {
+    var lo: u32 = 0;
+    var hi: u32 = 0;
+    asm volatile (
+        \\rdmsr
+        : [lo] "={eax}" (lo), [hi] "={edx}" (hi)
+        : [msr] "{ecx}" (msr),
+    );
+    return (@as(u64, hi) << 32) | lo;
+}
+
+pub fn wrmsr(msr: u32, value: u64) void {
+    const lo: u32 = @truncate(value);
+    const hi: u32 = @truncate(value >> 32);
+    asm volatile (
+        \\wrmsr
+        :
+        : [msr] "{ecx}" (msr),
+          [lo] "{eax}" (lo),
+          [hi] "{edx}" (hi),
+    );
 }
