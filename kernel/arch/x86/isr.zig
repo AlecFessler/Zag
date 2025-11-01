@@ -330,7 +330,9 @@ fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
     const pf_err = PFErrCode.from(ctx.err_code);
 
     if (pf_err.rsvd_violation) @panic("Page tables have reserved bits set (RSVD).");
-    if (pf_err.instr_fetch) @panic("Execute fault (NX) at kernel address.");
+    if (pmm_mod.global_pmm == null) {
+        @panic("Page fault prior to pmm initialization!");
+    }
 
     const code_privilege_level: u64 = ctx.cs & 3;
     const faulting_vaddr = cpu.read_cr2();
@@ -340,10 +342,8 @@ fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
         @intFromEnum(paging.PageSize.Page4K),
     ));
 
-    if (pmm_mod.global_pmm == null) {
-        @panic("Page fault prior to pmm initialization!");
-    }
     if (code_privilege_level == 0) {
+        if (pf_err.instr_fetch) @panic("Execute fault (NX) at kernel address.");
         if (pf_err.present) {
             @panic("Invalid memory access in kernelspace!");
         }

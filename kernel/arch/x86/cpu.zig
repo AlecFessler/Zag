@@ -39,6 +39,13 @@ pub fn halt() noreturn {
     }
 }
 
+/// Reads one byte from an I/O port.
+///
+/// Arguments:
+/// - `port`: I/O port to read from.
+///
+/// Returns:
+/// - The byte read from `port`.
 pub fn inb(port: u16) u8 {
     return asm volatile (
         \\inb %[port], %[ret]
@@ -47,6 +54,11 @@ pub fn inb(port: u16) u8 {
     );
 }
 
+/// Writes one byte to an I/O port.
+///
+/// Arguments:
+/// - `value`: byte to write.
+/// - `port`: I/O port to write to.
 pub fn outb(
     value: u8,
     port: u16,
@@ -102,6 +114,13 @@ pub fn reloadSegments() void {
         ::: .{ .memory = true });
 }
 
+/// Enables or disables the CR0.WP (write-protect) bit.
+///
+/// When disabled, supervisor-mode writes may modify read-only pages.
+/// Use with care; typically enable WP except for tightly controlled updates.
+///
+/// Arguments:
+/// - `enable`: `true` to set WP (protect read-only pages), `false` to clear WP.
 pub fn setWriteProtect(enable: bool) void {
     var cr0: u64 = 0;
     asm volatile ("mov %%cr0, %[out]"

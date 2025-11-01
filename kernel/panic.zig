@@ -117,6 +117,23 @@ const VAddr = zag.x86.Paging.VAddr;
 
 pub var g_symmap: ?SymbolMap = null;
 
+/// Initializes the global symbol map from a serialized slice.
+///
+/// The input format is a sequence of entries encoded as:
+/// `HEX_ADDR SP NAME \ n` (where the newline is the two-byte sequence `\` then `n`),
+/// repeated for each symbol. Example: `ffffffff80001000 _start\n`.
+///
+/// Arguments:
+/// - `map_bytes`: UTF-8 bytes of the serialized symbol map.
+/// - `alloc`: allocator used to store entries and duplicated names.
+///
+/// Returns:
+/// - `void` on success; populates `g_symmap`.
+///
+/// Errors:
+/// - `PanicError.InvalidSymbolFile` if no entries are found.
+/// - `std.mem.Allocator.Error` on allocation failures.
+/// - `std.fmt.ParseIntError` if an address field is not valid hex.
 pub fn initSymbolsFromSlice(
     map_bytes: []const u8,
     alloc: std.mem.Allocator,
@@ -192,6 +209,18 @@ pub fn initSymbolsFromSlice(
     g_symmap = sm;
 }
 
+/// Kernel panic handler: prints message and backtrace, then halts.
+///
+/// Emits a panic header (with optional return address), symbolized stack trace
+/// up to 64 frames if a symbol map is loaded, and stops the CPU.
+///
+/// Arguments:
+/// - `msg`: panic message to display.
+/// - `trace`: optional Zig return-trace (unused here; backtrace gathered manually).
+/// - `ret_addr`: optional return address for additional context.
+///
+/// Returns:
+/// - Never returns; halts the CPU.
 pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
     @branchHint(.cold);
     _ = trace;
@@ -218,6 +247,13 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?usize)
     zag.x86.Cpu.halt();
 }
 
+/// Logs a single program counter with symbolization if available.
+///
+/// When a symbol map is loaded, prints `PC: name+offset`; otherwise prints
+/// a sentinel (`?????`) or `(no symbols)`.
+///
+/// Arguments:
+/// - `pc`: program counter to log.
 fn logAddr(pc: u64) void {
     if (zag.panic.g_symmap) |sm| {
         if (sm.find(pc)) |hit| {

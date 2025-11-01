@@ -32,12 +32,15 @@ pub const BuddyAllocator = struct {
     /// Initializes a buddy allocator managing `[start_addr, end_addr)`.
     ///
     /// Arguments:
-    /// - `start_addr`: start (rounded up to PAGE_SIZE).
-    /// - `end_addr`: end (rounded down to PAGE_SIZE).
-    /// - `init_allocator`: used to allocate internal metadata (bitmap/order table).
+    /// - `start_addr`: start of the region (rounded up to `PAGE_SIZE`).
+    /// - `end_addr`: end of the region (rounded down to `PAGE_SIZE`).
+    /// - `init_allocator`: backing allocator used only for metadata (bitmap and page-pair orders).
     ///
     /// Returns:
-    /// - A fully initialized `BuddyAllocator` with freelists seeded by descending orders.
+    /// - A fully initialized `BuddyAllocator` with empty freelists and metadata allocated.
+    ///
+    /// Errors:
+    /// - `std.mem.Allocator.Error` if allocating the bitmap or order table fails.
     pub fn init(
         start_addr: u64,
         end_addr: u64,
@@ -78,6 +81,19 @@ pub const BuddyAllocator = struct {
         return self;
     }
 
+    /// Marks a region as free by pushing each page into the allocator via `free`.
+    ///
+    /// The input range is aligned to page boundaries, then each page-sized block
+    /// is individually freed, allowing the allocator to coalesce according to its
+    /// current state and boundaries.
+    ///
+    /// Arguments:
+    /// - `self`: allocator instance.
+    /// - `start_addr`: start of the region to free (inclusive).
+    /// - `end_addr`: end of the region to free (exclusive).
+    ///
+    /// Panics:
+    /// - Asserts if the aligned end is not greater than the aligned start.
     pub fn addRegion(
         self: *BuddyAllocator,
         start_addr: u64,

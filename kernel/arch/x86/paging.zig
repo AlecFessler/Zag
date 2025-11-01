@@ -132,10 +132,10 @@ pub const VAddr = struct {
     }
 };
 
-const PDEntry    = PageEntry;
-const PDPTEntry  = PageEntry;
-const PML4Entry  = PageEntry;
-const PTEntry    = PageEntry;
+const PDEntry = PageEntry;
+const PDPTEntry = PageEntry;
+const PML4Entry = PageEntry;
+const PTEntry = PageEntry;
 
 /// Zeroed entry template used for freshly allocated tables.
 pub const default_flags = PageEntry{
@@ -160,6 +160,22 @@ pub const PAGE_ALIGN = std.mem.Alignment.fromByteUnits(@intFromEnum(PageSize.Pag
 /// Entries per page table.
 pub const PAGE_TABLE_SIZE = 512;
 
+/// Drops the identity mapping for the lower half of the address space.
+///
+/// Clears PML4 entries 0–255, which correspond to canonical lower-half
+/// addresses when the kernel is running in the higher half. This removes
+/// the temporary identity map used during early boot so accidental access
+/// to physical addresses via identity is no longer possible.
+///
+/// After invalidating those entries, CR3 is reloaded to ensure the TLB
+/// flushes and all processors observe the new top-level tables.
+///
+/// Safety:
+/// - Must only be called after the kernel has fully switched to higher-half
+///   execution and no remaining references exist to identity-mapped pointers.
+///
+/// Returns:
+/// - `void`
 pub fn dropIdentityMap() void {
     const cr3 = read_cr3();
     const pml4_paddr = PAddr.fromInt(cr3.addr & ~@as(u64, 0xfff));

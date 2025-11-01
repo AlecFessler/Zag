@@ -1,3 +1,14 @@
+//! UEFI bootloader entry and kernel handoff.
+//!
+//! Responsibilities:
+//! - Initialize logging and access UEFI Boot Services.
+//! - Duplicate the current PML4 into a writeable page and reload CR3.
+//! - Open the boot volume via Simple File System and load `kernel.elf`.
+//! - Map PT_LOAD segments with appropriate permissions (RO/RW, NX).
+//! - Load `kernel.map` into a reserved pool for later symbolization.
+//! - Discover ACPI XSDP and capture the final memory map.
+//! - Exit Boot Services, build `BootInfo`, and jump to the kernel entry.
+
 const alloc_mod = @import("boot_allocator.zig");
 const defs_mod = @import("defs.zig");
 const file_mod = @import("file.zig");
@@ -11,10 +22,20 @@ const elf = std.elf;
 const paging = x86.Paging;
 const uefi = std.os.uefi;
 
-const KEntryType = fn (defs_mod.BootInfo) callconv(.{ .x86_64_sysv = .{} }) noreturn;
+pub const KEntryType = fn (defs_mod.BootInfo) callconv(.{ .x86_64_sysv = .{} }) noreturn;
 
 pub const std_options = log_mod.default_log_options;
 
+/// UEFI application entry point.
+///
+/// Performs loader setup, copies the current PML4 into a fresh page,
+/// opens the boot volume, loads and maps `kernel.elf`, loads `kernel.map`,
+/// locates ACPI XSDP, acquires the final memory map, exits Boot Services,
+/// constructs `BootInfo`, and tail-calls the kernel entry point.
+///
+/// Returns:
+/// - `.aborted` on failure (errors are logged here).
+/// - Does not return on success (transfers control to the kernel).
 pub fn main() uefi.Status {
     log_mod.init(uefi.system_table.con_out.?) catch return .aborted;
     const log = std.log.scoped(.loader);
@@ -123,6 +144,23 @@ pub fn main() uefi.Status {
     unreachable;
 }
 
+/// Load and map `kernel.elf` into the provided page tables, returning the entry address.
+///
+/// Behavior:
+/// - Opens `kernel.elf`, parses ELF header and program headers.
+/// - Allocates backing pages for each `PT_LOAD` segment and identity maps them
+///   into `new_pml4_paddr` with permissions derived from `p_flags` (read-only
+///   vs read-write, and NX for non-executable segments).
+/// - Copies file bytes into mapped memory and zero-fills BSS (`p_memsz > p_filesz`).
+///
+/// Params:
+/// - `boot_services`: UEFI boot services pointer.
+/// - `root_dir`: root volume already opened.
+/// - `new_pml4_paddr`: physical address of the active PML4 to receive mappings.
+///
+/// Returns:
+/// - `elf.Elf64_Addr` entry point on success.
+/// - `null` on failure (errors are logged here).
 fn loadKernel(
     boot_services: *uefi.tables.BootServices,
     root_dir: *uefi.protocol.File,
@@ -213,7 +251,11 @@ fn loadKernel(
 
         var vaddr = start_vaddr;
         while (vaddr < end_vaddr) {
-            const backing_page_slice = boot_services.allocatePages(.any, .reserved_memory_type, 1) catch {
+            const backing_page_slice = boot_services.allocatePages(
+                .any,
+                .reserved_memory_type,
+                1,
+            ) catch {
                 log.err("Failed to allocate backing page for segment", .{});
                 return null;
             };
@@ -252,7 +294,10 @@ fn loadKernel(
                 return null;
             };
             if (chunk == 0) {
-                log.err("Short read while loading segment: copied {} of {}", .{ copied, phdr.p_filesz });
+                log.err("Short read while loading segment: copied {} of {}", .{
+                    copied,
+                    phdr.p_filesz,
+                });
                 return null;
             }
             copied += chunk;
