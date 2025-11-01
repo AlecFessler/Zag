@@ -100,6 +100,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     idt.init();
     exceptions.init();
     irq.init();
+    cpu.enableX2Apic(irq.SPURIOUS_INTERRUPT_VECTOR);
 
     var mmap_entries_array: [boot_defs.MAX_MMAP_ENTRIES]boot_defs.MMapEntry = undefined;
     const mmap = boot_defs.collapseMmap(
@@ -296,8 +297,6 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         vendor_str,
     });
 
-    cpu.enableX2Apic(irq.SPURIOUS_INTERRUPT_VECTOR);
-
     const feat = cpu.cpuid(.basic_features, 0);
     if (!cpu.hasFeatureEcx(feat.ecx, .tsc_deadline)) @panic("TSC-deadline not supported");
 
@@ -358,6 +357,8 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
                 }
             }
         }
+
+        if (std.mem.eql(u8, &sdt.signature, "HPET")) {}
     }
 
     cpu.halt();
