@@ -8,64 +8,6 @@ const bitmap_freelist = @import("bitmap_freelist.zig");
 const intrusive_freelist = @import("intrusive_freelist.zig");
 const std = @import("std");
 
-/// Page object used only to give the intrusive free list a size/alignment and
-/// to act as the allocation unit for the buddy allocator (4 KiB).
-pub const Page = struct {
-    bytes: [PAGE_SIZE]u8 align(PAGE_SIZE),
-
-    comptime {
-        std.debug.assert(@sizeOf(Page) == PAGE_SIZE);
-        std.debug.assert(@alignOf(Page) == PAGE_SIZE);
-    }
-};
-
-/// Per-2-page metadata storing the current order of the even/odd page.
-/// Keeps order state in 1 byte per pair.
-const PagePairOrders = packed struct {
-    even: u4,
-    odd: u4,
-
-    comptime {
-        std.debug.assert(@sizeOf(PagePairOrders) == 1);
-    }
-};
-
-/// Return type for `splitAllocation`: a linked-list batch of blocks at a
-/// single order, allowing callers to push them back individually later.
-const using_popSpecific = true;
-const link_to_list = false;
-pub const FreeListBatch = intrusive_freelist.IntrusiveFreeList(
-    *Page,
-    !using_popSpecific,
-    link_to_list,
-);
-
-/// Bitmap free list backing the page state (1 = free, 0 = allocated).
-const using_getNextFree = false;
-const BitmapFreeList = bitmap_freelist.BitmapFreeList(using_getNextFree);
-
-/// Per-order intrusive free list of block bases.
-const IntrusiveFreeList = intrusive_freelist.IntrusiveFreeList(
-    *Page,
-    using_popSpecific,
-    link_to_list,
-);
-
-/// Number of buddy orders supported (0..10 → 1,2,4,...,1024 pages).
-const NUM_ORDERS = 11;
-
-/// Size in bytes for each order, indexed by order.
-const ORDERS = blk: {
-    var arr: [NUM_ORDERS]u64 = undefined;
-    for (0..NUM_ORDERS) |i| {
-        arr[i] = (1 << i) * PAGE_SIZE;
-    }
-    break :blk arr;
-};
-
-/// Page size in bytes (4 KiB).
-const PAGE_SIZE = 4096;
-
 /// Owning allocator for a contiguous, page-aligned address range.
 ///
 /// Does not require a backing allocator for data blocks (only for metadata
@@ -90,12 +32,15 @@ pub const BuddyAllocator = struct {
     /// Initializes a buddy allocator managing `[start_addr, end_addr)`.
     ///
     /// Arguments:
-    /// - `start_addr`: start (rounded up to PAGE_SIZE).
-    /// - `end_addr`: end (rounded down to PAGE_SIZE).
-    /// - `init_allocator`: used to allocate internal metadata (bitmap/order table).
+    /// - `start_addr`: start of the region (rounded up to `PAGE_SIZE`).
+    /// - `end_addr`: end of the region (rounded down to `PAGE_SIZE`).
+    /// - `init_allocator`: backing allocator used only for metadata (bitmap and page-pair orders).
     ///
     /// Returns:
-    /// - A fully initialized `BuddyAllocator` with freelists seeded by descending orders.
+    /// - A fully initialized `BuddyAllocator` with empty freelists and metadata allocated.
+    ///
+    /// Errors:
+    /// - `std.mem.Allocator.Error` if allocating the bitmap or order table fails.
     pub fn init(
         start_addr: u64,
         end_addr: u64,
@@ -136,6 +81,19 @@ pub const BuddyAllocator = struct {
         return self;
     }
 
+    /// Marks a region as free by pushing each page into the allocator via `free`.
+    ///
+    /// The input range is aligned to page boundaries, then each page-sized block
+    /// is individually freed, allowing the allocator to coalesce according to its
+    /// current state and boundaries.
+    ///
+    /// Arguments:
+    /// - `self`: allocator instance.
+    /// - `start_addr`: start of the region to free (inclusive).
+    /// - `end_addr`: end of the region to free (exclusive).
+    ///
+    /// Panics:
+    /// - Asserts if the aligned end is not greater than the aligned start.
     pub fn addRegion(
         self: *BuddyAllocator,
         start_addr: u64,
@@ -643,6 +601,60 @@ pub const BuddyAllocator = struct {
     }
 };
 
+/// Page object used only to give the intrusive free list a size/alignment and
+/// to act as the allocation unit for the buddy allocator (4 KiB).
+pub const Page = struct {
+    bytes: [PAGE_SIZE]u8 align(PAGE_SIZE),
+
+    comptime {
+        std.debug.assert(@sizeOf(Page) == PAGE_SIZE);
+        std.debug.assert(@alignOf(Page) == PAGE_SIZE);
+    }
+};
+
+/// Per-2-page metadata storing the current order of the even/odd page.
+/// Keeps order state in 1 byte per pair.
+const PagePairOrders = packed struct {
+    even: u4,
+    odd: u4,
+
+    comptime {
+        std.debug.assert(@sizeOf(PagePairOrders) == 1);
+    }
+};
+
+/// Return type for `splitAllocation`: a linked-list batch of blocks at a
+/// single order, allowing callers to push them back individually later.
+pub const FreeListBatch = intrusive_freelist.IntrusiveFreeList(
+    *Page,
+    !using_popSpecific,
+    link_to_list,
+);
+
+/// Bitmap free list backing the page state (1 = free, 0 = allocated).
+const BitmapFreeList = bitmap_freelist.BitmapFreeList(using_getNextFree);
+
+/// Per-order intrusive free list of block bases.
+const IntrusiveFreeList = intrusive_freelist.IntrusiveFreeList(
+    *Page,
+    using_popSpecific,
+    link_to_list,
+);
+
+const link_to_list = false;
+const NUM_ORDERS = 11;
+const ORDERS = blk: {
+    var arr: [NUM_ORDERS]u64 = undefined;
+    for (0..NUM_ORDERS) |i| {
+        arr[i] = (1 << i) * PAGE_SIZE;
+    }
+    break :blk arr;
+};
+/// Page size in bytes (4 KiB).
+const PAGE_SIZE = 4096;
+const using_getNextFree = false;
+const using_popSpecific = true;
+
 test "buddy allocator init fails with failing allocator" {
     const allocator = std.testing.failing_allocator;
 
@@ -665,86 +677,6 @@ test "buddy allocator init fails with failing allocator" {
             allocator,
         ),
     );
-}
-
-test "recursiveSplit splits larger blocks into smaller ones" {
-    const allocator = std.testing.allocator;
-
-    const memory = try allocator.alignedAlloc(
-        u8,
-        std.mem.Alignment.fromByteUnits(PAGE_SIZE),
-        ORDERS[1],
-    );
-    defer allocator.free(memory);
-
-    const start_addr = @intFromPtr(memory.ptr);
-    const end_addr = start_addr + ORDERS[1];
-
-    var buddy = try BuddyAllocator.init(
-        start_addr,
-        end_addr,
-        allocator,
-    );
-    defer buddy.deinit();
-
-    buddy.addRegion(start_addr, end_addr);
-
-    try std.testing.expect(buddy.freelists[1].head != null);
-    try std.testing.expect(buddy.freelists[0].head == null);
-
-    const addr1 = buddy.recursiveSplit(0).?;
-
-    try std.testing.expectEqual(@as(u4, 0), buddy.getOrder(addr1));
-
-    try std.testing.expect(buddy.freelists[0].head != null);
-    try std.testing.expect(buddy.freelists[1].head == null);
-
-    const addr2 = buddy.recursiveSplit(0).?;
-    try std.testing.expectEqual(@as(u4, 0), buddy.getOrder(addr2));
-
-    try std.testing.expect(buddy.freelists[0].head == null);
-
-    const diff = if (addr2 > addr1) addr2 - addr1 else addr1 - addr2;
-    try std.testing.expectEqual(ORDERS[0], diff);
-}
-
-test "recursiveMerge coalesces adjacent buddies and returns final state" {
-    const allocator = std.testing.allocator;
-
-    const memory = try allocator.alignedAlloc(
-        u8,
-        std.mem.Alignment.fromByteUnits(PAGE_SIZE),
-        ORDERS[1],
-    );
-    defer allocator.free(memory);
-
-    const start_addr = @intFromPtr(memory.ptr);
-    const end_addr = start_addr + ORDERS[1];
-
-    var buddy = try BuddyAllocator.init(
-        start_addr,
-        end_addr,
-        allocator,
-    );
-    defer buddy.deinit();
-
-    buddy.addRegion(start_addr, end_addr);
-
-    const addr1 = buddy.recursiveSplit(0).?;
-    const addr2 = buddy.recursiveSplit(0).?;
-
-    try std.testing.expect(buddy.getOrder(addr1) == 0);
-    try std.testing.expect(buddy.getOrder(addr2) == 0);
-
-    buddy.bitmap.setBit(addr1, 1);
-    buddy.freelists[0].push(@ptrFromInt(addr1));
-
-    buddy.bitmap.setBit(addr2, 1);
-    const result = buddy.recursiveMerge(addr2);
-
-    const expected_lower = @min(addr1, addr2);
-    try std.testing.expectEqual(expected_lower, result.addr);
-    try std.testing.expectEqual(@as(u4, 1), result.order);
 }
 
 test "out of bounds buddy handling - fragmentation recovery" {
@@ -796,6 +728,86 @@ test "out of bounds buddy handling - fragmentation recovery" {
     allocator.free(order_10_ptr);
     _ = allocations.remove(@intFromPtr(order_10_ptr.ptr));
     try std.testing.expect(buddy.validateState(&allocations));
+}
+
+test "recursiveMerge coalesces adjacent buddies and returns final state" {
+    const allocator = std.testing.allocator;
+
+    const memory = try allocator.alignedAlloc(
+        u8,
+        std.mem.Alignment.fromByteUnits(PAGE_SIZE),
+        ORDERS[1],
+    );
+    defer allocator.free(memory);
+
+    const start_addr = @intFromPtr(memory.ptr);
+    const end_addr = start_addr + ORDERS[1];
+
+    var buddy = try BuddyAllocator.init(
+        start_addr,
+        end_addr,
+        allocator,
+    );
+    defer buddy.deinit();
+
+    buddy.addRegion(start_addr, end_addr);
+
+    const addr1 = buddy.recursiveSplit(0).?;
+    const addr2 = buddy.recursiveSplit(0).?;
+
+    try std.testing.expect(buddy.getOrder(addr1) == 0);
+    try std.testing.expect(buddy.getOrder(addr2) == 0);
+
+    buddy.bitmap.setBit(addr1, 1);
+    buddy.freelists[0].push(@ptrFromInt(addr1));
+
+    buddy.bitmap.setBit(addr2, 1);
+    const result = buddy.recursiveMerge(addr2);
+
+    const expected_lower = @min(addr1, addr2);
+    try std.testing.expectEqual(expected_lower, result.addr);
+    try std.testing.expectEqual(@as(u4, 1), result.order);
+}
+
+test "recursiveSplit splits larger blocks into smaller ones" {
+    const allocator = std.testing.allocator;
+
+    const memory = try allocator.alignedAlloc(
+        u8,
+        std.mem.Alignment.fromByteUnits(PAGE_SIZE),
+        ORDERS[1],
+    );
+    defer allocator.free(memory);
+
+    const start_addr = @intFromPtr(memory.ptr);
+    const end_addr = start_addr + ORDERS[1];
+
+    var buddy = try BuddyAllocator.init(
+        start_addr,
+        end_addr,
+        allocator,
+    );
+    defer buddy.deinit();
+
+    buddy.addRegion(start_addr, end_addr);
+
+    try std.testing.expect(buddy.freelists[1].head != null);
+    try std.testing.expect(buddy.freelists[0].head == null);
+
+    const addr1 = buddy.recursiveSplit(0).?;
+
+    try std.testing.expectEqual(@as(u4, 0), buddy.getOrder(addr1));
+
+    try std.testing.expect(buddy.freelists[0].head != null);
+    try std.testing.expect(buddy.freelists[1].head == null);
+
+    const addr2 = buddy.recursiveSplit(0).?;
+    try std.testing.expectEqual(@as(u4, 0), buddy.getOrder(addr2));
+
+    try std.testing.expect(buddy.freelists[0].head == null);
+
+    const diff = if (addr2 > addr1) addr2 - addr1 else addr1 - addr2;
+    try std.testing.expectEqual(ORDERS[0], diff);
 }
 
 test "split allocation handles order changes correctly" {

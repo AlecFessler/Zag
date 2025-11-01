@@ -1,38 +1,50 @@
+//! Kernel entry and early bring-up for Zag.
+//!
+//! Handoff from the UEFI bootloader into the kernel proper. Initializes serial,
+//! GDT/IDT/ISRs, collapses the firmware memory map, installs a temporary bump
+//! allocator and the physmap, builds the buddy allocator and global PMM/VMM,
+//! sets up the heap, loads kernel symbols, validates ACPI XSDP, drops the
+//! identity map, and then halts. Errors propagate to `kEntry`, which panics.
+
+const boot_defs = @import("boot_defs");
 const std = @import("std");
 const zag = @import("zag");
-const boot_defs = @import("boot_defs");
 
+const acpi = zag.x86.Acpi;
 const cpu = zag.x86.Cpu;
 const gdt = zag.x86.Gdt;
 const idt = zag.x86.Idt;
 const isr = zag.x86.Isr;
-const serial = zag.x86.Serial;
 const paging = zag.x86.Paging;
 const pmm_mod = zag.memory.PhysicalMemoryManager;
-const vmm_mod = zag.memory.VirtualMemoryManager;
 const range = zag.math.range;
+const serial = zag.x86.Serial;
+const vmm_mod = zag.memory.VirtualMemoryManager;
 
 const BuddyAllocator = zag.memory.BuddyAllocator.BuddyAllocator;
 const BumpAllocator = zag.memory.BumpAllocator.BumpAllocator;
 const HeapAllocator = zag.memory.HeapAllocator.HeapAllocator;
 const HeapTreeAllocator = zag.memory.HeapAllocator.TreeAllocator;
 const PAddr = paging.PAddr;
-const VAddr = paging.VAddr;
 const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
-const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
 const Range = range.Range;
+const VAddr = paging.VAddr;
+const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
 
-const PAGE4K = @intFromEnum(paging.PageSize.Page4K);
 const PAGE1G = @intFromEnum(paging.PageSize.Page1G);
+const PAGE4K = @intFromEnum(paging.PageSize.Page4K);
 
 extern const __stackguard_lower: [*]const u8;
 
 /// Triggers a kernel panic and halts execution.
 ///
 /// Arguments:
-/// - `msg`: description of the failure
-/// - `error_return_trace`: optional Zig stack trace
-/// - `ret_addr`: optional return address for context
+/// - `msg`: description of the failure.
+/// - `error_return_trace`: optional Zig stack trace for diagnostics.
+/// - `ret_addr`: optional return address for additional context.
+///
+/// Returns:
+/// - Never returns; always panics and halts.
 pub fn panic(
     msg: []const u8,
     error_return_trace: ?*std.builtin.StackTrace,
@@ -41,6 +53,16 @@ pub fn panic(
     zag.panic.panic(msg, error_return_trace, ret_addr);
 }
 
+/// Kernel entry point from the UEFI bootloader.
+///
+/// Establishes a guarded stack and invokes `kMain`. Any error from `kMain`
+/// is converted to a hard panic.
+///
+/// Arguments:
+/// - `boot_info`: boot payload (memory map, kernel symbols, XSDP pointer).
+///
+/// Returns:
+/// - Never returns; transfers control or panics on failure.
 export fn kEntry(boot_info: boot_defs.BootInfo) callconv(.{ .x86_64_sysv = .{} }) noreturn {
     asm volatile (
         \\movq %[new_stack], %%rsp
@@ -54,6 +76,21 @@ export fn kEntry(boot_info: boot_defs.BootInfo) callconv(.{ .x86_64_sysv = .{} }
     unreachable;
 }
 
+/// Main kernel initialization routine.
+///
+/// Performs early bring-up steps: initializes serial, installs GDT/IDT/ISRs,
+/// collapses the UEFI memory map, creates a temporary bump allocator and
+/// establishes the physmap, initializes the buddy allocator and global PMM,
+/// creates and installs the global VMM, reserves virtual address space for
+/// the heap and initializes it, loads kernel symbols, validates the ACPI XSDP,
+/// drops the identity map, and halts.
+///
+/// Arguments:
+/// - `boot_info`: consumed boot information; fields in the identity-mapped
+///   region must not be accessed after `dropIdentityMap`.
+///
+/// Returns:
+/// - `!void`: on error, propagation to `kEntry` results in a panic.
 fn kMain(boot_info: boot_defs.BootInfo) !void {
     serial.init(.com1, 115200);
     gdt.init(VAddr.fromInt(@intFromPtr(&__stackguard_lower)));
@@ -117,7 +154,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     );
 
     for (mmap) |entry| {
-        if (entry.type != .free) continue;
+        if (entry.type != .free and entry.type != .acpi) continue;
         const entry_range: Range = .{
             .start = entry.start_paddr,
             .end = entry.start_paddr + entry.num_pages * PAGE4K,
@@ -140,6 +177,9 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     const ksyms_bytes: []const u8 = boot_info.ksyms.ptr[0..boot_info.ksyms.len];
     try zag.panic.initSymbolsFromSlice(ksyms_bytes, bump_alloc_iface.?);
 
+    const xsdp_phys = PAddr.fromInt(boot_info.xsdp_paddr);
+
+    // boot_info is identity mapped, so none of its fields can be accessed after this point
     paging.dropIdentityMap();
 
     const buddy_alloc_start_virt = VAddr.fromPAddr(
@@ -245,6 +285,9 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     );
     const heap_allocator_iface = heap_allocator.allocator();
     _ = heap_allocator_iface;
+
+    const xsdp_virt = VAddr.fromPAddr(xsdp_phys, .physmap);
+    acpi.validateXSDP(xsdp_virt) catch @panic("Invalid xsdp");
 
     cpu.halt();
 }

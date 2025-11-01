@@ -1,5 +1,12 @@
-const std = @import("std");
+//! Serial port driver for x86 PCs (16550-compatible UART).
+//!
+//! Provides minimal initialization and byte/format printing for use during
+//! early kernel bring-up. Defaults to `COM1` unless reconfigured. Intended
+//! for debugging, logging, and panic output before any higher-level I/O
+//! facilities are available.
+
 const cpu = @import("cpu.zig");
+const std = @import("std");
 
 pub const Ports = enum(u16) {
     com1 = 0x3F8,
@@ -25,6 +32,18 @@ const offsets = struct {
 
 var g_port: Ports = .com1;
 
+/// Initializes the given serial port for 8N1 operation at the requested baud.
+///
+/// Arguments:
+/// - `port`: which hardware UART to configure (`com1`/`com2`/`com3`/`com4`).
+/// - `baud`: desired baud rate (e.g., 115200).
+///
+/// Behavior:
+/// - Programs divisor latches, line control, and FIFO settings.
+/// - Sets `g_port` so later writes use this device.
+///
+/// Returns:
+/// - `void`
 pub fn init(port: Ports, baud: u32) void {
     const p = @intFromEnum(port);
     cpu.outb(0b00_000_0_00, p + offsets.lcr);
@@ -41,6 +60,14 @@ pub fn init(port: Ports, baud: u32) void {
     g_port = port;
 }
 
+/// Formats a string and writes it to the current serial port.
+///
+/// Arguments:
+/// - `format`: printf-style format string.
+/// - `args`: arguments substituted into the format.
+///
+/// Panics:
+/// - If the formatted output would exceed the internal buffer (256 bytes).
 pub fn print(
     comptime format: []const u8,
     args: anytype,
@@ -56,6 +83,14 @@ pub fn print(
     }
 }
 
+/// Writes a single byte to the given serial port, blocking until ready.
+///
+/// Arguments:
+/// - `byte`: the byte to transmit.
+/// - `port`: which UART to write to.
+///
+/// Behavior:
+/// - Waits until the transmit holding register is ready before sending.
 pub fn writeByte(
     byte: u8,
     port: Ports,
