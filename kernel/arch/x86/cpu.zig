@@ -29,7 +29,6 @@ pub const Context = packed struct {
     ss: u64,
 };
 
-
 /// Snapshot of general-purpose registers saved/restored by interrupt/exception glue.
 ///
 /// Layout matches the push/pop order used by our stubs so it can be copied
@@ -126,25 +125,25 @@ pub const CpuidFeatureEdx = enum(u32) {
 };
 
 pub const CpuidPowerEdx = enum(u32) {
-    ts              = 1 << 0, // Temperature sensor available
-    fid             = 1 << 1, // Frequency ID control
-    vid             = 1 << 2, // Voltage ID control
-    ttp             = 1 << 3, // Thermal Trip
-    tm              = 1 << 4, // Hardware Thermal Management
-    stc             = 1 << 5, // Software Thermal Control
-    step_100mhz     = 1 << 6, // 100 MHz bus multiplier capability
-    hwp             = 1 << 7, // Hardware P-State
-    constant_tsc    = 1 << 8, // Invariant TSC
+    ts = 1 << 0, // Temperature sensor available
+    fid = 1 << 1, // Frequency ID control
+    vid = 1 << 2, // Voltage ID control
+    ttp = 1 << 3, // Thermal Trip
+    tm = 1 << 4, // Hardware Thermal Management
+    stc = 1 << 5, // Software Thermal Control
+    step_100mhz = 1 << 6, // 100 MHz bus multiplier capability
+    hwp = 1 << 7, // Hardware P-State
+    constant_tsc = 1 << 8, // Invariant TSC
 };
 
 pub const CpuidLeaf = enum(u32) {
-    basic_max       = 0x00000000,
-    basic_features  = 0x00000001,
-    ext_max         = 0x80000000,
-    brand_0         = 0x80000002,
-    brand_1         = 0x80000003,
-    brand_2         = 0x80000004,
-    ext_power       = 0x80000007,
+    basic_max = 0x00000000,
+    basic_features = 0x00000001,
+    ext_max = 0x80000000,
+    brand_0 = 0x80000002,
+    brand_1 = 0x80000003,
+    brand_2 = 0x80000004,
+    ext_power = 0x80000007,
 };
 
 /// Checks whether a given ECX CPUID feature bit is present.
@@ -272,10 +271,10 @@ pub fn getBrandString(allocator: std.mem.Allocator) ![]u8 {
         const c: [4]u8 = @bitCast(r.ecx);
         const d: [4]u8 = @bitCast(r.edx);
 
-        @memcpy(out[i..i+4], &a);
-        @memcpy(out[i+4..i+8], &b);
-        @memcpy(out[i+8..i+12], &c);
-        @memcpy(out[i+12..i+16], &d);
+        @memcpy(out[i .. i + 4], &a);
+        @memcpy(out[i + 4 .. i + 8], &b);
+        @memcpy(out[i + 8 .. i + 12], &c);
+        @memcpy(out[i + 12 .. i + 16], &d);
 
         i += 16;
         leaf += 1;
@@ -396,7 +395,8 @@ pub fn rdmsr(msr: u32) u64 {
     var hi: u32 = 0;
     asm volatile (
         \\rdmsr
-        : [lo] "={eax}" (lo), [hi] "={edx}" (hi)
+        : [lo] "={eax}" (lo),
+          [hi] "={edx}" (hi),
         : [msr] "{ecx}" (msr),
     );
     return (@as(u64, hi) << 32) | lo;
@@ -437,4 +437,18 @@ pub fn enableX2Apic(spurious_vector: u8) void {
     const SVR_APIC_ENABLE: u64 = 1 << 8;
     const svr_value: u64 = SVR_APIC_ENABLE | (@as(u64, spurious_vector));
     wrmsr(X2APIC_SVR, svr_value);
+}
+
+pub fn rdtscp() u64 {
+    var a: u32 = 0;
+    var d: u32 = 0;
+    var c: u32 = 0;
+    asm volatile ("rdtscp"
+        : [a] "={eax}" (a),
+          [d] "={edx}" (d),
+          [c] "={ecx}" (c),
+        :
+        : .{ .memory = true }
+    );
+    return (@as(u64, d) << 32) | a;
 }

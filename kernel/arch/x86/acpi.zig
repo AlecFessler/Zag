@@ -285,3 +285,43 @@ pub const Madt = extern struct {
         return base[0..n];
     }
 };
+
+pub const GenericAddressStruct = extern struct {
+    address_space_id: u8,
+    register_bit_width: u8,
+    register_bit_offset: u8,
+    access_size: u8,
+    address: u64,
+};
+
+pub const HpetTable = extern struct {
+    signature: [4]u8,
+    length: u32,
+    revision: u8,
+    checksum: u8,
+    oem_id: [6]u8,
+    oem_table_id: [8]u8,
+    oem_revision: u32,
+    creator_id: u32,
+    creator_revision: u32,
+
+    event_timer_block_id: u32,
+    base_address: GenericAddressStruct,
+    hpet_number: u8,
+    min_tick_femtosecs: u16,
+    page_protection: u8,
+
+    pub fn fromVAddr(v: VAddr) *HpetTable {
+        @setRuntimeSafety(false);
+        return @ptrFromInt(v.addr);
+    }
+
+    pub fn validate(self: *const HpetTable) !void {
+        if (!std.mem.eql(u8, &self.signature, "HPET")) return validationError.InvalidSignature;
+        var sum: u8 = 0;
+        const bytes = @as([*]const u8, @ptrCast(self))[0..self.length];
+        for (bytes) |b| sum +%= b;
+        if (sum != 0) return validationError.InvalidChecksum;
+        if (self.base_address.address_space_id != 0) return error.InvalidSize;
+    }
+};

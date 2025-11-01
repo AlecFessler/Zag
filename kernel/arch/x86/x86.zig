@@ -13,5 +13,6 @@ pub const Gdt = @import("gdt.zig");
 pub const Idt = @import("idt.zig");
 pub const Interrupts = @import("interrupts.zig");
 pub const Irq = @import("irq.zig");
+pub const Timers = @import("timers.zig");
 pub const Paging = @import("paging.zig");
 pub const Serial = @import("serial.zig");

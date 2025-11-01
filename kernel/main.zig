@@ -17,6 +17,7 @@ const gdt = zag.x86.Gdt;
 const idt = zag.x86.Idt;
 const irq = zag.x86.Irq;
 const paging = zag.x86.Paging;
+const timers = zag.x86.Timers;
 const pmm_mod = zag.memory.PhysicalMemoryManager;
 const range = zag.math.range;
 const serial = zag.x86.Serial;
@@ -358,7 +359,25 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
             }
         }
 
-        if (std.mem.eql(u8, &sdt.signature, "HPET")) {}
+        if (std.mem.eql(u8, &sdt.signature, "HPET")) {
+            const hpet_table = acpi.HpetTable.fromVAddr(sdt_virt);
+            try hpet_table.validate();
+
+            const hpet_paddr = hpet_table.base_address.address;
+            const hpet_phys = PAddr.fromInt(hpet_paddr);
+            const hpet_virt = VAddr.fromPAddr(hpet_phys, .physmap);
+            var hpet = timers.Hpet.init(hpet_virt);
+
+            serial.print("HPET period {d} fs (~{d} Hz), 64-bit {any}\n", .{
+                hpet.period_femtos,
+                hpet.freq_hz,
+                hpet.is_64,
+            });
+
+            const window_ms = 20;
+            const tsc_hz = timers.calibrateTscHz(&hpet, window_ms);
+            serial.print("Calibrated TSC: {d} Hz\n", .{tsc_hz});
+        }
     }
 
     cpu.halt();
