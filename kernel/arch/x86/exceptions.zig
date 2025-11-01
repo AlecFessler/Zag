@@ -47,9 +47,6 @@ pub const Exception = enum(u5) {
     security = 30,
 };
 
-/// ISR handler function pointer signature.
-const IsrHandler = *const fn (*interrupts.InterruptContext) void;
-
 /// Page fault error code parser.
 const PFErrCode = struct {
     present: bool, // bit 0
@@ -75,166 +72,9 @@ const PFErrCode = struct {
     }
 };
 
-/// Human-readable names aligned to `NUM_ISR_ENTRIES`.
-pub const EXCEPTION_STRS: [NUM_ISR_ENTRIES][]const u8 = .{
-    "Divide by Zero",
-    "Single Step (Debugger)",
-    "Non-Maskable Interrupt",
-    "Breakpoint (Debugger)",
-    "Overflow",
-    "Bound Range Exceeded",
-    "Invalid Opcode",
-    "Device Not Available",
-    "Double Fault",
-    "Coprocessor Segment Overrun",
-    "Invalid Task State Segment (TSS)",
-    "Segment Not Present",
-    "General Protection Fault",
-    "Page Fault",
-    "Reserved",
-    "x87 FPU Floating Point Error",
-    "Alignment Check",
-    "Machine Check",
-    "SIMD Floating Point",
-    "Virtualization",
-    "Control Protection",
-    "Reserved",
-    "Reserved",
-    "Reserved",
-    "Reserved",
-    "Reserved",
-    "Hypervisor Injection",
-    "VMM Communication",
-    "Security",
-    "Reserved",
-    "Triple Fault",
-};
-
-/// Count of CPU exception vectors we install (0..31).
 pub const NUM_ISR_ENTRIES = 32;
 
-/// Syscall interrupt vector (user-invocable).
-pub const SYSCALL_INT_VECTOR = 0x80;
-
-/// Table marking which exceptions push an error code (true) versus not (false).
-///
-/// Used to generate per-vector stubs that synthesize a 0 error code when the
-/// CPU does not push one, so the dispatcher can use a single stack layout.
-const PUSHES_ERR = [_]bool{
-    //  0: #DE Divide Error
-    false,
-    //  1: #DB Debug Exception
-    false,
-    //  2: NMI Interrupt
-    false,
-    //  3: #BP Breakpoint
-    false,
-    //  4: #OF Overflow
-    false,
-    //  5: #BR BOUND Range Exceeded
-    false,
-    //  6: #UD Invalid Opcode
-    false,
-    //  7: #NM Device Not Available
-    false,
-
-    //  8: #DF Double Fault
-    true,
-    //  9: Coprocessor Segment Overrun
-    false,
-    // 10: #TS Invalid TSS
-    true,
-    // 11: #NP Segment Not Present
-    true,
-    // 12: #SS Stack Segment Fault
-    true,
-    // 13: #GP General Protection Fault
-    true,
-    // 14: #PF Page Fault
-    true,
-    // 15: #MF x87 FPU Floating-Point Error
-    false,
-
-    // 16: #AC Alignment Check
-    true,
-    // 17: #MC Machine Check
-    false,
-    // 18: #XM SIMD Floating-Point Exception
-    false,
-    // 19: #VE Virtualization Exception
-    false,
-    // 20: #CP Control Protection
-    true,
-    // 21: Reserved
-    false,
-    // 22: Reserved
-    false,
-    // 23: Reserved
-    false,
-
-    // 24: Reserved
-    false,
-    // 25: Reserved
-    false,
-    // 26: Reserved
-    false,
-    // 27: Reserved
-    false,
-    // 28: Reserved
-    false,
-    // 29: Reserved
-    false,
-    // 30: #SX Security Exception
-    true,
-    // 31: Reserved (Triple Fault)
-    false,
-};
-
-/// Per-vector ISR stubs (0..31) generated to match `InterruptContext`.
-const ISR_STUBS: [NUM_ISR_ENTRIES]idt.interruptHandler = blk: {
-    var arr: [NUM_ISR_ENTRIES]idt.interruptHandler = undefined;
-    for (0..NUM_ISR_ENTRIES) |i| {
-        arr[i] = interrupts.getInterruptStub(
-            @intCast(i),
-            PUSHES_ERR[i],
-        );
-    }
-    break :blk arr;
-};
-
-/// Syscall stub used by vector `SYSCALL_INT_VECTOR`.
-const SYSCALL_STUB: idt.interruptHandler = interrupts.getInterruptStub(
-    SYSCALL_INT_VECTOR,
-    false,
-);
-
-/// Optional handlers for exception vectors (null = unregistered).
-var isr_handlers: [NUM_ISR_ENTRIES]?IsrHandler = .{null} ** NUM_ISR_ENTRIES;
-
-/// Optional syscall handler.
-var syscall_handler: ?IsrHandler = null;
-
-/// Routes an ISR or syscall to a registered handler, or panics if missing.
-///
-/// Arguments:
-/// - `ctx`: pointer to the interrupt context from the common stub.
-pub fn dispatchIsr(ctx: *interrupts.InterruptContext) void {
-    std.debug.assert(ctx.int_num < NUM_ISR_ENTRIES or ctx.int_num == SYSCALL_INT_VECTOR);
-
-    if (ctx.int_num == SYSCALL_INT_VECTOR) {
-        if (syscall_handler) |handler| {
-            handler(ctx);
-        } else {
-            @panic("Syscall handler not registered!\n");
-        }
-    } else {
-        if (isr_handlers[ctx.int_num]) |handler| {
-            handler(ctx);
-        } else {
-            @panic("ISR Vector gate not open!\n");
-        }
-    }
-}
+const SYSCALL_INT_VECTOR = 0x80;
 
 /// Installs IDT gates for exception vectors and the syscall vector.
 ///
@@ -249,7 +89,7 @@ pub fn init() void {
         };
         idt.openInterruptGate(
             @intCast(i),
-            ISR_STUBS[i],
+            interrupts.STUBS[i],
             0x08,
             privilege,
             idt.GateType.interrupt_gate,
@@ -257,54 +97,33 @@ pub fn init() void {
     }
 
     idt.openInterruptGate(
-        SYSCALL_INT_VECTOR,
-        SYSCALL_STUB,
+        @intCast(SYSCALL_INT_VECTOR),
+        interrupts.STUBS[SYSCALL_INT_VECTOR],
         0x08,
         idt.PrivilegeLevel.ring_3,
         idt.GateType.interrupt_gate,
     );
 
-    registerIsr(
+    // will register syscall here with
+    // interrupts.registerSoftware(SYSCALL_INT_VECTOR, syscallHandler,);
+    // when the handler exists
+
+    interrupts.registerException(
         @intFromEnum(Exception.divide_by_zero),
         divByZeroHandler,
     );
 
-    registerIsr(
+    interrupts.registerException(
         @intFromEnum(Exception.page_fault),
         pageFaultHandler,
     );
-}
-
-/// Registers an ISR or syscall handler.
-///
-/// Panics if already registered.
-/// - For `SYSCALL_INT_VECTOR`, sets `syscall_handler`.
-/// - Otherwise fills `isr_handlers[isr_num]`.
-///
-/// Arguments:
-/// - `isr_num`: exception vector (0..31) or `SYSCALL_INT_VECTOR`
-/// - `handler`: function pointer to invoke on dispatch
-pub fn registerIsr(isr_num: u8, handler: IsrHandler) void {
-    if (isr_num == SYSCALL_INT_VECTOR) {
-        if (syscall_handler) |_| {
-            @panic("Sycall handler already registered!\n");
-        } else {
-            syscall_handler = handler;
-        }
-    } else {
-        if (isr_handlers[isr_num]) |_| {
-            @panic("ISR handler already registered!\n");
-        } else {
-            isr_handlers[isr_num] = handler;
-        }
-    }
 }
 
 /// Default handler: distinguishes kernel/user divide-by-zero and panics.
 ///
 /// Arguments:
 /// - `ctx`: interrupt context from the common stub
-fn divByZeroHandler(ctx: *interrupts.InterruptContext) void {
+fn divByZeroHandler(ctx: *cpu.Context) void {
     const cpl: u64 = ctx.cs & 3;
     if (cpl == 0) {
         @panic("Divide by zero in kernelspace!");
@@ -326,7 +145,7 @@ fn divByZeroHandler(ctx: *interrupts.InterruptContext) void {
 ///
 /// Arguments:
 /// - `ctx`: interrupt context from the common stub
-fn pageFaultHandler(ctx: *interrupts.InterruptContext) void {
+fn pageFaultHandler(ctx: *cpu.Context) void {
     const pf_err = PFErrCode.from(ctx.err_code);
 
     if (pf_err.rsvd_violation) @panic("Page tables have reserved bits set (RSVD).");

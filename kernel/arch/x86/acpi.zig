@@ -134,7 +134,7 @@ pub const Sdt = extern struct {
 pub const MadtType = enum(u8) {
     local_apic = 0,
     ioapic = 1,
-    iso = 2,
+    int_src_override = 2,
     lapic_nmi = 4,
     lapic_addr_override = 5,
 };
@@ -152,7 +152,7 @@ pub const IoApic = extern struct {
     gsi_base: u32,
 };
 
-pub const Iso = extern struct {
+pub const IntSrcOverride = extern struct {
     bus: u8,
     src: u8,
     gsi: u32,
@@ -167,7 +167,7 @@ pub const LapicAddrOverride = extern struct {
 pub const AnyMadt = union(MadtType) {
     local_apic: LocalApic,
     ioapic: IoApic,
-    iso: Iso,
+    int_src_override: IntSrcOverride,
     lapic_nmi: []const u8,
     lapic_addr_override: LapicAddrOverride,
 };
@@ -189,8 +189,8 @@ pub fn decodeMadt(e: Madt.Entry) AnyMadt {
                 .gsi_base = std.mem.readInt(u32, @ptrCast(p.ptr + 6), .little),
             },
         },
-        .iso => .{
-            .iso = .{
+        .int_src_override => .{
+            .int_src_override = .{
                 .bus = p[0],
                 .src = p[1],
                 .gsi = std.mem.readInt(u32, @ptrCast(p.ptr + 2), .little),

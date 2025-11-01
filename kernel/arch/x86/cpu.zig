@@ -10,6 +10,26 @@ const std = @import("std");
 
 const VAddr = paging.VAddr;
 
+pub const Context = packed struct {
+    /// General registers saved by the common stub.
+    regs: Registers,
+    /// Interrupt vector number (pushed by per-vector stub).
+    int_num: u64,
+    /// Error code (real or synthetic 0 depending on vector).
+    err_code: u64,
+    /// Saved instruction pointer.
+    rip: u64,
+    /// Saved code segment selector.
+    cs: u64,
+    /// Saved RFLAGS.
+    rflags: u64,
+    /// Saved stack pointer.
+    rsp: u64,
+    /// Saved stack segment selector.
+    ss: u64,
+};
+
+
 /// Snapshot of general-purpose registers saved/restored by interrupt/exception glue.
 ///
 /// Layout matches the push/pop order used by our stubs so it can be copied
@@ -392,4 +412,29 @@ pub fn wrmsr(msr: u32, value: u64) void {
           [lo] "{eax}" (lo),
           [hi] "{edx}" (hi),
     );
+}
+
+/// Enables x2APIC mode and software-enables the local APIC via SVR.
+///
+/// - Sets IA32_APIC_BASE.EN (bit 11) and IA32_APIC_BASE.EXTD (bit 10)
+/// - Programs x2APIC SVR MSR with the given spurious vector and APIC enable bit
+pub fn enableX2Apic(spurious_vector: u8) void {
+    std.debug.assert(spurious_vector >= 0x10);
+
+    const feat = cpuid(.basic_features, 0);
+    if (!hasFeatureEdx(feat.edx, .lapic)) @panic("Local APIC not present");
+    if (!hasFeatureEcx(feat.ecx, .x2apic)) @panic("x2APIC not supported");
+
+    const IA32_APIC_BASE: u32 = 0x1B;
+    const APIC_EN: u64 = 1 << 11;
+    const X2APIC_EN: u64 = 1 << 10;
+
+    var apic_base = rdmsr(IA32_APIC_BASE);
+    apic_base |= (APIC_EN | X2APIC_EN);
+    wrmsr(IA32_APIC_BASE, apic_base);
+
+    const X2APIC_SVR: u32 = 0x80F;
+    const SVR_APIC_ENABLE: u64 = 1 << 8;
+    const svr_value: u64 = SVR_APIC_ENABLE | (@as(u64, spurious_vector));
+    wrmsr(X2APIC_SVR, svr_value);
 }

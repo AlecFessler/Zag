@@ -12,9 +12,10 @@ const zag = @import("zag");
 
 const acpi = zag.x86.Acpi;
 const cpu = zag.x86.Cpu;
+const exceptions = zag.x86.Exceptions;
 const gdt = zag.x86.Gdt;
 const idt = zag.x86.Idt;
-const isr = zag.x86.Isr;
+const irq = zag.x86.Irq;
 const paging = zag.x86.Paging;
 const pmm_mod = zag.memory.PhysicalMemoryManager;
 const range = zag.math.range;
@@ -94,9 +95,11 @@ export fn kEntry(boot_info: boot_defs.BootInfo) callconv(.{ .x86_64_sysv = .{} }
 fn kMain(boot_info: boot_defs.BootInfo) !void {
     serial.init(.com1, 115200);
     serial.print("Booting Zag kernel...\n", .{});
+
     gdt.init(VAddr.fromInt(@intFromPtr(&__stackguard_lower)));
     idt.init();
-    isr.init();
+    exceptions.init();
+    irq.init();
 
     var mmap_entries_array: [boot_defs.MAX_MMAP_ENTRIES]boot_defs.MMapEntry = undefined;
     const mmap = boot_defs.collapseMmap(
@@ -293,9 +296,9 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         vendor_str,
     });
 
+    cpu.enableX2Apic(irq.SPURIOUS_INTERRUPT_VECTOR);
+
     const feat = cpu.cpuid(.basic_features, 0);
-    if (!cpu.hasFeatureEdx(feat.edx, .lapic)) @panic("Local APIC not present");
-    if (!cpu.hasFeatureEcx(feat.ecx, .x2apic)) @panic("x2APIC not supported");
     if (!cpu.hasFeatureEcx(feat.ecx, .tsc_deadline)) @panic("TSC-deadline not supported");
 
     const max_ext = cpu.cpuid(.ext_max, 0).eax;
@@ -327,21 +330,27 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
             while (madt_iter.next()) |e| {
                 const entry = acpi.decodeMadt(e);
                 switch (entry) {
-                    .local_apic => |x| serial.print("cpu {d} apic_id {d} flags {x}\n", .{
-                        x.processor_uid,
-                        x.apic_id,
-                        x.flags,
-                    }),
-                    .ioapic => |x| serial.print("ioapic id {d} addr {x} gsi_base {d}\n", .{
-                        x.ioapic_id,
-                        x.ioapic_addr,
-                        x.gsi_base,
-                    }),
-                    .iso => |x| serial.print("iso bus {d} src {d} -> gsi {d}\n", .{
-                        x.bus,
-                        x.src,
-                        x.gsi,
-                    }),
+                    .local_apic => |x| {
+                        serial.print("cpu {d} apic_id {d} flags {x}\n", .{
+                            x.processor_uid,
+                            x.apic_id,
+                            x.flags,
+                        });
+                    },
+                    .ioapic => |x| {
+                        serial.print("ioapic id {d} addr {x} gsi_base {d}\n", .{
+                            x.ioapic_id,
+                            x.ioapic_addr,
+                            x.gsi_base,
+                        });
+                    },
+                    .int_src_override => |x| {
+                        serial.print("interrupt source override bus {d} src {d} -> gsi {d}\n", .{
+                            x.bus,
+                            x.src,
+                            x.gsi,
+                        });
+                    },
                     .lapic_nmi => |_| {},
                     .lapic_addr_override => |x| {
                         lapic_base = x.addr;
