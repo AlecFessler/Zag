@@ -1,30 +1,55 @@
 //! IRQ registration and gate setup.
 //!
 //! Provides a tiny registry for level-triggered IRQ lines and installs the
-//! corresponding IDT gates after the CPU exception vectors. Dispatch is a
-//! stub for now and will panic until implemented.
-
-const std = @import("std");
+//! corresponding IDT gates after the CPU exception vectors. A spurious-IRQ
+//! software handler is registered and tracked via a simple counter.
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - None.
+//!
+//! ## Constants
+//! - `NUM_IRQ_ENTRIES` – number of legacy IRQ lines exposed by PIC/APIC shim.
+//!
+//! ## Variables
+//! - `spurious_interrupts` – global counter of spurious interrupts observed.
+//!
+//! ## Functions
+//! - `init` – install IRQ IDT gates and register software/LAPIC handlers.
+//! - `spuriousHandler` – increment the spurious interrupt counter (private).
 
 const cpu = @import("cpu.zig");
 const exceptions = @import("exceptions.zig");
-const interrupts = @import("interrupts.zig");
 const idt = @import("idt.zig");
+const interrupts = @import("interrupts.zig");
 const serial = @import("serial.zig");
-
+const std = @import("std");
 const zag = @import("zag");
+
 const sched = zag.sched.scheduler;
 
-/// Architectural IRQ lines exposed through the legacy PIC/APIC shim.
+/// Number of legacy IRQ lines exposed by the PIC/APIC shim.
 const NUM_IRQ_ENTRIES = 16;
 
+/// Global counter of spurious interrupts observed.
 var spurious_interrupts: u64 = 0;
 
-/// Installs IDT gates for IRQ vectors.
+/// Summary:
+/// Installs IDT gates for legacy IRQ vectors and registers the spurious and
+/// scheduler handlers with the interrupt dispatcher.
 ///
-/// Gates are opened at `isr.NUM_ISR_ENTRIES + irq` with kernel privilege,
-/// using the generated naked stubs that conform to our `Context`
-/// stack layout.
+/// Arguments:
+/// - None.
+///
+/// Returns:
+/// - void.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn init() void {
     const offset = exceptions.NUM_ISR_ENTRIES;
     for (offset..offset + NUM_IRQ_ENTRIES) |i| {
@@ -64,6 +89,20 @@ pub fn init() void {
     );
 }
 
+/// Summary:
+/// Software handler for spurious interrupts; increments the global counter.
+///
+/// Arguments:
+/// - ctx: Pointer to the interrupt context captured by the common stub.
+///
+/// Returns:
+/// - void.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 fn spuriousHandler(ctx: *cpu.Context) void {
     _ = ctx;
     spurious_interrupts += 1;

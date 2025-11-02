@@ -1,15 +1,45 @@
 //! Stack-based freelist for fixed-capacity slices.
 //!
-//! Simple LIFO pool backed by a caller-provided slice of `T`. Useful for very
+//! Simple LIFO pool backed by a caller-provided slice of `T`. Useful on very
 //! hot paths where you want predictable O(1) push/pop with no allocation.
 //!
 //! Notes:
 //! - Capacity is fixed by the provided slice length.
 //! - `top` starts at `-1` (empty), grows toward `stack.len - 1`.
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - `StackFreeList(T).Self` — concrete freelist type for element type `T`.
+//!
+//! ## Constants
+//! - None.
+//!
+//! ## Variables
+//! - None.
+//!
+//! ## Functions
+//! - `StackFreeList` — factory returning a freelist type specialized for `T`.
+//! - `StackFreeList(T).init` — construct an empty freelist over a backing slice.
+//! - `StackFreeList(T).pop` — pop the most recently pushed item (LIFO).
+//! - `StackFreeList(T).push` — push an item if capacity remains.
 
 const std = @import("std");
 
-/// Factory: returns a freelist type specialized for `T`.
+/// Summary:
+/// Factory that returns a freelist type specialized for `T`.
+///
+/// Arguments:
+/// - `T`: Element type stored in the freelist.
+///
+/// Returns:
+/// - `type`: A struct type `StackFreeList(T).Self` implementing LIFO push/pop over a fixed slice.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn StackFreeList(comptime T: type) type {
     return struct {
         const Self = @This();
@@ -18,13 +48,22 @@ pub fn StackFreeList(comptime T: type) type {
         stack: []T,
         top: isize,
 
-        /// Initializes the freelist over `slice`.
+        /// Function: `StackFreeList(T).init`
+        ///
+        /// Summary:
+        /// Initialize the freelist over `slice`, starting empty (`top = -1`).
         ///
         /// Arguments:
-        /// - `slice`: backing storage; its length is the fixed capacity.
+        /// - `slice`: Backing storage; its length fixes maximum capacity.
         ///
         /// Returns:
-        /// - A `Self` with `top = -1` (empty).
+        /// - `Self`: Newly initialized freelist.
+        ///
+        /// Errors:
+        /// - None.
+        ///
+        /// Panics:
+        /// - None.
         pub fn init(slice: []T) Self {
             return .{
                 .stack = slice,
@@ -32,13 +71,22 @@ pub fn StackFreeList(comptime T: type) type {
             };
         }
 
-        /// Pops the most-recently pushed item.
+        /// Function: `StackFreeList(T).pop`
+        ///
+        /// Summary:
+        /// Pop the most-recently pushed item (LIFO) if present.
         ///
         /// Arguments:
-        /// - `self`: freelist instance.
+        /// - `self`: Freelist instance.
         ///
         /// Returns:
-        /// - `T` on success, or `null` if the list is empty.
+        /// - `?T`: Popped value on success, or `null` if empty.
+        ///
+        /// Errors:
+        /// - None.
+        ///
+        /// Panics:
+        /// - None.
         pub fn pop(self: *Self) ?T {
             std.debug.assert(self.top < self.stack.len);
             if (self.top == -1) return null;
@@ -49,14 +97,26 @@ pub fn StackFreeList(comptime T: type) type {
             return addr;
         }
 
-        /// Pushes an item onto the stack if capacity remains.
+        /// Function: `StackFreeList(T).push`
+        ///
+        /// Summary:
+        /// Push an item onto the stack if capacity remains.
         ///
         /// Arguments:
-        /// - `self`: freelist instance.
-        /// - `addr`: value to push.
+        /// - `self`: Freelist instance.
+        /// - `addr`: Value to push.
+        ///
+        /// Returns:
+        /// - `void`.
+        ///
+        /// Errors:
+        /// - None.
+        ///
+        /// Panics:
+        /// - None.
         ///
         /// Notes:
-        /// - If already at capacity, `top` is not advanced.
+        /// - When at capacity, the top index is not advanced.
         pub fn push(self: *Self, addr: T) void {
             std.debug.assert(self.top >= -1);
             if (self.top + 1 < self.stack.len) {

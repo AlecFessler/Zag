@@ -3,6 +3,24 @@
 //! Monotonic virtual-address reserver over `[start_vaddr, end_vaddr)` with
 //! alignment support and a small fixed ledger of reservations. Intended for
 //! handing out stable VAs for subsystems (heaps, stacks, mappings).
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - `VmmErrors` — error set returned by reservation operations.
+//! - `VmmAllocation` — recorded reservation: base VAddr and byte size.
+//! - `VirtualMemoryManager` — monotonic VA reserver with a fixed-size ledger.
+//!
+//! ## Constants
+//! - `MAX_RESERVATIONS` — maximum number of tracked reservations.
+//!
+//! ## Variables
+//! - `global_vmm` — optional global VMM for early subsystems/page faults.
+//!
+//! ## Functions
+//! - `VirtualMemoryManager.init` — construct a VMM over a VA range.
+//! - `VirtualMemoryManager.isValidVaddr` — check if an address lies in any reservation.
+//! - `VirtualMemoryManager.reserve` — reserve `size` bytes at next aligned VA.
 
 const std = @import("std");
 const zag = @import("zag");
@@ -40,14 +58,23 @@ pub const VirtualMemoryManager = struct {
     vmm_allocations: [MAX_RESERVATIONS]VmmAllocation = undefined,
     vmm_allocations_idx: u32 = 0,
 
-    /// Initializes a VMM over `[start_vaddr, end_vaddr)`.
+    /// Function: `VirtualMemoryManager.init`
+    ///
+    /// Summary:
+    /// Initialize a VMM over `[start_vaddr, end_vaddr)`, starting with no reservations.
     ///
     /// Arguments:
-    /// - `start_vaddr`: start of the reservable VA range (inclusive).
-    /// - `end_vaddr`: end of the reservable VA range (exclusive).
+    /// - `start_vaddr`: Start of the reservable VA range (inclusive).
+    /// - `end_vaddr`: End of the reservable VA range (exclusive).
     ///
     /// Returns:
-    /// - A `VirtualMemoryManager` with `free_vaddr = start_vaddr`.
+    /// - `VirtualMemoryManager`: Instance with `free_vaddr = start_vaddr`.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     pub fn init(start_vaddr: VAddr, end_vaddr: VAddr) VirtualMemoryManager {
         std.debug.assert(end_vaddr.addr > start_vaddr.addr);
         return .{
@@ -57,14 +84,23 @@ pub const VirtualMemoryManager = struct {
         };
     }
 
-    /// Checks whether `vaddr` lies within any recorded reservation.
+    /// Function: `VirtualMemoryManager.isValidVaddr`
+    ///
+    /// Summary:
+    /// Check whether `vaddr` lies within any recorded reservation.
     ///
     /// Arguments:
     /// - `self`: VMM instance.
-    /// - `vaddr`: virtual address to test.
+    /// - `vaddr`: Virtual address to test.
     ///
     /// Returns:
-    /// - `true` if `vaddr` is inside a reserved span; `false` otherwise.
+    /// - `bool`: `true` if inside a reserved span; `false` otherwise.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     pub fn isValidVaddr(self: *VirtualMemoryManager, vaddr: VAddr) bool {
         var i: u32 = 0;
         while (i < self.vmm_allocations_idx) : (i += 1) {
@@ -75,20 +111,26 @@ pub const VirtualMemoryManager = struct {
         return false;
     }
 
-    /// Reserves `size` bytes at the next aligned free VA.
+    /// Function: `VirtualMemoryManager.reserve`
+    ///
+    /// Summary:
+    /// Reserve `size` bytes at the next aligned free VA and record it in the ledger.
     ///
     /// Arguments:
     /// - `self`: VMM instance.
-    /// - `size`: size in bytes to reserve (must be > 0).
-    /// - `alignment`: alignment for the reservation base.
+    /// - `size`: Size in bytes to reserve (must be > 0).
+    /// - `alignment`: Alignment for the reservation base.
     ///
     /// Returns:
-    /// - `VAddr` base of the reserved span on success.
+    /// - `VAddr`: Base of the reserved span on success.
     ///
     /// Errors:
-    /// - `error.TooManyReservations`: ledger is full.
-    /// - `error.InvalidSize`: size is zero.
-    /// - `error.OutOfAddressSpace`: range end would exceed `end_vaddr`.
+    /// - `error.TooManyReservations`: Ledger is full.
+    /// - `error.InvalidSize`: `size == 0`.
+    /// - `error.OutOfAddressSpace`: Reservation would exceed `end_vaddr`.
+    ///
+    /// Panics:
+    /// - None.
     pub fn reserve(self: *VirtualMemoryManager, size: u64, alignment: std.mem.Alignment) !VAddr {
         if (self.vmm_allocations_idx >= MAX_RESERVATIONS) return error.TooManyReservations;
         if (size == 0) return error.InvalidSize;

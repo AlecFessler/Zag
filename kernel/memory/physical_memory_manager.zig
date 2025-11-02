@@ -3,37 +3,70 @@
 //! Thin wrapper over a backing `std.mem.Allocator` to represent the PMM
 //! until a real frame allocator lands. Exposes a `std.mem.Allocator`
 //! interface for early boot and low-level subsystems.
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - `PhysicalMemoryManager` — PMM that delegates all ops to a backing allocator.
+//!
+//! ## Constants
+//! - None.
+//!
+//! ## Variables
+//! - `global_pmm` — optional process-wide PMM handle for low-level users.
+//!
+//! ## Functions
+//! - `PhysicalMemoryManager.init` — construct a PMM over a delegate allocator.
+//! - `PhysicalMemoryManager.allocator` — expose a `std.mem.Allocator` vtable.
+//! - `PhysicalMemoryManager.alloc` — allocator vtable `alloc` entry; forwards to delegate.
+//! - `PhysicalMemoryManager.resize` — allocator vtable `resize`; unsupported (traps).
+//! - `PhysicalMemoryManager.remap` — allocator vtable `remap`; unsupported (traps).
+//! - `PhysicalMemoryManager.free` — allocator vtable `free`; forwards to delegate.
 
 const std = @import("std");
 
-/// Physical memory manager backed by a delegate allocator.
-///
-/// Fields:
-/// - `backing_allocator`: allocator used for physical allocations.
+/// PMM that delegates all allocations to a backing allocator.
 pub const PhysicalMemoryManager = struct {
     backing_allocator: std.mem.Allocator,
 
-    /// Initializes a PMM that delegates to `backing_allocator`.
+    /// Function: `PhysicalMemoryManager.init`
+    ///
+    /// Summary:
+    /// Construct a `PhysicalMemoryManager` that delegates to `backing_allocator`.
     ///
     /// Arguments:
-    /// - `backing_allocator`: allocator to fulfill PMM requests.
+    /// - `backing_allocator`: Allocator used to fulfill PMM requests.
     ///
     /// Returns:
-    /// - A `PhysicalMemoryManager` instance.
+    /// - `PhysicalMemoryManager`: Newly initialized PMM instance.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     pub fn init(backing_allocator: std.mem.Allocator) PhysicalMemoryManager {
         return .{
             .backing_allocator = backing_allocator,
         };
     }
 
-    /// Returns a `std.mem.Allocator` interface backed by this PMM.
+    /// Function: `PhysicalMemoryManager.allocator`
+    ///
+    /// Summary:
+    /// Produce a `std.mem.Allocator` interface whose vtable forwards to this PMM.
     ///
     /// Arguments:
-    /// - `self`: PMM instance.
+    /// - `self`: Pointer to the PMM instance.
     ///
     /// Returns:
-    /// - A `std.mem.Allocator` whose vtable dispatches to this PMM.
-    ///   `resize` and `remap` are unsupported (trap).
+    /// - `std.mem.Allocator`: Vtable that dispatches to `alloc`, `free`, and traps on `resize`/`remap`.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     pub fn allocator(self: *PhysicalMemoryManager) std.mem.Allocator {
         return .{
             .ptr = self,
@@ -46,16 +79,25 @@ pub const PhysicalMemoryManager = struct {
         };
     }
 
-    /// `std.mem.Allocator.alloc` entry point.
+    /// Function: `PhysicalMemoryManager.alloc`
+    ///
+    /// Summary:
+    /// Vtable entry for `alloc`; forwards to the backing allocator's `rawAlloc`.
     ///
     /// Arguments:
-    /// - `ptr`: opaque pointer to the `PhysicalMemoryManager`.
-    /// - `len`: size in bytes to allocate.
-    /// - `alignment`: required alignment.
-    /// - `ret_addr`: caller return address (for diagnostics).
+    /// - `ptr`: Opaque pointer to `PhysicalMemoryManager` (`self`).
+    /// - `len`: Number of bytes to allocate.
+    /// - `alignment`: Required alignment for the allocation.
+    /// - `ret_addr`: Caller return address (for diagnostics/accounting).
     ///
     /// Returns:
-    /// - Pointer to `len` bytes on success, or `null` on OOM.
+    /// - `?[*]u8`: Pointer to `len` bytes on success, or `null` on OOM.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     fn alloc(
         ptr: *anyopaque,
         len: usize,
@@ -66,9 +108,26 @@ pub const PhysicalMemoryManager = struct {
         return self.backing_allocator.rawAlloc(len, alignment, ret_addr);
     }
 
-    /// `std.mem.Allocator.resize` entry point (unsupported).
+    /// Function: `PhysicalMemoryManager.resize`
     ///
-    /// Always traps; PMM does not support in-place growth/shrink.
+    /// Summary:
+    /// Vtable entry for `resize`; unsupported for the PMM and traps if called.
+    ///
+    /// Arguments:
+    /// - `ptr`: Opaque pointer to `PhysicalMemoryManager` (unused).
+    /// - `memory`: Previously allocated memory slice (unused).
+    /// - `alignment`: Alignment of `memory` (unused).
+    /// - `new_len`: Requested new length (unused).
+    /// - `ret_addr`: Caller return address (unused).
+    ///
+    /// Returns:
+    /// - `bool`: Never returns (traps).
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - Always panics (unreachable) because resize is unsupported.
     fn resize(
         ptr: *anyopaque,
         memory: []u8,
@@ -84,9 +143,26 @@ pub const PhysicalMemoryManager = struct {
         unreachable;
     }
 
-    /// `std.mem.Allocator.remap` entry point (unsupported).
+    /// Function: `PhysicalMemoryManager.remap`
     ///
-    /// Always traps; PMM does not support remapping.
+    /// Summary:
+    /// Vtable entry for `remap`; unsupported for the PMM and traps if called.
+    ///
+    /// Arguments:
+    /// - `ptr`: Opaque pointer to `PhysicalMemoryManager` (unused).
+    /// - `memory`: Previously allocated memory slice (unused).
+    /// - `alignment`: Alignment of `memory` (unused).
+    /// - `new_len`: Requested new length (unused).
+    /// - `ret_addr`: Caller return address (unused).
+    ///
+    /// Returns:
+    /// - `?[*]u8`: Never returns (traps).
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - Always panics (unreachable) because remap is unsupported.
     fn remap(
         ptr: *anyopaque,
         memory: []u8,
@@ -102,13 +178,25 @@ pub const PhysicalMemoryManager = struct {
         unreachable;
     }
 
-    /// `std.mem.Allocator.free` entry point.
+    /// Function: `PhysicalMemoryManager.free`
+    ///
+    /// Summary:
+    /// Vtable entry for `free`; forwards to the backing allocator's `rawFree`.
     ///
     /// Arguments:
-    /// - `ptr`: opaque pointer to the `PhysicalMemoryManager`.
-    /// - `buf`: slice previously returned by `alloc`.
-    /// - `alignment`: alignment used at allocation time.
-    /// - `ret_addr`: caller return address (for diagnostics).
+    /// - `ptr`: Opaque pointer to `PhysicalMemoryManager` (`self`).
+    /// - `buf`: Slice previously returned by `alloc`.
+    /// - `alignment`: Alignment used at allocation time.
+    /// - `ret_addr`: Caller return address (for diagnostics/accounting).
+    ///
+    /// Returns:
+    /// - None.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     fn free(
         ptr: *anyopaque,
         buf: []u8,
@@ -120,6 +208,5 @@ pub const PhysicalMemoryManager = struct {
     }
 };
 
-/// Global physical memory manager instance.
-/// Used primarily by the page fault handler and low-level allocators.
+/// Optional process-wide PMM handle for low-level users.
 pub var global_pmm: ?PhysicalMemoryManager = null;

@@ -4,6 +4,24 @@
 //! including a compacted memory map. `collapseMmap` coalesces adjacent UEFI
 //! descriptors into simple categories (`free`, `acpi`, `reserved`) to guide
 //! early mapping decisions and seed the buddy allocator with usable physmem.
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - `MMapEntryType` — simplified memory class used post-compaction.
+//! - `BootInfo` — payload handed from loader to kernel (XSDP, mmap, ksyms).
+//! - `MMapEntry` — one compacted memory-map run (base, pages, type).
+//!
+//! ## Constants
+//! - `MAX_MMAP_ENTRIES` — upper bound on compacted entries produced.
+//!
+//! ## Variables
+//! - None.
+//!
+//! ## Functions
+//! - `bootproto.collapseMmap` — compact and coalesce the UEFI memory map.
+//! - `bootproto.findXSDP` — locate ACPI 2.0+ RSDP (XSDP) via UEFI system table.
+//! - `bootproto.guidEq` — compare two GUIDs for exact equality.
 
 const builtin = @import("builtin");
 const mmap = @import("mmap.zig");
@@ -15,11 +33,6 @@ const SystemTable = uefi.tables.SystemTable;
 const uefi = std.os.uefi;
 
 /// Simplified memory classification used by the kernel after compaction.
-///
-/// Variants:
-/// - `acpi`: ACPI reclaimable regions (keep mapped/accessible).
-/// - `free`: allocatable RAM candidates for the buddy allocator.
-/// - `reserved`: everything else (runtime/code/data tables, MMIO, etc.).
 pub const MMapEntryType = enum {
     acpi,
     free,
@@ -27,11 +40,6 @@ pub const MMapEntryType = enum {
 };
 
 /// Payload handed off from the loader to the kernel at entry.
-///
-/// Fields:
-/// - `xsdp_paddr`: physical address of the ACPI RSDP/XSDP.
-/// - `mmap`: raw UEFI memory map snapshot (before compaction).
-/// - `ksyms`: bytes of `kernel.map` for symbolization during early boot.
 pub const BootInfo = extern struct {
     xsdp_paddr: u64,
     mmap: mmap.MMap,
@@ -41,12 +49,7 @@ pub const BootInfo = extern struct {
     },
 };
 
-/// A compacted memory map entry.
-///
-/// Fields:
-/// - `start_paddr`: starting physical address (inclusive).
-/// - `num_pages`: number of 4 KiB pages in this run.
-/// - `type`: simplified class for kernel policy.
+/// One compacted memory map entry (base address, page count, class).
 pub const MMapEntry = struct {
     start_paddr: u64,
     num_pages: u64,
@@ -56,23 +59,26 @@ pub const MMapEntry = struct {
 /// Maximum number of compacted entries `collapseMmap` will emit.
 pub const MAX_MMAP_ENTRIES = 256;
 
-/// Collapse and coalesce the UEFI memory map into simplified runs.
+/// Function: `bootproto.collapseMmap`
 ///
-/// Behavior:
-/// - Iterates UEFI descriptors in order, classifies them into `MMapEntryType`.
-/// - Adjacent descriptors with the same classification are merged into one run.
-/// - Assumes 4 KiB page granularity when computing extents.
+/// Summary:
+/// Collapse and coalesce the UEFI memory map into simplified runs of
+/// `{acpi, free, reserved}` at 4 KiB granularity, merging adjacent equal-type
+/// descriptors into single spans.
 ///
 /// Arguments:
-/// - `map`: pointer to the raw UEFI memory map (`mmap.MMap`).
-/// - `mmap_entries`: output buffer with capacity `MAX_MMAP_ENTRIES`.
+/// - `map`: Pointer to the raw UEFI memory map (`*const mmap.MMap`).
+/// - `mmap_entries`: Output buffer with capacity `MAX_MMAP_ENTRIES`.
 ///
 /// Returns:
-/// - Slice view over the filled prefix of `mmap_entries`.
+/// - `[]MMapEntry`: Slice view of the filled prefix in `mmap_entries`.
+///
+/// Errors:
+/// - None.
 ///
 /// Panics:
-/// - Asserts that `map.num_descriptors <= MAX_MMAP_ENTRIES`.
-/// - Asserts capacity when emitting a new run.
+/// - Asserts `map.num_descriptors <= MAX_MMAP_ENTRIES`.
+/// - Asserts capacity before emitting a new run.
 pub fn collapseMmap(
     map: *const mmap.MMap,
     mmap_entries: *[MAX_MMAP_ENTRIES]MMapEntry,
@@ -119,15 +125,23 @@ pub fn collapseMmap(
     return mmap_entries[0..idx];
 }
 
-/// Find the ACPI 2.0+ RSDP (XSDP) physical address from the UEFI system table.
+/// Function: `bootproto.findXSDP`
 ///
-/// Scans `SystemTable.ConfigurationTable` for `acpi_20_table_guid`.
+/// Summary:
+/// Scan `UEFI SystemTable.ConfigurationTable` for `acpi_20_table_guid` and
+/// return the physical address of the ACPI XSDP (RSDP 2.0+).
+///
+/// Arguments:
+/// - None.
 ///
 /// Returns:
-/// - Physical address (`u64`) of the XSDP on success.
+/// - `u64`: Physical address of the XSDP on success.
 ///
 /// Errors:
-/// - `uefi.Error.Aborted` if no matching configuration table is present.
+/// - `uefi.Error.Aborted`: No matching configuration table is present.
+///
+/// Panics:
+/// - None.
 pub fn findXSDP() !u64 {
     for (0..uefi.system_table.number_of_table_entries) |i| {
         const ct = uefi.system_table.configuration_table[i];
@@ -141,13 +155,23 @@ pub fn findXSDP() !u64 {
     return uefi.Error.Aborted;
 }
 
-/// GUID equality helper.
+/// Function: `bootproto.guidEq`
+///
+/// Summary:
+/// Compare two GUIDs for exact field-wise equality.
 ///
 /// Arguments:
-/// - `a`, `b`: GUIDs to compare.
+/// - `a`: First GUID.
+/// - `b`: Second GUID.
 ///
 /// Returns:
-/// - `true` if all fields match; `false` otherwise.
+/// - `bool`: `true` if all fields are equal; `false` otherwise.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 fn guidEq(a: Guid, b: Guid) bool {
     return a.time_low == b.time_low and a.time_mid == b.time_mid and a.time_high_and_version == b.time_high_and_version and a.clock_seq_high_and_reserved == b.clock_seq_high_and_reserved and a.clock_seq_low == b.clock_seq_low and std.mem.eql(
         u8,

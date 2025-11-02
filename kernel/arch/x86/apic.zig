@@ -1,5 +1,31 @@
+//! x2APIC MSR helpers and LAPIC timer control.
+//!
+//! Provides symbolic MSR indices for x2APIC registers and a small set of
+//! utilities to arm/cancel the IA32_TSC_DEADLINE timer, send end-of-interrupt
+//! (EOI), mask the legacy 8259 PIC, and program the LAPIC timer in TSC-deadline
+//! mode. Designed to be freestanding and safe to invoke during early bring-up.
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - `X2ApicMsr` – symbolic MSR indices for x2APIC registers.
+//!
+//! ## Constants
+//! - `tsc_deadline_msr` – MSR number for `IA32_TSC_DEADLINE`.
+//!
+//! ## Variables
+//! - None.
+//!
+//! ## Functions
+//! - `armTscDeadline` – write a TSC deadline to IA32_TSC_DEADLINE.
+//! - `cancelTscDeadline` – cancel any pending TSC deadline (write zero).
+//! - `disablePic` – mask both 8259 PICs to avoid spurious IRQs.
+//! - `endOfInterrupt` – write EOI to x2APIC EOI MSR.
+//! - `programLocalApicTimerTscDeadline` – enable LAPIC timer in TSC-deadline mode with a vector.
+
 const cpu = @import("cpu.zig");
 
+/// Symbolic MSR indices for x2APIC registers.
 pub const X2ApicMsr = enum(u32) {
     local_apic_id_register = 0x802,
     local_apic_version_register = 0x803,
@@ -56,30 +82,110 @@ pub const X2ApicMsr = enum(u32) {
     self_interrupt_register = 0x83f,
 };
 
+/// MSR number for `IA32_TSC_DEADLINE`.
 pub const tsc_deadline_msr: u32 = 0x6e0;
 
+/// Summary:
+/// Arms the LAPIC TSC-deadline timer by writing `deadline_tsc` to `IA32_TSC_DEADLINE`.
+///
+/// Arguments:
+/// - `deadline_tsc`: Absolute TSC value at which the timer interrupt should fire.
+///
+/// Returns:
+/// - `void`.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn armTscDeadline(deadline_tsc: u64) void {
+    cpu.wrmsr(tsc_deadline_msr, deadline_tsc);
+}
+
+/// Summary:
+/// Cancels any pending TSC-deadline interrupt by writing zero to `IA32_TSC_DEADLINE`.
+///
+/// Arguments:
+/// - None.
+///
+/// Returns:
+/// - `void`.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn cancelTscDeadline() void {
+    cpu.wrmsr(tsc_deadline_msr, 0);
+}
+
+/// Summary:
+/// Disables the legacy 8259 PICs by masking all interrupts on both controllers.
+///
+/// Arguments:
+/// - None.
+///
+/// Returns:
+/// - `void`.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn disablePic() void {
     cpu.outb(0xFF, 0x21);
     cpu.outb(0xFF, 0xA1);
 }
 
+/// Summary:
+/// Signals End-Of-Interrupt (EOI) to the local x2APIC.
+///
+/// Arguments:
+/// - None.
+///
+/// Returns:
+/// - `void`.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn endOfInterrupt() void {
+    cpu.wrmsr(@intFromEnum(X2ApicMsr.end_of_interrupt_register), 0);
+}
+
+/// Summary:
+/// Programs the LAPIC timer into TSC-deadline mode and sets the interrupt vector.
+///
+/// Arguments:
+/// - `vector`: Interrupt vector (0–255) to be delivered when the deadline expires.
+///
+/// Returns:
+/// - `void`.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - Panics if the CPU does not support x2APIC TSC-deadline mode or invariant TSC.
 pub fn programLocalApicTimerTscDeadline(vector: u8) void {
+    const feat = cpu.cpuid(.basic_features, 0);
+    if (!cpu.hasFeatureEcx(feat.ecx, .tsc_deadline)) @panic("TSC-deadline not supported");
+
+    const max_ext = cpu.cpuid(.ext_max, 0).eax;
+    if (max_ext < @intFromEnum(cpu.CpuidLeaf.ext_max)) @panic("Invariant TSC not supported");
+
+    const pwr = cpu.cpuid(.ext_power, 0);
+    if (!cpu.hasPowerFeatureEdx(pwr.edx, .constant_tsc)) @panic("Invariant TSC not supported");
+
     const TIMER_MODE_LSB: u6 = 17;
     const TSC_DEADLINE: u2 = 0b10;
 
     var lvt: u64 = vector;
     lvt |= (@as(u64, TSC_DEADLINE) << TIMER_MODE_LSB);
     cpu.wrmsr(@intFromEnum(X2ApicMsr.local_vector_table_timer_register), lvt);
-}
-
-pub fn armTscDeadline(deadline_tsc: u64) void {
-    cpu.wrmsr(tsc_deadline_msr, deadline_tsc);
-}
-
-pub fn cancelTscDeadline() void {
-    cpu.wrmsr(tsc_deadline_msr, 0);
-}
-
-pub fn endOfInterrupt() void {
-    cpu.wrmsr(@intFromEnum(X2ApicMsr.end_of_interrupt_register), 0);
 }

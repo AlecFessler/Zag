@@ -1,14 +1,48 @@
 //! GDT and TSS setup for x86-64.
 //!
-//! Defines the kernel and user segment descriptors, constructs the GDT,
-//! installs a TSS, and loads them via `lgdt`/`ltr`. Used during early bring-up
-//! and whenever the bootstrap CPU’s stack selector (`rsp0`) must be updated.
+//! Defines the kernel/user segment descriptors, constructs the GDT, installs a
+//! 64-bit TSS, and loads them via `lgdt`/`ltr`. Intended for early bring-up and
+//! later updates of the bootstrap CPU’s `rsp0`.
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - `GdtPtr` – GDTR pointer used by `lgdt`.
+//! - `Tss` – minimal 64-bit Task State Segment used by the kernel.
+//! - `GdtEntry` – raw descriptor layout for code/data/system entries (internal).
+//!
+//! ## Constants
+//! - `KERNEL_CODE_OFFSET` – selector for kernel code segment.
+//! - `KERNEL_DATA_OFFSET` – selector for kernel data segment.
+//! - `KERNEL_SEGMENT_CODE` – predefined kernel RX code descriptor.
+//! - `KERNEL_SEGMENT_DATA` – predefined kernel RW data descriptor.
+//! - `NULL_OFFSET` – selector for the null descriptor (index 0).
+//! - `NULL_SEGMENT` – null descriptor placeholder.
+//! - `TSS_OFFSET` – selector for the TSS system descriptor (low entry).
+//! - `USER_CODE_OFFSET` – selector for user code segment.
+//! - `USER_DATA_OFFSET` – selector for user data segment.
+//! - `USER_SEGMENT_CODE` – predefined user RX code descriptor (DPL=3).
+//! - `USER_SEGMENT_DATA` – predefined user RW data descriptor (DPL=3).
+//! - `NUM_GDT_ENTRIES` – number of GDT entries used (incl. TSS high slot).
+//! - `TABLE_SIZE` – GDTR.limit value computed from entry count.
+//!
+//! ## Variables
+//! - `gdt_entries` – global GDT, fixed order layout.
+//! - `gdt_ptr` – current GDTR contents for `lgdt`.
+//! - `main_tss_entry` – primary TSS for the bootstrap CPU.
+//!
+//! ## Functions
+//! - `init` – build/load GDT and TSS; set `rsp0`.
+//! - `lgdt` – load GDTR from a `GdtPtr` (internal).
+//! - `ltr` – load TR with a TSS selector (internal).
+//! - `writeTssDescriptor` – write 64-bit TSS descriptor pair into the GDT (internal).
 
 const cpu = @import("cpu.zig");
 const idt = @import("idt.zig");
 const paging = @import("paging.zig");
 const std = @import("std");
 
+/// Virtual address wrapper type alias.
 const VAddr = paging.VAddr;
 
 /// GDTR pointer used by `lgdt`.
@@ -19,10 +53,7 @@ pub const GdtPtr = packed struct {
     base: u64,
 };
 
-/// 64-bit Task State Segment (minimal fields used by the kernel).
-///
-/// Only `rsp0` and IST slots are used here; I/O bitmap is placed past the TSS
-/// and disabled by setting `iomap_base` to `@sizeOf(Tss)`.
+/// Minimal 64-bit Task State Segment used by the kernel.
 pub const Tss = packed struct {
     reserved_0: u32 = 0,
     /// Ring-0 stack pointer loaded on privilege transition.
@@ -44,7 +75,7 @@ pub const Tss = packed struct {
     iomap_base: u16 = @sizeOf(@This()),
 };
 
-/// Raw GDT entry layout (code/data/system). Internal use.
+/// Raw descriptor layout for code/data/system entries (internal).
 const GdtEntry = packed struct {
     limit_low: u16,
     base_low: u24,
@@ -62,7 +93,7 @@ const GdtEntry = packed struct {
     is_64_bit: bool,
     /// D-bit (default operand size 32) for 32-bit code; 0 for 64-bit.
     is_32_bit: bool,
-    /// Granularity (1 = 4KiB blocks, 0 = byte granularity).
+    /// Granularity (1 = 4 KiB blocks, 0 = byte granularity).
     granularity: u1,
     base_high: u8,
 };
@@ -110,7 +141,7 @@ pub const KERNEL_SEGMENT_DATA: GdtEntry = .{
     .base_high = 0,
 };
 
-/// Selector for the null descriptor (must be present at index 0).
+/// Selector for the null descriptor (index 0).
 pub const NULL_OFFSET: u16 = 0x00;
 
 /// Null descriptor placeholder.
@@ -182,11 +213,7 @@ const NUM_GDT_ENTRIES: u16 = 7;
 /// GDTR.limit value computed from entry count.
 const TABLE_SIZE: u16 = @sizeOf(GdtEntry) * NUM_GDT_ENTRIES - 1;
 
-/// Global GDT table (fixed order).
-///
-/// Index layout:
-/// 0: null, 1: kernel code, 2: kernel data, 3: user code, 4: user data,
-/// 5: TSS (low descriptor), 6: TSS (high dword).
+/// Global GDT, fixed order layout.
 pub var gdt_entries: [7]GdtEntry = blk: {
     var tmp: [7]GdtEntry = undefined;
     tmp[0] = NULL_SEGMENT;
@@ -199,19 +226,29 @@ pub var gdt_entries: [7]GdtEntry = blk: {
     break :blk tmp;
 };
 
-/// Current GDTR contents used by `lgdt`.
+/// Current GDTR contents for `lgdt`.
 pub var gdt_ptr: GdtPtr = .{
     .limit = TABLE_SIZE,
     .base = 0,
 };
 
-/// Primary TSS used by the bootstrap CPU.
+/// Primary TSS for the bootstrap CPU.
 pub var main_tss_entry: Tss = .{};
 
-/// Initializes GDT/TSS and loads them.
+/// Summary:
+/// Initializes the GDT/TSS, loads them, and sets the bootstrap CPU’s `rsp0`.
 ///
 /// Arguments:
-/// - `kernel_stack_top`: ring-0 stack pointer stored in `TSS.rsp0`
+/// - `kernel_stack_top`: Ring-0 stack top to store in `TSS.rsp0`.
+///
+/// Returns:
+/// - `void`.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn init(kernel_stack_top: VAddr) void {
     main_tss_entry = .{};
     main_tss_entry.rsp0 = kernel_stack_top.addr;
@@ -225,10 +262,20 @@ pub fn init(kernel_stack_top: VAddr) void {
     ltr(TSS_OFFSET);
 }
 
-/// Loads GDTR from `p`.
+/// Summary:
+/// Loads GDTR from the provided `GdtPtr`.
 ///
 /// Arguments:
-/// - `p`: pointer to `GdtPtr` structure to load.
+/// - `p`: Pointer to `GdtPtr` to load.
+///
+/// Returns:
+/// - `void`.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 fn lgdt(p: *const GdtPtr) void {
     asm volatile ("lgdt (%[p])"
         :
@@ -236,10 +283,20 @@ fn lgdt(p: *const GdtPtr) void {
         : .{ .memory = true });
 }
 
-/// Loads TR with selector `sel` (must reference a valid TSS descriptor).
+/// Summary:
+/// Loads TR with the provided TSS selector (must reference a valid TSS).
 ///
 /// Arguments:
-/// - `sel`: selector to load into TR (offset of the TSS descriptor).
+/// - `sel`: Selector to load into TR (offset of the TSS descriptor).
+///
+/// Returns:
+/// - `void`.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 fn ltr(sel: u16) void {
     asm volatile (
         \\mov %[s], %%ax
@@ -249,14 +306,20 @@ fn ltr(sel: u16) void {
         : .{});
 }
 
-/// Writes a 64-bit TSS descriptor (low+high) into the GDT at `TSS_OFFSET`.
+/// Summary:
+/// Writes a 64-bit TSS descriptor (low + high) into the GDT at `TSS_OFFSET`.
 ///
 /// Arguments:
-/// - `tss_ptr`: pointer to the TSS whose descriptor should be written.
+/// - `tss_ptr`: Pointer to the TSS whose descriptor should be written.
 ///
-/// Notes:
-/// - Populates the system descriptor fields, sets `present=1`, and stores the
-///   high 32 bits of the base in the following GDT slot.
+/// Returns:
+/// - `void`.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 fn writeTssDescriptor(tss_ptr: *Tss) void {
     const base: u64 = @intFromPtr(tss_ptr);
     const limit: u20 = @truncate(@sizeOf(Tss) - 1);
@@ -272,7 +335,7 @@ fn writeTssDescriptor(tss_ptr: *Tss) void {
     low.accessed = true;              // type=0b1001 (available 64-bit TSS), modeled via fields
     low.read_write = false;
     low.direction_confirming = false;
-    low.executable = true;            // “executable” bit contributes to system type encoding here
+    low.executable = true;            // contributes to system type encoding for TSS
     low.descriptor = false;           // system descriptor (not code/data)
     low.privilege = .ring_0;
     low.present = true;

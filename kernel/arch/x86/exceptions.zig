@@ -4,23 +4,36 @@
 //! registers a couple of default handlers, and routes all entries through the
 //! common naked stub. Includes a minimal kernel page-fault handler that
 //! demand-maps a fresh page for valid kernel VAddrs.
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - `Exception` – architectural exception vectors (subset explicitly listed).
+//! - `PFErrCode` – parsed x86-64 page-fault error code with convenience flags.
+//!
+//! ## Constants
+//! - `NUM_ISR_ENTRIES` – number of exception gates (0..31) to install.
+//!
+//! ## Variables
+//! - None.
+//!
+//! ## Functions
+//! - `init` – install exception gates and register default handlers + syscall gate.
+//! - `divByZeroHandler` – kernel/userspace divide-by-zero handler (private).
+//! - `pageFaultHandler` – kernel page-fault demand-mapper (private).
+//! - `PFErrCode.from` – decode a raw page-fault error code into fields.
 
 const cpu = @import("cpu.zig");
 const idt = @import("idt.zig");
 const interrupts = @import("interrupts.zig");
 const paging = @import("paging.zig");
+const serial = @import("serial.zig");
 const std = @import("std");
 const zag = @import("zag");
-const serial = @import("serial.zig");
 
 const memory = zag.memory;
 const pmm_mod = memory.PhysicalMemoryManager;
 const vmm_mod = memory.VirtualMemoryManager;
-
-const PAddr = paging.PAddr;
-const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
-const VAddr = paging.VAddr;
-const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
 
 /// Architectural exception vectors (subset shown explicitly).
 pub const Exception = enum(u5) {
@@ -47,7 +60,7 @@ pub const Exception = enum(u5) {
     security = 30,
 };
 
-/// Page fault error code parser.
+/// Parsed x86-64 page-fault error code with convenience flags.
 const PFErrCode = struct {
     present: bool, // bit 0
     is_write: bool, // bit 1
@@ -58,6 +71,20 @@ const PFErrCode = struct {
     cet_shadow_stack: bool, // bit 6
     sgx: bool, // bit 15
 
+    /// Summary:
+    /// Converts a raw page-fault error code into a parsed `PFErrCode`.
+    ///
+    /// Arguments:
+    /// - `err`: Raw error code from the page-fault (#PF) exception.
+    ///
+    /// Returns:
+    /// - `PFErrCode` populated with decoded flag fields.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     pub fn from(err: u64) PFErrCode {
         return .{
             .present = (err & 0x1) != 0,
@@ -72,11 +99,29 @@ const PFErrCode = struct {
     }
 };
 
+const PAddr = paging.PAddr;
+const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
+const VAddr = paging.VAddr;
+const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
+
+/// Number of exception gates (0..31) to install.
 pub const NUM_ISR_ENTRIES = 32;
 
-/// Installs IDT gates for exception vectors and the syscall vector.
+/// Summary:
+/// Installs IDT gates for exception vectors and the syscall vector, and
+/// registers default handlers for divide-by-zero and page-fault.
 ///
-/// Also registers default handlers for divide-by-zero and page-fault.
+/// Arguments:
+/// - None.
+///
+/// Returns:
+/// - `void`.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn init() void {
     for (0..NUM_ISR_ENTRIES) |i| {
         const privilege = switch (i) {
@@ -112,15 +157,25 @@ pub fn init() void {
         idt.PrivilegeLevel.ring_3,
         idt.GateType.interrupt_gate,
     );
-    // will register syscall here with
+    // When the syscall handler exists, register it via:
     // interrupts.registerSoftware(syscall_int_vec, syscallHandler,);
-    // when the handler exists
 }
 
-/// Default handler: distinguishes kernel/user divide-by-zero and panics.
+/// Summary:
+/// Default divide-by-zero handler that distinguishes kernel vs. user faults
+/// and panics with an appropriate message.
 ///
 /// Arguments:
-/// - `ctx`: interrupt context from the common stub
+/// - `ctx`: Interrupt context captured by the common stub.
+///
+/// Returns:
+/// - `void`.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - Always panics on divide-by-zero, message varies by CPL.
 fn divByZeroHandler(ctx: *cpu.Context) void {
     const cpl: u64 = ctx.cs & 3;
     if (cpl == 0) {
@@ -130,19 +185,23 @@ fn divByZeroHandler(ctx: *cpu.Context) void {
     }
 }
 
-/// Kernel page-fault handler: demand-maps a 4KiB page for valid kernel VAddrs.
-///
-/// Steps:
-/// - Reject faults before PMM/VMM init.
-/// - Validate that the faulting address lies within a reserved kernel VMM
-///   region; panic if not.
-/// - Allocate a physical page from the PMM and map it RW at the faulting page.
-/// - Invalidate the single TLB entry (`invlpg`).
-///
-/// Userspace faults are not implemented and will panic.
+/// Summary:
+/// Kernel page-fault handler that demand-maps a 4 KiB page for valid kernel
+/// VAddrs and rejects invalid or premature faults. Userspace faults are not
+/// implemented.
 ///
 /// Arguments:
-/// - `ctx`: interrupt context from the common stub
+/// - `ctx`: Interrupt context captured by the common stub.
+///
+/// Returns:
+/// - `void`.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - Panics on RSVD violations, PMM/VMM uninitialized, execute faults in kernel,
+///   invalid kernel addresses, PMM OOM, or any userspace page fault.
 fn pageFaultHandler(ctx: *cpu.Context) void {
     const pf_err = PFErrCode.from(ctx.err_code);
 

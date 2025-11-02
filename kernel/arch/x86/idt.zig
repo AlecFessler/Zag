@@ -1,16 +1,33 @@
 //! IDT setup and interrupt gate utilities for x86-64.
 //!
-//! Defines IDT entry formats, helpers for opening gates, and installs the IDT
-//! with `lidt`. Keeps the table immutable after population except for explicit
-//! gate openings during bring-up.
+//! Provides IDT entry formats and helpers to open gates and load the IDT with
+//! `lidt`. The global table is initialized non-present and treated as immutable
+//! after population, except for explicit gate openings during bring-up.
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - `GateType` – architectural gate kind encodings (task/interrupt/trap).
+//! - `IntVectors` – project-specific interrupt vector assignments.
+//! - `PrivilegeLevel` – descriptor privilege level encodings (rings).
+//! - `IDTEntry` – raw 16-byte IDT descriptor layout.
+//! - `IDTPtr` – IDTR operand used by `lidt`.
+//! - `interruptHandler` – naked ISR entrypoint function pointer type.
+//!
+//! ## Constants
+//! - `NUM_IDT_ENTRIES` – architectural IDT entry count (256).
+//! - `TABLE_SIZE` – value for `IDTR.limit` (bytes-1 for the table).
+//!
+//! ## Variables
+//! - `idt` – global IDT table, initially all non-present interrupt gates.
+//! - `idt_ptr` – IDTR image used when calling `lidt`.
+//!
+//! ## Functions
+//! - `init` – compute IDTR base and load the IDT.
+//! - `openInterruptGate` – populate a specific vector with a handler/gate.
+//! - `lidt` – private helper to execute the `lidt` instruction.
 
 const std = @import("std");
-
-pub const IntVectors = enum(u8) {
-    syscall = 0x80,
-    sched = 0xFE,
-    spurious = 0xFF,
-};
 
 /// Gate types for IDT descriptors (task, interrupt, trap).
 pub const GateType = enum(u4) {
@@ -19,16 +36,20 @@ pub const GateType = enum(u4) {
     trap_gate = 0xF,
 };
 
-/// Descriptor privilege level (DPL) encodings used by gates.
+/// Project-specific interrupt vectors (syscall, scheduler tick, spurious).
+pub const IntVectors = enum(u8) {
+    syscall = 0x80,
+    sched = 0xFE,
+    spurious = 0xFF,
+};
+
+/// Descriptor privilege level encodings (ring 0 and ring 3).
 pub const PrivilegeLevel = enum(u2) {
     ring_0 = 0x0,
     ring_3 = 0x3,
 };
 
-/// Raw IDT entry layout (16 bytes).
-///
-/// Fields split the ISR pointer into low/mid/high portions as required by
-/// the hardware format. `ist` selects an optional Interrupt Stack Table slot.
+/// Raw IDT entry layout (16 bytes), matching x86-64 hardware format.
 const IDTEntry = packed struct {
     /// ISR address bits 0..15.
     isr_base_low: u16,
@@ -56,7 +77,7 @@ comptime {
     std.debug.assert(@sizeOf(IDTEntry) == 16);
 }
 
-/// IDTR pointer used by `lidt`.
+/// IDTR pointer used by `lidt` to install the IDT.
 const IDTPtr = packed struct {
     /// Size of IDT in bytes minus 1.
     limit: u16,
@@ -64,13 +85,13 @@ const IDTPtr = packed struct {
     base: u64,
 };
 
-/// Naked interrupt handler entry point type.
+/// Naked interrupt handler entry point function pointer type.
 pub const interruptHandler = *const fn () callconv(.naked) void;
 
-/// Total number of IDT entries (architectural maximum).
-const NUM_IDT_ENTRIES = 256;
+/// Total number of IDT entries (architectural maximum, 256).
+const NUM_IDT_ENTRIES: usize = 256;
 
-/// Computed `IDTR.limit` value.
+/// Precomputed `IDTR.limit` value for a full table.
 const TABLE_SIZE: u16 = @sizeOf(IDTEntry) * NUM_IDT_ENTRIES - 1;
 
 /// Global IDT initialized to non-present interrupt gates.
@@ -91,20 +112,44 @@ var idt_ptr: IDTPtr = .{
     .base = 0,
 };
 
-/// Loads the IDT register with the global table.
+/// Summary:
+/// Loads the IDT by pointing `idtr.base` at the global table and executing `lidt`.
+///
+/// Arguments:
+/// - None.
+///
+/// Returns:
+/// - void.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn init() void {
     idt_ptr.base = @intFromPtr(&idt);
     lidt(&idt_ptr);
 }
 
-/// Opens a gate at `int_num` pointing to `handler`.
+/// Summary:
+/// Opens a gate at `int_num` pointing to `handler`, using the given selector,
+/// privilege level, and gate type (interrupt or trap).
 ///
 /// Arguments:
-/// - `int_num`: interrupt vector to configure (0..255)
-/// - `handler`: naked ISR entry (must preserve calling convention expectations)
-/// - `code_segment`: selector used for the ISR (e.g., kernel code selector)
-/// - `privilege`: DPL permitting user or kernel `int` invocation
-/// - `gate_type`: `.interrupt_gate` (clears IF) or `.trap_gate` (keeps IF)
+/// - `int_num`: Interrupt vector to configure (0..255).
+/// - `handler`: Naked ISR entrypoint (must follow calling convention).
+/// - `code_segment`: Code segment selector for the ISR (e.g., kernel CS).
+/// - `privilege`: Descriptor privilege level that may invoke the gate.
+/// - `gate_type`: `.interrupt_gate` (clears IF) or `.trap_gate` (leaves IF set).
+///
+/// Returns:
+/// - void.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - Panics in debug builds if `int_num >= 256` or if the gate is already present.
 pub fn openInterruptGate(
     int_num: u8,
     handler: interruptHandler,
@@ -129,10 +174,20 @@ pub fn openInterruptGate(
     };
 }
 
-/// Loads IDTR from `ptr`.
+/// Summary:
+/// Executes the `lidt` instruction to install the IDT from `ptr`.
 ///
 /// Arguments:
-/// - `ptr`: pointer to `IDTPtr` structure to load.
+/// - `ptr`: Pointer to an `IDTPtr` structure to load.
+///
+/// Returns:
+/// - void.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 fn lidt(ptr: *const IDTPtr) void {
     asm volatile ("lidt (%[p])"
         :

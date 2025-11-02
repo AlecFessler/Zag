@@ -4,12 +4,27 @@
 //! buffer, retrieves the map, and returns a compact struct (`MMap`) containing
 //! the key, descriptor pointer, sizes, and computed descriptor count. Intended
 //! for use just before `ExitBootServices`.
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - `MMap` — memory map snapshot returned by `mmap.getMmap` (key, ptr, sizes, count).
+//!
+//! ## Constants
+//! - None.
+//!
+//! ## Variables
+//! - None.
+//!
+//! ## Functions
+//! - `mmap.getMmap` — retrieve the current UEFI memory map into a pool buffer,
+//!   returning a compact snapshot or `null` on failure (with logging).
 
 const std = @import("std");
 
 const uefi = std.os.uefi;
 
-/// Memory map snapshot returned by `getMmap`.
+/// Memory map snapshot returned by `mmap.getMmap`.
 ///
 /// Fields:
 /// - `key`: token required by `ExitBootServices`.
@@ -27,25 +42,33 @@ pub const MMap = extern struct {
 
 const log = std.log.scoped(.mmap);
 
-/// Retrieve the current UEFI memory map into a freshly allocated pool buffer.
+/// Function: `mmap.getMmap`
+///
+/// Summary:
+/// Retrieve the current UEFI memory map into a freshly allocated pool buffer,
+/// then return a compact `MMap` snapshot. On error, logs and returns `null`.
 ///
 /// Behavior:
 /// - Calls `_getMemoryMap` to discover required size (expects `.buffer_too_small`).
 /// - Adds slack for allocation side effects, allocates buffer from `.loader_data`.
 /// - Calls `_getMemoryMap` again to populate the buffer.
-/// - On success, returns `MMap` with a valid key and counts. On failure, logs and returns `null`.
+/// - On success, computes descriptor count and returns `MMap`.
 ///
 /// Arguments:
 /// - `boot_services`: UEFI Boot Services pointer.
 ///
 /// Returns:
-/// - `MMap` on success (non-owning view over the allocated buffer).
-/// - `null` on error; details are logged here.
+/// - `?MMap`: Snapshot view on success; `null` on failure (details logged).
+///
+/// Errors:
+/// - None (errors are logged and signaled via `null` return).
+///
+/// Panics:
+/// - None.
 ///
 /// Notes:
-/// - The returned buffer resides in UEFI pool memory and should remain valid
-///   until `ExitBootServices`. If you reattempt `ExitBootServices`, you must
-///   reacquire a fresh map and key.
+/// - The returned buffer lives in UEFI pool memory and remains valid until
+///   `ExitBootServices`. If you retry `ExitBootServices`, reacquire a fresh map.
 pub fn getMmap(
     boot_services: *uefi.tables.BootServices,
 ) ?MMap {
