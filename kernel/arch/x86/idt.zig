@@ -6,6 +6,12 @@
 
 const std = @import("std");
 
+pub const IntVectors = enum(u8) {
+    syscall = 0x80,
+    sched = 0xFE,
+    spurious = 0xFF,
+};
+
 /// Gate types for IDT descriptors (task, interrupt, trap).
 pub const GateType = enum(u4) {
     task_gate = 0x5,

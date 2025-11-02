@@ -10,8 +10,6 @@ const interrupts = @import("interrupts.zig");
 const idt = @import("idt.zig");
 const std = @import("std");
 
-pub const SPURIOUS_INTERRUPT_VECTOR = 0xFF;
-
 /// Architectural IRQ lines exposed through the legacy PIC/APIC shim.
 const NUM_IRQ_ENTRIES = 16;
 
@@ -34,16 +32,18 @@ pub fn init() void {
         );
     }
 
+    const spurious_int_vec = @intFromEnum(idt.IntVectors.spurious);
+
     idt.openInterruptGate(
-        @intCast(SPURIOUS_INTERRUPT_VECTOR),
-        interrupts.STUBS[SPURIOUS_INTERRUPT_VECTOR],
+        @intCast(spurious_int_vec),
+        interrupts.STUBS[spurious_int_vec],
         0x08,
         idt.PrivilegeLevel.ring_0,
         idt.GateType.interrupt_gate,
     );
 
     interrupts.registerSoftware(
-        SPURIOUS_INTERRUPT_VECTOR,
+        spurious_int_vec,
         spuriousHandler,
     );
 }

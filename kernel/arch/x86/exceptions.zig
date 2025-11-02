@@ -74,8 +74,6 @@ const PFErrCode = struct {
 
 pub const NUM_ISR_ENTRIES = 32;
 
-const SYSCALL_INT_VECTOR = 0x80;
-
 /// Installs IDT gates for exception vectors and the syscall vector.
 ///
 /// Also registers default handlers for divide-by-zero and page-fault.
@@ -96,16 +94,18 @@ pub fn init() void {
         );
     }
 
+    const syscall_int_vec = @intFromEnum(idt.IntVectors.syscall);
+
     idt.openInterruptGate(
-        @intCast(SYSCALL_INT_VECTOR),
-        interrupts.STUBS[SYSCALL_INT_VECTOR],
+        @intCast(syscall_int_vec),
+        interrupts.STUBS[syscall_int_vec],
         0x08,
         idt.PrivilegeLevel.ring_3,
         idt.GateType.interrupt_gate,
     );
 
     // will register syscall here with
-    // interrupts.registerSoftware(SYSCALL_INT_VECTOR, syscallHandler,);
+    // interrupts.registerSoftware(syscall_int_vec, syscallHandler,);
     // when the handler exists
 
     interrupts.registerException(

@@ -17,6 +17,8 @@ pub const Timer = struct {
 };
 
 const ONE_QUADRILLION_NS = 1_000_000_000_000_000;
+const ONE_BILLION_NS = 1_000_000_000;
+const TEN_MILLION_NS = 10_000_000;
 
 pub const Hpet = struct {
     pub const GenCapsAndId = packed struct(u64) {
@@ -187,9 +189,6 @@ pub const Hpet = struct {
         return nanosFromTicksFloor(self.freq_hz, self.main_counter_val.val);
     }
 };
-
-const ONE_BILLION_NS = 1_000_000_000;
-const TEN_MILLION_NS = 10_000_000;
 
 pub const Tsc = struct {
     freq_hz: u64,

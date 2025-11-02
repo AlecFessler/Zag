@@ -101,7 +101,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     idt.init();
     exceptions.init();
     irq.init();
-    cpu.enableX2Apic(irq.SPURIOUS_INTERRUPT_VECTOR);
+    cpu.enableX2Apic(@intFromEnum(idt.IntVectors.spurious));
 
     var mmap_entries_array: [boot_defs.MAX_MMAP_ENTRIES]boot_defs.MMapEntry = undefined;
     const mmap = boot_defs.collapseMmap(
