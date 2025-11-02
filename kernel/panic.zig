@@ -1,7 +1,30 @@
 //! Symbol map and kernel panic utilities.
 //!
-//! Provides a compact symbol table for address-to-name lookups during panics
-//! and a minimal panic routine that prints a backtrace via serial.
+//! Provides a compact, binary-searchable symbol table for address→name lookups
+//! during faults/panics, and a minimal panic routine that prints a backtrace
+//! over serial before halting the CPU.
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - `PanicError` — error set for symbol-map loading failures.
+//! - `MapEntry` — one `(addr, name)` pair used by the symbol map.
+//! - `SymbolMap` — compact symbol table with binary search and append API.
+//!
+//! ## Constants
+//! - `VAddr` — typed virtual-address alias exposed by paging.
+//!
+//! ## Variables
+//! - `g_symmap` — optional process-wide symbol map used by panic/log helpers.
+//!
+//! ## Functions
+//! - `SymbolMap.init` — construct an empty map with a specified allocator.
+//! - `SymbolMap.deinit` — free entry storage and name copies.
+//! - `SymbolMap.add` — append `(addr, name)`; duplicates name into the map.
+//! - `SymbolMap.find` — binary-search for rightmost base `<= pc` (private).
+//! - `initSymbolsFromSlice` — parse serialized map bytes into `g_symmap`.
+//! - `panic` — print message and backtrace; halt (noreturn).
+//! - `logAddr` — print a single PC with symbolization if available (private).
 
 const std = @import("std");
 const zag = @import("zag.zig");
@@ -10,33 +33,36 @@ const builtin = std.builtin;
 const cpu = zag.x86.Cpu;
 const serial = zag.x86.Serial;
 
+/// Error set for symbol-map loading/validation.
 pub const PanicError = error{
-    /// The provided symbol file/slice is malformed or empty.
     InvalidSymbolFile,
 };
 
-/// A single symbol map entry (address base and name).
+/// One `(addr, name)` pair within the symbol map.
 const MapEntry = struct {
-    /// Base program counter of the symbol.
     addr: u64,
-    /// Symbol name bytes (duped into the map’s allocator).
     name: []const u8,
 };
 
-/// Compact symbol map supporting binary search by program counter.
+/// Compact symbol table supporting binary search by program counter.
 const SymbolMap = struct {
-    /// Allocator owning `entries` and name copies.
     alloc: std.mem.Allocator,
-    /// Sorted storage of `(addr,name)` pairs.
     entries: std.ArrayListUnmanaged(MapEntry),
 
-    /// Creates an empty symbol map using `alloc`.
+    /// Summary:
+    /// Construct an empty `SymbolMap` that uses `alloc`.
     ///
     /// Arguments:
-    /// - `alloc`: allocator that will own the entries array and name copies.
+    /// - `alloc`: allocator that will own entry storage and name copies.
     ///
     /// Returns:
     /// - New empty `SymbolMap`.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     pub fn init(alloc: std.mem.Allocator) SymbolMap {
         return .{
             .alloc = alloc,
@@ -44,27 +70,40 @@ const SymbolMap = struct {
         };
     }
 
-    /// Releases backing storage and name copies.
+    /// Summary:
+    /// Release backing storage and all duplicated names.
     ///
     /// Arguments:
     /// - `self`: map to deinitialize.
+    ///
+    /// Returns:
+    /// - `void`.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     pub fn deinit(self: *SymbolMap) void {
         self.entries.deinit(self.alloc);
     }
 
-    /// Inserts a `(addr, name)` pair; duplicates `name` into `alloc`.
+    /// Summary:
+    /// Insert a `(addr, name)` pair; duplicates `name` into `self.alloc`.
     ///
     /// Arguments:
     /// - `self`: target symbol map.
     /// - `addr`: base program counter of the symbol.
     /// - `name`: UTF-8 symbol name to copy into the map.
     ///
+    /// Returns:
+    /// - `void`.
+    ///
     /// Errors:
     /// - `std.mem.Allocator.Error` on allocation/dupe/append failure.
     ///
-    /// Notes:
-    /// - For best performance, insert in non-decreasing `addr` order;
-    ///   otherwise bulk-load then sort once before queries.
+    /// Panics:
+    /// - None.
     pub fn add(
         self: *SymbolMap,
         addr: u64,
@@ -80,14 +119,21 @@ const SymbolMap = struct {
         );
     }
 
-    /// Finds the symbol whose base address is the rightmost `<= pc`.
+    /// Summary:
+    /// Find the symbol whose base address is the rightmost value `<= pc`.
     ///
     /// Arguments:
     /// - `self`: map to query (read-only).
     /// - `pc`: program counter to resolve.
     ///
     /// Returns:
-    /// - `{ name, base }` on success; `null` if no symbol base is `<= pc`.
+    /// - `?{ name: []const u8, base: u64 }` — `null` if no base `<= pc`.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     fn find(
         self: *const SymbolMap,
         pc: u64,
@@ -113,27 +159,30 @@ const SymbolMap = struct {
     }
 };
 
+/// Typed virtual-address alias from the paging module.
 const VAddr = zag.x86.Paging.VAddr;
 
+/// Optional global symbol map used for backtrace symbolization.
 pub var g_symmap: ?SymbolMap = null;
 
-/// Initializes the global symbol map from a serialized slice.
-///
-/// The input format is a sequence of entries encoded as:
-/// `HEX_ADDR SP NAME \ n` (where the newline is the two-byte sequence `\` then `n`),
-/// repeated for each symbol. Example: `ffffffff80001000 _start\n`.
+/// Summary:
+/// Initialize the global symbol map from a serialized byte slice.
 ///
 /// Arguments:
-/// - `map_bytes`: UTF-8 bytes of the serialized symbol map.
+/// - `map_bytes`: UTF-8 bytes of the serialized symbol map; each line encoded
+///   as `HEX_ADDR SP NAME \ n` (backslash + `n` two-byte sequence).
 /// - `alloc`: allocator used to store entries and duplicated names.
 ///
 /// Returns:
-/// - `void` on success; populates `g_symmap`.
+/// - `void` (on success `g_symmap` is populated).
 ///
 /// Errors:
 /// - `PanicError.InvalidSymbolFile` if no entries are found.
 /// - `std.mem.Allocator.Error` on allocation failures.
 /// - `std.fmt.ParseIntError` if an address field is not valid hex.
+///
+/// Panics:
+/// - None.
 pub fn initSymbolsFromSlice(
     map_bytes: []const u8,
     alloc: std.mem.Allocator,
@@ -209,18 +258,22 @@ pub fn initSymbolsFromSlice(
     g_symmap = sm;
 }
 
-/// Kernel panic handler: prints message and backtrace, then halts.
-///
-/// Emits a panic header (with optional return address), symbolized stack trace
-/// up to 64 frames if a symbol map is loaded, and stops the CPU.
+/// Summary:
+/// Kernel panic handler: print message and backtrace, then halt the CPU.
 ///
 /// Arguments:
 /// - `msg`: panic message to display.
-/// - `trace`: optional Zig return-trace (unused here; backtrace gathered manually).
+/// - `trace`: optional Zig return-trace (unused; backtrace gathered manually).
 /// - `ret_addr`: optional return address for additional context.
 ///
 /// Returns:
-/// - Never returns; halts the CPU.
+/// - Never returns (`noreturn`).
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None (function halts the CPU).
 pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?usize) noreturn {
     @branchHint(.cold);
     _ = trace;
@@ -247,13 +300,20 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?usize)
     zag.x86.Cpu.halt();
 }
 
-/// Logs a single program counter with symbolization if available.
-///
-/// When a symbol map is loaded, prints `PC: name+offset`; otherwise prints
-/// a sentinel (`?????`) or `(no symbols)`.
+/// Summary:
+/// Log a single program counter with symbolization if available.
 ///
 /// Arguments:
 /// - `pc`: program counter to log.
+///
+/// Returns:
+/// - `void`.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 fn logAddr(pc: u64) void {
     if (zag.panic.g_symmap) |sm| {
         if (sm.find(pc)) |hit| {

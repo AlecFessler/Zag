@@ -1,14 +1,51 @@
 //! Paging, address types, and helpers for x86-64.
 //!
-//! Defines `PAddr`/`VAddr`, page table entry format, and mapping utilities
-//! (`mapPage`, `physMapRegion`) used during early bring-up and at runtime.
-//! Assumes 4-level paging with optional 2MiB/1GiB large pages.
+//! Defines strongly-typed physical/virtual address wrappers (`PAddr`, `VAddr`), the
+//! unified `PageEntry` format used across all four paging levels, and mapping utilities
+//! (`mapPage`, `physMapRegion`, `dropIdentityMap`) for early bring-up and runtime.
+//! Assumes 4-level paging with optional 2 MiB / 1 GiB large pages, higher-half kernel,
+//! and a physmap (direct map) at PML4 slot 511.
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - `AddressSpace` – PML4 slot reservations for kernel layouts.
+//! - `MappingType` – base used for PAddr↔VAddr translation (physmap, identity).
+//! - `PageSize` – supported page sizes (4 KiB, 2 MiB, 1 GiB).
+//! - `RW` – readable/writable selector for entries.
+//! - `User` – user/supervisor selector for entries.
+//! - `Executeable` – executable/NX selector for entries.
+//! - `Cacheable` – cacheability selector for entries.
+//! - `PageLevelShift` – bit shifts for PML4/PDPT/PD/PT indices.
+//! - `PAddr` – physical address wrapper with helpers.
+//! - `PageEntry` – hardware page-table entry layout (all levels).
+//! - `VAddr` – virtual address wrapper with helpers.
+//! - `PDEntry` / `PDPTEntry` / `PML4Entry` / `PTEntry` – aliases to `PageEntry`.
+//!
+//! ## Constants
+//! - `default_flags` – zeroed entry template for fresh tables.
+//! - `PAGE_ALIGN` – required 4 KiB alignment for tables/pages.
+//! - `PAGE_TABLE_SIZE` – number of entries per page table (512).
+//!
+//! ## Variables
+//! - None.
+//!
+//! ## Functions
+//! - `dropIdentityMap` – clear lower-half identity PML4 entries and reload CR3.
+//! - `mapPage` – map one page (4 KiB/2 MiB/1 GiB), allocating tables on demand.
+//! - `PageMem` – sized/ aligned struct type for allocator APIs (by page size).
+//! - `physMapRegion` – cover a physical range using the largest suitable pages.
+//! - `pml4_index` – compute PML4 index from a VAddr.
+//! - `pml4SlotBase` – canonical base VAddr of a PML4 slot.
+//! - `read_cr3` – read CR3 as a physical address plus flags.
+//! - `write_cr3` – write CR3 (TLB shootdown).
+//! - `pd_index` / `pdpt_index` / `pt_index` – lower-level index helpers.
 
 const std = @import("std");
 
 /// Top-level virtual address slots (PML4 indices) we reserve.
 pub const AddressSpace = enum(u9) {
-    /// Higher-half direct map: physmap at PML4=511
+    /// Higher-half direct map: physmap at PML4=511.
     physmap = 511,
     /// Kernel virtual memory area reserved for the VMM (allocator address space).
     kvmm = 510,
@@ -18,47 +55,102 @@ pub const AddressSpace = enum(u9) {
 pub const MappingType = enum {
     /// Physmap base (direct map of physical memory).
     physmap,
-    /// Identity mapping for use by uefi bootloader
+    /// Identity mapping for use by UEFI bootloader.
     identity,
 };
 
 /// Supported page sizes.
 pub const PageSize = enum(u64) {
+    /// 4 KiB page.
     Page4K = 4 * 1024,
+    /// 2 MiB page.
     Page2M = 2 * 1024 * 1024,
+    /// 1 GiB page.
     Page1G = 1 * 1024 * 1024 * 1024,
 };
 
 /// Read/write bit for entries.
 pub const RW = enum(u1) {
-    Readonly,
-    ReadWrite,
+    /// Read-only.
+    ro,
+    /// Read-write.
+    rw,
 };
 
 /// User/supervisor bit for entries.
 pub const User = enum(u1) {
-    User,
-    Supervisor,
+    /// User-accessible.
+    u,
+    /// Supervisor-only.
+    su,
+};
+
+/// Execute-disable (NX) flag for entries.
+pub const Executeable = enum(u1) {
+    /// Executable.
+    x,
+    /// Non-executable.
+    nx,
+};
+
+/// Cacheability control for entries.
+pub const Cacheable = enum(u1) {
+    /// Cached (WB).
+    cache,
+    /// Uncached (CD=1).
+    ncache,
 };
 
 /// Bit shifts for each page-table level.
 const PageLevelShift = enum(u6) {
+    /// PML4 shift (bits 47:39).
     PML4 = 39,
+    /// PDPT shift (bits 38:30).
     PDPT = 30,
+    /// PD shift (bits 29:21).
     PD   = 21,
+    /// PT shift (bits 20:12).
     PT   = 12,
 };
 
 /// Physical address wrapper (bytes).
 pub const PAddr = struct {
+    /// Underlying physical address in bytes.
     addr: u64,
 
-    /// Constructs from a raw integer.
+    /// Summary:
+    /// Constructs a `PAddr` from a raw integer.
+    ///
+    /// Args:
+    /// - `addr`: Raw physical address in bytes.
+    ///
+    /// Returns:
+    /// - `PAddr` newly constructed.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     pub fn fromInt(addr: u64) PAddr {
         return .{ .addr = addr };
     }
 
-    /// Translates a virtual address to physical using an base.
+    /// Summary:
+    /// Translates a virtual address into a physical address using the given mapping base.
+    ///
+    /// Args:
+    /// - `vaddr`: Virtual address to translate.
+    /// - `type_`: Mapping base (`.physmap` or `.identity`) to use for translation.
+    ///
+    /// Returns:
+    /// - `PAddr` computed physical address.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     pub fn fromVAddr(vaddr: VAddr, type_: MappingType) PAddr {
         const base_vaddr = switch (type_) {
             .physmap => pml4SlotBase(@intFromEnum(AddressSpace.physmap)),
@@ -68,7 +160,21 @@ pub const PAddr = struct {
         return .{ .addr = phys };
     }
 
-    /// Reinterprets the address as a pointer to `type_`.
+    /// Summary:
+    /// Reinterprets this physical address as a pointer to `type_`.
+    ///
+    /// Args:
+    /// - `self`: Receiver.
+    /// - `type_`: Compile-time pointee type to cast to.
+    ///
+    /// Returns:
+    /// - `type_` pointer value formed from `self.addr`.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     pub fn getPtr(self: *const @This(), comptime type_: anytype) type_ {
         return @ptrFromInt(self.addr);
     }
@@ -76,27 +182,67 @@ pub const PAddr = struct {
 
 /// Hardware page-table entry (works for all levels).
 pub const PageEntry = packed struct {
+    /// Present bit.
     present: bool,
+    /// Read/write flag.
     rw: RW,
+    /// User/supervisor flag.
     user: User,
+    /// Write-through flag.
     write_through: bool,
-    cache_disable: bool,
+    /// Cache disable.
+    cache_disable: Cacheable,
+    /// Accessed flag.
     accessed: bool,
+    /// Dirty flag (leaf).
     dirty: bool,
+    /// Large-page selector (PD/PT leaf).
     huge_page: bool,
+    /// Global mapping flag.
     global: bool,
+    /// Ignored bits.
     ignored: u3,
+    /// Physical address bits (51:12).
     addr: u40,
+    /// Reserved bits.
     reserved: u11,
-    nx: bool,
+    /// NX (execute-disable).
+    nx: Executeable,
 
-    /// Stores a physical address into the entry (asserts 4KiB alignment).
+    /// Summary:
+    /// Stores a physical address into the entry (requires 4 KiB alignment).
+    ///
+    /// Args:
+    /// - `self`: Receiver.
+    /// - `paddr`: Physical address to encode.
+    ///
+    /// Returns:
+    /// - `void`.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - Panics if `paddr` is not 4 KiB-aligned.
     pub fn setPAddr(self: *PageEntry, paddr: PAddr) void {
         std.debug.assert(std.mem.isAligned(paddr.addr, PAGE_ALIGN.toByteUnits()));
         self.addr = @intCast(paddr.addr >> 12);
     }
 
-    /// Extracts the physical address from the entry (lower 12 bits are zero).
+    /// Summary:
+    /// Extracts the physical address from the entry (lower 12 bits zeroed).
+    ///
+    /// Args:
+    /// - `self`: Receiver.
+    ///
+    /// Returns:
+    /// - `PAddr` decoded physical address.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     pub fn getPAddr(self: *const PageEntry) PAddr {
         const addr = @as(u64, self.addr) << 12;
         return PAddr.fromInt(addr);
@@ -109,14 +255,42 @@ comptime {
 
 /// Virtual address wrapper (bytes).
 pub const VAddr = struct {
+    /// Underlying virtual address in bytes.
     addr: u64,
 
-    /// Constructs from a raw integer.
+    /// Summary:
+    /// Constructs a `VAddr` from a raw integer.
+    ///
+    /// Args:
+    /// - `addr`: Raw virtual address in bytes.
+    ///
+    /// Returns:
+    /// - `VAddr` newly constructed.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     pub fn fromInt(addr: u64) VAddr {
         return .{ .addr = addr };
     }
 
-    /// Translates a physical address to virtual using a base.
+    /// Summary:
+    /// Translates a physical address into a virtual address via the selected base.
+    ///
+    /// Args:
+    /// - `paddr`: Physical address to translate.
+    /// - `type_`: Mapping base (`.physmap` or `.identity`) to use.
+    ///
+    /// Returns:
+    /// - `VAddr` computed virtual address.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     pub fn fromPAddr(paddr: PAddr, type_: MappingType) VAddr {
         const base_vaddr = switch (type_) {
             .physmap => pml4SlotBase(@intFromEnum(AddressSpace.physmap)),
@@ -126,24 +300,42 @@ pub const VAddr = struct {
         return .{ .addr = virt };
     }
 
-    /// Reinterprets the address as a pointer to `type_`.
+    /// Summary:
+    /// Reinterprets this virtual address as a pointer to `type_`.
+    ///
+    /// Args:
+    /// - `self`: Receiver.
+    /// - `type_`: Compile-time pointee type to cast to.
+    ///
+    /// Returns:
+    /// - `type_` pointer value formed from `self.addr`.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     pub fn getPtr(self: *const @This(), comptime type_: anytype) type_ {
         return @ptrFromInt(self.addr);
     }
 };
 
+/// Alias for page-directory entry type.
 const PDEntry = PageEntry;
+/// Alias for page-directory-pointer-table entry type.
 const PDPTEntry = PageEntry;
+/// Alias for top-level PML4 entry type.
 const PML4Entry = PageEntry;
+/// Alias for page-table entry type.
 const PTEntry = PageEntry;
 
 /// Zeroed entry template used for freshly allocated tables.
 pub const default_flags = PageEntry{
     .present = false,
-    .rw = .Readonly,
-    .user = .Supervisor,
+    .rw = .ro,
+    .user = .su,
     .write_through = false,
-    .cache_disable = false,
+    .cache_disable = .ncache,
     .accessed = false,
     .dirty = false,
     .huge_page = false,
@@ -151,59 +343,76 @@ pub const default_flags = PageEntry{
     .ignored = 0,
     .addr = 0,
     .reserved = 0,
-    .nx = true,
+    .nx = .nx,
 };
 
-/// Required alignment for page tables and 4KiB pages.
+/// Required alignment for page tables and 4 KiB pages.
 pub const PAGE_ALIGN = std.mem.Alignment.fromByteUnits(@intFromEnum(PageSize.Page4K));
 
 /// Entries per page table.
 pub const PAGE_TABLE_SIZE = 512;
 
-/// Drops the identity mapping for the lower half of the address space.
+/// Summary:
+/// Drops the identity mapping for the lower half of the address space and reloads CR3.
+/// Clears PML4 entries 0–255 to remove the early boot identity map once the kernel
+/// runs in the higher half.
 ///
-/// Clears PML4 entries 0–255, which correspond to canonical lower-half
-/// addresses when the kernel is running in the higher half. This removes
-/// the temporary identity map used during early boot so accidental access
-/// to physical addresses via identity is no longer possible.
-///
-/// After invalidating those entries, CR3 is reloaded to ensure the TLB
-/// flushes and all processors observe the new top-level tables.
-///
-/// Safety:
-/// - Must only be called after the kernel has fully switched to higher-half
-///   execution and no remaining references exist to identity-mapped pointers.
+/// Args:
+/// - None.
 ///
 /// Returns:
-/// - `void`
+/// - `void`.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None (expects an active, canonical higher-half layout).
 pub fn dropIdentityMap() void {
     const cr3 = read_cr3();
     const pml4_paddr = PAddr.fromInt(cr3.addr & ~@as(u64, 0xfff));
-    const pml4_vaddr = VAddr.fromPAddr(pml4_paddr, .identity);
+    const pml4_vaddr = VAddr.fromPAddr(pml4_paddr, .physmap);
     const pml4 = pml4_vaddr.getPtr([*]PML4Entry);
 
-    for(0..256) |i| {
+    for (0..256) |i| {
         pml4[i] = default_flags;
     }
 
     write_cr3(pml4_paddr);
 }
 
-/// Maps a single page (4KiB/2MiB/1GiB) at `vaddr` → `paddr`.
+/// Summary:
+/// Maps a single page (4 KiB / 2 MiB / 1 GiB) at `vaddr → paddr`, allocating
+/// intermediate tables as needed, and honoring flags (rw/nx/user/cacheable).
 ///
-/// Allocates intermediate tables on demand using `allocator`. Honors `rw`,
-/// `nx`, and `user`. `mapping_type` decides how newly allocated tables are
-/// translated into physical addresses.
+/// Args:
+/// - `pml4`: Pointer to active top-level PML4 (virtual).
+/// - `paddr`: Physical address to map to.
+/// - `vaddr`: Virtual address to map at.
+/// - `rw`: Read/write setting for the leaf.
+/// - `nx`: Executable/NX setting for the leaf.
+/// - `cacheable`: Cacheability for the leaf.
+/// - `user`: User/supervisor setting for the leaf.
+/// - `page_size`: Page size to use (`Page4K`, `Page2M`, `Page1G`).
+/// - `mapping_type`: How to translate newly allocated table addresses to PAddr.
+/// - `allocator`: Allocator for on-demand table pages (4 KiB).
 ///
-/// Preconditions:
-/// - `paddr` and `vaddr` are 4KiB-aligned.
-/// - `pml4` points to the active top-level table (virtual).
+/// Returns:
+/// - `void`.
+///
+/// Errors:
+/// - None (OOM triggers a panic).
+///
+/// Panics:
+/// - Panics on OOM while allocating tables.
+/// - Panics if `paddr` or `vaddr` are not 4 KiB-aligned.
 pub fn mapPage(
     pml4: [*]PML4Entry,
     paddr: PAddr,
     vaddr: VAddr,
     rw: RW,
-    nx: bool,
+    nx: Executeable,
+    cacheable: Cacheable,
     user: User,
     page_size: PageSize,
     mapping_type: MappingType,
@@ -212,12 +421,12 @@ pub fn mapPage(
     std.debug.assert(std.mem.isAligned(paddr.addr, PAGE_ALIGN.toByteUnits()));
     std.debug.assert(std.mem.isAligned(vaddr.addr, PAGE_ALIGN.toByteUnits()));
 
-    const flags = PageEntry{
+    const parent_flags = PageEntry{
         .present = true,
-        .rw = .ReadWrite,
+        .rw = .rw,
         .user = user,
         .write_through = false,
-        .cache_disable = false,
+        .cache_disable = .cache,
         .accessed = false,
         .dirty = false,
         .huge_page = false,
@@ -225,7 +434,23 @@ pub fn mapPage(
         .ignored = 0,
         .addr = 0,
         .reserved = 0,
-        .nx = false,
+        .nx = .x,
+    };
+
+    const leaf_flags = PageEntry{
+        .present = true,
+        .rw = rw,
+        .user = user,
+        .write_through = false,
+        .cache_disable = cacheable,
+        .accessed = false,
+        .dirty = false,
+        .huge_page = false,
+        .global = false,
+        .ignored = 0,
+        .addr = 0,
+        .reserved = 0,
+        .nx = nx,
     };
 
     const pml4_idx = pml4_index(vaddr);
@@ -235,8 +460,8 @@ pub fn mapPage(
 
     std.debug.assert(pml4_idx < 512);
     std.debug.assert(pdpt_idx < 512);
-    std.debug.assert(pd_idx   < 512);
-    std.debug.assert(pt_idx   < 512);
+    std.debug.assert(pd_idx < 512);
+    std.debug.assert(pt_idx < 512);
 
     var pdpt_entry = &pml4[pml4_idx];
     if (!pdpt_entry.present) {
@@ -244,7 +469,7 @@ pub fn mapPage(
             PDPTEntry, PAGE_ALIGN, PAGE_TABLE_SIZE,
         ) catch @panic("Went OOM mapping pages!");
         @memset(new_pdpt, default_flags);
-        pdpt_entry.* = flags;
+        pdpt_entry.* = parent_flags;
         const new_pdpt_vaddr = VAddr.fromInt(@intFromPtr(new_pdpt.ptr));
         const new_pdpt_paddr = PAddr.fromVAddr(new_pdpt_vaddr, mapping_type);
         pdpt_entry.setPAddr(new_pdpt_paddr);
@@ -254,10 +479,8 @@ pub fn mapPage(
 
     if (page_size == .Page1G) {
         var entry = &pdpt[pdpt_idx];
-        entry.* = flags;
+        entry.* = leaf_flags;
         entry.huge_page = true;
-        entry.rw = rw;
-        if (nx) entry.nx = true;
         entry.setPAddr(paddr);
         return;
     }
@@ -268,7 +491,7 @@ pub fn mapPage(
             PDEntry, PAGE_ALIGN, PAGE_TABLE_SIZE,
         ) catch @panic("Went OOM mapping pages!");
         @memset(new_pd, default_flags);
-        pd_entry.* = flags;
+        pd_entry.* = parent_flags;
         const new_pd_vaddr = VAddr.fromInt(@intFromPtr(new_pd.ptr));
         const new_pd_paddr = PAddr.fromVAddr(new_pd_vaddr, mapping_type);
         pd_entry.setPAddr(new_pd_paddr);
@@ -278,10 +501,8 @@ pub fn mapPage(
 
     if (page_size == .Page2M) {
         var entry = &pd[pd_idx];
-        entry.* = flags;
+        entry.* = leaf_flags;
         entry.huge_page = true;
-        entry.rw = rw;
-        if (nx) entry.nx = true;
         entry.setPAddr(paddr);
         return;
     }
@@ -292,7 +513,7 @@ pub fn mapPage(
             PTEntry, PAGE_ALIGN, PAGE_TABLE_SIZE,
         ) catch @panic("Went OOM mapping pages!");
         @memset(new_pt, default_flags);
-        pt_entry.* = flags;
+        pt_entry.* = parent_flags;
         const new_pt_vaddr = VAddr.fromInt(@intFromPtr(new_pt.ptr));
         const new_pt_paddr = PAddr.fromVAddr(new_pt_vaddr, mapping_type);
         pt_entry.setPAddr(new_pt_paddr);
@@ -300,21 +521,47 @@ pub fn mapPage(
     const pt_entry_vaddr = VAddr.fromPAddr(pt_entry.getPAddr(), mapping_type);
     const pt = pt_entry_vaddr.getPtr([*]PTEntry);
 
-    pt[pt_idx] = flags;
-    pt[pt_idx].rw = rw;
-    if (nx) pt[pt_idx].nx = true;
+    pt[pt_idx] = leaf_flags;
     pt[pt_idx].setPAddr(paddr);
 }
 
-/// Returns a stack-allocated, page-size-aligned region type for allocator APIs.
+/// Summary:
+/// Returns a page-size-aligned region type for allocator APIs (typed scratch).
+///
+/// Args:
+/// - `page_size`: Compile-time page size (`Page4K`, `Page2M`, `Page1G`).
+///
+/// Returns:
+/// - `type`: Struct type `{ mem: [size]u8 align(size) }` suitable for table/page allocs.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn PageMem(comptime page_size: PageSize) type {
     const size_bytes = @intFromEnum(page_size);
     return struct { mem: [size_bytes]u8 align(size_bytes) };
 }
 
-/// Identity-maps a physical range into the physmap with the fewest entries.
+/// Summary:
+/// Identity-maps a physical range into the physmap using the fewest entries, choosing
+/// 1 GiB / 2 MiB / 4 KiB pages based on alignment and remaining size.
 ///
-/// Chooses 1GiB/2MiB/4KiB pages based on alignment/remaining size.
+/// Args:
+/// - `pml4_vaddr`: Virtual address of the active PML4.
+/// - `start_paddr`: Start of physical range (inclusive).
+/// - `end_paddr`: End of physical range (exclusive).
+/// - `allocator`: Allocator for on-demand tables.
+///
+/// Returns:
+/// - `void`.
+///
+/// Errors:
+/// - None (invalid inputs assert; OOM panics).
+///
+/// Panics:
+/// - Panics if inputs are misaligned or `end_paddr <= start_paddr`.
 pub fn physMapRegion(
     pml4_vaddr: VAddr,
     start_paddr: PAddr,
@@ -343,9 +590,10 @@ pub fn physMapRegion(
             @ptrFromInt(pml4_vaddr.addr),
             paddr,
             vaddr,
-            RW.ReadWrite,
-            true,
-            User.Supervisor,
+            .rw,
+            .nx,
+            .cache,
+            .su,
             @enumFromInt(chosen_size),
             .identity,
             allocator,
@@ -355,19 +603,58 @@ pub fn physMapRegion(
     }
 }
 
-/// PML4 index for `vaddr`.
+/// Summary:
+/// Computes the PML4 index for a given virtual address.
+///
+/// Args:
+/// - `vaddr`: Virtual address.
+///
+/// Returns:
+/// - `u9` PML4 index (0..511).
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn pml4_index(vaddr: VAddr) u9 {
     return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PML4));
 }
 
-/// Virtual base address for a PML4 slot (sign-extended canonical form).
+/// Summary:
+/// Computes the canonical base virtual address for a given PML4 slot.
+///
+/// Args:
+/// - `slot`: PML4 index (0..511).
+///
+/// Returns:
+/// - `VAddr` canonical base of the slot (sign-extended).
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn pml4SlotBase(slot: u9) VAddr {
     const raw: u64 = (@as(u64, slot) << 39);
     const base = if ((raw & 1 << 47) != 0) (raw | 0xFFFF000000000000) else raw;
     return VAddr.fromInt(base);
 }
 
-/// Reads CR3 (PML4 physical address plus flags).
+/// Summary:
+/// Reads CR3 into a `PAddr` (including low flag bits).
+///
+/// Args:
+/// - None.
+///
+/// Returns:
+/// - `PAddr` raw CR3 value (address + flags).
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn read_cr3() PAddr {
     var value: u64 = 0;
     asm volatile ("mov %%cr3, %[out]"
@@ -376,7 +663,20 @@ pub fn read_cr3() PAddr {
     return PAddr.fromInt(value);
 }
 
-/// Writes CR3 with `pml4_paddr` (flushes TLB).
+/// Summary:
+/// Writes CR3 with the provided `pml4_paddr` (flushes TLB).
+///
+/// Args:
+/// - `pml4_paddr`: PML4 physical address (flags permitted in low bits).
+///
+/// Returns:
+/// - `void`.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn write_cr3(pml4_paddr: PAddr) void {
     asm volatile ("mov %[value], %%cr3"
         :
@@ -384,17 +684,56 @@ pub fn write_cr3(pml4_paddr: PAddr) void {
         : .{ .memory = true });
 }
 
-/// PD index for `vaddr`.
+/// Summary:
+/// Computes PD index for a virtual address.
+///
+/// Args:
+/// - `vaddr`: Virtual address.
+///
+/// Returns:
+/// - `u9` PD index.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 fn pd_index(vaddr: VAddr) u9 {
     return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PD));
 }
 
-/// PDPT index for `vaddr`.
+/// Summary:
+/// Computes PDPT index for a virtual address.
+///
+/// Args:
+/// - `vaddr`: Virtual address.
+///
+/// Returns:
+/// - `u9` PDPT index.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 fn pdpt_index(vaddr: VAddr) u9 {
     return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PDPT));
 }
 
-/// PT index for `vaddr`.
+/// Summary:
+/// Computes PT index for a virtual address.
+///
+/// Args:
+/// - `vaddr`: Virtual address.
+///
+/// Returns:
+/// - `u9` PT index.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 fn pt_index(vaddr: VAddr) u9 {
     return @truncate(vaddr.addr >> @intFromEnum(PageLevelShift.PT));
 }

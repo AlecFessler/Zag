@@ -1,38 +1,55 @@
 //! Intrusive singly/doubly-linked freelist with optional base back-pointer.
 //!
-//! Design:
-//! - T must be a **writable pointer type**; the pointed-to storage must
-//!   be large/aligned enough to host `FreeNode`. We store the list node
-//!   **inside** the freed object (intrusive).
-//! - `using_popSpecific=true` enables O(1) removal of a known node via
-//!   stored `prev` links (otherwise only LIFO `pop()` is available).
-//! - `link_to_base=true` stores a back-pointer to the owning list in
-//!   each node (`node.base = self`), useful for validation/auditing.
+//! Provides an intrusive LIFO freelist where the list node lives **inside**
+//! each freed object. Configurable at compile time to support O(1) removal of
+//! known nodes (`popSpecific`) via a maintained `prev` link, and/or to embed a
+//! back-pointer to the owning list (`base`) for validation/auditing.
 //!
-//! Safety:
-//! - In Debug builds, a `dbg_magic` tag is written while the node is on
-//!   the freelist and asserted on removal to catch use-after-free.
+//! # Directory
 //!
-//! Complexity:
-//! - `push`: O(1)
-//! - `pop`: O(1)
-//! - `popSpecific`: O(1) when enabled
+//! ## Type Definitions
+//! - `IntrusiveFreeList(T, using_popSpecific, link_to_base)` — factory returning
+//!   a concrete freelist `type` with `head` field, nested `FreeNode`, and methods.
+//!
+//! ## Constants
+//! - `DBG` — compile-mode flag enabling debug assertions and tags.
+//! - `DBG_MAGIC` — magic value written into nodes while they reside on the list.
+//!
+//! ## Variables
+//! - None at module scope. The returned `type` contains a `head` field.
+//!
+//! ## Functions
+//! - `IntrusiveFreeList` — factory that builds a freelist `type` specialized to `T`.
 
 const builtin = @import("builtin");
 const std = @import("std");
 
+/// Compile-mode flag enabling debug-time assertions and node tagging.
 const DBG = builtin.mode == .Debug;
+
+/// Magic value written into `dbg_magic` while a node resides on the freelist.
 const DBG_MAGIC = 0x0DEAD2A6DEAD2A60;
 
+/// Summary:
 /// Factory for an intrusive freelist over elements of pointer type `T`.
 ///
-/// Compile-time parameters:
-/// - `T`: pointer-to-element type (must be a pointer; element must fit `FreeNode`).
-/// - `using_popSpecific`: when true, enables O(1) `popSpecific()` by keeping `prev`.
-/// - `link_to_base`: when true, embeds a `base: *Self` back-pointer in nodes.
+/// Arguments:
+/// - `T`: Pointer-to-element type; the element storage must fit/align for `FreeNode`.
+/// - `using_popSpecific`: When `true`, enables O(1) `popSpecific()` by tracking `prev`.
+/// - `link_to_base`: When `true`, embeds a `base: *Self` back-pointer in each node.
 ///
 /// Returns:
-/// - A concrete freelist `type` with `push`, `pop`, and optional `popSpecific`.
+/// - A concrete freelist `type` exposing:
+///   - field `head: ?*FreeNode`
+///   - nested `FreeNode` node layout
+///   - methods `push`, `pop`, `popSpecific` (when enabled), and private `zeroItem`.
+///
+/// Errors:
+/// - None at runtime. May emit `@compileError` if misused at compile time (e.g., calling
+///   `popSpecific` without `using_popSpecific=true`).
+///
+/// Panics:
+/// - None.
 pub fn IntrusiveFreeList(
     comptime T: type,
     comptime using_popSpecific: bool,
@@ -57,11 +74,13 @@ pub fn IntrusiveFreeList(
         /// - `prev` (when `using_popSpecific`): back link for O(1) removal.
         /// - `base` (when `link_to_base`): owning list pointer.
         pub const FreeNode = struct {
-            /// dbg magic helps detect use after free in the assertion in pop()
-            /// by ensuring that nodes are not written to while in the free list
+            /// Debug tag set while the node is on the list to catch UAF in Debug builds.
             dbg_magic: if (DBG) u64 else void,
+            /// Forward link to the next node in the freelist.
             next: ?*FreeNode = null,
+            /// Back link for O(1) removal; only present when `using_popSpecific=true`.
             prev: if (using_popSpecific) ?*FreeNode else void = if (using_popSpecific) null,
+            /// Back-pointer to the owning list; only present when `link_to_base=true`.
             base: if (link_to_base) *Self else void,
         };
 
@@ -71,11 +90,21 @@ pub fn IntrusiveFreeList(
             std.debug.assert(@alignOf(ValType) >= @alignOf(FreeNode));
         }
 
+        /// Summary:
         /// Push an element onto the freelist (LIFO).
         ///
         /// Arguments:
-        /// - `self`: list instance.
-        /// - `addr`: pointer to an element of type `T`.
+        /// - `self`: List instance.
+        /// - `addr`: Pointer to an element of type `T`.
+        ///
+        /// Returns:
+        /// - None (void).
+        ///
+        /// Errors:
+        /// - None.
+        ///
+        /// Panics:
+        /// - None.
         pub fn push(self: *Self, addr: T) void {
             zeroItem(@ptrCast(addr));
             const node: *FreeNode = @alignCast(@ptrCast(addr));
@@ -95,13 +124,20 @@ pub fn IntrusiveFreeList(
             self.head = node;
         }
 
+        /// Summary:
         /// Pop the most recently pushed element.
         ///
         /// Arguments:
-        /// - `self`: list instance.
+        /// - `self`: List instance.
         ///
         /// Returns:
-        /// - `T` on success, or `null` if the list is empty.
+        /// - `?T` — the popped element pointer on success or `null` if empty.
+        ///
+        /// Errors:
+        /// - None.
+        ///
+        /// Panics:
+        /// - Panics in Debug builds if `dbg_magic` is corrupted (use-after-free indicator).
         pub fn pop(self: *Self) ?T {
             const addr = self.head orelse {
                 return null;
@@ -121,17 +157,26 @@ pub fn IntrusiveFreeList(
             return @alignCast(@ptrCast(addr));
         }
 
+        /// Summary:
         /// Remove a specific element from anywhere in the list in O(1).
         ///
         /// Requires:
-        /// - `using_popSpecific=true` at type construction time.
+        /// - Constructed with `using_popSpecific=true`.
         ///
         /// Arguments:
-        /// - `self`: list instance.
-        /// - `addr`: pointer to an element that is currently on `self`.
+        /// - `self`: List instance.
+        /// - `addr`: Pointer to an element that is currently on `self`.
         ///
         /// Returns:
-        /// - `T` on success, or `null` if the list was empty at head and fell back to `pop()`.
+        /// - `?T` — the removed element pointer on success, or if the element was
+        ///   at the head this may delegate to `pop()` and return that result; `null`
+        ///   only if the list was empty at head and fell back to `pop()`.
+        ///
+        /// Errors:
+        /// - None at runtime. If `using_popSpecific=false`, emits a compile-time error.
+        ///
+        /// Panics:
+        /// - Panics in Debug builds if `dbg_magic` is corrupted (use-after-free indicator).
         pub fn popSpecific(self: *Self, addr: T) ?T {
             if (!using_popSpecific) @compileError("must set using_popSpecific flag on the IntrusiveFreelist type to call popSpecific()");
 
@@ -166,10 +211,20 @@ pub fn IntrusiveFreeList(
             return @alignCast(@ptrCast(node));
         }
 
-        /// Zero the inlined freelist node inside the element.
+        /// Summary:
+        /// Zero the inlined freelist node inside the element payload.
         ///
         /// Arguments:
-        /// - `item`: byte pointer to the start of the element payload.
+        /// - `item`: Byte pointer to the start of the element payload.
+        ///
+        /// Returns:
+        /// - None (void).
+        ///
+        /// Errors:
+        /// - None.
+        ///
+        /// Panics:
+        /// - None.
         fn zeroItem(item: [*]u8) void {
             const len = @sizeOf(FreeNode);
             @memset(item[0..len], 0);

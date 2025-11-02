@@ -130,27 +130,25 @@ pub fn build(b: *std.Build) void {
     kernel.root_module.addImport("zag", zag_mod);
     kernel.root_module.addImport("boot_defs", defs_mod);
 
-    const qemu_args = [_][]const u8{
-        "qemu-system-x86_64",
-        "-m",
-        "512M",
-        "-bios",
-        "/usr/share/ovmf/x64/OVMF.4m.fd",
-        "-drive",
-        b.fmt("file=fat:rw:{s}/{s},format=raw", .{
-            b.install_path,
-            out_dir_name,
-        }),
-        "-nographic",
-        "-serial",
-        "mon:stdio",
-        "-no-reboot",
-        "-enable-kvm",
-        "-cpu",
-        "host",
-        "-s",
-    };
-    const qemu_cmd = b.addSystemCommand(&qemu_args);
+    const qemu_cmdline = b.fmt(
+        \\exec qemu-system-x86_64 \
+        \\ -m 512M \
+        \\ -bios /usr/share/ovmf/x64/OVMF.4m.fd \
+        \\ -drive file=fat:rw:{s}/{s},format=raw \
+        \\ -nographic \
+        \\ -serial mon:stdio \
+        \\ -no-reboot \
+        \\ -enable-kvm \
+        \\ -cpu host,+invtsc \
+        \\ -smp cores="$(
+        \\   lscpu -p=Core,Socket | grep -v '^#' | sort -u | wc -l
+        \\ )",threads=1,sockets=1 \
+        \\ -s
+    , .{ b.install_path, out_dir_name });
+
+    const qemu_cmd = b.addSystemCommand(&[_][]const u8{
+        "sh", "-lc", qemu_cmdline,
+    });
     qemu_cmd.step.dependOn(b.getInstallStep());
 
     const run_qemu_cmd = b.step("run", "Run QEMU");

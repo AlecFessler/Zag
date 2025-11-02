@@ -2,12 +2,28 @@
 //!
 //! Responsibilities:
 //! - Initialize logging and access UEFI Boot Services.
-//! - Duplicate the current PML4 into a writeable page and reload CR3.
+//! - Duplicate the current PML4 into a writable page and reload CR3.
 //! - Open the boot volume via Simple File System and load `kernel.elf`.
 //! - Map PT_LOAD segments with appropriate permissions (RO/RW, NX).
 //! - Load `kernel.map` into a reserved pool for later symbolization.
 //! - Discover ACPI XSDP and capture the final memory map.
 //! - Exit Boot Services, build `BootInfo`, and jump to the kernel entry.
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - `KEntryType` — function type for the kernel entry point (SysV x86_64, noreturn).
+//!
+//! ## Constants
+//! - `std_options` — default logging options forwarded from the boot logger.
+//!
+//! ## Variables
+//! - None.
+//!
+//! ## Functions
+//! - `main` — UEFI application entry: load kernel, exit BS, handoff to kernel.
+//! - `loadKernel` — open/map `kernel.elf`, set permissions, return entry (private).
+//! - `loadKsymsMap` — read `kernel.map` into reserved pool and return bytes (private).
 
 const alloc_mod = @import("boot_allocator.zig");
 const defs_mod = @import("defs.zig");
@@ -22,20 +38,28 @@ const elf = std.elf;
 const paging = x86.Paging;
 const uefi = std.os.uefi;
 
+/// Function type of the kernel entry point (`noreturn`, SysV x86_64).
 pub const KEntryType = fn (defs_mod.BootInfo) callconv(.{ .x86_64_sysv = .{} }) noreturn;
 
+/// Default logging options exposed to the standard library.
 pub const std_options = log_mod.default_log_options;
 
-/// UEFI application entry point.
+/// Summary:
+/// UEFI application entry point: initialize services, duplicate PML4, load and map
+/// `kernel.elf`, load `kernel.map`, locate ACPI XSDP, capture final memory map,
+/// exit Boot Services, build `BootInfo`, and jump to kernel entry.
 ///
-/// Performs loader setup, copies the current PML4 into a fresh page,
-/// opens the boot volume, loads and maps `kernel.elf`, loads `kernel.map`,
-/// locates ACPI XSDP, acquires the final memory map, exits Boot Services,
-/// constructs `BootInfo`, and tail-calls the kernel entry point.
+/// Arguments:
+/// - None.
 ///
 /// Returns:
-/// - `.aborted` on failure (errors are logged here).
-/// - Does not return on success (transfers control to the kernel).
+/// - `uefi.Status` — `.aborted` on failure; does not return on success (transfers control).
+///
+/// Errors:
+/// - None returned directly (errors are logged and mapped to `.aborted`).
+///
+/// Panics:
+/// - None.
 pub fn main() uefi.Status {
     log_mod.init(uefi.system_table.con_out.?) catch return .aborted;
     const log = std.log.scoped(.loader);
@@ -144,23 +168,23 @@ pub fn main() uefi.Status {
     unreachable;
 }
 
-/// Load and map `kernel.elf` into the provided page tables, returning the entry address.
+/// Summary:
+/// Load and map `kernel.elf` into `new_pml4_paddr`, establishing RO/RW and NX permissions
+/// derived from ELF `p_flags`, and return the ELF entry point address.
 ///
-/// Behavior:
-/// - Opens `kernel.elf`, parses ELF header and program headers.
-/// - Allocates backing pages for each `PT_LOAD` segment and identity maps them
-///   into `new_pml4_paddr` with permissions derived from `p_flags` (read-only
-///   vs read-write, and NX for non-executable segments).
-/// - Copies file bytes into mapped memory and zero-fills BSS (`p_memsz > p_filesz`).
-///
-/// Params:
+/// Arguments:
 /// - `boot_services`: UEFI boot services pointer.
-/// - `root_dir`: root volume already opened.
+/// - `root_dir`: open root directory of the boot volume.
 /// - `new_pml4_paddr`: physical address of the active PML4 to receive mappings.
 ///
 /// Returns:
-/// - `elf.Elf64_Addr` entry point on success.
-/// - `null` on failure (errors are logged here).
+/// - `?elf.Elf64_Addr` — entry point on success; `null` on failure.
+///
+/// Errors:
+/// - None (logs UEFI/ELF errors and returns `null`).
+///
+/// Panics:
+/// - None.
 fn loadKernel(
     boot_services: *uefi.tables.BootServices,
     root_dir: *uefi.protocol.File,
@@ -227,9 +251,13 @@ fn loadKernel(
 
     var iter = elf_header.iterateProgramHeadersBuffer(prefix_buffer);
 
+    // marking these pages as acpi reclaim means the kernel will physmap them,
+    // but it will not give them to the pmm for use, this is good because it means
+    // page tables we allocate for the kernel here will be correctly mapped when the
+    // kernel drops the identity mappings that the firmware provides
     var page_allocator = alloc_mod.PageAllocator.init(
         boot_services,
-        .reserved_memory_type,
+        .acpi_reclaim_memory,
     );
     const page_alloc_iface = page_allocator.allocator();
 
@@ -266,9 +294,10 @@ fn loadKernel(
                 @ptrFromInt(new_pml4_paddr.addr),
                 paging.PAddr.fromInt(backing_page_paddr),
                 paging.VAddr.fromInt(vaddr),
-                if (writeable) .ReadWrite else .Readonly,
-                not_executeable,
-                .Supervisor,
+                if (writeable) .rw else .ro,
+                if (not_executeable) .nx else .x,
+                .cache,
+                .su,
                 .Page4K,
                 .identity,
                 page_alloc_iface,
@@ -312,15 +341,21 @@ fn loadKernel(
     return elf_header.entry;
 }
 
-/// Load `kernel.map` into a reserved UEFI pool and return its bytes.
+/// Summary:
+/// Load `kernel.map` into a reserved UEFI pool and return its byte slice.
 ///
-/// Params:
-/// - `boot_services`: UEFI boot services pointer
-/// - `root_dir`: already-opened root volume
+/// Arguments:
+/// - `boot_services`: UEFI boot services pointer.
+/// - `root_dir`: already-opened root volume.
 ///
 /// Returns:
-/// - `[]u8` slice of the file contents on success
-/// - `null` on failure (errors are logged here)
+/// - `?[]u8` — slice of file contents on success; `null` on failure.
+///
+/// Errors:
+/// - None (errors are logged and `null` is returned).
+///
+/// Panics:
+/// - None.
 fn loadKsymsMap(
     boot_services: *uefi.tables.BootServices,
     root_dir: *uefi.protocol.File,

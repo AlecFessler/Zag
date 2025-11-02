@@ -1,44 +1,107 @@
-//! Interrupt stubs and dispatch for x86-64.
+//! Interrupt dispatch table, vector stubs, and common ISR trampoline.
 //!
-//! Provides a common naked stub that saves/restores registers, routes to the
-//! correct handler, and returns with `iretq`. Also exposes a comptime factory
-//! for per-vector stubs that push the expected error code layout.
+//! Provides a compile-time table of 256 interrupt stubs, a registry for
+//! associating vectors with handlers, and a naked common ISR trampoline that
+//! captures CPU state and routes to `dispatchInterrupt`. Supports exceptions,
+//! external (e.g., LAPIC) and software vectors, with optional LAPIC EOI.
+//! Designed for early bring-up and kernel use.
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - `VectorAck` – acknowledges source after handler returns (none or LAPIC).
+//! - `VectorKind` – categorizes vector origin (exception/external/software).
+//! - `VectorEntry` – registry entry holding handler, kind, and ack policy.
+//! - `Handler` – function pointer type for interrupt handlers.
+//!
+//! ## Constants
+//! - `STUBS` – array of 256 prebuilt interrupt stubs for the IDT.
+//! - `PUSHES_ERR` – table of which vectors push an error code.
+//!
+//! ## Variables
+//! - `vector_table` – registry of installed handlers and metadata by vector.
+//!
+//! ## Functions
+//! - `getInterruptStub` – build a naked ISR stub for a specific vector.
+//! - `registerException` – register handler for an exception vector.
+//! - `registerExternalLapic` – register handler for an external LAPIC vector.
+//! - `registerSoftware` – register handler for a software vector.
+//! - `registerVector` – internal helper to populate `vector_table`.
+//! - `commonInterruptStub` – naked common ISR trampoline (exported).
+//! - `dispatchInterrupt` – looks up handler, invokes it, and issues EOI if needed.
 
+const apic = @import("apic.zig");
 const cpu = @import("cpu.zig");
 const idt = @import("idt.zig");
-const irq = @import("irq.zig");
-const isr = @import("isr.zig");
 const std = @import("std");
 
-/// CPU context captured on interrupt entry (matches common stub push order).
-pub const InterruptContext = packed struct {
-    /// General registers saved by the common stub.
-    regs: cpu.Registers,
-    /// Interrupt vector number (pushed by per-vector stub).
-    int_num: u64,
-    /// Error code (real or synthetic 0 depending on vector).
-    err_code: u64,
-    /// Saved instruction pointer.
-    rip: u64,
-    /// Saved code segment selector.
-    cs: u64,
-    /// Saved RFLAGS.
-    rflags: u64,
-    /// Saved stack pointer.
-    rsp: u64,
-    /// Saved stack segment selector.
-    ss: u64,
+/// Acknowledge policy for a handled vector (e.g., LAPIC EOI required).
+pub const VectorAck = enum {
+    none,
+    lapic,
 };
 
-/// Generates a naked interrupt stub for `int_num`.
+/// Classification of an interrupt vector's origin.
+pub const VectorKind = enum {
+    exception,
+    external,
+    software,
+};
+
+/// Registry entry describing a vector's handler and metadata.
+const VectorEntry = struct {
+    handler: ?Handler = null,
+    kind: VectorKind = .external,
+    ack: VectorAck = .none,
+};
+
+/// Function pointer type for interrupt handlers.
+const Handler = *const fn (*cpu.Context) void;
+
+/// Prebuilt interrupt stubs (0..255) for installing into the IDT.
+pub const STUBS: [256]idt.interruptHandler = blk: {
+    var arr: [256]idt.interruptHandler = undefined;
+    for (0..256) |i| {
+        arr[i] = getInterruptStub(i, PUSHES_ERR[i]);
+    }
+    break :blk arr;
+};
+
+/// Map of which vectors push an error code per the architecture.
+const PUSHES_ERR = blk: {
+    var a: [256]bool = .{false} ** 256;
+    a[8] = true;
+    a[10] = true;
+    a[11] = true;
+    a[12] = true;
+    a[13] = true;
+    a[14] = true;
+    a[17] = true;
+    a[20] = true;
+    a[30] = true;
+    break :blk a;
+};
+
+/// Global registry of vector handlers and their metadata.
+var vector_table: [256]VectorEntry = .{VectorEntry{}} ** 256;
+
+/// Summary:
+/// Returns a naked ISR stub for `int_num` that pushes the vector number and,
+/// if `pushes_err` is true, preserves the architecture-pushed error slot
+/// before tail-jumping to `commonInterruptStub`.
 ///
-/// Arguments:
-/// - `int_num`: interrupt vector (0..255)
-/// - `pushes_err`: whether the CPU pushes an error code for this vector
+/// Args:
+/// - int_num: Compile-time vector number (0–255).
+/// - pushes_err: Compile-time flag indicating whether the CPU pushes an error code.
 ///
 /// Returns:
-/// - `idt.interruptHandler`: pointer to a naked stub that pushes `(err_code,int_num)`
-///   to match `InterruptContext`, then jumps to `commonInterruptStub`.
+/// - idt.interruptHandler: The generated naked stub function to place in the IDT.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn getInterruptStub(comptime int_num: u8, comptime pushes_err: bool) idt.interruptHandler {
     return struct {
         fn stub() callconv(.naked) void {
@@ -47,7 +110,7 @@ pub fn getInterruptStub(comptime int_num: u8, comptime pushes_err: bool) idt.int
                     \\pushq %[num]
                     \\jmp commonInterruptStub
                     :
-                    : [num] "i" (@as(usize, int_num))
+                    : [num] "i" (@as(u64, int_num)),
                 );
             } else {
                 asm volatile (
@@ -55,18 +118,120 @@ pub fn getInterruptStub(comptime int_num: u8, comptime pushes_err: bool) idt.int
                     \\pushq %[num]
                     \\jmp commonInterruptStub
                     :
-                    : [num] "i" (@as(usize, int_num))
+                    : [num] "i" (@as(u64, int_num)),
                 );
             }
         }
     }.stub;
 }
 
-/// Common naked entry used by all interrupt gates.
+/// Summary:
+/// Registers a handler for an exception vector in the dispatch table.
+/// No acknowledgement is issued after the handler returns.
 ///
-/// Saves GPRs, builds an `InterruptContext` on the stack, calls
-/// `dispatchInterrupt(ctx)` with `%rdi = %rsp`, restores state, and returns via
-/// `iretq`. Must be installed behind an IDT gate pointing at this symbol.
+/// Args:
+/// - vector: Exception vector number (0–31 typically).
+/// - handler: Function pointer taking `*cpu.Context`.
+///
+/// Returns:
+/// - void.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn registerException(vector: u8, handler: Handler) void {
+    registerVector(vector, handler, .exception, .none);
+}
+
+/// Summary:
+/// Registers a handler for an external LAPIC-delivered interrupt and configures
+/// the dispatcher to issue LAPIC EOI after the handler returns.
+///
+/// Args:
+/// - vector: External interrupt vector number (typically 32+).
+/// - handler: Function pointer taking `*cpu.Context`.
+///
+/// Returns:
+/// - void.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn registerExternalLapic(vector: u8, handler: Handler) void {
+    registerVector(vector, handler, .external, .lapic);
+}
+
+/// Summary:
+/// Registers a handler for a software-generated interrupt with no acknowledgement.
+///
+/// Args:
+/// - vector: Software interrupt vector number.
+/// - handler: Function pointer taking `*cpu.Context`.
+///
+/// Returns:
+/// - void.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn registerSoftware(vector: u8, handler: Handler) void {
+    registerVector(vector, handler, .software, .none);
+}
+
+/// Summary:
+/// Internal helper that writes a new `VectorEntry` into `vector_table`.
+/// Ensures a vector is registered at most once.
+///
+/// Args:
+/// - vector: Vector number to register.
+/// - handler: Function pointer taking `*cpu.Context`.
+/// - kind: Classification of the vector origin.
+/// - ack: Post-handler acknowledgement policy.
+///
+/// Returns:
+/// - void.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - Panics if the vector already has a registered handler.
+fn registerVector(
+    vector: u8,
+    handler: Handler,
+    kind: VectorKind,
+    ack: VectorAck,
+) void {
+    std.debug.assert(vector_table[vector].handler == null);
+    vector_table[vector] = .{
+        .handler = handler,
+        .kind = kind,
+        .ack = ack,
+    };
+}
+
+/// Summary:
+/// Common naked ISR trampoline exported for all stubs. Saves caller registers
+/// to build a `cpu.Context`, calls `dispatchInterrupt`, restores registers, and
+/// returns with `iretq`.
+///
+/// Args:
+/// - None.
+///
+/// Returns:
+/// - void.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 export fn commonInterruptStub() callconv(.naked) void {
     asm volatile (
         \\pushq %rax
@@ -106,20 +271,31 @@ export fn commonInterruptStub() callconv(.naked) void {
         \\
         \\addq $16, %rsp
         \\iretq
-        :
-        :
-        : .{ .memory = true, .cc = true }
-    );
+        ::: .{ .memory = true, .cc = true });
 }
 
-/// Routes an interrupt to the appropriate handler table.
+/// Summary:
+/// Dispatches to the registered handler for `ctx.int_num`, then issues LAPIC
+/// EOI if the vector's acknowledgement policy requires it.
 ///
-/// Arguments:
-/// - `ctx`: pointer to the interrupt context built by the stub.
-export fn dispatchInterrupt(ctx: *InterruptContext) void {
-    if (ctx.int_num < isr.NUM_ISR_ENTRIES or ctx.int_num == isr.SYSCALL_INT_VECTOR) {
-        isr.dispatchIsr(ctx);
-    } else {
-        irq.dispatchIrq(ctx);
+/// Args:
+/// - ctx: Saved register context captured by `commonInterruptStub`.
+///
+/// Returns:
+/// - void.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - Panics if no handler is registered for the vector.
+export fn dispatchInterrupt(ctx: *cpu.Context) void {
+    if (vector_table[ctx.int_num].handler) |h| {
+        h(ctx);
+        if (vector_table[@intCast(ctx.int_num)].ack == .lapic) {
+            apic.endOfInterrupt();
+        }
+        return;
     }
+    @panic("Unhandled interrupt!");
 }

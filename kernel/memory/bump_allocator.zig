@@ -3,29 +3,49 @@
 //! Owns a contiguous region and returns aligned slices by advancing a single
 //! pointer. No deallocation; only growth until the end of the region. Useful
 //! during early boot/bring-up or as a simple backing allocator for metadata.
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - BumpAllocator – monotonic allocator over a `[start, end)` region.
+//!
+//! ## Constants
+//! - None.
+//!
+//! ## Variables
+//! - None.
+//!
+//! ## Functions
+//! - BumpAllocator.init – construct a bump allocator for a region.
+//! - BumpAllocator.allocator – expose as `std.mem.Allocator`.
+//! - BumpAllocator.alloc – vtable entry: allocate (monotonic grow).
+//! - BumpAllocator.resize – vtable entry: unsupported (traps).
+//! - BumpAllocator.remap – vtable entry: unsupported (traps).
+//! - BumpAllocator.free – vtable entry: unsupported (traps).
 
 const std = @import("std");
 
-/// Owning allocator. Manages a contiguous address space; does not take a
-/// backing allocator; can itself be used as a backing allocator.
-///
-/// Fields:
-/// - `start_addr`: start of the managed range (inclusive).
-/// - `free_addr`: next allocation will begin at or after this address.
-/// - `end_addr`: end of the managed range (exclusive).
+/// Monotonic allocator over a half-open `[start, end)` address range.
 pub const BumpAllocator = struct {
     start_addr: u64,
     free_addr: u64,
     end_addr: u64,
 
+    /// Summary:
     /// Initializes a bump allocator over `[start_addr, end_addr)`.
     ///
     /// Arguments:
-    /// - `start_addr`: start of the region (inclusive).
-    /// - `end_addr`: end of the region (exclusive). Must be `> start_addr`.
+    /// - start_addr: Start of the region (inclusive).
+    /// - end_addr: End of the region (exclusive). Must be `> start_addr`.
     ///
     /// Returns:
-    /// - A `BumpAllocator` with `free_addr = start_addr`.
+    /// - `BumpAllocator`: New allocator with `free_addr = start_addr`.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - Panics if `end_addr <= start_addr` (failed precondition).
     pub fn init(start_addr: u64, end_addr: u64) BumpAllocator {
         std.debug.assert(end_addr > start_addr);
 
@@ -36,14 +56,21 @@ pub const BumpAllocator = struct {
         };
     }
 
+    /// Summary:
     /// Exposes this allocator as a `std.mem.Allocator`.
     ///
     /// Arguments:
-    /// - `self`: allocator instance.
+    /// - self: Allocator instance.
     ///
     /// Returns:
-    /// - A `std.mem.Allocator` whose vtable redirects to this bump allocator.
-    ///   `resize`, `remap`, and `free` trap (unsupported).
+    /// - `std.mem.Allocator`: Vtable whose operations dispatch to this bump allocator.
+    ///   `resize`, `remap`, and `free` are unsupported and trap.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
     pub fn allocator(self: *BumpAllocator) std.mem.Allocator {
         return .{
             .ptr = self,
@@ -56,19 +83,24 @@ pub const BumpAllocator = struct {
         };
     }
 
-    /// `std.mem.Allocator.alloc` entry point.
-    ///
-    /// Grows `free_addr` monotonically. The returned pointer is aligned to the
-    /// requested `alignment`. Memory is not zeroed.
+    /// Summary:
+    /// `std.mem.Allocator.alloc` entry point. Advances `free_addr` monotonically
+    /// and returns an aligned pointer to uninitialized memory.
     ///
     /// Arguments:
-    /// - `ptr`: opaque pointer to `BumpAllocator` (provided by vtable).
-    /// - `len`: requested size in bytes.
-    /// - `alignment`: required alignment for the returned pointer.
-    /// - `ret_addr`: caller return address for diagnostics (unused).
+    /// - ptr: Opaque pointer to `BumpAllocator` (provided by vtable).
+    /// - len: Requested size in bytes.
+    /// - alignment: Required alignment for the returned pointer.
+    /// - ret_addr: Caller return address for diagnostics (unused).
     ///
     /// Returns:
-    /// - `[*]u8` pointer on success, or `null` if the region would overflow.
+    /// - `?[*]u8`: Non-null on success; `null` if the region would overflow.
+    ///
+    /// Errors:
+    /// - None (uses nullable return instead of error codes).
+    ///
+    /// Panics:
+    /// - None.
     fn alloc(
         ptr: *anyopaque,
         len: u64,
@@ -83,29 +115,34 @@ pub const BumpAllocator = struct {
             self.free_addr,
             alignment.toByteUnits(),
         );
-        const free_addr = aligned + len;
+        const next_free = aligned + len;
 
-        if (free_addr > self.end_addr) {
+        if (next_free > self.end_addr) {
             return null;
         }
 
-        self.free_addr = free_addr;
+        self.free_addr = next_free;
         return @ptrFromInt(aligned);
     }
 
-    /// `std.mem.Allocator.resize` entry point (unsupported).
-    ///
-    /// A bump allocator cannot grow/shrink in place; this always traps.
+    /// Summary:
+    /// `std.mem.Allocator.resize` entry point (unsupported for bump allocators).
     ///
     /// Arguments:
-    /// - `ptr`: opaque pointer (ignored).
-    /// - `memory`: previously allocated slice (ignored).
-    /// - `alignment`: required alignment (ignored).
-    /// - `new_len`: requested new length (ignored).
-    /// - `ret_addr`: caller return address (ignored).
+    /// - ptr: Opaque pointer (ignored).
+    /// - memory: Previously allocated slice (ignored).
+    /// - alignment: Required alignment (ignored).
+    /// - new_len: Requested new length (ignored).
+    /// - ret_addr: Caller return address (ignored).
     ///
     /// Returns:
-    /// - Never returns; traps with `unreachable`.
+    /// - `bool`: Never returns; traps.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - Always panics (traps with `unreachable`).
     fn resize(
         ptr: *anyopaque,
         memory: []u8,
@@ -121,19 +158,24 @@ pub const BumpAllocator = struct {
         unreachable;
     }
 
-    /// `std.mem.Allocator.remap` entry point (unsupported).
-    ///
-    /// A bump allocator cannot remap; this always traps.
+    /// Summary:
+    /// `std.mem.Allocator.remap` entry point (unsupported for bump allocators).
     ///
     /// Arguments:
-    /// - `ptr`: opaque pointer (ignored).
-    /// - `memory`: previously allocated slice (ignored).
-    /// - `alignment`: required alignment (ignored).
-    /// - `new_len`: requested new length (ignored).
-    /// - `ret_addr`: caller return address (ignored).
+    /// - ptr: Opaque pointer (ignored).
+    /// - memory: Previously allocated slice (ignored).
+    /// - alignment: Required alignment (ignored).
+    /// - new_len: Requested new length (ignored).
+    /// - ret_addr: Caller return address (ignored).
     ///
     /// Returns:
-    /// - Never returns; traps with `unreachable`.
+    /// - `?[*]u8`: Never returns; traps.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - Always panics (traps with `unreachable`).
     fn remap(
         ptr: *anyopaque,
         memory: []u8,
@@ -149,18 +191,23 @@ pub const BumpAllocator = struct {
         unreachable;
     }
 
-    /// `std.mem.Allocator.free` entry point (unsupported).
-    ///
-    /// Bump allocators don’t free individual allocations; this always traps.
+    /// Summary:
+    /// `std.mem.Allocator.free` entry point (unsupported for bump allocators).
     ///
     /// Arguments:
-    /// - `ptr`: opaque pointer (ignored).
-    /// - `buf`: slice to free (ignored).
-    /// - `alignment`: alignment (ignored).
-    /// - `ret_addr`: caller return address (ignored).
+    /// - ptr: Opaque pointer (ignored).
+    /// - buf: Slice to free (ignored).
+    /// - alignment: Alignment (ignored).
+    /// - ret_addr: Caller return address (ignored).
     ///
     /// Returns:
-    /// - Nothing; traps with `unreachable`.
+    /// - `void`: Never returns; traps.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - Always panics (traps with `unreachable`).
     fn free(
         ptr: *anyopaque,
         buf: []u8,
