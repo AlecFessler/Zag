@@ -154,12 +154,20 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     }
 
     const code_privilege_level: u64 = ctx.cs & 3;
-    const faulting_vaddr = cpu.read_cr2();
-    const faulting_page_vaddr = VAddr.fromInt(std.mem.alignBackward(
+    const faulting_virt = cpu.read_cr2();
+    const faulting_page_virt = VAddr.fromInt(std.mem.alignBackward(
         u64,
-        faulting_vaddr.addr,
+        faulting_virt.addr,
         @intFromEnum(paging.PageSize.Page4K),
     ));
+
+    serial.print("Faulting Instruction: {X}\nFaulting Address: {X}\nFaulting Page: {X}\nPresent: {}\nIs Write: {}\n", .{
+        ctx.rip,
+        faulting_virt.addr,
+        faulting_page_virt.addr,
+        pf_err.present,
+        pf_err.is_write,
+    });
 
     if (code_privilege_level == 0) {
         if (pf_err.instr_fetch) @panic("Execute fault (NX) at kernel address.");
@@ -169,31 +177,32 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         if (vmm_mod.global_vmm == null) {
             @panic("Page fault prior to vmm initialization");
         }
-        if (!vmm_mod.global_vmm.?.isValidVaddr(faulting_page_vaddr)) {
+        if (!vmm_mod.global_vmm.?.isValidVaddr(faulting_page_virt)) {
             @panic("Invalid faulting address in kernel");
         }
 
         const pmm_iface = pmm_mod.global_pmm.?.allocator();
         const page = pmm_iface.alloc(paging.PageMem(.Page4K), 1) catch @panic("PMM OOM!");
-        const phys_page_vaddr = VAddr.fromInt(@intFromPtr(page.ptr));
-        const phys_page_paddr = PAddr.fromVAddr(phys_page_vaddr, .physmap);
+        const phys_page_virt = VAddr.fromInt(@intFromPtr(page.ptr));
+        const phys_page_phys = PAddr.fromVAddr(phys_page_virt, .physmap);
 
-        const pml4_paddr = PAddr.fromInt(paging.read_cr3().addr & ~@as(u64, 0xfff));
-        const pml4_vaddr = VAddr.fromPAddr(pml4_paddr, .physmap);
+        const pml4_phys = PAddr.fromInt(paging.read_cr3().addr & ~@as(u64, 0xfff));
+        const pml4_virt = VAddr.fromPAddr(pml4_phys, .physmap);
 
         paging.mapPage(
-            @ptrFromInt(pml4_vaddr.addr),
-            phys_page_paddr,
-            faulting_page_vaddr,
-            .ReadWrite,
-            true,
-            .Supervisor,
+            @ptrFromInt(pml4_virt.addr),
+            phys_page_phys,
+            faulting_page_virt,
+            .rw,
+            .nx,
+            .cache,
+            .su,
             .Page4K,
             .physmap,
             pmm_iface,
         );
 
-        cpu.invlpg(faulting_page_vaddr);
+        cpu.invlpg(faulting_page_virt);
     } else {
         @panic("Userspace page fault handler not implemented!");
     }

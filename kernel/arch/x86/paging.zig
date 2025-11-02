@@ -5,6 +5,7 @@
 //! Assumes 4-level paging with optional 2MiB/1GiB large pages.
 
 const std = @import("std");
+const serial = @import("serial.zig");
 
 /// Top-level virtual address slots (PML4 indices) we reserve.
 pub const AddressSpace = enum(u9) {
@@ -31,14 +32,24 @@ pub const PageSize = enum(u64) {
 
 /// Read/write bit for entries.
 pub const RW = enum(u1) {
-    Readonly,
-    ReadWrite,
+    ro,
+    rw,
 };
 
 /// User/supervisor bit for entries.
 pub const User = enum(u1) {
-    User,
-    Supervisor,
+    u,
+    su,
+};
+
+pub const Executeable = enum(u1) {
+    x,
+    nx,
+};
+
+pub const Cacheable = enum(u1) {
+    cache,
+    ncache,
 };
 
 /// Bit shifts for each page-table level.
@@ -80,7 +91,7 @@ pub const PageEntry = packed struct {
     rw: RW,
     user: User,
     write_through: bool,
-    cache_disable: bool,
+    cache_disable: Cacheable,
     accessed: bool,
     dirty: bool,
     huge_page: bool,
@@ -88,7 +99,7 @@ pub const PageEntry = packed struct {
     ignored: u3,
     addr: u40,
     reserved: u11,
-    nx: bool,
+    nx: Executeable,
 
     /// Stores a physical address into the entry (asserts 4KiB alignment).
     pub fn setPAddr(self: *PageEntry, paddr: PAddr) void {
@@ -140,10 +151,10 @@ const PTEntry = PageEntry;
 /// Zeroed entry template used for freshly allocated tables.
 pub const default_flags = PageEntry{
     .present = false,
-    .rw = .Readonly,
-    .user = .Supervisor,
+    .rw = .ro,
+    .user = .su,
     .write_through = false,
-    .cache_disable = false,
+    .cache_disable = .ncache,
     .accessed = false,
     .dirty = false,
     .huge_page = false,
@@ -151,7 +162,7 @@ pub const default_flags = PageEntry{
     .ignored = 0,
     .addr = 0,
     .reserved = 0,
-    .nx = true,
+    .nx = .nx,
 };
 
 /// Required alignment for page tables and 4KiB pages.
@@ -179,7 +190,7 @@ pub const PAGE_TABLE_SIZE = 512;
 pub fn dropIdentityMap() void {
     const cr3 = read_cr3();
     const pml4_paddr = PAddr.fromInt(cr3.addr & ~@as(u64, 0xfff));
-    const pml4_vaddr = VAddr.fromPAddr(pml4_paddr, .identity);
+    const pml4_vaddr = VAddr.fromPAddr(pml4_paddr, .physmap);
     const pml4 = pml4_vaddr.getPtr([*]PML4Entry);
 
     for(0..256) |i| {
@@ -203,7 +214,8 @@ pub fn mapPage(
     paddr: PAddr,
     vaddr: VAddr,
     rw: RW,
-    nx: bool,
+    nx: Executeable,
+    cacheable: Cacheable,
     user: User,
     page_size: PageSize,
     mapping_type: MappingType,
@@ -212,12 +224,12 @@ pub fn mapPage(
     std.debug.assert(std.mem.isAligned(paddr.addr, PAGE_ALIGN.toByteUnits()));
     std.debug.assert(std.mem.isAligned(vaddr.addr, PAGE_ALIGN.toByteUnits()));
 
-    const flags = PageEntry{
+    const parent_flags = PageEntry{
         .present = true,
-        .rw = .ReadWrite,
+        .rw = .rw,
         .user = user,
         .write_through = false,
-        .cache_disable = false,
+        .cache_disable = .cache,
         .accessed = false,
         .dirty = false,
         .huge_page = false,
@@ -225,7 +237,23 @@ pub fn mapPage(
         .ignored = 0,
         .addr = 0,
         .reserved = 0,
-        .nx = false,
+        .nx = .x,
+    };
+
+    const leaf_flags = PageEntry{
+        .present = true,
+        .rw = rw,
+        .user = user,
+        .write_through = false,
+        .cache_disable = cacheable,
+        .accessed = false,
+        .dirty = false,
+        .huge_page = false,
+        .global = false,
+        .ignored = 0,
+        .addr = 0,
+        .reserved = 0,
+        .nx = nx,
     };
 
     const pml4_idx = pml4_index(vaddr);
@@ -235,8 +263,8 @@ pub fn mapPage(
 
     std.debug.assert(pml4_idx < 512);
     std.debug.assert(pdpt_idx < 512);
-    std.debug.assert(pd_idx   < 512);
-    std.debug.assert(pt_idx   < 512);
+    std.debug.assert(pd_idx < 512);
+    std.debug.assert(pt_idx < 512);
 
     var pdpt_entry = &pml4[pml4_idx];
     if (!pdpt_entry.present) {
@@ -244,7 +272,7 @@ pub fn mapPage(
             PDPTEntry, PAGE_ALIGN, PAGE_TABLE_SIZE,
         ) catch @panic("Went OOM mapping pages!");
         @memset(new_pdpt, default_flags);
-        pdpt_entry.* = flags;
+        pdpt_entry.* = parent_flags;
         const new_pdpt_vaddr = VAddr.fromInt(@intFromPtr(new_pdpt.ptr));
         const new_pdpt_paddr = PAddr.fromVAddr(new_pdpt_vaddr, mapping_type);
         pdpt_entry.setPAddr(new_pdpt_paddr);
@@ -254,21 +282,20 @@ pub fn mapPage(
 
     if (page_size == .Page1G) {
         var entry = &pdpt[pdpt_idx];
-        entry.* = flags;
+        entry.* = leaf_flags;
         entry.huge_page = true;
-        entry.rw = rw;
-        if (nx) entry.nx = true;
         entry.setPAddr(paddr);
         return;
     }
 
     var pd_entry = &pdpt[pdpt_idx];
+    //serial.print("pdpt idx: {}\npd entry {X}\n", .{pdpt_idx, @intFromPtr(pd_entry)});
     if (!pd_entry.present) {
         const new_pd: []align(PAGE_ALIGN.toByteUnits()) PDEntry = allocator.alignedAlloc(
             PDEntry, PAGE_ALIGN, PAGE_TABLE_SIZE,
         ) catch @panic("Went OOM mapping pages!");
         @memset(new_pd, default_flags);
-        pd_entry.* = flags;
+        pd_entry.* = parent_flags;
         const new_pd_vaddr = VAddr.fromInt(@intFromPtr(new_pd.ptr));
         const new_pd_paddr = PAddr.fromVAddr(new_pd_vaddr, mapping_type);
         pd_entry.setPAddr(new_pd_paddr);
@@ -278,10 +305,8 @@ pub fn mapPage(
 
     if (page_size == .Page2M) {
         var entry = &pd[pd_idx];
-        entry.* = flags;
+        entry.* = leaf_flags;
         entry.huge_page = true;
-        entry.rw = rw;
-        if (nx) entry.nx = true;
         entry.setPAddr(paddr);
         return;
     }
@@ -292,7 +317,7 @@ pub fn mapPage(
             PTEntry, PAGE_ALIGN, PAGE_TABLE_SIZE,
         ) catch @panic("Went OOM mapping pages!");
         @memset(new_pt, default_flags);
-        pt_entry.* = flags;
+        pt_entry.* = parent_flags;
         const new_pt_vaddr = VAddr.fromInt(@intFromPtr(new_pt.ptr));
         const new_pt_paddr = PAddr.fromVAddr(new_pt_vaddr, mapping_type);
         pt_entry.setPAddr(new_pt_paddr);
@@ -300,13 +325,11 @@ pub fn mapPage(
     const pt_entry_vaddr = VAddr.fromPAddr(pt_entry.getPAddr(), mapping_type);
     const pt = pt_entry_vaddr.getPtr([*]PTEntry);
 
-    pt[pt_idx] = flags;
-    pt[pt_idx].rw = rw;
-    if (nx) pt[pt_idx].nx = true;
+    pt[pt_idx] = leaf_flags;
     pt[pt_idx].setPAddr(paddr);
 }
 
-/// Returns a stack-allocated, page-size-aligned region type for allocator APIs.
+/// Returns a page-size-aligned region type for allocator APIs.
 pub fn PageMem(comptime page_size: PageSize) type {
     const size_bytes = @intFromEnum(page_size);
     return struct { mem: [size_bytes]u8 align(size_bytes) };
@@ -343,9 +366,10 @@ pub fn physMapRegion(
             @ptrFromInt(pml4_vaddr.addr),
             paddr,
             vaddr,
-            RW.ReadWrite,
-            true,
-            User.Supervisor,
+            .rw,
+            .nx,
+            .cache,
+            .su,
             @enumFromInt(chosen_size),
             .identity,
             allocator,

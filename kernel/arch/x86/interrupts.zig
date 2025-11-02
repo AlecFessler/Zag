@@ -143,5 +143,7 @@ export fn dispatchInterrupt(ctx: *cpu.Context) void {
         if (vector_table[@intCast(ctx.int_num)].ack == .lapic) {
             cpu.wrmsr(X2APIC_EOI_MSR, 0); // eoi
         }
+        return;
     }
+    @panic("Unhandled interrupt!");
 }

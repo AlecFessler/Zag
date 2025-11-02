@@ -17,16 +17,16 @@ const validationError = error{
     InvalidChecksum,
 };
 
-pub const Xsdp = extern struct {
-    signature: [8]u8,
+pub const Xsdp = packed struct {
+    signature: u64,
     checksum20: u8,
-    oem_id: [6]u8,
+    oem_id: u48,
     revision: u8,
     rsdt_paddr: u32,
     length: u32,
     xsdt_paddr: u64,
     checksum_ext: u8,
-    reserved: [3]u8,
+    reserved: u24,
 
     pub fn fromVAddr(xsdp_virt: VAddr) *Xsdp {
         @setRuntimeSafety(false);
@@ -39,7 +39,7 @@ pub const Xsdp = extern struct {
     }
 
     pub fn validate(self: *const Xsdp) !void {
-        if (!std.mem.eql(u8, &self.signature, "RSD PTR ")) {
+        if (!std.mem.eql(u8, @ptrCast(&self.signature), "RSD PTR ")) {
             return validationError.InvalidSignature;
         }
 
@@ -57,13 +57,13 @@ pub const Xsdp = extern struct {
     }
 };
 
-pub const Xsdt = extern struct {
-    signature: [4]u8,
+pub const Xsdt = packed struct {
+    signature: u32,
     length: u32,
     revision: u8,
     checksum: u8,
-    oem_id: [6]u8,
-    oem_table_id: [8]u8,
+    oem_id: u48,
+    oem_table_id: u64,
     oem_revision: u32,
     creator_id: u32,
     creator_revision: u32,
@@ -75,7 +75,7 @@ pub const Xsdt = extern struct {
     }
 
     pub fn validate(self: *const Xsdt) !void {
-        if (!std.mem.eql(u8, &self.signature, "XSDT")) {
+        if (!std.mem.eql(u8, @ptrCast(&self.signature), "XSDT")) {
             return validationError.InvalidSignature;
         }
 
@@ -114,13 +114,13 @@ pub const Xsdt = extern struct {
     }
 };
 
-pub const Sdt = extern struct {
-    signature: [4]u8,
+pub const Sdt = packed struct {
+    signature: u32,
     length: u32,
     revision: u8,
     checksum: u8,
-    oem_id: [6]u8,
-    oem_table_id: [8]u8,
+    oem_id: u48,
+    oem_table_id: u64,
     oem_revision: u32,
     creator_id: u32,
     creator_revision: u32,
@@ -139,27 +139,27 @@ pub const MadtType = enum(u8) {
     lapic_addr_override = 5,
 };
 
-pub const LocalApic = extern struct {
+pub const LocalApic = packed struct {
     processor_uid: u8,
     apic_id: u8,
     flags: u32,
 };
 
-pub const IoApic = extern struct {
+pub const IoApic = packed struct {
     ioapic_id: u8,
     _rsvd: u8 = 0,
     ioapic_addr: u32,
     gsi_base: u32,
 };
 
-pub const IntSrcOverride = extern struct {
+pub const IntSrcOverride = packed struct {
     bus: u8,
     src: u8,
     gsi: u32,
     flags: u16,
 };
 
-pub const LapicAddrOverride = extern struct {
+pub const LapicAddrOverride = packed struct {
     _rsvd: u16 = 0,
     addr: u64,
 };
@@ -208,13 +208,13 @@ pub fn decodeMadt(e: Madt.Entry) AnyMadt {
     };
 }
 
-pub const Madt = extern struct {
-    signature: [4]u8,
+pub const Madt = packed struct {
+    signature: u32,
     length: u32,
     revision: u8,
     checksum: u8,
-    oem_id: [6]u8,
-    oem_table_id: [8]u8,
+    oem_id: u48,
+    oem_table_id: u64,
     oem_revision: u32,
     creator_id: u32,
     creator_revision: u32,
@@ -227,7 +227,7 @@ pub const Madt = extern struct {
     }
 
     pub fn validate(self: *const Madt) !void {
-        if (!std.mem.eql(u8, &self.signature, "APIC")) {
+        if (!std.mem.eql(u8, @ptrCast(&self.signature), "APIC")) {
             return validationError.InvalidSignature;
         }
 
@@ -240,7 +240,7 @@ pub const Madt = extern struct {
         }
     }
 
-    pub const EntryHeader = extern struct {
+    pub const EntryHeader = packed struct {
         kind: u8,
         length: u8,
     };
@@ -286,7 +286,7 @@ pub const Madt = extern struct {
     }
 };
 
-pub const GenericAddressStruct = extern struct {
+pub const GenericAddressStruct = packed struct {
     address_space_id: u8,
     register_bit_width: u8,
     register_bit_offset: u8,
@@ -294,13 +294,13 @@ pub const GenericAddressStruct = extern struct {
     address: u64,
 };
 
-pub const HpetTable = extern struct {
-    signature: [4]u8,
+pub const HpetTable = packed struct {
+    signature: u32,
     length: u32,
     revision: u8,
     checksum: u8,
-    oem_id: [6]u8,
-    oem_table_id: [8]u8,
+    oem_id: u48,
+    oem_table_id: u64,
     oem_revision: u32,
     creator_id: u32,
     creator_revision: u32,
@@ -308,7 +308,7 @@ pub const HpetTable = extern struct {
     event_timer_block_id: u32,
     base_address: GenericAddressStruct,
     hpet_number: u8,
-    min_tick_femtosecs: u16,
+    min_tick: u16,
     page_protection: u8,
 
     pub fn fromVAddr(v: VAddr) *HpetTable {
@@ -317,11 +317,19 @@ pub const HpetTable = extern struct {
     }
 
     pub fn validate(self: *const HpetTable) !void {
-        if (!std.mem.eql(u8, &self.signature, "HPET")) return validationError.InvalidSignature;
+        if (!std.mem.eql(u8, @ptrCast(&self.signature), "HPET")) {
+            return validationError.InvalidSignature;
+        }
         var sum: u8 = 0;
         const bytes = @as([*]const u8, @ptrCast(self))[0..self.length];
-        for (bytes) |b| sum +%= b;
-        if (sum != 0) return validationError.InvalidChecksum;
-        if (self.base_address.address_space_id != 0) return error.InvalidSize;
+        for (bytes) |b| {
+            sum +%= b;
+        }
+        if (sum != 0) {
+            return validationError.InvalidChecksum;
+        }
+        if (self.base_address.address_space_id != 0) {
+            return error.InvalidSize;
+        }
     }
 };

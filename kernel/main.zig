@@ -144,20 +144,23 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     );
     var bump_alloc_iface: ?std.mem.Allocator = bump_allocator.allocator();
 
-    const pml4_paddr = PAddr.fromInt(paging.read_cr3().addr & ~@as(u64, 0xfff));
-    const pml4_vaddr = VAddr.fromPAddr(pml4_paddr, .identity);
+    const pml4_phys = PAddr.fromInt(paging.read_cr3().addr & ~@as(u64, 0xfff));
+    const pml4_virt_id = VAddr.fromPAddr(pml4_phys, .identity);
+    const pml4_virt_physmap = VAddr.fromPAddr(pml4_phys, .physmap);
 
     paging.mapPage(
-        @ptrFromInt(pml4_vaddr.addr),
-        pml4_paddr,
-        VAddr.fromPAddr(pml4_paddr, .physmap),
-        .ReadWrite,
-        true,
-        .Supervisor,
+        @ptrFromInt(pml4_virt_id.addr),
+        pml4_phys,
+        pml4_virt_physmap,
+        .rw,
+        .nx,
+        .cache,
+        .su,
         .Page4K,
         .identity,
         bump_alloc_iface.?,
     );
+    cpu.invlpg(pml4_virt_physmap);
 
     for (mmap) |entry| {
         if (entry.type != .free and entry.type != .acpi) continue;
@@ -166,7 +169,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
             .end = entry.start_paddr + entry.num_pages * PAGE4K,
         };
         paging.physMapRegion(
-            pml4_vaddr,
+            pml4_virt_id,
             PAddr.fromInt(entry_range.start),
             PAddr.fromInt(entry_range.end),
             bump_alloc_iface.?,
@@ -185,7 +188,6 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
 
     const xsdp_phys = PAddr.fromInt(boot_info.xsdp_paddr);
 
-    // boot_info is identity mapped, so none of its fields can be accessed after this point
     paging.dropIdentityMap();
 
     const buddy_alloc_start_virt = VAddr.fromPAddr(
@@ -262,6 +264,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     }
 
     pmm_mod.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
+    const pmm_iface = pmm_mod.global_pmm.?.allocator();
 
     const vmm_start_virt = paging.pml4SlotBase(@intFromEnum(paging.AddressSpace.kvmm));
     const vmm_end_virt = VAddr.fromInt(vmm_start_virt.addr + PAGE1G * paging.PAGE_TABLE_SIZE);
@@ -322,7 +325,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         const sdt_virt = VAddr.fromPAddr(sdt_phys, .physmap);
         const sdt = acpi.Sdt.fromVAddr(sdt_virt);
 
-        if (std.mem.eql(u8, &sdt.signature, "APIC")) {
+        if (std.mem.eql(u8, @ptrCast(&sdt.signature), "APIC")) {
             const madt = acpi.Madt.fromVAddr(sdt_virt);
             try madt.validate();
             var lapic_base: u64 = @as(u64, madt.lapic_addr);
@@ -359,9 +362,29 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
             }
         }
 
-        if (std.mem.eql(u8, &sdt.signature, "HPET")) {
+        if (std.mem.eql(u8, @ptrCast(&sdt.signature), "HPET")) {
             const hpet_table = acpi.HpetTable.fromVAddr(sdt_virt);
             try hpet_table.validate();
+
+            const hpet_phys = PAddr.fromInt(hpet_table.base_address.address);
+            const hpet_virt = VAddr.fromPAddr(hpet_phys, .physmap);
+
+            paging.mapPage(
+                @ptrFromInt(pml4_virt_physmap.addr),
+                hpet_phys,
+                hpet_virt,
+                .rw,
+                .nx,
+                .ncache,
+                .su,
+                .Page4K,
+                .physmap,
+                pmm_iface,
+            );
+            cpu.invlpg(hpet_virt);
+
+            const hpet = timers.Hpet.init(hpet_virt);
+            _ = hpet;
         }
     }
 

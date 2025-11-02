@@ -227,9 +227,13 @@ fn loadKernel(
 
     var iter = elf_header.iterateProgramHeadersBuffer(prefix_buffer);
 
+    // marking these pages as acpi reclaim means the kernel will physmap them,
+    // but it will not give them to the pmm for use, this is good because it means
+    // page tables we allocate for the kernel here will be correctly mapped when the
+    // kernel drops the identity mappings that the firmware provides
     var page_allocator = alloc_mod.PageAllocator.init(
         boot_services,
-        .reserved_memory_type,
+        .acpi_reclaim_memory,
     );
     const page_alloc_iface = page_allocator.allocator();
 
@@ -266,9 +270,10 @@ fn loadKernel(
                 @ptrFromInt(new_pml4_paddr.addr),
                 paging.PAddr.fromInt(backing_page_paddr),
                 paging.VAddr.fromInt(vaddr),
-                if (writeable) .ReadWrite else .Readonly,
-                not_executeable,
-                .Supervisor,
+                if (writeable) .rw else .ro,
+                if (not_executeable) .nx else .x,
+                .cache,
+                .su,
                 .Page4K,
                 .identity,
                 page_alloc_iface,

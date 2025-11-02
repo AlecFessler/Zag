@@ -5,6 +5,7 @@
 //! descriptors into simple categories (`free`, `acpi`, `reserved`) to guide
 //! early mapping decisions and seed the buddy allocator with usable physmem.
 
+const builtin = @import("builtin");
 const mmap = @import("mmap.zig");
 const std = @import("std");
 
