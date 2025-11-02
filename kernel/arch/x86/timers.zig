@@ -16,6 +16,8 @@ pub const Timer = struct {
     }
 };
 
+const ONE_QUADRILLION_NS = 1_000_000_000_000_000;
+
 pub const Hpet = struct {
     pub const GenCapsAndId = packed struct(u64) {
         revision_id: u8,
@@ -114,7 +116,7 @@ pub const Hpet = struct {
             base_addr + @intFromEnum(Register.gen_caps_and_id),
         );
         return .{
-            .freq_hz = 1_000_000_000_000_000 / @as(u64, gen_caps_and_id.counter_clock_period),
+            .freq_hz = ONE_QUADRILLION_NS / @as(u64, gen_caps_and_id.counter_clock_period),
 
             .gen_caps_and_id = gen_caps_and_id,
             .gen_config = @ptrFromInt(
