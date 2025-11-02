@@ -7,6 +7,7 @@
 //! exposing all key components under one unified namespace for clarity and consistency.
 
 pub const Acpi = @import("acpi.zig");
+pub const Apic = @import("apic.zig");
 pub const Cpu = @import("cpu.zig");
 pub const Exceptions = @import("exceptions.zig");
 pub const Gdt = @import("gdt.zig");

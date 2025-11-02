@@ -94,20 +94,6 @@ pub fn init() void {
         );
     }
 
-    const syscall_int_vec = @intFromEnum(idt.IntVectors.syscall);
-
-    idt.openInterruptGate(
-        @intCast(syscall_int_vec),
-        interrupts.STUBS[syscall_int_vec],
-        0x08,
-        idt.PrivilegeLevel.ring_3,
-        idt.GateType.interrupt_gate,
-    );
-
-    // will register syscall here with
-    // interrupts.registerSoftware(syscall_int_vec, syscallHandler,);
-    // when the handler exists
-
     interrupts.registerException(
         @intFromEnum(Exception.divide_by_zero),
         divByZeroHandler,
@@ -117,6 +103,18 @@ pub fn init() void {
         @intFromEnum(Exception.page_fault),
         pageFaultHandler,
     );
+
+    const syscall_int_vec = @intFromEnum(idt.IntVectors.syscall);
+    idt.openInterruptGate(
+        @intCast(syscall_int_vec),
+        interrupts.STUBS[syscall_int_vec],
+        0x08,
+        idt.PrivilegeLevel.ring_3,
+        idt.GateType.interrupt_gate,
+    );
+    // will register syscall here with
+    // interrupts.registerSoftware(syscall_int_vec, syscallHandler,);
+    // when the handler exists
 }
 
 /// Default handler: distinguishes kernel/user divide-by-zero and panics.

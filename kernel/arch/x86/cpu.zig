@@ -485,3 +485,44 @@ pub fn rdtscp_lfenced() u64 {
     );
     return (@as(u64, d) << 32) | a;
 }
+
+/// Enable maskable interrupts (sets IF in RFLAGS).
+pub fn enableInterrupts() void {
+    asm volatile ("sti");
+}
+
+/// Disable maskable interrupts (clears IF in RFLAGS).
+pub fn disableInterrupts() void {
+    asm volatile ("cli");
+}
+
+/// Return whether IF (Interrupt Flag) is currently set.
+pub fn interruptsEnabled() bool {
+    const IF: u64 = 1 << 9;
+    var rflags: u64 = 0;
+    asm volatile ("pushfq; pop %[out]"
+        : [out] "={rax}" (rflags)
+    );
+    return (rflags & IF) != 0;
+}
+
+/// Save current interrupt state and then disable interrupts.
+/// Returns the caller’s RFLAGS so you can restore later.
+pub fn saveAndDisableInterrupts() u64 {
+    var rflags: u64 = 0;
+    asm volatile ("pushfq; pop %[out]"
+        : [out] "={rax}" (rflags)
+    );
+    asm volatile ("cli");
+    return rflags;
+}
+
+/// Restore interrupts to a prior state captured from `saveAndDisableInterrupts()`.
+pub fn restoreInterrupts(saved_rflags: u64) void {
+    const IF: u64 = 1 << 9;
+    if ((saved_rflags & IF) != 0) {
+        asm volatile ("sti");
+    } else {
+        asm volatile ("cli");
+    }
+}

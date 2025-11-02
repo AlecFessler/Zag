@@ -11,6 +11,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const acpi = zag.x86.Acpi;
+const apic = zag.x86.Apic;
 const cpu = zag.x86.Cpu;
 const exceptions = zag.x86.Exceptions;
 const gdt = zag.x86.Gdt;
@@ -22,6 +23,7 @@ const pmm_mod = zag.memory.PhysicalMemoryManager;
 const range = zag.math.range;
 const serial = zag.x86.Serial;
 const vmm_mod = zag.memory.VirtualMemoryManager;
+const sched = zag.sched.scheduler;
 
 const BuddyAllocator = zag.memory.BuddyAllocator.BuddyAllocator;
 const BumpAllocator = zag.memory.BumpAllocator.BumpAllocator;
@@ -102,6 +104,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     exceptions.init();
     irq.init();
     cpu.enableX2Apic(@intFromEnum(idt.IntVectors.spurious));
+    apic.disablePic();
 
     var mmap_entries_array: [boot_defs.MAX_MMAP_ENTRIES]boot_defs.MMapEntry = undefined;
     const mmap = boot_defs.collapseMmap(
@@ -395,7 +398,11 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     }
 
     const tsc = timers.Tsc.init(&hpet.?);
-    serial.print("Tsc hz {}\n", .{tsc.freq_hz});
+    apic.programLocalApicTimerTscDeadline(@intFromEnum(idt.IntVectors.sched));
+
+    sched.initFreqHz(tsc.freq_hz);
+    cpu.enableInterrupts();
+    sched.armSchedTimer();
 
     cpu.halt();
 }

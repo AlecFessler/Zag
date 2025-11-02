@@ -5,6 +5,7 @@ const VAddr = paging.VAddr;
 
 pub const VTable = struct {
     now: *const fn (*anyopaque) u64,
+    arm_interrupt_timer: *const fn (*anyopaque, u64) void,
 };
 
 pub const Timer = struct {
@@ -13,6 +14,16 @@ pub const Timer = struct {
 
     pub fn now(self: *const Timer) u64 {
         return self.vtable.now(self.ptr);
+    }
+
+    pub fn arm_interrupt_timer(
+        self: *const Timer,
+        timer_val: u64,
+    ) void {
+        return self.vtable.now(
+            self.ptr,
+            timer_val,
+        );
     }
 };
 
@@ -180,10 +191,19 @@ pub const Hpet = struct {
             .ptr = self,
             .vtable = &.{
                 .now = now,
+                .arm_interrupt_timer = arm_interrupt_timer,
             },
         };
     }
 
+    fn arm_interrupt_timer(
+        ctx: *anyopaque,
+        timer_val: u64,
+    ) void {
+        _ = ctx;
+        _ = timer_val;
+        unreachable;
+    }
     fn now(ctx: *anyopaque) u64 {
         const self: *Hpet = @alignCast(@ptrCast(ctx));
         return nanosFromTicksFloor(self.freq_hz, self.main_counter_val.val);
@@ -230,8 +250,18 @@ pub const Tsc = struct {
             .ptr = self,
             .vtable = &.{
                 .now = now,
+                .arm_interrupt_timer = arm_interrupt_timer,
             },
         };
+    }
+
+    fn arm_interrupt_timer(
+        ctx: *anyopaque,
+        timer_val: u64,
+    ) void {
+        _ = ctx;
+        _ = timer_val;
+        unreachable;
     }
 
     fn now(ctx: *anyopaque) u64 {

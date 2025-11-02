@@ -1,6 +1,8 @@
+const std = @import("std");
+
+const apic = @import("apic.zig");
 const cpu = @import("cpu.zig");
 const idt = @import("idt.zig");
-const std = @import("std");
 
 pub const VectorKind = enum {
     exception,
@@ -41,8 +43,6 @@ pub const STUBS: [256]idt.interruptHandler = blk: {
     }
     break :blk arr;
 };
-
-const X2APIC_EOI_MSR = 0x80B;
 
 var vector_table: [256]VectorEntry = .{VectorEntry{}} ** 256;
 
@@ -141,7 +141,7 @@ export fn dispatchInterrupt(ctx: *cpu.Context) void {
     if (vector_table[ctx.int_num].handler) |h| {
         h(ctx);
         if (vector_table[@intCast(ctx.int_num)].ack == .lapic) {
-            cpu.wrmsr(X2APIC_EOI_MSR, 0); // eoi
+            apic.endOfInterrupt();
         }
         return;
     }
