@@ -319,6 +319,8 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     const xsdt = acpi.Xsdt.fromVAddr(xsdt_virt);
     try xsdt.validate();
 
+    var hpet: ?timers.Hpet = null;
+
     var xsdt_iter = xsdt.iter();
     while (xsdt_iter.next()) |sdt_paddr| {
         const sdt_phys = PAddr.fromInt(sdt_paddr);
@@ -328,7 +330,8 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         if (std.mem.eql(u8, @ptrCast(&sdt.signature), "APIC")) {
             const madt = acpi.Madt.fromVAddr(sdt_virt);
             try madt.validate();
-            var lapic_base: u64 = @as(u64, madt.lapic_addr);
+
+            var lapic_base: u64 = @intCast(madt.lapic_addr);
             var madt_iter = madt.iter();
             while (madt_iter.next()) |e| {
                 const entry = acpi.decodeMadt(e);
@@ -383,10 +386,16 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
             );
             cpu.invlpg(hpet_virt);
 
-            const hpet = timers.Hpet.init(hpet_virt);
-            _ = hpet;
+            hpet = timers.Hpet.init(hpet_virt);
         }
     }
+
+    if (hpet == null) {
+        @panic("Failed to find and initialize hpet!");
+    }
+
+    const tsc = timers.Tsc.init(&hpet.?);
+    serial.print("Tsc hz {}\n", .{tsc.freq_hz});
 
     cpu.halt();
 }

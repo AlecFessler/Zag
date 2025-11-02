@@ -439,14 +439,47 @@ pub fn enableX2Apic(spurious_vector: u8) void {
     wrmsr(X2APIC_SVR, svr_value);
 }
 
+/// When getting a start and end tsc read, this should be the start
+pub fn rdtsc_lfenced() u64 {
+    var a: u32 = 0;
+    var d: u32 = 0;
+    asm volatile (
+        \\ lfence
+        \\ rdtsc
+        : [a] "={eax}" (a),
+          [d] "={edx}" (d)
+        :
+        : .{ .memory = true }
+    );
+    return (@as(u64, d) << 32) | a;
+}
+
 pub fn rdtscp() u64 {
     var a: u32 = 0;
     var d: u32 = 0;
     var c: u32 = 0;
-    asm volatile ("rdtscp"
+    asm volatile (
+        \\ rdtscp
         : [a] "={eax}" (a),
           [d] "={edx}" (d),
-          [c] "={ecx}" (c),
+          [c] "={ecx}" (c)
+        :
+        : .{ .memory = true }
+    );
+    return (@as(u64, d) << 32) | a;
+}
+
+/// When getting a start and end tsc read, this should be the end
+pub fn rdtscp_lfenced() u64 {
+    var a: u32 = 0;
+    var d: u32 = 0;
+    var c: u32 = 0;
+    asm volatile (
+        \\ rdtscp
+        \\ lfence
+        : [a] "={eax}" (a),
+          [d] "={edx}" (d),
+          [c] "={ecx}" (c)
         :
         : .{ .memory = true }
     );
