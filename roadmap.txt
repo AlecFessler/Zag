@@ -1,0 +1,10 @@
+- build out scheduler
+- syscall for serial output from userspace
+- userspace hello world
+- usb keyboard driver
+- userspace "typewriter"
+
+- maybe filesystem to write, save, and load userspace programs?
+- maybe graphics display and load a font through uefi bootloader
+
+- eventually the current long term goal is to work towards the kernel boot sequence ending in loading up some sort of userspace terminal, hence all of the above goals in the roadmap

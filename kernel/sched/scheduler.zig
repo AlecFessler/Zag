@@ -60,6 +60,6 @@ pub fn init(t: timers.Timer) void {
 /// - Panics if `timer` is null (because it calls `scheduler.armSchedTimer`).
 pub fn schedTimerHandler(ctx: *cpu.Context) void {
     _ = ctx;
-    serial.print("Sched timer!\n", .{});
+    //serial.print("Sched timer!\n", .{});
     armSchedTimer(SCHED_TIMESLICE_NS);
 }
