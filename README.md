@@ -1,7 +1,5 @@
 # Zag Kernel — Source File Ordering & Documentation Specification
 
-Welcome to the **Zag kernel**. This repository aims to be a **first‑class Zig systems development platform** with a clean, enforceable code style and documentation standard, while targeting **modern desktop hardware** (x86‑64, multi‑core, LAPIC/x2APIC, HPET/TS, higher‑half kernel, robust paging, and a serious allocator stack). The guidelines below keep the codebase coherent as it grows: deterministic layout, predictable diffs, and documentation that’s actually useful to humans and tooling.
-
 ---
 
 ## 0. Philosophy & Goals
