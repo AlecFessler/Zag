@@ -158,9 +158,15 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         .type = .free,
     };
     for (mmap) |entry| {
-        if (entry.start_paddr < smallest_addr_region.start_paddr) smallest_addr_region = entry;
-        if (entry.type == .free and entry.start_paddr > largest_addr_free_region.start_paddr) largest_addr_free_region = entry;
-        if (entry.type == .free and entry.num_pages > largest_free_region.num_pages) largest_free_region = entry;
+        if (entry.start_paddr < smallest_addr_region.start_paddr) {
+            smallest_addr_region = entry;
+        }
+        if (entry.type == .free and entry.start_paddr > largest_addr_free_region.start_paddr) {
+            largest_addr_free_region = entry;
+        }
+        if (entry.type == .free and entry.num_pages > largest_free_region.num_pages) {
+            largest_free_region = entry;
+        }
     }
 
     const bump_alloc_start_phys = PAddr.fromInt(largest_free_region.start_paddr);
@@ -187,7 +193,9 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     cpu.invlpg(pml4_virt_physmap);
 
     for (mmap) |entry| {
-        if (entry.type != .free and entry.type != .acpi) continue;
+        if (entry.type != .free and entry.type != .acpi) {
+            continue;
+        }
         const entry_range: Range = .{
             .start = entry.start_paddr,
             .end = entry.start_paddr + entry.num_pages * PAGE4K,
@@ -219,7 +227,11 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         .physmap,
     );
     const buddy_alloc_end_virt = VAddr.fromPAddr(
-        PAddr.fromInt(std.mem.alignBackward(u64, largest_addr_free_region.start_paddr + largest_addr_free_region.num_pages * PAGE4K, PAGE4K)),
+        PAddr.fromInt(std.mem.alignBackward(
+            u64,
+            largest_addr_free_region.start_paddr + largest_addr_free_region.num_pages * PAGE4K,
+            PAGE4K,
+        )),
         .physmap,
     );
     var buddy_allocator = try BuddyAllocator.init(
@@ -231,17 +243,35 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     bump_alloc_iface = null;
 
     for (mmap) |entry| {
-        if (entry.type != .free) continue;
+        if (entry.type != .free) {
+            continue;
+        }
 
         const entry_start_virt = VAddr.fromPAddr(PAddr.fromInt(entry.start_paddr), .physmap);
-        const entry_end_virt = VAddr.fromPAddr(PAddr.fromInt(entry.start_paddr + entry.num_pages * PAGE4K), .physmap);
-        const entry_range: Range = .{ .start = entry_start_virt.addr, .end = entry_end_virt.addr };
+        const entry_end_virt = VAddr.fromPAddr(
+            PAddr.fromInt(entry.start_paddr + entry.num_pages * PAGE4K),
+            .physmap,
+        );
+        const entry_range: Range = .{
+            .start = entry_start_virt.addr,
+            .end = entry_end_virt.addr,
+        };
 
-        const bump_alloc_range: Range = .{ .start = bump_allocator.start_addr, .end = bump_allocator.free_addr };
-        const null_page_range: Range = .{ .start = VAddr.fromPAddr(PAddr.fromInt(0), .physmap).addr, .end = VAddr.fromPAddr(PAddr.fromInt(PAGE4K), .physmap).addr };
+        const bump_alloc_range: Range = .{
+            .start = bump_allocator.start_addr,
+            .end = bump_allocator.free_addr,
+        };
+        const null_page_range: Range = .{
+            .start = VAddr.fromPAddr(PAddr.fromInt(0), .physmap).addr,
+            .end = VAddr.fromPAddr(PAddr.fromInt(PAGE4K), .physmap).addr,
+        };
 
         var useable_range: Range = entry_range;
-        if (entry_range.overlapsWith(bump_alloc_range)) useable_range = entry_range.removeOverlap(bump_alloc_range) else if (entry_range.overlapsWith(null_page_range)) useable_range = entry_range.removeOverlap(null_page_range);
+        if (entry_range.overlapsWith(bump_alloc_range)) {
+            useable_range = entry_range.removeOverlap(bump_alloc_range);
+        } else if (entry_range.overlapsWith(null_page_range)) {
+            useable_range = entry_range.removeOverlap(null_page_range);
+        }
 
         buddy_allocator.addRegion(useable_range.start, useable_range.end);
     }
@@ -260,11 +290,18 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     const heap_tree_vaddr_space_start = try vmm.reserve(PAGE1G, std.mem.Alignment.fromByteUnits(PAGE4K));
     const heap_tree_vaddr_space_end = VAddr.fromInt(heap_tree_vaddr_space_start.addr + PAGE1G);
 
-    var heap_tree_backing_allocator = BumpAllocator.init(heap_tree_vaddr_space_start.addr, heap_tree_vaddr_space_end.addr);
+    var heap_tree_backing_allocator = BumpAllocator.init(
+        heap_tree_vaddr_space_start.addr,
+        heap_tree_vaddr_space_end.addr,
+    );
     const heap_tree_backing_allocator_iface = heap_tree_backing_allocator.allocator();
     var heap_tree_allocator = try HeapTreeAllocator.init(heap_tree_backing_allocator_iface);
 
-    var heap_allocator = HeapAllocator.init(heap_vaddr_space_start.addr, heap_vaddr_space_end.addr, &heap_tree_allocator);
+    var heap_allocator = HeapAllocator.init(
+        heap_vaddr_space_start.addr,
+        heap_vaddr_space_end.addr,
+        &heap_tree_allocator,
+    );
     const heap_allocator_iface = heap_allocator.allocator();
 
     const brand_str = try cpu.getBrandString(heap_allocator_iface);
@@ -298,13 +335,25 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
                 const entry = acpi.decodeMadt(e);
                 switch (entry) {
                     .local_apic => |x| {
-                        serial.print("cpu {d} apic_id {d} flags {x}\n", .{ x.processor_uid, x.apic_id, x.flags });
+                        serial.print("cpu {d} apic_id {d} flags {x}\n", .{
+                            x.processor_uid,
+                            x.apic_id,
+                            x.flags,
+                        });
                     },
                     .ioapic => |x| {
-                        serial.print("ioapic id {d} addr {x} gsi_base {d}\n", .{ x.ioapic_id, x.ioapic_addr, x.gsi_base });
+                        serial.print("ioapic id {d} addr {x} gsi_base {d}\n", .{
+                            x.ioapic_id,
+                            x.ioapic_addr,
+                            x.gsi_base,
+                        });
                     },
                     .int_src_override => |x| {
-                        serial.print("interrupt source override bus {d} src {d} -> gsi {d}\n", .{ x.bus, x.src, x.gsi });
+                        serial.print("interrupt source override bus {d} src {d} -> gsi {d}\n", .{
+                            x.bus,
+                            x.src,
+                            x.gsi,
+                        });
                     },
                     .lapic_nmi => |_| {},
                     .lapic_addr_override => |x| {
@@ -339,7 +388,9 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         }
     }
 
-    if (hpet == null) @panic("Failed to find and initialize HPET!");
+    if (hpet == null) {
+        @panic("Failed to find and initialize HPET!");
+    }
 
     cpu.enableInterrupts();
 
