@@ -1,7 +1,8 @@
-//! Scheduler timer utilities (TSC-deadline timeslice).
+//! Scheduler timer utilities (generic `Timer`-backed timeslice).
 //!
-//! Arms and services a periodic scheduler tick using x2APIC TSC-deadline mode.
-//! You must initialize the measured TSC frequency before arming the timer.
+//! Arms and services a periodic scheduler tick using a provided `timers.Timer`
+//! implementation (e.g. TSC-deadline or LAPIC one-shot). A timer must be
+//! installed via `scheduler.init` before arming.
 //!
 //! # Directory
 //!
@@ -10,14 +11,13 @@
 //!
 //! ## Constants
 //! - `SCHED_TIMESLICE_NS` — nominal scheduler timeslice length in nanoseconds.
-//! - `ONE_BILLION_CYCLES` — nanoseconds-per-second factor (1_000_000_000).
 //!
 //! ## Variables
-//! - `freq_hz` — optionally stored TSC frequency in Hz; required before arming.
+//! - `timer` — optional `timers.Timer`; must be set by `scheduler.init` before use.
 //!
 //! ## Functions
-//! - `scheduler.armSchedTimer` — arm next TSC-deadline tick based on `freq_hz`.
-//! - `scheduler.initFreqHz` — set the measured TSC frequency (Hz).
+//! - `scheduler.armSchedTimer` — arm next tick after a delta in nanoseconds.
+//! - `scheduler.init` — install the active `timers.Timer` implementation.
 //! - `scheduler.schedTimerHandler` — IRQ handler; logs and rearms the timer.
 
 const zag = @import("zag");
@@ -25,77 +25,41 @@ const zag = @import("zag");
 const apic = zag.x86.Apic;
 const cpu = zag.x86.Cpu;
 const serial = zag.x86.Serial;
+const timers = zag.x86.Timers;
 
 /// Nominal scheduler timeslice in nanoseconds (2 ms).
 pub const SCHED_TIMESLICE_NS = 2_000_000;
 
-/// Nanoseconds-per-second factor used for ns→ticks scaling.
-const ONE_BILLION_CYCLES = 1_000_000_000;
+var timer: ?timers.Timer = null;
 
-/// Optionally stored TSC frequency in Hz; must be set before arming.
-var freq_hz: ?u64 = null;
-
-/// Function: `scheduler.armSchedTimer`
-///
-/// Summary:
-/// Compute the next TSC-deadline from `SCHED_TIMESLICE_NS` and the measured
-/// TSC frequency, then program the LAPIC TSC-deadline timer.
+/// Arm the scheduler timer to fire after `delta_ns`.
 ///
 /// Arguments:
-/// - None.
-///
-/// Returns:
-/// - `void`.
-///
-/// Errors:
-/// - None.
+/// - `delta_ns`: nanoseconds until the next scheduler tick.
 ///
 /// Panics:
-/// - Panics if `freq_hz` is null (must call `scheduler.initFreqHz` first).
-pub fn armSchedTimer() void {
-    const delta_ticks = freq_hz.? * SCHED_TIMESLICE_NS / ONE_BILLION_CYCLES;
-    const now_ticks = cpu.rdtscp();
-    apic.armTscDeadline(now_ticks + delta_ticks);
+/// - Panics if `timer` is null (must call `scheduler.init` first).
+pub fn armSchedTimer(delta_ns: u64) void {
+    timer.?.arm_interrupt_timer(delta_ns);
 }
 
-/// Function: `scheduler.initFreqHz`
-///
-/// Summary:
-/// Initialize the stored TSC frequency used for timeslice scheduling.
+/// Install the active `timers.Timer` used by the scheduler.
 ///
 /// Arguments:
-/// - `freq`: Measured TSC frequency in Hertz.
-///
-/// Returns:
-/// - `void`.
-///
-/// Errors:
-/// - None.
-///
-/// Panics:
-/// - None.
-pub fn initFreqHz(freq: u64) void {
-    freq_hz = freq;
+/// - `t`: timer implementation to use for arming deadlines.
+pub fn init(t: timers.Timer) void {
+    timer = t;
 }
 
-/// Function: `scheduler.schedTimerHandler`
-///
-/// Summary:
 /// Scheduler timer interrupt handler: logs a tick and rearms the deadline.
 ///
 /// Arguments:
-/// - `ctx`: Interrupt context pointer (`*cpu.Context`). Not used.
-///
-/// Returns:
-/// - `void`.
-///
-/// Errors:
-/// - None.
+/// - `ctx`: interrupt context pointer (`*cpu.Context`). Not used.
 ///
 /// Panics:
-/// - Panics if `freq_hz` is null (because it calls `scheduler.armSchedTimer`).
+/// - Panics if `timer` is null (because it calls `scheduler.armSchedTimer`).
 pub fn schedTimerHandler(ctx: *cpu.Context) void {
     _ = ctx;
     serial.print("Sched timer!\n", .{});
-    armSchedTimer();
+    armSchedTimer(SCHED_TIMESLICE_NS);
 }

@@ -341,12 +341,19 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
 
     if (hpet == null) @panic("Failed to find and initialize HPET!");
 
-    const tsc = timers.Tsc.init(&hpet.?);
-    apic.programLocalApicTimerTscDeadline(@intFromEnum(idt.IntVectors.sched));
-
     cpu.enableInterrupts();
-    sched.initFreqHz(tsc.freq_hz);
-    sched.armSchedTimer();
+
+    if (apic.programLocalApicTimerTscDeadline(@intFromEnum(idt.IntVectors.sched))) |_| {
+        var tsc_timer = timers.Tsc.init(&hpet.?);
+        const tsc_timer_iface = tsc_timer.timer();
+        sched.init(tsc_timer_iface);
+    } else |_| {
+        var lapic_timer = timers.Lapic.init(&hpet.?, @intFromEnum(idt.IntVectors.sched));
+        const lapic_timer_iface = lapic_timer.timer();
+        sched.init(lapic_timer_iface);
+    }
+
+    sched.armSchedTimer(sched.SCHED_TIMESLICE_NS);
 
     cpu.halt();
 }

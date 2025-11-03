@@ -23,8 +23,9 @@
 //! - `Hpet.NthTimerFSBIntRoute` – per-timer FSB interrupt routing layout.
 //! - `Hpet.HpetTimer` – view over one HPET timer’s register triplet.
 //! - `Hpet.Register` – symbolic offsets for the HPET register block.
+//! - `Lapic` – local APIC one-shot timer calibrated via HPET; exposes a `Timer`.
 //! - `Timer` – vtable-based timer interface (now/arm_interrupt_timer).
-//! - `Tsc` – TSC frequency helper calibrated via HPET.
+//! - `Tsc` – TSC frequency helper calibrated via HPET; exposes a `Timer`.
 //! - `VTable` – function table used by `Timer` adapters.
 //!
 //! ## Constants
@@ -44,17 +45,20 @@
 //! - `Hpet.getNthTimerFSBIntRoute` – internal pointer helper (Nth FSB route).
 //! - `Hpet.arm_interrupt_timer` – HPET-backed arm hook for `Timer` (stub).
 //! - `Hpet.now` – read HPET main counter → nanoseconds.
-//! - `Hpet.HpetTimer.init` – construct an `HpetTimer` view.
-//! - `Timer.now` – return current time via vtable.
-//! - `Timer.arm_interrupt_timer` – arm a deadline via vtable.
+//! - `Lapic.init` – calibrate LAPIC timer and configure one-shot mode.
+//! - `Lapic.timer` – expose the LAPIC as a generic `Timer`.
 //! - `Tsc.init` – calibrate TSC frequency against HPET.
 //! - `Tsc.timer` – expose the TSC as a generic `Timer`.
-//! - `Tsc.arm_interrupt_timer` – TSC-backed arm hook (stub).
+//! - `Tsc.arm_interrupt_timer` – compute TSC deadline and program `IA32_TSC_DEADLINE`.
 //! - `Tsc.now` – read TSC → nanoseconds.
+//! - `Timer.now` – return current time via vtable.
+//! - `Timer.arm_interrupt_timer` – arm a deadline via vtable.
 //! - `nanosFromTicksCeil` / `nanosFromTicksFloor` – ticks→ns.
 //! - `ticksFromNanosCeil` / `ticksFromNanosFloor` – ns→ticks.
 
+const apic = @import("apic.zig");
 const cpu = @import("cpu.zig");
+const idt = @import("idt.zig");
 const paging = @import("paging.zig");
 
 const VAddr = paging.VAddr;
@@ -168,23 +172,15 @@ pub const Hpet = struct {
     /// Byte stride between adjacent Nth-timer register triplets.
     const nth_timer_offset = 0x20;
 
-    /// HPET clock frequency in Hertz (derived from `counter_clock_period`).
     freq_hz: u64,
 
-    /// Pointer to GenCapsAndId register (read-only).
     gen_caps_and_id: *const volatile GenCapsAndId,
-    /// Pointer to GenConfig register.
     gen_config: *volatile GenConfig,
-    /// Pointer to GenIntStatus register.
     gen_int_status: *volatile GenIntStatus,
-    /// Pointer to MainCounterVal register.
     main_counter_val: *volatile MainCounterVal,
 
-    /// Base pointer to first NthTimerConfigAndCaps register.
     nth_timer_config_and_caps_base: [*]volatile NthTimerConfigAndCaps,
-    /// Base pointer to first NthTimerComparatorVal register.
     nth_timer_comparator_val_base: [*]volatile NthTimerComparatorVal,
-    /// Base pointer to first NthTimerFSBIntRoute register.
     nth_timer_fsb_int_route_base: [*]volatile NthTimerFSBIntRoute,
 
     /// Summary:
@@ -344,7 +340,7 @@ pub const Hpet = struct {
     ///
     /// Args:
     /// - `ctx`: Opaque pointer (expects `*Hpet`).
-    /// - `timer_val`: Absolute deadline in nanoseconds to arm.
+    /// - `timer_val_ns`: Absolute deadline in nanoseconds to arm.
     ///
     /// Returns:
     /// - `void`.
@@ -354,9 +350,9 @@ pub const Hpet = struct {
     ///
     /// Panics:
     /// - Panics unconditionally (`unreachable`) until implemented.
-    fn arm_interrupt_timer(ctx: *anyopaque, timer_val: u64) void {
+    fn arm_interrupt_timer(ctx: *anyopaque, timer_val_ns: u64) void {
         _ = ctx;
-        _ = timer_val;
+        _ = timer_val_ns;
         unreachable;
     }
 
@@ -377,6 +373,138 @@ pub const Hpet = struct {
     fn now(ctx: *anyopaque) u64 {
         const self: *Hpet = @alignCast(@ptrCast(ctx));
         return nanosFromTicksFloor(self.freq_hz, self.main_counter_val.val);
+    }
+};
+
+/// Local APIC one-shot timer calibrated via HPET; exposes a `Timer`.
+pub const Lapic = struct {
+    freq_hz: u64,
+    divider: u32,
+    vector: u8,
+
+    const LVT_MASK_BIT: u6 = 16;
+    const LVT_MODE_SHIFT: u6 = 17;
+    const LVT_MODE_ONE_SHOT: u2 = 0;
+
+    /// Summary:
+    /// Calibrate LAPIC timer frequency using HPET and configure one-shot mode.
+    ///
+    /// Args:
+    /// - `hpet`: Initialized HPET device used as the reference clock.
+    /// - `int_vec`: Interrupt vector to deliver on timer expiry.
+    ///
+    /// Returns:
+    /// - `Lapic` initialized with measured `freq_hz`, chosen `divider`, and `vector`.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
+    pub fn init(hpet: *Hpet, int_vec: u8) Lapic {
+        const DIV_CODE: u64 = 0b011;
+        const DIVIDER: u32 = 16;
+
+        cpu.wrmsr(@intFromEnum(apic.X2ApicMsr.timer_divide_configuration_register), DIV_CODE);
+
+        var lvt_spurious: u64 = @intFromEnum(idt.IntVectors.spurious);
+        lvt_spurious |= (@as(u64, LVT_MODE_ONE_SHOT) << LVT_MODE_SHIFT);
+        lvt_spurious |= (@as(u64, 1) << LVT_MASK_BIT);
+        cpu.wrmsr(@intFromEnum(apic.X2ApicMsr.local_vector_table_timer_register), lvt_spurious);
+
+        const hpet_iface = hpet.timer();
+        var estimate: u64 = 0;
+
+        for (0..3) |i| {
+            cpu.wrmsr(@intFromEnum(apic.X2ApicMsr.timer_initial_count_register), 0xFFFF_FFFF);
+
+            const start_ns = hpet_iface.now();
+            var now_ns = start_ns;
+            const target_ns = TEN_MILLION_NS;
+            while ((now_ns - start_ns) < target_ns) now_ns = hpet_iface.now();
+
+            const cur = cpu.rdmsr(@intFromEnum(apic.X2ApicMsr.timer_current_count_register));
+            const elapsed: u64 = 0xFFFF_FFFF - cur;
+
+            cpu.wrmsr(@intFromEnum(apic.X2ApicMsr.timer_initial_count_register), 0);
+
+            const delta_ns = now_ns - start_ns;
+            const sample = (elapsed * @as(u64, DIVIDER) * ONE_BILLION_NS) / delta_ns;
+            estimate = if (i == 0) sample else (estimate + sample) / 2;
+        }
+
+        var lvt_final: u64 = int_vec;
+        lvt_final |= (@as(u64, LVT_MODE_ONE_SHOT) << LVT_MODE_SHIFT);
+        cpu.wrmsr(@intFromEnum(apic.X2ApicMsr.local_vector_table_timer_register), lvt_final);
+
+        return .{ .freq_hz = estimate, .divider = DIVIDER, .vector = int_vec };
+    }
+
+    /// Summary:
+    /// Expose the LAPIC timer as a generic `Timer` (one-shot arming).
+    ///
+    /// Args:
+    /// - `self`: Receiver.
+    ///
+    /// Returns:
+    /// - `Timer` whose `arm_interrupt_timer` loads LAPIC Initial Count.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
+    pub fn timer(self: *Lapic) Timer {
+        return .{ .ptr = self, .vtable = &.{ .now = now, .arm_interrupt_timer = arm_interrupt_timer } };
+    }
+
+    /// Summary:
+    /// LAPIC-backed arm hook for the `Timer` vtable (one-shot mode).
+    ///
+    /// Args:
+    /// - `ctx`: Opaque pointer (expects `*Lapic`).
+    /// - `timer_val_ns`: Absolute deadline in nanoseconds to arm.
+    ///
+    /// Returns:
+    /// - `void`.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
+    fn arm_interrupt_timer(ctx: *anyopaque, timer_val_ns: u64) void {
+        const self: *Lapic = @alignCast(@ptrCast(ctx));
+
+        var lvt: u64 = self.vector;
+        lvt |= (@as(u64, LVT_MODE_ONE_SHOT) << LVT_MODE_SHIFT);
+        cpu.wrmsr(@intFromEnum(apic.X2ApicMsr.local_vector_table_timer_register), lvt);
+
+        const eff_hz: u64 = self.freq_hz / self.divider;
+        var ticks: u64 = ticksFromNanosCeil(eff_hz, timer_val_ns);
+        if (ticks == 0) ticks = 1;
+        if (ticks > 0xFFFF_FFFF) ticks = 0xFFFF_FFFF;
+
+        cpu.wrmsr(@intFromEnum(apic.X2ApicMsr.timer_initial_count_register), ticks);
+    }
+
+    /// Summary:
+    /// Not implemented for LAPIC (no monotonic readback in this adapter).
+    ///
+    /// Args:
+    /// - `ctx`: Opaque pointer (expects `*Lapic`).
+    ///
+    /// Returns:
+    /// - `u64` (unreachable).
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - Panics unconditionally (`unreachable`).
+    fn now(ctx: *anyopaque) u64 {
+        _ = ctx;
+        unreachable;
     }
 };
 
@@ -410,7 +538,7 @@ pub const Timer = struct {
     ///
     /// Args:
     /// - `self`: Receiver.
-    /// - `timer_val`: Absolute deadline in nanoseconds.
+    /// - `timer_val_ns`: Absolute deadline in nanoseconds.
     ///
     /// Returns:
     /// - `void`.
@@ -420,14 +548,13 @@ pub const Timer = struct {
     ///
     /// Panics:
     /// - None.
-    pub fn arm_interrupt_timer(self: *const Timer, timer_val: u64) void {
-        return self.vtable.arm_interrupt_timer(self.ptr, timer_val);
+    pub fn arm_interrupt_timer(self: *const Timer, timer_val_ns: u64) void {
+        return self.vtable.arm_interrupt_timer(self.ptr, timer_val_ns);
     }
 };
 
 /// TSC frequency helper calibrated via HPET and exposed as a `Timer`.
 pub const Tsc = struct {
-    /// Calibrated TSC frequency in Hertz.
     freq_hz: u64,
 
     /// Summary:
@@ -500,11 +627,12 @@ pub const Tsc = struct {
     }
 
     /// Summary:
-    /// TSC-backed arm hook for the `Timer` vtable (not yet implemented).
+    /// TSC-backed arm hook for the `Timer` vtable. Computes a TSC absolute
+    /// deadline and programs x2APIC `IA32_TSC_DEADLINE` (LAPIC deadline mode).
     ///
     /// Args:
     /// - `ctx`: Opaque pointer (expects `*Tsc`).
-    /// - `timer_val`: Absolute deadline in nanoseconds to arm.
+    /// - `timer_val_ns`: Absolute deadline in nanoseconds to arm.
     ///
     /// Returns:
     /// - `void`.
@@ -513,11 +641,12 @@ pub const Tsc = struct {
     /// - None.
     ///
     /// Panics:
-    /// - Panics unconditionally (`unreachable`) until implemented.
-    fn arm_interrupt_timer(ctx: *anyopaque, timer_val: u64) void {
-        _ = ctx;
-        _ = timer_val;
-        unreachable;
+    /// - None.
+    fn arm_interrupt_timer(ctx: *anyopaque, timer_val_ns: u64) void {
+        const self: *Tsc = @alignCast(@ptrCast(ctx));
+        const delta_ticks: u64 = ticksFromNanosCeil(self.freq_hz, timer_val_ns);
+        const now_ticks: u64 = cpu.rdtscp();
+        apic.armTscDeadline(now_ticks + delta_ticks);
     }
 
     /// Summary:
