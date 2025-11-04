@@ -55,7 +55,9 @@ const ThreadAllocator = SlabAllocator(
 );
 
 // NOTE: Redesign this to assume ring_3 since there's only one kernel proc
-// and it's going to be initialized in this module container level
+// and it's going to be initialized in this module container level.
+// Get rid of the cpl arg on createProcess
+// Vmm is always user space range
 pub const Process = struct {
     pid: u64,
     cpl: PrivilegeLevel,
@@ -219,8 +221,8 @@ pub const Thread = struct {
             int_frame_ptr.ss = gdt.KERNEL_DATA_OFFSET;
             int_frame_ptr.rsp = kstack_base;
         } else {
-            int_frame_ptr.cs = gdt.USER_CODE_OFFSET;
-            int_frame_ptr.ss = gdt.USER_DATA_OFFSET;
+            int_frame_ptr.cs = gdt.USER_CODE_OFFSET | 3;
+            int_frame_ptr.ss = gdt.USER_DATA_OFFSET | 3;
             int_frame_ptr.rsp = std.mem.alignBackward(
                 u64,
                 @intFromPtr(thread.ustack.?.ptr) + thread.ustack.?.len,
@@ -298,7 +300,8 @@ pub fn init(
 pub fn schedTimerHandler(ctx: *cpu.Context) void {
     armSchedTimer(SCHED_TIMESLICE_NS);
     //NOTE: also need to swap address space if the next thread is ring 3
-    // also need to swap tss.rsp0 to the next process
+    // also need to point rsp at next thread rsp
+    // also need to swap tss.rsp0 to the next thread
     // also need to save current threads state
     // advance run queue
     ctx.* = run_queue.ctx.*;
