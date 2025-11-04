@@ -134,7 +134,6 @@ pub const Thread = struct {
     state: State,
     ustack: ?[]u8,
     kstack: []u8,
-    krsp: VAddr,
     proc: *Process,
     next: ?*Thread = null,
 
@@ -185,7 +184,6 @@ pub const Thread = struct {
         );
         const int_frame_addr = kstack_base - @sizeOf(cpu.Context);
         var int_frame_ptr: *cpu.Context = @ptrFromInt(int_frame_addr);
-        thread.krsp = VAddr.fromInt(int_frame_addr);
 
         const RFLAGS_RESERVED_ONE: u64 = 1 << 1;
         const RFLAGS_IF: u64 = 1 << 9;
@@ -317,7 +315,7 @@ pub fn schedTimerHandler(ctx: *cpu.Context) void {
         \\movq %[new_stack], %%rsp
         \\movq %%rsp, %%rbp
         :
-        : [new_stack] "r" (running_thread.krsp),
+        : [new_stack] "r" (running_thread.ctx),
     );
 }
 
