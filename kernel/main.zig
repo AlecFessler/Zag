@@ -386,8 +386,6 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         @panic("Failed to find and initialize HPET!");
     }
 
-    cpu.enableInterrupts();
-
     const sched_slab_vaddr_space_start = try vmm.reserve(
         paging.PAGE1G,
         paging.PAGE_ALIGN,
@@ -400,13 +398,14 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     );
     const sched_slab_alloc_iface = sched_slab_backing_allocator.allocator();
 
+    cpu.enableInterrupts();
+
     if (apic.programLocalApicTimerTscDeadline(@intFromEnum(idt.IntVectors.sched))) |_| {
         var tsc_timer = timers.Tsc.init(&hpet.?);
         const tsc_timer_iface = tsc_timer.timer();
         try sched.init(
             tsc_timer_iface,
             sched_slab_alloc_iface,
-            heap_allocator_iface,
         );
     } else |_| {
         var lapic_timer = timers.Lapic.init(&hpet.?, @intFromEnum(idt.IntVectors.sched));
@@ -414,7 +413,6 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         try sched.init(
             lapic_timer_iface,
             sched_slab_alloc_iface,
-            heap_allocator_iface,
         );
     }
 

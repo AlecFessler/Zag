@@ -58,6 +58,7 @@ const ThreadAllocator = SlabAllocator(
 // and it's going to be initialized in this module container level.
 // Get rid of the cpl arg on createProcess
 // Vmm is always user space range
+// Add a bitmap for threads to unset bits when a thread is done so checking for process finished is just bitmap == 0
 pub const Process = struct {
     pid: u64,
     cpl: PrivilegeLevel,
@@ -72,9 +73,8 @@ pub const Process = struct {
         entry: *const fn () void,
         cpl: PrivilegeLevel,
     ) !*Process {
-        const proc_alloc_iface = process_allocator.?.allocator();
-        const proc = try proc_alloc_iface.create(Process);
-        errdefer proc_alloc_iface.destroy(proc);
+        const proc = try process_allocator.?.create(Process);
+        errdefer process_allocator.?.destroy(proc);
 
         proc.pid = pid_counter;
         pid_counter += 1;
@@ -134,6 +134,7 @@ pub const Thread = struct {
     state: State,
     ustack: ?[]u8,
     kstack: []u8,
+    krsp: VAddr,
     proc: *Process,
     next: ?*Thread = null,
 
@@ -152,9 +153,8 @@ pub const Thread = struct {
             return error.MaxThreads;
         }
 
-        const thread_alloc_iface = thread_allocator.?.allocator();
-        const thread: *Thread = try thread_alloc_iface.create(Thread);
-        errdefer thread_alloc_iface.destroy(thread);
+        const thread: *Thread = try thread_allocator.?.create(Thread);
+        errdefer thread_allocator.?.destroy(thread);
 
         thread.tid = tid_counter;
         tid_counter += 1;
@@ -185,6 +185,7 @@ pub const Thread = struct {
         );
         const int_frame_addr = kstack_base - @sizeOf(cpu.Context);
         var int_frame_ptr: *cpu.Context = @ptrFromInt(int_frame_addr);
+        thread.krsp = VAddr.fromInt(int_frame_addr);
 
         const RFLAGS_RESERVED_ONE: u64 = 1 << 1;
         const RFLAGS_IF: u64 = 1 << 9;
@@ -221,8 +222,9 @@ pub const Thread = struct {
             int_frame_ptr.ss = gdt.KERNEL_DATA_OFFSET;
             int_frame_ptr.rsp = kstack_base;
         } else {
-            int_frame_ptr.cs = gdt.USER_CODE_OFFSET | 3;
-            int_frame_ptr.ss = gdt.USER_DATA_OFFSET | 3;
+            const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
+            int_frame_ptr.cs = gdt.USER_CODE_OFFSET | ring_3;
+            int_frame_ptr.ss = gdt.USER_DATA_OFFSET | ring_3;
             int_frame_ptr.rsp = std.mem.alignBackward(
                 u64,
                 @intFromPtr(thread.ustack.?.ptr) + thread.ustack.?.len,
@@ -246,18 +248,26 @@ pub const Thread = struct {
 /// Nominal scheduler timeslice in nanoseconds (2 ms).
 pub const SCHED_TIMESLICE_NS = 2_000_000;
 
-var pid_counter: u64 = 0;
+var pid_counter: u64 = 1;
 var tid_counter: u64 = 0;
 
 var timer: ?timers.Timer = null;
-var process_allocator: ?ProcessAllocator = null;
-var thread_allocator: ?ThreadAllocator = null;
-var general_allocator: ?std.mem.Allocator = null;
+var process_allocator: ?std.mem.Allocator = null;
+var thread_allocator: ?std.mem.Allocator = null;
 
-var run_queue: *Thread = undefined;
-
-// NOTE: Should make a kernel process and store it here
-// Should also make a current *Thread and store it here
+var run_queue_head: *Thread = undefined;
+var run_queue_tail: *Thread = undefined;
+// NOTE: Page fault handler should get vmm from this threads proc
+pub var running_thread: *Thread = undefined;
+// NOTE: Still need to have kmain initialize pml4 virt and vmm
+pub var kproc: Process = .{
+    .pid = 0,
+    .cpl = .ring_0,
+    .pml4_virt = undefined,
+    .vmm = undefined,
+    .threads = undefined,
+    .num_threads = 0,
+};
 
 /// Arm the scheduler timer to fire after `delta_ns`.
 ///
@@ -274,20 +284,17 @@ pub fn armSchedTimer(delta_ns: u64) void {
 ///
 /// Arguments:
 /// - `t`: timer implementation to use for arming deadlines.
-pub fn init(
-    t: timers.Timer,
-    slab_backing_allocator: std.mem.Allocator,
-    general_alloc: std.mem.Allocator,
-) !void {
+pub fn init(t: timers.Timer, slab_backing_allocator: std.mem.Allocator) !void {
     timer = t;
-    process_allocator = try ProcessAllocator.init(slab_backing_allocator);
-    thread_allocator = try ThreadAllocator.init(slab_backing_allocator);
-    general_allocator = general_alloc;
+    var proc_alloc = try ProcessAllocator.init(slab_backing_allocator);
+    process_allocator = proc_alloc.allocator();
+    var thread_alloc = try ThreadAllocator.init(slab_backing_allocator);
+    thread_allocator = thread_alloc.allocator();
 
-    // NOTE: After making container level kernel process struct, this will
-    // just be a createThread call
-    const proc = try Process.createProcess(hltProcEntry, .ring_0);
-    run_queue = proc.threads[0];
+    const thread = try Thread.createThread(&kproc, hltProcEntry);
+    run_queue_head = thread;
+    run_queue_tail = thread;
+    running_thread = thread;
 }
 
 /// Scheduler timer interrupt handler: logs a tick and rearms the deadline.
@@ -300,11 +307,18 @@ pub fn init(
 pub fn schedTimerHandler(ctx: *cpu.Context) void {
     armSchedTimer(SCHED_TIMESLICE_NS);
     //NOTE: also need to swap address space if the next thread is ring 3
-    // also need to point rsp at next thread rsp
     // also need to swap tss.rsp0 to the next thread
-    // also need to save current threads state
-    // advance run queue
-    ctx.* = run_queue.ctx.*;
+    running_thread.ctx = ctx;
+    run_queue_tail.next = running_thread;
+    running_thread = run_queue_head;
+    run_queue_head = running_thread.next orelse running_thread;
+    running_thread.next = null;
+    asm volatile (
+        \\movq %[new_stack], %%rsp
+        \\movq %%rsp, %%rbp
+        :
+        : [new_stack] "r" (running_thread.krsp),
+    );
 }
 
 pub fn hltProcEntry() void {
