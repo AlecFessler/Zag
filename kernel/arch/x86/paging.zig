@@ -9,7 +9,7 @@
 //! # Directory
 //!
 //! ## Type Definitions
-//! - `AddressSpace` – PML4 slot reservations for kernel layouts.
+//! - `Pml4SlotIndices` – PML4 slot reservations for kernel layouts.
 //! - `MappingType` – base used for PAddr↔VAddr translation (physmap, identity).
 //! - `PageSize` – supported page sizes (4 KiB, 2 MiB, 1 GiB).
 //! - `RW` – readable/writable selector for entries.
@@ -31,6 +31,7 @@
 //! - None.
 //!
 //! ## Functions
+//! - `` - retrieve the physmapped vaddr of the current root page table
 //! - `dropIdentityMap` – clear lower-half identity PML4 entries and reload CR3.
 //! - `mapPage` – map one page (4 KiB/2 MiB/1 GiB), allocating tables on demand.
 //! - `PageMem` – sized/ aligned struct type for allocator APIs (by page size).
@@ -44,11 +45,12 @@
 const std = @import("std");
 
 /// Top-level virtual address slots (PML4 indices) we reserve.
-pub const AddressSpace = enum(u9) {
-    /// Higher-half direct map: physmap at PML4=511.
+pub const Pml4SlotIndices = enum(u9) {
+    uvmm_start = 0,
+    uvmm_end = 255,
+    kvmm_start = 256,
+    kvmm_end = 510,
     physmap = 511,
-    /// Kernel virtual memory area reserved for the VMM (allocator address space).
-    kvmm = 510,
 };
 
 /// Which base to use when translating between `PAddr` and `VAddr`.
@@ -153,7 +155,7 @@ pub const PAddr = struct {
     /// - None.
     pub fn fromVAddr(vaddr: VAddr, type_: MappingType) PAddr {
         const base_vaddr = switch (type_) {
-            .physmap => pml4SlotBase(@intFromEnum(AddressSpace.physmap)),
+            .physmap => pml4SlotBase(@intFromEnum(Pml4SlotIndices.physmap)),
             .identity => VAddr.fromInt(0),
         };
         const phys = vaddr.addr - base_vaddr.addr;
@@ -293,7 +295,7 @@ pub const VAddr = struct {
     /// - None.
     pub fn fromPAddr(paddr: PAddr, type_: MappingType) VAddr {
         const base_vaddr = switch (type_) {
-            .physmap => pml4SlotBase(@intFromEnum(AddressSpace.physmap)),
+            .physmap => pml4SlotBase(@intFromEnum(Pml4SlotIndices.physmap)),
             .identity => VAddr.fromInt(0),
         };
         const virt = paddr.addr + base_vaddr.addr;
@@ -346,11 +348,61 @@ pub const default_flags = PageEntry{
     .nx = .nx,
 };
 
+pub const PAGE4K = @intFromEnum(PageSize.Page4K);
+pub const PAGE2M = @intFromEnum(PageSize.Page2M);
+pub const PAGE1G = @intFromEnum(PageSize.Page1G);
+
 /// Required alignment for page tables and 4 KiB pages.
 pub const PAGE_ALIGN = std.mem.Alignment.fromByteUnits(@intFromEnum(PageSize.Page4K));
 
 /// Entries per page table.
 pub const PAGE_TABLE_SIZE = 512;
+
+/// Summary:
+/// Copy the kernel PML4 mappings from the currently active address space into
+/// `other`, covering slots `[kvmm_start .. 511]` (includes the physmap slot).
+///
+/// Args:
+/// - `other`: Pointer to the destination PML4 table (virtual address).
+///
+/// Returns:
+/// - `void`.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn copyKernelPml4Mappings(other: [*]PML4Entry) void {
+    const src_pml4_vaddr = currentPml4VAddr();
+    const src: [*]PML4Entry = src_pml4_vaddr.getPtr([*]PML4Entry);
+
+    const start = @intFromEnum(Pml4SlotIndices.kvmm_start);
+    for (start..PAGE_TABLE_SIZE) |i| {
+        other[i] = src[i];
+    }
+}
+
+/// Summary:
+/// Returns the virtual address of the currently active PML4 by reading CR3,
+/// masking off the low flag bits, and translating the physical base via the physmap.
+///
+/// Args:
+/// - None.
+///
+/// Returns:
+/// - `VAddr` canonical virtual address of the active PML4 page (4 KiB-aligned).
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn currentPml4VAddr() VAddr {
+    const cr3 = read_cr3();
+    const pml4_paddr = PAddr.fromInt(cr3.addr & ~@as(u64, 0xFFF));
+    return VAddr.fromPAddr(pml4_paddr, .physmap);
+}
 
 /// Summary:
 /// Drops the identity mapping for the lower half of the address space and reloads CR3.
@@ -370,7 +422,8 @@ pub const PAGE_TABLE_SIZE = 512;
 /// - None (expects an active, canonical higher-half layout).
 pub fn dropIdentityMap() void {
     const cr3 = read_cr3();
-    const pml4_paddr = PAddr.fromInt(cr3.addr & ~@as(u64, 0xfff));
+
+    const pml4_paddr = PAddr.fromInt(cr3.addr & ~@as(u64, 0xFFF));
     const pml4_vaddr = VAddr.fromPAddr(pml4_paddr, .physmap);
     const pml4 = pml4_vaddr.getPtr([*]PML4Entry);
 

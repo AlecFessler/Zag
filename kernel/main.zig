@@ -10,8 +10,8 @@
 //! # Directory
 //!
 //! ## Constants
-//! - PAGE1G – 1 GiB page size (bytes).
-//! - PAGE4K – 4 KiB page size (bytes).
+//! - paging.PAGE1G – 1 GiB page size (bytes).
+//! - paging.PAGE4K – 4 KiB page size (bytes).
 //!
 //! ## Variables
 //! - __stackguard_lower – lower bound of guarded bootstrap stack region.
@@ -49,12 +49,6 @@ const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
 const Range = range.Range;
 const VAddr = paging.VAddr;
 const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
-
-/// 1 GiB page size (bytes).
-const PAGE1G = @intFromEnum(paging.PageSize.Page1G);
-
-/// 4 KiB page size (bytes).
-const PAGE4K = @intFromEnum(paging.PageSize.Page4K);
 
 /// Lower bound of the guarded bootstrap stack region.
 extern const __stackguard_lower: [*]const u8;
@@ -170,7 +164,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     }
 
     const bump_alloc_start_phys = PAddr.fromInt(largest_free_region.start_paddr);
-    const bump_alloc_end_phys = PAddr.fromInt(largest_free_region.start_paddr + largest_free_region.num_pages * PAGE4K);
+    const bump_alloc_end_phys = PAddr.fromInt(largest_free_region.start_paddr + largest_free_region.num_pages * paging.PAGE4K);
     var bump_allocator = BumpAllocator.init(bump_alloc_start_phys.addr, bump_alloc_end_phys.addr);
     var bump_alloc_iface: ?std.mem.Allocator = bump_allocator.allocator();
 
@@ -198,7 +192,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         }
         const entry_range: Range = .{
             .start = entry.start_paddr,
-            .end = entry.start_paddr + entry.num_pages * PAGE4K,
+            .end = entry.start_paddr + entry.num_pages * paging.PAGE4K,
         };
         paging.physMapRegion(
             pml4_virt_id,
@@ -223,14 +217,14 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     paging.dropIdentityMap();
 
     const buddy_alloc_start_virt = VAddr.fromPAddr(
-        PAddr.fromInt(std.mem.alignForward(u64, smallest_addr_region.start_paddr, PAGE4K)),
+        PAddr.fromInt(std.mem.alignForward(u64, smallest_addr_region.start_paddr, paging.PAGE4K)),
         .physmap,
     );
     const buddy_alloc_end_virt = VAddr.fromPAddr(
         PAddr.fromInt(std.mem.alignBackward(
             u64,
-            largest_addr_free_region.start_paddr + largest_addr_free_region.num_pages * PAGE4K,
-            PAGE4K,
+            largest_addr_free_region.start_paddr + largest_addr_free_region.num_pages * paging.PAGE4K,
+            paging.PAGE4K,
         )),
         .physmap,
     );
@@ -249,7 +243,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
 
         const entry_start_virt = VAddr.fromPAddr(PAddr.fromInt(entry.start_paddr), .physmap);
         const entry_end_virt = VAddr.fromPAddr(
-            PAddr.fromInt(entry.start_paddr + entry.num_pages * PAGE4K),
+            PAddr.fromInt(entry.start_paddr + entry.num_pages * paging.PAGE4K),
             .physmap,
         );
         const entry_range: Range = .{
@@ -263,7 +257,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         };
         const null_page_range: Range = .{
             .start = VAddr.fromPAddr(PAddr.fromInt(0), .physmap).addr,
-            .end = VAddr.fromPAddr(PAddr.fromInt(PAGE4K), .physmap).addr,
+            .end = VAddr.fromPAddr(PAddr.fromInt(paging.PAGE4K), .physmap).addr,
         };
 
         var useable_range: Range = entry_range;
@@ -279,16 +273,16 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     pmm_mod.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
     const pmm_iface = pmm_mod.global_pmm.?.allocator();
 
-    const vmm_start_virt = paging.pml4SlotBase(@intFromEnum(paging.AddressSpace.kvmm));
-    const vmm_end_virt = VAddr.fromInt(vmm_start_virt.addr + PAGE1G * paging.PAGE_TABLE_SIZE);
+    const vmm_start_virt = paging.pml4SlotBase(@intFromEnum(paging.Pml4SlotIndices.kvmm_start));
+    const vmm_end_virt = VAddr.fromInt(vmm_start_virt.addr + paging.PAGE1G * paging.PAGE_TABLE_SIZE);
     vmm_mod.global_vmm = VirtualMemoryManager.init(vmm_start_virt, vmm_end_virt);
     var vmm = &vmm_mod.global_vmm.?;
 
-    const heap_vaddr_space_start = try vmm.reserve(PAGE1G * 256, std.mem.Alignment.fromByteUnits(PAGE4K));
-    const heap_vaddr_space_end = VAddr.fromInt(heap_vaddr_space_start.addr + PAGE1G * 256);
+    const heap_vaddr_space_start = try vmm.reserve(paging.PAGE1G * 256, std.mem.Alignment.fromByteUnits(paging.PAGE4K));
+    const heap_vaddr_space_end = VAddr.fromInt(heap_vaddr_space_start.addr + paging.PAGE1G * 256);
 
-    const heap_tree_vaddr_space_start = try vmm.reserve(PAGE1G, std.mem.Alignment.fromByteUnits(PAGE4K));
-    const heap_tree_vaddr_space_end = VAddr.fromInt(heap_tree_vaddr_space_start.addr + PAGE1G);
+    const heap_tree_vaddr_space_start = try vmm.reserve(paging.PAGE1G, std.mem.Alignment.fromByteUnits(paging.PAGE4K));
+    const heap_tree_vaddr_space_end = VAddr.fromInt(heap_tree_vaddr_space_start.addr + paging.PAGE1G);
 
     var heap_tree_backing_allocator = BumpAllocator.init(
         heap_tree_vaddr_space_start.addr,
@@ -394,14 +388,34 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
 
     cpu.enableInterrupts();
 
+    const sched_slab_vaddr_space_start = try vmm.reserve(
+        paging.PAGE1G,
+        paging.PAGE_ALIGN,
+    );
+    const sched_slab_vaddr_space_end = VAddr.fromInt(sched_slab_vaddr_space_start.addr + paging.PAGE1G);
+
+    var sched_slab_backing_allocator = BumpAllocator.init(
+        sched_slab_vaddr_space_start.addr,
+        sched_slab_vaddr_space_end.addr,
+    );
+    const sched_slab_alloc_iface = sched_slab_backing_allocator.allocator();
+
     if (apic.programLocalApicTimerTscDeadline(@intFromEnum(idt.IntVectors.sched))) |_| {
         var tsc_timer = timers.Tsc.init(&hpet.?);
         const tsc_timer_iface = tsc_timer.timer();
-        sched.init(tsc_timer_iface);
+        try sched.init(
+            tsc_timer_iface,
+            sched_slab_alloc_iface,
+            heap_allocator_iface,
+        );
     } else |_| {
         var lapic_timer = timers.Lapic.init(&hpet.?, @intFromEnum(idt.IntVectors.sched));
         const lapic_timer_iface = lapic_timer.timer();
-        sched.init(lapic_timer_iface);
+        try sched.init(
+            lapic_timer_iface,
+            sched_slab_alloc_iface,
+            heap_allocator_iface,
+        );
     }
 
     sched.armSchedTimer(sched.SCHED_TIMESLICE_NS);
