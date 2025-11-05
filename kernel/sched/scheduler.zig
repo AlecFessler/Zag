@@ -283,6 +283,7 @@ pub fn init(t: timers.Timer, slab_backing_allocator: std.mem.Allocator) !void {
 /// - Panics if `timer` is null (because it calls `scheduler.armSchedTimer`).
 pub fn schedTimerHandler(ctx: *cpu.Context) void {
     _ = ctx;
+    serial.print("Sched!\n", .{});
     armSchedTimer(SCHED_TIMESLICE_NS);
 
     // NOTE: Uncomment once run queue is up
@@ -298,6 +299,7 @@ pub fn schedTimerHandler(ctx: *cpu.Context) void {
     }
 
     running_thread.state = .running;
+    apic.endOfInterrupt();
 
     // NOTE: make this conditional on prev running thread and new running thread being different
     // also add memory and cc clobbers
