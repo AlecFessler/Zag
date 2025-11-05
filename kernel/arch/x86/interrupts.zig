@@ -109,7 +109,7 @@ pub fn getInterruptStub(comptime int_num: u8, comptime pushes_err: bool) idt.int
             if (pushes_err) {
                 asm volatile (
                     \\pushq %[num]
-                    \\jmp commonInterruptStub
+                    \\jmp commonInterruptStubPrologue
                     :
                     : [num] "i" (@as(u64, int_num)),
                 );
@@ -117,7 +117,7 @@ pub fn getInterruptStub(comptime int_num: u8, comptime pushes_err: bool) idt.int
                 asm volatile (
                     \\pushq $0
                     \\pushq %[num]
-                    \\jmp commonInterruptStub
+                    \\jmp commonInterruptStubPrologue
                     :
                     : [num] "i" (@as(u64, int_num)),
                 );
@@ -233,7 +233,7 @@ fn registerVector(
 ///
 /// Panics:
 /// - None.
-export fn commonInterruptStub() callconv(.naked) void {
+export fn commonInterruptStubPrologue() callconv(.naked) void {
     asm volatile (
         \\pushq %rax
         \\pushq %rcx
@@ -254,6 +254,12 @@ export fn commonInterruptStub() callconv(.naked) void {
         \\mov %rsp, %rdi
         \\call dispatchInterrupt
         \\
+        \\ jmp commonInterruptStubEpilogue
+        ::: .{ .memory = true, .cc = true });
+}
+
+export fn commonInterruptStubEpilogue() callconv(.naked) void {
+    asm volatile (
         \\popq %r15
         \\popq %r14
         \\popq %r13
