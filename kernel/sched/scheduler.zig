@@ -204,6 +204,7 @@ pub const Thread = struct {
         sp = push(sp, 0); // r14
         sp = push(sp, 0); // r15
 
+        // NOTE: Move this to the correct ordering relative to other pushes
         if (proc.cpl == .ring_3) {
             const user_rsp = std.mem.alignBackward(
                 u64,
@@ -299,6 +300,7 @@ pub fn schedTimerHandler(ctx: *cpu.Context) void {
     running_thread.state = .running;
 
     // NOTE: make this conditional on prev running thread and new running thread being different
+    // also add memory and cc clobbers
     asm volatile (
         \\movq %[new_stack], %%rsp
         \\jmp commonInterruptStubEpilogue
