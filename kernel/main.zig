@@ -186,6 +186,8 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     );
     cpu.invlpg(pml4_virt_physmap);
 
+    sched.kproc.pml4_virt = pml4_virt_physmap;
+
     for (mmap) |entry| {
         if (entry.type != .free and entry.type != .acpi) {
             continue;
@@ -274,14 +276,25 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     const pmm_iface = pmm_mod.global_pmm.?.allocator();
 
     const vmm_start_virt = paging.pml4SlotBase(@intFromEnum(paging.Pml4SlotIndices.kvmm_start));
-    const vmm_end_virt = VAddr.fromInt(vmm_start_virt.addr + paging.PAGE1G * paging.PAGE_TABLE_SIZE);
-    vmm_mod.global_vmm = VirtualMemoryManager.init(vmm_start_virt, vmm_end_virt);
-    var vmm = &vmm_mod.global_vmm.?;
+    const vmm_end_virt = VAddr.fromInt(paging.pml4SlotBase(
+        @intFromEnum(paging.Pml4SlotIndices.kvmm_end),
+    ).addr + paging.PAGE1G * paging.PAGE_TABLE_SIZE);
 
-    const heap_vaddr_space_start = try vmm.reserve(paging.PAGE1G * 256, std.mem.Alignment.fromByteUnits(paging.PAGE4K));
+    sched.kproc.vmm = VirtualMemoryManager.init(
+        vmm_start_virt,
+        vmm_end_virt,
+    );
+
+    const heap_vaddr_space_start = try sched.kproc.vmm.reserve(
+        paging.PAGE1G * 256,
+        paging.PAGE_ALIGN,
+    );
     const heap_vaddr_space_end = VAddr.fromInt(heap_vaddr_space_start.addr + paging.PAGE1G * 256);
 
-    const heap_tree_vaddr_space_start = try vmm.reserve(paging.PAGE1G, std.mem.Alignment.fromByteUnits(paging.PAGE4K));
+    const heap_tree_vaddr_space_start = try sched.kproc.vmm.reserve(
+        paging.PAGE1G,
+        paging.PAGE_ALIGN,
+    );
     const heap_tree_vaddr_space_end = VAddr.fromInt(heap_tree_vaddr_space_start.addr + paging.PAGE1G);
 
     var heap_tree_backing_allocator = BumpAllocator.init(
@@ -386,7 +399,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         @panic("Failed to find and initialize HPET!");
     }
 
-    const sched_slab_vaddr_space_start = try vmm.reserve(
+    const sched_slab_vaddr_space_start = try sched.kproc.vmm.reserve(
         paging.PAGE1G,
         paging.PAGE_ALIGN,
     );

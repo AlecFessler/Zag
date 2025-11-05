@@ -54,11 +54,7 @@ const ThreadAllocator = SlabAllocator(
     64, // allocation chunk size
 );
 
-// NOTE: Redesign this to assume ring_3 since there's only one kernel proc
-// and it's going to be initialized in this module container level.
-// Get rid of the cpl arg on createProcess
-// Vmm is always user space range
-// Add a bitmap for threads to unset bits when a thread is done so checking for process finished is just bitmap == 0
+// NOTE: Add a bitmap for threads to unset bits when a thread is done so checking for process finished is just bitmap == 0
 pub const Process = struct {
     pid: u64,
     cpl: PrivilegeLevel,
@@ -69,9 +65,8 @@ pub const Process = struct {
 
     const MAX_THREADS = 16; // for now
 
-    pub fn createProcess(
+    pub fn createUserProcess(
         entry: *const fn () void,
-        cpl: PrivilegeLevel,
     ) !*Process {
         const proc = try process_allocator.?.create(Process);
         errdefer process_allocator.?.destroy(proc);
@@ -79,7 +74,7 @@ pub const Process = struct {
         proc.pid = pid_counter;
         pid_counter += 1;
 
-        proc.cpl = cpl;
+        proc.cpl = .ring_3;
 
         const pmm_iface = pmm_mod.global_pmm.?.allocator();
         const pml4_page = try pmm_iface.alignedAlloc(
@@ -92,33 +87,14 @@ pub const Process = struct {
         proc.pml4_virt = VAddr.fromInt(@intFromPtr(pml4_page.ptr));
         paging.copyKernelPml4Mappings(@ptrFromInt(proc.pml4_virt.addr));
 
-        var vmm_start_virt: VAddr = undefined;
-        var vmm_end_virt: VAddr = undefined;
-        vmm_start_virt, vmm_end_virt = blk: {
-            const ustart = paging.PAGE4K;
-            const uend = paging.pml4SlotBase(
-                @intFromEnum(paging.Pml4SlotIndices.uvmm_end),
-            ).addr + paging.PAGE1G * paging.PAGE_TABLE_SIZE;
-
-            const kstart = paging.pml4SlotBase(
-                @intFromEnum(paging.Pml4SlotIndices.kvmm_start),
-            ).addr;
-            const kend = paging.pml4SlotBase(
-                @intFromEnum(paging.Pml4SlotIndices.kvmm_end),
-            ).addr + paging.PAGE1G * paging.PAGE_TABLE_SIZE;
-
-            const start = if (cpl == .ring_0) kstart else ustart;
-            const end = if (cpl == .ring_0) kend else uend;
-
-            break :blk .{
-                VAddr.fromInt(start),
-                VAddr.fromInt(end),
-            };
-        };
+        const vmm_start = VAddr.fromInt(paging.PAGE4K);
+        const vmm_end = VAddr.fromInt(paging.pml4SlotBase(
+            @intFromEnum(paging.Pml4SlotIndices.uvmm_end),
+        ).addr + paging.PAGE1G * paging.PAGE_TABLE_SIZE);
 
         proc.vmm = VirtualMemoryManager.init(
-            vmm_start_virt,
-            vmm_end_virt,
+            vmm_start,
+            vmm_end,
         );
 
         proc.num_threads = 0;
@@ -138,11 +114,19 @@ pub const Thread = struct {
     next: ?*Thread = null,
 
     pub const State = enum {
-        ready,
-        stopped,
+        starting,
+        running,
+        waiting,
         sleeping,
         done,
     };
+
+    fn push(sp: u64, val: u64) u64 {
+        const pushed = sp - @sizeOf(u64);
+        const ptr: *u64 = @ptrFromInt(pushed);
+        ptr.* = val;
+        return pushed;
+    }
 
     pub fn createThread(
         proc: *Process,
@@ -182,68 +166,67 @@ pub const Thread = struct {
             @intFromPtr(kstack_ptr) + paging.PAGE4K,
             16,
         );
-        const int_frame_addr = kstack_base - @sizeOf(cpu.Context);
-        var int_frame_ptr: *cpu.Context = @ptrFromInt(int_frame_addr);
+
+        var sp: u64 = kstack_base;
 
         const RFLAGS_RESERVED_ONE: u64 = 1 << 1;
         const RFLAGS_IF: u64 = 1 << 9;
+        const rflags_val: u64 = RFLAGS_RESERVED_ONE | RFLAGS_IF;
 
-        int_frame_ptr.* = .{
-            .regs = .{
-                .r15 = 0,
-                .r14 = 0,
-                .r13 = 0,
-                .r12 = 0,
-                .r11 = 0,
-                .r10 = 0,
-                .r9 = 0,
-                .r8 = 0,
-                .rdi = 0,
-                .rsi = 0,
-                .rbp = 0,
-                .rbx = 0,
-                .rdx = 0,
-                .rcx = 0,
-                .rax = 0,
-            },
-            .int_num = 0,
-            .err_code = 0,
-            .rip = @intFromPtr(entry),
-            .cs = 0,
-            .rflags = RFLAGS_RESERVED_ONE | RFLAGS_IF,
-            .rsp = 0,
-            .ss = 0,
+        const cs_val: u64 = blk: {
+            if (proc.cpl == .ring_3)
+                break :blk gdt.USER_CODE_OFFSET | @intFromEnum(idt.PrivilegeLevel.ring_3)
+            else
+                break :blk gdt.KERNEL_CODE_OFFSET;
         };
+        const rip_val: u64 = @intFromPtr(entry);
 
-        if (proc.cpl == .ring_0) {
-            int_frame_ptr.cs = gdt.KERNEL_CODE_OFFSET;
-            int_frame_ptr.ss = gdt.KERNEL_DATA_OFFSET;
-            int_frame_ptr.rsp = kstack_base;
-        } else {
-            const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
-            int_frame_ptr.cs = gdt.USER_CODE_OFFSET | ring_3;
-            int_frame_ptr.ss = gdt.USER_DATA_OFFSET | ring_3;
-            int_frame_ptr.rsp = std.mem.alignBackward(
+        sp = push(sp, rflags_val);
+        sp = push(sp, cs_val);
+        sp = push(sp, rip_val);
+
+        sp = push(sp, 0); // err_code
+        sp = push(sp, 0); // int_num
+
+        sp = push(sp, 0); // rax
+        sp = push(sp, 0); // rcx
+        sp = push(sp, 0); // rdx
+        sp = push(sp, 0); // rbx
+        sp = push(sp, 0); // rbp
+        sp = push(sp, 0); // rsi
+        sp = push(sp, 0); // rdi
+        sp = push(sp, 0); // r8
+        sp = push(sp, 0); // r9
+        sp = push(sp, 0); // r10
+        sp = push(sp, 0); // r11
+        sp = push(sp, 0); // r12
+        sp = push(sp, 0); // r13
+        sp = push(sp, 0); // r14
+        sp = push(sp, 0); // r15
+
+        if (proc.cpl == .ring_3) {
+            const user_rsp = std.mem.alignBackward(
                 u64,
                 @intFromPtr(thread.ustack.?.ptr) + thread.ustack.?.len,
                 16,
             );
+            sp = push(sp, user_rsp);
+            sp = push(sp, gdt.USER_DATA_OFFSET | @intFromEnum(idt.PrivilegeLevel.ring_3));
         }
 
-        thread.ctx = int_frame_ptr;
+        thread.ctx = @ptrFromInt(sp);
 
         thread.proc = proc;
 
         proc.threads[proc.num_threads] = thread;
         proc.num_threads += 1;
 
-        thread.state = .ready;
+        thread.state = .starting;
 
         return thread;
     }
 };
 
-/// Nominal scheduler timeslice in nanoseconds (2 ms).
 pub const SCHED_TIMESLICE_NS = 2_000_000;
 
 var pid_counter: u64 = 1;
@@ -253,14 +236,11 @@ var timer: ?timers.Timer = null;
 var process_allocator: ?std.mem.Allocator = null;
 var thread_allocator: ?std.mem.Allocator = null;
 
-var run_queue_head: *Thread = undefined;
-var run_queue_tail: *Thread = undefined;
-// NOTE: Page fault handler should get vmm from this threads proc
 pub var running_thread: *Thread = undefined;
-// NOTE: Still need to have kmain initialize pml4 virt and vmm
 pub var kproc: Process = .{
     .pid = 0,
     .cpl = .ring_0,
+    // kMain will initialize pml4_virt and vmm
     .pml4_virt = undefined,
     .vmm = undefined,
     .threads = undefined,
@@ -289,9 +269,7 @@ pub fn init(t: timers.Timer, slab_backing_allocator: std.mem.Allocator) !void {
     var thread_alloc = try ThreadAllocator.init(slab_backing_allocator);
     thread_allocator = thread_alloc.allocator();
 
-    const thread = try Thread.createThread(&kproc, hltProcEntry);
-    run_queue_head = thread;
-    run_queue_tail = thread;
+    const thread = try Thread.createThread(&kproc, hltThreadEntry);
     running_thread = thread;
 }
 
@@ -303,23 +281,56 @@ pub fn init(t: timers.Timer, slab_backing_allocator: std.mem.Allocator) !void {
 /// Panics:
 /// - Panics if `timer` is null (because it calls `scheduler.armSchedTimer`).
 pub fn schedTimerHandler(ctx: *cpu.Context) void {
+    _ = ctx;
     armSchedTimer(SCHED_TIMESLICE_NS);
-    //NOTE: also need to swap address space if the next thread is ring 3
-    // also need to swap tss.rsp0 to the next thread
-    running_thread.ctx = ctx;
-    run_queue_tail.next = running_thread;
-    running_thread = run_queue_head;
-    run_queue_head = running_thread.next orelse running_thread;
-    running_thread.next = null;
+
+    // NOTE: Uncomment once run queue is up
+    //running_thread.ctx = ctx;
+
+    // once run queue is a thing, advance run queue
+
+    const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
+    const cpl = running_thread.ctx.cs & ring_3;
+    if (cpl == 3) {
+        gdt.main_tss_entry.rsp0 = @intFromPtr(running_thread.kstack.ptr) + running_thread.kstack.len;
+        // NOTE: swap pml4
+    }
+
     asm volatile (
         \\movq %[new_stack], %%rsp
         \\movq %%rsp, %%rbp
         :
         : [new_stack] "r" (running_thread.ctx),
     );
+
+    if (running_thread.state == .starting) {
+        running_thread.state = .running;
+        asm volatile (
+            \\popq %r15
+            \\popq %r14
+            \\popq %r13
+            \\popq %r12
+            \\popq %r11
+            \\popq %r10
+            \\popq %r9
+            \\popq %r8
+            \\popq %rdi
+            \\popq %rsi
+            \\popq %rbp
+            \\popq %rbx
+            \\popq %rdx
+            \\popq %rcx
+            \\popq %rax
+            \\
+            \\addq $16, %rsp
+            \\iretq
+            ::: .{ .memory = true, .cc = true });
+    }
+
+    running_thread.state = .running;
 }
 
-pub fn hltProcEntry() void {
+pub fn hltThreadEntry() void {
     serial.print("Halt proc hello!\n", .{});
     cpu.halt();
 }

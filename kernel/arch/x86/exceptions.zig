@@ -33,7 +33,7 @@ const zag = @import("zag");
 
 const memory = zag.memory;
 const pmm_mod = memory.PhysicalMemoryManager;
-const vmm_mod = memory.VirtualMemoryManager;
+const sched = zag.sched.scheduler;
 
 /// Architectural exception vectors (subset shown explicitly).
 pub const Exception = enum(u5) {
@@ -102,7 +102,6 @@ const PFErrCode = struct {
 const PAddr = paging.PAddr;
 const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
 const VAddr = paging.VAddr;
-const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
 
 /// Number of exception gates (0..31) to install.
 pub const NUM_ISR_ENTRIES = 32;
@@ -145,6 +144,11 @@ pub fn init() void {
     );
 
     interrupts.registerException(
+        @intFromEnum(Exception.double_fault),
+        doubleFaultHandler,
+    );
+
+    interrupts.registerException(
         @intFromEnum(Exception.page_fault),
         pageFaultHandler,
     );
@@ -177,11 +181,22 @@ pub fn init() void {
 /// Panics:
 /// - Always panics on divide-by-zero, message varies by CPL.
 fn divByZeroHandler(ctx: *cpu.Context) void {
+    interrupts.dumpInterruptFrame(ctx);
     const cpl: u64 = ctx.cs & 3;
     if (cpl == 0) {
         @panic("Divide by zero in kernelspace!");
     } else {
         @panic("Divide by zero in userspace!");
+    }
+}
+
+fn doubleFaultHandler(ctx: *cpu.Context) void {
+    interrupts.dumpInterruptFrame(ctx);
+    const cpl: u64 = ctx.cs & 3;
+    if (cpl == 0) {
+        @panic("Double fault in kernelspace!");
+    } else {
+        @panic("Double fault in userspace!");
     }
 }
 
@@ -205,12 +220,14 @@ fn divByZeroHandler(ctx: *cpu.Context) void {
 fn pageFaultHandler(ctx: *cpu.Context) void {
     const pf_err = PFErrCode.from(ctx.err_code);
 
-    if (pf_err.rsvd_violation) @panic("Page tables have reserved bits set (RSVD).");
+    if (pf_err.rsvd_violation) {
+        @panic("Page tables have reserved bits set (RSVD).");
+    }
     if (pmm_mod.global_pmm == null) {
         @panic("Page fault prior to pmm initialization!");
     }
 
-    const code_privilege_level: u64 = ctx.cs & 3;
+    const cpl: u64 = ctx.cs & 3;
     const faulting_virt = cpu.read_cr2();
     const faulting_page_virt = VAddr.fromInt(std.mem.alignBackward(
         u64,
@@ -218,24 +235,25 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         @intFromEnum(paging.PageSize.Page4K),
     ));
 
-    serial.print("Faulting Instruction: {X}\nFaulting Address: {X}\nFaulting Page: {X}\nPresent: {}\nIs Write: {}\n", .{
-        ctx.rip,
-        faulting_virt.addr,
-        faulting_page_virt.addr,
-        pf_err.present,
-        pf_err.is_write,
-    });
+    if (cpl == 0) {
+        var panic_msg: ?[]const u8 = null;
+        if (pf_err.instr_fetch) {
+            panic_msg = "Execute fault (NX) at kernel address!";
+        } else if (pf_err.present) {
+            panic_msg = "Kernel tried to access non-present page!";
+        } else if (!sched.kproc.vmm.isValidVAddr(faulting_virt)) {
+            panic_msg = "Kernel tried to access an unreserved virtual address!";
+        }
 
-    if (code_privilege_level == 0) {
-        if (pf_err.instr_fetch) @panic("Execute fault (NX) at kernel address.");
-        if (pf_err.present) {
-            @panic("Invalid memory access in kernelspace!");
-        }
-        if (vmm_mod.global_vmm == null) {
-            @panic("Page fault prior to vmm initialization");
-        }
-        if (!vmm_mod.global_vmm.?.isValidVaddr(faulting_page_virt)) {
-            @panic("Invalid faulting address in kernel");
+        if (panic_msg) |msg| {
+            serial.print("Faulting Instruction: {X}\nFaulting Address: {X}\nFaulting Page: {X}\nPresent: {}\nIs Write: {}\n", .{
+                ctx.rip,
+                faulting_virt.addr,
+                faulting_page_virt.addr,
+                pf_err.present,
+                pf_err.is_write,
+            });
+            @panic(msg);
         }
 
         const pmm_iface = pmm_mod.global_pmm.?.allocator();
@@ -243,8 +261,7 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         const phys_page_virt = VAddr.fromInt(@intFromPtr(page.ptr));
         const phys_page_phys = PAddr.fromVAddr(phys_page_virt, .physmap);
 
-        const pml4_phys = PAddr.fromInt(paging.read_cr3().addr & ~@as(u64, 0xfff));
-        const pml4_virt = VAddr.fromPAddr(pml4_phys, .physmap);
+        const pml4_virt = paging.currentPml4VAddr();
 
         paging.mapPage(
             @ptrFromInt(pml4_virt.addr),

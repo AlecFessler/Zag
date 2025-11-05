@@ -33,6 +33,7 @@
 const apic = @import("apic.zig");
 const cpu = @import("cpu.zig");
 const idt = @import("idt.zig");
+const serial = @import("serial.zig");
 const std = @import("std");
 
 /// Acknowledge policy for a handled vector (e.g., LAPIC EOI required).
@@ -274,6 +275,49 @@ export fn commonInterruptStub() callconv(.naked) void {
         ::: .{ .memory = true, .cc = true });
 }
 
+pub fn dumpInterruptFrame(ctx: *cpu.Context) void {
+    const words: [*]const u64 = @ptrCast(ctx);
+
+    serial.print("\n=== INTERRUPT FRAME ===\n", .{});
+    serial.print("ctx @ {x}\n\n", .{ @intFromPtr(ctx) });
+
+    serial.print("Regs (pushed by stub):\n", .{});
+    const reg_names = [_][]const u8{
+        "r15","r14","r13","r12",
+        "r11","r10","r9 ","r8 ",
+        "rdi","rsi","rbp","rbx",
+        "rdx","rcx","rax","INT",
+    };
+
+    var i: usize = 0;
+    while (i < 16) : (i += 4) {
+        serial.print(
+            "{s}={x:016}  {s}={x:016}  {s}={x:016}  {s}={x:016}\n",
+            .{
+                reg_names[i],   words[i],
+                reg_names[i+1], words[i+1],
+                reg_names[i+2], words[i+2],
+                reg_names[i+3], words[i+3],
+            },
+        );
+    }
+    serial.print("\n", .{});
+
+    serial.print("err_code={x:016}\n", .{ words[16] });
+    serial.print("RIP      ={x:016}\n", .{ words[17] });
+    serial.print("CS       ={x:016}\n", .{ words[18] });
+    serial.print("RFLAGS   ={x:016}\n", .{ words[19] });
+
+    if ((words[18] & 3) == 3) {
+        serial.print("RSP      ={x:016}\n", .{ words[20] });
+        serial.print("SS       ={x:016}\n", .{ words[21] });
+    } else {
+        serial.print("(kernel CPL: no RSP/SS on frame)\n", .{});
+    }
+
+    serial.print("=== END FRAME ===\n\n", .{});
+}
+
 /// Summary:
 /// Dispatches to the registered handler for `ctx.int_num`, then issues LAPIC
 /// EOI if the vector's acknowledgement policy requires it.
@@ -297,5 +341,6 @@ export fn dispatchInterrupt(ctx: *cpu.Context) void {
         }
         return;
     }
+    dumpInterruptFrame(ctx);
     @panic("Unhandled interrupt!");
 }
