@@ -146,30 +146,17 @@ pub const CpuidPowerEdx = enum(u32) {
     constant_tsc = 1 << 8, // Invariant TSC
 };
 
-/// Interrupt frame captured/restored by the common entry/return stubs.
 pub const Context = packed struct {
-    /// General registers saved by the common stub.
     regs: Registers,
-    /// Interrupt vector number (pushed by per-vector stub).
     int_num: u64,
-    /// Error code (real or synthetic 0 depending on vector).
     err_code: u64,
-    /// Saved instruction pointer.
     rip: u64,
-    /// Saved code segment selector.
     cs: u64,
-    /// Saved RFLAGS.
     rflags: u64,
-    /// Saved stack pointer.
     rsp: u64,
-    /// Saved stack segment selector.
     ss: u64,
 };
 
-/// Snapshot of general-purpose registers saved/restored by interrupt/exception glue.
-///
-/// Layout matches the push/pop order used by our stubs so it can be copied
-/// verbatim to/from the stack. All fields are 64-bit.
 pub const Registers = packed struct {
     r15: u64,
     r14: u64,

@@ -1,31 +1,10 @@
-//! Scheduler timer utilities (generic `Timer`-backed timeslice).
-//!
-//! Arms and services a periodic scheduler tick using a provided `timers.Timer`
-//! implementation (e.g. TSC-deadline or LAPIC one-shot). A timer must be
-//! installed via `scheduler.init` before arming.
-//!
-//! # Directory
-//!
-//! ## Type Definitions
-//! - None.
-//!
-//! ## Constants
-//! - `SCHED_TIMESLICE_NS` — nominal scheduler timeslice length in nanoseconds.
-//!
-//! ## Variables
-//! - `timer` — optional `timers.Timer`; must be set by `scheduler.init` before use.
-//!
-//! ## Functions
-//! - `scheduler.armSchedTimer` — arm next tick after a delta in nanoseconds.
-//! - `scheduler.init` — install the active `timers.Timer` implementation.
-//! - `scheduler.schedTimerHandler` — IRQ handler; logs and rearms the timer.
-
 const std = @import("std");
 const zag = @import("zag");
 
 const apic = zag.x86.Apic;
 const cpu = zag.x86.Cpu;
 const idt = zag.x86.Idt;
+const interrupts = zag.x86.Interrupts;
 const gdt = zag.x86.Gdt;
 const serial = zag.x86.Serial;
 const timers = zag.x86.Timers;
@@ -114,7 +93,6 @@ pub const Thread = struct {
     next: ?*Thread = null,
 
     pub const State = enum {
-        starting,
         running,
         waiting,
         sleeping,
@@ -161,28 +139,33 @@ pub const Thread = struct {
         const kstack_ptr: [*]u8 = @ptrFromInt(kstack_virt.addr);
         thread.kstack = kstack_ptr[0..paging.PAGE4K];
 
-        const kstack_base = std.mem.alignBackward(
-            u64,
-            @intFromPtr(kstack_ptr) + paging.PAGE4K,
-            16,
-        );
+        var sp = @intFromPtr(kstack_ptr) + paging.PAGE4K;
 
-        var sp: u64 = kstack_base;
+        if (proc.cpl == .ring_3) {
+            const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
+            const user_ss = gdt.USER_DATA_OFFSET | ring_3;
+            sp = push(sp, user_ss);
+
+            const user_rsp = @intFromPtr(thread.ustack.?.ptr) + thread.ustack.?.len;
+            sp = push(sp, user_rsp);
+        }
 
         const RFLAGS_RESERVED_ONE: u64 = 1 << 1;
         const RFLAGS_IF: u64 = 1 << 9;
         const rflags_val: u64 = RFLAGS_RESERVED_ONE | RFLAGS_IF;
+        sp = push(sp, rflags_val);
 
         const cs_val: u64 = blk: {
-            if (proc.cpl == .ring_3)
-                break :blk gdt.USER_CODE_OFFSET | @intFromEnum(idt.PrivilegeLevel.ring_3)
-            else
+            if (proc.cpl == .ring_3) {
+                const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
+                break :blk gdt.USER_CODE_OFFSET | ring_3;
+            } else {
                 break :blk gdt.KERNEL_CODE_OFFSET;
+            }
         };
-        const rip_val: u64 = @intFromPtr(entry);
-
-        sp = push(sp, rflags_val);
         sp = push(sp, cs_val);
+
+        const rip_val: u64 = @intFromPtr(entry);
         sp = push(sp, rip_val);
 
         sp = push(sp, 0); // err_code
@@ -204,25 +187,14 @@ pub const Thread = struct {
         sp = push(sp, 0); // r14
         sp = push(sp, 0); // r15
 
-        // NOTE: Move this to the correct ordering relative to other pushes
-        if (proc.cpl == .ring_3) {
-            const user_rsp = std.mem.alignBackward(
-                u64,
-                @intFromPtr(thread.ustack.?.ptr) + thread.ustack.?.len,
-                16,
-            );
-            sp = push(sp, user_rsp);
-            sp = push(sp, gdt.USER_DATA_OFFSET | @intFromEnum(idt.PrivilegeLevel.ring_3));
-        }
-
         thread.ctx = @ptrFromInt(sp);
+
+        thread.state = .waiting;
 
         thread.proc = proc;
 
         proc.threads[proc.num_threads] = thread;
         proc.num_threads += 1;
-
-        thread.state = .starting;
 
         return thread;
     }
@@ -248,21 +220,10 @@ pub var kproc: Process = .{
     .num_threads = 0,
 };
 
-/// Arm the scheduler timer to fire after `delta_ns`.
-///
-/// Arguments:
-/// - `delta_ns`: nanoseconds until the next scheduler tick.
-///
-/// Panics:
-/// - Panics if `timer` is null (must call `scheduler.init` first).
 pub fn armSchedTimer(delta_ns: u64) void {
     timer.?.arm_interrupt_timer(delta_ns);
 }
 
-/// Install the active `timers.Timer` used by the scheduler.
-///
-/// Arguments:
-/// - `t`: timer implementation to use for arming deadlines.
 pub fn init(t: timers.Timer, slab_backing_allocator: std.mem.Allocator) !void {
     timer = t;
     var proc_alloc = try ProcessAllocator.init(slab_backing_allocator);
@@ -274,17 +235,14 @@ pub fn init(t: timers.Timer, slab_backing_allocator: std.mem.Allocator) !void {
     running_thread = thread;
 }
 
-/// Scheduler timer interrupt handler: logs a tick and rearms the deadline.
-///
-/// Arguments:
-/// - `ctx`: interrupt context pointer (`*cpu.Context`). Not used.
-///
-/// Panics:
-/// - Panics if `timer` is null (because it calls `scheduler.armSchedTimer`).
 pub fn schedTimerHandler(ctx: *cpu.Context) void {
-    _ = ctx;
-    serial.print("Sched!\n", .{});
-    armSchedTimer(SCHED_TIMESLICE_NS);
+    //armSchedTimer(SCHED_TIMESLICE_NS);
+
+    serial.print("Cold Start Frame:\n", .{});
+    interrupts.dumpInterruptFrame(running_thread.ctx);
+
+    serial.print("Current frame pre swap:\n", .{});
+    interrupts.dumpInterruptFrame(ctx);
 
     // NOTE: Uncomment once run queue is up
     //running_thread.ctx = ctx;
@@ -302,9 +260,9 @@ pub fn schedTimerHandler(ctx: *cpu.Context) void {
     apic.endOfInterrupt();
 
     // NOTE: make this conditional on prev running thread and new running thread being different
-    // also add memory and cc clobbers
     asm volatile (
         \\movq %[new_stack], %%rsp
+        \\movq %%rsp, %%rbp
         \\jmp commonInterruptStubEpilogue
         :
         : [new_stack] "r" (running_thread.ctx),
@@ -312,6 +270,6 @@ pub fn schedTimerHandler(ctx: *cpu.Context) void {
 }
 
 pub fn hltThreadEntry() void {
-    serial.print("Halt proc hello!\n", .{});
+    serial.print("Hello world!\n", .{});
     cpu.halt();
 }

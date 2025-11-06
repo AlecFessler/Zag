@@ -144,6 +144,16 @@ pub fn init() void {
     );
 
     interrupts.registerException(
+        @intFromEnum(Exception.single_step_debug),
+        debugHandler,
+    );
+
+    interrupts.registerException(
+        @intFromEnum(Exception.breakpoint_debug),
+        breakpointHandler,
+    );
+
+    interrupts.registerException(
         @intFromEnum(Exception.double_fault),
         doubleFaultHandler,
     );
@@ -197,6 +207,26 @@ fn doubleFaultHandler(ctx: *cpu.Context) void {
         @panic("Double fault in kernelspace!");
     } else {
         @panic("Double fault in userspace!");
+    }
+}
+
+fn debugHandler(ctx: *cpu.Context) void {
+    interrupts.dumpInterruptFrame(ctx);
+    const cpl: u64 = ctx.cs & 3;
+    if (cpl == 0) {
+        return;
+    } else {
+        @panic("Divide by zero in userspace!");
+    }
+}
+
+fn breakpointHandler(ctx: *cpu.Context) void {
+    interrupts.dumpInterruptFrame(ctx);
+    const cpl: u64 = ctx.cs & 3;
+    if (cpl == 0) {
+        return;
+    } else {
+        @panic("Divide by zero in userspace!");
     }
 }
 

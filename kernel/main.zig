@@ -399,16 +399,10 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         @panic("Failed to find and initialize HPET!");
     }
 
-    const sched_slab_vaddr_space_start = try sched.kproc.vmm.reserve(
-        paging.PAGE1G,
-        paging.PAGE_ALIGN,
-    );
+    const sched_slab_vaddr_space_start = try sched.kproc.vmm.reserve(paging.PAGE1G, paging.PAGE_ALIGN);
     const sched_slab_vaddr_space_end = VAddr.fromInt(sched_slab_vaddr_space_start.addr + paging.PAGE1G);
 
-    var sched_slab_backing_allocator = BumpAllocator.init(
-        sched_slab_vaddr_space_start.addr,
-        sched_slab_vaddr_space_end.addr,
-    );
+    var sched_slab_backing_allocator = BumpAllocator.init(sched_slab_vaddr_space_start.addr, sched_slab_vaddr_space_end.addr);
     const sched_slab_alloc_iface = sched_slab_backing_allocator.allocator();
 
     cpu.enableInterrupts();
@@ -416,17 +410,11 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     if (apic.programLocalApicTimerTscDeadline(@intFromEnum(idt.IntVectors.sched))) |_| {
         var tsc_timer = timers.Tsc.init(&hpet.?);
         const tsc_timer_iface = tsc_timer.timer();
-        try sched.init(
-            tsc_timer_iface,
-            sched_slab_alloc_iface,
-        );
+        try sched.init(tsc_timer_iface, sched_slab_alloc_iface);
     } else |_| {
         var lapic_timer = timers.Lapic.init(&hpet.?, @intFromEnum(idt.IntVectors.sched));
         const lapic_timer_iface = lapic_timer.timer();
-        try sched.init(
-            lapic_timer_iface,
-            sched_slab_alloc_iface,
-        );
+        try sched.init(lapic_timer_iface, sched_slab_alloc_iface);
     }
 
     sched.armSchedTimer(sched.SCHED_TIMESLICE_NS);
