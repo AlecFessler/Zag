@@ -130,8 +130,6 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     idt.init();
     exceptions.init();
     irq.init();
-    cpu.enableX2Apic(@intFromEnum(idt.IntVectors.spurious));
-    apic.disablePic();
 
     var mmap_entries_array: [boot_defs.MAX_MMAP_ENTRIES]boot_defs.MMapEntry = undefined;
     const mmap = boot_defs.collapseMmap(&boot_info.mmap, &mmap_entries_array);
@@ -368,6 +366,8 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
                     },
                 }
             }
+
+            apic.init(VAddr.fromInt(lapic_base));
         }
 
         if (std.mem.eql(u8, @ptrCast(&sdt.signature), "HPET")) {

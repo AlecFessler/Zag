@@ -150,9 +150,7 @@ pub const Thread = struct {
             sp = push(sp, user_rsp);
         }
 
-        const RFLAGS_RESERVED_ONE: u64 = 1 << 1;
-        const RFLAGS_IF: u64 = 1 << 9;
-        const rflags_val: u64 = RFLAGS_RESERVED_ONE | RFLAGS_IF;
+        const rflags_val: u64 = 0x202;
         sp = push(sp, rflags_val);
 
         const cs_val: u64 = blk: {

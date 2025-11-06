@@ -261,12 +261,12 @@ pub fn enableInterrupts() void {
 ///
 /// Panics:
 /// - Panics if LAPIC or x2APIC are not supported per CPUID.
-pub fn enableX2Apic(spurious_vector: u8) void {
+pub fn enableX2Apic(spurious_vector: u8) !void {
     std.debug.assert(spurious_vector >= 0x10);
 
     const feat = cpuid(.basic_features, 0);
-    if (!hasFeatureEdx(feat.edx, .lapic)) @panic("Local APIC not present");
-    if (!hasFeatureEcx(feat.ecx, .x2apic)) @panic("x2APIC not supported");
+    if (!hasFeatureEdx(feat.edx, .lapic)) return error.NoLAPIC;
+    if (!hasFeatureEcx(feat.ecx, .x2apic)) return error.NoX2APIC;
 
     const IA32_APIC_BASE: u32 = 0x1B;
     const APIC_EN: u64 = 1 << 11;

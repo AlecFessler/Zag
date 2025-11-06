@@ -382,10 +382,6 @@ pub const Lapic = struct {
     divider: u32,
     vector: u8,
 
-    const LVT_MASK_BIT: u6 = 16;
-    const LVT_MODE_SHIFT: u6 = 17;
-    const LVT_MODE_ONE_SHOT: u2 = 0;
-
     /// Summary:
     /// Calibrate LAPIC timer frequency using HPET and configure one-shot mode.
     ///
@@ -402,42 +398,65 @@ pub const Lapic = struct {
     /// Panics:
     /// - None.
     pub fn init(hpet: *Hpet, int_vec: u8) Lapic {
-        const DIV_CODE: u64 = 0b011;
+        const DIV_CODE: u32 = 0b011;
         const DIVIDER: u32 = 16;
 
-        cpu.wrmsr(@intFromEnum(apic.X2ApicMsr.timer_divide_configuration_register), DIV_CODE);
-
-        var lvt_spurious: u64 = @intFromEnum(idt.IntVectors.spurious);
-        lvt_spurious |= (@as(u64, LVT_MODE_ONE_SHOT) << LVT_MODE_SHIFT);
-        lvt_spurious |= (@as(u64, 1) << LVT_MASK_BIT);
-        cpu.wrmsr(@intFromEnum(apic.X2ApicMsr.local_vector_table_timer_register), lvt_spurious);
+        apic.initLapicTimer(
+            DIV_CODE,
+            @intFromEnum(idt.IntVectors.spurious),
+            true,
+        );
 
         const hpet_iface = hpet.timer();
         var estimate: u64 = 0;
 
         for (0..3) |i| {
-            cpu.wrmsr(@intFromEnum(apic.X2ApicMsr.timer_initial_count_register), 0xFFFF_FFFF);
+            if (apic.x2Apic) {
+                cpu.wrmsr(
+                    @intFromEnum(apic.X2ApicMsr.timer_initial_count_register),
+                    0xFFFF_FFFF,
+                );
+            } else {
+                apic.init_count.* = .{ .val = 0xFFFF_FFFF };
+            }
 
             const start_ns = hpet_iface.now();
             var now_ns = start_ns;
             const target_ns = TEN_MILLION_NS;
             while ((now_ns - start_ns) < target_ns) now_ns = hpet_iface.now();
 
-            const cur = cpu.rdmsr(@intFromEnum(apic.X2ApicMsr.timer_current_count_register));
+            const cur: u64 = if (apic.x2Apic)
+                cpu.rdmsr(@intFromEnum(apic.X2ApicMsr.timer_current_count_register))
+            else
+                apic.curr_count.val;
+
             const elapsed: u64 = 0xFFFF_FFFF - cur;
 
-            cpu.wrmsr(@intFromEnum(apic.X2ApicMsr.timer_initial_count_register), 0);
+            if (apic.x2Apic) {
+                cpu.wrmsr(
+                    @intFromEnum(apic.X2ApicMsr.timer_initial_count_register),
+                    0,
+                );
+            } else {
+                apic.init_count.* = .{ .val = 0 };
+            }
 
             const delta_ns = now_ns - start_ns;
             const sample = (elapsed * @as(u64, DIVIDER) * ONE_BILLION_NS) / delta_ns;
             estimate = if (i == 0) sample else (estimate + sample) / 2;
         }
 
-        var lvt_final: u64 = int_vec;
-        lvt_final |= (@as(u64, LVT_MODE_ONE_SHOT) << LVT_MODE_SHIFT);
-        cpu.wrmsr(@intFromEnum(apic.X2ApicMsr.local_vector_table_timer_register), lvt_final);
+        apic.initLapicTimer(
+            DIV_CODE,
+            int_vec,
+            false,
+        );
 
-        return .{ .freq_hz = estimate, .divider = DIVIDER, .vector = int_vec };
+        return .{
+            .freq_hz = estimate,
+            .divider = DIVIDER,
+            .vector = int_vec,
+        };
     }
 
     /// Summary:
@@ -455,7 +474,13 @@ pub const Lapic = struct {
     /// Panics:
     /// - None.
     pub fn timer(self: *Lapic) Timer {
-        return .{ .ptr = self, .vtable = &.{ .now = now, .arm_interrupt_timer = arm_interrupt_timer } };
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .now = now,
+                .arm_interrupt_timer = arm_interrupt_timer,
+            },
+        };
     }
 
     /// Summary:
@@ -476,16 +501,12 @@ pub const Lapic = struct {
     fn arm_interrupt_timer(ctx: *anyopaque, timer_val_ns: u64) void {
         const self: *Lapic = @alignCast(@ptrCast(ctx));
 
-        var lvt: u64 = self.vector;
-        lvt |= (@as(u64, LVT_MODE_ONE_SHOT) << LVT_MODE_SHIFT);
-        cpu.wrmsr(@intFromEnum(apic.X2ApicMsr.local_vector_table_timer_register), lvt);
-
         const eff_hz: u64 = self.freq_hz / self.divider;
         var ticks: u64 = ticksFromNanosCeil(eff_hz, timer_val_ns);
         if (ticks == 0) ticks = 1;
         if (ticks > 0xFFFF_FFFF) ticks = 0xFFFF_FFFF;
 
-        cpu.wrmsr(@intFromEnum(apic.X2ApicMsr.timer_initial_count_register), ticks);
+        apic.armLapicOneShot(@intCast(ticks), self.vector);
     }
 
     /// Summary:
