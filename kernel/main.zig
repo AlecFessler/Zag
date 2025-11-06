@@ -367,7 +367,24 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
                 }
             }
 
-            apic.init(VAddr.fromInt(lapic_base));
+            const lapic_phys = PAddr.fromInt(std.mem.alignBackward(u64, lapic_base, paging.PAGE4K));
+            const lapic_virt = VAddr.fromPAddr(lapic_phys, .physmap);
+
+            paging.mapPage(
+                @ptrFromInt(pml4_virt_physmap.addr),
+                lapic_phys,
+                lapic_virt,
+                .rw,
+                .nx,
+                .ncache,
+                .su,
+                .Page4K,
+                .physmap,
+                pmm_iface,
+            );
+            cpu.invlpg(lapic_virt);
+
+            apic.init(lapic_virt);
         }
 
         if (std.mem.eql(u8, @ptrCast(&sdt.signature), "HPET")) {
