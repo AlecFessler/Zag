@@ -142,11 +142,7 @@ pub const Thread = struct {
         const kstack_top: u64 = @intFromPtr(thread.kstack.ptr) + thread.kstack.len;
         const desired_rsp: u64 = std.mem.alignBackward(u64, kstack_top, 16) - 8;
 
-        const kcontext_pop: u64 = @as(u64, @sizeOf(cpu.Context)) - 2 * @as(u64, @sizeOf(u64));
-        const ucontext_pop: u64 = @as(u64, @sizeOf(cpu.Context));
-        const context_pop: u64 = if (proc.cpl == .ring_0) kcontext_pop else ucontext_pop;
-
-        const ctx_start: u64 = desired_rsp - context_pop;
+        const ctx_start: u64 = desired_rsp - @sizeOf(cpu.Context);
         @setRuntimeSafety(false);
         var int_frame_ptr: *cpu.Context = @ptrFromInt(ctx_start);
 
@@ -188,6 +184,9 @@ pub const Thread = struct {
             const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
             int_frame_ptr.ss = gdt.USER_DATA_OFFSET | ring_3;
             int_frame_ptr.rsp = @intFromPtr(thread.ustack.?.ptr) + thread.ustack.?.len;
+        } else {
+            int_frame_ptr.ss = gdt.KERNEL_DATA_OFFSET;
+            int_frame_ptr.rsp = ctx_start;
         }
 
         thread.ctx = int_frame_ptr;
@@ -239,13 +238,8 @@ pub fn init(t: timers.Timer, slab_backing_allocator: std.mem.Allocator) !void {
 }
 
 pub fn schedTimerHandler(ctx: *cpu.Context) void {
-    //armSchedTimer(SCHED_TIMESLICE_NS);
-
-    serial.print("Cold Start Frame:\n", .{});
-    interrupts.dumpInterruptFrame(running_thread.ctx);
-
-    serial.print("Current frame pre swap:\n", .{});
-    interrupts.dumpInterruptFrame(ctx);
+    _ = ctx;
+    armSchedTimer(SCHED_TIMESLICE_NS);
 
     // NOTE: Uncomment once run queue is up
     //running_thread.ctx = ctx;
@@ -262,17 +256,12 @@ pub fn schedTimerHandler(ctx: *cpu.Context) void {
     running_thread.state = .running;
     apic.endOfInterrupt();
 
-    const stack_ptr: u64 = @intFromPtr(running_thread.ctx);
-
-    serial.print("Stack ptr {X}\n", .{stack_ptr});
-
     // NOTE: make this conditional on prev running thread and new running thread being different
     asm volatile (
         \\movq %[new_stack], %%rsp
         \\jmp commonInterruptStubEpilogue
         :
-        : [new_stack] "r" (stack_ptr),
-        : .{ .memory = true, .cc = true }
+        : [new_stack] "r" (@intFromPtr(running_thread.ctx)),
     );
 }
 
