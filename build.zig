@@ -154,7 +154,7 @@ pub fn build(b: *std.Build) void {
         \\ -smp cores="$(
         \\   lscpu -p=Core,Socket | grep -v '^#' | sort -u | wc -l
         \\ )",threads=1,sockets=1 \
-        \\ -s -S
+        \\ -s
     , .{ b.install_path, out_dir_name, qemu_accel_args });
 
     const qemu_cmd = b.addSystemCommand(&[_][]const u8{
