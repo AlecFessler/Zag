@@ -139,53 +139,58 @@ pub const Thread = struct {
         const kstack_ptr: [*]u8 = @ptrFromInt(kstack_virt.addr);
         thread.kstack = kstack_ptr[0..paging.PAGE4K];
 
-        var sp = @intFromPtr(kstack_ptr) + paging.PAGE4K;
+        const kstack_top: u64 = @intFromPtr(thread.kstack.ptr) + thread.kstack.len;
+        const desired_rsp: u64 = std.mem.alignBackward(u64, kstack_top, 16) - 8;
+
+        const kcontext_pop: u64 = @as(u64, @sizeOf(cpu.Context)) - 2 * @as(u64, @sizeOf(u64));
+        const ucontext_pop: u64 = @as(u64, @sizeOf(cpu.Context));
+        const context_pop: u64 = if (proc.cpl == .ring_0) kcontext_pop else ucontext_pop;
+
+        const ctx_start: u64 = desired_rsp - context_pop;
+        @setRuntimeSafety(false);
+        var int_frame_ptr: *cpu.Context = @ptrFromInt(ctx_start);
+
+        int_frame_ptr.* = .{
+            .regs = .{
+                .r15 = 0,
+                .r14 = 0,
+                .r13 = 0,
+                .r12 = 0,
+                .r11 = 0,
+                .r10 = 0,
+                .r9 = 0,
+                .r8 = 0,
+                .rdi = 0,
+                .rsi = 0,
+                .rbp = 0,
+                .rbx = 0,
+                .rdx = 0,
+                .rcx = 0,
+                .rax = 0,
+            },
+            .int_num = 0,
+            .err_code = 0,
+            .rip = @intFromPtr(entry),
+            .cs = blk: {
+                if (proc.cpl == .ring_3) {
+                    const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
+                    break :blk gdt.USER_CODE_OFFSET | ring_3;
+                } else {
+                    break :blk gdt.KERNEL_CODE_OFFSET;
+                }
+            },
+            .rflags = 0x202,
+            .rsp = 0,
+            .ss = 0,
+        };
 
         if (proc.cpl == .ring_3) {
             const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
-            const user_ss = gdt.USER_DATA_OFFSET | ring_3;
-            sp = push(sp, user_ss);
-
-            const user_rsp = @intFromPtr(thread.ustack.?.ptr) + thread.ustack.?.len;
-            sp = push(sp, user_rsp);
+            int_frame_ptr.ss = gdt.USER_DATA_OFFSET | ring_3;
+            int_frame_ptr.rsp = @intFromPtr(thread.ustack.?.ptr) + thread.ustack.?.len;
         }
 
-        const rflags_val: u64 = 0x202;
-        sp = push(sp, rflags_val);
-
-        const cs_val: u64 = blk: {
-            if (proc.cpl == .ring_3) {
-                const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
-                break :blk gdt.USER_CODE_OFFSET | ring_3;
-            } else {
-                break :blk gdt.KERNEL_CODE_OFFSET;
-            }
-        };
-        sp = push(sp, cs_val);
-
-        const rip_val: u64 = @intFromPtr(entry);
-        sp = push(sp, rip_val);
-
-        sp = push(sp, 0); // err_code
-        sp = push(sp, 0); // int_num
-
-        sp = push(sp, 0); // rax
-        sp = push(sp, 0); // rcx
-        sp = push(sp, 0); // rdx
-        sp = push(sp, 0); // rbx
-        sp = push(sp, 0); // rbp
-        sp = push(sp, 0); // rsi
-        sp = push(sp, 0); // rdi
-        sp = push(sp, 0); // r8
-        sp = push(sp, 0); // r9
-        sp = push(sp, 0); // r10
-        sp = push(sp, 0); // r11
-        sp = push(sp, 0); // r12
-        sp = push(sp, 0); // r13
-        sp = push(sp, 0); // r14
-        sp = push(sp, 0); // r15
-
-        thread.ctx = @ptrFromInt(sp);
+        thread.ctx = int_frame_ptr;
 
         thread.state = .waiting;
 
@@ -257,13 +262,17 @@ pub fn schedTimerHandler(ctx: *cpu.Context) void {
     running_thread.state = .running;
     apic.endOfInterrupt();
 
+    const stack_ptr: u64 = @intFromPtr(running_thread.ctx);
+
+    serial.print("Stack ptr {X}\n", .{stack_ptr});
+
     // NOTE: make this conditional on prev running thread and new running thread being different
     asm volatile (
         \\movq %[new_stack], %%rsp
-        \\movq %%rsp, %%rbp
         \\jmp commonInterruptStubEpilogue
         :
-        : [new_stack] "r" (running_thread.ctx),
+        : [new_stack] "r" (stack_ptr),
+        : .{ .memory = true, .cc = true }
     );
 }
 

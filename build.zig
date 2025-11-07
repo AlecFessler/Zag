@@ -130,6 +130,18 @@ pub fn build(b: *std.Build) void {
     kernel.root_module.addImport("zag", zag_mod);
     kernel.root_module.addImport("boot_defs", defs_mod);
 
+    const kvm = b.option(bool, "kvm", "Enable KVM acceleration (default: on)") orelse true;
+
+    const qemu_accel_args: []const u8 = if (kvm)
+        \\-enable-kvm \
+        \\-cpu host,+invtsc
+    else
+        \\-machine accel=tcg \
+        \\-cpu qemu64,+invtsc \
+        \\-d in_asm,int,guest_errors \
+        \\-D qemu.log
+    ;
+
     const qemu_cmdline = b.fmt(
         \\exec qemu-system-x86_64 \
         \\ -m 512M \
@@ -138,13 +150,12 @@ pub fn build(b: *std.Build) void {
         \\ -nographic \
         \\ -serial mon:stdio \
         \\ -no-reboot \
-        \\ -enable-kvm \
-        \\ -cpu host,+invtsc \
+        \\ {s} \
         \\ -smp cores="$(
         \\   lscpu -p=Core,Socket | grep -v '^#' | sort -u | wc -l
         \\ )",threads=1,sockets=1 \
-        \\ -s
-    , .{ b.install_path, out_dir_name });
+        \\ -s -S
+    , .{ b.install_path, out_dir_name, qemu_accel_args });
 
     const qemu_cmd = b.addSystemCommand(&[_][]const u8{
         "sh", "-lc", qemu_cmdline,

@@ -1,28 +1,3 @@
-//! x2APIC MSR helpers and LAPIC timer control.
-//!
-//! Provides symbolic MSR indices for x2APIC registers and a small set of
-//! utilities to arm/cancel the IA32_TSC_DEADLINE timer, send end-of-interrupt
-//! (EOI), mask the legacy 8259 PIC, and program the LAPIC timer in TSC-deadline
-//! mode. Designed to be freestanding and safe to invoke during early bring-up.
-//!
-//! # Directory
-//!
-//! ## Type Definitions
-//! - `X2ApicMsr` – symbolic MSR indices for x2APIC registers.
-//!
-//! ## Constants
-//! - `tsc_deadline_msr` – MSR number for `IA32_TSC_DEADLINE`.
-//!
-//! ## Variables
-//! - None.
-//!
-//! ## Functions
-//! - `armTscDeadline` – write a TSC deadline to IA32_TSC_DEADLINE.
-//! - `cancelTscDeadline` – cancel any pending TSC deadline (write zero).
-//! - `disablePic` – mask both 8259 PICs to avoid spurious IRQs.
-//! - `endOfInterrupt` – write EOI to x2APIC EOI MSR.
-//! - `programLocalApicTimerTscDeadline` – enable LAPIC timer in TSC-deadline mode with a vector.
-
 const cpu = @import("cpu.zig");
 const idt = @import("idt.zig");
 const paging = @import("paging.zig");
@@ -85,7 +60,7 @@ pub const X2ApicMsr = enum(u32) {
     self_interrupt_register = 0x83f,
 };
 
-pub const Register = enum(u64) {
+pub const Register = enum(u32) {
     lapic_id_reg = 0x20,
     lapic_version_reg = 0x30,
     task_prio_reg = 0x80,
@@ -96,6 +71,7 @@ pub const Register = enum(u64) {
     logical_dest_reg = 0xD0,
     dest_fmt_reg = 0xE0,
     spurious_int_vec_reg = 0xF0,
+
     in_service_0_reg = 0x100,
     in_service_1_reg = 0x110,
     in_service_2_reg = 0x120,
@@ -104,6 +80,7 @@ pub const Register = enum(u64) {
     in_service_5_reg = 0x150,
     in_service_6_reg = 0x160,
     in_service_7_reg = 0x170,
+
     trigger_mode_0_reg = 0x180,
     trigger_mode_1_reg = 0x190,
     trigger_mode_2_reg = 0x1A0,
@@ -112,6 +89,7 @@ pub const Register = enum(u64) {
     trigger_mode_5_reg = 0x1D0,
     trigger_mode_6_reg = 0x1E0,
     trigger_mode_7_reg = 0x1F0,
+
     int_request_0_reg = 0x200,
     int_request_1_reg = 0x210,
     int_request_2_reg = 0x220,
@@ -120,7 +98,9 @@ pub const Register = enum(u64) {
     int_request_5_reg = 0x250,
     int_request_6_reg = 0x260,
     int_request_7_reg = 0x270,
+
     err_status_reg = 0x280,
+
     lvt_corrected_machine_check_int_reg = 0x2F0,
     int_cmd_low_reg = 0x300,
     int_cmd_high_reg = 0x310,
@@ -130,6 +110,7 @@ pub const Register = enum(u64) {
     lvt_lint0_reg = 0x350,
     lvt_lint1_reg = 0x360,
     lvt_err_reg = 0x370,
+
     init_count_reg = 0x380,
     curr_count_reg = 0x390,
     div_config_reg = 0x3E0,
@@ -184,9 +165,9 @@ pub const SpuriousIntVec = packed struct(u32) {
     spurious_vector: u8,
     apic_enable: bool,
     focus_check_disable: bool,
-    _res0: u2,
+    _res0: u2 = 0,
     eoi_bcast_supp: bool,
-    _res1: u19,
+    _res1: u19 = 0,
 };
 
 pub const InService0 = packed struct(u32) { bits: u32 };
@@ -221,11 +202,11 @@ pub const ErrStatus = packed struct(u32) { err: u32 };
 pub const LvtCorrectedMachineCheckInt = packed struct(u32) {
     vector: u8,
     delivery_mode: u3,
-    _res0: u1,
+    _res0: u1 = 0,
     delivery_status: bool,
-    _res1: u3,
+    _res1: u3 = 0,
     mask: bool,
-    _res2: u15,
+    _res2: u15 = 0,
 };
 
 pub const IntCmdLow = packed struct(u32) {
@@ -233,98 +214,93 @@ pub const IntCmdLow = packed struct(u32) {
     deliv_mode: u3,
     dest_mode_logical: bool,
     deliv_status: bool,
-    _res0: u1,
+    _res0: u1 = 0,
     level_assert: bool,
     trigger_mode_level: bool,
-    _res1: u1,
+    _res1: u1 = 0,
     dest_shorthand: u2,
-    _res2: u1,
-    _res3: u12,
+    _res2: u1 = 0,
+    _res3: u12 = 0,
 };
 
 pub const IntCmdHigh = packed struct(u32) {
-    _res0: u24,
+    _res0: u24 = 0,
     destination: u8,
 };
 
 pub const LvtTimer = packed struct(u32) {
     vector: u8,
-    _res0: u4,
+    _res0: u4 = 0,
     delivery_status: bool,
-    _res1: u3,
+    _res1: u3 = 0,
     mask: bool,
     timer_mode: u2,
-    _res2: u13,
+    _res2: u13 = 0,
 };
 
 pub const LvtThermalSensor = packed struct(u32) {
     vector: u8,
     delivery_mode: u3,
-    _res0: u1,
+    _res0: u1 = 0,
     delivery_status: bool,
-    _res1: u3,
+    _res1: u3 = 0,
     mask: bool,
-    _res2: u15,
+    _res2: u15 = 0,
 };
 
 pub const LvtPerfMonitoringCounters = packed struct(u32) {
     vector: u8,
     delivery_mode: u3,
-    _res0: u1,
+    _res0: u1 = 0,
     delivery_status: bool,
-    _res1: u3,
+    _res1: u3 = 0,
     mask: bool,
-    _res2: u15,
+    _res2: u15 = 0,
 };
 
 pub const LvtLint0 = packed struct(u32) {
     vector: u8,
     delivery_mode: u3,
-    _res0: u1,
+    _res0: u1 = 0,
     delivery_status: bool,
     polarity_low: bool,
     remote_irr: bool,
     trigger_mode_level: bool,
     mask: bool,
-    _res1: u15,
+    _res1: u15 = 0,
 };
 
 pub const LvtLint1 = packed struct(u32) {
     vector: u8,
     delivery_mode: u3,
-    _res0: u1,
+    _res0: u1 = 0,
     delivery_status: bool,
     polarity_low: bool,
     remote_irr: bool,
     trigger_mode_level: bool,
     mask: bool,
-    _res1: u15,
+    _res1: u15 = 0,
 };
 
 pub const LvtErr = packed struct(u32) {
     vector: u8,
-    _res0: u3,
-    _res1: u1,
+    _res0: u3 = 0,
+    _res1: u1 = 0,
     delivery_status: bool,
-    _res2: u3,
+    _res2: u3 = 0,
     mask: bool,
-    _res3: u15,
+    _res3: u15 = 0,
 };
 
-pub const InitCount = packed struct(u32) {
-    val: u32,
-};
-
-pub const CurrCount = packed struct(u32) {
-    val: u32,
-};
+pub const InitCount = packed struct(u32) { val: u32 };
+pub const CurrCount = packed struct(u32) { val: u32 };
 
 pub const DivConfig = packed struct(u32) {
     div0: u1,
     div1: u1,
-    _res0: u1,
+    _res0: u1 = 0,
     div3: u1,
-    _res1: u28,
+    _res1: u28 = 0,
 };
 
 pub const tsc_deadline_msr: u32 = 0x6e0;
@@ -389,57 +365,36 @@ pub const LVT_MASK_BIT: u6 = 16;
 pub const LVT_MODE_SHIFT: u6 = 17;
 pub const LVT_MODE_ONE_SHOT: u2 = 0;
 
-/// Arms the LAPIC TSC-deadline timer by writing `deadline_tsc` to `IA32_TSC_DEADLINE`.
-///
-/// Arguments:
-/// - `deadline_tsc`: absolute TSC value at which the timer interrupt should fire.
 pub fn armTscDeadline(deadline_tsc: u64) void {
     cpu.wrmsr(tsc_deadline_msr, deadline_tsc);
 }
 
-/// Cancels any pending TSC-deadline interrupt by writing zero to `IA32_TSC_DEADLINE`.
 pub fn cancelTscDeadline() void {
     cpu.wrmsr(tsc_deadline_msr, 0);
 }
 
-/// Disables the legacy 8259 PICs by masking all interrupts on both controllers.
 pub fn disablePic() void {
     cpu.outb(0xFF, 0x21);
     cpu.outb(0xFF, 0xA1);
 }
 
-/// Signals End-Of-Interrupt (EOI) to the local APIC.
 pub fn endOfInterrupt() void {
     if (x2Apic) {
-        eoi.eoi = 0;
-    } else {
         cpu.wrmsr(@intFromEnum(X2ApicMsr.end_of_interrupt_register), 0);
+    } else {
+        eoi.eoi = 0;
     }
 }
 
-/// Programs the LAPIC timer into TSC-deadline mode and sets the interrupt vector.
-///
-/// Arguments:
-/// - `vector`: interrupt vector (0–255) to be delivered when the deadline expires.
-///
-/// Errors:
-/// - `TscDeadlineNotSupported`: CPU lacks x2APIC TSC-deadline capability.
-/// - `InvariantTscNotSupported`: CPU lacks invariant/constant TSC guarantees.
-pub fn programLocalApicTimerTscDeadline(vector: u8) !void {
+pub fn programLocalApicTimerTscDeadline(vector: u8) bool {
     const feat = cpu.cpuid(.basic_features, 0);
-    if (!cpu.hasFeatureEcx(feat.ecx, .tsc_deadline)) {
-        return error.TscDeadlineNotSupported;
-    }
+    if (!cpu.hasFeatureEcx(feat.ecx, .tsc_deadline)) return false;
 
     const max_ext = cpu.cpuid(.ext_max, 0).eax;
-    if (max_ext < @intFromEnum(cpu.CpuidLeaf.ext_max)) {
-        return error.InvariantTscNotSupported;
-    }
+    if (max_ext < @intFromEnum(cpu.CpuidLeaf.ext_max)) return false;
 
     const pwr = cpu.cpuid(.ext_power, 0);
-    if (!cpu.hasPowerFeatureEdx(pwr.edx, .constant_tsc)) {
-        return error.InvariantTscNotSupported;
-    }
+    if (!cpu.hasPowerFeatureEdx(pwr.edx, .constant_tsc)) return false;
 
     const TIMER_MODE_LSB: u6 = 17;
     const TSC_DEADLINE: u2 = 0b10;
@@ -447,17 +402,15 @@ pub fn programLocalApicTimerTscDeadline(vector: u8) !void {
     var lvt: u64 = vector;
     lvt |= (@as(u64, TSC_DEADLINE) << TIMER_MODE_LSB);
     cpu.wrmsr(@intFromEnum(X2ApicMsr.local_vector_table_timer_register), lvt);
+
+    return true;
 }
 
 pub fn init(lapic_base_virt: VAddr) void {
     disablePic();
 
-    if (cpu.enableX2Apic(@intFromEnum(idt.IntVectors.spurious))) |_| {
-        x2Apic = false;
-        return;
-    } else |_| {
-        x2Apic = true;
-    }
+    x2Apic = cpu.enableX2Apic(@intFromEnum(idt.IntVectors.spurious));
+    if (x2Apic) return;
 
     const base_addr = lapic_base_virt.addr;
 
@@ -518,48 +471,41 @@ pub fn init(lapic_base_virt: VAddr) void {
 
 pub fn initLapicTimer(div_code: u32, vector: u8, masked: bool) void {
     if (x2Apic) {
+        const m: u64 =
+            vector | (@as(u64, LVT_MODE_ONE_SHOT) << LVT_MODE_SHIFT) | (@as(u64, @intFromBool(masked)) << LVT_MASK_BIT);
+        cpu.wrmsr(@intFromEnum(X2ApicMsr.timer_divide_configuration_register), div_code);
+        cpu.wrmsr(@intFromEnum(X2ApicMsr.local_vector_table_timer_register), m);
+    } else {
         const d: DivConfig = .{
             .div0 = @intCast(div_code & 0b001),
             .div1 = @intCast((div_code >> 1) & 0b001),
-            ._res0 = 0,
             .div3 = @intCast((div_code >> 3) & 0b001),
-            ._res1 = 0,
         };
         div_config.* = d;
 
         const l: LvtTimer = .{
             .vector = vector,
-            ._res0 = 0,
             .delivery_status = false,
-            ._res1 = 0,
             .mask = masked,
             .timer_mode = LVT_MODE_ONE_SHOT,
-            ._res2 = 0,
         };
         lvt_timer.* = l;
-    } else {
-        const m: u64 = vector | (@as(u64, LVT_MODE_ONE_SHOT) << LVT_MODE_SHIFT) | (@as(u64, @intFromBool(masked)) << LVT_MASK_BIT);
-        cpu.wrmsr(@intFromEnum(X2ApicMsr.timer_divide_configuration_register), div_code);
-        cpu.wrmsr(@intFromEnum(X2ApicMsr.local_vector_table_timer_register), m);
     }
 }
 
 pub fn armLapicOneShot(ticks: u32, vector: u8) void {
     if (x2Apic) {
-        const l: LvtTimer = .{
-            .vector = vector,
-            ._res0 = 0,
-            .delivery_status = false,
-            ._res1 = 0,
-            .mask = false,
-            .timer_mode = LVT_MODE_ONE_SHOT,
-            ._res2 = 0,
-        };
-        lvt_timer.* = l;
-        init_count.* = .{ .val = ticks };
-    } else {
         const m: u64 = vector | (@as(u64, LVT_MODE_ONE_SHOT) << LVT_MODE_SHIFT);
         cpu.wrmsr(@intFromEnum(X2ApicMsr.local_vector_table_timer_register), m);
         cpu.wrmsr(@intFromEnum(X2ApicMsr.timer_initial_count_register), ticks);
+    } else {
+        const l: LvtTimer = .{
+            .vector = vector,
+            .delivery_status = false,
+            .mask = false,
+            .timer_mode = LVT_MODE_ONE_SHOT,
+        };
+        lvt_timer.* = l;
+        init_count.* = .{ .val = ticks };
     }
 }

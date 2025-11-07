@@ -424,11 +424,11 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
 
     cpu.enableInterrupts();
 
-    if (apic.programLocalApicTimerTscDeadline(@intFromEnum(idt.IntVectors.sched))) |_| {
+    if (apic.programLocalApicTimerTscDeadline(@intFromEnum(idt.IntVectors.sched))) {
         var tsc_timer = timers.Tsc.init(&hpet.?);
         const tsc_timer_iface = tsc_timer.timer();
         try sched.init(tsc_timer_iface, sched_slab_alloc_iface);
-    } else |_| {
+    } else {
         var lapic_timer = timers.Lapic.init(&hpet.?, @intFromEnum(idt.IntVectors.sched));
         const lapic_timer_iface = lapic_timer.timer();
         try sched.init(lapic_timer_iface, sched_slab_alloc_iface);
