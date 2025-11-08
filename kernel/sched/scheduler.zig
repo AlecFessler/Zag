@@ -175,7 +175,6 @@ pub const Thread = struct {
     }
 };
 
-// This should never be empty by scheduler usage invariants
 pub const RunQueue = struct {
     sentinel: Thread,
     head: *Thread,
@@ -196,12 +195,19 @@ pub const RunQueue = struct {
     pub fn enqueueToFront(self: *RunQueue, thread: *Thread) void {
         thread.next = self.head.next;
         self.head.next = thread;
-        std.debug.assert(self.tail != self.head);
+
+        if (self.tail == self.head) {
+            self.tail = thread;
+        }
     }
 
-    pub fn dequeue(self: *RunQueue) *Thread {
-        const first = self.head.next.?;
-        std.debug.assert(self.tail != first);
+    pub fn dequeue(self: *RunQueue) ?*Thread {
+        const first = self.head.next orelse return null;
+
+        if (self.tail == first) {
+            self.tail = self.head;
+        }
+
         self.head.next = first.next;
         first.next = null;
         return first;
@@ -257,7 +263,7 @@ pub fn schedTimerHandler(ctx: *cpu.Context) void {
         preempted.ctx = ctx;
         rq.enqueue(preempted);
     }
-    running_thread = rq.dequeue();
+    running_thread = rq.dequeue() orelse &rq.sentinel;
 
     const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
     const cpl = running_thread.ctx.cs & ring_3;
