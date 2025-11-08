@@ -287,8 +287,8 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         }
 
         const pmm_iface = pmm_mod.global_pmm.?.allocator();
-        const page = pmm_iface.alloc(paging.PageMem(.Page4K), 1) catch @panic("PMM OOM!");
-        const phys_page_virt = VAddr.fromInt(@intFromPtr(page.ptr));
+        const page = pmm_iface.create(paging.PageMem(.Page4K)) catch @panic("PMM OOM!");
+        const phys_page_virt = VAddr.fromInt(@intFromPtr(page));
         const phys_page_phys = PAddr.fromVAddr(phys_page_virt, .physmap);
 
         const pml4_virt = paging.currentPml4VAddr();

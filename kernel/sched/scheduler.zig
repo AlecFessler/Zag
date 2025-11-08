@@ -47,8 +47,8 @@ pub const Process = struct {
     pub fn createUserProcess(
         entry: *const fn () void,
     ) !*Process {
-        const proc = try process_allocator.?.create(Process);
-        errdefer process_allocator.?.destroy(proc);
+        const proc = try process_allocator.create(Process);
+        errdefer process_allocator.destroy(proc);
 
         proc.pid = pid_counter;
         pid_counter += 1;
@@ -56,14 +56,10 @@ pub const Process = struct {
         proc.cpl = .ring_3;
 
         const pmm_iface = pmm_mod.global_pmm.?.allocator();
-        const pml4_page = try pmm_iface.alignedAlloc(
-            u8,
-            paging.PAGE_ALIGN,
-            paging.PAGE4K,
-        );
-        errdefer pmm_iface.free(pml4_page);
+        const pml4_page = try pmm_iface.create(paging.PageMem(.Page4K));
+        errdefer pmm_iface.destroy(pml4_page);
         @memset(pml4_page, 0);
-        proc.pml4_virt = VAddr.fromInt(@intFromPtr(pml4_page.ptr));
+        proc.pml4_virt = VAddr.fromInt(@intFromPtr(pml4_page));
         paging.copyKernelPml4Mappings(@ptrFromInt(proc.pml4_virt.addr));
 
         const vmm_start = VAddr.fromInt(paging.PAGE4K);
@@ -86,8 +82,8 @@ pub const Process = struct {
 pub const Thread = struct {
     tid: u64,
     ctx: *cpu.Context,
-    ustack: ?[]u8,
-    kstack: []u8,
+    ustack_base: ?VAddr,
+    kstack_base: VAddr,
     proc: *Process,
     next: ?*Thread = null,
 
@@ -99,35 +95,29 @@ pub const Thread = struct {
             return error.MaxThreads;
         }
 
-        const thread: *Thread = try thread_allocator.?.create(Thread);
-        errdefer thread_allocator.?.destroy(thread);
+        const thread: *Thread = try thread_allocator.create(Thread);
+        errdefer thread_allocator.destroy(thread);
 
         thread.tid = tid_counter;
         tid_counter += 1;
 
         if (proc.cpl == .ring_3) {
             const ustack_virt = try proc.vmm.reserve(paging.PAGE4K, paging.PAGE_ALIGN);
-            const ustack_ptr: [*]u8 = @ptrFromInt(ustack_virt.addr);
-            thread.ustack = ustack_ptr[0..paging.PAGE4K];
+            const ustack_base = ustack_virt.addr + paging.PAGE4K;
+            thread.ustack_base = VAddr.fromInt(std.mem.alignBackward(u64, ustack_base, 16) - 8);
         } else {
-            thread.ustack = null;
+            thread.ustack_base = null;
         }
 
         const pmm_iface = pmm_mod.global_pmm.?.allocator();
-        const kstack_page = try pmm_iface.alignedAlloc(
-            u8,
-            paging.PAGE_ALIGN,
-            paging.PAGE4K,
-        );
-        errdefer pmm_iface.free(kstack_page);
-        const kstack_virt = VAddr.fromInt(@intFromPtr(kstack_page.ptr));
-        const kstack_ptr: [*]u8 = @ptrFromInt(kstack_virt.addr);
-        thread.kstack = kstack_ptr[0..paging.PAGE4K];
+        const kstack_page = try pmm_iface.create(paging.PageMem(.Page4K));
+        errdefer pmm_iface.destroy(kstack_page);
 
-        const kstack_top: u64 = @intFromPtr(thread.kstack.ptr) + thread.kstack.len;
-        const desired_rsp: u64 = std.mem.alignBackward(u64, kstack_top, 16) - 8;
+        const kstack_virt = VAddr.fromInt(@intFromPtr(kstack_page));
+        const kstack_base = kstack_virt.addr + paging.PAGE4K;
+        thread.kstack_base = VAddr.fromInt(std.mem.alignBackward(u64, kstack_base, 16) - 8);
 
-        const ctx_start: u64 = desired_rsp - @sizeOf(cpu.Context);
+        const ctx_start: u64 = thread.kstack_base.addr - @sizeOf(cpu.Context);
         @setRuntimeSafety(false);
         var int_frame_ptr: *cpu.Context = @ptrFromInt(ctx_start);
 
@@ -167,9 +157,8 @@ pub const Thread = struct {
 
         if (proc.cpl == .ring_3) {
             const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
-            const ustack_top = @intFromPtr(thread.ustack.?.ptr) + thread.ustack.?.len;
             int_frame_ptr.ss = gdt.USER_DATA_OFFSET | ring_3;
-            int_frame_ptr.rsp = std.mem.alignBackward(u64, ustack_top, 16) - 8;
+            int_frame_ptr.rsp = thread.ustack_base.?.addr;
         } else {
             int_frame_ptr.ss = gdt.KERNEL_DATA_OFFSET;
             int_frame_ptr.rsp = ctx_start;
@@ -225,23 +214,22 @@ var pid_counter: u64 = 1;
 var tid_counter: u64 = 0;
 
 var rq: RunQueue = undefined;
-var timer: ?timers.Timer = null;
-var process_allocator: ?std.mem.Allocator = null;
-var thread_allocator: ?std.mem.Allocator = null;
+var timer: timers.Timer = undefined;
+var process_allocator: std.mem.Allocator = undefined;
+var thread_allocator: std.mem.Allocator = undefined;
 
 pub var running_thread: *Thread = undefined;
 pub var kproc: Process = .{
     .pid = 0,
     .cpl = .ring_0,
-    // kMain will initialize pml4_virt and vmm
-    .pml4_virt = undefined,
-    .vmm = undefined,
+    .pml4_virt = undefined, // initialized by kMain
+    .vmm = undefined, // initialized by kMain
     .threads = undefined,
     .num_threads = 0,
 };
 
 pub fn armSchedTimer(delta_ns: u64) void {
-    timer.?.arm_interrupt_timer(delta_ns);
+    timer.arm_interrupt_timer(delta_ns);
 }
 
 pub fn init(t: timers.Timer, slab_backing_allocator: std.mem.Allocator) !void {
@@ -274,7 +262,7 @@ pub fn schedTimerHandler(ctx: *cpu.Context) void {
     const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
     const cpl = running_thread.ctx.cs & ring_3;
     if (cpl == 3) {
-        gdt.main_tss_entry.rsp0 = @intFromPtr(running_thread.kstack.ptr) + running_thread.kstack.len;
+        gdt.main_tss_entry.rsp0 = @intFromPtr(running_thread.ctx);
         // NOTE: swap pml4
     }
 
