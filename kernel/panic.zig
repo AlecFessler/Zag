@@ -288,7 +288,7 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?usize)
     const first = @returnAddress();
     var it = std.debug.StackIterator.init(first, null);
     var last_pc: u64 = 0;
-    var frames: usize = 0;
+    var frames: u64 = 0;
 
     while (frames < 64) : (frames += 1) {
         const pc = it.next() orelse break;

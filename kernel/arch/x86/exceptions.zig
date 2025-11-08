@@ -342,6 +342,7 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         } else if (in_uspace) {
             break :blk .u;
         } else {
+            interrupts.dumpInterruptFrame(ctx);
             @panic("Non-present page in neither kernel or user address space!");
         }
     };

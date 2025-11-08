@@ -39,6 +39,7 @@ const zag = @import("zag");
 
 const apic = zag.x86.Apic;
 const cpu = zag.x86.Cpu;
+const debugger = zag.debugger;
 const gdt = zag.x86.Gdt;
 const idt = zag.x86.Idt;
 const interrupts = zag.x86.Interrupts;
@@ -84,8 +85,9 @@ pub const Process = struct {
     pub fn createUserProcess(
         entry: *const fn () void,
     ) !*Process {
-        const proc = try process_allocator.create(Process);
-        errdefer process_allocator.destroy(proc);
+        const proc_alloc_iface = process_allocator.allocator();
+        const proc = try proc_alloc_iface.create(Process);
+        errdefer proc_alloc_iface.destroy(proc);
 
         proc.pid = pid_counter;
         pid_counter += 1;
@@ -250,18 +252,19 @@ pub const Thread = struct {
             return error.MaxThreads;
         }
 
-        const thread: *Thread = try thread_allocator.create(Thread);
-        errdefer thread_allocator.destroy(thread);
+        const thread_alloc_iface = thread_allocator.allocator();
+        const thread: *Thread = try thread_alloc_iface.create(Thread);
+        errdefer thread_alloc_iface.destroy(thread);
 
         thread.tid = tid_counter;
         tid_counter += 1;
 
         const pmm_iface = pmm_mod.global_pmm.?.allocator();
-        const kstack_page = try pmm_iface.create(paging.PageMem(.Page4K));
-        errdefer pmm_iface.destroy(kstack_page);
+        const kstack_pages = try pmm_iface.alloc(paging.PageMem(.Page4K), 4);
+        errdefer pmm_iface.free(kstack_pages);
 
-        const kstack_virt = VAddr.fromInt(@intFromPtr(kstack_page));
-        const kstack_base = kstack_virt.addr + paging.PAGE4K;
+        const kstack_virt = VAddr.fromInt(@intFromPtr(kstack_pages.ptr));
+        const kstack_base = kstack_virt.addr + paging.PAGE4K * 4;
         thread.kstack_base = VAddr.fromInt(std.mem.alignBackward(u64, kstack_base, 16) - 8);
 
         const ctx_addr: u64 = thread.kstack_base.addr - @sizeOf(cpu.Context);
@@ -345,19 +348,19 @@ pub var kproc: Process = .{
 pub var running_thread: ?*Thread = null;
 
 /// Monotonic PID source.
-var pid_counter: u64 = 1;
+pub var pid_counter: u64 = 1;
 
 /// Backing allocator for `Process` slabs.
-var process_allocator: std.mem.Allocator = undefined;
+var process_allocator: ProcessAllocator = undefined;
 
 /// Global run queue.
-var rq: RunQueue = undefined;
+pub var rq: RunQueue = undefined;
 
 /// Backing allocator for `Thread` slabs.
-var thread_allocator: std.mem.Allocator = undefined;
+var thread_allocator: ThreadAllocator = undefined;
 
 /// Monotonic TID source.
-var tid_counter: u64 = 0;
+var tid_counter: u64 = 1;
 
 /// Active scheduler timer driver.
 var timer: timers.Timer = undefined;
@@ -446,13 +449,30 @@ pub fn schedTimerHandler(ctx: *cpu.Context) void {
 /// Leaves `running_thread` pointing at the sentinel until the first enqueue.
 pub fn init(t: timers.Timer, slab_backing_allocator: std.mem.Allocator) !void {
     timer = t;
-
-    var proc_alloc = try ProcessAllocator.init(slab_backing_allocator);
-    process_allocator = proc_alloc.allocator();
-
-    var thread_alloc = try ThreadAllocator.init(slab_backing_allocator);
-    thread_allocator = thread_alloc.allocator();
+    process_allocator = try ProcessAllocator.init(slab_backing_allocator);
+    thread_allocator = try ThreadAllocator.init(slab_backing_allocator);
 
     rq.init();
+
+    rq.sentinel.proc = &kproc;
+    rq.sentinel.tid = 0;
+    rq.sentinel.kstack_base = VAddr.fromInt(gdt.main_tss_entry.rsp0);
+    rq.sentinel.ustack_base = null;
+
+    kproc.threads[kproc.num_threads] = &rq.sentinel;
+    kproc.num_threads += 1;
+
+    // NOTE: temporary to give the debugger more interesting stuff to dump in development
+    const dbg_thread = try Thread.createThread(&kproc, debugger.init);
+    rq.enqueue(dbg_thread);
+
+    const uproc = try Process.createUserProcess(helloWorldUser);
+    rq.enqueue(uproc.threads[0]);
+
     running_thread = &rq.sentinel;
+}
+
+fn helloWorldUser() void {
+    serial.print("hello world!\n", .{});
+    cpu.halt();
 }

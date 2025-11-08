@@ -8,6 +8,7 @@
 //! # Included Subsystems
 //!
 //! - `containers` – Balanced trees, free lists, and other kernel data structures
+//! - `debugger`   – Kernel debugger with utilities for dumping kernel state
 //! - `math`       – Range logic and low-level numeric utilities
 //! - `memory`     – Physical/virtual memory managers and allocator implementations
 //! - `panic`      – Kernel panic handler and symbol resolution for stack traces
@@ -15,6 +16,7 @@
 //! - `x86`        – Architecture-specific initialization and CPU/hardware control
 
 pub const containers = @import("containers/containers.zig");
+pub const debugger = @import("debugger.zig");
 pub const math = @import("math/math.zig");
 pub const memory = @import("memory/memory.zig");
 pub const panic = @import("panic.zig");

@@ -340,25 +340,13 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
                 const entry = acpi.decodeMadt(e);
                 switch (entry) {
                     .local_apic => |x| {
-                        serial.print("cpu {d} apic_id {d} flags {x}\n", .{
-                            x.processor_uid,
-                            x.apic_id,
-                            x.flags,
-                        });
+                        _ = x;
                     },
                     .ioapic => |x| {
-                        serial.print("ioapic id {d} addr {x} gsi_base {d}\n", .{
-                            x.ioapic_id,
-                            x.ioapic_addr,
-                            x.gsi_base,
-                        });
+                        _ = x;
                     },
                     .int_src_override => |x| {
-                        serial.print("interrupt source override bus {d} src {d} -> gsi {d}\n", .{
-                            x.bus,
-                            x.src,
-                            x.gsi,
-                        });
+                        _ = x;
                     },
                     .lapic_nmi => |_| {},
                     .lapic_addr_override => |x| {
