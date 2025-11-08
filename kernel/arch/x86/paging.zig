@@ -43,6 +43,7 @@
 //! - `pd_index` / `pdpt_index` / `pt_index` – lower-level index helpers.
 
 const std = @import("std");
+const serial = @import("serial.zig");
 
 /// Top-level virtual address slots (PML4 indices) we reserve.
 pub const Pml4SlotIndices = enum(u9) {
@@ -81,10 +82,10 @@ pub const RW = enum(u1) {
 
 /// User/supervisor bit for entries.
 pub const User = enum(u1) {
-    /// User-accessible.
-    u,
     /// Supervisor-only.
     su,
+    /// User-accessible.
+    u,
 };
 
 /// Execute-disable (NX) flag for entries.
@@ -110,9 +111,9 @@ const PageLevelShift = enum(u6) {
     /// PDPT shift (bits 38:30).
     PDPT = 30,
     /// PD shift (bits 29:21).
-    PD   = 21,
+    PD = 21,
     /// PT shift (bits 20:12).
-    PT   = 12,
+    PT = 12,
 };
 
 /// Physical address wrapper (bytes).
@@ -434,6 +435,57 @@ pub fn dropIdentityMap() void {
     write_cr3(pml4_paddr);
 }
 
+pub fn dumpPageWalk(va: VAddr) void {
+    const l4 = pml4_index(va);
+    const l3 = pdpt_index(va);
+    const l2 = pd_index(va);
+    const l1 = pt_index(va);
+
+    std.debug.assert(l4 < 512);
+    std.debug.assert(l3 < 512);
+    std.debug.assert(l2 < 512);
+    std.debug.assert(l1 < 512);
+
+    const pml4_virt = currentPml4VAddr();
+    const pml4: [*]PML4Entry = @ptrFromInt(pml4_virt.addr);
+
+    const e4 = &pml4[l4];
+    serial.print("PML4E[{d}]: P={} RW={s} US={s} WT={} CD={s} A={} D={} PS={} G={} NX={s} PA={X}\n", .{
+        l4, e4.present, @tagName(e4.rw), @tagName(e4.user), e4.write_through, @tagName(e4.cache_disable),
+        e4.accessed, e4.dirty, e4.huge_page, e4.global, @tagName(e4.nx), e4.getPAddr().addr,
+    });
+    if (!e4.present) return;
+
+    const pdpt_v = VAddr.fromPAddr(e4.getPAddr(), .physmap);
+    const pdpt = pdpt_v.getPtr([*]PDPTEntry);
+
+    const e3 = &pdpt[l3];
+    serial.print("PDPTE[{d}]: P={} RW={s} US={s} WT={} CD={s} A={} D={} PS={} G={} NX={s} PA={X}\n", .{
+        l3, e3.present, @tagName(e3.rw), @tagName(e3.user), e3.write_through, @tagName(e3.cache_disable),
+        e3.accessed, e3.dirty, e3.huge_page, e3.global, @tagName(e3.nx), e3.getPAddr().addr,
+    });
+    if (!e3.present or e3.huge_page) return;
+
+    const pd_v = VAddr.fromPAddr(e3.getPAddr(), .physmap);
+    const pd = pd_v.getPtr([*]PDEntry);
+
+    const e2 = &pd[l2];
+    serial.print("PDE  [{d}]: P={} RW={s} US={s} WT={} CD={s} A={} D={} PS={} G={} NX={s} PA={X}\n", .{
+        l2, e2.present, @tagName(e2.rw), @tagName(e2.user), e2.write_through, @tagName(e2.cache_disable),
+        e2.accessed, e2.dirty, e2.huge_page, e2.global, @tagName(e2.nx), e2.getPAddr().addr,
+    });
+    if (!e2.present or e2.huge_page) return;
+
+    const pt_v = VAddr.fromPAddr(e2.getPAddr(), .physmap);
+    const pt = pt_v.getPtr([*]PTEntry);
+
+    const e1 = &pt[l1];
+    serial.print("PTE  [{d}]: P={} RW={s} US={s} WT={} CD={s} A={} D={} PS={} G={} NX={s} PA={X}\n", .{
+        l1, e1.present, @tagName(e1.rw), @tagName(e1.user), e1.write_through, @tagName(e1.cache_disable),
+        e1.accessed, e1.dirty, e1.huge_page, e1.global, @tagName(e1.nx), e1.getPAddr().addr,
+    });
+}
+
 /// Summary:
 /// Maps a single page (4 KiB / 2 MiB / 1 GiB) at `vaddr → paddr`, allocating
 /// intermediate tables as needed, and honoring flags (rw/nx/user/cacheable).
@@ -519,7 +571,9 @@ pub fn mapPage(
     var pdpt_entry = &pml4[pml4_idx];
     if (!pdpt_entry.present) {
         const new_pdpt: []align(PAGE_ALIGN.toByteUnits()) PDPTEntry = allocator.alignedAlloc(
-            PDPTEntry, PAGE_ALIGN, PAGE_TABLE_SIZE,
+            PDPTEntry,
+            PAGE_ALIGN,
+            PAGE_TABLE_SIZE,
         ) catch @panic("Went OOM mapping pages!");
         @memset(new_pdpt, default_flags);
         pdpt_entry.* = parent_flags;
@@ -541,7 +595,9 @@ pub fn mapPage(
     var pd_entry = &pdpt[pdpt_idx];
     if (!pd_entry.present) {
         const new_pd: []align(PAGE_ALIGN.toByteUnits()) PDEntry = allocator.alignedAlloc(
-            PDEntry, PAGE_ALIGN, PAGE_TABLE_SIZE,
+            PDEntry,
+            PAGE_ALIGN,
+            PAGE_TABLE_SIZE,
         ) catch @panic("Went OOM mapping pages!");
         @memset(new_pd, default_flags);
         pd_entry.* = parent_flags;
@@ -563,7 +619,9 @@ pub fn mapPage(
     var pt_entry = &pd[pd_idx];
     if (!pt_entry.present) {
         const new_pt: []align(PAGE_ALIGN.toByteUnits()) PTEntry = allocator.alignedAlloc(
-            PTEntry, PAGE_ALIGN, PAGE_TABLE_SIZE,
+            PTEntry,
+            PAGE_ALIGN,
+            PAGE_TABLE_SIZE,
         ) catch @panic("Went OOM mapping pages!");
         @memset(new_pt, default_flags);
         pt_entry.* = parent_flags;

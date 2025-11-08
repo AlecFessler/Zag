@@ -1,4 +1,5 @@
-- build out scheduler
+- build out scheduler [X]
+- maybe do simple filesystem now?
 - syscall for serial output from userspace
 - userspace hello world
 - usb keyboard driver

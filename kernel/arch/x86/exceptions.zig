@@ -249,7 +249,6 @@ fn breakpointHandler(ctx: *cpu.Context) void {
 ///   invalid kernel addresses, PMM OOM, or any userspace page fault.
 fn pageFaultHandler(ctx: *cpu.Context) void {
     const pf_err = PFErrCode.from(ctx.err_code);
-
     if (pf_err.rsvd_violation) {
         @panic("Page tables have reserved bits set (RSVD).");
     }
@@ -257,7 +256,8 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         @panic("Page fault prior to pmm initialization!");
     }
 
-    const cpl: u64 = ctx.cs & 3;
+    const pmm_iface = pmm_mod.global_pmm.?.allocator();
+
     const faulting_virt = cpu.read_cr2();
     const faulting_page_virt = VAddr.fromInt(std.mem.alignBackward(
         u64,
@@ -265,49 +265,60 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         @intFromEnum(paging.PageSize.Page4K),
     ));
 
-    if (cpl == 0) {
-        var panic_msg: ?[]const u8 = null;
-        if (pf_err.instr_fetch) {
-            panic_msg = "Execute fault (NX) at kernel address!";
-        } else if (pf_err.present) {
-            panic_msg = "Kernel tried to access non-present page!";
-        } else if (!sched.kproc.vmm.isValidVAddr(faulting_virt)) {
-            panic_msg = "Kernel tried to access an unreserved virtual address!";
+    const ring_0 = @intFromEnum(idt.PrivilegeLevel.ring_0);
+    const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
+    const cpl: u64 = ctx.cs & ring_3;
+
+    if (pf_err.present) {
+        serial.print("Faulting Instruction: {X}\nFaulting Address: {X}\nFaulting Page: {X}\nPresent: {}\nIs Write: {}\nIs fetch: {}\n", .{
+            ctx.rip,
+            faulting_virt.addr,
+            faulting_page_virt.addr,
+            pf_err.present,
+            pf_err.is_write,
+            pf_err.instr_fetch,
+        });
+        paging.dumpPageWalk(faulting_page_virt);
+        if (cpl == ring_0) {
+            @panic("Kernel page fault: invalid access");
+        } else {
+            @panic("User page fault: invalid access (process killing not implemented yet)");
         }
-
-        if (panic_msg) |msg| {
-            serial.print("Faulting Instruction: {X}\nFaulting Address: {X}\nFaulting Page: {X}\nPresent: {}\nIs Write: {}\n", .{
-                ctx.rip,
-                faulting_virt.addr,
-                faulting_page_virt.addr,
-                pf_err.present,
-                pf_err.is_write,
-            });
-            @panic(msg);
-        }
-
-        const pmm_iface = pmm_mod.global_pmm.?.allocator();
-        const page = pmm_iface.create(paging.PageMem(.Page4K)) catch @panic("PMM OOM!");
-        const phys_page_virt = VAddr.fromInt(@intFromPtr(page));
-        const phys_page_phys = PAddr.fromVAddr(phys_page_virt, .physmap);
-
-        const pml4_virt = paging.currentPml4VAddr();
-
-        paging.mapPage(
-            @ptrFromInt(pml4_virt.addr),
-            phys_page_phys,
-            faulting_page_virt,
-            .rw,
-            .nx,
-            .cache,
-            .su,
-            .Page4K,
-            .physmap,
-            pmm_iface,
-        );
-
-        cpu.invlpg(faulting_page_virt);
-    } else {
-        @panic("Userspace page fault handler not implemented!");
     }
+
+    const page = pmm_iface.create(paging.PageMem(.Page4K)) catch @panic("PMM OOM!");
+    const phys_page_virt = VAddr.fromInt(@intFromPtr(page));
+    const phys_page_phys = PAddr.fromVAddr(phys_page_virt, .physmap);
+
+    const pml4_virt = paging.currentPml4VAddr();
+
+    const in_kspace = sched.kproc.vmm.isValidVAddr(faulting_virt);
+    const in_uspace = blk: {
+        if (sched.running_thread) |rt| {
+            break :blk rt.proc.vmm.isValidVAddr(faulting_virt);
+        } else break :blk false;
+    };
+    const permissions: paging.User = blk: {
+        if (in_kspace) {
+            break :blk .su;
+        } else if (in_uspace) {
+            break :blk .u;
+        } else {
+            @panic("Non-present page in neither kernel or user address space!");
+        }
+    };
+
+    paging.mapPage(
+        @ptrFromInt(pml4_virt.addr),
+        phys_page_phys,
+        faulting_page_virt,
+        .rw,
+        .nx,
+        .cache,
+        permissions,
+        .Page4K,
+        .physmap,
+        pmm_iface,
+    );
+    cpu.invlpg(faulting_page_virt);
 }
