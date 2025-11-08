@@ -399,10 +399,8 @@ pub fn armSchedTimer(delta_ns: u64) void {
 /// Switches page tables when entering a ring-3 thread and updates `rsp0`.
 pub fn schedTimerHandler(ctx: *cpu.Context) void {
     const preempted = running_thread.?;
-    if (preempted == &rq.sentinel) {
-        rq.sentinel.ctx = ctx;
-    } else {
-        preempted.ctx = ctx;
+    preempted.ctx = ctx;
+    if (preempted != &rq.sentinel) {
         rq.enqueue(preempted);
     }
     running_thread = rq.dequeue() orelse &rq.sentinel;
