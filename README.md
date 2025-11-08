@@ -185,24 +185,7 @@ Every **implementation file** (allocator, scheduler, paging, etc.) must begin wi
 
 ---
 
-### 4.3 One‑Line Item Summaries (Types, Constants, Variables)
-
-Each **type**, **constant**, and **variable** requires a **single‑line `///` summary** directly above the declaration—concise and noun‑first.
-
-```zig
-/// Kernel heap allocator.
-pub const HeapAllocator = struct { ... };
-
-/// Number of entries in the per‑CPU run queue.
-pub const RUNQUEUE_SIZE: usize = 64;
-
-/// Global scheduler state.
-var scheduler_state: Scheduler = undefined;
-```
-
----
-
-### 4.4 Function & Method Docs — **Always Five Sections**
+### 4.3 Function & Method Docs — **Always Five Sections**
 
 Every function/method includes a `///` block with **all five sections in this exact order**. If a section doesn’t apply, write **`None.`**
 
@@ -256,7 +239,7 @@ pub fn halt() noreturn {
 
 ---
 
-### 4.5 Optional Extra Sections (when warranted)
+### 4.4 Optional Extra Sections (when warranted)
 
 May appear **after** the five required sections:
 

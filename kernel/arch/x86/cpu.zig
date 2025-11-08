@@ -15,7 +15,6 @@
 //! - `Registers` – general-purpose register snapshot layout.
 //!
 //! ## Constants
-//! - `VAddr` – type alias for virtual addresses used throughout paging.
 //!
 //! ## Variables
 //! - None.
@@ -32,8 +31,8 @@
 //! - `hasFeatureEdx` – test a CPUID EDX feature bit.
 //! - `hasPowerFeatureEdx` – test a CPUID 0x80000007:EDX power/TSC bit.
 //! - `inb` – read a byte from an I/O port.
-//! - `invlpg` – invalidate one TLB entry for a virtual address.
 //! - `interruptsEnabled` – query IF from RFLAGS.
+//! - `invlpg` – invalidate one TLB entry for a virtual address.
 //! - `outb` – write a byte to an I/O port.
 //! - `rdmsr` – read a 64-bit MSR.
 //! - `rdtsc_lfenced` – read TSC with LFENCE serialization (start).
@@ -50,10 +49,8 @@ const paging = @import("paging.zig");
 const serial = @import("serial.zig");
 const std = @import("std");
 
-/// Type alias for the kernel’s virtual address wrapper.
 const VAddr = paging.VAddr;
 
-/// CPUID feature bits reported in leaf 0x1:ECX.
 pub const CpuidFeatureEcx = enum(u32) {
     sse3 = 1 << 0, // Supplemental SSE3
     pclmul = 1 << 1, // Carryless multiply
@@ -88,7 +85,6 @@ pub const CpuidFeatureEcx = enum(u32) {
     hypervisor = 1 << 31, // Running under a hypervisor
 };
 
-/// CPUID feature bits reported in leaf 0x1:EDX.
 pub const CpuidFeatureEdx = enum(u32) {
     fpu = 1 << 0, // x87 FPU
     vme = 1 << 1, // Virtual 8086 extensions
@@ -122,7 +118,6 @@ pub const CpuidFeatureEdx = enum(u32) {
     pbe = 1 << 31, // Pending Break Enable
 };
 
-/// Symbolic CPUID leaf selectors used by this module.
 pub const CpuidLeaf = enum(u32) {
     basic_max = 0x00000000,
     basic_features = 0x00000001,
@@ -133,7 +128,6 @@ pub const CpuidLeaf = enum(u32) {
     ext_power = 0x80000007,
 };
 
-/// Extended power/TSC feature bits from CPUID 0x80000007:EDX.
 pub const CpuidPowerEdx = enum(u32) {
     ts = 1 << 0, // Temperature sensor available
     fid = 1 << 1, // Frequency ID control
@@ -178,11 +172,11 @@ pub const Registers = packed struct {
 /// Summary:
 /// Executes the CPUID instruction with the provided input registers.
 ///
-/// Args:
+/// Arguments:
 /// - `eax`: CPUID leaf selector.
 /// - `ecx`: subleaf/index value.
 ///
-/// Return value(s):
+/// Returns:
 /// - Struct containing post-instruction `eax`, `ebx`, `ecx`, and `edx`.
 ///
 /// Errors:
@@ -214,11 +208,11 @@ pub fn cpuid(eax: CpuidLeaf, ecx: u32) struct {
 /// Summary:
 /// Disable maskable interrupts by clearing IF in RFLAGS.
 ///
-/// Args:
+/// Arguments:
 /// - None.
 ///
-/// Return value(s):
-/// - `void`.
+/// Returns:
+/// - None.
 ///
 /// Errors:
 /// - None.
@@ -232,11 +226,11 @@ pub fn disableInterrupts() void {
 /// Summary:
 /// Enable maskable interrupts by setting IF in RFLAGS.
 ///
-/// Args:
+/// Arguments:
 /// - None.
 ///
-/// Return value(s):
-/// - `void`.
+/// Returns:
+/// - None.
 ///
 /// Errors:
 /// - None.
@@ -250,17 +244,20 @@ pub fn enableInterrupts() void {
 /// Summary:
 /// Enables x2APIC mode and software-enables the local APIC via SVR.
 ///
-/// Args:
+/// Arguments:
 /// - `spurious_vector`: interrupt vector (≥ 0x10) to program into SVR.
 ///
-/// Return value(s):
-/// - `void`.
+/// Returns:
+/// - `true` if x2APIC was enabled; `false` if unsupported.
 ///
 /// Errors:
 /// - None.
 ///
 /// Panics:
-/// - Panics if LAPIC or x2APIC are not supported per CPUID.
+/// - None.
+///
+/// Notes:
+/// - Returns `false` if LAPIC or x2APIC are not supported per CPUID.
 pub fn enableX2Apic(spurious_vector: u8) bool {
     std.debug.assert(spurious_vector >= 0x10);
 
@@ -287,10 +284,10 @@ pub fn enableX2Apic(spurious_vector: u8) bool {
 /// Summary:
 /// Returns the CPU brand string (48 bytes, vendor-defined formatting, no NUL).
 ///
-/// Args:
+/// Arguments:
 /// - `allocator`: allocator used to allocate the 48-byte result buffer.
 ///
-/// Return value(s):
+/// Returns:
 /// - `[]u8` of length 48; caller owns and must free.
 ///
 /// Errors:
@@ -325,10 +322,10 @@ pub fn getBrandString(allocator: std.mem.Allocator) ![]u8 {
 /// Summary:
 /// Returns the CPU vendor identification string (12 bytes, no NUL).
 ///
-/// Args:
+/// Arguments:
 /// - `allocator`: allocator used to allocate the 12-byte result buffer.
 ///
-/// Return value(s):
+/// Returns:
 /// - `[]u8` of length 12 containing EBX||EDX||ECX; caller owns and must free.
 ///
 /// Errors:
@@ -354,11 +351,11 @@ pub fn getVendorString(allocator: std.mem.Allocator) ![]u8 {
 /// Summary:
 /// Halt in a tight loop (low-power wait until an interrupt).
 ///
-/// Args:
+/// Arguments:
 /// - None.
 ///
-/// Return value(s):
-/// - Never returns (`noreturn`).
+/// Returns:
+/// - Never returns.
 ///
 /// Errors:
 /// - None.
@@ -374,11 +371,11 @@ pub fn halt() noreturn {
 /// Summary:
 /// Checks whether a given ECX CPUID feature bit is present.
 ///
-/// Args:
+/// Arguments:
 /// - `reg`: value returned from CPUID leaf 0x1:ECX.
 /// - `feat`: desired feature bit from `CpuidFeatureEcx`.
 ///
-/// Return value(s):
+/// Returns:
 /// - `true` if present; `false` otherwise.
 ///
 /// Errors:
@@ -386,21 +383,18 @@ pub fn halt() noreturn {
 ///
 /// Panics:
 /// - None.
-pub fn hasFeatureEcx(
-    reg: u32,
-    feat: CpuidFeatureEcx,
-) bool {
+pub fn hasFeatureEcx(reg: u32, feat: CpuidFeatureEcx) bool {
     return (reg & @intFromEnum(feat)) != 0;
 }
 
 /// Summary:
 /// Checks whether a given EDX CPUID feature bit is present.
 ///
-/// Args:
+/// Arguments:
 /// - `reg`: value returned from CPUID leaf 0x1:EDX.
 /// - `feat`: desired feature bit from `CpuidFeatureEdx`.
 ///
-/// Return value(s):
+/// Returns:
 /// - `true` if present; `false` otherwise.
 ///
 /// Errors:
@@ -408,21 +402,18 @@ pub fn hasFeatureEcx(
 ///
 /// Panics:
 /// - None.
-pub fn hasFeatureEdx(
-    reg: u32,
-    feat: CpuidFeatureEdx,
-) bool {
+pub fn hasFeatureEdx(reg: u32, feat: CpuidFeatureEdx) bool {
     return (reg & @intFromEnum(feat)) != 0;
 }
 
 /// Summary:
 /// Checks whether an extended power/TSC EDX feature bit is present.
 ///
-/// Args:
+/// Arguments:
 /// - `reg`: value from CPUID leaf 0x80000007:EDX.
 /// - `feat`: desired bit from `CpuidPowerEdx`.
 ///
-/// Return value(s):
+/// Returns:
 /// - `true` if present; `false` otherwise.
 ///
 /// Errors:
@@ -430,20 +421,17 @@ pub fn hasFeatureEdx(
 ///
 /// Panics:
 /// - None.
-pub fn hasPowerFeatureEdx(
-    reg: u32,
-    feat: CpuidPowerEdx,
-) bool {
+pub fn hasPowerFeatureEdx(reg: u32, feat: CpuidPowerEdx) bool {
     return (reg & @intFromEnum(feat)) != 0;
 }
 
 /// Summary:
 /// Reads one byte from an I/O port.
 ///
-/// Args:
+/// Arguments:
 /// - `port`: I/O port to read from.
 ///
-/// Return value(s):
+/// Returns:
 /// - The byte read from `port`.
 ///
 /// Errors:
@@ -460,34 +448,12 @@ pub fn inb(port: u16) u8 {
 }
 
 /// Summary:
-/// Invalidates the TLB entry for a virtual address with `invlpg`.
-///
-/// Args:
-/// - `vaddr`: virtual address whose page translation should be dropped.
-///
-/// Return value(s):
-/// - `void`.
-///
-/// Errors:
-/// - None.
-///
-/// Panics:
-/// - None.
-pub fn invlpg(vaddr: VAddr) void {
-    asm volatile (
-        \\invlpg (%[a])
-        :
-        : [a] "r" (vaddr.addr),
-        : .{ .memory = true });
-}
-
-/// Summary:
 /// Returns whether IF (Interrupt Flag) is currently set in RFLAGS.
 ///
-/// Args:
+/// Arguments:
 /// - None.
 ///
-/// Return value(s):
+/// Returns:
 /// - `true` if interrupts are enabled; `false` otherwise.
 ///
 /// Errors:
@@ -505,24 +471,43 @@ pub fn interruptsEnabled() bool {
 }
 
 /// Summary:
-/// Writes one byte to an I/O port.
+/// Invalidates the TLB entry for a virtual address with `invlpg`.
 ///
-/// Args:
-/// - `value`: byte to write.
-/// - `port`: I/O port to write to.
+/// Arguments:
+/// - `vaddr`: virtual address whose page translation should be dropped.
 ///
-/// Return value(s):
-/// - `void`.
+/// Returns:
+/// - None.
 ///
 /// Errors:
 /// - None.
 ///
 /// Panics:
 /// - None.
-pub fn outb(
-    value: u8,
-    port: u16,
-) void {
+pub fn invlpg(vaddr: VAddr) void {
+    asm volatile (
+        \\invlpg (%[a])
+        :
+        : [a] "r" (vaddr.addr),
+        : .{ .memory = true });
+}
+
+/// Summary:
+/// Writes one byte to an I/O port.
+///
+/// Arguments:
+/// - `value`: byte to write.
+/// - `port`: I/O port to write to.
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn outb(value: u8, port: u16) void {
     asm volatile (
         \\outb %[value], %[port]
         :
@@ -534,10 +519,10 @@ pub fn outb(
 /// Summary:
 /// Reads a 64-bit Model Specific Register (MSR) using RDMSR.
 ///
-/// Args:
+/// Arguments:
 /// - `msr`: MSR index (ECX).
 ///
-/// Return value(s):
+/// Returns:
 /// - 64-bit value read from the MSR.
 ///
 /// Errors:
@@ -560,10 +545,10 @@ pub fn rdmsr(msr: u32) u64 {
 /// Summary:
 /// Read TSC with LFENCE serialization before the read (best for “start”).
 ///
-/// Args:
+/// Arguments:
 /// - None.
 ///
-/// Return value(s):
+/// Returns:
 /// - 64-bit TSC value.
 ///
 /// Errors:
@@ -588,10 +573,10 @@ pub fn rdtsc_lfenced() u64 {
 /// Summary:
 /// Read TSC via RDTSCP (ordered; also reads IA32_TSC_AUX into ECX).
 ///
-/// Args:
+/// Arguments:
 /// - None.
 ///
-/// Return value(s):
+/// Returns:
 /// - 64-bit TSC value (aux is discarded).
 ///
 /// Errors:
@@ -617,10 +602,10 @@ pub fn rdtscp() u64 {
 /// Summary:
 /// Read TSC via RDTSCP then LFENCE (best for “end”).
 ///
-/// Args:
+/// Arguments:
 /// - None.
 ///
-/// Return value(s):
+/// Returns:
 /// - 64-bit TSC value.
 ///
 /// Errors:
@@ -647,10 +632,10 @@ pub fn rdtscp_lfenced() u64 {
 /// Summary:
 /// Reads `cr2` and returns the last page-fault linear address.
 ///
-/// Args:
+/// Arguments:
 /// - None.
 ///
-/// Return value(s):
+/// Returns:
 /// - `VAddr` of the most recent page-faulting linear address.
 ///
 /// Errors:
@@ -669,11 +654,11 @@ pub fn read_cr2() VAddr {
 /// Summary:
 /// Reloads CS/DS/ES/SS using known ring-0 selectors in the current GDT.
 ///
-/// Args:
+/// Arguments:
 /// - None. Assumes CS=0x08 and DS/ES/SS=0x10 exist in the active GDT.
 ///
-/// Return value(s):
-/// - `void`.
+/// Returns:
+/// - None.
 ///
 /// Errors:
 /// - None.
@@ -697,11 +682,11 @@ pub fn reloadSegments() void {
 /// Summary:
 /// Restore interrupts to a prior state captured from `saveAndDisableInterrupts()`.
 ///
-/// Args:
+/// Arguments:
 /// - `saved_rflags`: RFLAGS value previously returned by `saveAndDisableInterrupts`.
 ///
-/// Return value(s):
-/// - `void`.
+/// Returns:
+/// - None.
 ///
 /// Errors:
 /// - None.
@@ -720,10 +705,10 @@ pub fn restoreInterrupts(saved_rflags: u64) void {
 /// Summary:
 /// Save current interrupt state and then disable interrupts (CLI).
 ///
-/// Args:
+/// Arguments:
 /// - None.
 ///
-/// Return value(s):
+/// Returns:
 /// - The caller’s RFLAGS prior to disabling interrupts.
 ///
 /// Errors:
@@ -743,11 +728,11 @@ pub fn saveAndDisableInterrupts() u64 {
 /// Summary:
 /// Enables or disables the CR0.WP (write-protect) bit.
 ///
-/// Args:
+/// Arguments:
 /// - `enable`: `true` to set WP (enforce read-only pages), `false` to clear WP.
 ///
-/// Return value(s):
-/// - `void`.
+/// Returns:
+/// - None.
 ///
 /// Errors:
 /// - None.
@@ -774,12 +759,12 @@ pub fn setWriteProtect(enable: bool) void {
 /// Summary:
 /// Writes a 64-bit value to a Model Specific Register with WRMSR.
 ///
-/// Args:
+/// Arguments:
 /// - `msr`: MSR index (ECX).
 /// - `value`: 64-bit value to write (split into EDX:EAX).
 ///
-/// Return value(s):
-/// - `void`.
+/// Returns:
+/// - None.
 ///
 /// Errors:
 /// - None.

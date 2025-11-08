@@ -1,9 +1,10 @@
 //! CPU exception ISRs, syscall vector, and page-fault handling.
 //!
 //! Installs CPU exception gates (0..31), exposes a syscall vector (0x80),
-//! registers a couple of default handlers, and routes all entries through the
-//! common naked stub. Includes a minimal kernel page-fault handler that
-//! demand-maps a fresh page for valid kernel VAddrs.
+//! registers default handlers, and routes all entries through the common naked
+//! stub. Includes a kernel/userspace page-fault handler that demand-maps a
+//! fresh 4 KiB page for valid virtual addresses (kernel or user) on non-present
+//! faults; present faults are treated as protection errors and panic.
 //!
 //! # Directory
 //!
@@ -19,9 +20,11 @@
 //!
 //! ## Functions
 //! - `init` – install exception gates and register default handlers + syscall gate.
-//! - `divByZeroHandler` – kernel/userspace divide-by-zero handler (private).
-//! - `pageFaultHandler` – kernel page-fault demand-mapper (private).
-//! - `PFErrCode.from` – decode a raw page-fault error code into fields.
+//! - `breakpointHandler` – #BP handler (returns in kernelspace; panics in userspace).
+//! - `debugHandler` – #DB handler (returns in kernelspace; panics in userspace).
+//! - `divByZeroHandler` – #DE handler (panics; message varies by CPL).
+//! - `doubleFaultHandler` – #DF handler (panics; message varies by CPL).
+//! - `pageFaultHandler` – #PF handler; demand-maps non-present pages, panics on protection faults.
 
 const cpu = @import("cpu.zig");
 const idt = @import("idt.zig");
@@ -35,7 +38,6 @@ const memory = zag.memory;
 const pmm_mod = memory.PhysicalMemoryManager;
 const sched = zag.sched.scheduler;
 
-/// Architectural exception vectors (subset shown explicitly).
 pub const Exception = enum(u5) {
     divide_by_zero = 0,
     single_step_debug = 1,
@@ -60,7 +62,6 @@ pub const Exception = enum(u5) {
     security = 30,
 };
 
-/// Parsed x86-64 page-fault error code with convenience flags.
 const PFErrCode = struct {
     present: bool, // bit 0
     is_write: bool, // bit 1
@@ -103,7 +104,6 @@ const PAddr = paging.PAddr;
 const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
 const VAddr = paging.VAddr;
 
-/// Number of exception gates (0..31) to install.
 pub const NUM_ISR_ENTRIES = 32;
 
 /// Summary:
@@ -114,7 +114,7 @@ pub const NUM_ISR_ENTRIES = 32;
 /// - None.
 ///
 /// Returns:
-/// - `void`.
+/// - None.
 ///
 /// Errors:
 /// - None.
@@ -142,22 +142,18 @@ pub fn init() void {
         @intFromEnum(Exception.divide_by_zero),
         divByZeroHandler,
     );
-
     interrupts.registerException(
         @intFromEnum(Exception.single_step_debug),
         debugHandler,
     );
-
     interrupts.registerException(
         @intFromEnum(Exception.breakpoint_debug),
         breakpointHandler,
     );
-
     interrupts.registerException(
         @intFromEnum(Exception.double_fault),
         doubleFaultHandler,
     );
-
     interrupts.registerException(
         @intFromEnum(Exception.page_fault),
         pageFaultHandler,
@@ -176,50 +172,19 @@ pub fn init() void {
 }
 
 /// Summary:
-/// Default divide-by-zero handler that distinguishes kernel vs. user faults
-/// and panics with an appropriate message.
+/// #BP breakpoint handler. Dumps the frame, returns in kernelspace, panics in userspace.
 ///
 /// Arguments:
 /// - `ctx`: Interrupt context captured by the common stub.
 ///
 /// Returns:
-/// - `void`.
+/// - None.
 ///
 /// Errors:
 /// - None.
 ///
 /// Panics:
-/// - Always panics on divide-by-zero, message varies by CPL.
-fn divByZeroHandler(ctx: *cpu.Context) void {
-    interrupts.dumpInterruptFrame(ctx);
-    const cpl: u64 = ctx.cs & 3;
-    if (cpl == 0) {
-        @panic("Divide by zero in kernelspace!");
-    } else {
-        @panic("Divide by zero in userspace!");
-    }
-}
-
-fn doubleFaultHandler(ctx: *cpu.Context) void {
-    interrupts.dumpInterruptFrame(ctx);
-    const cpl: u64 = ctx.cs & 3;
-    if (cpl == 0) {
-        @panic("Double fault in kernelspace!");
-    } else {
-        @panic("Double fault in userspace!");
-    }
-}
-
-fn debugHandler(ctx: *cpu.Context) void {
-    interrupts.dumpInterruptFrame(ctx);
-    const cpl: u64 = ctx.cs & 3;
-    if (cpl == 0) {
-        return;
-    } else {
-        @panic("Divide by zero in userspace!");
-    }
-}
-
+/// - Panics when invoked from userspace.
 fn breakpointHandler(ctx: *cpu.Context) void {
     interrupts.dumpInterruptFrame(ctx);
     const cpl: u64 = ctx.cs & 3;
@@ -231,22 +196,95 @@ fn breakpointHandler(ctx: *cpu.Context) void {
 }
 
 /// Summary:
-/// Kernel page-fault handler that demand-maps a 4 KiB page for valid kernel
-/// VAddrs and rejects invalid or premature faults. Userspace faults are not
-/// implemented.
+/// #DB single-step/trace handler. Dumps the frame, returns in kernelspace, panics in userspace.
 ///
 /// Arguments:
 /// - `ctx`: Interrupt context captured by the common stub.
 ///
 /// Returns:
-/// - `void`.
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - Panics when invoked from userspace.
+fn debugHandler(ctx: *cpu.Context) void {
+    interrupts.dumpInterruptFrame(ctx);
+    const cpl: u64 = ctx.cs & 3;
+    if (cpl == 0) {
+        return;
+    } else {
+        @panic("Divide by zero in userspace!");
+    }
+}
+
+/// Summary:
+/// #DE divide-by-zero handler. Dumps the frame and panics; message varies by CPL.
+///
+/// Arguments:
+/// - `ctx`: Interrupt context captured by the common stub.
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - Always panics on divide-by-zero.
+fn divByZeroHandler(ctx: *cpu.Context) void {
+    interrupts.dumpInterruptFrame(ctx);
+    const cpl: u64 = ctx.cs & 3;
+    if (cpl == 0) {
+        @panic("Divide by zero in kernelspace!");
+    } else {
+        @panic("Divide by zero in userspace!");
+    }
+}
+
+/// Summary:
+/// #DF double-fault handler. Dumps the frame and panics; message varies by CPL.
+///
+/// Arguments:
+/// - `ctx`: Interrupt context captured by the common stub.
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - Always panics on double fault.
+fn doubleFaultHandler(ctx: *cpu.Context) void {
+    interrupts.dumpInterruptFrame(ctx);
+    const cpl: u64 = ctx.cs & 3;
+    if (cpl == 0) {
+        @panic("Double fault in kernelspace!");
+    } else {
+        @panic("Double fault in userspace!");
+    }
+}
+
+/// Summary:
+/// Kernel page-fault handler that demand-maps a 4 KiB page on non-present faults
+/// for addresses valid in either the kernel or the current process address space.
+/// Present faults are treated as protection errors and panic.
+///
+/// Arguments:
+/// - `ctx`: Interrupt context captured by the common stub.
+///
+/// Returns:
+/// - None.
 ///
 /// Errors:
 /// - None.
 ///
 /// Panics:
 /// - Panics on RSVD violations, PMM/VMM uninitialized, execute faults in kernel,
-///   invalid kernel addresses, PMM OOM, or any userspace page fault.
+///   protection faults, invalid address (neither kspace nor current uspace), or
+///   userspace invalid-access conditions.
 fn pageFaultHandler(ctx: *cpu.Context) void {
     const pf_err = PFErrCode.from(ctx.err_code);
     if (pf_err.rsvd_violation) {

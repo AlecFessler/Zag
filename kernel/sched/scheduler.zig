@@ -1,38 +1,61 @@
+//! Preemptive scheduler core: processes, threads, and run queue.
+//!
+//! Coordinates kernel/user threads, context switching, and preemption via
+//! LAPIC/x2APIC timers. Used by `zag.sched` to time-slice both kernel threads
+//! and ring-3 user threads. Integrates with the PMM/VMM for per-process
+//! address spaces and installs `rsp0` for safe user→kernel traps.
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - `Process` – Minimal process control block with address space and threads
+//! - `RunQueue` – Single-producer/single-consumer FIFO with sentinel
+//! - `Thread` – Kernel/user thread control block with saved interrupt frame
+//! - `ProcessAllocator` – Slab factory for `Process`
+//! - `ThreadAllocator` – Slab factory for `Thread`
+//!
+//! ## Constants
+//! - `SCHED_TIMESLICE_NS` – Default timeslice in nanoseconds
+//!
+//! ## Variables
+//! - `kproc` – Kernel process (ring-0 address space)
+//! - `running_thread` – Currently scheduled thread (or sentinel)
+//! - `pid_counter` – Monotonic PID source
+//! - `tid_counter` – Monotonic TID source
+//! - `process_allocator` – Backing allocator for `Process` slabs
+//! - `thread_allocator` – Backing allocator for `Thread` slabs
+//! - `rq` – Global run queue
+//! - `timer` – Active scheduler timer driver
+//!
+//! ## Functions
+//! - `armSchedTimer` – Program the next preemption deadline
+//! - `schedTimerHandler` – Timer ISR that performs the context switch
+//!
+//! ## Entry / Init
+//! - `init` – Bring up scheduler state and allocators
+
 const std = @import("std");
 const zag = @import("zag");
 
 const apic = zag.x86.Apic;
 const cpu = zag.x86.Cpu;
+const gdt = zag.x86.Gdt;
 const idt = zag.x86.Idt;
 const interrupts = zag.x86.Interrupts;
-const gdt = zag.x86.Gdt;
-const serial = zag.x86.Serial;
-const timers = zag.x86.Timers;
 const paging = zag.x86.Paging;
 const pmm_mod = zag.memory.PhysicalMemoryManager;
-const vmm_mod = zag.memory.VirtualMemoryManager;
+const serial = zag.x86.Serial;
 const slab_alloc = zag.memory.SlabAllocator;
+const timers = zag.x86.Timers;
+const vmm_mod = zag.memory.VirtualMemoryManager;
 
+const PAddr = paging.PAddr;
 const PrivilegeLevel = idt.PrivilegeLevel;
 const SlabAllocator = slab_alloc.SlabAllocator;
-const PAddr = paging.PAddr;
 const VAddr = paging.VAddr;
 const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
 
-const ProcessAllocator = SlabAllocator(
-    Process,
-    false, // no stack bootstrap
-    0, // no stack buffer
-    64, // allocation chunk size
-);
-
-const ThreadAllocator = SlabAllocator(
-    Thread,
-    false, // no stack bootstrap
-    0, // no stack buffer
-    64, // allocation chunk size
-);
-
+/// Process control block with per-process address space and threads.
 pub const Process = struct {
     pid: u64,
     cpl: PrivilegeLevel,
@@ -44,6 +67,20 @@ pub const Process = struct {
 
     const MAX_THREADS = 16; // for now
 
+    /// Summary:
+    /// Creates a ring-3 user process with a fresh address space and initial thread.
+    ///
+    /// Arguments:
+    /// - `entry`: entry function for the first thread (user-mode if CPL=ring_3)
+    ///
+    /// Returns:
+    /// - Pointer to the created `Process`.
+    ///
+    /// Errors:
+    /// - Propagates allocation errors from the PMM/VMM or slab allocator.
+    ///
+    /// Panics:
+    /// - None.
     pub fn createUserProcess(
         entry: *const fn () void,
     ) !*Process {
@@ -82,6 +119,105 @@ pub const Process = struct {
     }
 };
 
+/// Intrusive FIFO run queue with sentinel head/tail.
+pub const RunQueue = struct {
+    sentinel: Thread,
+    head: *Thread,
+    tail: *Thread,
+
+    /// Summary:
+    /// Initializes a run queue with a detached sentinel node.
+    ///
+    /// Arguments:
+    /// - `init_rq`: run queue to initialize
+    ///
+    /// Returns:
+    /// - None.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
+    pub fn init(init_rq: *RunQueue) void {
+        init_rq.sentinel.next = null;
+        init_rq.head = &init_rq.sentinel;
+        init_rq.tail = &init_rq.sentinel;
+    }
+
+    /// Summary:
+    /// Enqueues a thread at the tail of the queue.
+    ///
+    /// Arguments:
+    /// - `self`: target run queue
+    /// - `thread`: thread to append
+    ///
+    /// Returns:
+    /// - None.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
+    pub fn enqueue(self: *RunQueue, thread: *Thread) void {
+        thread.next = null;
+        self.tail.next = thread;
+        self.tail = thread;
+    }
+
+    /// Summary:
+    /// Enqueues a thread at the front of the queue.
+    ///
+    /// Arguments:
+    /// - `self`: target run queue
+    /// - `thread`: thread to insert at the head
+    ///
+    /// Returns:
+    /// - None.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
+    pub fn enqueueToFront(self: *RunQueue, thread: *Thread) void {
+        thread.next = self.head.next;
+        self.head.next = thread;
+
+        if (self.tail == self.head) {
+            self.tail = thread;
+        }
+    }
+
+    /// Summary:
+    /// Dequeues and returns the first runnable thread.
+    ///
+    /// Arguments:
+    /// - `self`: target run queue
+    ///
+    /// Returns:
+    /// - The dequeued `*Thread`, or `null` if empty.
+    ///
+    /// Errors:
+    /// - None.
+    ///
+    /// Panics:
+    /// - None.
+    pub fn dequeue(self: *RunQueue) ?*Thread {
+        const first = self.head.next orelse return null;
+
+        if (self.tail == first) {
+            self.tail = self.head;
+        }
+
+        self.head.next = first.next;
+        first.next = null;
+        return first;
+    }
+};
+
+/// Thread control block with saved interrupt frame and stacks.
 pub const Thread = struct {
     tid: u64,
     ctx: *cpu.Context,
@@ -90,6 +226,22 @@ pub const Thread = struct {
     proc: *Process,
     next: ?*Thread = null,
 
+    /// Summary:
+    /// Creates a kernel or user thread and seeds its interrupt frame.
+    ///
+    /// Arguments:
+    /// - `proc`: owning process
+    /// - `entry`: thread entry function (CPL derived from `proc.cpl`)
+    ///
+    /// Returns:
+    /// - Pointer to the created `Thread`.
+    ///
+    /// Errors:
+    /// - `MaxThreads` if the process would exceed `MAX_THREADS`.
+    /// - Propagates allocation errors for stacks/frames.
+    ///
+    /// Panics:
+    /// - None.
     pub fn createThread(
         proc: *Process,
         entry: *const fn () void,
@@ -160,56 +312,26 @@ pub const Thread = struct {
     }
 };
 
-pub const RunQueue = struct {
-    sentinel: Thread,
-    head: *Thread,
-    tail: *Thread,
+/// Slab factory for `Process`.
+const ProcessAllocator = SlabAllocator(
+    Process,
+    false, // no stack bootstrap
+    0, // no stack buffer
+    64, // allocation chunk size
+);
 
-    pub fn init(init_rq: *RunQueue) void {
-        init_rq.sentinel.next = null;
-        init_rq.head = &init_rq.sentinel;
-        init_rq.tail = &init_rq.sentinel;
-    }
+/// Slab factory for `Thread`.
+const ThreadAllocator = SlabAllocator(
+    Thread,
+    false, // no stack bootstrap
+    0, // no stack buffer
+    64, // allocation chunk size
+);
 
-    pub fn enqueue(self: *RunQueue, thread: *Thread) void {
-        thread.next = null;
-        self.tail.next = thread;
-        self.tail = thread;
-    }
-
-    pub fn enqueueToFront(self: *RunQueue, thread: *Thread) void {
-        thread.next = self.head.next;
-        self.head.next = thread;
-
-        if (self.tail == self.head) {
-            self.tail = thread;
-        }
-    }
-
-    pub fn dequeue(self: *RunQueue) ?*Thread {
-        const first = self.head.next orelse return null;
-
-        if (self.tail == first) {
-            self.tail = self.head;
-        }
-
-        self.head.next = first.next;
-        first.next = null;
-        return first;
-    }
-};
-
+/// Default scheduler time slice in nanoseconds.
 pub const SCHED_TIMESLICE_NS = 2_000_000;
 
-var pid_counter: u64 = 1;
-var tid_counter: u64 = 0;
-
-var rq: RunQueue = undefined;
-var timer: timers.Timer = undefined;
-var process_allocator: std.mem.Allocator = undefined;
-var thread_allocator: std.mem.Allocator = undefined;
-
-pub var running_thread: ?*Thread = null;
+/// Kernel process placeholder (initialized in `kMain`).
 pub var kproc: Process = .{
     .pid = 0,
     .cpl = .ring_0,
@@ -219,23 +341,62 @@ pub var kproc: Process = .{
     .num_threads = 0,
 };
 
+/// Currently running thread (or sentinel when idle).
+pub var running_thread: ?*Thread = null;
+
+/// Monotonic PID source.
+var pid_counter: u64 = 1;
+
+/// Backing allocator for `Process` slabs.
+var process_allocator: std.mem.Allocator = undefined;
+
+/// Global run queue.
+var rq: RunQueue = undefined;
+
+/// Backing allocator for `Thread` slabs.
+var thread_allocator: std.mem.Allocator = undefined;
+
+/// Monotonic TID source.
+var tid_counter: u64 = 0;
+
+/// Active scheduler timer driver.
+var timer: timers.Timer = undefined;
+
+/// Summary:
+/// Arms the scheduler preemption timer after `delta_ns`.
+///
+/// Arguments:
+/// - `delta_ns`: nanoseconds from now to trigger the next interrupt
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn armSchedTimer(delta_ns: u64) void {
     timer.arm_interrupt_timer(delta_ns);
 }
 
-pub fn init(t: timers.Timer, slab_backing_allocator: std.mem.Allocator) !void {
-    timer = t;
-
-    var proc_alloc = try ProcessAllocator.init(slab_backing_allocator);
-    process_allocator = proc_alloc.allocator();
-
-    var thread_alloc = try ThreadAllocator.init(slab_backing_allocator);
-    thread_allocator = thread_alloc.allocator();
-
-    rq.init();
-    running_thread = &rq.sentinel;
-}
-
+/// Summary:
+/// Timer ISR that saves the preempted context, picks next, and switches stacks.
+///
+/// Arguments:
+/// - `ctx`: interrupt frame of the preempted thread
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+///
+/// Safety:
+/// Switches page tables when entering a ring-3 thread and updates `rsp0`.
 pub fn schedTimerHandler(ctx: *cpu.Context) void {
     const preempted = running_thread.?;
     if (preempted == &rq.sentinel) {
@@ -265,4 +426,35 @@ pub fn schedTimerHandler(ctx: *cpu.Context) void {
         :
         : [new_stack] "r" (@intFromPtr(running_thread.?.ctx)),
     );
+}
+
+/// Summary:
+/// Initializes scheduler globals, allocators, and the run queue sentinel.
+///
+/// Arguments:
+/// - `t`: timer driver used for preemption
+/// - `slab_backing_allocator`: allocator backing the slab factories
+///
+/// Returns:
+/// - `!void` on success.
+///
+/// Errors:
+/// - Propagates allocation errors from slab initialization.
+///
+/// Panics:
+/// - None.
+///
+/// Notes:
+/// Leaves `running_thread` pointing at the sentinel until the first enqueue.
+pub fn init(t: timers.Timer, slab_backing_allocator: std.mem.Allocator) !void {
+    timer = t;
+
+    var proc_alloc = try ProcessAllocator.init(slab_backing_allocator);
+    process_allocator = proc_alloc.allocator();
+
+    var thread_alloc = try ThreadAllocator.init(slab_backing_allocator);
+    thread_allocator = thread_alloc.allocator();
+
+    rq.init();
+    running_thread = &rq.sentinel;
 }

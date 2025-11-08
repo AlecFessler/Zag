@@ -1,64 +1,68 @@
+//! Local APIC and x2APIC control.
+//!
+//! Provides symbolic register definitions, packed register layouts for MMIO
+//! LAPIC, and helpers for x2APIC MSR access. Used by the timer subsystem and
+//! interrupt dispatch to program LAPIC timers, acknowledge EOIs, and enable
+//! TSC-deadline mode when supported.
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - `Register` – MMIO LAPIC register offsets
+//! - `X2ApicMsr` – x2APIC MSR indices
+//! - `ArbitrationPrio` – Arbitration Priority register layout
+//! - `CurrCount` – Current Count register layout
+//! - `DestFmt` – Destination Format register layout
+//! - `DivConfig` – Divide Configuration register layout
+//! - `EOI` – End Of Interrupt register layout
+//! - `ErrStatus` – Error Status register layout
+//! - `InService[0..7]` – In-Service register bank layouts
+//! - `InitCount` – Initial Count register layout
+//! - `IntCmdHigh` – ICR high dword layout
+//! - `IntCmdLow` – ICR low dword layout
+//! - `IntRequest[0..7]` – IRR register bank layouts
+//! - `LapicID` – Local APIC ID register layout
+//! - `LapicVersion` – Local APIC Version register layout
+//! - `LogicalDest` – Logical Destination register layout
+//! - `Lvt*` – LVT entry layouts (Timer, LINT0/1, Thermal, Perf, Error, CMC)
+//! - `ProcessorPrio` – Processor Priority register layout
+//! - `RemoteRead` – Remote Read register layout
+//! - `SpuriousIntVec` – Spurious Interrupt Vector register layout
+//! - `TaskPrio` – Task Priority register layout
+//! - `TriggerMode[0..7]` – TMR register bank layouts
+//!
+//! ## Constants
+//! - `LVT_MASK_BIT` – LVT mask bit index
+//! - `LVT_MODE_SHIFT` – LVT timer mode bit LSB
+//! - `LVT_MODE_ONE_SHOT` – One-shot LVT timer mode
+//! - `tsc_deadline_msr` – IA32_TSC_DEADLINE MSR index
+//!
+//! ## Variables
+//! - `curr_count`, `init_count`, `div_config` – Timer MMIO pointers
+//! - `eoi` – EOI register pointer
+//! - `int_cmd_high`, `int_cmd_low` – ICR MMIO pointers
+//! - `in_service_*`, `int_request_*`, `trigger_mode_*` – ISR/IRR/TMR banks
+//! - `lapic_id`, `lapic_version` – LAPIC identification registers
+//! - `logical_dest`, `dest_fmt` – Logical destination registers
+//! - `lvt_*` – LVT entry pointers
+//! - `processor_prio`, `task_prio`, `arbitration_prio`, `remote_read`, `err_status`, `spurious_int_vec`
+//! - `x2Apic` – Whether x2APIC mode is enabled
+//!
+//! ## Functions
+//! - `armTscDeadline` – Program IA32_TSC_DEADLINE
+//! - `cancelTscDeadline` – Clear IA32_TSC_DEADLINE
+//! - `disablePic` – Mask legacy 8259 PICs
+//! - `endOfInterrupt` – Acknowledge interrupt (x2APIC or MMIO)
+//! - `programLocalApicTimerTscDeadline` – Enable LVT timer in deadline mode
+//! - `init` – Initialize LAPIC/x2APIC pointers and mode
+//! - `initLapicTimer` – Program LVT timer (divide/mode/mask)
+//! - `armLapicOneShot` – Arm one-shot LVT timer
+
 const cpu = @import("cpu.zig");
 const idt = @import("idt.zig");
 const paging = @import("paging.zig");
 
 const VAddr = paging.VAddr;
-
-pub const X2ApicMsr = enum(u32) {
-    local_apic_id_register = 0x802,
-    local_apic_version_register = 0x803,
-
-    task_priority_register = 0x808,
-    processor_priority_register = 0x80a,
-    end_of_interrupt_register = 0x80b,
-    logical_destination_register = 0x80d,
-    spurious_interrupt_vector_register = 0x80f,
-
-    in_service_register_bits_0_to_31 = 0x810,
-    in_service_register_bits_32_to_63 = 0x811,
-    in_service_register_bits_64_to_95 = 0x812,
-    in_service_register_bits_96_to_127 = 0x813,
-    in_service_register_bits_128_to_159 = 0x814,
-    in_service_register_bits_160_to_191 = 0x815,
-    in_service_register_bits_192_to_223 = 0x816,
-    in_service_register_bits_224_to_255 = 0x817,
-
-    trigger_mode_register_bits_0_to_31 = 0x818,
-    trigger_mode_register_bits_32_to_63 = 0x819,
-    trigger_mode_register_bits_64_to_95 = 0x81a,
-    trigger_mode_register_bits_96_to_127 = 0x81b,
-    trigger_mode_register_bits_128_to_159 = 0x81c,
-    trigger_mode_register_bits_160_to_191 = 0x81d,
-    trigger_mode_register_bits_192_to_223 = 0x81e,
-    trigger_mode_register_bits_224_to_255 = 0x81f,
-
-    interrupt_request_register_bits_0_to_31 = 0x820,
-    interrupt_request_register_bits_32_to_63 = 0x821,
-    interrupt_request_register_bits_64_to_95 = 0x822,
-    interrupt_request_register_bits_96_to_127 = 0x823,
-    interrupt_request_register_bits_128_to_159 = 0x824,
-    interrupt_request_register_bits_160_to_191 = 0x825,
-    interrupt_request_register_bits_192_to_223 = 0x826,
-    interrupt_request_register_bits_224_to_255 = 0x827,
-
-    error_status_register = 0x828,
-
-    local_vector_table_corrected_machine_check_interrupt = 0x82f,
-    interrupt_command_register = 0x830,
-
-    local_vector_table_timer_register = 0x832,
-    local_vector_table_thermal_sensor_register = 0x833,
-    local_vector_table_performance_monitor_register = 0x834,
-    local_vector_table_lint0_register = 0x835,
-    local_vector_table_lint1_register = 0x836,
-    local_vector_table_error_register = 0x837,
-
-    timer_initial_count_register = 0x838,
-    timer_current_count_register = 0x839,
-    timer_divide_configuration_register = 0x83e,
-
-    self_interrupt_register = 0x83f,
-};
 
 pub const Register = enum(u32) {
     lapic_id_reg = 0x20,
@@ -116,23 +120,60 @@ pub const Register = enum(u32) {
     div_config_reg = 0x3E0,
 };
 
-pub const LapicID = packed struct(u32) {
-    _res0: u24 = 0,
-    apic_id: u8,
-};
+pub const X2ApicMsr = enum(u32) {
+    local_apic_id_register = 0x802,
+    local_apic_version_register = 0x803,
 
-pub const LapicVersion = packed struct(u32) {
-    version: u8,
-    _res0: u8 = 0,
-    max_lvt_entry: u8,
-    eoi_broadcast_suppression_support: bool,
-    _res1: u7 = 0,
-};
+    task_priority_register = 0x808,
+    processor_priority_register = 0x80a,
+    end_of_interrupt_register = 0x80b,
+    logical_destination_register = 0x80d,
+    spurious_interrupt_vector_register = 0x80f,
 
-pub const TaskPrio = packed struct(u32) {
-    subclass: u4,
-    class: u4,
-    _res: u24 = 0,
+    in_service_register_bits_0_to_31 = 0x810,
+    in_service_register_bits_32_to_63 = 0x811,
+    in_service_register_bits_64_to_95 = 0x812,
+    in_service_register_bits_96_to_127 = 0x813,
+    in_service_register_bits_128_to_159 = 0x814,
+    in_service_register_bits_160_to_191 = 0x815,
+    in_service_register_bits_192_to_223 = 0x816,
+    in_service_register_bits_224_to_255 = 0x817,
+
+    trigger_mode_register_bits_0_to_31 = 0x818,
+    trigger_mode_register_bits_32_to_63 = 0x819,
+    trigger_mode_register_bits_64_to_95 = 0x81a,
+    trigger_mode_register_bits_96_to_127 = 0x81b,
+    trigger_mode_register_bits_128_to_159 = 0x81c,
+    trigger_mode_register_bits_160_to_191 = 0x81d,
+    trigger_mode_register_bits_192_to_223 = 0x81e,
+    trigger_mode_register_bits_224_to_255 = 0x81f,
+
+    interrupt_request_register_bits_0_to_31 = 0x820,
+    interrupt_request_register_bits_32_to_63 = 0x821,
+    interrupt_request_register_bits_64_to_95 = 0x822,
+    interrupt_request_register_bits_96_to_127 = 0x823,
+    interrupt_request_register_bits_128_to_159 = 0x824,
+    interrupt_request_register_bits_160_to_191 = 0x825,
+    interrupt_request_register_bits_192_to_223 = 0x826,
+    interrupt_request_register_bits_224_to_255 = 0x827,
+
+    error_status_register = 0x828,
+
+    local_vector_table_corrected_machine_check_interrupt = 0x82f,
+    interrupt_command_register = 0x830,
+
+    local_vector_table_timer_register = 0x832,
+    local_vector_table_thermal_sensor_register = 0x833,
+    local_vector_table_performance_monitor_register = 0x834,
+    local_vector_table_lint0_register = 0x835,
+    local_vector_table_lint1_register = 0x836,
+    local_vector_table_error_register = 0x837,
+
+    timer_initial_count_register = 0x838,
+    timer_current_count_register = 0x839,
+    timer_divide_configuration_register = 0x83e,
+
+    self_interrupt_register = 0x83f,
 };
 
 pub const ArbitrationPrio = packed struct(u32) {
@@ -141,34 +182,24 @@ pub const ArbitrationPrio = packed struct(u32) {
     _res: u24 = 0,
 };
 
-pub const ProcessorPrio = packed struct(u32) {
-    subclass: u4,
-    class: u4,
-    _res: u24 = 0,
-};
-
-pub const EOI = packed struct(u32) { eoi: u32 };
-
-pub const RemoteRead = packed struct(u32) { val: u32 };
-
-pub const LogicalDest = packed struct(u32) {
-    _res: u24 = 0,
-    logical_apic_id: u8,
-};
+pub const CurrCount = packed struct(u32) { val: u32 };
 
 pub const DestFmt = packed struct(u32) {
     _res: u28 = 0x0FFFFFFF,
     model: u4,
 };
 
-pub const SpuriousIntVec = packed struct(u32) {
-    spurious_vector: u8,
-    apic_enable: bool,
-    focus_check_disable: bool,
-    _res0: u2 = 0,
-    eoi_bcast_supp: bool,
-    _res1: u19 = 0,
+pub const DivConfig = packed struct(u32) {
+    div0: u1,
+    div1: u1,
+    _res0: u1 = 0,
+    div3: u1,
+    _res1: u28 = 0,
 };
+
+pub const EOI = packed struct(u32) { eoi: u32 };
+
+pub const ErrStatus = packed struct(u32) { err: u32 };
 
 pub const InService0 = packed struct(u32) { bits: u32 };
 pub const InService1 = packed struct(u32) { bits: u32 };
@@ -179,35 +210,7 @@ pub const InService5 = packed struct(u32) { bits: u32 };
 pub const InService6 = packed struct(u32) { bits: u32 };
 pub const InService7 = packed struct(u32) { bits: u32 };
 
-pub const TriggerMode0 = packed struct(u32) { bits: u32 };
-pub const TriggerMode1 = packed struct(u32) { bits: u32 };
-pub const TriggerMode2 = packed struct(u32) { bits: u32 };
-pub const TriggerMode3 = packed struct(u32) { bits: u32 };
-pub const TriggerMode4 = packed struct(u32) { bits: u32 };
-pub const TriggerMode5 = packed struct(u32) { bits: u32 };
-pub const TriggerMode6 = packed struct(u32) { bits: u32 };
-pub const TriggerMode7 = packed struct(u32) { bits: u32 };
-
-pub const IntRequest0 = packed struct(u32) { bits: u32 };
-pub const IntRequest1 = packed struct(u32) { bits: u32 };
-pub const IntRequest2 = packed struct(u32) { bits: u32 };
-pub const IntRequest3 = packed struct(u32) { bits: u32 };
-pub const IntRequest4 = packed struct(u32) { bits: u32 };
-pub const IntRequest5 = packed struct(u32) { bits: u32 };
-pub const IntRequest6 = packed struct(u32) { bits: u32 };
-pub const IntRequest7 = packed struct(u32) { bits: u32 };
-
-pub const ErrStatus = packed struct(u32) { err: u32 };
-
-pub const LvtCorrectedMachineCheckInt = packed struct(u32) {
-    vector: u8,
-    delivery_mode: u3,
-    _res0: u1 = 0,
-    delivery_status: bool,
-    _res1: u3 = 0,
-    mask: bool,
-    _res2: u15 = 0,
-};
+pub const InitCount = packed struct(u32) { val: u32 };
 
 pub const IntCmdLow = packed struct(u32) {
     vector: u8,
@@ -228,17 +231,34 @@ pub const IntCmdHigh = packed struct(u32) {
     destination: u8,
 };
 
-pub const LvtTimer = packed struct(u32) {
-    vector: u8,
-    _res0: u4 = 0,
-    delivery_status: bool,
-    _res1: u3 = 0,
-    mask: bool,
-    timer_mode: u2,
-    _res2: u13 = 0,
+pub const IntRequest0 = packed struct(u32) { bits: u32 };
+pub const IntRequest1 = packed struct(u32) { bits: u32 };
+pub const IntRequest2 = packed struct(u32) { bits: u32 };
+pub const IntRequest3 = packed struct(u32) { bits: u32 };
+pub const IntRequest4 = packed struct(u32) { bits: u32 };
+pub const IntRequest5 = packed struct(u32) { bits: u32 };
+pub const IntRequest6 = packed struct(u32) { bits: u32 };
+pub const IntRequest7 = packed struct(u32) { bits: u32 };
+
+pub const LapicID = packed struct(u32) {
+    _res0: u24 = 0,
+    apic_id: u8,
 };
 
-pub const LvtThermalSensor = packed struct(u32) {
+pub const LapicVersion = packed struct(u32) {
+    version: u8,
+    _res0: u8 = 0,
+    max_lvt_entry: u8,
+    eoi_broadcast_suppression_support: bool,
+    _res1: u7 = 0,
+};
+
+pub const LogicalDest = packed struct(u32) {
+    _res: u24 = 0,
+    logical_apic_id: u8,
+};
+
+pub const LvtCorrectedMachineCheckInt = packed struct(u32) {
     vector: u8,
     delivery_mode: u3,
     _res0: u1 = 0,
@@ -248,14 +268,14 @@ pub const LvtThermalSensor = packed struct(u32) {
     _res2: u15 = 0,
 };
 
-pub const LvtPerfMonitoringCounters = packed struct(u32) {
+pub const LvtErr = packed struct(u32) {
     vector: u8,
-    delivery_mode: u3,
-    _res0: u1 = 0,
+    _res0: u3 = 0,
+    _res1: u1 = 0,
     delivery_status: bool,
-    _res1: u3 = 0,
+    _res2: u3 = 0,
     mask: bool,
-    _res2: u15 = 0,
+    _res3: u15 = 0,
 };
 
 pub const LvtLint0 = packed struct(u32) {
@@ -282,40 +302,79 @@ pub const LvtLint1 = packed struct(u32) {
     _res1: u15 = 0,
 };
 
-pub const LvtErr = packed struct(u32) {
+pub const LvtPerfMonitoringCounters = packed struct(u32) {
     vector: u8,
-    _res0: u3 = 0,
-    _res1: u1 = 0,
-    delivery_status: bool,
-    _res2: u3 = 0,
-    mask: bool,
-    _res3: u15 = 0,
-};
-
-pub const InitCount = packed struct(u32) { val: u32 };
-pub const CurrCount = packed struct(u32) { val: u32 };
-
-pub const DivConfig = packed struct(u32) {
-    div0: u1,
-    div1: u1,
+    delivery_mode: u3,
     _res0: u1 = 0,
-    div3: u1,
-    _res1: u28 = 0,
+    delivery_status: bool,
+    _res1: u3 = 0,
+    mask: bool,
+    _res2: u15 = 0,
 };
+
+pub const LvtThermalSensor = packed struct(u32) {
+    vector: u8,
+    delivery_mode: u3,
+    _res0: u1 = 0,
+    delivery_status: bool,
+    _res1: u3 = 0,
+    mask: bool,
+    _res2: u15 = 0,
+};
+
+pub const LvtTimer = packed struct(u32) {
+    vector: u8,
+    _res0: u4 = 0,
+    delivery_status: bool,
+    _res1: u3 = 0,
+    mask: bool,
+    timer_mode: u2,
+    _res2: u13 = 0,
+};
+
+pub const ProcessorPrio = packed struct(u32) {
+    subclass: u4,
+    class: u4,
+    _res: u24 = 0,
+};
+
+pub const RemoteRead = packed struct(u32) { val: u32 };
+
+pub const SpuriousIntVec = packed struct(u32) {
+    spurious_vector: u8,
+    apic_enable: bool,
+    focus_check_disable: bool,
+    _res0: u2 = 0,
+    eoi_bcast_supp: bool,
+    _res1: u19 = 0,
+};
+
+pub const TaskPrio = packed struct(u32) {
+    subclass: u4,
+    class: u4,
+    _res: u24 = 0,
+};
+
+pub const TriggerMode0 = packed struct(u32) { bits: u32 };
+pub const TriggerMode1 = packed struct(u32) { bits: u32 };
+pub const TriggerMode2 = packed struct(u32) { bits: u32 };
+pub const TriggerMode3 = packed struct(u32) { bits: u32 };
+pub const TriggerMode4 = packed struct(u32) { bits: u32 };
+pub const TriggerMode5 = packed struct(u32) { bits: u32 };
+pub const TriggerMode6 = packed struct(u32) { bits: u32 };
+pub const TriggerMode7 = packed struct(u32) { bits: u32 };
+
+pub const LVT_MASK_BIT: u6 = 16;
+pub const LVT_MODE_SHIFT: u6 = 17;
+pub const LVT_MODE_ONE_SHOT: u2 = 0;
 
 pub const tsc_deadline_msr: u32 = 0x6e0;
 
-pub var lapic_id: *volatile LapicID = undefined;
-pub var lapic_version: *const volatile LapicVersion = undefined;
-pub var task_prio: *volatile TaskPrio = undefined;
-pub var arbitration_prio: *const volatile ArbitrationPrio = undefined;
-pub var processor_prio: *const volatile ProcessorPrio = undefined;
-pub var eoi: *volatile EOI = undefined;
-pub var remote_read: *const volatile RemoteRead = undefined;
-pub var logical_dest: *volatile LogicalDest = undefined;
+pub var curr_count: *const volatile CurrCount = undefined;
 pub var dest_fmt: *volatile DestFmt = undefined;
-pub var spurious_int_vec: *volatile SpuriousIntVec = undefined;
-
+pub var div_config: *volatile DivConfig = undefined;
+pub var eoi: *volatile EOI = undefined;
+pub var err_status: *volatile ErrStatus = undefined;
 pub var in_service_0: *const volatile InService0 = undefined;
 pub var in_service_1: *const volatile InService1 = undefined;
 pub var in_service_2: *const volatile InService2 = undefined;
@@ -324,16 +383,9 @@ pub var in_service_4: *const volatile InService4 = undefined;
 pub var in_service_5: *const volatile InService5 = undefined;
 pub var in_service_6: *const volatile InService6 = undefined;
 pub var in_service_7: *const volatile InService7 = undefined;
-
-pub var trigger_mode_0: *const volatile TriggerMode0 = undefined;
-pub var trigger_mode_1: *const volatile TriggerMode1 = undefined;
-pub var trigger_mode_2: *const volatile TriggerMode2 = undefined;
-pub var trigger_mode_3: *const volatile TriggerMode3 = undefined;
-pub var trigger_mode_4: *const volatile TriggerMode4 = undefined;
-pub var trigger_mode_5: *const volatile TriggerMode5 = undefined;
-pub var trigger_mode_6: *const volatile TriggerMode6 = undefined;
-pub var trigger_mode_7: *const volatile TriggerMode7 = undefined;
-
+pub var init_count: *volatile InitCount = undefined;
+pub var int_cmd_high: *volatile IntCmdHigh = undefined;
+pub var int_cmd_low: *volatile IntCmdLow = undefined;
 pub var int_request_0: *const volatile IntRequest0 = undefined;
 pub var int_request_1: *const volatile IntRequest1 = undefined;
 pub var int_request_2: *const volatile IntRequest2 = undefined;
@@ -342,42 +394,100 @@ pub var int_request_4: *const volatile IntRequest4 = undefined;
 pub var int_request_5: *const volatile IntRequest5 = undefined;
 pub var int_request_6: *const volatile IntRequest6 = undefined;
 pub var int_request_7: *const volatile IntRequest7 = undefined;
-
-pub var err_status: *volatile ErrStatus = undefined;
-
+pub var lapic_id: *volatile LapicID = undefined;
+pub var lapic_version: *const volatile LapicVersion = undefined;
+pub var logical_dest: *volatile LogicalDest = undefined;
 pub var lvt_corrected_machine_check_int: *volatile LvtCorrectedMachineCheckInt = undefined;
-pub var int_cmd_low: *volatile IntCmdLow = undefined;
-pub var int_cmd_high: *volatile IntCmdHigh = undefined;
-pub var lvt_timer: *volatile LvtTimer = undefined;
-pub var lvt_thermal_sensor: *volatile LvtThermalSensor = undefined;
-pub var lvt_perf_monitoring_counters: *volatile LvtPerfMonitoringCounters = undefined;
+pub var lvt_err: *volatile LvtErr = undefined;
 pub var lvt_lint0: *volatile LvtLint0 = undefined;
 pub var lvt_lint1: *volatile LvtLint1 = undefined;
-pub var lvt_err: *volatile LvtErr = undefined;
-
-pub var init_count: *volatile InitCount = undefined;
-pub var curr_count: *const volatile CurrCount = undefined;
-pub var div_config: *volatile DivConfig = undefined;
-
+pub var lvt_perf_monitoring_counters: *volatile LvtPerfMonitoringCounters = undefined;
+pub var lvt_thermal_sensor: *volatile LvtThermalSensor = undefined;
+pub var lvt_timer: *volatile LvtTimer = undefined;
+pub var processor_prio: *const volatile ProcessorPrio = undefined;
+pub var task_prio: *volatile TaskPrio = undefined;
+pub var arbitration_prio: *const volatile ArbitrationPrio = undefined;
+pub var remote_read: *const volatile RemoteRead = undefined;
+pub var spurious_int_vec: *volatile SpuriousIntVec = undefined;
+pub var trigger_mode_0: *const volatile TriggerMode0 = undefined;
+pub var trigger_mode_1: *const volatile TriggerMode1 = undefined;
+pub var trigger_mode_2: *const volatile TriggerMode2 = undefined;
+pub var trigger_mode_3: *const volatile TriggerMode3 = undefined;
+pub var trigger_mode_4: *const volatile TriggerMode4 = undefined;
+pub var trigger_mode_5: *const volatile TriggerMode5 = undefined;
+pub var trigger_mode_6: *const volatile TriggerMode6 = undefined;
+pub var trigger_mode_7: *const volatile TriggerMode7 = undefined;
 pub var x2Apic: bool = false;
 
-pub const LVT_MASK_BIT: u6 = 16;
-pub const LVT_MODE_SHIFT: u6 = 17;
-pub const LVT_MODE_ONE_SHOT: u2 = 0;
-
+/// Summary:
+/// Writes a deadline TSC to IA32_TSC_DEADLINE.
+///
+/// Arguments:
+/// - `deadline_tsc`: absolute TSC value at which to raise the interrupt
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn armTscDeadline(deadline_tsc: u64) void {
     cpu.wrmsr(tsc_deadline_msr, deadline_tsc);
 }
 
+/// Summary:
+/// Cancels any pending TSC-deadline by writing zero.
+///
+/// Arguments:
+/// - None.
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn cancelTscDeadline() void {
     cpu.wrmsr(tsc_deadline_msr, 0);
 }
 
+/// Summary:
+/// Masks both legacy 8259 PICs to avoid spurious IRQs.
+///
+/// Arguments:
+/// - None.
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn disablePic() void {
     cpu.outb(0xFF, 0x21);
     cpu.outb(0xFF, 0xA1);
 }
 
+/// Summary:
+/// Acknowledges end of interrupt via x2APIC MSR or MMIO EOI.
+///
+/// Arguments:
+/// - None.
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn endOfInterrupt() void {
     if (x2Apic) {
         cpu.wrmsr(@intFromEnum(X2ApicMsr.end_of_interrupt_register), 0);
@@ -386,6 +496,23 @@ pub fn endOfInterrupt() void {
     }
 }
 
+/// Summary:
+/// Enables LAPIC timer in TSC-deadline mode if supported and selects vector.
+///
+/// Arguments:
+/// - `vector`: interrupt vector number to program into the LVT timer
+///
+/// Returns:
+/// - `true` if deadline mode is available and programmed; `false` otherwise.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+///
+/// Notes:
+/// Checks CPUID for `tsc_deadline` and `constant_tsc` support.
 pub fn programLocalApicTimerTscDeadline(vector: u8) bool {
     const feat = cpu.cpuid(.basic_features, 0);
     if (!cpu.hasFeatureEcx(feat.ecx, .tsc_deadline)) return false;
@@ -406,6 +533,23 @@ pub fn programLocalApicTimerTscDeadline(vector: u8) bool {
     return true;
 }
 
+/// Summary:
+/// Initializes LAPIC/x2APIC mode and MMIO register pointers.
+///
+/// Arguments:
+/// - `lapic_base_virt`: virtual base address of the LAPIC MMIO window
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+///
+/// Notes:
+/// Attempts to enable x2APIC; if successful, MMIO pointers are unused.
 pub fn init(lapic_base_virt: VAddr) void {
     disablePic();
 
@@ -469,6 +613,22 @@ pub fn init(lapic_base_virt: VAddr) void {
     div_config = @ptrFromInt(base_addr + @intFromEnum(Register.div_config_reg));
 }
 
+/// Summary:
+/// Programs the LAPIC timer divide value and mode, optionally masking it.
+///
+/// Arguments:
+/// - `div_code`: hardware divide code (encoded bits 0,1,3)
+/// - `vector`: interrupt vector for the LVT timer
+/// - `masked`: whether to set the LVT mask bit
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn initLapicTimer(div_code: u32, vector: u8, masked: bool) void {
     if (x2Apic) {
         const m: u64 =
@@ -493,6 +653,21 @@ pub fn initLapicTimer(div_code: u32, vector: u8, masked: bool) void {
     }
 }
 
+/// Summary:
+/// Arms a one-shot LAPIC timer with the given initial count.
+///
+/// Arguments:
+/// - `ticks`: initial counter value to load
+/// - `vector`: interrupt vector for the LVT timer
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 pub fn armLapicOneShot(ticks: u32, vector: u8) void {
     if (x2Apic) {
         const m: u64 = vector | (@as(u64, LVT_MODE_ONE_SHOT) << LVT_MODE_SHIFT);
