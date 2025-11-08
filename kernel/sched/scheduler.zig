@@ -86,25 +86,10 @@ pub const Process = struct {
 pub const Thread = struct {
     tid: u64,
     ctx: *cpu.Context,
-    state: State,
     ustack: ?[]u8,
     kstack: []u8,
     proc: *Process,
     next: ?*Thread = null,
-
-    pub const State = enum {
-        running,
-        waiting,
-        sleeping,
-        done,
-    };
-
-    fn push(sp: u64, val: u64) u64 {
-        const pushed = sp - @sizeOf(u64);
-        const ptr: *u64 = @ptrFromInt(pushed);
-        ptr.* = val;
-        return pushed;
-    }
 
     pub fn createThread(
         proc: *Process,
@@ -182,16 +167,15 @@ pub const Thread = struct {
 
         if (proc.cpl == .ring_3) {
             const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
+            const ustack_top = @intFromPtr(thread.ustack.?.ptr) + thread.ustack.?.len;
             int_frame_ptr.ss = gdt.USER_DATA_OFFSET | ring_3;
-            int_frame_ptr.rsp = @intFromPtr(thread.ustack.?.ptr) + thread.ustack.?.len;
+            int_frame_ptr.rsp = std.mem.alignBackward(u64, ustack_top, 16) - 8;
         } else {
             int_frame_ptr.ss = gdt.KERNEL_DATA_OFFSET;
             int_frame_ptr.rsp = ctx_start;
         }
 
         thread.ctx = int_frame_ptr;
-
-        thread.state = .waiting;
 
         thread.proc = proc;
 
@@ -202,11 +186,45 @@ pub const Thread = struct {
     }
 };
 
+// This should never be empty by scheduler usage invariants
+pub const RunQueue = struct {
+    sentinel: Thread,
+    head: *Thread,
+    tail: *Thread,
+
+    pub fn init(init_rq: *RunQueue) void {
+        init_rq.sentinel.next = null;
+        init_rq.head = &init_rq.sentinel;
+        init_rq.tail = &init_rq.sentinel;
+    }
+
+    pub fn enqueue(self: *RunQueue, thread: *Thread) void {
+        thread.next = null;
+        self.tail.next = thread;
+        self.tail = thread;
+    }
+
+    pub fn enqueueToFront(self: *RunQueue, thread: *Thread) void {
+        thread.next = self.head.next;
+        self.head.next = thread;
+        std.debug.assert(self.tail != self.head);
+    }
+
+    pub fn dequeue(self: *RunQueue) *Thread {
+        const first = self.head.next.?;
+        std.debug.assert(self.tail != first);
+        self.head.next = first.next;
+        first.next = null;
+        return first;
+    }
+};
+
 pub const SCHED_TIMESLICE_NS = 2_000_000;
 
 var pid_counter: u64 = 1;
 var tid_counter: u64 = 0;
 
+var rq: RunQueue = undefined;
 var timer: ?timers.Timer = null;
 var process_allocator: ?std.mem.Allocator = null;
 var thread_allocator: ?std.mem.Allocator = null;
@@ -233,18 +251,25 @@ pub fn init(t: timers.Timer, slab_backing_allocator: std.mem.Allocator) !void {
     var thread_alloc = try ThreadAllocator.init(slab_backing_allocator);
     thread_allocator = thread_alloc.allocator();
 
-    const thread = try Thread.createThread(&kproc, hltThreadEntry);
-    running_thread = thread;
+    rq.init();
+
+    const t1 = try Thread.createThread(&kproc, threadOne);
+    rq.enqueue(t1);
+    const t2 = try Thread.createThread(&kproc, threadTwo);
+    rq.enqueue(t2);
+
+    running_thread = &rq.sentinel;
 }
 
 pub fn schedTimerHandler(ctx: *cpu.Context) void {
-    _ = ctx;
-    armSchedTimer(SCHED_TIMESLICE_NS);
-
-    // NOTE: Uncomment once run queue is up
-    //running_thread.ctx = ctx;
-
-    // once run queue is a thing, advance run queue
+    const preempted = running_thread;
+    if (preempted == &rq.sentinel) {
+        rq.sentinel.ctx = ctx;
+    } else {
+        preempted.ctx = ctx;
+        rq.enqueue(preempted);
+    }
+    running_thread = rq.dequeue();
 
     const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
     const cpl = running_thread.ctx.cs & ring_3;
@@ -253,10 +278,11 @@ pub fn schedTimerHandler(ctx: *cpu.Context) void {
         // NOTE: swap pml4
     }
 
-    running_thread.state = .running;
     apic.endOfInterrupt();
+    armSchedTimer(SCHED_TIMESLICE_NS);
 
-    // NOTE: make this conditional on prev running thread and new running thread being different
+    if (running_thread == preempted) return;
+
     asm volatile (
         \\movq %[new_stack], %%rsp
         \\jmp commonInterruptStubEpilogue
@@ -265,7 +291,12 @@ pub fn schedTimerHandler(ctx: *cpu.Context) void {
     );
 }
 
-pub fn hltThreadEntry() void {
-    serial.print("Hello world!\n", .{});
+pub fn threadOne() void {
+    serial.print("Thread one!\n", .{});
+    cpu.halt();
+}
+
+pub fn threadTwo() void {
+    serial.print("Thread two!\n", .{});
     cpu.halt();
 }
