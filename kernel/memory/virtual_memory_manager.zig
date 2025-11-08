@@ -15,11 +15,11 @@
 //! - `MAX_RESERVATIONS` — maximum number of tracked reservations.
 //!
 //! ## Variables
-//! - `global_vmm` — optional global VMM for early subsystems/page faults.
+//! - None.
 //!
 //! ## Functions
 //! - `VirtualMemoryManager.init` — construct a VMM over a VA range.
-//! - `VirtualMemoryManager.isValidVaddr` — check if an address lies in any reservation.
+//! - `VirtualMemoryManager.isValidVAddr` — check if an address lies in any reservation.
 //! - `VirtualMemoryManager.reserve` — reserve `size` bytes at next aligned VA.
 
 const std = @import("std");
@@ -84,7 +84,7 @@ pub const VirtualMemoryManager = struct {
         };
     }
 
-    /// Function: `VirtualMemoryManager.isValidVaddr`
+    /// Function: `VirtualMemoryManager.isValidVAddr`
     ///
     /// Summary:
     /// Check whether `vaddr` lies within any recorded reservation.
@@ -101,7 +101,7 @@ pub const VirtualMemoryManager = struct {
     ///
     /// Panics:
     /// - None.
-    pub fn isValidVaddr(self: *VirtualMemoryManager, vaddr: VAddr) bool {
+    pub fn isValidVAddr(self: *VirtualMemoryManager, vaddr: VAddr) bool {
         var i: u32 = 0;
         while (i < self.vmm_allocations_idx) : (i += 1) {
             const base = self.vmm_allocations[i].vaddr;
@@ -157,6 +157,3 @@ pub const VirtualMemoryManager = struct {
 
 /// Maximum number of reservations tracked in the ledger.
 const MAX_RESERVATIONS = 16;
-
-/// Global VMM primarily used by the page-fault handler and early subsystems.
-pub var global_vmm: ?VirtualMemoryManager = null;

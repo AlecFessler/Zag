@@ -314,8 +314,8 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?usize)
 ///
 /// Panics:
 /// - None.
-fn logAddr(pc: u64) void {
-    if (zag.panic.g_symmap) |sm| {
+pub fn logAddr(pc: u64) void {
+    if (g_symmap) |sm| {
         if (sm.find(pc)) |hit| {
             const off = pc - hit.base;
             serial.print("{X}: {s}+0x{X}\n", .{ pc, hit.name, off });

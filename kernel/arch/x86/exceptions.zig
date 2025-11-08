@@ -1,9 +1,10 @@
 //! CPU exception ISRs, syscall vector, and page-fault handling.
 //!
 //! Installs CPU exception gates (0..31), exposes a syscall vector (0x80),
-//! registers a couple of default handlers, and routes all entries through the
-//! common naked stub. Includes a minimal kernel page-fault handler that
-//! demand-maps a fresh page for valid kernel VAddrs.
+//! registers default handlers, and routes all entries through the common naked
+//! stub. Includes a kernel/userspace page-fault handler that demand-maps a
+//! fresh 4 KiB page for valid virtual addresses (kernel or user) on non-present
+//! faults; present faults are treated as protection errors and panic.
 //!
 //! # Directory
 //!
@@ -19,9 +20,11 @@
 //!
 //! ## Functions
 //! - `init` – install exception gates and register default handlers + syscall gate.
-//! - `divByZeroHandler` – kernel/userspace divide-by-zero handler (private).
-//! - `pageFaultHandler` – kernel page-fault demand-mapper (private).
-//! - `PFErrCode.from` – decode a raw page-fault error code into fields.
+//! - `breakpointHandler` – #BP handler (returns in kernelspace; panics in userspace).
+//! - `debugHandler` – #DB handler (returns in kernelspace; panics in userspace).
+//! - `divByZeroHandler` – #DE handler (panics; message varies by CPL).
+//! - `doubleFaultHandler` – #DF handler (panics; message varies by CPL).
+//! - `pageFaultHandler` – #PF handler; demand-maps non-present pages, panics on protection faults.
 
 const cpu = @import("cpu.zig");
 const idt = @import("idt.zig");
@@ -33,9 +36,8 @@ const zag = @import("zag");
 
 const memory = zag.memory;
 const pmm_mod = memory.PhysicalMemoryManager;
-const vmm_mod = memory.VirtualMemoryManager;
+const sched = zag.sched.scheduler;
 
-/// Architectural exception vectors (subset shown explicitly).
 pub const Exception = enum(u5) {
     divide_by_zero = 0,
     single_step_debug = 1,
@@ -60,7 +62,6 @@ pub const Exception = enum(u5) {
     security = 30,
 };
 
-/// Parsed x86-64 page-fault error code with convenience flags.
 const PFErrCode = struct {
     present: bool, // bit 0
     is_write: bool, // bit 1
@@ -102,9 +103,7 @@ const PFErrCode = struct {
 const PAddr = paging.PAddr;
 const PhysicalMemoryManager = pmm_mod.PhysicalMemoryManager;
 const VAddr = paging.VAddr;
-const VirtualMemoryManager = vmm_mod.VirtualMemoryManager;
 
-/// Number of exception gates (0..31) to install.
 pub const NUM_ISR_ENTRIES = 32;
 
 /// Summary:
@@ -115,7 +114,7 @@ pub const NUM_ISR_ENTRIES = 32;
 /// - None.
 ///
 /// Returns:
-/// - `void`.
+/// - None.
 ///
 /// Errors:
 /// - None.
@@ -143,7 +142,18 @@ pub fn init() void {
         @intFromEnum(Exception.divide_by_zero),
         divByZeroHandler,
     );
-
+    interrupts.registerException(
+        @intFromEnum(Exception.single_step_debug),
+        debugHandler,
+    );
+    interrupts.registerException(
+        @intFromEnum(Exception.breakpoint_debug),
+        breakpointHandler,
+    );
+    interrupts.registerException(
+        @intFromEnum(Exception.double_fault),
+        doubleFaultHandler,
+    );
     interrupts.registerException(
         @intFromEnum(Exception.page_fault),
         pageFaultHandler,
@@ -162,21 +172,69 @@ pub fn init() void {
 }
 
 /// Summary:
-/// Default divide-by-zero handler that distinguishes kernel vs. user faults
-/// and panics with an appropriate message.
+/// #BP breakpoint handler. Dumps the frame, returns in kernelspace, panics in userspace.
 ///
 /// Arguments:
 /// - `ctx`: Interrupt context captured by the common stub.
 ///
 /// Returns:
-/// - `void`.
+/// - None.
 ///
 /// Errors:
 /// - None.
 ///
 /// Panics:
-/// - Always panics on divide-by-zero, message varies by CPL.
+/// - Panics when invoked from userspace.
+fn breakpointHandler(ctx: *cpu.Context) void {
+    interrupts.dumpInterruptFrame(ctx);
+    const cpl: u64 = ctx.cs & 3;
+    if (cpl == 0) {
+        return;
+    } else {
+        @panic("Divide by zero in userspace!");
+    }
+}
+
+/// Summary:
+/// #DB single-step/trace handler. Dumps the frame, returns in kernelspace, panics in userspace.
+///
+/// Arguments:
+/// - `ctx`: Interrupt context captured by the common stub.
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - Panics when invoked from userspace.
+fn debugHandler(ctx: *cpu.Context) void {
+    interrupts.dumpInterruptFrame(ctx);
+    const cpl: u64 = ctx.cs & 3;
+    if (cpl == 0) {
+        return;
+    } else {
+        @panic("Divide by zero in userspace!");
+    }
+}
+
+/// Summary:
+/// #DE divide-by-zero handler. Dumps the frame and panics; message varies by CPL.
+///
+/// Arguments:
+/// - `ctx`: Interrupt context captured by the common stub.
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - Always panics on divide-by-zero.
 fn divByZeroHandler(ctx: *cpu.Context) void {
+    interrupts.dumpInterruptFrame(ctx);
     const cpl: u64 = ctx.cs & 3;
     if (cpl == 0) {
         @panic("Divide by zero in kernelspace!");
@@ -186,31 +244,58 @@ fn divByZeroHandler(ctx: *cpu.Context) void {
 }
 
 /// Summary:
-/// Kernel page-fault handler that demand-maps a 4 KiB page for valid kernel
-/// VAddrs and rejects invalid or premature faults. Userspace faults are not
-/// implemented.
+/// #DF double-fault handler. Dumps the frame and panics; message varies by CPL.
 ///
 /// Arguments:
 /// - `ctx`: Interrupt context captured by the common stub.
 ///
 /// Returns:
-/// - `void`.
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - Always panics on double fault.
+fn doubleFaultHandler(ctx: *cpu.Context) void {
+    interrupts.dumpInterruptFrame(ctx);
+    const cpl: u64 = ctx.cs & 3;
+    if (cpl == 0) {
+        @panic("Double fault in kernelspace!");
+    } else {
+        @panic("Double fault in userspace!");
+    }
+}
+
+/// Summary:
+/// Kernel page-fault handler that demand-maps a 4 KiB page on non-present faults
+/// for addresses valid in either the kernel or the current process address space.
+/// Present faults are treated as protection errors and panic.
+///
+/// Arguments:
+/// - `ctx`: Interrupt context captured by the common stub.
+///
+/// Returns:
+/// - None.
 ///
 /// Errors:
 /// - None.
 ///
 /// Panics:
 /// - Panics on RSVD violations, PMM/VMM uninitialized, execute faults in kernel,
-///   invalid kernel addresses, PMM OOM, or any userspace page fault.
+///   protection faults, invalid address (neither kspace nor current uspace), or
+///   userspace invalid-access conditions.
 fn pageFaultHandler(ctx: *cpu.Context) void {
     const pf_err = PFErrCode.from(ctx.err_code);
-
-    if (pf_err.rsvd_violation) @panic("Page tables have reserved bits set (RSVD).");
+    if (pf_err.rsvd_violation) {
+        @panic("Page tables have reserved bits set (RSVD).");
+    }
     if (pmm_mod.global_pmm == null) {
         @panic("Page fault prior to pmm initialization!");
     }
 
-    const code_privilege_level: u64 = ctx.cs & 3;
+    const pmm_iface = pmm_mod.global_pmm.?.allocator();
+
     const faulting_virt = cpu.read_cr2();
     const faulting_page_virt = VAddr.fromInt(std.mem.alignBackward(
         u64,
@@ -218,49 +303,60 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         @intFromEnum(paging.PageSize.Page4K),
     ));
 
-    serial.print("Faulting Instruction: {X}\nFaulting Address: {X}\nFaulting Page: {X}\nPresent: {}\nIs Write: {}\n", .{
-        ctx.rip,
-        faulting_virt.addr,
-        faulting_page_virt.addr,
-        pf_err.present,
-        pf_err.is_write,
-    });
+    const ring_0 = @intFromEnum(idt.PrivilegeLevel.ring_0);
+    const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
+    const cpl: u64 = ctx.cs & ring_3;
 
-    if (code_privilege_level == 0) {
-        if (pf_err.instr_fetch) @panic("Execute fault (NX) at kernel address.");
-        if (pf_err.present) {
-            @panic("Invalid memory access in kernelspace!");
+    if (pf_err.present) {
+        serial.print("Faulting Instruction: {X}\nFaulting Address: {X}\nFaulting Page: {X}\nPresent: {}\nIs Write: {}\nIs fetch: {}\n", .{
+            ctx.rip,
+            faulting_virt.addr,
+            faulting_page_virt.addr,
+            pf_err.present,
+            pf_err.is_write,
+            pf_err.instr_fetch,
+        });
+        paging.dumpPageWalk(faulting_page_virt);
+        if (cpl == ring_0) {
+            @panic("Kernel page fault: invalid access");
+        } else {
+            @panic("User page fault: invalid access (process killing not implemented yet)");
         }
-        if (vmm_mod.global_vmm == null) {
-            @panic("Page fault prior to vmm initialization");
-        }
-        if (!vmm_mod.global_vmm.?.isValidVaddr(faulting_page_virt)) {
-            @panic("Invalid faulting address in kernel");
-        }
-
-        const pmm_iface = pmm_mod.global_pmm.?.allocator();
-        const page = pmm_iface.alloc(paging.PageMem(.Page4K), 1) catch @panic("PMM OOM!");
-        const phys_page_virt = VAddr.fromInt(@intFromPtr(page.ptr));
-        const phys_page_phys = PAddr.fromVAddr(phys_page_virt, .physmap);
-
-        const pml4_phys = PAddr.fromInt(paging.read_cr3().addr & ~@as(u64, 0xfff));
-        const pml4_virt = VAddr.fromPAddr(pml4_phys, .physmap);
-
-        paging.mapPage(
-            @ptrFromInt(pml4_virt.addr),
-            phys_page_phys,
-            faulting_page_virt,
-            .rw,
-            .nx,
-            .cache,
-            .su,
-            .Page4K,
-            .physmap,
-            pmm_iface,
-        );
-
-        cpu.invlpg(faulting_page_virt);
-    } else {
-        @panic("Userspace page fault handler not implemented!");
     }
+
+    const page = pmm_iface.create(paging.PageMem(.Page4K)) catch @panic("PMM OOM!");
+    const phys_page_virt = VAddr.fromInt(@intFromPtr(page));
+    const phys_page_phys = PAddr.fromVAddr(phys_page_virt, .physmap);
+
+    const pml4_virt = paging.currentPml4VAddr();
+
+    const in_kspace = sched.kproc.vmm.isValidVAddr(faulting_virt);
+    const in_uspace = blk: {
+        if (sched.running_thread) |rt| {
+            break :blk rt.proc.vmm.isValidVAddr(faulting_virt);
+        } else break :blk false;
+    };
+    const permissions: paging.User = blk: {
+        if (in_kspace) {
+            break :blk .su;
+        } else if (in_uspace) {
+            break :blk .u;
+        } else {
+            @panic("Non-present page in neither kernel or user address space!");
+        }
+    };
+
+    paging.mapPage(
+        @ptrFromInt(pml4_virt.addr),
+        phys_page_phys,
+        faulting_page_virt,
+        .rw,
+        .nx,
+        .cache,
+        permissions,
+        .Page4K,
+        .physmap,
+        pmm_iface,
+    );
+    cpu.invlpg(faulting_page_virt);
 }

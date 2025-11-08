@@ -27,38 +27,36 @@
 //! - `registerExternalLapic` – register handler for an external LAPIC vector.
 //! - `registerSoftware` – register handler for a software vector.
 //! - `registerVector` – internal helper to populate `vector_table`.
-//! - `commonInterruptStub` – naked common ISR trampoline (exported).
+//! - `commonInterruptStubPrologue` – naked common ISR prologue (exported).
+//! - `commonInterruptStubEpilogue` – naked common ISR epilogue (exported).
+//! - `dumpInterruptFrame` – pretty-print a saved interrupt frame.
 //! - `dispatchInterrupt` – looks up handler, invokes it, and issues EOI if needed.
 
 const apic = @import("apic.zig");
 const cpu = @import("cpu.zig");
 const idt = @import("idt.zig");
+const serial = @import("serial.zig");
 const std = @import("std");
 
-/// Acknowledge policy for a handled vector (e.g., LAPIC EOI required).
 pub const VectorAck = enum {
     none,
     lapic,
 };
 
-/// Classification of an interrupt vector's origin.
 pub const VectorKind = enum {
     exception,
     external,
     software,
 };
 
-/// Registry entry describing a vector's handler and metadata.
 const VectorEntry = struct {
     handler: ?Handler = null,
     kind: VectorKind = .external,
     ack: VectorAck = .none,
 };
 
-/// Function pointer type for interrupt handlers.
 const Handler = *const fn (*cpu.Context) void;
 
-/// Prebuilt interrupt stubs (0..255) for installing into the IDT.
 pub const STUBS: [256]idt.interruptHandler = blk: {
     var arr: [256]idt.interruptHandler = undefined;
     for (0..256) |i| {
@@ -67,7 +65,6 @@ pub const STUBS: [256]idt.interruptHandler = blk: {
     break :blk arr;
 };
 
-/// Map of which vectors push an error code per the architecture.
 const PUSHES_ERR = blk: {
     var a: [256]bool = .{false} ** 256;
     a[8] = true;
@@ -82,20 +79,19 @@ const PUSHES_ERR = blk: {
     break :blk a;
 };
 
-/// Global registry of vector handlers and their metadata.
 var vector_table: [256]VectorEntry = .{VectorEntry{}} ** 256;
 
 /// Summary:
 /// Returns a naked ISR stub for `int_num` that pushes the vector number and,
 /// if `pushes_err` is true, preserves the architecture-pushed error slot
-/// before tail-jumping to `commonInterruptStub`.
+/// before tail-jumping to `commonInterruptStubPrologue`.
 ///
-/// Args:
-/// - int_num: Compile-time vector number (0–255).
-/// - pushes_err: Compile-time flag indicating whether the CPU pushes an error code.
+/// Arguments:
+/// - `int_num`: compile-time vector number (0–255).
+/// - `pushes_err`: compile-time flag indicating whether the CPU pushes an error code.
 ///
 /// Returns:
-/// - idt.interruptHandler: The generated naked stub function to place in the IDT.
+/// - `idt.interruptHandler` stub function to place in the IDT.
 ///
 /// Errors:
 /// - None.
@@ -108,7 +104,7 @@ pub fn getInterruptStub(comptime int_num: u8, comptime pushes_err: bool) idt.int
             if (pushes_err) {
                 asm volatile (
                     \\pushq %[num]
-                    \\jmp commonInterruptStub
+                    \\jmp commonInterruptStubPrologue
                     :
                     : [num] "i" (@as(u64, int_num)),
                 );
@@ -116,7 +112,7 @@ pub fn getInterruptStub(comptime int_num: u8, comptime pushes_err: bool) idt.int
                 asm volatile (
                     \\pushq $0
                     \\pushq %[num]
-                    \\jmp commonInterruptStub
+                    \\jmp commonInterruptStubPrologue
                     :
                     : [num] "i" (@as(u64, int_num)),
                 );
@@ -129,12 +125,12 @@ pub fn getInterruptStub(comptime int_num: u8, comptime pushes_err: bool) idt.int
 /// Registers a handler for an exception vector in the dispatch table.
 /// No acknowledgement is issued after the handler returns.
 ///
-/// Args:
-/// - vector: Exception vector number (0–31 typically).
-/// - handler: Function pointer taking `*cpu.Context`.
+/// Arguments:
+/// - `vector`: exception vector number (0–31 typically).
+/// - `handler`: function pointer taking `*cpu.Context`.
 ///
 /// Returns:
-/// - void.
+/// - None.
 ///
 /// Errors:
 /// - None.
@@ -149,12 +145,12 @@ pub fn registerException(vector: u8, handler: Handler) void {
 /// Registers a handler for an external LAPIC-delivered interrupt and configures
 /// the dispatcher to issue LAPIC EOI after the handler returns.
 ///
-/// Args:
-/// - vector: External interrupt vector number (typically 32+).
-/// - handler: Function pointer taking `*cpu.Context`.
+/// Arguments:
+/// - `vector`: external interrupt vector number (typically 32+).
+/// - `handler`: function pointer taking `*cpu.Context`.
 ///
 /// Returns:
-/// - void.
+/// - None.
 ///
 /// Errors:
 /// - None.
@@ -168,12 +164,12 @@ pub fn registerExternalLapic(vector: u8, handler: Handler) void {
 /// Summary:
 /// Registers a handler for a software-generated interrupt with no acknowledgement.
 ///
-/// Args:
-/// - vector: Software interrupt vector number.
-/// - handler: Function pointer taking `*cpu.Context`.
+/// Arguments:
+/// - `vector`: software interrupt vector number.
+/// - `handler`: function pointer taking `*cpu.Context`.
 ///
 /// Returns:
-/// - void.
+/// - None.
 ///
 /// Errors:
 /// - None.
@@ -188,14 +184,14 @@ pub fn registerSoftware(vector: u8, handler: Handler) void {
 /// Internal helper that writes a new `VectorEntry` into `vector_table`.
 /// Ensures a vector is registered at most once.
 ///
-/// Args:
-/// - vector: Vector number to register.
-/// - handler: Function pointer taking `*cpu.Context`.
-/// - kind: Classification of the vector origin.
-/// - ack: Post-handler acknowledgement policy.
+/// Arguments:
+/// - `vector`: vector number to register.
+/// - `handler`: function pointer taking `*cpu.Context`.
+/// - `kind`: classification of the vector origin.
+/// - `ack`: post-handler acknowledgement policy.
 ///
 /// Returns:
-/// - void.
+/// - None.
 ///
 /// Errors:
 /// - None.
@@ -218,21 +214,21 @@ fn registerVector(
 
 /// Summary:
 /// Common naked ISR trampoline exported for all stubs. Saves caller registers
-/// to build a `cpu.Context`, calls `dispatchInterrupt`, restores registers, and
-/// returns with `iretq`.
+/// to build a `cpu.Context`, calls `dispatchInterrupt`, then tail-jumps to the
+/// epilogue which restores registers and returns with `iretq`.
 ///
-/// Args:
+/// Arguments:
 /// - None.
 ///
 /// Returns:
-/// - void.
+/// - None.
 ///
 /// Errors:
 /// - None.
 ///
 /// Panics:
 /// - None.
-export fn commonInterruptStub() callconv(.naked) void {
+export fn commonInterruptStubPrologue() callconv(.naked) void {
     asm volatile (
         \\pushq %rax
         \\pushq %rcx
@@ -253,6 +249,27 @@ export fn commonInterruptStub() callconv(.naked) void {
         \\mov %rsp, %rdi
         \\call dispatchInterrupt
         \\
+        \\ jmp commonInterruptStubEpilogue
+        ::: .{ .memory = true, .cc = true });
+}
+
+/// Summary:
+/// Common ISR epilogue: restores registers, discards `int_num` and `err_code`,
+/// and returns to interrupted context with `iretq`.
+///
+/// Arguments:
+/// - None.
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+export fn commonInterruptStubEpilogue() callconv(.naked) void {
+    asm volatile (
         \\popq %r15
         \\popq %r14
         \\popq %r13
@@ -275,14 +292,71 @@ export fn commonInterruptStub() callconv(.naked) void {
 }
 
 /// Summary:
+/// Pretty-prints the interrupt frame saved by the common stub.
+///
+/// Arguments:
+/// - `ctx`: pointer to the saved `cpu.Context`.
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn dumpInterruptFrame(ctx: *cpu.Context) void {
+    const words: [*]const u64 = @ptrCast(ctx);
+
+    serial.print("\n=== INTERRUPT FRAME ===\n", .{});
+    serial.print("ctx @ {x}\n\n", .{ @intFromPtr(ctx) });
+
+    serial.print("Regs (pushed by stub):\n", .{});
+    const reg_names = [_][]const u8{
+        "r15","r14","r13","r12",
+        "r11","r10","r9 ","r8 ",
+        "rdi","rsi","rbp","rbx",
+        "rdx","rcx","rax","INT",
+    };
+
+    var i: usize = 0;
+    while (i < 16) : (i += 4) {
+        serial.print(
+            "{s}={x:016}  {s}={x:016}  {s}={x:016}  {s}={x:016}\n",
+            .{
+                reg_names[i],   words[i],
+                reg_names[i+1], words[i+1],
+                reg_names[i+2], words[i+2],
+                reg_names[i+3], words[i+3],
+            },
+        );
+    }
+    serial.print("\n", .{});
+
+    serial.print("err_code={x:016}\n", .{ words[16] });
+    serial.print("RIP      ={x:016}\n", .{ words[17] });
+    serial.print("CS       ={x:016}\n", .{ words[18] });
+    serial.print("RFLAGS   ={x:016}\n", .{ words[19] });
+
+    if ((words[18] & 3) == 3) {
+        serial.print("RSP      ={x:016}\n", .{ words[20] });
+        serial.print("SS       ={x:016}\n", .{ words[21] });
+    } else {
+        serial.print("(kernel CPL: no RSP/SS on frame)\n", .{});
+    }
+
+    serial.print("=== END FRAME ===\n\n", .{});
+}
+
+/// Summary:
 /// Dispatches to the registered handler for `ctx.int_num`, then issues LAPIC
 /// EOI if the vector's acknowledgement policy requires it.
 ///
-/// Args:
-/// - ctx: Saved register context captured by `commonInterruptStub`.
+/// Arguments:
+/// - `ctx`: saved register context captured by the common stub.
 ///
 /// Returns:
-/// - void.
+/// - None.
 ///
 /// Errors:
 /// - None.
@@ -297,5 +371,6 @@ export fn dispatchInterrupt(ctx: *cpu.Context) void {
         }
         return;
     }
+    dumpInterruptFrame(ctx);
     @panic("Unhandled interrupt!");
 }
