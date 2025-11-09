@@ -471,13 +471,5 @@ pub fn init(t: timers.Timer, slab_backing_allocator: std.mem.Allocator) !void {
     const dbg_thread = try Thread.createThread(&kproc, debugger.init);
     rq.enqueue(dbg_thread);
 
-    const uproc = try Process.createUserProcess(helloWorldUser);
-    rq.enqueue(uproc.threads[0]);
-
     running_thread = &rq.sentinel;
-}
-
-fn helloWorldUser() void {
-    serial.print("hello world!\n", .{});
-    cpu.halt();
 }

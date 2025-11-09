@@ -28,6 +28,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const sched = zag.sched.scheduler;
+const ps2_keyboard = zag.drivers.ps2_keyboard;
 
 /// Number of legacy IRQ lines exposed by the PIC/APIC shim.
 const NUM_IRQ_ENTRIES = 16;
@@ -73,6 +74,19 @@ pub fn init() void {
     interrupts.registerSoftware(
         spurious_int_vec,
         spuriousHandler,
+    );
+
+    const keyboard_int_vec = @intFromEnum(idt.IntVectors.keyboard);
+    idt.openInterruptGate(
+        @intCast(keyboard_int_vec),
+        interrupts.STUBS[keyboard_int_vec],
+        0x08,
+        idt.PrivilegeLevel.ring_0,
+        idt.GateType.interrupt_gate,
+    );
+    interrupts.registerExternalLapic(
+        keyboard_int_vec,
+        ps2_keyboard.keyboardIrqHandler,
     );
 
     const sched_int_vec = @intFromEnum(idt.IntVectors.sched);

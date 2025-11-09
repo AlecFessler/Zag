@@ -17,6 +17,7 @@
 
 pub const containers = @import("containers/containers.zig");
 pub const debugger = @import("debugger.zig");
+pub const drivers = @import("drivers/drivers.zig");
 pub const math = @import("math/math.zig");
 pub const memory = @import("memory/memory.zig");
 pub const panic = @import("panic.zig");

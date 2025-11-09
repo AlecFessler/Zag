@@ -418,6 +418,8 @@ pub var trigger_mode_5: *const volatile TriggerMode5 = undefined;
 pub var trigger_mode_6: *const volatile TriggerMode6 = undefined;
 pub var trigger_mode_7: *const volatile TriggerMode7 = undefined;
 pub var x2Apic: bool = false;
+pub var ioapic_base: VAddr = undefined;
+pub var ioapic_gsi_base: VAddr = undefined;
 
 /// Summary:
 /// Writes a deadline TSC to IA32_TSC_DEADLINE.
@@ -683,4 +685,48 @@ pub fn armLapicOneShot(ticks: u32, vector: u8) void {
         lvt_timer.* = l;
         init_count.* = .{ .val = ticks };
     }
+}
+
+const IoApic = struct {
+    sel: *volatile u32,
+    win: *volatile u32,
+
+    fn at(base_vaddr: VAddr) IoApic {
+        const base = base_vaddr.addr;
+        return .{
+            .sel = @ptrFromInt(base + 0x00),
+            .win = @ptrFromInt(base + 0x10),
+        };
+    }
+
+    fn read(self: IoApic, reg: u32) u32 {
+        self.sel.* = reg;
+        return self.win.*;
+    }
+
+    fn write(self: IoApic, reg: u32, val: u32) void {
+        self.sel.* = reg;
+        self.win.* = val;
+    }
+
+    fn writeRedir(self: IoApic, entry: u8, low: u32, high: u32) void {
+        const redtbl = 0x10 + (entry * 2);
+        self.write(redtbl, low);
+        self.write(redtbl + 1, high);
+    }
+};
+
+pub fn ioapicRouteIrq(irq_pin: u8, vector: u8) void {
+    const io = IoApic.at(ioapic_base);
+    const dest_apic_id_low8: u8 = if (x2Apic)
+        @intCast(cpu.rdmsr(@intFromEnum(X2ApicMsr.local_apic_id_register)) & 0xFF)
+    else
+        lapic_id.*.apic_id;
+
+    var low: u32 = @as(u32, vector) | (@as(u32, 1) << 16);
+    const high: u32 = (@as(u32, dest_apic_id_low8)) << 24;
+
+    io.writeRedir(irq_pin, low, high);
+    low &= ~(@as(u32, 1) << 16);
+    io.writeRedir(irq_pin, low, high);
 }

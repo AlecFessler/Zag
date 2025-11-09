@@ -33,6 +33,7 @@ const gdt = zag.x86.Gdt;
 const idt = zag.x86.Idt;
 const irq = zag.x86.Irq;
 const paging = zag.x86.Paging;
+const ps2_keyboard = zag.drivers.ps2_keyboard;
 const timers = zag.x86.Timers;
 const pmm_mod = zag.memory.PhysicalMemoryManager;
 const range = zag.math.range;
@@ -343,7 +344,21 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
                         _ = x;
                     },
                     .ioapic => |x| {
-                        _ = x;
+                        apic.ioapic_base = VAddr.fromPAddr(PAddr.fromInt(x.ioapic_addr), .physmap);
+                        apic.ioapic_gsi_base = VAddr.fromPAddr(PAddr.fromInt(x.gsi_base), .physmap);
+                        paging.mapPage(
+                            @ptrFromInt(pml4_virt_physmap.addr),
+                            PAddr.fromInt(x.ioapic_addr),
+                            apic.ioapic_base,
+                            .rw,
+                            .nx,
+                            .ncache,
+                            .su,
+                            .Page4K,
+                            .physmap,
+                            pmm_iface,
+                        );
+                        cpu.invlpg(apic.ioapic_base);
                     },
                     .int_src_override => |x| {
                         _ = x;
@@ -399,6 +414,8 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
             hpet = timers.Hpet.init(hpet_virt);
         }
     }
+
+    ps2_keyboard.init(@intFromEnum(idt.IntVectors.keyboard));
 
     if (hpet == null) {
         @panic("Failed to find and initialize HPET!");

@@ -39,6 +39,7 @@ pub const GateType = enum(u4) {
 /// Project-specific interrupt vectors (syscall, scheduler tick, spurious).
 pub const IntVectors = enum(u8) {
     syscall = 0x80,
+    keyboard = 0xFD,
     sched = 0xFE,
     spurious = 0xFF,
 };

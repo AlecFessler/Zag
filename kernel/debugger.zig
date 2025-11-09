@@ -171,12 +171,11 @@ pub fn dumpInterruptFrame(ctx: *cpu.Context) void {
     };
     serial.print(" INT={s}\n", .{int_str});
 
-    const words: [*]const u64 = @ptrCast(ctx);
     serial.print("    rfl=0x{X:016}  ", .{ctx.rflags});
     serial.print("rip=", .{});
     panic_mod.logAddr(ctx.rip);
     serial.print("    rsp=0x{X:016}   cs=0x{X:03}\n", .{ ctx.rsp, ctx.cs });
-    serial.print("    err=0x{X:016}   ss=0x{X:03}\n", .{ ctx.ss, ctx.err_code });
+    serial.print("    err=0x{X:016}   ss=0x{X:03}\n", .{ ctx.err_code, ctx.ss });
     serial.print("\n", .{});
 
     const reg_names = [_][]const u8{
@@ -185,6 +184,7 @@ pub fn dumpInterruptFrame(ctx: *cpu.Context) void {
         "rdi", "rsi", "rbp", "rbx",
         "rdx", "rcx", "rax", "int",
     };
+    const words: [*]const u64 = @ptrCast(ctx);
 
     var i: usize = 0;
     while (i < 16) : (i += 4) {
@@ -256,7 +256,6 @@ pub fn enumerateProcesses(procs_array: *[PROCS_ARRAY_SIZE]?*sched.Process) u64 {
 
 pub fn init() void {
     const saved_rflags = cpu.saveAndDisableInterrupts();
-    defer cpu.restoreInterrupts(saved_rflags);
 
     var procs_array: [PROCS_ARRAY_SIZE]?*sched.Process = .{null} ** PROCS_ARRAY_SIZE;
     const max_pid = enumerateProcesses(&procs_array);
@@ -267,6 +266,6 @@ pub fn init() void {
         }
     }
 
-    // NOTE: temporary while this runs as the entry point for a kernel thread during development
+    cpu.restoreInterrupts(saved_rflags);
     cpu.halt();
 }
