@@ -12,6 +12,24 @@ const sched = zag.sched.scheduler;
 const ps2 = zag.drivers.ps2_keyboard;
 const keyboard = zag.hal.keyboard;
 
+pub const PageEntryFilter = struct {
+    l4: ?u9,
+    l3: ?u9,
+    l2: ?u9,
+    l1: ?u9,
+    rw: ?paging.RW,
+    nx: ?paging.Executeable,
+    u: ?paging.User,
+    cache: ?paging.Cacheable,
+    wrt: ?bool,
+    global: ?bool,
+    accessed: ?bool,
+    dirty: ?bool,
+    page4k: ?bool,
+    page2m: ?bool,
+    page1g: ?bool,
+};
+
 const PROCS_ARRAY_SIZE = 256;
 const CMD_BUF_SIZE = 256;
 
@@ -19,7 +37,7 @@ var procs_array: [PROCS_ARRAY_SIZE]?*sched.Process = .{null} ** PROCS_ARRAY_SIZE
 var max_pid: u64 = 0;
 
 pub fn dumpPageEntry(e: paging.PageEntry) void {
-    serial.print("RW:{s} NX:{s} U:{s} C:{s} PAddr:0x{X}\n", .{
+    serial.print("RW:{s:>2} NX:{s:>2} U:{s:>2} C:{s:>6} PAddr:0x{X:016}\n", .{
         @tagName(e.rw),
         @tagName(e.nx),
         @tagName(e.user),
@@ -30,55 +48,75 @@ pub fn dumpPageEntry(e: paging.PageEntry) void {
 
 pub fn dumpPageEntryVerbose(e: paging.PageEntry) void {
     serial.print("\n", .{});
-    serial.print("   PAddr: 0x{X}\n", .{e.getPAddr().addr});
-    serial.print("      RW: {s}\n", .{@tagName(e.rw)});
-    serial.print("      NX: {s}\n", .{@tagName(e.nx)});
-    serial.print("    User: {s}\n", .{@tagName(e.user)});
-    serial.print("   Cache: {s}\n", .{@tagName(e.cache_disable)});
-    serial.print("     WRT: {}\n", .{e.write_through});
-    serial.print("    Huge: {}\n", .{e.huge_page});
-    serial.print("  Global: {}\n", .{e.global});
-    serial.print("Accessed: {}\n", .{e.accessed});
-    serial.print("   Dirty: {}\n", .{e.dirty});
+    serial.print("    PAddr:    0x{X:016}\n", .{e.getPAddr().addr});
+    serial.print("    RW:       {s}\n", .{@tagName(e.rw)});
+    serial.print("    NX:       {s}\n", .{@tagName(e.nx)});
+    serial.print("    User:     {s}\n", .{@tagName(e.user)});
+    serial.print("    Cache:    {s}\n", .{@tagName(e.cache_disable)});
+    serial.print("    WRT:      {}\n", .{e.write_through});
+    serial.print("    Huge:     {}\n", .{e.huge_page});
+    serial.print("    Global:   {}\n", .{e.global});
+    serial.print("    Accessed: {}\n", .{e.accessed});
+    serial.print("    Dirty:    {}\n", .{e.dirty});
     serial.print("\n", .{});
 }
 
-pub fn dumpPageTables(pml4_virt: paging.VAddr, verbose: bool) void {
-    const l4_root: [*]paging.PageEntry = @ptrFromInt(pml4_virt.addr);
-    const l3_page_entries = l4_root[0..paging.PAGE_TABLE_SIZE];
-    for (l3_page_entries, 0..) |l3_e, l3_i| {
-        if (!l3_e.present) continue;
-        serial.print("[{}]: ", .{l3_i});
-        if (verbose) {
-            dumpPageEntryVerbose(l3_e);
+fn printIdx4(l4: ?u64, l3: ?u64, l2: ?u64, l1: ?u64) void {
+    const idxs = [_]?u64{ l4, l3, l2, l1 };
+
+    serial.print("[", .{});
+    for (idxs, 0..) |maybe, n| {
+        if (n != 0) serial.print(",", .{});
+        if (maybe) |v| {
+            serial.print("{d:03}", .{v});
         } else {
-            dumpPageEntry(l3_e);
+            serial.print("___", .{});
         }
-        if (l3_e.huge_page == true) continue;
+        if (n == idxs.len - 1) {
+            serial.print("]: ", .{});
+        }
+    }
+}
 
-        const l3_root_virt = paging.VAddr.fromPAddr(l3_e.getPAddr(), .physmap);
-        const l3_root: [*]paging.PageEntry = @ptrFromInt(l3_root_virt.addr);
-        const l2_page_entries = l3_root[0..paging.PAGE_TABLE_SIZE];
-        for (l2_page_entries, 0..) |l2_e, l2_i| {
-            if (!l2_e.present) continue;
-            serial.print("[{},{}]: ", .{ l3_i, l2_i });
-            if (verbose) {
-                dumpPageEntryVerbose(l2_e);
-            } else {
-                dumpPageEntry(l2_e);
+pub fn dumpPageTables(pml4_virt: paging.VAddr, verbose: bool) void {
+    const L = paging.PAGE_TABLE_SIZE;
+    const pml4: [*]paging.PageEntry = @ptrFromInt(pml4_virt.addr);
+
+    for (pml4[0..L], 0..) |e4, idx4_us| {
+        if (!e4.present) continue;
+        const idx4: u64 = @intCast(idx4_us);
+        const pdpt: [*]paging.PageEntry = @ptrFromInt(paging.VAddr.fromPAddr(e4.getPAddr(), .physmap).addr);
+
+        for (pdpt[0..L], 0..) |e3, idx3_us| {
+            if (!e3.present) continue;
+            const idx3: u64 = @intCast(idx3_us);
+
+            if (e3.huge_page) {
+                printIdx4(idx4, idx3, null, null);
+                if (verbose) dumpPageEntryVerbose(e3) else dumpPageEntry(e3);
+                continue;
             }
-            if (l2_e.huge_page == true) continue;
 
-            const l2_root_virt = paging.VAddr.fromPAddr(l2_e.getPAddr(), .physmap);
-            const l2_root: [*]paging.PageEntry = @ptrFromInt(l2_root_virt.addr);
-            const l1_page_entries = l2_root[0..paging.PAGE_TABLE_SIZE];
-            for (l1_page_entries, 0..) |l1_e, l1_i| {
-                if (!l1_e.present) continue;
-                serial.print("[{},{},{}]: ", .{ l3_i, l2_i, l1_i });
-                if (verbose) {
-                    dumpPageEntryVerbose(l1_e);
-                } else {
-                    dumpPageEntry(l1_e);
+            const pd: [*]paging.PageEntry = @ptrFromInt(paging.VAddr.fromPAddr(e3.getPAddr(), .physmap).addr);
+
+            for (pd[0..L], 0..) |e2, idx2_us| {
+                if (!e2.present) continue;
+                const idx2: u64 = @intCast(idx2_us);
+
+                if (e2.huge_page) {
+                    printIdx4(idx4, idx3, idx2, null);
+                    if (verbose) dumpPageEntryVerbose(e2) else dumpPageEntry(e2);
+                    continue;
+                }
+
+                const pt: [*]paging.PageEntry = @ptrFromInt(paging.VAddr.fromPAddr(e2.getPAddr(), .physmap).addr);
+
+                for (pt[0..L], 0..) |e1, idx1_us| {
+                    if (!e1.present) continue;
+                    const idx1: u64 = @intCast(idx1_us);
+
+                    printIdx4(idx4, idx3, idx2, idx1);
+                    if (verbose) dumpPageEntryVerbose(e1) else dumpPageEntry(e1);
                 }
             }
         }
@@ -135,7 +173,7 @@ fn printRangeWithSize(lo: u64, hi: u64) void {
 
 pub fn printRflagsBrief(rfl: u64) void {
     var buf: [16]u8 = undefined;
-    var i: usize = 0;
+    var i: u64 = 0;
 
     if ((rfl & (1 << 9)) != 0) {
         buf[i] = 'I';
@@ -362,8 +400,8 @@ const Commands = struct {
     pub const proc = "proc ";
     pub const thread = "thread ";
     pub const help = "help";
-    pub const page_tables = "dump pt ";
-    pub const page_tablesv = "dump pt -v ";
+    pub const page_tables = "pt ";
+    pub const page_tablesv = "pt -v ";
     pub const newline = "";
 };
 
@@ -373,8 +411,8 @@ fn help() void {
     serial.print("  {s:<12}  List processes (verbose)\n", .{Commands.lsprocsv});
     serial.print("  {s:<12}  Show info for a process (usage: proc <pid>)\n", .{Commands.proc});
     serial.print("  {s:<12}  Show info for a thread (usage: thread <tid>)\n", .{Commands.thread});
-    serial.print("  {s:<12}  Dump page tables (usage: dump pt <pid>)\n", .{Commands.page_tables});
-    serial.print("  {s:<12}  Dump page tables (verbose) (usage: dump pt -v <pid>)\n", .{Commands.page_tablesv});
+    serial.print("  {s:<12}  Dump page tables (usage: pt <pid>)\n", .{Commands.page_tables});
+    serial.print("  {s:<12}  Dump page tables (verbose) (usage: pt -v <pid>)\n", .{Commands.page_tablesv});
     serial.print("  {s:<12}  Show this help menu\n", .{Commands.help});
 }
 
@@ -389,6 +427,7 @@ pub fn executeCmd(cmd: []const u8) void {
         printThread(cmd);
     } else if (cmd.len > Commands.page_tablesv.len and std.mem.startsWith(u8, cmd, Commands.page_tablesv)) {
         printPageTables(cmd, true);
+        // page tables -v command must come before the non verbose command so it's parsed correctly
     } else if (cmd.len > Commands.page_tables.len and std.mem.startsWith(u8, cmd, Commands.page_tables)) {
         printPageTables(cmd, false);
     } else if (std.mem.eql(u8, cmd, Commands.help)) {
