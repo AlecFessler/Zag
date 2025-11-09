@@ -36,6 +36,238 @@ const CMD_BUF_SIZE = 256;
 var procs_array: [PROCS_ARRAY_SIZE]?*sched.Process = .{null} ** PROCS_ARRAY_SIZE;
 var max_pid: u64 = 0;
 
+fn matchesFilter(
+    e: paging.PageEntry,
+    filter: ?PageEntryFilter,
+    l4_idx: ?u64,
+    l3_idx: ?u64,
+    l2_idx: ?u64,
+    l1_idx: ?u64,
+    page_size: enum {
+        page4k,
+        page2m,
+        page1g,
+    },
+) bool {
+    const f = filter orelse return true;
+
+    if (f.l4) |idx| {
+        if (l4_idx == null or l4_idx.? != idx) return false;
+    }
+    if (f.l3) |idx| {
+        if (l3_idx == null or l3_idx.? != idx) return false;
+    }
+    if (f.l2) |idx| {
+        if (l2_idx == null or l2_idx.? != idx) return false;
+    }
+    if (f.l1) |idx| {
+        if (l1_idx == null or l1_idx.? != idx) return false;
+    }
+
+    if (f.rw) |rw| {
+        if (e.rw != rw) return false;
+    }
+    if (f.nx) |nx| {
+        if (e.nx != nx) return false;
+    }
+    if (f.u) |u| {
+        if (e.user != u) return false;
+    }
+    if (f.cache) |cache| {
+        if (e.cache_disable != cache) return false;
+    }
+    if (f.wrt) |wrt| {
+        if (e.write_through != wrt) return false;
+    }
+    if (f.global) |global| {
+        if (e.global != global) return false;
+    }
+    if (f.accessed) |accessed| {
+        if (e.accessed != accessed) return false;
+    }
+    if (f.dirty) |dirty| {
+        if (e.dirty != dirty) return false;
+    }
+
+    switch (page_size) {
+        .page4k => {
+            if (f.page4k) |want| {
+                if (!want) return false;
+            }
+            if (f.page2m) |want| {
+                if (want) return false;
+            }
+            if (f.page1g) |want| {
+                if (want) return false;
+            }
+        },
+        .page2m => {
+            if (f.page2m) |want| {
+                if (!want) return false;
+            }
+            if (f.page4k) |want| {
+                if (want) return false;
+            }
+            if (f.page1g) |want| {
+                if (want) return false;
+            }
+        },
+        .page1g => {
+            if (f.page1g) |want| {
+                if (!want) return false;
+            }
+            if (f.page4k) |want| {
+                if (want) return false;
+            }
+            if (f.page2m) |want| {
+                if (want) return false;
+            }
+        },
+    }
+
+    return true;
+}
+
+pub fn parsePageEntryFilter(args: []const u8) ?PageEntryFilter {
+    var filter = PageEntryFilter{
+        .l4 = null,
+        .l3 = null,
+        .l2 = null,
+        .l1 = null,
+        .rw = null,
+        .nx = null,
+        .u = null,
+        .cache = null,
+        .wrt = null,
+        .global = null,
+        .accessed = null,
+        .dirty = null,
+        .page4k = null,
+        .page2m = null,
+        .page1g = null,
+    };
+
+    var i: u64 = 0;
+    while (i < args.len) {
+        while (i < args.len and args[i] == ' ') : (i += 1) {}
+        if (i >= args.len) break;
+
+        if (args[i] != '-') {
+            i += 1;
+            continue;
+        }
+
+        const flag_start = i + 1;
+        var flag_end = flag_start;
+        while (flag_end < args.len and args[flag_end] != ' ') : (flag_end += 1) {}
+        const flag = args[flag_start..flag_end];
+        i = flag_end;
+
+        while (i < args.len and args[i] == ' ') : (i += 1) {}
+        if (i >= args.len) break;
+
+        const val_start = i;
+        var val_end = val_start;
+        while (val_end < args.len and args[val_end] != ' ') : (val_end += 1) {}
+        const val = args[val_start..val_end];
+        i = val_end;
+
+        if (std.mem.eql(u8, flag, "l4")) {
+            if (parseU64Dec(val)) |v| {
+                if (v <= 511) {
+                    filter.l4 = @intCast(v);
+                }
+            }
+        } else if (std.mem.eql(u8, flag, "l3")) {
+            if (parseU64Dec(val)) |v| {
+                if (v <= 511) {
+                    filter.l3 = @intCast(v);
+                }
+            }
+        } else if (std.mem.eql(u8, flag, "l2")) {
+            if (parseU64Dec(val)) |v| {
+                if (v <= 511) {
+                    filter.l2 = @intCast(v);
+                }
+            }
+        } else if (std.mem.eql(u8, flag, "l1")) {
+            if (parseU64Dec(val)) |v| {
+                if (v <= 511) {
+                    filter.l1 = @intCast(v);
+                }
+            }
+        } else if (std.mem.eql(u8, flag, "rw")) {
+            if (std.mem.eql(u8, val, "ro")) {
+                filter.rw = .ro;
+            } else if (std.mem.eql(u8, val, "rw")) {
+                filter.rw = .rw;
+            }
+        } else if (std.mem.eql(u8, flag, "nx")) {
+            if (std.mem.eql(u8, val, "x")) {
+                filter.nx = .x;
+            } else if (std.mem.eql(u8, val, "nx")) {
+                filter.nx = .nx;
+            }
+        } else if (std.mem.eql(u8, flag, "u")) {
+            if (std.mem.eql(u8, val, "u")) {
+                filter.u = .u;
+            } else if (std.mem.eql(u8, val, "su")) {
+                filter.u = .su;
+            }
+        } else if (std.mem.eql(u8, flag, "cache")) {
+            if (std.mem.eql(u8, val, "cache")) {
+                filter.cache = .cache;
+            } else if (std.mem.eql(u8, val, "ncache")) {
+                filter.cache = .ncache;
+            }
+        } else if (std.mem.eql(u8, flag, "wrt")) {
+            if (std.mem.eql(u8, val, "true")) {
+                filter.wrt = true;
+            } else if (std.mem.eql(u8, val, "false")) {
+                filter.wrt = false;
+            }
+        } else if (std.mem.eql(u8, flag, "global")) {
+            if (std.mem.eql(u8, val, "true")) {
+                filter.global = true;
+            } else if (std.mem.eql(u8, val, "false")) {
+                filter.global = false;
+            }
+        } else if (std.mem.eql(u8, flag, "accessed")) {
+            if (std.mem.eql(u8, val, "true")) {
+                filter.accessed = true;
+            } else if (std.mem.eql(u8, val, "false")) {
+                filter.accessed = false;
+            }
+        } else if (std.mem.eql(u8, flag, "dirty")) {
+            if (std.mem.eql(u8, val, "true")) {
+                filter.dirty = true;
+            } else if (std.mem.eql(u8, val, "false")) {
+                filter.dirty = false;
+            }
+        } else if (std.mem.eql(u8, flag, "page4k")) {
+            if (std.mem.eql(u8, val, "true")) {
+                filter.page4k = true;
+            } else if (std.mem.eql(u8, val, "false")) {
+                filter.page4k = false;
+            }
+        } else if (std.mem.eql(u8, flag, "page2m")) {
+            if (std.mem.eql(u8, val, "true")) {
+                filter.page2m = true;
+            } else if (std.mem.eql(u8, val, "false")) {
+                filter.page2m = false;
+            }
+        } else if (std.mem.eql(u8, flag, "page1g")) {
+            if (std.mem.eql(u8, val, "true")) {
+                filter.page1g = true;
+            } else if (std.mem.eql(u8, val, "false")) {
+                filter.page1g = false;
+            }
+        }
+    }
+
+    return filter;
+}
+
 pub fn dumpPageEntry(e: paging.PageEntry) void {
     serial.print("RW:{s:>2} NX:{s:>2} U:{s:>2} C:{s:>6} PAddr:0x{X:016}\n", .{
         @tagName(e.rw),
@@ -78,49 +310,66 @@ fn printIdx4(l4: ?u64, l3: ?u64, l2: ?u64, l1: ?u64) void {
     }
 }
 
-pub fn dumpPageTables(pml4_virt: paging.VAddr, verbose: bool) void {
+pub fn dumpPageTables(pml4_virt: paging.VAddr, verbose: bool, filter: ?PageEntryFilter) void {
     const L = paging.PAGE_TABLE_SIZE;
     const pml4: [*]paging.PageEntry = @ptrFromInt(pml4_virt.addr);
+
+    var total_checked: u64 = 0;
+    var total_matched: u64 = 0;
+    var l4_entries_present: u64 = 0;
 
     for (pml4[0..L], 0..) |e4, idx4_us| {
         if (!e4.present) continue;
         const idx4: u64 = @intCast(idx4_us);
-        const pdpt: [*]paging.PageEntry = @ptrFromInt(paging.VAddr.fromPAddr(e4.getPAddr(), .physmap).addr);
+        l4_entries_present += 1;
 
+        const pdpt: [*]paging.PageEntry = @ptrFromInt(paging.VAddr.fromPAddr(e4.getPAddr(), .physmap).addr);
         for (pdpt[0..L], 0..) |e3, idx3_us| {
             if (!e3.present) continue;
             const idx3: u64 = @intCast(idx3_us);
 
             if (e3.huge_page) {
-                printIdx4(idx4, idx3, null, null);
-                if (verbose) dumpPageEntryVerbose(e3) else dumpPageEntry(e3);
+                total_checked += 1;
+                if (matchesFilter(e3, filter, idx4, idx3, null, null, .page1g)) {
+                    total_matched += 1;
+                    printIdx4(idx4, idx3, null, null);
+                    if (verbose) dumpPageEntryVerbose(e3) else dumpPageEntry(e3);
+                }
                 continue;
             }
 
             const pd: [*]paging.PageEntry = @ptrFromInt(paging.VAddr.fromPAddr(e3.getPAddr(), .physmap).addr);
-
             for (pd[0..L], 0..) |e2, idx2_us| {
                 if (!e2.present) continue;
                 const idx2: u64 = @intCast(idx2_us);
 
                 if (e2.huge_page) {
-                    printIdx4(idx4, idx3, idx2, null);
-                    if (verbose) dumpPageEntryVerbose(e2) else dumpPageEntry(e2);
+                    total_checked += 1;
+                    if (matchesFilter(e2, filter, idx4, idx3, idx2, null, .page2m)) {
+                        total_matched += 1;
+                        printIdx4(idx4, idx3, idx2, null);
+                        if (verbose) dumpPageEntryVerbose(e2) else dumpPageEntry(e2);
+                    }
                     continue;
                 }
 
                 const pt: [*]paging.PageEntry = @ptrFromInt(paging.VAddr.fromPAddr(e2.getPAddr(), .physmap).addr);
-
                 for (pt[0..L], 0..) |e1, idx1_us| {
                     if (!e1.present) continue;
                     const idx1: u64 = @intCast(idx1_us);
 
-                    printIdx4(idx4, idx3, idx2, idx1);
-                    if (verbose) dumpPageEntryVerbose(e1) else dumpPageEntry(e1);
+                    total_checked += 1;
+                    if (matchesFilter(e1, filter, idx4, idx3, idx2, idx1, .page4k)) {
+                        total_matched += 1;
+                        printIdx4(idx4, idx3, idx2, idx1);
+                        if (verbose) dumpPageEntryVerbose(e1) else dumpPageEntry(e1);
+                    }
                 }
             }
         }
     }
+
+    serial.print("{} matched filter / {} total\n", .{ total_matched, total_checked });
 }
 
 fn printStackUsage(stack_base: u64, rsp: u64, total_size_bytes: u64) void {
@@ -379,16 +628,25 @@ pub fn printThread(cmd: []const u8) void {
 }
 
 pub fn printPageTables(cmd: []const u8, verbose: bool) void {
-    const tail = if (verbose)
-        cmd[Commands.page_tablesv.len..cmd.len]
-    else
-        cmd[Commands.page_tables.len..cmd.len];
-    const pid = parseU64Dec(tail) orelse {
-        serial.print("Invalid pid: {s}\n", .{tail});
+    var base_end = if (verbose) Commands.page_tablesv.len else Commands.page_tables.len;
+
+    while (base_end < cmd.len and cmd[base_end] == ' ') : (base_end += 1) {}
+    const pid_start = base_end;
+
+    var pid_end = pid_start;
+    while (pid_end < cmd.len and cmd[pid_end] != ' ') : (pid_end += 1) {}
+
+    const pid_str = cmd[pid_start..pid_end];
+    const pid = parseU64Dec(pid_str) orelse {
+        serial.print("Invalid pid: {s}\n", .{pid_str});
         return;
     };
+
+    const filter_args = if (pid_end < cmd.len) cmd[pid_end..] else "";
+    const filter = if (filter_args.len > 0) parsePageEntryFilter(filter_args) else null;
+
     if (procs_array[pid]) |proc| {
-        dumpPageTables(proc.pml4_virt, verbose);
+        dumpPageTables(proc.pml4_virt, verbose, filter);
     } else {
         serial.print("Invalid pid: {}\n", .{pid});
     }
@@ -407,13 +665,31 @@ const Commands = struct {
 
 fn help() void {
     serial.print("Commands:\n", .{});
-    serial.print("  {s:<12}  List processes\n", .{Commands.lsprocs});
-    serial.print("  {s:<12}  List processes (verbose)\n", .{Commands.lsprocsv});
-    serial.print("  {s:<12}  Show info for a process (usage: proc <pid>)\n", .{Commands.proc});
-    serial.print("  {s:<12}  Show info for a thread (usage: thread <tid>)\n", .{Commands.thread});
-    serial.print("  {s:<12}  Dump page tables (usage: pt <pid>)\n", .{Commands.page_tables});
-    serial.print("  {s:<12}  Dump page tables (verbose) (usage: pt -v <pid>)\n", .{Commands.page_tablesv});
-    serial.print("  {s:<12}  Show this help menu\n", .{Commands.help});
+    serial.print("  {s:<12} List processes\n", .{Commands.lsprocs});
+    serial.print("  {s:<12} List processes (verbose)\n", .{Commands.lsprocsv});
+    serial.print("  {s:<12} Show info for a process (usage: proc <pid>)\n", .{Commands.proc});
+    serial.print("  {s:<12} Show info for a thread (usage: thread <tid>)\n", .{Commands.thread});
+    serial.print("  {s:<12} Dump page tables (usage: pt <pid> [filters])\n", .{Commands.page_tables});
+    serial.print("  {s:<12} Dump page tables (verbose) (usage: pt -v <pid> [filters])\n", .{Commands.page_tablesv});
+    serial.print("  {s:<12} Show this help menu\n", .{Commands.help});
+    serial.print("\n", .{});
+    serial.print("Page table filter options:\n", .{});
+    serial.print("  -l4 <0-511>    Filter by L4 index\n", .{});
+    serial.print("  -l3 <0-511>    Filter by L3 index\n", .{});
+    serial.print("  -l2 <0-511>    Filter by L2 index\n", .{});
+    serial.print("  -l1 <0-511>    Filter by L1 index\n", .{});
+    serial.print("  -rw <ro|rw>    Filter by read/write permission\n", .{});
+    serial.print("  -nx <x|nx>     Filter by execute permission\n", .{});
+    serial.print("  -u  <u|su>     Filter by user/supervisor\n", .{});
+    serial.print("  -cache <cache|ncache>  Filter by cache setting\n", .{});
+    serial.print("  -wrt <true|false>      Filter by write-through\n", .{});
+    serial.print("  -global <true|false>   Filter by global flag\n", .{});
+    serial.print("  -accessed <true|false> Filter by accessed bit\n", .{});
+    serial.print("  -dirty <true|false>    Filter by dirty bit\n", .{});
+    serial.print("  -page4k <true|false>   Filter 4KB pages\n", .{});
+    serial.print("  -page2m <true|false>   Filter 2MB pages\n", .{});
+    serial.print("  -page1g <true|false>   Filter 1GB pages\n", .{});
+    serial.print("\nExample: pt 1 -rw rw -nx nx -page2m true\n", .{});
 }
 
 pub fn executeCmd(cmd: []const u8) void {
