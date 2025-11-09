@@ -147,7 +147,6 @@ pub fn build(b: *std.Build) void {
         \\ -m 512M \
         \\ -bios /usr/share/ovmf/x64/OVMF.4m.fd \
         \\ -drive file=fat:rw:{s}/{s},format=raw \
-        \\ -nographic \
         \\ -serial mon:stdio \
         \\ -no-reboot \
         \\ {s} \

@@ -9,6 +9,8 @@ const panic_mod = zag.panic;
 const pmm_mod = zag.memory.PhysicalMemoryManager;
 const serial = zag.x86.Serial;
 const sched = zag.sched.scheduler;
+const ps2 = zag.drivers.ps2_keyboard;
+const keyboard = zag.hal.keyboard;
 
 const PROCS_ARRAY_SIZE = 256;
 
@@ -276,6 +278,32 @@ pub fn init() void {
     for (0..max_pid + 1) |pid| {
         if (procs_array[pid]) |proc| {
             dumpProcessVerbose(proc);
+        }
+    }
+
+    ps2.init(.{}) catch |e| {
+        serial.print("ps/2 init failed: {}\n", .{e});
+        cpu.restoreInterrupts(saved_rflags);
+        cpu.halt();
+    };
+
+    var exiting = false;
+    while (!exiting) {
+        if (ps2.pollKeyEvent()) |act| {
+            if (act.action == .press) {
+                if (act.ascii) |a| {
+                    const ch: u8 = @intFromEnum(a);
+                    switch (act.key) {
+                        .enter => serial.print("\n", .{}),
+                        else => serial.print("{c}", .{ch}),
+                    }
+                } else switch (act.key) {
+                    .escape => exiting = true,
+                    .enter => serial.print("\n", .{}),
+                    .backspace => serial.print("\x08 \x08", .{}),
+                    else => {},
+                }
+            }
         }
     }
 
