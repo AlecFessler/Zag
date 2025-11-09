@@ -344,21 +344,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
                         _ = x;
                     },
                     .ioapic => |x| {
-                        apic.ioapic_base = VAddr.fromPAddr(PAddr.fromInt(x.ioapic_addr), .physmap);
-                        apic.ioapic_gsi_base = VAddr.fromPAddr(PAddr.fromInt(x.gsi_base), .physmap);
-                        paging.mapPage(
-                            @ptrFromInt(pml4_virt_physmap.addr),
-                            PAddr.fromInt(x.ioapic_addr),
-                            apic.ioapic_base,
-                            .rw,
-                            .nx,
-                            .ncache,
-                            .su,
-                            .Page4K,
-                            .physmap,
-                            pmm_iface,
-                        );
-                        cpu.invlpg(apic.ioapic_base);
+                        _ = x;
                     },
                     .int_src_override => |x| {
                         _ = x;
@@ -414,8 +400,6 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
             hpet = timers.Hpet.init(hpet_virt);
         }
     }
-
-    ps2_keyboard.init(@intFromEnum(idt.IntVectors.keyboard));
 
     if (hpet == null) {
         @panic("Failed to find and initialize HPET!");

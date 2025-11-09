@@ -76,19 +76,6 @@ pub fn init() void {
         spuriousHandler,
     );
 
-    const keyboard_int_vec = @intFromEnum(idt.IntVectors.keyboard);
-    idt.openInterruptGate(
-        @intCast(keyboard_int_vec),
-        interrupts.STUBS[keyboard_int_vec],
-        0x08,
-        idt.PrivilegeLevel.ring_0,
-        idt.GateType.interrupt_gate,
-    );
-    interrupts.registerExternalLapic(
-        keyboard_int_vec,
-        ps2_keyboard.keyboardIrqHandler,
-    );
-
     const sched_int_vec = @intFromEnum(idt.IntVectors.sched);
     idt.openInterruptGate(
         @intCast(sched_int_vec),

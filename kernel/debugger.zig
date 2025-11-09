@@ -172,7 +172,7 @@ pub fn dumpInterruptFrame(ctx: *cpu.Context) void {
     serial.print(" INT={s}\n", .{int_str});
 
     serial.print("    rfl=0x{X:016}  ", .{ctx.rflags});
-    serial.print("rip=", .{});
+    serial.print("rip=0x", .{});
     panic_mod.logAddr(ctx.rip);
     serial.print("    rsp=0x{X:016}   cs=0x{X:03}\n", .{ ctx.rsp, ctx.cs });
     serial.print("    err=0x{X:016}   ss=0x{X:03}\n", .{ ctx.err_code, ctx.ss });
@@ -186,7 +186,7 @@ pub fn dumpInterruptFrame(ctx: *cpu.Context) void {
     };
     const words: [*]const u64 = @ptrCast(ctx);
 
-    var i: usize = 0;
+    var i: u64 = 0;
     while (i < 16) : (i += 4) {
         serial.print(
             "    {s}=0x{X:016}  {s}=0x{X:016}  {s}=0x{X:016}  {s}=0x{X:016}\n",
@@ -201,16 +201,28 @@ pub fn dumpInterruptFrame(ctx: *cpu.Context) void {
 }
 
 pub fn dumpThreadVerbose(thread: *sched.Thread) void {
-    serial.print("🧵 THREAD {}\n", .{thread.tid});
-    serial.print("   🗂️ Kstack base: 0x{X:016} ", .{thread.kstack_base.addr});
+    serial.print("🧵 THREAD {}", .{thread.tid});
+    if (thread == sched.running_thread) {
+        serial.print(" (running 🚀)\n", .{});
+    } else {
+        serial.print("\n", .{});
+    }
+
+    serial.print("   🥞 Kstack base: 0x{X:016} ", .{thread.kstack_base.addr});
     if (thread.ustack_base == null) {
-        printStackUsage(thread.kstack_base.addr, thread.ctx.rsp, thread.kstack_pages * paging.PAGE4K);
+        if (thread == sched.running_thread) {
+            const current_rsp = cpu.readCurrentRsp();
+            printStackUsage(thread.kstack_base.addr, current_rsp, thread.kstack_pages * paging.PAGE4K);
+        } else {
+            printStackUsage(thread.kstack_base.addr, thread.ctx.rsp, thread.kstack_pages * paging.PAGE4K);
+        }
     } else {
         printStackUsage(thread.kstack_base.addr, thread.kstack_base.addr, thread.kstack_pages * paging.PAGE4K);
         serial.print("   📚 Ustack base: 0x{X:016} ", .{thread.ustack_base.?.addr});
         printStackUsage(thread.ustack_base.?.addr, thread.ctx.rsp, thread.ustack_pages * paging.PAGE4K);
     }
     serial.print("\n", .{});
+
     dumpInterruptFrame(thread.ctx);
     serial.print("\n\n", .{});
 }
@@ -222,6 +234,7 @@ pub fn dumpThread(thread: *sched.Thread) void {
 pub fn dumpProcessVerbose(proc: *sched.Process) void {
     const ring_sym = if (proc.cpl == .ring_0) "👑" else "🔒";
     serial.print("{s} PROCESS {}\n", .{ ring_sym, proc.pid });
+
     serial.print("    PML4 @ 0x{X:016} | Threads: {}\n", .{ proc.pml4_virt.addr, proc.num_threads });
 
     serial.print("    VMM Reserved:\n", .{});

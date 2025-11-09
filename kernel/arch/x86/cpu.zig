@@ -516,6 +516,12 @@ pub fn outb(value: u8, port: u16) void {
     );
 }
 
+pub fn readCurrentRsp() u64 {
+    var rsp: u64 = 0;
+    asm volatile ("mov %%rsp, %[out]" : [out] "=r"(rsp));
+    return rsp;
+}
+
 /// Summary:
 /// Reads a 64-bit Model Specific Register (MSR) using RDMSR.
 ///
