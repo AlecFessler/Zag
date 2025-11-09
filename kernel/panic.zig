@@ -297,7 +297,7 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?usize)
         last_pc = pc;
     }
 
-    zag.x86.Cpu.halt();
+    cpu.halt();
 }
 
 /// Summary:

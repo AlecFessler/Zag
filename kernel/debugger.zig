@@ -1,16 +1,66 @@
+//! Kernel debugger and REPL for Zag.
+//!
+//! Serial-driven inspector for processes, threads, registers, and page tables.
+//! Designed for bring-up and bare-metal debugging with minimal dependencies
+//! (serial I/O, paging, scheduler state). Intended to run early and remain
+//! usable on real hardware.
+//!
+//! # Directory
+//!
+//! ## Type Definitions
+//! - `Commands` – Static command strings for the REPL.
+//! - `PageEntryFilter` – Filter for page-table walks (indexes, flags, page size).
+//!
+//! ## Constants
+//! - `CMD_BUF_SIZE` – Bytes in the REPL input buffer.
+//! - `PROCS_ARRAY_SIZE` – Maximum PIDs tracked in the in-memory index.
+//!
+//! ## Variables
+//! - `max_pid` – Highest PID discovered during enumeration.
+//! - `procs_array` – Sparse PID→Process table.
+//!
+//! ## Functions
+//! - `dumpInterruptFrame` – Pretty-print an interrupt context.
+//! - `dumpPageEntry` – One-line page entry summary.
+//! - `dumpPageEntryVerbose` – Multi-line page entry detail.
+//! - `dumpPageTables` – Filtered page-table walk from a PML4.
+//! - `dumpProcess` – Brief process header.
+//! - `dumpProcessVerbose` – Full process (VMM ranges, threads).
+//! - `dumpThread` – Brief thread header.
+//! - `dumpThreadVerbose` – Full thread + registers.
+//! - `printRflagsBrief` – Compact RFLAGS banner (IF/ZF/PF/SF).
+//! - `enumerateProcesses` – Populate PID→Process table from run queue.
+//! - `executeCmd` – Dispatch a command string.
+//! - `help` – Print the debugger help and filter options.
+//! - `lsProcs` – List processes (brief).
+//! - `lsProcsVerbose` – List processes (verbose).
+//! - `matchesFilter` – Test a page entry against a filter.
+//! - `parsePageEntryFilter` – Parse `pt` filter flags.
+//! - `parseU64Dec` – Parse unsigned decimal integer.
+//! - `printIdx4` – Print `[l4,l3,l2,l1]` with gaps.
+//! - `printPageTables` – Parse/execute `pt` or `pt -v` for a PID.
+//! - `printProcess` – Parse/execute `proc <pid>`.
+//! - `printRangeWithSize` – Print range with human-friendly size.
+//! - `printStackUsage` – Print `(used/total)` for a stack.
+//! - `printThread` – Parse/execute `thread <tid>`.
+//! - `repl` – Read keys and run the REPL loop.
+//!
+//! ## Entry / Init
+//! - `init` – Mask interrupts, enumerate, init PS/2, run REPL.
+
 const std = @import("std");
 const zag = @import("zag");
 
 const cpu = zag.x86.Cpu;
 const exceptions = zag.x86.Exceptions;
 const idt = zag.x86.Idt;
+const keyboard = zag.hal.keyboard;
 const paging = zag.x86.Paging;
 const panic_mod = zag.panic;
 const pmm_mod = zag.memory.PhysicalMemoryManager;
-const serial = zag.x86.Serial;
-const sched = zag.sched.scheduler;
 const ps2 = zag.drivers.ps2_keyboard;
-const keyboard = zag.hal.keyboard;
+const sched = zag.sched.scheduler;
+const serial = zag.x86.Serial;
 
 pub const PageEntryFilter = struct {
     l4: ?u9,
@@ -30,12 +80,586 @@ pub const PageEntryFilter = struct {
     page1g: ?bool,
 };
 
-const PROCS_ARRAY_SIZE = 256;
+const Commands = struct {
+    pub const lsprocs = "lsprocs";
+    pub const lsprocsv = "lsprocs -v";
+    pub const proc = "proc ";
+    pub const thread = "thread ";
+    pub const help = "help";
+    pub const page_tables = "pt ";
+    pub const page_tablesv = "pt -v ";
+    pub const newline = "";
+};
+
 const CMD_BUF_SIZE = 256;
+const PROCS_ARRAY_SIZE = 256;
 
-var procs_array: [PROCS_ARRAY_SIZE]?*sched.Process = .{null} ** PROCS_ARRAY_SIZE;
 var max_pid: u64 = 0;
+var procs_array: [PROCS_ARRAY_SIZE]?*sched.Process = .{null} ** PROCS_ARRAY_SIZE;
 
+/// Summary:
+/// Pretty-print an interrupt context with resolved RIP and vector name.
+///
+/// Arguments:
+/// - `ctx`: pointer to the saved interrupt context
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn dumpInterruptFrame(ctx: *cpu.Context) void {
+    serial.print("🪂 INTERRUPT FRAME\n", .{});
+    printRflagsBrief(ctx.rflags);
+    const int_str = blk: {
+        if (ctx.int_num <= 32) {
+            const exception: exceptions.Exception = @enumFromInt(ctx.int_num);
+            break :blk @tagName(exception);
+        } else {
+            const int_vec: idt.IntVectors = @enumFromInt(ctx.int_num);
+            break :blk @tagName(int_vec);
+        }
+    };
+    serial.print(" INT={s}\n", .{int_str});
+
+    serial.print("    rfl=0x{X:016}  ", .{ctx.rflags});
+    serial.print("rip=0x", .{});
+    panic_mod.logAddr(ctx.rip);
+    serial.print("    rsp=0x{X:016}   cs=0x{X:03}\n", .{ ctx.rsp, ctx.cs });
+    serial.print("    err=0x{X:016}   ss=0x{X:03}\n", .{ ctx.err_code, ctx.ss });
+    serial.print("\n", .{});
+
+    const reg_names = [_][]const u8{
+        "r15", "r14", "r13", "r12",
+        "r11", "r10", " r9", " r8",
+        "rdi", "rsi", "rbp", "rbx",
+        "rdx", "rcx", "rax", "int",
+    };
+    const words: [*]const u64 = @ptrCast(ctx);
+
+    var i: u64 = 0;
+    while (i < 16) : (i += 4) {
+        serial.print(
+            "    {s}=0x{X:016}  {s}=0x{X:016}  {s}=0x{X:016}  {s}=0x{X:016}\n",
+            .{
+                reg_names[i],     words[i],
+                reg_names[i + 1], words[i + 1],
+                reg_names[i + 2], words[i + 2],
+                reg_names[i + 3], words[i + 3],
+            },
+        );
+    }
+}
+
+/// Summary:
+/// Print a one-line page table entry summary.
+///
+/// Arguments:
+/// - `e`: page table entry to print
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn dumpPageEntry(e: paging.PageEntry) void {
+    serial.print("RW:{s:>2} NX:{s:>2} U:{s:>2} C:{s:>6} PAddr:0x{X:016}\n", .{
+        @tagName(e.rw),
+        @tagName(e.nx),
+        @tagName(e.user),
+        @tagName(e.cache_disable),
+        e.getPAddr().addr,
+    });
+}
+
+/// Summary:
+/// Print a verbose multi-line view of a page table entry.
+///
+/// Arguments:
+/// - `e`: page table entry to print
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn dumpPageEntryVerbose(e: paging.PageEntry) void {
+    serial.print("\n", .{});
+    serial.print("    PAddr:    0x{X:016}\n", .{e.getPAddr().addr});
+    serial.print("    RW:       {s}\n", .{@tagName(e.rw)});
+    serial.print("    NX:       {s}\n", .{@tagName(e.nx)});
+    serial.print("    User:     {s}\n", .{@tagName(e.user)});
+    serial.print("    Cache:    {s}\n", .{@tagName(e.cache_disable)});
+    serial.print("    WRT:      {}\n", .{e.write_through});
+    serial.print("    Huge:     {}\n", .{e.huge_page});
+    serial.print("    Global:   {}\n", .{e.global});
+    serial.print("    Accessed: {}\n", .{e.accessed});
+    serial.print("    Dirty:    {}\n", .{e.dirty});
+    serial.print("\n", .{});
+}
+
+/// Summary:
+/// Walk the page tables from a PML4 and print entries matching an optional filter.
+///
+/// Arguments:
+/// - `pml4_virt`: virtual address of the PML4
+/// - `verbose`: whether to print verbose entries
+/// - `filter`: optional `PageEntryFilter` controlling index/flag/size matches
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn dumpPageTables(pml4_virt: paging.VAddr, verbose: bool, filter: ?PageEntryFilter) void {
+    const L = paging.PAGE_TABLE_SIZE;
+    const pml4: [*]paging.PageEntry = @ptrFromInt(pml4_virt.addr);
+
+    var total_checked: u64 = 0;
+    var total_matched: u64 = 0;
+    var l4_entries_present: u64 = 0;
+
+    for (pml4[0..L], 0..) |e4, idx4_us| {
+        if (!e4.present) continue;
+        const idx4: u64 = @intCast(idx4_us);
+        l4_entries_present += 1;
+
+        const pdpt: [*]paging.PageEntry = @ptrFromInt(paging.VAddr.fromPAddr(e4.getPAddr(), .physmap).addr);
+        for (pdpt[0..L], 0..) |e3, idx3_us| {
+            if (!e3.present) continue;
+            const idx3: u64 = @intCast(idx3_us);
+
+            if (e3.huge_page) {
+                total_checked += 1;
+                if (matchesFilter(e3, filter, idx4, idx3, null, null, .page1g)) {
+                    total_matched += 1;
+                    printIdx4(idx4, idx3, null, null);
+                    if (verbose) dumpPageEntryVerbose(e3) else dumpPageEntry(e3);
+                }
+                continue;
+            }
+
+            const pd: [*]paging.PageEntry = @ptrFromInt(paging.VAddr.fromPAddr(e3.getPAddr(), .physmap).addr);
+            for (pd[0..L], 0..) |e2, idx2_us| {
+                if (!e2.present) continue;
+                const idx2: u64 = @intCast(idx2_us);
+
+                if (e2.huge_page) {
+                    total_checked += 1;
+                    if (matchesFilter(e2, filter, idx4, idx3, idx2, null, .page2m)) {
+                        total_matched += 1;
+                        printIdx4(idx4, idx3, idx2, null);
+                        if (verbose) dumpPageEntryVerbose(e2) else dumpPageEntry(e2);
+                    }
+                    continue;
+                }
+
+                const pt: [*]paging.PageEntry = @ptrFromInt(paging.VAddr.fromPAddr(e2.getPAddr(), .physmap).addr);
+                for (pt[0..L], 0..) |e1, idx1_us| {
+                    if (!e1.present) continue;
+                    const idx1: u64 = @intCast(idx1_us);
+
+                    total_checked += 1;
+                    if (matchesFilter(e1, filter, idx4, idx3, idx2, idx1, .page4k)) {
+                        total_matched += 1;
+                        printIdx4(idx4, idx3, idx2, idx1);
+                        if (verbose) dumpPageEntryVerbose(e1) else dumpPageEntry(e1);
+                    }
+                }
+            }
+        }
+    }
+
+    serial.print("{} matched filter / {} total\n", .{ total_matched, total_checked });
+}
+
+/// Summary:
+/// Print a brief process line (emoji for CPL, PID).
+///
+/// Arguments:
+/// - `proc`: process to print
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn dumpProcess(proc: *sched.Process) void {
+    const ring_sym = if (proc.cpl == .ring_0) "👑" else "🔒";
+    serial.print("{s} PID: {}\n", .{ ring_sym, proc.pid });
+}
+
+/// Summary:
+/// Print a detailed process view: PML4, reserved VMM regions, thread list.
+///
+/// Arguments:
+/// - `proc`: process to print
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn dumpProcessVerbose(proc: *sched.Process) void {
+    const ring_sym = if (proc.cpl == .ring_0) "👑" else "🔒";
+    serial.print("{s} PROCESS {}\n", .{ ring_sym, proc.pid });
+
+    serial.print("    PML4 @ 0x{X:016} | Threads: {}\n", .{ proc.pml4_virt.addr, proc.num_threads });
+
+    serial.print("    VMM Reserved:\n", .{});
+    for (0..proc.vmm.vmm_allocations_idx) |i| {
+        const region = proc.vmm.vmm_allocations[i];
+        printRangeWithSize(region.vaddr.addr, region.vaddr.addr + region.size);
+    }
+    serial.print("\n", .{});
+
+    serial.print("    Threads:\n", .{});
+    for (0..proc.num_threads) |i| {
+        serial.print("     · ", .{});
+        dumpThread(proc.threads[i]);
+    }
+}
+
+/// Summary:
+/// Print a brief thread header and running marker.
+///
+/// Arguments:
+/// - `thread`: thread to print
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn dumpThread(thread: *sched.Thread) void {
+    serial.print("TID {}", .{thread.tid});
+    if (thread == sched.running_thread) {
+        serial.print(" (running 🚀)\n", .{});
+    } else {
+        serial.print("\n", .{});
+    }
+}
+
+/// Summary:
+/// Print a detailed thread view (stack usage, optional ustack) and registers.
+///
+/// Arguments:
+/// - `thread`: thread to print
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn dumpThreadVerbose(thread: *sched.Thread) void {
+    serial.print("🧵 THREAD {}", .{thread.tid});
+    if (thread == sched.running_thread) {
+        serial.print(" (running 🚀)\n", .{});
+    } else {
+        serial.print("\n", .{});
+    }
+
+    serial.print("    🥞 Kstack base: 0x{X:016} ", .{thread.kstack_base.addr});
+    if (thread.ustack_base == null) {
+        if (thread == sched.running_thread) {
+            const current_rsp = cpu.readCurrentRsp();
+            printStackUsage(thread.kstack_base.addr, current_rsp, thread.kstack_pages * paging.PAGE4K);
+        } else {
+            printStackUsage(thread.kstack_base.addr, thread.ctx.rsp, thread.kstack_pages * paging.PAGE4K);
+        }
+    } else {
+        printStackUsage(thread.kstack_base.addr, thread.kstack_base.addr, thread.kstack_pages * paging.PAGE4K);
+        serial.print("    📚 Ustack base: 0x{X:016} ", .{thread.ustack_base.?.addr});
+        printStackUsage(thread.ustack_base.?.addr, thread.ctx.rsp, thread.ustack_pages * paging.PAGE4K);
+    }
+    serial.print("\n", .{});
+
+    dumpInterruptFrame(thread.ctx);
+    serial.print("\n\n", .{});
+}
+
+/// Summary:
+/// Print a compact banner of key RFLAGS bits (IF/ZF/PF/SF).
+///
+/// Arguments:
+/// - `rfl`: RFLAGS value
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+pub fn printRflagsBrief(rfl: u64) void {
+    var buf: [16]u8 = undefined;
+    var i: u64 = 0;
+
+    if ((rfl & (1 << 9)) != 0) {
+        buf[i] = 'I';
+        i += 1;
+        buf[i] = 'F';
+        i += 1;
+        buf[i] = ' ';
+        i += 1;
+    }
+    if ((rfl & (1 << 6)) != 0) {
+        buf[i] = 'Z';
+        i += 1;
+        buf[i] = 'F';
+        i += 1;
+        buf[i] = ' ';
+        i += 1;
+    }
+    if ((rfl & (1 << 2)) != 0) {
+        buf[i] = 'P';
+        i += 1;
+        buf[i] = 'F';
+        i += 1;
+        buf[i] = ' ';
+        i += 1;
+    }
+    if ((rfl & (1 << 7)) != 0) {
+        buf[i] = 'S';
+        i += 1;
+        buf[i] = 'F';
+        i += 1;
+        buf[i] = ' ';
+        i += 1;
+    }
+
+    if (i > 0 and buf[i - 1] == ' ') i -= 1;
+
+    serial.print("    [{s}]", .{buf[0..i]});
+}
+
+/// Summary:
+/// Initialize the debugger (mask interrupts, enumerate processes, bring up PS/2) and enter the REPL.
+///
+/// Arguments:
+/// - None.
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - Panics if PS/2 init fails (logs error then halts).
+pub fn init() void {
+    const saved_rflags = cpu.saveAndDisableInterrupts();
+
+    enumerateProcesses();
+
+    ps2.init(.{}) catch |e| {
+        serial.print("ps/2 init failed: {}\n", .{e});
+        cpu.restoreInterrupts(saved_rflags);
+        cpu.halt();
+    };
+
+    repl();
+
+    cpu.restoreInterrupts(saved_rflags);
+    cpu.halt();
+}
+
+/// Summary:
+/// Populate the sparse PID→Process table from the run queue.
+///
+/// Arguments:
+/// - None.
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+fn enumerateProcesses() void {
+    var current_thread: ?*sched.Thread = &sched.rq.sentinel;
+    while (current_thread) |thread| {
+        if (procs_array[thread.proc.pid] == null) {
+            procs_array[thread.proc.pid] = thread.proc;
+            if (thread.proc.pid > max_pid) max_pid = thread.proc.pid;
+        }
+        current_thread = thread.next;
+    }
+}
+
+/// Summary:
+/// Dispatch a command string to the appropriate sub-handler.
+///
+/// Arguments:
+/// - `cmd`: command buffer slice
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+fn executeCmd(cmd: []const u8) void {
+    if (std.mem.eql(u8, cmd, Commands.lsprocs)) {
+        lsProcs();
+    } else if (std.mem.eql(u8, cmd, Commands.lsprocsv)) {
+        lsProcsVerbose();
+    } else if (cmd.len > Commands.proc.len and std.mem.startsWith(u8, cmd, Commands.proc)) {
+        printProcess(cmd);
+    } else if (cmd.len > Commands.thread.len and std.mem.startsWith(u8, cmd, Commands.thread)) {
+        printThread(cmd);
+    } else if (cmd.len > Commands.page_tablesv.len and std.mem.startsWith(u8, cmd, Commands.page_tablesv)) {
+        printPageTables(cmd, true);
+        // must precede the non-verbose form
+    } else if (cmd.len > Commands.page_tables.len and std.mem.startsWith(u8, cmd, Commands.page_tables)) {
+        printPageTables(cmd, false);
+    } else if (std.mem.eql(u8, cmd, Commands.help)) {
+        help();
+    } else if (std.mem.eql(u8, cmd, Commands.newline)) {
+        return;
+    } else {
+        serial.print("Invalid Command: {s}\n", .{cmd});
+    }
+}
+
+/// Summary:
+/// Print the debugger help and filter options.
+///
+/// Arguments:
+/// - None.
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+fn help() void {
+    serial.print("Commands:\n", .{});
+    serial.print("  {s:<12} List processes\n", .{Commands.lsprocs});
+    serial.print("  {s:<12} List processes (verbose)\n", .{Commands.lsprocsv});
+    serial.print("  {s:<12} Show info for a process (usage: proc <pid>)\n", .{Commands.proc});
+    serial.print("  {s:<12} Show info for a thread (usage: thread <tid>)\n", .{Commands.thread});
+    serial.print("  {s:<12} Dump page tables (usage: pt <pid> [filters])\n", .{Commands.page_tables});
+    serial.print("  {s:<12} Dump page tables (verbose) (usage: pt -v <pid> [filters])\n", .{Commands.page_tablesv});
+    serial.print("  {s:<12} Show this help menu\n", .{Commands.help});
+    serial.print("\n", .{});
+    serial.print("Page table filter options:\n", .{});
+    serial.print("  Flag:      Options:        Summary:\n", .{});
+    serial.print("  ---------  --------------  -------------------------------\n", .{});
+    serial.print("  -l4        <0-511>         Filter by L4 index\n", .{});
+    serial.print("  -l3        <0-511>         Filter by L3 index\n", .{});
+    serial.print("  -l2        <0-511>         Filter by L2 index\n", .{});
+    serial.print("  -l1        <0-511>         Filter by L1 index\n", .{});
+    serial.print("  -rw        <ro|rw>         Filter by read/write permission\n", .{});
+    serial.print("  -nx        <x|nx>          Filter by execute permission\n", .{});
+    serial.print("  -u         <u|su>          Filter by user/supervisor\n", .{});
+    serial.print("  -cache     <cache|ncache>  Filter by cache setting\n", .{});
+    serial.print("  -wrt       <true|false>    Filter by write-through\n", .{});
+    serial.print("  -global    <true|false>    Filter by global flag\n", .{});
+    serial.print("  -accessed  <true|false>    Filter by accessed bit\n", .{});
+    serial.print("  -dirty     <true|false>    Filter by dirty bit\n", .{});
+    serial.print("  -page4k    <true|false>    Filter 4KB pages\n", .{});
+    serial.print("  -page2m    <true|false>    Filter 2MB pages\n", .{});
+    serial.print("  -page1g    <true|false>    Filter 1GB pages\n", .{});
+    serial.print("\nExample: pt 1 -rw rw -nx nx -page2m true\n", .{});
+}
+
+/// Summary:
+/// List all discovered processes in brief form.
+///
+/// Arguments:
+/// - None.
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+fn lsProcs() void {
+    for (0..max_pid + 1) |pid| {
+        if (procs_array[pid]) |proc| {
+            dumpProcess(proc);
+        }
+    }
+}
+
+/// Summary:
+/// List all discovered processes in verbose form.
+///
+/// Arguments:
+/// - None.
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+fn lsProcsVerbose() void {
+    for (0..max_pid + 1) |pid| {
+        if (procs_array[pid]) |proc| {
+            dumpProcessVerbose(proc);
+        }
+    }
+}
+
+/// Summary:
+/// Return true if a page entry and its indices match the provided filter.
+///
+/// Arguments:
+/// - `e`: page entry to test
+/// - `filter`: optional filter
+/// - `l4_idx`: optional L4 index
+/// - `l3_idx`: optional L3 index
+/// - `l2_idx`: optional L2 index
+/// - `l1_idx`: optional L1 index
+/// - `page_size`: the interpreted size of the mapped page
+///
+/// Returns:
+/// - `true` if the entry matches; otherwise `false`.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 fn matchesFilter(
     e: paging.PageEntry,
     filter: ?PageEntryFilter,
@@ -128,7 +752,21 @@ fn matchesFilter(
     return true;
 }
 
-pub fn parsePageEntryFilter(args: []const u8) ?PageEntryFilter {
+/// Summary:
+/// Parse `pt` filter flags from a raw argument string.
+///
+/// Arguments:
+/// - `args`: raw tail of the command line after `<pid>`
+///
+/// Returns:
+/// - A `PageEntryFilter` on success; `null` on parse failure.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+fn parsePageEntryFilter(args: []const u8) ?PageEntryFilter {
     var filter = PageEntryFilter{
         .l4 = null,
         .l3 = null,
@@ -268,31 +906,49 @@ pub fn parsePageEntryFilter(args: []const u8) ?PageEntryFilter {
     return filter;
 }
 
-pub fn dumpPageEntry(e: paging.PageEntry) void {
-    serial.print("RW:{s:>2} NX:{s:>2} U:{s:>2} C:{s:>6} PAddr:0x{X:016}\n", .{
-        @tagName(e.rw),
-        @tagName(e.nx),
-        @tagName(e.user),
-        @tagName(e.cache_disable),
-        e.getPAddr().addr,
-    });
+/// Summary:
+/// Parse an unsigned base-10 integer from ASCII.
+///
+/// Arguments:
+/// - `s`: ASCII digits
+///
+/// Returns:
+/// - Parsed value on success; `null` on failure or overflow.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+fn parseU64Dec(s: []const u8) ?u64 {
+    if (s.len == 0) return null;
+    var n: u64 = 0;
+    for (s) |c| {
+        if (c < '0' or c > '9') return null;
+        const d: u64 = c - '0';
+        if (n > (@as(u64, ~@as(u64, 0)) - d) / 10) return null;
+        n = n * 10 + d;
+    }
+    return n;
 }
 
-pub fn dumpPageEntryVerbose(e: paging.PageEntry) void {
-    serial.print("\n", .{});
-    serial.print("    PAddr:    0x{X:016}\n", .{e.getPAddr().addr});
-    serial.print("    RW:       {s}\n", .{@tagName(e.rw)});
-    serial.print("    NX:       {s}\n", .{@tagName(e.nx)});
-    serial.print("    User:     {s}\n", .{@tagName(e.user)});
-    serial.print("    Cache:    {s}\n", .{@tagName(e.cache_disable)});
-    serial.print("    WRT:      {}\n", .{e.write_through});
-    serial.print("    Huge:     {}\n", .{e.huge_page});
-    serial.print("    Global:   {}\n", .{e.global});
-    serial.print("    Accessed: {}\n", .{e.accessed});
-    serial.print("    Dirty:    {}\n", .{e.dirty});
-    serial.print("\n", .{});
-}
-
+/// Summary:
+/// Print a four-index bracket `[l4,l3,l2,l1]`, substituting `___` for nulls.
+///
+/// Arguments:
+/// - `l4`: optional L4 index
+/// - `l3`: optional L3 index
+/// - `l2`: optional L2 index
+/// - `l1`: optional L1 index
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 fn printIdx4(l4: ?u64, l3: ?u64, l2: ?u64, l1: ?u64) void {
     const idxs = [_]?u64{ l4, l3, l2, l1 };
 
@@ -310,68 +966,127 @@ fn printIdx4(l4: ?u64, l3: ?u64, l2: ?u64, l1: ?u64) void {
     }
 }
 
-pub fn dumpPageTables(pml4_virt: paging.VAddr, verbose: bool, filter: ?PageEntryFilter) void {
-    const L = paging.PAGE_TABLE_SIZE;
-    const pml4: [*]paging.PageEntry = @ptrFromInt(pml4_virt.addr);
+/// Summary:
+/// Parse and execute the `pt` command (non-verbose or `-v`) for a specific PID.
+///
+/// Arguments:
+/// - `cmd`: full command buffer
+/// - `verbose`: true for `pt -v`
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+fn printPageTables(cmd: []const u8, verbose: bool) void {
+    var base_end = if (verbose) Commands.page_tablesv.len else Commands.page_tables.len;
 
-    var total_checked: u64 = 0;
-    var total_matched: u64 = 0;
-    var l4_entries_present: u64 = 0;
+    while (base_end < cmd.len and cmd[base_end] == ' ') : (base_end += 1) {}
+    const pid_start = base_end;
 
-    for (pml4[0..L], 0..) |e4, idx4_us| {
-        if (!e4.present) continue;
-        const idx4: u64 = @intCast(idx4_us);
-        l4_entries_present += 1;
+    var pid_end = pid_start;
+    while (pid_end < cmd.len and cmd[pid_end] != ' ') : (pid_end += 1) {}
 
-        const pdpt: [*]paging.PageEntry = @ptrFromInt(paging.VAddr.fromPAddr(e4.getPAddr(), .physmap).addr);
-        for (pdpt[0..L], 0..) |e3, idx3_us| {
-            if (!e3.present) continue;
-            const idx3: u64 = @intCast(idx3_us);
+    const pid_str = cmd[pid_start..pid_end];
+    const pid = parseU64Dec(pid_str) orelse {
+        serial.print("Invalid pid: {s}\n", .{pid_str});
+        return;
+    };
 
-            if (e3.huge_page) {
-                total_checked += 1;
-                if (matchesFilter(e3, filter, idx4, idx3, null, null, .page1g)) {
-                    total_matched += 1;
-                    printIdx4(idx4, idx3, null, null);
-                    if (verbose) dumpPageEntryVerbose(e3) else dumpPageEntry(e3);
-                }
-                continue;
-            }
+    const filter_args = if (pid_end < cmd.len) cmd[pid_end..] else "";
+    const filter = if (filter_args.len > 0) parsePageEntryFilter(filter_args) else null;
 
-            const pd: [*]paging.PageEntry = @ptrFromInt(paging.VAddr.fromPAddr(e3.getPAddr(), .physmap).addr);
-            for (pd[0..L], 0..) |e2, idx2_us| {
-                if (!e2.present) continue;
-                const idx2: u64 = @intCast(idx2_us);
-
-                if (e2.huge_page) {
-                    total_checked += 1;
-                    if (matchesFilter(e2, filter, idx4, idx3, idx2, null, .page2m)) {
-                        total_matched += 1;
-                        printIdx4(idx4, idx3, idx2, null);
-                        if (verbose) dumpPageEntryVerbose(e2) else dumpPageEntry(e2);
-                    }
-                    continue;
-                }
-
-                const pt: [*]paging.PageEntry = @ptrFromInt(paging.VAddr.fromPAddr(e2.getPAddr(), .physmap).addr);
-                for (pt[0..L], 0..) |e1, idx1_us| {
-                    if (!e1.present) continue;
-                    const idx1: u64 = @intCast(idx1_us);
-
-                    total_checked += 1;
-                    if (matchesFilter(e1, filter, idx4, idx3, idx2, idx1, .page4k)) {
-                        total_matched += 1;
-                        printIdx4(idx4, idx3, idx2, idx1);
-                        if (verbose) dumpPageEntryVerbose(e1) else dumpPageEntry(e1);
-                    }
-                }
-            }
-        }
+    if (procs_array[pid]) |proc| {
+        dumpPageTables(proc.pml4_virt, verbose, filter);
+    } else {
+        serial.print("Invalid pid: {}\n", .{pid});
     }
-
-    serial.print("{} matched filter / {} total\n", .{ total_matched, total_checked });
 }
 
+/// Summary:
+/// Parse and execute the `proc <pid>` command.
+///
+/// Arguments:
+/// - `cmd`: full command buffer
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+fn printProcess(cmd: []const u8) void {
+    const tail = cmd[Commands.proc.len..cmd.len];
+    const pid = parseU64Dec(tail) orelse {
+        serial.print("Invalid pid: {s}\n", .{tail});
+        return;
+    };
+    if (procs_array[pid]) |proc| {
+        dumpProcessVerbose(proc);
+    } else {
+        serial.print("Invalid pid: {}\n", .{pid});
+    }
+}
+
+/// Summary:
+/// Print a range with human-friendly size suffixes.
+///
+/// Arguments:
+/// - `lo`: low address (inclusive)
+/// - `hi`: high address (exclusive)
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+fn printRangeWithSize(lo: u64, hi: u64) void {
+    if (hi <= lo) return;
+    const bytes = hi - lo;
+
+    const gib = bytes / (1024 * 1024 * 1024);
+    const mib = (bytes / (1024 * 1024)) % 1024;
+    const kib = (bytes / 1024) % 1024;
+
+    serial.print("     · 0x{X:016} - 0x{X:016} (", .{ lo, hi });
+
+    if (gib > 0) {
+        serial.print("{d} GiB", .{gib});
+        if (mib > 0 or kib > 0) serial.print(" {d} MiB {d} KiB", .{ mib, kib });
+    } else if (mib > 0) {
+        serial.print("{d} MiB", .{mib});
+        if (kib > 0) serial.print(" {d} KiB", .{kib});
+    } else {
+        serial.print("{d} KiB", .{kib});
+    }
+
+    serial.print(")\n", .{});
+}
+
+/// Summary:
+/// Print a `(used KiB / total KiB)` usage line for a downward-growing stack.
+///
+/// Arguments:
+/// - `stack_base`: base/top of the stack
+/// - `rsp`: current stack pointer
+/// - `total_size_bytes`: total stack bytes
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
 fn printStackUsage(stack_base: u64, rsp: u64, total_size_bytes: u64) void {
     if (total_size_bytes == 0) {
         serial.print("(unknown / 0 KiB)", .{});
@@ -397,216 +1112,21 @@ fn printStackUsage(stack_base: u64, rsp: u64, total_size_bytes: u64) void {
     serial.print("({d}.{d} KiB/{d} KiB)\n", .{ used_whole, used_frac, total_kib });
 }
 
-fn printRangeWithSize(lo: u64, hi: u64) void {
-    if (hi <= lo) return;
-    const bytes = hi - lo;
-
-    const gib = bytes / (1024 * 1024 * 1024);
-    const mib = (bytes / (1024 * 1024)) % 1024;
-    const kib = (bytes / 1024) % 1024;
-
-    serial.print("     · 0x{X:016} - 0x{X:016} (", .{ lo, hi });
-
-    if (gib > 0) {
-        serial.print("{d} GiB", .{gib});
-        if (mib > 0 or kib > 0) serial.print(" {d} MiB {d} KiB", .{ mib, kib });
-    } else if (mib > 0) {
-        serial.print("{d} MiB", .{mib});
-        if (kib > 0) serial.print(" {d} KiB", .{kib});
-    } else {
-        serial.print("{d} KiB", .{kib});
-    }
-
-    serial.print(")\n", .{});
-}
-
-pub fn printRflagsBrief(rfl: u64) void {
-    var buf: [16]u8 = undefined;
-    var i: u64 = 0;
-
-    if ((rfl & (1 << 9)) != 0) {
-        buf[i] = 'I';
-        i += 1;
-        buf[i] = 'F';
-        i += 1;
-        buf[i] = ' ';
-        i += 1;
-    } // IF
-    if ((rfl & (1 << 6)) != 0) {
-        buf[i] = 'Z';
-        i += 1;
-        buf[i] = 'F';
-        i += 1;
-        buf[i] = ' ';
-        i += 1;
-    } // ZF
-    if ((rfl & (1 << 2)) != 0) {
-        buf[i] = 'P';
-        i += 1;
-        buf[i] = 'F';
-        i += 1;
-        buf[i] = ' ';
-        i += 1;
-    } // PF
-    if ((rfl & (1 << 7)) != 0) {
-        buf[i] = 'S';
-        i += 1;
-        buf[i] = 'F';
-        i += 1;
-        buf[i] = ' ';
-        i += 1;
-    } // SF
-
-    if (i > 0 and buf[i - 1] == ' ') i -= 1;
-
-    serial.print("    [{s}]", .{buf[0..i]});
-}
-
-pub fn dumpInterruptFrame(ctx: *cpu.Context) void {
-    serial.print("🪂 INTERRUPT FRAME\n", .{});
-    printRflagsBrief(ctx.rflags);
-    const int_str = blk: {
-        if (ctx.int_num <= 32) {
-            const exception: exceptions.Exception = @enumFromInt(ctx.int_num);
-            break :blk @tagName(exception);
-        } else {
-            const int_vec: idt.IntVectors = @enumFromInt(ctx.int_num);
-            break :blk @tagName(int_vec);
-        }
-    };
-    serial.print(" INT={s}\n", .{int_str});
-
-    serial.print("    rfl=0x{X:016}  ", .{ctx.rflags});
-    serial.print("rip=0x", .{});
-    panic_mod.logAddr(ctx.rip);
-    serial.print("    rsp=0x{X:016}   cs=0x{X:03}\n", .{ ctx.rsp, ctx.cs });
-    serial.print("    err=0x{X:016}   ss=0x{X:03}\n", .{ ctx.err_code, ctx.ss });
-    serial.print("\n", .{});
-
-    const reg_names = [_][]const u8{
-        "r15", "r14", "r13", "r12",
-        "r11", "r10", " r9", " r8",
-        "rdi", "rsi", "rbp", "rbx",
-        "rdx", "rcx", "rax", "int",
-    };
-    const words: [*]const u64 = @ptrCast(ctx);
-
-    var i: u64 = 0;
-    while (i < 16) : (i += 4) {
-        serial.print(
-            "    {s}=0x{X:016}  {s}=0x{X:016}  {s}=0x{X:016}  {s}=0x{X:016}\n",
-            .{
-                reg_names[i],     words[i],
-                reg_names[i + 1], words[i + 1],
-                reg_names[i + 2], words[i + 2],
-                reg_names[i + 3], words[i + 3],
-            },
-        );
-    }
-}
-
-pub fn dumpThreadVerbose(thread: *sched.Thread) void {
-    serial.print("🧵 THREAD {}", .{thread.tid});
-    if (thread == sched.running_thread) {
-        serial.print(" (running 🚀)\n", .{});
-    } else {
-        serial.print("\n", .{});
-    }
-
-    serial.print("    🥞 Kstack base: 0x{X:016} ", .{thread.kstack_base.addr});
-    if (thread.ustack_base == null) {
-        if (thread == sched.running_thread) {
-            const current_rsp = cpu.readCurrentRsp();
-            printStackUsage(thread.kstack_base.addr, current_rsp, thread.kstack_pages * paging.PAGE4K);
-        } else {
-            printStackUsage(thread.kstack_base.addr, thread.ctx.rsp, thread.kstack_pages * paging.PAGE4K);
-        }
-    } else {
-        printStackUsage(thread.kstack_base.addr, thread.kstack_base.addr, thread.kstack_pages * paging.PAGE4K);
-        serial.print("    📚 Ustack base: 0x{X:016} ", .{thread.ustack_base.?.addr});
-        printStackUsage(thread.ustack_base.?.addr, thread.ctx.rsp, thread.ustack_pages * paging.PAGE4K);
-    }
-    serial.print("\n", .{});
-
-    dumpInterruptFrame(thread.ctx);
-    serial.print("\n\n", .{});
-}
-
-pub fn dumpThread(thread: *sched.Thread) void {
-    serial.print("TID {}", .{thread.tid});
-    if (thread == sched.running_thread) {
-        serial.print(" (running 🚀)\n", .{});
-    } else {
-        serial.print("\n", .{});
-    }
-}
-
-pub fn dumpProcessVerbose(proc: *sched.Process) void {
-    const ring_sym = if (proc.cpl == .ring_0) "👑" else "🔒";
-    serial.print("{s} PROCESS {}\n", .{ ring_sym, proc.pid });
-
-    serial.print("    PML4 @ 0x{X:016} | Threads: {}\n", .{ proc.pml4_virt.addr, proc.num_threads });
-
-    serial.print("    VMM Reserved:\n", .{});
-    for (0..proc.vmm.vmm_allocations_idx) |i| {
-        const region = proc.vmm.vmm_allocations[i];
-        printRangeWithSize(region.vaddr.addr, region.vaddr.addr + region.size);
-    }
-    serial.print("\n", .{});
-
-    serial.print("    Threads:\n", .{});
-    for (0..proc.num_threads) |i| {
-        serial.print("     · ", .{});
-        dumpThread(proc.threads[i]);
-    }
-}
-
-pub fn dumpProcess(proc: *sched.Process) void {
-    const ring_sym = if (proc.cpl == .ring_0) "👑" else "🔒";
-    serial.print("{s} PID: {}\n", .{ ring_sym, proc.pid });
-}
-
-pub fn enumerateProcesses() void {
-    var current_thread: ?*sched.Thread = &sched.rq.sentinel;
-    while (current_thread) |thread| {
-        if (procs_array[thread.proc.pid] == null) {
-            procs_array[thread.proc.pid] = thread.proc;
-            if (thread.proc.pid > max_pid) max_pid = thread.proc.pid;
-        }
-        current_thread = thread.next;
-    }
-}
-
-pub fn lsProcs() void {
-    for (0..max_pid + 1) |pid| {
-        if (procs_array[pid]) |proc| {
-            dumpProcess(proc);
-        }
-    }
-}
-
-pub fn lsProcsVerbose() void {
-    for (0..max_pid + 1) |pid| {
-        if (procs_array[pid]) |proc| {
-            dumpProcessVerbose(proc);
-        }
-    }
-}
-
-pub fn printProcess(cmd: []const u8) void {
-    const tail = cmd[Commands.proc.len..cmd.len];
-    const pid = parseU64Dec(tail) orelse {
-        serial.print("Invalid pid: {s}\n", .{tail});
-        return;
-    };
-    if (procs_array[pid]) |proc| {
-        dumpProcessVerbose(proc);
-    } else {
-        serial.print("Invalid pid: {}\n", .{pid});
-    }
-}
-
-pub fn printThread(cmd: []const u8) void {
+/// Summary:
+/// Parse and execute the `thread <tid>` command.
+///
+/// Arguments:
+/// - `cmd`: full command buffer
+///
+/// Returns:
+/// - None.
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - None.
+fn printThread(cmd: []const u8) void {
     const tail = cmd[Commands.thread.len..cmd.len];
     const tid = parseU64Dec(tail) orelse {
         serial.print("Invalid tid: {s}\n", .{tail});
@@ -627,95 +1147,21 @@ pub fn printThread(cmd: []const u8) void {
     serial.print("Invalid tid: {}\n", .{tid});
 }
 
-pub fn printPageTables(cmd: []const u8, verbose: bool) void {
-    var base_end = if (verbose) Commands.page_tablesv.len else Commands.page_tables.len;
-
-    while (base_end < cmd.len and cmd[base_end] == ' ') : (base_end += 1) {}
-    const pid_start = base_end;
-
-    var pid_end = pid_start;
-    while (pid_end < cmd.len and cmd[pid_end] != ' ') : (pid_end += 1) {}
-
-    const pid_str = cmd[pid_start..pid_end];
-    const pid = parseU64Dec(pid_str) orelse {
-        serial.print("Invalid pid: {s}\n", .{pid_str});
-        return;
-    };
-
-    const filter_args = if (pid_end < cmd.len) cmd[pid_end..] else "";
-    const filter = if (filter_args.len > 0) parsePageEntryFilter(filter_args) else null;
-
-    if (procs_array[pid]) |proc| {
-        dumpPageTables(proc.pml4_virt, verbose, filter);
-    } else {
-        serial.print("Invalid pid: {}\n", .{pid});
-    }
-}
-
-const Commands = struct {
-    pub const lsprocs = "lsprocs";
-    pub const lsprocsv = "lsprocs -v";
-    pub const proc = "proc ";
-    pub const thread = "thread ";
-    pub const help = "help";
-    pub const page_tables = "pt ";
-    pub const page_tablesv = "pt -v ";
-    pub const newline = "";
-};
-
-fn help() void {
-    serial.print("Commands:\n", .{});
-    serial.print("  {s:<12} List processes\n", .{Commands.lsprocs});
-    serial.print("  {s:<12} List processes (verbose)\n", .{Commands.lsprocsv});
-    serial.print("  {s:<12} Show info for a process (usage: proc <pid>)\n", .{Commands.proc});
-    serial.print("  {s:<12} Show info for a thread (usage: thread <tid>)\n", .{Commands.thread});
-    serial.print("  {s:<12} Dump page tables (usage: pt <pid> [filters])\n", .{Commands.page_tables});
-    serial.print("  {s:<12} Dump page tables (verbose) (usage: pt -v <pid> [filters])\n", .{Commands.page_tablesv});
-    serial.print("  {s:<12} Show this help menu\n", .{Commands.help});
-    serial.print("\n", .{});
-    serial.print("Page table filter options:\n", .{});
-    serial.print("  -l4 <0-511>    Filter by L4 index\n", .{});
-    serial.print("  -l3 <0-511>    Filter by L3 index\n", .{});
-    serial.print("  -l2 <0-511>    Filter by L2 index\n", .{});
-    serial.print("  -l1 <0-511>    Filter by L1 index\n", .{});
-    serial.print("  -rw <ro|rw>    Filter by read/write permission\n", .{});
-    serial.print("  -nx <x|nx>     Filter by execute permission\n", .{});
-    serial.print("  -u  <u|su>     Filter by user/supervisor\n", .{});
-    serial.print("  -cache <cache|ncache>  Filter by cache setting\n", .{});
-    serial.print("  -wrt <true|false>      Filter by write-through\n", .{});
-    serial.print("  -global <true|false>   Filter by global flag\n", .{});
-    serial.print("  -accessed <true|false> Filter by accessed bit\n", .{});
-    serial.print("  -dirty <true|false>    Filter by dirty bit\n", .{});
-    serial.print("  -page4k <true|false>   Filter 4KB pages\n", .{});
-    serial.print("  -page2m <true|false>   Filter 2MB pages\n", .{});
-    serial.print("  -page1g <true|false>   Filter 1GB pages\n", .{});
-    serial.print("\nExample: pt 1 -rw rw -nx nx -page2m true\n", .{});
-}
-
-pub fn executeCmd(cmd: []const u8) void {
-    if (std.mem.eql(u8, cmd, Commands.lsprocs)) {
-        lsProcs();
-    } else if (std.mem.eql(u8, cmd, Commands.lsprocsv)) {
-        lsProcsVerbose();
-    } else if (cmd.len > Commands.proc.len and std.mem.startsWith(u8, cmd, Commands.proc)) {
-        printProcess(cmd);
-    } else if (cmd.len > Commands.thread.len and std.mem.startsWith(u8, cmd, Commands.thread)) {
-        printThread(cmd);
-    } else if (cmd.len > Commands.page_tablesv.len and std.mem.startsWith(u8, cmd, Commands.page_tablesv)) {
-        printPageTables(cmd, true);
-        // page tables -v command must come before the non verbose command so it's parsed correctly
-    } else if (cmd.len > Commands.page_tables.len and std.mem.startsWith(u8, cmd, Commands.page_tables)) {
-        printPageTables(cmd, false);
-    } else if (std.mem.eql(u8, cmd, Commands.help)) {
-        help();
-    } else if (std.mem.eql(u8, cmd, Commands.newline)) {
-        return;
-    } else {
-        serial.print("Invalid Command: {s}\n", .{cmd});
-    }
-}
-
-pub fn repl() void {
+/// Summary:
+/// Read keystrokes from PS/2 and drive the debugger REPL.
+///
+/// Arguments:
+/// - None.
+///
+/// Returns:
+/// - Never returns (halts on exit).
+///
+/// Errors:
+/// - None.
+///
+/// Panics:
+/// - Panics if the command buffer overflows.
+fn repl() void {
     var cmd_buf: [CMD_BUF_SIZE]u8 = undefined;
     var cmd_idx: u8 = 0;
 
@@ -757,33 +1203,4 @@ pub fn repl() void {
             }
         }
     }
-}
-
-pub fn init() void {
-    const saved_rflags = cpu.saveAndDisableInterrupts();
-
-    enumerateProcesses();
-
-    ps2.init(.{}) catch |e| {
-        serial.print("ps/2 init failed: {}\n", .{e});
-        cpu.restoreInterrupts(saved_rflags);
-        cpu.halt();
-    };
-
-    repl();
-
-    cpu.restoreInterrupts(saved_rflags);
-    cpu.halt();
-}
-
-fn parseU64Dec(s: []const u8) ?u64 {
-    if (s.len == 0) return null;
-    var n: u64 = 0;
-    for (s) |c| {
-        if (c < '0' or c > '9') return null;
-        const d: u64 = c - '0';
-        if (n > (@as(u64, ~@as(u64, 0)) - d) / 10) return null;
-        n = n * 10 + d;
-    }
-    return n;
 }
