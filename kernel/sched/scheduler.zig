@@ -224,7 +224,9 @@ pub const Thread = struct {
     tid: u64,
     ctx: *cpu.Context,
     ustack_base: ?VAddr,
+    ustack_pages: u64,
     kstack_base: VAddr,
+    kstack_pages: u64,
     proc: *Process,
     next: ?*Thread = null,
 
@@ -259,12 +261,13 @@ pub const Thread = struct {
         thread.tid = tid_counter;
         tid_counter += 1;
 
+        thread.kstack_pages = 4;
         const pmm_iface = pmm_mod.global_pmm.?.allocator();
-        const kstack_pages = try pmm_iface.alloc(paging.PageMem(.Page4K), 4);
+        const kstack_pages = try pmm_iface.alloc(paging.PageMem(.Page4K), thread.kstack_pages);
         errdefer pmm_iface.free(kstack_pages);
 
         const kstack_virt = VAddr.fromInt(@intFromPtr(kstack_pages.ptr));
-        const kstack_base = kstack_virt.addr + paging.PAGE4K * 4;
+        const kstack_base = kstack_virt.addr + paging.PAGE4K * thread.kstack_pages;
         thread.kstack_base = VAddr.fromInt(std.mem.alignBackward(u64, kstack_base, 16) - 8);
 
         const ctx_addr: u64 = thread.kstack_base.addr - @sizeOf(cpu.Context);
@@ -290,8 +293,9 @@ pub const Thread = struct {
         };
 
         if (proc.cpl == .ring_3) {
-            const ustack_virt = try proc.vmm.reserve(paging.PAGE4K, paging.PAGE_ALIGN);
-            const ustack_base = ustack_virt.addr + paging.PAGE4K;
+            thread.ustack_pages = 4;
+            const ustack_virt = try proc.vmm.reserve(paging.PAGE4K * thread.ustack_pages, paging.PAGE_ALIGN);
+            const ustack_base = ustack_virt.addr + paging.PAGE4K * thread.ustack_pages;
             thread.ustack_base = VAddr.fromInt(std.mem.alignBackward(u64, ustack_base, 16) - 8);
 
             const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
@@ -457,6 +461,7 @@ pub fn init(t: timers.Timer, slab_backing_allocator: std.mem.Allocator) !void {
     rq.sentinel.proc = &kproc;
     rq.sentinel.tid = 0;
     rq.sentinel.kstack_base = VAddr.fromInt(gdt.main_tss_entry.rsp0);
+    rq.sentinel.kstack_pages = 4;
     rq.sentinel.ustack_base = null;
 
     kproc.threads[kproc.num_threads] = &rq.sentinel;

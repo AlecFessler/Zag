@@ -37,6 +37,7 @@ const zag = @import("zag");
 const memory = zag.memory;
 const pmm_mod = memory.PhysicalMemoryManager;
 const sched = zag.sched.scheduler;
+const debugger = zag.debugger;
 
 pub const Exception = enum(u5) {
     divide_by_zero = 0,
@@ -186,7 +187,7 @@ pub fn init() void {
 /// Panics:
 /// - Panics when invoked from userspace.
 fn breakpointHandler(ctx: *cpu.Context) void {
-    interrupts.dumpInterruptFrame(ctx);
+    debugger.dumpInterruptFrame(ctx);
     const cpl: u64 = ctx.cs & 3;
     if (cpl == 0) {
         return;
@@ -210,7 +211,7 @@ fn breakpointHandler(ctx: *cpu.Context) void {
 /// Panics:
 /// - Panics when invoked from userspace.
 fn debugHandler(ctx: *cpu.Context) void {
-    interrupts.dumpInterruptFrame(ctx);
+    debugger.dumpInterruptFrame(ctx);
     const cpl: u64 = ctx.cs & 3;
     if (cpl == 0) {
         return;
@@ -234,7 +235,7 @@ fn debugHandler(ctx: *cpu.Context) void {
 /// Panics:
 /// - Always panics on divide-by-zero.
 fn divByZeroHandler(ctx: *cpu.Context) void {
-    interrupts.dumpInterruptFrame(ctx);
+    debugger.dumpInterruptFrame(ctx);
     const cpl: u64 = ctx.cs & 3;
     if (cpl == 0) {
         @panic("Divide by zero in kernelspace!");
@@ -258,7 +259,7 @@ fn divByZeroHandler(ctx: *cpu.Context) void {
 /// Panics:
 /// - Always panics on double fault.
 fn doubleFaultHandler(ctx: *cpu.Context) void {
-    interrupts.dumpInterruptFrame(ctx);
+    debugger.dumpInterruptFrame(ctx);
     const cpl: u64 = ctx.cs & 3;
     if (cpl == 0) {
         @panic("Double fault in kernelspace!");
@@ -342,7 +343,7 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         } else if (in_uspace) {
             break :blk .u;
         } else {
-            interrupts.dumpInterruptFrame(ctx);
+            debugger.dumpInterruptFrame(ctx);
             @panic("Non-present page in neither kernel or user address space!");
         }
     };

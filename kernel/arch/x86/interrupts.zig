@@ -29,7 +29,6 @@
 //! - `registerVector` – internal helper to populate `vector_table`.
 //! - `commonInterruptStubPrologue` – naked common ISR prologue (exported).
 //! - `commonInterruptStubEpilogue` – naked common ISR epilogue (exported).
-//! - `dumpInterruptFrame` – pretty-print a saved interrupt frame.
 //! - `dispatchInterrupt` – looks up handler, invokes it, and issues EOI if needed.
 
 const apic = @import("apic.zig");
@@ -37,6 +36,9 @@ const cpu = @import("cpu.zig");
 const idt = @import("idt.zig");
 const serial = @import("serial.zig");
 const std = @import("std");
+const zag = @import("zag");
+
+const debugger = zag.debugger;
 
 pub const VectorAck = enum {
     none,
@@ -292,51 +294,6 @@ export fn commonInterruptStubEpilogue() callconv(.naked) void {
 }
 
 /// Summary:
-/// Pretty-prints the interrupt frame saved by the common stub.
-///
-/// Arguments:
-/// - `ctx`: pointer to the saved `cpu.Context`.
-///
-/// Returns:
-/// - None.
-///
-/// Errors:
-/// - None.
-///
-/// Panics:
-/// - None.
-pub fn dumpInterruptFrame(ctx: *cpu.Context) void {
-    serial.print("INTERRUPT FRAME:\n", .{});
-
-    const reg_names = [_][]const u8{
-        "r15","r14","r13","r12",
-        "r11","r10","r9 ","r8 ",
-        "rdi","rsi","rbp","rbx",
-        "rdx","rcx","rax","INT",
-    };
-
-    const words: [*]const u64 = @ptrCast(ctx);
-    var i: usize = 0;
-    while (i < 16) : (i += 4) {
-        serial.print(
-            "  {s}={x:016}  {s}={x:016}  {s}={x:016}  {s}={x:016}\n",
-            .{
-                reg_names[i],   words[i],
-                reg_names[i+1], words[i+1],
-                reg_names[i+2], words[i+2],
-                reg_names[i+3], words[i+3],
-            },
-        );
-    }
-    serial.print("  err_code ={x:016}\n", .{ words[16] });
-    serial.print("  RIP      ={x:016}\n", .{ words[17] });
-    serial.print("  CS       ={x:016}\n", .{ words[18] });
-    serial.print("  RFLAGS   ={x:016}\n", .{ words[19] });
-    serial.print("  RSP      ={x:016}\n", .{ words[20] });
-    serial.print("  SS       ={x:016}\n", .{ words[21] });
-}
-
-/// Summary:
 /// Dispatches to the registered handler for `ctx.int_num`, then issues LAPIC
 /// EOI if the vector's acknowledgement policy requires it.
 ///
@@ -359,6 +316,6 @@ export fn dispatchInterrupt(ctx: *cpu.Context) void {
         }
         return;
     }
-    dumpInterruptFrame(ctx);
+    debugger.dumpInterruptFrame(ctx);
     @panic("Unhandled interrupt!");
 }
