@@ -88,6 +88,7 @@ const Commands = struct {
     pub const help = "help";
     pub const page_tables = "pt ";
     pub const page_tablesv = "pt -v ";
+    pub const dbg_step = "step ";
     pub const newline = "";
 };
 
@@ -402,6 +403,15 @@ pub fn dumpThreadVerbose(thread: *sched.Thread) void {
     serial.print("\n\n", .{});
 }
 
+fn threadFromTID(tid: u64) ?*sched.Thread {
+    var current_thread: ?*sched.Thread = &sched.rq.sentinel;
+    while (current_thread) |thread| {
+        if (thread.tid == tid) return thread;
+        current_thread = thread.next;
+    }
+    return null;
+}
+
 /// Summary:
 /// Print a compact banner of key RFLAGS bits (IF/ZF/PF/SF).
 ///
@@ -472,17 +482,12 @@ pub fn printRflagsBrief(rfl: u64) void {
 ///
 /// Panics:
 /// - Panics if PS/2 init fails (logs error then halts).
-pub fn init() void {
+pub fn init(ctx: *cpu.Context) void {
     const saved_rflags = cpu.saveAndDisableInterrupts();
 
+    sched.running_thread.?.ctx = ctx;
+    dumpThreadVerbose(sched.running_thread.?);
     enumerateProcesses();
-
-    ps2.init(.{}) catch |e| {
-        serial.print("ps/2 init failed: {}\n", .{e});
-        cpu.restoreInterrupts(saved_rflags);
-        cpu.halt();
-    };
-
     repl();
 
     cpu.restoreInterrupts(saved_rflags);
@@ -542,12 +547,35 @@ fn executeCmd(cmd: []const u8) void {
         // must precede the non-verbose form
     } else if (cmd.len > Commands.page_tables.len and std.mem.startsWith(u8, cmd, Commands.page_tables)) {
         printPageTables(cmd, false);
+    } else if (cmd.len > Commands.dbg_step.len and std.mem.startsWith(u8, cmd, Commands.dbg_step)) {
+        debugStep(cmd);
     } else if (std.mem.eql(u8, cmd, Commands.help)) {
         help();
     } else if (std.mem.eql(u8, cmd, Commands.newline)) {
         return;
     } else {
         serial.print("Invalid Command: {s}\n", .{cmd});
+    }
+}
+
+fn debugStep(cmd: []const u8) void {
+    const tail = cmd[Commands.dbg_step.len..cmd.len];
+    const tid = parseU64Dec(tail) orelse {
+        serial.print("Invalid tid: {s}\n", .{tail});
+        return;
+    };
+
+    const maybe_target = threadFromTID(tid);
+    if (maybe_target) |target| {
+        setTF(target.ctx);
+        asm volatile (
+            \\movq %[new_stack], %%rsp
+            \\jmp commonInterruptStubEpilogue
+            :
+            : [new_stack] "r" (@intFromPtr(target.ctx)),
+        );
+    } else {
+        serial.print("Invalid tid: {}\n", .{tid});
     }
 }
 
@@ -571,6 +599,7 @@ fn help() void {
     serial.print("  {s:<12} List processes (verbose)\n", .{Commands.lsprocsv});
     serial.print("  {s:<12} Show info for a process (usage: proc <pid>)\n", .{Commands.proc});
     serial.print("  {s:<12} Show info for a thread (usage: thread <tid>)\n", .{Commands.thread});
+    serial.print("  {s:<12} Single-step a thread (usage: step <tid>)\n", .{Commands.dbg_step});
     serial.print("  {s:<12} Dump page tables (usage: pt <pid> [filters])\n", .{Commands.page_tables});
     serial.print("  {s:<12} Dump page tables (verbose) (usage: pt -v <pid> [filters])\n", .{Commands.page_tablesv});
     serial.print("  {s:<12} Show this help menu\n", .{Commands.help});
@@ -1165,6 +1194,7 @@ fn repl() void {
     var cmd_buf: [CMD_BUF_SIZE]u8 = undefined;
     var cmd_idx: u8 = 0;
 
+    serial.print("\nZag Dbg: ", .{});
     var exiting = false;
     while (!exiting) {
         if (ps2.pollKeyEvent()) |act| {
@@ -1172,7 +1202,7 @@ fn repl() void {
 
             switch (act.key) {
                 .enter => {
-                    serial.print("\n", .{});
+                    serial.print("\nZag Dbg: ", .{});
                     const cmd_str = cmd_buf[0..cmd_idx];
                     executeCmd(cmd_str);
                     cmd_idx = 0;
@@ -1203,4 +1233,12 @@ fn repl() void {
             }
         }
     }
+}
+
+pub fn breakpoint() void {
+    asm volatile ("int3");
+}
+
+fn setTF(ctx: *cpu.Context) void {
+    ctx.rflags |= (@as(u64, 1) << 8);
 }

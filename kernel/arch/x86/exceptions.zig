@@ -187,10 +187,9 @@ pub fn init() void {
 /// Panics:
 /// - Panics when invoked from userspace.
 fn breakpointHandler(ctx: *cpu.Context) void {
-    debugger.dumpInterruptFrame(ctx);
     const cpl: u64 = ctx.cs & 3;
     if (cpl == 0) {
-        return;
+        debugger.init(ctx);
     } else {
         @panic("Divide by zero in userspace!");
     }
@@ -211,10 +210,9 @@ fn breakpointHandler(ctx: *cpu.Context) void {
 /// Panics:
 /// - Panics when invoked from userspace.
 fn debugHandler(ctx: *cpu.Context) void {
-    debugger.dumpInterruptFrame(ctx);
     const cpl: u64 = ctx.cs & 3;
     if (cpl == 0) {
-        return;
+        debugger.init(ctx);
     } else {
         @panic("Divide by zero in userspace!");
     }

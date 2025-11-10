@@ -467,9 +467,5 @@ pub fn init(t: timers.Timer, slab_backing_allocator: std.mem.Allocator) !void {
     kproc.threads[kproc.num_threads] = &rq.sentinel;
     kproc.num_threads += 1;
 
-    // NOTE: temporary to give the debugger more interesting stuff to dump in development
-    const dbg_thread = try Thread.createThread(&kproc, debugger.init);
-    rq.enqueue(dbg_thread);
-
     running_thread = &rq.sentinel;
 }

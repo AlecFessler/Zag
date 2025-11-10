@@ -28,6 +28,7 @@ const zag = @import("zag");
 const acpi = zag.x86.Acpi;
 const apic = zag.x86.Apic;
 const cpu = zag.x86.Cpu;
+const debugger = zag.debugger;
 const exceptions = zag.x86.Exceptions;
 const gdt = zag.x86.Gdt;
 const idt = zag.x86.Idt;
@@ -405,6 +406,11 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         @panic("Failed to find and initialize HPET!");
     }
 
+    ps2_keyboard.init(.{}) catch |e| {
+        serial.print("ps/2 init failed: {}\n", .{e});
+        cpu.halt();
+    };
+
     const sched_slab_vaddr_space_start = try sched.kproc.vmm.reserve(paging.PAGE1G, paging.PAGE_ALIGN);
     const sched_slab_vaddr_space_end = VAddr.fromInt(sched_slab_vaddr_space_start.addr + paging.PAGE1G);
 
@@ -422,6 +428,8 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         const lapic_timer_iface = lapic_timer.timer();
         try sched.init(lapic_timer_iface, sched_slab_alloc_iface);
     }
+
+    debugger.breakpoint();
 
     sched.armSchedTimer(sched.SCHED_TIMESLICE_NS);
 
