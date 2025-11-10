@@ -38,8 +38,6 @@ const serial = @import("serial.zig");
 const std = @import("std");
 const zag = @import("zag");
 
-const debugger = zag.debugger;
-
 pub const VectorAck = enum {
     none,
     lapic,
@@ -316,6 +314,5 @@ export fn dispatchInterrupt(ctx: *cpu.Context) void {
         }
         return;
     }
-    debugger.dumpInterruptFrame(ctx);
     @panic("Unhandled interrupt!");
 }

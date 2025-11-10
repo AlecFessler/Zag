@@ -189,7 +189,7 @@ pub fn init() void {
 fn breakpointHandler(ctx: *cpu.Context) void {
     const cpl: u64 = ctx.cs & 3;
     if (cpl == 0) {
-        debugger.init(ctx);
+        debugger.control.init(ctx);
     } else {
         @panic("Divide by zero in userspace!");
     }
@@ -212,7 +212,7 @@ fn breakpointHandler(ctx: *cpu.Context) void {
 fn debugHandler(ctx: *cpu.Context) void {
     const cpl: u64 = ctx.cs & 3;
     if (cpl == 0) {
-        debugger.init(ctx);
+        debugger.control.init(ctx);
     } else {
         @panic("Divide by zero in userspace!");
     }
@@ -233,7 +233,6 @@ fn debugHandler(ctx: *cpu.Context) void {
 /// Panics:
 /// - Always panics on divide-by-zero.
 fn divByZeroHandler(ctx: *cpu.Context) void {
-    debugger.dumpInterruptFrame(ctx);
     const cpl: u64 = ctx.cs & 3;
     if (cpl == 0) {
         @panic("Divide by zero in kernelspace!");
@@ -257,7 +256,6 @@ fn divByZeroHandler(ctx: *cpu.Context) void {
 /// Panics:
 /// - Always panics on double fault.
 fn doubleFaultHandler(ctx: *cpu.Context) void {
-    debugger.dumpInterruptFrame(ctx);
     const cpl: u64 = ctx.cs & 3;
     if (cpl == 0) {
         @panic("Double fault in kernelspace!");
@@ -341,7 +339,6 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         } else if (in_uspace) {
             break :blk .u;
         } else {
-            debugger.dumpInterruptFrame(ctx);
             @panic("Non-present page in neither kernel or user address space!");
         }
     };

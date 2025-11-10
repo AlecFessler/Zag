@@ -429,7 +429,7 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
         try sched.init(lapic_timer_iface, sched_slab_alloc_iface);
     }
 
-    debugger.breakpoint();
+    debugger.control.breakpoint();
 
     sched.armSchedTimer(sched.SCHED_TIMESLICE_NS);
 
