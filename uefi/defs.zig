@@ -179,3 +179,27 @@ fn guidEq(a: Guid, b: Guid) bool {
         &b.node,
     );
 }
+
+pub const DwarfSectionId = enum {
+    debug_info,
+    debug_abbrev,
+    debug_str,
+    debug_str_offsets,
+    debug_line,
+    debug_line_str,
+    debug_ranges,
+    debug_loclists,
+    debug_rnglists,
+    debug_addr,
+    debug_names,
+};
+
+pub const Blob = extern struct {
+    ptr: u64,
+    len: u64,
+};
+
+pub const DwarfBootBlobTable = extern struct {
+    present_mask: u32,
+    blobs: [@intFromEnum(DwarfSectionId.debug_names) + 1]Blob,
+};
