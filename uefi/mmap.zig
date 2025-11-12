@@ -40,8 +40,6 @@ pub const MMap = extern struct {
     num_descriptors: u64,
 };
 
-const log = std.log.scoped(.mmap);
-
 /// Function: `mmap.getMmap`
 ///
 /// Summary:
@@ -112,9 +110,6 @@ pub fn getMmap(
             .num_descriptors = @divExact(mmap_size, descriptor_size),
         },
         else => {
-            log.err("Expected success from getMemoryMap but got {s}", .{
-                @tagName(status),
-            });
             return null;
         },
     }

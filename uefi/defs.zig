@@ -39,14 +39,16 @@ pub const MMapEntryType = enum {
     reserved,
 };
 
+pub const Blob = extern struct {
+    ptr: [*]u8,
+    len: u64,
+};
+
 /// Payload handed off from the loader to the kernel at entry.
 pub const BootInfo = extern struct {
     xsdp_paddr: u64,
     mmap: mmap.MMap,
-    ksyms: extern struct {
-        ptr: [*]const u8,
-        len: u64,
-    },
+    elf: Blob,
 };
 
 /// One compacted memory map entry (base address, page count, class).
@@ -179,27 +181,3 @@ fn guidEq(a: Guid, b: Guid) bool {
         &b.node,
     );
 }
-
-pub const DwarfSectionId = enum {
-    debug_info,
-    debug_abbrev,
-    debug_str,
-    debug_str_offsets,
-    debug_line,
-    debug_line_str,
-    debug_ranges,
-    debug_loclists,
-    debug_rnglists,
-    debug_addr,
-    debug_names,
-};
-
-pub const Blob = extern struct {
-    ptr: u64,
-    len: u64,
-};
-
-pub const DwarfBootBlobTable = extern struct {
-    present_mask: u32,
-    blobs: [@intFromEnum(DwarfSectionId.debug_names) + 1]Blob,
-};

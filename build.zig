@@ -121,11 +121,16 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("kernel/arch/x86/x86.zig"),
     });
 
+    const exec_mod = b.addModule("exec", .{
+        .root_source_file = b.path("kernel/exec/exec.zig"),
+    });
+
     const defs_mod = b.addModule("boot_defs", .{
         .root_source_file = b.path("uefi/defs.zig"),
     });
 
     loader.root_module.addImport("x86", x86_mod);
+    loader.root_module.addImport("exec", exec_mod);
     zag_mod.addImport("boot_defs", defs_mod);
     kernel.root_module.addImport("zag", zag_mod);
     kernel.root_module.addImport("boot_defs", defs_mod);

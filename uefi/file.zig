@@ -45,11 +45,47 @@ pub fn openFile(
         &toUCS2(name),
         .read,
         .{},
-    ) catch |err| {
-        std.log.err("Failed to open file: {s} {}", .{ name, err });
+    ) catch {
         return error.aborted;
     };
     return file;
+}
+
+pub fn readFile(
+    file: *uefi.protocol.File,
+    boot_services: *uefi.tables.BootServices,
+) ![]u8 {
+    const Info = uefi.protocol.File.Info;
+
+    const info_len = try file.getInfoSize(.file);
+
+    const info_ptr = try boot_services.allocatePool(.loader_data, info_len);
+    defer boot_services.freePool(@ptrCast(info_ptr)) catch {};
+
+    const info_slice_raw = @as([*]u8, @ptrCast(info_ptr))[0..info_len];
+    const info_slice: []align(@alignOf(Info.File)) u8 = @alignCast(info_slice_raw);
+
+    const finfo = try file.getInfo(.file, info_slice);
+
+    const file_size = std.math.cast(usize, finfo.file_size) orelse return error.OutOfMemory;
+
+    const data_ptr = try boot_services.allocatePool(.acpi_reclaim_memory, file_size);
+    errdefer boot_services.freePool(@ptrCast(data_ptr)) catch {};
+
+    var data = @as([*]u8, @ptrCast(data_ptr))[0..file_size];
+
+    try file.setPosition(0);
+
+    var off: usize = 0;
+    while (off < data.len) {
+        const n = try file.read(data[off..]);
+        if (n == 0) break;
+        off += n;
+    }
+
+    if (off != data.len) return error.UnexpectedEndOfFile;
+
+    return data;
 }
 
 /// Summary:

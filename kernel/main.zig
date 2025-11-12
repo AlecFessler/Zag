@@ -30,6 +30,7 @@ const apic = zag.x86.Apic;
 const cpu = zag.x86.Cpu;
 const debugger = zag.debugger;
 const exceptions = zag.x86.Exceptions;
+const exec = zag.exec;
 const gdt = zag.x86.Gdt;
 const idt = zag.x86.Idt;
 const irq = zag.x86.Irq;
@@ -210,9 +211,6 @@ fn kMain(boot_info: boot_defs.BootInfo) !void {
     bump_allocator.start_addr = bump_alloc_start_virt.addr;
     bump_allocator.free_addr = bump_alloc_free_virt.addr;
     bump_allocator.end_addr = bump_alloc_end_virt.addr;
-
-    const ksyms_bytes: []const u8 = boot_info.ksyms.ptr[0..boot_info.ksyms.len];
-    try zag.panic.initSymbolsFromSlice(ksyms_bytes, bump_alloc_iface.?);
 
     const xsdp_phys = PAddr.fromInt(boot_info.xsdp_paddr);
 
