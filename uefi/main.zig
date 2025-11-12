@@ -2,7 +2,7 @@ const alloc_mod = @import("boot_allocator.zig");
 const defs_mod = @import("defs.zig");
 const file_mod = @import("file.zig");
 const mmap_mod = @import("mmap.zig");
-const exec = @import("exec");
+const elf_dwarf = @import("elf_dwarf");
 const std = @import("std");
 const x86 = @import("x86");
 
@@ -52,7 +52,7 @@ pub fn main() uefi.Status {
 
     const kernel_file = file_mod.openFile(root_dir, "kernel.elf") catch return .aborted;
     const file_bytes = file_mod.readFile(kernel_file, boot_services) catch return .aborted;
-    const parsed_elf = exec.elf.parseElf(file_bytes) catch return .aborted;
+    const parsed_elf = elf_dwarf.elf.parseElf(file_bytes) catch return .aborted;
 
     var current_virt: u64 = undefined;
     var file_bytes_offset: u64 = undefined;

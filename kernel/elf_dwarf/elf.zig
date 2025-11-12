@@ -17,6 +17,7 @@ pub const ParsedElf = struct {
     stack: Section,
 };
 
+/// This function expects the WHOLE FILE
 pub fn parseElf(bytes: []u8) !ParsedElf {
     var result: ParsedElf = undefined;
     result.bytes = bytes;
@@ -72,6 +73,36 @@ pub fn parseElf(bytes: []u8) !ParsedElf {
                 .len = shdr.sh_size,
                 .offset = shdr.sh_offset,
             };
+        }
+
+        if (std.mem.eql(u8, name, ".debug_info")) {
+            //
+        } else if (std.mem.eql(u8, name, ".debug_abbrev")) {
+            //
+        } else if (std.mem.eql(u8, name, ".debug_str")) {
+            //
+        } else if (std.mem.eql(u8, name, ".debug_str_offsets")) {
+            //
+        } else if (std.mem.eql(u8, name, ".debug_line")) {
+            //
+        } else if (std.mem.eql(u8, name, ".debug_line_str")) {
+            //
+        } else if (std.mem.eql(u8, name, ".debug_ranges")) {
+            //
+        } else if (std.mem.eql(u8, name, ".debug_loclists")) {
+            //
+        } else if (std.mem.eql(u8, name, ".debug_rnglists")) {
+            //
+        } else if (std.mem.eql(u8, name, ".debug_addr")) {
+            //
+        } else if (std.mem.eql(u8, name, ".debug_names")) {
+            //
+        } else if (std.mem.eql(u8, name, ".eh_frame")) {
+            //
+        } else if (std.mem.eql(u8, name, ".eh_frame_hdr")) {
+            //
+        } else {
+            //
         }
     }
 

@@ -18,7 +18,7 @@
 pub const containers = @import("containers/containers.zig");
 pub const debugger = @import("debugger/debugger.zig");
 pub const drivers = @import("drivers/drivers.zig");
-pub const exec = @import("exec/exec.zig");
+pub const elf_dwarf = @import("elf_dwarf/elf_dwarf.zig");
 pub const hal = @import("hal/hal.zig");
 pub const math = @import("math/math.zig");
 pub const memory = @import("memory/memory.zig");
