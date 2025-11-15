@@ -14,17 +14,21 @@ export fn kEntry(boot_info: *BootInfo) callconv(.{ .x86_64_sysv = .{} }) noretur
                 \\movq %[sp], %%rsp
                 \\movq %%rsp, %%rbp
                 \\movq %[arg], %%rdi
-                \\jmp *%[kmain]
+                \\jmp *%[ktrampoline]
                 :
                 : [sp] "r" (boot_info.stack_top.addr),
                   [arg] "r" (@intFromPtr(boot_info)),
-                  [kmain] "r" (@intFromPtr(&kMain)),
+                  [ktrampoline] "r" (@intFromPtr(&kTrampoline)),
                 : .{ .rsp = true, .rbp = true, .rdi = true }
             );
         },
         .aarch64 => {},
         else => unreachable,
     }
+    unreachable;
+}
+
+export fn kTrampoline(boot_info: *BootInfo) noreturn {
     kMain(boot_info) catch {
         @panic("Exiting...");
     };
