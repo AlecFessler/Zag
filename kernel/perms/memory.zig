@@ -18,16 +18,16 @@ pub const CachePerm = enum(u2) {
     write_through,
 };
 
-pub const TLBFlushPersistPerm = enum(u1) {
-    always_flush,
-    never_flush,
+pub const GlobalPerm = enum(u1) {
+    not_global,
+    global,
 };
 
 pub const MemoryPerms = packed struct(u64) {
-    write_perm: WritePerm,
-    execute_perm: ExecutePerm,
-    cache_perm: CachePerm,
-    tlb_flush_persist_perm: TLBFlushPersistPerm,
-    privilege_perm: PrivilegePerm,
-    reserved: u58,
+    write_perm: WritePerm = .no_write,
+    execute_perm: ExecutePerm = .no_execute,
+    cache_perm: CachePerm = .write_back,
+    global_perm: GlobalPerm = .not_global,
+    privilege_perm: PrivilegePerm = .kernel,
+    reserved: u58 = 0,
 };

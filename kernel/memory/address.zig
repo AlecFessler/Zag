@@ -1,7 +1,7 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const Range = zag.math.range.Range;
+const Range = zag.utils.range.Range;
 
 pub const AddrSpacePartition = struct {
     pub const userspace: Range = .{

@@ -3,36 +3,24 @@ const std = @import("std");
 const elf = std.elf;
 const Dwarf = std.debug.Dwarf;
 
-pub const Text = struct {
+const ElfSection = enum {
+    text,
+    rodata,
+    data,
+    bss,
+    num_sections,
+};
+
+pub const Section = struct {
     vaddr: u64,
     size: u64,
     offset: u64,
-};
-
-pub const Rodata = struct {
-    vaddr: u64,
-    size: u64,
-    offset: u64,
-};
-
-pub const Data = struct {
-    vaddr: u64,
-    size: u64,
-    offset: u64,
-};
-
-pub const Bss = struct {
-    vaddr: u64,
-    size: u64,
 };
 
 pub const ParsedElf = struct {
     bytes: []u8,
     entry: u64,
-    text: Text,
-    rodata: Rodata,
-    data: Data,
-    bss: Bss,
+    sections: [ElfSection.num_sections]Section,
     dwarf: Dwarf,
 };
 
@@ -56,26 +44,27 @@ pub fn parseElf(result: *ParsedElf, bytes: []u8) !void {
         const writable = (phdr.p_flags & elf.PF_W) != 0;
         const executable = (phdr.p_flags & elf.PF_X) != 0;
         if (!writable and executable) {
-            result.text = .{
+            result.sections[@intFromEnum(ElfSection.text)] = .{
                 .vaddr = phdr.p_vaddr,
                 .size = phdr.p_filesz,
                 .offset = phdr.p_offset,
             };
         } else if (!writable and !executable) {
-            result.rodata = .{
+            result.sections[@intFromEnum(ElfSection.rodata)] = .{
                 .vaddr = phdr.p_vaddr,
                 .size = phdr.p_filesz,
                 .offset = phdr.p_offset,
             };
         } else if (writable and !executable) {
-            result.data = .{
+            result.sections[@intFromEnum(ElfSection.data)] = .{
                 .vaddr = phdr.p_vaddr,
                 .size = phdr.p_filesz,
                 .offset = phdr.p_offset,
             };
-            result.bss = .{
+            result.sections[@intFromEnum(ElfSection.bss)] = .{
                 .vaddr = phdr.p_vaddr + phdr.p_filesz,
                 .size = phdr.p_memsz - phdr.p_filesz,
+                .offset = 0,
             };
         }
     }

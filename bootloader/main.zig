@@ -3,16 +3,18 @@ const page_allocator = @import("page_allocator.zig");
 const std = @import("std");
 const zag = @import("zag");
 
-const BootInfo = zag.boot.protocol.BootInfo;
-const PageAllocator = page_allocator.PageAllocator;
-const ParsedElf = zag.utils.elf.ParsedElf;
-
 const arch = zag.arch.dispatch;
 const elf = zag.utils.elf;
 const paging = zag.memory.paging;
 const uefi = std.os.uefi;
 
+const BootInfo = zag.boot.protocol.BootInfo;
+const ElfSection = elf.ElfSection;
+const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
+const PageAllocator = page_allocator.PageAllocator;
+const ParsedElf = zag.utils.elf.ParsedElf;
+const VAddr = zag.memory.address.VAddr;
 
 pub fn main() uefi.Status {
     const boot_services: *uefi.tables.BootServices = uefi.system_table.boot_services orelse return .aborted;
@@ -57,7 +59,63 @@ pub fn main() uefi.Status {
     const parsed_elf: *ParsedElf = @ptrCast(parsed_elf_mem.ptr);
     elf.parseElf(parsed_elf, file_bytes) catch return .aborted;
 
-    // implement map page and then map in the program headers then call kEntry;
+    const num_sections = @intFromEnum(ElfSection.num_sections);
+    for (0..num_sections) |i| {
+        const section_idx: ElfSection = @enumFromInt(i);
+        const perms: MemoryPerms = switch (section_idx) {
+            .text => .{
+                .write_perm = .no_write,
+                .execute_perm = .execute,
+                .cache_perm = .write_back,
+                .global_perm = .global,
+                .privilege_perm = .kernel,
+            },
+            .rodata => .{
+                .write_perm = .no_write,
+                .execute_perm = .no_execute,
+                .cache_perm = .write_back,
+                .global_perm = .global,
+                .privilege_perm = .kernel,
+            },
+            .data, .bss => .{
+                .write_perm = .write,
+                .execute_perm = .no_execute,
+                .cache_perm = .write_back,
+                .global_perm = .global,
+                .privilege_perm = .kernel,
+            },
+        };
+
+        const section = parsed_elf.sections[i];
+        const start_vaddr = section.vaddr;
+        const end_vaddr = section.vaddr + section.size;
+        var current_vaddr = start_vaddr;
+        var file_offset = section.offset;
+        while (current_vaddr < end_vaddr) {
+            const page = page_alloc_iface.alignedAlloc(
+                u8,
+                paging.PAGE_ALIGN,
+                paging.PAGE4K,
+            ) catch return .aborted;
+            const bytes = file_bytes[file_offset .. file_offset + paging.PAGE4K];
+            @memcpy(page, bytes);
+
+            const page_phys = PAddr.fromInt(@intFromPtr(page.ptr));
+            const page_virt = VAddr.fromInt(current_vaddr);
+
+            arch.mapPage(
+                new_addr_space_root_phys,
+                page_phys,
+                page_virt,
+                .page4k,
+                perms,
+                page_alloc_iface,
+            ) catch return .aborted;
+
+            current_vaddr += paging.PAGE4K;
+            file_offset += paging.PAGE4K;
+        }
+    }
 
     arch.halt();
 }

@@ -4,6 +4,13 @@ pub const Range = struct {
     start: u64,
     end: u64,
 
+    pub fn contains(
+        self: *const Range,
+        value: u64,
+    ) bool {
+        return value >= self.start and value < self.end;
+    }
+
     pub fn overlapsWith(
         self: *const Range,
         other: Range,

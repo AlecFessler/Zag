@@ -4,7 +4,9 @@ const std = @import("std");
 const x64 = @import("x64/x64.zig");
 const zag = @import("zag");
 
+const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
+const PageSize = zag.memory.paging.PageSize;
 const VAddr = zag.memory.address.VAddr;
 
 pub fn init() void {
@@ -15,7 +17,7 @@ pub fn init() void {
     }
 }
 
-pub fn getAddrSpaceRoot() VAddr {
+pub fn getAddrSpaceRoot() PAddr {
     switch (builtin.cpu.arch) {
         .x86_64 => return x64.paging.getAddrSpaceRoot(),
         .aarch64 => return aarch64.paging.getAddrSpaceRoot(),
@@ -27,6 +29,21 @@ pub fn halt() noreturn {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.cpu.halt(),
         .aarch64 => aarch64.cpu.halt(),
+        else => unreachable,
+    }
+}
+
+pub fn mapPage(
+    addr_space_root: VAddr,
+    phys: PAddr,
+    virt: VAddr,
+    size: PageSize,
+    perms: MemoryPerms,
+    allocator: std.mem.Allocator,
+) !void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.mapPage(addr_space_root, phys, virt, size, perms, allocator),
+        .aarch64 => aarch64.paging.mapPage(addr_space_root, phys, virt, size, perms, allocator),
         else => unreachable,
     }
 }
