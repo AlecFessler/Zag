@@ -83,3 +83,8 @@ pub const VAddr = extern struct {
         return @ptrFromInt(self.addr);
     }
 };
+
+pub fn alignStack(stack_top: VAddr) VAddr {
+    const aligned = std.mem.alignBackward(u64, stack_top.addr, 16) - 8;
+    return VAddr.fromInt(aligned);
+}

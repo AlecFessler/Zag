@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    const kvm = b.option(bool, "kvm", "Enable KVM acceleration (default: on)") orelse true;
     const use_llvm = b.option(bool, "use-llvm", "Force LLVM+LLD backend") orelse false;
     const target_arch = b.option([]const u8, "arch", "Target architecture (x64 or arm)") orelse "x64";
 
@@ -87,8 +88,6 @@ pub fn build(b: *std.Build) void {
     );
     install_kernel.step.dependOn(&kernel.step);
     b.getInstallStep().dependOn(&install_kernel.step);
-
-    const kvm = b.option(bool, "kvm", "Enable KVM acceleration (default: on)") orelse true;
 
     const qemu_accel_args: []const u8 = if (kvm)
         \\-enable-kvm \

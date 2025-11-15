@@ -150,10 +150,9 @@ pub fn mapPage(
 
     for (0..3) |i| {
         if (!entry.present) {
-            const page4k_align = paging.PageAlign(.page4k);
-            const new_entry: []align(page4k_align.toByteUnits()) PageEntry = try allocator.alignedAlloc(
+            const new_entry: []align(paging.PAGE4K) PageEntry = try allocator.alignedAlloc(
                 PageEntry,
-                page4k_align,
+                paging.pageAlign(.page4k),
                 PAGE_ENTRY_TABLE_SIZE,
             );
             @memset(new_entry, DEFAULT_PAGE_ENTRY);
@@ -183,6 +182,7 @@ pub fn mapPage(
             0 => l3_idx,
             1 => l2_idx,
             2 => l1_idx,
+            else => unreachable,
         };
         entry = &table[idx];
 

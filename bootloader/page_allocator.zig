@@ -38,15 +38,20 @@ pub const PageAllocator = struct {
     ) ?[*]u8 {
         _ = ret_addr;
         const self: *PageAllocator = @alignCast(@ptrCast(ptr));
-        std.debug.assert(len == paging.PAGE4K);
-        std.debug.assert(alignment.toByteUnits() == paging.PAGE4K);
+        const align_bytes = alignment.toByteUnits();
+
+        std.debug.assert(len > 0);
+        std.debug.assert(align_bytes <= paging.PAGE4K);
+
+        const num_pages = (len + paging.PAGE4K - 1) / paging.PAGE4K;
+
         const pages = self.boot.allocatePages(
             .any,
             self.mem_type,
-            1,
+            num_pages,
         ) catch return null;
-        const page: *[paging.PAGE4K]u8 = &pages[0];
-        return @ptrCast(page);
+
+        return @ptrCast(pages);
     }
 
     fn resize(

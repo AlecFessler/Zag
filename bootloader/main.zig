@@ -4,17 +4,33 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const address = zag.memory.address;
+const boot_protocol = zag.boot.protocol;
 const elf = zag.utils.elf;
 const paging = zag.memory.paging;
 const uefi = std.os.uefi;
 
-const BootInfo = zag.boot.protocol.BootInfo;
+const BootInfo = boot_protocol.BootInfo;
 const ElfSection = elf.ElfSection;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageAllocator = page_allocator.PageAllocator;
 const ParsedElf = zag.utils.elf.ParsedElf;
 const VAddr = zag.memory.address.VAddr;
+
+const KEntryType = fn (*BootInfo) callconv(.{ .x86_64_sysv = .{} }) noreturn;
+
+fn print(
+    comptime fmt: []const u8,
+    args: anytype,
+) void {
+    var buf: [256]u8 = undefined;
+    const str = std.fmt.bufPrint(&buf, fmt ++ "\r\n", args) catch unreachable;
+
+    for (str) |char| {
+        _ = uefi.system_table.con_out.?.outputString(&[_:0]u16{char}) catch unreachable;
+    }
+}
 
 pub fn main() uefi.Status {
     const boot_services: *uefi.tables.BootServices = uefi.system_table.boot_services orelse return .aborted;
@@ -30,12 +46,15 @@ pub fn main() uefi.Status {
     const addr_space_root_bytes_slice = addr_space_root_bytes_ptr[0..paging.PAGE4K];
     const new_addr_space_root = page_alloc_iface.alignedAlloc(
         u8,
-        paging.PAGE_ALIGN,
+        paging.pageAlign(.page4k),
         paging.PAGE4K,
     ) catch return .aborted;
     @memcpy(new_addr_space_root, addr_space_root_bytes_slice);
     const new_addr_space_root_phys = PAddr.fromInt(@intFromPtr(new_addr_space_root.ptr));
     arch.swapAddrSpace(new_addr_space_root_phys);
+
+    const identity_mapping = 0;
+    const new_addr_space_root_virt = VAddr.fromPAddr(new_addr_space_root_phys, identity_mapping);
 
     const loaded_image = boot_services.handleProtocol(
         uefi.protocol.LoadedImage,
@@ -84,6 +103,7 @@ pub fn main() uefi.Status {
                 .global_perm = .global,
                 .privilege_perm = .kernel,
             },
+            else => unreachable,
         };
 
         const section = parsed_elf.sections[i];
@@ -94,17 +114,22 @@ pub fn main() uefi.Status {
         while (current_vaddr < end_vaddr) {
             const page = page_alloc_iface.alignedAlloc(
                 u8,
-                paging.PAGE_ALIGN,
+                paging.pageAlign(.page4k),
                 paging.PAGE4K,
             ) catch return .aborted;
-            const bytes = file_bytes[file_offset .. file_offset + paging.PAGE4K];
-            @memcpy(page, bytes);
+            if (section_idx == .bss) {
+                @memset(page, 0);
+            } else {
+                const bytes = file_bytes[file_offset .. file_offset + paging.PAGE4K];
+                @memcpy(page, bytes);
+                file_offset += paging.PAGE4K;
+            }
 
             const page_phys = PAddr.fromInt(@intFromPtr(page.ptr));
             const page_virt = VAddr.fromInt(current_vaddr);
 
             arch.mapPage(
-                new_addr_space_root_phys,
+                new_addr_space_root_virt,
                 page_phys,
                 page_virt,
                 .page4k,
@@ -113,9 +138,64 @@ pub fn main() uefi.Status {
             ) catch return .aborted;
 
             current_vaddr += paging.PAGE4K;
-            file_offset += paging.PAGE4K;
         }
     }
 
-    arch.halt();
+    const xsdp_addr = boot_protocol.findXSDP() catch return .aborted;
+    const xsdp_phys = PAddr.fromInt(xsdp_addr);
+
+    const stack_pages = page_alloc_iface.alignedAlloc(
+        u8,
+        paging.pageAlign(.page4k),
+        boot_protocol.STACK_SIZE,
+    ) catch return .aborted;
+
+    const num_pages = boot_protocol.STACK_SIZE / paging.PAGE4K;
+    var current_page_phys = PAddr.fromInt(@intFromPtr(stack_pages.ptr));
+    for (0..num_pages) |_| {
+        const current_page_virt = VAddr.fromPAddr(current_page_phys, null);
+        const perms: MemoryPerms = .{
+            .write_perm = .write,
+            .execute_perm = .no_execute,
+            .cache_perm = .write_back,
+            .global_perm = .global,
+            .privilege_perm = .kernel,
+        };
+
+        arch.mapPage(
+            new_addr_space_root_virt,
+            current_page_phys,
+            current_page_virt,
+            .page4k,
+            perms,
+            page_alloc_iface,
+        ) catch return .aborted;
+
+        current_page_phys = PAddr.fromInt(current_page_phys.addr + paging.PAGE4K);
+    }
+
+    const stack_top_virt = VAddr.fromPAddr(current_page_phys, null);
+    const boot_info_virt = VAddr.fromInt(stack_top_virt.addr - @sizeOf(BootInfo));
+    const aligned_stack_top_virt = address.alignStack(boot_info_virt);
+    const boot_info: *BootInfo = @ptrFromInt(boot_info_virt.addr);
+
+    boot_info.elf_blob.ptr = parsed_elf.bytes.ptr;
+    boot_info.elf_blob.len = parsed_elf.bytes.len;
+    boot_info.xsdp_phys = xsdp_phys;
+    boot_info.stack_top = aligned_stack_top_virt;
+    boot_info.mmap = boot_protocol.getMmap(boot_services) orelse return .aborted;
+    boot_services.exitBootServices(
+        uefi.handle,
+        boot_info.mmap.key,
+    ) catch {
+        boot_info.mmap = boot_protocol.getMmap(boot_services) orelse return .aborted;
+        boot_services.exitBootServices(
+            uefi.handle,
+            boot_info.mmap.key,
+        ) catch return .aborted;
+    };
+
+    const kEntry: *KEntryType = @ptrFromInt(parsed_elf.entry);
+    kEntry(boot_info);
+    unreachable;
 }

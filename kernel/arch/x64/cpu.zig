@@ -37,12 +37,3 @@ pub fn outb(value: u8, port: u16) void {
           [port] "{dx}" (port),
     );
 }
-
-pub fn swapStack(top: u64) void {
-    asm volatile (
-        \\movq %[new_stack], %%rsp
-        \\movq %%rsp, %%rbp
-        :
-        : [new_stack] "r" (top),
-    );
-}

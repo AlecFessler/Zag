@@ -1,9 +1,11 @@
 const std = @import("std");
+const zag = @import("zag");
 
+const paging = zag.memory.paging;
 const elf = std.elf;
 const Dwarf = std.debug.Dwarf;
 
-const ElfSection = enum {
+pub const ElfSection = enum {
     text,
     rodata,
     data,
@@ -20,7 +22,7 @@ pub const Section = struct {
 pub const ParsedElf = struct {
     bytes: []u8,
     entry: u64,
-    sections: [ElfSection.num_sections]Section,
+    sections: [@intFromEnum(ElfSection.num_sections)]Section,
     dwarf: Dwarf,
 };
 
@@ -62,7 +64,11 @@ pub fn parseElf(result: *ParsedElf, bytes: []u8) !void {
                 .offset = phdr.p_offset,
             };
             result.sections[@intFromEnum(ElfSection.bss)] = .{
-                .vaddr = phdr.p_vaddr + phdr.p_filesz,
+                .vaddr = std.mem.alignBackward(
+                    u64,
+                    phdr.p_vaddr + phdr.p_filesz,
+                    paging.PAGE4K,
+                ),
                 .size = phdr.p_memsz - phdr.p_filesz,
                 .offset = 0,
             };

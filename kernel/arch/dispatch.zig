@@ -42,8 +42,8 @@ pub fn mapPage(
     allocator: std.mem.Allocator,
 ) !void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.paging.mapPage(addr_space_root, phys, virt, size, perms, allocator),
-        .aarch64 => aarch64.paging.mapPage(addr_space_root, phys, virt, size, perms, allocator),
+        .x86_64 => try x64.paging.mapPage(addr_space_root, phys, virt, size, perms, allocator),
+        .aarch64 => try aarch64.paging.mapPage(addr_space_root, phys, virt, size, perms, allocator),
         else => unreachable,
     }
 }
@@ -52,14 +52,6 @@ pub fn swapAddrSpace(root: PAddr) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.paging.swapAddrSpace(root),
         .aarch64 => aarch64.paging.swapAddrSpace(root),
-        else => unreachable,
-    }
-}
-
-pub fn swapStack(top: VAddr) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.cpu.swapStack(top.addr),
-        .aarch64 => aarch64.cpu.swapStack(top.addr),
         else => unreachable,
     }
 }

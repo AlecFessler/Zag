@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
@@ -6,15 +7,32 @@ const BootInfo = zag.boot.protocol.BootInfo;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
 
-export fn kEntry(boot_info: BootInfo) callconv(.{ .x86_64_sysv = .{} }) noreturn {
-    arch.swapStack(boot_info.stack_top);
+export fn kEntry(boot_info: *BootInfo) callconv(.{ .x86_64_sysv = .{} }) noreturn {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            asm volatile (
+                \\movq %[sp], %%rsp
+                \\movq %%rsp, %%rbp
+                \\movq %[arg], %%rdi
+                \\jmp *%[kmain]
+                :
+                : [sp] "r" (boot_info.stack_top.addr),
+                  [arg] "r" (@intFromPtr(boot_info)),
+                  [kmain] "r" (@intFromPtr(&kMain)),
+                : .{ .rsp = true, .rbp = true, .rdi = true }
+            );
+        },
+        .aarch64 => {},
+        else => unreachable,
+    }
     kMain(boot_info) catch {
         @panic("Exiting...");
     };
     unreachable;
 }
 
-fn kMain(boot_info: BootInfo) !void {
+fn kMain(boot_info: *BootInfo) !void {
     _ = boot_info;
     arch.init();
+    arch.halt();
 }
