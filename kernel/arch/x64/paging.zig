@@ -5,11 +5,10 @@ const cpu = zag.arch.x64.cpu;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
 
-pub fn getAddrSpaceRoot(base: ?u64) VAddr {
+pub fn getAddrSpaceRoot() PAddr {
     const cr3 = cpu.readCr3();
     const mask: u64 = 0xFFF;
-    const addr_space_root_phys = PAddr.fromInt(cr3 & ~mask);
-    return VAddr.fromPAddr(addr_space_root_phys, base);
+    return PAddr.fromInt(cr3 & ~mask);
 }
 
 pub fn swapAddrSpace(root: PAddr) void {

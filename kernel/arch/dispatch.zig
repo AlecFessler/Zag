@@ -15,10 +15,10 @@ pub fn init() void {
     }
 }
 
-pub fn getAddrSpaceRoot(base: ?u64) VAddr {
+pub fn getAddrSpaceRoot() VAddr {
     switch (builtin.cpu.arch) {
-        .x86_64 => return x64.paging.getAddrSpaceRoot(base),
-        .aarch64 => return aarch64.paging.getAddrSpaceRoot(base),
+        .x86_64 => return x64.paging.getAddrSpaceRoot(),
+        .aarch64 => return aarch64.paging.getAddrSpaceRoot(),
         else => unreachable,
     }
 }

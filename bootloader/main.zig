@@ -23,8 +23,7 @@ pub fn main() uefi.Status {
     var page_alloc = PageAllocator.init(boot_services, .acpi_reclaim_memory);
     const page_alloc_iface = page_alloc.allocator();
 
-    const identity_mapping = 0;
-    const addr_space_root_phys = arch.getAddrSpaceRoot(identity_mapping);
+    const addr_space_root_phys = arch.getAddrSpaceRoot();
     const addr_space_root_bytes_ptr = addr_space_root_phys.getPtr([*]u8);
     const addr_space_root_bytes_slice = addr_space_root_bytes_ptr[0..paging.PAGE4K];
     const new_addr_space_root = page_alloc_iface.alignedAlloc(
