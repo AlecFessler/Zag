@@ -7,7 +7,7 @@ const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 
 const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
-const Process = zag.sched.process;
+const Process = zag.sched.process.Process;
 const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
 const VAddr = zag.memory.address.VAddr;
 

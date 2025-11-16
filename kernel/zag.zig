@@ -1,5 +1,6 @@
 pub const arch = @import("arch/arch.zig");
 pub const boot = @import("boot/boot.zig");
+pub const containers = @import("containers/containers.zig");
 pub const debug = @import("debug/debug.zig");
 pub const memory = @import("memory/memory.zig");
 pub const panic = @import("panic.zig");

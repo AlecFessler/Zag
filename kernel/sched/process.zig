@@ -10,7 +10,7 @@ const PrivilegePerm = zag.perms.privilege.PrivilegePerm;
 const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
-const VirtualMemoryManager = zag.memory.vmm;
+const VirtualMemoryManager = zag.memory.vmm.VirtualMemoryManager;
 
 pub const ProcessAllocator = SlabAllocator(
     Process,

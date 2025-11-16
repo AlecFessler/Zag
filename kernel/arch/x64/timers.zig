@@ -285,7 +285,7 @@ pub const Tsc = struct {
         for (0..3) |i| {
             const target_ns = timer_mod.TEN_MILLION_NS;
 
-            const tsc_start = cpu.rdtsc_lfenced();
+            const tsc_start = cpu.rdtscLFenced();
             const hpet_start_ns = hpet_iface.now();
 
             var now_ns = hpet_start_ns;
@@ -294,7 +294,7 @@ pub const Tsc = struct {
             }
 
             const hpet_end_ns = hpet_iface.now();
-            const tsc_end = cpu.rdtscp_lfenced();
+            const tsc_end = cpu.rdtscpLFenced();
 
             const delta_tsc = tsc_end - tsc_start;
             const delta_hpet_ns = hpet_end_ns - hpet_start_ns;
@@ -331,11 +331,11 @@ pub const Tsc = struct {
 };
 
 pub fn getInterruptTimer() Timer {
-    if (apic.programLocalApicTimerTscDeadline(@intFromEnum(interrupts.IntVectors.sched))) {
+    if (apic.programLocalApicTimerTscDeadline(@intFromEnum(interrupts.IntVecs.sched))) {
         var tsc_timer = Tsc.init(&hpet_timer);
         return tsc_timer.timer();
     } else {
-        var lapic_timer = Lapic.init(&hpet_timer.?, @intFromEnum(interrupts.IntVectors.sched));
+        var lapic_timer = Lapic.init(&hpet_timer, @intFromEnum(interrupts.IntVecs.sched));
         return lapic_timer.timer();
     }
 }

@@ -8,7 +8,7 @@ const PAddr = zag.memory.address.PAddr;
 const ParsedElf = zag.utils.elf.ParsedElf;
 const VAddr = zag.memory.address.VAddr;
 
-pub var global_ptr: *const std.debug.Dwarf = undefined;
+pub var global_ptr: *std.debug.Dwarf = undefined;
 
 pub fn init(
     elf_blob: Blob,
@@ -22,4 +22,5 @@ pub fn init(
     try elf.parseElf(parsed_elf, elf_bytes);
     try parsed_elf.dwarf.open(allocator);
     global_ptr = &parsed_elf.dwarf;
+    return parsed_elf;
 }

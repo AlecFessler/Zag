@@ -4,7 +4,7 @@ const zag = @import("zag");
 
 const intrusive_freelist = zag.memory.intrusive_freelist;
 const slab_alloc = zag.memory.slab_allocator;
-const rbt = zag.containers.RedBlackTree;
+const rbt = zag.containers.red_black_tree;
 
 pub const AllocFooter = packed struct(u64) {
     header: u64,

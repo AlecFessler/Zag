@@ -57,7 +57,7 @@ pub fn pageFaultHandler(ctx: PageFaultContext) void {
     const phys_page_phys = PAddr.fromVAddr(phys_page_virt, null);
 
     const addr_space_root_phys = arch.getAddrSpaceRoot();
-    const addr_space_root_virt = VAddr.fromPaddr(addr_space_root_phys, null);
+    const addr_space_root_virt = VAddr.fromPAddr(addr_space_root_phys, null);
 
     const in_kspace = process.global_kproc.vmm.isValidVAddr(ctx.faulting_virt);
     const in_uspace = blk: {

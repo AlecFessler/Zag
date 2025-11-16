@@ -47,8 +47,8 @@ pub fn init() void {
         @intCast(sched_int_vec),
         interrupts.STUBS[sched_int_vec],
         gdt.KERNEL_CODE_OFFSET,
-        idt.PrivilegeLevel.ring_0,
-        idt.GateType.interrupt_gate,
+        PrivilegeLevel.ring_0,
+        GateType.interrupt_gate,
     );
     interrupts.registerVector(
         sched_int_vec,

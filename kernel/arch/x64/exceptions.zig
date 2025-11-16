@@ -10,7 +10,7 @@ const gdt = zag.arch.x64.gdt;
 const GateType = zag.arch.x64.idt.GateType;
 const PageFaultContext = zag.arch.interrupts.PageFaultContext;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
-const VAddr = zag.arch.x64.VAddr;
+const VAddr = zag.memory.address.VAddr;
 
 pub const Exception = enum(u5) {
     divide_by_zero = 0,
@@ -79,9 +79,10 @@ pub fn init() void {
         );
     }
 
-    interrupts.registerException(
+    interrupts.registerVector(
         @intFromEnum(Exception.page_fault),
         pageFaultHandler,
+        .exception,
     );
 }
 
@@ -94,7 +95,7 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
     const from_user = (ctx.cs & ring_3) == 3;
 
-    const pf_ctx: PageFaultContext = undefined;
+    var pf_ctx: PageFaultContext = undefined;
     pf_ctx.privilege = if (from_user) .user else .kernel;
     pf_ctx.faulting_virt = VAddr.fromInt(faulting_addr);
     pf_ctx.present = pf_err.present;

@@ -14,11 +14,11 @@ const Process = zag.sched.process.Process;
 const ProcessAllocator = zag.sched.process.ProcessAllocator;
 const Timer = zag.arch.timer.Timer;
 const Thread = zag.sched.thread.Thread;
-const ThreadAllocator = zag.sched.thead.ThreadAllocator;
+const ThreadAllocator = zag.sched.thread.ThreadAllocator;
 const VAddr = zag.memory.address.VAddr;
 const VirtualMemoryManager = zag.memory.vmm.VirtualMemoryManager;
 
-pub const RunQueue = struct {
+const RunQueue = struct {
     sentinel: Thread,
     head: *Thread,
     tail: *Thread,
@@ -57,13 +57,13 @@ pub const RunQueue = struct {
     }
 };
 
-pub const SCHED_TIMESLICE_NS = 2_000_000;
+const SCHED_TIMESLICE_NS = 2_000_000;
 
 pub var global_running_thread: ?*Thread = null;
 var rq: RunQueue = undefined;
 var timer: Timer = undefined;
 
-pub fn armSchedTimer(delta_ns: u64) void {
+fn armSchedTimer(delta_ns: u64) void {
     timer.armInterruptTimer(delta_ns);
 }
 
@@ -72,7 +72,8 @@ pub const SchedInterruptContext = struct {
     thread_ctx: *ArchCpuContext,
 };
 
-fn schedTimerHandler(ctx: SchedInterruptContext) void {
+pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
+    arch.print("Sched!\n", .{});
     const preempted = global_running_thread.?;
     preempted.ctx = ctx.thread_ctx;
     if (preempted != &rq.sentinel) {
@@ -89,7 +90,7 @@ fn schedTimerHandler(ctx: SchedInterruptContext) void {
 pub fn init() !void {
     timer = arch.getInterruptTimer();
 
-    const slab_vaddr_space_start = try process_mod.global_kproc.vmm.reserve(paging.PAGE1G, paging.PAGE_ALIGN);
+    const slab_vaddr_space_start = try process_mod.global_kproc.vmm.reserve(paging.PAGE1G, paging.pageAlign(.page4k));
     const slab_vaddr_space_end = VAddr.fromInt(slab_vaddr_space_start.addr + paging.PAGE1G);
     var slab_backing_allocator = BumpAllocator.init(
         slab_vaddr_space_start.addr,

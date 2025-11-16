@@ -157,7 +157,7 @@ pub fn init(firmware_mmap: MMap) !void {
         pmm.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
 
         process.global_kproc.addr_space_root = VAddr.fromPAddr(addr_space_root_phys, null);
-        process.global_kproc.vmm.init(
+        process.global_kproc.vmm = VirtualMemoryManager.init(
             VAddr.fromInt(address.AddrSpacePartition.kernel.start),
             VAddr.fromInt(address.AddrSpacePartition.kernel.end),
         );

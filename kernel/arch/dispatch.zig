@@ -98,8 +98,8 @@ pub fn prepareInterruptFrame(
 
 pub fn getInterruptTimer() Timer {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.timers.getInterruptTimer(),
-        .aarch64 => aarch64.timers.getInterruptTimer(),
+        .x86_64 => return x64.timers.getInterruptTimer(),
+        .aarch64 => return aarch64.timers.getInterruptTimer(),
         else => unreachable,
     }
 }

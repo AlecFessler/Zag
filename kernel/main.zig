@@ -8,6 +8,7 @@ const debug = zag.debug;
 const memory = zag.memory.init;
 const paging = zag.memory.paging;
 const process = zag.sched.process;
+const sched = zag.sched.scheduler;
 
 const BootInfo = zag.boot.protocol.BootInfo;
 const PAddr = zag.memory.address.PAddr;
@@ -52,9 +53,9 @@ export fn kTrampoline(boot_info: *BootInfo) noreturn {
 fn kMain(boot_info: *BootInfo) !void {
     arch.init();
     try memory.init(boot_info.mmap);
-    const heap_allocator = try memory.getHeapAllocator();
+    var heap_allocator = try memory.getHeapAllocator();
     const heap_allocator_iface = heap_allocator.allocator();
-    const parsed_elf = try debug.info.init(&elf, boot_info.elf_blob, heap_alloc_iface);
+    _ = try debug.info.init(boot_info.elf_blob, heap_allocator_iface);
     try arch.parseAcpi(boot_info.xsdp_phys);
     try sched.init();
     arch.halt();
