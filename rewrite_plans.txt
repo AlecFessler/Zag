@@ -1,0 +1,18 @@
+- need to define x64 interrupt frame
+- need to define arch.registerInterrupt(vector, handler)
+- vector should be a generic enum that identifies the handlers purpose
+- the handler should take a struct specific to that handler that provides details about the fault, including anyopaque ptr to arch specific interrupt frame
+- the arch impls should map the vector to their internal vector
+- the arch impls should build a handler that takes their interrupt frame
+- need to implement handlers (at least page fault and sched timer)
+
+- need to implement arch agnostic memory subsystem init
+- need to copy over the rest of the memory subsystem files
+
+- need to cleanup acpi parsing code, archInit will probably need xsdp ptr
+- need to implement arch.getInterruptTimer (will do all timer initialization)
+- need to reimplement scheduler code
+
+MISC:
+- There's probably a lot of missing cpu.zig definitions still
+- Panic handler code, should use dwarf info now
