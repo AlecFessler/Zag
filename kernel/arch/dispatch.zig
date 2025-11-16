@@ -5,9 +5,12 @@ const zag = @import("zag");
 const aarch64 = zag.arch.aarch64;
 const x64 = zag.arch.x64;
 
+const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
+const Timer = zag.arch.timer.Timer;
+const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 
 pub fn init() void {
@@ -65,10 +68,54 @@ pub fn swapAddrSpace(root: PAddr) void {
     }
 }
 
+pub fn copyKernelMappings(root: VAddr) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.copyKernelMappings(root),
+        .aarch64 => aarch64.paging.copyKernelMappings(root),
+        else => unreachable,
+    }
+}
+
 pub fn dropIdentityAddrSpace() void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.paging.dropIdentityAddrSpace(),
         .aarch64 => aarch64.paging.dropIdentityAddrSpace(),
+        else => unreachable,
+    }
+}
+
+pub fn prepareInterruptFrame(
+    kstack_top: VAddr,
+    ustack_top: ?VAddr,
+    entry: *const fn () void,
+) *ArchCpuContext {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.prepareInterruptFrame(kstack_top, ustack_top, entry),
+        .aarch64 => aarch64.interrupts.prepareInterruptFrame(kstack_top, ustack_top, entry),
+        else => unreachable,
+    }
+}
+
+pub fn getInterruptTimer() Timer {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.timers.getInterruptTimer(),
+        .aarch64 => aarch64.timers.getInterruptTimer(),
+        else => unreachable,
+    }
+}
+
+pub fn switchTo(thread: *Thread) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.switchTo(thread),
+        .aarch64 => aarch64.interrupts.switchTo(thread),
+        else => unreachable,
+    }
+}
+
+pub fn enableInterrupts() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.enableInterrupts(),
+        .aarch64 => aarch64.cpu.enableInterrupts(),
         else => unreachable,
     }
 }

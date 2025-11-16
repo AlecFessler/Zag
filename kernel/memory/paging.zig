@@ -13,3 +13,10 @@ pub const PAGE1G: u64 = @intFromEnum(PageSize.page1g);
 pub fn pageAlign(size: PageSize) std.mem.Alignment {
     return std.mem.Alignment.fromByteUnits(@intFromEnum(size));
 }
+
+pub fn PageMem(comptime size: PageSize) type {
+    const size_bytes = @intFromEnum(size);
+    return struct {
+        mem: [size_bytes]u8 align(size_bytes),
+    };
+}

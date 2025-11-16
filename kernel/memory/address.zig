@@ -4,7 +4,7 @@ const zag = @import("zag");
 const Range = zag.utils.range.Range;
 
 pub const AddrSpacePartition = struct {
-    pub const userspace: Range = .{
+    pub const user: Range = .{
         .start = 0x0000_0000_0000_0000,
         .end = 0xFFFF_8000_0000_0000,
     };

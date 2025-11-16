@@ -1,10 +1,12 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const address = zag.memory.address;
+const arch = zag.arch.dispatch;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 
-const PrivilegeLevel = zag.perms.privilege.PrivilegeLevel;
+const PrivilegePerm = zag.perms.privilege.PrivilegePerm;
 const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
@@ -19,46 +21,36 @@ pub const ProcessAllocator = SlabAllocator(
 
 pub const Process = struct {
     pid: u64,
-    cpl: PrivilegeLevel,
-    pml4_virt: VAddr,
+    privilege: PrivilegePerm,
+    addr_space_root: VAddr,
     vmm: VirtualMemoryManager,
     threads: [MAX_THREADS]*Thread,
     num_threads: u64,
 
-    const MAX_THREADS = 16;
-
     pub fn createUserProcess(
         entry: *const fn () void,
     ) !*Process {
-        const proc = try process_allocator.create(Process);
-        errdefer process_allocator.destroy(proc);
+        const proc = try allocator.create(Process);
+        errdefer allocator.destroy(proc);
 
         proc.pid = pid_counter;
         pid_counter += 1;
 
-        // NOTE: This all needs to be made arch agnostic
-        proc.cpl = .ring_3;
+        proc.privilege = .user;
 
         const pmm_iface = pmm.global_pmm.?.allocator();
-        const pml4_page = try pmm_iface.create(paging.PageMem(.Page4K));
-        errdefer pmm_iface.destroy(pml4_page);
+        const new_addr_space_root_page = try pmm_iface.create(paging.PageMem(.page4k));
+        errdefer pmm_iface.destroy(new_addr_space_root_page);
 
-        const pml4_bytes: [*]u8 = @ptrCast(pml4_page);
-        @memset(pml4_bytes[0..paging.PAGE4K], 0);
+        const new_addr_space_root_bytes: [*]u8 = @ptrCast(new_addr_space_root_page);
+        @memset(new_addr_space_root_bytes[0..paging.PAGE4K], 0);
 
-        proc.pml4_virt = VAddr.fromInt(@intFromPtr(pml4_page));
-        // NOTE: Will need something like arch.copyKernelMappings(root)
-        paging.copyKernelPml4Mappings(@ptrFromInt(proc.pml4_virt.addr));
-
-        // NOTE: This is the wrong range
-        const vmm_start = VAddr.fromInt(paging.PAGE4K);
-        const vmm_end = VAddr.fromInt(paging.pml4SlotBase(
-            @intFromEnum(paging.Pml4SlotIndices.uvmm_end),
-        ).addr + paging.PAGE1G * paging.PAGE_TABLE_SIZE);
+        proc.addr_space_root = VAddr.fromInt(@intFromPtr(new_addr_space_root_page));
+        arch.copyKernelMappings(proc.addr_space_root);
 
         proc.vmm = VirtualMemoryManager.init(
-            vmm_start,
-            vmm_end,
+            VAddr.fromInt(address.AddrSpacePartition.user.start),
+            VAddr.fromInt(address.AddrSpacePartition.user.end),
         );
 
         proc.num_threads = 0;
@@ -68,5 +60,17 @@ pub const Process = struct {
     }
 };
 
+const MAX_THREADS = 16;
+
 pub var allocator: std.mem.Allocator = undefined;
+
+pub var global_kproc: Process = .{
+    .pid = 0,
+    .privilege = .kernel,
+    .addr_space_root = undefined,
+    .vmm = undefined,
+    .threads = undefined,
+    .num_threads = 0,
+};
+
 var pid_counter: u64 = 1;

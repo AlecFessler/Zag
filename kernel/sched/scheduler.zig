@@ -1,15 +1,18 @@
 const std = @import("std");
 const zag = @import("zag");
 
-// NOTE: Need to move timers iface into arch.timers.zig
-
+const arch = zag.arch.dispatch;
+const paging = zag.memory.paging;
 const process_mod = zag.sched.process;
 const thread_mod = zag.sched.thread;
 
+const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
+const BumpAllocator = zag.memory.bump_allocator.BumpAllocator;
 const PAddr = zag.memory.address.PAddr;
-const PrivilegeLevel = zag.perms.prilege.PrivilegeLevel;
+const PrivilegePerm = zag.perms.privilege.PrivilegePerm;
 const Process = zag.sched.process.Process;
 const ProcessAllocator = zag.sched.process.ProcessAllocator;
+const Timer = zag.arch.timer.Timer;
 const Thread = zag.sched.thread.Thread;
 const ThreadAllocator = zag.sched.thead.ThreadAllocator;
 const VAddr = zag.memory.address.VAddr;
@@ -56,65 +59,53 @@ pub const RunQueue = struct {
 
 pub const SCHED_TIMESLICE_NS = 2_000_000;
 
-pub var kproc: Process = .{
-    .pid = 0,
-    .cpl = .ring_0,
-    .pml4_virt = undefined,
-    .vmm = undefined,
-    .threads = undefined,
-    .num_threads = 0,
-};
-
-pub var running_thread: ?*Thread = null;
+pub var global_running_thread: ?*Thread = null;
 var rq: RunQueue = undefined;
-var timer: timers.Timer = undefined;
+var timer: Timer = undefined;
 
 pub fn armSchedTimer(delta_ns: u64) void {
-    timer.arm_interrupt_timer(delta_ns);
+    timer.armInterruptTimer(delta_ns);
 }
 
-// NOTE: Need to define arch agnostic sched hander struct
+pub const SchedInterruptContext = struct {
+    privilege: PrivilegePerm,
+    thread_ctx: *ArchCpuContext,
+};
 
-pub fn schedTimerHandler(ctx: *anyopaque) void {
-    const preempted = running_thread.?;
-    preempted.ctx = ctx;
+fn schedTimerHandler(ctx: SchedInterruptContext) void {
+    const preempted = global_running_thread.?;
+    preempted.ctx = ctx.thread_ctx;
     if (preempted != &rq.sentinel) {
         rq.enqueue(preempted);
     }
-    running_thread = rq.dequeue() orelse &rq.sentinel;
+    global_running_thread = rq.dequeue() orelse &rq.sentinel;
 
     armSchedTimer(SCHED_TIMESLICE_NS);
+    if (global_running_thread.? == preempted) return;
 
-    // NOTE: This needs to be made arch agnostic, something like arch.switchTo(thread)
-    apic.endOfInterrupt();
-    const ring_3 = @intFromEnum(idt.PrivilegeLevel.ring_3);
-    const cpl = running_thread.?.ctx.cs & ring_3;
-    if (cpl == 3) {
-        gdt.main_tss_entry.rsp0 = running_thread.?.kstack_base.addr;
-        const new_pml4_phys = PAddr.fromVAddr(running_thread.?.proc.pml4_virt, .physmap);
-        paging.write_cr3(new_pml4_phys);
-    }
-
-    if (running_thread.? == preempted) return;
-
-    // NOTE: Need to switch on arch
-    asm volatile (
-        \\movq %[new_stack], %%rsp
-        \\jmp interruptStubEpilogue
-        :
-        : [new_stack] "r" (@intFromPtr(running_thread.?.ctx)),
-    );
+    arch.switchTo(global_running_thread.?);
 }
 
-pub fn init(t: timers.Timer, slab_backing_allocator: std.mem.Allocator) !void {
-    timer = t;
+pub fn init() !void {
+    timer = arch.getInterruptTimer();
 
-    var proc_alloc = try ProcessAllocator.init(slab_backing_allocator);
+    const slab_vaddr_space_start = try process_mod.global_kproc.vmm.reserve(paging.PAGE1G, paging.PAGE_ALIGN);
+    const slab_vaddr_space_end = VAddr.fromInt(slab_vaddr_space_start.addr + paging.PAGE1G);
+    var slab_backing_allocator = BumpAllocator.init(
+        slab_vaddr_space_start.addr,
+        slab_vaddr_space_end.addr,
+    );
+    const slab_alloc_iface = slab_backing_allocator.allocator();
+
+    var proc_alloc = try ProcessAllocator.init(slab_alloc_iface);
     process_mod.allocator = proc_alloc.allocator();
 
-    var thread_alloc = try ThreadAllocator.init(slab_backing_allocator);
+    var thread_alloc = try ThreadAllocator.init(slab_alloc_iface);
     thread_mod.allocator = thread_alloc.allocator();
 
     rq.init();
-    running_thread = &rq.sentinel;
+    global_running_thread = &rq.sentinel;
+
+    arch.enableInterrupts();
+    armSchedTimer(SCHED_TIMESLICE_NS);
 }

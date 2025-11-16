@@ -3,7 +3,9 @@ const zag = @import("zag");
 const apic = zag.arch.x64.apic;
 const cpu = zag.arch.x64.cpu;
 const interrupts = zag.arch.x64.interrupts;
+const timer_mod = zag.arch.timer;
 
+const Timer = zag.arch.timer.Timer;
 const VAddr = zag.memory.address.VAddr;
 
 pub const Hpet = struct {
@@ -105,7 +107,7 @@ pub const Hpet = struct {
             base_addr + @intFromEnum(Register.gen_caps_and_id),
         );
         return .{
-            .freq_hz = ONE_QUADRILLION_NS / @as(u64, gen_caps_and_id.counter_clock_period),
+            .freq_hz = timer_mod.ONE_QUADRILLION_NS / @as(u64, gen_caps_and_id.counter_clock_period),
 
             .gen_caps_and_id = gen_caps_and_id,
             .gen_config = @ptrFromInt(base_addr + @intFromEnum(Register.gen_config)),
@@ -161,12 +163,12 @@ pub const Hpet = struct {
             .ptr = self,
             .vtable = &.{
                 .now = now,
-                .arm_interrupt_timer = arm_interrupt_timer,
+                .armInterruptTimer = armInterruptTimer,
             },
         };
     }
 
-    fn arm_interrupt_timer(ctx: *anyopaque, timer_val_ns: u64) void {
+    fn armInterruptTimer(ctx: *anyopaque, timer_val_ns: u64) void {
         _ = ctx;
         _ = timer_val_ns;
         unreachable;
@@ -174,7 +176,7 @@ pub const Hpet = struct {
 
     fn now(ctx: *anyopaque) u64 {
         const self: *Hpet = @alignCast(@ptrCast(ctx));
-        return nanosFromTicksFloor(self.freq_hz, self.main_counter_val.val);
+        return timer_mod.nanosFromTicksFloor(self.freq_hz, self.main_counter_val.val);
     }
 };
 
@@ -208,7 +210,7 @@ pub const Lapic = struct {
 
             const start_ns = hpet_iface.now();
             var now_ns = start_ns;
-            const target_ns = TEN_MILLION_NS;
+            const target_ns = timer_mod.TEN_MILLION_NS;
             while ((now_ns - start_ns) < target_ns) now_ns = hpet_iface.now();
 
             const cur: u64 = if (apic.x2Apic)
@@ -228,7 +230,7 @@ pub const Lapic = struct {
             }
 
             const delta_ns = now_ns - start_ns;
-            const sample = (elapsed * @as(u64, DIVIDER) * ONE_BILLION_NS) / delta_ns;
+            const sample = (elapsed * @as(u64, DIVIDER) * timer_mod.ONE_BILLION_NS) / delta_ns;
             estimate = if (i == 0) sample else (estimate + sample) / 2;
         }
 
@@ -250,16 +252,16 @@ pub const Lapic = struct {
             .ptr = self,
             .vtable = &.{
                 .now = now,
-                .arm_interrupt_timer = arm_interrupt_timer,
+                .armInterruptTimer = armInterruptTimer,
             },
         };
     }
 
-    fn arm_interrupt_timer(ctx: *anyopaque, timer_val_ns: u64) void {
+    fn armInterruptTimer(ctx: *anyopaque, timer_val_ns: u64) void {
         const self: *Lapic = @alignCast(@ptrCast(ctx));
 
         const eff_hz: u64 = self.freq_hz / self.divider;
-        var ticks: u64 = ticksFromNanosCeil(eff_hz, timer_val_ns);
+        var ticks: u64 = timer_mod.ticksFromNanosCeil(eff_hz, timer_val_ns);
         if (ticks == 0) ticks = 1;
         if (ticks > 0xFFFF_FFFF) ticks = 0xFFFF_FFFF;
 
@@ -272,19 +274,6 @@ pub const Lapic = struct {
     }
 };
 
-pub const Timer = struct {
-    ptr: *anyopaque,
-    vtable: *const VTable,
-
-    pub fn now(self: *const Timer) u64 {
-        return self.vtable.now(self.ptr);
-    }
-
-    pub fn arm_interrupt_timer(self: *const Timer, timer_val_ns: u64) void {
-        return self.vtable.arm_interrupt_timer(self.ptr, timer_val_ns);
-    }
-};
-
 pub const Tsc = struct {
     freq_hz: u64,
 
@@ -294,7 +283,7 @@ pub const Tsc = struct {
         var estimate: u64 = 0;
 
         for (0..3) |i| {
-            const target_ns = TEN_MILLION_NS;
+            const target_ns = timer_mod.TEN_MILLION_NS;
 
             const tsc_start = cpu.rdtsc_lfenced();
             const hpet_start_ns = hpet_iface.now();
@@ -310,7 +299,7 @@ pub const Tsc = struct {
             const delta_tsc = tsc_end - tsc_start;
             const delta_hpet_ns = hpet_end_ns - hpet_start_ns;
 
-            const sample_hz = (delta_tsc * ONE_BILLION_NS) / delta_hpet_ns;
+            const sample_hz = (delta_tsc * timer_mod.ONE_BILLION_NS) / delta_hpet_ns;
 
             estimate = if (i == 0) sample_hz else (estimate + sample_hz) / 2;
         }
@@ -323,47 +312,32 @@ pub const Tsc = struct {
             .ptr = self,
             .vtable = &.{
                 .now = now,
-                .arm_interrupt_timer = arm_interrupt_timer,
+                .armInterruptTimer = armInterruptTimer,
             },
         };
     }
 
-    fn arm_interrupt_timer(ctx: *anyopaque, timer_val_ns: u64) void {
+    fn armInterruptTimer(ctx: *anyopaque, timer_val_ns: u64) void {
         const self: *Tsc = @alignCast(@ptrCast(ctx));
-        const delta_ticks: u64 = ticksFromNanosCeil(self.freq_hz, timer_val_ns);
+        const delta_ticks: u64 = timer_mod.ticksFromNanosCeil(self.freq_hz, timer_val_ns);
         const now_ticks: u64 = cpu.rdtscp();
         apic.armTscDeadline(now_ticks + delta_ticks);
     }
 
     fn now(ctx: *anyopaque) u64 {
         const self: *Tsc = @alignCast(@ptrCast(ctx));
-        return nanosFromTicksFloor(self.freq_hz, cpu.rdtscp());
+        return timer_mod.nanosFromTicksFloor(self.freq_hz, cpu.rdtscp());
     }
 };
 
-pub const VTable = struct {
-    now: *const fn (*anyopaque) u64,
-    arm_interrupt_timer: *const fn (*anyopaque, u64) void,
-};
-
-const ONE_BILLION_NS = 1_000_000_000;
-const ONE_QUADRILLION_NS = 1_000_000_000_000_000;
-const TEN_MILLION_NS = 10_000_000;
+pub fn getInterruptTimer() Timer {
+    if (apic.programLocalApicTimerTscDeadline(@intFromEnum(interrupts.IntVectors.sched))) {
+        var tsc_timer = Tsc.init(&hpet_timer);
+        return tsc_timer.timer();
+    } else {
+        var lapic_timer = Lapic.init(&hpet_timer.?, @intFromEnum(interrupts.IntVectors.sched));
+        return lapic_timer.timer();
+    }
+}
 
 pub var hpet_timer: Hpet = undefined;
-
-pub fn nanosFromTicksCeil(freq_hz: u64, ticks: u64) u64 {
-    return (ticks * ONE_BILLION_NS + freq_hz - 1) / freq_hz;
-}
-
-pub fn nanosFromTicksFloor(freq_hz: u64, ticks: u64) u64 {
-    return (ticks * ONE_BILLION_NS) / freq_hz;
-}
-
-pub fn ticksFromNanosCeil(freq_hz: u64, ns: u64) u64 {
-    return (freq_hz * ns + ONE_BILLION_NS - 1) / ONE_BILLION_NS;
-}
-
-pub fn ticksFromNanosFloor(freq_hz: u64, ns: u64) u64 {
-    return (freq_hz * ns) / ONE_BILLION_NS;
-}

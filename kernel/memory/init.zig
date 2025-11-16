@@ -6,9 +6,12 @@ const address = zag.memory.address;
 const boot = zag.boot;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
+const process = zag.sched.process;
 
 const BuddyAllocator = zag.memory.buddy_allocator.BuddyAllocator;
 const BumpAllocator = zag.memory.bump_allocator.BumpAllocator;
+const HeapAllocator = zag.memory.heap_allocator.HeapAllocator;
+const HeapTreeAllocator = zag.memory.heap_allocator.TreeAllocator;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const MMap = zag.boot.protocol.MMap;
 const MMapEntry = zag.boot.protocol.MMapEntry;
@@ -153,11 +156,38 @@ pub fn init(firmware_mmap: MMap) !void {
 
         pmm.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
 
-        const vmm_start_virt = VAddr.fromInt(address.AddrSpacePartition.kernel.start);
-        const vmm_end_virt = VAddr.fromInt(address.AddrSpacePartition.kernel.end);
-        _ = vmm_start_virt;
-        _ = vmm_end_virt;
-        // assign to scheduler kernel process
-        // also assign the physmapped root page table
+        process.global_kproc.addr_space_root = VAddr.fromPAddr(addr_space_root_phys, null);
+        process.global_kproc.vmm.init(
+            VAddr.fromInt(address.AddrSpacePartition.kernel.start),
+            VAddr.fromInt(address.AddrSpacePartition.kernel.end),
+        );
     }
+}
+
+pub fn getHeapAllocator() !HeapAllocator {
+    const heap_vaddr_space_size = paging.PAGE1G * 256;
+    const heap_vaddr_space_start = try process.global_kproc.vmm.reserve(
+        heap_vaddr_space_size,
+        paging.pageAlign(.page4k),
+    );
+    const heap_vaddr_space_end = VAddr.fromInt(heap_vaddr_space_start.addr + heap_vaddr_space_size);
+
+    const heap_tree_vaddr_space_start = try process.global_kproc.vmm.reserve(
+        paging.PAGE1G,
+        paging.pageAlign(.page4k),
+    );
+    const heap_tree_vaddr_space_end = VAddr.fromInt(heap_tree_vaddr_space_start.addr + paging.PAGE1G);
+
+    var heap_tree_backing_allocator = BumpAllocator.init(
+        heap_tree_vaddr_space_start.addr,
+        heap_tree_vaddr_space_end.addr,
+    );
+    const heap_tree_backing_allocator_iface = heap_tree_backing_allocator.allocator();
+    var heap_tree_allocator = try HeapTreeAllocator.init(heap_tree_backing_allocator_iface);
+
+    return HeapAllocator.init(
+        heap_vaddr_space_start.addr,
+        heap_vaddr_space_end.addr,
+        &heap_tree_allocator,
+    );
 }

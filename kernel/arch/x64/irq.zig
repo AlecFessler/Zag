@@ -6,9 +6,11 @@ const exceptions = zag.arch.x64.exceptions;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const gdt = zag.arch.x64.gdt;
+const sched = zag.sched.scheduler;
 
 const GateType = zag.arch.x64.idt.GateType;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
+const SchedInterruptContext = zag.sched.scheduler.SchedInterruptContext;
 
 const NUM_IRQ_ENTRIES = 16;
 
@@ -39,9 +41,34 @@ pub fn init() void {
         spuriousHandler,
         .external,
     );
+
+    const sched_int_vec = @intFromEnum(interrupts.IntVecs.sched);
+    idt.openInterruptGate(
+        @intCast(sched_int_vec),
+        interrupts.STUBS[sched_int_vec],
+        gdt.KERNEL_CODE_OFFSET,
+        idt.PrivilegeLevel.ring_0,
+        idt.GateType.interrupt_gate,
+    );
+    interrupts.registerVector(
+        sched_int_vec,
+        schedTimerHandler,
+        .external,
+    );
 }
 
 fn spuriousHandler(ctx: *cpu.Context) void {
     _ = ctx;
     spurious_interrupts += 1;
+}
+
+fn schedTimerHandler(ctx: *cpu.Context) void {
+    const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
+    const from_user = (ctx.cs & ring_3) == 3;
+
+    var sched_interrupt_ctx: SchedInterruptContext = undefined;
+    sched_interrupt_ctx.privilege = if (from_user) .user else .kernel;
+    sched_interrupt_ctx.thread_ctx = @ptrCast(ctx);
+
+    sched.schedTimerHandler(sched_interrupt_ctx);
 }

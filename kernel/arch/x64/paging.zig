@@ -85,6 +85,17 @@ pub fn swapAddrSpace(root: PAddr) void {
     cpu.writeCr3(root.addr);
 }
 
+pub fn copyKernelMappings(root: VAddr) void {
+    const src_root_phys = getAddrSpaceRoot();
+    const src_root_virt = VAddr.fromPAddr(src_root_phys, null);
+    const src = src_root_virt.getPtr([*]PageEntry);
+    const dst = root.getPtr([*]PageEntry);
+
+    for (256..PAGE_ENTRY_TABLE_SIZE) |i| {
+        dst[i] = src[i];
+    }
+}
+
 pub fn dropIdentityAddrSpace() void {
     const root_phys = getAddrSpaceRoot();
     const root_virt = VAddr.fromPAddr(root_phys, null);

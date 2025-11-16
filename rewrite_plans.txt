@@ -1,6 +1,0 @@
-- the handler should take a struct specific to that handler that provides details about the fault, including anyopaque ptr to arch specific interrupt frame
-- the arch impls should build a handler that takes their interrupt frame
-- need to implement handlers (at least page fault and sched timer)
-
-- need to implement arch.getInterruptTimer (will do all timer initialization)
-- need to reimplement scheduler code

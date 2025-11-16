@@ -1,13 +1,16 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const arch = zag.arch;
 const cpu = zag.arch.x64.cpu;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const gdt = zag.arch.x64.gdt;
 
 const GateType = zag.arch.x64.idt.GateType;
+const PageFaultContext = zag.arch.interrupts.PageFaultContext;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
+const VAddr = zag.arch.x64.VAddr;
 
 pub const Exception = enum(u5) {
     divide_by_zero = 0,
@@ -75,4 +78,28 @@ pub fn init() void {
             GateType.interrupt_gate,
         );
     }
+
+    interrupts.registerException(
+        @intFromEnum(Exception.page_fault),
+        pageFaultHandler,
+    );
+}
+
+fn pageFaultHandler(ctx: *cpu.Context) void {
+    const pf_err = PFErrCode.from(ctx.err_code);
+    if (pf_err.rsvd_violation) {
+        @panic("Page tables have reserved bits set (RSVD).");
+    }
+    const faulting_addr = cpu.readCr2();
+    const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
+    const from_user = (ctx.cs & ring_3) == 3;
+
+    const pf_ctx: PageFaultContext = undefined;
+    pf_ctx.privilege = if (from_user) .user else .kernel;
+    pf_ctx.faulting_virt = VAddr.fromInt(faulting_addr);
+    pf_ctx.present = pf_err.present;
+    pf_ctx.fetch = pf_err.instr_fetch;
+    pf_ctx.write = pf_err.is_write;
+
+    arch.interrupts.pageFaultHandler(pf_ctx);
 }

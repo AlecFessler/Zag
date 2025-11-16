@@ -2,10 +2,18 @@ const std = @import("std");
 const zag = @import("zag");
 
 const apic = zag.arch.x64.apic;
+const arch = zag.arch.dispatch;
 const cpu = zag.arch.x64.cpu;
 const idt = zag.arch.x64.idt;
+const gdt = zag.arch.x64.gdt;
 
 const interruptHandler = idt.interruptHandler;
+
+const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
+const PAddr = zag.memory.address.PAddr;
+const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
+const Thread = zag.sched.thread.Thread;
+const VAddr = zag.memory.address.VAddr;
 
 pub const IntVecs = enum(u8) {
     sched = 0xFE,
@@ -48,6 +56,73 @@ const PUSHES_ERR = blk: {
 };
 
 var vector_table: [256]VectorEntry = .{VectorEntry{}} ** 256;
+
+pub fn prepareInterruptFrame(
+    kstack_top: VAddr,
+    ustack_top: ?VAddr,
+    entry: *const fn () void,
+) *ArchCpuContext {
+    // the alignment of the context on the stack will trip runtime safety checks but it's okay
+    @setRuntimeSafety(false);
+    const ctx_addr: u64 = kstack_top.addr - @sizeOf(cpu.Context);
+    var ctx: *cpu.Context = @ptrFromInt(ctx_addr);
+
+    const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
+
+    ctx.* = .{
+        .regs = .{
+            .r15 = 0,
+            .r14 = 0,
+            .r13 = 0,
+            .r12 = 0,
+            .r11 = 0,
+            .r10 = 0,
+            .r9 = 0,
+            .r8 = 0,
+            .rdi = 0,
+            .rsi = 0,
+            .rbp = 0,
+            .rbx = 0,
+            .rdx = 0,
+            .rcx = 0,
+            .rax = 0,
+        },
+        .int_num = 0,
+        .err_code = 0,
+        .rip = @intFromPtr(entry),
+        .cs = 0,
+        .rflags = 0x202,
+        .rsp = 0,
+        .ss = 0,
+    };
+
+    if (ustack_top != null) {
+        ctx.cs = gdt.USER_CODE_OFFSET | ring_3;
+        ctx.ss = gdt.USER_DATA_OFFSET | ring_3;
+        ctx.rsp = ustack_top.?.addr;
+    } else {
+        ctx.cs = gdt.KERNEL_CODE_OFFSET;
+        ctx.ss = gdt.KERNEL_DATA_OFFSET;
+        ctx.rsp = ctx_addr;
+    }
+
+    return @ptrCast(ctx);
+}
+
+pub fn switchTo(thread: *Thread) void {
+    if (thread.proc.privilege == .user) {
+        gdt.tss_entry.rsp0 = thread.kstack_base.addr;
+        const new_addr_space_root_phys = PAddr.fromVAddr(thread.proc.addr_space_root, null);
+        arch.swapAddrSpace(new_addr_space_root_phys);
+    }
+    apic.endOfInterrupt();
+    asm volatile (
+        \\movq %[new_stack], %%rsp
+        \\jmp interruptStubEpilogue
+        :
+        : [new_stack] "r" (@intFromPtr(thread.ctx)),
+    );
+}
 
 pub fn getInterruptStub(comptime int_num: u8, comptime pushes_err: bool) interruptHandler {
     return struct {
