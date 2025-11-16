@@ -85,6 +85,31 @@ pub fn swapAddrSpace(root: PAddr) void {
     cpu.writeCr3(root.addr);
 }
 
+pub fn dropIdentityAddrSpace() void {
+    const root_phys = getAddrSpaceRoot();
+    const root_virt = VAddr.fromPAddr(root_phys, null);
+    const root = root_virt.getPtr([*]PageEntry);
+
+    for (0..256) |i| {
+        root[i] = PageEntry{
+            .present = false,
+            .writable = false,
+            .user_accessible = false,
+            .write_through = false,
+            .not_cacheable = false,
+            .accessed = false,
+            .dirty = false,
+            .huge_page = false,
+            .global = false,
+            .ignored = 0,
+            .addr = 0,
+            .not_executable = false,
+        };
+    }
+
+    cpu.writeCr3(root_phys.addr);
+}
+
 pub fn mapPage(
     addr_space_root: VAddr,
     phys: PAddr,

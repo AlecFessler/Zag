@@ -7,6 +7,11 @@ const idt = zag.arch.x64.idt;
 
 const interruptHandler = idt.interruptHandler;
 
+pub const IntVecs = enum(u8) {
+    sched = 0xFE,
+    spurious = 0xFF,
+};
+
 pub const VectorKind = enum {
     exception,
     external,

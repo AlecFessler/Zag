@@ -9,6 +9,11 @@ pub const AddrSpacePartition = struct {
         .end = 0xFFFF_8000_0000_0000,
     };
 
+    pub const kernel: Range = .{
+        .start = 0xFFFF_8000_0000_0000,
+        .end = 0xFFFF_8400_0000_0000,
+    };
+
     pub const physmap: Range = .{
         .start = 0xFFFF_FF80_0000_0000,
         .end = 0xFFFF_FF88_0000_0000,

@@ -1,8 +1,9 @@
-const aarch64 = @import("aarch64/aarch64.zig");
 const builtin = @import("builtin");
 const std = @import("std");
-const x64 = @import("x64/x64.zig");
 const zag = @import("zag");
+
+const aarch64 = zag.arch.aarch64;
+const x64 = zag.arch.x64;
 
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
@@ -13,6 +14,14 @@ pub fn init() void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.init.init(),
         .aarch64 => aarch64.init.init(),
+        else => unreachable,
+    }
+}
+
+pub fn parseAcpi(xsdp_paddr: PAddr) !void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => try x64.acpi.parseAcpi(xsdp_paddr),
+        .aarch64 => try aarch64.acpi.parseAcpi(xsdp_paddr),
         else => unreachable,
     }
 }
@@ -52,6 +61,25 @@ pub fn swapAddrSpace(root: PAddr) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.paging.swapAddrSpace(root),
         .aarch64 => aarch64.paging.swapAddrSpace(root),
+        else => unreachable,
+    }
+}
+
+pub fn dropIdentityAddrSpace() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.dropIdentityAddrSpace(),
+        .aarch64 => aarch64.paging.dropIdentityAddrSpace(),
+        else => unreachable,
+    }
+}
+
+pub fn print(
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.serial.print(format, args),
+        .aarch64 => aarch64.serial.print(format, args),
         else => unreachable,
     }
 }

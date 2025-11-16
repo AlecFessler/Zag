@@ -56,6 +56,24 @@ pub fn main() uefi.Status {
     const identity_mapping = 0;
     const new_addr_space_root_virt = VAddr.fromPAddr(new_addr_space_root_phys, identity_mapping);
 
+    // physmap the address space root for the kernel, won't be used in the bootloader
+    const new_addr_space_root_virt_physmapped = VAddr.fromPAddr(new_addr_space_root_phys, null);
+    const addr_space_root_perms: MemoryPerms = .{
+        .write_perm = .write,
+        .execute_perm = .no_execute,
+        .cache_perm = .write_back,
+        .global_perm = .global,
+        .privilege_perm = .kernel,
+    };
+    arch.mapPage(
+        new_addr_space_root_virt,
+        new_addr_space_root_phys,
+        new_addr_space_root_virt_physmapped,
+        .page4k,
+        addr_space_root_perms,
+        page_alloc_iface,
+    ) catch return .aborted;
+
     const loaded_image = boot_services.handleProtocol(
         uefi.protocol.LoadedImage,
         uefi.handle,

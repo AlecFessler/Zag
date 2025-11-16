@@ -9,8 +9,6 @@ const Guid = uefi.Guid;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
 
-pub const STACK_SIZE: u64 = paging.PAGE4K * 6;
-
 pub const MMapEntryType = enum {
     acpi,
     free,
@@ -43,9 +41,10 @@ pub const MMapEntry = struct {
     type: MMapEntryType,
 };
 
+pub const STACK_SIZE: u64 = paging.PAGE4K * 6;
 pub const MAX_MMAP_ENTRIES = 256;
 
-pub fn collapseMmap(
+pub fn collapseMMap(
     map: *const MMap,
     mmap_entries: *[MAX_MMAP_ENTRIES]MMapEntry,
 ) []MMapEntry {

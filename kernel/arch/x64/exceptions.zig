@@ -7,7 +7,7 @@ const interrupts = zag.arch.x64.interrupts;
 const gdt = zag.arch.x64.gdt;
 
 const GateType = zag.arch.x64.idt.GateType;
-const PrivilegeLevel = zag.arch.x64.idt.PrivilegeLevel;
+const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 
 pub const Exception = enum(u5) {
     divide_by_zero = 0,

@@ -8,9 +8,11 @@ const interrupts = zag.arch.x64.interrupts;
 const gdt = zag.arch.x64.gdt;
 
 const GateType = zag.arch.x64.idt.GateType;
-const PrivilegeLevel = zag.arch.x64.idt.PrivilegeLevel;
+const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 
 const NUM_IRQ_ENTRIES = 16;
+
+var spurious_interrupts: u64 = 0;
 
 pub fn init() void {
     const offset = exceptions.NUM_ISR_ENTRIES;
@@ -23,4 +25,23 @@ pub fn init() void {
             GateType.interrupt_gate,
         );
     }
+
+    const spurious_int_vec = @intFromEnum(interrupts.IntVecs.spurious);
+    idt.openInterruptGate(
+        @intCast(spurious_int_vec),
+        interrupts.STUBS[spurious_int_vec],
+        gdt.KERNEL_CODE_OFFSET,
+        PrivilegeLevel.ring_0,
+        GateType.interrupt_gate,
+    );
+    interrupts.registerVector(
+        spurious_int_vec,
+        spuriousHandler,
+        .external,
+    );
+}
+
+fn spuriousHandler(ctx: *cpu.Context) void {
+    _ = ctx;
+    spurious_interrupts += 1;
 }

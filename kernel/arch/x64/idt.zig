@@ -5,7 +5,7 @@ const cpu = zag.arch.x64.cpu;
 
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 
-const GateType = enum(u4) {
+pub const GateType = enum(u4) {
     task_gate = 0x5,
     interrupt_gate = 0xE,
     trap_gate = 0xF,

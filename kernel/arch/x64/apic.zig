@@ -1,7 +1,7 @@
 const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
-const idt = zag.arch.x64.idt;
+const interrupts = zag.arch.x64.interrupts;
 const paging = zag.arch.x64.paging;
 
 const VAddr = zag.memory.address.VAddr;
@@ -402,7 +402,7 @@ pub fn init(lapic_base_virt: VAddr) void {
     cpu.outb(0xFF, 0x21);
     cpu.outb(0xFF, 0xA1);
 
-    x2Apic = cpu.enableX2Apic(@intFromEnum(idt.IntVectors.spurious));
+    x2Apic = cpu.enableX2Apic(@intFromEnum(interrupts.IntVecs.spurious));
     if (x2Apic) return;
 
     const base_addr = lapic_base_virt.addr;
