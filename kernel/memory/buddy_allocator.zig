@@ -240,7 +240,7 @@ pub const BuddyAllocator = struct {
         _ = alignment;
         _ = new_len;
         _ = ret_addr;
-        unreachable;
+        return false;
     }
 
     fn remap(
@@ -255,7 +255,7 @@ pub const BuddyAllocator = struct {
         _ = alignment;
         _ = new_len;
         _ = ret_addr;
-        unreachable;
+        return null;
     }
 
     fn free(

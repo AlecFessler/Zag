@@ -1,6 +1,9 @@
 const builtin = @import("builtin");
 const std = @import("std");
 
+const zag = @import("zag");
+const arch = zag.arch.dispatch;
+
 const DBG = builtin.mode == .Debug;
 const DBG_MAGIC = 0x0DEAD2A6DEAD2A60;
 
@@ -53,7 +56,14 @@ pub fn IntrusiveFreeList(
                 return null;
             };
 
-            if (DBG) std.debug.assert(addr.dbg_magic == DBG_MAGIC);
+            if (DBG) {
+                if (addr.dbg_magic != DBG_MAGIC) {
+                    arch.print("FREELIST CORRUPT: addr={x} expected={x} got={x}\n", .{
+                        @intFromPtr(addr), DBG_MAGIC, addr.dbg_magic,
+                    });
+                    std.debug.assert(false);
+                }
+            }
 
             self.head = addr.next;
 

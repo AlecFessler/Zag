@@ -3,17 +3,11 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
-const elf = zag.utils.elf;
 const debug = zag.debug;
 const memory = zag.memory.init;
-const paging = zag.memory.paging;
-const process = zag.sched.process;
 const sched = zag.sched.scheduler;
 
 const BootInfo = zag.boot.protocol.BootInfo;
-const PAddr = zag.memory.address.PAddr;
-const ParsedElf = zag.utils.elf.ParsedElf;
-const VAddr = zag.memory.address.VAddr;
 
 pub fn panic(
     msg: []const u8,
@@ -53,14 +47,16 @@ export fn kTrampoline(boot_info: *BootInfo) noreturn {
 fn kMain(boot_info: *BootInfo) !void {
     arch.init();
     try memory.init(boot_info.mmap);
-    arch.print("Initialized memory subsystem\n", .{});
-    //var heap_allocator = try memory.getHeapAllocator();
-    //const heap_allocator_iface = heap_allocator.allocator();
-    //arch.print("Initialized heap allocator\n", .{});
-    //_ = try debug.info.init(boot_info.elf_blob, heap_allocator_iface);
-    //arch.print("Initialized debug info\n", .{});
+    const suspect: *volatile u64 = @ptrFromInt(0xffffff801fe70000);
+    arch.print("after memory.init: {x}\n", .{suspect.*});
+
+    var heap_allocator = try memory.getHeapAllocator();
+
+    arch.print("after getHeapAllocator: {x}\n", .{suspect.*});
+    const heap_allocator_iface = heap_allocator.allocator();
+    _ = try debug.info.init(boot_info.elf_blob, heap_allocator_iface);
+    arch.print("Initialized debug info\n", .{});
     try arch.parseAcpi(boot_info.xsdp_phys);
-    arch.print("Parsed acpi tables\n", .{});
     try sched.init();
     arch.halt();
 }
