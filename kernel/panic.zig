@@ -10,9 +10,11 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) n
     _ = trace;
 
     if (ret_addr) |ra| {
-        const sym_name = debug.info.global_ptr.getSymbolName(ra);
-        if (sym_name) |sym| {
-            arch.print("KERNEL PANIC: {s} @ {s}\n", .{ msg, sym });
+        if (debug.info.global_ptr) |dbg_info| {
+            const sym_name = dbg_info.getSymbolName(ra);
+            if (sym_name) |sym| {
+                arch.print("KERNEL PANIC: {s} @ {s}\n", .{ msg, sym });
+            }
         } else {
             arch.print("KERNEL PANIC: {s}\n", .{msg});
         }
@@ -27,9 +29,12 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) n
 
     while (frames < 64) : (frames += 1) {
         const pc = it.next() orelse break;
-        const sym_name = debug.info.global_ptr.getSymbolName(pc);
-        if (sym_name) |sym| {
-            arch.print("{s}\n", .{sym});
+
+        if (debug.info.global_ptr) |dbg_info| {
+            const sym_name = dbg_info.getSymbolName(pc);
+            if (sym_name) |sym| {
+                arch.print("{s}\n", .{sym});
+            }
         } else {
             arch.print("PC: 0x{X} (no symbol)\n", .{pc});
         }

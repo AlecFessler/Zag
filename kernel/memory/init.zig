@@ -21,6 +21,11 @@ const Range = zag.utils.range.Range;
 const VAddr = zag.memory.address.VAddr;
 const VirtualMemoryManager = zag.memory.vmm.VirtualMemoryManager;
 
+var bump_allocator: BumpAllocator = undefined;
+var buddy_allocator: BuddyAllocator = undefined;
+var heap_tree_backing_allocator: BumpAllocator = undefined;
+var heap_tree_allocator: HeapTreeAllocator = undefined;
+
 pub fn init(firmware_mmap: MMap) !void {
     var mmap_entries: [boot.protocol.MAX_MMAP_ENTRIES]MMapEntry = undefined;
     const mmap = boot.protocol.collapseMMap(&firmware_mmap, &mmap_entries);
@@ -42,7 +47,7 @@ pub fn init(firmware_mmap: MMap) !void {
 
     const bump_alloc_start_phys = PAddr.fromInt(largest_free_region.start_paddr);
     const bump_alloc_end_phys = PAddr.fromInt(largest_free_region.start_paddr + largest_free_region.num_pages * paging.PAGE4K);
-    var bump_allocator = BumpAllocator.init(bump_alloc_start_phys.addr, bump_alloc_end_phys.addr);
+    bump_allocator = BumpAllocator.init(bump_alloc_start_phys.addr, bump_alloc_end_phys.addr);
     const bump_alloc_iface: std.mem.Allocator = bump_allocator.allocator();
 
     const addr_space_root_phys = arch.getAddrSpaceRoot();
@@ -116,7 +121,7 @@ pub fn init(firmware_mmap: MMap) !void {
         )),
         null,
     );
-    var buddy_allocator = try BuddyAllocator.init(
+    buddy_allocator = try BuddyAllocator.init(
         buddy_alloc_start_virt.addr,
         buddy_alloc_end_virt.addr,
         bump_alloc_iface,
@@ -153,15 +158,15 @@ pub fn init(firmware_mmap: MMap) !void {
         }
 
         buddy_allocator.addRegion(useable_range.start, useable_range.end);
-
-        pmm.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
-
-        process.global_kproc.addr_space_root = VAddr.fromPAddr(addr_space_root_phys, null);
-        process.global_kproc.vmm = VirtualMemoryManager.init(
-            VAddr.fromInt(address.AddrSpacePartition.kernel.start),
-            VAddr.fromInt(address.AddrSpacePartition.kernel.end),
-        );
     }
+
+    pmm.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
+
+    process.global_kproc.addr_space_root = VAddr.fromPAddr(addr_space_root_phys, null);
+    process.global_kproc.vmm = VirtualMemoryManager.init(
+        VAddr.fromInt(address.AddrSpacePartition.kernel.start),
+        VAddr.fromInt(address.AddrSpacePartition.kernel.end),
+    );
 }
 
 pub fn getHeapAllocator() !HeapAllocator {
@@ -178,12 +183,12 @@ pub fn getHeapAllocator() !HeapAllocator {
     );
     const heap_tree_vaddr_space_end = VAddr.fromInt(heap_tree_vaddr_space_start.addr + paging.PAGE1G);
 
-    var heap_tree_backing_allocator = BumpAllocator.init(
+    heap_tree_backing_allocator = BumpAllocator.init(
         heap_tree_vaddr_space_start.addr,
         heap_tree_vaddr_space_end.addr,
     );
     const heap_tree_backing_allocator_iface = heap_tree_backing_allocator.allocator();
-    var heap_tree_allocator = try HeapTreeAllocator.init(heap_tree_backing_allocator_iface);
+    heap_tree_allocator = try HeapTreeAllocator.init(heap_tree_backing_allocator_iface);
 
     return HeapAllocator.init(
         heap_vaddr_space_start.addr,

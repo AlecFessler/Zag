@@ -53,10 +53,14 @@ export fn kTrampoline(boot_info: *BootInfo) noreturn {
 fn kMain(boot_info: *BootInfo) !void {
     arch.init();
     try memory.init(boot_info.mmap);
+    arch.print("Initialized memory subsystem\n", .{});
     var heap_allocator = try memory.getHeapAllocator();
     const heap_allocator_iface = heap_allocator.allocator();
-    _ = try debug.info.init(boot_info.elf_blob, heap_allocator_iface);
+    arch.print("Initialized heap allocator\n", .{});
+    //_ = try debug.info.init(boot_info.elf_blob, heap_allocator_iface);
+    //arch.print("Initialized debug info\n", .{});
     try arch.parseAcpi(boot_info.xsdp_phys);
+    arch.print("Parsed acpi tables\n", .{});
     try sched.init();
     arch.halt();
 }
