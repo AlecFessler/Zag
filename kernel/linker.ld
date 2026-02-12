@@ -1,7 +1,6 @@
 ENTRY(_start)
 
 KERNEL_VADDR_BASE = 0xFFFFFFFF80000000;
-STACK_SIZE = 0x4000;
 
 SECTIONS {
     . = KERNEL_VADDR_BASE;
@@ -12,7 +11,6 @@ SECTIONS {
 
     .rodata : ALIGN(4K) {
         *(.rodata*)
-        PROVIDE(_kernel_base_vaddr = KERNEL_VADDR_BASE);
     }
 
     .data : ALIGN(4K) {
@@ -23,17 +21,4 @@ SECTIONS {
         *(COMMON)
         *(.bss*)
     }
-
-    __stackguard_upper (NOLOAD) : ALIGN(4K) {
-        . += 4K;
-    } :__stackguard_upper
-
-    __stack (NOLOAD) : ALIGN(4K) {
-        . += STACK_SIZE;
-    } :__stack
-
-    __stackguard_lower (NOLOAD) : ALIGN(4K) {
-        PROVIDE(__stackguard_lower = .);
-        . += 4K;
-    } :__stackguard_lower
 }

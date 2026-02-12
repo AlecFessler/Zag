@@ -1,80 +1,17 @@
-//! Buddy allocator managing page-aligned power-of-two blocks.
-//!
-//! Owns a contiguous address range and sub-divides/coalesces pages across 2^N
-//! orders. Backed by a bitmap (free = 1) plus per-order intrusive free lists and
-//! a compact per-pair order table for O(1) order lookups. Exposes a
-//! `std.mem.Allocator` facade for page-multiple allocations.
-//!
-//! # Directory
-//!
-//! ## Type Definitions
-//! - `BuddyAllocator` – owning buddy allocator over a contiguous, page-aligned region.
-//! - `Page` – page-sized object used as the allocation unit (4 KiB).
-//! - `PagePairOrders` – packed per-2-page metadata storing even/odd page orders.
-//! - `FreeListBatch` – per-order batch list used by `BuddyAllocator.splitAllocation`.
-//! - `BitmapFreeList` – bitmap-backed free-state helper (alias).
-//! - `IntrusiveFreeList` – per-order intrusive list of block bases (alias).
-//! - `AllocationMap` – test helper map of live allocations (base -> { size, order }).
-//!
-//! ## Constants
-//! - `link_to_list` – intrusive list configuration flag.
-//! - `NUM_ORDERS` – number of supported orders (0..10 inclusive).
-//! - `ORDERS` – table of block sizes in bytes for each order.
-//! - `PAGE_SIZE` – page size in bytes (4 KiB).
-//! - `using_getNextFree` – bitmap freelist configuration flag.
-//! - `using_popSpecific` – intrusive freelist configuration flag.
-//!
-//! ## Variables
-//! - None.
-//!
-//! ## Functions
-//! - `BuddyAllocator.init` – construct allocator and allocate metadata.
-//! - `BuddyAllocator.addRegion` – free a region page-by-page into the allocator.
-//! - `BuddyAllocator.deinit` – release bitmap/order-table metadata.
-//! - `BuddyAllocator.allocator` – return a `std.mem.Allocator` facade.
-//! - `BuddyAllocator.splitAllocation` – split an allocation into smaller blocks and batch-return them.
-//! - `BuddyAllocator.validateState` – verify internal invariants vs recorded allocations.
-//! - `BuddyAllocator.checkAllocationFailure` – assert higher-order exhaustion (private).
-//! - `BuddyAllocator.recursiveSplit` – obtain a block of target order, splitting as needed (private).
-//! - `BuddyAllocator.recursiveMerge` – coalesce a free block with its buddy up to fixpoint (private).
-//! - `BuddyAllocator.getOrder` – read stored order for page base (private).
-//! - `BuddyAllocator.setOrder` – write stored order for page base (private).
-//! - `BuddyAllocator.alloc` – `std.mem.Allocator.alloc` vtable entry (private).
-//! - `BuddyAllocator.resize` – `std.mem.Allocator.resize` vtable entry, unsupported (private).
-//! - `BuddyAllocator.remap` – `std.mem.Allocator.remap` vtable entry, unsupported (private).
-//! - `BuddyAllocator.free` – `std.mem.Allocator.free` vtable entry (private).
-
-const bitmap_freelist = @import("bitmap_freelist.zig");
-const intrusive_freelist = @import("intrusive_freelist.zig");
 const std = @import("std");
+const zag = @import("zag");
 
-/// Owning allocator for a contiguous, page-aligned address range.
+const bitmap_freelist = zag.memory.bitmap_freelist;
+const intrusive_freelist = zag.memory.intrusive_freelist;
+
 pub const BuddyAllocator = struct {
     start_addr: u64,
     end_addr: u64,
-
     init_allocator: std.mem.Allocator,
-
     page_pair_orders: []PagePairOrders = undefined,
     bitmap: BitmapFreeList = undefined,
     freelists: [NUM_ORDERS]IntrusiveFreeList = [_]IntrusiveFreeList{IntrusiveFreeList{}} ** NUM_ORDERS,
 
-    /// Summary:
-    /// Initializes a buddy allocator managing `[start_addr, end_addr)`.
-    ///
-    /// Arguments:
-    /// - `start_addr`: Start of region (rounded up to `PAGE_SIZE`).
-    /// - `end_addr`: End of region (rounded down to `PAGE_SIZE`).
-    /// - `init_allocator`: Allocator used to allocate bitmap and order table.
-    ///
-    /// Returns:
-    /// - `BuddyAllocator` initialized with metadata and empty freelists.
-    ///
-    /// Errors:
-    /// - Returns `std.mem.Allocator.Error` on metadata allocation failure.
-    ///
-    /// Panics:
-    /// - None.
     pub fn init(
         start_addr: u64,
         end_addr: u64,
@@ -115,22 +52,6 @@ pub const BuddyAllocator = struct {
         return self;
     }
 
-    /// Summary:
-    /// Marks a region as free by pushing each page into the allocator via `free`.
-    ///
-    /// Arguments:
-    /// - `self`: Allocator instance.
-    /// - `start_addr`: Start of region to free (inclusive).
-    /// - `end_addr`: End of region to free (exclusive).
-    ///
-    /// Returns:
-    /// - `void`.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - Asserts if the aligned end is not greater than the aligned start.
     pub fn addRegion(
         self: *BuddyAllocator,
         start_addr: u64,
@@ -155,40 +76,11 @@ pub const BuddyAllocator = struct {
         }
     }
 
-    /// Summary:
-    /// Releases internal metadata buffers (bitmap and order table).
-    ///
-    /// Arguments:
-    /// - `self`: Allocator instance.
-    ///
-    /// Returns:
-    /// - `void`.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - None.
     pub fn deinit(self: *BuddyAllocator) void {
         self.init_allocator.free(self.page_pair_orders);
         self.bitmap.deinit();
     }
 
-    /// Summary:
-    /// Returns a `std.mem.Allocator` interface backed by this buddy allocator.
-    ///
-    /// Arguments:
-    /// - `self`: Allocator instance.
-    ///
-    /// Returns:
-    /// - `std.mem.Allocator` whose `alloc`/`free` call into this allocator.
-    ///   `resize` and `remap` trap (unsupported).
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - None.
     pub fn allocator(self: *BuddyAllocator) std.mem.Allocator {
         return .{
             .ptr = self,
@@ -201,23 +93,6 @@ pub const BuddyAllocator = struct {
         };
     }
 
-    /// Summary:
-    /// Splits an existing allocation at `addr` (of order `getOrder(addr)`) into
-    /// blocks of `split_order` and returns them as a batch list.
-    ///
-    /// Arguments:
-    /// - `self`: Allocator instance.
-    /// - `addr`: Base address of an existing allocation to be split.
-    /// - `split_order`: Target smaller order (must be `< getOrder(addr)`).
-    ///
-    /// Returns:
-    /// - `FreeListBatch` whose nodes are `*Page` covering the original range.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - Asserts internally if invariants are violated by the caller-supplied inputs.
     pub fn splitAllocation(
         self: *BuddyAllocator,
         addr: u64,
@@ -239,21 +114,6 @@ pub const BuddyAllocator = struct {
         return batch;
     }
 
-    /// Summary:
-    /// Obtain a block base address of `order`, splitting a higher-order block if necessary.
-    ///
-    /// Arguments:
-    /// - `self`: Allocator instance.
-    /// - `order`: Desired order (0..10).
-    ///
-    /// Returns:
-    /// - `?u64` base address of an available block, or `null` if none exist.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - None.
     fn recursiveSplit(self: *BuddyAllocator, order: u4) ?u64 {
         const addr_ptr = self.freelists[order].pop() orelse {
             if (order == 10) return null;
@@ -278,22 +138,6 @@ pub const BuddyAllocator = struct {
         return addr;
     }
 
-    /// Summary:
-    /// Recursively merge a free block with its buddy while possible, returning
-    /// the final merged base address and order.
-    ///
-    /// Arguments:
-    /// - `self`: Allocator instance.
-    /// - `addr`: Base address of a free block.
-    ///
-    /// Returns:
-    /// - `struct { addr: u64, order: u4 }` describing the coalesced result.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - Asserts if internal assumptions (e.g., removing buddy from freelist) fail.
     fn recursiveMerge(self: *BuddyAllocator, addr: u64) struct { addr: u64, order: u4 } {
         const order = self.getOrder(addr);
         if (order == 10) return .{ .addr = addr, .order = order };
@@ -303,17 +147,6 @@ pub const BuddyAllocator = struct {
         const buddy_out_of_bounds = buddy < self.start_addr or buddy >= self.end_addr;
 
         if (buddy_out_of_bounds) {
-            const higher = order + 1;
-            const next_rel = rel & ~ORDERS[higher];
-            const next_size_addr = self.start_addr + next_rel;
-            const next_size_end = next_size_addr + ORDERS[higher];
-            const next_size_within_bounds = next_size_addr >= self.start_addr and next_size_end <= self.end_addr;
-
-            if (next_size_within_bounds) {
-                self.setOrder(next_size_addr, higher);
-                return self.recursiveMerge(next_size_addr);
-            }
-
             return .{ .addr = addr, .order = order };
         }
 
@@ -341,21 +174,6 @@ pub const BuddyAllocator = struct {
         return self.recursiveMerge(lower_half);
     }
 
-    /// Summary:
-    /// Returns the stored order (0..10) for the page that begins at `addr`.
-    ///
-    /// Arguments:
-    /// - `self`: Allocator instance.
-    /// - `addr`: Page-aligned address within the managed region.
-    ///
-    /// Returns:
-    /// - `u4` current order associated with that page base.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - None.
     fn getOrder(self: *BuddyAllocator, addr: u64) u4 {
         const page_idx = (addr - self.start_addr) / PAGE_SIZE;
         const pair_idx = page_idx / 2;
@@ -367,22 +185,6 @@ pub const BuddyAllocator = struct {
         }
     }
 
-    /// Summary:
-    /// Records `order` for the page that begins at `addr`.
-    ///
-    /// Arguments:
-    /// - `self`: Allocator instance.
-    /// - `addr`: Page-aligned address within the managed region.
-    /// - `order`: Value to store (0..10).
-    ///
-    /// Returns:
-    /// - `void`.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - None.
     fn setOrder(self: *BuddyAllocator, addr: u64, order: u4) void {
         const page_idx = (addr - self.start_addr) / PAGE_SIZE;
         const pair_idx = page_idx / 2;
@@ -394,23 +196,6 @@ pub const BuddyAllocator = struct {
         }
     }
 
-    /// Summary:
-    /// `std.mem.Allocator.alloc` entry point for page-multiple allocations.
-    ///
-    /// Arguments:
-    /// - `ptr`: Opaque pointer to the `BuddyAllocator` (vtable-provided).
-    /// - `len`: Requested size in bytes (must be a multiple of `PAGE_SIZE`).
-    /// - `alignment`: Ignored (blocks are page-aligned).
-    /// - `ret_addr`: Caller return address for diagnostics (unused).
-    ///
-    /// Returns:
-    /// - `?[*]u8` pointer to `len` bytes on success, or `null` if none available.
-    ///
-    /// Errors:
-    /// - None (nullable return indicates exhaustion).
-    ///
-    /// Panics:
-    /// - Asserts if `len` is not a multiple of `PAGE_SIZE` or order exceeds bounds.
     fn alloc(
         ptr: *anyopaque,
         len: u64,
@@ -432,24 +217,6 @@ pub const BuddyAllocator = struct {
         return @ptrFromInt(addr);
     }
 
-    /// Summary:
-    /// `std.mem.Allocator.resize` entry point (unsupported).
-    ///
-    /// Arguments:
-    /// - `ptr`: Opaque pointer to allocator (unused).
-    /// - `memory`: Existing allocation slice (unused).
-    /// - `alignment`: Alignment (unused).
-    /// - `new_len`: New size (unused).
-    /// - `ret_addr`: Caller return address (unused).
-    ///
-    /// Returns:
-    /// - `bool` – never returns normally; function traps.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - Traps unconditionally (`unreachable`).
     fn resize(
         ptr: *anyopaque,
         memory: []u8,
@@ -462,27 +229,9 @@ pub const BuddyAllocator = struct {
         _ = alignment;
         _ = new_len;
         _ = ret_addr;
-        unreachable;
+        return false;
     }
 
-    /// Summary:
-    /// `std.mem.Allocator.remap` entry point (unsupported).
-    ///
-    /// Arguments:
-    /// - `ptr`: Opaque pointer to allocator (unused).
-    /// - `memory`: Existing allocation slice (unused).
-    /// - `alignment`: Alignment (unused).
-    /// - `new_len`: New size (unused).
-    /// - `ret_addr`: Caller return address (unused).
-    ///
-    /// Returns:
-    /// - `?[*]u8` – never returns normally; function traps.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - Traps unconditionally (`unreachable`).
     fn remap(
         ptr: *anyopaque,
         memory: []u8,
@@ -495,26 +244,9 @@ pub const BuddyAllocator = struct {
         _ = alignment;
         _ = new_len;
         _ = ret_addr;
-        unreachable;
+        return null;
     }
 
-    /// Summary:
-    /// `std.mem.Allocator.free` entry point; frees and coalesces the block.
-    ///
-    /// Arguments:
-    /// - `ptr`: Opaque pointer to the `BuddyAllocator` (vtable-provided).
-    /// - `buf`: Slice previously returned by `alloc`.
-    /// - `alignment`: Ignored.
-    /// - `ret_addr`: Caller return address for diagnostics (unused).
-    ///
-    /// Returns:
-    /// - `void`.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - Asserts if internal coalescing assumptions fail.
     fn free(
         ptr: *anyopaque,
         buf: []u8,
@@ -530,7 +262,6 @@ pub const BuddyAllocator = struct {
         self.freelists[result.order].push(@ptrFromInt(result.addr));
     }
 
-    /// One-line: Test helper map recording active allocations (base -> { size, order }).
     pub const AllocationMap = std.HashMap(
         u64,
         struct { size: u64, order: u4 },
@@ -538,21 +269,6 @@ pub const BuddyAllocator = struct {
         std.hash_map.default_max_load_percentage,
     );
 
-    /// Summary:
-    /// Validates allocator state against a map of recorded allocations and logs on failure.
-    ///
-    /// Arguments:
-    /// - `self`: Allocator instance.
-    /// - `allocations`: Map of active allocations keyed by base address.
-    ///
-    /// Returns:
-    /// - `bool` – `true` if all invariants hold; `false` after emitting diagnostics.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - None (uses `std.debug.print`; returns `false` on invariant violations).
     pub fn validateState(self: *BuddyAllocator, allocations: *AllocationMap) bool {
         const Helper = struct {
             fn fail(reason: []const u8, ctx: struct {
@@ -726,22 +442,6 @@ pub const BuddyAllocator = struct {
         return true;
     }
 
-    /// Summary:
-    /// Test helper: after attempting to allocate `order`, asserts that freelists
-    /// at `order` and above are empty (i.e., allocation must fail).
-    ///
-    /// Arguments:
-    /// - `buddy_alloc`: Allocator under test.
-    /// - `order`: Order to check (0..10).
-    ///
-    /// Returns:
-    /// - `!void` – errors if any freelist is non-empty.
-    ///
-    /// Errors:
-    /// - Propagates errors from `std.testing.expect`.
-    ///
-    /// Panics:
-    /// - None.
     fn checkAllocationFailure(buddy_alloc: *BuddyAllocator, order: u4) !void {
         for (order..NUM_ORDERS) |check_order| {
             try std.testing.expect(buddy_alloc.freelists[check_order].head == null);
@@ -749,7 +449,6 @@ pub const BuddyAllocator = struct {
     }
 };
 
-/// Page object sized/aligned to `PAGE_SIZE`, the allocation unit.
 pub const Page = struct {
     bytes: [PAGE_SIZE]u8 align(PAGE_SIZE),
 
@@ -759,7 +458,6 @@ pub const Page = struct {
     }
 };
 
-/// Per-2-page metadata storing the current order for even/odd pages.
 const PagePairOrders = packed struct {
     even: u4,
     odd: u4,
@@ -769,28 +467,24 @@ const PagePairOrders = packed struct {
     }
 };
 
-/// Batch list type returned by `BuddyAllocator.splitAllocation` at a single order.
+const using_popSpecific = true;
+const link_to_list = false;
 pub const FreeListBatch = intrusive_freelist.IntrusiveFreeList(
     *Page,
     !using_popSpecific,
     link_to_list,
 );
 
-/// Bitmap free list type tracking per-page free state (1 = free).
+const using_getNextFree = false;
 const BitmapFreeList = bitmap_freelist.BitmapFreeList(using_getNextFree);
 
-/// Per-order intrusive free list of block base addresses.
 const IntrusiveFreeList = intrusive_freelist.IntrusiveFreeList(
     *Page,
     using_popSpecific,
     link_to_list,
 );
 
-/// Intrusive list configuration flag (do not maintain back-links).
-const link_to_list = false;
-/// Number of supported orders (0..10), i.e., 11 distinct sizes.
 const NUM_ORDERS = 11;
-/// Table of block sizes (bytes) for each order (order * 4 KiB).
 const ORDERS = blk: {
     var arr: [NUM_ORDERS]u64 = undefined;
     for (0..NUM_ORDERS) |i| {
@@ -798,12 +492,7 @@ const ORDERS = blk: {
     }
     break :blk arr;
 };
-/// Page size in bytes.
 const PAGE_SIZE = 4096;
-/// BitmapFreeList configuration – disable `getNextFree` fast path.
-const using_getNextFree = false;
-/// IntrusiveFreeList configuration – enable `popSpecific`.
-const using_popSpecific = true;
 
 test "buddy allocator init fails with failing allocator" {
     const allocator = std.testing.failing_allocator;

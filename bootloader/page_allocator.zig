@@ -1,21 +1,24 @@
 const std = @import("std");
+const zag = @import("zag");
 
-pub const BumpAllocator = struct {
-    start_addr: u64,
-    free_addr: u64,
-    end_addr: u64,
+const paging = zag.memory.paging;
+const uefi = std.os.uefi;
 
-    pub fn init(start_addr: u64, end_addr: u64) BumpAllocator {
-        std.debug.assert(end_addr > start_addr);
+pub const PageAllocator = struct {
+    boot: *uefi.tables.BootServices,
+    mem_type: uefi.tables.MemoryType,
 
+    pub fn init(
+        boot: *uefi.tables.BootServices,
+        mem_type: uefi.tables.MemoryType,
+    ) PageAllocator {
         return .{
-            .start_addr = start_addr,
-            .free_addr = start_addr,
-            .end_addr = end_addr,
+            .boot = boot,
+            .mem_type = mem_type,
         };
     }
 
-    pub fn allocator(self: *BumpAllocator) std.mem.Allocator {
+    pub fn allocator(self: *PageAllocator) std.mem.Allocator {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -34,21 +37,21 @@ pub const BumpAllocator = struct {
         ret_addr: u64,
     ) ?[*]u8 {
         _ = ret_addr;
-        const self: *BumpAllocator = @alignCast(@ptrCast(ptr));
+        const self: *PageAllocator = @alignCast(@ptrCast(ptr));
+        const align_bytes = alignment.toByteUnits();
 
-        const aligned = std.mem.alignForward(
-            u64,
-            self.free_addr,
-            alignment.toByteUnits(),
-        );
-        const next_free = aligned + len;
+        std.debug.assert(len > 0);
+        std.debug.assert(align_bytes <= paging.PAGE4K);
 
-        if (next_free > self.end_addr) {
-            return null;
-        }
+        const num_pages = (len + paging.PAGE4K - 1) / paging.PAGE4K;
 
-        self.free_addr = next_free;
-        return @ptrFromInt(aligned);
+        const pages = self.boot.allocatePages(
+            .any,
+            self.mem_type,
+            num_pages,
+        ) catch return null;
+
+        return @ptrCast(pages);
     }
 
     fn resize(

@@ -1,63 +1,9 @@
-//! Slab allocator for fixed-size objects.
-//!
-//! Factory that produces a type-specialized allocator for `T`. Allocates slabs
-//! in chunks from a backing allocator and hands out individual `T` objects via
-//! an intrusive freelist. Optionally supports a small bootstrap stack so code
-//! that depends on this allocator can allocate nodes before the general heap
-//! is ready.
-//!
-//! Exposes a `std.mem.Allocator` interface that only supports exact-size,
-//! exact-alignment allocations for `T`; `resize`/`remap` are unsupported.
-//!
-//! # Directory
-//!
-//! ## Type Definitions
-//! - `SlabAllocator(T, stack_bootstrap, stack_size, allocation_chunk_size)` — factory returning a concrete allocator type.
-//! - `AllocHeader` — linked-list node that tracks each allocated slab chunk.
-//!
-//! ## Constants
-//! - `DBG` — compile-mode flag enabling debug checks and leak assertions.
-//!
-//! ## Variables
-//! - None (module scope). Instance fields live on the returned `SlabAllocator(...)` type.
-//!
-//! ## Functions
-//! - `SlabAllocator` — factory; builds `SlabAllocator(...)` type specialized to `T`.
-//! - `SlabAllocator.init` — initialize the allocator with a backing allocator.
-//! - `SlabAllocator.deinit` — free all slab chunks; asserts no leaks in Debug.
-//! - `SlabAllocator.allocator` — expose a `std.mem.Allocator` vtable view.
-//! - `SlabAllocator.alloc` — vtable `alloc`; single-`T` allocation path.
-//! - `SlabAllocator.resize` — vtable `resize`; unsupported, always `false`.
-//! - `SlabAllocator.remap` — vtable `remap`; unsupported, always `null`.
-//! - `SlabAllocator.free` — vtable `free`; returns a single `T` to the freelist.
-
 const builtin = @import("builtin");
 const intrusive_freelist = @import("intrusive_freelist.zig");
 const std = @import("std");
 
-/// Compile-mode flag enabling debug-time checks (e.g., outstanding-allocation assertions).
 const DBG = builtin.mode == .Debug;
 
-/// Summary:
-/// Top-level slab allocator factory. Requires a backing allocator; returns a
-/// concrete allocator `type` specialized for `T`.
-///
-/// Arguments:
-/// - `T`: Element type managed by the slab.
-/// - `stack_bootstrap`: When true, preallocates a fixed in-struct stack of `T`
-///   for early allocations without touching the backing allocator.
-/// - `stack_size`: Number of `T` elements in the bootstrap stack (0 if disabled).
-/// - `allocation_chunk_size`: Number of `T` elements to request per slab chunk.
-///
-/// Returns:
-/// - A concrete allocator `type` with `init`, `deinit`, `allocator()` methods and
-///   a `std.mem.Allocator` vtable (`alloc`, `resize`, `remap`, `free`).
-///
-/// Errors:
-/// - None during factory instantiation. Runtime errors surface from `init`/`alloc`.
-///
-/// Panics:
-/// - None.
 pub fn SlabAllocator(
     comptime T: type,
     comptime stack_bootstrap: bool,
@@ -91,21 +37,6 @@ pub fn SlabAllocator(
         freelist: IntrusiveFreeList = .{},
         alloc_headers: ?*AllocHeader = null,
 
-        /// Summary:
-        /// Initializes a slab allocator that draws chunks from `backing_allocator`.
-        ///
-        /// Arguments:
-        /// - `backing_allocator`: Allocator to obtain/finalize slab chunks.
-        ///
-        /// Returns:
-        /// - `Self` — initialized allocator with freelist pre-seeded (unless stack bootstrap).
-        ///
-        /// Errors:
-        /// - `error.OutOfMemory` if allocating the initial chunk or header fails (when
-        ///   `stack_bootstrap == false`).
-        ///
-        /// Panics:
-        /// - None.
         pub fn init(
             backing_allocator: std.mem.Allocator,
         ) !Self {
@@ -135,20 +66,6 @@ pub fn SlabAllocator(
             return self;
         }
 
-        /// Summary:
-        /// Releases all slab chunks previously obtained from the backing allocator.
-        ///
-        /// Arguments:
-        /// - `self`: Allocator instance.
-        ///
-        /// Returns:
-        /// - None (void).
-        ///
-        /// Errors:
-        /// - None.
-        ///
-        /// Panics:
-        /// - Panics in Debug builds if `allocations != 0` (indicates a leak).
         pub fn deinit(self: *Self) void {
             if (DBG) std.debug.assert(self.allocations == 0);
 
@@ -160,21 +77,6 @@ pub fn SlabAllocator(
             }
         }
 
-        /// Summary:
-        /// Exposes this slab as a `std.mem.Allocator`.
-        ///
-        /// Arguments:
-        /// - `self`: Allocator instance.
-        ///
-        /// Returns:
-        /// - `std.mem.Allocator` — vtable that allocates/frees single `T` objects.
-        ///   `resize` and `remap` are unsupported (return false/null).
-        ///
-        /// Errors:
-        /// - None.
-        ///
-        /// Panics:
-        /// - None.
         pub fn allocator(self: *Self) std.mem.Allocator {
             return .{
                 .ptr = self,
@@ -187,27 +89,6 @@ pub fn SlabAllocator(
             };
         }
 
-        /// Summary:
-        /// `std.mem.Allocator.alloc` entry point for single-`T` allocations.
-        ///
-        /// Behavior:
-        /// - Requires `alignment == @alignOf(T)` and `len == @sizeOf(T)`.
-        /// - Preference order: bootstrap stack (if enabled) → freelist → allocate new chunk.
-        ///
-        /// Arguments:
-        /// - `ptr`: Opaque pointer to `Self`.
-        /// - `len`: Requested size (must equal `@sizeOf(T)`).
-        /// - `alignment`: Required alignment (must equal `@alignOf(T)`).
-        /// - `ret_addr`: Caller return address (unused).
-        ///
-        /// Returns:
-        /// - `?[*]u8` — pointer to a single `T` on success; `null` on OOM.
-        ///
-        /// Errors:
-        /// - None (OOM is reported as `null` per `std.mem.Allocator` contract).
-        ///
-        /// Panics:
-        /// - None.
         fn alloc(
             ptr: *anyopaque,
             len: usize,
@@ -256,24 +137,6 @@ pub fn SlabAllocator(
             }
         }
 
-        /// Summary:
-        /// `std.mem.Allocator.resize` entry point (unsupported).
-        ///
-        /// Arguments:
-        /// - `ptr`: Opaque pointer to `Self` (unused).
-        /// - `memory`: Slice to the currently allocated memory (unused).
-        /// - `alignment`: Alignment of `memory` (unused).
-        /// - `new_len`: Requested new length (unused).
-        /// - `ret_addr`: Caller return address (unused).
-        ///
-        /// Returns:
-        /// - `bool` — always `false`.
-        ///
-        /// Errors:
-        /// - None.
-        ///
-        /// Panics:
-        /// - None.
         fn resize(
             ptr: *anyopaque,
             memory: []u8,
@@ -289,24 +152,6 @@ pub fn SlabAllocator(
             return false;
         }
 
-        /// Summary:
-        /// `std.mem.Allocator.remap` entry point (unsupported).
-        ///
-        /// Arguments:
-        /// - `ptr`: Opaque pointer to `Self` (unused).
-        /// - `memory`: Slice to the currently allocated memory (unused).
-        /// - `alignment`: Alignment of `memory` (unused).
-        /// - `new_len`: Requested new length (unused).
-        /// - `ret_addr`: Caller return address (unused).
-        ///
-        /// Returns:
-        /// - `?[*]u8` — always `null`.
-        ///
-        /// Errors:
-        /// - None.
-        ///
-        /// Panics:
-        /// - None.
         fn remap(
             ptr: *anyopaque,
             memory: []u8,
@@ -322,23 +167,6 @@ pub fn SlabAllocator(
             return null;
         }
 
-        /// Summary:
-        /// `std.mem.Allocator.free` entry point for single-`T` frees.
-        ///
-        /// Arguments:
-        /// - `ptr`: Opaque pointer to `Self`.
-        /// - `buf`: Slice whose `ptr` is a previously returned `T*`.
-        /// - `alignment`: Alignment (ignored; validated during `alloc`).
-        /// - `ret_addr`: Caller return address (unused).
-        ///
-        /// Returns:
-        /// - None (void).
-        ///
-        /// Errors:
-        /// - None.
-        ///
-        /// Panics:
-        /// - Panics in Debug builds if internal accounting becomes negative.
         fn free(
             ptr: *anyopaque,
             buf: []u8,

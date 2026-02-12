@@ -1,85 +1,19 @@
-//! Bitmap-backed free list for fixed-size blocks.
-//!
-//! Provides a compact allocator-style bitmap where each bit represents a block:
-//! `1` means free, `0` means allocated. Supports constant-time bit set/clear and
-//! an optional O(1) “next free” scan using a moving word hint. Designed for use
-//! inside low-level allocators where predictable behavior and cache-friendly
-//! storage matter.
-//!
-//! # Directory
-//!
-//! ## Type Definitions
-//! - `Word` — underlying bitmap word type.
-//! - `BitmapFreeList(using_getNextFree)` — factory returning a bitmap-backed free list type.
-//!
-//! ## Constants
-//! - `WORD_BIT_SIZE` — number of bits per `Word`.
-//!
-//! ## Variables
-//! - None.
-//!
-//! ## Functions
-//! - `BitmapFreeList.init` — construct a bitmap and initialize all bits.
-//! - `BitmapFreeList.deinit` — free the backing bitmap storage.
-//! - `BitmapFreeList.getNextFree` — pop and return the next free block (only when enabled).
-//! - `BitmapFreeList.setBit` — set a block’s bit to free (1) or allocated (0).
-//! - `BitmapFreeList.isFree` — query whether a block is currently free.
-
 const std = @import("std");
 
-/// Underlying bitmap word type.
 pub const Word = u64;
 
-/// Number of bits per `Word`.
 pub const WORD_BIT_SIZE = @bitSizeOf(Word);
 
-/// Factory for a bitmap free list type.
-///
-/// Compile-time parameter:
-/// - `using_getNextFree` — when true, enables the `getNextFree()` fast path with
-///   a moving word index (`hint`). When false, that API is unavailable.
-///
-/// Bit convention:
-/// - `1` = free
-/// - `0` = allocated
-pub fn BitmapFreeList(
-    comptime using_getNextFree: bool,
-) type {
+pub fn BitmapFreeList(comptime using_getNextFree: bool) type {
     return struct {
         const Self = @This();
 
-        /// Base address of the first block represented by bit 0.
         base_addr: u64,
-        /// Size in bytes of each fixed block.
         block_size: u64,
-        /// Word index hint for the next free search (only when enabled).
-        hint: if (using_getNextFree) u64 else void =
-            if (using_getNextFree) 0,
-        /// The bitmap storage (1 = free, 0 = allocated).
+        hint: if (using_getNextFree) u64 else void = if (using_getNextFree) 0,
         bitmap: []Word,
-        /// Allocator used to allocate/free the bitmap buffer.
         allocator: std.mem.Allocator,
 
-        /// Summary:
-        /// Constructs a bitmap representing `num_bits` fixed-size blocks starting at `base_addr`,
-        /// with each block sized `block_size`. Initializes all bits to free (1) or allocated (0)
-        /// according to `initially_free`, and masks any tail bits beyond `num_bits`.
-        ///
-        /// Arguments:
-        /// - `base_addr`: Address represented by bit 0 (block 0).
-        /// - `block_size`: Size in bytes of each block; represented addresses must be multiples of this.
-        /// - `num_bits`: Number of blocks represented by the bitmap.
-        /// - `initially_free`: When true, mark all blocks free; otherwise mark all allocated.
-        /// - `allocator`: Backing allocator for the bitmap buffer.
-        ///
-        /// Returns:
-        /// - `Self` on success.
-        ///
-        /// Errors:
-        /// - Propagates allocation errors from `allocator.alloc`.
-        ///
-        /// Panics:
-        /// - None.
         pub fn init(
             base_addr: u64,
             block_size: u64,
@@ -109,40 +43,10 @@ pub fn BitmapFreeList(
             };
         }
 
-        /// Summary:
-        /// Releases the bitmap storage previously allocated during `init`.
-        ///
-        /// Arguments:
-        /// - `self`: Bitmap instance whose internal buffer will be freed.
-        ///
-        /// Returns:
-        /// - None.
-        ///
-        /// Errors:
-        /// - None.
-        ///
-        /// Panics:
-        /// - None.
         pub fn deinit(self: *Self) void {
             self.allocator.free(self.bitmap);
         }
 
-        /// Summary:
-        /// Returns the address of the next free block at/after the current `hint`, marks that
-        /// bit allocated (sets to 0), and advances `hint` to the next word containing any free bit.
-        /// This method exists only when the type is instantiated with `using_getNextFree = true`.
-        ///
-        /// Arguments:
-        /// - `self`: Bitmap instance.
-        ///
-        /// Returns:
-        /// - Address (`u64`) of the next free block, or `null` if no free bit remains at/after the hint.
-        ///
-        /// Errors:
-        /// - None.
-        ///
-        /// Panics:
-        /// - In debug builds, panics if internal invariants are violated.
         pub fn getNextFree(self: *Self) ?u64 {
             if (!using_getNextFree) @compileError("Must build type with using_getNextFree flag if you plan to call this");
             if (self.hint == self.bitmap.len) return null;
@@ -165,23 +69,6 @@ pub fn BitmapFreeList(
             return addr;
         }
 
-        /// Summary:
-        /// Sets the bit corresponding to `addr` to `val` (1 = free, 0 = allocated). Maintains
-        /// `hint` to preserve the fast path when enabling free bits.
-        ///
-        /// Arguments:
-        /// - `self`: Bitmap instance.
-        /// - `addr`: Block base address to modify (must be `block_size`-aligned and within range).
-        /// - `val`: `1` to mark free, `0` to mark allocated.
-        ///
-        /// Returns:
-        /// - None.
-        ///
-        /// Errors:
-        /// - None.
-        ///
-        /// Panics:
-        /// - In debug builds, panics if `addr` is not aligned or is out of range.
         pub fn setBit(self: *Self, addr: u64, val: u1) void {
             std.debug.assert(std.mem.isAligned(addr, self.block_size));
 
@@ -204,21 +91,6 @@ pub fn BitmapFreeList(
             }
         }
 
-        /// Summary:
-        /// Queries whether the block at `addr` is currently free (bit = 1).
-        ///
-        /// Arguments:
-        /// - `self`: Bitmap instance.
-        /// - `addr`: Block base address to query (must be aligned and in range).
-        ///
-        /// Returns:
-        /// - `true` if free, `false` if allocated.
-        ///
-        /// Errors:
-        /// - None.
-        ///
-        /// Panics:
-        /// - In debug builds, panics if alignment or address range invariants are violated.
         pub fn isFree(self: *Self, addr: u64) bool {
             std.debug.assert(std.mem.isAligned(addr, self.block_size));
 

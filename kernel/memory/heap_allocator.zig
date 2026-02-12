@@ -1,100 +1,30 @@
-//! Split/merge heap allocator with size-bucketed free lists on a red–black tree.
-//!
-//! Owns a reserved virtual range and carves it into blocks that can split and
-//! coalesce. Free blocks are grouped into size buckets stored in a red–black
-//! tree; each bucket holds an intrusive freelist of blocks of exactly that size.
-//!
-//! # Directory
-//!
-//! ## Type Definitions
-//! - `AllocFooter` — footer at the end of every block; back-links to header.
-//! - `AllocHeader` — header at the start of every block; free bit + bucket size.
-//! - `AllocPadding` — per-allocation padding storing offset back to header.
-//! - `HeapAllocator` — main allocator struct with tree and reserve/commit bounds.
-//! - `TreeEntry` — RB-tree payload: `{ bucket_size, freelist }`.
-//! - `FreelistEntry` — embedded node bytes placed inside free blocks.
-//! - `Freelist` — intrusive free list for blocks in a size bucket.
-//! - `RedBlackTree` — RB-tree keyed by `bucket_size`.
-//! - `TreeAllocator` — slab allocator for RB-tree nodes.
-//!
-//! ## Constants
-//! - `DBG` — toggles some iteration guards in Debug builds.
-//! - `HEADER_SIZE`, `HEADER_ALIGN` — header layout constants.
-//! - `PADDING_SIZE`, `PADDING_ALIGN` — padding layout constants.
-//! - `PREFIX_SIZE`, `PREFIX_ALIGN` — bytes before user region and its align.
-//! - `FOOTER_SIZE`, `FOOTER_ALIGN` — footer layout constants.
-//! - `FREELIST_ENTRY_ALIGN`, `FREELIST_ENTRY_SIZE` — embedded node layout.
-//! - `MIN_USER_SIZE`, `MIN_USER_ALIGN` — minimum user payload & alignment.
-//! - `MIN_BLOCK_SIZE` — smallest legal block (hdr + pad + min user + ftr).
-//! - `using_popSpecific`, `link_to_list` — freelist configuration toggles.
-//! - `duplicate_is_error` — RB-tree duplicate-key policy.
-//! - `stack_bootstrap`, `stack_size`, `allocation_chunk_size` — slab params.
-//!
-//! ## Variables
-//! - None.
-//!
-//! ## Functions
-//! - `HeapAllocator.init` — construct a heap over a reserved range.
-//! - `HeapAllocator.deinit` — release internal RB-tree structures.
-//! - `HeapAllocator.allocator` — expose as `std.mem.Allocator` vtable.
-//! - `HeapAllocator.alloc` — best-fit lower-bound allocation with optional split.
-//! - `HeapAllocator.findBestFitLowerBound` — RB-tree search for smallest bucket ≥ key.
-//! - `HeapAllocator.getBlockMetadata` — compute block placement inside a free block.
-//! - `HeapAllocator.getSplitBlockMetadata` — compute tail block metadata when splitting.
-//! - `HeapAllocator.findInOrderSuccessor` — RB-tree in-order successor.
-//! - `HeapAllocator.resize` — unsupported `std.mem.Allocator.resize` entry; traps.
-//! - `HeapAllocator.remap` — unsupported `std.mem.Allocator.remap` entry; traps.
-//! - `HeapAllocator.free` — free and attempt bidirectional coalescing; reinsert into tree.
-//! - `HeapAllocator.treeInsert` — insert a free block into the size-keyed tree.
-//! - `HeapAllocator.validateState` — deep structural invariant check.
-
 const builtin = @import("builtin");
-const intrusive_freelist = @import("intrusive_freelist.zig");
-const slab_alloc = @import("slab_allocator.zig");
 const std = @import("std");
 const zag = @import("zag");
 
-const rbt = zag.containers.RedBlackTree;
+const intrusive_freelist = zag.memory.intrusive_freelist;
+const slab_alloc = zag.memory.slab_allocator;
+const rbt = zag.containers.red_black_tree;
 
-/// Footer for a block; stores a back-pointer to its header for O(1) coalesce.
 pub const AllocFooter = packed struct(u64) {
     header: u64,
 };
 
-/// Header for a block; tracks free/used and the bucketed payload length.
 pub const AllocHeader = packed struct(u64) {
     is_free: bool,
     bucket_size: u63,
 };
 
-/// Per-allocation padding that records the offset back to the header.
 pub const AllocPadding = packed struct(u64) {
     header_offset: u64,
 };
 
-/// Main heap allocator; manages reserve/commit bounds and the size-tree.
 pub const HeapAllocator = struct {
     reserve_start: u64,
     commit_end: u64,
     reserve_end: u64,
     free_tree: RedBlackTree,
 
-    /// Summary:
-    /// Initializes a heap over `[reserve_start, reserve_end)` with an empty tree.
-    ///
-    /// Arguments:
-    /// - `reserve_start`: start of reserved region (inclusive), `HEADER_ALIGN`-aligned.
-    /// - `reserve_end`: end of reserved region (exclusive).
-    /// - `tree_allocator`: slab-backed node allocator for the RB-tree.
-    ///
-    /// Returns:
-    /// - `HeapAllocator` with `commit_end = reserve_start`.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - None.
     pub fn init(
         reserve_start: u64,
         reserve_end: u64,
@@ -109,38 +39,10 @@ pub const HeapAllocator = struct {
         };
     }
 
-    /// Summary:
-    /// Releases internal RB-tree nodes and freelist metadata.
-    ///
-    /// Arguments:
-    /// - `self`: allocator instance.
-    ///
-    /// Returns:
-    /// - `void`.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - None.
     pub fn deinit(self: *HeapAllocator) void {
         self.free_tree.deinit();
     }
 
-    /// Summary:
-    /// Exposes this heap as a `std.mem.Allocator` with alloc/resize/remap/free.
-    ///
-    /// Arguments:
-    /// - `self`: allocator instance.
-    ///
-    /// Returns:
-    /// - `std.mem.Allocator` whose vtable routes into this heap.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - None.
     pub fn allocator(self: *HeapAllocator) std.mem.Allocator {
         return .{
             .ptr = self,
@@ -153,23 +55,6 @@ pub const HeapAllocator = struct {
         };
     }
 
-    /// Summary:
-    /// `std.mem.Allocator.alloc` — best-fit lower-bound allocation with split or bump.
-    ///
-    /// Arguments:
-    /// - `ptr`: opaque pointer to `HeapAllocator` (from vtable).
-    /// - `len`: requested size in bytes.
-    /// - `alignment`: required alignment for the user pointer.
-    /// - `ret_addr`: caller return address (unused; reserved for diagnostics).
-    ///
-    /// Returns:
-    /// - `?[*]u8` user pointer on success, or `null` on OOM/overflow of reserve.
-    ///
-    /// Errors:
-    /// - None (uses nullable return for OOM).
-    ///
-    /// Panics:
-    /// - Panics only on internal debug guards when `DBG` is true.
     fn alloc(
         ptr: *anyopaque,
         len: usize,
@@ -304,21 +189,6 @@ pub const HeapAllocator = struct {
         return @ptrFromInt(user_block_base);
     }
 
-    /// Summary:
-    /// Finds the smallest RB-tree node whose key ≥ `key.bucket_size`.
-    ///
-    /// Arguments:
-    /// - `maybe_root`: root of the RB-tree or `null`.
-    /// - `key`: search key with desired `bucket_size`.
-    ///
-    /// Returns:
-    /// - `?*RedBlackTree.Node` best-fit node or `null` if none.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - Panics only on internal debug guards when `DBG` is true.
     fn findBestFitLowerBound(
         maybe_root: ?*RedBlackTree.Node,
         key: TreeEntry,
@@ -345,22 +215,6 @@ pub const HeapAllocator = struct {
         return best_fit_lower_bound;
     }
 
-    /// Summary:
-    /// Computes placement metadata for allocating within a candidate free block.
-    ///
-    /// Arguments:
-    /// - `freelist_entry_base`: address of the freelist entry in the block.
-    /// - `user_size`: requested payload size (≥ `MIN_USER_SIZE`).
-    /// - `user_align`: required user alignment (≥ `MIN_USER_ALIGN`).
-    ///
-    /// Returns:
-    /// - Struct `{ block_base, user_block_base, block_end, bucket_size }` (all `u64`).
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - None.
     fn getBlockMetadata(
         freelist_entry_base: u64,
         user_size: u64,
@@ -398,22 +252,6 @@ pub const HeapAllocator = struct {
         };
     }
 
-    /// Summary:
-    /// Computes the tail block metadata when a larger block is split.
-    ///
-    /// Arguments:
-    /// - `block_base`: header address of the original block.
-    /// - `bucket_size`: size consumed by the front part (aligned).
-    /// - `split_size`: remaining size (≥ `MIN_BLOCK_SIZE`).
-    ///
-    /// Returns:
-    /// - Struct `{ split_block_base, split_entry_base, split_footer_base, split_bucket_size }`.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - None.
     fn getSplitBlockMetadata(
         block_base: u64,
         bucket_size: u64,
@@ -463,20 +301,6 @@ pub const HeapAllocator = struct {
         };
     }
 
-    /// Summary:
-    /// Returns the in-order successor of an RB-tree node.
-    ///
-    /// Arguments:
-    /// - `tree_entry`: current node.
-    ///
-    /// Returns:
-    /// - `?*RedBlackTree.Node` next node or `null`.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - Panics only on internal debug guards when `DBG` is true.
     fn findInOrderSuccessor(tree_entry: *RedBlackTree.Node) ?*RedBlackTree.Node {
         const upper_bound_iterations = 10_000;
         var num_iterations: u64 = 0;
@@ -510,24 +334,6 @@ pub const HeapAllocator = struct {
         }
     }
 
-    /// Summary:
-    /// `std.mem.Allocator.resize` — unsupported entry; traps.
-    ///
-    /// Arguments:
-    /// - `ptr`: opaque pointer (unused).
-    /// - `memory`: the buffer being resized (unused).
-    /// - `alignment`: alignment (unused).
-    /// - `new_len`: new length (unused).
-    /// - `ret_addr`: caller return address (unused).
-    ///
-    /// Returns:
-    /// - `bool` (never returns; function traps).
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - Always traps via `unreachable`.
     fn resize(
         ptr: *anyopaque,
         memory: []u8,
@@ -540,27 +346,9 @@ pub const HeapAllocator = struct {
         _ = alignment;
         _ = new_len;
         _ = ret_addr;
-        unreachable;
+        return false;
     }
 
-    /// Summary:
-    /// `std.mem.Allocator.remap` — unsupported entry; traps.
-    ///
-    /// Arguments:
-    /// - `ptr`: opaque pointer (unused).
-    /// - `memory`: the buffer being remapped (unused).
-    /// - `alignment`: alignment (unused).
-    /// - `new_len`: new length (unused).
-    /// - `ret_addr`: caller return address (unused).
-    ///
-    /// Returns:
-    /// - `?[*]u8` (never returns; function traps).
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - Always traps via `unreachable`.
     fn remap(
         ptr: *anyopaque,
         memory: []u8,
@@ -573,26 +361,9 @@ pub const HeapAllocator = struct {
         _ = alignment;
         _ = new_len;
         _ = ret_addr;
-        unreachable;
+        return null;
     }
 
-    /// Summary:
-    /// Frees a user buffer and attempts bidirectional coalescing; reinserts result.
-    ///
-    /// Arguments:
-    /// - `ptr`: opaque pointer to `HeapAllocator` (from vtable).
-    /// - `buf`: user buffer previously returned by this allocator.
-    /// - `alignment`: alignment (unused here).
-    /// - `ret_addr`: caller return address (unused).
-    ///
-    /// Returns:
-    /// - `void`.
-    ///
-    /// Errors:
-    /// - None (assumes the pointer came from this allocator).
-    ///
-    /// Panics:
-    /// - Panics only on internal debug guards when `DBG` is true.
     fn free(
         ptr: *anyopaque,
         buf: []u8,
@@ -710,21 +481,6 @@ pub const HeapAllocator = struct {
         self.treeInsert(header.bucket_size, freelist_entry);
     }
 
-    /// Summary:
-    /// Inserts a free block into the size-keyed RB-tree (create/append bucket).
-    ///
-    /// Arguments:
-    /// - `bucket_size`: size class key for the block.
-    /// - `freelist_entry`: address of the block’s embedded freelist node.
-    ///
-    /// Returns:
-    /// - `void`.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - Panics only on internal debug guards when `DBG` is true.
     fn treeInsert(
         self: *HeapAllocator,
         bucket_size: u64,
@@ -763,20 +519,6 @@ pub const HeapAllocator = struct {
         new_node.data.freelist.push(freelist_entry);
     }
 
-    /// Summary:
-    /// Validates RB-tree invariants and linear block map coherence.
-    ///
-    /// Arguments:
-    /// - `tmp_alloc`: temporary allocator used for working maps.
-    ///
-    /// Returns:
-    /// - `bool` — `true` if all checks pass; prints diagnostics and returns `false` otherwise.
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - None (uses `std.debug.print` and boolean status, not panics).
     pub fn validateState(self: *HeapAllocator, tmp_alloc: std.mem.Allocator) bool {
         const tree_result = RedBlackTree.validateRedBlackTree(
             self.free_tree.root,
@@ -1125,37 +867,19 @@ pub const HeapAllocator = struct {
     }
 };
 
-/// Size-bucket RB-tree payload: `bucket_size` key and freelist for that size.
 pub const TreeEntry = struct {
     bucket_size: usize,
     freelist: Freelist,
 
-    /// Summary:
-    /// Compares two `TreeEntry` keys by `bucket_size` for strict total order.
-    ///
-    /// Arguments:
-    /// - `first`: left key.
-    /// - `second`: right key.
-    ///
-    /// Returns:
-    /// - `std.math.Order` (`.lt`, `.eq`, or `.gt`).
-    ///
-    /// Errors:
-    /// - None.
-    ///
-    /// Panics:
-    /// - None.
     pub fn cmpFn(first: TreeEntry, second: TreeEntry) std.math.Order {
         return std.math.order(first.bucket_size, second.bucket_size);
     }
 };
 
-/// Embedded freelist node payload stored inside a free block.
 const FreelistEntry = struct {
     bytes: [FREELIST_ENTRY_SIZE]u8 align(FREELIST_ENTRY_ALIGN),
 };
 
-/// Intrusive freelist for blocks in a single size bucket.
 const using_popSpecific = true;
 const link_to_list = true;
 pub const Freelist = intrusive_freelist.IntrusiveFreeList(
@@ -1164,7 +888,6 @@ pub const Freelist = intrusive_freelist.IntrusiveFreeList(
     link_to_list,
 );
 
-/// Red–black tree keyed by `TreeEntry.bucket_size` with bucket coalescing.
 const duplicate_is_error = false;
 pub const RedBlackTree = rbt.RedBlackTree(
     TreeEntry,
@@ -1172,7 +895,6 @@ pub const RedBlackTree = rbt.RedBlackTree(
     duplicate_is_error,
 );
 
-/// Slab allocator type that supplies storage for RB-tree nodes.
 const stack_bootstrap = false;
 const stack_size = 0;
 const allocation_chunk_size = 64;
@@ -1183,34 +905,26 @@ pub const TreeAllocator = slab_alloc.SlabAllocator(
     allocation_chunk_size,
 );
 
-/// Debug flag that enables extra iteration guardrails in Debug mode.
 const DBG = builtin.mode == .Debug;
 
-/// Size of the block header and its alignment requirement.
 const HEADER_SIZE = @sizeOf(AllocHeader);
 const HEADER_ALIGN = @alignOf(AllocHeader);
 
-/// Size of the per-allocation padding and its alignment requirement.
 const PADDING_SIZE = @sizeOf(AllocPadding);
 const PADDING_ALIGN = @alignOf(AllocPadding);
 
-/// Bytes before the user region (`header + padding`) and its alignment.
 const PREFIX_SIZE = HEADER_SIZE + PADDING_SIZE;
 const PREFIX_ALIGN = HEADER_ALIGN;
 
-/// Size of the block footer and its alignment requirement.
 const FOOTER_SIZE = @sizeOf(AllocFooter);
 const FOOTER_ALIGN = @alignOf(AllocFooter);
 
-/// Alignment and size of the embedded freelist node in free blocks.
 const FREELIST_ENTRY_ALIGN = @alignOf(u64);
 const FREELIST_ENTRY_SIZE = @sizeOf(usize) * 4;
 
-/// Minimum user payload size and alignment guaranteed by the allocator.
 const MIN_USER_SIZE = FREELIST_ENTRY_SIZE;
 const MIN_USER_ALIGN = FREELIST_ENTRY_ALIGN;
 
-/// Smallest legal block (`header + padding + min user + footer`).
 const MIN_BLOCK_SIZE = PREFIX_SIZE + MIN_USER_SIZE + FOOTER_SIZE;
 
 test "tree contains after free, then removed after re-alloc (exact fit)" {
