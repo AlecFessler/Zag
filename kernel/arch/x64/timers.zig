@@ -8,6 +8,9 @@ const timer_mod = zag.arch.timer;
 const Timer = zag.arch.timer.Timer;
 const VAddr = zag.memory.address.VAddr;
 
+var tsc_timer_instance: Tsc = undefined;
+var lapic_timer_instance: Lapic = undefined;
+
 pub const Hpet = struct {
     pub const GenCapsAndId = packed struct(u64) {
         revision_id: u8,
@@ -332,11 +335,11 @@ pub const Tsc = struct {
 
 pub fn getInterruptTimer() Timer {
     if (apic.programLocalApicTimerTscDeadline(@intFromEnum(interrupts.IntVecs.sched))) {
-        var tsc_timer = Tsc.init(&hpet_timer);
-        return tsc_timer.timer();
+        tsc_timer_instance = Tsc.init(&hpet_timer);
+        return tsc_timer_instance.timer();
     } else {
-        var lapic_timer = Lapic.init(&hpet_timer, @intFromEnum(interrupts.IntVecs.sched));
-        return lapic_timer.timer();
+        lapic_timer_instance = Lapic.init(&hpet_timer, @intFromEnum(interrupts.IntVecs.sched));
+        return lapic_timer_instance.timer();
     }
 }
 

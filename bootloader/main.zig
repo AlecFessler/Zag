@@ -20,18 +20,6 @@ const VAddr = zag.memory.address.VAddr;
 
 const KEntryType = fn (*BootInfo) callconv(.{ .x86_64_sysv = .{} }) noreturn;
 
-fn print(
-    comptime fmt: []const u8,
-    args: anytype,
-) void {
-    var buf: [256]u8 = undefined;
-    const str = std.fmt.bufPrint(&buf, fmt ++ "\r\n", args) catch unreachable;
-
-    for (str) |char| {
-        _ = uefi.system_table.con_out.?.outputString(&[_:0]u16{char}) catch unreachable;
-    }
-}
-
 pub fn main() uefi.Status {
     const boot_services: *uefi.tables.BootServices = uefi.system_table.boot_services orelse return .aborted;
     uefi.system_table.con_out.?.clearScreen() catch return .aborted;

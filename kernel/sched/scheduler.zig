@@ -18,6 +18,10 @@ const ThreadAllocator = zag.sched.thread.ThreadAllocator;
 const VAddr = zag.memory.address.VAddr;
 const VirtualMemoryManager = zag.memory.vmm.VirtualMemoryManager;
 
+var slab_backing_allocator_instance: BumpAllocator = undefined;
+var proc_alloc_instance: ProcessAllocator = undefined;
+var thread_alloc_instance: ThreadAllocator = undefined;
+
 const RunQueue = struct {
     sentinel: Thread,
     head: *Thread,
@@ -92,17 +96,17 @@ pub fn init() !void {
 
     const slab_vaddr_space_start = try process_mod.global_kproc.vmm.reserve(paging.PAGE1G, paging.pageAlign(.page4k));
     const slab_vaddr_space_end = VAddr.fromInt(slab_vaddr_space_start.addr + paging.PAGE1G);
-    var slab_backing_allocator = BumpAllocator.init(
+    slab_backing_allocator_instance = BumpAllocator.init(
         slab_vaddr_space_start.addr,
         slab_vaddr_space_end.addr,
     );
-    const slab_alloc_iface = slab_backing_allocator.allocator();
 
-    var proc_alloc = try ProcessAllocator.init(slab_alloc_iface);
-    process_mod.allocator = proc_alloc.allocator();
+    const slab_alloc_iface = slab_backing_allocator_instance.allocator();
+    proc_alloc_instance = try ProcessAllocator.init(slab_alloc_iface);
+    process_mod.allocator = proc_alloc_instance.allocator();
 
-    var thread_alloc = try ThreadAllocator.init(slab_alloc_iface);
-    thread_mod.allocator = thread_alloc.allocator();
+    thread_alloc_instance = try ThreadAllocator.init(slab_alloc_iface);
+    thread_mod.allocator = thread_alloc_instance.allocator();
 
     rq.init();
     global_running_thread = &rq.sentinel;
