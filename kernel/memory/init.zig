@@ -30,16 +30,6 @@ pub fn init(firmware_mmap: MMap) !void {
     var mmap_entries: [boot.protocol.MAX_MMAP_ENTRIES]MMapEntry = undefined;
     const mmap = boot.protocol.collapseMMap(&firmware_mmap, &mmap_entries);
 
-    for (mmap) |entry| {
-        const end = entry.start_paddr + entry.num_pages * paging.PAGE4K;
-        const t: u8 = switch (entry.type) {
-            .free => 'F',
-            .acpi => 'A',
-            .reserved => 'R',
-        };
-        arch.print("mmap: {x}-{x} {c}\n", .{ entry.start_paddr, end, t });
-    }
-
     var smallest_addr_region: MMapEntry = .{ .start_paddr = std.math.maxInt(u64), .num_pages = 0, .type = .free };
     var largest_addr_free_region: MMapEntry = .{ .start_paddr = 0, .num_pages = 0, .type = .free };
     var largest_free_region: MMapEntry = .{ .start_paddr = 0, .num_pages = 0, .type = .free };
@@ -138,9 +128,6 @@ pub fn init(firmware_mmap: MMap) !void {
     );
     const buddy_alloc_iface = buddy_allocator.allocator();
 
-    const pmm_virt = @intFromPtr(&pmm.global_pmm);
-    arch.print("global_pmm virt: {x}\n", .{pmm_virt});
-
     for (mmap) |entry| {
         if (entry.type != .free) continue;
 
@@ -170,26 +157,10 @@ pub fn init(firmware_mmap: MMap) !void {
             useable_range = entry_range.removeOverlap(null_page_range);
         }
 
-        arch.print("addRegion: phys {x}-{x} virt {x}-{x}\n", .{
-            entry.start_paddr,
-            entry.start_paddr + entry.num_pages * paging.PAGE4K,
-            useable_range.start,
-            useable_range.end,
-        });
-
         buddy_allocator.addRegion(useable_range.start, useable_range.end);
     }
 
-    const suspect_virt: *volatile u64 = @ptrFromInt(0xffffff801fe70000);
-    arch.print("before pmm init: suspect page[0] = {x}\n", .{suspect_virt.*});
-
     pmm.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
-
-    arch.print("after pmm init: suspect page[0] = {x}\n", .{suspect_virt.*});
-    arch.print("global_pmm value at {x} = {x}\n", .{
-        @intFromPtr(&pmm.global_pmm),
-        @as(*const u64, @ptrCast(&pmm.global_pmm)).*,
-    });
 
     process.global_kproc.addr_space_root = VAddr.fromPAddr(addr_space_root_phys, null);
     process.global_kproc.vmm = VirtualMemoryManager.init(

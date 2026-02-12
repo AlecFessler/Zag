@@ -147,17 +147,6 @@ pub const BuddyAllocator = struct {
         const buddy_out_of_bounds = buddy < self.start_addr or buddy >= self.end_addr;
 
         if (buddy_out_of_bounds) {
-            const higher = order + 1;
-            const next_rel = rel & ~ORDERS[higher];
-            const next_size_addr = self.start_addr + next_rel;
-            const next_size_end = next_size_addr + ORDERS[higher];
-            const next_size_within_bounds = next_size_addr >= self.start_addr and next_size_end <= self.end_addr;
-
-            if (next_size_within_bounds) {
-                self.setOrder(next_size_addr, higher);
-                return self.recursiveMerge(next_size_addr);
-            }
-
             return .{ .addr = addr, .order = order };
         }
 

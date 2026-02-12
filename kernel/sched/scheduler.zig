@@ -77,7 +77,6 @@ pub const SchedInterruptContext = struct {
 };
 
 pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
-    arch.print("Sched!\n", .{});
     const preempted = global_running_thread.?;
     preempted.ctx = ctx.thread_ctx;
     if (preempted != &rq.sentinel) {

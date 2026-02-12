@@ -39,6 +39,7 @@ pub fn pageFaultHandler(ctx: PageFaultContext) void {
         ctx.faulting_virt.addr,
         @intFromEnum(paging.PageSize.page4k),
     ));
+
     if (ctx.privilege == .kernel) {
         if (ctx.present) {
             if (ctx.fetch) {
@@ -51,32 +52,20 @@ pub fn pageFaultHandler(ctx: PageFaultContext) void {
         @panic("User page fault: invalid access (process killing not implemented yet)");
     }
 
-    const suspect: *volatile u64 = @ptrFromInt(0xffffff801fe70000);
-    const before = suspect.*;
-
     const phys_page = pmm_iface.create(paging.PageMem(.page4k)) catch @panic("PMM OOM!");
     const phys_page_virt = VAddr.fromInt(@intFromPtr(phys_page));
     const phys_page_phys = PAddr.fromVAddr(phys_page_virt, null);
 
-    if (phys_page_phys.addr == 0x1fe70000) {
-        arch.print("!!! suspect page allocated as data page for faulting={x}\n", .{ctx.faulting_virt.addr});
-    }
-
-    const after_alloc = suspect.*;
-    if (after_alloc != before) {
-        arch.print("!!! suspect corrupted during alloc: was={x} now={x} faulting={x}\n", .{
-            before, after_alloc, ctx.faulting_virt.addr,
-        });
-    }
-
     const addr_space_root_phys = arch.getAddrSpaceRoot();
     const addr_space_root_virt = VAddr.fromPAddr(addr_space_root_phys, null);
+
     const in_kspace = process.global_kproc.vmm.isValidVAddr(ctx.faulting_virt);
     const in_uspace = blk: {
         if (sched.global_running_thread) |rt| {
             break :blk rt.proc.vmm.isValidVAddr(ctx.faulting_virt);
         } else break :blk false;
     };
+
     const page_perms: MemoryPerms = blk: {
         if (in_kspace) {
             break :blk .{
@@ -107,11 +96,4 @@ pub fn pageFaultHandler(ctx: PageFaultContext) void {
         page_perms,
         pmm_iface,
     ) catch @panic("Failed to map page in page fault handler");
-
-    const after_map = suspect.*;
-    if (after_map != after_alloc) {
-        arch.print("!!! suspect corrupted during mapPage: was={x} now={x} faulting={x} mapped_phys={x}\n", .{
-            after_alloc, after_map, ctx.faulting_virt.addr, phys_page_phys.addr,
-        });
-    }
 }
