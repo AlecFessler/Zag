@@ -208,7 +208,7 @@ pub const Lapic = struct {
                     0xFFFF_FFFF,
                 );
             } else {
-                apic.init_count.* = .{ .val = 0xFFFF_FFFF };
+                apic.writeReg(.init_count_reg, 0xFFFF_FFFF);
             }
 
             const start_ns = hpet_iface.now();
@@ -219,7 +219,7 @@ pub const Lapic = struct {
             const cur: u64 = if (apic.x2Apic)
                 cpu.rdmsr(@intFromEnum(apic.X2ApicMsr.timer_current_count_register))
             else
-                apic.curr_count.val;
+                apic.readReg(.curr_count_reg);
 
             const elapsed: u64 = 0xFFFF_FFFF - cur;
 
@@ -229,7 +229,7 @@ pub const Lapic = struct {
                     0,
                 );
             } else {
-                apic.init_count.* = .{ .val = 0 };
+                apic.writeReg(.init_count_reg, 0);
             }
 
             const delta_ns = now_ns - start_ns;

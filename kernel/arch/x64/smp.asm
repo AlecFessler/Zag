@@ -8,9 +8,6 @@
 trampoline_start:
     cli
     cld
-    mov al, 'T'
-    mov dx, 0x3F8
-    out dx, al
 
     ; set up segments for real mode
     xor ax, ax
@@ -38,9 +35,9 @@ trampoline_start:
     mov es, ax
     mov ss, ax
 
-    ; enable PAE (CR4.PAE, bit 5)
+    ; enable PAE (CR4.PAE bit 5) + OSFXSR (bit 9) + OSXMMEXCPT (bit 10)
     mov eax, cr4
-    or eax, (1 << 5)
+    or eax, (1 << 5) | (1 << 9) | (1 << 10)
     mov cr4, eax
 
     ; load page table root from parameter block

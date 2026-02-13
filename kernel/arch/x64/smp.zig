@@ -61,27 +61,21 @@ pub fn smpInit() !void {
 
     const STACK_SIZE = paging.PAGE4K * 4;
 
-    for (apic.lapics, 0..) |la, i| {
+    for (apic.lapics) |la| {
         if (la.apic_id == bsp_id) continue;
-        arch.print("smp: booting AP {} (apic_id={})\n", .{ i, la.apic_id });
 
         const stack = try pmm_alloc.alignedAlloc(u8, paging.pageAlign(.page4k), STACK_SIZE);
         params.stack_top = @intFromPtr(stack.ptr) + STACK_SIZE - 8;
 
-        arch.print("smp: stack_top=0x{x}\n", .{params.stack_top});
-
         const expected = cores_online.load(.acquire);
         apic.sendInitIpi(la.apic_id);
 
-        arch.print("smp: INIT sent\n", .{});
         const start = hpet_iface.now();
         while (hpet_iface.now() - start < 10_000_000) {
             std.atomic.spinLoopHint();
         }
 
         apic.sendSipi(la.apic_id, TRAMPOLINE_VECTOR);
-        arch.print("smp: SIPI sent\n", .{});
-
         const timeout = hpet_iface.now();
         while (cores_online.load(.acquire) == expected) {
             if (hpet_iface.now() - timeout > 100_000_000) {
@@ -90,7 +84,6 @@ pub fn smpInit() !void {
             }
             std.atomic.spinLoopHint();
         }
-        arch.print("smp: AP {} done\n", .{la.apic_id});
     }
     arch.print("SMP: {}/{} cores online\n", .{ cores_online.load(.acquire), apic.coreCount() });
 }
@@ -117,15 +110,10 @@ fn coreInit() callconv(.c) noreturn {
     if (apic.x2Apic) {
         _ = cpu.enableX2Apic(@intFromEnum(interrupts.IntVecs.spurious));
     } else {
-        apic.spurious_int_vec.* = .{
-            .spurious_vector = @intFromEnum(interrupts.IntVecs.spurious),
-            .apic_enable = true,
-            .focus_check_disable = false,
-            .eoi_bcast_supp = false,
-        };
+        apic.enableSpuriousVector(@intFromEnum(interrupts.IntVecs.spurious));
     }
 
-    _ = cores_online.fetchAdd(1, .release);
     arch.print("AP core {} online\n", .{apic.coreID()});
+    _ = cores_online.fetchAdd(1, .release);
     arch.halt();
 }
