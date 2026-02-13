@@ -46,7 +46,7 @@ var idt: [NUM_IDT_ENTRIES]IDTEntry = [_]IDTEntry{.{
     .isr_base_high = 0,
 }} ** NUM_IDT_ENTRIES;
 
-var idt_ptr: IDTPtr = .{
+pub var idt_ptr: IDTPtr = .{
     .limit = TABLE_SIZE,
     .base = 0,
 };

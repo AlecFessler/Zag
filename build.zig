@@ -68,6 +68,10 @@ pub fn build(b: *std.Build) void {
         }),
         .linkage = .static,
     });
+    const nasm_step = b.addSystemCommand(&.{
+        "nasm",                    "-f", "bin",
+        "kernel/arch/x64/smp.asm", "-o", "kernel/arch/x64/trampoline.bin",
+    });
     if (use_llvm) {
         kernel.use_llvm = true;
         kernel.use_lld = true;
@@ -77,6 +81,7 @@ pub fn build(b: *std.Build) void {
     kernel.root_module.red_zone = false;
     kernel.root_module.addImport("zag", zag_mod);
     kernel.setLinkerScript(b.path("kernel/linker.ld"));
+    kernel.step.dependOn(&nasm_step.step);
     b.installArtifact(kernel);
 
     const install_kernel = b.addInstallFile(

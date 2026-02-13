@@ -361,10 +361,15 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
 
             var lapic_base: u64 = @intCast(madt.lapic_addr);
             var madt_iter = madt.iter();
+            var lapics_count: u32 = 0;
             while (madt_iter.next()) |e| {
                 const entry = decodeMadt(e);
                 switch (entry) {
-                    .local_apic => |_| {},
+                    .local_apic => |la| {
+                        if (la.flags & 0x1 == 0) continue;
+                        lapics_array[lapics_count] = la;
+                        lapics_count += 1;
+                    },
                     .ioapic => |_| {},
                     .int_src_override => |_| {},
                     .lapic_nmi => |_| {},
@@ -373,6 +378,8 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
                     },
                 }
             }
+
+            apic.lapics = lapics_array[0..lapics_count];
 
             const lapic_phys = PAddr.fromInt(std.mem.alignBackward(u64, lapic_base, paging.PAGE4K));
             const lapic_virt = VAddr.fromPAddr(lapic_phys, null);
@@ -425,3 +432,6 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
         }
     }
 }
+
+const MAX_CORES = 64;
+var lapics_array: [MAX_CORES]LocalApic = undefined;

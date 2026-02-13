@@ -1,9 +1,11 @@
+const std = @import("std");
 const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
 const interrupts = zag.arch.x64.interrupts;
 const paging = zag.arch.x64.paging;
 
+const LocalApic = zag.arch.x64.acpi.LocalApic;
 const VAddr = zag.memory.address.VAddr;
 
 pub const Register = enum(u32) {
@@ -361,6 +363,8 @@ pub var trigger_mode_6: *const volatile TriggerMode6 = undefined;
 pub var trigger_mode_7: *const volatile TriggerMode7 = undefined;
 pub var x2Apic: bool = false;
 
+pub var lapics: []LocalApic = undefined;
+
 pub fn armTscDeadline(deadline_tsc: u64) void {
     cpu.wrmsr(tsc_deadline_msr, deadline_tsc);
 }
@@ -500,5 +504,62 @@ pub fn armLapicOneShot(ticks: u32, vector: u8) void {
         };
         lvt_timer.* = l;
         init_count.* = .{ .val = ticks };
+    }
+}
+
+pub fn coreCount() u64 {
+    return lapics.len;
+}
+
+pub fn coreID() u64 {
+    if (x2Apic) {
+        return cpu.rdmsr(@intFromEnum(X2ApicMsr.local_apic_id_register));
+    } else {
+        return lapic_id.apic_id;
+    }
+}
+
+pub fn waitForDelivery() void {
+    if (x2Apic) return;
+    while (int_cmd_low.deliv_status) {
+        std.atomic.spinLoopHint();
+    }
+}
+
+pub fn sendInitIpi(apic_id_target: u8) void {
+    if (x2Apic) {
+        const icr: u64 = (@as(u64, apic_id_target) << 32) | (0b101 << 8) | (1 << 14) | (1 << 15);
+        cpu.wrmsr(@intFromEnum(X2ApicMsr.interrupt_command_register), icr);
+    } else {
+        int_cmd_high.* = .{ .destination = apic_id_target };
+        int_cmd_low.* = .{
+            .vector = 0,
+            .deliv_mode = 0b101,
+            .dest_mode_logical = false,
+            .deliv_status = false,
+            .level_assert = true,
+            .trigger_mode_level = true,
+            .dest_shorthand = 0,
+        };
+        waitForDelivery();
+    }
+}
+
+pub fn sendSipi(apic_id_target: u8, vector: u8) void {
+    if (x2Apic) {
+        const icr: u64 = (@as(u64, apic_id_target) << 32) | (0b110 << 8) | vector;
+        cpu.wrmsr(@intFromEnum(X2ApicMsr.interrupt_command_register), icr);
+    } else {
+        int_cmd_high.* = .{ .destination = apic_id_target };
+        int_cmd_low.* = .{
+            .vector = vector,
+            .deliv_mode = 0b110,
+            .dest_mode_logical = false,
+            .deliv_status = false,
+            .level_assert = true,
+            .trigger_mode_level = false,
+            .dest_shorthand = 0,
+        };
+        waitForDelivery();
     }
 }

@@ -9,4 +9,5 @@ pub const interrupts = @import("interrupts.zig");
 pub const irq = @import("irq.zig");
 pub const paging = @import("paging.zig");
 pub const serial = @import("serial.zig");
+pub const smp = @import("smp.zig");
 pub const timers = @import("timers.zig");
