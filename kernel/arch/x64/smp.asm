@@ -53,6 +53,12 @@ trampoline_start:
     or eax, (1 << 8)
     wrmsr
 
+    ; enable long mode AND NXE (EFER.LME bit 8, EFER.NXE bit 11)
+    mov ecx, 0xC0000080
+    rdmsr
+    or eax, (1 << 8) | (1 << 11)
+    wrmsr
+
     ; enable paging (CR0.PG, bit 31)
     mov eax, cr0
     or eax, (1 << 31)

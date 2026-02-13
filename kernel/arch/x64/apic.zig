@@ -1,6 +1,7 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const arch = zag.arch.dispatch;
 const cpu = zag.arch.x64.cpu;
 const interrupts = zag.arch.x64.interrupts;
 const paging = zag.arch.x64.paging;
@@ -531,16 +532,10 @@ pub fn sendInitIpi(apic_id_target: u8) void {
         const icr: u64 = (@as(u64, apic_id_target) << 32) | (0b101 << 8) | (1 << 14) | (1 << 15);
         cpu.wrmsr(@intFromEnum(X2ApicMsr.interrupt_command_register), icr);
     } else {
-        int_cmd_high.* = .{ .destination = apic_id_target };
-        int_cmd_low.* = .{
-            .vector = 0,
-            .deliv_mode = 0b101,
-            .dest_mode_logical = false,
-            .deliv_status = false,
-            .level_assert = true,
-            .trigger_mode_level = true,
-            .dest_shorthand = 0,
-        };
+        const high_ptr: *volatile u32 = @ptrFromInt(@intFromPtr(int_cmd_high));
+        const low_ptr: *volatile u32 = @ptrFromInt(@intFromPtr(int_cmd_low));
+        high_ptr.* = @as(u32, apic_id_target) << 24;
+        low_ptr.* = (0b101 << 8) | (1 << 14) | (1 << 15);
         waitForDelivery();
     }
 }
@@ -550,16 +545,10 @@ pub fn sendSipi(apic_id_target: u8, vector: u8) void {
         const icr: u64 = (@as(u64, apic_id_target) << 32) | (0b110 << 8) | vector;
         cpu.wrmsr(@intFromEnum(X2ApicMsr.interrupt_command_register), icr);
     } else {
-        int_cmd_high.* = .{ .destination = apic_id_target };
-        int_cmd_low.* = .{
-            .vector = vector,
-            .deliv_mode = 0b110,
-            .dest_mode_logical = false,
-            .deliv_status = false,
-            .level_assert = true,
-            .trigger_mode_level = false,
-            .dest_shorthand = 0,
-        };
+        const high_ptr: *volatile u32 = @ptrFromInt(@intFromPtr(int_cmd_high));
+        const low_ptr: *volatile u32 = @ptrFromInt(@intFromPtr(int_cmd_low));
+        high_ptr.* = @as(u32, apic_id_target) << 24;
+        low_ptr.* = (0b110 << 8) | @as(u32, vector);
         waitForDelivery();
     }
 }
