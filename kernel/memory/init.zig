@@ -145,16 +145,19 @@ pub fn init(firmware_mmap: MMap) !void {
             .start = bump_allocator.start_addr,
             .end = bump_allocator.free_addr,
         };
-        const null_page_range: Range = .{
+        const low_memory_range: Range = .{
             .start = VAddr.fromPAddr(PAddr.fromInt(0), null).addr,
-            .end = VAddr.fromPAddr(PAddr.fromInt(paging.PAGE4K), null).addr,
+            .end = VAddr.fromPAddr(PAddr.fromInt(0x100000), null).addr,
         };
 
         var useable_range: Range = entry_range;
         if (entry_range.overlapsWith(bump_alloc_range)) {
             useable_range = entry_range.removeOverlap(bump_alloc_range);
-        } else if (entry_range.overlapsWith(null_page_range)) {
-            useable_range = entry_range.removeOverlap(null_page_range);
+        } else if (entry_range.overlapsWith(low_memory_range)) {
+            if (entry_range.start >= low_memory_range.start and entry_range.end <= low_memory_range.end) {
+                continue;
+            }
+            useable_range = entry_range.removeOverlap(low_memory_range);
         }
 
         buddy_allocator.addRegion(useable_range.start, useable_range.end);

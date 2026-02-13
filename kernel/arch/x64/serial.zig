@@ -45,6 +45,8 @@ pub fn init(port: Ports, baud: u32) void {
     g_port = port;
 }
 
+var print_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
 pub fn print(
     comptime format: []const u8,
     args: anytype,
@@ -56,6 +58,12 @@ pub fn print(
         format,
         args,
     ) catch @panic("Print would be truncated!");
+
+    while (print_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+        std.atomic.spinLoopHint();
+    }
+    defer print_lock.store(0, .release);
+
     for (s) |b| {
         writeByte(b, g_port);
     }

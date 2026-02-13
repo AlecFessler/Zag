@@ -157,7 +157,7 @@ var gdt_entries: [7]GdtEntry = blk: {
     break :blk tmp;
 };
 
-var gdt_ptr: GdtPtr = .{
+pub var gdt_ptr: GdtPtr = .{
     .limit = TABLE_SIZE,
     .base = 0,
 };

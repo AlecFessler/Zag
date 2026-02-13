@@ -68,6 +68,22 @@ pub fn swapAddrSpace(root: PAddr) void {
     }
 }
 
+pub fn coreCount() u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.apic.coreCount(),
+        .aarch64 => aarch64.apic.coreCount(),
+        else => unreachable,
+    };
+}
+
+pub fn coreID() u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.apic.coreID(),
+        .aarch64 => aarch64.apic.coreID(),
+        else => unreachable,
+    };
+}
+
 pub fn copyKernelMappings(root: VAddr) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.paging.copyKernelMappings(root),
@@ -100,6 +116,14 @@ pub fn getInterruptTimer() Timer {
     switch (builtin.cpu.arch) {
         .x86_64 => return x64.timers.getInterruptTimer(),
         .aarch64 => return aarch64.timers.getInterruptTimer(),
+        else => unreachable,
+    }
+}
+
+pub fn smpInit() !void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => try x64.smp.smpInit(),
+        .aarch64 => try aarch64.smp.smpInit(),
         else => unreachable,
     }
 }
