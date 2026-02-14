@@ -22,15 +22,19 @@ var slab_backing_allocator_instance: BumpAllocator = undefined;
 var proc_alloc_instance: ProcessAllocator = undefined;
 var thread_alloc_instance: ThreadAllocator = undefined;
 
+const CACHE_LINE_SIZE = 64;
+const MAX_CORES = 64;
+const SCHED_TIMESLICE_NS = 2_000_000;
+
 const RunQueue = struct {
     sentinel: Thread,
     head: *Thread,
     tail: *Thread,
 
-    pub fn init(init_rq: *RunQueue) void {
-        init_rq.sentinel.next = null;
-        init_rq.head = &init_rq.sentinel;
-        init_rq.tail = &init_rq.sentinel;
+    pub fn init(self: *RunQueue) void {
+        self.sentinel.next = null;
+        self.head = &self.sentinel;
+        self.tail = &self.sentinel;
     }
 
     pub fn enqueue(self: *RunQueue, thread: *Thread) void {
@@ -42,7 +46,6 @@ const RunQueue = struct {
     pub fn enqueueToFront(self: *RunQueue, thread: *Thread) void {
         thread.next = self.head.next;
         self.head.next = thread;
-
         if (self.tail == self.head) {
             self.tail = thread;
         }
@@ -50,66 +53,69 @@ const RunQueue = struct {
 
     pub fn dequeue(self: *RunQueue) ?*Thread {
         const first = self.head.next orelse return null;
-
         if (self.tail == first) {
             self.tail = self.head;
         }
-
         self.head.next = first.next;
         first.next = null;
         return first;
     }
 };
 
-const SCHED_TIMESLICE_NS = 2_000_000;
+const PerCoreState = struct {
+    rq: RunQueue = undefined,
+    running_thread: ?*Thread = null,
+    timer: Timer = undefined,
+    _padding: [CACHE_LINE_SIZE]u8 = undefined,
+};
 
-pub var global_running_thread: ?*Thread = null;
-var rq: RunQueue = undefined;
-var timer: Timer = undefined;
-
-fn armSchedTimer(delta_ns: u64) void {
-    timer.armInterruptTimer(delta_ns);
-}
+var core_states: [MAX_CORES]PerCoreState = [_]PerCoreState{.{}} ** MAX_CORES;
 
 pub const SchedInterruptContext = struct {
     privilege: PrivilegePerm,
     thread_ctx: *ArchCpuContext,
 };
 
-pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
-    const preempted = global_running_thread.?;
-    preempted.ctx = ctx.thread_ctx;
-    if (preempted != &rq.sentinel) {
-        rq.enqueue(preempted);
-    }
-    global_running_thread = rq.dequeue() orelse &rq.sentinel;
-
-    armSchedTimer(SCHED_TIMESLICE_NS);
-    if (global_running_thread.? == preempted) return;
-
-    arch.switchTo(global_running_thread.?);
+fn armSchedTimer(state: *PerCoreState, delta_ns: u64) void {
+    state.timer.armInterruptTimer(delta_ns);
 }
 
-pub fn init() !void {
-    timer = arch.getInterruptTimer();
+pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
+    const state = &core_states[arch.coreID()];
+    const preempted = state.running_thread.?;
+    preempted.ctx = ctx.thread_ctx;
+    if (preempted != &state.rq.sentinel) {
+        state.rq.enqueue(preempted);
+    }
+    state.running_thread = state.rq.dequeue() orelse &state.rq.sentinel;
+    armSchedTimer(state, SCHED_TIMESLICE_NS);
+    if (state.running_thread.? == preempted) return;
+    arch.switchTo(state.running_thread.?);
+}
 
+pub fn enqueueOnCore(core_index: u64, thread: *Thread) void {
+    core_states[core_index].rq.enqueue(thread);
+}
+
+pub fn globalInit() !void {
     const slab_vaddr_space_start = try process_mod.global_kproc.vmm.reserve(paging.PAGE1G, paging.pageAlign(.page4k));
     const slab_vaddr_space_end = VAddr.fromInt(slab_vaddr_space_start.addr + paging.PAGE1G);
     slab_backing_allocator_instance = BumpAllocator.init(
         slab_vaddr_space_start.addr,
         slab_vaddr_space_end.addr,
     );
-
     const slab_alloc_iface = slab_backing_allocator_instance.allocator();
     proc_alloc_instance = try ProcessAllocator.init(slab_alloc_iface);
     process_mod.allocator = proc_alloc_instance.allocator();
-
     thread_alloc_instance = try ThreadAllocator.init(slab_alloc_iface);
     thread_mod.allocator = thread_alloc_instance.allocator();
+}
 
-    rq.init();
-    global_running_thread = &rq.sentinel;
-
+pub fn perCoreInit() void {
+    const state = &core_states[arch.coreID()];
+    state.rq.init();
+    state.running_thread = &state.rq.sentinel;
+    state.timer = arch.getInterruptTimer();
     arch.enableInterrupts();
-    armSchedTimer(SCHED_TIMESLICE_NS);
+    armSchedTimer(state, SCHED_TIMESLICE_NS);
 }
