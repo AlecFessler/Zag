@@ -12,6 +12,7 @@ const PAddr = zag.memory.address.PAddr;
 const PrivilegePerm = zag.perms.privilege.PrivilegePerm;
 const Process = zag.sched.process.Process;
 const ProcessAllocator = zag.sched.process.ProcessAllocator;
+const SpinLock = zag.sched.sync.SpinLock;
 const Timer = zag.arch.timer.Timer;
 const Thread = zag.sched.thread.Thread;
 const ThreadAllocator = zag.sched.thread.ThreadAllocator;
@@ -68,12 +69,12 @@ const RunQueue = struct {
 
 const PerCoreState = struct {
     rq: RunQueue = undefined,
+    rq_lock: SpinLock = .{},
     running_thread: ?*Thread = null,
     timer: Timer = undefined,
-    _padding: [CACHE_LINE_SIZE]u8 = undefined,
 };
 
-var core_states: [MAX_CORES]PerCoreState = [_]PerCoreState{.{}} ** MAX_CORES;
+var core_states: [MAX_CORES]PerCoreState align(CACHE_LINE_SIZE) = [_]PerCoreState{.{}} ** MAX_CORES;
 
 pub const SchedInterruptContext = struct {
     privilege: PrivilegePerm,
@@ -92,17 +93,38 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     const state = &core_states[arch.coreID()];
     const preempted = state.running_thread.?;
     preempted.ctx = ctx.thread_ctx;
-    if (preempted != &state.rq.sentinel) {
+    preempted.on_cpu.store(false, .release);
+
+    state.rq_lock.lock();
+
+    if (preempted != &state.rq.sentinel and preempted.state == .running) {
+        preempted.state = .ready;
         state.rq.enqueue(preempted);
     }
-    state.running_thread = state.rq.dequeue() orelse &state.rq.sentinel;
+
+    const next = state.rq.dequeue() orelse &state.rq.sentinel;
+    if (next != &state.rq.sentinel) {
+        next.state = .running;
+        next.on_cpu.store(true, .release);
+    }
+    state.running_thread = next;
+
+    state.rq_lock.unlock();
+
     armSchedTimer(state, SCHED_TIMESLICE_NS);
-    if (state.running_thread.? == preempted) return;
-    arch.switchTo(state.running_thread.?);
+    if (next == preempted) return;
+    arch.switchTo(next);
+}
+
+pub fn yield() void {
+    arch.triggerSchedulerInterrupt();
 }
 
 pub fn enqueueOnCore(core_index: u64, thread: *Thread) void {
-    core_states[core_index].rq.enqueue(thread);
+    const state = &core_states[core_index];
+    const irq = state.rq_lock.lockIrqSave();
+    state.rq.enqueue(thread);
+    state.rq_lock.unlockIrqRestore(irq);
 }
 
 pub fn globalInit() !void {

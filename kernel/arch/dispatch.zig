@@ -144,6 +144,30 @@ pub fn enableInterrupts() void {
     }
 }
 
+pub fn saveAndDisableInterrupts() u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.saveAndDisableInterrupts(),
+        .aarch64 => aarch64.cpu.saveAndDisableInterrupts(),
+        else => unreachable,
+    };
+}
+
+pub fn restoreInterrupts(state: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.restoreInterrupts(state),
+        .aarch64 => aarch64.cpu.restoreInterrupts(state),
+        else => unreachable,
+    }
+}
+
+pub fn triggerSchedulerInterrupt() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.apic.sendSelfIpi(@intFromEnum(x64.interrupts.IntVecs.sched)),
+        .aarch64 => aarch64.apic.sendSelfIpi(@intFromEnum(aarch64.interrupts.IntVecs.sched)),
+        else => unreachable,
+    }
+}
+
 pub fn print(
     comptime format: []const u8,
     args: anytype,

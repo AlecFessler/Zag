@@ -1,7 +1,7 @@
 const std = @import("std");
 const zag = @import("zag");
-
 const Range = zag.utils.range.Range;
+const SpinLock = zag.sched.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
 
 pub const VmmErrors = error{
@@ -19,9 +19,9 @@ pub const VirtualMemoryManager = struct {
     start_vaddr: VAddr,
     end_vaddr: VAddr,
     free_vaddr: VAddr,
-
     vmm_allocations: [MAX_RESERVATIONS]VmmAllocation = undefined,
     vmm_allocations_idx: u32 = 0,
+    lock: SpinLock = .{},
 
     pub fn init(start_vaddr: VAddr, end_vaddr: VAddr) VirtualMemoryManager {
         std.debug.assert(end_vaddr.addr > start_vaddr.addr);
@@ -32,7 +32,11 @@ pub const VirtualMemoryManager = struct {
         };
     }
 
+    // Called within the page fault handler, so must use irqsave variant of the spinlock
     pub fn isValidVAddr(self: *VirtualMemoryManager, vaddr: VAddr) bool {
+        const irq = self.lock.lockIrqSave();
+        defer self.lock.unlockIrqRestore(irq);
+
         for (self.vmm_allocations[0..self.vmm_allocations_idx]) |alloc| {
             const range = Range{
                 .start = alloc.vaddr.addr,
@@ -43,7 +47,12 @@ pub const VirtualMemoryManager = struct {
         return false;
     }
 
+    /// Not ever called within interrupt/exception handlers, but must use irqsave because the page
+    /// fault handler calls isValidVAddr on the same lock.
     pub fn reserve(self: *VirtualMemoryManager, size: u64, alignment: std.mem.Alignment) !VAddr {
+        const irq = self.lock.lockIrqSave();
+        defer self.lock.unlockIrqRestore(irq);
+
         if (self.vmm_allocations_idx >= MAX_RESERVATIONS) return error.TooManyReservations;
         if (size == 0) return error.InvalidSize;
 
@@ -61,8 +70,8 @@ pub const VirtualMemoryManager = struct {
             .size = size,
         };
         self.vmm_allocations_idx += 1;
-
         self.free_vaddr = next;
+
         return aligned;
     }
 };

@@ -10,6 +10,7 @@ const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PrivilegePerm = zag.perms.privilege.PrivilegePerm;
 const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
+const SpinLock = zag.sched.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 const VirtualMemoryManager = zag.memory.vmm.VirtualMemoryManager;
@@ -30,6 +31,7 @@ pub const Process = struct {
     vmm: VirtualMemoryManager,
     threads: [MAX_THREADS]*Thread,
     num_threads: u64,
+    lock: SpinLock = .{},
 
     pub const MAX_THREADS = 16;
 
@@ -41,17 +43,16 @@ pub const Process = struct {
         const proc = try allocator.create(Process);
         errdefer allocator.destroy(proc);
 
-        proc.pid = pid_counter;
-        pid_counter += 1;
+        proc.pid = @atomicRmw(u64, &pid_counter, .Add, 1, .monotonic);
         proc.privilege = .user;
+        proc.lock = .{};
+        proc.num_threads = 0;
 
         const pmm_iface = pmm.global_pmm.?.allocator();
-
         const new_addr_space_root_page = try pmm_iface.create(paging.PageMem(.page4k));
         errdefer pmm_iface.destroy(new_addr_space_root_page);
         const new_addr_space_root_bytes: [*]u8 = @ptrCast(new_addr_space_root_page);
         @memset(new_addr_space_root_bytes[0..paging.PAGE4K], 0);
-
         proc.addr_space_root = VAddr.fromInt(@intFromPtr(new_addr_space_root_page));
         arch.copyKernelMappings(proc.addr_space_root);
 
@@ -59,7 +60,6 @@ pub const Process = struct {
             VAddr.fromInt(address.AddrSpacePartition.user.start),
             VAddr.fromInt(address.AddrSpacePartition.user.end),
         );
-        proc.num_threads = 0;
 
         const code_phys_page = try pmm_iface.create(paging.PageMem(.page4k));
         errdefer pmm_iface.destroy(code_phys_page);
@@ -68,7 +68,6 @@ pub const Process = struct {
         @memcpy(code_bytes[0..binary.len], binary);
 
         const code_phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(code_phys_page)), null);
-
         try arch.mapPage(
             proc.addr_space_root,
             code_phys,
@@ -80,7 +79,6 @@ pub const Process = struct {
 
         const entry: *const fn () void = @ptrFromInt(USER_CODE_BASE);
         _ = try Thread.createThread(proc, entry, null);
-
         return proc;
     }
 };
@@ -94,6 +92,7 @@ pub var global_kproc: Process = .{
     .vmm = undefined,
     .threads = undefined,
     .num_threads = 0,
+    .lock = .{},
 };
 
 var pid_counter: u64 = 1;

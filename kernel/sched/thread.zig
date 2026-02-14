@@ -20,6 +20,13 @@ pub const ThreadAllocator = SlabAllocator(
     64,
 );
 
+pub const State = enum {
+    running,
+    ready,
+    blocked,
+    exited,
+};
+
 pub const Thread = struct {
     tid: u64,
     ctx: *ArchCpuContext,
@@ -28,6 +35,12 @@ pub const Thread = struct {
     proc: *Process,
     next: ?*Thread = null,
     core_affinity: ?u64 = null,
+    state: State = .ready,
+    // prevents a race in WaitQueue.wait() where the thread marks itself as blocked
+    // then another core calls WaitQueue.wakeOne and sets its to ready and enqueues
+    // it to the run queue but the thread is still executing on the original core because
+    // it hasn't called yield yet.
+    on_cpu: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn createThread(
         proc: *Process,
@@ -39,12 +52,10 @@ pub const Thread = struct {
         const thread: *Thread = try allocator.create(Thread);
         errdefer allocator.destroy(thread);
 
-        thread.tid = tid_counter;
-        tid_counter += 1;
+        thread.tid = @atomicRmw(u64, &tid_counter, .Add, 1, .monotonic);
         thread.core_affinity = affinity;
 
         const pmm_iface = pmm.global_pmm.?.allocator();
-
         const kstack_page = try pmm_iface.create(paging.PageMem(.page4k));
         errdefer pmm_iface.destroy(kstack_page);
         const kstack_virt = VAddr.fromInt(@intFromPtr(kstack_page));
@@ -53,8 +64,8 @@ pub const Thread = struct {
 
         if (proc.privilege == .user) {
             const ustack_virt = try proc.vmm.reserve(paging.PAGE4K, paging.pageAlign(.page4k));
-
             const ustack_phys_page = try pmm_iface.create(paging.PageMem(.page4k));
+
             errdefer pmm_iface.destroy(ustack_phys_page);
             const ustack_phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(ustack_phys_page)), null);
 
@@ -75,12 +86,19 @@ pub const Thread = struct {
 
         thread.ctx = arch.prepareInterruptFrame(thread.kstack_base, thread.ustack_base, entry);
         thread.proc = proc;
+
+        proc.lock.lock();
+        defer proc.lock.unlock();
+
+        if (proc.num_threads >= Process.MAX_THREADS) return error.MaxThreads;
         proc.threads[proc.num_threads] = thread;
         proc.num_threads += 1;
 
+        thread.state = .ready;
         return thread;
     }
 };
 
 pub var allocator: std.mem.Allocator = undefined;
+
 var tid_counter: u64 = 0;

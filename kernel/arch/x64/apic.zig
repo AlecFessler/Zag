@@ -166,7 +166,7 @@ pub const tsc_deadline_msr: u32 = 0x6e0;
 
 var lapic_base: u64 = 0;
 pub var x2Apic: bool = false;
-pub var lapics: []LocalApic = undefined;
+pub var lapics: ?[]LocalApic = null;
 
 // ── Raw MMIO helpers (always 32-bit aligned access) ─────────────
 
@@ -271,7 +271,7 @@ pub fn armLapicOneShot(ticks: u32, vector: u8) void {
 }
 
 pub fn coreCount() u64 {
-    return lapics.len;
+    return lapics.?.len;
 }
 
 pub fn rawApicId() u32 {
@@ -284,7 +284,7 @@ pub fn rawApicId() u32 {
 
 pub fn coreID() u64 {
     const raw = rawApicId();
-    for (lapics, 0..) |la, i| {
+    for (lapics.?, 0..) |la, i| {
         if (la.apic_id == raw) return i;
     }
     unreachable;
@@ -316,6 +316,15 @@ pub fn sendSipi(apic_id_target: u8, vector: u8) void {
         writeReg(.int_cmd_high_reg, @as(u32, apic_id_target) << 24);
         writeReg(.int_cmd_low_reg, (0b110 << 8) | @as(u32, vector));
         waitForDelivery();
+    }
+}
+
+pub fn sendSelfIpi(vector: u8) void {
+    if (x2Apic) {
+        cpu.wrmsr(@intFromEnum(X2ApicMsr.self_interrupt_register), vector);
+    } else {
+        writeReg(.int_cmd_high_reg, 0);
+        writeReg(.int_cmd_low_reg, @as(u32, vector) | (1 << 18));
     }
 }
 
