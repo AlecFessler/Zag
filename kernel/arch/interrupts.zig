@@ -61,8 +61,8 @@ pub fn pageFaultHandler(ctx: PageFaultContext) void {
 
     const in_kspace = process.global_kproc.vmm.isValidVAddr(ctx.faulting_virt);
     const in_uspace = blk: {
-        if (sched.global_running_thread) |rt| {
-            break :blk rt.proc.vmm.isValidVAddr(ctx.faulting_virt);
+        if (sched.currentThread()) |thread| {
+            break :blk thread.proc.vmm.isValidVAddr(ctx.faulting_virt);
         } else break :blk false;
     };
 
