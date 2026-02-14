@@ -3,6 +3,7 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const paging = zag.memory.paging;
+const sched = zag.sched.scheduler;
 
 const BuddyAllocator = zag.memory.buddy_allocator.BuddyAllocator;
 const SpinLock = zag.sched.sync.SpinLock;
@@ -115,7 +116,9 @@ pub const PhysicalMemoryManager = struct {
     ) void {
         const self: *PhysicalMemoryManager = @alignCast(@ptrCast(ptr));
 
-        if (buf.len == paging.PAGE4K) {
+        // only touch per core cache if the scheduler has been fully initialized (ie, system is fully booted)
+        // otherwise arch.coreID() will access an array that is undefined
+        if (buf.len == paging.PAGE4K and sched.initialized) {
             const irq = arch.saveAndDisableInterrupts();
             const cache = &page_caches[arch.coreID()];
 
