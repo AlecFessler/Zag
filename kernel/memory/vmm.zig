@@ -35,7 +35,7 @@ pub const VirtualMemoryManager = struct {
         };
     }
 
-    // Called within the page fault handler, so must use irqsave variant of the spinlock.
+    // Called within the page fault handler, so must use irqsave variant of the spinlock
     pub fn findReservation(self: *VirtualMemoryManager, vaddr: VAddr) ?*VmReservation {
         const irq = self.lock.lockIrqSave();
         defer self.lock.unlockIrqRestore(irq);
@@ -49,10 +49,9 @@ pub const VirtualMemoryManager = struct {
         return null;
     }
 
-    // Used to allocate a demand paged region of address space.
-    // Not ever called within interrupt/exception handlers, but must use irqsave because the page
-    // fault handler calls findReservation on the same lock.
-    pub fn reserve(self: *VirtualMemoryManager, size: u64, alignment: std.mem.Alignment) !VAddr {
+    /// Not ever called within interrupt/exception handlers, but must use irqsave because the page
+    /// fault handler calls findReservation on the same lock.
+    pub fn reserve(self: *VirtualMemoryManager, size: u64, alignment: std.mem.Alignment, rights: VmReservationRights) !VAddr {
         const irq = self.lock.lockIrqSave();
         defer self.lock.unlockIrqRestore(irq);
         if (self.vmm_reservations_idx >= MAX_RESERVATIONS) return error.TooManyReservations;
@@ -60,13 +59,12 @@ pub const VirtualMemoryManager = struct {
         self.vmm_reservations[self.vmm_reservations_idx] = .{
             .vaddr = aligned,
             .size = size,
+            .rights = rights,
         };
         self.vmm_reservations_idx += 1;
         return aligned;
     }
 
-    // Used by shared memory reservations to claim the address range, but does not store an entry in the
-    // vmm reservations because the page fault handler will never see shared memory since its eagerly paged.
     pub fn reserveRange(self: *VirtualMemoryManager, size: u64, alignment: std.mem.Alignment) !VAddr {
         const irq = self.lock.lockIrqSave();
         defer self.lock.unlockIrqRestore(irq);
