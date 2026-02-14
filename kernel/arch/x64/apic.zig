@@ -319,6 +319,15 @@ pub fn sendSipi(apic_id_target: u8, vector: u8) void {
     }
 }
 
+pub fn sendSelfIpi(vector: u8) void {
+    if (x2Apic) {
+        cpu.wrmsr(@intFromEnum(X2ApicMsr.self_interrupt_register), vector);
+    } else {
+        writeReg(.int_cmd_high_reg, 0);
+        writeReg(.int_cmd_low_reg, @as(u32, vector) | (1 << 18));
+    }
+}
+
 pub fn enableSpuriousVector(vector: u8) void {
     if (x2Apic) {
         _ = cpu.enableX2Apic(vector);

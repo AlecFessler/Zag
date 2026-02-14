@@ -160,6 +160,14 @@ pub fn restoreInterrupts(state: u64) void {
     }
 }
 
+pub fn triggerSchedulerInterrupt() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.apic.sendSelfIpi(@intFromEnum(x64.interrupts.IntVecs.sched)),
+        .aarch64 => aarch64.apic.sendSelfIpi(@intFromEnum(aarch64.interrupts.IntVecs.sched)),
+        else => unreachable,
+    }
+}
+
 pub fn print(
     comptime format: []const u8,
     args: anytype,
