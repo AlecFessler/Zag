@@ -15,7 +15,7 @@ const timers = zag.arch.x64.timers;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
 
-const trampoline_code = @embedFile("trampoline.bin");
+const trampoline_code = @import("embedded_bins").trampoline;
 
 const TrampolineParams = extern struct {
     cr3: u64,
