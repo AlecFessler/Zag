@@ -97,6 +97,30 @@ pub fn enqueueOnCore(core_index: u64, thread: *Thread) void {
     core_states[core_index].rq.enqueue(thread);
 }
 
+fn testThreadA() void {
+    while (true) {
+        arch.print("A core {}\n", .{arch.coreID()});
+    }
+}
+
+fn testThreadB() void {
+    while (true) {
+        arch.print("B core {}\n", .{arch.coreID()});
+    }
+}
+
+fn testThreadC() void {
+    while (true) {
+        arch.print("C core {}\n", .{arch.coreID()});
+    }
+}
+
+fn testThreadD() void {
+    while (true) {
+        arch.print("D core {}\n", .{arch.coreID()});
+    }
+}
+
 pub fn globalInit() !void {
     const slab_vaddr_space_start = try process_mod.global_kproc.vmm.reserve(paging.PAGE1G, paging.pageAlign(.page4k));
     const slab_vaddr_space_end = VAddr.fromInt(slab_vaddr_space_start.addr + paging.PAGE1G);
@@ -104,16 +128,33 @@ pub fn globalInit() !void {
         slab_vaddr_space_start.addr,
         slab_vaddr_space_end.addr,
     );
+
     const slab_alloc_iface = slab_backing_allocator_instance.allocator();
+
     proc_alloc_instance = try ProcessAllocator.init(slab_alloc_iface);
     process_mod.allocator = proc_alloc_instance.allocator();
+
     thread_alloc_instance = try ThreadAllocator.init(slab_alloc_iface);
     thread_mod.allocator = thread_alloc_instance.allocator();
+
+    const proc = &process_mod.global_kproc;
+    const a = try Thread.createThread(proc, &testThreadA, 0);
+    const b = try Thread.createThread(proc, &testThreadB, 0);
+    const c = try Thread.createThread(proc, &testThreadC, 1);
+    const d = try Thread.createThread(proc, &testThreadD, 1);
+
+    for (&core_states) |*state| {
+        state.rq.init();
+    }
+
+    core_states[0].rq.enqueue(a);
+    core_states[0].rq.enqueue(b);
+    core_states[1].rq.enqueue(c);
+    core_states[1].rq.enqueue(d);
 }
 
 pub fn perCoreInit() void {
     const state = &core_states[arch.coreID()];
-    state.rq.init();
     state.running_thread = &state.rq.sentinel;
     state.timer = arch.getInterruptTimer();
     arch.enableInterrupts();
