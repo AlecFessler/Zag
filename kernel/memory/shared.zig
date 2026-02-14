@@ -5,7 +5,6 @@ const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 
 const PAddr = zag.memory.address.PAddr;
-const SharedMemoryRights = zag.perms.permissions.SharedMemoryRights;
 const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
 const SpinLock = zag.sched.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
@@ -15,12 +14,11 @@ pub const SharedMemoryAllocator = SlabAllocator(SharedMemory, false, 0, 64);
 pub const SharedMemory = struct {
     pages: [MAX_PAGES]PAddr,
     num_pages: u32,
-    max_rights: SharedMemoryRights,
     refcount: std.atomic.Value(u32),
 
     pub const MAX_PAGES = 256;
 
-    pub fn create(num_bytes: u64, max_rights: SharedMemoryRights) !*SharedMemory {
+    pub fn create(num_bytes: u64) !*SharedMemory {
         if (num_bytes == 0) return error.InvalidSize;
 
         const num_pages: u32 = @intCast(
@@ -43,7 +41,6 @@ pub const SharedMemory = struct {
         shm.* = .{
             .pages = undefined,
             .num_pages = 0,
-            .max_rights = max_rights,
             .refcount = std.atomic.Value(u32).init(1),
         };
 
