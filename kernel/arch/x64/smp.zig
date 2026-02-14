@@ -54,7 +54,7 @@ pub fn smpInit() !void {
     params.entry_point = @intFromPtr(&coreInit);
 
     var pmm_alloc = pmm.global_pmm.?.allocator();
-    const bsp_id = apic.coreID();
+    const bsp_id = apic.rawApicId();
 
     var hpet = &timers.hpet_timer;
     const hpet_iface = hpet.timer();
