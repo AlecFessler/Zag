@@ -20,6 +20,13 @@ pub const ThreadAllocator = SlabAllocator(
     64,
 );
 
+pub const State = enum {
+    running,
+    ready,
+    blocked,
+    exited,
+};
+
 pub const Thread = struct {
     tid: u64,
     ctx: *ArchCpuContext,
@@ -28,6 +35,7 @@ pub const Thread = struct {
     proc: *Process,
     next: ?*Thread = null,
     core_affinity: ?u64 = null,
+    state: State = .ready,
 
     pub fn createThread(
         proc: *Process,
@@ -77,6 +85,7 @@ pub const Thread = struct {
         thread.proc = proc;
         proc.threads[proc.num_threads] = thread;
         proc.num_threads += 1;
+        thread.state = .ready;
 
         return thread;
     }
