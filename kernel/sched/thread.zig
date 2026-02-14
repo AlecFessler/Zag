@@ -25,10 +25,12 @@ pub const Thread = struct {
     kstack_base: VAddr,
     proc: *Process,
     next: ?*Thread = null,
+    core_affinity: ?u64 = null,
 
     pub fn createThread(
         proc: *Process,
         entry: *const fn () void,
+        affinity: ?u64,
     ) !*Thread {
         if (proc.num_threads + 1 >= Process.MAX_THREADS) return error.MaxThreads;
 
@@ -37,6 +39,7 @@ pub const Thread = struct {
 
         thread.tid = tid_counter;
         tid_counter += 1;
+        thread.core_affinity = affinity;
 
         const pmm_iface = pmm.global_pmm.?.allocator();
         const kstack_page = try pmm_iface.create(paging.PageMem(.page4k));
@@ -56,7 +59,6 @@ pub const Thread = struct {
 
         thread.ctx = arch.prepareInterruptFrame(thread.kstack_base, thread.ustack_base, entry);
         thread.proc = proc;
-
         proc.threads[proc.num_threads] = thread;
         proc.num_threads += 1;
 
@@ -65,5 +67,4 @@ pub const Thread = struct {
 };
 
 pub var allocator: std.mem.Allocator = undefined;
-
 var tid_counter: u64 = 0;
