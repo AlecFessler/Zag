@@ -68,7 +68,7 @@ pub const PhysicalMemoryManager = struct {
     ) ?[*]u8 {
         const self: *PhysicalMemoryManager = @alignCast(@ptrCast(ptr));
 
-        if (len == paging.PAGE4K) {
+        if (len == paging.PAGE4K and sched.initialized) {
             const irq = arch.saveAndDisableInterrupts();
             const cache = &page_caches[arch.coreID()];
 

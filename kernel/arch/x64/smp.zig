@@ -64,7 +64,7 @@ pub fn smpInit() !void {
     const hpet_iface = hpet.timer();
     const STACK_SIZE = paging.PAGE4K * 4;
 
-    for (apic.lapics) |la| {
+    for (apic.lapics.?) |la| {
         if (la.apic_id == bsp_id) continue;
 
         const stack = try pmm_alloc.alignedAlloc(u8, paging.pageAlign(.page4k), STACK_SIZE);
