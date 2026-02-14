@@ -22,6 +22,8 @@ var slab_backing_allocator_instance: BumpAllocator = undefined;
 var proc_alloc_instance: ProcessAllocator = undefined;
 var thread_alloc_instance: ThreadAllocator = undefined;
 
+pub var initialized: bool = false;
+
 const CACHE_LINE_SIZE = 64;
 const MAX_CORES = 64;
 const SCHED_TIMESLICE_NS = 2_000_000;
@@ -155,6 +157,8 @@ pub fn globalInit() !void {
     core_states[0].rq.enqueue(b);
     core_states[1].rq.enqueue(c);
     core_states[1].rq.enqueue(d);
+
+    initialized = true;
 }
 
 pub fn perCoreInit() void {

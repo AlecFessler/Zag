@@ -50,7 +50,7 @@ pub const Thread = struct {
         thread.kstack_base = address.alignStack(VAddr.fromInt(kstack_base));
 
         if (proc.privilege == .user) {
-            const ustack_virt = try proc.vmm.reserve(paging.PAGE4K, paging.PAGE_ALIGN);
+            const ustack_virt = try proc.vmm.reserve(paging.PAGE4K, paging.pageAlign(.page4k));
             const ustack_base = ustack_virt.addr + paging.PAGE4K;
             thread.ustack_base = address.alignStack(VAddr.fromInt(ustack_base));
         } else {
