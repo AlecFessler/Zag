@@ -47,12 +47,10 @@ pub const Thread = struct {
         const thread: *Thread = try allocator.create(Thread);
         errdefer allocator.destroy(thread);
 
-        thread.tid = tid_counter;
-        tid_counter += 1;
+        thread.tid = @atomicRmw(u64, &tid_counter, .Add, 1, .monotonic);
         thread.core_affinity = affinity;
 
         const pmm_iface = pmm.global_pmm.?.allocator();
-
         const kstack_page = try pmm_iface.create(paging.PageMem(.page4k));
         errdefer pmm_iface.destroy(kstack_page);
         const kstack_virt = VAddr.fromInt(@intFromPtr(kstack_page));
@@ -61,8 +59,8 @@ pub const Thread = struct {
 
         if (proc.privilege == .user) {
             const ustack_virt = try proc.vmm.reserve(paging.PAGE4K, paging.pageAlign(.page4k));
-
             const ustack_phys_page = try pmm_iface.create(paging.PageMem(.page4k));
+
             errdefer pmm_iface.destroy(ustack_phys_page);
             const ustack_phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(ustack_phys_page)), null);
 
@@ -83,13 +81,19 @@ pub const Thread = struct {
 
         thread.ctx = arch.prepareInterruptFrame(thread.kstack_base, thread.ustack_base, entry);
         thread.proc = proc;
+
+        proc.lock.lock();
+        defer proc.lock.unlock();
+
+        if (proc.num_threads >= Process.MAX_THREADS) return error.MaxThreads;
         proc.threads[proc.num_threads] = thread;
         proc.num_threads += 1;
-        thread.state = .ready;
 
+        thread.state = .ready;
         return thread;
     }
 };
 
 pub var allocator: std.mem.Allocator = undefined;
+
 var tid_counter: u64 = 0;
