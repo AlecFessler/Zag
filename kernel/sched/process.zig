@@ -27,6 +27,8 @@ pub const Process = struct {
     threads: [MAX_THREADS]*Thread,
     num_threads: u64,
 
+    const MAX_THREADS = 16;
+
     pub fn createUserProcess(
         entry: *const fn () void,
     ) !*Process {
@@ -59,8 +61,6 @@ pub const Process = struct {
         return proc;
     }
 };
-
-const MAX_THREADS = 16;
 
 pub var allocator: std.mem.Allocator = undefined;
 
