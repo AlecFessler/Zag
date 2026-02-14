@@ -51,7 +51,8 @@ fn kMain(boot_info: *BootInfo) !void {
     const heap_allocator_iface = heap_allocator.allocator();
     _ = try debug.info.init(boot_info.elf_blob, heap_allocator_iface);
     try arch.parseAcpi(boot_info.xsdp_phys);
+    try sched.globalInit();
     try arch.smpInit();
-    try sched.init();
+    sched.perCoreInit();
     arch.halt();
 }

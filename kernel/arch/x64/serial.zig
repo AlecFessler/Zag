@@ -3,6 +3,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
+const sync = zag.sched.sync;
 
 const Ports = enum(u16) {
     com1 = 0x3F8,
@@ -45,7 +46,7 @@ pub fn init(port: Ports, baud: u32) void {
     g_port = port;
 }
 
-var print_lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+var print_lock = sync.SpinLock{};
 
 pub fn print(
     comptime format: []const u8,
@@ -59,10 +60,8 @@ pub fn print(
         args,
     ) catch @panic("Print would be truncated!");
 
-    while (print_lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
-        std.atomic.spinLoopHint();
-    }
-    defer print_lock.store(0, .release);
+    print_lock.lock();
+    defer print_lock.unlock();
 
     for (s) |b| {
         writeByte(b, g_port);

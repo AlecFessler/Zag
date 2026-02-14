@@ -16,6 +16,7 @@ const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 
 pub const IntVecs = enum(u8) {
+    syscall = 0x80,
     sched = 0xFE,
     spurious = 0xFF,
 };

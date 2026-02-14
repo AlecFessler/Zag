@@ -274,12 +274,20 @@ pub fn coreCount() u64 {
     return lapics.len;
 }
 
-pub fn coreID() u64 {
+pub fn rawApicId() u32 {
     if (x2Apic) {
-        return cpu.rdmsr(@intFromEnum(X2ApicMsr.local_apic_id_register));
+        return @intCast(cpu.rdmsr(@intFromEnum(X2ApicMsr.local_apic_id_register)));
     } else {
         return (readReg(.lapic_id_reg) >> 24) & 0xFF;
     }
+}
+
+pub fn coreID() u64 {
+    const raw = rawApicId();
+    for (lapics, 0..) |la, i| {
+        if (la.apic_id == raw) return i;
+    }
+    unreachable;
 }
 
 pub fn waitForDelivery() void {

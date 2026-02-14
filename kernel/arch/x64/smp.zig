@@ -9,12 +9,13 @@ const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const pmm = zag.memory.pmm;
 const paging = zag.memory.paging;
+const sched = zag.sched.scheduler;
 const timers = zag.arch.x64.timers;
 
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
 
-const trampoline_code = @embedFile("trampoline.bin");
+const trampoline_code = @import("embedded_bins").trampoline;
 
 const TrampolineParams = extern struct {
     cr3: u64,
@@ -54,7 +55,7 @@ pub fn smpInit() !void {
     params.entry_point = @intFromPtr(&coreInit);
 
     var pmm_alloc = pmm.global_pmm.?.allocator();
-    const bsp_id = apic.coreID();
+    const bsp_id = apic.rawApicId();
 
     var hpet = &timers.hpet_timer;
     const hpet_iface = hpet.timer();
@@ -115,5 +116,6 @@ fn coreInit() callconv(.c) noreturn {
 
     arch.print("AP core {} online\n", .{apic.coreID()});
     _ = cores_online.fetchAdd(1, .release);
+    sched.perCoreInit();
     arch.halt();
 }
