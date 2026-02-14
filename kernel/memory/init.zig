@@ -7,6 +7,7 @@ const boot = zag.boot;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const process = zag.sched.process;
+const shared = zag.memory.shared;
 
 const BuddyAllocator = zag.memory.buddy_allocator.BuddyAllocator;
 const BumpAllocator = zag.memory.bump_allocator.BumpAllocator;
@@ -25,6 +26,7 @@ var bump_allocator: BumpAllocator = undefined;
 var buddy_allocator: BuddyAllocator = undefined;
 var heap_tree_backing_allocator: BumpAllocator = undefined;
 var heap_tree_allocator: HeapTreeAllocator = undefined;
+var shm_slab_backing_allocator: BumpAllocator = undefined;
 
 pub fn init(firmware_mmap: MMap) !void {
     var mmap_entries: [boot.protocol.MAX_MMAP_ENTRIES]MMapEntry = undefined;
@@ -170,6 +172,21 @@ pub fn init(firmware_mmap: MMap) !void {
         VAddr.fromInt(address.AddrSpacePartition.kernel.start),
         VAddr.fromInt(address.AddrSpacePartition.kernel.end),
     );
+
+    const slab_vaddr = try process.global_kproc.vmm.reserve(
+        paging.PAGE1G,
+        paging.pageAlign(.page4k),
+    );
+    const slab_vaddr_end = VAddr.fromInt(slab_vaddr.addr + paging.PAGE1G);
+
+    shm_slab_backing_allocator = BumpAllocator.init(
+        slab_vaddr.addr,
+        slab_vaddr_end.addr,
+    );
+    const slab_alloc_iface = shm_slab_backing_allocator.allocator();
+
+    shared.slab_allocator_instance = try shared.SharedMemoryAllocator.init(slab_alloc_iface);
+    shared.allocator = shared.slab_allocator_instance.allocator();
 }
 
 pub fn getHeapAllocator() !HeapAllocator {

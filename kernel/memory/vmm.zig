@@ -1,8 +1,10 @@
 const std = @import("std");
 const zag = @import("zag");
+
 const Range = zag.utils.range.Range;
 const SpinLock = zag.sched.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
+const VmReservationRights = zag.perms.permissions.VmReservationRights;
 
 pub const VmmErrors = error{
     TooManyReservations,
@@ -10,17 +12,18 @@ pub const VmmErrors = error{
     InvalidSize,
 };
 
-pub const VmmAllocation = struct {
+pub const VmReservation = struct {
     vaddr: VAddr,
     size: u64,
+    rights: VmReservationRights = .{},
 };
 
 pub const VirtualMemoryManager = struct {
     start_vaddr: VAddr,
     end_vaddr: VAddr,
     free_vaddr: VAddr,
-    vmm_allocations: [MAX_RESERVATIONS]VmmAllocation = undefined,
-    vmm_allocations_idx: u32 = 0,
+    vmm_reservations: [MAX_RESERVATIONS]VmReservation = undefined,
+    vmm_reservations_idx: u32 = 0,
     lock: SpinLock = .{},
 
     pub fn init(start_vaddr: VAddr, end_vaddr: VAddr) VirtualMemoryManager {
@@ -32,30 +35,46 @@ pub const VirtualMemoryManager = struct {
         };
     }
 
-    // Called within the page fault handler, so must use irqsave variant of the spinlock
-    pub fn isValidVAddr(self: *VirtualMemoryManager, vaddr: VAddr) bool {
+    // Called within the page fault handler, so must use irqsave variant of the spinlock.
+    pub fn findReservation(self: *VirtualMemoryManager, vaddr: VAddr) ?*VmReservation {
         const irq = self.lock.lockIrqSave();
         defer self.lock.unlockIrqRestore(irq);
-
-        for (self.vmm_allocations[0..self.vmm_allocations_idx]) |alloc| {
+        for (self.vmm_reservations[0..self.vmm_reservations_idx]) |*res| {
             const range = Range{
-                .start = alloc.vaddr.addr,
-                .end = alloc.vaddr.addr + alloc.size,
+                .start = res.vaddr.addr,
+                .end = res.vaddr.addr + res.size,
             };
-            if (range.contains(vaddr.addr)) return true;
+            if (range.contains(vaddr.addr)) return res;
         }
-        return false;
+        return null;
     }
 
-    /// Not ever called within interrupt/exception handlers, but must use irqsave because the page
-    /// fault handler calls isValidVAddr on the same lock.
+    // Used to allocate a demand paged region of address space.
+    // Not ever called within interrupt/exception handlers, but must use irqsave because the page
+    // fault handler calls findReservation on the same lock.
     pub fn reserve(self: *VirtualMemoryManager, size: u64, alignment: std.mem.Alignment) !VAddr {
         const irq = self.lock.lockIrqSave();
         defer self.lock.unlockIrqRestore(irq);
+        if (self.vmm_reservations_idx >= MAX_RESERVATIONS) return error.TooManyReservations;
+        const aligned = try self.allocateRange(size, alignment);
+        self.vmm_reservations[self.vmm_reservations_idx] = .{
+            .vaddr = aligned,
+            .size = size,
+        };
+        self.vmm_reservations_idx += 1;
+        return aligned;
+    }
 
-        if (self.vmm_allocations_idx >= MAX_RESERVATIONS) return error.TooManyReservations;
+    // Used by shared memory reservations to claim the address range, but does not store an entry in the
+    // vmm reservations because the page fault handler will never see shared memory since its eagerly paged.
+    pub fn reserveRange(self: *VirtualMemoryManager, size: u64, alignment: std.mem.Alignment) !VAddr {
+        const irq = self.lock.lockIrqSave();
+        defer self.lock.unlockIrqRestore(irq);
+        return self.allocateRange(size, alignment);
+    }
+
+    fn allocateRange(self: *VirtualMemoryManager, size: u64, alignment: std.mem.Alignment) !VAddr {
         if (size == 0) return error.InvalidSize;
-
         const align_bytes: u64 = alignment.toByteUnits();
         const aligned = VAddr.fromInt(std.mem.alignForward(
             u64,
@@ -64,14 +83,7 @@ pub const VirtualMemoryManager = struct {
         ));
         const next = VAddr.fromInt(aligned.addr + size);
         if (next.addr > self.end_vaddr.addr) return error.OutOfAddressSpace;
-
-        self.vmm_allocations[self.vmm_allocations_idx] = .{
-            .vaddr = aligned,
-            .size = size,
-        };
-        self.vmm_allocations_idx += 1;
         self.free_vaddr = next;
-
         return aligned;
     }
 };

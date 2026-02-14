@@ -7,5 +7,6 @@ pub const init = @import("init.zig");
 pub const intrusive_freelist = @import("intrusive_freelist.zig");
 pub const paging = @import("paging.zig");
 pub const pmm = @import("pmm.zig");
+pub const shared = @import("shared.zig");
 pub const slab_allocator = @import("slab_allocator.zig");
 pub const vmm = @import("vmm.zig");
