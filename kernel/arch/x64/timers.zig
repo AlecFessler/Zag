@@ -192,6 +192,15 @@ pub const Lapic = struct {
         const DIV_CODE: u32 = 0b011;
         const DIVIDER: u32 = 16;
 
+        if (cached_freq_hz) |freq| {
+            apic.initLapicTimer(DIV_CODE, int_vec, false);
+            return .{
+                .freq_hz = freq,
+                .divider = DIVIDER,
+                .vector = int_vec,
+            };
+        }
+
         apic.initLapicTimer(
             DIV_CODE,
             @intFromEnum(interrupts.IntVecs.spurious),
@@ -243,6 +252,8 @@ pub const Lapic = struct {
             false,
         );
 
+        cached_freq_hz = estimate;
+
         return .{
             .freq_hz = estimate,
             .divider = DIVIDER,
@@ -281,6 +292,10 @@ pub const Tsc = struct {
     freq_hz: u64,
 
     pub fn init(hpet: *Hpet) Tsc {
+        if (cached_freq_hz) |freq| {
+            return .{ .freq_hz = freq };
+        }
+
         const hpet_iface = hpet.timer();
 
         var estimate: u64 = 0;
@@ -306,6 +321,8 @@ pub const Tsc = struct {
 
             estimate = if (i == 0) sample_hz else (estimate + sample_hz) / 2;
         }
+
+        cached_freq_hz = estimate;
 
         return .{ .freq_hz = estimate };
     }
@@ -342,5 +359,7 @@ pub fn getInterruptTimer() Timer {
         return lapic_timer_instance.timer();
     }
 }
+
+var cached_freq_hz: ?u64 = null;
 
 pub var hpet_timer: Hpet = undefined;

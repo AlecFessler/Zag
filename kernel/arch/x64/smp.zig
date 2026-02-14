@@ -9,6 +9,7 @@ const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const pmm = zag.memory.pmm;
 const paging = zag.memory.paging;
+const sched = zag.sched.scheduler;
 const timers = zag.arch.x64.timers;
 
 const PAddr = zag.memory.address.PAddr;
@@ -115,5 +116,6 @@ fn coreInit() callconv(.c) noreturn {
 
     arch.print("AP core {} online\n", .{apic.coreID()});
     _ = cores_online.fetchAdd(1, .release);
+    sched.perCoreInit();
     arch.halt();
 }
