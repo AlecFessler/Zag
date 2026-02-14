@@ -36,6 +36,11 @@ pub const Thread = struct {
     next: ?*Thread = null,
     core_affinity: ?u64 = null,
     state: State = .ready,
+    // prevents a race in WaitQueue.wait() where the thread marks itself as blocked
+    // then another core calls WaitQueue.wakeOne and sets its to ready and enqueues
+    // it to the run queue but the thread is still executing on the original core because
+    // it hasn't called yield yet.
+    on_cpu: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn createThread(
         proc: *Process,

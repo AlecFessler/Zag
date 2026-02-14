@@ -53,8 +53,10 @@ pub const WaitQueue = struct {
     pub fn wakeOne(self: *WaitQueue) ?*Thread {
         const irq_state = self.lock.lockIrqSave();
         defer self.lock.unlockIrqRestore(irq_state);
-
         const thread = self.dequeueThread() orelse return null;
+        while (thread.on_cpu.load(.acquire)) {
+            std.atomic.spinLoopHint();
+        }
         thread.state = .ready;
         const target = thread.core_affinity orelse arch.coreID();
         sched.enqueueOnCore(target, thread);
@@ -64,9 +66,11 @@ pub const WaitQueue = struct {
     pub fn wakeAll(self: *WaitQueue) u64 {
         const irq_state = self.lock.lockIrqSave();
         defer self.lock.unlockIrqRestore(irq_state);
-
         var count: u64 = 0;
         while (self.dequeueThread()) |thread| {
+            while (thread.on_cpu.load(.acquire)) {
+                std.atomic.spinLoopHint();
+            }
             thread.state = .ready;
             const target = thread.core_affinity orelse arch.coreID();
             sched.enqueueOnCore(target, thread);

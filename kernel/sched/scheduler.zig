@@ -93,6 +93,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     const state = &core_states[arch.coreID()];
     const preempted = state.running_thread.?;
     preempted.ctx = ctx.thread_ctx;
+    preempted.on_cpu.store(false, .release);
 
     state.rq_lock.lock();
 
@@ -104,6 +105,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     const next = state.rq.dequeue() orelse &state.rq.sentinel;
     if (next != &state.rq.sentinel) {
         next.state = .running;
+        next.on_cpu.store(true, .release);
     }
     state.running_thread = next;
 
