@@ -128,7 +128,11 @@ pub fn enqueueOnCore(core_index: u64, thread: *Thread) void {
 }
 
 pub fn globalInit() !void {
-    const slab_vaddr_space_start = try process_mod.global_kproc.vmm.reserve(paging.PAGE1G, paging.pageAlign(.page4k));
+    const slab_vaddr_space_start = try process_mod.global_kproc.vmm.reserve(
+        paging.PAGE1G,
+        paging.pageAlign(.page4k),
+        .{ .read = true, .write = true },
+    );
     const slab_vaddr_space_end = VAddr.fromInt(slab_vaddr_space_start.addr + paging.PAGE1G);
     slab_backing_allocator_instance = BumpAllocator.init(
         slab_vaddr_space_start.addr,

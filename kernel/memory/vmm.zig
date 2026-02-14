@@ -51,7 +51,12 @@ pub const VirtualMemoryManager = struct {
 
     /// Not ever called within interrupt/exception handlers, but must use irqsave because the page
     /// fault handler calls findReservation on the same lock.
-    pub fn reserve(self: *VirtualMemoryManager, size: u64, alignment: std.mem.Alignment, rights: VmReservationRights) !VAddr {
+    pub fn reserve(
+        self: *VirtualMemoryManager,
+        size: u64,
+        alignment: std.mem.Alignment,
+        rights: VmReservationRights,
+    ) !VAddr {
         const irq = self.lock.lockIrqSave();
         defer self.lock.unlockIrqRestore(irq);
         if (self.vmm_reservations_idx >= MAX_RESERVATIONS) return error.TooManyReservations;

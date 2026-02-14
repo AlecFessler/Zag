@@ -176,6 +176,7 @@ pub fn init(firmware_mmap: MMap) !void {
     const slab_vaddr = try process.global_kproc.vmm.reserve(
         paging.PAGE1G,
         paging.pageAlign(.page4k),
+        .{ .read = true, .write = true },
     );
     const slab_vaddr_end = VAddr.fromInt(slab_vaddr.addr + paging.PAGE1G);
 
@@ -194,12 +195,14 @@ pub fn getHeapAllocator() !HeapAllocator {
     const heap_vaddr_space_start = try process.global_kproc.vmm.reserve(
         heap_vaddr_space_size,
         paging.pageAlign(.page4k),
+        .{ .read = true, .write = true },
     );
     const heap_vaddr_space_end = VAddr.fromInt(heap_vaddr_space_start.addr + heap_vaddr_space_size);
 
     const heap_tree_vaddr_space_start = try process.global_kproc.vmm.reserve(
         paging.PAGE1G,
         paging.pageAlign(.page4k),
+        .{ .read = true, .write = true },
     );
     const heap_tree_vaddr_space_end = VAddr.fromInt(heap_tree_vaddr_space_start.addr + paging.PAGE1G);
 

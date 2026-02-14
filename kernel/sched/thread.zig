@@ -63,7 +63,11 @@ pub const Thread = struct {
         thread.kstack_base = address.alignStack(VAddr.fromInt(kstack_base));
 
         if (proc.privilege == .user) {
-            const ustack_virt = try proc.vmm.reserve(paging.PAGE4K, paging.pageAlign(.page4k));
+            const ustack_virt = try proc.vmm.reserve(
+                paging.PAGE4K,
+                paging.pageAlign(.page4k),
+                .{ .read = true, .write = true },
+            );
             const ustack_phys_page = try pmm_iface.create(paging.PageMem(.page4k));
 
             errdefer pmm_iface.destroy(ustack_phys_page);
