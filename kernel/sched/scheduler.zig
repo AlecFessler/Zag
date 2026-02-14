@@ -105,30 +105,6 @@ pub fn enqueueOnCore(core_index: u64, thread: *Thread) void {
     core_states[core_index].rq.enqueue(thread);
 }
 
-fn testThreadA() void {
-    while (true) {
-        arch.print("A core {}\n", .{arch.coreID()});
-    }
-}
-
-fn testThreadB() void {
-    while (true) {
-        arch.print("B core {}\n", .{arch.coreID()});
-    }
-}
-
-fn testThreadC() void {
-    while (true) {
-        arch.print("C core {}\n", .{arch.coreID()});
-    }
-}
-
-fn testThreadD() void {
-    while (true) {
-        arch.print("D core {}\n", .{arch.coreID()});
-    }
-}
-
 pub fn globalInit() !void {
     const slab_vaddr_space_start = try process_mod.global_kproc.vmm.reserve(paging.PAGE1G, paging.pageAlign(.page4k));
     const slab_vaddr_space_end = VAddr.fromInt(slab_vaddr_space_start.addr + paging.PAGE1G);
