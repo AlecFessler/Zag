@@ -106,8 +106,8 @@ pub fn prepareInterruptFrame(
     entry: *const fn () void,
 ) *ArchCpuContext {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.interrupts.prepareInterruptFrame(kstack_top, ustack_top, entry),
-        .aarch64 => aarch64.interrupts.prepareInterruptFrame(kstack_top, ustack_top, entry),
+        .x86_64 => return x64.interrupts.prepareInterruptFrame(kstack_top, ustack_top, entry),
+        .aarch64 => return aarch64.interrupts.prepareInterruptFrame(kstack_top, ustack_top, entry),
         else => unreachable,
     }
 }
