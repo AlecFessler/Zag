@@ -18,6 +18,8 @@ const ThreadAllocator = zag.sched.thread.ThreadAllocator;
 const VAddr = zag.memory.address.VAddr;
 const VirtualMemoryManager = zag.memory.vmm.VirtualMemoryManager;
 
+const embedded = @import("embedded_bins");
+
 var slab_backing_allocator_instance: BumpAllocator = undefined;
 var proc_alloc_instance: ProcessAllocator = undefined;
 var thread_alloc_instance: ThreadAllocator = undefined;
@@ -143,20 +145,13 @@ pub fn globalInit() !void {
     thread_alloc_instance = try ThreadAllocator.init(slab_alloc_iface);
     thread_mod.allocator = thread_alloc_instance.allocator();
 
-    const proc = &process_mod.global_kproc;
-    const a = try Thread.createThread(proc, &testThreadA, 0);
-    const b = try Thread.createThread(proc, &testThreadB, 0);
-    const c = try Thread.createThread(proc, &testThreadC, 1);
-    const d = try Thread.createThread(proc, &testThreadD, 1);
-
     for (&core_states) |*state| {
         state.rq.init();
     }
 
-    core_states[0].rq.enqueue(a);
-    core_states[0].rq.enqueue(b);
-    core_states[1].rq.enqueue(c);
-    core_states[1].rq.enqueue(d);
+    const user_proc = try Process.createUserProcess(embedded.hello_world);
+    const user_thread = user_proc.threads[0];
+    core_states[0].rq.enqueue(user_thread);
 
     initialized = true;
 }

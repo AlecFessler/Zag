@@ -7,6 +7,7 @@ const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const gdt = zag.arch.x64.gdt;
 const sched = zag.sched.scheduler;
+const syscall = zag.arch.syscall;
 
 const GateType = zag.arch.x64.idt.GateType;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
@@ -55,6 +56,20 @@ pub fn init() void {
         schedTimerHandler,
         .external,
     );
+
+    const syscall_vec = @intFromEnum(interrupts.IntVecs.syscall);
+    idt.openInterruptGate(
+        syscall_vec,
+        interrupts.STUBS[syscall_vec],
+        gdt.KERNEL_CODE_OFFSET,
+        PrivilegeLevel.ring_3,
+        GateType.interrupt_gate,
+    );
+    interrupts.registerVector(
+        syscall_vec,
+        syscallHandler,
+        .software,
+    );
 }
 
 fn spuriousHandler(ctx: *cpu.Context) void {
@@ -71,4 +86,8 @@ fn schedTimerHandler(ctx: *cpu.Context) void {
     sched_interrupt_ctx.thread_ctx = @ptrCast(ctx);
 
     sched.schedTimerHandler(sched_interrupt_ctx);
+}
+
+fn syscallHandler(ctx: *cpu.Context) void {
+    syscall.dispatch(ctx.regs.rax, ctx.regs.rdi, ctx.regs.rsi);
 }
