@@ -63,7 +63,7 @@ pub fn prepareInterruptFrame(
     ustack_top: ?VAddr,
     entry: *const fn () void,
 ) *ArchCpuContext {
-    // the alignment of the context on the stack will trip runtime safety checks but it's okay
+    // unaligned access of the cpu context will set off runtime safety checks but that's okay
     @setRuntimeSafety(false);
     const ctx_addr: u64 = kstack_top.addr - @sizeOf(cpu.Context);
     var ctx: *cpu.Context = @ptrFromInt(ctx_addr);
@@ -112,7 +112,7 @@ pub fn prepareInterruptFrame(
 
 pub fn switchTo(thread: *Thread) void {
     if (thread.proc.privilege == .user) {
-        gdt.tss_entry.rsp0 = thread.kstack_base.addr;
+        gdt.coreTss(apic.coreID()).rsp0 = thread.kstack_base.addr;
         const new_addr_space_root_phys = PAddr.fromVAddr(thread.proc.addr_space_root, null);
         arch.swapAddrSpace(new_addr_space_root_phys);
     }

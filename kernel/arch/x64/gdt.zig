@@ -1,3 +1,4 @@
+const std = @import("std");
 const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
@@ -142,10 +143,11 @@ const USER_SEGMENT_DATA: GdtEntry = .{
     .base_high = 0,
 };
 
+const MAX_CORES = 64;
 const NUM_GDT_ENTRIES: u16 = 7;
 const TABLE_SIZE: u16 = @sizeOf(GdtEntry) * NUM_GDT_ENTRIES - 1;
 
-var gdt_entries: [7]GdtEntry = blk: {
+const base_gdt_entries: [7]GdtEntry = blk: {
     var tmp: [7]GdtEntry = undefined;
     tmp[0] = NULL_SEGMENT;
     tmp[1] = KERNEL_SEGMENT_CODE;
@@ -157,20 +159,32 @@ var gdt_entries: [7]GdtEntry = blk: {
     break :blk tmp;
 };
 
-pub var gdt_ptr: GdtPtr = .{
-    .limit = TABLE_SIZE,
-    .base = 0,
-};
-
-pub var tss_entry: Tss = .{};
+var tss_entries: [MAX_CORES]Tss = [_]Tss{.{}} ** MAX_CORES;
+var per_core_gdts: [MAX_CORES][7]GdtEntry = [_][7]GdtEntry{base_gdt_entries} ** MAX_CORES;
+var per_core_gdt_ptrs: [MAX_CORES]GdtPtr = [_]GdtPtr{.{ .limit = TABLE_SIZE, .base = 0 }} ** MAX_CORES;
 
 pub fn init() void {
-    tss_entry = .{};
-    writeTssDescriptor(&tss_entry);
+    initForCore(0);
+    loadGdt(0);
+    reloadSegments();
+    cpu.ltr(TSS_OFFSET);
+}
 
-    gdt_ptr.base = @intFromPtr(&gdt_entries[0]);
+pub fn initForCore(core_id: u64) void {
+    tss_entries[core_id] = .{};
+    writeTssDescriptor(core_id);
+    per_core_gdt_ptrs[core_id].base = @intFromPtr(&per_core_gdts[core_id]);
+}
 
-    cpu.lgdt(&gdt_ptr);
+pub fn loadGdt(core_id: u64) void {
+    cpu.lgdt(&per_core_gdt_ptrs[core_id]);
+}
+
+pub fn coreTss(core_id: u64) *Tss {
+    return &tss_entries[core_id];
+}
+
+pub fn reloadSegments() void {
     asm volatile (
         \\pushq %[cs_sel]
         \\leaq 1f(%%rip), %%rax
@@ -186,11 +200,10 @@ pub fn init() void {
           [ds_sel] "i" (KERNEL_DATA_OFFSET),
         : .{ .rax = true, .ax = true, .memory = true }
     );
-    cpu.ltr(TSS_OFFSET);
 }
 
-fn writeTssDescriptor(tss_ptr: *Tss) void {
-    const base: u64 = @intFromPtr(tss_ptr);
+fn writeTssDescriptor(core_id: u64) void {
+    const base: u64 = @intFromPtr(&tss_entries[core_id]);
     const limit: u20 = @truncate(@sizeOf(Tss) - 1);
 
     const tss_low_idx: u64 = @intCast((TSS_OFFSET >> 3));
@@ -212,8 +225,8 @@ fn writeTssDescriptor(tss_ptr: *Tss) void {
     low.is_32_bit = false;
     low.granularity = 0;
 
-    gdt_entries[tss_low_idx] = low;
+    per_core_gdts[core_id][tss_low_idx] = low;
 
-    const raw: *[NUM_GDT_ENTRIES]u64 = @ptrCast(&gdt_entries);
+    const raw: *[7]u64 = @ptrCast(&per_core_gdts[core_id]);
     raw[tss_high_idx] = base >> 32;
 }

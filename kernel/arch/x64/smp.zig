@@ -30,6 +30,10 @@ const params_offset = trampoline_code.len - @sizeOf(TrampolineParams);
 var cores_online: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
 
 pub fn smpInit() !void {
+    for (0..apic.coreCount()) |i| {
+        gdt.initForCore(i);
+    }
+
     const trampoline_phys = PAddr.fromInt(TRAMPOLINE_PHYS);
     const trampoline_virt = VAddr.fromInt(TRAMPOLINE_PHYS);
     try arch.mapPage(
@@ -56,10 +60,8 @@ pub fn smpInit() !void {
 
     var pmm_alloc = pmm.global_pmm.?.allocator();
     const bsp_id = apic.rawApicId();
-
     var hpet = &timers.hpet_timer;
     const hpet_iface = hpet.timer();
-
     const STACK_SIZE = paging.PAGE4K * 4;
 
     for (apic.lapics) |la| {
@@ -77,6 +79,7 @@ pub fn smpInit() !void {
         }
 
         apic.sendSipi(la.apic_id, TRAMPOLINE_VECTOR);
+
         const timeout = hpet_iface.now();
         while (cores_online.load(.acquire) == expected) {
             if (hpet_iface.now() - timeout > 100_000_000) {
@@ -86,26 +89,13 @@ pub fn smpInit() !void {
             std.atomic.spinLoopHint();
         }
     }
+
     arch.print("SMP: {}/{} cores online\n", .{ cores_online.load(.acquire), apic.coreCount() });
 }
 
 fn coreInit() callconv(.c) noreturn {
-    cpu.lgdt(&gdt.gdt_ptr);
-    asm volatile (
-        \\pushq %[cs_sel]
-        \\leaq 1f(%%rip), %%rax
-        \\pushq %%rax
-        \\lretq
-        \\1:
-        \\movw %[ds_sel], %%ax
-        \\movw %%ax, %%ds
-        \\movw %%ax, %%es
-        \\movw %%ax, %%ss
-        :
-        : [cs_sel] "i" (gdt.KERNEL_CODE_OFFSET),
-          [ds_sel] "i" (gdt.KERNEL_DATA_OFFSET),
-        : .{ .rax = true, .ax = true, .memory = true }
-    );
+    gdt.loadGdt(0);
+    gdt.reloadSegments();
     cpu.lidt(&idt.idt_ptr);
 
     if (apic.x2Apic) {
@@ -114,8 +104,13 @@ fn coreInit() callconv(.c) noreturn {
         apic.enableSpuriousVector(@intFromEnum(interrupts.IntVecs.spurious));
     }
 
-    arch.print("AP core {} online\n", .{apic.coreID()});
+    const core_id = apic.coreID();
+    gdt.loadGdt(core_id);
+    cpu.ltr(gdt.TSS_OFFSET);
+
+    arch.print("AP core {} online\n", .{core_id});
     _ = cores_online.fetchAdd(1, .release);
+
     sched.perCoreInit();
     arch.halt();
 }
