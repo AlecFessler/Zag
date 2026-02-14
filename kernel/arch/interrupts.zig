@@ -14,6 +14,7 @@ const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PrivilegePerm = zag.perms.privilege.PrivilegePerm;
 const VAddr = zag.memory.address.VAddr;
+const VmReservation = zag.memory.vmm.VmReservation;
 
 pub const ArchCpuContext = switch (builtin.cpu.arch) {
     .x86_64 => x64.cpu.Context,
@@ -34,23 +35,41 @@ pub fn pageFaultHandler(ctx: PageFaultContext) void {
         @panic("Page fault prior to pmm initialization");
     }
     const pmm_iface = pmm.global_pmm.?.allocator();
+
     const faulting_page_virt = VAddr.fromInt(std.mem.alignBackward(
         u64,
         ctx.faulting_virt.addr,
         @intFromEnum(paging.PageSize.page4k),
     ));
 
-    if (ctx.privilege == .kernel) {
-        if (ctx.present) {
-            if (ctx.fetch) {
-                @panic("Invalid kernel instruction fetch");
-            } else if (ctx.write) {
-                @panic("Invalid kernel write");
+    if (ctx.present) {
+        if (ctx.fetch) {
+            @panic("Invalid instruction fetch on present page");
+        } else if (ctx.write) {
+            @panic("Invalid write on present page");
+        }
+    }
+
+    const kspace_res = process.global_kproc.vmm.findReservation(ctx.faulting_virt);
+    const uspace_res: ?*VmReservation = blk: {
+        if (sched.initialized) {
+            if (sched.currentThread()) |thread| {
+                break :blk thread.proc.vmm.findReservation(ctx.faulting_virt);
             }
         }
-    } else {
-        @panic("User page fault: invalid access (process killing not implemented yet)");
-    }
+        break :blk null;
+    };
+
+    const res = kspace_res orelse uspace_res orelse
+        @panic("Page fault in unreserved address space");
+
+    const page_perms: MemoryPerms = .{
+        .write_perm = if (res.rights.write) .write else .no_write,
+        .execute_perm = if (res.rights.execute) .execute else .no_execute,
+        .cache_perm = .write_back,
+        .global_perm = if (kspace_res != null) .global else .not_global,
+        .privilege_perm = if (kspace_res != null) .kernel else .user,
+    };
 
     const phys_page = pmm_iface.create(paging.PageMem(.page4k)) catch @panic("PMM OOM!");
     const phys_page_virt = VAddr.fromInt(@intFromPtr(phys_page));
@@ -58,38 +77,6 @@ pub fn pageFaultHandler(ctx: PageFaultContext) void {
 
     const addr_space_root_phys = arch.getAddrSpaceRoot();
     const addr_space_root_virt = VAddr.fromPAddr(addr_space_root_phys, null);
-
-    const in_kspace = process.global_kproc.vmm.isValidVAddr(ctx.faulting_virt);
-    const in_uspace = blk: {
-        if (sched.initialized) {
-            if (sched.currentThread()) |thread| {
-                break :blk thread.proc.vmm.isValidVAddr(ctx.faulting_virt);
-            }
-        }
-        break :blk false;
-    };
-
-    const page_perms: MemoryPerms = blk: {
-        if (in_kspace) {
-            break :blk .{
-                .write_perm = .write,
-                .execute_perm = .no_execute,
-                .cache_perm = .write_back,
-                .global_perm = .global,
-                .privilege_perm = .kernel,
-            };
-        } else if (in_uspace) {
-            break :blk .{
-                .write_perm = .write,
-                .execute_perm = .no_execute,
-                .cache_perm = .write_back,
-                .global_perm = .not_global,
-                .privilege_perm = .user,
-            };
-        } else {
-            @panic("Non-present page in neither kernel or user address space!");
-        }
-    };
 
     arch.mapPage(
         addr_space_root_virt,
