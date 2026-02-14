@@ -7,6 +7,7 @@ const pmm = zag.memory.pmm;
 const PAddr = zag.memory.address.PAddr;
 const SharedMemoryRights = zag.perms.permissions.SharedMemoryRights;
 const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
+const SpinLock = zag.sched.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
 
 pub const SharedMemoryAllocator = SlabAllocator(SharedMemory, false, 0, 64);
@@ -27,8 +28,17 @@ pub const SharedMemory = struct {
         );
         if (num_pages > MAX_PAGES) return error.TooManyPages;
 
-        const shm = try allocator.create(SharedMemory);
-        errdefer allocator.destroy(shm);
+        lock.lock();
+        const shm = allocator.create(SharedMemory) catch |err| {
+            lock.unlock();
+            return err;
+        };
+        lock.unlock();
+        errdefer {
+            lock.lock();
+            allocator.destroy(shm);
+            lock.unlock();
+        }
 
         shm.* = .{
             .pages = undefined,
@@ -66,7 +76,9 @@ pub const SharedMemory = struct {
 
     fn destroy(self: *SharedMemory) void {
         self.freePages();
+        lock.lock();
         allocator.destroy(self);
+        lock.unlock();
     }
 
     fn freePages(self: *SharedMemory) void {
@@ -81,3 +93,4 @@ pub const SharedMemory = struct {
 
 pub var slab_allocator_instance: SharedMemoryAllocator = undefined;
 pub var allocator: std.mem.Allocator = undefined;
+var lock: SpinLock = .{};
