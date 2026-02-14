@@ -80,6 +80,10 @@ fn armSchedTimer(state: *PerCoreState, delta_ns: u64) void {
     state.timer.armInterruptTimer(delta_ns);
 }
 
+pub fn currentThread() ?*Thread {
+    return core_states[arch.coreID()].running_thread;
+}
+
 pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     const state = &core_states[arch.coreID()];
     const preempted = state.running_thread.?;
