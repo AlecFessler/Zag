@@ -54,7 +54,7 @@ pub const Process = struct {
         );
 
         proc.num_threads = 0;
-        _ = try Thread.createThread(proc, entry);
+        _ = try Thread.createThread(proc, entry, null);
 
         return proc;
     }
