@@ -89,3 +89,7 @@ pub fn thread_exit() noreturn {
     _ = syscall0(.thread_exit);
     unreachable;
 }
+
+pub fn thread_create(entry: *const fn () void) i64 {
+    return syscall1(.thread_create, @intFromPtr(entry));
+}
