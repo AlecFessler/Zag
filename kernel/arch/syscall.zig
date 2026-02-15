@@ -78,7 +78,7 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
         .mem_reserve => sysMemReserve(arg0, arg1, arg2, arg3),
         .mem_perms => ok(sysMemPerms(arg0, arg1)),
         .proc_create => ok(sysProcCreate(arg0, arg1, arg2, arg3, arg4)),
-        .thread_create => ok(sysThreadCreate(arg0, arg1, arg2)),
+        .thread_create => ok(sysThreadCreate(arg0, arg1)),
         .thread_exit => sysThreadExit(),
         .thread_yield => ok(sysThreadYield()),
         .thread_set_affinity => ok(sysThreadSetAffinity(arg0, arg1)),
@@ -210,11 +210,10 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, self_perms: u64, caps_ptr: u64, num
     return E_INVAL;
 }
 
-fn sysThreadCreate(entry_addr: u64, stack_addr: u64, arg: u64) i64 {
+fn sysThreadCreate(entry_addr: u64, arg: u64) i64 {
     _ = arg; // TODO: pass arg in rdi of new thread's initial register state
 
     if (!validateUserPtr(entry_addr, 1)) return E_BADADDR;
-    if (!validateUserPtr(stack_addr, 1)) return E_BADADDR;
 
     const proc = currentProc();
     const self_entry = proc.getPerm(0) orelse return E_PERM;

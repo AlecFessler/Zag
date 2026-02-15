@@ -175,6 +175,9 @@ pub fn globalInit() !void {
     const mem_reserve_proc = try Process.createUserProcess(embedded.mem_reserve);
     core_states[0].rq.enqueue(mem_reserve_proc.threads[0]);
 
+    const thread_create_proc = try Process.createUserProcess(embedded.thread_create);
+    core_states[0].rq.enqueue(thread_create_proc.threads[0]);
+
     initialized = true;
 }
 
