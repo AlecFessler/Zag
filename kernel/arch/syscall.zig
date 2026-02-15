@@ -230,13 +230,17 @@ fn sysThreadCreate(entry_addr: u64, stack_addr: u64, arg: u64) i64 {
 fn sysThreadExit() noreturn {
     const thread = sched.currentThread().?;
     const proc = thread.proc;
-
     const last_in_proc = proc.removeThread(thread);
     thread.state = .exited;
     thread.last_in_proc = last_in_proc;
 
     sched.yield();
-    unreachable;
+    // Self-IPI is async and interrupts may be masked inside the syscall handler.
+    // Spin with interrupts enabled until the scheduler preempts us.
+    while (true) {
+        arch.enableInterrupts();
+        asm volatile ("hlt");
+    }
 }
 
 fn sysThreadYield() i64 {
