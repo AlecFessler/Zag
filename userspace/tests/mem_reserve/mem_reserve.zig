@@ -1,3 +1,6 @@
+// the purpose of this test is to verify that userspace can make virtual memory allocations and the kernel will
+// back them with physical memory via demand paging
+
 const lib = @import("lib");
 
 pub fn main() void {
