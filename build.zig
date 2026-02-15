@@ -25,28 +25,27 @@ pub fn build(b: *std.Build) void {
     zag_mod.red_zone = false;
     zag_mod.addImport("zag", zag_mod);
 
-    // ── Userspace binaries ──────────────────────────────────────────────
-    const user_hello = b.addExecutable(.{
-        .name = "hello",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("userspace/hello_world/hello_world.zig"),
-            .target = b.resolveTargetQuery(.{
-                .cpu_arch = .x86_64,
-                .os_tag = .freestanding,
-            }),
-            .optimize = .ReleaseSmall,
-        }),
-        .linkage = .static,
-    });
-    user_hello.entry = .{ .symbol_name = "_start" };
-    user_hello.setLinkerScript(b.path("userspace/hello_world/linker.ld"));
-
-    const user_objcopy = b.addObjCopy(user_hello.getEmittedBin(), .{
-        .format = .bin,
-    });
-
+    // ── Userspace binaries (from userspace/bin/) ────────────────────────
     const embedded_wf = b.addWriteFiles();
-    _ = embedded_wf.addCopyFile(user_objcopy.getOutput(), "hello_world.bin");
+    var embed_src: std.ArrayListUnmanaged(u8) = .{};
+
+    var bin_dir = std.fs.cwd().openDir("userspace/bin", .{ .iterate = true }) catch
+        @panic("userspace/bin/ not found — build userspace programs first");
+    defer bin_dir.close();
+
+    var iter = bin_dir.iterate();
+    while (iter.next() catch @panic("failed to iterate userspace/bin/")) |entry| {
+        if (entry.kind != .file) continue;
+        const name = entry.name;
+        if (!std.mem.endsWith(u8, name, ".bin")) continue;
+
+        const stem = name[0 .. name.len - 4];
+        _ = embedded_wf.addCopyFile(.{ .cwd_relative = b.fmt("userspace/bin/{s}", .{name}) }, name);
+        embed_src.writer(b.allocator).print(
+            "pub const {s} = @embedFile(\"{s}\");\n",
+            .{ stem, name },
+        ) catch @panic("OOM");
+    }
 
     // ── SMP trampoline ──────────────────────────────────────────────────
     const nasm_step = b.addSystemCommand(&.{
@@ -55,12 +54,13 @@ pub fn build(b: *std.Build) void {
     });
     const trampoline_output = nasm_step.addOutputFileArg("trampoline.bin");
     _ = embedded_wf.addCopyFile(trampoline_output, "trampoline.bin");
+    embed_src.writer(b.allocator).print(
+        "pub const trampoline = @embedFile(\"trampoline.bin\");\n",
+        .{},
+    ) catch @panic("OOM");
 
     const embedded_bins_mod = b.createModule(.{
-        .root_source_file = embedded_wf.add("embedded_bins.zig",
-            \\pub const hello_world = @embedFile("hello_world.bin");
-            \\pub const trampoline = @embedFile("trampoline.bin");
-        ),
+        .root_source_file = embedded_wf.add("embedded_bins.zig", embed_src.items),
         .target = b.resolveTargetQuery(.{
             .cpu_arch = arch,
             .os_tag = .freestanding,

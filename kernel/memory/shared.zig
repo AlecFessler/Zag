@@ -66,7 +66,7 @@ pub const SharedMemory = struct {
     pub fn decRef(self: *SharedMemory) void {
         const prev = self.refcount.fetchSub(1, .release);
         if (prev == 1) {
-            std.atomic.fence(.acquire);
+            _ = self.refcount.load(.acquire);
             self.destroy();
         }
     }
