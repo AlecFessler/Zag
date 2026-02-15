@@ -51,11 +51,34 @@ pub fn mapPage(
     virt: VAddr,
     size: PageSize,
     perms: MemoryPerms,
-    allocator: std.mem.Allocator,
+    page_allocator: std.mem.Allocator,
 ) !void {
     switch (builtin.cpu.arch) {
-        .x86_64 => try x64.paging.mapPage(addr_space_root, phys, virt, size, perms, allocator),
-        .aarch64 => try aarch64.paging.mapPage(addr_space_root, phys, virt, size, perms, allocator),
+        .x86_64 => try x64.paging.mapPage(addr_space_root, phys, virt, size, perms, page_allocator),
+        .aarch64 => try aarch64.paging.mapPage(addr_space_root, phys, virt, size, perms, page_allocator),
+        else => unreachable,
+    }
+}
+
+pub fn freeUserAddrSpace(
+    addr_space_root: VAddr,
+    page_allocator: std.mem.Allocator,
+) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.freeUserAddrSpace(addr_space_root, page_allocator),
+        .aarch64 => aarch64.paging.freeUserAddrSpace(addr_space_root, page_allocator),
+        else => unreachable,
+    }
+}
+
+pub fn unmapPage(
+    addr_space_root: VAddr,
+    virt: VAddr,
+    size: PageSize,
+) ?PAddr {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return x64.paging.unmapPage(addr_space_root, virt, size),
+        .aarch64 => return aarch64.paging.unmapPage(addr_space_root, virt, size),
         else => unreachable,
     }
 }

@@ -67,11 +67,17 @@ const RunQueue = struct {
     }
 };
 
+const Zombie = struct {
+    thread: *Thread,
+    last_in_proc: bool,
+};
+
 const PerCoreState = struct {
     rq: RunQueue = undefined,
     rq_lock: SpinLock = .{},
     running_thread: ?*Thread = null,
     timer: Timer = undefined,
+    zombie: ?Zombie = null,
 };
 
 var core_states: [MAX_CORES]PerCoreState align(CACHE_LINE_SIZE) = [_]PerCoreState{.{}} ** MAX_CORES;
@@ -91,6 +97,12 @@ pub fn currentThread() ?*Thread {
 
 pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     const state = &core_states[arch.coreID()];
+
+    if (state.zombie) |zombie| {
+        zombie.thread.deinit();
+        state.zombie = null;
+    }
+
     const preempted = state.running_thread.?;
     preempted.ctx = ctx.thread_ctx;
     preempted.on_cpu.store(false, .release);
@@ -108,6 +120,10 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
         next.on_cpu.store(true, .release);
     }
     state.running_thread = next;
+
+    if (preempted != &state.rq.sentinel and preempted.state == .exited) {
+        state.zombie = .{ .thread = preempted, .last_in_proc = preempted.last_in_proc };
+    }
 
     state.rq_lock.unlock();
 

@@ -113,7 +113,7 @@ pub fn prepareInterruptFrame(
 
 pub fn switchTo(thread: *Thread) void {
     if (thread.proc.privilege == .user) {
-        gdt.coreTss(apic.coreID()).rsp0 = thread.kstack_base.addr;
+        gdt.coreTss(apic.coreID()).rsp0 = thread.kstack_top.addr;
         const new_addr_space_root_phys = PAddr.fromVAddr(thread.proc.addr_space_root, null);
         arch.swapAddrSpace(new_addr_space_root_phys);
         std.debug.assert(arch.getAddrSpaceRoot().addr == new_addr_space_root_phys.addr);

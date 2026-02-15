@@ -91,6 +91,39 @@ pub const Process = struct {
         return entry;
     }
 
+    pub fn removeThread(self: *Process, thread: *Thread) bool {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        for (self.threads[0..self.num_threads], 0..) |t, i| {
+            if (t == thread) {
+                self.num_threads -= 1;
+                if (i < self.num_threads) {
+                    self.threads[i] = self.threads[self.num_threads];
+                }
+                return self.num_threads == 0;
+            }
+        }
+        unreachable;
+    }
+
+    pub fn deinit(self: *Process) void {
+        for (&self.perm_table) |*entry| {
+            switch (entry.object) {
+                .shared_memory => |shm| shm.decRef(),
+                .vm_reservation => {
+                    // TODO: decommit pages, free physical memory, release VA range
+                },
+                .process => {},
+                .empty => {},
+            }
+        }
+
+        const pmm_iface = pmm.global_pmm.?.allocator();
+        arch.freeUserAddrSpace(self.addr_space_root, pmm_iface);
+        allocator.destroy(self);
+    }
+
     pub fn createUserProcess(
         binary: []const u8,
     ) !*Process {

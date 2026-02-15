@@ -32,20 +32,19 @@ pub const SyscallResult = struct {
 };
 
 pub const SyscallNum = enum(u64) {
-    write = 0,
-    mem_reserve = 1,
-    mem_perms = 2,
-    proc_create = 3,
-    proc_destroy = 4,
-    thread_create = 5,
-    thread_exit = 6,
-    thread_yield = 7,
-    thread_set_affinity = 8,
-    grant_perm = 9,
-    revoke_perm = 10,
-    futex_wait = 11,
-    futex_wake = 12,
-    clock_gettime = 13,
+    write,
+    mem_reserve,
+    mem_perms,
+    proc_create,
+    thread_create,
+    thread_exit,
+    thread_yield,
+    thread_set_affinity,
+    grant_perm,
+    revoke_perm,
+    futex_wait,
+    futex_wake,
+    clock_gettime,
     _,
 };
 
@@ -79,9 +78,8 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
         .mem_reserve => sysMemReserve(arg0, arg1, arg2, arg3),
         .mem_perms => ok(sysMemPerms(arg0, arg1)),
         .proc_create => ok(sysProcCreate(arg0, arg1, arg2, arg3, arg4)),
-        .proc_destroy => ok(sysProcDestroy(arg0)),
         .thread_create => ok(sysThreadCreate(arg0, arg1, arg2)),
-        .thread_exit => ok(sysThreadExit()),
+        .thread_exit => sysThreadExit(),
         .thread_yield => ok(sysThreadYield()),
         .thread_set_affinity => ok(sysThreadSetAffinity(arg0, arg1)),
         .grant_perm => ok(sysGrantPerm(arg0, arg1, arg2)),
@@ -212,19 +210,6 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, self_perms: u64, caps_ptr: u64, num
     return E_INVAL;
 }
 
-// TODO: needs Process.deinit — tear down address space, free physical pages,
-// remove threads from run queues, revoke all permissions, free kernel object
-fn sysProcDestroy(handle: u64) i64 {
-    const proc = currentProc();
-    const handle_u32: u32 = @intCast(handle);
-    const entry = proc.getPerm(handle_u32) orelse return E_BADCAP;
-
-    if (entry.object != .process) return E_INVAL;
-    if (!entry.processRights().destroy) return E_PERM;
-
-    return E_INVAL;
-}
-
 fn sysThreadCreate(entry_addr: u64, stack_addr: u64, arg: u64) i64 {
     _ = arg; // TODO: pass arg in rdi of new thread's initial register state
 
@@ -242,12 +227,16 @@ fn sysThreadCreate(entry_addr: u64, stack_addr: u64, arg: u64) i64 {
     return @intCast(thread.tid);
 }
 
-// TODO: needs Thread.deinit — remove from process thread list, free kernel stack,
-// if last thread then implicit proc_destroy on self
-fn sysThreadExit() i64 {
-    while (true) {
-        sched.yield();
-    }
+fn sysThreadExit() noreturn {
+    const thread = sched.currentThread().?;
+    const proc = thread.proc;
+
+    const last_in_proc = proc.removeThread(thread);
+    thread.state = .exited;
+    thread.last_in_proc = last_in_proc;
+
+    sched.yield();
+    unreachable;
 }
 
 fn sysThreadYield() i64 {

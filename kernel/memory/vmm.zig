@@ -70,6 +70,21 @@ pub const VirtualMemoryManager = struct {
         return aligned;
     }
 
+    pub fn removeReservation(self: *VirtualMemoryManager, vaddr: VAddr) void {
+        const irq = self.lock.lockIrqSave();
+        defer self.lock.unlockIrqRestore(irq);
+
+        for (self.vmm_reservations[0..self.vmm_reservations_idx], 0..) |*res, i| {
+            if (res.vaddr.addr == vaddr.addr) {
+                self.vmm_reservations_idx -= 1;
+                if (i < self.vmm_reservations_idx) {
+                    self.vmm_reservations[i] = self.vmm_reservations[self.vmm_reservations_idx];
+                }
+                return;
+            }
+        }
+    }
+
     pub fn reserveRange(self: *VirtualMemoryManager, size: u64, alignment: std.mem.Alignment) !VAddr {
         const irq = self.lock.lockIrqSave();
         defer self.lock.unlockIrqRestore(irq);

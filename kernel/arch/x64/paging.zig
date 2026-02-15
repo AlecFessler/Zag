@@ -236,3 +236,97 @@ pub fn mapPage(
         }
     }
 }
+
+pub fn unmapPage(
+    addr_space_root: VAddr,
+    virt: VAddr,
+    size: PageSize,
+) ?PAddr {
+    const use_physmap = physmap.contains(addr_space_root.addr);
+    var table: *[PAGE_ENTRY_TABLE_SIZE]PageEntry = @ptrFromInt(addr_space_root.addr);
+
+    const indices = [_]u9{ l4Idx(virt), l3Idx(virt), l2Idx(virt), l1Idx(virt) };
+    const sizes = [_]PageSize{ .page1g, .page2m, .page4k };
+
+    for (0..3) |i| {
+        const entry = &table[indices[i]];
+        if (!entry.present) return null;
+
+        if (size == sizes[i] and (entry.huge_page or size == .page4k)) {
+            const paddr = entry.getPAddr();
+            entry.* = DEFAULT_PAGE_ENTRY;
+            return paddr;
+        }
+
+        if (entry.huge_page) return null;
+
+        var next_virt: VAddr = undefined;
+        if (use_physmap) {
+            next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
+        } else {
+            next_virt = VAddr.fromPAddr(entry.getPAddr(), 0);
+        }
+        table = @ptrFromInt(next_virt.addr);
+    }
+
+    const entry = &table[indices[3]];
+    if (!entry.present) return null;
+    const paddr = entry.getPAddr();
+    entry.* = DEFAULT_PAGE_ENTRY;
+    return paddr;
+}
+
+pub fn freeUserAddrSpace(
+    addr_space_root: VAddr,
+    page_allocator: std.mem.Allocator,
+) void {
+    const root: *[PAGE_ENTRY_TABLE_SIZE]PageEntry = @ptrFromInt(addr_space_root.addr);
+
+    for (root[0..256]) |*l4_entry| {
+        if (!l4_entry.present) continue;
+        const l3_table = entryToTable(l4_entry);
+
+        for (l3_table) |*l3_entry| {
+            if (!l3_entry.present) continue;
+            if (l3_entry.huge_page) {
+                freePhysPage(l3_entry.getPAddr(), paging.PAGE1G, page_allocator);
+                continue;
+            }
+            const l2_table = entryToTable(l3_entry);
+
+            for (l2_table) |*l2_entry| {
+                if (!l2_entry.present) continue;
+                if (l2_entry.huge_page) {
+                    freePhysPage(l2_entry.getPAddr(), paging.PAGE2M, page_allocator);
+                    continue;
+                }
+                const l1_table = entryToTable(l2_entry);
+
+                for (l1_table) |*l1_entry| {
+                    if (!l1_entry.present) continue;
+                    freePhysPage(l1_entry.getPAddr(), paging.PAGE4K, page_allocator);
+                }
+                freeTablePage(l1_table, page_allocator);
+            }
+            freeTablePage(l2_table, page_allocator);
+        }
+        freeTablePage(l3_table, page_allocator);
+    }
+    freeTablePage(root, page_allocator);
+}
+
+fn entryToTable(entry: *const PageEntry) *[PAGE_ENTRY_TABLE_SIZE]PageEntry {
+    const virt = VAddr.fromPAddr(entry.getPAddr(), null);
+    return @ptrFromInt(virt.addr);
+}
+
+fn freePhysPage(paddr: PAddr, size: u64, page_allocator: std.mem.Allocator) void {
+    const virt = VAddr.fromPAddr(paddr, null);
+    const ptr: [*]align(paging.PAGE4K) u8 = @ptrFromInt(virt.addr);
+    page_allocator.free(ptr[0..size]);
+}
+
+fn freeTablePage(table: *[PAGE_ENTRY_TABLE_SIZE]PageEntry, page_allocator: std.mem.Allocator) void {
+    const ptr: [*]align(paging.PAGE4K) PageEntry = @alignCast(@as([*]PageEntry, @ptrCast(table)));
+    page_allocator.free(ptr[0..PAGE_ENTRY_TABLE_SIZE]);
+}
