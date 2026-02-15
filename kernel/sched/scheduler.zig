@@ -180,6 +180,11 @@ pub fn globalInit() !void {
 
 pub fn perCoreInit() void {
     const state = &core_states[arch.coreID()];
+    // Point the sentinels process at the kernel process so switchTo can read it
+    // when checking the privilege level of a thread.
+    // This means the sentinel threads won't live in the kernel processes thread list, but
+    // this is fine because the thread list exists for cleanup and these should never be cleaned up
+    state.rq.sentinel.proc = &process_mod.global_kproc;
     state.running_thread = &state.rq.sentinel;
     state.timer = arch.getInterruptTimer();
     arch.enableInterrupts();

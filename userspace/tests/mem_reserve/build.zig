@@ -1,31 +1,35 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    const target = b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = .freestanding,
+    });
     const lib_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "../../lib/lib.zig" },
-        .target = b.resolveTargetQuery(.{
-            .cpu_arch = .x86_64,
-            .os_tag = .freestanding,
-        }),
+        .target = target,
         .optimize = .ReleaseSmall,
     });
-
+    const app_mod = b.createModule(.{
+        .root_source_file = b.path("mem_reserve.zig"),
+        .target = target,
+        .optimize = .ReleaseSmall,
+    });
+    app_mod.addImport("lib", lib_mod);
+    const start_mod = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = "../../lib/start.zig" },
+        .target = target,
+        .optimize = .ReleaseSmall,
+    });
+    start_mod.addImport("lib", lib_mod);
+    start_mod.addImport("app", app_mod);
     const exe = b.addExecutable(.{
         .name = "mem_reserve",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("mem_reserve.zig"),
-            .target = b.resolveTargetQuery(.{
-                .cpu_arch = .x86_64,
-                .os_tag = .freestanding,
-            }),
-            .optimize = .ReleaseSmall,
-        }),
+        .root_module = start_mod,
         .linkage = .static,
     });
     exe.entry = .{ .symbol_name = "_start" };
     exe.setLinkerScript(.{ .cwd_relative = "linker.ld" });
-    exe.root_module.addImport("lib", lib_mod);
-
     const objcopy = b.addObjCopy(exe.getEmittedBin(), .{ .format = .bin });
     const install = b.addInstallFile(objcopy.getOutput(), "../../../bin/mem_reserve.bin");
     b.getInstallStep().dependOn(&install.step);
