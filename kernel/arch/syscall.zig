@@ -26,6 +26,11 @@ const E_TIMEOUT: i64 = -8;
 const E_AGAIN: i64 = -9;
 const E_NOENT: i64 = -10;
 
+pub const SyscallResult = struct {
+    rax: i64,
+    rdx: u64 = 0,
+};
+
 pub const SyscallNum = enum(u64) {
     write = 0,
     mem_reserve = 1,
@@ -59,24 +64,32 @@ fn validateUserPtr(ptr: u64, len: u64) bool {
         end <= address.AddrSpacePartition.user.end;
 }
 
-pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) i64 {
+fn ok(val: i64) SyscallResult {
+    return .{ .rax = val };
+}
+
+fn err(code: i64) SyscallResult {
+    return .{ .rax = code };
+}
+
+pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) SyscallResult {
     const syscall_num: SyscallNum = @enumFromInt(num);
     return switch (syscall_num) {
-        .write => sysWrite(arg0, arg1),
+        .write => ok(sysWrite(arg0, arg1)),
         .mem_reserve => sysMemReserve(arg0, arg1, arg2, arg3),
-        .mem_perms => sysMemPerms(arg0, arg1),
-        .proc_create => sysProcCreate(arg0, arg1, arg2, arg3, arg4),
-        .proc_destroy => sysProcDestroy(arg0),
-        .thread_create => sysThreadCreate(arg0, arg1, arg2),
-        .thread_exit => sysThreadExit(),
-        .thread_yield => sysThreadYield(),
-        .thread_set_affinity => sysThreadSetAffinity(arg0, arg1),
-        .grant_perm => sysGrantPerm(arg0, arg1, arg2),
-        .revoke_perm => sysRevokePerm(arg0),
-        .futex_wait => sysFutexWait(arg0, arg1, arg2),
-        .futex_wake => sysFutexWake(arg0, arg1),
-        .clock_gettime => sysClockGettime(),
-        _ => E_INVAL,
+        .mem_perms => ok(sysMemPerms(arg0, arg1)),
+        .proc_create => ok(sysProcCreate(arg0, arg1, arg2, arg3, arg4)),
+        .proc_destroy => ok(sysProcDestroy(arg0)),
+        .thread_create => ok(sysThreadCreate(arg0, arg1, arg2)),
+        .thread_exit => ok(sysThreadExit()),
+        .thread_yield => ok(sysThreadYield()),
+        .thread_set_affinity => ok(sysThreadSetAffinity(arg0, arg1)),
+        .grant_perm => ok(sysGrantPerm(arg0, arg1, arg2)),
+        .revoke_perm => ok(sysRevokePerm(arg0)),
+        .futex_wait => ok(sysFutexWait(arg0, arg1, arg2)),
+        .futex_wake => ok(sysFutexWake(arg0, arg1)),
+        .clock_gettime => ok(sysClockGettime()),
+        _ => err(E_INVAL),
     };
 }
 
@@ -90,47 +103,39 @@ fn sysWrite(buf_ptr: u64, buf_len: u64) i64 {
 // mem_reserve(hint, size, max_perms_bits, shared)
 //   shared = 0: anonymous demand-paged VmReservation
 //   shared = 1: eagerly-paged SharedMemory object
-// Returns: permission table handle or error
-fn sysMemReserve(hint: u64, size: u64, max_perms_bits: u64, shared_flag: u64) i64 {
-    _ = hint; // TODO: hint path not implemented, kernel always chooses address
-
-    if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) return E_INVAL;
-
+// Returns: rax = permission table handle (or error), rdx = vaddr (for anonymous)
+fn sysMemReserve(hint: u64, size: u64, max_perms_bits: u64, shared_flag: u64) SyscallResult {
+    _ = hint;
+    if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) return err(E_INVAL);
     const proc = currentProc();
-    const self_entry = proc.getPerm(0) orelse return E_PERM;
-    if (!self_entry.processRights().mem_reserve) return E_PERM;
-
+    const self_entry = proc.getPerm(0) orelse return err(E_PERM);
+    if (!self_entry.processRights().mem_reserve) return err(E_PERM);
     if (shared_flag == 1) {
-        const shm = SharedMemory.create(size) catch return E_NOMEM;
-
+        const shm = SharedMemory.create(size) catch return err(E_NOMEM);
         const shm_entry = PermissionEntry{
             .object = .{ .shared_memory = shm },
             .rights = @truncate(max_perms_bits),
         };
         const handle = proc.insertPerm(shm_entry) catch {
             shm.decRef();
-            return E_MAXCAP;
+            return err(E_MAXCAP);
         };
-
-        return @intCast(handle);
+        // shm doesn't have a vaddr until mapped via mem_perms
+        return ok(@intCast(handle));
     } else {
         const requested_rights: VmReservationRights = @bitCast(@as(u8, @truncate(max_perms_bits)));
-
         const vaddr = proc.vmm.reserve(
             size,
             paging.pageAlign(.page4k),
             requested_rights,
-        ) catch return E_NOMEM;
-
-        const res = proc.vmm.findReservation(vaddr) orelse return E_NOMEM;
-
+        ) catch return err(E_NOMEM);
+        const res = proc.vmm.findReservation(vaddr) orelse return err(E_NOMEM);
         const res_entry = PermissionEntry{
             .object = .{ .vm_reservation = res },
             .rights = @truncate(max_perms_bits),
         };
-        const handle = proc.insertPerm(res_entry) catch return E_MAXCAP;
-
-        return @intCast(handle);
+        const handle = proc.insertPerm(res_entry) catch return err(E_MAXCAP);
+        return .{ .rax = @intCast(handle), .rdx = vaddr.addr };
     }
 }
 

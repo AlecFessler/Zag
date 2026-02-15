@@ -151,9 +151,12 @@ pub fn globalInit() !void {
         state.rq.init();
     }
 
-    const user_proc = try Process.createUserProcess(embedded.hello_world);
-    const user_thread = user_proc.threads[0];
-    core_states[0].rq.enqueue(user_thread);
+    // NOTE: DEBUG TESTING
+    const hello_world_proc = try Process.createUserProcess(embedded.hello_world);
+    core_states[0].rq.enqueue(hello_world_proc.threads[0]);
+
+    const mem_reserve_proc = try Process.createUserProcess(embedded.mem_reserve);
+    core_states[0].rq.enqueue(mem_reserve_proc.threads[0]);
 
     initialized = true;
 }

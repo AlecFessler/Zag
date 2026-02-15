@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const lib_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "../lib/lib.zig" },
+        .root_source_file = .{ .cwd_relative = "../../lib/lib.zig" },
         .target = b.resolveTargetQuery(.{
             .cpu_arch = .x86_64,
             .os_tag = .freestanding,
@@ -11,9 +11,9 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "hello_world",
+        .name = "mem_reserve",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("hello_world.zig"),
+            .root_source_file = b.path("mem_reserve.zig"),
             .target = b.resolveTargetQuery(.{
                 .cpu_arch = .x86_64,
                 .os_tag = .freestanding,
@@ -27,6 +27,6 @@ pub fn build(b: *std.Build) void {
     exe.root_module.addImport("lib", lib_mod);
 
     const objcopy = b.addObjCopy(exe.getEmittedBin(), .{ .format = .bin });
-    const install = b.addInstallFile(objcopy.getOutput(), "../../bin/hello_world.bin");
+    const install = b.addInstallFile(objcopy.getOutput(), "../../../bin/mem_reserve.bin");
     b.getInstallStep().dependOn(&install.step);
 }
