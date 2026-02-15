@@ -35,13 +35,11 @@ pub fn pageFaultHandler(ctx: PageFaultContext) void {
         @panic("Page fault prior to pmm initialization");
     }
     const pmm_iface = pmm.global_pmm.?.allocator();
-
     const faulting_page_virt = VAddr.fromInt(std.mem.alignBackward(
         u64,
         ctx.faulting_virt.addr,
         @intFromEnum(paging.PageSize.page4k),
     ));
-
     if (ctx.present) {
         if (ctx.fetch) {
             @panic("Invalid instruction fetch on present page");
@@ -49,7 +47,6 @@ pub fn pageFaultHandler(ctx: PageFaultContext) void {
             @panic("Invalid write on present page");
         }
     }
-
     const kspace_res = process.global_kproc.vmm.findReservation(ctx.faulting_virt);
     const uspace_res: ?*VmReservation = blk: {
         if (sched.initialized) {
@@ -59,10 +56,8 @@ pub fn pageFaultHandler(ctx: PageFaultContext) void {
         }
         break :blk null;
     };
-
     const res = kspace_res orelse uspace_res orelse
         @panic("Page fault in unreserved address space");
-
     const page_perms: MemoryPerms = .{
         .write_perm = if (res.rights.write) .write else .no_write,
         .execute_perm = if (res.rights.execute) .execute else .no_execute,
@@ -70,14 +65,11 @@ pub fn pageFaultHandler(ctx: PageFaultContext) void {
         .global_perm = if (kspace_res != null) .global else .not_global,
         .privilege_perm = if (kspace_res != null) .kernel else .user,
     };
-
     const phys_page = pmm_iface.create(paging.PageMem(.page4k)) catch @panic("PMM OOM!");
     const phys_page_virt = VAddr.fromInt(@intFromPtr(phys_page));
     const phys_page_phys = PAddr.fromVAddr(phys_page_virt, null);
-
     const addr_space_root_phys = arch.getAddrSpaceRoot();
     const addr_space_root_virt = VAddr.fromPAddr(addr_space_root_phys, null);
-
     arch.mapPage(
         addr_space_root_virt,
         phys_page_phys,

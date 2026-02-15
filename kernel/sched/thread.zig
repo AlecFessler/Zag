@@ -56,10 +56,10 @@ pub const Thread = struct {
         thread.core_affinity = affinity;
 
         const pmm_iface = pmm.global_pmm.?.allocator();
-        const kstack_page = try pmm_iface.create(paging.PageMem(.page4k));
-        errdefer pmm_iface.destroy(kstack_page);
-        const kstack_virt = VAddr.fromInt(@intFromPtr(kstack_page));
-        const kstack_base = kstack_virt.addr + paging.PAGE4K;
+        const KSTACK_PAGES = 4;
+        const kstack = try pmm_iface.alignedAlloc(u8, paging.pageAlign(.page4k), paging.PAGE4K * KSTACK_PAGES);
+        const kstack_virt = VAddr.fromInt(@intFromPtr(kstack.ptr));
+        const kstack_base = kstack_virt.addr + (paging.PAGE4K * KSTACK_PAGES);
         thread.kstack_base = address.alignStack(VAddr.fromInt(kstack_base));
 
         if (proc.privilege == .user) {

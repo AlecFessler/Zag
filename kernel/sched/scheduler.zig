@@ -152,6 +152,7 @@ pub fn globalInit() !void {
     }
 
     // NOTE: DEBUG TESTING
+
     const hello_world_proc = try Process.createUserProcess(embedded.hello_world);
     core_states[0].rq.enqueue(hello_world_proc.threads[0]);
 

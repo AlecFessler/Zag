@@ -10,7 +10,7 @@ const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
 const VAddr = zag.memory.address.VAddr;
 
-const PageEntry = packed struct(u64) {
+pub const PageEntry = packed struct(u64) {
     present: bool = false,
     writable: bool = false,
     user_accessible: bool = false,

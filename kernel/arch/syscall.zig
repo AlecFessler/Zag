@@ -120,7 +120,6 @@ fn sysMemReserve(hint: u64, size: u64, max_perms_bits: u64, shared_flag: u64) Sy
             shm.decRef();
             return err(E_MAXCAP);
         };
-        // shm doesn't have a vaddr until mapped via mem_perms
         return ok(@intCast(handle));
     } else {
         const requested_rights: VmReservationRights = @bitCast(@as(u8, @truncate(max_perms_bits)));

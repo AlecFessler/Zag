@@ -11,6 +11,7 @@ const interruptHandler = idt.interruptHandler;
 
 const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
 const PAddr = zag.memory.address.PAddr;
+const PageEntry = zag.arch.x64.paging.PageEntry; // NOTE: DEBUG
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
@@ -115,6 +116,7 @@ pub fn switchTo(thread: *Thread) void {
         gdt.coreTss(apic.coreID()).rsp0 = thread.kstack_base.addr;
         const new_addr_space_root_phys = PAddr.fromVAddr(thread.proc.addr_space_root, null);
         arch.swapAddrSpace(new_addr_space_root_phys);
+        std.debug.assert(arch.getAddrSpaceRoot().addr == new_addr_space_root_phys.addr);
     }
     apic.endOfInterrupt();
     asm volatile (
