@@ -330,11 +330,7 @@ pub fn updatePagePerms(
     l1_entry.write_through = new_perms.cache_perm == .write_through;
     l1_entry.user_accessible = new_perms.privilege_perm == .user;
 
-    asm volatile ("invlpg (%[addr])"
-        :
-        : [addr] "r" (virt.addr),
-        : "memory"
-    );
+    cpu.invlpg(virt.addr);
 }
 
 pub fn resolveVaddr(
