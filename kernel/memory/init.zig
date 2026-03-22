@@ -68,8 +68,10 @@ pub fn init(firmware_mmap: MMap) !void {
     const bump_alloc_iface: std.mem.Allocator = bump_allocator.allocator();
 
     const addr_space_root_phys = arch.getAddrSpaceRoot();
+    kernel_addr_space_root = addr_space_root_phys;
     const addr_space_root_id_virt = VAddr.fromPAddr(addr_space_root_phys, 0);
 
+    var physmap_page_count: u64 = 0;
     for (mmap) |entry| {
         if (entry.type != .free and entry.type != .acpi) continue;
 
@@ -104,6 +106,7 @@ pub fn init(firmware_mmap: MMap) !void {
             );
 
             current_phys.addr += @intFromEnum(chosen_size);
+            physmap_page_count += 1;
         }
     }
 
@@ -116,7 +119,6 @@ pub fn init(firmware_mmap: MMap) !void {
     bump_allocator.end_addr = bump_alloc_end_virt.addr;
 
     arch.dropIdentityMapping();
-
     const buddy_alloc_start_virt = VAddr.fromPAddr(
         PAddr.fromInt(std.mem.alignForward(u64, smallest_addr_region.start_paddr, paging.PAGE4K)),
         null,
@@ -185,8 +187,6 @@ pub fn init(firmware_mmap: MMap) !void {
 
     shared.slab_allocator_instance = try shared.SharedMemoryAllocator.init(shm_slab_bump.allocator());
     shared.allocator = shared.slab_allocator_instance.allocator();
-
-    kernel_addr_space_root = addr_space_root_phys;
 }
 
 pub fn initHeap() !void {

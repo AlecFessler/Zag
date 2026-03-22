@@ -46,12 +46,28 @@ export fn kTrampoline(boot_info: *BootInfo) noreturn {
 
 fn kMain(boot_info: *BootInfo) !void {
     arch.init();
+    arch.print("[1] arch.init done\n", .{});
+
     try memory.init(boot_info.mmap);
+    arch.print("[2] memory.init done\n", .{});
+
     try memory.initHeap();
+    arch.print("[3] memory.initHeap done\n", .{});
+
     _ = try debug.info.init(boot_info.elf_blob, memory.heap_allocator);
+    arch.print("[4] debug.info.init done\n", .{});
+
     try arch.parseFirmwareTables(boot_info.xsdp_phys);
+    arch.print("[5] parseFirmwareTables done\n", .{});
+
     try sched.globalInit();
+    arch.print("[6] sched.globalInit done\n", .{});
+
     try arch.smpInit();
+    arch.print("[7] smpInit done\n", .{});
+
     sched.perCoreInit();
+    arch.print("[8] perCoreInit done -- should not reach here\n", .{});
+
     arch.halt();
 }

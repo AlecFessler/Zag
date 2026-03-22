@@ -9,10 +9,12 @@ const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
+const pmm = zag.memory.pmm;
 const sched = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
 const timers = zag.arch.x64.timers;
 
+const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
 
@@ -27,6 +29,14 @@ const TrampolineParams = extern struct {
 const TRAMPOLINE_PHYS: u64 = 0x8000;
 const TRAMPOLINE_VECTOR: u8 = @intCast(TRAMPOLINE_PHYS >> 12);
 const params_offset = trampoline_code.len - @sizeOf(TrampolineParams);
+
+const KERNEL_PERMS = MemoryPerms{
+    .write_perm = .write,
+    .execute_perm = .no_execute,
+    .cache_perm = .write_back,
+    .global_perm = .global,
+    .privilege_perm = .kernel,
+};
 
 var cores_online: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
 
@@ -59,13 +69,26 @@ pub fn smpInit() !void {
     params.entry_point = @intFromPtr(&coreInit);
 
     const bsp_id = apic.rawApicId();
+
+    const pmm_iface = pmm.global_pmm.?.allocator();
     var hpet = &timers.hpet_timer;
     const hpet_iface = hpet.timer();
 
     for (apic.lapics.?) |la| {
-        if (la.apic_id == bsp_id) continue;
+        if (la.apic_id == bsp_id) {
+            continue;
+        }
 
         const ap_stack = try stack_mod.createKernel();
+
+        const top_page_base = VAddr.fromInt(
+            std.mem.alignBackward(u64, ap_stack.top.addr - 1, paging.PAGE4K),
+        );
+        const kpage = try pmm_iface.create(paging.PageMem(.page4k));
+        @memset(std.mem.asBytes(kpage), 0);
+        const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
+        try arch.mapPage(memory_init.kernel_addr_space_root, kphys, top_page_base, KERNEL_PERMS);
+
         params.stack_top = zag.memory.address.alignStack(ap_stack.top).addr;
 
         const expected = cores_online.load(.acquire);
@@ -81,7 +104,10 @@ pub fn smpInit() !void {
         const timeout = hpet_iface.now();
         while (cores_online.load(.acquire) == expected) {
             if (hpet_iface.now() - timeout > 100_000_000) {
-                arch.print("AP {} failed to start\n", .{la.apic_id});
+                if (arch.unmapPage(memory_init.kernel_addr_space_root, top_page_base)) |paddr| {
+                    const pg: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
+                    pmm_iface.destroy(pg);
+                }
                 stack_mod.destroyKernel(ap_stack, memory_init.kernel_addr_space_root);
                 break;
             }

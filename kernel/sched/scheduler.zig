@@ -173,12 +173,29 @@ pub fn globalInit() !void {
     }, null);
     core_states[0].rq.enqueue(hello_world_proc.threads[0]);
 
+    const mem_reserve_proc = try Process.create(embedded.mem_reserve, .{
+        .destroy = true,
+        .spawn_thread = true,
+        .spawn_process = true,
+        .mem_reserve = true,
+        .set_affinity = true,
+    }, null);
+    core_states[0].rq.enqueue(mem_reserve_proc.threads[0]);
+
+    const thread_create_proc = try Process.create(embedded.thread_create, .{
+        .destroy = true,
+        .spawn_thread = true,
+        .spawn_process = true,
+        .mem_reserve = true,
+        .set_affinity = true,
+    }, null);
+    core_states[0].rq.enqueue(thread_create_proc.threads[0]);
+
     initialized = true;
 }
 
 pub fn perCoreInit() void {
     const state = &core_states[arch.coreID()];
-    state.rq.init();
     state.running_thread = &state.rq.sentinel;
     state.timer = arch.getPreemptionTimer();
     arch.enableInterrupts();
