@@ -35,6 +35,7 @@ pub const SyscallResult = struct {
 };
 
 pub const SyscallNum = enum(u64) {
+    write,
     vm_reserve,
     vm_perms,
     shm_create,
@@ -76,6 +77,7 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
     _ = arg4;
     const syscall_num: SyscallNum = @enumFromInt(num);
     return switch (syscall_num) {
+        .write => sysWrite(arg0, arg1),
         .vm_reserve => sysVmReserve(arg0, arg1, arg2),
         .vm_perms => ok(sysVmPerms(arg0, arg1, arg2, arg3)),
         .shm_create => ok(sysShmCreate(arg0)),
@@ -91,11 +93,19 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
         .grant_perm => ok(sysGrantPerm(arg0, arg1, arg2)),
         .revoke_perm => ok(sysRevokePerm(arg0)),
         .disable_restart => ok(sysDisableRestart()),
-        .futex_wait => ok(sysFutexWait(arg0, arg1, arg2)),
+        .futex_wait => ok(sysFutexWait(arg0, arg1)),
         .futex_wake => ok(sysFutexWake(arg0, arg1)),
         .clock_gettime => ok(sysClockGettime()),
         _ => err(E_INVAL),
     };
+}
+
+fn sysWrite(ptr: u64, len: u64) SyscallResult {
+    if (len == 0) return ok(0);
+    if (len > 4096) return err(E_INVAL);
+    const msg: []const u8 = @as([*]const u8, @ptrFromInt(ptr))[0..len];
+    arch.print("{s}", .{msg});
+    return ok(@intCast(len));
 }
 
 fn sysVmReserve(hint: u64, size: u64, max_perms_bits: u64) SyscallResult {
@@ -139,7 +149,10 @@ fn sysVmPerms(vm_handle: u64, offset: u64, size: u64, perms_bits: u64) i64 {
     const vm_res = entry.object.vm_reservation;
 
     const new_rwx = @as(u8, @truncate(perms_bits)) & 0b111;
-    const max_rwx = entry.rights & 0b111;
+    const max_rwx =
+        @as(u8, @intFromBool(vm_res.max_rights.read)) |
+        (@as(u8, @intFromBool(vm_res.max_rights.write)) << 1) |
+        (@as(u8, @intFromBool(vm_res.max_rights.execute)) << 2);
     if (!isSubset(new_rwx, max_rwx)) return E_PERM;
 
     const range_end = std.math.add(u64, offset, size) catch return E_INVAL;
@@ -161,8 +174,6 @@ fn sysShmCreate(size: u64) i64 {
     if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) return E_INVAL;
 
     const proc = currentProc();
-    const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
-    if (!self_entry.processRights().shm_create) return E_PERM;
 
     const shm = SharedMemory.create(size) catch return E_NOMEM;
 
@@ -195,7 +206,8 @@ fn sysShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
 
     const shm = shm_entry.object.shared_memory;
     const shm_rwx = shm_entry.rights & 0b111;
-    const max_rwx = vm_res.max_rights.read |
+    const max_rwx =
+        @as(u8, @intFromBool(vm_res.max_rights.read)) |
         (@as(u8, @intFromBool(vm_res.max_rights.write)) << 1) |
         (@as(u8, @intFromBool(vm_res.max_rights.execute)) << 2);
     if (!isSubset(shm_rwx, max_rwx)) return E_PERM;
@@ -249,7 +261,7 @@ fn sysMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
 
     const device_entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
     if (device_entry.object != .device_region) return E_BADCAP;
-    if (!device_entry.deviceRights().map) return E_PERM;
+    if (!device_entry.deviceRights().grant) return E_PERM;
 
     const vm_entry = proc.getPermByHandle(vm_handle) orelse return E_BADCAP;
     if (vm_entry.object != .vm_reservation) return E_BADCAP;
@@ -302,19 +314,18 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms: u64) i64 {
     if (!self_entry.processRights().spawn_process) return E_PERM;
 
     const child_perms: ProcessRights = @bitCast(@as(u8, @truncate(perms)));
-    if (child_perms.restart and !self_entry.processRights().restart) return E_PERM;
 
     const elf_bytes: [*]const u8 = @ptrFromInt(elf_ptr);
     const elf_binary = elf_bytes[0..elf_len];
 
     const child = Process.create(elf_binary, child_perms, proc) catch |e| return switch (e) {
-        error.InvalidElf => E_INVAL,
+        error.BinaryTooLarge => E_INVAL,
         else => E_NOMEM,
     };
 
     const child_entry = PermissionEntry{
         .handle = 0,
-        .object = .{ .process = .{ .child = child } },
+        .object = .{ .process = child },
         .rights = @truncate(perms),
     };
     const handle_id = proc.insertPerm(child_entry) catch {
@@ -322,6 +333,7 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms: u64) i64 {
         return E_MAXCAP;
     };
 
+    sched.enqueueOnCore(arch.coreID(), child.threads[0]);
     return @intCast(handle_id);
 }
 
@@ -335,7 +347,7 @@ fn sysThreadCreate(entry_addr: u64, arg: u64, num_stack_pages_u64: u64) i64 {
     const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
     if (!self_entry.processRights().spawn_thread) return E_PERM;
 
-    const thread = Thread.create(proc, entry_addr, arg, num_stack_pages) catch |e| return switch (e) {
+    const thread = Thread.create(proc, VAddr.fromInt(entry_addr), arg, num_stack_pages) catch |e| return switch (e) {
         error.MaxThreads => E_MAXTHREAD,
         else => E_NOMEM,
     };
@@ -348,8 +360,6 @@ fn sysThreadExit() noreturn {
     const thread = sched.currentThread().?;
     thread.state = .exited;
     sched.yield();
-    // Self-IPI is async and interrupts may be masked inside the syscall handler.
-    // Spin with interrupts enabled until the scheduler preempts us.
     while (true) {
         arch.enableInterrupts();
         asm volatile ("hlt");
@@ -384,7 +394,7 @@ fn sysGrantPerm(src_handle: u64, target_proc_handle: u64, granted_rights: u64) i
     if (target_entry.object != .process) return E_BADCAP;
     if (!target_entry.processRights().grant_to) return E_PERM;
 
-    const target_proc = target_entry.object.process.child;
+    const target_proc = target_entry.object.process;
 
     switch (src_entry.object) {
         .shared_memory => |shm| {
@@ -406,7 +416,6 @@ fn sysGrantPerm(src_handle: u64, target_proc_handle: u64, granted_rights: u64) i
         .device_region => |device| {
             if (!src_entry.deviceRights().grant) return E_PERM;
             if (!isSubset(granted_u8, src_entry.rights)) return E_PERM;
-            if (!target_entry.processRights().device_own) return E_PERM;
 
             const new_entry = PermissionEntry{
                 .handle = 0,
@@ -429,21 +438,21 @@ fn sysRevokePerm(handle: u64) i64 {
 
     switch (entry.object) {
         .vm_reservation => |vm_res| {
-            proc.vmm.revokeReservation(vm_res.original_start, vm_res.original_size, proc.addr_space_root) catch {};
+            proc.vmm.revokeReservation(vm_res.original_start, vm_res.original_size) catch {};
             proc.removePerm(handle) catch {};
         },
         .shared_memory => |shm| {
-            proc.vmm.revokeShmHandle(shm, proc.addr_space_root);
+            proc.vmm.revokeShmHandle(shm);
             shm.decRef();
             proc.removePerm(handle) catch {};
         },
         .device_region => |device| {
-            proc.vmm.revokeMmioHandle(device, proc.addr_space_root);
+            proc.vmm.revokeMmioHandle(device);
             returnDeviceHandleUpTree(proc, entry.rights, device);
             proc.removePerm(handle) catch {};
         },
-        .process => |proc_entry| {
-            proc_entry.child.kill();
+        .process => |child| {
+            child.kill();
             proc.removePerm(handle) catch {};
         },
         .empty => return E_BADCAP,
@@ -459,14 +468,14 @@ fn sysDisableRestart() i64 {
     return E_OK;
 }
 
-fn sysFutexWait(addr: u64, expected: u64, timeout_ns: u64) i64 {
+fn sysFutexWait(addr: u64, expected: u64) i64 {
     if (!std.mem.isAligned(addr, 8)) return E_INVAL;
 
     const proc = currentProc();
     const vaddr = VAddr.fromInt(addr);
     const paddr = arch.resolveVaddr(proc.addr_space_root, vaddr) orelse return E_BADADDR;
 
-    return futex.wait(paddr, expected, timeout_ns, sched.currentThread().?);
+    return futex.wait(paddr, @truncate(expected), sched.currentThread().?);
 }
 
 fn sysFutexWake(addr: u64, count: u64) i64 {
@@ -476,7 +485,7 @@ fn sysFutexWake(addr: u64, count: u64) i64 {
     const vaddr = VAddr.fromInt(addr);
     const paddr = arch.resolveVaddr(proc.addr_space_root, vaddr) orelse return E_BADADDR;
 
-    return @intCast(futex.wake(paddr, count));
+    return @intCast(futex.wake(paddr, @truncate(count)));
 }
 
 fn sysClockGettime() i64 {

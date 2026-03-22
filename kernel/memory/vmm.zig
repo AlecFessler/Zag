@@ -10,6 +10,7 @@ const slab_mod = zag.memory.slab_allocator;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
+const PrivilegePerm = zag.perms.privilege.PrivilegePerm;
 const SharedMemory = zag.memory.shared.SharedMemory;
 const SpinLock = zag.sched.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
@@ -100,6 +101,7 @@ pub const VirtualMemoryManager = struct {
         defer self.lock.unlock();
 
         while (self.tree.root != null) {
+            // tree.root is ?*Tree.Node — removeFromPtr takes *Tree.Node, correct here
             const vm_node = self.tree.removeFromPtr(self.tree.root.?);
             unmapNodePages(vm_node, self.addr_space_root, true);
             freeVmNode(vm_node);
@@ -212,7 +214,7 @@ pub const VirtualMemoryManager = struct {
         };
 
         self.tree.insert(stack_node) catch |e| {
-            _ = self.tree.removeFromPtr(guard_node);
+            _ = self.tree.remove(guard_node) catch {};
             freeVmNode(guard_node);
             freeVmNode(stack_node);
             return e;
@@ -230,12 +232,12 @@ pub const VirtualMemoryManager = struct {
         defer self.lock.unlock();
 
         if (findNodeLocked(&self.tree, stack.guard)) |guard_node| {
-            _ = self.tree.removeFromPtr(guard_node);
+            _ = self.tree.remove(guard_node) catch {};
             freeVmNode(guard_node);
         }
         if (findNodeLocked(&self.tree, stack.base)) |stack_node| {
             unmapNodePages(stack_node, self.addr_space_root, true);
-            _ = self.tree.removeFromPtr(stack_node);
+            _ = self.tree.remove(stack_node) catch {};
             freeVmNode(stack_node);
         }
     }
@@ -361,7 +363,7 @@ pub const VirtualMemoryManager = struct {
                 while (j < i) : (j += 1) {
                     _ = arch.unmapPage(self.addr_space_root, VAddr.fromInt(range_start.addr + @as(u64, j) * paging.PAGE4K));
                 }
-                _ = self.tree.removeFromPtr(map_node);
+                _ = self.tree.remove(map_node) catch {};
                 freeVmNode(map_node);
                 return error.OutOfMemory;
             };
@@ -385,7 +387,7 @@ pub const VirtualMemoryManager = struct {
 
         const map_node = inOrderFind(&self.tree, struct {
             target: *SharedMemory,
-            fn match(ctx: *@This(), node: *VmNode) bool {
+            fn match(ctx: *const @This(), node: *VmNode) bool {
                 return node.kind == .shared_memory and node.kind.shared_memory == ctx.target;
             }
         }{ .target = shm }) orelse return error.NotFound;
@@ -394,7 +396,7 @@ pub const VirtualMemoryManager = struct {
 
         const old_start = map_node.start;
         const old_size = map_node.size;
-        _ = self.tree.removeFromPtr(map_node);
+        _ = self.tree.remove(map_node) catch {};
         freeVmNode(map_node);
 
         const replacement = try allocVmNode();
@@ -451,7 +453,7 @@ pub const VirtualMemoryManager = struct {
         const perms = MemoryPerms{
             .write_perm = .write,
             .execute_perm = .no_execute,
-            .cache_perm = .uncacheable,
+            .cache_perm = .not_cacheable,
             .global_perm = .not_global,
             .privilege_perm = .user,
         };
@@ -465,7 +467,7 @@ pub const VirtualMemoryManager = struct {
                 while (undo < mapped) : (undo += paging.PAGE4K) {
                     _ = arch.unmapPage(self.addr_space_root, VAddr.fromInt(range_start.addr + undo));
                 }
-                _ = self.tree.removeFromPtr(map_node);
+                _ = self.tree.remove(map_node) catch {};
                 freeVmNode(map_node);
                 return error.OutOfMemory;
             };
@@ -489,7 +491,7 @@ pub const VirtualMemoryManager = struct {
 
         const map_node = inOrderFind(&self.tree, struct {
             target: *DeviceRegion,
-            fn match(ctx: *@This(), node: *VmNode) bool {
+            fn match(ctx: *const @This(), node: *VmNode) bool {
                 return node.kind == .mmio and node.kind.mmio == ctx.target;
             }
         }{ .target = device }) orelse return error.NotFound;
@@ -498,7 +500,7 @@ pub const VirtualMemoryManager = struct {
 
         const old_start = map_node.start;
         const old_size = map_node.size;
-        _ = self.tree.removeFromPtr(map_node);
+        _ = self.tree.remove(map_node) catch {};
         freeVmNode(map_node);
 
         const replacement = try allocVmNode();
@@ -543,7 +545,7 @@ pub const VirtualMemoryManager = struct {
         for (to_remove[0..remove_count]) |node| {
             const free_phys = node.kind == .private;
             unmapNodePages(node, self.addr_space_root, free_phys);
-            _ = self.tree.removeFromPtr(node);
+            _ = self.tree.remove(node) catch {};
             freeVmNode(node);
         }
     }
@@ -671,7 +673,7 @@ fn removeRange(tree: *VmTree, range_start: VAddr, range_end_addr: u64) !void {
     tree.forEachInRange(&s, &e, &ctx, Ctx.cb);
 
     for (to_remove[0..count]) |node| {
-        _ = tree.removeFromPtr(node);
+        _ = tree.remove(node) catch {};
         freeVmNode(node);
     }
 }
@@ -712,7 +714,7 @@ fn updateCommittedPages(
     node: *VmNode,
     addr_space_root: PAddr,
     rights: PageRights,
-    privilege: zag.perms.memory.PrivilegePerm,
+    privilege: PrivilegePerm,
 ) void {
     const perms = rightsToMemPerms(rights, privilege);
     var page_addr = node.start.addr;
@@ -724,7 +726,7 @@ fn updateCommittedPages(
     }
 }
 
-fn rightsToMemPerms(rights: PageRights, privilege: zag.perms.memory.PrivilegePerm) MemoryPerms {
+fn rightsToMemPerms(rights: PageRights, privilege: PrivilegePerm) MemoryPerms {
     return .{
         .write_perm = if (rights.write) .write else .no_write,
         .execute_perm = if (rights.execute) .execute else .no_execute,

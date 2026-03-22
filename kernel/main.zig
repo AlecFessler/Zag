@@ -47,10 +47,9 @@ export fn kTrampoline(boot_info: *BootInfo) noreturn {
 fn kMain(boot_info: *BootInfo) !void {
     arch.init();
     try memory.init(boot_info.mmap);
-    var heap_allocator = try memory.getHeapAllocator();
-    const heap_allocator_iface = heap_allocator.allocator();
-    _ = try debug.info.init(boot_info.elf_blob, heap_allocator_iface);
-    try arch.parseAcpi(boot_info.xsdp_phys);
+    try memory.initHeap();
+    _ = try debug.info.init(boot_info.elf_blob, memory.heap_allocator);
+    try arch.parseFirmwareTables(boot_info.xsdp_phys);
     try sched.globalInit();
     try arch.smpInit();
     sched.perCoreInit();

@@ -1,6 +1,6 @@
 const zag = @import("zag");
 
-const PrivilegePerm = zag.perms.privilege.PrivilegePerm;
+pub const PrivilegePerm = zag.perms.privilege.PrivilegePerm;
 
 pub const WritePerm = enum(u1) {
     no_write,

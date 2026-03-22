@@ -5,6 +5,8 @@ const paging = zag.memory.paging;
 const elf = std.elf;
 const Dwarf = std.debug.Dwarf;
 
+const VAddr = zag.memory.address.VAddr;
+
 pub const ElfSection = enum {
     text,
     rodata,
@@ -21,7 +23,7 @@ pub const Section = struct {
 
 pub const ParsedElf = struct {
     bytes: []u8,
-    entry: u64,
+    entry: VAddr,
     sections: [@intFromEnum(ElfSection.num_sections)]Section,
     dwarf: Dwarf,
 };
@@ -33,7 +35,7 @@ pub fn parseElf(result: *ParsedElf, bytes: []u8) !void {
     var rd = std.Io.Reader.fixed(bytes[0..hdr_sz]);
     const elf_hdr = try elf.Header.read(&rd);
 
-    result.entry = elf_hdr.entry;
+    result.entry = VAddr.fromInt(elf_hdr.entry);
     result.dwarf = .{
         .endian = elf_hdr.endian,
         .is_macho = false,

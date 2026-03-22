@@ -3,8 +3,8 @@ const zag = @import("zag");
 
 const apic = zag.arch.x64.apic;
 const arch = zag.arch.dispatch;
+const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
-const pmm = zag.memory.pmm;
 const timers = zag.arch.x64.timers;
 
 const MemoryPerms = zag.perms.memory.MemoryPerms;
@@ -335,11 +335,6 @@ pub fn decodeMadt(e: Madt.Entry) AnyMadt {
 }
 
 pub fn parseAcpi(xsdp_phys: PAddr) !void {
-    const addr_space_root_phys = arch.getAddrSpaceRoot();
-    const addr_space_root_virt = VAddr.fromPAddr(addr_space_root_phys, null);
-
-    const pmm_iface = pmm.global_pmm.?.allocator();
-
     const xsdp_virt = VAddr.fromPAddr(xsdp_phys, null);
     const xsdp = Xsdp.fromVAddr(xsdp_virt);
     try xsdp.validate();
@@ -393,12 +388,10 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
             };
 
             try arch.mapPage(
-                addr_space_root_virt,
+                memory_init.kernel_addr_space_root,
                 lapic_phys,
                 lapic_virt,
-                .page4k,
                 mmio_perms,
-                pmm_iface,
             );
 
             apic.init(lapic_virt);
@@ -420,12 +413,10 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
             };
 
             try arch.mapPage(
-                addr_space_root_virt,
+                memory_init.kernel_addr_space_root,
                 hpet_phys,
                 hpet_virt,
-                .page4k,
                 mmio_perms,
-                pmm_iface,
             );
 
             timers.hpet_timer = timers.Hpet.init(hpet_virt);

@@ -151,6 +151,7 @@ pub const Process = struct {
 
         if (self.restart_context) |rc| restart_context_mod.destroy(rc);
 
+        self.vmm.deinit();
         arch.freeUserAddrSpace(self.addr_space_root);
 
         const pmm_iface = pmm.global_pmm.?.allocator();

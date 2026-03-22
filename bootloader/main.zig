@@ -24,8 +24,6 @@ pub fn main() uefi.Status {
     const boot_services: *uefi.tables.BootServices = uefi.system_table.boot_services orelse return .aborted;
     uefi.system_table.con_out.?.clearScreen() catch return .aborted;
 
-    // by using acpi reclaim memory, we ensure that the kernel will physmap these addresses,
-    // but it will not give them to the buddy allocator as available memory
     var page_alloc = PageAllocator.init(boot_services, .acpi_reclaim_memory);
     const page_alloc_iface = page_alloc.allocator();
 
@@ -44,7 +42,6 @@ pub fn main() uefi.Status {
     const identity_mapping = 0;
     const new_addr_space_root_virt = VAddr.fromPAddr(new_addr_space_root_phys, identity_mapping);
 
-    // physmap the address space root for the kernel, won't be used in the bootloader
     const new_addr_space_root_virt_physmapped = VAddr.fromPAddr(new_addr_space_root_phys, null);
     const addr_space_root_perms: MemoryPerms = .{
         .write_perm = .write,
@@ -53,7 +50,7 @@ pub fn main() uefi.Status {
         .global_perm = .global,
         .privilege_perm = .kernel,
     };
-    arch.mapPage(
+    arch.mapPageBoot(
         new_addr_space_root_virt,
         new_addr_space_root_phys,
         new_addr_space_root_virt_physmapped,
@@ -134,7 +131,7 @@ pub fn main() uefi.Status {
             const page_phys = PAddr.fromInt(@intFromPtr(page.ptr));
             const page_virt = VAddr.fromInt(current_vaddr);
 
-            arch.mapPage(
+            arch.mapPageBoot(
                 new_addr_space_root_virt,
                 page_phys,
                 page_virt,
@@ -168,7 +165,7 @@ pub fn main() uefi.Status {
             .privilege_perm = .kernel,
         };
 
-        arch.mapPage(
+        arch.mapPageBoot(
             new_addr_space_root_virt,
             current_page_phys,
             current_page_virt,
@@ -201,7 +198,7 @@ pub fn main() uefi.Status {
         ) catch return .aborted;
     };
 
-    const kEntry: *KEntryType = @ptrFromInt(parsed_elf.entry);
+    const kEntry: *KEntryType = @ptrFromInt(parsed_elf.entry.addr);
     kEntry(boot_info);
     unreachable;
 }

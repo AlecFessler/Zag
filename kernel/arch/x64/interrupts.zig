@@ -9,10 +9,18 @@ const gdt = zag.arch.x64.gdt;
 
 const interruptHandler = idt.interruptHandler;
 
-const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
+
+pub const ArchCpuContext = cpu.Context;
+
+pub const PageFaultContext = struct {
+    faulting_address: u64,
+    is_kernel_privilege: bool,
+    is_write: bool,
+    is_exec: bool,
+};
 
 pub const IntVecs = enum(u8) {
     syscall = 0x80,
@@ -63,7 +71,6 @@ pub fn prepareThreadContext(
     entry: *const fn () void,
     arg: u64,
 ) *ArchCpuContext {
-    // unaligned access of the cpu context will set off runtime safety checks but that's okay
     @setRuntimeSafety(false);
     const ctx_addr: u64 = kstack_top.addr - @sizeOf(cpu.Context);
     var ctx: *cpu.Context = @ptrFromInt(ctx_addr);
@@ -163,6 +170,19 @@ pub fn registerVector(
     };
 }
 
+fn pageFaultHandler(ctx: *cpu.Context) void {
+    const fault_addr = asm volatile ("mov %%cr2, %[out]"
+        : [out] "=r" (-> u64),
+    );
+    const fault: PageFaultContext = .{
+        .faulting_address = fault_addr,
+        .is_kernel_privilege = (ctx.cs & 0x3) == 0,
+        .is_write = (ctx.err_code & 0x2) != 0,
+        .is_exec = (ctx.err_code & 0x10) != 0,
+    };
+    zag.arch.interrupts.handlePageFault(&fault);
+}
+
 export fn interruptStubPrologue() callconv(.naked) void {
     asm volatile (
         \\pushq %rax
@@ -206,7 +226,7 @@ export fn interruptStubEpilogue() callconv(.naked) void {
         \\popq %rcx
         \\popq %rax
         \\
-        \\addq $16, %rsp
+        \\addq $16, %%rsp
         \\iretq
     );
 }
@@ -219,5 +239,11 @@ export fn dispatchInterrupt(ctx: *cpu.Context) void {
         }
         return;
     }
+
+    if (ctx.int_num == 14) {
+        pageFaultHandler(ctx);
+        return;
+    }
+
     @panic("Unhandled interrupt!");
 }

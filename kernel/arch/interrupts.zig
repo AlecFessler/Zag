@@ -7,7 +7,7 @@ const address = zag.memory.address;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
-const sched = zag.sched;
+const scheduler = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
 
 const aarch64 = zag.arch.aarch64;
@@ -62,7 +62,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
 
     if (is_kernel_privilege) {
         if (is_user_va) {
-            const thread = sched.currentThread() orelse @panic("kernel page fault on user VA with no current thread");
+            const thread = scheduler.currentThread() orelse @panic("kernel page fault on user VA with no current thread");
             stack_mod.lookupGuard(thread.process.pid, faulting_virt);
             thread.process.kill();
             while (true) arch.halt();
@@ -87,7 +87,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         @panic("unexpected kernel page fault");
     }
 
-    const thread = sched.currentThread() orelse @panic("user page fault with no current thread");
+    const thread = scheduler.currentThread() orelse @panic("user page fault with no current thread");
     const proc = thread.process;
 
     const node = proc.vmm.findNode(faulting_virt) orelse {
