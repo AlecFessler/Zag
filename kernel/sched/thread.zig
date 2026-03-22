@@ -84,16 +84,8 @@ pub const Thread = struct {
         thread.kernel_stack = try stack_mod.createKernel();
         errdefer stack_mod.destroyKernel(thread.kernel_stack, memory_init.kernel_addr_space_root);
 
-        const top_page_base = VAddr.fromInt(
-            std.mem.alignBackward(u64, thread.kernel_stack.top.addr - 1, paging.PAGE4K),
-        );
-        const pmm_iface = pmm.global_pmm.?.allocator();
-        const kpage = try pmm_iface.create(paging.PageMem(.page4k));
-        errdefer pmm_iface.destroy(kpage);
-        @memset(std.mem.asBytes(kpage), 0);
-        const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
-        try arch.mapPage(memory_init.kernel_addr_space_root, kphys, top_page_base, KERNEL_PERMS);
-        errdefer _ = arch.unmapPage(memory_init.kernel_addr_space_root, top_page_base);
+        try mapKernelStack(thread.kernel_stack);
+        errdefer unmapKernelStack(thread.kernel_stack);
 
         const ustack = try stack_mod.createUser(&proc.vmm, num_stack_pages);
         thread.user_stack = ustack;
@@ -114,6 +106,41 @@ pub const Thread = struct {
         return thread;
     }
 };
+
+fn mapKernelStack(stack: Stack) !void {
+    const pmm_iface = pmm.global_pmm.?.allocator();
+    var page_addr = stack.base.addr;
+    var mapped: usize = 0;
+    errdefer {
+        var undo = stack.base.addr;
+        var i: usize = 0;
+        while (i < mapped) : (i += 1) {
+            if (arch.unmapPage(memory_init.kernel_addr_space_root, VAddr.fromInt(undo))) |paddr| {
+                const pg: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
+                pmm_iface.destroy(pg);
+            }
+            undo += paging.PAGE4K;
+        }
+    }
+    while (page_addr < stack.top.addr) : (page_addr += paging.PAGE4K) {
+        const kpage = try pmm_iface.create(paging.PageMem(.page4k));
+        @memset(std.mem.asBytes(kpage), 0);
+        const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
+        try arch.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS);
+        mapped += 1;
+    }
+}
+
+fn unmapKernelStack(stack: Stack) void {
+    const pmm_iface = pmm.global_pmm.?.allocator();
+    var page_addr = stack.base.addr;
+    while (page_addr < stack.top.addr) : (page_addr += paging.PAGE4K) {
+        if (arch.unmapPage(memory_init.kernel_addr_space_root, VAddr.fromInt(page_addr))) |paddr| {
+            const pg: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
+            pmm_iface.destroy(pg);
+        }
+    }
+}
 
 pub var allocator: std.mem.Allocator = undefined;
 var tid_counter: u64 = 0;

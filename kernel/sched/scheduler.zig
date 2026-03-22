@@ -3,7 +3,6 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const memory_init = zag.memory.init;
-const paging = zag.memory.paging;
 const process_mod = zag.sched.process;
 const thread_mod = zag.sched.thread;
 
@@ -15,6 +14,7 @@ const Timer = zag.arch.timer.Timer;
 const Thread = zag.sched.thread.Thread;
 const ThreadAllocator = zag.sched.thread.ThreadAllocator;
 const VAddr = zag.memory.address.VAddr;
+const x64_cpu = zag.arch.x64.cpu;
 
 const embedded = @import("embedded_bins");
 
@@ -103,8 +103,11 @@ pub fn currentThread() ?*Thread {
     return core_states[arch.coreID()].running_thread;
 }
 
+var first_switch_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
 pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
-    const state = &core_states[arch.coreID()];
+    const core_id = arch.coreID();
+    const state = &core_states[core_id];
 
     if (state.zombie) |zombie| {
         zombie.thread.deinit();
@@ -134,7 +137,6 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     }
 
     state.rq_lock.unlock();
-
     armSchedTimer(state, SCHED_TIMESLICE_NS);
     if (next == preempted) return;
     arch.switchTo(next);
@@ -172,24 +174,6 @@ pub fn globalInit() !void {
         .set_affinity = true,
     }, null);
     core_states[0].rq.enqueue(hello_world_proc.threads[0]);
-
-    const mem_reserve_proc = try Process.create(embedded.mem_reserve, .{
-        .destroy = true,
-        .spawn_thread = true,
-        .spawn_process = true,
-        .mem_reserve = true,
-        .set_affinity = true,
-    }, null);
-    core_states[0].rq.enqueue(mem_reserve_proc.threads[0]);
-
-    const thread_create_proc = try Process.create(embedded.thread_create, .{
-        .destroy = true,
-        .spawn_thread = true,
-        .spawn_process = true,
-        .mem_reserve = true,
-        .set_affinity = true,
-    }, null);
-    core_states[0].rq.enqueue(thread_create_proc.threads[0]);
 
     initialized = true;
 }

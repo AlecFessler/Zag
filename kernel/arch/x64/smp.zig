@@ -81,13 +81,26 @@ pub fn smpInit() !void {
 
         const ap_stack = try stack_mod.createKernel();
 
-        const top_page_base = VAddr.fromInt(
-            std.mem.alignBackward(u64, ap_stack.top.addr - 1, paging.PAGE4K),
-        );
-        const kpage = try pmm_iface.create(paging.PageMem(.page4k));
-        @memset(std.mem.asBytes(kpage), 0);
-        const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
-        try arch.mapPage(memory_init.kernel_addr_space_root, kphys, top_page_base, KERNEL_PERMS);
+        var page_addr = ap_stack.base.addr;
+        var map_ok = true;
+        while (page_addr < ap_stack.top.addr) : (page_addr += paging.PAGE4K) {
+            const kpage = pmm_iface.create(paging.PageMem(.page4k)) catch {
+                map_ok = false;
+                break;
+            };
+            @memset(std.mem.asBytes(kpage), 0);
+            const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
+            arch.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS) catch {
+                pmm_iface.destroy(kpage);
+                map_ok = false;
+                break;
+            };
+        }
+
+        if (!map_ok) {
+            stack_mod.destroyKernel(ap_stack, memory_init.kernel_addr_space_root);
+            continue;
+        }
 
         params.stack_top = zag.memory.address.alignStack(ap_stack.top).addr;
 
@@ -104,15 +117,12 @@ pub fn smpInit() !void {
         const timeout = hpet_iface.now();
         while (cores_online.load(.acquire) == expected) {
             if (hpet_iface.now() - timeout > 100_000_000) {
-                if (arch.unmapPage(memory_init.kernel_addr_space_root, top_page_base)) |paddr| {
-                    const pg: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
-                    pmm_iface.destroy(pg);
-                }
                 stack_mod.destroyKernel(ap_stack, memory_init.kernel_addr_space_root);
                 break;
             }
             std.atomic.spinLoopHint();
         }
+        arch.print("AP {} done, cores_online={}\n", .{ la.apic_id, cores_online.load(.acquire) });
     }
 
     arch.print("SMP: {}/{} cores online\n", .{ cores_online.load(.acquire), apic.coreCount() });
