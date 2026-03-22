@@ -10,18 +10,6 @@ pub fn run() void {
     testZombieChain();
 }
 
-fn waitForNonZero(ptr: *volatile u64) void {
-    while (ptr.* == 0) {
-        syscall.thread_yield();
-    }
-}
-
-fn waitForCleanup(handle: u64) void {
-    while (syscall.revoke_perm(handle) != -3) {
-        syscall.thread_yield();
-    }
-}
-
 fn testZombieChain() void {
     const child_exit_elf = embedded.child_exit;
     const spawner_elf = embedded.child_spawner;
@@ -58,16 +46,16 @@ fn testZombieChain() void {
     }).bits();
     _ = syscall.grant_perm(@intCast(shm_handle), @intCast(proc_handle), grant_rights);
 
-    waitForNonZero(signal_ptr);
+    t.waitUntilNonZero(signal_ptr);
 
     if (signal_ptr.* == 1) {
-        waitForCleanup(@intCast(proc_handle));
-        t.pass("S2.2: 3-level process tree created, subtree fully cleaned up");
+        t.waitForCleanup(@intCast(proc_handle));
+        t.pass("S2.1: 3-level process tree created, subtree fully cleaned up");
     } else if (signal_ptr.* == 0xDEAD) {
-        t.fail("S2.2: spawner child failed to create grandchild");
-        waitForCleanup(@intCast(proc_handle));
+        t.fail("S2.1: spawner child failed to create grandchild");
+        t.waitForCleanup(@intCast(proc_handle));
     } else {
-        t.fail("S2.2: spawner returned unexpected signal");
-        waitForCleanup(@intCast(proc_handle));
+        t.fail("S2.1: spawner returned unexpected signal");
+        t.waitForCleanup(@intCast(proc_handle));
     }
 }

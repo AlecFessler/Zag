@@ -1,6 +1,7 @@
 const lib = @import("lib");
 
 const syscall = lib.syscall;
+const t = lib.testing;
 
 const device_tests = @import("tests/device.zig");
 const futex_tests = @import("tests/futex.zig");
@@ -19,8 +20,8 @@ const vm_tests = @import("tests/vm.zig");
 const zombie_tests = @import("tests/zombie.zig");
 
 pub fn main(perm_view: u64) void {
-    syscall.write("Hello from userspace!\n");
     syscall.write("Running kernel tests...\n");
+    const start_ns: u64 = @bitCast(syscall.clock_gettime());
 
     vm_tests.run();
     shm_tests.run();
@@ -35,10 +36,13 @@ pub fn main(perm_view: u64) void {
     multithread_kill_tests.run();
     restart_tests.run();
     zombie_tests.run();
-    // TODO: grant_reduced_tests hangs in TCG - child fault cleanup path
-    // grant_reduced_tests.run();
+    grant_reduced_tests.run();
     misc_tests.run();
 
-    syscall.write("\nAll test suites completed.\n");
+    const end_ns: u64 = @bitCast(syscall.clock_gettime());
+    const elapsed_ms = (end_ns - start_ns) / 1_000_000;
+    syscall.write("\nAll test suites completed in ");
+    t.printDec(elapsed_ms);
+    syscall.write("ms\n");
     syscall.shutdown();
 }

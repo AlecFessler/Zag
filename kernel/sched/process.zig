@@ -26,7 +26,7 @@ const VAddrRange = zag.sched.restart_context.VAddrRange;
 const VirtualMemoryManager = zag.memory.vmm.VirtualMemoryManager;
 
 pub const DEFAULT_STACK_PAGES: u32 = 4;
-pub const MAX_PERMS: usize = 64;
+pub const MAX_PERMS: usize = 128;
 pub const HANDLE_SELF: u64 = 0;
 
 pub const ProcessAllocator = SlabAllocator(Process, false, 0, 64);
@@ -50,7 +50,7 @@ pub const Process = struct {
     perm_view_vaddr: VAddr,
     perm_view_phys: PAddr,
 
-    pub const MAX_THREADS = 16;
+    pub const MAX_THREADS = 64;
     pub const MAX_CHILDREN = 64;
 
     fn initPermTable(self: *Process, self_rights: ProcessRights) void {

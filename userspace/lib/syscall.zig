@@ -26,6 +26,8 @@ pub const SyscallNum = enum(u64) {
     futex_wake,
     clock_gettime,
     shutdown,
+    ioport_read,
+    ioport_write,
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -174,5 +176,13 @@ pub fn clock_gettime() i64 {
 pub fn shutdown() noreturn {
     _ = syscall0(.shutdown);
     unreachable;
+}
+
+pub fn ioport_read(device_handle: u64, port_offset: u64, width: u64) i64 {
+    return syscall3(.ioport_read, device_handle, port_offset, width);
+}
+
+pub fn ioport_write(device_handle: u64, port_offset: u64, width: u64, value: u64) i64 {
+    return syscall4(.ioport_write, device_handle, port_offset, width, value);
 }
 

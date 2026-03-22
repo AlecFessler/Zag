@@ -26,7 +26,7 @@ fn testPermsChange() void {
     const handle: u64 = @intCast(result.val);
     const ro = (perms.VmReservationRights{ .read = true }).bits();
     const rc = syscall.vm_perms(handle, syscall.PAGE4K, 2 * syscall.PAGE4K, ro);
-    t.expectEqual("S2.3.vm_perms: set current_rights on sub-range", 0, rc);
+    t.expectEqual("S2.2.vm_perms: set current_rights on sub-range", 0, rc);
 }
 
 fn testPermsExceedMax() void {
@@ -36,7 +36,7 @@ fn testPermsExceedMax() void {
     const handle: u64 = @intCast(result.val);
     const rw = (perms.VmReservationRights{ .read = true, .write = true }).bits();
     const rc = syscall.vm_perms(handle, 0, syscall.PAGE4K, rw);
-    t.expectEqual("S2.3: new_rights must be <= max_rights RWX", -2, rc);
+    t.expectEqual("S2.2: new_rights must be <= max_rights RWX", -2, rc);
 }
 
 fn testMergeSplitRestore() void {
@@ -49,7 +49,7 @@ fn testMergeSplitRestore() void {
     const rc1 = syscall.vm_perms(handle, syscall.PAGE4K, 2 * syscall.PAGE4K, ro);
     const rw = (perms.VmReservationRights{ .read = true, .write = true }).bits();
     const rc2 = syscall.vm_perms(handle, syscall.PAGE4K, 2 * syscall.PAGE4K, rw);
-    if (rc1 != 0 or rc2 != 0) { t.fail("S2.3: split/merge perms call failed"); return; }
+    if (rc1 != 0 or rc2 != 0) { t.fail("S2.2: split/merge perms call failed"); return; }
     const p0: *volatile u8 = @ptrFromInt(base);
     p0.* = 42;
     const p1: *volatile u8 = @ptrFromInt(base + syscall.PAGE4K);
@@ -59,9 +59,9 @@ fn testMergeSplitRestore() void {
     const p3: *volatile u8 = @ptrFromInt(base + 3 * syscall.PAGE4K - 1);
     p3.* = 45;
     if (p0.* == 42 and p1.* == 43 and p2.* == 44 and p3.* == 45) {
-        t.pass("S2.3: split then merge restores access to all pages");
+        t.pass("S2.2: split then merge restores access to all pages");
     } else {
-        t.fail("S2.3: split/merge data verification failed");
+        t.fail("S2.2: split/merge data verification failed");
     }
 }
 
@@ -75,13 +75,13 @@ fn testDecommit() void {
     ptr.* = 0xCAFEBABE;
     const zero = (perms.VmReservationRights{}).bits();
     const rc1 = syscall.vm_perms(handle, 0, syscall.PAGE4K, zero);
-    if (rc1 != 0) { t.fail("S2.3: decommit perms(0) failed"); return; }
+    if (rc1 != 0) { t.fail("S2.2: decommit perms(0) failed"); return; }
     const rw = (perms.VmReservationRights{ .read = true, .write = true }).bits();
     const rc2 = syscall.vm_perms(handle, 0, syscall.PAGE4K, rw);
-    if (rc2 != 0) { t.fail("S2.3: recommit perms(RW) failed"); return; }
+    if (rc2 != 0) { t.fail("S2.2: recommit perms(RW) failed"); return; }
     if (ptr.* == 0) {
-        t.pass("S2.3: RWX=0 decommits; recommit demand-pages zeroed page");
+        t.pass("S2.2: RWX=0 decommits; recommit demand-pages zeroed page");
     } else {
-        t.fail("S2.3: page not zeroed after decommit+recommit");
+        t.fail("S2.2: page not zeroed after decommit+recommit");
     }
 }

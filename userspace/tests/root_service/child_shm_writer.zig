@@ -4,7 +4,7 @@ const perms = lib.perms;
 const pv = lib.perm_view;
 const syscall = lib.syscall;
 
-const MAX_PERMS = 64;
+const MAX_PERMS = 128;
 
 pub fn main(perm_view_addr: u64) void {
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);

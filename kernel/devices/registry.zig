@@ -2,19 +2,44 @@ const zag = @import("zag");
 
 const device_region_mod = zag.memory.device_region;
 
+const DeviceClass = zag.memory.device_region.DeviceClass;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Process = zag.sched.process.Process;
 
-const MAX_DEVICES = 64;
+const MAX_DEVICES = 128;
 
 var device_table: [MAX_DEVICES]*DeviceRegion = undefined;
 var device_count: u32 = 0;
 
-pub fn registerDevice(phys_base: PAddr, size: u64) !*DeviceRegion {
+pub fn registerMmioDevice(
+    phys_base: PAddr,
+    size: u64,
+    device_class: DeviceClass,
+    pci_vendor: u16,
+    pci_device: u16,
+    pci_class: u8,
+    pci_subclass: u8,
+) !*DeviceRegion {
     if (device_count >= MAX_DEVICES) return error.TooManyDevices;
-    const dr = try device_region_mod.create(phys_base, size);
+    const dr = try device_region_mod.createMmio(phys_base, size, device_class, pci_vendor, pci_device, pci_class, pci_subclass);
+    device_table[device_count] = dr;
+    device_count += 1;
+    return dr;
+}
+
+pub fn registerPortIoDevice(
+    base_port: u16,
+    port_count: u16,
+    device_class: DeviceClass,
+    pci_vendor: u16,
+    pci_device: u16,
+    pci_class: u8,
+    pci_subclass: u8,
+) !*DeviceRegion {
+    if (device_count >= MAX_DEVICES) return error.TooManyDevices;
+    const dr = try device_region_mod.createPortIo(base_port, port_count, device_class, pci_vendor, pci_device, pci_class, pci_subclass);
     device_table[device_count] = dr;
     device_count += 1;
     return dr;

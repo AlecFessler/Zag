@@ -13,7 +13,7 @@ pub fn run() void {
 
 fn testShmCreateBasic() void {
     const rc = syscall.shm_create(syscall.PAGE4K);
-    t.expectOk("S2.8: shm_create allocates zeroed pages, returns handle", rc);
+    t.expectOk("S2.7: shm_create allocates zeroed pages, returns handle", rc);
 }
 
 fn testShmMapWriteReadUnmap() void {
@@ -32,7 +32,7 @@ fn testShmMapWriteReadUnmap() void {
     ptr.* = 0xDEADBEEF;
     if (ptr.* != 0xDEADBEEF) { t.fail("write/read through SHM failed"); return; }
     const unmap_rc = syscall.shm_unmap(@intCast(shm_handle), vm_handle);
-    t.expectEqual("S2.3.shm_map: eagerly maps all pages; unmap succeeds", 0, unmap_rc);
+    t.expectEqual("S2.2.shm_map: eagerly maps all pages; unmap succeeds", 0, unmap_rc);
 }
 
 fn testShmUnmapRestoresPrivateAccess() void {
@@ -52,8 +52,8 @@ fn testShmUnmapRestoresPrivateAccess() void {
     const ptr2: *volatile u8 = @ptrFromInt(base + syscall.PAGE4K);
     ptr2.* = 100;
     if (ptr.* == 99 and ptr2.* == 100) {
-        t.pass("S2.3.shm_unmap: reverts to private, max_rights RWX restored");
+        t.pass("S2.2.shm_unmap: reverts to private, max_rights RWX restored");
     } else {
-        t.fail("S2.3.shm_unmap: private access failed after unmap");
+        t.fail("S2.2.shm_unmap: private access failed after unmap");
     }
 }

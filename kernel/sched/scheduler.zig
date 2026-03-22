@@ -9,7 +9,6 @@ const process_mod = zag.sched.process;
 const thread_mod = zag.sched.thread;
 
 const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
-const PAddr = zag.memory.address.PAddr;
 const Process = zag.sched.process.Process;
 const ProcessAllocator = zag.sched.process.ProcessAllocator;
 const SpinLock = zag.sched.sync.SpinLock;
@@ -156,8 +155,6 @@ pub fn globalInit() !void {
     for (&core_states) |*state| {
         state.rq.init();
     }
-
-    _ = try device_registry.registerDevice(PAddr.fromInt(0xFEE0_0000), 0x1000);
 
     const root_proc = try Process.create(embedded.root_service, .{
         .grant_to = true,

@@ -4,10 +4,11 @@ const std = @import("std");
 const syscall = lib.syscall;
 const t = lib.testing;
 
-var thread_ran = std.atomic.Value(bool).init(false);
+var thread_ran: u64 align(8) = 0;
 
 fn threadEntry() void {
-    thread_ran.store(true, .release);
+    @as(*volatile u64, &thread_ran).* = 1;
+    _ = syscall.futex_wake(&thread_ran, 1);
     syscall.thread_exit();
 }
 
@@ -22,18 +23,11 @@ pub fn run() void {
 }
 
 fn testThreadCreate() void {
-    thread_ran.store(false, .release);
+    @as(*volatile u64, &thread_ran).* = 0;
     const rc = syscall.thread_create(&threadEntry, 0, 4);
     if (rc != 0) { t.failWithVal("thread_create failed", 0, rc); return; }
-    var spins: u32 = 0;
-    while (!thread_ran.load(.acquire) and spins < 500_000) : (spins += 1) {
-        syscall.thread_yield();
-    }
-    if (thread_ran.load(.acquire)) {
-        t.pass("S2.5: thread_create enqueues new thread; child ran");
-    } else {
-        t.fail("S2.5: spawned thread never ran");
-    }
+    t.waitUntilNonZero(@as(*volatile u64, &thread_ran));
+    t.pass("S2.4: thread_create enqueues new thread; child ran");
 }
 
 fn testThreadYield() void {

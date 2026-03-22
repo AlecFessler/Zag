@@ -125,8 +125,16 @@ pub const UserViewEntry = extern struct {
                 .handle = entry.handle,
                 .entry_type = @intFromEnum(UserViewEntryType.device_region),
                 .rights = entry.rights,
-                .field0 = dr.size,
-                .field1 = 0,
+                .field0 = @as(u64, @intFromEnum(dr.device_type)) |
+                    (@as(u64, @intFromEnum(dr.device_class)) << 8) |
+                    (if (dr.device_type == .mmio)
+                        @as(u64, @truncate(dr.size)) << 32
+                    else
+                        @as(u64, dr.port_count) << 32),
+                .field1 = @as(u64, dr.pci_vendor) |
+                    (@as(u64, dr.pci_device) << 16) |
+                    (@as(u64, dr.pci_class) << 32) |
+                    (@as(u64, dr.pci_subclass) << 40),
             },
             .empty => EMPTY,
         };

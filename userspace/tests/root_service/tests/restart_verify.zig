@@ -6,13 +6,8 @@ const syscall = lib.syscall;
 const t = lib.testing;
 
 pub fn run() void {
-    t.section("restart persistence verification (S2.11)");
+    t.section("restart persistence verification (S2.6)");
     testRestartClearsVmPreservesShm();
-}
-
-fn yieldN(n: u32) void {
-    var i: u32 = 0;
-    while (i < n) : (i += 1) { syscall.thread_yield(); }
 }
 
 fn testRestartClearsVmPreservesShm() void {
@@ -57,22 +52,21 @@ fn testRestartClearsVmPreservesShm() void {
         const vm_res_run1: *volatile u64 = @ptrFromInt(base + 32);
 
         if (shm_count_run1.* >= 1) {
-            t.pass("S2.11: SHM perm entries persist across restart");
+            t.pass("S2.6: SHM perm entries persist across restart");
         } else {
-            t.failWithVal("S2.11: SHM count on restart", 1, @as(i64, @bitCast(shm_count_run1.*)));
+            t.failWithVal("S2.6: SHM count on restart", 1, @as(i64, @bitCast(shm_count_run1.*)));
         }
         if (vm_res_run1.* == 0) {
-            t.pass("S2.11: VM reservation entries cleared by resetForRestart");
+            t.pass("S2.6: VM reservation entries cleared by resetForRestart");
         } else {
-            t.failWithVal("S2.11: VM reservation entries on restart", 0, @as(i64, @bitCast(vm_res_run1.*)));
+            t.failWithVal("S2.6: VM reservation entries on restart", 0, @as(i64, @bitCast(vm_res_run1.*)));
         }
         _ = shm_count_run0;
         _ = vm_res_run0;
     } else {
-        t.fail("S2.11: child did not restart (counter < 2)");
+        t.fail("S2.6: child did not restart (counter < 2)");
     }
 
     _ = syscall.disable_restart();
-    _ = syscall.revoke_perm(@intCast(proc_handle));
-    yieldN(5000);
+    t.waitForCleanup(@intCast(proc_handle));
 }

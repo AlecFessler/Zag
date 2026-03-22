@@ -10,18 +10,6 @@ pub fn run() void {
     testRestartWithVerification();
 }
 
-fn waitForMin(ptr: *volatile u64, min: u64) void {
-    while (ptr.* < min) {
-        syscall.thread_yield();
-    }
-}
-
-fn waitForCleanup(handle: u64) void {
-    while (syscall.revoke_perm(handle) != -3) {
-        syscall.thread_yield();
-    }
-}
-
 fn testRestartWithVerification() void {
     const shm_handle = syscall.shm_create(syscall.PAGE4K);
     if (shm_handle <= 0) { t.fail("setup: shm_create failed"); return; }
@@ -54,28 +42,28 @@ fn testRestartWithVerification() void {
     }).bits();
     _ = syscall.grant_perm(@intCast(shm_handle), @intCast(proc_handle), grant_rights);
 
-    waitForMin(run_counter, 2);
+    t.waitUntilAtLeast(run_counter, 2);
 
-    t.pass("S2.11: restartable child ran 2+ times (restart works)");
+    t.pass("S2.6: restartable child ran 2+ times (restart works)");
 
     const shm_count_run1: *volatile u64 = @ptrFromInt(base + 24);
     const vm_res_run1: *volatile u64 = @ptrFromInt(base + 32);
 
     if (shm_count_run1.* >= 1) {
-        t.pass("S2.11: SHM perm entries persist across restart");
+        t.pass("S2.6: SHM perm entries persist across restart");
     } else {
-        t.failWithVal("S2.11: SHM count on restart", 1, @as(i64, @bitCast(shm_count_run1.*)));
+        t.failWithVal("S2.6: SHM count on restart", 1, @as(i64, @bitCast(shm_count_run1.*)));
     }
     if (vm_res_run1.* == 0) {
-        t.pass("S2.11: VM reservation entries cleared by resetForRestart");
+        t.pass("S2.6: VM reservation entries cleared by resetForRestart");
     } else {
-        t.failWithVal("S2.11: VM reservation on restart", 0, @as(i64, @bitCast(vm_res_run1.*)));
+        t.failWithVal("S2.6: VM reservation on restart", 0, @as(i64, @bitCast(vm_res_run1.*)));
     }
 
     const dr = syscall.disable_restart();
     t.expectEqual("S4.disable_restart: clears restart for self and descendants", 0, dr);
 
-    waitForCleanup(@intCast(proc_handle));
+    t.waitForCleanup(@intCast(proc_handle));
 
     const dr2 = syscall.disable_restart();
     t.expectEqual("S4.disable_restart: already cleared returns E_PERM", -2, dr2);

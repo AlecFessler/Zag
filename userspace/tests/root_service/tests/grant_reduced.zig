@@ -10,12 +10,6 @@ pub fn run() void {
     testGrantReadOnlyWriteFaultsChild();
 }
 
-fn waitForCleanup(handle: u64) void {
-    while (syscall.revoke_perm(handle) != -3) {
-        syscall.thread_yield();
-    }
-}
-
 fn testGrantReadOnlyWriteFaultsChild() void {
     const shm_handle = syscall.shm_create(syscall.PAGE4K);
     if (shm_handle <= 0) { t.fail("setup: shm_create failed"); return; }
@@ -31,6 +25,6 @@ fn testGrantReadOnlyWriteFaultsChild() void {
     const rc = syscall.grant_perm(@intCast(shm_handle), @intCast(proc_handle), ro_grant);
     if (rc != 0) { t.fail("grant_perm failed"); return; }
 
-    waitForCleanup(@intCast(proc_handle));
-    t.pass("S2.4: child with RO SHM faulted on write, killed and cleaned up");
+    t.waitForCleanup(@intCast(proc_handle));
+    t.pass("S2.3: child with RO SHM faulted on write, killed and cleaned up");
 }

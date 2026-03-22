@@ -21,6 +21,7 @@ pub fn run() void {
     testShmUnmapNotFound();
     testShmMapBusy();
     testHintOverlapFallback();
+    testShmMapRwxExceedsMax();
 }
 
 fn testReserveZeroSize() void {
@@ -40,7 +41,7 @@ fn testReserveShareableAndMmio() void {
         .read = true, .write = true, .shareable = true, .mmio = true,
     }).bits();
     const result = syscall.vm_reserve(0, syscall.PAGE4K, rights);
-    t.expectEqual("S2.4: shareable and mmio are mutually exclusive", -1, result.val);
+    t.expectEqual("S2.2: shareable and mmio are mutually exclusive", -1, result.val);
 }
 
 fn testReserveWithHint() void {
@@ -48,9 +49,9 @@ fn testReserveWithHint() void {
     const rights = (perms.VmReservationRights{ .read = true, .write = true }).bits();
     const result = syscall.vm_reserve(hint, syscall.PAGE4K, rights);
     if (result.val > 0 and result.val2 == hint) {
-        t.pass("S2.3: hint honored when no overlap in static zone");
+        t.pass("S2.2: hint honored when no overlap in static zone");
     } else if (result.val > 0) {
-        t.pass("S2.3: hint fallback to cursor when overlap");
+        t.pass("S2.2: hint fallback to cursor when overlap");
     } else {
         t.failWithVal("S4.vm_reserve: hint failed", 0, result.val);
     }
@@ -111,7 +112,7 @@ fn testShmMapNoShareable() void {
     const vm_result = syscall.vm_reserve(0, syscall.PAGE4K, vm_rights);
     if (vm_result.val < 0) { t.fail("setup failed"); return; }
     const rc = syscall.shm_map(@intCast(shm_handle), @intCast(vm_result.val), 0);
-    t.expectEqual("S2.3.shm_map: max_rights must include shareable", -2, rc);
+    t.expectEqual("S2.2.shm_map: max_rights must include shareable", -2, rc);
 }
 
 fn testShmMapDuplicate() void {
@@ -126,7 +127,7 @@ fn testShmMapDuplicate() void {
     const rc1 = syscall.shm_map(@intCast(shm_handle), vm_handle, 0);
     if (rc1 != 0) { t.failWithVal("first map failed", 0, rc1); return; }
     const rc2 = syscall.shm_map(@intCast(shm_handle), vm_handle, syscall.PAGE4K);
-    t.expectEqual("S2.3.shm_map: no duplicate SharedMemory in reservation", -1, rc2);
+    t.expectEqual("S2.2.shm_map: no duplicate SharedMemory in reservation", -1, rc2);
 }
 
 fn testShmUnmapNotFound() void {
@@ -138,7 +139,7 @@ fn testShmUnmapNotFound() void {
     const vm_result = syscall.vm_reserve(0, syscall.PAGE4K, vm_rights);
     if (vm_result.val < 0) { t.fail("setup failed"); return; }
     const rc = syscall.shm_unmap(@intCast(shm_handle), @intCast(vm_result.val));
-    t.expectEqual("S2.3.shm_unmap: not mapped returns E_NOENT", -10, rc);
+    t.expectEqual("S2.2.shm_unmap: not mapped returns E_NOENT", -10, rc);
 }
 
 fn testShmMapBusy() void {
@@ -152,7 +153,7 @@ fn testShmMapBusy() void {
     const ptr: *volatile u8 = @ptrFromInt(vm_result.val2);
     ptr.* = 42;
     const rc = syscall.shm_map(@intCast(shm_handle), @intCast(vm_result.val), 0);
-    t.expectEqual("S2.3.shm_map: committed pages in range returns E_BUSY", -11, rc);
+    t.expectEqual("S2.2.shm_map: committed pages in range returns E_BUSY", -11, rc);
 }
 
 fn testHintOverlapFallback() void {
@@ -162,10 +163,22 @@ fn testHintOverlapFallback() void {
     if (r1.val < 0) { t.fail("setup failed"); return; }
     const r2 = syscall.vm_reserve(hint, syscall.PAGE4K, rights);
     if (r2.val > 0 and r2.val2 != hint) {
-        t.pass("S2.3: overlapping hint falls back to cursor allocation");
+        t.pass("S2.2: overlapping hint falls back to cursor allocation");
     } else if (r2.val > 0) {
-        t.fail("S2.3: overlapping hint should not get same addr");
+        t.fail("S2.2: overlapping hint should not get same addr");
     } else {
-        t.failWithVal("S2.3: hint overlap fallback failed", 0, r2.val);
+        t.failWithVal("S2.2: hint overlap fallback failed", 0, r2.val);
     }
+}
+
+fn testShmMapRwxExceedsMax() void {
+    const shm_handle = syscall.shm_create(syscall.PAGE4K);
+    if (shm_handle < 0) { t.fail("setup failed"); return; }
+    const vm_rights = (perms.VmReservationRights{
+        .read = true, .shareable = true,
+    }).bits();
+    const vm_result = syscall.vm_reserve(0, syscall.PAGE4K, vm_rights);
+    if (vm_result.val < 0) { t.fail("setup failed"); return; }
+    const rc = syscall.shm_map(@intCast(shm_handle), @intCast(vm_result.val), 0);
+    t.expectEqual("S2.2.shm_map: SHM RWX exceeds max_rights RWX (E_PERM)", -2, rc);
 }

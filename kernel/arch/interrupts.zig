@@ -99,6 +99,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         .shared_memory, .mmio => {
             stack_mod.lookupGuard(proc.pid, faulting_virt);
             proc.kill();
+            arch.enableInterrupts();
             while (true) arch.halt();
         },
         .private => {

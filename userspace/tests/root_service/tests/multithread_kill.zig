@@ -10,12 +10,6 @@ pub fn run() void {
     testKillMultiThreadChild();
 }
 
-fn waitForCleanup(handle: u64) void {
-    while (syscall.revoke_perm(handle) != -3) {
-        syscall.thread_yield();
-    }
-}
-
 fn testKillMultiThreadChild() void {
     const child_elf = embedded.child_multithread;
     const child_rights = (perms.ProcessRights{ .spawn_thread = true }).bits();
@@ -23,7 +17,7 @@ fn testKillMultiThreadChild() void {
     if (proc_handle <= 0) { t.failWithVal("proc_create failed", 1, proc_handle); return; }
     syscall.thread_yield();
     const rc = syscall.revoke_perm(@intCast(proc_handle));
-    t.expectEqual("S2.12: revoke kills all threads in child process", 0, rc);
-    waitForCleanup(@intCast(proc_handle));
-    t.pass("S2.12: multi-thread child fully cleaned up");
+    t.expectEqual("S2.6: revoke kills all threads in child process", 0, rc);
+    t.waitForCleanup(@intCast(proc_handle));
+    t.pass("S2.6: multi-thread child fully cleaned up");
 }

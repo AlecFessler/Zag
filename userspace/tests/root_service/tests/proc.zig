@@ -12,20 +12,6 @@ pub fn run() void {
     testCrossProcessShmAndGrant();
 }
 
-const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
-
-fn waitForNonZero(ptr: *volatile u64) void {
-    while (ptr.* == 0) {
-        _ = syscall.futex_wait(@ptrFromInt(@intFromPtr(ptr)), 0, MAX_TIMEOUT);
-    }
-}
-
-fn waitForCleanup(handle: u64) void {
-    while (syscall.revoke_perm(handle) != -3) {
-        syscall.thread_yield();
-    }
-}
-
 fn testProcCreateBadElf() void {
     var garbage: [64]u8 = undefined;
     for (&garbage) |*b| b.* = 0xAA;
@@ -58,30 +44,30 @@ fn testCrossProcessShmAndGrant() void {
     }).bits();
     const proc_handle = syscall.proc_create(@intFromPtr(child_elf.ptr), child_elf.len, child_rights);
     if (proc_handle <= 0) { t.fail("proc_create failed"); return; }
-    t.pass("S2.2: proc_create returns handle, child starts with self-handle only");
+    t.pass("S2.1: proc_create returns handle, child starts with self-handle only");
 
     const grant_rights = (perms.SharedMemoryRights{
         .read = true, .write = true, .grant = true,
     }).bits();
     const grant_rc = syscall.grant_perm(@intCast(shm_handle), @intCast(proc_handle), grant_rights);
-    t.expectEqual("S2.4: SHM grant inserts in child, increments refcount", 0, grant_rc);
+    t.expectEqual("S2.3: SHM grant inserts in child, increments refcount", 0, grant_rc);
 
-    waitForNonZero(parent_ptr);
+    t.waitUntilNonZero(parent_ptr);
 
     if (parent_ptr.* >= 1) {
-        t.pass("S2.8: SHM pages shared cross-process, child wrote parent read");
+        t.pass("S2.7: SHM pages shared cross-process, child wrote parent read");
     } else {
-        t.fail("S2.8: child never wrote to shared page");
+        t.fail("S2.7: child never wrote to shared page");
     }
 
-    waitForCleanup(@intCast(proc_handle));
+    t.waitForCleanup(@intCast(proc_handle));
 
     if (parent_ptr.* >= 1) {
-        t.pass("S2.8: SHM refcount > 0, parent retains access after child death");
+        t.pass("S2.7: SHM refcount > 0, parent retains access after child death");
     } else {
-        t.fail("S2.8: parent lost SHM access after child cleanup");
+        t.fail("S2.7: parent lost SHM access after child cleanup");
     }
 
     const rc2 = syscall.revoke_perm(@intCast(proc_handle));
-    t.expectEqual("S2.4: revoke cleaned-up handle returns E_BADCAP", -3, rc2);
+    t.expectEqual("S2.3: revoke cleaned-up handle returns E_BADCAP", -3, rc2);
 }

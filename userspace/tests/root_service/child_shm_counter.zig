@@ -4,7 +4,7 @@ const perms = lib.perms;
 const pv = lib.perm_view;
 const syscall = lib.syscall;
 
-const MAX_PERMS = 64;
+const MAX_PERMS = 128;
 
 pub fn main(perm_view_addr: u64) void {
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
@@ -25,28 +25,18 @@ pub fn main(perm_view_addr: u64) void {
         syscall.thread_yield();
     }
 
-    if (shm_handle == 0 or shm_size == 0) {
-        syscall.write("shm_counter: no SHM found\n");
-        return;
-    }
+    if (shm_handle == 0 or shm_size == 0) return;
 
     const vm_rights = (perms.VmReservationRights{
         .read = true, .write = true, .execute = true, .shareable = true,
     }).bits();
     const vm_result = syscall.vm_reserve(0, shm_size, vm_rights);
-    if (vm_result.val < 0) {
-        syscall.write("shm_counter: vm_reserve failed\n");
-        return;
-    }
+    if (vm_result.val < 0) return;
 
     const map_rc = syscall.shm_map(shm_handle, @intCast(vm_result.val), 0);
-    if (map_rc != 0) {
-        syscall.write("shm_counter: shm_map failed\n");
-        return;
-    }
+    if (map_rc != 0) return;
 
     const ptr: *volatile u64 = @ptrFromInt(vm_result.val2);
     ptr.* = ptr.* + 1;
     _ = syscall.futex_wake(@ptrFromInt(vm_result.val2), 1);
-    syscall.write("shm_counter: done\n");
 }

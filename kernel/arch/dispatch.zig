@@ -266,6 +266,30 @@ pub fn shutdown() noreturn {
     }
 }
 
+pub fn ioportIn(port: u16, width: u8) u32 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => switch (width) {
+            1 => @as(u32, x64.cpu.inb(port)),
+            2 => @as(u32, x64.cpu.inw(port)),
+            4 => x64.cpu.ind(port),
+            else => unreachable,
+        },
+        else => unreachable,
+    };
+}
+
+pub fn ioportOut(port: u16, width: u8, value: u32) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => switch (width) {
+            1 => x64.cpu.outb(@truncate(value), port),
+            2 => x64.cpu.outw(@truncate(value), port),
+            4 => x64.cpu.outd(value, port),
+            else => unreachable,
+        },
+        else => unreachable,
+    }
+}
+
 pub fn print(
     comptime format: []const u8,
     args: anytype,

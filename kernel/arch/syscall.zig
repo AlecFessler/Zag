@@ -54,6 +54,8 @@ pub const SyscallNum = enum(u64) {
     futex_wake,
     clock_gettime,
     shutdown,
+    ioport_read,
+    ioport_write,
     _,
 };
 
@@ -97,6 +99,8 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
         .futex_wake => ok(sysFutexWake(arg0, arg1)),
         .clock_gettime => ok(sysClockGettime()),
         .shutdown => sysShutdown(),
+        .ioport_read => ok(sysIoportRead(arg0, arg1, arg2)),
+        .ioport_write => ok(sysIoportWrite(arg0, arg1, arg2, arg3)),
         _ => err(E_INVAL),
     };
 }
@@ -265,6 +269,7 @@ fn sysMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
     const device_entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
     if (device_entry.object != .device_region) return E_BADCAP;
     if (!device_entry.deviceRights().map) return E_PERM;
+    if (device_entry.object.device_region.device_type != .mmio) return E_INVAL;
 
     const vm_entry = proc.getPermByHandle(vm_handle) orelse return E_BADCAP;
     if (vm_entry.object != .vm_reservation) return E_BADCAP;
@@ -317,7 +322,7 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms: u64) i64 {
     if (!self_entry.processRights().spawn_process) return E_PERM;
 
     const child_perms: ProcessRights = @bitCast(@as(u16, @truncate(perms)));
-    if (child_perms.restart and !self_entry.processRights().restart) return E_PERM;
+    if (child_perms.restart and proc.restart_context == null) return E_PERM;
 
     const elf_bytes: [*]const u8 = @ptrFromInt(elf_ptr);
     const elf_binary = elf_bytes[0..elf_len];
@@ -516,5 +521,38 @@ fn sysShutdown() noreturn {
         arch.enableInterrupts();
         asm volatile ("hlt");
     }
+}
+
+fn sysIoportRead(device_handle: u64, port_offset: u64, width: u64) i64 {
+    if (width != 1 and width != 2 and width != 4) return E_INVAL;
+
+    const proc = currentProc();
+    const entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
+    if (entry.object != .device_region) return E_BADCAP;
+    if (!entry.deviceRights().map) return E_PERM;
+
+    const device = entry.object.device_region;
+    if (device.device_type != .port_io) return E_INVAL;
+    if (port_offset + width > device.port_count) return E_INVAL;
+
+    const port: u16 = device.base_port + @as(u16, @truncate(port_offset));
+    return @intCast(arch.ioportIn(port, @truncate(width)));
+}
+
+fn sysIoportWrite(device_handle: u64, port_offset: u64, width: u64, value: u64) i64 {
+    if (width != 1 and width != 2 and width != 4) return E_INVAL;
+
+    const proc = currentProc();
+    const entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
+    if (entry.object != .device_region) return E_BADCAP;
+    if (!entry.deviceRights().map) return E_PERM;
+
+    const device = entry.object.device_region;
+    if (device.device_type != .port_io) return E_INVAL;
+    if (port_offset + width > device.port_count) return E_INVAL;
+
+    const port: u16 = device.base_port + @as(u16, @truncate(port_offset));
+    arch.ioportOut(port, @truncate(width), @truncate(value));
+    return E_OK;
 }
 
