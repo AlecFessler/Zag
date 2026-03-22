@@ -1,0 +1,37 @@
+const zag = @import("zag");
+
+const device_region_mod = zag.memory.device_region;
+
+const DeviceRegion = zag.memory.device_region.DeviceRegion;
+const PAddr = zag.memory.address.PAddr;
+const PermissionEntry = zag.perms.permissions.PermissionEntry;
+const Process = zag.sched.process.Process;
+
+const MAX_DEVICES = 64;
+
+var device_table: [MAX_DEVICES]*DeviceRegion = undefined;
+var device_count: u32 = 0;
+
+pub fn registerDevice(phys_base: PAddr, size: u64) !*DeviceRegion {
+    if (device_count >= MAX_DEVICES) return error.TooManyDevices;
+    const dr = try device_region_mod.create(phys_base, size);
+    device_table[device_count] = dr;
+    device_count += 1;
+    return dr;
+}
+
+pub fn grantAllToRootService(root_proc: *Process) void {
+    var i: u32 = 0;
+    while (i < device_count) : (i += 1) {
+        const entry = PermissionEntry{
+            .handle = 0,
+            .object = .{ .device_region = device_table[i] },
+            .rights = 0b11,
+        };
+        _ = root_proc.insertPerm(entry) catch {};
+    }
+}
+
+pub fn count() u32 {
+    return device_count;
+}

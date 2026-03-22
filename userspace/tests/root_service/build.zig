@@ -46,11 +46,32 @@ pub fn build(b: *std.Build) void {
     });
 
     const child_exit_bin = buildChild(b, target, lib_mod, "child_exit", "child_exit.zig");
+    const child_shm_counter_bin = buildChild(b, target, lib_mod, "child_shm_counter", "child_shm_counter.zig");
+    const child_stack_overflow_bin = buildChild(b, target, lib_mod, "child_stack_overflow", "child_stack_overflow.zig");
+    const child_restart_counter_bin = buildChild(b, target, lib_mod, "child_restart_counter", "child_restart_counter.zig");
+    const child_multithread_bin = buildChild(b, target, lib_mod, "child_multithread", "child_multithread.zig");
+    const child_spawner_bin = buildChild(b, target, lib_mod, "child_spawner", "child_spawner.zig");
+    const child_restart_verify_bin = buildChild(b, target, lib_mod, "child_restart_verify", "child_restart_verify.zig");
+    const child_shm_writer_bin = buildChild(b, target, lib_mod, "child_shm_writer", "child_shm_writer.zig");
 
     const embedded_wf = b.addWriteFiles();
     _ = embedded_wf.addCopyFile(child_exit_bin, "child_exit.elf");
+    _ = embedded_wf.addCopyFile(child_shm_counter_bin, "child_shm_counter.elf");
+    _ = embedded_wf.addCopyFile(child_stack_overflow_bin, "child_stack_overflow.elf");
+    _ = embedded_wf.addCopyFile(child_restart_counter_bin, "child_restart_counter.elf");
+    _ = embedded_wf.addCopyFile(child_multithread_bin, "child_multithread.elf");
+    _ = embedded_wf.addCopyFile(child_spawner_bin, "child_spawner.elf");
+    _ = embedded_wf.addCopyFile(child_restart_verify_bin, "child_restart_verify.elf");
+    _ = embedded_wf.addCopyFile(child_shm_writer_bin, "child_shm_writer.elf");
     const embed_src = embedded_wf.add("embedded_children.zig",
         \\pub const child_exit = @embedFile("child_exit.elf");
+        \\pub const child_shm_counter = @embedFile("child_shm_counter.elf");
+        \\pub const child_stack_overflow = @embedFile("child_stack_overflow.elf");
+        \\pub const child_restart_counter = @embedFile("child_restart_counter.elf");
+        \\pub const child_multithread = @embedFile("child_multithread.elf");
+        \\pub const child_spawner = @embedFile("child_spawner.elf");
+        \\pub const child_restart_verify = @embedFile("child_restart_verify.elf");
+        \\pub const child_shm_writer = @embedFile("child_shm_writer.elf");
         \\
     );
 

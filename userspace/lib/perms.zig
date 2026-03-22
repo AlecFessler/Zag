@@ -11,7 +11,7 @@ pub const VmReservationRights = packed struct(u8) {
     }
 };
 
-pub const ProcessRights = packed struct(u8) {
+pub const ProcessRights = packed struct(u16) {
     grant_to: bool = false,
     spawn_thread: bool = false,
     spawn_process: bool = false,
@@ -20,9 +20,11 @@ pub const ProcessRights = packed struct(u8) {
     restart: bool = false,
     shm_create: bool = false,
     device_own: bool = false,
+    shutdown: bool = false,
+    _reserved: u7 = 0,
 
     pub fn bits(self: @This()) u64 {
-        return @intCast(@as(u8, @bitCast(self)));
+        return @intCast(@as(u16, @bitCast(self)));
     }
 };
 

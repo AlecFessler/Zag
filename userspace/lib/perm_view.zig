@@ -7,8 +7,9 @@ pub const ENTRY_TYPE_EMPTY: u8 = 0xFF;
 pub const UserViewEntry = extern struct {
     handle: u64,
     entry_type: u8,
-    rights: u8,
-    _pad: [6]u8,
+    _pad0: u8,
+    rights: u16,
+    _pad: [4]u8,
     field0: u64,
     field1: u64,
 };

@@ -25,6 +25,7 @@ pub const SyscallNum = enum(u64) {
     futex_wait,
     futex_wake,
     clock_gettime,
+    shutdown,
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -158,8 +159,8 @@ pub fn disable_restart() i64 {
     return syscall0(.disable_restart);
 }
 
-pub fn futex_wait(addr: *const u64, expected: u64) i64 {
-    return syscall2(.futex_wait, @intFromPtr(addr), expected);
+pub fn futex_wait(addr: *const u64, expected: u64, timeout_ns: u64) i64 {
+    return syscall3(.futex_wait, @intFromPtr(addr), expected, timeout_ns);
 }
 
 pub fn futex_wake(addr: *const u64, count: u64) i64 {
@@ -168,5 +169,10 @@ pub fn futex_wake(addr: *const u64, count: u64) i64 {
 
 pub fn clock_gettime() i64 {
     return syscall0(.clock_gettime);
+}
+
+pub fn shutdown() noreturn {
+    _ = syscall0(.shutdown);
+    unreachable;
 }
 

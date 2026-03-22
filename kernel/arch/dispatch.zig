@@ -258,6 +258,14 @@ pub fn readTimestamp() u64 {
     }
 }
 
+pub fn shutdown() noreturn {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.qemuShutdown(),
+        .aarch64 => aarch64.cpu.halt(),
+        else => unreachable,
+    }
+}
+
 pub fn print(
     comptime format: []const u8,
     args: anytype,

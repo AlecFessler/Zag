@@ -8,10 +8,11 @@ const t = lib.testing;
 const MAX_PERMS = 64;
 
 pub fn run(perm_view_addr: u64) void {
-    t.section("user permissions view");
+    t.section("user permissions view (S2.2)");
     testViewMapped(perm_view_addr);
     testSelfHandle(perm_view_addr);
-    testReserveAppearsInView(perm_view_addr);
+    testVmReservationInView(perm_view_addr);
+    testShmInView(perm_view_addr);
 }
 
 fn getView(addr: u64) *const [MAX_PERMS]pv.UserViewEntry {
@@ -19,52 +20,57 @@ fn getView(addr: u64) *const [MAX_PERMS]pv.UserViewEntry {
 }
 
 fn testViewMapped(addr: u64) void {
-    if (addr == 0) {
-        t.fail("perm_view: addr is null");
-        return;
-    }
+    if (addr == 0) { t.fail("perm_view addr is null"); return; }
     const view = getView(addr);
     if (view[0].entry_type == pv.ENTRY_TYPE_PROCESS) {
-        t.pass("perm_view: mapped and readable");
+        t.pass("S2.2: user view mapped read-only, slot 0 is process type");
     } else {
-        t.fail("perm_view: slot 0 not a process entry");
+        t.fail("S2.2: slot 0 is not process type");
     }
 }
 
 fn testSelfHandle(addr: u64) void {
     const view = getView(addr);
     const slot0 = &view[0];
-    t.expectEqual("perm_view: slot0 handle is 0", 0, @as(i64, @bitCast(slot0.handle)));
-    if (slot0.entry_type != pv.ENTRY_TYPE_PROCESS) {
-        t.fail("perm_view: slot0 type not process");
-        return;
-    }
-    t.pass("perm_view: slot0 is HANDLE_SELF");
+    t.expectEqual("S2.4: HANDLE_SELF at slot 0 has handle=0", 0, @as(i64, @bitCast(slot0.handle)));
+    if (slot0.entry_type != pv.ENTRY_TYPE_PROCESS) { t.fail("slot 0 not process"); return; }
+    t.pass("S2.2: user view arg passed to initial thread is perm_view_vaddr");
 }
 
-fn testReserveAppearsInView(addr: u64) void {
+fn testVmReservationInView(addr: u64) void {
     const rights = (perms.VmReservationRights{ .read = true, .write = true }).bits();
     const result = syscall.vm_reserve(0, syscall.PAGE4K, rights);
-    if (result.val < 0) {
-        t.fail("perm_view: vm_reserve failed");
-        return;
-    }
+    if (result.val < 0) { t.fail("setup failed"); return; }
     const handle: u64 = @intCast(result.val);
-
     const view = getView(addr);
     var found = false;
     for (view) |*entry| {
         if (entry.handle == handle and entry.entry_type == pv.ENTRY_TYPE_VM_RESERVATION) {
-            if (entry.field1 == syscall.PAGE4K) {
-                found = true;
-            }
+            if (entry.field1 == syscall.PAGE4K) found = true;
             break;
         }
     }
-
     if (found) {
-        t.pass("perm_view: reservation visible in view");
+        t.pass("S2.2: vm_reservation entry visible with start+size fields");
     } else {
-        t.fail("perm_view: reservation not found in view");
+        t.fail("S2.2: vm_reservation not found in view after reserve");
+    }
+}
+
+fn testShmInView(addr: u64) void {
+    const shm_handle = syscall.shm_create(syscall.PAGE4K);
+    if (shm_handle < 0) { t.fail("setup failed"); return; }
+    const view = getView(addr);
+    var found = false;
+    for (view) |*entry| {
+        if (entry.handle == @as(u64, @intCast(shm_handle)) and entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY) {
+            if (entry.field0 == syscall.PAGE4K) found = true;
+            break;
+        }
+    }
+    if (found) {
+        t.pass("S2.2: shared_memory entry visible with size field");
+    } else {
+        t.fail("S2.2: shared_memory not found in view after create");
     }
 }

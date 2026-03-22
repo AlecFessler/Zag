@@ -362,8 +362,7 @@ pub fn getPreemptionTimer() Timer {
 }
 
 pub fn getMonotonicClock() Timer {
-    monotonic_tsc_instance = Tsc.init(&hpet_timer);
-    return monotonic_tsc_instance.timer();
+    return hpet_timer.timer();
 }
 
 var cached_freq_hz: ?u64 = null;

@@ -137,6 +137,7 @@ pub fn build(b: *std.Build) void {
         \\ -bios /usr/share/ovmf/x64/OVMF.4m.fd \
         \\ -drive file=fat:rw:{s}/{s},format=raw \
         \\ -serial mon:stdio \
+        \\ -display none \
         \\ -no-reboot \
         \\ {s} \
         \\ -smp cores=4 \

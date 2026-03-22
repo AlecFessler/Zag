@@ -95,9 +95,9 @@ The user address space `[0x0000_0000_0000_0000, 0xFFFF_8000_0000_0000)` is divid
 
 1. **Static reservation zone** — `[0x0000_1000_0000_0000, 0xFFFF_8000_0000_0000)`. Reserved for userspace `vm_reserve` calls using hint addresses. The kernel never places ELF segments or stacks in this zone. Userspace may rely on hint addresses within this zone being available (subject to overlap checks).
 
-2. **ASLR zone** — `[0x0000_0000_0040_0000, 0x0000_1000_0000_0000)`. The kernel randomizes the base address of ELF segments and user stacks within this zone. The VMM cursor starts at a random page-aligned offset within the ASLR zone during process creation.
+2. **ASLR zone** — `[0x0000_0000_0000_1000, 0x0000_1000_0000_0000)`. The kernel randomizes the base address of ELF segments and user stacks within this zone. The VMM cursor starts at a random page-aligned offset within the ASLR zone during process creation.
 
-The first 4 MiB `[0, 0x40_0000)` is unmapped (null guard region). ASLR randomization uses a kernel PRNG seeded at boot. The randomized base is page-aligned. User stacks are allocated sequentially from the VMM cursor after ELF segments.
+The first 4 KiB `[0, 0x1000)` is unmapped (null guard page). ASLR randomization uses a kernel PRNG seeded at boot. The randomized base is page-aligned. User stacks are allocated sequentially from the VMM cursor after ELF segments.
 
 #### Restart Context
 
@@ -233,11 +233,12 @@ Fixed-size array of permission entries per Process. Array size is implementation
 
 #### Rights
 
-**ProcessRights:** `grant_to`(0), `spawn_thread`(1), `spawn_process`(2), `mem_reserve`(3), `set_affinity`(4), `restart`(5), `shm_create`(6), `device_own`(7).
+**ProcessRights:** `grant_to`(0), `spawn_thread`(1), `spawn_process`(2), `mem_reserve`(3), `set_affinity`(4), `restart`(5), `shm_create`(6), `device_own`(7), `shutdown`(8). Stored as `u16`.
 
 - `restart`: can only be granted by a parent that itself has `restart`. Once cleared via `disable_restart`, cannot be re-enabled.
 - `shm_create`: required to create shared memory regions.
 - `device_own`: required to receive device handles via grant. The kernel checks this on the target process during device grant.
+- `shutdown`: required to invoke the `shutdown` syscall. Only the root service should hold this.
 
 **VmReservationRights:** `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4). `shareable` and `mmio` are mutually exclusive.
 
@@ -509,20 +510,27 @@ All syscalls return `i64`. Non-negative = success. Negative = error.
 
 ---
 
+### write(ptr, len) → bytes_written
+
+Debug serial output. Copies `len` bytes from user address `ptr` to the kernel debug console.
+
+**Returns:** Number of bytes written (positive).
+**Errors:** `E_INVAL` (len > 4096 or len == 0).
+
 ### vm_reserve(hint, size, max_perms) → handle
 
-Reserve VA range. Creates one `private` tree node and one permissions table entry.
+Reserve VA range. Creates one `private` tree node and one permissions table entry. `size` must be page-aligned and non-zero. `shareable` and `mmio` bits in `max_perms` are mutually exclusive. If `hint` is non-zero and page-aligned with no overlap, the kernel uses it; otherwise the kernel advances the VMM cursor to find a free range.
 
 **Permission:** `HANDLE_SELF.mem_reserve`.
 **Returns:** Handle ID (positive), plus vaddr via second return register.
-**Errors:** `E_PERM`, `E_INVAL` (bad alignment, `shareable`/`mmio` mutual exclusion, hint overlap), `E_NOMEM`, `E_MAXCAP`.
+**Errors:** `E_PERM`, `E_INVAL` (bad alignment, zero size, `shareable`/`mmio` mutual exclusion), `E_NOMEM`, `E_MAXCAP`.
 
 ### vm_perms(vm_handle, offset, size, perms) → result
 
-Adjust `current_rights` on a sub-range. See §2.3 vm_perms for full logic.
+Adjust `current_rights` on a sub-range within a VM reservation. `offset` and `size` must be page-aligned. `perms` must be RWX-only (no `shareable`/`mmio` bits) and ≤ `max_rights`. Range `[original_start + offset, ... + size)` must be within bounds. If RWX = 0, decommit: unmap pages and free physical memory; recommitting demand-pages fresh zeroed pages. See §2.3 vm_perms for full logic.
 
 **Returns:** `E_OK`.
-**Errors:** `E_BADCAP`, `E_INVAL` (exceeds `max_rights`, bad alignment, out of bounds, `shareable`/`mmio` bits), `E_PERM` (range contains SHM/MMIO nodes).
+**Errors:** `E_BADCAP`, `E_INVAL` (bad alignment, out of bounds, `shareable`/`mmio` bits set), `E_PERM` (exceeds `max_rights`, range contains SHM/MMIO nodes).
 
 ### shm_create(size) → handle
 
@@ -592,17 +600,27 @@ Sets core affinity for calling thread. Yield after for immediate effect.
 
 ### grant_perm(src_handle, target_proc_handle, granted_rights) → result
 
-SHM: insert in child, increment refcount. Device: exclusive transfer (requires target has `device_own`). Requires: `grant` bit, target has `grant_to`, rights ⊆ source.
+Grant a capability to a child process. `target_proc_handle` must reference a process entry with `grant_to` set. `granted_rights ⊆ src_handle.rights`. Source must have `grant` bit set.
+
+- **SHM:** Insert copy in target, increment refcount. Source retains handle.
+- **Device:** Exclusive transfer — remove from source, insert in target. Target must have `device_own`.
+
+Only SHM and device handles are grantable. VM reservation and process handles are not grantable.
 
 **Returns:** `E_OK`.
-**Errors:** `E_BADCAP`, `E_PERM`, `E_MAXCAP`.
+**Errors:** `E_BADCAP` (invalid src or target handle, target not a process), `E_PERM` (no `grant` bit, target lacks `grant_to`, target lacks `device_own` for device grants, rights exceed source), `E_MAXCAP` (target permissions table full), `E_INVAL` (non-grantable handle type).
 
 ### revoke_perm(handle) → result
 
-Cannot revoke `HANDLE_SELF`. See §2.4 revoke for per-type behavior.
+Cannot revoke `HANDLE_SELF`. Per-type behavior (§2.4):
+
+- **VM reservation:** Free all pages in range, remove all VMM nodes, clear slot.
+- **SHM:** Unmap PTEs for SHM nodes referencing this SharedMemory, revert to private, decrement refcount, clear slot.
+- **Device:** Unmap MMIO PTEs, return handle up process tree (§2.2 device handle return), clear slot in source.
+- **Process:** Recursively kill child's entire subtree (§2.12). Restartable children restart; non-restartable die. Clear slot.
 
 **Returns:** `E_OK`.
-**Errors:** `E_BADCAP`, `E_INVAL` (attempted `HANDLE_SELF`).
+**Errors:** `E_BADCAP` (invalid handle), `E_INVAL` (attempted `HANDLE_SELF`).
 
 ### disable_restart() → result
 
@@ -629,6 +647,13 @@ Wake up to `count` threads blocked on paddr.
 ### clock_gettime() → nanoseconds
 
 **Returns:** Monotonic nanoseconds since boot.
+
+### shutdown() → noreturn
+
+Immediately halt the machine. Implementation-defined mechanism (e.g. ACPI S5 on x86).
+
+**Permission:** `HANDLE_SELF.shutdown`.
+**Errors:** `E_PERM`.
 
 ---
 

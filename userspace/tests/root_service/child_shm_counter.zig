@@ -1,0 +1,52 @@
+const lib = @import("lib");
+
+const perms = lib.perms;
+const pv = lib.perm_view;
+const syscall = lib.syscall;
+
+const MAX_PERMS = 64;
+
+pub fn main(perm_view_addr: u64) void {
+    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
+
+    var shm_handle: u64 = 0;
+    var shm_size: u64 = 0;
+
+    var attempts: u32 = 0;
+    while (attempts < 50_000) : (attempts += 1) {
+        for (view) |*entry| {
+            if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY) {
+                shm_handle = entry.handle;
+                shm_size = entry.field0;
+                break;
+            }
+        }
+        if (shm_handle != 0) break;
+        syscall.thread_yield();
+    }
+
+    if (shm_handle == 0 or shm_size == 0) {
+        syscall.write("shm_counter: no SHM found\n");
+        return;
+    }
+
+    const vm_rights = (perms.VmReservationRights{
+        .read = true, .write = true, .execute = true, .shareable = true,
+    }).bits();
+    const vm_result = syscall.vm_reserve(0, shm_size, vm_rights);
+    if (vm_result.val < 0) {
+        syscall.write("shm_counter: vm_reserve failed\n");
+        return;
+    }
+
+    const map_rc = syscall.shm_map(shm_handle, @intCast(vm_result.val), 0);
+    if (map_rc != 0) {
+        syscall.write("shm_counter: shm_map failed\n");
+        return;
+    }
+
+    const ptr: *volatile u64 = @ptrFromInt(vm_result.val2);
+    ptr.* = ptr.* + 1;
+    _ = syscall.futex_wake(@ptrFromInt(vm_result.val2), 1);
+    syscall.write("shm_counter: done\n");
+}

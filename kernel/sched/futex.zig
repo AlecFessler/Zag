@@ -10,6 +10,7 @@ const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 
 pub const E_AGAIN: i64 = -9;
+pub const E_TIMEOUT: i64 = -8;
 
 const BUCKET_COUNT = 256;
 
@@ -55,7 +56,7 @@ fn removeWaiter(bucket: *Bucket, target: *Thread) bool {
     return false;
 }
 
-pub fn wait(paddr: PAddr, expected: u64, thread: *Thread) i64 {
+pub fn wait(paddr: PAddr, expected: u64, timeout_ns: u64, thread: *Thread) i64 {
     const bucket = &buckets[bucketIdx(paddr)];
 
     const vaddr = VAddr.fromPAddr(paddr, null);
@@ -68,11 +69,17 @@ pub fn wait(paddr: PAddr, expected: u64, thread: *Thread) i64 {
         return E_AGAIN;
     }
 
+    if (timeout_ns == 0) {
+        bucket.lock.unlockIrqRestore(irq);
+        return E_TIMEOUT;
+    }
+
     thread.state = .blocked;
     pushWaiter(bucket, thread);
 
     bucket.lock.unlockIrqRestore(irq);
 
+    arch.enableInterrupts();
     sched.yield();
     return 0;
 }
@@ -87,7 +94,10 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
         const thread = popWaiter(bucket) orelse break;
         while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
         thread.state = .ready;
-        const target = thread.core_affinity orelse arch.coreID();
+        const target = if (thread.core_affinity) |mask|
+            @as(u64, @ctz(mask))
+        else
+            arch.coreID();
         sched.enqueueOnCore(target, thread);
         woken += 1;
     }

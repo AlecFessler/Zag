@@ -53,6 +53,7 @@ pub const SyscallNum = enum(u64) {
     futex_wait,
     futex_wake,
     clock_gettime,
+    shutdown,
     _,
 };
 
@@ -60,7 +61,7 @@ fn currentProc() *Process {
     return sched.currentThread().?.process;
 }
 
-fn isSubset(requested: u8, allowed: u8) bool {
+fn isSubset(requested: u16, allowed: u16) bool {
     return (requested & ~allowed) == 0;
 }
 
@@ -92,9 +93,10 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
         .grant_perm => ok(sysGrantPerm(arg0, arg1, arg2)),
         .revoke_perm => ok(sysRevokePerm(arg0)),
         .disable_restart => ok(sysDisableRestart()),
-        .futex_wait => ok(sysFutexWait(arg0, arg1)),
+        .futex_wait => ok(sysFutexWait(arg0, arg1, arg2)),
         .futex_wake => ok(sysFutexWake(arg0, arg1)),
         .clock_gettime => ok(sysClockGettime()),
+        .shutdown => sysShutdown(),
         _ => err(E_INVAL),
     };
 }
@@ -147,11 +149,11 @@ fn sysVmPerms(vm_handle: u64, offset: u64, size: u64, perms_bits: u64) i64 {
 
     const vm_res = entry.object.vm_reservation;
 
-    const new_rwx = @as(u8, @truncate(perms_bits)) & 0b111;
+    const new_rwx = @as(u16, @truncate(perms_bits)) & 0b111;
     const max_rwx =
-        @as(u8, @intFromBool(vm_res.max_rights.read)) |
-        (@as(u8, @intFromBool(vm_res.max_rights.write)) << 1) |
-        (@as(u8, @intFromBool(vm_res.max_rights.execute)) << 2);
+        @as(u16, @intFromBool(vm_res.max_rights.read)) |
+        (@as(u16, @intFromBool(vm_res.max_rights.write)) << 1) |
+        (@as(u16, @intFromBool(vm_res.max_rights.execute)) << 2);
     if (!isSubset(new_rwx, max_rwx)) return E_PERM;
 
     const range_end = std.math.add(u64, offset, size) catch return E_INVAL;
@@ -207,10 +209,10 @@ fn sysShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
 
     const shm = shm_entry.object.shared_memory;
     const shm_rwx = shm_entry.rights & 0b111;
-    const max_rwx =
-        @as(u8, @intFromBool(vm_res.max_rights.read)) |
-        (@as(u8, @intFromBool(vm_res.max_rights.write)) << 1) |
-        (@as(u8, @intFromBool(vm_res.max_rights.execute)) << 2);
+    const max_rwx: u16 =
+        @as(u16, @intFromBool(vm_res.max_rights.read)) |
+        (@as(u16, @intFromBool(vm_res.max_rights.write)) << 1) |
+        (@as(u16, @intFromBool(vm_res.max_rights.execute)) << 2);
     if (!isSubset(shm_rwx, max_rwx)) return E_PERM;
 
     const shm_map_rights = VmReservationRights{
@@ -314,7 +316,7 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms: u64) i64 {
     const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
     if (!self_entry.processRights().spawn_process) return E_PERM;
 
-    const child_perms: ProcessRights = @bitCast(@as(u8, @truncate(perms)));
+    const child_perms: ProcessRights = @bitCast(@as(u16, @truncate(perms)));
     if (child_perms.restart and !self_entry.processRights().restart) return E_PERM;
 
     const elf_bytes: [*]const u8 = @ptrFromInt(elf_ptr);
@@ -363,6 +365,7 @@ fn sysThreadExit() noreturn {
     const is_last = thread.process.removeThread(thread);
     thread.last_in_proc = is_last;
     thread.state = .exited;
+    arch.enableInterrupts();
     sched.yield();
     while (true) {
         arch.enableInterrupts();
@@ -371,6 +374,7 @@ fn sysThreadExit() noreturn {
 }
 
 fn sysThreadYield() i64 {
+    arch.enableInterrupts();
     sched.yield();
     return E_OK;
 }
@@ -390,7 +394,7 @@ fn sysSetAffinity(core_mask: u64) i64 {
 
 fn sysGrantPerm(src_handle: u64, target_proc_handle: u64, granted_rights: u64) i64 {
     const proc = currentProc();
-    const granted_u8: u8 = @truncate(granted_rights);
+    const granted_u16: u16 = @truncate(granted_rights);
 
     const src_entry = proc.getPermByHandle(src_handle) orelse return E_BADCAP;
 
@@ -403,12 +407,12 @@ fn sysGrantPerm(src_handle: u64, target_proc_handle: u64, granted_rights: u64) i
     switch (src_entry.object) {
         .shared_memory => |shm| {
             if (!src_entry.shmRights().grant) return E_PERM;
-            if (!isSubset(granted_u8, src_entry.rights)) return E_PERM;
+            if (!isSubset(granted_u16, src_entry.rights)) return E_PERM;
 
             const new_entry = PermissionEntry{
                 .handle = 0,
                 .object = .{ .shared_memory = shm },
-                .rights = granted_u8,
+                .rights = granted_u16,
             };
             shm.incRef();
             _ = target_proc.insertPerm(new_entry) catch {
@@ -419,14 +423,14 @@ fn sysGrantPerm(src_handle: u64, target_proc_handle: u64, granted_rights: u64) i
         },
         .device_region => |device| {
             if (!src_entry.deviceRights().grant) return E_PERM;
-            if (!isSubset(granted_u8, src_entry.rights)) return E_PERM;
+            if (!isSubset(granted_u16, src_entry.rights)) return E_PERM;
             const target_self = target_proc.getPermByHandle(0) orelse return E_PERM;
             if (!target_self.processRights().device_own) return E_PERM;
 
             const new_entry = PermissionEntry{
                 .handle = 0,
                 .object = .{ .device_region = device },
-                .rights = granted_u8,
+                .rights = granted_u16,
             };
             _ = target_proc.insertPerm(new_entry) catch return E_MAXCAP;
             proc.removePerm(src_handle) catch {};
@@ -474,14 +478,14 @@ fn sysDisableRestart() i64 {
     return E_OK;
 }
 
-fn sysFutexWait(addr: u64, expected: u64) i64 {
+fn sysFutexWait(addr: u64, expected: u64, timeout_ns: u64) i64 {
     if (!std.mem.isAligned(addr, 8)) return E_INVAL;
 
     const proc = currentProc();
     const vaddr = VAddr.fromInt(addr);
     const paddr = arch.resolveVaddr(proc.addr_space_root, vaddr) orelse return E_BADADDR;
 
-    return futex.wait(paddr, expected, sched.currentThread().?);
+    return futex.wait(paddr, expected, timeout_ns, sched.currentThread().?);
 }
 
 fn sysFutexWake(addr: u64, count: u64) i64 {
@@ -496,5 +500,21 @@ fn sysFutexWake(addr: u64, count: u64) i64 {
 
 fn sysClockGettime() i64 {
     return @bitCast(arch.getMonotonicClock().now());
+}
+
+fn sysShutdown() noreturn {
+    const proc = currentProc();
+    const self_entry = proc.getPermByHandle(0);
+    if (self_entry) |entry| {
+        if (entry.processRights().shutdown) {
+            arch.print("shutdown: initiated by process\n", .{});
+            arch.shutdown();
+        }
+    }
+    arch.print("shutdown: denied (no permission)\n", .{});
+    while (true) {
+        arch.enableInterrupts();
+        asm volatile ("hlt");
+    }
 }
 

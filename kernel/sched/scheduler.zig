@@ -3,11 +3,13 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const device_registry = zag.devices.registry;
 const memory_init = zag.memory.init;
 const process_mod = zag.sched.process;
 const thread_mod = zag.sched.thread;
 
 const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
+const PAddr = zag.memory.address.PAddr;
 const Process = zag.sched.process.Process;
 const ProcessAllocator = zag.sched.process.ProcessAllocator;
 const SpinLock = zag.sched.sync.SpinLock;
@@ -155,6 +157,8 @@ pub fn globalInit() !void {
         state.rq.init();
     }
 
+    _ = try device_registry.registerDevice(PAddr.fromInt(0xFEE0_0000), 0x1000);
+
     const root_proc = try Process.create(embedded.root_service, .{
         .grant_to = true,
         .spawn_thread = true,
@@ -164,7 +168,9 @@ pub fn globalInit() !void {
         .restart = true,
         .shm_create = true,
         .device_own = true,
+        .shutdown = true,
     }, null);
+    device_registry.grantAllToRootService(root_proc);
     core_states[0].rq.enqueue(root_proc.threads[0]);
 
     initialized = true;

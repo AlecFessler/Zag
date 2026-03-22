@@ -152,14 +152,16 @@ pub const Process = struct {
             self.lock.unlock();
             return;
         }
+        if (self.restart_context == null) {
+            self.alive = false;
+        }
         for (self.threads[0..self.num_threads], 0..) |thread, i| {
             thread.state = .exited;
             thread.last_in_proc = (i == self.num_threads - 1);
         }
+        self.lock.unlock();
         if (self.num_threads == 0) {
-            self.exitUnlocked();
-        } else {
-            self.lock.unlock();
+            self.exit();
         }
     }
 
@@ -172,10 +174,12 @@ pub const Process = struct {
     }
 
     pub fn disableRestart(self: *Process) void {
+        self.lock.lock();
         if (self.restart_context) |rc| {
             restart_context_mod.destroy(rc);
             self.restart_context = null;
         }
+        self.lock.unlock();
 
         var i: u64 = 0;
         while (i < self.num_children) : (i += 1) {
@@ -185,13 +189,17 @@ pub const Process = struct {
 
     pub fn exit(self: *Process) void {
         self.lock.lock();
-        self.exitUnlocked();
-    }
-
-    fn exitUnlocked(self: *Process) void {
+        if (!self.alive) {
+            self.lock.unlock();
+            return;
+        }
+        const should_restart = self.restart_context != null;
+        if (!should_restart) {
+            self.alive = false;
+        }
         self.lock.unlock();
 
-        if (self.restart_context != null) {
+        if (should_restart) {
             self.performRestart();
             return;
         }
@@ -204,7 +212,13 @@ pub const Process = struct {
     }
 
     fn performRestart(self: *Process) void {
-        const rc = self.restart_context.?;
+        const rc = self.restart_context orelse {
+            self.cleanupPhase1();
+            if (self.num_children == 0) {
+                self.cleanupPhase2();
+            }
+            return;
+        };
 
         self.vmm.resetForRestart();
 
@@ -215,6 +229,7 @@ pub const Process = struct {
                 self.perm_count -= 1;
             }
         }
+        self.syncUserView();
         self.perm_lock.unlock();
 
         if (rc.data_segment.ghost.len > 0) {
@@ -225,13 +240,11 @@ pub const Process = struct {
             );
         }
 
-        const thread = thread_mod.Thread.create(self, rc.entry_point, 0, DEFAULT_STACK_PAGES) catch return;
+        const thread = thread_mod.Thread.create(self, rc.entry_point, self.perm_view_vaddr.addr, DEFAULT_STACK_PAGES) catch return;
         sched.enqueueOnCore(arch.coreID(), thread);
     }
 
     fn cleanupPhase1(self: *Process) void {
-        self.alive = false;
-
         self.vmm.deinit();
 
         for (&self.perm_table) |*entry| {
@@ -246,10 +259,6 @@ pub const Process = struct {
         }
 
         arch.freeUserAddrSpace(self.addr_space_root);
-
-        const pmm_iface = pmm.global_pmm.?.allocator();
-        const pml4: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(self.addr_space_root, null).addr);
-        pmm_iface.destroy(pml4);
     }
 
     fn cleanupPhase2(self: *Process) void {
@@ -284,7 +293,7 @@ pub const Process = struct {
         if (changed) self.syncUserView();
     }
 
-    pub fn returnDeviceHandleUpTree(source: *Process, rights: u8, device: *DeviceRegion) void {
+    pub fn returnDeviceHandleUpTree(source: *Process, rights: u16, device: *DeviceRegion) void {
         var ancestor = source.parent;
         while (ancestor) |anc| {
             if (anc.alive) {

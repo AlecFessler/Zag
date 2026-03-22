@@ -272,6 +272,15 @@ pub fn halt() noreturn {
     }
 }
 
+pub fn qemuShutdown() noreturn {
+    asm volatile ("outw %[val], %[port]"
+        :
+        : [val] "{ax}" (@as(u16, 0x2000)),
+          [port] "{dx}" (@as(u16, 0x604)),
+    );
+    unreachable;
+}
+
 pub fn readCr3() u64 {
     var value: u64 = 0;
     asm volatile ("mov %%cr3, %[out]"
