@@ -1,7 +1,7 @@
 ENTRY(_start)
 
 SECTIONS {
-    . = 0x400000;
+    . = 0x0;
 
     .text : {
         *(.text._start)
@@ -9,6 +9,8 @@ SECTIONS {
     }
 
     .rodata : { *(.rodata .rodata.*) }
+    .rela.dyn : { *(.rela.dyn) *(.rela.*) }
+    .got : { *(.got) *(.got.plt) }
     .data : { *(.data .data.*) }
     .bss : { *(.bss .bss.*) }
 
@@ -16,5 +18,9 @@ SECTIONS {
         *(.eh_frame*)
         *(.note*)
         *(.comment*)
+        *(.dynamic)
+        *(.dynsym)
+        *(.dynstr)
+        *(.gnu.hash)
     }
 }

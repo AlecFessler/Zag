@@ -10,11 +10,9 @@ const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
 const Process = zag.sched.process.Process;
 const ProcessAllocator = zag.sched.process.ProcessAllocator;
 const SpinLock = zag.sched.sync.SpinLock;
-const Timer = zag.arch.timer.Timer;
 const Thread = zag.sched.thread.Thread;
 const ThreadAllocator = zag.sched.thread.ThreadAllocator;
-const VAddr = zag.memory.address.VAddr;
-const x64_cpu = zag.arch.x64.cpu;
+const Timer = zag.arch.timer.Timer;
 
 const embedded = @import("embedded_bins");
 
@@ -166,14 +164,17 @@ pub fn globalInit() !void {
         state.rq.init();
     }
 
-    const hello_world_proc = try Process.create(embedded.hello_world, .{
-        .destroy = true,
+    const root_proc = try Process.create(embedded.root_service, .{
+        .grant_to = true,
         .spawn_thread = true,
         .spawn_process = true,
         .mem_reserve = true,
         .set_affinity = true,
+        .restart = true,
+        .shm_create = true,
+        .device_own = true,
     }, null);
-    core_states[0].rq.enqueue(hello_world_proc.threads[0]);
+    core_states[0].rq.enqueue(root_proc.threads[0]);
 
     initialized = true;
 }

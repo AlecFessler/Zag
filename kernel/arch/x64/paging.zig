@@ -269,6 +269,7 @@ pub fn unmapPage(
     if (!l1_entry.present) return null;
     const phys = l1_entry.getPAddr();
     l1_entry.* = DEFAULT_PAGE_ENTRY;
+    cpu.invlpg(virt.addr);
     return phys;
 }
 

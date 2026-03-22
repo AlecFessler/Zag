@@ -8,28 +8,31 @@ pub fn build(b: *std.Build) void {
         .root_source_file = .{ .cwd_relative = "../../lib/lib.zig" },
         .target = target,
         .optimize = .ReleaseSmall,
+        .pic = true,
     });
     const app_mod = b.createModule(.{
-        .root_source_file = b.path("hello_world.zig"),
+        .root_source_file = b.path("main.zig"),
         .target = target,
         .optimize = .ReleaseSmall,
+        .pic = true,
     });
     app_mod.addImport("lib", lib_mod);
     const start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "../../lib/start.zig" },
         .target = target,
         .optimize = .ReleaseSmall,
+        .pic = true,
     });
     start_mod.addImport("lib", lib_mod);
     start_mod.addImport("app", app_mod);
     const exe = b.addExecutable(.{
-        .name = "hello_world",
+        .name = "root_service",
         .root_module = start_mod,
         .linkage = .static,
     });
+    exe.pie = true;
     exe.entry = .{ .symbol_name = "_start" };
     exe.setLinkerScript(.{ .cwd_relative = "linker.ld" });
-    const objcopy = b.addObjCopy(exe.getEmittedBin(), .{ .format = .bin });
-    const install = b.addInstallFile(objcopy.getOutput(), "../../../bin/hello_world.bin");
+    const install = b.addInstallFile(exe.getEmittedBin(), "../../../bin/root_service.elf");
     b.getInstallStep().dependOn(&install.step);
 }

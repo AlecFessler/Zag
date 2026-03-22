@@ -250,6 +250,14 @@ pub fn triggerSchedulerInterrupt(core_id: u64) void {
     }
 }
 
+pub fn readTimestamp() u64 {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return x64.cpu.rdtscLFenced(),
+        .aarch64 => return 0,
+        else => unreachable,
+    }
+}
+
 pub fn print(
     comptime format: []const u8,
     args: anytype,

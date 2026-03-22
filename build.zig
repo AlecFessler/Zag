@@ -4,6 +4,7 @@ pub fn build(b: *std.Build) void {
     const kvm = b.option(bool, "kvm", "Enable KVM acceleration (default: on)") orelse true;
     const use_llvm = b.option(bool, "use-llvm", "Force LLVM+LLD backend") orelse false;
     const target_arch = b.option([]const u8, "arch", "Target architecture (x64 or arm)") orelse "x64";
+    const root_service_path = b.option([]const u8, "root-service", "Path to root service ELF (default: userspace/bin/root_service.elf)");
     const arch: std.Target.Cpu.Arch = blk: {
         break :blk if (std.mem.eql(u8, target_arch, "x64"))
             .x86_64
@@ -25,27 +26,16 @@ pub fn build(b: *std.Build) void {
     zag_mod.red_zone = false;
     zag_mod.addImport("zag", zag_mod);
 
-    // ── Userspace binaries (from userspace/bin/) ────────────────────────
+    // ── Root service binary ─────────────────────────────────────────────
     const embedded_wf = b.addWriteFiles();
     var embed_src: std.ArrayListUnmanaged(u8) = .{};
 
-    var bin_dir = std.fs.cwd().openDir("userspace/bin", .{ .iterate = true }) catch
-        @panic("userspace/bin/ not found — build userspace programs first");
-    defer bin_dir.close();
-
-    var iter = bin_dir.iterate();
-    while (iter.next() catch @panic("failed to iterate userspace/bin/")) |entry| {
-        if (entry.kind != .file) continue;
-        const name = entry.name;
-        if (!std.mem.endsWith(u8, name, ".bin")) continue;
-
-        const stem = name[0 .. name.len - 4];
-        _ = embedded_wf.addCopyFile(.{ .cwd_relative = b.fmt("userspace/bin/{s}", .{name}) }, name);
-        embed_src.writer(b.allocator).print(
-            "pub const {s} = @embedFile(\"{s}\");\n",
-            .{ stem, name },
-        ) catch @panic("OOM");
-    }
+    const root_elf_path = root_service_path orelse "userspace/bin/root_service.elf";
+    _ = embedded_wf.addCopyFile(.{ .cwd_relative = root_elf_path }, "root_service.elf");
+    embed_src.writer(b.allocator).print(
+        "pub const root_service = @embedFile(\"root_service.elf\");\n",
+        .{},
+    ) catch @panic("OOM");
 
     // ── SMP trampoline ──────────────────────────────────────────────────
     const nasm_step = b.addSystemCommand(&.{

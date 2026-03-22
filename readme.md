@@ -89,6 +89,16 @@ The kernel loads ELF binaries into the process's address space. Each segment is 
 
 Not all segments are present in every binary. The VMM cursor is bumped past each region. All pages in `[elf_ptr, elf_ptr + elf_len)` must be committed in the calling process's address space (see §3).
 
+#### User Address Space Layout and ASLR
+
+The user address space `[0x0000_0000_0000_0000, 0xFFFF_8000_0000_0000)` is divided into two zones:
+
+1. **Static reservation zone** — `[0x0000_1000_0000_0000, 0xFFFF_8000_0000_0000)`. Reserved for userspace `vm_reserve` calls using hint addresses. The kernel never places ELF segments or stacks in this zone. Userspace may rely on hint addresses within this zone being available (subject to overlap checks).
+
+2. **ASLR zone** — `[0x0000_0000_0040_0000, 0x0000_1000_0000_0000)`. The kernel randomizes the base address of ELF segments and user stacks within this zone. The VMM cursor starts at a random page-aligned offset within the ASLR zone during process creation.
+
+The first 4 MiB `[0, 0x40_0000)` is unmapped (null guard region). ASLR randomization uses a kernel PRNG seeded at boot. The randomized base is page-aligned. User stacks are allocated sequentially from the VMM cursor after ELF segments.
+
 #### Restart Context
 
 Allocated at process creation if `perms` includes `restart`. Contains:

@@ -9,7 +9,7 @@ const SpinLock = zag.sched.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 
-pub const E_BUSY: i64 = -11;
+pub const E_AGAIN: i64 = -9;
 
 const BUCKET_COUNT = 256;
 
@@ -55,17 +55,17 @@ fn removeWaiter(bucket: *Bucket, target: *Thread) bool {
     return false;
 }
 
-pub fn wait(paddr: PAddr, expected: u32, thread: *Thread) i64 {
+pub fn wait(paddr: PAddr, expected: u64, thread: *Thread) i64 {
     const bucket = &buckets[bucketIdx(paddr)];
 
     const vaddr = VAddr.fromPAddr(paddr, null);
-    const value_ptr: *const u32 = @ptrFromInt(vaddr.addr);
+    const value_ptr: *const u64 = @ptrFromInt(vaddr.addr);
 
     const irq = bucket.lock.lockIrqSave();
 
-    if (@atomicLoad(u32, value_ptr, .acquire) != expected) {
+    if (@atomicLoad(u64, value_ptr, .acquire) != expected) {
         bucket.lock.unlockIrqRestore(irq);
-        return E_BUSY;
+        return E_AGAIN;
     }
 
     thread.state = .blocked;

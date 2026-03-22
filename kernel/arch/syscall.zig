@@ -1,13 +1,12 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const arch = zag.arch.dispatch;
 const address = zag.memory.address;
+const arch = zag.arch.dispatch;
 const futex = zag.sched.futex;
 const paging = zag.memory.paging;
 const sched = zag.sched.scheduler;
 
-const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Process = zag.sched.process.Process;
 const ProcessRights = zag.perms.permissions.ProcessRights;
@@ -174,6 +173,8 @@ fn sysShmCreate(size: u64) i64 {
     if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) return E_INVAL;
 
     const proc = currentProc();
+    const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
+    if (!self_entry.processRights().shm_create) return E_PERM;
 
     const shm = SharedMemory.create(size) catch return E_NOMEM;
 
@@ -261,7 +262,7 @@ fn sysMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
 
     const device_entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
     if (device_entry.object != .device_region) return E_BADCAP;
-    if (!device_entry.deviceRights().grant) return E_PERM;
+    if (!device_entry.deviceRights().map) return E_PERM;
 
     const vm_entry = proc.getPermByHandle(vm_handle) orelse return E_BADCAP;
     if (vm_entry.object != .vm_reservation) return E_BADCAP;
@@ -314,12 +315,13 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms: u64) i64 {
     if (!self_entry.processRights().spawn_process) return E_PERM;
 
     const child_perms: ProcessRights = @bitCast(@as(u8, @truncate(perms)));
+    if (child_perms.restart and !self_entry.processRights().restart) return E_PERM;
 
     const elf_bytes: [*]const u8 = @ptrFromInt(elf_ptr);
     const elf_binary = elf_bytes[0..elf_len];
 
     const child = Process.create(elf_binary, child_perms, proc) catch |e| return switch (e) {
-        error.BinaryTooLarge => E_INVAL,
+        error.InvalidElf => E_INVAL,
         else => E_NOMEM,
     };
 
@@ -416,6 +418,8 @@ fn sysGrantPerm(src_handle: u64, target_proc_handle: u64, granted_rights: u64) i
         .device_region => |device| {
             if (!src_entry.deviceRights().grant) return E_PERM;
             if (!isSubset(granted_u8, src_entry.rights)) return E_PERM;
+            const target_self = target_proc.getPermByHandle(0) orelse return E_PERM;
+            if (!target_self.processRights().device_own) return E_PERM;
 
             const new_entry = PermissionEntry{
                 .handle = 0,
@@ -448,11 +452,11 @@ fn sysRevokePerm(handle: u64) i64 {
         },
         .device_region => |device| {
             proc.vmm.revokeMmioHandle(device);
-            returnDeviceHandleUpTree(proc, entry.rights, device);
+            Process.returnDeviceHandleUpTree(proc, entry.rights, device);
             proc.removePerm(handle) catch {};
         },
         .process => |child| {
-            child.kill();
+            child.killSubtree();
             proc.removePerm(handle) catch {};
         },
         .empty => return E_BADCAP,
@@ -475,7 +479,7 @@ fn sysFutexWait(addr: u64, expected: u64) i64 {
     const vaddr = VAddr.fromInt(addr);
     const paddr = arch.resolveVaddr(proc.addr_space_root, vaddr) orelse return E_BADADDR;
 
-    return futex.wait(paddr, @truncate(expected), sched.currentThread().?);
+    return futex.wait(paddr, expected, sched.currentThread().?);
 }
 
 fn sysFutexWake(addr: u64, count: u64) i64 {
@@ -492,17 +496,3 @@ fn sysClockGettime() i64 {
     return @bitCast(arch.getMonotonicClock().now());
 }
 
-fn returnDeviceHandleUpTree(source_proc: *Process, rights: u8, device: *DeviceRegion) void {
-    var ancestor = source_proc.parent;
-    while (ancestor) |anc| {
-        if (anc.alive) {
-            _ = anc.insertPerm(.{
-                .handle = 0,
-                .object = .{ .device_region = device },
-                .rights = rights,
-            }) catch {};
-            return;
-        }
-        ancestor = anc.parent;
-    }
-}
