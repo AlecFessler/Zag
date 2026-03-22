@@ -1,7 +1,8 @@
 const lib = @import("lib");
+
+const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
-const perms = lib.perms;
 
 pub fn run() void {
     t.section("shm_create + shm_map + shm_unmap");

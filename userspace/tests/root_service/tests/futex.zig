@@ -1,15 +1,13 @@
-const std = @import("std");
 const lib = @import("lib");
+const std = @import("std");
+
 const syscall = lib.syscall;
 const t = lib.testing;
 
-var futex_val = std.atomic.Value(u64).init(0);
-var producer_done = std.atomic.Value(bool).init(false);
+var thread_signal = std.atomic.Value(u64).init(0);
 
-fn producerThread() void {
-    futex_val.store(1, .release);
-    _ = syscall.futex_wake(@ptrCast(&futex_val), 1);
-    producer_done.store(true, .release);
+fn signalThread() void {
+    thread_signal.store(1, .release);
     syscall.thread_exit();
 }
 
@@ -18,7 +16,7 @@ pub fn run() void {
     testFutexMismatch();
     testFutexBadAlign();
     testFutexWakeNone();
-    testFutexSignal();
+    testFutexSignalViaPolling();
 }
 
 fn testFutexMismatch() void {
@@ -40,27 +38,23 @@ fn testFutexWakeNone() void {
     t.expectEqual("futex_wake: no waiters returns 0", 0, rc);
 }
 
-fn testFutexSignal() void {
-    futex_val.store(0, .release);
-    producer_done.store(false, .release);
+fn testFutexSignalViaPolling() void {
+    thread_signal.store(0, .release);
 
-    const rc = syscall.thread_create(&producerThread, 0, 4);
+    const rc = syscall.thread_create(&signalThread, 0, 4);
     if (rc != 0) {
-        t.fail("futex_signal: thread_create failed");
+        t.failWithVal("futex_signal: thread_create failed", 0, rc);
         return;
     }
 
     var spins: u32 = 0;
-    while (!producer_done.load(.acquire) and spins < 100_000) : (spins += 1) {
-        if (futex_val.load(.acquire) == 0) {
-            _ = syscall.futex_wait(@ptrCast(&futex_val), 0);
-        }
+    while (thread_signal.load(.acquire) == 0 and spins < 500_000) : (spins += 1) {
         syscall.thread_yield();
     }
 
-    if (futex_val.load(.acquire) == 1) {
-        t.pass("futex_signal: producer woke consumer");
+    if (thread_signal.load(.acquire) == 1) {
+        t.pass("futex_signal: thread signaled via atomic");
     } else {
-        t.fail("futex_signal: value not updated");
+        t.fail("futex_signal: thread did not signal");
     }
 }

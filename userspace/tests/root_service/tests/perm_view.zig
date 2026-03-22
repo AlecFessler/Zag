@@ -1,8 +1,9 @@
 const lib = @import("lib");
+
+const perms = lib.perms;
 const pv = lib.perm_view;
 const syscall = lib.syscall;
 const t = lib.testing;
-const perms = lib.perms;
 
 const MAX_PERMS = 64;
 

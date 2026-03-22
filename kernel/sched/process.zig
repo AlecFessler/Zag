@@ -1,9 +1,9 @@
 const std = @import("std");
 const zag = @import("zag");
-const elf = std.elf;
 
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
+const elf = std.elf;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
@@ -148,15 +148,18 @@ pub const Process = struct {
 
     pub fn kill(self: *Process) void {
         self.lock.lock();
-        defer self.lock.unlock();
-        if (!self.alive) return;
-        self.alive = false;
+        if (!self.alive) {
+            self.lock.unlock();
+            return;
+        }
         for (self.threads[0..self.num_threads], 0..) |thread, i| {
             thread.state = .exited;
             thread.last_in_proc = (i == self.num_threads - 1);
         }
         if (self.num_threads == 0) {
             self.exitUnlocked();
+        } else {
+            self.lock.unlock();
         }
     }
 

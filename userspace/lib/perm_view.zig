@@ -11,8 +11,4 @@ pub const UserViewEntry = extern struct {
     _pad: [6]u8,
     field0: u64,
     field1: u64,
-
-    pub fn isEmpty(self: *const UserViewEntry) bool {
-        return self.entry_type == ENTRY_TYPE_EMPTY;
-    }
 };

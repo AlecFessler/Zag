@@ -49,10 +49,6 @@ pub const PermissionEntry = struct {
         return @bitCast(self.rights);
     }
 
-    pub fn vmRights(self: @This()) VmReservationRights {
-        return @bitCast(self.rights);
-    }
-
     pub fn shmRights(self: @This()) SharedMemoryRights {
         return @bitCast(self.rights);
     }

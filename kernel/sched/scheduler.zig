@@ -1,3 +1,4 @@
+const embedded = @import("embedded_bins");
 const std = @import("std");
 const zag = @import("zag");
 
@@ -13,8 +14,6 @@ const SpinLock = zag.sched.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 const ThreadAllocator = zag.sched.thread.ThreadAllocator;
 const Timer = zag.arch.timer.Timer;
-
-const embedded = @import("embedded_bins");
 
 var proc_alloc_instance: ProcessAllocator = undefined;
 var thread_alloc_instance: ThreadAllocator = undefined;
@@ -52,14 +51,6 @@ const RunQueue = struct {
         thread.next = null;
         self.tail.next = thread;
         self.tail = thread;
-    }
-
-    pub fn enqueueToFront(self: *RunQueue, thread: *Thread) void {
-        thread.next = self.head.next;
-        self.head.next = thread;
-        if (self.tail == self.head) {
-            self.tail = thread;
-        }
     }
 
     pub fn dequeue(self: *RunQueue) ?*Thread {

@@ -414,8 +414,10 @@ pub const VirtualMemoryManager = struct {
         const range_start = VAddr.fromInt(original_start.addr + offset);
         const range_size = shm.size();
         const range_end_addr = range_start.addr + range_size;
-        _ = original_size;
         _ = vm_handle;
+
+        if (hasDuplicateShm(&self.tree, original_start, original_size, shm))
+            return error.DuplicateMapping;
 
         try splitAtLocked(&self.tree, range_start);
         try splitAtLocked(&self.tree, VAddr.fromInt(range_end_addr));
@@ -521,8 +523,10 @@ pub const VirtualMemoryManager = struct {
         const range_start = VAddr.fromInt(original_start.addr + offset);
         const range_size = device.size;
         const range_end_addr = range_start.addr + range_size;
-        _ = original_size;
         _ = vm_handle;
+
+        if (hasDuplicateMmio(&self.tree, original_start, original_size, device))
+            return error.DuplicateMapping;
 
         try splitAtLocked(&self.tree, range_start);
         try splitAtLocked(&self.tree, VAddr.fromInt(range_end_addr));
@@ -836,6 +840,34 @@ fn mergeRange(tree: *VmTree, range_start: VAddr, range_end: VAddr) void {
     }
 
     tryMergeAt(tree, range_start);
+}
+
+fn hasDuplicateShm(tree: *VmTree, res_start: VAddr, res_size: u64, shm: *SharedMemory) bool {
+    var found = false;
+    const Ctx = struct { target: *SharedMemory, found: *bool };
+    var ctx = Ctx{ .target = shm, .found = &found };
+    var s = mkSentinel(res_start);
+    var e = mkSentinel(VAddr.fromInt(res_start.addr + res_size));
+    tree.forEachInRange(&s, &e, &ctx, struct {
+        fn cb(c: *Ctx, node: *VmNode) void {
+            if (node.kind == .shared_memory and node.kind.shared_memory == c.target) c.found.* = true;
+        }
+    }.cb);
+    return found;
+}
+
+fn hasDuplicateMmio(tree: *VmTree, res_start: VAddr, res_size: u64, device: *DeviceRegion) bool {
+    var found = false;
+    const Ctx = struct { target: *DeviceRegion, found: *bool };
+    var ctx = Ctx{ .target = device, .found = &found };
+    var s = mkSentinel(res_start);
+    var e = mkSentinel(VAddr.fromInt(res_start.addr + res_size));
+    tree.forEachInRange(&s, &e, &ctx, struct {
+        fn cb(c: *Ctx, node: *VmNode) void {
+            if (node.kind == .mmio and node.kind.mmio == c.target) c.found.* = true;
+        }
+    }.cb);
+    return found;
 }
 
 fn hasCommittedPages(tree: *VmTree, root: PAddr, range_start: VAddr, range_end_addr: u64) bool {

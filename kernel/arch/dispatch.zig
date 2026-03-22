@@ -9,8 +9,8 @@ const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
-const Timer = zag.arch.timer.Timer;
 const Thread = zag.sched.thread.Thread;
+const Timer = zag.arch.timer.Timer;
 const VAddr = zag.memory.address.VAddr;
 
 pub fn init() void {

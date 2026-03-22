@@ -1,9 +1,8 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
-
 const PAddr = zag.memory.address.PAddr;
+const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
 
 pub const DeviceRegion = struct {
     phys_base: PAddr,

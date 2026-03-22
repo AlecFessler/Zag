@@ -1,7 +1,8 @@
 const lib = @import("lib");
+
+const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
-const perms = lib.perms;
 
 pub fn run() void {
     t.section("disable_restart + revoke_perm");
@@ -9,16 +10,6 @@ pub fn run() void {
     testRevokeSelf();
     testRevokeVmReservation();
     testDisableRestart();
-}
-
-fn testClockGettime() void {
-    const t1 = syscall.clock_gettime();
-    const t2 = syscall.clock_gettime();
-    if (t2 >= t1 and t1 > 0) {
-        t.pass("clock_gettime: monotonic and nonzero");
-    } else {
-        t.fail("clock_gettime: not monotonic or zero");
-    }
 }
 
 fn testDisableRestart() void {

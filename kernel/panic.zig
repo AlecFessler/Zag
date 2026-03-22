@@ -1,5 +1,5 @@
 const std = @import("std");
-const zag = @import("zag.zig");
+const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const builtin = std.builtin;

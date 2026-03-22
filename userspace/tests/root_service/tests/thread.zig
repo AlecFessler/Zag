@@ -1,5 +1,6 @@
-const std = @import("std");
 const lib = @import("lib");
+const std = @import("std");
+
 const syscall = lib.syscall;
 const t = lib.testing;
 

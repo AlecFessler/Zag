@@ -1,8 +1,8 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const arch = zag.arch.dispatch;
 const address = zag.memory.address;
+const arch = zag.arch.dispatch;
 const boot = zag.boot;
 const device_region_mod = zag.memory.device_region;
 const paging = zag.memory.paging;

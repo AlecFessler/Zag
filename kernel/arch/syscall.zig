@@ -360,6 +360,8 @@ fn sysThreadCreate(entry_addr: u64, arg: u64, num_stack_pages_u64: u64) i64 {
 
 fn sysThreadExit() noreturn {
     const thread = sched.currentThread().?;
+    const is_last = thread.process.removeThread(thread);
+    thread.last_in_proc = is_last;
     thread.state = .exited;
     sched.yield();
     while (true) {

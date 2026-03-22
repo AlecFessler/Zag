@@ -1,5 +1,3 @@
-const lib = @import("lib.zig");
-
 pub const PAGE4K: u64 = 4096;
 
 pub const SyscallResult2 = struct {
