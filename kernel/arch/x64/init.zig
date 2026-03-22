@@ -11,8 +11,6 @@ const PAddr = zag.memory.address.PAddr;
 
 pub fn init() void {
     serial.init(.com1, 115200);
-    serial.print("Booting Zag x64 kernel...\n", .{});
-
     gdt.init();
     idt.init();
     exceptions.init();

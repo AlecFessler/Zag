@@ -122,10 +122,7 @@ pub fn smpInit() !void {
             }
             std.atomic.spinLoopHint();
         }
-        arch.print("AP {} done, cores_online={}\n", .{ la.apic_id, cores_online.load(.acquire) });
     }
-
-    arch.print("SMP: {}/{} cores online\n", .{ cores_online.load(.acquire), apic.coreCount() });
 }
 
 fn coreInit() callconv(.c) noreturn {
@@ -143,7 +140,6 @@ fn coreInit() callconv(.c) noreturn {
     gdt.loadGdt(core_id);
     cpu.ltr(gdt.TSS_OFFSET);
 
-    arch.print("AP core {} online\n", .{core_id});
     _ = cores_online.fetchAdd(1, .release);
     sched.perCoreInit();
     arch.halt();

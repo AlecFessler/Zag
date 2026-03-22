@@ -45,14 +45,14 @@ pub fn build(b: *std.Build) void {
         .pic = true,
     });
 
-    const child_exit_bin = buildChild(b, target, lib_mod, "child_exit", "child_exit.zig");
-    const child_shm_counter_bin = buildChild(b, target, lib_mod, "child_shm_counter", "child_shm_counter.zig");
-    const child_stack_overflow_bin = buildChild(b, target, lib_mod, "child_stack_overflow", "child_stack_overflow.zig");
-    const child_restart_counter_bin = buildChild(b, target, lib_mod, "child_restart_counter", "child_restart_counter.zig");
-    const child_multithread_bin = buildChild(b, target, lib_mod, "child_multithread", "child_multithread.zig");
-    const child_spawner_bin = buildChild(b, target, lib_mod, "child_spawner", "child_spawner.zig");
-    const child_restart_verify_bin = buildChild(b, target, lib_mod, "child_restart_verify", "child_restart_verify.zig");
-    const child_shm_writer_bin = buildChild(b, target, lib_mod, "child_shm_writer", "child_shm_writer.zig");
+    const child_exit_bin = buildChild(b, target, lib_mod, "child_exit", "children/child_exit.zig");
+    const child_shm_counter_bin = buildChild(b, target, lib_mod, "child_shm_counter", "children/child_shm_counter.zig");
+    const child_stack_overflow_bin = buildChild(b, target, lib_mod, "child_stack_overflow", "children/child_stack_overflow.zig");
+    const child_restart_counter_bin = buildChild(b, target, lib_mod, "child_restart_counter", "children/child_restart_counter.zig");
+    const child_multithread_bin = buildChild(b, target, lib_mod, "child_multithread", "children/child_multithread.zig");
+    const child_spawner_bin = buildChild(b, target, lib_mod, "child_spawner", "children/child_spawner.zig");
+    const child_restart_verify_bin = buildChild(b, target, lib_mod, "child_restart_verify", "children/child_restart_verify.zig");
+    const child_shm_writer_bin = buildChild(b, target, lib_mod, "child_shm_writer", "children/child_shm_writer.zig");
 
     const embedded_wf = b.addWriteFiles();
     _ = embedded_wf.addCopyFile(child_exit_bin, "child_exit.elf");
