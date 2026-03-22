@@ -8,6 +8,7 @@ const x64 = zag.arch.x64;
 const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
+const PageSize = zag.memory.paging.PageSize;
 const Timer = zag.arch.timer.Timer;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
@@ -53,6 +54,21 @@ pub fn mapPage(
     switch (builtin.cpu.arch) {
         .x86_64 => try x64.paging.mapPage(addr_space_root, phys, virt, perms),
         .aarch64 => try aarch64.paging.mapPage(addr_space_root, phys, virt, perms),
+        else => unreachable,
+    }
+}
+
+pub fn mapPageBoot(
+    addr_space_root: VAddr,
+    phys: PAddr,
+    virt: VAddr,
+    size: PageSize,
+    perms: MemoryPerms,
+    allocator: std.mem.Allocator,
+) !void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => try x64.paging.mapPageBoot(addr_space_root, phys, virt, size, perms, allocator),
+        .aarch64 => try aarch64.paging.mapPageBoot(addr_space_root, phys, virt, size, perms, allocator),
         else => unreachable,
     }
 }

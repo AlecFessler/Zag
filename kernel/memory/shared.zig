@@ -6,54 +6,47 @@ const pmm = zag.memory.pmm;
 
 const PAddr = zag.memory.address.PAddr;
 const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
-const SpinLock = zag.sched.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
 
 pub const SharedMemoryAllocator = SlabAllocator(SharedMemory, false, 0, 64);
 
 pub const SharedMemory = struct {
-    pages: [MAX_PAGES]PAddr,
-    num_pages: u32,
+    pages: []PAddr,
     refcount: std.atomic.Value(u32),
 
-    pub const MAX_PAGES = 256;
+    pub const MAX_PAGES: u32 = 256;
+
+    pub fn size(self: *const SharedMemory) u64 {
+        return @as(u64, self.pages.len) * paging.PAGE4K;
+    }
 
     pub fn create(num_bytes: u64) !*SharedMemory {
         if (num_bytes == 0) return error.InvalidSize;
-
         const num_pages: u32 = @intCast(
             std.mem.alignForward(u64, num_bytes, paging.PAGE4K) / paging.PAGE4K,
         );
         if (num_pages > MAX_PAGES) return error.TooManyPages;
 
-        lock.lock();
-        const shm = allocator.create(SharedMemory) catch |err| {
-            lock.unlock();
-            return err;
-        };
-        lock.unlock();
-        errdefer {
-            lock.lock();
-            allocator.destroy(shm);
-            lock.unlock();
-        }
+        const shm = allocator.create(SharedMemory) catch return error.OutOfMemory;
+        errdefer allocator.destroy(shm);
+
+        const pages_slice = pages_allocator.alloc(PAddr, num_pages) catch return error.OutOfMemory;
+        errdefer pages_allocator.free(pages_slice);
 
         shm.* = .{
-            .pages = undefined,
-            .num_pages = 0,
+            .pages = pages_slice[0..0],
             .refcount = std.atomic.Value(u32).init(1),
         };
 
         const pmm_iface = pmm.global_pmm.?.allocator();
         errdefer shm.freePages();
 
-        var i: u32 = 0;
-        while (i < num_pages) : (i += 1) {
+        for (pages_slice) |*slot| {
             const page = pmm_iface.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
             const page_bytes: [*]u8 = @ptrCast(page);
             @memset(page_bytes[0..paging.PAGE4K], 0);
-            shm.pages[i] = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
-            shm.num_pages += 1;
+            slot.* = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
+            shm.pages = pages_slice[0 .. shm.pages.len + 1];
         }
 
         return shm;
@@ -73,14 +66,13 @@ pub const SharedMemory = struct {
 
     fn destroy(self: *SharedMemory) void {
         self.freePages();
-        lock.lock();
+        pages_allocator.free(self.pages);
         allocator.destroy(self);
-        lock.unlock();
     }
 
     fn freePages(self: *SharedMemory) void {
         const pmm_iface = pmm.global_pmm.?.allocator();
-        for (self.pages[0..self.num_pages]) |paddr| {
+        for (self.pages) |paddr| {
             const vaddr = VAddr.fromPAddr(paddr, null);
             const page: *paging.PageMem(.page4k) = @ptrFromInt(vaddr.addr);
             pmm_iface.destroy(page);
@@ -90,4 +82,4 @@ pub const SharedMemory = struct {
 
 pub var slab_allocator_instance: SharedMemoryAllocator = undefined;
 pub var allocator: std.mem.Allocator = undefined;
-var lock: SpinLock = .{};
+pub var pages_allocator: std.mem.Allocator = undefined;
