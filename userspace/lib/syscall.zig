@@ -1,5 +1,3 @@
-const lib = @import("lib.zig");
-
 pub const PAGE4K: u64 = 4096;
 
 pub const SyscallResult2 = struct {
@@ -27,13 +25,16 @@ pub const SyscallNum = enum(u64) {
     futex_wait,
     futex_wake,
     clock_gettime,
+    shutdown,
+    ioport_read,
+    ioport_write,
 };
 
 fn syscall0(num: SyscallNum) i64 {
     return asm volatile ("int $0x80"
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(num)),
-        : .{ .rcx = true, .r11 = true, .memory = true }
+        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }
     );
 }
 
@@ -42,7 +43,7 @@ fn syscall1(num: SyscallNum, a0: u64) i64 {
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(num)),
           [a0] "{rdi}" (a0),
-        : .{ .rcx = true, .r11 = true, .memory = true }
+        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }
     );
 }
 
@@ -57,25 +58,27 @@ fn syscall2(num: SyscallNum, a0: u64, a1: u64) i64 {
 }
 
 fn syscall3(num: SyscallNum, a0: u64, a1: u64, a2: u64) i64 {
-    return asm volatile ("int $0x80"
+    return asm volatile (
+        \\int $0x80
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(num)),
           [a0] "{rdi}" (a0),
           [a1] "{rsi}" (a1),
           [a2] "{rdx}" (a2),
-        : .{ .rcx = true, .r11 = true, .memory = true }
+        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }
     );
 }
 
 fn syscall4(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64) i64 {
-    return asm volatile ("int $0x80"
+    return asm volatile (
+        \\int $0x80
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(num)),
           [a0] "{rdi}" (a0),
           [a1] "{rsi}" (a1),
           [a2] "{rdx}" (a2),
           [a3] "{r10}" (a3),
-        : .{ .rcx = true, .r11 = true, .memory = true }
+        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }
     );
 }
 
@@ -158,8 +161,8 @@ pub fn disable_restart() i64 {
     return syscall0(.disable_restart);
 }
 
-pub fn futex_wait(addr: *const u64, expected: u64) i64 {
-    return syscall2(.futex_wait, @intFromPtr(addr), expected);
+pub fn futex_wait(addr: *const u64, expected: u64, timeout_ns: u64) i64 {
+    return syscall3(.futex_wait, @intFromPtr(addr), expected, timeout_ns);
 }
 
 pub fn futex_wake(addr: *const u64, count: u64) i64 {
@@ -169,3 +172,17 @@ pub fn futex_wake(addr: *const u64, count: u64) i64 {
 pub fn clock_gettime() i64 {
     return syscall0(.clock_gettime);
 }
+
+pub fn shutdown() noreturn {
+    _ = syscall0(.shutdown);
+    unreachable;
+}
+
+pub fn ioport_read(device_handle: u64, port_offset: u64, width: u64) i64 {
+    return syscall3(.ioport_read, device_handle, port_offset, width);
+}
+
+pub fn ioport_write(device_handle: u64, port_offset: u64, width: u64, value: u64) i64 {
+    return syscall4(.ioport_write, device_handle, port_offset, width, value);
+}
+

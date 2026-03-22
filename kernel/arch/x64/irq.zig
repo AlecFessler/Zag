@@ -3,9 +3,9 @@ const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
 const exceptions = zag.arch.x64.exceptions;
+const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
-const gdt = zag.arch.x64.gdt;
 const sched = zag.sched.scheduler;
 const syscall = zag.arch.syscall;
 

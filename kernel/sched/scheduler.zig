@@ -1,7 +1,9 @@
+const embedded = @import("embedded_bins");
 const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const device_registry = zag.devices.registry;
 const memory_init = zag.memory.init;
 const process_mod = zag.sched.process;
 const thread_mod = zag.sched.thread;
@@ -10,13 +12,9 @@ const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
 const Process = zag.sched.process.Process;
 const ProcessAllocator = zag.sched.process.ProcessAllocator;
 const SpinLock = zag.sched.sync.SpinLock;
-const Timer = zag.arch.timer.Timer;
 const Thread = zag.sched.thread.Thread;
 const ThreadAllocator = zag.sched.thread.ThreadAllocator;
-const VAddr = zag.memory.address.VAddr;
-const x64_cpu = zag.arch.x64.cpu;
-
-const embedded = @import("embedded_bins");
+const Timer = zag.arch.timer.Timer;
 
 var proc_alloc_instance: ProcessAllocator = undefined;
 var thread_alloc_instance: ThreadAllocator = undefined;
@@ -54,14 +52,6 @@ const RunQueue = struct {
         thread.next = null;
         self.tail.next = thread;
         self.tail = thread;
-    }
-
-    pub fn enqueueToFront(self: *RunQueue, thread: *Thread) void {
-        thread.next = self.head.next;
-        self.head.next = thread;
-        if (self.tail == self.head) {
-            self.tail = thread;
-        }
     }
 
     pub fn dequeue(self: *RunQueue) ?*Thread {
@@ -166,14 +156,19 @@ pub fn globalInit() !void {
         state.rq.init();
     }
 
-    const hello_world_proc = try Process.create(embedded.hello_world, .{
-        .destroy = true,
+    const root_proc = try Process.create(embedded.root_service, .{
+        .grant_to = true,
         .spawn_thread = true,
         .spawn_process = true,
         .mem_reserve = true,
         .set_affinity = true,
+        .restart = true,
+        .shm_create = true,
+        .device_own = true,
+        .shutdown = true,
     }, null);
-    core_states[0].rq.enqueue(hello_world_proc.threads[0]);
+    device_registry.grantAllToRootService(root_proc);
+    core_states[0].rq.enqueue(root_proc.threads[0]);
 
     initialized = true;
 }

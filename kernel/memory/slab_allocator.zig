@@ -2,7 +2,7 @@ const builtin = @import("builtin");
 const std = @import("std");
 const zag = @import("zag");
 
-const intrusive_freelist = @import("intrusive_freelist.zig");
+const intrusive_freelist = zag.memory.intrusive_freelist;
 
 const SpinLock = zag.sched.sync.SpinLock;
 

@@ -3,8 +3,8 @@ const std = @import("std");
 const zag = @import("zag");
 
 const intrusive_freelist = zag.memory.intrusive_freelist;
-const slab_alloc = zag.memory.slab_allocator;
 const rbt = zag.containers.red_black_tree;
+const slab_alloc = zag.memory.slab_allocator;
 
 pub const AllocFooter = packed struct(u64) {
     header: u64,

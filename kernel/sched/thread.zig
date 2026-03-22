@@ -59,7 +59,7 @@ pub const Thread = struct {
 
         allocator.destroy(self);
 
-        if (last) proc.deinit();
+        if (last) proc.exit();
     }
 
     pub fn create(

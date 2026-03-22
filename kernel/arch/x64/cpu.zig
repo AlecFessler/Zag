@@ -272,6 +272,15 @@ pub fn halt() noreturn {
     }
 }
 
+pub fn qemuShutdown() noreturn {
+    asm volatile ("outw %[val], %[port]"
+        :
+        : [val] "{ax}" (@as(u16, 0x2000)),
+          [port] "{dx}" (@as(u16, 0x604)),
+    );
+    unreachable;
+}
+
 pub fn readCr3() u64 {
     var value: u64 = 0;
     asm volatile ("mov %%cr3, %[out]"
@@ -301,6 +310,44 @@ pub fn outb(value: u8, port: u16) void {
         \\outb %[value], %[port]
         :
         : [value] "{al}" (value),
+          [port] "{dx}" (port),
+        : .{.dx = true}
+    );
+}
+
+pub fn inw(port: u16) u16 {
+    return asm volatile (
+        \\inw %[port], %[ret]
+        : [ret] "={ax}" (-> u16),
+        : [port] "{dx}" (port),
+        : .{.dx = true}
+    );
+}
+
+pub fn outw(value: u16, port: u16) void {
+    asm volatile (
+        \\outw %[value], %[port]
+        :
+        : [value] "{ax}" (value),
+          [port] "{dx}" (port),
+        : .{.dx = true}
+    );
+}
+
+pub fn ind(port: u16) u32 {
+    return asm volatile (
+        \\inl %[port], %[ret]
+        : [ret] "={eax}" (-> u32),
+        : [port] "{dx}" (port),
+        : .{.dx = true}
+    );
+}
+
+pub fn outd(value: u32, port: u16) void {
+    asm volatile (
+        \\outl %[value], %[port]
+        :
+        : [value] "{eax}" (value),
           [port] "{dx}" (port),
         : .{.dx = true}
     );

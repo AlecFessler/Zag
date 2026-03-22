@@ -29,6 +29,17 @@ pub const AddrSpacePartition = struct {
     };
 };
 
+pub const UserVA = struct {
+    pub const aslr: Range = .{
+        .start = 0x0000_0000_0000_1000,
+        .end = 0x0000_1000_0000_0000,
+    };
+    pub const static_reservations: Range = .{
+        .start = 0x0000_1000_0000_0000,
+        .end = AddrSpacePartition.user.end,
+    };
+};
+
 pub const KernelVA = struct {
     pub const kernel_stacks: Range = .{
         .start = AddrSpacePartition.kernel.start,

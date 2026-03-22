@@ -2,15 +2,14 @@ const builtin = @import("builtin");
 const std = @import("std");
 const zag = @import("zag");
 
-const arch = zag.arch.dispatch;
+const aarch64 = zag.arch.aarch64;
 const address = zag.memory.address;
+const arch = zag.arch.dispatch;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const scheduler = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
-
-const aarch64 = zag.arch.aarch64;
 const x64 = zag.arch.x64;
 
 const MemoryPerms = zag.perms.memory.MemoryPerms;
@@ -100,6 +99,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         .shared_memory, .mmio => {
             stack_mod.lookupGuard(proc.pid, faulting_virt);
             proc.kill();
+            arch.enableInterrupts();
             while (true) arch.halt();
         },
         .private => {

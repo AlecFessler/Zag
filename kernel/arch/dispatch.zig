@@ -9,8 +9,8 @@ const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
-const Timer = zag.arch.timer.Timer;
 const Thread = zag.sched.thread.Thread;
+const Timer = zag.arch.timer.Timer;
 const VAddr = zag.memory.address.VAddr;
 
 pub fn init() void {
@@ -245,6 +245,46 @@ pub fn triggerSchedulerInterrupt(core_id: u64) void {
                     @intFromEnum(aarch64.interrupts.IntVecs.sched),
                 );
             }
+        },
+        else => unreachable,
+    }
+}
+
+pub fn readTimestamp() u64 {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return x64.cpu.rdtscLFenced(),
+        .aarch64 => return 0,
+        else => unreachable,
+    }
+}
+
+pub fn shutdown() noreturn {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.qemuShutdown(),
+        .aarch64 => aarch64.cpu.halt(),
+        else => unreachable,
+    }
+}
+
+pub fn ioportIn(port: u16, width: u8) u32 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => switch (width) {
+            1 => @as(u32, x64.cpu.inb(port)),
+            2 => @as(u32, x64.cpu.inw(port)),
+            4 => x64.cpu.ind(port),
+            else => unreachable,
+        },
+        else => unreachable,
+    };
+}
+
+pub fn ioportOut(port: u16, width: u8, value: u32) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => switch (width) {
+            1 => x64.cpu.outb(@truncate(value), port),
+            2 => x64.cpu.outw(@truncate(value), port),
+            4 => x64.cpu.outd(value, port),
+            else => unreachable,
         },
         else => unreachable,
     }
