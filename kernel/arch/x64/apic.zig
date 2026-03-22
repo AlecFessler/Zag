@@ -328,6 +328,17 @@ pub fn sendSelfIpi(vector: u8) void {
     }
 }
 
+pub fn sendIpi(apic_id_target: u8, vector: u8) void {
+    if (x2Apic) {
+        const icr: u64 = (@as(u64, apic_id_target) << 32) | (1 << 14) | @as(u64, vector);
+        cpu.wrmsr(@intFromEnum(X2ApicMsr.interrupt_command_register), icr);
+    } else {
+        writeReg(.int_cmd_high_reg, @as(u32, apic_id_target) << 24);
+        writeReg(.int_cmd_low_reg, (1 << 14) | @as(u32, vector));
+        waitForDelivery();
+    }
+}
+
 pub fn enableSpuriousVector(vector: u8) void {
     if (x2Apic) {
         _ = cpu.enableX2Apic(vector);

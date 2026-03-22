@@ -9,6 +9,7 @@ const Timer = zag.arch.timer.Timer;
 const VAddr = zag.memory.address.VAddr;
 
 var tsc_timer_instance: Tsc = undefined;
+var monotonic_tsc_instance: Tsc = undefined;
 var lapic_timer_instance: Lapic = undefined;
 
 pub const Hpet = struct {
@@ -350,7 +351,7 @@ pub const Tsc = struct {
     }
 };
 
-pub fn getInterruptTimer() Timer {
+pub fn getPreemptionTimer() Timer {
     if (apic.programLocalApicTimerTscDeadline(@intFromEnum(interrupts.IntVecs.sched))) {
         tsc_timer_instance = Tsc.init(&hpet_timer);
         return tsc_timer_instance.timer();
@@ -358,6 +359,11 @@ pub fn getInterruptTimer() Timer {
         lapic_timer_instance = Lapic.init(&hpet_timer, @intFromEnum(interrupts.IntVecs.sched));
         return lapic_timer_instance.timer();
     }
+}
+
+pub fn getMonotonicClock() Timer {
+    monotonic_tsc_instance = Tsc.init(&hpet_timer);
+    return monotonic_tsc_instance.timer();
 }
 
 var cached_freq_hz: ?u64 = null;

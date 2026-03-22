@@ -1,11 +1,10 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const arch = zag.arch;
 const cpu = zag.arch.x64.cpu;
+const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
-const gdt = zag.arch.x64.gdt;
 
 const GateType = zag.arch.x64.idt.GateType;
 const PageFaultContext = zag.arch.interrupts.PageFaultContext;
@@ -78,7 +77,6 @@ pub fn init() void {
             GateType.interrupt_gate,
         );
     }
-
     interrupts.registerVector(
         @intFromEnum(Exception.page_fault),
         pageFaultHandler,
@@ -93,14 +91,12 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     }
     const faulting_addr = cpu.readCr2();
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
-    const from_user = (ctx.cs & ring_3) == 3;
-
-    var pf_ctx: PageFaultContext = undefined;
-    pf_ctx.privilege = if (from_user) .user else .kernel;
-    pf_ctx.faulting_virt = VAddr.fromInt(faulting_addr);
-    pf_ctx.present = pf_err.present;
-    pf_ctx.fetch = pf_err.instr_fetch;
-    pf_ctx.write = pf_err.is_write;
-
-    arch.interrupts.pageFaultHandler(pf_ctx);
+    const from_user = (ctx.cs & ring_3) == ring_3;
+    const pf_ctx = PageFaultContext{
+        .faulting_address = faulting_addr,
+        .is_kernel_privilege = !from_user,
+        .is_write = pf_err.is_write,
+        .is_exec = pf_err.instr_fetch,
+    };
+    zag.arch.interrupts.handlePageFault(&pf_ctx);
 }

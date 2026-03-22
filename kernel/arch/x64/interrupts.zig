@@ -9,11 +9,18 @@ const gdt = zag.arch.x64.gdt;
 
 const interruptHandler = idt.interruptHandler;
 
-const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
-const PAddr = zag.memory.address.PAddr;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
+
+pub const ArchCpuContext = cpu.Context;
+
+pub const PageFaultContext = struct {
+    faulting_address: u64,
+    is_kernel_privilege: bool,
+    is_write: bool,
+    is_exec: bool,
+};
 
 pub const IntVecs = enum(u8) {
     syscall = 0x80,
@@ -58,12 +65,12 @@ const PUSHES_ERR = blk: {
 
 var vector_table: [256]VectorEntry = .{VectorEntry{}} ** 256;
 
-pub fn prepareInterruptFrame(
+pub fn prepareThreadContext(
     kstack_top: VAddr,
     ustack_top: ?VAddr,
     entry: *const fn () void,
+    arg: u64,
 ) *ArchCpuContext {
-    // unaligned access of the cpu context will set off runtime safety checks but that's okay
     @setRuntimeSafety(false);
     const ctx_addr: u64 = kstack_top.addr - @sizeOf(cpu.Context);
     var ctx: *cpu.Context = @ptrFromInt(ctx_addr);
@@ -80,7 +87,7 @@ pub fn prepareInterruptFrame(
             .r10 = 0,
             .r9 = 0,
             .r8 = 0,
-            .rdi = 0,
+            .rdi = arg,
             .rsi = 0,
             .rbp = 0,
             .rbx = 0,
@@ -111,11 +118,14 @@ pub fn prepareInterruptFrame(
 }
 
 pub fn switchTo(thread: *Thread) void {
-    if (thread.proc.privilege == .user) {
-        gdt.coreTss(apic.coreID()).rsp0 = thread.kstack_base.addr;
-        const new_addr_space_root_phys = PAddr.fromVAddr(thread.proc.addr_space_root, null);
-        arch.swapAddrSpace(new_addr_space_root_phys);
+    gdt.coreTss(apic.coreID()).rsp0 = thread.kernel_stack.top.addr;
+
+    const new_root = thread.process.addr_space_root;
+    if (new_root.addr != arch.getAddrSpaceRoot().addr) {
+        arch.swapAddrSpace(new_root);
+        std.debug.assert(arch.getAddrSpaceRoot().addr == new_root.addr);
     }
+
     apic.endOfInterrupt();
     asm volatile (
         \\movq %[new_stack], %%rsp
@@ -158,6 +168,19 @@ pub fn registerVector(
         .handler = handler,
         .kind = kind,
     };
+}
+
+fn pageFaultHandler(ctx: *cpu.Context) void {
+    const fault_addr = asm volatile ("mov %%cr2, %[out]"
+        : [out] "=r" (-> u64),
+    );
+    const fault: PageFaultContext = .{
+        .faulting_address = fault_addr,
+        .is_kernel_privilege = (ctx.cs & 0x3) == 0,
+        .is_write = (ctx.err_code & 0x2) != 0,
+        .is_exec = (ctx.err_code & 0x10) != 0,
+    };
+    zag.arch.interrupts.handlePageFault(&fault);
 }
 
 export fn interruptStubPrologue() callconv(.naked) void {
@@ -203,7 +226,7 @@ export fn interruptStubEpilogue() callconv(.naked) void {
         \\popq %rcx
         \\popq %rax
         \\
-        \\addq $16, %rsp
+        \\addq $16, %%rsp
         \\iretq
     );
 }
@@ -216,5 +239,11 @@ export fn dispatchInterrupt(ctx: *cpu.Context) void {
         }
         return;
     }
+
+    if (ctx.int_num == 14) {
+        pageFaultHandler(ctx);
+        return;
+    }
+
     @panic("Unhandled interrupt!");
 }

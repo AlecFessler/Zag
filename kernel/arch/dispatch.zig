@@ -21,7 +21,7 @@ pub fn init() void {
     }
 }
 
-pub fn parseAcpi(xsdp_paddr: PAddr) !void {
+pub fn parseFirmwareTables(xsdp_paddr: PAddr) !void {
     switch (builtin.cpu.arch) {
         .x86_64 => try x64.acpi.parseAcpi(xsdp_paddr),
         .aarch64 => try aarch64.acpi.parseAcpi(xsdp_paddr),
@@ -46,6 +46,19 @@ pub fn halt() noreturn {
 }
 
 pub fn mapPage(
+    addr_space_root: PAddr,
+    phys: PAddr,
+    virt: VAddr,
+    perms: MemoryPerms,
+) !void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => try x64.paging.mapPage(addr_space_root, phys, virt, perms),
+        .aarch64 => try aarch64.paging.mapPage(addr_space_root, phys, virt, perms),
+        else => unreachable,
+    }
+}
+
+pub fn mapPageBoot(
     addr_space_root: VAddr,
     phys: PAddr,
     virt: VAddr,
@@ -54,8 +67,50 @@ pub fn mapPage(
     allocator: std.mem.Allocator,
 ) !void {
     switch (builtin.cpu.arch) {
-        .x86_64 => try x64.paging.mapPage(addr_space_root, phys, virt, size, perms, allocator),
-        .aarch64 => try aarch64.paging.mapPage(addr_space_root, phys, virt, size, perms, allocator),
+        .x86_64 => try x64.paging.mapPageBoot(addr_space_root, phys, virt, size, perms, allocator),
+        .aarch64 => try aarch64.paging.mapPageBoot(addr_space_root, phys, virt, size, perms, allocator),
+        else => unreachable,
+    }
+}
+
+pub fn freeUserAddrSpace(addr_space_root: PAddr) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.freeUserAddrSpace(addr_space_root),
+        .aarch64 => aarch64.paging.freeUserAddrSpace(addr_space_root),
+        else => unreachable,
+    }
+}
+
+pub fn unmapPage(
+    addr_space_root: PAddr,
+    virt: VAddr,
+) ?PAddr {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return x64.paging.unmapPage(addr_space_root, virt),
+        .aarch64 => return aarch64.paging.unmapPage(addr_space_root, virt),
+        else => unreachable,
+    }
+}
+
+pub fn updatePagePerms(
+    addr_space_root: PAddr,
+    virt: VAddr,
+    new_perms: MemoryPerms,
+) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.updatePagePerms(addr_space_root, virt, new_perms),
+        .aarch64 => aarch64.paging.updatePagePerms(addr_space_root, virt, new_perms),
+        else => unreachable,
+    }
+}
+
+pub fn resolveVaddr(
+    addr_space_root: PAddr,
+    virt: VAddr,
+) ?PAddr {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return x64.paging.resolveVaddr(addr_space_root, virt),
+        .aarch64 => return aarch64.paging.resolveVaddr(addr_space_root, virt),
         else => unreachable,
     }
 }
@@ -92,30 +147,39 @@ pub fn copyKernelMappings(root: VAddr) void {
     }
 }
 
-pub fn dropIdentityAddrSpace() void {
+pub fn dropIdentityMapping() void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.paging.dropIdentityAddrSpace(),
-        .aarch64 => aarch64.paging.dropIdentityAddrSpace(),
+        .x86_64 => x64.paging.dropIdentityMapping(),
+        .aarch64 => aarch64.paging.dropIdentityMapping(),
         else => unreachable,
     }
 }
 
-pub fn prepareInterruptFrame(
+pub fn prepareThreadContext(
     kstack_top: VAddr,
     ustack_top: ?VAddr,
     entry: *const fn () void,
+    arg: u64,
 ) *ArchCpuContext {
     switch (builtin.cpu.arch) {
-        .x86_64 => return x64.interrupts.prepareInterruptFrame(kstack_top, ustack_top, entry),
-        .aarch64 => return aarch64.interrupts.prepareInterruptFrame(kstack_top, ustack_top, entry),
+        .x86_64 => return x64.interrupts.prepareThreadContext(kstack_top, ustack_top, entry, arg),
+        .aarch64 => return aarch64.interrupts.prepareThreadContext(kstack_top, ustack_top, entry, arg),
         else => unreachable,
     }
 }
 
-pub fn getInterruptTimer() Timer {
+pub fn getPreemptionTimer() Timer {
     switch (builtin.cpu.arch) {
-        .x86_64 => return x64.timers.getInterruptTimer(),
-        .aarch64 => return aarch64.timers.getInterruptTimer(),
+        .x86_64 => return x64.timers.getPreemptionTimer(),
+        .aarch64 => return aarch64.timers.getPreemptionTimer(),
+        else => unreachable,
+    }
+}
+
+pub fn getMonotonicClock() Timer {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return x64.timers.getMonotonicClock(),
+        .aarch64 => return aarch64.timers.getMonotonicClock(),
         else => unreachable,
     }
 }
@@ -160,10 +224,28 @@ pub fn restoreInterrupts(state: u64) void {
     }
 }
 
-pub fn triggerSchedulerInterrupt() void {
+pub fn triggerSchedulerInterrupt(core_id: u64) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.apic.sendSelfIpi(@intFromEnum(x64.interrupts.IntVecs.sched)),
-        .aarch64 => aarch64.apic.sendSelfIpi(@intFromEnum(aarch64.interrupts.IntVecs.sched)),
+        .x86_64 => {
+            if (core_id == x64.apic.coreID()) {
+                x64.apic.sendSelfIpi(@intFromEnum(x64.interrupts.IntVecs.sched));
+            } else {
+                x64.apic.sendIpi(
+                    @intCast(x64.apic.lapics.?[core_id].apic_id),
+                    @intFromEnum(x64.interrupts.IntVecs.sched),
+                );
+            }
+        },
+        .aarch64 => {
+            if (core_id == aarch64.apic.coreID()) {
+                aarch64.apic.sendSelfIpi(@intFromEnum(aarch64.interrupts.IntVecs.sched));
+            } else {
+                aarch64.apic.sendIpi(
+                    @intCast(aarch64.apic.lapics.?[core_id].apic_id),
+                    @intFromEnum(aarch64.interrupts.IntVecs.sched),
+                );
+            }
+        },
         else => unreachable,
     }
 }

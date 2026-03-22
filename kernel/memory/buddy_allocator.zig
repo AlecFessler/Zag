@@ -108,6 +108,7 @@ pub const BuddyAllocator = struct {
         const block_size = ORDERS[split_order];
         while (current_addr < end_addr) : (current_addr += block_size) {
             self.setOrder(current_addr, split_order);
+            self.bitmap.setBit(current_addr, 0);
             batch.push(@ptrFromInt(current_addr));
         }
 

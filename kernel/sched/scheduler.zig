@@ -2,14 +2,11 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
-const paging = zag.memory.paging;
+const memory_init = zag.memory.init;
 const process_mod = zag.sched.process;
 const thread_mod = zag.sched.thread;
 
 const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
-const BumpAllocator = zag.memory.bump_allocator.BumpAllocator;
-const PAddr = zag.memory.address.PAddr;
-const PrivilegePerm = zag.perms.privilege.PrivilegePerm;
 const Process = zag.sched.process.Process;
 const ProcessAllocator = zag.sched.process.ProcessAllocator;
 const SpinLock = zag.sched.sync.SpinLock;
@@ -17,14 +14,14 @@ const Timer = zag.arch.timer.Timer;
 const Thread = zag.sched.thread.Thread;
 const ThreadAllocator = zag.sched.thread.ThreadAllocator;
 const VAddr = zag.memory.address.VAddr;
-const VirtualMemoryManager = zag.memory.vmm.VirtualMemoryManager;
+const x64_cpu = zag.arch.x64.cpu;
 
 const embedded = @import("embedded_bins");
 
-var slab_backing_allocator_instance: BumpAllocator = undefined;
 var proc_alloc_instance: ProcessAllocator = undefined;
 var thread_alloc_instance: ThreadAllocator = undefined;
 
+pub var idle_process: *Process = undefined;
 pub var initialized: bool = false;
 
 const CACHE_LINE_SIZE = 64;
@@ -37,7 +34,18 @@ const RunQueue = struct {
     tail: *Thread,
 
     pub fn init(self: *RunQueue) void {
-        self.sentinel.next = null;
+        self.sentinel = .{
+            .tid = std.math.maxInt(u64),
+            .ctx = undefined,
+            .kernel_stack = undefined,
+            .user_stack = null,
+            .process = idle_process,
+            .next = null,
+            .core_affinity = null,
+            .state = .running,
+            .last_in_proc = false,
+            .on_cpu = std.atomic.Value(bool).init(false),
+        };
         self.head = &self.sentinel;
         self.tail = &self.sentinel;
     }
@@ -67,17 +75,23 @@ const RunQueue = struct {
     }
 };
 
+const Zombie = struct {
+    thread: *Thread,
+    last_in_proc: bool,
+};
+
 const PerCoreState = struct {
     rq: RunQueue = undefined,
     rq_lock: SpinLock = .{},
     running_thread: ?*Thread = null,
     timer: Timer = undefined,
+    zombie: ?Zombie = null,
 };
 
 var core_states: [MAX_CORES]PerCoreState align(CACHE_LINE_SIZE) = [_]PerCoreState{.{}} ** MAX_CORES;
 
 pub const SchedInterruptContext = struct {
-    privilege: PrivilegePerm,
+    privilege: zag.perms.privilege.PrivilegePerm,
     thread_ctx: *ArchCpuContext,
 };
 
@@ -89,8 +103,17 @@ pub fn currentThread() ?*Thread {
     return core_states[arch.coreID()].running_thread;
 }
 
+var first_switch_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+
 pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
-    const state = &core_states[arch.coreID()];
+    const core_id = arch.coreID();
+    const state = &core_states[core_id];
+
+    if (state.zombie) |zombie| {
+        zombie.thread.deinit();
+        state.zombie = null;
+    }
+
     const preempted = state.running_thread.?;
     preempted.ctx = ctx.thread_ctx;
     preempted.on_cpu.store(false, .release);
@@ -109,15 +132,18 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     }
     state.running_thread = next;
 
-    state.rq_lock.unlock();
+    if (preempted != &state.rq.sentinel and preempted.state == .exited) {
+        state.zombie = .{ .thread = preempted, .last_in_proc = preempted.last_in_proc };
+    }
 
+    state.rq_lock.unlock();
     armSchedTimer(state, SCHED_TIMESLICE_NS);
     if (next == preempted) return;
     arch.switchTo(next);
 }
 
 pub fn yield() void {
-    arch.triggerSchedulerInterrupt();
+    arch.triggerSchedulerInterrupt(arch.coreID());
 }
 
 pub fn enqueueOnCore(core_index: u64, thread: *Thread) void {
@@ -128,28 +154,26 @@ pub fn enqueueOnCore(core_index: u64, thread: *Thread) void {
 }
 
 pub fn globalInit() !void {
-    const slab_vaddr_space_start = try process_mod.global_kproc.vmm.reserve(paging.PAGE1G, paging.pageAlign(.page4k));
-    const slab_vaddr_space_end = VAddr.fromInt(slab_vaddr_space_start.addr + paging.PAGE1G);
-    slab_backing_allocator_instance = BumpAllocator.init(
-        slab_vaddr_space_start.addr,
-        slab_vaddr_space_end.addr,
-    );
-
-    const slab_alloc_iface = slab_backing_allocator_instance.allocator();
-
-    proc_alloc_instance = try ProcessAllocator.init(slab_alloc_iface);
+    proc_alloc_instance = try ProcessAllocator.init(memory_init.proc_slab_backing.allocator());
     process_mod.allocator = proc_alloc_instance.allocator();
 
-    thread_alloc_instance = try ThreadAllocator.init(slab_alloc_iface);
+    thread_alloc_instance = try ThreadAllocator.init(memory_init.thread_slab_backing.allocator());
     thread_mod.allocator = thread_alloc_instance.allocator();
+
+    idle_process = try Process.createIdle();
 
     for (&core_states) |*state| {
         state.rq.init();
     }
 
-    const user_proc = try Process.createUserProcess(embedded.hello_world);
-    const user_thread = user_proc.threads[0];
-    core_states[0].rq.enqueue(user_thread);
+    const hello_world_proc = try Process.create(embedded.hello_world, .{
+        .destroy = true,
+        .spawn_thread = true,
+        .spawn_process = true,
+        .mem_reserve = true,
+        .set_affinity = true,
+    }, null);
+    core_states[0].rq.enqueue(hello_world_proc.threads[0]);
 
     initialized = true;
 }
@@ -157,7 +181,7 @@ pub fn globalInit() !void {
 pub fn perCoreInit() void {
     const state = &core_states[arch.coreID()];
     state.running_thread = &state.rq.sentinel;
-    state.timer = arch.getInterruptTimer();
+    state.timer = arch.getPreemptionTimer();
     arch.enableInterrupts();
     armSchedTimer(state, SCHED_TIMESLICE_NS);
 }

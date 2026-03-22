@@ -1,6 +1,10 @@
 const builtin = @import("builtin");
-const intrusive_freelist = @import("intrusive_freelist.zig");
 const std = @import("std");
+const zag = @import("zag");
+
+const intrusive_freelist = @import("intrusive_freelist.zig");
+
+const SpinLock = zag.sched.sync.SpinLock;
 
 const DBG = builtin.mode == .Debug;
 
@@ -36,6 +40,7 @@ pub fn SlabAllocator(
         stack_idx: if (stack_bootstrap) usize else void,
         freelist: IntrusiveFreeList = .{},
         alloc_headers: ?*AllocHeader = null,
+        lock: SpinLock = .{},
 
         pub fn init(
             backing_allocator: std.mem.Allocator,
@@ -101,6 +106,8 @@ pub fn SlabAllocator(
             std.debug.assert(len == @as(usize, @intCast(@sizeOf(T))));
 
             const self: *Self = @alignCast(@ptrCast(ptr));
+            self.lock.lock();
+            defer self.lock.unlock();
 
             if (stack_bootstrap and self.stack_idx < stack_size) {
                 const slab = &self.stack_array[self.stack_idx];
@@ -177,6 +184,9 @@ pub fn SlabAllocator(
             _ = ret_addr;
             const self: *Self = @alignCast(@ptrCast(ptr));
             const slab: *T = @alignCast(@ptrCast(buf.ptr));
+
+            self.lock.lock();
+            defer self.lock.unlock();
 
             if (DBG) self.allocations -= 1;
             if (DBG) std.debug.assert(self.allocations >= 0);

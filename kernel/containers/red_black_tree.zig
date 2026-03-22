@@ -857,6 +857,40 @@ pub fn RedBlackTree(
             return .{ .lower = lower, .upper = upper };
         }
 
+        pub fn forEachInRange(
+            self: *Self,
+            range_start: T,
+            range_end: T,
+            context: anytype,
+            comptime callback: fn (@TypeOf(context), T) void,
+        ) void {
+            var current = self.root;
+            var stack: [64]?*Node = undefined;
+            var stack_top: usize = 0;
+
+            while (current != null or stack_top > 0) {
+                while (current) |c| {
+                    if (cmpFn(c.data, range_end) != .lt) {
+                        current = c.getChild(.left);
+                    } else {
+                        stack[stack_top] = c;
+                        stack_top += 1;
+                        current = c.getChild(.left);
+                    }
+                }
+
+                if (stack_top == 0) break;
+                stack_top -= 1;
+                const node = stack[stack_top].?;
+
+                if (cmpFn(node.data, range_start) != .lt) {
+                    callback(context, node.data);
+                }
+
+                current = node.getChild(.right);
+            }
+        }
+
         /// Summary:
         /// Validates red-black invariants and returns `(valid, black_height)`.
         ///
