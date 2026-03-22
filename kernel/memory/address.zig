@@ -52,9 +52,17 @@ pub const KernelVA = struct {
             .start = shm_slab.end,
             .end = shm_slab.end + SLAB_RESERVATION,
         };
-        pub const heap_tree: Range = .{
+        pub const proc_slab: Range = .{
             .start = device_region_slab.end,
-            .end = device_region_slab.end + PAGE1G,
+            .end = device_region_slab.end + SLAB_RESERVATION,
+        };
+        pub const thread_slab: Range = .{
+            .start = proc_slab.end,
+            .end = proc_slab.end + SLAB_RESERVATION,
+        };
+        pub const heap_tree: Range = .{
+            .start = thread_slab.end,
+            .end = thread_slab.end + PAGE1G,
         };
         pub const heap: Range = .{
             .start = heap_tree.end,

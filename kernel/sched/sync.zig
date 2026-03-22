@@ -39,14 +39,11 @@ pub const WaitQueue = struct {
 
     pub fn wait(self: *WaitQueue, held_lock: *SpinLock, irq_state: u64) void {
         const thread = sched.currentThread().?;
-
         self.lock.lock();
         thread.state = .blocked;
         self.enqueueThread(thread);
         self.lock.unlock();
-
         held_lock.unlockIrqRestore(irq_state);
-
         sched.yield();
     }
 

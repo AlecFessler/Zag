@@ -33,8 +33,11 @@ var vm_node_slab_bump: BumpAllocator = undefined;
 var vm_tree_slab_bump: BumpAllocator = undefined;
 var shm_slab_bump: BumpAllocator = undefined;
 var device_region_slab_bump: BumpAllocator = undefined;
-var heap_tree_bump: BumpAllocator = undefined;
 
+pub var proc_slab_backing: BumpAllocator = undefined;
+pub var thread_slab_backing: BumpAllocator = undefined;
+
+var heap_tree_bump: BumpAllocator = undefined;
 var heap_tree_allocator: HeapTreeAllocator = undefined;
 var heap_allocator_instance: HeapAllocator = undefined;
 
@@ -174,6 +177,8 @@ pub fn init(firmware_mmap: MMap) !void {
     vm_tree_slab_bump = BumpAllocator.init(KA.vm_tree_slab.start, KA.vm_tree_slab.end);
     shm_slab_bump = BumpAllocator.init(KA.shm_slab.start, KA.shm_slab.end);
     device_region_slab_bump = BumpAllocator.init(KA.device_region_slab.start, KA.device_region_slab.end);
+    proc_slab_backing = BumpAllocator.init(KA.proc_slab.start, KA.proc_slab.end);
+    thread_slab_backing = BumpAllocator.init(KA.thread_slab.start, KA.thread_slab.end);
 
     try vmm_mod.initSlabs(vm_node_slab_bump.allocator(), vm_tree_slab_bump.allocator());
     try device_region_mod.initSlab(device_region_slab_bump.allocator());
