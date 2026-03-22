@@ -14,6 +14,7 @@ const proc_tests = @import("tests/proc.zig");
 const restart_tests = @import("tests/restart.zig");
 const shm_tests = @import("tests/shm.zig");
 const stack_guard_tests = @import("tests/stack_guard.zig");
+const sync_tests = @import("tests/sync.zig");
 const thread_tests = @import("tests/thread.zig");
 const vm_error_tests = @import("tests/vm_errors.zig");
 const vm_tests = @import("tests/vm.zig");
@@ -37,6 +38,7 @@ pub fn main(perm_view: u64) void {
     restart_tests.run();
     zombie_tests.run();
     grant_reduced_tests.run();
+    sync_tests.run();
     misc_tests.run();
 
     const end_ns: u64 = @bitCast(syscall.clock_gettime());
