@@ -4,11 +4,11 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const address = zag.memory.address;
+const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const sched = zag.sched;
 const stack_mod = zag.memory.stack;
-const process_mod = zag.sched.process;
 
 const aarch64 = zag.arch.aarch64;
 const x64 = zag.arch.x64;
@@ -39,7 +39,7 @@ const KERNEL_PERMS = MemoryPerms{
 
 fn demandPageKernel(faulting_virt: VAddr) void {
     const page_base = VAddr.fromInt(std.mem.alignBackward(u64, faulting_virt.addr, paging.PAGE4K));
-    const kroot = process_mod.global_kproc.addr_space_root;
+    const kroot = memory_init.kernel_addr_space_root;
 
     if (arch.resolveVaddr(kroot, page_base) != null) return;
 
