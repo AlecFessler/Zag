@@ -11,6 +11,13 @@ pub const Range = struct {
         return value >= self.start and value < self.end;
     }
 
+    pub fn containsRange(
+        self: *const Range,
+        other: Range,
+    ) bool {
+        return other.start >= self.start and other.end <= self.end;
+    }
+
     pub fn overlapsWith(
         self: *const Range,
         other: Range,
@@ -24,21 +31,18 @@ pub const Range = struct {
     ) Range {
         std.debug.assert(self.overlapsWith(other));
         std.debug.assert(!(other.start > self.start and other.end < self.end));
-
         if (other.start <= self.start and other.end < self.end) {
             return .{
                 .start = other.end,
                 .end = self.end,
             };
         }
-
         if (other.end >= self.end and other.start > self.start) {
             return .{
                 .start = self.start,
                 .end = other.start,
             };
         }
-
         unreachable;
     }
 };
