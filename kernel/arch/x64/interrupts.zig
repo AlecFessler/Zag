@@ -10,8 +10,6 @@ const gdt = zag.arch.x64.gdt;
 const interruptHandler = idt.interruptHandler;
 
 const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
-const PAddr = zag.memory.address.PAddr;
-const PageEntry = zag.arch.x64.paging.PageEntry; // NOTE: DEBUG
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
@@ -59,10 +57,11 @@ const PUSHES_ERR = blk: {
 
 var vector_table: [256]VectorEntry = .{VectorEntry{}} ** 256;
 
-pub fn prepareInterruptFrame(
+pub fn prepareThreadContext(
     kstack_top: VAddr,
     ustack_top: ?VAddr,
     entry: *const fn () void,
+    arg: u64,
 ) *ArchCpuContext {
     // unaligned access of the cpu context will set off runtime safety checks but that's okay
     @setRuntimeSafety(false);
@@ -81,7 +80,7 @@ pub fn prepareInterruptFrame(
             .r10 = 0,
             .r9 = 0,
             .r8 = 0,
-            .rdi = 0,
+            .rdi = arg,
             .rsi = 0,
             .rbp = 0,
             .rbx = 0,
@@ -112,12 +111,14 @@ pub fn prepareInterruptFrame(
 }
 
 pub fn switchTo(thread: *Thread) void {
-    if (thread.proc.privilege == .user) {
-        gdt.coreTss(apic.coreID()).rsp0 = thread.kstack_top.addr;
-        const new_addr_space_root_phys = PAddr.fromVAddr(thread.proc.addr_space_root, null);
-        arch.swapAddrSpace(new_addr_space_root_phys);
-        std.debug.assert(arch.getAddrSpaceRoot().addr == new_addr_space_root_phys.addr);
+    gdt.coreTss(apic.coreID()).rsp0 = thread.kernel_stack.top.addr;
+
+    const new_root = thread.process.addr_space_root;
+    if (new_root.addr != arch.getAddrSpaceRoot().addr) {
+        arch.swapAddrSpace(new_root);
+        std.debug.assert(arch.getAddrSpaceRoot().addr == new_root.addr);
     }
+
     apic.endOfInterrupt();
     asm volatile (
         \\movq %[new_stack], %%rsp
