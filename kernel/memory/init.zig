@@ -7,7 +7,6 @@ const boot = zag.boot;
 const device_region_mod = zag.memory.device_region;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
-const process = zag.sched.process;
 const shared = zag.memory.shared;
 const vmm_mod = zag.memory.vmm;
 
@@ -24,6 +23,8 @@ const Range = zag.utils.range.Range;
 const VAddr = zag.memory.address.VAddr;
 
 const KA = address.KernelVA.KernelAllocators;
+
+pub var kernel_addr_space_root: PAddr = undefined;
 
 var bump_allocator: BumpAllocator = undefined;
 var buddy_allocator: BuddyAllocator = undefined;
@@ -180,7 +181,7 @@ pub fn init(firmware_mmap: MMap) !void {
     shared.slab_allocator_instance = try shared.SharedMemoryAllocator.init(shm_slab_bump.allocator());
     shared.allocator = shared.slab_allocator_instance.allocator();
 
-    process.global_kproc.addr_space_root = addr_space_root_phys;
+    kernel_addr_space_root = addr_space_root_phys;
 }
 
 pub fn initHeap() !void {
