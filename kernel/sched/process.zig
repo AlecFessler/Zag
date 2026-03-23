@@ -4,6 +4,7 @@ const zag = @import("zag");
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const elf = std.elf;
+const iommu = zag.arch.x64.iommu;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
@@ -17,6 +18,7 @@ const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const ProcessRights = zag.perms.permissions.ProcessRights;
 const RestartContext = zag.sched.restart_context.RestartContext;
+const SharedMemory = zag.memory.shared.SharedMemory;
 const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
 const SpinLock = zag.sched.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
@@ -27,7 +29,16 @@ const VirtualMemoryManager = zag.memory.vmm.VirtualMemoryManager;
 
 pub const DEFAULT_STACK_PAGES: u32 = 4;
 pub const MAX_PERMS: usize = 128;
+pub const MAX_DMA_MAPPINGS: usize = 16;
 pub const HANDLE_SELF: u64 = 0;
+
+pub const DmaMapping = struct {
+    device: *DeviceRegion,
+    shm: *SharedMemory,
+    dma_base: u64,
+    num_pages: u64,
+    active: bool,
+};
 
 pub const ProcessAllocator = SlabAllocator(Process, false, 0, 64);
 
@@ -49,6 +60,8 @@ pub const Process = struct {
     handle_counter: u64,
     perm_view_vaddr: VAddr,
     perm_view_phys: PAddr,
+    dma_mappings: [MAX_DMA_MAPPINGS]DmaMapping,
+    num_dma_mappings: u32,
 
     pub const MAX_THREADS = 64;
     pub const MAX_CHILDREN = 64;
@@ -245,6 +258,7 @@ pub const Process = struct {
     }
 
     fn cleanupPhase1(self: *Process) void {
+        self.cleanupDmaMappings();
         self.vmm.deinit();
 
         for (&self.perm_table) |*entry| {
@@ -293,6 +307,42 @@ pub const Process = struct {
         if (changed) self.syncUserView();
     }
 
+    pub fn addDmaMapping(self: *Process, device: *DeviceRegion, shm: *SharedMemory, dma_base: u64, num_pages: u64) !void {
+        if (self.num_dma_mappings >= MAX_DMA_MAPPINGS) return error.TooManyDmaMappings;
+        self.dma_mappings[self.num_dma_mappings] = .{
+            .device = device,
+            .shm = shm,
+            .dma_base = dma_base,
+            .num_pages = num_pages,
+            .active = true,
+        };
+        self.num_dma_mappings += 1;
+    }
+
+    pub fn removeDmaMapping(self: *Process, device: *DeviceRegion, shm: *SharedMemory) ?DmaMapping {
+        for (self.dma_mappings[0..self.num_dma_mappings], 0..) |*m, i| {
+            if (m.active and m.device == device and m.shm == shm) {
+                const mapping = m.*;
+                m.active = false;
+                if (i == self.num_dma_mappings - 1) {
+                    self.num_dma_mappings -= 1;
+                }
+                return mapping;
+            }
+        }
+        return null;
+    }
+
+    pub fn cleanupDmaMappings(self: *Process) void {
+        for (self.dma_mappings[0..self.num_dma_mappings]) |*m| {
+            if (m.active) {
+                iommu.unmapDmaPages(m.device, m.dma_base, m.num_pages);
+                m.active = false;
+            }
+        }
+        self.num_dma_mappings = 0;
+    }
+
     pub fn returnDeviceHandleUpTree(source: *Process, rights: u16, device: *DeviceRegion) void {
         var ancestor = source.parent;
         while (ancestor) |anc| {
@@ -330,6 +380,8 @@ pub const Process = struct {
             .handle_counter = 1,
             .perm_view_vaddr = VAddr.fromInt(0),
             .perm_view_phys = PAddr.fromInt(0),
+            .dma_mappings = undefined,
+            .num_dma_mappings = 0,
         };
 
         const pmm_iface = pmm.global_pmm.?.allocator();
@@ -424,6 +476,8 @@ pub const Process = struct {
             .handle_counter = 1,
             .perm_view_vaddr = VAddr.fromInt(0),
             .perm_view_phys = PAddr.fromInt(0),
+            .dma_mappings = undefined,
+            .num_dma_mappings = 0,
         };
         proc.initPermTable(.{});
         return proc;

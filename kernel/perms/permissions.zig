@@ -39,7 +39,8 @@ pub const SharedMemoryRights = packed struct(u8) {
 pub const DeviceRegionRights = packed struct(u8) {
     map: bool = false,
     grant: bool = false,
-    _reserved: u6 = 0,
+    dma: bool = false,
+    _reserved: u5 = 0,
 };
 
 pub const PermissionEntry = struct {

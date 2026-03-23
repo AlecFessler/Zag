@@ -58,7 +58,8 @@ pub const DeviceClass = enum(u8) {
 pub const DeviceRegionRights = packed struct(u8) {
     map: bool = false,
     grant: bool = false,
-    _reserved: u6 = 0,
+    dma: bool = false,
+    _reserved: u5 = 0,
 
     pub fn bits(self: @This()) u64 {
         return @intCast(@as(u8, @bitCast(self)));

@@ -3,7 +3,7 @@ const syscall = @import("syscall.zig");
 
 const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 
-pub const Mutex = struct {
+pub const Mutex = extern struct {
     state: u64 align(8),
 
     pub const UNLOCKED: u64 = 0;

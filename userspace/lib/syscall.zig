@@ -28,6 +28,8 @@ pub const SyscallNum = enum(u64) {
     shutdown,
     ioport_read,
     ioport_write,
+    dma_map,
+    dma_unmap,
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -109,7 +111,11 @@ pub fn vm_perms(vm_handle: u64, offset: u64, size: u64, rights_bits: u64) i64 {
 }
 
 pub fn shm_create(size: u64) i64 {
-    return syscall1(.shm_create, size);
+    return syscall2(.shm_create, size, 0);
+}
+
+pub fn shm_create_with_rights(size: u64, rights: u64) i64 {
+    return syscall2(.shm_create, size, rights);
 }
 
 pub fn shm_map(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
@@ -185,4 +191,13 @@ pub fn ioport_read(device_handle: u64, port_offset: u64, width: u64) i64 {
 pub fn ioport_write(device_handle: u64, port_offset: u64, width: u64, value: u64) i64 {
     return syscall4(.ioport_write, device_handle, port_offset, width, value);
 }
+
+pub fn dma_map(device_handle: u64, shm_handle: u64) i64 {
+    return syscall2(.dma_map, device_handle, shm_handle);
+}
+
+pub fn dma_unmap(device_handle: u64, shm_handle: u64) i64 {
+    return syscall2(.dma_unmap, device_handle, shm_handle);
+}
+
 

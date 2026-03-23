@@ -21,9 +21,12 @@ pub fn registerMmioDevice(
     pci_device: u16,
     pci_class: u8,
     pci_subclass: u8,
+    pci_bus: u8,
+    pci_dev: u8,
+    pci_func: u8,
 ) !*DeviceRegion {
     if (device_count >= MAX_DEVICES) return error.TooManyDevices;
-    const dr = try device_region_mod.createMmio(phys_base, size, device_class, pci_vendor, pci_device, pci_class, pci_subclass);
+    const dr = try device_region_mod.createMmio(phys_base, size, device_class, pci_vendor, pci_device, pci_class, pci_subclass, pci_bus, pci_dev, pci_func);
     device_table[device_count] = dr;
     device_count += 1;
     return dr;
@@ -37,9 +40,12 @@ pub fn registerPortIoDevice(
     pci_device: u16,
     pci_class: u8,
     pci_subclass: u8,
+    pci_bus: u8,
+    pci_dev: u8,
+    pci_func: u8,
 ) !*DeviceRegion {
     if (device_count >= MAX_DEVICES) return error.TooManyDevices;
-    const dr = try device_region_mod.createPortIo(base_port, port_count, device_class, pci_vendor, pci_device, pci_class, pci_subclass);
+    const dr = try device_region_mod.createPortIo(base_port, port_count, device_class, pci_vendor, pci_device, pci_class, pci_subclass, pci_bus, pci_dev, pci_func);
     device_table[device_count] = dr;
     device_count += 1;
     return dr;
@@ -51,7 +57,7 @@ pub fn grantAllToRootService(root_proc: *Process) void {
         const entry = PermissionEntry{
             .handle = 0,
             .object = .{ .device_region = device_table[i] },
-            .rights = 0b11,
+            .rights = 0b111,
         };
         _ = root_proc.insertPerm(entry) catch {};
     }
@@ -59,4 +65,9 @@ pub fn grantAllToRootService(root_proc: *Process) void {
 
 pub fn count() u32 {
     return device_count;
+}
+
+pub fn getDevice(index: u32) ?*DeviceRegion {
+    if (index >= device_count) return null;
+    return device_table[index];
 }

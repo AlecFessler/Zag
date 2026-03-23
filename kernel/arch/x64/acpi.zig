@@ -5,6 +5,7 @@ const apic = zag.arch.x64.apic;
 const arch = zag.arch.dispatch;
 const cpu = zag.arch.x64.cpu;
 const device_registry = zag.devices.registry;
+const iommu = zag.arch.x64.iommu;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const timers = zag.arch.x64.timers;
@@ -428,6 +429,14 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
         if (std.mem.eql(u8, @ptrCast(&sdt.signature), "MCFG")) {
             parseMcfg(sdt_virt_x, sdt.length) catch {};
         }
+
+        if (std.mem.eql(u8, @ptrCast(&sdt.signature), "DMAR")) {
+            parseDmar(sdt_virt_x, sdt.length) catch {};
+        }
+
+        if (std.mem.eql(u8, @ptrCast(&sdt.signature), "IVRS")) {
+            parseIvrs(sdt_virt_x, sdt.length) catch {};
+        }
     }
 
     if (device_registry.count() == 0) {
@@ -435,6 +444,7 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
     }
 
     probeSerialPorts();
+    initIommuDevices();
 }
 
 const MMIO_PERMS: MemoryPerms = .{
@@ -446,17 +456,18 @@ const MMIO_PERMS: MemoryPerms = .{
 };
 
 fn parseMcfg(mcfg_vaddr: VAddr, length: u32) !void {
-    const header_size = 44;
-    const entry_size = 16;
+    const header_size: u32 = 44;
+    const entry_size: u32 = 16;
     if (length <= header_size) return;
 
     const num_entries = (length - header_size) / entry_size;
     var i: u32 = 0;
     while (i < num_entries) : (i += 1) {
         const entry_addr = mcfg_vaddr.addr + header_size + @as(u64, i) * entry_size;
-        const base_address = @as(*const volatile u64, @ptrFromInt(entry_addr)).*;
-        const start_bus = @as(*const volatile u8, @ptrFromInt(entry_addr + 10)).*;
-        const end_bus = @as(*const volatile u8, @ptrFromInt(entry_addr + 11)).*;
+        const bytes: [*]const u8 = @ptrFromInt(entry_addr);
+        const base_address = std.mem.readInt(u64, bytes[0..8], .little);
+        const start_bus = bytes[10];
+        const end_bus = bytes[11];
 
         if (base_address == 0) continue;
 
@@ -481,6 +492,32 @@ fn pciConfigRead32(ecam_base: VAddr, bus: u8, dev: u5, func: u3, offset: u12) u3
         (@as(u64, func) << 12) |
         @as(u64, offset);
     return @as(*const volatile u32, @ptrFromInt(addr)).*;
+}
+
+fn pciConfigWrite32(ecam_base: VAddr, bus: u8, dev: u5, func: u3, offset: u12, value: u32) void {
+    const addr = ecam_base.addr +
+        (@as(u64, bus) << 20) |
+        (@as(u64, dev) << 15) |
+        (@as(u64, func) << 12) |
+        @as(u64, offset);
+    @as(*volatile u32, @ptrFromInt(addr)).* = value;
+}
+
+fn pciEcamProbeBarSize(ecam_base: VAddr, bus: u8, dev: u5, func: u3, bar_offset: u12) u64 {
+    const original = pciConfigRead32(ecam_base, bus, dev, func, bar_offset);
+    pciConfigWrite32(ecam_base, bus, dev, func, bar_offset, 0xFFFFFFFF);
+    const sized = pciConfigRead32(ecam_base, bus, dev, func, bar_offset);
+    pciConfigWrite32(ecam_base, bus, dev, func, bar_offset, original);
+
+    if (original & 1 != 0) {
+        const mask = sized & 0xFFFC;
+        if (mask == 0) return 0;
+        return (~mask + 1) & 0xFFFF;
+    } else {
+        const mask = sized & 0xFFFFFFF0;
+        if (mask == 0) return 0;
+        return ~mask + 1;
+    }
 }
 
 fn pciClassToDeviceClass(class: u8, subclass: u8) DeviceClass {
@@ -532,7 +569,9 @@ fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
                     if (bar_val & 1 != 0) {
                         const port_base: u16 = @truncate(bar_val & 0xFFFC);
                         if (port_base == 0) continue;
-                        _ = device_registry.registerPortIoDevice(port_base, 32, device_class, v, d, class_code, subclass) catch continue;
+                        const port_size = pciEcamProbeBarSize(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), bar_offset);
+                        const port_count: u16 = if (port_size > 0) @truncate(port_size) else 32;
+                        _ = device_registry.registerPortIoDevice(port_base, port_count, device_class, v, d, class_code, subclass, @intCast(bus), @intCast(dev), @intCast(func)) catch continue;
                     } else {
                         const bar_type = (bar_val >> 1) & 0x3;
                         var phys_addr: u64 = bar_val & 0xFFFFFFF0;
@@ -545,19 +584,55 @@ fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
 
                         if (phys_addr == 0) continue;
 
+                        const bar_size = pciEcamProbeBarSize(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), bar_offset);
+                        const aligned_size = if (bar_size >= paging.PAGE4K)
+                            std.mem.alignForward(u64, bar_size, paging.PAGE4K)
+                        else
+                            paging.PAGE4K;
+
                         _ = device_registry.registerMmioDevice(
                             PAddr.fromInt(phys_addr),
-                            paging.PAGE4K,
+                            aligned_size,
                             device_class,
                             v,
                             d,
                             class_code,
                             subclass,
+                            @intCast(bus),
+                            @intCast(dev),
+                            @intCast(func),
                         ) catch continue;
                     }
                 }
             }
         }
+    }
+}
+
+fn pciLegacyWrite32(bus: u8, dev: u5, func: u3, offset: u8, value: u32) void {
+    const addr: u32 = 0x80000000 |
+        (@as(u32, bus) << 16) |
+        (@as(u32, dev) << 11) |
+        (@as(u32, func) << 8) |
+        (@as(u32, offset) & 0xFC);
+    cpu.outd(addr, 0xCF8);
+    cpu.outd(value, 0xCFC);
+}
+
+fn pciProbeBarSize(bus: u8, dev: u5, func: u3, bar_offset: u8) u64 {
+    const original = pciLegacyRead32(bus, dev, func, bar_offset);
+    pciLegacyWrite32(bus, dev, func, bar_offset, 0xFFFFFFFF);
+    const sized = pciLegacyRead32(bus, dev, func, bar_offset);
+    pciLegacyWrite32(bus, dev, func, bar_offset, original);
+
+    if (original & 1 != 0) {
+        const mask = sized & 0xFFFC;
+        if (mask == 0) return 0;
+        return (~mask + 1) & 0xFFFF;
+    } else {
+        const mask = sized & 0xFFFFFFF0;
+        if (mask == 0) return 0;
+        return ~mask + 1;
     }
 }
 
@@ -610,19 +685,29 @@ fn enumeratePciLegacy() void {
                     if (bar_val & 1 != 0) {
                         const port_base: u16 = @truncate(bar_val & 0xFFFC);
                         if (port_base == 0) continue;
-                        _ = device_registry.registerPortIoDevice(port_base, 32, device_class, v, d, class_code, subclass) catch continue;
+                        const port_size = pciProbeBarSize(@intCast(bus), @intCast(dev), @intCast(func), bar_offset);
+                        const port_count: u16 = if (port_size > 0) @truncate(port_size) else 32;
+                        _ = device_registry.registerPortIoDevice(port_base, port_count, device_class, v, d, class_code, subclass, @intCast(bus), @intCast(dev), @intCast(func)) catch continue;
                     } else {
                         const phys_addr: u64 = bar_val & 0xFFFFFFF0;
                         if (phys_addr == 0) continue;
+                        const bar_size = pciProbeBarSize(@intCast(bus), @intCast(dev), @intCast(func), bar_offset);
+                        const aligned_size = if (bar_size >= paging.PAGE4K)
+                            std.mem.alignForward(u64, bar_size, paging.PAGE4K)
+                        else
+                            paging.PAGE4K;
 
                         _ = device_registry.registerMmioDevice(
                             PAddr.fromInt(phys_addr),
-                            paging.PAGE4K,
+                            aligned_size,
                             device_class,
                             v,
                             d,
                             class_code,
                             subclass,
+                            @intCast(bus),
+                            @intCast(dev),
+                            @intCast(func),
                         ) catch continue;
                     }
                 }
@@ -638,7 +723,64 @@ fn probeSerialPorts() void {
         const readback = cpu.inb(port + 7);
         if (readback == 0xA5) {
             cpu.outb(0x00, port + 7);
-            _ = device_registry.registerPortIoDevice(port, 8, .serial, 0, 0, 0, 0) catch continue;
+            _ = device_registry.registerPortIoDevice(port, 8, .serial, 0, 0, 0, 0, 0, 0, 0) catch continue;
+        }
+    }
+}
+
+fn parseDmar(dmar_vaddr: VAddr, length: u32) !void {
+    const header_size: u32 = 48;
+    if (length <= header_size) return;
+
+    var offset: u32 = header_size;
+    while (offset + 4 <= length) {
+        const entry_type = @as(*const volatile u16, @ptrFromInt(dmar_vaddr.addr + offset)).*;
+        const entry_len = @as(*const volatile u16, @ptrFromInt(dmar_vaddr.addr + offset + 2)).*;
+        if (entry_len == 0) break;
+
+        if (entry_type == 0 and entry_len >= 16) {
+            const reg_base = @as(*const volatile u64, @ptrFromInt(dmar_vaddr.addr + offset + 8)).*;
+            if (reg_base != 0) {
+                iommu.initIntel(PAddr.fromInt(reg_base)) catch {};
+                break;
+            }
+        }
+
+        offset += entry_len;
+    }
+}
+
+fn parseIvrs(ivrs_vaddr: VAddr, length: u32) !void {
+    const header_size: u32 = 48;
+    if (length <= header_size) return;
+
+    var offset: u32 = header_size;
+    while (offset + 4 <= length) {
+        const entry_type = @as(*const volatile u8, @ptrFromInt(ivrs_vaddr.addr + offset)).*;
+        const entry_len = @as(*const volatile u16, @ptrFromInt(ivrs_vaddr.addr + offset + 2)).*;
+        if (entry_len == 0) break;
+
+        if ((entry_type == 0x10 or entry_type == 0x11 or entry_type == 0x40) and entry_len >= 24) {
+            const reg_base = @as(*const volatile u64, @ptrFromInt(ivrs_vaddr.addr + offset + 8)).*;
+            if (reg_base != 0) {
+                iommu.initAmd(PAddr.fromInt(reg_base)) catch {};
+                break;
+            }
+        }
+
+        offset += entry_len;
+    }
+}
+
+fn initIommuDevices() void {
+    if (!iommu.isAvailable()) return;
+
+    var i: u32 = 0;
+    while (i < device_registry.count()) : (i += 1) {
+        if (device_registry.getDevice(i)) |device| {
+            if (device.device_type == .mmio and (device.pci_bus != 0 or device.pci_dev != 0 or device.pci_func != 0)) {
+                iommu.setupDevice(device) catch {};
+            }
         }
     }
 }

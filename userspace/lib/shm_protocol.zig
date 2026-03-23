@@ -1,0 +1,149 @@
+const std = @import("std");
+const sync = @import("sync.zig");
+const syscall = @import("syscall.zig");
+const pv = @import("perm_view.zig");
+const perms = @import("perms.zig");
+
+const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
+
+pub const MAX_CONNECTIONS = 8;
+pub const COMMAND_SHM_SIZE = 4096;
+
+pub const ConnectionStatus = enum(u32) {
+    available = 0,
+    requested = 1,
+    connected = 2,
+};
+
+pub const ConnectionEntry = extern struct {
+    service_id: u32,
+    status: u32,
+    shm_handle: u64,
+    shm_size: u64,
+    _reserved: u64,
+};
+
+pub const CommandChannel = extern struct {
+    cmd_mutex: sync.Mutex,
+    wake_flag: u64 align(8),
+    reply_flag: u64 align(8),
+    num_connections: u32,
+    _pad: u32,
+    connections: [MAX_CONNECTIONS]ConnectionEntry,
+
+    pub fn init(self: *CommandChannel) void {
+        self.cmd_mutex = sync.Mutex.init();
+        self.wake_flag = 0;
+        self.reply_flag = 0;
+        self.num_connections = 0;
+        self._pad = 0;
+        for (&self.connections) |*c| {
+            c.* = .{
+                .service_id = 0,
+                .status = @intFromEnum(ConnectionStatus.available),
+                .shm_handle = 0,
+                .shm_size = 0,
+                ._reserved = 0,
+            };
+        }
+    }
+
+    pub fn addAllowedConnection(self: *CommandChannel, service_id: u32) void {
+        if (self.num_connections >= MAX_CONNECTIONS) return;
+        self.connections[self.num_connections] = .{
+            .service_id = service_id,
+            .status = @intFromEnum(ConnectionStatus.available),
+            .shm_handle = 0,
+            .shm_size = 0,
+            ._reserved = 0,
+        };
+        self.num_connections += 1;
+    }
+
+    pub fn requestConnection(self: *CommandChannel, service_id: u32) ?*ConnectionEntry {
+        for (self.connections[0..self.num_connections]) |*entry| {
+            if (entry.service_id == service_id and entry.status == @intFromEnum(ConnectionStatus.available)) {
+                @as(*volatile u32, &entry.status).* = @intFromEnum(ConnectionStatus.requested);
+                _ = @atomicRmw(u64, &self.wake_flag, .Add, 1, .release);
+                _ = syscall.futex_wake(&self.wake_flag, 1);
+                return entry;
+            }
+        }
+        return null;
+    }
+
+    pub fn waitForConnection(self: *CommandChannel, entry: *ConnectionEntry) bool {
+        while (@as(*volatile u32, &entry.status).* != @intFromEnum(ConnectionStatus.connected)) {
+            const current = @atomicLoad(u64, &self.reply_flag, .acquire);
+            if (@as(*volatile u32, &entry.status).* == @intFromEnum(ConnectionStatus.connected)) break;
+            _ = syscall.futex_wait(&self.reply_flag, current, MAX_TIMEOUT);
+        }
+        return entry.shm_handle != 0;
+    }
+
+    pub fn waitForAnyRequest(self: *CommandChannel) void {
+        const current = @atomicLoad(u64, &self.wake_flag, .acquire);
+        _ = syscall.futex_wait(&self.wake_flag, current, MAX_TIMEOUT);
+    }
+
+    pub fn notifyChild(self: *CommandChannel) void {
+        _ = @atomicRmw(u64, &self.reply_flag, .Add, 1, .release);
+        _ = syscall.futex_wake(&self.reply_flag, 1);
+    }
+
+    pub fn findConnectionByService(self: *CommandChannel, service_id: u32) ?*ConnectionEntry {
+        for (self.connections[0..self.num_connections]) |*entry| {
+            if (entry.service_id == service_id) return entry;
+        }
+        return null;
+    }
+
+    pub fn findConnectedShm(self: *CommandChannel, service_id: u32) ?u64 {
+        for (self.connections[0..self.num_connections]) |*entry| {
+            if (entry.service_id == service_id and entry.status == @intFromEnum(ConnectionStatus.connected)) {
+                return entry.shm_handle;
+            }
+        }
+        return null;
+    }
+};
+
+pub const ServiceId = struct {
+    pub const SERIAL: u32 = 1;
+    pub const NIC: u32 = 2;
+    pub const ROUTER: u32 = 3;
+    pub const CONSOLE: u32 = 4;
+};
+
+pub fn mapCommandChannel(perm_view_addr: u64) ?*CommandChannel {
+    const MAX_PERMS = 128;
+    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
+
+    var shm_handle: u64 = 0;
+    var shm_size: u64 = 0;
+    var attempts: u32 = 0;
+    while (attempts < 50_000) : (attempts += 1) {
+        for (view) |*entry| {
+            if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY) {
+                shm_handle = entry.handle;
+                shm_size = entry.field0;
+                break;
+            }
+        }
+        if (shm_handle != 0) break;
+        syscall.thread_yield();
+    }
+
+    if (shm_handle == 0 or shm_size < COMMAND_SHM_SIZE) return null;
+
+    const vm_rights = (perms.VmReservationRights{
+        .read = true, .write = true, .execute = true, .shareable = true,
+    }).bits();
+    const vm_result = syscall.vm_reserve(0, shm_size, vm_rights);
+    if (vm_result.val < 0) return null;
+
+    const map_rc = syscall.shm_map(shm_handle, @intCast(vm_result.val), 0);
+    if (map_rc != 0) return null;
+
+    return @ptrFromInt(vm_result.val2);
+}

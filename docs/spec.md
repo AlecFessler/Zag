@@ -110,7 +110,7 @@ Handle = monotonic u64 ID, unique across the lifetime of the process. Handle 0 (
 
 **SharedMemoryRights:** `read`(0), `write`(1), `execute`(2), `grant`(3).
 
-**DeviceRegionRights:** `map`(0), `grant`(1).
+**DeviceRegionRights:** `map`(0), `grant`(1), `dma`(2).
 
 #### Permission Rules
 
@@ -301,9 +301,9 @@ Adjust effective rights on a sub-range within a VM reservation. `offset` and `si
 **Returns:** `E_OK`.
 **Errors:** `E_BADCAP`, `E_INVAL` (bad alignment, out of bounds, `shareable`/`mmio` bits set), `E_PERM` (exceeds `max_rights`, range contains SHM/MMIO nodes).
 
-### shm_create(size) → handle
+### shm_create(size, rights) → handle
 
-Create shared memory. Eagerly allocates zeroed pages.
+Create shared memory. Eagerly allocates zeroed pages. `rights` specifies the SharedMemoryRights for the handle (read, write, execute, grant bits).
 
 **Permission:** `HANDLE_SELF.shm_create`.
 **Returns:** Handle ID (positive).
@@ -424,6 +424,23 @@ Immediately halt the machine.
 **Permission:** `HANDLE_SELF.shutdown`.
 **Errors:** `E_PERM`.
 
+### dma_map(device_handle, shm_handle) → dma_addr
+
+Map all pages of a shared memory region into the device's IOMMU address space. Returns a base DMA address that the device should use in its DMA descriptors. The IOMMU translates DMA addresses to physical addresses, isolating each device's memory access. Scattered physical pages appear contiguous to the device.
+
+**Permission:** device handle must have `dma` right, device must be MMIO type. IOMMU must be present.
+**Returns:** DMA base address (positive).
+**Errors:** `E_BADCAP`, `E_PERM` (no `dma` right or no IOMMU present), `E_INVAL` (device not MMIO), `E_NOMEM`.
+
+DMA mappings are tracked per-process. On process exit, all DMA mappings are automatically unmapped from the IOMMU.
+
+### dma_unmap(device_handle, shm_handle) → result
+
+Remove the SHM pages from the device's IOMMU address space. Invalidates the IOMMU TLB.
+
+**Returns:** `E_OK`.
+**Errors:** `E_BADCAP`, `E_PERM`.
+
 ### ioport_read(device_handle, port_offset, width) → value
 
 Read from a Port I/O device. `width` must be 1 (byte), 2 (word), or 4 (dword). `port_offset + width` must not exceed `port_count`. The `map` right on the device handle governs access.
@@ -454,3 +471,4 @@ Write to a Port I/O device. Same validation as `ioport_read`.
 | Default user stack | 16 KiB (4 pages) |
 | Futex wait queue buckets | 256 |
 | User permissions view | 1 page (128 entries x 32 bytes) |
+| DMA mappings per process | 16 |

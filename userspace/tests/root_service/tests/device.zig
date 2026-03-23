@@ -22,6 +22,8 @@ pub fn run(perm_view_addr: u64) void {
     testIoportBadWidth(perm_view_addr);
     testIoportBadOffset(perm_view_addr);
     testIoportReadWidth2(perm_view_addr);
+    testDmaMapBadHandle();
+    testDmaMapPortIoDevice(perm_view_addr);
     testDeviceDump(perm_view_addr);
 }
 
@@ -74,10 +76,12 @@ fn testMmioMapUnmap(perm_view_addr: u64) void {
     const dev_entry = findMmioDevice(perm_view_addr) orelse {
         t.fail("no MMIO device for map/unmap test"); return;
     };
+    const dev_size: u64 = dev_entry.deviceSizeOrPortCount();
+    const map_size = if (dev_size > 0) ((dev_size + syscall.PAGE4K - 1) / syscall.PAGE4K) * syscall.PAGE4K else syscall.PAGE4K;
     const vm_rights = (perms.VmReservationRights{
         .read = true, .write = true, .mmio = true,
     }).bits();
-    const vm_result = syscall.vm_reserve(0, syscall.PAGE4K, vm_rights);
+    const vm_result = syscall.vm_reserve(0, map_size, vm_rights);
     if (vm_result.val < 0) { t.fail("setup failed"); return; }
     const vm_handle: u64 = @intCast(vm_result.val);
     const map_rc = syscall.mmio_map(dev_entry.handle, vm_handle, 0);
@@ -180,6 +184,35 @@ fn testIoportBadOffset(perm_view_addr: u64) void {
     };
     const rc = syscall.ioport_read(serial_entry.handle, 100, 1);
     t.expectEqual("S4.ioport_read: offset > port_count returns E_INVAL", -1, rc);
+}
+
+fn testDmaMapBadHandle() void {
+    const shm = syscall.shm_create(syscall.PAGE4K);
+    if (shm <= 0) { t.fail("setup failed"); return; }
+    const rc = syscall.dma_map(99999, @intCast(shm));
+    if (rc == -3) {
+        t.pass("S4.dma_map: invalid device handle returns E_BADCAP");
+    } else if (rc == -2) {
+        t.pass("S4.dma_map: no IOMMU returns E_PERM (expected without IOMMU)");
+    } else {
+        t.failWithVal("S4.dma_map: unexpected result", -3, rc);
+    }
+}
+
+fn testDmaMapPortIoDevice(perm_view_addr: u64) void {
+    const serial_entry = findSerialDevice(perm_view_addr) orelse {
+        t.fail("no serial device for dma test"); return;
+    };
+    const shm = syscall.shm_create(syscall.PAGE4K);
+    if (shm <= 0) { t.fail("setup failed"); return; }
+    const rc = syscall.dma_map(serial_entry.handle, @intCast(shm));
+    if (rc == -1) {
+        t.pass("S4.dma_map: port_io device rejected (E_INVAL)");
+    } else if (rc == -2) {
+        t.pass("S4.dma_map: no IOMMU returns E_PERM (expected without IOMMU)");
+    } else {
+        t.failWithVal("S4.dma_map: unexpected result for port_io", -1, rc);
+    }
 }
 
 fn testIoportReadWidth2(perm_view_addr: u64) void {

@@ -30,6 +30,11 @@ pub const DeviceRegion = struct {
     pci_device: u16,
     pci_class: u8,
     pci_subclass: u8,
+    pci_bus: u8,
+    pci_dev: u8,
+    pci_func: u8,
+    dma_page_table_root: PAddr,
+    dma_cursor: u64,
 };
 
 const DeviceRegionSlab = SlabAllocator(DeviceRegion, false, 0, 32);
@@ -50,6 +55,9 @@ pub fn createMmio(
     pci_device: u16,
     pci_class: u8,
     pci_subclass: u8,
+    pci_bus: u8,
+    pci_dev: u8,
+    pci_func: u8,
 ) !*DeviceRegion {
     std.debug.assert(slab_initialized);
     const dr = try device_region_slab.allocator().create(DeviceRegion);
@@ -64,6 +72,11 @@ pub fn createMmio(
         .pci_device = pci_device,
         .pci_class = pci_class,
         .pci_subclass = pci_subclass,
+        .pci_bus = pci_bus,
+        .pci_dev = pci_dev,
+        .pci_func = pci_func,
+        .dma_page_table_root = PAddr.fromInt(0),
+        .dma_cursor = 0x1000,
     };
     return dr;
 }
@@ -76,6 +89,9 @@ pub fn createPortIo(
     pci_device: u16,
     pci_class: u8,
     pci_subclass: u8,
+    pci_bus: u8,
+    pci_dev: u8,
+    pci_func: u8,
 ) !*DeviceRegion {
     std.debug.assert(slab_initialized);
     const dr = try device_region_slab.allocator().create(DeviceRegion);
@@ -90,6 +106,11 @@ pub fn createPortIo(
         .pci_device = pci_device,
         .pci_class = pci_class,
         .pci_subclass = pci_subclass,
+        .pci_bus = pci_bus,
+        .pci_dev = pci_dev,
+        .pci_func = pci_func,
+        .dma_page_table_root = PAddr.fromInt(0),
+        .dma_cursor = 0,
     };
     return dr;
 }

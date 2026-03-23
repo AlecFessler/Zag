@@ -4,6 +4,7 @@ const zag = @import("zag");
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const futex = zag.sched.futex;
+const iommu = zag.arch.x64.iommu;
 const paging = zag.memory.paging;
 const sched = zag.sched.scheduler;
 
@@ -56,6 +57,8 @@ pub const SyscallNum = enum(u64) {
     shutdown,
     ioport_read,
     ioport_write,
+    dma_map,
+    dma_unmap,
     _,
 };
 
@@ -82,7 +85,7 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
         .write => sysWrite(arg0, arg1),
         .vm_reserve => sysVmReserve(arg0, arg1, arg2),
         .vm_perms => ok(sysVmPerms(arg0, arg1, arg2, arg3)),
-        .shm_create => ok(sysShmCreate(arg0)),
+        .shm_create => ok(sysShmCreate(arg0, arg1)),
         .shm_map => ok(sysShmMap(arg0, arg1, arg2)),
         .shm_unmap => ok(sysShmUnmap(arg0, arg1)),
         .mmio_map => ok(sysMmioMap(arg0, arg1, arg2)),
@@ -101,6 +104,8 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
         .shutdown => sysShutdown(),
         .ioport_read => ok(sysIoportRead(arg0, arg1, arg2)),
         .ioport_write => ok(sysIoportWrite(arg0, arg1, arg2, arg3)),
+        .dma_map => ok(sysDmaMap(arg0, arg1)),
+        .dma_unmap => ok(sysDmaUnmap(arg0, arg1)),
         _ => err(E_INVAL),
     };
 }
@@ -175,7 +180,7 @@ fn sysVmPerms(vm_handle: u64, offset: u64, size: u64, perms_bits: u64) i64 {
     return E_OK;
 }
 
-fn sysShmCreate(size: u64) i64 {
+fn sysShmCreate(size: u64, rights_bits: u64) i64 {
     if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) return E_INVAL;
 
     const proc = currentProc();
@@ -184,10 +189,11 @@ fn sysShmCreate(size: u64) i64 {
 
     const shm = SharedMemory.create(size) catch return E_NOMEM;
 
+    const rights: u16 = if (rights_bits == 0) 0b1111 else @truncate(rights_bits);
     const entry = PermissionEntry{
         .handle = 0,
         .object = .{ .shared_memory = shm },
-        .rights = 0b1111,
+        .rights = rights,
     };
     const handle_id = proc.insertPerm(entry) catch {
         shm.decRef();
@@ -555,4 +561,41 @@ fn sysIoportWrite(device_handle: u64, port_offset: u64, width: u64, value: u64) 
     arch.ioportOut(port, @truncate(width), @truncate(value));
     return E_OK;
 }
+
+fn sysDmaMap(device_handle: u64, shm_handle: u64) i64 {
+    if (!iommu.isAvailable()) return E_PERM;
+
+    const proc = currentProc();
+    const dev_entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
+    if (dev_entry.object != .device_region) return E_BADCAP;
+    if (!dev_entry.deviceRights().dma) return E_PERM;
+    const device = dev_entry.object.device_region;
+    if (device.device_type != .mmio) return E_INVAL;
+
+    const shm_entry = proc.getPermByHandle(shm_handle) orelse return E_BADCAP;
+    if (shm_entry.object != .shared_memory) return E_BADCAP;
+    const shm = shm_entry.object.shared_memory;
+
+    const dma_base = iommu.mapDmaPages(device, shm) catch return E_NOMEM;
+    proc.addDmaMapping(device, shm, dma_base, shm.pages.len) catch return E_NOMEM;
+    return @bitCast(dma_base);
+}
+
+fn sysDmaUnmap(device_handle: u64, shm_handle: u64) i64 {
+    if (!iommu.isAvailable()) return E_PERM;
+
+    const proc = currentProc();
+    const dev_entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
+    if (dev_entry.object != .device_region) return E_BADCAP;
+    const device = dev_entry.object.device_region;
+
+    const shm_entry = proc.getPermByHandle(shm_handle) orelse return E_BADCAP;
+    if (shm_entry.object != .shared_memory) return E_BADCAP;
+    const shm = shm_entry.object.shared_memory;
+
+    const mapping = proc.removeDmaMapping(device, shm) orelse return E_NOENT;
+    iommu.unmapDmaPages(device, mapping.dma_base, mapping.num_pages);
+    return E_OK;
+}
+
 

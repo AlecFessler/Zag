@@ -5,6 +5,8 @@ pub fn build(b: *std.Build) void {
     const use_llvm = b.option(bool, "use-llvm", "Force LLVM+LLD backend") orelse false;
     const target_arch = b.option([]const u8, "arch", "Target architecture (x64 or arm)") orelse "x64";
     const root_service_path = b.option([]const u8, "root-service", "Path to root service ELF (default: userspace/bin/root_service.elf)");
+    const iommu_type = b.option([]const u8, "iommu", "IOMMU type: intel, amd, or none (default: none)") orelse "none";
+    const net_type = b.option([]const u8, "net", "Network: tap, user, or none (default: user)") orelse "user";
     const arch: std.Target.Cpu.Arch = blk: {
         break :blk if (std.mem.eql(u8, target_arch, "x64"))
             .x86_64
@@ -131,6 +133,27 @@ pub fn build(b: *std.Build) void {
         \\-no-shutdown \
         \\-D qemu.log
     ;
+    const has_iommu = !std.mem.eql(u8, iommu_type, "none");
+    const qemu_machine_args: []const u8 = if (has_iommu)
+        \\-machine q35
+    else
+        \\
+    ;
+    const qemu_iommu_args: []const u8 = if (std.mem.eql(u8, iommu_type, "intel"))
+        \\-device intel-iommu,intremap=off
+    else if (std.mem.eql(u8, iommu_type, "amd"))
+        \\-device amd-iommu
+    else
+        \\
+    ;
+    const qemu_net_args: []const u8 = if (std.mem.eql(u8, net_type, "tap"))
+        \\-netdev tap,id=net0,ifname=tap0,script=no,downscript=no \
+        \\-device e1000,netdev=net0
+    else if (std.mem.eql(u8, net_type, "user"))
+        \\
+    else
+        \\-net none
+    ;
     const qemu_cmdline = b.fmt(
         \\exec qemu-system-x86_64 \
         \\ -m 512M \
@@ -140,9 +163,11 @@ pub fn build(b: *std.Build) void {
         \\ -display none \
         \\ -no-reboot \
         \\ {s} \
-        \\ -smp cores=4 \
-        \\ -s
-    , .{ b.install_path, out_dir, qemu_accel_args });
+        \\ {s} \
+        \\ {s} \
+        \\ {s} \
+        \\ -smp cores=4
+    , .{ b.install_path, out_dir, qemu_accel_args, qemu_machine_args, qemu_iommu_args, qemu_net_args });
     const qemu_cmd = b.addSystemCommand(&[_][]const u8{
         "sh", "-lc", qemu_cmdline,
     });
