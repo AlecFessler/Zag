@@ -61,6 +61,19 @@ fn waitForDataShm(perm_view_addr: u64, min_count: u32) void {
     }
 }
 
+fn eql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |x, y| {
+        if (x != y) return false;
+    }
+    return true;
+}
+
+fn startsWith(haystack: []const u8, prefix: []const u8) bool {
+    if (haystack.len < prefix.len) return false;
+    return eql(haystack[0..prefix.len], prefix);
+}
+
 const CMD_MAX = 128;
 
 fn processCommand(line: []const u8) void {
@@ -68,12 +81,13 @@ fn processCommand(line: []const u8) void {
 
     if (eql(line, "help")) {
         serialWrite("Available commands:\r\n");
-        serialWrite("  help      - show this help\r\n");
-        serialWrite("  status    - query router status\r\n");
-        serialWrite("  version   - show system version\r\n");
-        serialWrite("  uptime    - show system uptime\r\n");
-        serialWrite("  devices   - list device handles\r\n");
-        serialWrite("  clear     - clear screen\r\n");
+        serialWrite("  help        - show this help\r\n");
+        serialWrite("  status      - query router status\r\n");
+        serialWrite("  ping <ip>   - ping an IP address\r\n");
+        serialWrite("  arp         - show ARP table\r\n");
+        serialWrite("  version     - show system version\r\n");
+        serialWrite("  uptime      - show system uptime\r\n");
+        serialWrite("  clear       - clear screen\r\n");
     } else if (eql(line, "version")) {
         serialWrite("Zag RouterOS v0.1\r\n");
     } else if (eql(line, "uptime")) {
@@ -85,28 +99,66 @@ fn processCommand(line: []const u8) void {
     } else if (eql(line, "clear")) {
         serialWrite("\x1b[2J\x1b[H");
     } else if (eql(line, "status")) {
-        if (has_router) {
-            _ = router_chan.send("status");
-            var resp: [512]u8 = undefined;
-            var attempts: u32 = 0;
-            while (attempts < 10000) : (attempts += 1) {
-                if (router_chan.recv(&resp)) |len| {
-                    serialWrite(resp[0..len]);
-                    serialWrite("\r\n");
-                    return;
-                }
-                syscall.thread_yield();
-            }
-            serialWrite("router: no response\r\n");
-        } else {
-            serialWrite("router: not connected\r\n");
-        }
-    } else if (eql(line, "devices")) {
-        serialWrite("device listing not implemented yet\r\n");
+        routerCommand("status");
+    } else if (startsWith(line, "ping ")) {
+        routerMultiResponse(line);
+    } else if (eql(line, "arp")) {
+        routerMultiResponse("arp");
     } else {
         serialWrite("unknown command: ");
         serialWrite(line);
         serialWrite("\r\ntype 'help' for available commands\r\n");
+    }
+}
+
+fn routerCommand(cmd: []const u8) void {
+    if (!has_router) {
+        serialWrite("router: not connected\r\n");
+        return;
+    }
+    _ = router_chan.send(cmd);
+    var resp: [512]u8 = undefined;
+    var attempts: u32 = 0;
+    while (attempts < 10000) : (attempts += 1) {
+        if (router_chan.recv(&resp)) |len| {
+            serialWrite(resp[0..len]);
+            serialWrite("\r\n");
+            return;
+        }
+        syscall.thread_yield();
+    }
+    serialWrite("router: no response\r\n");
+}
+
+fn routerMultiResponse(cmd: []const u8) void {
+    if (!has_router) {
+        serialWrite("router: not connected\r\n");
+        return;
+    }
+    _ = router_chan.send(cmd);
+    var resp: [512]u8 = undefined;
+    var msg_count: u32 = 0;
+    var done = false;
+    while (!done and msg_count < 8) {
+        var attempts: u32 = 0;
+        var got_msg = false;
+        while (attempts < 100_000) : (attempts += 1) {
+            if (router_chan.recv(&resp)) |len| {
+                serialWrite(resp[0..len]);
+                serialWrite("\r\n");
+                msg_count += 1;
+                got_msg = true;
+                if (len >= 3 and resp[0] == '-' and resp[1] == '-' and resp[2] == '-') {
+                    done = true;
+                }
+                break;
+            }
+            syscall.thread_yield();
+        }
+        if (!got_msg) done = true;
+    }
+    if (msg_count == 0) {
+        serialWrite("router: no response\r\n");
     }
 }
 
@@ -134,14 +186,6 @@ fn printDecSerial(val: u64) void {
         v /= 10;
     }
     serialWrite(buf[i..20]);
-}
-
-fn eql(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (x != y) return false;
-    }
-    return true;
 }
 
 pub fn main(perm_view_addr: u64) void {

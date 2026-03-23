@@ -15,7 +15,7 @@ fn buildChild(
     });
     child_app_mod.addImport("lib", lib_mod);
     const child_start_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "../../lib/start.zig" },
+        .root_source_file = .{ .cwd_relative = "../lib/start.zig" },
         .target = target,
         .optimize = .ReleaseSmall,
         .pic = true,
@@ -29,7 +29,7 @@ fn buildChild(
     });
     child_exe.pie = true;
     child_exe.entry = .{ .symbol_name = "_start" };
-    child_exe.setLinkerScript(.{ .cwd_relative = "linker.ld" });
+    child_exe.setLinkerScript(b.path("linker.ld"));
     return child_exe.getEmittedBin();
 }
 
@@ -39,16 +39,16 @@ pub fn build(b: *std.Build) void {
         .os_tag = .freestanding,
     });
     const lib_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "../../lib/lib.zig" },
+        .root_source_file = .{ .cwd_relative = "../lib/lib.zig" },
         .target = target,
         .optimize = .ReleaseSmall,
         .pic = true,
     });
 
-    const serial_driver_bin = buildChild(b, target, lib_mod, "serial_driver", "children/serial_driver.zig");
-    const nic_driver_bin = buildChild(b, target, lib_mod, "nic_driver", "children/nic_driver.zig");
-    const router_bin = buildChild(b, target, lib_mod, "router", "children/router.zig");
-    const console_bin = buildChild(b, target, lib_mod, "console", "children/console.zig");
+    const serial_driver_bin = buildChild(b, target, lib_mod, "serial_driver", "serial_driver/main.zig");
+    const nic_driver_bin = buildChild(b, target, lib_mod, "nic_driver", "nic_driver/main.zig");
+    const router_bin = buildChild(b, target, lib_mod, "router", "router/main.zig");
+    const console_bin = buildChild(b, target, lib_mod, "console", "console/main.zig");
 
     const embedded_wf = b.addWriteFiles();
     _ = embedded_wf.addCopyFile(serial_driver_bin, "serial_driver.elf");
@@ -70,7 +70,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const app_mod = b.createModule(.{
-        .root_source_file = b.path("main.zig"),
+        .root_source_file = b.path("root_service/main.zig"),
         .target = target,
         .optimize = .ReleaseSmall,
         .pic = true,
@@ -79,7 +79,7 @@ pub fn build(b: *std.Build) void {
     app_mod.addImport("embedded_children", embedded_children_mod);
 
     const start_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "../../lib/start.zig" },
+        .root_source_file = .{ .cwd_relative = "../lib/start.zig" },
         .target = target,
         .optimize = .ReleaseSmall,
         .pic = true,
@@ -93,7 +93,7 @@ pub fn build(b: *std.Build) void {
     });
     exe.pie = true;
     exe.entry = .{ .symbol_name = "_start" };
-    exe.setLinkerScript(.{ .cwd_relative = "linker.ld" });
-    const install = b.addInstallFile(exe.getEmittedBin(), "../../../bin/routerOS.elf");
+    exe.setLinkerScript(b.path("linker.ld"));
+    const install = b.addInstallFile(exe.getEmittedBin(), "../../bin/routerOS.elf");
     b.getInstallStep().dependOn(&install.step);
 }
