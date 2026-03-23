@@ -47,9 +47,11 @@ const ContextEntry = packed struct(u128) {
     _res0: u8 = 0,
     slptptr: u52,
     address_width: u3,
+    _ignored: u1 = 0,
+    _avail: u3 = 0,
     _res1: u1 = 0,
     domain_id: u16,
-    _res2: u44 = 0,
+    _res2: u40 = 0,
 };
 
 var iommu_base: u64 = 0;

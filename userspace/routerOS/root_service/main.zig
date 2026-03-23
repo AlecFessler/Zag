@@ -9,7 +9,7 @@ const syscall = lib.syscall;
 const t = lib.testing;
 
 const MAX_PERMS = 128;
-const MAX_CHILDREN = 4;
+const MAX_CHILDREN = 8;
 
 const ChildInfo = struct {
     name: []const u8,
@@ -116,6 +116,23 @@ fn findDeviceByClass(perm_view_addr: u64, class: perms.DeviceClass, dtype: perms
         }
     }
     return null;
+}
+
+fn findAllMmioDevicesByClass(perm_view_addr: u64, class: perms.DeviceClass, out: []DeviceGrant) u32 {
+    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
+    var count: u32 = 0;
+    const dev_rights = (perms.DeviceRegionRights{ .map = true, .grant = true, .dma = true }).bits();
+    for (view) |*entry| {
+        if (entry.entry_type == pv.ENTRY_TYPE_DEVICE_REGION and
+            entry.deviceClass() == @intFromEnum(class) and
+            entry.deviceType() == @intFromEnum(perms.DeviceType.mmio) and
+            count < out.len)
+        {
+            out[count] = .{ .handle = entry.handle, .rights = dev_rights };
+            count += 1;
+        }
+    }
+    return count;
 }
 
 fn findAllDevicesByClass(perm_view_addr: u64, class: perms.DeviceClass, out: []DeviceGrant) u32 {
@@ -235,13 +252,17 @@ pub fn main(perm_view_addr: u64) void {
     const serial_count = findAllDevicesByClass(perm_view_addr, .serial, &serial_devices);
 
     var nic_devices: [8]DeviceGrant = undefined;
-    const nic_count = findAllDevicesByClass(perm_view_addr, .network, &nic_devices);
+    const nic_count = findAllMmioDevicesByClass(perm_view_addr, .network, &nic_devices);
 
     syscall.write("root: found ");
     t.printDec(serial_count);
     syscall.write(" serial, ");
     t.printDec(nic_count);
     syscall.write(" NIC device handles\n");
+
+    const nic_driver_rights = perms.ProcessRights{
+        .grant_to = true, .mem_reserve = true, .shm_create = true, .device_own = true, .restart = true,
+    };
 
     _ = spawnChild(
         "serial_driver",
@@ -253,25 +274,57 @@ pub fn main(perm_view_addr: u64) void {
         serial_devices[0..serial_count],
     );
 
-    _ = spawnChild(
-        "nic_driver",
-        embedded.nic_driver,
-        shm_protocol.ServiceId.NIC,
-        .{ .grant_to = true, .mem_reserve = true, .shm_create = true, .device_own = true, .restart = true },
-        &.{},
-        perm_view_addr,
-        nic_devices[0..nic_count],
-    );
+    if (nic_count >= 2) {
+        _ = spawnChild(
+            "nic_wan",
+            embedded.nic_driver,
+            shm_protocol.ServiceId.NIC_WAN,
+            nic_driver_rights,
+            &.{},
+            perm_view_addr,
+            nic_devices[0..1],
+        );
 
-    _ = spawnChild(
-        "router",
-        embedded.router,
-        shm_protocol.ServiceId.ROUTER,
-        .{ .grant_to = true, .mem_reserve = true, .restart = true },
-        &.{shm_protocol.ServiceId.NIC},
-        perm_view_addr,
-        &.{},
-    );
+        _ = spawnChild(
+            "nic_lan",
+            embedded.nic_driver,
+            shm_protocol.ServiceId.NIC_LAN,
+            nic_driver_rights,
+            &.{},
+            perm_view_addr,
+            nic_devices[1..2],
+        );
+
+        _ = spawnChild(
+            "router",
+            embedded.router,
+            shm_protocol.ServiceId.ROUTER,
+            .{ .grant_to = true, .mem_reserve = true, .restart = true },
+            &.{ shm_protocol.ServiceId.NIC_WAN, shm_protocol.ServiceId.NIC_LAN },
+            perm_view_addr,
+            &.{},
+        );
+    } else if (nic_count == 1) {
+        _ = spawnChild(
+            "nic_driver",
+            embedded.nic_driver,
+            shm_protocol.ServiceId.NIC_WAN,
+            nic_driver_rights,
+            &.{},
+            perm_view_addr,
+            nic_devices[0..1],
+        );
+
+        _ = spawnChild(
+            "router",
+            embedded.router,
+            shm_protocol.ServiceId.ROUTER,
+            .{ .grant_to = true, .mem_reserve = true, .restart = true },
+            &.{shm_protocol.ServiceId.NIC_WAN},
+            perm_view_addr,
+            &.{},
+        );
+    }
 
     _ = spawnChild(
         "console",

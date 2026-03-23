@@ -8,32 +8,42 @@ RouterOS is a userspace network router application for the Zag microkernel. All 
 
 ### 1.1 Process Hierarchy
 
-The **root service** spawns four child processes and brokers shared-memory connections between them:
+The **root service** spawns child processes and brokers shared-memory connections between them. With two NICs present, the topology is:
 
 ```
 root_service (broker)
-├── serial_driver   (UART hardware driver)
-├── nic_driver      (Intel e1000 hardware driver)
-├── router          (packet processing, ARP, ICMP)
-└── console         (serial line editor, user commands)
+├── serial_driver    (UART hardware driver)
+├── nic_wan          (Intel e1000 driver, WAN interface)
+├── nic_lan          (Intel e1000 driver, LAN interface)
+├── router           (packet processing, ARP, ICMP, NAT, DHCP)
+└── console          (serial line editor, user commands)
 ```
+
+With only one NIC, the root service spawns a single `nic_driver` and the router operates in single-interface mode (no NAT/DHCP).
 
 ### 1.2 Communication Topology
 
 ```
-Host (tap0) ←→ e1000 HW ←→ nic_driver ←channel→ router ←channel→ console ←channel→ serial_driver ←→ UART HW
+Host WAN (tap0) ←→ e1000 ←→ nic_wan ←channel→ router ←channel→ console ←channel→ serial_driver ←→ UART
+Host LAN (tap1) ←→ e1000 ←→ nic_lan ←channel→ router ↗
 ```
-
-Each arrow labeled `channel` is a bidirectional SPSC ring buffer in shared memory, brokered by the root service.
 
 ### 1.3 Service IDs
 
 | ID | Name | Process |
 |----|------|---------|
 | 1 | SERIAL | serial_driver |
-| 2 | NIC | nic_driver |
+| 2 | NIC_WAN | nic_wan |
 | 3 | ROUTER | router |
 | 4 | CONSOLE | console |
+| 5 | NIC_LAN | nic_lan |
+
+### 1.4 Network Addressing
+
+| Interface | IP | Subnet | MAC |
+|-----------|------|--------|-----|
+| WAN | 10.0.2.15 | 10.0.2.0/24 | 52:54:00:12:34:56 |
+| LAN | 192.168.1.1 | 192.168.1.0/24 | 52:54:00:12:34:57 |
 
 ---
 
@@ -44,28 +54,31 @@ Each arrow labeled `channel` is a bidirectional SPSC ring buffer in shared memor
 ### 2.1 Startup Sequence
 
 1. Scan the permission view for device handles (serial, NIC)
-2. Spawn children in order: serial_driver, nic_driver, router, console
-3. Grant each child its required device handles and permissions
-4. Enter the broker loop
+2. Filter NIC handles to MMIO-type only (port-IO handles are not used for DMA)
+3. Spawn children in order: serial_driver, nic_wan, nic_lan, router, console
+4. Grant each child its required device handles and minimal permissions
+5. Enter the broker loop
 
-### 2.2 Connection Brokering
+### 2.2 Device Grant Policy
+
+Each NIC driver receives exactly one MMIO device handle. The first MMIO network device goes to `nic_wan`, the second to `nic_lan`. This matches QEMU's PCI enumeration order where the first `-device e1000` gets a lower PCI slot number.
+
+### 2.3 Connection Brokering
 
 Each child has a **command channel** — a 4KB shared memory region containing a `CommandChannel` struct with a mutex, futex-based wake/reply flags, and an array of `ConnectionEntry` slots.
 
 The root service pre-populates each child's command channel with allowed connections:
-- **router**: may connect to NIC
+- **router**: may connect to NIC_WAN and NIC_LAN
 - **console**: may connect to SERIAL and ROUTER
 
 When a child calls `requestConnection(service_id)`, it sets the entry status to `requested` and wakes the root service via futex. The root service detects this, allocates a 16KB data SHM, initializes the channel header, grants the SHM to both endpoints, and sets the entry status to `connected`.
 
-### 2.3 Permissions
-
-Each child receives minimal permissions:
+### 2.4 Permissions
 
 | Process | Rights |
 |---------|--------|
 | serial_driver | grant_to, mem_reserve, device_own, restart |
-| nic_driver | grant_to, mem_reserve, shm_create, device_own, restart |
+| nic_wan / nic_lan | grant_to, mem_reserve, shm_create, device_own, restart |
 | router | grant_to, mem_reserve, restart |
 | console | grant_to, mem_reserve, restart |
 
@@ -88,10 +101,10 @@ Bridges the UART 16550 serial port to a SPSC channel for the console.
 ### 3.2 Runtime
 
 Polls in a loop:
-- **UART → Channel**: Reads LSR for data ready, reads RBR, sends single byte to channel
-- **Channel → UART**: Receives from channel, writes each byte to THR after checking LSR transmit ready
+- **UART → Channel**: Reads LSR for data ready, reads RBR, sends byte to channel
+- **Channel → UART**: Receives from channel, writes each byte to THR after checking LSR
 
-All UART register access uses `ioport_read` and `ioport_write` syscalls with the device handle.
+All UART register access uses `ioport_read` and `ioport_write` syscalls.
 
 ---
 
@@ -99,7 +112,7 @@ All UART register access uses `ioport_read` and `ioport_write` syscalls with the
 
 **File:** `nic_driver/main.zig`
 
-Bridges the Intel e1000 network card to a SPSC channel for the router.
+Bridges the Intel e1000 network card to a SPSC channel. The same binary is used for both WAN and LAN instances — each gets a different device handle from the root service.
 
 ### 4.1 Initialization
 
@@ -108,9 +121,9 @@ Bridges the Intel e1000 network card to a SPSC channel for the router.
 3. Resets the e1000 (CTRL.RST), waits for reset completion
 4. Sets link up (CTRL.SLU + CTRL.ASDE), reads MAC from RAL/RAH
 5. Clears multicast table array
-6. Allocates DMA shared memory (34 pages = 139264 bytes) via `shm_create_with_rights`
+6. Allocates DMA shared memory (34 pages = 139264 bytes) via `shm_create_with_rights` (RW, no execute)
 7. Maps DMA via IOMMU (`dma_map` syscall) — **IOMMU is required**, driver exits if unavailable
-8. Initializes RX and TX descriptor rings
+8. Initializes RX and TX descriptor rings in the DMA region
 9. Configures RCTL (receive) and TCTL (transmit) registers
 
 ### 4.2 DMA Buffer Layout
@@ -123,36 +136,15 @@ Offset 66560:    32 × TX packet buffers (32 × 2048 = 65536 bytes)
 Total: 132096 bytes (34 pages)
 ```
 
-Each descriptor is 16 bytes containing a DMA buffer address, length, status, and command flags. The e1000 hardware reads/writes these via DMA through the IOMMU.
+### 4.3 MAC Announcement
 
-### 4.3 Descriptor Formats
-
-**RxDesc:**
-```
-buffer_addr: u64   — DMA address of packet buffer
-length: u16        — received packet length (set by hardware)
-checksum: u16      — hardware checksum
-status: u8         — DD bit indicates descriptor done
-errors: u8         — error flags
-special: u16       — VLAN tag
-```
-
-**TxDesc:**
-```
-buffer_addr: u64   — DMA address of packet data
-length: u16        — packet length
-cso: u8            — checksum offset
-cmd: u8            — EOP | IFCS | RS
-status: u8         — DD bit indicates transmit complete
-css: u8            — checksum start
-special: u16       — VLAN tag
-```
+After establishing the data channel, the NIC driver sends its 6-byte MAC address as the first message. The router reads this to learn each interface's hardware address.
 
 ### 4.4 Runtime
 
 Polls in a loop:
-- **RX**: Check next RX descriptor for DD bit. If set, copy packet data from DMA buffer to stack, send via channel, clear status, advance RDT.
-- **TX**: Check channel for outbound packet. Copy to TX buffer, set descriptor length/cmd, advance TDT.
+- **RX**: Check next RX descriptor DD bit → copy to channel
+- **TX**: Check channel for data → copy to TX buffer, advance TDT
 
 ---
 
@@ -160,61 +152,94 @@ Polls in a loop:
 
 **File:** `router/main.zig`
 
-Processes network packets and handles console commands.
+Processes network packets, handles ARP/ICMP, performs NAT for LAN-to-WAN traffic, and serves DHCP on the LAN.
 
-### 5.1 State
+### 5.1 Per-Interface State
 
-- **router_mac**: `52:54:00:12:34:56` (matches QEMU e1000 default)
-- **router_ip**: `10.0.2.15`
-- **ARP table**: 16-entry fixed array of `{ip: [4]u8, mac: [6]u8, valid: bool}`
-- **Ping state machine**: `idle | arp_pending | echo_sent`
+Each interface (WAN, LAN) has:
+- **MAC address**: learned from NIC driver's MAC announcement
+- **IP address**: static (WAN: 10.0.2.15, LAN: 192.168.1.1)
+- **ARP table**: 16-entry fixed array of `{ip, mac, valid}` — no expiration, LRU eviction at slot 0
 
-### 5.2 Packet Processing
+### 5.2 Packet Processing Pipeline
 
-All packets arrive as raw Ethernet frames from the NIC driver channel.
+```
+Receive from NIC channel
+  → Parse ethertype
+  → 0x0806 (ARP): learn sender, reply if targeted at us, resolve pending ping
+  → 0x0800 (IPv4):
+      → Destination is our IP:
+          → UDP port 67: DHCP server (LAN only)
+          → ICMP echo request: reply
+          → ICMP echo reply: match to outbound ping
+      → LAN → WAN: NAT forward (rewrite src IP/port, send on WAN)
+      → WAN → LAN: NAT reverse (lookup by dst port, rewrite dst IP/port, send on LAN)
+```
 
-**ARP (ethertype 0x0806):**
-- Always learn sender IP/MAC from any ARP packet (request or reply)
-- If ARP request targets our IP: construct and send ARP reply
-- If ping is waiting for ARP resolution: check if target MAC now known
+### 5.3 ARP
 
-**IPv4/ICMP (ethertype 0x0800):**
-- ICMP echo request (type 8): swap addresses, recompute checksums, send reply
-- ICMP echo reply (type 0): match by identifier/sequence, compute RTT, report to console
-
-### 5.3 ARP Table
-
-Entries are learned from all incoming ARP packets. No expiration timer. The table is a linear scan:
-- `arpLookup(ip)`: returns MAC if found
-- `arpLearn(ip, mac)`: updates existing entry or fills first empty slot; overwrites slot 0 when full
+- **arpLearn**: called on every ARP packet (request or reply), updates the interface's ARP table
+- **sendArpRequestOn(iface, target_ip)**: builds and sends ARP request on the specified interface
+- **handleArp(iface, pkt)**: replies to ARP requests targeted at our IP, pads to 60 bytes minimum
 
 ### 5.4 Outbound Ping State Machine
 
 ```
-idle ──[ping command]──→ arp_pending ──[ARP reply]──→ echo_sent ──[ICMP reply]──→ idle
-                              │                            │
-                              └──[3s timeout]──→           └──[3s timeout]──→
-                              (retry or summary)           (retry or summary)
+idle ──[ping cmd]──→ arp_pending ──[ARP reply]──→ echo_sent ──[ICMP reply]──→ idle
+                          │                            │
+                          └──[3s timeout]──→           └──[3s timeout]──→
+                          (retry or summary)           (retry or summary)
 ```
 
-1. Console sends `"ping X.X.X.X"` string
-2. Router parses IP, checks ARP table
-3. If MAC unknown: send ARP request, enter `arp_pending`, start 3s timer
-4. On ARP reply: learn MAC, send ICMP echo request, enter `echo_sent`
-5. On ICMP echo reply: compute RTT, send result to console, advance sequence
-6. After 4 packets (or timeouts): send summary line and return to `idle`
+The ping command auto-selects the interface: LAN subnet destinations use LAN, all others use WAN.
 
-Each result is sent as a separate string message through the console channel.
+### 5.5 NAT (Network Address Translation)
 
-### 5.5 Console Commands
+Source NAT (masquerade) for LAN-to-WAN traffic. The NAT table has 128 entries, each mapping `(protocol, lan_ip, lan_port) → wan_port`.
 
-The router receives raw string commands from the console channel:
+**Outbound (LAN → WAN):**
+1. Extract protocol and source port from the LAN packet
+2. Look up or create NAT entry
+3. Rewrite source IP to WAN IP, source port to NAT port
+4. Set destination MAC to gateway (WAN ARP lookup)
+5. Recompute IP and transport checksums
+6. Send on WAN channel
 
-| Command | Response |
-|---------|----------|
-| `"status"` | Single message with IP and MAC |
-| `"ping X.X.X.X"` | Multiple messages: per-packet results + summary |
-| `"arp"` | Header line + one line per ARP table entry |
+**Inbound (WAN → LAN):**
+1. Check if destination IP matches WAN IP and protocol matches a NAT entry
+2. Look up NAT entry by (protocol, wan_port)
+3. Rewrite destination IP to original LAN IP, destination port to original port
+4. Set destination MAC from LAN ARP table
+5. Recompute checksums
+6. Send on LAN channel
+
+**Supported protocols:** ICMP (ID as port), TCP (source port), UDP (source port). For UDP, the transport checksum is zeroed (optional per RFC 768).
+
+**Entry lifecycle:** 2-minute timeout. Ephemeral WAN ports start at 10000 and wrap around.
+
+### 5.6 DHCP Server (LAN Side)
+
+The router serves DHCP on the LAN interface (UDP port 67).
+
+**Lease table:** 32 entries, maps MAC → IP. Addresses assigned from 192.168.1.100–192.168.1.231.
+
+**Supported message types:**
+- DHCPDISCOVER → DHCPOFFER
+- DHCPREQUEST → DHCPACK
+
+**Options provided:** subnet mask (255.255.255.0), router (192.168.1.1), DNS server (192.168.1.1), lease time (7200s), server identifier.
+
+### 5.7 Console Commands
+
+The router receives string commands from the console channel and sends back string responses:
+
+| Command | Response pattern |
+|---------|-----------------|
+| `"status"` | Single message with interface info |
+| `"ping X.X.X.X"` | Multiple messages: per-packet results + `"---"` summary |
+| `"arp"` | Table dump + `"---"` summary |
+| `"nat"` | Table dump + `"---"` summary |
+| `"leases"` | Table dump + `"---"` summary |
 
 ---
 
@@ -224,21 +249,13 @@ The router receives raw string commands from the console channel:
 
 Interactive serial terminal with line editing.
 
-### 6.1 Architecture
+### 6.1 Router Communication
 
-The console bridges two channels:
-- **serial_chan**: connects to serial_driver (Side A)
-- **router_chan**: connects to router (Side B)
+Commands that require the router use two patterns:
 
-Input characters arrive from `serial_chan.recv()`. The console echoes them back via `serial_chan.send()` and builds a line buffer. On Enter, the line is dispatched to `processCommand()`.
+**Single-response** (`status`): Send string, poll for up to 10,000 yields.
 
-### 6.2 Router Communication
-
-Commands that require the router (`status`, `ping`, `arp`) use two patterns:
-
-**Single-response** (`status`): Send command string, poll `router_chan.recv()` for up to 10,000 yields.
-
-**Multi-response** (`ping`, `arp`): Send command string, poll for up to 8 messages with 100,000-yield timeout between each. The summary line (starting with `"---"`) signals end of output.
+**Multi-response** (`ping`, `arp`, `nat`, `leases`): Send string, poll for up to 8 messages with 100,000-yield timeout between each. The `"---"` prefix signals end of output.
 
 ---
 
@@ -246,40 +263,21 @@ Commands that require the router (`status`, `ping`, `arp`) use two patterns:
 
 All inter-process communication uses the `lib.channel` SPSC ring buffer.
 
-### 7.1 Channel Layout
+### 7.1 Layout
 
 ```
 ChannelHeader (56 bytes):
-  magic: u64 = "ZAG_CHAN"
-  version: u16 = 1
-  ring_a_offset, ring_b_offset, ring_size: u32
+  magic: "ZAG_CHAN", version: 1
+  ring_a_offset, ring_b_offset, ring_size
 
 RingHeader (per direction):
-  head: u64 (atomic, owned by reader)
-  tail: u64 (atomic, owned by writer)
+  head, tail: u64 (atomic)
   wake_flag: u64 (futex)
   checksum: u32 (CRC32)
-  data_size: u32
-  [data bytes...]
+  [data bytes]
 ```
 
-Side A writes to ring A, reads from ring B. Side B writes to ring B, reads from ring A.
-
-### 7.2 Message Format
-
-Messages are length-prefixed:
-```
-[u32 length][payload bytes]
-```
-
-CRC32 checksum is computed over the written data. The ring wraps around using modulo arithmetic.
-
-### 7.3 Synchronization
-
-- Writers atomically store the new tail after writing
-- Readers atomically store the new head after reading
-- Futex wake/wait on `wake_flag` for blocking
-- All channel operations are non-blocking (`send` returns false if full, `recv` returns null if empty)
+Side A writes ring A, reads ring B. Side B is opposite. Messages are length-prefixed `[u32 len][payload]`.
 
 ---
 
@@ -288,56 +286,116 @@ CRC32 checksum is computed over the written data. The ring wraps around using mo
 ### 8.1 Ethernet Frame
 
 ```
-Offset  Size  Field
-0       6     Destination MAC
-6       6     Source MAC
-12      2     EtherType (0x0806=ARP, 0x0800=IPv4)
-14      ...   Payload
+[0:5]  Destination MAC
+[6:11] Source MAC
+[12:13] EtherType (0x0806=ARP, 0x0800=IPv4)
+[14:]  Payload
 ```
 
-Minimum frame size: 60 bytes (excluding FCS). The router pads ARP replies to 60 bytes.
+Minimum 60 bytes (excluding FCS).
 
-### 8.2 ARP
-
-```
-Offset  Size  Field
-14      2     Hardware Type (0x0001 = Ethernet)
-16      2     Protocol Type (0x0800 = IPv4)
-18      1     Hardware Address Length (6)
-19      1     Protocol Address Length (4)
-20      2     Operation (0x0001=Request, 0x0002=Reply)
-22      6     Sender Hardware Address (MAC)
-28      4     Sender Protocol Address (IP)
-32      6     Target Hardware Address (MAC)
-38      4     Target Protocol Address (IP)
-```
-
-### 8.3 IPv4
+### 8.2 ARP (EtherType 0x0806)
 
 ```
-Offset  Size  Field
-14      1     Version (4) + IHL (5 = 20 bytes)
-15      1     DSCP/ECN
-16      2     Total Length
-18      2     Identification
-20      2     Flags + Fragment Offset
-22      1     TTL
-23      1     Protocol (1 = ICMP)
-24      2     Header Checksum
-26      4     Source IP
-30      4     Destination IP
+[14:15] Hardware Type (0x0001)
+[16:17] Protocol Type (0x0800)
+[18]    HW Addr Len (6)
+[19]    Proto Addr Len (4)
+[20:21] Opcode (1=Request, 2=Reply)
+[22:27] Sender MAC
+[28:31] Sender IP
+[32:37] Target MAC
+[38:41] Target IP
+```
+
+### 8.3 IPv4 (EtherType 0x0800)
+
+```
+[14]    Version(4) + IHL(5)
+[16:17] Total Length
+[22]    TTL
+[23]    Protocol (1=ICMP, 6=TCP, 17=UDP)
+[24:25] Header Checksum
+[26:29] Source IP
+[30:33] Destination IP
 ```
 
 ### 8.4 ICMP Echo
 
 ```
-Offset     Size  Field
-IP+0       1     Type (8=Request, 0=Reply)
-IP+1       1     Code (0)
-IP+2       2     Checksum
-IP+4       2     Identifier
-IP+6       2     Sequence Number
-IP+8       ...   Data (56 bytes of payload)
+[IP+0]  Type (8=Request, 0=Reply)
+[IP+1]  Code (0)
+[IP+2:3] Checksum
+[IP+4:5] Identifier
+[IP+6:7] Sequence Number
 ```
 
-The router uses identifier `0x5A47` ("ZG") for outbound pings.
+### 8.5 UDP
+
+```
+[IP+0:1] Source Port
+[IP+2:3] Destination Port
+[IP+4:5] Length
+[IP+6:7] Checksum (optional, zeroed for NAT)
+```
+
+### 8.6 DHCP (UDP ports 67/68)
+
+The DHCP server responds to DISCOVER and REQUEST messages. Response includes: message type, subnet mask, router, DNS, lease time, and server identifier options. Magic cookie: `0x63825363`.
+
+---
+
+## 9. Build and Test
+
+### 9.1 Directory Structure
+
+```
+userspace/routerOS/
+  build.zig              (top-level build, compiles all programs)
+  linker.ld              (shared linker script)
+  root_service/main.zig
+  serial_driver/main.zig
+  nic_driver/main.zig
+  router/main.zig
+  console/main.zig
+```
+
+### 9.2 Build Commands
+
+```bash
+# Build routerOS
+cd userspace/routerOS && zig build
+
+# Build kernel + routerOS (Intel IOMMU, TCG)
+zig build -Dnet=tap -Duse-llvm=true -Dkvm=false -Diommu=intel \
+  -Droot-service=userspace/bin/routerOS.elf
+
+# Build kernel + routerOS (AMD IOMMU, KVM)
+zig build -Dnet=tap -Duse-llvm=true -Dkvm=true -Diommu=amd \
+  -Droot-service=userspace/bin/routerOS.elf
+```
+
+### 9.3 Host Setup
+
+```bash
+# WAN interface (already exists if previously configured)
+sudo ip tuntap add dev tap0 mode tap user $USER
+sudo ip addr add 10.0.2.1/24 dev tap0
+sudo ip link set tap0 up
+
+# LAN interface
+sudo ip tuntap add dev tap1 mode tap user $USER
+sudo ip addr add 192.168.1.100/24 dev tap1
+sudo ip link set tap1 up
+```
+
+### 9.4 Testing
+
+All four IOMMU configurations are verified working:
+
+| Configuration | WAN Ping | LAN Ping |
+|---------------|----------|----------|
+| Intel VT-d + TCG | ✓ | ✓ |
+| Intel VT-d + KVM | ✓ | ✓ |
+| AMD-Vi + TCG | ✓ | ✓ |
+| AMD-Vi + KVM | ✓ | ✓ |

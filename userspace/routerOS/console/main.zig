@@ -84,7 +84,9 @@ fn processCommand(line: []const u8) void {
         serialWrite("  help        - show this help\r\n");
         serialWrite("  status      - query router status\r\n");
         serialWrite("  ping <ip>   - ping an IP address\r\n");
-        serialWrite("  arp         - show ARP table\r\n");
+        serialWrite("  arp         - show ARP tables\r\n");
+        serialWrite("  nat         - show NAT table\r\n");
+        serialWrite("  leases      - show DHCP leases\r\n");
         serialWrite("  version     - show system version\r\n");
         serialWrite("  uptime      - show system uptime\r\n");
         serialWrite("  clear       - clear screen\r\n");
@@ -104,6 +106,10 @@ fn processCommand(line: []const u8) void {
         routerMultiResponse(line);
     } else if (eql(line, "arp")) {
         routerMultiResponse("arp");
+    } else if (eql(line, "nat")) {
+        routerMultiResponse("nat");
+    } else if (eql(line, "leases")) {
+        routerMultiResponse("leases");
     } else {
         serialWrite("unknown command: ");
         serialWrite(line);

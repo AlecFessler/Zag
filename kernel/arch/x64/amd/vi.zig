@@ -34,14 +34,17 @@ const DeviceTableEntry = packed struct(u256) {
     valid: bool,
     translation_valid: bool,
     _res0: u5 = 0,
-    host_page_table_root_lo: u45,
+    _had: u2 = 0,
     paging_mode: u3 = 4,
-    ir: bool = false,
-    iw: bool = false,
-    _res1: u6 = 0,
+    host_page_table_root: u40,
+    _res1: u3 = 0,
+    _sys: u6 = 0,
+    ir: bool = true,
+    iw: bool = true,
+    _res2: u1 = 0,
     domain_id: u16,
-    _res2: u49 = 0,
-    _res3: u128 = 0,
+    _res3: u48 = 0,
+    _res4: u128 = 0,
 };
 
 var iommu_base: u64 = 0;
@@ -97,7 +100,7 @@ pub fn init(reg_base_phys: PAddr) !void {
     }
     iommu_base = VAddr.fromPAddr(reg_base_phys, null).addr;
 
-    const dt_pages: u32 = 8;
+    const dt_pages: u32 = 1;
     dev_table_size = @as(u64, dt_pages) * paging.PAGE4K;
     const dt = try allocZeroedPage();
     dev_table_phys = dt.phys;
@@ -113,8 +116,12 @@ pub fn init(reg_base_phys: PAddr) !void {
     const cmd_len_bits: u64 = 8;
     writeReg64(MMIO_CMD_BUF_BASE, cmd_buf_phys.addr | (cmd_len_bits << 56));
 
+    const evt = try allocZeroedPage();
+    const evt_len_bits: u64 = 8;
+    writeReg64(MMIO_EVT_LOG_BASE, evt.phys.addr | (evt_len_bits << 56));
+
     var ctrl = readReg64(MMIO_CONTROL);
-    ctrl |= CTRL_IOMMU_EN | CTRL_CMD_BUF_EN;
+    ctrl |= CTRL_IOMMU_EN | CTRL_CMD_BUF_EN | CTRL_EVT_LOG_EN;
     writeReg64(MMIO_CONTROL, ctrl);
 
     initialized = true;
@@ -131,13 +138,40 @@ pub fn setupDevice(device: *DeviceRegion) !void {
     const pt = try allocZeroedPage();
     device.dma_page_table_root = pt.phys;
 
-    const entry_ptr: *DeviceTableEntry = @ptrFromInt(dev_table_virt.addr + entry_offset);
-    entry_ptr.* = .{
-        .valid = true,
-        .translation_valid = true,
-        .host_page_table_root_lo = @truncate(pt.phys.addr >> 12),
-        .domain_id = device_id,
-    };
+    const entry_base: [*]volatile u64 = @ptrFromInt(dev_table_virt.addr + entry_offset);
+
+    // DTE quadword 0:
+    // [0] V=1, [1] TV=1, [8:7] HAD=0, [11:9] Mode=4,
+    // [51:12] page table root, [61] IR=1, [62] IW=1
+    const mode: u64 = 4;
+    entry_base[0] = 0x3 | (mode << 9) | (pt.phys.addr & 0xFFFFFFFFF000) | (1 << 61) | (1 << 62);
+
+    // DTE quadword 1: [15:0] DomainID
+    entry_base[1] = @as(u64, device_id);
+
+    // DTE quadwords 2-3: reserved, keep zero
+    entry_base[2] = 0;
+    entry_base[3] = 0;
+
+    invalidateDeviceEntry(device_id);
+    invalidateIotlb();
+}
+
+const AMDVI_IR: u64 = 1 << 61;
+const AMDVI_IW: u64 = 1 << 62;
+const AMDVI_RW: u64 = AMDVI_IR | AMDVI_IW;
+const AMDVI_ADDR_MASK: u64 = 0xFFFFFFFFF000;
+
+fn amdviNonLeaf(phys_addr: u64, next_level: u64) u64 {
+    return (phys_addr & AMDVI_ADDR_MASK) | (next_level << 9) | AMDVI_RW | 0x3;
+}
+
+fn amdviLeaf(phys_addr: u64) u64 {
+    return (phys_addr & AMDVI_ADDR_MASK) | AMDVI_RW | 0x3;
+}
+
+fn amdviPresent(entry: u64) bool {
+    return (entry & 0x3) != 0;
 }
 
 pub fn mapDmaPage(device: *DeviceRegion, dma_addr: u64, phys: PAddr) !void {
@@ -151,25 +185,25 @@ pub fn mapDmaPage(device: *DeviceRegion, dma_addr: u64, phys: PAddr) !void {
     const pd_idx: u9 = @truncate((dma_addr >> 21) & 0x1FF);
     const pt_idx: u9 = @truncate((dma_addr >> 12) & 0x1FF);
 
-    if (pml4[pml4_idx] & 1 == 0) {
+    if (!amdviPresent(pml4[pml4_idx])) {
         const page = try allocZeroedPage();
-        pml4[pml4_idx] = page.phys.addr | 0x3;
+        pml4[pml4_idx] = amdviNonLeaf(page.phys.addr, 3);
     }
-    const pdpt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pml4[pml4_idx] & 0xFFFFFFFFF000), null).addr);
+    const pdpt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pml4[pml4_idx] & AMDVI_ADDR_MASK), null).addr);
 
-    if (pdpt[pdpt_idx] & 1 == 0) {
+    if (!amdviPresent(pdpt[pdpt_idx])) {
         const page = try allocZeroedPage();
-        pdpt[pdpt_idx] = page.phys.addr | 0x3;
+        pdpt[pdpt_idx] = amdviNonLeaf(page.phys.addr, 2);
     }
-    const pd: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pdpt[pdpt_idx] & 0xFFFFFFFFF000), null).addr);
+    const pd: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pdpt[pdpt_idx] & AMDVI_ADDR_MASK), null).addr);
 
-    if (pd[pd_idx] & 1 == 0) {
+    if (!amdviPresent(pd[pd_idx])) {
         const page = try allocZeroedPage();
-        pd[pd_idx] = page.phys.addr | 0x3;
+        pd[pd_idx] = amdviNonLeaf(page.phys.addr, 1);
     }
-    const pt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pd[pd_idx] & 0xFFFFFFFFF000), null).addr);
+    const pt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pd[pd_idx] & AMDVI_ADDR_MASK), null).addr);
 
-    pt[pt_idx] = phys.addr | 0x3;
+    pt[pt_idx] = amdviLeaf(phys.addr);
 }
 
 pub fn unmapDmaPage(device: *DeviceRegion, dma_addr: u64) void {
@@ -178,29 +212,48 @@ pub fn unmapDmaPage(device: *DeviceRegion, dma_addr: u64) void {
     const pml4_virt = VAddr.fromPAddr(device.dma_page_table_root, null);
     const pml4: *[512]u64 = @ptrFromInt(pml4_virt.addr);
     const pml4_idx: u9 = @truncate((dma_addr >> 39) & 0x1FF);
-    if (pml4[pml4_idx] & 1 == 0) return;
+    if (!amdviPresent(pml4[pml4_idx])) return;
 
-    const pdpt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pml4[pml4_idx] & 0xFFFFFFFFF000), null).addr);
+    const pdpt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pml4[pml4_idx] & AMDVI_ADDR_MASK), null).addr);
     const pdpt_idx: u9 = @truncate((dma_addr >> 30) & 0x1FF);
-    if (pdpt[pdpt_idx] & 1 == 0) return;
+    if (!amdviPresent(pdpt[pdpt_idx])) return;
 
-    const pd: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pdpt[pdpt_idx] & 0xFFFFFFFFF000), null).addr);
+    const pd: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pdpt[pdpt_idx] & AMDVI_ADDR_MASK), null).addr);
     const pd_idx: u9 = @truncate((dma_addr >> 21) & 0x1FF);
-    if (pd[pd_idx] & 1 == 0) return;
+    if (!amdviPresent(pd[pd_idx])) return;
 
-    const pt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pd[pd_idx] & 0xFFFFFFFFF000), null).addr);
+    const pt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pd[pd_idx] & AMDVI_ADDR_MASK), null).addr);
     const pt_idx: u9 = @truncate((dma_addr >> 12) & 0x1FF);
     pt[pt_idx] = 0;
 
     invalidateIotlb();
 }
 
-fn invalidateIotlb() void {
+fn issueCommand(lo: u64, hi: u64) void {
     const tail = readReg64(MMIO_CMD_BUF_TAIL);
-    const cmd_ptr: *[2]u64 = @ptrFromInt(cmd_buf_virt.addr + (tail & 0xFFF));
-    cmd_ptr[0] = 0x01;
-    cmd_ptr[1] = 0;
+    const cmd_ptr: [*]volatile u64 = @ptrFromInt(cmd_buf_virt.addr + (tail & 0xFFF));
+    cmd_ptr[0] = lo;
+    cmd_ptr[1] = hi;
     writeReg64(MMIO_CMD_BUF_TAIL, (tail + 16) & 0xFFF);
+}
+
+pub fn invalidateDeviceEntry(device_id: u16) void {
+    if (!initialized) return;
+    // CMD_INVALIDATE_DEVTAB_ENTRY (type 0x02)
+    // [3:0] = 2, [31:16] = device_id
+    issueCommand(0x02 | (@as(u64, device_id) << 16), 0);
+}
+
+fn invalidateIotlb() void {
+    // CMD_INVALIDATE_IOMMU_PAGES (type 0x03)
+    // First qword: [3:0]=opcode(3), [32]=S(size), [31:7]=domain_id(0=all)
+    // With S=1: invalidate all pages for all domains
+    issueCommand(0x03 | (@as(u64, 1) << 32), 0);
+}
+
+pub fn flushAll() void {
+    if (!initialized) return;
+    invalidateIotlb();
 }
 
 pub fn isInitialized() bool {

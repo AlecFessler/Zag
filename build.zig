@@ -148,7 +148,9 @@ pub fn build(b: *std.Build) void {
     ;
     const qemu_net_args: []const u8 = if (std.mem.eql(u8, net_type, "tap"))
         \\-netdev tap,id=net0,ifname=tap0,script=no,downscript=no \
-        \\-device e1000,netdev=net0
+        \\-device e1000,netdev=net0,mac=52:54:00:12:34:56 \
+        \\-netdev tap,id=net1,ifname=tap1,script=no,downscript=no \
+        \\-device e1000,netdev=net1,mac=52:54:00:12:34:57
     else if (std.mem.eql(u8, net_type, "user"))
         \\
     else

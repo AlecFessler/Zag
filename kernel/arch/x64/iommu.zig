@@ -46,6 +46,9 @@ pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
         }
     }
     device.dma_cursor = base_dma + @as(u64, shm.pages.len) * 0x1000;
+    if (active_type == .amd_vi) {
+        vi.flushAll();
+    }
     return base_dma;
 }
 

@@ -111,6 +111,8 @@ pub const CommandChannel = extern struct {
 pub const ServiceId = struct {
     pub const SERIAL: u32 = 1;
     pub const NIC: u32 = 2;
+    pub const NIC_WAN: u32 = 2;
+    pub const NIC_LAN: u32 = 5;
     pub const ROUTER: u32 = 3;
     pub const CONSOLE: u32 = 4;
 };

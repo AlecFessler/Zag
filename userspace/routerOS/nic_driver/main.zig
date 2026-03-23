@@ -333,6 +333,8 @@ pub fn main(perm_view_addr: u64) void {
 
     syscall.write("nic_driver: bridging NIC <-> channel\n");
 
+    _ = chan.send(&mac_addr);
+
     var pkt_buf: [2048]u8 = undefined;
     while (true) {
         if (rxPoll(&pkt_buf)) |len| {
