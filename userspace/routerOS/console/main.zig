@@ -94,6 +94,7 @@ fn processCommand(line: []const u8) void {
         serialWrite("  forward <tcp|udp> <wport> <lip> <lport>\r\n");
         serialWrite("                           - port forward to LAN\r\n");
         serialWrite("  dns <ip>                 - set upstream DNS\r\n");
+        serialWrite("  dhcp-client              - start/show WAN DHCP\r\n");
         serialWrite("  version                  - system version\r\n");
         serialWrite("  uptime                   - system uptime\r\n");
         serialWrite("  clear                    - clear screen\r\n");
@@ -128,6 +129,8 @@ fn processCommand(line: []const u8) void {
     } else if (startsWith(line, "forward ")) {
         routerCommand(line);
     } else if (startsWith(line, "dns ")) {
+        routerCommand(line);
+    } else if (eql(line, "dhcp-client")) {
         routerCommand(line);
     } else {
         serialWrite("unknown command: ");

@@ -1,46 +1,34 @@
 # RouterOS System Design
 
-RouterOS is a userspace network router application for the Zag microkernel. All components run as separate processes communicating via shared-memory SPSC channels. No dynamic memory allocation is used anywhere in the system.
+RouterOS is a userspace network router for the Zag microkernel. All components run as separate processes communicating via shared-memory SPSC channels. No dynamic memory allocation.
 
 ---
 
-## 1. Architecture Overview
+## 1. Architecture
 
 ### 1.1 Process Hierarchy
 
 ```
 root_service (broker)
-├── serial_driver    (UART 16550 driver)
-├── nic_wan          (Intel e1000 driver, WAN interface)
-├── nic_lan          (Intel e1000 driver, LAN interface)
-├── router           (packet processing, NAT, firewall, DNS, DHCP)
-└── console          (serial line editor, user commands)
+├── serial_driver    (UART 16550)
+├── nic_wan          (e1000, WAN interface)
+├── nic_lan          (e1000, LAN interface)
+├── router           (NAT, firewall, DNS, DHCP, ARP)
+└── console          (serial line editor)
 ```
 
-With only one NIC, the root service spawns a single `nic_driver` and the router operates in single-interface mode.
-
-### 1.2 Communication Topology
+### 1.2 Data Flow
 
 ```
 Host WAN (tap0) ←→ e1000 ←→ nic_wan ←channel→ router ←channel→ console ←channel→ serial_driver ←→ UART
 Host LAN (tap1) ←→ e1000 ←→ nic_lan ←channel→ router ↗
 ```
 
-### 1.3 Service IDs
-
-| ID | Name | Process |
-|----|------|---------|
-| 1 | SERIAL | serial_driver |
-| 2 | NIC_WAN | nic_wan |
-| 3 | ROUTER | router |
-| 4 | CONSOLE | console |
-| 5 | NIC_LAN | nic_lan |
-
-### 1.4 Network Addressing
+### 1.3 Addressing
 
 | Interface | IP | Subnet | MAC |
 |-----------|------|--------|-----|
-| WAN | 10.0.2.15 | 10.0.2.0/24 | 52:54:00:12:34:56 |
+| WAN | 10.0.2.15 (or DHCP) | 10.0.2.0/24 | 52:54:00:12:34:56 |
 | LAN | 192.168.1.1 | 192.168.1.0/24 | 52:54:00:12:34:57 |
 
 ---
@@ -49,14 +37,9 @@ Host LAN (tap1) ←→ e1000 ←→ nic_lan ←channel→ router ↗
 
 **File:** `root_service/main.zig`
 
-### 2.1 Startup
+Scans perm_view for MMIO network devices (filters out port-IO). Spawns children in order, grants one device handle per NIC driver. Enters broker loop to mediate SHM connections.
 
-1. Scan perm_view for device handles (serial, NIC MMIO only)
-2. Spawn children: serial_driver, nic_wan, nic_lan, router, console
-3. Grant each child exactly one device handle
-4. Enter broker loop for SHM connection requests
-
-### 2.2 Permissions
+### Permissions
 
 | Process | Rights |
 |---------|--------|
@@ -67,112 +50,168 @@ Host LAN (tap1) ←→ e1000 ←→ nic_lan ←channel→ router ↗
 
 ---
 
-## 3. Serial Driver
-
-**File:** `serial_driver/main.zig`
-
-UART 16550 driver: 115200 baud, 8N1, FIFO. Bridges serial port to SPSC channel via `ioport_read`/`ioport_write` syscalls.
-
----
-
-## 4. NIC Driver
+## 3. NIC Driver
 
 **File:** `nic_driver/main.zig`
 
-Intel e1000 driver. Same binary for WAN and LAN — each gets a different device handle.
+Same binary for WAN and LAN. Each gets one MMIO device handle.
 
-### 4.1 DMA Buffer Layout
+### DMA Layout (34 pages)
 
 ```
 Offset 0:      32 × RxDesc (512B)
 Offset 512:    32 × TxDesc (512B)
 Offset 1024:   32 × RX buffers (64KB)
 Offset 66560:  32 × TX buffers (64KB)
-Total: 34 pages (139264B)
 ```
 
-IOMMU is required (`dma_map` syscall). Driver exits if IOMMU unavailable. After establishing the data channel, sends 6-byte MAC as the first message.
+IOMMU required (`dma_map`). Sends 6-byte MAC announcement as first channel message.
 
 ---
 
-## 5. Router
+## 4. Router
 
 **File:** `router/main.zig`
 
-### 5.1 Data Structures
+### 4.1 Data Structures
 
-| Structure | Size | Description |
-|-----------|------|-------------|
-| ARP table | 16 per interface | `{ip, mac, valid}`, no expiration |
-| NAT table | 128 entries | `{proto, lan_ip, lan_port, wan_port, timestamp}`, 2min timeout |
-| DHCP leases | 32 entries | `{mac, ip, valid}`, range 192.168.1.100-231 |
-| Port forwards | 16 rules | `{proto, wan_port, lan_ip, lan_port}` |
-| Firewall rules | 32 rules | `{action, src_ip, src_mask, protocol, dst_port}` |
-| DNS relay | 32 entries | `{client_ip, client_port, query_id, relay_id}` |
-| Interface stats | 2 (WAN+LAN) | `{rx_pkts, rx_bytes, tx_pkts, tx_bytes, rx_dropped}` |
+| Structure | Size | Purpose |
+|-----------|------|---------|
+| ARP table | 16 × 2 | Per-interface IP→MAC, 5-minute expiry |
+| NAT table | 128 | Connection tracking with per-protocol timeouts |
+| DHCP leases | 32 | LAN DHCP server, 192.168.1.100-231 |
+| Port forwards | 16 | DNAT rules (WAN port → LAN IP:port) |
+| Firewall rules | 32 | Block/allow by source IP |
+| DNS relay | 32 | Query ID translation for LAN→upstream |
+| Fragment table | 16 | IP fragment reassembly tracking |
+| Interface stats | 2 | RX/TX/drop counters per interface |
 
-### 5.2 Packet Processing Pipeline
+### 4.2 Packet Pipeline
 
 ```
-Receive from NIC channel → count stats
-  ARP (0x0806):
-    → learn sender IP/MAC
-    → reply if targeted at us
-    → resolve pending ping ARP
-  IPv4 (0x0800):
-    → firewall check (WAN inbound only)
-    → if for us:
-        UDP 67 (LAN): DHCP server
-        UDP 53: DNS relay (LAN→upstream or upstream→LAN)
-        ICMP echo request: reply
-        ICMP echo reply: match outbound ping
-    → LAN→WAN: NAT forward (SNAT)
-    → WAN→LAN: port forward check, then NAT reverse (DNAT)
+Receive → stats → ethertype dispatch
+  ARP: learn sender, reply if for us, resolve pending ping
+  IPv4:
+    firewall check (WAN inbound)
+    if for us:
+      UDP 68 (WAN): DHCP client response
+      UDP 67 (LAN): DHCP server
+      UDP 53: DNS relay
+      ICMP echo request: reply
+      ICMP echo reply: match outbound ping
+    LAN→WAN: DNS intercept → NAT forward (SNAT)
+    WAN→LAN: DNS response → port forward → NAT reverse
 ```
 
-### 5.3 NAT (Source NAT / Masquerade)
+### 4.3 NAT
 
-**Outbound (LAN→WAN):** Rewrite source IP to WAN IP, source port to ephemeral NAT port. TCP: incremental checksum adjustment. UDP: zero checksum. ICMP: rewrite identifier.
+**Source NAT (LAN→WAN):**
+- Rewrite src IP → WAN IP, src port → ephemeral NAT port
+- TCP: incremental checksum (RFC 1624), track SYN/FIN/RST state
+- UDP: zero checksum (RFC 768 optional)
+- ICMP: rewrite identifier
 
-**Inbound (WAN→LAN):** Look up NAT entry by (proto, wan_port). Rewrite destination IP/port back to original LAN values.
+**Reverse NAT (WAN→LAN):**
+- Lookup by (protocol, wan_port)
+- Rewrite dst IP/port back to original LAN values
+- TCP state tracking on return path
 
-### 5.4 Port Forwarding (DNAT)
+### 4.4 TCP Connection Tracking
 
-Checked before NAT reverse lookup for WAN→LAN traffic. Rewrites destination IP/port per the forwarding rule. TCP checksum incrementally adjusted. Configured via console `forward` command.
+| State | Trigger | Timeout |
+|-------|---------|---------|
+| syn_sent | SYN seen | 30s |
+| established | ACK seen (after SYN) | 300s |
+| fin_wait | FIN or RST | 30s |
+| (removed) | RST in fin_wait | immediate |
 
-### 5.5 Firewall
+### 4.5 UDP Timeout Tuning
 
-Applied to inbound WAN IPv4 packets before any processing. Checks source IP against rule table. Matching block rules cause the packet to be dropped (counted in `rx_dropped`). Default policy: allow.
+| Traffic | Timeout |
+|---------|---------|
+| DNS (port 53) | 30s |
+| General UDP | 120s |
+| ICMP | 60s |
 
-### 5.6 DNS Relay
+### 4.6 ARP Table
 
-LAN clients send DNS queries to the router's LAN IP (192.168.1.1:53). The router:
-1. Records the client's IP, port, and original query ID
-2. Assigns a relay ID and rewrites the query
-3. Forwards to upstream DNS (default 10.0.2.1, configurable via `dns` command)
-4. On response: matches by relay ID, restores original query ID, forwards to client
+- 16 entries per interface, learned from all ARP packets
+- Timestamped on learn/update
+- Expired every 10 seconds (5-minute TTL)
+- Slot 0 evicted when full
 
-### 5.7 DHCP Server (LAN)
+### 4.7 DNS Relay
 
-Responds to DHCPDISCOVER with DHCPOFFER and DHCPREQUEST with DHCPACK. Options: subnet mask, router, DNS, lease time (7200s). Pool: 192.168.1.100-231.
+LAN clients → router (192.168.1.1:53) → upstream DNS (configurable, default 10.0.2.1)
+- Rewrites query ID with relay ID for tracking
+- 32 concurrent query slots
+- Upstream learned from DHCP option 6 if DHCP client active
 
-### 5.8 TCP Checksum Adjustment
+### 4.8 DHCP Server (LAN)
 
-For NAT and port forwarding, TCP checksums are incrementally adjusted using RFC 1624 method: subtract old IP/port contribution, add new contribution. This avoids recomputing the full pseudo-header checksum over the entire payload.
+- Pool: 192.168.1.100-231 (32 leases)
+- Options: subnet mask, router, DNS, lease time (7200s)
+- DISCOVER → OFFER, REQUEST → ACK
+
+### 4.9 DHCP Client (WAN)
+
+- DISCOVER → OFFER → REQUEST → ACK
+- Sets wan_ip dynamically
+- Learns upstream DNS from option 6
+- 10-second retry timeout
+- Triggered by `dhcp-client` console command
+
+### 4.10 Port Forwarding
+
+- 16 rules, configured via console (`forward tcp 80 192.168.1.100 8080`)
+- Checked before NAT reverse lookup for WAN→LAN traffic
+- TCP: incremental checksum adjustment
+- UDP: zero checksum
+
+### 4.11 Firewall
+
+- 32 rules, WAN inbound only
+- Match by source IP (full /32 mask)
+- Default policy: allow
+- Blocked packets increment drop counter
+
+### 4.12 IP Fragment Tracking
+
+- 16 entries tracking IP ID → source port from first fragment
+- Non-first fragments (fragment offset > 0) lack port numbers
+- Table maps (src_ip, ip_id) → first_frag_sport for NAT lookup
+- 30-second expiry
+
+### 4.13 Connection Logging
+
+NAT creation, DHCP events, and firewall actions logged to serial via `syscall.write`. Format:
+```
+nat: new tcp 192.168.1.100:49152 -> 10.0.2.1:80 (wan:10001)
+dhcp-client: bound to 10.0.2.15
+firewall: block rule added
+```
+
+### 4.14 Periodic Maintenance
+
+Every 10 seconds:
+- ARP table expiry (both interfaces)
+- NAT table expiry (per-protocol timeouts)
+- Fragment table expiry
+- DHCP client retry check
 
 ---
 
-## 6. Console
+## 5. Console
 
 **File:** `console/main.zig`
 
-Line editor over serial channel. Commands are forwarded to the router as raw strings. Multi-response commands (ping, arp, nat, leases, rules) use a `"---"` prefix to signal end of output.
+Line editor over serial. Single-response commands use 10k-yield timeout. Multi-response commands (ping, arp, nat, leases, rules) poll for up to 8 messages with 100k-yield inter-message timeout, end on `"---"` prefix.
 
 ---
 
-## 7. Build and Test
+## 6. Build and Test
 
-### 7.1 Directory Structure
+### 6.1 Directory Structure
 
 ```
 userspace/routerOS/
@@ -185,19 +224,36 @@ userspace/routerOS/
   console/main.zig
 ```
 
-### 7.2 Host Setup
+### 6.2 Host Setup
 
 ```bash
+# WAN
 sudo ip tuntap add dev tap0 mode tap user $USER
 sudo ip addr add 10.0.2.1/24 dev tap0
 sudo ip link set tap0 up
 
+# LAN
 sudo ip tuntap add dev tap1 mode tap user $USER
 sudo ip addr add 192.168.1.100/24 dev tap1
 sudo ip link set tap1 up
+
+# For NAT testing: namespace with bridge
+sudo ip link add br-lan type bridge
+sudo ip link set tap1 master br-lan
+sudo ip link set br-lan up
+sudo ip link add veth-host type veth peer name veth-ns
+sudo ip link set veth-host master br-lan
+sudo ip link set veth-host up
+sudo ip netns add lan_client
+sudo ip link set veth-ns netns lan_client
+sudo ip netns exec lan_client ip addr add 192.168.1.100/24 dev veth-ns
+sudo ip netns exec lan_client ip link set veth-ns up
+sudo ip netns exec lan_client ip route add default via 192.168.1.1
+
+# NAT test: sudo ip netns exec lan_client ping 10.0.2.1
 ```
 
-### 7.3 Build + Run
+### 6.3 Build
 
 ```bash
 cd userspace/routerOS && zig build
@@ -205,10 +261,10 @@ zig build -Dnet=tap -Duse-llvm=true -Dkvm=true -Diommu=amd \
   -Droot-service=userspace/bin/routerOS.elf
 ```
 
-### 7.4 Verified Configurations
+### 6.4 Verified Configurations
 
-| IOMMU | Accelerator | WAN | LAN |
-|-------|-------------|-----|-----|
+| IOMMU | Accel | WAN | LAN |
+|-------|-------|-----|-----|
 | Intel VT-d | TCG | ✓ | ✓ |
 | Intel VT-d | KVM | ✓ | ✓ |
 | AMD-Vi | TCG | ✓ | ✓ |

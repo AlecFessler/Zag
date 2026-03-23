@@ -140,13 +140,16 @@ var next_dns_id: u16 = 1;
 
 // ── ARP tables ──────────────────────────────────────────────────────────
 
+const ARP_EXPIRY_NS: u64 = 300_000_000_000;
+
 const ArpEntry = struct {
     ip: [4]u8,
     mac: [6]u8,
     valid: bool,
+    timestamp_ns: u64,
 };
 
-const empty_arp = ArpEntry{ .ip = .{ 0, 0, 0, 0 }, .mac = .{ 0, 0, 0, 0, 0, 0 }, .valid = false };
+const empty_arp = ArpEntry{ .ip = .{ 0, 0, 0, 0 }, .mac = .{ 0, 0, 0, 0, 0, 0 }, .valid = false, .timestamp_ns = 0 };
 var wan_arp: [ARP_TABLE_SIZE]ArpEntry = [_]ArpEntry{empty_arp} ** ARP_TABLE_SIZE;
 var lan_arp: [ARP_TABLE_SIZE]ArpEntry = [_]ArpEntry{empty_arp} ** ARP_TABLE_SIZE;
 
@@ -162,9 +165,11 @@ fn arpLookup(table: *[ARP_TABLE_SIZE]ArpEntry, ip: [4]u8) ?[6]u8 {
 }
 
 fn arpLearn(table: *[ARP_TABLE_SIZE]ArpEntry, ip: [4]u8, mac: [6]u8) void {
+    const ts = now();
     for (table) |*e| {
         if (e.valid and eql(&e.ip, &ip)) {
             @memcpy(&e.mac, &mac);
+            e.timestamp_ns = ts;
             return;
         }
     }
@@ -173,17 +178,37 @@ fn arpLearn(table: *[ARP_TABLE_SIZE]ArpEntry, ip: [4]u8, mac: [6]u8) void {
             e.ip = ip;
             @memcpy(&e.mac, &mac);
             e.valid = true;
+            e.timestamp_ns = ts;
             return;
         }
     }
     table[0].ip = ip;
     @memcpy(&table[0].mac, &mac);
     table[0].valid = true;
+    table[0].timestamp_ns = ts;
+}
+
+fn arpExpire(table: *[ARP_TABLE_SIZE]ArpEntry) void {
+    const ts = now();
+    for (table) |*e| {
+        if (e.valid and ts -| e.timestamp_ns > ARP_EXPIRY_NS) {
+            e.valid = false;
+        }
+    }
 }
 
 // ── NAT table ───────────────────────────────────────────────────────────
 
 const Protocol = enum(u8) { icmp = 1, tcp = 6, udp = 17 };
+
+const TcpState = enum(u8) { none, syn_sent, established, fin_wait };
+
+const NAT_TCP_SYN_TIMEOUT_NS: u64 = 30_000_000_000;
+const NAT_TCP_EST_TIMEOUT_NS: u64 = 300_000_000_000;
+const NAT_TCP_FIN_TIMEOUT_NS: u64 = 30_000_000_000;
+const NAT_UDP_TIMEOUT_NS: u64 = 120_000_000_000;
+const NAT_UDP_DNS_TIMEOUT_NS: u64 = 30_000_000_000;
+const NAT_ICMP_TIMEOUT_NS: u64 = 60_000_000_000;
 
 const NatEntry = struct {
     valid: bool,
@@ -192,11 +217,15 @@ const NatEntry = struct {
     lan_port: u16,
     wan_port: u16,
     timestamp_ns: u64,
+    tcp_state: TcpState,
+    dst_ip: [4]u8,
+    dst_port: u16,
 };
 
 const empty_nat = NatEntry{
     .valid = false, .protocol = .icmp,
     .lan_ip = .{ 0, 0, 0, 0 }, .lan_port = 0, .wan_port = 0, .timestamp_ns = 0,
+    .tcp_state = .none, .dst_ip = .{ 0, 0, 0, 0 }, .dst_port = 0,
 };
 var nat_table: [NAT_TABLE_SIZE]NatEntry = [_]NatEntry{empty_nat} ** NAT_TABLE_SIZE;
 var next_nat_port: u16 = 10000;
@@ -204,6 +233,89 @@ const NAT_TIMEOUT_NS: u64 = 120_000_000_000;
 
 fn now() u64 {
     return @bitCast(syscall.clock_gettime());
+}
+
+fn natTimeout(entry: *const NatEntry) u64 {
+    return switch (entry.protocol) {
+        .icmp => NAT_ICMP_TIMEOUT_NS,
+        .udp => if (entry.dst_port == 53) NAT_UDP_DNS_TIMEOUT_NS else NAT_UDP_TIMEOUT_NS,
+        .tcp => switch (entry.tcp_state) {
+            .syn_sent => NAT_TCP_SYN_TIMEOUT_NS,
+            .established => NAT_TCP_EST_TIMEOUT_NS,
+            .fin_wait => NAT_TCP_FIN_TIMEOUT_NS,
+            .none => NAT_UDP_TIMEOUT_NS,
+        },
+    };
+}
+
+fn natExpire() void {
+    const ts = now();
+    for (&nat_table) |*e| {
+        if (e.valid and ts -| e.timestamp_ns > natTimeout(e)) {
+            e.valid = false;
+        }
+    }
+}
+
+fn natUpdateTcpState(entry: *NatEntry, pkt: []const u8, len: u32, transport_start: usize) void {
+    if (entry.protocol != .tcp) return;
+    if (transport_start + 14 > len) return;
+
+    const flags = pkt[transport_start + 13];
+    const syn = (flags & 0x02) != 0;
+    const fin = (flags & 0x01) != 0;
+    const rst = (flags & 0x04) != 0;
+    const ack = (flags & 0x10) != 0;
+
+    switch (entry.tcp_state) {
+        .none, .syn_sent => {
+            if (syn and !ack) {
+                entry.tcp_state = .syn_sent;
+            } else if (ack) {
+                entry.tcp_state = .established;
+            }
+        },
+        .established => {
+            if (fin or rst) {
+                entry.tcp_state = .fin_wait;
+            }
+        },
+        .fin_wait => {
+            if (rst) {
+                entry.valid = false;
+            }
+        },
+    }
+    entry.timestamp_ns = now();
+}
+
+fn logNat(action: []const u8, entry: *const NatEntry) void {
+    var buf: [128]u8 = undefined;
+    var pos: usize = 0;
+    pos = appendStr(&buf, pos, "nat: ");
+    pos = appendStr(&buf, pos, action);
+    pos = appendStr(&buf, pos, " ");
+    pos = appendStr(&buf, pos, switch (entry.protocol) {
+        .icmp => "icmp",
+        .tcp => "tcp",
+        .udp => "udp",
+    });
+    pos = appendStr(&buf, pos, " ");
+    pos = appendIp(&buf, pos, entry.lan_ip);
+    pos = appendStr(&buf, pos, ":");
+    pos = appendDec(&buf, pos, entry.lan_port);
+    pos = appendStr(&buf, pos, " -> ");
+    pos = appendIp(&buf, pos, entry.dst_ip);
+    pos = appendStr(&buf, pos, ":");
+    pos = appendDec(&buf, pos, entry.dst_port);
+    pos = appendStr(&buf, pos, " (wan:");
+    pos = appendDec(&buf, pos, entry.wan_port);
+    pos = appendStr(&buf, pos, ")\n");
+    syscall.write(buf[0..pos]);
+}
+
+fn logEvent(msg: []const u8) void {
+    syscall.write(msg);
 }
 
 fn natLookupOutbound(proto: Protocol, lip: [4]u8, lport: u16) ?*NatEntry {
@@ -216,16 +328,19 @@ fn natLookupOutbound(proto: Protocol, lip: [4]u8, lport: u16) ?*NatEntry {
     return null;
 }
 
-fn natCreateOutbound(proto: Protocol, lip: [4]u8, lport: u16) ?*NatEntry {
+fn natCreateOutbound(proto: Protocol, lip: [4]u8, lport: u16, dip: [4]u8, dport: u16) ?*NatEntry {
     const ts = now();
+    const tcp_state: TcpState = if (proto == .tcp) .syn_sent else .none;
     var oldest_idx: usize = 0;
     var oldest_ts: u64 = ts;
     for (&nat_table, 0..) |*e, i| {
         if (!e.valid) {
             e.* = .{ .valid = true, .protocol = proto, .lan_ip = lip,
-                .lan_port = lport, .wan_port = next_nat_port, .timestamp_ns = ts };
+                .lan_port = lport, .wan_port = next_nat_port, .timestamp_ns = ts,
+                .tcp_state = tcp_state, .dst_ip = dip, .dst_port = dport };
             next_nat_port +%= 1;
             if (next_nat_port < 10000) next_nat_port = 10000;
+            logNat("new", e);
             return e;
         }
         if (e.timestamp_ns < oldest_ts) {
@@ -234,9 +349,11 @@ fn natCreateOutbound(proto: Protocol, lip: [4]u8, lport: u16) ?*NatEntry {
         }
     }
     nat_table[oldest_idx] = .{ .valid = true, .protocol = proto, .lan_ip = lip,
-        .lan_port = lport, .wan_port = next_nat_port, .timestamp_ns = ts };
+        .lan_port = lport, .wan_port = next_nat_port, .timestamp_ns = ts,
+        .tcp_state = tcp_state, .dst_ip = dip, .dst_port = dport };
     next_nat_port +%= 1;
     if (next_nat_port < 10000) next_nat_port = 10000;
+    logNat("new", &nat_table[oldest_idx]);
     return &nat_table[oldest_idx];
 }
 
@@ -1040,8 +1157,10 @@ fn natForwardLanToWan(pkt: []u8, len: u32) void {
         var src_ip: [4]u8 = undefined;
         @memcpy(&src_ip, pkt[26..30]);
 
+        var dst_ip_nat: [4]u8 = undefined;
+        @memcpy(&dst_ip_nat, pkt[30..34]);
         const nat_entry = natLookupOutbound(.icmp, src_ip, orig_id) orelse
-            (natCreateOutbound(.icmp, src_ip, orig_id) orelse return);
+            (natCreateOutbound(.icmp, src_ip, orig_id, dst_ip_nat, 0) orelse return);
 
         @memcpy(pkt[0..6], &gateway_mac);
         @memcpy(pkt[6..12], &wan_mac);
@@ -1069,9 +1188,16 @@ fn natForwardLanToWan(pkt: []u8, len: u32) void {
         var src_ip: [4]u8 = undefined;
         @memcpy(&src_ip, pkt[26..30]);
 
+        var dst_ip_tcp: [4]u8 = undefined;
+        @memcpy(&dst_ip_tcp, pkt[30..34]);
+        const dst_port_tcp = readU16Be(pkt[transport_start + 2 ..][0..2]);
         const proto: Protocol = if (protocol == 6) .tcp else .udp;
         const nat_entry = natLookupOutbound(proto, src_ip, orig_port) orelse
-            (natCreateOutbound(proto, src_ip, orig_port) orelse return);
+            (natCreateOutbound(proto, src_ip, orig_port, dst_ip_tcp, dst_port_tcp) orelse return);
+
+        if (protocol == 6) {
+            natUpdateTcpState(nat_entry, pkt, len, transport_start);
+        }
 
         @memcpy(pkt[0..6], &gateway_mac);
         @memcpy(pkt[6..12], &wan_mac);
@@ -1146,6 +1272,10 @@ fn natForwardWanToLan(pkt: []u8, len: u32) void {
         const proto: Protocol = if (protocol == 6) .tcp else .udp;
         const nat_entry = natLookupInbound(proto, dst_port) orelse return;
 
+        if (protocol == 6) {
+            natUpdateTcpState(nat_entry, pkt, len, transport_start);
+        }
+
         const dst_mac = arpLookup(&lan_arp, nat_entry.lan_ip) orelse return;
 
         @memcpy(pkt[0..6], &dst_mac);
@@ -1176,6 +1306,304 @@ fn natForwardWanToLan(pkt: []u8, len: u32) void {
             _ = ch.send(pkt[0..len]);
         }
     }
+}
+
+// ── DHCP client (WAN side) ───────────────────────────────────────────────
+
+const DhcpClientState = enum { idle, discovering, requesting, bound };
+
+var dhcp_client_state: DhcpClientState = .idle;
+var dhcp_client_xid: u32 = 0x5A470001;
+var dhcp_server_ip: [4]u8 = .{ 0, 0, 0, 0 };
+var dhcp_offered_ip: [4]u8 = .{ 0, 0, 0, 0 };
+var dhcp_client_start_ns: u64 = 0;
+var wan_ip_static: bool = true;
+
+fn dhcpClientSendDiscover() void {
+    var pkt: [600]u8 = undefined;
+    @memset(&pkt, 0);
+
+    @memset(pkt[0..6], 0xFF);
+    @memcpy(pkt[6..12], &wan_mac);
+    pkt[12] = 0x08;
+    pkt[13] = 0x00;
+
+    pkt[14] = 0x45;
+    pkt[22] = 64;
+    pkt[23] = 17;
+    @memset(pkt[26..30], 0);
+    @memset(pkt[30..34], 0xFF);
+
+    const udp_start: usize = 34;
+    writeU16Be(pkt[udp_start..][0..2], 68);
+    writeU16Be(pkt[udp_start + 2 ..][0..2], 67);
+
+    const dhcp_start: usize = udp_start + 8;
+    pkt[dhcp_start] = 1;
+    pkt[dhcp_start + 1] = 1;
+    pkt[dhcp_start + 2] = 6;
+    pkt[dhcp_start + 3] = 0;
+
+    pkt[dhcp_start + 4] = @truncate(dhcp_client_xid >> 24);
+    pkt[dhcp_start + 5] = @truncate(dhcp_client_xid >> 16);
+    pkt[dhcp_start + 6] = @truncate(dhcp_client_xid >> 8);
+    pkt[dhcp_start + 7] = @truncate(dhcp_client_xid);
+
+    @memcpy(pkt[dhcp_start + 28 ..][0..6], &wan_mac);
+
+    const magic: usize = dhcp_start + 236;
+    pkt[magic] = 0x63;
+    pkt[magic + 1] = 0x82;
+    pkt[magic + 2] = 0x53;
+    pkt[magic + 3] = 0x63;
+
+    var opt: usize = magic + 4;
+    pkt[opt] = 53;
+    pkt[opt + 1] = 1;
+    pkt[opt + 2] = DHCP_DISCOVER;
+    opt += 3;
+    pkt[opt] = 255;
+    opt += 1;
+
+    const total_dhcp = opt - dhcp_start;
+    const udp_len: u16 = @truncate(8 + total_dhcp);
+    writeU16Be(pkt[udp_start + 4 ..][0..2], udp_len);
+    const ip_total: u16 = @truncate(20 + udp_len);
+    writeU16Be(pkt[16..18], ip_total);
+
+    pkt[24] = 0;
+    pkt[25] = 0;
+    const ip_cs = computeChecksum(pkt[14..34]);
+    pkt[24] = @truncate(ip_cs >> 8);
+    pkt[25] = @truncate(ip_cs);
+
+    const send_len = @max(@as(usize, @intCast(14 + ip_total)), 60);
+    _ = wan_chan.send(pkt[0..send_len]);
+    dhcp_client_state = .discovering;
+    dhcp_client_start_ns = now();
+    logEvent("dhcp-client: sent DISCOVER on WAN\n");
+}
+
+fn dhcpClientSendRequest() void {
+    var pkt: [600]u8 = undefined;
+    @memset(&pkt, 0);
+
+    @memset(pkt[0..6], 0xFF);
+    @memcpy(pkt[6..12], &wan_mac);
+    pkt[12] = 0x08;
+    pkt[13] = 0x00;
+
+    pkt[14] = 0x45;
+    pkt[22] = 64;
+    pkt[23] = 17;
+    @memset(pkt[26..30], 0);
+    @memset(pkt[30..34], 0xFF);
+
+    const udp_start: usize = 34;
+    writeU16Be(pkt[udp_start..][0..2], 68);
+    writeU16Be(pkt[udp_start + 2 ..][0..2], 67);
+
+    const dhcp_start: usize = udp_start + 8;
+    pkt[dhcp_start] = 1;
+    pkt[dhcp_start + 1] = 1;
+    pkt[dhcp_start + 2] = 6;
+    pkt[dhcp_start + 3] = 0;
+    pkt[dhcp_start + 4] = @truncate(dhcp_client_xid >> 24);
+    pkt[dhcp_start + 5] = @truncate(dhcp_client_xid >> 16);
+    pkt[dhcp_start + 6] = @truncate(dhcp_client_xid >> 8);
+    pkt[dhcp_start + 7] = @truncate(dhcp_client_xid);
+    @memcpy(pkt[dhcp_start + 28 ..][0..6], &wan_mac);
+
+    const magic: usize = dhcp_start + 236;
+    pkt[magic] = 0x63;
+    pkt[magic + 1] = 0x82;
+    pkt[magic + 2] = 0x53;
+    pkt[magic + 3] = 0x63;
+
+    var opt: usize = magic + 4;
+    pkt[opt] = 53;
+    pkt[opt + 1] = 1;
+    pkt[opt + 2] = DHCP_REQUEST;
+    opt += 3;
+
+    pkt[opt] = 50;
+    pkt[opt + 1] = 4;
+    @memcpy(pkt[opt + 2 ..][0..4], &dhcp_offered_ip);
+    opt += 6;
+
+    pkt[opt] = 54;
+    pkt[opt + 1] = 4;
+    @memcpy(pkt[opt + 2 ..][0..4], &dhcp_server_ip);
+    opt += 6;
+
+    pkt[opt] = 255;
+    opt += 1;
+
+    const total_dhcp = opt - dhcp_start;
+    const udp_len: u16 = @truncate(8 + total_dhcp);
+    writeU16Be(pkt[udp_start + 4 ..][0..2], udp_len);
+    const ip_total: u16 = @truncate(20 + udp_len);
+    writeU16Be(pkt[16..18], ip_total);
+
+    pkt[24] = 0;
+    pkt[25] = 0;
+    const ip_cs = computeChecksum(pkt[14..34]);
+    pkt[24] = @truncate(ip_cs >> 8);
+    pkt[25] = @truncate(ip_cs);
+
+    const send_len = @max(@as(usize, @intCast(14 + ip_total)), 60);
+    _ = wan_chan.send(pkt[0..send_len]);
+    dhcp_client_state = .requesting;
+    dhcp_client_start_ns = now();
+    logEvent("dhcp-client: sent REQUEST on WAN\n");
+}
+
+fn handleDhcpClientResponse(pkt: []const u8, len: u32) void {
+    if (dhcp_client_state == .idle or dhcp_client_state == .bound) return;
+    if (len < 282) return;
+
+    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
+    const udp_start = 14 + ip_hdr_len;
+    if (udp_start + 8 > len) return;
+    if (pkt[23] != 17) return;
+
+    const src_port = readU16Be(pkt[udp_start..][0..2]);
+    const dst_port = readU16Be(pkt[udp_start + 2 ..][0..2]);
+    if (src_port != 67 or dst_port != 68) return;
+
+    const dhcp_start = udp_start + 8;
+    if (dhcp_start + 240 > len) return;
+    if (pkt[dhcp_start] != 2) return;
+
+    const xid = @as(u32, pkt[dhcp_start + 4]) << 24 |
+        @as(u32, pkt[dhcp_start + 5]) << 16 |
+        @as(u32, pkt[dhcp_start + 6]) << 8 |
+        pkt[dhcp_start + 7];
+    if (xid != dhcp_client_xid) return;
+
+    @memcpy(&dhcp_offered_ip, pkt[dhcp_start + 16 ..][0..4]);
+
+    const magic_offset = dhcp_start + 236;
+    if (pkt[magic_offset] != 0x63 or pkt[magic_offset + 1] != 0x82 or
+        pkt[magic_offset + 2] != 0x53 or pkt[magic_offset + 3] != 0x63) return;
+
+    var msg_type: u8 = 0;
+    var opt_idx: u32 = magic_offset + 4;
+    while (opt_idx + 1 < len) {
+        const o = pkt[opt_idx];
+        if (o == 255) break;
+        if (o == 0) {
+            opt_idx += 1;
+            continue;
+        }
+        const olen = pkt[opt_idx + 1];
+        if (o == 53 and olen >= 1) msg_type = pkt[opt_idx + 2];
+        if (o == 54 and olen >= 4) @memcpy(&dhcp_server_ip, pkt[opt_idx + 2 ..][0..4]);
+        if (o == 6 and olen >= 4) @memcpy(&upstream_dns, pkt[opt_idx + 2 ..][0..4]);
+        opt_idx += 2 + olen;
+    }
+
+    if (msg_type == DHCP_OFFER and dhcp_client_state == .discovering) {
+        var buf: [64]u8 = undefined;
+        var pos: usize = 0;
+        pos = appendStr(&buf, pos, "dhcp-client: offered ");
+        pos = appendIp(&buf, pos, dhcp_offered_ip);
+        pos = appendStr(&buf, pos, "\n");
+        logEvent(buf[0..pos]);
+        dhcpClientSendRequest();
+    } else if (msg_type == DHCP_ACK and dhcp_client_state == .requesting) {
+        wan_ip = dhcp_offered_ip;
+        dhcp_client_state = .bound;
+        var buf: [64]u8 = undefined;
+        var pos: usize = 0;
+        pos = appendStr(&buf, pos, "dhcp-client: bound to ");
+        pos = appendIp(&buf, pos, wan_ip);
+        pos = appendStr(&buf, pos, "\n");
+        logEvent(buf[0..pos]);
+    }
+}
+
+fn dhcpClientTick() void {
+    if (dhcp_client_state == .idle or dhcp_client_state == .bound) return;
+    if (now() -| dhcp_client_start_ns > 10_000_000_000) {
+        logEvent("dhcp-client: timeout, retrying\n");
+        dhcp_client_xid +%= 1;
+        dhcpClientSendDiscover();
+    }
+}
+
+// ── IP fragment tracking ────────────────────────────────────────────────
+
+const FRAG_TABLE_SIZE = 16;
+
+const FragEntry = struct {
+    valid: bool,
+    src_ip: [4]u8,
+    dst_ip: [4]u8,
+    ip_id: u16,
+    protocol: u8,
+    first_frag_sport: u16,
+    timestamp_ns: u64,
+};
+
+const empty_frag = FragEntry{
+    .valid = false, .src_ip = .{ 0, 0, 0, 0 }, .dst_ip = .{ 0, 0, 0, 0 },
+    .ip_id = 0, .protocol = 0, .first_frag_sport = 0, .timestamp_ns = 0,
+};
+var frag_table: [FRAG_TABLE_SIZE]FragEntry = [_]FragEntry{empty_frag} ** FRAG_TABLE_SIZE;
+
+fn fragLearn(src_ip: [4]u8, dst_ip: [4]u8, ip_id: u16, protocol: u8, sport: u16) void {
+    for (&frag_table) |*f| {
+        if (f.valid and f.ip_id == ip_id and eql(&f.src_ip, &src_ip)) {
+            f.timestamp_ns = now();
+            return;
+        }
+    }
+    for (&frag_table) |*f| {
+        if (!f.valid) {
+            f.* = .{ .valid = true, .src_ip = src_ip, .dst_ip = dst_ip,
+                .ip_id = ip_id, .protocol = protocol, .first_frag_sport = sport, .timestamp_ns = now() };
+            return;
+        }
+    }
+    frag_table[0] = .{ .valid = true, .src_ip = src_ip, .dst_ip = dst_ip,
+        .ip_id = ip_id, .protocol = protocol, .first_frag_sport = sport, .timestamp_ns = now() };
+}
+
+fn fragLookup(src_ip: [4]u8, ip_id: u16) ?u16 {
+    for (&frag_table) |*f| {
+        if (f.valid and f.ip_id == ip_id and eql(&f.src_ip, &src_ip)) {
+            f.timestamp_ns = now();
+            return f.first_frag_sport;
+        }
+    }
+    return null;
+}
+
+fn fragExpire() void {
+    const ts = now();
+    for (&frag_table) |*f| {
+        if (f.valid and ts -| f.timestamp_ns > 30_000_000_000) {
+            f.valid = false;
+        }
+    }
+}
+
+// ── Periodic maintenance ────────────────────────────────────────────────
+
+var last_maintenance_ns: u64 = 0;
+const MAINTENANCE_INTERVAL_NS: u64 = 10_000_000_000;
+
+fn periodicMaintenance() void {
+    const ts = now();
+    if (ts -| last_maintenance_ns < MAINTENANCE_INTERVAL_NS) return;
+    last_maintenance_ns = ts;
+
+    arpExpire(&wan_arp);
+    arpExpire(&lan_arp);
+    natExpire();
+    fragExpire();
+    dhcpClientTick();
 }
 
 // ── Packet dispatch ─────────────────────────────────────────────────────
@@ -1233,7 +1661,8 @@ fn processPacket(iface: Interface, pkt: []u8, len: u32) void {
         @memcpy(&dst_ip, pkt[30..34]);
 
         const my_ip = ifaceIp(iface);
-        const is_for_me = eql(&dst_ip, my_ip) or eql(&dst_ip, &lan_broadcast);
+        const is_broadcast = dst_ip[0] == 255 and dst_ip[1] == 255 and dst_ip[2] == 255 and dst_ip[3] == 255;
+        const is_for_me = eql(&dst_ip, my_ip) or eql(&dst_ip, &lan_broadcast) or is_broadcast;
 
         if (is_for_me) {
             if (pkt[23] == 17) {
@@ -1241,6 +1670,10 @@ fn processPacket(iface: Interface, pkt: []u8, len: u32) void {
                 const udp_start_dhcp = 14 + ip_hdr_len_dhcp;
                 if (udp_start_dhcp + 4 <= len) {
                     const udp_dst = readU16Be(pkt[udp_start_dhcp + 2 ..][0..2]);
+                    if (udp_dst == 68 and iface == .wan) {
+                        handleDhcpClientResponse(pkt, len);
+                        return;
+                    }
                     if (udp_dst == 67 and iface == .lan) {
                         handleDhcpServer(pkt, len);
                         return;
@@ -1258,6 +1691,8 @@ fn processPacket(iface: Interface, pkt: []u8, len: u32) void {
                 stats.tx_packets += 1;
                 stats.tx_bytes += reply.len;
                 _ = ifaceChan(iface).send(reply);
+            } else if (iface == .wan and has_lan) {
+                natForwardWanToLan(pkt, len);
             }
         } else if (iface == .wan and has_lan) {
             if (pkt[23] == 17) {
@@ -1557,6 +1992,23 @@ fn handleConsoleCommand(data: []const u8) void {
         spos = appendDec(&summary, spos, count);
         spos = appendStr(&summary, spos, " rules ---");
         _ = chan.send(summary[0..spos]);
+    } else if (eql(data, "dhcp-client")) {
+        if (dhcp_client_state == .bound) {
+            var resp: [128]u8 = undefined;
+            var rp: usize = 0;
+            rp = appendStr(&resp, rp, "DHCP client: bound to ");
+            rp = appendIp(&resp, rp, wan_ip);
+            rp = appendStr(&resp, rp, " (server ");
+            rp = appendIp(&resp, rp, dhcp_server_ip);
+            rp = appendStr(&resp, rp, ")");
+            _ = chan.send(resp[0..rp]);
+        } else if (dhcp_client_state == .idle) {
+            wan_ip_static = false;
+            dhcpClientSendDiscover();
+            _ = chan.send("DHCP client: discovering...");
+        } else {
+            _ = chan.send("DHCP client: in progress");
+        }
     } else if (startsWith(data, "dns ")) {
         if (parseIp(data[4..])) |ip| {
             upstream_dns = ip;
@@ -1741,6 +2193,7 @@ pub fn main(perm_view_addr: u64) void {
         }
 
         checkPingTimeout();
+        periodicMaintenance();
         syscall.thread_yield();
     }
 }
