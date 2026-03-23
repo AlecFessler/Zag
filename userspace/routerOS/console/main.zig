@@ -81,15 +81,22 @@ fn processCommand(line: []const u8) void {
 
     if (eql(line, "help")) {
         serialWrite("Available commands:\r\n");
-        serialWrite("  help        - show this help\r\n");
-        serialWrite("  status      - query router status\r\n");
-        serialWrite("  ping <ip>   - ping an IP address\r\n");
-        serialWrite("  arp         - show ARP tables\r\n");
-        serialWrite("  nat         - show NAT table\r\n");
-        serialWrite("  leases      - show DHCP leases\r\n");
-        serialWrite("  version     - show system version\r\n");
-        serialWrite("  uptime      - show system uptime\r\n");
-        serialWrite("  clear       - clear screen\r\n");
+        serialWrite("  help                     - show this help\r\n");
+        serialWrite("  status                   - interface status\r\n");
+        serialWrite("  ping <ip>                - ping an IP address\r\n");
+        serialWrite("  arp                      - show ARP tables\r\n");
+        serialWrite("  nat                      - show NAT table\r\n");
+        serialWrite("  leases                   - show DHCP leases\r\n");
+        serialWrite("  ifstat                   - interface statistics\r\n");
+        serialWrite("  rules                    - firewall & port forward rules\r\n");
+        serialWrite("  block <ip>               - block IP on WAN\r\n");
+        serialWrite("  allow <ip>               - remove block rule\r\n");
+        serialWrite("  forward <tcp|udp> <wport> <lip> <lport>\r\n");
+        serialWrite("                           - port forward to LAN\r\n");
+        serialWrite("  dns <ip>                 - set upstream DNS\r\n");
+        serialWrite("  version                  - system version\r\n");
+        serialWrite("  uptime                   - system uptime\r\n");
+        serialWrite("  clear                    - clear screen\r\n");
     } else if (eql(line, "version")) {
         serialWrite("Zag RouterOS v0.1\r\n");
     } else if (eql(line, "uptime")) {
@@ -110,6 +117,18 @@ fn processCommand(line: []const u8) void {
         routerMultiResponse("nat");
     } else if (eql(line, "leases")) {
         routerMultiResponse("leases");
+    } else if (eql(line, "ifstat")) {
+        routerCommand("ifstat");
+    } else if (eql(line, "rules")) {
+        routerMultiResponse("rules");
+    } else if (startsWith(line, "block ")) {
+        routerCommand(line);
+    } else if (startsWith(line, "allow ")) {
+        routerCommand(line);
+    } else if (startsWith(line, "forward ")) {
+        routerCommand(line);
+    } else if (startsWith(line, "dns ")) {
+        routerCommand(line);
     } else {
         serialWrite("unknown command: ");
         serialWrite(line);

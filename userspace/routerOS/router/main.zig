@@ -30,6 +30,114 @@ const lan_broadcast: [4]u8 = .{ 192, 168, 1, 255 };
 var has_wan: bool = false;
 var has_lan: bool = false;
 
+// ── Interface statistics ────────────────────────────────────────────────
+
+const IfaceStats = struct {
+    rx_packets: u64,
+    rx_bytes: u64,
+    tx_packets: u64,
+    tx_bytes: u64,
+    rx_dropped: u64,
+};
+
+var wan_stats: IfaceStats = .{ .rx_packets = 0, .rx_bytes = 0, .tx_packets = 0, .tx_bytes = 0, .rx_dropped = 0 };
+var lan_stats: IfaceStats = .{ .rx_packets = 0, .rx_bytes = 0, .tx_packets = 0, .tx_bytes = 0, .rx_dropped = 0 };
+
+fn ifaceStats(iface: Interface) *IfaceStats {
+    return if (iface == .wan) &wan_stats else &lan_stats;
+}
+
+// ── Port forwarding table ───────────────────────────────────────────────
+
+const PORT_FWD_SIZE = 16;
+
+const PortForward = struct {
+    valid: bool,
+    protocol: Protocol,
+    wan_port: u16,
+    lan_ip: [4]u8,
+    lan_port: u16,
+};
+
+const empty_fwd = PortForward{ .valid = false, .protocol = .tcp, .wan_port = 0, .lan_ip = .{ 0, 0, 0, 0 }, .lan_port = 0 };
+var port_forwards: [PORT_FWD_SIZE]PortForward = [_]PortForward{empty_fwd} ** PORT_FWD_SIZE;
+
+fn portFwdLookup(proto: Protocol, wan_port: u16) ?*const PortForward {
+    for (&port_forwards) |*f| {
+        if (f.valid and f.protocol == proto and f.wan_port == wan_port) return f;
+    }
+    return null;
+}
+
+fn portFwdAdd(proto: Protocol, wan_port: u16, lip: [4]u8, lport: u16) bool {
+    for (&port_forwards) |*f| {
+        if (!f.valid) {
+            f.* = .{ .valid = true, .protocol = proto, .wan_port = wan_port, .lan_ip = lip, .lan_port = lport };
+            return true;
+        }
+    }
+    return false;
+}
+
+// ── Firewall rules ──────────────────────────────────────────────────────
+
+const FIREWALL_RULES_SIZE = 32;
+
+const FirewallAction = enum { allow, block };
+
+const FirewallRule = struct {
+    valid: bool,
+    action: FirewallAction,
+    src_ip: [4]u8,
+    src_mask: [4]u8,
+    protocol: u8,
+    dst_port: u16,
+};
+
+const empty_rule = FirewallRule{
+    .valid = false, .action = .block,
+    .src_ip = .{ 0, 0, 0, 0 }, .src_mask = .{ 0, 0, 0, 0 },
+    .protocol = 0, .dst_port = 0,
+};
+var firewall_rules: [FIREWALL_RULES_SIZE]FirewallRule = [_]FirewallRule{empty_rule} ** FIREWALL_RULES_SIZE;
+
+fn firewallCheck(src_ip: [4]u8, protocol: u8, dst_port: u16) FirewallAction {
+    for (&firewall_rules) |*r| {
+        if (!r.valid) continue;
+        const ip_match = (src_ip[0] & r.src_mask[0]) == (r.src_ip[0] & r.src_mask[0]) and
+            (src_ip[1] & r.src_mask[1]) == (r.src_ip[1] & r.src_mask[1]) and
+            (src_ip[2] & r.src_mask[2]) == (r.src_ip[2] & r.src_mask[2]) and
+            (src_ip[3] & r.src_mask[3]) == (r.src_ip[3] & r.src_mask[3]);
+        if (!ip_match) continue;
+        if (r.protocol != 0 and r.protocol != protocol) continue;
+        if (r.dst_port != 0 and r.dst_port != dst_port) continue;
+        return r.action;
+    }
+    return .allow;
+}
+
+// ── DNS relay state ─────────────────────────────────────────────────────
+
+const DNS_RELAY_SIZE = 32;
+const DNS_PORT: u16 = 53;
+var upstream_dns: [4]u8 = .{ 10, 0, 2, 1 };
+
+const DnsRelay = struct {
+    valid: bool,
+    client_ip: [4]u8,
+    client_port: u16,
+    query_id: u16,
+    relay_id: u16,
+    timestamp_ns: u64,
+};
+
+const empty_dns = DnsRelay{
+    .valid = false, .client_ip = .{ 0, 0, 0, 0 },
+    .client_port = 0, .query_id = 0, .relay_id = 0, .timestamp_ns = 0,
+};
+var dns_relays: [DNS_RELAY_SIZE]DnsRelay = [_]DnsRelay{empty_dns} ** DNS_RELAY_SIZE;
+var next_dns_id: u16 = 1;
+
 // ── ARP tables ──────────────────────────────────────────────────────────
 
 const ArpEntry = struct {
@@ -697,6 +805,213 @@ fn checkPingTimeout() void {
     }
 }
 
+// ── TCP checksum helpers ────────────────────────────────────────────────
+
+fn tcpChecksumAdjust(pkt: []u8, transport_start: usize, len: u32, old_ip: [4]u8, new_ip: [4]u8, old_port: u16, new_port: u16) void {
+    if (transport_start + 18 > len) return;
+    var sum: i32 = @as(i32, @as(u16, pkt[transport_start + 16])) << 8 | pkt[transport_start + 17];
+    sum = ~sum & 0xFFFF;
+
+    sum -= @as(i32, @as(u16, old_ip[0])) << 8 | old_ip[1];
+    sum -= @as(i32, @as(u16, old_ip[2])) << 8 | old_ip[3];
+    sum -= @as(i32, old_port);
+    sum += @as(i32, @as(u16, new_ip[0])) << 8 | new_ip[1];
+    sum += @as(i32, @as(u16, new_ip[2])) << 8 | new_ip[3];
+    sum += @as(i32, new_port);
+
+    while (sum < 0) sum += 0x10000;
+    while (sum > 0xFFFF) sum = (sum & 0xFFFF) + (sum >> 16);
+    sum = ~sum & 0xFFFF;
+    if (sum == 0) sum = 0xFFFF;
+
+    pkt[transport_start + 16] = @truncate(@as(u32, @intCast(sum)) >> 8);
+    pkt[transport_start + 17] = @truncate(@as(u32, @intCast(sum)));
+}
+
+// ── DNS relay ───────────────────────────────────────────────────────────
+
+fn handleDnsFromLan(pkt: []u8, len: u32) void {
+    if (!has_wan) return;
+    if (len < 34) return;
+
+    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
+    const udp_start = 14 + ip_hdr_len;
+    if (udp_start + 8 > len) return;
+    if (pkt[23] != 17) return;
+
+    const dst_port = readU16Be(pkt[udp_start + 2 ..][0..2]);
+    if (dst_port != DNS_PORT) return;
+
+    const src_port = readU16Be(pkt[udp_start..][0..2]);
+    var client_ip: [4]u8 = undefined;
+    @memcpy(&client_ip, pkt[26..30]);
+
+    const dns_start = udp_start + 8;
+    if (dns_start + 2 > len) return;
+    const query_id = readU16Be(pkt[dns_start..][0..2]);
+
+    const relay_id = next_dns_id;
+    next_dns_id +%= 1;
+    if (next_dns_id == 0) next_dns_id = 1;
+
+    var slot: ?*DnsRelay = null;
+    var oldest_idx: usize = 0;
+    var oldest_ts: u64 = now();
+    for (&dns_relays, 0..) |*r, i| {
+        if (!r.valid) {
+            slot = r;
+            break;
+        }
+        if (r.timestamp_ns < oldest_ts) {
+            oldest_ts = r.timestamp_ns;
+            oldest_idx = i;
+        }
+    }
+    if (slot == null) slot = &dns_relays[oldest_idx];
+
+    slot.?.* = .{
+        .valid = true,
+        .client_ip = client_ip,
+        .client_port = src_port,
+        .query_id = query_id,
+        .relay_id = relay_id,
+        .timestamp_ns = now(),
+    };
+
+    writeU16Be(pkt[dns_start..][0..2], relay_id);
+
+    const gateway_mac = arpLookup(&wan_arp, upstream_dns) orelse {
+        sendArpRequestOn(.wan, upstream_dns);
+        return;
+    };
+
+    @memcpy(pkt[0..6], &gateway_mac);
+    @memcpy(pkt[6..12], &wan_mac);
+    @memcpy(pkt[26..30], &wan_ip);
+    @memcpy(pkt[30..34], &upstream_dns);
+
+    writeU16Be(pkt[udp_start..][0..2], relay_id);
+
+    pkt[udp_start + 6] = 0;
+    pkt[udp_start + 7] = 0;
+
+    pkt[24] = 0;
+    pkt[25] = 0;
+    const ip_cs = computeChecksum(pkt[14..][0..ip_hdr_len]);
+    pkt[24] = @truncate(ip_cs >> 8);
+    pkt[25] = @truncate(ip_cs);
+
+    wan_stats.tx_packets += 1;
+    wan_stats.tx_bytes += len;
+    _ = wan_chan.send(pkt[0..len]);
+}
+
+fn handleDnsFromWan(pkt: []u8, len: u32) void {
+    if (!has_lan) return;
+    if (len < 34) return;
+
+    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
+    const udp_start = 14 + ip_hdr_len;
+    if (udp_start + 8 > len) return;
+    if (pkt[23] != 17) return;
+
+    const src_port = readU16Be(pkt[udp_start..][0..2]);
+    if (src_port != DNS_PORT) return;
+
+    const dns_start = udp_start + 8;
+    if (dns_start + 2 > len) return;
+    const resp_id = readU16Be(pkt[dns_start..][0..2]);
+
+    for (&dns_relays) |*r| {
+        if (r.valid and r.relay_id == resp_id) {
+            writeU16Be(pkt[dns_start..][0..2], r.query_id);
+
+            const client_mac = arpLookup(&lan_arp, r.client_ip) orelse {
+                r.valid = false;
+                return;
+            };
+
+            @memcpy(pkt[0..6], &client_mac);
+            @memcpy(pkt[6..12], &lan_mac);
+            @memcpy(pkt[26..30], &lan_ip);
+            @memcpy(pkt[30..34], &r.client_ip);
+
+            writeU16Be(pkt[udp_start + 2 ..][0..2], r.client_port);
+            writeU16Be(pkt[udp_start..][0..2], DNS_PORT);
+
+            pkt[udp_start + 6] = 0;
+            pkt[udp_start + 7] = 0;
+
+            pkt[24] = 0;
+            pkt[25] = 0;
+            const ip_cs = computeChecksum(pkt[14..][0..ip_hdr_len]);
+            pkt[24] = @truncate(ip_cs >> 8);
+            pkt[25] = @truncate(ip_cs);
+
+            lan_stats.tx_packets += 1;
+            lan_stats.tx_bytes += len;
+            if (lan_chan) |*ch| {
+                _ = ch.send(pkt[0..len]);
+            }
+
+            r.valid = false;
+            return;
+        }
+    }
+}
+
+// ── Port forwarding (DNAT) ──────────────────────────────────────────────
+
+fn handlePortForward(pkt: []u8, len: u32) bool {
+    if (!has_lan) return false;
+    if (len < 34) return false;
+
+    const protocol = pkt[23];
+    if (protocol != 6 and protocol != 17) return false;
+
+    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
+    const transport_start = 14 + ip_hdr_len;
+    if (transport_start + 4 > len) return false;
+
+    const dst_port = readU16Be(pkt[transport_start + 2 ..][0..2]);
+    const proto: Protocol = if (protocol == 6) .tcp else .udp;
+
+    const fwd = portFwdLookup(proto, dst_port) orelse return false;
+
+    const dst_mac = arpLookup(&lan_arp, fwd.lan_ip) orelse {
+        sendArpRequestOn(.lan, fwd.lan_ip);
+        return true;
+    };
+
+    var old_dst_ip: [4]u8 = undefined;
+    @memcpy(&old_dst_ip, pkt[30..34]);
+
+    @memcpy(pkt[0..6], &dst_mac);
+    @memcpy(pkt[6..12], &lan_mac);
+    @memcpy(pkt[30..34], &fwd.lan_ip);
+    writeU16Be(pkt[transport_start + 2 ..][0..2], fwd.lan_port);
+
+    if (protocol == 6) {
+        tcpChecksumAdjust(pkt, transport_start, len, old_dst_ip, fwd.lan_ip, dst_port, fwd.lan_port);
+    } else {
+        pkt[transport_start + 6] = 0;
+        pkt[transport_start + 7] = 0;
+    }
+
+    pkt[24] = 0;
+    pkt[25] = 0;
+    const ip_cs = computeChecksum(pkt[14..][0..ip_hdr_len]);
+    pkt[24] = @truncate(ip_cs >> 8);
+    pkt[25] = @truncate(ip_cs);
+
+    lan_stats.tx_packets += 1;
+    lan_stats.tx_bytes += len;
+    if (lan_chan) |*ch| {
+        _ = ch.send(pkt[0..len]);
+    }
+    return true;
+}
+
 // ── NAT routing ─────────────────────────────────────────────────────────
 
 fn natForwardLanToWan(pkt: []u8, len: u32) void {
@@ -760,13 +1075,16 @@ fn natForwardLanToWan(pkt: []u8, len: u32) void {
 
         @memcpy(pkt[0..6], &gateway_mac);
         @memcpy(pkt[6..12], &wan_mac);
-        @memcpy(pkt[26..30], &wan_ip);
-        writeU16Be(pkt[transport_start..][0..2], nat_entry.wan_port);
 
-        if (protocol == 17 and transport_start + 8 <= len) {
+        if (protocol == 6) {
+            tcpChecksumAdjust(pkt, transport_start, len, src_ip, wan_ip, orig_port, nat_entry.wan_port);
+        } else if (transport_start + 8 <= len) {
             pkt[transport_start + 6] = 0;
             pkt[transport_start + 7] = 0;
         }
+
+        @memcpy(pkt[26..30], &wan_ip);
+        writeU16Be(pkt[transport_start..][0..2], nat_entry.wan_port);
 
         pkt[24] = 0;
         pkt[25] = 0;
@@ -774,6 +1092,8 @@ fn natForwardLanToWan(pkt: []u8, len: u32) void {
         pkt[24] = @truncate(ip_cs >> 8);
         pkt[25] = @truncate(ip_cs);
 
+        wan_stats.tx_packets += 1;
+        wan_stats.tx_bytes += len;
         _ = wan_chan.send(pkt[0..len]);
     }
 }
@@ -830,13 +1150,19 @@ fn natForwardWanToLan(pkt: []u8, len: u32) void {
 
         @memcpy(pkt[0..6], &dst_mac);
         @memcpy(pkt[6..12], &lan_mac);
-        @memcpy(pkt[30..34], &nat_entry.lan_ip);
-        writeU16Be(pkt[transport_start + 2 ..][0..2], nat_entry.lan_port);
 
-        if (protocol == 17 and transport_start + 8 <= len) {
+        var old_dst_ip: [4]u8 = undefined;
+        @memcpy(&old_dst_ip, pkt[30..34]);
+
+        if (protocol == 6) {
+            tcpChecksumAdjust(pkt, transport_start, len, old_dst_ip, nat_entry.lan_ip, dst_port, nat_entry.lan_port);
+        } else if (transport_start + 8 <= len) {
             pkt[transport_start + 6] = 0;
             pkt[transport_start + 7] = 0;
         }
+
+        @memcpy(pkt[30..34], &nat_entry.lan_ip);
+        writeU16Be(pkt[transport_start + 2 ..][0..2], nat_entry.lan_port);
 
         pkt[24] = 0;
         pkt[25] = 0;
@@ -844,6 +1170,8 @@ fn natForwardWanToLan(pkt: []u8, len: u32) void {
         pkt[24] = @truncate(ip_cs >> 8);
         pkt[25] = @truncate(ip_cs);
 
+        lan_stats.tx_packets += 1;
+        lan_stats.tx_bytes += len;
         if (lan_chan) |*ch| {
             _ = ch.send(pkt[0..len]);
         }
@@ -854,6 +1182,11 @@ fn natForwardWanToLan(pkt: []u8, len: u32) void {
 
 fn processPacket(iface: Interface, pkt: []u8, len: u32) void {
     if (len < 14) return;
+
+    const stats = ifaceStats(iface);
+    stats.rx_packets += 1;
+    stats.rx_bytes += len;
+
     const ethertype = readU16Be(pkt[12..14]);
 
     if (ethertype == 0x0806) {
@@ -872,9 +1205,30 @@ fn processPacket(iface: Interface, pkt: []u8, len: u32) void {
             }
         }
         if (handleArp(iface, pkt, len)) |reply| {
+            stats.tx_packets += 1;
+            stats.tx_bytes += reply.len;
             _ = ifaceChan(iface).send(reply);
         }
     } else if (ethertype == 0x0800 and len >= 34) {
+        var src_ip_fw: [4]u8 = undefined;
+        @memcpy(&src_ip_fw, pkt[26..30]);
+
+        if (iface == .wan and len >= 34) {
+            const protocol_fw = pkt[23];
+            var dst_port_fw: u16 = 0;
+            if (protocol_fw == 6 or protocol_fw == 17) {
+                const ip_hdr_len_fw: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
+                const ts_fw = 14 + ip_hdr_len_fw;
+                if (ts_fw + 4 <= len) {
+                    dst_port_fw = readU16Be(pkt[ts_fw + 2 ..][0..2]);
+                }
+            }
+            if (firewallCheck(src_ip_fw, protocol_fw, dst_port_fw) == .block) {
+                stats.rx_dropped += 1;
+                return;
+            }
+        }
+
         var dst_ip: [4]u8 = undefined;
         @memcpy(&dst_ip, pkt[30..34]);
 
@@ -883,16 +1237,55 @@ fn processPacket(iface: Interface, pkt: []u8, len: u32) void {
 
         if (is_for_me) {
             if (pkt[23] == 17) {
-                handleDhcpServer(pkt, len);
+                const ip_hdr_len_dhcp: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
+                const udp_start_dhcp = 14 + ip_hdr_len_dhcp;
+                if (udp_start_dhcp + 4 <= len) {
+                    const udp_dst = readU16Be(pkt[udp_start_dhcp + 2 ..][0..2]);
+                    if (udp_dst == 67 and iface == .lan) {
+                        handleDhcpServer(pkt, len);
+                        return;
+                    }
+                    if (udp_dst == DNS_PORT) {
+                        if (iface == .lan) {
+                            handleDnsFromLan(pkt, len);
+                        }
+                        return;
+                    }
+                }
             }
             handleEchoReply(pkt, len);
             if (handleIcmp(iface, pkt, len)) |reply| {
+                stats.tx_packets += 1;
+                stats.tx_bytes += reply.len;
                 _ = ifaceChan(iface).send(reply);
             }
-        } else if (iface == .lan and has_wan) {
-            natForwardLanToWan(pkt, len);
         } else if (iface == .wan and has_lan) {
+            if (pkt[23] == 17) {
+                const ip_hdr_len_dns: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
+                const udp_start_dns = 14 + ip_hdr_len_dns;
+                if (udp_start_dns + 4 <= len) {
+                    const udp_src_dns = readU16Be(pkt[udp_start_dns..][0..2]);
+                    if (udp_src_dns == DNS_PORT) {
+                        handleDnsFromWan(pkt, len);
+                        return;
+                    }
+                }
+            }
+            if (handlePortForward(pkt, len)) return;
             natForwardWanToLan(pkt, len);
+        } else if (iface == .lan and has_wan) {
+            if (pkt[23] == 17) {
+                const ip_hdr_len_dns2: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
+                const udp_start_dns2 = 14 + ip_hdr_len_dns2;
+                if (udp_start_dns2 + 4 <= len) {
+                    const udp_dst_dns = readU16Be(pkt[udp_start_dns2 + 2 ..][0..2]);
+                    if (udp_dst_dns == DNS_PORT) {
+                        handleDnsFromLan(pkt, len);
+                        return;
+                    }
+                }
+            }
+            natForwardLanToWan(pkt, len);
         }
     }
 }
@@ -1037,9 +1430,170 @@ fn handleConsoleCommand(data: []const u8) void {
         spos = appendDec(&summary, spos, count);
         spos = appendStr(&summary, spos, " leases ---");
         _ = chan.send(summary[0..spos]);
+    } else if (eql(data, "ifstat")) {
+        var resp: [512]u8 = undefined;
+        var pos: usize = 0;
+        pos = appendStr(&resp, pos, "WAN: rx=");
+        pos = appendDec(&resp, pos, wan_stats.rx_packets);
+        pos = appendStr(&resp, pos, " (");
+        pos = appendDec(&resp, pos, wan_stats.rx_bytes);
+        pos = appendStr(&resp, pos, "B) tx=");
+        pos = appendDec(&resp, pos, wan_stats.tx_packets);
+        pos = appendStr(&resp, pos, " (");
+        pos = appendDec(&resp, pos, wan_stats.tx_bytes);
+        pos = appendStr(&resp, pos, "B) drop=");
+        pos = appendDec(&resp, pos, wan_stats.rx_dropped);
+        if (has_lan) {
+            pos = appendStr(&resp, pos, "\nLAN: rx=");
+            pos = appendDec(&resp, pos, lan_stats.rx_packets);
+            pos = appendStr(&resp, pos, " (");
+            pos = appendDec(&resp, pos, lan_stats.rx_bytes);
+            pos = appendStr(&resp, pos, "B) tx=");
+            pos = appendDec(&resp, pos, lan_stats.tx_packets);
+            pos = appendStr(&resp, pos, " (");
+            pos = appendDec(&resp, pos, lan_stats.tx_bytes);
+            pos = appendStr(&resp, pos, "B) drop=");
+            pos = appendDec(&resp, pos, lan_stats.rx_dropped);
+        }
+        _ = chan.send(resp[0..pos]);
+    } else if (startsWith(data, "forward ")) {
+        // format: forward <proto> <wan_port> <lan_ip> <lan_port>
+        // example: forward tcp 80 192.168.1.100 8080
+        const args = data[8..];
+        var proto: Protocol = .tcp;
+        var rest = args;
+        if (startsWith(rest, "tcp ")) {
+            proto = .tcp;
+            rest = rest[4..];
+        } else if (startsWith(rest, "udp ")) {
+            proto = .udp;
+            rest = rest[4..];
+        } else {
+            _ = chan.send("forward: usage: forward <tcp|udp> <wan_port> <lan_ip> <lan_port>");
+            return;
+        }
+        if (parsePortIpPort(rest)) |result| {
+            if (portFwdAdd(proto, result.port1, result.ip, result.port2)) {
+                _ = chan.send("forward: rule added");
+            } else {
+                _ = chan.send("forward: table full");
+            }
+        } else {
+            _ = chan.send("forward: invalid arguments");
+        }
+    } else if (startsWith(data, "block ")) {
+        if (parseIp(data[6..])) |ip| {
+            for (&firewall_rules) |*r| {
+                if (!r.valid) {
+                    r.* = .{
+                        .valid = true, .action = .block,
+                        .src_ip = ip, .src_mask = .{ 255, 255, 255, 255 },
+                        .protocol = 0, .dst_port = 0,
+                    };
+                    _ = chan.send("firewall: block rule added");
+                    return;
+                }
+            }
+            _ = chan.send("firewall: rule table full");
+        } else {
+            _ = chan.send("block: invalid IP");
+        }
+    } else if (startsWith(data, "allow ")) {
+        if (parseIp(data[6..])) |ip| {
+            for (&firewall_rules) |*r| {
+                if (r.valid and r.src_ip[0] == ip[0] and r.src_ip[1] == ip[1] and
+                    r.src_ip[2] == ip[2] and r.src_ip[3] == ip[3])
+                {
+                    r.valid = false;
+                    _ = chan.send("firewall: rule removed");
+                    return;
+                }
+            }
+            _ = chan.send("firewall: no matching rule found");
+        } else {
+            _ = chan.send("allow: invalid IP");
+        }
+    } else if (eql(data, "rules")) {
+        var resp: [512]u8 = undefined;
+        var pos: usize = 0;
+        var count: u32 = 0;
+
+        pos = appendStr(&resp, pos, "Firewall rules:");
+        for (&firewall_rules) |*r| {
+            if (r.valid) {
+                pos = appendStr(&resp, pos, "\n  ");
+                pos = appendStr(&resp, pos, if (r.action == .block) "BLOCK " else "ALLOW ");
+                pos = appendIp(&resp, pos, r.src_ip);
+                if (r.protocol != 0) {
+                    pos = appendStr(&resp, pos, " proto=");
+                    pos = appendDec(&resp, pos, r.protocol);
+                }
+                if (r.dst_port != 0) {
+                    pos = appendStr(&resp, pos, " port=");
+                    pos = appendDec(&resp, pos, r.dst_port);
+                }
+                count += 1;
+            }
+        }
+
+        pos = appendStr(&resp, pos, "\nPort forwards:");
+        for (&port_forwards) |*f| {
+            if (f.valid) {
+                pos = appendStr(&resp, pos, "\n  ");
+                pos = appendStr(&resp, pos, if (f.protocol == .tcp) "tcp" else "udp");
+                pos = appendStr(&resp, pos, " :");
+                pos = appendDec(&resp, pos, f.wan_port);
+                pos = appendStr(&resp, pos, " -> ");
+                pos = appendIp(&resp, pos, f.lan_ip);
+                pos = appendStr(&resp, pos, ":");
+                pos = appendDec(&resp, pos, f.lan_port);
+                count += 1;
+            }
+        }
+        _ = chan.send(resp[0..pos]);
+        var summary: [64]u8 = undefined;
+        var spos: usize = 0;
+        spos = appendStr(&summary, spos, "--- ");
+        spos = appendDec(&summary, spos, count);
+        spos = appendStr(&summary, spos, " rules ---");
+        _ = chan.send(summary[0..spos]);
+    } else if (startsWith(data, "dns ")) {
+        if (parseIp(data[4..])) |ip| {
+            upstream_dns = ip;
+            var resp: [64]u8 = undefined;
+            var pos: usize = 0;
+            pos = appendStr(&resp, pos, "DNS upstream set to ");
+            pos = appendIp(&resp, pos, ip);
+            _ = chan.send(resp[0..pos]);
+        } else {
+            _ = chan.send("dns: invalid IP");
+        }
     } else {
         _ = chan.send("router: unknown command");
     }
+}
+
+fn parsePortIpPort(s: []const u8) ?struct { port1: u16, ip: [4]u8, port2: u16 } {
+    var port1: u16 = 0;
+    var i: usize = 0;
+    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+        port1 = port1 * 10 + @as(u16, s[i] - '0');
+    }
+    if (i == 0 or i >= s.len or s[i] != ' ') return null;
+    i += 1;
+
+    var ip_end = i;
+    while (ip_end < s.len and s[ip_end] != ' ') : (ip_end += 1) {}
+    const ip = parseIp(s[i..ip_end]) orelse return null;
+    if (ip_end >= s.len) return null;
+    i = ip_end + 1;
+
+    var port2: u16 = 0;
+    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+        port2 = port2 * 10 + @as(u16, s[i] - '0');
+    }
+    if (port2 == 0) return null;
+    return .{ .port1 = port1, .ip = ip, .port2 = port2 };
 }
 
 // ── Channel setup helpers ───────────────────────────────────────────────
@@ -1140,32 +1694,25 @@ pub fn main(perm_view_addr: u64) void {
     sendArpRequestOn(.wan, .{ 10, 0, 2, 1 });
     syscall.write("router: sent ARP request on WAN\n");
 
-    var mapped_console = false;
     while (true) {
-        if (!mapped_console) {
+        if (console_chan == null) {
+            var shm_idx: u32 = 0;
             for (view) |*e| {
                 if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and
-                    e.field0 > shm_protocol.COMMAND_SHM_SIZE and
-                    console_chan == null)
+                    e.field0 > shm_protocol.COMMAND_SHM_SIZE)
                 {
-                    var is_data = false;
-                    for (data_handles[0..data_count]) |dh| {
-                        if (e.handle == dh) {
-                            is_data = true;
-                            break;
-                        }
+                    if (shm_idx < data_count) {
+                        shm_idx += 1;
+                        continue;
                     }
-                    if (is_data) continue;
-
-                    const vm_rights = (perms.VmReservationRights{
+                    const vm_rights_con = (perms.VmReservationRights{
                         .read = true, .write = true, .shareable = true,
                     }).bits();
-                    const con_vm = syscall.vm_reserve(0, e.field0, vm_rights);
+                    const con_vm = syscall.vm_reserve(0, e.field0, vm_rights_con);
                     if (con_vm.val >= 0) {
                         if (syscall.shm_map(e.handle, @intCast(con_vm.val), 0) == 0) {
                             const con_header: *channel_mod.ChannelHeader = @ptrFromInt(con_vm.val2);
                             console_chan = channel_mod.Channel.initAsSideA(con_header, @truncate(e.field0));
-                            mapped_console = true;
                             syscall.write("router: console channel connected\n");
                         }
                     }
