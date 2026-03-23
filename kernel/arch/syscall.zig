@@ -113,6 +113,9 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
 fn sysWrite(ptr: u64, len: u64) SyscallResult {
     if (len == 0) return ok(0);
     if (len > 4096) return err(E_INVAL);
+    if (!address.AddrSpacePartition.user.contains(ptr)) return err(E_BADADDR);
+    const end = std.math.add(u64, ptr, len) catch return err(E_BADADDR);
+    if (!address.AddrSpacePartition.user.contains(end -| 1)) return err(E_BADADDR);
     const msg: []const u8 = @as([*]const u8, @ptrFromInt(ptr))[0..len];
     arch.print("{s}", .{msg});
     return ok(@intCast(len));
@@ -322,6 +325,9 @@ fn sysMmioUnmap(device_handle: u64, vm_handle: u64) i64 {
 
 fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms: u64) i64 {
     if (elf_len == 0) return E_INVAL;
+    if (!address.AddrSpacePartition.user.contains(elf_ptr)) return E_BADADDR;
+    const elf_end = std.math.add(u64, elf_ptr, elf_len) catch return E_BADADDR;
+    if (!address.AddrSpacePartition.user.contains(elf_end -| 1)) return E_BADADDR;
 
     const proc = currentProc();
     const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
@@ -393,7 +399,8 @@ fn sysThreadYield() i64 {
 fn sysSetAffinity(core_mask: u64) i64 {
     if (core_mask == 0) return E_INVAL;
     const count = arch.coreCount();
-    if (count < 64 and core_mask >= (@as(u64, 1) << @intCast(count))) return E_INVAL;
+    const valid_mask: u64 = if (count >= 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(count)) - 1;
+    if (core_mask & ~valid_mask != 0) return E_INVAL;
 
     const proc = currentProc();
     const self_entry = proc.getPermByHandle(0) orelse return E_PERM;

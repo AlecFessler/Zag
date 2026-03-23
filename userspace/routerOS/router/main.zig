@@ -1,763 +1,146 @@
 const lib = @import("lib");
 
+const arp = @import("arp.zig");
+const dhcp_client = @import("dhcp_client.zig");
+const dhcp_server = @import("dhcp_server.zig");
+const dns = @import("dns.zig");
+const firewall = @import("firewall.zig");
+const frag = @import("frag.zig");
+const nat = @import("nat.zig");
+const ping_mod = @import("ping.zig");
+const util = @import("util.zig");
+
 const channel_mod = lib.channel;
 const perms = lib.perms;
 const pv = lib.perm_view;
 const shm_protocol = lib.shm_protocol;
 const syscall = lib.syscall;
 
+// ── Constants ───────────────────────────────────────────────────────────
+
 const MAX_PERMS = 128;
-const ARP_TABLE_SIZE = 16;
-const NAT_TABLE_SIZE = 128;
-const DHCP_LEASE_TABLE_SIZE = 32;
 
-// ── Interface state ─────────────────────────────────────────────────────
+pub const lan_subnet: [4]u8 = .{ 192, 168, 1, 0 };
+pub const lan_mask: [4]u8 = .{ 255, 255, 255, 0 };
+pub const lan_broadcast: [4]u8 = .{ 192, 168, 1, 255 };
 
-const Interface = enum { wan, lan };
+const MAINTENANCE_INTERVAL_NS: u64 = 10_000_000_000;
 
-var wan_chan: channel_mod.Channel = undefined;
-var lan_chan: ?channel_mod.Channel = null;
-var console_chan: ?channel_mod.Channel = null;
+// ── Types ───────────────────────────────────────────────────────────────
 
-var wan_mac: [6]u8 = .{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 };
-var lan_mac: [6]u8 = .{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x57 };
-var wan_ip: [4]u8 = .{ 10, 0, 2, 15 };
-var lan_ip: [4]u8 = .{ 192, 168, 1, 1 };
-const lan_subnet: [4]u8 = .{ 192, 168, 1, 0 };
-const lan_mask: [4]u8 = .{ 255, 255, 255, 0 };
-const lan_broadcast: [4]u8 = .{ 192, 168, 1, 255 };
+pub const Interface = enum { wan, lan };
 
-var has_wan: bool = false;
-var has_lan: bool = false;
-
-// ── Interface statistics ────────────────────────────────────────────────
-
-const IfaceStats = struct {
-    rx_packets: u64,
-    rx_bytes: u64,
-    tx_packets: u64,
-    tx_bytes: u64,
-    rx_dropped: u64,
+pub const IfaceStats = struct {
+    rx_packets: u64 = 0,
+    rx_bytes: u64 = 0,
+    tx_packets: u64 = 0,
+    tx_bytes: u64 = 0,
+    rx_dropped: u64 = 0,
 };
 
-var wan_stats: IfaceStats = .{ .rx_packets = 0, .rx_bytes = 0, .tx_packets = 0, .tx_bytes = 0, .rx_dropped = 0 };
-var lan_stats: IfaceStats = .{ .rx_packets = 0, .rx_bytes = 0, .tx_packets = 0, .tx_bytes = 0, .rx_dropped = 0 };
+// ── RouterContext ────────────────────────────────────────────────────────
 
-fn ifaceStats(iface: Interface) *IfaceStats {
-    return if (iface == .wan) &wan_stats else &lan_stats;
-}
+pub const RouterContext = struct {
+    // Interface channels
+    wan_chan: channel_mod.Channel = undefined,
+    lan_chan: ?channel_mod.Channel = null,
+    console_chan: ?channel_mod.Channel = null,
 
-// ── Port forwarding table ───────────────────────────────────────────────
+    // Interface addresses
+    wan_mac: [6]u8 = .{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 },
+    lan_mac: [6]u8 = .{ 0x52, 0x54, 0x00, 0x12, 0x34, 0x57 },
+    wan_ip: [4]u8 = .{ 10, 0, 2, 15 },
+    lan_ip: [4]u8 = .{ 192, 168, 1, 1 },
 
-const PORT_FWD_SIZE = 16;
+    // Interface state
+    has_wan: bool = false,
+    has_lan: bool = false,
 
-const PortForward = struct {
-    valid: bool,
-    protocol: Protocol,
-    wan_port: u16,
-    lan_ip: [4]u8,
-    lan_port: u16,
+    // Interface statistics
+    wan_stats: IfaceStats = .{},
+    lan_stats: IfaceStats = .{},
+
+    // ARP tables
+    wan_arp: [arp.TABLE_SIZE]arp.ArpEntry = [_]arp.ArpEntry{arp.empty} ** arp.TABLE_SIZE,
+    lan_arp: [arp.TABLE_SIZE]arp.ArpEntry = [_]arp.ArpEntry{arp.empty} ** arp.TABLE_SIZE,
+
+    // NAT table
+    nat_table: [nat.TABLE_SIZE]nat.NatEntry = [_]nat.NatEntry{nat.empty} ** nat.TABLE_SIZE,
+    next_nat_port: u16 = 10000,
+
+    // Port forwarding
+    port_forwards: [firewall.PORT_FWD_SIZE]firewall.PortForward = [_]firewall.PortForward{firewall.empty_fwd} ** firewall.PORT_FWD_SIZE,
+
+    // Firewall rules
+    firewall_rules: [firewall.RULES_SIZE]firewall.FirewallRule = [_]firewall.FirewallRule{firewall.empty_rule} ** firewall.RULES_SIZE,
+
+    // DNS relay
+    dns_relays: [dns.RELAY_SIZE]dns.DnsRelay = [_]dns.DnsRelay{dns.empty} ** dns.RELAY_SIZE,
+    next_dns_id: u16 = 1,
+    upstream_dns: [4]u8 = .{ 10, 0, 2, 1 },
+
+    // DHCP server
+    dhcp_leases: [dhcp_server.TABLE_SIZE]dhcp_server.DhcpLease = [_]dhcp_server.DhcpLease{dhcp_server.empty} ** dhcp_server.TABLE_SIZE,
+    dhcp_next_ip: u8 = 100,
+
+    // DHCP client
+    dhcp_client_state: dhcp_client.DhcpClientState = .idle,
+    dhcp_client_xid: u32 = 0x5A470001,
+    dhcp_server_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    dhcp_offered_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    dhcp_client_start_ns: u64 = 0,
+    wan_ip_static: bool = true,
+
+    // Ping state
+    ping_state: ping_mod.PingState = .idle,
+    ping_target_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    ping_target_mac: [6]u8 = .{ 0, 0, 0, 0, 0, 0 },
+    ping_iface: Interface = .wan,
+    ping_seq: u16 = 0,
+    ping_start_ns: u64 = 0,
+    ping_count: u8 = 0,
+    ping_received: u8 = 0,
+
+    // Fragment tracking
+    frag_table: [frag.TABLE_SIZE]frag.FragEntry = [_]frag.FragEntry{frag.empty} ** frag.TABLE_SIZE,
+
+    // Periodic maintenance
+    last_maintenance_ns: u64 = 0,
+
+    // ── Accessor methods ────────────────────────────────────────────────
+
+    pub fn ifaceMac(self: *RouterContext, iface: Interface) *[6]u8 {
+        return if (iface == .wan) &self.wan_mac else &self.lan_mac;
+    }
+
+    pub fn ifaceIp(self: *RouterContext, iface: Interface) *[4]u8 {
+        return if (iface == .wan) &self.wan_ip else &self.lan_ip;
+    }
+
+    pub fn ifaceChan(self: *RouterContext, iface: Interface) *channel_mod.Channel {
+        if (iface == .wan) return &self.wan_chan;
+        return &(self.lan_chan orelse unreachable);
+    }
+
+    pub fn ifaceStats(self: *RouterContext, iface: Interface) *IfaceStats {
+        return if (iface == .wan) &self.wan_stats else &self.lan_stats;
+    }
+
+    pub fn arpTable(self: *RouterContext, iface: Interface) *[arp.TABLE_SIZE]arp.ArpEntry {
+        return if (iface == .wan) &self.wan_arp else &self.lan_arp;
+    }
 };
 
-const empty_fwd = PortForward{ .valid = false, .protocol = .tcp, .wan_port = 0, .lan_ip = .{ 0, 0, 0, 0 }, .lan_port = 0 };
-var port_forwards: [PORT_FWD_SIZE]PortForward = [_]PortForward{empty_fwd} ** PORT_FWD_SIZE;
+// ── Helpers ─────────────────────────────────────────────────────────────
 
-fn portFwdLookup(proto: Protocol, wan_port: u16) ?*const PortForward {
-    for (&port_forwards) |*f| {
-        if (f.valid and f.protocol == proto and f.wan_port == wan_port) return f;
-    }
-    return null;
-}
-
-fn portFwdAdd(proto: Protocol, wan_port: u16, lip: [4]u8, lport: u16) bool {
-    for (&port_forwards) |*f| {
-        if (!f.valid) {
-            f.* = .{ .valid = true, .protocol = proto, .wan_port = wan_port, .lan_ip = lip, .lan_port = lport };
-            return true;
-        }
-    }
-    return false;
-}
-
-// ── Firewall rules ──────────────────────────────────────────────────────
-
-const FIREWALL_RULES_SIZE = 32;
-
-const FirewallAction = enum { allow, block };
-
-const FirewallRule = struct {
-    valid: bool,
-    action: FirewallAction,
-    src_ip: [4]u8,
-    src_mask: [4]u8,
-    protocol: u8,
-    dst_port: u16,
-};
-
-const empty_rule = FirewallRule{
-    .valid = false, .action = .block,
-    .src_ip = .{ 0, 0, 0, 0 }, .src_mask = .{ 0, 0, 0, 0 },
-    .protocol = 0, .dst_port = 0,
-};
-var firewall_rules: [FIREWALL_RULES_SIZE]FirewallRule = [_]FirewallRule{empty_rule} ** FIREWALL_RULES_SIZE;
-
-fn firewallCheck(src_ip: [4]u8, protocol: u8, dst_port: u16) FirewallAction {
-    for (&firewall_rules) |*r| {
-        if (!r.valid) continue;
-        const ip_match = (src_ip[0] & r.src_mask[0]) == (r.src_ip[0] & r.src_mask[0]) and
-            (src_ip[1] & r.src_mask[1]) == (r.src_ip[1] & r.src_mask[1]) and
-            (src_ip[2] & r.src_mask[2]) == (r.src_ip[2] & r.src_mask[2]) and
-            (src_ip[3] & r.src_mask[3]) == (r.src_ip[3] & r.src_mask[3]);
-        if (!ip_match) continue;
-        if (r.protocol != 0 and r.protocol != protocol) continue;
-        if (r.dst_port != 0 and r.dst_port != dst_port) continue;
-        return r.action;
-    }
-    return .allow;
-}
-
-// ── DNS relay state ─────────────────────────────────────────────────────
-
-const DNS_RELAY_SIZE = 32;
-const DNS_PORT: u16 = 53;
-var upstream_dns: [4]u8 = .{ 10, 0, 2, 1 };
-
-const DnsRelay = struct {
-    valid: bool,
-    client_ip: [4]u8,
-    client_port: u16,
-    query_id: u16,
-    relay_id: u16,
-    timestamp_ns: u64,
-};
-
-const empty_dns = DnsRelay{
-    .valid = false, .client_ip = .{ 0, 0, 0, 0 },
-    .client_port = 0, .query_id = 0, .relay_id = 0, .timestamp_ns = 0,
-};
-var dns_relays: [DNS_RELAY_SIZE]DnsRelay = [_]DnsRelay{empty_dns} ** DNS_RELAY_SIZE;
-var next_dns_id: u16 = 1;
-
-// ── ARP tables ──────────────────────────────────────────────────────────
-
-const ARP_EXPIRY_NS: u64 = 300_000_000_000;
-
-const ArpEntry = struct {
-    ip: [4]u8,
-    mac: [6]u8,
-    valid: bool,
-    timestamp_ns: u64,
-};
-
-const empty_arp = ArpEntry{ .ip = .{ 0, 0, 0, 0 }, .mac = .{ 0, 0, 0, 0, 0, 0 }, .valid = false, .timestamp_ns = 0 };
-var wan_arp: [ARP_TABLE_SIZE]ArpEntry = [_]ArpEntry{empty_arp} ** ARP_TABLE_SIZE;
-var lan_arp: [ARP_TABLE_SIZE]ArpEntry = [_]ArpEntry{empty_arp} ** ARP_TABLE_SIZE;
-
-fn arpTable(iface: Interface) *[ARP_TABLE_SIZE]ArpEntry {
-    return if (iface == .wan) &wan_arp else &lan_arp;
-}
-
-fn arpLookup(table: *[ARP_TABLE_SIZE]ArpEntry, ip: [4]u8) ?[6]u8 {
-    for (table) |*e| {
-        if (e.valid and eql(&e.ip, &ip)) return e.mac;
-    }
-    return null;
-}
-
-fn arpLearn(table: *[ARP_TABLE_SIZE]ArpEntry, ip: [4]u8, mac: [6]u8) void {
-    const ts = now();
-    for (table) |*e| {
-        if (e.valid and eql(&e.ip, &ip)) {
-            @memcpy(&e.mac, &mac);
-            e.timestamp_ns = ts;
-            return;
-        }
-    }
-    for (table) |*e| {
-        if (!e.valid) {
-            e.ip = ip;
-            @memcpy(&e.mac, &mac);
-            e.valid = true;
-            e.timestamp_ns = ts;
-            return;
-        }
-    }
-    table[0].ip = ip;
-    @memcpy(&table[0].mac, &mac);
-    table[0].valid = true;
-    table[0].timestamp_ns = ts;
-}
-
-fn arpExpire(table: *[ARP_TABLE_SIZE]ArpEntry) void {
-    const ts = now();
-    for (table) |*e| {
-        if (e.valid and ts -| e.timestamp_ns > ARP_EXPIRY_NS) {
-            e.valid = false;
-        }
-    }
-}
-
-// ── NAT table ───────────────────────────────────────────────────────────
-
-const Protocol = enum(u8) { icmp = 1, tcp = 6, udp = 17 };
-
-const TcpState = enum(u8) { none, syn_sent, established, fin_wait };
-
-const NAT_TCP_SYN_TIMEOUT_NS: u64 = 30_000_000_000;
-const NAT_TCP_EST_TIMEOUT_NS: u64 = 300_000_000_000;
-const NAT_TCP_FIN_TIMEOUT_NS: u64 = 30_000_000_000;
-const NAT_UDP_TIMEOUT_NS: u64 = 120_000_000_000;
-const NAT_UDP_DNS_TIMEOUT_NS: u64 = 30_000_000_000;
-const NAT_ICMP_TIMEOUT_NS: u64 = 60_000_000_000;
-
-const NatEntry = struct {
-    valid: bool,
-    protocol: Protocol,
-    lan_ip: [4]u8,
-    lan_port: u16,
-    wan_port: u16,
-    timestamp_ns: u64,
-    tcp_state: TcpState,
-    dst_ip: [4]u8,
-    dst_port: u16,
-};
-
-const empty_nat = NatEntry{
-    .valid = false, .protocol = .icmp,
-    .lan_ip = .{ 0, 0, 0, 0 }, .lan_port = 0, .wan_port = 0, .timestamp_ns = 0,
-    .tcp_state = .none, .dst_ip = .{ 0, 0, 0, 0 }, .dst_port = 0,
-};
-var nat_table: [NAT_TABLE_SIZE]NatEntry = [_]NatEntry{empty_nat} ** NAT_TABLE_SIZE;
-var next_nat_port: u16 = 10000;
-const NAT_TIMEOUT_NS: u64 = 120_000_000_000;
-
-fn now() u64 {
-    return @bitCast(syscall.clock_gettime());
-}
-
-fn natTimeout(entry: *const NatEntry) u64 {
-    return switch (entry.protocol) {
-        .icmp => NAT_ICMP_TIMEOUT_NS,
-        .udp => if (entry.dst_port == 53) NAT_UDP_DNS_TIMEOUT_NS else NAT_UDP_TIMEOUT_NS,
-        .tcp => switch (entry.tcp_state) {
-            .syn_sent => NAT_TCP_SYN_TIMEOUT_NS,
-            .established => NAT_TCP_EST_TIMEOUT_NS,
-            .fin_wait => NAT_TCP_FIN_TIMEOUT_NS,
-            .none => NAT_UDP_TIMEOUT_NS,
-        },
-    };
-}
-
-fn natExpire() void {
-    const ts = now();
-    for (&nat_table) |*e| {
-        if (e.valid and ts -| e.timestamp_ns > natTimeout(e)) {
-            e.valid = false;
-        }
-    }
-}
-
-fn natUpdateTcpState(entry: *NatEntry, pkt: []const u8, len: u32, transport_start: usize) void {
-    if (entry.protocol != .tcp) return;
-    if (transport_start + 14 > len) return;
-
-    const flags = pkt[transport_start + 13];
-    const syn = (flags & 0x02) != 0;
-    const fin = (flags & 0x01) != 0;
-    const rst = (flags & 0x04) != 0;
-    const ack = (flags & 0x10) != 0;
-
-    switch (entry.tcp_state) {
-        .none, .syn_sent => {
-            if (syn and !ack) {
-                entry.tcp_state = .syn_sent;
-            } else if (ack) {
-                entry.tcp_state = .established;
-            }
-        },
-        .established => {
-            if (fin or rst) {
-                entry.tcp_state = .fin_wait;
-            }
-        },
-        .fin_wait => {
-            if (rst) {
-                entry.valid = false;
-            }
-        },
-    }
-    entry.timestamp_ns = now();
-}
-
-fn logNat(action: []const u8, entry: *const NatEntry) void {
-    var buf: [128]u8 = undefined;
-    var pos: usize = 0;
-    pos = appendStr(&buf, pos, "nat: ");
-    pos = appendStr(&buf, pos, action);
-    pos = appendStr(&buf, pos, " ");
-    pos = appendStr(&buf, pos, switch (entry.protocol) {
-        .icmp => "icmp",
-        .tcp => "tcp",
-        .udp => "udp",
-    });
-    pos = appendStr(&buf, pos, " ");
-    pos = appendIp(&buf, pos, entry.lan_ip);
-    pos = appendStr(&buf, pos, ":");
-    pos = appendDec(&buf, pos, entry.lan_port);
-    pos = appendStr(&buf, pos, " -> ");
-    pos = appendIp(&buf, pos, entry.dst_ip);
-    pos = appendStr(&buf, pos, ":");
-    pos = appendDec(&buf, pos, entry.dst_port);
-    pos = appendStr(&buf, pos, " (wan:");
-    pos = appendDec(&buf, pos, entry.wan_port);
-    pos = appendStr(&buf, pos, ")\n");
-    syscall.write(buf[0..pos]);
-}
-
-fn logEvent(msg: []const u8) void {
-    syscall.write(msg);
-}
-
-fn natLookupOutbound(proto: Protocol, lip: [4]u8, lport: u16) ?*NatEntry {
-    for (&nat_table) |*e| {
-        if (e.valid and e.protocol == proto and eql(&e.lan_ip, &lip) and e.lan_port == lport) {
-            e.timestamp_ns = now();
-            return e;
-        }
-    }
-    return null;
-}
-
-fn natCreateOutbound(proto: Protocol, lip: [4]u8, lport: u16, dip: [4]u8, dport: u16) ?*NatEntry {
-    const ts = now();
-    const tcp_state: TcpState = if (proto == .tcp) .syn_sent else .none;
-    var oldest_idx: usize = 0;
-    var oldest_ts: u64 = ts;
-    for (&nat_table, 0..) |*e, i| {
-        if (!e.valid) {
-            e.* = .{ .valid = true, .protocol = proto, .lan_ip = lip,
-                .lan_port = lport, .wan_port = next_nat_port, .timestamp_ns = ts,
-                .tcp_state = tcp_state, .dst_ip = dip, .dst_port = dport };
-            next_nat_port +%= 1;
-            if (next_nat_port < 10000) next_nat_port = 10000;
-            logNat("new", e);
-            return e;
-        }
-        if (e.timestamp_ns < oldest_ts) {
-            oldest_ts = e.timestamp_ns;
-            oldest_idx = i;
-        }
-    }
-    nat_table[oldest_idx] = .{ .valid = true, .protocol = proto, .lan_ip = lip,
-        .lan_port = lport, .wan_port = next_nat_port, .timestamp_ns = ts,
-        .tcp_state = tcp_state, .dst_ip = dip, .dst_port = dport };
-    next_nat_port +%= 1;
-    if (next_nat_port < 10000) next_nat_port = 10000;
-    logNat("new", &nat_table[oldest_idx]);
-    return &nat_table[oldest_idx];
-}
-
-fn natLookupInbound(proto: Protocol, wport: u16) ?*NatEntry {
-    for (&nat_table) |*e| {
-        if (e.valid and e.protocol == proto and e.wan_port == wport) {
-            e.timestamp_ns = now();
-            return e;
-        }
-    }
-    return null;
-}
-
-// ── DHCP server (LAN side) ──────────────────────────────────────────────
-
-const DhcpLease = struct {
-    mac: [6]u8,
-    ip: [4]u8,
-    valid: bool,
-};
-
-const empty_lease = DhcpLease{ .mac = .{ 0, 0, 0, 0, 0, 0 }, .ip = .{ 0, 0, 0, 0 }, .valid = false };
-var dhcp_leases: [DHCP_LEASE_TABLE_SIZE]DhcpLease = [_]DhcpLease{empty_lease} ** DHCP_LEASE_TABLE_SIZE;
-var dhcp_next_ip: u8 = 100;
-
-fn dhcpFindLease(mac: [6]u8) ?[4]u8 {
-    for (&dhcp_leases) |*l| {
-        if (l.valid and eql(&l.mac, &mac)) return l.ip;
-    }
-    return null;
-}
-
-fn dhcpAllocateLease(mac: [6]u8) ?[4]u8 {
-    if (dhcpFindLease(mac)) |ip| return ip;
-    for (&dhcp_leases) |*l| {
-        if (!l.valid) {
-            l.ip = .{ 192, 168, 1, dhcp_next_ip };
-            @memcpy(&l.mac, &mac);
-            l.valid = true;
-            dhcp_next_ip +%= 1;
-            if (dhcp_next_ip < 100) dhcp_next_ip = 100;
-            return l.ip;
-        }
-    }
-    return null;
-}
-
-// DHCP message types
-const DHCP_DISCOVER: u8 = 1;
-const DHCP_OFFER: u8 = 2;
-const DHCP_REQUEST: u8 = 3;
-const DHCP_ACK: u8 = 5;
-
-fn handleDhcpServer(pkt: []const u8, len: u32) void {
-    if (!has_lan) return;
-    if (len < 282) return;
-
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
-    const udp_start = 14 + ip_hdr_len;
-    if (udp_start + 8 > len) return;
-
-    const src_port = readU16Be(pkt[udp_start..][0..2]);
-    const dst_port = readU16Be(pkt[udp_start + 2 ..][0..2]);
-    if (src_port != 68 or dst_port != 67) return;
-
-    const dhcp_start = udp_start + 8;
-    if (dhcp_start + 240 > len) return;
-
-    if (pkt[dhcp_start] != 1) return;
-
-    var client_mac: [6]u8 = undefined;
-    @memcpy(&client_mac, pkt[dhcp_start + 28 ..][0..6]);
-
-    const magic_offset = dhcp_start + 236;
-    if (pkt[magic_offset] != 0x63 or pkt[magic_offset + 1] != 0x82 or
-        pkt[magic_offset + 2] != 0x53 or pkt[magic_offset + 3] != 0x63) return;
-
-    var msg_type: u8 = 0;
-    var opt_idx: u32 = magic_offset + 4;
-    while (opt_idx + 1 < len) {
-        const opt = pkt[opt_idx];
-        if (opt == 255) break;
-        if (opt == 0) {
-            opt_idx += 1;
-            continue;
-        }
-        const opt_len = pkt[opt_idx + 1];
-        if (opt == 53 and opt_len >= 1) {
-            msg_type = pkt[opt_idx + 2];
-        }
-        opt_idx += 2 + opt_len;
-    }
-
-    if (msg_type == DHCP_DISCOVER or msg_type == DHCP_REQUEST) {
-        const offer_ip = dhcpAllocateLease(client_mac) orelse return;
-        const response_type: u8 = if (msg_type == DHCP_DISCOVER) DHCP_OFFER else DHCP_ACK;
-        sendDhcpResponse(pkt[dhcp_start..], client_mac, offer_ip, response_type, @truncate(len - dhcp_start));
-    }
-}
-
-fn sendDhcpResponse(request: []const u8, client_mac: [6]u8, offer_ip: [4]u8, msg_type: u8, req_len: u32) void {
-    _ = req_len;
-    var pkt: [600]u8 = undefined;
-    @memset(&pkt, 0);
-
-    @memset(pkt[0..6], 0xFF);
-    @memcpy(pkt[6..12], &lan_mac);
-    pkt[12] = 0x08;
-    pkt[13] = 0x00;
-
-    pkt[14] = 0x45;
-    pkt[15] = 0x00;
-    pkt[22] = 64;
-    pkt[23] = 17;
-    @memcpy(pkt[26..30], &lan_ip);
-    @memset(pkt[30..34], 0xFF);
-
-    const udp_start: usize = 34;
-    writeU16Be(pkt[udp_start..][0..2], 67);
-    writeU16Be(pkt[udp_start + 2 ..][0..2], 68);
-
-    const dhcp_start: usize = udp_start + 8;
-    pkt[dhcp_start] = 2;
-    pkt[dhcp_start + 1] = 1;
-    pkt[dhcp_start + 2] = 6;
-    pkt[dhcp_start + 3] = 0;
-    @memcpy(pkt[dhcp_start + 4 ..][0..4], request[4..8]);
-    @memcpy(pkt[dhcp_start + 16 ..][0..4], &offer_ip);
-    @memcpy(pkt[dhcp_start + 20 ..][0..4], &lan_ip);
-    @memcpy(pkt[dhcp_start + 28 ..][0..6], &client_mac);
-
-    const magic: usize = dhcp_start + 236;
-    pkt[magic] = 0x63;
-    pkt[magic + 1] = 0x82;
-    pkt[magic + 2] = 0x53;
-    pkt[magic + 3] = 0x63;
-
-    var opt: usize = magic + 4;
-    pkt[opt] = 53;
-    pkt[opt + 1] = 1;
-    pkt[opt + 2] = msg_type;
-    opt += 3;
-
-    pkt[opt] = 1;
-    pkt[opt + 1] = 4;
-    @memcpy(pkt[opt + 2 ..][0..4], &lan_mask);
-    opt += 6;
-
-    pkt[opt] = 3;
-    pkt[opt + 1] = 4;
-    @memcpy(pkt[opt + 2 ..][0..4], &lan_ip);
-    opt += 6;
-
-    pkt[opt] = 6;
-    pkt[opt + 1] = 4;
-    @memcpy(pkt[opt + 2 ..][0..4], &lan_ip);
-    opt += 6;
-
-    pkt[opt] = 51;
-    pkt[opt + 1] = 4;
-    pkt[opt + 2] = 0;
-    pkt[opt + 3] = 0;
-    pkt[opt + 4] = 0x1C;
-    pkt[opt + 5] = 0x20;
-    opt += 6;
-
-    pkt[opt] = 54;
-    pkt[opt + 1] = 4;
-    @memcpy(pkt[opt + 2 ..][0..4], &lan_ip);
-    opt += 6;
-
-    pkt[opt] = 255;
-    opt += 1;
-
-    const total_dhcp = opt - dhcp_start;
-    const udp_len: u16 = @truncate(8 + total_dhcp);
-    writeU16Be(pkt[udp_start + 4 ..][0..2], udp_len);
-
-    const ip_total: u16 = @truncate(20 + udp_len);
-    writeU16Be(pkt[16..18], ip_total);
-
-    pkt[24] = 0;
-    pkt[25] = 0;
-    const ip_cs = computeChecksum(pkt[14..34]);
-    pkt[24] = @truncate(ip_cs >> 8);
-    pkt[25] = @truncate(ip_cs);
-
-    const total_len = 14 + ip_total;
-    const send_len = if (total_len < 60) @as(usize, 60) else @as(usize, @intCast(total_len));
-    if (lan_chan) |*ch| {
-        _ = ch.send(pkt[0..send_len]);
-    }
-}
-
-// ── Ping state machine ──────────────────────────────────────────────────
-
-const PingState = enum { idle, arp_pending, echo_sent };
-
-var ping_state: PingState = .idle;
-var ping_target_ip: [4]u8 = .{ 0, 0, 0, 0 };
-var ping_target_mac: [6]u8 = .{ 0, 0, 0, 0, 0, 0 };
-var ping_iface: Interface = .wan;
-var ping_seq: u16 = 0;
-const ping_id: u16 = 0x5A47;
-var ping_start_ns: u64 = 0;
-const ping_timeout_ns: u64 = 3_000_000_000;
-var ping_count: u8 = 0;
-const ping_total: u8 = 4;
-var ping_received: u8 = 0;
-
-// ── String helpers ──────────────────────────────────────────────────────
-
-fn eql(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |x, y| {
-        if (x != y) return false;
-    }
-    return true;
-}
-
-fn startsWith(haystack: []const u8, prefix: []const u8) bool {
-    if (haystack.len < prefix.len) return false;
-    return eql(haystack[0..prefix.len], prefix);
-}
-
-fn appendStr(buf: []u8, pos: usize, s: []const u8) usize {
-    const end = @min(pos + s.len, buf.len);
-    @memcpy(buf[pos..end], s[0..(end - pos)]);
-    return end;
-}
-
-fn appendDec(buf: []u8, pos: usize, val: u64) usize {
-    if (val == 0) {
-        if (pos < buf.len) {
-            buf[pos] = '0';
-            return pos + 1;
-        }
-        return pos;
-    }
-    var tmp: [20]u8 = undefined;
-    var v = val;
-    var i: usize = 20;
-    while (v > 0) {
-        i -= 1;
-        tmp[i] = '0' + @as(u8, @truncate(v % 10));
-        v /= 10;
-    }
-    return appendStr(buf, pos, tmp[i..20]);
-}
-
-fn appendIp(buf: []u8, pos: usize, ip: [4]u8) usize {
-    var p = pos;
-    for (ip, 0..) |octet, idx| {
-        p = appendDec(buf, p, octet);
-        if (idx < 3) p = appendStr(buf, p, ".");
-    }
-    return p;
-}
-
-fn appendMac(buf: []u8, pos: usize, mac: [6]u8) usize {
-    const hex_chars = "0123456789abcdef";
-    var p = pos;
-    for (mac, 0..) |byte, idx| {
-        if (p + 2 > buf.len) break;
-        buf[p] = hex_chars[byte >> 4];
-        buf[p + 1] = hex_chars[byte & 0xf];
-        p += 2;
-        if (idx < 5) p = appendStr(buf, p, ":");
-    }
-    return p;
-}
-
-fn parseIp(s: []const u8) ?[4]u8 {
-    var ip: [4]u8 = undefined;
-    var octet: u16 = 0;
-    var idx: usize = 0;
-    var digits: u8 = 0;
-    for (s) |c| {
-        if (c == '.') {
-            if (digits == 0 or octet > 255 or idx >= 3) return null;
-            ip[idx] = @truncate(octet);
-            idx += 1;
-            octet = 0;
-            digits = 0;
-        } else if (c >= '0' and c <= '9') {
-            octet = octet * 10 + (c - '0');
-            digits += 1;
-        } else {
-            return null;
-        }
-    }
-    if (digits == 0 or octet > 255 or idx != 3) return null;
-    ip[3] = @truncate(octet);
-    return ip;
-}
-
-// ── Packet helpers ──────────────────────────────────────────────────────
-
-fn readU16Be(buf: []const u8) u16 {
-    return @as(u16, buf[0]) << 8 | buf[1];
-}
-
-fn writeU16Be(buf: []u8, val: u16) void {
-    buf[0] = @truncate(val >> 8);
-    buf[1] = @truncate(val);
-}
-
-fn computeChecksum(data: []const u8) u16 {
-    var sum: u32 = 0;
-    var i: usize = 0;
-    while (i + 1 < data.len) : (i += 2) {
-        sum += @as(u32, data[i]) << 8 | data[i + 1];
-    }
-    if (i < data.len) sum += @as(u32, data[i]) << 8;
-    while (sum >> 16 != 0) sum = (sum & 0xFFFF) + (sum >> 16);
-    return @truncate(~sum);
-}
-
-fn isInLanSubnet(ip: [4]u8) bool {
+pub fn isInLanSubnet(ip: [4]u8) bool {
     return (ip[0] & lan_mask[0]) == (lan_subnet[0] & lan_mask[0]) and
         (ip[1] & lan_mask[1]) == (lan_subnet[1] & lan_mask[1]) and
         (ip[2] & lan_mask[2]) == (lan_subnet[2] & lan_mask[2]) and
         (ip[3] & lan_mask[3]) == (lan_subnet[3] & lan_mask[3]);
 }
 
-fn ifaceMac(iface: Interface) *[6]u8 {
-    return if (iface == .wan) &wan_mac else &lan_mac;
-}
-
-fn ifaceIp(iface: Interface) *[4]u8 {
-    return if (iface == .wan) &wan_ip else &lan_ip;
-}
-
-fn ifaceChan(iface: Interface) *channel_mod.Channel {
-    if (iface == .wan) return &wan_chan;
-    return &(lan_chan orelse unreachable);
-}
-
-// ── ARP packet handling ─────────────────────────────────────────────────
-
-fn sendArpRequestOn(iface: Interface, target_ip: [4]u8) void {
-    var pkt: [60]u8 = undefined;
-    @memset(&pkt, 0);
-    @memset(pkt[0..6], 0xFF);
-    @memcpy(pkt[6..12], ifaceMac(iface));
-    pkt[12] = 0x08;
-    pkt[13] = 0x06;
-    pkt[14] = 0x00;
-    pkt[15] = 0x01;
-    pkt[16] = 0x08;
-    pkt[17] = 0x00;
-    pkt[18] = 0x06;
-    pkt[19] = 0x04;
-    pkt[20] = 0x00;
-    pkt[21] = 0x01;
-    @memcpy(pkt[22..28], ifaceMac(iface));
-    @memcpy(pkt[28..32], ifaceIp(iface));
-    @memset(pkt[32..38], 0);
-    @memcpy(pkt[38..42], &target_ip);
-    _ = ifaceChan(iface).send(&pkt);
-}
-
-fn handleArp(iface: Interface, pkt: []u8, len: u32) ?[]u8 {
-    if (len < 42) return null;
-    const arp_start = 14;
-    if (readU16Be(pkt[arp_start..][0..2]) != 0x0001) return null;
-    if (readU16Be(pkt[arp_start + 2 ..][0..2]) != 0x0800) return null;
-
-    const my_ip = ifaceIp(iface);
-    const my_mac = ifaceMac(iface);
-
-    const opcode = readU16Be(pkt[arp_start + 6 ..][0..2]);
-    if (opcode != 0x0001 and opcode != 0x0002) return null;
-
-    if (opcode == 0x0001 and !eql(pkt[arp_start + 24 ..][0..4], my_ip)) return null;
-
-    if (opcode == 0x0001) {
-        @memcpy(pkt[0..6], pkt[6..12]);
-        @memcpy(pkt[6..12], my_mac);
-        writeU16Be(pkt[arp_start + 6 ..][0..2], 0x0002);
-
-        var mac_tmp: [6]u8 = undefined;
-        @memcpy(&mac_tmp, pkt[arp_start + 8 ..][0..6]);
-        @memcpy(pkt[arp_start + 18 ..][0..6], &mac_tmp);
-        @memcpy(pkt[arp_start + 8 ..][0..6], my_mac);
-
-        var ip_tmp: [4]u8 = undefined;
-        @memcpy(&ip_tmp, pkt[arp_start + 14 ..][0..4]);
-        @memcpy(pkt[arp_start + 24 ..][0..4], &ip_tmp);
-        @memcpy(pkt[arp_start + 14 ..][0..4], my_ip);
-
-        if (len < 60) {
-            @memset(pkt[42..60], 0);
-            return pkt[0..60];
-        }
-        return pkt[0..len];
-    }
-
-    return null;
-}
-
-// ── ICMP handling ───────────────────────────────────────────────────────
-
-fn handleIcmp(iface: Interface, pkt: []u8, len: u32) ?[]u8 {
+fn handleIcmp(ctx: *RouterContext, iface: Interface, pkt: []u8, len: u32) ?[]u8 {
     if (len < 34) return null;
     if (pkt[23] != 1) return null;
 
@@ -766,7 +149,7 @@ fn handleIcmp(iface: Interface, pkt: []u8, len: u32) ?[]u8 {
     if (icmp_start + 8 > len) return null;
     if (pkt[icmp_start] != 8) return null;
 
-    const my_mac = ifaceMac(iface);
+    const my_mac = ctx.ifaceMac(iface);
 
     @memcpy(pkt[0..6], pkt[6..12]);
     @memcpy(pkt[6..12], my_mac);
@@ -779,843 +162,43 @@ fn handleIcmp(iface: Interface, pkt: []u8, len: u32) ?[]u8 {
     pkt[icmp_start] = 0;
     pkt[icmp_start + 2] = 0;
     pkt[icmp_start + 3] = 0;
-    const cs = computeChecksum(pkt[icmp_start..len]);
+    const cs = util.computeChecksum(pkt[icmp_start..len]);
     pkt[icmp_start + 2] = @truncate(cs >> 8);
     pkt[icmp_start + 3] = @truncate(cs);
 
     pkt[24] = 0;
     pkt[25] = 0;
-    const ip_cs = computeChecksum(pkt[14..][0..ip_hdr_len]);
+    const ip_cs = util.computeChecksum(pkt[14..][0..ip_hdr_len]);
     pkt[24] = @truncate(ip_cs >> 8);
     pkt[25] = @truncate(ip_cs);
 
     return pkt[0..len];
 }
 
-// ── Outbound ping ───────────────────────────────────────────────────────
-
-fn sendEchoRequest() void {
-    var pkt: [98]u8 = undefined;
-    @memset(&pkt, 0);
-
-    const src_mac = ifaceMac(ping_iface);
-    const src_ip = ifaceIp(ping_iface);
-
-    @memcpy(pkt[0..6], &ping_target_mac);
-    @memcpy(pkt[6..12], src_mac);
-    pkt[12] = 0x08;
-    pkt[13] = 0x00;
-
-    pkt[14] = 0x45;
-    writeU16Be(pkt[16..18], 84);
-    writeU16Be(pkt[18..20], ping_id);
-    pkt[22] = 64;
-    pkt[23] = 1;
-    @memcpy(pkt[26..30], src_ip);
-    @memcpy(pkt[30..34], &ping_target_ip);
-
-    pkt[24] = 0;
-    pkt[25] = 0;
-    const ip_cs = computeChecksum(pkt[14..34]);
-    pkt[24] = @truncate(ip_cs >> 8);
-    pkt[25] = @truncate(ip_cs);
-
-    pkt[34] = 8;
-    writeU16Be(pkt[38..40], ping_id);
-    writeU16Be(pkt[40..42], ping_seq);
-
-    pkt[36] = 0;
-    pkt[37] = 0;
-    const icmp_cs = computeChecksum(pkt[34..98]);
-    pkt[36] = @truncate(icmp_cs >> 8);
-    pkt[37] = @truncate(icmp_cs);
-
-    ping_start_ns = now();
-    ping_state = .echo_sent;
-    _ = ifaceChan(ping_iface).send(&pkt);
-}
-
-fn handleEchoReply(pkt: []const u8, len: u32) void {
-    if (ping_state != .echo_sent) return;
-    if (len < 42) return;
-    if (pkt[23] != 1) return;
-
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
-    const icmp_start = 14 + ip_hdr_len;
-    if (icmp_start + 8 > len) return;
-    if (pkt[icmp_start] != 0) return;
-
-    const reply_id = readU16Be(pkt[icmp_start + 4 ..][0..2]);
-    const reply_seq = readU16Be(pkt[icmp_start + 6 ..][0..2]);
-    if (reply_id != ping_id or reply_seq != ping_seq) return;
-
-    const rtt_us = (now() -| ping_start_ns) / 1000;
-    ping_received += 1;
-
-    var resp: [128]u8 = undefined;
-    var pos: usize = 0;
-    pos = appendStr(&resp, pos, "reply from ");
-    pos = appendIp(&resp, pos, ping_target_ip);
-    pos = appendStr(&resp, pos, ": seq=");
-    pos = appendDec(&resp, pos, ping_seq);
-    pos = appendStr(&resp, pos, " time=");
-    pos = appendDec(&resp, pos, rtt_us);
-    pos = appendStr(&resp, pos, "us");
-    if (console_chan) |*chan| {
-        _ = chan.send(resp[0..pos]);
-    }
-
-    ping_count += 1;
-    if (ping_count >= ping_total) {
-        sendPingSummary();
-        ping_state = .idle;
-    } else {
-        ping_seq += 1;
-        sendEchoRequest();
-    }
-}
-
-fn sendPingSummary() void {
-    var resp: [128]u8 = undefined;
-    var pos: usize = 0;
-    pos = appendStr(&resp, pos, "--- ping ");
-    pos = appendIp(&resp, pos, ping_target_ip);
-    pos = appendStr(&resp, pos, ": ");
-    pos = appendDec(&resp, pos, ping_total);
-    pos = appendStr(&resp, pos, " sent, ");
-    pos = appendDec(&resp, pos, ping_received);
-    pos = appendStr(&resp, pos, " received ---");
-    if (console_chan) |*chan| {
-        _ = chan.send(resp[0..pos]);
-    }
-}
-
-fn checkPingTimeout() void {
-    if (ping_state == .idle) return;
-    if (now() -| ping_start_ns < ping_timeout_ns) return;
-
-    var resp: [128]u8 = undefined;
-    var pos: usize = 0;
-    if (ping_state == .arp_pending) {
-        pos = appendStr(&resp, pos, "ping: ARP timeout for ");
-        pos = appendIp(&resp, pos, ping_target_ip);
-    } else {
-        pos = appendStr(&resp, pos, "request timeout: seq=");
-        pos = appendDec(&resp, pos, ping_seq);
-    }
-    if (console_chan) |*chan| {
-        _ = chan.send(resp[0..pos]);
-    }
-
-    ping_count += 1;
-    if (ping_count >= ping_total) {
-        sendPingSummary();
-        ping_state = .idle;
-    } else {
-        ping_seq += 1;
-        if (ping_state == .arp_pending) {
-            sendArpRequestOn(ping_iface, ping_target_ip);
-            ping_start_ns = now();
-        } else {
-            sendEchoRequest();
-        }
-    }
-}
-
-// ── TCP checksum helpers ────────────────────────────────────────────────
-
-fn tcpChecksumAdjust(pkt: []u8, transport_start: usize, len: u32, old_ip: [4]u8, new_ip: [4]u8, old_port: u16, new_port: u16) void {
-    if (transport_start + 18 > len) return;
-    var sum: i32 = @as(i32, @as(u16, pkt[transport_start + 16])) << 8 | pkt[transport_start + 17];
-    sum = ~sum & 0xFFFF;
-
-    sum -= @as(i32, @as(u16, old_ip[0])) << 8 | old_ip[1];
-    sum -= @as(i32, @as(u16, old_ip[2])) << 8 | old_ip[3];
-    sum -= @as(i32, old_port);
-    sum += @as(i32, @as(u16, new_ip[0])) << 8 | new_ip[1];
-    sum += @as(i32, @as(u16, new_ip[2])) << 8 | new_ip[3];
-    sum += @as(i32, new_port);
-
-    while (sum < 0) sum += 0x10000;
-    while (sum > 0xFFFF) sum = (sum & 0xFFFF) + (sum >> 16);
-    sum = ~sum & 0xFFFF;
-    if (sum == 0) sum = 0xFFFF;
-
-    pkt[transport_start + 16] = @truncate(@as(u32, @intCast(sum)) >> 8);
-    pkt[transport_start + 17] = @truncate(@as(u32, @intCast(sum)));
-}
-
-// ── DNS relay ───────────────────────────────────────────────────────────
-
-fn handleDnsFromLan(pkt: []u8, len: u32) void {
-    if (!has_wan) return;
-    if (len < 34) return;
-
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
-    const udp_start = 14 + ip_hdr_len;
-    if (udp_start + 8 > len) return;
-    if (pkt[23] != 17) return;
-
-    const dst_port = readU16Be(pkt[udp_start + 2 ..][0..2]);
-    if (dst_port != DNS_PORT) return;
-
-    const src_port = readU16Be(pkt[udp_start..][0..2]);
-    var client_ip: [4]u8 = undefined;
-    @memcpy(&client_ip, pkt[26..30]);
-
-    const dns_start = udp_start + 8;
-    if (dns_start + 2 > len) return;
-    const query_id = readU16Be(pkt[dns_start..][0..2]);
-
-    const relay_id = next_dns_id;
-    next_dns_id +%= 1;
-    if (next_dns_id == 0) next_dns_id = 1;
-
-    var slot: ?*DnsRelay = null;
-    var oldest_idx: usize = 0;
-    var oldest_ts: u64 = now();
-    for (&dns_relays, 0..) |*r, i| {
-        if (!r.valid) {
-            slot = r;
-            break;
-        }
-        if (r.timestamp_ns < oldest_ts) {
-            oldest_ts = r.timestamp_ns;
-            oldest_idx = i;
-        }
-    }
-    if (slot == null) slot = &dns_relays[oldest_idx];
-
-    slot.?.* = .{
-        .valid = true,
-        .client_ip = client_ip,
-        .client_port = src_port,
-        .query_id = query_id,
-        .relay_id = relay_id,
-        .timestamp_ns = now(),
-    };
-
-    writeU16Be(pkt[dns_start..][0..2], relay_id);
-
-    const gateway_mac = arpLookup(&wan_arp, upstream_dns) orelse {
-        sendArpRequestOn(.wan, upstream_dns);
-        return;
-    };
-
-    @memcpy(pkt[0..6], &gateway_mac);
-    @memcpy(pkt[6..12], &wan_mac);
-    @memcpy(pkt[26..30], &wan_ip);
-    @memcpy(pkt[30..34], &upstream_dns);
-
-    writeU16Be(pkt[udp_start..][0..2], relay_id);
-
-    pkt[udp_start + 6] = 0;
-    pkt[udp_start + 7] = 0;
-
-    pkt[24] = 0;
-    pkt[25] = 0;
-    const ip_cs = computeChecksum(pkt[14..][0..ip_hdr_len]);
-    pkt[24] = @truncate(ip_cs >> 8);
-    pkt[25] = @truncate(ip_cs);
-
-    wan_stats.tx_packets += 1;
-    wan_stats.tx_bytes += len;
-    _ = wan_chan.send(pkt[0..len]);
-}
-
-fn handleDnsFromWan(pkt: []u8, len: u32) void {
-    if (!has_lan) return;
-    if (len < 34) return;
-
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
-    const udp_start = 14 + ip_hdr_len;
-    if (udp_start + 8 > len) return;
-    if (pkt[23] != 17) return;
-
-    const src_port = readU16Be(pkt[udp_start..][0..2]);
-    if (src_port != DNS_PORT) return;
-
-    const dns_start = udp_start + 8;
-    if (dns_start + 2 > len) return;
-    const resp_id = readU16Be(pkt[dns_start..][0..2]);
-
-    for (&dns_relays) |*r| {
-        if (r.valid and r.relay_id == resp_id) {
-            writeU16Be(pkt[dns_start..][0..2], r.query_id);
-
-            const client_mac = arpLookup(&lan_arp, r.client_ip) orelse {
-                r.valid = false;
-                return;
-            };
-
-            @memcpy(pkt[0..6], &client_mac);
-            @memcpy(pkt[6..12], &lan_mac);
-            @memcpy(pkt[26..30], &lan_ip);
-            @memcpy(pkt[30..34], &r.client_ip);
-
-            writeU16Be(pkt[udp_start + 2 ..][0..2], r.client_port);
-            writeU16Be(pkt[udp_start..][0..2], DNS_PORT);
-
-            pkt[udp_start + 6] = 0;
-            pkt[udp_start + 7] = 0;
-
-            pkt[24] = 0;
-            pkt[25] = 0;
-            const ip_cs = computeChecksum(pkt[14..][0..ip_hdr_len]);
-            pkt[24] = @truncate(ip_cs >> 8);
-            pkt[25] = @truncate(ip_cs);
-
-            lan_stats.tx_packets += 1;
-            lan_stats.tx_bytes += len;
-            if (lan_chan) |*ch| {
-                _ = ch.send(pkt[0..len]);
-            }
-
-            r.valid = false;
-            return;
-        }
-    }
-}
-
-// ── Port forwarding (DNAT) ──────────────────────────────────────────────
-
-fn handlePortForward(pkt: []u8, len: u32) bool {
-    if (!has_lan) return false;
-    if (len < 34) return false;
-
-    const protocol = pkt[23];
-    if (protocol != 6 and protocol != 17) return false;
-
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
-    const transport_start = 14 + ip_hdr_len;
-    if (transport_start + 4 > len) return false;
-
-    const dst_port = readU16Be(pkt[transport_start + 2 ..][0..2]);
-    const proto: Protocol = if (protocol == 6) .tcp else .udp;
-
-    const fwd = portFwdLookup(proto, dst_port) orelse return false;
-
-    const dst_mac = arpLookup(&lan_arp, fwd.lan_ip) orelse {
-        sendArpRequestOn(.lan, fwd.lan_ip);
-        return true;
-    };
-
-    var old_dst_ip: [4]u8 = undefined;
-    @memcpy(&old_dst_ip, pkt[30..34]);
-
-    @memcpy(pkt[0..6], &dst_mac);
-    @memcpy(pkt[6..12], &lan_mac);
-    @memcpy(pkt[30..34], &fwd.lan_ip);
-    writeU16Be(pkt[transport_start + 2 ..][0..2], fwd.lan_port);
-
-    if (protocol == 6) {
-        tcpChecksumAdjust(pkt, transport_start, len, old_dst_ip, fwd.lan_ip, dst_port, fwd.lan_port);
-    } else {
-        pkt[transport_start + 6] = 0;
-        pkt[transport_start + 7] = 0;
-    }
-
-    pkt[24] = 0;
-    pkt[25] = 0;
-    const ip_cs = computeChecksum(pkt[14..][0..ip_hdr_len]);
-    pkt[24] = @truncate(ip_cs >> 8);
-    pkt[25] = @truncate(ip_cs);
-
-    lan_stats.tx_packets += 1;
-    lan_stats.tx_bytes += len;
-    if (lan_chan) |*ch| {
-        _ = ch.send(pkt[0..len]);
-    }
-    return true;
-}
-
-// ── NAT routing ─────────────────────────────────────────────────────────
-
-fn natForwardLanToWan(pkt: []u8, len: u32) void {
-    if (len < 34) return;
-
-    var dst_ip: [4]u8 = undefined;
-    @memcpy(&dst_ip, pkt[30..34]);
-
-    if (eql(&dst_ip, &lan_ip)) return;
-    if (isInLanSubnet(dst_ip)) return;
-
-    const gateway_mac = arpLookup(&wan_arp, .{ 10, 0, 2, 1 }) orelse {
-        sendArpRequestOn(.wan, .{ 10, 0, 2, 1 });
-        return;
-    };
-
-    const protocol = pkt[23];
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
-
-    if (protocol == 1) {
-        const icmp_start = 14 + ip_hdr_len;
-        if (icmp_start + 8 > len) return;
-        if (pkt[icmp_start] != 8) return;
-
-        const orig_id = readU16Be(pkt[icmp_start + 4 ..][0..2]);
-        var src_ip: [4]u8 = undefined;
-        @memcpy(&src_ip, pkt[26..30]);
-
-        var dst_ip_nat: [4]u8 = undefined;
-        @memcpy(&dst_ip_nat, pkt[30..34]);
-        const nat_entry = natLookupOutbound(.icmp, src_ip, orig_id) orelse
-            (natCreateOutbound(.icmp, src_ip, orig_id, dst_ip_nat, 0) orelse return);
-
-        @memcpy(pkt[0..6], &gateway_mac);
-        @memcpy(pkt[6..12], &wan_mac);
-        @memcpy(pkt[26..30], &wan_ip);
-        writeU16Be(pkt[icmp_start + 4 ..][0..2], nat_entry.wan_port);
-
-        pkt[icmp_start + 2] = 0;
-        pkt[icmp_start + 3] = 0;
-        const icmp_cs = computeChecksum(pkt[icmp_start..len]);
-        pkt[icmp_start + 2] = @truncate(icmp_cs >> 8);
-        pkt[icmp_start + 3] = @truncate(icmp_cs);
-
-        pkt[24] = 0;
-        pkt[25] = 0;
-        const ip_cs = computeChecksum(pkt[14..][0..ip_hdr_len]);
-        pkt[24] = @truncate(ip_cs >> 8);
-        pkt[25] = @truncate(ip_cs);
-
-        _ = wan_chan.send(pkt[0..len]);
-    } else if (protocol == 6 or protocol == 17) {
-        const transport_start = 14 + ip_hdr_len;
-        if (transport_start + 4 > len) return;
-
-        const orig_port = readU16Be(pkt[transport_start..][0..2]);
-        var src_ip: [4]u8 = undefined;
-        @memcpy(&src_ip, pkt[26..30]);
-
-        var dst_ip_tcp: [4]u8 = undefined;
-        @memcpy(&dst_ip_tcp, pkt[30..34]);
-        const dst_port_tcp = readU16Be(pkt[transport_start + 2 ..][0..2]);
-        const proto: Protocol = if (protocol == 6) .tcp else .udp;
-        const nat_entry = natLookupOutbound(proto, src_ip, orig_port) orelse
-            (natCreateOutbound(proto, src_ip, orig_port, dst_ip_tcp, dst_port_tcp) orelse return);
-
-        if (protocol == 6) {
-            natUpdateTcpState(nat_entry, pkt, len, transport_start);
-        }
-
-        @memcpy(pkt[0..6], &gateway_mac);
-        @memcpy(pkt[6..12], &wan_mac);
-
-        if (protocol == 6) {
-            tcpChecksumAdjust(pkt, transport_start, len, src_ip, wan_ip, orig_port, nat_entry.wan_port);
-        } else if (transport_start + 8 <= len) {
-            pkt[transport_start + 6] = 0;
-            pkt[transport_start + 7] = 0;
-        }
-
-        @memcpy(pkt[26..30], &wan_ip);
-        writeU16Be(pkt[transport_start..][0..2], nat_entry.wan_port);
-
-        pkt[24] = 0;
-        pkt[25] = 0;
-        const ip_cs = computeChecksum(pkt[14..][0..ip_hdr_len]);
-        pkt[24] = @truncate(ip_cs >> 8);
-        pkt[25] = @truncate(ip_cs);
-
-        wan_stats.tx_packets += 1;
-        wan_stats.tx_bytes += len;
-        _ = wan_chan.send(pkt[0..len]);
-    }
-}
-
-fn natForwardWanToLan(pkt: []u8, len: u32) void {
-    if (len < 34) return;
-
-    var dst_ip: [4]u8 = undefined;
-    @memcpy(&dst_ip, pkt[30..34]);
-    if (!eql(&dst_ip, &wan_ip)) return;
-
-    const protocol = pkt[23];
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
-
-    if (protocol == 1) {
-        const icmp_start = 14 + ip_hdr_len;
-        if (icmp_start + 8 > len) return;
-        if (pkt[icmp_start] != 0) return;
-
-        const reply_id = readU16Be(pkt[icmp_start + 4 ..][0..2]);
-        const nat_entry = natLookupInbound(.icmp, reply_id) orelse return;
-
-        const dst_mac = arpLookup(&lan_arp, nat_entry.lan_ip) orelse return;
-
-        @memcpy(pkt[0..6], &dst_mac);
-        @memcpy(pkt[6..12], &lan_mac);
-        @memcpy(pkt[30..34], &nat_entry.lan_ip);
-        writeU16Be(pkt[icmp_start + 4 ..][0..2], nat_entry.lan_port);
-
-        pkt[icmp_start + 2] = 0;
-        pkt[icmp_start + 3] = 0;
-        const icmp_cs = computeChecksum(pkt[icmp_start..len]);
-        pkt[icmp_start + 2] = @truncate(icmp_cs >> 8);
-        pkt[icmp_start + 3] = @truncate(icmp_cs);
-
-        pkt[24] = 0;
-        pkt[25] = 0;
-        const ip_cs = computeChecksum(pkt[14..][0..ip_hdr_len]);
-        pkt[24] = @truncate(ip_cs >> 8);
-        pkt[25] = @truncate(ip_cs);
-
-        if (lan_chan) |*ch| {
-            _ = ch.send(pkt[0..len]);
-        }
-    } else if (protocol == 6 or protocol == 17) {
-        const transport_start = 14 + ip_hdr_len;
-        if (transport_start + 4 > len) return;
-
-        const dst_port = readU16Be(pkt[transport_start + 2 ..][0..2]);
-        const proto: Protocol = if (protocol == 6) .tcp else .udp;
-        const nat_entry = natLookupInbound(proto, dst_port) orelse return;
-
-        if (protocol == 6) {
-            natUpdateTcpState(nat_entry, pkt, len, transport_start);
-        }
-
-        const dst_mac = arpLookup(&lan_arp, nat_entry.lan_ip) orelse return;
-
-        @memcpy(pkt[0..6], &dst_mac);
-        @memcpy(pkt[6..12], &lan_mac);
-
-        var old_dst_ip: [4]u8 = undefined;
-        @memcpy(&old_dst_ip, pkt[30..34]);
-
-        if (protocol == 6) {
-            tcpChecksumAdjust(pkt, transport_start, len, old_dst_ip, nat_entry.lan_ip, dst_port, nat_entry.lan_port);
-        } else if (transport_start + 8 <= len) {
-            pkt[transport_start + 6] = 0;
-            pkt[transport_start + 7] = 0;
-        }
-
-        @memcpy(pkt[30..34], &nat_entry.lan_ip);
-        writeU16Be(pkt[transport_start + 2 ..][0..2], nat_entry.lan_port);
-
-        pkt[24] = 0;
-        pkt[25] = 0;
-        const ip_cs = computeChecksum(pkt[14..][0..ip_hdr_len]);
-        pkt[24] = @truncate(ip_cs >> 8);
-        pkt[25] = @truncate(ip_cs);
-
-        lan_stats.tx_packets += 1;
-        lan_stats.tx_bytes += len;
-        if (lan_chan) |*ch| {
-            _ = ch.send(pkt[0..len]);
-        }
-    }
-}
-
-// ── DHCP client (WAN side) ───────────────────────────────────────────────
-
-const DhcpClientState = enum { idle, discovering, requesting, bound };
-
-var dhcp_client_state: DhcpClientState = .idle;
-var dhcp_client_xid: u32 = 0x5A470001;
-var dhcp_server_ip: [4]u8 = .{ 0, 0, 0, 0 };
-var dhcp_offered_ip: [4]u8 = .{ 0, 0, 0, 0 };
-var dhcp_client_start_ns: u64 = 0;
-var wan_ip_static: bool = true;
-
-fn dhcpClientSendDiscover() void {
-    var pkt: [600]u8 = undefined;
-    @memset(&pkt, 0);
-
-    @memset(pkt[0..6], 0xFF);
-    @memcpy(pkt[6..12], &wan_mac);
-    pkt[12] = 0x08;
-    pkt[13] = 0x00;
-
-    pkt[14] = 0x45;
-    pkt[22] = 64;
-    pkt[23] = 17;
-    @memset(pkt[26..30], 0);
-    @memset(pkt[30..34], 0xFF);
-
-    const udp_start: usize = 34;
-    writeU16Be(pkt[udp_start..][0..2], 68);
-    writeU16Be(pkt[udp_start + 2 ..][0..2], 67);
-
-    const dhcp_start: usize = udp_start + 8;
-    pkt[dhcp_start] = 1;
-    pkt[dhcp_start + 1] = 1;
-    pkt[dhcp_start + 2] = 6;
-    pkt[dhcp_start + 3] = 0;
-
-    pkt[dhcp_start + 4] = @truncate(dhcp_client_xid >> 24);
-    pkt[dhcp_start + 5] = @truncate(dhcp_client_xid >> 16);
-    pkt[dhcp_start + 6] = @truncate(dhcp_client_xid >> 8);
-    pkt[dhcp_start + 7] = @truncate(dhcp_client_xid);
-
-    @memcpy(pkt[dhcp_start + 28 ..][0..6], &wan_mac);
-
-    const magic: usize = dhcp_start + 236;
-    pkt[magic] = 0x63;
-    pkt[magic + 1] = 0x82;
-    pkt[magic + 2] = 0x53;
-    pkt[magic + 3] = 0x63;
-
-    var opt: usize = magic + 4;
-    pkt[opt] = 53;
-    pkt[opt + 1] = 1;
-    pkt[opt + 2] = DHCP_DISCOVER;
-    opt += 3;
-    pkt[opt] = 255;
-    opt += 1;
-
-    const total_dhcp = opt - dhcp_start;
-    const udp_len: u16 = @truncate(8 + total_dhcp);
-    writeU16Be(pkt[udp_start + 4 ..][0..2], udp_len);
-    const ip_total: u16 = @truncate(20 + udp_len);
-    writeU16Be(pkt[16..18], ip_total);
-
-    pkt[24] = 0;
-    pkt[25] = 0;
-    const ip_cs = computeChecksum(pkt[14..34]);
-    pkt[24] = @truncate(ip_cs >> 8);
-    pkt[25] = @truncate(ip_cs);
-
-    const send_len = @max(@as(usize, @intCast(14 + ip_total)), 60);
-    _ = wan_chan.send(pkt[0..send_len]);
-    dhcp_client_state = .discovering;
-    dhcp_client_start_ns = now();
-    logEvent("dhcp-client: sent DISCOVER on WAN\n");
-}
-
-fn dhcpClientSendRequest() void {
-    var pkt: [600]u8 = undefined;
-    @memset(&pkt, 0);
-
-    @memset(pkt[0..6], 0xFF);
-    @memcpy(pkt[6..12], &wan_mac);
-    pkt[12] = 0x08;
-    pkt[13] = 0x00;
-
-    pkt[14] = 0x45;
-    pkt[22] = 64;
-    pkt[23] = 17;
-    @memset(pkt[26..30], 0);
-    @memset(pkt[30..34], 0xFF);
-
-    const udp_start: usize = 34;
-    writeU16Be(pkt[udp_start..][0..2], 68);
-    writeU16Be(pkt[udp_start + 2 ..][0..2], 67);
-
-    const dhcp_start: usize = udp_start + 8;
-    pkt[dhcp_start] = 1;
-    pkt[dhcp_start + 1] = 1;
-    pkt[dhcp_start + 2] = 6;
-    pkt[dhcp_start + 3] = 0;
-    pkt[dhcp_start + 4] = @truncate(dhcp_client_xid >> 24);
-    pkt[dhcp_start + 5] = @truncate(dhcp_client_xid >> 16);
-    pkt[dhcp_start + 6] = @truncate(dhcp_client_xid >> 8);
-    pkt[dhcp_start + 7] = @truncate(dhcp_client_xid);
-    @memcpy(pkt[dhcp_start + 28 ..][0..6], &wan_mac);
-
-    const magic: usize = dhcp_start + 236;
-    pkt[magic] = 0x63;
-    pkt[magic + 1] = 0x82;
-    pkt[magic + 2] = 0x53;
-    pkt[magic + 3] = 0x63;
-
-    var opt: usize = magic + 4;
-    pkt[opt] = 53;
-    pkt[opt + 1] = 1;
-    pkt[opt + 2] = DHCP_REQUEST;
-    opt += 3;
-
-    pkt[opt] = 50;
-    pkt[opt + 1] = 4;
-    @memcpy(pkt[opt + 2 ..][0..4], &dhcp_offered_ip);
-    opt += 6;
-
-    pkt[opt] = 54;
-    pkt[opt + 1] = 4;
-    @memcpy(pkt[opt + 2 ..][0..4], &dhcp_server_ip);
-    opt += 6;
-
-    pkt[opt] = 255;
-    opt += 1;
-
-    const total_dhcp = opt - dhcp_start;
-    const udp_len: u16 = @truncate(8 + total_dhcp);
-    writeU16Be(pkt[udp_start + 4 ..][0..2], udp_len);
-    const ip_total: u16 = @truncate(20 + udp_len);
-    writeU16Be(pkt[16..18], ip_total);
-
-    pkt[24] = 0;
-    pkt[25] = 0;
-    const ip_cs = computeChecksum(pkt[14..34]);
-    pkt[24] = @truncate(ip_cs >> 8);
-    pkt[25] = @truncate(ip_cs);
-
-    const send_len = @max(@as(usize, @intCast(14 + ip_total)), 60);
-    _ = wan_chan.send(pkt[0..send_len]);
-    dhcp_client_state = .requesting;
-    dhcp_client_start_ns = now();
-    logEvent("dhcp-client: sent REQUEST on WAN\n");
-}
-
-fn handleDhcpClientResponse(pkt: []const u8, len: u32) void {
-    if (dhcp_client_state == .idle or dhcp_client_state == .bound) return;
-    if (len < 282) return;
-
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
-    const udp_start = 14 + ip_hdr_len;
-    if (udp_start + 8 > len) return;
-    if (pkt[23] != 17) return;
-
-    const src_port = readU16Be(pkt[udp_start..][0..2]);
-    const dst_port = readU16Be(pkt[udp_start + 2 ..][0..2]);
-    if (src_port != 67 or dst_port != 68) return;
-
-    const dhcp_start = udp_start + 8;
-    if (dhcp_start + 240 > len) return;
-    if (pkt[dhcp_start] != 2) return;
-
-    const xid = @as(u32, pkt[dhcp_start + 4]) << 24 |
-        @as(u32, pkt[dhcp_start + 5]) << 16 |
-        @as(u32, pkt[dhcp_start + 6]) << 8 |
-        pkt[dhcp_start + 7];
-    if (xid != dhcp_client_xid) return;
-
-    @memcpy(&dhcp_offered_ip, pkt[dhcp_start + 16 ..][0..4]);
-
-    const magic_offset = dhcp_start + 236;
-    if (pkt[magic_offset] != 0x63 or pkt[magic_offset + 1] != 0x82 or
-        pkt[magic_offset + 2] != 0x53 or pkt[magic_offset + 3] != 0x63) return;
-
-    var msg_type: u8 = 0;
-    var opt_idx: u32 = magic_offset + 4;
-    while (opt_idx + 1 < len) {
-        const o = pkt[opt_idx];
-        if (o == 255) break;
-        if (o == 0) {
-            opt_idx += 1;
-            continue;
-        }
-        const olen = pkt[opt_idx + 1];
-        if (o == 53 and olen >= 1) msg_type = pkt[opt_idx + 2];
-        if (o == 54 and olen >= 4) @memcpy(&dhcp_server_ip, pkt[opt_idx + 2 ..][0..4]);
-        if (o == 6 and olen >= 4) @memcpy(&upstream_dns, pkt[opt_idx + 2 ..][0..4]);
-        opt_idx += 2 + olen;
-    }
-
-    if (msg_type == DHCP_OFFER and dhcp_client_state == .discovering) {
-        var buf: [64]u8 = undefined;
-        var pos: usize = 0;
-        pos = appendStr(&buf, pos, "dhcp-client: offered ");
-        pos = appendIp(&buf, pos, dhcp_offered_ip);
-        pos = appendStr(&buf, pos, "\n");
-        logEvent(buf[0..pos]);
-        dhcpClientSendRequest();
-    } else if (msg_type == DHCP_ACK and dhcp_client_state == .requesting) {
-        wan_ip = dhcp_offered_ip;
-        dhcp_client_state = .bound;
-        var buf: [64]u8 = undefined;
-        var pos: usize = 0;
-        pos = appendStr(&buf, pos, "dhcp-client: bound to ");
-        pos = appendIp(&buf, pos, wan_ip);
-        pos = appendStr(&buf, pos, "\n");
-        logEvent(buf[0..pos]);
-    }
-}
-
-fn dhcpClientTick() void {
-    if (dhcp_client_state == .idle or dhcp_client_state == .bound) return;
-    if (now() -| dhcp_client_start_ns > 10_000_000_000) {
-        logEvent("dhcp-client: timeout, retrying\n");
-        dhcp_client_xid +%= 1;
-        dhcpClientSendDiscover();
-    }
-}
-
-// ── IP fragment tracking ────────────────────────────────────────────────
-
-const FRAG_TABLE_SIZE = 16;
-
-const FragEntry = struct {
-    valid: bool,
-    src_ip: [4]u8,
-    dst_ip: [4]u8,
-    ip_id: u16,
-    protocol: u8,
-    first_frag_sport: u16,
-    timestamp_ns: u64,
-};
-
-const empty_frag = FragEntry{
-    .valid = false, .src_ip = .{ 0, 0, 0, 0 }, .dst_ip = .{ 0, 0, 0, 0 },
-    .ip_id = 0, .protocol = 0, .first_frag_sport = 0, .timestamp_ns = 0,
-};
-var frag_table: [FRAG_TABLE_SIZE]FragEntry = [_]FragEntry{empty_frag} ** FRAG_TABLE_SIZE;
-
-fn fragLearn(src_ip: [4]u8, dst_ip: [4]u8, ip_id: u16, protocol: u8, sport: u16) void {
-    for (&frag_table) |*f| {
-        if (f.valid and f.ip_id == ip_id and eql(&f.src_ip, &src_ip)) {
-            f.timestamp_ns = now();
-            return;
-        }
-    }
-    for (&frag_table) |*f| {
-        if (!f.valid) {
-            f.* = .{ .valid = true, .src_ip = src_ip, .dst_ip = dst_ip,
-                .ip_id = ip_id, .protocol = protocol, .first_frag_sport = sport, .timestamp_ns = now() };
-            return;
-        }
-    }
-    frag_table[0] = .{ .valid = true, .src_ip = src_ip, .dst_ip = dst_ip,
-        .ip_id = ip_id, .protocol = protocol, .first_frag_sport = sport, .timestamp_ns = now() };
-}
-
-fn fragLookup(src_ip: [4]u8, ip_id: u16) ?u16 {
-    for (&frag_table) |*f| {
-        if (f.valid and f.ip_id == ip_id and eql(&f.src_ip, &src_ip)) {
-            f.timestamp_ns = now();
-            return f.first_frag_sport;
-        }
-    }
-    return null;
-}
-
-fn fragExpire() void {
-    const ts = now();
-    for (&frag_table) |*f| {
-        if (f.valid and ts -| f.timestamp_ns > 30_000_000_000) {
-            f.valid = false;
-        }
-    }
-}
-
 // ── Periodic maintenance ────────────────────────────────────────────────
 
-var last_maintenance_ns: u64 = 0;
-const MAINTENANCE_INTERVAL_NS: u64 = 10_000_000_000;
+fn periodicMaintenance(ctx: *RouterContext) void {
+    const ts = util.now();
+    if (ts -| ctx.last_maintenance_ns < MAINTENANCE_INTERVAL_NS) return;
+    ctx.last_maintenance_ns = ts;
 
-fn periodicMaintenance() void {
-    const ts = now();
-    if (ts -| last_maintenance_ns < MAINTENANCE_INTERVAL_NS) return;
-    last_maintenance_ns = ts;
-
-    arpExpire(&wan_arp);
-    arpExpire(&lan_arp);
-    natExpire();
-    fragExpire();
-    dhcpClientTick();
+    arp.expire(&ctx.wan_arp);
+    arp.expire(&ctx.lan_arp);
+    nat.expire(&ctx.nat_table);
+    frag.expire(&ctx.frag_table);
+    dhcp_client.tick(ctx);
 }
 
 // ── Packet dispatch ─────────────────────────────────────────────────────
 
-fn processPacket(iface: Interface, pkt: []u8, len: u32) void {
+fn processPacket(ctx: *RouterContext, iface: Interface, pkt: []u8, len: u32) void {
     if (len < 14) return;
 
-    const stats = ifaceStats(iface);
+    const stats = ctx.ifaceStats(iface);
     stats.rx_packets += 1;
     stats.rx_bytes += len;
 
-    const ethertype = readU16Be(pkt[12..14]);
+    const ethertype = util.readU16Be(pkt[12..14]);
 
     if (ethertype == 0x0806) {
         if (len >= 42) {
@@ -1623,19 +206,19 @@ fn processPacket(iface: Interface, pkt: []u8, len: u32) void {
             var sender_ip: [4]u8 = undefined;
             @memcpy(&sender_mac, pkt[22..28]);
             @memcpy(&sender_ip, pkt[28..32]);
-            arpLearn(arpTable(iface), sender_ip, sender_mac);
+            arp.learn(ctx.arpTable(iface), sender_ip, sender_mac);
 
-            if (ping_state == .arp_pending and ping_iface == iface) {
-                if (arpLookup(arpTable(iface), ping_target_ip)) |mac| {
-                    @memcpy(&ping_target_mac, &mac);
-                    sendEchoRequest();
+            if (ctx.ping_state == .arp_pending and ctx.ping_iface == iface) {
+                if (arp.lookup(ctx.arpTable(iface), ctx.ping_target_ip)) |mac| {
+                    @memcpy(&ctx.ping_target_mac, &mac);
+                    ping_mod.sendEchoRequest(ctx);
                 }
             }
         }
-        if (handleArp(iface, pkt, len)) |reply| {
+        if (arp.handle(ctx, iface, pkt, len)) |reply| {
             stats.tx_packets += 1;
             stats.tx_bytes += reply.len;
-            _ = ifaceChan(iface).send(reply);
+            _ = ctx.ifaceChan(iface).send(reply);
         }
     } else if (ethertype == 0x0800 and len >= 34) {
         var src_ip_fw: [4]u8 = undefined;
@@ -1648,10 +231,10 @@ fn processPacket(iface: Interface, pkt: []u8, len: u32) void {
                 const ip_hdr_len_fw: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
                 const ts_fw = 14 + ip_hdr_len_fw;
                 if (ts_fw + 4 <= len) {
-                    dst_port_fw = readU16Be(pkt[ts_fw + 2 ..][0..2]);
+                    dst_port_fw = util.readU16Be(pkt[ts_fw + 2 ..][0..2]);
                 }
             }
-            if (firewallCheck(src_ip_fw, protocol_fw, dst_port_fw) == .block) {
+            if (firewall.check(&ctx.firewall_rules, src_ip_fw, protocol_fw, dst_port_fw) == .block) {
                 stats.rx_dropped += 1;
                 return;
             }
@@ -1660,137 +243,137 @@ fn processPacket(iface: Interface, pkt: []u8, len: u32) void {
         var dst_ip: [4]u8 = undefined;
         @memcpy(&dst_ip, pkt[30..34]);
 
-        const my_ip = ifaceIp(iface);
+        const my_ip = ctx.ifaceIp(iface);
         const is_broadcast = dst_ip[0] == 255 and dst_ip[1] == 255 and dst_ip[2] == 255 and dst_ip[3] == 255;
-        const is_for_me = eql(&dst_ip, my_ip) or eql(&dst_ip, &lan_broadcast) or is_broadcast;
+        const is_for_me = util.eql(&dst_ip, my_ip) or util.eql(&dst_ip, &lan_broadcast) or is_broadcast;
 
         if (is_for_me) {
             if (pkt[23] == 17) {
                 const ip_hdr_len_dhcp: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
                 const udp_start_dhcp = 14 + ip_hdr_len_dhcp;
                 if (udp_start_dhcp + 4 <= len) {
-                    const udp_dst = readU16Be(pkt[udp_start_dhcp + 2 ..][0..2]);
+                    const udp_dst = util.readU16Be(pkt[udp_start_dhcp + 2 ..][0..2]);
                     if (udp_dst == 68 and iface == .wan) {
-                        handleDhcpClientResponse(pkt, len);
+                        dhcp_client.handleResponse(ctx, pkt, len);
                         return;
                     }
                     if (udp_dst == 67 and iface == .lan) {
-                        handleDhcpServer(pkt, len);
+                        dhcp_server.handle(ctx, pkt, len);
                         return;
                     }
-                    if (udp_dst == DNS_PORT) {
+                    if (udp_dst == dns.DNS_PORT) {
                         if (iface == .lan) {
-                            handleDnsFromLan(pkt, len);
+                            dns.handleFromLan(ctx, pkt, len);
                         }
                         return;
                     }
                 }
             }
-            handleEchoReply(pkt, len);
-            if (handleIcmp(iface, pkt, len)) |reply| {
+            ping_mod.handleEchoReply(ctx, pkt, len);
+            if (handleIcmp(ctx, iface, pkt, len)) |reply| {
                 stats.tx_packets += 1;
                 stats.tx_bytes += reply.len;
-                _ = ifaceChan(iface).send(reply);
-            } else if (iface == .wan and has_lan) {
-                natForwardWanToLan(pkt, len);
+                _ = ctx.ifaceChan(iface).send(reply);
+            } else if (iface == .wan and ctx.has_lan) {
+                nat.forwardWanToLan(ctx, pkt, len);
             }
-        } else if (iface == .wan and has_lan) {
+        } else if (iface == .wan and ctx.has_lan) {
             if (pkt[23] == 17) {
                 const ip_hdr_len_dns: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
                 const udp_start_dns = 14 + ip_hdr_len_dns;
                 if (udp_start_dns + 4 <= len) {
-                    const udp_src_dns = readU16Be(pkt[udp_start_dns..][0..2]);
-                    if (udp_src_dns == DNS_PORT) {
-                        handleDnsFromWan(pkt, len);
+                    const udp_src_dns = util.readU16Be(pkt[udp_start_dns..][0..2]);
+                    if (udp_src_dns == dns.DNS_PORT) {
+                        dns.handleFromWan(ctx, pkt, len);
                         return;
                     }
                 }
             }
-            if (handlePortForward(pkt, len)) return;
-            natForwardWanToLan(pkt, len);
-        } else if (iface == .lan and has_wan) {
+            if (firewall.handlePortForward(ctx, pkt, len)) return;
+            nat.forwardWanToLan(ctx, pkt, len);
+        } else if (iface == .lan and ctx.has_wan) {
             if (pkt[23] == 17) {
                 const ip_hdr_len_dns2: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
                 const udp_start_dns2 = 14 + ip_hdr_len_dns2;
                 if (udp_start_dns2 + 4 <= len) {
-                    const udp_dst_dns = readU16Be(pkt[udp_start_dns2 + 2 ..][0..2]);
-                    if (udp_dst_dns == DNS_PORT) {
-                        handleDnsFromLan(pkt, len);
+                    const udp_dst_dns = util.readU16Be(pkt[udp_start_dns2 + 2 ..][0..2]);
+                    if (udp_dst_dns == dns.DNS_PORT) {
+                        dns.handleFromLan(ctx, pkt, len);
                         return;
                     }
                 }
             }
-            natForwardLanToWan(pkt, len);
+            nat.forwardLanToWan(ctx, pkt, len);
         }
     }
 }
 
 // ── Console commands ────────────────────────────────────────────────────
 
-fn handleConsoleCommand(data: []const u8) void {
-    var chan = &(console_chan orelse return);
-    if (eql(data, "status")) {
+fn handleConsoleCommand(ctx: *RouterContext, data: []const u8) void {
+    var chan = &(ctx.console_chan orelse return);
+    if (util.eql(data, "status")) {
         var resp: [256]u8 = undefined;
         var pos: usize = 0;
-        pos = appendStr(&resp, pos, "WAN: ");
-        pos = appendIp(&resp, pos, wan_ip);
-        pos = appendStr(&resp, pos, " (");
-        pos = appendMac(&resp, pos, wan_mac);
-        pos = appendStr(&resp, pos, ")");
-        if (has_lan) {
-            pos = appendStr(&resp, pos, "\nLAN: ");
-            pos = appendIp(&resp, pos, lan_ip);
-            pos = appendStr(&resp, pos, " (");
-            pos = appendMac(&resp, pos, lan_mac);
-            pos = appendStr(&resp, pos, ")");
+        pos = util.appendStr(&resp, pos, "WAN: ");
+        pos = util.appendIp(&resp, pos, ctx.wan_ip);
+        pos = util.appendStr(&resp, pos, " (");
+        pos = util.appendMac(&resp, pos, ctx.wan_mac);
+        pos = util.appendStr(&resp, pos, ")");
+        if (ctx.has_lan) {
+            pos = util.appendStr(&resp, pos, "\nLAN: ");
+            pos = util.appendIp(&resp, pos, ctx.lan_ip);
+            pos = util.appendStr(&resp, pos, " (");
+            pos = util.appendMac(&resp, pos, ctx.lan_mac);
+            pos = util.appendStr(&resp, pos, ")");
         }
         _ = chan.send(resp[0..pos]);
-    } else if (startsWith(data, "ping ")) {
-        if (ping_state != .idle) {
+    } else if (util.startsWith(data, "ping ")) {
+        if (ctx.ping_state != .idle) {
             _ = chan.send("ping: already in progress");
             return;
         }
-        if (parseIp(data[5..])) |ip| {
-            ping_target_ip = ip;
-            ping_seq = 0;
-            ping_count = 0;
-            ping_received = 0;
-            ping_iface = if (isInLanSubnet(ip)) .lan else .wan;
+        if (util.parseIp(data[5..])) |ip| {
+            ctx.ping_target_ip = ip;
+            ctx.ping_seq = 0;
+            ctx.ping_count = 0;
+            ctx.ping_received = 0;
+            ctx.ping_iface = if (isInLanSubnet(ip)) .lan else .wan;
 
-            if (arpLookup(arpTable(ping_iface), ip)) |mac| {
-                @memcpy(&ping_target_mac, &mac);
-                sendEchoRequest();
+            if (arp.lookup(ctx.arpTable(ctx.ping_iface), ip)) |mac| {
+                @memcpy(&ctx.ping_target_mac, &mac);
+                ping_mod.sendEchoRequest(ctx);
             } else {
-                ping_state = .arp_pending;
-                ping_start_ns = now();
-                sendArpRequestOn(ping_iface, ip);
+                ctx.ping_state = .arp_pending;
+                ctx.ping_start_ns = util.now();
+                arp.sendRequest(ctx, ctx.ping_iface, ip);
             }
         } else {
             _ = chan.send("ping: invalid IP address");
         }
-    } else if (eql(data, "arp")) {
+    } else if (util.eql(data, "arp")) {
         var resp: [512]u8 = undefined;
         var pos: usize = 0;
         var count: u32 = 0;
 
-        pos = appendStr(&resp, pos, "WAN ARP:");
-        for (&wan_arp) |*e| {
+        pos = util.appendStr(&resp, pos, "WAN ARP:");
+        for (&ctx.wan_arp) |*e| {
             if (e.valid) {
-                pos = appendStr(&resp, pos, "\n  ");
-                pos = appendIp(&resp, pos, e.ip);
-                pos = appendStr(&resp, pos, " -> ");
-                pos = appendMac(&resp, pos, e.mac);
+                pos = util.appendStr(&resp, pos, "\n  ");
+                pos = util.appendIp(&resp, pos, e.ip);
+                pos = util.appendStr(&resp, pos, " -> ");
+                pos = util.appendMac(&resp, pos, e.mac);
                 count += 1;
             }
         }
-        if (has_lan) {
-            pos = appendStr(&resp, pos, "\nLAN ARP:");
-            for (&lan_arp) |*e| {
+        if (ctx.has_lan) {
+            pos = util.appendStr(&resp, pos, "\nLAN ARP:");
+            for (&ctx.lan_arp) |*e| {
                 if (e.valid) {
-                    pos = appendStr(&resp, pos, "\n  ");
-                    pos = appendIp(&resp, pos, e.ip);
-                    pos = appendStr(&resp, pos, " -> ");
-                    pos = appendMac(&resp, pos, e.mac);
+                    pos = util.appendStr(&resp, pos, "\n  ");
+                    pos = util.appendIp(&resp, pos, e.ip);
+                    pos = util.appendStr(&resp, pos, " -> ");
+                    pos = util.appendMac(&resp, pos, e.mac);
                     count += 1;
                 }
             }
@@ -1798,15 +381,15 @@ fn handleConsoleCommand(data: []const u8) void {
         _ = chan.send(resp[0..pos]);
         var summary: [64]u8 = undefined;
         var spos: usize = 0;
-        spos = appendStr(&summary, spos, "--- ");
-        spos = appendDec(&summary, spos, count);
-        spos = appendStr(&summary, spos, " entries ---");
+        spos = util.appendStr(&summary, spos, "--- ");
+        spos = util.appendDec(&summary, spos, count);
+        spos = util.appendStr(&summary, spos, " entries ---");
         _ = chan.send(summary[0..spos]);
-    } else if (eql(data, "nat")) {
+    } else if (util.eql(data, "nat")) {
         var resp: [512]u8 = undefined;
         var pos: usize = 0;
         var count: u32 = 0;
-        for (&nat_table) |*e| {
+        for (&ctx.nat_table) |*e| {
             if (e.valid) {
                 if (count > 0 and pos < resp.len - 1) {
                     resp[pos] = '\n';
@@ -1817,13 +400,13 @@ fn handleConsoleCommand(data: []const u8) void {
                     .tcp => "tcp",
                     .udp => "udp",
                 };
-                pos = appendStr(&resp, pos, proto_str);
-                pos = appendStr(&resp, pos, " ");
-                pos = appendIp(&resp, pos, e.lan_ip);
-                pos = appendStr(&resp, pos, ":");
-                pos = appendDec(&resp, pos, e.lan_port);
-                pos = appendStr(&resp, pos, " -> :");
-                pos = appendDec(&resp, pos, e.wan_port);
+                pos = util.appendStr(&resp, pos, proto_str);
+                pos = util.appendStr(&resp, pos, " ");
+                pos = util.appendIp(&resp, pos, e.lan_ip);
+                pos = util.appendStr(&resp, pos, ":");
+                pos = util.appendDec(&resp, pos, e.lan_port);
+                pos = util.appendStr(&resp, pos, " -> :");
+                pos = util.appendDec(&resp, pos, e.wan_port);
                 count += 1;
             }
         }
@@ -1834,23 +417,23 @@ fn handleConsoleCommand(data: []const u8) void {
         }
         var summary: [64]u8 = undefined;
         var spos: usize = 0;
-        spos = appendStr(&summary, spos, "--- ");
-        spos = appendDec(&summary, spos, count);
-        spos = appendStr(&summary, spos, " NAT entries ---");
+        spos = util.appendStr(&summary, spos, "--- ");
+        spos = util.appendDec(&summary, spos, count);
+        spos = util.appendStr(&summary, spos, " NAT entries ---");
         _ = chan.send(summary[0..spos]);
-    } else if (eql(data, "leases")) {
+    } else if (util.eql(data, "leases")) {
         var resp: [512]u8 = undefined;
         var pos: usize = 0;
         var count: u32 = 0;
-        for (&dhcp_leases) |*l| {
+        for (&ctx.dhcp_leases) |*l| {
             if (l.valid) {
                 if (count > 0 and pos < resp.len - 1) {
                     resp[pos] = '\n';
                     pos += 1;
                 }
-                pos = appendMac(&resp, pos, l.mac);
-                pos = appendStr(&resp, pos, " -> ");
-                pos = appendIp(&resp, pos, l.ip);
+                pos = util.appendMac(&resp, pos, l.mac);
+                pos = util.appendStr(&resp, pos, " -> ");
+                pos = util.appendIp(&resp, pos, l.ip);
                 count += 1;
             }
         }
@@ -1861,54 +444,52 @@ fn handleConsoleCommand(data: []const u8) void {
         }
         var summary: [64]u8 = undefined;
         var spos: usize = 0;
-        spos = appendStr(&summary, spos, "--- ");
-        spos = appendDec(&summary, spos, count);
-        spos = appendStr(&summary, spos, " leases ---");
+        spos = util.appendStr(&summary, spos, "--- ");
+        spos = util.appendDec(&summary, spos, count);
+        spos = util.appendStr(&summary, spos, " leases ---");
         _ = chan.send(summary[0..spos]);
-    } else if (eql(data, "ifstat")) {
+    } else if (util.eql(data, "ifstat")) {
         var resp: [512]u8 = undefined;
         var pos: usize = 0;
-        pos = appendStr(&resp, pos, "WAN: rx=");
-        pos = appendDec(&resp, pos, wan_stats.rx_packets);
-        pos = appendStr(&resp, pos, " (");
-        pos = appendDec(&resp, pos, wan_stats.rx_bytes);
-        pos = appendStr(&resp, pos, "B) tx=");
-        pos = appendDec(&resp, pos, wan_stats.tx_packets);
-        pos = appendStr(&resp, pos, " (");
-        pos = appendDec(&resp, pos, wan_stats.tx_bytes);
-        pos = appendStr(&resp, pos, "B) drop=");
-        pos = appendDec(&resp, pos, wan_stats.rx_dropped);
-        if (has_lan) {
-            pos = appendStr(&resp, pos, "\nLAN: rx=");
-            pos = appendDec(&resp, pos, lan_stats.rx_packets);
-            pos = appendStr(&resp, pos, " (");
-            pos = appendDec(&resp, pos, lan_stats.rx_bytes);
-            pos = appendStr(&resp, pos, "B) tx=");
-            pos = appendDec(&resp, pos, lan_stats.tx_packets);
-            pos = appendStr(&resp, pos, " (");
-            pos = appendDec(&resp, pos, lan_stats.tx_bytes);
-            pos = appendStr(&resp, pos, "B) drop=");
-            pos = appendDec(&resp, pos, lan_stats.rx_dropped);
+        pos = util.appendStr(&resp, pos, "WAN: rx=");
+        pos = util.appendDec(&resp, pos, ctx.wan_stats.rx_packets);
+        pos = util.appendStr(&resp, pos, " (");
+        pos = util.appendDec(&resp, pos, ctx.wan_stats.rx_bytes);
+        pos = util.appendStr(&resp, pos, "B) tx=");
+        pos = util.appendDec(&resp, pos, ctx.wan_stats.tx_packets);
+        pos = util.appendStr(&resp, pos, " (");
+        pos = util.appendDec(&resp, pos, ctx.wan_stats.tx_bytes);
+        pos = util.appendStr(&resp, pos, "B) drop=");
+        pos = util.appendDec(&resp, pos, ctx.wan_stats.rx_dropped);
+        if (ctx.has_lan) {
+            pos = util.appendStr(&resp, pos, "\nLAN: rx=");
+            pos = util.appendDec(&resp, pos, ctx.lan_stats.rx_packets);
+            pos = util.appendStr(&resp, pos, " (");
+            pos = util.appendDec(&resp, pos, ctx.lan_stats.rx_bytes);
+            pos = util.appendStr(&resp, pos, "B) tx=");
+            pos = util.appendDec(&resp, pos, ctx.lan_stats.tx_packets);
+            pos = util.appendStr(&resp, pos, " (");
+            pos = util.appendDec(&resp, pos, ctx.lan_stats.tx_bytes);
+            pos = util.appendStr(&resp, pos, "B) drop=");
+            pos = util.appendDec(&resp, pos, ctx.lan_stats.rx_dropped);
         }
         _ = chan.send(resp[0..pos]);
-    } else if (startsWith(data, "forward ")) {
-        // format: forward <proto> <wan_port> <lan_ip> <lan_port>
-        // example: forward tcp 80 192.168.1.100 8080
+    } else if (util.startsWith(data, "forward ")) {
         const args = data[8..];
-        var proto: Protocol = .tcp;
+        var proto: util.Protocol = .tcp;
         var rest = args;
-        if (startsWith(rest, "tcp ")) {
+        if (util.startsWith(rest, "tcp ")) {
             proto = .tcp;
             rest = rest[4..];
-        } else if (startsWith(rest, "udp ")) {
+        } else if (util.startsWith(rest, "udp ")) {
             proto = .udp;
             rest = rest[4..];
         } else {
             _ = chan.send("forward: usage: forward <tcp|udp> <wan_port> <lan_ip> <lan_port>");
             return;
         }
-        if (parsePortIpPort(rest)) |result| {
-            if (portFwdAdd(proto, result.port1, result.ip, result.port2)) {
+        if (util.parsePortIpPort(rest)) |result| {
+            if (firewall.portFwdAdd(&ctx.port_forwards, proto, result.port1, result.ip, result.port2)) {
                 _ = chan.send("forward: rule added");
             } else {
                 _ = chan.send("forward: table full");
@@ -1916,9 +497,9 @@ fn handleConsoleCommand(data: []const u8) void {
         } else {
             _ = chan.send("forward: invalid arguments");
         }
-    } else if (startsWith(data, "block ")) {
-        if (parseIp(data[6..])) |ip| {
-            for (&firewall_rules) |*r| {
+    } else if (util.startsWith(data, "block ")) {
+        if (util.parseIp(data[6..])) |ip| {
+            for (&ctx.firewall_rules) |*r| {
                 if (!r.valid) {
                     r.* = .{
                         .valid = true, .action = .block,
@@ -1933,9 +514,9 @@ fn handleConsoleCommand(data: []const u8) void {
         } else {
             _ = chan.send("block: invalid IP");
         }
-    } else if (startsWith(data, "allow ")) {
-        if (parseIp(data[6..])) |ip| {
-            for (&firewall_rules) |*r| {
+    } else if (util.startsWith(data, "allow ")) {
+        if (util.parseIp(data[6..])) |ip| {
+            for (&ctx.firewall_rules) |*r| {
                 if (r.valid and r.src_ip[0] == ip[0] and r.src_ip[1] == ip[1] and
                     r.src_ip[2] == ip[2] and r.src_ip[3] == ip[3])
                 {
@@ -1948,74 +529,74 @@ fn handleConsoleCommand(data: []const u8) void {
         } else {
             _ = chan.send("allow: invalid IP");
         }
-    } else if (eql(data, "rules")) {
+    } else if (util.eql(data, "rules")) {
         var resp: [512]u8 = undefined;
         var pos: usize = 0;
         var count: u32 = 0;
 
-        pos = appendStr(&resp, pos, "Firewall rules:");
-        for (&firewall_rules) |*r| {
+        pos = util.appendStr(&resp, pos, "Firewall rules:");
+        for (&ctx.firewall_rules) |*r| {
             if (r.valid) {
-                pos = appendStr(&resp, pos, "\n  ");
-                pos = appendStr(&resp, pos, if (r.action == .block) "BLOCK " else "ALLOW ");
-                pos = appendIp(&resp, pos, r.src_ip);
+                pos = util.appendStr(&resp, pos, "\n  ");
+                pos = util.appendStr(&resp, pos, if (r.action == .block) "BLOCK " else "ALLOW ");
+                pos = util.appendIp(&resp, pos, r.src_ip);
                 if (r.protocol != 0) {
-                    pos = appendStr(&resp, pos, " proto=");
-                    pos = appendDec(&resp, pos, r.protocol);
+                    pos = util.appendStr(&resp, pos, " proto=");
+                    pos = util.appendDec(&resp, pos, r.protocol);
                 }
                 if (r.dst_port != 0) {
-                    pos = appendStr(&resp, pos, " port=");
-                    pos = appendDec(&resp, pos, r.dst_port);
+                    pos = util.appendStr(&resp, pos, " port=");
+                    pos = util.appendDec(&resp, pos, r.dst_port);
                 }
                 count += 1;
             }
         }
 
-        pos = appendStr(&resp, pos, "\nPort forwards:");
-        for (&port_forwards) |*f| {
+        pos = util.appendStr(&resp, pos, "\nPort forwards:");
+        for (&ctx.port_forwards) |*f| {
             if (f.valid) {
-                pos = appendStr(&resp, pos, "\n  ");
-                pos = appendStr(&resp, pos, if (f.protocol == .tcp) "tcp" else "udp");
-                pos = appendStr(&resp, pos, " :");
-                pos = appendDec(&resp, pos, f.wan_port);
-                pos = appendStr(&resp, pos, " -> ");
-                pos = appendIp(&resp, pos, f.lan_ip);
-                pos = appendStr(&resp, pos, ":");
-                pos = appendDec(&resp, pos, f.lan_port);
+                pos = util.appendStr(&resp, pos, "\n  ");
+                pos = util.appendStr(&resp, pos, if (f.protocol == .tcp) "tcp" else "udp");
+                pos = util.appendStr(&resp, pos, " :");
+                pos = util.appendDec(&resp, pos, f.wan_port);
+                pos = util.appendStr(&resp, pos, " -> ");
+                pos = util.appendIp(&resp, pos, f.lan_ip);
+                pos = util.appendStr(&resp, pos, ":");
+                pos = util.appendDec(&resp, pos, f.lan_port);
                 count += 1;
             }
         }
         _ = chan.send(resp[0..pos]);
         var summary: [64]u8 = undefined;
         var spos: usize = 0;
-        spos = appendStr(&summary, spos, "--- ");
-        spos = appendDec(&summary, spos, count);
-        spos = appendStr(&summary, spos, " rules ---");
+        spos = util.appendStr(&summary, spos, "--- ");
+        spos = util.appendDec(&summary, spos, count);
+        spos = util.appendStr(&summary, spos, " rules ---");
         _ = chan.send(summary[0..spos]);
-    } else if (eql(data, "dhcp-client")) {
-        if (dhcp_client_state == .bound) {
+    } else if (util.eql(data, "dhcp-client")) {
+        if (ctx.dhcp_client_state == .bound) {
             var resp: [128]u8 = undefined;
             var rp: usize = 0;
-            rp = appendStr(&resp, rp, "DHCP client: bound to ");
-            rp = appendIp(&resp, rp, wan_ip);
-            rp = appendStr(&resp, rp, " (server ");
-            rp = appendIp(&resp, rp, dhcp_server_ip);
-            rp = appendStr(&resp, rp, ")");
+            rp = util.appendStr(&resp, rp, "DHCP client: bound to ");
+            rp = util.appendIp(&resp, rp, ctx.wan_ip);
+            rp = util.appendStr(&resp, rp, " (server ");
+            rp = util.appendIp(&resp, rp, ctx.dhcp_server_ip);
+            rp = util.appendStr(&resp, rp, ")");
             _ = chan.send(resp[0..rp]);
-        } else if (dhcp_client_state == .idle) {
-            wan_ip_static = false;
-            dhcpClientSendDiscover();
+        } else if (ctx.dhcp_client_state == .idle) {
+            ctx.wan_ip_static = false;
+            dhcp_client.sendDiscover(ctx);
             _ = chan.send("DHCP client: discovering...");
         } else {
             _ = chan.send("DHCP client: in progress");
         }
-    } else if (startsWith(data, "dns ")) {
-        if (parseIp(data[4..])) |ip| {
-            upstream_dns = ip;
+    } else if (util.startsWith(data, "dns ")) {
+        if (util.parseIp(data[4..])) |ip| {
+            ctx.upstream_dns = ip;
             var resp: [64]u8 = undefined;
             var pos: usize = 0;
-            pos = appendStr(&resp, pos, "DNS upstream set to ");
-            pos = appendIp(&resp, pos, ip);
+            pos = util.appendStr(&resp, pos, "DNS upstream set to ");
+            pos = util.appendIp(&resp, pos, ip);
             _ = chan.send(resp[0..pos]);
         } else {
             _ = chan.send("dns: invalid IP");
@@ -2023,29 +604,6 @@ fn handleConsoleCommand(data: []const u8) void {
     } else {
         _ = chan.send("router: unknown command");
     }
-}
-
-fn parsePortIpPort(s: []const u8) ?struct { port1: u16, ip: [4]u8, port2: u16 } {
-    var port1: u16 = 0;
-    var i: usize = 0;
-    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
-        port1 = port1 * 10 + @as(u16, s[i] - '0');
-    }
-    if (i == 0 or i >= s.len or s[i] != ' ') return null;
-    i += 1;
-
-    var ip_end = i;
-    while (ip_end < s.len and s[ip_end] != ' ') : (ip_end += 1) {}
-    const ip = parseIp(s[i..ip_end]) orelse return null;
-    if (ip_end >= s.len) return null;
-    i = ip_end + 1;
-
-    var port2: u16 = 0;
-    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
-        port2 = port2 * 10 + @as(u16, s[i] - '0');
-    }
-    if (port2 == 0) return null;
-    return .{ .port1 = port1, .ip = ip, .port2 = port2 };
 }
 
 // ── Channel setup helpers ───────────────────────────────────────────────
@@ -2125,29 +683,31 @@ pub fn main(perm_view_addr: u64) void {
         if (data_count < expected_data_shms) syscall.thread_yield();
     }
 
-    wan_chan = mapShmAsSideB(data_handles[0], data_sizes[0]) orelse {
+    var ctx = RouterContext{};
+
+    ctx.wan_chan = mapShmAsSideB(data_handles[0], data_sizes[0]) orelse {
         syscall.write("router: WAN channel open failed\n");
         return;
     };
-    has_wan = true;
+    ctx.has_wan = true;
 
-    wan_mac = waitForMac(&wan_chan);
+    ctx.wan_mac = waitForMac(&ctx.wan_chan);
     syscall.write("router: WAN MAC learned\n");
 
     if (has_lan_connection and data_count >= 2) {
         if (mapShmAsSideB(data_handles[1], data_sizes[1])) |ch| {
-            lan_chan = ch;
-            has_lan = true;
-            lan_mac = waitForMac(&(lan_chan.?));
+            ctx.lan_chan = ch;
+            ctx.has_lan = true;
+            ctx.lan_mac = waitForMac(&(ctx.lan_chan.?));
             syscall.write("router: LAN MAC learned\n");
         }
     }
 
-    sendArpRequestOn(.wan, .{ 10, 0, 2, 1 });
+    arp.sendRequest(&ctx, .wan, .{ 10, 0, 2, 1 });
     syscall.write("router: sent ARP request on WAN\n");
 
     while (true) {
-        if (console_chan == null) {
+        if (ctx.console_chan == null) {
             var shm_idx: u32 = 0;
             for (view) |*e| {
                 if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and
@@ -2164,7 +724,7 @@ pub fn main(perm_view_addr: u64) void {
                     if (con_vm.val >= 0) {
                         if (syscall.shm_map(e.handle, @intCast(con_vm.val), 0) == 0) {
                             const con_header: *channel_mod.ChannelHeader = @ptrFromInt(con_vm.val2);
-                            console_chan = channel_mod.Channel.initAsSideA(con_header, @truncate(e.field0));
+                            ctx.console_chan = channel_mod.Channel.initAsSideA(con_header, @truncate(e.field0));
                             syscall.write("router: console channel connected\n");
                         }
                     }
@@ -2173,27 +733,27 @@ pub fn main(perm_view_addr: u64) void {
             }
         }
 
-        if (console_chan) |*chan| {
+        if (ctx.console_chan) |*chan| {
             var cmd_buf: [256]u8 = undefined;
             if (chan.recv(&cmd_buf)) |len| {
-                handleConsoleCommand(cmd_buf[0..len]);
+                handleConsoleCommand(&ctx, cmd_buf[0..len]);
             }
         }
 
         var pkt_buf: [2048]u8 = undefined;
-        if (wan_chan.recv(&pkt_buf)) |len| {
-            processPacket(.wan, &pkt_buf, len);
+        if (ctx.wan_chan.recv(&pkt_buf)) |len| {
+            processPacket(&ctx, .wan, &pkt_buf, len);
         }
 
-        if (lan_chan) |*ch| {
+        if (ctx.lan_chan) |*ch| {
             var lan_pkt: [2048]u8 = undefined;
             if (ch.recv(&lan_pkt)) |len| {
-                processPacket(.lan, &lan_pkt, len);
+                processPacket(&ctx, .lan, &lan_pkt, len);
             }
         }
 
-        checkPingTimeout();
-        periodicMaintenance();
+        ping_mod.checkTimeout(&ctx);
+        periodicMaintenance(&ctx);
         syscall.thread_yield();
     }
 }

@@ -513,7 +513,9 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
     const phdr_size = @as(u64, ehdr.e_phentsize);
     const phdr_count = @as(u64, ehdr.e_phnum);
 
-    if (phdr_offset + phdr_size * phdr_count > elf_binary.len) return error.InvalidElf;
+    const phdr_total = std.math.mul(u64, phdr_size, phdr_count) catch return error.InvalidElf;
+    const phdr_end = std.math.add(u64, phdr_offset, phdr_total) catch return error.InvalidElf;
+    if (phdr_end > elf_binary.len) return error.InvalidElf;
 
     const pmm_iface = pmm.global_pmm.?.allocator();
     const rela_info = findRelaSection(elf_binary, ehdr);

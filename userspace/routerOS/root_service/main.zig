@@ -17,6 +17,7 @@ const ChildInfo = struct {
     proc_handle: u64,
     cmd_shm_handle: i64,
     cmd_channel: ?*shm_protocol.CommandChannel,
+    allowed_connections: u32,
 };
 
 var children: [MAX_CHILDREN]ChildInfo = undefined;
@@ -47,7 +48,10 @@ fn spawnChild(
     }
 
     const vm_rights = (perms.VmReservationRights{
-        .read = true, .write = true, .execute = true, .shareable = true,
+        .read = true,
+        .write = true,
+        .execute = true,
+        .shareable = true,
     }).bits();
     const vm_result = syscall.vm_reserve(0, shm_protocol.COMMAND_SHM_SIZE, vm_rights);
     if (vm_result.val < 0) return false;
@@ -70,7 +74,9 @@ fn spawnChild(
     }
 
     const grant_rights = (perms.SharedMemoryRights{
-        .read = true, .write = true, .grant = true,
+        .read = true,
+        .write = true,
+        .grant = true,
     }).bits();
     _ = syscall.grant_perm(@intCast(cmd_shm), @intCast(proc_handle), grant_rights);
 
@@ -91,6 +97,7 @@ fn spawnChild(
         .proc_handle = @intCast(proc_handle),
         .cmd_shm_handle = cmd_shm,
         .cmd_channel = cmd,
+        .allowed_connections = @intCast(allowed_connections.len),
     };
     num_children += 1;
 
@@ -164,7 +171,10 @@ fn brokerConnection(requester: *ChildInfo, target_service_id: u32) void {
     }
 
     const data_vm_rights = (perms.VmReservationRights{
-        .read = true, .write = true, .execute = true, .shareable = true,
+        .read = true,
+        .write = true,
+        .execute = true,
+        .shareable = true,
     }).bits();
     const data_vm = syscall.vm_reserve(0, 4 * syscall.PAGE4K, data_vm_rights);
     if (data_vm.val < 0) {
@@ -182,7 +192,9 @@ fn brokerConnection(requester: *ChildInfo, target_service_id: u32) void {
     _ = channel_mod.Channel.initAsSideA(chan_header, 4 * syscall.PAGE4K);
 
     const grant_rights = (perms.SharedMemoryRights{
-        .read = true, .write = true, .grant = true,
+        .read = true,
+        .write = true,
+        .grant = true,
     }).bits();
     _ = syscall.grant_perm(@intCast(data_shm), requester.proc_handle, grant_rights);
     _ = syscall.grant_perm(@intCast(data_shm), target.proc_handle, grant_rights);
@@ -231,7 +243,11 @@ fn brokerLoop() void {
 
         for (children[0..num_children]) |*child| {
             const cmd = child.cmd_channel orelse continue;
-            for (cmd.connections[0..cmd.num_connections]) |*entry| {
+            // Only iterate over the connections that the root service originally
+            // authorized. Ignore any entries the child may have added by writing
+            // to shared memory (fixes VULN-I1).
+            const authorized_count = @min(child.allowed_connections, shm_protocol.MAX_CONNECTIONS);
+            for (cmd.connections[0..authorized_count]) |*entry| {
                 if (@as(*volatile u32, &entry.status).* == @intFromEnum(shm_protocol.ConnectionStatus.requested)) {
                     brokerConnection(child, entry.service_id);
                     found_request = true;
@@ -261,7 +277,11 @@ pub fn main(perm_view_addr: u64) void {
     syscall.write(" NIC device handles\n");
 
     const nic_driver_rights = perms.ProcessRights{
-        .grant_to = true, .mem_reserve = true, .shm_create = true, .device_own = true, .restart = true,
+        .grant_to = true,
+        .mem_reserve = true,
+        .shm_create = true,
+        .device_own = true,
+        .restart = true,
     };
 
     _ = spawnChild(

@@ -65,20 +65,29 @@ pub const RingHeader = extern struct {
         return @ptrFromInt(@intFromPtr(self) + @sizeOf(RingHeader));
     }
 
+    /// Message format in ring: [u32 length][u32 crc32][u8 data...]
+    /// The CRC covers the data bytes only.
     pub fn write(self: *RingHeader, ring_size: u32, data: []const u8) bool {
         const head = @atomicLoad(u64, &self.head, .acquire);
         const tail = @as(*volatile u64, &self.tail).*;
         const used = tail -% head;
         const free = ring_size - used;
 
-        const msg_size = @sizeOf(u32) + data.len;
+        // Message envelope: 4 bytes length + 4 bytes CRC + data
+        const msg_size = @sizeOf(u32) + @sizeOf(u32) + data.len;
         if (msg_size > free) return false;
 
         const buf = self.dataPtr();
         const len_bytes = std.mem.toBytes(@as(u32, @intCast(data.len)));
+        const msg_crc = crc32.compute(data);
+        const crc_bytes = std.mem.toBytes(msg_crc);
 
         var pos = tail % ring_size;
         for (len_bytes) |b| {
+            buf[pos] = b;
+            pos = (pos + 1) % ring_size;
+        }
+        for (crc_bytes) |b| {
             buf[pos] = b;
             pos = (pos + 1) % ring_size;
         }
@@ -87,11 +96,7 @@ pub const RingHeader = extern struct {
             pos = (pos + 1) % ring_size;
         }
 
-        const new_tail = tail +% msg_size;
-        const cs = computeRingChecksum(buf, head % ring_size, new_tail % ring_size, ring_size);
-        @as(*volatile u32, &self.checksum).* = cs;
-
-        @atomicStore(u64, &self.tail, new_tail, .release);
+        @atomicStore(u64, &self.tail, tail +% msg_size, .release);
 
         _ = @atomicRmw(u64, &self.wake_flag, .Add, 1, .release);
         _ = syscall.futex_wake(&self.wake_flag, 1);
@@ -108,6 +113,7 @@ pub const RingHeader = extern struct {
         const buf = self.dataPtr();
         var pos = head % ring_size;
 
+        // Read message length
         var len_bytes: [4]u8 = undefined;
         for (&len_bytes) |*b| {
             b.* = buf[pos];
@@ -117,12 +123,25 @@ pub const RingHeader = extern struct {
 
         if (msg_len > out.len) return null;
 
+        // Read stored CRC
+        var crc_bytes: [4]u8 = undefined;
+        for (&crc_bytes) |*b| {
+            b.* = buf[pos];
+            pos = (pos + 1) % ring_size;
+        }
+        const stored_crc = std.mem.bytesToValue(u32, &crc_bytes);
+
+        // Read message data
         for (out[0..msg_len]) |*b| {
             b.* = buf[pos];
             pos = (pos + 1) % ring_size;
         }
 
-        const new_head = head +% @sizeOf(u32) +% msg_len;
+        // Verify CRC
+        const actual_crc = crc32.compute(out[0..msg_len]);
+        if (stored_crc != actual_crc) return null;
+
+        const new_head = head +% @sizeOf(u32) +% @sizeOf(u32) +% msg_len;
         @atomicStore(u64, &self.head, new_head, .release);
 
         return msg_len;
@@ -140,16 +159,6 @@ pub const RingHeader = extern struct {
         return @as(*volatile u64, &self.head).* != @atomicLoad(u64, &self.tail, .acquire);
     }
 };
-
-fn computeRingChecksum(buf: [*]u8, start: u64, end: u64, ring_size: u32) u32 {
-    var crc: u32 = 0xFFFFFFFF;
-    var pos = start;
-    while (pos != end) {
-        crc = crc32.update(crc, buf[pos .. pos + 1]);
-        pos = (pos + 1) % ring_size;
-    }
-    return crc ^ 0xFFFFFFFF;
-}
 
 pub const Channel = struct {
     header: *ChannelHeader,

@@ -230,6 +230,8 @@ fn rxPoll(buf: []u8) ?u16 {
 }
 
 fn txSend(data: []const u8) bool {
+    if (data.len == 0 or data.len > PACKET_BUF_SIZE) return false;
+
     const desc = &tx_descs[tx_tail];
     if (@as(*volatile u8, &desc.status).* & TX_DESC_STA_DD == 0) return false;
 
