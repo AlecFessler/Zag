@@ -2,6 +2,7 @@ const arp = @import("arp.zig");
 const main = @import("main.zig");
 const util = @import("util.zig");
 
+const channel_mod = @import("lib").channel;
 const lib = @import("lib");
 const syscall = lib.syscall;
 
@@ -13,9 +14,12 @@ pub const MAX_BINDINGS = 8;
 pub const MAX_PENDING = 2;
 const PENDING_BUF_SIZE = 256;
 
+pub const AppId = enum(u8) { nfs = 0, ntp = 1 };
+
 pub const UdpBinding = struct {
     valid: bool = false,
     port: u16 = 0,
+    app: AppId = .nfs,
 };
 
 pub const PendingPacket = struct {
@@ -25,21 +29,21 @@ pub const PendingPacket = struct {
     data: [PENDING_BUF_SIZE]u8 = undefined,
 };
 
-pub fn handleAppMessage(data: []const u8) void {
+pub fn handleAppMessage(data: []const u8, app: AppId) void {
     if (data.len < 1) return;
     switch (data[0]) {
         MSG_UDP_SEND => handleUdpSend(data),
-        MSG_UDP_BIND => handleUdpBind(data),
+        MSG_UDP_BIND => handleUdpBind(data, app),
         else => {},
     }
 }
 
-fn handleUdpBind(data: []const u8) void {
+fn handleUdpBind(data: []const u8, app: AppId) void {
     if (data.len < 3) return;
     const port = util.readU16Be(data[1..3]);
     for (&main.udp_bindings) |*b| {
         if (!b.valid) {
-            b.* = .{ .valid = true, .port = port };
+            b.* = .{ .valid = true, .port = port, .app = app };
             return;
         }
     }
@@ -132,16 +136,21 @@ pub fn sendGratuitousArp() void {
 }
 
 pub fn forwardToApp(src_ip: [4]u8, src_port: u16, dst_port: u16, payload: []const u8) bool {
+    var target_app: AppId = .nfs;
     var matched = false;
     for (&main.udp_bindings) |*b| {
         if (b.valid and b.port == dst_port) {
+            target_app = b.app;
             matched = true;
             break;
         }
     }
     if (!matched) return false;
 
-    var chan = &(main.nfs_chan orelse return false);
+    var chan: *channel_mod.Channel = switch (target_app) {
+        .nfs => &(main.nfs_chan orelse return false),
+        .ntp => &(main.ntp_chan orelse return false),
+    };
 
     var msg: [2048]u8 = undefined;
     const msg_len = 9 + payload.len;

@@ -34,6 +34,7 @@ pub var lan_iface: Iface = undefined;
 pub var has_lan: bool = false;
 pub var console_chan: ?channel_mod.Channel = null;
 pub var nfs_chan: ?channel_mod.Channel = null;
+pub var ntp_chan: ?channel_mod.Channel = null;
 pub var nat_table: [nat.TABLE_SIZE]nat.NatEntry = .{nat.empty} ** nat.TABLE_SIZE;
 pub var next_nat_port: u16 = 10000;
 pub var port_forwards: [firewall.PORT_FWD_SIZE]firewall.PortForward = [_]firewall.PortForward{firewall.empty_fwd} ** firewall.PORT_FWD_SIZE;
@@ -217,7 +218,7 @@ fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
 }
 
 fn detectAppChannels(view: *const [MAX_PERMS]pv.UserViewEntry, mapped_handles: *[8]u64, mapped_count: *u32) void {
-    if (console_chan != null and nfs_chan != null) return;
+    if (console_chan != null and nfs_chan != null and ntp_chan != null) return;
     for (view) |*entry| {
         if (entry.entry_type != pv.ENTRY_TYPE_SHARED_MEMORY or entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) continue;
         var is_known = false;
@@ -236,6 +237,7 @@ fn detectAppChannels(view: *const [MAX_PERMS]pv.UserViewEntry, mapped_handles: *
             if (ch.recv(&id_buf)) |id_len| {
                 if (id_len >= 1) {
                     if (id_buf[0] == shm_protocol.ServiceId.NFS_CLIENT and nfs_chan == null) { nfs_chan = ch; syscall.write("router: NFS connected\n"); }
+                    else if (id_buf[0] == shm_protocol.ServiceId.NTP_CLIENT and ntp_chan == null) { ntp_chan = ch; syscall.write("router: NTP connected\n"); }
                     else if (id_buf[0] == shm_protocol.ServiceId.CONSOLE and console_chan == null) { console_chan = ch; syscall.write("router: console connected\n"); }
                 }
                 break;
@@ -326,7 +328,11 @@ pub fn main(perm_view_addr: u64) void {
         }
         if (nfs_chan) |*chan| {
             var nfs_buf: [2048]u8 = undefined;
-            if (chan.recv(&nfs_buf)) |nfs_len| { udp_fwd.handleAppMessage(nfs_buf[0..nfs_len]); }
+            if (chan.recv(&nfs_buf)) |nfs_len| { udp_fwd.handleAppMessage(nfs_buf[0..nfs_len], .nfs); }
+        }
+        if (ntp_chan) |*chan| {
+            var ntp_buf: [256]u8 = undefined;
+            if (chan.recv(&ntp_buf)) |ntp_len| { udp_fwd.handleAppMessage(ntp_buf[0..ntp_len], .ntp); }
         }
 
         // WAN poll + zero-copy forwarding

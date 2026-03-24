@@ -13,7 +13,8 @@ root_service (broker)
 ├── serial_driver    (UART 16550)
 ├── router           (e1000e WAN + LAN + NAT/ARP/firewall/DHCP/DNS)
 ├── nfs_client       (NFSv3 over UDP, connects to router)
-└── console          (serial line editor, connects to router + NFS)
+├── ntp_client       (SNTPv4 over UDP, connects to router)
+└── console          (serial line editor, connects to router + NFS + NTP)
 ```
 
 ### 1.2 Thread Model

@@ -11,8 +11,10 @@ const MAX_PERMS = 128;
 var serial_chan: channel_mod.Channel = undefined;
 var router_chan: channel_mod.Channel = undefined;
 var nfs_chan: channel_mod.Channel = undefined;
+var ntp_chan: channel_mod.Channel = undefined;
 var has_router: bool = false;
 var has_nfs: bool = false;
+var has_ntp: bool = false;
 
 fn serialWrite(data: []const u8) void {
     _ = serial_chan.send(data);
@@ -107,6 +109,10 @@ fn processCommand(line: []const u8) void {
         serialWrite("  put <path>               - write file (end with empty line)\r\n");
         serialWrite("  mkdir <path>             - create directory\r\n");
         serialWrite("  rm <path>                - remove file\r\n");
+        serialWrite("NTP commands:\r\n");
+        serialWrite("  time                     - show current time\r\n");
+        serialWrite("  sync                     - sync time via NTP\r\n");
+        serialWrite("  ntpserver <ip>           - set NTP server\r\n");
     } else if (eql(line, "version")) {
         serialWrite("Zag RouterOS v0.1\r\n");
     } else if (eql(line, "uptime")) {
@@ -156,6 +162,12 @@ fn processCommand(line: []const u8) void {
         nfsMultiResponse(line);
     } else if (startsWith(line, "rm ")) {
         nfsMultiResponse(line);
+    } else if (eql(line, "time")) {
+        ntpMultiResponse("time");
+    } else if (eql(line, "sync")) {
+        ntpMultiResponse("sync");
+    } else if (startsWith(line, "ntpserver ")) {
+        ntpMultiResponse(line);
     } else {
         serialWrite("unknown command: ");
         serialWrite(line);
@@ -327,6 +339,39 @@ fn nfsWaitResponse() void {
     }
 }
 
+fn ntpMultiResponse(cmd: []const u8) void {
+    if (!has_ntp) {
+        serialWrite("ntp: not connected\r\n");
+        return;
+    }
+    _ = ntp_chan.send(cmd);
+    var resp: [256]u8 = undefined;
+    var msg_count: u32 = 0;
+    var done = false;
+    while (!done and msg_count < 8) {
+        var attempts: u32 = 0;
+        var got_msg = false;
+        while (attempts < 500_000) : (attempts += 1) {
+            if (ntp_chan.recv(&resp)) |len| {
+                if (len == 0) {
+                    done = true;
+                    got_msg = true;
+                    break;
+                }
+                serialWrite(resp[0..len]);
+                msg_count += 1;
+                got_msg = true;
+                break;
+            }
+            syscall.thread_yield();
+        }
+        if (!got_msg) done = true;
+    }
+    if (msg_count == 0) {
+        serialWrite("ntp: no response\r\n");
+    }
+}
+
 fn printUptime(hrs: u64, mins: u64, secs: u64) void {
     serialWrite("uptime: ");
     printDecSerial(hrs);
@@ -370,10 +415,12 @@ pub fn main(perm_view_addr: u64) void {
 
     const router_entry = cmd.requestConnection(shm_protocol.ServiceId.ROUTER);
     const nfs_entry = cmd.requestConnection(shm_protocol.ServiceId.NFS_CLIENT);
+    const ntp_entry = cmd.requestConnection(shm_protocol.ServiceId.NTP_CLIENT);
 
     var expected_shm: u32 = 1;
     if (router_entry != null) expected_shm += 1;
     if (nfs_entry != null) expected_shm += 1;
+    if (ntp_entry != null) expected_shm += 1;
 
     if (router_entry) |re| {
         if (!cmd.waitForConnection(re)) {
@@ -391,14 +438,22 @@ pub fn main(perm_view_addr: u64) void {
         }
     }
 
+    if (ntp_entry) |nte| {
+        if (!cmd.waitForConnection(nte)) {
+            syscall.write("console: NTP client connection failed\n");
+        } else {
+            syscall.write("console: NTP client connected\n");
+        }
+    }
+
     waitForDataShm(perm_view_addr, expected_shm);
 
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
-    var shm_handles: [4]u64 = .{ 0, 0, 0, 0 };
-    var shm_sizes: [4]u64 = .{ 0, 0, 0, 0 };
+    var shm_handles: [8]u64 = .{0} ** 8;
+    var shm_sizes: [8]u64 = .{0} ** 8;
     var shm_count: u32 = 0;
     for (view) |*e| {
-        if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and e.field0 > shm_protocol.COMMAND_SHM_SIZE and shm_count < 4) {
+        if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and e.field0 > shm_protocol.COMMAND_SHM_SIZE and shm_count < 8) {
             shm_handles[shm_count] = e.handle;
             shm_sizes[shm_count] = e.field0;
             shm_count += 1;
@@ -452,6 +507,22 @@ pub fn main(perm_view_addr: u64) void {
                 };
                 has_nfs = true;
                 syscall.write("console: NFS channel ready\n");
+            }
+        }
+    }
+
+    if (shm_count >= 4) {
+        const ntp_vm = syscall.vm_reserve(0, shm_sizes[3], serial_vm_rights);
+        if (ntp_vm.val >= 0) {
+            if (syscall.shm_map(shm_handles[3], @intCast(ntp_vm.val), 0) == 0) {
+                const ntp_header: *channel_mod.ChannelHeader = @ptrFromInt(ntp_vm.val2);
+                ntp_chan = channel_mod.Channel.openAsSideB(ntp_header) orelse {
+                    syscall.write("console: NTP channel open failed\n");
+                    has_ntp = false;
+                    return;
+                };
+                has_ntp = true;
+                syscall.write("console: NTP channel ready\n");
             }
         }
     }

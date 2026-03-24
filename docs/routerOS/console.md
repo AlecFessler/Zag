@@ -36,6 +36,14 @@ Interactive command-line interface over the serial port for monitoring and confi
 | `mkdir <path>` | Create directory |
 | `rm <path>` | Remove file |
 
+### NTP Commands
+
+| Command | Description |
+|---------|-------------|
+| `time` | Show current UTC time |
+| `sync` | Sync time via NTP |
+| `ntpserver <ip>` | Set NTP server IP |
+
 ---
 
 ## status
