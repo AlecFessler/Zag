@@ -6,3 +6,4 @@ zig-out/
 iso/boot/kernel.elf
 **/data/*.csv
 **/venv/
+.claude/worktrees/

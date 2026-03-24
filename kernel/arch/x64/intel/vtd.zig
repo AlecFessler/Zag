@@ -101,13 +101,20 @@ pub fn init(reg_base_phys: PAddr) !void {
         if (readReg32(REG_GSTS) & GSTS_RTPS != 0) break;
     }
 
+    // NOTE: Translation enable (TE) is deferred until enableTranslation()
+    // to allow setupDevice() to populate context entries first.
+    initialized = true;
+}
+
+pub fn enableTranslation() void {
+    if (!initialized) return;
+    invalidateContextCache();
+    invalidateIotlb();
     writeReg32(REG_GCMD, readReg32(REG_GCMD) | GCMD_TE);
-    timeout = 0;
+    var timeout: u32 = 0;
     while (timeout < 1000000) : (timeout += 1) {
         if (readReg32(REG_GSTS) & GSTS_TES != 0) break;
     }
-
-    initialized = true;
 }
 
 pub fn setupDevice(device: *DeviceRegion) !void {
@@ -140,6 +147,11 @@ pub fn setupDevice(device: *DeviceRegion) !void {
             .slptptr = @truncate(pt.phys.addr >> 12),
             .domain_id = @as(u16, device.pci_bus) << 8 | @as(u16, ctx_idx),
         };
+
+        // Invalidate context cache and IOTLB so the IOMMU re-walks
+        // the root/context tables and picks up the new entry.
+        invalidateContextCache();
+        invalidateIotlb();
     }
 }
 
@@ -198,7 +210,17 @@ pub fn unmapDmaPage(device: *DeviceRegion, dma_addr: u64) void {
     invalidateIotlb();
 }
 
-fn invalidateIotlb() void {
+fn invalidateContextCache() void {
+    // Global context-cache invalidation: set ICC (bit 63) and cirg=01 (global)
+    writeReg64(REG_CCMD, (@as(u64, 1) << 63) | (@as(u64, 1) << 61));
+    var timeout: u32 = 0;
+    while (timeout < 1000000) : (timeout += 1) {
+        const val = @as(*const volatile u64, @ptrFromInt(iommu_base + REG_CCMD)).*;
+        if (val & (@as(u64, 1) << 63) == 0) break;
+    }
+}
+
+pub fn invalidateIotlb() void {
     writeReg64(REG_IOTLB + 8, @as(u64, 1) << 63 | @as(u64, 1) << 60);
     var timeout: u32 = 0;
     while (timeout < 1000000) : (timeout += 1) {

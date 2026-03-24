@@ -40,4 +40,16 @@ pub const UserViewEntry = extern struct {
     pub fn pciSubclass(self: *const UserViewEntry) u8 {
         return @truncate(self.field1 >> 40);
     }
+
+    pub fn pciBus(self: *const UserViewEntry) u8 {
+        return @truncate((self.field1 >> 48) & 0x1F);
+    }
+
+    pub fn pciDev(self: *const UserViewEntry) u5 {
+        return @truncate((self.field1 >> 53) & 0x1F);
+    }
+
+    pub fn pciFunc(self: *const UserViewEntry) u3 {
+        return @truncate((self.field1 >> 58) & 0x7);
+    }
 };

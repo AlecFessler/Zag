@@ -162,7 +162,7 @@ A unit of execution belonging to a Process.
 
 The futex mechanism allows userspace synchronization primitives (mutexes, condition variables, semaphores) to integrate with the kernel scheduler, avoiding busy-waiting.
 
-**wait(addr, expected, timeout_ns):** Compare the 64-bit value at `addr` against `expected`. If not equal: return `E_AGAIN`. If equal: block the calling thread. Address must be 8-byte aligned. Timeout: 0 = try-only, `MAX_U64` = indefinite. Cross-process futexes work over shared memory (two processes mapping the same SHM can synchronize via the same address).
+**wait(addr, expected, timeout_ns):** Compare the 64-bit value at `addr` against `expected`. If not equal: return `E_AGAIN`. If equal: block the calling thread until woken or the timeout expires. Address must be 8-byte aligned. Timeout: 0 = try-only (return `E_TIMEOUT` immediately), `MAX_U64` = indefinite wait, any other value = block for at most `timeout_ns` nanoseconds then return `E_TIMEOUT`. Timed waiters are checked every scheduler tick (~2ms). Cross-process futexes work over shared memory (two processes mapping the same SHM can synchronize via the same address).
 
 **wake(addr, count):** Wake up to `count` threads blocked on the physical address corresponding to `addr`. Returns number of threads woken.
 
@@ -401,7 +401,7 @@ Permanently clear `restart` bit and free restart context for calling process and
 
 ### futex_wait(addr, expected, timeout_ns) → result
 
-Compare 64-bit value at `addr` against `expected`. If not equal: `E_AGAIN`. If equal: block. Address must be 8-byte aligned. Timeout: 0 = try-only, `MAX_U64` = indefinite. Cross-process futexes work over SHM.
+Compare 64-bit value at `addr` against `expected`. If not equal: `E_AGAIN`. If equal: block until woken or timeout expires. Address must be 8-byte aligned. Timeout: 0 = try-only, `MAX_U64` = indefinite, other = nanosecond deadline. Cross-process futexes work over SHM.
 
 **Returns:** `E_OK` (woken), `E_AGAIN` (mismatch), `E_TIMEOUT`.
 **Errors:** `E_BADADDR`, `E_INVAL` (alignment).
@@ -470,5 +470,6 @@ Write to a Port I/O device. Same validation as `ioport_read`.
 | SHM max size | 1 MiB (256 pages) |
 | Default user stack | 16 KiB (4 pages) |
 | Futex wait queue buckets | 256 |
+| Futex timed waiter slots | 64 |
 | User permissions view | 1 page (128 entries x 32 bytes) |
 | DMA mappings per process | 16 |

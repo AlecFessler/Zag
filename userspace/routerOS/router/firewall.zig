@@ -2,8 +2,6 @@ const arp = @import("arp.zig");
 const main = @import("main.zig");
 const util = @import("util.zig");
 
-const RouterContext = main.RouterContext;
-
 pub const RULES_SIZE = 32;
 pub const PORT_FWD_SIZE = 16;
 
@@ -69,8 +67,8 @@ pub fn portFwdAdd(forwards: *[PORT_FWD_SIZE]PortForward, proto: util.Protocol, w
     return false;
 }
 
-pub fn handlePortForward(ctx: *RouterContext, pkt: []u8, len: u32) bool {
-    if (!ctx.has_lan) return false;
+pub fn handlePortForward(pkt: []u8, len: u32) bool {
+    if (!main.has_lan) return false;
     if (len < 34) return false;
 
     const protocol = pkt[23];
@@ -83,10 +81,10 @@ pub fn handlePortForward(ctx: *RouterContext, pkt: []u8, len: u32) bool {
     const dst_port = util.readU16Be(pkt[transport_start + 2 ..][0..2]);
     const proto: util.Protocol = if (protocol == 6) .tcp else .udp;
 
-    const fwd = portFwdLookup(&ctx.port_forwards, proto, dst_port) orelse return false;
+    const fwd = portFwdLookup(&main.port_forwards, proto, dst_port) orelse return false;
 
-    const dst_mac = arp.lookup(&ctx.lan_arp, fwd.lan_ip) orelse {
-        arp.sendRequest(ctx, .lan, fwd.lan_ip);
+    const dst_mac = arp.lookup(&main.lan_iface.arp_table, fwd.lan_ip) orelse {
+        arp.sendRequest(.lan, fwd.lan_ip);
         return true;
     };
 
@@ -94,7 +92,7 @@ pub fn handlePortForward(ctx: *RouterContext, pkt: []u8, len: u32) bool {
     @memcpy(&old_dst_ip, pkt[30..34]);
 
     @memcpy(pkt[0..6], &dst_mac);
-    @memcpy(pkt[6..12], &ctx.lan_mac);
+    @memcpy(pkt[6..12], &main.lan_iface.mac);
     @memcpy(pkt[30..34], &fwd.lan_ip);
     util.writeU16Be(pkt[transport_start + 2 ..][0..2], fwd.lan_port);
 
@@ -111,10 +109,8 @@ pub fn handlePortForward(ctx: *RouterContext, pkt: []u8, len: u32) bool {
     pkt[24] = @truncate(ip_cs >> 8);
     pkt[25] = @truncate(ip_cs);
 
-    ctx.lan_stats.tx_packets += 1;
-    ctx.lan_stats.tx_bytes += len;
-    if (ctx.lan_chan) |*ch| {
-        _ = ch.send(pkt[0..len]);
-    }
+    main.lan_iface.stats.tx_packets += 1;
+    main.lan_iface.stats.tx_bytes += len;
+    _ = main.lan_iface.txSendLocal(pkt[0..len]);
     return true;
 }

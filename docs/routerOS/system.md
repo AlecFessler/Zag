@@ -1,6 +1,6 @@
 # RouterOS System Design
 
-RouterOS is a userspace network router for the Zag microkernel. All components run as separate processes communicating via shared-memory SPSC channels. No dynamic memory allocation.
+RouterOS is a userspace network router for the Zag microkernel. The router process directly owns both e1000e NIC devices and performs all routing logic in-process with zero-copy packet forwarding.
 
 ---
 
@@ -11,20 +11,31 @@ RouterOS is a userspace network router for the Zag microkernel. All components r
 ```
 root_service (broker)
 ├── serial_driver    (UART 16550)
-├── nic_wan          (e1000, WAN interface)
-├── nic_lan          (e1000, LAN interface)
-├── router           (NAT, firewall, DNS, DHCP, ARP)
-└── console          (serial line editor)
+├── router           (e1000e WAN + LAN + NAT/ARP/firewall/DHCP/DNS)
+├── nfs_client       (NFSv3 over UDP, connects to router)
+└── console          (serial line editor, connects to router + NFS)
 ```
 
-### 1.2 Data Flow
+### 1.2 Thread Model
+
+The router process runs two threads:
+
+| Thread | Role | Affinity |
+|--------|------|----------|
+| WAN thread | Poll WAN RX, route, channels (console/NFS), maintenance | Initial thread |
+| LAN thread | Poll LAN RX, route, forward to WAN | Spawned via thread_create |
+
+Both threads are lock-free. No mutexes anywhere in the data path.
+
+### 1.3 Data Flow
 
 ```
-Host WAN (tap0) ←→ e1000 ←→ nic_wan ←channel→ router ←channel→ console ←channel→ serial_driver ←→ UART
-Host LAN (tap1) ←→ e1000 ←→ nic_lan ←channel→ router ↗
+Host WAN (tap0) ←→ e1000e ←→ WAN thread ←→ [zero-copy DMA] ←→ LAN thread ←→ e1000e ←→ Host LAN (tap1)
+                                  ↕
+                           console/NFS channels
 ```
 
-### 1.3 Addressing
+### 1.4 Addressing
 
 | Interface | IP | Subnet | MAC |
 |-----------|------|--------|-----|
@@ -33,179 +44,98 @@ Host LAN (tap1) ←→ e1000 ←→ nic_lan ←channel→ router ↗
 
 ---
 
-## 2. Root Service
+## 2. Zero-Copy Forwarding
 
-**File:** `root_service/main.zig`
+### 2.1 Shared DMA Region
 
-Scans perm_view for MMIO network devices (filters out port-IO). Spawns children in order, grants one device handle per NIC driver. Enters broker loop to mediate SHM connections.
+One SHM region mapped to both e1000e devices. Both NICs DMA to/from the same physical pages.
 
-### Permissions
+```
+Pages   Content
+0       WAN RX descriptors (32 × 16B)
+1       WAN TX descriptors (32 × 16B)
+2       LAN RX descriptors (32 × 16B)
+3       LAN TX descriptors (32 × 16B)
+4-19    WAN RX packet buffers (32 × 2KB)
+20-35   LAN RX packet buffers (32 × 2KB)
+36-51   WAN local TX buffers (32 × 2KB)
+52-67   LAN local TX buffers (32 × 2KB)
+```
 
-| Process | Rights |
-|---------|--------|
-| serial_driver | grant_to, mem_reserve, device_own, restart |
-| nic_wan / nic_lan | grant_to, mem_reserve, shm_create, device_own, restart |
-| router | grant_to, mem_reserve, restart |
-| console | grant_to, mem_reserve, restart |
+### 2.2 Forwarding Path (0 copies)
+
+1. WAN e1000e receives packet into WAN RX buffer via DMA
+2. WAN thread modifies IP/TCP/UDP headers **in-place** in the DMA buffer
+3. WAN thread points LAN TX descriptor at the WAN RX buffer's DMA address
+4. LAN e1000e transmits from the WAN RX buffer — zero copies
+5. Next iteration: WAN thread reclaims the buffer after LAN TX completes
+
+### 2.3 Local Packet Path
+
+For locally-generated packets (ARP replies, DHCP, ICMP echo replies):
+- Main thread writes packet to a lock-free pending TX slot (atomic flag + buffer)
+- Poll thread drains the slot and sends via the local TX buffer pool
 
 ---
 
-## 3. NIC Driver
+## 3. Lock-Free Design
 
-**File:** `nic_driver/main.zig`
+### 3.1 NAT Table
 
-Same binary for WAN and LAN. Each gets one MMIO device handle.
+Open-addressing hash table with atomic entry states:
+- **Insert** (LAN thread): CAS on state field (empty/expired → active)
+- **Lookup** (both threads): atomic load of state, compare key fields
+- **Expiry** (WAN thread): atomic store of state (active → expired)
+- **Port allocation**: `@atomicRmw(.Add)` on `next_nat_port`
 
-### DMA Layout (34 pages)
+### 3.2 Per-Thread Ownership
 
-```
-Offset 0:      32 × RxDesc (512B)
-Offset 512:    32 × TxDesc (512B)
-Offset 1024:   32 × RX buffers (64KB)
-Offset 66560:  32 × TX buffers (64KB)
-```
-
-IOMMU required (`dma_map`). Sends 6-byte MAC announcement as first channel message.
-
----
-
-## 4. Router
-
-**File:** `router/main.zig`
-
-### 4.1 Data Structures
-
-| Structure | Size | Purpose |
-|-----------|------|---------|
-| ARP table | 16 × 2 | Per-interface IP→MAC, 5-minute expiry |
-| NAT table | 128 | Connection tracking with per-protocol timeouts |
-| DHCP leases | 32 | LAN DHCP server, 192.168.1.100-231 |
-| Port forwards | 16 | DNAT rules (WAN port → LAN IP:port) |
-| Firewall rules | 32 | Block/allow by source IP |
-| DNS relay | 32 | Query ID translation for LAN→upstream |
-| Fragment table | 16 | IP fragment reassembly tracking |
-| Interface stats | 2 | RX/TX/drop counters per interface |
-
-### 4.2 Packet Pipeline
-
-```
-Receive → stats → ethertype dispatch
-  ARP: learn sender, reply if for us, resolve pending ping
-  IPv4:
-    firewall check (WAN inbound)
-    if for us:
-      UDP 68 (WAN): DHCP client response
-      UDP 67 (LAN): DHCP server
-      UDP 53: DNS relay
-      ICMP echo request: reply
-      ICMP echo reply: match outbound ping
-    LAN→WAN: DNS intercept → NAT forward (SNAT)
-    WAN→LAN: DNS response → port forward → NAT reverse
-```
-
-### 4.3 NAT
-
-**Source NAT (LAN→WAN):**
-- Rewrite src IP → WAN IP, src port → ephemeral NAT port
-- TCP: incremental checksum (RFC 1624), track SYN/FIN/RST state
-- UDP: zero checksum (RFC 768 optional)
-- ICMP: rewrite identifier
-
-**Reverse NAT (WAN→LAN):**
-- Lookup by (protocol, wan_port)
-- Rewrite dst IP/port back to original LAN values
-- TCP state tracking on return path
-
-### 4.4 TCP Connection Tracking
-
-| State | Trigger | Timeout |
-|-------|---------|---------|
-| syn_sent | SYN seen | 30s |
-| established | ACK seen (after SYN) | 300s |
-| fin_wait | FIN or RST | 30s |
-| (removed) | RST in fin_wait | immediate |
-
-### 4.5 UDP Timeout Tuning
-
-| Traffic | Timeout |
-|---------|---------|
-| DNS (port 53) | 30s |
-| General UDP | 120s |
-| ICMP | 60s |
-
-### 4.6 ARP Table
-
-- 16 entries per interface, learned from all ARP packets
-- Timestamped on learn/update
-- Expired every 10 seconds (5-minute TTL)
-- Slot 0 evicted when full
-
-### 4.7 DNS Relay
-
-LAN clients → router (192.168.1.1:53) → upstream DNS (configurable, default 10.0.2.1)
-- Rewrites query ID with relay ID for tracking
-- 32 concurrent query slots
-- Upstream learned from DHCP option 6 if DHCP client active
-
-### 4.8 DHCP Server (LAN)
-
-- Pool: 192.168.1.100-231 (32 leases)
-- Options: subnet mask, router, DNS, lease time (7200s)
-- DISCOVER → OFFER, REQUEST → ACK
-
-### 4.9 DHCP Client (WAN)
-
-- DISCOVER → OFFER → REQUEST → ACK
-- Sets wan_ip dynamically
-- Learns upstream DNS from option 6
-- 10-second retry timeout
-- Triggered by `dhcp-client` console command
-
-### 4.10 Port Forwarding
-
-- 16 rules, configured via console (`forward tcp 80 192.168.1.100 8080`)
-- Checked before NAT reverse lookup for WAN→LAN traffic
-- TCP: incremental checksum adjustment
-- UDP: zero checksum
-
-### 4.11 Firewall
-
-- 32 rules, WAN inbound only
-- Match by source IP (full /32 mask)
-- Default policy: allow
-- Blocked packets increment drop counter
-
-### 4.12 IP Fragment Tracking
-
-- 16 entries tracking IP ID → source port from first fragment
-- Non-first fragments (fragment offset > 0) lack port numbers
-- Table maps (src_ip, ip_id) → first_frag_sport for NAT lookup
-- 30-second expiry
-
-### 4.13 Connection Logging
-
-NAT creation, DHCP events, and firewall actions logged to serial via `syscall.write`. Format:
-```
-nat: new tcp 192.168.1.100:49152 -> 10.0.2.1:80 (wan:10001)
-dhcp-client: bound to 10.0.2.15
-firewall: block rule added
-```
-
-### 4.14 Periodic Maintenance
-
-Every 10 seconds:
-- ARP table expiry (both interfaces)
-- NAT table expiry (per-protocol timeouts)
-- Fragment table expiry
-- DHCP client retry check
+| Resource | Owner | Access |
+|----------|-------|--------|
+| WAN RX/TX rings | WAN thread | Exclusive |
+| LAN RX/TX rings | LAN thread | Exclusive |
+| WAN ARP table | WAN thread | Exclusive |
+| LAN ARP table | LAN thread | Exclusive |
+| NAT table | Both | Lock-free atomics |
+| Console/NFS channels | WAN thread | Exclusive |
+| Pending TX slots | Writer: any, Reader: owning poll thread | Atomic flag |
 
 ---
 
-## 5. Console
+## 4. NIC Driver (e1000e)
 
-**File:** `console/main.zig`
+**File:** `router/e1000.zig`
 
-Line editor over serial. Single-response commands use 10k-yield timeout. Multi-response commands (ping, arp, nat, leases, rules) poll for up to 8 messages with 100k-yield inter-message timeout, end on `"---"` prefix.
+The e1000e Intel Gigabit Ethernet controller is driven directly from the router process. Key operations:
+
+- **Init**: Reset, set link up, configure RX/TX descriptor rings, enable RCTL
+- **RX poll**: Check DD bit on next descriptor, return buffer index
+- **TX zero-copy**: Point TX descriptor at arbitrary DMA address (other NIC's RX buffer)
+- **TX local**: Copy data to local TX buffer, program descriptor
+- **Bus master**: Enabled via `pci_enable_bus_master` syscall after e1000e reset
+
+### PCI Enumeration
+
+The kernel registers only the first MMIO BAR per PCI function (e1000e has multiple BARs). Bus master is enabled during PCI enumeration for network devices.
+
+---
+
+## 5. NFS Client
+
+**Files:** `nfs_client/main.zig`, `nfs_client/nfs3.zig`, `nfs_client/rpc.zig`, `nfs_client/xdr.zig`
+
+NFSv3 over UDP, using AUTH_UNIX (uid=0, gid=0). Communicates with the router via SHM channel for UDP send/recv.
+
+### Operations
+
+| Command | NFS Procedure | Status |
+|---------|--------------|--------|
+| mount | MOUNTPROC_MNT | ✓ Working |
+| ls | READDIR | ✓ Working |
+| cat | LOOKUP + READ | ✓ Working |
+| put | CREATE + WRITE + COMMIT | ✓ Working |
+| mkdir | MKDIR | ✓ Working |
+| rm | REMOVE | ✓ Working |
 
 ---
 
@@ -215,13 +145,20 @@ Line editor over serial. Single-response commands use 10k-yield timeout. Multi-r
 
 ```
 userspace/routerOS/
-  build.zig
-  linker.ld
-  root_service/main.zig
+  build.zig              — builds all child processes + root service
+  linker.ld              — links .bss into .data for zero-init
+  root_service/main.zig  — spawns router with NIC device handles
   serial_driver/main.zig
-  nic_driver/main.zig
-  router/main.zig
+  router/
+    main.zig             — entry point, thread spawn, WAN poll loop
+    e1000.zig            — e1000e NIC driver (parameterized, no globals)
+    dma.zig              — shared DMA region layout + setup
+    iface.zig            — per-interface state, zero-copy TX, lock-free pending TX
+    nat.zig              — lock-free NAT hash table
+    arp.zig, firewall.zig, dhcp_client.zig, dhcp_server.zig,
+    dns.zig, ping.zig, udp_fwd.zig, frag.zig, util.zig
   console/main.zig
+  nfs_client/main.zig, nfs3.zig, rpc.zig, xdr.zig
 ```
 
 ### 6.2 Host Setup
@@ -234,38 +171,52 @@ sudo ip link set tap0 up
 
 # LAN
 sudo ip tuntap add dev tap1 mode tap user $USER
-sudo ip addr add 192.168.1.100/24 dev tap1
+sudo ip addr add 192.168.1.50/24 dev tap1
 sudo ip link set tap1 up
 
-# For NAT testing: namespace with bridge
-sudo ip link add br-lan type bridge
-sudo ip link set tap1 master br-lan
-sudo ip link set br-lan up
-sudo ip link add veth-host type veth peer name veth-ns
-sudo ip link set veth-host master br-lan
-sudo ip link set veth-host up
-sudo ip netns add lan_client
-sudo ip link set veth-ns netns lan_client
-sudo ip netns exec lan_client ip addr add 192.168.1.100/24 dev veth-ns
-sudo ip netns exec lan_client ip link set veth-ns up
-sudo ip netns exec lan_client ip route add default via 192.168.1.1
-
-# NAT test: sudo ip netns exec lan_client ping 10.0.2.1
+# NFS server (for NFS client testing)
+sudo mkdir -p /export/zagtest
+sudo chmod 777 /export/zagtest
+echo '/export/zagtest 10.0.2.0/24(rw,sync,no_subtree_check,no_root_squash)' | sudo tee /etc/exports
+sudo exportfs -ra
+sudo systemctl start nfs-server
+echo "written by host" > /export/zagtest/hello.txt
 ```
 
 ### 6.3 Build
 
 ```bash
+# Build routerOS userspace (from userspace/routerOS/)
 cd userspace/routerOS && zig build
-zig build -Dnet=tap -Duse-llvm=true -Dkvm=true -Diommu=amd \
-  -Droot-service=userspace/bin/routerOS.elf
+
+# Build kernel + run with routerOS (from repo root)
+# Uses e1000e NICs on Q35 machine
+zig build -Dnet=tap -Duse-llvm=true -Dkvm=true -Diommu=none \
+  -Droot-service=userspace/bin/routerOS.elf run
 ```
 
-### 6.4 Verified Configurations
+### 6.4 Testing
 
-| IOMMU | Accel | WAN | LAN |
-|-------|-------|-----|-----|
-| Intel VT-d | TCG | ✓ | ✓ |
-| Intel VT-d | KVM | ✓ | ✓ |
-| AMD-Vi | TCG | ✓ | ✓ |
-| AMD-Vi | KVM | ✓ | ✓ |
+```bash
+# Host → Router ping
+ping 10.0.2.15
+
+# NFS (via serial console)
+# Commands: ls, cat <file>, put <file>, mkdir <dir>, rm <file>
+```
+
+### 6.5 Device Configuration
+
+| Setting | Value |
+|---------|-------|
+| NIC model | e1000e (QEMU) |
+| Machine | Q35 |
+| IOMMU | None (physical passthrough) |
+| DMA | Contiguous physical pages via SHM |
+
+### 6.6 Known Issues
+
+- Console `status` and `ping` commands not yet re-implemented after rearchitecture
+- `cat` immediately after `put` may timeout due to serial protocol timing
+- AMD-Vi and Intel VT-d IOMMU have QEMU-specific issues (e1000 RX DMA writeback fails through IOMMU); using physical passthrough as workaround
+- BSS section merged into .data in linker script to ensure zero-initialization (Zig `undefined` globals)

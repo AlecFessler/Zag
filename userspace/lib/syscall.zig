@@ -30,6 +30,8 @@ pub const SyscallNum = enum(u64) {
     ioport_write,
     dma_map,
     dma_unmap,
+    pci_enable_bus_master,
+    shm_phys_addr, // TEMPORARY
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -194,6 +196,15 @@ pub fn ioport_write(device_handle: u64, port_offset: u64, width: u64, value: u64
 
 pub fn dma_map(device_handle: u64, shm_handle: u64) i64 {
     return syscall2(.dma_map, device_handle, shm_handle);
+}
+
+pub fn pci_enable_bus_master(device_handle: u64) i64 {
+    return syscall1(.pci_enable_bus_master, device_handle);
+}
+
+// TEMPORARY: get physical address of SHM page for testing without IOMMU
+pub fn shm_phys_addr(shm_handle: u64, page_idx: u64) i64 {
+    return syscall2(.shm_phys_addr, shm_handle, page_idx);
 }
 
 pub fn dma_unmap(device_handle: u64, shm_handle: u64) i64 {

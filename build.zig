@@ -133,12 +133,10 @@ pub fn build(b: *std.Build) void {
         \\-no-shutdown \
         \\-D qemu.log
     ;
-    const has_iommu = !std.mem.eql(u8, iommu_type, "none");
-    const qemu_machine_args: []const u8 = if (has_iommu)
-        \\-machine q35
-    else
-        \\
+    const qemu_machine_args: []const u8 = \\-machine q35
     ;
+    const has_iommu = !std.mem.eql(u8, iommu_type, "none");
+    _ = has_iommu;
     const qemu_iommu_args: []const u8 = if (std.mem.eql(u8, iommu_type, "intel"))
         \\-device intel-iommu,intremap=off
     else if (std.mem.eql(u8, iommu_type, "amd"))
@@ -147,10 +145,10 @@ pub fn build(b: *std.Build) void {
         \\
     ;
     const qemu_net_args: []const u8 = if (std.mem.eql(u8, net_type, "tap"))
-        \\-netdev tap,id=net0,ifname=tap0,script=no,downscript=no \
-        \\-device e1000,netdev=net0,mac=52:54:00:12:34:56 \
-        \\-netdev tap,id=net1,ifname=tap1,script=no,downscript=no \
-        \\-device e1000,netdev=net1,mac=52:54:00:12:34:57
+        \\-netdev tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=off \
+        \\-device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
+        \\-netdev tap,id=net1,ifname=tap1,script=no,downscript=no,vhost=off \
+        \\-device e1000e,netdev=net1,mac=52:54:00:12:34:57
     else if (std.mem.eql(u8, net_type, "user"))
         \\
     else

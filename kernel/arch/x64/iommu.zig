@@ -33,6 +33,17 @@ pub fn setupDevice(device: *DeviceRegion) !void {
     }
 }
 
+/// Call after all setupDevice calls to enable translation.
+/// For Intel VT-d, TE is deferred from init to avoid caching
+/// "not present" entries before context entries are populated.
+pub fn enableTranslation() void {
+    switch (active_type) {
+        .intel_vtd => vtd.enableTranslation(),
+        .amd_vi => {}, // AMD-Vi enables during init()
+        .none => {},
+    }
+}
+
 pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
     if (active_type == .none) return error.NoIommu;
 
@@ -46,8 +57,10 @@ pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
         }
     }
     device.dma_cursor = base_dma + @as(u64, shm.pages.len) * 0x1000;
-    if (active_type == .amd_vi) {
-        vi.flushAll();
+    switch (active_type) {
+        .amd_vi => vi.flushAll(),
+        .intel_vtd => vtd.invalidateIotlb(),
+        .none => {},
     }
     return base_dma;
 }

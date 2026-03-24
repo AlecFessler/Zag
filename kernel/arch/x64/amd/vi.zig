@@ -144,7 +144,7 @@ pub fn setupDevice(device: *DeviceRegion) !void {
     // [0] V=1, [1] TV=1, [8:7] HAD=0, [11:9] Mode=4,
     // [51:12] page table root, [61] IR=1, [62] IW=1
     const mode: u64 = 4;
-    entry_base[0] = 0x3 | (mode << 9) | (pt.phys.addr & 0xFFFFFFFFF000) | (1 << 61) | (1 << 62);
+    entry_base[0] = 0x3 | (mode << 9) | (pt.phys.addr & 0xFFFFFFFFF000) | AMDVI_RW;
 
     // DTE quadword 1: [15:0] DomainID
     entry_base[1] = @as(u64, device_id);
@@ -246,9 +246,9 @@ pub fn invalidateDeviceEntry(device_id: u16) void {
 
 fn invalidateIotlb() void {
     // CMD_INVALIDATE_IOMMU_PAGES (type 0x03)
-    // First qword: [3:0]=opcode(3), [32]=S(size), [31:7]=domain_id(0=all)
-    // With S=1: invalidate all pages for all domains
-    issueCommand(0x03 | (@as(u64, 1) << 32), 0);
+    // First qword: [3:0]=opcode(3), [20]=S(size=1 → all pages), [47:32]=DomainId
+    // With S=1 and DomainId=0: invalidate all pages for all domains
+    issueCommand(0x03 | (@as(u64, 1) << 20), 0);
 }
 
 pub fn flushAll() void {

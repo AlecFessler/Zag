@@ -46,20 +46,20 @@ pub fn build(b: *std.Build) void {
     });
 
     const serial_driver_bin = buildChild(b, target, lib_mod, "serial_driver", "serial_driver/main.zig");
-    const nic_driver_bin = buildChild(b, target, lib_mod, "nic_driver", "nic_driver/main.zig");
     const router_bin = buildChild(b, target, lib_mod, "router", "router/main.zig");
     const console_bin = buildChild(b, target, lib_mod, "console", "console/main.zig");
+    const nfs_client_bin = buildChild(b, target, lib_mod, "nfs_client", "nfs_client/main.zig");
 
     const embedded_wf = b.addWriteFiles();
     _ = embedded_wf.addCopyFile(serial_driver_bin, "serial_driver.elf");
-    _ = embedded_wf.addCopyFile(nic_driver_bin, "nic_driver.elf");
     _ = embedded_wf.addCopyFile(router_bin, "router.elf");
     _ = embedded_wf.addCopyFile(console_bin, "console.elf");
+    _ = embedded_wf.addCopyFile(nfs_client_bin, "nfs_client.elf");
     const embed_src = embedded_wf.add("embedded_children.zig",
         \\pub const serial_driver = @embedFile("serial_driver.elf");
-        \\pub const nic_driver = @embedFile("nic_driver.elf");
         \\pub const router = @embedFile("router.elf");
         \\pub const console = @embedFile("console.elf");
+        \\pub const nfs_client = @embedFile("nfs_client.elf");
         \\
     );
 

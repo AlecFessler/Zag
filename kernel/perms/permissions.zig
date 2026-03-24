@@ -135,7 +135,10 @@ pub const UserViewEntry = extern struct {
                 .field1 = @as(u64, dr.pci_vendor) |
                     (@as(u64, dr.pci_device) << 16) |
                     (@as(u64, dr.pci_class) << 32) |
-                    (@as(u64, dr.pci_subclass) << 40),
+                    (@as(u64, dr.pci_subclass) << 40) |
+                    (@as(u64, dr.pci_bus) << 48) |
+                    (@as(u64, dr.pci_dev) << 53) |
+                    (@as(u64, dr.pci_func) << 58),
             },
             .empty => EMPTY,
         };

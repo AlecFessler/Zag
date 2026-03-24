@@ -1,8 +1,6 @@
 const main = @import("main.zig");
 const util = @import("util.zig");
 
-const RouterContext = main.RouterContext;
-
 const DHCP_DISCOVER: u8 = 1;
 const DHCP_OFFER: u8 = 2;
 const DHCP_REQUEST: u8 = 3;
@@ -10,12 +8,12 @@ const DHCP_ACK: u8 = 5;
 
 pub const DhcpClientState = enum { idle, discovering, requesting, bound };
 
-pub fn sendDiscover(ctx: *RouterContext) void {
+pub fn sendDiscover() void {
     var pkt: [600]u8 = undefined;
     @memset(&pkt, 0);
 
     @memset(pkt[0..6], 0xFF);
-    @memcpy(pkt[6..12], &ctx.wan_mac);
+    @memcpy(pkt[6..12], &main.wan_iface.mac);
     pkt[12] = 0x08;
     pkt[13] = 0x00;
 
@@ -35,12 +33,12 @@ pub fn sendDiscover(ctx: *RouterContext) void {
     pkt[dhcp_start + 2] = 6;
     pkt[dhcp_start + 3] = 0;
 
-    pkt[dhcp_start + 4] = @truncate(ctx.dhcp_client_xid >> 24);
-    pkt[dhcp_start + 5] = @truncate(ctx.dhcp_client_xid >> 16);
-    pkt[dhcp_start + 6] = @truncate(ctx.dhcp_client_xid >> 8);
-    pkt[dhcp_start + 7] = @truncate(ctx.dhcp_client_xid);
+    pkt[dhcp_start + 4] = @truncate(main.dhcp_client_xid >> 24);
+    pkt[dhcp_start + 5] = @truncate(main.dhcp_client_xid >> 16);
+    pkt[dhcp_start + 6] = @truncate(main.dhcp_client_xid >> 8);
+    pkt[dhcp_start + 7] = @truncate(main.dhcp_client_xid);
 
-    @memcpy(pkt[dhcp_start + 28 ..][0..6], &ctx.wan_mac);
+    @memcpy(pkt[dhcp_start + 28 ..][0..6], &main.wan_iface.mac);
 
     const magic: usize = dhcp_start + 236;
     pkt[magic] = 0x63;
@@ -69,18 +67,18 @@ pub fn sendDiscover(ctx: *RouterContext) void {
     pkt[25] = @truncate(ip_cs);
 
     const send_len = @max(@as(usize, @intCast(14 + ip_total)), 60);
-    _ = ctx.wan_chan.send(pkt[0..send_len]);
-    ctx.dhcp_client_state = .discovering;
-    ctx.dhcp_client_start_ns = util.now();
+    _ = main.wan_iface.txSendLocal(pkt[0..send_len]);
+    main.dhcp_client_state = .discovering;
+    main.dhcp_client_start_ns = util.now();
     util.logEvent("dhcp-client: sent DISCOVER on WAN\n");
 }
 
-pub fn sendRequest(ctx: *RouterContext) void {
+pub fn sendRequest() void {
     var pkt: [600]u8 = undefined;
     @memset(&pkt, 0);
 
     @memset(pkt[0..6], 0xFF);
-    @memcpy(pkt[6..12], &ctx.wan_mac);
+    @memcpy(pkt[6..12], &main.wan_iface.mac);
     pkt[12] = 0x08;
     pkt[13] = 0x00;
 
@@ -99,11 +97,11 @@ pub fn sendRequest(ctx: *RouterContext) void {
     pkt[dhcp_start + 1] = 1;
     pkt[dhcp_start + 2] = 6;
     pkt[dhcp_start + 3] = 0;
-    pkt[dhcp_start + 4] = @truncate(ctx.dhcp_client_xid >> 24);
-    pkt[dhcp_start + 5] = @truncate(ctx.dhcp_client_xid >> 16);
-    pkt[dhcp_start + 6] = @truncate(ctx.dhcp_client_xid >> 8);
-    pkt[dhcp_start + 7] = @truncate(ctx.dhcp_client_xid);
-    @memcpy(pkt[dhcp_start + 28 ..][0..6], &ctx.wan_mac);
+    pkt[dhcp_start + 4] = @truncate(main.dhcp_client_xid >> 24);
+    pkt[dhcp_start + 5] = @truncate(main.dhcp_client_xid >> 16);
+    pkt[dhcp_start + 6] = @truncate(main.dhcp_client_xid >> 8);
+    pkt[dhcp_start + 7] = @truncate(main.dhcp_client_xid);
+    @memcpy(pkt[dhcp_start + 28 ..][0..6], &main.wan_iface.mac);
 
     const magic: usize = dhcp_start + 236;
     pkt[magic] = 0x63;
@@ -119,12 +117,12 @@ pub fn sendRequest(ctx: *RouterContext) void {
 
     pkt[opt] = 50;
     pkt[opt + 1] = 4;
-    @memcpy(pkt[opt + 2 ..][0..4], &ctx.dhcp_offered_ip);
+    @memcpy(pkt[opt + 2 ..][0..4], &main.dhcp_offered_ip);
     opt += 6;
 
     pkt[opt] = 54;
     pkt[opt + 1] = 4;
-    @memcpy(pkt[opt + 2 ..][0..4], &ctx.dhcp_server_ip);
+    @memcpy(pkt[opt + 2 ..][0..4], &main.dhcp_server_ip);
     opt += 6;
 
     pkt[opt] = 255;
@@ -143,14 +141,14 @@ pub fn sendRequest(ctx: *RouterContext) void {
     pkt[25] = @truncate(ip_cs);
 
     const send_len = @max(@as(usize, @intCast(14 + ip_total)), 60);
-    _ = ctx.wan_chan.send(pkt[0..send_len]);
-    ctx.dhcp_client_state = .requesting;
-    ctx.dhcp_client_start_ns = util.now();
+    _ = main.wan_iface.txSendLocal(pkt[0..send_len]);
+    main.dhcp_client_state = .requesting;
+    main.dhcp_client_start_ns = util.now();
     util.logEvent("dhcp-client: sent REQUEST on WAN\n");
 }
 
-pub fn handleResponse(ctx: *RouterContext, pkt: []const u8, len: u32) void {
-    if (ctx.dhcp_client_state == .idle or ctx.dhcp_client_state == .bound) return;
+pub fn handleResponse(pkt: []const u8, len: u32) void {
+    if (main.dhcp_client_state == .idle or main.dhcp_client_state == .bound) return;
     if (len < 282) return;
 
     const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
@@ -170,9 +168,9 @@ pub fn handleResponse(ctx: *RouterContext, pkt: []const u8, len: u32) void {
         @as(u32, pkt[dhcp_start + 5]) << 16 |
         @as(u32, pkt[dhcp_start + 6]) << 8 |
         pkt[dhcp_start + 7];
-    if (xid != ctx.dhcp_client_xid) return;
+    if (xid != main.dhcp_client_xid) return;
 
-    @memcpy(&ctx.dhcp_offered_ip, pkt[dhcp_start + 16 ..][0..4]);
+    @memcpy(&main.dhcp_offered_ip, pkt[dhcp_start + 16 ..][0..4]);
 
     const magic_offset = dhcp_start + 236;
     if (pkt[magic_offset] != 0x63 or pkt[magic_offset + 1] != 0x82 or
@@ -189,36 +187,36 @@ pub fn handleResponse(ctx: *RouterContext, pkt: []const u8, len: u32) void {
         }
         const olen = pkt[opt_idx + 1];
         if (o == 53 and olen >= 1) msg_type = pkt[opt_idx + 2];
-        if (o == 54 and olen >= 4) @memcpy(&ctx.dhcp_server_ip, pkt[opt_idx + 2 ..][0..4]);
-        if (o == 6 and olen >= 4) @memcpy(&ctx.upstream_dns, pkt[opt_idx + 2 ..][0..4]);
+        if (o == 54 and olen >= 4) @memcpy(&main.dhcp_server_ip, pkt[opt_idx + 2 ..][0..4]);
+        if (o == 6 and olen >= 4) @memcpy(&main.upstream_dns, pkt[opt_idx + 2 ..][0..4]);
         opt_idx += 2 + olen;
     }
 
-    if (msg_type == DHCP_OFFER and ctx.dhcp_client_state == .discovering) {
+    if (msg_type == DHCP_OFFER and main.dhcp_client_state == .discovering) {
         var buf: [64]u8 = undefined;
         var pos: usize = 0;
         pos = util.appendStr(&buf, pos, "dhcp-client: offered ");
-        pos = util.appendIp(&buf, pos, ctx.dhcp_offered_ip);
+        pos = util.appendIp(&buf, pos, main.dhcp_offered_ip);
         pos = util.appendStr(&buf, pos, "\n");
         util.logEvent(buf[0..pos]);
-        sendRequest(ctx);
-    } else if (msg_type == DHCP_ACK and ctx.dhcp_client_state == .requesting) {
-        ctx.wan_ip = ctx.dhcp_offered_ip;
-        ctx.dhcp_client_state = .bound;
+        sendRequest();
+    } else if (msg_type == DHCP_ACK and main.dhcp_client_state == .requesting) {
+        main.wan_iface.ip = main.dhcp_offered_ip;
+        main.dhcp_client_state = .bound;
         var buf: [64]u8 = undefined;
         var pos: usize = 0;
         pos = util.appendStr(&buf, pos, "dhcp-client: bound to ");
-        pos = util.appendIp(&buf, pos, ctx.wan_ip);
+        pos = util.appendIp(&buf, pos, main.wan_iface.ip);
         pos = util.appendStr(&buf, pos, "\n");
         util.logEvent(buf[0..pos]);
     }
 }
 
-pub fn tick(ctx: *RouterContext) void {
-    if (ctx.dhcp_client_state == .idle or ctx.dhcp_client_state == .bound) return;
-    if (util.now() -| ctx.dhcp_client_start_ns > 10_000_000_000) {
+pub fn tick() void {
+    if (main.dhcp_client_state == .idle or main.dhcp_client_state == .bound) return;
+    if (util.now() -| main.dhcp_client_start_ns > 10_000_000_000) {
         util.logEvent("dhcp-client: timeout, retrying\n");
-        ctx.dhcp_client_xid +%= 1;
-        sendDiscover(ctx);
+        main.dhcp_client_xid +%= 1;
+        sendDiscover();
     }
 }

@@ -75,3 +75,4 @@ fn writeByte(
     while ((cpu.inb(@intFromEnum(port) + offsets.lsr) & 0b0010_0000) == 0) {}
     cpu.outb(byte, @intFromEnum(port));
 }
+

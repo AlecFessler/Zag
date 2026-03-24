@@ -92,6 +92,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     const node = proc.vmm.findNode(faulting_virt) orelse {
         stack_mod.lookupGuard(proc.pid, faulting_virt);
         proc.kill();
+        arch.enableInterrupts();
         while (true) arch.halt();
     };
 

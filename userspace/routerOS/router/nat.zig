@@ -1,182 +1,196 @@
-const lib = @import("lib");
-
+/// NAT table with lock-free concurrent access.
+/// Outbound: keyed by (protocol, lan_ip, lan_port) — LAN thread inserts + looks up.
+/// Inbound: keyed by (protocol, wan_port) — WAN thread looks up.
+/// Expiry: main thread scans periodically.
+///
+/// Thread safety: entries use an atomic `state` field. Insert uses CAS on state.
+/// Lookup reads state atomically. Expiry writes state atomically.
 const arp = @import("arp.zig");
 const main = @import("main.zig");
 const util = @import("util.zig");
 
-const syscall = lib.syscall;
+const Interface = main.Interface;
 
-const RouterContext = main.RouterContext;
+pub const TABLE_SIZE = 256; // power of 2 for hash masking
 
-pub const TABLE_SIZE = 128;
-
-const TCP_SYN_TIMEOUT_NS: u64 = 30_000_000_000;
-const TCP_EST_TIMEOUT_NS: u64 = 300_000_000_000;
-const TCP_FIN_TIMEOUT_NS: u64 = 30_000_000_000;
+const ICMP_TIMEOUT_NS: u64 = 60_000_000_000;
 const UDP_TIMEOUT_NS: u64 = 120_000_000_000;
 const UDP_DNS_TIMEOUT_NS: u64 = 30_000_000_000;
-const ICMP_TIMEOUT_NS: u64 = 60_000_000_000;
+const TCP_ESTABLISHED_TIMEOUT_NS: u64 = 300_000_000_000;
+const TCP_OTHER_TIMEOUT_NS: u64 = 30_000_000_000;
 
-pub const TcpState = enum(u8) { none, syn_sent, established, fin_wait };
+const State = enum(u8) {
+    empty = 0,
+    active = 1,
+    expired = 2, // tombstone for linear probing
+};
+
+const TcpState = enum(u8) {
+    none = 0,
+    syn_sent = 1,
+    established = 2,
+    fin_wait = 3,
+};
 
 pub const NatEntry = struct {
-    valid: bool,
-    protocol: util.Protocol,
-    lan_ip: [4]u8,
-    lan_port: u16,
-    wan_port: u16,
-    timestamp_ns: u64,
-    tcp_state: TcpState,
-    dst_ip: [4]u8,
-    dst_port: u16,
+    // Atomic state field — all reads/writes go through atomics
+    state: u8 align(8) = @intFromEnum(State.empty),
+
+    protocol: u8 = 0,
+    lan_port: u16 = 0,
+    wan_port: u16 = 0,
+    dst_port: u16 = 0,
+    lan_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    dst_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    timestamp_ns: u64 = 0,
+    tcp_state: u8 = 0,
 };
 
-pub const empty = NatEntry{
-    .valid = false, .protocol = .icmp,
-    .lan_ip = .{ 0, 0, 0, 0 }, .lan_port = 0, .wan_port = 0, .timestamp_ns = 0,
-    .tcp_state = .none, .dst_ip = .{ 0, 0, 0, 0 }, .dst_port = 0,
-};
+pub const empty = NatEntry{};
 
-fn natTimeout(entry: *const NatEntry) u64 {
-    return switch (entry.protocol) {
-        .icmp => ICMP_TIMEOUT_NS,
-        .udp => if (entry.dst_port == 53) UDP_DNS_TIMEOUT_NS else UDP_TIMEOUT_NS,
-        .tcp => switch (entry.tcp_state) {
-            .syn_sent => TCP_SYN_TIMEOUT_NS,
-            .established => TCP_EST_TIMEOUT_NS,
-            .fin_wait => TCP_FIN_TIMEOUT_NS,
-            .none => UDP_TIMEOUT_NS,
-        },
-    };
+// ── Hash functions ──────────────────────────────────────────────────────
+
+fn hashOutbound(protocol: u8, lan_ip: [4]u8, lan_port: u16) u32 {
+    var h: u32 = @as(u32, protocol) *% 31;
+    h +%= @as(u32, lan_ip[0]) *% 257;
+    h +%= @as(u32, lan_ip[1]) *% 1031;
+    h +%= @as(u32, lan_ip[2]) *% 4099;
+    h +%= @as(u32, lan_ip[3]) *% 16411;
+    h +%= @as(u32, lan_port) *% 65537;
+    return h & (TABLE_SIZE - 1);
 }
 
-pub fn expire(table: *[TABLE_SIZE]NatEntry) void {
-    const ts = util.now();
-    for (table) |*e| {
-        if (e.valid and ts -| e.timestamp_ns > natTimeout(e)) {
-            e.valid = false;
+fn hashInbound(protocol: u8, wan_port: u16) u32 {
+    var h: u32 = @as(u32, protocol) *% 31;
+    h +%= @as(u32, wan_port) *% 65537;
+    return h & (TABLE_SIZE - 1);
+}
+
+fn loadState(entry: *const NatEntry) State {
+    return @enumFromInt(@atomicLoad(u8, &entry.state, .acquire));
+}
+
+fn storeState(entry: *NatEntry, s: State) void {
+    @atomicStore(u8, &entry.state, @intFromEnum(s), .release);
+}
+
+// ── Lookup ──────────────────────────────────────────────────────────────
+
+fn lookupOutbound(protocol: util.Protocol, lan_ip: [4]u8, lan_port: u16) ?*NatEntry {
+    const proto: u8 = @intFromEnum(protocol);
+    var idx = hashOutbound(proto, lan_ip, lan_port);
+    var probes: u32 = 0;
+    while (probes < TABLE_SIZE) : (probes += 1) {
+        const entry = &main.nat_table[idx];
+        const s = loadState(entry);
+        if (s == .empty) return null; // empty slot = end of chain
+        if (s == .active and entry.protocol == proto and
+            util.eql(&entry.lan_ip, &lan_ip) and entry.lan_port == lan_port)
+        {
+            @atomicStore(u64, &entry.timestamp_ns, util.now(), .release);
+            return entry;
+        }
+        idx = (idx + 1) & (TABLE_SIZE - 1);
+    }
+    return null;
+}
+
+fn lookupInbound(protocol: util.Protocol, wan_port: u16) ?*NatEntry {
+    const proto: u8 = @intFromEnum(protocol);
+    // Linear scan — inbound doesn't have its own hash table, scan all
+    for (&main.nat_table) |*entry| {
+        if (loadState(entry) == .active and entry.protocol == proto and entry.wan_port == wan_port) {
+            @atomicStore(u64, &entry.timestamp_ns, util.now(), .release);
+            return entry;
+        }
+    }
+    return null;
+}
+
+fn createOutbound(protocol: util.Protocol, lan_ip: [4]u8, lan_port: u16, dst_ip: [4]u8, dst_port: u16) ?*NatEntry {
+    const proto: u8 = @intFromEnum(protocol);
+    const wan_port = @atomicRmw(u16, &main.next_nat_port, .Add, 1, .monotonic);
+
+    var idx = hashOutbound(proto, lan_ip, lan_port);
+    var probes: u32 = 0;
+    while (probes < TABLE_SIZE) : (probes += 1) {
+        const entry = &main.nat_table[idx];
+        const s = loadState(entry);
+        if (s == .empty or s == .expired) {
+            // Try to claim this slot with CAS
+            const expected: u8 = @intFromEnum(s);
+            if (@cmpxchgWeak(u8, &entry.state, expected, @intFromEnum(State.active), .acq_rel, .monotonic) == null) {
+                // Won the slot — fill in fields
+                entry.protocol = proto;
+                entry.lan_ip = lan_ip;
+                entry.lan_port = lan_port;
+                entry.wan_port = wan_port;
+                entry.dst_ip = dst_ip;
+                entry.dst_port = dst_port;
+                entry.timestamp_ns = util.now();
+                entry.tcp_state = @intFromEnum(TcpState.none);
+                if (protocol == .tcp) entry.tcp_state = @intFromEnum(TcpState.syn_sent);
+                return entry;
+            }
+            // CAS failed — another thread claimed it, continue probing
+        }
+        idx = (idx + 1) & (TABLE_SIZE - 1);
+    }
+    return null;
+}
+
+// ── Expiry (main thread only) ───────────────────────────────────────────
+
+pub fn expire() void {
+    const now_ns = util.now();
+    for (&main.nat_table) |*entry| {
+        if (loadState(entry) != .active) continue;
+        const timeout = switch (@as(util.Protocol, @enumFromInt(entry.protocol))) {
+            .icmp => ICMP_TIMEOUT_NS,
+            .udp => if (entry.dst_port == 53) UDP_DNS_TIMEOUT_NS else UDP_TIMEOUT_NS,
+            .tcp => if (entry.tcp_state == @intFromEnum(TcpState.established)) TCP_ESTABLISHED_TIMEOUT_NS else TCP_OTHER_TIMEOUT_NS,
+        };
+        const ts = @atomicLoad(u64, &entry.timestamp_ns, .acquire);
+        if (now_ns -| ts > timeout) {
+            storeState(entry, .expired);
         }
     }
 }
 
-pub fn updateTcpState(entry: *NatEntry, pkt: []const u8, len: u32, transport_start: usize) void {
-    if (entry.protocol != .tcp) return;
-    if (transport_start + 14 > len) return;
+// ── TCP state tracking ──────────────────────────────────────────────────
 
+fn updateTcpState(entry: *NatEntry, pkt: []const u8, len: u32, transport_start: usize) void {
+    if (transport_start + 14 > len) return;
     const flags = pkt[transport_start + 13];
     const syn = (flags & 0x02) != 0;
     const fin = (flags & 0x01) != 0;
     const rst = (flags & 0x04) != 0;
     const ack = (flags & 0x10) != 0;
 
-    switch (entry.tcp_state) {
-        .none, .syn_sent => {
-            if (syn and !ack) {
-                entry.tcp_state = .syn_sent;
-            } else if (ack) {
-                entry.tcp_state = .established;
-            }
-        },
-        .established => {
-            if (fin or rst) {
-                entry.tcp_state = .fin_wait;
-            }
-        },
-        .fin_wait => {
-            if (rst) {
-                entry.valid = false;
-            }
-        },
-    }
-    entry.timestamp_ns = util.now();
+    const current: TcpState = @enumFromInt(entry.tcp_state);
+    const new_state: TcpState = switch (current) {
+        .none, .syn_sent => if (ack and !syn) .established else .syn_sent,
+        .established => if (fin or rst) .fin_wait else .established,
+        .fin_wait => if (rst) .none else .fin_wait,
+    };
+    @atomicStore(u8, &entry.tcp_state, @intFromEnum(new_state), .release);
 }
 
-fn logNat(action: []const u8, entry: *const NatEntry) void {
-    var buf: [128]u8 = undefined;
-    var pos: usize = 0;
-    pos = util.appendStr(&buf, pos, "nat: ");
-    pos = util.appendStr(&buf, pos, action);
-    pos = util.appendStr(&buf, pos, " ");
-    pos = util.appendStr(&buf, pos, switch (entry.protocol) {
-        .icmp => "icmp",
-        .tcp => "tcp",
-        .udp => "udp",
-    });
-    pos = util.appendStr(&buf, pos, " ");
-    pos = util.appendIp(&buf, pos, entry.lan_ip);
-    pos = util.appendStr(&buf, pos, ":");
-    pos = util.appendDec(&buf, pos, entry.lan_port);
-    pos = util.appendStr(&buf, pos, " -> ");
-    pos = util.appendIp(&buf, pos, entry.dst_ip);
-    pos = util.appendStr(&buf, pos, ":");
-    pos = util.appendDec(&buf, pos, entry.dst_port);
-    pos = util.appendStr(&buf, pos, " (wan:");
-    pos = util.appendDec(&buf, pos, entry.wan_port);
-    pos = util.appendStr(&buf, pos, ")\n");
-    syscall.write(buf[0..pos]);
-}
+// ── Forwarding (modifies headers in-place, returns true if ready) ───────
 
-pub fn lookupOutbound(table: *[TABLE_SIZE]NatEntry, proto: util.Protocol, lip: [4]u8, lport: u16) ?*NatEntry {
-    for (table) |*e| {
-        if (e.valid and e.protocol == proto and util.eql(&e.lan_ip, &lip) and e.lan_port == lport) {
-            e.timestamp_ns = util.now();
-            return e;
-        }
-    }
-    return null;
-}
-
-pub fn createOutbound(ctx: *RouterContext, proto: util.Protocol, lip: [4]u8, lport: u16, dip: [4]u8, dport: u16) ?*NatEntry {
-    const ts = util.now();
-    const tcp_state: TcpState = if (proto == .tcp) .syn_sent else .none;
-    var oldest_idx: usize = 0;
-    var oldest_ts: u64 = ts;
-    for (&ctx.nat_table, 0..) |*e, i| {
-        if (!e.valid) {
-            e.* = .{ .valid = true, .protocol = proto, .lan_ip = lip,
-                .lan_port = lport, .wan_port = ctx.next_nat_port, .timestamp_ns = ts,
-                .tcp_state = tcp_state, .dst_ip = dip, .dst_port = dport };
-            ctx.next_nat_port +%= 1;
-            if (ctx.next_nat_port < 10000) ctx.next_nat_port = 10000;
-            logNat("new", e);
-            return e;
-        }
-        if (e.timestamp_ns < oldest_ts) {
-            oldest_ts = e.timestamp_ns;
-            oldest_idx = i;
-        }
-    }
-    ctx.nat_table[oldest_idx] = .{ .valid = true, .protocol = proto, .lan_ip = lip,
-        .lan_port = lport, .wan_port = ctx.next_nat_port, .timestamp_ns = ts,
-        .tcp_state = tcp_state, .dst_ip = dip, .dst_port = dport };
-    ctx.next_nat_port +%= 1;
-    if (ctx.next_nat_port < 10000) ctx.next_nat_port = 10000;
-    logNat("new", &ctx.nat_table[oldest_idx]);
-    return &ctx.nat_table[oldest_idx];
-}
-
-pub fn lookupInbound(table: *[TABLE_SIZE]NatEntry, proto: util.Protocol, wport: u16) ?*NatEntry {
-    for (table) |*e| {
-        if (e.valid and e.protocol == proto and e.wan_port == wport) {
-            e.timestamp_ns = util.now();
-            return e;
-        }
-    }
-    return null;
-}
-
-pub fn forwardLanToWan(ctx: *RouterContext, pkt: []u8, len: u32) void {
-    if (len < 34) return;
+/// Rewrite headers in-place for LAN→WAN NAT. Returns true if ready to forward.
+pub fn forwardLanToWan(pkt: []u8, len: u32) bool {
+    if (len < 34) return false;
 
     var dst_ip: [4]u8 = undefined;
     @memcpy(&dst_ip, pkt[30..34]);
 
-    if (util.eql(&dst_ip, &ctx.lan_ip)) return;
-    if (main.isInLanSubnet(dst_ip)) return;
+    if (util.eql(&dst_ip, &main.lan_iface.ip)) return false;
+    if (main.isInLanSubnet(dst_ip)) return false;
 
-    const gateway_mac = arp.lookup(&ctx.wan_arp, .{ 10, 0, 2, 1 }) orelse {
-        arp.sendRequest(ctx, .wan, .{ 10, 0, 2, 1 });
-        return;
+    const gateway_mac = arp.lookup(&main.wan_iface.arp_table, .{ 10, 0, 2, 1 }) orelse {
+        arp.sendRequest(.wan, .{ 10, 0, 2, 1 });
+        return false;
     };
 
     const protocol = pkt[23];
@@ -184,21 +198,21 @@ pub fn forwardLanToWan(ctx: *RouterContext, pkt: []u8, len: u32) void {
 
     if (protocol == 1) {
         const icmp_start = 14 + ip_hdr_len;
-        if (icmp_start + 8 > len) return;
-        if (pkt[icmp_start] != 8) return;
+        if (icmp_start + 8 > len) return false;
+        if (pkt[icmp_start] != 8) return false;
 
         const orig_id = util.readU16Be(pkt[icmp_start + 4 ..][0..2]);
         var src_ip: [4]u8 = undefined;
         @memcpy(&src_ip, pkt[26..30]);
-
         var dst_ip_nat: [4]u8 = undefined;
         @memcpy(&dst_ip_nat, pkt[30..34]);
-        const nat_entry = lookupOutbound(&ctx.nat_table, .icmp, src_ip, orig_id) orelse
-            (createOutbound(ctx, .icmp, src_ip, orig_id, dst_ip_nat, 0) orelse return);
+
+        const nat_entry = lookupOutbound(.icmp, src_ip, orig_id) orelse
+            (createOutbound(.icmp, src_ip, orig_id, dst_ip_nat, 0) orelse return false);
 
         @memcpy(pkt[0..6], &gateway_mac);
-        @memcpy(pkt[6..12], &ctx.wan_mac);
-        @memcpy(pkt[26..30], &ctx.wan_ip);
+        @memcpy(pkt[6..12], &main.wan_iface.mac);
+        @memcpy(pkt[26..30], &main.wan_iface.ip);
         util.writeU16Be(pkt[icmp_start + 4 ..][0..2], nat_entry.wan_port);
 
         pkt[icmp_start + 2] = 0;
@@ -212,38 +226,34 @@ pub fn forwardLanToWan(ctx: *RouterContext, pkt: []u8, len: u32) void {
         const ip_cs = util.computeChecksum(pkt[14..][0..ip_hdr_len]);
         pkt[24] = @truncate(ip_cs >> 8);
         pkt[25] = @truncate(ip_cs);
-
-        _ = ctx.wan_chan.send(pkt[0..len]);
+        return true;
     } else if (protocol == 6 or protocol == 17) {
         const transport_start = 14 + ip_hdr_len;
-        if (transport_start + 4 > len) return;
+        if (transport_start + 4 > len) return false;
 
         const orig_port = util.readU16Be(pkt[transport_start..][0..2]);
         var src_ip: [4]u8 = undefined;
         @memcpy(&src_ip, pkt[26..30]);
-
         var dst_ip_tcp: [4]u8 = undefined;
         @memcpy(&dst_ip_tcp, pkt[30..34]);
         const dst_port_tcp = util.readU16Be(pkt[transport_start + 2 ..][0..2]);
         const proto: util.Protocol = if (protocol == 6) .tcp else .udp;
-        const nat_entry = lookupOutbound(&ctx.nat_table, proto, src_ip, orig_port) orelse
-            (createOutbound(ctx, proto, src_ip, orig_port, dst_ip_tcp, dst_port_tcp) orelse return);
+        const nat_entry = lookupOutbound(proto, src_ip, orig_port) orelse
+            (createOutbound(proto, src_ip, orig_port, dst_ip_tcp, dst_port_tcp) orelse return false);
 
-        if (protocol == 6) {
-            updateTcpState(nat_entry, pkt, len, transport_start);
-        }
+        if (protocol == 6) updateTcpState(nat_entry, pkt, len, transport_start);
 
         @memcpy(pkt[0..6], &gateway_mac);
-        @memcpy(pkt[6..12], &ctx.wan_mac);
+        @memcpy(pkt[6..12], &main.wan_iface.mac);
 
         if (protocol == 6) {
-            util.tcpChecksumAdjust(pkt, transport_start, len, src_ip, ctx.wan_ip, orig_port, nat_entry.wan_port);
+            util.tcpChecksumAdjust(pkt, transport_start, len, src_ip, main.wan_iface.ip, orig_port, nat_entry.wan_port);
         } else if (transport_start + 8 <= len) {
             pkt[transport_start + 6] = 0;
             pkt[transport_start + 7] = 0;
         }
 
-        @memcpy(pkt[26..30], &ctx.wan_ip);
+        @memcpy(pkt[26..30], &main.wan_iface.ip);
         util.writeU16Be(pkt[transport_start..][0..2], nat_entry.wan_port);
 
         pkt[24] = 0;
@@ -251,35 +261,33 @@ pub fn forwardLanToWan(ctx: *RouterContext, pkt: []u8, len: u32) void {
         const ip_cs = util.computeChecksum(pkt[14..][0..ip_hdr_len]);
         pkt[24] = @truncate(ip_cs >> 8);
         pkt[25] = @truncate(ip_cs);
-
-        ctx.wan_stats.tx_packets += 1;
-        ctx.wan_stats.tx_bytes += len;
-        _ = ctx.wan_chan.send(pkt[0..len]);
+        return true;
     }
+    return false;
 }
 
-pub fn forwardWanToLan(ctx: *RouterContext, pkt: []u8, len: u32) void {
-    if (len < 34) return;
+/// Rewrite headers in-place for WAN→LAN NAT reverse. Returns true if ready to forward.
+pub fn forwardWanToLan(pkt: []u8, len: u32) bool {
+    if (len < 34) return false;
 
     var dst_ip: [4]u8 = undefined;
     @memcpy(&dst_ip, pkt[30..34]);
-    if (!util.eql(&dst_ip, &ctx.wan_ip)) return;
+    if (!util.eql(&dst_ip, &main.wan_iface.ip)) return false;
 
     const protocol = pkt[23];
     const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
 
     if (protocol == 1) {
         const icmp_start = 14 + ip_hdr_len;
-        if (icmp_start + 8 > len) return;
-        if (pkt[icmp_start] != 0) return;
+        if (icmp_start + 8 > len) return false;
+        if (pkt[icmp_start] != 0) return false;
 
         const reply_id = util.readU16Be(pkt[icmp_start + 4 ..][0..2]);
-        const nat_entry = lookupInbound(&ctx.nat_table, .icmp, reply_id) orelse return;
-
-        const dst_mac = arp.lookup(&ctx.lan_arp, nat_entry.lan_ip) orelse return;
+        const nat_entry = lookupInbound(.icmp, reply_id) orelse return false;
+        const dst_mac = arp.lookup(&main.lan_iface.arp_table, nat_entry.lan_ip) orelse return false;
 
         @memcpy(pkt[0..6], &dst_mac);
-        @memcpy(pkt[6..12], &ctx.lan_mac);
+        @memcpy(pkt[6..12], &main.lan_iface.mac);
         @memcpy(pkt[30..34], &nat_entry.lan_ip);
         util.writeU16Be(pkt[icmp_start + 4 ..][0..2], nat_entry.lan_port);
 
@@ -294,26 +302,21 @@ pub fn forwardWanToLan(ctx: *RouterContext, pkt: []u8, len: u32) void {
         const ip_cs = util.computeChecksum(pkt[14..][0..ip_hdr_len]);
         pkt[24] = @truncate(ip_cs >> 8);
         pkt[25] = @truncate(ip_cs);
-
-        if (ctx.lan_chan) |*ch| {
-            _ = ch.send(pkt[0..len]);
-        }
+        return true;
     } else if (protocol == 6 or protocol == 17) {
         const transport_start = 14 + ip_hdr_len;
-        if (transport_start + 4 > len) return;
+        if (transport_start + 4 > len) return false;
 
         const dst_port = util.readU16Be(pkt[transport_start + 2 ..][0..2]);
         const proto: util.Protocol = if (protocol == 6) .tcp else .udp;
-        const nat_entry = lookupInbound(&ctx.nat_table, proto, dst_port) orelse return;
+        const nat_entry = lookupInbound(proto, dst_port) orelse return false;
 
-        if (protocol == 6) {
-            updateTcpState(nat_entry, pkt, len, transport_start);
-        }
+        if (protocol == 6) updateTcpState(nat_entry, pkt, len, transport_start);
 
-        const dst_mac = arp.lookup(&ctx.lan_arp, nat_entry.lan_ip) orelse return;
+        const dst_mac = arp.lookup(&main.lan_iface.arp_table, nat_entry.lan_ip) orelse return false;
 
         @memcpy(pkt[0..6], &dst_mac);
-        @memcpy(pkt[6..12], &ctx.lan_mac);
+        @memcpy(pkt[6..12], &main.lan_iface.mac);
 
         var old_dst_ip: [4]u8 = undefined;
         @memcpy(&old_dst_ip, pkt[30..34]);
@@ -333,11 +336,7 @@ pub fn forwardWanToLan(ctx: *RouterContext, pkt: []u8, len: u32) void {
         const ip_cs = util.computeChecksum(pkt[14..][0..ip_hdr_len]);
         pkt[24] = @truncate(ip_cs >> 8);
         pkt[25] = @truncate(ip_cs);
-
-        ctx.lan_stats.tx_packets += 1;
-        ctx.lan_stats.tx_bytes += len;
-        if (ctx.lan_chan) |*ch| {
-            _ = ch.send(pkt[0..len]);
-        }
+        return true;
     }
+    return false;
 }

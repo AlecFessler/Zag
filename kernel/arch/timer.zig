@@ -21,10 +21,12 @@ pub const ONE_QUADRILLION_NS = 1_000_000_000_000_000;
 pub const TEN_MILLION_NS = 10_000_000;
 
 pub fn nanosFromTicksFloor(freq_hz: u64, ticks: u64) u64 {
-    return (ticks * ONE_BILLION_NS) / freq_hz;
+    const wide: u128 = @as(u128, ticks) * ONE_BILLION_NS;
+    return @truncate(wide / freq_hz);
 }
 
 pub fn ticksFromNanosCeil(freq_hz: u64, ns: u64) u64 {
-    return (freq_hz * ns + ONE_BILLION_NS - 1) / ONE_BILLION_NS;
+    const wide: u128 = @as(u128, freq_hz) * ns + ONE_BILLION_NS - 1;
+    return @truncate(wide / ONE_BILLION_NS);
 }
 

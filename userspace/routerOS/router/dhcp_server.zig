@@ -1,8 +1,6 @@
 const main = @import("main.zig");
 const util = @import("util.zig");
 
-const RouterContext = main.RouterContext;
-
 pub const TABLE_SIZE = 32;
 
 const DHCP_DISCOVER: u8 = 1;
@@ -25,23 +23,23 @@ fn findLease(leases: []const DhcpLease, mac: [6]u8) ?[4]u8 {
     return null;
 }
 
-fn allocateLease(ctx: *RouterContext, mac: [6]u8) ?[4]u8 {
-    if (findLease(&ctx.dhcp_leases, mac)) |ip| return ip;
-    for (&ctx.dhcp_leases) |*l| {
+fn allocateLease(mac: [6]u8) ?[4]u8 {
+    if (findLease(&main.dhcp_leases, mac)) |ip| return ip;
+    for (&main.dhcp_leases) |*l| {
         if (!l.valid) {
-            l.ip = .{ 192, 168, 1, ctx.dhcp_next_ip };
+            l.ip = .{ 192, 168, 1, main.dhcp_next_ip };
             @memcpy(&l.mac, &mac);
             l.valid = true;
-            ctx.dhcp_next_ip +%= 1;
-            if (ctx.dhcp_next_ip < 100) ctx.dhcp_next_ip = 100;
+            main.dhcp_next_ip +%= 1;
+            if (main.dhcp_next_ip < 100) main.dhcp_next_ip = 100;
             return l.ip;
         }
     }
     return null;
 }
 
-pub fn handle(ctx: *RouterContext, pkt: []const u8, len: u32) void {
-    if (!ctx.has_lan) return;
+pub fn handle(pkt: []const u8, len: u32) void {
+    if (!main.has_lan) return;
     if (len < 282) return;
 
     const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
@@ -81,18 +79,18 @@ pub fn handle(ctx: *RouterContext, pkt: []const u8, len: u32) void {
     }
 
     if (msg_type == DHCP_DISCOVER or msg_type == DHCP_REQUEST) {
-        const offer_ip = allocateLease(ctx, client_mac) orelse return;
+        const offer_ip = allocateLease(client_mac) orelse return;
         const response_type: u8 = if (msg_type == DHCP_DISCOVER) DHCP_OFFER else DHCP_ACK;
-        sendResponse(ctx, pkt[dhcp_start..], client_mac, offer_ip, response_type);
+        sendResponse(pkt[dhcp_start..], client_mac, offer_ip, response_type);
     }
 }
 
-fn sendResponse(ctx: *RouterContext, request: []const u8, client_mac: [6]u8, offer_ip: [4]u8, msg_type: u8) void {
+fn sendResponse(request: []const u8, client_mac: [6]u8, offer_ip: [4]u8, msg_type: u8) void {
     var pkt: [600]u8 = undefined;
     @memset(&pkt, 0);
 
     @memset(pkt[0..6], 0xFF);
-    @memcpy(pkt[6..12], &ctx.lan_mac);
+    @memcpy(pkt[6..12], &main.lan_iface.mac);
     pkt[12] = 0x08;
     pkt[13] = 0x00;
 
@@ -100,7 +98,7 @@ fn sendResponse(ctx: *RouterContext, request: []const u8, client_mac: [6]u8, off
     pkt[15] = 0x00;
     pkt[22] = 64;
     pkt[23] = 17;
-    @memcpy(pkt[26..30], &ctx.lan_ip);
+    @memcpy(pkt[26..30], &main.lan_iface.ip);
     @memset(pkt[30..34], 0xFF);
 
     const udp_start: usize = 34;
@@ -114,7 +112,7 @@ fn sendResponse(ctx: *RouterContext, request: []const u8, client_mac: [6]u8, off
     pkt[dhcp_start + 3] = 0;
     @memcpy(pkt[dhcp_start + 4 ..][0..4], request[4..8]);
     @memcpy(pkt[dhcp_start + 16 ..][0..4], &offer_ip);
-    @memcpy(pkt[dhcp_start + 20 ..][0..4], &ctx.lan_ip);
+    @memcpy(pkt[dhcp_start + 20 ..][0..4], &main.lan_iface.ip);
     @memcpy(pkt[dhcp_start + 28 ..][0..6], &client_mac);
 
     const magic: usize = dhcp_start + 236;
@@ -136,12 +134,12 @@ fn sendResponse(ctx: *RouterContext, request: []const u8, client_mac: [6]u8, off
 
     pkt[opt] = 3;
     pkt[opt + 1] = 4;
-    @memcpy(pkt[opt + 2 ..][0..4], &ctx.lan_ip);
+    @memcpy(pkt[opt + 2 ..][0..4], &main.lan_iface.ip);
     opt += 6;
 
     pkt[opt] = 6;
     pkt[opt + 1] = 4;
-    @memcpy(pkt[opt + 2 ..][0..4], &ctx.lan_ip);
+    @memcpy(pkt[opt + 2 ..][0..4], &main.lan_iface.ip);
     opt += 6;
 
     pkt[opt] = 51;
@@ -154,7 +152,7 @@ fn sendResponse(ctx: *RouterContext, request: []const u8, client_mac: [6]u8, off
 
     pkt[opt] = 54;
     pkt[opt + 1] = 4;
-    @memcpy(pkt[opt + 2 ..][0..4], &ctx.lan_ip);
+    @memcpy(pkt[opt + 2 ..][0..4], &main.lan_iface.ip);
     opt += 6;
 
     pkt[opt] = 255;
@@ -175,7 +173,5 @@ fn sendResponse(ctx: *RouterContext, request: []const u8, client_mac: [6]u8, off
 
     const total_len = 14 + ip_total;
     const send_len = if (total_len < 60) @as(usize, 60) else @as(usize, @intCast(total_len));
-    if (ctx.lan_chan) |*ch| {
-        _ = ch.send(pkt[0..send_len]);
-    }
+    _ = main.lan_iface.txSendLocal(pkt[0..send_len]);
 }

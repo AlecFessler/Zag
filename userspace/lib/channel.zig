@@ -176,6 +176,16 @@ pub const Channel = struct {
         };
     }
 
+    pub fn openAsSideA(base: *ChannelHeader) ?Channel {
+        if (!base.isValid()) return null;
+        return .{
+            .header = base,
+            .tx = base.ringA(),
+            .rx = base.ringB(),
+            .ring_size = base.ring_size,
+        };
+    }
+
     pub fn openAsSideB(base: *ChannelHeader) ?Channel {
         if (!base.isValid()) return null;
         return .{

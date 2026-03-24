@@ -2,23 +2,20 @@ const arp = @import("arp.zig");
 const main = @import("main.zig");
 const util = @import("util.zig");
 
-const RouterContext = main.RouterContext;
-
 pub const PingState = enum { idle, arp_pending, echo_sent };
 
 const ping_id: u16 = 0x5A47;
 const timeout_ns: u64 = 3_000_000_000;
 const total: u8 = 4;
 
-pub fn sendEchoRequest(ctx: *RouterContext) void {
+pub fn sendEchoRequest() void {
     var pkt: [98]u8 = undefined;
     @memset(&pkt, 0);
 
-    const src_mac = ctx.ifaceMac(ctx.ping_iface);
-    const src_ip = ctx.ifaceIp(ctx.ping_iface);
+    const ifc = main.getIface(main.ping_iface);
 
-    @memcpy(pkt[0..6], &ctx.ping_target_mac);
-    @memcpy(pkt[6..12], src_mac);
+    @memcpy(pkt[0..6], &main.ping_target_mac);
+    @memcpy(pkt[6..12], &ifc.mac);
     pkt[12] = 0x08;
     pkt[13] = 0x00;
 
@@ -27,8 +24,8 @@ pub fn sendEchoRequest(ctx: *RouterContext) void {
     util.writeU16Be(pkt[18..20], ping_id);
     pkt[22] = 64;
     pkt[23] = 1;
-    @memcpy(pkt[26..30], src_ip);
-    @memcpy(pkt[30..34], &ctx.ping_target_ip);
+    @memcpy(pkt[26..30], &ifc.ip);
+    @memcpy(pkt[30..34], &main.ping_target_ip);
 
     pkt[24] = 0;
     pkt[25] = 0;
@@ -38,7 +35,7 @@ pub fn sendEchoRequest(ctx: *RouterContext) void {
 
     pkt[34] = 8;
     util.writeU16Be(pkt[38..40], ping_id);
-    util.writeU16Be(pkt[40..42], ctx.ping_seq);
+    util.writeU16Be(pkt[40..42], main.ping_seq);
 
     pkt[36] = 0;
     pkt[37] = 0;
@@ -46,13 +43,13 @@ pub fn sendEchoRequest(ctx: *RouterContext) void {
     pkt[36] = @truncate(icmp_cs >> 8);
     pkt[37] = @truncate(icmp_cs);
 
-    ctx.ping_start_ns = util.now();
-    ctx.ping_state = .echo_sent;
-    _ = ctx.ifaceChan(ctx.ping_iface).send(&pkt);
+    main.ping_start_ns = util.now();
+    main.ping_state = .echo_sent;
+    _ = ifc.txSendLocal(&pkt);
 }
 
-pub fn handleEchoReply(ctx: *RouterContext, pkt: []const u8, len: u32) void {
-    if (ctx.ping_state != .echo_sent) return;
+pub fn handleEchoReply(pkt: []const u8, len: u32) void {
+    if (main.ping_state != .echo_sent) return;
     if (len < 42) return;
     if (pkt[23] != 1) return;
 
@@ -63,77 +60,77 @@ pub fn handleEchoReply(ctx: *RouterContext, pkt: []const u8, len: u32) void {
 
     const reply_id = util.readU16Be(pkt[icmp_start + 4 ..][0..2]);
     const reply_seq = util.readU16Be(pkt[icmp_start + 6 ..][0..2]);
-    if (reply_id != ping_id or reply_seq != ctx.ping_seq) return;
+    if (reply_id != ping_id or reply_seq != main.ping_seq) return;
 
-    const rtt_us = (util.now() -| ctx.ping_start_ns) / 1000;
-    ctx.ping_received += 1;
+    const rtt_us = (util.now() -| main.ping_start_ns) / 1000;
+    main.ping_received += 1;
 
     var resp: [128]u8 = undefined;
     var pos: usize = 0;
     pos = util.appendStr(&resp, pos, "reply from ");
-    pos = util.appendIp(&resp, pos, ctx.ping_target_ip);
+    pos = util.appendIp(&resp, pos, main.ping_target_ip);
     pos = util.appendStr(&resp, pos, ": seq=");
-    pos = util.appendDec(&resp, pos, ctx.ping_seq);
+    pos = util.appendDec(&resp, pos, main.ping_seq);
     pos = util.appendStr(&resp, pos, " time=");
     pos = util.appendDec(&resp, pos, rtt_us);
     pos = util.appendStr(&resp, pos, "us");
-    if (ctx.console_chan) |*chan| {
+    if (main.console_chan) |*chan| {
         _ = chan.send(resp[0..pos]);
     }
 
-    ctx.ping_count += 1;
-    if (ctx.ping_count >= total) {
-        sendSummary(ctx);
-        ctx.ping_state = .idle;
+    main.ping_count += 1;
+    if (main.ping_count >= total) {
+        sendSummary();
+        main.ping_state = .idle;
     } else {
-        ctx.ping_seq += 1;
-        sendEchoRequest(ctx);
+        main.ping_seq += 1;
+        sendEchoRequest();
     }
 }
 
-fn sendSummary(ctx: *RouterContext) void {
+fn sendSummary() void {
     var resp: [128]u8 = undefined;
     var pos: usize = 0;
     pos = util.appendStr(&resp, pos, "--- ping ");
-    pos = util.appendIp(&resp, pos, ctx.ping_target_ip);
+    pos = util.appendIp(&resp, pos, main.ping_target_ip);
     pos = util.appendStr(&resp, pos, ": ");
     pos = util.appendDec(&resp, pos, total);
     pos = util.appendStr(&resp, pos, " sent, ");
-    pos = util.appendDec(&resp, pos, ctx.ping_received);
+    pos = util.appendDec(&resp, pos, main.ping_received);
     pos = util.appendStr(&resp, pos, " received ---");
-    if (ctx.console_chan) |*chan| {
+    if (main.console_chan) |*chan| {
         _ = chan.send(resp[0..pos]);
     }
 }
 
-pub fn checkTimeout(ctx: *RouterContext) void {
-    if (ctx.ping_state == .idle) return;
-    if (util.now() -| ctx.ping_start_ns < timeout_ns) return;
+pub fn checkTimeout() void {
+    if (main.ping_state == .idle) return;
+    if (util.now() -| main.ping_start_ns < timeout_ns) return;
 
     var resp: [128]u8 = undefined;
     var pos: usize = 0;
-    if (ctx.ping_state == .arp_pending) {
+    if (main.ping_state == .arp_pending) {
         pos = util.appendStr(&resp, pos, "ping: ARP timeout for ");
-        pos = util.appendIp(&resp, pos, ctx.ping_target_ip);
+        pos = util.appendIp(&resp, pos, main.ping_target_ip);
     } else {
         pos = util.appendStr(&resp, pos, "request timeout: seq=");
-        pos = util.appendDec(&resp, pos, ctx.ping_seq);
+        pos = util.appendDec(&resp, pos, main.ping_seq);
     }
-    if (ctx.console_chan) |*chan| {
+    if (main.console_chan) |*chan| {
         _ = chan.send(resp[0..pos]);
     }
 
-    ctx.ping_count += 1;
-    if (ctx.ping_count >= total) {
-        sendSummary(ctx);
-        ctx.ping_state = .idle;
+    main.ping_count += 1;
+    if (main.ping_count >= total) {
+        sendSummary();
+        main.ping_state = .idle;
     } else {
-        ctx.ping_seq += 1;
-        if (ctx.ping_state == .arp_pending) {
-            arp.sendRequest(ctx, ctx.ping_iface, ctx.ping_target_ip);
-            ctx.ping_start_ns = util.now();
+        main.ping_seq += 1;
+        if (main.ping_state == .arp_pending) {
+            arp.sendRequest(main.ping_iface, main.ping_target_ip);
+            main.ping_start_ns = util.now();
         } else {
-            sendEchoRequest(ctx);
+            sendEchoRequest();
         }
     }
 }

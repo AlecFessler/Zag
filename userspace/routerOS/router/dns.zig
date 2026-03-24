@@ -2,8 +2,6 @@ const arp = @import("arp.zig");
 const main = @import("main.zig");
 const util = @import("util.zig");
 
-const RouterContext = main.RouterContext;
-
 pub const RELAY_SIZE = 32;
 pub const DNS_PORT: u16 = 53;
 
@@ -21,8 +19,7 @@ pub const empty = DnsRelay{
     .client_port = 0, .query_id = 0, .relay_id = 0, .timestamp_ns = 0,
 };
 
-pub fn handleFromLan(ctx: *RouterContext, pkt: []u8, len: u32) void {
-    if (!ctx.has_wan) return;
+pub fn handleFromLan(pkt: []u8, len: u32) void {
     if (len < 34) return;
 
     const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
@@ -41,14 +38,14 @@ pub fn handleFromLan(ctx: *RouterContext, pkt: []u8, len: u32) void {
     if (dns_start + 2 > len) return;
     const query_id = util.readU16Be(pkt[dns_start..][0..2]);
 
-    const relay_id = ctx.next_dns_id;
-    ctx.next_dns_id +%= 1;
-    if (ctx.next_dns_id == 0) ctx.next_dns_id = 1;
+    const relay_id = main.next_dns_id;
+    main.next_dns_id +%= 1;
+    if (main.next_dns_id == 0) main.next_dns_id = 1;
 
     var slot: ?*DnsRelay = null;
     var oldest_idx: usize = 0;
     var oldest_ts: u64 = util.now();
-    for (&ctx.dns_relays, 0..) |*r, i| {
+    for (&main.dns_relays, 0..) |*r, i| {
         if (!r.valid) {
             slot = r;
             break;
@@ -58,7 +55,7 @@ pub fn handleFromLan(ctx: *RouterContext, pkt: []u8, len: u32) void {
             oldest_idx = i;
         }
     }
-    if (slot == null) slot = &ctx.dns_relays[oldest_idx];
+    if (slot == null) slot = &main.dns_relays[oldest_idx];
 
     slot.?.* = .{
         .valid = true,
@@ -71,15 +68,15 @@ pub fn handleFromLan(ctx: *RouterContext, pkt: []u8, len: u32) void {
 
     util.writeU16Be(pkt[dns_start..][0..2], relay_id);
 
-    const gateway_mac = arp.lookup(&ctx.wan_arp, ctx.upstream_dns) orelse {
-        arp.sendRequest(ctx, .wan, ctx.upstream_dns);
+    const gateway_mac = arp.lookup(&main.wan_iface.arp_table, main.upstream_dns) orelse {
+        arp.sendRequest(.wan, main.upstream_dns);
         return;
     };
 
     @memcpy(pkt[0..6], &gateway_mac);
-    @memcpy(pkt[6..12], &ctx.wan_mac);
-    @memcpy(pkt[26..30], &ctx.wan_ip);
-    @memcpy(pkt[30..34], &ctx.upstream_dns);
+    @memcpy(pkt[6..12], &main.wan_iface.mac);
+    @memcpy(pkt[26..30], &main.wan_iface.ip);
+    @memcpy(pkt[30..34], &main.upstream_dns);
 
     util.writeU16Be(pkt[udp_start..][0..2], relay_id);
 
@@ -92,13 +89,13 @@ pub fn handleFromLan(ctx: *RouterContext, pkt: []u8, len: u32) void {
     pkt[24] = @truncate(ip_cs >> 8);
     pkt[25] = @truncate(ip_cs);
 
-    ctx.wan_stats.tx_packets += 1;
-    ctx.wan_stats.tx_bytes += len;
-    _ = ctx.wan_chan.send(pkt[0..len]);
+    main.wan_iface.stats.tx_packets += 1;
+    main.wan_iface.stats.tx_bytes += len;
+    _ = main.wan_iface.txSendLocal(pkt[0..len]);
 }
 
-pub fn handleFromWan(ctx: *RouterContext, pkt: []u8, len: u32) void {
-    if (!ctx.has_lan) return;
+pub fn handleFromWan(pkt: []u8, len: u32) void {
+    if (!main.has_lan) return;
     if (len < 34) return;
 
     const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
@@ -113,18 +110,18 @@ pub fn handleFromWan(ctx: *RouterContext, pkt: []u8, len: u32) void {
     if (dns_start + 2 > len) return;
     const resp_id = util.readU16Be(pkt[dns_start..][0..2]);
 
-    for (&ctx.dns_relays) |*r| {
+    for (&main.dns_relays) |*r| {
         if (r.valid and r.relay_id == resp_id) {
             util.writeU16Be(pkt[dns_start..][0..2], r.query_id);
 
-            const client_mac = arp.lookup(&ctx.lan_arp, r.client_ip) orelse {
+            const client_mac = arp.lookup(&main.lan_iface.arp_table, r.client_ip) orelse {
                 r.valid = false;
                 return;
             };
 
             @memcpy(pkt[0..6], &client_mac);
-            @memcpy(pkt[6..12], &ctx.lan_mac);
-            @memcpy(pkt[26..30], &ctx.lan_ip);
+            @memcpy(pkt[6..12], &main.lan_iface.mac);
+            @memcpy(pkt[26..30], &main.lan_iface.ip);
             @memcpy(pkt[30..34], &r.client_ip);
 
             util.writeU16Be(pkt[udp_start + 2 ..][0..2], r.client_port);
@@ -139,11 +136,9 @@ pub fn handleFromWan(ctx: *RouterContext, pkt: []u8, len: u32) void {
             pkt[24] = @truncate(ip_cs >> 8);
             pkt[25] = @truncate(ip_cs);
 
-            ctx.lan_stats.tx_packets += 1;
-            ctx.lan_stats.tx_bytes += len;
-            if (ctx.lan_chan) |*ch| {
-                _ = ch.send(pkt[0..len]);
-            }
+            main.lan_iface.stats.tx_packets += 1;
+            main.lan_iface.stats.tx_bytes += len;
+            _ = main.lan_iface.txSendLocal(pkt[0..len]);
 
             r.valid = false;
             return;

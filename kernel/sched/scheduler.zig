@@ -4,6 +4,7 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const device_registry = zag.devices.registry;
+const futex = zag.sched.futex;
 const memory_init = zag.memory.init;
 const process_mod = zag.sched.process;
 const thread_mod = zag.sched.thread;
@@ -79,6 +80,7 @@ const PerCoreState = struct {
 };
 
 var core_states: [MAX_CORES]PerCoreState align(CACHE_LINE_SIZE) = [_]PerCoreState{.{}} ** MAX_CORES;
+var expire_core: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
 pub const SchedInterruptContext = struct {
     privilege: zag.perms.privilege.PrivilegePerm,
@@ -127,6 +129,10 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     }
 
     state.rq_lock.unlock();
+    if (core_id == expire_core.load(.monotonic)) {
+        futex.expireTimedWaiters();
+        expire_core.store((core_id + 1) % MAX_CORES, .monotonic);
+    }
     armSchedTimer(state, SCHED_TIMESLICE_NS);
     if (next == preempted) return;
     arch.switchTo(next);
