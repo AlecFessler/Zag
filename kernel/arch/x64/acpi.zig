@@ -503,11 +503,6 @@ fn pciConfigWrite32(ecam_base: VAddr, bus: u8, dev: u5, func: u3, offset: u12, v
     @as(*volatile u32, @ptrFromInt(addr)).* = value;
 }
 
-fn pciEcamEnableBusMaster(ecam_base: VAddr, bus: u8, dev: u5, func: u3) void {
-    const cmd = pciConfigRead32(ecam_base, bus, dev, func, 0x04);
-    pciConfigWrite32(ecam_base, bus, dev, func, 0x04, cmd | 0x06); // Bus Master + Memory Space
-}
-
 fn pciEcamProbeBarSize(ecam_base: VAddr, bus: u8, dev: u5, func: u3, bar_offset: u12) u64 {
     const original = pciConfigRead32(ecam_base, bus, dev, func, bar_offset);
     pciConfigWrite32(ecam_base, bus, dev, func, bar_offset, 0xFFFFFFFF);
@@ -608,14 +603,7 @@ fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
                             @intCast(func),
                         ) catch continue;
 
-                        // Enable PCI bus master for network MMIO devices (via legacy ports)
-                        if (device_class == .network) {
-                            const pci_cmd = pciLegacyRead32(@intCast(bus), @intCast(dev), @intCast(func), 0x04);
-                            pciLegacyWrite32(@intCast(bus), @intCast(dev), @intCast(func), 0x04, pci_cmd | 0x06);
-                        }
                         // Only register the first MMIO BAR per PCI function.
-                        // e1000e has multiple BARs (flash, MSI-X) that would otherwise
-                        // appear as separate device handles.
                         break;
                     }
                 }
@@ -725,12 +713,8 @@ fn enumeratePciLegacy() void {
                             @intCast(func),
                         ) catch continue;
 
-                        // Enable PCI bus master + memory space for network MMIO devices
-                        if (device_class == .network) {
-                            const cmd = pciLegacyRead32(@intCast(bus), @intCast(dev), @intCast(func), 0x04);
-                            pciLegacyWrite32(@intCast(bus), @intCast(dev), @intCast(func), 0x04, cmd | 0x06);
-                        }
-                        break; // only first MMIO BAR per function
+                        // Only register the first MMIO BAR per PCI function.
+                        break;
                     }
                 }
             }

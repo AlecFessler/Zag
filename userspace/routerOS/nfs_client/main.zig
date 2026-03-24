@@ -274,7 +274,7 @@ fn sendRead(fh: *const nfs3.FileHandle, offset: u64) void {
 fn sendReadDir(dir_fh: *const nfs3.FileHandle) void {
     var buf: [512]u8 = undefined;
     pending_xid = allocXid();
-    const len = nfs3.buildReadDirRequest(&buf, pending_xid, dir_fh, readdir_cookie, readdir_cookieverf, 4096);
+    const len = nfs3.buildReadDirRequest(&buf, pending_xid, dir_fh, readdir_cookie, readdir_cookieverf, 1024);
     sendUdpPacket(SERVER_IP, nfs3.NFS_PORT, nfs3.LOCAL_PORT, buf[0..len]);
     state = .readdir_pending;
 }
@@ -490,49 +490,6 @@ fn parsePath(path: []const u8) void {
 fn getComponent(idx: u32) []const u8 {
     const comp = path_components[idx];
     return path_buf[comp.start..][0..comp.len];
-}
-
-fn startLookupChain(path: []const u8, op: enum { read, readdir, create, mkdir, remove }) void {
-    parsePath(path);
-    lookup_depth = 0;
-    current_fh = root_fh;
-
-    // For create/mkdir/remove, we look up the parent directory
-    const target_depth: u32 = switch (op) {
-        .create, .mkdir, .remove => if (num_components > 0) num_components - 1 else 0,
-        .read, .readdir => num_components,
-    };
-
-    if (target_depth == 0 and (op == .read or op == .readdir)) {
-        // Operating on root
-        switch (op) {
-            .read => {
-                read_offset = 0;
-                sendRead(&current_fh, 0);
-            },
-            .readdir => {
-                readdir_cookie = 0;
-                readdir_cookieverf = [_]u8{0} ** 8;
-                sendReadDir(&current_fh);
-            },
-            else => {},
-        }
-        return;
-    }
-
-    if (target_depth == 0) {
-        // create/mkdir/remove at root level
-        switch (op) {
-            .create => sendCreate(&root_fh, getComponent(0)),
-            .mkdir => sendMkdir(&root_fh, getComponent(0)),
-            .remove => sendRemove(&root_fh, getComponent(0)),
-            else => {},
-        }
-        return;
-    }
-
-    // Start looking up the first component
-    sendLookup(&current_fh, getComponent(0));
 }
 
 fn continueAfterLookup() void {

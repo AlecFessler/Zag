@@ -41,31 +41,12 @@ pub const SharedMemory = struct {
         const pmm_iface = pmm.global_pmm.?.allocator();
         errdefer shm.freePages();
 
-        // Try to allocate contiguous pages for DMA compatibility.
-        // Allocate all pages and check if they're contiguous.
-        // The PMM typically returns sequential pages on a fresh system.
         for (pages_slice) |*slot| {
             const page = pmm_iface.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
             const page_bytes: [*]u8 = @ptrCast(page);
             @memset(page_bytes[0..paging.PAGE4K], 0);
             slot.* = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
             shm.pages = pages_slice[0 .. shm.pages.len + 1];
-        }
-
-        // Verify contiguity (best effort - warn if not contiguous)
-        if (shm.pages.len > 1) {
-            const base = shm.pages[0].addr;
-            var contiguous = true;
-            for (shm.pages[1..], 1..) |p, i| {
-                if (p.addr != base + @as(u64, i) * paging.PAGE4K) {
-                    contiguous = false;
-                    break;
-                }
-            }
-            if (!contiguous) {
-                // Pages are not contiguous - DMA without IOMMU may not work
-                // For now, accept and rely on IOMMU or shm_phys_addr for fixup
-            }
         }
 
         return shm;

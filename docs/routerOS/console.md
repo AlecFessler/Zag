@@ -25,16 +25,37 @@ Interactive command-line interface over the serial port for monitoring and confi
 | `uptime` | Show time since boot |
 | `clear` | Clear terminal |
 
+### NFS Commands
+
+| Command | Description |
+|---------|-------------|
+| `mount` | Mount NFS export |
+| `ls [path]` | List directory |
+| `cat <path>` | Read file |
+| `put <path>` | Write file (end with empty line) |
+| `mkdir <path>` | Create directory |
+| `rm <path>` | Remove file |
+
+---
+
+## status
+
+```
+> status
+WAN: 10.0.2.15 mac=52:54:00:12:34:56
+LAN: 192.168.1.1 mac=52:54:00:12:34:57
+```
+
 ---
 
 ## ping
 
 ```
 > ping 10.0.2.1
-reply from 10.0.2.1: seq=0 time=201us
-reply from 10.0.2.1: seq=1 time=643us
-reply from 10.0.2.1: seq=2 time=661us
-reply from 10.0.2.1: seq=3 time=667us
+reply from 10.0.2.1: seq=0 time=81us
+reply from 10.0.2.1: seq=1 time=625us
+reply from 10.0.2.1: seq=2 time=131us
+reply from 10.0.2.1: seq=3 time=629us
 --- ping 10.0.2.1: 4 sent, 4 received ---
 ```
 
@@ -46,8 +67,8 @@ Auto-selects interface: LAN subnet (192.168.1.0/24) via LAN, all others via WAN.
 
 ```
 > ifstat
-WAN: rx=8 (708B) tx=3 (256B) drop=0
-LAN: rx=3 (180B) tx=3 (180B) drop=0
+WAN rx=4 tx=3 drop=0
+LAN rx=0 tx=0 drop=0
 ```
 
 ---
@@ -55,22 +76,30 @@ LAN: rx=3 (180B) tx=3 (180B) drop=0
 ## Firewall
 
 ```
-> block 10.0.2.99
-firewall: block rule added
+> block 1.2.3.4
+OK
 
-> allow 10.0.2.99
-firewall: rule removed
+> rules
+block 1.2.3.4
+---
+
+> allow 1.2.3.4
+OK
 ```
 
-Block rules apply to incoming WAN traffic. Blocked packets counted in `ifstat` drop counter. Up to 32 rules.
+Block rules apply to incoming WAN traffic. Up to 32 rules.
 
 ---
 
 ## Port Forwarding
 
 ```
-> forward tcp 80 192.168.1.100 8080
-forward: rule added
+> forward tcp 8080 192.168.1.100 80
+OK
+
+> rules
+forward tcp :8080 -> 192.168.1.100:80
+---
 ```
 
 Forwards WAN TCP/UDP port to LAN IP:port. TCP checksums adjusted incrementally (RFC 1624). Up to 16 rules.
@@ -81,7 +110,7 @@ Forwards WAN TCP/UDP port to LAN IP:port. TCP checksums adjusted incrementally (
 
 ```
 > dns 8.8.8.8
-DNS upstream set to 8.8.8.8
+OK
 ```
 
 Relays DNS queries (UDP 53) from LAN clients to the configured upstream. Default: 10.0.2.1. Updated automatically by DHCP client if option 6 is received. Up to 32 concurrent queries tracked.
@@ -92,10 +121,7 @@ Relays DNS queries (UDP 53) from LAN clients to the configured upstream. Default
 
 ```
 > dhcp-client
-DHCP client: discovering...
-
-> dhcp-client
-DHCP client: bound to 10.0.2.15 (server 10.0.2.2)
+DHCP client: idle -> discovering
 ```
 
 Starts DHCP on the WAN interface. The router sends DISCOVER, processes OFFER, sends REQUEST, and applies the ACK'd IP. Also learns upstream DNS from option 6. Retries on 10-second timeout.
@@ -106,12 +132,12 @@ Starts DHCP on the WAN interface. The router sends DISCOVER, processes OFFER, se
 
 ```
 > nat
-tcp 192.168.1.100:49152 -> 10.0.2.1:80 (wan:10001)
-icmp 192.168.1.100:1234 -> 10.0.2.1:0 (wan:10000)
---- 2 NAT entries ---
+tcp 192.168.1.100:49152 -> :10001 -> 10.0.2.1:80
+udp 192.168.1.100:1234 -> :10000 -> 10.0.2.1:53
+---
 ```
 
-Shows protocol, LAN source, destination, and translated WAN port. TCP entries track connection state (SYN/EST/FIN) with per-state timeouts:
+Shows protocol, LAN source, translated WAN port, and destination. TCP entries track connection state (SYN/EST/FIN) with per-state timeouts:
 
 | Protocol | State | Timeout |
 |----------|-------|---------|
@@ -128,14 +154,23 @@ Shows protocol, LAN source, destination, and translated WAN port. TCP entries tr
 
 ```
 > arp
-WAN ARP:
-  10.0.2.1 -> e6:11:e1:e5:b6:b9
-LAN ARP:
-  192.168.1.100 -> 3a:26:f0:f3:db:fc
---- 2 entries ---
+WAN 10.0.2.1 e6:11:e1:e5:b6:b9
+---
 ```
 
 16 entries per interface. Entries expire after 5 minutes of inactivity.
+
+---
+
+## DHCP Leases
+
+```
+> leases
+192.168.1.100 aa:bb:cc:dd:ee:ff
+---
+```
+
+Shows IP and MAC for each active DHCP lease. Up to 32 leases.
 
 ---
 

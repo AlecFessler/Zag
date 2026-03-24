@@ -1,6 +1,10 @@
 /// NFSv3 protocol procedures (RFC 1813) and MOUNT protocol.
+const lib = @import("lib");
+
 const rpc = @import("rpc.zig");
 const xdr = @import("xdr.zig");
+
+const syscall = lib.syscall;
 
 // Ports (skip portmapper, use fixed ports)
 pub const NFS_PORT: u16 = 2049;
@@ -65,7 +69,10 @@ pub fn parseMountReply(buf: []const u8, xid_val: u32) ?FileHandle {
     const body = rpc.parseReplyHeader(buf, xid_val) orelse return null;
     // Mount status
     const status = xdr.readU32(buf, body) orelse return null;
-    if (status.val != 0) return null;
+    if (status.val != 0) {
+        reportNfsError("MOUNT", status.val);
+        return null;
+    }
     // File handle (opaque)
     const fh = xdr.readOpaque(buf, status.pos) orelse return null;
     return FileHandle.fromSlice(fh.data);
@@ -107,7 +114,10 @@ pub fn buildLookupRequest(buf: []u8, xid_val: u32, dir_fh: *const FileHandle, na
 pub fn parseLookupReply(buf: []const u8, xid_val: u32) ?FileHandle {
     const body = rpc.parseReplyHeader(buf, xid_val) orelse return null;
     const status = xdr.readU32(buf, body) orelse return null;
-    if (status.val != NFS3_OK) return null;
+    if (status.val != NFS3_OK) {
+        reportNfsError("LOOKUP", status.val);
+        return null;
+    }
     const fh = xdr.readOpaque(buf, status.pos) orelse return null;
     return FileHandle.fromSlice(fh.data);
 }
@@ -130,7 +140,10 @@ pub const ReadResult = struct {
 pub fn parseReadReply(buf: []const u8, xid_val: u32) ?ReadResult {
     const body = rpc.parseReplyHeader(buf, xid_val) orelse return null;
     const status = xdr.readU32(buf, body) orelse return null;
-    if (status.val != NFS3_OK) return null;
+    if (status.val != NFS3_OK) {
+        reportNfsError("READ", status.val);
+        return null;
+    }
     // post_op_attr: bool(4) + if true, fattr3 (84 bytes)
     const has_attr = xdr.readU32(buf, status.pos) orelse return null;
     var p = has_attr.pos;
@@ -172,7 +185,10 @@ pub const ReadDirResult = struct {
 pub fn parseReadDirReply(buf: []const u8, xid_val: u32) ?ReadDirResult {
     const body = rpc.parseReplyHeader(buf, xid_val) orelse return null;
     const status = xdr.readU32(buf, body) orelse return null;
-    if (status.val != NFS3_OK) return null;
+    if (status.val != NFS3_OK) {
+        reportNfsError("READDIR", status.val);
+        return null;
+    }
     // post_op_attr
     const has_attr = xdr.readU32(buf, status.pos) orelse return null;
     var p = has_attr.pos;
@@ -223,7 +239,10 @@ pub fn buildWriteRequest(buf: []u8, xid_val: u32, fh: *const FileHandle, offset:
 pub fn parseWriteReply(buf: []const u8, xid_val: u32) ?u32 {
     const body = rpc.parseReplyHeader(buf, xid_val) orelse return null;
     const status = xdr.readU32(buf, body) orelse return null;
-    if (status.val != NFS3_OK) return null;
+    if (status.val != NFS3_OK) {
+        reportNfsError("WRITE", status.val);
+        return null;
+    }
     // wcc_data: pre_op(bool+opt), post_op(bool+opt)
     const pre = xdr.readU32(buf, status.pos) orelse return null;
     var p = pre.pos;
@@ -258,7 +277,10 @@ pub fn buildCreateRequest(buf: []u8, xid_val: u32, dir_fh: *const FileHandle, na
 pub fn parseCreateReply(buf: []const u8, xid_val: u32) ?FileHandle {
     const body = rpc.parseReplyHeader(buf, xid_val) orelse return null;
     const status = xdr.readU32(buf, body) orelse return null;
-    if (status.val != NFS3_OK) return null;
+    if (status.val != NFS3_OK) {
+        reportNfsError("CREATE", status.val);
+        return null;
+    }
     // post_op_fh3: bool(4) + optional fh(opaque)
     const has_fh = xdr.readU32(buf, status.pos) orelse return null;
     if (has_fh.val == 0) return null;
@@ -316,4 +338,27 @@ pub fn parseCommitReply(buf: []const u8, xid_val: u32) bool {
     const body = rpc.parseReplyHeader(buf, xid_val) orelse return false;
     const status = xdr.readU32(buf, body) orelse return false;
     return status.val == NFS3_OK;
+}
+
+// ── Diagnostics ────────────────────────────────────────────────────────
+
+fn reportNfsError(op: []const u8, status_code: u32) void {
+    syscall.write("nfs3: ");
+    syscall.write(op);
+    syscall.write(" error status=");
+    var buf: [10]u8 = undefined;
+    var v = status_code;
+    var i: usize = 10;
+    if (v == 0) {
+        i -= 1;
+        buf[i] = '0';
+    } else {
+        while (v > 0) {
+            i -= 1;
+            buf[i] = '0' + @as(u8, @truncate(v % 10));
+            v /= 10;
+        }
+    }
+    syscall.write(buf[i..10]);
+    syscall.write("\n");
 }

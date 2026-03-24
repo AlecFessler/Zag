@@ -105,16 +105,6 @@ pub const InitParams = struct {
     tx_bufs_dma_base: u64,
     rx_descs: *[NUM_RX_DESC]RxDesc,
     tx_descs: *[NUM_TX_DESC]TxDesc,
-    pci_bus: u8 = 0,
-    pci_dev: u5 = 0,
-    pci_func: u3 = 0,
-    /// If non-zero, use shm_phys_addr syscall to resolve per-buffer phys addrs
-    /// (TEMPORARY: for passthrough mode without IOMMU)
-    shm_handle: i64 = 0,
-    rx_bufs_shm_offset: u64 = 0,
-    tx_bufs_shm_offset: u64 = 0,
-    rx_descs_shm_offset: u64 = 0,
-    tx_descs_shm_offset: u64 = 0,
 };
 
 pub fn init(p: InitParams) bool {
@@ -136,7 +126,7 @@ pub fn init(p: InitParams) bool {
         asm volatile ("pause");
     }
 
-    // PCI bus master is enabled by the kernel in dma_map syscall
+    // PCI bus master must be enabled via pci_enable_bus_master after init
 
     // Disable interrupts again after reset
     writeReg(base, REG_IMC, 0xFFFFFFFF);
@@ -154,27 +144,12 @@ pub fn init(p: InitParams) bool {
     // ── RX ring setup ───────────────────────────────────────────────────
     i = 0;
     while (i < NUM_RX_DESC) : (i += 1) {
-        if (p.shm_handle != 0) {
-            // Passthrough: resolve each buffer's physical address individually
-            const dma_mod = @import("dma.zig");
-            p.rx_descs[i].buffer_addr = dma_mod.physAddrOf(p.shm_handle, p.rx_bufs_shm_offset + @as(u64, i) * PACKET_BUF_SIZE);
-        } else {
-            p.rx_descs[i].buffer_addr = p.rx_bufs_dma_base + @as(u64, i) * PACKET_BUF_SIZE;
-        }
+        p.rx_descs[i].buffer_addr = p.rx_bufs_dma_base + @as(u64, i) * PACKET_BUF_SIZE;
         p.rx_descs[i].status = 0;
     }
 
-    // For passthrough, descriptor ring phys addr also needs resolving
-    var rx_descs_phys = p.rx_descs_dma;
-    var tx_descs_phys = p.tx_descs_dma;
-    if (p.shm_handle != 0) {
-        const dma_mod = @import("dma.zig");
-        rx_descs_phys = dma_mod.physAddrOf(p.shm_handle, p.rx_descs_shm_offset);
-        tx_descs_phys = dma_mod.physAddrOf(p.shm_handle, p.tx_descs_shm_offset);
-    }
-
-    writeReg(base, REG_RDBAL, @truncate(rx_descs_phys));
-    writeReg(base, REG_RDBAH, @truncate(rx_descs_phys >> 32));
+    writeReg(base, REG_RDBAL, @truncate(p.rx_descs_dma));
+    writeReg(base, REG_RDBAH, @truncate(p.rx_descs_dma >> 32));
     writeReg(base, REG_RDLEN, @sizeOf(RxDesc) * NUM_RX_DESC);
     writeReg(base, REG_RDH, 0);
 
@@ -188,17 +163,12 @@ pub fn init(p: InitParams) bool {
     // ── TX ring setup ───────────────────────────────────────────────────
     i = 0;
     while (i < NUM_TX_DESC) : (i += 1) {
-        if (p.shm_handle != 0) {
-            const dma_mod = @import("dma.zig");
-            p.tx_descs[i].buffer_addr = dma_mod.physAddrOf(p.shm_handle, p.tx_bufs_shm_offset + @as(u64, i) * PACKET_BUF_SIZE);
-        } else {
-            p.tx_descs[i].buffer_addr = p.tx_bufs_dma_base + @as(u64, i) * PACKET_BUF_SIZE;
-        }
+        p.tx_descs[i].buffer_addr = p.tx_bufs_dma_base + @as(u64, i) * PACKET_BUF_SIZE;
         p.tx_descs[i].status = TX_DESC_STA_DD;
     }
 
-    writeReg(base, REG_TDBAL, @truncate(tx_descs_phys));
-    writeReg(base, REG_TDBAH, @truncate(tx_descs_phys >> 32));
+    writeReg(base, REG_TDBAL, @truncate(p.tx_descs_dma));
+    writeReg(base, REG_TDBAH, @truncate(p.tx_descs_dma >> 32));
     writeReg(base, REG_TDLEN, @sizeOf(TxDesc) * NUM_TX_DESC);
     writeReg(base, REG_TDH, 0);
     writeReg(base, REG_TDT, 0);

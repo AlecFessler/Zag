@@ -74,22 +74,6 @@ fn allocZeroedPage() !struct { phys: PAddr, virt: VAddr } {
     return .{ .phys = phys, .virt = virt };
 }
 
-fn allocZeroedPages(num: u32) !struct { phys: PAddr, virt: VAddr } {
-    const pmm_iface = pmm.global_pmm.?.allocator();
-    const first = try pmm_iface.create(paging.PageMem(.page4k));
-    @memset(std.mem.asBytes(first), 0);
-
-    var i: u32 = 1;
-    while (i < num) : (i += 1) {
-        const page = try pmm_iface.create(paging.PageMem(.page4k));
-        @memset(std.mem.asBytes(page), 0);
-    }
-
-    const virt = VAddr.fromInt(@intFromPtr(first));
-    const phys = PAddr.fromVAddr(virt, null);
-    return .{ .phys = phys, .virt = virt };
-}
-
 pub fn init(reg_base_phys: PAddr) !void {
     const num_mmio_pages: u32 = 4;
     var i: u32 = 0;
@@ -254,8 +238,4 @@ fn invalidateIotlb() void {
 pub fn flushAll() void {
     if (!initialized) return;
     invalidateIotlb();
-}
-
-pub fn isInitialized() bool {
-    return initialized;
 }

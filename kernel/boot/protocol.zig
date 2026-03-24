@@ -22,6 +22,7 @@ pub const Blob = extern struct {
 
 pub const BootInfo = extern struct {
     elf_blob: Blob,
+    root_service: Blob,
     stack_top: VAddr,
     xsdp_phys: PAddr,
     mmap: MMap,

@@ -77,6 +77,9 @@ pub fn main() uefi.Status {
     const kernel_file = fs_mod.openFile(root_dir, "kernel.elf") catch return .aborted;
     const file_bytes = fs_mod.readFile(kernel_file, boot_services) catch return .aborted;
 
+    const rs_file = fs_mod.openFile(root_dir, "root_service.elf") catch return .aborted;
+    const rs_bytes = fs_mod.readFile(rs_file, boot_services) catch return .aborted;
+
     const parsed_elf_mem = boot_services.allocatePool(.loader_data, @sizeOf(ParsedElf)) catch return .aborted;
     const parsed_elf: *ParsedElf = @ptrCast(parsed_elf_mem.ptr);
     elf.parseElf(parsed_elf, file_bytes) catch return .aborted;
@@ -184,6 +187,8 @@ pub fn main() uefi.Status {
 
     boot_info.elf_blob.ptr = parsed_elf.bytes.ptr;
     boot_info.elf_blob.len = parsed_elf.bytes.len;
+    boot_info.root_service.ptr = rs_bytes.ptr;
+    boot_info.root_service.len = rs_bytes.len;
     boot_info.xsdp_phys = xsdp_phys;
     boot_info.stack_top = aligned_stack_top_virt;
     boot_info.mmap = boot_protocol.getMmap(boot_services) orelse return .aborted;

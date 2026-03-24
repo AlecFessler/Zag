@@ -190,13 +190,7 @@ fn testDmaMapBadHandle() void {
     const shm = syscall.shm_create(syscall.PAGE4K);
     if (shm <= 0) { t.fail("setup failed"); return; }
     const rc = syscall.dma_map(99999, @intCast(shm));
-    if (rc == -3) {
-        t.pass("S4.dma_map: invalid device handle returns E_BADCAP");
-    } else if (rc == -2) {
-        t.pass("S4.dma_map: no IOMMU returns E_PERM (expected without IOMMU)");
-    } else {
-        t.failWithVal("S4.dma_map: unexpected result", -3, rc);
-    }
+    t.expectEqual("S4.dma_map: invalid device handle returns E_BADCAP", -3, rc);
 }
 
 fn testDmaMapPortIoDevice(perm_view_addr: u64) void {
@@ -206,13 +200,7 @@ fn testDmaMapPortIoDevice(perm_view_addr: u64) void {
     const shm = syscall.shm_create(syscall.PAGE4K);
     if (shm <= 0) { t.fail("setup failed"); return; }
     const rc = syscall.dma_map(serial_entry.handle, @intCast(shm));
-    if (rc == -1) {
-        t.pass("S4.dma_map: port_io device rejected (E_INVAL)");
-    } else if (rc == -2) {
-        t.pass("S4.dma_map: no IOMMU returns E_PERM (expected without IOMMU)");
-    } else {
-        t.failWithVal("S4.dma_map: unexpected result for port_io", -1, rc);
-    }
+    t.expectEqual("S4.dma_map: port_io device rejected (E_INVAL)", -1, rc);
 }
 
 fn testIoportReadWidth2(perm_view_addr: u64) void {

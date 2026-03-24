@@ -1,5 +1,5 @@
 /// Shared DMA region layout for dual-NIC zero-copy router.
-/// One SHM mapped to both devices via IOMMU.
+/// One SHM mapped to both devices via dma_map (IOMMU or physical passthrough).
 const lib = @import("lib");
 
 const e1000 = @import("e1000.zig");
@@ -35,26 +35,12 @@ pub const TOTAL_SIZE: u64 = TOTAL_PAGES * PAGE;
 
 // ── Result of DMA setup ─────────────────────────────────────────────────
 
-/// Get the physical address for a byte offset within the SHM.
-/// Uses shm_phys_addr syscall for each page. Only for passthrough (no IOMMU).
-pub fn physAddrOf(shm_handle: i64, byte_offset: u64) u64 {
-    const page_idx = byte_offset / PAGE;
-    const page_off = byte_offset % PAGE;
-    const phys = syscall.shm_phys_addr(@intCast(shm_handle), page_idx);
-    if (phys < 0) return 0;
-    return @as(u64, @bitCast(phys)) + page_off;
-}
-
 pub const DmaRegion = struct {
     // Virtual base (CPU address)
     virt_base: u64,
-    // IOMMU DMA base per device
+    // DMA base per device (IOMMU-translated or physical)
     wan_dma_base: u64,
     lan_dma_base: u64,
-    // SHM handle
-    shm_handle: i64,
-    // True when using physical passthrough (no IOMMU)
-    passthrough: bool = false,
 
     // Convenience: virtual addresses of each section
     pub fn wanRxDescs(self: DmaRegion) *[e1000.NUM_RX_DESC]e1000.RxDesc {
@@ -121,40 +107,24 @@ pub fn setup(wan_device_handle: u64, lan_device_handle: u64) ?DmaRegion {
     const ptr: [*]u8 = @ptrFromInt(virt_base);
     @memset(ptr[0..TOTAL_SIZE], 0);
 
-    // DMA-map to WAN device (try IOMMU, fallback to physical passthrough)
-    var wan_dma_base: u64 = 0;
-    var lan_dma_base: u64 = 0;
-    var use_passthrough = false;
-
+    // DMA-map to both devices (works with or without IOMMU)
     const wan_dma_result = syscall.dma_map(wan_device_handle, @intCast(shm_handle));
-    if (wan_dma_result >= 0) {
-        wan_dma_base = @bitCast(wan_dma_result);
-        const lan_dma_result = syscall.dma_map(lan_device_handle, @intCast(shm_handle));
-        if (lan_dma_result >= 0) {
-            lan_dma_base = @bitCast(lan_dma_result);
-        } else {
-            lan_dma_base = wan_dma_base; // fallback: same mapping
-        }
-    } else {
-        // No IOMMU: use physical address of first page as base.
-        // ONLY works if pages happen to be contiguous (testing only).
-        const phys0 = syscall.shm_phys_addr(@intCast(shm_handle), 0);
-        if (phys0 < 0) {
-            syscall.write("dma: shm_phys_addr failed\n");
-            return null;
-        }
-        wan_dma_base = @bitCast(phys0);
-        lan_dma_base = wan_dma_base;
-        use_passthrough = true;
-        syscall.write("dma: passthrough\n");
+    if (wan_dma_result < 0) {
+        syscall.write("dma: WAN dma_map failed\n");
+        return null;
     }
+    const wan_dma_base: u64 = @bitCast(wan_dma_result);
+
+    const lan_dma_result = syscall.dma_map(lan_device_handle, @intCast(shm_handle));
+    const lan_dma_base: u64 = if (lan_dma_result >= 0)
+        @bitCast(lan_dma_result)
+    else
+        wan_dma_base;
 
     return .{
         .virt_base = virt_base,
         .wan_dma_base = wan_dma_base,
         .lan_dma_base = lan_dma_base,
-        .shm_handle = shm_handle,
-        .passthrough = use_passthrough,
     };
 }
 
@@ -175,22 +145,15 @@ pub fn setupSingle(wan_device_handle: u64) ?DmaRegion {
     const ptr: [*]u8 = @ptrFromInt(virt_base);
     @memset(ptr[0..TOTAL_SIZE], 0);
 
-    var wan_dma_base: u64 = 0;
     const wan_dma_result = syscall.dma_map(wan_device_handle, @intCast(shm_handle));
-    if (wan_dma_result >= 0) {
-        wan_dma_base = @bitCast(wan_dma_result);
-    } else {
-        const phys0 = syscall.shm_phys_addr(@intCast(shm_handle), 0);
-        if (phys0 < 0) return null;
-        wan_dma_base = @bitCast(phys0);
-        syscall.write("dma: passthrough\n");
+    if (wan_dma_result < 0) {
+        syscall.write("dma: dma_map failed\n");
+        return null;
     }
 
     return .{
         .virt_base = virt_base,
-        .wan_dma_base = wan_dma_base,
+        .wan_dma_base = @bitCast(wan_dma_result),
         .lan_dma_base = 0,
-        .shm_handle = shm_handle,
-        .passthrough = wan_dma_result < 0,
     };
 }

@@ -8,6 +8,8 @@ const memory = zag.memory.init;
 const sched = zag.sched.scheduler;
 
 const BootInfo = zag.boot.protocol.BootInfo;
+const PAddr = zag.memory.address.PAddr;
+const VAddr = zag.memory.address.VAddr;
 
 pub fn panic(
     msg: []const u8,
@@ -50,7 +52,10 @@ fn kMain(boot_info: *BootInfo) !void {
     try memory.initHeap();
     _ = try debug.info.init(boot_info.elf_blob, memory.heap_allocator);
     try arch.parseFirmwareTables(boot_info.xsdp_phys);
-    try sched.globalInit();
+    const rs_phys = PAddr.fromInt(@intFromPtr(boot_info.root_service.ptr));
+    const rs_virt = VAddr.fromPAddr(rs_phys, null);
+    const rs_ptr: [*]const u8 = @ptrFromInt(rs_virt.addr);
+    try sched.globalInit(rs_ptr[0..boot_info.root_service.len]);
     try arch.smpInit();
     sched.perCoreInit();
     arch.halt();

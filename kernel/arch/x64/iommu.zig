@@ -80,11 +80,3 @@ pub fn unmapDmaPages(device: *DeviceRegion, dma_base: u64, num_pages: u64) void 
 pub fn isAvailable() bool {
     return active_type != .none;
 }
-
-pub fn typeName() []const u8 {
-    return switch (active_type) {
-        .intel_vtd => "Intel VT-d",
-        .amd_vi => "AMD-Vi",
-        .none => "none",
-    };
-}

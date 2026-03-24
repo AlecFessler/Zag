@@ -174,10 +174,7 @@ pub const Iface = struct {
         if (@atomicLoad(u64, &self.pending_tx_flag, .acquire) == 0) return;
         const len = self.pending_tx_len;
         const tx_off = if (self.role == .wan) dma.WAN_TX_BUFS_OFF else dma.LAN_TX_BUFS_OFF;
-        const tx_bufs_dma = if (self.dma_region.passthrough)
-            dma.physAddrOf(self.dma_region.shm_handle, tx_off + @as(u64, self.tx_tail) * e1000.PACKET_BUF_SIZE) - @as(u64, self.tx_tail) * e1000.PACKET_BUF_SIZE
-        else
-            self.dma_base + tx_off;
+        const tx_bufs_dma = self.dma_base + tx_off;
         const tx_bufs_virt = self.dma_region.virt_base + tx_off;
         if (e1000.txSendCopy(self.mmio_base, self.tx_descs, &self.tx_tail, tx_bufs_dma, tx_bufs_virt, self.pending_tx_buf[0..len])) {
             self.stats.tx_packets += 1;

@@ -1,4 +1,3 @@
-const embedded = @import("embedded_bins");
 const std = @import("std");
 const zag = @import("zag");
 
@@ -131,7 +130,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     state.rq_lock.unlock();
     if (core_id == expire_core.load(.monotonic)) {
         futex.expireTimedWaiters();
-        expire_core.store((core_id + 1) % MAX_CORES, .monotonic);
+        expire_core.store((core_id + 1) % arch.coreCount(), .monotonic);
     }
     armSchedTimer(state, SCHED_TIMESLICE_NS);
     if (next == preempted) return;
@@ -149,7 +148,7 @@ pub fn enqueueOnCore(core_index: u64, thread: *Thread) void {
     state.rq_lock.unlockIrqRestore(irq);
 }
 
-pub fn globalInit() !void {
+pub fn globalInit(root_service_elf: []const u8) !void {
     proc_alloc_instance = try ProcessAllocator.init(memory_init.proc_slab_backing.allocator());
     process_mod.allocator = proc_alloc_instance.allocator();
 
@@ -162,7 +161,7 @@ pub fn globalInit() !void {
         state.rq.init();
     }
 
-    const root_proc = try Process.create(embedded.root_service, .{
+    const root_proc = try Process.create(root_service_elf, .{
         .grant_to = true,
         .spawn_thread = true,
         .spawn_process = true,

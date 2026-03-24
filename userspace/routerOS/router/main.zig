@@ -286,11 +286,6 @@ pub fn main(perm_view_addr: u64) void {
         .tx_bufs_dma_base = region.wanDma(dma.WAN_TX_BUFS_OFF),
         .rx_descs = region.wanRxDescs(),
         .tx_descs = region.wanTxDescs(),
-        .shm_handle = if (region.passthrough) region.shm_handle else 0,
-        .rx_bufs_shm_offset = dma.WAN_RX_BUFS_OFF,
-        .tx_bufs_shm_offset = dma.WAN_TX_BUFS_OFF,
-        .rx_descs_shm_offset = dma.WAN_RX_DESCS_OFF,
-        .tx_descs_shm_offset = dma.WAN_TX_DESCS_OFF,
     })) { syscall.write("router: e1000 init fail\n"); return; }
 
     _ = syscall.pci_enable_bus_master(wan_nic.handle);
@@ -325,7 +320,9 @@ pub fn main(perm_view_addr: u64) void {
         if (loop_n % 500 == 0) detectAppChannels(view, &mapped_handles, &mapped_count);
         if (console_chan) |*chan| {
             var cmd_buf: [256]u8 = undefined;
-            if (chan.recv(&cmd_buf)) |cmd_len| { _ = cmd_len; }
+            if (chan.recv(&cmd_buf)) |cmd_len| {
+                handleConsoleCommand(chan, cmd_buf[0..cmd_len]);
+            }
         }
         if (nfs_chan) |*chan| {
             var nfs_buf: [2048]u8 = undefined;
@@ -339,6 +336,240 @@ pub fn main(perm_view_addr: u64) void {
         ping_mod.checkTimeout();
         periodicMaintenance();
         syscall.thread_yield();
+    }
+}
+
+// ── Console command dispatch ─────────────────────────────────────────────
+
+fn handleConsoleCommand(chan: *channel_mod.Channel, cmd: []const u8) void {
+    if (cmd.len == 0) return;
+    var resp: [512]u8 = undefined;
+
+    if (util.eql(cmd, "status")) {
+        var p: usize = 0;
+        p = util.appendStr(&resp, p, "WAN: ");
+        p = util.appendIp(&resp, p, wan_iface.ip);
+        p = util.appendStr(&resp, p, " mac=");
+        p = util.appendMac(&resp, p, wan_iface.mac);
+        if (has_lan) {
+            p = util.appendStr(&resp, p, "\nLAN: ");
+            p = util.appendIp(&resp, p, lan_iface.ip);
+            p = util.appendStr(&resp, p, " mac=");
+            p = util.appendMac(&resp, p, lan_iface.mac);
+        }
+        _ = chan.send(resp[0..p]);
+    } else if (util.eql(cmd, "ifstat")) {
+        var p: usize = 0;
+        p = util.appendStr(&resp, p, "WAN rx=");
+        p = util.appendDec(&resp, p, wan_iface.stats.rx_packets);
+        p = util.appendStr(&resp, p, " tx=");
+        p = util.appendDec(&resp, p, wan_iface.stats.tx_packets);
+        p = util.appendStr(&resp, p, " drop=");
+        p = util.appendDec(&resp, p, wan_iface.stats.rx_dropped);
+        if (has_lan) {
+            p = util.appendStr(&resp, p, "\nLAN rx=");
+            p = util.appendDec(&resp, p, lan_iface.stats.rx_packets);
+            p = util.appendStr(&resp, p, " tx=");
+            p = util.appendDec(&resp, p, lan_iface.stats.tx_packets);
+            p = util.appendStr(&resp, p, " drop=");
+            p = util.appendDec(&resp, p, lan_iface.stats.rx_dropped);
+        }
+        _ = chan.send(resp[0..p]);
+    } else if (util.eql(cmd, "arp")) {
+        sendArpTable(chan, "WAN", &wan_iface.arp_table);
+        if (has_lan) sendArpTable(chan, "LAN", &lan_iface.arp_table);
+        _ = chan.send("---");
+    } else if (util.eql(cmd, "nat")) {
+        var count: u32 = 0;
+        for (&nat_table) |*e| {
+            if (@atomicLoad(u8, &e.state, .acquire) != 1) continue; // 1 = active
+            var p: usize = 0;
+            const proto_str: []const u8 = if (e.protocol == 6) "tcp" else if (e.protocol == 17) "udp" else "icmp";
+            p = util.appendStr(&resp, p, proto_str);
+            p = util.appendStr(&resp, p, " ");
+            p = util.appendIp(&resp, p, e.lan_ip);
+            p = util.appendStr(&resp, p, ":");
+            p = util.appendDec(&resp, p, e.lan_port);
+            p = util.appendStr(&resp, p, " -> :");
+            p = util.appendDec(&resp, p, e.wan_port);
+            p = util.appendStr(&resp, p, " -> ");
+            p = util.appendIp(&resp, p, e.dst_ip);
+            p = util.appendStr(&resp, p, ":");
+            p = util.appendDec(&resp, p, e.dst_port);
+            _ = chan.send(resp[0..p]);
+            count += 1;
+        }
+        if (count == 0) _ = chan.send("(empty)");
+        _ = chan.send("---");
+    } else if (util.eql(cmd, "leases")) {
+        var count: u32 = 0;
+        for (&dhcp_leases) |*l| {
+            if (!l.valid) continue;
+            var p: usize = 0;
+            p = util.appendIp(&resp, p, l.ip);
+            p = util.appendStr(&resp, p, " ");
+            p = util.appendMac(&resp, p, l.mac);
+            _ = chan.send(resp[0..p]);
+            count += 1;
+        }
+        if (count == 0) _ = chan.send("(empty)");
+        _ = chan.send("---");
+    } else if (util.eql(cmd, "rules")) {
+        var count: u32 = 0;
+        for (&firewall_rules) |*r| {
+            if (!r.valid) continue;
+            var p: usize = 0;
+            const action_str: []const u8 = if (r.action == .block) "block" else "allow";
+            p = util.appendStr(&resp, p, action_str);
+            p = util.appendStr(&resp, p, " ");
+            p = util.appendIp(&resp, p, r.src_ip);
+            if (r.protocol != 0) {
+                p = util.appendStr(&resp, p, " proto=");
+                p = util.appendDec(&resp, p, r.protocol);
+            }
+            if (r.dst_port != 0) {
+                p = util.appendStr(&resp, p, " port=");
+                p = util.appendDec(&resp, p, r.dst_port);
+            }
+            _ = chan.send(resp[0..p]);
+            count += 1;
+        }
+        for (&port_forwards) |*f| {
+            if (!f.valid) continue;
+            var p: usize = 0;
+            const proto_str: []const u8 = if (f.protocol == .tcp) "tcp" else "udp";
+            p = util.appendStr(&resp, p, "forward ");
+            p = util.appendStr(&resp, p, proto_str);
+            p = util.appendStr(&resp, p, " :");
+            p = util.appendDec(&resp, p, f.wan_port);
+            p = util.appendStr(&resp, p, " -> ");
+            p = util.appendIp(&resp, p, f.lan_ip);
+            p = util.appendStr(&resp, p, ":");
+            p = util.appendDec(&resp, p, f.lan_port);
+            _ = chan.send(resp[0..p]);
+            count += 1;
+        }
+        if (count == 0) _ = chan.send("(empty)");
+        _ = chan.send("---");
+    } else if (util.startsWith(cmd, "ping ")) {
+        const ip = util.parseIp(cmd[5..]) orelse {
+            _ = chan.send("invalid IP");
+            return;
+        };
+        ping_target_ip = ip;
+        ping_seq = 0;
+        ping_count = 0;
+        ping_received = 0;
+        ping_iface = if (isInLanSubnet(ip)) .lan else .wan;
+        const ifc = getIface(ping_iface);
+        if (arp.lookup(&ifc.arp_table, ip)) |mac| {
+            @memcpy(&ping_target_mac, &mac);
+            ping_mod.sendEchoRequest();
+        } else {
+            ping_state = .arp_pending;
+            ping_start_ns = util.now();
+            arp.sendRequest(ping_iface, ip);
+        }
+    } else if (util.startsWith(cmd, "block ")) {
+        const ip = util.parseIp(cmd[6..]) orelse {
+            _ = chan.send("invalid IP");
+            return;
+        };
+        for (&firewall_rules) |*r| {
+            if (!r.valid) {
+                r.* = .{ .valid = true, .action = .block, .src_ip = ip, .src_mask = .{ 255, 255, 255, 255 }, .protocol = 0, .dst_port = 0 };
+                _ = chan.send("OK");
+                return;
+            }
+        }
+        _ = chan.send("firewall table full");
+    } else if (util.startsWith(cmd, "allow ")) {
+        const ip = util.parseIp(cmd[6..]) orelse {
+            _ = chan.send("invalid IP");
+            return;
+        };
+        for (&firewall_rules) |*r| {
+            if (r.valid and r.action == .block and util.eql(&r.src_ip, &ip)) {
+                r.valid = false;
+                _ = chan.send("OK");
+                return;
+            }
+        }
+        _ = chan.send("rule not found");
+    } else if (util.startsWith(cmd, "forward ")) {
+        // forward tcp|udp <wport> <lip> <lport>
+        const args = cmd[8..];
+        var proto: util.Protocol = .tcp;
+        var rest: []const u8 = args;
+        if (util.startsWith(args, "tcp ")) {
+            rest = args[4..];
+        } else if (util.startsWith(args, "udp ")) {
+            proto = .udp;
+            rest = args[4..];
+        } else {
+            _ = chan.send("usage: forward tcp|udp <wport> <lip> <lport>");
+            return;
+        }
+        const parsed = util.parsePortIpPort(rest) orelse {
+            _ = chan.send("usage: forward tcp|udp <wport> <lip> <lport>");
+            return;
+        };
+        for (&port_forwards) |*f| {
+            if (!f.valid) {
+                f.* = .{ .valid = true, .protocol = proto, .wan_port = parsed.port1, .lan_ip = parsed.ip, .lan_port = parsed.port2 };
+                _ = chan.send("OK");
+                return;
+            }
+        }
+        _ = chan.send("port forward table full");
+    } else if (util.startsWith(cmd, "dns ")) {
+        const ip = util.parseIp(cmd[4..]) orelse {
+            _ = chan.send("invalid IP");
+            return;
+        };
+        upstream_dns = ip;
+        _ = chan.send("OK");
+    } else if (util.eql(cmd, "dhcp-client")) {
+        var p: usize = 0;
+        const state_str: []const u8 = switch (dhcp_client_state) {
+            .idle => "idle",
+            .discovering => "discovering",
+            .requesting => "requesting",
+            .bound => "bound",
+        };
+        p = util.appendStr(&resp, p, "DHCP client: ");
+        p = util.appendStr(&resp, p, state_str);
+        if (dhcp_client_state == .idle) {
+            dhcp_client.sendDiscover();
+            dhcp_client_state = .discovering;
+            dhcp_client_start_ns = util.now();
+            p = util.appendStr(&resp, p, " -> discovering");
+        }
+        _ = chan.send(resp[0..p]);
+    } else {
+        _ = chan.send("unknown router command");
+    }
+}
+
+fn sendArpTable(chan: *channel_mod.Channel, label: []const u8, table: *const [arp.TABLE_SIZE]arp.ArpEntry) void {
+    var resp: [256]u8 = undefined;
+    var count: u32 = 0;
+    for (table) |*e| {
+        if (!e.valid) continue;
+        var p: usize = 0;
+        p = util.appendStr(&resp, p, label);
+        p = util.appendStr(&resp, p, " ");
+        p = util.appendIp(&resp, p, e.ip);
+        p = util.appendStr(&resp, p, " ");
+        p = util.appendMac(&resp, p, e.mac);
+        _ = chan.send(resp[0..p]);
+        count += 1;
+    }
+    if (count == 0) {
+        var p: usize = 0;
+        p = util.appendStr(&resp, p, label);
+        p = util.appendStr(&resp, p, " (empty)");
+        _ = chan.send(resp[0..p]);
     }
 }
 

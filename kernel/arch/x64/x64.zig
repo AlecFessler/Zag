@@ -1,11 +1,11 @@
 pub const acpi = @import("acpi.zig");
 pub const apic = @import("apic.zig");
-pub const iommu = @import("iommu.zig");
 pub const cpu = @import("cpu.zig");
 pub const exceptions = @import("exceptions.zig");
 pub const gdt = @import("gdt.zig");
 pub const idt = @import("idt.zig");
 pub const init = @import("init.zig");
+pub const iommu = @import("iommu.zig");
 pub const interrupts = @import("interrupts.zig");
 pub const irq = @import("irq.zig");
 pub const paging = @import("paging.zig");

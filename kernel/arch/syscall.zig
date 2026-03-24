@@ -60,7 +60,6 @@ pub const SyscallNum = enum(u64) {
     dma_map,
     dma_unmap,
     pci_enable_bus_master,
-    shm_phys_addr, // TEMPORARY: returns physical address of SHM page[idx]
     _,
 };
 
@@ -109,7 +108,6 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
         .dma_map => ok(sysDmaMap(arg0, arg1)),
         .dma_unmap => ok(sysDmaUnmap(arg0, arg1)),
         .pci_enable_bus_master => ok(sysPciEnableBusMaster(arg0)),
-        .shm_phys_addr => ok(sysShmPhysAddr(arg0, arg1)),
         _ => err(E_INVAL),
     };
 }
@@ -574,8 +572,6 @@ fn sysIoportWrite(device_handle: u64, port_offset: u64, width: u64, value: u64) 
 }
 
 fn sysDmaMap(device_handle: u64, shm_handle: u64) i64 {
-    if (!iommu.isAvailable()) return E_PERM;
-
     const proc = currentProc();
     const dev_entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
     if (dev_entry.object != .device_region) return E_BADCAP;
@@ -587,9 +583,20 @@ fn sysDmaMap(device_handle: u64, shm_handle: u64) i64 {
     if (shm_entry.object != .shared_memory) return E_BADCAP;
     const shm = shm_entry.object.shared_memory;
 
-    const dma_base = iommu.mapDmaPages(device, shm) catch return E_NOMEM;
-    proc.addDmaMapping(device, shm, dma_base, shm.pages.len) catch return E_NOMEM;
-    return @bitCast(dma_base);
+    if (iommu.isAvailable()) {
+        const dma_base = iommu.mapDmaPages(device, shm) catch return E_NOMEM;
+        proc.addDmaMapping(device, shm, dma_base, shm.pages.len) catch return E_NOMEM;
+        return @bitCast(dma_base);
+    }
+
+    // No IOMMU: return physical base address directly.
+    // Requires pages to be contiguous in physical memory.
+    if (shm.pages.len == 0) return E_INVAL;
+    const base = shm.pages[0].addr;
+    for (shm.pages[1..], 1..) |p, i| {
+        if (p.addr != base + @as(u64, i) * paging.PAGE4K) return E_NOMEM;
+    }
+    return @bitCast(base);
 }
 
 fn sysPciEnableBusMaster(device_handle: u64) i64 {
@@ -601,16 +608,6 @@ fn sysPciEnableBusMaster(device_handle: u64) i64 {
 
     pciEnableBusMaster(device.pci_bus, device.pci_dev, device.pci_func);
     return 0;
-}
-
-// TEMPORARY: Return physical address of SHM page at index. For testing without IOMMU.
-fn sysShmPhysAddr(shm_handle: u64, page_idx: u64) i64 {
-    const proc = currentProc();
-    const entry = proc.getPermByHandle(shm_handle) orelse return E_BADCAP;
-    if (entry.object != .shared_memory) return E_BADCAP;
-    const shm = entry.object.shared_memory;
-    if (page_idx >= shm.pages.len) return E_INVAL;
-    return @bitCast(shm.pages[page_idx].addr);
 }
 
 fn pciEnableBusMaster(bus: u8, dev: u8, func: u8) void {
@@ -626,8 +623,6 @@ fn pciEnableBusMaster(bus: u8, dev: u8, func: u8) void {
 }
 
 fn sysDmaUnmap(device_handle: u64, shm_handle: u64) i64 {
-    if (!iommu.isAvailable()) return E_PERM;
-
     const proc = currentProc();
     const dev_entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
     if (dev_entry.object != .device_region) return E_BADCAP;
@@ -637,9 +632,13 @@ fn sysDmaUnmap(device_handle: u64, shm_handle: u64) i64 {
     if (shm_entry.object != .shared_memory) return E_BADCAP;
     const shm = shm_entry.object.shared_memory;
 
+    if (!iommu.isAvailable()) {
+        // No IOMMU: no page table entries to clean up, just remove tracking
+        _ = proc.removeDmaMapping(device, shm);
+        return E_OK;
+    }
+
     const mapping = proc.removeDmaMapping(device, shm) orelse return E_NOENT;
     iommu.unmapDmaPages(device, mapping.dma_base, mapping.num_pages);
     return E_OK;
 }
-
-

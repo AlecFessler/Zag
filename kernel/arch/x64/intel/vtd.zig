@@ -24,13 +24,10 @@ const GCMD_SRTP: u32 = 1 << 30;
 const GSTS_TES: u32 = 1 << 31;
 const GSTS_RTPS: u32 = 1 << 30;
 
-const REG_VER = 0x00;
 const REG_GCMD = 0x18;
 const REG_GSTS = 0x1C;
 const REG_RTADDR = 0x20;
 const REG_CCMD = 0x28;
-const REG_FSTS = 0x34;
-const REG_FECTL = 0x38;
 const REG_IOTLB = 0x100;
 
 const RootEntry = packed struct(u128) {
@@ -229,6 +226,3 @@ pub fn invalidateIotlb() void {
     }
 }
 
-pub fn isInitialized() bool {
-    return initialized;
-}

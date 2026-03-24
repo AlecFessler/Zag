@@ -190,10 +190,13 @@ echo "written by host" > /export/zagtest/hello.txt
 cd userspace/routerOS && zig build
 
 # Build kernel + run with routerOS (from repo root)
-# Uses e1000e NICs on Q35 machine
-zig build -Dnet=tap -Duse-llvm=true -Dkvm=true -Diommu=none \
-  -Droot-service=userspace/bin/routerOS.elf run
+zig build run -Dprofile=router
+
+# Or with individual flags:
+zig build run -Droot-service=userspace/bin/routerOS.elf -Dnet=tap -Duse-llvm=true
 ```
+
+The bootloader loads `root_service.elf` from the FAT image alongside `kernel.elf`. The `-Dprofile=router` flag sets defaults for all build options (tap networking, LLVM backend, KVM, routerOS binary).
 
 ### 6.4 Testing
 
@@ -211,12 +214,11 @@ ping 10.0.2.15
 |---------|-------|
 | NIC model | e1000e (QEMU) |
 | Machine | Q35 |
-| IOMMU | None (physical passthrough) |
+| IOMMU | Optional (dma_map works with or without) |
 | DMA | Contiguous physical pages via SHM |
 
 ### 6.6 Known Issues
 
-- Console `status` and `ping` commands not yet re-implemented after rearchitecture
 - `cat` immediately after `put` may timeout due to serial protocol timing
-- AMD-Vi and Intel VT-d IOMMU have QEMU-specific issues (e1000 RX DMA writeback fails through IOMMU); using physical passthrough as workaround
+- QEMU IOMMU (VT-d/AMD-Vi) breaks e1000e RX DMA; `dma_map` falls back to physical addresses when no IOMMU is present
 - BSS section merged into .data in linker script to ensure zero-initialization (Zig `undefined` globals)
