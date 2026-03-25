@@ -58,16 +58,13 @@ class TestIcmpDestUnreachable:
     def test_port_unreachable(self, router, router_wan_ip):
         """UDP to closed port generates ICMP Port Unreachable (Type 3, Code 3).
 
-        Capture the ICMP error with a raw socket to verify it's actually sent.
+        Capture the ICMP error with AF_PACKET raw socket on tap0.
         """
-        import socket
-        import struct
-
         try:
-            raw = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+            raw = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800))
         except PermissionError:
             pytest.skip("Raw socket requires CAP_NET_RAW — run with sudo")
-        raw.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tap0")
+        raw.bind(("tap0", 0))
         raw.settimeout(3.0)
 
         # Send UDP to a port the router doesn't handle
@@ -78,17 +75,20 @@ class TestIcmpDestUnreachable:
         finally:
             client.close()
 
-        # Listen for ICMP Destination Unreachable
+        # Listen for ICMP Destination Unreachable on the raw socket
         deadline = time.time() + 3.0
         while time.time() < deadline:
             try:
-                data, addr = raw.recvfrom(1500)
+                frame = raw.recv(1500)
             except socket.timeout:
                 break
-            if len(data) < 8:
+            if len(frame) < 42:
                 continue
-            icmp_type = data[0]
-            icmp_code = data[1]
+            # Check: IPv4 (ethertype 0x0800), protocol ICMP (1)
+            if frame[23] != 1:
+                continue
+            icmp_type = frame[34]
+            icmp_code = frame[35]
             if icmp_type == 3 and icmp_code == 3:  # Port Unreachable
                 raw.close()
                 return  # Success

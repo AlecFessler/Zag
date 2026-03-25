@@ -432,6 +432,10 @@ fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
                 if (udp_dst == 68 and role == .wan) { dhcp_client.handleResponse(pkt, len); return .consumed; }
                 if (udp_dst == 67 and role == .lan) { dhcp_server.handle(pkt, len); return .consumed; }
                 if (udp_dst == dns.DNS_PORT and role == .lan) { dns.handleFromLan(pkt, len); return .consumed; }
+                if (role == .wan) {
+                    const udp_src_port = util.readU16Be(pkt[udp_start..][0..2]);
+                    if (udp_src_port == dns.DNS_PORT) { dns.handleFromWan(pkt, len); return .consumed; }
+                }
                 if (udp_start + 8 <= len) {
                     var src_ip_udp: [4]u8 = undefined;
                     @memcpy(&src_ip_udp, pkt[26..30]);
@@ -627,6 +631,9 @@ pub fn main(perm_view_addr: u64) void {
     if (has_lan) {
         _ = syscall.thread_create(&lanPollThread, 0, 4);
     }
+
+    // Auto-start DHCPv6-PD on WAN
+    dhcpv6_client.sendSolicit();
 
     // WAN thread (runs on the initial/main thread):
     // Polls WAN RX, handles routing, console/NFS channels, maintenance.
@@ -868,6 +875,21 @@ fn handleConsoleCommand(chan: *channel_mod.Channel, cmd: []const u8) void {
             dhcp_client_state = .discovering;
             dhcp_client_start_ns = util.now();
             p = util.appendStr(&resp, p, " -> discovering");
+        }
+        _ = chan.send(resp[0..p]);
+    } else if (util.eql(cmd, "dhcpv6")) {
+        var p: usize = 0;
+        const state_str: []const u8 = switch (dhcpv6_state) {
+            .idle => "idle",
+            .soliciting => "soliciting",
+            .requesting => "requesting",
+            .bound => "bound",
+        };
+        p = util.appendStr(&resp, p, "DHCPv6: ");
+        p = util.appendStr(&resp, p, state_str);
+        if (dhcpv6_state != .bound) {
+            dhcpv6_client.sendSolicit();
+            p = util.appendStr(&resp, p, " -> soliciting");
         }
         _ = chan.send(resp[0..p]);
     } else {

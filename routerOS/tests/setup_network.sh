@@ -26,9 +26,15 @@ else
     echo "  tap1 already exists"
 fi
 
+# ── IPv6 addresses ─────────────────────────────────────────────────
+echo "Adding IPv6 addresses..."
+ip -6 addr add fd00:wan::1/64 dev tap0 2>/dev/null || true
+ip -6 addr add fd00:lan::50/64 dev tap1 2>/dev/null || true
+
 # ── IP forwarding ───────────────────────────────────────────────────
 echo "Enabling IP forwarding..."
 sysctl -q net.ipv4.ip_forward=1
+sysctl -q net.ipv6.conf.all.forwarding=1
 
 echo ""
 echo "=== Setup complete ==="

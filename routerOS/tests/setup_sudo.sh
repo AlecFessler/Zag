@@ -33,6 +33,7 @@ ip netns exec lan_test ip link set lan-test0 up
 # Use .60 to avoid conflict with host's .50 on tap1
 ip netns exec lan_test ip addr add 192.168.1.60/24 dev lan-test0
 ip netns exec lan_test ip route add default via 192.168.1.1
+ip netns exec lan_test ip -6 addr add fd00:lan::60/64 dev lan-test0 2>/dev/null || true
 
 # ── Allow non-root to use raw sockets on tap interfaces ─────────────
 # (scapy needs this for packet injection)

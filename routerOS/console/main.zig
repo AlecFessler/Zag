@@ -147,6 +147,8 @@ fn processCommand(line: []const u8) void {
         routerCommand(line);
     } else if (eql(line, "dhcp-client")) {
         routerCommand(line);
+    } else if (eql(line, "dhcpv6")) {
+        routerCommand(line);
     } else if (eql(line, "mount")) {
         nfsMultiResponse("mount");
     } else if (startsWith(line, "ls")) {
