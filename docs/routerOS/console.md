@@ -11,6 +11,7 @@ Interactive command-line interface over the serial port for monitoring and confi
 | `help` | List available commands |
 | `status` | Show interface IPs and MACs |
 | `ping <ip>` | Ping an IP address (4 packets) |
+| `traceroute <ip>` | Trace route to IP (up to 30 hops) |
 | `arp` | Show ARP tables (WAN + LAN) |
 | `nat` | Show NAT connection tracking table |
 | `leases` | Show DHCP lease table |
@@ -68,6 +69,21 @@ reply from 10.0.2.1: seq=3 time=629us
 ```
 
 Auto-selects interface: LAN subnet (192.168.1.0/24) via LAN, all others via WAN. 3-second timeout per packet.
+
+---
+
+## traceroute
+
+```
+> traceroute 8.8.8.8
+traceroute to 8.8.8.8, 30 hops max
+1  10.0.2.1  152us
+2  *
+3  8.8.8.8  1203us
+---
+```
+
+Sends ICMP echo requests with incrementing TTL (1-30). Reports each hop's IP and round-trip time. Hops that don't respond within 3 seconds are shown as `*`. Completes when a reply is received from the target or max hops reached.
 
 ---
 
@@ -179,6 +195,12 @@ WAN 10.0.2.1 e6:11:e1:e5:b6:b9
 ```
 
 Shows IP and MAC for each active DHCP lease. Up to 32 leases.
+
+---
+
+## Web Management GUI
+
+A web-based management interface is available at `http://192.168.1.1/` from any LAN-side host. It displays the same information as the console commands (status, ARP, NAT, leases, firewall rules) in a live-updating dashboard.
 
 ---
 

@@ -8,6 +8,7 @@ const futex_tests = @import("tests/futex.zig");
 const grant_reduced_tests = @import("tests/grant_reduced.zig");
 const grant_tests = @import("tests/grant.zig");
 const misc_tests = @import("tests/misc.zig");
+const pin_exclusive_tests = @import("tests/pin_exclusive.zig");
 const multithread_kill_tests = @import("tests/multithread_kill.zig");
 const perm_view_tests = @import("tests/perm_view.zig");
 const proc_tests = @import("tests/proc.zig");
@@ -38,6 +39,7 @@ pub fn main(perm_view: u64) void {
     zombie_tests.run();
     grant_reduced_tests.run();
     misc_tests.run();
+    pin_exclusive_tests.run();
 
     const end_ns: u64 = @bitCast(syscall.clock_gettime());
     const elapsed_ms = (end_ns - start_ns) / 1_000_000;

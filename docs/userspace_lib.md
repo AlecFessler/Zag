@@ -38,6 +38,7 @@ Raw syscall wrappers. Each function maps 1:1 to a kernel syscall.
 - `thread_exit() -> noreturn` — exit current thread.
 - `thread_yield() -> void` — yield timeslice.
 - `set_affinity(core_mask: u64) -> i64` — set core affinity.
+- `pin_exclusive() -> i64` — pin calling thread exclusively to its core (non-preemptible). Returns handle; revoke to unpin.
 
 ### Capabilities
 - `grant_perm(src: u64, target_proc: u64, rights: u64) -> i64` — grant capability to child.
@@ -79,7 +80,8 @@ VmReservationRights: packed struct(u8)
 
 ProcessRights: packed struct(u16)
     grant_to, spawn_thread, spawn_process, mem_reserve,
-    set_affinity, restart, shm_create, device_own, shutdown
+    set_affinity, restart, shm_create, device_own, shutdown,
+    pin_exclusive
     fn bits(self) -> u64
 
 SharedMemoryRights: packed struct(u8)

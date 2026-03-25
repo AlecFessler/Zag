@@ -16,7 +16,8 @@ pub const ProcessRights = packed struct(u16) {
     shm_create: bool = false,
     device_own: bool = false,
     shutdown: bool = false,
-    _reserved: u7 = 0,
+    pin_exclusive: bool = false,
+    _reserved: u6 = 0,
 };
 
 pub const VmReservationRights = packed struct(u8) {
@@ -67,11 +68,17 @@ pub const VmReservationObject = struct {
     original_size: u64,
 };
 
+pub const CorePinObject = struct {
+    core_id: u64,
+    thread_tid: u64,
+};
+
 pub const KernelObject = union(enum) {
     process: *Process,
     vm_reservation: VmReservationObject,
     shared_memory: *SharedMemory,
     device_region: *DeviceRegion,
+    core_pin: CorePinObject,
     empty: void,
 };
 
@@ -80,6 +87,7 @@ pub const UserViewEntryType = enum(u8) {
     vm_reservation = 1,
     shared_memory = 2,
     device_region = 3,
+    core_pin = 4,
 };
 
 pub const UserViewEntry = extern struct {
@@ -139,6 +147,13 @@ pub const UserViewEntry = extern struct {
                     (@as(u64, dr.pci_bus) << 48) |
                     (@as(u64, dr.pci_dev) << 53) |
                     (@as(u64, dr.pci_func) << 58),
+            },
+            .core_pin => |cp| .{
+                .handle = entry.handle,
+                .entry_type = @intFromEnum(UserViewEntryType.core_pin),
+                .rights = entry.rights,
+                .field0 = cp.core_id,
+                .field1 = cp.thread_tid,
             },
             .empty => EMPTY,
         };

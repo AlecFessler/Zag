@@ -198,17 +198,24 @@ pub const VirtualMemoryManager = struct {
             if (hint.addr != 0 and
                 std.mem.isAligned(hint.addr, paging.PAGE4K) and
                 hint.addr >= self.range_start.addr and
-                hint.addr + size <= self.range_end.addr and
-                findNodeLocked(&self.tree, hint) == null)
+                hint.addr + size <= self.range_end.addr)
             {
-                // Check that no existing node starts inside [hint, hint+size).
                 var sentinel = mkSentinel(hint);
                 const neighbors = self.tree.findNeighbors(&sentinel);
+
+                // Check hint doesn't fall inside an existing node (lower bound)
+                const hint_free = if (neighbors.lower) |lower|
+                    hint.addr >= lower.end()
+                else
+                    true;
+
+                // Check no existing node starts inside [hint, hint+size) (upper bound)
                 const range_clear = if (neighbors.upper) |upper|
                     upper.start.addr >= hint.addr + size
                 else
                     true;
-                if (range_clear) break :blk hint;
+
+                if (hint_free and range_clear) break :blk hint;
             }
             break :blk try self.findFreeRange(size);
         };
@@ -808,42 +815,34 @@ fn tryMergeAt(tree: *VmTree, vaddr: VAddr) void {
 fn mergeRange(tree: *VmTree, range_start: VAddr, range_end: VAddr) void {
     tryMergeAt(tree, range_end);
 
-    var changed = true;
-    while (changed) {
-        changed = false;
-        var merge_into: ?*VmNode = null;
-        var merge_victim: ?*VmNode = null;
-        var prev_node: ?*VmNode = null;
+    var victims: [64]*VmNode = undefined;
+    var victim_count: usize = 0;
+    var prev_node: ?*VmNode = null;
 
-        var s = mkSentinel(range_start);
-        var e = mkSentinel(range_end);
-        const Ctx = struct {
-            prev: *?*VmNode,
-            into: *?*VmNode,
-            victim: *?*VmNode,
-            fn cb(ctx: *@This(), node: *VmNode) void {
-                if (ctx.victim.* != null) return;
-                if (ctx.prev.*) |p| {
-                    if (canMerge(p, node)) {
-                        ctx.into.* = p;
-                        ctx.victim.* = node;
-                        return;
-                    }
+    var s = mkSentinel(range_start);
+    var e = mkSentinel(range_end);
+    const Ctx = struct {
+        prev: *?*VmNode,
+        buf: *[64]*VmNode,
+        count: *usize,
+        fn cb(ctx: *@This(), node: *VmNode) void {
+            if (ctx.prev.*) |p| {
+                if (canMerge(p, node) and ctx.count.* < 64) {
+                    p.size += node.size;
+                    ctx.buf.*[ctx.count.*] = node;
+                    ctx.count.* += 1;
+                    return;
                 }
-                ctx.prev.* = node;
             }
-        };
-        var ctx = Ctx{ .prev = &prev_node, .into = &merge_into, .victim = &merge_victim };
-        tree.forEachInRange(&s, &e, &ctx, Ctx.cb);
-
-        if (merge_into) |into| {
-            if (merge_victim) |victim| {
-                into.size += victim.size;
-                _ = tree.remove(victim) catch {};
-                freeVmNode(victim);
-                changed = true;
-            }
+            ctx.prev.* = node;
         }
+    };
+    var ctx = Ctx{ .prev = &prev_node, .buf = &victims, .count = &victim_count };
+    tree.forEachInRange(&s, &e, &ctx, Ctx.cb);
+
+    for (victims[0..victim_count]) |victim| {
+        _ = tree.remove(victim) catch {};
+        freeVmNode(victim);
     }
 
     tryMergeAt(tree, range_start);

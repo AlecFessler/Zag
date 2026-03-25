@@ -60,6 +60,7 @@ pub const SyscallNum = enum(u64) {
     dma_map,
     dma_unmap,
     pci_enable_bus_master,
+    pin_exclusive,
     _,
 };
 
@@ -113,6 +114,7 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
         .dma_map => ok(sysDmaMap(arg0, arg1)),
         .dma_unmap => ok(sysDmaUnmap(arg0, arg1)),
         .pci_enable_bus_master => ok(sysPciEnableBusMaster(arg0)),
+        .pin_exclusive => ok(sysPinExclusive()),
         _ => err(E_INVAL),
     };
 }
@@ -507,6 +509,10 @@ fn sysRevokePerm(handle: u64) i64 {
             Process.returnDeviceHandleUpTree(proc, entry.rights, device);
             proc.removePerm(handle) catch {};
         },
+        .core_pin => |cp| {
+            sched.unpinByRevoke(cp.core_id, cp.thread_tid);
+            proc.removePerm(handle) catch {};
+        },
         .process => |child| {
             child.killSubtree();
             proc.removePerm(handle) catch {};
@@ -646,6 +652,32 @@ fn pciEnableBusMaster(bus: u8, dev: u8, func: u8) void {
     cpu.outd(addr, 0xCF8);
     const cmd = cpu.ind(0xCFC);
     cpu.outd(cmd | 0x06, 0xCFC);
+}
+
+fn sysPinExclusive() i64 {
+    const proc = currentProc();
+    const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
+    if (!self_entry.processRights().pin_exclusive) return E_PERM;
+
+    const thread = sched.currentThread().?;
+    const pin_result = sched.pinExclusive(thread);
+    if (pin_result < 0) return pin_result;
+
+    const core_id: u64 = @intCast(pin_result);
+    const entry = PermissionEntry{
+        .handle = 0,
+        .object = .{ .core_pin = .{
+            .core_id = core_id,
+            .thread_tid = thread.tid,
+        } },
+        .rights = 0,
+    };
+    const handle_id = proc.insertPerm(entry) catch {
+        _ = sched.unpinExclusive(thread);
+        return E_MAXCAP;
+    };
+
+    return @intCast(handle_id);
 }
 
 fn sysDmaUnmap(device_handle: u64, shm_handle: u64) i64 {

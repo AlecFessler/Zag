@@ -99,12 +99,13 @@ Handle = monotonic u64 ID, unique across the lifetime of the process. Handle 0 (
 
 #### Rights
 
-**ProcessRights:** `grant_to`(0), `spawn_thread`(1), `spawn_process`(2), `mem_reserve`(3), `set_affinity`(4), `restart`(5), `shm_create`(6), `device_own`(7), `shutdown`(8). Stored as `u16`.
+**ProcessRights:** `grant_to`(0), `spawn_thread`(1), `spawn_process`(2), `mem_reserve`(3), `set_affinity`(4), `restart`(5), `shm_create`(6), `device_own`(7), `shutdown`(8), `pin_exclusive`(9). Stored as `u16`.
 
 - `restart`: can only be granted by a parent that itself has `restart`. Once cleared via `disable_restart`, cannot be re-enabled.
 - `shm_create`: required to create shared memory regions.
 - `device_own`: required to receive device handles via grant. The kernel checks this on the target process during device grant.
 - `shutdown`: required to invoke the `shutdown` syscall. Only the root service should hold this.
+- `pin_exclusive`: required to pin a thread exclusively to a core, making it non-preemptible.
 
 **VmReservationRights:** `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4). `shareable` and `mmio` are mutually exclusive.
 
@@ -232,6 +233,23 @@ A hardware device region. Two types: **MMIO** (memory-mapped I/O, mappable into 
 
 - `field0`: `device_type(u8) | device_class(u8) << 8 | size_or_port_count(u32) << 32`.
 - `field1`: `pci_vendor(u16) | pci_device(u16) << 16 | pci_class(u8) << 32 | pci_subclass(u8) << 40`.
+
+---
+
+### 2.10 Core Pin
+
+A core pin object represents exclusive, non-preemptible ownership of a CPU core by a thread. Created via `pin_exclusive`, revoked via `revoke_perm`. While pinned, the scheduler skips preemption on that core — the thread runs uninterrupted until it voluntarily yields or is unpinned. Other threads are migrated off the pinned core's run queue.
+
+**Constraints:**
+- The calling thread must have single-core affinity set (exactly one bit in the mask).
+- The target core must not already be pinned by another thread.
+- At least one core must remain unpinned for preemptive scheduling.
+
+**User View Encoding:**
+- `field0`: `core_id` (the pinned core index).
+- `field1`: `thread_tid` (the pinned thread's TID).
+
+---
 
 #### Enumeration
 
@@ -367,6 +385,18 @@ Sets core affinity for calling thread. Yield after for immediate effect.
 **Returns:** `E_OK`.
 **Errors:** `E_PERM`, `E_INVAL` (empty mask, invalid core IDs).
 
+### pin_exclusive() → handle
+
+Pin the calling thread exclusively to its current core. The thread becomes non-preemptible — the scheduler timer still fires (for futex expiry) but skips the context switch. Returns a core_pin handle that can be revoked to unpin.
+
+The thread must have single-core affinity set. The target core must not already be pinned. At least one core must remain unpinned. Any other threads on the core's run queue are migrated to unpinned cores.
+
+**Permission:** `HANDLE_SELF.pin_exclusive`.
+**Returns:** Core pin handle ID (positive).
+**Errors:** `E_PERM` (no `pin_exclusive` right), `E_INVAL` (no affinity set, multi-core affinity, would pin all cores), `E_BUSY` (core already pinned), `E_MAXCAP`.
+
+---
+
 ### grant_perm(src_handle, target_proc_handle, granted_rights) → result
 
 Grant a capability to a child process. `target_proc_handle` must reference a process entry with `grant_to` set. `granted_rights` must be a subset of `src_handle.rights`. Source must have `grant` bit set.
@@ -386,6 +416,7 @@ Cannot revoke `HANDLE_SELF`. Per-type behavior (§2.3):
 - **VM reservation:** Free all pages in range, clear slot.
 - **SHM:** Unmap SHM PTEs, revert mapped regions to private, clear slot.
 - **Device:** Unmap MMIO PTEs, return handle up process tree (§2.1 device handle return), clear slot in source.
+- **Core pin:** Unpin the thread, restore preemptive scheduling on the core, clear slot.
 - **Process:** Recursively kill child's entire subtree (§2.6). Restartable children restart; non-restartable die. Clear slot.
 
 **Returns:** `E_OK`.

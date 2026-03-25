@@ -215,7 +215,7 @@ pub const HeapAllocator = struct {
         return best_fit_lower_bound;
     }
 
-    fn getBlockMetadata(
+    inline fn getBlockMetadata(
         freelist_entry_base: u64,
         user_size: u64,
         user_align: u64,
@@ -386,12 +386,15 @@ pub const HeapAllocator = struct {
 
         const block_end = header_base + PREFIX_SIZE + header.bucket_size;
 
-        const next_header_base: u64 = header_base + PREFIX_SIZE + header.bucket_size;
-        const next_header: *AllocHeader = @ptrFromInt(next_header_base);
+        const next_header: *AllocHeader = @ptrFromInt(block_end);
         @prefetch(next_header, .{});
 
         const block_footer: *AllocFooter = @ptrFromInt(block_end - FOOTER_SIZE);
         @prefetch(block_footer, .{});
+
+        // Prefetch prev footer for merge_prev path
+        const prev_footer_ptr: *AllocFooter = @ptrFromInt(header_base - FOOTER_SIZE);
+        @prefetch(prev_footer_ptr, .{});
 
         merge_prev: {
             const prev_footer_base = header_base - FOOTER_SIZE;
@@ -431,14 +434,14 @@ pub const HeapAllocator = struct {
 
         merge_next: {
             std.debug.assert(std.mem.isAligned(
-                next_header_base,
+                block_end,
                 HEADER_ALIGN,
             ));
-            const next_header_within_bounds = next_header_base <= self.reserve_end;
+            const next_header_within_bounds = block_end <= self.reserve_end;
             if (!next_header_within_bounds) break :merge_next;
             if (!next_header.is_free) break :merge_next;
 
-            const next_end: u64 = next_header_base + PREFIX_SIZE + next_header.bucket_size;
+            const next_end: u64 = block_end + PREFIX_SIZE + next_header.bucket_size;
             std.debug.assert(std.mem.isAligned(
                 next_end,
                 HEADER_ALIGN,
@@ -448,7 +451,7 @@ pub const HeapAllocator = struct {
             const footer_ptr: *AllocFooter = @ptrFromInt(footer_base);
             @prefetch(footer_ptr, .{});
 
-            const next_entry_base: u64 = next_header_base + PREFIX_SIZE;
+            const next_entry_base: u64 = block_end + PREFIX_SIZE;
             const next_node: *Freelist.FreeNode = @ptrFromInt(next_entry_base);
             const next_list: *Freelist = next_node.base;
 

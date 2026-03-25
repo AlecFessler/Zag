@@ -19,14 +19,15 @@ root_service (broker)
 
 ### 1.2 Thread Model
 
-The router process runs two threads:
+The router process runs three threads:
 
-| Thread | Role | Affinity |
-|--------|------|----------|
-| WAN thread | Poll WAN RX, route, channels (console/NFS), maintenance | Initial thread |
-| LAN thread | Poll LAN RX, route, forward to WAN | Spawned via thread_create |
+| Thread | Role | Core | Preemption |
+|--------|------|------|------------|
+| WAN thread | Poll WAN RX, route, maintenance | Core 1 (pinned) | Non-preemptible |
+| LAN thread | Poll LAN RX, route, forward to WAN | Core 2 (pinned) | Non-preemptible |
+| Service thread | Console commands, NFS/NTP channels | Core 0 | Preemptive |
 
-Both threads are lock-free. No mutexes anywhere in the data path.
+The WAN and LAN threads are pinned exclusively to dedicated cores via `pin_exclusive`, making them non-preemptible for maximum packet processing throughput. The service thread handles all management-plane operations (console commands, NFS/NTP app messages, channel detection) on core 0 under normal preemptive scheduling, ensuring console commands never stall the data plane.
 
 ### 1.3 Data Flow
 
@@ -98,7 +99,7 @@ Open-addressing hash table with atomic entry states:
 | WAN ARP table | WAN thread | Exclusive |
 | LAN ARP table | LAN thread | Exclusive |
 | NAT table | Both | Lock-free atomics |
-| Console/NFS channels | WAN thread | Exclusive |
+| Console/NFS channels | Service thread | Exclusive |
 | Pending TX slots | Writer: any, Reader: owning poll thread | Atomic flag |
 
 ---
@@ -121,7 +122,35 @@ The kernel registers only the first MMIO BAR per PCI function (e1000e has multip
 
 ---
 
-## 5. NFS Client
+## 5. Web Management GUI
+
+**File:** `router/services/http.zig`
+
+A minimal HTTP/1.0 server running on LAN port 80. Serves an embedded HTML/CSS/JS management page that displays router status, ARP table, NAT table, DHCP leases, firewall rules, and port forwards. The page auto-refreshes every 5 seconds via AJAX.
+
+### TCP State Machine
+
+Single-connection HTTP server with states: closed, syn_received, established, fin_wait. Handles SYN → SYN-ACK → data → FIN handshake inline within the packet processing pipeline.
+
+### API Endpoints
+
+| Endpoint | Returns |
+|----------|---------|
+| `GET /` | HTML management page |
+| `GET /api/status` | Interface IPs, MACs, gateway |
+| `GET /api/ifstat` | RX/TX/drop counters |
+| `GET /api/arp` | ARP table entries |
+| `GET /api/nat` | NAT connection tracking |
+| `GET /api/leases` | DHCP lease table |
+| `GET /api/rules` | Firewall rules + port forwards |
+
+### Access
+
+From a LAN-side host: `http://192.168.1.1/`
+
+---
+
+## 6. NFS Client
 
 **Files:** `nfs_client/main.zig`, `nfs_client/nfs3.zig`, `nfs_client/rpc.zig`, `nfs_client/xdr.zig`
 

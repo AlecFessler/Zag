@@ -44,6 +44,7 @@ pub const Thread = struct {
     state: State = .ready,
     last_in_proc: bool = false,
     on_cpu: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    pinned_exclusive: bool = false,
     futex_deadline_ns: u64 = 0,
     futex_paddr: PAddr = PAddr.fromInt(0),
 

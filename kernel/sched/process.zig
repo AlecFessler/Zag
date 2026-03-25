@@ -267,6 +267,9 @@ pub const Process = struct {
                 .device_region => |device| {
                     returnDeviceHandleUpTree(self, entry.rights, device);
                 },
+                .core_pin => |cp| {
+                    sched.unpinByRevoke(cp.core_id, cp.thread_tid);
+                },
                 .vm_reservation, .process, .empty => {},
             }
             entry.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };

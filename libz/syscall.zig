@@ -31,6 +31,7 @@ pub const SyscallNum = enum(u64) {
     dma_map,
     dma_unmap,
     pci_enable_bus_master,
+    pin_exclusive,
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -204,3 +205,8 @@ pub fn pci_enable_bus_master(device_handle: u64) i64 {
 pub fn dma_unmap(device_handle: u64, shm_handle: u64) i64 {
     return syscall2(.dma_unmap, device_handle, shm_handle);
 }
+
+pub fn pin_exclusive() i64 {
+    return syscall0(.pin_exclusive);
+}
+

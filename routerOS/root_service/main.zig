@@ -276,9 +276,11 @@ pub fn main(perm_view_addr: u64) void {
         .grant_to = true,
         .spawn_thread = true,
         .mem_reserve = true,
+        .set_affinity = true,
         .shm_create = true,
         .device_own = true,
         .restart = true,
+        .pin_exclusive = true,
     };
 
     _ = spawnChild(

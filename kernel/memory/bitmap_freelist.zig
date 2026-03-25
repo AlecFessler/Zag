@@ -38,7 +38,6 @@ pub fn BitmapFreeList(comptime using_getNextFree: bool) type {
             return .{
                 .base_addr = base_addr,
                 .block_size = block_size,
-                .block_shift = @intCast(@ctz(block_size)),
                 .bitmap = bitmap,
                 .allocator = allocator,
             };
@@ -74,7 +73,7 @@ pub fn BitmapFreeList(comptime using_getNextFree: bool) type {
             std.debug.assert(std.mem.isAligned(addr, self.block_size));
 
             const norm_addr = addr - self.base_addr;
-            const bit_number = norm_addr >> self.block_shift;
+            const bit_number = norm_addr / self.block_size;
 
             const word_idx = bit_number / WORD_BIT_SIZE;
             const bit_idx: u6 = @intCast(bit_number % WORD_BIT_SIZE);
@@ -96,7 +95,7 @@ pub fn BitmapFreeList(comptime using_getNextFree: bool) type {
             std.debug.assert(std.mem.isAligned(addr, self.block_size));
 
             const norm_addr = addr - self.base_addr;
-            const bit_number = norm_addr >> self.block_shift;
+            const bit_number = norm_addr / self.block_size;
 
             const word_idx = bit_number / WORD_BIT_SIZE;
             const bit_idx: u6 = @intCast(bit_number % WORD_BIT_SIZE);

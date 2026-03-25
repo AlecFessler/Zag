@@ -88,6 +88,7 @@ fn processCommand(line: []const u8) void {
         serialWrite("  help                     - show this help\r\n");
         serialWrite("  status                   - interface status\r\n");
         serialWrite("  ping <ip>                - ping an IP address\r\n");
+        serialWrite("  traceroute <ip>          - trace route to IP\r\n");
         serialWrite("  arp                      - show ARP tables\r\n");
         serialWrite("  nat                      - show NAT table\r\n");
         serialWrite("  leases                   - show DHCP leases\r\n");
@@ -128,6 +129,8 @@ fn processCommand(line: []const u8) void {
         serialWrite("\x1b[2J\x1b[H");
     } else if (eql(line, "status")) {
         routerCommand("status");
+    } else if (startsWith(line, "traceroute ")) {
+        routerMultiResponse(line);
     } else if (startsWith(line, "ping ")) {
         routerMultiResponse(line);
     } else if (eql(line, "arp")) {
@@ -212,10 +215,10 @@ fn routerMultiResponse(cmd: []const u8) void {
     var resp: [512]u8 = undefined;
     var msg_count: u32 = 0;
     var done = false;
-    while (!done and msg_count < 8) {
+    while (!done and msg_count < 40) {
         var attempts: u32 = 0;
         var got_msg = false;
-        while (attempts < 100_000) : (attempts += 1) {
+        while (attempts < 500_000) : (attempts += 1) {
             if (router_chan.recv(&resp)) |len| {
                 serialWrite(resp[0..len]);
                 serialWrite("\r\n");

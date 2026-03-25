@@ -7,6 +7,7 @@ const dhcp_server = router.services.dhcp_server;
 const dhcpv6_client = router.ipv6.dhcpv6_client;
 const dma = router.net.dma;
 const dns = router.services.dns;
+const http = router.services.http;
 const e1000 = router.net.e1000;
 const firewall = router.ipv4.firewall;
 const firewall6 = router.ipv6.firewall6;
@@ -67,10 +68,18 @@ pub var ping_seq: u16 = 0;
 pub var ping_start_ns: u64 = 0;
 pub var ping_count: u8 = 0;
 pub var ping_received: u8 = 0;
+pub var traceroute_state: ping_mod.TracerouteState = .idle;
+pub var traceroute_target_ip: [4]u8 = .{ 0, 0, 0, 0 };
+pub var traceroute_target_mac: [6]u8 = .{ 0, 0, 0, 0, 0, 0 };
+pub var traceroute_iface: Interface = .wan;
+pub var traceroute_ttl: u8 = 1;
+pub var traceroute_start_ns: u64 = 0;
+pub var traceroute_max_hops: u8 = 30;
 pub var frag_table: [frag.TABLE_SIZE]frag.FragEntry = [_]frag.FragEntry{frag.empty} ** frag.TABLE_SIZE;
 pub var udp_bindings: [udp_fwd.MAX_BINDINGS]udp_fwd.UdpBinding = [_]udp_fwd.UdpBinding{.{}} ** udp_fwd.MAX_BINDINGS;
 pub var pending_udp: [udp_fwd.MAX_PENDING]udp_fwd.PendingPacket = [_]udp_fwd.PendingPacket{.{}} ** udp_fwd.MAX_PENDING;
 var last_maintenance_ns: u64 = 0;
+var perm_view: ?*const [MAX_PERMS]pv.UserViewEntry = null;
 
 // ── IPv6 global state ────────────────────────────────────────────────────
 pub var wan_ndp_table: [ndp.TABLE_SIZE]ndp.NdpEntry = .{ndp.empty} ** ndp.TABLE_SIZE;
@@ -404,6 +413,14 @@ fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
                     ping_mod.sendEchoRequest();
                 }
             }
+            if (traceroute_state == .arp_pending and traceroute_iface == role) {
+                // For non-local traceroute, resolve gateway MAC
+                const resolve_ip = if (traceroute_iface == .wan) wan_gateway else traceroute_target_ip;
+                if (arp.lookup(&ifc.arp_table, resolve_ip)) |mac| {
+                    @memcpy(&traceroute_target_mac, &mac);
+                    ping_mod.sendTracerouteProbe();
+                }
+            }
         }
         if (arp.handle(role, pkt, len)) |reply| {
             _ = ifc.txSendLocal(reply);
@@ -424,6 +441,12 @@ fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
 
     if (is_for_me) {
         // Packet addressed to us — handle locally, never zero-copy forward
+
+        // TCP — HTTP server on LAN port 80
+        if (pkt[23] == 6 and role == .lan) {
+            if (http.handleTcp(pkt, len)) return .consumed;
+        }
+
         if (pkt[23] == 17) {
             const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
             const udp_start = 14 + ip_hdr_len;
@@ -457,6 +480,8 @@ fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
             }
         }
         ping_mod.handleEchoReply(pkt, len);
+        ping_mod.handleTimeExceeded(pkt, len);
+        ping_mod.handleTracerouteEchoReply(pkt, len);
         if (handleIcmp(role, pkt, len)) |reply| {
             _ = ifc.txSendLocal(reply);
         } else if (role == .wan and has_lan) {
@@ -528,6 +553,7 @@ pub fn main(perm_view_addr: u64) void {
     const cmd = shm_protocol.mapCommandChannel(perm_view_addr) orelse { syscall.write("router: no cmd ch\n"); return; };
     _ = cmd;
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
+    perm_view = view;
     const nics = findNicDevices(perm_view_addr);
     const wan_nic = nics.wan orelse { syscall.write("router: no WAN\n"); return; };
 
@@ -618,48 +644,32 @@ pub fn main(perm_view_addr: u64) void {
     arp.sendRequest(.wan, wan_gateway);
     if (has_lan) arp.sendRequest(.lan, .{ 192, 168, 1, 50 });
 
-    var mapped_handles: [8]u64 = .{0} ** 8;
-    var mapped_count: u32 = 0;
-    for (view) |*entry| {
-        if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and entry.field0 <= shm_protocol.COMMAND_SHM_SIZE and mapped_count < mapped_handles.len) {
-            mapped_handles[mapped_count] = entry.handle;
-            mapped_count += 1;
-        }
-    }
-
     // Spawn LAN poll thread if dual-NIC
     if (has_lan) {
         _ = syscall.thread_create(&lanPollThread, 0, 4);
     }
 
+    // Spawn service thread for console/NFS/NTP channel handling
+    _ = syscall.thread_create(&serviceThread, 0, 4);
+
+    // Pin WAN thread to core 1 (non-preemptible)
+    if (syscall.set_affinity(1 << 1) == 0) {
+        syscall.thread_yield(); // migrate to core 1
+        const pin_rc = syscall.pin_exclusive();
+        if (pin_rc > 0) {
+            syscall.write("router: WAN pinned to core 1\n");
+        }
+    }
+
     // WAN thread (runs on the initial/main thread):
-    // Polls WAN RX, handles routing, console/NFS channels, maintenance.
-    var loop_n: u32 = 0;
+    // Polls WAN RX, handles routing, maintenance. Channels handled by service thread.
     while (true) {
-        loop_n +%= 1;
-
-        // Channel detection + handling (cheap: one atomic read per channel)
-        if (loop_n % 500 == 0) detectAppChannels(view, &mapped_handles, &mapped_count);
-        if (console_chan) |*chan| {
-            var cmd_buf: [256]u8 = undefined;
-            if (chan.recv(&cmd_buf)) |cmd_len| {
-                handleConsoleCommand(chan, cmd_buf[0..cmd_len]);
-            }
-        }
-        if (nfs_chan) |*chan| {
-            var nfs_buf: [2048]u8 = undefined;
-            if (chan.recv(&nfs_buf)) |nfs_len| { udp_fwd.handleAppMessage(nfs_buf[0..nfs_len], .nfs); }
-        }
-        if (ntp_chan) |*chan| {
-            var ntp_buf: [256]u8 = undefined;
-            if (chan.recv(&ntp_buf)) |ntp_len| { udp_fwd.handleAppMessage(ntp_buf[0..ntp_len], .ntp); }
-        }
-
         // WAN poll + zero-copy forwarding
         pollOnce(&wan_iface, &lan_iface, .wan);
 
         // Periodic tasks (only on WAN thread)
         ping_mod.checkTimeout();
+        ping_mod.checkTracerouteTimeout();
         periodicMaintenance();
         syscall.thread_yield();
     }
@@ -797,6 +807,48 @@ fn handleConsoleCommand(chan: *channel_mod.Channel, cmd: []const u8) void {
             ping_state = .arp_pending;
             ping_start_ns = util.now();
             arp.sendRequest(ping_iface, ip);
+        }
+    } else if (util.startsWith(cmd, "traceroute ")) {
+        if (traceroute_state != .idle) {
+            _ = chan.send("traceroute already in progress");
+            return;
+        }
+        const ip = util.parseIp(cmd[11..]) orelse {
+            _ = chan.send("invalid IP");
+            return;
+        };
+        traceroute_target_ip = ip;
+        traceroute_ttl = 1;
+        traceroute_iface = if (isInLanSubnet(ip)) .lan else .wan;
+        const ifc = getIface(traceroute_iface);
+        // Send header line
+        var p: usize = 0;
+        p = util.appendStr(&resp, p, "traceroute to ");
+        p = util.appendIp(&resp, p, ip);
+        p = util.appendStr(&resp, p, ", ");
+        p = util.appendDec(&resp, p, traceroute_max_hops);
+        p = util.appendStr(&resp, p, " hops max");
+        _ = chan.send(resp[0..p]);
+        // Resolve MAC and send first probe
+        if (arp.lookup(&ifc.arp_table, ip)) |mac| {
+            @memcpy(&traceroute_target_mac, &mac);
+            ping_mod.sendTracerouteProbe();
+        } else {
+            // For traceroute, we route through the gateway, so use gateway MAC
+            if (traceroute_iface == .wan) {
+                if (arp.lookup(&ifc.arp_table, wan_gateway)) |gw_mac| {
+                    @memcpy(&traceroute_target_mac, &gw_mac);
+                    ping_mod.sendTracerouteProbe();
+                } else {
+                    traceroute_state = .arp_pending;
+                    traceroute_start_ns = util.now();
+                    arp.sendRequest(traceroute_iface, wan_gateway);
+                }
+            } else {
+                traceroute_state = .arp_pending;
+                traceroute_start_ns = util.now();
+                arp.sendRequest(traceroute_iface, ip);
+            }
         }
     } else if (util.startsWith(cmd, "block ")) {
         const ip = util.parseIp(cmd[6..]) orelse {
@@ -992,8 +1044,59 @@ fn pollOnce(self_iface: *Iface, other_iface: *Iface, role: Interface) void {
     }
 }
 
+/// Service thread: handles console commands, NFS/NTP app messages, and channel detection.
+/// Runs on core 0 (preemptive) so it doesn't interfere with the pinned data-plane threads.
+fn serviceThread() void {
+    const view = perm_view orelse return;
+    var mapped_handles: [8]u64 = .{0} ** 8;
+    var mapped_count: u32 = 0;
+    var loop_n: u32 = 0;
+
+    while (true) {
+        loop_n +%= 1;
+
+        // Channel detection (periodically scan for new SHM channels)
+        if (loop_n % 500 == 0) detectAppChannels(view, &mapped_handles, &mapped_count);
+
+        // Console command handling
+        if (console_chan) |*chan| {
+            var cmd_buf: [256]u8 = undefined;
+            if (chan.recv(&cmd_buf)) |cmd_len| {
+                handleConsoleCommand(chan, cmd_buf[0..cmd_len]);
+            }
+        }
+
+        // NFS app messages
+        if (nfs_chan) |*chan| {
+            var nfs_buf: [2048]u8 = undefined;
+            if (chan.recv(&nfs_buf)) |nfs_len| {
+                udp_fwd.handleAppMessage(nfs_buf[0..nfs_len], .nfs);
+            }
+        }
+
+        // NTP app messages
+        if (ntp_chan) |*chan| {
+            var ntp_buf: [256]u8 = undefined;
+            if (chan.recv(&ntp_buf)) |ntp_len| {
+                udp_fwd.handleAppMessage(ntp_buf[0..ntp_len], .ntp);
+            }
+        }
+
+        syscall.thread_yield();
+    }
+}
+
 /// LAN poll thread entry point. Polls LAN NIC, forwards to WAN via zero-copy.
 fn lanPollThread() void {
+    // Pin LAN thread to core 2 (non-preemptible)
+    if (syscall.set_affinity(1 << 2) == 0) {
+        syscall.thread_yield(); // migrate to core 2
+        const pin_rc = syscall.pin_exclusive();
+        if (pin_rc > 0) {
+            syscall.write("router: LAN pinned to core 2\n");
+        }
+    }
+
     while (true) {
         pollOnce(&lan_iface, &wan_iface, .lan);
         syscall.thread_yield();
