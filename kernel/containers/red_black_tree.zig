@@ -616,7 +616,10 @@ pub fn RedBlackTree(
 
                 if (target_node == self.root) {
                     self.root = child_replacement;
-                    if (child_replacement) |r| r.parent = null;
+                    if (child_replacement) |r| {
+                        r.parent = null;
+                        r.color = Color.Black;
+                    }
                 } else {
                     const direction_from_parent: Direction =
                         if (target_node == parent_of_target.?.getChild(.left)) Direction.left else Direction.right;

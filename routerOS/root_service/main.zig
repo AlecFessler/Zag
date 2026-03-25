@@ -251,12 +251,15 @@ fn brokerLoop() void {
 }
 
 pub fn main(perm_view_addr: u64) void {
+    syscall.write("root: starting\n");
     var serial_devices: [4]DeviceGrant = undefined;
     const serial_count = findAllDevicesByClass(perm_view_addr, .serial, &serial_devices);
+    syscall.write("root: found serial devices\n");
 
     var nic_devices: [8]DeviceGrant = undefined;
     const nic_count = findAllMmioDevicesByClass(perm_view_addr, .network, &nic_devices);
 
+    syscall.write("root: spawning serial_driver\n");
     _ = spawnChild(
         "serial_driver",
         embedded.serial_driver,
@@ -266,6 +269,7 @@ pub fn main(perm_view_addr: u64) void {
         perm_view_addr,
         serial_devices[0..serial_count],
     );
+    syscall.write("root: spawning router\n");
 
     // Router process owns NIC devices directly (monolithic NIC+router)
     const router_rights = perms.ProcessRights{
@@ -286,6 +290,7 @@ pub fn main(perm_view_addr: u64) void {
         perm_view_addr,
         nic_devices[0..nic_count],
     );
+    syscall.write("root: spawning nfs_client\n");
 
     _ = spawnChild(
         "nfs_client",

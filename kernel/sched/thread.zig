@@ -16,7 +16,7 @@ const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
 const Stack = zag.memory.stack.Stack;
 const VAddr = zag.memory.address.VAddr;
 
-pub const ThreadAllocator = SlabAllocator(Thread, false, 0, 64);
+pub const ThreadAllocator = SlabAllocator(Thread, false, 0, 64, true);
 
 pub const State = enum {
     running,

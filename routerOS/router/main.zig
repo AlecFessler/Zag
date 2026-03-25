@@ -632,9 +632,6 @@ pub fn main(perm_view_addr: u64) void {
         _ = syscall.thread_create(&lanPollThread, 0, 4);
     }
 
-    // Auto-start DHCPv6-PD on WAN
-    dhcpv6_client.sendSolicit();
-
     // WAN thread (runs on the initial/main thread):
     // Polls WAN RX, handles routing, console/NFS channels, maintenance.
     var loop_n: u32 = 0;
@@ -892,6 +889,39 @@ fn handleConsoleCommand(chan: *channel_mod.Channel, cmd: []const u8) void {
             p = util.appendStr(&resp, p, " -> soliciting");
         }
         _ = chan.send(resp[0..p]);
+    } else if (util.eql(cmd, "get-config")) {
+        // Serialize current config as lines (multi-response)
+        // DNS upstream
+        if (!util.eql(&upstream_dns, &[4]u8{ 10, 0, 2, 1 })) {
+            var p: usize = 0;
+            p = util.appendStr(&resp, p, "dns ");
+            p = util.appendIp(&resp, p, upstream_dns);
+            _ = chan.send(resp[0..p]);
+        }
+        // Firewall block rules
+        for (&firewall_rules) |*r| {
+            if (!r.valid) continue;
+            var p: usize = 0;
+            p = util.appendStr(&resp, p, "block ");
+            p = util.appendIp(&resp, p, r.src_ip);
+            _ = chan.send(resp[0..p]);
+        }
+        // Port forwards
+        for (&port_forwards) |*f| {
+            if (!f.valid) continue;
+            var p: usize = 0;
+            const proto_str: []const u8 = if (f.protocol == .tcp) "tcp" else "udp";
+            p = util.appendStr(&resp, p, "forward ");
+            p = util.appendStr(&resp, p, proto_str);
+            p = util.appendStr(&resp, p, " ");
+            p = util.appendDec(&resp, p, f.wan_port);
+            p = util.appendStr(&resp, p, " ");
+            p = util.appendIp(&resp, p, f.lan_ip);
+            p = util.appendStr(&resp, p, " ");
+            p = util.appendDec(&resp, p, f.lan_port);
+            _ = chan.send(resp[0..p]);
+        }
+        _ = chan.send("---");
     } else {
         _ = chan.send("unknown router command");
     }

@@ -99,6 +99,9 @@ fn processCommand(line: []const u8) void {
         serialWrite("                           - port forward to LAN\r\n");
         serialWrite("  dns <ip>                 - set upstream DNS\r\n");
         serialWrite("  dhcp-client              - start/show WAN DHCP\r\n");
+        serialWrite("  dhcpv6                   - start/show WAN DHCPv6-PD\r\n");
+        serialWrite("  save-config              - save config to NFS\r\n");
+        serialWrite("  load-config              - load config from NFS\r\n");
         serialWrite("  version                  - system version\r\n");
         serialWrite("  uptime                   - system uptime\r\n");
         serialWrite("  clear                    - clear screen\r\n");
@@ -149,6 +152,10 @@ fn processCommand(line: []const u8) void {
         routerCommand(line);
     } else if (eql(line, "dhcpv6")) {
         routerCommand(line);
+    } else if (eql(line, "save-config")) {
+        saveConfig();
+    } else if (eql(line, "load-config")) {
+        loadConfig();
     } else if (eql(line, "mount")) {
         nfsMultiResponse("mount");
     } else if (startsWith(line, "ls")) {
@@ -326,6 +333,233 @@ fn nfsPut(cmd: []const u8) void {
         }
         syscall.thread_yield();
     }
+}
+
+fn autoLoadConfig() void {
+    // Quick check: send NFS status query and see if we get a response
+    _ = nfs_chan.send("status");
+    var resp: [256]u8 = undefined;
+    var nfs_alive = false;
+    var attempts: u32 = 0;
+    while (attempts < 20_000) : (attempts += 1) {
+        if (nfs_chan.recv(&resp)) |_| {
+            nfs_alive = true;
+            break;
+        }
+        syscall.thread_yield();
+    }
+
+    if (!nfs_alive) {
+        syscall.write("console: NFS not ready, skipping config load\n");
+        return;
+    }
+
+    // NFS client is alive — try mount
+    _ = nfs_chan.send("mount");
+    var mounted = false;
+    attempts = 0;
+    while (attempts < 50_000) : (attempts += 1) {
+        if (nfs_chan.recv(&resp)) |len| {
+            if (len == 0) { mounted = true; break; }
+            if (len >= 5) {
+                if (containsStr(resp[0..len], "mounted") or containsStr(resp[0..len], "OK")) {
+                    mounted = true;
+                }
+            }
+            break;
+        }
+        syscall.thread_yield();
+    }
+    drainNfs();
+
+    if (!mounted) {
+        syscall.write("console: NFS mount failed, skipping config load\n");
+        return;
+    }
+
+    syscall.write("console: loading config from NFS\n");
+    loadConfig();
+}
+
+fn containsStr(haystack: []const u8, needle: []const u8) bool {
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (eql(haystack[i..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn drainNfs() void {
+    var buf: [2048]u8 = undefined;
+    var attempts: u32 = 0;
+    while (attempts < 10_000) : (attempts += 1) {
+        if (nfs_chan.recv(&buf)) |len| {
+            if (len == 0) return; // EOF
+            attempts = 0; // Reset on data
+        }
+        syscall.thread_yield();
+    }
+}
+
+fn saveConfig() void {
+    if (!has_router or !has_nfs) {
+        serialWrite("save-config: router or NFS not connected\r\n");
+        return;
+    }
+
+    // Get config lines from router
+    _ = router_chan.send("get-config");
+    var lines: [64][256]u8 = undefined;
+    var line_lens: [64]usize = .{0} ** 64;
+    var count: usize = 0;
+
+    var done = false;
+    while (!done and count < 64) {
+        var attempts: u32 = 0;
+        while (attempts < 100_000) : (attempts += 1) {
+            var resp: [256]u8 = undefined;
+            if (router_chan.recv(&resp)) |len| {
+                if (len >= 3 and resp[0] == '-' and resp[1] == '-' and resp[2] == '-') {
+                    done = true;
+                } else if (len > 0) {
+                    @memcpy(lines[count][0..len], resp[0..len]);
+                    line_lens[count] = len;
+                    count += 1;
+                }
+                break;
+            }
+            syscall.thread_yield();
+        }
+        if (attempts >= 100_000) done = true;
+    }
+
+    if (count == 0) {
+        serialWrite("save-config: no config to save\r\n");
+        return;
+    }
+
+    // Write to NFS: put router.cfg
+    _ = nfs_chan.send("put router.cfg");
+
+    // Wait for ack
+    var ack_buf: [256]u8 = undefined;
+    var got_ack = false;
+    var ack_attempts: u32 = 0;
+    while (ack_attempts < 500_000) : (ack_attempts += 1) {
+        if (nfs_chan.recv(&ack_buf)) |_| {
+            got_ack = true;
+            break;
+        }
+        syscall.thread_yield();
+    }
+    if (!got_ack) {
+        serialWrite("save-config: NFS not responding\r\n");
+        return;
+    }
+
+    // Send each config line
+    for (0..count) |i| {
+        _ = nfs_chan.send(lines[i][0..line_lens[i]]);
+        // NFS put only takes one data message then commits on empty
+        // But our NFS client sends one WRITE per data message
+        // Wait briefly for the write to complete
+        var wait: u32 = 0;
+        while (wait < 50_000) : (wait += 1) {
+            syscall.thread_yield();
+        }
+    }
+
+    // Empty line = EOF/commit
+    _ = nfs_chan.send(&[_]u8{});
+    nfsWaitResponse();
+    serialWrite("save-config: OK\r\n");
+}
+
+fn loadConfig() void {
+    if (!has_router or !has_nfs) {
+        serialWrite("load-config: router or NFS not connected\r\n");
+        return;
+    }
+
+    // Read config from NFS
+    _ = nfs_chan.send("cat router.cfg");
+    var resp: [2048]u8 = undefined;
+    var config_data: [4096]u8 = undefined;
+    var config_len: usize = 0;
+
+    var done = false;
+    while (!done) {
+        var attempts: u32 = 0;
+        while (attempts < 500_000) : (attempts += 1) {
+            if (nfs_chan.recv(&resp)) |len| {
+                if (len == 0) {
+                    done = true;
+                } else if (len > 0 and resp[0] == 0xFF) {
+                    // Error — file not found
+                    serialWrite("load-config: no config file\r\n");
+                    return;
+                } else {
+                    const copy_len = @min(len, config_data.len - config_len);
+                    @memcpy(config_data[config_len..][0..copy_len], resp[0..copy_len]);
+                    config_len += copy_len;
+                }
+                break;
+            }
+            syscall.thread_yield();
+        }
+        if (attempts >= 500_000) done = true;
+    }
+
+    if (config_len == 0) {
+        serialWrite("load-config: empty config\r\n");
+        return;
+    }
+
+    // Parse lines and send each as a router command
+    var applied: u32 = 0;
+    var start: usize = 0;
+    for (0..config_len) |i| {
+        if (config_data[i] == '\n' or i == config_len - 1) {
+            var end = i;
+            if (i == config_len - 1 and config_data[i] != '\n') end = i + 1;
+            if (end > start) {
+                const line = config_data[start..end];
+                // Send to router as a command
+                _ = router_chan.send(line);
+                // Wait for response (discard it)
+                var r_resp: [512]u8 = undefined;
+                var r_attempts: u32 = 0;
+                while (r_attempts < 50_000) : (r_attempts += 1) {
+                    if (router_chan.recv(&r_resp)) |_| break;
+                    syscall.thread_yield();
+                }
+                applied += 1;
+            }
+            start = i + 1;
+        }
+    }
+
+    serialWrite("load-config: applied ");
+    var num_buf: [8]u8 = undefined;
+    var n = applied;
+    var digits: usize = 0;
+    if (n == 0) {
+        num_buf[0] = '0';
+        digits = 1;
+    } else {
+        while (n > 0) {
+            num_buf[7 - digits] = '0' + @as(u8, @truncate(n % 10));
+            digits += 1;
+            n /= 10;
+        }
+    }
+    if (applied == 0) {
+        serialWrite("0");
+    } else {
+        serialWrite(num_buf[8 - digits .. 8]);
+    }
+    serialWrite(" rules\r\n");
 }
 
 fn nfsWaitResponse() void {
@@ -520,7 +754,8 @@ pub fn main(perm_view_addr: u64) void {
 
     serialWrite("\x1b[2J\x1b[H");
     serialWrite("=== Zag RouterOS Console ===\r\n");
-    serialWrite("Type 'help' for available commands.\r\n\r\n");
+    serialWrite("Type 'help' for available commands.\r\n");
+    serialWrite("Use 'load-config' to restore saved settings.\r\n\r\n");
     serialWrite("> ");
 
     var line_buf: [CMD_MAX]u8 = undefined;

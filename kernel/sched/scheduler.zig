@@ -96,9 +96,15 @@ pub fn currentThread() ?*Thread {
 
 var first_switch_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
+var dbg_sched_count: u32 = 0;
+
 pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     const core_id = arch.coreID();
     const state = &core_states[core_id];
+    dbg_sched_count += 1;
+    if (dbg_sched_count <= 20) {
+        arch.print("K: tick {d} c={d}\n", .{ dbg_sched_count, core_id });
+    }
 
     if (state.zombie) |zombie| {
         zombie.thread.deinit();
@@ -134,6 +140,9 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     }
     armSchedTimer(state, SCHED_TIMESLICE_NS);
     if (next == preempted) return;
+    if (dbg_sched_count <= 30) {
+        arch.print("K: sw pid={d}\n", .{next.process.pid});
+    }
     arch.switchTo(next);
 }
 

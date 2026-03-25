@@ -14,21 +14,21 @@ const profiles = struct {
         .net = "tap",
         .kvm = true,
         .use_llvm = true,
-        .iommu = "none",
+        .iommu = "intel",
     };
     const test_ = Profile{
         .root_service = "kernel/tests/bin/root_service.elf",
         .net = "none",
         .kvm = true,
         .use_llvm = true,
-        .iommu = "none",
+        .iommu = "intel",
     };
     const bench = Profile{
         .root_service = "kernel/tests/bin/bench.elf",
         .net = "none",
         .kvm = true,
         .use_llvm = true,
-        .iommu = "none",
+        .iommu = "intel",
     };
 };
 
@@ -50,8 +50,8 @@ pub fn build(b: *std.Build) void {
     const target_arch = b.option([]const u8, "arch", "Target architecture (x64 or arm)") orelse "x64";
     const root_service_path = b.option([]const u8, "root-service", "Path to root service ELF") orelse
         if (profile) |p| p.root_service else "kernel/tests/bin/root_service.elf";
-    const iommu_type = b.option([]const u8, "iommu", "IOMMU type: intel, amd, or none (default: none)") orelse
-        if (profile) |p| p.iommu else "none";
+    const iommu_type = b.option([]const u8, "iommu", "IOMMU type: intel or amd (default: intel)") orelse
+        if (profile) |p| p.iommu else "intel";
     const net_type = b.option([]const u8, "net", "Network: tap, user, or none (default: user)") orelse
         if (profile) |p| p.net else "user";
 
@@ -180,10 +180,8 @@ pub fn build(b: *std.Build) void {
     ;
     const qemu_iommu_args: []const u8 = if (std.mem.eql(u8, iommu_type, "intel"))
         \\-device intel-iommu,intremap=off
-    else if (std.mem.eql(u8, iommu_type, "amd"))
-        \\-device amd-iommu
     else
-        \\
+        \\-device amd-iommu
     ;
     const qemu_net_args: []const u8 = if (std.mem.eql(u8, net_type, "tap"))
         \\-netdev tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=off \
@@ -197,7 +195,7 @@ pub fn build(b: *std.Build) void {
     ;
     const qemu_cmdline = b.fmt(
         \\exec qemu-system-x86_64 \
-        \\ -m 512M \
+        \\ -m 1G \
         \\ -bios /usr/share/ovmf/x64/OVMF.4m.fd \
         \\ -drive file=fat:rw:{s}/{s},format=raw \
         \\ -serial mon:stdio \

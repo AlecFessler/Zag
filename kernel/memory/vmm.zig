@@ -52,8 +52,8 @@ fn vmNodeCmp(a: *VmNode, b: *VmNode) std.math.Order {
 }
 
 const VmTree = containers.red_black_tree.RedBlackTree(*VmNode, vmNodeCmp, true);
-const VmNodeSlab = slab_mod.SlabAllocator(VmNode, false, 0, 64);
-const VmTreeSlab = slab_mod.SlabAllocator(VmTree.Node, false, 0, 64);
+const VmNodeSlab = slab_mod.SlabAllocator(VmNode, false, 0, 64, true);
+const VmTreeSlab = slab_mod.SlabAllocator(VmTree.Node, false, 0, 64, true);
 
 var vm_node_slab: VmNodeSlab = undefined;
 var vm_tree_slab: VmTreeSlab = undefined;
@@ -198,10 +198,16 @@ pub const VirtualMemoryManager = struct {
                 std.mem.isAligned(hint.addr, paging.PAGE4K) and
                 hint.addr >= self.range_start.addr and
                 hint.addr + size <= self.range_end.addr and
-                findNodeLocked(&self.tree, hint) == null and
-                findNodeLocked(&self.tree, VAddr.fromInt(hint.addr + size - paging.PAGE4K)) == null)
+                findNodeLocked(&self.tree, hint) == null)
             {
-                break :blk hint;
+                // Check that no existing node starts inside [hint, hint+size).
+                var sentinel = mkSentinel(hint);
+                const neighbors = self.tree.findNeighbors(&sentinel);
+                const range_clear = if (neighbors.upper) |upper|
+                    upper.start.addr >= hint.addr + size
+                else
+                    true;
+                if (range_clear) break :blk hint;
             }
             break :blk try self.findFreeRange(size);
         };

@@ -27,7 +27,7 @@ const VAddr = zag.memory.address.VAddr;
 const VAddrRange = zag.sched.restart_context.VAddrRange;
 const VirtualMemoryManager = zag.memory.vmm.VirtualMemoryManager;
 
-pub const DEFAULT_STACK_PAGES: u32 = 4;
+pub const DEFAULT_STACK_PAGES: u32 = 16;
 pub const MAX_PERMS: usize = 128;
 pub const MAX_DMA_MAPPINGS: usize = 16;
 pub const HANDLE_SELF: u64 = 0;
@@ -40,7 +40,7 @@ pub const DmaMapping = struct {
     active: bool,
 };
 
-pub const ProcessAllocator = SlabAllocator(Process, false, 0, 64);
+pub const ProcessAllocator = SlabAllocator(Process, false, 0, 64, true);
 
 pub const Process = struct {
     pid: u64,

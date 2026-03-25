@@ -15,7 +15,7 @@ OVMF_BIOS = "/usr/share/ovmf/x64/OVMF.4m.fd"
 
 QEMU_CMD = (
     "qemu-system-x86_64"
-    " -m 512M"
+    " -m 1G"
     f" -bios {OVMF_BIOS}"
     f" -drive file=fat:rw:{INSTALL_DIR}/{IMG_DIR},format=raw"
     " -serial mon:stdio"
@@ -23,6 +23,7 @@ QEMU_CMD = (
     " -no-reboot"
     " -enable-kvm -cpu host,+invtsc"
     " -machine q35"
+    " -device intel-iommu,intremap=off"
     " -netdev tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=off"
     " -device e1000e,netdev=net0,mac=52:54:00:12:34:56"
     " -netdev tap,id=net1,ifname=tap1,script=no,downscript=no,vhost=off"

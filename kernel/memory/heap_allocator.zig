@@ -903,6 +903,7 @@ pub const TreeAllocator = slab_alloc.SlabAllocator(
     stack_bootstrap,
     stack_size,
     allocation_chunk_size,
+    true,
 );
 
 const DBG = builtin.mode == .Debug;

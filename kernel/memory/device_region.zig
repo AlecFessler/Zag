@@ -37,7 +37,7 @@ pub const DeviceRegion = struct {
     dma_cursor: u64,
 };
 
-const DeviceRegionSlab = SlabAllocator(DeviceRegion, false, 0, 32);
+const DeviceRegionSlab = SlabAllocator(DeviceRegion, false, 0, 32, true);
 
 var device_region_slab: DeviceRegionSlab = undefined;
 var slab_initialized = false;

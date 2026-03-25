@@ -103,8 +103,10 @@ pub fn init(reg_base_phys: PAddr) !void {
     initialized = true;
 }
 
+var translation_enabled: bool = false;
+
 pub fn enableTranslation() void {
-    if (!initialized) return;
+    if (!initialized or translation_enabled) return;
     invalidateContextCache();
     invalidateIotlb();
     writeReg32(REG_GCMD, readReg32(REG_GCMD) | GCMD_TE);
@@ -112,6 +114,7 @@ pub fn enableTranslation() void {
     while (timeout < 1000000) : (timeout += 1) {
         if (readReg32(REG_GSTS) & GSTS_TES != 0) break;
     }
+    translation_enabled = true;
 }
 
 pub fn setupDevice(device: *DeviceRegion) !void {

@@ -8,7 +8,7 @@ const PAddr = zag.memory.address.PAddr;
 const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
 const VAddr = zag.memory.address.VAddr;
 
-pub const SharedMemoryAllocator = SlabAllocator(SharedMemory, false, 0, 64);
+pub const SharedMemoryAllocator = SlabAllocator(SharedMemory, false, 0, 64, true);
 
 pub const SharedMemory = struct {
     pages: []PAddr,
@@ -27,10 +27,17 @@ pub const SharedMemory = struct {
         );
         if (num_pages > MAX_PAGES) return error.TooManyPages;
 
-        const shm = allocator.create(SharedMemory) catch return error.OutOfMemory;
+        const arch = @import("zag").arch.dispatch;
+        const shm = allocator.create(SharedMemory) catch {
+            arch.print("K: SHM slab alloc fail\n", .{});
+            return error.OutOfMemory;
+        };
         errdefer allocator.destroy(shm);
 
-        const pages_slice = pages_allocator.alloc(PAddr, num_pages) catch return error.OutOfMemory;
+        const pages_slice = pages_allocator.alloc(PAddr, num_pages) catch {
+            arch.print("K: SHM pages_slice alloc fail n={d}\n", .{num_pages});
+            return error.OutOfMemory;
+        };
         errdefer pages_allocator.free(pages_slice);
 
         shm.* = .{
@@ -40,7 +47,6 @@ pub const SharedMemory = struct {
 
         const pmm_iface = pmm.global_pmm.?.allocator();
         errdefer shm.freePages();
-
         for (pages_slice) |*slot| {
             const page = pmm_iface.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
             const page_bytes: [*]u8 = @ptrCast(page);

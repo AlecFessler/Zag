@@ -79,8 +79,13 @@ fn err(code: i64) SyscallResult {
     return .{ .rax = code };
 }
 
+var dbg_dispatch_count: u32 = 0;
 pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) SyscallResult {
     _ = arg4;
+    dbg_dispatch_count += 1;
+    if (dbg_dispatch_count <= 30) {
+        arch.print("K: syscall {d}\n", .{num});
+    }
     const syscall_num: SyscallNum = @enumFromInt(num);
     return switch (syscall_num) {
         .write => sysWrite(arg0, arg1),
@@ -112,9 +117,15 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
     };
 }
 
+var dbg_write_count: u32 = 0;
 fn sysWrite(ptr: u64, len: u64) SyscallResult {
     if (len == 0) return ok(0);
     if (len > 4096) return err(E_INVAL);
+    dbg_write_count += 1;
+    if (dbg_write_count <= 5) {
+        const proc = currentProc();
+        arch.print("K: write pid={d} len={d} ptr=0x{x}\n", .{ proc.pid, len, ptr });
+    }
     if (!address.AddrSpacePartition.user.contains(ptr)) return err(E_BADADDR);
     const end = std.math.add(u64, ptr, len) catch return err(E_BADADDR);
     if (!address.AddrSpacePartition.user.contains(end -| 1)) return err(E_BADADDR);
@@ -185,14 +196,28 @@ fn sysVmPerms(vm_handle: u64, offset: u64, size: u64, perms_bits: u64) i64 {
     return E_OK;
 }
 
+var dbg_shm_count: u32 = 0;
 fn sysShmCreate(size: u64, rights_bits: u64) i64 {
-    if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) return E_INVAL;
+    dbg_shm_count += 1;
+    if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) {
+        if (dbg_shm_count <= 5) arch.print("K: shm_create INVAL s={d} r={d}\n", .{ size, rights_bits });
+        return E_INVAL;
+    }
 
     const proc = currentProc();
-    const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
-    if (!self_entry.processRights().shm_create) return E_PERM;
+    const self_entry = proc.getPermByHandle(0) orelse {
+        if (dbg_shm_count <= 5) arch.print("K: shm_create NOPERM pid={d}\n", .{proc.pid});
+        return E_PERM;
+    };
+    if (!self_entry.processRights().shm_create) {
+        if (dbg_shm_count <= 5) arch.print("K: shm_create NOSHM pid={d}\n", .{proc.pid});
+        return E_PERM;
+    }
 
-    const shm = SharedMemory.create(size) catch return E_NOMEM;
+    const shm = SharedMemory.create(size) catch {
+        if (dbg_shm_count <= 5) arch.print("K: shm_create NOMEM pid={d} s={d}\n", .{ proc.pid, size });
+        return E_NOMEM;
+    };
 
     const rights: u16 = if (rights_bits == 0) 0b1111 else @truncate(rights_bits);
     const entry = PermissionEntry{
@@ -356,6 +381,7 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms: u64) i64 {
         return E_MAXCAP;
     };
 
+    arch.print("K: proc_create pid={d} entry=0x{x}\n", .{ child.pid, child.threads[0].ctx.*.rip });
     sched.enqueueOnCore(arch.coreID(), child.threads[0]);
     return @intCast(handle_id);
 }
@@ -585,12 +611,12 @@ fn sysDmaMap(device_handle: u64, shm_handle: u64) i64 {
 
     if (iommu.isAvailable()) {
         const dma_base = iommu.mapDmaPages(device, shm) catch return E_NOMEM;
+        iommu.enableTranslation();
         proc.addDmaMapping(device, shm, dma_base, shm.pages.len) catch return E_NOMEM;
         return @bitCast(dma_base);
     }
 
-    // No IOMMU: return physical base address directly.
-    // Requires pages to be contiguous in physical memory.
+    // No IOMMU fallback: requires contiguous physical pages
     if (shm.pages.len == 0) return E_INVAL;
     const base = shm.pages[0].addr;
     for (shm.pages[1..], 1..) |p, i| {

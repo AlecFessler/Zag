@@ -790,8 +790,8 @@ fn initIommuDevices() void {
         }
     }
 
-    // Enable IOMMU translation now that all device context entries are populated.
-    iommu.enableTranslation();
+    // Translation enable is deferred to the first dma_map syscall.
+    // Enabling now with empty page tables would fault any early device DMA.
 }
 
 const MAX_CORES = 64;
