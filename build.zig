@@ -10,21 +10,21 @@ const Profile = struct {
 
 const profiles = struct {
     const router = Profile{
-        .root_service = "userspace/bin/routerOS.elf",
+        .root_service = "routerOS/bin/routerOS.elf",
         .net = "tap",
         .kvm = true,
         .use_llvm = true,
         .iommu = "none",
     };
     const test_ = Profile{
-        .root_service = "userspace/bin/root_service.elf",
+        .root_service = "kernel/tests/bin/root_service.elf",
         .net = "none",
         .kvm = true,
         .use_llvm = true,
         .iommu = "none",
     };
     const bench = Profile{
-        .root_service = "userspace/bin/bench.elf",
+        .root_service = "kernel/tests/bin/bench.elf",
         .net = "none",
         .kvm = true,
         .use_llvm = true,
@@ -49,7 +49,7 @@ pub fn build(b: *std.Build) void {
         if (profile) |p| p.use_llvm else false;
     const target_arch = b.option([]const u8, "arch", "Target architecture (x64 or arm)") orelse "x64";
     const root_service_path = b.option([]const u8, "root-service", "Path to root service ELF") orelse
-        if (profile) |p| p.root_service else "userspace/bin/root_service.elf";
+        if (profile) |p| p.root_service else "kernel/tests/bin/root_service.elf";
     const iommu_type = b.option([]const u8, "iommu", "IOMMU type: intel, amd, or none (default: none)") orelse
         if (profile) |p| p.iommu else "none";
     const net_type = b.option([]const u8, "net", "Network: tap, user, or none (default: user)") orelse

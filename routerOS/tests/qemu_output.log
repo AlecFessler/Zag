@@ -1,0 +1,243 @@
+[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01HBdsDxe: loading Boot0001 "UEFI QEMU HARDDISK QM00001 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x0,0xFFFF,0x0)
+BdsDxe: starting Boot0001 "UEFI QEMU HARDDISK QM00001 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x0,0xFFFF,0x0)
+[2J[01;01Hdma: dma_map failed
+router: DMA fail
+dma: dma_map failed
+router: DMA fail
+dma: dma_map failed
+router: DMA fail
+[2J[H=== Zag RouterOS Console ===
+Type 'help' for available commands.
+
+> arp
+WAN 10.0.2.1 e6:11:e1:e5:b6:b9
+LAN 192.168.1.50 3a:26:f0:f3:db:fc
+---
+> arp
+WAN 10.0.2.1 e6:11:e1:e5:b6:b9
+LAN 192.168.1.50 3a:26:f0:f3:db:fc
+---
+> arp
+WAN 10.0.2.1 e6:11:e1:e5:b6:b9
+LAN 192.168.1.50 3a:26:f0:f3:db:fc
+---
+> arp
+WAN 10.0.2.1 e6:11:e1:e5:b6:b9
+LAN 192.168.1.50 3a:26:f0:f3:db:fc
+---
+> leases
+(empty)
+---
+> leases
+192.168.1.100 02:00:00:00:00:30
+---
+> status
+WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
+LAN: 192.168.1.1 mac=52:54:00:12:34:57
+> leases
+192.168.1.100 02:00:00:00:00:30
+---
+> dhcp-client
+dhcp-client: sent DISCOVER on WAN
+DHCP client: idle -> discovering
+> status
+WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
+LAN: 192.168.1.1 mac=52:54:00:12:34:57
+> status
+WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
+LAN: 192.168.1.1 mac=52:54:00:12:34:57
+> dns 10.0.2.1
+OK
+> dns 10.0.2.1
+OK
+> dns 10.0.2.1
+OK
+> block 10.0.2.100
+OK
+> rules
+block 10.0.2.100
+---
+> allow 10.0.2.100
+OK
+> rules
+(empty)
+---
+> block 10.0.2.1
+OK
+> rules
+block 10.0.2.1
+---
+> allow 10.0.2.1
+OK
+> block 10.55.55.55
+OK
+> rules
+block 10.55.55.55
+---
+> allow 10.55.55.55
+OK
+> block 10.0.2.1
+OK
+> allow 10.0.2.1
+OK
+> dhcp-client: timeout, retrying
+dhcp-client: sent DISCOVER on WAN
+block 10.33.33.33
+OK
+> rules
+block 10.33.33.33
+---
+> status
+WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
+LAN: 192.168.1.1 mac=52:54:00:12:34:57
+> ifstat
+WAN rx=42 tx=87 drop=0
+LAN rx=51 tx=13 drop=0
+> rules
+block 10.33.33.33
+---
+> allow 10.33.33.33
+OK
+> forward tcp 8080 192.168.1.50 80
+OK
+> rules
+forward tcp :8080 -> 192.168.1.50:80
+---
+> forward tcp 7778 192.168.1.60 7777
+OK
+> forward udp 7780 192.168.1.60 7779
+OK
+> forward udp 19950 192.168.1.60 19950
+OK
+> ifstat
+WAN rx=65 tx=138 drop=0
+LAN rx=86 tx=35 drop=0
+> ping 10.0.2.1
+reply from 10.0.2.1: seq=0 time=41us
+reply from 10.0.2.1: seq=1 time=646us
+reply from 10.0.2.1: seq=2 time=148us
+reply from 10.0.2.1: seq=3 time=643us
+--- ping 10.0.2.1: 4 sent, 4 received ---
+> dhcp-client: timeout, retrying
+dhcp-client: sent DISCOVER on WAN
+version
+Zag RouterOS v0.1
+> dhcp-client: timeout, retrying
+dhcp-client: sent DISCOVER on WAN
+dhcp-client: timeout, retrying
+dhcp-client: sent DISCOVER on WAN
+dhcp-client: timeout, retrying
+dhcp-client: sent DISCOVER on WAN
+nat
+(empty)
+---
+> block 10.99.99.99
+OK
+> rules
+block 10.99.99.99
+forward tcp :8080 -> 192.168.1.50:80
+forward tcp :7778 -> 192.168.1.60:7777
+forward udp :7780 -> 192.168.1.60:7779
+forward udp :19950 -> 192.168.1.60:19950
+---
+> allow 10.99.99.99
+OK
+> nat
+tcp 192.168.1.60:57036 -> :10003 -> 10.0.2.1:19900
+---
+> nat
+tcp 192.168.1.60:57036 -> :10003 -> 10.0.2.1:19900
+icmp 192.168.1.60:11476 -> :10004 -> 10.0.2.1:0
+---
+> nat
+tcp 192.168.1.60:57802 -> :10005 -> 10.0.2.1:19876
+tcp 192.168.1.60:57036 -> :10003 -> 10.0.2.1:19900
+icmp 192.168.1.60:11476 -> :10004 -> 10.0.2.1:0
+---
+> nat
+tcp 192.168.1.60:57802 -> :10005 -> 10.0.2.1:19876
+tcp 192.168.1.60:57036 -> :10003 -> 10.0.2.1:19900
+icmp 192.168.1.60:11476 -> :10004 -> 10.0.2.1:0
+---
+> nat
+tcp 192.168.1.60:57802 -> :10005 -> 10.0.2.1:19876
+tcp 192.168.1.60:57036 -> :10003 -> 10.0.2.1:19900
+icmp 192.168.1.60:11476 -> :10004 -> 10.0.2.1:0
+udp 192.168.1.60:55024 -> :10006 -> 10.0.2.1:19878
+---
+> mount
+NFS: mounted
+NFS: mounted
+dhcp-client: timeout, retrying
+dhcp-client: sent DISCOVER on WAN
+dhcp-client: timeout, retrying
+dhcp-client: sent DISCOVER on WAN
+> ls
+subdir
+hello.txt
+> cat hello.txt
+Hello from NFS
+> time
+NTP: synced to 10.0.2.1 | 2026-03-25 02:25:03 UTC
+> ntpserver 10.0.2.1
+2026-03-25 02:27:43 UTC
+> ntpserver 10.0.2.1
+OK
+> block 10.88.88.88
+OK
+> rules
+block 10.88.88.88
+forward tcp :8080 -> 192.168.1.50:80
+forward tcp :7778 -> 192.168.1.60:7777
+forward udp :7780 -> 192.168.1.60:7779
+forward udp :19950 -> 192.168.1.60:19950
+---
+> allow 10.88.88.88
+OK
+> forward tcp 9090 192.168.1.50 80
+OK
+> rules
+forward tcp :8080 -> 192.168.1.50:80
+forward tcp :7778 -> 192.168.1.60:7777
+forward udp :7780 -> 192.168.1.60:7779
+forward udp :19950 -> 192.168.1.60:19950
+forward tcp :9090 -> 192.168.1.50:80
+---
+> dns 10.0.2.1
+OK
+> leases
+192.168.1.100 02:00:00:00:00:30
+---
+> ping 10.0.2.1
+reply from 10.0.2.1: seq=0 time=41us
+reply from 10.0.2.1: seq=1 time=655us
+reply from 10.0.2.1: seq=2 time=148us
+reply from 10.0.2.1: seq=3 time=648us
+--- ping 10.0.2.1: 4 sent, 4 received ---
+> ping 192.168.1.50
+reply from 192.168.1.50: seq=0 time=102us
+reply from 192.168.1.50: seq=1 time=705us
+reply from 192.168.1.50: seq=2 time=143us
+reply from 192.168.1.50: seq=3 time=710us
+--- ping 192.168.1.50: 4 sent, 4 received ---
+> status
+WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
+LAN: 192.168.1.1 mac=52:54:00:12:34:57
+> status
+WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
+LAN: 192.168.1.1 mac=52:54:00:12:34:57
+> status
+WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
+LAN: 192.168.1.1 mac=52:54:00:12:34:57
+> ifstat
+WAN rx=225 tx=611 drop=0
+LAN rx=363 tx=72 drop=0
+> ifstat
+WAN rx=225 tx=611 drop=0
+LAN rx=363 tx=72 drop=0
+> version
+Zag RouterOS v0.1
+> uptime
+uptime: 0h 2m 49s
+> QEMU 10.1.2 monitor - type 'help' for more information
+(qemu) q[K[Dqu[K[D[Dqui[K[D[D[Dquit[K
