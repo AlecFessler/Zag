@@ -10,6 +10,7 @@ pub const DNS_PORT: u16 = 53;
 pub const DnsRelay = struct {
     valid: bool,
     client_ip: [4]u8,
+    client_mac: [6]u8,
     client_port: u16,
     query_id: u16,
     relay_id: u16,
@@ -17,7 +18,7 @@ pub const DnsRelay = struct {
 };
 
 pub const empty = DnsRelay{
-    .valid = false, .client_ip = .{ 0, 0, 0, 0 },
+    .valid = false, .client_ip = .{ 0, 0, 0, 0 }, .client_mac = .{ 0, 0, 0, 0, 0, 0 },
     .client_port = 0, .query_id = 0, .relay_id = 0, .timestamp_ns = 0,
 };
 
@@ -35,6 +36,8 @@ pub fn handleFromLan(pkt: []u8, len: u32) void {
     const src_port = util.readU16Be(pkt[udp_start..][0..2]);
     var client_ip: [4]u8 = undefined;
     @memcpy(&client_ip, pkt[26..30]);
+    var client_mac: [6]u8 = undefined;
+    @memcpy(&client_mac, pkt[6..12]);
 
     const dns_start = udp_start + 8;
     if (dns_start + 2 > len) return;
@@ -62,6 +65,7 @@ pub fn handleFromLan(pkt: []u8, len: u32) void {
     slot.?.* = .{
         .valid = true,
         .client_ip = client_ip,
+        .client_mac = client_mac,
         .client_port = src_port,
         .query_id = query_id,
         .relay_id = relay_id,
@@ -70,8 +74,10 @@ pub fn handleFromLan(pkt: []u8, len: u32) void {
 
     util.writeU16Be(pkt[dns_start..][0..2], relay_id);
 
-    const gateway_mac = arp.lookup(&main.wan_iface.arp_table, main.upstream_dns) orelse {
-        arp.sendRequest(.wan, main.upstream_dns);
+    // Use WAN gateway MAC as next-hop (always known after boot ARP exchange)
+    // rather than looking up the upstream DNS IP which may not be in ARP table
+    const gateway_mac = arp.lookup(&main.wan_iface.arp_table, main.wan_gateway) orelse {
+        arp.sendRequest(.wan, main.wan_gateway);
         return;
     };
 
@@ -116,12 +122,7 @@ pub fn handleFromWan(pkt: []u8, len: u32) void {
         if (r.valid and r.relay_id == resp_id) {
             util.writeU16Be(pkt[dns_start..][0..2], r.query_id);
 
-            const client_mac = arp.lookup(&main.lan_iface.arp_table, r.client_ip) orelse {
-                r.valid = false;
-                return;
-            };
-
-            @memcpy(pkt[0..6], &client_mac);
+            @memcpy(pkt[0..6], &r.client_mac);
             @memcpy(pkt[6..12], &main.lan_iface.mac);
             @memcpy(pkt[26..30], &main.lan_iface.ip);
             @memcpy(pkt[30..34], &r.client_ip);

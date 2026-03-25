@@ -3,7 +3,7 @@
 # Run with: sudo ./routerOS/tests/setup_sudo.sh
 #
 # Creates a "lan" network namespace with a macvlan on tap1.
-# Traffic from this namespace must route through the router (192.168.1.1)
+# Traffic from this namespace must route through the router (10.1.1.1)
 # to reach the WAN side, which is what we need for NAT/forwarding tests.
 set -euo pipefail
 
@@ -18,7 +18,7 @@ ip link del lan-test0 2>/dev/null || true
 
 # ── Create LAN test namespace ───────────────────────────────────────
 # This namespace has a macvlan on tap1 and can only reach the WAN
-# through the router at 192.168.1.1 (no direct path to tap0).
+# through the router at 10.1.1.1 (no direct path to tap0).
 echo "Creating lan_test namespace..."
 ip netns add lan_test
 
@@ -31,8 +31,8 @@ ip link set lan-test0 netns lan_test
 ip netns exec lan_test ip link set lo up
 ip netns exec lan_test ip link set lan-test0 up
 # Use .60 to avoid conflict with host's .50 on tap1
-ip netns exec lan_test ip addr add 192.168.1.60/24 dev lan-test0
-ip netns exec lan_test ip route add default via 192.168.1.1
+ip netns exec lan_test ip addr add 10.1.1.60/24 dev lan-test0
+ip netns exec lan_test ip route add default via 10.1.1.1
 ip netns exec lan_test ip -6 addr add fd00:lan::60/64 dev lan-test0 2>/dev/null || true
 
 # ── Allow non-root to use raw sockets on tap interfaces ─────────────
@@ -60,8 +60,8 @@ echo ""
 echo "Namespace 'lan_test' created with:"
 echo "  Interface: lan-test0 (macvlan on tap1)"
 echo "  MAC:       02:00:00:00:00:20"
-echo "  IP:        192.168.1.60/24"
-echo "  Gateway:   192.168.1.1 (router)"
+echo "  IP:        10.1.1.60/24"
+echo "  Gateway:   10.1.1.1 (router)"
 echo ""
 echo "Run tests with:"
 echo "  cd $REPO && routerOS/tests/.venv/bin/pytest routerOS/tests/ -v"

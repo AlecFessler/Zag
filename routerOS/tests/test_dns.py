@@ -35,47 +35,50 @@ class TestDnsRelay:
     @pytest.mark.lan
     def test_dns_relay_forwards_query(self, router, wan_ip, router_lan_ip):
         """DNS query from LAN is forwarded to upstream and response returned."""
-        from conftest import ping_host
-        # Warm ARP: router needs to know both our LAN MAC and the upstream MAC
-        ping_host(router_lan_ip, interface="tap1", count=1)
-        ping_host("10.0.2.15", interface="tap0", count=1)
-        time.sleep(0.5)
+        from conftest import ping_host, LAN_IFACE
+        import subprocess
+        # Add static ARP entry on host for router's WAN IP (avoids ARP race)
+        subprocess.run(["ip", "neigh", "replace", "10.0.2.15", "lladdr", "52:54:00:12:34:56",
+                        "dev", "tap0", "nud", "permanent"], capture_output=True)
+        # Warm ARP: ping LAN to ensure router knows our MAC
+        ping_host(router_lan_ip, interface="tap1", count=2)
+        # Ping WAN to warm router's WAN ARP for gateway
+        ping_host("10.0.2.15", interface="tap0", count=2)
+        time.sleep(1)
 
         received_queries = []
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tap0")
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server_sock.bind((wan_ip, 53))
+        except (PermissionError, OSError):
+            pytest.skip("Could not bind DNS server on port 53")
+        server_sock.settimeout(5.0)
 
         def dns_server():
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tap0")
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                sock.bind((wan_ip, 53))
-            except (PermissionError, OSError):
-                return
-            sock.settimeout(8.0)
-            try:
-                data, addr = sock.recvfrom(512)
-                received_queries.append((data, addr))
-                resp = build_dns_response(data, "93.184.216.34")
-                sock.sendto(resp, addr)
-            except socket.timeout:
+                for _ in range(10):
+                    data, addr = server_sock.recvfrom(512)
+                    received_queries.append((data, addr))
+                    resp = build_dns_response(data, "93.184.216.34")
+                    server_sock.sendto(resp, addr)
+            except (socket.timeout, OSError):
                 pass
-            finally:
-                sock.close()
 
         server = threading.Thread(target=dns_server, daemon=True)
         server.start()
-        time.sleep(1)
+        time.sleep(0.5)
 
         router.set_dns(wan_ip)
         time.sleep(0.5)
 
         query = build_dns_query("test.example.com", query_id=0xABCD)
         client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        client.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tap1")
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, LAN_IFACE.encode())
         client.settimeout(3.0)
         try:
-            # Try up to 3 times (relay may need ARP resolution on first attempt)
-            for attempt in range(3):
+            for attempt in range(5):
                 client.sendto(query, (router_lan_ip, 53))
                 try:
                     response, _ = client.recvfrom(512)
@@ -84,49 +87,52 @@ class TestDnsRelay:
                     assert ancount >= 1, f"DNS response has no answers: {response.hex()}"
                     return  # Success
                 except socket.timeout:
-                    if attempt < 2:
-                        time.sleep(1)
+                    if attempt < 4:
+                        time.sleep(2)
                         continue
                     if not received_queries:
-                        pytest.skip("Could not bind DNS server on port 53 — run with sudo")
+                        pytest.fail("DNS query never reached upstream server")
                     pytest.fail("DNS query forwarded but no response received from router")
         finally:
             client.close()
-            server.join(timeout=2)
+            server_sock.close()
+            server.join(timeout=3)
 
     @pytest.mark.lan
     def test_dns_relay_rewrites_query_id(self, router, wan_ip, router_lan_ip):
         """DNS relay rewrites query ID and maps it back on response."""
-        from conftest import ping_host
+        from conftest import ping_host, LAN_IFACE
+        import subprocess
+        # Ensure host ARP for router WAN is permanent (prevents ARP race on response)
+        subprocess.run(["ip", "neigh", "replace", "10.0.2.15", "lladdr", "52:54:00:12:34:56",
+                        "dev", "tap0", "nud", "permanent"], capture_output=True)
         ping_host(router_lan_ip, interface="tap1", count=1)
+        ping_host("10.0.2.15", interface="tap0", count=1)
         time.sleep(0.5)
 
         received_queries = []
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tap0")
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server_sock.bind((wan_ip, 53))
+        except (PermissionError, OSError):
+            pytest.skip("Could not bind DNS server on port 53")
+        server_sock.settimeout(5.0)
 
         def dns_server():
-            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tap0")
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             try:
-                sock.bind((wan_ip, 53))
-            except (PermissionError, OSError):
-                return
-            sock.settimeout(8.0)
-            try:
-                # Handle up to 2 queries (in case of retransmit)
-                for _ in range(2):
-                    data, addr = sock.recvfrom(512)
+                for _ in range(3):
+                    data, addr = server_sock.recvfrom(512)
                     received_queries.append(data)
                     resp = build_dns_response(data, "1.2.3.4")
-                    sock.sendto(resp, addr)
-            except socket.timeout:
+                    server_sock.sendto(resp, addr)
+            except (socket.timeout, OSError):
                 pass
-            finally:
-                sock.close()
 
         server = threading.Thread(target=dns_server, daemon=True)
         server.start()
-        time.sleep(1)
+        time.sleep(0.5)
 
         router.set_dns(wan_ip)
         time.sleep(0.5)
@@ -134,7 +140,7 @@ class TestDnsRelay:
         original_id = 0xBEEF
         query = build_dns_query("rewrite.test", query_id=original_id)
         client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        client.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tap1")
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, LAN_IFACE.encode())
         client.settimeout(3.0)
         try:
             for attempt in range(3):
@@ -150,10 +156,11 @@ class TestDnsRelay:
                         time.sleep(1)
                         continue
                     if not received_queries:
-                        pytest.skip("Could not bind DNS server on port 53 — run with sudo")
+                        pytest.fail("DNS query never reached upstream server")
                     pytest.fail("DNS query forwarded but no response received")
         finally:
             client.close()
+            server_sock.close()
             server.join(timeout=3)
 
     def test_dns_set_upstream(self, router, wan_ip):

@@ -26,7 +26,7 @@ class TestPersistentConfig:
 
     def test_port_forwards_persist(self, router):
         """Port forward rules added during session are retrievable."""
-        resp = router.add_port_forward("tcp", 9090, "192.168.1.50", 80)
+        resp = router.add_port_forward("tcp", 9090, "10.1.1.50", 80)
         assert "OK" in resp
 
         rules = router.get_rules()

@@ -10,6 +10,7 @@ import time
 import pytest
 
 from conftest import run_in_lan_ns
+from conftest import LAN_IFACE
 
 
 # Router's WAN MAC → EUI-64 link-local
@@ -121,7 +122,7 @@ class TestIpv6:
     @pytest.mark.lan
     def test_ndp_router_advertisement(self, router):
         """Router sends Router Advertisements on LAN (type 134)."""
-        sock = raw_socket("tap1", timeout=65.0)  # RAs sent every 60s
+        sock = raw_socket(LAN_IFACE, timeout=65.0)  # RAs sent every 60s
         try:
             deadline = time.time() + 65.0
             while time.time() < deadline:
@@ -190,7 +191,7 @@ class TestIpv6:
         """
         # Router LAN MAC: 52:54:00:12:34:57 → link-local fe80::5054:ff:fe12:3457
         router_lan_ll = "fe80::5054:ff:fe12:3457"
-        sock = raw_socket("tap1", timeout=5.0)
+        sock = raw_socket(LAN_IFACE, timeout=5.0)
         try:
             src_mac = b"\x02\x00\x00\x00\x00\x50"
             src_ip6 = b"\xfe\x80" + b"\x00" * 6 + b"\x00\x00\x00\xff\xfe\x00\x00\x50"
@@ -265,7 +266,7 @@ class TestIpv6:
 
         Verify RA on LAN contains a Prefix Information option (type 3).
         """
-        sock = raw_socket("tap1", timeout=65.0)
+        sock = raw_socket(LAN_IFACE, timeout=65.0)
         try:
             deadline = time.time() + 65.0
             while time.time() < deadline:

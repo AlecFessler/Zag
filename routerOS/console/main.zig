@@ -243,6 +243,11 @@ fn nfsMultiResponse(cmd: []const u8) void {
         serialWrite("nfs: not connected\r\n");
         return;
     }
+    // Drain any stale messages (e.g. auto-mount response) before sending new command
+    {
+        var stale_buf: [2048]u8 = undefined;
+        while (nfs_chan.recv(&stale_buf) != null) {}
+    }
     _ = nfs_chan.send(cmd);
     var resp: [2048]u8 = undefined;
     var msg_count: u32 = 0;

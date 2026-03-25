@@ -98,15 +98,9 @@ pub fn currentThread() ?*Thread {
 
 var first_switch_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
-var dbg_sched_count: u32 = 0;
-
 pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     const core_id = arch.coreID();
     const state = &core_states[core_id];
-    dbg_sched_count += 1;
-    if (dbg_sched_count <= 20) {
-        arch.print("K: tick {d} c={d}\n", .{ dbg_sched_count, core_id });
-    }
 
     if (state.zombie) |zombie| {
         zombie.thread.deinit();
@@ -133,7 +127,19 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
 
     if (preempted != &state.rq.sentinel and preempted.state == .running) {
         preempted.state = .ready;
-        state.rq.enqueue(preempted);
+        // If the thread has affinity that excludes this core, migrate it
+        if (preempted.core_affinity) |aff| {
+            if (aff & (@as(u64, 1) << @intCast(core_id)) == 0) {
+                // Thread shouldn't be on this core — find the right one
+                state.rq_lock.unlock();
+                enqueueOnCore(@ctz(aff), preempted);
+                state.rq_lock.lock();
+            } else {
+                state.rq.enqueue(preempted);
+            }
+        } else {
+            state.rq.enqueue(preempted);
+        }
     }
 
     const next = state.rq.dequeue() orelse &state.rq.sentinel;
@@ -154,9 +160,6 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     }
     armSchedTimer(state, SCHED_TIMESLICE_NS);
     if (next == preempted) return;
-    if (dbg_sched_count <= 30) {
-        arch.print("K: sw pid={d}\n", .{next.process.pid});
-    }
     arch.switchTo(next);
 }
 

@@ -25,11 +25,11 @@ class TestIpForwarding:
     def test_wan_to_lan_forwarding(self, router, wan_ip, router_wan_ip):
         """Port-forwarded packet from WAN reaches LAN namespace server."""
         port = 19950
-        lan_ip = "192.168.1.60"
+        lan_ip = "10.1.1.60"
         received = []
 
         # Warm ARP
-        ping_from_lan_ns("192.168.1.1", count=1)
+        ping_from_lan_ns("10.1.1.1", count=1)
         time.sleep(1)
 
         resp = router.add_port_forward("udp", port, lan_ip, port)

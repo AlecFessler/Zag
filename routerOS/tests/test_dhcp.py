@@ -26,7 +26,7 @@ class TestDhcpServer:
     @pytest.mark.lan
     @pytest.mark.lan_ns
     def test_dhcp_server_assigns_ip(self, router):
-        """DHCP server assigns IP in 192.168.1.100+ range to LAN client.
+        """DHCP server assigns IP in 10.1.1.100+ range to LAN client.
 
         Uses a second macvlan inside the lan_test namespace to get a fresh lease.
         """
@@ -54,7 +54,7 @@ class TestDhcpServer:
 
             if ip_match:
                 assigned_ip = ip_match.group(1)
-                assert assigned_ip.startswith("192.168.1."), \
+                assert assigned_ip.startswith("10.1.1."), \
                     f"DHCP assigned wrong subnet: {assigned_ip}"
                 ip_last = int(assigned_ip.split(".")[-1])
                 assert ip_last >= 100, \
@@ -75,7 +75,7 @@ class TestDhcpServer:
         """DHCP OFFER includes gateway option pointing to router LAN IP.
 
         We verify indirectly: the router's DHCP server sends option 3 (gateway)
-        set to 192.168.1.1. We check the DHCP server config by verifying
+        set to 10.1.1.1. We check the DHCP server config by verifying
         that a LAN client with the router as default gw can reach the WAN.
         This is already proven by the NAT/forwarding tests, so here we just
         verify the status output confirms the LAN gateway IP.

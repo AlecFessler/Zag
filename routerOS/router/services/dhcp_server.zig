@@ -40,7 +40,7 @@ fn allocateLease(mac: [6]u8) ?[4]u8 {
     // Allocate new lease
     for (&main.dhcp_leases) |*l| {
         if (!l.valid) {
-            l.ip = .{ 192, 168, 1, main.dhcp_next_ip };
+            l.ip = .{ 10, 1, 1, main.dhcp_next_ip };
             @memcpy(&l.mac, &mac);
             l.valid = true;
             l.timestamp_ns = now;

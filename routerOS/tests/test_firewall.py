@@ -115,11 +115,11 @@ class TestPortForwarding:
         """TCP port forward: WAN connection reaches LAN namespace server."""
         lan_port = 7777
         wan_port = 7778
-        lan_ip = "192.168.1.60"  # LAN namespace IP
+        lan_ip = "10.1.1.60"  # LAN namespace IP
 
         # Warm up ARP so router knows .60's MAC
         from conftest import ping_from_lan_ns
-        ping_from_lan_ns("192.168.1.1", count=1)
+        ping_from_lan_ns("10.1.1.1", count=1)
         time.sleep(1)
 
         resp = router.add_port_forward("tcp", wan_port, lan_ip, lan_port)
@@ -163,11 +163,11 @@ class TestPortForwarding:
         """UDP port forward: WAN datagrams reach LAN namespace server."""
         lan_port = 7779
         wan_port = 7780
-        lan_ip = "192.168.1.60"  # LAN namespace IP
+        lan_ip = "10.1.1.60"  # LAN namespace IP
 
         # Warm up ARP
         from conftest import ping_from_lan_ns
-        ping_from_lan_ns("192.168.1.1", count=1)
+        ping_from_lan_ns("10.1.1.1", count=1)
         time.sleep(1)
 
         resp = router.add_port_forward("udp", wan_port, lan_ip, lan_port)

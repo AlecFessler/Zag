@@ -18,21 +18,62 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(config, items):
-    """Auto-skip tests marked @lan_ns if the lan_test namespace doesn't exist."""
-    if not lan_ns_exists():
-        skip = pytest.mark.skip(reason="lan_test namespace not found — run sudo ./routerOS/tests/setup_sudo.sh")
+    """Auto-skip tests marked @lan_ns if not running as root and no namespace exists."""
+    if os.geteuid() != 0 and not lan_ns_exists():
+        skip = pytest.mark.skip(reason="lan_test namespace not found — run with sudo or run sudo ./routerOS/tests/setup_sudo.sh")
         for item in items:
             if "lan_ns" in item.keywords:
                 item.add_marker(skip)
 
 
+def _run_ip(args: list[str]):
+    """Run an ip command, using sudo only if not already root."""
+    cmd = args if os.geteuid() == 0 else ["sudo"] + args
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def _setup_lan_namespace():
+    """Create lan_test namespace with macvlan on tap1 (after QEMU boots)."""
+    if lan_ns_exists():
+        return
+    cmds = [
+        ["ip", "netns", "add", "lan_test"],
+        ["ip", "link", "add", "lan-test0", "link", "tap1",
+         "type", "macvlan", "mode", "bridge"],
+        ["ip", "link", "set", "lan-test0", "address", "02:00:00:00:00:20"],
+        ["ip", "link", "set", "lan-test0", "netns", "lan_test"],
+        ["ip", "netns", "exec", "lan_test", "ip", "link", "set", "lo", "up"],
+        ["ip", "netns", "exec", "lan_test", "ip", "link", "set", "lan-test0", "up"],
+        ["ip", "netns", "exec", "lan_test", "ip", "addr", "add",
+         "10.1.1.60/24", "dev", "lan-test0"],
+        ["ip", "netns", "exec", "lan_test", "ip", "route", "add",
+         "default", "via", "10.1.1.1"],
+    ]
+    for cmd in cmds:
+        r = _run_ip(cmd)
+        if r.returncode != 0:
+            import sys
+            print(f"[conftest] namespace setup failed: {' '.join(cmd)}: {r.stderr.strip()}", file=sys.stderr)
+            return
+
+
+def _teardown_lan_namespace():
+    """Remove lan_test namespace."""
+    _run_ip(["ip", "netns", "del", "lan_test"])
+    _run_ip(["ip", "link", "del", "lan-test0"])
+
+
 @pytest.fixture(scope="session")
 def router():
     """Session-scoped fixture: build, boot, and yield a QemuRouter."""
-    r = QemuRouter(build=True, boot_timeout=ROUTER_BOOT_TIMEOUT)
+    r = QemuRouter(build=False, boot_timeout=ROUTER_BOOT_TIMEOUT)
     r.start()
     time.sleep(2)
+    # Create namespace AFTER QEMU boots (macvlan on tap1 must be after QEMU opens it)
+    _setup_lan_namespace()
+    time.sleep(1)  # Let macvlan settle
     yield r
+    _teardown_lan_namespace()
     r.stop()
 
 
@@ -45,7 +86,7 @@ def wan_ip():
 @pytest.fixture(scope="session")
 def lan_ip():
     """The host's LAN-side IP (on tap1)."""
-    return "192.168.1.50"
+    return "10.1.1.50"
 
 
 @pytest.fixture(scope="session")
@@ -57,13 +98,13 @@ def router_wan_ip():
 @pytest.fixture(scope="session")
 def router_lan_ip():
     """The router's LAN gateway IP."""
-    return "192.168.1.1"
+    return "10.1.1.1"
 
 
 @pytest.fixture(scope="session")
 def lan_ns_ip():
     """The IP of the lan_test namespace interface."""
-    return "192.168.1.60"
+    return "10.1.1.60"
 
 
 def run_on_host(cmd: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess:
@@ -71,9 +112,29 @@ def run_on_host(cmd: list[str], timeout: float = 10.0) -> subprocess.CompletedPr
     return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
 
 
+def _lan_iface() -> str:
+    """Return the LAN interface name: br-lan if bridged, tap1 otherwise."""
+    result = subprocess.run(
+        ["ip", "link", "show", "br-lan"],
+        capture_output=True, text=True,
+    )
+    return "br-lan" if result.returncode == 0 else "tap1"
+
+
+LAN_IFACE = _lan_iface()
+
+
+def _resolve_interface(interface: str | None) -> str | None:
+    """If tap1 is in a bridge, use the bridge interface instead."""
+    if interface == "tap1":
+        return LAN_IFACE
+    return interface
+
+
 def ping_host(target: str, interface: str | None = None, count: int = 3,
               timeout: float = 10.0) -> bool:
     """Ping a target from the host. Returns True if at least one reply received."""
+    interface = _resolve_interface(interface)
     cmd = ["ping", "-c", str(count), "-W", "2", target]
     if interface:
         cmd.extend(["-I", interface])
@@ -91,8 +152,10 @@ def lan_ns_exists() -> bool:
 
 def run_in_lan_ns(cmd: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess:
     """Run a command inside the lan_test network namespace."""
+    prefix = ["ip", "netns", "exec", "lan_test"] if os.geteuid() == 0 \
+        else ["sudo", "ip", "netns", "exec", "lan_test"]
     return subprocess.run(
-        ["sudo", "ip", "netns", "exec", "lan_test"] + cmd,
+        prefix + cmd,
         capture_output=True, text=True, timeout=timeout,
     )
 

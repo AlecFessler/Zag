@@ -73,7 +73,7 @@ class TestTcpNat:
 
         # Warm ARP: namespace pings router to ensure .60 MAC is known
         from conftest import ping_from_lan_ns
-        ping_from_lan_ns("192.168.1.1", count=1)
+        ping_from_lan_ns("10.1.1.1", count=1)
         time.sleep(1)
 
         server = threading.Thread(target=tcp_server, daemon=True)
@@ -100,6 +100,7 @@ class TestTcpNat:
             f"Connection source was {received[0][0]}, expected 10.0.2.15 (NATed)"
 
     @pytest.mark.lan
+    @pytest.mark.lan_ns
     def test_tcp_nat_state_tracking(self, router):
         """TCP NAT entries show protocol and port information."""
         entries = router.get_nat_table()

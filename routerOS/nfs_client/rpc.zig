@@ -39,6 +39,12 @@ pub fn buildCallHeader(buf: []u8, xid: u32, program: u32, version: u32, procedur
     return p;
 }
 
+/// Quick check: does the packet's XID match the expected one?
+pub fn xidMatches(buf: []const u8, expected_xid: u32) bool {
+    const xid_r = xdr.readU32(buf, 0) orelse return false;
+    return xid_r.val == expected_xid;
+}
+
 /// Parse an RPC REPLY header. Returns the offset to procedure-specific data,
 /// or null if the reply is invalid/rejected.
 pub fn parseReplyHeader(buf: []const u8, expected_xid: u32) ?usize {

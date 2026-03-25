@@ -19,9 +19,9 @@ fi
 
 if ! ip link show tap1 &>/dev/null; then
     ip tuntap add dev tap1 mode tap user "${SUDO_USER:-$USER}"
-    ip addr add 192.168.1.50/24 dev tap1
+    ip addr add 10.1.1.50/24 dev tap1
     ip link set tap1 up
-    echo "  tap1 created (LAN: 192.168.1.50/24)"
+    echo "  tap1 created (LAN: 10.1.1.50/24)"
 else
     echo "  tap1 already exists"
 fi
@@ -31,10 +31,8 @@ echo "Adding IPv6 addresses..."
 ip -6 addr add fd00:wan::1/64 dev tap0 2>/dev/null || true
 ip -6 addr add fd00:lan::50/64 dev tap1 2>/dev/null || true
 
-# ── IP forwarding ───────────────────────────────────────────────────
-echo "Enabling IP forwarding..."
-sysctl -q net.ipv4.ip_forward=1
-sysctl -q net.ipv6.conf.all.forwarding=1
+# NOTE: ip_forward is NOT enabled here — the router inside QEMU handles
+# forwarding. Enabling it on the host can break the host's DNS resolution.
 
 echo ""
 echo "=== Setup complete ==="

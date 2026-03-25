@@ -119,15 +119,9 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
     };
 }
 
-var dbg_write_count: u32 = 0;
 fn sysWrite(ptr: u64, len: u64) SyscallResult {
     if (len == 0) return ok(0);
     if (len > 4096) return err(E_INVAL);
-    dbg_write_count += 1;
-    if (dbg_write_count <= 5) {
-        const proc = currentProc();
-        arch.print("K: write pid={d} len={d} ptr=0x{x}\n", .{ proc.pid, len, ptr });
-    }
     if (!address.AddrSpacePartition.user.contains(ptr)) return err(E_BADADDR);
     const end = std.math.add(u64, ptr, len) catch return err(E_BADADDR);
     if (!address.AddrSpacePartition.user.contains(end -| 1)) return err(E_BADADDR);

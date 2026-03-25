@@ -28,9 +28,9 @@ const shm_protocol = lib.shm_protocol;
 const syscall = lib.syscall;
 
 const MAX_PERMS = 128;
-pub const lan_subnet: [4]u8 = .{ 192, 168, 1, 0 };
+pub const lan_subnet: [4]u8 = .{ 10, 1, 1, 0 };
 pub const lan_mask: [4]u8 = .{ 255, 255, 255, 0 };
-pub const lan_broadcast: [4]u8 = .{ 192, 168, 1, 255 };
+pub const lan_broadcast: [4]u8 = .{ 10, 1, 1, 255 };
 const MAINTENANCE_INTERVAL_NS: u64 = 10_000_000_000;
 pub const Interface = enum { wan, lan };
 const Iface = iface_mod.Iface;
@@ -554,7 +554,15 @@ pub fn main(perm_view_addr: u64) void {
     _ = cmd;
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
     perm_view = view;
-    const nics = findNicDevices(perm_view_addr);
+    // Scan for NICs — retry if only 1 found (kernel PCI grant race)
+    var nics = findNicDevices(perm_view_addr);
+    if (nics.lan == null) {
+        var retry: u32 = 0;
+        while (retry < 50 and nics.lan == null) : (retry += 1) {
+            syscall.thread_yield();
+            nics = findNicDevices(perm_view_addr);
+        }
+    }
     const wan_nic = nics.wan orelse { syscall.write("router: no WAN\n"); return; };
 
     const wan_mmio_size = if (wan_nic.mmio_size == 0) syscall.PAGE4K else wan_nic.mmio_size;
@@ -619,7 +627,7 @@ pub fn main(perm_view_addr: u64) void {
                 lan_iface.mmio_base = lan_mmio;
                 lan_iface.mac = e1000.readMac(lan_mmio);
                 lan_iface.ip6_link_local = util.macToLinkLocal(lan_iface.mac);
-                lan_iface.ip = .{ 192, 168, 1, 1 };
+                lan_iface.ip = .{ 10, 1, 1, 1 };
                 lan_iface.dma_base = region.lan_dma_base;
                 lan_iface.dma_region = &region;
                 lan_iface.rx_descs = region.lanRxDescs();
@@ -642,7 +650,7 @@ pub fn main(perm_view_addr: u64) void {
     }
 
     arp.sendRequest(.wan, wan_gateway);
-    if (has_lan) arp.sendRequest(.lan, .{ 192, 168, 1, 50 });
+    if (has_lan) arp.sendRequest(.lan, .{ 10, 1, 1, 50 });
 
     // Spawn LAN poll thread if dual-NIC
     if (has_lan) {
@@ -655,10 +663,7 @@ pub fn main(perm_view_addr: u64) void {
     // Pin WAN thread to core 1 (non-preemptible)
     if (syscall.set_affinity(1 << 1) == 0) {
         syscall.thread_yield(); // migrate to core 1
-        const pin_rc = syscall.pin_exclusive();
-        if (pin_rc > 0) {
-            syscall.write("router: WAN pinned to core 1\n");
-        }
+        _ = syscall.pin_exclusive();
     }
 
     // WAN thread (runs on the initial/main thread):
@@ -1091,10 +1096,7 @@ fn lanPollThread() void {
     // Pin LAN thread to core 2 (non-preemptible)
     if (syscall.set_affinity(1 << 2) == 0) {
         syscall.thread_yield(); // migrate to core 2
-        const pin_rc = syscall.pin_exclusive();
-        if (pin_rc > 0) {
-            syscall.write("router: LAN pinned to core 2\n");
-        }
+        _ = syscall.pin_exclusive();
     }
 
     while (true) {

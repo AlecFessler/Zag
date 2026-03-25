@@ -5,7 +5,7 @@ const util = router.util;
 
 const Interface = main.Interface;
 
-pub const TABLE_SIZE = 16;
+pub const TABLE_SIZE = 64;
 const EXPIRY_NS: u64 = 300_000_000_000;
 
 pub const ArpEntry = struct {
@@ -42,10 +42,19 @@ pub fn learn(table: *[TABLE_SIZE]ArpEntry, ip: [4]u8, mac: [6]u8) void {
             return;
         }
     }
-    table[0].ip = ip;
-    @memcpy(&table[0].mac, &mac);
-    table[0].valid = true;
-    table[0].timestamp_ns = ts;
+    // Evict oldest entry (LRU)
+    var oldest_idx: usize = 0;
+    var oldest_ts: u64 = table[0].timestamp_ns;
+    for (table, 0..) |*e, idx| {
+        if (e.timestamp_ns < oldest_ts) {
+            oldest_ts = e.timestamp_ns;
+            oldest_idx = idx;
+        }
+    }
+    table[oldest_idx].ip = ip;
+    @memcpy(&table[oldest_idx].mac, &mac);
+    table[oldest_idx].valid = true;
+    table[oldest_idx].timestamp_ns = ts;
 }
 
 pub fn expire(table: *[TABLE_SIZE]ArpEntry) void {

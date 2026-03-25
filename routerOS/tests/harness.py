@@ -31,7 +31,7 @@ QEMU_CMD = (
     " -smp cores=4"
 )
 
-BOOT_BANNER = "=== Zag RouterOS Console ==="
+BOOT_BANNER = "load-config"
 PROMPT = "\n> "
 
 # Debug lines from syscall.write that get mixed into serial output

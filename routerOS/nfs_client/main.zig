@@ -53,7 +53,7 @@ var has_router: bool = false;
 var state: State = .idle;
 var mounted: bool = false;
 var root_fh: nfs3.FileHandle = .{};
-var next_xid: u32 = 1;
+var next_xid: u32 = 0;
 var pending_xid: u32 = 0;
 var request_source: RequestSource = .console;
 var send_time_ns: u64 = 0;
@@ -135,6 +135,11 @@ pub fn main(perm_view_addr: u64) void {
 
     // Identify ourselves to the router
     _ = router_chan.send(&[_]u8{@truncate(shm_protocol.ServiceId.NFS_CLIENT)});
+
+    // Seed XID from clock to avoid NFS reply cache hits across reboots
+    const seed_ns: u64 = @bitCast(syscall.clock_gettime());
+    next_xid = @truncate(seed_ns);
+    if (next_xid == 0) next_xid = 1;
 
     // Bind our UDP port via the router
     sendUdpBind(nfs3.LOCAL_PORT);
@@ -328,6 +333,10 @@ fn handleUdpRecv(data: []const u8) void {
 }
 
 fn handleNfsReply(payload: []const u8) void {
+    // Ignore packets with wrong XID (stale retransmissions from prior operations)
+    if (state != .mounted and state != .idle) {
+        if (!rpc.xidMatches(payload, pending_xid)) return;
+    }
     switch (state) {
         .mount_pending => {
             if (nfs3.parseMountReply(payload, pending_xid)) |fh| {
@@ -686,4 +695,6 @@ fn checkTimeout() void {
         send_time_ns = now();
     }
 }
+
+
 
