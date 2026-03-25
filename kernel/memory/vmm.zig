@@ -157,6 +157,7 @@ pub const VirtualMemoryManager = struct {
         return findNodeLocked(&self.tree, vaddr);
     }
 
+
     fn findFreeRange(self: *VirtualMemoryManager, size: u64) !VAddr {
         var prev_end: u64 = self.range_start.addr;
         var found: ?u64 = null;

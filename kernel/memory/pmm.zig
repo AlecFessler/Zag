@@ -179,6 +179,7 @@ pub const PhysicalMemoryManager = struct {
         _ = ret_addr;
         unreachable;
     }
+
 };
 
 pub var global_pmm: ?PhysicalMemoryManager = null;

@@ -27,7 +27,7 @@ const VAddr = zag.memory.address.VAddr;
 const VAddrRange = zag.sched.restart_context.VAddrRange;
 const VirtualMemoryManager = zag.memory.vmm.VirtualMemoryManager;
 
-pub const DEFAULT_STACK_PAGES: u32 = 16;
+pub const DEFAULT_STACK_PAGES: u32 = 8;
 pub const MAX_PERMS: usize = 128;
 pub const MAX_DMA_MAPPINGS: usize = 16;
 pub const HANDLE_SELF: u64 = 0;
@@ -559,11 +559,11 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
         if (seg_file_end > highest_va) highest_va = seg_file_end;
 
         if (phdr.p_memsz > phdr.p_filesz) {
-            has_bss = true;
             const this_bss_start = std.mem.alignForward(u64, seg_file_end, paging.PAGE4K);
             const this_bss_end = std.mem.alignForward(u64, seg_mem_end, paging.PAGE4K);
             if (this_bss_end > bss_end) bss_end = this_bss_end;
             if (!has_bss or this_bss_start < bss_start) bss_start = this_bss_start;
+            has_bss = true;
         }
     }
 
