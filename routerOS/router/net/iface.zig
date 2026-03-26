@@ -187,6 +187,33 @@ pub const Iface = struct {
         @atomicStore(u64, &self.pending_tx_flag, 0, .release);
     }
 
+    /// Send a packet directly on the TX ring. Must be called from the poll
+    /// thread that owns this interface (no cross-thread synchronization).
+    /// Unlike txSendLocal, this can be called multiple times per poll iteration.
+    /// Spin-waits for the TX descriptor to become available if the NIC is busy.
+    pub fn txSendDirect(self: *Iface, data: []const u8) bool {
+        if (data.len == 0 or data.len > e1000.PACKET_BUF_SIZE) return false;
+        const tx_off = if (self.role == .wan) dma.WAN_TX_BUFS_OFF else dma.LAN_TX_BUFS_OFF;
+        const tx_bufs_dma = self.dma_base + tx_off;
+        const tx_bufs_virt = self.dma_region.virt_base + tx_off;
+
+        // Spin-wait for the descriptor to be available (NIC sets DD when done).
+        // On a gigabit link a max-size frame takes ~12us, so this is brief.
+        const desc = &self.tx_descs[self.tx_tail];
+        var spins: u32 = 0;
+        while (@as(*volatile u8, &desc.status).* & e1000.TX_DESC_STA_DD == 0) {
+            spins += 1;
+            if (spins > 1_000_000) return false; // safety bail-out
+        }
+
+        if (e1000.txSendCopy(self.mmio_base, self.tx_descs, &self.tx_tail, tx_bufs_dma, tx_bufs_virt, data)) {
+            self.stats.tx_packets += 1;
+            self.stats.tx_bytes += data.len;
+            return true;
+        }
+        return false;
+    }
+
     /// Reclaim RX buffers that were lent to the other NIC's TX (zero-copy).
     /// Call this on the SOURCE iface whose RX buffers were used as TX data
     /// on the OTHER iface.

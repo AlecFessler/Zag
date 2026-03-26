@@ -42,7 +42,7 @@ pub fn handleTcp(pkt: []u8, len: u32) bool {
     const dst_port = util.readU16Be(pkt[tcp_start + 2 ..][0..2]);
     if (dst_port != HTTP_PORT) return false;
 
-    const src_port = util.readU16Be(pkt[tcp_start..][0..2]);
+    const src_port = util.readU16Be(pkt[tcp_start ..][0..2]);
     const flags = pkt[tcp_start + 13];
     const seq = readU32Be(pkt[tcp_start + 4 ..][0..4]);
     const tcp_data_offset: usize = (@as(usize, pkt[tcp_start + 12] >> 4)) * 4;
@@ -97,9 +97,6 @@ pub fn handleTcp(pkt: []u8, len: u32) bool {
 
         // Check if we have a complete HTTP request (ends with \r\n\r\n)
         if (hasCompleteRequest()) {
-            // Don't send a separate ACK — the response packet will ACK the data.
-            // (txSendLocal has a single pending slot; sending ACK + response
-            //  back-to-back would drop the response.)
             handleHttpRequest();
         } else {
             // Not complete yet — ACK the data to let client continue sending
@@ -131,20 +128,34 @@ fn hasCompleteRequest() bool {
 }
 
 fn handleHttpRequest() void {
-    // Parse GET request and extract path
     if (request_len < 14) return; // "GET / HTTP/1.0"
-    if (!util.startsWith(request_buf[0..@min(request_len, 4)], "GET ")) {
+
+    // Parse method and path
+    var path: []const u8 = undefined;
+    var is_post = false;
+
+    if (util.startsWith(request_buf[0..@min(request_len, 5)], "GET ")) {
+        var path_end: usize = 4;
+        while (path_end < request_len and request_buf[path_end] != ' ' and request_buf[path_end] != '\r') : (path_end += 1) {}
+        path = request_buf[4..path_end];
+    } else if (util.startsWith(request_buf[0..@min(request_len, 6)], "POST ")) {
+        var path_end: usize = 5;
+        while (path_end < request_len and request_buf[path_end] != ' ' and request_buf[path_end] != '\r') : (path_end += 1) {}
+        path = request_buf[5..path_end];
+        is_post = true;
+    } else {
         directResponse("405 Method Not Allowed", "text/plain", "Method Not Allowed");
         return;
     }
 
-    // Find path end
-    var path_end: usize = 4;
-    while (path_end < request_len and request_buf[path_end] != ' ' and request_buf[path_end] != '\r') : (path_end += 1) {}
-    const path = request_buf[4..path_end];
+    if (is_post) {
+        handlePostRequest(path);
+        return;
+    }
 
+    // GET requests — read-only endpoints
     if (util.eql(path, "/") or util.eql(path, "/index.html")) {
-        directResponse("200 OK", "text/html", "<h1>Zag RouterOS</h1>");
+        directResponse("200 OK", "text/html", HTML_PAGE);
     } else if (util.eql(path, "/api/status")) {
         var buf: [512]u8 = undefined;
         const n = formatJsonStatus(&buf);
@@ -173,6 +184,134 @@ fn handleHttpRequest() void {
         directResponse("404 Not Found", "text/plain", "Not Found");
     }
 }
+
+// ── POST mutation endpoints ─────────────────────────────────────────
+
+fn handlePostRequest(path: []const u8) void {
+    const block_prefix = "/api/block/";
+    const allow_prefix = "/api/allow/";
+    const forward_prefix = "/api/forward/";
+    const unforward_prefix = "/api/unforward/";
+    const dns_prefix = "/api/dns/";
+
+    if (path.len > block_prefix.len and util.startsWith(path, block_prefix)) {
+        const ip = util.parseIp(path[block_prefix.len..]) orelse return jsonError("invalid ip");
+        for (&main.firewall_rules) |*r| {
+            if (!r.valid) {
+                r.* = .{
+                    .valid = true,
+                    .action = .block,
+                    .src_ip = ip,
+                    .src_mask = .{ 255, 255, 255, 255 },
+                    .protocol = 0,
+                    .dst_port = 0,
+                };
+                return jsonOk();
+            }
+        }
+        return jsonError("firewall table full");
+    } else if (path.len > allow_prefix.len and util.startsWith(path, allow_prefix)) {
+        const ip = util.parseIp(path[allow_prefix.len..]) orelse return jsonError("invalid ip");
+        for (&main.firewall_rules) |*r| {
+            if (r.valid and r.action == .block and util.eql(&r.src_ip, &ip)) {
+                r.valid = false;
+                return jsonOk();
+            }
+        }
+        return jsonError("rule not found");
+    } else if (path.len > forward_prefix.len and util.startsWith(path, forward_prefix)) {
+        handleAddForward(path[forward_prefix.len..]);
+    } else if (path.len > unforward_prefix.len and util.startsWith(path, unforward_prefix)) {
+        handleRemoveForward(path[unforward_prefix.len..]);
+    } else if (path.len > dns_prefix.len and util.startsWith(path, dns_prefix)) {
+        const ip = util.parseIp(path[dns_prefix.len..]) orelse return jsonError("invalid ip");
+        main.upstream_dns = ip;
+        return jsonOk();
+    } else {
+        directResponse("404 Not Found", "text/plain", "Not Found");
+    }
+}
+
+fn handleAddForward(args: []const u8) void {
+    // Expected: <proto>/<wport>/<lip>/<lport>
+    var proto: util.Protocol = .tcp;
+    var i: usize = 0;
+
+    if (util.startsWith(args, "tcp/")) {
+        i = 4;
+    } else if (util.startsWith(args, "udp/")) {
+        proto = .udp;
+        i = 4;
+    } else return jsonError("invalid protocol");
+
+    // Parse wan_port
+    const wport = parseU16(args[i..]) orelse return jsonError("invalid wan port");
+    i += wport.len;
+    if (i >= args.len or args[i] != '/') return jsonError("invalid format");
+    i += 1;
+
+    // Parse lan_ip (find next /)
+    var ip_end = i;
+    while (ip_end < args.len and args[ip_end] != '/') : (ip_end += 1) {}
+    const lip = util.parseIp(args[i..ip_end]) orelse return jsonError("invalid lan ip");
+    if (ip_end >= args.len) return jsonError("missing lan port");
+    i = ip_end + 1;
+
+    // Parse lan_port
+    const lport = parseU16(args[i..]) orelse return jsonError("invalid lan port");
+
+    for (&main.port_forwards) |*f| {
+        if (!f.valid) {
+            f.* = .{
+                .valid = true,
+                .protocol = proto,
+                .wan_port = wport.val,
+                .lan_ip = lip,
+                .lan_port = lport.val,
+            };
+            return jsonOk();
+        }
+    }
+    return jsonError("port forward table full");
+}
+
+fn handleRemoveForward(args: []const u8) void {
+    const wport = parseU16(args) orelse return jsonError("invalid port");
+    for (&main.port_forwards) |*f| {
+        if (f.valid and f.wan_port == wport.val) {
+            f.valid = false;
+            return jsonOk();
+        }
+    }
+    return jsonError("forward not found");
+}
+
+fn jsonOk() void {
+    directResponse("200 OK", "application/json", "{\"ok\":true}");
+}
+
+fn jsonError(msg: []const u8) void {
+    var buf: [128]u8 = undefined;
+    var p: usize = 0;
+    p = util.appendStr(&buf, p, "{\"ok\":false,\"error\":\"");
+    p = util.appendStr(&buf, p, msg);
+    p = util.appendStr(&buf, p, "\"}");
+    directResponse("200 OK", "application/json", buf[0..p]);
+}
+
+const ParsedU16 = struct { val: u16, len: usize };
+
+fn parseU16(s: []const u8) ?ParsedU16 {
+    var val: u16 = 0;
+    var i: usize = 0;
+    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+        val = val *% 10 +% @as(u16, s[i] - '0');
+    }
+    if (i == 0) return null;
+    return .{ .val = val, .len = i };
+}
+
+// ── Response helpers ────────────────────────────────────────────────
 
 fn directResponse(status_val: []const u8, content_type: []const u8, body: []const u8) void {
     var hdr: [256]u8 = undefined;
@@ -251,7 +390,7 @@ fn sendTcpPacket(payload: []const u8, flags: u8, seq: u32, ack: u32) void {
 
     // TCP header
     const tcp_start: usize = 34;
-    util.writeU16Be(pkt[tcp_start..][0..2], HTTP_PORT); // src port
+    util.writeU16Be(pkt[tcp_start ..][0..2], HTTP_PORT); // src port
     util.writeU16Be(pkt[tcp_start + 2 ..][0..2], client_port); // dst port
     writeU32Be(pkt[tcp_start + 4 ..][0..4], seq);
     writeU32Be(pkt[tcp_start + 8 ..][0..4], ack);
@@ -267,7 +406,7 @@ fn sendTcpPacket(payload: []const u8, flags: u8, seq: u32, ack: u32) void {
     // TCP checksum
     util.recomputeTransportChecksum(&pkt, tcp_start, @intCast(14 + ip_total), 6);
 
-    _ = ifc.txSendLocal(pkt[0..@max(frame_len, 14 + @as(usize, ip_total))]);
+    _ = ifc.txSendDirect(pkt[0..@max(frame_len, 14 + @as(usize, ip_total))]);
 }
 
 fn readU32Be(buf: []const u8) u32 {
@@ -300,7 +439,9 @@ pub fn formatJsonStatus(buf: []u8) usize {
         p = util.appendMac(buf, p, main.lan_iface.mac);
         p = util.appendStr(buf, p, "\"}");
     }
-    p = util.appendStr(buf, p, "}");
+    p = util.appendStr(buf, p, ",\"dns\":\"");
+    p = util.appendIp(buf, p, main.upstream_dns);
+    p = util.appendStr(buf, p, "\"}");
     return p;
 }
 
@@ -434,3 +575,7 @@ pub fn formatJsonRules(buf: []u8) usize {
     p = util.appendStr(buf, p, "]}");
     return p;
 }
+
+// ── Embedded HTML Management Page ───────────────────────────────────
+
+const HTML_PAGE = @embedFile("services/index.html");
