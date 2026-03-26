@@ -193,6 +193,10 @@ pub const Iface = struct {
     /// Spin-waits for the TX descriptor to become available if the NIC is busy.
     pub fn txSendDirect(self: *Iface, data: []const u8) bool {
         if (data.len == 0 or data.len > e1000.PACKET_BUF_SIZE) return false;
+
+        // When running without hardware (mmio_base == 0), fall back to pending TX slot
+        if (self.mmio_base == 0) return self.txSendLocal(data);
+
         const tx_off = if (self.role == .wan) dma.WAN_TX_BUFS_OFF else dma.LAN_TX_BUFS_OFF;
         const tx_bufs_dma = self.dma_base + tx_off;
         const tx_bufs_virt = self.dma_region.virt_base + tx_off;

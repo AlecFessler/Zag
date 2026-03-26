@@ -135,7 +135,7 @@ fn findNicDevices(perm_view_addr: u64) struct { wan: ?NicInfo, lan: ?NicInfo } {
     return .{ .wan = first, .lan = second };
 }
 
-fn handleIcmp(role: Interface, pkt: []u8, len: u32) ?[]u8 {
+pub fn handleIcmp(role: Interface, pkt: []u8, len: u32) ?[]u8 {
     const ip = h.Ipv4Header.parseMut(pkt[h.EthernetHeader.LEN..]) orelse return null;
     if (len < h.EthernetHeader.LEN + h.Ipv4Header.MIN_LEN or ip.protocol != h.Ipv4Header.PROTO_ICMP) return null;
     const ip_hdr_len = ip.headerLen();
@@ -158,7 +158,7 @@ fn handleIcmp(role: Interface, pkt: []u8, len: u32) ?[]u8 {
 
 /// Clamp TCP MSS option on SYN/SYN-ACK packets to 1460 (1500 MTU - 40).
 /// Only modifies packets with SYN flag set and MSS option present.
-fn clampMss(pkt: []u8, len: u32) void {
+pub fn clampMss(pkt: []u8, len: u32) void {
     const ip = h.Ipv4Header.parseMut(pkt[h.EthernetHeader.LEN..]) orelse return;
     const ip_hdr_len = ip.headerLen();
     const tcp_start = h.EthernetHeader.LEN + ip_hdr_len;
@@ -197,7 +197,7 @@ fn clampMss(pkt: []u8, len: u32) void {
 
 /// Send an ICMP error message (TTL exceeded, dest unreachable, etc.)
 /// back to the source of the original packet.
-fn sendIcmpError(role: Interface, orig_pkt: []const u8, orig_len: u32, icmp_type: u8, icmp_code: u8) void {
+pub fn sendIcmpError(role: Interface, orig_pkt: []const u8, orig_len: u32, icmp_type: u8, icmp_code: u8) void {
     if (orig_len < h.EthernetHeader.LEN + h.Ipv4Header.MIN_LEN) return;
     const ifc = getIface(role);
 
@@ -250,7 +250,7 @@ fn sendIcmpError(role: Interface, orig_pkt: []const u8, orig_len: u32, icmp_type
     _ = ifc.txSendLocal(pkt[0..frame_len]);
 }
 
-fn periodicMaintenance() void {
+pub fn periodicMaintenance() void {
     const ts = util.now();
     if (ts -| last_maintenance_ns < MAINTENANCE_INTERVAL_NS) return;
     last_maintenance_ns = ts;
@@ -292,7 +292,7 @@ fn isIpv6ForUs(ifc: *const Iface, dst_ip6: [16]u8) bool {
     return false;
 }
 
-fn processIpv6Packet(role: Interface, pkt: []u8, len: u32) PacketAction {
+pub fn processIpv6Packet(role: Interface, pkt: []u8, len: u32) PacketAction {
     if (len < h.EthernetHeader.LEN + h.Ipv6Header.LEN) return .consumed;
 
     const ip6 = h.Ipv6Header.parseMut(pkt[h.EthernetHeader.LEN..]) orelse return .consumed;
@@ -385,7 +385,7 @@ fn processIpv6Packet(role: Interface, pkt: []u8, len: u32) PacketAction {
 
 /// Process a received packet. Returns whether it should be forwarded zero-copy.
 /// For forwarded packets, headers are modified IN-PLACE in the DMA buffer.
-fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
+pub fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
     if (len < h.EthernetHeader.LEN) return .consumed;
     const ifc = getIface(role);
     const eth = h.EthernetHeader.parse(pkt) orelse return .consumed;

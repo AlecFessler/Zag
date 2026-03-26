@@ -5,6 +5,12 @@ const syscall = lib.syscall;
 pub const Protocol = enum(u8) { icmp = 1, tcp = 6, udp = 17 };
 pub const Protocol6 = enum(u8) { tcp = 6, udp = 17, icmpv6 = 58 };
 
+/// Internal invariant assertion. Only fires on programmer errors, never on
+/// invalid network input. In ReleaseFast builds this is a no-op.
+pub inline fn assert(ok: bool) void {
+    if (!ok) unreachable; // triggers panic in Debug/ReleaseSafe
+}
+
 pub fn now() u64 {
     return @bitCast(syscall.clock_gettime());
 }
@@ -129,6 +135,22 @@ pub fn writeU16Be(buf: []u8, val: u16) void {
     buf[1] = @truncate(val);
 }
 
+/// Verify an IP header checksum is correct (sum folds to 0xFFFF).
+/// Used as a post-condition assertion after in-place header rewrites.
+pub fn verifyIpChecksum(ip_hdr: []const u8) bool {
+    if (ip_hdr.len < 20) return false;
+    const ihl = ip_hdr[0] & 0x0F;
+    const hdr_len: usize = @as(usize, ihl) * 4;
+    if (hdr_len < 20 or hdr_len > ip_hdr.len) return false;
+    var sum: u32 = 0;
+    var i: usize = 0;
+    while (i + 1 < hdr_len) : (i += 2) {
+        sum += @as(u32, ip_hdr[i]) << 8 | @as(u32, ip_hdr[i + 1]);
+    }
+    while (sum > 0xFFFF) sum = (sum & 0xFFFF) + (sum >> 16);
+    return @as(u16, @truncate(sum)) == 0xFFFF;
+}
+
 pub fn computeChecksum(data: []const u8) u16 {
     var sum: u32 = 0;
     var i: usize = 0;
@@ -148,6 +170,7 @@ pub fn recomputeTransportChecksum(pkt: []u8, transport_start: usize, len: u32, p
     // not the Ethernet frame length (which may include padding).
     const ip_total_len: u16 = readU16Be(pkt[16..18]);
     const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
+    if (ip_total_len < ip_hdr_len) return; // malformed: total < header
     const tcp_len: u16 = ip_total_len - ip_hdr_len;
 
     // Zero out the checksum field before computing
@@ -176,7 +199,8 @@ pub fn recomputeTransportChecksum(pkt: []u8, transport_start: usize, len: u32, p
     sum += @as(u32, tcp_len);
 
     // Sum the transport segment (use tcp_len, not frame len, to avoid padding)
-    const seg_end = transport_start + tcp_len;
+    // Clamp to actual packet length to avoid out-of-bounds on malformed packets
+    const seg_end = @min(transport_start + tcp_len, pkt.len);
     var i: usize = transport_start;
     while (i + 1 < seg_end) : (i += 2) {
         sum += @as(u32, pkt[i]) << 8 | pkt[i + 1];

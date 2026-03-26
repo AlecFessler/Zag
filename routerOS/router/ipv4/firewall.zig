@@ -4,6 +4,7 @@ const arp = router.net.arp;
 const h = router.net.headers;
 const main = router.state;
 const util = router.util;
+const assert = util.assert;
 
 pub const RULES_SIZE = 32;
 pub const PORT_FWD_SIZE = 16;

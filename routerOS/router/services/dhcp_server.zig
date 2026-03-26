@@ -100,7 +100,7 @@ pub fn handle(pkt: []const u8, len: u32) void {
         if (opt == 53 and opt_len >= 1) {
             msg_type = pkt[opt_idx + 2];
         }
-        opt_idx += 2 + opt_len;
+        opt_idx += 2 + @as(u32, opt_len);
     }
 
     if (msg_type == DHCP_DISCOVER or msg_type == DHCP_REQUEST) {

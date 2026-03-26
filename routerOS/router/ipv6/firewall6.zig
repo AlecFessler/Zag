@@ -6,7 +6,7 @@ const util = router.util;
 
 pub const CONN_TABLE_SIZE = 256;
 
-const ConnState = enum(u8) { empty = 0, active = 1, expired = 2 };
+pub const ConnState = enum(u8) { empty = 0, active = 1, expired = 2 };
 
 const TCP_ESTABLISHED_TIMEOUT_NS: u64 = 300_000_000_000;
 const TCP_OTHER_TIMEOUT_NS: u64 = 30_000_000_000;

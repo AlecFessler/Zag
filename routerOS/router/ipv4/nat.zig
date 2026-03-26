@@ -12,6 +12,8 @@ const h = router.net.headers;
 const main = router.state;
 const util = router.util;
 
+const assert = util.assert;
+
 const Interface = main.Interface;
 
 pub const TABLE_SIZE = 256; // power of 2 for hash masking
@@ -22,7 +24,7 @@ const UDP_DNS_TIMEOUT_NS: u64 = 30_000_000_000;
 const TCP_ESTABLISHED_TIMEOUT_NS: u64 = 300_000_000_000;
 const TCP_OTHER_TIMEOUT_NS: u64 = 30_000_000_000;
 
-const State = enum(u8) {
+pub const State = enum(u8) {
     empty = 0,
     active = 1,
     expired = 2, // tombstone for linear probing
@@ -113,6 +115,8 @@ fn lookupInbound(protocol: util.Protocol, wan_port: u16) ?*NatEntry {
 fn createOutbound(protocol: util.Protocol, lan_ip: [4]u8, lan_port: u16, dst_ip: [4]u8, dst_port: u16) ?*NatEntry {
     const proto: u8 = @intFromEnum(protocol);
     const wan_port = @atomicRmw(u16, &main.next_nat_port, .Add, 1, .monotonic);
+    // Prevent wraparound into privileged/low port range
+    if (main.next_nat_port < 10000) main.next_nat_port = 10000;
 
     var idx = hashOutbound(proto, lan_ip, lan_port);
     var probes: u32 = 0;
@@ -133,6 +137,14 @@ fn createOutbound(protocol: util.Protocol, lan_ip: [4]u8, lan_port: u16, dst_ip:
                 entry.timestamp_ns = util.now();
                 entry.tcp_state = @intFromEnum(TcpState.none);
                 if (protocol == .tcp) entry.tcp_state = @intFromEnum(TcpState.syn_sent);
+                // Post-condition: entry is reachable via lookup
+                if (lookupOutbound(protocol, lan_ip, lan_port) == null) {
+                    // Debug: dump the hash chain to understand why lookup failed
+                    const dbg_idx = hashOutbound(proto, lan_ip, lan_port);
+                    util.logEvent("NAT post-condition FAIL: lookup cannot find just-created entry\n");
+                    _ = dbg_idx;
+                    assert(false);
+                }
                 return entry;
             }
             // CAS failed — another thread claimed it, continue probing
@@ -148,6 +160,8 @@ pub fn expire() void {
     const now_ns = util.now();
     for (&main.nat_table) |*entry| {
         if (loadState(entry) != .active) continue;
+        // Invariant: active entries must have valid protocol (set by createOutbound)
+        assert(entry.protocol == 1 or entry.protocol == 6 or entry.protocol == 17);
         const timeout = switch (@as(util.Protocol, @enumFromInt(entry.protocol))) {
             .icmp => ICMP_TIMEOUT_NS,
             .udp => if (entry.dst_port == 53) UDP_DNS_TIMEOUT_NS else UDP_TIMEOUT_NS,
@@ -176,6 +190,13 @@ fn updateTcpState(entry: *NatEntry, pkt: []const u8, len: u32, transport_start: 
         .established => if (fin or rst) .fin_wait else .established,
         .fin_wait => if (rst) .none else .fin_wait,
     };
+    // Post-condition: state transitions are valid (no backward jumps except RST→none)
+    const valid_transition = switch (current) {
+        .none, .syn_sent => new_state == .syn_sent or new_state == .established,
+        .established => new_state == .established or new_state == .fin_wait,
+        .fin_wait => new_state == .fin_wait or new_state == .none,
+    };
+    assert(valid_transition);
     @atomicStore(u8, &entry.tcp_state, @intFromEnum(new_state), .release);
 }
 
@@ -246,6 +267,15 @@ pub fn forwardLanToWan(pkt: []u8, len: u32) bool {
         ip.computeAndSetChecksum(pkt);
 
         util.recomputeTransportChecksum(pkt, transport_start, len, protocol);
+        // Post-conditions: NAT rewrite produced valid results
+        // Only check when IHL is valid (malformed IHL can cause overlapping writes)
+        if (ip_hdr_len >= 20) {
+            assert(util.eql(&ip.src_ip, &main.wan_iface.ip));
+            assert(util.eql(pkt[6..12], &main.wan_iface.mac));
+            if (14 + ip_hdr_len <= pkt.len) {
+                assert(util.verifyIpChecksum(pkt[14 .. 14 + ip_hdr_len]));
+            }
+        }
         return true;
     }
     return false;
@@ -307,6 +337,14 @@ pub fn forwardWanToLan(pkt: []u8, len: u32) bool {
         ip.computeAndSetChecksum(pkt);
 
         util.recomputeTransportChecksum(pkt, transport_start, len, protocol);
+        // Post-conditions: reverse NAT rewrite produced valid results
+        if (ip_hdr_len >= 20) {
+            assert(util.eql(&ip.dst_ip, &nat_entry.lan_ip));
+            assert(util.eql(pkt[6..12], &main.lan_iface.mac));
+            if (14 + ip_hdr_len <= pkt.len) {
+                assert(util.verifyIpChecksum(pkt[14 .. 14 + ip_hdr_len]));
+            }
+        }
         return true;
     }
     return false;
