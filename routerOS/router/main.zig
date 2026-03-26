@@ -11,6 +11,7 @@ const web_tcp = router.services.web_tcp;
 const e1000 = router.net.e1000;
 const firewall = router.ipv4.firewall;
 const firewall6 = router.ipv6.firewall6;
+const h = router.net.headers;
 const frag = router.ipv4.frag;
 const iface_mod = router.net.iface;
 const icmpv6 = router.ipv6.icmpv6;
@@ -135,43 +136,39 @@ fn findNicDevices(perm_view_addr: u64) struct { wan: ?NicInfo, lan: ?NicInfo } {
 }
 
 fn handleIcmp(role: Interface, pkt: []u8, len: u32) ?[]u8 {
-    if (len < 34 or pkt[23] != 1) return null;
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
-    const icmp_start = 14 + ip_hdr_len;
-    if (icmp_start + 8 > len or pkt[icmp_start] != 8) return null;
+    const ip = h.Ipv4Header.parseMut(pkt[h.EthernetHeader.LEN..]) orelse return null;
+    if (len < h.EthernetHeader.LEN + h.Ipv4Header.MIN_LEN or ip.protocol != h.Ipv4Header.PROTO_ICMP) return null;
+    const ip_hdr_len = ip.headerLen();
+    const icmp_start = h.EthernetHeader.LEN + ip_hdr_len;
+    if (icmp_start + h.IcmpHeader.LEN > len) return null;
+    const icmp = h.IcmpHeader.parseMut(pkt[icmp_start..]) orelse return null;
+    if (icmp.icmp_type != h.IcmpHeader.TYPE_ECHO_REQUEST) return null;
     const ifc = getIface(role);
     @memcpy(pkt[0..6], pkt[6..12]);
     @memcpy(pkt[6..12], &ifc.mac);
     var tmp: [4]u8 = undefined;
-    @memcpy(&tmp, pkt[26..30]);
-    @memcpy(pkt[26..30], pkt[30..34]);
-    @memcpy(pkt[30..34], &tmp);
-    pkt[icmp_start] = 0;
-    pkt[icmp_start + 2] = 0;
-    pkt[icmp_start + 3] = 0;
-    const cs = util.computeChecksum(pkt[icmp_start..len]);
-    pkt[icmp_start + 2] = @truncate(cs >> 8);
-    pkt[icmp_start + 3] = @truncate(cs);
-    pkt[24] = 0;
-    pkt[25] = 0;
-    const ip_cs = util.computeChecksum(pkt[14..][0..ip_hdr_len]);
-    pkt[24] = @truncate(ip_cs >> 8);
-    pkt[25] = @truncate(ip_cs);
+    @memcpy(&tmp, &ip.src_ip);
+    ip.src_ip = ip.dst_ip;
+    ip.dst_ip = tmp;
+    icmp.icmp_type = h.IcmpHeader.TYPE_ECHO_REPLY;
+    icmp.computeAndSetChecksum(pkt[icmp_start..len]);
+    ip.computeAndSetChecksum(pkt);
     return pkt[0..len];
 }
 
 /// Clamp TCP MSS option on SYN/SYN-ACK packets to 1460 (1500 MTU - 40).
 /// Only modifies packets with SYN flag set and MSS option present.
 fn clampMss(pkt: []u8, len: u32) void {
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
-    const tcp_start = 14 + ip_hdr_len;
-    if (tcp_start + 20 > len) return;
+    const ip = h.Ipv4Header.parseMut(pkt[h.EthernetHeader.LEN..]) orelse return;
+    const ip_hdr_len = ip.headerLen();
+    const tcp_start = h.EthernetHeader.LEN + ip_hdr_len;
+    if (tcp_start + h.TcpHeader.MIN_LEN > len) return;
 
-    const flags = pkt[tcp_start + 13];
-    if (flags & 0x02 == 0) return; // Not SYN
+    const tcp = h.TcpHeader.parseMut(pkt[tcp_start..]) orelse return;
+    if (tcp.flags & h.TcpHeader.SYN == 0) return; // Not SYN
 
-    const tcp_data_offset = (@as(u16, pkt[tcp_start + 12] >> 4)) * 4;
-    if (tcp_data_offset <= 20) return; // No options
+    const tcp_data_offset = tcp.dataOffset();
+    if (tcp_data_offset <= h.TcpHeader.MIN_LEN) return; // No options
 
     // Walk TCP options looking for MSS (kind=2, len=4)
     var i: usize = tcp_start + 20;
@@ -201,19 +198,20 @@ fn clampMss(pkt: []u8, len: u32) void {
 /// Send an ICMP error message (TTL exceeded, dest unreachable, etc.)
 /// back to the source of the original packet.
 fn sendIcmpError(role: Interface, orig_pkt: []const u8, orig_len: u32, icmp_type: u8, icmp_code: u8) void {
-    if (orig_len < 34) return;
+    if (orig_len < h.EthernetHeader.LEN + h.Ipv4Header.MIN_LEN) return;
     const ifc = getIface(role);
 
     // ICMP error payload: original IP header + first 8 bytes of original payload
-    const orig_ihl: u16 = (@as(u16, orig_pkt[14] & 0x0F)) * 4;
-    const payload_start: usize = 14; // start of original IP header
+    const orig_ip = h.Ipv4Header.parse(orig_pkt[h.EthernetHeader.LEN..]) orelse return;
+    const orig_ihl = orig_ip.headerLen();
+    const payload_start: usize = h.EthernetHeader.LEN; // start of original IP header
     const payload_end = @min(payload_start + orig_ihl + 8, orig_len);
     const payload_len: u16 = @intCast(payload_end - payload_start);
 
     // Build response: 14 eth + 20 IP + 8 ICMP header + payload
-    const icmp_total: u16 = 8 + payload_len;
-    const ip_total: u16 = 20 + icmp_total;
-    const frame_len: usize = @max(@as(usize, 14 + ip_total), 60);
+    const icmp_total: u16 = @as(u16, h.IcmpHeader.LEN) + payload_len;
+    const ip_total: u16 = @as(u16, h.Ipv4Header.MIN_LEN) + icmp_total;
+    const frame_len: usize = @max(@as(usize, @as(u16, h.EthernetHeader.LEN) + ip_total), 60);
 
     var pkt: [600]u8 = undefined;
     @memset(pkt[0..frame_len], 0);
@@ -227,29 +225,27 @@ fn sendIcmpError(role: Interface, orig_pkt: []const u8, orig_len: u32, icmp_type
     // IP header
     pkt[14] = 0x45; // version 4, IHL 5
     util.writeU16Be(pkt[16..18], ip_total);
-    pkt[22] = 64; // TTL
-    pkt[23] = 1; // protocol = ICMP
-    @memcpy(pkt[26..30], &ifc.ip); // source = router's interface IP
-    @memcpy(pkt[30..34], orig_pkt[26..30]); // dest = original source IP
+    const ip = h.Ipv4Header.parseMut(pkt[h.EthernetHeader.LEN..]) orelse return;
+    ip.ttl = 64;
+    ip.protocol = h.Ipv4Header.PROTO_ICMP;
+    ip.src_ip = ifc.ip;
+    ip.dst_ip = orig_ip.src_ip;
 
     // IP checksum
-    const ip_cs = util.computeChecksum(pkt[14..34]);
-    pkt[24] = @truncate(ip_cs >> 8);
-    pkt[25] = @truncate(ip_cs);
+    ip.computeAndSetChecksum(&pkt);
 
     // ICMP header
-    const icmp_start: usize = 34;
-    pkt[icmp_start] = icmp_type;
-    pkt[icmp_start + 1] = icmp_code;
+    const icmp_start: usize = h.EthernetHeader.LEN + h.Ipv4Header.MIN_LEN;
+    const icmp_hdr = h.IcmpHeader.parseMut(pkt[icmp_start..]) orelse return;
+    icmp_hdr.icmp_type = icmp_type;
+    icmp_hdr.code = icmp_code;
     // bytes 4-7 are unused (zero) for TTL exceeded and most unreachable codes
 
     // ICMP payload: original IP header + 8 bytes
-    @memcpy(pkt[icmp_start + 8 ..][0..payload_len], orig_pkt[payload_start..payload_end]);
+    @memcpy(pkt[icmp_start + h.IcmpHeader.LEN ..][0..payload_len], orig_pkt[payload_start..payload_end]);
 
     // ICMP checksum
-    const icmp_cs = util.computeChecksum(pkt[icmp_start..][0..icmp_total]);
-    pkt[icmp_start + 2] = @truncate(icmp_cs >> 8);
-    pkt[icmp_start + 3] = @truncate(icmp_cs);
+    icmp_hdr.computeAndSetChecksum(pkt[icmp_start..][0..icmp_total]);
 
     _ = ifc.txSendLocal(pkt[0..frame_len]);
 }
@@ -297,25 +293,20 @@ fn isIpv6ForUs(ifc: *const Iface, dst_ip6: [16]u8) bool {
 }
 
 fn processIpv6Packet(role: Interface, pkt: []u8, len: u32) PacketAction {
-    if (len < 54) return .consumed; // 14 eth + 40 ipv6 minimum
+    if (len < h.EthernetHeader.LEN + h.Ipv6Header.LEN) return .consumed;
 
-    const next_header = pkt[20];
-    const hop_limit = pkt[21];
-    var dst_ip6: [16]u8 = undefined;
-    @memcpy(&dst_ip6, pkt[38..54]);
+    const ip6 = h.Ipv6Header.parseMut(pkt[h.EthernetHeader.LEN..]) orelse return .consumed;
     const ifc = getIface(role);
-    const is_for_me = isIpv6ForUs(ifc, dst_ip6);
+    const is_for_me = isIpv6ForUs(ifc, ip6.dst_ip);
 
     // Learn source neighbor
-    var src_ip6: [16]u8 = undefined;
-    @memcpy(&src_ip6, pkt[22..38]);
     var src_mac: [6]u8 = undefined;
     @memcpy(&src_mac, pkt[6..12]);
     const ndp_tbl = if (role == .wan) &wan_ndp_table else &lan_ndp_table;
-    if (!util.isAllZeros(&src_ip6)) ndp.learn(ndp_tbl, src_ip6, src_mac, false);
+    if (!util.isAllZeros(&ip6.src_ip)) ndp.learn(ndp_tbl, ip6.src_ip, src_mac, false);
 
-    if (next_header == 58 and len >= 55) {
-        const icmpv6_type = pkt[54];
+    if (ip6.next_header == 58 and len >= h.EthernetHeader.LEN + h.Ipv6Header.LEN + 1) {
+        const icmpv6_type = pkt[h.EthernetHeader.LEN + h.Ipv6Header.LEN];
 
         // NDP: NS/NA
         if (icmpv6_type == 135 or icmpv6_type == 136) {
@@ -348,8 +339,8 @@ fn processIpv6Packet(role: Interface, pkt: []u8, len: u32) PacketAction {
     }
 
     // UDP — check for DHCPv6
-    if (next_header == 17 and is_for_me and len >= 58) {
-        const udp_dst = util.readU16Be(pkt[56..58]);
+    if (ip6.next_header == 17 and is_for_me and len >= h.EthernetHeader.LEN + h.Ipv6Header.LEN + 4) {
+        const udp_dst = util.readU16Be(pkt[h.EthernetHeader.LEN + h.Ipv6Header.LEN + 2 ..][0..2]);
         if (udp_dst == 546 and role == .wan) {
             dhcpv6_client.handleResponse(pkt, len);
             return .consumed;
@@ -359,11 +350,11 @@ fn processIpv6Packet(role: Interface, pkt: []u8, len: u32) PacketAction {
     if (is_for_me) return .consumed;
 
     // Not for us — forward (no NAT for IPv6)
-    if (hop_limit <= 1) {
+    if (ip6.hop_limit <= 1) {
         icmpv6.sendError(role, pkt, len, 3, 0); // Time Exceeded
         return .consumed;
     }
-    pkt[21] -= 1; // Decrement hop limit (no IP checksum to update!)
+    ip6.hop_limit -= 1; // Decrement hop limit (no IP checksum to update!)
 
     if (role == .lan and has_lan) {
         // LAN → WAN
@@ -379,8 +370,7 @@ fn processIpv6Packet(role: Interface, pkt: []u8, len: u32) PacketAction {
     if (role == .wan and has_lan) {
         // WAN → LAN
         if (!firewall6.allowInbound(pkt, len)) return .consumed;
-        var inner_dst: [16]u8 = undefined;
-        @memcpy(&inner_dst, pkt[38..54]);
+        const inner_dst = ip6.dst_ip;
         const dst_mac = ndp.lookup(&lan_ndp_table, inner_dst) orelse {
             ndp.sendNeighborSolicitation(.lan, inner_dst);
             return .consumed;
@@ -396,18 +386,16 @@ fn processIpv6Packet(role: Interface, pkt: []u8, len: u32) PacketAction {
 /// Process a received packet. Returns whether it should be forwarded zero-copy.
 /// For forwarded packets, headers are modified IN-PLACE in the DMA buffer.
 fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
-    if (len < 14) return .consumed;
+    if (len < h.EthernetHeader.LEN) return .consumed;
     const ifc = getIface(role);
-    const ethertype = util.readU16Be(pkt[12..14]);
+    const eth = h.EthernetHeader.parse(pkt) orelse return .consumed;
+    const ethertype = eth.etherType();
 
-    if (ethertype == 0x0806) {
+    if (ethertype == h.EthernetHeader.ARP) {
         // ARP: learn, reply, never forwarded
-        if (len >= 42) {
-            var sender_mac: [6]u8 = undefined;
-            var sender_ip: [4]u8 = undefined;
-            @memcpy(&sender_mac, pkt[22..28]);
-            @memcpy(&sender_ip, pkt[28..32]);
-            arp.learn(&ifc.arp_table, sender_ip, sender_mac);
+        if (len >= h.EthernetHeader.LEN + h.ArpHeader.LEN) {
+            const arp_hdr = h.ArpHeader.parse(pkt[h.EthernetHeader.LEN..]) orelse return .consumed;
+            arp.learn(&ifc.arp_table, arp_hdr.sender_ip, arp_hdr.sender_mac);
             udp_fwd.drainPending();
             if (ping_state == .arp_pending and ping_iface == role) {
                 if (arp.lookup(&ifc.arp_table, ping_target_ip)) |mac| {
@@ -430,13 +418,13 @@ fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
         return .consumed;
     }
 
-    if (ethertype == 0x86DD) return processIpv6Packet(role, pkt, len);
+    if (ethertype == h.EthernetHeader.IPv6) return processIpv6Packet(role, pkt, len);
 
-    if (ethertype != 0x0800 or len < 34) return .consumed;
+    if (ethertype != h.EthernetHeader.IPv4 or len < h.EthernetHeader.LEN + h.Ipv4Header.MIN_LEN) return .consumed;
 
     // IPv4 packet
-    var dst_ip: [4]u8 = undefined;
-    @memcpy(&dst_ip, pkt[30..34]);
+    const ip = h.Ipv4Header.parseMut(pkt[h.EthernetHeader.LEN..]) orelse return .consumed;
+    const dst_ip = ip.dst_ip;
     const my_ip = &ifc.ip;
     const is_for_me = util.eql(&dst_ip, my_ip) or util.eql(&dst_ip, &lan_broadcast) or
         (dst_ip[0] == 255 and dst_ip[1] == 255 and dst_ip[2] == 255 and dst_ip[3] == 255);
@@ -445,13 +433,13 @@ fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
         // Packet addressed to us — handle locally, never zero-copy forward
 
         // TCP — HTTP server on LAN port 80
-        if (pkt[23] == 6 and role == .lan) {
+        if (ip.protocol == h.Ipv4Header.PROTO_TCP and role == .lan) {
             if (web_tcp.handleTcp(pkt, len)) return .consumed;
         }
 
-        if (pkt[23] == 17) {
-            const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
-            const udp_start = 14 + ip_hdr_len;
+        if (ip.protocol == h.Ipv4Header.PROTO_UDP) {
+            const ip_hdr_len = ip.headerLen();
+            const udp_start = h.EthernetHeader.LEN + ip_hdr_len;
             if (udp_start + 4 <= len) {
                 const udp_dst = util.readU16Be(pkt[udp_start + 2 ..][0..2]);
                 if (udp_dst == 68 and role == .wan) {
@@ -474,8 +462,7 @@ fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
                     }
                 }
                 if (udp_start + 8 <= len) {
-                    var src_ip_udp: [4]u8 = undefined;
-                    @memcpy(&src_ip_udp, pkt[26..30]);
+                    const src_ip_udp = ip.src_ip;
                     const udp_src = util.readU16Be(pkt[udp_start..][0..2]);
                     if (udp_fwd.forwardToApp(src_ip_udp, udp_src, udp_dst, pkt[udp_start + 8 .. len])) return .consumed;
                 }
@@ -507,22 +494,17 @@ fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
 
     // Packet not for us — forward to the other interface
     // Check TTL before forwarding
-    if (pkt[22] <= 1) {
+    if (ip.ttl <= 1) {
         // TTL expired — send ICMP Time Exceeded (Type 11, Code 0)
         sendIcmpError(role, pkt, len, 11, 0);
         return .consumed;
     }
     // Decrement TTL and recompute IP checksum
-    pkt[22] -= 1;
-    pkt[24] = 0;
-    pkt[25] = 0;
-    const ihl: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
-    const cs = util.computeChecksum(pkt[14..][0..ihl]);
-    pkt[24] = @truncate(cs >> 8);
-    pkt[25] = @truncate(cs);
+    ip.ttl -= 1;
+    ip.computeAndSetChecksum(pkt);
 
     // TCP MSS clamping on SYN/SYN-ACK traversing the router
-    if (pkt[23] == 6) clampMss(pkt, len);
+    if (ip.protocol == h.Ipv4Header.PROTO_TCP) clampMss(pkt, len);
 
     if (role == .lan and has_lan) {
         if (firewall.reversePortForward(pkt, len)) return .forward_wan;

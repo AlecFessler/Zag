@@ -1,5 +1,6 @@
 const router = @import("router");
 
+const h = router.net.headers;
 const main = router.state;
 const util = router.util;
 
@@ -9,10 +10,12 @@ const ALL_NODES: [16]u8 = .{ 0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 
 /// Handle Router Solicitation (type 133) from a LAN device.
 pub fn handleRouterSolicitation(pkt: []const u8, len: u32) void {
     if (len < 54) return;
+    const eth = h.EthernetHeader.parse(pkt) orelse return;
+    const ip6 = h.Ipv6Header.parse(pkt[14..]) orelse return;
     var src_mac: [6]u8 = undefined;
     var src_ip6: [16]u8 = undefined;
-    @memcpy(&src_mac, pkt[6..12]);
-    @memcpy(&src_ip6, pkt[22..38]);
+    @memcpy(&src_mac, &eth.src_mac);
+    @memcpy(&src_ip6, &ip6.src_ip);
 
     // Send solicited RA to the requester
     if (util.isAllZeros(&src_ip6)) {
@@ -32,25 +35,26 @@ pub fn sendRA(dst_mac: ?[6]u8, dst_ip6: ?[16]u8) void {
     @memset(&pkt, 0);
 
     // Ethernet
+    const eth = h.EthernetHeader.parseMut(&pkt) orelse return;
     if (dst_mac) |dm| {
-        @memcpy(pkt[0..6], &dm);
+        @memcpy(&eth.dst_mac, &dm);
     } else {
         const mcast_mac = util.multicastMac6(ALL_NODES);
-        @memcpy(pkt[0..6], &mcast_mac);
+        @memcpy(&eth.dst_mac, &mcast_mac);
     }
-    @memcpy(pkt[6..12], &ifc.mac);
-    pkt[12] = 0x86;
-    pkt[13] = 0xDD;
+    @memcpy(&eth.src_mac, &ifc.mac);
+    eth.setEtherType(h.EthernetHeader.IPv6);
 
     // IPv6
-    pkt[14] = 0x60;
-    pkt[20] = 58; // ICMPv6
-    pkt[21] = 255;
-    @memcpy(pkt[22..38], &ifc.ip6_link_local); // source = link-local
+    const ip6 = h.Ipv6Header.parseMut(pkt[14..]) orelse return;
+    ip6.ver_tc_fl[0] = 0x60;
+    ip6.next_header = 58; // ICMPv6
+    ip6.hop_limit = 255;
+    @memcpy(&ip6.src_ip, &ifc.ip6_link_local); // source = link-local
     if (dst_ip6) |di| {
-        @memcpy(pkt[38..54], &di);
+        @memcpy(&ip6.dst_ip, &di);
     } else {
-        @memcpy(pkt[38..54], &ALL_NODES);
+        @memcpy(&ip6.dst_ip, &ALL_NODES);
     }
 
     // ICMPv6 Router Advertisement (type 134)
@@ -95,13 +99,13 @@ pub fn sendRA(dst_mac: ?[6]u8, dst_ip6: ?[16]u8) void {
 
     // Fill IPv6 payload length
     const payload_len: u16 = @truncate(pos - 54);
-    util.writeU16Be(pkt[18..20], payload_len);
+    ip6.setPayloadLen(payload_len);
 
     // ICMPv6 checksum
     var src_ip6_cs: [16]u8 = undefined;
     var dst_ip6_cs: [16]u8 = undefined;
-    @memcpy(&src_ip6_cs, pkt[22..38]);
-    @memcpy(&dst_ip6_cs, pkt[38..54]);
+    @memcpy(&src_ip6_cs, &ip6.src_ip);
+    @memcpy(&dst_ip6_cs, &ip6.dst_ip);
     const cs = util.computeIcmpv6Checksum(src_ip6_cs, dst_ip6_cs, pkt[54..pos]);
     pkt[56] = @truncate(cs >> 8);
     pkt[57] = @truncate(cs);

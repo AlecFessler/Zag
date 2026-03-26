@@ -1,6 +1,7 @@
 const router = @import("router");
 
 const arp = router.net.arp;
+const h = router.net.headers;
 const main = router.state;
 const util = router.util;
 
@@ -79,38 +80,30 @@ pub fn handlePortForward(pkt: []u8, len: u32) bool {
     if (!main.has_lan) return false;
     if (len < 34) return false;
 
-    const protocol = pkt[23];
-    if (protocol != 6 and protocol != 17) return false;
+    const ip = h.Ipv4Header.parseMut(pkt[14..]) orelse return false;
+    if (ip.protocol != h.Ipv4Header.PROTO_TCP and ip.protocol != h.Ipv4Header.PROTO_UDP) return false;
 
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
-    const transport_start = 14 + ip_hdr_len;
+    const transport_start = 14 + ip.headerLen();
     if (transport_start + 4 > len) return false;
 
-    const dst_port = util.readU16Be(pkt[transport_start + 2 ..][0..2]);
-    const proto: util.Protocol = if (protocol == 6) .tcp else .udp;
+    const udp = h.UdpHeader.parseMut(pkt[transport_start..]) orelse return false;
+    const proto: util.Protocol = if (ip.protocol == h.Ipv4Header.PROTO_TCP) .tcp else .udp;
 
-    const fwd = portFwdLookup(&main.port_forwards, proto, dst_port) orelse return false;
+    const fwd = portFwdLookup(&main.port_forwards, proto, udp.dstPort()) orelse return false;
 
     const dst_mac = arp.lookup(&main.lan_iface.arp_table, fwd.lan_ip) orelse {
         arp.sendRequest(.lan, fwd.lan_ip);
         return true;
     };
 
-    var old_dst_ip: [4]u8 = undefined;
-    @memcpy(&old_dst_ip, pkt[30..34]);
-
     @memcpy(pkt[0..6], &dst_mac);
     @memcpy(pkt[6..12], &main.lan_iface.mac);
-    @memcpy(pkt[30..34], &fwd.lan_ip);
-    util.writeU16Be(pkt[transport_start + 2 ..][0..2], fwd.lan_port);
+    @memcpy(&ip.dst_ip, &fwd.lan_ip);
+    udp.setDstPort(fwd.lan_port);
 
-    util.recomputeTransportChecksum(pkt, transport_start, len, protocol);
+    util.recomputeTransportChecksum(pkt, transport_start, len, ip.protocol);
 
-    pkt[24] = 0;
-    pkt[25] = 0;
-    const ip_cs = util.computeChecksum(pkt[14..][0..ip_hdr_len]);
-    pkt[24] = @truncate(ip_cs >> 8);
-    pkt[25] = @truncate(ip_cs);
+    ip.computeAndSetChecksum(pkt);
 
     main.lan_iface.stats.tx_packets += 1;
     main.lan_iface.stats.tx_bytes += len;
@@ -124,23 +117,20 @@ pub fn handlePortForward(pkt: []u8, len: u32) bool {
 pub fn reversePortForward(pkt: []u8, len: u32) bool {
     if (len < 34) return false;
 
-    const protocol = pkt[23];
-    if (protocol != 6 and protocol != 17) return false;
+    const ip = h.Ipv4Header.parseMut(pkt[14..]) orelse return false;
+    if (ip.protocol != h.Ipv4Header.PROTO_TCP and ip.protocol != h.Ipv4Header.PROTO_UDP) return false;
 
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
-    const transport_start = 14 + ip_hdr_len;
+    const transport_start = 14 + ip.headerLen();
     if (transport_start + 4 > len) return false;
 
-    var src_ip: [4]u8 = undefined;
-    @memcpy(&src_ip, pkt[26..30]);
-    const src_port = util.readU16Be(pkt[transport_start..][0..2]);
-    const proto: util.Protocol = if (protocol == 6) .tcp else .udp;
+    const udp = h.UdpHeader.parseMut(pkt[transport_start..]) orelse return false;
+    const proto: util.Protocol = if (ip.protocol == h.Ipv4Header.PROTO_TCP) .tcp else .udp;
 
     for (&main.port_forwards) |*f| {
         if (!f.valid) continue;
         if (f.protocol != proto) continue;
-        if (!util.eql(&f.lan_ip, &src_ip)) continue;
-        if (f.lan_port != src_port) continue;
+        if (!util.eql(&f.lan_ip, &ip.src_ip)) continue;
+        if (f.lan_port != udp.srcPort()) continue;
 
         // Match — rewrite src to router WAN IP:wan_port
         const gateway_mac = arp.lookup(&main.wan_iface.arp_table, main.wan_gateway) orelse {
@@ -150,16 +140,12 @@ pub fn reversePortForward(pkt: []u8, len: u32) bool {
 
         @memcpy(pkt[0..6], &gateway_mac);
         @memcpy(pkt[6..12], &main.wan_iface.mac);
-        @memcpy(pkt[26..30], &main.wan_iface.ip);
-        util.writeU16Be(pkt[transport_start..][0..2], f.wan_port);
+        @memcpy(&ip.src_ip, &main.wan_iface.ip);
+        udp.setSrcPort(f.wan_port);
 
-        pkt[24] = 0;
-        pkt[25] = 0;
-        const ip_cs = util.computeChecksum(pkt[14..][0..ip_hdr_len]);
-        pkt[24] = @truncate(ip_cs >> 8);
-        pkt[25] = @truncate(ip_cs);
+        ip.computeAndSetChecksum(pkt);
 
-        util.recomputeTransportChecksum(pkt, transport_start, len, protocol);
+        util.recomputeTransportChecksum(pkt, transport_start, len, ip.protocol);
         return true;
     }
     return false;

@@ -1,5 +1,6 @@
 const router = @import("router");
 
+const h = router.net.headers;
 const main = router.state;
 const util = router.util;
 
@@ -66,13 +67,13 @@ pub fn handle(pkt: []const u8, len: u32) void {
     if (!main.has_lan) return;
     if (len < 282) return;
 
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
+    const ip = h.Ipv4Header.parse(pkt[14..]) orelse return;
+    const ip_hdr_len = ip.headerLen();
     const udp_start = 14 + ip_hdr_len;
     if (udp_start + 8 > len) return;
 
-    const src_port = util.readU16Be(pkt[udp_start..][0..2]);
-    const dst_port = util.readU16Be(pkt[udp_start + 2 ..][0..2]);
-    if (src_port != 68 or dst_port != 67) return;
+    const udp = h.UdpHeader.parse(pkt[udp_start..]) orelse return;
+    if (udp.srcPort() != 68 or udp.dstPort() != 67) return;
 
     const dhcp_start = udp_start + 8;
     if (dhcp_start + 240 > len) return;
@@ -113,21 +114,23 @@ fn sendResponse(request: []const u8, client_mac: [6]u8, offer_ip: [4]u8, msg_typ
     var pkt: [600]u8 = undefined;
     @memset(&pkt, 0);
 
-    @memset(pkt[0..6], 0xFF);
-    @memcpy(pkt[6..12], &main.lan_iface.mac);
-    pkt[12] = 0x08;
-    pkt[13] = 0x00;
+    const eth = h.EthernetHeader.parseMut(&pkt) orelse unreachable;
+    @memset(&eth.dst_mac, 0xFF);
+    @memcpy(&eth.src_mac, &main.lan_iface.mac);
+    eth.setEtherType(h.EthernetHeader.IPv4);
 
-    pkt[14] = 0x45;
-    pkt[15] = 0x00;
-    pkt[22] = 64;
-    pkt[23] = 17;
-    @memcpy(pkt[26..30], &main.lan_iface.ip);
-    @memset(pkt[30..34], 0xFF);
+    const ip = h.Ipv4Header.parseMut(pkt[14..]) orelse unreachable;
+    ip.ver_ihl = 0x45;
+    ip.tos = 0x00;
+    ip.ttl = 64;
+    ip.protocol = h.Ipv4Header.PROTO_UDP;
+    @memcpy(&ip.src_ip, &main.lan_iface.ip);
+    @memset(&ip.dst_ip, 0xFF);
 
     const udp_start: usize = 34;
-    util.writeU16Be(pkt[udp_start..][0..2], 67);
-    util.writeU16Be(pkt[udp_start + 2 ..][0..2], 68);
+    const udp = h.UdpHeader.parseMut(pkt[udp_start..]) orelse unreachable;
+    udp.setSrcPort(67);
+    udp.setDstPort(68);
 
     const dhcp_start: usize = udp_start + 8;
     pkt[dhcp_start] = 2;
@@ -184,16 +187,12 @@ fn sendResponse(request: []const u8, client_mac: [6]u8, offer_ip: [4]u8, msg_typ
 
     const total_dhcp = opt - dhcp_start;
     const udp_len: u16 = @truncate(8 + total_dhcp);
-    util.writeU16Be(pkt[udp_start + 4 ..][0..2], udp_len);
+    udp.setLength(udp_len);
 
     const ip_total: u16 = @truncate(20 + udp_len);
-    util.writeU16Be(pkt[16..18], ip_total);
+    ip.setTotalLen(ip_total);
 
-    pkt[24] = 0;
-    pkt[25] = 0;
-    const ip_cs = util.computeChecksum(pkt[14..34]);
-    pkt[24] = @truncate(ip_cs >> 8);
-    pkt[25] = @truncate(ip_cs);
+    ip.computeAndSetChecksum(&pkt);
 
     const total_len = 14 + ip_total;
     const send_len = if (total_len < 60) @as(usize, 60) else @as(usize, @intCast(total_len));

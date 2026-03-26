@@ -1,5 +1,6 @@
 const router = @import("router");
 
+const h = router.net.headers;
 const main = router.state;
 const util = router.util;
 
@@ -70,52 +71,56 @@ pub fn sendRequest(iface: Interface, target_ip: [4]u8) void {
     const ifc = main.getIface(iface);
     var pkt: [60]u8 = undefined;
     @memset(&pkt, 0);
-    @memset(pkt[0..6], 0xFF);
-    @memcpy(pkt[6..12], &ifc.mac);
-    pkt[12] = 0x08;
-    pkt[13] = 0x06;
+
+    const eth = h.EthernetHeader.parseMut(&pkt) orelse unreachable;
+    @memset(&eth.dst_mac, 0xFF);
+    @memcpy(&eth.src_mac, &ifc.mac);
+    eth.setEtherType(h.EthernetHeader.ARP);
+
+    const arp_hdr = h.ArpHeader.parseMut(pkt[14..]) orelse unreachable;
+    // hw_type = 0x0001 (Ethernet), proto_type = 0x0800 (IPv4) — raw network-order bytes
     pkt[14] = 0x00;
     pkt[15] = 0x01;
     pkt[16] = 0x08;
     pkt[17] = 0x00;
-    pkt[18] = 0x06;
-    pkt[19] = 0x04;
-    pkt[20] = 0x00;
-    pkt[21] = 0x01;
-    @memcpy(pkt[22..28], &ifc.mac);
-    @memcpy(pkt[28..32], &ifc.ip);
-    @memset(pkt[32..38], 0);
-    @memcpy(pkt[38..42], &target_ip);
+    arp_hdr.hw_len = 6;
+    arp_hdr.proto_len = 4;
+    arp_hdr.setOpcode(h.ArpHeader.OP_REQUEST);
+    @memcpy(&arp_hdr.sender_mac, &ifc.mac);
+    @memcpy(&arp_hdr.sender_ip, &ifc.ip);
+    @memset(&arp_hdr.target_mac, 0);
+    @memcpy(&arp_hdr.target_ip, &target_ip);
     _ = ifc.txSendLocal(&pkt);
 }
 
 pub fn handle(iface: Interface, pkt: []u8, len: u32) ?[]u8 {
     if (len < 42) return null;
-    const arp_start = 14;
-    if (util.readU16Be(pkt[arp_start..][0..2]) != 0x0001) return null;
-    if (util.readU16Be(pkt[arp_start + 2 ..][0..2]) != 0x0800) return null;
+
+    const arp_hdr = h.ArpHeader.parseMut(pkt[14..]) orelse return null;
+    if (arp_hdr.hwType() != 0x0001) return null;
+    if (arp_hdr.protoType() != 0x0800) return null;
 
     const ifc = main.getIface(iface);
 
-    const opcode = util.readU16Be(pkt[arp_start + 6 ..][0..2]);
-    if (opcode != 0x0001 and opcode != 0x0002) return null;
+    const op = arp_hdr.opcode();
+    if (op != h.ArpHeader.OP_REQUEST and op != h.ArpHeader.OP_REPLY) return null;
 
-    if (opcode == 0x0001 and !util.eql(pkt[arp_start + 24 ..][0..4], &ifc.ip)) return null;
+    if (op == h.ArpHeader.OP_REQUEST and !util.eql(&arp_hdr.target_ip, &ifc.ip)) return null;
 
-    if (opcode == 0x0001) {
+    if (op == h.ArpHeader.OP_REQUEST) {
         @memcpy(pkt[0..6], pkt[6..12]);
         @memcpy(pkt[6..12], &ifc.mac);
-        util.writeU16Be(pkt[arp_start + 6 ..][0..2], 0x0002);
+        arp_hdr.setOpcode(h.ArpHeader.OP_REPLY);
 
         var mac_tmp: [6]u8 = undefined;
-        @memcpy(&mac_tmp, pkt[arp_start + 8 ..][0..6]);
-        @memcpy(pkt[arp_start + 18 ..][0..6], &mac_tmp);
-        @memcpy(pkt[arp_start + 8 ..][0..6], &ifc.mac);
+        @memcpy(&mac_tmp, &arp_hdr.sender_mac);
+        @memcpy(&arp_hdr.target_mac, &mac_tmp);
+        @memcpy(&arp_hdr.sender_mac, &ifc.mac);
 
         var ip_tmp: [4]u8 = undefined;
-        @memcpy(&ip_tmp, pkt[arp_start + 14 ..][0..4]);
-        @memcpy(pkt[arp_start + 24 ..][0..4], &ip_tmp);
-        @memcpy(pkt[arp_start + 14 ..][0..4], &ifc.ip);
+        @memcpy(&ip_tmp, &arp_hdr.sender_ip);
+        @memcpy(&arp_hdr.target_ip, &ip_tmp);
+        @memcpy(&arp_hdr.sender_ip, &ifc.ip);
 
         if (len < 60) {
             @memset(pkt[42..60], 0);

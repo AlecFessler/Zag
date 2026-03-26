@@ -1,6 +1,7 @@
 const router = @import("router");
 
 const arp = router.net.arp;
+const h = router.net.headers;
 const main = router.state;
 const util = router.util;
 
@@ -17,34 +18,27 @@ pub fn sendEchoRequest() void {
 
     const ifc = main.getIface(main.ping_iface);
 
-    @memcpy(pkt[0..6], &main.ping_target_mac);
-    @memcpy(pkt[6..12], &ifc.mac);
-    pkt[12] = 0x08;
-    pkt[13] = 0x00;
+    const eth = h.EthernetHeader.parseMut(&pkt) orelse unreachable;
+    const ip = h.Ipv4Header.parseMut(pkt[14..]) orelse unreachable;
+    const icmp = h.IcmpHeader.parseMut(pkt[34..]) orelse unreachable;
 
-    pkt[14] = 0x45;
-    util.writeU16Be(pkt[16..18], 84);
-    util.writeU16Be(pkt[18..20], ping_id);
-    pkt[22] = 64;
-    pkt[23] = 1;
-    @memcpy(pkt[26..30], &ifc.ip);
-    @memcpy(pkt[30..34], &main.ping_target_ip);
+    @memcpy(&eth.dst_mac, &main.ping_target_mac);
+    @memcpy(&eth.src_mac, &ifc.mac);
+    eth.setEtherType(h.EthernetHeader.IPv4);
 
-    pkt[24] = 0;
-    pkt[25] = 0;
-    const ip_cs = util.computeChecksum(pkt[14..34]);
-    pkt[24] = @truncate(ip_cs >> 8);
-    pkt[25] = @truncate(ip_cs);
+    ip.ver_ihl = 0x45;
+    ip.setTotalLen(84);
+    ip.setIdentification(ping_id);
+    ip.ttl = 64;
+    ip.protocol = h.Ipv4Header.PROTO_ICMP;
+    @memcpy(&ip.src_ip, &ifc.ip);
+    @memcpy(&ip.dst_ip, &main.ping_target_ip);
+    ip.computeAndSetChecksum(&pkt);
 
-    pkt[34] = 8;
-    util.writeU16Be(pkt[38..40], ping_id);
-    util.writeU16Be(pkt[40..42], main.ping_seq);
-
-    pkt[36] = 0;
-    pkt[37] = 0;
-    const icmp_cs = util.computeChecksum(pkt[34..98]);
-    pkt[36] = @truncate(icmp_cs >> 8);
-    pkt[37] = @truncate(icmp_cs);
+    icmp.icmp_type = h.IcmpHeader.TYPE_ECHO_REQUEST;
+    icmp.setId(ping_id);
+    icmp.setSeq(main.ping_seq);
+    icmp.computeAndSetChecksum(pkt[34..98]);
 
     main.ping_start_ns = util.now();
     main.ping_state = .echo_sent;
@@ -54,16 +48,17 @@ pub fn sendEchoRequest() void {
 pub fn handleEchoReply(pkt: []const u8, len: u32) void {
     if (main.ping_state != .echo_sent) return;
     if (len < 42) return;
-    if (pkt[23] != 1) return;
 
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
-    const icmp_start = 14 + ip_hdr_len;
+    const ip = h.Ipv4Header.parse(pkt[14..]) orelse return;
+    if (ip.protocol != h.Ipv4Header.PROTO_ICMP) return;
+
+    const icmp_start = 14 + ip.headerLen();
     if (icmp_start + 8 > len) return;
-    if (pkt[icmp_start] != 0) return;
 
-    const reply_id = util.readU16Be(pkt[icmp_start + 4 ..][0..2]);
-    const reply_seq = util.readU16Be(pkt[icmp_start + 6 ..][0..2]);
-    if (reply_id != ping_id or reply_seq != main.ping_seq) return;
+    const icmp = h.IcmpHeader.parse(pkt[icmp_start..]) orelse return;
+    if (icmp.icmp_type != h.IcmpHeader.TYPE_ECHO_REPLY) return;
+
+    if (icmp.id() != ping_id or icmp.sequence() != main.ping_seq) return;
 
     const rtt_us = (util.now() -| main.ping_start_ns) / 1000;
     main.ping_received += 1;
@@ -148,36 +143,27 @@ pub fn sendTracerouteProbe() void {
 
     const ifc = main.getIface(main.traceroute_iface);
 
-    @memcpy(pkt[0..6], &main.traceroute_target_mac);
-    @memcpy(pkt[6..12], &ifc.mac);
-    pkt[12] = 0x08;
-    pkt[13] = 0x00;
+    const eth = h.EthernetHeader.parseMut(&pkt) orelse unreachable;
+    const ip = h.Ipv4Header.parseMut(pkt[14..]) orelse unreachable;
+    const icmp = h.IcmpHeader.parseMut(pkt[34..]) orelse unreachable;
 
-    pkt[14] = 0x45;
-    util.writeU16Be(pkt[16..18], 84);
-    util.writeU16Be(pkt[18..20], traceroute_id);
-    pkt[22] = main.traceroute_ttl;
-    pkt[23] = 1; // ICMP
+    @memcpy(&eth.dst_mac, &main.traceroute_target_mac);
+    @memcpy(&eth.src_mac, &ifc.mac);
+    eth.setEtherType(h.EthernetHeader.IPv4);
 
-    @memcpy(pkt[26..30], &ifc.ip);
-    @memcpy(pkt[30..34], &main.traceroute_target_ip);
+    ip.ver_ihl = 0x45;
+    ip.setTotalLen(84);
+    ip.setIdentification(traceroute_id);
+    ip.ttl = main.traceroute_ttl;
+    ip.protocol = h.Ipv4Header.PROTO_ICMP;
+    @memcpy(&ip.src_ip, &ifc.ip);
+    @memcpy(&ip.dst_ip, &main.traceroute_target_ip);
+    ip.computeAndSetChecksum(&pkt);
 
-    pkt[24] = 0;
-    pkt[25] = 0;
-    const ip_cs = util.computeChecksum(pkt[14..34]);
-    pkt[24] = @truncate(ip_cs >> 8);
-    pkt[25] = @truncate(ip_cs);
-
-    // ICMP Echo Request
-    pkt[34] = 8; // type = echo request
-    util.writeU16Be(pkt[38..40], traceroute_id);
-    util.writeU16Be(pkt[40..42], @as(u16, main.traceroute_ttl));
-
-    pkt[36] = 0;
-    pkt[37] = 0;
-    const icmp_cs = util.computeChecksum(pkt[34..98]);
-    pkt[36] = @truncate(icmp_cs >> 8);
-    pkt[37] = @truncate(icmp_cs);
+    icmp.icmp_type = h.IcmpHeader.TYPE_ECHO_REQUEST;
+    icmp.setId(traceroute_id);
+    icmp.setSeq(@as(u16, main.traceroute_ttl));
+    icmp.computeAndSetChecksum(pkt[34..98]);
 
     main.traceroute_start_ns = util.now();
     main.traceroute_state = .probe_sent;
@@ -191,29 +177,31 @@ const traceroute_id: u16 = 0x5A48;
 pub fn handleTimeExceeded(pkt: []const u8, len: u32) void {
     if (main.traceroute_state != .probe_sent) return;
     if (len < 42) return;
-    if (pkt[23] != 1) return; // protocol must be ICMP
 
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
-    const icmp_start: usize = 14 + ip_hdr_len;
+    const ip = h.Ipv4Header.parse(pkt[14..]) orelse return;
+    if (ip.protocol != h.Ipv4Header.PROTO_ICMP) return;
+
+    const icmp_start: usize = 14 + ip.headerLen();
     if (icmp_start + 8 > len) return;
-    if (pkt[icmp_start] != 11) return; // type 11 = time exceeded
+
+    const icmp = h.IcmpHeader.parse(pkt[icmp_start..]) orelse return;
+    if (icmp.icmp_type != h.IcmpHeader.TYPE_TIME_EXCEEDED) return;
 
     // The ICMP payload starts at icmp_start + 8 (after type/code/checksum/unused)
     // It contains the original IP header + first 8 bytes of original ICMP
     const orig_ip_start = icmp_start + 8;
     if (orig_ip_start + 28 > len) return; // need at least orig IP (20) + ICMP (8)
 
-    const orig_ihl: u16 = (@as(u16, pkt[orig_ip_start] & 0x0F)) * 4;
-    const orig_icmp_start = orig_ip_start + orig_ihl;
+    const orig_ip = h.Ipv4Header.parse(pkt[orig_ip_start..]) orelse return;
+    const orig_icmp_start = orig_ip_start + orig_ip.headerLen();
     if (orig_icmp_start + 4 > len) return;
 
     // Check that original packet was our traceroute probe
-    const orig_id = util.readU16Be(pkt[orig_icmp_start + 4 ..][0..2]);
-    if (orig_id != traceroute_id) return;
+    const orig_icmp = h.IcmpHeader.parse(pkt[orig_icmp_start..]) orelse return;
+    if (orig_icmp.id() != traceroute_id) return;
 
     // Report the hop
-    var src_ip: [4]u8 = undefined;
-    @memcpy(&src_ip, pkt[26..30]); // source IP of the TTL exceeded reply
+    const src_ip = ip.src_ip;
     const rtt_us = (util.now() -| main.traceroute_start_ns) / 1000;
 
     var resp: [128]u8 = undefined;
@@ -244,18 +232,19 @@ pub fn handleTimeExceeded(pkt: []const u8, len: u32) void {
 pub fn handleTracerouteEchoReply(pkt: []const u8, len: u32) void {
     if (main.traceroute_state != .probe_sent) return;
     if (len < 42) return;
-    if (pkt[23] != 1) return;
 
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
-    const icmp_start: usize = 14 + ip_hdr_len;
+    const ip = h.Ipv4Header.parse(pkt[14..]) orelse return;
+    if (ip.protocol != h.Ipv4Header.PROTO_ICMP) return;
+
+    const icmp_start: usize = 14 + ip.headerLen();
     if (icmp_start + 8 > len) return;
-    if (pkt[icmp_start] != 0) return; // echo reply
 
-    const reply_id = util.readU16Be(pkt[icmp_start + 4 ..][0..2]);
-    if (reply_id != traceroute_id) return;
+    const icmp = h.IcmpHeader.parse(pkt[icmp_start..]) orelse return;
+    if (icmp.icmp_type != h.IcmpHeader.TYPE_ECHO_REPLY) return;
 
-    var src_ip: [4]u8 = undefined;
-    @memcpy(&src_ip, pkt[26..30]);
+    if (icmp.id() != traceroute_id) return;
+
+    const src_ip = ip.src_ip;
     const rtt_us = (util.now() -| main.traceroute_start_ns) / 1000;
 
     var resp: [128]u8 = undefined;

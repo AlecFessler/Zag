@@ -8,6 +8,7 @@
 const router = @import("router");
 
 const arp = router.net.arp;
+const h = router.net.headers;
 const main = router.state;
 const util = router.util;
 
@@ -53,19 +54,19 @@ pub const empty = NatEntry{};
 // ── Hash functions ──────────────────────────────────────────────────────
 
 fn hashOutbound(protocol: u8, lan_ip: [4]u8, lan_port: u16) u32 {
-    var h: u32 = @as(u32, protocol) *% 31;
-    h +%= @as(u32, lan_ip[0]) *% 257;
-    h +%= @as(u32, lan_ip[1]) *% 1031;
-    h +%= @as(u32, lan_ip[2]) *% 4099;
-    h +%= @as(u32, lan_ip[3]) *% 16411;
-    h +%= @as(u32, lan_port) *% 65537;
-    return h & (TABLE_SIZE - 1);
+    var hash: u32 = @as(u32, protocol) *% 31;
+    hash +%= @as(u32, lan_ip[0]) *% 257;
+    hash +%= @as(u32, lan_ip[1]) *% 1031;
+    hash +%= @as(u32, lan_ip[2]) *% 4099;
+    hash +%= @as(u32, lan_ip[3]) *% 16411;
+    hash +%= @as(u32, lan_port) *% 65537;
+    return hash & (TABLE_SIZE - 1);
 }
 
 fn hashInbound(protocol: u8, wan_port: u16) u32 {
-    var h: u32 = @as(u32, protocol) *% 31;
-    h +%= @as(u32, wan_port) *% 65537;
-    return h & (TABLE_SIZE - 1);
+    var hash: u32 = @as(u32, protocol) *% 31;
+    hash +%= @as(u32, wan_port) *% 65537;
+    return hash & (TABLE_SIZE - 1);
 }
 
 fn loadState(entry: *const NatEntry) State {
@@ -163,15 +164,15 @@ pub fn expire() void {
 
 fn updateTcpState(entry: *NatEntry, pkt: []const u8, len: u32, transport_start: usize) void {
     if (transport_start + 14 > len) return;
-    const flags = pkt[transport_start + 13];
-    const syn = (flags & 0x02) != 0;
-    const fin = (flags & 0x01) != 0;
-    const rst = (flags & 0x04) != 0;
-    const ack = (flags & 0x10) != 0;
+    const tcp = h.TcpHeader.parse(pkt[transport_start..]) orelse return;
+    const syn = tcp.isSyn();
+    const fin = tcp.isFin();
+    const rst = tcp.isRst();
+    const ack_ = tcp.isAck();
 
     const current: TcpState = @enumFromInt(entry.tcp_state);
     const new_state: TcpState = switch (current) {
-        .none, .syn_sent => if (ack and !syn) .established else .syn_sent,
+        .none, .syn_sent => if (ack_ and !syn) .established else .syn_sent,
         .established => if (fin or rst) .fin_wait else .established,
         .fin_wait => if (rst) .none else .fin_wait,
     };
@@ -184,81 +185,65 @@ fn updateTcpState(entry: *NatEntry, pkt: []const u8, len: u32, transport_start: 
 pub fn forwardLanToWan(pkt: []u8, len: u32) bool {
     if (len < 34) return false;
 
-    var dst_ip: [4]u8 = undefined;
-    @memcpy(&dst_ip, pkt[30..34]);
+    const ip = h.Ipv4Header.parseMut(pkt[14..]) orelse return false;
 
-    if (util.eql(&dst_ip, &main.lan_iface.ip)) return false;
-    if (main.isInLanSubnet(dst_ip)) return false;
+    if (util.eql(&ip.dst_ip, &main.lan_iface.ip)) return false;
+    if (main.isInLanSubnet(ip.dst_ip)) return false;
 
     const gateway_mac = arp.lookup(&main.wan_iface.arp_table, main.wan_gateway) orelse {
         arp.sendRequest(.wan, main.wan_gateway);
         return false;
     };
 
-    const protocol = pkt[23];
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
+    const protocol = ip.protocol;
+    const ip_hdr_len = ip.headerLen();
 
-    if (protocol == 1) {
+    if (protocol == h.Ipv4Header.PROTO_ICMP) {
         const icmp_start = 14 + ip_hdr_len;
         if (icmp_start + 8 > len) return false;
-        if (pkt[icmp_start] != 8) return false;
+        const icmp = h.IcmpHeader.parseMut(pkt[icmp_start..]) orelse return false;
+        if (icmp.icmp_type != h.IcmpHeader.TYPE_ECHO_REQUEST) return false;
 
-        const orig_id = util.readU16Be(pkt[icmp_start + 4 ..][0..2]);
-        var src_ip: [4]u8 = undefined;
-        @memcpy(&src_ip, pkt[26..30]);
-        var dst_ip_nat: [4]u8 = undefined;
-        @memcpy(&dst_ip_nat, pkt[30..34]);
+        const orig_id = icmp.id();
+        const src_ip = ip.src_ip;
+        const dst_ip_nat = ip.dst_ip;
 
         const nat_entry = lookupOutbound(.icmp, src_ip, orig_id) orelse
             (createOutbound(.icmp, src_ip, orig_id, dst_ip_nat, 0) orelse return false);
 
         @memcpy(pkt[0..6], &gateway_mac);
         @memcpy(pkt[6..12], &main.wan_iface.mac);
-        @memcpy(pkt[26..30], &main.wan_iface.ip);
-        util.writeU16Be(pkt[icmp_start + 4 ..][0..2], nat_entry.wan_port);
+        @memcpy(&ip.src_ip, &main.wan_iface.ip);
+        icmp.setId(nat_entry.wan_port);
 
-        pkt[icmp_start + 2] = 0;
-        pkt[icmp_start + 3] = 0;
-        const icmp_cs = util.computeChecksum(pkt[icmp_start..len]);
-        pkt[icmp_start + 2] = @truncate(icmp_cs >> 8);
-        pkt[icmp_start + 3] = @truncate(icmp_cs);
-
-        pkt[24] = 0;
-        pkt[25] = 0;
-        const ip_cs = util.computeChecksum(pkt[14..][0..ip_hdr_len]);
-        pkt[24] = @truncate(ip_cs >> 8);
-        pkt[25] = @truncate(ip_cs);
+        icmp.computeAndSetChecksum(pkt[icmp_start..len]);
+        ip.computeAndSetChecksum(pkt);
         return true;
-    } else if (protocol == 6 or protocol == 17) {
+    } else if (protocol == h.Ipv4Header.PROTO_TCP or protocol == h.Ipv4Header.PROTO_UDP) {
         const transport_start = 14 + ip_hdr_len;
         if (transport_start + 4 > len) return false;
 
-        const orig_port = util.readU16Be(pkt[transport_start..][0..2]);
-        var src_ip: [4]u8 = undefined;
-        @memcpy(&src_ip, pkt[26..30]);
-        var dst_ip_tcp: [4]u8 = undefined;
-        @memcpy(&dst_ip_tcp, pkt[30..34]);
-        const dst_port_tcp = util.readU16Be(pkt[transport_start + 2 ..][0..2]);
-        const proto: util.Protocol = if (protocol == 6) .tcp else .udp;
+        const tcp = h.TcpHeader.parseMut(pkt[transport_start..]) orelse return false;
+        const orig_port = tcp.srcPort();
+        const src_ip = ip.src_ip;
+        const dst_ip_tcp = ip.dst_ip;
+        const dst_port_tcp = tcp.dstPort();
+        const proto: util.Protocol = if (protocol == h.Ipv4Header.PROTO_TCP) .tcp else .udp;
         const nat_entry = lookupOutbound(proto, src_ip, orig_port) orelse
             (createOutbound(proto, src_ip, orig_port, dst_ip_tcp, dst_port_tcp) orelse return false);
 
-        if (protocol == 6) updateTcpState(nat_entry, pkt, len, transport_start);
+        if (protocol == h.Ipv4Header.PROTO_TCP) updateTcpState(nat_entry, pkt, len, transport_start);
 
         // Rewrite Ethernet header
         @memcpy(pkt[0..6], &gateway_mac);
         @memcpy(pkt[6..12], &main.wan_iface.mac);
 
         // Rewrite IP source and transport source port
-        @memcpy(pkt[26..30], &main.wan_iface.ip);
-        util.writeU16Be(pkt[transport_start..][0..2], nat_entry.wan_port);
+        @memcpy(&ip.src_ip, &main.wan_iface.ip);
+        tcp.setSrcPort(nat_entry.wan_port);
 
         // Recompute checksums after all fields are written
-        pkt[24] = 0;
-        pkt[25] = 0;
-        const ip_cs = util.computeChecksum(pkt[14..][0..ip_hdr_len]);
-        pkt[24] = @truncate(ip_cs >> 8);
-        pkt[25] = @truncate(ip_cs);
+        ip.computeAndSetChecksum(pkt);
 
         util.recomputeTransportChecksum(pkt, transport_start, len, protocol);
         return true;
@@ -270,48 +255,40 @@ pub fn forwardLanToWan(pkt: []u8, len: u32) bool {
 pub fn forwardWanToLan(pkt: []u8, len: u32) bool {
     if (len < 34) return false;
 
-    var dst_ip: [4]u8 = undefined;
-    @memcpy(&dst_ip, pkt[30..34]);
-    if (!util.eql(&dst_ip, &main.wan_iface.ip)) return false;
+    const ip = h.Ipv4Header.parseMut(pkt[14..]) orelse return false;
+    if (!util.eql(&ip.dst_ip, &main.wan_iface.ip)) return false;
 
-    const protocol = pkt[23];
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
+    const protocol = ip.protocol;
+    const ip_hdr_len = ip.headerLen();
 
-    if (protocol == 1) {
+    if (protocol == h.Ipv4Header.PROTO_ICMP) {
         const icmp_start = 14 + ip_hdr_len;
         if (icmp_start + 8 > len) return false;
-        if (pkt[icmp_start] != 0) return false;
+        const icmp = h.IcmpHeader.parseMut(pkt[icmp_start..]) orelse return false;
+        if (icmp.icmp_type != h.IcmpHeader.TYPE_ECHO_REPLY) return false;
 
-        const reply_id = util.readU16Be(pkt[icmp_start + 4 ..][0..2]);
+        const reply_id = icmp.id();
         const nat_entry = lookupInbound(.icmp, reply_id) orelse return false;
         const dst_mac = arp.lookup(&main.lan_iface.arp_table, nat_entry.lan_ip) orelse return false;
 
         @memcpy(pkt[0..6], &dst_mac);
         @memcpy(pkt[6..12], &main.lan_iface.mac);
-        @memcpy(pkt[30..34], &nat_entry.lan_ip);
-        util.writeU16Be(pkt[icmp_start + 4 ..][0..2], nat_entry.lan_port);
+        @memcpy(&ip.dst_ip, &nat_entry.lan_ip);
+        icmp.setId(nat_entry.lan_port);
 
-        pkt[icmp_start + 2] = 0;
-        pkt[icmp_start + 3] = 0;
-        const icmp_cs = util.computeChecksum(pkt[icmp_start..len]);
-        pkt[icmp_start + 2] = @truncate(icmp_cs >> 8);
-        pkt[icmp_start + 3] = @truncate(icmp_cs);
-
-        pkt[24] = 0;
-        pkt[25] = 0;
-        const ip_cs = util.computeChecksum(pkt[14..][0..ip_hdr_len]);
-        pkt[24] = @truncate(ip_cs >> 8);
-        pkt[25] = @truncate(ip_cs);
+        icmp.computeAndSetChecksum(pkt[icmp_start..len]);
+        ip.computeAndSetChecksum(pkt);
         return true;
-    } else if (protocol == 6 or protocol == 17) {
+    } else if (protocol == h.Ipv4Header.PROTO_TCP or protocol == h.Ipv4Header.PROTO_UDP) {
         const transport_start = 14 + ip_hdr_len;
         if (transport_start + 4 > len) return false;
 
-        const dst_port = util.readU16Be(pkt[transport_start + 2 ..][0..2]);
-        const proto: util.Protocol = if (protocol == 6) .tcp else .udp;
+        const tcp = h.TcpHeader.parseMut(pkt[transport_start..]) orelse return false;
+        const dst_port = tcp.dstPort();
+        const proto: util.Protocol = if (protocol == h.Ipv4Header.PROTO_TCP) .tcp else .udp;
         const nat_entry = lookupInbound(proto, dst_port) orelse return false;
 
-        if (protocol == 6) updateTcpState(nat_entry, pkt, len, transport_start);
+        if (protocol == h.Ipv4Header.PROTO_TCP) updateTcpState(nat_entry, pkt, len, transport_start);
 
         const dst_mac = arp.lookup(&main.lan_iface.arp_table, nat_entry.lan_ip) orelse {
             arp.sendRequest(.lan, nat_entry.lan_ip);
@@ -323,15 +300,11 @@ pub fn forwardWanToLan(pkt: []u8, len: u32) bool {
         @memcpy(pkt[6..12], &main.lan_iface.mac);
 
         // Rewrite IP dest and transport dest port
-        @memcpy(pkt[30..34], &nat_entry.lan_ip);
-        util.writeU16Be(pkt[transport_start + 2 ..][0..2], nat_entry.lan_port);
+        @memcpy(&ip.dst_ip, &nat_entry.lan_ip);
+        tcp.setDstPort(nat_entry.lan_port);
 
         // Recompute checksums after all fields are written
-        pkt[24] = 0;
-        pkt[25] = 0;
-        const ip_cs = util.computeChecksum(pkt[14..][0..ip_hdr_len]);
-        pkt[24] = @truncate(ip_cs >> 8);
-        pkt[25] = @truncate(ip_cs);
+        ip.computeAndSetChecksum(pkt);
 
         util.recomputeTransportChecksum(pkt, transport_start, len, protocol);
         return true;

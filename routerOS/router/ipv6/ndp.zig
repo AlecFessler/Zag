@@ -1,5 +1,6 @@
 const router = @import("router");
 
+const h = router.net.headers;
 const main = router.state;
 const util = router.util;
 
@@ -86,24 +87,25 @@ pub fn sendNeighborSolicitation(iface: Interface, target_ip6: [16]u8) void {
     // Ethernet header
     const snm = util.solicitedNodeMulticast(target_ip6);
     const dst_mac = util.multicastMac6(snm);
-    @memcpy(pkt[0..6], &dst_mac);
-    @memcpy(pkt[6..12], &ifc.mac);
-    pkt[12] = 0x86;
-    pkt[13] = 0xDD;
+    const eth = h.EthernetHeader.parseMut(&pkt) orelse return;
+    @memcpy(&eth.dst_mac, &dst_mac);
+    @memcpy(&eth.src_mac, &ifc.mac);
+    eth.setEtherType(h.EthernetHeader.IPv6);
 
     // IPv6 header
-    pkt[14] = 0x60; // version 6
+    const ip6 = h.Ipv6Header.parseMut(pkt[14..]) orelse return;
+    ip6.ver_tc_fl[0] = 0x60; // version 6
     // payload length = 32 (24 NS + 8 source link-layer option)
-    pkt[18] = 0;
-    pkt[19] = 32;
-    pkt[20] = 58; // next header: ICMPv6
-    pkt[21] = 255; // hop limit
-    @memcpy(pkt[22..38], &ifc.ip6_link_local); // source
-    @memcpy(pkt[38..54], &snm); // destination: solicited-node multicast
+    ip6.setPayloadLen(32);
+    ip6.next_header = 58; // ICMPv6
+    ip6.hop_limit = 255;
+    @memcpy(&ip6.src_ip, &ifc.ip6_link_local); // source
+    @memcpy(&ip6.dst_ip, &snm); // destination: solicited-node multicast
 
     // ICMPv6 Neighbor Solicitation (type 135)
-    pkt[54] = 135;
-    pkt[55] = 0; // code
+    const icmpv6 = h.Icmpv6Header.parseMut(pkt[54..]) orelse return;
+    icmpv6.icmp_type = h.Icmpv6Header.TYPE_NS;
+    icmpv6.code = 0;
     // checksum at 56-57, filled below
     // reserved at 58-61 (already zeroed)
     @memcpy(pkt[62..78], &target_ip6); // target address
@@ -115,8 +117,7 @@ pub fn sendNeighborSolicitation(iface: Interface, target_ip6: [16]u8) void {
 
     // Compute ICMPv6 checksum
     const cs = util.computeIcmpv6Checksum(ifc.ip6_link_local, snm, pkt[54..86]);
-    pkt[56] = @truncate(cs >> 8);
-    pkt[57] = @truncate(cs);
+    icmpv6.setChecksum(cs);
 
     _ = ifc.txSendLocal(&pkt);
 }
@@ -125,9 +126,11 @@ pub fn sendNeighborSolicitation(iface: Interface, target_ip6: [16]u8) void {
 pub fn handle(iface: Interface, pkt: []u8, len: u32) ?[]const u8 {
     if (len < 78) return null; // 14 eth + 40 ipv6 + 24 NS minimum
     const ifc = main.getIface(iface);
-    const icmpv6_type = pkt[54];
+    const eth = h.EthernetHeader.parse(pkt) orelse return null;
+    const ip6 = h.Ipv6Header.parse(pkt[14..]) orelse return null;
+    const icmpv6 = h.Icmpv6Header.parse(pkt[54..]) orelse return null;
 
-    if (icmpv6_type == 135) {
+    if (icmpv6.icmp_type == h.Icmpv6Header.TYPE_NS) {
         // Neighbor Solicitation — check if target is our address
         var target: [16]u8 = undefined;
         @memcpy(&target, pkt[62..78]);
@@ -138,9 +141,9 @@ pub fn handle(iface: Interface, pkt: []u8, len: u32) ?[]const u8 {
 
         // Learn sender
         var src_ip6: [16]u8 = undefined;
-        @memcpy(&src_ip6, pkt[22..38]);
+        @memcpy(&src_ip6, &ip6.src_ip);
         var src_mac: [6]u8 = undefined;
-        @memcpy(&src_mac, pkt[6..12]);
+        @memcpy(&src_mac, &eth.src_mac);
         const ndp_tbl = if (iface == .wan) &main.wan_ndp_table else &main.lan_ndp_table;
         if (!util.isAllZeros(&src_ip6)) learn(ndp_tbl, src_ip6, src_mac, false);
 
@@ -148,7 +151,7 @@ pub fn handle(iface: Interface, pkt: []u8, len: u32) ?[]const u8 {
         return buildNA(ifc, src_ip6, src_mac, target);
     }
 
-    if (icmpv6_type == 136 and len >= 78) {
+    if (icmpv6.icmp_type == h.Icmpv6Header.TYPE_NA and len >= 78) {
         // Neighbor Advertisement — learn the mapping
         var target: [16]u8 = undefined;
         @memcpy(&target, pkt[62..78]);
@@ -157,10 +160,10 @@ pub fn handle(iface: Interface, pkt: []u8, len: u32) ?[]const u8 {
         if (len >= 86 and pkt[78] == 2 and pkt[79] == 1) {
             @memcpy(&src_mac, pkt[80..86]);
         } else {
-            @memcpy(&src_mac, pkt[6..12]);
+            @memcpy(&src_mac, &eth.src_mac);
         }
         const ndp_tbl = if (iface == .wan) &main.wan_ndp_table else &main.lan_ndp_table;
-        const flags = pkt[58];
+        const flags = pkt[58]; // flags byte after ICMPv6 4-byte header
         learn(ndp_tbl, target, src_mac, flags & 0x80 != 0); // R flag = router
     }
 
@@ -178,23 +181,24 @@ fn buildNA(
     @memset(&na_buf, 0);
 
     // Ethernet
-    @memcpy(na_buf[0..6], &dst_mac);
-    @memcpy(na_buf[6..12], &ifc.mac);
-    na_buf[12] = 0x86;
-    na_buf[13] = 0xDD;
+    const eth = h.EthernetHeader.parseMut(&na_buf) orelse return &na_buf;
+    @memcpy(&eth.dst_mac, &dst_mac);
+    @memcpy(&eth.src_mac, &ifc.mac);
+    eth.setEtherType(h.EthernetHeader.IPv6);
 
     // IPv6
-    na_buf[14] = 0x60;
-    na_buf[18] = 0;
-    na_buf[19] = 32; // payload = 24 NA + 8 option
-    na_buf[20] = 58; // ICMPv6
-    na_buf[21] = 255;
-    @memcpy(na_buf[22..38], &target); // source = target (our address)
-    @memcpy(na_buf[38..54], &dst_ip6); // destination
+    const ip6 = h.Ipv6Header.parseMut(na_buf[14..]) orelse return &na_buf;
+    ip6.ver_tc_fl[0] = 0x60;
+    ip6.setPayloadLen(32); // payload = 24 NA + 8 option
+    ip6.next_header = 58; // ICMPv6
+    ip6.hop_limit = 255;
+    @memcpy(&ip6.src_ip, &target); // source = target (our address)
+    @memcpy(&ip6.dst_ip, &dst_ip6); // destination
 
     // ICMPv6 NA (type 136)
-    na_buf[54] = 136;
-    na_buf[55] = 0;
+    const icmpv6 = h.Icmpv6Header.parseMut(na_buf[54..]) orelse return &na_buf;
+    icmpv6.icmp_type = h.Icmpv6Header.TYPE_NA;
+    icmpv6.code = 0;
     // Flags: R (router) + S (solicited) + O (override)
     na_buf[58] = 0xE0;
     @memcpy(na_buf[62..78], &target);
@@ -206,8 +210,7 @@ fn buildNA(
 
     // ICMPv6 checksum
     const cs = util.computeIcmpv6Checksum(target, dst_ip6, na_buf[54..86]);
-    na_buf[56] = @truncate(cs >> 8);
-    na_buf[57] = @truncate(cs);
+    icmpv6.setChecksum(cs);
 
     return &na_buf;
 }

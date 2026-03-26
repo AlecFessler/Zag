@@ -1,5 +1,6 @@
 const router = @import("router");
 
+const h = router.net.headers;
 const main = router.state;
 const util = router.util;
 
@@ -56,21 +57,23 @@ pub fn sendSolicit() void {
     const dst_mac = util.multicastMac6(ALL_DHCP_SERVERS);
 
     // Ethernet
-    @memcpy(pkt[0..6], &dst_mac);
-    @memcpy(pkt[6..12], &ifc.mac);
-    pkt[12] = 0x86;
-    pkt[13] = 0xDD;
+    const eth = h.EthernetHeader.parseMut(&pkt) orelse return;
+    @memcpy(&eth.dst_mac, &dst_mac);
+    @memcpy(&eth.src_mac, &ifc.mac);
+    eth.setEtherType(h.EthernetHeader.IPv6);
 
     // IPv6 header
-    pkt[14] = 0x60;
-    pkt[20] = 17; // UDP
-    pkt[21] = 255;
-    @memcpy(pkt[22..38], &ifc.ip6_link_local);
-    @memcpy(pkt[38..54], &ALL_DHCP_SERVERS);
+    const ip6 = h.Ipv6Header.parseMut(pkt[14..]) orelse return;
+    ip6.ver_tc_fl[0] = 0x60;
+    ip6.next_header = 17; // UDP
+    ip6.hop_limit = 255;
+    @memcpy(&ip6.src_ip, &ifc.ip6_link_local);
+    @memcpy(&ip6.dst_ip, &ALL_DHCP_SERVERS);
 
     // UDP header at offset 54
-    util.writeU16Be(pkt[54..56], 546); // src port
-    util.writeU16Be(pkt[56..58], 547); // dst port
+    const udp = h.UdpHeader.parseMut(pkt[54..]) orelse return;
+    udp.setSrcPort(546);
+    udp.setDstPort(547);
 
     // DHCPv6 message at offset 62
     var pos: usize = 62;
@@ -101,8 +104,8 @@ pub fn sendSolicit() void {
 
     // Fill lengths
     const udp_len: u16 = @truncate(pos - 54);
-    util.writeU16Be(pkt[58..60], udp_len);
-    util.writeU16Be(pkt[18..20], udp_len); // IPv6 payload = UDP
+    udp.setLength(udp_len);
+    ip6.setPayloadLen(udp_len); // IPv6 payload = UDP
 
     const total_len = pos;
     _ = ifc.txSendLocal(pkt[0..total_len]);
@@ -194,18 +197,21 @@ fn sendRequest() void {
     const ifc = &main.wan_iface;
     const dst_mac = util.multicastMac6(ALL_DHCP_SERVERS);
 
-    @memcpy(pkt[0..6], &dst_mac);
-    @memcpy(pkt[6..12], &ifc.mac);
-    pkt[12] = 0x86;
-    pkt[13] = 0xDD;
-    pkt[14] = 0x60;
-    pkt[20] = 17;
-    pkt[21] = 255;
-    @memcpy(pkt[22..38], &ifc.ip6_link_local);
-    @memcpy(pkt[38..54], &ALL_DHCP_SERVERS);
+    const eth = h.EthernetHeader.parseMut(&pkt) orelse return;
+    @memcpy(&eth.dst_mac, &dst_mac);
+    @memcpy(&eth.src_mac, &ifc.mac);
+    eth.setEtherType(h.EthernetHeader.IPv6);
 
-    util.writeU16Be(pkt[54..56], 546);
-    util.writeU16Be(pkt[56..58], 547);
+    const ip6 = h.Ipv6Header.parseMut(pkt[14..]) orelse return;
+    ip6.ver_tc_fl[0] = 0x60;
+    ip6.next_header = 17;
+    ip6.hop_limit = 255;
+    @memcpy(&ip6.src_ip, &ifc.ip6_link_local);
+    @memcpy(&ip6.dst_ip, &ALL_DHCP_SERVERS);
+
+    const udp = h.UdpHeader.parseMut(pkt[54..]) orelse return;
+    udp.setSrcPort(546);
+    udp.setDstPort(547);
 
     var pos: usize = 62;
     pkt[pos] = REQUEST;
@@ -236,8 +242,8 @@ fn sendRequest() void {
     pos += 16;
 
     const udp_len: u16 = @truncate(pos - 54);
-    util.writeU16Be(pkt[58..60], udp_len);
-    util.writeU16Be(pkt[18..20], udp_len);
+    udp.setLength(udp_len);
+    ip6.setPayloadLen(udp_len);
 
     _ = ifc.txSendLocal(pkt[0..pos]);
     main.dhcpv6_state = .requesting;

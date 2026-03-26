@@ -3,6 +3,7 @@ const router = @import("router");
 const arp = router.net.arp;
 const dhcp_server = router.services.dhcp_server;
 const firewall = router.ipv4.firewall;
+const h = router.net.headers;
 const main = router.state;
 const nat = router.ipv4.nat;
 const util = router.util;
@@ -35,27 +36,27 @@ var request_len: usize = 0;
 pub fn handleTcp(pkt: []u8, len: u32) bool {
     if (len < 54) return false; // 14 eth + 20 IP + 20 TCP minimum
 
-    const ip_hdr_len: u16 = (@as(u16, pkt[14] & 0x0F)) * 4;
+    const ip = h.Ipv4Header.parseMut(pkt[14..]) orelse return false;
+    const ip_hdr_len = ip.headerLen();
     const tcp_start: usize = 14 + ip_hdr_len;
     if (tcp_start + 20 > len) return false;
 
-    const dst_port = util.readU16Be(pkt[tcp_start + 2 ..][0..2]);
-    if (dst_port != HTTP_PORT) return false;
+    const tcp = h.TcpHeader.parseMut(pkt[tcp_start..]) orelse return false;
+    if (tcp.dstPort() != HTTP_PORT) return false;
 
-    const src_port = util.readU16Be(pkt[tcp_start..][0..2]);
-    const flags = pkt[tcp_start + 13];
-    const seq = readU32Be(pkt[tcp_start + 4 ..][0..4]);
-    const tcp_data_offset: usize = (@as(usize, pkt[tcp_start + 12] >> 4)) * 4;
+    const src_port = tcp.srcPort();
+    const seq = tcp.seq();
+    const tcp_data_offset: usize = tcp.dataOffset();
     const payload_start = tcp_start + tcp_data_offset;
     // Use IP total length to exclude Ethernet padding (min frame = 60 bytes)
-    const ip_total_len: usize = util.readU16Be(pkt[16..18]);
+    const ip_total_len: usize = ip.totalLen();
     const actual_end: usize = @min(14 + ip_total_len, len);
     const payload_len: usize = if (payload_start < actual_end) actual_end - payload_start else 0;
 
-    const is_syn = flags & 0x02 != 0;
-    const is_ack = flags & 0x10 != 0;
-    const is_fin = flags & 0x01 != 0;
-    const is_rst = flags & 0x04 != 0;
+    const is_syn = tcp.isSyn();
+    const is_ack = tcp.isAck();
+    const is_fin = tcp.isFin();
+    const is_rst = tcp.isRst();
 
     if (is_rst) {
         if (state != .closed and src_port == client_port) {
@@ -67,7 +68,7 @@ pub fn handleTcp(pkt: []u8, len: u32) bool {
 
     if (is_syn and !is_ack) {
         // New connection — SYN
-        @memcpy(&client_ip, pkt[26..30]);
+        @memcpy(&client_ip, &ip.src_ip);
         @memcpy(&client_mac, pkt[6..12]);
         client_port = src_port;
         remote_seq = seq + 1;
@@ -368,35 +369,33 @@ fn sendTcpPacket(payload: []const u8, flags: u8, seq: u32, ack: u32) void {
     @memset(pkt[0..frame_len], 0);
 
     // Ethernet
-    @memcpy(pkt[0..6], &client_mac);
-    @memcpy(pkt[6..12], &ifc.mac);
-    pkt[12] = 0x08;
-    pkt[13] = 0x00;
+    const eth = h.EthernetHeader.parseMut(&pkt) orelse unreachable;
+    @memcpy(&eth.dst_mac, &client_mac);
+    @memcpy(&eth.src_mac, &ifc.mac);
+    eth.setEtherType(h.EthernetHeader.IPv4);
 
     // IP header
-    pkt[14] = 0x45;
-    util.writeU16Be(pkt[16..18], ip_total);
+    const ip = h.Ipv4Header.parseMut(pkt[14..]) orelse unreachable;
+    ip.ver_ihl = 0x45;
+    ip.setTotalLen(ip_total);
     pkt[20] = 0x40; // Don't Fragment
-    pkt[22] = 64; // TTL
-    pkt[23] = 6; // TCP
-    @memcpy(pkt[26..30], &ifc.ip);
-    @memcpy(pkt[30..34], &client_ip);
+    ip.ttl = 64;
+    ip.protocol = h.Ipv4Header.PROTO_TCP;
+    @memcpy(&ip.src_ip, &ifc.ip);
+    @memcpy(&ip.dst_ip, &client_ip);
 
-    pkt[24] = 0;
-    pkt[25] = 0;
-    const ip_cs = util.computeChecksum(pkt[14..34]);
-    pkt[24] = @truncate(ip_cs >> 8);
-    pkt[25] = @truncate(ip_cs);
+    ip.computeAndSetChecksum(&pkt);
 
     // TCP header
     const tcp_start: usize = 34;
-    util.writeU16Be(pkt[tcp_start..][0..2], HTTP_PORT); // src port
-    util.writeU16Be(pkt[tcp_start + 2 ..][0..2], client_port); // dst port
-    writeU32Be(pkt[tcp_start + 4 ..][0..4], seq);
-    writeU32Be(pkt[tcp_start + 8 ..][0..4], ack);
-    pkt[tcp_start + 12] = 0x50; // data offset = 5 (20 bytes)
-    pkt[tcp_start + 13] = flags;
-    util.writeU16Be(pkt[tcp_start + 14 ..][0..2], 65535); // window size
+    const tcp = h.TcpHeader.parseMut(pkt[tcp_start..]) orelse unreachable;
+    tcp.setSrcPort(HTTP_PORT);
+    tcp.setDstPort(client_port);
+    tcp.setSeq(seq);
+    tcp.setAck(ack);
+    tcp.data_off_rsvd = 0x50;
+    tcp.flags = flags;
+    tcp.setWindow(65535);
 
     // Copy payload
     if (payload.len > 0) {
@@ -407,17 +406,6 @@ fn sendTcpPacket(payload: []const u8, flags: u8, seq: u32, ack: u32) void {
     util.recomputeTransportChecksum(&pkt, tcp_start, @intCast(14 + ip_total), 6);
 
     _ = ifc.txSendDirect(pkt[0..@max(frame_len, 14 + @as(usize, ip_total))]);
-}
-
-fn readU32Be(buf: []const u8) u32 {
-    return @as(u32, buf[0]) << 24 | @as(u32, buf[1]) << 16 | @as(u32, buf[2]) << 8 | buf[3];
-}
-
-fn writeU32Be(buf: []u8, val: u32) void {
-    buf[0] = @truncate(val >> 24);
-    buf[1] = @truncate(val >> 16);
-    buf[2] = @truncate(val >> 8);
-    buf[3] = @truncate(val);
 }
 
 // ── JSON state formatters (called from service thread) ───────────────

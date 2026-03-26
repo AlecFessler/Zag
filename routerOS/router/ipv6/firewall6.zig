@@ -1,5 +1,6 @@
 const router = @import("router");
 
+const hdrs = router.net.headers;
 const main = router.state;
 const util = router.util;
 
@@ -38,7 +39,8 @@ fn hash(protocol: u8, ip6: [16]u8, port: u16) u32 {
 /// Track an outbound (LAN→WAN) connection.
 pub fn allowOutbound(pkt: []const u8, len: u32) void {
     if (len < 54) return;
-    const next_header = pkt[20];
+    const ip6 = hdrs.Ipv6Header.parse(pkt[14..]) orelse return;
+    const next_header = ip6.next_header;
     if (next_header != 6 and next_header != 17) return;
 
     const transport_start: usize = 54;
@@ -46,8 +48,8 @@ pub fn allowOutbound(pkt: []const u8, len: u32) void {
 
     var src_ip6: [16]u8 = undefined;
     var dst_ip6: [16]u8 = undefined;
-    @memcpy(&src_ip6, pkt[22..38]);
-    @memcpy(&dst_ip6, pkt[38..54]);
+    @memcpy(&src_ip6, &ip6.src_ip);
+    @memcpy(&dst_ip6, &ip6.dst_ip);
     const src_port = util.readU16Be(pkt[transport_start..][0..2]);
     const dst_port = util.readU16Be(pkt[transport_start + 2 ..][0..2]);
 
@@ -93,7 +95,8 @@ pub fn allowOutbound(pkt: []const u8, len: u32) void {
 /// Check if inbound (WAN→LAN) traffic matches a tracked connection.
 pub fn allowInbound(pkt: []const u8, len: u32) bool {
     if (len < 54) return false;
-    const next_header = pkt[20];
+    const ip6 = hdrs.Ipv6Header.parse(pkt[14..]) orelse return false;
+    const next_header = ip6.next_header;
 
     // Always allow essential ICMPv6
     if (next_header == 58) return isAllowedIcmpv6(pkt, len);
@@ -106,8 +109,8 @@ pub fn allowInbound(pkt: []const u8, len: u32) bool {
     // For inbound, src/dst are swapped relative to the outbound entry
     var src_ip6: [16]u8 = undefined;
     var dst_ip6: [16]u8 = undefined;
-    @memcpy(&src_ip6, pkt[22..38]); // remote source
-    @memcpy(&dst_ip6, pkt[38..54]); // LAN destination
+    @memcpy(&src_ip6, &ip6.src_ip); // remote source
+    @memcpy(&dst_ip6, &ip6.dst_ip); // LAN destination
     const src_port = util.readU16Be(pkt[transport_start..][0..2]);
     const dst_port = util.readU16Be(pkt[transport_start + 2 ..][0..2]);
 
@@ -135,7 +138,8 @@ pub fn allowInbound(pkt: []const u8, len: u32) bool {
 
 fn isAllowedIcmpv6(pkt: []const u8, len: u32) bool {
     if (len < 55) return false;
-    const icmpv6_type = pkt[54];
+    const icmpv6 = hdrs.Icmpv6Header.parse(pkt[54..]) orelse return false;
+    const icmpv6_type = icmpv6.icmp_type;
     // Allow error messages (types 1-4)
     if (icmpv6_type >= 1 and icmpv6_type <= 4) return true;
     // Allow echo request/reply (128-129)

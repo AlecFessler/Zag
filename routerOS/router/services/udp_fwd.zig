@@ -2,6 +2,7 @@ const lib = @import("lib");
 const router = @import("router");
 
 const arp = router.net.arp;
+const h = router.net.headers;
 const main = router.state;
 const util = router.util;
 
@@ -71,34 +72,26 @@ fn handleUdpSend(data: []const u8) void {
         queuePending(dst_ip, data);
         return;
     };
-    @memcpy(frame[0..6], &gateway_mac);
-    @memcpy(frame[6..12], &main.wan_iface.mac);
-    frame[12] = 0x08;
-    frame[13] = 0x00;
 
-    frame[14] = 0x45;
-    frame[15] = 0x00;
-    util.writeU16Be(frame[16..18], ip_total);
-    frame[18] = 0;
-    frame[19] = 0;
-    frame[20] = 0;
-    frame[21] = 0;
-    frame[22] = 64;
-    frame[23] = 17;
-    frame[24] = 0;
-    frame[25] = 0;
-    @memcpy(frame[26..30], &main.wan_iface.ip);
-    @memcpy(frame[30..34], &dst_ip);
+    const eth = h.EthernetHeader.parseMut(&frame) orelse return;
+    @memcpy(&eth.dst_mac, &gateway_mac);
+    @memcpy(&eth.src_mac, &main.wan_iface.mac);
+    eth.setEtherType(h.EthernetHeader.IPv4);
 
-    const ip_cs = util.computeChecksum(frame[14..34]);
-    frame[24] = @truncate(ip_cs >> 8);
-    frame[25] = @truncate(ip_cs);
+    const ip = h.Ipv4Header.parseMut(frame[14..]) orelse return;
+    ip.ver_ihl = 0x45;
+    ip.setTotalLen(ip_total);
+    ip.ttl = 64;
+    ip.protocol = h.Ipv4Header.PROTO_UDP;
+    @memcpy(&ip.src_ip, &main.wan_iface.ip);
+    @memcpy(&ip.dst_ip, &dst_ip);
+    ip.computeAndSetChecksum(&frame);
 
-    util.writeU16Be(frame[34..36], src_port);
-    util.writeU16Be(frame[36..38], dst_port);
-    util.writeU16Be(frame[38..40], udp_len);
-    frame[40] = 0;
-    frame[41] = 0;
+    const udp = h.UdpHeader.parseMut(frame[34..]) orelse return;
+    udp.setSrcPort(src_port);
+    udp.setDstPort(dst_port);
+    udp.setLength(udp_len);
+    udp.zeroChecksum();
 
     @memcpy(frame[42..][0..payload.len], payload);
 
