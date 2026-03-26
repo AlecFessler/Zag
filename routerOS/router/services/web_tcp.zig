@@ -42,7 +42,7 @@ pub fn handleTcp(pkt: []u8, len: u32) bool {
     const dst_port = util.readU16Be(pkt[tcp_start + 2 ..][0..2]);
     if (dst_port != HTTP_PORT) return false;
 
-    const src_port = util.readU16Be(pkt[tcp_start ..][0..2]);
+    const src_port = util.readU16Be(pkt[tcp_start..][0..2]);
     const flags = pkt[tcp_start + 13];
     const seq = readU32Be(pkt[tcp_start + 4 ..][0..4]);
     const tcp_data_offset: usize = (@as(usize, pkt[tcp_start + 12] >> 4)) * 4;
@@ -390,7 +390,7 @@ fn sendTcpPacket(payload: []const u8, flags: u8, seq: u32, ack: u32) void {
 
     // TCP header
     const tcp_start: usize = 34;
-    util.writeU16Be(pkt[tcp_start ..][0..2], HTTP_PORT); // src port
+    util.writeU16Be(pkt[tcp_start..][0..2], HTTP_PORT); // src port
     util.writeU16Be(pkt[tcp_start + 2 ..][0..2], client_port); // dst port
     writeU32Be(pkt[tcp_start + 4 ..][0..4], seq);
     writeU32Be(pkt[tcp_start + 8 ..][0..4], ack);
@@ -578,4 +578,4 @@ pub fn formatJsonRules(buf: []u8) usize {
 
 // ── Embedded HTML Management Page ───────────────────────────────────
 
-const HTML_PAGE = @embedFile("services/index.html");
+const HTML_PAGE = @embedFile("index.html");
