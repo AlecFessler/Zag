@@ -19,9 +19,12 @@ pub const FirewallRule = struct {
 };
 
 pub const empty_rule = FirewallRule{
-    .valid = false, .action = .block,
-    .src_ip = .{ 0, 0, 0, 0 }, .src_mask = .{ 0, 0, 0, 0 },
-    .protocol = 0, .dst_port = 0,
+    .valid = false,
+    .action = .block,
+    .src_ip = .{ 0, 0, 0, 0 },
+    .src_mask = .{ 0, 0, 0, 0 },
+    .protocol = 0,
+    .dst_port = 0,
 };
 
 pub const PortForward = struct {
@@ -33,8 +36,11 @@ pub const PortForward = struct {
 };
 
 pub const empty_fwd = PortForward{
-    .valid = false, .protocol = .tcp, .wan_port = 0,
-    .lan_ip = .{ 0, 0, 0, 0 }, .lan_port = 0,
+    .valid = false,
+    .protocol = .tcp,
+    .wan_port = 0,
+    .lan_ip = .{ 0, 0, 0, 0 },
+    .lan_port = 0,
 };
 
 pub fn check(rules: *const [RULES_SIZE]FirewallRule, src_ip: [4]u8, protocol: u8, dst_port: u16) FirewallAction {

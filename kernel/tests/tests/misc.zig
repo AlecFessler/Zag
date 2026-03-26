@@ -45,7 +45,10 @@ fn testRevokeSelf() void {
 fn testRevokeVmReservation() void {
     const rights = (perms.VmReservationRights{ .read = true, .write = true }).bits();
     const result = syscall.vm_reserve(0, syscall.PAGE4K, rights);
-    if (result.val < 0) { t.fail("setup failed"); return; }
+    if (result.val < 0) {
+        t.fail("setup failed");
+        return;
+    }
     const handle: u64 = @intCast(result.val);
     const base = result.val2;
     const ptr: *volatile u8 = @ptrFromInt(base);
@@ -62,19 +65,27 @@ fn testWriteZeroLen() void {
         : [num] "{rax}" (@as(u64, 0)),
           [a0] "{rdi}" (@as(u64, 0x1000)),
           [a1] "{rsi}" (@as(u64, 0)),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }
-    );
+        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
     t.expectEqual("S4.write: len=0 returns E_OK (0 bytes written)", 0, rc);
 }
 
 fn testRevokeShmUnmapsAndClearsSlot() void {
     const shm_handle = syscall.shm_create(syscall.PAGE4K);
-    if (shm_handle <= 0) { t.fail("setup failed"); return; }
+    if (shm_handle <= 0) {
+        t.fail("setup failed");
+        return;
+    }
     const vm_rights = (perms.VmReservationRights{
-        .read = true, .write = true, .execute = true, .shareable = true,
+        .read = true,
+        .write = true,
+        .execute = true,
+        .shareable = true,
     }).bits();
     const vm_result = syscall.vm_reserve(0, syscall.PAGE4K, vm_rights);
-    if (vm_result.val < 0) { t.fail("setup failed"); return; }
+    if (vm_result.val < 0) {
+        t.fail("setup failed");
+        return;
+    }
     const vm_handle: u64 = @intCast(vm_result.val);
     _ = syscall.shm_map(@intCast(shm_handle), vm_handle, 0);
     const ptr: *volatile u64 = @ptrFromInt(vm_result.val2);
@@ -88,7 +99,8 @@ fn testRevokeShmUnmapsAndClearsSlot() void {
 fn testProcCreateRestartWithoutRestart() void {
     const child_elf = embedded.child_exit;
     const child_rights = (perms.ProcessRights{
-        .spawn_thread = true, .restart = true,
+        .spawn_thread = true,
+        .restart = true,
     }).bits();
     const rc = syscall.proc_create(@intFromPtr(child_elf.ptr), child_elf.len, child_rights);
     t.expectEqual("S4.proc_create: parent without restart cannot grant restart (E_PERM)", -2, rc);

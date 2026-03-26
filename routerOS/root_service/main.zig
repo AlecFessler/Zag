@@ -223,7 +223,6 @@ fn brokerConnection(requester: *ChildInfo, target_service_id: u32) void {
 
     _ = syscall.shm_unmap(@intCast(data_shm), @intCast(data_vm.val));
     _ = syscall.revoke_perm(@intCast(data_shm));
-
 }
 
 fn brokerLoop() void {

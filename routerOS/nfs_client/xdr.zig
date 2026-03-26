@@ -1,6 +1,5 @@
 /// XDR (External Data Representation) encoding/decoding for NFS/RPC.
 /// All values are big-endian, 4-byte aligned per RFC 4506.
-
 pub fn writeU32(buf: []u8, pos: usize, val: u32) usize {
     if (pos + 4 > buf.len) return pos;
     buf[pos] = @truncate(val >> 24);

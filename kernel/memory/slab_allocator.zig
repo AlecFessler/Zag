@@ -106,7 +106,7 @@ pub fn SlabAllocator(
             std.debug.assert(alignment.toByteUnits() == @as(usize, @intCast(@alignOf(T))));
             std.debug.assert(len == @as(usize, @intCast(@sizeOf(T))));
 
-            const self: *Self = @alignCast(@ptrCast(ptr));
+            const self: *Self = @ptrCast(@alignCast(ptr));
             if (use_lock) self.lock.lock();
             defer if (use_lock) self.lock.unlock();
 
@@ -183,8 +183,8 @@ pub fn SlabAllocator(
         ) void {
             _ = alignment;
             _ = ret_addr;
-            const self: *Self = @alignCast(@ptrCast(ptr));
-            const slab: *T = @alignCast(@ptrCast(buf.ptr));
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const slab: *T = @ptrCast(@alignCast(buf.ptr));
 
             if (use_lock) self.lock.lock();
             defer if (use_lock) self.lock.unlock();

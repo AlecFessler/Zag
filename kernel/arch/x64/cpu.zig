@@ -194,10 +194,9 @@ pub fn rdtscLFenced() u64 {
         \\ lfence
         \\ rdtsc
         : [a] "={eax}" (a),
-          [d] "={edx}" (d)
+          [d] "={edx}" (d),
         :
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
     return (@as(u64, d) << 32) | a;
 }
 
@@ -209,10 +208,9 @@ pub fn rdtscp() u64 {
         \\ rdtscp
         : [a] "={eax}" (a),
           [d] "={edx}" (d),
-          [c] "={ecx}" (c)
+          [c] "={ecx}" (c),
         :
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
     return (@as(u64, d) << 32) | a;
 }
 
@@ -225,10 +223,9 @@ pub fn rdtscpLFenced() u64 {
         \\ lfence
         : [a] "={eax}" (a),
           [d] "={edx}" (d),
-          [c] "={ecx}" (c)
+          [c] "={ecx}" (c),
         :
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
     return (@as(u64, d) << 32) | a;
 }
 
@@ -252,7 +249,7 @@ pub fn restoreInterrupts(saved_rflags: u64) void {
 pub fn saveAndDisableInterrupts() u64 {
     var rflags: u64 = 0;
     asm volatile ("pushfq; pop %[out]"
-        : [out] "={rax}" (rflags)
+        : [out] "={rax}" (rflags),
     );
     asm volatile ("cli");
     return rflags;
@@ -301,8 +298,7 @@ pub fn inb(port: u16) u8 {
         \\inb %[port], %[ret]
         : [ret] "={al}" (-> u8),
         : [port] "{dx}" (port),
-        : .{.dx = true}
-    );
+        : .{ .dx = true });
 }
 
 pub fn outb(value: u8, port: u16) void {
@@ -311,8 +307,7 @@ pub fn outb(value: u8, port: u16) void {
         :
         : [value] "{al}" (value),
           [port] "{dx}" (port),
-        : .{.dx = true}
-    );
+        : .{ .dx = true });
 }
 
 pub fn inw(port: u16) u16 {
@@ -320,8 +315,7 @@ pub fn inw(port: u16) u16 {
         \\inw %[port], %[ret]
         : [ret] "={ax}" (-> u16),
         : [port] "{dx}" (port),
-        : .{.dx = true}
-    );
+        : .{ .dx = true });
 }
 
 pub fn outw(value: u16, port: u16) void {
@@ -330,8 +324,7 @@ pub fn outw(value: u16, port: u16) void {
         :
         : [value] "{ax}" (value),
           [port] "{dx}" (port),
-        : .{.dx = true}
-    );
+        : .{ .dx = true });
 }
 
 pub fn ind(port: u16) u32 {
@@ -339,8 +332,7 @@ pub fn ind(port: u16) u32 {
         \\inl %[port], %[ret]
         : [ret] "={eax}" (-> u32),
         : [port] "{dx}" (port),
-        : .{.dx = true}
-    );
+        : .{ .dx = true });
 }
 
 pub fn outd(value: u32, port: u16) void {
@@ -349,8 +341,7 @@ pub fn outd(value: u32, port: u16) void {
         :
         : [value] "{eax}" (value),
           [port] "{dx}" (port),
-        : .{.dx = true}
-    );
+        : .{ .dx = true });
 }
 
 pub fn lgdt(desc: *const anyopaque) void {
@@ -373,7 +364,7 @@ pub fn ltr(sel: u16) void {
 pub fn lidt(desc: *const anyopaque) void {
     asm volatile ("lidt (%[ptr])"
         :
-        : [ptr] "r" (desc)
+        : [ptr] "r" (desc),
     );
 }
 

@@ -89,7 +89,9 @@ pub fn setup(wan_device_handle: u64, lan_device_handle: u64) ?DmaRegion {
 
     // Map into our address space
     const vm_rights = (perms.VmReservationRights{
-        .read = true, .write = true, .shareable = true,
+        .read = true,
+        .write = true,
+        .shareable = true,
     }).bits();
     const vm = syscall.vm_reserve(0, TOTAL_SIZE, vm_rights);
     if (vm.val < 0) {
@@ -140,7 +142,9 @@ pub fn setupWan(wan_device_handle: u64, lan_device_handle: ?u64) ?DmaRegion {
     if (shm_handle <= 0) return null;
 
     const vm_rights = (perms.VmReservationRights{
-        .read = true, .write = true, .shareable = true,
+        .read = true,
+        .write = true,
+        .shareable = true,
     }).bits();
     const vm = syscall.vm_reserve(0, TOTAL_SIZE, vm_rights);
     if (vm.val < 0) return null;

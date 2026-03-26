@@ -228,4 +228,3 @@ pub fn invalidateIotlb() void {
         if (val & (@as(u64, 1) << 63) == 0) break;
     }
 }
-

@@ -14,7 +14,10 @@ fn testKillMultiThreadChild() void {
     const child_elf = embedded.child_multithread;
     const child_rights = (perms.ProcessRights{ .spawn_thread = true }).bits();
     const proc_handle = syscall.proc_create(@intFromPtr(child_elf.ptr), child_elf.len, child_rights);
-    if (proc_handle <= 0) { t.failWithVal("proc_create failed", 1, proc_handle); return; }
+    if (proc_handle <= 0) {
+        t.failWithVal("proc_create failed", 1, proc_handle);
+        return;
+    }
     syscall.thread_yield();
     const rc = syscall.revoke_perm(@intCast(proc_handle));
     t.expectEqual("S2.6: revoke kills all threads in child process", 0, rc);

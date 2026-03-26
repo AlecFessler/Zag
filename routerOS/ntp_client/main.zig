@@ -68,7 +68,9 @@ pub fn main(perm_view_addr: u64) void {
     }
 
     const vm_rights = (perms.VmReservationRights{
-        .read = true, .write = true, .shareable = true,
+        .read = true,
+        .write = true,
+        .shareable = true,
     }).bits();
     const vm_result = syscall.vm_reserve(0, data_shm_size, vm_rights);
     if (vm_result.val < 0) {
@@ -128,7 +130,9 @@ fn detectConsoleChannel(view: *const [MAX_PERMS]pv.UserViewEntry) void {
                 continue;
             }
             const vm_rights = (perms.VmReservationRights{
-                .read = true, .write = true, .shareable = true,
+                .read = true,
+                .write = true,
+                .shareable = true,
             }).bits();
             const vm = syscall.vm_reserve(0, e.field0, vm_rights);
             if (vm.val >= 0) {
@@ -317,15 +321,30 @@ fn appendDateTime(buf: []u8, start: usize, timestamp: u64) usize {
     const day = days + 1;
 
     p += appendDec4(buf[p..], year);
-    if (p < buf.len) { buf[p] = '-'; p += 1; }
+    if (p < buf.len) {
+        buf[p] = '-';
+        p += 1;
+    }
     p += appendDec2(buf[p..], month);
-    if (p < buf.len) { buf[p] = '-'; p += 1; }
+    if (p < buf.len) {
+        buf[p] = '-';
+        p += 1;
+    }
     p += appendDec2(buf[p..], day);
-    if (p < buf.len) { buf[p] = ' '; p += 1; }
+    if (p < buf.len) {
+        buf[p] = ' ';
+        p += 1;
+    }
     p += appendDec2(buf[p..], hours);
-    if (p < buf.len) { buf[p] = ':'; p += 1; }
+    if (p < buf.len) {
+        buf[p] = ':';
+        p += 1;
+    }
     p += appendDec2(buf[p..], mins);
-    if (p < buf.len) { buf[p] = ':'; p += 1; }
+    if (p < buf.len) {
+        buf[p] = ':';
+        p += 1;
+    }
     p += appendDec2(buf[p..], secs);
     return p;
 }
@@ -381,7 +400,10 @@ fn appendStr(buf: []u8, start: usize, s: []const u8) usize {
 fn appendIp(buf: []u8, start: usize, ip: [4]u8) usize {
     var p = start;
     for (ip, 0..) |octet, i| {
-        if (i > 0 and p < buf.len) { buf[p] = '.'; p += 1; }
+        if (i > 0 and p < buf.len) {
+            buf[p] = '.';
+            p += 1;
+        }
         p = appendDecU8(buf, p, octet);
     }
     return p;
@@ -389,9 +411,18 @@ fn appendIp(buf: []u8, start: usize, ip: [4]u8) usize {
 
 fn appendDecU8(buf: []u8, start: usize, val: u8) usize {
     var p = start;
-    if (val >= 100 and p < buf.len) { buf[p] = '0' + val / 100; p += 1; }
-    if (val >= 10 and p < buf.len) { buf[p] = '0' + (val / 10) % 10; p += 1; }
-    if (p < buf.len) { buf[p] = '0' + val % 10; p += 1; }
+    if (val >= 100 and p < buf.len) {
+        buf[p] = '0' + val / 100;
+        p += 1;
+    }
+    if (val >= 10 and p < buf.len) {
+        buf[p] = '0' + (val / 10) % 10;
+        p += 1;
+    }
+    if (p < buf.len) {
+        buf[p] = '0' + val % 10;
+        p += 1;
+    }
     return p;
 }
 

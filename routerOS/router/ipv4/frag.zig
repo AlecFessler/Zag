@@ -16,8 +16,13 @@ pub const FragEntry = struct {
 };
 
 pub const empty = FragEntry{
-    .valid = false, .src_ip = .{ 0, 0, 0, 0 }, .dst_ip = .{ 0, 0, 0, 0 },
-    .ip_id = 0, .protocol = 0, .first_frag_sport = 0, .timestamp_ns = 0,
+    .valid = false,
+    .src_ip = .{ 0, 0, 0, 0 },
+    .dst_ip = .{ 0, 0, 0, 0 },
+    .ip_id = 0,
+    .protocol = 0,
+    .first_frag_sport = 0,
+    .timestamp_ns = 0,
 };
 
 pub fn learn(table: *[TABLE_SIZE]FragEntry, src_ip: [4]u8, dst_ip: [4]u8, ip_id: u16, protocol: u8, sport: u16) void {
@@ -29,13 +34,11 @@ pub fn learn(table: *[TABLE_SIZE]FragEntry, src_ip: [4]u8, dst_ip: [4]u8, ip_id:
     }
     for (table) |*f| {
         if (!f.valid) {
-            f.* = .{ .valid = true, .src_ip = src_ip, .dst_ip = dst_ip,
-                .ip_id = ip_id, .protocol = protocol, .first_frag_sport = sport, .timestamp_ns = util.now() };
+            f.* = .{ .valid = true, .src_ip = src_ip, .dst_ip = dst_ip, .ip_id = ip_id, .protocol = protocol, .first_frag_sport = sport, .timestamp_ns = util.now() };
             return;
         }
     }
-    table[0] = .{ .valid = true, .src_ip = src_ip, .dst_ip = dst_ip,
-        .ip_id = ip_id, .protocol = protocol, .first_frag_sport = sport, .timestamp_ns = util.now() };
+    table[0] = .{ .valid = true, .src_ip = src_ip, .dst_ip = dst_ip, .ip_id = ip_id, .protocol = protocol, .first_frag_sport = sport, .timestamp_ns = util.now() };
 }
 
 pub fn lookup(table: *[TABLE_SIZE]FragEntry, src_ip: [4]u8, ip_id: u16) ?u16 {

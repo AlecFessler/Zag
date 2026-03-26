@@ -18,8 +18,13 @@ pub const DnsRelay = struct {
 };
 
 pub const empty = DnsRelay{
-    .valid = false, .client_ip = .{ 0, 0, 0, 0 }, .client_mac = .{ 0, 0, 0, 0, 0, 0 },
-    .client_port = 0, .query_id = 0, .relay_id = 0, .timestamp_ns = 0,
+    .valid = false,
+    .client_ip = .{ 0, 0, 0, 0 },
+    .client_mac = .{ 0, 0, 0, 0, 0, 0 },
+    .client_port = 0,
+    .query_id = 0,
+    .relay_id = 0,
+    .timestamp_ns = 0,
 };
 
 pub fn handleFromLan(pkt: []u8, len: u32) void {

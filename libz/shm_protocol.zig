@@ -142,7 +142,10 @@ pub fn mapCommandChannel(perm_view_addr: u64) ?*CommandChannel {
     if (shm_handle == 0 or shm_size < COMMAND_SHM_SIZE) return null;
 
     const vm_rights = (perms.VmReservationRights{
-        .read = true, .write = true, .execute = true, .shareable = true,
+        .read = true,
+        .write = true,
+        .execute = true,
+        .shareable = true,
     }).bits();
     const vm_result = syscall.vm_reserve(0, shm_size, vm_rights);
     if (vm_result.val < 0) return null;

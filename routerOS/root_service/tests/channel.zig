@@ -25,16 +25,23 @@ pub fn run() void {
 }
 
 fn testSendRecvRoundTrip() void {
-    const base = allocPage() orelse { t.fail("channel: alloc failed"); return; };
+    const base = allocPage() orelse {
+        t.fail("channel: alloc failed");
+        return;
+    };
     const header: *channel_mod.ChannelHeader = @ptrCast(@alignCast(base));
 
     var a = channel_mod.Channel.initAsSideA(header, syscall.PAGE4K);
     var b = channel_mod.Channel.openAsSideB(header) orelse {
-        t.fail("channel: side B open failed"); return;
+        t.fail("channel: side B open failed");
+        return;
     };
 
     const msg = "hello channel";
-    if (!a.send(msg)) { t.fail("channel: send failed"); return; }
+    if (!a.send(msg)) {
+        t.fail("channel: send failed");
+        return;
+    }
 
     var buf: [64]u8 = undefined;
     if (b.recv(&buf)) |len| {
@@ -49,17 +56,24 @@ fn testSendRecvRoundTrip() void {
 }
 
 fn testMultipleMessagesFIFO() void {
-    const base = allocPage() orelse { t.fail("channel multi: alloc failed"); return; };
+    const base = allocPage() orelse {
+        t.fail("channel multi: alloc failed");
+        return;
+    };
     const header: *channel_mod.ChannelHeader = @ptrCast(@alignCast(base));
 
     var a = channel_mod.Channel.initAsSideA(header, syscall.PAGE4K);
     var b = channel_mod.Channel.openAsSideB(header) orelse {
-        t.fail("channel multi: open failed"); return;
+        t.fail("channel multi: open failed");
+        return;
     };
 
     const msgs = [_][]const u8{ "first", "second message", "3", "four!!" };
     for (msgs) |msg| {
-        if (!a.send(msg)) { t.fail("channel multi: send failed"); return; }
+        if (!a.send(msg)) {
+            t.fail("channel multi: send failed");
+            return;
+        }
     }
 
     var buf: [64]u8 = undefined;
@@ -84,12 +98,16 @@ fn testMultipleMessagesFIFO() void {
 }
 
 fn testEmptyRecvReturnsNull() void {
-    const base = allocPage() orelse { t.fail("channel empty: alloc failed"); return; };
+    const base = allocPage() orelse {
+        t.fail("channel empty: alloc failed");
+        return;
+    };
     const header: *channel_mod.ChannelHeader = @ptrCast(@alignCast(base));
 
     _ = channel_mod.Channel.initAsSideA(header, syscall.PAGE4K);
     var b = channel_mod.Channel.openAsSideB(header) orelse {
-        t.fail("channel empty: open failed"); return;
+        t.fail("channel empty: open failed");
+        return;
     };
 
     var buf: [64]u8 = undefined;
@@ -101,12 +119,16 @@ fn testEmptyRecvReturnsNull() void {
 }
 
 fn testRingWrapAround() void {
-    const base = allocPage() orelse { t.fail("channel wrap: alloc failed"); return; };
+    const base = allocPage() orelse {
+        t.fail("channel wrap: alloc failed");
+        return;
+    };
     const header: *channel_mod.ChannelHeader = @ptrCast(@alignCast(base));
 
     var a = channel_mod.Channel.initAsSideA(header, syscall.PAGE4K);
     var b = channel_mod.Channel.openAsSideB(header) orelse {
-        t.fail("channel wrap: open failed"); return;
+        t.fail("channel wrap: open failed");
+        return;
     };
 
     var buf: [256]u8 = undefined;
@@ -114,7 +136,10 @@ fn testRingWrapAround() void {
     var ok = true;
     var i: u32 = 0;
     while (i < 20) : (i += 1) {
-        if (!a.send(payload)) { ok = false; break; }
+        if (!a.send(payload)) {
+            ok = false;
+            break;
+        }
         if (b.recv(&buf)) |len| {
             if (len != payload.len or !std.mem.eql(u8, buf[0..len], payload)) {
                 ok = false;
@@ -134,7 +159,10 @@ fn testRingWrapAround() void {
 }
 
 fn testChannelMagicValidation() void {
-    const base = allocPage() orelse { t.fail("channel magic: alloc failed"); return; };
+    const base = allocPage() orelse {
+        t.fail("channel magic: alloc failed");
+        return;
+    };
     const header: *channel_mod.ChannelHeader = @ptrCast(@alignCast(base));
     header.magic = 0;
 
@@ -146,16 +174,26 @@ fn testChannelMagicValidation() void {
 }
 
 fn testBidirectional() void {
-    const base = allocPage() orelse { t.fail("channel bidi: alloc failed"); return; };
+    const base = allocPage() orelse {
+        t.fail("channel bidi: alloc failed");
+        return;
+    };
     const header: *channel_mod.ChannelHeader = @ptrCast(@alignCast(base));
 
     var a = channel_mod.Channel.initAsSideA(header, syscall.PAGE4K);
     var b = channel_mod.Channel.openAsSideB(header) orelse {
-        t.fail("channel bidi: open failed"); return;
+        t.fail("channel bidi: open failed");
+        return;
     };
 
-    if (!a.send("from A")) { t.fail("channel bidi: A send failed"); return; }
-    if (!b.send("from B")) { t.fail("channel bidi: B send failed"); return; }
+    if (!a.send("from A")) {
+        t.fail("channel bidi: A send failed");
+        return;
+    }
+    if (!b.send("from B")) {
+        t.fail("channel bidi: B send failed");
+        return;
+    }
 
     var buf: [64]u8 = undefined;
     var ok = true;

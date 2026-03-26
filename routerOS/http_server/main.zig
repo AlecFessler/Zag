@@ -66,7 +66,9 @@ pub fn main(perm_view_addr: u64) void {
     }
 
     const vm_rights = (perms.VmReservationRights{
-        .read = true, .write = true, .shareable = true,
+        .read = true,
+        .write = true,
+        .shareable = true,
     }).bits();
     const vm_result = syscall.vm_reserve(0, data_shm_size, vm_rights);
     if (vm_result.val < 0) {

@@ -37,7 +37,7 @@ pub const PageAllocator = struct {
         ret_addr: u64,
     ) ?[*]u8 {
         _ = ret_addr;
-        const self: *PageAllocator = @alignCast(@ptrCast(ptr));
+        const self: *PageAllocator = @ptrCast(@alignCast(ptr));
         const align_bytes = alignment.toByteUnits();
 
         std.debug.assert(len > 0);

@@ -29,4 +29,3 @@ pub fn ticksFromNanosCeil(freq_hz: u64, ns: u64) u64 {
     const wide: u128 = @as(u128, freq_hz) * ns + ONE_BILLION_NS - 1;
     return @truncate(wide / ONE_BILLION_NS);
 }
-

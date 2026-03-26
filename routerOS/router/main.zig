@@ -454,12 +454,24 @@ fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
             const udp_start = 14 + ip_hdr_len;
             if (udp_start + 4 <= len) {
                 const udp_dst = util.readU16Be(pkt[udp_start + 2 ..][0..2]);
-                if (udp_dst == 68 and role == .wan) { dhcp_client.handleResponse(pkt, len); return .consumed; }
-                if (udp_dst == 67 and role == .lan) { dhcp_server.handle(pkt, len); return .consumed; }
-                if (udp_dst == dns.DNS_PORT and role == .lan) { dns.handleFromLan(pkt, len); return .consumed; }
+                if (udp_dst == 68 and role == .wan) {
+                    dhcp_client.handleResponse(pkt, len);
+                    return .consumed;
+                }
+                if (udp_dst == 67 and role == .lan) {
+                    dhcp_server.handle(pkt, len);
+                    return .consumed;
+                }
+                if (udp_dst == dns.DNS_PORT and role == .lan) {
+                    dns.handleFromLan(pkt, len);
+                    return .consumed;
+                }
                 if (role == .wan) {
                     const udp_src_port = util.readU16Be(pkt[udp_start..][0..2]);
-                    if (udp_src_port == dns.DNS_PORT) { dns.handleFromWan(pkt, len); return .consumed; }
+                    if (udp_src_port == dns.DNS_PORT) {
+                        dns.handleFromWan(pkt, len);
+                        return .consumed;
+                    }
                 }
                 if (udp_start + 8 <= len) {
                     var src_ip_udp: [4]u8 = undefined;
@@ -525,24 +537,37 @@ fn detectAppChannels(view: *const [MAX_PERMS]pv.UserViewEntry, mapped_handles: *
     for (view) |*entry| {
         if (entry.entry_type != pv.ENTRY_TYPE_SHARED_MEMORY or entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) continue;
         var is_known = false;
-        for (mapped_handles[0..mapped_count.*]) |kh| { if (kh == entry.handle) { is_known = true; break; } }
+        for (mapped_handles[0..mapped_count.*]) |kh| {
+            if (kh == entry.handle) {
+                is_known = true;
+                break;
+            }
+        }
         if (is_known) continue;
         const vm_rights = (perms.VmReservationRights{ .read = true, .write = true, .shareable = true }).bits();
         const vm = syscall.vm_reserve(0, entry.field0, vm_rights);
         if (vm.val < 0) continue;
         if (syscall.shm_map(entry.handle, @intCast(vm.val), 0) != 0) continue;
         const hdr: *channel_mod.ChannelHeader = @ptrFromInt(vm.val2);
-        if (mapped_count.* < mapped_handles.len) { mapped_handles[mapped_count.*] = entry.handle; mapped_count.* += 1; }
+        if (mapped_count.* < mapped_handles.len) {
+            mapped_handles[mapped_count.*] = entry.handle;
+            mapped_count.* += 1;
+        }
         var ch = channel_mod.Channel.openAsSideA(hdr) orelse continue;
         var id_buf: [4]u8 = undefined;
         var attempts: u32 = 0;
         while (attempts < 100) : (attempts += 1) {
             if (ch.recv(&id_buf)) |id_len| {
                 if (id_len >= 1) {
-                    if (id_buf[0] == shm_protocol.ServiceId.NFS_CLIENT and nfs_chan == null) { nfs_chan = ch; }
-                    else if (id_buf[0] == shm_protocol.ServiceId.NTP_CLIENT and ntp_chan == null) { ntp_chan = ch; }
-                    else if (id_buf[0] == shm_protocol.ServiceId.HTTP_SERVER and http_chan == null) { http_chan = ch; }
-                    else if (id_buf[0] == shm_protocol.ServiceId.CONSOLE and console_chan == null) { console_chan = ch; }
+                    if (id_buf[0] == shm_protocol.ServiceId.NFS_CLIENT and nfs_chan == null) {
+                        nfs_chan = ch;
+                    } else if (id_buf[0] == shm_protocol.ServiceId.NTP_CLIENT and ntp_chan == null) {
+                        ntp_chan = ch;
+                    } else if (id_buf[0] == shm_protocol.ServiceId.HTTP_SERVER and http_chan == null) {
+                        http_chan = ch;
+                    } else if (id_buf[0] == shm_protocol.ServiceId.CONSOLE and console_chan == null) {
+                        console_chan = ch;
+                    }
                 }
                 break;
             }
@@ -553,7 +578,10 @@ fn detectAppChannels(view: *const [MAX_PERMS]pv.UserViewEntry, mapped_handles: *
 }
 
 pub fn main(perm_view_addr: u64) void {
-    const cmd = shm_protocol.mapCommandChannel(perm_view_addr) orelse { syscall.write("router: no cmd ch\n"); return; };
+    const cmd = shm_protocol.mapCommandChannel(perm_view_addr) orelse {
+        syscall.write("router: no cmd ch\n");
+        return;
+    };
     _ = cmd;
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
     perm_view = view;
@@ -566,10 +594,16 @@ pub fn main(perm_view_addr: u64) void {
             nics = findNicDevices(perm_view_addr);
         }
     }
-    const wan_nic = nics.wan orelse { syscall.write("router: no WAN\n"); return; };
+    const wan_nic = nics.wan orelse {
+        syscall.write("router: no WAN\n");
+        return;
+    };
 
     const wan_mmio_size = if (wan_nic.mmio_size == 0) syscall.PAGE4K else wan_nic.mmio_size;
-    const wan_mmio = mmioMap(wan_nic.handle, wan_mmio_size) orelse { syscall.write("router: WAN MMIO fail\n"); return; };
+    const wan_mmio = mmioMap(wan_nic.handle, wan_mmio_size) orelse {
+        syscall.write("router: WAN MMIO fail\n");
+        return;
+    };
 
     // DMA setup — create SHM, map WAN, optionally also map LAN
     const lan_handle: ?u64 = if (nics.lan) |ln| ln.handle else null;
@@ -604,7 +638,10 @@ pub fn main(perm_view_addr: u64) void {
         .tx_bufs_dma_base = region.wanDma(dma.WAN_TX_BUFS_OFF),
         .rx_descs = region.wanRxDescs(),
         .tx_descs = region.wanTxDescs(),
-    })) { syscall.write("router: e1000 init fail\n"); return; }
+    })) {
+        syscall.write("router: e1000 init fail\n");
+        return;
+    }
 
     _ = syscall.pci_enable_bus_master(wan_nic.handle);
     wan_iface.mac = e1000.readMac(wan_mmio);
@@ -1060,7 +1097,6 @@ fn serviceThread() void {
     var mapped_count: u32 = 0;
     var loop_n: u32 = 0;
 
-    // Demand-paged arena for buffers — avoids stack overflow.
     var svc_arena = Arena.init(1 << 30) orelse return;
     const a = svc_arena.allocator();
 

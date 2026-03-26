@@ -74,18 +74,27 @@ fn testSerialPortPresent(perm_view_addr: u64) void {
 
 fn testMmioMapUnmap(perm_view_addr: u64) void {
     const dev_entry = findMmioDevice(perm_view_addr) orelse {
-        t.fail("no MMIO device for map/unmap test"); return;
+        t.fail("no MMIO device for map/unmap test");
+        return;
     };
     const dev_size: u64 = dev_entry.deviceSizeOrPortCount();
     const map_size = if (dev_size > 0) ((dev_size + syscall.PAGE4K - 1) / syscall.PAGE4K) * syscall.PAGE4K else syscall.PAGE4K;
     const vm_rights = (perms.VmReservationRights{
-        .read = true, .write = true, .mmio = true,
+        .read = true,
+        .write = true,
+        .mmio = true,
     }).bits();
     const vm_result = syscall.vm_reserve(0, map_size, vm_rights);
-    if (vm_result.val < 0) { t.fail("setup failed"); return; }
+    if (vm_result.val < 0) {
+        t.fail("setup failed");
+        return;
+    }
     const vm_handle: u64 = @intCast(vm_result.val);
     const map_rc = syscall.mmio_map(dev_entry.handle, vm_handle, 0);
-    if (map_rc != 0) { t.failWithVal("mmio_map failed", 0, map_rc); return; }
+    if (map_rc != 0) {
+        t.failWithVal("mmio_map failed", 0, map_rc);
+        return;
+    }
     t.pass("S2.2.mmio_map: PCI device mapped into reservation");
     const unmap_rc = syscall.mmio_unmap(dev_entry.handle, vm_handle);
     t.expectEqual("S2.2.mmio_unmap: unbinds MMIO mapping", 0, unmap_rc);
@@ -93,54 +102,76 @@ fn testMmioMapUnmap(perm_view_addr: u64) void {
 
 fn testMmioMapInvalidDevice() void {
     const vm_rights = (perms.VmReservationRights{
-        .read = true, .write = true, .mmio = true,
+        .read = true,
+        .write = true,
+        .mmio = true,
     }).bits();
     const vm_result = syscall.vm_reserve(0, syscall.PAGE4K, vm_rights);
-    if (vm_result.val < 0) { t.fail("setup failed"); return; }
+    if (vm_result.val < 0) {
+        t.fail("setup failed");
+        return;
+    }
     const rc = syscall.mmio_map(99999, @intCast(vm_result.val), 0);
     t.expectEqual("S4.mmio_map: invalid device handle returns E_BADCAP", -3, rc);
 }
 
 fn testMmioMapNoMmioRight(perm_view_addr: u64) void {
     const dev_entry = findMmioDevice(perm_view_addr) orelse {
-        t.fail("no MMIO device"); return;
+        t.fail("no MMIO device");
+        return;
     };
     const vm_rights = (perms.VmReservationRights{ .read = true, .write = true }).bits();
     const vm_result = syscall.vm_reserve(0, syscall.PAGE4K, vm_rights);
-    if (vm_result.val < 0) { t.fail("setup failed"); return; }
+    if (vm_result.val < 0) {
+        t.fail("setup failed");
+        return;
+    }
     const rc = syscall.mmio_map(dev_entry.handle, @intCast(vm_result.val), 0);
     t.expectEqual("S4.mmio_map: mmio/R/W not in max_rights returns E_PERM", -2, rc);
 }
 
 fn testMmioUnmapNotFound(perm_view_addr: u64) void {
     const dev_entry = findMmioDevice(perm_view_addr) orelse {
-        t.fail("no MMIO device"); return;
+        t.fail("no MMIO device");
+        return;
     };
     const vm_rights = (perms.VmReservationRights{
-        .read = true, .write = true, .mmio = true,
+        .read = true,
+        .write = true,
+        .mmio = true,
     }).bits();
     const vm_result = syscall.vm_reserve(0, syscall.PAGE4K, vm_rights);
-    if (vm_result.val < 0) { t.fail("setup failed"); return; }
+    if (vm_result.val < 0) {
+        t.fail("setup failed");
+        return;
+    }
     const rc = syscall.mmio_unmap(dev_entry.handle, @intCast(vm_result.val));
     t.expectEqual("S4.mmio_unmap: no prior map returns E_NOENT", -10, rc);
 }
 
 fn testMmioMapPortIoDevice(perm_view_addr: u64) void {
     const serial_entry = findSerialDevice(perm_view_addr) orelse {
-        t.fail("no serial device for port_io guard test"); return;
+        t.fail("no serial device for port_io guard test");
+        return;
     };
     const vm_rights = (perms.VmReservationRights{
-        .read = true, .write = true, .mmio = true,
+        .read = true,
+        .write = true,
+        .mmio = true,
     }).bits();
     const vm_result = syscall.vm_reserve(0, syscall.PAGE4K, vm_rights);
-    if (vm_result.val < 0) { t.fail("setup failed"); return; }
+    if (vm_result.val < 0) {
+        t.fail("setup failed");
+        return;
+    }
     const rc = syscall.mmio_map(serial_entry.handle, @intCast(vm_result.val), 0);
     t.expectEqual("S4.mmio_map: port_io device rejected for mmio_map (E_INVAL)", -1, rc);
 }
 
 fn testIoportReadSerial(perm_view_addr: u64) void {
     const serial_entry = findSerialDevice(perm_view_addr) orelse {
-        t.fail("no serial device for ioport_read test"); return;
+        t.fail("no serial device for ioport_read test");
+        return;
     };
     const rc = syscall.ioport_read(serial_entry.handle, 5, 1);
     if (rc >= 0) {
@@ -152,10 +183,14 @@ fn testIoportReadSerial(perm_view_addr: u64) void {
 
 fn testIoportWriteReadScratch(perm_view_addr: u64) void {
     const serial_entry = findSerialDevice(perm_view_addr) orelse {
-        t.fail("no serial device for scratch test"); return;
+        t.fail("no serial device for scratch test");
+        return;
     };
     const write_rc = syscall.ioport_write(serial_entry.handle, 7, 1, 0xA5);
-    if (write_rc != 0) { t.failWithVal("scratch write failed", 0, write_rc); return; }
+    if (write_rc != 0) {
+        t.failWithVal("scratch write failed", 0, write_rc);
+        return;
+    }
     const read_rc = syscall.ioport_read(serial_entry.handle, 7, 1);
     if (read_rc == 0xA5) {
         t.pass("S4.ioport_write+read: scratch register round-trip works");
@@ -172,7 +207,8 @@ fn testIoportBadHandle() void {
 
 fn testIoportBadWidth(perm_view_addr: u64) void {
     const serial_entry = findSerialDevice(perm_view_addr) orelse {
-        t.fail("no serial device"); return;
+        t.fail("no serial device");
+        return;
     };
     const rc = syscall.ioport_read(serial_entry.handle, 0, 3);
     t.expectEqual("S4.ioport_read: width=3 returns E_INVAL", -1, rc);
@@ -180,7 +216,8 @@ fn testIoportBadWidth(perm_view_addr: u64) void {
 
 fn testIoportBadOffset(perm_view_addr: u64) void {
     const serial_entry = findSerialDevice(perm_view_addr) orelse {
-        t.fail("no serial device"); return;
+        t.fail("no serial device");
+        return;
     };
     const rc = syscall.ioport_read(serial_entry.handle, 100, 1);
     t.expectEqual("S4.ioport_read: offset > port_count returns E_INVAL", -1, rc);
@@ -188,24 +225,32 @@ fn testIoportBadOffset(perm_view_addr: u64) void {
 
 fn testDmaMapBadHandle() void {
     const shm = syscall.shm_create(syscall.PAGE4K);
-    if (shm <= 0) { t.fail("setup failed"); return; }
+    if (shm <= 0) {
+        t.fail("setup failed");
+        return;
+    }
     const rc = syscall.dma_map(99999, @intCast(shm));
     t.expectEqual("S4.dma_map: invalid device handle returns E_BADCAP", -3, rc);
 }
 
 fn testDmaMapPortIoDevice(perm_view_addr: u64) void {
     const serial_entry = findSerialDevice(perm_view_addr) orelse {
-        t.fail("no serial device for dma test"); return;
+        t.fail("no serial device for dma test");
+        return;
     };
     const shm = syscall.shm_create(syscall.PAGE4K);
-    if (shm <= 0) { t.fail("setup failed"); return; }
+    if (shm <= 0) {
+        t.fail("setup failed");
+        return;
+    }
     const rc = syscall.dma_map(serial_entry.handle, @intCast(shm));
     t.expectEqual("S4.dma_map: port_io device rejected (E_INVAL)", -1, rc);
 }
 
 fn testIoportReadWidth2(perm_view_addr: u64) void {
     const serial_entry = findSerialDevice(perm_view_addr) orelse {
-        t.fail("no serial device"); return;
+        t.fail("no serial device");
+        return;
     };
     const rc = syscall.ioport_read(serial_entry.handle, 0, 2);
     if (rc >= 0) {

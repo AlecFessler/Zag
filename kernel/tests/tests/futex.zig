@@ -60,7 +60,10 @@ fn testFutexTimeoutZeroTryOnly() void {
 fn testFutexCrossThreadSignal() void {
     @as(*volatile u64, &thread_signal).* = 0;
     const rc = syscall.thread_create(&signalThread, 0, 4);
-    if (rc != 0) { t.failWithVal("thread_create failed", 0, rc); return; }
+    if (rc != 0) {
+        t.failWithVal("thread_create failed", 0, rc);
+        return;
+    }
     t.waitUntilNonZero(@as(*volatile u64, &thread_signal));
     t.pass("S2.5: cross-thread futex_wake unblocks futex_wait");
 }
@@ -102,7 +105,10 @@ fn testFutexTimedWaitWokenBeforeTimeout() void {
     @as(*volatile u64, &timed_wake_ready).* = 0;
     timed_wake_result = 0;
     const rc = syscall.thread_create(&timedWaitThread, 0, 4);
-    if (rc != 0) { t.failWithVal("thread_create failed", 0, rc); return; }
+    if (rc != 0) {
+        t.failWithVal("thread_create failed", 0, rc);
+        return;
+    }
 
     t.waitUntilNonZero(@as(*volatile u64, &timed_wake_ready));
 

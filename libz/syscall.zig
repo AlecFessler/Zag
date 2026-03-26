@@ -38,8 +38,7 @@ fn syscall0(num: SyscallNum) i64 {
     return asm volatile ("int $0x80"
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(num)),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }
-    );
+        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
 }
 
 fn syscall1(num: SyscallNum, a0: u64) i64 {
@@ -47,8 +46,7 @@ fn syscall1(num: SyscallNum, a0: u64) i64 {
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(num)),
           [a0] "{rdi}" (a0),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }
-    );
+        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
 }
 
 fn syscall2(num: SyscallNum, a0: u64, a1: u64) i64 {
@@ -57,8 +55,7 @@ fn syscall2(num: SyscallNum, a0: u64, a1: u64) i64 {
         : [num] "{rax}" (@intFromEnum(num)),
           [a0] "{rdi}" (a0),
           [a1] "{rsi}" (a1),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }
-    );
+        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
 }
 
 fn syscall3(num: SyscallNum, a0: u64, a1: u64, a2: u64) i64 {
@@ -69,8 +66,7 @@ fn syscall3(num: SyscallNum, a0: u64, a1: u64, a2: u64) i64 {
           [a0] "{rdi}" (a0),
           [a1] "{rsi}" (a1),
           [a2] "{rdx}" (a2),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }
-    );
+        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
 }
 
 fn syscall4(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64) i64 {
@@ -82,8 +78,7 @@ fn syscall4(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64) i64 {
           [a1] "{rsi}" (a1),
           [a2] "{rdx}" (a2),
           [a3] "{r10}" (a3),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }
-    );
+        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
 }
 
 fn syscall3_2(num: SyscallNum, a0: u64, a1: u64, a2: u64) SyscallResult2 {
@@ -95,8 +90,7 @@ fn syscall3_2(num: SyscallNum, a0: u64, a1: u64, a2: u64) SyscallResult2 {
           [a0] "{rdi}" (a0),
           [a1] "{rsi}" (a1),
           [a2] "{rdx}" (a2),
-        : .{ .rcx = true, .r11 = true, .memory = true }
-    );
+        : .{ .rcx = true, .r11 = true, .memory = true });
     return .{ .val = val, .val2 = val2 };
 }
 
@@ -209,4 +203,3 @@ pub fn dma_unmap(device_handle: u64, shm_handle: u64) i64 {
 pub fn pin_exclusive() i64 {
     return syscall0(.pin_exclusive);
 }
-

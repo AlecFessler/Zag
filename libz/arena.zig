@@ -46,7 +46,7 @@ pub const Arena = struct {
         ret_addr: u64,
     ) ?[*]u8 {
         _ = ret_addr;
-        const self: *Arena = @alignCast(@ptrCast(ptr));
+        const self: *Arena = @ptrCast(@alignCast(ptr));
 
         const aligned = std.mem.alignForward(
             u64,

@@ -176,7 +176,8 @@ pub fn build(b: *std.Build) void {
         \\-no-shutdown \
         \\-D qemu.log
     ;
-    const qemu_machine_args: []const u8 = \\-machine q35
+    const qemu_machine_args: []const u8 = 
+        \\-machine q35
     ;
     const qemu_iommu_args: []const u8 = if (std.mem.eql(u8, iommu_type, "intel"))
         \\-device intel-iommu,intremap=off

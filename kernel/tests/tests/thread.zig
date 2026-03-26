@@ -25,7 +25,10 @@ pub fn run() void {
 fn testThreadCreate() void {
     @as(*volatile u64, &thread_ran).* = 0;
     const rc = syscall.thread_create(&threadEntry, 0, 4);
-    if (rc != 0) { t.failWithVal("thread_create failed", 0, rc); return; }
+    if (rc != 0) {
+        t.failWithVal("thread_create failed", 0, rc);
+        return;
+    }
     t.waitUntilNonZero(@as(*volatile u64, &thread_ran));
     t.pass("S2.4: thread_create enqueues new thread; child ran");
 }

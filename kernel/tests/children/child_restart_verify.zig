@@ -39,7 +39,10 @@ pub fn main(perm_view_addr: u64) void {
     if (shm_handle == 0 or shm_size == 0) return;
 
     const vm_rights = (perms.VmReservationRights{
-        .read = true, .write = true, .execute = true, .shareable = true,
+        .read = true,
+        .write = true,
+        .execute = true,
+        .shareable = true,
     }).bits();
     const vm_result = syscall.vm_reserve(0, shm_size, vm_rights);
     if (vm_result.val < 0) return;

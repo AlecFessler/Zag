@@ -22,7 +22,10 @@ fn testReserveBasic() void {
 fn testPermsChange() void {
     const rights = (perms.VmReservationRights{ .read = true, .write = true }).bits();
     const result = syscall.vm_reserve(0, 4 * syscall.PAGE4K, rights);
-    if (result.val < 0) { t.fail("setup failed"); return; }
+    if (result.val < 0) {
+        t.fail("setup failed");
+        return;
+    }
     const handle: u64 = @intCast(result.val);
     const ro = (perms.VmReservationRights{ .read = true }).bits();
     const rc = syscall.vm_perms(handle, syscall.PAGE4K, 2 * syscall.PAGE4K, ro);
@@ -32,7 +35,10 @@ fn testPermsChange() void {
 fn testPermsExceedMax() void {
     const rights = (perms.VmReservationRights{ .read = true }).bits();
     const result = syscall.vm_reserve(0, syscall.PAGE4K, rights);
-    if (result.val < 0) { t.fail("setup failed"); return; }
+    if (result.val < 0) {
+        t.fail("setup failed");
+        return;
+    }
     const handle: u64 = @intCast(result.val);
     const rw = (perms.VmReservationRights{ .read = true, .write = true }).bits();
     const rc = syscall.vm_perms(handle, 0, syscall.PAGE4K, rw);
@@ -42,14 +48,20 @@ fn testPermsExceedMax() void {
 fn testMergeSplitRestore() void {
     const rights = (perms.VmReservationRights{ .read = true, .write = true }).bits();
     const result = syscall.vm_reserve(0, 4 * syscall.PAGE4K, rights);
-    if (result.val < 0) { t.fail("setup failed"); return; }
+    if (result.val < 0) {
+        t.fail("setup failed");
+        return;
+    }
     const handle: u64 = @intCast(result.val);
     const base = result.val2;
     const ro = (perms.VmReservationRights{ .read = true }).bits();
     const rc1 = syscall.vm_perms(handle, syscall.PAGE4K, 2 * syscall.PAGE4K, ro);
     const rw = (perms.VmReservationRights{ .read = true, .write = true }).bits();
     const rc2 = syscall.vm_perms(handle, syscall.PAGE4K, 2 * syscall.PAGE4K, rw);
-    if (rc1 != 0 or rc2 != 0) { t.fail("S2.2: split/merge perms call failed"); return; }
+    if (rc1 != 0 or rc2 != 0) {
+        t.fail("S2.2: split/merge perms call failed");
+        return;
+    }
     const p0: *volatile u8 = @ptrFromInt(base);
     p0.* = 42;
     const p1: *volatile u8 = @ptrFromInt(base + syscall.PAGE4K);
@@ -68,17 +80,26 @@ fn testMergeSplitRestore() void {
 fn testDecommit() void {
     const rights = (perms.VmReservationRights{ .read = true, .write = true }).bits();
     const result = syscall.vm_reserve(0, syscall.PAGE4K, rights);
-    if (result.val < 0) { t.fail("setup failed"); return; }
+    if (result.val < 0) {
+        t.fail("setup failed");
+        return;
+    }
     const handle: u64 = @intCast(result.val);
     const base = result.val2;
     const ptr: *volatile u64 = @ptrFromInt(base);
     ptr.* = 0xCAFEBABE;
     const zero = (perms.VmReservationRights{}).bits();
     const rc1 = syscall.vm_perms(handle, 0, syscall.PAGE4K, zero);
-    if (rc1 != 0) { t.fail("S2.2: decommit perms(0) failed"); return; }
+    if (rc1 != 0) {
+        t.fail("S2.2: decommit perms(0) failed");
+        return;
+    }
     const rw = (perms.VmReservationRights{ .read = true, .write = true }).bits();
     const rc2 = syscall.vm_perms(handle, 0, syscall.PAGE4K, rw);
-    if (rc2 != 0) { t.fail("S2.2: recommit perms(RW) failed"); return; }
+    if (rc2 != 0) {
+        t.fail("S2.2: recommit perms(RW) failed");
+        return;
+    }
     if (ptr.* == 0) {
         t.pass("S2.2: RWX=0 decommits; recommit demand-pages zeroed page");
     } else {

@@ -208,7 +208,9 @@ pub fn isMulticast6(ip6: [16]u8) bool {
 }
 
 pub fn isAllZeros(data: []const u8) bool {
-    for (data) |b| { if (b != 0) return false; }
+    for (data) |b| {
+        if (b != 0) return false;
+    }
     return true;
 }
 

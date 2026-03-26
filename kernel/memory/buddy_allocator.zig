@@ -206,7 +206,7 @@ pub const BuddyAllocator = struct {
         _ = alignment;
         _ = ret_addr;
         std.debug.assert(len % PAGE_SIZE == 0);
-        const self: *BuddyAllocator = @alignCast(@ptrCast(ptr));
+        const self: *BuddyAllocator = @ptrCast(@alignCast(ptr));
 
         const num_pages = len / PAGE_SIZE;
         const order: u4 = @intCast(@ctz(num_pages));
@@ -256,7 +256,7 @@ pub const BuddyAllocator = struct {
     ) void {
         _ = alignment;
         _ = ret_addr;
-        const self: *BuddyAllocator = @alignCast(@ptrCast(ptr));
+        const self: *BuddyAllocator = @ptrCast(@alignCast(ptr));
         const addr = @intFromPtr(buf.ptr);
         const result = self.recursiveMerge(addr);
         self.bitmap.setBit(result.addr, 1);

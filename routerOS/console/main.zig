@@ -40,7 +40,9 @@ fn mapDataChannel(perm_view_addr: u64, cmd_shm_size: u64) ?*channel_mod.ChannelH
     if (best_handle == 0) return null;
 
     const vm_rights = (perms.VmReservationRights{
-        .read = true, .write = true, .shareable = true,
+        .read = true,
+        .write = true,
+        .shareable = true,
     }).bits();
     const vm_result = syscall.vm_reserve(0, best_size, vm_rights);
     if (vm_result.val < 0) return null;
@@ -368,7 +370,10 @@ fn autoLoadConfig() void {
     attempts = 0;
     while (attempts < 50_000) : (attempts += 1) {
         if (nfs_chan.recv(&resp)) |len| {
-            if (len == 0) { mounted = true; break; }
+            if (len == 0) {
+                mounted = true;
+                break;
+            }
             if (len >= 5) {
                 if (containsStr(resp[0..len], "mounted") or containsStr(resp[0..len], "OK")) {
                     mounted = true;
@@ -701,7 +706,9 @@ pub fn main(perm_view_addr: u64) void {
     }
 
     const serial_vm_rights = (perms.VmReservationRights{
-        .read = true, .write = true, .shareable = true,
+        .read = true,
+        .write = true,
+        .shareable = true,
     }).bits();
     const serial_vm = syscall.vm_reserve(0, shm_sizes[0], serial_vm_rights);
     if (serial_vm.val < 0) return;

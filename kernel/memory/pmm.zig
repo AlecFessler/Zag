@@ -22,7 +22,7 @@ const PerCorePageCache = struct {
     count: u32 = 0,
 
     fn push(self: *PerCorePageCache, ptr: [*]u8) void {
-        const node: *PageNode = @alignCast(@ptrCast(ptr));
+        const node: *PageNode = @ptrCast(@alignCast(ptr));
         node.next = self.head;
         self.head = node;
         self.count += 1;
@@ -66,7 +66,7 @@ pub const PhysicalMemoryManager = struct {
         alignment: std.mem.Alignment,
         ret_addr: usize,
     ) ?[*]u8 {
-        const self: *PhysicalMemoryManager = @alignCast(@ptrCast(ptr));
+        const self: *PhysicalMemoryManager = @ptrCast(@alignCast(ptr));
 
         if (len == paging.PAGE4K and sched.initialized) {
             const irq = arch.saveAndDisableInterrupts();
@@ -90,7 +90,7 @@ pub const PhysicalMemoryManager = struct {
                 return single;
             };
 
-            const buddy: *BuddyAllocator = @alignCast(@ptrCast(self.backing_allocator.ptr));
+            const buddy: *BuddyAllocator = @ptrCast(@alignCast(self.backing_allocator.ptr));
             var batch = buddy.splitAllocation(@intFromPtr(bulk), 0);
             self.lock.unlock();
 
@@ -114,7 +114,7 @@ pub const PhysicalMemoryManager = struct {
         alignment: std.mem.Alignment,
         ret_addr: usize,
     ) void {
-        const self: *PhysicalMemoryManager = @alignCast(@ptrCast(ptr));
+        const self: *PhysicalMemoryManager = @ptrCast(@alignCast(ptr));
 
         // only touch per core cache if the scheduler has been fully initialized (ie, system is fully booted)
         // otherwise arch.coreID() will access an array that is undefined
@@ -179,7 +179,6 @@ pub const PhysicalMemoryManager = struct {
         _ = ret_addr;
         unreachable;
     }
-
 };
 
 pub var global_pmm: ?PhysicalMemoryManager = null;

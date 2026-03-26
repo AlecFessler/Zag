@@ -18,31 +18,55 @@ fn testShmCreateBasic() void {
 
 fn testShmMapWriteReadUnmap() void {
     const shm_handle = syscall.shm_create(syscall.PAGE4K);
-    if (shm_handle < 0) { t.fail("setup failed"); return; }
+    if (shm_handle < 0) {
+        t.fail("setup failed");
+        return;
+    }
     const vm_rights = (perms.VmReservationRights{
-        .read = true, .write = true, .execute = true, .shareable = true,
+        .read = true,
+        .write = true,
+        .execute = true,
+        .shareable = true,
     }).bits();
     const vm_result = syscall.vm_reserve(0, syscall.PAGE4K, vm_rights);
-    if (vm_result.val < 0) { t.fail("setup failed"); return; }
+    if (vm_result.val < 0) {
+        t.fail("setup failed");
+        return;
+    }
     const vm_handle: u64 = @intCast(vm_result.val);
     const base = vm_result.val2;
     const map_rc = syscall.shm_map(@intCast(shm_handle), vm_handle, 0);
-    if (map_rc != 0) { t.failWithVal("shm_map failed", 0, map_rc); return; }
+    if (map_rc != 0) {
+        t.failWithVal("shm_map failed", 0, map_rc);
+        return;
+    }
     const ptr: *volatile u64 = @ptrFromInt(base);
     ptr.* = 0xDEADBEEF;
-    if (ptr.* != 0xDEADBEEF) { t.fail("write/read through SHM failed"); return; }
+    if (ptr.* != 0xDEADBEEF) {
+        t.fail("write/read through SHM failed");
+        return;
+    }
     const unmap_rc = syscall.shm_unmap(@intCast(shm_handle), vm_handle);
     t.expectEqual("S2.2.shm_map: eagerly maps all pages; unmap succeeds", 0, unmap_rc);
 }
 
 fn testShmUnmapRestoresPrivateAccess() void {
     const shm_handle = syscall.shm_create(syscall.PAGE4K);
-    if (shm_handle < 0) { t.fail("setup failed"); return; }
+    if (shm_handle < 0) {
+        t.fail("setup failed");
+        return;
+    }
     const vm_rights = (perms.VmReservationRights{
-        .read = true, .write = true, .execute = true, .shareable = true,
+        .read = true,
+        .write = true,
+        .execute = true,
+        .shareable = true,
     }).bits();
     const vm_result = syscall.vm_reserve(0, 2 * syscall.PAGE4K, vm_rights);
-    if (vm_result.val < 0) { t.fail("setup failed"); return; }
+    if (vm_result.val < 0) {
+        t.fail("setup failed");
+        return;
+    }
     const vm_handle: u64 = @intCast(vm_result.val);
     const base = vm_result.val2;
     _ = syscall.shm_map(@intCast(shm_handle), vm_handle, 0);

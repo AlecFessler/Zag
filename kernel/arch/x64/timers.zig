@@ -179,7 +179,7 @@ pub const Hpet = struct {
     }
 
     fn now(ctx: *anyopaque) u64 {
-        const self: *Hpet = @alignCast(@ptrCast(ctx));
+        const self: *Hpet = @ptrCast(@alignCast(ctx));
         return timer_mod.nanosFromTicksFloor(self.freq_hz, self.main_counter_val.val);
     }
 };
@@ -273,7 +273,7 @@ pub const Lapic = struct {
     }
 
     fn armInterruptTimer(ctx: *anyopaque, timer_val_ns: u64) void {
-        const self: *Lapic = @alignCast(@ptrCast(ctx));
+        const self: *Lapic = @ptrCast(@alignCast(ctx));
 
         const eff_hz: u64 = self.freq_hz / self.divider;
         var ticks: u64 = timer_mod.ticksFromNanosCeil(eff_hz, timer_val_ns);
@@ -339,14 +339,14 @@ pub const Tsc = struct {
     }
 
     fn armInterruptTimer(ctx: *anyopaque, timer_val_ns: u64) void {
-        const self: *Tsc = @alignCast(@ptrCast(ctx));
+        const self: *Tsc = @ptrCast(@alignCast(ctx));
         const delta_ticks: u64 = timer_mod.ticksFromNanosCeil(self.freq_hz, timer_val_ns);
         const now_ticks: u64 = cpu.rdtscp();
         apic.armTscDeadline(now_ticks + delta_ticks);
     }
 
     fn now(ctx: *anyopaque) u64 {
-        const self: *Tsc = @alignCast(@ptrCast(ctx));
+        const self: *Tsc = @ptrCast(@alignCast(ctx));
         return timer_mod.nanosFromTicksFloor(self.freq_hz, cpu.rdtscp());
     }
 };

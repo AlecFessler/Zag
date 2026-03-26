@@ -31,7 +31,7 @@ pub fn IntrusiveFreeList(
 
         pub fn push(self: *Self, addr: T) void {
             zeroItem(@ptrCast(addr));
-            const node: *FreeNode = @alignCast(@ptrCast(addr));
+            const node: *FreeNode = @ptrCast(@alignCast(addr));
 
             if (DBG) node.dbg_magic = DBG_MAGIC;
             if (using_popSpecific) {
@@ -64,13 +64,13 @@ pub fn IntrusiveFreeList(
             }
 
             zeroItem(@ptrCast(addr));
-            return @alignCast(@ptrCast(addr));
+            return @ptrCast(@alignCast(addr));
         }
 
         pub fn popSpecific(self: *Self, addr: T) ?T {
             if (!using_popSpecific) @compileError("must set using_popSpecific flag on the IntrusiveFreelist type to call popSpecific()");
 
-            const node: *FreeNode = @alignCast(@ptrCast(addr));
+            const node: *FreeNode = @ptrCast(@alignCast(addr));
             if (link_to_base) {
                 _ = node.base;
             }
@@ -98,7 +98,7 @@ pub fn IntrusiveFreeList(
             }
 
             zeroItem(@ptrCast(node));
-            return @alignCast(@ptrCast(node));
+            return @ptrCast(@alignCast(node));
         }
 
         fn zeroItem(item: [*]u8) void {
@@ -168,8 +168,8 @@ test "popSpecific() works for start, middle, and end" {
 
     try std.testing.expect(freelist.popSpecific(&b).? == &b);
 
-    const node_c: *FreeNode = @alignCast(@ptrCast(&c));
-    const node_a: *FreeNode = @alignCast(@ptrCast(&a));
+    const node_c: *FreeNode = @ptrCast(@alignCast(&c));
+    const node_a: *FreeNode = @ptrCast(@alignCast(&a));
     try std.testing.expect(node_c.next == node_a);
     try std.testing.expect(node_c.next.?.prev == node_c);
 

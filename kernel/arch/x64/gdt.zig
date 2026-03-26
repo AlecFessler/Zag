@@ -198,8 +198,7 @@ pub fn reloadSegments() void {
         :
         : [cs_sel] "i" (KERNEL_CODE_OFFSET),
           [ds_sel] "i" (KERNEL_DATA_OFFSET),
-        : .{ .rax = true, .ax = true, .memory = true }
-    );
+        : .{ .rax = true, .ax = true, .memory = true });
 }
 
 fn writeTssDescriptor(core_id: u64) void {

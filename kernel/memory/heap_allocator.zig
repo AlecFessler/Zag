@@ -63,7 +63,7 @@ pub const HeapAllocator = struct {
     ) ?[*]u8 {
         _ = ret_addr;
 
-        const self: *HeapAllocator = @alignCast(@ptrCast(ptr));
+        const self: *HeapAllocator = @ptrCast(@alignCast(ptr));
 
         std.debug.assert(std.mem.isAligned(self.commit_end, HEADER_ALIGN));
 
@@ -373,7 +373,7 @@ pub const HeapAllocator = struct {
         _ = alignment;
         _ = ret_addr;
 
-        const self: *HeapAllocator = @alignCast(@ptrCast(ptr));
+        const self: *HeapAllocator = @ptrCast(@alignCast(ptr));
 
         const user_base: u64 = @intCast(@intFromPtr(buf.ptr));
         const padding_base = user_base - PADDING_SIZE;

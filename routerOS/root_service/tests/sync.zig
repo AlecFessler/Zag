@@ -71,7 +71,10 @@ fn testMutexContended() void {
 
     const rc1 = syscall.thread_create(&incrementThread, 0, 4);
     const rc2 = syscall.thread_create(&incrementThread, 0, 4);
-    if (rc1 != 0 or rc2 != 0) { t.fail("mutex contended: thread_create failed"); return; }
+    if (rc1 != 0 or rc2 != 0) {
+        t.fail("mutex contended: thread_create failed");
+        return;
+    }
 
     while (@atomicLoad(u64, &done_flag, .acquire) < 2) {
         _ = syscall.futex_wait(&done_flag, @atomicLoad(u64, &done_flag, .acquire), @bitCast(@as(i64, -1)));
@@ -92,7 +95,10 @@ fn testCondvarSignal() void {
     condvar = sync.Condvar.init();
 
     const rc = syscall.thread_create(&condvarWaiterThread, 0, 4);
-    if (rc != 0) { t.fail("condvar: thread_create failed"); return; }
+    if (rc != 0) {
+        t.fail("condvar: thread_create failed");
+        return;
+    }
 
     syscall.thread_yield();
     syscall.thread_yield();
@@ -114,7 +120,10 @@ fn testSemaphoreBlocking() void {
     @as(*volatile u64, &sem_received).* = 0;
 
     const rc = syscall.thread_create(&semWaiterThread, 0, 4);
-    if (rc != 0) { t.fail("semaphore blocking: thread_create failed"); return; }
+    if (rc != 0) {
+        t.fail("semaphore blocking: thread_create failed");
+        return;
+    }
 
     syscall.thread_yield();
     syscall.thread_yield();
