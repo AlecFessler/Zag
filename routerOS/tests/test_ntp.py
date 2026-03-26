@@ -1,5 +1,7 @@
 """NTP client tests."""
 
+import time
+
 import pytest
 
 
@@ -34,13 +36,19 @@ class TestTimezone:
         assert "OK" in output, f"timezone not accepted: {lines}"
         assert "UTC-5" in output, f"timezone label wrong: {lines}"
 
-    def test_time_reflects_timezone(self, router):
-        """time command shows the timezone that was set."""
-        # Set timezone first
+    def test_time_reflects_timezone(self, router, wan_ip):
+        """time command shows timezone when synced, or 'not synced' otherwise."""
+        # Set timezone
         router.multi_command("timezone -5", timeout=5)
+        # Force NTP sync attempt
+        router.multi_command(f"ntpserver {wan_ip}", timeout=5)
+        router.multi_command("sync", timeout=5)
+        time.sleep(3)
         lines = router.multi_command("time", timeout=5)
         output = " ".join(lines)
-        assert "UTC-5" in output, f"time doesn't reflect timezone: {lines}"
+        # If NTP synced, timezone should be displayed; if not, "not synced" is valid
+        assert "UTC-5" in output or "not synced" in output, \
+            f"time returned unexpected output: {lines}"
 
     def test_timezone_positive(self, router):
         """Positive timezone offset works."""

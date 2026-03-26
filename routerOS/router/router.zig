@@ -1,5 +1,6 @@
 pub const ipv4 = @import("ipv4/ipv4.zig");
 pub const ipv6 = @import("ipv6/ipv6.zig");
+pub const log = @import("log.zig");
 pub const net = @import("net/net.zig");
 pub const services = @import("services/services.zig");
 pub const util = @import("util.zig");

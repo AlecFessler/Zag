@@ -1,6 +1,7 @@
 const router = @import("router");
 
 const h = router.net.headers;
+const log = router.log;
 const main = router.state;
 const util = router.util;
 
@@ -111,7 +112,7 @@ pub fn sendSolicit() void {
     _ = ifc.txSendLocal(pkt[0..total_len]);
     main.dhcpv6_state = .soliciting;
     main.dhcpv6_start_ns = util.now();
-    util.logEvent("dhcpv6: sent SOLICIT\n");
+    log.write(.dhcpv6_sent_solicit);
 }
 
 /// Handle DHCPv6 response (Advertise or Reply).
@@ -162,7 +163,7 @@ pub fn handleResponse(pkt: []const u8, len: u32) void {
     }
 
     if (msg_type == ADVERTISE and main.dhcpv6_state == .soliciting) {
-        util.logEvent("dhcpv6: received ADVERTISE\n");
+        log.write(.dhcpv6_received_advertise);
         sendRequest();
     } else if (msg_type == REPLY and (main.dhcpv6_state == .requesting or main.dhcpv6_state == .bound)) {
         main.dhcpv6_state = .bound;
@@ -186,7 +187,7 @@ pub fn handleResponse(pkt: []const u8, len: u32) void {
             main.lan_iface.ip6_global_valid = true;
         }
 
-        util.logEvent("dhcpv6: bound, prefix delegated\n");
+        log.write(.dhcpv6_bound_prefix);
     }
 }
 
@@ -248,7 +249,7 @@ fn sendRequest() void {
     _ = ifc.txSendLocal(pkt[0..pos]);
     main.dhcpv6_state = .requesting;
     main.dhcpv6_start_ns = util.now();
-    util.logEvent("dhcpv6: sent REQUEST\n");
+    log.write(.dhcpv6_sent_request);
 }
 
 pub fn tick() void {
@@ -258,7 +259,7 @@ pub fn tick() void {
         if (main.delegated_prefix.valid_lifetime_ns > 0) {
             const t1 = main.delegated_prefix.valid_lifetime_ns / 2;
             if (now -% main.delegated_prefix.bound_ns > t1) {
-                util.logEvent("dhcpv6: T1 renewal\n");
+                log.write(.dhcpv6_t1_renewal);
                 main.dhcpv6_xid +%= 1;
                 sendRequest();
             }
@@ -267,7 +268,7 @@ pub fn tick() void {
     }
     if (main.dhcpv6_state == .idle) return;
     if (now -% main.dhcpv6_start_ns > 10_000_000_000) {
-        util.logEvent("dhcpv6: timeout, retrying\n");
+        log.write(.dhcpv6_timeout_retry);
         main.dhcpv6_xid +%= 1;
         sendSolicit();
     }

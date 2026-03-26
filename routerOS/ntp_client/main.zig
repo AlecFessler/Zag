@@ -12,6 +12,7 @@ const MSG_UDP_SEND: u8 = 0x01;
 const MSG_UDP_RECV: u8 = 0x02;
 const MSG_UDP_BIND: u8 = 0x03;
 const MSG_SET_TIMEZONE: u8 = 0x04;
+const MSG_TIME_SYNC: u8 = 0x11;
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -158,6 +159,26 @@ fn sendUdpBind(port: u16) void {
     _ = router_chan.send(&msg);
 }
 
+fn sendTimeSync(unix_secs: u64, mono_ns: u64) void {
+    // [0] = MSG_TIME_SYNC, [1..9] = unix_secs BE, [9..17] = mono_ns BE
+    var msg: [17]u8 = undefined;
+    msg[0] = MSG_TIME_SYNC;
+    writeU64Be(msg[1..9], unix_secs);
+    writeU64Be(msg[9..17], mono_ns);
+    _ = router_chan.send(&msg);
+}
+
+fn writeU64Be(buf: *[8]u8, val: u64) void {
+    buf[0] = @truncate(val >> 56);
+    buf[1] = @truncate(val >> 48);
+    buf[2] = @truncate(val >> 40);
+    buf[3] = @truncate(val >> 32);
+    buf[4] = @truncate(val >> 24);
+    buf[5] = @truncate(val >> 16);
+    buf[6] = @truncate(val >> 8);
+    buf[7] = @truncate(val);
+}
+
 fn sendUdpPacket(dst_ip: [4]u8, dst_port: u16, src_port: u16, payload: []const u8) void {
     var msg: [256]u8 = undefined;
     const total = 9 + payload.len;
@@ -204,6 +225,9 @@ fn handleNtpResponse(payload: []const u8) void {
     sync_mono_ns = now();
     synced = true;
     sync_pending = false;
+
+    // Send time sync to router for log timestamps
+    sendTimeSync(unix_timestamp, sync_mono_ns);
 
     // Send result to console if connected
     var buf: [80]u8 = undefined;

@@ -1,6 +1,7 @@
 const router = @import("router");
 
 const h = router.net.headers;
+const log = router.log;
 const main = router.state;
 const util = router.util;
 
@@ -71,7 +72,7 @@ pub fn sendDiscover() void {
     _ = main.wan_iface.txSendLocal(pkt[0..send_len]);
     main.dhcp_client_state = .discovering;
     main.dhcp_client_start_ns = util.now();
-    util.logEvent("dhcp-client: sent DISCOVER on WAN\n");
+    log.write(.dhcp_sent_discover);
 }
 
 pub fn sendRequest() void {
@@ -143,7 +144,7 @@ pub fn sendRequest() void {
     _ = main.wan_iface.txSendLocal(pkt[0..send_len]);
     main.dhcp_client_state = .requesting;
     main.dhcp_client_start_ns = util.now();
-    util.logEvent("dhcp-client: sent REQUEST on WAN\n");
+    log.write(.dhcp_sent_request);
 }
 
 pub fn sendRebind() void {
@@ -212,7 +213,7 @@ pub fn sendRebind() void {
     _ = main.wan_iface.txSendLocal(pkt[0..send_len]);
     main.dhcp_client_state = .rebinding;
     main.dhcp_client_start_ns = util.now();
-    util.logEvent("dhcp-client: sent REBIND on WAN\n");
+    log.write(.dhcp_sent_rebind);
 }
 
 pub fn handleResponse(pkt: []const u8, len: u32) void {
@@ -269,12 +270,7 @@ pub fn handleResponse(pkt: []const u8, len: u32) void {
     }
 
     if (msg_type == DHCP_OFFER and main.dhcp_client_state == .discovering) {
-        var buf: [64]u8 = undefined;
-        var pos: usize = 0;
-        pos = util.appendStr(&buf, pos, "dhcp-client: offered ");
-        pos = util.appendIp(&buf, pos, main.dhcp_offered_ip);
-        pos = util.appendStr(&buf, pos, "\n");
-        util.logEvent(buf[0..pos]);
+        log.writeWithIp(.dhcp_offered, main.dhcp_offered_ip);
         sendRequest();
     } else if (msg_type == DHCP_ACK and (main.dhcp_client_state == .requesting or main.dhcp_client_state == .rebinding)) {
         main.wan_iface.ip = main.dhcp_offered_ip;
@@ -283,12 +279,7 @@ pub fn handleResponse(pkt: []const u8, len: u32) void {
         if (lease_time_secs > 0) {
             main.dhcp_client_lease_time_ns = @as(u64, lease_time_secs) * 1_000_000_000;
         }
-        var buf: [64]u8 = undefined;
-        var pos: usize = 0;
-        pos = util.appendStr(&buf, pos, "dhcp-client: bound to ");
-        pos = util.appendIp(&buf, pos, main.wan_iface.ip);
-        pos = util.appendStr(&buf, pos, "\n");
-        util.logEvent(buf[0..pos]);
+        log.writeWithIp(.dhcp_bound, main.wan_iface.ip);
     }
 }
 
@@ -298,7 +289,7 @@ pub fn tick() void {
         // T1 renewal at 50% of lease time
         const t1 = main.dhcp_client_lease_time_ns / 2;
         if (now -| main.dhcp_client_bound_ns > t1) {
-            util.logEvent("dhcp-client: T1 renewal\n");
+            log.write(.dhcp_t1_renewal);
             main.dhcp_client_xid +%= 1;
             sendRequest();
             main.dhcp_client_state = .requesting;
@@ -310,14 +301,14 @@ pub fn tick() void {
         // T2 rebind at 87.5% of lease time
         const t2 = main.dhcp_client_lease_time_ns / 8 * 7;
         if (now -| main.dhcp_client_bound_ns > t2) {
-            util.logEvent("dhcp-client: T2 rebind\n");
+            log.write(.dhcp_t2_rebind);
             main.dhcp_client_xid +%= 1;
             sendRebind();
             return;
         }
         // Retry unicast request every 10s
         if (now -| main.dhcp_client_start_ns > 10_000_000_000) {
-            util.logEvent("dhcp-client: timeout, retrying request\n");
+            log.write(.dhcp_timeout_request);
             main.dhcp_client_xid +%= 1;
             sendRequest();
             main.dhcp_client_start_ns = now;
@@ -327,14 +318,14 @@ pub fn tick() void {
     if (main.dhcp_client_state == .rebinding) {
         // Lease expired — restart from scratch
         if (now -| main.dhcp_client_bound_ns > main.dhcp_client_lease_time_ns) {
-            util.logEvent("dhcp-client: lease expired, restarting\n");
+            log.write(.dhcp_lease_expired);
             main.dhcp_client_xid +%= 1;
             sendDiscover();
             return;
         }
         // Retry rebind every 10s
         if (now -| main.dhcp_client_start_ns > 10_000_000_000) {
-            util.logEvent("dhcp-client: timeout, retrying rebind\n");
+            log.write(.dhcp_timeout_rebind);
             main.dhcp_client_xid +%= 1;
             sendRebind();
         }
@@ -343,7 +334,7 @@ pub fn tick() void {
     if (main.dhcp_client_state == .idle) return;
     // Timeout for discover — retry after 10s
     if (now -| main.dhcp_client_start_ns > 10_000_000_000) {
-        util.logEvent("dhcp-client: timeout, retrying\n");
+        log.write(.dhcp_timeout_retry);
         main.dhcp_client_xid +%= 1;
         sendDiscover();
     }

@@ -15,6 +15,7 @@ const syscall = lib.syscall;
 const MSG_UDP_SEND: u8 = 0x01;
 const MSG_UDP_RECV: u8 = 0x02;
 const MSG_UDP_BIND: u8 = 0x03;
+const MSG_LOG_WRITE: u8 = 0x10;
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -83,6 +84,17 @@ var rename_from_name_buf: [256]u8 = undefined;
 var rename_from_name_len: usize = 0;
 var rename_dst_buf: [256]u8 = undefined;
 var rename_dst_len: usize = 0;
+
+// ── Log file state ──────────────────────────────────────────────────
+var log_fh: nfs3.FileHandle = .{};
+var log_fh_valid: bool = false;
+var log_write_offset: u64 = 0;
+var log_pending_data: [2048]u8 = undefined;
+var log_pending_len: usize = 0;
+var log_setup_done: bool = false;
+var log_dir_fh: nfs3.FileHandle = .{};
+var log_dir_created: bool = false;
+const LOG_ROTATE_SIZE: u64 = 256 * 1024; // 256 KB
 
 // Retry state
 var retry_buf: [2048]u8 = undefined;
@@ -180,7 +192,49 @@ pub fn main(perm_view_addr: u64) void {
         }
 
         checkTimeout();
+        processLogQueue();
         syscall.thread_yield();
+    }
+}
+
+fn processLogQueue() void {
+    if (!mounted or state != .mounted) return;
+    if (log_pending_len == 0) return;
+
+    if (!log_setup_done) {
+        // Step 1: Create the logs/ directory
+        if (!log_dir_created) {
+            pending_op = .log_mkdir;
+            request_source = .router;
+            sendMkdir(&root_fh, "logs");
+            return;
+        }
+        // Step 2: Create the log file
+        pending_op = .log_create;
+        request_source = .router;
+        sendCreate(&log_dir_fh, "router.log");
+        return;
+    }
+
+    // Check for rotation
+    if (log_write_offset >= LOG_ROTATE_SIZE) {
+        // Rotate: rename router.log -> router.log.1, then create new
+        pending_op = .log_mkdir; // reuse mkdir op to trigger rename chain
+        request_source = .router;
+        sendRename(&log_dir_fh, "router.log", &log_dir_fh, "router.log.1");
+        log_fh_valid = false;
+        log_setup_done = false;
+        log_dir_created = true; // dir already exists
+        return;
+    }
+
+    // Write pending log data
+    if (log_fh_valid and log_pending_len > 0) {
+        pending_op = .log_write;
+        request_source = .router;
+        sendWrite(&log_fh, log_write_offset, log_pending_data[0..log_pending_len]);
+        log_write_offset += log_pending_len;
+        log_pending_len = 0;
     }
 }
 
@@ -359,8 +413,32 @@ fn handleRouterMessage(data: []const u8) void {
     if (data.len < 1) return;
     switch (data[0]) {
         MSG_UDP_RECV => handleUdpRecv(data),
+        MSG_LOG_WRITE => handleLogWrite(data),
         else => {},
     }
+}
+
+fn handleLogWrite(data: []const u8) void {
+    if (data.len < 3) return;
+    const data_len: usize = @as(usize, data[1]) << 8 | data[2];
+    if (data.len < 3 + data_len) return;
+
+    // Buffer the log data (overwrite if previous still pending)
+    const copy_len = @min(data_len, log_pending_data.len);
+    @memcpy(log_pending_data[0..copy_len], data[3..][0..copy_len]);
+    log_pending_len = copy_len;
+}
+
+fn sendLookupForLogDir() void {
+    // mkdir failed (dir may already exist), try lookup instead
+    pending_op = .log_mkdir;
+    sendLookup(&root_fh, "logs");
+}
+
+fn handleLogDirLookupResult(fh: nfs3.FileHandle) void {
+    log_dir_fh = fh;
+    log_dir_created = true;
+    state = .mounted;
 }
 
 fn handleUdpRecv(data: []const u8) void {
@@ -388,13 +466,23 @@ fn handleNfsReply(payload: []const u8) void {
         },
         .lookup_pending => {
             if (nfs3.parseLookupReply(payload, pending_xid)) |fh| {
-                current_fh = fh;
-                lookup_depth += 1;
-                continueAfterLookup();
+                if (pending_op == .log_mkdir) {
+                    // Lookup for log directory after mkdir failed
+                    handleLogDirLookupResult(fh);
+                } else {
+                    current_fh = fh;
+                    lookup_depth += 1;
+                    continueAfterLookup();
+                }
             } else {
-                sendResponse("NFS: lookup failed\n");
-                sendEof();
-                state = .mounted;
+                if (pending_op == .log_mkdir) {
+                    syscall.write("nfs_client: log dir lookup failed\n");
+                    state = .mounted;
+                } else {
+                    sendResponse("NFS: lookup failed\n");
+                    sendEof();
+                    state = .mounted;
+                }
             }
         },
         .read_pending => {
@@ -447,7 +535,18 @@ fn handleNfsReply(payload: []const u8) void {
             }
         },
         .create_pending => {
-            if (nfs3.parseCreateReply(payload, pending_xid)) |fh| {
+            if (pending_op == .log_create) {
+                if (nfs3.parseCreateReply(payload, pending_xid)) |fh| {
+                    log_fh = fh;
+                    log_fh_valid = true;
+                    log_write_offset = 0;
+                    log_setup_done = true;
+                    syscall.write("nfs_client: log file created\n");
+                } else {
+                    syscall.write("nfs_client: log file create failed\n");
+                }
+                state = .mounted;
+            } else if (nfs3.parseCreateReply(payload, pending_xid)) |fh| {
                 if (pending_op == .touch_op) {
                     // touch: commit immediately, no write data prompt
                     write_fh = fh;
@@ -466,24 +565,43 @@ fn handleNfsReply(payload: []const u8) void {
             }
         },
         .write_pending => {
-            if (nfs3.parseWriteReply(payload, pending_xid)) |bytes_written| {
-                write_offset += bytes_written;
-                awaiting_write_data = true;
+            if (pending_op == .log_write) {
+                if (nfs3.parseWriteReply(payload, pending_xid) == null) {
+                    syscall.write("nfs_client: log write failed\n");
+                }
                 state = .mounted;
             } else {
-                sendResponse("NFS: write failed\n");
-                awaiting_write_data = false;
-                state = .mounted;
+                if (nfs3.parseWriteReply(payload, pending_xid)) |bytes_written| {
+                    write_offset += bytes_written;
+                    awaiting_write_data = true;
+                    state = .mounted;
+                } else {
+                    sendResponse("NFS: write failed\n");
+                    awaiting_write_data = false;
+                    state = .mounted;
+                }
             }
         },
         .mkdir_pending => {
-            if (nfs3.parseMkdirReply(payload, pending_xid) != null) {
-                sendResponse("OK\n");
+            if (pending_op == .log_mkdir) {
+                if (nfs3.parseMkdirReply(payload, pending_xid)) |fh| {
+                    log_dir_fh = fh;
+                    log_dir_created = true;
+                } else {
+                    // Directory may already exist -- try lookup instead
+                    sendLookupForLogDir();
+                    return;
+                }
+                state = .mounted;
             } else {
-                sendResponse("NFS: mkdir failed\n");
+                if (nfs3.parseMkdirReply(payload, pending_xid) != null) {
+                    sendResponse("OK\n");
+                } else {
+                    sendResponse("NFS: mkdir failed\n");
+                }
+                sendEof();
+                state = .mounted;
             }
-            sendEof();
-            state = .mounted;
         },
         .remove_pending => {
             if (nfs3.parseRemoveReply(payload, pending_xid)) {
@@ -504,13 +622,24 @@ fn handleNfsReply(payload: []const u8) void {
             state = .mounted;
         },
         .rename_pending => {
-            if (nfs3.parseRenameReply(payload, pending_xid)) {
-                sendResponse("OK\n");
+            if (pending_op == .log_mkdir) {
+                // Log rotation rename completed (reusing log_mkdir for rename state)
+                if (nfs3.parseRenameReply(payload, pending_xid)) {
+                    syscall.write("nfs_client: log rotated\n");
+                } else {
+                    syscall.write("nfs_client: log rotate failed\n");
+                }
+                // processLogQueue will create new file on next iteration
+                state = .mounted;
             } else {
-                sendResponse("NFS: rename failed\n");
+                if (nfs3.parseRenameReply(payload, pending_xid)) {
+                    sendResponse("OK\n");
+                } else {
+                    sendResponse("NFS: rename failed\n");
+                }
+                sendEof();
+                state = .mounted;
             }
-            sendEof();
-            state = .mounted;
         },
         .getattr_pending => {
             if (nfs3.parseGetAttrReply(payload, pending_xid)) |attr| {
@@ -581,6 +710,7 @@ fn continueAfterLookup() void {
     const target_depth: u32 = switch (pending_op) {
         .create, .mkdir_op, .remove, .rmdir_op, .rename_src, .rename_dst, .touch_op => if (num_components > 1) num_components - 1 else 0,
         .read, .readdir, .stat_op => num_components,
+        .log_mkdir, .log_create, .log_write => 0, // log ops don't use lookup chain
     };
     if (lookup_depth < target_depth) {
         sendLookup(&current_fh, getComponent(lookup_depth));
@@ -670,7 +800,7 @@ fn handleCommand(data: []const u8, source: RequestSource) void {
 }
 
 // Operation tracking for lookup chains
-var pending_op: enum { read, readdir, create, mkdir_op, remove, rmdir_op, rename_src, rename_dst, stat_op, touch_op } = .read;
+var pending_op: enum { read, readdir, create, mkdir_op, remove, rmdir_op, rename_src, rename_dst, stat_op, touch_op, log_mkdir, log_create, log_write } = .read;
 
 fn startLookupChainForOp(path: []const u8, op: @TypeOf(pending_op)) void {
     pending_op = op;
@@ -681,6 +811,7 @@ fn startLookupChainForOp(path: []const u8, op: @TypeOf(pending_op)) void {
     const target_depth: u32 = switch (op) {
         .create, .mkdir_op, .remove, .rmdir_op, .rename_src, .rename_dst, .touch_op => if (num_components > 1) num_components - 1 else 0,
         .read, .readdir, .stat_op => num_components,
+        .log_mkdir, .log_create, .log_write => 0,
     };
 
     if (target_depth == 0) {
@@ -754,6 +885,7 @@ fn finishLookupChain() void {
         .stat_op => {
             sendGetAttr(&current_fh);
         },
+        .log_mkdir, .log_create, .log_write => {},
     }
 }
 

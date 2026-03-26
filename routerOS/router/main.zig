@@ -15,6 +15,7 @@ const h = router.net.headers;
 const frag = router.ipv4.frag;
 const iface_mod = router.net.iface;
 const icmpv6 = router.ipv6.icmpv6;
+const log = router.log;
 const nat = router.ipv4.nat;
 const ndp = router.ipv6.ndp;
 const ping_mod = router.ipv4.icmp;
@@ -108,6 +109,13 @@ pub fn isInLanSubnet(ip: [4]u8) bool {
         (ip[1] & lan_mask[1]) == (lan_subnet[1] & lan_mask[1]) and
         (ip[2] & lan_mask[2]) == (lan_subnet[2] & lan_mask[2]) and
         (ip[3] & lan_mask[3]) == (lan_subnet[3] & lan_mask[3]);
+}
+
+fn readU64Be(b: *const [8]u8) u64 {
+    return @as(u64, b[0]) << 56 | @as(u64, b[1]) << 48 |
+        @as(u64, b[2]) << 40 | @as(u64, b[3]) << 32 |
+        @as(u64, b[4]) << 24 | @as(u64, b[5]) << 16 |
+        @as(u64, b[6]) << 8 | @as(u64, b[7]);
 }
 
 fn mmioMap(device_handle: u64, size: u64) ?u64 {
@@ -546,12 +554,16 @@ fn detectAppChannels(view: *const [MAX_PERMS]pv.UserViewEntry, mapped_handles: *
                 if (id_len >= 1) {
                     if (id_buf[0] == shm_protocol.ServiceId.NFS_CLIENT and nfs_chan == null) {
                         nfs_chan = ch;
+                        log.write(.nfs_connected);
                     } else if (id_buf[0] == shm_protocol.ServiceId.NTP_CLIENT and ntp_chan == null) {
                         ntp_chan = ch;
+                        log.write(.ntp_connected);
                     } else if (id_buf[0] == shm_protocol.ServiceId.HTTP_SERVER and http_chan == null) {
                         http_chan = ch;
+                        log.write(.http_connected);
                     } else if (id_buf[0] == shm_protocol.ServiceId.CONSOLE and console_chan == null) {
                         console_chan = ch;
+                        log.write(.console_connected);
                     }
                 }
                 break;
@@ -1091,6 +1103,8 @@ fn serviceThread() void {
     var mapped_count: u32 = 0;
     var loop_n: u32 = 0;
 
+    log.write(.service_started);
+
     var svc_arena = Arena.init(1 << 30) orelse return;
     const a = svc_arena.allocator();
 
@@ -1125,7 +1139,14 @@ fn serviceThread() void {
         // NTP app messages
         if (ntp_chan) |*chan| {
             if (chan.recv(ntp_buf)) |ntp_len| {
-                udp_fwd.handleAppMessage(ntp_buf[0..ntp_len], .ntp);
+                if (ntp_len >= 17 and ntp_buf[0] == log.MSG_TIME_SYNC) {
+                    // [0] = MSG_TIME_SYNC, [1..9] = unix_secs, [9..17] = mono_ns
+                    const unix_secs = readU64Be(ntp_buf[1..9]);
+                    const mono_ns = readU64Be(ntp_buf[9..17]);
+                    log.updateNtpTime(unix_secs, mono_ns);
+                } else {
+                    udp_fwd.handleAppMessage(ntp_buf[0..ntp_len], .ntp);
+                }
             }
         }
 
@@ -1161,6 +1182,9 @@ fn serviceThread() void {
                 }
             }
         }
+
+        // Drain log ring buffer and flush to NFS
+        log.drainAndFlush(&nfs_chan, loop_n);
 
         syscall.thread_yield();
     }

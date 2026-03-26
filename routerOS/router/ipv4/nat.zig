@@ -141,7 +141,7 @@ fn createOutbound(protocol: util.Protocol, lan_ip: [4]u8, lan_port: u16, dst_ip:
                 if (lookupOutbound(protocol, lan_ip, lan_port) == null) {
                     // Debug: dump the hash chain to understand why lookup failed
                     const dbg_idx = hashOutbound(proto, lan_ip, lan_port);
-                    util.logEvent("NAT post-condition FAIL: lookup cannot find just-created entry\n");
+                    router.log.write(.nat_postcondition_fail);
                     _ = dbg_idx;
                     assert(false);
                 }
