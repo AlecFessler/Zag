@@ -57,6 +57,7 @@ pub var upstream_dns: [4]u8 = .{ 10, 0, 2, 1 };
 pub var tz_offset_minutes: i16 = -360; // CST (UTC-6) default
 pub var wan_gateway: [4]u8 = .{ 10, 0, 2, 1 };
 pub var dhcp_leases: [dhcp_server.TABLE_SIZE]dhcp_server.DhcpLease = [_]dhcp_server.DhcpLease{dhcp_server.empty} ** dhcp_server.TABLE_SIZE;
+pub var dhcp_static_leases: [dhcp_server.STATIC_TABLE_SIZE]dhcp_server.StaticLease = [_]dhcp_server.StaticLease{dhcp_server.empty_static} ** dhcp_server.STATIC_TABLE_SIZE;
 pub var dhcp_next_ip: u8 = 100;
 pub var dhcp_client_state: dhcp_client.DhcpClientState = .idle;
 pub var dhcp_client_xid: u32 = 0x5A470001;
@@ -992,6 +993,55 @@ fn handleConsoleCommand(chan: *channel_mod.Channel, cmd: []const u8) void {
             p = util.appendStr(&resp, p, " -> soliciting");
         }
         _ = chan.send(resp[0..p]);
+    } else if (util.eql(cmd, "static-leases")) {
+        var count: u32 = 0;
+        for (&dhcp_static_leases) |*s| {
+            if (!s.valid) continue;
+            var p: usize = 0;
+            p = util.appendIp(&resp, p, s.ip);
+            p = util.appendStr(&resp, p, " ");
+            p = util.appendMac(&resp, p, s.mac);
+            _ = chan.send(resp[0..p]);
+            count += 1;
+        }
+        if (count == 0) _ = chan.send("(empty)");
+        _ = chan.send("---");
+    } else if (util.startsWith(cmd, "static-lease ")) {
+        const args = cmd[13..];
+        if (args.len < 19) {
+            _ = chan.send("usage: static-lease <mac> <ip>");
+            return;
+        }
+        const mac = util.parseMac(args[0..17]) orelse {
+            _ = chan.send("invalid MAC");
+            return;
+        };
+        if (args[17] != ' ') {
+            _ = chan.send("usage: static-lease <mac> <ip>");
+            return;
+        }
+        const ip = util.parseIp(args[18..]) orelse {
+            _ = chan.send("invalid IP");
+            return;
+        };
+        if (ip[0] != 10 or ip[1] != 1 or ip[2] != 1 or ip[3] < 2) {
+            _ = chan.send("IP must be 10.1.1.2-255");
+            return;
+        }
+        for (&dhcp_static_leases) |*s| {
+            if (s.valid and (util.eql(&s.mac, &mac) or util.eql(&s.ip, &ip))) {
+                _ = chan.send("conflict: MAC or IP already reserved");
+                return;
+            }
+        }
+        for (&dhcp_static_leases) |*s| {
+            if (!s.valid) {
+                s.* = .{ .mac = mac, .ip = ip, .valid = true };
+                _ = chan.send("OK");
+                return;
+            }
+        }
+        _ = chan.send("static lease table full");
     } else if (util.eql(cmd, "get-config")) {
         // Serialize current config as lines (multi-response)
         // DNS upstream
@@ -1022,6 +1072,16 @@ fn handleConsoleCommand(chan: *channel_mod.Channel, cmd: []const u8) void {
             p = util.appendIp(&resp, p, f.lan_ip);
             p = util.appendStr(&resp, p, " ");
             p = util.appendDec(&resp, p, f.lan_port);
+            _ = chan.send(resp[0..p]);
+        }
+        // Static DHCP leases
+        for (&dhcp_static_leases) |*s| {
+            if (!s.valid) continue;
+            var p: usize = 0;
+            p = util.appendStr(&resp, p, "static-lease ");
+            p = util.appendMac(&resp, p, s.mac);
+            p = util.appendStr(&resp, p, " ");
+            p = util.appendIp(&resp, p, s.ip);
             _ = chan.send(resp[0..p]);
         }
         _ = chan.send("---");

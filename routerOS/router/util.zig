@@ -91,6 +91,27 @@ pub fn appendMac(buf: []u8, pos: usize, mac: [6]u8) usize {
     return p;
 }
 
+pub fn parseMac(s: []const u8) ?[6]u8 {
+    if (s.len != 17) return null;
+    var mac: [6]u8 = undefined;
+    var idx: usize = 0;
+    while (idx < 6) : (idx += 1) {
+        const off = idx * 3;
+        const hi = hexVal(s[off]) orelse return null;
+        const lo = hexVal(s[off + 1]) orelse return null;
+        mac[idx] = (@as(u8, hi) << 4) | lo;
+        if (idx < 5 and s[off + 2] != ':') return null;
+    }
+    return mac;
+}
+
+fn hexVal(c: u8) ?u4 {
+    if (c >= '0' and c <= '9') return @truncate(c - '0');
+    if (c >= 'a' and c <= 'f') return @truncate(c - 'a' + 10);
+    if (c >= 'A' and c <= 'F') return @truncate(c - 'A' + 10);
+    return null;
+}
+
 pub fn parseIp(s: []const u8) ?[4]u8 {
     var ip: [4]u8 = undefined;
     var octet: u16 = 0;

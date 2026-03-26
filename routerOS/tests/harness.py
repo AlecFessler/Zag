@@ -233,6 +233,14 @@ class QemuRouter:
         """Set upstream DNS server."""
         return self.command(f"dns {ip}")
 
+    def add_static_lease(self, mac: str, ip: str) -> str:
+        """Add a static DHCP lease."""
+        return self.command(f"static-lease {mac} {ip}")
+
+    def get_static_leases(self) -> list[str]:
+        """Get static DHCP lease entries."""
+        return self.multi_command("static-leases")
+
     def wait_for_output(self, pattern: str, timeout: float = 10.0) -> str:
         """Wait for a pattern in serial output (regex)."""
         assert self.child is not None

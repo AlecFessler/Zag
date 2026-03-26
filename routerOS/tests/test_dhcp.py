@@ -324,3 +324,45 @@ class TestDhcpClient:
                 f"Expected >=2 ACKs, got {srv.ack_count}"
         finally:
             srv.stop()
+
+
+class TestStaticDhcpLeases:
+    """Test static DHCP lease functionality."""
+
+    def test_add_static_lease(self, router):
+        """Adding a static lease returns OK."""
+        resp = router.add_static_lease("aa:bb:cc:dd:ee:01", "10.1.1.50")
+        assert "OK" in resp
+
+    def test_list_static_leases(self, router):
+        """Static leases appear in the static-leases list."""
+        router.add_static_lease("aa:bb:cc:dd:ee:02", "10.1.1.51")
+        leases = router.get_static_leases()
+        assert any("10.1.1.51" in l and "aa:bb:cc:dd:ee:02" in l for l in leases)
+
+    def test_static_lease_invalid_mac(self, router):
+        """Invalid MAC address is rejected."""
+        resp = router.command("static-lease ZZZZ 10.1.1.50")
+        assert "invalid" in resp.lower() or "usage" in resp.lower()
+
+    def test_static_lease_invalid_ip(self, router):
+        """Invalid IP address is rejected."""
+        resp = router.command("static-lease aa:bb:cc:dd:ee:03 999.999.999.999")
+        assert "invalid" in resp.lower()
+
+    def test_static_lease_out_of_subnet(self, router):
+        """IP outside LAN subnet is rejected."""
+        resp = router.command("static-lease aa:bb:cc:dd:ee:04 192.168.1.50")
+        assert "must be" in resp.lower() or "IP" in resp
+
+    def test_static_lease_duplicate_ip_rejected(self, router):
+        """Duplicate IP in static leases is rejected."""
+        router.add_static_lease("aa:bb:cc:dd:ee:05", "10.1.1.52")
+        resp = router.command("static-lease aa:bb:cc:dd:ee:06 10.1.1.52")
+        assert "conflict" in resp.lower()
+
+    def test_static_lease_in_get_config(self, router):
+        """Static leases appear in get-config output."""
+        router.add_static_lease("aa:bb:cc:dd:ee:07", "10.1.1.53")
+        config = router.multi_command("get-config")
+        assert any("static-lease" in line and "10.1.1.53" in line for line in config)

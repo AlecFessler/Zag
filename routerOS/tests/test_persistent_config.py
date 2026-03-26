@@ -50,3 +50,11 @@ class TestPersistentConfig:
         data_leases = [l for l in leases if l != "(empty)" and l != "---"]
         for lease in data_leases:
             assert "." in lease, f"Lease entry missing IP: {lease}"
+
+    def test_static_lease_persists_in_config(self, router):
+        """Static DHCP leases appear in get-config for persistence."""
+        resp = router.add_static_lease("aa:bb:cc:dd:ee:10", "10.1.1.40")
+        assert "OK" in resp
+        config = router.multi_command("get-config")
+        found = any("static-lease" in l and "10.1.1.40" in l for l in config)
+        assert found, f"Static lease not in get-config: {config}"

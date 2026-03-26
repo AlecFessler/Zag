@@ -15,7 +15,7 @@ K: syscall 3
 K: syscall 1
 K: syscall 4
 K: syscall 8
-K: proc_create pid=3 entry=0x9859c1000
+K: proc_create pid=3 entry=0x3c226d87000
 K: syscall 11
 K: syscall 13
 K: syscall 13
@@ -25,7 +25,7 @@ K: syscall 3
 K: syscall 1
 K: syscall 4
 K: syscall 8
-K: proc_create pid=4 entry=0x117e819000
+K: proc_create pid=4 entry=0x3c9c4127000
 K: syscall 1
 K: syscall 4
 K: syscall 21
@@ -39,22 +39,22 @@ K: syscall 13
 K: syscall 13
 K: syscall 0
 root: spawning nfs_client
-K: proc_create pid=5 entry=0x1f17ccb000
-K: proc_create pid=6 entry=0x2124497000
-K: proc_create pid=7 entry=0x2326c19000
-K: proc_create pid=8 entry=0x2eb1e95000
+K: proc_create pid=5 entry=0x3d7ba663000
+K: proc_create pid=6 entry=0x3d9b2345000
+K: proc_create pid=7 entry=0x3dbb28d1000
+K: proc_create pid=8 entry=0x3e726d1d000
 http_server: started
 [boot+0.079] INFO  router  : service thread started
 [2J[H=== Zag RouterOS Console ===
 Type 'help' for available commands.
 Use 'load-config' to restore saved settings.
 
-> [boot+0.118] INFO  router  : nfs channel connected
-[boot+0.148] INFO  router  : ntp channel connected
+> [boot+0.117] INFO  router  : nfs channel connected
+[boot+0.145] INFO  router  : ntp channel connected
 nfs3: CREATE error status=17
 nfs_client: log file created
-[boot+0.178] INFO  router  : http channel connected
-[boot+0.206] INFO  router  : console channel connected
+[boot+0.174] INFO  router  : http channel connected
+[boot+0.202] INFO  router  : console channel connected
 ntp_client: timeout
 arp
 WAN 10.0.2.1 e6:11:e1:e5:b6:b9
@@ -85,7 +85,7 @@ LAN: 10.1.1.1 mac=52:54:00:12:34:57
 10.1.1.100 02:00:00:00:00:30
 ---
 > dhcp-client
-[boot+11.800] INFO  dhcp    : sent DISCOVER
+[boot+11.796] INFO  dhcp    : sent DISCOVER
 DHCP client: idle -> discovering
 > status
 WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
@@ -117,11 +117,37 @@ DHCP client: discovering
 dhcp-client
 DHCP client: bound
 > dhcp-test-rebind
-[boot+32.441] INFO  dhcp    : sent REBIND
-[boot+32.442] INFO  dhcp    : bound to 10.0.2.15
+[boot+32.436] INFO  dhcp    : sent REBIND
+[boot+32.437] INFO  dhcp    : bound to 10.0.2.15
 rebinding
 > dhcp-client
 DHCP client: bound
+> static-lease aa:bb:cc:dd:ee:01 10.1.1.50
+OK
+> static-lease aa:bb:cc:dd:ee:02 10.1.1.51
+OK
+> static-leases
+10.1.1.50 aa:bb:cc:dd:ee:01
+10.1.1.51 aa:bb:cc:dd:ee:02
+---
+> static-lease ZZZZ 10.1.1.50
+usage: static-lease <mac> <ip>
+> static-lease aa:bb:cc:dd:ee:03 999.999.999.999
+invalid IP
+> static-lease aa:bb:cc:dd:ee:04 192.168.1.50
+IP must be 10.1.1.2-255
+> static-lease aa:bb:cc:dd:ee:05 10.1.1.52
+OK
+> static-lease aa:bb:cc:dd:ee:06 10.1.1.52
+conflict: MAC or IP already reserved
+> static-lease aa:bb:cc:dd:ee:07 10.1.1.53
+OK
+> get-config
+static-lease aa:bb:cc:dd:ee:01 10.1.1.50
+static-lease aa:bb:cc:dd:ee:02 10.1.1.51
+static-lease aa:bb:cc:dd:ee:05 10.1.1.52
+static-lease aa:bb:cc:dd:ee:07 10.1.1.53
+---
 > dns 10.0.2.1
 OK
 > dns 10.0.2.1
@@ -167,8 +193,8 @@ block 10.33.33.33
 WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
 LAN: 10.1.1.1 mac=52:54:00:12:34:57
 > ifstat
-WAN rx=78 tx=198 drop=0
-LAN rx=137 tx=33 drop=0
+WAN rx=1299 tx=1347 drop=0
+LAN rx=1233 tx=30 drop=0
 > rules
 block 10.33.33.33
 ---
@@ -186,8 +212,8 @@ OK
 > forward udp 19950 10.1.1.60 19950
 OK
 > ifstat
-WAN rx=105 tx=279 drop=0
-LAN rx=183 tx=54 drop=0
+WAN rx=1560 tx=1604 drop=0
+LAN rx=1472 tx=51 drop=0
 > version
 Zag RouterOS v0.1
 > version
@@ -197,10 +223,10 @@ Zag RouterOS v0.1
 > version
 Zag RouterOS v0.1
 > ping 10.0.2.1
-reply from 10.0.2.1: seq=0 time=106us
-reply from 10.0.2.1: seq=1 time=85us
-reply from 10.0.2.1: seq=2 time=144us
-reply from 10.0.2.1: seq=3 time=161us
+reply from 10.0.2.1: seq=0 time=65us
+reply from 10.0.2.1: seq=1 time=75us
+reply from 10.0.2.1: seq=2 time=137us
+reply from 10.0.2.1: seq=3 time=139us
 --- ping 10.0.2.1: 4 sent, 4 received ---
 > version
 Zag RouterOS v0.1
@@ -211,7 +237,7 @@ Zag RouterOS v0.1
 [boot+120.000] WARN  dhcp    : timeout, retrying request
 [boot+120.000] INFO  dhcp    : sent REQUEST
 dhcpv6
-[boot+121.301] INFO  dhcpv6  : sent SOLICIT
+[boot+121.308] INFO  dhcpv6  : sent SOLICIT
 DHCPv6: idle -> soliciting
 > [boot+130.000] WARN  dhcp    : timeout, retrying request
 [boot+130.000] INFO  dhcp    : sent REQUEST
@@ -221,22 +247,23 @@ DHCPv6: idle -> soliciting
 [boot+140.001] INFO  dhcpv6  : sent SOLICIT
 [boot+150.000] WARN  dhcp    : timeout, retrying rebind
 [boot+150.000] INFO  dhcp    : sent REBIND
-[boot+150.001] WARN  dhcpv6  : timeout, retrying
-[boot+150.001] INFO  dhcpv6  : sent SOLICIT
 [boot+160.000] WARN  dhcp    : lease expired, restarting
 [boot+160.000] INFO  dhcp    : sent DISCOVER
-[boot+170.000] WARN  dhcpv6  : timeout, retrying
-[boot+170.000] INFO  dhcpv6  : sent SOLICIT
+[boot+160.001] WARN  dhcpv6  : timeout, retrying
+[boot+160.002] INFO  dhcpv6  : sent SOLICIT
+[boot+170.000] WARN  dhcp    : timeout, retrying
+[boot+170.000] INFO  dhcp    : sent DISCOVER
+[boot+170.001] WARN  dhcpv6  : timeout, retrying
+[boot+170.002] INFO  dhcpv6  : sent SOLICIT
 [boot+180.000] WARN  dhcp    : timeout, retrying
 [boot+180.000] INFO  dhcp    : sent DISCOVER
-[boot+180.001] WARN  dhcpv6  : timeout, retrying
-[boot+180.002] INFO  dhcpv6  : sent SOLICIT
 version
 Zag RouterOS v0.1
 > version
 Zag RouterOS v0.1
 > nat
-(empty)
+udp 10.1.1.50:5353 -> :10000 -> 224.0.0.251:5353
+udp 10.1.1.50:5355 -> :10001 -> 224.0.0.252:5355
 ---
 > block 10.99.99.99
 OK
@@ -250,31 +277,41 @@ forward udp :19950 -> 10.1.1.60:19950
 > allow 10.99.99.99
 OK
 > nat
-tcp 10.1.1.60:39908 -> :10005 -> 10.0.2.1:19900
+udp 10.1.1.50:5353 -> :10000 -> 224.0.0.251:5353
+udp 10.1.1.50:5355 -> :10001 -> 224.0.0.252:5355
+tcp 10.1.1.60:39128 -> :10005 -> 10.0.2.1:19900
 ---
 > nat
-tcp 10.1.1.60:39908 -> :10005 -> 10.0.2.1:19900
-icmp 10.1.1.60:25395 -> :10006 -> 10.0.2.1:0
+icmp 10.1.1.60:29779 -> :10006 -> 10.0.2.1:0
+udp 10.1.1.50:5353 -> :10000 -> 224.0.0.251:5353
+udp 10.1.1.50:5355 -> :10001 -> 224.0.0.252:5355
+tcp 10.1.1.60:39128 -> :10005 -> 10.0.2.1:19900
 ---
 > [boot+190.000] WARN  dhcp    : timeout, retrying
 [boot+190.000] INFO  dhcp    : sent DISCOVER
 [boot+190.001] WARN  dhcpv6  : timeout, retrying
 [boot+190.002] INFO  dhcpv6  : sent SOLICIT
 nat
-tcp 10.1.1.60:39908 -> :10005 -> 10.0.2.1:19900
-icmp 10.1.1.60:25395 -> :10006 -> 10.0.2.1:0
-tcp 10.1.1.60:43564 -> :10007 -> 10.0.2.1:19876
+tcp 10.1.1.60:53086 -> :10007 -> 10.0.2.1:19876
+icmp 10.1.1.60:29779 -> :10006 -> 10.0.2.1:0
+udp 10.1.1.50:5353 -> :10000 -> 224.0.0.251:5353
+udp 10.1.1.50:5355 -> :10001 -> 224.0.0.252:5355
+tcp 10.1.1.60:39128 -> :10005 -> 10.0.2.1:19900
 ---
 > nat
-tcp 10.1.1.60:39908 -> :10005 -> 10.0.2.1:19900
-icmp 10.1.1.60:25395 -> :10006 -> 10.0.2.1:0
-tcp 10.1.1.60:43564 -> :10007 -> 10.0.2.1:19876
+tcp 10.1.1.60:53086 -> :10007 -> 10.0.2.1:19876
+icmp 10.1.1.60:29779 -> :10006 -> 10.0.2.1:0
+udp 10.1.1.50:5353 -> :10000 -> 224.0.0.251:5353
+udp 10.1.1.50:5355 -> :10001 -> 224.0.0.252:5355
+tcp 10.1.1.60:39128 -> :10005 -> 10.0.2.1:19900
 ---
 > nat
-tcp 10.1.1.60:39908 -> :10005 -> 10.0.2.1:19900
-icmp 10.1.1.60:25395 -> :10006 -> 10.0.2.1:0
-udp 10.1.1.60:58723 -> :10008 -> 10.0.2.1:19878
-tcp 10.1.1.60:43564 -> :10007 -> 10.0.2.1:19876
+udp 10.1.1.60:39741 -> :10008 -> 10.0.2.1:19878
+tcp 10.1.1.60:53086 -> :10007 -> 10.0.2.1:19876
+icmp 10.1.1.60:29779 -> :10006 -> 10.0.2.1:0
+udp 10.1.1.50:5353 -> :10000 -> 224.0.0.251:5353
+udp 10.1.1.50:5355 -> :10001 -> 224.0.0.252:5355
+tcp 10.1.1.60:39128 -> :10005 -> 10.0.2.1:19900
 ---
 > ls
 subdir
@@ -289,18 +326,18 @@ nice
 > cat hello.txt
 Hello from NFS
 > ping 10.0.2.1
-reply from 10.0.2.1: seq=0 time=78us
-reply from 10.0.2.1: seq=1 time=112us
-reply from 10.0.2.1: seq=2 time=119us
-reply from 10.0.2.1: seq=3 time=96us
+reply from 10.0.2.1: seq=0 time=96us
+reply from 10.0.2.1: seq=1 time=95us
+reply from 10.0.2.1: seq=2 time=71us
+reply from 10.0.2.1: seq=3 time=98us
 --- ping 10.0.2.1: 4 sent, 4 received ---
 > mkdir test_mkdir_dir
 OK
 > ping 10.0.2.1
-reply from 10.0.2.1: seq=0 time=107us
-reply from 10.0.2.1: seq=1 time=116us
-reply from 10.0.2.1: seq=2 time=113us
-reply from 10.0.2.1: seq=3 time=90us
+reply from 10.0.2.1: seq=0 time=79us
+reply from 10.0.2.1: seq=1 time=113us
+reply from 10.0.2.1: seq=2 time=118us
+reply from 10.0.2.1: seq=3 time=117us
 --- ping 10.0.2.1: 4 sent, 4 received ---
 > rm test_rm_file.txt
 OK
@@ -314,38 +351,38 @@ nested.txt
 > cat hello.txt
 Hello from NFS
 > ping 10.0.2.1
-reply from 10.0.2.1: seq=0 time=98us
-reply from 10.0.2.1: seq=1 time=143us
-reply from 10.0.2.1: seq=2 time=106us
-reply from 10.0.2.1: seq=3 time=181us
+reply from 10.0.2.1: seq=0 time=112us
+reply from 10.0.2.1: seq=1 time=129us
+reply from 10.0.2.1: seq=2 time=199us
+reply from 10.0.2.1: seq=3 time=187us
 --- ping 10.0.2.1: 4 sent, 4 received ---
 > rmdir test_rmdir_dir
 OK
 > ping 10.0.2.1
-reply from 10.0.2.1: seq=0 time=114us
-reply from 10.0.2.1: seq=1 time=104us
-reply from 10.0.2.1: seq=2 time=85us
-reply from 10.0.2.1: seq=3 time=142us
+reply from 10.0.2.1: seq=0 time=82us
+reply from 10.0.2.1: seq=1 time=93us
+reply from 10.0.2.1: seq=2 time=160us
+reply from 10.0.2.1: seq=3 time=158us
 --- ping 10.0.2.1: 4 sent, 4 received ---
 > mv test_mv_src.txt test_mv_dst.txt
 OK
 > ping 10.0.2.1
-reply from 10.0.2.1: seq=0 time=107us
-reply from 10.0.2.1: seq=1 time=87us
-reply from 10.0.2.1: seq=2 time=146us
-reply from 10.0.2.1: seq=3 time=155us
+reply from 10.0.2.1: seq=0 time=120us
+reply from 10.0.2.1: seq=1 time=119us
+reply from 10.0.2.1: seq=2 time=161us
+reply from 10.0.2.1: seq=3 time=101us
 --- ping 10.0.2.1: 4 sent, 4 received ---
 > [boot+210.000] WARN  dhcp    : timeout, retrying
 [boot+210.000] INFO  dhcp    : sent DISCOVER
 [boot+210.001] WARN  dhcpv6  : timeout, retrying
-[boot+210.001] INFO  dhcpv6  : sent SOLICIT
+[boot+210.002] INFO  dhcpv6  : sent SOLICIT
 stat hello.txt
 type=file size=15
 > ping 10.0.2.1
-reply from 10.0.2.1: seq=0 time=85us
-reply from 10.0.2.1: seq=1 time=103us
-reply from 10.0.2.1: seq=2 time=76us
-reply from 10.0.2.1: seq=3 time=104us
+reply from 10.0.2.1: seq=0 time=64us
+reply from 10.0.2.1: seq=1 time=94us
+reply from 10.0.2.1: seq=2 time=113us
+reply from 10.0.2.1: seq=3 time=94us
 --- ping 10.0.2.1: 4 sent, 4 received ---
 > touch test_touch_file.txt
 OK
@@ -362,9 +399,13 @@ OK UTC-5
 > ntpserver 10.0.2.1
 OK
 > sync
-NTP: synced to 10.0.2.1 | 2026-03-26 12:27:41 UTC-5
-> time
-2026-03-26 12:27:44 UTC-5
+NTP: synced to 10.0.2.1 | 2026-03-26 13:19:21 UTC-5
+> [18:19:24] WARN  dhcp    : timeout, retrying
+[18:19:24] INFO  dhcp    : sent DISCOVER
+[18:19:24] WARN  dhcpv6  : timeout, retrying
+[18:19:24] INFO  dhcpv6  : sent SOLICIT
+time
+2026-03-26 13:19:24 UTC-5
 > timezone +3
 OK UTC+3
 > timezone +5:30
@@ -398,17 +439,31 @@ OK
 > leases
 10.1.1.100 02:00:00:00:00:30
 ---
+> static-lease aa:bb:cc:dd:ee:10 10.1.1.40
+OK
+> get-config
+forward tcp 8080 10.1.1.50 80
+forward tcp 7778 10.1.1.60 7777
+forward udp 7780 10.1.1.60 7779
+forward udp 19950 10.1.1.60 19950
+forward tcp 9090 10.1.1.50 80
+static-lease aa:bb:cc:dd:ee:01 10.1.1.50
+static-lease aa:bb:cc:dd:ee:02 10.1.1.51
+static-lease aa:bb:cc:dd:ee:05 10.1.1.52
+static-lease aa:bb:cc:dd:ee:07 10.1.1.53
+static-lease aa:bb:cc:dd:ee:10 10.1.1.40
+---
 > ping 10.0.2.1
-reply from 10.0.2.1: seq=0 time=132us
-reply from 10.0.2.1: seq=1 time=129us
-reply from 10.0.2.1: seq=2 time=100us
-reply from 10.0.2.1: seq=3 time=82us
+reply from 10.0.2.1: seq=0 time=113us
+reply from 10.0.2.1: seq=1 time=160us
+reply from 10.0.2.1: seq=2 time=171us
+reply from 10.0.2.1: seq=3 time=152us
 --- ping 10.0.2.1: 4 sent, 4 received ---
 > ping 10.1.1.50
-reply from 10.1.1.50: seq=0 time=81us
-reply from 10.1.1.50: seq=1 time=70us
-reply from 10.1.1.50: seq=2 time=84us
-reply from 10.1.1.50: seq=3 time=59us
+reply from 10.1.1.50: seq=0 time=65us
+reply from 10.1.1.50: seq=1 time=50us
+reply from 10.1.1.50: seq=2 time=91us
+reply from 10.1.1.50: seq=3 time=58us
 --- ping 10.1.1.50: 4 sent, 4 received ---
 > status
 WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
@@ -420,44 +475,44 @@ LAN: 10.1.1.1 mac=52:54:00:12:34:57
 WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
 LAN: 10.1.1.1 mac=52:54:00:12:34:57
 > ifstat
-WAN rx=321 tx=711 drop=0
-LAN rx=400 tx=126 drop=0
+WAN rx=4341 tx=4415 drop=0
+LAN rx=3995 tx=122 drop=0
 > ifstat
-WAN rx=321 tx=711 drop=0
-LAN rx=400 tx=126 drop=0
+WAN rx=4345 tx=4419 drop=0
+LAN rx=3999 tx=122 drop=0
 > version
 Zag RouterOS v0.1
 > uptime
 uptime: 0h 3m 49s
-> [17:27:54] WARN  dhcp    : timeout, retrying
-[17:27:54] INFO  dhcp    : sent DISCOVER
-[17:27:54] WARN  dhcpv6  : timeout, retrying
-[17:27:54] INFO  dhcpv6  : sent SOLICIT
+> [18:19:34] WARN  dhcp    : timeout, retrying
+[18:19:34] INFO  dhcp    : sent DISCOVER
 traceroute 10.0.2.1
 traceroute to 10.0.2.1, 30 hops max
-1  10.0.2.1  84us
+1  10.0.2.1  76us
 ---
 > traceroute 10.0.2.1
 traceroute to 10.0.2.1, 30 hops max
-1  10.0.2.1  97us
+1  10.0.2.1  91us
 ---
 > traceroute notanip
 invalid IP
-[17:28:14] WARN  dhcp    : timeout, retrying
-[17:28:14] INFO  dhcp    : sent DISCOVER
-[17:28:14] WARN  dhcpv6  : timeout, retrying
-[17:28:14] INFO  dhcpv6  : sent SOLICIT
+[18:19:44] WARN  dhcpv6  : timeout, retrying
+[18:19:44] INFO  dhcpv6  : sent SOLICIT
+[18:19:54] WARN  dhcp    : timeout, retrying
+[18:19:54] INFO  dhcp    : sent DISCOVER
+[18:19:54] WARN  dhcpv6  : timeout, retrying
+[18:19:54] INFO  dhcpv6  : sent SOLICIT
 > sync
-NTP: synced to 10.0.2.1 | 2026-03-26 11:28:17 UTC-6
+NTP: synced to 10.0.2.1 | 2026-03-26 12:19:58 UTC-6
 > dns 10.0.2.1
 OK
 > version
 Zag RouterOS v0.1
 > uptime
-uptime: 0h 4m 15s
+uptime: 0h 4m 16s
 > mount
 NFS: mounted
-[17:28:23] WARN  dhcp    : timeout, retrying
-[17:28:23] INFO  dhcp    : sent DISCOVER
+[18:20:03] WARN  dhcp    : timeout, retrying
+[18:20:03] INFO  dhcp    : sent DISCOVER
 QEMU 10.1.2 monitor - type 'help' for more information
 (qemu) q[K[Dqu[K[D[Dqui[K[D[D[Dquit[K

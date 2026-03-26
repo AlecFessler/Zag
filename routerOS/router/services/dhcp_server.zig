@@ -5,6 +5,7 @@ const main = router.state;
 const util = router.util;
 
 pub const TABLE_SIZE = 128;
+pub const STATIC_TABLE_SIZE = 32;
 
 const DHCP_DISCOVER: u8 = 1;
 const DHCP_OFFER: u8 = 2;
@@ -20,7 +21,14 @@ pub const DhcpLease = struct {
     timestamp_ns: u64,
 };
 
+pub const StaticLease = struct {
+    mac: [6]u8,
+    ip: [4]u8,
+    valid: bool,
+};
+
 pub const empty = DhcpLease{ .mac = .{ 0, 0, 0, 0, 0, 0 }, .ip = .{ 0, 0, 0, 0 }, .valid = false, .timestamp_ns = 0 };
+pub const empty_static = StaticLease{ .mac = .{ 0, 0, 0, 0, 0, 0 }, .ip = .{ 0, 0, 0, 0 }, .valid = false };
 
 fn findLease(leases: []const DhcpLease, mac: [6]u8) ?[4]u8 {
     for (leases) |l| {
@@ -30,6 +38,11 @@ fn findLease(leases: []const DhcpLease, mac: [6]u8) ?[4]u8 {
 }
 
 fn allocateLease(mac: [6]u8) ?[4]u8 {
+    // Check static leases first
+    for (&main.dhcp_static_leases) |*s| {
+        if (s.valid and util.eql(&s.mac, &mac)) return s.ip;
+    }
+
     const now = util.now();
     // Renew existing lease
     for (&main.dhcp_leases) |*l| {
@@ -38,19 +51,34 @@ fn allocateLease(mac: [6]u8) ?[4]u8 {
             return l.ip;
         }
     }
-    // Allocate new lease
+    // Allocate new lease, skipping IPs reserved by static leases
     for (&main.dhcp_leases) |*l| {
         if (!l.valid) {
-            l.ip = .{ 10, 1, 1, main.dhcp_next_ip };
+            var candidate = main.dhcp_next_ip;
+            var attempts: u16 = 0;
+            while (attempts < 156) : (attempts += 1) { // 256 - 100 = 156 possible IPs
+                if (!staticLeaseConflict(.{ 10, 1, 1, candidate })) break;
+                candidate +%= 1;
+                if (candidate < 100) candidate = 100;
+            } else return null; // all IPs conflict with static leases
+
+            l.ip = .{ 10, 1, 1, candidate };
             @memcpy(&l.mac, &mac);
             l.valid = true;
             l.timestamp_ns = now;
-            main.dhcp_next_ip +%= 1;
+            main.dhcp_next_ip = candidate +% 1;
             if (main.dhcp_next_ip < 100) main.dhcp_next_ip = 100;
             return l.ip;
         }
     }
     return null;
+}
+
+fn staticLeaseConflict(ip: [4]u8) bool {
+    for (&main.dhcp_static_leases) |*s| {
+        if (s.valid and util.eql(&s.ip, &ip)) return true;
+    }
+    return false;
 }
 
 /// Expire leases that have exceeded their duration.

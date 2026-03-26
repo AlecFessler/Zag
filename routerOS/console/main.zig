@@ -101,6 +101,8 @@ fn processCommand(line: []const u8) void {
         serialWrite("  forward <tcp|udp> <wport> <lip> <lport>\r\n");
         serialWrite("                           - port forward to LAN\r\n");
         serialWrite("  dns <ip>                 - set upstream DNS\r\n");
+        serialWrite("  static-lease <mac> <ip>   - add static DHCP lease\r\n");
+        serialWrite("  static-leases            - list static DHCP leases\r\n");
         serialWrite("  dhcp-client              - start/show WAN DHCP\r\n");
         serialWrite("  dhcpv6                   - start/show WAN DHCPv6-PD\r\n");
         serialWrite("  save-config              - save config to NFS\r\n");
@@ -162,8 +164,14 @@ fn processCommand(line: []const u8) void {
         routerCommand(line);
     } else if (eql(line, "dhcp-test-rebind")) {
         routerCommand(line);
+    } else if (eql(line, "static-leases")) {
+        routerMultiResponse("static-leases");
+    } else if (startsWith(line, "static-lease ")) {
+        routerCommand(line);
     } else if (eql(line, "dhcpv6")) {
         routerCommand(line);
+    } else if (eql(line, "get-config")) {
+        routerMultiResponse("get-config");
     } else if (eql(line, "save-config")) {
         saveConfig();
     } else if (eql(line, "load-config")) {
