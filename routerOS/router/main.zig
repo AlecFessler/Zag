@@ -50,6 +50,7 @@ pub var next_nat_port: u16 = 10000;
 pub var port_forwards: [firewall.PORT_FWD_SIZE]firewall.PortForward = [_]firewall.PortForward{firewall.empty_fwd} ** firewall.PORT_FWD_SIZE;
 pub var firewall_rules: [firewall.RULES_SIZE]firewall.FirewallRule = [_]firewall.FirewallRule{firewall.empty_rule} ** firewall.RULES_SIZE;
 pub var dns_relays: [dns.RELAY_SIZE]dns.DnsRelay = [_]dns.DnsRelay{dns.empty} ** dns.RELAY_SIZE;
+pub var dns_cache: [dns.CACHE_SIZE]dns.DnsCacheEntry = .{dns.empty_cache} ** dns.CACHE_SIZE;
 pub var next_dns_id: u16 = 1;
 pub var upstream_dns: [4]u8 = .{ 10, 0, 2, 1 };
 pub var tz_offset_minutes: i16 = -360; // CST (UTC-6) default
@@ -264,6 +265,7 @@ pub fn periodicMaintenance() void {
     ndp.expire(&wan_ndp_table);
     if (has_lan) ndp.expire(&lan_ndp_table);
     firewall6.expire();
+    dns.expireCache();
     dhcpv6_client.tick();
     if (has_lan) slaac.tick();
 }

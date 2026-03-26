@@ -167,3 +167,82 @@ class TestDnsRelay:
         """Verify the dns command is accepted."""
         resp = router.set_dns(wan_ip)
         assert "OK" in resp, f"DNS set failed: {resp}"
+
+
+class TestDnsCache:
+    """Test the router's DNS response caching."""
+
+    @pytest.mark.lan
+    def test_dns_cache_serves_repeated_query(self, router, wan_ip, router_lan_ip):
+        """Second identical DNS query should be served from cache without hitting upstream."""
+        from conftest import ping_host, LAN_IFACE
+        import subprocess
+        subprocess.run(["ip", "neigh", "replace", "10.0.2.15", "lladdr", "52:54:00:12:34:56",
+                        "dev", "tap0", "nud", "permanent"], capture_output=True)
+        ping_host(router_lan_ip, interface="tap1", count=2)
+        ping_host("10.0.2.15", interface="tap0", count=2)
+        time.sleep(1)
+
+        received_queries = []
+        server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tap0")
+        server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            server_sock.bind((wan_ip, 53))
+        except (PermissionError, OSError):
+            pytest.skip("Could not bind DNS server on port 53")
+        server_sock.settimeout(5.0)
+
+        def dns_server():
+            try:
+                for _ in range(10):
+                    data, addr = server_sock.recvfrom(512)
+                    received_queries.append((data, addr))
+                    resp = build_dns_response(data, "93.184.216.34")
+                    server_sock.sendto(resp, addr)
+            except (socket.timeout, OSError):
+                pass
+
+        server = threading.Thread(target=dns_server, daemon=True)
+        server.start()
+        time.sleep(0.5)
+
+        router.set_dns(wan_ip)
+        time.sleep(0.5)
+
+        # First query — should go to upstream
+        query1 = build_dns_query("cache.example.com", query_id=0x1111)
+        client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        client.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, LAN_IFACE.encode())
+        client.settimeout(3.0)
+        try:
+            client.sendto(query1, (router_lan_ip, 53))
+            response1, _ = client.recvfrom(512)
+            assert len(response1) > 12, "First DNS response too short"
+
+            assert len(received_queries) >= 1, "First query did not reach upstream"
+
+            # Wait for response caching and any duplicates to settle
+            time.sleep(2)
+            baseline_count = len(received_queries)
+
+            # Second query — same domain, different query ID — should come from cache
+            query2 = build_dns_query("cache.example.com", query_id=0x2222)
+            client.sendto(query2, (router_lan_ip, 53))
+            response2, _ = client.recvfrom(512)
+            assert len(response2) > 12, "Cached DNS response too short"
+
+            time.sleep(1)
+
+            # Verify response has correct query ID
+            resp_id = struct.unpack("!H", response2[:2])[0]
+            assert resp_id == 0x2222, \
+                f"Cached response ID {resp_id:#x} != 0x2222"
+
+            # Verify upstream was NOT queried again (cache hit)
+            assert len(received_queries) == baseline_count, \
+                f"Cache miss: upstream got {len(received_queries) - baseline_count} new queries after cache should be warm"
+        finally:
+            client.close()
+            server_sock.close()
+            server.join(timeout=3)
