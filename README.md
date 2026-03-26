@@ -1,10 +1,11 @@
 # Zag
 
-Bare-metal x86_64 operating system with a built-in network router.
+A capability-based microkernel written in Zig, targeting x86-64, with a bare-metal network router built on top.
 
 ## Prerequisites
 
-- Zig compiler (0.14+)
+- Zig compiler (0.15+)
+- NASM
 - QEMU with KVM support
 - OVMF UEFI firmware (`/usr/share/ovmf/x64/OVMF.4m.fd`)
 - Python 3 with venv (for integration tests)
@@ -35,6 +36,8 @@ zig build run -Dprofile=router   # boots router in QEMU with tap networking
 zig build run -Dprofile=test     # runs kernel test suite in QEMU
 ```
 
+The kernel boots via UEFI, brings up all CPU cores, enumerates PCI devices and serial ports, then launches the root service with full capabilities.
+
 ## Testing
 
 ### Integration tests (routerOS)
@@ -62,6 +65,16 @@ cd routerOS/tests
 .venv/bin/pytest test_dns.py -v      # single test file
 ```
 
+### Kernel test suite
+
+The root service (`userspace/tests/root_service/`) exercises every syscall and validates kernel behavior against the specification. Tests reference specific spec sections (e.g., `S2.3`, `S4.vm_reserve`).
+
+```bash
+zig build run -Dprofile=test
+```
+
+The test suite prints pass/fail for each test, reports total elapsed time, and calls `shutdown` to cleanly exit QEMU.
+
 ### Router fuzzer
 
 The fuzzer tests the router's packet processing logic against invariants and an oracle, using AFL++-style mutations:
@@ -86,3 +99,47 @@ cd fuzzing/red_black_tree && zig build run
 zig test kernel/memory/buddy_allocator.zig
 zig test kernel/containers/red_black_tree.zig
 ```
+
+## Documentation
+
+- **[Specification](docs/spec.md)** — The kernel's observable behavior from userspace. Syscall API, capability model, error codes, device types, system limits. What you need to write a conformant implementation.
+
+- **[Systems Design](docs/systems.md)** — Internal architecture and implementation details. Data structures, algorithms, memory management, scheduling, page table management, architecture abstraction layer.
+
+## Architecture
+
+```
+kernel/
+  arch/         Architecture-specific (x64, aarch64 placeholder)
+    dispatch.zig   Portable arch wrapper API
+    x64/           x86-64 implementation
+  boot/         UEFI boot protocol
+  containers/   Data structures (red-black tree)
+  debug/        Debug info (DWARF symbols)
+  devices/      Device registry
+  memory/       PMM, VMM, SHM, stacks, slab/buddy/heap allocators
+  perms/        Capability permission types
+  sched/        Scheduler, process, thread, futex, sync
+  utils/        ELF loader, range utilities
+
+userspace/
+  lib/          Userspace library (syscall wrappers, permissions, test framework)
+  tests/        Test programs (root service + child processes)
+
+routerOS/       Bare-metal network router (NAT, DHCP, DNS, firewall, IPv6)
+
+bootloader/     UEFI bootloader
+docs/           Specification and design documents
+```
+
+## Capabilities
+
+The kernel provides:
+- Process isolation with capability-based access control
+- Shared memory IPC with reference counting
+- MMIO device mapping and port I/O syscalls for userspace drivers
+- PCI device enumeration with vendor/device/class metadata
+- Process restart (crash recovery) with configurable persistence
+- Futex-based synchronization (cross-process via SHM)
+- ASLR and stack guard pages
+- SMP support (up to 64 cores)
