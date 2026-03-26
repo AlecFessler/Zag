@@ -5,7 +5,7 @@ const h = router.net.headers;
 const main = router.state;
 const util = router.util;
 
-pub const RELAY_SIZE = 32;
+pub const RELAY_SIZE = 256;
 pub const DNS_PORT: u16 = 53;
 
 pub const DnsRelay = struct {

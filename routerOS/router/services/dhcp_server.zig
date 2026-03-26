@@ -4,7 +4,7 @@ const h = router.net.headers;
 const main = router.state;
 const util = router.util;
 
-pub const TABLE_SIZE = 32;
+pub const TABLE_SIZE = 128;
 
 const DHCP_DISCOVER: u8 = 1;
 const DHCP_OFFER: u8 = 2;

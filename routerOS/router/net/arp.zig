@@ -6,7 +6,7 @@ const util = router.util;
 
 const Interface = main.Interface;
 
-pub const TABLE_SIZE = 64;
+pub const TABLE_SIZE = 128;
 const EXPIRY_NS: u64 = 300_000_000_000;
 
 pub const ArpEntry = struct {

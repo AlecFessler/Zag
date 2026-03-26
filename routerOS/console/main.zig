@@ -160,6 +160,8 @@ fn processCommand(line: []const u8) void {
         routerCommand(line);
     } else if (eql(line, "dhcp-client")) {
         routerCommand(line);
+    } else if (eql(line, "dhcp-test-rebind")) {
+        routerCommand(line);
     } else if (eql(line, "dhcpv6")) {
         routerCommand(line);
     } else if (eql(line, "save-config")) {

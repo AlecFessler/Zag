@@ -2,7 +2,7 @@ const router = @import("router");
 
 const util = router.util;
 
-pub const TABLE_SIZE = 16;
+pub const TABLE_SIZE = 64;
 const EXPIRY_NS: u64 = 30_000_000_000;
 
 pub const FragEntry = struct {

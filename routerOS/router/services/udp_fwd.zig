@@ -13,8 +13,8 @@ pub const MSG_UDP_SEND: u8 = 0x01;
 pub const MSG_UDP_RECV: u8 = 0x02;
 pub const MSG_UDP_BIND: u8 = 0x03;
 
-pub const MAX_BINDINGS = 8;
-pub const MAX_PENDING = 4;
+pub const MAX_BINDINGS = 16;
+pub const MAX_PENDING = 8;
 const PENDING_BUF_SIZE = 2048;
 
 pub const AppId = enum(u8) { nfs = 0, ntp = 1 };

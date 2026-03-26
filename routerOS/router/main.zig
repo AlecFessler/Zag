@@ -944,6 +944,7 @@ fn handleConsoleCommand(chan: *channel_mod.Channel, cmd: []const u8) void {
             .discovering => "discovering",
             .requesting => "requesting",
             .bound => "bound",
+            .rebinding => "rebinding",
         };
         p = util.appendStr(&resp, p, "DHCP client: ");
         p = util.appendStr(&resp, p, state_str);
@@ -954,6 +955,14 @@ fn handleConsoleCommand(chan: *channel_mod.Channel, cmd: []const u8) void {
             p = util.appendStr(&resp, p, " -> discovering");
         }
         _ = chan.send(resp[0..p]);
+    } else if (util.eql(cmd, "dhcp-test-rebind")) {
+        if (dhcp_client_state == .bound or dhcp_client_state == .requesting) {
+            dhcp_client_xid +%= 1;
+            dhcp_client.sendRebind();
+            _ = chan.send("rebinding");
+        } else {
+            _ = chan.send("not bound");
+        }
     } else if (util.eql(cmd, "dhcpv6")) {
         var p: usize = 0;
         const state_str: []const u8 = switch (dhcpv6_state) {

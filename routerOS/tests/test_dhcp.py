@@ -1,10 +1,159 @@
 """DHCP server and client tests."""
 
+import fcntl
+import socket
+import struct
+import threading
 import time
 
 import pytest
 
 from conftest import run_in_lan_ns
+
+
+class MiniDhcpServer:
+    """Minimal DHCP server on tap0 using raw sockets for the router's WAN client."""
+
+    def __init__(self, iface="tap0", server_ip="10.0.2.1", offer_ip="10.0.2.15"):
+        self.iface = iface
+        self.server_ip = server_ip
+        self.offer_ip = offer_ip
+        self.server_ip_bytes = socket.inet_aton(server_ip)
+        self.offer_ip_bytes = socket.inet_aton(offer_ip)
+        self.sock = None
+        self.thread = None
+        self.running = False
+        self.ack_count = 0
+        self.server_mac = self._get_mac(iface)
+
+    @staticmethod
+    def _get_mac(iface):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        info = fcntl.ioctl(s.fileno(), 0x8927, struct.pack("256s", iface.encode()))
+        s.close()
+        return info[18:24]
+
+    def start(self):
+        self.sock = socket.socket(
+            socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0800)
+        )
+        self.sock.bind((self.iface, 0))
+        self.sock.settimeout(1.0)
+        self.running = True
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=3)
+        if self.sock:
+            self.sock.close()
+
+    def _serve(self):
+        while self.running:
+            try:
+                data = self.sock.recv(2048)
+            except socket.timeout:
+                continue
+            if len(data) < 42:
+                continue
+            # Ethernet type must be IPv4
+            if struct.unpack("!H", data[12:14])[0] != 0x0800:
+                continue
+            # IP protocol must be UDP
+            if data[23] != 17:
+                continue
+            ip_hdr_len = (data[14] & 0x0F) * 4
+            udp_off = 14 + ip_hdr_len
+            if len(data) < udp_off + 8:
+                continue
+            src_port, dst_port = struct.unpack("!HH", data[udp_off : udp_off + 4])
+            if src_port != 68 or dst_port != 67:
+                continue
+            dhcp = data[udp_off + 8 :]
+            if len(dhcp) < 240:
+                continue
+            msg_type = self._get_option(dhcp, 53)
+            if msg_type == 1:  # DISCOVER → OFFER
+                self._send_response(dhcp, 2)
+            elif msg_type == 3:  # REQUEST → ACK
+                self._send_response(dhcp, 5)
+                self.ack_count += 1
+
+    def _send_response(self, dhcp_request, msg_type):
+        # DHCP payload
+        dhcp = bytearray(300)
+        dhcp[0] = 2  # BOOTREPLY
+        dhcp[1] = 1  # Ethernet
+        dhcp[2] = 6  # HW addr len
+        dhcp[4:8] = dhcp_request[4:8]  # XID
+        dhcp[16:20] = self.offer_ip_bytes  # yiaddr
+        dhcp[20:24] = self.server_ip_bytes  # siaddr
+        dhcp[28:34] = dhcp_request[28:34]  # chaddr
+        dhcp[236:240] = b"\x63\x82\x53\x63"
+        opt = 240
+        dhcp[opt : opt + 3] = bytes([53, 1, msg_type])
+        opt += 3
+        dhcp[opt : opt + 6] = bytes([54, 4]) + self.server_ip_bytes
+        opt += 6
+        dhcp[opt : opt + 6] = bytes([51, 4, 0, 0, 0, 120])  # 120s lease
+        opt += 6
+        dhcp[opt : opt + 6] = bytes([1, 4, 255, 255, 255, 0])
+        opt += 6
+        dhcp[opt : opt + 6] = bytes([3, 4]) + self.server_ip_bytes
+        opt += 6
+        dhcp[opt] = 255
+        opt += 1
+        dhcp_payload = bytes(dhcp[:opt])
+
+        # UDP header
+        udp_len = 8 + len(dhcp_payload)
+        udp_hdr = struct.pack("!HHHH", 67, 68, udp_len, 0)
+
+        # IP header
+        ip_total = 20 + udp_len
+        ip_hdr = bytearray(
+            struct.pack(
+                "!BBHHHBBH4s4s",
+                0x45, 0, ip_total, 0, 0, 64, 17, 0,
+                self.server_ip_bytes,
+                b"\xff\xff\xff\xff",
+            )
+        )
+        ip_hdr[10:12] = struct.pack("!H", self._checksum(ip_hdr))
+
+        # Ethernet header
+        eth_hdr = b"\xff\xff\xff\xff\xff\xff" + self.server_mac + b"\x08\x00"
+
+        frame = eth_hdr + bytes(ip_hdr) + udp_hdr + dhcp_payload
+        if len(frame) < 60:
+            frame += b"\x00" * (60 - len(frame))
+        self.sock.send(frame)
+
+    @staticmethod
+    def _checksum(data):
+        if len(data) % 2:
+            data += b"\x00"
+        s = sum(struct.unpack("!%dH" % (len(data) // 2), bytes(data)))
+        while s >> 16:
+            s = (s & 0xFFFF) + (s >> 16)
+        return ~s & 0xFFFF
+
+    @staticmethod
+    def _get_option(data, code):
+        idx = 240
+        while idx + 1 < len(data):
+            if data[idx] == 255:
+                break
+            if data[idx] == 0:
+                idx += 1
+                continue
+            c, length = data[idx], data[idx + 1]
+            if c == code and length >= 1:
+                return data[idx + 2]
+            idx += 2 + length
+        return None
 
 
 class TestDhcpServer:
@@ -106,7 +255,7 @@ class TestDhcpClient:
         resp = router.command("dhcp-client")
         assert "DHCP client:" in resp, f"Unexpected dhcp-client response: {resp}"
         assert any(state in resp.lower() for state in
-                    ["bound", "idle", "discovering", "requesting"]), \
+                    ["bound", "idle", "discovering", "requesting", "rebinding"]), \
             f"Unknown DHCP client state: {resp}"
 
     def test_dhcp_client_extracts_gateway(self, router, wan_ip):
@@ -129,3 +278,49 @@ class TestDhcpClient:
         # WAN should have an IP (either from DHCP or static)
         assert "10." in status["wan"] or "192." in status["wan"], \
             f"WAN has no IP: {status['wan']}"
+
+    def test_dhcp_client_t2_rebind(self, router):
+        """DHCP client can rebind via broadcast REQUEST (T2 behavior).
+
+        Runs a mini DHCP server on tap0, gets the client to bound state,
+        forces a rebind, and verifies the client re-binds via broadcast.
+        """
+        srv = MiniDhcpServer()
+        srv.start()
+        try:
+            # Trigger discovery — async DHCP logs interfere with prompt
+            # detection, so use sendline for the initial trigger.
+            # If an earlier test already triggered discovery, the 10s tick
+            # retry needs to fire and see our server — poll until bound.
+            router._drain()
+            router.child.sendline("dhcp-client")
+
+            bound = False
+            for _ in range(15):
+                time.sleep(2)
+                router._drain()
+                try:
+                    resp = router.command("dhcp-client")
+                except Exception:
+                    continue
+                if "bound" in resp.lower():
+                    bound = True
+                    break
+            assert bound, f"DHCP client did not bind: {resp}"
+
+            # Force a rebind — async logs will interfere with prompt
+            router._drain()
+            router.child.sendline("dhcp-test-rebind")
+            time.sleep(5)
+            router._drain()
+
+            # Verify client returned to bound state
+            resp = router.command("dhcp-client")
+            assert "bound" in resp.lower(), \
+                f"DHCP client did not rebind: {resp}"
+
+            # Server should have seen at least 2 ACKs (initial + rebind)
+            assert srv.ack_count >= 2, \
+                f"Expected >=2 ACKs, got {srv.ack_count}"
+        finally:
+            srv.stop()

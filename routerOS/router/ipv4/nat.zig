@@ -16,7 +16,7 @@ const assert = util.assert;
 
 const Interface = main.Interface;
 
-pub const TABLE_SIZE = 256; // power of 2 for hash masking
+pub const TABLE_SIZE = 4096; // power of 2 for hash masking
 
 const ICMP_TIMEOUT_NS: u64 = 60_000_000_000;
 const UDP_TIMEOUT_NS: u64 = 120_000_000_000;

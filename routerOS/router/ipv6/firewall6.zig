@@ -4,7 +4,7 @@ const hdrs = router.net.headers;
 const main = router.state;
 const util = router.util;
 
-pub const CONN_TABLE_SIZE = 256;
+pub const CONN_TABLE_SIZE = 4096;
 
 pub const ConnState = enum(u8) { empty = 0, active = 1, expired = 2 };
 
