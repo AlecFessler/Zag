@@ -6,12 +6,14 @@ const pv = lib.perm_view;
 const shm_protocol = lib.shm_protocol;
 const syscall = lib.syscall;
 
-// ── Message tags (must match router/services/web_tcp.zig) ───────────
+// ── Message tags (must match router/services/tcp_stack.zig) ─────────
 
 const MSG_HTTP_REQUEST: u8 = 0x10;
 const MSG_HTTP_RESPONSE: u8 = 0x11;
 const MSG_STATE_QUERY: u8 = 0x12;
 const MSG_STATE_RESPONSE: u8 = 0x13;
+const MSG_MUTATION_REQUEST: u8 = 0x14;
+const MSG_MUTATION_RESPONSE: u8 = 0x15;
 
 // ── State query endpoint IDs ────────────────────────────────────────
 
@@ -21,6 +23,14 @@ const EP_ARP: u8 = 2;
 const EP_NAT: u8 = 3;
 const EP_LEASES: u8 = 4;
 const EP_RULES: u8 = 5;
+
+// ── Mutation types ──────────────────────────────────────────────────
+
+const MUT_BLOCK: u8 = 0;
+const MUT_ALLOW: u8 = 1;
+const MUT_FORWARD: u8 = 2;
+const MUT_UNFORWARD: u8 = 3;
+const MUT_DNS: u8 = 4;
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -107,20 +117,45 @@ fn handleRouterMessage(data: []const u8) void {
     if (data.len < 1) return;
     switch (data[0]) {
         MSG_HTTP_REQUEST => {
-            syscall.write("http_server: got req\n");
             handleHttpRequest(data[1..]);
         },
         else => {},
     }
 }
 
-fn handleHttpRequest(path: []const u8) void {
-    // path_len == 0 means non-GET method (sentinel from router)
-    if (path.len == 0) {
-        sendHttpResponse("405 Method Not Allowed", "text/plain", "Method Not Allowed");
+// ── HTTP request parsing ────────────────────────────────────────────
+
+fn handleHttpRequest(raw: []const u8) void {
+    if (raw.len < 5) {
+        sendHttpResponse("400 Bad Request", "text/plain", "Bad Request");
         return;
     }
 
+    var method_end: usize = 0;
+    while (method_end < raw.len and raw[method_end] != ' ') : (method_end += 1) {}
+    if (method_end >= raw.len) {
+        sendHttpResponse("400 Bad Request", "text/plain", "Bad Request");
+        return;
+    }
+    const method = raw[0..method_end];
+    const path_start = method_end + 1;
+
+    var path_end: usize = path_start;
+    while (path_end < raw.len and raw[path_end] != ' ' and raw[path_end] != '\r') : (path_end += 1) {}
+    const path = raw[path_start..path_end];
+
+    if (eql(method, "GET")) {
+        handleGet(path);
+    } else if (eql(method, "POST")) {
+        handlePost(path);
+    } else {
+        sendHttpResponse("405 Method Not Allowed", "text/plain", "Method Not Allowed");
+    }
+}
+
+// ── GET handlers ────────────────────────────────────────────────────
+
+fn handleGet(path: []const u8) void {
     if (eql(path, "/") or eql(path, "/index.html")) {
         sendHttpResponse("200 OK", "text/html", HTML_PAGE);
     } else if (eql(path, "/api/status")) {
@@ -141,25 +176,138 @@ fn handleHttpRequest(path: []const u8) void {
 }
 
 fn sendStateQueryResponse(endpoint: u8) void {
-    // Send state query to router
     _ = router_chan.send(&[_]u8{ MSG_STATE_QUERY, endpoint });
 
-    // Wait for response (single-threaded, only one request at a time)
     var buf: [8192]u8 = undefined;
     var attempts: u32 = 0;
     while (attempts < 50000) : (attempts += 1) {
         if (router_chan.recv(&buf)) |len| {
             if (len >= 1 and buf[0] == MSG_STATE_RESPONSE) {
-                const json = buf[1..len];
-                sendHttpResponse("200 OK", "application/json", json);
+                sendHttpResponse("200 OK", "application/json", buf[1..len]);
                 return;
             }
         }
         syscall.thread_yield();
     }
 
-    // Timeout — send error response
     sendHttpResponse("503 Service Unavailable", "text/plain", "State query timeout");
+}
+
+// ── POST handlers ───────────────────────────────────────────────────
+
+fn handlePost(path: []const u8) void {
+    const block_prefix = "/api/block/";
+    const allow_prefix = "/api/allow/";
+    const forward_prefix = "/api/forward/";
+    const unforward_prefix = "/api/unforward/";
+    const dns_prefix = "/api/dns/";
+
+    if (path.len > block_prefix.len and startsWith(path, block_prefix)) {
+        const ip = parseIp(path[block_prefix.len..]) orelse return sendMutationError("invalid ip");
+        var msg: [6]u8 = undefined;
+        msg[0] = MSG_MUTATION_REQUEST;
+        msg[1] = MUT_BLOCK;
+        @memcpy(msg[2..6], &ip);
+        sendMutationAndRespond(&msg);
+    } else if (path.len > allow_prefix.len and startsWith(path, allow_prefix)) {
+        const ip = parseIp(path[allow_prefix.len..]) orelse return sendMutationError("invalid ip");
+        var msg: [6]u8 = undefined;
+        msg[0] = MSG_MUTATION_REQUEST;
+        msg[1] = MUT_ALLOW;
+        @memcpy(msg[2..6], &ip);
+        sendMutationAndRespond(&msg);
+    } else if (path.len > forward_prefix.len and startsWith(path, forward_prefix)) {
+        handleAddForward(path[forward_prefix.len..]);
+    } else if (path.len > unforward_prefix.len and startsWith(path, unforward_prefix)) {
+        handleRemoveForward(path[unforward_prefix.len..]);
+    } else if (path.len > dns_prefix.len and startsWith(path, dns_prefix)) {
+        const ip = parseIp(path[dns_prefix.len..]) orelse return sendMutationError("invalid ip");
+        var msg: [6]u8 = undefined;
+        msg[0] = MSG_MUTATION_REQUEST;
+        msg[1] = MUT_DNS;
+        @memcpy(msg[2..6], &ip);
+        sendMutationAndRespond(&msg);
+    } else {
+        sendHttpResponse("404 Not Found", "text/plain", "Not Found");
+    }
+}
+
+fn handleAddForward(args: []const u8) void {
+    // Expected: <proto>/<wport>/<lip>/<lport>
+    var proto_byte: u8 = 0; // 0=tcp
+    var i: usize = 0;
+
+    if (startsWith(args, "tcp/")) {
+        i = 4;
+    } else if (startsWith(args, "udp/")) {
+        proto_byte = 1;
+        i = 4;
+    } else return sendMutationError("invalid protocol");
+
+    // Parse wan_port
+    const wport = parseU16(args[i..]) orelse return sendMutationError("invalid wan port");
+    i += wport.len;
+    if (i >= args.len or args[i] != '/') return sendMutationError("invalid format");
+    i += 1;
+
+    // Parse lan_ip
+    var ip_end = i;
+    while (ip_end < args.len and args[ip_end] != '/') : (ip_end += 1) {}
+    const lip = parseIp(args[i..ip_end]) orelse return sendMutationError("invalid lan ip");
+    if (ip_end >= args.len) return sendMutationError("missing lan port");
+    i = ip_end + 1;
+
+    // Parse lan_port
+    const lport = parseU16(args[i..]) orelse return sendMutationError("invalid lan port");
+
+    // Build mutation: [MSG][MUT_FORWARD][proto:1][wan_port:2][lan_ip:4][lan_port:2]
+    var msg: [11]u8 = undefined;
+    msg[0] = MSG_MUTATION_REQUEST;
+    msg[1] = MUT_FORWARD;
+    msg[2] = proto_byte;
+    msg[3] = @intCast(wport.val >> 8);
+    msg[4] = @intCast(wport.val & 0xff);
+    @memcpy(msg[5..9], &lip);
+    msg[9] = @intCast(lport.val >> 8);
+    msg[10] = @intCast(lport.val & 0xff);
+    sendMutationAndRespond(&msg);
+}
+
+fn handleRemoveForward(args: []const u8) void {
+    const wport = parseU16(args) orelse return sendMutationError("invalid port");
+    var msg: [4]u8 = undefined;
+    msg[0] = MSG_MUTATION_REQUEST;
+    msg[1] = MUT_UNFORWARD;
+    msg[2] = @intCast(wport.val >> 8);
+    msg[3] = @intCast(wport.val & 0xff);
+    sendMutationAndRespond(&msg);
+}
+
+fn sendMutationAndRespond(msg: []const u8) void {
+    _ = router_chan.send(msg);
+
+    var buf: [8192]u8 = undefined;
+    var attempts: u32 = 0;
+    while (attempts < 50000) : (attempts += 1) {
+        if (router_chan.recv(&buf)) |len| {
+            if (len >= 1 and buf[0] == MSG_MUTATION_RESPONSE) {
+                sendHttpResponse("200 OK", "application/json", buf[1..len]);
+                return;
+            }
+        }
+        syscall.thread_yield();
+    }
+
+    sendHttpResponse("503 Service Unavailable", "text/plain", "Mutation timeout");
+}
+
+fn sendMutationError(msg: []const u8) void {
+    var buf: [128]u8 = undefined;
+    var p: usize = 0;
+    p = appendSlice(&buf, p, "{\"ok\":false,\"error\":\"");
+    p = appendSlice(&buf, p, msg);
+    p = appendSlice(&buf, p, "\"}");
+    sendHttpResponse("200 OK", "application/json", buf[0..p]);
 }
 
 // ── HTTP response builder ───────────────────────────────────────────
@@ -186,7 +334,7 @@ fn sendHttpResponse(status: []const u8, content_type: []const u8, body: []const 
     @memcpy(msg[p..][0..ctlen], content_type[0..ctlen]);
     p += ctlen;
 
-    // Body
+    // Body (may need multiple sends for large payloads like HTML)
     const blen = @min(body.len, msg.len - p);
     @memcpy(msg[p..][0..blen], body[0..blen]);
     p += blen;
@@ -204,43 +352,52 @@ fn eql(a: []const u8, b: []const u8) bool {
     return true;
 }
 
-// ── Embedded HTML Page ──────────────────────────────────────────────
+fn startsWith(haystack: []const u8, prefix: []const u8) bool {
+    if (haystack.len < prefix.len) return false;
+    return eql(haystack[0..prefix.len], prefix);
+}
 
-const HTML_PAGE =
-    \\<!DOCTYPE html>
-    \\<html><head><meta charset="utf-8"><title>Zag RouterOS</title>
-    \\<style>
-    \\*{margin:0;padding:0;box-sizing:border-box}
-    \\body{font-family:monospace;background:#1a1a2e;color:#e0e0e0;padding:20px}
-    \\h1{color:#0f0;margin-bottom:20px;font-size:1.4em}
-    \\h2{color:#0af;margin:15px 0 8px;font-size:1.1em}
-    \\.card{background:#16213e;border:1px solid #0a3d62;border-radius:6px;padding:12px;margin-bottom:12px}
-    \\table{width:100%;border-collapse:collapse;font-size:0.9em}
-    \\th{text-align:left;color:#0af;padding:4px 8px;border-bottom:1px solid #0a3d62}
-    \\td{padding:4px 8px}
-    \\tr:hover{background:#1a1a4e}
-    \\.stat{display:inline-block;margin-right:20px}
-    \\.label{color:#888}.val{color:#0f0}
-    \\#err{color:#f44;margin:10px 0}
-    \\</style></head><body>
-    \\<h1>&gt; Zag RouterOS Management</h1>
-    \\<div id="err"></div>
-    \\<div class="card" id="status"><h2>Interfaces</h2><div id="status-body">Loading...</div></div>
-    \\<div class="card" id="stats"><h2>Statistics</h2><div id="stats-body">Loading...</div></div>
-    \\<div class="card"><h2>ARP Table</h2><table><thead><tr><th>Iface</th><th>IP</th><th>MAC</th></tr></thead><tbody id="arp-body"></tbody></table></div>
-    \\<div class="card"><h2>NAT Table</h2><table><thead><tr><th>Proto</th><th>LAN</th><th>WAN Port</th><th>Destination</th></tr></thead><tbody id="nat-body"></tbody></table></div>
-    \\<div class="card"><h2>DHCP Leases</h2><table><thead><tr><th>IP</th><th>MAC</th></tr></thead><tbody id="lease-body"></tbody></table></div>
-    \\<div class="card"><h2>Firewall Rules</h2><table><thead><tr><th>Action</th><th>IP</th></tr></thead><tbody id="fw-body"></tbody></table><h2>Port Forwards</h2><table><thead><tr><th>Proto</th><th>WAN Port</th><th>LAN Target</th></tr></thead><tbody id="fwd-body"></tbody></table></div>
-    \\<script>
-    \\function f(u,cb){var x=new XMLHttpRequest();x.open('GET',u);x.onload=function(){if(x.status==200)cb(JSON.parse(x.responseText));};x.onerror=function(){document.getElementById('err').textContent='Connection error';};x.send();}
-    \\function r(){
-    \\f('/api/status',function(d){var h='';if(d.wan)h+='<span class="stat"><span class="label">WAN:</span> <span class="val">'+d.wan.ip+'</span> gw='+d.wan.gateway+' mac='+d.wan.mac+'</span>';if(d.lan)h+='<span class="stat"><span class="label">LAN:</span> <span class="val">'+d.lan.ip+'</span> mac='+d.lan.mac+'</span>';document.getElementById('status-body').innerHTML=h;});
-    \\f('/api/ifstat',function(d){var h='';if(d.wan)h+='<span class="stat"><span class="label">WAN</span> rx=<span class="val">'+d.wan.rx+'</span> tx=<span class="val">'+d.wan.tx+'</span> drop='+d.wan.drop+'</span>';if(d.lan)h+=' <span class="stat"><span class="label">LAN</span> rx=<span class="val">'+d.lan.rx+'</span> tx=<span class="val">'+d.lan.tx+'</span> drop='+d.lan.drop+'</span>';document.getElementById('stats-body').innerHTML=h;});
-    \\f('/api/arp',function(d){var h='';d.forEach(function(e){h+='<tr><td>'+e.iface+'</td><td>'+e.ip+'</td><td>'+e.mac+'</td></tr>';});document.getElementById('arp-body').innerHTML=h||'<tr><td colspan=3>empty</td></tr>';});
-    \\f('/api/nat',function(d){var h='';d.forEach(function(e){h+='<tr><td>'+e.proto+'</td><td>'+e.lan_ip+':'+e.lan_port+'</td><td>:'+e.wan_port+'</td><td>'+e.dst_ip+':'+e.dst_port+'</td></tr>';});document.getElementById('nat-body').innerHTML=h||'<tr><td colspan=4>empty</td></tr>';});
-    \\f('/api/leases',function(d){var h='';d.forEach(function(e){h+='<tr><td>'+e.ip+'</td><td>'+e.mac+'</td></tr>';});document.getElementById('lease-body').innerHTML=h||'<tr><td colspan=2>empty</td></tr>';});
-    \\f('/api/rules',function(d){var h='';d.firewall.forEach(function(e){h+='<tr><td>'+e.action+'</td><td>'+e.ip+'</td></tr>';});document.getElementById('fw-body').innerHTML=h||'<tr><td colspan=2>none</td></tr>';var g='';d.forwards.forEach(function(e){g+='<tr><td>'+e.proto+'</td><td>:'+e.wan_port+'</td><td>'+e.lan_ip+':'+e.lan_port+'</td></tr>';});document.getElementById('fwd-body').innerHTML=g||'<tr><td colspan=3>none</td></tr>';});
-    \\}
-    \\r();setInterval(r,5000);
-    \\</script></body></html>
-;
+fn appendSlice(buf: []u8, pos: usize, s: []const u8) usize {
+    const n = @min(s.len, buf.len - pos);
+    @memcpy(buf[pos..][0..n], s[0..n]);
+    return pos + n;
+}
+
+fn parseIp(s: []const u8) ?[4]u8 {
+    var result: [4]u8 = undefined;
+    var octet: usize = 0;
+    var val: u16 = 0;
+    var digits: usize = 0;
+    for (s) |c| {
+        if (c >= '0' and c <= '9') {
+            val = val * 10 + @as(u16, c - '0');
+            if (val > 255) return null;
+            digits += 1;
+        } else if (c == '.') {
+            if (digits == 0 or octet >= 3) return null;
+            result[octet] = @intCast(val);
+            octet += 1;
+            val = 0;
+            digits = 0;
+        } else break;
+    }
+    if (digits == 0 or octet != 3) return null;
+    result[3] = @intCast(val);
+    return result;
+}
+
+const ParsedU16 = struct { val: u16, len: usize };
+
+fn parseU16(s: []const u8) ?ParsedU16 {
+    var val: u16 = 0;
+    var i: usize = 0;
+    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+        val = val *% 10 +% @as(u16, s[i] - '0');
+    }
+    if (i == 0) return null;
+    return .{ .val = val, .len = i };
+}
+
+// ── Embedded HTML Management Page ───────────────────────────────────
+
+const HTML_PAGE = @embedFile("index.html");

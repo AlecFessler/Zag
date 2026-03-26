@@ -7,7 +7,7 @@ const dhcp_server = router.services.dhcp_server;
 const dhcpv6_client = router.ipv6.dhcpv6_client;
 const dma = router.net.dma;
 const dns = router.services.dns;
-const web_tcp = router.services.web_tcp;
+const tcp_stack = router.services.tcp_stack;
 const e1000 = router.net.e1000;
 const firewall = router.ipv4.firewall;
 const firewall6 = router.ipv6.firewall6;
@@ -434,7 +434,7 @@ fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
 
         // TCP — HTTP server on LAN port 80
         if (ip.protocol == h.Ipv4Header.PROTO_TCP and role == .lan) {
-            if (web_tcp.handleTcp(pkt, len)) return .consumed;
+            if (tcp_stack.handleTcp(pkt, len)) return .consumed;
         }
 
         if (ip.protocol == h.Ipv4Header.PROTO_UDP) {
@@ -1129,26 +1129,165 @@ fn serviceThread() void {
 fn handleHttpServerMessage(data: []const u8, chan: *channel_mod.Channel, buf: []u8) void {
     if (data.len < 1) return;
     switch (data[0]) {
-        web_tcp.MSG_STATE_QUERY => {
+        tcp_stack.MSG_STATE_QUERY => {
             if (data.len < 2) return;
             handleStateQuery(data[1], chan, buf);
+        },
+        tcp_stack.MSG_HTTP_RESPONSE => {
+            if (data.len < 3) return;
+            handleHttpResponse(data[1..]);
+        },
+        tcp_stack.MSG_MUTATION_REQUEST => {
+            if (data.len < 2) return;
+            handleMutationRequest(data[1..], chan, buf);
         },
         else => {},
     }
 }
 
 fn handleStateQuery(endpoint: u8, chan: *channel_mod.Channel, buf: []u8) void {
-    buf[0] = web_tcp.MSG_STATE_RESPONSE;
+    buf[0] = tcp_stack.MSG_STATE_RESPONSE;
     const json_len: usize = switch (endpoint) {
-        0 => web_tcp.formatJsonStatus(buf[1..]),
-        1 => web_tcp.formatJsonIfstat(buf[1..]),
-        2 => web_tcp.formatJsonArp(buf[1..]),
-        3 => web_tcp.formatJsonNat(buf[1..]),
-        4 => web_tcp.formatJsonLeases(buf[1..]),
-        5 => web_tcp.formatJsonRules(buf[1..]),
+        0 => tcp_stack.formatJsonStatus(buf[1..]),
+        1 => tcp_stack.formatJsonIfstat(buf[1..]),
+        2 => tcp_stack.formatJsonArp(buf[1..]),
+        3 => tcp_stack.formatJsonNat(buf[1..]),
+        4 => tcp_stack.formatJsonLeases(buf[1..]),
+        5 => tcp_stack.formatJsonRules(buf[1..]),
         else => 0,
     };
     _ = chan.send(buf[0 .. 1 + json_len]);
+}
+
+/// Parse MSG_HTTP_RESPONSE from http_server and send as TCP data.
+/// Wire format: [status_len:1][status...][ct_len:1][content_type...][body...]
+fn handleHttpResponse(data: []const u8) void {
+    var p: usize = 0;
+
+    // Parse status
+    if (p >= data.len) return;
+    const slen: usize = data[p];
+    p += 1;
+    if (p + slen > data.len) return;
+    const status = data[p..][0..slen];
+    p += slen;
+
+    // Parse content-type
+    if (p >= data.len) return;
+    const ctlen: usize = data[p];
+    p += 1;
+    if (p + ctlen > data.len) return;
+    const content_type = data[p..][0..ctlen];
+    p += ctlen;
+
+    // Remaining is body
+    const body = data[p..];
+
+    // Build HTTP/1.0 response header
+    var hdr: [256]u8 = undefined;
+    var hp: usize = 0;
+    hp = util.appendStr(&hdr, hp, "HTTP/1.0 ");
+    hp = util.appendStr(&hdr, hp, status);
+    hp = util.appendStr(&hdr, hp, "\r\nContent-Type: ");
+    hp = util.appendStr(&hdr, hp, content_type);
+    hp = util.appendStr(&hdr, hp, "\r\nContent-Length: ");
+    hp = util.appendDec(&hdr, hp, body.len);
+    hp = util.appendStr(&hdr, hp, "\r\nConnection: close\r\n\r\n");
+
+    tcp_stack.sendHttpResponse(hdr[0..hp], body);
+}
+
+/// Handle a mutation request from http_server.
+/// Wire format: [mutation_type:1][params...]
+/// Mutation types: 0=block, 1=allow, 2=forward, 3=unforward, 4=dns
+fn handleMutationRequest(data: []const u8, chan: *channel_mod.Channel, buf: []u8) void {
+    if (data.len < 1) return;
+    const mutation_type = data[0];
+    const params = data[1..];
+
+    const result: []const u8 = switch (mutation_type) {
+        0 => mutateBlock(params),
+        1 => mutateAllow(params),
+        2 => mutateForward(params),
+        3 => mutateUnforward(params),
+        4 => mutateDns(params),
+        else => "{\"ok\":false,\"error\":\"unknown mutation\"}",
+    };
+
+    buf[0] = tcp_stack.MSG_MUTATION_RESPONSE;
+    const rlen = @min(result.len, buf.len - 1);
+    @memcpy(buf[1..][0..rlen], result[0..rlen]);
+    _ = chan.send(buf[0 .. 1 + rlen]);
+}
+
+fn mutateBlock(params: []const u8) []const u8 {
+    const ip = util.parseIp(params) orelse return "{\"ok\":false,\"error\":\"invalid ip\"}";
+    for (&firewall_rules) |*r| {
+        if (!r.valid) {
+            r.* = .{
+                .valid = true,
+                .action = .block,
+                .src_ip = ip,
+                .src_mask = .{ 255, 255, 255, 255 },
+                .protocol = 0,
+                .dst_port = 0,
+            };
+            return "{\"ok\":true}";
+        }
+    }
+    return "{\"ok\":false,\"error\":\"firewall table full\"}";
+}
+
+fn mutateAllow(params: []const u8) []const u8 {
+    const ip = util.parseIp(params) orelse return "{\"ok\":false,\"error\":\"invalid ip\"}";
+    for (&firewall_rules) |*r| {
+        if (r.valid and r.action == .block and util.eql(&r.src_ip, &ip)) {
+            r.valid = false;
+            return "{\"ok\":true}";
+        }
+    }
+    return "{\"ok\":false,\"error\":\"rule not found\"}";
+}
+
+fn mutateForward(params: []const u8) []const u8 {
+    // Format: <proto_byte><wan_port:2><lan_ip:4><lan_port:2>
+    if (params.len < 9) return "{\"ok\":false,\"error\":\"invalid format\"}";
+    const proto: util.Protocol = if (params[0] == 0) .tcp else .udp;
+    const wan_port = util.readU16Be(params[1..3]);
+    const lan_ip = params[3..7].*;
+    const lan_port = util.readU16Be(params[7..9]);
+    for (&port_forwards) |*f| {
+        if (!f.valid) {
+            f.* = .{
+                .valid = true,
+                .protocol = proto,
+                .wan_port = wan_port,
+                .lan_ip = lan_ip,
+                .lan_port = lan_port,
+            };
+            return "{\"ok\":true}";
+        }
+    }
+    return "{\"ok\":false,\"error\":\"port forward table full\"}";
+}
+
+fn mutateUnforward(params: []const u8) []const u8 {
+    // Format: <wan_port:2>
+    if (params.len < 2) return "{\"ok\":false,\"error\":\"invalid format\"}";
+    const wan_port = util.readU16Be(params[0..2]);
+    for (&port_forwards) |*f| {
+        if (f.valid and f.wan_port == wan_port) {
+            f.valid = false;
+            return "{\"ok\":true}";
+        }
+    }
+    return "{\"ok\":false,\"error\":\"forward not found\"}";
+}
+
+fn mutateDns(params: []const u8) []const u8 {
+    if (params.len < 4) return "{\"ok\":false,\"error\":\"invalid ip\"}";
+    upstream_dns = params[0..4].*;
+    return "{\"ok\":true}";
 }
 
 /// LAN poll thread entry point. Polls LAN NIC, forwards to WAN via zero-copy.
