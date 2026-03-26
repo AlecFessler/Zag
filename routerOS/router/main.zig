@@ -7,7 +7,7 @@ const dhcp_server = router.services.dhcp_server;
 const dhcpv6_client = router.ipv6.dhcpv6_client;
 const dma = router.net.dma;
 const dns = router.services.dns;
-const http = router.services.http;
+const web_tcp = router.services.web_tcp;
 const e1000 = router.net.e1000;
 const firewall = router.ipv4.firewall;
 const firewall6 = router.ipv6.firewall6;
@@ -21,6 +21,7 @@ const slaac = router.ipv6.slaac;
 const udp_fwd = router.services.udp_fwd;
 const util = router.util;
 
+const Arena = lib.arena.Arena;
 const channel_mod = lib.channel;
 const perms = lib.perms;
 const pv = lib.perm_view;
@@ -42,6 +43,7 @@ pub var has_lan: bool = false;
 pub var console_chan: ?channel_mod.Channel = null;
 pub var nfs_chan: ?channel_mod.Channel = null;
 pub var ntp_chan: ?channel_mod.Channel = null;
+pub var http_chan: ?channel_mod.Channel = null;
 pub var nat_table: [nat.TABLE_SIZE]nat.NatEntry = .{nat.empty} ** nat.TABLE_SIZE;
 pub var next_nat_port: u16 = 10000;
 pub var port_forwards: [firewall.PORT_FWD_SIZE]firewall.PortForward = [_]firewall.PortForward{firewall.empty_fwd} ** firewall.PORT_FWD_SIZE;
@@ -444,7 +446,7 @@ fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
 
         // TCP — HTTP server on LAN port 80
         if (pkt[23] == 6 and role == .lan) {
-            if (http.handleTcp(pkt, len)) return .consumed;
+            if (web_tcp.handleTcp(pkt, len)) return .consumed;
         }
 
         if (pkt[23] == 17) {
@@ -519,7 +521,7 @@ fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
 }
 
 fn detectAppChannels(view: *const [MAX_PERMS]pv.UserViewEntry, mapped_handles: *[8]u64, mapped_count: *u32) void {
-    if (console_chan != null and nfs_chan != null and ntp_chan != null) return;
+    if (console_chan != null and nfs_chan != null and ntp_chan != null and http_chan != null) return;
     for (view) |*entry| {
         if (entry.entry_type != pv.ENTRY_TYPE_SHARED_MEMORY or entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) continue;
         var is_known = false;
@@ -539,6 +541,7 @@ fn detectAppChannels(view: *const [MAX_PERMS]pv.UserViewEntry, mapped_handles: *
                 if (id_len >= 1) {
                     if (id_buf[0] == shm_protocol.ServiceId.NFS_CLIENT and nfs_chan == null) { nfs_chan = ch; }
                     else if (id_buf[0] == shm_protocol.ServiceId.NTP_CLIENT and ntp_chan == null) { ntp_chan = ch; }
+                    else if (id_buf[0] == shm_protocol.ServiceId.HTTP_SERVER and http_chan == null) { http_chan = ch; }
                     else if (id_buf[0] == shm_protocol.ServiceId.CONSOLE and console_chan == null) { console_chan = ch; }
                 }
                 break;
@@ -1057,6 +1060,16 @@ fn serviceThread() void {
     var mapped_count: u32 = 0;
     var loop_n: u32 = 0;
 
+    // Demand-paged arena for buffers — avoids stack overflow.
+    var svc_arena = Arena.init(1 << 30) orelse return;
+    const a = svc_arena.allocator();
+
+    const cmd_buf = a.alloc(u8, 256) catch return;
+    const nfs_buf = a.alloc(u8, 2048) catch return;
+    const ntp_buf = a.alloc(u8, 256) catch return;
+    const http_buf = a.alloc(u8, 8192) catch return;
+    const state_buf = a.alloc(u8, 4096) catch return;
+
     while (true) {
         loop_n +%= 1;
 
@@ -1065,30 +1078,59 @@ fn serviceThread() void {
 
         // Console command handling
         if (console_chan) |*chan| {
-            var cmd_buf: [256]u8 = undefined;
-            if (chan.recv(&cmd_buf)) |cmd_len| {
+            if (chan.recv(cmd_buf)) |cmd_len| {
                 handleConsoleCommand(chan, cmd_buf[0..cmd_len]);
             }
         }
 
         // NFS app messages
         if (nfs_chan) |*chan| {
-            var nfs_buf: [2048]u8 = undefined;
-            if (chan.recv(&nfs_buf)) |nfs_len| {
+            if (chan.recv(nfs_buf)) |nfs_len| {
                 udp_fwd.handleAppMessage(nfs_buf[0..nfs_len], .nfs);
             }
         }
 
         // NTP app messages
         if (ntp_chan) |*chan| {
-            var ntp_buf: [256]u8 = undefined;
-            if (chan.recv(&ntp_buf)) |ntp_len| {
+            if (chan.recv(ntp_buf)) |ntp_len| {
                 udp_fwd.handleAppMessage(ntp_buf[0..ntp_len], .ntp);
+            }
+        }
+
+        // HTTP server app messages
+        if (http_chan) |*chan| {
+            if (chan.recv(http_buf)) |hlen| {
+                handleHttpServerMessage(http_buf[0..hlen], chan, state_buf);
             }
         }
 
         syscall.thread_yield();
     }
+}
+
+fn handleHttpServerMessage(data: []const u8, chan: *channel_mod.Channel, buf: []u8) void {
+    if (data.len < 1) return;
+    switch (data[0]) {
+        web_tcp.MSG_STATE_QUERY => {
+            if (data.len < 2) return;
+            handleStateQuery(data[1], chan, buf);
+        },
+        else => {},
+    }
+}
+
+fn handleStateQuery(endpoint: u8, chan: *channel_mod.Channel, buf: []u8) void {
+    buf[0] = web_tcp.MSG_STATE_RESPONSE;
+    const json_len: usize = switch (endpoint) {
+        0 => web_tcp.formatJsonStatus(buf[1..]),
+        1 => web_tcp.formatJsonIfstat(buf[1..]),
+        2 => web_tcp.formatJsonArp(buf[1..]),
+        3 => web_tcp.formatJsonNat(buf[1..]),
+        4 => web_tcp.formatJsonLeases(buf[1..]),
+        5 => web_tcp.formatJsonRules(buf[1..]),
+        else => 0,
+    };
+    _ = chan.send(buf[0 .. 1 + json_len]);
 }
 
 /// LAN poll thread entry point. Polls LAN NIC, forwards to WAN via zero-copy.

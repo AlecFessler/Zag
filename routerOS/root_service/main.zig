@@ -315,11 +315,21 @@ pub fn main(perm_view_addr: u64) void {
     );
 
     _ = spawnChild(
+        "http_server",
+        embedded.http_server,
+        shm_protocol.ServiceId.HTTP_SERVER,
+        .{ .grant_to = true, .mem_reserve = true, .restart = true },
+        &.{shm_protocol.ServiceId.ROUTER},
+        perm_view_addr,
+        &.{},
+    );
+
+    _ = spawnChild(
         "console",
         embedded.console,
         shm_protocol.ServiceId.CONSOLE,
         .{ .grant_to = true, .mem_reserve = true, .restart = true },
-        &.{ shm_protocol.ServiceId.SERIAL, shm_protocol.ServiceId.ROUTER, shm_protocol.ServiceId.NFS_CLIENT, shm_protocol.ServiceId.NTP_CLIENT },
+        &.{ shm_protocol.ServiceId.SERIAL, shm_protocol.ServiceId.ROUTER, shm_protocol.ServiceId.NFS_CLIENT, shm_protocol.ServiceId.NTP_CLIENT, shm_protocol.ServiceId.HTTP_SERVER },
         perm_view_addr,
         &.{},
     );

@@ -18,26 +18,33 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(config, items):
-    """Auto-skip tests marked @lan_ns if not running as root and no namespace exists."""
-    if os.geteuid() != 0 and not lan_ns_exists():
-        skip = pytest.mark.skip(reason="lan_test namespace not found — run with sudo or run sudo ./routerOS/tests/setup_sudo.sh")
+    """Auto-skip tests marked @lan_ns if the namespace doesn't exist."""
+    if not lan_ns_exists():
+        skip = pytest.mark.skip(reason="lan_test namespace not found — run: sudo routerOS/tests/setup_sudo.sh")
         for item in items:
             if "lan_ns" in item.keywords:
                 item.add_marker(skip)
 
 
 def _run_ip(args: list[str]):
-    """Run an ip command, using sudo only if not already root."""
-    cmd = args if os.geteuid() == 0 else ["sudo"] + args
+    """Run an ip command via sudo -n (passwordless, via sudoers rule)."""
+    cmd = args if os.geteuid() == 0 else ["sudo", "-n"] + args
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
-def _setup_lan_namespace():
-    """Create lan_test namespace with macvlan on tap1 (after QEMU boots)."""
-    if lan_ns_exists():
+def _setup_lan_macvlan():
+    """Set up macvlan on tap1 inside the existing lan_test namespace (after QEMU boots).
+
+    The namespace itself must be created beforehand via setup_sudo.sh.
+    This only configures the macvlan interface, which needs CAP_NET_ADMIN.
+    """
+    if not lan_ns_exists():
+        return
+    # Check if already configured
+    r = _run_ip(["ip", "netns", "exec", "lan_test", "ip", "addr", "show", "lan-test0"])
+    if r.returncode == 0 and "10.1.1.60" in r.stdout:
         return
     cmds = [
-        ["ip", "netns", "add", "lan_test"],
         ["ip", "link", "add", "lan-test0", "link", "tap1",
          "type", "macvlan", "mode", "bridge"],
         ["ip", "link", "set", "lan-test0", "address", "02:00:00:00:00:20"],
@@ -53,14 +60,13 @@ def _setup_lan_namespace():
         r = _run_ip(cmd)
         if r.returncode != 0:
             import sys
-            print(f"[conftest] namespace setup failed: {' '.join(cmd)}: {r.stderr.strip()}", file=sys.stderr)
+            print(f"[conftest] macvlan setup failed: {' '.join(cmd)}: {r.stderr.strip()}", file=sys.stderr)
             return
 
 
-def _teardown_lan_namespace():
-    """Remove lan_test namespace."""
-    _run_ip(["ip", "netns", "del", "lan_test"])
-    _run_ip(["ip", "link", "del", "lan-test0"])
+def _teardown_lan_macvlan():
+    """Remove macvlan interface (namespace persists for reuse)."""
+    _run_ip(["ip", "netns", "exec", "lan_test", "ip", "link", "del", "lan-test0"])
 
 
 @pytest.fixture(scope="session")
@@ -69,11 +75,11 @@ def router():
     r = QemuRouter(build=False, boot_timeout=ROUTER_BOOT_TIMEOUT)
     r.start()
     time.sleep(2)
-    # Create namespace AFTER QEMU boots (macvlan on tap1 must be after QEMU opens it)
-    _setup_lan_namespace()
+    # Create macvlan AFTER QEMU boots (tap1 must be open first)
+    _setup_lan_macvlan()
     time.sleep(1)  # Let macvlan settle
     yield r
-    _teardown_lan_namespace()
+    _teardown_lan_macvlan()
     r.stop()
 
 
@@ -153,7 +159,7 @@ def lan_ns_exists() -> bool:
 def run_in_lan_ns(cmd: list[str], timeout: float = 10.0) -> subprocess.CompletedProcess:
     """Run a command inside the lan_test network namespace."""
     prefix = ["ip", "netns", "exec", "lan_test"] if os.geteuid() == 0 \
-        else ["sudo", "ip", "netns", "exec", "lan_test"]
+        else ["sudo", "-n", "ip", "netns", "exec", "lan_test"]
     return subprocess.run(
         prefix + cmd,
         capture_output=True, text=True, timeout=timeout,

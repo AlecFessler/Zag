@@ -37,7 +37,7 @@ PROMPT = "\n> "
 # Debug lines from syscall.write that get mixed into serial output
 DEBUG_PREFIXES = [
     "router:", "root:", "console:", "serial_driver:", "nfs_client:",
-    "ntp_client:", "BdsDxe:",
+    "ntp_client:", "http_server:", "BdsDxe:",
 ]
 
 

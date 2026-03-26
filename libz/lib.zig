@@ -1,3 +1,4 @@
+pub const arena = @import("arena.zig");
 pub const channel = @import("channel.zig");
 pub const crc32 = @import("crc32.zig");
 pub const perm_view = @import("perm_view.zig");

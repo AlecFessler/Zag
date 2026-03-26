@@ -232,7 +232,6 @@ HOST_LAN_IP = "10.1.1.50"
 
 
 @pytest.mark.lan
-@pytest.mark.skip(reason="Raw TCP handshake test needs packet-level debugging — router HTTP server works via browser")
 class TestHttpServer:
     """Test the HTTP management server on the LAN interface."""
 
