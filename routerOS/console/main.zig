@@ -115,10 +115,15 @@ fn processCommand(line: []const u8) void {
         serialWrite("  put <path>               - write file (end with empty line)\r\n");
         serialWrite("  mkdir <path>             - create directory\r\n");
         serialWrite("  rm <path>                - remove file\r\n");
+        serialWrite("  rmdir <path>             - remove directory\r\n");
+        serialWrite("  mv <src> <dst>           - rename file\r\n");
+        serialWrite("  touch <path>             - create empty file\r\n");
+        serialWrite("  stat <path>              - file attributes\r\n");
         serialWrite("NTP commands:\r\n");
         serialWrite("  time                     - show current time\r\n");
         serialWrite("  sync                     - sync time via NTP\r\n");
         serialWrite("  ntpserver <ip>           - set NTP server\r\n");
+        serialWrite("  timezone <offset>        - set timezone (e.g. -6, +5:30)\r\n");
     } else if (eql(line, "version")) {
         serialWrite("Zag RouterOS v0.1\r\n");
     } else if (eql(line, "uptime")) {
@@ -176,11 +181,21 @@ fn processCommand(line: []const u8) void {
         nfsMultiResponse(line);
     } else if (startsWith(line, "rm ")) {
         nfsMultiResponse(line);
+    } else if (startsWith(line, "rmdir ")) {
+        nfsMultiResponse(line);
+    } else if (startsWith(line, "mv ")) {
+        nfsMultiResponse(line);
+    } else if (startsWith(line, "touch ")) {
+        nfsMultiResponse(line);
+    } else if (startsWith(line, "stat ")) {
+        nfsMultiResponse(line);
     } else if (eql(line, "time")) {
         ntpMultiResponse("time");
     } else if (eql(line, "sync")) {
         ntpMultiResponse("sync");
     } else if (startsWith(line, "ntpserver ")) {
+        ntpMultiResponse(line);
+    } else if (startsWith(line, "timezone ")) {
         ntpMultiResponse(line);
     } else {
         serialWrite("unknown command: ");
@@ -592,6 +607,11 @@ fn ntpMultiResponse(cmd: []const u8) void {
     if (!has_ntp) {
         serialWrite("ntp: not connected\r\n");
         return;
+    }
+    // Drain any stale messages (e.g. auto-sync response) before sending new command
+    {
+        var stale_buf: [256]u8 = undefined;
+        while (ntp_chan.recv(&stale_buf) != null) {}
     }
     _ = ntp_chan.send(cmd);
     var resp: [256]u8 = undefined;

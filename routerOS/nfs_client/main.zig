@@ -39,6 +39,8 @@ const State = enum {
     write_pending,
     mkdir_pending,
     remove_pending,
+    rmdir_pending,
+    rename_pending,
     commit_pending,
 };
 
@@ -74,6 +76,13 @@ var readdir_cookieverf: [8]u8 = [_]u8{0} ** 8;
 var write_fh: nfs3.FileHandle = .{};
 var write_offset: u64 = 0;
 var awaiting_write_data: bool = false;
+
+// For rename operations (need to resolve two paths)
+var rename_from_fh: nfs3.FileHandle = .{};
+var rename_from_name_buf: [256]u8 = undefined;
+var rename_from_name_len: usize = 0;
+var rename_dst_buf: [256]u8 = undefined;
+var rename_dst_len: usize = 0;
 
 // Retry state
 var retry_buf: [2048]u8 = undefined;
@@ -312,6 +321,30 @@ fn sendRemove(dir_fh: *const nfs3.FileHandle, name: []const u8) void {
     state = .remove_pending;
 }
 
+fn sendRmdir(dir_fh: *const nfs3.FileHandle, name: []const u8) void {
+    var buf: [512]u8 = undefined;
+    pending_xid = allocXid();
+    const len = nfs3.buildRmdirRequest(&buf, pending_xid, dir_fh, name);
+    sendUdpPacket(SERVER_IP, nfs3.NFS_PORT, nfs3.LOCAL_PORT, buf[0..len]);
+    state = .rmdir_pending;
+}
+
+fn sendRename(from_dir_fh: *const nfs3.FileHandle, from_name: []const u8, to_dir_fh: *const nfs3.FileHandle, to_name: []const u8) void {
+    var buf: [1024]u8 = undefined;
+    pending_xid = allocXid();
+    const len = nfs3.buildRenameRequest(&buf, pending_xid, from_dir_fh, from_name, to_dir_fh, to_name);
+    sendUdpPacket(SERVER_IP, nfs3.NFS_PORT, nfs3.LOCAL_PORT, buf[0..len]);
+    state = .rename_pending;
+}
+
+fn sendGetAttr(fh: *const nfs3.FileHandle) void {
+    var buf: [512]u8 = undefined;
+    pending_xid = allocXid();
+    const len = nfs3.buildGetAttrRequest(&buf, pending_xid, fh);
+    sendUdpPacket(SERVER_IP, nfs3.NFS_PORT, nfs3.LOCAL_PORT, buf[0..len]);
+    state = .getattr_pending;
+}
+
 fn sendCommit(fh: *const nfs3.FileHandle) void {
     var buf: [512]u8 = undefined;
     pending_xid = allocXid();
@@ -415,11 +448,17 @@ fn handleNfsReply(payload: []const u8) void {
         },
         .create_pending => {
             if (nfs3.parseCreateReply(payload, pending_xid)) |fh| {
-                write_fh = fh;
-                write_offset = 0;
-                awaiting_write_data = true;
-                state = .mounted;
-                sendResponse("OK: send data\n");
+                if (pending_op == .touch_op) {
+                    // touch: commit immediately, no write data prompt
+                    write_fh = fh;
+                    sendCommit(&write_fh);
+                } else {
+                    write_fh = fh;
+                    write_offset = 0;
+                    awaiting_write_data = true;
+                    state = .mounted;
+                    sendResponse("OK: send data\n");
+                }
             } else {
                 sendResponse("NFS: create failed\n");
                 sendEof();
@@ -451,6 +490,50 @@ fn handleNfsReply(payload: []const u8) void {
                 sendResponse("OK\n");
             } else {
                 sendResponse("NFS: remove failed\n");
+            }
+            sendEof();
+            state = .mounted;
+        },
+        .rmdir_pending => {
+            if (nfs3.parseRmdirReply(payload, pending_xid)) {
+                sendResponse("OK\n");
+            } else {
+                sendResponse("NFS: rmdir failed\n");
+            }
+            sendEof();
+            state = .mounted;
+        },
+        .rename_pending => {
+            if (nfs3.parseRenameReply(payload, pending_xid)) {
+                sendResponse("OK\n");
+            } else {
+                sendResponse("NFS: rename failed\n");
+            }
+            sendEof();
+            state = .mounted;
+        },
+        .getattr_pending => {
+            if (nfs3.parseGetAttrReply(payload, pending_xid)) |attr| {
+                var resp_buf: [128]u8 = undefined;
+                var pos: usize = 0;
+                // File type
+                const type_str: []const u8 = if (attr.ftype == nfs3.NF3REG) "file" else if (attr.ftype == nfs3.NF3DIR) "dir" else "other";
+                @memcpy(resp_buf[pos..][0..5], "type=");
+                pos += 5;
+                @memcpy(resp_buf[pos..][0..type_str.len], type_str);
+                pos += type_str.len;
+                // Size
+                @memcpy(resp_buf[pos..][0..6], " size=");
+                pos += 6;
+                var size_buf: [20]u8 = undefined;
+                const size_str = formatSize(attr.size, &size_buf);
+                @memcpy(resp_buf[pos..][0..size_str.len], size_str);
+                pos += size_str.len;
+                resp_buf[pos] = '\n';
+                pos += 1;
+                sendResponse(resp_buf[0..pos]);
+            } else {
+                sendResponse("NFS: stat failed\n");
             }
             sendEof();
             state = .mounted;
@@ -496,8 +579,8 @@ fn getComponent(idx: u32) []const u8 {
 
 fn continueAfterLookup() void {
     const target_depth: u32 = switch (pending_op) {
-        .create, .mkdir_op, .remove => if (num_components > 1) num_components - 1 else 0,
-        .read, .readdir => num_components,
+        .create, .mkdir_op, .remove, .rmdir_op, .rename_src, .rename_dst, .touch_op => if (num_components > 1) num_components - 1 else 0,
+        .read, .readdir, .stat_op => num_components,
     };
     if (lookup_depth < target_depth) {
         sendLookup(&current_fh, getComponent(lookup_depth));
@@ -562,9 +645,17 @@ fn handleCommand(data: []const u8, source: RequestSource) void {
     } else if (startsWith(cmd, "rm ")) {
         const path = trimCommand(cmd, "rm");
         startLookupChainForOp(path, .remove);
+    } else if (startsWith(cmd, "rmdir ")) {
+        const path = trimCommand(cmd, "rmdir");
+        startLookupChainForOp(path, .rmdir_op);
+    } else if (startsWith(cmd, "mv ")) {
+        handleMvCommand(cmd);
+    } else if (startsWith(cmd, "touch ")) {
+        const path = trimCommand(cmd, "touch");
+        startLookupChainForOp(path, .touch_op);
     } else if (startsWith(cmd, "stat ")) {
         const path = trimCommand(cmd, "stat");
-        startLookupChainForOp(path, .read); // TODO: proper stat
+        startLookupChainForOp(path, .stat_op);
     } else if (startsWith(cmd, "status")) {
         if (mounted) {
             sendResponse("NFS: mounted\n");
@@ -579,7 +670,7 @@ fn handleCommand(data: []const u8, source: RequestSource) void {
 }
 
 // Operation tracking for lookup chains
-var pending_op: enum { read, readdir, create, mkdir_op, remove } = .read;
+var pending_op: enum { read, readdir, create, mkdir_op, remove, rmdir_op, rename_src, rename_dst, stat_op, touch_op } = .read;
 
 fn startLookupChainForOp(path: []const u8, op: @TypeOf(pending_op)) void {
     pending_op = op;
@@ -588,8 +679,8 @@ fn startLookupChainForOp(path: []const u8, op: @TypeOf(pending_op)) void {
     current_fh = root_fh;
 
     const target_depth: u32 = switch (op) {
-        .create, .mkdir_op, .remove => if (num_components > 1) num_components - 1 else 0,
-        .read, .readdir => num_components,
+        .create, .mkdir_op, .remove, .rmdir_op, .rename_src, .rename_dst, .touch_op => if (num_components > 1) num_components - 1 else 0,
+        .read, .readdir, .stat_op => num_components,
     };
 
     if (target_depth == 0) {
@@ -611,7 +702,7 @@ fn finishLookupChain() void {
             readdir_cookieverf = [_]u8{0} ** 8;
             sendReadDir(&current_fh);
         },
-        .create => {
+        .create, .touch_op => {
             if (num_components > 0) {
                 sendCreate(&current_fh, getComponent(num_components - 1));
             }
@@ -625,6 +716,43 @@ fn finishLookupChain() void {
             if (num_components > 0) {
                 sendRemove(&current_fh, getComponent(num_components - 1));
             }
+        },
+        .rmdir_op => {
+            if (num_components > 0) {
+                sendRmdir(&current_fh, getComponent(num_components - 1));
+            }
+        },
+        .rename_src => {
+            // Save the source parent FH and name, then resolve destination
+            rename_from_fh = current_fh;
+            if (num_components > 0) {
+                const name = getComponent(num_components - 1);
+                const copy_len = @min(name.len, rename_from_name_buf.len);
+                @memcpy(rename_from_name_buf[0..copy_len], name[0..copy_len]);
+                rename_from_name_len = copy_len;
+            }
+            // Now resolve destination path
+            parsePath(rename_dst_buf[0..rename_dst_len]);
+            lookup_depth = 0;
+            current_fh = root_fh;
+            pending_op = .rename_dst;
+
+            const target_depth: u32 = if (num_components > 1) num_components - 1 else 0;
+            if (target_depth == 0) {
+                finishLookupChain();
+                return;
+            }
+            sendLookup(&current_fh, getComponent(0));
+        },
+        .rename_dst => {
+            // Both paths resolved, send RENAME
+            if (num_components > 0) {
+                const to_name = getComponent(num_components - 1);
+                sendRename(&rename_from_fh, rename_from_name_buf[0..rename_from_name_len], &current_fh, to_name);
+            }
+        },
+        .stat_op => {
+            sendGetAttr(&current_fh);
         },
     }
 }
@@ -643,6 +771,57 @@ fn trimCommand(cmd: []const u8, prefix: []const u8) []const u8 {
     while (rest.len > 0 and rest[0] == ' ') rest = rest[1..];
     if (rest.len == 0) return "/";
     return rest;
+}
+
+fn handleMvCommand(cmd: []const u8) void {
+    // Parse "mv <src> <dst>"
+    var rest = cmd;
+    if (rest.len > 3) rest = rest[3..] else {
+        sendResponse("usage: mv <src> <dst>\n");
+        sendEof();
+        return;
+    }
+    while (rest.len > 0 and rest[0] == ' ') rest = rest[1..];
+
+    // Find space separating src and dst
+    var split: usize = 0;
+    while (split < rest.len and rest[split] != ' ') : (split += 1) {}
+    if (split == 0 or split >= rest.len) {
+        sendResponse("usage: mv <src> <dst>\n");
+        sendEof();
+        return;
+    }
+    const src = rest[0..split];
+    var dst = rest[split..];
+    while (dst.len > 0 and dst[0] == ' ') dst = dst[1..];
+    if (dst.len == 0) {
+        sendResponse("usage: mv <src> <dst>\n");
+        sendEof();
+        return;
+    }
+
+    // Save destination path for later
+    const dst_copy_len = @min(dst.len, rename_dst_buf.len);
+    @memcpy(rename_dst_buf[0..dst_copy_len], dst[0..dst_copy_len]);
+    rename_dst_len = dst_copy_len;
+
+    // Start resolving source path
+    startLookupChainForOp(src, .rename_src);
+}
+
+fn formatSize(size: u64, buf: []u8) []const u8 {
+    if (size == 0) {
+        buf[0] = '0';
+        return buf[0..1];
+    }
+    var v = size;
+    var i: usize = buf.len;
+    while (v > 0 and i > 0) {
+        i -= 1;
+        buf[i] = '0' + @as(u8, @truncate(v % 10));
+        v /= 10;
+    }
+    return buf[i..];
 }
 
 // ── Response helpers ────────────────────────────────────────────────

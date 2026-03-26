@@ -321,6 +321,29 @@
     </div>
   </div>
 
+  <!-- Timezone -->
+  <div class="card">
+    <div class="card-header" onclick="toggleCard(this)">
+      <h2>Timezone</h2><span class="toggle">&#9660;</span>
+    </div>
+    <div class="card-body">
+      <div class="dns-current" id="tz-cur"></div>
+      <div class="form-row">
+        <span class="form-label">Timezone:</span>
+        <select id="tz-select">
+          <option value="0">UTC</option>
+          <option value="-300">EST (UTC-5)</option>
+          <option value="-360" selected>CST (UTC-6)</option>
+          <option value="-420">MST (UTC-7)</option>
+          <option value="-480">PST (UTC-8)</option>
+          <option value="-540">AKST (UTC-9)</option>
+          <option value="-600">HST (UTC-10)</option>
+        </select>
+        <button onclick="setTimezone()">Set</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Firewall -->
   <div class="card">
     <div class="card-header" onclick="toggleCard(this)">
@@ -557,6 +580,22 @@
         var v = el('span', 'val', d.dns);
         $('dns-cur').appendChild(v);
       }
+      if (d.tz_offset !== undefined) {
+        var tzLabel = formatTzOffset(d.tz_offset);
+        $('tz-cur').innerHTML = '';
+        $('tz-cur').appendChild(document.createTextNode('Current: '));
+        $('tz-cur').appendChild(el('span', 'val', tzLabel));
+        // Sync dropdown selection
+        var sel = $('tz-select');
+        var found = false;
+        for (var j = 0; j < sel.options.length; j++) {
+          if (parseInt(sel.options[j].value) === d.tz_offset) {
+            sel.selectedIndex = j;
+            found = true;
+            break;
+          }
+        }
+      }
     });
 
     get('/api/ifstat', function(err, d) {
@@ -654,6 +693,20 @@
     input.value = '';
     mutate('/api/dns/' + val);
   };
+
+  window.setTimezone = function() {
+    var val = $('tz-select').value;
+    mutate('/api/timezone/' + val);
+  };
+
+  function formatTzOffset(minutes) {
+    if (minutes === 0) return 'UTC';
+    var sign = minutes < 0 ? '-' : '+';
+    var abs = Math.abs(minutes);
+    var h = Math.floor(abs / 60);
+    var m = abs % 60;
+    return 'UTC' + sign + h + (m > 0 ? ':' + (m < 10 ? '0' : '') + m : '');
+  }
 
   window.addFwd = function() {
     var proto = $('fwd-proto').value;

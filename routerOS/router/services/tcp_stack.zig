@@ -140,6 +140,25 @@ pub fn sendHttpResponse(header: []const u8, body: []const u8) void {
     sendTcpData(header, body);
 }
 
+/// Send a chunk of TCP data without FIN (for streaming responses).
+pub fn sendTcpChunk(data: []const u8) void {
+    const MSS: usize = 1400;
+    var offset: usize = 0;
+    while (offset < data.len) {
+        const seg_len = @min(MSS, data.len - offset);
+        sendTcpPacket(data[offset..][0..seg_len], 0x18, local_seq, remote_seq); // PSH+ACK
+        local_seq +%= @intCast(seg_len);
+        offset += seg_len;
+    }
+}
+
+/// Send TCP FIN to close the connection (after streaming is complete).
+pub fn sendTcpFin() void {
+    sendTcpPacket(&.{}, 0x11, local_seq, remote_seq); // FIN+ACK
+    local_seq +%= 1;
+    state = .fin_wait;
+}
+
 // ── TCP transmission ────────────────────────────────────────────────
 
 fn sendTcpData(header: []const u8, body: []const u8) void {
@@ -244,7 +263,9 @@ pub fn formatJsonStatus(buf: []u8) usize {
     }
     p = util.appendStr(buf, p, ",\"dns\":\"");
     p = util.appendIp(buf, p, main.upstream_dns);
-    p = util.appendStr(buf, p, "\"}");
+    p = util.appendStr(buf, p, "\",\"tz_offset\":");
+    p = util.appendSignedDec(buf, p, main.tz_offset_minutes);
+    p = util.appendStr(buf, p, "}");
     return p;
 }
 

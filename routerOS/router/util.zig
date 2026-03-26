@@ -57,6 +57,18 @@ pub fn appendDec(buf: []u8, pos: usize, val: u64) usize {
     return appendStr(buf, pos, tmp[i..20]);
 }
 
+pub fn appendSignedDec(buf: []u8, pos: usize, val: i16) usize {
+    var p = pos;
+    if (val < 0) {
+        if (p < buf.len) {
+            buf[p] = '-';
+            p += 1;
+        }
+        return appendDec(buf, p, @as(u64, @intCast(-@as(i32, val))));
+    }
+    return appendDec(buf, p, @as(u64, @intCast(val)));
+}
+
 pub fn appendIp(buf: []u8, pos: usize, ip: [4]u8) usize {
     var p = pos;
     for (ip, 0..) |octet, idx| {

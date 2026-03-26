@@ -11,6 +11,7 @@ const syscall = lib.syscall;
 const MSG_UDP_SEND: u8 = 0x01;
 const MSG_UDP_RECV: u8 = 0x02;
 const MSG_UDP_BIND: u8 = 0x03;
+const MSG_SET_TIMEZONE: u8 = 0x04;
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -32,6 +33,7 @@ var sync_mono_ns: u64 = 0;
 var synced: bool = false;
 var sync_pending: bool = false;
 var send_time_ns: u64 = 0;
+var tz_offset_minutes: i16 = -360; // CST (UTC-6) default
 
 // ── Entry point ─────────────────────────────────────────────────────
 
@@ -210,7 +212,9 @@ fn handleNtpResponse(payload: []const u8) void {
     p = appendIp(&buf, p, ntp_server_ip);
     p = appendStr(&buf, p, " | ");
     p = appendDateTime(&buf, p, unix_timestamp);
-    p = appendStr(&buf, p, " UTC\n");
+    p = appendStr(&buf, p, " ");
+    p = appendTzLabel(&buf, p);
+    p = appendStr(&buf, p, "\n");
     sendConsole(buf[0..p]);
     sendEof();
 }
@@ -221,6 +225,8 @@ fn handleRouterMessage(data: []const u8) void {
     if (data.len < 1) return;
     if (data[0] == MSG_UDP_RECV and data.len >= 9) {
         handleNtpResponse(data[9..]);
+    } else if (data[0] == MSG_SET_TIMEZONE and data.len >= 3) {
+        tz_offset_minutes = @bitCast([2]u8{ data[1], data[2] });
     }
 }
 
@@ -245,7 +251,9 @@ fn handleCommand(data: []const u8) void {
         var buf: [64]u8 = undefined;
         var p: usize = 0;
         p = appendDateTime(&buf, p, current);
-        p = appendStr(&buf, p, " UTC\n");
+        p = appendStr(&buf, p, " ");
+        p = appendTzLabel(&buf, p);
+        p = appendStr(&buf, p, "\n");
         sendConsole(buf[0..p]);
         sendEof();
     } else if (startsWith(cmd, "ntpserver ")) {
@@ -256,8 +264,21 @@ fn handleCommand(data: []const u8) void {
             sendConsole("invalid IP\n");
         }
         sendEof();
+    } else if (startsWith(cmd, "timezone ")) {
+        if (parseTzOffset(cmd[9..])) |offset| {
+            tz_offset_minutes = offset;
+            var buf: [32]u8 = undefined;
+            var p: usize = 0;
+            p = appendStr(&buf, p, "OK ");
+            p = appendTzLabel(&buf, p);
+            p = appendStr(&buf, p, "\n");
+            sendConsole(buf[0..p]);
+        } else {
+            sendConsole("invalid offset (e.g. -6, +5:30)\n");
+        }
+        sendEof();
     } else {
-        sendConsole("NTP commands: sync, time, ntpserver <ip>\n");
+        sendConsole("NTP commands: sync, time, ntpserver <ip>, timezone <offset>\n");
         sendEof();
     }
 }
@@ -292,9 +313,16 @@ fn sendEof() void {
 // ── Date/time formatting ────────────────────────────────────────────
 
 fn appendDateTime(buf: []u8, start: usize, timestamp: u64) usize {
+    // Apply timezone offset
+    const offset_secs: i64 = @as(i64, tz_offset_minutes) * 60;
+    const adjusted: u64 = if (offset_secs >= 0)
+        timestamp +% @as(u64, @intCast(offset_secs))
+    else
+        timestamp -% @as(u64, @intCast(-offset_secs));
+
     var p = start;
-    var days: u64 = timestamp / 86400;
-    const day_secs = timestamp % 86400;
+    var days: u64 = adjusted / 86400;
+    const day_secs = adjusted % 86400;
     const hours = day_secs / 3600;
     const mins = (day_secs % 3600) / 60;
     const secs = day_secs % 60;
@@ -367,6 +395,73 @@ fn appendDec2(buf: []u8, val: u64) usize {
     buf[0] = '0' + @as(u8, @truncate((val / 10) % 10));
     buf[1] = '0' + @as(u8, @truncate(val % 10));
     return 2;
+}
+
+// ── Timezone helpers ─────────────────────────────────────────────────
+
+fn appendTzLabel(buf: []u8, start: usize) usize {
+    var p = start;
+    if (tz_offset_minutes == 0) {
+        p = appendStr(buf, p, "UTC");
+        return p;
+    }
+    p = appendStr(buf, p, "UTC");
+    const abs_mins: u16 = if (tz_offset_minutes < 0) @intCast(-tz_offset_minutes) else @intCast(tz_offset_minutes);
+    const hrs = abs_mins / 60;
+    const mins = abs_mins % 60;
+    if (tz_offset_minutes < 0) {
+        if (p < buf.len) {
+            buf[p] = '-';
+            p += 1;
+        }
+    } else {
+        if (p < buf.len) {
+            buf[p] = '+';
+            p += 1;
+        }
+    }
+    p = appendDecU8(buf, p, @intCast(hrs));
+    if (mins > 0) {
+        if (p < buf.len) {
+            buf[p] = ':';
+            p += 1;
+        }
+        p += appendDec2(buf[p..], mins);
+    }
+    return p;
+}
+
+fn parseTzOffset(s: []const u8) ?i16 {
+    if (s.len == 0) return null;
+    var i: usize = 0;
+    var negative = false;
+    if (s[0] == '-') {
+        negative = true;
+        i += 1;
+    } else if (s[0] == '+') {
+        i += 1;
+    }
+    // Parse hours
+    var hrs: i16 = 0;
+    var digits: usize = 0;
+    while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+        hrs = hrs * 10 + @as(i16, s[i] - '0');
+        digits += 1;
+    }
+    if (digits == 0 or hrs > 14) return null;
+    // Optional :MM
+    var mins: i16 = 0;
+    if (i < s.len and s[i] == ':') {
+        i += 1;
+        var mdigits: usize = 0;
+        while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
+            mins = mins * 10 + @as(i16, s[i] - '0');
+            mdigits += 1;
+        }
+        if (mdigits == 0 or mins > 59) return null;
+    }
+    const total = hrs * 60 + mins;
+    return if (negative) -total else total;
 }
 
 // ── Utility ─────────────────────────────────────────────────────────

@@ -35,7 +35,11 @@ Interactive command-line interface over the serial port for monitoring and confi
 | `cat <path>` | Read file |
 | `put <path>` | Write file (end with empty line) |
 | `mkdir <path>` | Create directory |
+| `rmdir <path>` | Remove directory |
 | `rm <path>` | Remove file |
+| `mv <src> <dst>` | Rename/move file or directory |
+| `touch <path>` | Create empty file |
+| `stat <path>` | Show file type and size |
 
 ### NTP Commands
 

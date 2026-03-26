@@ -22,6 +22,8 @@ pub const NFSPROC3_WRITE: u32 = 7;
 pub const NFSPROC3_CREATE: u32 = 8;
 pub const NFSPROC3_MKDIR: u32 = 9;
 pub const NFSPROC3_REMOVE: u32 = 12;
+pub const NFSPROC3_RMDIR: u32 = 13;
+pub const NFSPROC3_RENAME: u32 = 14;
 pub const NFSPROC3_READDIR: u32 = 16;
 pub const NFSPROC3_COMMIT: u32 = 21;
 
@@ -321,6 +323,44 @@ pub fn buildRemoveRequest(buf: []u8, xid_val: u32, dir_fh: *const FileHandle, na
 pub fn parseRemoveReply(buf: []const u8, xid_val: u32) bool {
     const body = rpc.parseReplyHeader(buf, xid_val) orelse return false;
     const status = xdr.readU32(buf, body) orelse return false;
+    return status.val == NFS3_OK;
+}
+
+// ── RMDIR ──────────────────────────────────────────────────────────────
+
+pub fn buildRmdirRequest(buf: []u8, xid_val: u32, dir_fh: *const FileHandle, name: []const u8) usize {
+    var p = rpc.buildCallHeader(buf, xid_val, rpc.NFS_PROGRAM, rpc.NFS_VERSION, NFSPROC3_RMDIR);
+    p = xdr.writeOpaque(buf, p, dir_fh.slice());
+    p = xdr.writeString(buf, p, name);
+    return p;
+}
+
+pub fn parseRmdirReply(buf: []const u8, xid_val: u32) bool {
+    const body = rpc.parseReplyHeader(buf, xid_val) orelse return false;
+    const status = xdr.readU32(buf, body) orelse return false;
+    if (status.val != NFS3_OK) {
+        reportNfsError("RMDIR", status.val);
+    }
+    return status.val == NFS3_OK;
+}
+
+// ── RENAME ─────────────────────────────────────────────────────────────
+
+pub fn buildRenameRequest(buf: []u8, xid_val: u32, from_dir_fh: *const FileHandle, from_name: []const u8, to_dir_fh: *const FileHandle, to_name: []const u8) usize {
+    var p = rpc.buildCallHeader(buf, xid_val, rpc.NFS_PROGRAM, rpc.NFS_VERSION, NFSPROC3_RENAME);
+    p = xdr.writeOpaque(buf, p, from_dir_fh.slice());
+    p = xdr.writeString(buf, p, from_name);
+    p = xdr.writeOpaque(buf, p, to_dir_fh.slice());
+    p = xdr.writeString(buf, p, to_name);
+    return p;
+}
+
+pub fn parseRenameReply(buf: []const u8, xid_val: u32) bool {
+    const body = rpc.parseReplyHeader(buf, xid_val) orelse return false;
+    const status = xdr.readU32(buf, body) orelse return false;
+    if (status.val != NFS3_OK) {
+        reportNfsError("RENAME", status.val);
+    }
     return status.val == NFS3_OK;
 }
 

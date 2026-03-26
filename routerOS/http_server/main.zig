@@ -31,6 +31,7 @@ const MUT_ALLOW: u8 = 1;
 const MUT_FORWARD: u8 = 2;
 const MUT_UNFORWARD: u8 = 3;
 const MUT_DNS: u8 = 4;
+const MUT_TIMEZONE: u8 = 5;
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -227,6 +228,13 @@ fn handlePost(path: []const u8) void {
         msg[1] = MUT_DNS;
         @memcpy(msg[2..6], &ip);
         sendMutationAndRespond(&msg);
+    } else if (startsWith(path, "/api/timezone/")) {
+        const tz_prefix = "/api/timezone/";
+        if (path.len > tz_prefix.len) {
+            handleSetTimezone(path[tz_prefix.len..]);
+        } else {
+            sendMutationError("missing offset");
+        }
     } else {
         sendHttpResponse("404 Not Found", "text/plain", "Not Found");
     }
@@ -283,6 +291,35 @@ fn handleRemoveForward(args: []const u8) void {
     sendMutationAndRespond(&msg);
 }
 
+fn handleSetTimezone(args: []const u8) void {
+    // Parse signed integer offset in minutes from URL path
+    if (args.len == 0) return sendMutationError("missing offset");
+    var i: usize = 0;
+    var negative = false;
+    if (args[0] == '-') {
+        negative = true;
+        i += 1;
+    } else if (args[0] == '+') {
+        i += 1;
+    }
+    var val: i16 = 0;
+    var digits: usize = 0;
+    while (i < args.len and args[i] >= '0' and args[i] <= '9') : (i += 1) {
+        val = val * 10 + @as(i16, args[i] - '0');
+        digits += 1;
+    }
+    if (digits == 0) return sendMutationError("invalid offset");
+    if (negative) val = -val;
+
+    const offset_bytes: [2]u8 = @bitCast(val);
+    var msg: [4]u8 = undefined;
+    msg[0] = MSG_MUTATION_REQUEST;
+    msg[1] = MUT_TIMEZONE;
+    msg[2] = offset_bytes[0];
+    msg[3] = offset_bytes[1];
+    sendMutationAndRespond(&msg);
+}
+
 fn sendMutationAndRespond(msg: []const u8) void {
     _ = router_chan.send(msg);
 
@@ -313,33 +350,58 @@ fn sendMutationError(msg: []const u8) void {
 // ── HTTP response builder ───────────────────────────────────────────
 
 fn sendHttpResponse(status: []const u8, content_type: []const u8, body: []const u8) void {
-    // Build: [0x11][status_len:1][status...][ct_len:1][content_type...][body...]
-    var msg: [8192]u8 = undefined;
-    var p: usize = 0;
+    // Wire format: [0x11][chunk_index:1][total_chunks:1][payload...]
+    // Chunk 0 payload: [body_len:2 BE][slen:1][status...][ctlen:1][ct...][body_start...]
+    // Chunk 1..N payload: [body_continuation...]
+    const CHUNK_PAYLOAD = 1900;
 
-    msg[p] = MSG_HTTP_RESPONSE;
-    p += 1;
-
-    // Status
+    // Build header metadata: [body_len_hi][body_len_lo][slen][status][ctlen][ct]
+    var meta: [512]u8 = undefined;
+    var mp: usize = 0;
+    const body_len_u16: u16 = @intCast(@min(body.len, 65535));
+    meta[mp] = @intCast(body_len_u16 >> 8);
+    mp += 1;
+    meta[mp] = @intCast(body_len_u16 & 0xFF);
+    mp += 1;
     const slen: u8 = @intCast(@min(status.len, 255));
-    msg[p] = slen;
-    p += 1;
-    @memcpy(msg[p..][0..slen], status[0..slen]);
-    p += slen;
-
-    // Content-Type
+    meta[mp] = slen;
+    mp += 1;
+    @memcpy(meta[mp..][0..slen], status[0..slen]);
+    mp += slen;
     const ctlen: u8 = @intCast(@min(content_type.len, 255));
-    msg[p] = ctlen;
-    p += 1;
-    @memcpy(msg[p..][0..ctlen], content_type[0..ctlen]);
-    p += ctlen;
+    meta[mp] = ctlen;
+    mp += 1;
+    @memcpy(meta[mp..][0..ctlen], content_type[0..ctlen]);
+    mp += ctlen;
 
-    // Body (may need multiple sends for large payloads like HTML)
-    const blen = @min(body.len, msg.len - p);
-    @memcpy(msg[p..][0..blen], body[0..blen]);
-    p += blen;
+    const total_payload = mp + body.len;
+    const total_chunks: u8 = @intCast((total_payload + CHUNK_PAYLOAD - 1) / CHUNK_PAYLOAD);
 
-    _ = router_chan.send(msg[0..p]);
+    var sent: usize = 0;
+    var chunk_idx: u8 = 0;
+
+    while (chunk_idx < total_chunks) : (chunk_idx += 1) {
+        var msg: [1950]u8 = undefined;
+        msg[0] = MSG_HTTP_RESPONSE;
+        msg[1] = chunk_idx;
+        msg[2] = total_chunks;
+        var p: usize = 3;
+
+        const chunk_end = @min(sent + CHUNK_PAYLOAD, total_payload);
+        while (sent < chunk_end) : (sent += 1) {
+            if (sent < mp) {
+                msg[p] = meta[sent];
+            } else {
+                msg[p] = body[sent - mp];
+            }
+            p += 1;
+        }
+
+        // Spin-wait until ring buffer has space (router must consume previous chunk)
+        while (!router_chan.send(msg[0..p])) {
+            syscall.thread_yield();
+        }
+    }
 }
 
 // ── Utilities ───────────────────────────────────────────────────────

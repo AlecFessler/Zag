@@ -52,6 +52,7 @@ pub var firewall_rules: [firewall.RULES_SIZE]firewall.FirewallRule = [_]firewall
 pub var dns_relays: [dns.RELAY_SIZE]dns.DnsRelay = [_]dns.DnsRelay{dns.empty} ** dns.RELAY_SIZE;
 pub var next_dns_id: u16 = 1;
 pub var upstream_dns: [4]u8 = .{ 10, 0, 2, 1 };
+pub var tz_offset_minutes: i16 = -360; // CST (UTC-6) default
 pub var wan_gateway: [4]u8 = .{ 10, 0, 2, 1 };
 pub var dhcp_leases: [dhcp_server.TABLE_SIZE]dhcp_server.DhcpLease = [_]dhcp_server.DhcpLease{dhcp_server.empty} ** dhcp_server.TABLE_SIZE;
 pub var dhcp_next_ip: u8 = 100;
@@ -1086,6 +1087,8 @@ fn serviceThread() void {
     const nfs_buf = a.alloc(u8, 2048) catch return;
     const ntp_buf = a.alloc(u8, 256) catch return;
     const http_buf = a.alloc(u8, 8192) catch return;
+    var http_chunks_expected: u8 = 0;
+    var http_chunks_received: u8 = 0;
     const state_buf = a.alloc(u8, 4096) catch return;
 
     while (true) {
@@ -1118,7 +1121,33 @@ fn serviceThread() void {
         // HTTP server app messages
         if (http_chan) |*chan| {
             if (chan.recv(http_buf)) |hlen| {
-                handleHttpServerMessage(http_buf[0..hlen], chan, state_buf);
+                if (hlen >= 3 and http_buf[0] == tcp_stack.MSG_HTTP_RESPONSE) {
+                    const chunk_idx = http_buf[1];
+                    const total_chunks = http_buf[2];
+                    const chunk_data = http_buf[3..hlen];
+
+                    if (chunk_idx == 0) {
+                        // First chunk: parse metadata and send HTTP header + body start
+                        http_chunks_expected = total_chunks;
+                        http_chunks_received = 1;
+                        handleHttpResponseStreaming(chunk_data, total_chunks == 1);
+                    } else {
+                        // Continuation chunk: send body data directly as TCP
+                        http_chunks_received += 1;
+                        const is_last = (http_chunks_received >= http_chunks_expected);
+                        if (is_last) {
+                            // Last chunk: send data + FIN
+                            tcp_stack.sendTcpChunk(chunk_data);
+                            tcp_stack.sendTcpFin();
+                            http_chunks_expected = 0;
+                            http_chunks_received = 0;
+                        } else {
+                            tcp_stack.sendTcpChunk(chunk_data);
+                        }
+                    }
+                } else {
+                    handleHttpServerMessage(http_buf[0..hlen], chan, state_buf);
+                }
             }
         }
 
@@ -1134,8 +1163,7 @@ fn handleHttpServerMessage(data: []const u8, chan: *channel_mod.Channel, buf: []
             handleStateQuery(data[1], chan, buf);
         },
         tcp_stack.MSG_HTTP_RESPONSE => {
-            if (data.len < 3) return;
-            handleHttpResponse(data[1..]);
+            // Handled by chunked reassembly in service loop; should not reach here
         },
         tcp_stack.MSG_MUTATION_REQUEST => {
             if (data.len < 2) return;
@@ -1159,10 +1187,16 @@ fn handleStateQuery(endpoint: u8, chan: *channel_mod.Channel, buf: []u8) void {
     _ = chan.send(buf[0 .. 1 + json_len]);
 }
 
-/// Parse MSG_HTTP_RESPONSE from http_server and send as TCP data.
-/// Wire format: [status_len:1][status...][ct_len:1][content_type...][body...]
-fn handleHttpResponse(data: []const u8) void {
+/// Parse chunk 0 of MSG_HTTP_RESPONSE from http_server and send via TCP.
+/// Wire format: [body_len:2 BE][slen:1][status...][ctlen:1][ct...][body_start...]
+/// If is_complete, sends with FIN. Otherwise, sends header + body start without FIN.
+fn handleHttpResponseStreaming(data: []const u8, is_complete: bool) void {
     var p: usize = 0;
+
+    // Parse total body length (2 bytes BE)
+    if (p + 2 > data.len) return;
+    const body_len: u64 = @as(u64, data[p]) << 8 | @as(u64, data[p + 1]);
+    p += 2;
 
     // Parse status
     if (p >= data.len) return;
@@ -1180,8 +1214,8 @@ fn handleHttpResponse(data: []const u8) void {
     const content_type = data[p..][0..ctlen];
     p += ctlen;
 
-    // Remaining is body
-    const body = data[p..];
+    // Remaining is the first body data
+    const body_start = data[p..];
 
     // Build HTTP/1.0 response header
     var hdr: [256]u8 = undefined;
@@ -1191,10 +1225,17 @@ fn handleHttpResponse(data: []const u8) void {
     hp = util.appendStr(&hdr, hp, "\r\nContent-Type: ");
     hp = util.appendStr(&hdr, hp, content_type);
     hp = util.appendStr(&hdr, hp, "\r\nContent-Length: ");
-    hp = util.appendDec(&hdr, hp, body.len);
+    hp = util.appendDec(&hdr, hp, body_len);
     hp = util.appendStr(&hdr, hp, "\r\nConnection: close\r\n\r\n");
 
-    tcp_stack.sendHttpResponse(hdr[0..hp], body);
+    if (is_complete) {
+        // Single chunk — send header + body with FIN (original path)
+        tcp_stack.sendHttpResponse(hdr[0..hp], body_start);
+    } else {
+        // Multi-chunk — send header + first body data without FIN
+        tcp_stack.sendTcpChunk(hdr[0..hp]);
+        tcp_stack.sendTcpChunk(body_start);
+    }
 }
 
 /// Handle a mutation request from http_server.
@@ -1211,6 +1252,7 @@ fn handleMutationRequest(data: []const u8, chan: *channel_mod.Channel, buf: []u8
         2 => mutateForward(params),
         3 => mutateUnforward(params),
         4 => mutateDns(params),
+        5 => mutateTimezone(params),
         else => "{\"ok\":false,\"error\":\"unknown mutation\"}",
     };
 
@@ -1287,6 +1329,18 @@ fn mutateUnforward(params: []const u8) []const u8 {
 fn mutateDns(params: []const u8) []const u8 {
     if (params.len < 4) return "{\"ok\":false,\"error\":\"invalid ip\"}";
     upstream_dns = params[0..4].*;
+    return "{\"ok\":true}";
+}
+
+fn mutateTimezone(params: []const u8) []const u8 {
+    if (params.len < 2) return "{\"ok\":false,\"error\":\"invalid offset\"}";
+    const offset: i16 = @bitCast([2]u8{ params[0], params[1] });
+    if (offset < -840 or offset > 840) return "{\"ok\":false,\"error\":\"offset out of range\"}";
+    tz_offset_minutes = offset;
+    // Forward to NTP client
+    if (ntp_chan) |*chan| {
+        _ = chan.send(&[_]u8{ 0x04, params[0], params[1] });
+    }
     return "{\"ok\":true}";
 }
 
