@@ -176,6 +176,8 @@ pub fn main(perm_view_addr: u64) void {
         var router_buf: [2048]u8 = undefined;
         if (router_chan.recv(&router_buf)) |len| {
             handleRouterMessage(router_buf[0..len]);
+        } else {
+            router_chan.rx.waitForData(10_000_000); // 10ms
         }
 
         // Detect console channel
@@ -193,7 +195,6 @@ pub fn main(perm_view_addr: u64) void {
 
         checkTimeout();
         processLogQueue();
-        syscall.thread_yield();
     }
 }
 

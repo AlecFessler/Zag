@@ -714,7 +714,6 @@ pub fn main(perm_view_addr: u64) void {
         ping_mod.checkTimeout();
         ping_mod.checkTracerouteTimeout();
         periodicMaintenance();
-        syscall.thread_yield();
     }
 }
 
@@ -785,11 +784,16 @@ fn handleConsoleCommand(chan: *channel_mod.Channel, cmd: []const u8) void {
     } else if (util.eql(cmd, "leases")) {
         var count: u32 = 0;
         for (&dhcp_leases) |*l| {
-            if (!l.valid) continue;
+            const gen = l.seq.readBegin();
+            const valid = l.valid;
+            const l_ip = l.ip;
+            const l_mac = l.mac;
+            if (l.seq.readRetry(gen)) continue;
+            if (!valid) continue;
             var p: usize = 0;
-            p = util.appendIp(&resp, p, l.ip);
+            p = util.appendIp(&resp, p, l_ip);
             p = util.appendStr(&resp, p, " ");
-            p = util.appendMac(&resp, p, l.mac);
+            p = util.appendMac(&resp, p, l_mac);
             _ = chan.send(resp[0..p]);
             count += 1;
         }
@@ -900,7 +904,14 @@ fn handleConsoleCommand(chan: *channel_mod.Channel, cmd: []const u8) void {
         };
         for (&firewall_rules) |*r| {
             if (!r.valid) {
-                r.* = .{ .valid = true, .action = .block, .src_ip = ip, .src_mask = .{ 255, 255, 255, 255 }, .protocol = 0, .dst_port = 0 };
+                r.seq.writeBegin();
+                r.valid = true;
+                r.action = .block;
+                r.src_ip = ip;
+                r.src_mask = .{ 255, 255, 255, 255 };
+                r.protocol = 0;
+                r.dst_port = 0;
+                r.seq.writeEnd();
                 _ = chan.send("OK");
                 return;
             }
@@ -913,7 +924,9 @@ fn handleConsoleCommand(chan: *channel_mod.Channel, cmd: []const u8) void {
         };
         for (&firewall_rules) |*r| {
             if (r.valid and r.action == .block and util.eql(&r.src_ip, &ip)) {
+                r.seq.writeBegin();
                 r.valid = false;
+                r.seq.writeEnd();
                 _ = chan.send("OK");
                 return;
             }
@@ -939,7 +952,13 @@ fn handleConsoleCommand(chan: *channel_mod.Channel, cmd: []const u8) void {
         };
         for (&port_forwards) |*f| {
             if (!f.valid) {
-                f.* = .{ .valid = true, .protocol = proto, .wan_port = parsed.port1, .lan_ip = parsed.ip, .lan_port = parsed.port2 };
+                f.seq.writeBegin();
+                f.valid = true;
+                f.protocol = proto;
+                f.wan_port = parsed.port1;
+                f.lan_ip = parsed.ip;
+                f.lan_port = parsed.port2;
+                f.seq.writeEnd();
                 _ = chan.send("OK");
                 return;
             }
@@ -996,7 +1015,7 @@ fn handleConsoleCommand(chan: *channel_mod.Channel, cmd: []const u8) void {
     } else if (util.eql(cmd, "static-leases")) {
         var count: u32 = 0;
         for (&dhcp_static_leases) |*s| {
-            if (!s.valid) continue;
+            if (@atomicLoad(u8, &s.state, .acquire) == 0) continue;
             var p: usize = 0;
             p = util.appendIp(&resp, p, s.ip);
             p = util.appendStr(&resp, p, " ");
@@ -1029,14 +1048,16 @@ fn handleConsoleCommand(chan: *channel_mod.Channel, cmd: []const u8) void {
             return;
         }
         for (&dhcp_static_leases) |*s| {
-            if (s.valid and (util.eql(&s.mac, &mac) or util.eql(&s.ip, &ip))) {
+            if (@atomicLoad(u8, &s.state, .acquire) != 0 and (util.eql(&s.mac, &mac) or util.eql(&s.ip, &ip))) {
                 _ = chan.send("conflict: MAC or IP already reserved");
                 return;
             }
         }
         for (&dhcp_static_leases) |*s| {
-            if (!s.valid) {
-                s.* = .{ .mac = mac, .ip = ip, .valid = true };
+            if (@atomicLoad(u8, &s.state, .acquire) == 0) {
+                s.mac = mac;
+                s.ip = ip;
+                @atomicStore(u8, &s.state, 1, .release);
                 _ = chan.send("OK");
                 return;
             }
@@ -1076,7 +1097,7 @@ fn handleConsoleCommand(chan: *channel_mod.Channel, cmd: []const u8) void {
         }
         // Static DHCP leases
         for (&dhcp_static_leases) |*s| {
-            if (!s.valid) continue;
+            if (@atomicLoad(u8, &s.state, .acquire) == 0) continue;
             var p: usize = 0;
             p = util.appendStr(&resp, p, "static-lease ");
             p = util.appendMac(&resp, p, s.mac);
@@ -1361,14 +1382,14 @@ fn mutateBlock(params: []const u8) []const u8 {
     const ip = util.parseIp(params) orelse return "{\"ok\":false,\"error\":\"invalid ip\"}";
     for (&firewall_rules) |*r| {
         if (!r.valid) {
-            r.* = .{
-                .valid = true,
-                .action = .block,
-                .src_ip = ip,
-                .src_mask = .{ 255, 255, 255, 255 },
-                .protocol = 0,
-                .dst_port = 0,
-            };
+            r.seq.writeBegin();
+            r.valid = true;
+            r.action = .block;
+            r.src_ip = ip;
+            r.src_mask = .{ 255, 255, 255, 255 };
+            r.protocol = 0;
+            r.dst_port = 0;
+            r.seq.writeEnd();
             return "{\"ok\":true}";
         }
     }
@@ -1379,7 +1400,9 @@ fn mutateAllow(params: []const u8) []const u8 {
     const ip = util.parseIp(params) orelse return "{\"ok\":false,\"error\":\"invalid ip\"}";
     for (&firewall_rules) |*r| {
         if (r.valid and r.action == .block and util.eql(&r.src_ip, &ip)) {
+            r.seq.writeBegin();
             r.valid = false;
+            r.seq.writeEnd();
             return "{\"ok\":true}";
         }
     }
@@ -1395,13 +1418,13 @@ fn mutateForward(params: []const u8) []const u8 {
     const lan_port = util.readU16Be(params[7..9]);
     for (&port_forwards) |*f| {
         if (!f.valid) {
-            f.* = .{
-                .valid = true,
-                .protocol = proto,
-                .wan_port = wan_port,
-                .lan_ip = lan_ip,
-                .lan_port = lan_port,
-            };
+            f.seq.writeBegin();
+            f.valid = true;
+            f.protocol = proto;
+            f.wan_port = wan_port;
+            f.lan_ip = lan_ip;
+            f.lan_port = lan_port;
+            f.seq.writeEnd();
             return "{\"ok\":true}";
         }
     }
@@ -1449,6 +1472,5 @@ fn lanPollThread() void {
 
     while (true) {
         pollOnce(&lan_iface, &wan_iface, .lan);
-        syscall.thread_yield();
     }
 }

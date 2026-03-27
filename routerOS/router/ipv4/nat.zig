@@ -124,22 +124,24 @@ fn createOutbound(protocol: util.Protocol, lan_ip: [4]u8, lan_port: u16, dst_ip:
         const entry = &main.nat_table[idx];
         const s = loadState(entry);
         if (s == .empty or s == .expired) {
-            // Try to claim this slot with CAS
+            // Write data fields first — safe because readers check
+            // state == .active (via acquire) before reading data, and
+            // we haven't published .active yet.
+            entry.protocol = proto;
+            entry.lan_ip = lan_ip;
+            entry.lan_port = lan_port;
+            entry.wan_port = wan_port;
+            entry.dst_ip = dst_ip;
+            entry.dst_port = dst_port;
+            entry.timestamp_ns = util.now();
+            entry.tcp_state = @intFromEnum(TcpState.none);
+            if (protocol == .tcp) entry.tcp_state = @intFromEnum(TcpState.syn_sent);
+            // Publish: CAS .acq_rel acts as release fence for the above stores.
+            // Readers' acquire load on state pairs with this.
             const expected: u8 = @intFromEnum(s);
             if (@cmpxchgWeak(u8, &entry.state, expected, @intFromEnum(State.active), .acq_rel, .monotonic) == null) {
-                // Won the slot — fill in fields
-                entry.protocol = proto;
-                entry.lan_ip = lan_ip;
-                entry.lan_port = lan_port;
-                entry.wan_port = wan_port;
-                entry.dst_ip = dst_ip;
-                entry.dst_port = dst_port;
-                entry.timestamp_ns = util.now();
-                entry.tcp_state = @intFromEnum(TcpState.none);
-                if (protocol == .tcp) entry.tcp_state = @intFromEnum(TcpState.syn_sent);
                 // Post-condition: entry is reachable via lookup
                 if (lookupOutbound(protocol, lan_ip, lan_port) == null) {
-                    // Debug: dump the hash chain to understand why lookup failed
                     const dbg_idx = hashOutbound(proto, lan_ip, lan_port);
                     router.log.write(.nat_postcondition_fail);
                     _ = dbg_idx;

@@ -23,6 +23,7 @@ pub fn run() void {
     testFutexTimeoutZeroTryOnly();
     testFutexCrossThreadSignal();
     testFutexTimedWait();
+    testFutexTimedWaitWokenBeforeTimeout();
 }
 
 fn testFutexMismatch() void {
@@ -112,10 +113,15 @@ fn testFutexTimedWaitWokenBeforeTimeout() void {
 
     t.waitUntilNonZero(@as(*volatile u64, &timed_wake_ready));
 
-    var i: u32 = 0;
-    while (i < 10) : (i += 1) syscall.thread_yield();
-
-    _ = syscall.futex_wake(&timed_wake_val, 1);
+    // Yield enough times for the child to enter futex_wait, then wake it.
+    // Re-wake in a loop to handle the race where the child hasn't entered
+    // futex_wait yet when we first call wake.
+    var attempts: u32 = 0;
+    while (attempts < 1000) : (attempts += 1) {
+        syscall.thread_yield();
+        _ = syscall.futex_wake(&timed_wake_val, 1);
+        if (@as(*volatile u64, &timed_wake_done).* != 0) break;
+    }
 
     t.waitUntilNonZero(@as(*volatile u64, &timed_wake_done));
     t.expectEqual("S4.futex_wait: woken before timeout returns E_OK", 0, timed_wake_result);

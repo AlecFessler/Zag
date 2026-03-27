@@ -102,13 +102,16 @@ pub fn main(perm_view_addr: u64) void {
 
     syscall.write("http_server: started\n");
 
+    const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
+
     // Main loop
     while (true) {
         var router_buf: [8192]u8 = undefined;
         if (router_chan.recv(&router_buf)) |len| {
             handleRouterMessage(router_buf[0..len]);
+        } else {
+            router_chan.rx.waitForData(MAX_TIMEOUT);
         }
-        syscall.thread_yield();
     }
 }
 
@@ -180,15 +183,15 @@ fn sendStateQueryResponse(endpoint: u8) void {
     _ = router_chan.send(&[_]u8{ MSG_STATE_QUERY, endpoint });
 
     var buf: [8192]u8 = undefined;
-    var attempts: u32 = 0;
-    while (attempts < 50000) : (attempts += 1) {
+    var attempts: u8 = 0;
+    while (attempts < 10) : (attempts += 1) {
         if (router_chan.recv(&buf)) |len| {
             if (len >= 1 and buf[0] == MSG_STATE_RESPONSE) {
                 sendHttpResponse("200 OK", "application/json", buf[1..len]);
                 return;
             }
         }
-        syscall.thread_yield();
+        router_chan.rx.waitForData(500_000_000); // 500ms
     }
 
     sendHttpResponse("503 Service Unavailable", "text/plain", "State query timeout");
@@ -324,15 +327,15 @@ fn sendMutationAndRespond(msg: []const u8) void {
     _ = router_chan.send(msg);
 
     var buf: [8192]u8 = undefined;
-    var attempts: u32 = 0;
-    while (attempts < 50000) : (attempts += 1) {
+    var attempts: u8 = 0;
+    while (attempts < 10) : (attempts += 1) {
         if (router_chan.recv(&buf)) |len| {
             if (len >= 1 and buf[0] == MSG_MUTATION_RESPONSE) {
                 sendHttpResponse("200 OK", "application/json", buf[1..len]);
                 return;
             }
         }
-        syscall.thread_yield();
+        router_chan.rx.waitForData(500_000_000); // 500ms
     }
 
     sendHttpResponse("503 Service Unavailable", "text/plain", "Mutation timeout");
@@ -397,9 +400,10 @@ fn sendHttpResponse(status: []const u8, content_type: []const u8, body: []const 
             p += 1;
         }
 
-        // Spin-wait until ring buffer has space (router must consume previous chunk)
+        // Wait until ring buffer has space (router must consume previous chunk)
         while (!router_chan.send(msg[0..p])) {
-            syscall.thread_yield();
+            const head_val = @atomicLoad(u64, &router_chan.tx.head, .acquire);
+            _ = syscall.futex_wait(&router_chan.tx.head, head_val, 50_000_000); // 50ms
         }
     }
 }

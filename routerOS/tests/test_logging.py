@@ -122,7 +122,7 @@ class TestNfsLogging:
             f"Boot marker not found in NFS log. Content: {log[:200]}"
 
     def test_log_entries_have_timestamps(self, router):
-        """Log entries have [secs.ms] timestamp prefix."""
+        """Log entries have [boot+secs.ms] or [HH:MM:SS] timestamp prefix."""
         assert wait_for_log_entries(timeout=20), \
             f"No structured log entries appeared. Log content: {get_nfs_log()[:500]}"
         log = get_nfs_log()
@@ -130,8 +130,9 @@ class TestNfsLogging:
         for line in lines[:5]:
             assert line.startswith("["), \
                 f"Log line missing timestamp prefix: {line}"
-            assert "." in line.split("]")[0], \
-                f"Log timestamp missing decimal point (expected [secs.ms]): {line}"
+            ts = line.split("]")[0]
+            assert "." in ts or ":" in ts, \
+                f"Log timestamp missing separator (expected [boot+s.ms] or [HH:MM:SS]): {line}"
 
     def test_log_entries_have_level(self, router):
         """Log entries contain a level tag (INFO, WARN, ERR, DEBUG)."""

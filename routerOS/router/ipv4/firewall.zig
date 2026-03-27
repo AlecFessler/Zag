@@ -1,9 +1,12 @@
+const lib = @import("lib");
 const router = @import("router");
 
 const arp = router.net.arp;
 const h = router.net.headers;
 const main = router.state;
 const util = router.util;
+
+const Seqlock = lib.sync.Seqlock;
 const assert = util.assert;
 
 pub const RULES_SIZE = 64;
@@ -12,57 +15,73 @@ pub const PORT_FWD_SIZE = 32;
 pub const FirewallAction = enum { allow, block };
 
 pub const FirewallRule = struct {
-    valid: bool,
-    action: FirewallAction,
-    src_ip: [4]u8,
-    src_mask: [4]u8,
-    protocol: u8,
-    dst_port: u16,
+    seq: Seqlock = Seqlock.init(),
+    valid: bool = false,
+    action: FirewallAction = .block,
+    src_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    src_mask: [4]u8 = .{ 0, 0, 0, 0 },
+    protocol: u8 = 0,
+    dst_port: u16 = 0,
 };
 
-pub const empty_rule = FirewallRule{
-    .valid = false,
-    .action = .block,
-    .src_ip = .{ 0, 0, 0, 0 },
-    .src_mask = .{ 0, 0, 0, 0 },
-    .protocol = 0,
-    .dst_port = 0,
-};
+pub const empty_rule = FirewallRule{};
 
 pub const PortForward = struct {
-    valid: bool,
-    protocol: util.Protocol,
-    wan_port: u16,
-    lan_ip: [4]u8,
-    lan_port: u16,
+    seq: Seqlock = Seqlock.init(),
+    valid: bool = false,
+    protocol: util.Protocol = .tcp,
+    wan_port: u16 = 0,
+    lan_ip: [4]u8 = .{ 0, 0, 0, 0 },
+    lan_port: u16 = 0,
 };
 
-pub const empty_fwd = PortForward{
-    .valid = false,
-    .protocol = .tcp,
-    .wan_port = 0,
-    .lan_ip = .{ 0, 0, 0, 0 },
-    .lan_port = 0,
-};
+pub const empty_fwd = PortForward{};
 
-pub fn check(rules: *const [RULES_SIZE]FirewallRule, src_ip: [4]u8, protocol: u8, dst_port: u16) FirewallAction {
+pub fn check(rules: *[RULES_SIZE]FirewallRule, src_ip: [4]u8, protocol: u8, dst_port: u16) FirewallAction {
     for (rules) |*r| {
-        if (!r.valid) continue;
-        const ip_match = (src_ip[0] & r.src_mask[0]) == (r.src_ip[0] & r.src_mask[0]) and
-            (src_ip[1] & r.src_mask[1]) == (r.src_ip[1] & r.src_mask[1]) and
-            (src_ip[2] & r.src_mask[2]) == (r.src_ip[2] & r.src_mask[2]) and
-            (src_ip[3] & r.src_mask[3]) == (r.src_ip[3] & r.src_mask[3]);
+        const gen = r.seq.readBeginNonblock();
+        if (!r.valid) {
+            if (!r.seq.readRetry(gen)) continue;
+            continue;
+        }
+        const action = r.action;
+        const r_src_ip = r.src_ip;
+        const r_src_mask = r.src_mask;
+        const r_protocol = r.protocol;
+        const r_dst_port = r.dst_port;
+        if (r.seq.readRetry(gen)) continue;
+
+        const ip_match = (src_ip[0] & r_src_mask[0]) == (r_src_ip[0] & r_src_mask[0]) and
+            (src_ip[1] & r_src_mask[1]) == (r_src_ip[1] & r_src_mask[1]) and
+            (src_ip[2] & r_src_mask[2]) == (r_src_ip[2] & r_src_mask[2]) and
+            (src_ip[3] & r_src_mask[3]) == (r_src_ip[3] & r_src_mask[3]);
         if (!ip_match) continue;
-        if (r.protocol != 0 and r.protocol != protocol) continue;
-        if (r.dst_port != 0 and r.dst_port != dst_port) continue;
-        return r.action;
+        if (r_protocol != 0 and r_protocol != protocol) continue;
+        if (r_dst_port != 0 and r_dst_port != dst_port) continue;
+        return action;
     }
     return .allow;
 }
 
-pub fn portFwdLookup(forwards: *const [PORT_FWD_SIZE]PortForward, proto: util.Protocol, wan_port: u16) ?*const PortForward {
+pub fn portFwdLookup(forwards: *[PORT_FWD_SIZE]PortForward, proto: util.Protocol, wan_port: u16) ?PortForward {
     for (forwards) |*f| {
-        if (f.valid and f.protocol == proto and f.wan_port == wan_port) return f;
+        const gen = f.seq.readBeginNonblock();
+        const valid = f.valid;
+        const f_proto = f.protocol;
+        const f_wan_port = f.wan_port;
+        const f_lan_ip = f.lan_ip;
+        const f_lan_port = f.lan_port;
+        if (f.seq.readRetry(gen)) continue;
+
+        if (valid and f_proto == proto and f_wan_port == wan_port) {
+            return .{
+                .valid = true,
+                .protocol = f_proto,
+                .wan_port = f_wan_port,
+                .lan_ip = f_lan_ip,
+                .lan_port = f_lan_port,
+            };
+        }
     }
     return null;
 }
@@ -70,7 +89,13 @@ pub fn portFwdLookup(forwards: *const [PORT_FWD_SIZE]PortForward, proto: util.Pr
 pub fn portFwdAdd(forwards: *[PORT_FWD_SIZE]PortForward, proto: util.Protocol, wan_port: u16, lip: [4]u8, lport: u16) bool {
     for (forwards) |*f| {
         if (!f.valid) {
-            f.* = .{ .valid = true, .protocol = proto, .wan_port = wan_port, .lan_ip = lip, .lan_port = lport };
+            f.seq.writeBegin();
+            f.valid = true;
+            f.protocol = proto;
+            f.wan_port = wan_port;
+            f.lan_ip = lip;
+            f.lan_port = lport;
+            f.seq.writeEnd();
             return true;
         }
     }
@@ -128,10 +153,18 @@ pub fn reversePortForward(pkt: []u8, len: u32) bool {
     const proto: util.Protocol = if (ip.protocol == h.Ipv4Header.PROTO_TCP) .tcp else .udp;
 
     for (&main.port_forwards) |*f| {
-        if (!f.valid) continue;
-        if (f.protocol != proto) continue;
-        if (!util.eql(&f.lan_ip, &ip.src_ip)) continue;
-        if (f.lan_port != udp.srcPort()) continue;
+        const gen = f.seq.readBeginNonblock();
+        const valid = f.valid;
+        const f_proto = f.protocol;
+        const f_lan_ip = f.lan_ip;
+        const f_lan_port = f.lan_port;
+        const f_wan_port = f.wan_port;
+        if (f.seq.readRetry(gen)) continue;
+
+        if (!valid) continue;
+        if (f_proto != proto) continue;
+        if (!util.eql(&f_lan_ip, &ip.src_ip)) continue;
+        if (f_lan_port != udp.srcPort()) continue;
 
         // Match — rewrite src to router WAN IP:wan_port
         const gateway_mac = arp.lookup(&main.wan_iface.arp_table, main.wan_gateway) orelse {
@@ -142,7 +175,7 @@ pub fn reversePortForward(pkt: []u8, len: u32) bool {
         @memcpy(pkt[0..6], &gateway_mac);
         @memcpy(pkt[6..12], &main.wan_iface.mac);
         @memcpy(&ip.src_ip, &main.wan_iface.ip);
-        udp.setSrcPort(f.wan_port);
+        udp.setSrcPort(f_wan_port);
 
         ip.computeAndSetChecksum(pkt);
 

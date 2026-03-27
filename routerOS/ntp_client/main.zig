@@ -102,6 +102,8 @@ pub fn main(perm_view_addr: u64) void {
         var router_buf: [256]u8 = undefined;
         if (router_chan.recv(&router_buf)) |len| {
             handleRouterMessage(router_buf[0..len]);
+        } else {
+            router_chan.rx.waitForData(10_000_000); // 10ms
         }
 
         if (console_chan == null) {
@@ -116,7 +118,6 @@ pub fn main(perm_view_addr: u64) void {
         }
 
         checkTimeout();
-        syscall.thread_yield();
     }
 }
 

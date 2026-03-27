@@ -1,8 +1,11 @@
+const lib = @import("lib");
 const router = @import("router");
 
 const h = router.net.headers;
 const main = router.state;
 const util = router.util;
+
+const Seqlock = lib.sync.Seqlock;
 
 pub const TABLE_SIZE = 128;
 pub const STATIC_TABLE_SIZE = 32;
@@ -15,39 +18,47 @@ const DHCP_ACK: u8 = 5;
 pub const LEASE_DURATION_NS: u64 = 7200_000_000_000; // 7200 seconds
 
 pub const DhcpLease = struct {
-    mac: [6]u8,
-    ip: [4]u8,
-    valid: bool,
-    timestamp_ns: u64,
+    seq: Seqlock = Seqlock.init(),
+    mac: [6]u8 = .{ 0, 0, 0, 0, 0, 0 },
+    ip: [4]u8 = .{ 0, 0, 0, 0 },
+    valid: bool = false,
+    timestamp_ns: u64 = 0,
 };
 
 pub const StaticLease = struct {
-    mac: [6]u8,
-    ip: [4]u8,
-    valid: bool,
+    state: u8 align(8) = 0, // atomic: 0=empty, 1=valid
+    mac: [6]u8 = .{ 0, 0, 0, 0, 0, 0 },
+    ip: [4]u8 = .{ 0, 0, 0, 0 },
 };
 
-pub const empty = DhcpLease{ .mac = .{ 0, 0, 0, 0, 0, 0 }, .ip = .{ 0, 0, 0, 0 }, .valid = false, .timestamp_ns = 0 };
-pub const empty_static = StaticLease{ .mac = .{ 0, 0, 0, 0, 0, 0 }, .ip = .{ 0, 0, 0, 0 }, .valid = false };
+pub const empty = DhcpLease{};
+pub const empty_static = StaticLease{};
 
-fn findLease(leases: []const DhcpLease, mac: [6]u8) ?[4]u8 {
-    for (leases) |l| {
-        if (l.valid and util.eql(&l.mac, &mac)) return l.ip;
+fn findLease(leases: []DhcpLease, mac: [6]u8) ?[4]u8 {
+    for (leases) |*l| {
+        const gen = l.seq.readBeginNonblock();
+        const valid = l.valid;
+        const l_mac = l.mac;
+        const l_ip = l.ip;
+        if (l.seq.readRetry(gen)) continue;
+        if (valid and util.eql(&l_mac, &mac)) return l_ip;
     }
     return null;
 }
 
 fn allocateLease(mac: [6]u8) ?[4]u8 {
-    // Check static leases first
+    // Check static leases first (atomic valid)
     for (&main.dhcp_static_leases) |*s| {
-        if (s.valid and util.eql(&s.mac, &mac)) return s.ip;
+        if (@atomicLoad(u8, &s.state, .acquire) != 0 and util.eql(&s.mac, &mac)) return s.ip;
     }
 
     const now = util.now();
     // Renew existing lease
     for (&main.dhcp_leases) |*l| {
         if (l.valid and util.eql(&l.mac, &mac)) {
+            l.seq.writeBegin();
             l.timestamp_ns = now;
+            l.seq.writeEnd();
             return l.ip;
         }
     }
@@ -62,10 +73,12 @@ fn allocateLease(mac: [6]u8) ?[4]u8 {
                 if (candidate < 100) candidate = 100;
             } else return null; // all IPs conflict with static leases
 
+            l.seq.writeBegin();
             l.ip = .{ 10, 1, 1, candidate };
             @memcpy(&l.mac, &mac);
             l.valid = true;
             l.timestamp_ns = now;
+            l.seq.writeEnd();
             main.dhcp_next_ip = candidate +% 1;
             if (main.dhcp_next_ip < 100) main.dhcp_next_ip = 100;
             return l.ip;
@@ -76,7 +89,7 @@ fn allocateLease(mac: [6]u8) ?[4]u8 {
 
 fn staticLeaseConflict(ip: [4]u8) bool {
     for (&main.dhcp_static_leases) |*s| {
-        if (s.valid and util.eql(&s.ip, &ip)) return true;
+        if (@atomicLoad(u8, &s.state, .acquire) != 0 and util.eql(&s.ip, &ip)) return true;
     }
     return false;
 }
@@ -86,7 +99,9 @@ pub fn expireLeases() void {
     const now = util.now();
     for (&main.dhcp_leases) |*l| {
         if (l.valid and now -% l.timestamp_ns > LEASE_DURATION_NS) {
+            l.seq.writeBegin();
             l.valid = false;
+            l.seq.writeEnd();
         }
     }
 }

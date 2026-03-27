@@ -8,6 +8,7 @@ const iommu = zag.arch.x64.iommu;
 const paging = zag.memory.paging;
 const sched = zag.sched.scheduler;
 
+const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Process = zag.sched.process.Process;
 const ProcessRights = zag.perms.permissions.ProcessRights;
@@ -529,7 +530,8 @@ fn sysFutexWait(addr: u64, expected: u64, timeout_ns: u64) i64 {
 
     const proc = currentProc();
     const vaddr = VAddr.fromInt(addr);
-    const paddr = arch.resolveVaddr(proc.addr_space_root, vaddr) orelse return E_BADADDR;
+    const page_paddr = arch.resolveVaddr(proc.addr_space_root, vaddr) orelse return E_BADADDR;
+    const paddr = PAddr.fromInt(page_paddr.addr + (addr & 0xFFF));
 
     return futex.wait(paddr, expected, timeout_ns, sched.currentThread().?);
 }
@@ -539,7 +541,8 @@ fn sysFutexWake(addr: u64, count: u64) i64 {
 
     const proc = currentProc();
     const vaddr = VAddr.fromInt(addr);
-    const paddr = arch.resolveVaddr(proc.addr_space_root, vaddr) orelse return E_BADADDR;
+    const page_paddr = arch.resolveVaddr(proc.addr_space_root, vaddr) orelse return E_BADADDR;
+    const paddr = PAddr.fromInt(page_paddr.addr + (addr & 0xFFF));
 
     return @intCast(futex.wake(paddr, @truncate(count)));
 }

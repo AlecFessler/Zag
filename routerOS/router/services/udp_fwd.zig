@@ -6,6 +6,7 @@ const h = router.net.headers;
 const main = router.state;
 const util = router.util;
 
+const Seqlock = lib.sync.Seqlock;
 const channel_mod = lib.channel;
 const syscall = lib.syscall;
 
@@ -20,13 +21,14 @@ const PENDING_BUF_SIZE = 2048;
 pub const AppId = enum(u8) { nfs = 0, ntp = 1 };
 
 pub const UdpBinding = struct {
+    seq: Seqlock = Seqlock.init(),
     valid: bool = false,
     port: u16 = 0,
     app: AppId = .nfs,
 };
 
 pub const PendingPacket = struct {
-    valid: bool = false,
+    state: u8 align(8) = 0, // 0=empty, 1=ready (atomic)
     dst_ip: [4]u8 = .{ 0, 0, 0, 0 },
     len: u16 = 0,
     data: [PENDING_BUF_SIZE]u8 = undefined,
@@ -46,7 +48,11 @@ fn handleUdpBind(data: []const u8, app: AppId) void {
     const port = util.readU16Be(data[1..3]);
     for (&main.udp_bindings) |*b| {
         if (!b.valid) {
-            b.* = .{ .valid = true, .port = port, .app = app };
+            b.seq.writeBegin();
+            b.valid = true;
+            b.port = port;
+            b.app = app;
+            b.seq.writeEnd();
             return;
         }
     }
@@ -101,26 +107,28 @@ fn handleUdpSend(data: []const u8) void {
 fn queuePending(dst_ip: [4]u8, data: []const u8) void {
     if (data.len > PENDING_BUF_SIZE) return;
     for (&main.pending_udp) |*p| {
-        if (!p.valid) {
-            p.valid = true;
+        if (@atomicLoad(u8, &p.state, .acquire) == 0) {
             p.dst_ip = dst_ip;
             p.len = @intCast(data.len);
             @memcpy(p.data[0..data.len], data);
+            @atomicStore(u8, &p.state, 1, .release);
             return;
         }
     }
-    main.pending_udp[0].valid = true;
-    main.pending_udp[0].dst_ip = dst_ip;
-    main.pending_udp[0].len = @intCast(data.len);
-    @memcpy(main.pending_udp[0].data[0..data.len], data);
+    // Overwrite first slot as fallback
+    const p = &main.pending_udp[0];
+    p.dst_ip = dst_ip;
+    p.len = @intCast(data.len);
+    @memcpy(p.data[0..data.len], data);
+    @atomicStore(u8, &p.state, 1, .release);
 }
 
 pub fn drainPending() void {
     for (&main.pending_udp) |*p| {
-        if (!p.valid) continue;
+        if (@atomicLoad(u8, &p.state, .acquire) == 0) continue;
         if (arp.lookup(&main.wan_iface.arp_table, p.dst_ip) != null) {
             handleUdpSend(p.data[0..p.len]);
-            p.valid = false;
+            @atomicStore(u8, &p.state, 0, .release);
         }
     }
 }
@@ -133,8 +141,13 @@ pub fn forwardToApp(src_ip: [4]u8, src_port: u16, dst_port: u16, payload: []cons
     var target_app: AppId = .nfs;
     var matched = false;
     for (&main.udp_bindings) |*b| {
-        if (b.valid and b.port == dst_port) {
-            target_app = b.app;
+        const gen = b.seq.readBeginNonblock();
+        const valid = b.valid;
+        const port = b.port;
+        const app = b.app;
+        if (b.seq.readRetry(gen)) continue;
+        if (valid and port == dst_port) {
+            target_app = app;
             matched = true;
             break;
         }

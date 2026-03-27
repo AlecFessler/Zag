@@ -221,14 +221,14 @@ fn routerCommand(cmd: []const u8) void {
     }
     _ = router_chan.send(cmd);
     var resp: [512]u8 = undefined;
-    var attempts: u32 = 0;
-    while (attempts < 10000) : (attempts += 1) {
+    var attempts: u8 = 0;
+    while (attempts < 20) : (attempts += 1) {
         if (router_chan.recv(&resp)) |len| {
             serialWrite(resp[0..len]);
             serialWrite("\r\n");
             return;
         }
-        syscall.thread_yield();
+        router_chan.rx.waitForData(50_000_000); // 50ms
     }
     serialWrite("router: no response\r\n");
 }
@@ -243,22 +243,26 @@ fn routerMultiResponse(cmd: []const u8) void {
     var msg_count: u32 = 0;
     var done = false;
     while (!done and msg_count < 40) {
-        var attempts: u32 = 0;
-        var got_msg = false;
-        while (attempts < 500_000) : (attempts += 1) {
+        if (router_chan.recv(&resp)) |len| {
+            serialWrite(resp[0..len]);
+            serialWrite("\r\n");
+            msg_count += 1;
+            if (len >= 3 and resp[0] == '-' and resp[1] == '-' and resp[2] == '-') {
+                done = true;
+            }
+        } else {
+            router_chan.rx.waitForData(50_000_000); // 50ms
             if (router_chan.recv(&resp)) |len| {
                 serialWrite(resp[0..len]);
                 serialWrite("\r\n");
                 msg_count += 1;
-                got_msg = true;
                 if (len >= 3 and resp[0] == '-' and resp[1] == '-' and resp[2] == '-') {
                     done = true;
                 }
-                break;
+            } else {
+                done = true; // timed out, no more data
             }
-            syscall.thread_yield();
         }
-        if (!got_msg) done = true;
     }
     if (msg_count == 0) {
         serialWrite("router: no response\r\n");
@@ -280,29 +284,36 @@ fn nfsMultiResponse(cmd: []const u8) void {
     var msg_count: u32 = 0;
     var done = false;
     while (!done and msg_count < 64) {
-        var attempts: u32 = 0;
-        var got_msg = false;
-        while (attempts < 500_000) : (attempts += 1) {
+        if (nfs_chan.recv(&resp)) |len| {
+            if (len == 0) {
+                done = true;
+                continue;
+            }
+            if (len > 0 and resp[0] == 0xFF) {
+                serialWrite(resp[1..len]);
+                serialWrite("\r\n");
+            } else {
+                serialWrite(resp[0..len]);
+            }
+            msg_count += 1;
+        } else {
+            nfs_chan.rx.waitForData(50_000_000); // 50ms
             if (nfs_chan.recv(&resp)) |len| {
                 if (len == 0) {
-                    done = true; // EOF
-                    got_msg = true;
-                    break;
+                    done = true;
+                    continue;
                 }
                 if (len > 0 and resp[0] == 0xFF) {
-                    // Error message
                     serialWrite(resp[1..len]);
                     serialWrite("\r\n");
                 } else {
                     serialWrite(resp[0..len]);
                 }
                 msg_count += 1;
-                got_msg = true;
-                break;
+            } else {
+                done = true;
             }
-            syscall.thread_yield();
         }
-        if (!got_msg) done = true;
     }
     if (msg_count == 0) {
         serialWrite("nfs: no response\r\n");

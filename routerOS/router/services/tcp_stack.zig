@@ -353,12 +353,17 @@ pub fn formatJsonLeases(buf: []u8) usize {
     p = util.appendStr(buf, p, "[");
     var first = true;
     for (&main.dhcp_leases) |*l| {
-        if (!l.valid) continue;
+        const gen = l.seq.readBegin();
+        const valid = l.valid;
+        const l_ip = l.ip;
+        const l_mac = l.mac;
+        if (l.seq.readRetry(gen)) continue;
+        if (!valid) continue;
         if (!first) p = util.appendStr(buf, p, ",");
         p = util.appendStr(buf, p, "{\"ip\":\"");
-        p = util.appendIp(buf, p, l.ip);
+        p = util.appendIp(buf, p, l_ip);
         p = util.appendStr(buf, p, "\",\"mac\":\"");
-        p = util.appendMac(buf, p, l.mac);
+        p = util.appendMac(buf, p, l_mac);
         p = util.appendStr(buf, p, "\"}");
         first = false;
     }

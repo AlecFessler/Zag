@@ -244,7 +244,14 @@ fn brokerLoop() void {
         }
 
         if (!found_request) {
-            syscall.thread_yield();
+            // Block until any child sends a connection request (with 10ms timeout
+            // to periodically check all children, since we can only wait on one)
+            if (num_children > 0) {
+                if (children[0].cmd_channel) |cmd| {
+                    const current = @atomicLoad(u64, &cmd.wake_flag, .acquire);
+                    _ = syscall.futex_wait(&cmd.wake_flag, current, 10_000_000);
+                }
+            }
         }
     }
 }
