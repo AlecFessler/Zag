@@ -4,6 +4,7 @@ const zag = @import("zag");
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const elf = std.elf;
+const futex = zag.sched.futex;
 const iommu = zag.arch.x64.iommu;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
@@ -12,6 +13,8 @@ const restart_context_mod = zag.sched.restart_context;
 const sched = zag.sched.scheduler;
 const thread_mod = zag.sched.thread;
 
+const CrashReason = zag.perms.permissions.CrashReason;
+const DeadProcessInfo = zag.perms.permissions.DeadProcessInfo;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
@@ -62,6 +65,8 @@ pub const Process = struct {
     perm_view_phys: PAddr,
     dma_mappings: [MAX_DMA_MAPPINGS]DmaMapping,
     num_dma_mappings: u32,
+    crash_reason: CrashReason,
+    restart_count: u16,
 
     pub const MAX_THREADS = 64;
     pub const MAX_CHILDREN = 64;
@@ -159,12 +164,13 @@ pub const Process = struct {
         unreachable;
     }
 
-    pub fn kill(self: *Process) void {
+    pub fn kill(self: *Process, reason: CrashReason) void {
         self.lock.lock();
         if (!self.alive) {
             self.lock.unlock();
             return;
         }
+        self.crash_reason = reason;
         if (self.restart_context == null) {
             self.alive = false;
         }
@@ -183,7 +189,7 @@ pub const Process = struct {
         while (i < self.num_children) : (i += 1) {
             self.children[i].killSubtree();
         }
-        self.kill();
+        self.kill(.none);
     }
 
     pub fn disableRestart(self: *Process) void {
@@ -233,6 +239,8 @@ pub const Process = struct {
             return;
         };
 
+        self.restart_count +%= 1;
+
         self.vmm.resetForRestart();
 
         self.perm_lock.lock();
@@ -245,6 +253,8 @@ pub const Process = struct {
         self.syncUserView();
         self.perm_lock.unlock();
 
+        self.updateParentView();
+
         if (rc.data_segment.ghost.len > 0) {
             writeToUserPages(
                 self.addr_space_root,
@@ -255,6 +265,26 @@ pub const Process = struct {
 
         const thread = thread_mod.Thread.create(self, rc.entry_point, self.perm_view_vaddr.addr, DEFAULT_STACK_PAGES) catch return;
         sched.enqueueOnCore(arch.coreID(), thread);
+    }
+
+    fn updateParentView(self: *Process) void {
+        const parent = self.parent orelse return;
+        parent.perm_lock.lock();
+        defer parent.perm_lock.unlock();
+        for (parent.perm_table[1..], 1..) |*slot, idx| {
+            const matches = switch (slot.object) {
+                .process => |p| @intFromPtr(p) == @intFromPtr(self),
+                else => false,
+            };
+            if (matches) {
+                parent.syncUserView();
+                if (parent.perm_view_phys.addr != 0) {
+                    const field0_pa = PAddr.fromInt(parent.perm_view_phys.addr + idx * @sizeOf(UserViewEntry) + 16);
+                    _ = futex.wake(field0_pa, 1);
+                }
+                return;
+            }
+        }
     }
 
     fn cleanupPhase1(self: *Process) void {
@@ -270,7 +300,7 @@ pub const Process = struct {
                 .core_pin => |cp| {
                     sched.unpinByRevoke(cp.core_id, cp.thread_tid);
                 },
-                .vm_reservation, .process, .empty => {},
+                .vm_reservation, .process, .dead_process, .empty => {},
             }
             entry.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
         }
@@ -281,7 +311,7 @@ pub const Process = struct {
     fn cleanupPhase2(self: *Process) void {
         if (self.parent) |p| {
             p.removeChild(self);
-            p.clearPermByObject(self);
+            p.convertToDeadProcess(self);
 
             if (!p.alive and p.num_children == 0) {
                 p.cleanupPhase2();
@@ -290,6 +320,29 @@ pub const Process = struct {
 
         if (self.restart_context) |rc| restart_context_mod.destroy(rc);
         allocator.destroy(self);
+    }
+
+    fn convertToDeadProcess(parent: *Process, child: *Process) void {
+        parent.perm_lock.lock();
+        defer parent.perm_lock.unlock();
+        for (parent.perm_table[1..], 1..) |*slot, idx| {
+            const matches = switch (slot.object) {
+                .process => |p| @intFromPtr(p) == @intFromPtr(child),
+                else => false,
+            };
+            if (matches) {
+                slot.object = .{ .dead_process = .{
+                    .crash_reason = child.crash_reason,
+                    .restart_count = child.restart_count,
+                } };
+                parent.syncUserView();
+                if (parent.perm_view_phys.addr != 0) {
+                    const field0_pa = PAddr.fromInt(parent.perm_view_phys.addr + idx * @sizeOf(UserViewEntry) + 16);
+                    _ = futex.wake(field0_pa, 1);
+                }
+                return;
+            }
+        }
     }
 
     pub fn clearPermByObject(self: *Process, target: anytype) void {
@@ -385,6 +438,8 @@ pub const Process = struct {
             .perm_view_phys = PAddr.fromInt(0),
             .dma_mappings = undefined,
             .num_dma_mappings = 0,
+            .crash_reason = .none,
+            .restart_count = 0,
         };
 
         const pmm_iface = pmm.global_pmm.?.allocator();
@@ -445,7 +500,7 @@ pub const Process = struct {
             p.lock.lock();
             defer p.lock.unlock();
             if (p.num_children >= MAX_CHILDREN) {
-                proc.kill();
+                proc.kill(.none);
                 return error.TooManyChildren;
             }
             p.children[p.num_children] = proc;
@@ -481,6 +536,8 @@ pub const Process = struct {
             .perm_view_phys = PAddr.fromInt(0),
             .dma_mappings = undefined,
             .num_dma_mappings = 0,
+            .crash_reason = .none,
+            .restart_count = 0,
         };
         proc.initPermTable(.{});
         return proc;

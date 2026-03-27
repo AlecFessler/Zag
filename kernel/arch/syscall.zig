@@ -374,7 +374,7 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms: u64) i64 {
         .rights = @truncate(perms),
     };
     const handle_id = proc.insertPerm(child_entry) catch {
-        child.kill();
+        child.kill(.none);
         return E_MAXCAP;
     };
 
@@ -510,6 +510,9 @@ fn sysRevokePerm(handle: u64) i64 {
         },
         .process => |child| {
             child.killSubtree();
+            proc.removePerm(handle) catch {};
+        },
+        .dead_process => {
             proc.removePerm(handle) catch {};
         },
         .empty => return E_BADCAP,

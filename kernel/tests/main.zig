@@ -3,6 +3,7 @@ const lib = @import("lib");
 const syscall = lib.syscall;
 const t = lib.testing;
 
+const crash_reason_tests = @import("tests/crash_reason.zig");
 const device_tests = @import("tests/device.zig");
 const futex_tests = @import("tests/futex.zig");
 const grant_reduced_tests = @import("tests/grant_reduced.zig");
@@ -35,6 +36,7 @@ pub fn main(perm_view: u64) void {
     proc_tests.run();
     stack_guard_tests.run();
     multithread_kill_tests.run();
+    crash_reason_tests.run(perm_view);
     restart_tests.run();
     zombie_tests.run();
     grant_reduced_tests.run();

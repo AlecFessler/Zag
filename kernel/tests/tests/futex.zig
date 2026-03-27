@@ -33,6 +33,7 @@ fn testFutexMismatch() void {
 }
 
 fn testFutexBadAlign() void {
+    @setRuntimeSafety(false);
     var buf: [16]u8 align(8) = undefined;
     const misaligned: *const u64 = @ptrFromInt(@intFromPtr(&buf) + 1);
     const rc = syscall.futex_wait(misaligned, 0, MAX_TIMEOUT);
@@ -40,6 +41,7 @@ fn testFutexBadAlign() void {
 }
 
 fn testFutexWakeBadAlign() void {
+    @setRuntimeSafety(false);
     var buf: [16]u8 align(8) = undefined;
     const misaligned: *const u64 = @ptrFromInt(@intFromPtr(&buf) + 1);
     const rc = syscall.futex_wake(misaligned, 1);

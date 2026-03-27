@@ -6,6 +6,23 @@ const Process = zag.sched.process.Process;
 const SharedMemory = zag.memory.shared.SharedMemory;
 const VAddr = zag.memory.address.VAddr;
 
+pub const CrashReason = enum(u5) {
+    none = 0,
+    stack_overflow = 1,
+    stack_underflow = 2,
+    invalid_read = 3,
+    invalid_write = 4,
+    invalid_execute = 5,
+    unmapped_access = 6,
+    out_of_memory = 7,
+    _,
+};
+
+pub const DeadProcessInfo = struct {
+    crash_reason: CrashReason,
+    restart_count: u16,
+};
+
 pub const ProcessRights = packed struct(u16) {
     grant_to: bool = false,
     spawn_thread: bool = false,
@@ -75,6 +92,7 @@ pub const CorePinObject = struct {
 
 pub const KernelObject = union(enum) {
     process: *Process,
+    dead_process: DeadProcessInfo,
     vm_reservation: VmReservationObject,
     shared_memory: *SharedMemory,
     device_region: *DeviceRegion,
@@ -88,6 +106,7 @@ pub const UserViewEntryType = enum(u8) {
     shared_memory = 2,
     device_region = 3,
     core_pin = 4,
+    dead_process = 5,
 };
 
 pub const UserViewEntry = extern struct {
@@ -107,13 +126,25 @@ pub const UserViewEntry = extern struct {
         .field1 = 0,
     };
 
+    fn processField0(crash_reason: CrashReason, restart_count: u16) u64 {
+        return @as(u64, @intFromEnum(crash_reason)) |
+            (@as(u64, restart_count) << 16);
+    }
+
     pub fn fromKernelEntry(entry: PermissionEntry) UserViewEntry {
         return switch (entry.object) {
-            .process => .{
+            .process => |p| .{
                 .handle = entry.handle,
                 .entry_type = @intFromEnum(UserViewEntryType.process),
                 .rights = entry.rights,
-                .field0 = 0,
+                .field0 = processField0(p.crash_reason, p.restart_count),
+                .field1 = 0,
+            },
+            .dead_process => |dp| .{
+                .handle = entry.handle,
+                .entry_type = @intFromEnum(UserViewEntryType.dead_process),
+                .rights = entry.rights,
+                .field0 = processField0(dp.crash_reason, dp.restart_count),
                 .field1 = 0,
             },
             .vm_reservation => |vm| .{

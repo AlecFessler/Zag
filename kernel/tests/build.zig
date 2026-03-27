@@ -10,14 +10,14 @@ fn buildChild(
     const child_app_mod = b.createModule(.{
         .root_source_file = b.path(src),
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .Debug,
         .pic = true,
     });
     child_app_mod.addImport("lib", lib_mod);
     const child_start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "../../libz/start.zig" },
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .Debug,
         .pic = true,
     });
     child_start_mod.addImport("lib", lib_mod);
@@ -41,7 +41,7 @@ pub fn build(b: *std.Build) void {
     const lib_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "../../libz/lib.zig" },
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .Debug,
         .pic = true,
     });
 
@@ -53,6 +53,7 @@ pub fn build(b: *std.Build) void {
     const child_spawner_bin = buildChild(b, target, lib_mod, "child_spawner", "children/child_spawner.zig");
     const child_restart_verify_bin = buildChild(b, target, lib_mod, "child_restart_verify", "children/child_restart_verify.zig");
     const child_shm_writer_bin = buildChild(b, target, lib_mod, "child_shm_writer", "children/child_shm_writer.zig");
+    const child_stack_overflow_restart_bin = buildChild(b, target, lib_mod, "child_stack_overflow_restart", "children/child_stack_overflow_restart.zig");
 
     const embedded_wf = b.addWriteFiles();
     _ = embedded_wf.addCopyFile(child_exit_bin, "child_exit.elf");
@@ -63,6 +64,7 @@ pub fn build(b: *std.Build) void {
     _ = embedded_wf.addCopyFile(child_spawner_bin, "child_spawner.elf");
     _ = embedded_wf.addCopyFile(child_restart_verify_bin, "child_restart_verify.elf");
     _ = embedded_wf.addCopyFile(child_shm_writer_bin, "child_shm_writer.elf");
+    _ = embedded_wf.addCopyFile(child_stack_overflow_restart_bin, "child_stack_overflow_restart.elf");
     const embed_src = embedded_wf.add("embedded_children.zig",
         \\pub const child_exit = @embedFile("child_exit.elf");
         \\pub const child_shm_counter = @embedFile("child_shm_counter.elf");
@@ -72,19 +74,20 @@ pub fn build(b: *std.Build) void {
         \\pub const child_spawner = @embedFile("child_spawner.elf");
         \\pub const child_restart_verify = @embedFile("child_restart_verify.elf");
         \\pub const child_shm_writer = @embedFile("child_shm_writer.elf");
+        \\pub const child_stack_overflow_restart = @embedFile("child_stack_overflow_restart.elf");
         \\
     );
 
     const embedded_children_mod = b.createModule(.{
         .root_source_file = embed_src,
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .Debug,
     });
 
     const app_mod = b.createModule(.{
         .root_source_file = b.path("main.zig"),
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .Debug,
         .pic = true,
     });
     app_mod.addImport("lib", lib_mod);
@@ -93,7 +96,7 @@ pub fn build(b: *std.Build) void {
     const start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "../../libz/start.zig" },
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .Debug,
         .pic = true,
     });
     start_mod.addImport("lib", lib_mod);

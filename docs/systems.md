@@ -111,6 +111,8 @@ Process {
     handle_counter: u64                    -- monotonic, per-process
     perm_view_vaddr: VAddr
     perm_view_phys: PAddr                  -- physmap address for kernel writes
+    crash_reason: CrashReason              -- reason for last crash (u5, .none if no crash)
+    restart_count: u16                     -- number of restarts (wraps on overflow)
 }
 ```
 
@@ -280,12 +282,18 @@ PermissionEntry {
 ```
 KernelObject = union(enum) {
     process: *Process
+    dead_process: DeadProcessInfo { crash_reason: CrashReason, restart_count: u16 }
     vm_reservation: VmReservationObject { max_rights, original_start, original_size }
     shared_memory: *SharedMemory
     device_region: *DeviceRegion
+    core_pin: CorePinObject { core_id, thread_tid }
     empty: void
 }
 ```
+
+### Dead Process Entries
+
+When a non-restartable child process dies, `cleanupPhase2` calls `convertToDeadProcess` on the parent, which replaces the `.process` entry with `.dead_process` carrying the child's crash reason and restart count. This avoids a dangling `*Process` pointer after the process struct is freed. The kernel issues a `futex.wake` on the parent's user view field0 physical address for this entry so that watchdog threads blocked on the field are woken. The parent revokes the handle at its convenience via `revoke_perm`, which simply clears the slot.
 
 ### Empty Slot Sentinel
 
@@ -637,6 +645,14 @@ Stack {
 
 This is pure modular arithmetic -- no data structure lookup needed. A guard hit in kernel mode triggers a panic.
 
+### Guard Detection (User Stacks)
+
+User stack guard pages are VMM reservation nodes with all-zero rights (`read=false, write=false, execute=false`) and size == `PAGE4K`. Detection happens in the page fault handler's rights-violation branch:
+1. If the faulting node has all-zero rights and size == PAGE4K, it is a guard page.
+2. Look up the VMM node immediately above this guard page (`findNode(guard_start + PAGE4K)`).
+3. If the node above is a writable region, the guard is below the usable stack → `stack_overflow` (stack grew past bottom).
+4. Otherwise, the guard is above the usable stack → `stack_underflow` (popped past top).
+
 ### createKernel() -> Stack
 
 Allocate a slot. Compute addresses:
@@ -765,8 +781,8 @@ For each thread in the process's thread list:
 After all threads are marked exited and removed from queues:
 - Destroy stacks, deregister stack guards.
 - Process exit logic runs.
-- If `restart_context` present: restart (process survives).
-- If no restart context: cleanup (zombie if non-leaf, full free if leaf).
+- If `restart_context` present: restart (process survives). `restart_count` is incremented with wrapping arithmetic (`+%=`). `crash_reason` and `restart_count` are written to the process's own user view (slot 0 field0) and the parent's user view entry via `updateParentView`, which also issues a `futex.wake` on the parent's field0 physical address.
+- If no restart context: cleanup. In `cleanupPhase2`, `convertToDeadProcess` replaces the parent's `.process` entry with `.dead_process` carrying `crash_reason` and `restart_count`, syncs the parent's user view, and issues a `futex.wake`.
 
 ### Recursive Kill (Parent Revokes Child Process Handle)
 

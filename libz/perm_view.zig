@@ -2,7 +2,20 @@ pub const ENTRY_TYPE_PROCESS: u8 = 0;
 pub const ENTRY_TYPE_VM_RESERVATION: u8 = 1;
 pub const ENTRY_TYPE_SHARED_MEMORY: u8 = 2;
 pub const ENTRY_TYPE_DEVICE_REGION: u8 = 3;
+pub const ENTRY_TYPE_DEAD_PROCESS: u8 = 5;
 pub const ENTRY_TYPE_EMPTY: u8 = 0xFF;
+
+pub const CrashReason = enum(u5) {
+    none = 0,
+    stack_overflow = 1,
+    stack_underflow = 2,
+    invalid_read = 3,
+    invalid_write = 4,
+    invalid_execute = 5,
+    unmapped_access = 6,
+    out_of_memory = 7,
+    _,
+};
 
 pub const UserViewEntry = extern struct {
     handle: u64,
@@ -12,6 +25,14 @@ pub const UserViewEntry = extern struct {
     _pad: [4]u8,
     field0: u64,
     field1: u64,
+
+    pub fn processCrashReason(self: *const UserViewEntry) CrashReason {
+        return @enumFromInt(@as(u5, @truncate(self.field0)));
+    }
+
+    pub fn processRestartCount(self: *const UserViewEntry) u16 {
+        return @truncate(self.field0 >> 16);
+    }
 
     pub fn deviceType(self: *const UserViewEntry) u8 {
         return @truncate(self.field0);

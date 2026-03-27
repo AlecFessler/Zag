@@ -14,7 +14,7 @@ pub const SharedMemory = struct {
     pages: []PAddr,
     refcount: std.atomic.Value(u32),
 
-    pub const MAX_PAGES: u32 = 256;
+    pub const MAX_PAGES: u32 = 4096;
 
     pub fn size(self: *const SharedMemory) u64 {
         return @as(u64, self.pages.len) * paging.PAGE4K;

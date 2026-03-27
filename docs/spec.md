@@ -37,10 +37,12 @@ Read-only region mapped into the process's address space, mirroring the permissi
 
 Each entry is 32 bytes and contains:
 - `handle: u64` — monotonic ID. `U64_MAX` = empty slot.
-- `type: enum { process, vm_reservation, shared_memory, device_region }`.
+- `type: enum { process, vm_reservation, shared_memory, device_region, core_pin, dead_process }`.
 - `rights: u16`.
 
 Type-specific fields:
+- `process`: `field0` encodes `crash_reason(u5, bits 0-4) | restart_count(u16, bits 16-31)`. On first boot, field0 = 0. After a restart, crash_reason reflects the fault that triggered the restart and restart_count increments.
+- `dead_process`: Same field0 encoding as `process`. This entry type replaces a `process` entry when the child dies without restarting. The parent may inspect the crash reason and restart count, then revoke the handle at its convenience.
 - `vm_reservation`: `start: VAddr`, `size: u64` (original range).
 - `shared_memory`: `size: u64`.
 - `device_region`: `field0: u64`, `field1: u64` (see §2.7 Device Region for encoding).
@@ -175,17 +177,21 @@ The futex mechanism allows userspace synchronization primitives (mutexes, condit
 
 Triggered when a process with a restart context terminates for any reason (last thread exits, fault kill, parent-initiated kill).
 
-The process remains alive throughout. Its permissions table and user view remain intact (except VM reservation entries, which are cleared).
+The process remains alive throughout. Its permissions table and user view remain intact (except VM reservation entries, which are cleared). Each restart increments a restart count (`u16`, wraps to zero on overflow). The crash reason from the triggering fault is recorded in the process's user view field0.
 
 **Persists across restart:** code/rodata/data mappings (data content reloaded from original), user permissions view, BSS region (decommitted), SHM and device handle permissions table entries, process tree position, children, restart context.
 
 **Does not persist:** user-created VM reservations, VM reservation permissions table entries, user stacks, SHM/MMIO mappings within freed reservations, committed pages in decommitted regions, threads.
 
-**First boot vs restart:** On first boot, only slot 0 (`HANDLE_SELF`) exists. On restart, SHM and device handles persist. VM reservation handles do not. No explicit kernel signal — the process inspects its user view.
+**First boot vs restart:** On first boot, only slot 0 (`HANDLE_SELF`) exists and field0 = 0. On restart, SHM and device handles persist. VM reservation handles do not. The process can detect a restart by inspecting its own slot 0 field0 — if crash_reason is non-zero or restart_count is non-zero, it has been restarted.
 
 #### Kill
 
 A process terminates only by: (a) last thread voluntarily exiting, (b) a fault, or (c) parent revoking its process handle. There is no `proc_kill` syscall.
+
+When a process is killed by a fault, the kernel records a **crash reason** (see §3 for the mapping). If the process has a restart context, it restarts and the crash reason and incremented restart count are written to both the process's own user view (slot 0 field0) and the parent's user view entry for this child. The kernel issues a futex wake on the parent's user view field0 for this entry.
+
+If the process does not have a restart context, it undergoes cleanup. The parent's permissions table entry is converted from `process` to `dead_process`, preserving the crash reason and restart count. The kernel issues a futex wake on the parent's user view field0. The parent may inspect the crash info via its user view and revoke the handle at its convenience to free the slot.
 
 **Non-recursive kill** (fault, voluntary exit): All threads are stopped and removed. If the process has a restart context, it restarts. Otherwise, it undergoes cleanup (becoming a zombie if it has children).
 
@@ -213,7 +219,7 @@ Each user stack consists of a usable region flanked by guard pages:
 2. **Usable region** — N pages, read-write. First page eagerly mapped, rest demand-paged.
 3. **Overflow guard** — 1 page, unmapped.
 
-Faults on guard pages kill the process.
+Faults on guard pages kill the process with a specific crash reason: `stack_overflow` if the fault is on the guard below the usable stack (stack grew past bottom), or `stack_underflow` if the fault is on the guard above the usable stack.
 
 ---
 
@@ -261,12 +267,27 @@ At boot, the kernel enumerates devices (PCI bus walk, legacy serial port probing
 
 ### User Faults
 
-1. No VMM node found for the fault address: **kill**.
-2. Shared memory or MMIO region: **kill** (all pages eagerly mapped; a fault means corruption).
-3. Private region, access type not permitted by current rights: **kill**.
-4. Private region, access permitted: **demand-page** (allocate zeroed page, map, resume).
+Each fault that kills a process records a `CrashReason` (u5):
 
-Faults on stack guard pages produce stack overflow/underflow diagnostics. Any other user-triggerable CPU exception (divide-by-zero, invalid opcode, GPF, etc.) kills the faulting process.
+| Value | Name | Trigger |
+|-------|------|---------|
+| 0 | `none` | No crash (sentinel) |
+| 1 | `stack_overflow` | Guard page fault below stack |
+| 2 | `stack_underflow` | Guard page fault above stack |
+| 3 | `invalid_read` | Read fault with no read permission |
+| 4 | `invalid_write` | Write fault with no write permission |
+| 5 | `invalid_execute` | Execute fault with no execute permission |
+| 6 | `unmapped_access` | No VMM node for faulting address |
+| 7 | `out_of_memory` | Demand page allocation failed |
+
+Fault handling:
+
+1. No VMM node found for the fault address: **kill** (`unmapped_access`).
+2. Shared memory or MMIO region: **kill** (`invalid_read`/`invalid_write`/`invalid_execute` based on access type).
+3. Private region, access type not permitted by current rights: if the faulting node is a stack guard page, **kill** (`stack_overflow` or `stack_underflow`); otherwise **kill** (`invalid_read`/`invalid_write`/`invalid_execute`).
+4. Private region, access permitted: **demand-page** (allocate zeroed page, map, resume). If allocation fails: **kill** (`out_of_memory`).
+
+Any other user-triggerable CPU exception (divide-by-zero, invalid opcode, GPF, etc.) kills the faulting process.
 
 All user faults are non-recursive: killing a faulting process does not propagate to children.
 
@@ -418,6 +439,7 @@ Cannot revoke `HANDLE_SELF`. Per-type behavior (§2.3):
 - **Device:** Unmap MMIO PTEs, return handle up process tree (§2.1 device handle return), clear slot in source.
 - **Core pin:** Unpin the thread, restore preemptive scheduling on the core, clear slot.
 - **Process:** Recursively kill child's entire subtree (§2.6). Restartable children restart; non-restartable die. Clear slot.
+- **Dead process:** Clear slot (process already dead, no further cleanup needed).
 
 **Returns:** `E_OK`.
 **Errors:** `E_BADCAP` (invalid handle), `E_INVAL` (attempted `HANDLE_SELF`).
