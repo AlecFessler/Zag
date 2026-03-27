@@ -14,6 +14,10 @@ pub const CrashReason = enum(u5) {
     invalid_execute = 5,
     unmapped_access = 6,
     out_of_memory = 7,
+    arithmetic_fault = 8,
+    illegal_instruction = 9,
+    alignment_fault = 10,
+    protection_fault = 11,
     _,
 };
 

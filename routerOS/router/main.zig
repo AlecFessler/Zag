@@ -18,9 +18,11 @@ const icmpv6 = router.ipv6.icmpv6;
 const log = router.log;
 const nat = router.ipv4.nat;
 const ndp = router.ipv6.ndp;
+const pcp = router.services.pcp;
 const ping_mod = router.ipv4.icmp;
 const slaac = router.ipv6.slaac;
 const udp_fwd = router.services.udp_fwd;
+const upnp = router.services.upnp;
 const util = router.util;
 
 const Arena = lib.arena.Arena;
@@ -275,6 +277,7 @@ pub fn periodicMaintenance() void {
     if (has_lan) ndp.expire(&lan_ndp_table);
     firewall6.expire();
     dns.expireCache();
+    firewall.expireLeases(&port_forwards, ts);
     dhcpv6_client.tick();
     if (has_lan) slaac.tick();
 }
@@ -439,7 +442,8 @@ pub fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
     const dst_ip = ip.dst_ip;
     const my_ip = &ifc.ip;
     const is_for_me = util.eql(&dst_ip, my_ip) or util.eql(&dst_ip, &lan_broadcast) or
-        (dst_ip[0] == 255 and dst_ip[1] == 255 and dst_ip[2] == 255 and dst_ip[3] == 255);
+        (dst_ip[0] == 255 and dst_ip[1] == 255 and dst_ip[2] == 255 and dst_ip[3] == 255) or
+        (role == .lan and (dst_ip[0] & 0xF0) == 0xE0); // LAN multicast (224.0.0.0/4)
 
     if (is_for_me) {
         // Packet addressed to us — handle locally, never zero-copy forward
@@ -464,6 +468,14 @@ pub fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
                 }
                 if (udp_dst == dns.DNS_PORT and role == .lan) {
                     dns.handleFromLan(pkt, len);
+                    return .consumed;
+                }
+                if (udp_dst == upnp.SSDP_PORT and role == .lan) {
+                    upnp.handleSsdp(pkt, len);
+                    return .consumed;
+                }
+                if (udp_dst == pcp.PCP_PORT and role == .lan) {
+                    pcp.handleRequest(pkt, len);
                     return .consumed;
                 }
                 if (role == .wan) {
@@ -1369,6 +1381,7 @@ fn handleMutationRequest(data: []const u8, chan: *channel_mod.Channel, buf: []u8
         3 => mutateUnforward(params),
         4 => mutateDns(params),
         5 => mutateTimezone(params),
+        6 => mutateForwardLeased(params),
         else => "{\"ok\":false,\"error\":\"unknown mutation\"}",
     };
 
@@ -1431,16 +1444,34 @@ fn mutateForward(params: []const u8) []const u8 {
     return "{\"ok\":false,\"error\":\"port forward table full\"}";
 }
 
+fn mutateForwardLeased(params: []const u8) []const u8 {
+    // Format: <proto_byte><wan_port:2><lan_ip:4><lan_port:2><lease_secs:4><source:1>
+    if (params.len < 14) return "{\"ok\":false,\"error\":\"invalid format\"}";
+    const proto: util.Protocol = if (params[0] == 0) .tcp else .udp;
+    const wan_port = util.readU16Be(params[1..3]);
+    const lan_ip = params[3..7].*;
+    const lan_port = util.readU16Be(params[7..9]);
+    const lease_secs = @as(u32, params[9]) << 24 | @as(u32, params[10]) << 16 | @as(u32, params[11]) << 8 | @as(u32, params[12]);
+    const source: firewall.PortFwdSource = switch (params[13]) {
+        1 => .upnp,
+        2 => .pcp,
+        else => .manual,
+    };
+    const expiry_ns: u64 = if (lease_secs > 0) util.now() + @as(u64, lease_secs) * 1_000_000_000 else 0;
+    if (firewall.portFwdAddLeased(&port_forwards, proto, wan_port, lan_ip, lan_port, expiry_ns, source))
+        return "{\"ok\":true}";
+    return "{\"ok\":false,\"error\":\"port forward table full\"}";
+}
+
 fn mutateUnforward(params: []const u8) []const u8 {
     // Format: <wan_port:2>
     if (params.len < 2) return "{\"ok\":false,\"error\":\"invalid format\"}";
     const wan_port = util.readU16Be(params[0..2]);
-    for (&port_forwards) |*f| {
-        if (f.valid and f.wan_port == wan_port) {
-            f.valid = false;
-            return "{\"ok\":true}";
-        }
-    }
+    // Try both protocols for backward compat (no proto in wire format)
+    if (firewall.portFwdDelete(&port_forwards, .tcp, wan_port))
+        return "{\"ok\":true}";
+    if (firewall.portFwdDelete(&port_forwards, .udp, wan_port))
+        return "{\"ok\":true}";
     return "{\"ok\":false,\"error\":\"forward not found\"}";
 }
 

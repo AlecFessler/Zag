@@ -32,6 +32,7 @@ const MUT_FORWARD: u8 = 2;
 const MUT_UNFORWARD: u8 = 3;
 const MUT_DNS: u8 = 4;
 const MUT_TIMEZONE: u8 = 5;
+const MUT_FORWARD_LEASED: u8 = 6;
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -102,15 +103,13 @@ pub fn main(perm_view_addr: u64) void {
 
     syscall.write("http_server: started\n");
 
-    const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
-
     // Main loop
     while (true) {
         var router_buf: [8192]u8 = undefined;
         if (router_chan.recv(&router_buf)) |len| {
             handleRouterMessage(router_buf[0..len]);
         } else {
-            router_chan.rx.waitForData(MAX_TIMEOUT);
+            router_chan.rx.waitForData(10_000_000); // 10ms
         }
     }
 }
@@ -151,7 +150,7 @@ fn handleHttpRequest(raw: []const u8) void {
     if (eql(method, "GET")) {
         handleGet(path);
     } else if (eql(method, "POST")) {
-        handlePost(path);
+        handlePost(path, raw);
     } else {
         sendHttpResponse("405 Method Not Allowed", "text/plain", "Method Not Allowed");
     }
@@ -174,6 +173,10 @@ fn handleGet(path: []const u8) void {
         sendStateQueryResponse(EP_LEASES);
     } else if (eql(path, "/api/rules")) {
         sendStateQueryResponse(EP_RULES);
+    } else if (eql(path, "/upnp/rootDesc.xml")) {
+        sendHttpResponse("200 OK", "text/xml", UPNP_ROOT_DESC);
+    } else if (eql(path, "/upnp/WANIPConn.xml")) {
+        sendHttpResponse("200 OK", "text/xml", UPNP_WANIP_DESC);
     } else {
         sendHttpResponse("404 Not Found", "text/plain", "Not Found");
     }
@@ -199,7 +202,7 @@ fn sendStateQueryResponse(endpoint: u8) void {
 
 // ── POST handlers ───────────────────────────────────────────────────
 
-fn handlePost(path: []const u8) void {
+fn handlePost(path: []const u8, raw: []const u8) void {
     const block_prefix = "/api/block/";
     const allow_prefix = "/api/allow/";
     const forward_prefix = "/api/forward/";
@@ -238,6 +241,8 @@ fn handlePost(path: []const u8) void {
         } else {
             sendMutationError("missing offset");
         }
+    } else if (eql(path, "/upnp/control/WANIPConn1")) {
+        handleSoapAction(raw);
     } else {
         sendHttpResponse("404 Not Found", "text/plain", "Not Found");
     }
@@ -407,6 +412,248 @@ fn sendHttpResponse(status: []const u8, content_type: []const u8, body: []const 
         }
     }
 }
+
+// ── UPnP SOAP handling ──────────────────────────────────────────────
+
+fn handleSoapAction(raw: []const u8) void {
+    // Use full raw request for tag extraction (body may be in same buffer as headers)
+    // The SOAP XML tags are unique enough to not conflict with HTTP headers
+
+    // Determine action from SOAPAction header or body
+    if (containsStr(raw, "AddPortMapping")) {
+        handleSoapAddPortMapping(raw);
+    } else if (containsStr(raw, "DeletePortMapping")) {
+        handleSoapDeletePortMapping(raw);
+    } else if (containsStr(raw, "GetExternalIPAddress")) {
+        handleSoapGetExternalIP();
+    } else if (containsStr(raw, "GetSpecificPortMappingEntry")) {
+        handleSoapGetSpecificEntry(raw);
+    } else {
+        sendSoapFault("401", "Invalid Action");
+    }
+}
+
+fn handleSoapAddPortMapping(raw: []const u8) void {
+    // Extract parameters from SOAP XML (search full raw — body follows headers in same buffer)
+    const ext_port = extractTagU16(raw, "NewExternalPort") orelse {
+        sendSoapFault("402", "Missing ExternalPort");
+        return;
+    };
+    const int_port = extractTagU16(raw, "NewInternalPort") orelse {
+        sendSoapFault("402", "Missing InternalPort");
+        return;
+    };
+    const proto_str = extractTagValue(raw, "NewProtocol");
+    var proto_byte: u8 = 0; // TCP
+    if (proto_str) |ps| {
+        if (containsStr(ps, "UDP") or containsStr(ps, "udp")) proto_byte = 1;
+    }
+    const client_ip = extractTagIp(raw, "NewInternalClient") orelse {
+        sendSoapFault("402", "Missing InternalClient");
+        return;
+    };
+    const lease = extractTagU32(raw, "NewLeaseDuration") orelse 0;
+
+    // Build MUT_FORWARD_LEASED message
+    // Format: [MSG][MUT][proto:1][wan_port:2][lan_ip:4][lan_port:2][lease_secs:4][source:1]
+    var msg: [16]u8 = undefined;
+    msg[0] = MSG_MUTATION_REQUEST;
+    msg[1] = MUT_FORWARD_LEASED;
+    msg[2] = proto_byte;
+    msg[3] = @intCast(ext_port >> 8);
+    msg[4] = @intCast(ext_port & 0xff);
+    @memcpy(msg[5..9], &client_ip);
+    msg[9] = @intCast(int_port >> 8);
+    msg[10] = @intCast(int_port & 0xff);
+    msg[11] = @intCast((lease >> 24) & 0xff);
+    msg[12] = @intCast((lease >> 16) & 0xff);
+    msg[13] = @intCast((lease >> 8) & 0xff);
+    msg[14] = @intCast(lease & 0xff);
+    msg[15] = 1; // source = upnp
+
+    _ = router_chan.send(&msg);
+
+    // Wait for response
+    var buf: [8192]u8 = undefined;
+    var attempts: u8 = 0;
+    while (attempts < 10) : (attempts += 1) {
+        if (router_chan.recv(&buf)) |len| {
+            if (len >= 1 and buf[0] == MSG_MUTATION_RESPONSE) {
+                // Check if ok
+                if (containsStr(buf[1..len], "\"ok\":true")) {
+                    sendSoapResponse("AddPortMappingResponse", "");
+                } else {
+                    sendSoapFault("718", "ConflictInMappingEntry");
+                }
+                return;
+            }
+        }
+        router_chan.rx.waitForData(500_000_000);
+    }
+    sendSoapFault("501", "Action Failed");
+}
+
+fn handleSoapDeletePortMapping(body: []const u8) void {
+    const ext_port = extractTagU16(body, "NewExternalPort") orelse {
+        sendSoapFault("402", "Missing ExternalPort");
+        return;
+    };
+    _ = extractTagValue(body, "NewProtocol"); // Ignored — unforward tries both
+
+    var msg: [4]u8 = undefined;
+    msg[0] = MSG_MUTATION_REQUEST;
+    msg[1] = MUT_UNFORWARD;
+    msg[2] = @intCast(ext_port >> 8);
+    msg[3] = @intCast(ext_port & 0xff);
+    sendMutationAndRespond(&msg);
+}
+
+fn handleSoapGetExternalIP() void {
+    // Query router status to get WAN IP
+    _ = router_chan.send(&[_]u8{ MSG_STATE_QUERY, EP_STATUS });
+
+    var buf: [8192]u8 = undefined;
+    var attempts: u8 = 0;
+    while (attempts < 10) : (attempts += 1) {
+        if (router_chan.recv(&buf)) |len| {
+            if (len >= 1 and buf[0] == MSG_STATE_RESPONSE) {
+                // Parse WAN IP from status JSON: {"wan":"x.x.x.x ..."}
+                const status = buf[1..len];
+                const ip_str = extractJsonWanIp(status);
+                var resp_buf: [256]u8 = undefined;
+                var p: usize = 0;
+                p = appendSlice(&resp_buf, p, "<NewExternalIPAddress>");
+                p = appendSlice(&resp_buf, p, ip_str);
+                p = appendSlice(&resp_buf, p, "</NewExternalIPAddress>");
+                sendSoapResponse("GetExternalIPAddressResponse", resp_buf[0..p]);
+                return;
+            }
+        }
+        router_chan.rx.waitForData(500_000_000);
+    }
+    sendSoapFault("501", "Action Failed");
+}
+
+fn handleSoapGetSpecificEntry(body: []const u8) void {
+    // We can't query individual port forwards via existing IPC, so return 714 NoSuchEntryInArray
+    // This is acceptable — many routers return this for non-existent entries
+    _ = body;
+    sendSoapFault("714", "NoSuchEntryInArray");
+}
+
+fn extractJsonWanIp(json: []const u8) []const u8 {
+    // Find "ip":" inside the wan object: {"wan":{"ip":"10.0.2.15",...}}
+    const prefix = "\"ip\":\"";
+    var i: usize = 0;
+    while (i + prefix.len < json.len) : (i += 1) {
+        if (eql(json[i..][0..prefix.len], prefix)) {
+            const start = i + prefix.len;
+            var end = start;
+            while (end < json.len and json[end] != '"') : (end += 1) {}
+            return json[start..end];
+        }
+    }
+    return "0.0.0.0";
+}
+
+fn sendSoapResponse(action_name: []const u8, inner: []const u8) void {
+    var buf: [2048]u8 = undefined;
+    var p: usize = 0;
+    p = appendSlice(&buf, p, "<?xml version=\"1.0\"?>\r\n<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><u:");
+    p = appendSlice(&buf, p, action_name);
+    p = appendSlice(&buf, p, " xmlns:u=\"urn:schemas-upnp-org:service:WANIPConnection:1\">");
+    p = appendSlice(&buf, p, inner);
+    p = appendSlice(&buf, p, "</u:");
+    p = appendSlice(&buf, p, action_name);
+    p = appendSlice(&buf, p, "></s:Body></s:Envelope>");
+    sendHttpResponse("200 OK", "text/xml; charset=\"utf-8\"", buf[0..p]);
+}
+
+fn sendSoapFault(code: []const u8, desc: []const u8) void {
+    var buf: [1024]u8 = undefined;
+    var p: usize = 0;
+    p = appendSlice(&buf, p, "<?xml version=\"1.0\"?>\r\n<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><s:Fault><faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail><UPnPError xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>");
+    p = appendSlice(&buf, p, code);
+    p = appendSlice(&buf, p, "</errorCode><errorDescription>");
+    p = appendSlice(&buf, p, desc);
+    p = appendSlice(&buf, p, "</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>");
+    sendHttpResponse("500 Internal Server Error", "text/xml; charset=\"utf-8\"", buf[0..p]);
+}
+
+fn findBody(raw: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i + 3 < raw.len) : (i += 1) {
+        if (raw[i] == '\r' and raw[i + 1] == '\n' and raw[i + 2] == '\r' and raw[i + 3] == '\n') {
+            return raw[i + 4 ..];
+        }
+    }
+    return null;
+}
+
+fn containsStr(haystack: []const u8, needle: []const u8) bool {
+    if (haystack.len < needle.len) return false;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        if (eql(haystack[i..][0..needle.len], needle)) return true;
+    }
+    return false;
+}
+
+fn extractTagValue(xml: []const u8, tag: []const u8) ?[]const u8 {
+    // Find <tag>value</tag> and return value
+    // Search for "<tag>" opening
+    var i: usize = 0;
+    while (i + tag.len + 2 < xml.len) : (i += 1) {
+        if (xml[i] == '<' and i + 1 + tag.len + 1 <= xml.len and
+            eql(xml[i + 1 ..][0..tag.len], tag) and xml[i + 1 + tag.len] == '>')
+        {
+            const val_start = i + 1 + tag.len + 1;
+            var val_end = val_start;
+            while (val_end < xml.len and xml[val_end] != '<') : (val_end += 1) {}
+            return xml[val_start..val_end];
+        }
+    }
+    return null;
+}
+
+fn extractTagU16(xml: []const u8, tag: []const u8) ?u16 {
+    const val = extractTagValue(xml, tag) orelse return null;
+    return parseU16Simple(val);
+}
+
+fn extractTagU32(xml: []const u8, tag: []const u8) ?u32 {
+    const val = extractTagValue(xml, tag) orelse return null;
+    var result: u32 = 0;
+    for (val) |c| {
+        if (c >= '0' and c <= '9') {
+            result = result * 10 + @as(u32, c - '0');
+        } else break;
+    }
+    return result;
+}
+
+fn extractTagIp(xml: []const u8, tag: []const u8) ?[4]u8 {
+    const val = extractTagValue(xml, tag) orelse return null;
+    return parseIp(val);
+}
+
+fn parseU16Simple(s: []const u8) ?u16 {
+    var val: u16 = 0;
+    var digits: usize = 0;
+    for (s) |c| {
+        if (c >= '0' and c <= '9') {
+            val = val *% 10 +% @as(u16, c - '0');
+            digits += 1;
+        } else break;
+    }
+    if (digits == 0) return null;
+    return val;
+}
+
+// ── UPnP XML descriptors ────────────────────────────────────────────
+
+const UPNP_ROOT_DESC = @embedFile("rootDesc.xml");
+const UPNP_WANIP_DESC = @embedFile("WANIPConn.xml");
 
 // ── Utilities ───────────────────────────────────────────────────────
 

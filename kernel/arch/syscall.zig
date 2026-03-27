@@ -81,13 +81,8 @@ fn err(code: i64) SyscallResult {
     return .{ .rax = code };
 }
 
-var dbg_dispatch_count: u32 = 0;
 pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) SyscallResult {
     _ = arg4;
-    dbg_dispatch_count += 1;
-    if (dbg_dispatch_count <= 30) {
-        arch.print("K: syscall {d}\n", .{num});
-    }
     const syscall_num: SyscallNum = @enumFromInt(num);
     return switch (syscall_num) {
         .write => sysWrite(arg0, arg1),
@@ -404,8 +399,6 @@ fn sysThreadCreate(entry_addr: u64, arg: u64, num_stack_pages_u64: u64) i64 {
 
 fn sysThreadExit() noreturn {
     const thread = sched.currentThread().?;
-    const is_last = thread.process.removeThread(thread);
-    thread.last_in_proc = is_last;
     thread.state = .exited;
     arch.enableInterrupts();
     sched.yield();

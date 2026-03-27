@@ -639,23 +639,26 @@ fn ntpMultiResponse(cmd: []const u8) void {
     var msg_count: u32 = 0;
     var done = false;
     while (!done and msg_count < 8) {
-        var attempts: u32 = 0;
-        var got_msg = false;
-        while (attempts < 500_000) : (attempts += 1) {
+        if (ntp_chan.recv(&resp)) |len| {
+            if (len == 0) {
+                done = true;
+                continue;
+            }
+            serialWrite(resp[0..len]);
+            msg_count += 1;
+        } else {
+            ntp_chan.rx.waitForData(50_000_000); // 50ms
             if (ntp_chan.recv(&resp)) |len| {
                 if (len == 0) {
                     done = true;
-                    got_msg = true;
-                    break;
+                    continue;
                 }
                 serialWrite(resp[0..len]);
                 msg_count += 1;
-                got_msg = true;
-                break;
+            } else {
+                done = true;
             }
-            syscall.thread_yield();
         }
-        if (!got_msg) done = true;
     }
     if (msg_count == 0) {
         serialWrite("ntp: no response\r\n");

@@ -239,6 +239,10 @@ fn crashReasonName(reason: pv.CrashReason) []const u8 {
         .invalid_execute => "invalid_execute",
         .unmapped_access => "unmapped_access",
         .out_of_memory => "out_of_memory",
+        .arithmetic_fault => "arithmetic_fault",
+        .illegal_instruction => "illegal_instruction",
+        .alignment_fault => "alignment_fault",
+        .protection_fault => "protection_fault",
         _ => "unknown",
     };
 }

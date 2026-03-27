@@ -174,9 +174,8 @@ pub const Process = struct {
         if (self.restart_context == null) {
             self.alive = false;
         }
-        for (self.threads[0..self.num_threads], 0..) |thread, i| {
+        for (self.threads[0..self.num_threads]) |thread| {
             thread.state = .exited;
-            thread.last_in_proc = (i == self.num_threads - 1);
         }
         self.lock.unlock();
         if (self.num_threads == 0) {

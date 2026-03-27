@@ -26,6 +26,8 @@ pub const FirewallRule = struct {
 
 pub const empty_rule = FirewallRule{};
 
+pub const PortFwdSource = enum(u8) { manual = 0, upnp = 1, pcp = 2 };
+
 pub const PortForward = struct {
     seq: Seqlock = Seqlock.init(),
     valid: bool = false,
@@ -33,6 +35,8 @@ pub const PortForward = struct {
     wan_port: u16 = 0,
     lan_ip: [4]u8 = .{ 0, 0, 0, 0 },
     lan_port: u16 = 0,
+    lease_expiry_ns: u64 = 0, // 0 = permanent (manual), else monotonic deadline
+    source: PortFwdSource = .manual,
 };
 
 pub const empty_fwd = PortForward{};
@@ -87,6 +91,10 @@ pub fn portFwdLookup(forwards: *[PORT_FWD_SIZE]PortForward, proto: util.Protocol
 }
 
 pub fn portFwdAdd(forwards: *[PORT_FWD_SIZE]PortForward, proto: util.Protocol, wan_port: u16, lip: [4]u8, lport: u16) bool {
+    return portFwdAddLeased(forwards, proto, wan_port, lip, lport, 0, .manual);
+}
+
+pub fn portFwdAddLeased(forwards: *[PORT_FWD_SIZE]PortForward, proto: util.Protocol, wan_port: u16, lip: [4]u8, lport: u16, expiry_ns: u64, source: PortFwdSource) bool {
     for (forwards) |*f| {
         if (!f.valid) {
             f.seq.writeBegin();
@@ -95,11 +103,39 @@ pub fn portFwdAdd(forwards: *[PORT_FWD_SIZE]PortForward, proto: util.Protocol, w
             f.wan_port = wan_port;
             f.lan_ip = lip;
             f.lan_port = lport;
+            f.lease_expiry_ns = expiry_ns;
+            f.source = source;
             f.seq.writeEnd();
             return true;
         }
     }
     return false;
+}
+
+pub fn portFwdDelete(forwards: *[PORT_FWD_SIZE]PortForward, proto: util.Protocol, wan_port: u16) bool {
+    for (forwards) |*f| {
+        if (f.valid and f.protocol == proto and f.wan_port == wan_port) {
+            f.seq.writeBegin();
+            f.valid = false;
+            f.lease_expiry_ns = 0;
+            f.source = .manual;
+            f.seq.writeEnd();
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn expireLeases(forwards: *[PORT_FWD_SIZE]PortForward, now_ns: u64) void {
+    for (forwards) |*f| {
+        if (f.valid and f.lease_expiry_ns != 0 and now_ns >= f.lease_expiry_ns) {
+            f.seq.writeBegin();
+            f.valid = false;
+            f.lease_expiry_ns = 0;
+            f.source = .manual;
+            f.seq.writeEnd();
+        }
+    }
 }
 
 pub fn handlePortForward(pkt: []u8, len: u32) bool {

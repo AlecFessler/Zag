@@ -40,6 +40,19 @@ The kernel boots via UEFI, brings up all CPU cores, enumerates PCI devices and s
 
 ## Testing
 
+### Quick start
+
+```bash
+./test.sh              # run kernel + router tests
+./test.sh kernel       # kernel tests only
+./test.sh router       # router integration tests only
+./test.sh kernel-fuzz  # all kernel fuzzers
+./test.sh router-fuzz  # router fuzzer
+./test.sh -h           # full usage
+```
+
+The test runner automatically checks whether tap interfaces are up and prompts for sudo only if they need to be created.
+
 ### Integration tests (routerOS)
 
 One-time setup (requires sudo):

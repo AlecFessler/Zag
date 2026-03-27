@@ -67,7 +67,7 @@ pub fn parseElf(result: *ParsedElf, bytes: []u8) !void {
                 .offset = phdr.p_offset,
             };
             result.sections[@intFromEnum(ElfSection.bss)] = .{
-                .vaddr = std.mem.alignBackward(
+                .vaddr = std.mem.alignForward(
                     u64,
                     phdr.p_vaddr + phdr.p_filesz,
                     paging.PAGE4K,

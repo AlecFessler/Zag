@@ -41,7 +41,6 @@ const RunQueue = struct {
             .next = null,
             .core_affinity = null,
             .state = .running,
-            .last_in_proc = false,
             .on_cpu = std.atomic.Value(bool).init(false),
         };
         self.head = &self.sentinel;
@@ -67,7 +66,6 @@ const RunQueue = struct {
 
 const Zombie = struct {
     thread: *Thread,
-    last_in_proc: bool,
 };
 
 const PerCoreState = struct {
@@ -109,15 +107,20 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
 
     const preempted = state.running_thread.?;
 
-    // Non-preemptible pinned threads: just re-arm the timer for futex expiry
-    // and skip the context switch entirely.
+    // Non-preemptible pinned threads: normally skip the context switch.
+    // But if the thread has been killed (.exited), unpin it and fall through
+    // to normal scheduling so it can be cleaned up as a zombie.
     if (preempted.pinned_exclusive) {
-        if (core_id == expire_core.load(.monotonic)) {
-            futex.expireTimedWaiters();
-            expire_core.store((core_id + 1) % arch.coreCount(), .monotonic);
+        if (preempted.state == .exited) {
+            _ = unpinExclusive(preempted);
+        } else {
+            if (core_id == expire_core.load(.monotonic)) {
+                futex.expireTimedWaiters();
+                expire_core.store((core_id + 1) % arch.coreCount(), .monotonic);
+            }
+            armSchedTimer(state, SCHED_TIMESLICE_NS);
+            return;
         }
-        armSchedTimer(state, SCHED_TIMESLICE_NS);
-        return;
     }
 
     preempted.ctx = ctx.thread_ctx;
@@ -150,7 +153,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     state.running_thread = next;
 
     if (preempted != &state.rq.sentinel and preempted.state == .exited) {
-        state.zombie = .{ .thread = preempted, .last_in_proc = preempted.last_in_proc };
+        state.zombie = .{ .thread = preempted };
     }
 
     state.rq_lock.unlock();

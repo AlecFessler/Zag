@@ -42,19 +42,19 @@ pub const Thread = struct {
     next: ?*Thread = null,
     core_affinity: ?u64 = null,
     state: State = .ready,
-    last_in_proc: bool = false,
     on_cpu: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pinned_exclusive: bool = false,
     futex_deadline_ns: u64 = 0,
     futex_paddr: PAddr = PAddr.fromInt(0),
 
     pub fn deinit(self: *Thread) void {
-        const last = self.last_in_proc;
         const proc = self.process;
 
         stack_mod.destroyKernel(self.kernel_stack, memory_init.kernel_addr_space_root);
 
-        if (!last) {
+        const is_last = proc.removeThread(self);
+
+        if (!is_last) {
             if (self.user_stack) |ustack| {
                 stack_mod.destroyUser(ustack, &proc.vmm);
             }
@@ -62,7 +62,7 @@ pub const Thread = struct {
 
         allocator.destroy(self);
 
-        if (last) proc.exit();
+        if (is_last) proc.exit();
     }
 
     pub fn create(
