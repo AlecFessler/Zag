@@ -47,6 +47,7 @@ pub var has_lan: bool = false;
 pub var console_chan: ?channel_mod.Channel = null;
 pub var nfs_chan: ?channel_mod.Channel = null;
 pub var ntp_chan: ?channel_mod.Channel = null;
+pub var desktop_chan: ?channel_mod.Channel = null;
 pub var http_chan: ?channel_mod.Channel = null;
 pub var nat_table: [nat.TABLE_SIZE]nat.NatEntry = .{nat.empty} ** nat.TABLE_SIZE;
 pub var next_nat_port: u16 = 10000;
@@ -539,8 +540,64 @@ pub fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
     return .consumed;
 }
 
+fn sendDesktopBootInfo(chan: *channel_mod.Channel) void {
+    _ = chan.send("--- Router Status ---\n");
+
+    var buf: [128]u8 = undefined;
+
+    // Report WAN NIC
+    {
+        var p: usize = 0;
+        p = util.appendStr(&buf, p, "  WAN IP=");
+        p = util.appendIp(&buf, p, wan_iface.ip);
+        p = util.appendStr(&buf, p, " MAC=");
+        p = util.appendMac(&buf, p, wan_iface.mac);
+        p = util.appendStr(&buf, p, "\n");
+        _ = chan.send(buf[0..p]);
+    }
+
+    // WAN stats
+    {
+        var p: usize = 0;
+        p = util.appendStr(&buf, p, "  WAN rx=");
+        p = util.appendDec(&buf, p, wan_iface.stats.rx_packets);
+        p = util.appendStr(&buf, p, " tx=");
+        p = util.appendDec(&buf, p, wan_iface.stats.tx_packets);
+        p = util.appendStr(&buf, p, " drop=");
+        p = util.appendDec(&buf, p, wan_iface.stats.rx_dropped);
+        p = util.appendStr(&buf, p, "\n");
+        _ = chan.send(buf[0..p]);
+    }
+
+    if (has_lan) {
+        {
+            var p: usize = 0;
+            p = util.appendStr(&buf, p, "  LAN IP=");
+            p = util.appendIp(&buf, p, lan_iface.ip);
+            p = util.appendStr(&buf, p, " MAC=");
+            p = util.appendMac(&buf, p, lan_iface.mac);
+            p = util.appendStr(&buf, p, "\n");
+            _ = chan.send(buf[0..p]);
+        }
+        {
+            var p: usize = 0;
+            p = util.appendStr(&buf, p, "  LAN rx=");
+            p = util.appendDec(&buf, p, lan_iface.stats.rx_packets);
+            p = util.appendStr(&buf, p, " tx=");
+            p = util.appendDec(&buf, p, lan_iface.stats.tx_packets);
+            p = util.appendStr(&buf, p, " drop=");
+            p = util.appendDec(&buf, p, lan_iface.stats.rx_dropped);
+            p = util.appendStr(&buf, p, "\n");
+            _ = chan.send(buf[0..p]);
+        }
+    } else {
+        _ = chan.send("  LAN: not available\n");
+    }
+    _ = chan.send("--- end router ---\n");
+}
+
 fn detectAppChannels(view: *const [MAX_PERMS]pv.UserViewEntry, mapped_handles: *[8]u64, mapped_count: *u32) void {
-    if (console_chan != null and nfs_chan != null and ntp_chan != null and http_chan != null) return;
+    if (console_chan != null and nfs_chan != null and ntp_chan != null and http_chan != null and desktop_chan != null) return;
     for (view) |*entry| {
         if (entry.entry_type != pv.ENTRY_TYPE_SHARED_MEMORY or entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) continue;
         var is_known = false;
@@ -578,6 +635,9 @@ fn detectAppChannels(view: *const [MAX_PERMS]pv.UserViewEntry, mapped_handles: *
                     } else if (id_buf[0] == shm_protocol.ServiceId.CONSOLE and console_chan == null) {
                         console_chan = ch;
                         log.write(.console_connected);
+                    } else if (id_buf[0] == shm_protocol.ServiceId.DESKTOP_ENV and desktop_chan == null) {
+                        desktop_chan = ch;
+                        sendDesktopBootInfo(&ch);
                     }
                 }
                 break;

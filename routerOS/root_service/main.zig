@@ -1,3 +1,4 @@
+const build_options = @import("build_options");
 const lib = @import("lib");
 
 const channel_mod = lib.channel;
@@ -10,7 +11,7 @@ const syscall = lib.syscall;
 const std = @import("std");
 
 const MAX_PERMS = 128;
-const MAX_CHILDREN = 8;
+const MAX_CHILDREN = 16;
 
 const ChildInfo = struct {
     name: []const u8,
@@ -313,6 +314,159 @@ fn writeU16(val: u16) void {
     syscall.write(buf[i..]);
 }
 
+fn writeU32(val: u32) void {
+    var buf: [10]u8 = undefined;
+    var n = val;
+    var i: usize = buf.len;
+    if (n == 0) {
+        syscall.write("0");
+        return;
+    }
+    while (n > 0) {
+        i -= 1;
+        buf[i] = '0' + @as(u8, @truncate(n % 10));
+        n /= 10;
+    }
+    syscall.write(buf[i..]);
+}
+
+// Send boot device info to desktop_env via a direct channel
+fn sendBootInfo(desktop_env: *ChildInfo) void {
+    const data_shm = syscall.shm_create(4 * syscall.PAGE4K);
+    if (data_shm <= 0) return;
+
+    const data_vm_rights = (perms.VmReservationRights{
+        .read = true,
+        .write = true,
+        .execute = true,
+        .shareable = true,
+    }).bits();
+    const data_vm = syscall.vm_reserve(0, 4 * syscall.PAGE4K, data_vm_rights);
+    if (data_vm.val < 0) return;
+
+    if (syscall.shm_map(@intCast(data_shm), @intCast(data_vm.val), 0) != 0) return;
+
+    const chan_header: *channel_mod.ChannelHeader = @ptrFromInt(data_vm.val2);
+    var chan = channel_mod.Channel.initAsSideA(chan_header, 4 * syscall.PAGE4K);
+
+    // Grant SHM to desktop_env
+    const grant_rights = (perms.SharedMemoryRights{
+        .read = true,
+        .write = true,
+        .grant = true,
+    }).bits();
+    _ = syscall.grant_perm(@intCast(data_shm), desktop_env.proc_handle, grant_rights);
+
+    // Add connection entry to desktop_env's command channel
+    if (desktop_env.cmd_channel) |cmd| {
+        cmd.addAllowedConnection(0); // service_id 0 = root
+        if (cmd.findConnectionByService(0)) |entry| {
+            @as(*volatile u64, &entry.shm_handle).* = @intCast(data_shm);
+            @as(*volatile u64, &entry.shm_size).* = 4 * syscall.PAGE4K;
+            @as(*volatile u32, &entry.status).* = @intFromEnum(shm_protocol.ConnectionStatus.connected);
+            cmd.notifyChild();
+        }
+    }
+
+    // Send boot info messages
+    var msg_buf: [128]u8 = undefined;
+
+    _ = chan.send("--- Zag OS Boot Info ---\n");
+    {
+        const msg = formatBootMsg(&msg_buf, "root: children spawned: ", num_children);
+        _ = chan.send(msg);
+    }
+
+    // Enumerate all devices from perm view
+    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_global);
+    for (view) |*entry| {
+        if (entry.entry_type != pv.ENTRY_TYPE_DEVICE_REGION) continue;
+        var p: usize = 0;
+        const class = entry.deviceClass();
+        const class_name: []const u8 = switch (@as(perms.DeviceClass, @enumFromInt(class))) {
+            .network => "network",
+            .serial => "serial",
+            .storage => "storage",
+            .display => "display",
+            .timer => "timer",
+            .usb => "usb",
+            .unknown => "unknown",
+        };
+        p = appendStr(&msg_buf, p, "  ");
+        p = appendStr(&msg_buf, p, class_name);
+        p = appendStr(&msg_buf, p, " [");
+        p = appendHex16(&msg_buf, p, entry.pciVendor());
+        p = appendStr(&msg_buf, p, ":");
+        p = appendHex16(&msg_buf, p, entry.pciDevice());
+        p = appendStr(&msg_buf, p, "] bus=");
+        p = appendDec(&msg_buf, p, entry.pciBus());
+        p = appendStr(&msg_buf, p, " dev=");
+        p = appendDec(&msg_buf, p, @as(u32, entry.pciDev()));
+        p = appendStr(&msg_buf, p, " func=");
+        p = appendDec(&msg_buf, p, @as(u32, entry.pciFunc()));
+        if (class == @intFromEnum(perms.DeviceClass.display)) {
+            p = appendStr(&msg_buf, p, " ");
+            p = appendDec(&msg_buf, p, entry.fbWidth());
+            p = appendStr(&msg_buf, p, "x");
+            p = appendDec(&msg_buf, p, entry.fbHeight());
+        }
+        p = appendStr(&msg_buf, p, "\n");
+        _ = chan.send(msg_buf[0..p]);
+    }
+
+    // List spawned children
+    for (children[0..num_children]) |*child| {
+        var p: usize = 0;
+        p = appendStr(&msg_buf, p, "  process: ");
+        p = appendStr(&msg_buf, p, child.name);
+        p = appendStr(&msg_buf, p, " (id=");
+        p = appendDec(&msg_buf, p, child.service_id);
+        p = appendStr(&msg_buf, p, ")\n");
+        _ = chan.send(msg_buf[0..p]);
+    }
+    _ = chan.send("--- end boot info ---\n");
+}
+
+fn appendStr(buf: []u8, pos: usize, s: []const u8) usize {
+    const len = @min(s.len, buf.len - pos);
+    @memcpy(buf[pos..][0..len], s[0..len]);
+    return pos + len;
+}
+
+fn appendDec(buf: []u8, pos: usize, val: u32) usize {
+    if (val == 0) {
+        buf[pos] = '0';
+        return pos + 1;
+    }
+    var tmp: [10]u8 = undefined;
+    var n = val;
+    var j: usize = tmp.len;
+    while (n > 0) {
+        j -= 1;
+        tmp[j] = '0' + @as(u8, @truncate(n % 10));
+        n /= 10;
+    }
+    const digits = tmp[j..];
+    @memcpy(buf[pos..][0..digits.len], digits);
+    return pos + digits.len;
+}
+
+fn appendHex16(buf: []u8, pos: usize, val: u16) usize {
+    const hex = "0123456789abcdef";
+    buf[pos + 0] = hex[(val >> 12) & 0xf];
+    buf[pos + 1] = hex[(val >> 8) & 0xf];
+    buf[pos + 2] = hex[(val >> 4) & 0xf];
+    buf[pos + 3] = hex[val & 0xf];
+    return pos + 4;
+}
+
+fn formatBootMsg(buf: []u8, prefix: []const u8, value: u32) []const u8 {
+    var i = appendStr(buf, 0, prefix);
+    i = appendDec(buf, i, value);
+    buf[i] = '\n';
+    return buf[0 .. i + 1];
+}
+
 fn brokerLoop() void {
     while (true) {
         var found_request = false;
@@ -378,12 +532,14 @@ pub fn main(perm_view_addr: u64) void {
         .pin_exclusive = true,
     };
 
+    const router_connections: []const u32 = &.{};
+
     _ = spawnChild(
         "router",
         embedded.router,
         shm_protocol.ServiceId.ROUTER,
         router_rights,
-        &.{},
+        router_connections,
         perm_view_addr,
         nic_devices[0..nic_count],
     );
@@ -429,19 +585,38 @@ pub fn main(perm_view_addr: u64) void {
         &.{},
     );
 
-    var display_devices: [2]DeviceGrant = undefined;
-    const display_count = findAllMmioDevicesByClass(perm_view_addr, .display, &display_devices);
-    if (display_count > 0) {
-        syscall.write("root: spawning compositor\n");
-        _ = spawnChild(
-            "compositor",
-            embedded.compositor,
-            shm_protocol.ServiceId.COMPOSITOR,
-            .{ .grant_to = true, .mem_reserve = true, .device_own = true, .restart = true },
-            &.{},
-            perm_view_addr,
-            display_devices[0..display_count],
-        );
+    var display_count: u32 = 0;
+    if (build_options.use_desktop) {
+        var display_devices: [2]DeviceGrant = undefined;
+        display_count = findAllMmioDevicesByClass(perm_view_addr, .display, &display_devices);
+        if (display_count > 0) {
+            syscall.write("root: spawning compositor\n");
+            _ = spawnChild(
+                "compositor",
+                embedded.compositor,
+                shm_protocol.ServiceId.COMPOSITOR,
+                .{ .grant_to = true, .mem_reserve = true, .device_own = true, .restart = true },
+                &.{},
+                perm_view_addr,
+                display_devices[0..display_count],
+            );
+
+            syscall.write("root: spawning desktop_env\n");
+            _ = spawnChild(
+                "desktop_env",
+                embedded.desktop_env,
+                shm_protocol.ServiceId.DESKTOP_ENV,
+                .{ .grant_to = true, .mem_reserve = true, .restart = true },
+                &.{ shm_protocol.ServiceId.COMPOSITOR, shm_protocol.ServiceId.ROUTER },
+                perm_view_addr,
+                &.{},
+            );
+
+            // Send boot info to desktop_env
+            if (findChildByService(shm_protocol.ServiceId.DESKTOP_ENV)) |de| {
+                sendBootInfo(de);
+            }
+        }
     }
 
     // Spawn watchdog threads for each child
