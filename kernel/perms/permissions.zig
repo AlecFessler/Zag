@@ -6,6 +6,30 @@ const Process = zag.sched.process.Process;
 const SharedMemory = zag.memory.shared.SharedMemory;
 const VAddr = zag.memory.address.VAddr;
 
+pub const CrashReason = enum(u5) {
+    none = 0,
+    stack_overflow = 1,
+    stack_underflow = 2,
+    invalid_read = 3,
+    invalid_write = 4,
+    invalid_execute = 5,
+    unmapped_access = 6,
+    out_of_memory = 7,
+    arithmetic_fault = 8,
+    illegal_instruction = 9,
+    alignment_fault = 10,
+    protection_fault = 11,
+    normal_exit = 12,
+    killed = 13,
+    revoked = 14,
+    _,
+};
+
+pub const DeadProcessInfo = struct {
+    crash_reason: CrashReason,
+    restart_count: u16,
+};
+
 pub const ProcessRights = packed struct(u16) {
     grant_to: bool = false,
     spawn_thread: bool = false,
@@ -16,7 +40,8 @@ pub const ProcessRights = packed struct(u16) {
     shm_create: bool = false,
     device_own: bool = false,
     shutdown: bool = false,
-    _reserved: u7 = 0,
+    pin_exclusive: bool = false,
+    _reserved: u6 = 0,
 };
 
 pub const VmReservationRights = packed struct(u8) {
@@ -39,7 +64,8 @@ pub const SharedMemoryRights = packed struct(u8) {
 pub const DeviceRegionRights = packed struct(u8) {
     map: bool = false,
     grant: bool = false,
-    _reserved: u6 = 0,
+    dma: bool = false,
+    _reserved: u5 = 0,
 };
 
 pub const PermissionEntry = struct {
@@ -66,11 +92,18 @@ pub const VmReservationObject = struct {
     original_size: u64,
 };
 
+pub const CorePinObject = struct {
+    core_id: u64,
+    thread_tid: u64,
+};
+
 pub const KernelObject = union(enum) {
     process: *Process,
+    dead_process: DeadProcessInfo,
     vm_reservation: VmReservationObject,
     shared_memory: *SharedMemory,
     device_region: *DeviceRegion,
+    core_pin: CorePinObject,
     empty: void,
 };
 
@@ -79,6 +112,8 @@ pub const UserViewEntryType = enum(u8) {
     vm_reservation = 1,
     shared_memory = 2,
     device_region = 3,
+    core_pin = 4,
+    dead_process = 5,
 };
 
 pub const UserViewEntry = extern struct {
@@ -98,13 +133,25 @@ pub const UserViewEntry = extern struct {
         .field1 = 0,
     };
 
+    fn processField0(crash_reason: CrashReason, restart_count: u16) u64 {
+        return @as(u64, @intFromEnum(crash_reason)) |
+            (@as(u64, restart_count) << 16);
+    }
+
     pub fn fromKernelEntry(entry: PermissionEntry) UserViewEntry {
         return switch (entry.object) {
-            .process => .{
+            .process => |p| .{
                 .handle = entry.handle,
                 .entry_type = @intFromEnum(UserViewEntryType.process),
                 .rights = entry.rights,
-                .field0 = 0,
+                .field0 = processField0(p.crash_reason, p.restart_count),
+                .field1 = 0,
+            },
+            .dead_process => |dp| .{
+                .handle = entry.handle,
+                .entry_type = @intFromEnum(UserViewEntryType.dead_process),
+                .rights = entry.rights,
+                .field0 = processField0(dp.crash_reason, dp.restart_count),
                 .field1 = 0,
             },
             .vm_reservation => |vm| .{
@@ -131,10 +178,26 @@ pub const UserViewEntry = extern struct {
                         @as(u64, @truncate(dr.size)) << 32
                     else
                         @as(u64, dr.port_count) << 32),
-                .field1 = @as(u64, dr.pci_vendor) |
-                    (@as(u64, dr.pci_device) << 16) |
-                    (@as(u64, dr.pci_class) << 32) |
-                    (@as(u64, dr.pci_subclass) << 40),
+                .field1 = if (dr.device_class == .display)
+                    @as(u64, dr.fb_width) |
+                        (@as(u64, dr.fb_height) << 16) |
+                        (@as(u64, dr.fb_stride) << 32) |
+                        (@as(u64, dr.fb_pixel_format) << 48)
+                else
+                    @as(u64, dr.pci_vendor) |
+                        (@as(u64, dr.pci_device) << 16) |
+                        (@as(u64, dr.pci_class) << 32) |
+                        (@as(u64, dr.pci_subclass) << 40) |
+                        (@as(u64, dr.pci_bus) << 48) |
+                        (@as(u64, dr.pci_dev) << 53) |
+                        (@as(u64, dr.pci_func) << 58),
+            },
+            .core_pin => |cp| .{
+                .handle = entry.handle,
+                .entry_type = @intFromEnum(UserViewEntryType.core_pin),
+                .rights = entry.rights,
+                .field0 = cp.core_id,
+                .field1 = cp.thread_tid,
             },
             .empty => EMPTY,
         };

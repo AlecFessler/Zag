@@ -4,6 +4,8 @@ const zag = @import("zag");
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const elf = std.elf;
+const futex = zag.sched.futex;
+const iommu = zag.arch.x64.iommu;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
@@ -11,12 +13,15 @@ const restart_context_mod = zag.sched.restart_context;
 const sched = zag.sched.scheduler;
 const thread_mod = zag.sched.thread;
 
+const CrashReason = zag.perms.permissions.CrashReason;
+const DeadProcessInfo = zag.perms.permissions.DeadProcessInfo;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const ProcessRights = zag.perms.permissions.ProcessRights;
 const RestartContext = zag.sched.restart_context.RestartContext;
+const SharedMemory = zag.memory.shared.SharedMemory;
 const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
 const SpinLock = zag.sched.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
@@ -25,11 +30,20 @@ const VAddr = zag.memory.address.VAddr;
 const VAddrRange = zag.sched.restart_context.VAddrRange;
 const VirtualMemoryManager = zag.memory.vmm.VirtualMemoryManager;
 
-pub const DEFAULT_STACK_PAGES: u32 = 4;
+pub const DEFAULT_STACK_PAGES: u32 = 8;
 pub const MAX_PERMS: usize = 128;
+pub const MAX_DMA_MAPPINGS: usize = 16;
 pub const HANDLE_SELF: u64 = 0;
 
-pub const ProcessAllocator = SlabAllocator(Process, false, 0, 64);
+pub const DmaMapping = struct {
+    device: *DeviceRegion,
+    shm: *SharedMemory,
+    dma_base: u64,
+    num_pages: u64,
+    active: bool,
+};
+
+pub const ProcessAllocator = SlabAllocator(Process, false, 0, 64, true);
 
 pub const Process = struct {
     pid: u64,
@@ -49,6 +63,10 @@ pub const Process = struct {
     handle_counter: u64,
     perm_view_vaddr: VAddr,
     perm_view_phys: PAddr,
+    dma_mappings: [MAX_DMA_MAPPINGS]DmaMapping,
+    num_dma_mappings: u32,
+    crash_reason: CrashReason,
+    restart_count: u16,
 
     pub const MAX_THREADS = 64;
     pub const MAX_CHILDREN = 64;
@@ -146,18 +164,18 @@ pub const Process = struct {
         unreachable;
     }
 
-    pub fn kill(self: *Process) void {
+    pub fn kill(self: *Process, reason: CrashReason) void {
         self.lock.lock();
         if (!self.alive) {
             self.lock.unlock();
             return;
         }
+        self.crash_reason = reason;
         if (self.restart_context == null) {
             self.alive = false;
         }
-        for (self.threads[0..self.num_threads], 0..) |thread, i| {
+        for (self.threads[0..self.num_threads]) |thread| {
             thread.state = .exited;
-            thread.last_in_proc = (i == self.num_threads - 1);
         }
         self.lock.unlock();
         if (self.num_threads == 0) {
@@ -170,7 +188,7 @@ pub const Process = struct {
         while (i < self.num_children) : (i += 1) {
             self.children[i].killSubtree();
         }
-        self.kill();
+        self.kill(.killed);
     }
 
     pub fn disableRestart(self: *Process) void {
@@ -192,6 +210,9 @@ pub const Process = struct {
         if (!self.alive) {
             self.lock.unlock();
             return;
+        }
+        if (self.crash_reason == .none) {
+            self.crash_reason = .normal_exit;
         }
         const should_restart = self.restart_context != null;
         if (!should_restart) {
@@ -220,6 +241,8 @@ pub const Process = struct {
             return;
         };
 
+        self.restart_count +%= 1;
+
         self.vmm.resetForRestart();
 
         self.perm_lock.lock();
@@ -231,6 +254,8 @@ pub const Process = struct {
         }
         self.syncUserView();
         self.perm_lock.unlock();
+
+        self.updateParentView();
 
         if (rc.data_segment.ghost.len > 0) {
             writeToUserPages(
@@ -244,7 +269,28 @@ pub const Process = struct {
         sched.enqueueOnCore(arch.coreID(), thread);
     }
 
+    fn updateParentView(self: *Process) void {
+        const parent = self.parent orelse return;
+        parent.perm_lock.lock();
+        defer parent.perm_lock.unlock();
+        for (parent.perm_table[1..], 1..) |*slot, idx| {
+            const matches = switch (slot.object) {
+                .process => |p| @intFromPtr(p) == @intFromPtr(self),
+                else => false,
+            };
+            if (matches) {
+                parent.syncUserView();
+                if (parent.perm_view_phys.addr != 0) {
+                    const field0_pa = PAddr.fromInt(parent.perm_view_phys.addr + idx * @sizeOf(UserViewEntry) + 16);
+                    _ = futex.wake(field0_pa, 1);
+                }
+                return;
+            }
+        }
+    }
+
     fn cleanupPhase1(self: *Process) void {
+        self.cleanupDmaMappings();
         self.vmm.deinit();
 
         for (&self.perm_table) |*entry| {
@@ -253,7 +299,10 @@ pub const Process = struct {
                 .device_region => |device| {
                     returnDeviceHandleUpTree(self, entry.rights, device);
                 },
-                .vm_reservation, .process, .empty => {},
+                .core_pin => |cp| {
+                    sched.unpinByRevoke(cp.core_id, cp.thread_tid);
+                },
+                .vm_reservation, .process, .dead_process, .empty => {},
             }
             entry.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
         }
@@ -264,7 +313,7 @@ pub const Process = struct {
     fn cleanupPhase2(self: *Process) void {
         if (self.parent) |p| {
             p.removeChild(self);
-            p.clearPermByObject(self);
+            p.convertToDeadProcess(self);
 
             if (!p.alive and p.num_children == 0) {
                 p.cleanupPhase2();
@@ -273,6 +322,29 @@ pub const Process = struct {
 
         if (self.restart_context) |rc| restart_context_mod.destroy(rc);
         allocator.destroy(self);
+    }
+
+    fn convertToDeadProcess(parent: *Process, child: *Process) void {
+        parent.perm_lock.lock();
+        defer parent.perm_lock.unlock();
+        for (parent.perm_table[1..], 1..) |*slot, idx| {
+            const matches = switch (slot.object) {
+                .process => |p| @intFromPtr(p) == @intFromPtr(child),
+                else => false,
+            };
+            if (matches) {
+                slot.object = .{ .dead_process = .{
+                    .crash_reason = child.crash_reason,
+                    .restart_count = child.restart_count,
+                } };
+                parent.syncUserView();
+                if (parent.perm_view_phys.addr != 0) {
+                    const field0_pa = PAddr.fromInt(parent.perm_view_phys.addr + idx * @sizeOf(UserViewEntry) + 16);
+                    _ = futex.wake(field0_pa, 1);
+                }
+                return;
+            }
+        }
     }
 
     pub fn clearPermByObject(self: *Process, target: anytype) void {
@@ -291,6 +363,42 @@ pub const Process = struct {
             }
         }
         if (changed) self.syncUserView();
+    }
+
+    pub fn addDmaMapping(self: *Process, device: *DeviceRegion, shm: *SharedMemory, dma_base: u64, num_pages: u64) !void {
+        if (self.num_dma_mappings >= MAX_DMA_MAPPINGS) return error.TooManyDmaMappings;
+        self.dma_mappings[self.num_dma_mappings] = .{
+            .device = device,
+            .shm = shm,
+            .dma_base = dma_base,
+            .num_pages = num_pages,
+            .active = true,
+        };
+        self.num_dma_mappings += 1;
+    }
+
+    pub fn removeDmaMapping(self: *Process, device: *DeviceRegion, shm: *SharedMemory) ?DmaMapping {
+        for (self.dma_mappings[0..self.num_dma_mappings], 0..) |*m, i| {
+            if (m.active and m.device == device and m.shm == shm) {
+                const mapping = m.*;
+                m.active = false;
+                if (i == self.num_dma_mappings - 1) {
+                    self.num_dma_mappings -= 1;
+                }
+                return mapping;
+            }
+        }
+        return null;
+    }
+
+    pub fn cleanupDmaMappings(self: *Process) void {
+        for (self.dma_mappings[0..self.num_dma_mappings]) |*m| {
+            if (m.active) {
+                iommu.unmapDmaPages(m.device, m.dma_base, m.num_pages);
+                m.active = false;
+            }
+        }
+        self.num_dma_mappings = 0;
     }
 
     pub fn returnDeviceHandleUpTree(source: *Process, rights: u16, device: *DeviceRegion) void {
@@ -330,6 +438,10 @@ pub const Process = struct {
             .handle_counter = 1,
             .perm_view_vaddr = VAddr.fromInt(0),
             .perm_view_phys = PAddr.fromInt(0),
+            .dma_mappings = undefined,
+            .num_dma_mappings = 0,
+            .crash_reason = .none,
+            .restart_count = 0,
         };
 
         const pmm_iface = pmm.global_pmm.?.allocator();
@@ -390,7 +502,7 @@ pub const Process = struct {
             p.lock.lock();
             defer p.lock.unlock();
             if (p.num_children >= MAX_CHILDREN) {
-                proc.kill();
+                proc.kill(.none);
                 return error.TooManyChildren;
             }
             p.children[p.num_children] = proc;
@@ -424,6 +536,10 @@ pub const Process = struct {
             .handle_counter = 1,
             .perm_view_vaddr = VAddr.fromInt(0),
             .perm_view_phys = PAddr.fromInt(0),
+            .dma_mappings = undefined,
+            .num_dma_mappings = 0,
+            .crash_reason = .none,
+            .restart_count = 0,
         };
         proc.initPermTable(.{});
         return proc;
@@ -459,7 +575,9 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
     const phdr_size = @as(u64, ehdr.e_phentsize);
     const phdr_count = @as(u64, ehdr.e_phnum);
 
-    if (phdr_offset + phdr_size * phdr_count > elf_binary.len) return error.InvalidElf;
+    const phdr_total = std.math.mul(u64, phdr_size, phdr_count) catch return error.InvalidElf;
+    const phdr_end = std.math.add(u64, phdr_offset, phdr_total) catch return error.InvalidElf;
+    if (phdr_end > elf_binary.len) return error.InvalidElf;
 
     const pmm_iface = pmm.global_pmm.?.allocator();
     const rela_info = findRelaSection(elf_binary, ehdr);
@@ -503,11 +621,11 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
         if (seg_file_end > highest_va) highest_va = seg_file_end;
 
         if (phdr.p_memsz > phdr.p_filesz) {
-            has_bss = true;
             const this_bss_start = std.mem.alignForward(u64, seg_file_end, paging.PAGE4K);
             const this_bss_end = std.mem.alignForward(u64, seg_mem_end, paging.PAGE4K);
             if (this_bss_end > bss_end) bss_end = this_bss_end;
             if (!has_bss or this_bss_start < bss_start) bss_start = this_bss_start;
+            has_bss = true;
         }
     }
 

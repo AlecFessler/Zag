@@ -367,6 +367,6 @@ fn freePhysPage(paddr: PAddr, pmm_iface: std.mem.Allocator) void {
 }
 
 fn freeTablePage(table: *[PAGE_ENTRY_TABLE_SIZE]PageEntry, pmm_iface: std.mem.Allocator) void {
-    const page: *paging.PageMem(.page4k) = @alignCast(@ptrCast(table));
+    const page: *paging.PageMem(.page4k) = @ptrCast(@alignCast(table));
     pmm_iface.destroy(page);
 }

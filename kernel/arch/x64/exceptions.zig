@@ -1,11 +1,14 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const arch = zag.arch.dispatch;
 const cpu = zag.arch.x64.cpu;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
+const scheduler = zag.sched.scheduler;
 
+const CrashReason = zag.perms.permissions.CrashReason;
 const GateType = zag.arch.x64.idt.GateType;
 const PageFaultContext = zag.arch.interrupts.PageFaultContext;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
@@ -82,6 +85,90 @@ pub fn init() void {
         pageFaultHandler,
         .exception,
     );
+
+    const exception_vectors = [_]u5{
+        @intFromEnum(Exception.divide_by_zero),
+        @intFromEnum(Exception.single_step_debug),
+        @intFromEnum(Exception.non_maskable_interrupt),
+        @intFromEnum(Exception.breakpoint_debug),
+        @intFromEnum(Exception.overflow),
+        @intFromEnum(Exception.bound_range_exceeded),
+        @intFromEnum(Exception.invalid_opcode),
+        @intFromEnum(Exception.device_not_available),
+        @intFromEnum(Exception.double_fault),
+        @intFromEnum(Exception.coprocessor_segment_overrun),
+        @intFromEnum(Exception.invalid_task_state_segment),
+        @intFromEnum(Exception.segment_not_pressent),
+        @intFromEnum(Exception.stack_segment_fault),
+        @intFromEnum(Exception.general_protection_fault),
+        // page_fault already registered above
+        @intFromEnum(Exception.x87_floating_point),
+        @intFromEnum(Exception.alignment_check),
+        @intFromEnum(Exception.machine_check),
+        @intFromEnum(Exception.simd_floating_point),
+        @intFromEnum(Exception.virtualization),
+        @intFromEnum(Exception.security),
+    };
+
+    for (exception_vectors) |vec| {
+        interrupts.registerVector(vec, exceptionHandler, .exception);
+    }
+}
+
+fn exceptionCrashReason(vector: u5) ?CrashReason {
+    return switch (@as(Exception, @enumFromInt(vector))) {
+        .divide_by_zero, .overflow, .bound_range_exceeded => .arithmetic_fault,
+        .x87_floating_point, .simd_floating_point => .arithmetic_fault,
+        .invalid_opcode, .device_not_available => .illegal_instruction,
+        .alignment_check => .alignment_fault,
+        .general_protection_fault, .stack_segment_fault => .protection_fault,
+        .invalid_task_state_segment, .segment_not_pressent => .protection_fault,
+        .virtualization, .security => .protection_fault,
+        .single_step_debug, .breakpoint_debug => null,
+        .double_fault, .machine_check => null,
+        .non_maskable_interrupt, .coprocessor_segment_overrun => null,
+        .page_fault => unreachable,
+    };
+}
+
+fn exceptionHandler(ctx: *cpu.Context) void {
+    const vector: u5 = @intCast(ctx.int_num);
+    const exception: Exception = @enumFromInt(vector);
+    const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
+    const from_user = (ctx.cs & ring_3) == ring_3;
+
+    if (from_user) {
+        // Debug/breakpoint from userspace: no debugger attached, just resume.
+        if (exception == .single_step_debug or exception == .breakpoint_debug) return;
+
+        if (exceptionCrashReason(vector)) |reason| {
+            const thread = scheduler.currentThread() orelse
+                @panic("user exception with no current thread");
+            arch.print("K: EXCEPTION pid={d} vec={d} err=0x{x}\n", .{
+                thread.process.pid, vector, ctx.err_code,
+            });
+            thread.process.kill(reason);
+            arch.enableInterrupts();
+            while (true) arch.halt();
+        }
+    }
+
+    switch (exception) {
+        .double_fault => @panic("Double fault"),
+        .machine_check => @panic("Machine check exception"),
+        .non_maskable_interrupt => @panic("NMI"),
+        .general_protection_fault => {
+            arch.print("GPF at rip=0x{x} err=0x{x}\n", .{ ctx.rip, ctx.err_code });
+            @panic("General protection fault");
+        },
+        .page_fault => unreachable,
+        else => {
+            arch.print("Exception {d} at rip=0x{x} err=0x{x}\n", .{
+                vector, ctx.rip, ctx.err_code,
+            });
+            @panic("Unhandled kernel exception");
+        },
+    }
 }
 
 fn pageFaultHandler(ctx: *cpu.Context) void {

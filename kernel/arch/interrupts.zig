@@ -12,6 +12,7 @@ const scheduler = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
 const x64 = zag.arch.x64;
 
+const CrashReason = zag.perms.permissions.CrashReason;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
@@ -52,6 +53,20 @@ fn demandPageKernel(faulting_virt: VAddr) void {
         @panic("mapPage failed in kernel demand page fault");
 }
 
+fn accessReason(is_write: bool, is_exec: bool) CrashReason {
+    if (is_exec) return .invalid_execute;
+    if (is_write) return .invalid_write;
+    return .invalid_read;
+}
+
+fn guardPageReason(proc: anytype, node_start: u64) CrashReason {
+    const above = proc.vmm.findNode(VAddr.fromInt(node_start + paging.PAGE4K));
+    if (above != null and above.?.rights.write) {
+        return .stack_overflow;
+    }
+    return .stack_underflow;
+}
+
 pub fn handlePageFault(fault: *const PageFaultContext) void {
     const faulting_virt = VAddr.fromInt(fault.faulting_address);
     const is_kernel_privilege = fault.is_kernel_privilege;
@@ -62,8 +77,9 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     if (is_kernel_privilege) {
         if (is_user_va) {
             const thread = scheduler.currentThread() orelse @panic("kernel page fault on user VA with no current thread");
-            stack_mod.lookupGuard(thread.process.pid, faulting_virt);
-            thread.process.kill();
+            arch.print("K: PAGEFAULT pid={d} addr=0x{x} w={} x={}\n", .{ thread.process.pid, fault.faulting_address, is_write, is_exec });
+            thread.process.kill(accessReason(is_write, is_exec));
+            arch.enableInterrupts();
             while (true) arch.halt();
         }
 
@@ -90,15 +106,15 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     const proc = thread.process;
 
     const node = proc.vmm.findNode(faulting_virt) orelse {
-        stack_mod.lookupGuard(proc.pid, faulting_virt);
-        proc.kill();
+        arch.print("K: USER_PF pid={d} addr=0x{x} w={} x={}\n", .{ proc.pid, faulting_virt.addr, is_write, is_exec });
+        proc.kill(.unmapped_access);
+        arch.enableInterrupts();
         while (true) arch.halt();
     };
 
     switch (node.kind) {
         .shared_memory, .mmio => {
-            stack_mod.lookupGuard(proc.pid, faulting_virt);
-            proc.kill();
+            proc.kill(accessReason(is_write, is_exec));
             arch.enableInterrupts();
             while (true) arch.halt();
         },
@@ -110,21 +126,23 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
             };
 
             if (!rights_ok) {
-                stack_mod.lookupGuard(proc.pid, faulting_virt);
-                proc.kill();
+                if (!node.rights.read and !node.rights.write and !node.rights.execute and node.size == paging.PAGE4K) {
+                    proc.kill(guardPageReason(proc, node.start.addr));
+                } else {
+                    proc.kill(accessReason(is_write, is_exec));
+                }
+                arch.enableInterrupts();
                 while (true) arch.halt();
             }
 
             const page_base = VAddr.fromInt(std.mem.alignBackward(u64, faulting_virt.addr, paging.PAGE4K));
             if (arch.resolveVaddr(proc.addr_space_root, page_base) != null) {
-                stack_mod.lookupGuard(proc.pid, faulting_virt);
-                proc.kill();
-                while (true) arch.halt();
+                @panic("user fault on already-mapped page");
             }
 
             proc.vmm.demandPage(faulting_virt, is_write, is_exec) catch {
-                stack_mod.lookupGuard(proc.pid, faulting_virt);
-                proc.kill();
+                proc.kill(.out_of_memory);
+                arch.enableInterrupts();
                 while (true) arch.halt();
             };
         },

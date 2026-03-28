@@ -34,7 +34,7 @@ pub const BumpAllocator = struct {
         ret_addr: u64,
     ) ?[*]u8 {
         _ = ret_addr;
-        const self: *BumpAllocator = @alignCast(@ptrCast(ptr));
+        const self: *BumpAllocator = @ptrCast(@alignCast(ptr));
 
         const aligned = std.mem.alignForward(
             u64,

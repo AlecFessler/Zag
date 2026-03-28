@@ -1,10 +1,61 @@
 const std = @import("std");
 
+const Profile = struct {
+    root_service: []const u8,
+    net: []const u8,
+    kvm: bool,
+    use_llvm: bool,
+    iommu: []const u8,
+};
+
+const profiles = struct {
+    const router = Profile{
+        .root_service = "routerOS/bin/routerOS.elf",
+        .net = "tap",
+        .kvm = true,
+        .use_llvm = true,
+        .iommu = "intel",
+    };
+    const test_ = Profile{
+        .root_service = "kernel/tests/bin/root_service.elf",
+        .net = "none",
+        .kvm = true,
+        .use_llvm = true,
+        .iommu = "intel",
+    };
+    const bench = Profile{
+        .root_service = "kernel/tests/bin/bench.elf",
+        .net = "none",
+        .kvm = true,
+        .use_llvm = true,
+        .iommu = "intel",
+    };
+};
+
+fn getProfile(name: []const u8) ?Profile {
+    if (std.mem.eql(u8, name, "router")) return profiles.router;
+    if (std.mem.eql(u8, name, "test")) return profiles.test_;
+    if (std.mem.eql(u8, name, "bench")) return profiles.bench;
+    return null;
+}
+
 pub fn build(b: *std.Build) void {
-    const kvm = b.option(bool, "kvm", "Enable KVM acceleration (default: on)") orelse true;
-    const use_llvm = b.option(bool, "use-llvm", "Force LLVM+LLD backend") orelse false;
+    const profile_name = b.option([]const u8, "profile", "Build profile: router, test, bench (sets defaults for other flags)");
+    const profile = if (profile_name) |name| getProfile(name) else null;
+
+    const kvm = b.option(bool, "kvm", "Enable KVM acceleration (default: on)") orelse
+        if (profile) |p| p.kvm else true;
+    const use_llvm = b.option(bool, "use-llvm", "Force LLVM+LLD backend") orelse
+        if (profile) |p| p.use_llvm else false;
     const target_arch = b.option([]const u8, "arch", "Target architecture (x64 or arm)") orelse "x64";
-    const root_service_path = b.option([]const u8, "root-service", "Path to root service ELF (default: userspace/bin/root_service.elf)");
+    const root_service_path = b.option([]const u8, "root-service", "Path to root service ELF") orelse
+        if (profile) |p| p.root_service else "kernel/tests/bin/root_service.elf";
+    const iommu_type = b.option([]const u8, "iommu", "IOMMU type: intel or amd (default: intel)") orelse
+        if (profile) |p| p.iommu else "intel";
+    const display_type = b.option([]const u8, "display", "QEMU display: none, gtk, sdl (default: none)") orelse "none";
+    const net_type = b.option([]const u8, "net", "Network: tap, user, or none (default: user)") orelse
+        if (profile) |p| p.net else "user";
+
     const arch: std.Target.Cpu.Arch = blk: {
         break :blk if (std.mem.eql(u8, target_arch, "x64"))
             .x86_64
@@ -26,31 +77,19 @@ pub fn build(b: *std.Build) void {
     zag_mod.red_zone = false;
     zag_mod.addImport("zag", zag_mod);
 
-    // ── Root service binary ─────────────────────────────────────────────
+    // ── SMP trampoline (only remaining embedded binary) ─────────────────
     const embedded_wf = b.addWriteFiles();
-    var embed_src: std.ArrayListUnmanaged(u8) = .{};
-
-    const root_elf_path = root_service_path orelse "userspace/bin/root_service.elf";
-    _ = embedded_wf.addCopyFile(.{ .cwd_relative = root_elf_path }, "root_service.elf");
-    embed_src.writer(b.allocator).print(
-        "pub const root_service = @embedFile(\"root_service.elf\");\n",
-        .{},
-    ) catch @panic("OOM");
-
-    // ── SMP trampoline ──────────────────────────────────────────────────
     const nasm_step = b.addSystemCommand(&.{
         "nasm",                    "-f", "bin",
         "kernel/arch/x64/smp.asm", "-o",
     });
     const trampoline_output = nasm_step.addOutputFileArg("trampoline.bin");
     _ = embedded_wf.addCopyFile(trampoline_output, "trampoline.bin");
-    embed_src.writer(b.allocator).print(
-        "pub const trampoline = @embedFile(\"trampoline.bin\");\n",
-        .{},
-    ) catch @panic("OOM");
-
     const embedded_bins_mod = b.createModule(.{
-        .root_source_file = embedded_wf.add("embedded_bins.zig", embed_src.items),
+        .root_source_file = embedded_wf.add("embedded_bins.zig",
+            \\pub const trampoline = @embedFile("trampoline.bin");
+            \\
+        ),
         .target = b.resolveTargetQuery(.{
             .cpu_arch = arch,
             .os_tag = .freestanding,
@@ -120,6 +159,13 @@ pub fn build(b: *std.Build) void {
     install_kernel.step.dependOn(&kernel.step);
     b.getInstallStep().dependOn(&install_kernel.step);
 
+    // ── Root service (copied into FAT image, loaded by bootloader) ─────
+    const install_root_service = b.addInstallFile(
+        .{ .cwd_relative = root_service_path },
+        b.fmt("{s}/root_service.elf", .{out_dir}),
+    );
+    b.getInstallStep().dependOn(&install_root_service.step);
+
     // ── QEMU ────────────────────────────────────────────────────────────
     const qemu_accel_args: []const u8 = if (kvm)
         \\-enable-kvm \
@@ -131,18 +177,47 @@ pub fn build(b: *std.Build) void {
         \\-no-shutdown \
         \\-D qemu.log
     ;
+    const qemu_machine_args: []const u8 = 
+        \\-machine q35
+    ;
+    const qemu_iommu_args: []const u8 = if (std.mem.eql(u8, iommu_type, "intel"))
+        "-device intel-iommu,intremap=off"
+    else
+        "-device amd-iommu"
+    ;
+    const qemu_net_args: []const u8 = if (std.mem.eql(u8, net_type, "tap"))
+        \\-netdev tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=off \
+        \\-device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
+        \\-netdev tap,id=net1,ifname=tap1,script=no,downscript=no,vhost=off \
+        \\-device e1000e,netdev=net1,mac=52:54:00:12:34:57
+    else if (std.mem.eql(u8, net_type, "passthrough"))
+        \\-net none \
+        \\-device pcie-root-port,id=rp1,slot=1 \
+        \\-device pcie-pci-bridge,id=br1,bus=rp1 \
+        \\-device vfio-pci,host=05:00.0,bus=br1,addr=1.0 \
+        \\-device vfio-pci,host=05:00.1,bus=br1,addr=2.0
+    else if (std.mem.eql(u8, net_type, "user"))
+        \\-netdev user,id=net0 \
+        \\-device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
+        \\-netdev user,id=net1 \
+        \\-device e1000e,netdev=net1,mac=52:54:00:12:34:57
+    else
+        \\-net none
+    ;
     const qemu_cmdline = b.fmt(
         \\exec qemu-system-x86_64 \
-        \\ -m 512M \
+        \\ -m 1G \
         \\ -bios /usr/share/ovmf/x64/OVMF.4m.fd \
         \\ -drive file=fat:rw:{s}/{s},format=raw \
         \\ -serial mon:stdio \
-        \\ -display none \
+        \\ -display {s} \
         \\ -no-reboot \
         \\ {s} \
-        \\ -smp cores=4 \
-        \\ -s
-    , .{ b.install_path, out_dir, qemu_accel_args });
+        \\ {s} \
+        \\ {s} \
+        \\ {s} \
+        \\ -smp cores=4
+    , .{ b.install_path, out_dir, display_type, qemu_accel_args, qemu_machine_args, qemu_iommu_args, qemu_net_args });
     const qemu_cmd = b.addSystemCommand(&[_][]const u8{
         "sh", "-lc", qemu_cmdline,
     });

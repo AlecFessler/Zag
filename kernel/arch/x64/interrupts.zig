@@ -77,32 +77,16 @@ pub fn prepareThreadContext(
 
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
 
-    ctx.* = .{
-        .regs = .{
-            .r15 = 0,
-            .r14 = 0,
-            .r13 = 0,
-            .r12 = 0,
-            .r11 = 0,
-            .r10 = 0,
-            .r9 = 0,
-            .r8 = 0,
-            .rdi = arg,
-            .rsi = 0,
-            .rbp = 0,
-            .rbx = 0,
-            .rdx = 0,
-            .rcx = 0,
-            .rax = 0,
-        },
-        .int_num = 0,
-        .err_code = 0,
-        .rip = @intFromPtr(entry),
-        .cs = 0,
-        .rflags = 0x202,
-        .rsp = 0,
-        .ss = 0,
-    };
+    // Zero the entire context with @memset to avoid movaps alignment issues
+    // in ReleaseFast. The packed struct Context sits at an 8-byte-aligned
+    // (not 16-byte-aligned) address due to the SysV ABI stack convention,
+    // but LLVM emits movaps (requiring 16-byte alignment) for bulk struct
+    // literal initialization.
+    const ctx_bytes: [*]u8 = @ptrFromInt(ctx_addr);
+    @memset(ctx_bytes[0..@sizeOf(cpu.Context)], 0);
+    ctx.regs.rdi = arg;
+    ctx.rip = @intFromPtr(entry);
+    ctx.rflags = 0x202;
 
     if (ustack_top != null) {
         ctx.cs = gdt.USER_CODE_OFFSET | ring_3;
@@ -170,19 +154,6 @@ pub fn registerVector(
     };
 }
 
-fn pageFaultHandler(ctx: *cpu.Context) void {
-    const fault_addr = asm volatile ("mov %%cr2, %[out]"
-        : [out] "=r" (-> u64),
-    );
-    const fault: PageFaultContext = .{
-        .faulting_address = fault_addr,
-        .is_kernel_privilege = (ctx.cs & 0x3) == 0,
-        .is_write = (ctx.err_code & 0x2) != 0,
-        .is_exec = (ctx.err_code & 0x10) != 0,
-    };
-    zag.arch.interrupts.handlePageFault(&fault);
-}
-
 export fn interruptStubPrologue() callconv(.naked) void {
     asm volatile (
         \\pushq %rax
@@ -237,11 +208,6 @@ export fn dispatchInterrupt(ctx: *cpu.Context) void {
         if (vector_table[@intCast(ctx.int_num)].kind == .external) {
             apic.endOfInterrupt();
         }
-        return;
-    }
-
-    if (ctx.int_num == 14) {
-        pageFaultHandler(ctx);
         return;
     }
 

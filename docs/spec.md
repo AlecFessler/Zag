@@ -37,10 +37,12 @@ Read-only region mapped into the process's address space, mirroring the permissi
 
 Each entry is 32 bytes and contains:
 - `handle: u64` — monotonic ID. `U64_MAX` = empty slot.
-- `type: enum { process, vm_reservation, shared_memory, device_region }`.
+- `type: enum { process, vm_reservation, shared_memory, device_region, core_pin, dead_process }`.
 - `rights: u16`.
 
 Type-specific fields:
+- `process`: `field0` encodes `crash_reason(u5, bits 0-4) | restart_count(u16, bits 16-31)`. On first boot, field0 = 0. After a restart, crash_reason reflects the fault that triggered the restart and restart_count increments.
+- `dead_process`: Same field0 encoding as `process`. This entry type replaces a `process` entry when the child dies without restarting. The parent may inspect the crash reason and restart count, then revoke the handle at its convenience.
 - `vm_reservation`: `start: VAddr`, `size: u64` (original range).
 - `shared_memory`: `size: u64`.
 - `device_region`: `field0: u64`, `field1: u64` (see §2.7 Device Region for encoding).
@@ -99,18 +101,19 @@ Handle = monotonic u64 ID, unique across the lifetime of the process. Handle 0 (
 
 #### Rights
 
-**ProcessRights:** `grant_to`(0), `spawn_thread`(1), `spawn_process`(2), `mem_reserve`(3), `set_affinity`(4), `restart`(5), `shm_create`(6), `device_own`(7), `shutdown`(8). Stored as `u16`.
+**ProcessRights:** `grant_to`(0), `spawn_thread`(1), `spawn_process`(2), `mem_reserve`(3), `set_affinity`(4), `restart`(5), `shm_create`(6), `device_own`(7), `shutdown`(8), `pin_exclusive`(9). Stored as `u16`.
 
 - `restart`: can only be granted by a parent that itself has `restart`. Once cleared via `disable_restart`, cannot be re-enabled.
 - `shm_create`: required to create shared memory regions.
 - `device_own`: required to receive device handles via grant. The kernel checks this on the target process during device grant.
 - `shutdown`: required to invoke the `shutdown` syscall. Only the root service should hold this.
+- `pin_exclusive`: required to pin a thread exclusively to a core, making it non-preemptible.
 
 **VmReservationRights:** `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4). `shareable` and `mmio` are mutually exclusive.
 
 **SharedMemoryRights:** `read`(0), `write`(1), `execute`(2), `grant`(3).
 
-**DeviceRegionRights:** `map`(0), `grant`(1).
+**DeviceRegionRights:** `map`(0), `grant`(1), `dma`(2).
 
 #### Permission Rules
 
@@ -162,7 +165,7 @@ A unit of execution belonging to a Process.
 
 The futex mechanism allows userspace synchronization primitives (mutexes, condition variables, semaphores) to integrate with the kernel scheduler, avoiding busy-waiting.
 
-**wait(addr, expected, timeout_ns):** Compare the 64-bit value at `addr` against `expected`. If not equal: return `E_AGAIN`. If equal: block the calling thread. Address must be 8-byte aligned. Timeout: 0 = try-only, `MAX_U64` = indefinite. Cross-process futexes work over shared memory (two processes mapping the same SHM can synchronize via the same address).
+**wait(addr, expected, timeout_ns):** Compare the 64-bit value at `addr` against `expected`. If not equal: return `E_AGAIN`. If equal: block the calling thread until woken or the timeout expires. Address must be 8-byte aligned. Timeout: 0 = try-only (return `E_TIMEOUT` immediately), `MAX_U64` = indefinite wait, any other value = block for at most `timeout_ns` nanoseconds then return `E_TIMEOUT`. Timed waiters are checked every scheduler tick (~2ms). Cross-process futexes work over shared memory (two processes mapping the same SHM can synchronize via the same address).
 
 **wake(addr, count):** Wake up to `count` threads blocked on the physical address corresponding to `addr`. Returns number of threads woken.
 
@@ -174,17 +177,21 @@ The futex mechanism allows userspace synchronization primitives (mutexes, condit
 
 Triggered when a process with a restart context terminates for any reason (last thread exits, fault kill, parent-initiated kill).
 
-The process remains alive throughout. Its permissions table and user view remain intact (except VM reservation entries, which are cleared).
+The process remains alive throughout. Its permissions table and user view remain intact (except VM reservation entries, which are cleared). Each restart increments a restart count (`u16`, wraps to zero on overflow). The crash reason from the triggering fault is recorded in the process's user view field0.
 
 **Persists across restart:** code/rodata/data mappings (data content reloaded from original), user permissions view, BSS region (decommitted), SHM and device handle permissions table entries, process tree position, children, restart context.
 
 **Does not persist:** user-created VM reservations, VM reservation permissions table entries, user stacks, SHM/MMIO mappings within freed reservations, committed pages in decommitted regions, threads.
 
-**First boot vs restart:** On first boot, only slot 0 (`HANDLE_SELF`) exists. On restart, SHM and device handles persist. VM reservation handles do not. No explicit kernel signal — the process inspects its user view.
+**First boot vs restart:** On first boot, only slot 0 (`HANDLE_SELF`) exists and field0 = 0. On restart, SHM and device handles persist. VM reservation handles do not. The process can detect a restart by inspecting its own slot 0 field0 — if crash_reason is non-zero or restart_count is non-zero, it has been restarted.
 
 #### Kill
 
 A process terminates only by: (a) last thread voluntarily exiting, (b) a fault, or (c) parent revoking its process handle. There is no `proc_kill` syscall.
+
+When a process is killed by a fault, the kernel records a **crash reason** (see §3 for the mapping). If the process has a restart context, it restarts and the crash reason and incremented restart count are written to both the process's own user view (slot 0 field0) and the parent's user view entry for this child. The kernel issues a futex wake on the parent's user view field0 for this entry.
+
+If the process does not have a restart context, it undergoes cleanup. The parent's permissions table entry is converted from `process` to `dead_process`, preserving the crash reason and restart count. The kernel issues a futex wake on the parent's user view field0. The parent may inspect the crash info via its user view and revoke the handle at its convenience to free the slot.
 
 **Non-recursive kill** (fault, voluntary exit): All threads are stopped and removed. If the process has a restart context, it restarts. Otherwise, it undergoes cleanup (becoming a zombie if it has children).
 
@@ -212,7 +219,7 @@ Each user stack consists of a usable region flanked by guard pages:
 2. **Usable region** — N pages, read-write. First page eagerly mapped, rest demand-paged.
 3. **Overflow guard** — 1 page, unmapped.
 
-Faults on guard pages kill the process.
+Faults on guard pages kill the process with a specific crash reason: `stack_overflow` if the fault is on the guard below the usable stack (stack grew past bottom), or `stack_underflow` if the fault is on the guard above the usable stack.
 
 ---
 
@@ -233,6 +240,23 @@ A hardware device region. Two types: **MMIO** (memory-mapped I/O, mappable into 
 - `field0`: `device_type(u8) | device_class(u8) << 8 | size_or_port_count(u32) << 32`.
 - `field1`: `pci_vendor(u16) | pci_device(u16) << 16 | pci_class(u8) << 32 | pci_subclass(u8) << 40`.
 
+---
+
+### 2.10 Core Pin
+
+A core pin object represents exclusive, non-preemptible ownership of a CPU core by a thread. Created via `pin_exclusive`, revoked via `revoke_perm`. While pinned, the scheduler skips preemption on that core — the thread runs uninterrupted until it voluntarily yields or is unpinned. Other threads are migrated off the pinned core's run queue.
+
+**Constraints:**
+- The calling thread must have single-core affinity set (exactly one bit in the mask).
+- The target core must not already be pinned by another thread.
+- At least one core must remain unpinned for preemptive scheduling.
+
+**User View Encoding:**
+- `field0`: `core_id` (the pinned core index).
+- `field1`: `thread_tid` (the pinned thread's TID).
+
+---
+
 #### Enumeration
 
 At boot, the kernel enumerates devices (PCI bus walk, legacy serial port probing) and inserts all handles into the root service's permissions table. Kernel-internal devices (HPET, LAPIC, I/O APIC) are not exposed.
@@ -243,12 +267,27 @@ At boot, the kernel enumerates devices (PCI bus walk, legacy serial port probing
 
 ### User Faults
 
-1. No VMM node found for the fault address: **kill**.
-2. Shared memory or MMIO region: **kill** (all pages eagerly mapped; a fault means corruption).
-3. Private region, access type not permitted by current rights: **kill**.
-4. Private region, access permitted: **demand-page** (allocate zeroed page, map, resume).
+Each fault that kills a process records a `CrashReason` (u5):
 
-Faults on stack guard pages produce stack overflow/underflow diagnostics. Any other user-triggerable CPU exception (divide-by-zero, invalid opcode, GPF, etc.) kills the faulting process.
+| Value | Name | Trigger |
+|-------|------|---------|
+| 0 | `none` | No crash (sentinel) |
+| 1 | `stack_overflow` | Guard page fault below stack |
+| 2 | `stack_underflow` | Guard page fault above stack |
+| 3 | `invalid_read` | Read fault with no read permission |
+| 4 | `invalid_write` | Write fault with no write permission |
+| 5 | `invalid_execute` | Execute fault with no execute permission |
+| 6 | `unmapped_access` | No VMM node for faulting address |
+| 7 | `out_of_memory` | Demand page allocation failed |
+
+Fault handling:
+
+1. No VMM node found for the fault address: **kill** (`unmapped_access`).
+2. Shared memory or MMIO region: **kill** (`invalid_read`/`invalid_write`/`invalid_execute` based on access type).
+3. Private region, access type not permitted by current rights: if the faulting node is a stack guard page, **kill** (`stack_overflow` or `stack_underflow`); otherwise **kill** (`invalid_read`/`invalid_write`/`invalid_execute`).
+4. Private region, access permitted: **demand-page** (allocate zeroed page, map, resume). If allocation fails: **kill** (`out_of_memory`).
+
+Any other user-triggerable CPU exception (divide-by-zero, invalid opcode, GPF, etc.) kills the faulting process.
 
 All user faults are non-recursive: killing a faulting process does not propagate to children.
 
@@ -301,9 +340,9 @@ Adjust effective rights on a sub-range within a VM reservation. `offset` and `si
 **Returns:** `E_OK`.
 **Errors:** `E_BADCAP`, `E_INVAL` (bad alignment, out of bounds, `shareable`/`mmio` bits set), `E_PERM` (exceeds `max_rights`, range contains SHM/MMIO nodes).
 
-### shm_create(size) → handle
+### shm_create(size, rights) → handle
 
-Create shared memory. Eagerly allocates zeroed pages.
+Create shared memory. Eagerly allocates zeroed pages. `rights` specifies the SharedMemoryRights for the handle (read, write, execute, grant bits).
 
 **Permission:** `HANDLE_SELF.shm_create`.
 **Returns:** Handle ID (positive).
@@ -367,6 +406,18 @@ Sets core affinity for calling thread. Yield after for immediate effect.
 **Returns:** `E_OK`.
 **Errors:** `E_PERM`, `E_INVAL` (empty mask, invalid core IDs).
 
+### pin_exclusive() → handle
+
+Pin the calling thread exclusively to its current core. The thread becomes non-preemptible — the scheduler timer still fires (for futex expiry) but skips the context switch. Returns a core_pin handle that can be revoked to unpin.
+
+The thread must have single-core affinity set. The target core must not already be pinned. At least one core must remain unpinned. Any other threads on the core's run queue are migrated to unpinned cores.
+
+**Permission:** `HANDLE_SELF.pin_exclusive`.
+**Returns:** Core pin handle ID (positive).
+**Errors:** `E_PERM` (no `pin_exclusive` right), `E_INVAL` (no affinity set, multi-core affinity, would pin all cores), `E_BUSY` (core already pinned), `E_MAXCAP`.
+
+---
+
 ### grant_perm(src_handle, target_proc_handle, granted_rights) → result
 
 Grant a capability to a child process. `target_proc_handle` must reference a process entry with `grant_to` set. `granted_rights` must be a subset of `src_handle.rights`. Source must have `grant` bit set.
@@ -386,7 +437,9 @@ Cannot revoke `HANDLE_SELF`. Per-type behavior (§2.3):
 - **VM reservation:** Free all pages in range, clear slot.
 - **SHM:** Unmap SHM PTEs, revert mapped regions to private, clear slot.
 - **Device:** Unmap MMIO PTEs, return handle up process tree (§2.1 device handle return), clear slot in source.
+- **Core pin:** Unpin the thread, restore preemptive scheduling on the core, clear slot.
 - **Process:** Recursively kill child's entire subtree (§2.6). Restartable children restart; non-restartable die. Clear slot.
+- **Dead process:** Clear slot (process already dead, no further cleanup needed).
 
 **Returns:** `E_OK`.
 **Errors:** `E_BADCAP` (invalid handle), `E_INVAL` (attempted `HANDLE_SELF`).
@@ -401,7 +454,7 @@ Permanently clear `restart` bit and free restart context for calling process and
 
 ### futex_wait(addr, expected, timeout_ns) → result
 
-Compare 64-bit value at `addr` against `expected`. If not equal: `E_AGAIN`. If equal: block. Address must be 8-byte aligned. Timeout: 0 = try-only, `MAX_U64` = indefinite. Cross-process futexes work over SHM.
+Compare 64-bit value at `addr` against `expected`. If not equal: `E_AGAIN`. If equal: block until woken or timeout expires. Address must be 8-byte aligned. Timeout: 0 = try-only, `MAX_U64` = indefinite, other = nanosecond deadline. Cross-process futexes work over SHM.
 
 **Returns:** `E_OK` (woken), `E_AGAIN` (mismatch), `E_TIMEOUT`.
 **Errors:** `E_BADADDR`, `E_INVAL` (alignment).
@@ -423,6 +476,31 @@ Immediately halt the machine.
 
 **Permission:** `HANDLE_SELF.shutdown`.
 **Errors:** `E_PERM`.
+
+### dma_map(device_handle, shm_handle) → dma_addr
+
+Map all pages of a shared memory region into the device's IOMMU address space. Returns a base DMA address that the device should use in its DMA descriptors. The IOMMU translates DMA addresses to physical addresses, isolating each device's memory access. Scattered physical pages appear contiguous to the device.
+
+**Permission:** device handle must have `dma` right, device must be MMIO type. IOMMU must be present.
+**Returns:** DMA base address (positive).
+**Errors:** `E_BADCAP`, `E_PERM` (no `dma` right or no IOMMU present), `E_INVAL` (device not MMIO), `E_NOMEM`.
+
+DMA mappings are tracked per-process. On process exit, all DMA mappings are automatically unmapped from the IOMMU.
+
+### dma_unmap(device_handle, shm_handle) → result
+
+Remove the SHM pages from the device's IOMMU address space. Invalidates the IOMMU TLB.
+
+**Returns:** `E_OK`.
+**Errors:** `E_BADCAP`, `E_PERM`.
+
+### pci_enable_bus_master(device_handle) → result
+
+Enable PCI bus mastering for the device. Sets the bus master bit in the PCI command register, allowing the device to initiate DMA transactions.
+
+**Permission:** device handle must have `dma` right.
+**Returns:** `E_OK`.
+**Errors:** `E_BADCAP`, `E_PERM` (no `dma` right).
 
 ### ioport_read(device_handle, port_offset, width) → value
 
@@ -453,4 +531,6 @@ Write to a Port I/O device. Same validation as `ioport_read`.
 | SHM max size | 1 MiB (256 pages) |
 | Default user stack | 16 KiB (4 pages) |
 | Futex wait queue buckets | 256 |
+| Futex timed waiter slots | 64 |
 | User permissions view | 1 page (128 entries x 32 bytes) |
+| DMA mappings per process | 16 |

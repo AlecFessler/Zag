@@ -13,6 +13,7 @@ pub fn SlabAllocator(
     comptime stack_bootstrap: bool,
     comptime stack_size: usize,
     comptime allocation_chunk_size: usize,
+    comptime use_lock: bool,
 ) type {
     if (stack_bootstrap) {
         std.debug.assert(stack_size > 0);
@@ -40,7 +41,7 @@ pub fn SlabAllocator(
         stack_idx: if (stack_bootstrap) usize else void,
         freelist: IntrusiveFreeList = .{},
         alloc_headers: ?*AllocHeader = null,
-        lock: SpinLock = .{},
+        lock: if (use_lock) SpinLock else void = if (use_lock) .{} else {},
 
         pub fn init(
             backing_allocator: std.mem.Allocator,
@@ -105,9 +106,9 @@ pub fn SlabAllocator(
             std.debug.assert(alignment.toByteUnits() == @as(usize, @intCast(@alignOf(T))));
             std.debug.assert(len == @as(usize, @intCast(@sizeOf(T))));
 
-            const self: *Self = @alignCast(@ptrCast(ptr));
-            self.lock.lock();
-            defer self.lock.unlock();
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            if (use_lock) self.lock.lock();
+            defer if (use_lock) self.lock.unlock();
 
             if (stack_bootstrap and self.stack_idx < stack_size) {
                 const slab = &self.stack_array[self.stack_idx];
@@ -182,11 +183,11 @@ pub fn SlabAllocator(
         ) void {
             _ = alignment;
             _ = ret_addr;
-            const self: *Self = @alignCast(@ptrCast(ptr));
-            const slab: *T = @alignCast(@ptrCast(buf.ptr));
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const slab: *T = @ptrCast(@alignCast(buf.ptr));
 
-            self.lock.lock();
-            defer self.lock.unlock();
+            if (use_lock) self.lock.lock();
+            defer if (use_lock) self.lock.unlock();
 
             if (DBG) self.allocations -= 1;
             if (DBG) std.debug.assert(self.allocations >= 0);
@@ -210,6 +211,7 @@ test "stack exhaustion and transition" {
         stack_bootstrap,
         stack_size,
         allocation_chunk_size,
+        false,
     ).init(test_allocator);
     defer slab_allocator.deinit();
 
@@ -241,6 +243,7 @@ test "stack bootstrap stress test" {
         stack_bootstrap,
         stack_size,
         allocation_chunk_size,
+        false,
     ).init(test_allocator);
     defer slab_allocator.deinit();
 
@@ -289,6 +292,7 @@ test "allocation failure with exhausted stack" {
         stack_bootstrap,
         stack_size,
         allocation_chunk_size,
+        false,
     ).init(test_allocator);
     defer slab_allocator.deinit();
 
@@ -327,6 +331,7 @@ test "basic create destroy cycle" {
         stack_bootstrap,
         stack_size,
         allocation_chunk_size,
+        false,
     ).init(test_allocator);
     defer slab_allocator.deinit();
 
@@ -366,6 +371,7 @@ test "memory leak detection" {
         stack_bootstrap,
         stack_size,
         allocation_chunk_size,
+        false,
     ).init(test_allocator);
     defer slab_allocator.deinit();
 

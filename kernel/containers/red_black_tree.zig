@@ -397,8 +397,14 @@ pub fn RedBlackTree(
             while (current) |node| {
                 switch (cmpFn(data, node.data)) {
                     .eq => return true,
-                    .lt => current = node.getChild(Direction.left),
-                    .gt => current = node.getChild(Direction.right),
+                    .lt => {
+                        current = node.getChild(Direction.left);
+                        if (current) |c| @prefetch(c, .{});
+                    },
+                    .gt => {
+                        current = node.getChild(Direction.right);
+                        if (current) |c| @prefetch(c, .{});
+                    },
                 }
             }
 
@@ -616,7 +622,10 @@ pub fn RedBlackTree(
 
                 if (target_node == self.root) {
                     self.root = child_replacement;
-                    if (child_replacement) |r| r.parent = null;
+                    if (child_replacement) |r| {
+                        r.parent = null;
+                        r.color = Color.Black;
+                    }
                 } else {
                     const direction_from_parent: Direction =
                         if (target_node == parent_of_target.?.getChild(.left)) Direction.left else Direction.right;
@@ -841,10 +850,12 @@ pub fn RedBlackTree(
                     .lt => {
                         upper = node.data;
                         current = node.getChild(.left);
+                        if (current) |c| @prefetch(c, .{});
                     },
                     .gt => {
                         lower = node.data;
                         current = node.getChild(.right);
+                        if (current) |c| @prefetch(c, .{});
                     },
                     .eq => {
                         lower = node.data;

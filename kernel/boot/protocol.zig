@@ -20,11 +20,31 @@ pub const Blob = extern struct {
     len: u64,
 };
 
+pub const PixelFormat = enum(u8) {
+    bgr8 = 0,
+    rgb8 = 1,
+    bitmask = 2,
+    blt_only = 3,
+    none = 0xFF,
+};
+
+pub const Framebuffer = extern struct {
+    base: PAddr,
+    size: u64,
+    width: u32,
+    height: u32,
+    stride: u32,
+    pixel_format: PixelFormat,
+    _pad: [3]u8 = .{ 0, 0, 0 },
+};
+
 pub const BootInfo = extern struct {
     elf_blob: Blob,
+    root_service: Blob,
     stack_top: VAddr,
     xsdp_phys: PAddr,
     mmap: MMap,
+    framebuffer: Framebuffer,
 };
 
 pub const MMap = extern struct {
