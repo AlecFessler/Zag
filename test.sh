@@ -17,6 +17,7 @@ Usage: ./test.sh [target] [options]
 Targets:
   kernel          Run kernel integration tests (QEMU)
   router          Run router integration tests (pytest)
+  passthrough     Run x550 passthrough test (real hardware, requires sudo)
   kernel-fuzz     Run all kernel fuzzers (buddy, heap, vmm, rbt)
   router-fuzz     Run router packet processing fuzzer
   all             Run kernel + router tests (default)
@@ -34,6 +35,7 @@ Examples:
   ./test.sh router -k test_dns           # router DNS tests only
   ./test.sh router -f test_nat.py        # single test file
   ./test.sh router-fuzz --iterations 50000 --seed 123
+  ./test.sh passthrough                  # x550 real hardware test
 EOF
 }
 
@@ -136,6 +138,109 @@ run_router_fuzzer() {
     (cd "$SCRIPT_DIR/fuzzing/router" && zig build run -- -s "$SEED" -i "$ITERATIONS")
 }
 
+run_passthrough_test() {
+    echo "=== X550 Passthrough Test ==="
+
+    # 1. Build with x550 driver
+    echo "Building routerOS with x550 driver..."
+    (cd "$SCRIPT_DIR/routerOS" && zig build -Dnic=x550)
+    zig build -Dprofile=router -Dnet=passthrough
+
+    # 2. Bind x550 to vfio-pci
+    echo "Binding x550 to vfio-pci..."
+    sudo "$SCRIPT_DIR/tools/vfio-bind.sh"
+
+    # 3. Set up Realtek as WAN mock gateway (x550 is owned by VM now)
+    echo "Setting up Realtek as mock ISP gateway..."
+    sudo ip addr add 10.0.2.1/24 dev eno1 2>/dev/null || true
+    sudo ip link set eno1 up
+
+    # 4. Start tcpdump on Realtek (WAN side) to capture forwarded traffic
+    local PCAP="/tmp/x550_passthrough_test.pcap"
+    echo "Starting tcpdump on eno1 (WAN side)..."
+    sudo tcpdump -i eno1 -c 10 -w "$PCAP" udp port 9999 &
+    local TCPDUMP_PID=$!
+
+    # 5. Launch QEMU with passthrough
+    echo "Launching QEMU with x550 passthrough..."
+    local QEMU_LOG="/tmp/x550_passthrough_qemu.log"
+    sudo timeout 60 qemu-system-x86_64 \
+        -m 1G \
+        -bios /usr/share/ovmf/x64/OVMF.4m.fd \
+        -drive file=fat:rw:zig-out/img,format=raw \
+        -serial file:/tmp/x550_passthrough_serial.log \
+        -display none \
+        -no-reboot \
+        -enable-kvm -cpu host,+invtsc \
+        -machine q35 \
+        -net none \
+        -device pcie-root-port,id=rp1,slot=1 \
+        -device pcie-pci-bridge,id=br1,bus=rp1 \
+        -device vfio-pci,host=05:00.0,bus=br1,addr=1.0 \
+        -device vfio-pci,host=05:00.1,bus=br1,addr=2.0 \
+        -smp cores=4 \
+        > "$QEMU_LOG" 2>&1 &
+    local QEMU_PID=$!
+
+    # 6. Wait for router to boot (look for console banner in serial log)
+    local SERIAL_LOG="/tmp/x550_passthrough_serial.log"
+    echo "Waiting for router to boot..."
+    local BOOTED=false
+    for i in $(seq 1 30); do
+        if sudo grep -q "load-config" "$SERIAL_LOG" 2>/dev/null; then
+            BOOTED=true
+            break
+        fi
+        sleep 1
+    done
+
+    if ! $BOOTED; then
+        echo "FAIL: Router did not boot within 30s"
+        echo "=== Serial log ==="
+        sudo cat "$SERIAL_LOG" 2>/dev/null || echo "(empty)"
+        echo "=== QEMU log ==="
+        cat "$QEMU_LOG" 2>/dev/null || echo "(empty)"
+        sudo kill $QEMU_PID 2>/dev/null || true
+        sudo kill $TCPDUMP_PID 2>/dev/null || true
+        sudo "$SCRIPT_DIR/tools/vfio-unbind.sh"
+        exit 1
+    fi
+    echo "Router booted."
+
+    # 7. Wait for traffic to flow through (tcpdump captures or timeout)
+    echo "Waiting up to 30s for UDP traffic on WAN side..."
+    local TRAFFIC=false
+    for i in $(seq 1 30); do
+        if ! kill -0 $TCPDUMP_PID 2>/dev/null; then
+            # tcpdump exited — it captured its 10 packets
+            TRAFFIC=true
+            break
+        fi
+        sleep 1
+    done
+
+    # 8. Cleanup
+    sudo kill $QEMU_PID 2>/dev/null || true
+    sudo kill $TCPDUMP_PID 2>/dev/null || true
+    wait $QEMU_PID 2>/dev/null || true
+    wait $TCPDUMP_PID 2>/dev/null || true
+
+    echo "Restoring ixgbe driver..."
+    sudo "$SCRIPT_DIR/tools/vfio-unbind.sh"
+
+    # 9. Report results
+    echo ""
+    if $TRAFFIC; then
+        echo "PASS: Captured UDP traffic on WAN side"
+        sudo tcpdump -r "$PCAP" 2>/dev/null | head -5
+    else
+        echo "FAIL: No UDP traffic captured on WAN side within 30s"
+        echo "=== Serial log (last 30 lines) ==="
+        sudo tail -30 "$SERIAL_LOG" 2>/dev/null || echo "(empty)"
+        exit 1
+    fi
+}
+
 # ── Dispatch ──────────────────────────────────────────────────────────
 
 case "$TARGET" in
@@ -144,6 +249,9 @@ case "$TARGET" in
         ;;
     router)
         run_router_tests
+        ;;
+    passthrough)
+        run_passthrough_test
         ;;
     kernel-fuzz)
         run_kernel_fuzzers

@@ -278,3 +278,16 @@ pub fn txSendCopy(
 pub fn txDone(tx_descs: *[NUM_TX_DESC]TxDesc, idx: u32) bool {
     return @as(*volatile u8, &tx_descs[idx].status).* & TX_DESC_STA_DD != 0;
 }
+
+// ── Interrupt status ───────────────────────────────────────────────────
+
+/// Clear pending interrupt status (read-to-clear).
+pub fn clearIrq(mmio_base: u64) void {
+    _ = readReg(mmio_base, REG_ICR);
+}
+
+// ── Link status ────────────────────────────────────────────────────────
+
+pub fn linkUp(mmio_base: u64) bool {
+    return (readReg(mmio_base, REG_STATUS) & 0x02) != 0;
+}

@@ -179,16 +179,25 @@ pub fn build(b: *std.Build) void {
     const qemu_machine_args: []const u8 = 
         \\-machine q35
     ;
-    const qemu_iommu_args: []const u8 = if (std.mem.eql(u8, iommu_type, "intel"))
-        \\-device intel-iommu,intremap=off
+    const passthrough = std.mem.eql(u8, net_type, "passthrough");
+    const qemu_iommu_args: []const u8 = if (passthrough)
+        "" // No guest IOMMU — VFIO handles host IOMMU directly with 1:1 GPA→HPA
+    else if (std.mem.eql(u8, iommu_type, "intel"))
+        "-device intel-iommu,intremap=off"
     else
-        \\-device amd-iommu
+        "-device amd-iommu"
     ;
     const qemu_net_args: []const u8 = if (std.mem.eql(u8, net_type, "tap"))
         \\-netdev tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=off \
         \\-device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
         \\-netdev tap,id=net1,ifname=tap1,script=no,downscript=no,vhost=off \
         \\-device e1000e,netdev=net1,mac=52:54:00:12:34:57
+    else if (std.mem.eql(u8, net_type, "passthrough"))
+        \\-net none \
+        \\-device pcie-root-port,id=rp1,slot=1 \
+        \\-device pcie-pci-bridge,id=br1,bus=rp1 \
+        \\-device vfio-pci,host=05:00.0,bus=br1,addr=1.0 \
+        \\-device vfio-pci,host=05:00.1,bus=br1,addr=2.0
     else if (std.mem.eql(u8, net_type, "user"))
         \\
     else

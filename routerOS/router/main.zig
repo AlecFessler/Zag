@@ -7,7 +7,7 @@ const dhcp_server = router.protocols.dhcp_server;
 const dhcpv6_client = router.protocols.ipv6.dhcp_client;
 const dma = router.hal.dma;
 const dns = router.protocols.dns;
-const e1000 = router.hal.e1000;
+const nic = router.hal.nic;
 const firewall = router.protocols.ipv4.firewall;
 const firewall6 = router.protocols.ipv6.firewall;
 const frag = router.protocols.frag;
@@ -632,15 +632,15 @@ pub fn main(perm_view_addr: u64) void {
     wan_iface.dma_region = &region;
     wan_iface.rx_descs = region.wanRxDescs();
     wan_iface.tx_descs = region.wanTxDescs();
-    wan_iface.rx_tail = e1000.NUM_RX_DESC - 1;
+    wan_iface.rx_tail = nic.NUM_RX_DESC - 1;
     wan_iface.tx_tail = 0;
-    wan_iface.rx_buf_state = .{.free} ** e1000.NUM_RX_DESC;
-    wan_iface.rx_buf_tx_idx = .{0} ** e1000.NUM_RX_DESC;
+    wan_iface.rx_buf_state = .{.free} ** nic.NUM_RX_DESC;
+    wan_iface.rx_buf_tx_idx = .{0} ** nic.NUM_RX_DESC;
     wan_iface.arp_table = .{arp.empty} ** arp.TABLE_SIZE;
     wan_iface.stats = .{};
     wan_iface.pending_tx = .{ .{}, .{} };
 
-    if (!e1000.init(.{
+    if (!nic.init(.{
         .mmio_base = wan_mmio,
         .rx_descs_dma = region.wanDma(dma.WAN_RX_DESCS_OFF),
         .tx_descs_dma = region.wanDma(dma.WAN_TX_DESCS_OFF),
@@ -649,12 +649,11 @@ pub fn main(perm_view_addr: u64) void {
         .rx_descs = region.wanRxDescs(),
         .tx_descs = region.wanTxDescs(),
     })) {
-        syscall.write("router: e1000 init fail\n");
+        syscall.write("router: WAN NIC init fail\n");
         return;
     }
-
     _ = syscall.pci_enable_bus_master(wan_nic.handle);
-    wan_iface.mac = e1000.readMac(wan_mmio);
+    wan_iface.mac = nic.readMac(wan_mmio);
     wan_iface.ip6_link_local = util.macToLinkLocal(wan_iface.mac);
 
     // Initialize LAN interface if dual-NIC DMA succeeded
@@ -662,7 +661,7 @@ pub fn main(perm_view_addr: u64) void {
         const lan_nic = nics.lan.?;
         const lan_mmio_size = if (lan_nic.mmio_size == 0) syscall.PAGE4K else lan_nic.mmio_size;
         if (mmioMap(lan_nic.handle, lan_mmio_size)) |lan_mmio| {
-            if (e1000.init(.{
+            if (nic.init(.{
                 .mmio_base = lan_mmio,
                 .rx_descs_dma = region.lanDma(dma.LAN_RX_DESCS_OFF),
                 .tx_descs_dma = region.lanDma(dma.LAN_TX_DESCS_OFF),
@@ -675,30 +674,29 @@ pub fn main(perm_view_addr: u64) void {
 
                 lan_iface.role = .lan;
                 lan_iface.mmio_base = lan_mmio;
-                lan_iface.mac = e1000.readMac(lan_mmio);
+                lan_iface.mac = nic.readMac(lan_mmio);
                 lan_iface.ip6_link_local = util.macToLinkLocal(lan_iface.mac);
                 lan_iface.ip = .{ 10, 1, 1, 1 };
                 lan_iface.dma_base = region.lan_dma_base;
                 lan_iface.dma_region = &region;
                 lan_iface.rx_descs = region.lanRxDescs();
                 lan_iface.tx_descs = region.lanTxDescs();
-                lan_iface.rx_tail = e1000.NUM_RX_DESC - 1;
+                lan_iface.rx_tail = nic.NUM_RX_DESC - 1;
                 lan_iface.tx_tail = 0;
-                lan_iface.rx_buf_state = .{.free} ** e1000.NUM_RX_DESC;
-                lan_iface.rx_buf_tx_idx = .{0} ** e1000.NUM_RX_DESC;
+                lan_iface.rx_buf_state = .{.free} ** nic.NUM_RX_DESC;
+                lan_iface.rx_buf_tx_idx = .{0} ** nic.NUM_RX_DESC;
                 lan_iface.arp_table = .{arp.empty} ** arp.TABLE_SIZE;
                 lan_iface.stats = .{};
                 lan_iface.pending_tx = .{ .{}, .{} };
 
                 has_lan = true;
             } else {
-                syscall.write("router: LAN e1000 init fail\n");
+                syscall.write("router: LAN NIC init fail\n");
             }
         } else {
             syscall.write("router: LAN MMIO fail\n");
         }
     }
-
     arp.sendRequest(.wan, wan_gateway);
     if (has_lan) arp.sendRequest(.lan, .{ 10, 1, 1, 50 });
 
@@ -1142,6 +1140,9 @@ fn sendArpTable(chan: *channel_mod.Channel, label: []const u8, table: *const [ar
 // ── Poll thread ─────────────────────────────────────────────────────────
 
 /// Poll one interface: receive a packet, process it, forward zero-copy if needed.
+var wan_rx_log_count: u32 = 0;
+var lan_rx_log_count: u32 = 0;
+
 fn pollOnce(self_iface: *Iface, other_iface: *Iface, role: Interface) void {
     // Drain any pending TX from the main thread (lock-free)
     self_iface.drainPendingTx();
@@ -1149,8 +1150,19 @@ fn pollOnce(self_iface: *Iface, other_iface: *Iface, role: Interface) void {
     // Reclaim any RX buffers that were lent to the other NIC's TX
     if (has_lan) self_iface.reclaimTxPending(other_iface);
 
-    _ = e1000.readReg(self_iface.mmio_base, e1000.REG_ICR);
+    nic.clearIrq(self_iface.mmio_base);
     const rx = self_iface.rxPoll() orelse return;
+
+    // Log first few packets per interface for debugging
+    const log_count = if (role == .wan) &wan_rx_log_count else &lan_rx_log_count;
+    if (log_count.* < 5) {
+        log_count.* += 1;
+        if (role == .wan) {
+            syscall.write("router: WAN RX packet\n");
+        } else {
+            syscall.write("router: LAN RX packet\n");
+        }
+    }
     const buf_ptr = self_iface.rxBufPtr(rx.index);
     const pkt = buf_ptr[0..rx.len];
 

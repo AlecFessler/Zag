@@ -1,11 +1,11 @@
 /// Per-interface state for the monolithic NIC+router process.
-/// Each Iface owns one e1000 NIC and its associated RX/TX rings.
+/// Each Iface owns one NIC and its associated RX/TX rings.
 const lib = @import("lib");
 const router = @import("router");
 
 const arp = router.protocols.arp;
 const dma = @import("dma.zig");
-const e1000 = @import("e1000.zig");
+const nic = @import("nic.zig");
 const util = router.util;
 
 const syscall = lib.syscall;
@@ -49,7 +49,7 @@ pub const PendingTxRing = struct {
 
     // ── Data slots ──────────────────────────────────────────
     lens: [PENDING_TX_SLOTS]u16 = .{0} ** PENDING_TX_SLOTS,
-    bufs: [PENDING_TX_SLOTS][e1000.PACKET_BUF_SIZE]u8 = undefined,
+    bufs: [PENDING_TX_SLOTS][nic.PACKET_BUF_SIZE]u8 = undefined,
 
     comptime {
         if (@offsetOf(PendingTxRing, "tail") / CACHE_LINE == @offsetOf(PendingTxRing, "head") / CACHE_LINE)
@@ -58,7 +58,7 @@ pub const PendingTxRing = struct {
 
     /// Enqueue a packet (producer side). Returns false if ring is full.
     fn send(self: *PendingTxRing, data: []const u8) bool {
-        if (data.len == 0 or data.len > e1000.PACKET_BUF_SIZE) return false;
+        if (data.len == 0 or data.len > nic.PACKET_BUF_SIZE) return false;
 
         const tail = @as(*volatile u64, &self.tail).*;
 
@@ -97,7 +97,7 @@ pub const PendingTxRing = struct {
         while (head_val != self.cached_tail) {
             const slot: usize = @intCast(head_val % PENDING_TX_SLOTS);
             const len = self.lens[slot];
-            if (e1000.txSendCopy(iface.mmio_base, iface.tx_descs, &iface.tx_tail, tx_bufs_dma, tx_bufs_virt, self.bufs[slot][0..len])) {
+            if (nic.txSendCopy(iface.mmio_base, iface.tx_descs, &iface.tx_tail, tx_bufs_dma, tx_bufs_virt, self.bufs[slot][0..len])) {
                 iface.stats.tx_packets += 1;
                 iface.stats.tx_bytes += len;
             }
@@ -125,15 +125,15 @@ pub const Iface = struct {
     dma_region: *dma.DmaRegion,
 
     // Descriptor rings (virtual addresses)
-    rx_descs: *[e1000.NUM_RX_DESC]e1000.RxDesc,
-    tx_descs: *[e1000.NUM_TX_DESC]e1000.TxDesc,
+    rx_descs: *[nic.NUM_RX_DESC]nic.RxDesc,
+    tx_descs: *[nic.NUM_TX_DESC]nic.TxDesc,
     rx_tail: u32,
     tx_tail: u32,
 
     // RX buffer state tracking for zero-copy
-    rx_buf_state: [e1000.NUM_RX_DESC]BufState,
+    rx_buf_state: [nic.NUM_RX_DESC]BufState,
     // For tx_pending buffers: which TX desc index on the OTHER iface
-    rx_buf_tx_idx: [e1000.NUM_RX_DESC]u8,
+    rx_buf_tx_idx: [nic.NUM_RX_DESC]u8,
 
     // Per-interface tables
     arp_table: [arp.TABLE_SIZE]arp.ArpEntry,
@@ -157,10 +157,10 @@ pub const Iface = struct {
             .dma_region = region,
             .rx_descs = region.wanRxDescs(),
             .tx_descs = region.wanTxDescs(),
-            .rx_tail = e1000.NUM_RX_DESC - 1,
+            .rx_tail = nic.NUM_RX_DESC - 1,
             .tx_tail = 0,
-            .rx_buf_state = .{.free} ** e1000.NUM_RX_DESC,
-            .rx_buf_tx_idx = .{0} ** e1000.NUM_RX_DESC,
+            .rx_buf_state = .{.free} ** nic.NUM_RX_DESC,
+            .rx_buf_tx_idx = .{0} ** nic.NUM_RX_DESC,
             .arp_table = .{arp.empty} ** arp.TABLE_SIZE,
             .stats = .{},
         };
@@ -176,10 +176,10 @@ pub const Iface = struct {
             .dma_region = region,
             .rx_descs = region.lanRxDescs(),
             .tx_descs = region.lanTxDescs(),
-            .rx_tail = e1000.NUM_RX_DESC - 1,
+            .rx_tail = nic.NUM_RX_DESC - 1,
             .tx_tail = 0,
-            .rx_buf_state = .{.free} ** e1000.NUM_RX_DESC,
-            .rx_buf_tx_idx = .{0} ** e1000.NUM_RX_DESC,
+            .rx_buf_state = .{.free} ** nic.NUM_RX_DESC,
+            .rx_buf_tx_idx = .{0} ** nic.NUM_RX_DESC,
             .arp_table = .{arp.empty} ** arp.TABLE_SIZE,
             .stats = .{},
         };
@@ -189,8 +189,8 @@ pub const Iface = struct {
 
     /// Poll for a received packet. Returns the buffer index and length.
     /// The buffer is marked sw_owned and NOT returned to hardware.
-    pub fn rxPoll(self: *Iface) ?e1000.RxResult {
-        const result = e1000.rxPoll(self.rx_descs, &self.rx_tail) orelse return null;
+    pub fn rxPoll(self: *Iface) ?nic.RxResult {
+        const result = nic.rxPoll(self.rx_descs, &self.rx_tail) orelse return null;
         self.rx_buf_state[result.index] = .sw_owned;
         self.stats.rx_packets += 1;
         self.stats.rx_bytes += result.len;
@@ -209,13 +209,13 @@ pub const Iface = struct {
     /// Get the DMA address of an RX buffer (for zero-copy TX on the OTHER device).
     pub fn rxBufDmaForDevice(self: *Iface, idx: u5, target: *Iface) u64 {
         const offset = if (self.role == .wan) dma.WAN_RX_BUFS_OFF else dma.LAN_RX_BUFS_OFF;
-        return target.dma_base + offset + @as(u64, idx) * e1000.PACKET_BUF_SIZE;
+        return target.dma_base + offset + @as(u64, idx) * nic.PACKET_BUF_SIZE;
     }
 
     /// Return an RX buffer to the hardware ring.
     pub fn rxReturn(self: *Iface, idx: u5) void {
         self.rx_buf_state[idx] = .free;
-        e1000.rxReturn(self.mmio_base, self.rx_tail);
+        nic.rxReturn(self.mmio_base, self.rx_tail);
     }
 
     // ── TX ──────────────────────────────────────────────────────────────
@@ -224,7 +224,7 @@ pub const Iface = struct {
     /// Used for zero-copy forwarding. Caller must hold tx_mutex or be the
     /// exclusive poll thread.
     pub fn txSendZeroCopy(self: *Iface, dma_addr: u64, len: u16) bool {
-        const ok = e1000.txSendAddr(
+        const ok = nic.txSendAddr(
             self.mmio_base,
             self.tx_descs,
             &self.tx_tail,
@@ -256,7 +256,7 @@ pub const Iface = struct {
     /// Unlike txSendLocal, this can be called multiple times per poll iteration.
     /// Spin-waits for the TX descriptor to become available if the NIC is busy.
     pub fn txSendDirect(self: *Iface, data: []const u8) bool {
-        if (data.len == 0 or data.len > e1000.PACKET_BUF_SIZE) return false;
+        if (data.len == 0 or data.len > nic.PACKET_BUF_SIZE) return false;
 
         // When running without hardware (mmio_base == 0), fall back to pending TX slot
         if (self.mmio_base == 0) return self.txSendLocal(data, .dataplane);
@@ -269,12 +269,12 @@ pub const Iface = struct {
         // On a gigabit link a max-size frame takes ~12us, so this is brief.
         const desc = &self.tx_descs[self.tx_tail];
         var spins: u32 = 0;
-        while (@as(*volatile u8, &desc.status).* & e1000.TX_DESC_STA_DD == 0) {
+        while (@as(*volatile u8, &desc.status).* & nic.TX_DESC_STA_DD == 0) {
             spins += 1;
             if (spins > 1_000_000) return false; // safety bail-out
         }
 
-        if (e1000.txSendCopy(self.mmio_base, self.tx_descs, &self.tx_tail, tx_bufs_dma, tx_bufs_virt, data)) {
+        if (nic.txSendCopy(self.mmio_base, self.tx_descs, &self.tx_tail, tx_bufs_dma, tx_bufs_virt, data)) {
             self.stats.tx_packets += 1;
             self.stats.tx_bytes += data.len;
             return true;
@@ -289,9 +289,9 @@ pub const Iface = struct {
         for (&self.rx_buf_state, 0..) |*state, i| {
             if (state.* == .tx_pending) {
                 const tx_idx = self.rx_buf_tx_idx[i];
-                if (e1000.txDone(other.tx_descs, tx_idx)) {
+                if (nic.txDone(other.tx_descs, tx_idx)) {
                     state.* = .free;
-                    e1000.rxReturn(self.mmio_base, self.rx_tail);
+                    nic.rxReturn(self.mmio_base, self.rx_tail);
                 }
             }
         }
@@ -300,6 +300,6 @@ pub const Iface = struct {
     // ── Helpers ─────────────────────────────────────────────────────────
 
     pub fn linkUp(self: *const Iface) bool {
-        return (e1000.readReg(self.mmio_base, e1000.REG_STATUS) & 0x02) != 0;
+        return nic.linkUp(self.mmio_base);
     }
 };
