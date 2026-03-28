@@ -1,6 +1,6 @@
 # RouterOS System Design
 
-RouterOS is a userspace network router for the Zag microkernel. The router process directly owns both e1000e NIC devices and performs all routing logic in-process with zero-copy packet forwarding.
+RouterOS is a userspace network router for the Zag microkernel. The router process directly owns both NIC devices (e1000 in QEMU, x550 on bare metal) and performs all routing logic in-process with zero-copy packet forwarding.
 
 ---
 
@@ -11,9 +11,10 @@ RouterOS is a userspace network router for the Zag microkernel. The router proce
 ```
 root_service (broker)
 ├── serial_driver    (UART 16550)
-├── router           (e1000e WAN + LAN + NAT/ARP/firewall/DHCP/DNS)
+├── router           (WAN + LAN NIC + NAT/ARP/firewall/DHCP/DNS)
 ├── nfs_client       (NFSv3 over UDP, connects to router)
 ├── ntp_client       (SNTPv4 over UDP, connects to router)
+├── http_server      (web management GUI on LAN port 80)
 └── console          (serial line editor, connects to router + NFS + NTP)
 ```
 
@@ -42,7 +43,7 @@ Host WAN (tap0) ←→ e1000e ←→ WAN thread ←→ [zero-copy DMA] ←→ LA
 | Interface | IP | Subnet | MAC |
 |-----------|------|--------|-----|
 | WAN | 10.0.2.15 (or DHCP) | 10.0.2.0/24 | 52:54:00:12:34:56 |
-| LAN | 192.168.1.1 | 192.168.1.0/24 | 52:54:00:12:34:57 |
+| LAN | 10.1.1.1 | 10.1.1.0/24 | 52:54:00:12:34:57 |
 
 ---
 
@@ -104,21 +105,23 @@ Open-addressing hash table with atomic entry states:
 
 ---
 
-## 4. NIC Driver (e1000e)
+## 4. NIC Driver
 
-**File:** `router/e1000.zig`
+The router supports two NIC drivers, selected at build time with `-Dnic=e1000` (QEMU) or `-Dnic=x550` (bare metal). For bare metal, also pass `-Dpassthrough=true`.
 
-The e1000e Intel Gigabit Ethernet controller is driven directly from the router process. Key operations:
+**Files:** `router/hal/e1000.zig`, `router/hal/x550.zig`
+
+Both drivers implement the same interface. Key operations:
 
 - **Init**: Reset, set link up, configure RX/TX descriptor rings, enable RCTL
 - **RX poll**: Check DD bit on next descriptor, return buffer index
 - **TX zero-copy**: Point TX descriptor at arbitrary DMA address (other NIC's RX buffer)
 - **TX local**: Copy data to local TX buffer, program descriptor
-- **Bus master**: Enabled via `pci_enable_bus_master` syscall after e1000e reset
+- **Bus master**: Enabled via `pci_enable_bus_master` syscall after NIC reset
 
 ### PCI Enumeration
 
-The kernel registers only the first MMIO BAR per PCI function (e1000e has multiple BARs). Bus master is enabled during PCI enumeration for network devices.
+The kernel registers only the first MMIO BAR per PCI function. Bus master is enabled during PCI enumeration for network devices.
 
 ---
 
@@ -146,7 +149,7 @@ Single-connection HTTP server with states: closed, syn_received, established, fi
 
 ### Access
 
-From a LAN-side host: `http://192.168.1.1/`
+From a LAN-side host: `http://10.1.1.1/`
 
 ---
 
@@ -169,19 +172,20 @@ NFSv3 over UDP, using AUTH_UNIX (uid=0, gid=0). Communicates with the router via
 
 ---
 
-## 6. Build and Test
+## 7. Build and Test
 
-### 6.1 Directory Structure
+### 7.1 Directory Structure
 
 ```
-userspace/routerOS/
+routerOS/
   build.zig              — builds all child processes + root service
   linker.ld              — links .bss into .data for zero-init
   root_service/main.zig  — spawns router with NIC device handles
   serial_driver/main.zig
   router/
     main.zig             — entry point, thread spawn, WAN poll loop
-    e1000.zig            — e1000e NIC driver (parameterized, no globals)
+    hal/e1000.zig        — e1000 NIC driver (QEMU)
+    hal/x550.zig         — x550 NIC driver (bare metal)
     dma.zig              — shared DMA region layout + setup
     iface.zig            — per-interface state, zero-copy TX, lock-free pending TX
     nat.zig              — lock-free NAT hash table
@@ -191,7 +195,7 @@ userspace/routerOS/
   nfs_client/main.zig, nfs3.zig, rpc.zig, xdr.zig
 ```
 
-### 6.2 Host Setup
+### 7.2 Host Setup
 
 ```bash
 # WAN
@@ -201,7 +205,7 @@ sudo ip link set tap0 up
 
 # LAN
 sudo ip tuntap add dev tap1 mode tap user $USER
-sudo ip addr add 192.168.1.50/24 dev tap1
+sudo ip addr add 10.1.1.50/24 dev tap1
 sudo ip link set tap1 up
 
 # NFS server (for NFS client testing)
@@ -213,22 +217,25 @@ sudo systemctl start nfs-server
 echo "written by host" > /export/zagtest/hello.txt
 ```
 
-### 6.3 Build
+### 7.3 Build
 
 ```bash
-# Build routerOS userspace (from userspace/routerOS/)
-cd userspace/routerOS && zig build
+# Build routerOS userspace for QEMU
+cd routerOS && zig build -Dnic=e1000
 
-# Build kernel + run with routerOS (from repo root)
-zig build run -Dprofile=router
+# Build routerOS userspace for bare metal
+cd routerOS && zig build -Dnic=x550
 
-# Or with individual flags:
-zig build run -Droot-service=userspace/bin/routerOS.elf -Dnet=tap -Duse-llvm=true
+# Build kernel for QEMU tap tests (from repo root)
+zig build -Dprofile=router
+
+# Build kernel for bare metal with AMD IOMMU (from repo root)
+zig build -Dprofile=router -Diommu=amd
 ```
 
 The bootloader loads `root_service.elf` from the FAT image alongside `kernel.elf`. The `-Dprofile=router` flag sets defaults for all build options (tap networking, LLVM backend, KVM, routerOS binary).
 
-### 6.4 Testing
+### 7.4 Testing
 
 ```bash
 # Host → Router ping
@@ -238,16 +245,16 @@ ping 10.0.2.15
 # Commands: ls, cat <file>, put <file>, mkdir <dir>, rm <file>
 ```
 
-### 6.5 Device Configuration
+### 7.5 Device Configuration
 
 | Setting | Value |
 |---------|-------|
-| NIC model | e1000e (QEMU) |
+| NIC model | e1000 (QEMU) / x550 (bare metal) |
 | Machine | Q35 |
-| IOMMU | Optional (dma_map works with or without) |
+| IOMMU | Optional for QEMU; AMD IOMMU for bare metal (`-Diommu=amd`) |
 | DMA | Contiguous physical pages via SHM |
 
-### 6.6 Known Issues
+### 7.6 Known Issues
 
 - `cat` immediately after `put` may timeout due to serial protocol timing
 - QEMU IOMMU (VT-d/AMD-Vi) breaks e1000e RX DMA; `dma_map` falls back to physical addresses when no IOMMU is present

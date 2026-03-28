@@ -59,13 +59,6 @@ def wait_for_log_entries(timeout=20.0):
 class TestLogging:
     """Test structured event logging via serial output."""
 
-    def test_serial_log_has_output(self, router):
-        """Serial log captures boot and runtime messages."""
-        log = get_serial_log()
-        assert len(log) > 0, "Serial log is empty"
-        # Should have boot messages from root service
-        assert "root:" in log, "No root service boot messages in serial"
-
     def test_structured_log_on_serial(self, router):
         """Structured log entries with timestamps appear on serial."""
         log = get_serial_log()

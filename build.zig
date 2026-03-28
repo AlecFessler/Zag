@@ -180,10 +180,7 @@ pub fn build(b: *std.Build) void {
     const qemu_machine_args: []const u8 = 
         \\-machine q35
     ;
-    const passthrough = std.mem.eql(u8, net_type, "passthrough");
-    const qemu_iommu_args: []const u8 = if (passthrough)
-        "" // No guest IOMMU — VFIO handles host IOMMU directly with 1:1 GPA→HPA
-    else if (std.mem.eql(u8, iommu_type, "intel"))
+    const qemu_iommu_args: []const u8 = if (std.mem.eql(u8, iommu_type, "intel"))
         "-device intel-iommu,intremap=off"
     else
         "-device amd-iommu"

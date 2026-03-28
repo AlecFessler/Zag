@@ -494,6 +494,14 @@ Remove the SHM pages from the device's IOMMU address space. Invalidates the IOMM
 **Returns:** `E_OK`.
 **Errors:** `E_BADCAP`, `E_PERM`.
 
+### pci_enable_bus_master(device_handle) → result
+
+Enable PCI bus mastering for the device. Sets the bus master bit in the PCI command register, allowing the device to initiate DMA transactions.
+
+**Permission:** device handle must have `dma` right.
+**Returns:** `E_OK`.
+**Errors:** `E_BADCAP`, `E_PERM` (no `dma` right).
+
 ### ioport_read(device_handle, port_offset, width) → value
 
 Read from a Port I/O device. `width` must be 1 (byte), 2 (word), or 4 (dword). `port_offset + width` must not exceed `port_count`. The `map` right on the device handle governs access.

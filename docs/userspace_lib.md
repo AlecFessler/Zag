@@ -1,6 +1,6 @@
 # Zag Userspace Library Reference
 
-The userspace library (`userspace/lib/`) provides the core building blocks for all Zag userspace programs. It is imported as `lib` by applications.
+The userspace library (`libz/`) provides the core building blocks for all Zag userspace programs. It is imported as `lib` by applications.
 
 ---
 

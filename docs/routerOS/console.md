@@ -56,7 +56,7 @@ Interactive command-line interface over the serial port for monitoring and confi
 ```
 > status
 WAN: 10.0.2.15 mac=52:54:00:12:34:56
-LAN: 192.168.1.1 mac=52:54:00:12:34:57
+LAN: 10.1.1.1 mac=52:54:00:12:34:57
 ```
 
 ---
@@ -72,7 +72,7 @@ reply from 10.0.2.1: seq=3 time=629us
 --- ping 10.0.2.1: 4 sent, 4 received ---
 ```
 
-Auto-selects interface: LAN subnet (192.168.1.0/24) via LAN, all others via WAN. 3-second timeout per packet.
+Auto-selects interface: LAN subnet (10.1.1.0/24) via LAN, all others via WAN. 3-second timeout per packet.
 
 ---
 
@@ -122,11 +122,11 @@ Block rules apply to incoming WAN traffic. Up to 32 rules.
 ## Port Forwarding
 
 ```
-> forward tcp 8080 192.168.1.100 80
+> forward tcp 8080 10.1.1.100 80
 OK
 
 > rules
-forward tcp :8080 -> 192.168.1.100:80
+forward tcp :8080 -> 10.1.1.100:80
 ---
 ```
 
@@ -160,8 +160,8 @@ Starts DHCP on the WAN interface. The router sends DISCOVER, processes OFFER, se
 
 ```
 > nat
-tcp 192.168.1.100:49152 -> :10001 -> 10.0.2.1:80
-udp 192.168.1.100:1234 -> :10000 -> 10.0.2.1:53
+tcp 10.1.1.100:49152 -> :10001 -> 10.0.2.1:80
+udp 10.1.1.100:1234 -> :10000 -> 10.0.2.1:53
 ---
 ```
 
@@ -194,7 +194,7 @@ WAN 10.0.2.1 e6:11:e1:e5:b6:b9
 
 ```
 > leases
-192.168.1.100 aa:bb:cc:dd:ee:ff
+10.1.1.100 aa:bb:cc:dd:ee:ff
 ---
 ```
 
@@ -204,7 +204,7 @@ Shows IP and MAC for each active DHCP lease. Up to 32 leases.
 
 ## Web Management GUI
 
-A web-based management interface is available at `http://192.168.1.1/` from any LAN-side host. It displays the same information as the console commands (status, ARP, NAT, leases, firewall rules) in a live-updating dashboard.
+A web-based management interface is available at `http://10.1.1.1/` from any LAN-side host. It displays the same information as the console commands (status, ARP, NAT, leases, firewall rules) in a live-updating dashboard.
 
 ---
 

@@ -1,10 +1,8 @@
 /// x550 NIC driver — parameterized, no globals.
 /// Intel X550-T2 10GbE controller. Uses legacy descriptors for compatibility.
 const build_options = @import("build_options");
-const lib = @import("lib");
 
 const e1000 = @import("e1000.zig");
-const syscall = lib.syscall;
 
 // ── Re-export shared types (legacy descriptors are identical) ──────────
 pub const RxDesc = e1000.RxDesc;
@@ -140,13 +138,10 @@ pub fn init(p: InitParams) bool {
     } else {
         // Bare metal: full init per datasheet Section 4.6.3.
         // 2. Software reset (global reset = software reset + link reset)
-        syscall.write("x550: resetting...\n");
         writeReg(base, REG_CTRL, readReg(base, REG_CTRL) | CTRL_RST);
         if (!pollWithTimeout(base, REG_CTRL, CTRL_RST, 0, 1_000_000)) {
-            syscall.write("x550: reset timeout\n");
             return false;
         }
-        syscall.write("x550: reset done\n");
 
         // Wait at least 10ms after reset (datasheet 4.6.3.2)
         var d: u32 = 0;
@@ -160,24 +155,16 @@ pub fn init(p: InitParams) bool {
 
         // 4. Wait for NVM auto-read completion
         if (!pollWithTimeout(base, REG_EEC, EEC_AUTO_RD, EEC_AUTO_RD, 1_000_000)) {
-            syscall.write("x550: NVM auto-read timeout\n");
             return false;
         }
-        syscall.write("x550: NVM ready\n");
 
         // 5. Wait for manageability configuration done (non-fatal — x550-T2 has no BMC)
-        if (!pollWithTimeout(base, REG_EEMNGCTL, EEMNGCTL_CFG_DONE0, EEMNGCTL_CFG_DONE0, 1_000_000)) {
-            syscall.write("x550: mgmt config timeout (continuing)\n");
-        } else {
-            syscall.write("x550: mgmt ready\n");
-        }
+        _ = pollWithTimeout(base, REG_EEMNGCTL, EEMNGCTL_CFG_DONE0, EEMNGCTL_CFG_DONE0, 1_000_000);
 
         // 6. Wait for DMA initialization done
         if (!pollWithTimeout(base, REG_RDRXCTL, RDRXCTL_DMAIDONE, RDRXCTL_DMAIDONE, 1_000_000)) {
-            syscall.write("x550: DMA init timeout\n");
             return false;
         }
-        syscall.write("x550: DMA ready\n");
     }
 
     // 7. Clear multicast table

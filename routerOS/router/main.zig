@@ -1,4 +1,3 @@
-const font = @import("font8x16");
 const lib = @import("lib");
 const router = @import("router");
 
@@ -91,213 +90,7 @@ pub var pending_udp: [udp_fwd.MAX_PENDING]udp_fwd.PendingPacket = [_]udp_fwd.Pen
 var last_maintenance_ns: u64 = 0;
 var perm_view: ?*const [MAX_PERMS]pv.UserViewEntry = null;
 
-// ── Framebuffer display ────────────────────────────────────────────
-const MARGIN = 8;
-const FB_MAX_LINES = 128;
-const FB_MAX_COLS = 200;
-const Color = struct { r: u8, g: u8, b: u8 };
-const FG_COLOR = Color{ .r = 0xc0, .g = 0xc0, .b = 0xc0 };
-const BG_COLOR = Color{ .r = 0x0a, .g = 0x0a, .b = 0x1a };
-const HEADER_FG = Color{ .r = 0x40, .g = 0xa0, .b = 0xff };
 
-const DisplayInfo = struct {
-    handle: u64,
-    fb_size: u32,
-    width: u16,
-    height: u16,
-    stride: u16,
-    pixel_format: u8,
-};
-
-var fb_ptr: ?[*]volatile u32 = null;
-var fb_display: DisplayInfo = undefined;
-var fb_visible_cols: u32 = 0;
-var fb_visible_rows: u32 = 0;
-var fb_lines: [FB_MAX_LINES][FB_MAX_COLS]u8 = .{.{0} ** FB_MAX_COLS} ** FB_MAX_LINES;
-var fb_line_lens: [FB_MAX_LINES]u16 = .{0} ** FB_MAX_LINES;
-var fb_head: u32 = 0;
-var fb_count: u32 = 0;
-
-fn packPixel(c: Color) u32 {
-    if (fb_display.pixel_format == 0) { // BGR8
-        return @as(u32, c.b) | (@as(u32, c.g) << 8) | (@as(u32, c.r) << 16);
-    } else { // RGB8
-        return @as(u32, c.r) | (@as(u32, c.g) << 8) | (@as(u32, c.b) << 16);
-    }
-}
-
-fn drawChar(px: u32, py: u32, char: u8, fg: u32, bg: u32) void {
-    const fb = fb_ptr orelse return;
-    const glyph = font.data[(@as(u32, char) * font.height)..][0..font.height];
-    const stride: u32 = fb_display.stride;
-    var row: u32 = 0;
-    while (row < font.height) : (row += 1) {
-        const bits = glyph[row];
-        var col: u32 = 0;
-        while (col < font.width) : (col += 1) {
-            const pixel = if ((bits >> @intCast(7 - col)) & 1 != 0) fg else bg;
-            fb[(py + row) * stride + (px + col)] = pixel;
-        }
-    }
-}
-
-fn drawString(px: u32, py: u32, text: []const u8, fg: u32, bg: u32) void {
-    var x = px;
-    for (text) |ch| {
-        if (x + font.width > fb_display.width) break;
-        drawChar(x, py, ch, fg, bg);
-        x += font.width;
-    }
-}
-
-fn clearRect(px: u32, py: u32, w: u32, ht: u32, color: u32) void {
-    const fb = fb_ptr orelse return;
-    const stride: u32 = fb_display.stride;
-    var row: u32 = 0;
-    while (row < ht) : (row += 1) {
-        var col: u32 = 0;
-        while (col < w) : (col += 1) {
-            fb[(py + row) * stride + (px + col)] = color;
-        }
-    }
-}
-
-fn fbAppendLine(text: []const u8) void {
-    const idx = (fb_head + fb_count) % FB_MAX_LINES;
-    const len = @min(text.len, FB_MAX_COLS);
-    @memcpy(fb_lines[idx][0..len], text[0..len]);
-    fb_line_lens[idx] = @intCast(len);
-    if (fb_count < FB_MAX_LINES) {
-        fb_count += 1;
-    } else {
-        fb_head = (fb_head + 1) % FB_MAX_LINES;
-    }
-}
-
-fn fbAppendText(text: []const u8) void {
-    var start: usize = 0;
-    for (text, 0..) |ch, i| {
-        if (ch == '\n') {
-            fbAppendLine(text[start..i]);
-            start = i + 1;
-        }
-    }
-    if (start < text.len) {
-        fbAppendLine(text[start..]);
-    }
-}
-
-fn renderTextBuffer() void {
-    if (fb_ptr == null) return;
-    const bg = packPixel(BG_COLOR);
-    const fg_pixel = packPixel(FG_COLOR);
-    const header_fg = packPixel(HEADER_FG);
-
-    // Header
-    const header_y = MARGIN;
-    clearRect(MARGIN, header_y, fb_visible_cols * font.width, font.height, bg);
-    drawString(MARGIN, header_y, "Zag Router", header_fg, bg);
-
-    // Text area starts below header with a gap
-    const text_y_start = MARGIN + font.height + 4;
-    const text_rows = (fb_display.height - text_y_start - MARGIN) / font.height;
-
-    // Determine which lines to show (last text_rows lines)
-    const show_count = @min(fb_count, text_rows);
-    const start_idx = if (fb_count > text_rows) (fb_head + fb_count - text_rows) % FB_MAX_LINES else fb_head;
-
-    var row: u32 = 0;
-    while (row < text_rows) : (row += 1) {
-        const y = text_y_start + row * font.height;
-        clearRect(MARGIN, y, fb_visible_cols * font.width, font.height, bg);
-        if (row < show_count) {
-            const line_idx = (start_idx + row) % FB_MAX_LINES;
-            const len = fb_line_lens[line_idx];
-            if (len > 0) {
-                drawString(MARGIN, y, fb_lines[line_idx][0..len], fg_pixel, bg);
-            }
-        }
-    }
-}
-
-fn findDisplay(perm_view_addr: u64) ?DisplayInfo {
-    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
-    for (view) |*entry| {
-        if (entry.entry_type == pv.ENTRY_TYPE_DEVICE_REGION and
-            entry.deviceClass() == @intFromEnum(perms.DeviceClass.display) and
-            entry.deviceType() == @intFromEnum(perms.DeviceType.mmio))
-        {
-            return .{
-                .handle = entry.handle,
-                .fb_size = entry.deviceSizeOrPortCount(),
-                .width = entry.fbWidth(),
-                .height = entry.fbHeight(),
-                .stride = entry.fbStride(),
-                .pixel_format = entry.fbPixelFormat(),
-            };
-        }
-    }
-    return null;
-}
-
-fn initDisplay(perm_view_addr: u64) void {
-    const di = findDisplay(perm_view_addr) orelse return;
-    if (di.width == 0 or di.height == 0) return;
-
-    const aligned = ((di.fb_size + syscall.PAGE4K - 1) / syscall.PAGE4K) * syscall.PAGE4K;
-    const vm_rights = (perms.VmReservationRights{ .read = true, .write = true, .mmio = true }).bits();
-    const vm = syscall.vm_reserve(0, aligned, vm_rights);
-    if (vm.val < 0) return;
-    if (syscall.mmio_map(di.handle, @intCast(vm.val), 0) != 0) return;
-
-    fb_display = di;
-    fb_ptr = @ptrFromInt(vm.val2);
-    fb_visible_cols = (di.width - 2 * MARGIN) / font.width;
-    fb_visible_rows = (di.height - 2 * MARGIN) / font.height;
-
-    // Fill background
-    const bg = packPixel(BG_COLOR);
-    const stride: u32 = di.stride;
-    const fb = fb_ptr.?;
-    var y: u32 = 0;
-    while (y < di.height) : (y += 1) {
-        var x: u32 = 0;
-        while (x < di.width) : (x += 1) {
-            fb[y * stride + x] = bg;
-        }
-    }
-    renderTextBuffer();
-}
-
-fn fbMsg(msg: []const u8) void {
-    syscall.write(msg);
-    if (fb_ptr != null) {
-        fbAppendText(msg);
-        renderTextBuffer();
-    }
-}
-
-fn renderStats() void {
-    if (fb_ptr == null) return;
-    var buf: [128]u8 = undefined;
-    var p: usize = 0;
-    p = util.appendStr(&buf, p, "WAN rx=");
-    p = util.appendDec(&buf, p, wan_iface.stats.rx_packets);
-    p = util.appendStr(&buf, p, " tx=");
-    p = util.appendDec(&buf, p, wan_iface.stats.tx_packets);
-    p = util.appendStr(&buf, p, " drop=");
-    p = util.appendDec(&buf, p, wan_iface.stats.rx_dropped);
-    if (has_lan) {
-        p = util.appendStr(&buf, p, " | LAN rx=");
-        p = util.appendDec(&buf, p, lan_iface.stats.rx_packets);
-        p = util.appendStr(&buf, p, " tx=");
-        p = util.appendDec(&buf, p, lan_iface.stats.tx_packets);
-        p = util.appendStr(&buf, p, " drop=");
-        p = util.appendDec(&buf, p, lan_iface.stats.rx_dropped);
-    }
-    fbAppendLine(buf[0..p]);
-    renderTextBuffer();
-}
 
 // ── IPv6 global state ────────────────────────────────────────────────────
 pub var wan_ndp_table: [ndp.TABLE_SIZE]ndp.NdpEntry = .{ndp.empty} ** ndp.TABLE_SIZE;
@@ -800,19 +593,15 @@ fn detectAppChannels(view: *const [MAX_PERMS]pv.UserViewEntry, mapped_handles: *
                     if (id_buf[0] == shm_protocol.ServiceId.NFS_CLIENT and nfs_chan == null) {
                         nfs_chan = ch;
                         log.write(.nfs_connected);
-                        fbMsg("router: nfs_client connected\n");
                     } else if (id_buf[0] == shm_protocol.ServiceId.NTP_CLIENT and ntp_chan == null) {
                         ntp_chan = ch;
                         log.write(.ntp_connected);
-                        fbMsg("router: ntp_client connected\n");
                     } else if (id_buf[0] == shm_protocol.ServiceId.HTTP_SERVER and http_chan == null) {
                         http_chan = ch;
                         log.write(.http_connected);
-                        fbMsg("router: http_server connected\n");
                     } else if (id_buf[0] == shm_protocol.ServiceId.CONSOLE and console_chan == null) {
                         console_chan = ch;
                         log.write(.console_connected);
-                        fbMsg("router: console connected\n");
                     }
                 }
                 break;
@@ -850,9 +639,6 @@ pub fn main(perm_view_addr: u64) void {
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
     perm_view = view;
 
-    // Initialize framebuffer display (optional — works without display device)
-    initDisplay(perm_view_addr);
-
     // Detect restart: slot 0 (self) has restart_count and crash_reason
     const self_entry = &view[0];
     const restart_count = self_entry.processRestartCount();
@@ -865,10 +651,9 @@ pub fn main(perm_view_addr: u64) void {
         rp = util.appendStr(&rbuf, rp, ") reason=");
         rp = util.appendStr(&rbuf, rp, crashReasonName(reason));
         rp = util.appendStr(&rbuf, rp, "\n");
-        fbMsg(rbuf[0..rp]);
+        syscall.write(rbuf[0..rp]);
     }
 
-    fbMsg("router: scanning for NICs\n");
     // Scan for NICs — retry until WAN is found (grant may race with proc start)
     var nics: @TypeOf(findNicDevices(perm_view_addr)) = undefined;
     while (true) {
@@ -876,7 +661,6 @@ pub fn main(perm_view_addr: u64) void {
         if (nics.wan != null) break;
         syscall.thread_yield();
     }
-    fbMsg("router: WAN NIC found\n");
     // Also wait for LAN if not yet visible
     if (nics.lan == null) {
         var retry: u32 = 0;
@@ -885,27 +669,20 @@ pub fn main(perm_view_addr: u64) void {
             nics = findNicDevices(perm_view_addr);
         }
     }
-    if (nics.lan != null) {
-        fbMsg("router: LAN NIC found\n");
-    } else {
-        fbMsg("router: LAN NIC NOT found\n");
-    }
     const wan_nic = nics.wan.?;
 
     const wan_mmio_size = if (wan_nic.mmio_size == 0) syscall.PAGE4K else wan_nic.mmio_size;
     const wan_mmio = mmioMap(wan_nic.handle, wan_mmio_size) orelse {
-        fbMsg("router: WAN MMIO fail — halted\n");
+        syscall.write("router: WAN MMIO fail — halted\n");
         while (true) syscall.thread_yield();
     };
 
     // DMA setup — create SHM, map WAN, optionally also map LAN
     const lan_handle: ?u64 = if (nics.lan) |ln| ln.handle else null;
-    fbMsg("router: setting up DMA\n");
     var region = dma.setupWan(wan_nic.handle, lan_handle) orelse {
-        fbMsg("router: DMA fail — halted\n");
+        syscall.write("router: DMA fail — halted\n");
         while (true) syscall.thread_yield();
     };
-    fbMsg("router: DMA ok\n");
     const dual_dma_ok = region.lan_dma_base != 0;
 
     // Initialize WAN interface
@@ -934,12 +711,11 @@ pub fn main(perm_view_addr: u64) void {
         .rx_descs = region.wanRxDescs(),
         .tx_descs = region.wanTxDescs(),
     })) {
-        fbMsg("router: WAN NIC init fail — halted\n");
+        syscall.write("router: WAN NIC init fail — halted\n");
         while (true) syscall.thread_yield();
     }
     _ = syscall.pci_enable_bus_master(wan_nic.handle);
     wan_iface.mac = nic.readMac(wan_mmio);
-    fbMsg("router: WAN NIC init ok\n");
     wan_iface.ip6_link_local = util.macToLinkLocal(wan_iface.mac);
 
     // Initialize LAN interface if dual-NIC DMA succeeded
@@ -976,15 +752,9 @@ pub fn main(perm_view_addr: u64) void {
                 lan_iface.pending_tx = .{ .{}, .{} };
 
                 has_lan = true;
-                fbMsg("router: LAN NIC init ok\n");
-            } else {
-                fbMsg("router: LAN NIC init fail\n");
             }
-        } else {
-            fbMsg("router: LAN MMIO fail\n");
         }
     }
-    fbMsg("router: starting poll threads\n");
     arp.sendRequest(.wan, wan_gateway);
     if (has_lan) arp.sendRequest(.lan, .{ 10, 1, 1, 50 });
 
@@ -1428,9 +1198,6 @@ fn sendArpTable(chan: *channel_mod.Channel, label: []const u8, table: *const [ar
 // ── Poll thread ─────────────────────────────────────────────────────────
 
 /// Poll one interface: receive a packet, process it, forward zero-copy if needed.
-var wan_rx_log_count: u32 = 0;
-var lan_rx_log_count: u32 = 0;
-
 fn pollOnce(self_iface: *Iface, other_iface: *Iface, role: Interface) void {
     // Drain any pending TX from the main thread (lock-free)
     self_iface.drainPendingTx();
@@ -1440,22 +1207,6 @@ fn pollOnce(self_iface: *Iface, other_iface: *Iface, role: Interface) void {
 
     nic.clearIrq(self_iface.mmio_base);
     const rx = self_iface.rxPoll() orelse return;
-
-    // Log first few packets per interface for debugging
-    const log_count = if (role == .wan) &wan_rx_log_count else &lan_rx_log_count;
-    if (log_count.* < 5) {
-        log_count.* += 1;
-        var dbg_buf: [64]u8 = undefined;
-        var p: usize = 0;
-        p = util.appendStr(&dbg_buf, p, "router: ");
-        p = util.appendStr(&dbg_buf, p, if (role == .wan) "WAN" else "LAN");
-        p = util.appendStr(&dbg_buf, p, " RX #");
-        p = util.appendDec(&dbg_buf, p, log_count.*);
-        p = util.appendStr(&dbg_buf, p, " len=");
-        p = util.appendDec(&dbg_buf, p, rx.len);
-        p = util.appendStr(&dbg_buf, p, "\n");
-        fbMsg(dbg_buf[0..p]);
-    }
     const buf_ptr = self_iface.rxBufPtr(rx.index);
     const pkt = buf_ptr[0..rx.len];
 
@@ -1496,7 +1247,6 @@ fn serviceThread() void {
     var loop_n: u32 = 0;
 
     log.write(.service_started);
-    syscall.write("router: service thread started\n");
 
     var svc_arena = Arena.init(1 << 30) orelse return;
     const a = svc_arena.allocator();
@@ -1580,11 +1330,6 @@ fn serviceThread() void {
         periodicMaintenance();
         ping_mod.checkTimeout();
         ping_mod.checkTracerouteTimeout();
-
-        // Render live stats to framebuffer (~every 0.5s)
-        if (loop_n % 500 == 0) {
-            renderStats();
-        }
 
         // Drain log ring buffer and flush to NFS
         log.drainAndFlush(&nfs_chan, loop_n);

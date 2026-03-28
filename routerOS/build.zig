@@ -53,9 +53,6 @@ fn buildRouterChild(
     child_app_mod.addImport("lib", lib_mod);
     child_app_mod.addImport("router", child_app_mod);
     child_app_mod.addOptions("build_options", options);
-    child_app_mod.addAnonymousImport("font8x16", .{
-        .root_source_file = b.path("router/font8x16.zig"),
-    });
     const child_start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "../libz/start.zig" },
         .target = target,

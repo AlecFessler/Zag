@@ -341,10 +341,10 @@ Types: `process = 0, vm_reservation = 1, shared_memory = 2, device_region = 3`.
 
 All rights are packed structs with bit fields:
 
-- `ProcessRights`: packed `u16` -- `grant_to`(0), `spawn_thread`(1), `spawn_process`(2), `mem_reserve`(3), `set_affinity`(4), `restart`(5), `shm_create`(6), `device_own`(7), `shutdown`(8), 7 bits reserved.
+- `ProcessRights`: packed `u16` -- `grant_to`(0), `spawn_thread`(1), `spawn_process`(2), `mem_reserve`(3), `set_affinity`(4), `restart`(5), `shm_create`(6), `device_own`(7), `shutdown`(8), `pin_exclusive`(9), 6 bits reserved.
 - `VmReservationRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4), 3 bits reserved.
 - `SharedMemoryRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `grant`(3), 4 bits reserved.
-- `DeviceRegionRights`: packed `u8` -- `map`(0), `grant`(1), 6 bits reserved.
+- `DeviceRegionRights`: packed `u8` -- `map`(0), `grant`(1), `dma`(2), 5 bits reserved.
 
 ---
 
@@ -1124,7 +1124,7 @@ device_count: u32
 
 **registerPortIoDevice(base_port, port_count, device_class, pci_vendor, pci_device, pci_class, pci_subclass) -> *DeviceRegion**: Same for Port I/O devices.
 
-**grantAllToRootService(root_proc)**: Iterate device table, insert each as a PermissionEntry with rights `0b11` (map + grant) into the root service's permissions table.
+**grantAllToRootService(root_proc)**: Iterate device table, insert each as a PermissionEntry with rights `0b111` (map + grant + dma) into the root service's permissions table.
 
 ### DeviceRegion Struct
 

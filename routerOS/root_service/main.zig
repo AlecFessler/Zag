@@ -313,21 +313,6 @@ fn writeU16(val: u16) void {
     syscall.write(buf[i..]);
 }
 
-fn writeU32(val: u32) void {
-    var buf: [10]u8 = undefined;
-    var n = val;
-    var i: usize = buf.len;
-    if (n == 0) {
-        syscall.write("0");
-        return;
-    }
-    while (n > 0) {
-        i -= 1;
-        buf[i] = '0' + @as(u8, @truncate(n % 10));
-        n /= 10;
-    }
-    syscall.write(buf[i..]);
-}
 
 fn brokerLoop() void {
     while (true) {
@@ -362,26 +347,12 @@ fn brokerLoop() void {
 
 pub fn main(perm_view_addr: u64) void {
     perm_view_global = perm_view_addr;
-    syscall.write("root: starting\n");
     var serial_devices: [4]DeviceGrant = undefined;
     const serial_count = findAllDevicesByClass(perm_view_addr, .serial, &serial_devices);
-    syscall.write("root: found serial devices\n");
 
     var nic_devices: [8]DeviceGrant = undefined;
     const nic_count = findAllMmioDevicesByClass(perm_view_addr, .network, &nic_devices);
-    syscall.write("root: found MMIO NICs: ");
-    writeU32(nic_count);
-    syscall.write("\n");
 
-    var display_devices: [2]DeviceGrant = undefined;
-    const display_count = findAllMmioDevicesByClass(perm_view_addr, .display, &display_devices);
-    if (display_count > 0) {
-        syscall.write("root: found display devices: ");
-        writeU32(display_count);
-        syscall.write("\n");
-    }
-
-    syscall.write("root: spawning serial_driver\n");
     _ = spawnChild(
         "serial_driver",
         embedded.serial_driver,
@@ -391,20 +362,6 @@ pub fn main(perm_view_addr: u64) void {
         perm_view_addr,
         serial_devices[0..serial_count],
     );
-
-    syscall.write("root: spawning router\n");
-
-    // Router process owns NIC devices and display devices directly
-    var router_devices: [10]DeviceGrant = undefined;
-    var router_dev_count: u32 = 0;
-    for (nic_devices[0..nic_count]) |d| {
-        router_devices[router_dev_count] = d;
-        router_dev_count += 1;
-    }
-    for (display_devices[0..display_count]) |d| {
-        router_devices[router_dev_count] = d;
-        router_dev_count += 1;
-    }
 
     const router_rights = perms.ProcessRights{
         .grant_to = true,
@@ -424,10 +381,8 @@ pub fn main(perm_view_addr: u64) void {
         router_rights,
         &.{},
         perm_view_addr,
-        router_devices[0..router_dev_count],
+        nic_devices[0..nic_count],
     );
-    syscall.write("root: spawning nfs_client\n");
-
     _ = spawnChild(
         "nfs_client",
         embedded.nfs_client,
