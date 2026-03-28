@@ -1,6 +1,6 @@
 const router = @import("router");
 
-const hdrs = router.net.headers;
+const hdrs = router.hal.headers;
 const main = router.state;
 const util = router.util;
 

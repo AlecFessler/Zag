@@ -2,6 +2,7 @@
 
 import os
 import subprocess
+import sys
 import time
 
 import pytest
@@ -32,36 +33,74 @@ def _run_ip(args: list[str]):
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
+def _cleanup_stale_macvlan():
+    """Remove any leftover lan-test0 from both root and lan_test namespaces."""
+    _run_ip(["ip", "link", "del", "lan-test0"])
+    _run_ip(["ip", "netns", "exec", "lan_test", "ip", "link", "del", "lan-test0"])
+
+
+def _verify_lan_macvlan() -> bool:
+    """Check that lan-test0 is UP with 10.1.1.60 inside lan_test."""
+    r = _run_ip(["ip", "netns", "exec", "lan_test", "ip", "addr", "show", "lan-test0"])
+    return r.returncode == 0 and "10.1.1.60" in r.stdout and "UP" in r.stdout
+
+
 def _setup_lan_macvlan():
     """Set up macvlan on tap1 inside the existing lan_test namespace (after QEMU boots).
 
     The namespace itself must be created beforehand via setup_sudo.sh.
     This only configures the macvlan interface, which needs CAP_NET_ADMIN.
+    Retries up to 3 times to handle tap1 readiness races and stale state.
     """
     if not lan_ns_exists():
         return
-    # Check if already configured
-    r = _run_ip(["ip", "netns", "exec", "lan_test", "ip", "addr", "show", "lan-test0"])
-    if r.returncode == 0 and "10.1.1.60" in r.stdout:
+
+    if _verify_lan_macvlan():
         return
-    cmds = [
-        ["ip", "link", "add", "lan-test0", "link", "tap1",
-         "type", "macvlan", "mode", "bridge"],
-        ["ip", "link", "set", "lan-test0", "address", "02:00:00:00:00:20"],
-        ["ip", "link", "set", "lan-test0", "netns", "lan_test"],
-        ["ip", "netns", "exec", "lan_test", "ip", "link", "set", "lo", "up"],
-        ["ip", "netns", "exec", "lan_test", "ip", "link", "set", "lan-test0", "up"],
-        ["ip", "netns", "exec", "lan_test", "ip", "addr", "add",
-         "10.1.1.60/24", "dev", "lan-test0"],
-        ["ip", "netns", "exec", "lan_test", "ip", "route", "add",
-         "default", "via", "10.1.1.1"],
-    ]
-    for cmd in cmds:
-        r = _run_ip(cmd)
-        if r.returncode != 0:
-            import sys
-            print(f"[conftest] macvlan setup failed: {' '.join(cmd)}: {r.stderr.strip()}", file=sys.stderr)
+
+    max_attempts = 3
+    last_error = ""
+
+    for attempt in range(max_attempts):
+        _cleanup_stale_macvlan()
+
+        if attempt > 0:
+            time.sleep(2)
+
+        cmds = [
+            ["ip", "link", "add", "lan-test0", "link", "tap1",
+             "type", "macvlan", "mode", "bridge"],
+            ["ip", "link", "set", "lan-test0", "address", "02:00:00:00:00:20"],
+            ["ip", "link", "set", "lan-test0", "netns", "lan_test"],
+            ["ip", "netns", "exec", "lan_test", "ip", "link", "set", "lo", "up"],
+            ["ip", "netns", "exec", "lan_test", "ip", "link", "set", "lan-test0", "up"],
+            ["ip", "netns", "exec", "lan_test", "ip", "addr", "add",
+             "10.1.1.60/24", "dev", "lan-test0"],
+            ["ip", "netns", "exec", "lan_test", "ip", "route", "add",
+             "default", "via", "10.1.1.1"],
+        ]
+
+        failed = False
+        for cmd in cmds:
+            r = _run_ip(cmd)
+            if r.returncode != 0:
+                last_error = f"{' '.join(cmd)}: {r.stderr.strip()}"
+                print(f"[conftest] macvlan setup attempt {attempt + 1}/{max_attempts} "
+                      f"failed: {last_error}", file=sys.stderr)
+                failed = True
+                break
+
+        if failed:
+            continue
+
+        if _verify_lan_macvlan():
             return
+
+        last_error = "interface created but verification failed"
+        print(f"[conftest] macvlan verification failed on attempt {attempt + 1}/{max_attempts}",
+              file=sys.stderr)
+
+    pytest.skip(f"macvlan setup failed after {max_attempts} attempts: {last_error}")
 
 
 def _teardown_lan_macvlan():
@@ -74,10 +113,8 @@ def router():
     """Session-scoped fixture: build, boot, and yield a QemuRouter."""
     r = QemuRouter(build=False, boot_timeout=ROUTER_BOOT_TIMEOUT)
     r.start()
-    time.sleep(2)
     # Create macvlan AFTER QEMU boots (tap1 must be open first)
     _setup_lan_macvlan()
-    time.sleep(1)  # Let macvlan settle
     yield r
     _teardown_lan_macvlan()
     r.stop()

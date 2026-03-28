@@ -1,6 +1,6 @@
 const router = @import("router");
 
-const h = router.net.headers;
+const h = router.hal.headers;
 const log = router.log;
 const main = router.state;
 const util = router.util;
@@ -69,7 +69,7 @@ pub fn sendDiscover() void {
     ip.computeAndSetChecksum(&pkt);
 
     const send_len = @max(@as(usize, @intCast(14 + ip_total)), 60);
-    _ = main.wan_iface.txSendLocal(pkt[0..send_len]);
+    _ = main.wan_iface.txSendLocal(pkt[0..send_len], .dataplane);
     main.dhcp_client_state = .discovering;
     main.dhcp_client_start_ns = util.now();
     log.write(.dhcp_sent_discover);
@@ -141,7 +141,7 @@ pub fn sendRequest() void {
     ip.computeAndSetChecksum(&pkt);
 
     const send_len = @max(@as(usize, @intCast(14 + ip_total)), 60);
-    _ = main.wan_iface.txSendLocal(pkt[0..send_len]);
+    _ = main.wan_iface.txSendLocal(pkt[0..send_len], .dataplane);
     main.dhcp_client_state = .requesting;
     main.dhcp_client_start_ns = util.now();
     log.write(.dhcp_sent_request);
@@ -210,7 +210,7 @@ pub fn sendRebind() void {
     ip.computeAndSetChecksum(&pkt);
 
     const send_len = @max(@as(usize, @intCast(14 + ip_total)), 60);
-    _ = main.wan_iface.txSendLocal(pkt[0..send_len]);
+    _ = main.wan_iface.txSendLocal(pkt[0..send_len], .dataplane);
     main.dhcp_client_state = .rebinding;
     main.dhcp_client_start_ns = util.now();
     log.write(.dhcp_sent_rebind);

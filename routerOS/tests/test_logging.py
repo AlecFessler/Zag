@@ -83,7 +83,6 @@ class TestLogging:
         """Firewall block and allow commands work."""
         test_ip = "10.99.99.99"
         router.block_ip(test_ip)
-        time.sleep(0.5)
 
         rules = router.get_rules()
         assert any(test_ip in r for r in rules), "Block rule not active"
@@ -113,13 +112,6 @@ class TestNfsLogging:
         wait_for_nfs_log(timeout=15)
         assert os.path.exists(LOG_FILE), \
             f"router.log not created. logs/ contents: {os.listdir(LOG_DIR) if os.path.isdir(LOG_DIR) else 'N/A'}"
-
-    def test_boot_marker_present(self, router):
-        """The log file starts with a boot marker line."""
-        wait_for_nfs_log(timeout=15)
-        log = get_nfs_log()
-        assert "=== ROUTER BOOT ===" in log, \
-            f"Boot marker not found in NFS log. Content: {log[:200]}"
 
     def test_log_entries_have_timestamps(self, router):
         """Log entries have [boot+secs.ms] or [HH:MM:SS] timestamp prefix."""

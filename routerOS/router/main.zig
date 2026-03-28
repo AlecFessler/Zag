@@ -1,28 +1,28 @@
 const lib = @import("lib");
 const router = @import("router");
 
-const arp = router.net.arp;
-const dhcp_client = router.services.dhcp_client;
-const dhcp_server = router.services.dhcp_server;
-const dhcpv6_client = router.ipv6.dhcpv6_client;
-const dma = router.net.dma;
-const dns = router.services.dns;
-const tcp_stack = router.services.tcp_stack;
-const e1000 = router.net.e1000;
-const firewall = router.ipv4.firewall;
-const firewall6 = router.ipv6.firewall6;
-const h = router.net.headers;
-const frag = router.ipv4.frag;
-const iface_mod = router.net.iface;
-const icmpv6 = router.ipv6.icmpv6;
+const arp = router.protocols.arp;
+const dhcp_client = router.protocols.dhcp_client;
+const dhcp_server = router.protocols.dhcp_server;
+const dhcpv6_client = router.protocols.ipv6.dhcp_client;
+const dma = router.hal.dma;
+const dns = router.protocols.dns;
+const e1000 = router.hal.e1000;
+const firewall = router.protocols.ipv4.firewall;
+const firewall6 = router.protocols.ipv6.firewall;
+const frag = router.protocols.frag;
+const h = router.hal.headers;
+const iface_mod = router.hal.iface;
+const icmpv6 = router.protocols.ipv6.icmp;
 const log = router.log;
-const nat = router.ipv4.nat;
-const ndp = router.ipv6.ndp;
-const pcp = router.services.pcp;
-const ping_mod = router.ipv4.icmp;
-const slaac = router.ipv6.slaac;
-const udp_fwd = router.services.udp_fwd;
-const upnp = router.services.upnp;
+const nat = router.protocols.ipv4.nat;
+const ndp = router.protocols.ipv6.ndp;
+const pcp = router.protocols.pcp;
+const ping_mod = router.protocols.ipv4.icmp;
+const slaac = router.protocols.ipv6.slaac;
+const tcp_stack = router.protocols.tcp_stack;
+const udp_fwd = router.protocols.udp_fwd;
+const upnp = router.protocols.upnp;
 const util = router.util;
 
 const Arena = lib.arena.Arena;
@@ -260,7 +260,7 @@ pub fn sendIcmpError(role: Interface, orig_pkt: []const u8, orig_len: u32, icmp_
     // ICMP checksum
     icmp_hdr.computeAndSetChecksum(pkt[icmp_start..][0..icmp_total]);
 
-    _ = ifc.txSendLocal(pkt[0..frame_len]);
+    _ = ifc.txSendLocal(pkt[0..frame_len], .dataplane);
 }
 
 pub fn periodicMaintenance() void {
@@ -326,7 +326,7 @@ pub fn processIpv6Packet(role: Interface, pkt: []u8, len: u32) PacketAction {
         // NDP: NS/NA
         if (icmpv6_type == 135 or icmpv6_type == 136) {
             if (ndp.handle(role, pkt, len)) |reply| {
-                _ = ifc.txSendLocal(reply);
+                _ = ifc.txSendLocal(reply, .dataplane);
             }
             return .consumed;
         }
@@ -342,7 +342,7 @@ pub fn processIpv6Packet(role: Interface, pkt: []u8, len: u32) PacketAction {
         // Echo Request
         if (icmpv6_type == 128 and is_for_me) {
             if (icmpv6.handleEchoRequest(role, pkt, len)) |reply| {
-                _ = ifc.txSendLocal(reply);
+                _ = ifc.txSendLocal(reply, .dataplane);
             }
             return .consumed;
         }
@@ -428,7 +428,7 @@ pub fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
             }
         }
         if (arp.handle(role, pkt, len)) |reply| {
-            _ = ifc.txSendLocal(reply);
+            _ = ifc.txSendLocal(reply, .dataplane);
         }
         return .consumed;
     }
@@ -508,7 +508,7 @@ pub fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
         ping_mod.handleTimeExceeded(pkt, len);
         ping_mod.handleTracerouteEchoReply(pkt, len);
         if (handleIcmp(role, pkt, len)) |reply| {
-            _ = ifc.txSendLocal(reply);
+            _ = ifc.txSendLocal(reply, .dataplane);
         } else if (role == .wan and has_lan) {
             if (firewall.handlePortForward(pkt, len)) return .consumed;
             if (nat.forwardWanToLan(pkt, len)) return .forward_lan;
@@ -638,7 +638,7 @@ pub fn main(perm_view_addr: u64) void {
     wan_iface.rx_buf_tx_idx = .{0} ** e1000.NUM_RX_DESC;
     wan_iface.arp_table = .{arp.empty} ** arp.TABLE_SIZE;
     wan_iface.stats = .{};
-    wan_iface.pending_tx_flag = 0;
+    wan_iface.pending_tx = .{ .{}, .{} };
 
     if (!e1000.init(.{
         .mmio_base = wan_mmio,
@@ -688,7 +688,7 @@ pub fn main(perm_view_addr: u64) void {
                 lan_iface.rx_buf_tx_idx = .{0} ** e1000.NUM_RX_DESC;
                 lan_iface.arp_table = .{arp.empty} ** arp.TABLE_SIZE;
                 lan_iface.stats = .{};
-                lan_iface.pending_tx_flag = 0;
+                lan_iface.pending_tx = .{ .{}, .{} };
 
                 has_lan = true;
             } else {
@@ -717,15 +717,9 @@ pub fn main(perm_view_addr: u64) void {
     }
 
     // WAN thread (runs on the initial/main thread):
-    // Polls WAN RX, handles routing, maintenance. Channels handled by service thread.
+    // Pure data-plane: polls WAN RX, handles routing, forwards to LAN.
     while (true) {
-        // WAN poll + zero-copy forwarding
         pollOnce(&wan_iface, &lan_iface, .wan);
-
-        // Periodic tasks (only on WAN thread)
-        ping_mod.checkTimeout();
-        ping_mod.checkTracerouteTimeout();
-        periodicMaintenance();
     }
 }
 
@@ -1275,6 +1269,11 @@ fn serviceThread() void {
                 }
             }
         }
+
+        // Periodic maintenance (timers, expiry, DHCP ticks)
+        periodicMaintenance();
+        ping_mod.checkTimeout();
+        ping_mod.checkTracerouteTimeout();
 
         // Drain log ring buffer and flush to NFS
         log.drainAndFlush(&nfs_chan, loop_n);

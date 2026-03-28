@@ -7,8 +7,8 @@
 /// Lookup reads state atomically. Expiry writes state atomically.
 const router = @import("router");
 
-const arp = router.net.arp;
-const h = router.net.headers;
+const arp = router.protocols.arp;
+const h = router.hal.headers;
 const main = router.state;
 const util = router.util;
 

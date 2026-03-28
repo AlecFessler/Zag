@@ -35,7 +35,6 @@ class TestFirewallRules:
     def test_firewall_blocks_wan_inbound(self, router, wan_ip):
         """Blocked WAN source IP should be dropped by the firewall."""
         router.block_ip(wan_ip)
-        time.sleep(0.5)
 
         rules = router.get_rules()
         assert any(wan_ip in r for r in rules), f"Block rule missing: {rules}"
@@ -61,7 +60,6 @@ class TestFirewallRules:
         """
         # Block WAN host
         router.block_ip(wan_ip)
-        time.sleep(0.5)
 
         # Ping should fail (or at least not all succeed)
         from conftest import ping_host
@@ -69,7 +67,6 @@ class TestFirewallRules:
 
         # Unblock
         router.allow_ip(wan_ip)
-        time.sleep(0.5)
 
         # Ping should work again
         unblocked_result = ping_host(router_wan_ip, interface="tap0", count=2, timeout=5)
@@ -120,11 +117,9 @@ class TestPortForwarding:
         # Warm up ARP so router knows .60's MAC
         from conftest import ping_from_lan_ns
         ping_from_lan_ns("10.1.1.1", count=1)
-        time.sleep(1)
 
         resp = router.add_port_forward("tcp", wan_port, lan_ip, lan_port)
         assert "OK" in resp
-        time.sleep(1)
 
         # Start TCP server in the LAN namespace
         server_proc = subprocess.Popen(
@@ -135,19 +130,24 @@ class TestPortForwarding:
              f"c,a=s.accept(); d=c.recv(64); print(d); c.sendall(b'ACK'); c.close(); s.close()"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-        time.sleep(1)
 
         # Connect from WAN side to router's WAN IP on the forwarded port
-        client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        client.settimeout(10.0)
         received_reply = None
-        try:
-            client.connect((router_wan_ip, wan_port))
-            client.sendall(b"hello-port-forward")
-            received_reply = client.recv(1024)
-            client.close()
-        except (socket.timeout, ConnectionRefusedError, OSError):
-            pass
+        for _ in range(20):
+            client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            client.settimeout(10.0)
+            try:
+                client.connect((router_wan_ip, wan_port))
+                client.sendall(b"hello-port-forward")
+                received_reply = client.recv(1024)
+                client.close()
+                break
+            except ConnectionRefusedError:
+                client.close()
+                time.sleep(0.05)
+            except (socket.timeout, OSError):
+                client.close()
+                break
 
         server_proc.wait(timeout=16)
         server_stdout = server_proc.stdout.read().decode()
@@ -168,11 +168,9 @@ class TestPortForwarding:
         # Warm up ARP
         from conftest import ping_from_lan_ns
         ping_from_lan_ns("10.1.1.1", count=1)
-        time.sleep(1)
 
         resp = router.add_port_forward("udp", wan_port, lan_ip, lan_port)
         assert "OK" in resp
-        time.sleep(1)
 
         # Start UDP server in the LAN namespace
         server_proc = subprocess.Popen(
@@ -183,13 +181,16 @@ class TestPortForwarding:
              f"d,a=s.recvfrom(1024); print(d); s.close()"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-        time.sleep(1)
 
-        # Send UDP from WAN side
+        # Send UDP from WAN side (retry — subprocess needs time to start and bind)
         client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         client.settimeout(5.0)
         try:
-            client.sendto(b"udp-forward-test", (router_wan_ip, wan_port))
+            for _ in range(10):
+                client.sendto(b"udp-forward-test", (router_wan_ip, wan_port))
+                if server_proc.poll() is not None:
+                    break
+                time.sleep(0.1)
         finally:
             client.close()
 

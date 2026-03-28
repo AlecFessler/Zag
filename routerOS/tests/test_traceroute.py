@@ -15,7 +15,6 @@ class TestTraceroute:
         """Traceroute to WAN gateway (1 hop) should show the gateway IP and RTT."""
         # Warm ARP so the router already knows the gateway MAC
         ping_host(wan_ip, interface="tap0", count=1)
-        time.sleep(1)
 
         lines = router.multi_command(f"traceroute {wan_ip}", timeout=30)
         assert len(lines) > 0, f"Traceroute returned no output: {lines}"
@@ -38,7 +37,6 @@ class TestTraceroute:
     def test_traceroute_shows_rtt(self, router, wan_ip):
         """Traceroute hop lines include RTT in microseconds."""
         ping_host(wan_ip, interface="tap0", count=1)
-        time.sleep(1)
 
         lines = router.multi_command(f"traceroute {wan_ip}", timeout=30)
         hop_lines = [l for l in lines if re.match(r"^\d+\s+", l)]

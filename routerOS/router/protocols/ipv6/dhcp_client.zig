@@ -1,6 +1,6 @@
 const router = @import("router");
 
-const h = router.net.headers;
+const h = router.hal.headers;
 const log = router.log;
 const main = router.state;
 const util = router.util;
@@ -109,7 +109,7 @@ pub fn sendSolicit() void {
     ip6.setPayloadLen(udp_len); // IPv6 payload = UDP
 
     const total_len = pos;
-    _ = ifc.txSendLocal(pkt[0..total_len]);
+    _ = ifc.txSendLocal(pkt[0..total_len], .dataplane);
     main.dhcpv6_state = .soliciting;
     main.dhcpv6_start_ns = util.now();
     log.write(.dhcpv6_sent_solicit);
@@ -246,7 +246,7 @@ fn sendRequest() void {
     udp.setLength(udp_len);
     ip6.setPayloadLen(udp_len);
 
-    _ = ifc.txSendLocal(pkt[0..pos]);
+    _ = ifc.txSendLocal(pkt[0..pos], .dataplane);
     main.dhcpv6_state = .requesting;
     main.dhcpv6_start_ns = util.now();
     log.write(.dhcpv6_sent_request);

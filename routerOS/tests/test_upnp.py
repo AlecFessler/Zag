@@ -35,7 +35,6 @@ class TestSSDPDiscovery:
     def test_ssdp_msearch_handled(self, router, router_lan_ip):
         """M-SEARCH to 239.255.255.250:1900 should be handled (not crash router)."""
         ping_from_lan_ns("10.1.1.1", count=1)
-        time.sleep(1)
 
         script = (
             "import socket\n"
@@ -66,7 +65,6 @@ class TestSSDPDiscovery:
     def test_ssdp_multicast_does_not_forward(self, router, router_lan_ip):
         """SSDP multicast from LAN should NOT be forwarded to WAN."""
         ping_from_lan_ns("10.1.1.1", count=1)
-        time.sleep(1)
 
         # Get WAN stats before
         ifstat_before = router.get_ifstat()
@@ -84,7 +82,6 @@ class TestSSDPDiscovery:
         )
 
         run_python_in_lan_ns(script)
-        time.sleep(1)
 
         # Verify router didn't forward multicast to WAN (WAN TX shouldn't increase from SSDP)
         status = router.get_status()
@@ -133,7 +130,6 @@ class TestUPnPHTTP:
     def test_root_desc_xml(self, router, router_lan_ip):
         """GET /upnp/rootDesc.xml should return valid UPnP device description."""
         ping_from_lan_ns("10.1.1.1", count=1)
-        time.sleep(1)
 
         script = (
             "import urllib.request\n"
@@ -169,7 +165,6 @@ class TestUPnPHTTP:
         Uses a compact SOAP body to ensure it fits in a single TCP segment.
         """
         ping_from_lan_ns("10.1.1.1", count=1)
-        time.sleep(2)
 
         wan_port = 19878
 
@@ -196,7 +191,6 @@ class TestUPnPHTTP:
         # The TCP stack may forward headers before body arrives (single-connection HTTP/1.0).
         # If the SOAP succeeds, verify the response. Otherwise fall back to checking rules.
         if "AddPortMappingResponse" in result:
-            time.sleep(1)
             rules = router.get_rules()
             assert any(str(wan_port) in r for r in rules), \
                 f"SOAP succeeded but forward not in rules: {rules}"
@@ -214,12 +208,11 @@ class TestUPnPHTTP:
     def test_soap_delete_port_mapping(self, router, router_lan_ip):
         """SOAP DeletePortMapping should remove the forward."""
         ping_from_lan_ns("10.1.1.1", count=1)
-        time.sleep(1)
 
         wan_port = 19879
 
         router.add_port_forward("tcp", wan_port, "10.1.1.60", 80)
-        time.sleep(0.5)
+
         rules = router.get_rules()
         assert any(str(wan_port) in r for r in rules), "Setup failed"
 
@@ -237,7 +230,6 @@ class TestUPnPHTTP:
         result = _send_soap_request(router_lan_ip, soap_body, "DeletePortMapping")
         assert result is not None, "No SOAP response"
 
-        time.sleep(1)
         rules = router.get_rules()
         fwd_rules = [r for r in rules if str(wan_port) in r and "forward" in r.lower()]
         assert len(fwd_rules) == 0, f"Forward still present: {rules}"
@@ -247,7 +239,6 @@ class TestUPnPHTTP:
     def test_soap_get_external_ip(self, router, router_lan_ip, router_wan_ip):
         """SOAP GetExternalIPAddress should return WAN IP."""
         ping_from_lan_ns("10.1.1.1", count=1)
-        time.sleep(1)
 
         soap_body = (
             '<?xml version="1.0"?>'

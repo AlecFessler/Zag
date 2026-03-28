@@ -3,7 +3,7 @@
 const lib = @import("lib");
 const router = @import("router");
 
-const arp = @import("arp.zig");
+const arp = router.protocols.arp;
 const dma = @import("dma.zig");
 const e1000 = @import("e1000.zig");
 const util = router.util;
@@ -29,7 +29,88 @@ pub const IfaceStats = struct {
     rx_dropped: u64 = 0,
 };
 
+const CACHE_LINE = 64;
+const PENDING_TX_SLOTS = 4;
+
+pub const TxProducer = enum(u1) { service = 0, dataplane = 1 };
+
+/// SPSC ring buffer for pending TX packets.
+/// Producer and consumer cursors are on separate cache lines to avoid false sharing.
+pub const PendingTxRing = struct {
+    // ── Producer cache line ─────────────────────────────────
+    tail: u64 align(CACHE_LINE) = 0,
+    cached_head: u64 = 0,
+    _pad0: [CACHE_LINE - 16]u8 = .{0} ** (CACHE_LINE - 16),
+
+    // ── Consumer cache line ─────────────────────────────────
+    head: u64 align(CACHE_LINE) = 0,
+    cached_tail: u64 = 0,
+    _pad1: [CACHE_LINE - 16]u8 = .{0} ** (CACHE_LINE - 16),
+
+    // ── Data slots ──────────────────────────────────────────
+    lens: [PENDING_TX_SLOTS]u16 = .{0} ** PENDING_TX_SLOTS,
+    bufs: [PENDING_TX_SLOTS][e1000.PACKET_BUF_SIZE]u8 = undefined,
+
+    comptime {
+        if (@offsetOf(PendingTxRing, "tail") / CACHE_LINE == @offsetOf(PendingTxRing, "head") / CACHE_LINE)
+            @compileError("tail and head must be on different cache lines");
+    }
+
+    /// Enqueue a packet (producer side). Returns false if ring is full.
+    fn send(self: *PendingTxRing, data: []const u8) bool {
+        if (data.len == 0 or data.len > e1000.PACKET_BUF_SIZE) return false;
+
+        const tail = @as(*volatile u64, &self.tail).*;
+
+        // Fast path: check cached head
+        var free = PENDING_TX_SLOTS -% (tail -% self.cached_head);
+        if (free == 0) {
+            // Slow path: reload remote head
+            self.cached_head = @atomicLoad(u64, &self.head, .acquire);
+            free = PENDING_TX_SLOTS -% (tail -% self.cached_head);
+            if (free == 0) return false;
+        }
+
+        const slot: usize = @intCast(tail % PENDING_TX_SLOTS);
+        @memcpy(self.bufs[slot][0..data.len], data);
+        self.lens[slot] = @intCast(data.len);
+
+        @atomicStore(u64, &self.tail, tail +% 1, .release);
+        return true;
+    }
+
+    /// Drain all pending packets (consumer side). Calls transmit_fn for each.
+    fn drain(self: *PendingTxRing, iface: *Iface) void {
+        var head_val = @as(*volatile u64, &self.head).*;
+
+        // Fast path: check cached tail
+        if (head_val == self.cached_tail) {
+            // Slow path: reload remote tail
+            self.cached_tail = @atomicLoad(u64, &self.tail, .acquire);
+            if (head_val == self.cached_tail) return;
+        }
+
+        const tx_off = if (iface.role == .wan) dma.WAN_TX_BUFS_OFF else dma.LAN_TX_BUFS_OFF;
+        const tx_bufs_dma = iface.dma_base + tx_off;
+        const tx_bufs_virt = iface.dma_region.virt_base + tx_off;
+
+        while (head_val != self.cached_tail) {
+            const slot: usize = @intCast(head_val % PENDING_TX_SLOTS);
+            const len = self.lens[slot];
+            if (e1000.txSendCopy(iface.mmio_base, iface.tx_descs, &iface.tx_tail, tx_bufs_dma, tx_bufs_virt, self.bufs[slot][0..len])) {
+                iface.stats.tx_packets += 1;
+                iface.stats.tx_bytes += len;
+            }
+            head_val +%= 1;
+        }
+
+        @atomicStore(u64, &self.head, head_val, .release);
+    }
+};
+
 pub const Iface = struct {
+    pub const TX_RING_SLOTS = PENDING_TX_SLOTS;
+
     role: Role,
     mmio_base: u64,
     mac: [6]u8,
@@ -58,11 +139,11 @@ pub const Iface = struct {
     arp_table: [arp.TABLE_SIZE]arp.ArpEntry,
     stats: IfaceStats,
 
-    // Lock-free pending TX: main thread writes packet here, poll thread drains.
-    // Atomic flag: 0 = empty, 1 = packet ready.
-    pending_tx_flag: u64 align(8) = 0,
-    pending_tx_len: u16 = 0,
-    pending_tx_buf: [e1000.PACKET_BUF_SIZE]u8 = undefined,
+    // Dual SPSC ring buffers for pending TX.
+    // Ring 0: service thread → poll thread
+    // Ring 1: other poll thread → this poll thread
+    // Design follows libz/channel.zig RingHeader pattern.
+    pending_tx: [2]PendingTxRing = .{ .{}, .{} },
 
     // ── Initialization ──────────────────────────────────────────────────
 
@@ -82,7 +163,6 @@ pub const Iface = struct {
             .rx_buf_tx_idx = .{0} ** e1000.NUM_RX_DESC,
             .arp_table = .{arp.empty} ** arp.TABLE_SIZE,
             .stats = .{},
-            .pending_tx_flag = 0,
         };
     }
 
@@ -102,7 +182,6 @@ pub const Iface = struct {
             .rx_buf_tx_idx = .{0} ** e1000.NUM_RX_DESC,
             .arp_table = .{arp.empty} ** arp.TABLE_SIZE,
             .stats = .{},
-            .pending_tx_flag = 0,
         };
     }
 
@@ -160,31 +239,16 @@ pub const Iface = struct {
     }
 
     /// Enqueue a locally-generated packet for the poll thread to send.
-    /// Lock-free: writes to pending slot, poll thread drains it.
-    /// Safe to call from any thread. Returns false if the slot is full.
-    pub fn txSendLocal(self: *Iface, data: []const u8) bool {
-        if (data.len == 0 or data.len > e1000.PACKET_BUF_SIZE) return false;
-        // Check if slot is free
-        if (@atomicLoad(u64, &self.pending_tx_flag, .acquire) != 0) return false;
-        // Write data and length, then set flag
-        @memcpy(self.pending_tx_buf[0..data.len], data);
-        self.pending_tx_len = @intCast(data.len);
-        @atomicStore(u64, &self.pending_tx_flag, 1, .release);
-        return true;
+    /// Each producer (service thread, other dataplane thread) has its own
+    /// SPSC ring, so no CAS is needed.
+    pub fn txSendLocal(self: *Iface, data: []const u8, producer: TxProducer) bool {
+        return self.pending_tx[@intFromEnum(producer)].send(data);
     }
 
-    /// Drain the pending TX slot. Called by the poll thread each iteration.
+    /// Drain all pending TX rings. Called by the poll thread each iteration.
     pub fn drainPendingTx(self: *Iface) void {
-        if (@atomicLoad(u64, &self.pending_tx_flag, .acquire) == 0) return;
-        const len = self.pending_tx_len;
-        const tx_off = if (self.role == .wan) dma.WAN_TX_BUFS_OFF else dma.LAN_TX_BUFS_OFF;
-        const tx_bufs_dma = self.dma_base + tx_off;
-        const tx_bufs_virt = self.dma_region.virt_base + tx_off;
-        if (e1000.txSendCopy(self.mmio_base, self.tx_descs, &self.tx_tail, tx_bufs_dma, tx_bufs_virt, self.pending_tx_buf[0..len])) {
-            self.stats.tx_packets += 1;
-            self.stats.tx_bytes += len;
-        }
-        @atomicStore(u64, &self.pending_tx_flag, 0, .release);
+        self.pending_tx[0].drain(self);
+        self.pending_tx[1].drain(self);
     }
 
     /// Send a packet directly on the TX ring. Must be called from the poll
@@ -195,7 +259,7 @@ pub const Iface = struct {
         if (data.len == 0 or data.len > e1000.PACKET_BUF_SIZE) return false;
 
         // When running without hardware (mmio_base == 0), fall back to pending TX slot
-        if (self.mmio_base == 0) return self.txSendLocal(data);
+        if (self.mmio_base == 0) return self.txSendLocal(data, .dataplane);
 
         const tx_off = if (self.role == .wan) dma.WAN_TX_BUFS_OFF else dma.LAN_TX_BUFS_OFF;
         const tx_bufs_dma = self.dma_base + tx_off;

@@ -1,8 +1,8 @@
 const lib = @import("lib");
 const router = @import("router");
 
-const arp = router.net.arp;
-const h = router.net.headers;
+const arp = router.protocols.arp;
+const h = router.hal.headers;
 const main = router.state;
 const util = router.util;
 
@@ -169,7 +169,7 @@ pub fn handlePortForward(pkt: []u8, len: u32) bool {
 
     main.lan_iface.stats.tx_packets += 1;
     main.lan_iface.stats.tx_bytes += len;
-    _ = main.lan_iface.txSendLocal(pkt[0..len]);
+    _ = main.lan_iface.txSendLocal(pkt[0..len], .dataplane);
     return true;
 }
 

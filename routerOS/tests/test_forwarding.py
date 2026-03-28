@@ -30,11 +30,9 @@ class TestIpForwarding:
 
         # Warm ARP
         ping_from_lan_ns("10.1.1.1", count=1)
-        time.sleep(1)
 
         resp = router.add_port_forward("udp", port, lan_ip, port)
         assert "OK" in resp
-        time.sleep(0.5)
 
         # UDP server in LAN namespace
         server_proc = __import__("subprocess").Popen(
@@ -46,11 +44,14 @@ class TestIpForwarding:
             stdout=__import__("subprocess").PIPE,
             stderr=__import__("subprocess").PIPE,
         )
-        time.sleep(1)
 
-        # Send from WAN
+        # Send from WAN (retry — subprocess needs time to start and bind)
         client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        client.sendto(b"wan-to-lan-test", (router_wan_ip, port))
+        for _ in range(10):
+            client.sendto(b"wan-to-lan-test", (router_wan_ip, port))
+            if server_proc.poll() is not None:
+                break
+            time.sleep(0.1)
         client.close()
 
         server_proc.wait(timeout=12)
@@ -61,7 +62,6 @@ class TestIpForwarding:
     def test_ifstat_shows_traffic(self, router, router_wan_ip):
         """After some traffic, ifstat should show non-zero counters."""
         ping_host(router_wan_ip, interface="tap0", count=2)
-        time.sleep(1)
 
         stats = router.get_ifstat()
         assert stats.get("wan", {}).get("rx", 0) > 0, \

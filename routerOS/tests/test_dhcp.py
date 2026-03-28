@@ -209,7 +209,6 @@ class TestDhcpServer:
                 assert ip_last >= 100, \
                     f"DHCP IP {assigned_ip} not in range (>=.100)"
 
-                time.sleep(1)
                 leases = router.get_leases()
                 assert any(assigned_ip in l for l in leases), \
                     f"IP {assigned_ip} not in leases: {leases}"
@@ -294,14 +293,19 @@ class TestDhcpClient:
             # retry needs to fire and see our server — poll until bound.
             router._drain()
             router.child.sendline("dhcp-client")
+            # Consume the response+prompt to stay synced
+            try:
+                router._wait_prompt(timeout=5)
+            except Exception:
+                router._drain()
 
             bound = False
             for _ in range(15):
-                time.sleep(2)
                 router._drain()
                 try:
                     resp = router.command("dhcp-client")
                 except Exception:
+                    router._resync()
                     continue
                 if "bound" in resp.lower():
                     bound = True
@@ -311,9 +315,15 @@ class TestDhcpClient:
             # Force a rebind — async logs will interfere with prompt
             router._drain()
             router.child.sendline("dhcp-test-rebind")
-            time.sleep(5)
+            # Consume the response+prompt to stay synced
+            try:
+                router._wait_prompt(timeout=10)
+            except Exception:
+                pass
             router._drain()
 
+            # Resync before final check
+            router._resync()
             # Verify client returned to bound state
             resp = router.command("dhcp-client")
             assert "bound" in resp.lower(), \

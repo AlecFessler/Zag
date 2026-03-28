@@ -1,7 +1,7 @@
 const router = @import("router");
 
-const arp = router.net.arp;
-const h = router.net.headers;
+const arp = router.protocols.arp;
+const h = router.hal.headers;
 const main = router.state;
 const util = router.util;
 
@@ -42,7 +42,7 @@ pub fn sendEchoRequest() void {
 
     main.ping_start_ns = util.now();
     main.ping_state = .echo_sent;
-    _ = ifc.txSendLocal(&pkt);
+    _ = ifc.txSendLocal(&pkt, .dataplane);
 }
 
 pub fn handleEchoReply(pkt: []const u8, len: u32) void {
@@ -167,7 +167,7 @@ pub fn sendTracerouteProbe() void {
 
     main.traceroute_start_ns = util.now();
     main.traceroute_state = .probe_sent;
-    _ = ifc.txSendLocal(&pkt);
+    _ = ifc.txSendLocal(&pkt, .dataplane);
 }
 
 const traceroute_id: u16 = 0x5A48;

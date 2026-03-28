@@ -1,7 +1,7 @@
 const router = @import("router");
 
-const arp = router.net.arp;
-const h = router.net.headers;
+const arp = router.protocols.arp;
+const h = router.hal.headers;
 const main = router.state;
 const util = router.util;
 
@@ -146,7 +146,7 @@ pub fn handleFromLan(pkt: []u8, len: u32) void {
 
     main.wan_iface.stats.tx_packets += 1;
     main.wan_iface.stats.tx_bytes += len;
-    _ = main.wan_iface.txSendLocal(pkt[0..len]);
+    _ = main.wan_iface.txSendLocal(pkt[0..len], .dataplane);
 }
 
 pub fn handleFromWan(pkt: []u8, len: u32) void {
@@ -197,7 +197,7 @@ pub fn handleFromWan(pkt: []u8, len: u32) void {
 
             main.lan_iface.stats.tx_packets += 1;
             main.lan_iface.stats.tx_bytes += len;
-            _ = main.lan_iface.txSendLocal(pkt[0..len]);
+            _ = main.lan_iface.txSendLocal(pkt[0..len], .dataplane);
 
             r.valid = false;
             return;
@@ -473,5 +473,5 @@ fn sendCachedResponse(
 
     main.lan_iface.stats.tx_packets += 1;
     main.lan_iface.stats.tx_bytes += frame_len;
-    _ = main.lan_iface.txSendLocal(buf[0..frame_len]);
+    _ = main.lan_iface.txSendLocal(buf[0..frame_len], .dataplane);
 }

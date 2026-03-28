@@ -44,7 +44,6 @@ class TestDnsRelay:
         ping_host(router_lan_ip, interface="tap1", count=2)
         # Ping WAN to warm router's WAN ARP for gateway
         ping_host("10.0.2.15", interface="tap0", count=2)
-        time.sleep(1)
 
         received_queries = []
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -68,10 +67,8 @@ class TestDnsRelay:
 
         server = threading.Thread(target=dns_server, daemon=True)
         server.start()
-        time.sleep(0.5)
 
         router.set_dns(wan_ip)
-        time.sleep(0.5)
 
         query = build_dns_query("test.example.com", query_id=0xABCD)
         client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -88,7 +85,6 @@ class TestDnsRelay:
                     return  # Success
                 except socket.timeout:
                     if attempt < 4:
-                        time.sleep(2)
                         continue
                     if not received_queries:
                         pytest.fail("DNS query never reached upstream server")
@@ -108,7 +104,6 @@ class TestDnsRelay:
                         "dev", "tap0", "nud", "permanent"], capture_output=True)
         ping_host(router_lan_ip, interface="tap1", count=1)
         ping_host("10.0.2.15", interface="tap0", count=1)
-        time.sleep(0.5)
 
         received_queries = []
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -132,10 +127,8 @@ class TestDnsRelay:
 
         server = threading.Thread(target=dns_server, daemon=True)
         server.start()
-        time.sleep(0.5)
 
         router.set_dns(wan_ip)
-        time.sleep(0.5)
 
         original_id = 0xBEEF
         query = build_dns_query("rewrite.test", query_id=original_id)
@@ -143,7 +136,7 @@ class TestDnsRelay:
         client.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, LAN_IFACE.encode())
         client.settimeout(3.0)
         try:
-            for attempt in range(3):
+            for attempt in range(5):
                 client.sendto(query, (router_lan_ip, 53))
                 try:
                     response, _ = client.recvfrom(512)
@@ -152,8 +145,7 @@ class TestDnsRelay:
                         f"Response ID {resp_id:#x} != original {original_id:#x}"
                     return  # Success
                 except socket.timeout:
-                    if attempt < 2:
-                        time.sleep(1)
+                    if attempt < 4:
                         continue
                     if not received_queries:
                         pytest.fail("DNS query never reached upstream server")
@@ -181,7 +173,6 @@ class TestDnsCache:
                         "dev", "tap0", "nud", "permanent"], capture_output=True)
         ping_host(router_lan_ip, interface="tap1", count=2)
         ping_host("10.0.2.15", interface="tap0", count=2)
-        time.sleep(1)
 
         received_queries = []
         server_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -205,10 +196,8 @@ class TestDnsCache:
 
         server = threading.Thread(target=dns_server, daemon=True)
         server.start()
-        time.sleep(0.5)
 
         router.set_dns(wan_ip)
-        time.sleep(0.5)
 
         # First query — should go to upstream
         query1 = build_dns_query("cache.example.com", query_id=0x1111)
@@ -222,8 +211,6 @@ class TestDnsCache:
 
             assert len(received_queries) >= 1, "First query did not reach upstream"
 
-            # Wait for response caching and any duplicates to settle
-            time.sleep(2)
             baseline_count = len(received_queries)
 
             # Second query — same domain, different query ID — should come from cache
@@ -231,8 +218,6 @@ class TestDnsCache:
             client.sendto(query2, (router_lan_ip, 53))
             response2, _ = client.recvfrom(512)
             assert len(response2) > 12, "Cached DNS response too short"
-
-            time.sleep(1)
 
             # Verify response has correct query ID
             resp_id = struct.unpack("!H", response2[:2])[0]

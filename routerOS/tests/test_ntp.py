@@ -43,7 +43,6 @@ class TestTimezone:
         # Force NTP sync attempt
         router.multi_command(f"ntpserver {wan_ip}", timeout=5)
         router.multi_command("sync", timeout=5)
-        time.sleep(3)
         lines = router.multi_command("time", timeout=5)
         output = " ".join(lines)
         # If NTP synced, timezone should be displayed; if not, "not synced" is valid

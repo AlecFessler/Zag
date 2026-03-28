@@ -1,7 +1,7 @@
 const lib = @import("lib");
 const router = @import("router");
 
-const h = router.net.headers;
+const h = router.hal.headers;
 const main = router.state;
 const util = router.util;
 
@@ -239,5 +239,5 @@ fn sendResponse(request: []const u8, client_mac: [6]u8, offer_ip: [4]u8, msg_typ
 
     const total_len = 14 + ip_total;
     const send_len = if (total_len < 60) @as(usize, 60) else @as(usize, @intCast(total_len));
-    _ = main.lan_iface.txSendLocal(pkt[0..send_len]);
+    _ = main.lan_iface.txSendLocal(pkt[0..send_len], .dataplane);
 }

@@ -119,7 +119,6 @@ class TestPCPProtocol:
     def test_pcp_map_response(self, router, router_lan_ip):
         """Send PCP MAP request and verify the mapping is created (response optional)."""
         ping_from_lan_ns("10.1.1.1", count=1)
-        time.sleep(1)
 
         wan_port = 18181
         req = build_pcp_map_request(
@@ -132,7 +131,6 @@ class TestPCPProtocol:
 
         # Send the PCP request (response may not arrive due to macvlan layer-2)
         resp_bytes = send_pcp_from_lan_ns(router_lan_ip, req)
-        time.sleep(1)
 
         # Verify the port forward was created even if response wasn't received
         rules = router.get_rules()
@@ -151,7 +149,6 @@ class TestPCPProtocol:
     def test_pcp_map_creates_forward(self, router, router_lan_ip):
         """PCP MAP should create a port forward visible in rules."""
         ping_from_lan_ns("10.1.1.1", count=1)
-        time.sleep(1)
 
         wan_port = 19876
 
@@ -164,7 +161,6 @@ class TestPCPProtocol:
         )
 
         send_pcp_from_lan_ns(router_lan_ip, req)
-        time.sleep(1)
 
         rules = router.get_rules()
         fwd_rules = [r for r in rules if str(wan_port) in r]
@@ -175,7 +171,6 @@ class TestPCPProtocol:
     def test_pcp_map_delete(self, router, router_lan_ip):
         """PCP MAP with lifetime=0 should delete a mapping."""
         ping_from_lan_ns("10.1.1.1", count=1)
-        time.sleep(1)
 
         wan_port = 19877
 
@@ -188,7 +183,6 @@ class TestPCPProtocol:
             lifetime=300,
         )
         send_pcp_from_lan_ns(router_lan_ip, req_create)
-        time.sleep(1)
 
         rules = router.get_rules()
         assert any(str(wan_port) in r for r in rules), \
@@ -203,7 +197,6 @@ class TestPCPProtocol:
             lifetime=0,
         )
         send_pcp_from_lan_ns(router_lan_ip, req_delete)
-        time.sleep(1)
 
         rules = router.get_rules()
         fwd_rules = [r for r in rules if str(wan_port) in r and "forward" in r.lower()]

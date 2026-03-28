@@ -1,6 +1,6 @@
 const router = @import("router");
 
-const h = router.net.headers;
+const h = router.hal.headers;
 const main = router.state;
 const util = router.util;
 
@@ -114,13 +114,51 @@ pub fn handleTcp(pkt: []u8, len: u32) bool {
 
 fn hasCompleteRequest() bool {
     if (request_len < 4) return false;
+    // Find \r\n\r\n (end of headers)
+    var header_end: usize = 0;
+    const found = while (header_end + 3 < request_len) : (header_end += 1) {
+        if (request_buf[header_end] == '\r' and request_buf[header_end + 1] == '\n' and
+            request_buf[header_end + 2] == '\r' and request_buf[header_end + 3] == '\n')
+            break true;
+    } else false;
+    if (!found) return false;
+
+    const body_start = header_end + 4;
+
+    // For non-POST requests, headers alone are sufficient
+    if (request_buf[0] != 'P' or request_buf[1] != 'O' or
+        request_buf[2] != 'S' or request_buf[3] != 'T')
+        return true;
+
+    // POST: need Content-Length header to know when body is complete
+    const content_length = parseContentLength(request_buf[0..header_end]) orelse return true;
+    return request_len >= body_start + content_length;
+}
+
+fn parseContentLength(headers: []const u8) ?usize {
+    const needle = "content-length:";
+    if (headers.len < needle.len) return null;
     var i: usize = 0;
-    while (i + 3 < request_len) : (i += 1) {
-        if (request_buf[i] == '\r' and request_buf[i + 1] == '\n' and
-            request_buf[i + 2] == '\r' and request_buf[i + 3] == '\n')
-            return true;
+    outer: while (i + needle.len <= headers.len) : (i += 1) {
+        for (needle, 0..) |nc, k| {
+            const hc = headers[i + k];
+            // Case-insensitive compare
+            const lc = if (hc >= 'A' and hc <= 'Z') hc + 32 else hc;
+            if (lc != nc) continue :outer;
+        }
+        // Found — skip whitespace, parse digits
+        var j = i + needle.len;
+        while (j < headers.len and headers[j] == ' ') : (j += 1) {}
+        var val: usize = 0;
+        var digits: usize = 0;
+        while (j < headers.len and headers[j] >= '0' and headers[j] <= '9') : (j += 1) {
+            val = val * 10 + @as(usize, headers[j] - '0');
+            digits += 1;
+        }
+        if (digits > 0) return val;
+        return null;
     }
-    return false;
+    return null;
 }
 
 /// Forward the complete HTTP request to the http_server process via IPC.

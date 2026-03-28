@@ -32,8 +32,6 @@ class TestArpLearning:
     def test_arp_shows_mac_format(self, router, router_wan_ip):
         """ARP entries should contain MAC addresses in xx:xx:xx:xx:xx:xx format."""
         ping_host(router_wan_ip, interface="tap0", count=1)
-        import time
-        time.sleep(1)
         entries = router.get_arp_table()
         mac_pattern = re.compile(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", re.IGNORECASE)
         # Filter to just data lines (not headers or empty markers)

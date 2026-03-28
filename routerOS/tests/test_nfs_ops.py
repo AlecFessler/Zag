@@ -31,7 +31,6 @@ def ensure_arp(router):
                     "52:54:00:12:34:56", "dev", "tap0", "nud", "permanent"],
                    capture_output=True)
     router.ping("10.0.2.1")
-    time.sleep(1)
     router._drain()
 
 
@@ -49,8 +48,11 @@ class TestNfsMkdir:
         ensure_arp(router)
 
         lines = router.multi_command(f"mkdir {test_dir}", timeout=10)
-        time.sleep(2)
 
+        for _ in range(40):
+            if os.path.isdir(host_path):
+                break
+            time.sleep(0.05)
         assert os.path.isdir(host_path), \
             f"NFS mkdir failed. Response: {lines}, export: {os.listdir(NFS_EXPORT)}"
         os.rmdir(host_path)
@@ -73,8 +75,11 @@ class TestNfsRm:
         ensure_arp(router)
 
         lines = router.multi_command(f"rm {test_file}", timeout=10)
-        time.sleep(2)
 
+        for _ in range(40):
+            if not os.path.exists(host_path):
+                break
+            time.sleep(0.05)
         still_exists = os.path.exists(host_path)
         if still_exists:
             os.remove(host_path)
@@ -116,8 +121,11 @@ class TestNfsRmdir:
         ensure_arp(router)
 
         lines = router.multi_command(f"rmdir {test_dir}", timeout=10)
-        time.sleep(2)
 
+        for _ in range(40):
+            if not os.path.exists(host_path):
+                break
+            time.sleep(0.05)
         still_exists = os.path.exists(host_path)
         if still_exists:
             os.rmdir(host_path)
@@ -148,8 +156,11 @@ class TestNfsRename:
         ensure_arp(router)
 
         lines = router.multi_command(f"mv {src_name} {dst_name}", timeout=10)
-        time.sleep(2)
 
+        for _ in range(40):
+            if os.path.exists(dst_path):
+                break
+            time.sleep(0.05)
         src_gone = not os.path.exists(src_path)
         dst_exists = os.path.exists(dst_path)
 
@@ -189,8 +200,11 @@ class TestNfsTouch:
         ensure_arp(router)
 
         lines = router.multi_command(f"touch {test_file}", timeout=10)
-        time.sleep(2)
 
+        for _ in range(40):
+            if os.path.exists(host_path):
+                break
+            time.sleep(0.05)
         exists = os.path.exists(host_path)
         size = os.path.getsize(host_path) if exists else -1
 

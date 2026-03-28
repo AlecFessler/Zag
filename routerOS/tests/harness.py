@@ -78,8 +78,12 @@ class QemuRouter:
         self.child.expect(re.escape(BOOT_BANNER), timeout=self.boot_timeout)
         # Wait for first prompt - use a pattern that matches "> " at line start
         self._wait_prompt(timeout=15)
-        # Give services time to connect (NFS, NTP debug messages arrive late)
-        time.sleep(3)
+        # Wait for console channel to connect (last service to init)
+        try:
+            self.child.expect("console channel connected", timeout=10)
+            self._wait_prompt(timeout=5)
+        except pexpect.TIMEOUT:
+            pass
         # Drain any pending debug output
         self._drain()
 
@@ -112,6 +116,12 @@ class QemuRouter:
         # Wait for prompt after response
         self._wait_prompt(timeout=timeout)
         raw = self.child.before or ""
+        # Stale prompt detection: if our command echo isn't in the output,
+        # we matched a prompt from late-arriving async debug output.
+        # Wait for the real prompt (one retry to avoid long hangs on crash).
+        if cmd.strip() not in raw:
+            self._wait_prompt(timeout=timeout)
+            raw = self.child.before or ""
         # Parse: echoed command, then response lines, then prompt
         lines = raw.splitlines()
         response_lines = []
@@ -140,10 +150,10 @@ class QemuRouter:
 
         lines: list[str] = []
         deadline = time.time() + timeout
+        found_echo = False
 
         # Read all output until we see '---' line and then the prompt
         try:
-            # Wait for the --- terminator followed eventually by prompt
             while time.time() < deadline:
                 remaining = max(0.1, deadline - time.time())
                 idx = self.child.expect(
@@ -153,13 +163,20 @@ class QemuRouter:
                 before = self.child.before or ""
                 for line in before.splitlines():
                     stripped = line.strip()
-                    if stripped and not is_debug_line(stripped) and stripped != cmd.strip():
-                        lines.append(stripped)
+                    if not stripped or is_debug_line(stripped):
+                        continue
+                    if not found_echo and cmd.strip() in stripped:
+                        found_echo = True
+                        continue
+                    lines.append(stripped)
                 if idx == 0:
                     # Got terminator - now wait for prompt
                     self._wait_prompt(timeout=3)
                     break
                 elif idx == 1:
+                    if not found_echo:
+                        # Stale prompt — haven't seen our echo yet, keep going
+                        continue
                     # Got prompt directly (single-response or empty)
                     break
                 else:
@@ -253,12 +270,23 @@ class QemuRouter:
         # Match "> " that appears after a newline or at start of line
         self.child.expect(r"(?:^|\n)> ", timeout=timeout)
 
+    def _resync(self) -> None:
+        """Recover from serial console desync by finding a fresh prompt."""
+        assert self.child is not None
+        self._drain()
+        self.child.sendline("")
+        try:
+            self._wait_prompt(timeout=3)
+        except pexpect.TIMEOUT:
+            time.sleep(0.5)
+            self._drain()
+
     def _drain(self) -> None:
         """Drain any pending output (debug messages arriving late)."""
         assert self.child is not None
         while True:
             try:
-                self.child.expect(r".+", timeout=0.2)
+                self.child.expect(r".+", timeout=0.3)
             except pexpect.TIMEOUT:
                 break
 

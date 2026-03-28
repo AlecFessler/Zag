@@ -1,6 +1,6 @@
 const router = @import("router");
 
-const h = router.net.headers;
+const h = router.hal.headers;
 const main = router.state;
 const util = router.util;
 
@@ -112,5 +112,5 @@ pub fn sendError(iface: Interface, orig_pkt: []const u8, orig_len: u32, icmp_typ
     const cs = util.computeIcmpv6Checksum(src_ip6, dst_ip6, error_buf[54..total_len]);
     icmpv6.setChecksum(cs);
 
-    _ = ifc.txSendLocal(error_buf[0..total_len]);
+    _ = ifc.txSendLocal(error_buf[0..total_len], .dataplane);
 }

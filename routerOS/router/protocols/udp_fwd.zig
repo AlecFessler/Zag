@@ -1,8 +1,8 @@
 const lib = @import("lib");
 const router = @import("router");
 
-const arp = router.net.arp;
-const h = router.net.headers;
+const arp = router.protocols.arp;
+const h = router.hal.headers;
 const main = router.state;
 const util = router.util;
 
@@ -101,7 +101,7 @@ fn handleUdpSend(data: []const u8) void {
 
     @memcpy(frame[42..][0..payload.len], payload);
 
-    _ = main.wan_iface.txSendLocal(frame[0..frame_len]);
+    _ = main.wan_iface.txSendLocal(frame[0..frame_len], .service);
 }
 
 fn queuePending(dst_ip: [4]u8, data: []const u8) void {

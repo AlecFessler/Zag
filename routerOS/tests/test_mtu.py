@@ -43,7 +43,6 @@ class TestTcpMssClamping:
 
         server = threading.Thread(target=tcp_server, daemon=True)
         server.start()
-        time.sleep(0.5)
 
         result = run_in_lan_ns(
             ["python3", "-c",

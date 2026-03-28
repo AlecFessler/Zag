@@ -39,7 +39,6 @@ class TestIcmpNat:
         assert ping_from_lan_ns(wan_ip), \
             "LAN could not ping WAN gateway through the router"
 
-        time.sleep(0.5)
         entries = router.get_nat_table()
         icmp_entries = [e for e in entries if "icmp" in e.lower()]
         assert len(icmp_entries) > 0, f"No ICMP NAT entry after ping: {entries}"
@@ -74,11 +73,9 @@ class TestTcpNat:
         # Warm ARP: namespace pings router to ensure .60 MAC is known
         from conftest import ping_from_lan_ns
         ping_from_lan_ns("10.1.1.1", count=1)
-        time.sleep(1)
 
         server = threading.Thread(target=tcp_server, daemon=True)
         server.start()
-        time.sleep(1)
 
         # Connect from LAN namespace — traffic goes through router NAT
         result = run_in_lan_ns(
@@ -136,7 +133,6 @@ class TestUdpNat:
 
         server = threading.Thread(target=udp_server, daemon=True)
         server.start()
-        time.sleep(0.5)
 
         # Send UDP from LAN namespace
         run_in_lan_ns(

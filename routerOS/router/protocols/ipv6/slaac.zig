@@ -1,6 +1,6 @@
 const router = @import("router");
 
-const h = router.net.headers;
+const h = router.hal.headers;
 const main = router.state;
 const util = router.util;
 
@@ -110,7 +110,7 @@ pub fn sendRA(dst_mac: ?[6]u8, dst_ip6: ?[16]u8) void {
     pkt[56] = @truncate(cs >> 8);
     pkt[57] = @truncate(cs);
 
-    _ = ifc.txSendLocal(pkt[0..pos]);
+    _ = ifc.txSendLocal(pkt[0..pos], .dataplane);
 }
 
 /// Periodic tick — send unsolicited RAs on LAN.

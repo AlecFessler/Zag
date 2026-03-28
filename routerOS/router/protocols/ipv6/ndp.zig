@@ -1,6 +1,6 @@
 const router = @import("router");
 
-const h = router.net.headers;
+const h = router.hal.headers;
 const main = router.state;
 const util = router.util;
 
@@ -119,7 +119,7 @@ pub fn sendNeighborSolicitation(iface: Interface, target_ip6: [16]u8) void {
     const cs = util.computeIcmpv6Checksum(ifc.ip6_link_local, snm, pkt[54..86]);
     icmpv6.setChecksum(cs);
 
-    _ = ifc.txSendLocal(&pkt);
+    _ = ifc.txSendLocal(&pkt, .dataplane);
 }
 
 /// Handle an incoming NDP packet. Returns a reply packet if applicable.
@@ -173,7 +173,7 @@ pub fn handle(iface: Interface, pkt: []u8, len: u32) ?[]const u8 {
 var na_buf: [86]u8 = undefined;
 
 fn buildNA(
-    ifc: *const @import("router").net.iface.Iface,
+    ifc: *const @import("router").hal.iface.Iface,
     dst_ip6: [16]u8,
     dst_mac: [6]u8,
     target: [16]u8,

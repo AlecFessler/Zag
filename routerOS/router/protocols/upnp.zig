@@ -1,6 +1,6 @@
 const router = @import("router");
 
-const h = router.net.headers;
+const h = router.hal.headers;
 const main = router.state;
 const util = router.util;
 
@@ -103,7 +103,7 @@ fn sendUdpResponse(dst_ip: [4]u8, dst_mac: [6]u8, dst_port: u16, payload: []cons
     // Payload
     @memcpy(frame[42..][0..payload.len], payload);
 
-    _ = main.lan_iface.txSendLocal(frame[0..frame_len]);
+    _ = main.lan_iface.txSendLocal(frame[0..frame_len], .dataplane);
 }
 
 fn startsWith(haystack: []const u8, prefix: []const u8) bool {

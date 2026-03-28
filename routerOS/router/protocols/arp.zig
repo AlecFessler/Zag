@@ -1,6 +1,6 @@
 const router = @import("router");
 
-const h = router.net.headers;
+const h = router.hal.headers;
 const main = router.state;
 const util = router.util;
 
@@ -90,7 +90,7 @@ pub fn sendRequest(iface: Interface, target_ip: [4]u8) void {
     @memcpy(&arp_hdr.sender_ip, &ifc.ip);
     @memset(&arp_hdr.target_mac, 0);
     @memcpy(&arp_hdr.target_ip, &target_ip);
-    _ = ifc.txSendLocal(&pkt);
+    _ = ifc.txSendLocal(&pkt, .dataplane);
 }
 
 pub fn handle(iface: Interface, pkt: []u8, len: u32) ?[]u8 {

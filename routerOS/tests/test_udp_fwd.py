@@ -47,12 +47,9 @@ class TestUdpForwarding:
         client.settimeout(2.0)
         try:
             client.sendto(b"test-unbound-port", (router_wan_ip, 12345))
-            time.sleep(0.5)
         finally:
             client.close()
 
-        # Use multi_command for version check — more tolerant of noise
-        time.sleep(1)
         lines = router.multi_command("version", timeout=10)
         # version is a single-response command, may come back via multi path
         resp = router.command("uptime")
