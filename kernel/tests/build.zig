@@ -15,7 +15,7 @@ fn buildChild(
     });
     child_app_mod.addImport("lib", lib_mod);
     const child_start_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "../../libz/start.zig" },
+        .root_source_file = .{ .cwd_relative = "libz/start.zig" },
         .target = target,
         .optimize = .Debug,
         .pic = true,
@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
         .os_tag = .freestanding,
     });
     const lib_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "../../libz/lib.zig" },
+        .root_source_file = .{ .cwd_relative = "libz/lib.zig" },
         .target = target,
         .optimize = .Debug,
         .pic = true,
@@ -94,7 +94,7 @@ pub fn build(b: *std.Build) void {
     app_mod.addImport("embedded_children", embedded_children_mod);
 
     const start_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "../../libz/start.zig" },
+        .root_source_file = .{ .cwd_relative = "libz/start.zig" },
         .target = target,
         .optimize = .Debug,
         .pic = true,
