@@ -38,58 +38,79 @@ var tz_offset_minutes: i16 = -360; // CST (UTC-6) default
 
 // ── Entry point ─────────────────────────────────────────────────────
 
-pub fn main(perm_view_addr: u64) void {
-    const cmd = shm_protocol.mapCommandChannel(perm_view_addr) orelse {
-        syscall.write("ntp_client: no command channel\n");
-        return;
-    };
+// Track mapped SHM handles so we can find unmapped data SHMs.
+var mapped_handles: [16]u64 = .{0} ** 16;
+var num_mapped: u32 = 0;
 
-    const router_entry = cmd.requestConnection(shm_protocol.ServiceId.ROUTER) orelse {
-        syscall.write("ntp_client: no router connection allowed\n");
-        return;
-    };
-    if (!cmd.waitForConnection(router_entry)) {
-        syscall.write("ntp_client: router connection failed\n");
-        return;
+fn isHandleMapped(handle: u64) bool {
+    for (mapped_handles[0..num_mapped]) |h| {
+        if (h == handle) return true;
     }
-    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
-    var data_shm_handle: u64 = 0;
-    var data_shm_size: u64 = 0;
-    for (view) |*e| {
-        if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and
-            e.field0 > shm_protocol.COMMAND_SHM_SIZE and
-            e.handle != router_entry.shm_handle)
-        {
-            data_shm_handle = e.handle;
-            data_shm_size = e.field0;
-            break;
+    return false;
+}
+
+fn recordMapped(handle: u64) void {
+    if (num_mapped < mapped_handles.len) {
+        mapped_handles[num_mapped] = handle;
+        num_mapped += 1;
+    }
+}
+
+pub fn main(perm_view_addr: u64) void {
+    const cmd = shm_protocol.mapCommandChannel(perm_view_addr) orelse return;
+
+    // Record the command channel SHM as mapped so we skip it later.
+    {
+        const view_init: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
+        for (view_init) |*entry| {
+            if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) {
+                recordMapped(entry.handle);
+                break;
+            }
         }
     }
-    if (data_shm_handle == 0) {
-        data_shm_handle = router_entry.shm_handle;
-        data_shm_size = router_entry.shm_size;
-    }
 
-    const vm_rights = (perms.VmReservationRights{
-        .read = true,
-        .write = true,
-        .shareable = true,
-    }).bits();
-    const vm_result = syscall.vm_reserve(0, data_shm_size, vm_rights);
-    if (vm_result.val < 0) {
-        syscall.write("ntp_client: vm_reserve failed\n");
-        return;
+    // Wait for router connection — on restart, already connected.
+    var router_entry: *shm_protocol.ConnectionEntry = undefined;
+    while (true) {
+        router_entry = cmd.requestConnection(shm_protocol.ServiceId.ROUTER) orelse {
+            syscall.thread_yield();
+            continue;
+        };
+        break;
     }
-    if (syscall.shm_map(data_shm_handle, @intCast(vm_result.val), 0) != 0) {
-        syscall.write("ntp_client: shm_map failed\n");
-        return;
+    _ = cmd.waitForConnection(router_entry);
+
+    // Wait for the next unmapped data SHM to appear (the router data channel).
+    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
+    while (true) {
+        for (view) |*entry| {
+            if (entry.entry_type != pv.ENTRY_TYPE_SHARED_MEMORY) continue;
+            if (entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) continue;
+            if (isHandleMapped(entry.handle)) continue;
+
+            const vm_rights = (perms.VmReservationRights{
+                .read = true,
+                .write = true,
+                .shareable = true,
+            }).bits();
+            const vm_result = syscall.vm_reserve(0, entry.field0, vm_rights);
+            if (vm_result.val >= 0) {
+                if (syscall.shm_map(entry.handle, @intCast(vm_result.val), 0) == 0) {
+                    recordMapped(entry.handle);
+                    const header: *channel_mod.ChannelHeader = @ptrFromInt(vm_result.val2);
+                    router_chan = channel_mod.Channel.openAsSideB(header) orelse {
+                        syscall.thread_yield();
+                        continue;
+                    };
+                    has_router = true;
+                    break;
+                }
+            }
+        }
+        if (has_router) break;
+        syscall.thread_yield();
     }
-    const header: *channel_mod.ChannelHeader = @ptrFromInt(vm_result.val2);
-    router_chan = channel_mod.Channel.openAsSideB(header) orelse {
-        syscall.write("ntp_client: channel open failed\n");
-        return;
-    };
-    has_router = true;
 
     _ = router_chan.send(&[_]u8{@truncate(shm_protocol.ServiceId.NTP_CLIENT)});
 
@@ -124,29 +145,25 @@ pub fn main(perm_view_addr: u64) void {
 // ── Console channel detection ───────────────────────────────────────
 
 fn detectConsoleChannel(view: *const [MAX_PERMS]pv.UserViewEntry) void {
-    var skip: u32 = 0;
     for (view) |*e| {
-        if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and
-            e.field0 > shm_protocol.COMMAND_SHM_SIZE)
-        {
-            if (skip == 0) {
-                skip += 1;
-                continue;
+        if (e.entry_type != pv.ENTRY_TYPE_SHARED_MEMORY) continue;
+        if (e.field0 <= shm_protocol.COMMAND_SHM_SIZE) continue;
+        if (isHandleMapped(e.handle)) continue;
+
+        const vm_rights = (perms.VmReservationRights{
+            .read = true,
+            .write = true,
+            .shareable = true,
+        }).bits();
+        const vm = syscall.vm_reserve(0, e.field0, vm_rights);
+        if (vm.val >= 0) {
+            if (syscall.shm_map(e.handle, @intCast(vm.val), 0) == 0) {
+                recordMapped(e.handle);
+                const hdr: *channel_mod.ChannelHeader = @ptrFromInt(vm.val2);
+                console_chan = channel_mod.Channel.openAsSideA(hdr) orelse return;
             }
-            const vm_rights = (perms.VmReservationRights{
-                .read = true,
-                .write = true,
-                .shareable = true,
-            }).bits();
-            const vm = syscall.vm_reserve(0, e.field0, vm_rights);
-            if (vm.val >= 0) {
-                if (syscall.shm_map(e.handle, @intCast(vm.val), 0) == 0) {
-                    const hdr: *channel_mod.ChannelHeader = @ptrFromInt(vm.val2);
-                    console_chan = channel_mod.Channel.openAsSideA(hdr) orelse return;
-                }
-            }
-            break;
         }
+        break;
     }
 }
 

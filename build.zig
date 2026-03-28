@@ -200,7 +200,10 @@ pub fn build(b: *std.Build) void {
         \\-device vfio-pci,host=05:00.0,bus=br1,addr=1.0 \
         \\-device vfio-pci,host=05:00.1,bus=br1,addr=2.0
     else if (std.mem.eql(u8, net_type, "user"))
-        \\
+        \\-netdev user,id=net0 \
+        \\-device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
+        \\-netdev user,id=net1 \
+        \\-device e1000e,netdev=net1,mac=52:54:00:12:34:57
     else
         \\-net none
     ;

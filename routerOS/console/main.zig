@@ -25,48 +25,6 @@ fn serialWriteByte(byte: u8) void {
     _ = serial_chan.send(&buf);
 }
 
-fn mapDataChannel(perm_view_addr: u64, cmd_shm_size: u64) ?*channel_mod.ChannelHeader {
-    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
-    var best_handle: u64 = 0;
-    var best_size: u64 = 0;
-    for (view) |*e| {
-        if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and e.field0 > cmd_shm_size and e.handle != best_handle) {
-            if (best_handle == 0 or e.handle > best_handle) {
-                best_handle = e.handle;
-                best_size = e.field0;
-            }
-        }
-    }
-    if (best_handle == 0) return null;
-
-    const vm_rights = (perms.VmReservationRights{
-        .read = true,
-        .write = true,
-        .shareable = true,
-    }).bits();
-    const vm_result = syscall.vm_reserve(0, best_size, vm_rights);
-    if (vm_result.val < 0) return null;
-
-    const map_rc = syscall.shm_map(best_handle, @intCast(vm_result.val), 0);
-    if (map_rc != 0) return null;
-
-    return @ptrFromInt(vm_result.val2);
-}
-
-fn waitForDataShm(perm_view_addr: u64, min_count: u32) void {
-    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
-    while (true) {
-        var count: u32 = 0;
-        for (view) |*e| {
-            if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and e.field0 > shm_protocol.COMMAND_SHM_SIZE) {
-                count += 1;
-            }
-        }
-        if (count >= min_count) return;
-        syscall.thread_yield();
-    }
-}
-
 fn eql(a: []const u8, b: []const u8) bool {
     if (a.len != b.len) return false;
     for (a, b) |x, y| {
@@ -691,126 +649,110 @@ fn printDecSerial(val: u64) void {
     serialWrite(buf[i..20]);
 }
 
+var mapped_handles: [16]u64 = .{0} ** 16;
+var num_mapped: u32 = 0;
+
+fn isHandleMapped(handle: u64) bool {
+    for (mapped_handles[0..num_mapped]) |h| {
+        if (h == handle) return true;
+    }
+    return false;
+}
+
+fn recordMapped(handle: u64) void {
+    if (num_mapped < mapped_handles.len) {
+        mapped_handles[num_mapped] = handle;
+        num_mapped += 1;
+    }
+}
+
+fn mapNextDataShm(perm_view_addr: u64) ?*channel_mod.ChannelHeader {
+    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
+    for (view) |*entry| {
+        if (entry.entry_type != pv.ENTRY_TYPE_SHARED_MEMORY) continue;
+        if (entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) continue;
+        if (isHandleMapped(entry.handle)) continue;
+        const vm_rights = (perms.VmReservationRights{
+            .read = true,
+            .write = true,
+            .shareable = true,
+        }).bits();
+        const vm = syscall.vm_reserve(0, entry.field0, vm_rights);
+        if (vm.val < 0) continue;
+        if (syscall.shm_map(entry.handle, @intCast(vm.val), 0) != 0) continue;
+        recordMapped(entry.handle);
+        return @ptrFromInt(vm.val2);
+    }
+    return null;
+}
+
+fn waitAndMapNextShm(perm_view_addr: u64) *channel_mod.ChannelHeader {
+    while (true) {
+        if (mapNextDataShm(perm_view_addr)) |header| return header;
+        syscall.thread_yield();
+    }
+}
+
 pub fn main(perm_view_addr: u64) void {
-    const cmd = shm_protocol.mapCommandChannel(perm_view_addr) orelse {
-        syscall.write("console: no command channel\n");
-        return;
-    };
+    const cmd = shm_protocol.mapCommandChannel(perm_view_addr) orelse return;
 
-    const serial_entry = cmd.requestConnection(shm_protocol.ServiceId.SERIAL) orelse {
-        syscall.write("console: serial not allowed\n");
-        return;
-    };
-    if (!cmd.waitForConnection(serial_entry)) return;
+    // Record command SHM handle so we skip it
+    {
+        const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
+        for (view) |*entry| {
+            if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) {
+                recordMapped(entry.handle);
+                break;
+            }
+        }
+    }
 
+    // Serial is required — wait for it.
+    var serial_entry: *shm_protocol.ConnectionEntry = undefined;
+    while (true) {
+        serial_entry = cmd.requestConnection(shm_protocol.ServiceId.SERIAL) orelse {
+            syscall.thread_yield();
+            continue;
+        };
+        break;
+    }
+    _ = cmd.waitForConnection(serial_entry);
+    // Map the next data SHM that appears — it's the serial channel
+    const serial_header = waitAndMapNextShm(perm_view_addr);
+    serial_chan = channel_mod.Channel.openAsSideA(serial_header) orelse return;
+
+    // Optional connections — request, wait, then map each as it appears
     const router_entry = cmd.requestConnection(shm_protocol.ServiceId.ROUTER);
     const nfs_entry = cmd.requestConnection(shm_protocol.ServiceId.NFS_CLIENT);
     const ntp_entry = cmd.requestConnection(shm_protocol.ServiceId.NTP_CLIENT);
 
-    var expected_shm: u32 = 1;
-    if (router_entry != null) expected_shm += 1;
-    if (nfs_entry != null) expected_shm += 1;
-    if (ntp_entry != null) expected_shm += 1;
-
     if (router_entry) |re| {
-        if (!cmd.waitForConnection(re)) {
-            syscall.write("console: router connection failed\n");
+        _ = cmd.waitForConnection(re);
+        const header = waitAndMapNextShm(perm_view_addr);
+        if (channel_mod.Channel.openAsSideB(header)) |ch| {
+            router_chan = ch;
+            has_router = true;
+            _ = router_chan.send(&[_]u8{@truncate(shm_protocol.ServiceId.CONSOLE)});
         }
     }
 
     if (nfs_entry) |ne| {
-        if (!cmd.waitForConnection(ne)) {
-            syscall.write("console: NFS client connection failed\n");
+        _ = cmd.waitForConnection(ne);
+        const header = waitAndMapNextShm(perm_view_addr);
+        if (channel_mod.Channel.openAsSideB(header)) |ch| {
+            nfs_chan = ch;
+            has_nfs = true;
         }
     }
 
     if (ntp_entry) |nte| {
-        if (!cmd.waitForConnection(nte)) {
-            syscall.write("console: NTP client connection failed\n");
+        _ = cmd.waitForConnection(nte);
+        const header = waitAndMapNextShm(perm_view_addr);
+        if (channel_mod.Channel.openAsSideB(header)) |ch| {
+            ntp_chan = ch;
+            has_ntp = true;
         }
     }
-
-    waitForDataShm(perm_view_addr, expected_shm);
-
-    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
-    var shm_handles: [8]u64 = .{0} ** 8;
-    var shm_sizes: [8]u64 = .{0} ** 8;
-    var shm_count: u32 = 0;
-    for (view) |*e| {
-        if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and e.field0 > shm_protocol.COMMAND_SHM_SIZE and shm_count < 8) {
-            shm_handles[shm_count] = e.handle;
-            shm_sizes[shm_count] = e.field0;
-            shm_count += 1;
-        }
-    }
-
-    if (shm_count == 0) {
-        syscall.write("console: no data SHMs found\n");
-        return;
-    }
-
-    const serial_vm_rights = (perms.VmReservationRights{
-        .read = true,
-        .write = true,
-        .shareable = true,
-    }).bits();
-    const serial_vm = syscall.vm_reserve(0, shm_sizes[0], serial_vm_rights);
-    if (serial_vm.val < 0) return;
-    if (syscall.shm_map(shm_handles[0], @intCast(serial_vm.val), 0) != 0) return;
-
-    const serial_header: *channel_mod.ChannelHeader = @ptrFromInt(serial_vm.val2);
-    serial_chan = channel_mod.Channel.openAsSideA(serial_header) orelse {
-        syscall.write("console: serial channel open failed\n");
-        return;
-    };
-
-    if (shm_count >= 2) {
-        const router_vm = syscall.vm_reserve(0, shm_sizes[1], serial_vm_rights);
-        if (router_vm.val >= 0) {
-            if (syscall.shm_map(shm_handles[1], @intCast(router_vm.val), 0) == 0) {
-                const router_header: *channel_mod.ChannelHeader = @ptrFromInt(router_vm.val2);
-                router_chan = channel_mod.Channel.openAsSideB(router_header) orelse {
-                    syscall.write("console: router channel open failed\n");
-                    has_router = false;
-                    return;
-                };
-                has_router = true;
-                // Identify ourselves to the router
-                _ = router_chan.send(&[_]u8{@truncate(shm_protocol.ServiceId.CONSOLE)});
-            }
-        }
-    }
-
-    if (shm_count >= 3) {
-        const nfs_vm = syscall.vm_reserve(0, shm_sizes[2], serial_vm_rights);
-        if (nfs_vm.val >= 0) {
-            if (syscall.shm_map(shm_handles[2], @intCast(nfs_vm.val), 0) == 0) {
-                const nfs_header: *channel_mod.ChannelHeader = @ptrFromInt(nfs_vm.val2);
-                nfs_chan = channel_mod.Channel.openAsSideB(nfs_header) orelse {
-                    syscall.write("console: NFS channel open failed\n");
-                    has_nfs = false;
-                    return;
-                };
-                has_nfs = true;
-            }
-        }
-    }
-
-    if (shm_count >= 4) {
-        const ntp_vm = syscall.vm_reserve(0, shm_sizes[3], serial_vm_rights);
-        if (ntp_vm.val >= 0) {
-            if (syscall.shm_map(shm_handles[3], @intCast(ntp_vm.val), 0) == 0) {
-                const ntp_header: *channel_mod.ChannelHeader = @ptrFromInt(ntp_vm.val2);
-                ntp_chan = channel_mod.Channel.openAsSideB(ntp_header) orelse {
-                    syscall.write("console: NTP channel open failed\n");
-                    has_ntp = false;
-                    return;
-                };
-                has_ntp = true;
-            }
-        }
-    }
-
     serialWrite("\x1b[2J\x1b[H");
     serialWrite("=== Zag RouterOS Console ===\r\n");
     serialWrite("Type 'help' for available commands.\r\n");

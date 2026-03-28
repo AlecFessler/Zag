@@ -369,7 +369,7 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms: u64) i64 {
         .rights = @truncate(perms),
     };
     const handle_id = proc.insertPerm(child_entry) catch {
-        child.kill(.none);
+        child.kill(.revoked);
         return E_MAXCAP;
     };
 

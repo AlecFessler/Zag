@@ -188,7 +188,7 @@ pub const Process = struct {
         while (i < self.num_children) : (i += 1) {
             self.children[i].killSubtree();
         }
-        self.kill(.none);
+        self.kill(.killed);
     }
 
     pub fn disableRestart(self: *Process) void {
@@ -210,6 +210,9 @@ pub const Process = struct {
         if (!self.alive) {
             self.lock.unlock();
             return;
+        }
+        if (self.crash_reason == .none) {
+            self.crash_reason = .normal_exit;
         }
         const should_restart = self.restart_context != null;
         if (!should_restart) {

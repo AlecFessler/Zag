@@ -19,6 +19,9 @@ pub const CrashReason = enum(u5) {
     illegal_instruction = 9,
     alignment_fault = 10,
     protection_fault = 11,
+    normal_exit = 12,
+    killed = 13,
+    revoked = 14,
     _,
 };
 

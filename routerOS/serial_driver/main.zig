@@ -53,10 +53,7 @@ fn rxByte() u8 {
 }
 
 pub fn main(perm_view_addr: u64) void {
-    const cmd = shm_protocol.mapCommandChannel(perm_view_addr) orelse {
-        syscall.write("serial_driver: no command channel\n");
-        return;
-    };
+    _ = shm_protocol.mapCommandChannel(perm_view_addr) orelse return;
 
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
     while (device_handle == 0) {
@@ -73,7 +70,6 @@ pub fn main(perm_view_addr: u64) void {
 
     initUart();
 
-    _ = cmd;
     var data_shm_handle: u64 = 0;
     var data_shm_size: u64 = 0;
     while (data_shm_handle == 0) {
@@ -92,23 +88,21 @@ pub fn main(perm_view_addr: u64) void {
         .write = true,
         .shareable = true,
     }).bits();
-    const vm_result = syscall.vm_reserve(0, data_shm_size, vm_rights);
-    if (vm_result.val < 0) {
-        syscall.write("serial_driver: vm_reserve failed\n");
-        return;
+    var chan: channel_mod.Channel = undefined;
+    while (true) {
+        const vm_result = syscall.vm_reserve(0, data_shm_size, vm_rights);
+        if (vm_result.val >= 0) {
+            if (syscall.shm_map(data_shm_handle, @intCast(vm_result.val), 0) == 0) {
+                const chan_header: *channel_mod.ChannelHeader = @ptrFromInt(vm_result.val2);
+                chan = channel_mod.Channel.openAsSideB(chan_header) orelse {
+                    syscall.thread_yield();
+                    continue;
+                };
+                break;
+            }
+        }
+        syscall.thread_yield();
     }
-
-    const map_rc = syscall.shm_map(data_shm_handle, @intCast(vm_result.val), 0);
-    if (map_rc != 0) {
-        syscall.write("serial_driver: shm_map failed\n");
-        return;
-    }
-
-    const chan_header: *channel_mod.ChannelHeader = @ptrFromInt(vm_result.val2);
-    var chan = channel_mod.Channel.openAsSideB(chan_header) orelse {
-        syscall.write("serial_driver: channel open failed\n");
-        return;
-    };
 
     var tx_buf: [256]u8 = undefined;
     while (true) {

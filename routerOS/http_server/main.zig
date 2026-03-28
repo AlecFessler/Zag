@@ -45,63 +45,80 @@ var has_router: bool = false;
 
 // ── Entry point ─────────────────────────────────────────────────────
 
-pub fn main(perm_view_addr: u64) void {
-    const cmd = shm_protocol.mapCommandChannel(perm_view_addr) orelse {
-        syscall.write("http_server: no command channel\n");
-        return;
-    };
+// Track mapped SHM handles so we can find unmapped data SHMs.
+var mapped_handles: [16]u64 = .{0} ** 16;
+var num_mapped: u32 = 0;
 
-    const router_entry = cmd.requestConnection(shm_protocol.ServiceId.ROUTER) orelse {
-        syscall.write("http_server: no router connection allowed\n");
-        return;
-    };
-    if (!cmd.waitForConnection(router_entry)) {
-        syscall.write("http_server: router connection failed\n");
-        return;
+fn isHandleMapped(handle: u64) bool {
+    for (mapped_handles[0..num_mapped]) |h| {
+        if (h == handle) return true;
     }
-    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
-    var data_shm_handle: u64 = 0;
-    var data_shm_size: u64 = 0;
-    for (view) |*e| {
-        if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and
-            e.field0 > shm_protocol.COMMAND_SHM_SIZE and
-            e.handle != router_entry.shm_handle)
-        {
-            data_shm_handle = e.handle;
-            data_shm_size = e.field0;
-            break;
+    return false;
+}
+
+fn recordMapped(handle: u64) void {
+    if (num_mapped < mapped_handles.len) {
+        mapped_handles[num_mapped] = handle;
+        num_mapped += 1;
+    }
+}
+
+pub fn main(perm_view_addr: u64) void {
+    const cmd = shm_protocol.mapCommandChannel(perm_view_addr) orelse return;
+
+    // Record the command channel SHM as mapped so we skip it later.
+    {
+        const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
+        for (view) |*entry| {
+            if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) {
+                recordMapped(entry.handle);
+                break;
+            }
         }
     }
-    if (data_shm_handle == 0) {
-        data_shm_handle = router_entry.shm_handle;
-        data_shm_size = router_entry.shm_size;
+
+    var router_entry: *shm_protocol.ConnectionEntry = undefined;
+    while (true) {
+        router_entry = cmd.requestConnection(shm_protocol.ServiceId.ROUTER) orelse {
+            syscall.thread_yield();
+            continue;
+        };
+        break;
+    }
+    _ = cmd.waitForConnection(router_entry);
+
+    // Wait for the next unmapped data SHM to appear (the router data channel).
+    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
+    while (true) {
+        for (view) |*entry| {
+            if (entry.entry_type != pv.ENTRY_TYPE_SHARED_MEMORY) continue;
+            if (entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) continue;
+            if (isHandleMapped(entry.handle)) continue;
+
+            const vm_rights = (perms.VmReservationRights{
+                .read = true,
+                .write = true,
+                .shareable = true,
+            }).bits();
+            const vm_result = syscall.vm_reserve(0, entry.field0, vm_rights);
+            if (vm_result.val >= 0) {
+                if (syscall.shm_map(entry.handle, @intCast(vm_result.val), 0) == 0) {
+                    recordMapped(entry.handle);
+                    const header: *channel_mod.ChannelHeader = @ptrFromInt(vm_result.val2);
+                    router_chan = channel_mod.Channel.openAsSideB(header) orelse {
+                        syscall.thread_yield();
+                        continue;
+                    };
+                    has_router = true;
+                    break;
+                }
+            }
+        }
+        if (has_router) break;
+        syscall.thread_yield();
     }
 
-    const vm_rights = (perms.VmReservationRights{
-        .read = true,
-        .write = true,
-        .shareable = true,
-    }).bits();
-    const vm_result = syscall.vm_reserve(0, data_shm_size, vm_rights);
-    if (vm_result.val < 0) {
-        syscall.write("http_server: vm_reserve failed\n");
-        return;
-    }
-    if (syscall.shm_map(data_shm_handle, @intCast(vm_result.val), 0) != 0) {
-        syscall.write("http_server: shm_map failed\n");
-        return;
-    }
-    const header: *channel_mod.ChannelHeader = @ptrFromInt(vm_result.val2);
-    router_chan = channel_mod.Channel.openAsSideB(header) orelse {
-        syscall.write("http_server: channel open failed\n");
-        return;
-    };
-    has_router = true;
-
-    // Identify ourselves to the router
     _ = router_chan.send(&[_]u8{@truncate(shm_protocol.ServiceId.HTTP_SERVER)});
-
-    syscall.write("http_server: started\n");
 
     // Main loop
     while (true) {

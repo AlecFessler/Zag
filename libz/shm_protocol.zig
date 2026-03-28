@@ -62,7 +62,11 @@ pub const CommandChannel = extern struct {
 
     pub fn requestConnection(self: *CommandChannel, service_id: u32) ?*ConnectionEntry {
         for (self.connections[0..self.num_connections]) |*entry| {
-            if (entry.service_id == service_id and entry.status == @intFromEnum(ConnectionStatus.available)) {
+            if (entry.service_id != service_id) continue;
+            const status = @as(*volatile u32, &entry.status).*;
+            // Already connected (e.g. after restart) — SHM handle is still valid
+            if (status == @intFromEnum(ConnectionStatus.connected)) return entry;
+            if (status == @intFromEnum(ConnectionStatus.available)) {
                 @as(*volatile u32, &entry.status).* = @intFromEnum(ConnectionStatus.requested);
                 _ = @atomicRmw(u64, &self.wake_flag, .Add, 1, .release);
                 _ = syscall.futex_wake(&self.wake_flag, 1);
@@ -73,6 +77,9 @@ pub const CommandChannel = extern struct {
     }
 
     pub fn waitForConnection(self: *CommandChannel, entry: *ConnectionEntry) bool {
+        // Already connected (e.g. after restart) — skip waiting
+        if (@as(*volatile u32, &entry.status).* == @intFromEnum(ConnectionStatus.connected))
+            return entry.shm_handle != 0;
         while (@as(*volatile u32, &entry.status).* != @intFromEnum(ConnectionStatus.connected)) {
             const current = @atomicLoad(u64, &self.reply_flag, .acquire);
             if (@as(*volatile u32, &entry.status).* == @intFromEnum(ConnectionStatus.connected)) break;
@@ -125,8 +132,6 @@ pub const ServiceId = struct {
     pub const NFS_CLIENT: u32 = 6;
     pub const NTP_CLIENT: u32 = 7;
     pub const HTTP_SERVER: u32 = 8;
-    pub const COMPOSITOR: u32 = 9;
-    pub const DESKTOP_ENV: u32 = 10;
 };
 
 pub fn mapCommandChannel(perm_view_addr: u64) ?*CommandChannel {
@@ -135,8 +140,7 @@ pub fn mapCommandChannel(perm_view_addr: u64) ?*CommandChannel {
 
     var shm_handle: u64 = 0;
     var shm_size: u64 = 0;
-    var attempts: u32 = 0;
-    while (attempts < 50_000) : (attempts += 1) {
+    while (true) {
         for (view) |*entry| {
             if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY) {
                 shm_handle = entry.handle;
@@ -148,7 +152,7 @@ pub fn mapCommandChannel(perm_view_addr: u64) ?*CommandChannel {
         syscall.thread_yield();
     }
 
-    if (shm_handle == 0 or shm_size < COMMAND_SHM_SIZE) return null;
+    if (shm_size < COMMAND_SHM_SIZE) return null;
 
     const vm_rights = (perms.VmReservationRights{
         .read = true,

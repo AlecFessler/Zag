@@ -119,7 +119,7 @@ run_router_tests() {
     ensure_venv
 
     echo "=== Building RouterOS ==="
-    (cd "$SCRIPT_DIR/routerOS" && zig build)
+    (cd "$SCRIPT_DIR/routerOS" && zig build -Dnic=e1000)
     zig build -Dprofile=router
     clean_nvvars
 

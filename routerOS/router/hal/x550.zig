@@ -165,12 +165,12 @@ pub fn init(p: InitParams) bool {
         }
         syscall.write("x550: NVM ready\n");
 
-        // 5. Wait for manageability configuration done
+        // 5. Wait for manageability configuration done (non-fatal — x550-T2 has no BMC)
         if (!pollWithTimeout(base, REG_EEMNGCTL, EEMNGCTL_CFG_DONE0, EEMNGCTL_CFG_DONE0, 1_000_000)) {
-            syscall.write("x550: mgmt config timeout\n");
-            return false;
+            syscall.write("x550: mgmt config timeout (continuing)\n");
+        } else {
+            syscall.write("x550: mgmt ready\n");
         }
-        syscall.write("x550: mgmt ready\n");
 
         // 6. Wait for DMA initialization done
         if (!pollWithTimeout(base, REG_RDRXCTL, RDRXCTL_DMAIDONE, RDRXCTL_DMAIDONE, 1_000_000)) {

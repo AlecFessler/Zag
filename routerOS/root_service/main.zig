@@ -1,4 +1,3 @@
-const build_options = @import("build_options");
 const lib = @import("lib");
 
 const channel_mod = lib.channel;
@@ -26,7 +25,6 @@ var children: [MAX_CHILDREN]ChildInfo = undefined;
 var num_children: u32 = 0;
 var perm_view_global: u64 = 0;
 var watchdog_counter = std.atomic.Value(u32).init(0);
-var boot_info_chan: ?channel_mod.Channel = null;
 
 fn findChildByService(service_id: u32) ?*ChildInfo {
     for (children[0..num_children]) |*child| {
@@ -59,10 +57,20 @@ fn spawnChild(
         .shareable = true,
     }).bits();
     const vm_result = syscall.vm_reserve(0, shm_protocol.COMMAND_SHM_SIZE, vm_rights);
-    if (vm_result.val < 0) return false;
+    if (vm_result.val < 0) {
+        syscall.write("root: vm_reserve failed for ");
+        syscall.write(name);
+        syscall.write("\n");
+        return false;
+    }
 
     const map_rc = syscall.shm_map(@intCast(cmd_shm), @intCast(vm_result.val), 0);
-    if (map_rc != 0) return false;
+    if (map_rc != 0) {
+        syscall.write("root: shm_map failed for ");
+        syscall.write(name);
+        syscall.write("\n");
+        return false;
+    }
 
     const cmd: *shm_protocol.CommandChannel = @ptrFromInt(vm_result.val2);
     cmd.init();
@@ -113,19 +121,6 @@ const DeviceGrant = struct {
     handle: u64,
     rights: u64,
 };
-
-fn findDeviceByClass(perm_view_addr: u64, class: perms.DeviceClass, dtype: perms.DeviceType) ?u64 {
-    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
-    for (view) |*entry| {
-        if (entry.entry_type == pv.ENTRY_TYPE_DEVICE_REGION and
-            entry.deviceClass() == @intFromEnum(class) and
-            entry.deviceType() == @intFromEnum(dtype))
-        {
-            return entry.handle;
-        }
-    }
-    return null;
-}
 
 fn findAllMmioDevicesByClass(perm_view_addr: u64, class: perms.DeviceClass, out: []DeviceGrant) u32 {
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
@@ -245,6 +240,9 @@ fn crashReasonName(reason: pv.CrashReason) []const u8 {
         .illegal_instruction => "illegal_instruction",
         .alignment_fault => "alignment_fault",
         .protection_fault => "protection_fault",
+        .normal_exit => "normal_exit",
+        .killed => "killed",
+        .revoked => "revoked",
         _ => "unknown",
     };
 }
@@ -278,7 +276,6 @@ fn watchdogThread() void {
             syscall.write(" died, reason=");
             syscall.write(crashReasonName(reason));
             syscall.write("\n");
-            sendWatchdogGui("died", child.name, crashReasonName(reason), 0);
             return;
         }
 
@@ -292,32 +289,12 @@ fn watchdogThread() void {
             syscall.write("), reason=");
             syscall.write(crashReasonName(reason));
             syscall.write("\n");
-            sendWatchdogGui("restarted", child.name, crashReasonName(reason), restart_count);
             last_restart_count = restart_count;
         }
 
         _ = syscall.futex_wait(@ptrCast(&entry.field0), last_field0, std.math.maxInt(u64));
         last_field0 = @as(*const volatile u64, @ptrCast(&entry.field0)).*;
     }
-}
-
-fn sendWatchdogGui(event: []const u8, name: []const u8, reason: []const u8, count: u16) void {
-    var chan = &(boot_info_chan orelse return);
-    var buf: [128]u8 = undefined;
-    var p: usize = 0;
-    p = appendStr(&buf, p, "watchdog: ");
-    p = appendStr(&buf, p, name);
-    p = appendStr(&buf, p, " ");
-    p = appendStr(&buf, p, event);
-    if (count > 0) {
-        p = appendStr(&buf, p, " (count=");
-        p = appendDec(&buf, p, count);
-        p = appendStr(&buf, p, ")");
-    }
-    p = appendStr(&buf, p, ", reason=");
-    p = appendStr(&buf, p, reason);
-    p = appendStr(&buf, p, "\n");
-    _ = chan.send(buf[0..p]);
 }
 
 fn writeU16(val: u16) void {
@@ -350,144 +327,6 @@ fn writeU32(val: u32) void {
         n /= 10;
     }
     syscall.write(buf[i..]);
-}
-
-// Send boot device info to desktop_env via a direct channel
-fn sendBootInfo(desktop_env: *ChildInfo) void {
-    const data_shm = syscall.shm_create(4 * syscall.PAGE4K);
-    if (data_shm <= 0) return;
-
-    const data_vm_rights = (perms.VmReservationRights{
-        .read = true,
-        .write = true,
-        .execute = true,
-        .shareable = true,
-    }).bits();
-    const data_vm = syscall.vm_reserve(0, 4 * syscall.PAGE4K, data_vm_rights);
-    if (data_vm.val < 0) return;
-
-    if (syscall.shm_map(@intCast(data_shm), @intCast(data_vm.val), 0) != 0) return;
-
-    const chan_header: *channel_mod.ChannelHeader = @ptrFromInt(data_vm.val2);
-    boot_info_chan = channel_mod.Channel.initAsSideA(chan_header, 4 * syscall.PAGE4K);
-    var chan = &boot_info_chan.?;
-
-    // Grant SHM to desktop_env
-    const grant_rights = (perms.SharedMemoryRights{
-        .read = true,
-        .write = true,
-        .grant = true,
-    }).bits();
-    _ = syscall.grant_perm(@intCast(data_shm), desktop_env.proc_handle, grant_rights);
-
-    // Add connection entry to desktop_env's command channel
-    if (desktop_env.cmd_channel) |cmd| {
-        cmd.addAllowedConnection(0); // service_id 0 = root
-        if (cmd.findConnectionByService(0)) |entry| {
-            @as(*volatile u64, &entry.shm_handle).* = @intCast(data_shm);
-            @as(*volatile u64, &entry.shm_size).* = 4 * syscall.PAGE4K;
-            @as(*volatile u32, &entry.status).* = @intFromEnum(shm_protocol.ConnectionStatus.connected);
-            cmd.notifyChild();
-        }
-    }
-
-    // Send boot info messages
-    var msg_buf: [128]u8 = undefined;
-
-    _ = chan.send("--- Zag OS Boot Info ---\n");
-    {
-        const msg = formatBootMsg(&msg_buf, "root: children spawned: ", num_children);
-        _ = chan.send(msg);
-    }
-
-    // Enumerate all devices from perm view
-    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_global);
-    for (view) |*entry| {
-        if (entry.entry_type != pv.ENTRY_TYPE_DEVICE_REGION) continue;
-        var p: usize = 0;
-        const class = entry.deviceClass();
-        const class_name: []const u8 = switch (@as(perms.DeviceClass, @enumFromInt(class))) {
-            .network => "network",
-            .serial => "serial",
-            .storage => "storage",
-            .display => "display",
-            .timer => "timer",
-            .usb => "usb",
-            .unknown => "unknown",
-        };
-        p = appendStr(&msg_buf, p, "  ");
-        p = appendStr(&msg_buf, p, class_name);
-        p = appendStr(&msg_buf, p, " [");
-        p = appendHex16(&msg_buf, p, entry.pciVendor());
-        p = appendStr(&msg_buf, p, ":");
-        p = appendHex16(&msg_buf, p, entry.pciDevice());
-        p = appendStr(&msg_buf, p, "] bus=");
-        p = appendDec(&msg_buf, p, entry.pciBus());
-        p = appendStr(&msg_buf, p, " dev=");
-        p = appendDec(&msg_buf, p, @as(u32, entry.pciDev()));
-        p = appendStr(&msg_buf, p, " func=");
-        p = appendDec(&msg_buf, p, @as(u32, entry.pciFunc()));
-        if (class == @intFromEnum(perms.DeviceClass.display)) {
-            p = appendStr(&msg_buf, p, " ");
-            p = appendDec(&msg_buf, p, entry.fbWidth());
-            p = appendStr(&msg_buf, p, "x");
-            p = appendDec(&msg_buf, p, entry.fbHeight());
-        }
-        p = appendStr(&msg_buf, p, "\n");
-        _ = chan.send(msg_buf[0..p]);
-    }
-
-    // List spawned children
-    for (children[0..num_children]) |*child| {
-        var p: usize = 0;
-        p = appendStr(&msg_buf, p, "  process: ");
-        p = appendStr(&msg_buf, p, child.name);
-        p = appendStr(&msg_buf, p, " (id=");
-        p = appendDec(&msg_buf, p, child.service_id);
-        p = appendStr(&msg_buf, p, ")\n");
-        _ = chan.send(msg_buf[0..p]);
-    }
-    _ = chan.send("--- end boot info ---\n");
-}
-
-fn appendStr(buf: []u8, pos: usize, s: []const u8) usize {
-    const len = @min(s.len, buf.len - pos);
-    @memcpy(buf[pos..][0..len], s[0..len]);
-    return pos + len;
-}
-
-fn appendDec(buf: []u8, pos: usize, val: u32) usize {
-    if (val == 0) {
-        buf[pos] = '0';
-        return pos + 1;
-    }
-    var tmp: [10]u8 = undefined;
-    var n = val;
-    var j: usize = tmp.len;
-    while (n > 0) {
-        j -= 1;
-        tmp[j] = '0' + @as(u8, @truncate(n % 10));
-        n /= 10;
-    }
-    const digits = tmp[j..];
-    @memcpy(buf[pos..][0..digits.len], digits);
-    return pos + digits.len;
-}
-
-fn appendHex16(buf: []u8, pos: usize, val: u16) usize {
-    const hex = "0123456789abcdef";
-    buf[pos + 0] = hex[(val >> 12) & 0xf];
-    buf[pos + 1] = hex[(val >> 8) & 0xf];
-    buf[pos + 2] = hex[(val >> 4) & 0xf];
-    buf[pos + 3] = hex[val & 0xf];
-    return pos + 4;
-}
-
-fn formatBootMsg(buf: []u8, prefix: []const u8, value: u32) []const u8 {
-    var i = appendStr(buf, 0, prefix);
-    i = appendDec(buf, i, value);
-    buf[i] = '\n';
-    return buf[0 .. i + 1];
 }
 
 fn brokerLoop() void {
@@ -530,6 +369,17 @@ pub fn main(perm_view_addr: u64) void {
 
     var nic_devices: [8]DeviceGrant = undefined;
     const nic_count = findAllMmioDevicesByClass(perm_view_addr, .network, &nic_devices);
+    syscall.write("root: found MMIO NICs: ");
+    writeU32(nic_count);
+    syscall.write("\n");
+
+    var display_devices: [2]DeviceGrant = undefined;
+    const display_count = findAllMmioDevicesByClass(perm_view_addr, .display, &display_devices);
+    if (display_count > 0) {
+        syscall.write("root: found display devices: ");
+        writeU32(display_count);
+        syscall.write("\n");
+    }
 
     syscall.write("root: spawning serial_driver\n");
     _ = spawnChild(
@@ -541,45 +391,21 @@ pub fn main(perm_view_addr: u64) void {
         perm_view_addr,
         serial_devices[0..serial_count],
     );
-    // Spawn compositor/desktop BEFORE router so the framebuffer initializes
-    // before the NIC init (which may fault on bare metal).
-    var display_count: u32 = 0;
-    if (build_options.use_desktop) {
-        var display_devices: [2]DeviceGrant = undefined;
-        display_count = findAllMmioDevicesByClass(perm_view_addr, .display, &display_devices);
-        if (display_count > 0) {
-            syscall.write("root: spawning compositor\n");
-            _ = spawnChild(
-                "compositor",
-                embedded.compositor,
-                shm_protocol.ServiceId.COMPOSITOR,
-                .{ .grant_to = true, .mem_reserve = true, .device_own = true, .restart = true },
-                &.{},
-                perm_view_addr,
-                display_devices[0..display_count],
-            );
-
-            syscall.write("root: spawning desktop_env\n");
-            _ = spawnChild(
-                "desktop_env",
-                embedded.desktop_env,
-                shm_protocol.ServiceId.DESKTOP_ENV,
-                .{ .grant_to = true, .mem_reserve = true, .restart = true },
-                &.{ shm_protocol.ServiceId.COMPOSITOR, shm_protocol.ServiceId.ROUTER },
-                perm_view_addr,
-                &.{},
-            );
-
-            // Send boot info to desktop_env
-            if (findChildByService(shm_protocol.ServiceId.DESKTOP_ENV)) |de| {
-                sendBootInfo(de);
-            }
-        }
-    }
 
     syscall.write("root: spawning router\n");
 
-    // Router process owns NIC devices directly (monolithic NIC+router)
+    // Router process owns NIC devices and display devices directly
+    var router_devices: [10]DeviceGrant = undefined;
+    var router_dev_count: u32 = 0;
+    for (nic_devices[0..nic_count]) |d| {
+        router_devices[router_dev_count] = d;
+        router_dev_count += 1;
+    }
+    for (display_devices[0..display_count]) |d| {
+        router_devices[router_dev_count] = d;
+        router_dev_count += 1;
+    }
+
     const router_rights = perms.ProcessRights{
         .grant_to = true,
         .spawn_thread = true,
@@ -591,16 +417,14 @@ pub fn main(perm_view_addr: u64) void {
         .pin_exclusive = true,
     };
 
-    const router_connections: []const u32 = &.{};
-
     _ = spawnChild(
         "router",
         embedded.router,
         shm_protocol.ServiceId.ROUTER,
         router_rights,
-        router_connections,
+        &.{},
         perm_view_addr,
-        nic_devices[0..nic_count],
+        router_devices[0..router_dev_count],
     );
     syscall.write("root: spawning nfs_client\n");
 

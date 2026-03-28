@@ -53,6 +53,9 @@ fn buildRouterChild(
     child_app_mod.addImport("lib", lib_mod);
     child_app_mod.addImport("router", child_app_mod);
     child_app_mod.addOptions("build_options", options);
+    child_app_mod.addAnonymousImport("font8x16", .{
+        .root_source_file = b.path("router/font8x16.zig"),
+    });
     const child_start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "../libz/start.zig" },
         .target = target,
@@ -84,10 +87,6 @@ pub fn build(b: *std.Build) void {
         .pic = true,
     });
 
-    const use_desktop = b.option(bool, "desktop", "Enable desktop environment (compositor + desktop_env)") orelse false;
-    const root_options = b.addOptions();
-    root_options.addOption(bool, "use_desktop", use_desktop);
-
     const serial_driver_bin = buildChild(b, target, lib_mod, "serial_driver", "serial_driver/main.zig");
     const router_bin = buildRouterChild(b, target, lib_mod);
     const console_bin = buildChild(b, target, lib_mod, "console", "console/main.zig");
@@ -103,23 +102,7 @@ pub fn build(b: *std.Build) void {
     _ = embedded_wf.addCopyFile(ntp_client_bin, "ntp_client.elf");
     _ = embedded_wf.addCopyFile(http_server_bin, "http_server.elf");
 
-    const embed_src = if (use_desktop) blk: {
-        const compositor_bin = buildChild(b, target, lib_mod, "compositor", "compositor/main.zig");
-        const desktop_env_bin = buildChild(b, target, lib_mod, "desktop_env", "desktop_env/main.zig");
-        _ = embedded_wf.addCopyFile(compositor_bin, "compositor.elf");
-        _ = embedded_wf.addCopyFile(desktop_env_bin, "desktop_env.elf");
-        break :blk embedded_wf.add("embedded_children.zig",
-            \\pub const serial_driver = @embedFile("serial_driver.elf");
-            \\pub const router = @embedFile("router.elf");
-            \\pub const console = @embedFile("console.elf");
-            \\pub const nfs_client = @embedFile("nfs_client.elf");
-            \\pub const ntp_client = @embedFile("ntp_client.elf");
-            \\pub const http_server = @embedFile("http_server.elf");
-            \\pub const compositor = @embedFile("compositor.elf");
-            \\pub const desktop_env = @embedFile("desktop_env.elf");
-            \\
-        );
-    } else embedded_wf.add("embedded_children.zig",
+    const embed_src = embedded_wf.add("embedded_children.zig",
         \\pub const serial_driver = @embedFile("serial_driver.elf");
         \\pub const router = @embedFile("router.elf");
         \\pub const console = @embedFile("console.elf");
@@ -143,7 +126,6 @@ pub fn build(b: *std.Build) void {
     });
     app_mod.addImport("lib", lib_mod);
     app_mod.addImport("embedded_children", embedded_children_mod);
-    app_mod.addOptions("build_options", root_options);
 
     const start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "../libz/start.zig" },
