@@ -175,13 +175,19 @@ pub const UserViewEntry = extern struct {
                         @as(u64, @truncate(dr.size)) << 32
                     else
                         @as(u64, dr.port_count) << 32),
-                .field1 = @as(u64, dr.pci_vendor) |
-                    (@as(u64, dr.pci_device) << 16) |
-                    (@as(u64, dr.pci_class) << 32) |
-                    (@as(u64, dr.pci_subclass) << 40) |
-                    (@as(u64, dr.pci_bus) << 48) |
-                    (@as(u64, dr.pci_dev) << 53) |
-                    (@as(u64, dr.pci_func) << 58),
+                .field1 = if (dr.device_class == .display)
+                    @as(u64, dr.fb_width) |
+                        (@as(u64, dr.fb_height) << 16) |
+                        (@as(u64, dr.fb_stride) << 32) |
+                        (@as(u64, dr.fb_pixel_format) << 48)
+                else
+                    @as(u64, dr.pci_vendor) |
+                        (@as(u64, dr.pci_device) << 16) |
+                        (@as(u64, dr.pci_class) << 32) |
+                        (@as(u64, dr.pci_subclass) << 40) |
+                        (@as(u64, dr.pci_bus) << 48) |
+                        (@as(u64, dr.pci_dev) << 53) |
+                        (@as(u64, dr.pci_func) << 58),
             },
             .core_pin => |cp| .{
                 .handle = entry.handle,

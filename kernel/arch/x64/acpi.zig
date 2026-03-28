@@ -524,7 +524,7 @@ fn pciClassToDeviceClass(class: u8, subclass: u8) DeviceClass {
     return switch (class) {
         0x01 => .storage,
         0x02 => .network,
-        0x03 => .display,
+        // Display devices (0x03) are handled via UEFI GOP, not PCI BARs.
         0x0C => if (subclass == 0x03) .usb else .unknown,
         else => .unknown,
     };

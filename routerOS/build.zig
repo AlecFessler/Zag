@@ -88,6 +88,7 @@ pub fn build(b: *std.Build) void {
     const nfs_client_bin = buildChild(b, target, lib_mod, "nfs_client", "nfs_client/main.zig");
     const ntp_client_bin = buildChild(b, target, lib_mod, "ntp_client", "ntp_client/main.zig");
     const http_server_bin = buildChild(b, target, lib_mod, "http_server", "http_server/main.zig");
+    const compositor_bin = buildChild(b, target, lib_mod, "compositor", "compositor/main.zig");
 
     const embedded_wf = b.addWriteFiles();
     _ = embedded_wf.addCopyFile(serial_driver_bin, "serial_driver.elf");
@@ -96,6 +97,7 @@ pub fn build(b: *std.Build) void {
     _ = embedded_wf.addCopyFile(nfs_client_bin, "nfs_client.elf");
     _ = embedded_wf.addCopyFile(ntp_client_bin, "ntp_client.elf");
     _ = embedded_wf.addCopyFile(http_server_bin, "http_server.elf");
+    _ = embedded_wf.addCopyFile(compositor_bin, "compositor.elf");
     const embed_src = embedded_wf.add("embedded_children.zig",
         \\pub const serial_driver = @embedFile("serial_driver.elf");
         \\pub const router = @embedFile("router.elf");
@@ -103,6 +105,7 @@ pub fn build(b: *std.Build) void {
         \\pub const nfs_client = @embedFile("nfs_client.elf");
         \\pub const ntp_client = @embedFile("ntp_client.elf");
         \\pub const http_server = @embedFile("http_server.elf");
+        \\pub const compositor = @embedFile("compositor.elf");
         \\
     );
 

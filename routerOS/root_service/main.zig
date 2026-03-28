@@ -429,6 +429,21 @@ pub fn main(perm_view_addr: u64) void {
         &.{},
     );
 
+    var display_devices: [2]DeviceGrant = undefined;
+    const display_count = findAllMmioDevicesByClass(perm_view_addr, .display, &display_devices);
+    if (display_count > 0) {
+        syscall.write("root: spawning compositor\n");
+        _ = spawnChild(
+            "compositor",
+            embedded.compositor,
+            shm_protocol.ServiceId.COMPOSITOR,
+            .{ .grant_to = true, .mem_reserve = true, .device_own = true, .restart = true },
+            &.{},
+            perm_view_addr,
+            display_devices[0..display_count],
+        );
+    }
+
     // Spawn watchdog threads for each child
     var wi: u32 = 0;
     while (wi < num_children) : (wi += 1) {

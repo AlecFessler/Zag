@@ -77,4 +77,20 @@ pub const UserViewEntry = extern struct {
     pub fn pciFunc(self: *const UserViewEntry) u3 {
         return @truncate((self.field1 >> 58) & 0x7);
     }
+
+    pub fn fbWidth(self: *const UserViewEntry) u16 {
+        return @truncate(self.field1);
+    }
+
+    pub fn fbHeight(self: *const UserViewEntry) u16 {
+        return @truncate(self.field1 >> 16);
+    }
+
+    pub fn fbStride(self: *const UserViewEntry) u16 {
+        return @truncate(self.field1 >> 32);
+    }
+
+    pub fn fbPixelFormat(self: *const UserViewEntry) u8 {
+        return @truncate(self.field1 >> 48);
+    }
 };

@@ -5,6 +5,13 @@ set -euo pipefail
 
 echo "=== RouterOS E2E Test Network Setup ==="
 
+# ── Remove stale passthrough IP from eno1 if present ────────────────
+# The passthrough tests add 10.0.2.1/24 to eno1; this conflicts with tap0
+if ip addr show eno1 2>/dev/null | grep -q "10.0.2.1/24"; then
+    ip addr del 10.0.2.1/24 dev eno1 2>/dev/null || true
+    echo "  Removed stale 10.0.2.1/24 from eno1"
+fi
+
 # ── TAP interfaces ──────────────────────────────────────────────────
 echo "Setting up TAP interfaces..."
 

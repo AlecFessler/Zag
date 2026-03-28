@@ -248,7 +248,9 @@ def qemu_router():
     print("Binding x550 to vfio-pci...")
     subprocess.run(["sudo", VFIO_BIND], check=True, timeout=30)
 
-    # 4. Set up eno1 as mock gateway
+    # 4. Set up eno1 as mock gateway (remove from tap0 first to avoid routing conflict)
+    subprocess.run(["sudo", "ip", "addr", "del", "10.0.2.1/24", "dev", "tap0"],
+                   capture_output=True)  # may not exist
     subprocess.run(["sudo", "ip", "addr", "add", "10.0.2.1/24", "dev", "eno1"],
                    capture_output=True)  # may already exist
     subprocess.run(["sudo", "ip", "link", "set", "eno1", "up"], check=True)

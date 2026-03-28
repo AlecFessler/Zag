@@ -52,6 +52,7 @@ pub fn build(b: *std.Build) void {
         if (profile) |p| p.root_service else "kernel/tests/bin/root_service.elf";
     const iommu_type = b.option([]const u8, "iommu", "IOMMU type: intel or amd (default: intel)") orelse
         if (profile) |p| p.iommu else "intel";
+    const display_type = b.option([]const u8, "display", "QEMU display: none, gtk, sdl (default: none)") orelse "none";
     const net_type = b.option([]const u8, "net", "Network: tap, user, or none (default: user)") orelse
         if (profile) |p| p.net else "user";
 
@@ -209,14 +210,14 @@ pub fn build(b: *std.Build) void {
         \\ -bios /usr/share/ovmf/x64/OVMF.4m.fd \
         \\ -drive file=fat:rw:{s}/{s},format=raw \
         \\ -serial mon:stdio \
-        \\ -display none \
+        \\ -display {s} \
         \\ -no-reboot \
         \\ {s} \
         \\ {s} \
         \\ {s} \
         \\ {s} \
         \\ -smp cores=4
-    , .{ b.install_path, out_dir, qemu_accel_args, qemu_machine_args, qemu_iommu_args, qemu_net_args });
+    , .{ b.install_path, out_dir, display_type, qemu_accel_args, qemu_machine_args, qemu_iommu_args, qemu_net_args });
     const qemu_cmd = b.addSystemCommand(&[_][]const u8{
         "sh", "-lc", qemu_cmdline,
     });

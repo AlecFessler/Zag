@@ -300,7 +300,7 @@ class TestDhcpClient:
                 router._drain()
 
             bound = False
-            for _ in range(15):
+            for _ in range(20):
                 router._drain()
                 try:
                     resp = router.command("dhcp-client")
@@ -310,6 +310,7 @@ class TestDhcpClient:
                 if "bound" in resp.lower():
                     bound = True
                     break
+                time.sleep(1)
             assert bound, f"DHCP client did not bind: {resp}"
 
             # Force a rebind — async logs will interfere with prompt

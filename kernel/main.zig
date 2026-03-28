@@ -4,6 +4,7 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const debug = zag.debug;
+const device_registry = zag.devices.registry;
 const memory = zag.memory.init;
 const sched = zag.sched.scheduler;
 
@@ -54,6 +55,18 @@ fn kMain(boot_info: *BootInfo) !void {
     _ = try debug.info.init(boot_info.elf_blob, memory.heap_allocator);
     arch.print("K: memory done, firmware tables\n", .{});
     try arch.parseFirmwareTables(boot_info.xsdp_phys);
+    if (boot_info.framebuffer.pixel_format != .none and boot_info.framebuffer.base.addr != 0) {
+        const fb = &boot_info.framebuffer;
+        _ = device_registry.registerDisplayDevice(
+            fb.base,
+            fb.size,
+            @truncate(fb.width),
+            @truncate(fb.height),
+            @truncate(fb.stride),
+            @intFromEnum(fb.pixel_format),
+        ) catch {};
+        arch.print("K: registered GOP framebuffer {}x{}\n", .{ fb.width, fb.height });
+    }
     arch.print("K: sched init\n", .{});
     const rs_phys = PAddr.fromInt(@intFromPtr(boot_info.root_service.ptr));
     const rs_virt = VAddr.fromPAddr(rs_phys, null);

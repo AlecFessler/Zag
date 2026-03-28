@@ -31,7 +31,7 @@ QEMU_CMD = (
     " -smp cores=4"
 )
 
-BOOT_BANNER = "load-config"
+BOOT_BANNER = "console channel connected"
 PROMPT = "\n> "
 
 # Debug lines from syscall.write that get mixed into serial output
@@ -74,16 +74,13 @@ class QemuRouter:
         self.child.logfile_read = open(
             os.path.join(os.path.dirname(__file__), "qemu_output.log"), "w"
         )
-        # Wait for the console banner
+        # Wait for the console banner (last service to init)
         self.child.expect(re.escape(BOOT_BANNER), timeout=self.boot_timeout)
-        # Wait for first prompt - use a pattern that matches "> " at line start
+        # The prompt may have already been consumed; send empty line to get a fresh one
+        time.sleep(0.5)
+        self._drain()
+        self.child.sendline("")
         self._wait_prompt(timeout=15)
-        # Wait for console channel to connect (last service to init)
-        try:
-            self.child.expect("console channel connected", timeout=10)
-            self._wait_prompt(timeout=5)
-        except pexpect.TIMEOUT:
-            pass
         # Drain any pending debug output
         self._drain()
 

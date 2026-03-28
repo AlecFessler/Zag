@@ -51,6 +51,21 @@ pub fn registerPortIoDevice(
     return dr;
 }
 
+pub fn registerDisplayDevice(
+    phys_base: PAddr,
+    size: u64,
+    fb_width: u16,
+    fb_height: u16,
+    fb_stride: u16,
+    fb_pixel_format: u8,
+) !*DeviceRegion {
+    if (device_count >= MAX_DEVICES) return error.TooManyDevices;
+    const dr = try device_region_mod.createDisplay(phys_base, size, fb_width, fb_height, fb_stride, fb_pixel_format);
+    device_table[device_count] = dr;
+    device_count += 1;
+    return dr;
+}
+
 pub fn grantAllToRootService(root_proc: *Process) void {
     var i: u32 = 0;
     while (i < device_count) : (i += 1) {

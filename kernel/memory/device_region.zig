@@ -35,6 +35,10 @@ pub const DeviceRegion = struct {
     pci_func: u8,
     dma_page_table_root: PAddr,
     dma_cursor: u64,
+    fb_width: u16 = 0,
+    fb_height: u16 = 0,
+    fb_stride: u16 = 0,
+    fb_pixel_format: u8 = 0,
 };
 
 const DeviceRegionSlab = SlabAllocator(DeviceRegion, false, 0, 32, true);
@@ -111,6 +115,40 @@ pub fn createPortIo(
         .pci_func = pci_func,
         .dma_page_table_root = PAddr.fromInt(0),
         .dma_cursor = 0,
+    };
+    return dr;
+}
+
+pub fn createDisplay(
+    phys_base: PAddr,
+    size: u64,
+    fb_width: u16,
+    fb_height: u16,
+    fb_stride: u16,
+    fb_pixel_format: u8,
+) !*DeviceRegion {
+    std.debug.assert(slab_initialized);
+    const dr = try device_region_slab.allocator().create(DeviceRegion);
+    dr.* = .{
+        .phys_base = phys_base,
+        .size = size,
+        .base_port = 0,
+        .port_count = 0,
+        .device_type = .mmio,
+        .device_class = .display,
+        .pci_vendor = 0,
+        .pci_device = 0,
+        .pci_class = 0,
+        .pci_subclass = 0,
+        .pci_bus = 0,
+        .pci_dev = 0,
+        .pci_func = 0,
+        .dma_page_table_root = PAddr.fromInt(0),
+        .dma_cursor = 0,
+        .fb_width = fb_width,
+        .fb_height = fb_height,
+        .fb_stride = fb_stride,
+        .fb_pixel_format = fb_pixel_format,
     };
     return dr;
 }

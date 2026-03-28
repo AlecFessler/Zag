@@ -150,6 +150,28 @@ pub fn main() uefi.Status {
     const xsdp_addr = boot_protocol.findXSDP() catch return .aborted;
     const xsdp_phys = PAddr.fromInt(xsdp_addr);
 
+    const gop = boot_services.locateProtocol(uefi.protocol.GraphicsOutput, null) catch null;
+    const framebuffer: boot_protocol.Framebuffer = if (gop) |g| .{
+        .base = PAddr.fromInt(g.mode.frame_buffer_base),
+        .size = g.mode.frame_buffer_size,
+        .width = g.mode.info.horizontal_resolution,
+        .height = g.mode.info.vertical_resolution,
+        .stride = g.mode.info.pixels_per_scan_line,
+        .pixel_format = switch (g.mode.info.pixel_format) {
+            .red_green_blue_reserved_8_bit_per_color => .rgb8,
+            .blue_green_red_reserved_8_bit_per_color => .bgr8,
+            .bit_mask => .bitmask,
+            .blt_only => .blt_only,
+        },
+    } else .{
+        .base = PAddr.fromInt(0),
+        .size = 0,
+        .width = 0,
+        .height = 0,
+        .stride = 0,
+        .pixel_format = .none,
+    };
+
     const stack_pages = page_alloc_iface.alignedAlloc(
         u8,
         paging.pageAlign(.page4k),
@@ -191,6 +213,7 @@ pub fn main() uefi.Status {
     boot_info.root_service.len = rs_bytes.len;
     boot_info.xsdp_phys = xsdp_phys;
     boot_info.stack_top = aligned_stack_top_virt;
+    boot_info.framebuffer = framebuffer;
     boot_info.mmap = boot_protocol.getMmap(boot_services) orelse return .aborted;
     boot_services.exitBootServices(
         uefi.handle,

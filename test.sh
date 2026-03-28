@@ -100,8 +100,17 @@ ensure_venv() {
 
 # ── Test runners ──────────────────────────────────────────────────────
 
+clean_nvvars() {
+    # Remove OVMF NvVars if root-owned (leftover from sudo passthrough tests)
+    local nv="$SCRIPT_DIR/zig-out/img/NvVars"
+    if [[ -f "$nv" ]] && [[ "$(stat -c %U "$nv" 2>/dev/null)" == "root" ]]; then
+        rm -f "$nv"
+    fi
+}
+
 run_kernel_tests() {
     echo "=== Kernel Tests ==="
+    clean_nvvars
     zig build run -Dprofile=test
 }
 
@@ -112,6 +121,7 @@ run_router_tests() {
     echo "=== Building RouterOS ==="
     (cd "$SCRIPT_DIR/routerOS" && zig build)
     zig build -Dprofile=router
+    clean_nvvars
 
     echo "=== Router Integration Tests ==="
     local pytest_args=("-v")
@@ -153,8 +163,9 @@ run_passthrough_test() {
     echo "Binding x550 to vfio-pci..."
     sudo "$SCRIPT_DIR/tools/vfio-bind.sh"
 
-    # 3. Set up Realtek as WAN mock gateway (x550 is owned by VM now)
+    # 3. Set up Realtek as WAN mock gateway (remove from tap0 to avoid routing conflict)
     echo "Setting up Realtek as mock ISP gateway..."
+    sudo ip addr del 10.0.2.1/24 dev tap0 2>/dev/null || true
     sudo ip addr add 10.0.2.1/24 dev eno1 2>/dev/null || true
     sudo ip link set eno1 up
 

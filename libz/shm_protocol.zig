@@ -118,6 +118,7 @@ pub const ServiceId = struct {
     pub const NFS_CLIENT: u32 = 6;
     pub const NTP_CLIENT: u32 = 7;
     pub const HTTP_SERVER: u32 = 8;
+    pub const COMPOSITOR: u32 = 9;
 };
 
 pub fn mapCommandChannel(perm_view_addr: u64) ?*CommandChannel {
