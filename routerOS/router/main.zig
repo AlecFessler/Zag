@@ -493,6 +493,7 @@ pub fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
                 // Check port forwarding before declaring unreachable
                 if (role == .wan and has_lan) {
                     if (firewall.handlePortForward(pkt, len)) return .consumed;
+                    if (nat.forwardWanToLan(pkt, len)) return .forward_lan;
                 }
                 // No handler matched — send ICMP Port Unreachable (Type 3, Code 3)
                 // Don't send for broadcasts

@@ -1,9 +1,15 @@
 #!/usr/bin/env python3
-"""Deploy UDP sender and configure static ethernet IPs on all Raspberry Pis.
+"""Deploy test agents and configure ethernet on all Raspberry Pis.
 
 Requires: pip install fabric
+
+Usage:
+  python3 deploy.py              # deploy pi_agent (default)
+  python3 deploy.py --agent      # deploy pi_agent (explicit)
+  python3 deploy.py --udp-sender # deploy legacy udp_sender
 """
 
+import argparse
 import getpass
 import os
 
@@ -12,17 +18,16 @@ from fabric import Connection, Config
 USERNAME = "alecfessler"
 
 PIES = [
-    {"wifi_ip": "192.168.86.106", "eth_ip": "192.168.1.101"},
-    {"wifi_ip": "192.168.86.107", "eth_ip": "192.168.1.102"},
-    {"wifi_ip": "192.168.86.112", "eth_ip": "192.168.1.103"},
+    {"wifi_ip": "192.168.86.79", "eth_ip": "192.168.1.101"},
+    {"wifi_ip": "192.168.86.78", "eth_ip": "192.168.1.102"},
+    {"wifi_ip": "192.168.86.104", "eth_ip": "192.168.1.103"},
 ]
 
 GATEWAY = "192.168.1.1"
-REMOTE_DIR = "/opt/udp_sender"
-SERVICE_NAME = "udp_sender.service"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SENDER_DIR = os.path.join(SCRIPT_DIR, "udp_sender")
+AGENT_DIR = os.path.join(SCRIPT_DIR, "pi_agent")
 
 
 def detect_eth_iface(conn):
@@ -85,7 +90,9 @@ def configure_dhcp(conn, eth_iface):
 
 def deploy_sender(conn):
     """Upload and install the UDP sender service."""
-    conn.sudo(f"mkdir -p {REMOTE_DIR}")
+    remote_dir = "/opt/udp_sender"
+    service_name = "udp_sender.service"
+    conn.sudo(f"mkdir -p {remote_dir}")
 
     local_script = os.path.join(SENDER_DIR, "udp_sender.py")
     local_service = os.path.join(SENDER_DIR, "udp_sender.service")
@@ -94,18 +101,56 @@ def deploy_sender(conn):
     conn.put(local_script, "/tmp/udp_sender.py")
     conn.put(local_service, "/tmp/udp_sender.service")
 
-    conn.sudo(f"mv /tmp/udp_sender.py {REMOTE_DIR}/udp_sender.py")
-    conn.sudo(f"chmod +x {REMOTE_DIR}/udp_sender.py")
-    conn.sudo(f"mv /tmp/udp_sender.service /etc/systemd/system/{SERVICE_NAME}")
+    conn.sudo(f"mv /tmp/udp_sender.py {remote_dir}/udp_sender.py")
+    conn.sudo(f"chmod +x {remote_dir}/udp_sender.py")
+    conn.sudo(f"mv /tmp/udp_sender.service /etc/systemd/system/{service_name}")
 
     conn.sudo("systemctl daemon-reload")
-    conn.sudo(f"systemctl enable {SERVICE_NAME}")
-    conn.sudo(f"systemctl restart {SERVICE_NAME}")
+    conn.sudo(f"systemctl enable {service_name}")
+    conn.sudo(f"systemctl restart {service_name}")
+
+
+def deploy_agent(conn):
+    """Upload and install the Pi test agent service."""
+    remote_dir = "/opt/pi_agent"
+    service_name = "pi_agent.service"
+
+    # Stop udp_sender if running (replaced by pi_agent)
+    conn.sudo("systemctl stop udp_sender.service 2>/dev/null || true")
+    conn.sudo("systemctl disable udp_sender.service 2>/dev/null || true")
+
+    conn.sudo(f"mkdir -p {remote_dir}")
+
+    local_script = os.path.join(AGENT_DIR, "pi_agent.py")
+    local_service = os.path.join(AGENT_DIR, "pi_agent.service")
+
+    conn.put(local_script, "/tmp/pi_agent.py")
+    conn.put(local_service, "/tmp/pi_agent.service")
+
+    conn.sudo(f"mv /tmp/pi_agent.py {remote_dir}/pi_agent.py")
+    conn.sudo(f"chmod +x {remote_dir}/pi_agent.py")
+    conn.sudo(f"mv /tmp/pi_agent.service /etc/systemd/system/{service_name}")
+
+    conn.sudo("systemctl daemon-reload")
+    conn.sudo(f"systemctl enable {service_name}")
+    conn.sudo(f"systemctl restart {service_name}")
 
 
 def main():
+    parser = argparse.ArgumentParser(description="Deploy test services to Raspberry Pis")
+    parser.add_argument("--agent", action="store_true", default=True,
+                        help="Deploy pi_agent test agent (default)")
+    parser.add_argument("--udp-sender", action="store_true",
+                        help="Deploy legacy UDP sender instead")
+    args = parser.parse_args()
+
+    use_agent = not args.udp_sender
+
     pswd = getpass.getpass("Enter the sudo password for the Pis: ")
     ssh_config = Config(overrides={"sudo": {"password": pswd}})
+
+    mode = "pi_agent" if use_agent else "udp_sender"
+    print(f"Deploying: {mode}")
 
     for pi in PIES:
         host = pi["wifi_ip"]
@@ -128,13 +173,20 @@ def main():
 
         eth_iface = detect_eth_iface(conn)
         configure_dhcp(conn, eth_iface)
-        deploy_sender(conn)
 
-        print(f"  Done! UDP sender running, eth set to DHCP")
+        if use_agent:
+            deploy_agent(conn)
+            print(f"  Done! Pi agent running on port 8080, eth set to DHCP")
+        else:
+            deploy_sender(conn)
+            print(f"  Done! UDP sender running, eth set to DHCP")
 
-    print("\n=== Deployment complete ===")
-    print("Pis will send UDP packets to 10.0.2.1:9999 every 3 seconds")
-    print("(Pis will get IPs via DHCP from the router)")
+    print(f"\n=== Deployment complete ({mode}) ===")
+    if use_agent:
+        print("Pi agents listening on port 8080 (WiFi interface)")
+        print("Pis will get IPs via DHCP from the router")
+    else:
+        print("Pis will send UDP packets to 10.0.2.1:9999 every 3 seconds")
 
 
 if __name__ == "__main__":

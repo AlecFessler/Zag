@@ -20,6 +20,8 @@ $USER ALL=(root) NOPASSWD: /usr/bin/cat
 $USER ALL=(root) NOPASSWD: /usr/bin/tail
 $USER ALL=(root) NOPASSWD: /usr/bin/grep
 $USER ALL=(root) NOPASSWD: /usr/bin/timeout
+$USER ALL=(root) NOPASSWD: /usr/bin/rm
+$USER ALL=(root) NOPASSWD: /home/$USER/Zag/tools/passthrough_tests/.venv/bin/python3
 EOF
 
 chmod 0440 "$RULES_FILE"

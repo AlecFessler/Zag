@@ -17,7 +17,8 @@ Usage: ./test.sh [target] [options]
 Targets:
   kernel          Run kernel integration tests (QEMU)
   router          Run router integration tests (pytest)
-  passthrough     Run x550 passthrough test (real hardware, requires sudo)
+  passthrough     Run x550 passthrough smoke test (real hardware, requires sudo)
+  passthrough-suite  Run full x550 passthrough test suite (requires Pis + sudo)
   kernel-fuzz     Run all kernel fuzzers (buddy, heap, vmm, rbt)
   router-fuzz     Run router packet processing fuzzer
   all             Run kernel + router tests (default)
@@ -35,7 +36,9 @@ Examples:
   ./test.sh router -k test_dns           # router DNS tests only
   ./test.sh router -f test_nat.py        # single test file
   ./test.sh router-fuzz --iterations 50000 --seed 123
-  ./test.sh passthrough                  # x550 real hardware test
+  ./test.sh passthrough                  # x550 real hardware smoke test
+  ./test.sh passthrough-suite            # full x550 test suite (needs Pis)
+  ./test.sh passthrough-suite -k test_dhcp  # specific passthrough tests
 EOF
 }
 
@@ -241,6 +244,31 @@ run_passthrough_test() {
     fi
 }
 
+run_passthrough_suite() {
+    echo "=== X550 Passthrough Test Suite ==="
+
+    # Ensure venv
+    local venv="$SCRIPT_DIR/tools/passthrough_tests/.venv"
+    if [[ ! -d "$venv" ]]; then
+        echo "Creating Python venv for passthrough tests..."
+        python3 -m venv "$venv"
+        "$venv/bin/pip" install --quiet pytest
+    fi
+
+    # QEMU lifecycle is managed by conftest fixtures, but we can pass -k filter
+    local pytest_args=("-v" "--tb=short")
+    if [[ -n "$PYTEST_K" ]]; then
+        pytest_args+=("-k" "$PYTEST_K")
+    fi
+    if [[ -n "$PYTEST_FILE" ]]; then
+        pytest_args+=("$SCRIPT_DIR/tools/passthrough_tests/$PYTEST_FILE")
+    else
+        pytest_args+=("$SCRIPT_DIR/tools/passthrough_tests/")
+    fi
+
+    "$venv/bin/pytest" "${pytest_args[@]}"
+}
+
 # ── Dispatch ──────────────────────────────────────────────────────────
 
 case "$TARGET" in
@@ -252,6 +280,9 @@ case "$TARGET" in
         ;;
     passthrough)
         run_passthrough_test
+        ;;
+    passthrough-suite)
+        run_passthrough_suite
         ;;
     kernel-fuzz)
         run_kernel_fuzzers
