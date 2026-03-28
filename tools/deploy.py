@@ -1,29 +1,32 @@
 #!/usr/bin/env python3
 """Deploy test agents and configure ethernet on all Raspberry Pis.
 
-Requires: pip install fabric
+Requires: pip install fabric (for deploy modes only)
 
 Usage:
   python3 deploy.py              # deploy pi_agent (default)
   python3 deploy.py --agent      # deploy pi_agent (explicit)
   python3 deploy.py --udp-sender # deploy legacy udp_sender
+  python3 deploy.py --renew      # trigger DHCP renewal via pi_agent HTTP API
 """
 
 import argparse
 import getpass
+import json
 import os
-
-from fabric import Connection, Config
+import urllib.request
+import urllib.error
 
 USERNAME = "alecfessler"
 
 PIES = [
-    {"wifi_ip": "192.168.86.79", "eth_ip": "192.168.1.101"},
-    {"wifi_ip": "192.168.86.78", "eth_ip": "192.168.1.102"},
-    {"wifi_ip": "192.168.86.104", "eth_ip": "192.168.1.103"},
+    {"wifi_ip": "192.168.86.79", "eth_ip": "192.168.1.101", "name": "pi1"},
+    {"wifi_ip": "192.168.86.78", "eth_ip": "192.168.1.102", "name": "pi2"},
+    {"wifi_ip": "192.168.86.104", "eth_ip": "192.168.1.103", "name": "pi3"},
 ]
 
 GATEWAY = "192.168.1.1"
+ROUTER_LAN_IP = "10.1.1.1"
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 SENDER_DIR = os.path.join(SCRIPT_DIR, "udp_sender")
@@ -88,6 +91,69 @@ def configure_dhcp(conn, eth_iface):
         conn.sudo(f"nmcli connection up '{eth_iface}'")
 
 
+def pi_agent_post(wifi_ip, path, data=None, timeout=15):
+    """Send a POST request to a Pi agent's HTTP API."""
+    url = f"http://{wifi_ip}:8080{path}"
+    body = json.dumps(data or {}).encode()
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("Content-Type", "application/json")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def pi_agent_get(wifi_ip, path, timeout=10):
+    """Send a GET request to a Pi agent's HTTP API."""
+    url = f"http://{wifi_ip}:8080{path}"
+    req = urllib.request.Request(url)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read())
+
+
+def renew_pis():
+    """Flush stale leases and trigger DHCP renewal on all Pis via pi_agent HTTP API.
+
+    Run this from Linux before rebooting into Zag. The Pis will have no valid
+    lease, so they'll broadcast DHCP DISCOVER as soon as the router appears.
+    """
+    print("=== Triggering DHCP renewal on all Pis via pi_agent ===")
+    print(f"(Router LAN will be {ROUTER_LAN_IP}/24)\n")
+
+    for pi in PIES:
+        wifi_ip = pi["wifi_ip"]
+        name = pi["name"]
+        print(f"--- {name} ({wifi_ip}) ---")
+
+        # Check health first
+        try:
+            health = pi_agent_get(wifi_ip, "/health")
+            print(f"  Current eth_ip: {health.get('eth_ip')}, gateway: {health.get('gateway')}")
+        except Exception as e:
+            print(f"  ERROR: pi_agent unreachable at {wifi_ip}:8080 ({e})")
+            continue
+
+        # Trigger DHCP renewal (flushes static IPs, releases old lease, rebinds)
+        try:
+            result = pi_agent_post(wifi_ip, "/net/dhcp_renew", timeout=25)
+            new_ip = result.get("eth_ip")
+            new_gw = result.get("gateway")
+            errors = result.get("errors")
+            if errors:
+                print(f"  DHCP warnings: {errors}")
+            print(f"  After renew: eth_ip={new_ip}, gateway={new_gw}")
+            if new_ip and new_ip.startswith("10.1.1."):
+                print(f"  Already got router IP — router must be running")
+            elif new_ip:
+                print(f"  Got IP {new_ip} (not on router subnet yet — expected before Zag boots)")
+            else:
+                print(f"  No IP yet — Pi will broadcast DHCP DISCOVER when router appears")
+        except Exception as e:
+            print(f"  ERROR: DHCP renewal failed ({e})")
+
+    print("\n=== Done ===")
+    print("Pis will auto-discover the router via DHCP when you boot Zag.")
+    print(f"Router LAN: {ROUTER_LAN_IP}/24, DHCP pool: 10.1.1.100-255")
+
+
 def deploy_sender(conn):
     """Upload and install the UDP sender service."""
     remote_dir = "/opt/udp_sender"
@@ -142,7 +208,15 @@ def main():
                         help="Deploy pi_agent test agent (default)")
     parser.add_argument("--udp-sender", action="store_true",
                         help="Deploy legacy UDP sender instead")
+    parser.add_argument("--renew", action="store_true",
+                        help="Trigger DHCP renewal via pi_agent HTTP (no SSH needed)")
     args = parser.parse_args()
+
+    if args.renew:
+        renew_pis()
+        return
+
+    from fabric import Connection, Config
 
     use_agent = not args.udp_sender
 
