@@ -1,5 +1,6 @@
 /// x550 NIC driver — parameterized, no globals.
 /// Intel X550-T2 10GbE controller. Uses legacy descriptors for compatibility.
+const build_options = @import("build_options");
 const lib = @import("lib");
 
 const e1000 = @import("e1000.zig");
@@ -124,23 +125,59 @@ pub fn init(p: InitParams) bool {
     writeReg(base, REG_EIMC, 0x7FFFFFFF);
     _ = readReg(base, REG_EICR);
 
-    // Skip software reset for VFIO passthrough — the device was already
-    // initialized by host firmware. A reset through VFIO can leave the NVM
-    // inaccessible and registers reading as 0. Instead, just disable RX/TX,
-    // reconfigure the rings, and re-enable.
+    if (build_options.passthrough) {
+        // VFIO passthrough: device was already initialized by host firmware.
+        // A reset through VFIO can leave the NVM inaccessible and registers
+        // reading as 0. Just disable RX/TX, reconfigure rings, and re-enable.
+        writeReg(base, REG_RXCTRL, readReg(base, REG_RXCTRL) & ~@as(u32, RXCTRL_RXEN));
+        writeReg(base, REG_DMATXCTL, readReg(base, REG_DMATXCTL) & ~@as(u32, DMATXCTL_TE));
+        writeReg(base, REG_RXDCTL, readReg(base, REG_RXDCTL) & ~@as(u32, RXDCTL_ENABLE));
+        writeReg(base, REG_TXDCTL, readReg(base, REG_TXDCTL) & ~@as(u32, TXDCTL_ENABLE));
+        var delay: u32 = 0;
+        while (delay < 10_000) : (delay += 1) {
+            asm volatile ("pause");
+        }
+    } else {
+        // Bare metal: full init per datasheet Section 4.6.3.
+        // 2. Software reset (global reset = software reset + link reset)
+        syscall.write("x550: resetting...\n");
+        writeReg(base, REG_CTRL, readReg(base, REG_CTRL) | CTRL_RST);
+        if (!pollWithTimeout(base, REG_CTRL, CTRL_RST, 0, 1_000_000)) {
+            syscall.write("x550: reset timeout\n");
+            return false;
+        }
+        syscall.write("x550: reset done\n");
 
-    // Disable RX and TX before reconfiguring
-    writeReg(base, REG_RXCTRL, readReg(base, REG_RXCTRL) & ~@as(u32, RXCTRL_RXEN));
-    writeReg(base, REG_DMATXCTL, readReg(base, REG_DMATXCTL) & ~@as(u32, DMATXCTL_TE));
+        // Wait at least 10ms after reset (datasheet 4.6.3.2)
+        var d: u32 = 0;
+        while (d < 10_000_000) : (d += 1) {
+            asm volatile ("pause");
+        }
 
-    // Disable queue 0 RX/TX
-    writeReg(base, REG_RXDCTL, readReg(base, REG_RXDCTL) & ~@as(u32, RXDCTL_ENABLE));
-    writeReg(base, REG_TXDCTL, readReg(base, REG_TXDCTL) & ~@as(u32, TXDCTL_ENABLE));
+        // 3. Disable interrupts again after reset
+        writeReg(base, REG_EIMC, 0x7FFFFFFF);
+        _ = readReg(base, REG_EICR);
 
-    // Brief pause for queues to drain
-    var delay: u32 = 0;
-    while (delay < 10_000) : (delay += 1) {
-        asm volatile ("pause");
+        // 4. Wait for NVM auto-read completion
+        if (!pollWithTimeout(base, REG_EEC, EEC_AUTO_RD, EEC_AUTO_RD, 1_000_000)) {
+            syscall.write("x550: NVM auto-read timeout\n");
+            return false;
+        }
+        syscall.write("x550: NVM ready\n");
+
+        // 5. Wait for manageability configuration done
+        if (!pollWithTimeout(base, REG_EEMNGCTL, EEMNGCTL_CFG_DONE0, EEMNGCTL_CFG_DONE0, 1_000_000)) {
+            syscall.write("x550: mgmt config timeout\n");
+            return false;
+        }
+        syscall.write("x550: mgmt ready\n");
+
+        // 6. Wait for DMA initialization done
+        if (!pollWithTimeout(base, REG_RDRXCTL, RDRXCTL_DMAIDONE, RDRXCTL_DMAIDONE, 1_000_000)) {
+            syscall.write("x550: DMA init timeout\n");
+            return false;
+        }
+        syscall.write("x550: DMA ready\n");
     }
 
     // 7. Clear multicast table

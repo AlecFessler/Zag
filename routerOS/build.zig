@@ -38,9 +38,11 @@ fn buildRouterChild(
     target: std.Build.ResolvedTarget,
     lib_mod: *std.Build.Module,
 ) std.Build.LazyPath {
-    const nic_driver = b.option([]const u8, "nic", "NIC driver: e1000 or x550 (default: e1000)") orelse "e1000";
+    const nic_driver = b.option([]const u8, "nic", "NIC driver: e1000 or x550 (default: x550)") orelse "x550";
+    const passthrough = b.option(bool, "passthrough", "NIC is pre-initialized by host (VFIO passthrough)") orelse false;
     const options = b.addOptions();
     options.addOption(bool, "use_x550", std.mem.eql(u8, nic_driver, "x550"));
+    options.addOption(bool, "passthrough", passthrough);
 
     const child_app_mod = b.createModule(.{
         .root_source_file = b.path("router/router.zig"),

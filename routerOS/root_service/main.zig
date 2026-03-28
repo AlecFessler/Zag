@@ -26,6 +26,7 @@ var children: [MAX_CHILDREN]ChildInfo = undefined;
 var num_children: u32 = 0;
 var perm_view_global: u64 = 0;
 var watchdog_counter = std.atomic.Value(u32).init(0);
+var boot_info_chan: ?channel_mod.Channel = null;
 
 fn findChildByService(service_id: u32) ?*ChildInfo {
     for (children[0..num_children]) |*child| {
@@ -277,6 +278,7 @@ fn watchdogThread() void {
             syscall.write(" died, reason=");
             syscall.write(crashReasonName(reason));
             syscall.write("\n");
+            sendWatchdogGui("died", child.name, crashReasonName(reason), 0);
             return;
         }
 
@@ -290,12 +292,32 @@ fn watchdogThread() void {
             syscall.write("), reason=");
             syscall.write(crashReasonName(reason));
             syscall.write("\n");
+            sendWatchdogGui("restarted", child.name, crashReasonName(reason), restart_count);
             last_restart_count = restart_count;
         }
 
         _ = syscall.futex_wait(@ptrCast(&entry.field0), last_field0, std.math.maxInt(u64));
         last_field0 = @as(*const volatile u64, @ptrCast(&entry.field0)).*;
     }
+}
+
+fn sendWatchdogGui(event: []const u8, name: []const u8, reason: []const u8, count: u16) void {
+    var chan = &(boot_info_chan orelse return);
+    var buf: [128]u8 = undefined;
+    var p: usize = 0;
+    p = appendStr(&buf, p, "watchdog: ");
+    p = appendStr(&buf, p, name);
+    p = appendStr(&buf, p, " ");
+    p = appendStr(&buf, p, event);
+    if (count > 0) {
+        p = appendStr(&buf, p, " (count=");
+        p = appendDec(&buf, p, count);
+        p = appendStr(&buf, p, ")");
+    }
+    p = appendStr(&buf, p, ", reason=");
+    p = appendStr(&buf, p, reason);
+    p = appendStr(&buf, p, "\n");
+    _ = chan.send(buf[0..p]);
 }
 
 fn writeU16(val: u16) void {
@@ -347,7 +369,8 @@ fn sendBootInfo(desktop_env: *ChildInfo) void {
     if (syscall.shm_map(@intCast(data_shm), @intCast(data_vm.val), 0) != 0) return;
 
     const chan_header: *channel_mod.ChannelHeader = @ptrFromInt(data_vm.val2);
-    var chan = channel_mod.Channel.initAsSideA(chan_header, 4 * syscall.PAGE4K);
+    boot_info_chan = channel_mod.Channel.initAsSideA(chan_header, 4 * syscall.PAGE4K);
+    var chan = &boot_info_chan.?;
 
     // Grant SHM to desktop_env
     const grant_rights = (perms.SharedMemoryRights{
@@ -518,6 +541,42 @@ pub fn main(perm_view_addr: u64) void {
         perm_view_addr,
         serial_devices[0..serial_count],
     );
+    // Spawn compositor/desktop BEFORE router so the framebuffer initializes
+    // before the NIC init (which may fault on bare metal).
+    var display_count: u32 = 0;
+    if (build_options.use_desktop) {
+        var display_devices: [2]DeviceGrant = undefined;
+        display_count = findAllMmioDevicesByClass(perm_view_addr, .display, &display_devices);
+        if (display_count > 0) {
+            syscall.write("root: spawning compositor\n");
+            _ = spawnChild(
+                "compositor",
+                embedded.compositor,
+                shm_protocol.ServiceId.COMPOSITOR,
+                .{ .grant_to = true, .mem_reserve = true, .device_own = true, .restart = true },
+                &.{},
+                perm_view_addr,
+                display_devices[0..display_count],
+            );
+
+            syscall.write("root: spawning desktop_env\n");
+            _ = spawnChild(
+                "desktop_env",
+                embedded.desktop_env,
+                shm_protocol.ServiceId.DESKTOP_ENV,
+                .{ .grant_to = true, .mem_reserve = true, .restart = true },
+                &.{ shm_protocol.ServiceId.COMPOSITOR, shm_protocol.ServiceId.ROUTER },
+                perm_view_addr,
+                &.{},
+            );
+
+            // Send boot info to desktop_env
+            if (findChildByService(shm_protocol.ServiceId.DESKTOP_ENV)) |de| {
+                sendBootInfo(de);
+            }
+        }
+    }
+
     syscall.write("root: spawning router\n");
 
     // Router process owns NIC devices directly (monolithic NIC+router)
@@ -584,40 +643,6 @@ pub fn main(perm_view_addr: u64) void {
         perm_view_addr,
         &.{},
     );
-
-    var display_count: u32 = 0;
-    if (build_options.use_desktop) {
-        var display_devices: [2]DeviceGrant = undefined;
-        display_count = findAllMmioDevicesByClass(perm_view_addr, .display, &display_devices);
-        if (display_count > 0) {
-            syscall.write("root: spawning compositor\n");
-            _ = spawnChild(
-                "compositor",
-                embedded.compositor,
-                shm_protocol.ServiceId.COMPOSITOR,
-                .{ .grant_to = true, .mem_reserve = true, .device_own = true, .restart = true },
-                &.{},
-                perm_view_addr,
-                display_devices[0..display_count],
-            );
-
-            syscall.write("root: spawning desktop_env\n");
-            _ = spawnChild(
-                "desktop_env",
-                embedded.desktop_env,
-                shm_protocol.ServiceId.DESKTOP_ENV,
-                .{ .grant_to = true, .mem_reserve = true, .restart = true },
-                &.{ shm_protocol.ServiceId.COMPOSITOR, shm_protocol.ServiceId.ROUTER },
-                perm_view_addr,
-                &.{},
-            );
-
-            // Send boot info to desktop_env
-            if (findChildByService(shm_protocol.ServiceId.DESKTOP_ENV)) |de| {
-                sendBootInfo(de);
-            }
-        }
-    }
 
     // Spawn watchdog threads for each child
     var wi: u32 = 0;

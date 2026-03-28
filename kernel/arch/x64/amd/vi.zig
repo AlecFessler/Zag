@@ -84,11 +84,20 @@ pub fn init(reg_base_phys: PAddr) !void {
     }
     iommu_base = VAddr.fromPAddr(reg_base_phys, null).addr;
 
-    const dt_pages: u32 = 1;
+    // Full device table: 65536 entries × 32 bytes = 2MB = 512 pages.
+    // Must be physically contiguous since the IOMMU hardware walks it.
+    const dt_pages: u32 = 512;
     dev_table_size = @as(u64, dt_pages) * paging.PAGE4K;
-    const dt = try allocZeroedPage();
-    dev_table_phys = dt.phys;
-    dev_table_virt = dt.virt;
+    const pmm_iface = pmm.global_pmm.?.allocator();
+    const dt_mem = pmm_iface.rawAlloc(
+        dev_table_size,
+        std.mem.Alignment.fromByteUnits(paging.PAGE4K),
+        0,
+    ) orelse return error.OutOfMemory;
+    @memset(dt_mem[0..dev_table_size], 0);
+    const dt_virt = VAddr.fromInt(@intFromPtr(dt_mem));
+    dev_table_phys = PAddr.fromVAddr(dt_virt, null);
+    dev_table_virt = dt_virt;
 
     const dt_entries = dev_table_size / 32;
     const dt_size_bits: u64 = std.math.log2(dt_entries) - 1;

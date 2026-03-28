@@ -86,6 +86,13 @@ pub const CommandChannel = extern struct {
         _ = syscall.futex_wait(&self.wake_flag, current, MAX_TIMEOUT);
     }
 
+    /// Wait for a broker-established connection notification (signals reply_flag).
+    /// Used by target processes that receive connections rather than request them.
+    pub fn waitForNotification(self: *CommandChannel, timeout_ns: u64) void {
+        const current = @atomicLoad(u64, &self.reply_flag, .acquire);
+        _ = syscall.futex_wait(&self.reply_flag, current, timeout_ns);
+    }
+
     pub fn notifyChild(self: *CommandChannel) void {
         _ = @atomicRmw(u64, &self.reply_flag, .Add, 1, .release);
         _ = syscall.futex_wake(&self.reply_flag, 1);

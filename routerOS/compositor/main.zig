@@ -39,6 +39,11 @@ var display: DisplayInfo = undefined;
 var visible_cols: u32 = 0;
 var visible_rows: u32 = 0;
 
+// Track mapped SHM handles
+var mapped_shm_handles: [8]u64 = .{0} ** 8;
+var num_mapped_shms: u32 = 0;
+var perm_view_global: u64 = 0;
+
 fn packPixel(c: Color) u32 {
     if (display.pixel_format == 0) { // BGR8
         return @as(u32, c.b) | (@as(u32, c.g) << 8) | (@as(u32, c.r) << 16);
@@ -167,21 +172,47 @@ fn mmioMap(device_handle: u64, size: u64) ?[*]volatile u32 {
     return @ptrFromInt(vm.val2);
 }
 
-fn mapDataChannel(shm_handle: u64, shm_size: u64) ?*channel_mod.ChannelHeader {
-    const vm_rights = (perms.VmReservationRights{
-        .read = true,
-        .write = true,
-        .execute = true,
-        .shareable = true,
-    }).bits();
-    const vm = syscall.vm_reserve(0, shm_size, vm_rights);
-    if (vm.val < 0) return null;
-    if (syscall.shm_map(shm_handle, @intCast(vm.val), 0) != 0) return null;
-    return @ptrFromInt(vm.val2);
+fn isHandleMapped(handle: u64) bool {
+    for (mapped_shm_handles[0..num_mapped_shms]) |h| {
+        if (h == handle) return true;
+    }
+    return false;
+}
+
+fn recordMapped(handle: u64) void {
+    if (num_mapped_shms < mapped_shm_handles.len) {
+        mapped_shm_handles[num_mapped_shms] = handle;
+        num_mapped_shms += 1;
+    }
+}
+
+/// Find and map the next unmapped data SHM from the perm view.
+fn findAndMapNextDataShm() ?*channel_mod.ChannelHeader {
+    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_global);
+    for (view) |*entry| {
+        if (entry.entry_type != pv.ENTRY_TYPE_SHARED_MEMORY) continue;
+        if (entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) continue;
+        if (isHandleMapped(entry.handle)) continue;
+
+        const vm_rights = (perms.VmReservationRights{
+            .read = true,
+            .write = true,
+            .execute = true,
+            .shareable = true,
+        }).bits();
+        const vm = syscall.vm_reserve(0, entry.field0, vm_rights);
+        if (vm.val < 0) continue;
+        if (syscall.shm_map(entry.handle, @intCast(vm.val), 0) != 0) continue;
+
+        recordMapped(entry.handle);
+        return @ptrFromInt(vm.val2);
+    }
+    return null;
 }
 
 pub fn main(perm_view_addr: u64) void {
-    syscall.write("compositor: starting\n");
+    perm_view_global = perm_view_addr;
+    // compositor: starting (display only, no serial)
 
     display = findDisplay(perm_view_addr) orelse {
         syscall.write("compositor: no display device found\n");
@@ -214,34 +245,37 @@ pub fn main(perm_view_addr: u64) void {
 
     appendLine("compositor: display initialized");
     renderTextBuffer();
-    syscall.write("compositor: display initialized\n");
+    // display initialized (shown on framebuffer)
 
-    // Map command channel for IPC
+    // Map command channel for IPC — record its handle so we skip it
     const cmd = shm_protocol.mapCommandChannel(perm_view_addr) orelse {
         appendLine("compositor: no command channel");
         renderTextBuffer();
-        // Spin — no IPC possible
         while (true) syscall.thread_yield();
     };
+    {
+        const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
+        for (view) |*entry| {
+            if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) {
+                recordMapped(entry.handle);
+                break;
+            }
+        }
+    }
 
-    // Wait for incoming connections
+    // Wait for incoming connections — scan perm view for data SHMs
     var recv_buf: [1024]u8 = undefined;
     var chan: ?channel_mod.Channel = null;
 
     while (true) {
-        // Check for new connections
+        // Check for new data SHM (connection from desktop_env)
         if (chan == null) {
-            for (cmd.connections[0..cmd.num_connections]) |*entry| {
-                if (@as(*volatile u32, &entry.status).* == @intFromEnum(shm_protocol.ConnectionStatus.connected)) {
-                    if (entry.shm_handle != 0) {
-                        if (mapDataChannel(entry.shm_handle, entry.shm_size)) |header| {
-                            chan = channel_mod.Channel.openAsSideB(header);
-                            if (chan != null) {
-                                appendLine("compositor: client connected");
-                                renderTextBuffer();
-                            }
-                        }
-                    }
+            if (findAndMapNextDataShm()) |header| {
+                chan = channel_mod.Channel.openAsSideA(header);
+                if (chan != null) {
+                    appendLine("compositor: client connected");
+                    renderTextBuffer();
+                    // client connected (shown on framebuffer)
                 }
             }
         }
@@ -254,8 +288,8 @@ pub fn main(perm_view_addr: u64) void {
             }
             c.waitForMessage(50_000_000); // 50ms timeout
         } else {
-            // No connections yet — poll command channel
-            cmd.waitForAnyRequest();
+            // No connections yet — wait for broker notification
+            cmd.waitForNotification(50_000_000);
         }
     }
 }

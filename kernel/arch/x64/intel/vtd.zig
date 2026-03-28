@@ -24,11 +24,13 @@ const GCMD_SRTP: u32 = 1 << 30;
 const GSTS_TES: u32 = 1 << 31;
 const GSTS_RTPS: u32 = 1 << 30;
 
+const REG_ECAP = 0x10;
 const REG_GCMD = 0x18;
 const REG_GSTS = 0x1C;
 const REG_RTADDR = 0x20;
 const REG_CCMD = 0x28;
-const REG_IOTLB = 0x100;
+
+var iotlb_offset: u32 = 0;
 
 const RootEntry = packed struct(u128) {
     present: bool,
@@ -85,6 +87,10 @@ pub fn init(reg_base_phys: PAddr) !void {
 
     try arch.mapPage(memory_init.kernel_addr_space_root, reg_base_phys, reg_base_virt, MMIO_PERMS);
     iommu_base = reg_base_virt.addr;
+
+    // Read IOTLB register offset from ECAP.IRO (bits 17:8), shifted left by 4
+    const ecap: u64 = @as(*const volatile u64, @ptrFromInt(iommu_base + REG_ECAP)).*;
+    iotlb_offset = @truncate(((ecap >> 8) & 0x3FF) << 4);
 
     const root = try allocZeroedPage();
     root_table_phys = root.phys;
@@ -221,10 +227,11 @@ fn invalidateContextCache() void {
 }
 
 pub fn invalidateIotlb() void {
-    writeReg64(REG_IOTLB + 8, @as(u64, 1) << 63 | @as(u64, 1) << 60);
+    const reg = iotlb_offset + 8;
+    writeReg64(reg, @as(u64, 1) << 63 | @as(u64, 1) << 60);
     var timeout: u32 = 0;
     while (timeout < 1000000) : (timeout += 1) {
-        const val = @as(*const volatile u64, @ptrFromInt(iommu_base + REG_IOTLB + 8)).*;
+        const val = @as(*const volatile u64, @ptrFromInt(iommu_base + reg)).*;
         if (val & (@as(u64, 1) << 63) == 0) break;
     }
 }

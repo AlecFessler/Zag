@@ -540,6 +540,35 @@ pub fn processPacket(role: Interface, pkt: []u8, len: u32) PacketAction {
     return .consumed;
 }
 
+fn sendDesktopMsg(msg: []const u8) void {
+    if (desktop_chan) |*dc| {
+        _ = dc.send(msg);
+    }
+}
+
+fn sendDesktopStats(chan: *channel_mod.Channel) void {
+    var buf: [128]u8 = undefined;
+    {
+        var p: usize = 0;
+        p = util.appendStr(&buf, p, "WAN rx=");
+        p = util.appendDec(&buf, p, wan_iface.stats.rx_packets);
+        p = util.appendStr(&buf, p, " tx=");
+        p = util.appendDec(&buf, p, wan_iface.stats.tx_packets);
+        p = util.appendStr(&buf, p, " drop=");
+        p = util.appendDec(&buf, p, wan_iface.stats.rx_dropped);
+        if (has_lan) {
+            p = util.appendStr(&buf, p, " | LAN rx=");
+            p = util.appendDec(&buf, p, lan_iface.stats.rx_packets);
+            p = util.appendStr(&buf, p, " tx=");
+            p = util.appendDec(&buf, p, lan_iface.stats.tx_packets);
+            p = util.appendStr(&buf, p, " drop=");
+            p = util.appendDec(&buf, p, lan_iface.stats.rx_dropped);
+        }
+        p = util.appendStr(&buf, p, "\n");
+        _ = chan.send(buf[0..p]);
+    }
+}
+
 fn sendDesktopBootInfo(chan: *channel_mod.Channel) void {
     _ = chan.send("--- Router Status ---\n");
 
@@ -597,7 +626,7 @@ fn sendDesktopBootInfo(chan: *channel_mod.Channel) void {
 }
 
 fn detectAppChannels(view: *const [MAX_PERMS]pv.UserViewEntry, mapped_handles: *[8]u64, mapped_count: *u32) void {
-    if (console_chan != null and nfs_chan != null and ntp_chan != null and http_chan != null and desktop_chan != null) return;
+    if (console_chan != null and nfs_chan != null and ntp_chan != null and http_chan != null) return;
     for (view) |*entry| {
         if (entry.entry_type != pv.ENTRY_TYPE_SHARED_MEMORY or entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) continue;
         var is_known = false;
@@ -626,15 +655,19 @@ fn detectAppChannels(view: *const [MAX_PERMS]pv.UserViewEntry, mapped_handles: *
                     if (id_buf[0] == shm_protocol.ServiceId.NFS_CLIENT and nfs_chan == null) {
                         nfs_chan = ch;
                         log.write(.nfs_connected);
+                        sendDesktopMsg("router: nfs_client connected\n");
                     } else if (id_buf[0] == shm_protocol.ServiceId.NTP_CLIENT and ntp_chan == null) {
                         ntp_chan = ch;
                         log.write(.ntp_connected);
+                        sendDesktopMsg("router: ntp_client connected\n");
                     } else if (id_buf[0] == shm_protocol.ServiceId.HTTP_SERVER and http_chan == null) {
                         http_chan = ch;
                         log.write(.http_connected);
+                        sendDesktopMsg("router: http_server connected\n");
                     } else if (id_buf[0] == shm_protocol.ServiceId.CONSOLE and console_chan == null) {
                         console_chan = ch;
                         log.write(.console_connected);
+                        sendDesktopMsg("router: console connected\n");
                     } else if (id_buf[0] == shm_protocol.ServiceId.DESKTOP_ENV and desktop_chan == null) {
                         desktop_chan = ch;
                         sendDesktopBootInfo(&ch);
@@ -1214,7 +1247,7 @@ fn pollOnce(self_iface: *Iface, other_iface: *Iface, role: Interface) void {
     nic.clearIrq(self_iface.mmio_base);
     const rx = self_iface.rxPoll() orelse return;
 
-    // Log first few packets per interface for debugging
+    // Log first few packets per interface for debugging (serial + GUI)
     const log_count = if (role == .wan) &wan_rx_log_count else &lan_rx_log_count;
     if (log_count.* < 5) {
         log_count.* += 1;
@@ -1222,6 +1255,19 @@ fn pollOnce(self_iface: *Iface, other_iface: *Iface, role: Interface) void {
             syscall.write("router: WAN RX packet\n");
         } else {
             syscall.write("router: LAN RX packet\n");
+        }
+        // Also send to GUI for bare-metal visibility
+        if (desktop_chan) |*dc| {
+            var dbg_buf: [64]u8 = undefined;
+            var p: usize = 0;
+            p = util.appendStr(&dbg_buf, p, "router: ");
+            p = util.appendStr(&dbg_buf, p, if (role == .wan) "WAN" else "LAN");
+            p = util.appendStr(&dbg_buf, p, " RX #");
+            p = util.appendDec(&dbg_buf, p, log_count.*);
+            p = util.appendStr(&dbg_buf, p, " len=");
+            p = util.appendDec(&dbg_buf, p, rx.len);
+            p = util.appendStr(&dbg_buf, p, "\n");
+            _ = dc.send(dbg_buf[0..p]);
         }
     }
     const buf_ptr = self_iface.rxBufPtr(rx.index);
@@ -1264,6 +1310,7 @@ fn serviceThread() void {
     var loop_n: u32 = 0;
 
     log.write(.service_started);
+    syscall.write("router: service thread started\n");
 
     var svc_arena = Arena.init(1 << 30) orelse return;
     const a = svc_arena.allocator();
@@ -1347,6 +1394,13 @@ fn serviceThread() void {
         periodicMaintenance();
         ping_mod.checkTimeout();
         ping_mod.checkTracerouteTimeout();
+
+        // Send live stats to desktop display (~every 0.5s)
+        if (loop_n % 500 == 0) {
+            if (desktop_chan) |*dc| {
+                sendDesktopStats(dc);
+            }
+        }
 
         // Drain log ring buffer and flush to NFS
         log.drainAndFlush(&nfs_chan, loop_n);
