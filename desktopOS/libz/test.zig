@@ -99,7 +99,8 @@ pub fn waitUntilAtLeast(ptr: *volatile u64, min: u64) void {
 }
 
 pub fn waitForCleanup(handle: u64) void {
+    var dummy: u64 = 0;
     while (syscall.revoke_perm(handle) != -3) {
-        syscall.thread_yield();
+        _ = syscall.futex_wait(&dummy, 0, 1_000_000); // 1ms backoff
     }
 }

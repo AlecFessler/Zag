@@ -33,6 +33,7 @@ const shm_protocol = lib.shm_protocol;
 const syscall = lib.syscall;
 
 const MAX_PERMS = 128;
+const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 pub const lan_subnet: [4]u8 = .{ 10, 1, 1, 0 };
 pub const lan_mask: [4]u8 = .{ 255, 255, 255, 0 };
 pub const lan_broadcast: [4]u8 = .{ 10, 1, 1, 255 };
@@ -606,7 +607,7 @@ fn detectAppChannels(view: *const [MAX_PERMS]pv.UserViewEntry, mapped_handles: *
                 }
                 break;
             }
-            syscall.thread_yield();
+            ch.rx.waitForData(10_000_000); // 10ms
         }
         break;
     }
@@ -659,13 +660,13 @@ pub fn main(perm_view_addr: u64) void {
     while (true) {
         nics = findNicDevices(perm_view_addr);
         if (nics.wan != null) break;
-        syscall.thread_yield();
+        pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
     // Also wait for LAN if not yet visible
     if (nics.lan == null) {
         var retry: u32 = 0;
         while (retry < 200 and nics.lan == null) : (retry += 1) {
-            syscall.thread_yield();
+            pv.waitForChange(perm_view_addr, 10_000_000); // 10ms
             nics = findNicDevices(perm_view_addr);
         }
     }
@@ -674,14 +675,14 @@ pub fn main(perm_view_addr: u64) void {
     const wan_mmio_size = if (wan_nic.mmio_size == 0) syscall.PAGE4K else wan_nic.mmio_size;
     const wan_mmio = mmioMap(wan_nic.handle, wan_mmio_size) orelse {
         syscall.write("router: WAN MMIO fail — halted\n");
-        while (true) syscall.thread_yield();
+        while (true) pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     };
 
     // DMA setup — create SHM, map WAN, optionally also map LAN
     const lan_handle: ?u64 = if (nics.lan) |ln| ln.handle else null;
     var region = dma.setupWan(wan_nic.handle, lan_handle) orelse {
         syscall.write("router: DMA fail — halted\n");
-        while (true) syscall.thread_yield();
+        while (true) pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     };
     const dual_dma_ok = region.lan_dma_base != 0;
 
@@ -712,7 +713,7 @@ pub fn main(perm_view_addr: u64) void {
         .tx_descs = region.wanTxDescs(),
     })) {
         syscall.write("router: WAN NIC init fail — halted\n");
-        while (true) syscall.thread_yield();
+        while (true) pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
     _ = syscall.pci_enable_bus_master(wan_nic.handle);
     wan_iface.mac = nic.readMac(wan_mmio);

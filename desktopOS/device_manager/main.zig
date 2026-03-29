@@ -8,6 +8,7 @@ const shm_protocol = lib.shm_protocol;
 const syscall = lib.syscall;
 
 const MAX_PERMS = 128;
+const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 const MAX_DRIVERS = 8;
 
 const MSG_DRIVER_AVAILABLE: u8 = 0x01;
@@ -270,7 +271,7 @@ pub fn main(perm_view_addr: u64) void {
                 break;
             }
         }
-        if (am_shm_handle == 0) syscall.thread_yield();
+        if (am_shm_handle == 0) pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
     recordMapped(&mapped_handles, &num_mapped, am_shm_handle);
 
@@ -369,14 +370,30 @@ pub fn main(perm_view_addr: u64) void {
             }
         }
 
-        // Check for spawn requests from compositor (Super+T hotkey)
+        // Check for flags from compositor
         if (findDriverByService(shm_protocol.ServiceId.COMPOSITOR)) |comp_drv| {
             if (comp_drv.cmd_channel) |comp_cmd| {
                 const flags = @atomicLoad(u32, &comp_cmd.child_flags, .acquire);
-                if (flags & shm_protocol.CHILD_FLAG_SPAWN_APP != 0) {
-                    @atomicStore(u32, &comp_cmd.child_flags, flags & ~shm_protocol.CHILD_FLAG_SPAWN_APP, .release);
-                    _ = am_chan.send(&[_]u8{MSG_SPAWN_APP});
-                    syscall.write("device_manager: forwarding spawn request\n");
+                if (flags != 0) {
+                    @atomicStore(u32, &comp_cmd.child_flags, 0, .release);
+                    if (flags & shm_protocol.CHILD_FLAG_SPAWN_APP != 0) {
+                        _ = am_chan.send(&[_]u8{MSG_SPAWN_APP});
+                        syscall.write("device_manager: forwarding spawn request\n");
+                    }
+                    if (flags & shm_protocol.CHILD_FLAG_ACTIVE_CHANGED != 0) {
+                        const app_idx = @atomicLoad(u8, &comp_cmd.active_app_index, .acquire);
+                        // Relay to all driver children
+                        for (drivers[0..num_drivers]) |*drv| {
+                            if (drv.cmd_channel) |child_cmd| {
+                                @atomicStore(u8, &child_cmd.active_app_index, app_idx, .release);
+                                _ = @atomicRmw(u64, &child_cmd.active_app_gen, .Add, 1, .release);
+                                _ = syscall.futex_wake(&child_cmd.active_app_gen, 1);
+                            }
+                        }
+                        // Also tell app_manager
+                        var changed: [2]u8 = .{ MSG_ACTIVE_APP_CHANGED, app_idx };
+                        _ = am_chan.send(&changed);
+                    }
                 }
             }
         }

@@ -8,6 +8,7 @@ const shm_protocol = lib.shm_protocol;
 const syscall = lib.syscall;
 
 const MAX_PERMS = 128;
+const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 const MAX_APPS = 16;
 const MAX_BUCKET_ENTRIES = 16;
 
@@ -252,7 +253,7 @@ pub fn main(perm_view_addr: u64) void {
                 break;
             }
         }
-        if (dm_shm_handle == 0) syscall.thread_yield();
+        if (dm_shm_handle == 0) pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
     recordMapped(dm_shm_handle);
 

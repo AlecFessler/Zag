@@ -9,6 +9,7 @@ const shm_protocol = lib.shm_protocol;
 const syscall = lib.syscall;
 
 const MAX_PERMS = 128;
+const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 const MAX_APP_FBS = 4;
 const MOUSE_CHAN_SIZE: u64 = 4 * syscall.PAGE4K; // 16 KB
 const MAX_PIXELS: u64 = (fb_proto.FRAMEBUFFER_SHM_SIZE - fb_proto.PIXEL_DATA_OFFSET) / 4;
@@ -66,185 +67,38 @@ const cursor_outline = [CURSOR_H]u16{
 };
 
 // ── App framebuffers ───────────────────────────────────────────────
+const STALE_HEARTBEAT: u32 = 1_000_000; // iterations without heartbeat change → dead
+
 const AppFramebuffer = struct {
-    header: *volatile fb_proto.FramebufferHeader,
+    header: *fb_proto.FramebufferHeader,
     last_frame: u64,
+    last_heartbeat: u64,
+    stale_count: u32,
     shm_handle: u64,
     win_x: u32,
     win_y: u32,
     win_w: u32,
     win_h: u32,
+    alive: bool = true,
 };
 
 var app_fbs: [MAX_APP_FBS]AppFramebuffer = undefined;
 var num_app_fbs: u32 = 0;
 var active_app: u32 = 0;
 
-// ── Tiling tree ───────────────────────────────────────────────────
-const SplitDir = enum(u8) { horizontal, vertical };
-
-const TileNode = struct {
-    occupied: bool = false,
-    is_leaf: bool = true,
-    app_index: u8 = 0,
-    split_dir: SplitDir = .horizontal,
-};
-
-const MAX_TILE_NODES = 15;
-var tile_tree: [MAX_TILE_NODES]TileNode = [_]TileNode{.{}} ** MAX_TILE_NODES;
-
-fn tileLeft(i: usize) usize {
-    return 2 * i + 1;
-}
-
-fn tileRight(i: usize) usize {
-    return 2 * i + 2;
-}
-
-fn addWindowToTree(app_index: u8) void {
-    // If tree is empty, root becomes the leaf
-    if (!tile_tree[0].occupied) {
-        tile_tree[0] = .{ .occupied = true, .is_leaf = true, .app_index = app_index };
-        return;
-    }
-
-    // Find the leaf to split — use the active app's leaf, or the first leaf
-    var target: usize = 0;
-    if (findLeafByApp(0, active_app)) |idx| {
-        target = idx;
-    } else {
-        target = findFirstLeaf(0) orelse return;
-    }
-
-    const left = tileLeft(target);
-    const right = tileRight(target);
-    if (left >= MAX_TILE_NODES or right >= MAX_TILE_NODES) return;
-
-    // Determine split direction based on depth
-    const depth = tileDepth(target);
-    const dir: SplitDir = if (depth % 2 == 0) .horizontal else .vertical;
-
-    // Old leaf content goes left, new app goes right
-    const old_app = tile_tree[target].app_index;
-    tile_tree[target] = .{ .occupied = true, .is_leaf = false, .split_dir = dir };
-    tile_tree[left] = .{ .occupied = true, .is_leaf = true, .app_index = old_app };
-    tile_tree[right] = .{ .occupied = true, .is_leaf = true, .app_index = app_index };
-}
-
-fn removeWindowFromTree(app_index: u8) void {
-    const leaf_idx = findLeafByApp(0, app_index) orelse return;
-
-    if (leaf_idx == 0) {
-        // Root leaf — just clear it
-        tile_tree[0].occupied = false;
-        return;
-    }
-
-    // Find parent and sibling
-    const parent_idx = (leaf_idx - 1) / 2;
-    const sibling_idx = if (leaf_idx == tileLeft(parent_idx)) tileRight(parent_idx) else tileLeft(parent_idx);
-
-    // Sibling replaces parent
-    tile_tree[parent_idx] = tile_tree[sibling_idx];
-
-    // If sibling was a split node, move its subtree up
-    if (!tile_tree[sibling_idx].is_leaf) {
-        copySubtree(sibling_idx, parent_idx);
-    }
-
-    // Clear old positions
-    clearSubtree(sibling_idx);
-    tile_tree[leaf_idx].occupied = false;
-}
-
-fn copySubtree(from: usize, to: usize) void {
-    const from_l = tileLeft(from);
-    const from_r = tileRight(from);
-    const to_l = tileLeft(to);
-    const to_r = tileRight(to);
-    if (from_l >= MAX_TILE_NODES or to_l >= MAX_TILE_NODES) return;
-
-    tile_tree[to_l] = tile_tree[from_l];
-    tile_tree[to_r] = tile_tree[from_r];
-
-    if (tile_tree[from_l].occupied and !tile_tree[from_l].is_leaf) {
-        copySubtree(from_l, to_l);
-    }
-    if (tile_tree[from_r].occupied and !tile_tree[from_r].is_leaf) {
-        copySubtree(from_r, to_r);
-    }
-}
-
-fn clearSubtree(idx: usize) void {
-    tile_tree[idx].occupied = false;
-    const l = tileLeft(idx);
-    const r = tileRight(idx);
-    if (l < MAX_TILE_NODES and tile_tree[l].occupied) clearSubtree(l);
-    if (r < MAX_TILE_NODES and tile_tree[r].occupied) clearSubtree(r);
-}
-
-fn findLeafByApp(idx: usize, app_index: u32) ?usize {
-    if (idx >= MAX_TILE_NODES or !tile_tree[idx].occupied) return null;
-    if (tile_tree[idx].is_leaf) {
-        if (tile_tree[idx].app_index == @as(u8, @intCast(app_index))) return idx;
-        return null;
-    }
-    return findLeafByApp(tileLeft(idx), app_index) orelse findLeafByApp(tileRight(idx), app_index);
-}
-
-fn findFirstLeaf(idx: usize) ?usize {
-    if (idx >= MAX_TILE_NODES or !tile_tree[idx].occupied) return null;
-    if (tile_tree[idx].is_leaf) return idx;
-    return findFirstLeaf(tileLeft(idx)) orelse findFirstLeaf(tileRight(idx));
-}
-
-fn tileDepth(idx: usize) u32 {
-    if (idx == 0) return 0;
-    var d: u32 = 0;
-    var i = idx;
-    while (i > 0) {
-        i = (i - 1) / 2;
-        d += 1;
-    }
-    return d;
-}
-
-fn layoutTileTree(idx: usize, x: u32, y: u32, w: u32, h: u32) void {
-    if (idx >= MAX_TILE_NODES or !tile_tree[idx].occupied) return;
-
-    if (tile_tree[idx].is_leaf) {
-        const ai = tile_tree[idx].app_index;
-        if (ai < num_app_fbs) {
-            app_fbs[ai].win_x = x;
-            app_fbs[ai].win_y = y;
-            app_fbs[ai].win_w = w;
-            app_fbs[ai].win_h = h;
-        }
-        return;
-    }
-
-    const left = tileLeft(idx);
-    const right = tileRight(idx);
-
-    if (tile_tree[idx].split_dir == .horizontal) {
-        const half = w / 2;
-        const gap = if (half > BORDER_GAP) BORDER_GAP else 0;
-        layoutTileTree(left, x, y, half - gap, h);
-        layoutTileTree(right, x + half + gap, y, w - half - gap, h);
-    } else {
-        const half = h / 2;
-        const gap = if (half > BORDER_GAP) BORDER_GAP else 0;
-        layoutTileTree(left, x, y, w, half - gap);
-        layoutTileTree(right, x, y + half + gap, w, h - half - gap);
-    }
-}
+// ── Tiling ───────────────────────────────────────────────────────
+const ui_mod = lib.ui;
+var tile_tree: ui_mod.TileTree = .{};
 
 fn retile() void {
-    layoutTileTree(0, 0, 0, screen_width, screen_height);
-
-    // Update each app's framebuffer header with new window dimensions
+    tile_tree.layout(screen_width, screen_height, BORDER_GAP);
     var i: u32 = 0;
     while (i < num_app_fbs) : (i += 1) {
+        const t = tile_tree.tiles[i];
+        app_fbs[i].win_x = t.x;
+        app_fbs[i].win_y = t.y;
+        app_fbs[i].win_w = t.w;
+        app_fbs[i].win_h = t.h;
         updateAppDimensions(&app_fbs[i]);
     }
 }
@@ -260,14 +114,10 @@ fn updateAppDimensions(afb: *AppFramebuffer) void {
         w = @intCast(MAX_PIXELS / @as(u64, h));
     }
 
-    const w_ptr: *u32 = @ptrCast(@volatileCast(@constCast(&hdr.width)));
-    const h_ptr: *u32 = @ptrCast(@volatileCast(@constCast(&hdr.height)));
-    const s_ptr: *u32 = @ptrCast(@volatileCast(@constCast(&hdr.stride)));
-    const f_ptr: *u32 = @ptrCast(@volatileCast(@constCast(&hdr.format)));
-    @atomicStore(u32, w_ptr, w, .release);
-    @atomicStore(u32, h_ptr, h, .release);
-    @atomicStore(u32, s_ptr, w, .release);
-    @atomicStore(u32, f_ptr, screen_format, .release);
+    hdr.setWidth(w);
+    hdr.setHeight(h);
+    hdr.setStride(w);
+    hdr.setFormat(screen_format);
     hdr.incrementLayoutGeneration();
 }
 
@@ -312,12 +162,9 @@ fn blitAppFramebuffer(afb: *const AppFramebuffer) void {
     const hdr = afb.header;
     if (!hdr.isValid()) return;
     const src = hdr.pixelDataConst();
-    const w_ptr: *const u32 = @ptrCast(@volatileCast(@constCast(&hdr.width)));
-    const h_ptr: *const u32 = @ptrCast(@volatileCast(@constCast(&hdr.height)));
-    const s_ptr: *const u32 = @ptrCast(@volatileCast(@constCast(&hdr.stride)));
-    const w = @min(@atomicLoad(u32, w_ptr, .acquire), afb.win_w);
-    const h = @min(@atomicLoad(u32, h_ptr, .acquire), afb.win_h);
-    const src_stride = @atomicLoad(u32, s_ptr, .acquire);
+    const w = @min(hdr.readWidth(), afb.win_w);
+    const h = @min(hdr.readHeight(), afb.win_h);
+    const src_stride = hdr.readStride();
     const dst_x = afb.win_x;
     const dst_y = afb.win_y;
     var y: u32 = 0;
@@ -438,7 +285,7 @@ pub fn main(perm_view_addr: u64) void {
                 break;
             }
         }
-        if (display_handle == 0) syscall.thread_yield();
+        if (display_handle == 0) pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
 
     if (screen_width == 0 or screen_height == 0) {
@@ -480,8 +327,7 @@ pub fn main(perm_view_addr: u64) void {
 
     // Look for internal mouse channel (16 KB, from device_manager)
     var mouse_chan: ?channel_mod.Channel = null;
-    var mouse_wait: u32 = 0;
-    while (mouse_chan == null and mouse_wait < 1000) : (mouse_wait += 1) {
+    while (mouse_chan == null) {
         for (view) |*e| {
             if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and
                 e.field0 == MOUSE_CHAN_SIZE and
@@ -506,7 +352,7 @@ pub fn main(perm_view_addr: u64) void {
                 break;
             }
         }
-        if (mouse_chan == null) syscall.thread_yield();
+        if (mouse_chan == null) pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
 
     // Main compositing loop
@@ -558,6 +404,11 @@ pub fn main(perm_view_addr: u64) void {
                 if (hit_idx != active_app) {
                     active_app = hit_idx;
                     needs_redraw = true;
+                    // Notify device_manager of active app change
+                    @atomicStore(u8, &cmd.active_app_index, @intCast(hit_idx), .release);
+                    @atomicStore(u32, &cmd.child_flags, @atomicLoad(u32, &cmd.child_flags, .acquire) | shm_protocol.CHILD_FLAG_ACTIVE_CHANGED, .release);
+                    _ = @atomicRmw(u64, &cmd.wake_flag, .Add, 1, .release);
+                    _ = syscall.futex_wake(&cmd.wake_flag, 1);
                 }
             }
         }
@@ -577,12 +428,14 @@ pub fn main(perm_view_addr: u64) void {
                     const fb_vm = syscall.vm_reserve(0, fb_proto.FRAMEBUFFER_SHM_SIZE, fb_vm_rights);
                     if (fb_vm.val >= 0) {
                         if (syscall.shm_map(e.handle, @intCast(fb_vm.val), 0) == 0) {
-                            const hdr: *volatile fb_proto.FramebufferHeader = @ptrFromInt(fb_vm.val2);
+                            const hdr: *fb_proto.FramebufferHeader = @ptrFromInt(fb_vm.val2);
 
                             const app_idx: u8 = @intCast(num_app_fbs);
                             app_fbs[num_app_fbs] = .{
                                 .header = hdr,
                                 .last_frame = 0,
+                                .last_heartbeat = 0,
+                                .stale_count = 0,
                                 .shm_handle = e.handle,
                                 .win_x = 0,
                                 .win_y = 0,
@@ -590,20 +443,18 @@ pub fn main(perm_view_addr: u64) void {
                                 .win_h = screen_height,
                             };
                             num_app_fbs += 1;
-                            active_app = app_idx;
                             recordShm(e.handle);
 
-                            // Add to tiling tree and recalculate layout
-                            addWindowToTree(app_idx);
+                            tile_tree.addWindow(app_idx, @intCast(active_app));
+                            active_app = app_idx;
                             retile();
 
-                            // Initialize header with tiled dimensions (retile already set them)
                             // Set frame_counter before magic so app starts fresh
-                            const fc_ptr: *u64 = @ptrCast(@volatileCast(@constCast(&hdr.frame_counter)));
-                            @atomicStore(u64, fc_ptr, 0, .release);
+                            @atomicStore(u64, &hdr.frame_counter, 0, .release);
                             // Magic last — signals to app that header is ready
-                            const m_ptr: *u32 = @ptrCast(@volatileCast(@constCast(&hdr.magic)));
-                            @atomicStore(u32, m_ptr, fb_proto.FRAMEBUFFER_MAGIC, .release);
+                            hdr.setMagic(fb_proto.FRAMEBUFFER_MAGIC);
+                            const magic_u64: *const u64 = @ptrCast(&hdr.magic);
+                            _ = syscall.futex_wake(magic_u64, 0xFFFF);
 
                             syscall.write("compositor: app framebuffer connected\n");
                             needs_redraw = true;
@@ -614,12 +465,64 @@ pub fn main(perm_view_addr: u64) void {
             }
         }
 
-        // Check for new frames from apps
-        for (app_fbs[0..num_app_fbs]) |*afb| {
-            const current_frame = afb.header.readFrameCounter();
-            if (current_frame != afb.last_frame) {
-                afb.last_frame = current_frame;
-                needs_redraw = true;
+        // Check for new frames + heartbeat liveness
+        {
+            var fi: u32 = 0;
+            while (fi < num_app_fbs) : (fi += 1) {
+                const afb = &app_fbs[fi];
+                if (!afb.alive) continue;
+
+                // Immediate detection: app cleared magic on exit
+                if (afb.last_heartbeat > 0 and !afb.header.isValid()) {
+                    afb.alive = false;
+                    syscall.write("compositor: app exited, removing window\n");
+                    tile_tree.removeWindow(@intCast(fi));
+                    retile();
+                    if (active_app == fi or !app_fbs[active_app].alive) {
+                        var j: u32 = 0;
+                        while (j < num_app_fbs) : (j += 1) {
+                            if (app_fbs[j].alive) {
+                                active_app = j;
+                                break;
+                            }
+                        }
+                    }
+                    needs_redraw = true;
+                    continue;
+                }
+
+                // Heartbeat — app increments every loop iteration
+                const hb = afb.header.readHeartbeat();
+                if (hb != afb.last_heartbeat) {
+                    afb.last_heartbeat = hb;
+                    afb.stale_count = 0;
+                } else if (afb.last_heartbeat > 0) {
+                    afb.stale_count += 1;
+                    if (afb.stale_count >= STALE_HEARTBEAT) {
+                        afb.alive = false;
+                        syscall.write("compositor: app stopped responding, removing window\n");
+                        tile_tree.removeWindow(@intCast(fi));
+                        retile();
+                        if (active_app == fi or !app_fbs[active_app].alive) {
+                            var j: u32 = 0;
+                            while (j < num_app_fbs) : (j += 1) {
+                                if (app_fbs[j].alive) {
+                                    active_app = j;
+                                    break;
+                                }
+                            }
+                        }
+                        needs_redraw = true;
+                        continue;
+                    }
+                }
+
+                // Check for new rendered frames
+                const current_frame = afb.header.readFrameCounter();
+                if (current_frame != afb.last_frame) {
+                    afb.last_frame = current_frame;
+                    needs_redraw = true;
+                }
             }
         }
 
@@ -630,11 +533,11 @@ pub fn main(perm_view_addr: u64) void {
 
             // Draw inactive windows first, active last
             for (app_fbs[0..num_app_fbs], 0..) |*afb, i| {
+                if (!afb.alive) continue;
                 if (i != active_app) blitAppFramebuffer(afb);
             }
-            if (active_app < num_app_fbs) {
+            if (active_app < num_app_fbs and app_fbs[active_app].alive) {
                 blitAppFramebuffer(&app_fbs[active_app]);
-                // Draw border around active window
                 const border_color = packPixel(0x40, 0xa0, 0xff);
                 drawWindowBorder(&app_fbs[active_app], border_color);
             }

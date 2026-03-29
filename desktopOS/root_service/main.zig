@@ -320,9 +320,12 @@ fn brokerLoop() void {
         }
 
         if (!found_request) {
-            // Short sleep — we need to wake on any child's request.
-            // futex_wait on first child with a short timeout, then re-check all.
-            syscall.thread_yield();
+            // Short sleep then re-check — requests come from different children's wake_flags
+            if (num_children > 0) {
+                if (children[0].cmd_channel) |cmd| {
+                    cmd.waitForNotification(10_000_000); // 10ms
+                }
+            }
         }
     }
 }

@@ -8,6 +8,7 @@ const shm_protocol = lib.shm_protocol;
 const syscall = lib.syscall;
 
 const MAX_PERMS = 128;
+const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 
 // ============================================================================
 // xHCI Register Offsets (Capability Registers at MMIO base)
@@ -1133,7 +1134,7 @@ pub fn main(perm_view_addr: u64) void {
                 break;
             }
         }
-        if (usb_device_handle == 0) syscall.thread_yield();
+        if (usb_device_handle == 0) pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
 
     syscall.write("usb: found xHCI controller\n");
@@ -1226,7 +1227,7 @@ pub fn main(perm_view_addr: u64) void {
         return;
     }
 
-    // Small delay for port state to settle
+    // Hardware delay for port state to settle — intentional busy-wait for USB timing
     var settle: u32 = 0;
     while (settle < 100_000) : (settle += 1) {
         syscall.thread_yield();
@@ -1263,8 +1264,7 @@ pub fn main(perm_view_addr: u64) void {
 
     // Look for internal mouse channel (16 KB from device_manager, for compositor)
     var mouse_chan: ?channel_mod.Channel = null;
-    var mouse_wait: u32 = 0;
-    while (mouse_chan == null and mouse_wait < 1000) : (mouse_wait += 1) {
+    while (mouse_chan == null) {
         for (view) |*e| {
             if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and
                 e.field0 == MOUSE_CHAN_SIZE and
@@ -1289,7 +1289,7 @@ pub fn main(perm_view_addr: u64) void {
                 break;
             }
         }
-        if (mouse_chan == null) syscall.thread_yield();
+        if (mouse_chan == null) pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
 
     // Wait for first data channel SHM (brokered by root for app connection)
@@ -1306,7 +1306,7 @@ pub fn main(perm_view_addr: u64) void {
                 break;
             }
         }
-        if (data_shm_handle == 0) syscall.thread_yield();
+        if (data_shm_handle == 0) pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
 
     const chan_vm_rights = (perms.VmReservationRights{

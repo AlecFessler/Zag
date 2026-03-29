@@ -16,6 +16,7 @@ const Edges = ui_mod.Edges;
 const UI = ui_mod.UI;
 
 const MAX_PERMS = 128;
+const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 const HISTORY_SIZE = 4096;
 const INPUT_SIZE = 256;
 const RENDER_SIZE = HISTORY_SIZE + INPUT_SIZE + 16;
@@ -50,10 +51,9 @@ fn recordMapped(handle: u64) void {
 }
 
 // ── Framebuffer mapping ───────────────────────────────────────────────
-fn mapFramebuffer(view: *const [MAX_PERMS]pv.UserViewEntry) ?*volatile fb_proto.FramebufferHeader {
+fn mapFramebuffer(view: *const [MAX_PERMS]pv.UserViewEntry) ?*fb_proto.FramebufferHeader {
     var fb_handle: u64 = 0;
-    var wait: u32 = 0;
-    while (fb_handle == 0 and wait < 5000) : (wait += 1) {
+    while (fb_handle == 0) {
         for (view) |*e| {
             if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and
                 e.field0 == fb_proto.FRAMEBUFFER_SHM_SIZE and
@@ -63,7 +63,7 @@ fn mapFramebuffer(view: *const [MAX_PERMS]pv.UserViewEntry) ?*volatile fb_proto.
                 break;
             }
         }
-        if (fb_handle == 0) syscall.thread_yield();
+        if (fb_handle == 0) pv.waitForChange(@intFromPtr(view), MAX_TIMEOUT);
     }
     if (fb_handle == 0) return null;
     recordMapped(fb_handle);
@@ -95,7 +95,7 @@ fn mapDataChannel(view: *const [MAX_PERMS]pv.UserViewEntry) ?channel_mod.Channel
                 break;
             }
         }
-        if (data_shm_handle == 0) syscall.thread_yield();
+        if (data_shm_handle == 0) pv.waitForChange(@intFromPtr(view), MAX_TIMEOUT);
     }
     recordMapped(data_shm_handle);
 
@@ -182,17 +182,13 @@ fn calcScrollY(text_w: u32, text_h: u32) u32 {
     return 0;
 }
 
-fn buildAndRenderUI(hdr: *volatile fb_proto.FramebufferHeader) void {
-    const w_ptr: *const u32 = @ptrCast(@volatileCast(@constCast(&hdr.width)));
-    const h_ptr: *const u32 = @ptrCast(@volatileCast(@constCast(&hdr.height)));
-    const s_ptr: *const u32 = @ptrCast(@volatileCast(@constCast(&hdr.stride)));
-    const f_ptr: *const u32 = @ptrCast(@volatileCast(@constCast(&hdr.format)));
-    const width = @atomicLoad(u32, w_ptr, .acquire);
-    const height = @atomicLoad(u32, h_ptr, .acquire);
-    const stride = @atomicLoad(u32, s_ptr, .acquire);
-    const format: u8 = @truncate(@atomicLoad(u32, f_ptr, .acquire));
+fn buildAndRenderUI(hdr: *fb_proto.FramebufferHeader) void {
+    const width = hdr.readWidth();
+    const height = hdr.readHeight();
+    const stride = hdr.readStride();
+    const format = hdr.readFormat();
 
-    const pixels: [*]u32 = @ptrCast(@volatileCast(hdr.pixelData()));
+    const pixels: [*]u32 = hdr.pixelData();
     ui_state = UI.init(pixels, width, height, stride, format);
     const ui = &ui_state;
 
@@ -229,6 +225,8 @@ fn buildAndRenderUI(hdr: *volatile fb_proto.FramebufferHeader) void {
 }
 
 // ── Command execution ─────────────────────────────────────────────────
+var should_exit: bool = false;
+
 fn executeCommand(line: []const u8) void {
     // Parse command name
     var cmd_end: usize = 0;
@@ -246,6 +244,9 @@ fn executeCommand(line: []const u8) void {
 
     if (strEql(cmd_name, "clear")) {
         history_len = 0;
+    } else if (strEql(cmd_name, "exit")) {
+        should_exit = true;
+        return;
     } else if (strEql(cmd_name, "echo")) {
         runEcho(args);
     } else if (cmd_name.len > 0) {
@@ -287,6 +288,7 @@ fn runEcho(args: []const u8) void {
     // Spawn echo process
     const echo_elf = embedded.echo;
     const child_rights = (perms.ProcessRights{
+        .grant_to = true,
         .mem_reserve = true,
     }).bits();
     const proc_handle = syscall.proc_create(@intFromPtr(echo_elf.ptr), echo_elf.len, child_rights);
@@ -301,7 +303,11 @@ fn runEcho(args: []const u8) void {
         .write = true,
         .grant = false,
     }).bits();
-    _ = syscall.grant_perm(@intCast(shm_handle), @intCast(proc_handle), grant_rights);
+    const grant_result = syscall.grant_perm(@intCast(shm_handle), @intCast(proc_handle), grant_rights);
+    if (grant_result != 0) {
+        appendHistory("error: grant_perm failed\n");
+        return;
+    }
 
     // Send args to echo
     if (args.len > 0) {
@@ -312,14 +318,15 @@ fn runEcho(args: []const u8) void {
 
     // Wait for response
     var recv_buf: [256]u8 = undefined;
-    var wait: u32 = 0;
-    while (wait < 5000) : (wait += 1) {
+    const ECHO_TIMEOUT: u64 = 5_000_000_000; // 5 seconds
+    var attempts: u32 = 0;
+    while (attempts < 100) : (attempts += 1) {
         if (chan.recv(&recv_buf)) |len| {
             appendHistory(recv_buf[0..len]);
             appendHistory("\n");
             return;
         }
-        syscall.thread_yield();
+        chan.waitForMessage(ECHO_TIMEOUT / 100);
     }
     appendHistory("error: echo timed out\n");
 }
@@ -382,7 +389,7 @@ pub fn main(perm_view_addr: u64) void {
     _ = cmd.requestConnection(shm_protocol.ServiceId.USB_DRIVER);
 
     // Wait for compositor framebuffer
-    var fb_hdr: ?*volatile fb_proto.FramebufferHeader = null;
+    var fb_hdr: ?*fb_proto.FramebufferHeader = null;
     if (comp_entry) |entry| {
         if (cmd.waitForConnection(entry)) {
             fb_hdr = mapFramebuffer(view);
@@ -392,18 +399,17 @@ pub fn main(perm_view_addr: u64) void {
     const _fb_hdr = fb_hdr;
     if (_fb_hdr) |hdr| {
         while (!hdr.isValid()) {
-            syscall.thread_yield();
+            const magic_u64: *const u64 = @ptrCast(&hdr.magic);
+            _ = syscall.futex_wait(magic_u64, 0, MAX_TIMEOUT);
         }
 
-        // Initialize with welcome prompt
         appendHistory("zagOS terminal v0.1\n");
         buildAndRenderUI(hdr);
     }
 
     // Wait for USB input channel (serial SHM is already mapped, so this finds the USB one)
     var usb_chan: ?channel_mod.Channel = null;
-    var usb_wait: u32 = 0;
-    while (usb_chan == null and usb_wait < 2000) : (usb_wait += 1) {
+    while (usb_chan == null) {
         for (view) |*e| {
             if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and
                 e.field0 > shm_protocol.COMMAND_SHM_SIZE and
@@ -428,7 +434,7 @@ pub fn main(perm_view_addr: u64) void {
                 break;
             }
         }
-        if (usb_chan == null) syscall.thread_yield();
+        if (usb_chan == null) pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
 
     // Main input loop
@@ -436,7 +442,7 @@ pub fn main(perm_view_addr: u64) void {
     var last_layout_gen: u64 = if (_fb_hdr) |hdr| hdr.readLayoutGeneration() else 0;
     var needs_redraw: bool = false;
 
-    while (true) {
+    while (!should_exit) {
         // Check for layout changes (window resize)
         if (_fb_hdr) |hdr| {
             const gen = hdr.readLayoutGeneration();
@@ -472,7 +478,13 @@ pub fn main(perm_view_addr: u64) void {
             needs_redraw = false;
         }
 
+        if (_fb_hdr) |hdr| hdr.tickHeartbeat();
         syscall.thread_yield();
+    }
+
+    // Clear magic so compositor knows we exited
+    if (_fb_hdr) |hdr| {
+        hdr.setMagic(0);
     }
 }
 

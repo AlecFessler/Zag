@@ -160,7 +160,7 @@ pub fn mapCommandChannel(perm_view_addr: u64) ?*CommandChannel {
             }
         }
         if (shm_handle != 0) break;
-        syscall.thread_yield();
+        pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
 
     if (shm_size < COMMAND_SHM_SIZE) return null;

@@ -22,6 +22,7 @@ const MSG_LOG_WRITE: u8 = 0x10;
 const SERVER_IP = [4]u8{ 10, 0, 2, 1 };
 const EXPORT_PATH = "/export/zagtest";
 const MAX_PERMS = 128;
+const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 const MAX_PATH_COMPONENTS = 16;
 const TIMEOUT_NS: u64 = 5_000_000_000; // 5 seconds
 const MAX_RETRIES: u32 = 3;
@@ -137,7 +138,7 @@ pub fn main(perm_view_addr: u64) void {
     var router_entry: *shm_protocol.ConnectionEntry = undefined;
     while (true) {
         router_entry = cmd.requestConnection(shm_protocol.ServiceId.ROUTER) orelse {
-            syscall.thread_yield();
+            cmd.waitForNotification(MAX_TIMEOUT);
             continue;
         };
         break;
@@ -163,7 +164,7 @@ pub fn main(perm_view_addr: u64) void {
                     recordMapped(entry.handle);
                     const header: *channel_mod.ChannelHeader = @ptrFromInt(vm_result.val2);
                     router_chan = channel_mod.Channel.openAsSideB(header) orelse {
-                        syscall.thread_yield();
+                        pv.waitForChange(perm_view_addr, 10_000_000); // 10ms
                         continue;
                     };
                     has_router = true;
@@ -172,7 +173,7 @@ pub fn main(perm_view_addr: u64) void {
             }
         }
         if (has_router) break;
-        syscall.thread_yield();
+        pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
 
     // Identify ourselves to the router

@@ -146,6 +146,7 @@ pub const CommandChannel = extern struct {
 };
 
 pub const CHILD_FLAG_SPAWN_APP: u32 = 1;
+pub const CHILD_FLAG_ACTIVE_CHANGED: u32 = 2;
 
 pub const ServiceId = struct {
     pub const DEVICE_MANAGER: u32 = 1;
@@ -170,7 +171,7 @@ pub fn mapCommandChannel(perm_view_addr: u64) ?*CommandChannel {
             }
         }
         if (shm_handle != 0) break;
-        syscall.thread_yield();
+        pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
 
     if (shm_size < COMMAND_SHM_SIZE) return null;

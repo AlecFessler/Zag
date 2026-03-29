@@ -1,3 +1,4 @@
+const pv = @import("perm_view.zig");
 const syscall = @import("syscall.zig");
 
 const hex_chars = "0123456789abcdef";
@@ -98,8 +99,8 @@ pub fn waitUntilAtLeast(ptr: *volatile u64, min: u64) void {
     }
 }
 
-pub fn waitForCleanup(handle: u64) void {
+pub fn waitForCleanup(handle: u64, perm_view_addr: u64) void {
     while (syscall.revoke_perm(handle) != -3) {
-        syscall.thread_yield();
+        pv.waitForChange(perm_view_addr, 10_000_000); // 10ms
     }
 }

@@ -101,10 +101,10 @@ pub fn wait(paddr: PAddr, expected: u64, timeout_ns: u64, thread: *Thread) i64 {
     }
 
     const max_timeout: u64 = @bitCast(@as(i64, -1));
+    thread.futex_paddr = paddr;
     if (timeout_ns != max_timeout) {
         const now_ns = arch.getMonotonicClock().now();
         thread.futex_deadline_ns = now_ns +| timeout_ns;
-        thread.futex_paddr = paddr;
     } else {
         thread.futex_deadline_ns = 0;
     }
@@ -132,20 +132,37 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
 
     const irq = bucket.lock.lockIrqSave();
 
-    while (woken < count) {
-        const thread = popWaiter(bucket) orelse break;
-        while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
-        if (thread.futex_deadline_ns != 0) {
-            thread.futex_deadline_ns = 0;
-            removeTimedWaiter(thread);
+    // Walk the waiter list, waking only threads waiting on the target paddr
+    var prev: ?*Thread = null;
+    var current = bucket.head;
+    while (current) |thread| {
+        if (woken >= count) break;
+        const next = thread.next;
+        if (thread.futex_paddr.addr == paddr.addr) {
+            // Remove from list
+            if (prev) |p| {
+                p.next = next;
+            } else {
+                bucket.head = next;
+            }
+            thread.next = null;
+            while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+            if (thread.futex_deadline_ns != 0) {
+                thread.futex_deadline_ns = 0;
+                removeTimedWaiter(thread);
+            }
+            thread.state = .ready;
+            const target_core = if (thread.core_affinity) |mask|
+                @as(u64, @ctz(mask))
+            else
+                arch.coreID();
+            sched.enqueueOnCore(target_core, thread);
+            woken += 1;
+            // Don't advance prev — it stays the same
+        } else {
+            prev = thread;
         }
-        thread.state = .ready;
-        const target = if (thread.core_affinity) |mask|
-            @as(u64, @ctz(mask))
-        else
-            arch.coreID();
-        sched.enqueueOnCore(target, thread);
-        woken += 1;
+        current = next;
     }
 
     bucket.lock.unlockIrqRestore(irq);

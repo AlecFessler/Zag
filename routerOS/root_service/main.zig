@@ -11,6 +11,7 @@ const std = @import("std");
 
 const MAX_PERMS = 128;
 const MAX_CHILDREN = 16;
+const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 
 const ChildInfo = struct {
     name: []const u8,
@@ -319,7 +320,16 @@ fn brokerLoop() void {
         }
 
         if (!found_request) {
-            syscall.thread_yield();
+            // Wait briefly on the first child's wake_flag for a connection request.
+            // Any requesting child bumps its own wake_flag and does futex_wake.
+            // Use a short timeout so we also check other children periodically.
+            for (children[0..num_children]) |*child| {
+                if (child.cmd_channel) |cmd0| {
+                    const current = @atomicLoad(u64, &cmd0.wake_flag, .acquire);
+                    _ = syscall.futex_wait(&cmd0.wake_flag, current, 10_000_000); // 10ms
+                    break;
+                }
+            }
         }
     }
 }

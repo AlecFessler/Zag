@@ -7,6 +7,7 @@ const shm_protocol = lib.shm_protocol;
 const syscall = lib.syscall;
 
 const MAX_PERMS = 128;
+const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 
 const REG_DATA = 0;
 const REG_IER = 1;
@@ -65,7 +66,7 @@ pub fn main(perm_view_addr: u64) void {
                 break;
             }
         }
-        if (device_handle == 0) syscall.thread_yield();
+        if (device_handle == 0) pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
 
     initUart();
@@ -80,7 +81,7 @@ pub fn main(perm_view_addr: u64) void {
                 break;
             }
         }
-        if (data_shm_handle == 0) syscall.thread_yield();
+        if (data_shm_handle == 0) pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
 
     const vm_rights = (perms.VmReservationRights{

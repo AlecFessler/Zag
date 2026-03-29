@@ -67,6 +67,7 @@ pub const Process = struct {
     num_dma_mappings: u32,
     crash_reason: CrashReason,
     restart_count: u16,
+    perm_view_gen: u64 = 0,
 
     pub const MAX_THREADS = 64;
     pub const MAX_CHILDREN = 64;
@@ -89,9 +90,16 @@ pub const Process = struct {
         const view_ptr: *[MAX_PERMS]UserViewEntry = @ptrFromInt(
             VAddr.fromPAddr(self.perm_view_phys, null).addr,
         );
+        // Bump generation counter before syncing entries
+        self.perm_view_gen += 1;
         for (&self.perm_table, 0..) |*entry, i| {
             view_ptr[i] = UserViewEntry.fromKernelEntry(entry.*);
         }
+        // Write generation counter into self-entry's field1 (after fromKernelEntry overwrites it)
+        @atomicStore(u64, &view_ptr[0].field1, self.perm_view_gen, .release);
+        // Wake any userspace waiters on this field
+        const gen_paddr = PAddr.fromInt(self.perm_view_phys.addr + @offsetOf(UserViewEntry, "field1"));
+        _ = futex.wake(gen_paddr, 0xFFFF_FFFF);
     }
 
     pub fn getPermByHandle(self: *Process, handle_id: u64) ?PermissionEntry {

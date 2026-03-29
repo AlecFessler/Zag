@@ -444,6 +444,161 @@ pub const UI = struct {
     }
 };
 
+// ── Tiling ───────────────────────────────────────────────────────────
+
+pub const Tile = struct {
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+};
+
+pub const MAX_TILES = 16;
+const MAX_TILE_NODES = 2 * MAX_TILES - 1;
+
+const SplitDir = enum(u8) { horizontal, vertical };
+
+const TileNode = struct {
+    occupied: bool = false,
+    is_leaf: bool = true,
+    app_index: u8 = 0,
+    split_dir: SplitDir = .horizontal,
+};
+
+pub const TileTree = struct {
+    nodes: [MAX_TILE_NODES]TileNode = [_]TileNode{.{}} ** MAX_TILE_NODES,
+    tiles: [MAX_TILES]Tile = undefined,
+
+    fn left(i: usize) usize {
+        return 2 * i + 1;
+    }
+
+    fn right(i: usize) usize {
+        return 2 * i + 2;
+    }
+
+    fn depth(idx: usize) u32 {
+        if (idx == 0) return 0;
+        var d: u32 = 0;
+        var i = idx;
+        while (i > 0) {
+            i = (i - 1) / 2;
+            d += 1;
+        }
+        return d;
+    }
+
+    fn findLeaf(self: *const TileTree, idx: usize, app_index: u8) ?usize {
+        if (idx >= MAX_TILE_NODES or !self.nodes[idx].occupied) return null;
+        if (self.nodes[idx].is_leaf) {
+            if (self.nodes[idx].app_index == app_index) return idx;
+            return null;
+        }
+        return self.findLeaf(left(idx), app_index) orelse self.findLeaf(right(idx), app_index);
+    }
+
+    fn firstLeaf(self: *const TileTree, idx: usize) ?usize {
+        if (idx >= MAX_TILE_NODES or !self.nodes[idx].occupied) return null;
+        if (self.nodes[idx].is_leaf) return idx;
+        return self.firstLeaf(left(idx)) orelse self.firstLeaf(right(idx));
+    }
+
+    pub fn addWindow(self: *TileTree, app_index: u8, active: u8) void {
+        if (!self.nodes[0].occupied) {
+            self.nodes[0] = .{ .occupied = true, .is_leaf = true, .app_index = app_index };
+            return;
+        }
+
+        const target = self.findLeaf(0, active) orelse self.firstLeaf(0) orelse return;
+
+        const l = left(target);
+        const r = right(target);
+        if (l >= MAX_TILE_NODES or r >= MAX_TILE_NODES) return;
+
+        const d = depth(target);
+        const dir: SplitDir = if (d % 2 == 0) .horizontal else .vertical;
+
+        const old_app = self.nodes[target].app_index;
+        self.nodes[target] = .{ .occupied = true, .is_leaf = false, .split_dir = dir };
+        self.nodes[l] = .{ .occupied = true, .is_leaf = true, .app_index = old_app };
+        self.nodes[r] = .{ .occupied = true, .is_leaf = true, .app_index = app_index };
+    }
+
+    pub fn removeWindow(self: *TileTree, app_index: u8) void {
+        const leaf_idx = self.findLeaf(0, app_index) orelse return;
+
+        if (leaf_idx == 0) {
+            self.nodes[0].occupied = false;
+            return;
+        }
+
+        const parent_idx = (leaf_idx - 1) / 2;
+        const sibling_idx = if (leaf_idx == left(parent_idx)) right(parent_idx) else left(parent_idx);
+
+        self.nodes[parent_idx] = self.nodes[sibling_idx];
+
+        if (!self.nodes[sibling_idx].is_leaf) {
+            self.copySubtree(sibling_idx, parent_idx);
+        }
+
+        self.clearSubtree(sibling_idx);
+        self.nodes[leaf_idx].occupied = false;
+    }
+
+    fn copySubtree(self: *TileTree, from: usize, to: usize) void {
+        const fl = left(from);
+        const fr = right(from);
+        const tl = left(to);
+        const tr = right(to);
+        if (fl >= MAX_TILE_NODES or tl >= MAX_TILE_NODES) return;
+
+        self.nodes[tl] = self.nodes[fl];
+        self.nodes[tr] = self.nodes[fr];
+
+        if (self.nodes[fl].occupied and !self.nodes[fl].is_leaf) self.copySubtree(fl, tl);
+        if (self.nodes[fr].occupied and !self.nodes[fr].is_leaf) self.copySubtree(fr, tr);
+    }
+
+    fn clearSubtree(self: *TileTree, idx: usize) void {
+        self.nodes[idx].occupied = false;
+        const l = left(idx);
+        const r = right(idx);
+        if (l < MAX_TILE_NODES and self.nodes[l].occupied) self.clearSubtree(l);
+        if (r < MAX_TILE_NODES and self.nodes[r].occupied) self.clearSubtree(r);
+    }
+
+    pub fn layout(self: *TileTree, screen_w: u32, screen_h: u32, gap: u32) void {
+        self.layoutNode(0, 0, 0, screen_w, screen_h, gap);
+    }
+
+    fn layoutNode(self: *TileTree, idx: usize, x: u32, y: u32, w: u32, h: u32, gap: u32) void {
+        if (idx >= MAX_TILE_NODES or !self.nodes[idx].occupied) return;
+
+        if (self.nodes[idx].is_leaf) {
+            const ai = self.nodes[idx].app_index;
+            if (ai < MAX_TILES) {
+                self.tiles[ai] = .{ .x = x, .y = y, .w = w, .h = h };
+            }
+            return;
+        }
+
+        const l = left(idx);
+        const r = right(idx);
+
+        if (self.nodes[idx].split_dir == .horizontal) {
+            const half = w / 2;
+            const g = if (half > gap) gap else 0;
+            self.layoutNode(l, x, y, half - g, h, gap);
+            self.layoutNode(r, x + half + g, y, w - half - g, h, gap);
+        } else {
+            const half = h / 2;
+            const g = if (half > gap) gap else 0;
+            self.layoutNode(l, x, y, w, half - g, gap);
+            self.layoutNode(r, x, y + half + g, w, h - half - g, gap);
+        }
+    }
+};
+
 // ── Unit Tests ────────────────────────────────────────────────────────
 
 const std = @import("std");

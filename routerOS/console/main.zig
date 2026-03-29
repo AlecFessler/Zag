@@ -7,6 +7,7 @@ const shm_protocol = lib.shm_protocol;
 const syscall = lib.syscall;
 
 const MAX_PERMS = 128;
+const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 
 var serial_chan: channel_mod.Channel = undefined;
 var router_chan: channel_mod.Channel = undefined;
@@ -290,13 +291,13 @@ fn nfsPut(cmd: []const u8) void {
     var resp: [256]u8 = undefined;
     var got_ack = false;
     var attempts: u32 = 0;
-    while (attempts < 500_000) : (attempts += 1) {
+    while (attempts < 50) : (attempts += 1) {
         if (nfs_chan.recv(&resp)) |len| {
             serialWrite(resp[0..len]);
             got_ack = true;
             break;
         }
-        syscall.thread_yield();
+        nfs_chan.rx.waitForData(100_000_000); // 100ms
     }
     if (!got_ack) {
         serialWrite("nfs: no response\r\n");
@@ -345,12 +346,12 @@ fn autoLoadConfig() void {
     var resp: [256]u8 = undefined;
     var nfs_alive = false;
     var attempts: u32 = 0;
-    while (attempts < 20_000) : (attempts += 1) {
+    while (attempts < 20) : (attempts += 1) {
         if (nfs_chan.recv(&resp)) |_| {
             nfs_alive = true;
             break;
         }
-        syscall.thread_yield();
+        nfs_chan.rx.waitForData(100_000_000); // 100ms
     }
 
     if (!nfs_alive) {
@@ -362,7 +363,7 @@ fn autoLoadConfig() void {
     _ = nfs_chan.send("mount");
     var mounted = false;
     attempts = 0;
-    while (attempts < 50_000) : (attempts += 1) {
+    while (attempts < 50) : (attempts += 1) {
         if (nfs_chan.recv(&resp)) |len| {
             if (len == 0) {
                 mounted = true;
@@ -375,7 +376,7 @@ fn autoLoadConfig() void {
             }
             break;
         }
-        syscall.thread_yield();
+        nfs_chan.rx.waitForData(100_000_000); // 100ms
     }
     drainNfs();
 
@@ -400,12 +401,12 @@ fn containsStr(haystack: []const u8, needle: []const u8) bool {
 fn drainNfs() void {
     var buf: [2048]u8 = undefined;
     var attempts: u32 = 0;
-    while (attempts < 10_000) : (attempts += 1) {
+    while (attempts < 20) : (attempts += 1) {
         if (nfs_chan.recv(&buf)) |len| {
             if (len == 0) return; // EOF
             attempts = 0; // Reset on data
         }
-        syscall.thread_yield();
+        nfs_chan.rx.waitForData(50_000_000); // 50ms
     }
 }
 
@@ -424,7 +425,7 @@ fn saveConfig() void {
     var done = false;
     while (!done and count < 64) {
         var attempts: u32 = 0;
-        while (attempts < 100_000) : (attempts += 1) {
+        while (attempts < 100) : (attempts += 1) {
             var resp: [256]u8 = undefined;
             if (router_chan.recv(&resp)) |len| {
                 if (len >= 3 and resp[0] == '-' and resp[1] == '-' and resp[2] == '-') {
@@ -436,9 +437,9 @@ fn saveConfig() void {
                 }
                 break;
             }
-            syscall.thread_yield();
+            router_chan.rx.waitForData(50_000_000); // 50ms
         }
-        if (attempts >= 100_000) done = true;
+        if (attempts >= 100) done = true;
     }
 
     if (count == 0) {
@@ -453,12 +454,12 @@ fn saveConfig() void {
     var ack_buf: [256]u8 = undefined;
     var got_ack = false;
     var ack_attempts: u32 = 0;
-    while (ack_attempts < 500_000) : (ack_attempts += 1) {
+    while (ack_attempts < 50) : (ack_attempts += 1) {
         if (nfs_chan.recv(&ack_buf)) |_| {
             got_ack = true;
             break;
         }
-        syscall.thread_yield();
+        nfs_chan.rx.waitForData(100_000_000); // 100ms
     }
     if (!got_ack) {
         serialWrite("save-config: NFS not responding\r\n");
@@ -471,10 +472,7 @@ fn saveConfig() void {
         // NFS put only takes one data message then commits on empty
         // But our NFS client sends one WRITE per data message
         // Wait briefly for the write to complete
-        var wait: u32 = 0;
-        while (wait < 50_000) : (wait += 1) {
-            syscall.thread_yield();
-        }
+        nfs_chan.rx.waitForData(50_000_000); // 50ms
     }
 
     // Empty line = EOF/commit
@@ -498,7 +496,7 @@ fn loadConfig() void {
     var done = false;
     while (!done) {
         var attempts: u32 = 0;
-        while (attempts < 500_000) : (attempts += 1) {
+        while (attempts < 50) : (attempts += 1) {
             if (nfs_chan.recv(&resp)) |len| {
                 if (len == 0) {
                     done = true;
@@ -513,9 +511,9 @@ fn loadConfig() void {
                 }
                 break;
             }
-            syscall.thread_yield();
+            nfs_chan.rx.waitForData(100_000_000); // 100ms
         }
-        if (attempts >= 500_000) done = true;
+        if (attempts >= 50) done = true;
     }
 
     if (config_len == 0) {
@@ -537,9 +535,9 @@ fn loadConfig() void {
                 // Wait for response (discard it)
                 var r_resp: [512]u8 = undefined;
                 var r_attempts: u32 = 0;
-                while (r_attempts < 50_000) : (r_attempts += 1) {
+                while (r_attempts < 50) : (r_attempts += 1) {
                     if (router_chan.recv(&r_resp)) |_| break;
-                    syscall.thread_yield();
+                    router_chan.rx.waitForData(50_000_000); // 50ms
                 }
                 applied += 1;
             }
@@ -572,13 +570,13 @@ fn loadConfig() void {
 fn nfsWaitResponse() void {
     var resp: [256]u8 = undefined;
     var attempts: u32 = 0;
-    while (attempts < 500_000) : (attempts += 1) {
+    while (attempts < 50) : (attempts += 1) {
         if (nfs_chan.recv(&resp)) |len| {
             if (len == 0) return; // EOF
             serialWrite(resp[0..len]);
             return;
         }
-        syscall.thread_yield();
+        nfs_chan.rx.waitForData(100_000_000); // 100ms
     }
 }
 
@@ -689,7 +687,7 @@ fn mapNextDataShm(perm_view_addr: u64) ?*channel_mod.ChannelHeader {
 fn waitAndMapNextShm(perm_view_addr: u64) *channel_mod.ChannelHeader {
     while (true) {
         if (mapNextDataShm(perm_view_addr)) |header| return header;
-        syscall.thread_yield();
+        pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
 }
 
@@ -711,7 +709,7 @@ pub fn main(perm_view_addr: u64) void {
     var serial_entry: *shm_protocol.ConnectionEntry = undefined;
     while (true) {
         serial_entry = cmd.requestConnection(shm_protocol.ServiceId.SERIAL) orelse {
-            syscall.thread_yield();
+            cmd.waitForNotification(MAX_TIMEOUT);
             continue;
         };
         break;

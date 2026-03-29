@@ -1,3 +1,5 @@
+const syscall = @import("syscall.zig");
+
 pub const ENTRY_TYPE_PROCESS: u8 = 0;
 pub const ENTRY_TYPE_VM_RESERVATION: u8 = 1;
 pub const ENTRY_TYPE_SHARED_MEMORY: u8 = 2;
@@ -23,6 +25,21 @@ pub const CrashReason = enum(u5) {
     revoked = 14,
     _,
 };
+
+const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
+
+/// Wait until the perm_view changes (new grants/revokes).
+pub fn waitForChange(view_addr: u64, timeout_ns: u64) void {
+    const view: *const [128]UserViewEntry = @ptrFromInt(view_addr);
+    const gen = @atomicLoad(u64, &view[0].field1, .acquire);
+    _ = syscall.futex_wait(&view[0].field1, gen, timeout_ns);
+}
+
+/// Read current perm_view generation counter.
+pub fn generation(view_addr: u64) u64 {
+    const view: *const [128]UserViewEntry = @ptrFromInt(view_addr);
+    return @atomicLoad(u64, &view[0].field1, .acquire);
+}
 
 pub const UserViewEntry = extern struct {
     handle: u64,

@@ -19,6 +19,7 @@ const MSG_TIME_SYNC: u8 = 0x11;
 const NTP_PORT: u16 = 123;
 const LOCAL_PORT: u16 = 1230;
 const MAX_PERMS = 128;
+const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 const NTP_EPOCH_OFFSET: u64 = 2208988800; // seconds between 1900-01-01 and 1970-01-01
 const TIMEOUT_NS: u64 = 5_000_000_000;
 
@@ -74,7 +75,7 @@ pub fn main(perm_view_addr: u64) void {
     var router_entry: *shm_protocol.ConnectionEntry = undefined;
     while (true) {
         router_entry = cmd.requestConnection(shm_protocol.ServiceId.ROUTER) orelse {
-            syscall.thread_yield();
+            cmd.waitForNotification(MAX_TIMEOUT);
             continue;
         };
         break;
@@ -100,7 +101,7 @@ pub fn main(perm_view_addr: u64) void {
                     recordMapped(entry.handle);
                     const header: *channel_mod.ChannelHeader = @ptrFromInt(vm_result.val2);
                     router_chan = channel_mod.Channel.openAsSideB(header) orelse {
-                        syscall.thread_yield();
+                        pv.waitForChange(perm_view_addr, 10_000_000); // 10ms
                         continue;
                     };
                     has_router = true;
@@ -109,7 +110,7 @@ pub fn main(perm_view_addr: u64) void {
             }
         }
         if (has_router) break;
-        syscall.thread_yield();
+        pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
 
     _ = router_chan.send(&[_]u8{@truncate(shm_protocol.ServiceId.NTP_CLIENT)});
