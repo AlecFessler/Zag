@@ -391,3 +391,11 @@ pub fn rdmsr(msr: u32) u64 {
     );
     return (@as(u64, hi) << 32) | lo;
 }
+
+const IA32_PAT: u32 = 0x277;
+// PAT0=WB, PAT1=WT, PAT2=UC-, PAT3=UC, PAT4=WB, PAT5=WC, PAT6=UC-, PAT7=UC
+const PAT_VALUE: u64 = 0x00070106_00070406;
+
+pub fn initPat() void {
+    wrmsr(IA32_PAT, PAT_VALUE);
+}

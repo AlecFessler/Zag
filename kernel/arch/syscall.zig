@@ -317,6 +317,7 @@ fn sysMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
         vm_res.original_size,
         offset,
         device,
+        vm_res.max_rights.write_combining,
     ) catch |e| return switch (e) {
         error.CommittedPages => E_BUSY,
         else => E_INVAL,

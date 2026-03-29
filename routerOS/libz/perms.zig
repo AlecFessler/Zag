@@ -4,7 +4,8 @@ pub const VmReservationRights = packed struct(u8) {
     execute: bool = false,
     shareable: bool = false,
     mmio: bool = false,
-    _reserved: u3 = 0,
+    write_combining: bool = false,
+    _reserved: u2 = 0,
 
     pub fn bits(self: @This()) u64 {
         return @intCast(@as(u8, @bitCast(self)));

@@ -22,6 +22,7 @@ var screen_height: u32 = 0;
 var screen_stride: u32 = 0;
 var screen_format: u8 = 0; // 0=BGR8, 1=RGB8
 var screen_fb: [*]volatile u32 = undefined;
+var back_buf: [*]u32 = undefined;
 
 // ── Mouse cursor ───────────────────────────────────────────────────
 var cursor_x: i32 = 0;
@@ -153,7 +154,7 @@ fn fillScreen(color: u32) void {
     while (y < screen_height) : (y += 1) {
         var x: u32 = 0;
         while (x < screen_width) : (x += 1) {
-            screen_fb[y * screen_stride + x] = color;
+            back_buf[y * screen_stride + x] = color;
         }
     }
 }
@@ -175,7 +176,7 @@ fn blitAppFramebuffer(afb: *const AppFramebuffer) void {
         while (x < w) : (x += 1) {
             const dx = dst_x + x;
             if (dx >= screen_width) break;
-            screen_fb[dy * screen_stride + dx] = src[y * src_stride + x];
+            back_buf[dy * screen_stride + dx] = src[y * src_stride + x];
         }
     }
 }
@@ -192,7 +193,7 @@ fn drawWindowBorder(afb: *const AppFramebuffer, color: u32) void {
     while (y < @min(y1 + bw, y2)) : (y += 1) {
         var x: u32 = x1;
         while (x < x2) : (x += 1) {
-            screen_fb[y * screen_stride + x] = color;
+            back_buf[y * screen_stride + x] = color;
         }
     }
     // Bottom
@@ -200,7 +201,7 @@ fn drawWindowBorder(afb: *const AppFramebuffer, color: u32) void {
     while (y < y2) : (y += 1) {
         var x: u32 = x1;
         while (x < x2) : (x += 1) {
-            screen_fb[y * screen_stride + x] = color;
+            back_buf[y * screen_stride + x] = color;
         }
     }
     // Left
@@ -208,7 +209,7 @@ fn drawWindowBorder(afb: *const AppFramebuffer, color: u32) void {
     while (y < y2) : (y += 1) {
         var x: u32 = x1;
         while (x < @min(x1 + bw, x2)) : (x += 1) {
-            screen_fb[y * screen_stride + x] = color;
+            back_buf[y * screen_stride + x] = color;
         }
     }
     // Right
@@ -216,8 +217,16 @@ fn drawWindowBorder(afb: *const AppFramebuffer, color: u32) void {
     while (y < y2) : (y += 1) {
         var x: u32 = if (x2 > bw) x2 - bw else 0;
         while (x < x2) : (x += 1) {
-            screen_fb[y * screen_stride + x] = color;
+            back_buf[y * screen_stride + x] = color;
         }
+    }
+}
+
+fn presentFrame() void {
+    const total = screen_height * screen_stride;
+    var i: u32 = 0;
+    while (i < total) : (i += 1) {
+        screen_fb[i] = back_buf[i];
     }
 }
 
@@ -247,9 +256,9 @@ fn drawCursor() void {
             if (px >= screen_width or py >= screen_height) continue;
             const bit: u4 = @intCast(15 - col);
             if ((cursor_outline[row] >> bit) & 1 != 0) {
-                screen_fb[py * screen_stride + px] = black;
+                back_buf[py * screen_stride + px] = black;
             } else if ((cursor_bitmap[row] >> bit) & 1 != 0) {
-                screen_fb[py * screen_stride + px] = white;
+                back_buf[py * screen_stride + px] = white;
             }
         }
     }
@@ -299,6 +308,7 @@ pub fn main(perm_view_addr: u64) void {
         .read = true,
         .write = true,
         .mmio = true,
+        .write_combining = true,
     }).bits();
     const mmio_vm = syscall.vm_reserve(0, aligned_size, mmio_vm_rights);
     if (mmio_vm.val < 0) {
@@ -310,6 +320,15 @@ pub fn main(perm_view_addr: u64) void {
         return;
     }
     screen_fb = @ptrFromInt(mmio_vm.val2);
+
+    // Allocate WB-cached back buffer for double buffering (private memory, demand-paged)
+    const bb_vm_rights = (perms.VmReservationRights{ .read = true, .write = true }).bits();
+    const bb_vm = syscall.vm_reserve(0, aligned_size, bb_vm_rights);
+    if (bb_vm.val < 0) {
+        syscall.write("compositor: back buffer vm_reserve failed\n");
+        return;
+    }
+    back_buf = @ptrFromInt(bb_vm.val2);
 
     syscall.write("compositor: display ");
     writeU32(screen_width);
@@ -543,6 +562,7 @@ pub fn main(perm_view_addr: u64) void {
             }
 
             drawCursor();
+            presentFrame();
             needs_redraw = false;
         }
 
