@@ -86,6 +86,7 @@ const AppFramebuffer = struct {
 var app_fbs: [MAX_APP_FBS]AppFramebuffer = undefined;
 var num_app_fbs: u32 = 0;
 var active_app: u32 = 0;
+var cmd_channel: *shm_protocol.CommandChannel = undefined;
 
 // ── Tiling ───────────────────────────────────────────────────────
 const ui_mod = lib.ui;
@@ -102,6 +103,22 @@ fn retile() void {
         app_fbs[i].win_h = t.h;
         updateAppDimensions(&app_fbs[i]);
     }
+}
+
+fn selectNextAliveApp() void {
+    var j: u32 = 0;
+    while (j < num_app_fbs) : (j += 1) {
+        if (app_fbs[j].alive) {
+            active_app = j;
+            @atomicStore(u8, &cmd_channel.active_app_index, @intCast(j), .release);
+            @atomicStore(u32, &cmd_channel.child_flags, @atomicLoad(u32, &cmd_channel.child_flags, .acquire) | shm_protocol.CHILD_FLAG_ACTIVE_CHANGED, .release);
+            _ = @atomicRmw(u64, &cmd_channel.wake_flag, .Add, 1, .release);
+            _ = syscall.futex_wake(&cmd_channel.wake_flag, 1);
+            return;
+        }
+    }
+    // No alive apps — set to invalid index
+    active_app = num_app_fbs;
 }
 
 fn updateAppDimensions(afb: *AppFramebuffer) void {
@@ -234,6 +251,7 @@ fn hitTestWindow(px: u32, py: u32) ?u32 {
     var i: u32 = 0;
     while (i < num_app_fbs) : (i += 1) {
         const afb = &app_fbs[i];
+        if (!afb.alive) continue;
         if (px >= afb.win_x and px < afb.win_x + afb.win_w and
             py >= afb.win_y and py < afb.win_y + afb.win_h)
         {
@@ -266,6 +284,7 @@ fn drawCursor() void {
 
 pub fn main(perm_view_addr: u64) void {
     const cmd = shm_protocol.mapCommandChannel(perm_view_addr) orelse return;
+    cmd_channel = cmd;
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
 
     // Record command channel SHM
@@ -497,14 +516,8 @@ pub fn main(perm_view_addr: u64) void {
                     syscall.write("compositor: app exited, removing window\n");
                     tile_tree.removeWindow(@intCast(fi));
                     retile();
-                    if (active_app == fi or !app_fbs[active_app].alive) {
-                        var j: u32 = 0;
-                        while (j < num_app_fbs) : (j += 1) {
-                            if (app_fbs[j].alive) {
-                                active_app = j;
-                                break;
-                            }
-                        }
+                    if (active_app == fi or active_app >= num_app_fbs or !app_fbs[active_app].alive) {
+                        selectNextAliveApp();
                     }
                     needs_redraw = true;
                     continue;
@@ -522,14 +535,8 @@ pub fn main(perm_view_addr: u64) void {
                         syscall.write("compositor: app stopped responding, removing window\n");
                         tile_tree.removeWindow(@intCast(fi));
                         retile();
-                        if (active_app == fi or !app_fbs[active_app].alive) {
-                            var j: u32 = 0;
-                            while (j < num_app_fbs) : (j += 1) {
-                                if (app_fbs[j].alive) {
-                                    active_app = j;
-                                    break;
-                                }
-                            }
+                        if (active_app == fi or active_app >= num_app_fbs or !app_fbs[active_app].alive) {
+                            selectNextAliveApp();
                         }
                         needs_redraw = true;
                         continue;
