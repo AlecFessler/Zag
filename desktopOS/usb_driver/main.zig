@@ -988,7 +988,7 @@ fn queueInterruptIn(slot: u8, dci: u8) void {
     );
 }
 
-fn processKeyboardReport(dev: *HidDevice, data: [*]const u8, chan: *channel_mod.Channel) void {
+fn processKeyboardReport(dev: *HidDevice, data: [*]const u8, chan: *channel_mod.Channel, extra_chan: ?*channel_mod.Channel) void {
     const modifiers = data[0];
 
     // Check modifier changes
@@ -1008,6 +1008,7 @@ fn processKeyboardReport(dev: *HidDevice, data: [*]const u8, chan: *channel_mod.
                     .modifiers = modifiers,
                 });
                 _ = chan.send(&msg);
+                if (extra_chan) |ec| _ = ec.send(&msg);
             }
         }
         dev.prev_modifiers = modifiers;
@@ -1033,6 +1034,7 @@ fn processKeyboardReport(dev: *HidDevice, data: [*]const u8, chan: *channel_mod.
                 .modifiers = modifiers,
             });
             _ = chan.send(&msg);
+            if (extra_chan) |ec| _ = ec.send(&msg);
         }
     }
 
@@ -1053,6 +1055,7 @@ fn processKeyboardReport(dev: *HidDevice, data: [*]const u8, chan: *channel_mod.
                 .modifiers = modifiers,
             });
             _ = chan.send(&msg);
+            if (extra_chan) |ec| _ = ec.send(&msg);
         }
     }
 
@@ -1102,8 +1105,13 @@ fn isKnownShm(handle: u64) bool {
 // Main
 // ============================================================================
 
+const MAX_APP_CHANS = 8;
+var app_chans: [MAX_APP_CHANS]channel_mod.Channel = undefined;
+var num_app_chans: u32 = 0;
+var active_chan: u32 = 0;
+
 pub fn main(perm_view_addr: u64) void {
-    _ = shm_protocol.mapCommandChannel(perm_view_addr) orelse return;
+    const cmd = shm_protocol.mapCommandChannel(perm_view_addr) orelse return;
 
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
 
@@ -1251,7 +1259,40 @@ pub fn main(perm_view_addr: u64) void {
         syscall.write(" HID device(s) ready\n");
     }
 
-    // Wait for data channel SHM (brokered by root for app connection)
+    const MOUSE_CHAN_SIZE: u64 = 4 * syscall.PAGE4K;
+
+    // Look for internal mouse channel (16 KB from device_manager, for compositor)
+    var mouse_chan: ?channel_mod.Channel = null;
+    var mouse_wait: u32 = 0;
+    while (mouse_chan == null and mouse_wait < 1000) : (mouse_wait += 1) {
+        for (view) |*e| {
+            if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and
+                e.field0 == MOUSE_CHAN_SIZE and
+                !isKnownShm(e.handle))
+            {
+                const mc_vm_rights = (perms.VmReservationRights{
+                    .read = true,
+                    .write = true,
+                    .shareable = true,
+                }).bits();
+                const mc_vm = syscall.vm_reserve(0, MOUSE_CHAN_SIZE, mc_vm_rights);
+                if (mc_vm.val >= 0) {
+                    if (syscall.shm_map(e.handle, @intCast(mc_vm.val), 0) == 0) {
+                        const mc_header: *channel_mod.ChannelHeader = @ptrFromInt(mc_vm.val2);
+                        mouse_chan = channel_mod.Channel.openAsSideA(mc_header);
+                        if (mouse_chan != null) {
+                            recordKnownShm(e.handle);
+                            syscall.write("usb: mouse channel connected\n");
+                        }
+                    }
+                }
+                break;
+            }
+        }
+        if (mouse_chan == null) syscall.thread_yield();
+    }
+
+    // Wait for first data channel SHM (brokered by root for app connection)
     var data_shm_handle: u64 = 0;
     var data_shm_size: u64 = 0;
     while (data_shm_handle == 0) {
@@ -1273,16 +1314,17 @@ pub fn main(perm_view_addr: u64) void {
         .write = true,
         .shareable = true,
     }).bits();
-    var chan: channel_mod.Channel = undefined;
     while (true) {
         const chan_vm = syscall.vm_reserve(0, data_shm_size, chan_vm_rights);
         if (chan_vm.val >= 0) {
             if (syscall.shm_map(data_shm_handle, @intCast(chan_vm.val), 0) == 0) {
                 const chan_header: *channel_mod.ChannelHeader = @ptrFromInt(chan_vm.val2);
-                chan = channel_mod.Channel.openAsSideB(chan_header) orelse {
+                app_chans[0] = channel_mod.Channel.openAsSideB(chan_header) orelse {
                     syscall.thread_yield();
                     continue;
                 };
+                num_app_chans = 1;
+                recordKnownShm(data_shm_handle);
                 break;
             }
         }
@@ -1291,26 +1333,65 @@ pub fn main(perm_view_addr: u64) void {
 
     syscall.write("usb: data channel connected\n");
 
+    var last_active_gen: u64 = @atomicLoad(u64, &cmd.active_app_gen, .acquire);
+
     // Main loop: poll event ring for HID reports, send input events
     while (true) {
+        // Check for active app changes
+        const gen = @atomicLoad(u64, &cmd.active_app_gen, .acquire);
+        if (gen != last_active_gen) {
+            last_active_gen = gen;
+            const idx = @atomicLoad(u8, &cmd.active_app_index, .acquire);
+            active_chan = idx;
+        }
+
+        // Check for new data channel SHMs (from new app connections)
+        if (num_app_chans < MAX_APP_CHANS) {
+            for (view) |*e| {
+                if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and
+                    e.field0 > shm_protocol.COMMAND_SHM_SIZE and
+                    !isKnownShm(e.handle))
+                {
+                    const new_vm = syscall.vm_reserve(0, e.field0, chan_vm_rights);
+                    if (new_vm.val >= 0) {
+                        if (syscall.shm_map(e.handle, @intCast(new_vm.val), 0) == 0) {
+                            const new_header: *channel_mod.ChannelHeader = @ptrFromInt(new_vm.val2);
+                            if (channel_mod.Channel.openAsSideB(new_header)) |new_chan| {
+                                app_chans[num_app_chans] = new_chan;
+                                num_app_chans += 1;
+                                recordKnownShm(e.handle);
+                                syscall.write("usb: new app channel connected\n");
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
         if (pollEvent()) |evt| {
             if (evt.trbType() == TRB_TYPE_TRANSFER_EVENT) {
                 const cc = evt.completionCode();
                 if (cc == TRB_COMP_SUCCESS or cc == TRB_COMP_SHORT_PACKET) {
                     const slot_id = evt.slotId();
-                    // Find which HID device this belongs to
                     for (hid_devices[0..num_hid_devices]) |*dev| {
                         if (dev.slot_id == slot_id and dev.active) {
                             const dev_offset = @as(u64, slot_id) * 64;
                             const report_data: [*]const u8 = @ptrFromInt(report_buf_virt + dev_offset);
 
+                            // Send to active app channel
+                            const ci = if (active_chan < num_app_chans) active_chan else 0;
+
                             if (dev.protocol == HID_PROTOCOL_KEYBOARD) {
-                                processKeyboardReport(dev, report_data, &chan);
+                                const mc_ptr: ?*channel_mod.Channel = if (mouse_chan != null) &mouse_chan.? else null;
+                                processKeyboardReport(dev, report_data, &app_chans[ci], mc_ptr);
                             } else if (dev.protocol == HID_PROTOCOL_MOUSE) {
-                                processMouseReport(dev, report_data, &chan);
+                                processMouseReport(dev, report_data, &app_chans[ci]);
+                                if (mouse_chan != null) {
+                                    processMouseReport(dev, report_data, &mouse_chan.?);
+                                }
                             }
 
-                            // Re-queue interrupt transfer
                             queueInterruptIn(slot_id, dev.ep_dci);
                             ringDoorbell(slot_id, dev.ep_dci);
                             break;

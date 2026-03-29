@@ -1,8 +1,8 @@
 /// Framebuffer display rendering for Zag desktopOS.
 /// Extracted from routerOS/router/main.zig — provides text-mode rendering
 /// on top of a GOP (Graphics Output Protocol) framebuffer.
-const font = @import("font8x16.zig");
 const lib = @import("lib");
+const font = lib.font;
 
 const perms = lib.perms;
 const pv = lib.perm_view;

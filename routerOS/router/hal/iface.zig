@@ -60,7 +60,7 @@ pub const PendingTxRing = struct {
     fn send(self: *PendingTxRing, data: []const u8) bool {
         if (data.len == 0 or data.len > nic.PACKET_BUF_SIZE) return false;
 
-        const tail = @as(*volatile u64, &self.tail).*;
+        const tail = @atomicLoad(u64, &self.tail, .monotonic);
 
         // Fast path: check cached head
         var free = PENDING_TX_SLOTS -% (tail -% self.cached_head);
@@ -81,7 +81,7 @@ pub const PendingTxRing = struct {
 
     /// Drain all pending packets (consumer side). Calls transmit_fn for each.
     fn drain(self: *PendingTxRing, iface: *Iface) void {
-        var head_val = @as(*volatile u64, &self.head).*;
+        var head_val = @atomicLoad(u64, &self.head, .monotonic);
 
         // Fast path: check cached tail
         if (head_val == self.cached_tail) {

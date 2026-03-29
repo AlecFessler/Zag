@@ -28,7 +28,10 @@ pub const CommandChannel = extern struct {
     wake_flag: u64 align(8),
     reply_flag: u64 align(8),
     num_connections: u32,
-    _pad: u32,
+    child_flags: u32 = 0,
+    active_app_gen: u64 align(8) = 0,
+    active_app_index: u8 = 0,
+    _pad_active: [7]u8 = .{0} ** 7,
     connections: [MAX_CONNECTIONS]ConnectionEntry,
 
     pub fn init(self: *CommandChannel) void {
@@ -36,7 +39,10 @@ pub const CommandChannel = extern struct {
         self.wake_flag = 0;
         self.reply_flag = 0;
         self.num_connections = 0;
-        self._pad = 0;
+        self.child_flags = 0;
+        self.active_app_gen = 0;
+        self.active_app_index = 0;
+        self._pad_active = .{0} ** 7;
         for (&self.connections) |*c| {
             c.* = .{
                 .service_id = 0,
@@ -63,11 +69,16 @@ pub const CommandChannel = extern struct {
     pub fn requestConnection(self: *CommandChannel, service_id: u32) ?*ConnectionEntry {
         for (self.connections[0..self.num_connections]) |*entry| {
             if (entry.service_id != service_id) continue;
-            const status = @as(*volatile u32, &entry.status).*;
-            // Already connected (e.g. after restart) — SHM handle is still valid
+            // Atomic read of status to handle concurrent updates from broker
+            const status = @atomicLoad(u32, &entry.status, .acquire);
             if (status == @intFromEnum(ConnectionStatus.connected)) return entry;
             if (status == @intFromEnum(ConnectionStatus.available)) {
-                @as(*volatile u32, &entry.status).* = @intFromEnum(ConnectionStatus.requested);
+                // CAS: only set requested if still available (broker may have set connected)
+                if (@cmpxchgStrong(u32, &entry.status, @intFromEnum(ConnectionStatus.available), @intFromEnum(ConnectionStatus.requested), .acq_rel, .acquire)) |actual| {
+                    // CAS failed — check if broker already connected it
+                    if (actual == @intFromEnum(ConnectionStatus.connected)) return entry;
+                    return null; // unexpected state
+                }
                 _ = @atomicRmw(u64, &self.wake_flag, .Add, 1, .release);
                 _ = syscall.futex_wake(&self.wake_flag, 1);
                 return entry;
@@ -77,12 +88,11 @@ pub const CommandChannel = extern struct {
     }
 
     pub fn waitForConnection(self: *CommandChannel, entry: *ConnectionEntry) bool {
-        // Already connected (e.g. after restart) — skip waiting
-        if (@as(*volatile u32, &entry.status).* == @intFromEnum(ConnectionStatus.connected))
+        if (@atomicLoad(u32, &entry.status, .acquire) == @intFromEnum(ConnectionStatus.connected))
             return entry.shm_handle != 0;
-        while (@as(*volatile u32, &entry.status).* != @intFromEnum(ConnectionStatus.connected)) {
+        while (@atomicLoad(u32, &entry.status, .acquire) != @intFromEnum(ConnectionStatus.connected)) {
             const current = @atomicLoad(u64, &self.reply_flag, .acquire);
-            if (@as(*volatile u32, &entry.status).* == @intFromEnum(ConnectionStatus.connected)) break;
+            if (@atomicLoad(u32, &entry.status, .acquire) == @intFromEnum(ConnectionStatus.connected)) break;
             _ = syscall.futex_wait(&self.reply_flag, current, MAX_TIMEOUT);
         }
         return entry.shm_handle != 0;
@@ -112,6 +122,19 @@ pub const CommandChannel = extern struct {
         return null;
     }
 
+    /// Set a connection entry to connected with the given SHM.
+    /// Writes shm fields first, then atomically stores connected status.
+    pub fn setConnected(self: *CommandChannel, service_id: u32, shm_handle: u64, shm_size: u64) void {
+        const entry = self.findConnectionByService(service_id) orelse blk: {
+            self.addAllowedConnection(service_id);
+            break :blk self.findConnectionByService(service_id) orelse return;
+        };
+        // Write data fields before status so reader sees valid data after status change
+        entry.shm_handle = shm_handle;
+        entry.shm_size = shm_size;
+        @atomicStore(u32, &entry.status, @intFromEnum(ConnectionStatus.connected), .release);
+    }
+
     pub fn findConnectedShm(self: *CommandChannel, service_id: u32) ?u64 {
         for (self.connections[0..self.num_connections]) |*entry| {
             if (entry.service_id == service_id and entry.status == @intFromEnum(ConnectionStatus.connected)) {
@@ -122,11 +145,14 @@ pub const CommandChannel = extern struct {
     }
 };
 
+pub const CHILD_FLAG_SPAWN_APP: u32 = 1;
+
 pub const ServiceId = struct {
     pub const DEVICE_MANAGER: u32 = 1;
     pub const APP_MANAGER: u32 = 2;
     pub const SERIAL_DRIVER: u32 = 3;
     pub const USB_DRIVER: u32 = 4;
+    pub const COMPOSITOR: u32 = 5;
 };
 
 pub fn mapCommandChannel(perm_view_addr: u64) ?*CommandChannel {

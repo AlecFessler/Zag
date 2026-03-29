@@ -197,29 +197,13 @@ fn brokerConnection(requester: *ChildInfo, target_service_id: u32) void {
     _ = syscall.grant_perm(@intCast(data_shm), target.proc_handle, grant_rights);
 
     if (requester.cmd_channel) |cmd| {
-        if (cmd.findConnectionByService(target_service_id)) |entry| {
-            @as(*volatile u64, &entry.shm_handle).* = @intCast(data_shm);
-            @as(*volatile u64, &entry.shm_size).* = 4 * syscall.PAGE4K;
-            @as(*volatile u32, &entry.status).* = @intFromEnum(shm_protocol.ConnectionStatus.connected);
-            cmd.notifyChild();
-        }
+        cmd.setConnected(target_service_id, @intCast(data_shm), 4 * syscall.PAGE4K);
+        cmd.notifyChild();
     }
 
     if (target.cmd_channel) |cmd| {
-        if (cmd.findConnectionByService(requester.service_id)) |entry| {
-            @as(*volatile u64, &entry.shm_handle).* = @intCast(data_shm);
-            @as(*volatile u64, &entry.shm_size).* = 4 * syscall.PAGE4K;
-            @as(*volatile u32, &entry.status).* = @intFromEnum(shm_protocol.ConnectionStatus.connected);
-            cmd.notifyChild();
-        } else {
-            cmd.addAllowedConnection(requester.service_id);
-            if (cmd.findConnectionByService(requester.service_id)) |entry| {
-                @as(*volatile u64, &entry.shm_handle).* = @intCast(data_shm);
-                @as(*volatile u64, &entry.shm_size).* = 4 * syscall.PAGE4K;
-                @as(*volatile u32, &entry.status).* = @intFromEnum(shm_protocol.ConnectionStatus.connected);
-                cmd.notifyChild();
-            }
-        }
+        cmd.setConnected(requester.service_id, @intCast(data_shm), 4 * syscall.PAGE4K);
+        cmd.notifyChild();
     }
 
     _ = syscall.shm_unmap(@intCast(data_shm), @intCast(data_vm.val));
@@ -264,11 +248,13 @@ fn watchdogThread() void {
     }
     const entry = entry_ptr orelse return;
 
-    var last_field0 = @as(*const volatile u64, @ptrCast(&entry.field0)).*;
+    const field0_ptr: *const u64 = @ptrCast(&entry.field0);
+    const type_ptr: *const u8 = @ptrCast(&entry.entry_type);
+    var last_field0 = @atomicLoad(u64, field0_ptr, .acquire);
     var last_restart_count: u16 = 0;
 
     while (true) {
-        const current_type = @as(*const volatile u8, @ptrCast(&entry.entry_type)).*;
+        const current_type = @atomicLoad(u8, type_ptr, .acquire);
         if (current_type == pv.ENTRY_TYPE_DEAD_PROCESS) {
             const reason = @as(*const pv.UserViewEntry, @ptrCast(entry)).processCrashReason();
             syscall.write("watchdog: ");
@@ -293,7 +279,7 @@ fn watchdogThread() void {
         }
 
         _ = syscall.futex_wait(@ptrCast(&entry.field0), last_field0, std.math.maxInt(u64));
-        last_field0 = @as(*const volatile u64, @ptrCast(&entry.field0)).*;
+        last_field0 = @atomicLoad(u64, field0_ptr, .acquire);
     }
 }
 
@@ -325,7 +311,7 @@ fn brokerLoop() void {
             // to shared memory (fixes VULN-I1).
             const authorized_count = @min(child.allowed_connections, shm_protocol.MAX_CONNECTIONS);
             for (cmd.connections[0..authorized_count]) |*entry| {
-                if (@as(*volatile u32, &entry.status).* == @intFromEnum(shm_protocol.ConnectionStatus.requested)) {
+                if (@atomicLoad(u32, &entry.status, .acquire) == @intFromEnum(shm_protocol.ConnectionStatus.requested)) {
                     brokerConnection(child, entry.service_id);
                     found_request = true;
                 }
@@ -333,14 +319,7 @@ fn brokerLoop() void {
         }
 
         if (!found_request) {
-            // Block until any child sends a connection request (with 10ms timeout
-            // to periodically check all children, since we can only wait on one)
-            if (num_children > 0) {
-                if (children[0].cmd_channel) |cmd| {
-                    const current = @atomicLoad(u64, &cmd.wake_flag, .acquire);
-                    _ = syscall.futex_wait(&cmd.wake_flag, current, 10_000_000);
-                }
-            }
+            syscall.thread_yield();
         }
     }
 }

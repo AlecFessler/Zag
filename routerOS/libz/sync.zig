@@ -15,15 +15,14 @@ pub const Mutex = extern struct {
     }
 
     pub fn lock(self: *Mutex) void {
-        const ptr = @as(*volatile u64, &self.state);
         if (@cmpxchgWeak(u64, &self.state, UNLOCKED, LOCKED, .acquire, .monotonic) == null) return;
 
         while (true) {
             const old = @cmpxchgWeak(u64, &self.state, UNLOCKED, LOCKED_WAITERS, .acquire, .monotonic);
             if (old == null) return;
 
-            if (ptr.* != UNLOCKED) {
-                ptr.* = LOCKED_WAITERS;
+            if (@atomicLoad(u64, &self.state, .monotonic) != UNLOCKED) {
+                @atomicStore(u64, &self.state, LOCKED_WAITERS, .monotonic);
             }
             _ = syscall.futex_wait(@ptrCast(&self.state), LOCKED_WAITERS, MAX_TIMEOUT);
         }

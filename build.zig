@@ -6,6 +6,7 @@ const Profile = struct {
     kvm: bool,
     use_llvm: bool,
     iommu: []const u8,
+    display: []const u8 = "none",
 };
 
 const profiles = struct {
@@ -36,6 +37,7 @@ const profiles = struct {
         .kvm = true,
         .use_llvm = true,
         .iommu = "intel",
+        .display = "gtk",
     };
 };
 
@@ -60,7 +62,8 @@ pub fn build(b: *std.Build) void {
         if (profile) |p| p.root_service else "kernel/tests/bin/root_service.elf";
     const iommu_type = b.option([]const u8, "iommu", "IOMMU type: intel or amd (default: intel)") orelse
         if (profile) |p| p.iommu else "intel";
-    const display_type = b.option([]const u8, "display", "QEMU display: none, gtk, sdl (default: none)") orelse "none";
+    const display_type = b.option([]const u8, "display", "QEMU display: none, gtk, sdl (default: none)") orelse
+        if (profile) |p| p.display else "none";
     const net_type = b.option([]const u8, "net", "Network: tap, user, or none (default: user)") orelse
         if (profile) |p| p.net else "user";
 

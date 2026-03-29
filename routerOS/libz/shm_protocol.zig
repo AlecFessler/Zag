@@ -63,11 +63,13 @@ pub const CommandChannel = extern struct {
     pub fn requestConnection(self: *CommandChannel, service_id: u32) ?*ConnectionEntry {
         for (self.connections[0..self.num_connections]) |*entry| {
             if (entry.service_id != service_id) continue;
-            const status = @as(*volatile u32, &entry.status).*;
-            // Already connected (e.g. after restart) — SHM handle is still valid
+            const status = @atomicLoad(u32, &entry.status, .acquire);
             if (status == @intFromEnum(ConnectionStatus.connected)) return entry;
             if (status == @intFromEnum(ConnectionStatus.available)) {
-                @as(*volatile u32, &entry.status).* = @intFromEnum(ConnectionStatus.requested);
+                if (@cmpxchgStrong(u32, &entry.status, @intFromEnum(ConnectionStatus.available), @intFromEnum(ConnectionStatus.requested), .acq_rel, .acquire)) |actual| {
+                    if (actual == @intFromEnum(ConnectionStatus.connected)) return entry;
+                    return null;
+                }
                 _ = @atomicRmw(u64, &self.wake_flag, .Add, 1, .release);
                 _ = syscall.futex_wake(&self.wake_flag, 1);
                 return entry;
@@ -77,12 +79,11 @@ pub const CommandChannel = extern struct {
     }
 
     pub fn waitForConnection(self: *CommandChannel, entry: *ConnectionEntry) bool {
-        // Already connected (e.g. after restart) — skip waiting
-        if (@as(*volatile u32, &entry.status).* == @intFromEnum(ConnectionStatus.connected))
+        if (@atomicLoad(u32, &entry.status, .acquire) == @intFromEnum(ConnectionStatus.connected))
             return entry.shm_handle != 0;
-        while (@as(*volatile u32, &entry.status).* != @intFromEnum(ConnectionStatus.connected)) {
+        while (@atomicLoad(u32, &entry.status, .acquire) != @intFromEnum(ConnectionStatus.connected)) {
             const current = @atomicLoad(u64, &self.reply_flag, .acquire);
-            if (@as(*volatile u32, &entry.status).* == @intFromEnum(ConnectionStatus.connected)) break;
+            if (@atomicLoad(u32, &entry.status, .acquire) == @intFromEnum(ConnectionStatus.connected)) break;
             _ = syscall.futex_wait(&self.reply_flag, current, MAX_TIMEOUT);
         }
         return entry.shm_handle != 0;
@@ -110,6 +111,16 @@ pub const CommandChannel = extern struct {
             if (entry.service_id == service_id) return entry;
         }
         return null;
+    }
+
+    pub fn setConnected(self: *CommandChannel, service_id: u32, shm_handle: u64, shm_size: u64) void {
+        const entry = self.findConnectionByService(service_id) orelse blk: {
+            self.addAllowedConnection(service_id);
+            break :blk self.findConnectionByService(service_id) orelse return;
+        };
+        entry.shm_handle = shm_handle;
+        entry.shm_size = shm_size;
+        @atomicStore(u32, &entry.status, @intFromEnum(ConnectionStatus.connected), .release);
     }
 
     pub fn findConnectedShm(self: *CommandChannel, service_id: u32) ?u64 {

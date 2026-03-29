@@ -81,15 +81,39 @@ pub fn build(b: *std.Build) void {
     });
 
     // Step 1: Build leaf processes
+    const compositor_bin = buildChild(b, target, lib_mod, "compositor", "compositor/main.zig");
     const serial_driver_bin = buildChild(b, target, lib_mod, "serial_driver", "serial_driver/main.zig");
     const usb_driver_bin = buildChild(b, target, lib_mod, "usb_driver", "usb_driver/main.zig");
-    const hello_app_bin = buildChild(b, target, lib_mod, "hello_app", "hello_app/main.zig");
+    const echo_bin = buildChild(b, target, lib_mod, "echo", "zutils/echo/main.zig");
+
+    // Step 1b: Build terminal with embedded echo
+    const term_embedded_wf = b.addWriteFiles();
+    _ = term_embedded_wf.addCopyFile(echo_bin, "echo.elf");
+    const term_embed_src = term_embedded_wf.add("embedded_children.zig",
+        \\pub const echo = @embedFile("echo.elf");
+        \\
+    );
+    const term_embedded_mod = b.createModule(.{
+        .root_source_file = term_embed_src,
+        .target = target,
+        .optimize = .ReleaseSmall,
+    });
+    const terminal_bin = buildManagerChild(
+        b,
+        target,
+        lib_mod,
+        term_embedded_mod,
+        "terminal",
+        "terminal/main.zig",
+    );
 
     // Step 2a: Build device_manager with serial_driver + usb_driver embedded
     const dm_embedded_wf = b.addWriteFiles();
+    _ = dm_embedded_wf.addCopyFile(compositor_bin, "compositor.elf");
     _ = dm_embedded_wf.addCopyFile(serial_driver_bin, "serial_driver.elf");
     _ = dm_embedded_wf.addCopyFile(usb_driver_bin, "usb_driver.elf");
     const dm_embed_src = dm_embedded_wf.add("embedded_children.zig",
+        \\pub const compositor = @embedFile("compositor.elf");
         \\pub const serial_driver = @embedFile("serial_driver.elf");
         \\pub const usb_driver = @embedFile("usb_driver.elf");
         \\
@@ -108,11 +132,11 @@ pub fn build(b: *std.Build) void {
         "device_manager/main.zig",
     );
 
-    // Step 2b: Build app_manager with hello_app embedded
+    // Step 2b: Build app_manager with terminal embedded
     const am_embedded_wf = b.addWriteFiles();
-    _ = am_embedded_wf.addCopyFile(hello_app_bin, "hello_app.elf");
+    _ = am_embedded_wf.addCopyFile(terminal_bin, "terminal.elf");
     const am_embed_src = am_embedded_wf.add("embedded_children.zig",
-        \\pub const hello_app = @embedFile("hello_app.elf");
+        \\pub const terminal = @embedFile("terminal.elf");
         \\
     );
     const am_embedded_mod = b.createModule(.{
@@ -171,4 +195,16 @@ pub fn build(b: *std.Build) void {
     exe.setLinkerScript(b.path("linker.ld"));
     const install = b.addInstallFile(exe.getEmittedBin(), "../bin/desktopOS.elf");
     b.getInstallStep().dependOn(&install.step);
+
+    // ── Tests ──────────────────────────────────────────────────────────
+    const test_step = b.step("test", "Run UI library unit tests");
+    const ui_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = .{ .cwd_relative = "libz/ui.zig" },
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_tests = b.addRunArtifact(ui_tests);
+    test_step.dependOn(&run_tests.step);
 }

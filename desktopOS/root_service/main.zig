@@ -2,6 +2,7 @@ const lib = @import("lib");
 
 const channel_mod = lib.channel;
 const embedded = @import("embedded_children");
+const fb_proto = lib.framebuffer;
 const perms = lib.perms;
 const pv = lib.perm_view;
 const shm_protocol = lib.shm_protocol;
@@ -39,6 +40,7 @@ fn routeServiceToParent(service_id: u32) ?u32 {
     return switch (service_id) {
         shm_protocol.ServiceId.SERIAL_DRIVER => shm_protocol.ServiceId.DEVICE_MANAGER,
         shm_protocol.ServiceId.USB_DRIVER => shm_protocol.ServiceId.DEVICE_MANAGER,
+        shm_protocol.ServiceId.COMPOSITOR => shm_protocol.ServiceId.DEVICE_MANAGER,
         else => null,
     };
 }
@@ -148,7 +150,11 @@ fn brokerConnection(requester: *ChildInfo, target_service_id: u32) void {
         return;
     };
 
-    const data_shm = syscall.shm_create(4 * syscall.PAGE4K);
+    // Use large SHM for compositor (framebuffer), small for data channels
+    const is_compositor = (target_service_id == shm_protocol.ServiceId.COMPOSITOR);
+    const shm_size: u64 = if (is_compositor) fb_proto.FRAMEBUFFER_SHM_SIZE else 4 * syscall.PAGE4K;
+
+    const data_shm = syscall.shm_create(shm_size);
     if (data_shm <= 0) {
         syscall.write("root: data shm_create failed\n");
         return;
@@ -160,7 +166,7 @@ fn brokerConnection(requester: *ChildInfo, target_service_id: u32) void {
         .execute = true,
         .shareable = true,
     }).bits();
-    const data_vm = syscall.vm_reserve(0, 4 * syscall.PAGE4K, data_vm_rights);
+    const data_vm = syscall.vm_reserve(0, shm_size, data_vm_rights);
     if (data_vm.val < 0) {
         syscall.write("root: data vm_reserve failed\n");
         return;
@@ -172,8 +178,11 @@ fn brokerConnection(requester: *ChildInfo, target_service_id: u32) void {
         return;
     }
 
-    const chan_header: *channel_mod.ChannelHeader = @ptrFromInt(data_vm.val2);
-    _ = channel_mod.Channel.initAsSideA(chan_header, 4 * syscall.PAGE4K);
+    // Only init as ring-buffer channel for non-compositor SHMs
+    if (!is_compositor) {
+        const chan_header: *channel_mod.ChannelHeader = @ptrFromInt(data_vm.val2);
+        _ = channel_mod.Channel.initAsSideA(chan_header, @intCast(shm_size));
+    }
 
     const grant_rights = (perms.SharedMemoryRights{
         .read = true,
@@ -183,36 +192,20 @@ fn brokerConnection(requester: *ChildInfo, target_service_id: u32) void {
     _ = syscall.grant_perm(@intCast(data_shm), requester.proc_handle, grant_rights);
     _ = syscall.grant_perm(@intCast(data_shm), target.proc_handle, grant_rights);
 
-    // Write connection entry to requester's command channel
+    // Write connection entry to requester's command channel (under mutex)
     if (requester.cmd_channel) |cmd| {
-        if (cmd.findConnectionByService(target_service_id)) |entry| {
-            @as(*volatile u64, &entry.shm_handle).* = @intCast(data_shm);
-            @as(*volatile u64, &entry.shm_size).* = 4 * syscall.PAGE4K;
-            @as(*volatile u32, &entry.status).* = @intFromEnum(shm_protocol.ConnectionStatus.connected);
-            cmd.notifyChild();
-        }
+        cmd.setConnected(target_service_id, @intCast(data_shm), shm_size);
+        cmd.notifyChild();
     }
 
-    // Write connection entry to target's command channel
+    // Write connection entry to target's command channel (under mutex)
     if (target.cmd_channel) |cmd| {
         // For routed connections (grandchild services), use target_service_id
         // so device_manager knows which driver to forward to.
         // For direct connections, use requester's service_id.
         const lookup_id = if (routed_id != target_service_id) target_service_id else requester.service_id;
-        if (cmd.findConnectionByService(lookup_id)) |entry| {
-            @as(*volatile u64, &entry.shm_handle).* = @intCast(data_shm);
-            @as(*volatile u64, &entry.shm_size).* = 4 * syscall.PAGE4K;
-            @as(*volatile u32, &entry.status).* = @intFromEnum(shm_protocol.ConnectionStatus.connected);
-            cmd.notifyChild();
-        } else {
-            cmd.addAllowedConnection(lookup_id);
-            if (cmd.findConnectionByService(lookup_id)) |entry| {
-                @as(*volatile u64, &entry.shm_handle).* = @intCast(data_shm);
-                @as(*volatile u64, &entry.shm_size).* = 4 * syscall.PAGE4K;
-                @as(*volatile u32, &entry.status).* = @intFromEnum(shm_protocol.ConnectionStatus.connected);
-                cmd.notifyChild();
-            }
-        }
+        cmd.setConnected(lookup_id, @intCast(data_shm), shm_size);
+        cmd.notifyChild();
     }
 
     _ = syscall.shm_unmap(@intCast(data_shm), @intCast(data_vm.val));
@@ -260,11 +253,13 @@ fn watchdogThread() void {
     }
     const entry = entry_ptr orelse return;
 
-    var last_field0 = @as(*const volatile u64, @ptrCast(&entry.field0)).*;
+    const field0_ptr: *const u64 = @ptrCast(&entry.field0);
+    const type_ptr: *const u8 = @ptrCast(&entry.entry_type);
+    var last_field0 = @atomicLoad(u64, field0_ptr, .acquire);
     var last_restart_count: u16 = 0;
 
     while (true) {
-        const current_type = @as(*const volatile u8, @ptrCast(&entry.entry_type)).*;
+        const current_type = @atomicLoad(u8, type_ptr, .acquire);
         if (current_type == pv.ENTRY_TYPE_DEAD_PROCESS) {
             const reason = @as(*const pv.UserViewEntry, @ptrCast(entry)).processCrashReason();
             syscall.write("watchdog: ");
@@ -289,7 +284,7 @@ fn watchdogThread() void {
         }
 
         _ = syscall.futex_wait(@ptrCast(&entry.field0), last_field0, std.math.maxInt(u64));
-        last_field0 = @as(*const volatile u64, @ptrCast(&entry.field0)).*;
+        last_field0 = @atomicLoad(u64, field0_ptr, .acquire);
     }
 }
 
@@ -317,7 +312,7 @@ fn brokerLoop() void {
             const cmd = child.cmd_channel orelse continue;
             const authorized_count = @min(child.allowed_connections, shm_protocol.MAX_CONNECTIONS);
             for (cmd.connections[0..authorized_count]) |*entry| {
-                if (@as(*volatile u32, &entry.status).* == @intFromEnum(shm_protocol.ConnectionStatus.requested)) {
+                if (@atomicLoad(u32, &entry.status, .acquire) == @intFromEnum(shm_protocol.ConnectionStatus.requested)) {
                     brokerConnection(child, entry.service_id);
                     found_request = true;
                 }
@@ -325,12 +320,9 @@ fn brokerLoop() void {
         }
 
         if (!found_request) {
-            if (num_children > 0) {
-                if (children[0].cmd_channel) |cmd| {
-                    const current = @atomicLoad(u64, &cmd.wake_flag, .acquire);
-                    _ = syscall.futex_wait(&cmd.wake_flag, current, 10_000_000);
-                }
-            }
+            // Short sleep — we need to wake on any child's request.
+            // futex_wait on first child with a short timeout, then re-check all.
+            syscall.thread_yield();
         }
     }
 }
@@ -357,6 +349,7 @@ pub fn main(perm_view_addr: u64) void {
         },
         &.{
             shm_protocol.ServiceId.APP_MANAGER,
+            shm_protocol.ServiceId.COMPOSITOR,
             shm_protocol.ServiceId.SERIAL_DRIVER,
             shm_protocol.ServiceId.USB_DRIVER,
         },
@@ -376,6 +369,7 @@ pub fn main(perm_view_addr: u64) void {
             .shm_create = true,
         },
         &.{
+            shm_protocol.ServiceId.COMPOSITOR,
             shm_protocol.ServiceId.DEVICE_MANAGER,
             shm_protocol.ServiceId.SERIAL_DRIVER,
             shm_protocol.ServiceId.USB_DRIVER,

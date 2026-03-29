@@ -13,6 +13,10 @@ const MAX_BUCKET_ENTRIES = 16;
 
 const MSG_DRIVER_AVAILABLE: u8 = 0x01;
 const MSG_CONNECT_REQUEST: u8 = 0x02;
+const MSG_SUBSCRIBE_ACTIVE_APP: u8 = 0x03;
+const MSG_ACTIVE_APP_CHANGED: u8 = 0x04;
+const MSG_MOUSE_CLICK: u8 = 0x05;
+const MSG_SPAWN_APP: u8 = 0x06;
 
 const AppInfo = struct {
     proc_handle: u64,
@@ -23,6 +27,8 @@ const AppInfo = struct {
 
 var apps: [MAX_APPS]AppInfo = undefined;
 var num_apps: u32 = 0;
+var active_app_index: u8 = 0;
+var dm_subscribed_active: bool = false;
 
 // Bucket dispatch: per-driver queue of app proc_handles waiting for a connection
 const Bucket = struct {
@@ -143,6 +149,9 @@ fn spawnApp(
     }).bits();
     _ = syscall.grant_perm(@intCast(cmd_shm), @intCast(proc_handle), grant_rights);
 
+    // New app becomes the active app
+    active_app_index = @intCast(num_apps);
+
     apps[num_apps] = .{
         .proc_handle = @intCast(proc_handle),
         .cmd_shm_handle = cmd_shm,
@@ -198,13 +207,13 @@ pub fn main(perm_view_addr: u64) void {
         }
     }
 
-    // On fresh boot, spawn hello_app. On restart, recover child handle from perm view.
+    // On fresh boot, spawn terminal. On restart, recover child handle from perm view.
     if (restart_count == 0) {
         _ = spawnApp(
-            "hello_app",
-            embedded.hello_app,
-            .{ .grant_to = true, .mem_reserve = true },
-            &.{ shm_protocol.ServiceId.SERIAL_DRIVER, shm_protocol.ServiceId.USB_DRIVER },
+            "terminal",
+            embedded.terminal,
+            .{ .grant_to = true, .mem_reserve = true, .shm_create = true, .spawn_process = true },
+            &.{ shm_protocol.ServiceId.COMPOSITOR, shm_protocol.ServiceId.SERIAL_DRIVER, shm_protocol.ServiceId.USB_DRIVER },
         );
     } else {
         // Recover child process handles from perm view
@@ -222,7 +231,7 @@ pub fn main(perm_view_addr: u64) void {
                 break;
             }
         }
-        syscall.write("app_manager: recovered hello_app handle\n");
+        syscall.write("app_manager: recovered terminal handle\n");
     }
 
     // Request connection to device_manager (brokered by root)
@@ -265,7 +274,7 @@ pub fn main(perm_view_addr: u64) void {
     var processed_conns: [shm_protocol.MAX_CONNECTIONS]bool = .{false} ** shm_protocol.MAX_CONNECTIONS;
     // Mark already-connected entries as processed (e.g. data channel with device_manager)
     for (cmd.connections[0..cmd.num_connections], 0..) |*conn, ci| {
-        if (@as(*volatile u32, &conn.status).* == @intFromEnum(shm_protocol.ConnectionStatus.connected)) {
+        if (@atomicLoad(u32, &conn.status, .acquire) == @intFromEnum(shm_protocol.ConnectionStatus.connected)) {
             processed_conns[ci] = true;
         }
     }
@@ -273,7 +282,7 @@ pub fn main(perm_view_addr: u64) void {
     // Main loop: process messages from device_manager and app connection requests
     var msg_buf: [256]u8 = undefined;
     while (true) {
-        // Check for messages from device_manager (driver availability)
+        // Check for messages from device_manager (driver availability, subscriptions)
         if (dm_chan.recv(&msg_buf)) |len| {
             if (len >= 5 and msg_buf[0] == MSG_DRIVER_AVAILABLE) {
                 const sid = @as(u32, msg_buf[1]) |
@@ -287,6 +296,41 @@ pub fn main(perm_view_addr: u64) void {
                 syscall.write("app_manager: driver available, service_id=");
                 writeU32(sid);
                 syscall.write("\n");
+            } else if (len >= 1 and msg_buf[0] == MSG_SUBSCRIBE_ACTIVE_APP) {
+                dm_subscribed_active = true;
+                // Send current active app immediately
+                var notify: [2]u8 = .{ MSG_ACTIVE_APP_CHANGED, active_app_index };
+                _ = dm_chan.send(&notify);
+                syscall.write("app_manager: active app subscription registered\n");
+            } else if (len >= 1 and msg_buf[0] == MSG_SPAWN_APP) {
+                _ = spawnApp(
+                    "terminal",
+                    embedded.terminal,
+                    .{ .grant_to = true, .mem_reserve = true, .shm_create = true, .spawn_process = true },
+                    &.{ shm_protocol.ServiceId.COMPOSITOR, shm_protocol.ServiceId.SERIAL_DRIVER, shm_protocol.ServiceId.USB_DRIVER },
+                );
+                syscall.write("app_manager: spawned new terminal\n");
+                // Notify device_manager of new active app
+                if (dm_subscribed_active) {
+                    var changed: [2]u8 = .{ MSG_ACTIVE_APP_CHANGED, active_app_index };
+                    _ = dm_chan.send(&changed);
+                }
+            } else if (len >= 1 and msg_buf[0] == MSG_MOUSE_CLICK) {
+                // Compositor reports a click on a different window
+                // For now, payload is app_index
+                if (len >= 2) {
+                    const new_active = msg_buf[1];
+                    if (new_active < num_apps and new_active != active_app_index) {
+                        active_app_index = new_active;
+                        syscall.write("app_manager: active app changed to ");
+                        writeU32(new_active);
+                        syscall.write("\n");
+                        if (dm_subscribed_active) {
+                            var changed: [2]u8 = .{ MSG_ACTIVE_APP_CHANGED, active_app_index };
+                            _ = dm_chan.send(&changed);
+                        }
+                    }
+                }
             }
         }
 
@@ -295,7 +339,7 @@ pub fn main(perm_view_addr: u64) void {
             const app_cmd = app.cmd_channel;
             const authorized_count = @min(app.allowed_connections, shm_protocol.MAX_CONNECTIONS);
             for (app_cmd.connections[0..authorized_count]) |*conn| {
-                if (@as(*volatile u32, &conn.status).* == @intFromEnum(shm_protocol.ConnectionStatus.requested)) {
+                if (@atomicLoad(u32, &conn.status, .acquire) == @intFromEnum(shm_protocol.ConnectionStatus.requested)) {
                     // App wants a connection to this driver service
                     const driver_sid = conn.service_id;
 
@@ -313,7 +357,7 @@ pub fn main(perm_view_addr: u64) void {
                     }
 
                     // Mark as pending so we don't re-request on next loop
-                    @as(*volatile u32, &conn.status).* = @intFromEnum(shm_protocol.ConnectionStatus.available);
+                    @atomicStore(u32, &conn.status, @intFromEnum(shm_protocol.ConnectionStatus.available), .release);
 
                     // Push to bucket and request from root
                     const bucket = findOrCreateBucket(driver_sid) orelse continue;
@@ -331,7 +375,7 @@ pub fn main(perm_view_addr: u64) void {
         // Match by finding newly connected command channel entries + new SHM in perm_view
         for (cmd.connections[0..cmd.num_connections], 0..) |*conn, ci| {
             if (processed_conns[ci]) continue;
-            if (@as(*volatile u32, &conn.status).* != @intFromEnum(shm_protocol.ConnectionStatus.connected)) continue;
+            if (@atomicLoad(u32, &conn.status, .acquire) != @intFromEnum(shm_protocol.ConnectionStatus.connected)) continue;
 
             // Find matching new SHM in perm_view
             for (view) |*e| {
@@ -355,9 +399,9 @@ pub fn main(perm_view_addr: u64) void {
                     for (apps[0..num_apps]) |*app| {
                         if (app.proc_handle == app_proc) {
                             if (app.cmd_channel.findConnectionByService(conn.service_id)) |app_conn| {
-                                @as(*volatile u64, &app_conn.shm_handle).* = e.handle;
-                                @as(*volatile u64, &app_conn.shm_size).* = e.field0;
-                                @as(*volatile u32, &app_conn.status).* = @intFromEnum(shm_protocol.ConnectionStatus.connected);
+                                app_conn.shm_handle = e.handle;
+                                app_conn.shm_size = e.field0;
+                                @atomicStore(u32, &app_conn.status, @intFromEnum(shm_protocol.ConnectionStatus.connected), .release);
                                 app.cmd_channel.notifyChild();
                             }
                             break;
@@ -366,7 +410,8 @@ pub fn main(perm_view_addr: u64) void {
 
                     syscall.write("app_manager: granted driver SHM to app\n");
                     recordMapped(e.handle);
-                    processed_conns[ci] = true;
+                    // Reset entry to available so it can be reused for future app connections
+                    @atomicStore(u32, &conn.status, @intFromEnum(shm_protocol.ConnectionStatus.available), .release);
                     break;
                 }
             }

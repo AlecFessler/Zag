@@ -99,14 +99,14 @@ pub const RingHeader = extern struct {
     /// Waits directly on the tail cursor — the producer calls
     /// futex_wake(&tail) after each write.
     pub fn waitForData(self: *RingHeader, timeout_ns: u64) void {
-        const head_val = @as(*volatile u64, &self.head).*;
+        const head_val = @atomicLoad(u64, &self.head, .monotonic);
         const tail_val = @atomicLoad(u64, &self.tail, .acquire);
         if (head_val != tail_val) return;
         _ = syscall.futex_wait(&self.tail, tail_val, timeout_ns);
     }
 
     pub fn hasData(self: *RingHeader) bool {
-        return @as(*volatile u64, &self.head).* != @atomicLoad(u64, &self.tail, .acquire);
+        return @atomicLoad(u64, &self.head, .monotonic) != @atomicLoad(u64, &self.tail, .acquire);
     }
 };
 
@@ -154,7 +154,7 @@ pub const Channel = struct {
         const ring = self.tx;
         const ring_size = self.ring_size;
 
-        const tail = @as(*volatile u64, &ring.tail).*;
+        const tail = @atomicLoad(u64, &ring.tail, .monotonic);
         const msg_size: u64 = @sizeOf(u32) + @sizeOf(u32) + data.len;
 
         // Fast path: check cached head
@@ -197,7 +197,7 @@ pub const Channel = struct {
         const ring = self.rx;
         const ring_size = self.ring_size;
 
-        const head_val = @as(*volatile u64, &ring.head).*;
+        const head_val = @atomicLoad(u64, &ring.head, .monotonic);
 
         // Fast path: check cached tail
         if (head_val == ring.cached_tail) {
