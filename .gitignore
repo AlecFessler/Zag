@@ -10,3 +10,4 @@ iso/boot/kernel.elf
 *.elf
 __pycache__/
 *.pyc
+qemu.log
