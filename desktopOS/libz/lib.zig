@@ -1,13 +1,18 @@
-pub const arena = @import("arena.zig");
-pub const channel = @import("channel.zig");
-pub const crc32 = @import("crc32.zig");
+pub const channel = @import("ipc/channel.zig");
+pub const display = @import("protocols/display.zig");
 pub const font = @import("font8x16.zig");
-pub const framebuffer = @import("framebuffer.zig");
-pub const input = @import("input.zig");
+pub const keyboard = @import("protocols/keyboard.zig");
+pub const mouse = @import("protocols/mouse.zig");
 pub const perm_view = @import("perm_view.zig");
 pub const perms = @import("perms.zig");
-pub const shm_protocol = @import("shm_protocol.zig");
 pub const sync = @import("sync.zig");
 pub const syscall = @import("syscall.zig");
-pub const testing = @import("test.zig");
 pub const ui = @import("ui.zig");
+
+/// Well-known service protocol identifiers for discovery.
+pub const Protocol = enum(u8) {
+    compositor = 1,
+    usb_keyboard = 2,
+    usb_mouse = 3,
+    input_control = 4,
+};

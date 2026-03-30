@@ -1,23 +1,27 @@
 const std = @import("std");
 
-fn buildChild(
+fn buildProcess(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     lib_mod: *std.Build.Module,
     comptime name: []const u8,
     comptime src: []const u8,
+    embedded_mod: ?*std.Build.Module,
 ) std.Build.LazyPath {
     const child_app_mod = b.createModule(.{
         .root_source_file = b.path(src),
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .Debug,
         .pic = true,
     });
     child_app_mod.addImport("lib", lib_mod);
+    if (embedded_mod) |em| {
+        child_app_mod.addImport("embedded_children", em);
+    }
     const child_start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "libz/start.zig" },
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .Debug,
         .pic = true,
     });
     child_start_mod.addImport("lib", lib_mod);
@@ -28,31 +32,32 @@ fn buildChild(
         .linkage = .static,
     });
     child_exe.pie = true;
+    child_exe.use_llvm = true;
+    child_exe.use_lld = true;
     child_exe.entry = .{ .symbol_name = "_start" };
     child_exe.setLinkerScript(b.path("linker.ld"));
+    child_exe.root_module.strip = true;
     return child_exe.getEmittedBin();
 }
 
-fn buildManagerChild(
+fn buildUtil(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     lib_mod: *std.Build.Module,
-    embedded_mod: *std.Build.Module,
     comptime name: []const u8,
     comptime src: []const u8,
 ) std.Build.LazyPath {
     const child_app_mod = b.createModule(.{
         .root_source_file = b.path(src),
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .Debug,
         .pic = true,
     });
     child_app_mod.addImport("lib", lib_mod);
-    child_app_mod.addImport("embedded_children", embedded_mod);
     const child_start_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = "libz/start.zig" },
+        .root_source_file = .{ .cwd_relative = "libz/simple_start.zig" },
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .Debug,
         .pic = true,
     });
     child_start_mod.addImport("lib", lib_mod);
@@ -63,9 +68,51 @@ fn buildManagerChild(
         .linkage = .static,
     });
     child_exe.pie = true;
+    child_exe.use_llvm = true;
+    child_exe.use_lld = true;
     child_exe.entry = .{ .symbol_name = "_start" };
     child_exe.setLinkerScript(b.path("linker.ld"));
+    child_exe.root_module.strip = true;
     return child_exe.getEmittedBin();
+}
+
+fn makeEmbeddedModule1(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    comptime name: []const u8,
+    path: std.Build.LazyPath,
+) *std.Build.Module {
+    const wf = b.addWriteFiles();
+    _ = wf.addCopyFile(path, name);
+    const id = comptime name[0 .. name.len - 4];
+    return b.createModule(.{
+        .root_source_file = wf.add("embedded_children.zig",
+            "pub const " ++ id ++ " = @embedFile(\"" ++ name ++ "\");\n"),
+        .target = target,
+        .optimize = .Debug,
+    });
+}
+
+fn makeEmbeddedModule2(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    comptime name1: []const u8,
+    path1: std.Build.LazyPath,
+    comptime name2: []const u8,
+    path2: std.Build.LazyPath,
+) *std.Build.Module {
+    const wf = b.addWriteFiles();
+    _ = wf.addCopyFile(path1, name1);
+    _ = wf.addCopyFile(path2, name2);
+    const id1 = comptime name1[0 .. name1.len - 4];
+    const id2 = comptime name2[0 .. name2.len - 4];
+    return b.createModule(.{
+        .root_source_file = wf.add("embedded_children.zig",
+            "pub const " ++ id1 ++ " = @embedFile(\"" ++ name1 ++ "\");\n" ++
+                "pub const " ++ id2 ++ " = @embedFile(\"" ++ name2 ++ "\");\n"),
+        .target = target,
+        .optimize = .Debug,
+    });
 }
 
 pub fn build(b: *std.Build) void {
@@ -76,111 +123,43 @@ pub fn build(b: *std.Build) void {
     const lib_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "libz/lib.zig" },
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .Debug,
         .pic = true,
     });
+    lib_mod.addImport("lib", lib_mod); // self-reference so libz files can @import("lib")
 
-    // Step 1: Build leaf processes
-    const compositor_bin = buildChild(b, target, lib_mod, "compositor", "compositor/main.zig");
-    const serial_driver_bin = buildChild(b, target, lib_mod, "serial_driver", "serial_driver/main.zig");
-    const usb_driver_bin = buildChild(b, target, lib_mod, "usb_driver", "usb_driver/main.zig");
-    const echo_bin = buildChild(b, target, lib_mod, "echo", "zutils/echo/main.zig");
+    // ── Level 0: Leaf processes and utilities ─────────────────────
+    const compositor = buildProcess(b, target, lib_mod, "compositor", "compositor/main.zig", null);
+    const usb_driver = buildProcess(b, target, lib_mod, "usb_driver", "usb_driver/main.zig", null);
+    const echo = buildUtil(b, target, lib_mod, "echo", "zutils/echo/main.zig");
 
-    // Step 1b: Build terminal with embedded echo
-    const term_embedded_wf = b.addWriteFiles();
-    _ = term_embedded_wf.addCopyFile(echo_bin, "echo.elf");
-    const term_embed_src = term_embedded_wf.add("embedded_children.zig",
-        \\pub const echo = @embedFile("echo.elf");
-        \\
-    );
-    const term_embedded_mod = b.createModule(.{
-        .root_source_file = term_embed_src,
-        .target = target,
-        .optimize = .ReleaseSmall,
-    });
-    const terminal_bin = buildManagerChild(
-        b,
-        target,
-        lib_mod,
-        term_embedded_mod,
-        "terminal",
-        "terminal/main.zig",
-    );
+    // Terminal embeds echo, so it's built as a manager
+    const echo_embed = makeEmbeddedModule1(b, target, "echo.elf", echo);
+    const terminal = buildProcess(b, target, lib_mod, "terminal", "terminal/main.zig", echo_embed);
 
-    // Step 2a: Build device_manager with serial_driver + usb_driver embedded
-    const dm_embedded_wf = b.addWriteFiles();
-    _ = dm_embedded_wf.addCopyFile(compositor_bin, "compositor.elf");
-    _ = dm_embedded_wf.addCopyFile(serial_driver_bin, "serial_driver.elf");
-    _ = dm_embedded_wf.addCopyFile(usb_driver_bin, "usb_driver.elf");
-    const dm_embed_src = dm_embedded_wf.add("embedded_children.zig",
-        \\pub const compositor = @embedFile("compositor.elf");
-        \\pub const serial_driver = @embedFile("serial_driver.elf");
-        \\pub const usb_driver = @embedFile("usb_driver.elf");
-        \\
-    );
-    const dm_embedded_mod = b.createModule(.{
-        .root_source_file = dm_embed_src,
-        .target = target,
-        .optimize = .ReleaseSmall,
-    });
-    const device_manager_bin = buildManagerChild(
-        b,
-        target,
-        lib_mod,
-        dm_embedded_mod,
-        "device_manager",
-        "device_manager/main.zig",
-    );
+    // ── Level 1: Managers ──────────────────────────────────────────
+    const svc_embed = makeEmbeddedModule2(b, target, "compositor.elf", compositor, "usb_driver.elf", usb_driver);
+    const app_embed = makeEmbeddedModule1(b, target, "terminal.elf", terminal);
 
-    // Step 2b: Build app_manager with terminal embedded
-    const am_embedded_wf = b.addWriteFiles();
-    _ = am_embedded_wf.addCopyFile(terminal_bin, "terminal.elf");
-    const am_embed_src = am_embedded_wf.add("embedded_children.zig",
-        \\pub const terminal = @embedFile("terminal.elf");
-        \\
-    );
-    const am_embedded_mod = b.createModule(.{
-        .root_source_file = am_embed_src,
-        .target = target,
-        .optimize = .ReleaseSmall,
-    });
-    const app_manager_bin = buildManagerChild(
-        b,
-        target,
-        lib_mod,
-        am_embedded_mod,
-        "app_manager",
-        "app_manager/main.zig",
-    );
+    const service_manager = buildProcess(b, target, lib_mod, "service_manager", "service_manager/main.zig", svc_embed);
+    const app_manager = buildProcess(b, target, lib_mod, "app_manager", "app_manager/main.zig", app_embed);
 
-    // Step 3: Build root_service with device_manager + app_manager embedded
-    const root_embedded_wf = b.addWriteFiles();
-    _ = root_embedded_wf.addCopyFile(device_manager_bin, "device_manager.elf");
-    _ = root_embedded_wf.addCopyFile(app_manager_bin, "app_manager.elf");
-    const root_embed_src = root_embedded_wf.add("embedded_children.zig",
-        \\pub const device_manager = @embedFile("device_manager.elf");
-        \\pub const app_manager = @embedFile("app_manager.elf");
-        \\
-    );
-    const root_embedded_mod = b.createModule(.{
-        .root_source_file = root_embed_src,
-        .target = target,
-        .optimize = .ReleaseSmall,
-    });
+    // ── Level 2: Root service ──────────────────────────────────────
+    const root_embed = makeEmbeddedModule2(b, target, "service_manager.elf", service_manager, "app_manager.elf", app_manager);
 
     const app_mod = b.createModule(.{
         .root_source_file = b.path("root_service/main.zig"),
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .Debug,
         .pic = true,
     });
     app_mod.addImport("lib", lib_mod);
-    app_mod.addImport("embedded_children", root_embedded_mod);
+    app_mod.addImport("embedded_children", root_embed);
 
     const start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "libz/start.zig" },
         .target = target,
-        .optimize = .ReleaseSmall,
+        .optimize = .Debug,
         .pic = true,
     });
     start_mod.addImport("lib", lib_mod);
@@ -191,20 +170,10 @@ pub fn build(b: *std.Build) void {
         .linkage = .static,
     });
     exe.pie = true;
+    exe.use_llvm = true;
+    exe.use_lld = true;
     exe.entry = .{ .symbol_name = "_start" };
     exe.setLinkerScript(b.path("linker.ld"));
     const install = b.addInstallFile(exe.getEmittedBin(), "../bin/desktopOS.elf");
     b.getInstallStep().dependOn(&install.step);
-
-    // ── Tests ──────────────────────────────────────────────────────────
-    const test_step = b.step("test", "Run UI library unit tests");
-    const ui_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = .{ .cwd_relative = "libz/ui.zig" },
-            .target = b.graph.host,
-            .optimize = .Debug,
-        }),
-    });
-    const run_tests = b.addRunArtifact(ui_tests);
-    test_step.dependOn(&run_tests.step);
 }

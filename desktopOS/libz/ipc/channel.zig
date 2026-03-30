@@ -1,7 +1,9 @@
-const perm_view = @import("perm_view.zig");
-const perms = @import("perms.zig");
-const sync = @import("sync.zig");
-const syscall = @import("syscall.zig");
+const lib = @import("lib");
+
+const perm_view = lib.perm_view;
+const perms = lib.perms;
+const sync = lib.sync;
+const syscall = lib.syscall;
 
 // These are pub for access by syscall.zig (spawn_child) and start.zig (init).
 // Not part of the application-facing API.
@@ -374,9 +376,10 @@ pub const CommandChannel = extern struct {
         self_id: SemanticID,
         target_id: SemanticID,
         channel_id: u64,
+        shm_size: u64,
     ) Command {
         return .{
-            .payload = .{ self_id.toInt(), target_id.toInt(), channel_id },
+            .payload = .{ self_id.toInt(), target_id.toInt(), channel_id | (shm_size << 32) },
             .id = .request_channel,
         };
     }
@@ -388,9 +391,9 @@ pub const CommandChannel = extern struct {
         };
     }
 
-    pub fn forwardChannelHandleCommand(channel_id: u64, target_id: SemanticID) Command {
+    pub fn forwardChannelHandleCommand(channel_id: u64, target_id: SemanticID, shm_size: u64) Command {
         return .{
-            .payload = .{ channel_id, target_id.toInt(), 0 },
+            .payload = .{ channel_id, target_id.toInt(), shm_size },
             .id = .forward_channel_handle,
         };
     }
@@ -554,6 +557,9 @@ pub const Channel = extern struct {
 
     // unique identifier set by A side to tell B what the channel is for, 0 means not yet initialized
     channel_id: u64 = 0,
+    // semantic IDs of both sides, written by the LCA broker during channel creation
+    semantic_id_a: u64 = 0, // requester (side A)
+    semantic_id_b: u64 = 0, // target (side B)
 
     /// Places the Channel header at the start of `region`, splits the remainder
     /// in half for A's and B's ring buffers. Returns a pointer to the Channel.
@@ -681,13 +687,18 @@ pub const Channel = extern struct {
             if (data_avail < HEADER_SIZE + msg_len) return null;
         }
 
-        if (msg_len > out.len) return null;
+        if (msg_len > out.len) {
+            // Message too large for buffer — skip it to unblock the ring
+            @atomicStore(u64, rx_p, rx +% HEADER_SIZE +% msg_len, .release);
+            return null;
+        }
 
         ringRead(buf, buf_size, rx + HEADER_SIZE, out[0..msg_len]);
 
         const actual_cksum = checksum(out[0..msg_len]);
         if (actual_cksum != expected_cksum) {
             syscall.write("channel: checksum mismatch\n");
+            @atomicStore(u64, rx_p, rx +% HEADER_SIZE +% msg_len, .release);
             return null;
         }
 
@@ -739,17 +750,17 @@ pub fn makeDiscoverable(protocol: ProtocolID, ttl: u64) !void {
 /// Find a process advertising `protocol` in the discovery table, request a
 /// channel with `channel_id`, and block (futex) until it's established.
 /// Returns the connected Channel or null on timeout.
-pub fn requestConnection(protocol: ProtocolID, channel_id: u64, timeout_ns: u64) ?*Channel {
+pub fn requestConnection(protocol: ProtocolID, channel_id: u64, shm_size: u64, timeout_ns: u64) ?*Channel {
     const target_id = discoverTarget(protocol) orelse return null;
-    sendChannelRequest(target_id, channel_id) catch return null;
+    sendChannelRequest(target_id, channel_id, shm_size) catch return null;
     return awaitChannel(channel_id, timeout_ns);
 }
 
 /// Find a process advertising `protocol`, send the channel request, and
 /// return immediately. Call `pollConnection` to check if the channel arrived.
-pub fn requestConnectionAsync(protocol: ProtocolID, channel_id: u64) !void {
+pub fn requestConnectionAsync(protocol: ProtocolID, channel_id: u64, shm_size: u64) !void {
     const target_id = discoverTarget(protocol) orelse return error.NotFound;
-    try sendChannelRequest(target_id, channel_id);
+    try sendChannelRequest(target_id, channel_id, shm_size);
 }
 
 /// Check if a previously requested channel has been delivered.
@@ -777,6 +788,17 @@ pub fn pollConnection(channel_id: u64) ?*Channel {
         }
     }
     return null;
+}
+
+/// Return any pending incoming channel regardless of channel_id. Non-blocking.
+pub fn pollAnyIncoming() ?*Channel {
+    const pcount = @atomicLoad(u8, &pending_channel_count, .acquire);
+    if (pcount == 0) return null;
+    const ptr: *Channel = @ptrFromInt(pending_channels[0].channel_ptr);
+    const last = pcount - 1;
+    pending_channels[0] = pending_channels[last];
+    @atomicStore(u8, &pending_channel_count, last, .release);
+    return ptr;
 }
 
 /// Run the protocol loop as the root service (no parent, no worker thread needed).
@@ -821,9 +843,9 @@ pub fn initSemanticId() void {
     }
 }
 
-fn sendChannelRequest(target_id: SemanticID, channel_id: u64) !void {
+fn sendChannelRequest(target_id: SemanticID, channel_id: u64, shm_size: u64) !void {
     const pcc = parent_command_channel orelse return error.NoParent;
-    try pcc.enqueueA(CommandChannel.requestChannelCommand(my_semantic_id, target_id, channel_id));
+    try pcc.enqueueA(CommandChannel.requestChannelCommand(my_semantic_id, target_id, channel_id, shm_size));
 }
 
 fn protocolLoop() void {
@@ -944,25 +966,22 @@ fn handleNewDiscoveryEntry(cmd: CommandChannel.Command) void {
 fn handleRequestChannel(cmd: CommandChannel.Command) void {
     const src_id = SemanticID.fromInt(cmd.payload[0]);
     const target_id = SemanticID.fromInt(cmd.payload[1]);
-    const channel_id = cmd.payload[2];
+    const channel_id = cmd.payload[2] & 0xFFFFFFFF;
+    const requested_size = cmd.payload[2] >> 32;
+    const shm_size = if (requested_size > 0) alignToPages(requested_size) else alignToPages(4 * syscall.PAGE4K);
 
     if (SemanticID.eql(my_semantic_id, target_id)) {
-        // I am the target — create the channel and pass handle down toward src
-        brokerChannelAsTarget(src_id, channel_id);
+        brokerChannelAsTarget(src_id, channel_id, shm_size);
     } else if (SemanticID.isAncestor(my_semantic_id, target_id)) {
-        // I am the LCA — broker between src and target subtrees
-        brokerChannel(src_id, target_id, channel_id);
+        brokerChannel(src_id, target_id, channel_id, shm_size);
     } else {
-        // Not the LCA — forward up
         if (parent_command_channel) |pcc| {
             pcc.enqueueA(cmd) catch {};
         }
     }
 }
 
-fn brokerChannelAsTarget(src_id: SemanticID, channel_id: u64) void {
-    // Create SHM for the data channel
-    const shm_size = alignToPages(4 * syscall.PAGE4K); // default channel size
+fn brokerChannelAsTarget(src_id: SemanticID, channel_id: u64, shm_size: u64) void {
     const shm = syscall.shm_create_with_rights(shm_size, shm_rw_grant);
     if (shm <= 0) return;
 
@@ -974,6 +993,8 @@ fn brokerChannelAsTarget(src_id: SemanticID, channel_id: u64) void {
     const region: [*]u8 = @ptrFromInt(vm_result.val2);
     const chan = Channel.init(region[0..shm_size]) orelse return;
     chan.channel_id = channel_id;
+    chan.semantic_id_a = @bitCast(src_id.bytes);
+    chan.semantic_id_b = @bitCast(my_semantic_id.bytes);
 
     addKnownShmHandle(@intCast(shm));
 
@@ -984,7 +1005,7 @@ fn brokerChannelAsTarget(src_id: SemanticID, channel_id: u64) void {
                 SemanticID.isAncestor(cc.self_semantic_id, src_id))
             {
                 _ = syscall.grant_perm(@intCast(shm), child_proc_handles[i], shm_rw_grant);
-                cc.enqueueB(CommandChannel.forwardChannelHandleCommand(channel_id, src_id)) catch {};
+                cc.enqueueB(CommandChannel.forwardChannelHandleCommand(channel_id, src_id, shm_size)) catch {};
                 break;
             }
         }
@@ -994,8 +1015,7 @@ fn brokerChannelAsTarget(src_id: SemanticID, channel_id: u64) void {
     deliverChannel(channel_id, chan);
 }
 
-fn brokerChannel(src_id: SemanticID, target_id: SemanticID, channel_id: u64) void {
-    const shm_size = alignToPages(4 * syscall.PAGE4K);
+fn brokerChannel(src_id: SemanticID, target_id: SemanticID, channel_id: u64, shm_size: u64) void {
     const shm = syscall.shm_create_with_rights(shm_size, shm_rw_grant);
     if (shm <= 0) return;
 
@@ -1007,6 +1027,8 @@ fn brokerChannel(src_id: SemanticID, target_id: SemanticID, channel_id: u64) voi
     const region: [*]u8 = @ptrFromInt(vm_result.val2);
     const chan = Channel.init(region[0..shm_size]) orelse return;
     chan.channel_id = channel_id;
+    chan.semantic_id_a = @bitCast(src_id.bytes);
+    chan.semantic_id_b = @bitCast(target_id.bytes);
     addKnownShmHandle(@intCast(shm));
 
     // Grant to child leading to src
@@ -1016,7 +1038,7 @@ fn brokerChannel(src_id: SemanticID, target_id: SemanticID, channel_id: u64) voi
                 SemanticID.isAncestor(cc.self_semantic_id, src_id))
             {
                 _ = syscall.grant_perm(@intCast(shm), child_proc_handles[i], shm_rw_grant);
-                cc.enqueueB(CommandChannel.forwardChannelHandleCommand(channel_id, src_id)) catch {};
+                cc.enqueueB(CommandChannel.forwardChannelHandleCommand(channel_id, src_id, shm_size)) catch {};
                 break;
             }
         }
@@ -1029,7 +1051,7 @@ fn brokerChannel(src_id: SemanticID, target_id: SemanticID, channel_id: u64) voi
                 SemanticID.isAncestor(cc.self_semantic_id, target_id))
             {
                 _ = syscall.grant_perm(@intCast(shm), child_proc_handles[i], shm_rw_grant);
-                cc.enqueueB(CommandChannel.forwardChannelHandleCommand(channel_id, target_id)) catch {};
+                cc.enqueueB(CommandChannel.forwardChannelHandleCommand(channel_id, target_id, shm_size)) catch {};
                 break;
             }
         }
@@ -1042,6 +1064,7 @@ fn brokerChannel(src_id: SemanticID, target_id: SemanticID, channel_id: u64) voi
 fn handleForwardChannelHandle(cmd: CommandChannel.Command) void {
     const channel_id = cmd.payload[0];
     const target_id = SemanticID.fromInt(cmd.payload[1]);
+    const shm_size = if (cmd.payload[2] > 0) cmd.payload[2] else alignToPages(4 * syscall.PAGE4K);
 
     // Find the new SHM handle in perm_view
     const view: *const [128]perm_view.UserViewEntry = @ptrFromInt(perm_view_addr);
@@ -1060,31 +1083,26 @@ fn handleForwardChannelHandle(cmd: CommandChannel.Command) void {
     addKnownShmHandle(shm_handle);
 
     // Map the SHM
-    const shm_size = alignToPages(4 * syscall.PAGE4K);
     const vm_result = syscall.vm_reserve(0, shm_size, rw_shareable);
     if (vm_result.val < 0) return;
 
     const map_rc = syscall.shm_map(shm_handle, @intCast(vm_result.val), 0);
-    if (map_rc != 0 and map_rc != -1) return; // -1 = E_INVAL (already mapped), that's ok
+    if (map_rc != 0 and map_rc != -1) return;
 
     const chan: *Channel = @ptrFromInt(vm_result.val2);
 
-    // Verify channel_id matches
     if (chan.channel_id != channel_id) return;
 
     if (SemanticID.eql(my_semantic_id, target_id)) {
-        // Final destination — deliver to main thread
         deliverChannel(channel_id, chan);
     } else {
-        // Forward to child subtree containing target
         for (&child_command_channels, 0..) |*maybe_cc, i| {
             if (maybe_cc.*) |cc| {
                 if (SemanticID.eql(cc.self_semantic_id, target_id) or
                     SemanticID.isAncestor(cc.self_semantic_id, target_id))
                 {
                     _ = syscall.grant_perm(shm_handle, child_proc_handles[i], shm_rw_grant);
-                    cc.enqueueB(CommandChannel.forwardChannelHandleCommand(channel_id, target_id)) catch {};
-                    // Revoke own access
+                    cc.enqueueB(CommandChannel.forwardChannelHandleCommand(channel_id, target_id, shm_size)) catch {};
                     _ = syscall.revoke_perm(shm_handle);
                     break;
                 }

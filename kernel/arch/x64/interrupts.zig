@@ -72,18 +72,29 @@ pub fn prepareThreadContext(
     arg: u64,
 ) *ArchCpuContext {
     @setRuntimeSafety(false);
-    const ctx_addr: u64 = kstack_top.addr - @sizeOf(cpu.Context);
+    // Match the real interrupt entry layout. TSS.RSP0 = kernel_stack.top (page-aligned).
+    // CPU pushes 5 words (40 bytes), stub pushes 2 words (16 bytes),
+    // prologue pushes 15 GP regs (120 bytes) = 176 total. Then FXSAVE area below.
+    // kstack_top from caller is alignStack(top) = top-8, but we need the raw top
+    // (same as TSS.RSP0) so FXSAVE lands at a 16-byte aligned address.
+    // Undo the -8 from alignStack:
+    const raw_top: u64 = (kstack_top.addr + 8 + 15) & ~@as(u64, 15);
+    const ctx_addr: u64 = raw_top - @sizeOf(cpu.Context);
+    const fxsave_addr: u64 = ctx_addr - cpu.FXSAVE_SIZE;
     var ctx: *cpu.Context = @ptrFromInt(ctx_addr);
 
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
 
-    // Zero the entire context with @memset to avoid movaps alignment issues
-    // in ReleaseFast. The packed struct Context sits at an 8-byte-aligned
-    // (not 16-byte-aligned) address due to the SysV ABI stack convention,
-    // but LLVM emits movaps (requiring 16-byte alignment) for bulk struct
-    // literal initialization.
-    const ctx_bytes: [*]u8 = @ptrFromInt(ctx_addr);
-    @memset(ctx_bytes[0..@sizeOf(cpu.Context)], 0);
+    // Zero the entire region (FXSAVE area + Context) to avoid movaps
+    // alignment issues and to give a clean initial SSE state.
+    const full_bytes: [*]u8 = @ptrFromInt(fxsave_addr);
+    @memset(full_bytes[0 .. cpu.FXSAVE_SIZE + @sizeOf(cpu.Context)], 0);
+
+    // Set FXSAVE defaults: FCW=0x037F (mask all FPU exceptions),
+    // MXCSR=0x1F80 (mask all SSE exceptions, round-to-nearest)
+    const fxsave: [*]u8 = @ptrFromInt(fxsave_addr);
+    @as(*align(1) u16, @ptrCast(fxsave[0..2])).* = 0x037F; // FCW
+    @as(*align(1) u32, @ptrCast(fxsave[24..28])).* = 0x1F80; // MXCSR
     ctx.regs.rdi = arg;
     ctx.rip = @intFromPtr(entry);
     ctx.rflags = 0x202;
@@ -111,8 +122,11 @@ pub fn switchTo(thread: *Thread) void {
     }
 
     apic.endOfInterrupt();
+    // ctx points to Context (GP regs). FXSAVE area is 512 bytes below.
+    // Epilogue expects RSP at FXSAVE area.
     asm volatile (
         \\movq %[new_stack], %%rsp
+        \\subq $512, %%rsp
         \\jmp interruptStubEpilogue
         :
         : [new_stack] "r" (@intFromPtr(thread.ctx)),
@@ -172,7 +186,12 @@ export fn interruptStubPrologue() callconv(.naked) void {
         \\pushq %r14
         \\pushq %r15
         \\
-        \\mov %rsp, %rdi
+        // Save SSE/x87 state (512 bytes below GP regs)
+        \\subq $512, %rsp
+        \\fxsave (%rsp)
+        \\
+        // Pass Context address (GP regs, 512 bytes above FXSAVE) to handler
+        \\lea 512(%rsp), %rdi
         \\call dispatchInterrupt
         \\
         \\jmp interruptStubEpilogue
@@ -181,6 +200,10 @@ export fn interruptStubPrologue() callconv(.naked) void {
 
 export fn interruptStubEpilogue() callconv(.naked) void {
     asm volatile (
+        // Restore SSE/x87 state
+        \\fxrstor (%rsp)
+        \\addq $512, %rsp
+        \\
         \\popq %r15
         \\popq %r14
         \\popq %r13

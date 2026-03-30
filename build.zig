@@ -39,13 +39,7 @@ const profiles = struct {
         .iommu = "intel",
         .display = "gtk",
     };
-    const channel_rework = Profile{
-        .root_service = "channel_rework/bin/channel_rework.elf",
-        .net = "none",
-        .kvm = true,
-        .use_llvm = true,
-        .iommu = "intel",
-    };
+
 };
 
 fn getProfile(name: []const u8) ?Profile {
@@ -53,7 +47,7 @@ fn getProfile(name: []const u8) ?Profile {
     if (std.mem.eql(u8, name, "test")) return profiles.test_;
     if (std.mem.eql(u8, name, "bench")) return profiles.bench;
     if (std.mem.eql(u8, name, "desktop")) return profiles.desktop;
-    if (std.mem.eql(u8, name, "channel_rework")) return profiles.channel_rework;
+
     return null;
 }
 

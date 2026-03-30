@@ -1,3 +1,6 @@
+const lib = @import("lib");
+const syscall = lib.syscall;
+
 pub const ENTRY_TYPE_PROCESS: u8 = 0;
 pub const ENTRY_TYPE_VM_RESERVATION: u8 = 1;
 pub const ENTRY_TYPE_SHARED_MEMORY: u8 = 2;
@@ -24,11 +27,9 @@ pub const CrashReason = enum(u5) {
     _,
 };
 
-const syscall = @import("syscall.zig");
 const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 
 /// Wait until the perm_view changes (new grants/revokes).
-/// The kernel bumps field1 of the self-entry on each change and does futex_wake.
 pub fn waitForChange(view_addr: u64, timeout_ns: u64) void {
     const view: *const [128]UserViewEntry = @ptrFromInt(view_addr);
     const gen = @atomicLoad(u64, &view[0].field1, .acquire);

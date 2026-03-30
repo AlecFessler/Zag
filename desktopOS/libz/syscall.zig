@@ -1,3 +1,9 @@
+const lib = @import("lib");
+
+const channel = lib.channel;
+const perms_ = lib.perms;
+const sync_ = lib.sync;
+
 pub const PAGE4K: u64 = 4096;
 
 pub const SyscallResult2 = struct {
@@ -202,4 +208,64 @@ pub fn dma_unmap(device_handle: u64, shm_handle: u64) i64 {
 
 pub fn pin_exclusive() i64 {
     return syscall0(.pin_exclusive);
+}
+
+/// Higher-level spawn: calls proc_create and wires up the child's command channel
+/// and discovery table. `child_id` is the SemanticID assigned to the child.
+pub fn spawn_child(elf_ptr: u64, elf_len: u64, rights_bits: u64, child_id: channel.SemanticID) i64 {
+    const child_index = child_id.bytes[channel.my_semantic_id.depth()];
+
+    const proc_handle = proc_create(elf_ptr, elf_len, rights_bits);
+    if (proc_handle <= 0) {
+        write("spawn_child: proc_create failed\n");
+        return proc_handle;
+    }
+    // Store proc handle for grant_perm during brokering
+    channel.child_proc_handles[child_index - 1] = @intCast(proc_handle);
+
+    // Create and grant discovery table SHM
+    const dt_shm_size = channel.alignToPages(@sizeOf(channel.DiscoveryTable));
+    const dt_shm = shm_create_with_rights(dt_shm_size, (perms_.SharedMemoryRights{
+        .read = true,
+        .write = true,
+        .grant = true,
+    }).bits());
+    if (dt_shm <= 0) {
+        write("spawn_child: dt shm_create failed\n");
+        return -1;
+    }
+    channel.addKnownShmHandle(@intCast(dt_shm));
+    const dt_vm = vm_reserve(0, dt_shm_size, (perms_.VmReservationRights{
+        .read = true,
+        .write = true,
+        .shareable = true,
+    }).bits());
+    if (dt_vm.val < 0) {
+        write("spawn_child: dt vm_reserve failed\n");
+        return -1;
+    }
+    if (shm_map(@intCast(dt_shm), @intCast(dt_vm.val), 0) != 0) {
+        write("spawn_child: dt shm_map failed\n");
+        return -1;
+    }
+    const dt: *channel.DiscoveryTable = @ptrFromInt(dt_vm.val2);
+    dt.my_semantic_id = child_id;
+    dt.entries_len = 0;
+    dt.seq = sync_.Seqlock.init();
+    channel.child_discovery_tables[child_index - 1] = dt;
+    channel.copyPropagatedEntries(dt);
+    _ = grant_perm(@intCast(dt_shm), @intCast(proc_handle), (perms_.SharedMemoryRights{
+        .read = true,
+        .write = true,
+        .grant = true,
+    }).bits());
+
+    // Create command channel and set child's semantic ID on it
+    // semantic_id MUST be set before the grant so the child can read it after mapping
+    _ = channel.initChildCommandChannel(child_index, child_id, @intCast(proc_handle)) orelse {
+        write("spawn_child: initChildCommandChannel failed\n");
+        return -1;
+    };
+
+    return proc_handle;
 }

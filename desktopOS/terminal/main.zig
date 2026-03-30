@@ -1,13 +1,10 @@
 const lib = @import("lib");
 
-const channel_mod = lib.channel;
-const embedded = @import("embedded_children");
-const fb_proto = lib.framebuffer;
+const channel = lib.channel;
+const display = lib.display;
 const font = lib.font;
-const input = lib.input;
+const keyboard = lib.keyboard;
 const perms = lib.perms;
-const pv = lib.perm_view;
-const shm_protocol = lib.shm_protocol;
 const syscall = lib.syscall;
 const ui_mod = lib.ui;
 
@@ -15,12 +12,12 @@ const Color = ui_mod.Color;
 const Edges = ui_mod.Edges;
 const UI = ui_mod.UI;
 
-const MAX_PERMS = 128;
-const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
+const embedded = @import("embedded_children");
+
 const HISTORY_SIZE = 4096;
 const INPUT_SIZE = 256;
 const RENDER_SIZE = HISTORY_SIZE + INPUT_SIZE + 16;
-const DATA_CHAN_SIZE: u64 = 4 * syscall.PAGE4K;
+const DATA_CHAN_SIZE: u64 = 4 * 4096; // 16KB for echo data channel
 
 // ── State ─────────────────────────────────────────────────────────────
 var history_buf: [HISTORY_SIZE]u8 = undefined;
@@ -32,114 +29,35 @@ var input_len: u16 = 0;
 var render_buf: [RENDER_SIZE]u8 = undefined;
 var render_len: u16 = 0;
 
-// ── SHM tracking ──────────────────────────────────────────────────────
-var mapped_handles: [16]u64 = .{0} ** 16;
-var num_mapped: u32 = 0;
+var should_exit: bool = false;
 
-fn isHandleMapped(handle: u64) bool {
-    for (mapped_handles[0..num_mapped]) |h| {
-        if (h == handle) return true;
-    }
-    return false;
-}
-
-fn recordMapped(handle: u64) void {
-    if (num_mapped < mapped_handles.len) {
-        mapped_handles[num_mapped] = handle;
-        num_mapped += 1;
-    }
-}
-
-// ── Framebuffer mapping ───────────────────────────────────────────────
-fn mapFramebuffer(view: *const [MAX_PERMS]pv.UserViewEntry) ?*fb_proto.FramebufferHeader {
-    var fb_handle: u64 = 0;
-    while (fb_handle == 0) {
-        for (view) |*e| {
-            if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and
-                e.field0 == fb_proto.FRAMEBUFFER_SHM_SIZE and
-                !isHandleMapped(e.handle))
-            {
-                fb_handle = e.handle;
-                break;
-            }
-        }
-        if (fb_handle == 0) pv.waitForChange(@intFromPtr(view), MAX_TIMEOUT);
-    }
-    if (fb_handle == 0) return null;
-    recordMapped(fb_handle);
-
-    const vm_rights = (perms.VmReservationRights{
-        .read = true,
-        .write = true,
-        .shareable = true,
-    }).bits();
-    const vm = syscall.vm_reserve(0, fb_proto.FRAMEBUFFER_SHM_SIZE, vm_rights);
-    if (vm.val < 0) return null;
-    if (syscall.shm_map(fb_handle, @intCast(vm.val), 0) != 0) return null;
-    return @ptrFromInt(vm.val2);
-}
-
-// ── Data channel mapping ──────────────────────────────────────────────
-fn mapDataChannel(view: *const [MAX_PERMS]pv.UserViewEntry) ?channel_mod.Channel {
-    var data_shm_handle: u64 = 0;
-    var data_shm_size: u64 = 0;
-    while (data_shm_handle == 0) {
-        for (view) |*e| {
-            if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and
-                e.field0 > shm_protocol.COMMAND_SHM_SIZE and
-                e.field0 != fb_proto.FRAMEBUFFER_SHM_SIZE and
-                !isHandleMapped(e.handle))
-            {
-                data_shm_handle = e.handle;
-                data_shm_size = e.field0;
-                break;
-            }
-        }
-        if (data_shm_handle == 0) pv.waitForChange(@intFromPtr(view), MAX_TIMEOUT);
-    }
-    recordMapped(data_shm_handle);
-
-    const vm_rights = (perms.VmReservationRights{
-        .read = true,
-        .write = true,
-        .shareable = true,
-    }).bits();
-    while (true) {
-        const vm_result = syscall.vm_reserve(0, data_shm_size, vm_rights);
-        if (vm_result.val >= 0) {
-            if (syscall.shm_map(data_shm_handle, @intCast(vm_result.val), 0) == 0) {
-                const chan_header: *channel_mod.ChannelHeader = @ptrFromInt(vm_result.val2);
-                return channel_mod.Channel.openAsSideA(chan_header) orelse {
-                    syscall.thread_yield();
-                    continue;
-                };
-            }
-        }
-        syscall.thread_yield();
-    }
-}
+// Display state — updated on render_target and window_resized
+var display_client: display.Client = undefined;
+var frame_pixels: [*]u32 = undefined;
+var frame_bytes: [*]u8 = undefined;
+var frame_byte_size: u64 = 0;
+var render_width: u32 = 0;
+var render_height: u32 = 0;
+var render_stride: u32 = 0;
+var render_format: u32 = 0;
 
 // ── Render buffer management ──────────────────────────────────────────
 fn rebuildRenderBuf() void {
     render_len = 0;
-    // Copy history
     const hl: usize = history_len;
     if (hl > 0) {
         @memcpy(render_buf[0..hl], history_buf[0..hl]);
         render_len = @intCast(hl);
     }
-    // Add prompt
     const prompt = "> ";
     const pl: usize = prompt.len;
     @memcpy(render_buf[render_len..][0..pl], prompt);
     render_len += @intCast(pl);
-    // Add current input
     const il: usize = input_len;
     if (il > 0) {
         @memcpy(render_buf[render_len..][0..il], input_buf[0..il]);
         render_len += @intCast(il);
     }
-    // Add cursor
     render_buf[render_len] = '_';
     render_len += 1;
 }
@@ -162,7 +80,6 @@ fn calcScrollY(text_w: u32, text_h: u32) u32 {
     const cols = text_w / char_w;
     if (cols == 0) return 0;
 
-    // Count wrapped lines in render buffer
     var lines: u32 = 0;
     var i: u32 = 0;
     const len: u32 = render_len;
@@ -182,14 +99,14 @@ fn calcScrollY(text_w: u32, text_h: u32) u32 {
     return 0;
 }
 
-fn buildAndRenderUI(hdr: *fb_proto.FramebufferHeader) void {
-    const width = hdr.readWidth();
-    const height = hdr.readHeight();
-    const stride = hdr.readStride();
-    const format = hdr.readFormat();
+fn renderFrame() void {
+    const width = render_width;
+    const height = render_height;
+    const stride = render_stride;
+    const format = render_format;
+    if (width == 0 or height == 0) return;
 
-    const pixels: [*]u32 = hdr.pixelData();
-    ui_state = UI.init(pixels, width, height, stride, format);
+    ui_state = UI.init(frame_pixels, width, height, stride, @intCast(format));
     const ui = &ui_state;
 
     const root = ui.createBox(.{
@@ -198,7 +115,6 @@ fn buildAndRenderUI(hdr: *fb_proto.FramebufferHeader) void {
     });
     ui.setRoot(root);
 
-    // Scrollable text area (full window)
     rebuildRenderBuf();
 
     const text_w = if (width > 16) width - 16 else 0;
@@ -215,27 +131,35 @@ fn buildAndRenderUI(hdr: *fb_proto.FramebufferHeader) void {
 
     ui.layout();
 
-    // Set scroll after layout so we know the node dimensions
     if (body_node != ui_mod.NONE) {
         ui.nodes[body_node].scroll_y = scroll;
     }
 
     ui.render();
-    hdr.incrementFrameCounter();
+}
+
+fn allocFrameBuffer() void {
+    const pixel_count: usize = @as(usize, render_width) * @as(usize, render_height);
+    frame_byte_size = @intCast(pixel_count * 4);
+    const aligned_size = ((frame_byte_size + syscall.PAGE4K - 1) / syscall.PAGE4K) * syscall.PAGE4K;
+    const fb_vm_rights = (perms.VmReservationRights{ .read = true, .write = true }).bits();
+    const fb_vm = syscall.vm_reserve(0, aligned_size, fb_vm_rights);
+    if (fb_vm.val < 0) {
+        syscall.write("terminal: FAIL vm_reserve frame buffer\n");
+        return;
+    }
+    frame_pixels = @ptrFromInt(fb_vm.val2);
+    frame_bytes = @ptrCast(frame_pixels);
 }
 
 // ── Command execution ─────────────────────────────────────────────────
-var should_exit: bool = false;
-
 fn executeCommand(line: []const u8) void {
-    // Parse command name
     var cmd_end: usize = 0;
     while (cmd_end < line.len and line[cmd_end] != ' ') {
         cmd_end += 1;
     }
     const cmd_name = line[0..cmd_end];
 
-    // Get args (skip space after command)
     var args_start = cmd_end;
     if (args_start < line.len and line[args_start] == ' ') {
         args_start += 1;
@@ -246,7 +170,6 @@ fn executeCommand(line: []const u8) void {
         history_len = 0;
     } else if (strEql(cmd_name, "exit")) {
         should_exit = true;
-        return;
     } else if (strEql(cmd_name, "echo")) {
         runEcho(args);
     } else if (cmd_name.len > 0) {
@@ -257,18 +180,15 @@ fn executeCommand(line: []const u8) void {
 }
 
 fn runEcho(args: []const u8) void {
-    // Create data channel SHM
     const shm_handle = syscall.shm_create(DATA_CHAN_SIZE);
     if (shm_handle <= 0) {
         appendHistory("error: failed to create channel\n");
         return;
     }
 
-    // Map it
     const vm_rights = (perms.VmReservationRights{
         .read = true,
         .write = true,
-        .execute = true,
         .shareable = true,
     }).bits();
     const vm_result = syscall.vm_reserve(0, DATA_CHAN_SIZE, vm_rights);
@@ -281,11 +201,12 @@ fn runEcho(args: []const u8) void {
         return;
     }
 
-    // Initialize channel
-    const chan_header: *channel_mod.ChannelHeader = @ptrFromInt(vm_result.val2);
-    var chan = channel_mod.Channel.initAsSideA(chan_header, @intCast(DATA_CHAN_SIZE));
+    const region: [*]u8 = @ptrFromInt(vm_result.val2);
+    const chan = channel.Channel.init(region[0..DATA_CHAN_SIZE]) orelse {
+        appendHistory("error: failed to init channel\n");
+        return;
+    };
 
-    // Spawn echo process
     const echo_elf = embedded.echo;
     const child_rights = (perms.ProcessRights{
         .grant_to = true,
@@ -297,11 +218,9 @@ fn runEcho(args: []const u8) void {
         return;
     }
 
-    // Grant data channel to echo
     const grant_rights = (perms.SharedMemoryRights{
         .read = true,
         .write = true,
-        .grant = false,
     }).bits();
     const grant_result = syscall.grant_perm(@intCast(shm_handle), @intCast(proc_handle), grant_rights);
     if (grant_result != 0) {
@@ -309,24 +228,27 @@ fn runEcho(args: []const u8) void {
         return;
     }
 
-    // Send args to echo
     if (args.len > 0) {
-        _ = chan.send(args);
+        chan.enqueue(.A, args) catch {
+            appendHistory("error: enqueue failed\n");
+            return;
+        };
     } else {
-        _ = chan.send("\n");
+        chan.enqueue(.A, "\n") catch {
+            appendHistory("error: enqueue failed\n");
+            return;
+        };
     }
 
-    // Wait for response
     var recv_buf: [256]u8 = undefined;
-    const ECHO_TIMEOUT: u64 = 5_000_000_000; // 5 seconds
     var attempts: u32 = 0;
-    while (attempts < 100) : (attempts += 1) {
-        if (chan.recv(&recv_buf)) |len| {
+    while (attempts < 50000) : (attempts += 1) {
+        if (chan.dequeue(.A, &recv_buf)) |len| {
             appendHistory(recv_buf[0..len]);
             appendHistory("\n");
             return;
         }
-        chan.waitForMessage(ECHO_TIMEOUT / 100);
+        syscall.thread_yield();
     }
     appendHistory("error: echo timed out\n");
 }
@@ -340,8 +262,8 @@ fn strEql(a: []const u8, b: []const u8) bool {
 }
 
 // ── HID to ASCII ──────────────────────────────────────────────────────
-fn hidToAscii(keycode: u8, modifiers: u8) u8 {
-    const shift = (modifiers & 0x22) != 0;
+fn hidToAscii(keycode: u8, modifiers: keyboard.Modifiers) u8 {
+    const shift = modifiers.l_shift or modifiers.r_shift;
     return switch (keycode) {
         0x04...0x1D => if (shift) keycode - 0x04 + 'A' else keycode - 0x04 + 'a',
         0x1E...0x26 => if (shift) "!@#$%^&*("[keycode - 0x1E] else keycode - 0x1E + '1',
@@ -366,134 +288,38 @@ fn hidToAscii(keycode: u8, modifiers: u8) u8 {
     };
 }
 
-// ── Main ──────────────────────────────────────────────────────────────
-pub fn main(perm_view_addr: u64) void {
-    const cmd = shm_protocol.mapCommandChannel(perm_view_addr) orelse return;
-    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
+// HID keycodes for arrow keys and special keys
+const HID_RIGHT_ARROW: u8 = 0x4F;
+const HID_LEFT_ARROW: u8 = 0x50;
+const HID_KEY_N: u8 = 0x11;
 
-    // Record command channel SHM
-    for (view) |*e| {
-        if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and e.field0 <= shm_protocol.COMMAND_SHM_SIZE) {
-            recordMapped(e.handle);
-            break;
+fn handleKeyPress(keycode: u8, modifiers: keyboard.Modifiers) void {
+    const ctrl = modifiers.l_ctrl or modifiers.r_ctrl;
+
+    // Compositor control shortcuts
+    if (ctrl) {
+        if (keycode == HID_LEFT_ARROW) {
+            display_client.slideLeft() catch {};
+            return;
+        }
+        if (keycode == HID_RIGHT_ARROW) {
+            display_client.slideRight() catch {};
+            return;
+        }
+        if (keycode == HID_KEY_N) {
+            display_client.requestNewPane() catch {};
+            return;
+        }
+        // Ctrl+1 through Ctrl+8 → switch pane
+        if (keycode >= 0x1E and keycode <= 0x25) {
+            const pane_id: u8 = keycode - 0x1E;
+            display_client.switchPane(pane_id) catch {};
+            return;
         }
     }
-
-    // Request serial first, wait and map it (records the SHM so USB search skips it)
-    const serial_entry = cmd.requestConnection(shm_protocol.ServiceId.SERIAL_DRIVER) orelse return;
-    if (!cmd.waitForConnection(serial_entry)) return;
-    _ = mapDataChannel(view) orelse return;
-
-    // Request compositor and USB
-    const comp_entry = cmd.requestConnection(shm_protocol.ServiceId.COMPOSITOR);
-    _ = cmd.requestConnection(shm_protocol.ServiceId.USB_DRIVER);
-
-    // Wait for compositor framebuffer
-    var fb_hdr: ?*fb_proto.FramebufferHeader = null;
-    if (comp_entry) |entry| {
-        if (cmd.waitForConnection(entry)) {
-            fb_hdr = mapFramebuffer(view);
-        }
-    }
-
-    const _fb_hdr = fb_hdr;
-    if (_fb_hdr) |hdr| {
-        while (!hdr.isValid()) {
-            const magic_u64: *const u64 = @ptrCast(&hdr.magic);
-            _ = syscall.futex_wait(magic_u64, 0, MAX_TIMEOUT);
-        }
-
-        appendHistory("zagOS terminal v0.1\n");
-        buildAndRenderUI(hdr);
-    }
-
-    // Wait for USB input channel (serial SHM is already mapped, so this finds the USB one)
-    var usb_chan: ?channel_mod.Channel = null;
-    while (usb_chan == null) {
-        for (view) |*e| {
-            if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and
-                e.field0 > shm_protocol.COMMAND_SHM_SIZE and
-                e.field0 != fb_proto.FRAMEBUFFER_SHM_SIZE and
-                !isHandleMapped(e.handle))
-            {
-                const vm_rights = (perms.VmReservationRights{
-                    .read = true,
-                    .write = true,
-                    .shareable = true,
-                }).bits();
-                const vm_result = syscall.vm_reserve(0, e.field0, vm_rights);
-                if (vm_result.val >= 0) {
-                    if (syscall.shm_map(e.handle, @intCast(vm_result.val), 0) == 0) {
-                        const chan_header: *channel_mod.ChannelHeader = @ptrFromInt(vm_result.val2);
-                        usb_chan = channel_mod.Channel.openAsSideA(chan_header);
-                        if (usb_chan != null) {
-                            recordMapped(e.handle);
-                        }
-                    }
-                }
-                break;
-            }
-        }
-        if (usb_chan == null) pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
-    }
-
-    // Main input loop
-    var recv_buf: [64]u8 = undefined;
-    var last_layout_gen: u64 = if (_fb_hdr) |hdr| hdr.readLayoutGeneration() else 0;
-    var needs_redraw: bool = false;
-
-    while (!should_exit) {
-        // Check for layout changes (window resize)
-        if (_fb_hdr) |hdr| {
-            const gen = hdr.readLayoutGeneration();
-            if (gen != last_layout_gen) {
-                last_layout_gen = gen;
-                buildAndRenderUI(hdr);
-            }
-        }
-
-        // Process keyboard input
-        if (usb_chan) |*uc| {
-            if (uc.recv(&recv_buf)) |len| {
-                if (len >= input.EVENT_SIZE) {
-                    const tag = input.decodeTag(&recv_buf);
-                    if (tag) |t| {
-                        if (t == input.Tag.KEYBOARD) {
-                            if (input.decodeKeyboard(&recv_buf)) |ev| {
-                                if (ev.state == input.KeyState.PRESSED) {
-                                    handleKeyPress(ev.keycode, ev.modifiers);
-                                    needs_redraw = true;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        if (needs_redraw) {
-            if (_fb_hdr) |hdr| {
-                buildAndRenderUI(hdr);
-            }
-            needs_redraw = false;
-        }
-
-        if (_fb_hdr) |hdr| hdr.tickHeartbeat();
-        syscall.thread_yield();
-    }
-
-    // Clear magic so compositor knows we exited
-    if (_fb_hdr) |hdr| {
-        hdr.setMagic(0);
-    }
-}
-
-fn handleKeyPress(keycode: u8, modifiers: u8) void {
-    // Ignore input when Super/GUI is held (compositor hotkeys)
-    if ((modifiers & 0x88) != 0) return;
 
     if (keycode == 0x28) {
-        // Enter: execute command
+        // Enter
         appendHistory("> ");
         appendHistory(input_buf[0..input_len]);
         appendHistory("\n");
@@ -505,11 +331,128 @@ fn handleKeyPress(keycode: u8, modifiers: u8) void {
             input_len -= 1;
         }
     } else {
-        // Regular character
         const ch = hidToAscii(keycode, modifiers);
         if (ch >= 0x20 and ch < 0x7F and input_len < INPUT_SIZE) {
             input_buf[input_len] = ch;
             input_len += 1;
         }
+    }
+}
+
+// ── Main ──────────────────────────────────────────────────────────────
+pub fn main(perm_view_addr: u64) void {
+    _ = perm_view_addr;
+    syscall.write("terminal: starting\n");
+
+    // Derive unique channel_id from semantic ID
+    const my_depth = channel.my_semantic_id.depth();
+    const child_byte: u64 = if (my_depth > 0) channel.my_semantic_id.bytes[my_depth - 1] else 1;
+    const display_channel_id: u64 = 199 + child_byte;
+
+    // Request display channel to compositor
+    const display_chan = channel.requestConnection(
+        @enumFromInt(@intFromEnum(display.protocol_id)),
+        display_channel_id,
+        display.SHM_SIZE,
+        10_000_000_000,
+    ) orelse {
+        syscall.write("terminal: FAIL requestConnection compositor timed out\n");
+        return;
+    };
+    display_client = display.Client.init(display_chan);
+    syscall.write("terminal: display channel connected to compositor\n");
+
+    // Request keyboard channel to usb_driver
+    const kb_channel_id: u64 = 299 + child_byte;
+    const kb_chan = channel.requestConnection(
+        @enumFromInt(@intFromEnum(keyboard.protocol_id)),
+        kb_channel_id,
+        0,
+        10_000_000_000,
+    ) orelse {
+        syscall.write("terminal: FAIL requestConnection usb_keyboard timed out\n");
+        return;
+    };
+    syscall.write("terminal: keyboard channel connected to usb_driver\n");
+
+    // Receive render target info from compositor
+    var retries: u32 = 0;
+    while (retries < 50000) : (retries += 1) {
+        if (display_client.recv()) |msg| {
+            switch (msg) {
+                .render_target => |info| {
+                    render_width = info.width;
+                    render_height = info.height;
+                    render_stride = info.stride;
+                    render_format = info.format;
+                    break;
+                },
+                else => {},
+            }
+        }
+        syscall.thread_yield();
+    } else {
+        syscall.write("terminal: FAIL no render target info\n");
+        return;
+    }
+    syscall.write("terminal: received render target info\n");
+
+    // Allocate frame buffer
+    allocFrameBuffer();
+
+    // Render initial frame
+    appendHistory("zagOS terminal v0.1\n");
+    renderFrame();
+
+    display_client.sendFrame(frame_bytes[0..frame_byte_size]) catch {
+        syscall.write("terminal: FAIL sendFrame\n");
+        return;
+    };
+
+    // Main input loop
+    var needs_redraw: bool = false;
+    while (!should_exit) {
+        // Check for display protocol messages (resize, pane notifications)
+        if (display_client.recv()) |msg| {
+            switch (msg) {
+                .window_resized => |info| {
+                    render_width = info.width;
+                    render_height = info.height;
+                    render_stride = info.stride;
+                    render_format = info.format;
+                    allocFrameBuffer();
+                    needs_redraw = true;
+                },
+                .render_target => |info| {
+                    render_width = info.width;
+                    render_height = info.height;
+                    render_stride = info.stride;
+                    render_format = info.format;
+                    allocFrameBuffer();
+                    needs_redraw = true;
+                },
+                .pane_created => {},
+                .pane_activated => {},
+            }
+        }
+
+        if (keyboard.Client.recv(kb_chan)) |msg| {
+            switch (msg) {
+                .key => |ev| {
+                    if (ev.state == .pressed) {
+                        handleKeyPress(ev.keycode, ev.modifiers);
+                        needs_redraw = true;
+                    }
+                },
+            }
+        }
+
+        if (needs_redraw) {
+            renderFrame();
+            display_client.sendFrame(frame_bytes[0..frame_byte_size]) catch {};
+            needs_redraw = false;
+        }
+
+        syscall.thread_yield();
     }
 }

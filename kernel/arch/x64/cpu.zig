@@ -100,6 +100,10 @@ pub const Context = packed struct {
     ss: u64,
 };
 
+/// Size of FXSAVE area allocated below Context on kernel stack.
+/// FXSAVE/FXRSTOR is handled in assembly prologue/epilogue.
+pub const FXSAVE_SIZE: u64 = 512;
+
 pub const Registers = packed struct {
     r15: u64,
     r14: u64,
