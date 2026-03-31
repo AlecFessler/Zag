@@ -112,7 +112,12 @@ pub fn vm_perms(vm_handle: u64, offset: u64, size: u64, rights_bits: u64) i64 {
 }
 
 pub fn shm_create(size: u64) i64 {
-    return syscall2(.shm_create, size, 0);
+    // Default to rw+grant (no execute) — passing 0 would give kernel default of rwx+grant
+    return syscall2(.shm_create, size, (perms_.SharedMemoryRights{
+        .read = true,
+        .write = true,
+        .grant = true,
+    }).bits());
 }
 
 pub fn shm_create_with_rights(size: u64, rights: u64) i64 {

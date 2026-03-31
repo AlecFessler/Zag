@@ -38,7 +38,8 @@ pub fn executeCommand(line: []const u8) void {
 }
 
 fn runEcho(args: []const u8) void {
-    const shm_handle = syscall.shm_create(DATA_CHAN_SIZE);
+    const shm_rights = (perms.SharedMemoryRights{ .read = true, .write = true, .grant = true }).bits();
+    const shm_handle = syscall.shm_create_with_rights(DATA_CHAN_SIZE, shm_rights);
     if (shm_handle <= 0) {
         render.appendHistory("error: failed to create channel\n");
         return;
