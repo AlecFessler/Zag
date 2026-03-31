@@ -1066,35 +1066,44 @@ fn handleForwardChannelHandle(cmd: CommandChannel.Command) void {
     const target_id = SemanticID.fromInt(cmd.payload[1]);
     const shm_size = if (cmd.payload[2] > 0) cmd.payload[2] else alignToPages(4 * syscall.PAGE4K);
 
-    // Find the new SHM handle in perm_view
+    // Find the SHM matching this channel_id in perm_view.
+    // Multiple SHMs may arrive simultaneously, so we must check channel_id
+    // to avoid grabbing the wrong one.
     const view: *const [128]perm_view.UserViewEntry = @ptrFromInt(perm_view_addr);
     var shm_handle: u64 = 0;
+    var matched_chan: *Channel = undefined;
+    var matched_vm: u64 = 0;
     var attempts: u32 = 0;
+
     while (shm_handle == 0 and attempts < 1000) : (attempts += 1) {
         for (view) |*entry| {
-            if (entry.entry_type == perm_view.ENTRY_TYPE_SHARED_MEMORY and !isKnownShmHandle(entry.handle)) {
+            if (entry.entry_type != perm_view.ENTRY_TYPE_SHARED_MEMORY or isKnownShmHandle(entry.handle))
+                continue;
+
+            // Try mapping this SHM to check its channel_id
+            const vm_result = syscall.vm_reserve(0, shm_size, rw_shareable);
+            if (vm_result.val < 0) continue;
+
+            const map_rc = syscall.shm_map(entry.handle, @intCast(vm_result.val), 0);
+            if (map_rc != 0 and map_rc != -1) continue;
+
+            const chan: *Channel = @ptrFromInt(vm_result.val2);
+            if (chan.channel_id == channel_id) {
                 shm_handle = entry.handle;
+                matched_chan = chan;
+                matched_vm = vm_result.val2;
                 break;
             }
+            // Wrong SHM — leave it for another forward to claim
         }
         if (shm_handle == 0) syscall.thread_yield();
     }
+
     if (shm_handle == 0) return;
     addKnownShmHandle(shm_handle);
 
-    // Map the SHM
-    const vm_result = syscall.vm_reserve(0, shm_size, rw_shareable);
-    if (vm_result.val < 0) return;
-
-    const map_rc = syscall.shm_map(shm_handle, @intCast(vm_result.val), 0);
-    if (map_rc != 0 and map_rc != -1) return;
-
-    const chan: *Channel = @ptrFromInt(vm_result.val2);
-
-    if (chan.channel_id != channel_id) return;
-
     if (SemanticID.eql(my_semantic_id, target_id)) {
-        deliverChannel(channel_id, chan);
+        deliverChannel(channel_id, matched_chan);
     } else {
         for (&child_command_channels, 0..) |*maybe_cc, i| {
             if (maybe_cc.*) |cc| {

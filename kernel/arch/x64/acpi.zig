@@ -559,6 +559,10 @@ fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
 
                 if (header_type & 0x7F != 0) continue;
 
+                // Enable bus mastering and memory space for all devices
+                const cmd_reg = pciConfigRead32(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), 0x04);
+                pciConfigWrite32(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), 0x04, cmd_reg | 0x06);
+
                 var bar_idx: u12 = 0;
                 while (bar_idx < 6) : (bar_idx += 1) {
                     const bar_offset: u12 = 0x10 + bar_idx * 4;
@@ -677,6 +681,10 @@ fn enumeratePciLegacy() void {
                 const device_class = pciClassToDeviceClass(class_code, subclass);
 
                 if (header_type & 0x7F != 0) continue;
+
+                // Enable bus mastering and memory space for all devices
+                const cmd_reg = pciLegacyRead32(@intCast(bus), @intCast(dev), @intCast(func), 0x04);
+                pciLegacyWrite32(@intCast(bus), @intCast(dev), @intCast(func), 0x04, cmd_reg | 0x06);
 
                 var bar_idx: u8 = 0;
                 while (bar_idx < 6) : (bar_idx += 1) {

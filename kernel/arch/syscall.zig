@@ -60,7 +60,6 @@ pub const SyscallNum = enum(u64) {
     ioport_write,
     dma_map,
     dma_unmap,
-    pci_enable_bus_master,
     pin_exclusive,
     _,
 };
@@ -109,7 +108,6 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
         .ioport_write => ok(sysIoportWrite(arg0, arg1, arg2, arg3)),
         .dma_map => ok(sysDmaMap(arg0, arg1)),
         .dma_unmap => ok(sysDmaUnmap(arg0, arg1)),
-        .pci_enable_bus_master => ok(sysPciEnableBusMaster(arg0)),
         .pin_exclusive => ok(sysPinExclusive()),
         _ => err(E_INVAL),
     };
@@ -623,29 +621,6 @@ fn sysDmaMap(device_handle: u64, shm_handle: u64) i64 {
         if (p.addr != base + @as(u64, i) * paging.PAGE4K) return E_NOMEM;
     }
     return @bitCast(base);
-}
-
-fn sysPciEnableBusMaster(device_handle: u64) i64 {
-    const proc = currentProc();
-    const entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
-    if (entry.object != .device_region) return E_BADCAP;
-    if (!entry.deviceRights().dma) return E_PERM;
-    const device = entry.object.device_region;
-
-    pciEnableBusMaster(device.pci_bus, device.pci_dev, device.pci_func);
-    return 0;
-}
-
-fn pciEnableBusMaster(bus: u8, dev: u8, func: u8) void {
-    const cpu = @import("x64/cpu.zig");
-    const addr: u32 = 0x80000000 |
-        (@as(u32, bus) << 16) |
-        (@as(u32, dev) << 11) |
-        (@as(u32, func) << 8) |
-        0x04;
-    cpu.outd(addr, 0xCF8);
-    const cmd = cpu.ind(0xCFC);
-    cpu.outd(cmd | 0x06, 0xCFC);
 }
 
 fn sysPinExclusive() i64 {

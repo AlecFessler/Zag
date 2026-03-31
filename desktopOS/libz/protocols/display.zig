@@ -18,6 +18,7 @@ const CMD_REQUEST_NEW_PANE: u8 = 0x10;
 const CMD_SLIDE_LEFT: u8 = 0x11;
 const CMD_SLIDE_RIGHT: u8 = 0x12;
 const CMD_SWITCH_PANE: u8 = 0x13;
+const CMD_CLIENT_EXIT: u8 = 0x14;
 
 // ── Types ────────────────────────────────────────────────────────────
 pub const RenderTargetInfo = struct {
@@ -82,6 +83,7 @@ pub const Server = struct {
             CMD_SLIDE_LEFT => .slide_left,
             CMD_SLIDE_RIGHT => .slide_right,
             CMD_SWITCH_PANE => if (len >= 2) ServerMessage{ .switch_pane = frame_out[1] } else null,
+            CMD_CLIENT_EXIT => .client_exit,
             else => null,
         };
     }
@@ -92,6 +94,7 @@ pub const Server = struct {
         slide_left: void,
         slide_right: void,
         switch_pane: u8,
+        client_exit: void,
     };
 };
 
@@ -124,6 +127,11 @@ pub const Client = struct {
 
     pub fn switchPane(self: *const Client, pane_id: u8) !void {
         const bytes = [2]u8{ CMD_SWITCH_PANE, pane_id };
+        try self.chan.enqueue(.A, &bytes);
+    }
+
+    pub fn sendExit(self: *const Client) !void {
+        const bytes = [1]u8{CMD_CLIENT_EXIT};
         try self.chan.enqueue(.A, &bytes);
     }
 

@@ -18,24 +18,21 @@ pub fn main(perm_view_addr: u64) void {
         .restart = true,
     };
 
-    // Spawn terminals
-    var i: u8 = 0;
-    while (i < 3) : (i += 1) {
-        const id = channel.my_semantic_id.newChildID() orelse {
-            syscall.write("app_manager: failed to allocate terminal id\n");
-            return;
-        };
-        if (syscall.spawn_child(
-            @intFromPtr(embedded.terminal.ptr),
-            embedded.terminal.len,
-            child_rights.bits(),
-            id,
-        ) <= 0) {
-            syscall.write("app_manager: failed to spawn terminal\n");
-            return;
-        }
+    // Spawn terminal
+    const id = channel.my_semantic_id.newChildID() orelse {
+        syscall.write("app_manager: failed to allocate terminal id\n");
+        return;
+    };
+    if (syscall.spawn_child(
+        @intFromPtr(embedded.terminal.ptr),
+        embedded.terminal.len,
+        child_rights.bits(),
+        id,
+    ) <= 0) {
+        syscall.write("app_manager: failed to spawn terminal\n");
+        return;
     }
-    syscall.write("app_manager: spawned terminals\n");
+    syscall.write("app_manager: spawned terminal\n");
 
     while (true) syscall.thread_yield();
 }

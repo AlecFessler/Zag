@@ -52,7 +52,9 @@ pub fn main(perm_view_addr: u64) void {
     }
     syscall.write("service_manager: spawned usb_driver\n");
 
-    // Wait for device grants from root, then forward to children
+    // Wait for device grants from root, then route to children by device class.
+    // Device region grants have move semantics -- each handle can only be
+    // granted once before it's removed from our table.
     const view: *const [128]perm_view.UserViewEntry = @ptrFromInt(perm_view_addr);
     const device_grant_rights = (perms.DeviceRegionRights{
         .map = true,
@@ -75,8 +77,12 @@ pub fn main(perm_view_addr: u64) void {
 
     for (view) |*entry| {
         if (entry.entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION) {
-            _ = syscall.grant_perm(entry.handle, @intCast(comp_proc), device_grant_rights);
-            _ = syscall.grant_perm(entry.handle, @intCast(usb_proc), device_grant_rights);
+            const class = entry.deviceClass();
+            if (class == @intFromEnum(perms.DeviceClass.display)) {
+                _ = syscall.grant_perm(entry.handle, @intCast(comp_proc), device_grant_rights);
+            } else if (class == @intFromEnum(perms.DeviceClass.usb)) {
+                _ = syscall.grant_perm(entry.handle, @intCast(usb_proc), device_grant_rights);
+            }
         }
     }
     syscall.write("service_manager: device handles forwarded\n");

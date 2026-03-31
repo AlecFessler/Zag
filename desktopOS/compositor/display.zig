@@ -91,11 +91,10 @@ pub const Display = struct {
     }
 
     pub fn present(self: *const Display) void {
-        const total = self.height * self.stride;
-        var i: u32 = 0;
-        while (i < total) : (i += 1) {
-            self.screen_fb[i] = self.back_buf[i];
-        }
+        const total: usize = @as(usize, self.height) * @as(usize, self.stride);
+        const src: [*]const u8 = @ptrCast(self.back_buf);
+        const dst: [*]u8 = @ptrCast(self.screen_fb);
+        @memcpy(dst[0 .. total * 4], src[0 .. total * 4]);
     }
 
     pub fn fill(self: *const Display, color: u32) void {

@@ -251,6 +251,23 @@ fn handleSwitchPane(pane_id: u8) void {
     }
 }
 
+// ── Hit testing ─────────────────────────────────────────────────────
+fn hitTestWindow(pane: *const Pane, layout: *const TileLayout, cx: i32, cy: i32) ?u8 {
+    if (cx < 0 or cy < 0) return null;
+    if (cy >= @as(i32, @intCast(layout.tile_h))) return null;
+    if (layout.visible_count == 0) return null;
+
+    const tw: i32 = @intCast(layout.tile_w);
+    if (cx < tw) {
+        const idx = layout.visible[0];
+        if (idx < pane.window_count) return pane.windows[idx];
+    } else if (layout.visible_count == 2 and cx < tw * 2) {
+        const idx = layout.visible[1];
+        if (idx < pane.window_count) return pane.windows[idx];
+    }
+    return null;
+}
+
 // ── Rendering ────────────────────────────────────────────────────────
 fn clampI32(val: i32, min_v: i32, max_v: i32) i32 {
     if (val < min_v) return min_v;
@@ -366,15 +383,31 @@ pub fn main(perm_view_addr: u64) void {
         if (channel.pollAnyIncoming()) |chan| {
             registerWindow(chan, &disp);
             needs_composite = true;
+
+            // Default focus: send focus_change for the first window
+            if (window_count == 1) {
+                const sid = windows[0].server.chan.semantic_id_a;
+                mouse_server.sendFocusChange(sid) catch {};
+            }
         }
 
-        // Poll mouse
-        if (mouse_server.recv()) |msg| {
+        // Drain all pending mouse events before compositing
+        while (mouse_server.recv()) |msg| {
             switch (msg) {
                 .mouse => |ev| {
                     cursor_x = clampI32(cursor_x + ev.dx, 0, screen_w - 1);
                     cursor_y = clampI32(cursor_y + ev.dy, 0, screen_h - 1);
                     needs_composite = true;
+
+                    // Click-to-focus: send focus_change to USB driver
+                    if (ev.buttons.left) {
+                        const pane = &panes[active_pane];
+                        const layout = computeLayout(pane, disp.width, disp.height);
+                        if (hitTestWindow(pane, &layout, cursor_x, cursor_y)) |win_idx| {
+                            const sid = windows[win_idx].server.chan.semantic_id_a;
+                            mouse_server.sendFocusChange(sid) catch {};
+                        }
+                    }
                 },
             }
         }
@@ -401,6 +434,10 @@ pub fn main(perm_view_addr: u64) void {
                     },
                     .switch_pane => |pane_id| {
                         handleSwitchPane(pane_id);
+                        needs_composite = true;
+                    },
+                    .client_exit => {
+                        win.active = false;
                         needs_composite = true;
                     },
                 }
