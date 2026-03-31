@@ -159,14 +159,16 @@ pub fn main(perm_view_addr: u64) void {
                             .slot_cmd_timeout => "slot_cmd_timeout",
                             .slot_cmd_error => "slot_cmd_error",
                             .address_failed => "address_failed",
-                            .desc_failed => "desc_failed",
+                            .desc_timeout => "desc_timeout",
+                            .desc_error => "desc_error",
+                            .desc_short => "desc_short",
                             .config_failed => "config_failed",
                             .no_hid => "no_hid",
                             .ok => "ok",
                         });
-                        if (status == .slot_cmd_error) {
+                        if (status == .slot_cmd_error or status == .desc_error) {
                             dbg.log(" cc=");
-                            dbg.logU32(ctrl.last_cmd_cc);
+                            dbg.logU32(ctrl.diag_last_cc);
                         }
                         dbg.log("\n");
                     }

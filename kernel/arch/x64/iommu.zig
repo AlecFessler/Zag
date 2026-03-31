@@ -82,6 +82,13 @@ pub fn unmapDmaPages(device: *DeviceRegion, dma_base: u64, num_pages: u64) void 
     }
 }
 
+pub fn addDeviceAlias(source: u16, alias: u16) void {
+    switch (active_type) {
+        .amd_vi => vi.addAlias(source, alias),
+        else => {},
+    }
+}
+
 pub fn isAvailable() bool {
     return active_type != .none;
 }

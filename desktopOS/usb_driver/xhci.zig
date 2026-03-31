@@ -272,7 +272,9 @@ pub const PortStatus = enum(u8) {
     slot_cmd_timeout,
     slot_cmd_error,
     address_failed,
-    desc_failed,
+    desc_timeout,
+    desc_error,
+    desc_short,
     config_failed,
     no_hid,
     ok,
@@ -351,6 +353,7 @@ pub const Controller = struct {
     diag_hccparams1: u32 = 0,
     diag_pagesize: u32 = 0,
     diag_db_offset: u32 = 0,
+    diag_last_cc: u8 = 0,
 
     // ── Hardware init from device handle ─────────────────────────
 
@@ -389,8 +392,8 @@ pub const Controller = struct {
 
         const slots: u64 = @min(hcsparams1 & 0xFF, MAX_SLOTS);
         const csz: u64 = if (hccparams1 & (1 << 2) != 0) 64 else 32;
-        const scratchpad_hi: u32 = (hcsparams2 >> 27) & 0x1F;
-        const scratchpad_lo: u32 = (hcsparams2 >> 21) & 0x1F;
+        const scratchpad_hi: u32 = (hcsparams2 >> 21) & 0x1F;
+        const scratchpad_lo: u32 = (hcsparams2 >> 27) & 0x1F;
         const num_scratch: u32 = (scratchpad_hi << 5) | scratchpad_lo;
 
         // Compute DMA size:
@@ -737,10 +740,16 @@ pub const Controller = struct {
                         if (wait % 1000 == 0) syscall.thread_yield();
                     }
 
-                    // Disable SMI sources in USBLEGCTLSTS (offset +4)
-                    const ctlsts: *volatile u32 = @ptrFromInt(cap_addr + 4);
-                    ctlsts.* = 0;
+                    // Force-clear BIOS ownership if it didn't release (like Linux)
+                    if (cap_reg.* & USBLEGSUP_BIOS_OWNED != 0) {
+                        cap_reg.* = (cap_reg.* & ~USBLEGSUP_BIOS_OWNED) | USBLEGSUP_OS_OWNED;
+                    }
                 }
+
+                // Disable all SMI sources and clear pending SMI events
+                // Bits 29:31 are W1C event status — write 1 to clear
+                const ctlsts: *volatile u32 = @ptrFromInt(cap_addr + 4);
+                ctlsts.* = 0xE0000000;
                 return;
             }
 
@@ -773,8 +782,8 @@ pub const Controller = struct {
         self.context_size = if (hccparams1 & (1 << 2) != 0) 64 else 32;
 
         const hcsparams2 = self.readCap(.hcs_params2);
-        const max_scratchpad_hi: u32 = (hcsparams2 >> 27) & 0x1F;
-        const max_scratchpad_lo: u32 = (hcsparams2 >> 21) & 0x1F;
+        const max_scratchpad_hi: u32 = (hcsparams2 >> 21) & 0x1F;
+        const max_scratchpad_lo: u32 = (hcsparams2 >> 27) & 0x1F;
         const max_scratchpad = (max_scratchpad_hi << 5) | max_scratchpad_lo;
         self.num_scratchpad = max_scratchpad;
 
@@ -1029,10 +1038,14 @@ pub const Controller = struct {
 
         self.ringDoorbell(slot, 1);
 
-        const evt = self.waitForEvent(.transfer_event, 1_000_000) orelse return null;
+        const evt = self.waitForEvent(.transfer_event, 1_000_000) orelse {
+            self.diag_last_cc = 0; // 0 = timeout
+            return null;
+        };
         const cc = evt.completionCode();
         const residual: u16 = @truncate(evt.status & 0xFFFFFF);
         self.advanceEventRing();
+        self.diag_last_cc = @truncate((evt.status >> 24) & 0xFF);
 
         if (cc != .success and cc != .short_packet) return null;
 
@@ -1163,17 +1176,21 @@ pub const Controller = struct {
 
         // Get device descriptor
         const dev_desc_len = self.getDescriptor(slot, USB_DESC_DEVICE, 0, 18) orelse {
-            if (port < MAX_PORTS_TRACKED) self.port_status[port] = .desc_failed;
+            if (port < MAX_PORTS_TRACKED) {
+                self.port_status[port] = if (self.diag_last_cc == 0) .desc_timeout else .desc_error;
+            }
             return;
         };
         if (dev_desc_len < 18) {
-            if (port < MAX_PORTS_TRACKED) self.port_status[port] = .desc_failed;
+            if (port < MAX_PORTS_TRACKED) self.port_status[port] = .desc_short;
             return;
         }
 
         // Get configuration descriptor header
         _ = self.getDescriptor(slot, USB_DESC_CONFIGURATION, 0, 9) orelse {
-            if (port < MAX_PORTS_TRACKED) self.port_status[port] = .desc_failed;
+            if (port < MAX_PORTS_TRACKED) {
+                self.port_status[port] = if (self.diag_last_cc == 0) .desc_timeout else .desc_error;
+            }
             return;
         };
         const desc: [*]const u8 = @ptrFromInt(self.desc_buf_virt);
@@ -1183,7 +1200,9 @@ pub const Controller = struct {
 
         // Get full configuration descriptor
         const full_len = self.getDescriptor(slot, USB_DESC_CONFIGURATION, 0, actual_len) orelse {
-            if (port < MAX_PORTS_TRACKED) self.port_status[port] = .desc_failed;
+            if (port < MAX_PORTS_TRACKED) {
+                self.port_status[port] = if (self.diag_last_cc == 0) .desc_timeout else .desc_error;
+            }
             return;
         };
 

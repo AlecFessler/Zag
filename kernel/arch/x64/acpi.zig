@@ -771,18 +771,45 @@ fn parseIvrs(ivrs_vaddr: VAddr, length: u32) !void {
     var offset: u32 = header_size;
     while (offset + 4 <= length) {
         const entry_type = @as(*const volatile u8, @ptrFromInt(ivrs_vaddr.addr + offset)).*;
-        const entry_len = @as(*const volatile u16, @ptrFromInt(ivrs_vaddr.addr + offset + 2)).*;
+        const entry_len = @as(*align(1) const volatile u16, @ptrFromInt(ivrs_vaddr.addr + offset + 2)).*;
         if (entry_len == 0) break;
 
         if ((entry_type == 0x10 or entry_type == 0x11 or entry_type == 0x40) and entry_len >= 24) {
-            const reg_base = @as(*const volatile u64, @ptrFromInt(ivrs_vaddr.addr + offset + 8)).*;
+            const reg_base = @as(*align(1) const volatile u64, @ptrFromInt(ivrs_vaddr.addr + offset + 8)).*;
             if (reg_base != 0) {
                 iommu.initAmd(PAddr.fromInt(reg_base)) catch {};
-                break;
+
+                // Parse device entries within this IVHD for aliases
+                parseIvhdDeviceEntries(ivrs_vaddr.addr + offset, entry_type, entry_len);
             }
         }
 
         offset += entry_len;
+    }
+}
+
+fn parseIvhdDeviceEntries(ivhd_base: u64, entry_type: u8, entry_len: u16) void {
+    const dev_start: u32 = if (entry_type == 0x10) 24 else 40;
+    var dev_off: u32 = dev_start;
+    while (dev_off + 4 <= entry_len) {
+        const dev_type = @as(*const volatile u8, @ptrFromInt(ivhd_base + dev_off)).*;
+        const size_class = @as(u2, @truncate(dev_type >> 6));
+        const dev_entry_size: u32 = @as(u32, 4) << size_class;
+        if (dev_off + dev_entry_size > entry_len) break;
+
+        if ((dev_type == 0x42 or dev_type == 0x43) and dev_entry_size >= 8) {
+            const lo0 = @as(*const volatile u8, @ptrFromInt(ivhd_base + dev_off + 1)).*;
+            const hi0 = @as(*const volatile u8, @ptrFromInt(ivhd_base + dev_off + 2)).*;
+            const device_id = @as(u16, hi0) << 8 | @as(u16, lo0);
+            const lo1 = @as(*const volatile u8, @ptrFromInt(ivhd_base + dev_off + 5)).*;
+            const hi1 = @as(*const volatile u8, @ptrFromInt(ivhd_base + dev_off + 6)).*;
+            const source_id = @as(u16, hi1) << 8 | @as(u16, lo1);
+            if (device_id != source_id) {
+                iommu.addDeviceAlias(device_id, source_id);
+            }
+        }
+
+        dev_off += dev_entry_size;
     }
 }
 
