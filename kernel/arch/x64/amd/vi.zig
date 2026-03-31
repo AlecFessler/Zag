@@ -147,7 +147,7 @@ pub fn setupDevice(device: *DeviceRegion) !void {
     entry_base[3] = 0;
 
     invalidateDeviceEntry(device_id);
-    invalidateIotlb();
+    invalidateIotlbDomain(device_id);
 }
 
 const AMDVI_IR: u64 = 1 << 61;
@@ -156,15 +156,15 @@ const AMDVI_RW: u64 = AMDVI_IR | AMDVI_IW;
 const AMDVI_ADDR_MASK: u64 = 0xFFFFFFFFF000;
 
 fn amdviNonLeaf(phys_addr: u64, next_level: u64) u64 {
-    return (phys_addr & AMDVI_ADDR_MASK) | (next_level << 9) | AMDVI_RW | 0x3;
+    return (phys_addr & AMDVI_ADDR_MASK) | (next_level << 9) | AMDVI_RW | 0x1;
 }
 
 fn amdviLeaf(phys_addr: u64) u64 {
-    return (phys_addr & AMDVI_ADDR_MASK) | AMDVI_RW | 0x3;
+    return (phys_addr & AMDVI_ADDR_MASK) | AMDVI_RW | 0x1;
 }
 
 fn amdviPresent(entry: u64) bool {
-    return (entry & 0x3) != 0;
+    return (entry & 0x1) != 0;
 }
 
 pub fn mapDmaPage(device: *DeviceRegion, dma_addr: u64, phys: PAddr) !void {
@@ -218,8 +218,6 @@ pub fn unmapDmaPage(device: *DeviceRegion, dma_addr: u64) void {
     const pt: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(PAddr.fromInt(pd[pd_idx] & AMDVI_ADDR_MASK), null).addr);
     const pt_idx: u9 = @truncate((dma_addr >> 12) & 0x1FF);
     pt[pt_idx] = 0;
-
-    invalidateIotlb();
 }
 
 fn issueCommand(lo: u64, hi: u64) void {
@@ -237,14 +235,14 @@ pub fn invalidateDeviceEntry(device_id: u16) void {
     issueCommand(0x02 | (@as(u64, device_id) << 16), 0);
 }
 
-fn invalidateIotlb() void {
+fn invalidateIotlbDomain(domain_id: u16) void {
     // CMD_INVALIDATE_IOMMU_PAGES (type 0x03)
     // First qword: [3:0]=opcode(3), [20]=S(size=1 → all pages), [47:32]=DomainId
-    // With S=1 and DomainId=0: invalidate all pages for all domains
-    issueCommand(0x03 | (@as(u64, 1) << 20), 0);
+    issueCommand(0x03 | (@as(u64, 1) << 20) | (@as(u64, domain_id) << 32), 0);
 }
 
-pub fn flushAll() void {
+pub fn flushDevice(device: *const DeviceRegion) void {
     if (!initialized) return;
-    invalidateIotlb();
+    const domain_id = @as(u16, device.pci_bus) << 8 | @as(u16, device.pci_dev) << 3 | @as(u16, device.pci_func);
+    invalidateIotlbDomain(domain_id);
 }

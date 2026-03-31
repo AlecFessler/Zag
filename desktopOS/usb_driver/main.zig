@@ -1,7 +1,8 @@
 const lib = @import("lib");
-const xhci = @import("xhci.zig");
+const dbg = @import("debug_display.zig");
 const kb = @import("keyboard.zig");
 const ms = @import("mouse.zig");
+const xhci = @import("xhci.zig");
 
 const channel = lib.channel;
 const keyboard = lib.keyboard;
@@ -12,18 +13,19 @@ const syscall = lib.syscall;
 
 const MAX_KB_CHANNELS = 16;
 const MAX_PERMS = 128;
+const MAX_USB_CONTROLLERS = 8;
 
 var kb_channels: [MAX_KB_CHANNELS]*channel.Channel = undefined;
 var kb_count: u8 = 0;
 var active_semantic_id: u64 = 0;
+var controllers: [MAX_USB_CONTROLLERS]xhci.Controller = .{xhci.Controller{}} ** MAX_USB_CONTROLLERS;
+var ctrl_count: u8 = 0;
 
 pub fn main(perm_view_addr: u64) void {
     _ = perm_view_addr;
     syscall.write("usb_driver: starting\n");
 
     // ── Set up channel discovery early (before hardware init) ───
-    // The compositor is already waiting for our requestConnection,
-    // so we must connect before spending time on xHCI init.
     channel.makeDiscoverable(@enumFromInt(@intFromEnum(keyboard.protocol_id)), 2) catch {
         syscall.write("usb_driver: FAIL makeDiscoverable keyboard\n");
         return;
@@ -40,83 +42,218 @@ pub fn main(perm_view_addr: u64) void {
     };
     const mouse_client = mouse.Client.init(mouse_chan);
 
-    // ── Find USB device in permission view ──────────────────────
-    var usb_device_handle: u64 = 0;
+    // ── Debug display window ────────────────────────────────────
+    const has_debug = dbg.init();
+    if (has_debug) {
+        dbg.log("usb_driver debug window\n");
+        dbg.log("keyboard discoverable: ok\n");
+        dbg.log("mouse channel: ok\n");
+    }
+
+    // ── Collect all USB device handles from permission view ─────
     const view: *const [MAX_PERMS]perm_view.UserViewEntry = @ptrFromInt(channel.perm_view_addr);
-    for (view) |*entry| {
-        if (entry.entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION and
-            entry.deviceClass() == @intFromEnum(perms.DeviceClass.usb))
-        {
-            usb_device_handle = entry.handle;
-            break;
-        }
-    }
-    if (usb_device_handle == 0) {
-        syscall.write("usb_driver: waiting for USB device...\n");
-        while (usb_device_handle == 0) {
-            for (view) |*entry| {
-                if (entry.entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION and
-                    entry.deviceClass() == @intFromEnum(perms.DeviceClass.usb))
-                {
-                    usb_device_handle = entry.handle;
-                    break;
-                }
+    var usb_handles: [MAX_USB_CONTROLLERS]u64 = .{0} ** MAX_USB_CONTROLLERS;
+    var usb_mmio_sizes: [MAX_USB_CONTROLLERS]u32 = .{0} ** MAX_USB_CONTROLLERS;
+    var usb_count: u8 = 0;
+
+    if (has_debug) dbg.log("\nperm_view scan:\n");
+
+    for (view, 0..) |*entry, idx| {
+        if (entry.entry_type == perm_view.ENTRY_TYPE_EMPTY) continue;
+        if (entry.entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION) {
+            if (has_debug) {
+                dbg.log("  [");
+                dbg.logU32(@intCast(idx));
+                dbg.log("] dev handle=");
+                dbg.logHex(entry.handle);
+                dbg.log(" type=");
+                dbg.logU32(entry.deviceType());
+                dbg.log(" class=");
+                dbg.logU32(entry.deviceClass());
+                dbg.log(" pci=");
+                dbg.logHex(entry.pciVendor());
+                dbg.log(":");
+                dbg.logHex(entry.pciDevice());
+                dbg.log(" bus=");
+                dbg.logU32(entry.pciBus());
+                dbg.log(" dev=");
+                dbg.logU32(entry.pciDev());
+                dbg.log(" func=");
+                dbg.logU32(entry.pciFunc());
+                dbg.log(" size=");
+                dbg.logHex(entry.deviceSizeOrPortCount());
+                dbg.log("\n");
             }
-            if (usb_device_handle == 0) syscall.thread_yield();
+
+            if (entry.deviceClass() == @intFromEnum(perms.DeviceClass.usb) and
+                usb_count < MAX_USB_CONTROLLERS)
+            {
+                usb_handles[usb_count] = entry.handle;
+                usb_mmio_sizes[usb_count] = entry.deviceSizeOrPortCount();
+                usb_count += 1;
+            }
         }
     }
-    // ── Allocate DMA region ─────────────────────────────────────
-    const shm_rights = (perms.SharedMemoryRights{ .read = true, .write = true }).bits();
-    const dma_shm = syscall.shm_create_with_rights(xhci.DMA_REGION_SIZE, shm_rights);
-    if (dma_shm <= 0) {
-        syscall.write("usb_driver: DMA shm_create failed\n");
-        return;
+
+    if (has_debug) {
+        dbg.log("found ");
+        dbg.logU32(usb_count);
+        dbg.log(" USB controller(s)\n");
+        dbg.flush();
     }
 
-    const dma_vm_rights = (perms.VmReservationRights{
-        .read = true,
-        .write = true,
-        .shareable = true,
-    }).bits();
-    const dma_vm = syscall.vm_reserve(0, xhci.DMA_REGION_SIZE, dma_vm_rights);
-    if (dma_vm.val < 0) {
-        syscall.write("usb_driver: DMA vm_reserve failed\n");
-        return;
-    }
-    if (syscall.shm_map(@intCast(dma_shm), @intCast(dma_vm.val), 0) != 0) {
-        syscall.write("usb_driver: DMA shm_map failed\n");
-        return;
+    if (usb_count == 0) {
+        if (has_debug) dbg.log("no USB controllers found, waiting...\n");
+        syscall.write("usb_driver: no USB controllers\n");
+        while (true) syscall.thread_yield();
     }
 
-    const dma_result = syscall.dma_map(usb_device_handle, @intCast(dma_shm));
-    if (dma_result < 0) {
-        syscall.write("usb_driver: DMA map failed\n");
-        return;
-    }
-    const dma_phys: u64 = @bitCast(dma_result);
+    // ── Initialize all USB controllers ──────────────────────────
+    for (usb_handles[0..usb_count], usb_mmio_sizes[0..usb_count], 0..) |handle, mmio_size, i| {
+        if (has_debug) {
+            dbg.log("\ninit controller ");
+            dbg.logU32(@intCast(i));
+            dbg.log(" (handle=");
+            dbg.logHex(handle);
+            dbg.log(" mmio_size=");
+            dbg.logHex(mmio_size);
+            dbg.log(")...\n");
+            dbg.flush();
+        }
 
-    // ── Map xHCI MMIO ───────────────────────────────────────────
-    const mmio_size: u64 = 65536;
-    const mmio_vm_rights = (perms.VmReservationRights{
-        .read = true,
-        .write = true,
-        .mmio = true,
-    }).bits();
-    const mmio_vm = syscall.vm_reserve(0, mmio_size, mmio_vm_rights);
-    if (mmio_vm.val < 0) {
-        syscall.write("usb_driver: MMIO vm_reserve failed\n");
-        return;
-    }
-    if (syscall.mmio_map(usb_device_handle, @intCast(mmio_vm.val), 0) != 0) {
-        syscall.write("usb_driver: MMIO map failed\n");
-        return;
+        const err = controllers[ctrl_count].initFromHandle(handle, mmio_size);
+        if (err == .none) {
+            const ctrl = &controllers[ctrl_count];
+            const hid_count = ctrl.num_hid_devices;
+            if (has_debug) {
+                dbg.log("  ok: ");
+                dbg.logU32(ctrl.max_ports);
+                dbg.log(" ports, ");
+                dbg.logU32(hid_count);
+                dbg.log(" HID, csz=");
+                dbg.logU32(ctrl.context_size);
+                dbg.log(" scratch=");
+                dbg.logU32(ctrl.num_scratchpad);
+                dbg.log("\n");
+                // Dump per-port enumeration results
+                const port_count = if (ctrl.max_ports < xhci.MAX_PORTS_TRACKED) ctrl.max_ports else xhci.MAX_PORTS_TRACKED;
+                var p: u32 = 0;
+                while (p < port_count) : (p += 1) {
+                    const before = ctrl.port_portsc_before[p];
+                    const after = ctrl.readPortsc(p);
+                    const status = ctrl.port_status[p];
+                    // Only show ports that had CCS or have interesting status
+                    if (before & 0x1 != 0 or status != .no_ccs) {
+                        dbg.log("    p");
+                        dbg.logU32(p);
+                        dbg.log(": before=");
+                        dbg.logHex(before);
+                        dbg.log(" after=");
+                        dbg.logHex(after);
+                        dbg.log(" -> ");
+                        dbg.log(switch (status) {
+                            .not_checked => "not_checked",
+                            .no_ccs => "no_ccs",
+                            .reset_timeout => "reset_timeout",
+                            .not_enabled => "not_enabled",
+                            .slot_cmd_timeout => "slot_cmd_timeout",
+                            .slot_cmd_error => "slot_cmd_error",
+                            .address_failed => "address_failed",
+                            .desc_failed => "desc_failed",
+                            .config_failed => "config_failed",
+                            .no_hid => "no_hid",
+                            .ok => "ok",
+                        });
+                        if (status == .slot_cmd_error) {
+                            dbg.log(" cc=");
+                            dbg.logU32(ctrl.last_cmd_cc);
+                        }
+                        dbg.log("\n");
+                    }
+                }
+                for (ctrl.hidDevices(), 0..) |*dev, j| {
+                    dbg.log("    hid[");
+                    dbg.logU32(@intCast(j));
+                    dbg.log("] slot=");
+                    dbg.logU32(dev.slot_id);
+                    dbg.log(" proto=");
+                    switch (dev.protocol) {
+                        .keyboard => dbg.log("keyboard"),
+                        .mouse => dbg.log("mouse"),
+                    }
+                    dbg.log("\n");
+                }
+                dbg.flush();
+            }
+            ctrl_count += 1;
+        } else {
+            if (has_debug) {
+                dbg.log("  FAILED: ");
+                dbg.log(switch (err) {
+                    .dma_shm_create => "dma_shm_create",
+                    .dma_vm_reserve => "dma_vm_reserve",
+                    .dma_shm_map => "dma_shm_map",
+                    .dma_map => "dma_map",
+                    .mmio_vm_reserve => "mmio_vm_reserve",
+                    .mmio_map => "mmio_map",
+                    .controller_reset => "controller_reset timeout",
+                    .controller_cnr => "controller_cnr timeout",
+                    .dma_oom => "dma_oom",
+                    .controller_start => "controller_start",
+                    .noop_timeout => "noop_timeout",
+                    .none => unreachable,
+                });
+                dbg.log(" scratch=");
+                dbg.logU32(controllers[ctrl_count].num_scratchpad);
+                dbg.log(" csz=");
+                dbg.logU32(controllers[ctrl_count].context_size);
+                if (err == .noop_timeout) {
+                    const ctrl = &controllers[ctrl_count];
+                    dbg.log("\n  dma_size=");
+                    dbg.logHex(ctrl.dma_region_size);
+                    dbg.log("\n  usbcmd=");
+                    dbg.logHex(ctrl.diag_usbcmd);
+                    dbg.log(" usbsts=");
+                    dbg.logHex(ctrl.diag_usbsts);
+                    dbg.log("\n  dma_phys=");
+                    dbg.logHex(ctrl.dma_phys_base);
+                    dbg.log(" cmd_ring_phys=");
+                    dbg.logHex(ctrl.cmd_ring_phys);
+                    dbg.log("\n  cmd_trb_ctrl=");
+                    dbg.logHex(ctrl.diag_cmd_trb_control);
+                    dbg.log(" cycle=");
+                    dbg.logU32(ctrl.diag_cmd_trb_cycle);
+                    dbg.log("\n  evt_trb_ctrl=");
+                    dbg.logHex(ctrl.diag_evt_trb_control);
+                    dbg.log(" evt_cycle=");
+                    dbg.logU32(@intFromBool(ctrl.diag_evt_trb_cycle));
+                    dbg.log(" expect=");
+                    dbg.logU32(@as(u32, ctrl.evt_ring_cycle));
+                    dbg.log("\n  erdp=");
+                    dbg.logHex(ctrl.diag_erdp);
+                    dbg.log(" iman=");
+                    dbg.logHex(ctrl.diag_iman);
+                    dbg.log("\n  hccparams1=");
+                    dbg.logHex(ctrl.diag_hccparams1);
+                    dbg.log(" pagesize=");
+                    dbg.logHex(ctrl.diag_pagesize);
+                    dbg.log(" db_off=");
+                    dbg.logHex(ctrl.diag_db_offset);
+                    dbg.log("\n  crcr_readback=");
+                    dbg.logHex(ctrl.diag_crcr_lo);
+                }
+                dbg.log("\n");
+                dbg.flush();
+            }
+        }
     }
 
-    // ── Initialize xHCI controller ──────────────────────────────
-    const result = xhci.init(mmio_vm.val2, dma_vm.val2, dma_phys) orelse {
-        syscall.write("usb_driver: controller init failed\n");
-        return;
-    };
+    if (has_debug) {
+        dbg.log("\n");
+        dbg.logU32(ctrl_count);
+        dbg.log(" controller(s) active, entering main loop\n");
+        dbg.flush();
+    }
 
     // ── Main event loop ─────────────────────────────────────────
     while (true) {
@@ -127,7 +264,12 @@ pub fn main(perm_view_addr: u64) void {
                 kb_count += 1;
                 syscall.write("usb_driver: keyboard channel connected\n");
 
-                // Default focus to first connected channel
+                if (has_debug) {
+                    dbg.log("kb channel connected (");
+                    dbg.logU32(kb_count);
+                    dbg.log(" total)\n");
+                }
+
                 if (kb_count == 1) {
                     active_semantic_id = chan.semantic_id_a;
                 }
@@ -143,36 +285,42 @@ pub fn main(perm_view_addr: u64) void {
             }
         }
 
-        // Poll xHCI event ring
-        if (xhci.pollEvent()) |evt| {
-            if (evt.trbType() == .transfer_event) {
-                const cc = evt.completionCode();
-                if (cc == .success or cc == .short_packet) {
-                    const slot_id = evt.slotId();
-                    for (result.hid_devices) |*dev| {
-                        if (dev.slot_id == slot_id and dev.active) {
-                            const report = xhci.getReportData(slot_id);
+        // Poll all controllers for events
+        var had_event = false;
+        for (controllers[0..ctrl_count]) |*ctrl| {
+            if (ctrl.pollEvent()) |evt| {
+                had_event = true;
+                if (evt.trbType() == .transfer_event) {
+                    const cc = evt.completionCode();
+                    if (cc == .success or cc == .short_packet) {
+                        const slot_id = evt.slotId();
+                        for (ctrl.hidDevices()) |*dev| {
+                            if (dev.slot_id == slot_id and dev.active) {
+                                const report = ctrl.getReportData(slot_id);
 
-                            switch (dev.protocol) {
-                                .keyboard => {
-                                    if (findFocusedChannel()) |chan| {
-                                        kb.processReport(dev, report, chan);
-                                    }
-                                },
-                                .mouse => {
-                                    ms.processReport(report, &mouse_client);
-                                },
+                                switch (dev.protocol) {
+                                    .keyboard => {
+                                        if (findFocusedChannel()) |chan| {
+                                            kb.processReport(dev, report, chan);
+                                        }
+                                    },
+                                    .mouse => {
+                                        ms.processReport(report, &mouse_client);
+                                    },
+                                }
+
+                                ctrl.queueInterruptIn(slot_id, dev.ep_dci);
+                                ctrl.ringDoorbell(slot_id, dev.ep_dci);
+                                break;
                             }
-
-                            xhci.queueInterruptIn(slot_id, dev.ep_dci);
-                            xhci.ringDoorbell(slot_id, dev.ep_dci);
-                            break;
                         }
                     }
                 }
+                ctrl.advanceEventRing();
             }
-            xhci.advanceEventRing();
-        } else {
+        }
+
+        if (!had_event) {
             syscall.thread_yield();
         }
     }
@@ -181,7 +329,6 @@ pub fn main(perm_view_addr: u64) void {
 fn findFocusedChannel() ?*channel.Channel {
     if (kb_count == 0) return null;
 
-    // Find channel matching active_semantic_id
     if (active_semantic_id != 0) {
         for (kb_channels[0..kb_count]) |chan| {
             if (chan.semantic_id_a == active_semantic_id) {
@@ -190,6 +337,5 @@ fn findFocusedChannel() ?*channel.Channel {
         }
     }
 
-    // Fallback to first channel
     return kb_channels[0];
 }
