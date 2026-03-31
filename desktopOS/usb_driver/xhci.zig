@@ -1,3 +1,4 @@
+const dbg = @import("debug_display.zig");
 const lib = @import("lib");
 
 const perms = lib.perms;
@@ -246,6 +247,23 @@ const EVENT_RING_SIZE = 64;
 const TRANSFER_RING_SIZE = 64;
 const MAX_SLOTS = 16;
 const MAX_HID_DEVICES = 4;
+
+// ── USB Vendor ID lookup ───────────────────────────────────────
+
+const VidEntry = struct { vid: u16, name: []const u8 };
+const known_vendors = [_]VidEntry{
+    .{ .vid = 0x1022, .name = "AMD" },
+    .{ .vid = 0x1532, .name = "Razer" },
+    .{ .vid = 0x1b1c, .name = "Corsair" },
+    .{ .vid = 0x320f, .name = "Glorious" },
+};
+
+fn lookupVendor(vid: u16) []const u8 {
+    for (known_vendors) |entry| {
+        if (entry.vid == vid) return entry.name;
+    }
+    return "unknown";
+}
 
 // ── Public types ────────────────────────────────────────────────
 
@@ -1114,12 +1132,17 @@ pub const Controller = struct {
 
     // ── Endpoint Configuration ──────────────────────────────────
 
-    fn configureEndpoint(self: *Controller, slot: u8, ep_addr: u8, max_packet: u16, interval: u8) bool {
+    fn configureEndpoint(self: *Controller, slot: u8, ep_addr: u8, max_packet: u16, interval: u8, speed: u32) bool {
         const ep_num = ep_addr & 0x0F;
         const ep_dir_in = (ep_addr & 0x80) != 0;
         const dci: u8 = ep_num * 2 + @as(u8, if (ep_dir_in) 1 else 0);
 
-        if (!self.initTransferRing(slot, dci)) return false;
+        if (!self.initTransferRing(slot, dci)) {
+            dbg.log("    cfgep: ring alloc failed dci=");
+            dbg.logU32(dci);
+            dbg.log("\n");
+            return false;
+        }
 
         const csz: u64 = self.context_size;
         @memset(@as([*]u8, @ptrFromInt(self.input_context_virt))[0 .. 33 * csz], 0);
@@ -1134,19 +1157,48 @@ pub const Controller = struct {
         slot_ctx.field2 = out_slot.field2;
         slot_ctx.field3 = out_slot.field3;
 
+        // Convert interval to xHCI format based on speed
+        // FS/LS: bInterval is in ms (frames), convert to 2^(Interval-1) * 125µs
+        // HS/SS: bInterval is already in 2^(bInterval-1) * 125µs format
+        const xhci_interval: u32 = if (speed == SPEED_FULL or speed == SPEED_LOW) blk: {
+            // Find smallest N where 2^N >= bInterval*8, then interval = N+1
+            // This converts frames (1ms) to microframes (125µs)
+            const target: u32 = @as(u32, interval) * 8;
+            var n: u32 = 0;
+            while ((@as(u32, 1) << @as(u5, @truncate(n))) < target) : (n += 1) {}
+            break :blk n + 1;
+        } else interval;
+
         const ep_ctx: *volatile EndpointContext = @ptrFromInt(self.input_context_virt + csz + @as(u64, dci) * csz);
         const xhci_ep_type: u32 = if (ep_dir_in) EP_TYPE_INTERRUPT_IN else EP_TYPE_INTERRUPT_OUT;
-        ep_ctx.field0 = @as(u32, interval) << 16;
+        ep_ctx.field0 = xhci_interval << 16;
         ep_ctx.field1 = (3 << 1) | (xhci_ep_type << 3) | (@as(u32, max_packet) << 16);
         ep_ctx.tr_dequeue = self.transfer_rings[slot][dci].phys | 1;
         ep_ctx.field2 = 8;
 
+        dbg.log("    cfgep: dci=");
+        dbg.logU32(dci);
+        dbg.log(" maxpkt=");
+        dbg.logU32(max_packet);
+        dbg.log(" interval=");
+        dbg.logU32(xhci_interval);
+        dbg.log("\n");
+
         self.submitCommand(self.input_context_phys, 0, (@as(u32, @intFromEnum(TrbType.configure_endpoint)) << 10) | (@as(u32, slot) << 24));
-        const evt = self.waitForCommandCompletion() orelse return false;
+        const evt = self.waitForCommandCompletion() orelse {
+            dbg.log("    cfgep: cmd timeout dci=");
+            dbg.logU32(dci);
+            dbg.log("\n");
+            return false;
+        };
         const cc = evt.completionCode();
         self.advanceEventRing();
         if (cc != .success) {
-            syscall.write("usb: configure endpoint failed\n");
+            dbg.log("    cfgep: failed dci=");
+            dbg.logU32(dci);
+            dbg.log(" cc=");
+            dbg.logU32(@intFromEnum(cc));
+            dbg.log("\n");
             return false;
         }
         return true;
@@ -1244,6 +1296,20 @@ pub const Controller = struct {
             return;
         }
 
+        // Log VID:PID from device descriptor
+        {
+            const dd: [*]const u8 = @ptrFromInt(self.desc_buf_virt);
+            const vid = @as(u16, dd[8]) | (@as(u16, dd[9]) << 8);
+            const pid = @as(u16, dd[10]) | (@as(u16, dd[11]) << 8);
+            dbg.log("  dev: ");
+            dbg.log(lookupVendor(vid));
+            dbg.log(" (0x");
+            dbg.logHex(vid);
+            dbg.log(":0x");
+            dbg.logHex(pid);
+            dbg.log(")\n");
+        }
+
         // Get configuration descriptor header
         _ = self.getDescriptor(slot, USB_DESC_CONFIGURATION, 0, 9) orelse {
             if (port < MAX_PORTS_TRACKED) {
@@ -1270,18 +1336,22 @@ pub const Controller = struct {
         }
 
         const hid_before = self.num_hid_devices;
-        self.parseConfigDescriptor(slot, full_len);
+        self.parseConfigDescriptor(slot, full_len, speed);
         if (port < MAX_PORTS_TRACKED) {
             self.port_status[port] = if (self.num_hid_devices > hid_before) .ok else .no_hid;
         }
     }
 
-    fn parseConfigDescriptor(self: *Controller, slot: u8, total_len: u16) void {
+    fn parseConfigDescriptor(self: *Controller, slot: u8, total_len: u16, speed: u32) void {
         const buf: [*]const u8 = @ptrFromInt(self.desc_buf_virt);
         var offset: u16 = 0;
         var current_interface: u8 = 0;
         var current_hid_protocol: u8 = 0;
         var found_hid = false;
+
+        dbg.log("  cfg desc: total_len=");
+        dbg.logU32(total_len);
+        dbg.log("\n");
 
         while (offset + 2 <= total_len) {
             const desc_len = buf[offset];
@@ -1295,38 +1365,54 @@ pub const Controller = struct {
                 const iface_subclass = buf[offset + 6];
                 const iface_protocol = buf[offset + 7];
 
+                dbg.log("    iface ");
+                dbg.logU32(current_interface);
+                dbg.log(": class=");
+                dbg.logU32(iface_class);
+                dbg.log(" sub=");
+                dbg.logU32(iface_subclass);
+                dbg.log(" proto=");
+                dbg.logU32(iface_protocol);
+                dbg.log("\n");
+
                 if (iface_class == USB_CLASS_HID) {
                     found_hid = true;
                     current_hid_protocol = iface_protocol;
 
-                    const device_name: []const u8 = switch (iface_protocol) {
-                        HID_PROTOCOL_KEYBOARD => "keyboard",
-                        HID_PROTOCOL_MOUSE => "mouse",
-                        else => "unknown HID",
-                    };
-                    syscall.write("usb: found ");
-                    syscall.write(device_name);
                     if (iface_subclass == HID_SUBCLASS_BOOT) {
-                        syscall.write(" (boot protocol)");
-                    }
-                    syscall.write("\n");
-
-                    if (iface_subclass == HID_SUBCLASS_BOOT) {
-                        _ = self.setProtocol(slot, current_interface, HID_BOOT_PROTOCOL);
-                        _ = self.setIdle(slot, current_interface);
+                        if (!self.setProtocol(slot, current_interface, HID_BOOT_PROTOCOL)) {
+                            dbg.log("    setProtocol failed iface=");
+                            dbg.logU32(current_interface);
+                            dbg.log("\n");
+                        }
+                        if (!self.setIdle(slot, current_interface)) {
+                            dbg.log("    setIdle failed iface=");
+                            dbg.logU32(current_interface);
+                            dbg.log("\n");
+                        }
                     }
                 } else {
                     found_hid = false;
                 }
-            } else if (desc_type == USB_DESC_ENDPOINT and desc_len >= 7 and found_hid) {
+            } else if (desc_type == USB_DESC_ENDPOINT and desc_len >= 7) {
                 const ep_addr = buf[offset + 2];
                 const ep_attrs = buf[offset + 3];
                 const ep_max_packet = @as(u16, buf[offset + 4]) | (@as(u16, buf[offset + 5]) << 8);
                 const ep_interval = buf[offset + 6];
 
-                // Only interrupt IN endpoints
-                if ((ep_attrs & 0x03) == 0x03 and (ep_addr & 0x80) != 0) {
-                    if (self.configureEndpoint(slot, ep_addr, ep_max_packet, ep_interval)) {
+                dbg.log("    ep: addr=0x");
+                dbg.logHex(ep_addr);
+                dbg.log(" attrs=0x");
+                dbg.logHex(ep_attrs);
+                dbg.log(" maxpkt=");
+                dbg.logU32(ep_max_packet);
+                dbg.log(" hid=");
+                dbg.logU32(@intFromBool(found_hid));
+                dbg.log("\n");
+
+                // Only interrupt IN endpoints for HID
+                if (found_hid and (ep_attrs & 0x03) == 0x03 and (ep_addr & 0x80) != 0) {
+                    if (self.configureEndpoint(slot, ep_addr, ep_max_packet, ep_interval, speed)) {
                         if (self.num_hid_devices < MAX_HID_DEVICES) {
                             const ep_num = ep_addr & 0x0F;
                             const dci = ep_num * 2 + 1;
@@ -1350,6 +1436,7 @@ pub const Controller = struct {
 
             offset += desc_len;
         }
+        dbg.flush();
     }
 };
 
