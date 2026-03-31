@@ -63,27 +63,22 @@ const TileLayout = struct {
     tile_h: u32 = 0,
 };
 
-// Max tile size so frame fits in channel ring buffer (~2MB per direction)
-// 800*600*4 = 1.92MB
-const MAX_TILE_W: u32 = 800;
-const MAX_TILE_H: u32 = 600;
-
 fn computeLayout(pane: *const Pane, screen_w: u32, screen_h: u32) TileLayout {
     if (pane.window_count == 0) return .{};
     if (pane.window_count == 1) {
         return .{
             .visible = .{ 0, 0 },
             .visible_count = 1,
-            .tile_w = @min(screen_w, MAX_TILE_W),
-            .tile_h = @min(screen_h, MAX_TILE_H),
+            .tile_w = screen_w,
+            .tile_h = screen_h,
         };
     }
     // 2+ windows: two halves at slide_offset
     return .{
         .visible = .{ pane.slide_offset, pane.slide_offset + 1 },
         .visible_count = 2,
-        .tile_w = @min(screen_w / 2, MAX_TILE_W),
-        .tile_h = @min(screen_h, MAX_TILE_H),
+        .tile_w = screen_w / 2,
+        .tile_h = screen_h,
     };
 }
 

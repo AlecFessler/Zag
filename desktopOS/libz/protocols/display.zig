@@ -4,7 +4,7 @@ const Channel = lib.channel.Channel;
 const Protocol = lib.Protocol;
 
 pub const protocol_id: Protocol = .compositor;
-pub const SHM_SIZE: u64 = 4 * 1024 * 1024;
+pub const SHM_SIZE: u64 = 16 * 1024 * 1024;
 
 // ── Commands ─────────────────────────────────────────────────────────
 // B→A (server → client)
