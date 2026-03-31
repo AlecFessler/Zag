@@ -170,6 +170,12 @@ pub fn main(perm_view_addr: u64) void {
                             dbg.log(" cc=");
                             dbg.logU32(ctrl.diag_last_cc);
                         }
+                        // Show speed for ports that got past reset
+                        if (@intFromEnum(status) >= @intFromEnum(xhci.PortStatus.slot_cmd_timeout)) {
+                            const spd = (after >> 10) & 0xF;
+                            dbg.log(" spd=");
+                            dbg.logU32(spd);
+                        }
                         dbg.log("\n");
                     }
                 }
@@ -209,7 +215,16 @@ pub fn main(perm_view_addr: u64) void {
                 dbg.logU32(controllers[ctrl_count].num_scratchpad);
                 dbg.log(" csz=");
                 dbg.logU32(controllers[ctrl_count].context_size);
-                if (err == .noop_timeout) {
+                if (err == .controller_start) {
+                    const ctrl = &controllers[ctrl_count];
+                    dbg.log("\n  pre_start_sts=");
+                    dbg.logHex(ctrl.diag_pre_start_sts);
+                    dbg.log(" post_start_cmd=");
+                    dbg.logHex(ctrl.diag_post_start_cmd);
+                    dbg.log(" post_start_sts=");
+                    dbg.logHex(ctrl.diag_post_start_sts);
+                }
+                if (err == .noop_timeout or err == .controller_start) {
                     const ctrl = &controllers[ctrl_count];
                     dbg.log("\n  dma_size=");
                     dbg.logHex(ctrl.dma_region_size);

@@ -765,27 +765,9 @@ fn parseDmar(dmar_vaddr: VAddr, length: u32) !void {
 }
 
 fn parseIvrs(ivrs_vaddr: VAddr, length: u32) !void {
-    const header_size: u32 = 48;
-    if (length <= header_size) return;
-
-    var offset: u32 = header_size;
-    while (offset + 4 <= length) {
-        const entry_type = @as(*const volatile u8, @ptrFromInt(ivrs_vaddr.addr + offset)).*;
-        const entry_len = @as(*align(1) const volatile u16, @ptrFromInt(ivrs_vaddr.addr + offset + 2)).*;
-        if (entry_len == 0) break;
-
-        if ((entry_type == 0x10 or entry_type == 0x11 or entry_type == 0x40) and entry_len >= 24) {
-            const reg_base = @as(*align(1) const volatile u64, @ptrFromInt(ivrs_vaddr.addr + offset + 8)).*;
-            if (reg_base != 0) {
-                iommu.initAmd(PAddr.fromInt(reg_base)) catch {};
-
-                // Parse device entries within this IVHD for aliases
-                parseIvhdDeviceEntries(ivrs_vaddr.addr + offset, entry_type, entry_len);
-            }
-        }
-
-        offset += entry_len;
-    }
+    // IOMMU disabled while debugging bare metal xHCI
+    _ = ivrs_vaddr;
+    _ = length;
 }
 
 fn parseIvhdDeviceEntries(ivhd_base: u64, entry_type: u8, entry_len: u16) void {

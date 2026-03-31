@@ -118,7 +118,16 @@ pub const TrbType = enum(u6) {
 
 pub const CompletionCode = enum(u8) {
     success = 1,
+    data_buffer_error = 2,
+    babble = 3,
+    usb_transaction_error = 4,
+    trb_error = 5,
+    stall = 6,
+    resource_error = 7,
+    bandwidth_error = 8,
+    no_slots = 9,
     short_packet = 13,
+    context_state_error = 19,
     _,
 };
 
@@ -354,6 +363,9 @@ pub const Controller = struct {
     diag_pagesize: u32 = 0,
     diag_db_offset: u32 = 0,
     diag_last_cc: u8 = 0,
+    diag_pre_start_sts: u32 = 0,
+    diag_post_start_sts: u32 = 0,
+    diag_post_start_cmd: u32 = 0,
 
     // ── Hardware init from device handle ─────────────────────────
 
@@ -577,7 +589,6 @@ pub const Controller = struct {
     }
 
     fn writeOp64(self: *const Controller, offset: u32, val: u64) void {
-        // xHCI spec 5.1: write lo DWORD first, then hi DWORD
         @as(*volatile u32, @ptrFromInt(self.op_base + offset)).* = @truncate(val);
         @as(*volatile u32, @ptrFromInt(self.op_base + offset + 4)).* = @truncate(val >> 32);
     }
@@ -599,7 +610,6 @@ pub const Controller = struct {
     }
 
     fn writeRt64(self: *const Controller, offset: u32, val: u64) void {
-        // xHCI spec 5.1: write lo DWORD first, then hi DWORD
         @as(*volatile u32, @ptrFromInt(self.rt_base + offset)).* = @truncate(val);
         @as(*volatile u32, @ptrFromInt(self.rt_base + offset + 4)).* = @truncate(val >> 32);
     }
@@ -762,87 +772,74 @@ pub const Controller = struct {
 
     // ── Controller initialization ───────────────────────────────
 
+    // Follows the illumos/Oxide xHCI init sequence:
+    // 1. Read params  2. BIOS takeover  3. Stop  4. Reset (with delay)
+    // 5. Configure (slots, DCBAA, scratchpad, cmd ring, event ring)
+    // 6. Start  7. NOOP test
     fn initController(self: *Controller) InitError {
+        // ── 1. Read register offsets and hardware parameters ────────
         const cap_length: u8 = @truncate(self.readCap(.cap_length));
         self.op_base = self.mmio_base + cap_length;
-
-        const rts_off = self.readCap(.rts_offset) & ~@as(u32, 0x1F);
-        self.rt_base = self.mmio_base + rts_off;
-
-        const db_off = self.readCap(.db_offset) & ~@as(u32, 0x3);
-        self.db_base = self.mmio_base + db_off;
+        self.rt_base = self.mmio_base + (self.readCap(.rts_offset) & ~@as(u32, 0x1F));
+        self.db_base = self.mmio_base + (self.readCap(.db_offset) & ~@as(u32, 0x3));
 
         const hcsparams1 = self.readCap(.hcs_params1);
-        self.max_slots_cfg = hcsparams1 & 0xFF;
+        self.max_slots_cfg = @min(hcsparams1 & 0xFF, MAX_SLOTS);
         self.max_ports = (hcsparams1 >> 24) & 0xFF;
-
-        if (self.max_slots_cfg > MAX_SLOTS) self.max_slots_cfg = MAX_SLOTS;
 
         const hccparams1 = self.readCap(.hcc_params1);
         self.context_size = if (hccparams1 & (1 << 2) != 0) 64 else 32;
 
         const hcsparams2 = self.readCap(.hcs_params2);
-        const max_scratchpad_hi: u32 = (hcsparams2 >> 21) & 0x1F;
-        const max_scratchpad_lo: u32 = (hcsparams2 >> 27) & 0x1F;
-        const max_scratchpad = (max_scratchpad_hi << 5) | max_scratchpad_lo;
-        self.num_scratchpad = max_scratchpad;
+        const scratchpad_hi: u32 = (hcsparams2 >> 21) & 0x1F;
+        const scratchpad_lo: u32 = (hcsparams2 >> 27) & 0x1F;
+        self.num_scratchpad = (scratchpad_hi << 5) | scratchpad_lo;
 
-        // BIOS/UEFI handoff via USB Legacy Support extended capability
+        // ── 2. BIOS/UEFI takeover ─────────────────────────────────
+        // Claims ownership, force-clears if BIOS doesn't release,
+        // unconditionally disables SMI sources and clears SMI events.
         self.biosHandoff();
 
-        // Stop controller if running
-        var cmd: u32 = self.readOp(.usb_cmd);
+        // ── 3. Stop controller ─────────────────────────────────────
+        // Clear RS, wait for HCH (halted).
+        const cmd: u32 = self.readOp(.usb_cmd);
         if (cmd & @as(u32, 1) != 0) {
             self.writeOp(.usb_cmd, cmd & ~@as(u32, 1));
-            var i: u32 = 0;
-            while (i < 100_000) : (i += 1) {
-                if (self.readOp(.usb_sts) & @as(u32, 1) != 0) break;
-            }
+            _ = self.pollOp(.usb_sts, 0x1, 0x1, 100_000);
         }
 
-        // Reset controller
+        // ── 4. Reset controller ────────────────────────────────────
         self.writeOp(.usb_cmd, 1 << 1);
-        var i: u32 = 0;
-        while (i < 1_000_000) : (i += 1) {
-            if (self.readOp(.usb_cmd) & (1 << 1) == 0) break;
-        }
-        if (self.readOp(.usb_cmd) & (1 << 1) != 0) return .controller_reset;
+        if (!self.pollOp(.usb_cmd, 1 << 1, 0, 1_000_000)) return .controller_reset;
+        if (!self.pollOp(.usb_sts, 1 << 11, 0, 1_000_000)) return .controller_cnr;
 
-        // Wait for CNR to clear
-        i = 0;
-        while (i < 1_000_000) : (i += 1) {
-            if (self.readOp(.usb_sts) & (1 << 11) == 0) break;
-        }
-        if (self.readOp(.usb_sts) & (1 << 11) != 0) return .controller_cnr;
-
-        // Configure max slots
+        // ── 5a. Configure max device slots ─────────────────────────
+        // illumos: xhci_controller_configure
         self.writeOp(.config, self.max_slots_cfg);
 
-        // Allocate DCBAA
+        // ── 5b. DCBAA + scratchpad ─────────────────────────────────
         const dcbaa_size = (self.max_slots_cfg + 1) * 8;
         const dcbaa = self.dmaAlloc(dcbaa_size, 64) orelse return .dma_oom;
         self.dcbaa_virt = dcbaa.virt;
         self.dcbaa_phys = dcbaa.phys;
         @memset(@as([*]u8, @ptrFromInt(dcbaa.virt))[0..dcbaa_size], 0);
-        self.writeOp64(OP_DCBAAP, dcbaa.phys);
 
-        // Allocate scratchpad buffers if needed
-        if (max_scratchpad > 0) {
-            const sp_array = self.dmaAlloc(max_scratchpad * 8, 64) orelse return .dma_oom;
+        if (self.num_scratchpad > 0) {
+            const sp_array = self.dmaAlloc(self.num_scratchpad * 8, 64) orelse return .dma_oom;
             const sp_arr_ptr: [*]volatile u64 = @ptrFromInt(sp_array.virt);
-
             var sp_i: u32 = 0;
-            while (sp_i < max_scratchpad) : (sp_i += 1) {
+            while (sp_i < self.num_scratchpad) : (sp_i += 1) {
                 const sp_buf = self.dmaAlloc(4096, 4096) orelse return .dma_oom;
                 @memset(@as([*]u8, @ptrFromInt(sp_buf.virt))[0..4096], 0);
                 sp_arr_ptr[sp_i] = sp_buf.phys;
             }
-
             const dcbaa_ptr: [*]volatile u64 = @ptrFromInt(dcbaa.virt);
             dcbaa_ptr[0] = sp_array.phys;
         }
 
-        // Allocate command ring
+        self.writeOp64(OP_DCBAAP, dcbaa.phys);
+
+        // ── 5c. Command ring ───────────────────────────────────────
         const cmd_ring = self.dmaAlloc(COMMAND_RING_SIZE * 16, 64) orelse return .dma_oom;
         self.cmd_ring_virt = cmd_ring.virt;
         self.cmd_ring_phys = cmd_ring.phys;
@@ -851,14 +848,13 @@ pub const Controller = struct {
         self.cmd_ring_cycle = 1;
         self.writeOp64(OP_CRCR, cmd_ring.phys | 1);
 
-        // Allocate event ring
+        // ── 5d. Event ring + ERST ──────────────────────────────────
         const evt_ring = self.dmaAlloc(EVENT_RING_SIZE * 16, 64) orelse return .dma_oom;
         self.evt_ring_virt = evt_ring.virt;
         @memset(@as([*]u8, @ptrFromInt(evt_ring.virt))[0 .. EVENT_RING_SIZE * 16], 0);
         self.evt_ring_dequeue = 0;
         self.evt_ring_cycle = 1;
 
-        // Event Ring Segment Table (1 entry)
         const erst = self.dmaAlloc(@sizeOf(ErstEntry), 64) orelse return .dma_oom;
         const erst_entry: *volatile ErstEntry = @ptrFromInt(erst.virt);
         erst_entry.ring_segment_base = evt_ring.phys;
@@ -866,66 +862,89 @@ pub const Controller = struct {
         erst_entry._reserved = 0;
         erst_entry._reserved2 = 0;
 
-        // Configure interrupter 0
+        // ── 5e. Configure interrupter 0 ────────────────────────────
+        // Order matters: ERST size, then ERDP, then ERSTBA (illumos: xhci_event_init)
         self.writeRt(.erst_sz, 1);
         self.writeRt64(RT_ERDP, evt_ring.phys);
         self.writeRt64(RT_ERSTBA, erst.phys);
         self.writeRt(.iman, self.readRt(.iman) | 0x2);
 
-        // Allocate shared input context
+        // ── 5f. Input context ──────────────────────────────────────
         const input_ctx = self.dmaAlloc(33 * @as(u64, self.context_size), 64) orelse return .dma_oom;
         self.input_context_virt = input_ctx.virt;
         self.input_context_phys = input_ctx.phys;
 
-        // Start controller
-        cmd = self.readOp(.usb_cmd);
-        self.writeOp(.usb_cmd, cmd | 0x05); // RS | INTE
-
-        // Wait for not halted
-        i = 0;
-        while (i < 100_000) : (i += 1) {
-            if (self.readOp(.usb_sts) & @as(u32, 1) == 0) break;
+        // ── 6. Start controller ────────────────────────────────────
+        // Set RS, wait for HCH to clear.
+        self.diag_pre_start_sts = self.readOp(.usb_sts);
+        self.writeOp(.usb_cmd, self.readOp(.usb_cmd) | 0x1);
+        self.diag_post_start_cmd = self.readOp(.usb_cmd);
+        self.diag_post_start_sts = self.readOp(.usb_sts);
+        if (!self.pollOp(.usb_sts, 0x1, 0, 100_000)) {
+            self.captureDiagnostics();
+            return .controller_start;
         }
 
-        // Test command ring with a NOOP
+        // ── 7. Test command ring with NOOP ─────────────────────────
         self.submitCommand(0, 0, @as(u32, @intFromEnum(TrbType.noop)) << 10);
-        const noop_evt = self.waitForCommandCompletion();
-        if (noop_evt) |evt| {
+        if (self.waitForCommandCompletion()) |_| {
             self.advanceEventRing();
-            _ = evt;
         } else {
-            // Snapshot diagnostic state while running
-            self.diag_usbsts = self.readOp(.usb_sts);
-            self.diag_usbcmd = self.readOp(.usb_cmd);
-            self.diag_pagesize = self.readOp(.page_size);
-            self.diag_hccparams1 = self.readCap(.hcc_params1);
-            self.diag_db_offset = self.readCap(.db_offset);
-            self.diag_iman = self.readRt(.iman);
-            self.diag_erdp = self.readRt64(RT_ERDP);
-
-            // Read back the command TRB we submitted (it's at enqueue-1 or end of ring)
-            const cmd_idx = if (self.cmd_ring_enqueue > 0) self.cmd_ring_enqueue - 1 else COMMAND_RING_SIZE - 2;
-            const cmd_trb = self.cmdRingTrb(cmd_idx);
-            self.diag_cmd_trb_control = cmd_trb.control;
-            self.diag_cmd_trb_cycle = cmd_trb.control & 1;
-
-            // Read what's at the event ring dequeue position
-            const evt_trb = self.evtRingTrb(self.evt_ring_dequeue);
-            self.diag_evt_trb_control = evt_trb.control;
-            self.diag_evt_trb_cycle = evt_trb.cycle();
-
-            // Halt controller so we can read back CRCR
-            self.writeOp(.usb_cmd, self.readOp(.usb_cmd) & ~@as(u32, 1));
-            var halt_wait: u32 = 0;
-            while (halt_wait < 100_000) : (halt_wait += 1) {
-                if (self.readOp(.usb_sts) & @as(u32, 1) != 0) break;
-            }
-            self.diag_crcr_lo = @truncate(self.readOp64(OP_CRCR));
-
+            self.captureDiagnostics();
             return .noop_timeout;
         }
 
         return .none;
+    }
+
+    fn pollPortsc(self: *Controller, port: u32, mask: u32, target: u32, tries: u32) bool {
+        var i: u32 = 0;
+        while (i < tries) : (i += 1) {
+            if (self.readPortsc(port) & mask == target) return true;
+            if (i % 1000 == 0) syscall.thread_yield();
+        }
+        return false;
+    }
+
+    fn pollOp(self: *Controller, reg: OpRegister, mask: u32, target: u32, tries: u32) bool {
+        var i: u32 = 0;
+        while (i < tries) : (i += 1) {
+            if (self.readOp(reg) & mask == target) return true;
+            if (i % 10 == 0) syscall.thread_yield(); // ~1ms between yields
+        }
+        return false;
+    }
+
+    fn delayYield(self: *const Controller, count: u32) void {
+        _ = self;
+        var i: u32 = 0;
+        while (i < count) : (i += 1) {
+            syscall.thread_yield();
+        }
+    }
+
+    fn captureDiagnostics(self: *Controller) void {
+        self.diag_usbsts = self.readOp(.usb_sts);
+        self.diag_usbcmd = self.readOp(.usb_cmd);
+        self.diag_pagesize = self.readOp(.page_size);
+        self.diag_hccparams1 = self.readCap(.hcc_params1);
+        self.diag_db_offset = self.readCap(.db_offset);
+        self.diag_iman = self.readRt(.iman);
+        self.diag_erdp = self.readRt64(RT_ERDP);
+
+        const cmd_idx = if (self.cmd_ring_enqueue > 0) self.cmd_ring_enqueue - 1 else COMMAND_RING_SIZE - 2;
+        const cmd_trb = self.cmdRingTrb(cmd_idx);
+        self.diag_cmd_trb_control = cmd_trb.control;
+        self.diag_cmd_trb_cycle = cmd_trb.control & 1;
+
+        const evt_trb = self.evtRingTrb(self.evt_ring_dequeue);
+        self.diag_evt_trb_control = evt_trb.control;
+        self.diag_evt_trb_cycle = evt_trb.cycle();
+
+        // Halt and read CRCR
+        self.writeOp(.usb_cmd, self.readOp(.usb_cmd) & ~@as(u32, 1));
+        _ = self.pollOp(.usb_sts, 0x1, 0x1, 500);
+        self.diag_crcr_lo = @truncate(self.readOp64(OP_CRCR));
     }
 
     // ── USB Device Enumeration ──────────────────────────────────
@@ -1003,6 +1022,22 @@ pub const Controller = struct {
             return false;
         }
         return true;
+    }
+
+    fn evaluateEp0MaxPacket(self: *Controller, slot: u8, max_packet: u16) void {
+        const csz: u64 = self.context_size;
+        @memset(@as([*]u8, @ptrFromInt(self.input_context_virt))[0 .. 33 * csz], 0);
+
+        const input_ctrl: *volatile InputControlContext = @ptrFromInt(self.input_context_virt);
+        input_ctrl.add_flags = (1 << 1); // Evaluate EP0 context
+
+        const ep0_ctx: *volatile EndpointContext = @ptrFromInt(self.input_context_virt + csz * 2);
+        ep0_ctx.field1 = (EP_TYPE_CONTROL << 3) | (3 << 1) | (@as(u32, max_packet) << 16);
+
+        self.submitCommand(self.input_context_phys, 0, (@as(u32, @intFromEnum(TrbType.evaluate_context)) << 10) | (@as(u32, slot) << 24));
+        if (self.waitForCommandCompletion()) |_| {
+            self.advanceEventRing();
+        }
     }
 
     // ── Control Transfers ───────────────────────────────────────
@@ -1130,30 +1165,26 @@ pub const Controller = struct {
             return;
         }
 
-        // If port is already enabled (CCS+PED), skip reset — device is ready
+        // Always reset the port to put the device in Default state.
+        // The BIOS may have left it configured — we need a clean start.
+        self.writePortsc(port, (portsc & PORTSC_PP) | PORTSC_PR);
+
+        if (!self.pollPortsc(port, PORTSC_PRC, PORTSC_PRC, 500_000)) {
+            if (port < MAX_PORTS_TRACKED) self.port_status[port] = .reset_timeout;
+            return;
+        }
+
+        // Clear PRC
+        portsc = self.readPortsc(port);
+        self.writePortsc(port, (portsc & PORTSC_PP) | PORTSC_PRC);
+
+        // Small delay for device to settle after reset
+        self.delayYield(10);
+
+        portsc = self.readPortsc(port);
         if (portsc & PORTSC_PED == 0) {
-            // Port has device but isn't enabled — need to reset
-            self.writePortsc(port, (portsc & PORTSC_PP) | PORTSC_PR);
-
-            var wait: u32 = 0;
-            while (wait < 500_000) : (wait += 1) {
-                portsc = self.readPortsc(port);
-                if (portsc & PORTSC_PRC != 0) break;
-                if (wait % 1000 == 0) syscall.thread_yield();
-            }
-            if (portsc & PORTSC_PRC == 0) {
-                if (port < MAX_PORTS_TRACKED) self.port_status[port] = .reset_timeout;
-                return;
-            }
-
-            // Clear PRC
-            self.writePortsc(port, (portsc & PORTSC_PP) | PORTSC_PRC);
-
-            portsc = self.readPortsc(port);
-            if (portsc & PORTSC_PED == 0) {
-                if (port < MAX_PORTS_TRACKED) self.port_status[port] = .not_enabled;
-                return;
-            }
+            if (port < MAX_PORTS_TRACKED) self.port_status[port] = .not_enabled;
+            return;
         }
 
         const speed = (portsc & PORTSC_SPEED_MASK) >> 10;
@@ -1174,7 +1205,34 @@ pub const Controller = struct {
             return;
         }
 
-        // Get device descriptor
+        const initial_max_packet: u16 = switch (speed) {
+            SPEED_LOW => 8,
+            SPEED_FULL => 8,
+            SPEED_HIGH => 64,
+            SPEED_SUPER => 512,
+            else => 8,
+        };
+
+        // Get first 8 bytes of device descriptor to read bMaxPacketSize0
+        const initial_len = self.getDescriptor(slot, USB_DESC_DEVICE, 0, 8) orelse {
+            if (port < MAX_PORTS_TRACKED) {
+                self.port_status[port] = if (self.diag_last_cc == 0) .desc_timeout else .desc_error;
+            }
+            return;
+        };
+        if (initial_len < 8) {
+            if (port < MAX_PORTS_TRACKED) self.port_status[port] = .desc_short;
+            return;
+        }
+
+        // Read bMaxPacketSize0 (byte 7) and update EP0 via Evaluate Context if needed
+        const desc_buf: [*]const u8 = @ptrFromInt(self.desc_buf_virt);
+        const actual_max_packet: u16 = desc_buf[7];
+        if (actual_max_packet > 0 and actual_max_packet != initial_max_packet) {
+            self.evaluateEp0MaxPacket(slot, actual_max_packet);
+        }
+
+        // Now get full device descriptor
         const dev_desc_len = self.getDescriptor(slot, USB_DESC_DEVICE, 0, 18) orelse {
             if (port < MAX_PORTS_TRACKED) {
                 self.port_status[port] = if (self.diag_last_cc == 0) .desc_timeout else .desc_error;
