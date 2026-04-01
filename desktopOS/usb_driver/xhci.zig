@@ -139,22 +139,53 @@ pub const Trb = extern struct {
     status: u32 align(1),
     control: u32 align(1),
 
+    /// Extract the TRB Type from control[15:10] (xHCI §4.11.1, §6.4.6 Table 6-91).
+    ///
+    /// Every TRB carries a 6-bit Type field in bits 15:10 of the control dword,
+    /// identifying it as a Transfer, Event, Command, or Link TRB. The xHC uses
+    /// this field to determine how to interpret the remaining TRB fields.
     pub fn trbType(self: *const volatile Trb) TrbType {
         return @enumFromInt(@as(u6, @truncate(self.control >> 10)));
     }
 
+    /// Extract the Completion Code from status[31:24] (xHCI §6.4.5 Table 6-90).
+    ///
+    /// Event TRBs carry an 8-bit Completion Code in bits 31:24 of the status
+    /// dword. A value of 1 = Success, 13 = Short Packet (acceptable for IN
+    /// transfers), and all other non-1 values indicate an error condition.
+    /// The full table of codes is defined in §6.4.5.
     pub fn completionCode(self: *const volatile Trb) CompletionCode {
         return @enumFromInt(@as(u8, @truncate(self.status >> 24)));
     }
 
+    /// Extract the Slot ID from control[31:24] of Event TRBs.
+    ///
+    /// For Command Completion Events (§6.4.2.2), this identifies which Device
+    /// Slot the completed command was associated with. For Transfer Events
+    /// (§6.4.2.1), it identifies the Device Slot that generated the event.
+    /// The Slot ID is assigned by the xHC via the Enable Slot Command (§4.6.3).
     pub fn slotId(self: *const volatile Trb) u8 {
         return @truncate(self.control >> 24);
     }
 
+    /// Extract the Endpoint ID from control[20:16] of Transfer Event TRBs
+    /// (xHCI §6.4.2.1).
+    ///
+    /// This 5-bit field contains the Device Context Index (DCI) of the endpoint
+    /// that generated the Transfer Event. DCI values follow the formula in
+    /// §4.5.1: DCI = Endpoint Number * 2 + Direction (0=OUT, 1=IN), with
+    /// DCI 0 reserved and DCI 1 = Default Control Endpoint.
     pub fn endpointId(self: *const volatile Trb) u8 {
         return @truncate((self.control >> 16) & 0x1F);
     }
 
+    /// Extract the Cycle bit from control[0] (xHCI §4.9.2, §4.9.2.2).
+    ///
+    /// The Cycle bit is the fundamental mechanism for determining TRB ownership
+    /// between the Producer (software) and Consumer (hardware). For Event Ring
+    /// TRBs, software compares the Cycle bit against its Consumer Cycle State
+    /// (CCS) to determine if the xHC has written a new event (§4.9.4). When the
+    /// bits match, the TRB contains valid event data.
     pub fn cycle(self: *const volatile Trb) bool {
         return self.control & 1 != 0;
     }
@@ -392,6 +423,17 @@ pub const Controller = struct {
         noop_timeout,
     };
 
+    /// Map the xHCI MMIO BAR and allocate a contiguous DMA region, then initialize
+    /// the controller (xHCI §5.3 Capability Registers, §4.2 Host Controller Initialization).
+    ///
+    /// Reads hardware capabilities to size the DMA region before allocation:
+    ///   - HCSPARAMS1[7:0] = MaxSlots — number of device slots (§5.3.3)
+    ///   - HCSPARAMS2[25:21]/[31:27] = Max Scratchpad Buffers Hi/Lo (§5.3.4)
+    ///   - HCCPARAMS1[2] = CSZ — context size is 64 bytes if set, else 32 (§5.3.6)
+    ///
+    /// DMA region includes: descriptor buffer, report buffers, DCBAA, scratchpad
+    /// array + pages, command ring, event ring, ERST, input context, per-slot
+    /// device contexts and transfer rings. All alignment requirements per Table 6-1.
     pub fn initFromHandle(self: *Controller, device_handle: u64, mmio_size: u32) InitError {
         // Map xHCI MMIO first so we can read hardware caps
         const aligned_mmio: u64 = ((@as(u64, mmio_size) + syscall.PAGE4K - 1) / syscall.PAGE4K) * syscall.PAGE4K;
@@ -469,6 +511,14 @@ pub const Controller = struct {
 
     // ── Initialize controller ───────────────────────────────────
 
+    /// Top-level xHCI initialization: zero DMA memory, allocate descriptor and report
+    /// buffers, run the hardware init sequence, then enumerate all root hub ports
+    /// (xHCI §4.2 Host Controller Initialization, §4.3 USB Device Initialization).
+    ///
+    /// After initController completes, waits ~100ms for port status to settle (real
+    /// hardware needs time for link training), drains any pending Port Status Change
+    /// Events (§4.19.2) by acknowledging their W1C change bits (§5.4.8), then walks
+    /// every root hub port calling enumeratePort to detect and configure HID devices.
     pub fn init(self: *Controller, mmio_virt: u64, dma_virt: u64, dma_phys: u64, dma_size: u64) InitError {
         self.mmio_base = mmio_virt;
         self.dma_virt_base = dma_virt;
@@ -529,15 +579,32 @@ pub const Controller = struct {
 
     // ── Public API ──────────────────────────────────────────────
 
+    /// Return a slice of all discovered HID devices (keyboards and mice).
+    /// Each HidDevice carries the slot ID, endpoint DCI, buffer index, and
+    /// protocol type needed for the caller to poll interrupt IN transfers.
     pub fn hidDevices(self: *Controller) []HidDevice {
         return self.hid_devices_storage[0..self.num_hid_devices];
     }
 
+    /// Return a pointer to the HID report data for the given device buffer index.
+    /// Each device gets a 64-byte slot in the DMA report buffer region, which the
+    /// xHC writes to when completing a Normal TRB on an interrupt IN endpoint.
     pub fn getReportData(self: *const Controller, buf_index: u8) [*]const u8 {
         const dev_offset: u64 = @as(u64, buf_index) * 64;
         return @ptrFromInt(self.report_buf_virt + dev_offset);
     }
 
+    /// Queue a Normal TRB on an interrupt IN endpoint's transfer ring to receive
+    /// the next HID report (xHCI §6.4.1.1 Normal TRB, §3.2.10 Interrupt Transfers).
+    ///
+    /// The TRB points to a 64-byte region in the DMA report buffer, with:
+    ///   - TRB Type = Normal (1) in control[15:10]
+    ///   - IOC (Interrupt On Completion) bit[5] = 1 (§4.10.4), so the xHC generates
+    ///     a Transfer Event when the device delivers the interrupt IN data
+    ///   - TRB Transfer Length = 64 in status[16:0]
+    ///
+    /// After queuing, the caller must ring the device's doorbell with the endpoint
+    /// DCI as the DB Target to inform the xHC that new work is available (§4.7).
     pub fn queueInterruptIn(self: *Controller, slot: u8, dci: u8, buf_index: u8) void {
         const dev_offset: u64 = @as(u64, buf_index) * 64;
         self.queueTransferTrb(
@@ -549,12 +616,28 @@ pub const Controller = struct {
         );
     }
 
+    /// Check if a new event is available on the Event Ring by comparing the Cycle
+    /// bit of the TRB at the current dequeue position against the Consumer Cycle
+    /// State (xHCI §4.9.4 Event Ring Management, §4.17 Interrupters).
+    ///
+    /// "Software determines that an Event TRB is valid by comparing its Cycle bit
+    /// with the Consumer Cycle State (CCS). If they match, the Event TRB is valid."
+    /// Returns null if no new event is ready (Cycle bit mismatch = xHC hasn't
+    /// written here yet), otherwise returns a pointer to the event TRB.
     pub fn pollEvent(self: *const Controller) ?*const volatile Trb {
         const trb = self.evtRingTrb(self.evt_ring_dequeue);
         if (trb.cycle() != (self.evt_ring_cycle == 1)) return null;
         return trb;
     }
 
+    /// Advance the Event Ring dequeue pointer after consuming an event
+    /// (xHCI §4.9.4 Event Ring Management, §5.5.2.3.3 ERDP Register).
+    ///
+    /// Increments the software dequeue index. When wrapping past the end of the
+    /// segment, toggles the Consumer Cycle State so the next pass through the ring
+    /// expects the opposite Cycle bit value (§4.9.4). Then writes the new dequeue
+    /// physical address to the ERDP register with bit[3] (EHB = Event Handler Busy)
+    /// set to '1' to clear the flag and acknowledge the event to the xHC.
     pub fn advanceEventRing(self: *Controller) void {
         self.evt_ring_dequeue += 1;
         if (self.evt_ring_dequeue >= EVENT_RING_SIZE) {
@@ -565,69 +648,111 @@ pub const Controller = struct {
         self.writeRt64(RT_ERDP, phys | (1 << 3));
     }
 
+    /// Ring a Doorbell Register to notify the xHC that new work is available
+    /// (xHCI §4.7 Doorbells, §5.6 Doorbell Registers).
+    ///
+    /// The Doorbell Array base is at db_base (from DBOFF register §5.3.7), with
+    /// each doorbell at a 4-byte stride indexed by slot. Doorbell[0] is reserved
+    /// for the Host Controller Command ring (DB Target = 0). Doorbell[1-255] are
+    /// Device Context doorbells where DB Target identifies the endpoint DCI
+    /// (Table 5-43: target 1 = EP0 enqueue pointer update, target 2+ = endpoints).
     pub fn ringDoorbell(self: *const Controller, slot: u8, target: u8) void {
         @as(*volatile u32, @ptrFromInt(self.db_base + @as(u64, slot) * 4)).* = target;
     }
 
+    /// Read the Port Status and Control Register (PORTSC) for the given port
+    /// (xHCI §5.4.8, Table 5-27).
+    ///
+    /// Port Register Sets start at op_base + 0x400 with a 0x10 stride per port
+    /// (Table 5-18). The PORTSC register is the first dword of each Port Register
+    /// Set. Contains CCS[0], PED[1], PR[4], PLS[8:5], PP[9], Speed[13:10], and
+    /// various W1C status change bits (CSC[17], PRC[21], etc.).
     pub fn readPortsc(self: *const Controller, port: u32) u32 {
         return @as(*const volatile u32, @ptrFromInt(self.op_base + 0x400 + port * 0x10)).*;
     }
 
     // ── MMIO access ─────────────────────────────────────────────
 
+    /// Read a 32-bit Host Controller Capability Register at mmio_base + offset
+    /// (xHCI §5.3, Table 5-9). All Capability Registers are Read-Only.
+    /// Uses volatile to ensure the compiler emits the MMIO load.
     fn readCap(self: *const Controller, reg: CapRegister) u32 {
         const ptr: *const volatile u32 = @ptrFromInt(self.mmio_base + @intFromEnum(reg));
         return ptr.*;
     }
 
+    /// Read a 32-bit Operational Register at op_base + offset
+    /// (xHCI §5.4, Table 5-18). op_base = mmio_base + CAPLENGTH (§5.3.1).
     fn readOp(self: *const Controller, reg: OpRegister) u32 {
         const ptr: *const volatile u32 = @ptrFromInt(self.op_base + @intFromEnum(reg));
         return ptr.*;
     }
 
+    /// Write a 32-bit Operational Register at op_base + offset (xHCI §5.4).
     fn writeOp(self: *const Controller, reg: OpRegister, val: u32) void {
         const ptr: *volatile u32 = @ptrFromInt(self.op_base + @intFromEnum(reg));
         ptr.* = val;
     }
 
+    /// Read a 64-bit Operational Register (e.g. CRCR §5.4.5, DCBAAP §5.4.6)
+    /// as two 32-bit volatile reads, low dword first (xHCI §5.1).
     fn readOp64(self: *const Controller, offset: u32) u64 {
         const lo: u64 = @as(*const volatile u32, @ptrFromInt(self.op_base + offset)).*;
         const hi: u64 = @as(*const volatile u32, @ptrFromInt(self.op_base + offset + 4)).*;
         return lo | (hi << 32);
     }
 
+    /// Write a 64-bit Operational Register as two 32-bit volatile writes,
+    /// low dword first (xHCI §5.1).
     fn writeOp64(self: *const Controller, offset: u32, val: u64) void {
         @as(*volatile u32, @ptrFromInt(self.op_base + offset)).* = @truncate(val);
         @as(*volatile u32, @ptrFromInt(self.op_base + offset + 4)).* = @truncate(val >> 32);
     }
 
+    /// Read a 32-bit Runtime Register at rt_base + offset
+    /// (xHCI §5.5, Table 5-37). rt_base = mmio_base + RTSOFF (§5.3.8).
     fn readRt(self: *const Controller, reg: RtRegister) u32 {
         const ptr: *const volatile u32 = @ptrFromInt(self.rt_base + @intFromEnum(reg));
         return ptr.*;
     }
 
+    /// Write a 32-bit Runtime Register at rt_base + offset (xHCI §5.5).
     fn writeRt(self: *const Controller, reg: RtRegister, val: u32) void {
         const ptr: *volatile u32 = @ptrFromInt(self.rt_base + @intFromEnum(reg));
         ptr.* = val;
     }
 
+    /// Read a 64-bit Runtime Register (e.g. ERSTBA §5.5.2.3.2, ERDP §5.5.2.3.3)
+    /// as two 32-bit volatile reads, low dword first.
     fn readRt64(self: *const Controller, offset: u32) u64 {
         const lo: u64 = @as(*const volatile u32, @ptrFromInt(self.rt_base + offset)).*;
         const hi: u64 = @as(*const volatile u32, @ptrFromInt(self.rt_base + offset + 4)).*;
         return lo | (hi << 32);
     }
 
+    /// Write a 64-bit Runtime Register as two 32-bit volatile writes,
+    /// low dword first.
     fn writeRt64(self: *const Controller, offset: u32, val: u64) void {
         @as(*volatile u32, @ptrFromInt(self.rt_base + offset)).* = @truncate(val);
         @as(*volatile u32, @ptrFromInt(self.rt_base + offset + 4)).* = @truncate(val >> 32);
     }
 
+    /// Write the Port Status and Control Register (PORTSC) for the given port
+    /// (xHCI §5.4.8). Callers must be careful with W1C (Write-1-to-Clear) bits:
+    /// CSC[17], PEC[18], WRC[19], OCC[20], PRC[21], PLC[22], CEC[23]. Writing
+    /// '1' to these bits clears them; writing '0' preserves them. The PP[9] bit
+    /// must typically be preserved to avoid powering off the port.
     fn writePortsc(self: *const Controller, port: u32, val: u32) void {
         @as(*volatile u32, @ptrFromInt(self.op_base + 0x400 + port * 0x10)).* = val;
     }
 
     // ── DMA memory management (bump allocator) ──────────────────
 
+    /// Bump-allocate from the contiguous DMA region, returning aligned virtual
+    /// and physical addresses. The xHCI spec requires specific alignments for
+    /// different data structures (Table 6-1): 64 bytes for most structures
+    /// (DCBAA, rings, contexts), 4096 bytes for scratchpad buffer pages (§6.6).
+    /// Returns null if the allocation would exceed the DMA region.
     fn dmaAlloc(self: *Controller, size: u64, alignment: u64) ?DmaAlloc {
         const aligned_cursor = (self.dma_cursor + alignment - 1) & ~(alignment - 1);
         if (aligned_cursor + size > self.dma_region_size) return null;
@@ -637,16 +762,34 @@ pub const Controller = struct {
         return .{ .virt = virt, .phys = phys };
     }
 
+    /// Convert a virtual address within the DMA region to its physical address.
+    /// Works because the DMA region is a single contiguous mapping where
+    /// phys = phys_base + (virt - virt_base).
     fn dmaVirtToPhys(self: *const Controller, virt: u64) u64 {
         return self.dma_phys_base + (virt - self.dma_virt_base);
     }
 
     // ── Command Ring ────────────────────────────────────────────
 
+    /// Return a volatile pointer to the TRB at the given index in the Command Ring.
+    /// Each TRB is 16 bytes (xHCI §6.4 Transfer Request Block).
     fn cmdRingTrb(self: *const Controller, idx: u32) *volatile Trb {
         return @ptrFromInt(self.cmd_ring_virt + @as(u64, idx) * 16);
     }
 
+    /// Submit a command TRB to the Command Ring and ring Doorbell[0]
+    /// (xHCI §4.6.1 Command Ring Operation, §4.9.3 Command Ring Management).
+    ///
+    /// Writes the TRB at the current enqueue position with the Producer Cycle
+    /// State (PCS) OR'd into control[0]. Advances the enqueue pointer, and when
+    /// it reaches the last slot (COMMAND_RING_SIZE - 1), inserts a Link TRB
+    /// (type 6, §6.4.4.1) pointing back to the ring base with:
+    ///   - Toggle Cycle (TC) bit[1] = 1, which flips the PCS on wrap
+    ///   - Cycle bit[0] = current PCS
+    /// This allows the xHC to distinguish old TRBs from new ones across wraps.
+    ///
+    /// Finally, rings Doorbell Register 0 with DB Target = 0 ("Host Controller
+    /// Command", §5.6 Table 5-43) to notify the xHC that a new command is posted.
     fn submitCommand(self: *Controller, param: u64, status: u32, control_base: u32) void {
         const trb = self.cmdRingTrb(self.cmd_ring_enqueue);
         trb.param = param;
@@ -668,10 +811,19 @@ pub const Controller = struct {
 
     // ── Event Ring ──────────────────────────────────────────────
 
+    /// Return a volatile pointer to the TRB at the given index in the Event Ring.
+    /// The xHC (producer) writes Event TRBs here; software (consumer) reads them.
     fn evtRingTrb(self: *const Controller, idx: u32) *const volatile Trb {
         return @ptrFromInt(self.evt_ring_virt + @as(u64, idx) * 16);
     }
 
+    /// Poll the Event Ring for an event of the specified type, with a nanosecond
+    /// timeout (xHCI §4.9.4 Event Ring Management).
+    ///
+    /// Repeatedly calls pollEvent() to check for new events via Cycle bit matching.
+    /// Non-matching event types are consumed (advanceEventRing) and skipped.
+    /// Returns the matching event TRB, or null on timeout. The caller is
+    /// responsible for calling advanceEventRing after processing the returned event.
     fn waitForEvent(self: *Controller, expected_type: TrbType, timeout_ns: i64) ?*const volatile Trb {
         const deadline = syscall.clock_gettime() + timeout_ns;
         while (syscall.clock_gettime() < deadline) {
@@ -687,12 +839,22 @@ pub const Controller = struct {
         return null;
     }
 
+    /// Wait up to 2 seconds for a Command Completion Event TRB (type 33,
+    /// xHCI §6.4.2.2). Every command submitted to the Command Ring generates
+    /// exactly one Command Completion Event on the Event Ring (§4.6.1).
     fn waitForCommandCompletion(self: *Controller) ?*const volatile Trb {
         return self.waitForEvent(.command_completion, 2_000_000_000);
     }
 
     // ── Transfer Rings ──────────────────────────────────────────
 
+    /// Allocate and initialize a Transfer Ring for the given slot and endpoint
+    /// (xHCI §4.9.2 Transfer Ring Management, §6.3 TRB Ring, Table 6-1).
+    ///
+    /// Each ring is TRANSFER_RING_SIZE (64) TRBs × 16 bytes = 1024 bytes,
+    /// 64-byte aligned per Table 6-1. The ring is zeroed and the software state
+    /// initialized with enqueue = 0 and Producer Cycle State (PCS) = 1.
+    /// The last TRB slot is reserved for a Link TRB inserted by queueTransferTrb.
     fn initTransferRing(self: *Controller, slot: u8, ep_index: u8) bool {
         const ring = self.dmaAlloc(TRANSFER_RING_SIZE * 16, 64) orelse return false;
         const ptr: [*]u8 = @ptrFromInt(ring.virt);
@@ -707,6 +869,14 @@ pub const Controller = struct {
         return true;
     }
 
+    /// Enqueue a Transfer TRB on a device endpoint's Transfer Ring
+    /// (xHCI §4.9.2 Transfer Ring Management, §4.9.2.1 Segmented Rings).
+    ///
+    /// Writes the TRB at the current enqueue position with the Producer Cycle
+    /// State OR'd into control[0]. When the enqueue pointer reaches the last
+    /// slot, inserts a Link TRB (type 6, §6.4.4.1) with Toggle Cycle bit[1] = 1
+    /// pointing back to the ring base, then wraps the enqueue to 0 and flips PCS.
+    /// This is the same wrap mechanism as the Command Ring (see submitCommand).
     fn queueTransferTrb(self: *Controller, slot: u8, ep_index: u8, param: u64, status: u32, control_base: u32) void {
         var ring = &self.transfer_rings[slot][ep_index];
         const trb: *volatile Trb = @ptrFromInt(ring.virt + @as(u64, ring.enqueue) * 16);
@@ -731,6 +901,22 @@ pub const Controller = struct {
     const USBLEGSUP_BIOS_OWNED: u32 = 1 << 16;
     const USBLEGSUP_OS_OWNED: u32 = 1 << 24;
 
+    /// Claim xHC ownership from BIOS/UEFI via the USB Legacy Support extended
+    /// capability (xHCI §4.22.1 Pre-OS to OS Handoff, §7.1 USB Legacy Support).
+    ///
+    /// Walks the xHCI Extended Capabilities linked list starting at the DWORD
+    /// offset in HCCPARAMS1[31:16] (xECP, §5.3.6). Each capability has an 8-bit
+    /// ID in bits[7:0] and a next-pointer in bits[15:8] (DWORD offset).
+    ///
+    /// When the USB Legacy Support capability (ID = 1, §7.1.1 USBLEGSUP) is found:
+    ///   1. If HC BIOS Owned Semaphore (bit[16]) is set, sets HC OS Owned
+    ///      Semaphore (bit[24]) and waits for BIOS to release (clear bit[16]).
+    ///      The spec allows up to 1 second for BIOS to respond (§4.22.1).
+    ///   2. If BIOS doesn't release, force-clears BIOS Owned and sets OS Owned.
+    ///   3. Writes 0xE0000000 to USBLEGCTLSTS (xECP+4, §7.1.2) to disable all
+    ///      SMI sources (USB SMI Enable, SMI on Host System Error, etc.) and
+    ///      clear pending SMI status bits, preventing BIOS SMI handlers from
+    ///      interfering with OS operation.
     fn biosHandoff(self: *Controller) void {
         // HCCPARAMS1 bits [31:16] = xECP (xHCI Extended Capabilities Pointer)
         // This is a DWORD offset from MMIO base
@@ -775,10 +961,49 @@ pub const Controller = struct {
 
     // ── Controller initialization ───────────────────────────────
 
-    // Follows the illumos/Oxide xHCI init sequence:
-    // 1. Read params  2. BIOS takeover  3. Stop  4. Reset (with delay)
-    // 5. Configure (slots, DCBAA, scratchpad, cmd ring, event ring)
-    // 6. Start  7. NOOP test
+    /// Full xHC initialization sequence per xHCI §4.2 "Host Controller
+    /// Initialization", following the illumos/Oxide ordering:
+    ///
+    /// Step 1 — Read register offsets and hardware parameters:
+    ///   - CAPLENGTH (§5.3.1): offset to Operational Registers
+    ///   - RTSOFF (§5.3.8): offset to Runtime Registers (masked to 32-byte alignment)
+    ///   - DBOFF (§5.3.7): offset to Doorbell Array (masked to DWORD alignment)
+    ///   - HCSPARAMS1 (§5.3.3): MaxSlots[7:0], MaxPorts[31:24]
+    ///   - HCCPARAMS1 (§5.3.6): CSZ bit[2] selects 32 or 64-byte context size
+    ///   - HCSPARAMS2 (§5.3.4): Max Scratchpad Bufs Hi[25:21] | Lo[31:27]
+    ///
+    /// Step 2 — BIOS/UEFI ownership handoff (§4.22.1, §7.1).
+    ///
+    /// Step 3 — Stop: clear Run/Stop (R/S) bit[0] in USBCMD (§5.4.1), wait for
+    ///   HCHalted (HCH) bit[0] in USBSTS (§5.4.2) to confirm halt.
+    ///
+    /// Step 4 — Reset: set HCRST bit[1] in USBCMD (§5.4.1), wait for HCRST to
+    ///   self-clear, then wait for Controller Not Ready (CNR) bit[11] in USBSTS
+    ///   (§5.4.2) to clear. "After Chip Hardware Reset, wait until CNR is '0'
+    ///   before writing any xHC Operational or Runtime registers."
+    ///
+    /// Step 5a — Write MaxSlotsEn to CONFIG register (§5.4.7).
+    ///
+    /// Step 5b — DCBAA (§6.1, §5.4.6): allocate (MaxSlots+1)*8 byte array,
+    ///   64-byte aligned. If scratchpad buffers are needed (§4.20, §6.6), allocate
+    ///   the scratchpad array and individual 4096-byte pages, storing the array
+    ///   physical address in DCBAA[0]. Write DCBAAP register (§5.4.6).
+    ///
+    /// Step 5c — Command Ring: allocate ring, write physical address | RCS bit[0]=1
+    ///   to CRCR register (§5.4.5). RCS sets the initial Producer Cycle State.
+    ///
+    /// Step 5d — Event Ring + ERST (§6.5): allocate ring and one ERST entry
+    ///   pointing to it. Configure Interrupter 0 registers in order:
+    ///   ERSTSZ (§5.5.2.3.1) = 1, ERDP (§5.5.2.3.3) = ring phys,
+    ///   ERSTBA (§5.5.2.3.2) = ERST phys — "writing ERSTBA enables the Event Ring"
+    ///   (§4.9.4). Set IMAN IE bit[1] (§5.5.2.1) to enable the interrupter.
+    ///
+    /// Step 5f — Allocate Input Context (33 × context_size, §6.2.5).
+    ///
+    /// Step 6 — Start: set R/S=1 in USBCMD, wait for HCH=0 in USBSTS (§5.4.1.1).
+    ///
+    /// Step 7 — NOOP test: submit a No Op Command TRB (type 23, §6.4.3.1, §4.6.2)
+    ///   to verify the command ring is operational. Wait for Command Completion Event.
     fn initController(self: *Controller) InitError {
         // ── 1. Read register offsets and hardware parameters ────────
         const cap_length: u8 = @truncate(self.readCap(.cap_length));
@@ -900,6 +1125,8 @@ pub const Controller = struct {
         return .none;
     }
 
+    /// Poll PORTSC for a specific bit pattern, used primarily for waiting on
+    /// Port Reset Change (PRC) after writing Port Reset (PR) (xHCI §4.3.1).
     fn pollPortsc(self: *Controller, port: u32, mask: u32, target: u32, tries: u32) bool {
         var i: u32 = 0;
         while (i < tries) : (i += 1) {
@@ -909,6 +1136,9 @@ pub const Controller = struct {
         return false;
     }
 
+    /// Poll an Operational Register for a specific bit pattern. Used for waiting
+    /// on HCH (halt), HCRST (reset complete), and CNR (controller ready) bits
+    /// in USBSTS/USBCMD (xHCI §5.4.1, §5.4.2).
     fn pollOp(self: *Controller, reg: OpRegister, mask: u32, target: u32, tries: u32) bool {
         var i: u32 = 0;
         while (i < tries) : (i += 1) {
@@ -918,6 +1148,8 @@ pub const Controller = struct {
         return false;
     }
 
+    /// Simple delay loop via repeated thread yields. Used when a coarse
+    /// time-based delay is needed without a precise clock.
     fn delayYield(self: *const Controller, count: u32) void {
         _ = self;
         var i: u32 = 0;
@@ -926,6 +1158,12 @@ pub const Controller = struct {
         }
     }
 
+    /// Snapshot key register state for post-mortem debugging when init fails.
+    ///
+    /// Captures USBSTS (§5.4.2), USBCMD (§5.4.1), PAGESIZE (§5.4.3),
+    /// HCCPARAMS1 (§5.3.6), DBOFF (§5.3.7), IMAN (§5.5.2.1), ERDP (§5.5.2.3.3),
+    /// and the contents of the most recent command and event TRBs. Also halts the
+    /// controller to read CRCR (§5.4.5), which is write-only when R/S=1.
     fn captureDiagnostics(self: *Controller) void {
         self.diag_usbsts = self.readOp(.usb_sts);
         self.diag_usbcmd = self.readOp(.usb_cmd);
@@ -954,10 +1192,20 @@ pub const Controller = struct {
 
     const EnableSlotError = enum { timeout, error_code };
 
+    /// Issue an Enable Slot Command (xHCI §4.6.3, §4.3.2 Device Slot Assignment).
+    /// Shorthand for enableSlotDetailed without error reporting.
     fn enableSlot(self: *Controller) ?u8 {
         return self.enableSlotDetailed(null);
     }
 
+    /// Issue an Enable Slot Command TRB (type 9, xHCI §6.4.3.2, §4.6.3) to obtain
+    /// a Device Slot ID from the xHC.
+    ///
+    /// "The first operation that software shall perform after detecting a device
+    /// attach event and resetting the port is to obtain a Device Slot" (§4.3.2).
+    /// The xHC selects an available slot and returns the Slot ID in control[31:24]
+    /// of the Command Completion Event (§6.4.2.2). On success, the slot transitions
+    /// to the Enabled state (§4.5.3.3).
     fn enableSlotDetailed(self: *Controller, err_out: ?*EnableSlotError) ?u8 {
         self.submitCommand(0, 0, @as(u32, @intFromEnum(TrbType.enable_slot)) << 10);
         const evt = self.waitForCommandCompletion() orelse {
@@ -976,9 +1224,28 @@ pub const Controller = struct {
         return slot;
     }
 
-    /// Initialize slot and optionally assign a USB address.
-    /// bsr=true: slot enters Default state, device stays at address 0 (for initial descriptor read).
-    /// bsr=false: slot enters Addressed state, device gets a USB address.
+    /// Issue an Address Device Command (TRB type 11, xHCI §6.4.3.4, §4.6.5) to
+    /// initialize a device slot and optionally assign a USB address.
+    ///
+    /// This is a two-phase process per §4.3.3–4.3.4:
+    ///
+    /// Phase 1 (BSR=1, Block Set Address Request, bit[9] of command TRB):
+    ///   - Allocates Output Device Context (32 × context_size, §6.2.1) and sets
+    ///     the corresponding DCBAA[slot] entry (§6.1)
+    ///   - Allocates EP0 Transfer Ring via initTransferRing (§4.9.2)
+    ///   - Fills Input Context (§6.2.5):
+    ///     * Input Control Context (§6.2.5.1): A0=1, A1=1 (add Slot + EP0 contexts)
+    ///     * Slot Context (§6.2.2): Route String=0 (direct root hub attach),
+    ///       Context Entries=1 (just EP0), Speed per §4.3.3, Root Hub Port Number
+    ///     * EP0 Context (§6.2.3, §4.8.2.1): EP Type=Control(4), CErr=3 (§4.10.2.7),
+    ///       Max Packet Size per speed (LS=8, FS=64, HS=64, SS=512 per USB spec),
+    ///       TR Dequeue Pointer with DCS=1, Average TRB Length=8
+    ///   - Device enters Default state (address 0) — can do GET_DESCRIPTOR
+    ///
+    /// Phase 2 (BSR=0):
+    ///   - Re-zeros the EP0 transfer ring to prevent replaying stale TRBs
+    ///   - Resubmits with same Input Context but BSR=0
+    ///   - xHC assigns a USB address, device enters Addressed state (§4.3.4)
     fn addressDevice(self: *Controller, slot: u8, port: u32, speed: u32, bsr: bool) bool {
         if (bsr) {
             // First call: allocate device context and transfer ring
@@ -1041,6 +1308,15 @@ pub const Controller = struct {
         return true;
     }
 
+    /// Issue an Evaluate Context Command (TRB type 13, xHCI §6.4.3.6, §4.6.7) to
+    /// update EP0's Max Packet Size after reading bMaxPacketSize0 from the device
+    /// descriptor (xHCI §4.3 step 7x, USB 2.0 §9.6.1).
+    ///
+    /// Sets Input Control Context A1=1 (evaluate EP0 context only, §6.2.5.1) and
+    /// writes the new Max Packet Size to EP0 Context field1[31:16]. "After
+    /// successfully executing the Evaluate Context Command the xHC will use the
+    /// updated Max Packet Size for all subsequent Default Control Endpoint
+    /// transfers" (§4.3 step 7x).
     fn evaluateEp0MaxPacket(self: *Controller, slot: u8, max_packet: u16) void {
         const csz: u64 = self.context_size;
         @memset(@as([*]u8, @ptrFromInt(self.input_context_virt))[0 .. 33 * csz], 0);
@@ -1059,6 +1335,31 @@ pub const Controller = struct {
 
     // ── Control Transfers ───────────────────────────────────────
 
+    /// Execute a USB control transfer as a 3-TRB Transfer Descriptor on EP0's
+    /// Transfer Ring (xHCI §4.11.2.2, §3.2.9 Control Transfers).
+    ///
+    /// Setup Stage TRB (type 2, §6.4.1.2.1):
+    ///   - param[7:0]=bmRequestType, [15:8]=bRequest, [31:16]=wValue,
+    ///     [47:32]=wIndex, [63:48]=wLength — packed per USB 2.0 §9.3
+    ///   - status[16:0] = TRB Transfer Length = 8 (always 8 for setup)
+    ///   - control: IDT bit[6]=1 (Immediate Data, setup data is in the TRB itself),
+    ///     TRT[17:16] = Transfer Type: 0=No Data, 2=OUT Data, 3=IN Data (§6.4.1.2.1)
+    ///
+    /// Data Stage TRB (type 3, §6.4.1.2.2) — only if length > 0:
+    ///   - param = physical address of data buffer
+    ///   - status = transfer length
+    ///   - control: DIR bit[16] = 1 for IN, 0 for OUT
+    ///
+    /// Status Stage TRB (type 4, §6.4.1.2.3):
+    ///   - IOC bit[5]=1 to generate a Transfer Event on completion (§4.10.4)
+    ///   - DIR bit[16] = opposite of data stage direction (0 if IN data, 1 if OUT
+    ///     or no data stage) — "the direction of the Status Stage TD shall be the
+    ///     opposite of the Data Stage direction" (§4.11.2.2)
+    ///
+    /// Rings doorbell with target=1 (DCI 1 = Default Control EP0, Table 5-43).
+    /// Waits for Transfer Event (§6.4.2.1), extracts completion code from
+    /// status[31:24] and transfer residual from status[23:0]. Returns actual
+    /// bytes transferred (length - residual), or null on error/timeout.
     fn controlTransfer(
         self: *Controller,
         slot: u8,
@@ -1104,6 +1405,10 @@ pub const Controller = struct {
         return length -| residual;
     }
 
+    /// Issue a USB GET_DESCRIPTOR request via control transfer
+    /// (USB 2.0 §9.4.3, bmRequestType=0x80 device-to-host/standard/device,
+    /// bRequest=6, wValue=desc_type<<8|desc_index, wIndex=0).
+    /// Uses the shared desc_buf DMA buffer as the data stage target.
     fn getDescriptor(self: *Controller, slot: u8, desc_type: u8, desc_index: u8, length: u16) ?u16 {
         return self.controlTransfer(
             slot,
@@ -1117,21 +1422,41 @@ pub const Controller = struct {
         );
     }
 
+    /// Issue a USB SET_CONFIGURATION request (USB 2.0 §9.4.7,
+    /// bmRequestType=0x00 host-to-device/standard/device, bRequest=9,
+    /// wValue=configuration value from the Configuration Descriptor).
+    /// Advances the USB device from Addressed to Configured state.
     fn setConfiguration(self: *Controller, slot: u8, config_value: u8) bool {
         return self.controlTransfer(slot, 0x00, USB_REQ_SET_CONFIGURATION, config_value, 0, 0, 0, false) != null;
     }
 
+    /// Issue a HID SET_PROTOCOL class request (HID 1.11 §7.2.6,
+    /// bmRequestType=0x21 host-to-device/class/interface, bRequest=0x0B,
+    /// wValue=protocol: 0=Boot Protocol, 1=Report Protocol).
     fn setProtocol(self: *Controller, slot: u8, interface: u16, protocol: u16) bool {
         return self.controlTransfer(slot, 0x21, USB_REQ_SET_PROTOCOL, protocol, interface, 0, 0, false) != null;
     }
 
+    /// Issue a HID SET_IDLE class request (HID 1.11 §7.2.4,
+    /// bmRequestType=0x21 host-to-device/class/interface, bRequest=0x0A,
+    /// wValue=0 meaning infinite idle duration — device only sends reports
+    /// when the report data changes).
     fn setIdle(self: *Controller, slot: u8, interface: u16) bool {
         return self.controlTransfer(slot, 0x21, USB_REQ_SET_IDLE, 0, interface, 0, 0, false) != null;
     }
 
-    /// Read the HID report descriptor and check Usage Page + Usage to identify device type.
+    /// Read the HID Report Descriptor and parse top-level Usage Page + Usage items
+    /// to identify the device type (HID 1.11 §6.2.2 Report Descriptor).
+    ///
+    /// Issues GET_DESCRIPTOR with bmRequestType=0x81 (device-to-host, standard,
+    /// interface), descriptor type 0x22 (HID Report Descriptor). Uses the report
+    /// buffer region as scratch space (not desc_buf, which may hold other data).
+    ///
+    /// Scans the report descriptor byte stream for short items (HID §6.2.2.2):
+    ///   - Usage Page (tag=0x04): checks for Generic Desktop (0x01)
+    ///   - Usage (tag=0x08): checks for Keyboard (0x06) or Mouse (0x02)
+    ///
     /// Returns HID_PROTOCOL_KEYBOARD (1), HID_PROTOCOL_MOUSE (2), or 0 (unknown).
-    /// Uses report_buf (slot 0 region) as scratch to avoid overwriting desc_buf.
     fn identifyHidUsage(self: *Controller, slot: u8, interface: u16) u8 {
         // GET_DESCRIPTOR for HID Report Descriptor (class-specific, from interface)
         // bmRequestType=0x81 (device-to-host, standard, interface)
@@ -1192,6 +1517,26 @@ pub const Controller = struct {
 
     // ── Endpoint Configuration ──────────────────────────────────
 
+    /// Issue a Configure Endpoint Command (TRB type 12, xHCI §6.4.3.5, §4.6.6)
+    /// to add an interrupt endpoint for HID report polling.
+    ///
+    /// Computes the Device Context Index (DCI) from the USB endpoint address per
+    /// §4.5.1: DCI = Endpoint Number × 2 + Direction (0=OUT, 1=IN).
+    ///
+    /// Fills the Input Context (§6.2.5):
+    ///   - Input Control Context (§6.2.5.1): A0=1 (Slot), A[DCI]=1 (target EP)
+    ///   - Slot Context (§6.2.2): copies current Output Slot Context fields,
+    ///     updates Context Entries (field0[31:27]) to max DCI — "the index of the
+    ///     last valid Endpoint Context" (§6.2.2)
+    ///   - Endpoint Context (§6.2.3, §4.8.2.4):
+    ///     * Interval (field0[23:16]): for FS/LS, converted from bInterval (ms)
+    ///       to xHCI 2^(Interval-1) × 125µs format (§6.2.3.6). For HS/SS,
+    ///       bInterval is already in the correct format.
+    ///     * EP Type (field1[5:3]): Interrupt IN (7) or Interrupt OUT (3)
+    ///     * CErr (field1[2:1]) = 3 — retry up to 3 times on error (§4.10.2.7)
+    ///     * Max Packet Size (field1[31:16])
+    ///     * TR Dequeue Pointer with DCS=1 (bit[0])
+    ///     * Average TRB Length (field2[15:0]) = 8
     fn configureEndpoint(self: *Controller, slot: u8, ep_addr: u8, max_packet: u16, interval: u8, speed: u32) bool {
         const ep_num = ep_addr & 0x0F;
         const ep_dir_in = (ep_addr & 0x80) != 0;
@@ -1241,6 +1586,45 @@ pub const Controller = struct {
 
     // ── Port Enumeration ────────────────────────────────────────
 
+    /// Enumerate a single root hub port following xHCI §4.3 USB Device
+    /// Initialization. This implements the full sequence:
+    ///
+    ///  1. Read PORTSC and check CCS bit[0] (Current Connect Status, §5.4.8).
+    ///     If no device is attached, return early.
+    ///
+    ///  2. Reset the port by writing PR bit[4] = 1 (§4.3.1). Wait for PRC
+    ///     bit[21] (Port Reset Change) to indicate reset completion. Even if
+    ///     the BIOS left the port configured, we reset for a clean state.
+    ///
+    ///  3. Clear all W1C status change bits (CSC, PEC, WRC, OCC, PRC, PLC, CEC)
+    ///     in PORTSC (§5.4.8) so stale events don't confuse later processing.
+    ///
+    ///  4. Wait 50ms for USB 2.0 TRSTRCY (reset recovery, USB 2.0 §7.1.7.3).
+    ///
+    ///  5. Verify PED bit[1] (Port Enabled) is set and read speed from
+    ///     PORTSC[13:10] (§5.4.8, §4.19.9).
+    ///
+    ///  6. Enable Slot (§4.3.2) — obtains a Device Slot ID from the xHC.
+    ///
+    ///  7. Address Device with BSR=1 (§4.3.3, §4.3.4) — device enters Default
+    ///     state at USB address 0 with EP0 initialized.
+    ///
+    ///  8. GET_DESCRIPTOR for first 8 bytes of Device Descriptor to read
+    ///     bMaxPacketSize0 (USB 2.0 §9.6.1, byte offset 7). This is the minimum
+    ///     safe read because FS devices may have max packet sizes as small as 8.
+    ///
+    ///  9. If bMaxPacketSize0 differs from the default, issue Evaluate Context
+    ///     (§4.6.7) to update EP0's Max Packet Size (§4.3 step 7).
+    ///
+    /// 10. Address Device with BSR=0 (§4.3.4) — assigns a real USB address.
+    ///
+    /// 11. Read full Device Descriptor (18 bytes), Configuration Descriptor
+    ///     header (9 bytes) to get wTotalLength and bConfigurationValue, then
+    ///     full Configuration Descriptor. Issue SET_CONFIGURATION (§4.3 step 10,
+    ///     §4.5.4.2).
+    ///
+    /// 12. Parse the Configuration Descriptor for HID interfaces and configure
+    ///     interrupt IN endpoints (via parseConfigDescriptor).
     fn enumeratePort(self: *Controller, port: u32) void {
         var portsc = self.readPortsc(port);
         if (port < MAX_PORTS_TRACKED) {
@@ -1366,6 +1750,24 @@ pub const Controller = struct {
         }
     }
 
+    /// Walk a USB Configuration Descriptor and its subordinate descriptors to
+    /// find HID interfaces with interrupt IN endpoints.
+    ///
+    /// The Configuration Descriptor (USB 2.0 §9.6.3, type 2) is followed by a
+    /// chain of Interface Descriptors (type 4, §9.6.5), class-specific descriptors,
+    /// and Endpoint Descriptors (type 5, §9.6.6), all concatenated in order.
+    ///
+    /// For each Interface Descriptor with bInterfaceClass = 3 (HID):
+    ///   1. Issues SET_IDLE (HID §7.2.4) to reduce unnecessary reports.
+    ///   2. Reads the HID Descriptor (type 0x21, HID §6.2.1) to get the report
+    ///      descriptor length from bytes 7-8 (wDescriptorLength).
+    ///   3. Fetches the full HID Report Descriptor (type 0x22) and parses it
+    ///      via hid.parse() to identify device type and report field layout.
+    ///   4. For each Endpoint Descriptor with interrupt IN attributes
+    ///      (bmAttributes[1:0]=0x03, bEndpointAddress[7]=1):
+    ///      - Calls configureEndpoint (xHCI §4.6.6) to set up the endpoint
+    ///      - Registers the HID device with its protocol, slot, and DCI
+    ///      - Queues the first interrupt IN transfer and rings the doorbell
     fn parseConfigDescriptor(self: *Controller, slot: u8, total_len: u16, speed: u32) void {
         const buf: [*]const u8 = @ptrFromInt(self.desc_buf_virt);
         var offset: u16 = 0;
@@ -1478,6 +1880,8 @@ pub const Controller = struct {
 
 // ── Utility ─────────────────────────────────────────────────────
 
+/// Write a u32 value as decimal ASCII text to the debug output via syscall.write.
+/// Used for diagnostic messages during USB initialization.
 fn writeU32(val: u32) void {
     var buf: [10]u8 = undefined;
     var n = val;

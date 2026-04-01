@@ -922,21 +922,36 @@ pub const Controller = struct {
         return ptr.*;
     }
 
+    /// Read a 64-bit controller register via two 32-bit MMIO reads.
+    ///
+    /// Spec Section 3.1.3 notes that 64-bit register properties (CAP,
+    /// ASQ, ACQ) may be read as two 32-bit accesses for compatibility
+    /// with controllers or platforms that don't support atomic 64-bit
+    /// MMIO reads. The low dword is read first, then the high dword,
+    /// and the results are combined.
     fn readReg64(self: *const Controller, offset: u32) u64 {
-        // NVMe spec allows 64-bit properties to be read as two 32-bit reads
-        // for controllers that don't support 64-bit access.
         const lo: u64 = self.readReg32(offset);
         const hi: u64 = self.readReg32(offset + 4);
         return lo | (hi << 32);
     }
 
+    /// Write a 32-bit value to a controller register via MMIO.
+    ///
+    /// Uses volatile pointer access to ensure the write reaches hardware
+    /// immediately and is not reordered with other register accesses.
+    /// This is critical for doorbell writes (which trigger command
+    /// processing) and CC writes (which change controller state).
     fn writeReg32(self: *const Controller, offset: u32, val: u32) void {
         const ptr: *volatile u32 = @ptrFromInt(self.mmio_base + offset);
         ptr.* = val;
     }
 
+    /// Write a 64-bit value to a controller register via two 32-bit MMIO
+    /// writes. Low dword is written first, then high dword, matching the
+    /// read order in readReg64(). Used for ASQ and ACQ base address
+    /// registers (offsets 0x28 and 0x30) which hold 64-bit physical
+    /// addresses.
     fn writeReg64(self: *const Controller, offset: u32, val: u64) void {
-        // Write low dword first, then high dword
         self.writeReg32(offset, @truncate(val));
         self.writeReg32(offset + 4, @truncate(val >> 32));
     }
@@ -944,6 +959,9 @@ pub const Controller = struct {
 
 // ── Utility ─────────────────────────────────────────────────────
 
+/// Format and write a u32 value as decimal text to the debug console.
+/// Used for diagnostic output during initialization (version numbers,
+/// namespace counts, LBA sizes, error status codes, etc.).
 fn writeU32(val: u32) void {
     var buf: [10]u8 = undefined;
     var n = val;
@@ -960,6 +978,11 @@ fn writeU32(val: u32) void {
     syscall.write(buf[idx..]);
 }
 
+/// Format and write a u64 value as decimal text to the debug console.
+/// For values that fit in 32 bits, delegates to writeU32(). For larger
+/// values, splits into billions and remainder to avoid needing 64-bit
+/// division in a loop. Used for printing namespace size (NSZE) which
+/// can exceed 2^32 logical blocks on large drives.
 fn writeU64(val: u64) void {
     if (val <= 0xFFFFFFFF) {
         writeU32(@truncate(val));
