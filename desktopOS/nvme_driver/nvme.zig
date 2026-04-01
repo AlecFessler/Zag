@@ -30,8 +30,9 @@ const DMA_ADMIN_CQ: u64 = 0x1000; // Admin CQ: 64 entries × 16B = 1024B (page-a
 const DMA_IO_SQ: u64 = 0x2000; // I/O SQ: 64 entries × 64B = 4096B
 const DMA_IO_CQ: u64 = 0x3000; // I/O CQ: 64 entries × 16B = 1024B (page-aligned)
 const DMA_IDENTIFY: u64 = 0x4000; // Identify data buffer: 4096B
-const DMA_DATA: u64 = 0x5000; // Read/write data buffer: 4096B
-const DMA_TOTAL: u64 = 0x6000;
+const DMA_DATA: u64 = 0x5000; // Read data buffer: 4096B (8 LBAs at 512B)
+const DMA_WRITE: u64 = 0x6000; // Write data buffer: 4096B
+const DMA_TOTAL: u64 = 0x7000;
 
 // ── Admin Command Opcodes (Spec Section 5, Figure 89) ─────────────
 // "Figure 89 defines the Admin commands and their associated opcodes"
@@ -41,6 +42,7 @@ const ADMIN_OPC_IDENTIFY: u8 = 0x06;
 const ADMIN_OPC_SET_FEATURES: u8 = 0x09;
 
 // ── NVM I/O Command Opcodes (NVM Command Set Spec) ────────────────
+const IO_OPC_WRITE: u8 = 0x01;
 const IO_OPC_READ: u8 = 0x02;
 
 // ── Submission Queue Entry (Spec Section 4.1.1, Figure 92) ────────
@@ -514,7 +516,7 @@ pub const Controller = struct {
     // "A read operation reads the data and may read the metadata for
     //  the set of logical blocks specified"
     //
-    fn readSectors(self: *Controller, nsid: u32, lba: u64, count: u16) bool {
+    pub fn readSectors(self: *Controller, nsid: u32, lba: u64, count: u16) bool {
         var sqe = SubmissionQueueEntry{};
         sqe.cdw0 = buildCdw0(IO_OPC_READ, self.nextCid());
         sqe.nsid = nsid;
@@ -534,6 +536,46 @@ pub const Controller = struct {
             return false;
         }
         return true;
+    }
+
+    // ── NVM Write Command (NVM Command Set Spec, Write command) ───
+    //
+    // Opcode: 01h
+    // NSID: namespace identifier
+    // PRP1: physical address of data buffer
+    // CDW10: Starting LBA [31:0] (lower 32 bits)
+    // CDW11: Starting LBA [63:32] (upper 32 bits)
+    // CDW12[15:0]: NLB - "number of logical blocks... 0's based value"
+    //
+    pub fn writeSectors(self: *Controller, nsid: u32, lba: u64, count: u16) bool {
+        var sqe = SubmissionQueueEntry{};
+        sqe.cdw0 = buildCdw0(IO_OPC_WRITE, self.nextCid());
+        sqe.nsid = nsid;
+        const buf_phys = self.dma_phys + DMA_WRITE;
+        sqe.prp1_lo = @truncate(buf_phys);
+        sqe.prp1_hi = @truncate(buf_phys >> 32);
+        sqe.cdw10 = @truncate(lba);
+        sqe.cdw11 = @truncate(lba >> 32);
+        sqe.cdw12 = count - 1;
+
+        self.submitIo(sqe);
+        const status = self.pollIoCompletion();
+        if (status != 0) {
+            syscall.write("nvme: write failed status=");
+            writeU32(status);
+            syscall.write("\n");
+            return false;
+        }
+        return true;
+    }
+
+    // ── Data buffer accessors ─────────────────────────────────────
+    pub fn getReadBuf(self: *const Controller) [*]u8 {
+        return @ptrFromInt(self.dma_virt + DMA_DATA);
+    }
+
+    pub fn getWriteBuf(self: *const Controller) [*]u8 {
+        return @ptrFromInt(self.dma_virt + DMA_WRITE);
     }
 
     // ── Doorbell Calculation (Spec Section 3.1.3, Figure 33-34) ───

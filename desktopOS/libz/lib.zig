@@ -1,5 +1,6 @@
 pub const channel = @import("ipc/channel.zig");
 pub const display = @import("protocols/display.zig");
+pub const filesystem = @import("protocols/filesystem.zig");
 pub const font = @import("font8x16.zig");
 pub const keyboard = @import("protocols/keyboard.zig");
 pub const mouse = @import("protocols/mouse.zig");
@@ -15,4 +16,5 @@ pub const Protocol = enum(u8) {
     usb_keyboard = 2,
     usb_mouse = 3,
     input_control = 4,
+    filesystem = 5,
 };

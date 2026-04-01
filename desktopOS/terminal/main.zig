@@ -5,8 +5,10 @@ const render = @import("render.zig");
 
 const channel = lib.channel;
 const display = lib.display;
+const filesystem = lib.filesystem;
 const keyboard = lib.keyboard;
 const syscall = lib.syscall;
+const ui_mod = lib.ui;
 
 pub fn main(perm_view_addr: u64) void {
     _ = perm_view_addr;
@@ -43,6 +45,21 @@ pub fn main(perm_view_addr: u64) void {
     };
     syscall.write("terminal: keyboard channel connected to usb_driver\n");
 
+    // Request filesystem channel to nvme_driver
+    const fs_channel_id: u64 = 399 + child_byte;
+    const fs_chan = channel.requestConnection(
+        @enumFromInt(@intFromEnum(filesystem.protocol_id)),
+        fs_channel_id,
+        0,
+        10_000_000_000,
+    ) orelse {
+        syscall.write("terminal: FAIL requestConnection filesystem timed out\n");
+        return;
+    };
+    var fs_client = filesystem.Client.init(fs_chan);
+    commands.setFsClient(&fs_client);
+    syscall.write("terminal: filesystem channel connected\n");
+
     // Receive render target info from compositor
     var retries: u32 = 0;
     while (retries < 50000) : (retries += 1) {
@@ -63,6 +80,18 @@ pub fn main(perm_view_addr: u64) void {
 
     // Allocate frame buffer and render initial frame
     render.allocFrameBuffer();
+
+    // Try to read config file for background color
+    var conf_buf: [512]u8 = undefined;
+    if (fs_client.read("/etc/terminal.conf", &conf_buf)) |resp| {
+        switch (resp) {
+            .data => |data| {
+                parseConfig(data);
+            },
+            else => {},
+        }
+    }
+
     render.appendHistory("zagOS terminal v0.1\n");
     render.renderFrame();
 
@@ -109,4 +138,46 @@ pub fn main(perm_view_addr: u64) void {
 
     // Notify compositor we're exiting
     display_client.sendExit() catch {};
+}
+
+fn parseConfig(data: []const u8) void {
+    // Parse lines looking for "bg=RRGGBB"
+    var pos: usize = 0;
+    while (pos < data.len) {
+        // Find line end
+        var end = pos;
+        while (end < data.len and data[end] != '\n') {
+            end += 1;
+        }
+        const line = data[pos..end];
+
+        if (line.len >= 9 and line[0] == 'b' and line[1] == 'g' and line[2] == '=') {
+            // Parse 6 hex digits
+            const hex = line[3..];
+            if (hex.len >= 6) {
+                const r = parseHexByte(hex[0], hex[1]);
+                const g = parseHexByte(hex[2], hex[3]);
+                const b = parseHexByte(hex[4], hex[5]);
+                if (r != null and g != null and b != null) {
+                    render.setBgColor(r.?, g.?, b.?);
+                    syscall.write("terminal: config bg color applied\n");
+                }
+            }
+        }
+
+        pos = end + 1;
+    }
+}
+
+fn parseHexByte(hi: u8, lo: u8) ?u8 {
+    const h = hexDigit(hi) orelse return null;
+    const l = hexDigit(lo) orelse return null;
+    return (@as(u8, h) << 4) | l;
+}
+
+fn hexDigit(c: u8) ?u4 {
+    if (c >= '0' and c <= '9') return @truncate(c - '0');
+    if (c >= 'a' and c <= 'f') return @truncate(c - 'a' + 10);
+    if (c >= 'A' and c <= 'F') return @truncate(c - 'A' + 10);
+    return null;
 }

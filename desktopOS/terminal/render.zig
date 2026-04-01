@@ -23,6 +23,13 @@ var input_len: u16 = 0;
 var render_buf: [RENDER_SIZE]u8 = undefined;
 var render_len: u16 = 0;
 
+// ── Configurable colors ─────────────────────────────────────────────
+pub var bg_color: Color = Color{ .r = 0x1a, .g = 0x1a, .b = 0x2e };
+
+pub fn setBgColor(r: u8, g: u8, b: u8) void {
+    bg_color = Color{ .r = r, .g = g, .b = b };
+}
+
 // ── Display state ────────────────────────────────────────────────────
 pub var frame_pixels: [*]u32 = undefined;
 pub var frame_bytes: [*]u8 = undefined;
@@ -120,7 +127,7 @@ pub fn renderFrame() void {
 
     const root = ui.createBox(.{
         .flex_direction = .column,
-        .background = Color{ .r = 0x1a, .g = 0x1a, .b = 0x2e },
+        .background = bg_color,
     });
     ui.setRoot(root);
 
