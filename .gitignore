@@ -11,3 +11,4 @@ iso/boot/kernel.elf
 __pycache__/
 *.pyc
 qemu.log
+*.img
