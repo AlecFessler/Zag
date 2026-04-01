@@ -1,4 +1,3 @@
-const dbg = @import("debug_display.zig");
 const hid = @import("hid.zig");
 const lib = @import("lib");
 
@@ -253,25 +252,6 @@ const EVENT_RING_SIZE = 64;
 const TRANSFER_RING_SIZE = 64;
 const MAX_SLOTS = 16;
 const MAX_HID_DEVICES = 4;
-
-// ── USB Vendor ID lookup ───────────────────────────────────────
-
-const VidEntry = struct { vid: u16, name: []const u8 };
-const known_vendors = [_]VidEntry{
-    .{ .vid = 0x0b05, .name = "ASUS" },
-    .{ .vid = 0x1022, .name = "AMD" },
-    .{ .vid = 0x13d3, .name = "IMC Networks" },
-    .{ .vid = 0x1532, .name = "Razer" },
-    .{ .vid = 0x1b1c, .name = "Corsair" },
-    .{ .vid = 0x320f, .name = "Glorious" },
-};
-
-fn lookupVendor(vid: u16) []const u8 {
-    for (known_vendors) |entry| {
-        if (entry.vid == vid) return entry.name;
-    }
-    return "unknown";
-}
 
 // ── Public types ────────────────────────────────────────────────
 
@@ -784,22 +764,6 @@ pub const Controller = struct {
                 }
                 const ctlsts: *volatile u32 = @ptrFromInt(cap_addr + 4);
                 ctlsts.* = 0xE0000000;
-            } else if (cap_id == 2) {
-                // Supported Protocol capability — log port ranges
-                const dword1: *volatile u32 = @ptrFromInt(cap_addr + 4);
-                const dword2: *volatile u32 = @ptrFromInt(cap_addr + 8);
-                const rev_major: u8 = @truncate(cap_val >> 24);
-                const name = dword1.*;
-                _ = name;
-                const port_offset: u8 = @truncate(dword2.*);
-                const port_count: u8 = @truncate(dword2.* >> 8);
-                dbg.log("  proto USB");
-                dbg.logU32(rev_major);
-                dbg.log(" ports ");
-                dbg.logU32(port_offset);
-                dbg.log("-");
-                dbg.logU32(@as(u32, port_offset) + port_count - 1);
-                dbg.log("\n");
             }
 
             // Next capability: bits [15:8] = next pointer (DWORD offset)
@@ -1072,10 +1036,6 @@ pub const Controller = struct {
         const cc = evt.completionCode();
         self.advanceEventRing();
         if (cc != .success) {
-            dbg.log("  addr dev failed cc=");
-            dbg.logU32(@intFromEnum(cc));
-            dbg.log(if (bsr) " bsr=1" else " bsr=0");
-            dbg.log("\n");
             return false;
         }
         return true;
@@ -1341,13 +1301,6 @@ pub const Controller = struct {
         const initial_len = self.getDescriptor(slot, USB_DESC_DEVICE, 0, 8) orelse {
             if (port < MAX_PORTS_TRACKED) {
                 self.port_status[port] = if (self.diag_last_cc == 0) .desc_timeout else .desc_error;
-                dbg.log("  desc fail p");
-                dbg.logU32(port);
-                dbg.log(" cc=");
-                dbg.logU32(self.diag_last_cc);
-                dbg.log(" spd=");
-                dbg.logU32(speed);
-                dbg.log(" (bsr)\n");
             }
             return;
         };
@@ -1379,20 +1332,6 @@ pub const Controller = struct {
         if (dev_desc_len < 18) {
             if (port < MAX_PORTS_TRACKED) self.port_status[port] = .desc_short;
             return;
-        }
-
-        // Log VID:PID from device descriptor
-        {
-            const dd: [*]const u8 = @ptrFromInt(self.desc_buf_virt);
-            const vid = @as(u16, dd[8]) | (@as(u16, dd[9]) << 8);
-            const pid = @as(u16, dd[10]) | (@as(u16, dd[11]) << 8);
-            dbg.log("  dev: ");
-            dbg.log(lookupVendor(vid));
-            dbg.log(" (");
-            dbg.logHex(vid);
-            dbg.log(":");
-            dbg.logHex(pid);
-            dbg.log(")\n");
         }
 
         // Get configuration descriptor header
@@ -1478,16 +1417,8 @@ pub const Controller = struct {
 
                 if (rd_len >= 4) {
                     current_report_info = hid.parse(scratch_virt, rd_len);
-                    dbg.log("  iface ");
-                    dbg.logU32(current_interface);
-                    dbg.log(" rdlen=");
-                    dbg.logU32(rd_len);
-                    hid.logInfo(&current_report_info);
                 } else {
                     found_hid = false;
-                    dbg.log("  iface ");
-                    dbg.logU32(current_interface);
-                    dbg.log(" rd_fail\n");
                 }
             } else if (desc_type == USB_DESC_ENDPOINT and desc_len >= 7) {
                 const ep_addr = buf[offset + 2];
@@ -1542,7 +1473,6 @@ pub const Controller = struct {
 
             offset += desc_len;
         }
-        dbg.flush();
     }
 };
 

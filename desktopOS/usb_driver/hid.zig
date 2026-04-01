@@ -3,8 +3,6 @@
 /// Parses USB HID report descriptors to determine device type and report layout.
 /// Used to interpret reports in Report Protocol (not boot protocol).
 
-const dbg = @import("debug_display.zig");
-
 pub const DeviceType = enum(u8) {
     unknown = 0,
     keyboard = 1,
@@ -218,45 +216,3 @@ pub fn extractI(report: [*]const u8, bit_offset: u16, bit_size: u8) i32 {
     return @bitCast(raw);
 }
 
-/// Log parsed report info for debugging.
-pub fn logInfo(info: *const ReportInfo) void {
-    dbg.log("    type=");
-    dbg.log(switch (info.device_type) {
-        .keyboard => "kbd",
-        .mouse => "mouse",
-        .unknown => "?",
-    });
-    if (info.report_id > 0) {
-        dbg.log(" rid=");
-        dbg.logU32(info.report_id);
-    }
-    dbg.log(" bits=");
-    dbg.logU32(info.total_bits);
-    if (info.device_type == .keyboard) {
-        dbg.log(" mod@");
-        dbg.logU32(info.modifiers.bit_offset);
-        dbg.log("x");
-        dbg.logU32(info.modifiers.count);
-        dbg.log(" keys@");
-        dbg.logU32(info.keys.bit_offset);
-        dbg.log("x");
-        dbg.logU32(info.keys.count);
-        dbg.log("/");
-        dbg.logU32(info.keys.bit_size);
-    }
-    if (info.device_type == .mouse) {
-        dbg.log(" btn@");
-        dbg.logU32(info.buttons.bit_offset);
-        dbg.log("x");
-        dbg.logU32(info.buttons.count);
-        dbg.log(" x@");
-        dbg.logU32(info.x.bit_offset);
-        dbg.log("/");
-        dbg.logU32(info.x.bit_size);
-        dbg.log(" y@");
-        dbg.logU32(info.y.bit_offset);
-        dbg.log("/");
-        dbg.logU32(info.y.bit_size);
-    }
-    dbg.log("\n");
-}

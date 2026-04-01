@@ -1,4 +1,3 @@
-const dbg = @import("debug_display.zig");
 const hid = @import("hid.zig");
 const lib = @import("lib");
 const xhci = @import("xhci.zig");
@@ -25,17 +24,6 @@ pub fn processReport(dev: *xhci.HidDevice, report: [*]const u8, chan: ?*channel.
         while (k < count) : (k += 1) {
             keys[k] = @truncate(hid.extractU(data, info.keys.bit_offset + @as(u16, k) * @as(u16, info.keys.bit_size), info.keys.bit_size));
         }
-    }
-
-    // Log non-empty reports
-    if (modifiers != 0 or keys[0] != 0) {
-        dbg.log("k: m=");
-        dbg.logHex(modifiers);
-        for (keys) |key| {
-            dbg.log(" ");
-            dbg.logHex(key);
-        }
-        dbg.log("\n");
     }
 
     // Check modifier changes
