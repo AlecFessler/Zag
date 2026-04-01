@@ -45,20 +45,21 @@ pub fn main(perm_view_addr: u64) void {
     };
     syscall.write("terminal: keyboard channel connected to usb_driver\n");
 
-    // Request filesystem channel to nvme_driver
-    const fs_channel_id: u64 = 399 + child_byte;
-    const fs_chan = channel.requestConnection(
-        @enumFromInt(@intFromEnum(filesystem.protocol_id)),
-        fs_channel_id,
-        0,
-        10_000_000_000,
-    ) orelse {
-        syscall.write("terminal: FAIL requestConnection filesystem timed out\n");
-        return;
-    };
-    var fs_client = filesystem.Client.init(fs_chan);
-    commands.setFsClient(&fs_client);
-    syscall.write("terminal: filesystem channel connected\n");
+    // // Request filesystem channel to nvme_driver
+    // const fs_channel_id: u64 = 399 + child_byte;
+    // var fs_client_storage: filesystem.Client = undefined;
+    // if (channel.requestConnection(
+    //     @enumFromInt(@intFromEnum(filesystem.protocol_id)),
+    //     fs_channel_id,
+    //     0,
+    //     10_000_000_000,
+    // )) |fs_chan| {
+    //     fs_client_storage = filesystem.Client.init(fs_chan);
+    //     commands.setFsClient(&fs_client_storage);
+    //     syscall.write("terminal: filesystem channel connected\n");
+    // } else {
+    //     syscall.write("terminal: filesystem unavailable, continuing without fs\n");
+    // }
 
     // Receive render target info from compositor
     var retries: u32 = 0;
@@ -81,16 +82,18 @@ pub fn main(perm_view_addr: u64) void {
     // Allocate frame buffer and render initial frame
     render.allocFrameBuffer();
 
-    // Try to read config file for background color
-    var conf_buf: [512]u8 = undefined;
-    if (fs_client.read("/etc/terminal.conf", &conf_buf)) |resp| {
-        switch (resp) {
-            .data => |data| {
-                parseConfig(data);
-            },
-            else => {},
-        }
-    }
+    // // Try to read config file for background color
+    // if (commands.fs_client) |fc| {
+    //     var conf_buf: [512]u8 = undefined;
+    //     if (fc.read("/etc/terminal.conf", &conf_buf)) |resp| {
+    //         switch (resp) {
+    //             .data => |data| {
+    //                 parseConfig(data);
+    //             },
+    //             else => {},
+    //         }
+    //     }
+    // }
 
     render.appendHistory("zagOS terminal v0.1\n");
     render.renderFrame();
