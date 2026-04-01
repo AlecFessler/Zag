@@ -1,0 +1,69 @@
+#1: findNeighbors(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 5881210131331364753 ) = 0
+#2: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 15021278609987233951 ) = error.NotFound
+#3: contains(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 14637574242682825331 ) = false
+#4: contains(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 2312344417745909078 ) = false
+#5: contains(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 3831705504650218695 ) = false
+#6: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 5881210131331364753 ) = error.NotFound
+#7: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 18149643915985481100 ) = error.NotFound
+#8: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 12933668939759105464 ) = error.NotFound
+#9: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 14637574242682825331 ) = error.NotFound
+#10: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 7435390023275438269 )
+#11: contains(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 3925656069808229166 ) = false
+#12: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 10637074315653535228 )
+#13: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 2982902689111255716 )
+#14: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 10637074315653535228 ) = 10637074315653535228
+#15: contains(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 9693691992080689692 ) = false
+#16: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 7435390023275438269 ) = 7435390023275438269
+#17: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 7860803162265517708 )
+#18: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 7860803162265517708 ) = 7860803162265517708
+#19: findNeighbors(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 16082950443159596267 ) = 2982902689111255716
+#20: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 11752218394177209120 )
+#21: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 2982902689111255716 ) = 2982902689111255716
+#22: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 18155818430975299096 )
+#23: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 18155818430975299096 ) = 18155818430975299096
+#24: findNeighbors(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 7494982184730312787 ) = 0
+#25: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 11752218394177209120 ) = 11752218394177209120
+#26: contains(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 15740397740720822077 ) = false
+#27: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 8620501356544741343 )
+#28: contains(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 879987454908009879 ) = false
+#29: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 11880187017084977320 )
+#30: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 11880187017084977320 ) = 11880187017084977320
+#31: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 8620501356544741343 ) = 8620501356544741343
+#32: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 13721728628974436119 )
+#33: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 8360343936123383675 )
+#34: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 13721728628974436119 ) = 13721728628974436119
+#35: contains(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 3244153277377354374 ) = false
+#36: findNeighbors(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 3384379379345988038 ) = 0
+#37: findNeighbors(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 1114590012034452875 ) = 0
+#38: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 8360343936123383675 ) = 8360343936123383675
+#39: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 10071993084810367336 ) = error.NotFound
+#40: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 3925656069808229166 ) = error.NotFound
+#41: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 928397841245673342 ) = error.NotFound
+#42: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 10637074315653535228 ) = error.NotFound
+#43: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 8612232180506566011 ) = error.NotFound
+#44: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 2982902689111255716 ) = error.NotFound
+#45: findNeighbors(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 4782554165154246669 ) = 0
+#46: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 1285408594027663245 )
+#47: contains(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 15904479769003846634 ) = false
+#48: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 3147692337647000727 )
+#49: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 608196513219568798 )
+#50: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 18228755284713029100 )
+#51: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 18228755284713029100 ) = 18228755284713029100
+#52: contains(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 7197030673223459168 ) = false
+#53: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 5020492609352454581 )
+#54: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 7078619098779856993 )
+#55: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 6445056489526351351 )
+#56: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 5020492609352454581 ) = 5020492609352454581
+#57: contains(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 16614386823638528991 ) = false
+#58: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 13800829335493134691 )
+#59: contains(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 15302276699435844449 ) = false
+#60: contains(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 2123801776687569951 ) = false
+#61: findNeighbors(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 4594231116901011764 ) = 3147692337647000727
+#62: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 12872200202381000141 )
+#63: remove(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 6445056489526351351 ) = 6445056489526351351
+#64: insert(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 4141004032416272823 )
+#65: contains(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 4307927522169068600 ) = false
+#66: findNeighbors(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 18152111349252975930 ) = 13800829335493134691
+#67: contains(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 7938376948874077639 ) = false
+#68: findNeighbors(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 12267807325393598100 ) = 7078619098779856993
+#69: findNeighbors(red_black_tree.RedBlackTree(u64,(function 'cmpU64'),false)@7ffeb5f64330, 11328877142493511192 ) = 7078619098779856993
