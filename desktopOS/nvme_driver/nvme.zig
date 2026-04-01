@@ -116,13 +116,26 @@ pub const Controller = struct {
     ns_size: u64 = 0,
     lba_size: u32 = 0,
 
-    // ── MMIO and DMA Setup ────────────────────────────────────────
-    //
-    // Follows the same pattern as xhci.zig initFromHandle:
-    // 1. Map device BAR0 as MMIO
-    // 2. Allocate DMA-capable shared memory for queues and data buffers
-    // 3. Initialize the NVMe controller
-    //
+    /// Initialize the NVMe controller from a device handle by mapping MMIO and
+    /// allocating DMA memory, then running the full controller init sequence.
+    ///
+    /// Per the NVMe over PCIe Transport Spec, the controller's registers are
+    /// exposed via PCI BAR0 as a memory-mapped I/O region. This function maps
+    /// that BAR0 region with MMIO permissions so register reads/writes go
+    /// directly to hardware.
+    ///
+    /// DMA memory is allocated as a single physically-contiguous shared memory
+    /// region, subdivided into page-aligned sub-regions for queues and data
+    /// buffers (see DMA_ADMIN_SQ through DMA_WRITE constants). The spec
+    /// requires queue base addresses to be page-aligned:
+    ///   - Spec Section 3.1.3.6 (ASQ): "This address shall be memory page aligned"
+    ///   - Spec Section 3.1.3.7 (ACQ): "This address shall be memory page aligned"
+    ///
+    /// After mapping, the entire DMA region is zeroed — this is critical because
+    /// the controller interprets completion queue phase bits as '0' on creation
+    /// (Spec Section 4.2.4), and the host expects to see phase=1 for new entries.
+    /// If the memory contained stale data with phase=1 set, the host would
+    /// incorrectly interpret old entries as new completions.
     pub fn initFromHandle(self: *Controller, device_handle: u64, mmio_size: u32) InitError {
         // Map MMIO region
         const aligned_mmio: u64 = (((@as(u64, mmio_size) + syscall.PAGE4K - 1) / syscall.PAGE4K) * syscall.PAGE4K);
@@ -163,22 +176,34 @@ pub const Controller = struct {
         return .none;
     }
 
-    // ── Controller Initialization (Spec Section 3.5.1) ────────────
-    //
-    // "The host should perform the following sequence of actions to
-    //  initialize the controller to begin executing commands:
-    //  1. Wait for CSTS.RDY to become '0'
-    //  2. Configure AQA, ASQ, and ACQ
-    //  3. Determine supported I/O Command Sets via CAP.CSS and set CC.CSS
-    //  4. Configure CC settings (AMS, MPS)
-    //  5. Set CC.EN to '1'
-    //  6. Wait for CSTS.RDY to become '1'
-    //  7. Issue Identify Controller
-    //  8. ...
-    //  9. Set Features: Number of Queues
-    //  10. Create I/O Completion Queues
-    //  11. Create I/O Submission Queues"
-    //
+    /// Execute the full NVMe controller initialization sequence per Spec
+    /// Section 3.5.1: "The host should perform the following sequence of
+    /// actions to initialize the controller to begin executing commands."
+    ///
+    /// The sequence implemented here follows the spec steps:
+    ///   1. Read CAP register (Spec 3.1.3.1) to discover hardware limits:
+    ///      MQES (max queue entries), TO (timeout), DSTRD (doorbell stride),
+    ///      MPSMIN (minimum page size).
+    ///   2. Disable controller (clear CC.EN) and wait for CSTS.RDY=0
+    ///      (Spec 3.1.3.5: "When the host modifies CC to clear this bit
+    ///      from '1' to '0', the controller is reset").
+    ///   3. Configure Admin Queue Attributes (AQA, Spec 3.1.3.4) and base
+    ///      addresses (ASQ at offset 0x28, ACQ at offset 0x30).
+    ///   4. Configure CC register (Spec 3.1.3.5): CSS=NVM Command Set,
+    ///      MPS=4KiB pages, AMS=Round Robin, IOSQES=64B, IOCQES=16B.
+    ///   5. Set CC.EN=1 and wait for CSTS.RDY=1 within CAP.TO timeout.
+    ///   6. Issue Identify Controller (Spec 5.1.13, CNS=01h) to learn
+    ///      the number of namespaces (NN).
+    ///   7. Issue Identify Namespace (Spec 5.1.13, CNS=00h) for NSID 1
+    ///      to learn LBA size and namespace capacity.
+    ///   8. Set Features: Number of Queues (Spec 5.1.25.2.1, FID=07h)
+    ///      to request the desired number of I/O queue pairs.
+    ///   9. Create I/O Completion Queue (Spec 5.2.1, opcode 05h).
+    ///  10. Create I/O Submission Queue (Spec 5.2.2, opcode 01h).
+    ///  11. Perform a test read of LBA 0 to verify the data path works.
+    ///
+    /// Returns false if any step fails, with diagnostic output written
+    /// to the serial console.
     fn initController(self: *Controller) bool {
         // Read capabilities
         // Spec Section 3.1.3.1 (CAP): "This property indicates basic capabilities"
@@ -312,15 +337,22 @@ pub const Controller = struct {
         return true;
     }
 
-    // ── Identify Controller (Spec Section 5.1.13, CNS 01h) ───────
-    //
-    // "The Identify Controller data structure is returned to the host
-    //  for the controller processing the command."
-    //
-    // CDW10.CNS = 01h: "Identify Controller data structure" (Figure 311)
-    // Returns 4096 bytes with controller info including:
-    //   Bytes 519:516 - NN: "maximum value of a valid NSID" (Figure 313)
-    //
+    /// Issue the Identify Controller admin command (Spec Section 5.1.13).
+    ///
+    /// Opcode 06h with CDW10.CNS = 01h requests the "Identify Controller
+    /// data structure" (Figure 311). The controller returns 4096 bytes of
+    /// controller capabilities and configuration into the PRP1 buffer.
+    ///
+    /// This function extracts the following field from the response:
+    ///   - NN (Number of Namespaces) at bytes 519:516 (Figure 313):
+    ///     "the maximum value of a valid NSID for the NVM subsystem."
+    ///     This tells us how many namespaces exist on the device and
+    ///     bounds the NSID values we can use in subsequent commands.
+    ///
+    /// The identify data buffer is at DMA offset 0x4000 (DMA_IDENTIFY),
+    /// which is page-aligned as required by the PRP1 pointer rules
+    /// (Spec Section 4.3: PRP entries must be aligned to the memory
+    /// page size).
     fn identifyController(self: *Controller) bool {
         var sqe = SubmissionQueueEntry{};
         sqe.cdw0 = buildCdw0(ADMIN_OPC_IDENTIFY, self.nextCid());
@@ -351,19 +383,27 @@ pub const Controller = struct {
         return true;
     }
 
-    // ── Identify Namespace (Spec Section 5.1.13, CNS 00h) ────────
-    //
-    // CDW10.CNS = 00h: "Identify Namespace data structure" (Figure 311)
-    // NSID field specifies which namespace to identify.
-    //
-    // Returns 4096 bytes with namespace info including:
-    //   Bytes 7:0 - NSZE: "total size of the namespace in logical blocks"
-    //   Byte 26 - FLBAS: "LBA format currently being used"
-    //     bits [3:0] select the LBAF index
-    //   Bytes 128+4n - LBAF[n]: LBA Format descriptor
-    //     bits [19:16] = LBADS: "LBA data size... as a power of two (2^n)"
-    //     (Refer to NVM Command Set Spec for Identify Namespace fields)
-    //
+    /// Issue the Identify Namespace admin command (Spec Section 5.1.13).
+    ///
+    /// Opcode 06h with CDW10.CNS = 00h requests the "Identify Namespace
+    /// data structure" (Figure 311). The SQE.NSID field specifies which
+    /// namespace to query. The controller returns 4096 bytes into the
+    /// PRP1 buffer describing the namespace's geometry.
+    ///
+    /// Fields extracted from the response:
+    ///   - NSZE (bytes 7:0): "total size of the namespace in logical
+    ///     blocks" — gives the namespace capacity used for bounds checking.
+    ///   - FLBAS (byte 26): "indicates the LBA data size & metadata size
+    ///     combination that the namespace has been formatted with."
+    ///     Bits [3:0] select the index into the LBAF (LBA Format) array.
+    ///   - LBAF[n] (bytes 128+4*n): LBA Format descriptor where
+    ///     bits [19:16] = LBADS: "the LBA data size as a power of two
+    ///     (2^n)." For example, LBADS=9 means 512-byte sectors and
+    ///     LBADS=12 means 4096-byte sectors.
+    ///
+    /// The derived `lba_size` (2^LBADS) is stored on the controller and
+    /// used to calculate transfer sizes for read/write commands. The
+    /// `ns_size` (NSZE) tracks total capacity in logical blocks.
     fn identifyNamespace(self: *Controller, nsid: u32) bool {
         var sqe = SubmissionQueueEntry{};
         sqe.cdw0 = buildCdw0(ADMIN_OPC_IDENTIFY, self.nextCid());
@@ -414,18 +454,28 @@ pub const Controller = struct {
         return true;
     }
 
-    // ── Set Features: Number of Queues (Spec Section 5.1.25.2.1) ──
-    //
-    // "The Number of Queues feature... indicates the number of I/O
-    //  Submission Queues and I/O Completion Queues the host requests."
-    //
-    // FID = 07h (Figure 323)
-    // CDW11[15:0] = NSQR: "Number of I/O Submission Queues Requested (0's based)"
-    // CDW11[31:16] = NCQR: "Number of I/O Completion Queues Requested (0's based)"
-    //
-    // Completion DW0[15:0] = NSQA: "Number of I/O SQs Allocated (0's based)"
-    // Completion DW0[31:16] = NCQA: "Number of I/O CQs Allocated (0's based)"
-    //
+    /// Issue the Set Features admin command for Number of Queues
+    /// (Spec Section 5.1.25.2.1, Feature Identifier 07h, Figure 323).
+    ///
+    /// "The Number of Queues feature indicates the number of I/O
+    /// Submission Queues and I/O Completion Queues the host requests."
+    /// This must be issued before creating any I/O queues.
+    ///
+    /// Command fields (opcode 09h):
+    ///   - CDW10 = 0x07: FID (Feature Identifier) for Number of Queues
+    ///   - CDW11[15:0] = NSQR: "Number of I/O Submission Queues Requested
+    ///     (0's based)" — value of 0 means 1 queue requested.
+    ///   - CDW11[31:16] = NCQR: "Number of I/O Completion Queues Requested
+    ///     (0's based)" — value of 0 means 1 queue requested.
+    ///
+    /// The controller may allocate fewer queues than requested. The
+    /// completion entry DW0 reports what was actually allocated:
+    ///   - DW0[15:0] = NSQA: "Number of I/O SQs Allocated (0's based)"
+    ///   - DW0[31:16] = NCQA: "Number of I/O CQs Allocated (0's based)"
+    ///
+    /// Note: "This feature shall only be issued as part of initialization
+    /// after a reset" — issuing it after queues are already created is
+    /// undefined behavior per the spec.
     fn setNumberOfQueues(self: *Controller, nsq: u16, ncq: u16) bool {
         var sqe = SubmissionQueueEntry{};
         sqe.cdw0 = buildCdw0(ADMIN_OPC_SET_FEATURES, self.nextCid());
@@ -441,20 +491,30 @@ pub const Controller = struct {
         return true;
     }
 
-    // ── Create I/O Completion Queue (Spec Section 5.2.1) ──────────
-    //
-    // "The Create I/O Completion Queue command is used to create all I/O
-    //  Completion Queues with the exception of the Admin Completion Queue."
-    //
-    // Opcode: 05h
-    // PRP1: "64-bit base memory address pointer of the Completion Queue
-    //        that is physically contiguous" (Figure 474)
-    // CDW10[31:16] = QSIZE: "size of the CQ... 0's based value" (Figure 475)
-    // CDW10[15:0] = QID: "identifier to assign to the CQ" (Figure 475)
-    // CDW11[0] = PC: "Physically Contiguous" (Figure 476)
-    // CDW11[1] = IEN: "Interrupts Enabled"
-    // CDW11[31:16] = IV: "Interrupt Vector"
-    //
+    /// Issue the Create I/O Completion Queue admin command
+    /// (Spec Section 5.2.1, opcode 05h, Figures 474-476).
+    ///
+    /// "The Create I/O Completion Queue command is used to create all I/O
+    /// Completion Queues with the exception of the Admin Completion Queue."
+    /// The Admin CQ is configured via the ACQ register during init instead.
+    ///
+    /// Command fields:
+    ///   - PRP1: "64-bit base memory address pointer of the Completion Queue
+    ///     that is physically contiguous" (Figure 474). Must be page-aligned.
+    ///   - CDW10[15:0] = QID: "identifier to assign to the Completion Queue"
+    ///     (Figure 475). Valid QIDs start at 1; QID 0 is the admin queue.
+    ///   - CDW10[31:16] = QSIZE: "the size of the Completion Queue to be
+    ///     created... This is a 0's based value" (Figure 475).
+    ///   - CDW11[0] = PC: "If set to '1', then the Completion Queue is
+    ///     physically contiguous" (Figure 476). We always set this since
+    ///     our DMA region is a single contiguous allocation.
+    ///   - CDW11[1] = IEN: "If set to '1', then interrupts are enabled for
+    ///     this Completion Queue" (Figure 476).
+    ///   - CDW11[31:16] = IV: "Interrupt Vector to use for this Completion
+    ///     Queue" (Figure 476). Set to 0 to use MSI-X vector 0.
+    ///
+    /// The CQ must be created before its associated SQ, since the Create
+    /// I/O SQ command references the CQ by its QID (Spec Section 5.2.2).
     fn createIoCq(self: *Controller, qid: u16, size: u16, phys_addr: u64) bool {
         var sqe = SubmissionQueueEntry{};
         sqe.cdw0 = buildCdw0(ADMIN_OPC_CREATE_IO_CQ, self.nextCid());
@@ -474,19 +534,28 @@ pub const Controller = struct {
         return true;
     }
 
-    // ── Create I/O Submission Queue (Spec Section 5.2.2) ──────────
-    //
-    // "The Create I/O Submission Queue command is used to create I/O
-    //  Submission Queues."
-    //
-    // Opcode: 01h
-    // PRP1: "64-bit base memory address pointer of the Submission Queue
-    //        that is physically contiguous" (Figure 478)
-    // CDW10[31:16] = QSIZE: "size of the SQ... 0's based value" (Figure 479)
-    // CDW10[15:0] = QID: "identifier to assign to the SQ" (Figure 479)
-    // CDW11[31:16] = CQID: "identifier of the I/O CQ to utilize" (Figure 480)
-    // CDW11[0] = PC: "Physically Contiguous"
-    //
+    /// Issue the Create I/O Submission Queue admin command
+    /// (Spec Section 5.2.2, opcode 01h, Figures 478-480).
+    ///
+    /// "The Create I/O Submission Queue command is used to create I/O
+    /// Submission Queues." Each SQ must be associated with an existing CQ
+    /// that will receive its completion entries.
+    ///
+    /// Command fields:
+    ///   - PRP1: "64-bit base memory address pointer of the Submission Queue
+    ///     that is physically contiguous" (Figure 478). Must be page-aligned.
+    ///   - CDW10[15:0] = QID: "identifier to assign to the Submission Queue"
+    ///     (Figure 479). Valid QIDs start at 1; QID 0 is the admin queue.
+    ///   - CDW10[31:16] = QSIZE: "the size of the Submission Queue to be
+    ///     created... This is a 0's based value" (Figure 479). Must not
+    ///     exceed CAP.MQES.
+    ///   - CDW11[15:0] = PC: "If set to '1', then the Submission Queue is
+    ///     physically contiguous" (Figure 480). Set since our DMA region
+    ///     is a single contiguous allocation.
+    ///   - CDW11[31:16] = CQID: "the identifier of the Completion Queue to
+    ///     utilize for any command completions entries associated with this
+    ///     Submission Queue" (Figure 480). The referenced CQ must already
+    ///     exist (created via createIoCq).
     fn createIoSq(self: *Controller, qid: u16, size: u16, cqid: u16, phys_addr: u64) bool {
         var sqe = SubmissionQueueEntry{};
         sqe.cdw0 = buildCdw0(ADMIN_OPC_CREATE_IO_SQ, self.nextCid());
@@ -504,18 +573,27 @@ pub const Controller = struct {
         return true;
     }
 
-    // ── NVM Read Command (NVM Command Set Spec, Read command) ─────
-    //
-    // Opcode: 02h
-    // NSID: namespace identifier
-    // PRP1: physical address of data buffer
-    // CDW10: Starting LBA [31:0] (lower 32 bits)
-    // CDW11: Starting LBA [63:32] (upper 32 bits)
-    // CDW12[15:0]: NLB - "number of logical blocks... 0's based value"
-    //
-    // "A read operation reads the data and may read the metadata for
-    //  the set of logical blocks specified"
-    //
+    /// Issue an NVM Read command on the I/O submission queue
+    /// (NVM Command Set Spec, Read command, opcode 02h).
+    ///
+    /// "The Read command is used to read data and optionally metadata from
+    /// the NVM for the set of logical blocks specified."
+    ///
+    /// Command fields:
+    ///   - NSID: identifies which namespace to read from.
+    ///   - PRP1: physical address of the destination data buffer (Spec
+    ///     Section 4.3). For transfers that fit within a single memory page
+    ///     (4KiB), only PRP1 is needed. For larger transfers, PRP2 would
+    ///     point to a second page or a PRP List — not currently used here
+    ///     since reads are bounded to DMA_DATA's single 4KiB page.
+    ///   - CDW10: Starting LBA [31:0] (lower 32 bits of the 64-bit LBA).
+    ///   - CDW11: Starting LBA [63:32] (upper 32 bits of the 64-bit LBA).
+    ///   - CDW12[15:0] = NLB: "the number of logical blocks to be read.
+    ///     This is a 0's based value." A value of 0 reads 1 block.
+    ///
+    /// The read data lands in the DMA read buffer (DMA_DATA at offset
+    /// 0x5000), accessible via getReadBuf(). The caller is responsible
+    /// for ensuring count * lba_size does not exceed the buffer size.
     pub fn readSectors(self: *Controller, nsid: u32, lba: u64, count: u16) bool {
         var sqe = SubmissionQueueEntry{};
         sqe.cdw0 = buildCdw0(IO_OPC_READ, self.nextCid());
@@ -538,15 +616,26 @@ pub const Controller = struct {
         return true;
     }
 
-    // ── NVM Write Command (NVM Command Set Spec, Write command) ───
-    //
-    // Opcode: 01h
-    // NSID: namespace identifier
-    // PRP1: physical address of data buffer
-    // CDW10: Starting LBA [31:0] (lower 32 bits)
-    // CDW11: Starting LBA [63:32] (upper 32 bits)
-    // CDW12[15:0]: NLB - "number of logical blocks... 0's based value"
-    //
+    /// Issue an NVM Write command on the I/O submission queue
+    /// (NVM Command Set Spec, Write command, opcode 01h).
+    ///
+    /// "The Write command is used to write data and optionally metadata
+    /// to the NVM for the set of logical blocks specified."
+    ///
+    /// Command fields follow the same layout as the Read command:
+    ///   - NSID: identifies which namespace to write to.
+    ///   - PRP1: physical address of the source data buffer (Spec
+    ///     Section 4.3). Bounded to DMA_WRITE's single 4KiB page,
+    ///     so PRP2 is not needed for these single-page transfers.
+    ///   - CDW10: Starting LBA [31:0] (lower 32 bits of the 64-bit LBA).
+    ///   - CDW11: Starting LBA [63:32] (upper 32 bits of the 64-bit LBA).
+    ///   - CDW12[15:0] = NLB: "the number of logical blocks to be written.
+    ///     This is a 0's based value." A value of 0 writes 1 block.
+    ///
+    /// The caller must populate the DMA write buffer (DMA_WRITE at offset
+    /// 0x6000, accessible via getWriteBuf()) with the data before calling
+    /// this function. The caller is responsible for ensuring count *
+    /// lba_size does not exceed the buffer size.
     pub fn writeSectors(self: *Controller, nsid: u32, lba: u64, count: u16) bool {
         var sqe = SubmissionQueueEntry{};
         sqe.cdw0 = buildCdw0(IO_OPC_WRITE, self.nextCid());
@@ -569,41 +658,68 @@ pub const Controller = struct {
         return true;
     }
 
-    // ── Data buffer accessors ─────────────────────────────────────
+    /// Return a pointer to the DMA read data buffer (offset 0x5000).
+    /// After a successful readSectors() call, the read data is available
+    /// at this address. The buffer is 4096 bytes (one memory page),
+    /// sufficient for up to 8 LBAs at 512 bytes each.
     pub fn getReadBuf(self: *const Controller) [*]u8 {
         return @ptrFromInt(self.dma_virt + DMA_DATA);
     }
 
+    /// Return a pointer to the DMA write data buffer (offset 0x6000).
+    /// The caller should fill this buffer with the data to be written
+    /// before calling writeSectors(). The buffer is 4096 bytes (one
+    /// memory page), sufficient for up to 8 LBAs at 512 bytes each.
     pub fn getWriteBuf(self: *const Controller) [*]u8 {
         return @ptrFromInt(self.dma_virt + DMA_WRITE);
     }
 
-    // ── Doorbell Calculation (Spec Section 3.1.3, Figure 33-34) ───
-    //
-    // "Offset (1000h + ((2y) * (4 << CAP.DSTRD))) for Submission Queue
-    //  y Tail Doorbell"
-    // "Offset (1000h + ((2y+1) * (4 << CAP.DSTRD))) for Completion
-    //  Queue y Head Doorbell"
-    //
+    /// Calculate the MMIO offset of a Submission Queue Tail Doorbell
+    /// (Spec Section 3.1.3, Figures 33-34).
+    ///
+    /// Per the spec: "Offset (1000h + ((2y) * (4 << CAP.DSTRD)))" where
+    /// y is the queue identifier. Writing the new SQ tail value to this
+    /// doorbell register notifies the controller that new commands have
+    /// been placed in the submission queue and are ready to be fetched.
+    ///
+    /// CAP.DSTRD (Doorbell Stride) at bits [35:32] of the CAP register
+    /// defines the spacing: "(2 ^ (2 + DSTRD)) in bytes" between
+    /// consecutive doorbell registers. A DSTRD of 0 gives the minimum
+    /// stride of 4 bytes (one 32-bit register width).
     fn sqDoorbell(self: *const Controller, qid: u16) u32 {
         const stride: u32 = @as(u32, 4) << @intCast(self.db_stride);
         return 0x1000 + @as(u32, 2 * qid) * stride;
     }
 
+    /// Calculate the MMIO offset of a Completion Queue Head Doorbell
+    /// (Spec Section 3.1.3, Figures 33-34).
+    ///
+    /// Per the spec: "Offset (1000h + ((2y+1) * (4 << CAP.DSTRD)))"
+    /// where y is the queue identifier. Writing the new CQ head value
+    /// to this doorbell register tells the controller that the host has
+    /// consumed completion entries up to that index, freeing those CQ
+    /// slots for reuse by the controller.
     fn cqDoorbell(self: *const Controller, qid: u16) u32 {
         const stride: u32 = @as(u32, 4) << @intCast(self.db_stride);
         return 0x1000 + @as(u32, 2 * qid + 1) * stride;
     }
 
-    // ── Admin Queue Submission ────────────────────────────────────
-    //
-    // Spec Section 2.1 (Memory-Based Transport): "Host software updates
-    // the appropriate SQ Tail doorbell register when there are one to n
-    // new commands to execute."
-    //
-    // Spec Section 3.3.1.2: "The submitter increments the Tail entry
-    // pointer after placing the new entry to the open queue slot."
-    //
+    /// Submit a command to the Admin Submission Queue (QID 0).
+    ///
+    /// Implements the submission flow described in Spec Section 2.1
+    /// (Memory-Based Transport Queue Model) and Section 3.3.1.2:
+    ///   1. Write the 64-byte SQE into the next available slot in the
+    ///      admin SQ, indexed by the local tail pointer. The SQ base
+    ///      address is accessed via volatile pointer to ensure the
+    ///      write is not elided or reordered by the compiler.
+    ///   2. Increment the tail pointer modulo queue size (circular buffer).
+    ///      Spec 3.3.1.2: "The submitter increments the Tail entry pointer
+    ///      after placing the new entry to the open queue slot."
+    ///   3. Write the new tail value to the SQ 0 Tail Doorbell register
+    ///      at offset 0x1000. Spec Section 2.1: "Host software updates
+    ///      the appropriate SQ Tail doorbell register when there are one
+    ///      to n new commands to execute." This doorbell write is what
+    ///      triggers the controller to fetch and process the command.
     fn submitAdmin(self: *Controller, sqe: SubmissionQueueEntry) void {
         const sq_base: [*]volatile SubmissionQueueEntry = @ptrFromInt(self.dma_virt + DMA_ADMIN_SQ);
         sq_base[self.admin_sq_tail] = sqe;
@@ -611,17 +727,33 @@ pub const Controller = struct {
         self.writeReg32(self.sqDoorbell(0), self.admin_sq_tail);
     }
 
-    // ── Admin Queue Completion Polling ────────────────────────────
-    //
-    // Spec Section 4.2.4 (Phase Tag): "The Phase Tag (P) bit identifies
-    // whether a completion queue entry is new. When a CQ is created, the
-    // controller sets the P bit of all entries to '0'. The host initializes
-    // the current Phase Tag to '1'. Each pass through the CQ, the phase
-    // tag is inverted."
-    //
-    // Spec Section 4.2.1 (CQE DW3): "Status[31:17] | P[16] | CID[15:0]"
-    // Status field: SCT[27:25] | SC[24:17]
-    //
+    /// Poll the Admin Completion Queue for a new completion entry.
+    ///
+    /// Uses the phase tag mechanism described in Spec Section 4.2.4:
+    /// "The Phase Tag (P) bit identifies whether a completion queue entry
+    /// is new. When a Completion Queue is created, the controller sets
+    /// the Phase Tag of all entries to '0'. The host initializes the
+    /// current Phase Tag value to '1'."
+    ///
+    /// The polling loop reads the CQE at the current head index and
+    /// checks if DW3 bit [16] (Phase Tag) matches our expected phase.
+    /// A match means the controller has written a new completion:
+    ///   - DW3[15:0] = CID: echoes back the Command Identifier from the
+    ///     original SQE, allowing the host to correlate completions with
+    ///     submitted commands (Spec Section 4.2.1, Figure 96).
+    ///   - DW3[31:17] = Status: contains SCT (Status Code Type, bits
+    ///     [27:25]) and SC (Status Code, bits [24:17]) per Spec Section
+    ///     4.2.3. A status of 0 indicates successful completion.
+    ///   - DW2[15:0] = SQ Head Pointer: the controller's view of the SQ
+    ///     head, indicating which commands have been consumed.
+    ///
+    /// After processing, the head pointer advances and wraps modulo the
+    /// queue size. On wrap, the expected phase inverts — "each pass
+    /// through the Completion Queue, the Phase Tag is inverted" (Spec
+    /// 4.2.4). The new head is written to the CQ 0 Head Doorbell to
+    /// inform the controller that entries have been consumed.
+    ///
+    /// Returns the 15-bit status field, or 0xFFFF on timeout.
     fn pollAdminCompletion(self: *Controller) u16 {
         const cq_base: [*]volatile CompletionQueueEntry = @ptrFromInt(self.dma_virt + DMA_ADMIN_CQ);
         const timeout_ns: i64 = 5_000_000_000; // 5 second timeout
@@ -652,12 +784,17 @@ pub const Controller = struct {
         }
     }
 
-    // ── I/O Queue Submission ──────────────────────────────────────
-    //
-    // Same mechanism as admin queue but uses I/O SQ (QID 1).
-    // Spec Section 3.3.1.2: "The submitter increments the Tail entry
-    // pointer after placing the new entry."
-    //
+    /// Submit a command to the I/O Submission Queue (QID 1).
+    ///
+    /// Identical mechanism to submitAdmin() but targets the I/O queue
+    /// pair (QID 1) created during initialization. Commands submitted
+    /// here are NVM I/O commands (Read, Write, etc.) rather than admin
+    /// commands.
+    ///
+    /// Per Spec Section 3.3.1.2: the SQE is written to the next slot
+    /// at io_sq_tail, the tail wraps modulo IO_QUEUE_SIZE, and the new
+    /// tail is written to the SQ 1 Tail Doorbell to notify the controller.
+    /// The doorbell offset is calculated via sqDoorbell(1).
     fn submitIo(self: *Controller, sqe: SubmissionQueueEntry) void {
         const sq_base: [*]volatile SubmissionQueueEntry = @ptrFromInt(self.dma_virt + DMA_IO_SQ);
         sq_base[self.io_sq_tail] = sqe;
@@ -665,12 +802,20 @@ pub const Controller = struct {
         self.writeReg32(self.sqDoorbell(1), self.io_sq_tail);
     }
 
-    // ── I/O Queue Completion Polling ──────────────────────────────
-    //
-    // Same phase-bit mechanism as admin CQ.
-    // Spec Section 4.2.4: "Each pass through the CQ, the phase tag
-    // is inverted."
-    //
+    /// Poll the I/O Completion Queue (QID 1) for a new completion entry.
+    ///
+    /// Uses the same phase tag mechanism as pollAdminCompletion() — see
+    /// Spec Section 4.2.4. The only differences are:
+    ///   - Operates on the I/O CQ at DMA_IO_CQ (offset 0x3000) instead
+    ///     of the Admin CQ.
+    ///   - Tracks io_cq_head / io_cq_phase independently from the admin
+    ///     queue's head/phase, since each queue pair maintains its own
+    ///     completion state.
+    ///   - Writes the CQ 1 Head Doorbell (via cqDoorbell(1)) after
+    ///     consuming the entry.
+    ///
+    /// Returns the 15-bit status field from DW3[31:17], or 0xFFFF on
+    /// timeout. A status of 0 indicates successful completion.
     fn pollIoCompletion(self: *Controller) u16 {
         const cq_base: [*]volatile CompletionQueueEntry = @ptrFromInt(self.dma_virt + DMA_IO_CQ);
         const timeout_ns: i64 = 5_000_000_000;
@@ -697,14 +842,24 @@ pub const Controller = struct {
         }
     }
 
-    // ── Wait for CSTS.RDY ─────────────────────────────────────────
-    //
-    // Spec Section 3.1.3.6 (CSTS): "Ready (RDY): This bit is set to '1'
-    // when the controller is ready to process submission queue entries
-    // after CC.EN is set to '1'. This bit shall be cleared to '0' when
-    // CC.EN is cleared to '0' once the controller is ready to be
-    // re-enabled."
-    //
+    /// Wait for the controller's CSTS.RDY bit to reach an expected value.
+    ///
+    /// Spec Section 3.1.3.6 (CSTS register, offset 0x1C):
+    ///   - RDY (bit 0): "This bit is set to '1' when the controller is
+    ///     ready to process submission queue entries after CC.EN is set
+    ///     to '1'. This bit shall be cleared to '0' when CC.EN is
+    ///     cleared to '0' once the controller is ready to be re-enabled."
+    ///   - CFS (bit 1): "Controller Fatal Status — set to '1' when a
+    ///     fatal controller error occurred that could not be communicated
+    ///     via a completion queue entry."
+    ///
+    /// When waiting for RDY=1 (enable), this function also checks CFS
+    /// to detect fatal errors early — there's no point waiting for
+    /// readiness if the controller has already entered a fatal state.
+    ///
+    /// The timeout comes from CAP.TO (Spec 3.1.3.1, bits [31:24]):
+    /// "the worst case time that host software shall wait for CSTS.RDY
+    /// to transition... in 500 millisecond units."
     fn waitForReady(self: *Controller, expected: u1, timeout_ns: i64) bool {
         const start = syscall.clock_gettime();
         while (true) {
@@ -720,34 +875,48 @@ pub const Controller = struct {
         }
     }
 
-    // ── CDW0 Builder ──────────────────────────────────────────────
-    //
-    // Spec Section 4.1.1 (Figure 91):
-    //   bits [7:0] = OPC (Opcode)
-    //   bits [9:8] = FUSE (00b = normal operation)
-    //   bits [15:14] = PSDT (00b = PRPs used)
-    //   bits [31:16] = CID (Command Identifier)
-    //
+    /// Build Command Dword 0 from an opcode and command identifier.
+    ///
+    /// Spec Section 4.1.1 (Figure 91) defines the CDW0 layout:
+    ///   - bits [7:0] = OPC: Opcode identifying the command.
+    ///   - bits [9:8] = FUSE: Fused Operation, 00b = "normal operation"
+    ///     (no command fusion). Left as 0.
+    ///   - bits [13:10] = Reserved.
+    ///   - bits [15:14] = PSDT: PRP or SGL for Data Transfer, 00b =
+    ///     "PRPs are used for this transfer." Left as 0 since we always
+    ///     use Physical Region Pages, not Scatter Gather Lists.
+    ///   - bits [31:16] = CID: Command Identifier, a unique tag the
+    ///     controller echoes back in the completion entry so the host
+    ///     can match completions to submitted commands.
     fn buildCdw0(opcode: u8, cid: u16) u32 {
         return @as(u32, opcode) | (@as(u32, cid) << 16);
     }
 
+    /// Allocate the next Command Identifier (CID) for a new command.
+    ///
+    /// Per Spec Section 4.1.1: the CID is placed in CDW0[31:16] of the
+    /// SQE and echoed back in DW3[15:0] of the CQE, allowing the host
+    /// to correlate completions with their originating commands. The CID
+    /// must be unique among all outstanding commands on the same SQ.
+    ///
+    /// Since this driver submits one command at a time and waits for its
+    /// completion before submitting the next, a simple wrapping counter
+    /// is sufficient — there is never more than one outstanding command
+    /// per queue, so uniqueness is trivially satisfied.
     fn nextCid(self: *Controller) u16 {
         const cid = self.next_cid;
         self.next_cid +%= 1;
         return cid;
     }
 
-    // ── MMIO Register Access ──────────────────────────────────────
-    //
-    // Spec Section 3.1.3: "For memory-based controllers, refer to the
-    // applicable NVMe Transport binding specification for access methods
-    // and rules."
-    //
-    // NVMe over PCIe Transport Spec: registers are memory-mapped in BAR0.
-    // Access via volatile pointers to ensure hardware side effects are
-    // observed and the compiler does not reorder or elide accesses.
-    //
+    /// Read a 32-bit controller register via MMIO.
+    ///
+    /// NVMe over PCIe Transport Spec: controller registers are memory-
+    /// mapped in PCI BAR0. Volatile pointer access is required to ensure
+    /// the compiler does not cache, reorder, or elide register reads —
+    /// each read must hit hardware since register values reflect
+    /// controller state that changes asynchronously (e.g., CSTS.RDY
+    /// transitions, doorbell processing).
     fn readReg32(self: *const Controller, offset: u32) u32 {
         const ptr: *const volatile u32 = @ptrFromInt(self.mmio_base + offset);
         return ptr.*;

@@ -538,7 +538,7 @@ pub const Channel = extern struct {
         B,
     };
 
-    const HEADER_SIZE = 16; // checksum (8) + len (8), serialized into the ring buffer
+    const HEADER_SIZE = 8; // len (8), serialized into the ring buffer
 
     A_tx: u64 = 0,
     A_cached_rx: u64 = 0,
@@ -592,17 +592,6 @@ pub const Channel = extern struct {
         return if (id == .A) base else base + self.mid;
     }
 
-    fn checksum(data: []const u8) u64 {
-        const aligned = @as([*]align(1) const u64, @ptrCast(data.ptr))[0 .. data.len / 8];
-        var sum: u64 = 0;
-        for (aligned) |word| sum +%= word;
-        var tail: u64 = 0;
-        for (data[aligned.len * 8 ..]) |b| {
-            tail = (tail << 8) | b;
-        }
-        return sum +% tail;
-    }
-
     fn ringWrite(buf: [*]u8, buf_size: u64, pos: u64, data: []const u8) void {
         const start = pos % buf_size;
         const first = buf_size - start;
@@ -645,10 +634,8 @@ pub const Channel = extern struct {
             if (available < total) return error.ChannelFull;
         }
 
-        const cksum = checksum(msg);
-        var hdr_buf: [16]u8 = undefined;
-        @as(*align(1) u64, @ptrCast(&hdr_buf[0])).* = cksum;
-        @as(*align(1) u64, @ptrCast(&hdr_buf[8])).* = msg.len;
+        var hdr_buf: [8]u8 = undefined;
+        @as(*align(1) u64, @ptrCast(&hdr_buf[0])).* = msg.len;
         ringWrite(buf, buf_size, tx, &hdr_buf);
 
         ringWrite(buf, buf_size, tx + HEADER_SIZE, msg);
@@ -676,10 +663,9 @@ pub const Channel = extern struct {
             if (data_avail < HEADER_SIZE) return null;
         }
 
-        var hdr_buf: [16]u8 = undefined;
+        var hdr_buf: [8]u8 = undefined;
         ringRead(buf, buf_size, rx, &hdr_buf);
-        const expected_cksum = @as(*align(1) const u64, @ptrCast(&hdr_buf[0])).*;
-        const msg_len = @as(*align(1) const u64, @ptrCast(&hdr_buf[8])).*;
+        const msg_len = @as(*align(1) const u64, @ptrCast(&hdr_buf[0])).*;
 
         if (data_avail < HEADER_SIZE + msg_len) {
             cached_tx_p.* = @atomicLoad(u64, tx_p, .acquire);
@@ -694,13 +680,6 @@ pub const Channel = extern struct {
         }
 
         ringRead(buf, buf_size, rx + HEADER_SIZE, out[0..msg_len]);
-
-        const actual_cksum = checksum(out[0..msg_len]);
-        if (actual_cksum != expected_cksum) {
-            syscall.write("channel: checksum mismatch\n");
-            @atomicStore(u64, rx_p, rx +% HEADER_SIZE +% msg_len, .release);
-            return null;
-        }
 
         @atomicStore(u64, rx_p, rx +% HEADER_SIZE +% msg_len, .release);
         return msg_len;
