@@ -1,4 +1,5 @@
 const dbg = @import("debug_display.zig");
+const hid = @import("hid.zig");
 const lib = @import("lib");
 
 const perms = lib.perms;
@@ -151,6 +152,10 @@ pub const Trb = extern struct {
         return @truncate(self.control >> 24);
     }
 
+    pub fn endpointId(self: *const volatile Trb) u8 {
+        return @truncate((self.control >> 16) & 0x1F);
+    }
+
     pub fn cycle(self: *const volatile Trb) bool {
         return self.control & 1 != 0;
     }
@@ -218,6 +223,7 @@ const USB_REQ_SET_IDLE = 0x0A;
 
 const USB_CLASS_HID = 3;
 const HID_SUBCLASS_BOOT = 1;
+const USB_DESC_HID_REPORT = 0x22;
 const HID_PROTOCOL_KEYBOARD = 1;
 const HID_PROTOCOL_MOUSE = 2;
 const HID_BOOT_PROTOCOL = 0;
@@ -252,7 +258,9 @@ const MAX_HID_DEVICES = 4;
 
 const VidEntry = struct { vid: u16, name: []const u8 };
 const known_vendors = [_]VidEntry{
+    .{ .vid = 0x0b05, .name = "ASUS" },
     .{ .vid = 0x1022, .name = "AMD" },
+    .{ .vid = 0x13d3, .name = "IMC Networks" },
     .{ .vid = 0x1532, .name = "Razer" },
     .{ .vid = 0x1b1c, .name = "Corsair" },
     .{ .vid = 0x320f, .name = "Glorious" },
@@ -276,10 +284,12 @@ pub const HidDevice = struct {
     slot_id: u8,
     ep_index: u8,
     ep_dci: u8,
+    buf_index: u8,
     protocol: HidProtocol,
     active: bool,
     prev_keys: [6]u8,
     prev_modifiers: u8,
+    report_info: hid.ReportInfo,
 };
 
 const TransferRing = struct {
@@ -543,13 +553,13 @@ pub const Controller = struct {
         return self.hid_devices_storage[0..self.num_hid_devices];
     }
 
-    pub fn getReportData(self: *const Controller, slot: u8) [*]const u8 {
-        const dev_offset: u64 = @as(u64, slot) * 64;
+    pub fn getReportData(self: *const Controller, buf_index: u8) [*]const u8 {
+        const dev_offset: u64 = @as(u64, buf_index) * 64;
         return @ptrFromInt(self.report_buf_virt + dev_offset);
     }
 
-    pub fn queueInterruptIn(self: *Controller, slot: u8, dci: u8) void {
-        const dev_offset: u64 = @as(u64, slot) * 64;
+    pub fn queueInterruptIn(self: *Controller, slot: u8, dci: u8, buf_index: u8) void {
+        const dev_offset: u64 = @as(u64, buf_index) * 64;
         self.queueTransferTrb(
             slot,
             dci,
@@ -682,22 +692,23 @@ pub const Controller = struct {
         return @ptrFromInt(self.evt_ring_virt + @as(u64, idx) * 16);
     }
 
-    fn waitForEvent(self: *Controller, expected_type: TrbType, timeout_spins: u32) ?*const volatile Trb {
-        var spins: u32 = 0;
-        while (spins < timeout_spins) : (spins += 1) {
+    fn waitForEvent(self: *Controller, expected_type: TrbType, timeout_ns: i64) ?*const volatile Trb {
+        const deadline = syscall.clock_gettime() + timeout_ns;
+        while (syscall.clock_gettime() < deadline) {
             if (self.pollEvent()) |trb| {
                 if (trb.trbType() == expected_type) {
                     return trb;
                 }
                 self.advanceEventRing();
+            } else {
+                syscall.thread_yield();
             }
-            if (spins % 1000 == 0) syscall.thread_yield();
         }
         return null;
     }
 
     fn waitForCommandCompletion(self: *Controller) ?*const volatile Trb {
-        return self.waitForEvent(.command_completion, 1_000_000);
+        return self.waitForEvent(.command_completion, 2_000_000_000);
     }
 
     // ── Transfer Rings ──────────────────────────────────────────
@@ -747,6 +758,8 @@ pub const Controller = struct {
         var xecp: u32 = (hccparams1 >> 16) & 0xFFFF;
         if (xecp == 0) return;
 
+        var did_handoff = false;
+
         // Walk extended capability linked list
         while (xecp != 0) {
             const cap_addr = self.mmio_base + @as(u64, xecp) * 4;
@@ -754,31 +767,39 @@ pub const Controller = struct {
             const cap_val = cap_reg.*;
 
             const cap_id: u8 = @truncate(cap_val);
-            if (cap_id == USBLEGSUP_CAP_ID) {
-                // Found USB Legacy Support capability
+
+            if (cap_id == USBLEGSUP_CAP_ID and !did_handoff) {
+                did_handoff = true;
                 // Check if BIOS owns the controller
                 if (cap_val & USBLEGSUP_BIOS_OWNED != 0) {
-                    // Request OS ownership
                     cap_reg.* = cap_val | USBLEGSUP_OS_OWNED;
-
-                    // Wait for BIOS to release (up to ~1 second)
                     var wait: u32 = 0;
                     while (wait < 1_000_000) : (wait += 1) {
                         if (cap_reg.* & USBLEGSUP_BIOS_OWNED == 0) break;
                         if (wait % 1000 == 0) syscall.thread_yield();
                     }
-
-                    // Force-clear BIOS ownership if it didn't release (like Linux)
                     if (cap_reg.* & USBLEGSUP_BIOS_OWNED != 0) {
                         cap_reg.* = (cap_reg.* & ~USBLEGSUP_BIOS_OWNED) | USBLEGSUP_OS_OWNED;
                     }
                 }
-
-                // Disable all SMI sources and clear pending SMI events
-                // Bits 29:31 are W1C event status — write 1 to clear
                 const ctlsts: *volatile u32 = @ptrFromInt(cap_addr + 4);
                 ctlsts.* = 0xE0000000;
-                return;
+            } else if (cap_id == 2) {
+                // Supported Protocol capability — log port ranges
+                const dword1: *volatile u32 = @ptrFromInt(cap_addr + 4);
+                const dword2: *volatile u32 = @ptrFromInt(cap_addr + 8);
+                const rev_major: u8 = @truncate(cap_val >> 24);
+                const name = dword1.*;
+                _ = name;
+                const port_offset: u8 = @truncate(dword2.*);
+                const port_count: u8 = @truncate(dword2.* >> 8);
+                dbg.log("  proto USB");
+                dbg.logU32(rev_major);
+                dbg.log(" ports ");
+                dbg.logU32(port_offset);
+                dbg.log("-");
+                dbg.logU32(@as(u32, port_offset) + port_count - 1);
+                dbg.log("\n");
             }
 
             // Next capability: bits [15:8] = next pointer (DWORD offset)
@@ -991,17 +1012,30 @@ pub const Controller = struct {
         return slot;
     }
 
-    fn addressDevice(self: *Controller, slot: u8, port: u32, speed: u32) bool {
-        const dev_ctx_size: u64 = 32 * @as(u64, self.context_size);
-        const dev_ctx = self.dmaAlloc(dev_ctx_size, 64) orelse return false;
-        @memset(@as([*]u8, @ptrFromInt(dev_ctx.virt))[0..dev_ctx_size], 0);
-        self.device_context_virt[slot] = dev_ctx.virt;
-        self.device_context_phys[slot] = dev_ctx.phys;
+    /// Initialize slot and optionally assign a USB address.
+    /// bsr=true: slot enters Default state, device stays at address 0 (for initial descriptor read).
+    /// bsr=false: slot enters Addressed state, device gets a USB address.
+    fn addressDevice(self: *Controller, slot: u8, port: u32, speed: u32, bsr: bool) bool {
+        if (bsr) {
+            // First call: allocate device context and transfer ring
+            const dev_ctx_size: u64 = 32 * @as(u64, self.context_size);
+            const dev_ctx = self.dmaAlloc(dev_ctx_size, 64) orelse return false;
+            @memset(@as([*]u8, @ptrFromInt(dev_ctx.virt))[0..dev_ctx_size], 0);
+            self.device_context_virt[slot] = dev_ctx.virt;
+            self.device_context_phys[slot] = dev_ctx.phys;
 
-        const dcbaa_ptr: [*]volatile u64 = @ptrFromInt(self.dcbaa_virt);
-        dcbaa_ptr[slot] = dev_ctx.phys;
+            const dcbaa_ptr: [*]volatile u64 = @ptrFromInt(self.dcbaa_virt);
+            dcbaa_ptr[slot] = dev_ctx.phys;
 
-        if (!self.initTransferRing(slot, 1)) return false;
+            if (!self.initTransferRing(slot, 1)) return false;
+        } else {
+            // Second call: reset transfer ring so hardware doesn't replay old TRBs
+            var ring = &self.transfer_rings[slot][1];
+            const ptr: [*]u8 = @ptrFromInt(ring.virt);
+            @memset(ptr[0 .. TRANSFER_RING_SIZE * 16], 0);
+            ring.enqueue = 0;
+            ring.cycle = 1;
+        }
 
         const csz: u64 = self.context_size;
         @memset(@as([*]u8, @ptrFromInt(self.input_context_virt))[0 .. 33 * csz], 0);
@@ -1023,20 +1057,25 @@ pub const Controller = struct {
         const ep0_ctx: *volatile EndpointContext = @ptrFromInt(self.input_context_virt + csz * 2);
         const max_packet: u32 = switch (speed) {
             SPEED_LOW => 8,
-            SPEED_FULL => 8,
+            SPEED_FULL => 64,
             SPEED_HIGH => 64,
             SPEED_SUPER => 512,
             else => 8,
         };
         ep0_ctx.field1 = (EP_TYPE_CONTROL << 3) | (3 << 1) | (max_packet << 16);
         ep0_ctx.tr_dequeue = self.transfer_rings[slot][1].phys | 1;
+        ep0_ctx.field2 = 8; // Average TRB Length — required by xHCI spec for control endpoints
 
-        self.submitCommand(self.input_context_phys, 0, (@as(u32, @intFromEnum(TrbType.address_device)) << 10) | (@as(u32, slot) << 24));
+        const bsr_bit: u32 = if (bsr) (1 << 9) else 0;
+        self.submitCommand(self.input_context_phys, 0, (@as(u32, @intFromEnum(TrbType.address_device)) << 10) | (@as(u32, slot) << 24) | bsr_bit);
         const evt = self.waitForCommandCompletion() orelse return false;
         const cc = evt.completionCode();
         self.advanceEventRing();
         if (cc != .success) {
-            syscall.write("usb: address device failed\n");
+            dbg.log("  addr dev failed cc=");
+            dbg.logU32(@intFromEnum(cc));
+            dbg.log(if (bsr) " bsr=1" else " bsr=0");
+            dbg.log("\n");
             return false;
         }
         return true;
@@ -1091,7 +1130,7 @@ pub const Controller = struct {
 
         self.ringDoorbell(slot, 1);
 
-        const evt = self.waitForEvent(.transfer_event, 1_000_000) orelse {
+        const evt = self.waitForEvent(.transfer_event, 2_000_000_000) orelse {
             self.diag_last_cc = 0; // 0 = timeout
             return null;
         };
@@ -1130,6 +1169,67 @@ pub const Controller = struct {
         return self.controlTransfer(slot, 0x21, USB_REQ_SET_IDLE, 0, interface, 0, 0, false) != null;
     }
 
+    /// Read the HID report descriptor and check Usage Page + Usage to identify device type.
+    /// Returns HID_PROTOCOL_KEYBOARD (1), HID_PROTOCOL_MOUSE (2), or 0 (unknown).
+    /// Uses report_buf (slot 0 region) as scratch to avoid overwriting desc_buf.
+    fn identifyHidUsage(self: *Controller, slot: u8, interface: u16) u8 {
+        // GET_DESCRIPTOR for HID Report Descriptor (class-specific, from interface)
+        // bmRequestType=0x81 (device-to-host, standard, interface)
+        const len = self.controlTransfer(
+            slot,
+            0x81,
+            USB_REQ_GET_DESCRIPTOR,
+            (@as(u16, USB_DESC_HID_REPORT) << 8),
+            interface,
+            64,
+            self.report_buf_phys,
+            true,
+        ) orelse return 0;
+
+        if (len < 4) return 0;
+
+        const buf: [*]const u8 = @ptrFromInt(self.report_buf_virt);
+        // Scan for Usage Page (Generic Desktop = 0x01) followed by Usage (Keyboard = 0x06, Mouse = 0x02)
+        var i: u16 = 0;
+        while (i + 1 < len) {
+            const item = buf[i];
+            const tag = item & 0xFC;
+            const size = item & 0x03;
+            if (size == 0) {
+                i += 1;
+                continue;
+            }
+            if (i + 1 + size > len) break;
+
+            // Usage Page (short item: tag=0x04, size varies)
+            if (tag == 0x04 and size >= 1 and buf[i + 1] == 0x01) {
+                // Generic Desktop usage page — check next Usage item
+                var j = i + 1 + size;
+                while (j + 1 < len) {
+                    const next_item = buf[j];
+                    const next_tag = next_item & 0xFC;
+                    const next_size = next_item & 0x03;
+                    if (next_size == 0) {
+                        j += 1;
+                        continue;
+                    }
+                    if (j + 1 + next_size > len) break;
+                    // Usage (short item: tag=0x08)
+                    if (next_tag == 0x08 and next_size >= 1) {
+                        const usage = buf[j + 1];
+                        if (usage == 0x06) return HID_PROTOCOL_KEYBOARD;
+                        if (usage == 0x02) return HID_PROTOCOL_MOUSE;
+                        break;
+                    }
+                    j += 1 + next_size;
+                }
+                break;
+            }
+            i += 1 + size;
+        }
+        return 0;
+    }
+
     // ── Endpoint Configuration ──────────────────────────────────
 
     fn configureEndpoint(self: *Controller, slot: u8, ep_addr: u8, max_packet: u16, interval: u8, speed: u32) bool {
@@ -1137,12 +1237,7 @@ pub const Controller = struct {
         const ep_dir_in = (ep_addr & 0x80) != 0;
         const dci: u8 = ep_num * 2 + @as(u8, if (ep_dir_in) 1 else 0);
 
-        if (!self.initTransferRing(slot, dci)) {
-            dbg.log("    cfgep: ring alloc failed dci=");
-            dbg.logU32(dci);
-            dbg.log("\n");
-            return false;
-        }
+        if (!self.initTransferRing(slot, dci)) return false;
 
         const csz: u64 = self.context_size;
         @memset(@as([*]u8, @ptrFromInt(self.input_context_virt))[0 .. 33 * csz], 0);
@@ -1176,31 +1271,11 @@ pub const Controller = struct {
         ep_ctx.tr_dequeue = self.transfer_rings[slot][dci].phys | 1;
         ep_ctx.field2 = 8;
 
-        dbg.log("    cfgep: dci=");
-        dbg.logU32(dci);
-        dbg.log(" maxpkt=");
-        dbg.logU32(max_packet);
-        dbg.log(" interval=");
-        dbg.logU32(xhci_interval);
-        dbg.log("\n");
-
         self.submitCommand(self.input_context_phys, 0, (@as(u32, @intFromEnum(TrbType.configure_endpoint)) << 10) | (@as(u32, slot) << 24));
-        const evt = self.waitForCommandCompletion() orelse {
-            dbg.log("    cfgep: cmd timeout dci=");
-            dbg.logU32(dci);
-            dbg.log("\n");
-            return false;
-        };
+        const evt = self.waitForCommandCompletion() orelse return false;
         const cc = evt.completionCode();
         self.advanceEventRing();
-        if (cc != .success) {
-            dbg.log("    cfgep: failed dci=");
-            dbg.logU32(dci);
-            dbg.log(" cc=");
-            dbg.logU32(@intFromEnum(cc));
-            dbg.log("\n");
-            return false;
-        }
+        if (cc != .success) return false;
         return true;
     }
 
@@ -1226,12 +1301,16 @@ pub const Controller = struct {
             return;
         }
 
-        // Clear PRC
+        // Clear all status change bits (CSC, PEC, WRC, OCC, PRC, PLC, CEC)
         portsc = self.readPortsc(port);
-        self.writePortsc(port, (portsc & PORTSC_PP) | PORTSC_PRC);
+        const change_bits = PORTSC_CSC | PORTSC_PRC | PORTSC_WRC | (1 << 18) | (1 << 20) | (1 << 22) | (1 << 23);
+        self.writePortsc(port, (portsc & PORTSC_PP) | change_bits);
 
-        // Small delay for device to settle after reset
-        self.delayYield(10);
+        // Wait 50ms for device to recover after port reset (USB 2.0 TRSTRCY)
+        const reset_done = syscall.clock_gettime();
+        while (syscall.clock_gettime() - reset_done < 50_000_000) {
+            syscall.thread_yield();
+        }
 
         portsc = self.readPortsc(port);
         if (portsc & PORTSC_PED == 0) {
@@ -1252,23 +1331,23 @@ pub const Controller = struct {
             return;
         };
 
-        if (!self.addressDevice(slot, port, speed)) {
+        // Step 1: Address Device with BSR=1 — slot in Default state, device at address 0
+        if (!self.addressDevice(slot, port, speed, true)) {
             if (port < MAX_PORTS_TRACKED) self.port_status[port] = .address_failed;
             return;
         }
 
-        const initial_max_packet: u16 = switch (speed) {
-            SPEED_LOW => 8,
-            SPEED_FULL => 8,
-            SPEED_HIGH => 64,
-            SPEED_SUPER => 512,
-            else => 8,
-        };
-
-        // Get first 8 bytes of device descriptor to read bMaxPacketSize0
+        // Step 2: Read first 8 bytes of device descriptor at address 0
         const initial_len = self.getDescriptor(slot, USB_DESC_DEVICE, 0, 8) orelse {
             if (port < MAX_PORTS_TRACKED) {
                 self.port_status[port] = if (self.diag_last_cc == 0) .desc_timeout else .desc_error;
+                dbg.log("  desc fail p");
+                dbg.logU32(port);
+                dbg.log(" cc=");
+                dbg.logU32(self.diag_last_cc);
+                dbg.log(" spd=");
+                dbg.logU32(speed);
+                dbg.log(" (bsr)\n");
             }
             return;
         };
@@ -1280,8 +1359,14 @@ pub const Controller = struct {
         // Read bMaxPacketSize0 (byte 7) and update EP0 via Evaluate Context if needed
         const desc_buf: [*]const u8 = @ptrFromInt(self.desc_buf_virt);
         const actual_max_packet: u16 = desc_buf[7];
-        if (actual_max_packet > 0 and actual_max_packet != initial_max_packet) {
+        if (actual_max_packet > 0 and actual_max_packet != 64) {
             self.evaluateEp0MaxPacket(slot, actual_max_packet);
+        }
+
+        // Step 3: Address Device with BSR=0 — assign real USB address
+        if (!self.addressDevice(slot, port, speed, false)) {
+            if (port < MAX_PORTS_TRACKED) self.port_status[port] = .address_failed;
+            return;
         }
 
         // Now get full device descriptor
@@ -1303,9 +1388,9 @@ pub const Controller = struct {
             const pid = @as(u16, dd[10]) | (@as(u16, dd[11]) << 8);
             dbg.log("  dev: ");
             dbg.log(lookupVendor(vid));
-            dbg.log(" (0x");
+            dbg.log(" (");
             dbg.logHex(vid);
-            dbg.log(":0x");
+            dbg.log(":");
             dbg.logHex(pid);
             dbg.log(")\n");
         }
@@ -1346,12 +1431,15 @@ pub const Controller = struct {
         const buf: [*]const u8 = @ptrFromInt(self.desc_buf_virt);
         var offset: u16 = 0;
         var current_interface: u8 = 0;
-        var current_hid_protocol: u8 = 0;
+        var report_desc_len: u16 = 0;
+        var current_report_info: hid.ReportInfo = .{};
         var found_hid = false;
 
-        dbg.log("  cfg desc: total_len=");
-        dbg.logU32(total_len);
-        dbg.log("\n");
+        // Scratch area for reading HID report descriptors (past HID device buffers)
+        const scratch_offset: u64 = @as(u64, MAX_HID_DEVICES) * 64;
+        const scratch_phys = self.report_buf_phys + scratch_offset;
+        const scratch_virt: [*]const u8 = @ptrFromInt(self.report_buf_virt + scratch_offset);
+        const max_report_desc: u16 = 512;
 
         while (offset + 2 <= total_len) {
             const desc_len = buf[offset];
@@ -1362,37 +1450,44 @@ pub const Controller = struct {
             if (desc_type == USB_DESC_INTERFACE and desc_len >= 9) {
                 current_interface = buf[offset + 2];
                 const iface_class = buf[offset + 5];
-                const iface_subclass = buf[offset + 6];
-                const iface_protocol = buf[offset + 7];
 
-                dbg.log("    iface ");
-                dbg.logU32(current_interface);
-                dbg.log(": class=");
-                dbg.logU32(iface_class);
-                dbg.log(" sub=");
-                dbg.logU32(iface_subclass);
-                dbg.log(" proto=");
-                dbg.logU32(iface_protocol);
-                dbg.log("\n");
+                found_hid = false;
+                report_desc_len = 0;
+                current_report_info = .{};
 
                 if (iface_class == USB_CLASS_HID) {
                     found_hid = true;
-                    current_hid_protocol = iface_protocol;
+                    _ = self.setIdle(slot, current_interface);
+                }
+            } else if (desc_type == USB_DESC_HID and desc_len >= 9 and found_hid) {
+                // HID descriptor — extract report descriptor length
+                report_desc_len = @as(u16, buf[offset + 7]) | (@as(u16, buf[offset + 8]) << 8);
 
-                    if (iface_subclass == HID_SUBCLASS_BOOT) {
-                        if (!self.setProtocol(slot, current_interface, HID_BOOT_PROTOCOL)) {
-                            dbg.log("    setProtocol failed iface=");
-                            dbg.logU32(current_interface);
-                            dbg.log("\n");
-                        }
-                        if (!self.setIdle(slot, current_interface)) {
-                            dbg.log("    setIdle failed iface=");
-                            dbg.logU32(current_interface);
-                            dbg.log("\n");
-                        }
-                    }
+                // Read full report descriptor
+                const request_len: u16 = if (report_desc_len > max_report_desc) max_report_desc else report_desc_len;
+                const rd_len = self.controlTransfer(
+                    slot,
+                    0x81,
+                    USB_REQ_GET_DESCRIPTOR,
+                    (@as(u16, USB_DESC_HID_REPORT) << 8),
+                    current_interface,
+                    request_len,
+                    scratch_phys,
+                    true,
+                ) orelse 0;
+
+                if (rd_len >= 4) {
+                    current_report_info = hid.parse(scratch_virt, rd_len);
+                    dbg.log("  iface ");
+                    dbg.logU32(current_interface);
+                    dbg.log(" rdlen=");
+                    dbg.logU32(rd_len);
+                    hid.logInfo(&current_report_info);
                 } else {
                     found_hid = false;
+                    dbg.log("  iface ");
+                    dbg.logU32(current_interface);
+                    dbg.log(" rd_fail\n");
                 }
             } else if (desc_type == USB_DESC_ENDPOINT and desc_len >= 7) {
                 const ep_addr = buf[offset + 2];
@@ -1400,35 +1495,46 @@ pub const Controller = struct {
                 const ep_max_packet = @as(u16, buf[offset + 4]) | (@as(u16, buf[offset + 5]) << 8);
                 const ep_interval = buf[offset + 6];
 
-                dbg.log("    ep: addr=0x");
-                dbg.logHex(ep_addr);
-                dbg.log(" attrs=0x");
-                dbg.logHex(ep_attrs);
-                dbg.log(" maxpkt=");
-                dbg.logU32(ep_max_packet);
-                dbg.log(" hid=");
-                dbg.logU32(@intFromBool(found_hid));
-                dbg.log("\n");
-
-                // Only interrupt IN endpoints for HID
+                // Only interrupt IN endpoints for identified HID devices
                 if (found_hid and (ep_attrs & 0x03) == 0x03 and (ep_addr & 0x80) != 0) {
-                    if (self.configureEndpoint(slot, ep_addr, ep_max_packet, ep_interval, speed)) {
-                        if (self.num_hid_devices < MAX_HID_DEVICES) {
-                            const ep_num = ep_addr & 0x0F;
-                            const dci = ep_num * 2 + 1;
-                            self.hid_devices_storage[self.num_hid_devices] = .{
-                                .slot_id = slot,
-                                .ep_index = dci,
-                                .ep_dci = dci,
-                                .protocol = if (current_hid_protocol == HID_PROTOCOL_KEYBOARD) .keyboard else .mouse,
-                                .active = true,
-                                .prev_keys = .{0} ** 6,
-                                .prev_modifiers = 0,
-                            };
-                            self.num_hid_devices += 1;
+                    const dev_type = current_report_info.device_type;
+                    if (dev_type == .unknown) {
+                        // Parser couldn't identify — skip
+                    } else {
+                        const proto: HidProtocol = if (dev_type == .keyboard) .keyboard else .mouse;
 
-                            self.queueInterruptIn(slot, dci);
-                            self.ringDoorbell(slot, dci);
+                        // Only register one HID device per protocol per slot
+                        var already_registered = false;
+                        for (self.hid_devices_storage[0..self.num_hid_devices]) |*existing| {
+                            if (existing.slot_id == slot and existing.protocol == proto) {
+                                already_registered = true;
+                                break;
+                            }
+                        }
+
+                        if (!already_registered) {
+                            if (self.configureEndpoint(slot, ep_addr, ep_max_packet, ep_interval, speed)) {
+                                if (self.num_hid_devices < MAX_HID_DEVICES) {
+                                    const ep_num = ep_addr & 0x0F;
+                                    const dci = ep_num * 2 + 1;
+                                    const bi: u8 = @truncate(self.num_hid_devices);
+                                    self.hid_devices_storage[self.num_hid_devices] = .{
+                                        .slot_id = slot,
+                                        .ep_index = dci,
+                                        .ep_dci = dci,
+                                        .buf_index = bi,
+                                        .protocol = proto,
+                                        .active = true,
+                                        .prev_keys = .{0} ** 6,
+                                        .prev_modifiers = 0,
+                                        .report_info = current_report_info,
+                                    };
+                                    self.num_hid_devices += 1;
+
+                                    self.queueInterruptIn(slot, dci, bi);
+                                    self.ringDoorbell(slot, dci);
+                                }
+                            }
                         }
                     }
                 }

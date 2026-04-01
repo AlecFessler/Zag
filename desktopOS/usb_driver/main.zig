@@ -184,6 +184,8 @@ pub fn main(perm_view_addr: u64) void {
                     dbg.logU32(@intCast(j));
                     dbg.log("] slot=");
                     dbg.logU32(dev.slot_id);
+                    dbg.log(" ep=");
+                    dbg.logU32(dev.ep_dci);
                     dbg.log(" proto=");
                     switch (dev.protocol) {
                         .keyboard => dbg.log("keyboard"),
@@ -309,28 +311,35 @@ pub fn main(perm_view_addr: u64) void {
                 had_event = true;
                 if (evt.trbType() == .transfer_event) {
                     const cc = evt.completionCode();
+                    const slot_id = evt.slotId();
+                    const ep_id = evt.endpointId();
                     if (cc == .success or cc == .short_packet) {
-                        const slot_id = evt.slotId();
                         for (ctrl.hidDevices()) |*dev| {
-                            if (dev.slot_id == slot_id and dev.active) {
-                                const report = ctrl.getReportData(slot_id);
+                            if (dev.slot_id == slot_id and dev.ep_dci == ep_id and dev.active) {
+                                const report = ctrl.getReportData(dev.buf_index);
 
                                 switch (dev.protocol) {
                                     .keyboard => {
-                                        if (findFocusedChannel()) |chan| {
-                                            kb.processReport(dev, report, chan);
-                                        }
+                                        kb.processReport(dev, report, findFocusedChannel());
                                     },
                                     .mouse => {
-                                        ms.processReport(report, &mouse_client);
+                                        ms.processReport(report, &dev.report_info, &mouse_client);
                                     },
                                 }
 
-                                ctrl.queueInterruptIn(slot_id, dev.ep_dci);
+                                ctrl.queueInterruptIn(slot_id, dev.ep_dci, dev.buf_index);
                                 ctrl.ringDoorbell(slot_id, dev.ep_dci);
                                 break;
                             }
                         }
+                    } else {
+                        dbg.log("xfer err slot=");
+                        dbg.logU32(slot_id);
+                        dbg.log(" ep=");
+                        dbg.logU32(ep_id);
+                        dbg.log(" cc=");
+                        dbg.logU32(@intFromEnum(cc));
+                        dbg.log("\n");
                     }
                 }
                 ctrl.advanceEventRing();
