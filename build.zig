@@ -205,6 +205,12 @@ pub fn build(b: *std.Build) void {
     else
         ""
     ;
+    const qemu_nvme_args: []const u8 = if (profile_name != null and std.mem.eql(u8, profile_name.?, "desktop"))
+        \\-drive file=nvme.img,format=raw,if=none,id=nvme0 \
+        \\-device nvme,drive=nvme0,serial=zagdisk0
+    else
+        ""
+    ;
     const qemu_net_args: []const u8 = if (std.mem.eql(u8, net_type, "tap"))
         \\-netdev tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=off \
         \\-device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
@@ -237,12 +243,19 @@ pub fn build(b: *std.Build) void {
         \\ {s} \
         \\ {s} \
         \\ {s} \
+        \\ {s} \
         \\ -smp cores=4
-    , .{ b.install_path, out_dir, display_type, qemu_accel_args, qemu_machine_args, qemu_iommu_args, qemu_net_args, qemu_usb_args });
+    , .{ b.install_path, out_dir, display_type, qemu_accel_args, qemu_machine_args, qemu_iommu_args, qemu_net_args, qemu_usb_args, qemu_nvme_args });
+    // Create NVMe disk image if it doesn't exist
+    const create_nvme_img = b.addSystemCommand(&[_][]const u8{
+        "sh", "-c", "test -f nvme.img || dd if=/dev/zero of=nvme.img bs=1M count=64 2>/dev/null",
+    });
+
     const qemu_cmd = b.addSystemCommand(&[_][]const u8{
         "sh", "-lc", qemu_cmdline,
     });
     qemu_cmd.step.dependOn(b.getInstallStep());
+    qemu_cmd.step.dependOn(&create_nvme_img.step);
     const run_qemu_cmd = b.step("run", "Run QEMU");
     run_qemu_cmd.dependOn(&qemu_cmd.step);
 }

@@ -115,6 +115,33 @@ fn makeEmbeddedModule2(
     });
 }
 
+fn makeEmbeddedModule3(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    comptime name1: []const u8,
+    path1: std.Build.LazyPath,
+    comptime name2: []const u8,
+    path2: std.Build.LazyPath,
+    comptime name3: []const u8,
+    path3: std.Build.LazyPath,
+) *std.Build.Module {
+    const wf = b.addWriteFiles();
+    _ = wf.addCopyFile(path1, name1);
+    _ = wf.addCopyFile(path2, name2);
+    _ = wf.addCopyFile(path3, name3);
+    const id1 = comptime name1[0 .. name1.len - 4];
+    const id2 = comptime name2[0 .. name2.len - 4];
+    const id3 = comptime name3[0 .. name3.len - 4];
+    return b.createModule(.{
+        .root_source_file = wf.add("embedded_children.zig",
+            "pub const " ++ id1 ++ " = @embedFile(\"" ++ name1 ++ "\");\n" ++
+                "pub const " ++ id2 ++ " = @embedFile(\"" ++ name2 ++ "\");\n" ++
+                "pub const " ++ id3 ++ " = @embedFile(\"" ++ name3 ++ "\");\n"),
+        .target = target,
+        .optimize = .Debug,
+    });
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.resolveTargetQuery(.{
         .cpu_arch = .x86_64,
@@ -131,6 +158,7 @@ pub fn build(b: *std.Build) void {
     // ── Level 0: Leaf processes and utilities ─────────────────────
     const compositor = buildProcess(b, target, lib_mod, "compositor", "compositor/main.zig", null);
     const usb_driver = buildProcess(b, target, lib_mod, "usb_driver", "usb_driver/main.zig", null);
+    const nvme_driver = buildProcess(b, target, lib_mod, "nvme_driver", "nvme_driver/main.zig", null);
     const echo = buildUtil(b, target, lib_mod, "echo", "zutils/echo/main.zig");
 
     // Terminal embeds echo, so it's built as a manager
@@ -138,7 +166,7 @@ pub fn build(b: *std.Build) void {
     const terminal = buildProcess(b, target, lib_mod, "terminal", "terminal/main.zig", echo_embed);
 
     // ── Level 1: Managers ──────────────────────────────────────────
-    const svc_embed = makeEmbeddedModule2(b, target, "compositor.elf", compositor, "usb_driver.elf", usb_driver);
+    const svc_embed = makeEmbeddedModule3(b, target, "compositor.elf", compositor, "usb_driver.elf", usb_driver, "nvme_driver.elf", nvme_driver);
     const app_embed = makeEmbeddedModule1(b, target, "terminal.elf", terminal);
 
     const service_manager = buildProcess(b, target, lib_mod, "service_manager", "service_manager/main.zig", svc_embed);

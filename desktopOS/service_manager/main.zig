@@ -52,6 +52,23 @@ pub fn main(perm_view_addr: u64) void {
     }
     syscall.write("service_manager: spawned usb_driver\n");
 
+    // Spawn nvme_driver
+    const id_nvme = channel.my_semantic_id.newChildID() orelse {
+        syscall.write("service_manager: failed to allocate nvme_driver id\n");
+        return;
+    };
+    const nvme_proc = syscall.spawn_child(
+        @intFromPtr(embedded.nvme_driver.ptr),
+        embedded.nvme_driver.len,
+        child_rights.bits(),
+        id_nvme,
+    );
+    if (nvme_proc <= 0) {
+        syscall.write("service_manager: failed to spawn nvme_driver\n");
+        return;
+    }
+    syscall.write("service_manager: spawned nvme_driver\n");
+
     // Wait for device grants from root, then route to children by device class.
     // Device region grants have move semantics -- each handle can only be
     // granted once before it's removed from our table.
@@ -82,6 +99,8 @@ pub fn main(perm_view_addr: u64) void {
                 _ = syscall.grant_perm(entry.handle, @intCast(comp_proc), device_grant_rights);
             } else if (class == @intFromEnum(perms.DeviceClass.usb)) {
                 _ = syscall.grant_perm(entry.handle, @intCast(usb_proc), device_grant_rights);
+            } else if (class == @intFromEnum(perms.DeviceClass.storage)) {
+                _ = syscall.grant_perm(entry.handle, @intCast(nvme_proc), device_grant_rights);
             }
         }
     }
