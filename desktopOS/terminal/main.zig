@@ -28,14 +28,14 @@ pub fn main(perm_view_addr: u64) void {
     var display_client = display.Client.init(display_conn.chan);
     syscall.write("terminal: display channel connected to compositor\n");
 
-    // Find usb_keyboard and connect for keyboard input
+    // Find keyboard and connect for keyboard input
     var kb_handle: u64 = 0;
     while (kb_handle == 0) {
-        kb_handle = channel.findBroadcastHandle(perm_view_addr, .usb_keyboard) orelse 0;
+        kb_handle = channel.findBroadcastHandle(perm_view_addr, .keyboard) orelse 0;
         if (kb_handle == 0) syscall.thread_yield();
     }
-    const kb_conn = Channel.connectAsA(kb_handle, .usb_keyboard, DEFAULT_SHM_SIZE) orelse {
-        syscall.write("terminal: FAIL connectAsA usb_keyboard\n");
+    const kb_conn = Channel.connectAsA(kb_handle, .keyboard, DEFAULT_SHM_SIZE) orelse {
+        syscall.write("terminal: FAIL connectAsA keyboard\n");
         return;
     };
     const kb_chan = kb_conn.chan;

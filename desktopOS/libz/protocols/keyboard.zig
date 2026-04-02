@@ -3,7 +3,7 @@ const lib = @import("lib");
 const Channel = lib.channel.Channel;
 const Protocol = lib.Protocol;
 
-pub const protocol_id: Protocol = .usb_keyboard;
+pub const protocol_id: Protocol = .keyboard;
 
 // ── Commands ─────────────────────────────────────────────────────────
 // B→A (server → client)

@@ -6,15 +6,9 @@ pub const keyboard = @import("protocols/keyboard.zig");
 pub const mouse = @import("protocols/mouse.zig");
 pub const perm_view = @import("perm_view.zig");
 pub const perms = @import("perms.zig");
+pub const protocol = @import("protocols/protocol.zig");
 pub const sync = @import("sync.zig");
 pub const syscall = @import("syscall.zig");
 pub const ui = @import("ui.zig");
 
-/// Well-known service protocol identifiers for discovery.
-pub const Protocol = enum(u8) {
-    compositor = 1,
-    usb_keyboard = 2,
-    usb_mouse = 3,
-    input_control = 4,
-    filesystem = 5,
-};
+pub const Protocol = protocol.Protocol;

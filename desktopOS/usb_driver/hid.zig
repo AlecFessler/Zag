@@ -29,6 +29,7 @@ pub const ReportInfo = struct {
     x: ReportField = .{},
     y: ReportField = .{},
     wheel: ReportField = .{},
+    hwheel: ReportField = .{},
 };
 
 const MAX_USAGES = 16;
@@ -150,7 +151,8 @@ pub fn parse(desc: [*]const u8, len: u16) ReportInfo {
 
 fn hasUsefulFields(info: *const ReportInfo) bool {
     return info.modifiers.count > 0 or info.keys.count > 0 or
-        info.buttons.count > 0 or info.x.bit_size > 0 or info.y.bit_size > 0;
+        info.buttons.count > 0 or info.x.bit_size > 0 or info.y.bit_size > 0 or
+        info.wheel.bit_size > 0 or info.hwheel.bit_size > 0;
 }
 
 fn classifyField(info: *ReportInfo, usage_page: u16, usages: *const [MAX_USAGES]u16, usage_count: u8, usage_min: u16, usage_max: u16, report_size: u8, report_count: u8, is_variable: bool, bit_offset: u16) void {
@@ -166,6 +168,18 @@ fn classifyField(info: *ReportInfo, usage_page: u16, usages: *const [MAX_USAGES]
         // Button Usage Page
         if (info.buttons.count == 0) {
             info.buttons = .{ .bit_offset = bit_offset, .bit_size = report_size, .count = report_count };
+        }
+    } else if (usage_page == 0x0C and is_variable) {
+        // Consumer Page — match AC Pan (horizontal scroll)
+        var u_idx: u8 = 0;
+        var field_bit = bit_offset;
+        while (u_idx < report_count) : (u_idx += 1) {
+            const usage: u16 = if (u_idx < usage_count) usages[u_idx] else if (usage_min > 0) usage_min + u_idx else 0;
+            switch (usage) {
+                0x238 => info.hwheel = .{ .bit_offset = field_bit, .bit_size = report_size, .count = 1 },
+                else => {},
+            }
+            field_bit += report_size;
         }
     } else if (usage_page == 0x01 and is_variable) {
         // Generic Desktop — match X, Y, Wheel
