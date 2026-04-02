@@ -97,6 +97,8 @@ const NavEntry = struct {
     active_pane: Pane,
 };
 
+const CliQuery = enum { none, list_files, source, disasm, func };
+
 // ── Main ────────────────────────────────────────────────────────────────────
 
 pub fn main() !void {
@@ -106,17 +108,51 @@ pub fn main() !void {
     defer std.process.argsFree(gpa, args);
 
     if (args.len < 2) {
-        _ = std.posix.write(2, "Usage: bin_analyzer <elf-binary>\n") catch {};
+        _ = std.posix.write(2, usage_text) catch {};
         std.process.exit(1);
     }
 
-    const elf_path = args[1];
+    // Parse flags — query mode if any --flag is present
+    var elf_path: ?[]const u8 = null;
+    var query: CliQuery = .none;
+    var query_arg: ?[]const u8 = null;
+    var context_lines: usize = 5;
+
+    var i: usize = 1;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "--list-files")) {
+            query = .list_files;
+        } else if (std.mem.eql(u8, arg, "--source")) {
+            query = .source;
+            i += 1;
+            if (i < args.len) query_arg = args[i];
+        } else if (std.mem.eql(u8, arg, "--disasm")) {
+            query = .disasm;
+            i += 1;
+            if (i < args.len) query_arg = args[i];
+        } else if (std.mem.eql(u8, arg, "--func")) {
+            query = .func;
+            i += 1;
+            if (i < args.len) query_arg = args[i];
+        } else if (std.mem.eql(u8, arg, "--context") or std.mem.eql(u8, arg, "-C")) {
+            i += 1;
+            if (i < args.len) context_lines = std.fmt.parseInt(usize, args[i], 10) catch 5;
+        } else if (arg[0] != '-') {
+            elf_path = arg;
+        }
+    }
+
+    const path = elf_path orelse {
+        _ = std.posix.write(2, usage_text) catch {};
+        std.process.exit(1);
+    };
 
     // Load ELF + DWARF
-    var dwarf = try loadDwarf(gpa, elf_path);
+    var dwarf = try loadDwarf(gpa, path);
 
     // Run objdump and parse
-    const objdump_output = try runObjdump(gpa, elf_path);
+    const objdump_output = try runObjdump(gpa, path);
     var disasm_lines_list: std.ArrayList(DisasmLine) = .empty;
     var addr_to_disasm = std.AutoHashMap(u64, usize).init(gpa);
     parseDisasm(gpa, objdump_output, &disasm_lines_list, &addr_to_disasm);
@@ -128,13 +164,18 @@ pub fn main() !void {
     var reverse_map = std.AutoHashMap(SourceKey, DisasmIdxList).init(gpa);
     try buildReverseMap(gpa, &dwarf, &addr_to_disasm, &file_paths, &file_path_map, &reverse_map);
 
-    // Init terminal
+    // CLI query mode
+    if (query != .none) {
+        try cliMode(gpa, query, query_arg, context_lines, &dwarf, disasm_lines, &addr_to_disasm, &file_paths, &file_path_map, &reverse_map);
+        return;
+    }
+
+    // TUI mode
     const tty = try std.fs.openFileAbsolute("/dev/tty", .{ .mode = .read_write });
     const orig_termios = try std.posix.tcgetattr(tty.handle);
     enableRawMode(tty.handle, orig_termios);
     const ws = getWinSize(tty.handle);
 
-    // Enter alternate screen + hide cursor
     try tty.writeAll("\x1b[?1049h\x1b[?25l");
 
     var app = App{
@@ -166,11 +207,9 @@ pub fn main() !void {
         .orig_termios = orig_termios,
     };
 
-    // Find first instruction with debug info to set initial view
     setInitialView(&app);
     try updateHighlights(&app);
 
-    // Main loop
     while (true) {
         try render(&app);
         const action = try readInput(tty);
@@ -217,8 +256,8 @@ pub fn main() !void {
                 try updateHighlights(&app);
             },
             .goto_file => {
-                if (try readPrompt(&app, "file: ")) |query| {
-                    gotoFile(&app, query);
+                if (try readPrompt(&app, "file: ")) |query_str| {
+                    gotoFile(&app, query_str);
                     try updateHighlights(&app);
                 }
             },
@@ -248,9 +287,311 @@ pub fn main() !void {
         }
     }
 
-    // Cleanup
     try tty.writeAll("\x1b[?25h\x1b[?1049l");
     try std.posix.tcsetattr(tty.handle, .FLUSH, orig_termios);
+}
+
+const usage_text =
+    \\Usage: bin_analyzer <elf-binary> [options]
+    \\
+    \\  No options: launch interactive TUI
+    \\
+    \\  --list-files           List all source files in debug info
+    \\  --source <file:line>   Show source line and its disassembly
+    \\  --disasm <addr>        Show disassembly at address and its source
+    \\  --func <name>          Find function by name, show location + disasm
+    \\  -C, --context <n>      Lines of context around matches (default 5)
+    \\
+;
+
+// ── CLI query mode ──────────────────────────────────────────────────────────
+
+fn cliMode(
+    gpa: Allocator,
+    query: CliQuery,
+    query_arg: ?[]const u8,
+    context_lines: usize,
+    dwarf: *Dwarf,
+    disasm_lines: []DisasmLine,
+    addr_to_disasm: *std.AutoHashMap(u64, usize),
+    file_paths: *std.ArrayList([]const u8),
+    file_path_map: *std.StringHashMap(u32),
+    reverse_map: *std.AutoHashMap(SourceKey, DisasmIdxList),
+) !void {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(gpa);
+    const w = out.writer(gpa);
+
+    switch (query) {
+        .list_files => {
+            try w.writeAll("Source files in debug info:\n");
+            for (file_paths.items) |path| {
+                try w.print("  {s}\n", .{path});
+            }
+        },
+        .source => {
+            const arg = query_arg orelse {
+                try w.writeAll("Error: --source requires <file:line> argument\n");
+                try writeOut(out.items);
+                return;
+            };
+            try cliSource(gpa, w, arg, context_lines, dwarf, disasm_lines, file_paths, file_path_map, reverse_map);
+        },
+        .disasm => {
+            const arg = query_arg orelse {
+                try w.writeAll("Error: --disasm requires <addr> argument\n");
+                try writeOut(out.items);
+                return;
+            };
+            try cliDisasm(gpa, w, arg, context_lines, dwarf, disasm_lines, addr_to_disasm);
+        },
+        .func => {
+            const arg = query_arg orelse {
+                try w.writeAll("Error: --func requires <name> argument\n");
+                try writeOut(out.items);
+                return;
+            };
+            try cliFunc(gpa, w, arg, context_lines, dwarf, disasm_lines);
+        },
+        .none => {},
+    }
+
+    try writeOut(out.items);
+}
+
+fn writeOut(data: []const u8) !void {
+    _ = std.posix.write(1, data) catch return error.WriteError;
+}
+
+fn cliSource(
+    gpa: Allocator,
+    w: anytype,
+    arg: []const u8,
+    context_lines: usize,
+    dwarf: *Dwarf,
+    disasm_lines: []DisasmLine,
+    file_paths: *std.ArrayList([]const u8),
+    file_path_map: *std.StringHashMap(u32),
+    reverse_map: *std.AutoHashMap(SourceKey, DisasmIdxList),
+) !void {
+    // Parse "file:line" or "file" (shows first lines)
+    const colon = std.mem.lastIndexOfScalar(u8, arg, ':');
+    const file_query = if (colon) |c| arg[0..c] else arg;
+    const target_line: ?u32 = if (colon) |c| std.fmt.parseInt(u32, arg[c + 1 ..], 10) catch null else null;
+
+    // Find matching file
+    var match_path: ?[]const u8 = null;
+    for (file_paths.items) |path| {
+        if (std.mem.indexOf(u8, path, file_query) != null) {
+            match_path = path;
+            break;
+        }
+    }
+
+    const file_path = match_path orelse {
+        try w.print("No file matching '{s}' found in debug info.\nUse --list-files to see available files.\n", .{file_query});
+        return;
+    };
+
+    try w.print("── {s} ──\n", .{file_path});
+
+    // Load source
+    const source = loadSourceFileStatic(gpa, file_path);
+    const line_num = target_line orelse 1;
+
+    if (source) |lines| {
+        const start = if (line_num > context_lines) line_num - context_lines else 1;
+        const end = @min(line_num + context_lines, @as(u32, @intCast(lines.len)));
+
+        try w.writeAll("\nSource:\n");
+        for (start..end + 1) |ln| {
+            const marker: u8 = if (ln == line_num) '>' else ' ';
+            if (ln - 1 < lines.len) {
+                try w.print("  {c} {d:>5} | {s}\n", .{ marker, ln, lines[ln - 1] });
+            }
+        }
+    } else {
+        try w.writeAll("  (source file not found on disk)\n");
+    }
+
+    // Show corresponding disasm
+    const file_idx = file_path_map.get(file_path) orelse resolveFileIdxStatic(file_paths, file_path) orelse return;
+    if (target_line) |tl| {
+        const key = SourceKey{ .file_idx = file_idx, .line = tl };
+        if (reverse_map.get(key)) |indices| {
+            try w.writeAll("\nDisassembly:\n");
+            for (indices.items) |idx| {
+                if (idx < disasm_lines.len) {
+                    try w.print("  {s}\n", .{disasm_lines[idx].text});
+                }
+            }
+        } else {
+            try w.writeAll("\n  (no disassembly for this line)\n");
+        }
+    } else {
+        // Show disasm for first few lines that have mappings
+        try w.writeAll("\nDisassembly (first mapped lines):\n");
+        var shown: usize = 0;
+        var ln: u32 = 1;
+        while (ln < 200 and shown < 20) : (ln += 1) {
+            const key = SourceKey{ .file_idx = file_idx, .line = ln };
+            if (reverse_map.get(key)) |indices| {
+                for (indices.items) |idx| {
+                    if (idx < disasm_lines.len) {
+                        try w.print("  {s}\n", .{disasm_lines[idx].text});
+                        shown += 1;
+                    }
+                }
+            }
+        }
+    }
+
+    _ = dwarf;
+}
+
+fn cliDisasm(
+    gpa: Allocator,
+    w: anytype,
+    arg: []const u8,
+    context_lines: usize,
+    dwarf: *Dwarf,
+    disasm_lines: []DisasmLine,
+    addr_to_disasm: *std.AutoHashMap(u64, usize),
+) !void {
+    const addr = parseHexAddr(arg) orelse {
+        try w.print("Error: cannot parse address '{s}'\n", .{arg});
+        return;
+    };
+
+    // Find in disasm — exact match or closest
+    const idx = addr_to_disasm.get(addr) orelse blk: {
+        // Find closest
+        var best: ?usize = null;
+        var best_diff: u64 = std.math.maxInt(u64);
+        for (disasm_lines, 0..) |dl, di| {
+            if (dl.is_label or dl.address == 0) continue;
+            const diff = if (dl.address >= addr) dl.address - addr else addr - dl.address;
+            if (diff < best_diff) {
+                best_diff = diff;
+                best = di;
+            }
+        }
+        break :blk best orelse {
+            try w.print("Address 0x{x} not found in disassembly.\n", .{addr});
+            return;
+        };
+    };
+
+    // Show disasm context
+    try w.print("── Disassembly around 0x{x} ──\n\n", .{addr});
+    const start = idx -| context_lines;
+    const end = @min(idx + context_lines + 1, disasm_lines.len);
+    for (start..end) |di| {
+        const marker: u8 = if (di == idx) '>' else ' ';
+        try w.print("  {c} {s}\n", .{ marker, disasm_lines[di].text });
+    }
+
+    // Show source location
+    if (idx < disasm_lines.len) {
+        const dl = disasm_lines[idx];
+        if (!dl.is_label and dl.address != 0) {
+            const cu = dwarf.findCompileUnit(dl.address) catch return;
+            const sloc = dwarf.getLineNumberInfo(gpa, cu, dl.address) catch return;
+            try w.print("\n── Source: {s}:{d} ──\n\n", .{ sloc.file_name, sloc.line });
+
+            if (loadSourceFileStatic(gpa, sloc.file_name)) |lines| {
+                const src_line: u32 = @intCast(sloc.line);
+                const s = if (src_line > context_lines) src_line - context_lines else 1;
+                const e = @min(src_line + context_lines, @as(u32, @intCast(lines.len)));
+                for (s..e + 1) |ln| {
+                    const m: u8 = if (ln == src_line) '>' else ' ';
+                    if (ln - 1 < lines.len) {
+                        try w.print("  {c} {d:>5} | {s}\n", .{ m, ln, lines[ln - 1] });
+                    }
+                }
+            } else {
+                try w.writeAll("  (source file not found on disk)\n");
+            }
+        }
+    }
+}
+
+fn cliFunc(
+    gpa: Allocator,
+    w: anytype,
+    name: []const u8,
+    context_lines: usize,
+    dwarf: *Dwarf,
+    disasm_lines: []DisasmLine,
+) !void {
+    // Search labels for function name
+    var found = false;
+    for (disasm_lines, 0..) |dl, di| {
+        if (!dl.is_label) continue;
+        if (std.mem.indexOf(u8, dl.text, name) == null) continue;
+
+        found = true;
+        try w.print("── {s} ──\n\n", .{dl.text});
+
+        // Show instructions following the label
+        try w.writeAll("Disassembly:\n");
+        var count: usize = 0;
+        var ii = di + 1;
+        while (ii < disasm_lines.len and count < context_lines * 2 + 10) : (ii += 1) {
+            if (disasm_lines[ii].is_label) break; // next function
+            try w.print("  {s}\n", .{disasm_lines[ii].text});
+            count += 1;
+        }
+
+        // Source location from first instruction
+        if (di + 1 < disasm_lines.len) {
+            const first_instr = disasm_lines[di + 1];
+            if (!first_instr.is_label and first_instr.address != 0) {
+                const cu = dwarf.findCompileUnit(first_instr.address) catch continue;
+                const sloc = dwarf.getLineNumberInfo(gpa, cu, first_instr.address) catch continue;
+                try w.print("\nDefined at: {s}:{d}\n", .{ sloc.file_name, sloc.line });
+
+                if (loadSourceFileStatic(gpa, sloc.file_name)) |lines| {
+                    const src_line: u32 = @intCast(sloc.line);
+                    const s = if (src_line > context_lines) src_line - context_lines else 1;
+                    const e = @min(src_line + context_lines, @as(u32, @intCast(lines.len)));
+                    try w.writeAll("\nSource:\n");
+                    for (s..e + 1) |ln| {
+                        const m: u8 = if (ln == src_line) '>' else ' ';
+                        if (ln - 1 < lines.len) {
+                            try w.print("  {c} {d:>5} | {s}\n", .{ m, ln, lines[ln - 1] });
+                        }
+                    }
+                }
+            }
+        }
+        try w.writeByte('\n');
+    }
+
+    if (!found) {
+        try w.print("No function matching '{s}' found.\n", .{name});
+    }
+}
+
+fn loadSourceFileStatic(gpa: Allocator, path: []const u8) ?[][]const u8 {
+    const file = std.fs.cwd().openFile(path, .{}) catch return null;
+    defer file.close();
+    const content = file.readToEndAlloc(gpa, std.math.maxInt(u32)) catch return null;
+
+    var lines_list: std.ArrayList([]const u8) = .empty;
+    var iter = std.mem.splitScalar(u8, content, '\n');
+    while (iter.next()) |line| {
+        lines_list.append(gpa, line) catch return null;
+    }
+    return lines_list.toOwnedSlice(gpa) catch null;
+}
+
+fn resolveFileIdxStatic(file_paths: *std.ArrayList([]const u8), file: []const u8) ?u32 {
+    const basename = std.fs.path.basename(file);
+    for (file_paths.items, 0..) |path, idx| {
+        if (std.mem.endsWith(u8, path, basename)) return @intCast(idx);
+    }
+    return null;
 }
 
 // ── ELF / DWARF loading ────────────────────────────────────────────────────

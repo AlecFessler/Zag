@@ -40,7 +40,7 @@ fn testShmMapWriteReadUnmap() void {
         t.failWithVal("shm_map failed", 0, map_rc);
         return;
     }
-    const ptr: *volatile u64 = @ptrFromInt(base);
+    const ptr: *u64 = @ptrFromInt(base);
     ptr.* = 0xDEADBEEF;
     if (ptr.* != 0xDEADBEEF) {
         t.fail("write/read through SHM failed");
@@ -71,9 +71,9 @@ fn testShmUnmapRestoresPrivateAccess() void {
     const base = vm_result.val2;
     _ = syscall.shm_map(@intCast(shm_handle), vm_handle, 0);
     _ = syscall.shm_unmap(@intCast(shm_handle), vm_handle);
-    const ptr: *volatile u8 = @ptrFromInt(base);
+    const ptr: *u8 = @ptrFromInt(base);
     ptr.* = 99;
-    const ptr2: *volatile u8 = @ptrFromInt(base + syscall.PAGE4K);
+    const ptr2: *u8 = @ptrFromInt(base + syscall.PAGE4K);
     ptr2.* = 100;
     if (ptr.* == 99 and ptr2.* == 100) {
         t.pass("S2.2.shm_unmap: reverts to private, max_rights RWX restored");

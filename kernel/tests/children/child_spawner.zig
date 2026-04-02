@@ -41,7 +41,7 @@ pub fn main(perm_view_addr: u64) void {
     const elf_ptr = vm_result.val2;
     const elf_bytes: [*]const u8 = @ptrFromInt(elf_ptr);
 
-    const signal_ptr: *volatile u64 = @ptrFromInt(elf_ptr + shm_size - 8);
+    const signal_ptr: *u64 = @ptrFromInt(elf_ptr + shm_size - 8);
 
     const child_rights = (perms.ProcessRights{ .spawn_thread = true }).bits();
     const child_handle = syscall.proc_create(@intFromPtr(elf_bytes), shm_size - syscall.PAGE4K, child_rights);
@@ -51,5 +51,5 @@ pub fn main(perm_view_addr: u64) void {
     } else {
         signal_ptr.* = 0xDEAD;
     }
-    _ = syscall.futex_wake(@ptrCast(@volatileCast(signal_ptr)), 1);
+    _ = syscall.futex_wake(signal_ptr, 1);
 }

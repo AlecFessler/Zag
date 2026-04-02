@@ -86,13 +86,13 @@ pub fn section(name: []const u8) void {
 
 const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 
-pub fn waitUntilNonZero(ptr: *volatile u64) void {
+pub fn waitUntilNonZero(ptr: *u64) void {
     while (ptr.* == 0) {
         _ = syscall.futex_wait(@ptrFromInt(@intFromPtr(ptr)), 0, MAX_TIMEOUT);
     }
 }
 
-pub fn waitUntilAtLeast(ptr: *volatile u64, min: u64) void {
+pub fn waitUntilAtLeast(ptr: *u64, min: u64) void {
     while (ptr.* < min) {
         _ = syscall.futex_wait(@ptrFromInt(@intFromPtr(ptr)), ptr.*, MAX_TIMEOUT);
     }

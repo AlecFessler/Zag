@@ -30,11 +30,11 @@ fn testRestartWithVerification() void {
     _ = syscall.shm_map(@intCast(shm_handle), @intCast(vm_result.val), 0);
     const base = vm_result.val2;
 
-    const run_counter: *volatile u64 = @ptrFromInt(base);
+    const run_counter: *u64 = @ptrFromInt(base);
     run_counter.* = 0;
     var i: usize = 1;
     while (i < 512) : (i += 1) {
-        const slot: *volatile u64 = @ptrFromInt(base + i * 8);
+        const slot: *u64 = @ptrFromInt(base + i * 8);
         slot.* = 0xFFFF;
     }
 
@@ -63,8 +63,8 @@ fn testRestartWithVerification() void {
 
     t.pass("S2.6: restartable child ran 2+ times (restart works)");
 
-    const shm_count_run1: *volatile u64 = @ptrFromInt(base + 24);
-    const vm_res_run1: *volatile u64 = @ptrFromInt(base + 32);
+    const shm_count_run1: *u64 = @ptrFromInt(base + 24);
+    const vm_res_run1: *u64 = @ptrFromInt(base + 32);
 
     if (shm_count_run1.* >= 1) {
         t.pass("S2.6: SHM perm entries persist across restart");

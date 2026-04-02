@@ -47,7 +47,7 @@ fn testCrossProcessShmAndGrant() void {
         t.fail("parent shm_map failed");
         return;
     }
-    const parent_ptr: *volatile u64 = @ptrFromInt(vm_result.val2);
+    const parent_ptr: *u64 = @ptrFromInt(vm_result.val2);
     parent_ptr.* = 0;
 
     const child_elf = embedded.child_shm_counter;

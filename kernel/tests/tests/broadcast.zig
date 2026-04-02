@@ -231,7 +231,7 @@ fn testGrantViaBroadcastTable(perm_view_addr: u64) void {
         t.failWithVal("setup: shm_map failed", 0, map_rc);
         return;
     }
-    const shm_ptr: *volatile u64 = @ptrFromInt(vm_result.val2);
+    const shm_ptr: *u64 = @ptrFromInt(vm_result.val2);
     shm_ptr.* = 0;
 
     // Spawn child with broadcast right — it will call broadcast(0xBEEF)

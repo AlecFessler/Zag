@@ -42,7 +42,7 @@ fn testZombieChain() void {
         dest[i] = child_exit_elf[i];
     }
 
-    const signal_ptr: *volatile u64 = @ptrFromInt(vm_result.val2 + aligned_size - 8);
+    const signal_ptr: *u64 = @ptrFromInt(vm_result.val2 + aligned_size - 8);
     signal_ptr.* = 0;
 
     const child_rights = (perms.ProcessRights{

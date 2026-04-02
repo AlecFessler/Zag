@@ -198,7 +198,7 @@ fn testShmMapBusy() void {
         t.fail("setup failed");
         return;
     }
-    const ptr: *volatile u8 = @ptrFromInt(vm_result.val2);
+    const ptr: *u8 = @ptrFromInt(vm_result.val2);
     ptr.* = 42;
     const rc = syscall.shm_map(@intCast(shm_handle), @intCast(vm_result.val), 0);
     t.expectEqual("S2.2.shm_map: committed pages in range returns E_BUSY", -11, rc);

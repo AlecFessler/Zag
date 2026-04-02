@@ -43,7 +43,7 @@ pub fn main(perm_view_addr: u64) void {
     const map_rc = syscall.shm_map(shm_handle, @intCast(vm_result.val), 0);
     if (map_rc != 0) return;
 
-    const ptr: *volatile u64 = @ptrFromInt(vm_result.val2);
+    const ptr: *u64 = @ptrFromInt(vm_result.val2);
     ptr.* = 0xCAFE;
     _ = syscall.futex_wake(@ptrFromInt(vm_result.val2), 1);
 }
