@@ -45,7 +45,7 @@ fn testStackOverflowCrashReason(perm_view_addr: u64) void {
     // Spawn restartable child
     const child_elf = embedded.child_stack_overflow_restart;
     const child_rights = (perms.ProcessRights{
-        .grant_to = true,
+        .grant_to_child = true,
         .spawn_thread = true,
         .mem_reserve = true,
         .shm_create = true,

@@ -40,7 +40,7 @@ fn testRestartWithVerification() void {
 
     const child_elf = embedded.child_restart_verify;
     const child_rights = (perms.ProcessRights{
-        .grant_to = true,
+        .grant_to_child = true,
         .spawn_thread = true,
         .mem_reserve = true,
         .shm_create = true,

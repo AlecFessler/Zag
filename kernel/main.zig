@@ -49,12 +49,11 @@ export fn kTrampoline(boot_info: *BootInfo) noreturn {
 
 fn kMain(boot_info: *BootInfo) !void {
     arch.init();
-    arch.print("K: memory init\n", .{});
     try memory.init(boot_info.mmap);
     try memory.initHeap();
     _ = try debug.info.init(boot_info.elf_blob, memory.heap_allocator);
-    arch.print("K: memory done, firmware tables\n", .{});
     try arch.parseFirmwareTables(boot_info.xsdp_phys);
+
     if (boot_info.framebuffer.pixel_format != .none and boot_info.framebuffer.base.addr != 0) {
         const fb = &boot_info.framebuffer;
         _ = device_registry.registerDisplayDevice(
@@ -65,16 +64,13 @@ fn kMain(boot_info: *BootInfo) !void {
             @truncate(fb.stride),
             @intFromEnum(fb.pixel_format),
         ) catch {};
-        arch.print("K: registered GOP framebuffer {}x{}\n", .{ fb.width, fb.height });
     }
-    arch.print("K: sched init\n", .{});
+
     const rs_phys = PAddr.fromInt(@intFromPtr(boot_info.root_service.ptr));
     const rs_virt = VAddr.fromPAddr(rs_phys, null);
     const rs_ptr: [*]const u8 = @ptrFromInt(rs_virt.addr);
     try sched.globalInit(rs_ptr[0..boot_info.root_service.len]);
-    arch.print("K: smp init\n", .{});
     try arch.smpInit();
-    arch.print("K: per core init\n", .{});
     sched.perCoreInit();
     arch.halt();
 }

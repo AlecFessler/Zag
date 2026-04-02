@@ -26,7 +26,18 @@ pub fn registerMmioDevice(
     pci_func: u8,
 ) !*DeviceRegion {
     if (device_count >= MAX_DEVICES) return error.TooManyDevices;
-    const dr = try device_region_mod.createMmio(phys_base, size, device_class, pci_vendor, pci_device, pci_class, pci_subclass, pci_bus, pci_dev, pci_func);
+    const dr = try device_region_mod.createMmio(
+        phys_base,
+        size,
+        device_class,
+        pci_vendor,
+        pci_device,
+        pci_class,
+        pci_subclass,
+        pci_bus,
+        pci_dev,
+        pci_func,
+    );
     device_table[device_count] = dr;
     device_count += 1;
     return dr;
@@ -45,7 +56,18 @@ pub fn registerPortIoDevice(
     pci_func: u8,
 ) !*DeviceRegion {
     if (device_count >= MAX_DEVICES) return error.TooManyDevices;
-    const dr = try device_region_mod.createPortIo(base_port, port_count, device_class, pci_vendor, pci_device, pci_class, pci_subclass, pci_bus, pci_dev, pci_func);
+    const dr = try device_region_mod.createPortIo(
+        base_port,
+        port_count,
+        device_class,
+        pci_vendor,
+        pci_device,
+        pci_class,
+        pci_subclass,
+        pci_bus,
+        pci_dev,
+        pci_func,
+    );
     device_table[device_count] = dr;
     device_count += 1;
     return dr;
@@ -60,7 +82,14 @@ pub fn registerDisplayDevice(
     fb_pixel_format: u8,
 ) !*DeviceRegion {
     if (device_count >= MAX_DEVICES) return error.TooManyDevices;
-    const dr = try device_region_mod.createDisplay(phys_base, size, fb_width, fb_height, fb_stride, fb_pixel_format);
+    const dr = try device_region_mod.createDisplay(
+        phys_base,
+        size,
+        fb_width,
+        fb_height,
+        fb_stride,
+        fb_pixel_format,
+    );
     device_table[device_count] = dr;
     device_count += 1;
     return dr;

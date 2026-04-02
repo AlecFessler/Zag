@@ -3,6 +3,7 @@ const zag = @import("zag");
 
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
+const broadcast_mod = zag.perms.broadcast;
 const futex = zag.sched.futex;
 const iommu = zag.arch.x64.iommu;
 const paging = zag.memory.paging;
@@ -61,6 +62,7 @@ pub const SyscallNum = enum(u64) {
     dma_map,
     dma_unmap,
     pin_exclusive,
+    broadcast,
     _,
 };
 
@@ -109,6 +111,7 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
         .dma_map => ok(sysDmaMap(arg0, arg1)),
         .dma_unmap => ok(sysDmaUnmap(arg0, arg1)),
         .pin_exclusive => ok(sysPinExclusive()),
+        .broadcast => ok(sysBroadcast(arg0)),
         _ => err(E_INVAL),
     };
 }
@@ -186,26 +189,20 @@ fn sysVmPerms(vm_handle: u64, offset: u64, size: u64, perms_bits: u64) i64 {
     return E_OK;
 }
 
-var dbg_shm_count: u32 = 0;
 fn sysShmCreate(size: u64, rights_bits: u64) i64 {
-    dbg_shm_count += 1;
     if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) {
-        if (dbg_shm_count <= 5) arch.print("K: shm_create INVAL s={d} r={d}\n", .{ size, rights_bits });
         return E_INVAL;
     }
 
     const proc = currentProc();
     const self_entry = proc.getPermByHandle(0) orelse {
-        if (dbg_shm_count <= 5) arch.print("K: shm_create NOPERM pid={d}\n", .{proc.pid});
         return E_PERM;
     };
     if (!self_entry.processRights().shm_create) {
-        if (dbg_shm_count <= 5) arch.print("K: shm_create NOSHM pid={d}\n", .{proc.pid});
         return E_PERM;
     }
 
     const shm = SharedMemory.create(size) catch {
-        if (dbg_shm_count <= 5) arch.print("K: shm_create NOMEM pid={d} s={d}\n", .{ proc.pid, size });
         return E_NOMEM;
     };
 
@@ -372,7 +369,6 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms: u64) i64 {
         return E_MAXCAP;
     };
 
-    arch.print("K: proc_create pid={d} entry=0x{x}\n", .{ child.pid, child.threads[0].ctx.*.rip });
     sched.enqueueOnCore(arch.coreID(), child.threads[0]);
     return @intCast(handle_id);
 }
@@ -432,12 +428,20 @@ fn sysGrantPerm(src_handle: u64, target_proc_handle: u64, granted_rights: u64) i
     const granted_u16: u16 = @truncate(granted_rights);
 
     const src_entry = proc.getPermByHandle(src_handle) orelse return E_BADCAP;
+    const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
+    const self_rights = self_entry.processRights();
 
-    const target_entry = proc.getPermByHandle(target_proc_handle) orelse return E_BADCAP;
-    if (target_entry.object != .process) return E_BADCAP;
-    if (!target_entry.processRights().grant_to) return E_PERM;
+    var target_proc: *Process = undefined;
 
-    const target_proc = target_entry.object.process;
+    if (target_proc_handle >= broadcast_mod.BROADCAST_OFFSET) {
+        if (!self_rights.grant_to_broadcast) return E_PERM;
+        target_proc = broadcast_mod.resolveHandle(target_proc_handle) orelse return E_BADCAP;
+    } else {
+        if (!self_rights.grant_to_child) return E_PERM;
+        const target_entry = proc.getPermByHandle(target_proc_handle) orelse return E_BADCAP;
+        if (target_entry.object != .process) return E_BADCAP;
+        target_proc = target_entry.object.process;
+    }
 
     switch (src_entry.object) {
         .shared_memory => |shm| {
@@ -507,6 +511,9 @@ fn sysRevokePerm(handle: u64) i64 {
         .dead_process => {
             proc.removePerm(handle) catch {};
         },
+        .broadcast_table => {
+            proc.removePerm(handle) catch {};
+        },
         .empty => return E_BADCAP,
     }
 
@@ -551,11 +558,9 @@ fn sysShutdown() noreturn {
     const self_entry = proc.getPermByHandle(0);
     if (self_entry) |entry| {
         if (entry.processRights().shutdown) {
-            arch.print("shutdown: initiated by process\n", .{});
             arch.shutdown();
         }
     }
-    arch.print("shutdown: denied (no permission)\n", .{});
     while (true) {
         arch.enableInterrupts();
         asm volatile ("hlt");
@@ -647,6 +652,17 @@ fn sysPinExclusive() i64 {
     };
 
     return @intCast(handle_id);
+}
+
+fn sysBroadcast(payload: u64) i64 {
+    const proc = currentProc();
+    const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
+    if (!self_entry.processRights().broadcast) return E_PERM;
+    broadcast_mod.insert(proc, payload) catch |e| return switch (e) {
+        error.TableFull => E_NOMEM,
+        error.DuplicatePayload => E_INVAL,
+    };
+    return E_OK;
 }
 
 fn sysDmaUnmap(device_handle: u64, shm_handle: u64) i64 {

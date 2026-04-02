@@ -46,7 +46,7 @@ fn testZombieChain() void {
     signal_ptr.* = 0;
 
     const child_rights = (perms.ProcessRights{
-        .grant_to = true,
+        .grant_to_child = true,
         .spawn_thread = true,
         .spawn_process = true,
         .mem_reserve = true,

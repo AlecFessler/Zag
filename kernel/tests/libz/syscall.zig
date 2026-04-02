@@ -31,6 +31,7 @@ pub const SyscallNum = enum(u64) {
     dma_map,
     dma_unmap,
     pin_exclusive,
+    broadcast,
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -197,4 +198,8 @@ pub fn dma_unmap(device_handle: u64, shm_handle: u64) i64 {
 
 pub fn pin_exclusive() i64 {
     return syscall0(.pin_exclusive);
+}
+
+pub fn broadcast_syscall(payload: u64) i64 {
+    return syscall1(.broadcast, payload);
 }

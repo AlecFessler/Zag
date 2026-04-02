@@ -37,7 +37,7 @@ Read-only region mapped into the process's address space, mirroring the permissi
 
 Each entry is 32 bytes and contains:
 - `handle: u64` — monotonic ID. `U64_MAX` = empty slot.
-- `type: enum { process, vm_reservation, shared_memory, device_region, core_pin, dead_process }`.
+- `type: enum { process, vm_reservation, shared_memory, device_region, core_pin, dead_process, broadcast_table }`.
 - `rights: u16`.
 
 Type-specific fields:
@@ -101,7 +101,7 @@ Handle = monotonic u64 ID, unique across the lifetime of the process. Handle 0 (
 
 #### Rights
 
-**ProcessRights:** `grant_to`(0), `spawn_thread`(1), `spawn_process`(2), `mem_reserve`(3), `set_affinity`(4), `restart`(5), `shm_create`(6), `device_own`(7), `shutdown`(8), `pin_exclusive`(9). Stored as `u16`.
+**ProcessRights:** `grant_to_child`(0), `spawn_thread`(1), `spawn_process`(2), `mem_reserve`(3), `set_affinity`(4), `restart`(5), `shm_create`(6), `device_own`(7), `shutdown`(8), `pin_exclusive`(9), `grant_to_broadcast`(10), `broadcast`(11). Stored as `u16`. Note: `grant_to_child` and `grant_to_broadcast` are caller-side rights — they are checked on the calling process, not the target.
 
 - `restart`: can only be granted by a parent that itself has `restart`. Once cleared via `disable_restart`, cannot be re-enabled.
 - `shm_create`: required to create shared memory regions.
@@ -121,12 +121,12 @@ Handle = monotonic u64 ID, unique across the lifetime of the process. Handle 0 (
 2. **Shared memory handles** — acquired via `shm_create` or grant. Grantable if `grant` bit set. Granting creates a copy in the target.
 3. **Process handles** — acquired by spawning. Not grantable. **Revoking kills the child's entire subtree** (§2.6).
 4. **Device region handles** — distributed to root service at boot. Exclusive: grant removes from parent, return walks up tree. Target must have `device_own`.
-5. **Downward only** — grants go parent to child (via process handles).
+5. **Caller-side grant checks** — the caller must have `grant_to_child` (when the target is a child process in the caller's perm view) or `grant_to_broadcast` (when the target is identified by a broadcast table handle). These rights are checked on the caller, not the target.
 6. **Subsets only** — granted rights must be a subset of source rights.
 
 #### Grant
 
-Validate: subset of source rights, source has `grant` bit, target has `grant_to`. Device grants additionally require target has `device_own`. SHM: insert in target. Device: remove from source, insert in target (exclusive).
+Validate: granted rights must be a subset of source rights, source must have `grant` bit. Caller must have `grant_to_child` if the target process handle is a child in the caller's perm view, or `grant_to_broadcast` if the target handle identifies a broadcast table entry. Device grants additionally require the target process has `device_own`. SHM: insert in target. Device: remove from source, insert in target (exclusive).
 
 #### Revoke
 
@@ -254,6 +254,22 @@ A core pin object represents exclusive, non-preemptible ownership of a CPU core 
 **User View Encoding:**
 - `field0`: `core_id` (the pinned core index).
 - `field1`: `thread_tid` (the pinned thread's TID).
+
+---
+
+### 2.11 Broadcast Table
+
+A kernel-managed read-only region mapped into every process that has the `grant_to_broadcast` right. The table provides a discovery mechanism: processes with the `broadcast` right register themselves, and processes with `grant_to_broadcast` can see and grant permissions to those broadcasters.
+
+**Structure:** 256 entries, each 16 bytes: `handle: u64` + `payload: u64`. Total size = 1 page (4096 bytes).
+
+**Registration:** A process with the `broadcast` right may call `broadcast(payload)` to insert an entry containing its own process handle and the given payload. A process may broadcast multiple times with unique payloads.
+
+**Death cleanup:** When a broadcaster dies, all its entries are removed and the table is compacted (the last entry fills each gap).
+
+**Dead process restriction:** Dead processes cannot insert new entries.
+
+**User view:** A `broadcast_table` perm view entry type provides the virtual address of the mapping. `field0` = vaddr. Revocable.
 
 ---
 
@@ -416,11 +432,19 @@ The thread must have single-core affinity set. The target core must not already 
 **Returns:** Core pin handle ID (positive).
 **Errors:** `E_PERM` (no `pin_exclusive` right), `E_INVAL` (no affinity set, multi-core affinity, would pin all cores), `E_BUSY` (core already pinned), `E_MAXCAP`.
 
+### broadcast(payload) → result
+
+Register in the global broadcast table. Inserts an entry with the calling process's handle and the given payload. A process may broadcast multiple times with unique payloads.
+
+**Permission:** `HANDLE_SELF.broadcast`.
+**Returns:** `E_OK`.
+**Errors:** `E_PERM` (no `broadcast` right), `E_NOMEM` (table full), `E_INVAL` (duplicate payload).
+
 ---
 
 ### grant_perm(src_handle, target_proc_handle, granted_rights) → result
 
-Grant a capability to a child process. `target_proc_handle` must reference a process entry with `grant_to` set. `granted_rights` must be a subset of `src_handle.rights`. Source must have `grant` bit set.
+Grant a capability to another process. `target_proc_handle` identifies the target: either a child process handle in the caller's perm view (requires caller has `grant_to_child`) or a broadcast table handle (requires caller has `grant_to_broadcast`). `granted_rights` must be a subset of `src_handle.rights`. Source must have `grant` bit set.
 
 - **SHM:** Insert copy in target. Source retains handle.
 - **Device:** Exclusive transfer — remove from source, insert in target. Target must have `device_own`.
@@ -428,7 +452,7 @@ Grant a capability to a child process. `target_proc_handle` must reference a pro
 Only SHM and device handles are grantable. VM reservation and process handles are not grantable.
 
 **Returns:** `E_OK`.
-**Errors:** `E_BADCAP` (invalid src or target handle, target not a process), `E_PERM` (no `grant` bit, target lacks `grant_to`, target lacks `device_own` for device grants, rights exceed source), `E_MAXCAP` (target permissions table full), `E_INVAL` (non-grantable handle type).
+**Errors:** `E_BADCAP` (invalid src or target handle, target not a process), `E_PERM` (no `grant` bit, caller lacks `grant_to_child`/`grant_to_broadcast`, target lacks `device_own` for device grants, rights exceed source), `E_MAXCAP` (target permissions table full), `E_INVAL` (non-grantable handle type).
 
 ### revoke_perm(handle) → result
 
@@ -438,6 +462,7 @@ Cannot revoke `HANDLE_SELF`. Per-type behavior (§2.3):
 - **SHM:** Unmap SHM PTEs, revert mapped regions to private, clear slot.
 - **Device:** Unmap MMIO PTEs, return handle up process tree (§2.1 device handle return), clear slot in source.
 - **Core pin:** Unpin the thread, restore preemptive scheduling on the core, clear slot.
+- **Broadcast table:** Clear slot (process loses visibility into broadcast table).
 - **Process:** Recursively kill child's entire subtree (§2.6). Restartable children restart; non-restartable die. Clear slot.
 - **Dead process:** Clear slot (process already dead, no further cleanup needed).
 
@@ -534,3 +559,4 @@ Write to a Port I/O device. Same validation as `ioport_read`.
 | Futex timed waiter slots | 64 |
 | User permissions view | 1 page (128 entries x 32 bytes) |
 | DMA mappings per process | 16 |
+| Broadcast table capacity | 256 slots |

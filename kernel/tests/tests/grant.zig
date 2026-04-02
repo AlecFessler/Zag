@@ -13,7 +13,6 @@ pub fn run(perm_view_addr: u64) void {
     testGrantInvalidSource();
     testGrantInvalidTarget();
     testGrantNonProcessTarget();
-    testGrantTargetNoGrantTo();
     testDeviceInPermView(perm_view_addr);
     testGrantVmReservationNotGrantable();
     testDeviceGrantNoDeviceOwn(perm_view_addr);
@@ -54,29 +53,6 @@ fn testGrantNonProcessTarget() void {
     t.expectEqual("S4.grant_perm: target must be a process handle", -3, rc);
 }
 
-fn testGrantTargetNoGrantTo() void {
-    const shm_handle = syscall.shm_create(syscall.PAGE4K);
-    if (shm_handle <= 0) {
-        t.fail("setup failed");
-        return;
-    }
-    const child_elf = embedded.child_exit;
-    const child_rights = (perms.ProcessRights{ .spawn_thread = true }).bits();
-    const proc_handle = syscall.proc_create(@intFromPtr(child_elf.ptr), child_elf.len, child_rights);
-    if (proc_handle <= 0) {
-        t.fail("proc_create failed");
-        return;
-    }
-    const grant_rights = (perms.SharedMemoryRights{
-        .read = true,
-        .write = true,
-        .grant = true,
-    }).bits();
-    const rc = syscall.grant_perm(@intCast(shm_handle), @intCast(proc_handle), grant_rights);
-    t.expectEqual("S2.3: target must have grant_to right", -2, rc);
-    t.waitForCleanup(@intCast(proc_handle));
-}
-
 fn testDeviceInPermView(perm_view_addr: u64) void {
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
     var found = false;
@@ -111,7 +87,7 @@ fn testDeviceGrantNoDeviceOwn(perm_view_addr: u64) void {
     };
     const child_elf = embedded.child_exit;
     const child_rights = (perms.ProcessRights{
-        .grant_to = true,
+        .grant_to_child = true,
         .spawn_thread = true,
     }).bits();
     const proc_handle = syscall.proc_create(@intFromPtr(child_elf.ptr), child_elf.len, child_rights);
@@ -132,7 +108,7 @@ fn testDeviceExclusiveTransfer(perm_view_addr: u64) void {
     };
     const child_elf = embedded.child_exit;
     const child_rights = (perms.ProcessRights{
-        .grant_to = true,
+        .grant_to_child = true,
         .spawn_thread = true,
         .device_own = true,
     }).bits();

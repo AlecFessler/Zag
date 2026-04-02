@@ -287,6 +287,7 @@ KernelObject = union(enum) {
     shared_memory: *SharedMemory
     device_region: *DeviceRegion
     core_pin: CorePinObject { core_id, thread_tid }
+    broadcast_table: BroadcastTableObject { vaddr: VAddr }
     empty: void
 }
 ```
@@ -335,13 +336,13 @@ UserViewEntry (extern struct, 32 bytes) {
 
 `EMPTY` sentinel: `handle = U64_MAX, entry_type = 0xFF, rights = 0, field0 = 0, field1 = 0`.
 
-Types: `process = 0, vm_reservation = 1, shared_memory = 2, device_region = 3`.
+Types: `process = 0, vm_reservation = 1, shared_memory = 2, device_region = 3, core_pin = 4, dead_process = 5, broadcast_table = 6`.
 
 ### Rights Types
 
 All rights are packed structs with bit fields:
 
-- `ProcessRights`: packed `u16` -- `grant_to`(0), `spawn_thread`(1), `spawn_process`(2), `mem_reserve`(3), `set_affinity`(4), `restart`(5), `shm_create`(6), `device_own`(7), `shutdown`(8), `pin_exclusive`(9), 6 bits reserved.
+- `ProcessRights`: packed `u16` -- `grant_to_child`(0), `spawn_thread`(1), `spawn_process`(2), `mem_reserve`(3), `set_affinity`(4), `restart`(5), `shm_create`(6), `device_own`(7), `shutdown`(8), `pin_exclusive`(9), `grant_to_broadcast`(10), `broadcast`(11), 4 bits reserved.
 - `VmReservationRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4), 3 bits reserved.
 - `SharedMemoryRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `grant`(3), 4 bits reserved.
 - `DeviceRegionRights`: packed `u8` -- `map`(0), `grant`(1), `dma`(2), 5 bits reserved.
@@ -1187,3 +1188,35 @@ Fallback when MCFG is not present or yields zero devices.
 ### Kernel-Internal Devices
 
 HPET, LAPIC, and I/O APIC are discovered during ACPI parsing and mapped into kernel VA space, but they are **not** registered in the device table and **not** exposed to userspace. They are used exclusively by the kernel for timing, interrupt routing, and IPI.
+
+---
+
+## 16. Broadcast Table Internals
+
+### Storage
+
+Global singleton: one physical page (4096 bytes) allocated at boot during `globalInit`. User-visible entries occupy the page as a 256-element array of `BroadcastEntry { handle: u64, payload: u64 }`.
+
+A parallel kernel-only array `internal_procs: [256]?*Process` maps each slot to its owning process. A global `count: u32` tracks the number of active entries. A `SpinLock` serializes all mutations.
+
+### Handle Disambiguation
+
+`BROADCAST_OFFSET = 0x8000_0000_0000_0000`. Broadcast table handles are `BROADCAST_OFFSET + slot_index`. Since per-process handle counters start at 1 and increment monotonically, they never reach `BROADCAST_OFFSET`. `grant_perm` uses `target_proc_handle >= BROADCAST_OFFSET` to distinguish broadcast targets from perm view targets.
+
+### Insert
+
+Linear scan of `entries[0..count]` to enforce payload uniqueness. Rejects inserts from dead processes (`!proc.alive`). Appends at `entries[count]`, increments count.
+
+### Compaction on Death
+
+`removeByProcess(proc)` iterates backward-safe (index not incremented on match). For each matching slot: decrement count, copy last entry into gap (both user-visible and internal arrays), update moved entry's handle to reflect new slot index, zero the vacated last slot.
+
+Called from two paths:
+- `kill()` -- after setting threads to exited, before returning. Ensures broadcast entries are cleaned up before the parent's `waitForCleanup` loop returns.
+- `cleanupPhase1()` -- idempotent second call for the normal exit path.
+
+### Mapping into Processes
+
+During `Process.create`, if `initial_rights.grant_to_broadcast` is set, the broadcast table's physical page is mapped read-only into the process's address space (same pattern as the perm view page). A `broadcast_table` perm entry is inserted with `field0 = vaddr`. The VMM node uses `.preserve` restart policy so the mapping survives process restarts.
+
+The physical page is shared across all processes with `grant_to_broadcast`. When a process dies, its `cleanupPhase1` unmaps the broadcast table PTE before `freeUserAddrSpace` runs, preventing the shared page from being freed with the dying process's address space.
