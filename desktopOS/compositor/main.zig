@@ -4,15 +4,18 @@ const display_mod = @import("display.zig");
 const channel = lib.channel;
 const display = lib.display;
 const mouse = lib.mouse;
+const perm_view = lib.perm_view;
 const perms = lib.perms;
 const syscall = lib.syscall;
 
+const Channel = channel.Channel;
 const Display = display_mod.Display;
 
 // ── Constants ────────────────────────────────────────────────────────
 const MAX_PANES = 8;
 const MAX_WINDOWS_PER_PANE = 8;
 const MAX_TOTAL_WINDOWS = 16;
+const DEFAULT_SHM_SIZE: u64 = 4 * syscall.PAGE4K;
 
 // ── Window / Pane state ──────────────────────────────────────────────
 const Window = struct {
@@ -39,6 +42,31 @@ var window_count: u8 = 0;
 var panes: [MAX_PANES]Pane = .{Pane{}} ** MAX_PANES;
 var pane_count: u8 = 0;
 var active_pane: u8 = 0;
+
+// ── Known SHM tracking ──────────────────────────────────────────────
+var known_shm_handles: [32]u64 = .{0} ** 32;
+var known_shm_count: u8 = 0;
+
+fn pollNewShm(view_addr: u64) ?u64 {
+    const view: *const [128]perm_view.UserViewEntry = @ptrFromInt(view_addr);
+    for (view) |*entry| {
+        if (entry.entry_type == perm_view.ENTRY_TYPE_SHARED_MEMORY) {
+            var known = false;
+            for (known_shm_handles[0..known_shm_count]) |h| {
+                if (h == entry.handle) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known and known_shm_count < 32) {
+                known_shm_handles[known_shm_count] = entry.handle;
+                known_shm_count += 1;
+                return entry.handle;
+            }
+        }
+    }
+    return null;
+}
 
 // ── Cursor ───────────────────────────────────────────────────────────
 const cursor_bitmap = [8]u8{
@@ -73,7 +101,6 @@ fn computeLayout(pane: *const Pane, screen_w: u32, screen_h: u32) TileLayout {
             .tile_h = screen_h,
         };
     }
-    // 2+ windows: two halves at slide_offset
     return .{
         .visible = .{ pane.slide_offset, pane.slide_offset + 1 },
         .visible_count = 2,
@@ -94,10 +121,8 @@ fn addWindowToPane(pane_idx: u8, win_idx: u8) void {
     const pane = &panes[pane_idx];
     if (pane.window_count >= MAX_WINDOWS_PER_PANE) return;
 
-    // Insert after the focused window
     const insert_pos: u8 = if (pane.window_count == 0) 0 else pane.focused + 1;
 
-    // Shift windows right to make room
     var i: u8 = pane.window_count;
     while (i > insert_pos) : (i -= 1) {
         pane.windows[i] = pane.windows[i - 1];
@@ -105,10 +130,8 @@ fn addWindowToPane(pane_idx: u8, win_idx: u8) void {
     pane.windows[insert_pos] = win_idx;
     pane.window_count += 1;
 
-    // Focus the new window and slide so it's visible
     pane.focused = insert_pos;
     if (pane.window_count >= 2) {
-        // Slide so the new window is visible (on the right half)
         const max_offset: u8 = pane.window_count - 2;
         if (insert_pos > 0) {
             pane.slide_offset = @min(insert_pos - 1, max_offset);
@@ -118,7 +141,7 @@ fn addWindowToPane(pane_idx: u8, win_idx: u8) void {
     }
 }
 
-fn registerWindow(chan: *channel.Channel, disp: *const Display) void {
+fn registerWindow(chan: *Channel, disp: *const Display) void {
     const win_idx = allocWindow() orelse {
         syscall.write("compositor: max windows reached\n");
         return;
@@ -132,7 +155,6 @@ fn registerWindow(chan: *channel.Channel, disp: *const Display) void {
 
     const layout_after = computeLayout(pane, disp.width, disp.height);
 
-    // Allocate frame receive buffer for this window
     const tile_w = layout_after.tile_w;
     const tile_h = layout_after.tile_h;
     const frame_size: usize = @as(usize, tile_w) * @as(usize, tile_h) * 4;
@@ -154,7 +176,6 @@ fn registerWindow(chan: *channel.Channel, disp: *const Display) void {
         .has_frame = false,
     };
 
-    // Send render target to new window
     server.sendRenderTarget(.{
         .width = tile_w,
         .height = tile_h,
@@ -165,7 +186,6 @@ fn registerWindow(chan: *channel.Channel, disp: *const Display) void {
         return;
     };
 
-    // If we went from 1→2 visible windows, resize the existing window that was full-screen
     if (layout_before.visible_count == 1 and layout_after.visible_count == 2) {
         resizeExistingWindows(pane, &layout_after, disp);
     }
@@ -174,13 +194,11 @@ fn registerWindow(chan: *channel.Channel, disp: *const Display) void {
 }
 
 fn resizeExistingWindows(pane: *const Pane, layout: *const TileLayout, disp: *const Display) void {
-    // Resize all windows in pane to the new tile size
     for (pane.windows[0..pane.window_count]) |wi| {
         const win = &windows[wi];
         if (!win.active) continue;
         if (win.width == layout.tile_w and win.height == layout.tile_h) continue;
 
-        // Re-allocate frame buffer
         const new_size: usize = @as(usize, layout.tile_w) * @as(usize, layout.tile_h) * 4;
         const aligned: u64 = ((new_size + syscall.PAGE4K - 1) / syscall.PAGE4K) * syscall.PAGE4K;
         const vm_rights = (perms.VmReservationRights{ .read = true, .write = true }).bits();
@@ -225,7 +243,6 @@ fn handleRequestNewPane(from_server: *const display.Server) void {
     panes[new_id] = .{ .active = true };
     pane_count += 1;
 
-    // Notify all active windows
     for (windows[0..window_count]) |*win| {
         if (win.active) {
             win.server.sendPaneCreated(new_id) catch {};
@@ -238,7 +255,6 @@ fn handleSwitchPane(pane_id: u8) void {
     if (pane_id >= pane_count) return;
     active_pane = pane_id;
 
-    // Notify all active windows
     for (windows[0..window_count]) |*win| {
         if (win.active) {
             win.server.sendPaneActivated(pane_id) catch {};
@@ -351,19 +367,25 @@ pub fn main(perm_view_addr: u64) void {
     disp.fill(bg_color);
     disp.present();
 
-    channel.makeDiscoverable(@enumFromInt(@intFromEnum(lib.Protocol.compositor)), 2) catch {
-        syscall.write("compositor: FAIL makeDiscoverable\n");
+    // Broadcast as compositor service
+    channel.broadcast(@intFromEnum(lib.Protocol.compositor)) catch {
+        syscall.write("compositor: FAIL broadcast\n");
         return;
     };
-    syscall.write("compositor: discoverable\n");
+    syscall.write("compositor: broadcast ok\n");
 
-    // Await mouse channel from usb_driver
-    const mouse_chan = channel.awaitIncoming(100, 10_000_000_000) orelse {
-        syscall.write("compositor: FAIL awaitIncoming(100) mouse channel timed out\n");
+    // Wait for mouse channel from usb_driver (first incoming SHM)
+    var mouse_shm: u64 = 0;
+    while (mouse_shm == 0) {
+        mouse_shm = pollNewShm(perm_view_addr) orelse 0;
+        if (mouse_shm == 0) syscall.thread_yield();
+    }
+    const mouse_chan = Channel.connectAsB(mouse_shm, DEFAULT_SHM_SIZE) orelse {
+        syscall.write("compositor: FAIL connectAsB mouse\n");
         return;
     };
     const mouse_server = mouse.Server.init(mouse_chan);
-    syscall.write("compositor: mouse channel 100 connected\n");
+    syscall.write("compositor: mouse channel connected\n");
 
     // Create default pane 0
     panes[0] = .{ .active = true };
@@ -374,35 +396,21 @@ pub fn main(perm_view_addr: u64) void {
     var needs_composite: bool = false;
 
     while (true) {
-        // Accept new display channels dynamically
-        if (channel.pollAnyIncoming()) |chan| {
-            registerWindow(chan, &disp);
-            needs_composite = true;
-
-            // Default focus: send focus_change for the first window
-            if (window_count == 1) {
-                const sid = windows[0].server.chan.semantic_id_a;
-                mouse_server.sendFocusChange(sid) catch {};
+        // Accept new display channels
+        if (pollNewShm(perm_view_addr)) |shm_handle| {
+            if (Channel.connectAsB(shm_handle, display.SHM_SIZE)) |chan| {
+                registerWindow(chan, &disp);
+                needs_composite = true;
             }
         }
 
-        // Drain all pending mouse events before compositing
+        // Drain all pending mouse events
         while (mouse_server.recv()) |msg| {
             switch (msg) {
                 .mouse => |ev| {
                     cursor_x = clampI32(cursor_x + ev.dx, 0, screen_w - 1);
                     cursor_y = clampI32(cursor_y + ev.dy, 0, screen_h - 1);
                     needs_composite = true;
-
-                    // Click-to-focus: send focus_change to USB driver
-                    if (ev.buttons.left) {
-                        const pane = &panes[active_pane];
-                        const layout = computeLayout(pane, disp.width, disp.height);
-                        if (hitTestWindow(pane, &layout, cursor_x, cursor_y)) |win_idx| {
-                            const sid = windows[win_idx].server.chan.semantic_id_a;
-                            mouse_server.sendFocusChange(sid) catch {};
-                        }
-                    }
                 },
             }
         }

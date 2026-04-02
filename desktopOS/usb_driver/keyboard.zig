@@ -5,8 +5,11 @@ const xhci = @import("xhci.zig");
 const channel = lib.channel;
 const keyboard = lib.keyboard;
 
+const Channel = channel.Channel;
+
 /// Process a HID keyboard report using parsed report descriptor info.
-pub fn processReport(dev: *xhci.HidDevice, report: [*]const u8, chan: ?*channel.Channel) void {
+/// Sends events to all connected keyboard channels.
+pub fn processReport(dev: *xhci.HidDevice, report: [*]const u8, channels: []*Channel) void {
     const info = &dev.report_info;
     const data = if (info.report_id > 0) report + 1 else report;
 
@@ -35,13 +38,11 @@ pub fn processReport(dev: *xhci.HidDevice, report: [*]const u8, chan: ?*channel.
             const curr = modifiers & mask;
             if (prev != curr) {
                 const keycode: u8 = 0xE0 + @as(u8, bit);
-                if (chan) |c| {
-                    keyboard.Server.send(c, .{
-                        .keycode = keycode,
-                        .state = if (curr != 0) .pressed else .released,
-                        .modifiers = @bitCast(modifiers),
-                    }) catch {};
-                }
+                sendToAll(channels, .{
+                    .keycode = keycode,
+                    .state = if (curr != 0) .pressed else .released,
+                    .modifiers = @bitCast(modifiers),
+                });
             }
         }
         dev.prev_modifiers = modifiers;
@@ -58,13 +59,11 @@ pub fn processReport(dev: *xhci.HidDevice, report: [*]const u8, chan: ?*channel.
             }
         }
         if (!still_pressed) {
-            if (chan) |c| {
-                keyboard.Server.send(c, .{
-                    .keycode = prev_key,
-                    .state = .released,
-                    .modifiers = @bitCast(modifiers),
-                }) catch {};
-            }
+            sendToAll(channels, .{
+                .keycode = prev_key,
+                .state = .released,
+                .modifiers = @bitCast(modifiers),
+            });
         }
     }
 
@@ -79,15 +78,19 @@ pub fn processReport(dev: *xhci.HidDevice, report: [*]const u8, chan: ?*channel.
             }
         }
         if (!was_pressed) {
-            if (chan) |c| {
-                keyboard.Server.send(c, .{
-                    .keycode = curr_key,
-                    .state = .pressed,
-                    .modifiers = @bitCast(modifiers),
-                }) catch {};
-            }
+            sendToAll(channels, .{
+                .keycode = curr_key,
+                .state = .pressed,
+                .modifiers = @bitCast(modifiers),
+            });
         }
     }
 
     dev.prev_keys = keys;
+}
+
+fn sendToAll(channels: []*Channel, event: keyboard.Event) void {
+    for (channels) |c| {
+        keyboard.Server.send(c, event) catch {};
+    }
 }

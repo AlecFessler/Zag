@@ -1,6 +1,5 @@
 const lib = @import("lib");
 
-const channel = lib.channel;
 const embedded = @import("embedded_children");
 const perm_view = lib.perm_view;
 const perms = lib.perms;
@@ -10,24 +9,21 @@ pub fn main(perm_view_addr: u64) void {
     syscall.write("service_manager: starting\n");
 
     const child_rights = perms.ProcessRights{
-        .grant_to = true,
+        .grant_to_child = true,
         .spawn_thread = true,
         .mem_reserve = true,
         .shm_create = true,
         .restart = true,
         .device_own = true,
+        .grant_to_broadcast = true,
+        .broadcast = true,
     };
 
     // Spawn compositor
-    const id_comp = channel.my_semantic_id.newChildID() orelse {
-        syscall.write("service_manager: failed to allocate compositor id\n");
-        return;
-    };
     const comp_proc = syscall.spawn_child(
         @intFromPtr(embedded.compositor.ptr),
         embedded.compositor.len,
         child_rights.bits(),
-        id_comp,
     );
     if (comp_proc <= 0) {
         syscall.write("service_manager: failed to spawn compositor\n");
@@ -36,38 +32,16 @@ pub fn main(perm_view_addr: u64) void {
     syscall.write("service_manager: spawned compositor\n");
 
     // Spawn usb_driver
-    const id_usb = channel.my_semantic_id.newChildID() orelse {
-        syscall.write("service_manager: failed to allocate usb_driver id\n");
-        return;
-    };
     const usb_proc = syscall.spawn_child(
         @intFromPtr(embedded.usb_driver.ptr),
         embedded.usb_driver.len,
         child_rights.bits(),
-        id_usb,
     );
     if (usb_proc <= 0) {
         syscall.write("service_manager: failed to spawn usb_driver\n");
         return;
     }
     syscall.write("service_manager: spawned usb_driver\n");
-
-    // // Spawn nvme_driver
-    // const id_nvme = channel.my_semantic_id.newChildID() orelse {
-    //     syscall.write("service_manager: failed to allocate nvme_driver id\n");
-    //     return;
-    // };
-    // const nvme_proc = syscall.spawn_child(
-    //     @intFromPtr(embedded.nvme_driver.ptr),
-    //     embedded.nvme_driver.len,
-    //     child_rights.bits(),
-    //     id_nvme,
-    // );
-    // if (nvme_proc <= 0) {
-    //     syscall.write("service_manager: failed to spawn nvme_driver\n");
-    //     return;
-    // }
-    // syscall.write("service_manager: spawned nvme_driver\n");
 
     // Wait for device grants from root, then route to children by device class.
     // Device region grants have move semantics -- each handle can only be
@@ -99,8 +73,6 @@ pub fn main(perm_view_addr: u64) void {
                 _ = syscall.grant_perm(entry.handle, @intCast(comp_proc), device_grant_rights);
             } else if (class == @intFromEnum(perms.DeviceClass.usb)) {
                 _ = syscall.grant_perm(entry.handle, @intCast(usb_proc), device_grant_rights);
-            // } else if (class == @intFromEnum(perms.DeviceClass.storage)) {
-            //     _ = syscall.grant_perm(entry.handle, @intCast(nvme_proc), device_grant_rights);
             }
         }
     }

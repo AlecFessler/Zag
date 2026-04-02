@@ -10,39 +10,67 @@ const perm_view = lib.perm_view;
 const perms = lib.perms;
 const syscall = lib.syscall;
 
+const Channel = channel.Channel;
+
 const MAX_KB_CHANNELS = 16;
 const MAX_PERMS = 128;
 const MAX_USB_CONTROLLERS = 8;
+const DEFAULT_SHM_SIZE: u64 = 4 * syscall.PAGE4K;
 
-var kb_channels: [MAX_KB_CHANNELS]*channel.Channel = undefined;
+var kb_channels: [MAX_KB_CHANNELS]*Channel = undefined;
 var kb_count: u8 = 0;
-var active_semantic_id: u64 = 0;
 var controllers: [MAX_USB_CONTROLLERS]xhci.Controller = .{xhci.Controller{}} ** MAX_USB_CONTROLLERS;
 var ctrl_count: u8 = 0;
 
+// ── Known SHM tracking ──────────────────────────────────────────────
+var known_shm_handles: [32]u64 = .{0} ** 32;
+var known_shm_count: u8 = 0;
+
+fn pollNewShm(view_addr: u64) ?u64 {
+    const view: *const [128]perm_view.UserViewEntry = @ptrFromInt(view_addr);
+    for (view) |*entry| {
+        if (entry.entry_type == perm_view.ENTRY_TYPE_SHARED_MEMORY) {
+            var known = false;
+            for (known_shm_handles[0..known_shm_count]) |h| {
+                if (h == entry.handle) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known and known_shm_count < 32) {
+                known_shm_handles[known_shm_count] = entry.handle;
+                known_shm_count += 1;
+                return entry.handle;
+            }
+        }
+    }
+    return null;
+}
+
 pub fn main(perm_view_addr: u64) void {
-    _ = perm_view_addr;
     syscall.write("usb_driver: starting\n");
 
-    // ── Set up channel discovery early (before hardware init) ───
-    channel.makeDiscoverable(@enumFromInt(@intFromEnum(keyboard.protocol_id)), 2) catch {
-        syscall.write("usb_driver: FAIL makeDiscoverable keyboard\n");
+    // Broadcast keyboard service
+    channel.broadcast(@intFromEnum(keyboard.protocol_id)) catch {
+        syscall.write("usb_driver: FAIL broadcast keyboard\n");
         return;
     };
-    // Connect to compositor for mouse events + focus changes
-    const mouse_chan = channel.requestConnection(
-        @enumFromInt(@intFromEnum(lib.Protocol.compositor)),
-        100,
-        0,
-        10_000_000_000,
-    ) orelse {
-        syscall.write("usb_driver: FAIL requestConnection compositor timed out\n");
+
+    // Connect to compositor for mouse events
+    var comp_handle: u64 = 0;
+    while (comp_handle == 0) {
+        comp_handle = channel.findBroadcastHandle(perm_view_addr, .compositor) orelse 0;
+        if (comp_handle == 0) syscall.thread_yield();
+    }
+    const mouse_chan = Channel.connectAsA(comp_handle, .input_control, DEFAULT_SHM_SIZE) orelse {
+        syscall.write("usb_driver: FAIL connectAsA compositor\n");
         return;
     };
     const mouse_client = mouse.Client.init(mouse_chan);
+    syscall.write("usb_driver: mouse channel connected to compositor\n");
 
-    // ── Collect all USB device handles from permission view ─────
-    const view: *const [MAX_PERMS]perm_view.UserViewEntry = @ptrFromInt(channel.perm_view_addr);
+    // Collect all USB device handles from permission view
+    const view: *const [MAX_PERMS]perm_view.UserViewEntry = @ptrFromInt(perm_view_addr);
     var usb_handles: [MAX_USB_CONTROLLERS]u64 = .{0} ** MAX_USB_CONTROLLERS;
     var usb_mmio_sizes: [MAX_USB_CONTROLLERS]u32 = .{0} ** MAX_USB_CONTROLLERS;
     var usb_count: u8 = 0;
@@ -65,7 +93,7 @@ pub fn main(perm_view_addr: u64) void {
         while (true) syscall.thread_yield();
     }
 
-    // ── Initialize all USB controllers ──────────────────────────
+    // Initialize all USB controllers
     for (usb_handles[0..usb_count], usb_mmio_sizes[0..usb_count]) |handle, mmio_size| {
         const err = controllers[ctrl_count].initFromHandle(handle, mmio_size);
         if (err == .none) {
@@ -73,27 +101,16 @@ pub fn main(perm_view_addr: u64) void {
         }
     }
 
-    // ── Main event loop ─────────────────────────────────────────
+    // Main event loop
     while (true) {
         // Accept new keyboard channels from terminals
-        if (channel.pollAnyIncoming()) |chan| {
-            if (kb_count < MAX_KB_CHANNELS) {
-                kb_channels[kb_count] = chan;
-                kb_count += 1;
-                syscall.write("usb_driver: keyboard channel connected\n");
-
-                if (kb_count == 1) {
-                    active_semantic_id = chan.semantic_id_a;
+        if (pollNewShm(perm_view_addr)) |shm_handle| {
+            if (Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE)) |chan| {
+                if (kb_count < MAX_KB_CHANNELS) {
+                    kb_channels[kb_count] = chan;
+                    kb_count += 1;
+                    syscall.write("usb_driver: keyboard channel connected\n");
                 }
-            }
-        }
-
-        // Check for focus change from compositor
-        if (mouse_client.recv()) |msg| {
-            switch (msg) {
-                .focus_change => |sid| {
-                    active_semantic_id = sid;
-                },
             }
         }
 
@@ -113,7 +130,8 @@ pub fn main(perm_view_addr: u64) void {
 
                                 switch (dev.protocol) {
                                     .keyboard => {
-                                        kb.processReport(dev, report, findFocusedChannel());
+                                        // Send to all connected keyboard channels
+                                        kb.processReport(dev, report, kb_channels[0..kb_count]);
                                     },
                                     .mouse => {
                                         ms.processReport(report, &dev.report_info, &mouse_client);
@@ -135,18 +153,4 @@ pub fn main(perm_view_addr: u64) void {
             syscall.thread_yield();
         }
     }
-}
-
-fn findFocusedChannel() ?*channel.Channel {
-    if (kb_count == 0) return null;
-
-    if (active_semantic_id != 0) {
-        for (kb_channels[0..kb_count]) |chan| {
-            if (chan.semantic_id_a == active_semantic_id) {
-                return chan;
-            }
-        }
-    }
-
-    return kb_channels[0];
 }

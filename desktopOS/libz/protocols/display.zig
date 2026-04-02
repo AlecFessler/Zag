@@ -47,7 +47,7 @@ pub const Server = struct {
         @as(*align(1) u32, @ptrCast(bytes[5..9])).* = info.height;
         @as(*align(1) u32, @ptrCast(bytes[9..13])).* = info.stride;
         @as(*align(1) u32, @ptrCast(bytes[13..17])).* = info.format;
-        try self.chan.enqueue(.B, &bytes);
+        try self.chan.sendMessage(.B, &bytes);
     }
 
     pub fn sendWindowResized(self: *const Server, info: RenderTargetInfo) !void {
@@ -57,23 +57,23 @@ pub const Server = struct {
         @as(*align(1) u32, @ptrCast(bytes[5..9])).* = info.height;
         @as(*align(1) u32, @ptrCast(bytes[9..13])).* = info.stride;
         @as(*align(1) u32, @ptrCast(bytes[13..17])).* = info.format;
-        try self.chan.enqueue(.B, &bytes);
+        try self.chan.sendMessage(.B, &bytes);
     }
 
     pub fn sendPaneCreated(self: *const Server, pane_id: u8) !void {
         const bytes = [2]u8{ CMD_PANE_CREATED, pane_id };
-        try self.chan.enqueue(.B, &bytes);
+        try self.chan.sendMessage(.B, &bytes);
     }
 
     pub fn sendPaneActivated(self: *const Server, pane_id: u8) !void {
         const bytes = [2]u8{ CMD_PANE_ACTIVATED, pane_id };
-        try self.chan.enqueue(.B, &bytes);
+        try self.chan.sendMessage(.B, &bytes);
     }
 
     /// Receive a message from the client. Large messages (>32 bytes) are frame data,
     /// small messages are parsed as tagged commands.
     pub fn recvMessage(self: *const Server, frame_out: []u8) ?ServerMessage {
-        const len = self.chan.dequeue(.B, frame_out) orelse return null;
+        const len = (self.chan.receiveMessage(.B, frame_out) catch return null) orelse return null;
         if (len > CMD_FRAME_THRESHOLD) {
             return .{ .frame = len };
         }
@@ -107,37 +107,37 @@ pub const Client = struct {
     }
 
     pub fn sendFrame(self: *const Client, pixels: []const u8) !void {
-        try self.chan.enqueue(.A, pixels);
+        try self.chan.sendMessage(.A, pixels);
     }
 
     pub fn requestNewPane(self: *const Client) !void {
         const bytes = [1]u8{CMD_REQUEST_NEW_PANE};
-        try self.chan.enqueue(.A, &bytes);
+        try self.chan.sendMessage(.A, &bytes);
     }
 
     pub fn slideLeft(self: *const Client) !void {
         const bytes = [1]u8{CMD_SLIDE_LEFT};
-        try self.chan.enqueue(.A, &bytes);
+        try self.chan.sendMessage(.A, &bytes);
     }
 
     pub fn slideRight(self: *const Client) !void {
         const bytes = [1]u8{CMD_SLIDE_RIGHT};
-        try self.chan.enqueue(.A, &bytes);
+        try self.chan.sendMessage(.A, &bytes);
     }
 
     pub fn switchPane(self: *const Client, pane_id: u8) !void {
         const bytes = [2]u8{ CMD_SWITCH_PANE, pane_id };
-        try self.chan.enqueue(.A, &bytes);
+        try self.chan.sendMessage(.A, &bytes);
     }
 
     pub fn sendExit(self: *const Client) !void {
         const bytes = [1]u8{CMD_CLIENT_EXIT};
-        try self.chan.enqueue(.A, &bytes);
+        try self.chan.sendMessage(.A, &bytes);
     }
 
     pub fn recv(self: *const Client) ?Message {
         var buf: [1 + RENDER_TARGET_PAYLOAD]u8 = undefined;
-        const len = self.chan.dequeue(.A, &buf) orelse return null;
+        const len = (self.chan.receiveMessage(.A, &buf) catch return null) orelse return null;
         if (len < 1) return null;
         return switch (buf[0]) {
             CMD_RENDER_TARGET => parseRenderTarget(buf, len, .render_target),

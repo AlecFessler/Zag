@@ -38,7 +38,7 @@ pub const Server = struct {
     };
 
     pub fn recv(self: *const Server, buf: []u8) ?Request {
-        const len = self.chan.dequeue(.B, buf) orelse return null;
+        const len = (self.chan.receiveMessage(.B, buf) catch return null) orelse return null;
         if (len < 1) return null;
         return .{
             .tag = buf[0],
@@ -48,7 +48,7 @@ pub const Server = struct {
 
     pub fn sendOk(self: *const Server) void {
         const bytes = [1]u8{RESP_OK};
-        self.chan.enqueue(.B, &bytes) catch {};
+        self.chan.sendMessage(.B, &bytes) catch {};
     }
 
     pub fn sendData(self: *const Server, data: []const u8) void {
@@ -56,7 +56,7 @@ pub const Server = struct {
         buf[0] = RESP_DATA;
         const copy_len = @min(data.len, MAX_MSG);
         @memcpy(buf[1..][0..copy_len], data[0..copy_len]);
-        self.chan.enqueue(.B, buf[0 .. 1 + copy_len]) catch {};
+        self.chan.sendMessage(.B, buf[0 .. 1 + copy_len]) catch {};
     }
 
     pub fn sendError(self: *const Server, msg: []const u8) void {
@@ -64,7 +64,7 @@ pub const Server = struct {
         buf[0] = RESP_ERROR;
         const copy_len = @min(msg.len, 128);
         @memcpy(buf[1..][0..copy_len], msg[0..copy_len]);
-        self.chan.enqueue(.B, buf[0 .. 1 + copy_len]) catch {};
+        self.chan.sendMessage(.B, buf[0 .. 1 + copy_len]) catch {};
     }
 };
 
@@ -89,13 +89,13 @@ pub const Client = struct {
         if (copy_len > 0) {
             @memcpy(buf[1..][0..copy_len], payload[0..copy_len]);
         }
-        self.chan.enqueue(.A, buf[0 .. 1 + copy_len]) catch {};
+        self.chan.sendMessage(.A, buf[0 .. 1 + copy_len]) catch {};
     }
 
     fn recvResponse(self: *const Client, buf: []u8) ?Response {
         var attempts: u32 = 0;
         while (attempts < 500_000) : (attempts += 1) {
-            if (self.chan.dequeue(.A, buf)) |len| {
+            if (self.chan.receiveMessage(.A, buf) catch null) |len| {
                 if (len < 1) return null;
                 return switch (buf[0]) {
                     RESP_OK => .{ .ok = {} },

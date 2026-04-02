@@ -8,12 +8,9 @@ pub const protocol_id: Protocol = .input_control;
 // ── Commands ─────────────────────────────────────────────────────────
 // A→B (client → server)
 const CMD_MOUSE_EVENT: u8 = 0x01;
-// B→A (server → client)
-const CMD_FOCUS_CHANGE: u8 = 0x02;
 
 const MOUSE_PAYLOAD = 5; // buttons(1) + dx(2) + dy(2)
-const FOCUS_PAYLOAD = 8; // semantic_id(8)
-const MAX_WIRE = 9; // tag(1) + largest payload
+const MAX_WIRE = 6; // tag(1) + largest payload
 
 // ── Types ────────────────────────────────────────────────────────────
 pub const Buttons = packed struct(u8) {
@@ -37,18 +34,9 @@ pub const Server = struct {
         return .{ .chan = chan };
     }
 
-    pub fn sendFocusChange(self: *const Server, semantic_id: u64) !void {
-        var bytes: [1 + FOCUS_PAYLOAD]u8 = undefined;
-        bytes[0] = CMD_FOCUS_CHANGE;
-        inline for (0..8) |i| {
-            bytes[1 + i] = @truncate(semantic_id >> @intCast(i * 8));
-        }
-        try self.chan.enqueue(.B, &bytes);
-    }
-
     pub fn recv(self: *const Server) ?Message {
         var buf: [MAX_WIRE]u8 = undefined;
-        const len = self.chan.dequeue(.B, &buf) orelse return null;
+        const len = (self.chan.receiveMessage(.B, &buf) catch return null) orelse return null;
         if (len < 1) return null;
         return switch (buf[0]) {
             CMD_MOUSE_EVENT => if (len == 1 + MOUSE_PAYLOAD) Message{
@@ -86,28 +74,6 @@ pub const Client = struct {
             @truncate(dy),
             @truncate(dy >> 8),
         };
-        try self.chan.enqueue(.A, &bytes);
+        try self.chan.sendMessage(.A, &bytes);
     }
-
-    pub fn recv(self: *const Client) ?Message {
-        var buf: [MAX_WIRE]u8 = undefined;
-        const len = self.chan.dequeue(.A, &buf) orelse return null;
-        if (len < 1) return null;
-        return switch (buf[0]) {
-            CMD_FOCUS_CHANGE => if (len == 1 + FOCUS_PAYLOAD) Message{
-                .focus_change = blk: {
-                    var id: u64 = 0;
-                    inline for (0..8) |i| {
-                        id |= @as(u64, buf[1 + i]) << @intCast(i * 8);
-                    }
-                    break :blk id;
-                },
-            } else null,
-            else => null,
-        };
-    }
-
-    pub const Message = union(enum) {
-        focus_change: u64, // semantic_id
-    };
 };

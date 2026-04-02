@@ -53,9 +53,9 @@ pub fn main(perm_view_addr: u64) void {
     var buf: [256]u8 = undefined;
     var retries: u32 = 0;
     while (retries < 50000) : (retries += 1) {
-        if (chan.dequeue(.B, &buf)) |len| {
-            chan.enqueue(.B, buf[0..len]) catch {
-                syscall.write("echo: enqueue failed\n");
+        if (chan.receiveMessage(.B, &buf) catch null) |len| {
+            chan.sendMessage(.B, buf[0..len]) catch {
+                syscall.write("echo: sendMessage failed\n");
                 return;
             };
             return;

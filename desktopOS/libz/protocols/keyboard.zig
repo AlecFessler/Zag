@@ -43,7 +43,7 @@ pub const Server = struct {
             @intFromEnum(event.state),
             @bitCast(event.modifiers),
         };
-        try chan.enqueue(.B, &bytes);
+        try chan.sendMessage(.B, &bytes);
     }
 };
 
@@ -51,7 +51,7 @@ pub const Server = struct {
 pub const Client = struct {
     pub fn recv(chan: *Channel) ?Message {
         var buf: [1 + KEY_PAYLOAD]u8 = undefined;
-        const len = chan.dequeue(.A, &buf) orelse return null;
+        const len = (chan.receiveMessage(.A, &buf) catch return null) orelse return null;
         if (len < 1) return null;
         return switch (buf[0]) {
             CMD_KEY_EVENT => if (len == 1 + KEY_PAYLOAD) Message{

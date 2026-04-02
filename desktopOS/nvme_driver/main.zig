@@ -8,20 +8,47 @@ const perm_view = lib.perm_view;
 const perms = lib.perms;
 const syscall = lib.syscall;
 
+const Channel = channel.Channel;
+
 const MAX_CLIENTS = 16;
 const MAX_CONTROLLERS = 4;
 const MAX_PERMS = 128;
+const DEFAULT_SHM_SIZE: u64 = 4 * syscall.PAGE4K;
 
 var controllers: [MAX_CONTROLLERS]nvme.Controller = .{nvme.Controller{}} ** MAX_CONTROLLERS;
 var ctrl_count: u8 = 0;
 var clients: [MAX_CLIENTS]filesystem.Server = undefined;
 var client_count: u8 = 0;
 
+// ── Known SHM tracking ──────────────────────────────────────────────
+var known_shm_handles: [32]u64 = .{0} ** 32;
+var known_shm_count: u8 = 0;
+
+fn pollNewShm(view_addr: u64) ?u64 {
+    const view: *const [128]perm_view.UserViewEntry = @ptrFromInt(view_addr);
+    for (view) |*entry| {
+        if (entry.entry_type == perm_view.ENTRY_TYPE_SHARED_MEMORY) {
+            var known = false;
+            for (known_shm_handles[0..known_shm_count]) |h| {
+                if (h == entry.handle) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known and known_shm_count < 32) {
+                known_shm_handles[known_shm_count] = entry.handle;
+                known_shm_count += 1;
+                return entry.handle;
+            }
+        }
+    }
+    return null;
+}
+
 pub fn main(perm_view_addr: u64) void {
-    _ = perm_view_addr;
     syscall.write("nvme_driver: starting\n");
 
-    const view: *const [MAX_PERMS]perm_view.UserViewEntry = @ptrFromInt(channel.perm_view_addr);
+    const view: *const [MAX_PERMS]perm_view.UserViewEntry = @ptrFromInt(perm_view_addr);
 
     // Scan for NVMe devices: PCI class 0x01 (storage), subclass 0x08 (NVM)
     var nvme_handles: [MAX_CONTROLLERS]u64 = .{0} ** MAX_CONTROLLERS;
@@ -68,22 +95,24 @@ pub fn main(perm_view_addr: u64) void {
     }
     syscall.write("nvme_driver: filesystem ready\n");
 
-    // Make filesystem discoverable
-    channel.makeDiscoverable(@enumFromInt(@intFromEnum(filesystem.protocol_id)), 2) catch {
-        syscall.write("nvme_driver: FAIL makeDiscoverable\n");
+    // Broadcast filesystem service
+    channel.broadcast(@intFromEnum(filesystem.protocol_id)) catch {
+        syscall.write("nvme_driver: FAIL broadcast\n");
         while (true) syscall.thread_yield();
     };
-    syscall.write("nvme_driver: discoverable\n");
+    syscall.write("nvme_driver: broadcast ok\n");
 
     // Main loop: accept clients and serve filesystem requests
     var req_buf: [4096]u8 = undefined;
     while (true) {
         // Accept new filesystem clients
-        if (channel.pollAnyIncoming()) |chan| {
-            if (client_count < MAX_CLIENTS) {
-                clients[client_count] = filesystem.Server.init(chan);
-                client_count += 1;
-                syscall.write("nvme_driver: fs client connected\n");
+        if (pollNewShm(perm_view_addr)) |shm_handle| {
+            if (Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE)) |chan| {
+                if (client_count < MAX_CLIENTS) {
+                    clients[client_count] = filesystem.Server.init(chan);
+                    client_count += 1;
+                    syscall.write("nvme_driver: fs client connected\n");
+                }
             }
         }
 

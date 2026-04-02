@@ -356,14 +356,14 @@ fn runEcho(args: []const u8) void {
     }
 
     const region: [*]u8 = @ptrFromInt(vm_result.val2);
-    const chan = channel.Channel.init(region[0..DATA_CHAN_SIZE]) orelse {
+    const chan = channel.Channel.init(region[0..DATA_CHAN_SIZE], 0) orelse {
         render.appendHistory("error: failed to init channel\n");
         return;
     };
 
     const echo_elf = embedded.echo;
     const child_rights = (perms.ProcessRights{
-        .grant_to = true,
+        .grant_to_child = true,
         .mem_reserve = true,
     }).bits();
     const proc_handle = syscall.proc_create(@intFromPtr(echo_elf.ptr), echo_elf.len, child_rights);
@@ -383,13 +383,13 @@ fn runEcho(args: []const u8) void {
     }
 
     if (args.len > 0) {
-        chan.enqueue(.A, args) catch {
-            render.appendHistory("error: enqueue failed\n");
+        chan.sendMessage(.A, args) catch {
+            render.appendHistory("error: sendMessage failed\n");
             return;
         };
     } else {
-        chan.enqueue(.A, "\n") catch {
-            render.appendHistory("error: enqueue failed\n");
+        chan.sendMessage(.A, "\n") catch {
+            render.appendHistory("error: sendMessage failed\n");
             return;
         };
     }
@@ -397,7 +397,7 @@ fn runEcho(args: []const u8) void {
     var recv_buf: [256]u8 = undefined;
     var attempts: u32 = 0;
     while (attempts < 50000) : (attempts += 1) {
-        if (chan.dequeue(.A, &recv_buf)) |len| {
+        if (chan.receiveMessage(.A, &recv_buf) catch null) |len| {
             render.appendHistory(recv_buf[0..len]);
             render.appendHistory("\n");
             return;

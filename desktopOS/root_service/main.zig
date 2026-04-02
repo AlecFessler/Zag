@@ -1,6 +1,5 @@
 const lib = @import("lib");
 
-const channel = lib.channel;
 const embedded = @import("embedded_children");
 const perm_view = lib.perm_view;
 const perms = lib.perms;
@@ -9,29 +8,25 @@ const syscall = lib.syscall;
 pub const is_root = true;
 
 pub fn main(perm_view_addr: u64) void {
-    channel.perm_view_addr = perm_view_addr;
     syscall.write("root: starting\n");
 
     const child_rights = perms.ProcessRights{
-        .grant_to = true,
+        .grant_to_child = true,
         .spawn_thread = true,
         .spawn_process = true,
         .mem_reserve = true,
         .shm_create = true,
         .restart = true,
         .device_own = true,
+        .grant_to_broadcast = true,
+        .broadcast = true,
     };
 
     // Spawn service_manager
-    const id_svc = channel.my_semantic_id.newChildID() orelse {
-        syscall.write("root: failed to allocate service_manager id\n");
-        return;
-    };
     const svc_proc = syscall.spawn_child(
         @intFromPtr(embedded.service_manager.ptr),
         embedded.service_manager.len,
         child_rights.bits(),
-        id_svc,
     );
     if (svc_proc <= 0) {
         syscall.write("root: failed to spawn service_manager\n");
@@ -55,21 +50,15 @@ pub fn main(perm_view_addr: u64) void {
     syscall.write("root: device handles granted to service_manager\n");
 
     // Spawn app_manager
-    const id_app = channel.my_semantic_id.newChildID() orelse {
-        syscall.write("root: failed to allocate app_manager id\n");
-        return;
-    };
     if (syscall.spawn_child(
         @intFromPtr(embedded.app_manager.ptr),
         embedded.app_manager.len,
         child_rights.bits(),
-        id_app,
     ) <= 0) {
         syscall.write("root: failed to spawn app_manager\n");
         return;
     }
     syscall.write("root: spawned app_manager\n");
 
-    syscall.write("root: entering protocol loop\n");
-    channel.runAsRoot();
+    while (true) syscall.thread_yield();
 }

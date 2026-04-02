@@ -6,6 +6,7 @@ pub const ENTRY_TYPE_VM_RESERVATION: u8 = 1;
 pub const ENTRY_TYPE_SHARED_MEMORY: u8 = 2;
 pub const ENTRY_TYPE_DEVICE_REGION: u8 = 3;
 pub const ENTRY_TYPE_DEAD_PROCESS: u8 = 5;
+pub const ENTRY_TYPE_BROADCAST_TABLE: u8 = 6;
 pub const ENTRY_TYPE_EMPTY: u8 = 0xFF;
 
 pub const CrashReason = enum(u5) {
