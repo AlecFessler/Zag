@@ -95,8 +95,6 @@ pub fn currentThread() ?*Thread {
     return core_states[arch.coreID()].running_thread;
 }
 
-var first_switch_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
-
 pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     const core_id = arch.coreID();
     const state = &core_states[core_id];

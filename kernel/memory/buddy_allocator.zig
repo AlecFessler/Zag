@@ -442,12 +442,6 @@ pub const BuddyAllocator = struct {
 
         return true;
     }
-
-    fn checkAllocationFailure(buddy_alloc: *BuddyAllocator, order: u4) !void {
-        for (order..NUM_ORDERS) |check_order| {
-            try std.testing.expect(buddy_alloc.freelists[check_order].head == null);
-        }
-    }
 };
 
 pub const Page = struct {

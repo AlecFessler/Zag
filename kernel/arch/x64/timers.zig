@@ -9,7 +9,6 @@ const Timer = zag.arch.timer.Timer;
 const VAddr = zag.memory.address.VAddr;
 
 var tsc_timer_instance: Tsc = undefined;
-var monotonic_tsc_instance: Tsc = undefined;
 var lapic_timer_instance: Lapic = undefined;
 
 pub const Hpet = struct {
@@ -38,61 +37,12 @@ pub const Hpet = struct {
         val: u64,
     };
 
-    pub const NthTimerConfigAndCaps = packed struct(u64) {
-        _res0: u1 = 0,
-        interrupt_level_triggered: bool,
-        interrupt_enabled: bool,
-        periodic_enabled: bool,
-        periodic_supported: bool,
-        comparator_64bit: bool,
-        periodic_accumulator_set: bool,
-        _res7: u1 = 0,
-        force_32bit_mode: bool,
-        ioapic_route_index: u5,
-        fsb_delivery_enabled: bool,
-        fsb_delivery_supported: bool,
-        _res16_31: u16 = 0,
-        ioapic_route_capabilities: u32,
-    };
-
-    pub const NthTimerComparatorVal = packed struct(u64) {
-        comparator_val: u64,
-    };
-
-    pub const NthTimerFSBIntRoute = packed struct(u64) {
-        message_address: u32,
-        message_data: u32,
-    };
-
-    pub const HpetTimer = struct {
-        config_and_caps: *volatile NthTimerConfigAndCaps,
-        comparator_val: *volatile NthTimerComparatorVal,
-        fsb_int_route: *volatile NthTimerFSBIntRoute,
-
-        pub fn init(
-            config_and_caps: *volatile NthTimerConfigAndCaps,
-            comparator_val: *volatile NthTimerComparatorVal,
-            fsb_int_route: *volatile NthTimerFSBIntRoute,
-        ) HpetTimer {
-            return .{
-                .config_and_caps = config_and_caps,
-                .comparator_val = comparator_val,
-                .fsb_int_route = fsb_int_route,
-            };
-        }
-    };
-
     pub const Register = enum(u64) {
         gen_caps_and_id = 0x0,
         gen_config = 0x10,
         gen_int_status = 0x20,
         main_counter_val = 0xF0,
-        nth_timer_config_and_caps = 0x100,
-        nth_timer_comparator_val = 0x108,
-        nth_timer_fsb_int_route = 0x110,
     };
-
-    const nth_timer_offset = 0x20;
 
     freq_hz: u64,
 
@@ -100,10 +50,6 @@ pub const Hpet = struct {
     gen_config: *volatile GenConfig,
     gen_int_status: *volatile GenIntStatus,
     main_counter_val: *volatile MainCounterVal,
-
-    nth_timer_config_and_caps_base: [*]volatile NthTimerConfigAndCaps,
-    nth_timer_comparator_val_base: [*]volatile NthTimerComparatorVal,
-    nth_timer_fsb_int_route_base: [*]volatile NthTimerFSBIntRoute,
 
     pub fn init(base_virt: VAddr) Hpet {
         const base_addr = base_virt.addr;
@@ -117,46 +63,7 @@ pub const Hpet = struct {
             .gen_config = @ptrFromInt(base_addr + @intFromEnum(Register.gen_config)),
             .gen_int_status = @ptrFromInt(base_addr + @intFromEnum(Register.gen_int_status)),
             .main_counter_val = @ptrFromInt(base_addr + @intFromEnum(Register.main_counter_val)),
-
-            .nth_timer_config_and_caps_base = @ptrFromInt(
-                base_addr + @intFromEnum(Register.nth_timer_config_and_caps),
-            ),
-            .nth_timer_comparator_val_base = @ptrFromInt(
-                base_addr + @intFromEnum(Register.nth_timer_comparator_val),
-            ),
-            .nth_timer_fsb_int_route_base = @ptrFromInt(
-                base_addr + @intFromEnum(Register.nth_timer_fsb_int_route),
-            ),
         };
-    }
-
-    pub fn getNthTimer(self: *Hpet, n: u64) HpetTimer {
-        if (n > self.gen_caps_and_id.num_timers_minus_one) {
-            @panic("Tried to select non-existent hpet timer!");
-        }
-        return HpetTimer.init(
-            self.getNthTimerConfigAndCaps(n),
-            self.getNthTimerComparatorVal(n),
-            self.getNthTimerFSBIntRoute(n),
-        );
-    }
-
-    fn getNthTimerConfigAndCaps(self: *Hpet, n: u64) *volatile NthTimerConfigAndCaps {
-        return @ptrFromInt(
-            @intFromPtr(self.nth_timer_config_and_caps_base) + n * nth_timer_offset,
-        );
-    }
-
-    fn getNthTimerComparatorVal(self: *Hpet, n: u64) *volatile NthTimerComparatorVal {
-        return @ptrFromInt(
-            @intFromPtr(self.nth_timer_comparator_val_base) + n * nth_timer_offset,
-        );
-    }
-
-    fn getNthTimerFSBIntRoute(self: *Hpet, n: u64) *volatile NthTimerFSBIntRoute {
-        return @ptrFromInt(
-            @intFromPtr(self.nth_timer_fsb_int_route_base) + n * nth_timer_offset,
-        );
     }
 
     pub fn timer(self: *Hpet) Timer {

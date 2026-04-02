@@ -186,10 +186,6 @@ pub fn armTscDeadline(deadline_tsc: u64) void {
     cpu.wrmsr(tsc_deadline_msr, deadline_tsc);
 }
 
-pub fn cancelTscDeadline() void {
-    cpu.wrmsr(tsc_deadline_msr, 0);
-}
-
 pub fn endOfInterrupt() void {
     if (x2Apic) {
         cpu.wrmsr(@intFromEnum(X2ApicMsr.end_of_interrupt_register), 0);

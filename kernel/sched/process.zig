@@ -361,24 +361,6 @@ pub const Process = struct {
         }
     }
 
-    pub fn clearPermByObject(self: *Process, target: anytype) void {
-        self.perm_lock.lock();
-        defer self.perm_lock.unlock();
-        var changed = false;
-        for (self.perm_table[1..]) |*slot| {
-            const matches = switch (slot.object) {
-                .process => |p| @intFromPtr(p) == @intFromPtr(target),
-                else => false,
-            };
-            if (matches) {
-                slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
-                self.perm_count -= 1;
-                changed = true;
-            }
-        }
-        if (changed) self.syncUserView();
-    }
-
     pub fn addDmaMapping(self: *Process, device: *DeviceRegion, shm: *SharedMemory, dma_base: u64, num_pages: u64) !void {
         if (self.num_dma_mappings >= MAX_DMA_MAPPINGS) return error.TooManyDmaMappings;
         self.dma_mappings[self.num_dma_mappings] = .{

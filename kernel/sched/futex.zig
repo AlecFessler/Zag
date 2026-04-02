@@ -34,13 +34,6 @@ fn pushWaiter(bucket: *Bucket, thread: *Thread) void {
     bucket.head = thread;
 }
 
-fn popWaiter(bucket: *Bucket) ?*Thread {
-    const thread = bucket.head orelse return null;
-    bucket.head = thread.next;
-    thread.next = null;
-    return thread;
-}
-
 fn removeWaiter(bucket: *Bucket, target: *Thread) bool {
     var prev: ?*Thread = null;
     var current = bucket.head;

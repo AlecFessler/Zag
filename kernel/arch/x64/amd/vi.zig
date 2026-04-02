@@ -54,11 +54,6 @@ const MMIO_EVT_LOG_BASE = 0x0010;
 /// Controls IOMMU enable, command buffer enable, event log enable, etc.
 const MMIO_CONTROL = 0x0018;
 
-/// Command Buffer Head Pointer — spec MMIO Offset 2000h.
-/// Bits [18:4] = CmdHeadPtr (16-byte aligned offset from buffer base).
-/// Read by IOMMU to determine next command to fetch.
-const MMIO_CMD_BUF_HEAD = 0x2000;
-
 /// Command Buffer Tail Pointer — spec MMIO Offset 2008h.
 /// Bits [18:4] = CmdTailPtr (16-byte aligned offset from buffer base).
 /// Written by software after enqueueing commands.
@@ -249,15 +244,6 @@ fn lookupAlias(bdf: u16) u16 {
         if (entry.source == bdf) return entry.alias;
     }
     return bdf;
-}
-
-/// Register a DeviceID alias (typically parsed from the ACPI IVRS table).
-/// Some chipsets route device DMA through bridges that remap the requester ID;
-/// the alias table ensures the DTE is programmed for the ID the IOMMU actually sees.
-pub fn addAlias(source: u16, alias: u16) void {
-    if (alias_count >= MAX_ALIASES) return;
-    aliases[alias_count] = .{ .source = source, .alias = alias };
-    alias_count += 1;
 }
 
 /// Initialize one IOMMU unit given its MMIO register base physical address.

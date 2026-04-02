@@ -770,31 +770,6 @@ fn parseIvrs(ivrs_vaddr: VAddr, length: u32) !void {
     _ = length;
 }
 
-fn parseIvhdDeviceEntries(ivhd_base: u64, entry_type: u8, entry_len: u16) void {
-    const dev_start: u32 = if (entry_type == 0x10) 24 else 40;
-    var dev_off: u32 = dev_start;
-    while (dev_off + 4 <= entry_len) {
-        const dev_type = @as(*const volatile u8, @ptrFromInt(ivhd_base + dev_off)).*;
-        const size_class = @as(u2, @truncate(dev_type >> 6));
-        const dev_entry_size: u32 = @as(u32, 4) << size_class;
-        if (dev_off + dev_entry_size > entry_len) break;
-
-        if ((dev_type == 0x42 or dev_type == 0x43) and dev_entry_size >= 8) {
-            const lo0 = @as(*const volatile u8, @ptrFromInt(ivhd_base + dev_off + 1)).*;
-            const hi0 = @as(*const volatile u8, @ptrFromInt(ivhd_base + dev_off + 2)).*;
-            const device_id = @as(u16, hi0) << 8 | @as(u16, lo0);
-            const lo1 = @as(*const volatile u8, @ptrFromInt(ivhd_base + dev_off + 5)).*;
-            const hi1 = @as(*const volatile u8, @ptrFromInt(ivhd_base + dev_off + 6)).*;
-            const source_id = @as(u16, hi1) << 8 | @as(u16, lo1);
-            if (device_id != source_id) {
-                iommu.addDeviceAlias(device_id, source_id);
-            }
-        }
-
-        dev_off += dev_entry_size;
-    }
-}
-
 fn initIommuDevices() void {
     if (!iommu.isAvailable()) return;
 

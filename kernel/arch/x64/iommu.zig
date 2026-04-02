@@ -20,11 +20,6 @@ pub fn initIntel(reg_base: PAddr) !void {
     active_type = .intel_vtd;
 }
 
-pub fn initAmd(reg_base: PAddr) !void {
-    try vi.init(reg_base);
-    active_type = .amd_vi;
-}
-
 pub fn setupDevice(device: *DeviceRegion) !void {
     switch (active_type) {
         .intel_vtd => try vtd.setupDevice(device),
@@ -79,13 +74,6 @@ pub fn unmapDmaPages(device: *DeviceRegion, dma_base: u64, num_pages: u64) void 
         .amd_vi => vi.flushDevice(device),
         .intel_vtd => vtd.invalidateIotlb(),
         .none => {},
-    }
-}
-
-pub fn addDeviceAlias(source: u16, alias: u16) void {
-    switch (active_type) {
-        .amd_vi => vi.addAlias(source, alias),
-        else => {},
     }
 }
 

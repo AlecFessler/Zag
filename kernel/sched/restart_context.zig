@@ -4,11 +4,6 @@ const memory_init = zag.memory.init;
 
 const VAddr = zag.memory.address.VAddr;
 
-pub const VAddrRange = struct {
-    vaddr: VAddr,
-    size: u64,
-};
-
 pub const RestartContext = struct {
     entry_point: VAddr,
     data_segment: struct {

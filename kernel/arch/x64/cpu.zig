@@ -148,10 +148,6 @@ pub fn cpuid(eax: CpuidLeaf, ecx: u32) struct {
     return .{ .eax = a, .ebx = b, .ecx = c, .edx = d };
 }
 
-pub fn disableInterrupts() void {
-    asm volatile ("cli");
-}
-
 pub fn enableInterrupts() void {
     asm volatile ("sti");
 }
