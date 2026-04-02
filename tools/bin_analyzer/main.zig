@@ -1239,6 +1239,204 @@ fn readGCommand(tty: std.fs.File) !Action {
     };
 }
 
+// ── Syntax Highlighting ────────────────────────────────────────────────────
+
+const SyntaxColor = enum(u8) {
+    default,
+    keyword,
+    string,
+    number,
+    comment,
+    builtin,
+    type_ident,
+    asm_address,
+    asm_mnemonic,
+    asm_register,
+    asm_immediate,
+    asm_label,
+
+    fn escape(c: SyntaxColor) []const u8 {
+        return switch (c) {
+            .default => "",
+            .keyword => "\x1b[38;5;168m",
+            .string => "\x1b[38;5;107m",
+            .number => "\x1b[38;5;173m",
+            .comment => "\x1b[38;5;243m",
+            .builtin => "\x1b[38;5;109m",
+            .type_ident => "\x1b[38;5;180m",
+            .asm_address => "\x1b[38;5;243m",
+            .asm_mnemonic => "\x1b[38;5;75m",
+            .asm_register => "\x1b[38;5;114m",
+            .asm_immediate => "\x1b[38;5;173m",
+            .asm_label => "\x1b[38;5;223m",
+        };
+    }
+};
+
+fn highlightZigLine(line: []const u8, colors: []SyntaxColor) void {
+    @memset(colors[0..line.len], .default);
+    var buf: [4096]u8 = undefined;
+    if (line.len >= buf.len) return;
+    @memcpy(buf[0..line.len], line);
+    buf[line.len] = 0;
+    const z_line: [:0]const u8 = buf[0..line.len :0];
+
+    var tok = std.zig.Tokenizer.init(z_line);
+    var prev_end: usize = 0;
+
+    while (true) {
+        const token = tok.next();
+        if (token.tag == .eof) break;
+
+        // Gaps between tokens may contain // comments (tokenizer skips them)
+        if (token.loc.start > prev_end) {
+            const gap = z_line[prev_end..token.loc.start];
+            if (std.mem.indexOf(u8, gap, "//")) |offset| {
+                @memset(colors[prev_end + offset .. line.len], .comment);
+                return;
+            }
+        }
+
+        const color = classifyZigToken(token.tag, z_line[token.loc.start..token.loc.end]);
+        @memset(colors[token.loc.start..token.loc.end], color);
+        prev_end = token.loc.end;
+    }
+
+    // Trailing comment after last token
+    if (prev_end < line.len) {
+        const gap = z_line[prev_end..line.len];
+        if (std.mem.indexOf(u8, gap, "//")) |offset| {
+            @memset(colors[prev_end + offset .. line.len], .comment);
+        }
+    }
+}
+
+fn classifyZigToken(tag: std.zig.Token.Tag, text: []const u8) SyntaxColor {
+    return switch (tag) {
+        .string_literal, .multiline_string_literal_line, .char_literal => .string,
+        .number_literal => .number,
+        .builtin => .builtin,
+        .doc_comment, .container_doc_comment => .comment,
+        .identifier => classifyIdentifier(text),
+        else => if (isKeywordTag(tag)) .keyword else .default,
+    };
+}
+
+fn isKeywordTag(tag: std.zig.Token.Tag) bool {
+    const t = @intFromEnum(tag);
+    return t >= @intFromEnum(std.zig.Token.Tag.keyword_addrspace) and
+        t <= @intFromEnum(std.zig.Token.Tag.keyword_while);
+}
+
+fn classifyIdentifier(text: []const u8) SyntaxColor {
+    if (text.len == 0) return .default;
+    if (std.zig.primitives.isPrimitive(text)) return .type_ident;
+    if (text[0] >= 'A' and text[0] <= 'Z') return .type_ident;
+    return .default;
+}
+
+fn highlightDisasm(text: []const u8, is_label: bool, colors: []SyntaxColor) void {
+    @memset(colors[0..text.len], .default);
+    if (is_label) {
+        @memset(colors[0..text.len], .asm_label);
+        return;
+    }
+
+    const colon = std.mem.indexOfScalar(u8, text, ':') orelse return;
+    @memset(colors[0 .. colon + 1], .asm_address);
+
+    var pos = colon + 1;
+    while (pos < text.len and text[pos] == ' ') : (pos += 1) {}
+
+    // Mnemonic
+    const mn_start = pos;
+    while (pos < text.len and text[pos] != ' ') : (pos += 1) {}
+    if (mn_start < pos) @memset(colors[mn_start..pos], .asm_mnemonic);
+
+    // Operands
+    while (pos < text.len) {
+        if (text[pos] == '<') {
+            const end = std.mem.indexOfScalarPos(u8, text, pos + 1, '>') orelse text.len - 1;
+            @memset(colors[pos .. end + 1], .asm_label);
+            pos = end + 1;
+        } else if (text[pos] == '0' and pos + 1 < text.len and text[pos + 1] == 'x') {
+            const s = pos;
+            pos += 2;
+            while (pos < text.len and std.ascii.isHex(text[pos])) : (pos += 1) {}
+            @memset(colors[s..pos], .asm_immediate);
+        } else if (std.ascii.isAlphabetic(text[pos])) {
+            const s = pos;
+            while (pos < text.len and (std.ascii.isAlphanumeric(text[pos]) or text[pos] == '_')) : (pos += 1) {}
+            if (isX86Register(text[s..pos])) @memset(colors[s..pos], .asm_register);
+        } else {
+            pos += 1;
+        }
+    }
+}
+
+fn isX86Register(name: []const u8) bool {
+    const regs = std.StaticStringMap(void).initComptime(.{
+        .{ "rax", {} }, .{ "rbx", {} }, .{ "rcx", {} }, .{ "rdx", {} },
+        .{ "rsi", {} }, .{ "rdi", {} }, .{ "rsp", {} }, .{ "rbp", {} },
+        .{ "r8", {} },  .{ "r9", {} },  .{ "r10", {} }, .{ "r11", {} },
+        .{ "r12", {} }, .{ "r13", {} }, .{ "r14", {} }, .{ "r15", {} },
+        .{ "eax", {} }, .{ "ebx", {} }, .{ "ecx", {} }, .{ "edx", {} },
+        .{ "esi", {} }, .{ "edi", {} }, .{ "esp", {} }, .{ "ebp", {} },
+        .{ "ax", {} },  .{ "bx", {} },  .{ "cx", {} },  .{ "dx", {} },
+        .{ "si", {} },  .{ "di", {} },  .{ "sp", {} },  .{ "bp", {} },
+        .{ "al", {} },  .{ "bl", {} },  .{ "cl", {} },  .{ "dl", {} },
+        .{ "ah", {} },  .{ "bh", {} },  .{ "ch", {} },  .{ "dh", {} },
+        .{ "sil", {} }, .{ "dil", {} }, .{ "spl", {} }, .{ "bpl", {} },
+        .{ "r8b", {} }, .{ "r9b", {} }, .{ "r10b", {} }, .{ "r11b", {} },
+        .{ "r12b", {} }, .{ "r13b", {} }, .{ "r14b", {} }, .{ "r15b", {} },
+        .{ "r8w", {} }, .{ "r9w", {} }, .{ "r10w", {} }, .{ "r11w", {} },
+        .{ "r12w", {} }, .{ "r13w", {} }, .{ "r14w", {} }, .{ "r15w", {} },
+        .{ "r8d", {} }, .{ "r9d", {} }, .{ "r10d", {} }, .{ "r11d", {} },
+        .{ "r12d", {} }, .{ "r13d", {} }, .{ "r14d", {} }, .{ "r15d", {} },
+        .{ "xmm0", {} }, .{ "xmm1", {} }, .{ "xmm2", {} }, .{ "xmm3", {} },
+        .{ "xmm4", {} }, .{ "xmm5", {} }, .{ "xmm6", {} }, .{ "xmm7", {} },
+        .{ "xmm8", {} }, .{ "xmm9", {} }, .{ "xmm10", {} }, .{ "xmm11", {} },
+        .{ "xmm12", {} }, .{ "xmm13", {} }, .{ "xmm14", {} }, .{ "xmm15", {} },
+        .{ "cs", {} },  .{ "ds", {} },  .{ "es", {} },  .{ "fs", {} },
+        .{ "gs", {} },  .{ "ss", {} },  .{ "rip", {} }, .{ "eip", {} },
+        .{ "cr0", {} }, .{ "cr2", {} }, .{ "cr3", {} }, .{ "cr4", {} },
+    });
+    return regs.has(name);
+}
+
+fn writeColoredText(w: anytype, text: []const u8, colors: []const SyntaxColor) !void {
+    var current: SyntaxColor = .default;
+    for (text, colors) |byte, color| {
+        if (color != current) {
+            if (current != .default) try w.writeAll("\x1b[39m");
+            if (color != .default) try w.writeAll(color.escape());
+            current = color;
+        }
+        try w.writeByte(byte);
+    }
+    if (current != .default) try w.writeAll("\x1b[39m");
+}
+
+fn renderWithCharCursorColored(w: anytype, text: []const u8, colors: []const SyntaxColor, col: usize) !void {
+    if (text.len == 0) return;
+    const cursor_pos = @min(col, text.len);
+
+    if (cursor_pos > 0)
+        try writeColoredText(w, text[0..cursor_pos], colors[0..cursor_pos]);
+
+    if (cursor_pos < text.len) {
+        const c = colors[cursor_pos];
+        if (c != .default) try w.writeAll(c.escape());
+        try w.writeAll("\x1b[7m");
+        try w.writeByte(text[cursor_pos]);
+        try w.writeAll("\x1b[27m\x1b[48;5;236m");
+        if (c != .default) try w.writeAll("\x1b[39m");
+
+        if (cursor_pos + 1 < text.len)
+            try writeColoredText(w, text[cursor_pos + 1 ..], colors[cursor_pos + 1 ..]);
+    }
+}
+
 // ── Rendering ───────────────────────────────────────────────────────────────
 
 fn render(app: *App) !void {
@@ -1292,11 +1490,18 @@ fn renderSourceLine(w: anytype, app: *App, line_idx: usize, width: usize) !void 
             const visible = line[start..];
             const to_write = @min(visible.len, content_w);
 
+            var color_buf: [4096]SyntaxColor = undefined;
+            if (line.len < color_buf.len) {
+                highlightZigLine(line, color_buf[0..line.len]);
+            } else {
+                @memset(color_buf[0..@min(line.len, color_buf.len)], .default);
+            }
+            const vis_colors = color_buf[start..][0..to_write];
+
             if (is_cursor_line) {
-                // Render char-by-char for cursor character highlight
-                try w.writeAll("\x1b[48;5;236m"); // dark gray bg for cursor line
+                try w.writeAll("\x1b[48;5;236m");
                 try w.print("{d:>5} ", .{line_num});
-                try renderWithCharCursor(w, visible[0..to_write], app.src_col -| start);
+                try renderWithCharCursorColored(w, visible[0..to_write], vis_colors, app.src_col -| start);
                 const written = num_w + to_write;
                 if (written < width) try padSpaces(w, width - written);
                 try w.writeAll("\x1b[0m");
@@ -1309,7 +1514,7 @@ fn renderSourceLine(w: anytype, app: *App, line_idx: usize, width: usize) !void 
                 try w.writeAll("\x1b[0m");
             } else {
                 try w.print("{d:>5} ", .{line_num});
-                try w.writeAll(visible[0..to_write]);
+                try writeColoredText(w, visible[0..to_write], vis_colors);
                 const written = num_w + to_write;
                 if (written < width) try padSpaces(w, width - written);
             }
@@ -1340,9 +1545,17 @@ fn renderDisasmLine(w: anytype, app: *App, line_idx: usize, width: usize) !void 
         const visible = text[start..];
         const to_write = @min(visible.len, width);
 
+        var color_buf: [4096]SyntaxColor = undefined;
+        if (text.len < color_buf.len) {
+            highlightDisasm(text, dl.is_label, color_buf[0..text.len]);
+        } else {
+            @memset(color_buf[0..@min(text.len, color_buf.len)], .default);
+        }
+        const vis_colors = color_buf[start..][0..to_write];
+
         if (is_cursor_line) {
             try w.writeAll("\x1b[48;5;236m");
-            try renderWithCharCursor(w, visible[0..to_write], app.disasm_col -| start);
+            try renderWithCharCursorColored(w, visible[0..to_write], vis_colors, app.disasm_col -| start);
             if (to_write < width) try padSpaces(w, width - to_write);
             try w.writeAll("\x1b[0m");
         } else if (is_highlighted) {
@@ -1351,32 +1564,11 @@ fn renderDisasmLine(w: anytype, app: *App, line_idx: usize, width: usize) !void 
             if (to_write < width) try padSpaces(w, width - to_write);
             try w.writeAll("\x1b[0m");
         } else {
-            try w.writeAll(visible[0..to_write]);
+            try writeColoredText(w, visible[0..to_write], vis_colors);
             if (to_write < width) try padSpaces(w, width - to_write);
         }
     } else {
         try padSpaces(w, width);
-    }
-}
-
-fn renderWithCharCursor(w: anytype, text: []const u8, col: usize) !void {
-    // Render text with the character at col in inverse video
-    if (text.len == 0) return;
-    const cursor_pos = @min(col, text.len);
-
-    // Text before cursor
-    if (cursor_pos > 0) {
-        try w.writeAll(text[0..cursor_pos]);
-    }
-    // Cursor character
-    if (cursor_pos < text.len) {
-        try w.writeAll("\x1b[7m"); // inverse for cursor char
-        try w.writeByte(text[cursor_pos]);
-        try w.writeAll("\x1b[27m\x1b[48;5;236m"); // un-inverse, restore line bg
-        // Text after cursor
-        if (cursor_pos + 1 < text.len) {
-            try w.writeAll(text[cursor_pos + 1 ..]);
-        }
     }
 }
 

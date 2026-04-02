@@ -17,6 +17,11 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    const copy = b.addSystemCommand(&.{ "cp", "-f" });
+    copy.addArtifactArg(exe);
+    copy.addArg(b.pathFromRoot("../../tools/binanalyze"));
+    b.getInstallStep().dependOn(&copy.step);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
