@@ -132,6 +132,10 @@ Maps a granted SHM handle. Does not reinitialize the header -- the requester alr
 
 Writes a message with an 8-byte length prefix and advances the tx index with a release store. Returns `error.ChannelFull` if insufficient space. Does not check peer connection state -- writing to the ring buffer before the peer connects is valid (the grant is the publication barrier).
 
+### `Channel.waitForMessage(side: Side, timeout_ns: u64) void`
+
+Blocks until the peer has written new data, or the timeout expires. Uses futex_wait on the peer's tx index. Returns immediately if data is already available (peer tx differs from cached value).
+
 ### `Channel.receiveMessage(side: Side, out: []u8) error{Disconnected}!?u64`
 
 Acquire-loads the peer's tx, reads the next message into `out`. Returns the number of bytes read, or null if no message is available. If no data is available and the peer's connected flag is cleared, returns `error.Disconnected`. Messages larger than `out.len` are silently skipped to unblock the ring.

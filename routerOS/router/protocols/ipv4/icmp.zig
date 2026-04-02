@@ -72,8 +72,8 @@ pub fn handleEchoReply(pkt: []const u8, len: u32) void {
     pos = util.appendStr(&resp, pos, " time=");
     pos = util.appendDec(&resp, pos, rtt_us);
     pos = util.appendStr(&resp, pos, "us");
-    if (main.console_chan) |*chan| {
-        _ = chan.send(resp[0..pos]);
+    if (main.console_chan) |chan| {
+        chan.sendMessage(.B, resp[0..pos]) catch {};
     }
 
     main.ping_count += 1;
@@ -96,8 +96,8 @@ fn sendSummary() void {
     pos = util.appendStr(&resp, pos, " sent, ");
     pos = util.appendDec(&resp, pos, main.ping_received);
     pos = util.appendStr(&resp, pos, " received ---");
-    if (main.console_chan) |*chan| {
-        _ = chan.send(resp[0..pos]);
+    if (main.console_chan) |chan| {
+        chan.sendMessage(.B, resp[0..pos]) catch {};
     }
 }
 
@@ -109,9 +109,9 @@ pub fn checkTracerouteTimeout() void {
         var resp: [128]u8 = undefined;
         var pos: usize = 0;
         pos = util.appendStr(&resp, pos, "traceroute: ARP timeout");
-        if (main.console_chan) |*chan| {
-            _ = chan.send(resp[0..pos]);
-            _ = chan.send("---");
+        if (main.console_chan) |chan| {
+            chan.sendMessage(.B, resp[0..pos]) catch {};
+            chan.sendMessage(.B, "---") catch {};
         }
         main.traceroute_state = .idle;
         return;
@@ -122,14 +122,14 @@ pub fn checkTracerouteTimeout() void {
     var pos: usize = 0;
     pos = util.appendDec(&resp, pos, main.traceroute_ttl);
     pos = util.appendStr(&resp, pos, "  *");
-    if (main.console_chan) |*chan| {
-        _ = chan.send(resp[0..pos]);
+    if (main.console_chan) |chan| {
+        chan.sendMessage(.B, resp[0..pos]) catch {};
     }
 
     main.traceroute_ttl += 1;
     if (main.traceroute_ttl > main.traceroute_max_hops) {
-        if (main.console_chan) |*chan| {
-            _ = chan.send("---");
+        if (main.console_chan) |chan| {
+            chan.sendMessage(.B, "---") catch {};
         }
         main.traceroute_state = .idle;
     } else {
@@ -212,15 +212,15 @@ pub fn handleTimeExceeded(pkt: []const u8, len: u32) void {
     pos = util.appendStr(&resp, pos, "  ");
     pos = util.appendDec(&resp, pos, rtt_us);
     pos = util.appendStr(&resp, pos, "us");
-    if (main.console_chan) |*chan| {
-        _ = chan.send(resp[0..pos]);
+    if (main.console_chan) |chan| {
+        chan.sendMessage(.B, resp[0..pos]) catch {};
     }
 
     // Next hop
     main.traceroute_ttl += 1;
     if (main.traceroute_ttl > main.traceroute_max_hops) {
-        if (main.console_chan) |*chan| {
-            _ = chan.send("---");
+        if (main.console_chan) |chan| {
+            chan.sendMessage(.B, "---") catch {};
         }
         main.traceroute_state = .idle;
     } else {
@@ -255,9 +255,9 @@ pub fn handleTracerouteEchoReply(pkt: []const u8, len: u32) void {
     pos = util.appendStr(&resp, pos, "  ");
     pos = util.appendDec(&resp, pos, rtt_us);
     pos = util.appendStr(&resp, pos, "us");
-    if (main.console_chan) |*chan| {
-        _ = chan.send(resp[0..pos]);
-        _ = chan.send("---");
+    if (main.console_chan) |chan| {
+        chan.sendMessage(.B, resp[0..pos]) catch {};
+        chan.sendMessage(.B, "---") catch {};
     }
 
     main.traceroute_state = .idle;
@@ -276,8 +276,8 @@ pub fn checkTimeout() void {
         pos = util.appendStr(&resp, pos, "request timeout: seq=");
         pos = util.appendDec(&resp, pos, main.ping_seq);
     }
-    if (main.console_chan) |*chan| {
-        _ = chan.send(resp[0..pos]);
+    if (main.console_chan) |chan| {
+        chan.sendMessage(.B, resp[0..pos]) catch {};
     }
 
     main.ping_count += 1;

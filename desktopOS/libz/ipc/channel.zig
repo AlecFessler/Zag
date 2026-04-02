@@ -109,9 +109,14 @@ pub const Channel = extern struct {
         return self;
     }
 
+    pub const Connection = struct {
+        chan: *Channel,
+        shm_handle: u64,
+    };
+
     /// Allocates SHM, initializes the channel header, and grants to target.
     /// target_handle is either a child proc handle or a broadcast table handle.
-    pub fn connectAsA(target_handle: u64, protocol: lib.Protocol, shm_size: u64) ?*Channel {
+    pub fn connectAsA(target_handle: u64, protocol: lib.Protocol, shm_size: u64) ?Connection {
         const aligned_size = alignToPages(shm_size);
         const shm = syscall.shm_create_with_rights(aligned_size, shm_rw_grant);
         if (shm <= 0) return null;
@@ -127,7 +132,7 @@ pub const Channel = extern struct {
         // grant is the publication barrier — all header writes are visible after this
         _ = syscall.grant_perm(@intCast(shm), target_handle, shm_rw_grant);
 
-        return chan;
+        return .{ .chan = chan, .shm_handle = @intCast(shm) };
     }
 
     /// Maps a granted SHM handle and returns the Channel. Does not reinitialize.
@@ -215,6 +220,17 @@ pub const Channel = extern struct {
         ringWrite(buf, buf_size, tx + HEADER_SIZE, msg);
 
         @atomicStore(u64, tx_p, tx +% total, .release);
+        _ = syscall.futex_wake(tx_p, 1);
+    }
+
+    /// Block until a message is available from the peer, or timeout expires.
+    pub fn waitForMessage(self: *Channel, side: Side, timeout_ns: u64) void {
+        const other: Side = if (side == .A) .B else .A;
+        const peer_tx_p = self.txPtr(other);
+        const cached_tx_p = self.cachedTxPtr(other);
+        const current_tx = @atomicLoad(u64, peer_tx_p, .acquire);
+        if (current_tx != cached_tx_p.*) return;
+        _ = syscall.futex_wait(peer_tx_p, current_tx, timeout_ns);
     }
 
     pub fn receiveMessage(self: *Channel, side: Side, out: []u8) error{Disconnected}!?u64 {

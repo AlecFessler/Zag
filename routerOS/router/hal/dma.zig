@@ -41,6 +41,8 @@ pub const DmaRegion = struct {
     // DMA base per device (IOMMU-translated or physical)
     wan_dma_base: u64,
     lan_dma_base: u64,
+    // SHM handle (for tracking as known handle)
+    shm_handle: u64,
 
     // Convenience: virtual addresses of each section
     pub fn wanRxDescs(self: DmaRegion) *[e1000.NUM_RX_DESC]e1000.RxDesc {
@@ -127,6 +129,7 @@ pub fn setup(wan_device_handle: u64, lan_device_handle: u64) ?DmaRegion {
         .virt_base = virt_base,
         .wan_dma_base = wan_dma_base,
         .lan_dma_base = lan_dma_base,
+        .shm_handle = @intCast(shm_handle),
     };
 }
 
@@ -176,5 +179,6 @@ pub fn setupWan(wan_device_handle: u64, lan_device_handle: ?u64) ?DmaRegion {
         .virt_base = virt_base,
         .wan_dma_base = wan_dma_base,
         .lan_dma_base = lan_dma_base,
+        .shm_handle = @intCast(shm_handle),
     };
 }

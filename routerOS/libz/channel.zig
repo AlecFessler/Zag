@@ -1,253 +1,274 @@
-const std = @import("std");
-const crc32 = @import("crc32.zig");
-const syscall = @import("syscall.zig");
+const lib = @import("lib.zig");
 
-const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
-const CACHE_LINE = 64;
+const perm_view = lib.perm_view;
+const perms = lib.perms;
+const syscall = lib.syscall;
 
-pub const CHANNEL_MAGIC: u64 = 0x5A41475F4348414E;
+pub var perm_view_addr: u64 = 0;
 
-pub const ChannelHeader = extern struct {
-    magic: u64,
-    version: u16,
-    flags: u16,
-    ring_a_offset: u32,
-    ring_b_offset: u32,
-    ring_size: u32,
-    _reserved: u32,
+const BROADCAST_TABLE_CAPACITY: usize = 256;
 
-    pub fn init(self: *ChannelHeader, total_size: u32) void {
-        // Ring offsets must be 64-byte aligned for cache-line separation
-        const ring_a_off = std.mem.alignForward(u32, @sizeOf(ChannelHeader), CACHE_LINE);
-        const remaining = total_size - ring_a_off;
-        const per_ring_raw = remaining / 2;
-        const per_ring = std.mem.alignBackward(u32, per_ring_raw, CACHE_LINE);
-        const ring_b_off = ring_a_off + per_ring;
-        const ring_data = per_ring - @sizeOf(RingHeader);
-
-        self.magic = CHANNEL_MAGIC;
-        self.version = 1;
-        self.flags = 0;
-        self.ring_a_offset = ring_a_off;
-        self.ring_b_offset = ring_b_off;
-        self.ring_size = ring_data;
-        self._reserved = 0;
-
-        self.ringA().init();
-        self.ringB().init();
-    }
-
-    pub fn isValid(self: *const ChannelHeader) bool {
-        return self.magic == CHANNEL_MAGIC and self.version == 1;
-    }
-
-    pub fn ringA(self: *ChannelHeader) *RingHeader {
-        return @ptrFromInt(@intFromPtr(self) + self.ring_a_offset);
-    }
-
-    pub fn ringB(self: *ChannelHeader) *RingHeader {
-        return @ptrFromInt(@intFromPtr(self) + self.ring_b_offset);
-    }
+pub const BroadcastEntry = extern struct {
+    handle: u64,
+    payload: u64,
 };
 
-/// Ring header with cache-line-separated producer and consumer fields.
-///
-/// Cache line 0 (producer-owned): tail + cached_head
-/// Cache line 1 (consumer-owned): head + cached_tail
-///
-/// The producer only touches cache line 1 when the queue appears full
-/// (to reload the remote head). The consumer only touches cache line 0
-/// when the queue appears empty (to reload the remote tail).
-pub const RingHeader = extern struct {
-    // ── Cache line 0: producer-owned ─────────────────────────
-    tail: u64 align(CACHE_LINE) = 0,
-    cached_head: u64 = 0,
-    _pad_producer: [CACHE_LINE - 16]u8 = .{0} ** (CACHE_LINE - 16),
+const rw_shareable = (perms.VmReservationRights{
+    .read = true,
+    .write = true,
+    .shareable = true,
+}).bits();
 
-    // ── Cache line 1: consumer-owned ─────────────────────────
-    head: u64 align(CACHE_LINE) = 0,
-    cached_tail: u64 = 0,
-    _pad_consumer: [CACHE_LINE - 16]u8 = .{0} ** (CACHE_LINE - 16),
+const shm_rw_grant = (perms.SharedMemoryRights{
+    .read = true,
+    .write = true,
+    .grant = true,
+}).bits();
 
-    // ── Metadata ─────────────────────────────────────────────
-    data_size: u32 = 0,
-    _reserved: u32 = 0,
+pub fn alignToPages(size: u64) u64 {
+    return (size + syscall.PAGE4K - 1) & ~(syscall.PAGE4K - 1);
+}
 
-    comptime {
-        if (@offsetOf(RingHeader, "tail") / CACHE_LINE == @offsetOf(RingHeader, "head") / CACHE_LINE)
-            @compileError("tail and head must be on different cache lines");
-        if (@offsetOf(RingHeader, "tail") / CACHE_LINE != @offsetOf(RingHeader, "cached_head") / CACHE_LINE)
-            @compileError("tail and cached_head must share a cache line");
-        if (@offsetOf(RingHeader, "head") / CACHE_LINE != @offsetOf(RingHeader, "cached_tail") / CACHE_LINE)
-            @compileError("head and cached_tail must share a cache line");
+/// Calls the broadcast syscall with protocol_id in the low byte of the payload.
+pub fn broadcast(protocol_id: u8) !void {
+    const rc = syscall.broadcast_syscall(@as(u64, protocol_id));
+    if (rc == -2) return error.NoPerm;
+    if (rc == -4) return error.TableFull;
+    if (rc == -1) return error.DuplicatePayload;
+    if (rc != 0) return error.Unexpected;
+}
+
+/// Scans the broadcast table for an entry whose payload low byte matches
+/// the given protocol. Returns the broadcast handle, or null if not found.
+pub fn findBroadcastHandle(view_addr: u64, protocol: lib.Protocol) ?u64 {
+    const table_vaddr = findBroadcastTableVaddr(view_addr) orelse return null;
+    const entries: *const [BROADCAST_TABLE_CAPACITY]BroadcastEntry = @ptrFromInt(table_vaddr);
+    for (entries) |entry| {
+        if (entry.handle == 0) break;
+        if (@as(u8, @truncate(entry.payload)) == @intFromEnum(protocol)) return entry.handle;
+    }
+    return null;
+}
+
+fn findBroadcastTableVaddr(view_addr: u64) ?u64 {
+    const view: *const [128]perm_view.UserViewEntry = @ptrFromInt(view_addr);
+    for (view) |*entry| {
+        if (entry.entry_type == perm_view.ENTRY_TYPE_BROADCAST_TABLE) return entry.field0;
+    }
+    return null;
+}
+
+pub const Channel = extern struct {
+    pub const Side = enum(u1) {
+        A,
+        B,
+    };
+
+    const HEADER_SIZE = 8;
+
+    protocol_id: u8 = 0,
+    _reserved: [7]u8 = .{0} ** 7,
+
+    // Cache line 1 — written by A-side producer, read by B-side consumer
+    A_tx: u64 = 0,
+    A_cached_rx: u64 = 0,
+    B_rx: u64 = 0,
+    B_cached_tx: u64 = 0,
+    _pad1: [64]u8 = .{0} ** 64,
+
+    // Cache line 2 — written by B-side producer, read by A-side consumer
+    A_rx: u64 = 0,
+    A_cached_tx: u64 = 0,
+    B_tx: u64 = 0,
+    B_cached_rx: u64 = 0,
+    _pad2: [64]u8 = .{0} ** 64,
+
+    // Connection state
+    A_connected: u64 = 0,
+    B_connected: u64 = 0,
+
+    // Layout
+    base1: u64 = 0,
+    base2: u64 = 0,
+    capacity: u64 = 0,
+
+    pub fn init(region: []u8, protocol: u8) ?*Channel {
+        if (region.len <= @sizeOf(Channel)) return null;
+        const self: *Channel = @ptrCast(@alignCast(region.ptr));
+        self.* = .{};
+        const data_size = region.len - @sizeOf(Channel);
+        const half = data_size / 2;
+        self.protocol_id = protocol;
+        self.base1 = @sizeOf(Channel);
+        self.base2 = @sizeOf(Channel) + half;
+        self.capacity = half;
+        self.A_connected = 1;
+        return self;
     }
 
-    pub fn init(self: *RingHeader) void {
-        self.tail = 0;
-        self.cached_head = 0;
-        self.head = 0;
-        self.cached_tail = 0;
-        self.data_size = 0;
-        self._reserved = 0;
+    pub const Connection = struct {
+        chan: *Channel,
+        shm_handle: u64,
+    };
+
+    pub fn connectAsA(target_handle: u64, protocol: lib.Protocol, shm_size: u64) ?Connection {
+        const aligned_size = alignToPages(shm_size);
+        const shm = syscall.shm_create_with_rights(aligned_size, shm_rw_grant);
+        if (shm <= 0) return null;
+
+        const vm_result = syscall.vm_reserve(0, aligned_size, rw_shareable);
+        if (vm_result.val < 0) return null;
+
+        if (syscall.shm_map(@intCast(shm), @intCast(vm_result.val), 0) != 0) return null;
+
+        const region: [*]u8 = @ptrFromInt(vm_result.val2);
+        const chan = Channel.init(region[0..aligned_size], @intFromEnum(protocol)) orelse return null;
+
+        _ = syscall.grant_perm(@intCast(shm), target_handle, shm_rw_grant);
+
+        return .{ .chan = chan, .shm_handle = @intCast(shm) };
     }
 
-    fn dataPtr(self: *RingHeader) [*]u8 {
-        return @ptrFromInt(@intFromPtr(self) + @sizeOf(RingHeader));
+    pub fn connectAsB(shm_handle: u64, shm_size: u64) ?*Channel {
+        const aligned_size = alignToPages(shm_size);
+        const vm_result = syscall.vm_reserve(0, aligned_size, rw_shareable);
+        if (vm_result.val < 0) return null;
+
+        const map_rc = syscall.shm_map(shm_handle, @intCast(vm_result.val), 0);
+        if (map_rc != 0) return null;
+
+        const chan: *Channel = @ptrFromInt(vm_result.val2);
+        @atomicStore(u64, &chan.B_connected, 1, .release);
+        return chan;
     }
 
-    /// Wait until the ring has data, or the timeout expires.
-    /// Waits directly on the tail cursor — the producer calls
-    /// futex_wake(&tail) after each write.
-    pub fn waitForData(self: *RingHeader, timeout_ns: u64) void {
-        const head_val = @atomicLoad(u64, &self.head, .monotonic);
-        const tail_val = @atomicLoad(u64, &self.tail, .acquire);
-        if (head_val != tail_val) return;
-        _ = syscall.futex_wait(&self.tail, tail_val, timeout_ns);
+    fn peerConnected(self: *Channel, side: Side) bool {
+        const flag = if (side == .A) &self.B_connected else &self.A_connected;
+        return @atomicLoad(u64, flag, .acquire) != 0;
     }
 
-    pub fn hasData(self: *RingHeader) bool {
-        return @atomicLoad(u64, &self.head, .monotonic) != @atomicLoad(u64, &self.tail, .acquire);
-    }
-};
-
-pub const Channel = struct {
-    header: *ChannelHeader,
-    tx: *RingHeader,
-    rx: *RingHeader,
-    ring_size: u32,
-
-    pub fn initAsSideA(base: *ChannelHeader, total_size: u32) Channel {
-        base.init(total_size);
-        return .{
-            .header = base,
-            .tx = base.ringA(),
-            .rx = base.ringB(),
-            .ring_size = base.ring_size,
-        };
+    fn txPtr(self: *Channel, side: Side) *u64 {
+        return if (side == .A) &self.A_tx else &self.B_tx;
     }
 
-    pub fn openAsSideA(base: *ChannelHeader) ?Channel {
-        if (!base.isValid()) return null;
-        return .{
-            .header = base,
-            .tx = base.ringA(),
-            .rx = base.ringB(),
-            .ring_size = base.ring_size,
-        };
+    fn cachedRxPtr(self: *Channel, side: Side) *u64 {
+        return if (side == .A) &self.A_cached_rx else &self.B_cached_rx;
     }
 
-    pub fn openAsSideB(base: *ChannelHeader) ?Channel {
-        if (!base.isValid()) return null;
-        return .{
-            .header = base,
-            .tx = base.ringB(),
-            .rx = base.ringA(),
-            .ring_size = base.ring_size,
-        };
+    fn rxPtr(self: *Channel, side: Side) *u64 {
+        return if (side == .A) &self.B_rx else &self.A_rx;
     }
 
-    /// Send a message. Uses cached head to avoid cross-core atomic loads
-    /// unless the ring appears full.
-    ///
-    /// Message format: [u32 length][u32 crc32][u8 data...]
-    pub fn send(self: *Channel, data: []const u8) bool {
-        const ring = self.tx;
-        const ring_size = self.ring_size;
+    fn cachedTxPtr(self: *Channel, side: Side) *u64 {
+        return if (side == .A) &self.B_cached_tx else &self.A_cached_tx;
+    }
 
-        const tail = @atomicLoad(u64, &ring.tail, .monotonic);
-        const msg_size: u64 = @sizeOf(u32) + @sizeOf(u32) + data.len;
+    fn bufferSlice(self: *Channel, side: Side) [*]u8 {
+        const base: [*]u8 = @ptrCast(self);
+        const offset = if (side == .A) self.base1 else self.base2;
+        return base + offset;
+    }
 
-        // Fast path: check cached head
-        var free = ring_size -% (tail -% ring.cached_head);
-        if (msg_size > free) {
-            // Slow path: reload remote head
-            ring.cached_head = @atomicLoad(u64, &ring.head, .acquire);
-            free = ring_size -% (tail -% ring.cached_head);
-            if (msg_size > free) return false;
+    fn ringWrite(buf: [*]u8, buf_size: u64, pos: u64, data: []const u8) void {
+        const start = pos % buf_size;
+        const first = buf_size - start;
+        if (first >= data.len) {
+            @memcpy(buf[start..][0..data.len], data);
+        } else {
+            @memcpy(buf[start..][0..first], data[0..first]);
+            @memcpy(buf[0 .. data.len - first], data[first..]);
+        }
+    }
+
+    fn ringRead(buf: [*]u8, buf_size: u64, pos: u64, out: []u8) void {
+        const start = pos % buf_size;
+        const first = buf_size - start;
+        if (first >= out.len) {
+            @memcpy(out, buf[start..][0..out.len]);
+        } else {
+            @memcpy(out[0..first], buf[start..][0..first]);
+            @memcpy(out[first..], buf[0 .. out.len - first]);
+        }
+    }
+
+    pub fn sendMessage(self: *Channel, side: Side, msg: []const u8) error{ChannelFull}!void {
+        const tx_p = self.txPtr(side);
+        const cached_rx_p = self.cachedRxPtr(side);
+        const rx_p = self.rxPtr(side);
+        const buf = self.bufferSlice(side);
+        const buf_size = self.capacity;
+
+        const total = HEADER_SIZE + msg.len;
+        const tx = tx_p.*;
+        var available = buf_size -% (tx -% cached_rx_p.*);
+        if (available < total) {
+            cached_rx_p.* = @atomicLoad(u64, rx_p, .acquire);
+            available = buf_size -% (tx -% cached_rx_p.*);
+            if (available < total) return error.ChannelFull;
         }
 
-        const buf = ring.dataPtr();
-        const len_bytes = std.mem.toBytes(@as(u32, @intCast(data.len)));
-        const msg_crc = crc32.compute(data);
-        const crc_bytes = std.mem.toBytes(msg_crc);
+        var hdr_buf: [8]u8 = undefined;
+        @as(*align(1) u64, @ptrCast(&hdr_buf[0])).* = msg.len;
+        ringWrite(buf, buf_size, tx, &hdr_buf);
+        ringWrite(buf, buf_size, tx + HEADER_SIZE, msg);
 
-        var pos = tail % ring_size;
-        for (len_bytes) |b| {
-            buf[pos] = b;
-            pos = (pos + 1) % ring_size;
-        }
-        for (crc_bytes) |b| {
-            buf[pos] = b;
-            pos = (pos + 1) % ring_size;
-        }
-        for (data) |b| {
-            buf[pos] = b;
-            pos = (pos + 1) % ring_size;
-        }
-
-        @atomicStore(u64, &ring.tail, tail +% msg_size, .release);
-        _ = syscall.futex_wake(&ring.tail, 1);
-
-        return true;
+        @atomicStore(u64, tx_p, tx +% total, .release);
+        _ = syscall.futex_wake(tx_p, 1);
     }
 
-    /// Receive a message. Uses cached tail to avoid cross-core atomic loads
-    /// unless the ring appears empty.
-    pub fn recv(self: *Channel, out: []u8) ?u32 {
-        const ring = self.rx;
-        const ring_size = self.ring_size;
+    /// Block until a message is available from the peer, or timeout expires.
+    pub fn waitForMessage(self: *Channel, side: Side, timeout_ns: u64) void {
+        const other: Side = if (side == .A) .B else .A;
+        const peer_tx_p = self.txPtr(other);
+        const cached_tx_p = self.cachedTxPtr(other);
+        const current_tx = @atomicLoad(u64, peer_tx_p, .acquire);
+        if (current_tx != cached_tx_p.*) return;
+        _ = syscall.futex_wait(peer_tx_p, current_tx, timeout_ns);
+    }
 
-        const head_val = @atomicLoad(u64, &ring.head, .monotonic);
+    pub fn receiveMessage(self: *Channel, side: Side, out: []u8) error{Disconnected}!?u64 {
+        const other: Side = if (side == .A) .B else .A;
+        const rx_p = self.rxPtr(other);
+        const cached_tx_p = self.cachedTxPtr(other);
+        const tx_p = self.txPtr(other);
+        const buf = self.bufferSlice(other);
+        const buf_size = self.capacity;
 
-        // Fast path: check cached tail
-        if (head_val == ring.cached_tail) {
-            // Slow path: reload remote tail
-            ring.cached_tail = @atomicLoad(u64, &ring.tail, .acquire);
-            if (head_val == ring.cached_tail) return null;
+        const rx = rx_p.*;
+        var data_avail = cached_tx_p.* -% rx;
+        if (data_avail < HEADER_SIZE) {
+            cached_tx_p.* = @atomicLoad(u64, tx_p, .acquire);
+            data_avail = cached_tx_p.* -% rx;
+            if (data_avail < HEADER_SIZE) {
+                if (!self.peerConnected(side)) return error.Disconnected;
+                return null;
+            }
         }
 
-        const buf = ring.dataPtr();
-        var pos = head_val % ring_size;
+        var hdr_buf: [8]u8 = undefined;
+        ringRead(buf, buf_size, rx, &hdr_buf);
+        const msg_len = @as(*align(1) const u64, @ptrCast(&hdr_buf[0])).*;
 
-        // Read message length
-        var len_bytes: [4]u8 = undefined;
-        for (&len_bytes) |*b| {
-            b.* = buf[pos];
-            pos = (pos + 1) % ring_size;
-        }
-        const msg_len = std.mem.bytesToValue(u32, &len_bytes);
-
-        if (msg_len > out.len) return null;
-
-        // Read stored CRC
-        var crc_bytes: [4]u8 = undefined;
-        for (&crc_bytes) |*b| {
-            b.* = buf[pos];
-            pos = (pos + 1) % ring_size;
-        }
-        const stored_crc = std.mem.bytesToValue(u32, &crc_bytes);
-
-        // Read message data
-        for (out[0..msg_len]) |*b| {
-            b.* = buf[pos];
-            pos = (pos + 1) % ring_size;
+        if (data_avail < HEADER_SIZE + msg_len) {
+            cached_tx_p.* = @atomicLoad(u64, tx_p, .acquire);
+            data_avail = cached_tx_p.* -% rx;
+            if (data_avail < HEADER_SIZE + msg_len) return null;
         }
 
-        // Verify CRC
-        const actual_crc = crc32.compute(out[0..msg_len]);
-        if (stored_crc != actual_crc) return null;
+        if (msg_len > out.len) {
+            @atomicStore(u64, rx_p, rx +% HEADER_SIZE +% msg_len, .release);
+            return null;
+        }
 
-        const new_head = head_val +% @sizeOf(u32) +% @sizeOf(u32) +% msg_len;
-        @atomicStore(u64, &ring.head, new_head, .release);
-
+        ringRead(buf, buf_size, rx + HEADER_SIZE, out[0..msg_len]);
+        @atomicStore(u64, rx_p, rx +% HEADER_SIZE +% msg_len, .release);
         return msg_len;
     }
 
-    pub fn waitForMessage(self: *Channel, timeout_ns: u64) void {
-        self.rx.waitForData(timeout_ns);
-    }
-
-    pub fn hasMessage(self: *Channel) bool {
-        return self.rx.hasData();
+    pub fn disconnect(self: *Channel, side: Side, shm_handle: u64, vm_handle: u64) void {
+        const flag = if (side == .A) &self.A_connected else &self.B_connected;
+        @atomicStore(u64, flag, 0, .release);
+        _ = syscall.revoke_perm(shm_handle);
+        _ = syscall.revoke_perm(vm_handle);
     }
 };

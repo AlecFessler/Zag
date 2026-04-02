@@ -7,7 +7,8 @@ const main = router.state;
 const util = router.util;
 
 const Seqlock = lib.sync.Seqlock;
-const channel_mod = lib.channel;
+const channel = lib.channel;
+const Channel = channel.Channel;
 const syscall = lib.syscall;
 
 pub const MSG_UDP_SEND: u8 = 0x01;
@@ -154,9 +155,9 @@ pub fn forwardToApp(src_ip: [4]u8, src_port: u16, dst_port: u16, payload: []cons
     }
     if (!matched) return false;
 
-    var chan: *channel_mod.Channel = switch (target_app) {
-        .nfs => &(main.nfs_chan orelse return false),
-        .ntp => &(main.ntp_chan orelse return false),
+    const chan: *Channel = switch (target_app) {
+        .nfs => main.nfs_chan orelse return false,
+        .ntp => main.ntp_chan orelse return false,
     };
 
     var msg: [2048]u8 = undefined;
@@ -169,6 +170,6 @@ pub fn forwardToApp(src_ip: [4]u8, src_port: u16, dst_port: u16, payload: []cons
     util.writeU16Be(msg[7..9], dst_port);
     @memcpy(msg[9..][0..payload.len], payload);
 
-    _ = chan.send(msg[0..msg_len]);
+    chan.sendMessage(.B, msg[0..msg_len]) catch {};
     return true;
 }

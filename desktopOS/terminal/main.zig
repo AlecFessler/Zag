@@ -21,11 +21,11 @@ pub fn main(perm_view_addr: u64) void {
         comp_handle = channel.findBroadcastHandle(perm_view_addr, .compositor) orelse 0;
         if (comp_handle == 0) syscall.thread_yield();
     }
-    const display_chan = Channel.connectAsA(comp_handle, .compositor, display.SHM_SIZE) orelse {
+    const display_conn = Channel.connectAsA(comp_handle, .compositor, display.SHM_SIZE) orelse {
         syscall.write("terminal: FAIL connectAsA compositor\n");
         return;
     };
-    var display_client = display.Client.init(display_chan);
+    var display_client = display.Client.init(display_conn.chan);
     syscall.write("terminal: display channel connected to compositor\n");
 
     // Find usb_keyboard and connect for keyboard input
@@ -34,10 +34,11 @@ pub fn main(perm_view_addr: u64) void {
         kb_handle = channel.findBroadcastHandle(perm_view_addr, .usb_keyboard) orelse 0;
         if (kb_handle == 0) syscall.thread_yield();
     }
-    const kb_chan = Channel.connectAsA(kb_handle, .usb_keyboard, DEFAULT_SHM_SIZE) orelse {
+    const kb_conn = Channel.connectAsA(kb_handle, .usb_keyboard, DEFAULT_SHM_SIZE) orelse {
         syscall.write("terminal: FAIL connectAsA usb_keyboard\n");
         return;
     };
+    const kb_chan = kb_conn.chan;
     syscall.write("terminal: keyboard channel connected to usb_driver\n");
 
     // Receive render target info from compositor

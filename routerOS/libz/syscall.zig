@@ -30,8 +30,8 @@ pub const SyscallNum = enum(u64) {
     ioport_write,
     dma_map,
     dma_unmap,
-    pci_enable_bus_master,
     pin_exclusive,
+    broadcast,
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -192,8 +192,10 @@ pub fn dma_map(device_handle: u64, shm_handle: u64) i64 {
     return syscall2(.dma_map, device_handle, shm_handle);
 }
 
+/// Stub — the kernel handles PCI bus master enabling during device init.
 pub fn pci_enable_bus_master(device_handle: u64) i64 {
-    return syscall1(.pci_enable_bus_master, device_handle);
+    _ = device_handle;
+    return 0;
 }
 
 pub fn dma_unmap(device_handle: u64, shm_handle: u64) i64 {
@@ -202,4 +204,8 @@ pub fn dma_unmap(device_handle: u64, shm_handle: u64) i64 {
 
 pub fn pin_exclusive() i64 {
     return syscall0(.pin_exclusive);
+}
+
+pub fn broadcast_syscall(payload: u64) i64 {
+    return syscall1(.broadcast, payload);
 }

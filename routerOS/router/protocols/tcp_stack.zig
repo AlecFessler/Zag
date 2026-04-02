@@ -163,12 +163,12 @@ fn parseContentLength(headers: []const u8) ?usize {
 
 /// Forward the complete HTTP request to the http_server process via IPC.
 fn forwardToHttpServer() void {
-    const chan = &(main.http_chan orelse return);
+    const chan = main.http_chan orelse return;
     var msg: [2049]u8 = undefined;
     msg[0] = MSG_HTTP_REQUEST;
     const len = @min(request_len, msg.len - 1);
     @memcpy(msg[1..][0..len], request_buf[0..len]);
-    _ = chan.send(msg[0 .. 1 + len]);
+    chan.sendMessage(.B, msg[0 .. 1 + len]) catch {};
     request_len = 0;
 }
 

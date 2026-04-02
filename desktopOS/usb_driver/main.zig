@@ -62,11 +62,11 @@ pub fn main(perm_view_addr: u64) void {
         comp_handle = channel.findBroadcastHandle(perm_view_addr, .compositor) orelse 0;
         if (comp_handle == 0) syscall.thread_yield();
     }
-    const mouse_chan = Channel.connectAsA(comp_handle, .input_control, DEFAULT_SHM_SIZE) orelse {
+    const mouse_conn = Channel.connectAsA(comp_handle, .input_control, DEFAULT_SHM_SIZE) orelse {
         syscall.write("usb_driver: FAIL connectAsA compositor\n");
         return;
     };
-    const mouse_client = mouse.Client.init(mouse_chan);
+    const mouse_client = mouse.Client.init(mouse_conn.chan);
     syscall.write("usb_driver: mouse channel connected to compositor\n");
 
     // Collect all USB device handles from permission view

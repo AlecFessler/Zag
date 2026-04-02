@@ -1,10 +1,9 @@
 const lib = @import("lib");
 
-const channel_mod = lib.channel;
-const perms = lib.perms;
-const pv = lib.perm_view;
-const shm_protocol = lib.shm_protocol;
+const channel = lib.channel;
 const syscall = lib.syscall;
+
+const Channel = channel.Channel;
 
 // ── Message tags (must match router/services/tcp_stack.zig) ─────────
 
@@ -36,98 +35,36 @@ const MUT_FORWARD_LEASED: u8 = 6;
 
 // ── Configuration ───────────────────────────────────────────────────
 
-const MAX_PERMS = 128;
+const DEFAULT_SHM_SIZE = 4 * syscall.PAGE4K;
 const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 
 // ── State ───────────────────────────────────────────────────────────
 
-var router_chan: channel_mod.Channel = undefined;
-var has_router: bool = false;
+var router_chan: *Channel = undefined;
 
 // ── Entry point ─────────────────────────────────────────────────────
 
-// Track mapped SHM handles so we can find unmapped data SHMs.
-var mapped_handles: [16]u64 = .{0} ** 16;
-var num_mapped: u32 = 0;
-
-fn isHandleMapped(handle: u64) bool {
-    for (mapped_handles[0..num_mapped]) |h| {
-        if (h == handle) return true;
-    }
-    return false;
-}
-
-fn recordMapped(handle: u64) void {
-    if (num_mapped < mapped_handles.len) {
-        mapped_handles[num_mapped] = handle;
-        num_mapped += 1;
-    }
-}
-
 pub fn main(perm_view_addr: u64) void {
-    const cmd = shm_protocol.mapCommandChannel(perm_view_addr) orelse return;
+    channel.perm_view_addr = perm_view_addr;
 
-    // Record the command channel SHM as mapped so we skip it later.
-    {
-        const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
-        for (view) |*entry| {
-            if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) {
-                recordMapped(entry.handle);
-                break;
-            }
-        }
+    // Broadcast as HTTP_SERVER
+    channel.broadcast(@intFromEnum(lib.Protocol.http_server)) catch {};
+
+    // Connect to router as side A via broadcast table
+    var handle: u64 = 0;
+    while (handle == 0) {
+        handle = channel.findBroadcastHandle(perm_view_addr, .router) orelse 0;
+        if (handle == 0) syscall.thread_yield();
     }
-
-    var router_entry: *shm_protocol.ConnectionEntry = undefined;
-    while (true) {
-        router_entry = cmd.requestConnection(shm_protocol.ServiceId.ROUTER) orelse {
-            cmd.waitForNotification(MAX_TIMEOUT);
-            continue;
-        };
-        break;
-    }
-    _ = cmd.waitForConnection(router_entry);
-
-    // Wait for the next unmapped data SHM to appear (the router data channel).
-    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
-    while (true) {
-        for (view) |*entry| {
-            if (entry.entry_type != pv.ENTRY_TYPE_SHARED_MEMORY) continue;
-            if (entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) continue;
-            if (isHandleMapped(entry.handle)) continue;
-
-            const vm_rights = (perms.VmReservationRights{
-                .read = true,
-                .write = true,
-                .shareable = true,
-            }).bits();
-            const vm_result = syscall.vm_reserve(0, entry.field0, vm_rights);
-            if (vm_result.val >= 0) {
-                if (syscall.shm_map(entry.handle, @intCast(vm_result.val), 0) == 0) {
-                    recordMapped(entry.handle);
-                    const header: *channel_mod.ChannelHeader = @ptrFromInt(vm_result.val2);
-                    router_chan = channel_mod.Channel.openAsSideB(header) orelse {
-                        pv.waitForChange(perm_view_addr, 10_000_000); // 10ms
-                        continue;
-                    };
-                    has_router = true;
-                    break;
-                }
-            }
-        }
-        if (has_router) break;
-        pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
-    }
-
-    _ = router_chan.send(&[_]u8{@truncate(shm_protocol.ServiceId.HTTP_SERVER)});
+    router_chan = (Channel.connectAsA(handle, .http_server, DEFAULT_SHM_SIZE) orelse return).chan;
 
     // Main loop
     while (true) {
         var router_buf: [8192]u8 = undefined;
-        if (router_chan.recv(&router_buf)) |len| {
+        if (router_chan.receiveMessage(.A, &router_buf) catch null) |len| {
             handleRouterMessage(router_buf[0..len]);
         } else {
-            router_chan.rx.waitForData(10_000_000); // 10ms
+            router_chan.waitForMessage(.A, 10_000_000); // 10ms
         }
     }
 }
@@ -201,18 +138,18 @@ fn handleGet(path: []const u8) void {
 }
 
 fn sendStateQueryResponse(endpoint: u8) void {
-    _ = router_chan.send(&[_]u8{ MSG_STATE_QUERY, endpoint });
+    router_chan.sendMessage(.A, &[_]u8{ MSG_STATE_QUERY, endpoint }) catch {};
 
     var buf: [8192]u8 = undefined;
     var attempts: u8 = 0;
     while (attempts < 10) : (attempts += 1) {
-        if (router_chan.recv(&buf)) |len| {
+        if (router_chan.receiveMessage(.A, &buf) catch null) |len| {
             if (len >= 1 and buf[0] == MSG_STATE_RESPONSE) {
                 sendHttpResponse("200 OK", "application/json", buf[1..len]);
                 return;
             }
         }
-        router_chan.rx.waitForData(500_000_000); // 500ms
+        router_chan.waitForMessage(.A, 500_000_000); // 500ms
     }
 
     sendHttpResponse("503 Service Unavailable", "text/plain", "State query timeout");
@@ -347,18 +284,18 @@ fn handleSetTimezone(args: []const u8) void {
 }
 
 fn sendMutationAndRespond(msg: []const u8) void {
-    _ = router_chan.send(msg);
+    router_chan.sendMessage(.A, msg) catch {};
 
     var buf: [8192]u8 = undefined;
     var attempts: u8 = 0;
     while (attempts < 10) : (attempts += 1) {
-        if (router_chan.recv(&buf)) |len| {
+        if (router_chan.receiveMessage(.A, &buf) catch null) |len| {
             if (len >= 1 and buf[0] == MSG_MUTATION_RESPONSE) {
                 sendHttpResponse("200 OK", "application/json", buf[1..len]);
                 return;
             }
         }
-        router_chan.rx.waitForData(500_000_000); // 500ms
+        router_chan.waitForMessage(.A, 500_000_000); // 500ms
     }
 
     sendHttpResponse("503 Service Unavailable", "text/plain", "Mutation timeout");
@@ -424,9 +361,12 @@ fn sendHttpResponse(status: []const u8, content_type: []const u8, body: []const 
         }
 
         // Wait until ring buffer has space (router must consume previous chunk)
-        while (!router_chan.send(msg[0..p])) {
-            const head_val = @atomicLoad(u64, &router_chan.tx.head, .acquire);
-            _ = syscall.futex_wait(&router_chan.tx.head, head_val, 50_000_000); // 50ms
+        while (true) {
+            router_chan.sendMessage(.A, msg[0..p]) catch {
+                router_chan.waitForMessage(.A, 50_000_000); // 50ms
+                continue;
+            };
+            break;
         }
     }
 }
@@ -489,13 +429,13 @@ fn handleSoapAddPortMapping(raw: []const u8) void {
     msg[14] = @intCast(lease & 0xff);
     msg[15] = 1; // source = upnp
 
-    _ = router_chan.send(&msg);
+    router_chan.sendMessage(.A, &msg) catch {};
 
     // Wait for response
     var buf: [8192]u8 = undefined;
     var attempts: u8 = 0;
     while (attempts < 10) : (attempts += 1) {
-        if (router_chan.recv(&buf)) |len| {
+        if (router_chan.receiveMessage(.A, &buf) catch null) |len| {
             if (len >= 1 and buf[0] == MSG_MUTATION_RESPONSE) {
                 // Check if ok
                 if (containsStr(buf[1..len], "\"ok\":true")) {
@@ -506,7 +446,7 @@ fn handleSoapAddPortMapping(raw: []const u8) void {
                 return;
             }
         }
-        router_chan.rx.waitForData(500_000_000);
+        router_chan.waitForMessage(.A, 500_000_000);
     }
     sendSoapFault("501", "Action Failed");
 }
@@ -528,12 +468,12 @@ fn handleSoapDeletePortMapping(body: []const u8) void {
 
 fn handleSoapGetExternalIP() void {
     // Query router status to get WAN IP
-    _ = router_chan.send(&[_]u8{ MSG_STATE_QUERY, EP_STATUS });
+    router_chan.sendMessage(.A, &[_]u8{ MSG_STATE_QUERY, EP_STATUS }) catch {};
 
     var buf: [8192]u8 = undefined;
     var attempts: u8 = 0;
     while (attempts < 10) : (attempts += 1) {
-        if (router_chan.recv(&buf)) |len| {
+        if (router_chan.receiveMessage(.A, &buf) catch null) |len| {
             if (len >= 1 and buf[0] == MSG_STATE_RESPONSE) {
                 // Parse WAN IP from status JSON: {"wan":"x.x.x.x ..."}
                 const status = buf[1..len];
@@ -547,7 +487,7 @@ fn handleSoapGetExternalIP() void {
                 return;
             }
         }
-        router_chan.rx.waitForData(500_000_000);
+        router_chan.waitForMessage(.A, 500_000_000);
     }
     sendSoapFault("501", "Action Failed");
 }

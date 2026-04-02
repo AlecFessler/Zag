@@ -1,13 +1,15 @@
 const lib = @import("lib");
 
-const channel_mod = lib.channel;
+const channel = lib.channel;
 const perms = lib.perms;
 const pv = lib.perm_view;
-const shm_protocol = lib.shm_protocol;
 const syscall = lib.syscall;
+
+const Channel = channel.Channel;
 
 const MAX_PERMS = 128;
 const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
+const DEFAULT_SHM_SIZE: u64 = 4 * syscall.PAGE4K;
 
 const REG_DATA = 0;
 const REG_IER = 1;
@@ -53,10 +55,35 @@ fn rxByte() u8 {
     return portRead(REG_DATA);
 }
 
-pub fn main(perm_view_addr: u64) void {
-    _ = shm_protocol.mapCommandChannel(perm_view_addr) orelse return;
+// ── Known SHM tracking ──────────────────────────────────────────────
+var known_shm_handles: [32]u64 = .{0} ** 32;
+var known_shm_count: u8 = 0;
 
+fn pollNewShm(view_addr: u64) ?u64 {
+    const view: *const [128]pv.UserViewEntry = @ptrFromInt(view_addr);
+    for (view) |*entry| {
+        if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY) {
+            var known = false;
+            for (known_shm_handles[0..known_shm_count]) |h| {
+                if (h == entry.handle) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known and known_shm_count < 32) {
+                known_shm_handles[known_shm_count] = entry.handle;
+                known_shm_count += 1;
+                return entry.handle;
+            }
+        }
+    }
+    return null;
+}
+
+pub fn main(perm_view_addr: u64) void {
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
+
+    // Find serial device
     while (device_handle == 0) {
         for (view) |*entry| {
             if (entry.entry_type == pv.ENTRY_TYPE_DEVICE_REGION and
@@ -71,38 +98,17 @@ pub fn main(perm_view_addr: u64) void {
 
     initUart();
 
-    var data_shm_handle: u64 = 0;
-    var data_shm_size: u64 = 0;
-    while (data_shm_handle == 0) {
-        for (view) |*e| {
-            if (e.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and e.field0 > shm_protocol.COMMAND_SHM_SIZE) {
-                data_shm_handle = e.handle;
-                data_shm_size = e.field0;
-                break;
-            }
-        }
-        if (data_shm_handle == 0) pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
-    }
+    // Broadcast as serial service
+    channel.broadcast(@intFromEnum(lib.Protocol.serial)) catch return;
 
-    const vm_rights = (perms.VmReservationRights{
-        .read = true,
-        .write = true,
-        .shareable = true,
-    }).bits();
-    var chan: channel_mod.Channel = undefined;
+    // Wait for console to connect
+    var chan: *Channel = undefined;
     while (true) {
-        const vm_result = syscall.vm_reserve(0, data_shm_size, vm_rights);
-        if (vm_result.val >= 0) {
-            if (syscall.shm_map(data_shm_handle, @intCast(vm_result.val), 0) == 0) {
-                const chan_header: *channel_mod.ChannelHeader = @ptrFromInt(vm_result.val2);
-                chan = channel_mod.Channel.openAsSideB(chan_header) orelse {
-                    pv.waitForChange(perm_view_addr, 10_000_000); // 10ms
-                    continue;
-                };
-                break;
-            }
+        if (pollNewShm(perm_view_addr)) |shm_handle| {
+            chan = Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE) orelse continue;
+            break;
         }
-        pv.waitForChange(perm_view_addr, 10_000_000); // 10ms
+        syscall.thread_yield();
     }
 
     var tx_buf: [256]u8 = undefined;
@@ -110,10 +116,10 @@ pub fn main(perm_view_addr: u64) void {
         if (rxReady()) {
             const byte = rxByte();
             const msg = [_]u8{byte};
-            _ = chan.send(&msg);
+            chan.sendMessage(.B, &msg) catch {};
         }
 
-        if (chan.recv(&tx_buf)) |len| {
+        if (chan.receiveMessage(.B, &tx_buf) catch null) |len| {
             for (tx_buf[0..len]) |byte| {
                 txByte(byte);
             }

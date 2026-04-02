@@ -1,6 +1,7 @@
 const lib = @import("lib");
 
-const channel_mod = lib.channel;
+const channel = lib.channel;
+const Channel = channel.Channel;
 const syscall = lib.syscall;
 
 // ── Log levels ───────────────────────────────────────────────────────
@@ -173,7 +174,7 @@ fn writeWithData(msg: Msg, data: []const u8) void {
 
 // ── Service thread: drain ring and flush to NFS ──────────────────────
 
-pub fn drainAndFlush(nfs_chan: *?channel_mod.Channel, loop_n: u32) void {
+pub fn drainAndFlush(nfs_chan: *?*Channel, loop_n: u32) void {
     // Boot marker
     if (!boot_marker_sent) {
         var marker: [64]u8 = undefined;
@@ -255,13 +256,13 @@ pub fn drainAndFlush(nfs_chan: *?channel_mod.Channel, loop_n: u32) void {
         (loop_n % FLUSH_INTERVAL == 0 and write_buf_pos > 0);
 
     if (should_flush) {
-        if (nfs_chan.*) |*chan| {
+        if (nfs_chan.*) |chan| {
             flushToNfs(chan);
         }
     }
 }
 
-fn flushToNfs(chan: *channel_mod.Channel) void {
+fn flushToNfs(chan: *Channel) void {
     if (write_buf_pos == 0) return;
 
     var msg: [3 + WRITE_BUF_SIZE]u8 = undefined;
@@ -271,9 +272,8 @@ fn flushToNfs(chan: *channel_mod.Channel) void {
     msg[2] = @truncate(data_len);
     @memcpy(msg[3..][0..data_len], write_buf[0..data_len]);
 
-    if (chan.send(msg[0 .. 3 + data_len])) {
-        write_buf_pos = 0;
-    }
+    chan.sendMessage(.B, msg[0 .. 3 + data_len]) catch return;
+    write_buf_pos = 0;
 }
 
 fn appendToWriteBuf(data: []const u8) void {

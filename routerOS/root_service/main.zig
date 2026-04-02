@@ -1,25 +1,18 @@
 const lib = @import("lib");
 
-const channel_mod = lib.channel;
 const embedded = @import("embedded_children");
 const perms = lib.perms;
 const pv = lib.perm_view;
-const shm_protocol = lib.shm_protocol;
 const syscall = lib.syscall;
 
 const std = @import("std");
 
 const MAX_PERMS = 128;
 const MAX_CHILDREN = 16;
-const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 
 const ChildInfo = struct {
     name: []const u8,
-    service_id: u32,
     proc_handle: u64,
-    cmd_shm_handle: i64,
-    cmd_channel: ?*shm_protocol.CommandChannel,
-    allowed_connections: u32,
 };
 
 var children: [MAX_CHILDREN]ChildInfo = undefined;
@@ -27,58 +20,17 @@ var num_children: u32 = 0;
 var perm_view_global: u64 = 0;
 var watchdog_counter = std.atomic.Value(u32).init(0);
 
-fn findChildByService(service_id: u32) ?*ChildInfo {
-    for (children[0..num_children]) |*child| {
-        if (child.service_id == service_id) return child;
-    }
-    return null;
-}
+const DeviceGrant = struct {
+    handle: u64,
+    rights: u64,
+};
 
 fn spawnChild(
     name: []const u8,
     elf: []const u8,
-    service_id: u32,
     child_rights: perms.ProcessRights,
-    allowed_connections: []const u32,
-    perm_view_addr: u64,
     device_handles: []const DeviceGrant,
 ) bool {
-    const cmd_shm = syscall.shm_create(shm_protocol.COMMAND_SHM_SIZE);
-    if (cmd_shm <= 0) {
-        syscall.write("root: shm_create failed for ");
-        syscall.write(name);
-        syscall.write("\n");
-        return false;
-    }
-
-    const vm_rights = (perms.VmReservationRights{
-        .read = true,
-        .write = true,
-        .execute = true,
-        .shareable = true,
-    }).bits();
-    const vm_result = syscall.vm_reserve(0, shm_protocol.COMMAND_SHM_SIZE, vm_rights);
-    if (vm_result.val < 0) {
-        syscall.write("root: vm_reserve failed for ");
-        syscall.write(name);
-        syscall.write("\n");
-        return false;
-    }
-
-    const map_rc = syscall.shm_map(@intCast(cmd_shm), @intCast(vm_result.val), 0);
-    if (map_rc != 0) {
-        syscall.write("root: shm_map failed for ");
-        syscall.write(name);
-        syscall.write("\n");
-        return false;
-    }
-
-    const cmd: *shm_protocol.CommandChannel = @ptrFromInt(vm_result.val2);
-    cmd.init();
-    for (allowed_connections) |conn| {
-        cmd.addAllowedConnection(conn);
-    }
-
     const proc_handle = syscall.proc_create(@intFromPtr(elf.ptr), elf.len, child_rights.bits());
     if (proc_handle <= 0) {
         syscall.write("root: proc_create failed for ");
@@ -86,13 +38,6 @@ fn spawnChild(
         syscall.write("\n");
         return false;
     }
-
-    const grant_rights = (perms.SharedMemoryRights{
-        .read = true,
-        .write = true,
-        .grant = true,
-    }).bits();
-    _ = syscall.grant_perm(@intCast(cmd_shm), @intCast(proc_handle), grant_rights);
 
     for (device_handles) |dg| {
         const grant_rc = syscall.grant_perm(dg.handle, @intCast(proc_handle), dg.rights);
@@ -103,25 +48,14 @@ fn spawnChild(
         }
     }
 
-    _ = perm_view_addr;
-
     children[num_children] = .{
         .name = name,
-        .service_id = service_id,
         .proc_handle = @intCast(proc_handle),
-        .cmd_shm_handle = cmd_shm,
-        .cmd_channel = cmd,
-        .allowed_connections = @intCast(allowed_connections.len),
     };
     num_children += 1;
 
     return true;
 }
-
-const DeviceGrant = struct {
-    handle: u64,
-    rights: u64,
-};
 
 fn findAllMmioDevicesByClass(perm_view_addr: u64, class: perms.DeviceClass, out: []DeviceGrant) u32 {
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
@@ -156,61 +90,6 @@ fn findAllDevicesByClass(perm_view_addr: u64, class: perms.DeviceClass, out: []D
     return count;
 }
 
-fn brokerConnection(requester: *ChildInfo, target_service_id: u32) void {
-    const target = findChildByService(target_service_id) orelse {
-        syscall.write("root: broker target not found\n");
-        return;
-    };
-
-    const data_shm = syscall.shm_create(4 * syscall.PAGE4K);
-    if (data_shm <= 0) {
-        syscall.write("root: data shm_create failed\n");
-        return;
-    }
-
-    const data_vm_rights = (perms.VmReservationRights{
-        .read = true,
-        .write = true,
-        .execute = true,
-        .shareable = true,
-    }).bits();
-    const data_vm = syscall.vm_reserve(0, 4 * syscall.PAGE4K, data_vm_rights);
-    if (data_vm.val < 0) {
-        syscall.write("root: data vm_reserve failed\n");
-        return;
-    }
-
-    const data_map = syscall.shm_map(@intCast(data_shm), @intCast(data_vm.val), 0);
-    if (data_map != 0) {
-        syscall.write("root: data shm_map failed\n");
-        return;
-    }
-
-    const chan_header: *channel_mod.ChannelHeader = @ptrFromInt(data_vm.val2);
-    _ = channel_mod.Channel.initAsSideA(chan_header, 4 * syscall.PAGE4K);
-
-    const grant_rights = (perms.SharedMemoryRights{
-        .read = true,
-        .write = true,
-        .grant = true,
-    }).bits();
-    _ = syscall.grant_perm(@intCast(data_shm), requester.proc_handle, grant_rights);
-    _ = syscall.grant_perm(@intCast(data_shm), target.proc_handle, grant_rights);
-
-    if (requester.cmd_channel) |cmd| {
-        cmd.setConnected(target_service_id, @intCast(data_shm), 4 * syscall.PAGE4K);
-        cmd.notifyChild();
-    }
-
-    if (target.cmd_channel) |cmd| {
-        cmd.setConnected(requester.service_id, @intCast(data_shm), 4 * syscall.PAGE4K);
-        cmd.notifyChild();
-    }
-
-    _ = syscall.shm_unmap(@intCast(data_shm), @intCast(data_vm.val));
-    _ = syscall.revoke_perm(@intCast(data_shm));
-}
-
 fn crashReasonName(reason: pv.CrashReason) []const u8 {
     return switch (reason) {
         .none => "none",
@@ -239,7 +118,6 @@ fn watchdogThread() void {
 
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_global);
 
-    // Find the perm view entry for this child's process handle
     var entry_ptr: ?*const pv.UserViewEntry = null;
     for (view) |*e| {
         if (e.entry_type == pv.ENTRY_TYPE_PROCESS and e.handle == child.proc_handle) {
@@ -300,40 +178,6 @@ fn writeU16(val: u16) void {
     syscall.write(buf[i..]);
 }
 
-
-fn brokerLoop() void {
-    while (true) {
-        var found_request = false;
-
-        for (children[0..num_children]) |*child| {
-            const cmd = child.cmd_channel orelse continue;
-            // Only iterate over the connections that the root service originally
-            // authorized. Ignore any entries the child may have added by writing
-            // to shared memory (fixes VULN-I1).
-            const authorized_count = @min(child.allowed_connections, shm_protocol.MAX_CONNECTIONS);
-            for (cmd.connections[0..authorized_count]) |*entry| {
-                if (@atomicLoad(u32, &entry.status, .acquire) == @intFromEnum(shm_protocol.ConnectionStatus.requested)) {
-                    brokerConnection(child, entry.service_id);
-                    found_request = true;
-                }
-            }
-        }
-
-        if (!found_request) {
-            // Wait briefly on the first child's wake_flag for a connection request.
-            // Any requesting child bumps its own wake_flag and does futex_wake.
-            // Use a short timeout so we also check other children periodically.
-            for (children[0..num_children]) |*child| {
-                if (child.cmd_channel) |cmd0| {
-                    const current = @atomicLoad(u64, &cmd0.wake_flag, .acquire);
-                    _ = syscall.futex_wait(&cmd0.wake_flag, current, 10_000_000); // 10ms
-                    break;
-                }
-            }
-        }
-    }
-}
-
 pub fn main(perm_view_addr: u64) void {
     perm_view_global = perm_view_addr;
     var serial_devices: [4]DeviceGrant = undefined;
@@ -342,18 +186,27 @@ pub fn main(perm_view_addr: u64) void {
     var nic_devices: [8]DeviceGrant = undefined;
     const nic_count = findAllMmioDevicesByClass(perm_view_addr, .network, &nic_devices);
 
-    _ = spawnChild(
-        "serial_driver",
-        embedded.serial_driver,
-        shm_protocol.ServiceId.SERIAL,
-        .{ .grant_to = true, .mem_reserve = true, .device_own = true, .restart = true },
-        &.{},
-        perm_view_addr,
-        serial_devices[0..serial_count],
-    );
+    const base_rights = perms.ProcessRights{
+        .grant_to_child = true,
+        .mem_reserve = true,
+        .restart = true,
+        .shm_create = true,
+        .grant_to_broadcast = true,
+        .broadcast = true,
+    };
+
+    _ = spawnChild("serial_driver", embedded.serial_driver, perms.ProcessRights{
+        .grant_to_child = base_rights.grant_to_child,
+        .mem_reserve = true,
+        .device_own = true,
+        .restart = true,
+        .shm_create = true,
+        .grant_to_broadcast = true,
+        .broadcast = true,
+    }, serial_devices[0..serial_count]);
 
     const router_rights = perms.ProcessRights{
-        .grant_to = true,
+        .grant_to_child = true,
         .spawn_thread = true,
         .mem_reserve = true,
         .set_affinity = true,
@@ -361,56 +214,15 @@ pub fn main(perm_view_addr: u64) void {
         .device_own = true,
         .restart = true,
         .pin_exclusive = true,
+        .grant_to_broadcast = true,
+        .broadcast = true,
     };
 
-    _ = spawnChild(
-        "router",
-        embedded.router,
-        shm_protocol.ServiceId.ROUTER,
-        router_rights,
-        &.{},
-        perm_view_addr,
-        nic_devices[0..nic_count],
-    );
-    _ = spawnChild(
-        "nfs_client",
-        embedded.nfs_client,
-        shm_protocol.ServiceId.NFS_CLIENT,
-        .{ .grant_to = true, .mem_reserve = true, .restart = true },
-        &.{shm_protocol.ServiceId.ROUTER},
-        perm_view_addr,
-        &.{},
-    );
-
-    _ = spawnChild(
-        "ntp_client",
-        embedded.ntp_client,
-        shm_protocol.ServiceId.NTP_CLIENT,
-        .{ .grant_to = true, .mem_reserve = true, .restart = true },
-        &.{shm_protocol.ServiceId.ROUTER},
-        perm_view_addr,
-        &.{},
-    );
-
-    _ = spawnChild(
-        "http_server",
-        embedded.http_server,
-        shm_protocol.ServiceId.HTTP_SERVER,
-        .{ .grant_to = true, .mem_reserve = true, .restart = true },
-        &.{shm_protocol.ServiceId.ROUTER},
-        perm_view_addr,
-        &.{},
-    );
-
-    _ = spawnChild(
-        "console",
-        embedded.console,
-        shm_protocol.ServiceId.CONSOLE,
-        .{ .grant_to = true, .mem_reserve = true, .restart = true },
-        &.{ shm_protocol.ServiceId.SERIAL, shm_protocol.ServiceId.ROUTER, shm_protocol.ServiceId.NFS_CLIENT, shm_protocol.ServiceId.NTP_CLIENT, shm_protocol.ServiceId.HTTP_SERVER },
-        perm_view_addr,
-        &.{},
-    );
+    _ = spawnChild("router", embedded.router, router_rights, nic_devices[0..nic_count]);
+    _ = spawnChild("nfs_client", embedded.nfs_client, base_rights, &.{});
+    _ = spawnChild("ntp_client", embedded.ntp_client, base_rights, &.{});
+    _ = spawnChild("http_server", embedded.http_server, base_rights, &.{});
+    _ = spawnChild("console", embedded.console, base_rights, &.{});
 
     // Spawn watchdog threads for each child
     var wi: u32 = 0;
@@ -418,5 +230,5 @@ pub fn main(perm_view_addr: u64) void {
         _ = syscall.thread_create(&watchdogThread, 0, 4);
     }
 
-    brokerLoop();
+    while (true) syscall.thread_yield();
 }
