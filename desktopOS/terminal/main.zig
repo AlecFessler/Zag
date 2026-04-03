@@ -4,6 +4,7 @@ const input = @import("input.zig");
 const render = @import("render.zig");
 
 const display = lib.display;
+const filesystem = lib.filesystem;
 const keyboard = lib.keyboard;
 const syscall = lib.syscall;
 
@@ -29,6 +30,20 @@ pub fn main(perm_view_addr: u64) void {
         if (kb_client_opt == null) syscall.thread_yield();
     }
     const kb_client = kb_client_opt.?;
+
+    // Connect to filesystem server
+    var fs_client_opt: ?filesystem.Client = null;
+    var fs_attempts: u32 = 0;
+    while (fs_client_opt == null and fs_attempts < 500_000) : (fs_attempts += 1) {
+        fs_client_opt = filesystem.connectToServer(perm_view_addr) catch |err| switch (err) {
+            error.ServerNotFound => null,
+            error.ChannelFailed => null,
+        };
+        if (fs_client_opt == null) syscall.thread_yield();
+    }
+    if (fs_client_opt) |*fc| {
+        commands.setFsClient(fc);
+    }
 
     // Wait for render target info and set up framebuffers
     if (!waitForRenderTarget(&display_client)) return;

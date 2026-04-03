@@ -31,6 +31,13 @@ pub fn main(perm_view_addr: u64) void {
         child_rights.bits(),
     ) catch return;
 
+    // Spawn nvme_driver
+    const nvme_proc = syscall.spawn_child(
+        @intFromPtr(embedded.nvme_driver.ptr),
+        embedded.nvme_driver.len,
+        child_rights.bits(),
+    ) catch return;
+
     // Wait for device grants from root, then route to children by device class.
     // Device region grants have move semantics -- each handle can only be
     // granted once before it's removed from our table.
@@ -61,6 +68,8 @@ pub fn main(perm_view_addr: u64) void {
                 syscall.grant_perm(entry.handle, comp_proc, device_grant_rights) catch {};
             } else if (class == @intFromEnum(perms.DeviceClass.usb)) {
                 syscall.grant_perm(entry.handle, usb_proc, device_grant_rights) catch {};
+            } else if (class == @intFromEnum(perms.DeviceClass.storage)) {
+                syscall.grant_perm(entry.handle, nvme_proc, device_grant_rights) catch {};
             }
         }
     }

@@ -1,6 +1,7 @@
 const lib = @import("lib");
 const nvme = @import("nvme.zig");
 
+const filesystem = lib.filesystem;
 const syscall = lib.syscall;
 
 // ── On-disk layout ──────────────────────────────────────────────────
@@ -39,7 +40,6 @@ const SB_OFF_NEXT_FREE: usize = 8;
 
 // ── Module state ────────────────────────────────────────────────────
 var ctrl: *nvme.Controller = undefined;
-var open_inode_lba: u32 = 0; // currently open file (0 = none)
 
 pub fn init(controller: *nvme.Controller) bool {
     ctrl = controller;
@@ -148,67 +148,124 @@ pub fn rmfile(path: []const u8) bool {
     return removeEntry(path, inode_lba);
 }
 
-pub fn openFile(path: []const u8) bool {
-    if (open_inode_lba != 0) return false; // already open
+pub fn writeFile(path: []const u8, offset: u64, data: []const u8) bool {
     const inode_lba = resolvePath(path) orelse return false;
 
     if (!ctrl.readSectors(1, inode_lba, 1)) return false;
-    const buf = ctrl.getReadBuf();
-    if (buf[0] != INODE_FILE) return false;
-
-    open_inode_lba = inode_lba;
-    return true;
-}
-
-pub fn writeFile(data: []const u8) bool {
-    if (open_inode_lba == 0) return false;
-
-    // Read current inode
-    if (!ctrl.readSectors(1, open_inode_lba, 1)) return false;
     const rbuf = ctrl.getReadBuf();
-    const wbuf = ctrl.getWriteBuf();
+    if (rbuf[0] != INODE_FILE) return false;
 
-    // Copy inode to write buffer for modification
+    const wbuf = ctrl.getWriteBuf();
     @memcpy(wbuf[0..LBA_SIZE], rbuf[0..LBA_SIZE]);
 
-    var current_size = readU64(wbuf, 68);
+    const current_size = readU64(wbuf, 68);
     var block_count = readU32(wbuf, 80);
 
-    // Write data in LBA-sized chunks
+    // Calculate starting block index and offset within block
+    const start_block: u32 = @truncate(offset / LBA_SIZE);
+    var block_offset: usize = @truncate(offset % LBA_SIZE);
+
     var written: usize = 0;
+    var block_idx: u32 = start_block;
+
     while (written < data.len) {
-        if (block_count >= INODE_DIRECT_MAX) return false; // out of direct blocks
+        var data_lba: u32 = undefined;
 
-        const new_lba = allocBlock() orelse return false;
-        const chunk_len = @min(data.len - written, LBA_SIZE);
+        if (block_idx < block_count) {
+            // Existing block — read its LBA from the inode
+            // Re-read inode to get current block pointers
+            if (!ctrl.readSectors(1, inode_lba, 1)) return false;
+            data_lba = readU32(ctrl.getReadBuf(), 84 + block_idx * 4);
+        } else {
+            // Need new blocks up to block_idx
+            while (block_count <= block_idx) {
+                if (block_count >= INODE_DIRECT_MAX) return false;
+                const new_lba = allocBlock() orelse return false;
 
-        // Prepare data block in a temporary area
-        const data_buf = ctrl.getWriteBuf();
-        @memset(data_buf[0..LBA_SIZE], 0);
-        @memcpy(data_buf[0..chunk_len], data[written..][0..chunk_len]);
-        if (!ctrl.writeSectors(1, new_lba, 1)) return false;
+                // Clear new block
+                const db = ctrl.getWriteBuf();
+                @memset(db[0..LBA_SIZE], 0);
+                if (!ctrl.writeSectors(1, new_lba, 1)) return false;
 
-        // Re-read inode since writeSectors used write buffer
-        if (!ctrl.readSectors(1, open_inode_lba, 1)) return false;
-        @memcpy(ctrl.getWriteBuf()[0..LBA_SIZE], ctrl.getReadBuf()[0..LBA_SIZE]);
+                // Re-read inode and add block pointer
+                if (!ctrl.readSectors(1, inode_lba, 1)) return false;
+                @memcpy(ctrl.getWriteBuf()[0..LBA_SIZE], ctrl.getReadBuf()[0..LBA_SIZE]);
+                writeU32(ctrl.getWriteBuf(), 84 + block_count * 4, new_lba);
+                block_count += 1;
+                writeU32(ctrl.getWriteBuf(), 80, block_count);
+                if (!ctrl.writeSectors(1, inode_lba, 1)) return false;
+            }
+            // Re-read inode to get the LBA we just wrote
+            if (!ctrl.readSectors(1, inode_lba, 1)) return false;
+            data_lba = readU32(ctrl.getReadBuf(), 84 + block_idx * 4);
+        }
 
-        // Update inode with new block
-        const wb = ctrl.getWriteBuf();
-        writeU32(wb, 84 + block_count * 4, new_lba);
-        block_count += 1;
-        current_size += chunk_len;
-        writeU32(wb, 80, block_count);
-        writeU64(wb, 68, current_size);
-        if (!ctrl.writeSectors(1, open_inode_lba, 1)) return false;
+        // Read existing block data
+        if (!ctrl.readSectors(1, data_lba, 1)) return false;
+        const db = ctrl.getWriteBuf();
+        @memcpy(db[0..LBA_SIZE], ctrl.getReadBuf()[0..LBA_SIZE]);
+
+        // Write data into block at block_offset
+        const space = LBA_SIZE - block_offset;
+        const chunk_len = @min(data.len - written, space);
+        @memcpy(db[block_offset..][0..chunk_len], data[written..][0..chunk_len]);
+        if (!ctrl.writeSectors(1, data_lba, 1)) return false;
 
         written += chunk_len;
+        block_idx += 1;
+        block_offset = 0; // subsequent blocks start at offset 0
+    }
+
+    // Update file size if we extended past the end
+    const end_offset = offset + data.len;
+    if (end_offset > current_size) {
+        if (!ctrl.readSectors(1, inode_lba, 1)) return false;
+        @memcpy(ctrl.getWriteBuf()[0..LBA_SIZE], ctrl.getReadBuf()[0..LBA_SIZE]);
+        writeU64(ctrl.getWriteBuf(), 68, end_offset);
+        writeU32(ctrl.getWriteBuf(), 80, block_count);
+        if (!ctrl.writeSectors(1, inode_lba, 1)) return false;
     }
 
     return true;
 }
 
-pub fn closeFile() void {
-    open_inode_lba = 0;
+pub fn readFile(path: []const u8, offset: u64, size: u64, out_buf: []u8) usize {
+    const inode_lba = resolvePath(path) orelse return 0;
+
+    if (!ctrl.readSectors(1, inode_lba, 1)) return 0;
+    const buf = ctrl.getReadBuf();
+    if (buf[0] != INODE_FILE) return 0;
+
+    const file_size: u64 = readU64(buf, 68);
+    if (offset >= file_size) return 0;
+
+    const available = file_size - offset;
+    const to_read: usize = @truncate(@min(size, @min(available, out_buf.len)));
+    const block_count = readU32(buf, 80);
+
+    // Save block LBAs
+    var data_lbas: [INODE_DIRECT_MAX]u32 = undefined;
+    var i: u32 = 0;
+    while (i < block_count and i < INODE_DIRECT_MAX) : (i += 1) {
+        data_lbas[i] = readU32(buf, 84 + i * 4);
+    }
+
+    const start_block: u32 = @truncate(offset / LBA_SIZE);
+    var block_offset: usize = @truncate(offset % LBA_SIZE);
+    var out_len: usize = 0;
+    var block_idx: u32 = start_block;
+
+    while (out_len < to_read and block_idx < block_count) {
+        if (!ctrl.readSectors(1, data_lbas[block_idx], 1)) break;
+        const data_buf = ctrl.getReadBuf();
+        const space = LBA_SIZE - block_offset;
+        const chunk: usize = @min(to_read - out_len, space);
+        @memcpy(out_buf[out_len..][0..chunk], data_buf[block_offset..][0..chunk]);
+        out_len += chunk;
+        block_idx += 1;
+        block_offset = 0;
+    }
+    return out_len;
 }
 
 pub fn ls(path: []const u8, out_buf: []u8) usize {
@@ -221,8 +278,7 @@ pub fn ls(path: []const u8, out_buf: []u8) usize {
     const block_count = readU32(buf, 80);
     var out_len: usize = 0;
 
-    // Read child LBAs from parent inode's direct_blocks
-    // Need to save them since readSectors will overwrite read buffer
+    // Save child LBAs since readSectors will overwrite read buffer
     var child_lbas: [INODE_DIRECT_MAX]u32 = undefined;
     var i: u32 = 0;
     while (i < block_count and i < INODE_DIRECT_MAX) : (i += 1) {
@@ -244,35 +300,133 @@ pub fn ls(path: []const u8, out_buf: []u8) usize {
     return out_len;
 }
 
-pub fn readFile(path: []const u8, out_buf: []u8) usize {
-    const inode_lba = resolvePath(path) orelse return 0;
+pub const StatResult = struct {
+    size: u64,
+    inode_type: u8,
+};
 
-    if (!ctrl.readSectors(1, inode_lba, 1)) return 0;
+pub fn stat(path: []const u8) ?StatResult {
+    const inode_lba = resolvePath(path) orelse return null;
+
+    if (!ctrl.readSectors(1, inode_lba, 1)) return null;
     const buf = ctrl.getReadBuf();
-    if (buf[0] != INODE_FILE) return 0;
 
-    const file_size: usize = @truncate(readU64(buf, 68));
-    const block_count = readU32(buf, 80);
+    return .{
+        .size = readU64(buf, 68),
+        .inode_type = buf[0],
+    };
+}
+
+pub fn renamePath(src: []const u8, dst: []const u8) bool {
+    // Resolve source
+    const src_lba = resolvePath(src) orelse return false;
+    if (src_lba == ROOT_INODE_LBA) return false;
+
+    // Destination parent must exist and be a directory
+    if (dst.len < 2 or dst[0] != '/') return false;
+    var last_slash: usize = 0;
+    for (dst, 0..) |ch, idx| {
+        if (ch == '/') last_slash = idx;
+    }
+    const dst_parent_path = if (last_slash == 0) "/" else dst[0..last_slash];
+    const dst_name = dst[last_slash + 1 ..];
+    if (dst_name.len == 0 or dst_name.len > INODE_NAME_MAX) return false;
+
+    const dst_parent_lba = resolvePath(dst_parent_path) orelse return false;
+
+    // Check destination name doesn't already exist
+    if (findChild(dst_parent_lba, dst_name) != null) return false;
+
+    // Get source parent info
+    if (src.len < 2 or src[0] != '/') return false;
+    var src_last_slash: usize = 0;
+    for (src, 0..) |ch, idx| {
+        if (ch == '/') src_last_slash = idx;
+    }
+    const src_parent_path = if (src_last_slash == 0) "/" else src[0..src_last_slash];
+    const src_parent_lba = resolvePath(src_parent_path) orelse return false;
+
+    // Remove from source parent's direct_blocks
+    if (!ctrl.readSectors(1, src_parent_lba, 1)) return false;
+    const rbuf = ctrl.getReadBuf();
+    const wbuf = ctrl.getWriteBuf();
+    @memcpy(wbuf[0..LBA_SIZE], rbuf[0..LBA_SIZE]);
+
+    var block_count = readU32(wbuf, 80);
+    var found = false;
+    var i: u32 = 0;
+    while (i < block_count) : (i += 1) {
+        if (readU32(wbuf, 84 + i * 4) == src_lba) {
+            const last_lba = readU32(wbuf, 84 + (block_count - 1) * 4);
+            writeU32(wbuf, 84 + i * 4, last_lba);
+            block_count -= 1;
+            writeU32(wbuf, 80, block_count);
+            found = true;
+            break;
+        }
+    }
+    if (!found) return false;
+    if (!ctrl.writeSectors(1, src_parent_lba, 1)) return false;
+
+    // Add to destination parent's direct_blocks
+    if (!ctrl.readSectors(1, dst_parent_lba, 1)) return false;
+    @memcpy(ctrl.getWriteBuf()[0..LBA_SIZE], ctrl.getReadBuf()[0..LBA_SIZE]);
+    const dst_idx = readU32(ctrl.getWriteBuf(), 80);
+    if (dst_idx >= INODE_DIRECT_MAX) return false;
+    writeU32(ctrl.getWriteBuf(), 84 + dst_idx * 4, src_lba);
+    writeU32(ctrl.getWriteBuf(), 80, dst_idx + 1);
+    if (!ctrl.writeSectors(1, dst_parent_lba, 1)) return false;
+
+    // Update inode name and parent pointer
+    if (!ctrl.readSectors(1, src_lba, 1)) return false;
+    @memcpy(ctrl.getWriteBuf()[0..LBA_SIZE], ctrl.getReadBuf()[0..LBA_SIZE]);
+    const wb = ctrl.getWriteBuf();
+    wb[2] = @truncate(dst_name.len);
+    wb[3] = @truncate(dst_name.len >> 8);
+    // Clear old name area and write new name
+    @memset(wb[4..][0..INODE_NAME_MAX], 0);
+    @memcpy(wb[4..][0..dst_name.len], dst_name);
+    writeU32(wb, 76, dst_parent_lba);
+    if (!ctrl.writeSectors(1, src_lba, 1)) return false;
+
+    return true;
+}
+
+pub fn truncateFile(path: []const u8, new_size: u64) bool {
+    const inode_lba = resolvePath(path) orelse return false;
+
+    if (!ctrl.readSectors(1, inode_lba, 1)) return false;
+    const rbuf = ctrl.getReadBuf();
+    if (rbuf[0] != INODE_FILE) return false;
+
+    const current_size = readU64(rbuf, 68);
+    var block_count = readU32(rbuf, 80);
 
     // Save block LBAs
     var data_lbas: [INODE_DIRECT_MAX]u32 = undefined;
     var i: u32 = 0;
     while (i < block_count and i < INODE_DIRECT_MAX) : (i += 1) {
-        data_lbas[i] = readU32(buf, 84 + i * 4);
+        data_lbas[i] = readU32(rbuf, 84 + i * 4);
     }
 
-    var out_len: usize = 0;
-    i = 0;
-    while (i < block_count and i < INODE_DIRECT_MAX) : (i += 1) {
-        if (!ctrl.readSectors(1, data_lbas[i], 1)) break;
-        const data_buf = ctrl.getReadBuf();
-        const remaining = file_size - out_len;
-        const chunk = @min(remaining, LBA_SIZE);
-        if (out_len + chunk > out_buf.len) break;
-        @memcpy(out_buf[out_len..][0..chunk], data_buf[0..chunk]);
-        out_len += chunk;
+    if (new_size < current_size) {
+        // Shrink: free blocks beyond new size
+        const needed_blocks: u32 = if (new_size == 0) 0 else @truncate((new_size + LBA_SIZE - 1) / LBA_SIZE);
+        var j: u32 = needed_blocks;
+        while (j < block_count) : (j += 1) {
+            freeBlock(data_lbas[j]);
+        }
+        block_count = needed_blocks;
     }
-    return out_len;
+
+    // Update inode
+    if (!ctrl.readSectors(1, inode_lba, 1)) return false;
+    @memcpy(ctrl.getWriteBuf()[0..LBA_SIZE], ctrl.getReadBuf()[0..LBA_SIZE]);
+    writeU64(ctrl.getWriteBuf(), 68, new_size);
+    writeU32(ctrl.getWriteBuf(), 80, block_count);
+    if (!ctrl.writeSectors(1, inode_lba, 1)) return false;
+
+    return true;
 }
 
 // ── Path resolution ─────────────────────────────────────────────────

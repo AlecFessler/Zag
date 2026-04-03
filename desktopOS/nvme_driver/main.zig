@@ -13,7 +13,6 @@ const Channel = channel.Channel;
 const MAX_CLIENTS = 16;
 const MAX_CONTROLLERS = 4;
 const MAX_PERMS = 128;
-const DEFAULT_SHM_SIZE: u64 = 4 * syscall.PAGE4K;
 
 var controllers: [MAX_CONTROLLERS]nvme.Controller = .{nvme.Controller{}} ** MAX_CONTROLLERS;
 var ctrl_count: u8 = 0;
@@ -107,7 +106,7 @@ pub fn main(perm_view_addr: u64) void {
     while (true) {
         // Accept new filesystem clients
         if (pollNewShm(perm_view_addr)) |shm_handle| {
-            if (Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE) catch null) |chan| {
+            if (Channel.connectAsB(shm_handle, filesystem.SHM_SIZE) catch null) |chan| {
                 if (client_count < MAX_CLIENTS) {
                     clients[client_count] = filesystem.Server.init(chan);
                     client_count += 1;
@@ -161,25 +160,38 @@ fn handleRequest(server: *const filesystem.Server, req: filesystem.Server.Reques
                 server.sendError("rmfile failed");
             }
         },
-        0x05 => { // open
-            if (fs.openFile(req.payload)) {
-                server.sendOk();
-            } else {
-                server.sendError("open failed");
+        0x05 => { // read: offset(u64) + size(u64) + path
+            if (req.payload.len < 16) {
+                server.sendError("read: bad payload");
+                return;
             }
+            const offset = readU64(req.payload, 0);
+            const size = readU64(req.payload, 8);
+            const path = req.payload[16..];
+            var out_buf: [4096]u8 = undefined;
+            const len = fs.readFile(path, offset, size, &out_buf);
+            server.sendData(out_buf[0..len]);
         },
-        0x06 => { // write
-            if (fs.writeFile(req.payload)) {
+        0x06 => { // write: offset(u64) + path_len(u16) + path + data
+            if (req.payload.len < 10) {
+                server.sendError("write: bad payload");
+                return;
+            }
+            const offset = readU64(req.payload, 0);
+            const path_len: u16 = @as(u16, req.payload[8]) | (@as(u16, req.payload[9]) << 8);
+            if (req.payload.len < 10 + path_len) {
+                server.sendError("write: bad path");
+                return;
+            }
+            const path = req.payload[10..][0..path_len];
+            const data = req.payload[10 + path_len ..];
+            if (fs.writeFile(path, offset, data)) {
                 server.sendOk();
             } else {
                 server.sendError("write failed");
             }
         },
-        0x07 => { // close
-            fs.closeFile();
-            server.sendOk();
-        },
-        0x08 => { // ls
+        0x07 => { // ls
             var out_buf: [4096]u8 = undefined;
             const len = fs.ls(req.payload, &out_buf);
             if (len > 0) {
@@ -188,13 +200,63 @@ fn handleRequest(server: *const filesystem.Server, req: filesystem.Server.Reques
                 server.sendData(&[0]u8{});
             }
         },
-        0x09 => { // read
-            var out_buf: [4096]u8 = undefined;
-            const len = fs.readFile(req.payload, &out_buf);
-            server.sendData(out_buf[0..len]);
+        0x08 => { // stat
+            if (fs.stat(req.payload)) |result| {
+                server.sendStat(.{
+                    .size = result.size,
+                    .file_type = if (result.inode_type == 1) .file else .directory,
+                    .created = 0,
+                    .modified = 0,
+                    .accessed = 0,
+                });
+            } else {
+                server.sendError("stat failed");
+            }
+        },
+        0x09 => { // rename: path1_len(u16) + path1 + path2
+            if (req.payload.len < 2) {
+                server.sendError("rename: bad payload");
+                return;
+            }
+            const path1_len: u16 = @as(u16, req.payload[0]) | (@as(u16, req.payload[1]) << 8);
+            if (req.payload.len < 2 + path1_len) {
+                server.sendError("rename: bad path");
+                return;
+            }
+            const path1 = req.payload[2..][0..path1_len];
+            const path2 = req.payload[2 + path1_len ..];
+            if (fs.renamePath(path1, path2)) {
+                server.sendOk();
+            } else {
+                server.sendError("rename failed");
+            }
+        },
+        0x0A => { // truncate: size(u64) + path
+            if (req.payload.len < 8) {
+                server.sendError("truncate: bad payload");
+                return;
+            }
+            const size = readU64(req.payload, 0);
+            const path = req.payload[8..];
+            if (fs.truncateFile(path, size)) {
+                server.sendOk();
+            } else {
+                server.sendError("truncate failed");
+            }
         },
         else => {
             server.sendError("unknown command");
         },
     }
+}
+
+fn readU64(buf: []const u8, offset: usize) u64 {
+    return @as(u64, buf[offset]) |
+        (@as(u64, buf[offset + 1]) << 8) |
+        (@as(u64, buf[offset + 2]) << 16) |
+        (@as(u64, buf[offset + 3]) << 24) |
+        (@as(u64, buf[offset + 4]) << 32) |
+        (@as(u64, buf[offset + 5]) << 40) |
+        (@as(u64, buf[offset + 6]) << 48) |
+        (@as(u64, buf[offset + 7]) << 56);
 }

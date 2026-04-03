@@ -58,6 +58,12 @@ pub fn executeCommand(line: []const u8) void {
         cmdCat(args);
     } else if (strEql(cmd_name, "write")) {
         cmdWrite(args);
+    } else if (strEql(cmd_name, "stat")) {
+        cmdStat(args);
+    } else if (strEql(cmd_name, "rename")) {
+        cmdRename(args);
+    } else if (strEql(cmd_name, "truncate")) {
+        cmdTruncate(args);
     } else if (strEql(cmd_name, "pwd")) {
         render.appendHistory(cwd[0..cwd_len]);
         render.appendHistory("\n");
@@ -145,7 +151,7 @@ fn cmdCd(args: []const u8) void {
                 render.appendHistory(msg);
                 render.appendHistory("\n");
             },
-            .ok => {},
+            .ok, .stat => {},
         }
     } else {
         render.appendHistory("cd: timeout\n");
@@ -180,7 +186,7 @@ fn cmdLs(args: []const u8) void {
                 render.appendHistory(msg);
                 render.appendHistory("\n");
             },
-            .ok => {},
+            .ok, .stat => {},
         }
     } else {
         render.appendHistory("ls: timeout\n");
@@ -204,7 +210,7 @@ fn cmdCat(args: []const u8) void {
     };
 
     var resp_buf: [4096]u8 = undefined;
-    if (client.read(full, &resp_buf)) |resp| {
+    if (client.read(full, 0, 4096, &resp_buf)) |resp| {
         switch (resp) {
             .data => |data| {
                 if (data.len > 0) {
@@ -217,7 +223,7 @@ fn cmdCat(args: []const u8) void {
                 render.appendHistory(msg);
                 render.appendHistory("\n");
             },
-            .ok => {},
+            .ok, .stat => {},
         }
     } else {
         render.appendHistory("cat: timeout\n");
@@ -252,46 +258,159 @@ fn cmdWrite(args: []const u8) void {
         return;
     };
 
-    // Open, write, close
+    // Truncate file to 0 then write at offset 0
     var resp_buf: [256]u8 = undefined;
-    if (client.open(full, &resp_buf)) |resp| {
+    if (client.truncate(full, 0, &resp_buf)) |resp| {
         switch (resp) {
-            .ok => {},
             .err => |msg| {
-                render.appendHistory("write: open: ");
+                render.appendHistory("write: truncate: ");
                 render.appendHistory(msg);
                 render.appendHistory("\n");
                 return;
             },
-            .data => {},
+            .ok, .data, .stat => {},
         }
     } else {
-        render.appendHistory("write: open timeout\n");
+        render.appendHistory("write: truncate timeout\n");
         return;
     }
 
     if (content.len > 0) {
-        if (client.fsWrite(content, &resp_buf)) |resp| {
+        if (client.write(full, 0, content, &resp_buf)) |resp| {
             switch (resp) {
                 .ok => {},
                 .err => |msg| {
                     render.appendHistory("write: ");
                     render.appendHistory(msg);
                     render.appendHistory("\n");
-                    _ = client.close(&resp_buf);
                     return;
                 },
-                .data => {},
+                .data, .stat => {},
             }
         } else {
             render.appendHistory("write: timeout\n");
-            _ = client.close(&resp_buf);
             return;
         }
     }
 
-    _ = client.close(&resp_buf);
     render.appendHistory("ok\n");
+}
+
+fn cmdStat(args: []const u8) void {
+    const client = fs_client orelse {
+        render.appendHistory("error: no filesystem\n");
+        return;
+    };
+    if (args.len == 0) {
+        render.appendHistory("usage: stat <path>\n");
+        return;
+    }
+
+    var path_buf: [512]u8 = undefined;
+    const full = fullPath(args, &path_buf) orelse {
+        render.appendHistory("error: path too long\n");
+        return;
+    };
+
+    var resp_buf: [256]u8 = undefined;
+    if (client.stat(full, &resp_buf)) |resp| {
+        switch (resp) {
+            .stat => |info| {
+                render.appendHistory("type: ");
+                render.appendHistory(switch (info.file_type) {
+                    .file => "file",
+                    .directory => "directory",
+                });
+                render.appendHistory("\nsize: ");
+                var num_buf: [20]u8 = undefined;
+                const num_str = formatU64(info.size, &num_buf);
+                render.appendHistory(num_str);
+                render.appendHistory("\n");
+            },
+            .err => |msg| {
+                render.appendHistory("stat: ");
+                render.appendHistory(msg);
+                render.appendHistory("\n");
+            },
+            .ok, .data => {},
+        }
+    } else {
+        render.appendHistory("stat: timeout\n");
+    }
+}
+
+fn cmdRename(args: []const u8) void {
+    const client = fs_client orelse {
+        render.appendHistory("error: no filesystem\n");
+        return;
+    };
+
+    // Parse: rename <src> <dst>
+    var src_end: usize = 0;
+    while (src_end < args.len and args[src_end] != ' ') {
+        src_end += 1;
+    }
+    if (src_end == 0 or src_end >= args.len) {
+        render.appendHistory("usage: rename <src> <dst>\n");
+        return;
+    }
+    const src_arg = args[0..src_end];
+    const dst_arg = args[src_end + 1 ..];
+    if (dst_arg.len == 0) {
+        render.appendHistory("usage: rename <src> <dst>\n");
+        return;
+    }
+
+    var src_buf: [512]u8 = undefined;
+    const src_full = fullPath(src_arg, &src_buf) orelse {
+        render.appendHistory("error: src path too long\n");
+        return;
+    };
+    var dst_buf: [512]u8 = undefined;
+    const dst_full = fullPath(dst_arg, &dst_buf) orelse {
+        render.appendHistory("error: dst path too long\n");
+        return;
+    };
+
+    var resp_buf: [256]u8 = undefined;
+    handleSimpleResponse(client.rename(src_full, dst_full, &resp_buf));
+}
+
+fn cmdTruncate(args: []const u8) void {
+    const client = fs_client orelse {
+        render.appendHistory("error: no filesystem\n");
+        return;
+    };
+
+    // Parse: truncate <path> <size>
+    var path_end: usize = 0;
+    while (path_end < args.len and args[path_end] != ' ') {
+        path_end += 1;
+    }
+    if (path_end == 0 or path_end >= args.len) {
+        render.appendHistory("usage: truncate <path> <size>\n");
+        return;
+    }
+    const path_arg = args[0..path_end];
+    const size_str = args[path_end + 1 ..];
+
+    var size: u64 = 0;
+    for (size_str) |ch| {
+        if (ch < '0' or ch > '9') {
+            render.appendHistory("truncate: invalid size\n");
+            return;
+        }
+        size = size * 10 + (ch - '0');
+    }
+
+    var path_buf: [512]u8 = undefined;
+    const full = fullPath(path_arg, &path_buf) orelse {
+        render.appendHistory("error: path too long\n");
+        return;
+    };
+
+    var resp_buf: [256]u8 = undefined;
+    handleSimpleResponse(client.truncate(full, size, &resp_buf));
 }
 
 // ── Path helpers ────────────────────────────────────────────────────
@@ -323,11 +442,26 @@ fn handleSimpleResponse(result: ?filesystem.Client.Response) void {
                 render.appendHistory(msg);
                 render.appendHistory("\n");
             },
-            .data => {},
+            .data, .stat => {},
         }
     } else {
         render.appendHistory("error: timeout\n");
     }
+}
+
+fn formatU64(val: u64, buf: *[20]u8) []const u8 {
+    if (val == 0) {
+        buf[19] = '0';
+        return buf[19..20];
+    }
+    var v = val;
+    var pos: usize = 20;
+    while (v > 0) {
+        pos -= 1;
+        buf[pos] = @truncate((v % 10) + '0');
+        v /= 10;
+    }
+    return buf[pos..20];
 }
 
 // ── Echo (existing zutil) ───────────────────────────────────────────
