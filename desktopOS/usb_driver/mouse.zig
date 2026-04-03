@@ -4,7 +4,7 @@ const lib = @import("lib");
 const mouse = lib.mouse;
 
 /// Process a HID mouse report using parsed report descriptor info.
-pub fn processReport(report: [*]const u8, info: *const hid.ReportInfo, client: *const mouse.Client) void {
+pub fn processReport(report: [*]const u8, info: *const hid.ReportInfo, servers: []mouse.Server) void {
     const data = if (info.report_id > 0) report + 1 else report;
 
     const buttons: u16 = if (info.buttons.count > 0)
@@ -33,12 +33,15 @@ pub fn processReport(report: [*]const u8, info: *const hid.ReportInfo, client: *
         0;
 
     if (buttons != 0 or dx != 0 or dy != 0 or scroll_v != 0 or scroll_h != 0) {
-        client.sendMouse(.{
+        const event = mouse.MouseEvent{
             .buttons = buttons,
             .dx = dx,
             .dy = dy,
             .scroll_v = scroll_v,
             .scroll_h = scroll_h,
-        }) catch {};
+        };
+        for (servers) |*server| {
+            server.send(event) catch {};
+        }
     }
 }

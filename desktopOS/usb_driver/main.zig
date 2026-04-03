@@ -13,12 +13,15 @@ const syscall = lib.syscall;
 const Channel = channel.Channel;
 
 const MAX_KB_CHANNELS = 16;
+const MAX_MOUSE_CHANNELS = 4;
 const MAX_PERMS = 128;
 const MAX_USB_CONTROLLERS = 8;
 const DEFAULT_SHM_SIZE: u64 = 4 * syscall.PAGE4K;
 
-var kb_channels: [MAX_KB_CHANNELS]*Channel = undefined;
+var kb_servers: [MAX_KB_CHANNELS]keyboard.Server = undefined;
 var kb_count: u8 = 0;
+var mouse_servers: [MAX_MOUSE_CHANNELS]mouse.Server = undefined;
+var mouse_count: u8 = 0;
 var controllers: [MAX_USB_CONTROLLERS]xhci.Controller = .{xhci.Controller{}} ** MAX_USB_CONTROLLERS;
 var ctrl_count: u8 = 0;
 
@@ -50,26 +53,15 @@ fn pollNewShm(view_addr: u64) ?u64 {
 pub fn main(perm_view_addr: u64) void {
     syscall.write("usb_driver: starting\n");
 
-    // Broadcast keyboard service
+    // Broadcast keyboard and mouse services
     channel.broadcast(@intFromEnum(keyboard.protocol_id)) catch {
         syscall.write("usb_driver: FAIL broadcast keyboard\n");
         return;
     };
-
-    // Connect to compositor for mouse events
-    var mouse_client_opt: ?mouse.Client = null;
-    while (mouse_client_opt == null) {
-        mouse_client_opt = mouse.connectToMouseServer(perm_view_addr) catch |err| switch (err) {
-            error.ServerNotFound => null,
-            error.ChannelFailed => {
-                syscall.write("usb_driver: FAIL connect mouse\n");
-                return;
-            },
-        };
-        if (mouse_client_opt == null) syscall.thread_yield();
-    }
-    const mouse_client = mouse_client_opt.?;
-    syscall.write("usb_driver: mouse channel connected to compositor\n");
+    channel.broadcast(@intFromEnum(mouse.protocol_id)) catch {
+        syscall.write("usb_driver: FAIL broadcast mouse\n");
+        return;
+    };
 
     // Collect all USB device handles from permission view
     const view: *const [MAX_PERMS]perm_view.UserViewEntry = @ptrFromInt(perm_view_addr);
@@ -105,13 +97,25 @@ pub fn main(perm_view_addr: u64) void {
 
     // Main event loop
     while (true) {
-        // Accept new keyboard channels from terminals
+        // Accept new channels from clients
         if (pollNewShm(perm_view_addr)) |shm_handle| {
             if (Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE)) |chan| {
-                if (kb_count < MAX_KB_CHANNELS) {
-                    kb_channels[kb_count] = chan;
-                    kb_count += 1;
-                    syscall.write("usb_driver: keyboard channel connected\n");
+                switch (@as(lib.Protocol, @enumFromInt(chan.protocol_id))) {
+                    .keyboard => {
+                        if (kb_count < MAX_KB_CHANNELS) {
+                            kb_servers[kb_count] = keyboard.Server.init(chan);
+                            kb_count += 1;
+                            syscall.write("usb_driver: keyboard channel connected\n");
+                        }
+                    },
+                    .mouse => {
+                        if (mouse_count < MAX_MOUSE_CHANNELS) {
+                            mouse_servers[mouse_count] = mouse.Server.init(chan);
+                            mouse_count += 1;
+                            syscall.write("usb_driver: mouse channel connected\n");
+                        }
+                    },
+                    else => {},
                 }
             }
         }
@@ -132,11 +136,10 @@ pub fn main(perm_view_addr: u64) void {
 
                                 switch (dev.protocol) {
                                     .keyboard => {
-                                        // Send to all connected keyboard channels
-                                        kb.processReport(dev, report, kb_channels[0..kb_count]);
+                                        kb.processReport(dev, report, kb_servers[0..kb_count]);
                                     },
                                     .mouse => {
-                                        ms.processReport(report, &dev.report_info, &mouse_client);
+                                        ms.processReport(report, &dev.report_info, mouse_servers[0..mouse_count]);
                                     },
                                 }
 

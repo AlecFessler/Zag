@@ -28,17 +28,19 @@ pub fn main(perm_view_addr: u64) void {
     var display_client = display.Client.init(display_conn.chan);
     syscall.write("terminal: display channel connected to compositor\n");
 
-    // Find keyboard and connect for keyboard input
-    var kb_handle: u64 = 0;
-    while (kb_handle == 0) {
-        kb_handle = channel.findBroadcastHandle(perm_view_addr, .keyboard) orelse 0;
-        if (kb_handle == 0) syscall.thread_yield();
+    // Connect to keyboard server (USB HID driver)
+    var kb_client_opt: ?keyboard.Client = null;
+    while (kb_client_opt == null) {
+        kb_client_opt = keyboard.connectToServer(perm_view_addr) catch |err| switch (err) {
+            error.ServerNotFound => null,
+            error.ChannelFailed => {
+                syscall.write("terminal: FAIL connect keyboard\n");
+                return;
+            },
+        };
+        if (kb_client_opt == null) syscall.thread_yield();
     }
-    const kb_conn = Channel.connectAsA(kb_handle, .keyboard, DEFAULT_SHM_SIZE) orelse {
-        syscall.write("terminal: FAIL connectAsA keyboard\n");
-        return;
-    };
-    const kb_chan = kb_conn.chan;
+    const kb_client = kb_client_opt.?;
     syscall.write("terminal: keyboard channel connected to usb_driver\n");
 
     // Receive render target info from compositor
@@ -86,7 +88,7 @@ pub fn main(perm_view_addr: u64) void {
             }
         }
 
-        if (keyboard.Client.recv(kb_chan)) |msg| {
+        if (kb_client.recv()) |msg| {
             switch (msg) {
                 .key => |ev| {
                     if (ev.state == .pressed) {

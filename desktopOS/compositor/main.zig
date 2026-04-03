@@ -374,17 +374,19 @@ pub fn main(perm_view_addr: u64) void {
     };
     syscall.write("compositor: broadcast ok\n");
 
-    // Wait for mouse channel from usb_driver (first incoming SHM)
-    var mouse_shm: u64 = 0;
-    while (mouse_shm == 0) {
-        mouse_shm = pollNewShm(perm_view_addr) orelse 0;
-        if (mouse_shm == 0) syscall.thread_yield();
+    // Connect to mouse server (USB HID driver)
+    var mouse_client_opt: ?mouse.Client = null;
+    while (mouse_client_opt == null) {
+        mouse_client_opt = mouse.connectToServer(perm_view_addr) catch |err| switch (err) {
+            error.ServerNotFound => null,
+            error.ChannelFailed => {
+                syscall.write("compositor: FAIL connect mouse\n");
+                return;
+            },
+        };
+        if (mouse_client_opt == null) syscall.thread_yield();
     }
-    const mouse_chan = Channel.connectAsB(mouse_shm, DEFAULT_SHM_SIZE) orelse {
-        syscall.write("compositor: FAIL connectAsB mouse\n");
-        return;
-    };
-    const mouse_server = mouse.Server.init(mouse_chan);
+    const mouse_client = mouse_client_opt.?;
     syscall.write("compositor: mouse channel connected\n");
 
     // Create default pane 0
@@ -405,7 +407,7 @@ pub fn main(perm_view_addr: u64) void {
         }
 
         // Drain all pending mouse events
-        while (mouse_server.recv()) |msg| {
+        while (mouse_client.recv()) |msg| {
             switch (msg) {
                 .mouse => |ev| {
                     cursor_x = clampI32(cursor_x + ev.dx, 0, screen_w - 1);

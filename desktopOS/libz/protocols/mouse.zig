@@ -16,10 +16,10 @@ pub const ConnectError = error{
     ChannelFailed,
 };
 
-/// Discovers the mouse server (compositor) via broadcast table and connects.
-/// Returns a Client ready to send mouse events.
-pub fn connectToMouseServer(perm_view_addr: u64) ConnectError!Client {
-    const handle = channel.findBroadcastHandle(perm_view_addr, .compositor) orelse
+/// Discovers the mouse server (USB HID driver) via broadcast table and connects.
+/// Returns a Client ready to receive mouse events.
+pub fn connectToServer(perm_view_addr: u64) ConnectError!Client {
+    const handle = channel.findBroadcastHandle(perm_view_addr, .mouse) orelse
         return error.ServerNotFound;
     const conn = Channel.connectAsA(handle, .mouse, SHM_SIZE) orelse
         return error.ChannelFailed;
@@ -49,17 +49,17 @@ pub const MouseEvent = struct {
     scroll_h: i8,
 };
 
-// ── Server (compositor, side B) ─────────────────────────────────────
-pub const Server = struct {
+// ── Client (consumer, side A) ───────────────────────────────────────
+pub const Client = struct {
     chan: *Channel,
 
-    pub fn init(chan: *Channel) Server {
+    pub fn init(chan: *Channel) Client {
         return .{ .chan = chan };
     }
 
-    pub fn recv(self: *const Server) ?Message {
+    pub fn recv(self: *const Client) ?Message {
         var buf: [MAX_WIRE]u8 = undefined;
-        const len = (self.chan.receiveMessage(.B, &buf) catch return null) orelse return null;
+        const len = (self.chan.receiveMessage(.A, &buf) catch return null) orelse return null;
         if (len < 1) return null;
         return switch (buf[0]) {
             CMD_MOUSE_EVENT => if (len == 1 + MOUSE_PAYLOAD) Message{
@@ -80,15 +80,15 @@ pub const Server = struct {
     };
 };
 
-// ── Client (usb_driver, side A) ─────────────────────────────────────
-pub const Client = struct {
+// ── Server (USB HID driver, side B) ─────────────────────────────────
+pub const Server = struct {
     chan: *Channel,
 
-    pub fn init(chan: *Channel) Client {
+    pub fn init(chan: *Channel) Server {
         return .{ .chan = chan };
     }
 
-    pub fn sendMouse(self: *const Client, event: MouseEvent) !void {
+    pub fn send(self: *const Server, event: MouseEvent) !void {
         const buttons: u16 = event.buttons;
         const dx: u16 = @bitCast(event.dx);
         const dy: u16 = @bitCast(event.dy);
@@ -103,6 +103,6 @@ pub const Client = struct {
             @bitCast(event.scroll_v),
             @bitCast(event.scroll_h),
         };
-        try self.chan.sendMessage(.A, &bytes);
+        try self.chan.sendMessage(.B, &bytes);
     }
 };

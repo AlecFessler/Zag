@@ -59,24 +59,24 @@ Translates incoming HID reports into MOUSE_EVENT messages. One channel per conne
 
 ## Public API
 
-### `connectToMouseServer(perm_view_addr: u64) ConnectError!Client`
+### `connectToServer(perm_view_addr: u64) ConnectError!Client`
 
-Discovers the mouse server (compositor) via the broadcast table and establishes a channel. Returns a `Client` ready to send mouse events, or:
+Discovers the mouse server (USB HID driver) via the broadcast table and establishes a channel. Returns a `Client` ready to receive mouse events, or:
 
-- `error.ServerNotFound` -- no compositor is broadcasting yet.
+- `error.ServerNotFound` -- no mouse server is broadcasting yet.
 - `error.ChannelFailed` -- SHM allocation or grant failed.
 
-Callers should retry on `ServerNotFound` if the compositor has not started yet.
+Callers should retry on `ServerNotFound` if the USB driver has not started yet.
 
-### `Client`
+### `Client` (consumer, side A)
 
 - `Client.init(chan: *Channel) Client` -- wraps a connected channel.
-- `Client.sendMouse(event: MouseEvent) !void` -- serializes and sends a mouse event. Returns `error.ChannelFull` if the ring buffer is full.
+- `Client.recv() ?Message` -- reads the next message from the ring buffer. Returns `null` if no message is available or on parse error.
 
-### `Server`
+### `Server` (USB HID driver, side B)
 
 - `Server.init(chan: *Channel) Server` -- wraps a connected channel.
-- `Server.recv() ?Message` -- reads the next message from the ring buffer. Returns `null` if no message is available or on parse error.
+- `Server.send(event: MouseEvent) !void` -- serializes and sends a mouse event. Returns `error.ChannelFull` if the ring buffer is full.
 
 ### `MouseEvent`
 

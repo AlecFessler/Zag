@@ -2,14 +2,11 @@ const hid = @import("hid.zig");
 const lib = @import("lib");
 const xhci = @import("xhci.zig");
 
-const channel = lib.channel;
 const keyboard = lib.keyboard;
-
-const Channel = channel.Channel;
 
 /// Process a HID keyboard report using parsed report descriptor info.
 /// Sends events to all connected keyboard channels.
-pub fn processReport(dev: *xhci.HidDevice, report: [*]const u8, channels: []*Channel) void {
+pub fn processReport(dev: *xhci.HidDevice, report: [*]const u8, servers: []keyboard.Server) void {
     const info = &dev.report_info;
     const data = if (info.report_id > 0) report + 1 else report;
 
@@ -37,8 +34,8 @@ pub fn processReport(dev: *xhci.HidDevice, report: [*]const u8, channels: []*Cha
             const prev = dev.prev_modifiers & mask;
             const curr = modifiers & mask;
             if (prev != curr) {
-                const keycode: u8 = 0xE0 + @as(u8, bit);
-                sendToAll(channels, .{
+                const keycode: u16 = 0xE0 + @as(u16, bit);
+                sendToAll(servers, .{
                     .keycode = keycode,
                     .state = if (curr != 0) .pressed else .released,
                     .modifiers = @bitCast(modifiers),
@@ -59,7 +56,7 @@ pub fn processReport(dev: *xhci.HidDevice, report: [*]const u8, channels: []*Cha
             }
         }
         if (!still_pressed) {
-            sendToAll(channels, .{
+            sendToAll(servers, .{
                 .keycode = prev_key,
                 .state = .released,
                 .modifiers = @bitCast(modifiers),
@@ -78,7 +75,7 @@ pub fn processReport(dev: *xhci.HidDevice, report: [*]const u8, channels: []*Cha
             }
         }
         if (!was_pressed) {
-            sendToAll(channels, .{
+            sendToAll(servers, .{
                 .keycode = curr_key,
                 .state = .pressed,
                 .modifiers = @bitCast(modifiers),
@@ -89,8 +86,8 @@ pub fn processReport(dev: *xhci.HidDevice, report: [*]const u8, channels: []*Cha
     dev.prev_keys = keys;
 }
 
-fn sendToAll(channels: []*Channel, event: keyboard.Event) void {
-    for (channels) |c| {
-        keyboard.Server.send(c, event) catch {};
+fn sendToAll(servers: []keyboard.Server, event: keyboard.Event) void {
+    for (servers) |*server| {
+        server.send(event) catch {};
     }
 }
