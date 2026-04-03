@@ -8,8 +8,6 @@ const syscall = lib.syscall;
 pub const is_root = true;
 
 pub fn main(perm_view_addr: u64) void {
-    syscall.write("root: starting\n");
-
     const child_rights = perms.ProcessRights{
         .grant_to_child = true,
         .spawn_thread = true,
@@ -27,12 +25,7 @@ pub fn main(perm_view_addr: u64) void {
         @intFromPtr(embedded.service_manager.ptr),
         embedded.service_manager.len,
         child_rights.bits(),
-    );
-    if (svc_proc <= 0) {
-        syscall.write("root: failed to spawn service_manager\n");
-        return;
-    }
-    syscall.write("root: spawned service_manager\n");
+    ) catch return;
 
     // Grant all device handles to service_manager
     const view: *const [128]perm_view.UserViewEntry = @ptrFromInt(perm_view_addr);
@@ -44,21 +37,14 @@ pub fn main(perm_view_addr: u64) void {
 
     for (view) |*entry| {
         if (entry.entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION) {
-            _ = syscall.grant_perm(entry.handle, @intCast(svc_proc), device_grant_rights);
+            syscall.grant_perm(entry.handle, svc_proc, device_grant_rights) catch {};
         }
     }
-    syscall.write("root: device handles granted to service_manager\n");
-
-    // Spawn app_manager
-    if (syscall.spawn_child(
+    _ = syscall.spawn_child(
         @intFromPtr(embedded.app_manager.ptr),
         embedded.app_manager.len,
         child_rights.bits(),
-    ) <= 0) {
-        syscall.write("root: failed to spawn app_manager\n");
-        return;
-    }
-    syscall.write("root: spawned app_manager\n");
+    ) catch return;
 
     while (true) syscall.thread_yield();
 }

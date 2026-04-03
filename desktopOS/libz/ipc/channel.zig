@@ -31,11 +31,12 @@ pub fn alignToPages(size: u64) u64 {
 
 /// Calls the broadcast syscall with protocol_id in the low byte of the payload.
 pub fn broadcast(protocol_id: u8) !void {
-    const rc = syscall.broadcast_syscall(@as(u64, protocol_id));
-    if (rc == -2) return error.NoPerm;
-    if (rc == -4) return error.TableFull;
-    if (rc == -1) return error.DuplicatePayload;
-    if (rc != 0) return error.Unexpected;
+    syscall.broadcast_syscall(@as(u64, protocol_id)) catch |e| return switch (e) {
+        error.PermissionDenied => error.PermissionDenied,
+        error.OutOfMemory => error.OutOfMemory,
+        error.InvalidArgument => error.InvalidArgument,
+        else => error.InvalidArgument,
+    };
 }
 
 /// Scans the broadcast table for an entry whose payload low byte matches
@@ -111,40 +112,34 @@ pub const Channel = extern struct {
 
     pub const Connection = struct {
         chan: *Channel,
-        shm_handle: u64,
+        shm_handle: syscall.Handle,
     };
 
     /// Allocates SHM, initializes the channel header, and grants to target.
     /// target_handle is either a child proc handle or a broadcast table handle.
-    pub fn connectAsA(target_handle: u64, protocol: lib.Protocol, shm_size: u64) ?Connection {
+    pub fn connectAsA(target_handle: u64, protocol: lib.Protocol, shm_size: u64) syscall.SystemError!Connection {
         const aligned_size = alignToPages(shm_size);
-        const shm = syscall.shm_create_with_rights(aligned_size, shm_rw_grant);
-        if (shm <= 0) return null;
+        const shm = try syscall.shm_create_with_rights(aligned_size, shm_rw_grant);
+        const vm = try syscall.vm_reserve(0, aligned_size, rw_shareable);
+        try syscall.shm_map(shm, vm.handle, 0);
 
-        const vm_result = syscall.vm_reserve(0, aligned_size, rw_shareable);
-        if (vm_result.val < 0) return null;
-
-        if (syscall.shm_map(@intCast(shm), @intCast(vm_result.val), 0) != 0) return null;
-
-        const region: [*]u8 = @ptrFromInt(vm_result.val2);
-        const chan = Channel.init(region[0..aligned_size], @intFromEnum(protocol)) orelse return null;
+        const region: [*]u8 = @ptrFromInt(vm.addr);
+        const chan = Channel.init(region[0..aligned_size], @intFromEnum(protocol)) orelse
+            return error.InvalidArgument;
 
         // grant is the publication barrier — all header writes are visible after this
-        _ = syscall.grant_perm(@intCast(shm), target_handle, shm_rw_grant);
+        try syscall.grant_perm(shm, target_handle, shm_rw_grant);
 
-        return .{ .chan = chan, .shm_handle = @intCast(shm) };
+        return .{ .chan = chan, .shm_handle = shm };
     }
 
     /// Maps a granted SHM handle and returns the Channel. Does not reinitialize.
-    pub fn connectAsB(shm_handle: u64, shm_size: u64) ?*Channel {
+    pub fn connectAsB(shm_handle: u64, shm_size: u64) syscall.SystemError!*Channel {
         const aligned_size = alignToPages(shm_size);
-        const vm_result = syscall.vm_reserve(0, aligned_size, rw_shareable);
-        if (vm_result.val < 0) return null;
+        const vm = try syscall.vm_reserve(0, aligned_size, rw_shareable);
+        try syscall.shm_map(shm_handle, vm.handle, 0);
 
-        const map_rc = syscall.shm_map(shm_handle, @intCast(vm_result.val), 0);
-        if (map_rc != 0) return null;
-
-        const chan: *Channel = @ptrFromInt(vm_result.val2);
+        const chan: *Channel = @ptrFromInt(vm.addr);
         @atomicStore(u64, &chan.B_connected, 1, .release);
         return chan;
     }
@@ -220,7 +215,7 @@ pub const Channel = extern struct {
         ringWrite(buf, buf_size, tx + HEADER_SIZE, msg);
 
         @atomicStore(u64, tx_p, tx +% total, .release);
-        _ = syscall.futex_wake(tx_p, 1);
+        syscall.futex_wake(tx_p, 1) catch {};
     }
 
     /// Block until a message is available from the peer, or timeout expires.
@@ -230,7 +225,7 @@ pub const Channel = extern struct {
         const cached_tx_p = self.cachedTxPtr(other);
         const current_tx = @atomicLoad(u64, peer_tx_p, .acquire);
         if (current_tx != cached_tx_p.*) return;
-        _ = syscall.futex_wait(peer_tx_p, current_tx, timeout_ns);
+        syscall.futex_wait(peer_tx_p, current_tx, timeout_ns) catch {};
     }
 
     pub fn receiveMessage(self: *Channel, side: Side, out: []u8) error{Disconnected}!?u64 {
@@ -247,7 +242,6 @@ pub const Channel = extern struct {
             cached_tx_p.* = @atomicLoad(u64, tx_p, .acquire);
             data_avail = cached_tx_p.* -% rx;
             if (data_avail < HEADER_SIZE) {
-                // No data — check if peer disconnected
                 if (!self.peerConnected(side)) return error.Disconnected;
                 return null;
             }
@@ -277,7 +271,7 @@ pub const Channel = extern struct {
     pub fn disconnect(self: *Channel, side: Side, shm_handle: u64, vm_handle: u64) void {
         const flag = if (side == .A) &self.A_connected else &self.B_connected;
         @atomicStore(u64, flag, 0, .release);
-        _ = syscall.revoke_perm(shm_handle);
-        _ = syscall.revoke_perm(vm_handle);
+        syscall.revoke_perm(shm_handle);
+        syscall.revoke_perm(vm_handle);
     }
 };

@@ -1,8 +1,6 @@
 const lib = @import("lib");
 
 const font = lib.font;
-const perms = lib.perms;
-const syscall = lib.syscall;
 const ui_mod = lib.ui;
 
 const Color = ui_mod.Color;
@@ -30,15 +28,6 @@ pub fn setBgColor(r: u8, g: u8, b: u8) void {
     bg_color = Color{ .r = r, .g = g, .b = b };
 }
 
-// ── Display state ────────────────────────────────────────────────────
-pub var frame_pixels: [*]u32 = undefined;
-pub var frame_bytes: [*]u8 = undefined;
-pub var frame_byte_size: u64 = 0;
-pub var render_width: u32 = 0;
-pub var render_height: u32 = 0;
-pub var render_stride: u32 = 0;
-pub var render_format: u32 = 0;
-
 // ── Public accessors ─────────────────────────────────────────────────
 pub fn inputBuf() []u8 {
     return input_buf[0..INPUT_SIZE];
@@ -58,13 +47,6 @@ pub fn appendHistory(text: []const u8) void {
 
 pub fn clearHistory() void {
     history_len = 0;
-}
-
-pub fn updateDisplayInfo(width: u32, height: u32, stride: u32, format: u32) void {
-    render_width = width;
-    render_height = height;
-    render_stride = stride;
-    render_format = format;
 }
 
 // ── Render buffer management ─────────────────────────────────────────
@@ -115,14 +97,10 @@ fn calcScrollY(text_w: u32, text_h: u32) u32 {
 }
 
 // ── Frame rendering ──────────────────────────────────────────────────
-pub fn renderFrame() void {
-    const width = render_width;
-    const height = render_height;
-    const stride = render_stride;
-    const format = render_format;
+pub fn renderFrame(frame_pixels: [*]u32, width: u32, height: u32, stride: u32) void {
     if (width == 0 or height == 0) return;
 
-    var ui_state = UI.init(frame_pixels, width, height, stride, @intCast(format));
+    var ui_state = UI.init(frame_pixels, width, height, stride, 0);
     const ui = &ui_state;
 
     const root = ui.createBox(.{
@@ -152,18 +130,4 @@ pub fn renderFrame() void {
     }
 
     ui.render();
-}
-
-pub fn allocFrameBuffer() void {
-    const pixel_count: usize = @as(usize, render_width) * @as(usize, render_height);
-    frame_byte_size = @intCast(pixel_count * 4);
-    const aligned_size = ((frame_byte_size + syscall.PAGE4K - 1) / syscall.PAGE4K) * syscall.PAGE4K;
-    const fb_vm_rights = (perms.VmReservationRights{ .read = true, .write = true }).bits();
-    const fb_vm = syscall.vm_reserve(0, aligned_size, fb_vm_rights);
-    if (fb_vm.val < 0) {
-        syscall.write("terminal: FAIL vm_reserve frame buffer\n");
-        return;
-    }
-    frame_pixels = @ptrFromInt(fb_vm.val2);
-    frame_bytes = @ptrCast(frame_pixels);
 }

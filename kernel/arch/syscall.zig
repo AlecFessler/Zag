@@ -5,7 +5,6 @@ const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const broadcast_mod = zag.perms.broadcast;
 const futex = zag.sched.futex;
-const iommu = zag.arch.x64.iommu;
 const paging = zag.memory.paging;
 const sched = zag.sched.scheduler;
 
@@ -30,6 +29,7 @@ const E_TIMEOUT: i64 = -8;
 const E_AGAIN: i64 = -9;
 const E_NOENT: i64 = -10;
 const E_BUSY: i64 = -11;
+const E_EXIST: i64 = -12;
 
 pub const SyscallResult = struct {
     rax: i64,
@@ -74,70 +74,62 @@ fn isSubset(requested: u16, allowed: u16) bool {
     return (requested & ~allowed) == 0;
 }
 
-fn ok(val: i64) SyscallResult {
-    return .{ .rax = val };
-}
-
-fn err(code: i64) SyscallResult {
-    return .{ .rax = code };
-}
-
 pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) SyscallResult {
     _ = arg4;
     const syscall_num: SyscallNum = @enumFromInt(num);
     return switch (syscall_num) {
         .write => sysWrite(arg0, arg1),
         .vm_reserve => sysVmReserve(arg0, arg1, arg2),
-        .vm_perms => ok(sysVmPerms(arg0, arg1, arg2, arg3)),
-        .shm_create => ok(sysShmCreate(arg0, arg1)),
-        .shm_map => ok(sysShmMap(arg0, arg1, arg2)),
-        .shm_unmap => ok(sysShmUnmap(arg0, arg1)),
-        .mmio_map => ok(sysMmioMap(arg0, arg1, arg2)),
-        .mmio_unmap => ok(sysMmioUnmap(arg0, arg1)),
-        .proc_create => ok(sysProcCreate(arg0, arg1, arg2)),
-        .thread_create => ok(sysThreadCreate(arg0, arg1, arg2)),
+        .vm_perms => .{ .rax = sysVmPerms(arg0, arg1, arg2, arg3) },
+        .shm_create => .{ .rax = sysShmCreate(arg0, arg1) },
+        .shm_map => .{ .rax = sysShmMap(arg0, arg1, arg2) },
+        .shm_unmap => .{ .rax = sysShmUnmap(arg0, arg1) },
+        .mmio_map => .{ .rax = sysMmioMap(arg0, arg1, arg2) },
+        .mmio_unmap => .{ .rax = sysMmioUnmap(arg0, arg1) },
+        .proc_create => .{ .rax = sysProcCreate(arg0, arg1, arg2) },
+        .thread_create => .{ .rax = sysThreadCreate(arg0, arg1, arg2) },
         .thread_exit => sysThreadExit(),
-        .thread_yield => ok(sysThreadYield()),
-        .set_affinity => ok(sysSetAffinity(arg0)),
-        .grant_perm => ok(sysGrantPerm(arg0, arg1, arg2)),
-        .revoke_perm => ok(sysRevokePerm(arg0)),
-        .disable_restart => ok(sysDisableRestart()),
-        .futex_wait => ok(sysFutexWait(arg0, arg1, arg2)),
-        .futex_wake => ok(sysFutexWake(arg0, arg1)),
-        .clock_gettime => ok(sysClockGettime()),
+        .thread_yield => .{ .rax = sysThreadYield() },
+        .set_affinity => .{ .rax = sysSetAffinity(arg0) },
+        .grant_perm => .{ .rax = sysGrantPerm(arg0, arg1, arg2) },
+        .revoke_perm => .{ .rax = sysRevokePerm(arg0) },
+        .disable_restart => .{ .rax = sysDisableRestart() },
+        .futex_wait => .{ .rax = sysFutexWait(arg0, arg1, arg2) },
+        .futex_wake => .{ .rax = sysFutexWake(arg0, arg1) },
+        .clock_gettime => .{ .rax = sysClockGettime() },
         .shutdown => sysShutdown(),
-        .ioport_read => ok(sysIoportRead(arg0, arg1, arg2)),
-        .ioport_write => ok(sysIoportWrite(arg0, arg1, arg2, arg3)),
-        .dma_map => ok(sysDmaMap(arg0, arg1)),
-        .dma_unmap => ok(sysDmaUnmap(arg0, arg1)),
-        .pin_exclusive => ok(sysPinExclusive()),
-        .broadcast => ok(sysBroadcast(arg0)),
-        _ => err(E_INVAL),
+        .ioport_read => .{ .rax = sysIoportRead(arg0, arg1, arg2) },
+        .ioport_write => .{ .rax = sysIoportWrite(arg0, arg1, arg2, arg3) },
+        .dma_map => .{ .rax = sysDmaMap(arg0, arg1) },
+        .dma_unmap => .{ .rax = sysDmaUnmap(arg0, arg1) },
+        .pin_exclusive => .{ .rax = sysPinExclusive() },
+        .broadcast => .{ .rax = sysBroadcast(arg0) },
+        _ => .{ .rax = E_INVAL },
     };
 }
 
 fn sysWrite(ptr: u64, len: u64) SyscallResult {
-    if (len == 0) return ok(0);
-    if (len > 4096) return err(E_INVAL);
-    if (!address.AddrSpacePartition.user.contains(ptr)) return err(E_BADADDR);
-    const end = std.math.add(u64, ptr, len) catch return err(E_BADADDR);
-    if (!address.AddrSpacePartition.user.contains(end -| 1)) return err(E_BADADDR);
+    if (len == 0) return .{ .rax = 0 };
+    if (len > 4096) return .{ .rax = E_INVAL };
+    if (!address.AddrSpacePartition.user.contains(ptr)) return .{ .rax = E_BADADDR };
+    const end = std.math.add(u64, ptr, len) catch return .{ .rax = E_BADADDR };
+    if (!address.AddrSpacePartition.user.contains(end -| 1)) return .{ .rax = E_BADADDR };
     const msg: []const u8 = @as([*]const u8, @ptrFromInt(ptr))[0..len];
     arch.print("{s}", .{msg});
-    return ok(@intCast(len));
+    return .{ .rax = @intCast(len) };
 }
 
 fn sysVmReserve(hint: u64, size: u64, max_perms_bits: u64) SyscallResult {
-    if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) return err(E_INVAL);
+    if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) return .{ .rax = E_INVAL };
 
     const max_rights: VmReservationRights = @bitCast(@as(u8, @truncate(max_perms_bits)));
-    if (max_rights.shareable and max_rights.mmio) return err(E_INVAL);
+    if (max_rights.shareable and max_rights.mmio) return .{ .rax = E_INVAL };
 
     const proc = currentProc();
-    const self_entry = proc.getPermByHandle(0) orelse return err(E_PERM);
-    if (!self_entry.processRights().mem_reserve) return err(E_PERM);
+    const self_entry = proc.getPermByHandle(0) orelse return .{ .rax = E_PERM };
+    if (!self_entry.processRights().mem_reserve) return .{ .rax = E_PERM };
 
-    const result = proc.vmm.reserve(VAddr.fromInt(hint), size, max_rights) catch return err(E_NOMEM);
+    const result = proc.vmm.reserve(VAddr.fromInt(hint), size, max_rights) catch return .{ .rax = E_NOMEM };
 
     const entry = PermissionEntry{
         .handle = 0,
@@ -148,7 +140,7 @@ fn sysVmReserve(hint: u64, size: u64, max_perms_bits: u64) SyscallResult {
         } },
         .rights = @truncate(max_perms_bits),
     };
-    const handle_id = proc.insertPerm(entry) catch return err(E_MAXCAP);
+    const handle_id = proc.insertPerm(entry) catch return .{ .rax = E_MAXCAP };
     result.node.handle = handle_id;
 
     return .{ .rax = @intCast(handle_id), .rdx = result.vaddr.addr };
@@ -260,7 +252,7 @@ fn sysShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
         shm,
         shm_map_rights,
     ) catch |e| return switch (e) {
-        error.CommittedPages => E_BUSY,
+        error.CommittedPages => E_EXIST,
         else => E_INVAL,
     };
 
@@ -314,7 +306,7 @@ fn sysMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
         device,
         vm_res.max_rights.write_combining,
     ) catch |e| return switch (e) {
-        error.CommittedPages => E_BUSY,
+        error.CommittedPages => E_EXIST,
         else => E_INVAL,
     };
 
@@ -612,9 +604,9 @@ fn sysDmaMap(device_handle: u64, shm_handle: u64) i64 {
     if (shm_entry.object != .shared_memory) return E_BADCAP;
     const shm = shm_entry.object.shared_memory;
 
-    if (iommu.isAvailable()) {
-        const dma_base = iommu.mapDmaPages(device, shm) catch return E_NOMEM;
-        iommu.enableTranslation();
+    if (arch.isDmaRemapAvailable()) {
+        const dma_base = arch.mapDmaPages(device, shm) catch return E_NOMEM;
+        arch.enableDmaRemapping();
         proc.addDmaMapping(device, shm, dma_base, shm.pages.len) catch return E_NOMEM;
         return @bitCast(dma_base);
     }
@@ -675,13 +667,13 @@ fn sysDmaUnmap(device_handle: u64, shm_handle: u64) i64 {
     if (shm_entry.object != .shared_memory) return E_BADCAP;
     const shm = shm_entry.object.shared_memory;
 
-    if (!iommu.isAvailable()) {
+    if (!arch.isDmaRemapAvailable()) {
         // No IOMMU: no page table entries to clean up, just remove tracking
         _ = proc.removeDmaMapping(device, shm);
         return E_OK;
     }
 
     const mapping = proc.removeDmaMapping(device, shm) orelse return E_NOENT;
-    iommu.unmapDmaPages(device, mapping.dma_base, mapping.num_pages);
+    arch.unmapDmaPages(device, mapping.dma_base, mapping.num_pages);
     return E_OK;
 }

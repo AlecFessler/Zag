@@ -2,38 +2,9 @@ const lib = @import("lib");
 const commands = @import("commands.zig");
 const render = @import("render.zig");
 
-const display = lib.display;
 const keyboard = lib.keyboard;
 
-// HID keycodes
-const HID_RIGHT_ARROW: u16 = 0x4F;
-const HID_LEFT_ARROW: u16 = 0x50;
-const HID_KEY_N: u16 = 0x11;
-
-pub fn handleKeyPress(keycode: u16, modifiers: keyboard.Modifiers, display_client: *const display.Client) void {
-    const ctrl = modifiers.l_ctrl or modifiers.r_ctrl;
-
-    // Compositor control shortcuts
-    if (ctrl) {
-        if (keycode == HID_LEFT_ARROW) {
-            display_client.slideLeft() catch {};
-            return;
-        }
-        if (keycode == HID_RIGHT_ARROW) {
-            display_client.slideRight() catch {};
-            return;
-        }
-        if (keycode == HID_KEY_N) {
-            display_client.requestNewPane() catch {};
-            return;
-        }
-        if (keycode >= 0x1E and keycode <= 0x25) {
-            const pane_id: u8 = @truncate(keycode - 0x1E);
-            display_client.switchPane(pane_id) catch {};
-            return;
-        }
-    }
-
+pub fn handleKeyPress(keycode: u16, modifiers: keyboard.Modifiers) void {
     if (keycode == 0x28) {
         // Enter
         const il = render.inputLen().*;

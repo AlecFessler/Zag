@@ -334,28 +334,26 @@ fn handleSimpleResponse(result: ?filesystem.Client.Response) void {
 
 fn runEcho(args: []const u8) void {
     const shm_rights = (perms.SharedMemoryRights{ .read = true, .write = true, .grant = true }).bits();
-    const shm_handle = syscall.shm_create_with_rights(DATA_CHAN_SIZE, shm_rights);
-    if (shm_handle <= 0) {
+    const shm_handle = syscall.shm_create_with_rights(DATA_CHAN_SIZE, shm_rights) catch {
         render.appendHistory("error: failed to create channel\n");
         return;
-    }
+    };
 
     const vm_rights = (perms.VmReservationRights{
         .read = true,
         .write = true,
         .shareable = true,
     }).bits();
-    const vm_result = syscall.vm_reserve(0, DATA_CHAN_SIZE, vm_rights);
-    if (vm_result.val < 0) {
+    const vm_result = syscall.vm_reserve(0, DATA_CHAN_SIZE, vm_rights) catch {
         render.appendHistory("error: failed to reserve vm\n");
         return;
-    }
-    if (syscall.shm_map(@intCast(shm_handle), @intCast(vm_result.val), 0) != 0) {
+    };
+    syscall.shm_map(shm_handle, vm_result.handle, 0) catch {
         render.appendHistory("error: failed to map channel\n");
         return;
-    }
+    };
 
-    const region: [*]u8 = @ptrFromInt(vm_result.val2);
+    const region: [*]u8 = @ptrFromInt(vm_result.addr);
     const chan = channel.Channel.init(region[0..DATA_CHAN_SIZE], 0) orelse {
         render.appendHistory("error: failed to init channel\n");
         return;
@@ -366,21 +364,19 @@ fn runEcho(args: []const u8) void {
         .grant_to_child = true,
         .mem_reserve = true,
     }).bits();
-    const proc_handle = syscall.proc_create(@intFromPtr(echo_elf.ptr), echo_elf.len, child_rights);
-    if (proc_handle <= 0) {
+    const proc_handle = syscall.proc_create(@intFromPtr(echo_elf.ptr), echo_elf.len, child_rights) catch {
         render.appendHistory("error: failed to spawn echo\n");
         return;
-    }
+    };
 
     const grant_rights = (perms.SharedMemoryRights{
         .read = true,
         .write = true,
     }).bits();
-    const grant_result = syscall.grant_perm(@intCast(shm_handle), @intCast(proc_handle), grant_rights);
-    if (grant_result != 0) {
+    syscall.grant_perm(shm_handle, proc_handle, grant_rights) catch {
         render.appendHistory("error: grant_perm failed\n");
         return;
-    }
+    };
 
     if (args.len > 0) {
         chan.sendMessage(.A, args) catch {

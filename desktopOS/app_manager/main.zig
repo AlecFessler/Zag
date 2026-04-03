@@ -6,8 +6,6 @@ const syscall = lib.syscall;
 
 pub fn main(perm_view_addr: u64) void {
     _ = perm_view_addr;
-    syscall.write("app_manager: starting\n");
-
     const child_rights = perms.ProcessRights{
         .grant_to_child = true,
         .spawn_thread = true,
@@ -19,15 +17,11 @@ pub fn main(perm_view_addr: u64) void {
         .broadcast = true,
     };
 
-    if (syscall.spawn_child(
+    _ = syscall.spawn_child(
         @intFromPtr(embedded.terminal.ptr),
         embedded.terminal.len,
         child_rights.bits(),
-    ) <= 0) {
-        syscall.write("app_manager: failed to spawn terminal\n");
-        return;
-    }
-    syscall.write("app_manager: spawned terminal\n");
+    ) catch return;
 
     while (true) syscall.thread_yield();
 }

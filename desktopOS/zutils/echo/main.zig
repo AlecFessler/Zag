@@ -11,7 +11,6 @@ pub fn main(perm_view_addr: u64) void {
     const view: *const [MAX_PERMS]perm_view.UserViewEntry = @ptrFromInt(perm_view_addr);
 
     // Find the data channel SHM granted by the terminal.
-    // It's the only SHM entry in our perm_view.
     var data_shm_handle: u64 = 0;
     var data_shm_size: u64 = 0;
     var attempts: u32 = 0;
@@ -36,18 +35,17 @@ pub fn main(perm_view_addr: u64) void {
         .write = true,
         .shareable = true,
     }).bits();
-    const vm_result = syscall.vm_reserve(0, data_shm_size, vm_rights);
-    if (vm_result.val < 0) {
+    const vm = syscall.vm_reserve(0, data_shm_size, vm_rights) catch {
         syscall.write("echo: vm_reserve failed\n");
         return;
-    }
-    if (syscall.shm_map(data_shm_handle, @intCast(vm_result.val), 0) != 0) {
+    };
+    syscall.shm_map(data_shm_handle, vm.handle, 0) catch {
         syscall.write("echo: shm_map failed\n");
         return;
-    }
+    };
 
     // Open channel as side B (child/receiver)
-    const chan: *channel.Channel = @ptrFromInt(vm_result.val2);
+    const chan: *channel.Channel = @ptrFromInt(vm.addr);
 
     // Read input from side A, echo it back on side B
     var buf: [256]u8 = undefined;

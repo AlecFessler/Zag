@@ -6,7 +6,6 @@ const arch = zag.arch.dispatch;
 const broadcast = zag.perms.broadcast;
 const elf = std.elf;
 const futex = zag.sched.futex;
-const iommu = zag.arch.x64.iommu;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
@@ -390,7 +389,7 @@ pub const Process = struct {
     pub fn cleanupDmaMappings(self: *Process) void {
         for (self.dma_mappings[0..self.num_dma_mappings]) |*m| {
             if (m.active) {
-                iommu.unmapDmaPages(m.device, m.dma_base, m.num_pages);
+                arch.unmapDmaPages(m.device, m.dma_base, m.num_pages);
                 m.active = false;
             }
         }

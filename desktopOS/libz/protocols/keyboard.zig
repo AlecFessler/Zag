@@ -21,7 +21,7 @@ pub const ConnectError = error{
 pub fn connectToServer(perm_view_addr: u64) ConnectError!Client {
     const handle = channel.findBroadcastHandle(perm_view_addr, .keyboard) orelse
         return error.ServerNotFound;
-    const conn = Channel.connectAsA(handle, .keyboard, SHM_SIZE) orelse
+    const conn = Channel.connectAsA(handle, .keyboard, SHM_SIZE) catch
         return error.ChannelFailed;
     return Client.init(conn.chan);
 }

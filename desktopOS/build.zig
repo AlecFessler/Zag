@@ -156,7 +156,7 @@ pub fn build(b: *std.Build) void {
     lib_mod.addImport("lib", lib_mod); // self-reference so libz files can @import("lib")
 
     // ── Level 0: Leaf processes and utilities ─────────────────────
-    const compositor = buildProcess(b, target, lib_mod, "compositor", "compositor/main.zig", null);
+    const display_server = buildProcess(b, target, lib_mod, "display_server", "display_server/main.zig", null);
     const usb_driver = buildProcess(b, target, lib_mod, "usb_driver", "usb_driver/main.zig", null);
     const nvme_driver = buildProcess(b, target, lib_mod, "nvme_driver", "nvme_driver/main.zig", null);
     const echo = buildUtil(b, target, lib_mod, "echo", "zutils/echo/main.zig");
@@ -166,7 +166,7 @@ pub fn build(b: *std.Build) void {
     const terminal = buildProcess(b, target, lib_mod, "terminal", "terminal/main.zig", echo_embed);
 
     // ── Level 1: Managers ──────────────────────────────────────────
-    const svc_embed = makeEmbeddedModule3(b, target, "compositor.elf", compositor, "usb_driver.elf", usb_driver, "nvme_driver.elf", nvme_driver);
+    const svc_embed = makeEmbeddedModule3(b, target, "display_server.elf", display_server, "usb_driver.elf", usb_driver, "nvme_driver.elf", nvme_driver);
     const app_embed = makeEmbeddedModule1(b, target, "terminal.elf", terminal);
 
     const service_manager = buildProcess(b, target, lib_mod, "service_manager", "service_manager/main.zig", svc_embed);

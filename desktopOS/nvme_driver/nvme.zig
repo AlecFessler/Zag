@@ -144,30 +144,26 @@ pub const Controller = struct {
             .write = true,
             .mmio = true,
         }).bits();
-        const mmio_vm = syscall.vm_reserve(0, aligned_mmio, mmio_vm_rights);
-        if (mmio_vm.val < 0) return .mmio_vm_reserve;
-        if (syscall.mmio_map(device_handle, @intCast(mmio_vm.val), 0) != 0) return .mmio_map;
-        self.mmio_base = mmio_vm.val2;
+        const mmio_vm = syscall.vm_reserve(0, aligned_mmio, mmio_vm_rights) catch return .mmio_vm_reserve;
+        syscall.mmio_map(device_handle, mmio_vm.handle, 0) catch return .mmio_map;
+        self.mmio_base = mmio_vm.addr;
 
         // Allocate DMA memory for queues and buffers
         const shm_rights = (perms.SharedMemoryRights{ .read = true, .write = true }).bits();
-        const dma_shm = syscall.shm_create_with_rights(DMA_TOTAL, shm_rights);
-        if (dma_shm <= 0) return .dma_shm_create;
+        const dma_shm = syscall.shm_create_with_rights(DMA_TOTAL, shm_rights) catch return .dma_shm_create;
 
         const dma_vm_rights = (perms.VmReservationRights{
             .read = true,
             .write = true,
             .shareable = true,
         }).bits();
-        const dma_vm = syscall.vm_reserve(0, DMA_TOTAL, dma_vm_rights);
-        if (dma_vm.val < 0) return .dma_vm_reserve;
-        if (syscall.shm_map(@intCast(dma_shm), @intCast(dma_vm.val), 0) != 0) return .dma_shm_map;
+        const dma_vm = syscall.vm_reserve(0, DMA_TOTAL, dma_vm_rights) catch return .dma_vm_reserve;
+        syscall.shm_map(dma_shm, dma_vm.handle, 0) catch return .dma_shm_map;
 
-        const dma_result = syscall.dma_map(device_handle, @intCast(dma_shm));
-        if (dma_result < 0) return .dma_map;
+        const dma_result = syscall.dma_map(device_handle, dma_shm) catch return .dma_map;
 
-        self.dma_virt = dma_vm.val2;
-        self.dma_phys = @bitCast(dma_result);
+        self.dma_virt = dma_vm.addr;
+        self.dma_phys = dma_result;
 
         // Zero all DMA memory
         @memset(@as([*]u8, @ptrFromInt(self.dma_virt))[0..DMA_TOTAL], 0);

@@ -330,7 +330,8 @@ All syscalls return `i64`. Non-negative = success. Negative = error.
 | `E_TIMEOUT` | -8 | Timed out. |
 | `E_AGAIN` | -9 | Transient failure, retry. |
 | `E_NOENT` | -10 | Entry not found. |
-| `E_BUSY` | -11 | Committed pages in range must be decommitted first. |
+| `E_BUSY` | -11 | Resource already in use (e.g. core already pinned). |
+| `E_EXIST` | -12 | Committed pages in range must be decommitted first. |
 
 ---
 
@@ -369,7 +370,7 @@ Create shared memory. Eagerly allocates zeroed pages. `rights` specifies the Sha
 Map full SHM region into reservation at the given offset. See §2.2 shm_map behavior.
 
 **Returns:** `E_OK`.
-**Errors:** `E_BADCAP`, `E_PERM` (`shareable` missing, SHM RWX exceeds `max_rights`), `E_INVAL` (bad offset, out of bounds, duplicate SHM), `E_BUSY`.
+**Errors:** `E_BADCAP`, `E_PERM` (`shareable` missing, SHM RWX exceeds `max_rights`), `E_INVAL` (bad offset, out of bounds, duplicate SHM), `E_EXIST` (committed pages in range).
 
 ### shm_unmap(shm_handle, vm_handle) → result
 
@@ -383,7 +384,7 @@ Unbind SHM mapping. Process retains handle. See §2.2 shm_unmap behavior.
 Map MMIO with uncacheable attributes. See §2.2 mmio_map behavior.
 
 **Returns:** `E_OK`.
-**Errors:** `E_BADCAP`, `E_PERM` (missing `map`, `mmio`/R/W not in `max_rights`), `E_INVAL` (bad offset, out of bounds, nodes missing R/W, duplicate MMIO), `E_BUSY`.
+**Errors:** `E_BADCAP`, `E_PERM` (missing `map`, `mmio`/R/W not in `max_rights`), `E_INVAL` (bad offset, out of bounds, nodes missing R/W, duplicate MMIO), `E_EXIST` (committed pages in range).
 
 ### mmio_unmap(device_handle, vm_handle) → result
 

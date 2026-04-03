@@ -51,17 +51,8 @@ fn pollNewShm(view_addr: u64) ?u64 {
 }
 
 pub fn main(perm_view_addr: u64) void {
-    syscall.write("usb_driver: starting\n");
-
-    // Broadcast keyboard and mouse services
-    channel.broadcast(@intFromEnum(keyboard.protocol_id)) catch {
-        syscall.write("usb_driver: FAIL broadcast keyboard\n");
-        return;
-    };
-    channel.broadcast(@intFromEnum(mouse.protocol_id)) catch {
-        syscall.write("usb_driver: FAIL broadcast mouse\n");
-        return;
-    };
+    channel.broadcast(@intFromEnum(keyboard.protocol_id)) catch return;
+    channel.broadcast(@intFromEnum(mouse.protocol_id)) catch return;
 
     // Collect all USB device handles from permission view
     const view: *const [MAX_PERMS]perm_view.UserViewEntry = @ptrFromInt(perm_view_addr);
@@ -82,10 +73,7 @@ pub fn main(perm_view_addr: u64) void {
         }
     }
 
-    if (usb_count == 0) {
-        syscall.write("usb_driver: no USB controllers\n");
-        while (true) syscall.thread_yield();
-    }
+    if (usb_count == 0) while (true) syscall.thread_yield();
 
     // Initialize all USB controllers
     for (usb_handles[0..usb_count], usb_mmio_sizes[0..usb_count]) |handle, mmio_size| {
@@ -99,20 +87,18 @@ pub fn main(perm_view_addr: u64) void {
     while (true) {
         // Accept new channels from clients
         if (pollNewShm(perm_view_addr)) |shm_handle| {
-            if (Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE)) |chan| {
+            if (Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE) catch null) |chan| {
                 switch (@as(lib.Protocol, @enumFromInt(chan.protocol_id))) {
                     .keyboard => {
                         if (kb_count < MAX_KB_CHANNELS) {
                             kb_servers[kb_count] = keyboard.Server.init(chan);
                             kb_count += 1;
-                            syscall.write("usb_driver: keyboard channel connected\n");
                         }
                     },
                     .mouse => {
                         if (mouse_count < MAX_MOUSE_CHANNELS) {
                             mouse_servers[mouse_count] = mouse.Server.init(chan);
                             mouse_count += 1;
-                            syscall.write("usb_driver: mouse channel connected\n");
                         }
                     },
                     else => {},

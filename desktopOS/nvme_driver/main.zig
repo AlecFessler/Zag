@@ -107,7 +107,7 @@ pub fn main(perm_view_addr: u64) void {
     while (true) {
         // Accept new filesystem clients
         if (pollNewShm(perm_view_addr)) |shm_handle| {
-            if (Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE)) |chan| {
+            if (Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE) catch null) |chan| {
                 if (client_count < MAX_CLIENTS) {
                     clients[client_count] = filesystem.Server.init(chan);
                     client_count += 1;

@@ -16,14 +16,18 @@ pub const ConnectError = error{
     ChannelFailed,
 };
 
+pub const ConnectResult = struct {
+    client: Client,
+    shm_handle: syscall.Handle,
+};
+
 /// Discovers the mouse server (USB HID driver) via broadcast table and connects.
-/// Returns a Client ready to receive mouse events.
-pub fn connectToServer(perm_view_addr: u64) ConnectError!Client {
+pub fn connectToServer(perm_view_addr: u64) ConnectError!ConnectResult {
     const handle = channel.findBroadcastHandle(perm_view_addr, .mouse) orelse
         return error.ServerNotFound;
-    const conn = Channel.connectAsA(handle, .mouse, SHM_SIZE) orelse
+    const conn = Channel.connectAsA(handle, .mouse, SHM_SIZE) catch
         return error.ChannelFailed;
-    return Client.init(conn.chan);
+    return .{ .client = Client.init(conn.chan), .shm_handle = conn.shm_handle };
 }
 
 // ── Commands ─────────────────────────────────────────────────────────

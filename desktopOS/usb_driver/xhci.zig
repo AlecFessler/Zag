@@ -442,12 +442,11 @@ pub const Controller = struct {
             .write = true,
             .mmio = true,
         }).bits();
-        const mmio_vm = syscall.vm_reserve(0, aligned_mmio, mmio_vm_rights);
-        if (mmio_vm.val < 0) return .mmio_vm_reserve;
-        if (syscall.mmio_map(device_handle, @intCast(mmio_vm.val), 0) != 0) return .mmio_map;
+        const mmio_vm = syscall.vm_reserve(0, aligned_mmio, mmio_vm_rights) catch return .mmio_vm_reserve;
+        syscall.mmio_map(device_handle, mmio_vm.handle, 0) catch return .mmio_map;
 
         // Read hardware caps to compute DMA region size
-        self.mmio_base = mmio_vm.val2;
+        self.mmio_base = mmio_vm.addr;
         const hcsparams1 = self.readCap(.hcs_params1);
         const hcsparams2 = self.readCap(.hcs_params2);
         const hccparams1 = self.readCap(.hcc_params1);
@@ -490,23 +489,19 @@ pub const Controller = struct {
 
         // Allocate DMA region
         const shm_rights = (perms.SharedMemoryRights{ .read = true, .write = true }).bits();
-        const dma_shm = syscall.shm_create_with_rights(dma_size, shm_rights);
-        if (dma_shm <= 0) return .dma_shm_create;
+        const dma_shm = syscall.shm_create_with_rights(dma_size, shm_rights) catch return .dma_shm_create;
 
         const dma_vm_rights = (perms.VmReservationRights{
             .read = true,
             .write = true,
             .shareable = true,
         }).bits();
-        const dma_vm = syscall.vm_reserve(0, dma_size, dma_vm_rights);
-        if (dma_vm.val < 0) return .dma_vm_reserve;
-        if (syscall.shm_map(@intCast(dma_shm), @intCast(dma_vm.val), 0) != 0) return .dma_shm_map;
+        const dma_vm = syscall.vm_reserve(0, dma_size, dma_vm_rights) catch return .dma_vm_reserve;
+        syscall.shm_map(dma_shm, dma_vm.handle, 0) catch return .dma_shm_map;
 
-        const dma_result = syscall.dma_map(device_handle, @intCast(dma_shm));
-        if (dma_result < 0) return .dma_map;
-        const dma_phys: u64 = @bitCast(dma_result);
+        const dma_phys = syscall.dma_map(device_handle, dma_shm) catch return .dma_map;
 
-        return self.init(mmio_vm.val2, dma_vm.val2, dma_phys, dma_size);
+        return self.init(mmio_vm.addr, dma_vm.addr, dma_phys, dma_size);
     }
 
     // ── Initialize controller ───────────────────────────────────
@@ -564,14 +559,6 @@ pub const Controller = struct {
         var port: u32 = 0;
         while (port < self.max_ports) : (port += 1) {
             self.enumeratePort(port);
-        }
-
-        if (self.num_hid_devices == 0) {
-            syscall.write("usb: no HID devices found\n");
-        } else {
-            syscall.write("usb: ");
-            writeU32(self.num_hid_devices);
-            syscall.write(" HID device(s) ready\n");
         }
 
         return .none;
@@ -824,7 +811,7 @@ pub const Controller = struct {
     /// Non-matching event types are consumed (advanceEventRing) and skipped.
     /// Returns the matching event TRB, or null on timeout. The caller is
     /// responsible for calling advanceEventRing after processing the returned event.
-    fn waitForEvent(self: *Controller, expected_type: TrbType, timeout_ns: i64) ?*const volatile Trb {
+    fn waitForEvent(self: *Controller, expected_type: TrbType, timeout_ns: u64) ?*const volatile Trb {
         const deadline = syscall.clock_gettime() + timeout_ns;
         while (syscall.clock_gettime() < deadline) {
             if (self.pollEvent()) |trb| {
