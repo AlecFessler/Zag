@@ -1,8 +1,10 @@
 const lib = @import("lib");
 
-const channel = lib.channel;
-const Channel = channel.Channel;
+const nfs_proto = lib.nfs;
+const ntp_proto = lib.ntp;
 const syscall = lib.syscall;
+
+const Channel = lib.channel.Channel;
 
 // ── Log levels ───────────────────────────────────────────────────────
 
@@ -111,7 +113,7 @@ pub var dropped_count: u64 align(8) = 0;
 
 // ── NTP wall-clock state (updated by service thread) ─────────────────
 
-pub const MSG_TIME_SYNC: u8 = 0x11;
+pub const MSG_TIME_SYNC: u8 = ntp_proto.CMD_TIME_SYNC;
 
 var ntp_unix_secs: u64 = 0;
 var ntp_sync_mono_ns: u64 = 0;
@@ -132,7 +134,7 @@ fn wallClockSecs() u64 {
 
 // ── Write buffer for formatted text (service thread only) ────────────
 
-const MSG_LOG_WRITE: u8 = 0x10;
+const MSG_LOG_WRITE: u8 = nfs_proto.CMD_LOG_WRITE;
 const WRITE_BUF_SIZE: usize = 4096;
 const FLUSH_THRESHOLD: usize = 3072;
 const FLUSH_INTERVAL: u32 = 1000;

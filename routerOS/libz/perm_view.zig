@@ -1,4 +1,6 @@
-const syscall = @import("syscall.zig");
+const lib = @import("lib");
+
+const syscall = lib.syscall;
 
 pub const ENTRY_TYPE_PROCESS: u8 = 0;
 pub const ENTRY_TYPE_VM_RESERVATION: u8 = 1;
@@ -33,7 +35,10 @@ const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 pub fn waitForChange(view_addr: u64, timeout_ns: u64) void {
     const view: *const [128]UserViewEntry = @ptrFromInt(view_addr);
     const gen = @atomicLoad(u64, &view[0].field1, .acquire);
-    _ = syscall.futex_wait(&view[0].field1, gen, timeout_ns);
+    syscall.futex_wait(&view[0].field1, gen, timeout_ns) catch |err| switch (err) {
+        error.Timeout, error.Again => {},
+        else => syscall.write("perm_view: futex_wait failed\n"),
+    };
 }
 
 /// Read current perm_view generation counter.

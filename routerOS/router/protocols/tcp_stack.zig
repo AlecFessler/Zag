@@ -1,18 +1,20 @@
+const lib = @import("lib");
 const router = @import("router");
 
 const h = router.hal.headers;
+const http_proto = lib.http;
 const main = router.state;
 const util = router.util;
 
 pub const HTTP_PORT: u16 = 80;
 
-// ── Message tags (must match http_server/main.zig) ──────────────────
-pub const MSG_HTTP_REQUEST: u8 = 0x10;
-pub const MSG_HTTP_RESPONSE: u8 = 0x11;
-pub const MSG_STATE_QUERY: u8 = 0x12;
-pub const MSG_STATE_RESPONSE: u8 = 0x13;
-pub const MSG_MUTATION_REQUEST: u8 = 0x14;
-pub const MSG_MUTATION_RESPONSE: u8 = 0x15;
+// ── Message tags (sourced from lib.http protocol module) ────────────
+pub const MSG_HTTP_REQUEST: u8 = http_proto.RESP_HTTP_REQUEST;
+pub const MSG_HTTP_RESPONSE: u8 = http_proto.CMD_HTTP_RESPONSE;
+pub const MSG_STATE_QUERY: u8 = http_proto.CMD_STATE_QUERY;
+pub const MSG_STATE_RESPONSE: u8 = http_proto.RESP_STATE_RESPONSE;
+pub const MSG_MUTATION_REQUEST: u8 = http_proto.CMD_MUTATION_REQUEST;
+pub const MSG_MUTATION_RESPONSE: u8 = http_proto.RESP_MUTATION_RESPONSE;
 
 // Simple single-connection TCP state machine for HTTP/1.0
 const TcpState = enum { closed, syn_received, established, fin_wait };

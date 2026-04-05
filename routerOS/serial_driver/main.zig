@@ -24,12 +24,12 @@ const LSR_TX_EMPTY: u8 = 0x20;
 var device_handle: u64 = 0;
 
 fn portRead(offset: u64) u8 {
-    const rc = syscall.ioport_read(device_handle, offset, 1);
-    return @truncate(@as(u64, @bitCast(rc)));
+    const val = syscall.ioport_read(device_handle, offset, 1) catch return 0;
+    return @truncate(val);
 }
 
 fn portWrite(offset: u64, value: u8) void {
-    _ = syscall.ioport_write(device_handle, offset, 1, value);
+    syscall.ioport_write(device_handle, offset, 1, value) catch {};
 }
 
 fn initUart() void {
@@ -105,7 +105,7 @@ pub fn main(perm_view_addr: u64) void {
     var chan: *Channel = undefined;
     while (true) {
         if (pollNewShm(perm_view_addr)) |shm_handle| {
-            chan = Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE) orelse continue;
+            chan = Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE) catch continue;
             break;
         }
         syscall.thread_yield();

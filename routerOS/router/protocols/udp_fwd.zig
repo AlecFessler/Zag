@@ -4,16 +4,16 @@ const router = @import("router");
 const arp = router.protocols.arp;
 const h = router.hal.headers;
 const main = router.state;
+const syscall = lib.syscall;
+const udp_proxy = lib.udp_proxy;
 const util = router.util;
 
+const Channel = lib.channel.Channel;
 const Seqlock = lib.sync.Seqlock;
-const channel = lib.channel;
-const Channel = channel.Channel;
-const syscall = lib.syscall;
 
-pub const MSG_UDP_SEND: u8 = 0x01;
-pub const MSG_UDP_RECV: u8 = 0x02;
-pub const MSG_UDP_BIND: u8 = 0x03;
+pub const MSG_UDP_SEND: u8 = udp_proxy.CMD_UDP_SEND;
+pub const MSG_UDP_RECV: u8 = udp_proxy.RESP_UDP_RECV;
+pub const MSG_UDP_BIND: u8 = udp_proxy.CMD_UDP_BIND;
 
 pub const MAX_BINDINGS = 16;
 pub const MAX_PENDING = 8;

@@ -5,18 +5,14 @@ const rpc = @import("rpc.zig");
 const xdr = @import("xdr.zig");
 
 const channel = lib.channel;
+const nfs_proto = lib.nfs;
 const perms = lib.perms;
 const pv = lib.perm_view;
 const syscall = lib.syscall;
+const text_cmd = lib.text_command;
+const udp_proxy = lib.udp_proxy;
 
 const Channel = channel.Channel;
-
-// ── UDP proxy message tags (must match router/udp_fwd.zig) ──────────
-
-const MSG_UDP_SEND: u8 = 0x01;
-const MSG_UDP_RECV: u8 = 0x02;
-const MSG_UDP_BIND: u8 = 0x03;
-const MSG_LOG_WRITE: u8 = 0x10;
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -144,7 +140,7 @@ pub fn main(perm_view_addr: u64) void {
     // Connect to router as side A — poll until router is found
     while (true) {
         if (channel.findBroadcastHandle(perm_view_addr, .router)) |handle| {
-            const conn = Channel.connectAsA(handle, .nfs_client, DEFAULT_SHM_SIZE) orelse {
+            const conn = Channel.connectAsA(handle, .nfs_client, DEFAULT_SHM_SIZE) catch {
                 syscall.thread_yield();
                 continue;
             };
@@ -156,7 +152,7 @@ pub fn main(perm_view_addr: u64) void {
     }
 
     // Seed XID from clock to avoid NFS reply cache hits across reboots
-    const seed_ns: u64 = @bitCast(syscall.clock_gettime());
+    const seed_ns: u64 = syscall.clock_gettime();
     next_xid = @truncate(seed_ns);
     if (next_xid == 0) next_xid = 1;
 
@@ -179,15 +175,20 @@ pub fn main(perm_view_addr: u64) void {
         // Accept console connection (side B)
         if (console_chan == null) {
             if (pollNewShm(perm_view_global)) |shm_handle| {
-                console_chan = Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE);
+                console_chan = Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE) catch null;
             }
         }
 
         // Check console commands
         if (console_chan) |chan| {
             var cmd_buf: [256]u8 = undefined;
-            if (chan.receiveMessage(.B, &cmd_buf) catch null) |len| {
-                handleCommand(cmd_buf[0..len], .console);
+            const srv = text_cmd.Server.init(chan);
+            if (srv.recvCommand(&cmd_buf)) |cmd| {
+                switch (cmd) {
+                    .text => |text| handleCommand(text, .console),
+                    .data => |data| handleWriteData(data),
+                    .data_end => handleWriteDataEnd(),
+                }
             }
         }
 
@@ -241,7 +242,7 @@ fn processLogQueue() void {
 
 fn sendUdpBind(port: u16) void {
     var msg: [3]u8 = undefined;
-    msg[0] = MSG_UDP_BIND;
+    msg[0] = udp_proxy.CMD_UDP_BIND;
     msg[1] = @truncate(port >> 8);
     msg[2] = @truncate(port);
     router_chan.sendMessage(.A, &msg) catch {};
@@ -251,7 +252,7 @@ fn sendUdpPacket(dst_ip: [4]u8, dst_port: u16, src_port: u16, payload: []const u
     var msg: [2048]u8 = undefined;
     const total = 9 + payload.len;
     if (total > msg.len) return;
-    msg[0] = MSG_UDP_SEND;
+    msg[0] = udp_proxy.CMD_UDP_SEND;
     @memcpy(msg[1..5], &dst_ip);
     msg[5] = @truncate(dst_port >> 8);
     msg[6] = @truncate(dst_port);
@@ -270,7 +271,7 @@ fn sendUdpPacket(dst_ip: [4]u8, dst_port: u16, src_port: u16, payload: []const u
 }
 
 fn now() u64 {
-    return @bitCast(syscall.clock_gettime());
+    return syscall.clock_gettime();
 }
 
 // ── Send NFS requests ───────────────────────────────────────────────
@@ -383,8 +384,8 @@ fn sendCommit(fh: *const nfs3.FileHandle) void {
 fn handleRouterMessage(data: []const u8) void {
     if (data.len < 1) return;
     switch (data[0]) {
-        MSG_UDP_RECV => handleUdpRecv(data),
-        MSG_LOG_WRITE => handleLogWrite(data),
+        udp_proxy.RESP_UDP_RECV => handleUdpRecv(data),
+        nfs_proto.CMD_LOG_WRITE => handleLogWrite(data),
         else => {},
     }
 }
@@ -527,7 +528,9 @@ fn handleNfsReply(payload: []const u8) void {
                     write_offset = 0;
                     awaiting_write_data = true;
                     state = .mounted;
-                    sendResponse("OK: send data\n");
+                    if (console_chan) |chan| {
+                        text_cmd.Server.init(chan).sendAck("OK: send data\r\n");
+                    }
                 }
             } else {
                 sendResponse("NFS: create failed\n");
@@ -694,6 +697,18 @@ fn continueAfterLookup() void {
 
 const CmdOp = enum { cat, ls, put, mkdir_cmd, rm, stat_cmd, mount_cmd };
 
+fn handleWriteData(data: []const u8) void {
+    if (!awaiting_write_data) return;
+    sendWrite(&write_fh, write_offset, data);
+    awaiting_write_data = false;
+}
+
+fn handleWriteDataEnd() void {
+    if (!awaiting_write_data) return;
+    awaiting_write_data = false;
+    sendCommit(&write_fh);
+}
+
 fn handleCommand(data: []const u8, source: RequestSource) void {
     request_source = source;
 
@@ -701,20 +716,6 @@ fn handleCommand(data: []const u8, source: RequestSource) void {
     var cmd = data;
     while (cmd.len > 0 and (cmd[cmd.len - 1] == '\n' or cmd[cmd.len - 1] == '\r')) {
         cmd = cmd[0 .. cmd.len - 1];
-    }
-
-    // Handle write data if awaiting
-    if (awaiting_write_data) {
-        if (cmd.len == 0) {
-            // Empty line = EOF, commit
-            awaiting_write_data = false;
-            sendCommit(&write_fh);
-            return;
-        }
-        // Send this data as a WRITE
-        sendWrite(&write_fh, write_offset, cmd);
-        awaiting_write_data = false;
-        return;
     }
 
     if (!mounted and !startsWith(cmd, "mount")) {
@@ -933,7 +934,7 @@ fn sendResponse(msg: []const u8) void {
     switch (request_source) {
         .console => {
             if (console_chan) |chan| {
-                chan.sendMessage(.B, msg) catch {};
+                text_cmd.Server.init(chan).sendText(msg);
             }
         },
         .router => {
@@ -950,7 +951,7 @@ fn sendEof() void {
     switch (request_source) {
         .console => {
             if (console_chan) |chan| {
-                chan.sendMessage(.B, &[_]u8{}) catch {}; // 0-byte = EOF
+                text_cmd.Server.init(chan).sendEnd();
             }
         },
         .router => {},

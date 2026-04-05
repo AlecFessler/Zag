@@ -18,12 +18,11 @@ pub const Arena = struct {
             .read = true,
             .write = true,
         }).bits();
-        const result = syscall.vm_reserve(0, size, rights);
-        if (result.val < 0) return null;
+        const result = syscall.vm_reserve(0, size, rights) catch return null;
         return .{
-            .start_addr = result.val2,
-            .free_addr = result.val2,
-            .end_addr = result.val2 + size,
+            .start_addr = result.addr,
+            .free_addr = result.addr,
+            .end_addr = result.addr + size,
         };
     }
 

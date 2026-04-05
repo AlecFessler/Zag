@@ -3,6 +3,19 @@ const syscall = @import("syscall.zig");
 
 const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 
+fn futexWait(addr: *const u64, expected: u64, timeout_ns: u64) void {
+    syscall.futex_wait(addr, expected, timeout_ns) catch |err| switch (err) {
+        error.Timeout, error.Again => {},
+        else => syscall.write("sync: futex_wait failed\n"),
+    };
+}
+
+fn futexWake(addr: *const u64, count: u64) void {
+    syscall.futex_wake(addr, count) catch {
+        syscall.write("sync: futex_wake failed\n");
+    };
+}
+
 pub const Mutex = extern struct {
     state: u64 align(8),
 
@@ -24,14 +37,14 @@ pub const Mutex = extern struct {
             if (@atomicLoad(u64, &self.state, .monotonic) != UNLOCKED) {
                 @atomicStore(u64, &self.state, LOCKED_WAITERS, .monotonic);
             }
-            _ = syscall.futex_wait(@ptrCast(&self.state), LOCKED_WAITERS, MAX_TIMEOUT);
+            futexWait(@ptrCast(&self.state), LOCKED_WAITERS, MAX_TIMEOUT);
         }
     }
 
     pub fn unlock(self: *Mutex) void {
         const prev = @atomicRmw(u64, &self.state, .Xchg, UNLOCKED, .release);
         if (prev == LOCKED_WAITERS) {
-            _ = syscall.futex_wake(@ptrCast(&self.state), 1);
+            futexWake(@ptrCast(&self.state), 1);
         }
     }
 };
@@ -46,18 +59,18 @@ pub const Condvar = struct {
     pub fn wait(self: *Condvar, mutex: *Mutex) void {
         const current_seq = @atomicLoad(u64, &self.seq, .acquire);
         mutex.unlock();
-        _ = syscall.futex_wait(@ptrCast(&self.seq), current_seq, MAX_TIMEOUT);
+        futexWait(@ptrCast(&self.seq), current_seq, MAX_TIMEOUT);
         mutex.lock();
     }
 
     pub fn signal(self: *Condvar) void {
         _ = @atomicRmw(u64, &self.seq, .Add, 1, .release);
-        _ = syscall.futex_wake(@ptrCast(&self.seq), 1);
+        futexWake(@ptrCast(&self.seq), 1);
     }
 
     pub fn broadcast(self: *Condvar) void {
         _ = @atomicRmw(u64, &self.seq, .Add, 1, .release);
-        _ = syscall.futex_wake(@ptrCast(&self.seq), @as(u64, @bitCast(@as(i64, -1))));
+        futexWake(@ptrCast(&self.seq), @as(u64, @bitCast(@as(i64, -1))));
     }
 };
 
@@ -74,14 +87,14 @@ pub const Semaphore = struct {
             if (current > 0) {
                 if (@cmpxchgWeak(u64, &self.count, current, current - 1, .acquire, .monotonic) == null) return;
             } else {
-                _ = syscall.futex_wait(@ptrCast(&self.count), 0, MAX_TIMEOUT);
+                futexWait(@ptrCast(&self.count), 0, MAX_TIMEOUT);
             }
         }
     }
 
     pub fn post(self: *Semaphore) void {
         _ = @atomicRmw(u64, &self.count, .Add, 1, .release);
-        _ = syscall.futex_wake(@ptrCast(&self.count), 1);
+        futexWake(@ptrCast(&self.count), 1);
     }
 };
 
@@ -110,7 +123,7 @@ pub const Seqlock = extern struct {
     /// Wakes one futex waiter so blocked readers can retry.
     pub fn writeEnd(self: *Seqlock) void {
         _ = @atomicRmw(u64, &self.gen, .Add, 1, .release);
-        _ = syscall.futex_wake(@ptrCast(&self.gen), 1);
+        futexWake(@ptrCast(&self.gen), 1);
     }
 
     /// Begin a read. Blocks (with 1ms futex timeout) if a write is in
@@ -119,7 +132,7 @@ pub const Seqlock = extern struct {
         while (true) {
             const g = @atomicLoad(u64, &self.gen, .acquire);
             if (g & 1 == 0) return g;
-            _ = syscall.futex_wait(@ptrCast(&self.gen), g, 1_000_000);
+            futexWait(@ptrCast(&self.gen), g, 1_000_000);
         }
     }
 
@@ -129,7 +142,7 @@ pub const Seqlock = extern struct {
         while (true) {
             const g = @atomicLoad(u64, &self.gen, .acquire);
             if (g & 1 == 0) return g;
-            _ = syscall.futex_wait(@ptrCast(&self.gen), g, 1_000);
+            futexWait(@ptrCast(&self.gen), g, 1_000);
         }
     }
 

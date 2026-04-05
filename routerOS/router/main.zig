@@ -27,9 +27,12 @@ const util = router.util;
 
 const Arena = lib.arena.Arena;
 const channel = lib.channel;
+const http_proto = lib.http;
+const ntp_proto = lib.ntp;
 const perms = lib.perms;
 const pv = lib.perm_view;
 const syscall = lib.syscall;
+const text_cmd = lib.text_command;
 
 const Channel = channel.Channel;
 
@@ -129,10 +132,9 @@ fn readU64Be(b: *const [8]u8) u64 {
 fn mmioMap(device_handle: u64, size: u64) ?u64 {
     const aligned = ((size + syscall.PAGE4K - 1) / syscall.PAGE4K) * syscall.PAGE4K;
     const vm_rights = (perms.VmReservationRights{ .read = true, .write = true, .mmio = true }).bits();
-    const vm = syscall.vm_reserve(0, aligned, vm_rights);
-    if (vm.val < 0) return null;
-    if (syscall.mmio_map(device_handle, @intCast(vm.val), 0) != 0) return null;
-    return vm.val2;
+    const vm = syscall.vm_reserve(0, aligned, vm_rights) catch return null;
+    syscall.mmio_map(device_handle, vm.handle, 0) catch return null;
+    return vm.addr;
 }
 
 const NicInfo = struct { handle: u64, mmio_size: u64, pci_bus: u8, pci_dev: u5, pci_func: u3 };
@@ -600,7 +602,7 @@ fn pollNewShm(view_addr: u64) ?u64 {
 fn detectAppChannels(perm_view_addr_local: u64) void {
     if (console_chan != null and nfs_chan != null and ntp_chan != null and http_chan != null) return;
     const shm_handle = pollNewShm(perm_view_addr_local) orelse return;
-    const chan = Channel.connectAsB(shm_handle, 4 * syscall.PAGE4K) orelse return;
+    const chan = Channel.connectAsB(shm_handle, 4 * syscall.PAGE4K) catch return;
     switch (chan.protocol_id) {
         @intFromEnum(lib.Protocol.nfs_client) => {
             if (nfs_chan == null) {
@@ -732,7 +734,7 @@ pub fn main(perm_view_addr: u64) void {
         syscall.write("router: WAN NIC init fail — halted\n");
         while (true) pv.waitForChange(perm_view_addr, MAX_TIMEOUT);
     }
-    _ = syscall.pci_enable_bus_master(wan_nic.handle);
+    syscall.pci_enable_bus_master(wan_nic.handle);
     wan_iface.mac = nic.readMac(wan_mmio);
     wan_iface.ip6_link_local = util.macToLinkLocal(wan_iface.mac);
 
@@ -750,7 +752,7 @@ pub fn main(perm_view_addr: u64) void {
                 .rx_descs = region.lanRxDescs(),
                 .tx_descs = region.lanTxDescs(),
             })) {
-                _ = syscall.pci_enable_bus_master(lan_nic.handle);
+                syscall.pci_enable_bus_master(lan_nic.handle);
 
                 lan_iface.role = .lan;
                 lan_iface.mmio_base = lan_mmio;
@@ -778,19 +780,20 @@ pub fn main(perm_view_addr: u64) void {
 
     // Spawn LAN poll thread if dual-NIC
     if (has_lan) {
-        _ = syscall.thread_create(&lanPollThread, 0, 4);
+        _ = syscall.thread_create(&lanPollThread, 0, 4) catch 0;
     }
 
     // Record DMA SHM as known so channel detection ignores it
     addKnownShmHandle(region.shm_handle);
 
     // Spawn service thread for console/NFS/NTP channel handling
-    _ = syscall.thread_create(&serviceThread, 0, 4);
+    _ = syscall.thread_create(&serviceThread, 0, 4) catch 0;
 
     // Pin WAN thread to core 1 (non-preemptible)
-    if (syscall.set_affinity(1 << 1) == 0) {
+    const affinity_ok = if (syscall.set_affinity(1 << 1)) |_| true else |_| false;
+    if (affinity_ok) {
         syscall.thread_yield(); // migrate to core 1
-        _ = syscall.pin_exclusive();
+        syscall.pin_exclusive() catch {};
     }
 
     // WAN thread (runs on the initial/main thread):
@@ -804,6 +807,7 @@ pub fn main(perm_view_addr: u64) void {
 
 fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
     if (cmd.len == 0) return;
+    const srv = text_cmd.Server.init(chan);
     var resp: [512]u8 = undefined;
 
     if (util.eql(cmd, "status")) {
@@ -820,7 +824,8 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
             p = util.appendStr(&resp, p, " mac=");
             p = util.appendMac(&resp, p, lan_iface.mac);
         }
-        chan.sendMessage(.B,resp[0..p]) catch {};
+        srv.sendText(resp[0..p]);
+        srv.sendEnd();
     } else if (util.eql(cmd, "ifstat")) {
         var p: usize = 0;
         p = util.appendStr(&resp, p, "WAN rx=");
@@ -837,11 +842,12 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
             p = util.appendStr(&resp, p, " drop=");
             p = util.appendDec(&resp, p, lan_iface.stats.rx_dropped);
         }
-        chan.sendMessage(.B,resp[0..p]) catch {};
+        srv.sendText(resp[0..p]);
+        srv.sendEnd();
     } else if (util.eql(cmd, "arp")) {
         sendArpTable(chan, "WAN", &wan_iface.arp_table);
         if (has_lan) sendArpTable(chan, "LAN", &lan_iface.arp_table);
-        chan.sendMessage(.B,"---") catch {};
+        srv.sendEnd();
     } else if (util.eql(cmd, "nat")) {
         var count: u32 = 0;
         for (&nat_table) |*e| {
@@ -859,11 +865,11 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
             p = util.appendIp(&resp, p, e.dst_ip);
             p = util.appendStr(&resp, p, ":");
             p = util.appendDec(&resp, p, e.dst_port);
-            chan.sendMessage(.B,resp[0..p]) catch {};
+            srv.sendText(resp[0..p]);
             count += 1;
         }
-        if (count == 0) chan.sendMessage(.B,"(empty)") catch {};
-        chan.sendMessage(.B,"---") catch {};
+        if (count == 0) srv.sendText("(empty)");
+        srv.sendEnd();
     } else if (util.eql(cmd, "leases")) {
         var count: u32 = 0;
         for (&dhcp_leases) |*l| {
@@ -877,11 +883,11 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
             p = util.appendIp(&resp, p, l_ip);
             p = util.appendStr(&resp, p, " ");
             p = util.appendMac(&resp, p, l_mac);
-            chan.sendMessage(.B,resp[0..p]) catch {};
+            srv.sendText(resp[0..p]);
             count += 1;
         }
-        if (count == 0) chan.sendMessage(.B,"(empty)") catch {};
-        chan.sendMessage(.B,"---") catch {};
+        if (count == 0) srv.sendText("(empty)");
+        srv.sendEnd();
     } else if (util.eql(cmd, "rules")) {
         var count: u32 = 0;
         for (&firewall_rules) |*r| {
@@ -899,7 +905,7 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
                 p = util.appendStr(&resp, p, " port=");
                 p = util.appendDec(&resp, p, r.dst_port);
             }
-            chan.sendMessage(.B,resp[0..p]) catch {};
+            srv.sendText(resp[0..p]);
             count += 1;
         }
         for (&port_forwards) |*f| {
@@ -914,14 +920,15 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
             p = util.appendIp(&resp, p, f.lan_ip);
             p = util.appendStr(&resp, p, ":");
             p = util.appendDec(&resp, p, f.lan_port);
-            chan.sendMessage(.B,resp[0..p]) catch {};
+            srv.sendText(resp[0..p]);
             count += 1;
         }
-        if (count == 0) chan.sendMessage(.B,"(empty)") catch {};
-        chan.sendMessage(.B,"---") catch {};
+        if (count == 0) srv.sendText("(empty)");
+        srv.sendEnd();
     } else if (util.startsWith(cmd, "ping ")) {
         const ip = util.parseIp(cmd[5..]) orelse {
-            chan.sendMessage(.B,"invalid IP") catch {};
+            srv.sendText("invalid IP");
+            srv.sendEnd();
             return;
         };
         ping_target_ip = ip;
@@ -940,11 +947,13 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
         }
     } else if (util.startsWith(cmd, "traceroute ")) {
         if (traceroute_state != .idle) {
-            chan.sendMessage(.B,"traceroute already in progress") catch {};
+            srv.sendText("traceroute already in progress");
+            srv.sendEnd();
             return;
         }
         const ip = util.parseIp(cmd[11..]) orelse {
-            chan.sendMessage(.B,"invalid IP") catch {};
+            srv.sendText("invalid IP");
+            srv.sendEnd();
             return;
         };
         traceroute_target_ip = ip;
@@ -958,7 +967,7 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
         p = util.appendStr(&resp, p, ", ");
         p = util.appendDec(&resp, p, traceroute_max_hops);
         p = util.appendStr(&resp, p, " hops max");
-        chan.sendMessage(.B,resp[0..p]) catch {};
+        srv.sendText(resp[0..p]);
         // Resolve MAC and send first probe
         if (arp.lookup(&ifc.arp_table, ip)) |mac| {
             @memcpy(&traceroute_target_mac, &mac);
@@ -982,7 +991,8 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
         }
     } else if (util.startsWith(cmd, "block ")) {
         const ip = util.parseIp(cmd[6..]) orelse {
-            chan.sendMessage(.B,"invalid IP") catch {};
+            srv.sendText("invalid IP");
+            srv.sendEnd();
             return;
         };
         for (&firewall_rules) |*r| {
@@ -995,14 +1005,17 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
                 r.protocol = 0;
                 r.dst_port = 0;
                 r.seq.writeEnd();
-                chan.sendMessage(.B,"OK") catch {};
+                srv.sendText("OK");
+                srv.sendEnd();
                 return;
             }
         }
-        chan.sendMessage(.B,"firewall table full") catch {};
+        srv.sendText("firewall table full");
+        srv.sendEnd();
     } else if (util.startsWith(cmd, "allow ")) {
         const ip = util.parseIp(cmd[6..]) orelse {
-            chan.sendMessage(.B,"invalid IP") catch {};
+            srv.sendText("invalid IP");
+            srv.sendEnd();
             return;
         };
         for (&firewall_rules) |*r| {
@@ -1010,11 +1023,13 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
                 r.seq.writeBegin();
                 r.valid = false;
                 r.seq.writeEnd();
-                chan.sendMessage(.B,"OK") catch {};
+                srv.sendText("OK");
+                srv.sendEnd();
                 return;
             }
         }
-        chan.sendMessage(.B,"rule not found") catch {};
+        srv.sendText("rule not found");
+        srv.sendEnd();
     } else if (util.startsWith(cmd, "forward ")) {
         // forward tcp|udp <wport> <lip> <lport>
         const args = cmd[8..];
@@ -1026,11 +1041,13 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
             proto = .udp;
             rest = args[4..];
         } else {
-            chan.sendMessage(.B,"usage: forward tcp|udp <wport> <lip> <lport>") catch {};
+            srv.sendText("usage: forward tcp|udp <wport> <lip> <lport>");
+            srv.sendEnd();
             return;
         }
         const parsed = util.parsePortIpPort(rest) orelse {
-            chan.sendMessage(.B,"usage: forward tcp|udp <wport> <lip> <lport>") catch {};
+            srv.sendText("usage: forward tcp|udp <wport> <lip> <lport>");
+            srv.sendEnd();
             return;
         };
         for (&port_forwards) |*f| {
@@ -1042,18 +1059,22 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
                 f.lan_ip = parsed.ip;
                 f.lan_port = parsed.port2;
                 f.seq.writeEnd();
-                chan.sendMessage(.B,"OK") catch {};
+                srv.sendText("OK");
+                srv.sendEnd();
                 return;
             }
         }
-        chan.sendMessage(.B,"port forward table full") catch {};
+        srv.sendText("port forward table full");
+        srv.sendEnd();
     } else if (util.startsWith(cmd, "dns ")) {
         const ip = util.parseIp(cmd[4..]) orelse {
-            chan.sendMessage(.B,"invalid IP") catch {};
+            srv.sendText("invalid IP");
+            srv.sendEnd();
             return;
         };
         upstream_dns = ip;
-        chan.sendMessage(.B,"OK") catch {};
+        srv.sendText("OK");
+        srv.sendEnd();
     } else if (util.eql(cmd, "dhcp-client")) {
         var p: usize = 0;
         const state_str: []const u8 = switch (dhcp_client_state) {
@@ -1071,15 +1092,17 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
             dhcp_client_start_ns = util.now();
             p = util.appendStr(&resp, p, " -> discovering");
         }
-        chan.sendMessage(.B,resp[0..p]) catch {};
+        srv.sendText(resp[0..p]);
+        srv.sendEnd();
     } else if (util.eql(cmd, "dhcp-test-rebind")) {
         if (dhcp_client_state == .bound or dhcp_client_state == .requesting) {
             dhcp_client_xid +%= 1;
             dhcp_client.sendRebind();
-            chan.sendMessage(.B,"rebinding") catch {};
+            srv.sendText("rebinding");
         } else {
-            chan.sendMessage(.B,"not bound") catch {};
+            srv.sendText("not bound");
         }
+        srv.sendEnd();
     } else if (util.eql(cmd, "dhcpv6")) {
         var p: usize = 0;
         const state_str: []const u8 = switch (dhcpv6_state) {
@@ -1094,7 +1117,8 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
             dhcpv6_client.sendSolicit();
             p = util.appendStr(&resp, p, " -> soliciting");
         }
-        chan.sendMessage(.B,resp[0..p]) catch {};
+        srv.sendText(resp[0..p]);
+        srv.sendEnd();
     } else if (util.eql(cmd, "static-leases")) {
         var count: u32 = 0;
         for (&dhcp_static_leases) |*s| {
@@ -1103,36 +1127,42 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
             p = util.appendIp(&resp, p, s.ip);
             p = util.appendStr(&resp, p, " ");
             p = util.appendMac(&resp, p, s.mac);
-            chan.sendMessage(.B,resp[0..p]) catch {};
+            srv.sendText(resp[0..p]);
             count += 1;
         }
-        if (count == 0) chan.sendMessage(.B,"(empty)") catch {};
-        chan.sendMessage(.B,"---") catch {};
+        if (count == 0) srv.sendText("(empty)");
+        srv.sendEnd();
     } else if (util.startsWith(cmd, "static-lease ")) {
         const args = cmd[13..];
         if (args.len < 19) {
-            chan.sendMessage(.B,"usage: static-lease <mac> <ip>") catch {};
+            srv.sendText("usage: static-lease <mac> <ip>");
+            srv.sendEnd();
             return;
         }
         const mac = util.parseMac(args[0..17]) orelse {
-            chan.sendMessage(.B,"invalid MAC") catch {};
+            srv.sendText("invalid MAC");
+            srv.sendEnd();
             return;
         };
         if (args[17] != ' ') {
-            chan.sendMessage(.B,"usage: static-lease <mac> <ip>") catch {};
+            srv.sendText("usage: static-lease <mac> <ip>");
+            srv.sendEnd();
             return;
         }
         const ip = util.parseIp(args[18..]) orelse {
-            chan.sendMessage(.B,"invalid IP") catch {};
+            srv.sendText("invalid IP");
+            srv.sendEnd();
             return;
         };
         if (ip[0] != 10 or ip[1] != 1 or ip[2] != 1 or ip[3] < 2) {
-            chan.sendMessage(.B,"IP must be 10.1.1.2-255") catch {};
+            srv.sendText("IP must be 10.1.1.2-255");
+            srv.sendEnd();
             return;
         }
         for (&dhcp_static_leases) |*s| {
             if (@atomicLoad(u8, &s.state, .acquire) != 0 and (util.eql(&s.mac, &mac) or util.eql(&s.ip, &ip))) {
-                chan.sendMessage(.B,"conflict: MAC or IP already reserved") catch {};
+                srv.sendText("conflict: MAC or IP already reserved");
+                srv.sendEnd();
                 return;
             }
         }
@@ -1141,11 +1171,13 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
                 s.mac = mac;
                 s.ip = ip;
                 @atomicStore(u8, &s.state, 1, .release);
-                chan.sendMessage(.B,"OK") catch {};
+                srv.sendText("OK");
+                srv.sendEnd();
                 return;
             }
         }
-        chan.sendMessage(.B,"static lease table full") catch {};
+        srv.sendText("static lease table full");
+        srv.sendEnd();
     } else if (util.eql(cmd, "get-config")) {
         // Serialize current config as lines (multi-response)
         // DNS upstream
@@ -1153,7 +1185,7 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
             var p: usize = 0;
             p = util.appendStr(&resp, p, "dns ");
             p = util.appendIp(&resp, p, upstream_dns);
-            chan.sendMessage(.B,resp[0..p]) catch {};
+            srv.sendText(resp[0..p]);
         }
         // Firewall block rules
         for (&firewall_rules) |*r| {
@@ -1161,7 +1193,7 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
             var p: usize = 0;
             p = util.appendStr(&resp, p, "block ");
             p = util.appendIp(&resp, p, r.src_ip);
-            chan.sendMessage(.B,resp[0..p]) catch {};
+            srv.sendText(resp[0..p]);
         }
         // Port forwards
         for (&port_forwards) |*f| {
@@ -1176,7 +1208,7 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
             p = util.appendIp(&resp, p, f.lan_ip);
             p = util.appendStr(&resp, p, " ");
             p = util.appendDec(&resp, p, f.lan_port);
-            chan.sendMessage(.B,resp[0..p]) catch {};
+            srv.sendText(resp[0..p]);
         }
         // Static DHCP leases
         for (&dhcp_static_leases) |*s| {
@@ -1186,15 +1218,17 @@ fn handleConsoleCommand(chan: *Channel, cmd: []const u8) void {
             p = util.appendMac(&resp, p, s.mac);
             p = util.appendStr(&resp, p, " ");
             p = util.appendIp(&resp, p, s.ip);
-            chan.sendMessage(.B,resp[0..p]) catch {};
+            srv.sendText(resp[0..p]);
         }
-        chan.sendMessage(.B,"---") catch {};
+        srv.sendEnd();
     } else {
-        chan.sendMessage(.B,"unknown router command") catch {};
+        srv.sendText("unknown router command");
+        srv.sendEnd();
     }
 }
 
 fn sendArpTable(chan: *Channel, label: []const u8, table: *const [arp.TABLE_SIZE]arp.ArpEntry) void {
+    const srv = text_cmd.Server.init(chan);
     var resp: [256]u8 = undefined;
     var count: u32 = 0;
     for (table) |*e| {
@@ -1205,14 +1239,14 @@ fn sendArpTable(chan: *Channel, label: []const u8, table: *const [arp.TABLE_SIZE
         p = util.appendIp(&resp, p, e.ip);
         p = util.appendStr(&resp, p, " ");
         p = util.appendMac(&resp, p, e.mac);
-        chan.sendMessage(.B,resp[0..p]) catch {};
+        srv.sendText(resp[0..p]);
         count += 1;
     }
     if (count == 0) {
         var p: usize = 0;
         p = util.appendStr(&resp, p, label);
         p = util.appendStr(&resp, p, " (empty)");
-        chan.sendMessage(.B,resp[0..p]) catch {};
+        srv.sendText(resp[0..p]);
     }
 }
 
@@ -1286,8 +1320,12 @@ fn serviceThread() void {
 
         // Console command handling
         if (console_chan) |chan| {
-            if (chan.receiveMessage(.B, cmd_buf) catch null) |cmd_len| {
-                handleConsoleCommand(chan, cmd_buf[0..cmd_len]);
+            const con_srv = text_cmd.Server.init(chan);
+            if (con_srv.recvCommand(cmd_buf)) |cmd| {
+                switch (cmd) {
+                    .text => |text| handleConsoleCommand(chan, text),
+                    else => {},
+                }
             }
         }
 
@@ -1301,8 +1339,8 @@ fn serviceThread() void {
         // NTP app messages
         if (ntp_chan) |chan| {
             if (chan.receiveMessage(.B, ntp_buf) catch null) |ntp_len| {
-                if (ntp_len >= 17 and ntp_buf[0] == log.MSG_TIME_SYNC) {
-                    // [0] = MSG_TIME_SYNC, [1..9] = unix_secs, [9..17] = mono_ns
+                if (ntp_len >= 17 and ntp_buf[0] == ntp_proto.CMD_TIME_SYNC) {
+                    // [0] = CMD_TIME_SYNC, [1..9] = unix_secs, [9..17] = mono_ns
                     const unix_secs = readU64Be(ntp_buf[1..9]);
                     const mono_ns = readU64Be(ntp_buf[9..17]);
                     log.updateNtpTime(unix_secs, mono_ns);
@@ -1315,7 +1353,7 @@ fn serviceThread() void {
         // HTTP server app messages
         if (http_chan) |chan| {
             if (chan.receiveMessage(.B, http_buf) catch null) |hlen| {
-                if (hlen >= 3 and http_buf[0] == tcp_stack.MSG_HTTP_RESPONSE) {
+                if (hlen >= 3 and http_buf[0] == http_proto.CMD_HTTP_RESPONSE) {
                     const chunk_idx = http_buf[1];
                     const total_chunks = http_buf[2];
                     const chunk_data = http_buf[3..hlen];
@@ -1360,14 +1398,14 @@ fn serviceThread() void {
 fn handleHttpServerMessage(data: []const u8, chan: *Channel, buf: []u8) void {
     if (data.len < 1) return;
     switch (data[0]) {
-        tcp_stack.MSG_STATE_QUERY => {
+        http_proto.CMD_STATE_QUERY => {
             if (data.len < 2) return;
             handleStateQuery(data[1], chan, buf);
         },
-        tcp_stack.MSG_HTTP_RESPONSE => {
+        http_proto.CMD_HTTP_RESPONSE => {
             // Handled by chunked reassembly in service loop; should not reach here
         },
-        tcp_stack.MSG_MUTATION_REQUEST => {
+        http_proto.CMD_MUTATION_REQUEST => {
             if (data.len < 2) return;
             handleMutationRequest(data[1..], chan, buf);
         },
@@ -1376,7 +1414,7 @@ fn handleHttpServerMessage(data: []const u8, chan: *Channel, buf: []u8) void {
 }
 
 fn handleStateQuery(endpoint: u8, chan: *Channel, buf: []u8) void {
-    buf[0] = tcp_stack.MSG_STATE_RESPONSE;
+    buf[0] = http_proto.RESP_STATE_RESPONSE;
     const json_len: usize = switch (endpoint) {
         0 => tcp_stack.formatJsonStatus(buf[1..]),
         1 => tcp_stack.formatJsonIfstat(buf[1..]),
@@ -1459,7 +1497,7 @@ fn handleMutationRequest(data: []const u8, chan: *Channel, buf: []u8) void {
         else => "{\"ok\":false,\"error\":\"unknown mutation\"}",
     };
 
-    buf[0] = tcp_stack.MSG_MUTATION_RESPONSE;
+    buf[0] = http_proto.RESP_MUTATION_RESPONSE;
     const rlen = @min(result.len, buf.len - 1);
     @memcpy(buf[1..][0..rlen], result[0..rlen]);
     chan.sendMessage(.B,buf[0 .. 1 + rlen]) catch {};
@@ -1562,7 +1600,7 @@ fn mutateTimezone(params: []const u8) []const u8 {
     tz_offset_minutes = offset;
     // Forward to NTP client
     if (ntp_chan) |chan| {
-        chan.sendMessage(.B,&[_]u8{ 0x04, params[0], params[1] }) catch {};
+        chan.sendMessage(.B, &[_]u8{ ntp_proto.RESP_SET_TIMEZONE, params[0], params[1] }) catch {};
     }
     return "{\"ok\":true}";
 }
@@ -1570,9 +1608,10 @@ fn mutateTimezone(params: []const u8) []const u8 {
 /// LAN poll thread entry point. Polls LAN NIC, forwards to WAN via zero-copy.
 fn lanPollThread() void {
     // Pin LAN thread to core 2 (non-preemptible)
-    if (syscall.set_affinity(1 << 2) == 0) {
+    const affinity_ok = if (syscall.set_affinity(1 << 2)) |_| true else |_| false;
+    if (affinity_ok) {
         syscall.thread_yield(); // migrate to core 2
-        _ = syscall.pin_exclusive();
+        syscall.pin_exclusive() catch {};
     }
 
     while (true) {

@@ -83,6 +83,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSmall,
         .pic = true,
     });
+    lib_mod.addImport("lib", lib_mod); // self-reference so libz files can @import("lib")
 
     const serial_driver_bin = buildChild(b, target, lib_mod, "serial_driver", "serial_driver/main.zig");
     const router_bin = buildRouterChild(b, target, lib_mod);

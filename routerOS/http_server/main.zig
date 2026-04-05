@@ -1,37 +1,10 @@
 const lib = @import("lib");
 
 const channel = lib.channel;
+const http_proto = lib.http;
 const syscall = lib.syscall;
 
 const Channel = channel.Channel;
-
-// ── Message tags (must match router/services/tcp_stack.zig) ─────────
-
-const MSG_HTTP_REQUEST: u8 = 0x10;
-const MSG_HTTP_RESPONSE: u8 = 0x11;
-const MSG_STATE_QUERY: u8 = 0x12;
-const MSG_STATE_RESPONSE: u8 = 0x13;
-const MSG_MUTATION_REQUEST: u8 = 0x14;
-const MSG_MUTATION_RESPONSE: u8 = 0x15;
-
-// ── State query endpoint IDs ────────────────────────────────────────
-
-const EP_STATUS: u8 = 0;
-const EP_IFSTAT: u8 = 1;
-const EP_ARP: u8 = 2;
-const EP_NAT: u8 = 3;
-const EP_LEASES: u8 = 4;
-const EP_RULES: u8 = 5;
-
-// ── Mutation types ──────────────────────────────────────────────────
-
-const MUT_BLOCK: u8 = 0;
-const MUT_ALLOW: u8 = 1;
-const MUT_FORWARD: u8 = 2;
-const MUT_UNFORWARD: u8 = 3;
-const MUT_DNS: u8 = 4;
-const MUT_TIMEZONE: u8 = 5;
-const MUT_FORWARD_LEASED: u8 = 6;
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -56,7 +29,7 @@ pub fn main(perm_view_addr: u64) void {
         handle = channel.findBroadcastHandle(perm_view_addr, .router) orelse 0;
         if (handle == 0) syscall.thread_yield();
     }
-    router_chan = (Channel.connectAsA(handle, .http_server, DEFAULT_SHM_SIZE) orelse return).chan;
+    router_chan = (Channel.connectAsA(handle, .http_server, DEFAULT_SHM_SIZE) catch return).chan;
 
     // Main loop
     while (true) {
@@ -74,7 +47,7 @@ pub fn main(perm_view_addr: u64) void {
 fn handleRouterMessage(data: []const u8) void {
     if (data.len < 1) return;
     switch (data[0]) {
-        MSG_HTTP_REQUEST => {
+        http_proto.RESP_HTTP_REQUEST => {
             handleHttpRequest(data[1..]);
         },
         else => {},
@@ -117,17 +90,17 @@ fn handleGet(path: []const u8) void {
     if (eql(path, "/") or eql(path, "/index.html")) {
         sendHttpResponse("200 OK", "text/html", HTML_PAGE);
     } else if (eql(path, "/api/status")) {
-        sendStateQueryResponse(EP_STATUS);
+        sendStateQueryResponse(http_proto.EP_STATUS);
     } else if (eql(path, "/api/ifstat")) {
-        sendStateQueryResponse(EP_IFSTAT);
+        sendStateQueryResponse(http_proto.EP_IFSTAT);
     } else if (eql(path, "/api/arp")) {
-        sendStateQueryResponse(EP_ARP);
+        sendStateQueryResponse(http_proto.EP_ARP);
     } else if (eql(path, "/api/nat")) {
-        sendStateQueryResponse(EP_NAT);
+        sendStateQueryResponse(http_proto.EP_NAT);
     } else if (eql(path, "/api/leases")) {
-        sendStateQueryResponse(EP_LEASES);
+        sendStateQueryResponse(http_proto.EP_LEASES);
     } else if (eql(path, "/api/rules")) {
-        sendStateQueryResponse(EP_RULES);
+        sendStateQueryResponse(http_proto.EP_RULES);
     } else if (eql(path, "/upnp/rootDesc.xml")) {
         sendHttpResponse("200 OK", "text/xml", UPNP_ROOT_DESC);
     } else if (eql(path, "/upnp/WANIPConn.xml")) {
@@ -138,13 +111,13 @@ fn handleGet(path: []const u8) void {
 }
 
 fn sendStateQueryResponse(endpoint: u8) void {
-    router_chan.sendMessage(.A, &[_]u8{ MSG_STATE_QUERY, endpoint }) catch {};
+    router_chan.sendMessage(.A, &[_]u8{ http_proto.CMD_STATE_QUERY, endpoint }) catch {};
 
     var buf: [8192]u8 = undefined;
     var attempts: u8 = 0;
     while (attempts < 10) : (attempts += 1) {
         if (router_chan.receiveMessage(.A, &buf) catch null) |len| {
-            if (len >= 1 and buf[0] == MSG_STATE_RESPONSE) {
+            if (len >= 1 and buf[0] == http_proto.RESP_STATE_RESPONSE) {
                 sendHttpResponse("200 OK", "application/json", buf[1..len]);
                 return;
             }
@@ -167,15 +140,15 @@ fn handlePost(path: []const u8, raw: []const u8) void {
     if (path.len > block_prefix.len and startsWith(path, block_prefix)) {
         const ip = parseIp(path[block_prefix.len..]) orelse return sendMutationError("invalid ip");
         var msg: [6]u8 = undefined;
-        msg[0] = MSG_MUTATION_REQUEST;
-        msg[1] = MUT_BLOCK;
+        msg[0] = http_proto.CMD_MUTATION_REQUEST;
+        msg[1] = http_proto.MUT_BLOCK;
         @memcpy(msg[2..6], &ip);
         sendMutationAndRespond(&msg);
     } else if (path.len > allow_prefix.len and startsWith(path, allow_prefix)) {
         const ip = parseIp(path[allow_prefix.len..]) orelse return sendMutationError("invalid ip");
         var msg: [6]u8 = undefined;
-        msg[0] = MSG_MUTATION_REQUEST;
-        msg[1] = MUT_ALLOW;
+        msg[0] = http_proto.CMD_MUTATION_REQUEST;
+        msg[1] = http_proto.MUT_ALLOW;
         @memcpy(msg[2..6], &ip);
         sendMutationAndRespond(&msg);
     } else if (path.len > forward_prefix.len and startsWith(path, forward_prefix)) {
@@ -185,8 +158,8 @@ fn handlePost(path: []const u8, raw: []const u8) void {
     } else if (path.len > dns_prefix.len and startsWith(path, dns_prefix)) {
         const ip = parseIp(path[dns_prefix.len..]) orelse return sendMutationError("invalid ip");
         var msg: [6]u8 = undefined;
-        msg[0] = MSG_MUTATION_REQUEST;
-        msg[1] = MUT_DNS;
+        msg[0] = http_proto.CMD_MUTATION_REQUEST;
+        msg[1] = http_proto.MUT_DNS;
         @memcpy(msg[2..6], &ip);
         sendMutationAndRespond(&msg);
     } else if (startsWith(path, "/api/timezone/")) {
@@ -231,10 +204,10 @@ fn handleAddForward(args: []const u8) void {
     // Parse lan_port
     const lport = parseU16(args[i..]) orelse return sendMutationError("invalid lan port");
 
-    // Build mutation: [MSG][MUT_FORWARD][proto:1][wan_port:2][lan_ip:4][lan_port:2]
+    // Build mutation: [MSG][http_proto.MUT_FORWARD][proto:1][wan_port:2][lan_ip:4][lan_port:2]
     var msg: [11]u8 = undefined;
-    msg[0] = MSG_MUTATION_REQUEST;
-    msg[1] = MUT_FORWARD;
+    msg[0] = http_proto.CMD_MUTATION_REQUEST;
+    msg[1] = http_proto.MUT_FORWARD;
     msg[2] = proto_byte;
     msg[3] = @intCast(wport.val >> 8);
     msg[4] = @intCast(wport.val & 0xff);
@@ -247,8 +220,8 @@ fn handleAddForward(args: []const u8) void {
 fn handleRemoveForward(args: []const u8) void {
     const wport = parseU16(args) orelse return sendMutationError("invalid port");
     var msg: [4]u8 = undefined;
-    msg[0] = MSG_MUTATION_REQUEST;
-    msg[1] = MUT_UNFORWARD;
+    msg[0] = http_proto.CMD_MUTATION_REQUEST;
+    msg[1] = http_proto.MUT_UNFORWARD;
     msg[2] = @intCast(wport.val >> 8);
     msg[3] = @intCast(wport.val & 0xff);
     sendMutationAndRespond(&msg);
@@ -276,8 +249,8 @@ fn handleSetTimezone(args: []const u8) void {
 
     const offset_bytes: [2]u8 = @bitCast(val);
     var msg: [4]u8 = undefined;
-    msg[0] = MSG_MUTATION_REQUEST;
-    msg[1] = MUT_TIMEZONE;
+    msg[0] = http_proto.CMD_MUTATION_REQUEST;
+    msg[1] = http_proto.MUT_TIMEZONE;
     msg[2] = offset_bytes[0];
     msg[3] = offset_bytes[1];
     sendMutationAndRespond(&msg);
@@ -290,7 +263,7 @@ fn sendMutationAndRespond(msg: []const u8) void {
     var attempts: u8 = 0;
     while (attempts < 10) : (attempts += 1) {
         if (router_chan.receiveMessage(.A, &buf) catch null) |len| {
-            if (len >= 1 and buf[0] == MSG_MUTATION_RESPONSE) {
+            if (len >= 1 and buf[0] == http_proto.RESP_MUTATION_RESPONSE) {
                 sendHttpResponse("200 OK", "application/json", buf[1..len]);
                 return;
             }
@@ -345,7 +318,7 @@ fn sendHttpResponse(status: []const u8, content_type: []const u8, body: []const 
 
     while (chunk_idx < total_chunks) : (chunk_idx += 1) {
         var msg: [1950]u8 = undefined;
-        msg[0] = MSG_HTTP_RESPONSE;
+        msg[0] = http_proto.CMD_HTTP_RESPONSE;
         msg[1] = chunk_idx;
         msg[2] = total_chunks;
         var p: usize = 3;
@@ -412,11 +385,11 @@ fn handleSoapAddPortMapping(raw: []const u8) void {
     };
     const lease = extractTagU32(raw, "NewLeaseDuration") orelse 0;
 
-    // Build MUT_FORWARD_LEASED message
+    // Build http_proto.MUT_FORWARD_LEASED message
     // Format: [MSG][MUT][proto:1][wan_port:2][lan_ip:4][lan_port:2][lease_secs:4][source:1]
     var msg: [16]u8 = undefined;
-    msg[0] = MSG_MUTATION_REQUEST;
-    msg[1] = MUT_FORWARD_LEASED;
+    msg[0] = http_proto.CMD_MUTATION_REQUEST;
+    msg[1] = http_proto.MUT_FORWARD_LEASED;
     msg[2] = proto_byte;
     msg[3] = @intCast(ext_port >> 8);
     msg[4] = @intCast(ext_port & 0xff);
@@ -436,7 +409,7 @@ fn handleSoapAddPortMapping(raw: []const u8) void {
     var attempts: u8 = 0;
     while (attempts < 10) : (attempts += 1) {
         if (router_chan.receiveMessage(.A, &buf) catch null) |len| {
-            if (len >= 1 and buf[0] == MSG_MUTATION_RESPONSE) {
+            if (len >= 1 and buf[0] == http_proto.RESP_MUTATION_RESPONSE) {
                 // Check if ok
                 if (containsStr(buf[1..len], "\"ok\":true")) {
                     sendSoapResponse("AddPortMappingResponse", "");
@@ -459,8 +432,8 @@ fn handleSoapDeletePortMapping(body: []const u8) void {
     _ = extractTagValue(body, "NewProtocol"); // Ignored — unforward tries both
 
     var msg: [4]u8 = undefined;
-    msg[0] = MSG_MUTATION_REQUEST;
-    msg[1] = MUT_UNFORWARD;
+    msg[0] = http_proto.CMD_MUTATION_REQUEST;
+    msg[1] = http_proto.MUT_UNFORWARD;
     msg[2] = @intCast(ext_port >> 8);
     msg[3] = @intCast(ext_port & 0xff);
     sendMutationAndRespond(&msg);
@@ -468,13 +441,13 @@ fn handleSoapDeletePortMapping(body: []const u8) void {
 
 fn handleSoapGetExternalIP() void {
     // Query router status to get WAN IP
-    router_chan.sendMessage(.A, &[_]u8{ MSG_STATE_QUERY, EP_STATUS }) catch {};
+    router_chan.sendMessage(.A, &[_]u8{ http_proto.CMD_STATE_QUERY, http_proto.EP_STATUS }) catch {};
 
     var buf: [8192]u8 = undefined;
     var attempts: u8 = 0;
     while (attempts < 10) : (attempts += 1) {
         if (router_chan.receiveMessage(.A, &buf) catch null) |len| {
-            if (len >= 1 and buf[0] == MSG_STATE_RESPONSE) {
+            if (len >= 1 and buf[0] == http_proto.RESP_STATE_RESPONSE) {
                 // Parse WAN IP from status JSON: {"wan":"x.x.x.x ..."}
                 const status = buf[1..len];
                 const ip_str = extractJsonWanIp(status);

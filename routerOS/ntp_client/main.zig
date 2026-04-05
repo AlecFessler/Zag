@@ -1,18 +1,13 @@
 const lib = @import("lib");
 
 const channel = lib.channel;
+const ntp_proto = lib.ntp;
 const pv = lib.perm_view;
 const syscall = lib.syscall;
+const text_cmd = lib.text_command;
+const udp_proxy = lib.udp_proxy;
 
 const Channel = channel.Channel;
-
-// ── UDP proxy message tags (must match router/udp_fwd.zig) ──────────
-
-const MSG_UDP_SEND: u8 = 0x01;
-const MSG_UDP_RECV: u8 = 0x02;
-const MSG_UDP_BIND: u8 = 0x03;
-const MSG_SET_TIMEZONE: u8 = 0x04;
-const MSG_TIME_SYNC: u8 = 0x11;
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -82,7 +77,7 @@ pub fn main(perm_view_addr: u64) void {
         handle = channel.findBroadcastHandle(perm_view_addr, .router) orelse 0;
         if (handle == 0) syscall.thread_yield();
     }
-    const conn = Channel.connectAsA(handle, .ntp_client, DEFAULT_SHM_SIZE) orelse return;
+    const conn = Channel.connectAsA(handle, .ntp_client, DEFAULT_SHM_SIZE) catch return;
     router_chan = conn.chan;
     addKnownShmHandle(conn.shm_handle);
 
@@ -102,14 +97,18 @@ pub fn main(perm_view_addr: u64) void {
         // Accept console connection (side B) via perm view polling
         if (console_chan == null) {
             if (pollNewShm(perm_view_addr)) |shm_handle| {
-                console_chan = Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE);
+                console_chan = Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE) catch null;
             }
         }
 
         if (console_chan) |chan| {
             var cmd_buf: [128]u8 = undefined;
-            if (chan.receiveMessage(.B, &cmd_buf) catch null) |len| {
-                handleCommand(cmd_buf[0..len]);
+            const srv = text_cmd.Server.init(chan);
+            if (srv.recvCommand(&cmd_buf)) |cmd| {
+                switch (cmd) {
+                    .text => |text| handleCommand(text),
+                    else => {},
+                }
             }
         }
 
@@ -121,7 +120,7 @@ pub fn main(perm_view_addr: u64) void {
 
 fn sendUdpBind(port: u16) void {
     var msg: [3]u8 = undefined;
-    msg[0] = MSG_UDP_BIND;
+    msg[0] = udp_proxy.CMD_UDP_BIND;
     msg[1] = @truncate(port >> 8);
     msg[2] = @truncate(port);
     router_chan.sendMessage(.A, &msg) catch {};
@@ -130,7 +129,7 @@ fn sendUdpBind(port: u16) void {
 fn sendTimeSync(unix_secs: u64, mono_ns: u64) void {
     // [0] = MSG_TIME_SYNC, [1..9] = unix_secs BE, [9..17] = mono_ns BE
     var msg: [17]u8 = undefined;
-    msg[0] = MSG_TIME_SYNC;
+    msg[0] = ntp_proto.CMD_TIME_SYNC;
     writeU64Be(msg[1..9], unix_secs);
     writeU64Be(msg[9..17], mono_ns);
     router_chan.sendMessage(.A, &msg) catch {};
@@ -151,7 +150,7 @@ fn sendUdpPacket(dst_ip: [4]u8, dst_port: u16, src_port: u16, payload: []const u
     var msg: [256]u8 = undefined;
     const total = 9 + payload.len;
     if (total > msg.len) return;
-    msg[0] = MSG_UDP_SEND;
+    msg[0] = udp_proxy.CMD_UDP_SEND;
     @memcpy(msg[1..5], &dst_ip);
     msg[5] = @truncate(dst_port >> 8);
     msg[6] = @truncate(dst_port);
@@ -215,9 +214,9 @@ fn handleNtpResponse(payload: []const u8) void {
 
 fn handleRouterMessage(data: []const u8) void {
     if (data.len < 1) return;
-    if (data[0] == MSG_UDP_RECV and data.len >= 9) {
+    if (data[0] == udp_proxy.RESP_UDP_RECV and data.len >= 9) {
         handleNtpResponse(data[9..]);
-    } else if (data[0] == MSG_SET_TIMEZONE and data.len >= 3) {
+    } else if (data[0] == ntp_proto.RESP_SET_TIMEZONE and data.len >= 3) {
         tz_offset_minutes = @bitCast([2]u8{ data[1], data[2] });
     }
 }
@@ -292,13 +291,15 @@ fn checkTimeout() void {
 
 fn sendConsole(msg: []const u8) void {
     if (console_chan) |chan| {
-        chan.sendMessage(.B, msg) catch {};
+        const srv = text_cmd.Server.init(chan);
+        srv.sendText(msg);
     }
 }
 
 fn sendEof() void {
     if (console_chan) |chan| {
-        chan.sendMessage(.B, &[_]u8{}) catch {};
+        const srv = text_cmd.Server.init(chan);
+        srv.sendEnd();
     }
 }
 
@@ -459,7 +460,7 @@ fn parseTzOffset(s: []const u8) ?i16 {
 // ── Utility ─────────────────────────────────────────────────────────
 
 fn now() u64 {
-    return @bitCast(syscall.clock_gettime());
+    return syscall.clock_gettime();
 }
 
 fn eql(a: []const u8, b: []const u8) bool {

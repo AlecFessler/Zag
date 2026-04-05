@@ -31,26 +31,24 @@ fn spawnChild(
     child_rights: perms.ProcessRights,
     device_handles: []const DeviceGrant,
 ) bool {
-    const proc_handle = syscall.proc_create(@intFromPtr(elf.ptr), elf.len, child_rights.bits());
-    if (proc_handle <= 0) {
+    const proc_handle = syscall.proc_create(@intFromPtr(elf.ptr), elf.len, child_rights.bits()) catch {
         syscall.write("root: proc_create failed for ");
         syscall.write(name);
         syscall.write("\n");
         return false;
-    }
+    };
 
     for (device_handles) |dg| {
-        const grant_rc = syscall.grant_perm(dg.handle, @intCast(proc_handle), dg.rights);
-        if (grant_rc != 0) {
+        syscall.grant_perm(dg.handle, proc_handle, dg.rights) catch {
             syscall.write("root: device grant failed for ");
             syscall.write(name);
             syscall.write("\n");
-        }
+        };
     }
 
     children[num_children] = .{
         .name = name,
-        .proc_handle = @intCast(proc_handle),
+        .proc_handle = proc_handle,
     };
     num_children += 1;
 
@@ -157,7 +155,10 @@ fn watchdogThread() void {
             last_restart_count = restart_count;
         }
 
-        _ = syscall.futex_wait(@ptrCast(&entry.field0), last_field0, std.math.maxInt(u64));
+        syscall.futex_wait(@ptrCast(&entry.field0), last_field0, std.math.maxInt(u64)) catch |err| switch (err) {
+            error.Timeout, error.Again => {},
+            else => syscall.write("watchdog: futex_wait failed\n"),
+        };
         last_field0 = @atomicLoad(u64, field0_ptr, .acquire);
     }
 }
@@ -227,7 +228,7 @@ pub fn main(perm_view_addr: u64) void {
     // Spawn watchdog threads for each child
     var wi: u32 = 0;
     while (wi < num_children) : (wi += 1) {
-        _ = syscall.thread_create(&watchdogThread, 0, 4);
+        _ = syscall.thread_create(&watchdogThread, 0, 4) catch 0;
     }
 
     while (true) syscall.thread_yield();
