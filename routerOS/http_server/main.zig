@@ -5,6 +5,7 @@ const http_proto = lib.http;
 const syscall = lib.syscall;
 
 const Channel = channel.Channel;
+const HttpClient = http_proto.Client;
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -14,6 +15,7 @@ const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 // ── State ───────────────────────────────────────────────────────────
 
 var router_chan: *Channel = undefined;
+var http_client: HttpClient = undefined;
 
 // ── Entry point ─────────────────────────────────────────────────────
 
@@ -30,27 +32,19 @@ pub fn main(perm_view_addr: u64) void {
         if (handle == 0) syscall.thread_yield();
     }
     router_chan = (Channel.connectAsA(handle, .http_server, DEFAULT_SHM_SIZE) catch return).chan;
+    http_client = HttpClient.init(router_chan);
 
     // Main loop
     while (true) {
         var router_buf: [8192]u8 = undefined;
-        if (router_chan.receiveMessage(.A, &router_buf) catch null) |len| {
-            handleRouterMessage(router_buf[0..len]);
+        if (http_client.recv(&router_buf)) |msg| {
+            switch (msg) {
+                .http_request => |data| handleHttpRequest(data),
+                .state_response, .mutation_response => {},
+            }
         } else {
-            router_chan.waitForMessage(.A, 10_000_000); // 10ms
+            http_client.waitForMessage(10_000_000); // 10ms
         }
-    }
-}
-
-// ── Message handling ────────────────────────────────────────────────
-
-fn handleRouterMessage(data: []const u8) void {
-    if (data.len < 1) return;
-    switch (data[0]) {
-        http_proto.RESP_HTTP_REQUEST => {
-            handleHttpRequest(data[1..]);
-        },
-        else => {},
     }
 }
 
@@ -111,18 +105,21 @@ fn handleGet(path: []const u8) void {
 }
 
 fn sendStateQueryResponse(endpoint: u8) void {
-    router_chan.sendMessage(.A, &[_]u8{ http_proto.CMD_STATE_QUERY, endpoint }) catch {};
+    http_client.sendStateQuery(endpoint);
 
     var buf: [8192]u8 = undefined;
     var attempts: u8 = 0;
     while (attempts < 10) : (attempts += 1) {
-        if (router_chan.receiveMessage(.A, &buf) catch null) |len| {
-            if (len >= 1 and buf[0] == http_proto.RESP_STATE_RESPONSE) {
-                sendHttpResponse("200 OK", "application/json", buf[1..len]);
-                return;
+        if (http_client.recv(&buf)) |msg| {
+            switch (msg) {
+                .state_response => |data| {
+                    sendHttpResponse("200 OK", "application/json", data);
+                    return;
+                },
+                else => {},
             }
         }
-        router_chan.waitForMessage(.A, 500_000_000); // 500ms
+        http_client.waitForMessage(500_000_000); // 500ms
     }
 
     sendHttpResponse("503 Service Unavailable", "text/plain", "State query timeout");
@@ -257,18 +254,21 @@ fn handleSetTimezone(args: []const u8) void {
 }
 
 fn sendMutationAndRespond(msg: []const u8) void {
-    router_chan.sendMessage(.A, msg) catch {};
+    http_client.sendMutationRequest(msg);
 
     var buf: [8192]u8 = undefined;
     var attempts: u8 = 0;
     while (attempts < 10) : (attempts += 1) {
-        if (router_chan.receiveMessage(.A, &buf) catch null) |len| {
-            if (len >= 1 and buf[0] == http_proto.RESP_MUTATION_RESPONSE) {
-                sendHttpResponse("200 OK", "application/json", buf[1..len]);
-                return;
+        if (http_client.recv(&buf)) |resp| {
+            switch (resp) {
+                .mutation_response => |data| {
+                    sendHttpResponse("200 OK", "application/json", data);
+                    return;
+                },
+                else => {},
             }
         }
-        router_chan.waitForMessage(.A, 500_000_000); // 500ms
+        http_client.waitForMessage(500_000_000); // 500ms
     }
 
     sendHttpResponse("503 Service Unavailable", "text/plain", "Mutation timeout");
@@ -402,24 +402,26 @@ fn handleSoapAddPortMapping(raw: []const u8) void {
     msg[14] = @intCast(lease & 0xff);
     msg[15] = 1; // source = upnp
 
-    router_chan.sendMessage(.A, &msg) catch {};
+    http_client.sendMutationRequest(&msg);
 
     // Wait for response
     var buf: [8192]u8 = undefined;
     var attempts: u8 = 0;
     while (attempts < 10) : (attempts += 1) {
-        if (router_chan.receiveMessage(.A, &buf) catch null) |len| {
-            if (len >= 1 and buf[0] == http_proto.RESP_MUTATION_RESPONSE) {
-                // Check if ok
-                if (containsStr(buf[1..len], "\"ok\":true")) {
-                    sendSoapResponse("AddPortMappingResponse", "");
-                } else {
-                    sendSoapFault("718", "ConflictInMappingEntry");
-                }
-                return;
+        if (http_client.recv(&buf)) |resp| {
+            switch (resp) {
+                .mutation_response => |data| {
+                    if (containsStr(data, "\"ok\":true")) {
+                        sendSoapResponse("AddPortMappingResponse", "");
+                    } else {
+                        sendSoapFault("718", "ConflictInMappingEntry");
+                    }
+                    return;
+                },
+                else => {},
             }
         }
-        router_chan.waitForMessage(.A, 500_000_000);
+        http_client.waitForMessage(500_000_000);
     }
     sendSoapFault("501", "Action Failed");
 }
@@ -441,26 +443,27 @@ fn handleSoapDeletePortMapping(body: []const u8) void {
 
 fn handleSoapGetExternalIP() void {
     // Query router status to get WAN IP
-    router_chan.sendMessage(.A, &[_]u8{ http_proto.CMD_STATE_QUERY, http_proto.EP_STATUS }) catch {};
+    http_client.sendStateQuery(http_proto.EP_STATUS);
 
     var buf: [8192]u8 = undefined;
     var attempts: u8 = 0;
     while (attempts < 10) : (attempts += 1) {
-        if (router_chan.receiveMessage(.A, &buf) catch null) |len| {
-            if (len >= 1 and buf[0] == http_proto.RESP_STATE_RESPONSE) {
-                // Parse WAN IP from status JSON: {"wan":"x.x.x.x ..."}
-                const status = buf[1..len];
-                const ip_str = extractJsonWanIp(status);
-                var resp_buf: [256]u8 = undefined;
-                var p: usize = 0;
-                p = appendSlice(&resp_buf, p, "<NewExternalIPAddress>");
-                p = appendSlice(&resp_buf, p, ip_str);
-                p = appendSlice(&resp_buf, p, "</NewExternalIPAddress>");
-                sendSoapResponse("GetExternalIPAddressResponse", resp_buf[0..p]);
-                return;
+        if (http_client.recv(&buf)) |resp| {
+            switch (resp) {
+                .state_response => |data| {
+                    const ip_str = extractJsonWanIp(data);
+                    var resp_buf: [256]u8 = undefined;
+                    var p: usize = 0;
+                    p = appendSlice(&resp_buf, p, "<NewExternalIPAddress>");
+                    p = appendSlice(&resp_buf, p, ip_str);
+                    p = appendSlice(&resp_buf, p, "</NewExternalIPAddress>");
+                    sendSoapResponse("GetExternalIPAddressResponse", resp_buf[0..p]);
+                    return;
+                },
+                else => {},
             }
         }
-        router_chan.waitForMessage(.A, 500_000_000);
+        http_client.waitForMessage(500_000_000);
     }
     sendSoapFault("501", "Action Failed");
 }
@@ -511,15 +514,7 @@ fn sendSoapFault(code: []const u8, desc: []const u8) void {
     sendHttpResponse("500 Internal Server Error", "text/xml; charset=\"utf-8\"", buf[0..p]);
 }
 
-fn findBody(raw: []const u8) ?[]const u8 {
-    var i: usize = 0;
-    while (i + 3 < raw.len) : (i += 1) {
-        if (raw[i] == '\r' and raw[i + 1] == '\n' and raw[i + 2] == '\r' and raw[i + 3] == '\n') {
-            return raw[i + 4 ..];
-        }
-    }
-    return null;
-}
+
 
 fn containsStr(haystack: []const u8, needle: []const u8) bool {
     if (haystack.len < needle.len) return false;

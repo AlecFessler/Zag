@@ -21,9 +21,7 @@ pub const TX_DESC_STA_DD = e1000.TX_DESC_STA_DD;
 // ── Register offsets ───────────────────────────────────────────────────
 pub const REG_CTRL = 0x00000000;
 pub const REG_STATUS = 0x00000008;
-pub const REG_CTRL_EXT = 0x00000018;
 pub const REG_EICR = 0x00000800;
-pub const REG_EIMS = 0x00000880;
 pub const REG_EIMC = 0x00000888;
 pub const REG_RXCTRL = 0x00003000;
 pub const REG_DMATXCTL = 0x00004A80;
@@ -59,7 +57,6 @@ pub const REG_MTA = 0x00005200;
 
 // ── Control register bits ──────────────────────────────────────────────
 const CTRL_RST = 1 << 26;
-const CTRL_LRST = 1 << 3;
 
 const EEC_AUTO_RD = 1 << 9;
 const EEMNGCTL_CFG_DONE0 = 1 << 18;

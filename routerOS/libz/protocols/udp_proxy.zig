@@ -23,12 +23,6 @@ pub const UdpPacket = struct {
     payload: []const u8,
 };
 
-pub const AppMessage = union(enum) {
-    udp_send: []const u8,
-    udp_bind: []const u8,
-    unknown: []const u8,
-};
-
 // ── Client (side A — NFS/NTP connecting to router) ──────────────────
 
 pub const Client = struct {
@@ -93,16 +87,6 @@ pub const Server = struct {
 
     pub fn init(chan: *Channel) Server {
         return .{ .chan = chan };
-    }
-
-    pub fn recvAppMessage(self: *const Server, buf: []u8) ?AppMessage {
-        const len = (self.chan.receiveMessage(.B, buf) catch return null) orelse return null;
-        if (len < 1) return null;
-        return switch (buf[0]) {
-            CMD_UDP_SEND => AppMessage{ .udp_send = buf[0..len] },
-            CMD_UDP_BIND => AppMessage{ .udp_bind = buf[0..len] },
-            else => AppMessage{ .unknown = buf[0..len] },
-        };
     }
 
     pub fn sendUdpRecv(self: *const Server, src_ip: [4]u8, src_port: u16, dst_port: u16, payload: []const u8) void {

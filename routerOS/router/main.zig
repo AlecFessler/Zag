@@ -35,6 +35,7 @@ const syscall = lib.syscall;
 const text_cmd = lib.text_command;
 
 const Channel = channel.Channel;
+const HttpServer = http_proto.Server;
 
 const MAX_PERMS = 128;
 const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
@@ -600,33 +601,24 @@ fn pollNewShm(view_addr: u64) ?u64 {
 }
 
 fn detectAppChannels(perm_view_addr_local: u64) void {
-    if (console_chan != null and nfs_chan != null and ntp_chan != null and http_chan != null) return;
     const shm_handle = pollNewShm(perm_view_addr_local) orelse return;
     const chan = Channel.connectAsB(shm_handle, 4 * syscall.PAGE4K) catch return;
     switch (chan.protocol_id) {
         @intFromEnum(lib.Protocol.nfs_client) => {
-            if (nfs_chan == null) {
-                nfs_chan = chan;
-                log.write(.nfs_connected);
-            }
+            nfs_chan = chan;
+            log.write(.nfs_connected);
         },
         @intFromEnum(lib.Protocol.ntp_client) => {
-            if (ntp_chan == null) {
-                ntp_chan = chan;
-                log.write(.ntp_connected);
-            }
+            ntp_chan = chan;
+            log.write(.ntp_connected);
         },
         @intFromEnum(lib.Protocol.http_server) => {
-            if (http_chan == null) {
-                http_chan = chan;
-                log.write(.http_connected);
-            }
+            http_chan = chan;
+            log.write(.http_connected);
         },
         @intFromEnum(lib.Protocol.console) => {
-            if (console_chan == null) {
-                console_chan = chan;
-                log.write(.console_connected);
-            }
+            console_chan = chan;
+            log.write(.console_connected);
         },
         else => {},
     }
@@ -1397,34 +1389,34 @@ fn serviceThread() void {
 
 fn handleHttpServerMessage(data: []const u8, chan: *Channel, buf: []u8) void {
     if (data.len < 1) return;
+    const srv = HttpServer.init(chan);
     switch (data[0]) {
         http_proto.CMD_STATE_QUERY => {
             if (data.len < 2) return;
-            handleStateQuery(data[1], chan, buf);
+            handleStateQuery(data[1], &srv, buf);
         },
         http_proto.CMD_HTTP_RESPONSE => {
             // Handled by chunked reassembly in service loop; should not reach here
         },
         http_proto.CMD_MUTATION_REQUEST => {
             if (data.len < 2) return;
-            handleMutationRequest(data[1..], chan, buf);
+            handleMutationRequest(data[1..], &srv, buf);
         },
         else => {},
     }
 }
 
-fn handleStateQuery(endpoint: u8, chan: *Channel, buf: []u8) void {
-    buf[0] = http_proto.RESP_STATE_RESPONSE;
+fn handleStateQuery(endpoint: u8, srv: *const HttpServer, buf: []u8) void {
     const json_len: usize = switch (endpoint) {
-        0 => tcp_stack.formatJsonStatus(buf[1..]),
-        1 => tcp_stack.formatJsonIfstat(buf[1..]),
-        2 => tcp_stack.formatJsonArp(buf[1..]),
-        3 => tcp_stack.formatJsonNat(buf[1..]),
-        4 => tcp_stack.formatJsonLeases(buf[1..]),
-        5 => tcp_stack.formatJsonRules(buf[1..]),
+        0 => tcp_stack.formatJsonStatus(buf),
+        1 => tcp_stack.formatJsonIfstat(buf),
+        2 => tcp_stack.formatJsonArp(buf),
+        3 => tcp_stack.formatJsonNat(buf),
+        4 => tcp_stack.formatJsonLeases(buf),
+        5 => tcp_stack.formatJsonRules(buf),
         else => 0,
     };
-    chan.sendMessage(.B,buf[0 .. 1 + json_len]) catch {};
+    srv.sendStateResponse(buf[0..json_len]);
 }
 
 /// Parse chunk 0 of MSG_HTTP_RESPONSE from http_server and send via TCP.
@@ -1481,7 +1473,7 @@ fn handleHttpResponseStreaming(data: []const u8, is_complete: bool) void {
 /// Handle a mutation request from http_server.
 /// Wire format: [mutation_type:1][params...]
 /// Mutation types: 0=block, 1=allow, 2=forward, 3=unforward, 4=dns
-fn handleMutationRequest(data: []const u8, chan: *Channel, buf: []u8) void {
+fn handleMutationRequest(data: []const u8, srv: *const HttpServer, _: []u8) void {
     if (data.len < 1) return;
     const mutation_type = data[0];
     const params = data[1..];
@@ -1497,10 +1489,7 @@ fn handleMutationRequest(data: []const u8, chan: *Channel, buf: []u8) void {
         else => "{\"ok\":false,\"error\":\"unknown mutation\"}",
     };
 
-    buf[0] = http_proto.RESP_MUTATION_RESPONSE;
-    const rlen = @min(result.len, buf.len - 1);
-    @memcpy(buf[1..][0..rlen], result[0..rlen]);
-    chan.sendMessage(.B,buf[0 .. 1 + rlen]) catch {};
+    srv.sendMutationResponse(result);
 }
 
 fn mutateBlock(params: []const u8) []const u8 {

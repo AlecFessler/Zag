@@ -8,6 +8,7 @@ const text_cmd = lib.text_command;
 const udp_proxy = lib.udp_proxy;
 
 const Channel = channel.Channel;
+const UdpClient = udp_proxy.Client;
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -21,6 +22,7 @@ const TIMEOUT_NS: u64 = 5_000_000_000;
 // ── State ───────────────────────────────────────────────────────────
 
 var router_chan: *Channel = undefined;
+var udp_client: UdpClient = undefined;
 var console_chan: ?*Channel = null;
 
 var ntp_server_ip: [4]u8 = .{ 10, 0, 2, 1 };
@@ -79,9 +81,10 @@ pub fn main(perm_view_addr: u64) void {
     }
     const conn = Channel.connectAsA(handle, .ntp_client, DEFAULT_SHM_SIZE) catch return;
     router_chan = conn.chan;
+    udp_client = UdpClient.init(router_chan);
     addKnownShmHandle(conn.shm_handle);
 
-    sendUdpBind(LOCAL_PORT);
+    udp_client.bindPort(LOCAL_PORT);
 
     // Auto-sync on startup
     sendNtpRequest();
@@ -95,9 +98,10 @@ pub fn main(perm_view_addr: u64) void {
         }
 
         // Accept console connection (side B) via perm view polling
-        if (console_chan == null) {
-            if (pollNewShm(perm_view_addr)) |shm_handle| {
-                console_chan = Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE) catch null;
+        // Always poll — after process reload, a new connection may arrive
+        if (pollNewShm(perm_view_addr)) |shm_handle| {
+            if (Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE) catch null) |chan| {
+                console_chan = chan;
             }
         }
 
@@ -117,14 +121,6 @@ pub fn main(perm_view_addr: u64) void {
 }
 
 // ── UDP helpers ─────────────────────────────────────────────────────
-
-fn sendUdpBind(port: u16) void {
-    var msg: [3]u8 = undefined;
-    msg[0] = udp_proxy.CMD_UDP_BIND;
-    msg[1] = @truncate(port >> 8);
-    msg[2] = @truncate(port);
-    router_chan.sendMessage(.A, &msg) catch {};
-}
 
 fn sendTimeSync(unix_secs: u64, mono_ns: u64) void {
     // [0] = MSG_TIME_SYNC, [1..9] = unix_secs BE, [9..17] = mono_ns BE
@@ -146,27 +142,13 @@ fn writeU64Be(buf: *[8]u8, val: u64) void {
     buf[7] = @truncate(val);
 }
 
-fn sendUdpPacket(dst_ip: [4]u8, dst_port: u16, src_port: u16, payload: []const u8) void {
-    var msg: [256]u8 = undefined;
-    const total = 9 + payload.len;
-    if (total > msg.len) return;
-    msg[0] = udp_proxy.CMD_UDP_SEND;
-    @memcpy(msg[1..5], &dst_ip);
-    msg[5] = @truncate(dst_port >> 8);
-    msg[6] = @truncate(dst_port);
-    msg[7] = @truncate(src_port >> 8);
-    msg[8] = @truncate(src_port);
-    @memcpy(msg[9..][0..payload.len], payload);
-    router_chan.sendMessage(.A, msg[0..total]) catch {};
-}
-
 // ── NTP protocol ────────────────────────────────────────────────────
 
 fn sendNtpRequest() void {
     var pkt: [48]u8 = .{0} ** 48;
     // LI=0 (no warning), VN=4 (NTPv4), Mode=3 (client)
     pkt[0] = 0x23;
-    sendUdpPacket(ntp_server_ip, NTP_PORT, LOCAL_PORT, &pkt);
+    udp_client.sendUdp(ntp_server_ip, NTP_PORT, LOCAL_PORT, &pkt);
     sync_pending = true;
     send_time_ns = now();
 }

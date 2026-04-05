@@ -12,12 +12,6 @@ const PAGE = syscall.PAGE4K;
 // ── Layout constants ────────────────────────────────────────────────────
 // All offsets in bytes from the start of the SHM region.
 
-const RX_DESCS_SIZE = @sizeOf(e1000.RxDesc) * e1000.NUM_RX_DESC; // 512
-const TX_DESCS_SIZE = @sizeOf(e1000.TxDesc) * e1000.NUM_TX_DESC; // 512
-const RX_BUFS_SIZE = e1000.NUM_RX_DESC * e1000.PACKET_BUF_SIZE; // 64KB
-pub const LOCAL_TX_COUNT = e1000.NUM_TX_DESC; // must match TX ring size
-const LOCAL_TX_SIZE = LOCAL_TX_COUNT * e1000.PACKET_BUF_SIZE; // 64KB
-
 // Page-aligned offsets
 pub const WAN_RX_DESCS_OFF: u64 = 0; // page 0
 pub const WAN_TX_DESCS_OFF: u64 = 1 * PAGE; // page 1
@@ -64,10 +58,6 @@ pub const DmaRegion = struct {
     pub fn lanRxBufVirt(self: DmaRegion, idx: u32) [*]u8 {
         return @ptrFromInt(self.virt_base + LAN_RX_BUFS_OFF + @as(u64, idx) * e1000.PACKET_BUF_SIZE);
     }
-    pub fn localTxBufVirt(self: DmaRegion, idx: u32) [*]u8 {
-        return @ptrFromInt(self.virt_base + LOCAL_TX_BUFS_OFF + @as(u64, idx) * e1000.PACKET_BUF_SIZE);
-    }
-
     // DMA addresses for WAN device
     pub fn wanDma(self: DmaRegion, offset: u64) u64 {
         return self.wan_dma_base + offset;
@@ -123,11 +113,6 @@ pub fn setup(wan_device_handle: u64, lan_device_handle: u64) ?DmaRegion {
         .lan_dma_base = lan_dma_base,
         .shm_handle = shm_handle,
     };
-}
-
-/// Setup for single-NIC configuration (WAN only, no LAN).
-pub fn setupSingle(wan_device_handle: u64) ?DmaRegion {
-    return setupWan(wan_device_handle, null);
 }
 
 /// Setup WAN DMA, optionally also mapping LAN device.

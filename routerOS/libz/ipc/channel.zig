@@ -44,11 +44,14 @@ pub fn broadcast(protocol_id: u8) !void {
 pub fn findBroadcastHandle(view_addr: u64, protocol: lib.Protocol) ?u64 {
     const table_vaddr = findBroadcastTableVaddr(view_addr) orelse return null;
     const entries: *const [BROADCAST_TABLE_CAPACITY]BroadcastEntry = @ptrFromInt(table_vaddr);
+    // Return the last match — after process reload, a new entry is appended
+    // while the stale entry for the old (dead) process remains.
+    var result: ?u64 = null;
     for (entries) |entry| {
         if (entry.handle == 0) break;
-        if (@as(u8, @truncate(entry.payload)) == @intFromEnum(protocol)) return entry.handle;
+        if (@as(u8, @truncate(entry.payload)) == @intFromEnum(protocol)) result = entry.handle;
     }
-    return null;
+    return result;
 }
 
 fn findBroadcastTableVaddr(view_addr: u64) ?u64 {

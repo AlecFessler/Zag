@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """
-Dead code detector for the Zag kernel.
+Dead code detector for Zag.
 
-Parses all kernel .zig files (excluding tests/) for definitions:
+Usage: python3 dead_code.py [target_dir]
+
+  target_dir  Directory to scan for definitions (default: kernel)
+              Relative to repo root, e.g. "routerOS" or "kernel"
+
+Parses all .zig files (excluding tests/) for definitions:
   - functions (pub fn / fn)
   - structs, enums, unions (const Name = struct/enum/union)
   - constants (const NAME = ...)
@@ -23,12 +28,18 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-KERNEL_DIR = REPO_ROOT / "kernel"
 
-# Files to scan for definitions (kernel source, excluding tests)
-KERNEL_SRC_FILES = sorted(
-    p for p in KERNEL_DIR.rglob("*.zig")
-    if "tests" not in p.relative_to(KERNEL_DIR).parts
+target_name = sys.argv[1] if len(sys.argv) > 1 else "kernel"
+TARGET_DIR = REPO_ROOT / target_name
+if not TARGET_DIR.is_dir():
+    print(f"Error: {TARGET_DIR} is not a directory", file=sys.stderr)
+    sys.exit(1)
+
+# Files to scan for definitions (excluding tests and build cache)
+SRC_FILES = sorted(
+    p for p in TARGET_DIR.rglob("*.zig")
+    if "tests" not in p.relative_to(TARGET_DIR).parts
+    and ".zig-cache" not in p.relative_to(TARGET_DIR).parts
 )
 
 # Directories to search for references (entire repo)
@@ -234,8 +245,8 @@ def parse_file(filepath: Path) -> list[Definition]:
 def main():
     all_defs: dict[Path, list[Definition]] = {}
 
-    print(f"Scanning {len(KERNEL_SRC_FILES)} kernel source files...")
-    for f in KERNEL_SRC_FILES:
+    print(f"Scanning {len(SRC_FILES)} source files in {target_name}/...")
+    for f in SRC_FILES:
         defs = parse_file(f)
         if defs:
             all_defs[f] = defs

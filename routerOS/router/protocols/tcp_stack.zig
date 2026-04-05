@@ -6,15 +6,9 @@ const http_proto = lib.http;
 const main = router.state;
 const util = router.util;
 
-pub const HTTP_PORT: u16 = 80;
+const HttpServer = http_proto.Server;
 
-// ── Message tags (sourced from lib.http protocol module) ────────────
-pub const MSG_HTTP_REQUEST: u8 = http_proto.RESP_HTTP_REQUEST;
-pub const MSG_HTTP_RESPONSE: u8 = http_proto.CMD_HTTP_RESPONSE;
-pub const MSG_STATE_QUERY: u8 = http_proto.CMD_STATE_QUERY;
-pub const MSG_STATE_RESPONSE: u8 = http_proto.RESP_STATE_RESPONSE;
-pub const MSG_MUTATION_REQUEST: u8 = http_proto.CMD_MUTATION_REQUEST;
-pub const MSG_MUTATION_RESPONSE: u8 = http_proto.RESP_MUTATION_RESPONSE;
+pub const HTTP_PORT: u16 = 80;
 
 // Simple single-connection TCP state machine for HTTP/1.0
 const TcpState = enum { closed, syn_received, established, fin_wait };
@@ -166,16 +160,13 @@ fn parseContentLength(headers: []const u8) ?usize {
 /// Forward the complete HTTP request to the http_server process via IPC.
 fn forwardToHttpServer() void {
     const chan = main.http_chan orelse return;
-    var msg: [2049]u8 = undefined;
-    msg[0] = MSG_HTTP_REQUEST;
-    const len = @min(request_len, msg.len - 1);
-    @memcpy(msg[1..][0..len], request_buf[0..len]);
-    chan.sendMessage(.B, msg[0 .. 1 + len]) catch {};
+    const srv = HttpServer.init(chan);
+    srv.sendHttpRequest(request_buf[0..request_len]);
     request_len = 0;
 }
 
 /// Send an HTTP response as TCP data. Called by router/main.zig when
-/// MSG_HTTP_RESPONSE is received back from the http_server process.
+/// CMD_HTTP_RESPONSE is received back from the http_server process.
 pub fn sendHttpResponse(header: []const u8, body: []const u8) void {
     sendTcpData(header, body);
 }

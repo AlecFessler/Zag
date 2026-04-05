@@ -13,6 +13,7 @@ const text_cmd = lib.text_command;
 const udp_proxy = lib.udp_proxy;
 
 const Channel = channel.Channel;
+const UdpClient = udp_proxy.Client;
 
 // ── Configuration ───────────────────────────────────────────────────
 
@@ -44,12 +45,14 @@ const State = enum {
     commit_pending,
 };
 
-const RequestSource = enum { console, router };
+const RequestSource = enum { console, router, root_service };
 
 // ── NFS Client state ────────────────────────────────────────────────
 
 var router_chan: *Channel = undefined;
+var udp_client: UdpClient = undefined;
 var console_chan: ?*Channel = null;
+var root_chan: ?*Channel = null;
 var perm_view_global: u64 = 0;
 
 var state: State = .idle;
@@ -99,6 +102,7 @@ const LOG_ROTATE_SIZE: u64 = 256 * 1024; // 256 KB
 var retry_buf: [2048]u8 = undefined;
 var retry_len: usize = 0;
 
+
 // ── Known SHM tracking ──────────────────────────────────────────────
 var known_shm_handles: [32]u64 = .{0} ** 32;
 var known_shm_count: u8 = 0;
@@ -145,6 +149,7 @@ pub fn main(perm_view_addr: u64) void {
                 continue;
             };
             router_chan = conn.chan;
+            udp_client = UdpClient.init(router_chan);
             addKnownShmHandle(conn.shm_handle);
             break;
         }
@@ -157,7 +162,7 @@ pub fn main(perm_view_addr: u64) void {
     if (next_xid == 0) next_xid = 1;
 
     // Bind our UDP port via the router
-    sendUdpBind(nfs3.LOCAL_PORT);
+    udp_client.bindPort(nfs3.LOCAL_PORT);
 
     // Auto-mount
     sendMountRequest();
@@ -172,10 +177,17 @@ pub fn main(perm_view_addr: u64) void {
             router_chan.waitForMessage(.A, 10_000_000); // 10ms
         }
 
-        // Accept console connection (side B)
-        if (console_chan == null) {
+        // Accept new SHM connections (side B) — dispatch by protocol_id
+        if (console_chan == null or root_chan == null) {
             if (pollNewShm(perm_view_global)) |shm_handle| {
-                console_chan = Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE) catch null;
+                if (Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE) catch null) |chan| {
+                    switch (@as(lib.Protocol, @enumFromInt(chan.protocol_id))) {
+                        .root_service => root_chan = chan,
+                        else => if (console_chan == null) {
+                            console_chan = chan;
+                        },
+                    }
+                }
             }
         }
 
@@ -186,6 +198,19 @@ pub fn main(perm_view_addr: u64) void {
             if (srv.recvCommand(&cmd_buf)) |cmd| {
                 switch (cmd) {
                     .text => |text| handleCommand(text, .console),
+                    .data => |data| handleWriteData(data),
+                    .data_end => handleWriteDataEnd(),
+                }
+            }
+        }
+
+        // Check root service commands
+        if (root_chan) |chan| {
+            var cmd_buf: [256]u8 = undefined;
+            const srv = text_cmd.Server.init(chan);
+            if (srv.recvCommand(&cmd_buf)) |cmd| {
+                switch (cmd) {
+                    .text => |text| handleCommand(text, .root_service),
                     .data => |data| handleWriteData(data),
                     .data_end => handleWriteDataEnd(),
                 }
@@ -240,30 +265,19 @@ fn processLogQueue() void {
 
 // ── UDP send helpers ────────────────────────────────────────────────
 
-fn sendUdpBind(port: u16) void {
-    var msg: [3]u8 = undefined;
-    msg[0] = udp_proxy.CMD_UDP_BIND;
-    msg[1] = @truncate(port >> 8);
-    msg[2] = @truncate(port);
-    router_chan.sendMessage(.A, &msg) catch {};
-}
-
 fn sendUdpPacket(dst_ip: [4]u8, dst_port: u16, src_port: u16, payload: []const u8) void {
-    var msg: [2048]u8 = undefined;
-    const total = 9 + payload.len;
-    if (total > msg.len) return;
-    msg[0] = udp_proxy.CMD_UDP_SEND;
-    @memcpy(msg[1..5], &dst_ip);
-    msg[5] = @truncate(dst_port >> 8);
-    msg[6] = @truncate(dst_port);
-    msg[7] = @truncate(src_port >> 8);
-    msg[8] = @truncate(src_port);
-    @memcpy(msg[9..][0..payload.len], payload);
-    router_chan.sendMessage(.A, msg[0..total]) catch {};
+    udp_client.sendUdp(dst_ip, dst_port, src_port, payload);
 
-    // Save for retries
+    // Save for retries (reconstruct wire format into retry_buf)
+    const total = 9 + payload.len;
     if (total <= retry_buf.len) {
-        @memcpy(retry_buf[0..total], msg[0..total]);
+        retry_buf[0] = udp_proxy.CMD_UDP_SEND;
+        @memcpy(retry_buf[1..5], &dst_ip);
+        retry_buf[5] = @truncate(dst_port >> 8);
+        retry_buf[6] = @truncate(dst_port);
+        retry_buf[7] = @truncate(src_port >> 8);
+        retry_buf[8] = @truncate(src_port);
+        @memcpy(retry_buf[9..][0..payload.len], payload);
         retry_len = total;
     }
     send_time_ns = now();
@@ -695,8 +709,6 @@ fn continueAfterLookup() void {
 
 // ── Command handling ────────────────────────────────────────────────
 
-const CmdOp = enum { cat, ls, put, mkdir_cmd, rm, stat_cmd, mount_cmd };
-
 fn handleWriteData(data: []const u8) void {
     if (!awaiting_write_data) return;
     sendWrite(&write_fh, write_offset, data);
@@ -725,9 +737,14 @@ fn handleCommand(data: []const u8, source: RequestSource) void {
     }
 
     if (state != .mounted and state != .idle) {
-        sendResponse("NFS: busy\n");
-        sendEof();
-        return;
+        if (isLogOp()) {
+            // Preempt background log I/O so the user command can proceed
+            state = .mounted;
+        } else {
+            sendResponse("NFS: busy\n");
+            sendEof();
+            return;
+        }
     }
 
     if (startsWith(cmd, "mount")) {
@@ -773,6 +790,10 @@ fn handleCommand(data: []const u8, source: RequestSource) void {
 
 // Operation tracking for lookup chains
 var pending_op: enum { read, readdir, create, mkdir_op, remove, rmdir_op, rename_src, rename_dst, stat_op, touch_op, log_mkdir, log_create, log_write } = .read;
+
+fn isLogOp() bool {
+    return pending_op == .log_mkdir or pending_op == .log_create or pending_op == .log_write;
+}
 
 fn startLookupChainForOp(path: []const u8, op: @TypeOf(pending_op)) void {
     pending_op = op;
@@ -937,9 +958,12 @@ fn sendResponse(msg: []const u8) void {
                 text_cmd.Server.init(chan).sendText(msg);
             }
         },
-        .router => {
-            // TODO: FILE_DATA response to router
+        .root_service => {
+            if (root_chan) |chan| {
+                text_cmd.Server.init(chan).sendText(msg);
+            }
         },
+        .router => {},
     }
 }
 
@@ -951,6 +975,11 @@ fn sendEof() void {
     switch (request_source) {
         .console => {
             if (console_chan) |chan| {
+                text_cmd.Server.init(chan).sendEnd();
+            }
+        },
+        .root_service => {
+            if (root_chan) |chan| {
                 text_cmd.Server.init(chan).sendEnd();
             }
         },
@@ -978,7 +1007,7 @@ fn checkTimeout() void {
     // Retry: resend the last UDP packet
     syscall.write("nfs_client: retrying...\n");
     if (retry_len > 0) {
-        router_chan.sendMessage(.A, retry_buf[0..retry_len]) catch {};
+        udp_client.sendRaw(retry_buf[0..retry_len]);
         send_time_ns = now();
     }
 }

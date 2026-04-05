@@ -145,46 +145,6 @@ pub const Iface = struct {
     // Design follows libz/channel.zig RingHeader pattern.
     pending_tx: [2]PendingTxRing = .{ .{}, .{} },
 
-    // ── Initialization ──────────────────────────────────────────────────
-
-    pub fn initWan(region: *dma.DmaRegion) Iface {
-        return .{
-            .role = .wan,
-            .mmio_base = 0,
-            .mac = .{ 0, 0, 0, 0, 0, 0 },
-            .ip = .{ 10, 0, 2, 15 },
-            .dma_base = region.wan_dma_base,
-            .dma_region = region,
-            .rx_descs = region.wanRxDescs(),
-            .tx_descs = region.wanTxDescs(),
-            .rx_tail = nic.NUM_RX_DESC - 1,
-            .tx_tail = 0,
-            .rx_buf_state = .{.free} ** nic.NUM_RX_DESC,
-            .rx_buf_tx_idx = .{0} ** nic.NUM_RX_DESC,
-            .arp_table = .{arp.empty} ** arp.TABLE_SIZE,
-            .stats = .{},
-        };
-    }
-
-    pub fn initLan(region: *dma.DmaRegion) Iface {
-        return .{
-            .role = .lan,
-            .mmio_base = 0,
-            .mac = .{ 0, 0, 0, 0, 0, 0 },
-            .ip = .{ 10, 1, 1, 1 },
-            .dma_base = region.lan_dma_base,
-            .dma_region = region,
-            .rx_descs = region.lanRxDescs(),
-            .tx_descs = region.lanTxDescs(),
-            .rx_tail = nic.NUM_RX_DESC - 1,
-            .tx_tail = 0,
-            .rx_buf_state = .{.free} ** nic.NUM_RX_DESC,
-            .rx_buf_tx_idx = .{0} ** nic.NUM_RX_DESC,
-            .arp_table = .{arp.empty} ** arp.TABLE_SIZE,
-            .stats = .{},
-        };
-    }
-
     // ── RX ──────────────────────────────────────────────────────────────
 
     /// Poll for a received packet. Returns the buffer index and length.

@@ -6,17 +6,11 @@ const util = router.util;
 
 pub const SSDP_PORT: u16 = 1900;
 
-const SSDP_MCAST_IP: [4]u8 = .{ 239, 255, 255, 250 };
-
 // UPnP device/service type URNs
 const WANIP_SERVICE = "urn:schemas-upnp-org:service:WANIPConnection:1";
 const ROOT_DEVICE = "upnp:rootdevice";
 const IGD_DEVICE = "urn:schemas-upnp-org:device:InternetGatewayDevice:1";
 const UUID = "uuid:zag-router-1";
-
-// XML descriptors (served via HTTP, also used in SSDP location)
-pub const ROOT_DESC_XML = @embedFile("rootDesc.xml");
-pub const WANIP_CONN_XML = @embedFile("WANIPConn.xml");
 
 pub fn handleSsdp(pkt: []u8, len: u32) void {
     const ip = h.Ipv4Header.parseMut(pkt[14..]) orelse return;

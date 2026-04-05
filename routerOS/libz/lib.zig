@@ -11,6 +11,7 @@ pub const testing = @import("test.zig");
 pub const http = @import("protocols/http.zig");
 pub const nfs = @import("protocols/nfs.zig");
 pub const ntp = @import("protocols/ntp.zig");
+pub const reload = @import("protocols/reload.zig");
 pub const serial = @import("protocols/serial.zig");
 pub const text_command = @import("protocols/text_command.zig");
 pub const udp_proxy = @import("protocols/udp_proxy.zig");

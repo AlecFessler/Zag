@@ -90,10 +90,6 @@ pub fn portFwdLookup(forwards: *[PORT_FWD_SIZE]PortForward, proto: util.Protocol
     return null;
 }
 
-pub fn portFwdAdd(forwards: *[PORT_FWD_SIZE]PortForward, proto: util.Protocol, wan_port: u16, lip: [4]u8, lport: u16) bool {
-    return portFwdAddLeased(forwards, proto, wan_port, lip, lport, 0, .manual);
-}
-
 pub fn portFwdAddLeased(forwards: *[PORT_FWD_SIZE]PortForward, proto: util.Protocol, wan_port: u16, lip: [4]u8, lport: u16, expiry_ns: u64, source: PortFwdSource) bool {
     for (forwards) |*f| {
         if (!f.valid) {

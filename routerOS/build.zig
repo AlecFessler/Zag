@@ -143,4 +143,18 @@ pub fn build(b: *std.Build) void {
     exe.setLinkerScript(b.path("linker.ld"));
     const install = b.addInstallFile(exe.getEmittedBin(), "../bin/routerOS.elf");
     b.getInstallStep().dependOn(&install.step);
+
+    // Install individual child ELFs for NFS-based reload
+    const child_bins = .{
+        .{ serial_driver_bin, "../bin/children/serial_driver.elf" },
+        .{ router_bin, "../bin/children/router.elf" },
+        .{ console_bin, "../bin/children/console.elf" },
+        .{ nfs_client_bin, "../bin/children/nfs_client.elf" },
+        .{ ntp_client_bin, "../bin/children/ntp_client.elf" },
+        .{ http_server_bin, "../bin/children/http_server.elf" },
+    };
+    inline for (child_bins) |entry| {
+        const child_install = b.addInstallFile(entry[0], entry[1]);
+        b.getInstallStep().dependOn(&child_install.step);
+    }
 }

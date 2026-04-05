@@ -128,17 +128,6 @@ pub const Server = struct {
         self.chan.sendMessage(.B, msg[0..total]) catch {};
     }
 
-    pub fn recvClientMessage(self: *const Server, buf: []u8) ?ClientMessage {
-        const len = (self.chan.receiveMessage(.B, buf) catch return null) orelse return null;
-        if (len < 1) return null;
-        return switch (buf[0]) {
-            CMD_HTTP_RESPONSE => ClientMessage{ .http_response = buf[0..len] },
-            CMD_STATE_QUERY => ClientMessage{ .state_query = buf[0..len] },
-            CMD_MUTATION_REQUEST => ClientMessage{ .mutation_request = buf[0..len] },
-            else => null,
-        };
-    }
-
     pub fn waitForMessage(self: *const Server, timeout_ns: u64) void {
         self.chan.waitForMessage(.B, timeout_ns);
     }
