@@ -16,22 +16,16 @@ pub const RestartContext = struct {
 pub fn create(
     entry: VAddr,
     data_vaddr: VAddr,
-    data_content: []const u8,
+    data_ghost: []u8,
 ) !*RestartContext {
     const rc = try memory_init.heap_allocator.create(RestartContext);
-    errdefer memory_init.heap_allocator.destroy(rc);
-
-    const ghost: []u8 = if (data_content.len > 0)
-        try memory_init.heap_allocator.dupe(u8, data_content)
-    else
-        &.{};
 
     rc.* = .{
         .entry_point = entry,
         .data_segment = .{
             .vaddr = data_vaddr,
-            .size = data_content.len,
-            .ghost = ghost,
+            .size = data_ghost.len,
+            .ghost = data_ghost,
         },
     };
     return rc;

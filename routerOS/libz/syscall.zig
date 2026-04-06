@@ -281,8 +281,3 @@ pub fn broadcast_syscall(payload: u64) SystemError!void {
     const rc = syscall1(.broadcast, payload);
     if (rc < 0) return mapError(rc);
 }
-
-/// Stub — the kernel handles PCI bus master enabling during device init.
-pub fn pci_enable_bus_master(device_handle: Handle) void {
-    _ = device_handle;
-}

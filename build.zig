@@ -39,7 +39,13 @@ const profiles = struct {
         .iommu = "intel",
         .display = "gtk",
     };
-
+    const routerfh = Profile{
+        .root_service = "routerOS_fh/bin/root_service.elf",
+        .net = "none",
+        .kvm = true,
+        .use_llvm = true,
+        .iommu = "intel",
+    };
 };
 
 fn getProfile(name: []const u8) ?Profile {
@@ -47,6 +53,7 @@ fn getProfile(name: []const u8) ?Profile {
     if (std.mem.eql(u8, name, "test")) return profiles.test_;
     if (std.mem.eql(u8, name, "bench")) return profiles.bench;
     if (std.mem.eql(u8, name, "desktop")) return profiles.desktop;
+    if (std.mem.eql(u8, name, "routerfh")) return profiles.routerfh;
 
     return null;
 }
@@ -190,27 +197,24 @@ pub fn build(b: *std.Build) void {
         \\-no-shutdown \
         \\-D qemu.log
     ;
-    const qemu_machine_args: []const u8 = 
+    const qemu_machine_args: []const u8 =
         \\-machine q35
     ;
     const qemu_iommu_args: []const u8 = if (std.mem.eql(u8, iommu_type, "intel"))
         "-device intel-iommu,intremap=off"
     else
-        "-device amd-iommu"
-    ;
+        "-device amd-iommu";
     const qemu_usb_args: []const u8 = if (profile_name != null and std.mem.eql(u8, profile_name.?, "desktop"))
         \\-device qemu-xhci,id=xhci \
         \\-device usb-kbd,bus=xhci.0 \
         \\-device usb-mouse,bus=xhci.0
     else
-        ""
-    ;
+        "";
     const qemu_nvme_args: []const u8 = if (profile_name != null and std.mem.eql(u8, profile_name.?, "desktop"))
         \\-drive file=nvme.img,format=raw,if=none,id=nvme0 \
         \\-device nvme,drive=nvme0,serial=zagdisk0
     else
-        ""
-    ;
+        "";
     const qemu_net_args: []const u8 = if (std.mem.eql(u8, net_type, "tap"))
         \\-netdev tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=off \
         \\-device e1000e,netdev=net0,mac=52:54:00:12:34:56 \

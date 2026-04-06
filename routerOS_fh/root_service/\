@@ -1,0 +1,18 @@
+const lib = @import("lib");
+
+const syscall = lib.syscall;
+
+pub fn main(perm_view_addr: u64) void {
+    _ = perm_view_addr; // Avoid unused parameter warning
+    syscall.write("Hello, World!\n") catch {};
+
+    // we could have restarted, check the perms view for existing shm handles
+
+    // enumerate devices in perms view, specifically we want
+    // - the nic
+    // - the nvme ssd
+
+    // spawn child processes
+
+    // setup shared memory for hot reloads of child processes then enter loop
+}

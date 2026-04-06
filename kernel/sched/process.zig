@@ -505,9 +505,11 @@ pub const Process = struct {
             proc.restart_context = try restart_context_mod.create(
                 elf_result.entry,
                 elf_result.data_vaddr,
-                elf_result.data_content,
+                elf_result.data_ghost,
             );
             errdefer restart_context_mod.destroy(proc.restart_context.?);
+        } else if (elf_result.data_ghost.len > 0) {
+            memory_init.heap_allocator.free(elf_result.data_ghost);
         }
 
         _ = try thread_mod.Thread.create(proc, elf_result.entry, proc.perm_view_vaddr.addr, DEFAULT_STACK_PAGES);
@@ -573,7 +575,7 @@ fn generateAslrBase() u64 {
 const ElfLoadResult = struct {
     entry: VAddr,
     data_vaddr: VAddr,
-    data_content: []const u8,
+    data_ghost: []u8,
 };
 
 fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResult {
@@ -687,22 +689,23 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
         );
     }
 
+    const data_ghost: []u8 = if (data_filesz > 0) blk: {
+        const ghost = try memory_init.heap_allocator.alloc(u8, data_filesz);
+        @memcpy(ghost, elf_binary[data_offset..][0..data_filesz]);
+        break :blk ghost;
+    } else &[_]u8{};
+
     if (rela_info) |rela| {
-        try applyRelocations(proc, aslr_base, elf_binary, rela.offset, rela.size);
+        try applyRelocations(proc, aslr_base, elf_binary, rela.offset, rela.size, data_ghost, if (data_filesz > 0) data_vaddr.addr - aslr_base else 0);
     }
 
     const final_end = if (has_bss and bss_end > page_end) bss_end else page_end;
     proc.vmm.bump(VAddr.fromInt(final_end));
 
-    const data_content: []const u8 = if (data_filesz > 0)
-        elf_binary[data_offset..][0..data_filesz]
-    else
-        &[_]u8{};
-
     return .{
         .entry = VAddr.fromInt(aslr_base + ehdr.e_entry),
         .data_vaddr = data_vaddr,
-        .data_content = data_content,
+        .data_ghost = data_ghost,
     };
 }
 
@@ -745,7 +748,7 @@ fn findRelaSection(elf_binary: []const u8, ehdr: *align(1) const elf.Elf64_Ehdr)
     return null;
 }
 
-fn applyRelocations(proc: *Process, aslr_base: u64, elf_binary: []const u8, rela_offset: u64, rela_size: u64) !void {
+fn applyRelocations(proc: *Process, aslr_base: u64, elf_binary: []const u8, rela_offset: u64, rela_size: u64, data_ghost: []u8, data_seg_vaddr: u64) !void {
     const entry_size = @sizeOf(elf.Elf64_Rela);
     const num_entries = rela_size / entry_size;
 
@@ -766,6 +769,13 @@ fn applyRelocations(proc: *Process, aslr_base: u64, elf_binary: []const u8, rela
         const physmap_addr = VAddr.fromPAddr(paddr, null).addr + (target_vaddr - page_base);
         const ptr: *u64 = @ptrFromInt(physmap_addr);
         ptr.* = value;
+
+        if (data_ghost.len > 0) {
+            const ghost_offset = rela.r_offset -% data_seg_vaddr;
+            if (ghost_offset + 8 <= data_ghost.len) {
+                @as(*align(1) u64, @ptrCast(data_ghost.ptr + ghost_offset)).* = value;
+            }
+        }
     }
 }
 
