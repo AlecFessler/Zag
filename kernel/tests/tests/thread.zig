@@ -7,7 +7,7 @@ const t = lib.testing;
 var thread_ran: u64 align(8) = 0;
 
 fn threadEntry() void {
-    @as(*volatile u64, &thread_ran).* = 1;
+    thread_ran = 1;
     _ = syscall.futex_wake(&thread_ran, 1);
     syscall.thread_exit();
 }
@@ -23,13 +23,13 @@ pub fn run() void {
 }
 
 fn testThreadCreate() void {
-    @as(*volatile u64, &thread_ran).* = 0;
+    thread_ran = 0;
     const rc = syscall.thread_create(&threadEntry, 0, 4);
     if (rc != 0) {
         t.failWithVal("thread_create failed", 0, rc);
         return;
     }
-    t.waitUntilNonZero(@as(*volatile u64, &thread_ran));
+    t.waitUntilNonZero(&thread_ran);
     t.pass("S2.4: thread_create enqueues new thread; child ran");
 }
 

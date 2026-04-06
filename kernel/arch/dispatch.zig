@@ -6,9 +6,11 @@ const aarch64 = zag.arch.aarch64;
 const x64 = zag.arch.x64;
 
 const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
+const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
+const SharedMemory = zag.memory.shared.SharedMemory;
 const Thread = zag.sched.thread.Thread;
 const Timer = zag.arch.timer.Timer;
 const VAddr = zag.memory.address.VAddr;
@@ -297,6 +299,38 @@ pub fn print(
     switch (builtin.cpu.arch) {
         .x86_64 => x64.serial.print(format, args),
         .aarch64 => aarch64.serial.print(format, args),
+        else => unreachable,
+    }
+}
+
+pub fn isDmaRemapAvailable() bool {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.iommu.isAvailable(),
+        .aarch64 => false,
+        else => unreachable,
+    };
+}
+
+pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.iommu.mapDmaPages(device, shm),
+        .aarch64 => @panic("unimplemented"),
+        else => unreachable,
+    };
+}
+
+pub fn unmapDmaPages(device: *DeviceRegion, dma_base: u64, num_pages: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.iommu.unmapDmaPages(device, dma_base, num_pages),
+        .aarch64 => @panic("unimplemented"),
+        else => unreachable,
+    }
+}
+
+pub fn enableDmaRemapping() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.iommu.enableTranslation(),
+        .aarch64 => @panic("unimplemented"),
         else => unreachable,
     }
 }

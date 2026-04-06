@@ -1,28 +1,67 @@
 const lib = @import("lib");
 
-const channel_mod = lib.channel;
-const perms = lib.perms;
+const channel = lib.channel;
 const pv = lib.perm_view;
-const shm_protocol = lib.shm_protocol;
+const reload_proto = lib.reload;
 const syscall = lib.syscall;
+const text_cmd = lib.text_command;
 
+const Channel = channel.Channel;
+
+const DEFAULT_SHM_SIZE = 4 * syscall.PAGE4K;
+const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 const MAX_PERMS = 128;
 
-var serial_chan: channel_mod.Channel = undefined;
-var router_chan: channel_mod.Channel = undefined;
-var nfs_chan: channel_mod.Channel = undefined;
-var ntp_chan: channel_mod.Channel = undefined;
+var serial_chan: *Channel = undefined;
+var router_chan: *Channel = undefined;
+var nfs_chan: *Channel = undefined;
+var ntp_chan: *Channel = undefined;
+var root_chan: *Channel = undefined;
 var has_router: bool = false;
 var has_nfs: bool = false;
 var has_ntp: bool = false;
+var has_root: bool = false;
+var perm_view_global: u64 = 0;
+
+// ── Known SHM tracking ──────────────────────────────────────────────
+var known_shm_handles: [32]u64 = .{0} ** 32;
+var known_shm_count: u8 = 0;
+
+fn addKnownShmHandle(handle: u64) void {
+    if (known_shm_count < 32) {
+        known_shm_handles[known_shm_count] = handle;
+        known_shm_count += 1;
+    }
+}
+
+fn pollNewShm(view_addr: u64) ?u64 {
+    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(view_addr);
+    for (view) |*entry| {
+        if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY) {
+            var known = false;
+            for (known_shm_handles[0..known_shm_count]) |h| {
+                if (h == entry.handle) {
+                    known = true;
+                    break;
+                }
+            }
+            if (!known and known_shm_count < 32) {
+                known_shm_handles[known_shm_count] = entry.handle;
+                known_shm_count += 1;
+                return entry.handle;
+            }
+        }
+    }
+    return null;
+}
 
 fn serialWrite(data: []const u8) void {
-    _ = serial_chan.send(data);
+    serial_chan.sendMessage(.A, data) catch {};
 }
 
 fn serialWriteByte(byte: u8) void {
     const buf = [_]u8{byte};
-    _ = serial_chan.send(&buf);
+    serial_chan.sendMessage(.A, &buf) catch {};
 }
 
 fn eql(a: []const u8, b: []const u8) bool {
@@ -84,10 +123,12 @@ fn processCommand(line: []const u8) void {
         serialWrite("  sync                     - sync time via NTP\r\n");
         serialWrite("  ntpserver <ip>           - set NTP server\r\n");
         serialWrite("  timezone <offset>        - set timezone (e.g. -6, +5:30)\r\n");
+        serialWrite("System commands:\r\n");
+        serialWrite("  reload <name>            - reload process from NFS\r\n");
     } else if (eql(line, "version")) {
         serialWrite("Zag RouterOS v0.1\r\n");
     } else if (eql(line, "uptime")) {
-        const ns: u64 = @bitCast(syscall.clock_gettime());
+        const ns: u64 = syscall.clock_gettime();
         const secs = ns / 1_000_000_000;
         const mins = secs / 60;
         const hrs = mins / 60;
@@ -165,6 +206,8 @@ fn processCommand(line: []const u8) void {
         ntpMultiResponse(line);
     } else if (startsWith(line, "timezone ")) {
         ntpMultiResponse(line);
+    } else if (startsWith(line, "reload ")) {
+        reloadCommand(line);
     } else {
         serialWrite("unknown command: ");
         serialWrite(line);
@@ -177,16 +220,26 @@ fn routerCommand(cmd: []const u8) void {
         serialWrite("router: not connected\r\n");
         return;
     }
-    _ = router_chan.send(cmd);
+    const client = text_cmd.Client.init(router_chan);
+    client.sendCommand(cmd);
     var resp: [512]u8 = undefined;
     var attempts: u8 = 0;
     while (attempts < 20) : (attempts += 1) {
-        if (router_chan.recv(&resp)) |len| {
-            serialWrite(resp[0..len]);
-            serialWrite("\r\n");
-            return;
+        if (client.recv(&resp)) |msg| {
+            switch (msg) {
+                .text => |text| {
+                    serialWrite(text);
+                    serialWrite("\r\n");
+                    // Drain the RESP_END
+                    var drain: [4]u8 = undefined;
+                    _ = client.recv(&drain);
+                    return;
+                },
+                .end => return,
+                else => return,
+            }
         }
-        router_chan.rx.waitForData(50_000_000); // 50ms
+        client.waitForMessage(50_000_000);
     }
     serialWrite("router: no response\r\n");
 }
@@ -196,29 +249,46 @@ fn routerMultiResponse(cmd: []const u8) void {
         serialWrite("router: not connected\r\n");
         return;
     }
-    _ = router_chan.send(cmd);
+    const client = text_cmd.Client.init(router_chan);
+    client.sendCommand(cmd);
     var resp: [512]u8 = undefined;
     var msg_count: u32 = 0;
     var done = false;
+    var retries: u32 = 0;
     while (!done and msg_count < 40) {
-        if (router_chan.recv(&resp)) |len| {
-            serialWrite(resp[0..len]);
-            serialWrite("\r\n");
-            msg_count += 1;
-            if (len >= 3 and resp[0] == '-' and resp[1] == '-' and resp[2] == '-') {
-                done = true;
+        if (client.recv(&resp)) |msg| {
+            switch (msg) {
+                .text => |text| {
+                    serialWrite(text);
+                    serialWrite("\r\n");
+                    msg_count += 1;
+                },
+                .end => {
+                    done = true;
+                },
+                else => {
+                    done = true;
+                },
             }
         } else {
-            router_chan.rx.waitForData(50_000_000); // 50ms
-            if (router_chan.recv(&resp)) |len| {
-                serialWrite(resp[0..len]);
-                serialWrite("\r\n");
-                msg_count += 1;
-                if (len >= 3 and resp[0] == '-' and resp[1] == '-' and resp[2] == '-') {
-                    done = true;
+            client.waitForMessage(500_000_000); // 500ms
+            if (client.recv(&resp)) |msg| {
+                switch (msg) {
+                    .text => |text| {
+                        serialWrite(text);
+                        serialWrite("\r\n");
+                        msg_count += 1;
+                    },
+                    .end => {
+                        done = true;
+                    },
+                    else => {
+                        done = true;
+                    },
                 }
             } else {
-                done = true; // timed out, no more data
+                retries += 1;
+                if (retries >= 12) done = true; // 6s total
             }
         }
     }
@@ -232,44 +302,61 @@ fn nfsMultiResponse(cmd: []const u8) void {
         serialWrite("nfs: not connected\r\n");
         return;
     }
-    // Drain any stale messages (e.g. auto-mount response) before sending new command
+    const client = text_cmd.Client.init(nfs_chan);
+    // Drain stale messages
     {
         var stale_buf: [2048]u8 = undefined;
-        while (nfs_chan.recv(&stale_buf) != null) {}
+        while (client.recv(&stale_buf) != null) {}
     }
-    _ = nfs_chan.send(cmd);
+    client.sendCommand(cmd);
     var resp: [2048]u8 = undefined;
     var msg_count: u32 = 0;
     var done = false;
+    var retries: u32 = 0;
     while (!done and msg_count < 64) {
-        if (nfs_chan.recv(&resp)) |len| {
-            if (len == 0) {
-                done = true;
-                continue;
-            }
-            if (len > 0 and resp[0] == 0xFF) {
-                serialWrite(resp[1..len]);
-                serialWrite("\r\n");
-            } else {
-                serialWrite(resp[0..len]);
-            }
-            msg_count += 1;
-        } else {
-            nfs_chan.rx.waitForData(50_000_000); // 50ms
-            if (nfs_chan.recv(&resp)) |len| {
-                if (len == 0) {
+        if (client.recv(&resp)) |msg| {
+            switch (msg) {
+                .text => |text| {
+                    serialWrite(text);
+                    msg_count += 1;
+                },
+                .end => {
                     done = true;
-                    continue;
-                }
-                if (len > 0 and resp[0] == 0xFF) {
-                    serialWrite(resp[1..len]);
+                },
+                .err => |text| {
+                    serialWrite(text);
                     serialWrite("\r\n");
-                } else {
-                    serialWrite(resp[0..len]);
+                    msg_count += 1;
+                },
+                .ack => |text| {
+                    serialWrite(text);
+                    msg_count += 1;
+                },
+            }
+        } else {
+            client.waitForMessage(500_000_000); // 500ms
+            if (client.recv(&resp)) |msg| {
+                switch (msg) {
+                    .text => |text| {
+                        serialWrite(text);
+                        msg_count += 1;
+                    },
+                    .end => {
+                        done = true;
+                    },
+                    .err => |text| {
+                        serialWrite(text);
+                        serialWrite("\r\n");
+                        msg_count += 1;
+                    },
+                    .ack => |text| {
+                        serialWrite(text);
+                        msg_count += 1;
+                    },
                 }
-                msg_count += 1;
             } else {
-                done = true;
+                retries += 1;
+                if (retries >= 12) done = true; // 6s total
             }
         }
     }
@@ -283,20 +370,30 @@ fn nfsPut(cmd: []const u8) void {
         serialWrite("nfs: not connected\r\n");
         return;
     }
-    // Send the put command to NFS client
-    _ = nfs_chan.send(cmd);
+    const client = text_cmd.Client.init(nfs_chan);
+    client.sendCommand(cmd);
 
-    // Wait for the "OK: send data" response
+    // Wait for the ack response
     var resp: [256]u8 = undefined;
     var got_ack = false;
     var attempts: u32 = 0;
-    while (attempts < 500_000) : (attempts += 1) {
-        if (nfs_chan.recv(&resp)) |len| {
-            serialWrite(resp[0..len]);
-            got_ack = true;
+    while (attempts < 50) : (attempts += 1) {
+        if (client.recv(&resp)) |msg| {
+            switch (msg) {
+                .ack => |text| {
+                    serialWrite(text);
+                    got_ack = true;
+                },
+                .err => |text| {
+                    serialWrite(text);
+                    serialWrite("\r\n");
+                    return;
+                },
+                else => {},
+            }
             break;
         }
-        syscall.thread_yield();
+        client.waitForMessage(100_000_000); // 100ms
     }
     if (!got_ack) {
         serialWrite("nfs: no response\r\n");
@@ -310,18 +407,19 @@ fn nfsPut(cmd: []const u8) void {
     var rx_buf: [64]u8 = undefined;
 
     while (true) {
-        if (serial_chan.recv(&rx_buf)) |len| {
+        if (serial_chan.receiveMessage(.A, &rx_buf) catch null) |len_u64| {
+            const len: usize = @intCast(len_u64);
             for (rx_buf[0..len]) |byte| {
                 if (byte == '\r' or byte == '\n') {
                     serialWrite("\r\n");
                     if (line_len == 0) {
-                        // Empty line = done, send empty to NFS client
-                        _ = nfs_chan.send(&[_]u8{});
+                        // Empty line = done
+                        client.sendDataEnd();
                         // Wait for commit response
                         nfsWaitResponse();
                         return;
                     }
-                    _ = nfs_chan.send(line_buf[0..line_len]);
+                    client.sendData(line_buf[0..line_len]);
                     line_len = 0;
                 } else if (byte == 127 or byte == 8) {
                     if (line_len > 0) {
@@ -339,55 +437,6 @@ fn nfsPut(cmd: []const u8) void {
     }
 }
 
-fn autoLoadConfig() void {
-    // Quick check: send NFS status query and see if we get a response
-    _ = nfs_chan.send("status");
-    var resp: [256]u8 = undefined;
-    var nfs_alive = false;
-    var attempts: u32 = 0;
-    while (attempts < 20_000) : (attempts += 1) {
-        if (nfs_chan.recv(&resp)) |_| {
-            nfs_alive = true;
-            break;
-        }
-        syscall.thread_yield();
-    }
-
-    if (!nfs_alive) {
-        syscall.write("console: NFS not ready, skipping config load\n");
-        return;
-    }
-
-    // NFS client is alive — try mount
-    _ = nfs_chan.send("mount");
-    var mounted = false;
-    attempts = 0;
-    while (attempts < 50_000) : (attempts += 1) {
-        if (nfs_chan.recv(&resp)) |len| {
-            if (len == 0) {
-                mounted = true;
-                break;
-            }
-            if (len >= 5) {
-                if (containsStr(resp[0..len], "mounted") or containsStr(resp[0..len], "OK")) {
-                    mounted = true;
-                }
-            }
-            break;
-        }
-        syscall.thread_yield();
-    }
-    drainNfs();
-
-    if (!mounted) {
-        syscall.write("console: NFS mount failed, skipping config load\n");
-        return;
-    }
-
-    syscall.write("console: loading config from NFS\n");
-    loadConfig();
-}
-
 fn containsStr(haystack: []const u8, needle: []const u8) bool {
     if (haystack.len < needle.len) return false;
     var i: usize = 0;
@@ -398,14 +447,19 @@ fn containsStr(haystack: []const u8, needle: []const u8) bool {
 }
 
 fn drainNfs() void {
+    const client = text_cmd.Client.init(nfs_chan);
     var buf: [2048]u8 = undefined;
     var attempts: u32 = 0;
-    while (attempts < 10_000) : (attempts += 1) {
-        if (nfs_chan.recv(&buf)) |len| {
-            if (len == 0) return; // EOF
-            attempts = 0; // Reset on data
+    while (attempts < 20) : (attempts += 1) {
+        if (client.recv(&buf)) |msg| {
+            switch (msg) {
+                .end => return,
+                else => {
+                    attempts = 0; // Reset on data
+                },
+            }
         }
-        syscall.thread_yield();
+        client.waitForMessage(50_000_000); // 50ms
     }
 }
 
@@ -416,7 +470,8 @@ fn saveConfig() void {
     }
 
     // Get config lines from router
-    _ = router_chan.send("get-config");
+    const rclient = text_cmd.Client.init(router_chan);
+    rclient.sendCommand("get-config");
     var lines: [64][256]u8 = undefined;
     var line_lens: [64]usize = .{0} ** 64;
     var count: usize = 0;
@@ -424,21 +479,27 @@ fn saveConfig() void {
     var done = false;
     while (!done and count < 64) {
         var attempts: u32 = 0;
-        while (attempts < 100_000) : (attempts += 1) {
+        while (attempts < 100) : (attempts += 1) {
             var resp: [256]u8 = undefined;
-            if (router_chan.recv(&resp)) |len| {
-                if (len >= 3 and resp[0] == '-' and resp[1] == '-' and resp[2] == '-') {
-                    done = true;
-                } else if (len > 0) {
-                    @memcpy(lines[count][0..len], resp[0..len]);
-                    line_lens[count] = len;
-                    count += 1;
+            if (rclient.recv(&resp)) |msg| {
+                switch (msg) {
+                    .text => |text| {
+                        @memcpy(lines[count][0..text.len], text);
+                        line_lens[count] = text.len;
+                        count += 1;
+                    },
+                    .end => {
+                        done = true;
+                    },
+                    else => {
+                        done = true;
+                    },
                 }
                 break;
             }
-            syscall.thread_yield();
+            rclient.waitForMessage(50_000_000); // 50ms
         }
-        if (attempts >= 100_000) done = true;
+        if (attempts >= 100) done = true;
     }
 
     if (count == 0) {
@@ -447,18 +508,24 @@ fn saveConfig() void {
     }
 
     // Write to NFS: put router.cfg
-    _ = nfs_chan.send("put router.cfg");
+    const nclient = text_cmd.Client.init(nfs_chan);
+    nclient.sendCommand("put router.cfg");
 
     // Wait for ack
     var ack_buf: [256]u8 = undefined;
     var got_ack = false;
     var ack_attempts: u32 = 0;
-    while (ack_attempts < 500_000) : (ack_attempts += 1) {
-        if (nfs_chan.recv(&ack_buf)) |_| {
-            got_ack = true;
+    while (ack_attempts < 50) : (ack_attempts += 1) {
+        if (nclient.recv(&ack_buf)) |msg| {
+            switch (msg) {
+                .ack => {
+                    got_ack = true;
+                },
+                else => {},
+            }
             break;
         }
-        syscall.thread_yield();
+        nclient.waitForMessage(100_000_000); // 100ms
     }
     if (!got_ack) {
         serialWrite("save-config: NFS not responding\r\n");
@@ -467,18 +534,11 @@ fn saveConfig() void {
 
     // Send each config line
     for (0..count) |i| {
-        _ = nfs_chan.send(lines[i][0..line_lens[i]]);
-        // NFS put only takes one data message then commits on empty
-        // But our NFS client sends one WRITE per data message
-        // Wait briefly for the write to complete
-        var wait: u32 = 0;
-        while (wait < 50_000) : (wait += 1) {
-            syscall.thread_yield();
-        }
+        nclient.sendData(lines[i][0..line_lens[i]]);
     }
 
-    // Empty line = EOF/commit
-    _ = nfs_chan.send(&[_]u8{});
+    // Commit
+    nclient.sendDataEnd();
     nfsWaitResponse();
     serialWrite("save-config: OK\r\n");
 }
@@ -490,7 +550,8 @@ fn loadConfig() void {
     }
 
     // Read config from NFS
-    _ = nfs_chan.send("cat router.cfg");
+    const nclient = text_cmd.Client.init(nfs_chan);
+    nclient.sendCommand("cat router.cfg");
     var resp: [2048]u8 = undefined;
     var config_data: [4096]u8 = undefined;
     var config_len: usize = 0;
@@ -498,24 +559,29 @@ fn loadConfig() void {
     var done = false;
     while (!done) {
         var attempts: u32 = 0;
-        while (attempts < 500_000) : (attempts += 1) {
-            if (nfs_chan.recv(&resp)) |len| {
-                if (len == 0) {
-                    done = true;
-                } else if (len > 0 and resp[0] == 0xFF) {
-                    // Error — file not found
-                    serialWrite("load-config: no config file\r\n");
-                    return;
-                } else {
-                    const copy_len = @min(len, config_data.len - config_len);
-                    @memcpy(config_data[config_len..][0..copy_len], resp[0..copy_len]);
-                    config_len += copy_len;
+        while (attempts < 50) : (attempts += 1) {
+            if (nclient.recv(&resp)) |msg| {
+                switch (msg) {
+                    .text => |text| {
+                        const copy_len = @min(text.len, config_data.len - config_len);
+                        @memcpy(config_data[config_len..][0..copy_len], text[0..copy_len]);
+                        config_len += copy_len;
+                    },
+                    .end => {
+                        done = true;
+                    },
+                    .err => {
+                        // Error -- file not found
+                        serialWrite("load-config: no config file\r\n");
+                        return;
+                    },
+                    else => {},
                 }
                 break;
             }
-            syscall.thread_yield();
+            nclient.waitForMessage(100_000_000); // 100ms
         }
-        if (attempts >= 500_000) done = true;
+        if (attempts >= 50) done = true;
     }
 
     if (config_len == 0) {
@@ -524,6 +590,7 @@ fn loadConfig() void {
     }
 
     // Parse lines and send each as a router command
+    const rclient = text_cmd.Client.init(router_chan);
     var applied: u32 = 0;
     var start: usize = 0;
     for (0..config_len) |i| {
@@ -533,13 +600,13 @@ fn loadConfig() void {
             if (end > start) {
                 const line = config_data[start..end];
                 // Send to router as a command
-                _ = router_chan.send(line);
+                rclient.sendCommand(line);
                 // Wait for response (discard it)
                 var r_resp: [512]u8 = undefined;
                 var r_attempts: u32 = 0;
-                while (r_attempts < 50_000) : (r_attempts += 1) {
-                    if (router_chan.recv(&r_resp)) |_| break;
-                    syscall.thread_yield();
+                while (r_attempts < 50) : (r_attempts += 1) {
+                    if (rclient.recv(&r_resp)) |_| break;
+                    rclient.waitForMessage(50_000_000); // 50ms
                 }
                 applied += 1;
             }
@@ -570,15 +637,29 @@ fn loadConfig() void {
 }
 
 fn nfsWaitResponse() void {
+    const client = text_cmd.Client.init(nfs_chan);
     var resp: [256]u8 = undefined;
     var attempts: u32 = 0;
-    while (attempts < 500_000) : (attempts += 1) {
-        if (nfs_chan.recv(&resp)) |len| {
-            if (len == 0) return; // EOF
-            serialWrite(resp[0..len]);
-            return;
+    while (attempts < 50) : (attempts += 1) {
+        if (client.recv(&resp)) |msg| {
+            switch (msg) {
+                .end => return,
+                .text => |text| {
+                    serialWrite(text);
+                    return;
+                },
+                .err => |text| {
+                    serialWrite(text);
+                    serialWrite("\r\n");
+                    return;
+                },
+                .ack => |text| {
+                    serialWrite(text);
+                    return;
+                },
+            }
         }
-        syscall.thread_yield();
+        client.waitForMessage(100_000_000); // 100ms
     }
 }
 
@@ -587,39 +668,158 @@ fn ntpMultiResponse(cmd: []const u8) void {
         serialWrite("ntp: not connected\r\n");
         return;
     }
-    // Drain any stale messages (e.g. auto-sync response) before sending new command
+    const client = text_cmd.Client.init(ntp_chan);
+    // Drain stale
     {
         var stale_buf: [256]u8 = undefined;
-        while (ntp_chan.recv(&stale_buf) != null) {}
+        while (client.recv(&stale_buf) != null) {}
     }
-    _ = ntp_chan.send(cmd);
+    client.sendCommand(cmd);
     var resp: [256]u8 = undefined;
     var msg_count: u32 = 0;
     var done = false;
+    var retries: u32 = 0;
     while (!done and msg_count < 8) {
-        if (ntp_chan.recv(&resp)) |len| {
-            if (len == 0) {
-                done = true;
-                continue;
-            }
-            serialWrite(resp[0..len]);
-            msg_count += 1;
-        } else {
-            ntp_chan.rx.waitForData(50_000_000); // 50ms
-            if (ntp_chan.recv(&resp)) |len| {
-                if (len == 0) {
+        if (client.recv(&resp)) |msg| {
+            switch (msg) {
+                .text => |text| {
+                    serialWrite(text);
+                    msg_count += 1;
+                },
+                .end => {
                     done = true;
-                    continue;
+                },
+                else => {
+                    done = true;
+                },
+            }
+        } else {
+            client.waitForMessage(500_000_000); // 500ms
+            if (client.recv(&resp)) |msg| {
+                switch (msg) {
+                    .text => |text| {
+                        serialWrite(text);
+                        msg_count += 1;
+                    },
+                    .end => {
+                        done = true;
+                    },
+                    else => {
+                        done = true;
+                    },
                 }
-                serialWrite(resp[0..len]);
-                msg_count += 1;
             } else {
-                done = true;
+                retries += 1;
+                if (retries >= 12) done = true; // 6s total
             }
         }
     }
     if (msg_count == 0) {
         serialWrite("ntp: no response\r\n");
+    }
+}
+
+fn reloadCommand(line: []const u8) void {
+    if (!has_root) {
+        serialWrite("reload: root service not connected\r\n");
+        return;
+    }
+    const name = blk: {
+        var rest = line;
+        if (rest.len > 7) {
+            rest = rest[7..];
+            while (rest.len > 0 and rest[0] == ' ') rest = rest[1..];
+            if (rest.len > 0) break :blk rest;
+        }
+        serialWrite("usage: reload <name>\r\n");
+        return;
+    };
+
+    const client = reload_proto.Client.init(root_chan);
+    client.sendReload(name);
+
+    var resp: [256]u8 = undefined;
+    var done = false;
+    var attempts: u32 = 0;
+    while (!done and attempts < 200) : (attempts += 1) {
+        if (client.recv(&resp)) |msg| {
+            switch (msg) {
+                .status => |text| {
+                    serialWrite(text);
+                    serialWrite("\r\n");
+                    attempts = 0;
+                },
+                .ok => {
+                    serialWrite("reload: OK\r\n");
+                    done = true;
+                },
+                .err => |text| {
+                    serialWrite("reload: error: ");
+                    serialWrite(text);
+                    serialWrite("\r\n");
+                    done = true;
+                },
+            }
+        } else {
+            client.waitForMessage(100_000_000);
+        }
+    }
+
+    if (!done) {
+        serialWrite("reload: timeout\r\n");
+        return;
+    }
+
+    reconnectService(name);
+}
+
+fn reconnectService(name: []const u8) void {
+    if (eql(name, "router")) {
+        reconnectBroadcast(.router);
+        if (has_router) serialWrite("reconnected to router\r\n");
+    } else if (eql(name, "nfs_client")) {
+        reconnectBroadcast(.nfs_client);
+        if (has_nfs) serialWrite("reconnected to nfs_client\r\n");
+    } else if (eql(name, "ntp_client")) {
+        reconnectBroadcast(.ntp_client);
+        if (has_ntp) serialWrite("reconnected to ntp_client\r\n");
+    } else if (eql(name, "http_server")) {
+        reconnectBroadcast(.http_server);
+    }
+}
+
+fn reconnectBroadcast(protocol: lib.Protocol) void {
+    // Get the current (stale) handle so we can wait for a new one
+    const old_handle = channel.findBroadcastHandle(perm_view_global, protocol) orelse 0;
+
+    var handle: u64 = 0;
+    var retries: u32 = 0;
+    while (retries < 50000) : (retries += 1) {
+        handle = channel.findBroadcastHandle(perm_view_global, protocol) orelse 0;
+        if (handle != 0 and handle != old_handle) break;
+        handle = 0;
+        syscall.thread_yield();
+    }
+    // Fallback to whatever handle is available
+    if (handle == 0) {
+        handle = channel.findBroadcastHandle(perm_view_global, protocol) orelse return;
+    }
+
+    const conn = Channel.connectAsA(handle, .console, DEFAULT_SHM_SIZE) catch return;
+    switch (protocol) {
+        .router => {
+            router_chan = conn.chan;
+            has_router = true;
+        },
+        .nfs_client => {
+            nfs_chan = conn.chan;
+            has_nfs = true;
+        },
+        .ntp_client => {
+            ntp_chan = conn.chan;
+            has_ntp = true;
+        },
+        else => {},
     }
 }
 
@@ -649,110 +849,90 @@ fn printDecSerial(val: u64) void {
     serialWrite(buf[i..20]);
 }
 
-var mapped_handles: [16]u64 = .{0} ** 16;
-var num_mapped: u32 = 0;
-
-fn isHandleMapped(handle: u64) bool {
-    for (mapped_handles[0..num_mapped]) |h| {
-        if (h == handle) return true;
-    }
-    return false;
-}
-
-fn recordMapped(handle: u64) void {
-    if (num_mapped < mapped_handles.len) {
-        mapped_handles[num_mapped] = handle;
-        num_mapped += 1;
-    }
-}
-
-fn mapNextDataShm(perm_view_addr: u64) ?*channel_mod.ChannelHeader {
-    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
-    for (view) |*entry| {
-        if (entry.entry_type != pv.ENTRY_TYPE_SHARED_MEMORY) continue;
-        if (entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) continue;
-        if (isHandleMapped(entry.handle)) continue;
-        const vm_rights = (perms.VmReservationRights{
-            .read = true,
-            .write = true,
-            .shareable = true,
-        }).bits();
-        const vm = syscall.vm_reserve(0, entry.field0, vm_rights);
-        if (vm.val < 0) continue;
-        if (syscall.shm_map(entry.handle, @intCast(vm.val), 0) != 0) continue;
-        recordMapped(entry.handle);
-        return @ptrFromInt(vm.val2);
-    }
-    return null;
-}
-
-fn waitAndMapNextShm(perm_view_addr: u64) *channel_mod.ChannelHeader {
-    while (true) {
-        if (mapNextDataShm(perm_view_addr)) |header| return header;
-        syscall.thread_yield();
-    }
-}
-
 pub fn main(perm_view_addr: u64) void {
-    const cmd = shm_protocol.mapCommandChannel(perm_view_addr) orelse return;
+    perm_view_global = perm_view_addr;
 
-    // Record command SHM handle so we skip it
+    // Serial is required -- poll until found
+    var serial_handle: u64 = 0;
+    while (serial_handle == 0) {
+        serial_handle = channel.findBroadcastHandle(perm_view_addr, .serial) orelse 0;
+        if (serial_handle == 0) syscall.thread_yield();
+    }
     {
-        const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
-        for (view) |*entry| {
-            if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) {
-                recordMapped(entry.handle);
-                break;
+        const conn = Channel.connectAsA(serial_handle, .console, DEFAULT_SHM_SIZE) catch return;
+        serial_chan = conn.chan;
+        addKnownShmHandle(conn.shm_handle);
+    }
+
+    // Optional: router (limited retry)
+    {
+        var handle: u64 = 0;
+        var retries: u32 = 0;
+        while (handle == 0 and retries < 5000) : (retries += 1) {
+            handle = channel.findBroadcastHandle(perm_view_addr, .router) orelse 0;
+            if (handle == 0) syscall.thread_yield();
+        }
+        if (handle != 0) {
+            if (Channel.connectAsA(handle, .console, DEFAULT_SHM_SIZE) catch null) |conn| {
+                router_chan = conn.chan;
+                has_router = true;
+                addKnownShmHandle(conn.shm_handle);
             }
         }
     }
 
-    // Serial is required — wait for it.
-    var serial_entry: *shm_protocol.ConnectionEntry = undefined;
-    while (true) {
-        serial_entry = cmd.requestConnection(shm_protocol.ServiceId.SERIAL) orelse {
-            syscall.thread_yield();
-            continue;
-        };
-        break;
-    }
-    _ = cmd.waitForConnection(serial_entry);
-    // Map the next data SHM that appears — it's the serial channel
-    const serial_header = waitAndMapNextShm(perm_view_addr);
-    serial_chan = channel_mod.Channel.openAsSideA(serial_header) orelse return;
-
-    // Optional connections — request, wait, then map each as it appears
-    const router_entry = cmd.requestConnection(shm_protocol.ServiceId.ROUTER);
-    const nfs_entry = cmd.requestConnection(shm_protocol.ServiceId.NFS_CLIENT);
-    const ntp_entry = cmd.requestConnection(shm_protocol.ServiceId.NTP_CLIENT);
-
-    if (router_entry) |re| {
-        _ = cmd.waitForConnection(re);
-        const header = waitAndMapNextShm(perm_view_addr);
-        if (channel_mod.Channel.openAsSideB(header)) |ch| {
-            router_chan = ch;
-            has_router = true;
-            _ = router_chan.send(&[_]u8{@truncate(shm_protocol.ServiceId.CONSOLE)});
+    // Optional: nfs_client (limited retry)
+    {
+        var handle: u64 = 0;
+        var retries: u32 = 0;
+        while (handle == 0 and retries < 5000) : (retries += 1) {
+            handle = channel.findBroadcastHandle(perm_view_addr, .nfs_client) orelse 0;
+            if (handle == 0) syscall.thread_yield();
+        }
+        if (handle != 0) {
+            if (Channel.connectAsA(handle, .console, DEFAULT_SHM_SIZE) catch null) |conn| {
+                nfs_chan = conn.chan;
+                has_nfs = true;
+                addKnownShmHandle(conn.shm_handle);
+            }
         }
     }
 
-    if (nfs_entry) |ne| {
-        _ = cmd.waitForConnection(ne);
-        const header = waitAndMapNextShm(perm_view_addr);
-        if (channel_mod.Channel.openAsSideB(header)) |ch| {
-            nfs_chan = ch;
-            has_nfs = true;
+    // Optional: ntp_client (limited retry)
+    {
+        var handle: u64 = 0;
+        var retries: u32 = 0;
+        while (handle == 0 and retries < 5000) : (retries += 1) {
+            handle = channel.findBroadcastHandle(perm_view_addr, .ntp_client) orelse 0;
+            if (handle == 0) syscall.thread_yield();
+        }
+        if (handle != 0) {
+            if (Channel.connectAsA(handle, .console, DEFAULT_SHM_SIZE) catch null) |conn| {
+                ntp_chan = conn.chan;
+                has_ntp = true;
+                addKnownShmHandle(conn.shm_handle);
+            }
         }
     }
 
-    if (ntp_entry) |nte| {
-        _ = cmd.waitForConnection(nte);
-        const header = waitAndMapNextShm(perm_view_addr);
-        if (channel_mod.Channel.openAsSideB(header)) |ch| {
-            ntp_chan = ch;
-            has_ntp = true;
+    // Root service channel: granted directly via SHM (not broadcast)
+    // Uses protocol_id dispatch like desktopOS usb_driver pattern
+    {
+        var retries: u32 = 0;
+        while (!has_root and retries < 5000) : (retries += 1) {
+            if (pollNewShm(perm_view_addr)) |shm_handle| {
+                if (Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE) catch null) |chan| {
+                    if (chan.protocol_id == @intFromEnum(lib.Protocol.root_service)) {
+                        root_chan = chan;
+                        has_root = true;
+                    }
+                }
+            } else {
+                syscall.thread_yield();
+            }
         }
     }
+
     serialWrite("\x1b[2J\x1b[H");
     serialWrite("=== Zag RouterOS Console ===\r\n");
     serialWrite("Type 'help' for available commands.\r\n");
@@ -764,7 +944,8 @@ pub fn main(perm_view_addr: u64) void {
     var rx_buf: [64]u8 = undefined;
 
     while (true) {
-        if (serial_chan.recv(&rx_buf)) |len| {
+        if (serial_chan.receiveMessage(.A, &rx_buf) catch null) |len_u64| {
+            const len: usize = @intCast(len_u64);
             for (rx_buf[0..len]) |byte| {
                 if (byte == '\r' or byte == '\n') {
                     serialWrite("\r\n");

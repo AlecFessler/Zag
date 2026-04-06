@@ -3,7 +3,6 @@ const lib = @import("lib");
 const syscall = lib.syscall;
 
 pub const Protocol = enum(u8) { icmp = 1, tcp = 6, udp = 17 };
-pub const Protocol6 = enum(u8) { tcp = 6, udp = 17, icmpv6 = 58 };
 
 /// Internal invariant assertion. Only fires on programmer errors, never on
 /// invalid network input. In ReleaseFast builds this is a no-op.
@@ -13,10 +12,6 @@ pub inline fn assert(ok: bool) void {
 
 pub fn now() u64 {
     return @bitCast(syscall.clock_gettime());
-}
-
-pub fn logEvent(msg: []const u8) void {
-    syscall.write(msg);
 }
 
 pub fn eql(a: []const u8, b: []const u8) bool {
@@ -256,14 +251,6 @@ pub fn recomputeTransportChecksum(pkt: []u8, transport_start: usize, len: u32, p
 
 // ── IPv6 helpers ─────────────────────────────────────────────────────────
 
-pub fn isLinkLocal6(ip6: [16]u8) bool {
-    return ip6[0] == 0xfe and ip6[1] & 0xc0 == 0x80;
-}
-
-pub fn isMulticast6(ip6: [16]u8) bool {
-    return ip6[0] == 0xff;
-}
-
 pub fn isAllZeros(data: []const u8) bool {
     for (data) |b| {
         if (b != 0) return false;
@@ -356,19 +343,3 @@ pub fn computeIcmpv6Checksum(src_ip6: [16]u8, dst_ip6: [16]u8, icmpv6_data: []co
     return @truncate(~sum);
 }
 
-/// Append IPv6 address in hex colon notation (full form).
-pub fn appendIp6(buf: []u8, pos: usize, ip6: [16]u8) usize {
-    const hex_chars = "0123456789abcdef";
-    var p = pos;
-    var i: usize = 0;
-    while (i < 16) : (i += 2) {
-        if (i > 0) p = appendStr(buf, p, ":");
-        if (p + 4 > buf.len) break;
-        buf[p] = hex_chars[ip6[i] >> 4];
-        buf[p + 1] = hex_chars[ip6[i] & 0xf];
-        buf[p + 2] = hex_chars[ip6[i + 1] >> 4];
-        buf[p + 3] = hex_chars[ip6[i + 1] & 0xf];
-        p += 4;
-    }
-    return p;
-}

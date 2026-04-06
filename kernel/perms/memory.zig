@@ -16,6 +16,7 @@ pub const CachePerm = enum(u2) {
     not_cacheable,
     write_back,
     write_through,
+    write_combining,
 };
 
 pub const GlobalPerm = enum(u1) {

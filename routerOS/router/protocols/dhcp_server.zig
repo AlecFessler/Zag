@@ -34,18 +34,6 @@ pub const StaticLease = struct {
 pub const empty = DhcpLease{};
 pub const empty_static = StaticLease{};
 
-fn findLease(leases: []DhcpLease, mac: [6]u8) ?[4]u8 {
-    for (leases) |*l| {
-        const gen = l.seq.readBeginNonblock();
-        const valid = l.valid;
-        const l_mac = l.mac;
-        const l_ip = l.ip;
-        if (l.seq.readRetry(gen)) continue;
-        if (valid and util.eql(&l_mac, &mac)) return l_ip;
-    }
-    return null;
-}
-
 fn allocateLease(mac: [6]u8) ?[4]u8 {
     // Check static leases first (atomic valid)
     for (&main.dhcp_static_leases) |*s| {

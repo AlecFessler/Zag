@@ -4,15 +4,13 @@ const router = @import("router");
 const arp = router.protocols.arp;
 const h = router.hal.headers;
 const main = router.state;
+const syscall = lib.syscall;
+const udp_proxy = lib.udp_proxy;
 const util = router.util;
 
+const Channel = lib.channel.Channel;
 const Seqlock = lib.sync.Seqlock;
-const channel_mod = lib.channel;
-const syscall = lib.syscall;
-
-pub const MSG_UDP_SEND: u8 = 0x01;
-pub const MSG_UDP_RECV: u8 = 0x02;
-pub const MSG_UDP_BIND: u8 = 0x03;
+const UdpServer = udp_proxy.Server;
 
 pub const MAX_BINDINGS = 16;
 pub const MAX_PENDING = 8;
@@ -37,8 +35,8 @@ pub const PendingPacket = struct {
 pub fn handleAppMessage(data: []const u8, app: AppId) void {
     if (data.len < 1) return;
     switch (data[0]) {
-        MSG_UDP_SEND => handleUdpSend(data),
-        MSG_UDP_BIND => handleUdpBind(data, app),
+        udp_proxy.CMD_UDP_SEND => handleUdpSend(data),
+        udp_proxy.CMD_UDP_BIND => handleUdpBind(data, app),
         else => {},
     }
 }
@@ -46,6 +44,15 @@ pub fn handleAppMessage(data: []const u8, app: AppId) void {
 fn handleUdpBind(data: []const u8, app: AppId) void {
     if (data.len < 3) return;
     const port = util.readU16Be(data[1..3]);
+    // Check if this port is already bound (e.g. after process reload)
+    for (&main.udp_bindings) |*b| {
+        if (b.valid and b.port == port) {
+            b.seq.writeBegin();
+            b.app = app;
+            b.seq.writeEnd();
+            return;
+        }
+    }
     for (&main.udp_bindings) |*b| {
         if (!b.valid) {
             b.seq.writeBegin();
@@ -133,10 +140,6 @@ pub fn drainPending() void {
     }
 }
 
-pub fn sendGratuitousArp() void {
-    arp.sendRequest(.wan, main.wan_gateway);
-}
-
 pub fn forwardToApp(src_ip: [4]u8, src_port: u16, dst_port: u16, payload: []const u8) bool {
     var target_app: AppId = .nfs;
     var matched = false;
@@ -154,21 +157,12 @@ pub fn forwardToApp(src_ip: [4]u8, src_port: u16, dst_port: u16, payload: []cons
     }
     if (!matched) return false;
 
-    var chan: *channel_mod.Channel = switch (target_app) {
-        .nfs => &(main.nfs_chan orelse return false),
-        .ntp => &(main.ntp_chan orelse return false),
+    const chan: *Channel = switch (target_app) {
+        .nfs => main.nfs_chan orelse return false,
+        .ntp => main.ntp_chan orelse return false,
     };
 
-    var msg: [2048]u8 = undefined;
-    const msg_len = 9 + payload.len;
-    if (msg_len > msg.len) return false;
-
-    msg[0] = MSG_UDP_RECV;
-    @memcpy(msg[1..5], &src_ip);
-    util.writeU16Be(msg[5..7], src_port);
-    util.writeU16Be(msg[7..9], dst_port);
-    @memcpy(msg[9..][0..payload.len], payload);
-
-    _ = chan.send(msg[0..msg_len]);
+    const srv = UdpServer.init(chan);
+    srv.sendUdpRecv(src_ip, src_port, dst_port, payload);
     return true;
 }

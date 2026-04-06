@@ -1,6 +1,7 @@
 const zag = @import("zag");
 
 const acpi = zag.arch.x64.acpi;
+const cpu = zag.arch.x64.cpu;
 const exceptions = zag.arch.x64.exceptions;
 const idt = zag.arch.x64.idt;
 const irq = zag.arch.x64.irq;
@@ -15,4 +16,5 @@ pub fn init() void {
     idt.init();
     exceptions.init();
     irq.init();
+    cpu.initPat();
 }

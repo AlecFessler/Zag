@@ -46,7 +46,6 @@ const GdtEntry = packed struct(u64) {
     base_high: u8,
 };
 
-pub const NULL_OFFSET: u16 = 0x00;
 pub const KERNEL_CODE_OFFSET: u16 = 0x08;
 pub const KERNEL_DATA_OFFSET: u16 = 0x10;
 pub const USER_CODE_OFFSET: u16 = 0x18;

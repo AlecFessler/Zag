@@ -65,12 +65,6 @@ fn hashOutbound(protocol: u8, lan_ip: [4]u8, lan_port: u16) u32 {
     return hash & (TABLE_SIZE - 1);
 }
 
-fn hashInbound(protocol: u8, wan_port: u16) u32 {
-    var hash: u32 = @as(u32, protocol) *% 31;
-    hash +%= @as(u32, wan_port) *% 65537;
-    return hash & (TABLE_SIZE - 1);
-}
-
 fn loadState(entry: *const NatEntry) State {
     return @enumFromInt(@atomicLoad(u8, &entry.state, .acquire));
 }

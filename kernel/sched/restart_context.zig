@@ -4,11 +4,6 @@ const memory_init = zag.memory.init;
 
 const VAddr = zag.memory.address.VAddr;
 
-pub const VAddrRange = struct {
-    vaddr: VAddr,
-    size: u64,
-};
-
 pub const RestartContext = struct {
     entry_point: VAddr,
     data_segment: struct {
@@ -16,18 +11,12 @@ pub const RestartContext = struct {
         size: u64,
         ghost: []u8,
     },
-    code_range: VAddrRange,
-    rodata_range: VAddrRange,
-    perm_view_range: VAddrRange,
 };
 
 pub fn create(
     entry: VAddr,
-    code_range: VAddrRange,
-    rodata_range: VAddrRange,
     data_vaddr: VAddr,
     data_content: []const u8,
-    perm_view_range: VAddrRange,
 ) !*RestartContext {
     const rc = try memory_init.heap_allocator.create(RestartContext);
     errdefer memory_init.heap_allocator.destroy(rc);
@@ -44,9 +33,6 @@ pub fn create(
             .size = data_content.len,
             .ghost = ghost,
         },
-        .code_range = code_range,
-        .rodata_range = rodata_range,
-        .perm_view_range = perm_view_range,
     };
     return rc;
 }

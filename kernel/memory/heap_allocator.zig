@@ -918,7 +918,6 @@ const PADDING_SIZE = @sizeOf(AllocPadding);
 const PADDING_ALIGN = @alignOf(AllocPadding);
 
 const PREFIX_SIZE = HEADER_SIZE + PADDING_SIZE;
-const PREFIX_ALIGN = HEADER_ALIGN;
 
 const FOOTER_SIZE = @sizeOf(AllocFooter);
 const FOOTER_ALIGN = @alignOf(AllocFooter);

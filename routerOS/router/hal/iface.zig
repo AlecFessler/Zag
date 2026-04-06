@@ -60,7 +60,7 @@ pub const PendingTxRing = struct {
     fn send(self: *PendingTxRing, data: []const u8) bool {
         if (data.len == 0 or data.len > nic.PACKET_BUF_SIZE) return false;
 
-        const tail = @as(*volatile u64, &self.tail).*;
+        const tail = @atomicLoad(u64, &self.tail, .monotonic);
 
         // Fast path: check cached head
         var free = PENDING_TX_SLOTS -% (tail -% self.cached_head);
@@ -81,7 +81,7 @@ pub const PendingTxRing = struct {
 
     /// Drain all pending packets (consumer side). Calls transmit_fn for each.
     fn drain(self: *PendingTxRing, iface: *Iface) void {
-        var head_val = @as(*volatile u64, &self.head).*;
+        var head_val = @atomicLoad(u64, &self.head, .monotonic);
 
         // Fast path: check cached tail
         if (head_val == self.cached_tail) {
@@ -144,46 +144,6 @@ pub const Iface = struct {
     // Ring 1: other poll thread → this poll thread
     // Design follows libz/channel.zig RingHeader pattern.
     pending_tx: [2]PendingTxRing = .{ .{}, .{} },
-
-    // ── Initialization ──────────────────────────────────────────────────
-
-    pub fn initWan(region: *dma.DmaRegion) Iface {
-        return .{
-            .role = .wan,
-            .mmio_base = 0,
-            .mac = .{ 0, 0, 0, 0, 0, 0 },
-            .ip = .{ 10, 0, 2, 15 },
-            .dma_base = region.wan_dma_base,
-            .dma_region = region,
-            .rx_descs = region.wanRxDescs(),
-            .tx_descs = region.wanTxDescs(),
-            .rx_tail = nic.NUM_RX_DESC - 1,
-            .tx_tail = 0,
-            .rx_buf_state = .{.free} ** nic.NUM_RX_DESC,
-            .rx_buf_tx_idx = .{0} ** nic.NUM_RX_DESC,
-            .arp_table = .{arp.empty} ** arp.TABLE_SIZE,
-            .stats = .{},
-        };
-    }
-
-    pub fn initLan(region: *dma.DmaRegion) Iface {
-        return .{
-            .role = .lan,
-            .mmio_base = 0,
-            .mac = .{ 0, 0, 0, 0, 0, 0 },
-            .ip = .{ 10, 1, 1, 1 },
-            .dma_base = region.lan_dma_base,
-            .dma_region = region,
-            .rx_descs = region.lanRxDescs(),
-            .tx_descs = region.lanTxDescs(),
-            .rx_tail = nic.NUM_RX_DESC - 1,
-            .tx_tail = 0,
-            .rx_buf_state = .{.free} ** nic.NUM_RX_DESC,
-            .rx_buf_tx_idx = .{0} ** nic.NUM_RX_DESC,
-            .arp_table = .{arp.empty} ** arp.TABLE_SIZE,
-            .stats = .{},
-        };
-    }
 
     // ── RX ──────────────────────────────────────────────────────────────
 

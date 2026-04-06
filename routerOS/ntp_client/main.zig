@@ -1,32 +1,29 @@
 const lib = @import("lib");
 
-const channel_mod = lib.channel;
-const perms = lib.perms;
+const channel = lib.channel;
+const ntp_proto = lib.ntp;
 const pv = lib.perm_view;
-const shm_protocol = lib.shm_protocol;
 const syscall = lib.syscall;
+const text_cmd = lib.text_command;
+const udp_proxy = lib.udp_proxy;
 
-// ── UDP proxy message tags (must match router/udp_fwd.zig) ──────────
-
-const MSG_UDP_SEND: u8 = 0x01;
-const MSG_UDP_RECV: u8 = 0x02;
-const MSG_UDP_BIND: u8 = 0x03;
-const MSG_SET_TIMEZONE: u8 = 0x04;
-const MSG_TIME_SYNC: u8 = 0x11;
+const Channel = channel.Channel;
+const UdpClient = udp_proxy.Client;
 
 // ── Configuration ───────────────────────────────────────────────────
 
+const DEFAULT_SHM_SIZE = 4 * syscall.PAGE4K;
 const NTP_PORT: u16 = 123;
 const LOCAL_PORT: u16 = 1230;
-const MAX_PERMS = 128;
+const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 const NTP_EPOCH_OFFSET: u64 = 2208988800; // seconds between 1900-01-01 and 1970-01-01
 const TIMEOUT_NS: u64 = 5_000_000_000;
 
 // ── State ───────────────────────────────────────────────────────────
 
-var router_chan: channel_mod.Channel = undefined;
-var console_chan: ?channel_mod.Channel = null;
-var has_router: bool = false;
+var router_chan: *Channel = undefined;
+var udp_client: UdpClient = undefined;
+var console_chan: ?*Channel = null;
 
 var ntp_server_ip: [4]u8 = .{ 10, 0, 2, 1 };
 var unix_timestamp: u64 = 0;
@@ -38,103 +35,84 @@ var tz_offset_minutes: i16 = -360; // CST (UTC-6) default
 
 // ── Entry point ─────────────────────────────────────────────────────
 
-// Track mapped SHM handles so we can find unmapped data SHMs.
-var mapped_handles: [16]u64 = .{0} ** 16;
-var num_mapped: u32 = 0;
+// ── Known SHM tracking ──────────────────────────────────────────────
+var known_shm_handles: [32]u64 = .{0} ** 32;
+var known_shm_count: u8 = 0;
 
-fn isHandleMapped(handle: u64) bool {
-    for (mapped_handles[0..num_mapped]) |h| {
-        if (h == handle) return true;
-    }
-    return false;
-}
-
-fn recordMapped(handle: u64) void {
-    if (num_mapped < mapped_handles.len) {
-        mapped_handles[num_mapped] = handle;
-        num_mapped += 1;
+fn addKnownShmHandle(h: u64) void {
+    if (known_shm_count < 32) {
+        known_shm_handles[known_shm_count] = h;
+        known_shm_count += 1;
     }
 }
 
-pub fn main(perm_view_addr: u64) void {
-    const cmd = shm_protocol.mapCommandChannel(perm_view_addr) orelse return;
-
-    // Record the command channel SHM as mapped so we skip it later.
-    {
-        const view_init: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
-        for (view_init) |*entry| {
-            if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY and entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) {
-                recordMapped(entry.handle);
-                break;
-            }
-        }
-    }
-
-    // Wait for router connection — on restart, already connected.
-    var router_entry: *shm_protocol.ConnectionEntry = undefined;
-    while (true) {
-        router_entry = cmd.requestConnection(shm_protocol.ServiceId.ROUTER) orelse {
-            syscall.thread_yield();
-            continue;
-        };
-        break;
-    }
-    _ = cmd.waitForConnection(router_entry);
-
-    // Wait for the next unmapped data SHM to appear (the router data channel).
-    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
-    while (true) {
-        for (view) |*entry| {
-            if (entry.entry_type != pv.ENTRY_TYPE_SHARED_MEMORY) continue;
-            if (entry.field0 <= shm_protocol.COMMAND_SHM_SIZE) continue;
-            if (isHandleMapped(entry.handle)) continue;
-
-            const vm_rights = (perms.VmReservationRights{
-                .read = true,
-                .write = true,
-                .shareable = true,
-            }).bits();
-            const vm_result = syscall.vm_reserve(0, entry.field0, vm_rights);
-            if (vm_result.val >= 0) {
-                if (syscall.shm_map(entry.handle, @intCast(vm_result.val), 0) == 0) {
-                    recordMapped(entry.handle);
-                    const header: *channel_mod.ChannelHeader = @ptrFromInt(vm_result.val2);
-                    router_chan = channel_mod.Channel.openAsSideB(header) orelse {
-                        syscall.thread_yield();
-                        continue;
-                    };
-                    has_router = true;
+fn pollNewShm(view_addr: u64) ?u64 {
+    const view: *const [128]pv.UserViewEntry = @ptrFromInt(view_addr);
+    for (view) |*entry| {
+        if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY) {
+            var known = false;
+            for (known_shm_handles[0..known_shm_count]) |h| {
+                if (h == entry.handle) {
+                    known = true;
                     break;
                 }
             }
+            if (!known and known_shm_count < 32) {
+                known_shm_handles[known_shm_count] = entry.handle;
+                known_shm_count += 1;
+                return entry.handle;
+            }
         }
-        if (has_router) break;
-        syscall.thread_yield();
     }
+    return null;
+}
 
-    _ = router_chan.send(&[_]u8{@truncate(shm_protocol.ServiceId.NTP_CLIENT)});
+pub fn main(perm_view_addr: u64) void {
+    channel.perm_view_addr = perm_view_addr;
 
-    sendUdpBind(LOCAL_PORT);
+    // Broadcast as NTP_CLIENT
+    channel.broadcast(@intFromEnum(lib.Protocol.ntp_client)) catch {};
+
+    // Connect to router as side A via broadcast table
+    var handle: u64 = 0;
+    while (handle == 0) {
+        handle = channel.findBroadcastHandle(perm_view_addr, .router) orelse 0;
+        if (handle == 0) syscall.thread_yield();
+    }
+    const conn = Channel.connectAsA(handle, .ntp_client, DEFAULT_SHM_SIZE) catch return;
+    router_chan = conn.chan;
+    udp_client = UdpClient.init(router_chan);
+    addKnownShmHandle(conn.shm_handle);
+
+    udp_client.bindPort(LOCAL_PORT);
 
     // Auto-sync on startup
     sendNtpRequest();
 
     while (true) {
         var router_buf: [256]u8 = undefined;
-        if (router_chan.recv(&router_buf)) |len| {
+        if (router_chan.receiveMessage(.A, &router_buf) catch null) |len| {
             handleRouterMessage(router_buf[0..len]);
         } else {
-            router_chan.rx.waitForData(10_000_000); // 10ms
+            router_chan.waitForMessage(.A, 10_000_000); // 10ms
         }
 
-        if (console_chan == null) {
-            detectConsoleChannel(view);
+        // Accept console connection (side B) via perm view polling
+        // Always poll — after process reload, a new connection may arrive
+        if (pollNewShm(perm_view_addr)) |shm_handle| {
+            if (Channel.connectAsB(shm_handle, DEFAULT_SHM_SIZE) catch null) |chan| {
+                console_chan = chan;
+            }
         }
 
-        if (console_chan) |*chan| {
+        if (console_chan) |chan| {
             var cmd_buf: [128]u8 = undefined;
-            if (chan.recv(&cmd_buf)) |len| {
-                handleCommand(cmd_buf[0..len]);
+            const srv = text_cmd.Server.init(chan);
+            if (srv.recvCommand(&cmd_buf)) |cmd| {
+                switch (cmd) {
+                    .text => |text| handleCommand(text),
+                    else => {},
+                }
             }
         }
 
@@ -142,48 +120,15 @@ pub fn main(perm_view_addr: u64) void {
     }
 }
 
-// ── Console channel detection ───────────────────────────────────────
-
-fn detectConsoleChannel(view: *const [MAX_PERMS]pv.UserViewEntry) void {
-    for (view) |*e| {
-        if (e.entry_type != pv.ENTRY_TYPE_SHARED_MEMORY) continue;
-        if (e.field0 <= shm_protocol.COMMAND_SHM_SIZE) continue;
-        if (isHandleMapped(e.handle)) continue;
-
-        const vm_rights = (perms.VmReservationRights{
-            .read = true,
-            .write = true,
-            .shareable = true,
-        }).bits();
-        const vm = syscall.vm_reserve(0, e.field0, vm_rights);
-        if (vm.val >= 0) {
-            if (syscall.shm_map(e.handle, @intCast(vm.val), 0) == 0) {
-                recordMapped(e.handle);
-                const hdr: *channel_mod.ChannelHeader = @ptrFromInt(vm.val2);
-                console_chan = channel_mod.Channel.openAsSideA(hdr) orelse return;
-            }
-        }
-        break;
-    }
-}
-
 // ── UDP helpers ─────────────────────────────────────────────────────
-
-fn sendUdpBind(port: u16) void {
-    var msg: [3]u8 = undefined;
-    msg[0] = MSG_UDP_BIND;
-    msg[1] = @truncate(port >> 8);
-    msg[2] = @truncate(port);
-    _ = router_chan.send(&msg);
-}
 
 fn sendTimeSync(unix_secs: u64, mono_ns: u64) void {
     // [0] = MSG_TIME_SYNC, [1..9] = unix_secs BE, [9..17] = mono_ns BE
     var msg: [17]u8 = undefined;
-    msg[0] = MSG_TIME_SYNC;
+    msg[0] = ntp_proto.CMD_TIME_SYNC;
     writeU64Be(msg[1..9], unix_secs);
     writeU64Be(msg[9..17], mono_ns);
-    _ = router_chan.send(&msg);
+    router_chan.sendMessage(.A, &msg) catch {};
 }
 
 fn writeU64Be(buf: *[8]u8, val: u64) void {
@@ -197,27 +142,13 @@ fn writeU64Be(buf: *[8]u8, val: u64) void {
     buf[7] = @truncate(val);
 }
 
-fn sendUdpPacket(dst_ip: [4]u8, dst_port: u16, src_port: u16, payload: []const u8) void {
-    var msg: [256]u8 = undefined;
-    const total = 9 + payload.len;
-    if (total > msg.len) return;
-    msg[0] = MSG_UDP_SEND;
-    @memcpy(msg[1..5], &dst_ip);
-    msg[5] = @truncate(dst_port >> 8);
-    msg[6] = @truncate(dst_port);
-    msg[7] = @truncate(src_port >> 8);
-    msg[8] = @truncate(src_port);
-    @memcpy(msg[9..][0..payload.len], payload);
-    _ = router_chan.send(msg[0..total]);
-}
-
 // ── NTP protocol ────────────────────────────────────────────────────
 
 fn sendNtpRequest() void {
     var pkt: [48]u8 = .{0} ** 48;
     // LI=0 (no warning), VN=4 (NTPv4), Mode=3 (client)
     pkt[0] = 0x23;
-    sendUdpPacket(ntp_server_ip, NTP_PORT, LOCAL_PORT, &pkt);
+    udp_client.sendUdp(ntp_server_ip, NTP_PORT, LOCAL_PORT, &pkt);
     sync_pending = true;
     send_time_ns = now();
 }
@@ -265,9 +196,9 @@ fn handleNtpResponse(payload: []const u8) void {
 
 fn handleRouterMessage(data: []const u8) void {
     if (data.len < 1) return;
-    if (data[0] == MSG_UDP_RECV and data.len >= 9) {
+    if (data[0] == udp_proxy.RESP_UDP_RECV and data.len >= 9) {
         handleNtpResponse(data[9..]);
-    } else if (data[0] == MSG_SET_TIMEZONE and data.len >= 3) {
+    } else if (data[0] == ntp_proto.RESP_SET_TIMEZONE and data.len >= 3) {
         tz_offset_minutes = @bitCast([2]u8{ data[1], data[2] });
     }
 }
@@ -341,14 +272,16 @@ fn checkTimeout() void {
 // ── Response helpers ────────────────────────────────────────────────
 
 fn sendConsole(msg: []const u8) void {
-    if (console_chan) |*chan| {
-        _ = chan.send(msg);
+    if (console_chan) |chan| {
+        const srv = text_cmd.Server.init(chan);
+        srv.sendText(msg);
     }
 }
 
 fn sendEof() void {
-    if (console_chan) |*chan| {
-        _ = chan.send(&[_]u8{});
+    if (console_chan) |chan| {
+        const srv = text_cmd.Server.init(chan);
+        srv.sendEnd();
     }
 }
 
@@ -509,7 +442,7 @@ fn parseTzOffset(s: []const u8) ?i16 {
 // ── Utility ─────────────────────────────────────────────────────────
 
 fn now() u64 {
-    return @bitCast(syscall.clock_gettime());
+    return syscall.clock_gettime();
 }
 
 fn eql(a: []const u8, b: []const u8) bool {

@@ -3,6 +3,7 @@ const lib = @import("lib");
 const syscall = lib.syscall;
 const t = lib.testing;
 
+const broadcast_tests = @import("tests/broadcast.zig");
 const crash_reason_tests = @import("tests/crash_reason.zig");
 const device_tests = @import("tests/device.zig");
 const futex_tests = @import("tests/futex.zig");
@@ -42,6 +43,7 @@ pub fn main(perm_view: u64) void {
     grant_reduced_tests.run();
     misc_tests.run();
     pin_exclusive_tests.run();
+    broadcast_tests.run(perm_view);
 
     const end_ns: u64 = @bitCast(syscall.clock_gettime());
     const elapsed_ms = (end_ns - start_ns) / 1_000_000;

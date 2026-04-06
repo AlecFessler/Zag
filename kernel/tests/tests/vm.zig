@@ -62,13 +62,13 @@ fn testMergeSplitRestore() void {
         t.fail("S2.2: split/merge perms call failed");
         return;
     }
-    const p0: *volatile u8 = @ptrFromInt(base);
+    const p0: *u8 = @ptrFromInt(base);
     p0.* = 42;
-    const p1: *volatile u8 = @ptrFromInt(base + syscall.PAGE4K);
+    const p1: *u8 = @ptrFromInt(base + syscall.PAGE4K);
     p1.* = 43;
-    const p2: *volatile u8 = @ptrFromInt(base + 2 * syscall.PAGE4K);
+    const p2: *u8 = @ptrFromInt(base + 2 * syscall.PAGE4K);
     p2.* = 44;
-    const p3: *volatile u8 = @ptrFromInt(base + 3 * syscall.PAGE4K - 1);
+    const p3: *u8 = @ptrFromInt(base + 3 * syscall.PAGE4K - 1);
     p3.* = 45;
     if (p0.* == 42 and p1.* == 43 and p2.* == 44 and p3.* == 45) {
         t.pass("S2.2: split then merge restores access to all pages");
@@ -86,7 +86,7 @@ fn testDecommit() void {
     }
     const handle: u64 = @intCast(result.val);
     const base = result.val2;
-    const ptr: *volatile u64 = @ptrFromInt(base);
+    const ptr: *u64 = @ptrFromInt(base);
     ptr.* = 0xCAFEBABE;
     const zero = (perms.VmReservationRights{}).bits();
     const rc1 = syscall.vm_perms(handle, 0, syscall.PAGE4K, zero);

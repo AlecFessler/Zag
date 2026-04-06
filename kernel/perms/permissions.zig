@@ -31,7 +31,7 @@ pub const DeadProcessInfo = struct {
 };
 
 pub const ProcessRights = packed struct(u16) {
-    grant_to: bool = false,
+    grant_to_child: bool = false,
     spawn_thread: bool = false,
     spawn_process: bool = false,
     mem_reserve: bool = false,
@@ -41,7 +41,9 @@ pub const ProcessRights = packed struct(u16) {
     device_own: bool = false,
     shutdown: bool = false,
     pin_exclusive: bool = false,
-    _reserved: u6 = 0,
+    grant_to_broadcast: bool = false,
+    broadcast: bool = false,
+    _reserved: u4 = 0,
 };
 
 pub const VmReservationRights = packed struct(u8) {
@@ -50,7 +52,8 @@ pub const VmReservationRights = packed struct(u8) {
     execute: bool = false,
     shareable: bool = false,
     mmio: bool = false,
-    _reserved: u3 = 0,
+    write_combining: bool = false,
+    _reserved: u2 = 0,
 };
 
 pub const SharedMemoryRights = packed struct(u8) {
@@ -104,6 +107,7 @@ pub const KernelObject = union(enum) {
     shared_memory: *SharedMemory,
     device_region: *DeviceRegion,
     core_pin: CorePinObject,
+    broadcast_table: u64,
     empty: void,
 };
 
@@ -114,6 +118,7 @@ pub const UserViewEntryType = enum(u8) {
     device_region = 3,
     core_pin = 4,
     dead_process = 5,
+    broadcast_table = 6,
 };
 
 pub const UserViewEntry = extern struct {
@@ -198,6 +203,13 @@ pub const UserViewEntry = extern struct {
                 .rights = entry.rights,
                 .field0 = cp.core_id,
                 .field1 = cp.thread_tid,
+            },
+            .broadcast_table => |vaddr| .{
+                .handle = entry.handle,
+                .entry_type = @intFromEnum(UserViewEntryType.broadcast_table),
+                .rights = entry.rights,
+                .field0 = vaddr,
+                .field1 = 0,
             },
             .empty => EMPTY,
         };

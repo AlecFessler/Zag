@@ -13,18 +13,12 @@ const Ports = enum(u16) {
 };
 
 const offsets = struct {
-    const txr = 0;
-    const rxr = 0;
     const dll = 0;
     const ier = 1;
     const dlh = 1;
-    const iir = 2;
     const fcr = 2;
     const lcr = 3;
-    const mcr = 4;
     const lsr = 5;
-    const msr = 6;
-    const sr = 7;
 };
 
 var g_port: Ports = .com1;

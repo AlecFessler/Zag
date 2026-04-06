@@ -47,12 +47,12 @@ fn testCrossProcessShmAndGrant() void {
         t.fail("parent shm_map failed");
         return;
     }
-    const parent_ptr: *volatile u64 = @ptrFromInt(vm_result.val2);
+    const parent_ptr: *u64 = @ptrFromInt(vm_result.val2);
     parent_ptr.* = 0;
 
     const child_elf = embedded.child_shm_counter;
     const child_rights = (perms.ProcessRights{
-        .grant_to = true,
+        .grant_to_child = true,
         .spawn_thread = true,
         .mem_reserve = true,
         .shm_create = true,

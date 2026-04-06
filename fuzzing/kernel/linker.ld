@@ -1,0 +1,1 @@
+../../kernel/tests/linker.ld

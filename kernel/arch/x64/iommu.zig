@@ -20,11 +20,6 @@ pub fn initIntel(reg_base: PAddr) !void {
     active_type = .intel_vtd;
 }
 
-pub fn initAmd(reg_base: PAddr) !void {
-    try vi.init(reg_base);
-    active_type = .amd_vi;
-}
-
 pub fn setupDevice(device: *DeviceRegion) !void {
     switch (active_type) {
         .intel_vtd => try vtd.setupDevice(device),
@@ -58,7 +53,7 @@ pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
     }
     device.dma_cursor = base_dma + @as(u64, shm.pages.len) * 0x1000;
     switch (active_type) {
-        .amd_vi => vi.flushAll(),
+        .amd_vi => vi.flushDevice(device),
         .intel_vtd => vtd.invalidateIotlb(),
         .none => {},
     }
@@ -74,6 +69,11 @@ pub fn unmapDmaPages(device: *DeviceRegion, dma_base: u64, num_pages: u64) void 
             .amd_vi => vi.unmapDmaPage(device, dma_addr),
             .none => {},
         }
+    }
+    switch (active_type) {
+        .amd_vi => vi.flushDevice(device),
+        .intel_vtd => vtd.invalidateIotlb(),
+        .none => {},
     }
 }
 

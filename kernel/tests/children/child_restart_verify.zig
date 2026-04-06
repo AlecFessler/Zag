@@ -51,11 +51,11 @@ pub fn main(perm_view_addr: u64) void {
     if (map_rc != 0) return;
 
     const base = vm_result.val2;
-    const run_counter: *volatile u64 = @ptrFromInt(base);
+    const run_counter: *u64 = @ptrFromInt(base);
     const run_count = run_counter.*;
 
-    const shm_count_slot: *volatile u64 = @ptrFromInt(base + 8 + run_count * 16);
-    const vm_res_slot: *volatile u64 = @ptrFromInt(base + 16 + run_count * 16);
+    const shm_count_slot: *u64 = @ptrFromInt(base + 8 + run_count * 16);
+    const vm_res_slot: *u64 = @ptrFromInt(base + 16 + run_count * 16);
 
     shm_count_slot.* = shm_count;
     vm_res_slot.* = if (has_vm_res) 1 else 0;

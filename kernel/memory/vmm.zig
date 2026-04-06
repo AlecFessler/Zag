@@ -529,6 +529,7 @@ pub const VirtualMemoryManager = struct {
         original_size: u64,
         offset: u64,
         device: *DeviceRegion,
+        write_combining: bool,
     ) !void {
         self.lock.lock();
         defer self.lock.unlock();
@@ -567,7 +568,7 @@ pub const VirtualMemoryManager = struct {
         const perms = MemoryPerms{
             .write_perm = .write,
             .execute_perm = .no_execute,
-            .cache_perm = .not_cacheable,
+            .cache_perm = if (write_combining) .write_combining else .not_cacheable,
             .global_perm = .not_global,
             .privilege_perm = .user,
         };

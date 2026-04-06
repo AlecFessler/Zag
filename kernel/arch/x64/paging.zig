@@ -109,8 +109,9 @@ pub fn mapPage(
     const user_accessible = perms.privilege_perm == .user;
     const writable = perms.write_perm == .write;
     const not_executable = perms.execute_perm == .no_execute;
+    const wc = perms.cache_perm == .write_combining;
     const not_cacheable = perms.cache_perm == .not_cacheable;
-    const write_through = perms.cache_perm == .write_through;
+    const write_through = perms.cache_perm == .write_through or wc;
     const global = perms.global_perm == .global;
 
     const parent_entry = PageEntry{
@@ -119,12 +120,14 @@ pub fn mapPage(
         .user_accessible = user_accessible,
     };
 
+    // For L1 leaf entries, bit 7 (huge_page) is the PAT index bit
     const leaf_entry = PageEntry{
         .present = true,
         .writable = writable,
         .user_accessible = user_accessible,
         .write_through = write_through,
         .not_cacheable = not_cacheable,
+        .huge_page = wc,
         .global = global,
         .not_executable = not_executable,
     };
@@ -166,8 +169,9 @@ pub fn mapPageBoot(
     const user_accessible = perms.privilege_perm == .user;
     const writable = perms.write_perm == .write;
     const not_executable = perms.execute_perm == .no_execute;
+    const wc = perms.cache_perm == .write_combining;
     const not_cacheable = perms.cache_perm == .not_cacheable;
-    const write_through = perms.cache_perm == .write_through;
+    const write_through = perms.cache_perm == .write_through or wc;
     const global = perms.global_perm == .global;
 
     const parent_entry = PageEntry{
@@ -176,12 +180,14 @@ pub fn mapPageBoot(
         .user_accessible = user_accessible,
     };
 
+    // For L1 leaf entries, bit 7 (huge_page) is the PAT index bit
     const leaf_entry = PageEntry{
         .present = true,
         .writable = writable,
         .user_accessible = user_accessible,
         .write_through = write_through,
         .not_cacheable = not_cacheable,
+        .huge_page = wc,
         .global = global,
         .not_executable = not_executable,
     };
@@ -327,8 +333,10 @@ pub fn updatePagePerms(
 
     l1_entry.writable = new_perms.write_perm == .write;
     l1_entry.not_executable = new_perms.execute_perm == .no_execute;
+    const wc = new_perms.cache_perm == .write_combining;
     l1_entry.not_cacheable = new_perms.cache_perm == .not_cacheable;
-    l1_entry.write_through = new_perms.cache_perm == .write_through;
+    l1_entry.write_through = new_perms.cache_perm == .write_through or wc;
+    l1_entry.huge_page = wc;
     l1_entry.user_accessible = new_perms.privilege_perm == .user;
 
     cpu.invlpg(virt.addr);

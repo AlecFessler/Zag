@@ -167,10 +167,6 @@ pub const Ipv6Header = extern struct {
 
     pub const LEN: usize = 40;
 
-    pub fn payloadLen(self: *const @This()) u16 {
-        return toHost16(self.payload_len_raw);
-    }
-
     pub fn setPayloadLen(self: *@This(), val: u16) void {
         self.payload_len_raw = fromHost16(val);
     }
@@ -404,8 +400,6 @@ pub const Icmpv6Header = extern struct {
     pub const TYPE_ECHO_REPLY: u8 = 129;
     pub const TYPE_NS: u8 = 135;
     pub const TYPE_NA: u8 = 136;
-    pub const TYPE_RS: u8 = 133;
-    pub const TYPE_RA: u8 = 134;
 
     pub fn setChecksum(self: *@This(), val: u16) void {
         self.checksum_raw = fromHost16(val);

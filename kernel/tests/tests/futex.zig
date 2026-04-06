@@ -9,7 +9,7 @@ const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 var thread_signal: u64 align(8) = 0;
 
 fn signalThread() void {
-    @as(*volatile u64, &thread_signal).* = 1;
+    thread_signal = 1;
     _ = syscall.futex_wake(&thread_signal, 1);
     syscall.thread_exit();
 }
@@ -61,13 +61,13 @@ fn testFutexTimeoutZeroTryOnly() void {
 }
 
 fn testFutexCrossThreadSignal() void {
-    @as(*volatile u64, &thread_signal).* = 0;
+    thread_signal = 0;
     const rc = syscall.thread_create(&signalThread, 0, 4);
     if (rc != 0) {
         t.failWithVal("thread_create failed", 0, rc);
         return;
     }
-    t.waitUntilNonZero(@as(*volatile u64, &thread_signal));
+    t.waitUntilNonZero(&thread_signal);
     t.pass("S2.5: cross-thread futex_wake unblocks futex_wait");
 }
 
@@ -95,17 +95,17 @@ var timed_wake_done: u64 align(8) = 0;
 var timed_wake_ready: u64 align(8) = 0;
 
 fn timedWaitThread() void {
-    @as(*volatile u64, &timed_wake_ready).* = 1;
+    timed_wake_ready = 1;
     _ = syscall.futex_wake(&timed_wake_ready, 1);
     timed_wake_result = syscall.futex_wait(&timed_wake_val, 0, 5_000_000_000);
-    @as(*volatile u64, &timed_wake_done).* = 1;
+    timed_wake_done = 1;
     syscall.thread_exit();
 }
 
 fn testFutexTimedWaitWokenBeforeTimeout() void {
-    @as(*volatile u64, &timed_wake_val).* = 0;
-    @as(*volatile u64, &timed_wake_done).* = 0;
-    @as(*volatile u64, &timed_wake_ready).* = 0;
+    timed_wake_val = 0;
+    timed_wake_done = 0;
+    timed_wake_ready = 0;
     timed_wake_result = 0;
     const rc = syscall.thread_create(&timedWaitThread, 0, 4);
     if (rc != 0) {
@@ -113,7 +113,7 @@ fn testFutexTimedWaitWokenBeforeTimeout() void {
         return;
     }
 
-    t.waitUntilNonZero(@as(*volatile u64, &timed_wake_ready));
+    t.waitUntilNonZero(&timed_wake_ready);
 
     // Yield enough times for the child to enter futex_wait, then wake it.
     // Re-wake in a loop to handle the race where the child hasn't entered
@@ -122,9 +122,9 @@ fn testFutexTimedWaitWokenBeforeTimeout() void {
     while (attempts < 1000) : (attempts += 1) {
         syscall.thread_yield();
         _ = syscall.futex_wake(&timed_wake_val, 1);
-        if (@as(*volatile u64, &timed_wake_done).* != 0) break;
+        if (timed_wake_done != 0) break;
     }
 
-    t.waitUntilNonZero(@as(*volatile u64, &timed_wake_done));
+    t.waitUntilNonZero(&timed_wake_done);
     t.expectEqual("S4.futex_wait: woken before timeout returns E_OK", 0, timed_wake_result);
 }

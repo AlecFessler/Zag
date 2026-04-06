@@ -37,8 +37,7 @@ pub const NF3DIR: u32 = 2;
 // NFS3 write stability
 pub const UNSTABLE: u32 = 0;
 
-pub const READ_SIZE: u32 = 4096;
-pub const WRITE_SIZE: u32 = 4096;
+pub const READ_SIZE: u32 = 1024;
 
 pub const FileHandle = struct {
     data: [64]u8 = [_]u8{0} ** 64,
@@ -372,12 +371,6 @@ pub fn buildCommitRequest(buf: []u8, xid_val: u32, fh: *const FileHandle) usize 
     p = xdr.writeU64(buf, p, 0); // offset
     p = xdr.writeU32(buf, p, 0); // count (0 = entire file)
     return p;
-}
-
-pub fn parseCommitReply(buf: []const u8, xid_val: u32) bool {
-    const body = rpc.parseReplyHeader(buf, xid_val) orelse return false;
-    const status = xdr.readU32(buf, body) orelse return false;
-    return status.val == NFS3_OK;
 }
 
 // ── Diagnostics ────────────────────────────────────────────────────────

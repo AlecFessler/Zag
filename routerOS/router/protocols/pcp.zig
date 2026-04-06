@@ -10,12 +10,10 @@ pub const PCP_PORT: u16 = 5351;
 // PCP constants (RFC 6887)
 const PCP_VERSION: u8 = 2;
 const OPCODE_MAP: u8 = 1;
-const OPCODE_PEER: u8 = 2;
 
 // PCP result codes
 const RESULT_SUCCESS: u8 = 0;
 const RESULT_UNSUPP_VERSION: u8 = 1;
-const RESULT_NOT_AUTHORIZED: u8 = 2;
 const RESULT_MALFORMED_REQUEST: u8 = 3;
 const RESULT_UNSUPP_OPCODE: u8 = 4;
 const RESULT_NO_RESOURCES: u8 = 8;
@@ -30,7 +28,6 @@ const HDR_LEN: usize = 24;
 // MAP opcode offsets (after header)
 const MAP_NONCE: usize = 0; // 12 bytes
 const MAP_PROTOCOL: usize = 12; // 1 byte (IANA protocol number)
-const MAP_RESERVED: usize = 13; // 3 bytes
 const MAP_INTERNAL_PORT: usize = 16; // 2 bytes BE
 const MAP_EXTERNAL_PORT: usize = 18; // 2 bytes BE
 const MAP_EXTERNAL_IP: usize = 20; // 16 bytes (v4-mapped)

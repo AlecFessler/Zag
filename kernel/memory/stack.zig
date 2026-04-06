@@ -39,11 +39,6 @@ pub fn isKernelStackPage(vaddr: VAddr) KernelStackPage {
     return .usable;
 }
 
-pub fn lookupGuard(pid: u64, vaddr: VAddr) void {
-    _ = pid;
-    _ = vaddr;
-}
-
 fn allocSlot() !u64 {
     freelist_lock.lock();
     if (freelist_top > 0) {

@@ -140,6 +140,7 @@ fn coreInit() callconv(.c) noreturn {
     gdt.loadGdt(core_id);
     cpu.ltr(gdt.TSS_OFFSET);
 
+    cpu.initPat();
     _ = cores_online.fetchAdd(1, .release);
     sched.perCoreInit();
     arch.halt();

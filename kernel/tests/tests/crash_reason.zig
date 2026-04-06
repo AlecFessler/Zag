@@ -35,9 +35,9 @@ fn testStackOverflowCrashReason(perm_view_addr: u64) void {
     syscall.write("crash_reason: setup done\n");
 
     // Zero the SHM
-    const run_counter: *volatile u64 = @ptrFromInt(base);
-    const crash_reason_slot: *volatile u64 = @ptrFromInt(base + 8);
-    const restart_count_slot: *volatile u64 = @ptrFromInt(base + 16);
+    const run_counter: *u64 = @ptrFromInt(base);
+    const crash_reason_slot: *u64 = @ptrFromInt(base + 8);
+    const restart_count_slot: *u64 = @ptrFromInt(base + 16);
     run_counter.* = 0;
     crash_reason_slot.* = 0;
     restart_count_slot.* = 0;
@@ -45,7 +45,7 @@ fn testStackOverflowCrashReason(perm_view_addr: u64) void {
     // Spawn restartable child
     const child_elf = embedded.child_stack_overflow_restart;
     const child_rights = (perms.ProcessRights{
-        .grant_to = true,
+        .grant_to_child = true,
         .spawn_thread = true,
         .mem_reserve = true,
         .shm_create = true,

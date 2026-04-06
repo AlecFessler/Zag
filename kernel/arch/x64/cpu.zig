@@ -100,6 +100,10 @@ pub const Context = packed struct {
     ss: u64,
 };
 
+/// Size of FXSAVE area allocated below Context on kernel stack.
+/// FXSAVE/FXRSTOR is handled in assembly prologue/epilogue.
+pub const FXSAVE_SIZE: u64 = 512;
+
 pub const Registers = packed struct {
     r15: u64,
     r14: u64,
@@ -142,10 +146,6 @@ pub fn cpuid(eax: CpuidLeaf, ecx: u32) struct {
           [in_c] "{ecx}" (ecx),
     );
     return .{ .eax = a, .ebx = b, .ecx = c, .edx = d };
-}
-
-pub fn disableInterrupts() void {
-    asm volatile ("cli");
 }
 
 pub fn enableInterrupts() void {
@@ -390,4 +390,12 @@ pub fn rdmsr(msr: u32) u64 {
         : [msr] "{ecx}" (msr),
     );
     return (@as(u64, hi) << 32) | lo;
+}
+
+const IA32_PAT: u32 = 0x277;
+// PAT0=WB, PAT1=WT, PAT2=UC-, PAT3=UC, PAT4=WB, PAT5=WC, PAT6=UC-, PAT7=UC
+const PAT_VALUE: u64 = 0x00070106_00070406;
+
+pub fn initPat() void {
+    wrmsr(IA32_PAT, PAT_VALUE);
 }

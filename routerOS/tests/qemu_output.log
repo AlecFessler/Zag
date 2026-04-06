@@ -1,45 +1,105 @@
-[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01H[2J[01;01H[=3h[2J[01;01HBdsDxe: loading Boot0001 "UEFI QEMU HARDDISK QM00001 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x0,0xFFFF,0x0)
+[2J[01;01H[=3h[2J[01;01H[2J[01;01H[8;042;160t0[2J[01;01H[2J[01;01H[8;056;240t0[2J[01;01HBdsDxe: loading Boot0001 "UEFI QEMU HARDDISK QM00001 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x0,0xFFFF,0x0)
 BdsDxe: starting Boot0001 "UEFI QEMU HARDDISK QM00001 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x0,0xFFFF,0x0)
-[2J[01;01HK: memory init
-K: memory done, firmware tables
-K: registered GOP framebuffer 1280x800
-K: sched init
-K: smp init
-K: per core init
-K: proc_create pid=3 entry=0x3d2653c3000
-K: proc_create pid=4 entry=0x3d56bdb3000
-K: proc_create pid=5 entry=0x3db1363d000
-K: proc_create pid=6 entry=0x3dd7779f000
-K: proc_create pid=7 entry=0x3df96691000
-K: proc_create pid=8 entry=0x3e1db6d7000
-[boot+0.072] INFO  router  : service thread started
-[2J[H=== Zag RouterOS Console ===
+[2J[01;01H[2J[H=== Zag RouterOS Console ===
 Type 'help' for available commands.
+[boot+0.070] INFO  router  : service thread started
 Use 'load-config' to restore saved settings.
 
-> [boot+0.094] INFO  router  : nfs channel connected
-[boot+0.113] INFO  router  : ntp channel connected
+> [boot+0.073] INFO  router  : nfs channel connected
+[boot+0.076] INFO  router  : ntp channel connected
+[00:50:03] INFO  router  : http channel connected
+[00:50:03] INFO  router  : console channel connected
 nfs3: CREATE error status=17
 nfs_client: log file created
-[22:14:06] INFO  router  : http channel connected
-[22:14:06] INFO  router  : console channel connected
 
 > arp
 WAN 10.0.2.1 e6:11:e1:e5:b6:b9
 LAN 10.1.1.50 3a:26:f0:f3:db:fc
----
 > arp
 WAN 10.0.2.1 e6:11:e1:e5:b6:b9
 LAN 10.1.1.50 3a:26:f0:f3:db:fc
----
 > arp
 WAN 10.0.2.1 e6:11:e1:e5:b6:b9
 LAN 10.1.1.50 3a:26:f0:f3:db:fc
----
 > arp
 WAN 10.0.2.1 e6:11:e1:e5:b6:b9
 LAN 10.1.1.50 3a:26:f0:f3:db:fc
----
+> leases
+(empty)
+> leases
+10.1.1.100 02:00:00:00:00:30
+> status
+WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
+LAN: 10.1.1.1 mac=52:54:00:12:34:57
+> nfs_client: retrying...
+leases
+10.1.1.100 02:00:00:00:00:30
+> dhcp-client[00:50:08] INFO  dhcp    : sent DISCOVER
+
+DHCP client: idle -> discovering
+> status
+WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
+LAN: 10.1.1.1 mac=52:54:00:12:34:57
+> status
+WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
+LAN: 10.1.1.1 mac=52:54:00:12:34:57
+> dhcp-client
+DHCP client: discovering
+> dhcp-client
+DHCP client: discovering
+> dhcp-client
+DHCP client: discovering
+> dhcp-client
+DHCP client: discovering
+> dhcp-client
+DHCP client: discovering
+> dhcp-client
+DHCP client: discovering
+> dhcp-client
+DHCP client: discovering
+> dhcp-client
+DHCP client: discovering
+> dhcp-client
+DHCP client: discovering
+> [00:50:22] WARN  dhcp    : timeout, retrying
+[00:50:22] INFO  dhcp    : sent DISCOVER
+[00:50:22] INFO  dhcp    : offered 10.0.2.15
+[00:50:22] INFO  dhcp    : sent REQUEST
+[00:50:22] INFO  dhcp    : bound to 10.0.2.15
+dhcp-client
+DHCP client: bound
+> dhcp-test-rebind[00:50:24] INFO  dhcp    : sent REBIND
+[00:50:24] INFO  dhcp    : bound to 10.0.2.15
+
+rebinding
+> 
+> dhcp-client
+DHCP client: bound
+> static-lease aa:bb:cc:dd:ee:01 10.1.1.50
+OK
+> static-lease aa:bb:cc:dd:ee:02 10.1.1.51
+OK
+> static-leases
+10.1.1.50 aa:bb:cc:dd:ee:01
+10.1.1.51 aa:bb:cc:dd:ee:02
+> static-lease ZZZZ 10.1.1.50
+usage: static-lease <mac> <ip>
+> static-lease aa:bb:cc:dd:ee:03 999.999.999.999
+invalid IP
+> nfs_client: retrying...
+static-lease aa:bb:cc:dd:ee:04 192.168.1.50
+IP must be 10.1.1.2-255
+> static-lease aa:bb:cc:dd:ee:05 10.1.1.52
+OK
+> static-lease aa:bb:cc:dd:ee:06 10.1.1.52
+conflict: MAC or IP already reserved
+> static-lease aa:bb:cc:dd:ee:07 10.1.1.53
+OK
+> get-config
+static-lease aa:bb:cc:dd:ee:01 10.1.1.50
+static-lease aa:bb:cc:dd:ee:02 10.1.1.51
+static-lease aa:bb:cc:dd:ee:05 10.1.1.52
+static-lease aa:bb:cc:dd:ee:07 10.1.1.53
 > dns 10.0.2.1
 OK
 > dns 10.0.2.1
@@ -48,49 +108,504 @@ OK
 OK
 > dns 10.0.2.1
 OK
+> block 10.0.2.100
+OK
+> rules
+block 10.0.2.100
+> allow 10.0.2.100
+OK
+> rules
+(empty)
+> block 10.0.2.1
+OK
+> rules
+block 10.0.2.1
+> allow 10.0.2.1
+OK
+> block 10.55.55.55
+OK
+> rules
+block 10.55.55.55
+> allow 10.55.55.55
+OK
+> block 10.0.2.1
+OK
+> allow 10.0.2.1
+OK
+> block 10.33.33.33
+OK
+> rules
+block 10.33.33.33
+> status
+WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
+LAN: 10.1.1.1 mac=52:54:00:12:34:57
+> ifstat
+WAN rx=55 tx=183 drop=0
+LAN rx=134 tx=33 drop=0
+> rules
+block 10.33.33.33
+> allow 10.33.33.33
+OK
+> forward tcp 8080 10.1.1.50 80
+OK
+> rules
+forward tcp :8080 -> 10.1.1.50:80
+> forward tcp 7778 10.1.1.60 7777
+OK
+> forward udp 7780 10.1.1.60 7779
+OK
+> forward udp 19950 10.1.1.60 19950
+OK
+> ifstat
+WAN rx=72 tx=193 drop=0
+LAN rx=152 tx=64 drop=0
+> version
+Zag RouterOS v0.1
+> version
+Zag RouterOS v0.1
+> version
+Zag RouterOS v0.1
+> version
+Zag RouterOS v0.1
 > ping 10.0.2.1
-reply from 10.0.2.1: seq=0 time=105us
-reply from 10.0.2.1: seq=1 time=79us
-reply from 10.0.2.1: seq=2 time=76us
-reply from 10.0.2.1: seq=3 time=77us
+reply from 10.0.2.1: seq=0 time=80us
+reply from 10.0.2.1: seq=1 time=56us
+reply from 10.0.2.1: seq=2 time=66us
+reply from 10.0.2.1: seq=3 time=80us
 --- ping 10.0.2.1: 4 sent, 4 received ---
+> version
+Zag RouterOS v0.1
+> [00:51:32] INFO  dhcp    : T1 renewal
+[00:51:32] INFO  dhcp    : sent REQUEST
+[00:51:42] WARN  dhcp    : timeout, retrying request
+[00:51:42] INFO  dhcp    : sent REQUEST
+[00:51:52] WARN  dhcp    : timeout, retrying request
+[00:51:52] INFO  dhcp    : sent REQUEST
+[00:52:02] WARN  dhcp    : timeout, retrying request
+[00:52:02] INFO  dhcp    : sent REQUEST
+dhcpv6[00:52:04] INFO  dhcpv6  : sent SOLICIT
+
+DHCPv6: idle -> soliciting
+> [00:52:12] INFO  dhcp    : T2 rebind
+[00:52:12] INFO  dhcp    : sent REBIND
+[00:52:22] WARN  dhcp    : timeout, retrying rebind
+[00:52:22] INFO  dhcp    : sent REBIND
+[00:52:22] WARN  dhcpv6  : timeout, retrying
+[00:52:22] INFO  dhcpv6  : sent SOLICIT
+nfs_client: retrying...
+[00:52:32] WARN  dhcp    : lease expired, restarting
+[00:52:32] INFO  dhcp    : sent DISCOVER
+[00:52:42] WARN  dhcp    : timeout, retrying
+[00:52:42] INFO  dhcp    : sent DISCOVER
+[00:52:42] WARN  dhcpv6  : timeout, retrying
+[00:52:42] INFO  dhcpv6  : sent SOLICIT
+nfs_client: retrying...
+[00:53:02] WARN  dhcp    : timeout, retrying
+[00:53:02] INFO  dhcp    : sent DISCOVER
+[00:53:02] WARN  dhcpv6  : timeout, retrying
+[00:53:02] INFO  dhcpv6  : sent SOLICIT
+version
+Zag RouterOS v0.1
+> nfs_client: retrying...
+version
+Zag RouterOS v0.1
 > nat
 (empty)
----
-> nat
-(empty)
----
-> nat
-icmp 10.1.1.60:15409 -> :10000 -> 10.0.2.1:0
----
-> nat
-icmp 10.1.1.60:15409 -> :10000 -> 10.0.2.1:0
-tcp 10.1.1.60:46490 -> :10001 -> 10.0.2.1:19876
----
-> nat
-icmp 10.1.1.60:15409 -> :10000 -> 10.0.2.1:0
-tcp 10.1.1.60:46490 -> :10001 -> 10.0.2.1:19876
----
-> nat
-icmp 10.1.1.60:15409 -> :10000 -> 10.0.2.1:0
-tcp 10.1.1.60:46490 -> :10001 -> 10.0.2.1:19876
-udp 10.1.1.60:58727 -> :10002 -> 10.0.2.1:19878
----
-> dns 10.0.2.1
+> block 10.99.99.99
 OK
+> rules
+block 10.99.99.99
+forward tcp :8080 -> 10.1.1.50:80
+forward tcp :7778 -> 10.1.1.60:7777
+forward udp :7780 -> 10.1.1.60:7779
+forward udp :19950 -> 10.1.1.60:19950
+> allow 10.99.99.99
+OK
+> nat
+tcp 10.1.1.60:33830 -> :10003 -> 10.0.2.1:19900
+> nat
+icmp 10.1.1.60:60954 -> :10004 -> 10.0.2.1:0
+tcp 10.1.1.60:33830 -> :10003 -> 10.0.2.1:19900
+> nat
+tcp 10.1.1.60:56248 -> :10005 -> 10.0.2.1:19876
+icmp 10.1.1.60:60954 -> :10004 -> 10.0.2.1:0
+tcp 10.1.1.60:33830 -> :10003 -> 10.0.2.1:19900
+> nat
+tcp 10.1.1.60:56248 -> :10005 -> 10.0.2.1:19876
+icmp 10.1.1.60:60954 -> :10004 -> 10.0.2.1:0
+tcp 10.1.1.60:33830 -> :10003 -> 10.0.2.1:19900
+> [00:53:12] WARN  dhcp    : timeout, retrying
+[00:53:12] INFO  dhcp    : sent DISCOVER
+[00:53:12] WARN  dhcpv6  : timeout, retrying
+[00:53:12] INFO  dhcpv6  : sent SOLICIT
+nat
+tcp 10.1.1.60:56248 -> :10005 -> 10.0.2.1:19876
+icmp 10.1.1.60:60954 -> :10004 -> 10.0.2.1:0
+tcp 10.1.1.60:33830 -> :10003 -> 10.0.2.1:19900
+udp 10.1.1.60:34247 -> :10006 -> 10.0.2.1:19878
+> ls
+subdir
+hello.txt
+router.cfg
+logs
+nice
+> ls
+subdir
+hello.txt
+router.cfg
+logs
+nice
+> cat hello.txt
+Hello from NFS
 > ping 10.0.2.1
-reply from 10.0.2.1: seq=0 time=68us
+reply from 10.0.2.1: seq=0 time=97us
+reply from 10.0.2.1: seq=1 time=66us
+reply from 10.0.2.1: seq=2 time=77us
+reply from 10.0.2.1: seq=3 time=85us
+--- ping 10.0.2.1: 4 sent, 4 received ---
+> mkdir test_mkdir_dir
+OK
+> ping 10.0.2.1
+reply from 10.0.2.1: seq=0 time=86us
+reply from 10.0.2.1: seq=1 time=65us
+reply from 10.0.2.1: seq=2 time=92us
+reply from 10.0.2.1: seq=3 time=105us
+--- ping 10.0.2.1: 4 sent, 4 received ---
+[00:53:22] WARN  dhcp    : timeout, retrying
+[00:53:22] INFO  dhcp    : sent DISCOVER
+[00:53:22] WARN  dhcpv6  : timeout, retrying
+[00:53:22] INFO  dhcpv6  : sent SOLICIT
+> nfs_client: retrying...
+rm test_rm_file.txt
+OK
+> ls
+subdir
+hello.txt
+router.cfg
+logs
+nice
+> ls subdir
+nested.txt
+> cat hello.txt
+Hello from NFS
+> ping 10.0.2.1
+reply from 10.0.2.1: seq=0 time=91us
+reply from 10.0.2.1: seq=1 time=72us
+reply from 10.0.2.1: seq=2 time=105us
+reply from 10.0.2.1: seq=3 time=78us
+--- ping 10.0.2.1: 4 sent, 4 received ---
+[00:53:32] WARN  dhcp    : timeout, retrying
+[00:53:32] INFO  dhcp    : sent DISCOVER
+[00:53:32] WARN  dhcpv6  : timeout, retrying
+[00:53:32] INFO  dhcpv6  : sent SOLICIT
+> rmdir test_rmdir_dir
+OK
+> ping 10.0.2.1
+reply from 10.0.2.1: seq=0 time=81us
 reply from 10.0.2.1: seq=1 time=58us
-reply from 10.0.2.1: seq=2 time=65us
-reply from 10.0.2.1: seq=3 time=65us
+reply from 10.0.2.1: seq=2 time=99us
+reply from 10.0.2.1: seq=3 time=76us
 --- ping 10.0.2.1: 4 sent, 4 received ---
-> ping 10.1.1.50
-reply from 10.1.1.50: seq=0 time=93us
-reply from 10.1.1.50: seq=1 time=76us
-reply from 10.1.1.50: seq=2 time=61us
-reply from 10.1.1.50: seq=3 time=42us
---- ping 10.1.1.50: 4 sent, 4 received ---
+[00:53:42] WARN  dhcp    : timeout, retrying
+[00:53:42] INFO  dhcp    : sent DISCOVER
+[00:53:42] WARN  dhcpv6  : timeout, retrying
+[00:53:42] INFO  dhcpv6  : sent SOLICIT
+> mv test_mv_src.txt test_mv_dst.txt
+OK
+> ping 10.0.2.1
+reply from 10.0.2.1: seq=0 time=83us
+reply from 10.0.2.1: seq=1 time=53us
+reply from 10.0.2.1: seq=2 time=66us
+reply from 10.0.2.1: seq=3 time=67us
+--- ping 10.0.2.1: 4 sent, 4 received ---
+> stat hello.txt
+type=file size=15
+> ping 10.0.2.1
+reply from 10.0.2.1: seq=0 time=100us
+reply from 10.0.2.1: seq=1 time=67us
+reply from 10.0.2.1: seq=2 time=80us
+reply from 10.0.2.1: seq=3 time=67us
+--- ping 10.0.2.1: 4 sent, 4 received ---
+> touch test_touch_file.txt
+OK
+> time
+2026-04-05 18:53:58 UTC-6
+> ntpserver 10.0.2.1
+OK
+> ntpserver 10.0.2.1
+OK
+> timezone -5
+OK UTC-5
+> timezone -5
+OK UTC-5
+> ntpserver 10.0.2.1
+OK
+> sync
+NTP: synced to 10.0.2.1 | 2026-04-05 19:54:00 UTC-5
+> time
+2026-04-05 19:54:00 UTC-5
+> timezone +3
+OK UTC+3
+> timezone +5:30
+OK UTC+5:30
+> timezone abc
+invalid offset (e.g. -6, +5:30)
+> timezone -6
+OK UTC-6
+> [00:54:02] WARN  dhcp    : timeout, retrying
+[00:54:02] INFO  dhcp    : sent DISCOVER
+[00:54:02] WARN  dhcpv6  : timeout, retrying
+[00:54:02] INFO  dhcpv6  : sent SOLICIT
+rules
+forward tcp :8080 -> 10.1.1.50:80
+forward tcp :7778 -> 10.1.1.60:7777
+forward udp :7780 -> 10.1.1.60:7779
+forward udp :19950 -> 10.1.1.60:19950
+forward tcp :18181 -> 10.1.1.60:8181
+> nfs_client: retrying...
+rules
+forward tcp :8080 -> 10.1.1.50:80
+forward tcp :7778 -> 10.1.1.60:7777
+forward udp :7780 -> 10.1.1.60:7779
+forward udp :19950 -> 10.1.1.60:19950
+forward tcp :18181 -> 10.1.1.60:8181
+forward tcp :19876 -> 10.1.1.60:9999
+> [00:54:12] WARN  dhcp    : timeout, retrying
+[00:54:12] INFO  dhcp    : sent DISCOVER
+[00:54:12] WARN  dhcpv6  : timeout, retrying
+[00:54:12] INFO  dhcpv6  : sent SOLICIT
+nfs_client: retrying...
+rules
+forward tcp :8080 -> 10.1.1.50:80
+forward tcp :7778 -> 10.1.1.60:7777
+forward udp :7780 -> 10.1.1.60:7779
+forward udp :19950 -> 10.1.1.60:19950
+forward tcp :18181 -> 10.1.1.60:8181
+forward tcp :19876 -> 10.1.1.60:9999
+forward udp :19877 -> 10.1.1.60:7777
+> [00:54:22] WARN  dhcp    : timeout, retrying
+[00:54:22] INFO  dhcp    : sent DISCOVER
+[00:54:22] WARN  dhcpv6  : timeout, retrying
+[00:54:22] INFO  dhcpv6  : sent SOLICIT
+rules
+forward tcp :8080 -> 10.1.1.50:80
+forward tcp :7778 -> 10.1.1.60:7777
+forward udp :7780 -> 10.1.1.60:7779
+forward udp :19950 -> 10.1.1.60:19950
+forward tcp :18181 -> 10.1.1.60:8181
+forward tcp :19876 -> 10.1.1.60:9999
+> block 10.88.88.88
+OK
+> rules
+block 10.88.88.88
+forward tcp :8080 -> 10.1.1.50:80
+forward tcp :7778 -> 10.1.1.60:7777
+forward udp :7780 -> 10.1.1.60:7779
+forward udp :19950 -> 10.1.1.60:19950
+forward tcp :18181 -> 10.1.1.60:8181
+forward tcp :19876 -> 10.1.1.60:9999
+> allow 10.88.88.88
+OK
+> forward tcp 9090 10.1.1.50 80
+OK
+> rules
+forward tcp :8080 -> 10.1.1.50:80
+forward tcp :7778 -> 10.1.1.60:7777
+forward udp :7780 -> 10.1.1.60:7779
+forward udp :19950 -> 10.1.1.60:19950
+forward tcp :18181 -> 10.1.1.60:8181
+forward tcp :19876 -> 10.1.1.60:9999
+forward tcp :9090 -> 10.1.1.50:80
 > dns 10.0.2.1
 OK
-> QEMU 10.1.2 monitor - type 'help' for more information
+> leases
+10.1.1.100 02:00:00:00:00:30
+> static-lease aa:bb:cc:dd:ee:10 10.1.1.40
+OK
+> get-config
+forward tcp 8080 10.1.1.50 80
+forward tcp 7778 10.1.1.60 7777
+forward udp 7780 10.1.1.60 7779
+forward udp 19950 10.1.1.60 19950
+forward tcp 18181 10.1.1.60 8181
+forward tcp 19876 10.1.1.60 9999
+forward tcp 9090 10.1.1.50 80
+static-lease aa:bb:cc:dd:ee:01 10.1.1.50
+static-lease aa:bb:cc:dd:ee:02 10.1.1.51
+static-lease aa:bb:cc:dd:ee:05 10.1.1.52
+static-lease aa:bb:cc:dd:ee:07 10.1.1.53
+static-lease aa:bb:cc:dd:ee:10 10.1.1.40
+> nfs_client: retrying...
+ping 10.0.2.1
+reply from 10.0.2.1: seq=0 time=74us
+reply from 10.0.2.1: seq=1 time=68us
+reply from 10.0.2.1: seq=2 time=82us
+reply from 10.0.2.1: seq=3 time=84us
+--- ping 10.0.2.1: 4 sent, 4 received ---
+[00:54:32] WARN  dhcp    : timeout, retrying
+[00:54:32] INFO  dhcp    : sent DISCOVER
+[00:54:32] WARN  dhcpv6  : timeout, retrying
+[00:54:32] INFO  dhcpv6  : sent SOLICIT
+> ping 10.1.1.50
+reply from 10.1.1.50: seq=0 time=96us
+reply from 10.1.1.50: seq=1 time=62us
+reply from 10.1.1.50: seq=2 time=82us
+reply from 10.1.1.50: seq=3 time=59us
+--- ping 10.1.1.50: 4 sent, 4 received ---
+nfs_client: retrying...
+[00:54:42] WARN  dhcp    : timeout, retrying
+[00:54:42] INFO  dhcp    : sent DISCOVER
+[00:54:42] WARN  dhcpv6  : timeout, retrying
+[00:54:42] INFO  dhcpv6  : sent SOLICIT
+> ping 10.0.2.1
+reply from 10.0.2.1: seq=0 time=97us
+reply from 10.0.2.1: seq=1 time=64us
+reply from 10.0.2.1: seq=2 time=89us
+reply from 10.0.2.1: seq=3 time=64us
+--- ping 10.0.2.1: 4 sent, 4 received ---
+nfs_client: retrying...
+> reload ntp_client
+fetching ELF from NFS...
+root: reloaded ntp_client
+K: USER_PF pid=2 addr=0x0 w=false x=true
+killing old process...
+spawning new process...
+reload: OK
+[00:54:50] INFO  router  : ntp channel connected
+reconnected to ntp_client
+> [00:54:52] WARN  dhcp    : timeout, retrying
+[00:54:52] INFO  dhcp    : sent DISCOVER
+time
+2026-04-05 18:54:53 UTC-6
+> reload nonexistent
+reload: error: unknown process
+> ping 10.0.2.1
+reply from 10.0.2.1: seq=0 time=97us
+reply from 10.0.2.1: seq=1 time=55us
+reply from 10.0.2.1: seq=2 time=131us
+reply from 10.0.2.1: seq=3 time=88us
+--- ping 10.0.2.1: 4 sent, 4 received ---
+> reload ntp_client
+fetching ELF from NFS...
+root: reloaded ntp_client
+K: USER_PF pid=2 addr=0x0 w=false x=true
+killing old process...
+spawning new process...
+reload: OK
+[00:55:00] INFO  router  : ntp channel connected
+[00:55:02] WARN  dhcp    : timeout, retrying
+[00:55:02] INFO  dhcp    : sent DISCOVER
+[00:55:02] WARN  dhcpv6  : timeout, retrying
+[00:55:02] INFO  dhcpv6  : sent SOLICIT
+reconnected to ntp_client
+> status
+WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
+LAN: 10.1.1.1 mac=52:54:00:12:34:57
+> ping 10.0.2.1
+reply from 10.0.2.1: seq=0 time=91us
+reply from 10.0.2.1: seq=1 time=58us
+reply from 10.0.2.1: seq=2 time=84us
+reply from 10.0.2.1: seq=3 time=72us
+--- ping 10.0.2.1: 4 sent, 4 received ---
+nfs_client: retrying...
+> reload http_server
+fetching ELF from NFS...
+root: reloaded http_server
+K: USER_PF pid=2 addr=0x0 w=false x=true
+killing old process...
+spawning new process...
+reload: OK
+[00:55:11] INFO  router  : http channel connected
+[00:55:12] WARN  dhcp    : timeout, retrying
+[00:55:12] INFO  dhcp    : sent DISCOVER
+[00:55:12] WARN  dhcpv6  : timeout, retrying
+[00:55:12] INFO  dhcpv6  : sent SOLICIT
+> status
+WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
+LAN: 10.1.1.1 mac=52:54:00:12:34:57
+> status
+WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
+LAN: 10.1.1.1 mac=52:54:00:12:34:57
+> status
+WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
+LAN: 10.1.1.1 mac=52:54:00:12:34:57
+> ifstat
+WAN rx=371 tx=1048 drop=0
+LAN rx=679 tx=151 drop=0
+> ifstat
+WAN rx=371 tx=1048 drop=0
+LAN rx=679 tx=151 drop=0
+> version
+Zag RouterOS v0.1
+> uptime
+uptime: 0h 5m 12s
+> traceroute 10.0.2.1
+traceroute to 10.0.2.1, 30 hops max
+1  10.0.2.1  88us
+> traceroute 10.0.2.1
+traceroute to 10.0.2.1, 30 hops max
+1  10.0.2.1  78us
+> traceroute notanip
+invalid IP
+> sync
+nfs_client: retrying...
+ntp_client: timeout
+NTP: timeout
+> dns 10.0.2.1
+OK
+> version
+Zag RouterOS v0.1
+> [00:55:22] WARN  dhcp    : timeout, retrying
+[00:55:22] INFO  dhcp    : sent DISCOVER
+nfs_client: retrying...
+uptime
+uptime: 0h 5m 20s
+> mount
+nfs_client: retrying...
+nfs: no response
+> [00:55:32] WARN  dhcp    : timeout, retrying
+[00:55:32] INFO  dhcp    : sent DISCOVER
+[00:55:32] WARN  dhcpv6  : timeout, retrying
+[00:55:32] INFO  dhcpv6  : sent SOLICIT
+status
+WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
+LAN: 10.1.1.1 mac=52:54:00:12:34:57
+> ifstat
+WAN rx=380 tx=1096 drop=0
+LAN rx=713 tx=155 drop=0
+> nfs_client: retrying...
+status
+WAN: 10.0.2.15 gw=10.0.2.1 mac=52:54:00:12:34:56
+LAN: 10.1.1.1 mac=52:54:00:12:34:57
+> rules
+forward tcp :8080 -> 10.1.1.50:80
+forward tcp :7778 -> 10.1.1.60:7777
+forward udp :7780 -> 10.1.1.60:7779
+forward udp :19950 -> 10.1.1.60:19950
+forward tcp :18181 -> 10.1.1.60:8181
+forward tcp :19876 -> 10.1.1.60:9999
+forward tcp :9090 -> 10.1.1.50:80
+forward tcp :19878 -> 10.1.1.60:80
+> forward tcp 19879 10.1.1.60 80
+OK
+> rules
+forward tcp :8080 -> 10.1.1.50:80
+forward tcp :7778 -> 10.1.1.60:7777
+forward udp :7780 -> 10.1.1.60:7779
+forward udp :19950 -> 10.1.1.60:19950
+forward tcp :18181 -> 10.1.1.60:8181
+forward tcp :19876 -> 10.1.1.60:9999
+forward tcp :9090 -> 10.1.1.50:80
+forward tcp :19878 -> 10.1.1.60:80
+forward tcp :19879 -> 10.1.1.60:80
+> rules
+forward tcp :8080 -> 10.1.1.50:80
+forward tcp :7778 -> 10.1.1.60:7777
+forward udp :7780 -> 10.1.1.60:7779
+forward udp :19950 -> 10.1.1.60:19950
+forward tcp :18181 -> 10.1.1.60:8181
+forward tcp :19876 -> 10.1.1.60:9999
+forward tcp :9090 -> 10.1.1.50:80
+forward tcp :19878 -> 10.1.1.60:80
+> QEMU 10.2.2 monitor - type 'help' for more information
 (qemu) q[K[Dqu[K[D[Dqui[K[D[D[Dquit[K

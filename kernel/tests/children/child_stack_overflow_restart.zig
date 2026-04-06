@@ -49,9 +49,9 @@ pub fn main(perm_view_addr: u64) void {
 
     const base = vm_result.val2;
     // SHM layout: [run_counter: u64][crash_reason: u64][restart_count: u64]
-    const run_counter: *volatile u64 = @ptrFromInt(base);
-    const crash_reason_slot: *volatile u64 = @ptrFromInt(base + 8);
-    const restart_count_slot: *volatile u64 = @ptrFromInt(base + 16);
+    const run_counter: *u64 = @ptrFromInt(base);
+    const crash_reason_slot: *u64 = @ptrFromInt(base + 8);
+    const restart_count_slot: *u64 = @ptrFromInt(base + 16);
 
     const run_count = run_counter.*;
 

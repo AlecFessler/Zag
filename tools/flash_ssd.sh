@@ -2,11 +2,11 @@
 set -euo pipefail
 
 SSD_PART="/dev/nvme0n1p1"
-MNT="/mnt/routeros"
+MNT="/mnt/desktopOS"
 REPO_ROOT="$(dirname "$0")/.."
 BOOT_EFI="$REPO_ROOT/zig-out/img/efi/boot/BOOTX64.EFI"
 KERNEL="$REPO_ROOT/zig-out/img/kernel.elf"
-ROOT_SVC="$REPO_ROOT/routerOS/bin/routerOS.elf"
+ROOT_SVC="$REPO_ROOT/desktopOS/bin/desktopOS.elf"
 
 for f in "$BOOT_EFI" "$KERNEL" "$ROOT_SVC"; do
     if [ ! -f "$f" ]; then

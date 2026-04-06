@@ -6,6 +6,7 @@ const Profile = struct {
     kvm: bool,
     use_llvm: bool,
     iommu: []const u8,
+    display: []const u8 = "none",
 };
 
 const profiles = struct {
@@ -30,12 +31,23 @@ const profiles = struct {
         .use_llvm = true,
         .iommu = "intel",
     };
+    const desktop = Profile{
+        .root_service = "desktopOS/bin/desktopOS.elf",
+        .net = "none",
+        .kvm = true,
+        .use_llvm = true,
+        .iommu = "intel",
+        .display = "gtk",
+    };
+
 };
 
 fn getProfile(name: []const u8) ?Profile {
     if (std.mem.eql(u8, name, "router")) return profiles.router;
     if (std.mem.eql(u8, name, "test")) return profiles.test_;
     if (std.mem.eql(u8, name, "bench")) return profiles.bench;
+    if (std.mem.eql(u8, name, "desktop")) return profiles.desktop;
+
     return null;
 }
 
@@ -52,7 +64,8 @@ pub fn build(b: *std.Build) void {
         if (profile) |p| p.root_service else "kernel/tests/bin/root_service.elf";
     const iommu_type = b.option([]const u8, "iommu", "IOMMU type: intel or amd (default: intel)") orelse
         if (profile) |p| p.iommu else "intel";
-    const display_type = b.option([]const u8, "display", "QEMU display: none, gtk, sdl (default: none)") orelse "none";
+    const display_type = b.option([]const u8, "display", "QEMU display: none, gtk, sdl (default: none)") orelse
+        if (profile) |p| p.display else "none";
     const net_type = b.option([]const u8, "net", "Network: tap, user, or none (default: user)") orelse
         if (profile) |p| p.net else "user";
 
@@ -185,6 +198,19 @@ pub fn build(b: *std.Build) void {
     else
         "-device amd-iommu"
     ;
+    const qemu_usb_args: []const u8 = if (profile_name != null and std.mem.eql(u8, profile_name.?, "desktop"))
+        \\-device qemu-xhci,id=xhci \
+        \\-device usb-kbd,bus=xhci.0 \
+        \\-device usb-mouse,bus=xhci.0
+    else
+        ""
+    ;
+    const qemu_nvme_args: []const u8 = if (profile_name != null and std.mem.eql(u8, profile_name.?, "desktop"))
+        \\-drive file=nvme.img,format=raw,if=none,id=nvme0 \
+        \\-device nvme,drive=nvme0,serial=zagdisk0
+    else
+        ""
+    ;
     const qemu_net_args: []const u8 = if (std.mem.eql(u8, net_type, "tap"))
         \\-netdev tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=off \
         \\-device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
@@ -216,12 +242,20 @@ pub fn build(b: *std.Build) void {
         \\ {s} \
         \\ {s} \
         \\ {s} \
+        \\ {s} \
+        \\ {s} \
         \\ -smp cores=4
-    , .{ b.install_path, out_dir, display_type, qemu_accel_args, qemu_machine_args, qemu_iommu_args, qemu_net_args });
+    , .{ b.install_path, out_dir, display_type, qemu_accel_args, qemu_machine_args, qemu_iommu_args, qemu_net_args, qemu_usb_args, qemu_nvme_args });
+    // Create NVMe disk image if it doesn't exist
+    const create_nvme_img = b.addSystemCommand(&[_][]const u8{
+        "sh", "-c", "test -f nvme.img || dd if=/dev/zero of=nvme.img bs=1M count=64 2>/dev/null",
+    });
+
     const qemu_cmd = b.addSystemCommand(&[_][]const u8{
         "sh", "-lc", qemu_cmdline,
     });
     qemu_cmd.step.dependOn(b.getInstallStep());
+    qemu_cmd.step.dependOn(&create_nvme_img.step);
     const run_qemu_cmd = b.step("run", "Run QEMU");
     run_qemu_cmd.dependOn(&qemu_cmd.step);
 }

@@ -7,6 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TARGET="all"
 PYTEST_K=""
 PYTEST_FILE=""
+FAIL_FAST=""
 ITERATIONS="100000"
 SEED="42"
 
@@ -25,6 +26,7 @@ Options:
   -h, --help        Show this help
   -k EXPR           Pass -k filter to pytest (router tests only)
   -f FILE           Run specific pytest file (router tests only)
+  -x                Exit after first test failure (router tests only)
   --iterations N    Fuzzer iteration count (default: 100000)
   --seed N          Fuzzer seed (default: 42)
 
@@ -58,6 +60,10 @@ while [[ $# -gt 0 ]]; do
         -f)
             PYTEST_FILE="$2"
             shift 2
+            ;;
+        -x)
+            FAIL_FAST="-x"
+            shift
             ;;
         --iterations)
             ITERATIONS="$2"
@@ -120,6 +126,9 @@ run_router_tests() {
 
     echo "=== Router Integration Tests ==="
     local pytest_args=("-v")
+    if [[ -n "$FAIL_FAST" ]]; then
+        pytest_args+=("-x")
+    fi
     if [[ -n "$PYTEST_K" ]]; then
         pytest_args+=("-k" "$PYTEST_K")
     fi

@@ -51,7 +51,7 @@ fn testRevokeVmReservation() void {
     }
     const handle: u64 = @intCast(result.val);
     const base = result.val2;
-    const ptr: *volatile u8 = @ptrFromInt(base);
+    const ptr: *u8 = @ptrFromInt(base);
     ptr.* = 77;
     const rc = syscall.revoke_perm(handle);
     t.expectEqual("S2.3.revoke(vm_reservation): frees pages, removes nodes", 0, rc);
@@ -88,7 +88,7 @@ fn testRevokeShmUnmapsAndClearsSlot() void {
     }
     const vm_handle: u64 = @intCast(vm_result.val);
     _ = syscall.shm_map(@intCast(shm_handle), vm_handle, 0);
-    const ptr: *volatile u64 = @ptrFromInt(vm_result.val2);
+    const ptr: *u64 = @ptrFromInt(vm_result.val2);
     ptr.* = 0xDEAD;
     const rc = syscall.revoke_perm(@intCast(shm_handle));
     t.expectEqual("S2.2: revoke SHM handle unmaps PTEs and clears slot", 0, rc);

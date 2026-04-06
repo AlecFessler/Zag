@@ -13,7 +13,7 @@ fn incrementThread() void {
     var i: u32 = 0;
     while (i < 100) : (i += 1) {
         mutex.lock();
-        @as(*volatile u64, &shared_counter).* += 1;
+        shared_counter += 1;
         mutex.unlock();
     }
     _ = @atomicRmw(u64, &done_flag, .Add, 1, .release);
@@ -28,7 +28,7 @@ var condvar_done: u64 align(8) = 0;
 
 fn condvarWaiterThread() void {
     condvar_mutex.lock();
-    while (@as(*volatile u64, &condvar_value).* == 0) {
+    while (@atomicLoad(u64, &condvar_value, .acquire) == 0) {
         condvar.wait(&condvar_mutex);
     }
     condvar_mutex.unlock();
@@ -42,7 +42,7 @@ var sem_received: u64 align(8) = 0;
 
 fn semWaiterThread() void {
     sem.wait();
-    @as(*volatile u64, &sem_received).* = 1;
+    @atomicStore(u64, &sem_received, 1, .release);
     _ = syscall.futex_wake(&sem_received, 1);
     syscall.thread_exit();
 }
@@ -66,8 +66,8 @@ fn testMutexUncontended() void {
 }
 
 fn testMutexContended() void {
-    @as(*volatile u64, &shared_counter).* = 0;
-    @as(*volatile u64, &done_flag).* = 0;
+    @atomicStore(u64, &shared_counter, 0, .release);
+    @atomicStore(u64, &done_flag, 0, .release);
 
     const rc1 = syscall.thread_create(&incrementThread, 0, 4);
     const rc2 = syscall.thread_create(&incrementThread, 0, 4);
@@ -80,7 +80,7 @@ fn testMutexContended() void {
         _ = syscall.futex_wait(&done_flag, @atomicLoad(u64, &done_flag, .acquire), @bitCast(@as(i64, -1)));
     }
 
-    const val = @as(*volatile u64, &shared_counter).*;
+    const val = @atomicLoad(u64, &shared_counter, .acquire);
     if (val == 200) {
         t.pass("mutex: 2 threads x 100 increments = 200 (no data race)");
     } else {
@@ -89,8 +89,8 @@ fn testMutexContended() void {
 }
 
 fn testCondvarSignal() void {
-    @as(*volatile u64, &condvar_value).* = 0;
-    @as(*volatile u64, &condvar_done).* = 0;
+    @atomicStore(u64, &condvar_value, 0, .release);
+    @atomicStore(u64, &condvar_done, 0, .release);
     condvar_mutex = sync.Mutex.init();
     condvar = sync.Condvar.init();
 
@@ -104,7 +104,7 @@ fn testCondvarSignal() void {
     syscall.thread_yield();
 
     condvar_mutex.lock();
-    @as(*volatile u64, &condvar_value).* = 1;
+    @atomicStore(u64, &condvar_value, 1, .release);
     condvar.signal();
     condvar_mutex.unlock();
 
@@ -117,7 +117,7 @@ fn testCondvarSignal() void {
 
 fn testSemaphoreBlocking() void {
     sem = sync.Semaphore.init(0);
-    @as(*volatile u64, &sem_received).* = 0;
+    @atomicStore(u64, &sem_received, 0, .release);
 
     const rc = syscall.thread_create(&semWaiterThread, 0, 4);
     if (rc != 0) {

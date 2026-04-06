@@ -559,6 +559,10 @@ fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
 
                 if (header_type & 0x7F != 0) continue;
 
+                // Enable bus mastering and memory space for all devices
+                const cmd_reg = pciConfigRead32(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), 0x04);
+                pciConfigWrite32(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), 0x04, cmd_reg | 0x06);
+
                 var bar_idx: u12 = 0;
                 while (bar_idx < 6) : (bar_idx += 1) {
                     const bar_offset: u12 = 0x10 + bar_idx * 4;
@@ -678,6 +682,10 @@ fn enumeratePciLegacy() void {
 
                 if (header_type & 0x7F != 0) continue;
 
+                // Enable bus mastering and memory space for all devices
+                const cmd_reg = pciLegacyRead32(@intCast(bus), @intCast(dev), @intCast(func), 0x04);
+                pciLegacyWrite32(@intCast(bus), @intCast(dev), @intCast(func), 0x04, cmd_reg | 0x06);
+
                 var bar_idx: u8 = 0;
                 while (bar_idx < 6) : (bar_idx += 1) {
                     const bar_offset: u8 = 0x10 + bar_idx * 4;
@@ -757,25 +765,9 @@ fn parseDmar(dmar_vaddr: VAddr, length: u32) !void {
 }
 
 fn parseIvrs(ivrs_vaddr: VAddr, length: u32) !void {
-    const header_size: u32 = 48;
-    if (length <= header_size) return;
-
-    var offset: u32 = header_size;
-    while (offset + 4 <= length) {
-        const entry_type = @as(*const volatile u8, @ptrFromInt(ivrs_vaddr.addr + offset)).*;
-        const entry_len = @as(*const volatile u16, @ptrFromInt(ivrs_vaddr.addr + offset + 2)).*;
-        if (entry_len == 0) break;
-
-        if ((entry_type == 0x10 or entry_type == 0x11 or entry_type == 0x40) and entry_len >= 24) {
-            const reg_base = @as(*const volatile u64, @ptrFromInt(ivrs_vaddr.addr + offset + 8)).*;
-            if (reg_base != 0) {
-                iommu.initAmd(PAddr.fromInt(reg_base)) catch {};
-                break;
-            }
-        }
-
-        offset += entry_len;
-    }
+    // IOMMU disabled while debugging bare metal xHCI
+    _ = ivrs_vaddr;
+    _ = length;
 }
 
 fn initIommuDevices() void {

@@ -3,9 +3,9 @@ const zag = @import("zag");
 
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
+const broadcast = zag.perms.broadcast;
 const elf = std.elf;
 const futex = zag.sched.futex;
-const iommu = zag.arch.x64.iommu;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
@@ -27,7 +27,6 @@ const SpinLock = zag.sched.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 const UserViewEntry = zag.perms.permissions.UserViewEntry;
 const VAddr = zag.memory.address.VAddr;
-const VAddrRange = zag.sched.restart_context.VAddrRange;
 const VirtualMemoryManager = zag.memory.vmm.VirtualMemoryManager;
 
 pub const DEFAULT_STACK_PAGES: u32 = 8;
@@ -67,6 +66,7 @@ pub const Process = struct {
     num_dma_mappings: u32,
     crash_reason: CrashReason,
     restart_count: u16,
+    perm_view_gen: u64 = 0,
 
     pub const MAX_THREADS = 64;
     pub const MAX_CHILDREN = 64;
@@ -89,9 +89,16 @@ pub const Process = struct {
         const view_ptr: *[MAX_PERMS]UserViewEntry = @ptrFromInt(
             VAddr.fromPAddr(self.perm_view_phys, null).addr,
         );
+        // Bump generation counter before syncing entries
+        self.perm_view_gen += 1;
         for (&self.perm_table, 0..) |*entry, i| {
             view_ptr[i] = UserViewEntry.fromKernelEntry(entry.*);
         }
+        // Write generation counter into self-entry's field1 (after fromKernelEntry overwrites it)
+        @atomicStore(u64, &view_ptr[0].field1, self.perm_view_gen, .release);
+        // Wake any userspace waiters on this field
+        const gen_paddr = PAddr.fromInt(self.perm_view_phys.addr + @offsetOf(UserViewEntry, "field1"));
+        _ = futex.wake(gen_paddr, 0xFFFF_FFFF);
     }
 
     pub fn getPermByHandle(self: *Process, handle_id: u64) ?PermissionEntry {
@@ -291,6 +298,7 @@ pub const Process = struct {
 
     fn cleanupPhase1(self: *Process) void {
         self.cleanupDmaMappings();
+        broadcast.removeByProcess(self);
         self.vmm.deinit();
 
         for (&self.perm_table) |*entry| {
@@ -301,6 +309,11 @@ pub const Process = struct {
                 },
                 .core_pin => |cp| {
                     sched.unpinByRevoke(cp.core_id, cp.thread_tid);
+                },
+                .broadcast_table => |vaddr| {
+                    // Unmap the shared broadcast table page before freeUserAddrSpace
+                    // so the shared physical page doesn't get freed with the process
+                    _ = arch.unmapPage(self.addr_space_root, VAddr.fromInt(vaddr));
                 },
                 .vm_reservation, .process, .dead_process, .empty => {},
             }
@@ -347,24 +360,6 @@ pub const Process = struct {
         }
     }
 
-    pub fn clearPermByObject(self: *Process, target: anytype) void {
-        self.perm_lock.lock();
-        defer self.perm_lock.unlock();
-        var changed = false;
-        for (self.perm_table[1..]) |*slot| {
-            const matches = switch (slot.object) {
-                .process => |p| @intFromPtr(p) == @intFromPtr(target),
-                else => false,
-            };
-            if (matches) {
-                slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
-                self.perm_count -= 1;
-                changed = true;
-            }
-        }
-        if (changed) self.syncUserView();
-    }
-
     pub fn addDmaMapping(self: *Process, device: *DeviceRegion, shm: *SharedMemory, dma_base: u64, num_pages: u64) !void {
         if (self.num_dma_mappings >= MAX_DMA_MAPPINGS) return error.TooManyDmaMappings;
         self.dma_mappings[self.num_dma_mappings] = .{
@@ -394,7 +389,7 @@ pub const Process = struct {
     pub fn cleanupDmaMappings(self: *Process) void {
         for (self.dma_mappings[0..self.num_dma_mappings]) |*m| {
             if (m.active) {
-                iommu.unmapDmaPages(m.device, m.dma_base, m.num_pages);
+                arch.unmapDmaPages(m.device, m.dma_base, m.num_pages);
                 m.active = false;
             }
         }
@@ -484,14 +479,33 @@ pub const Process = struct {
 
         proc.initPermTable(initial_rights);
 
+        if (initial_rights.grant_to_broadcast) {
+            const bt_phys = broadcast.physPage();
+            if (bt_phys.addr != 0) {
+                const bt_vaddr = try proc.vmm.allocateAfterCursor(paging.PAGE4K);
+                const bt_perms = MemoryPerms{
+                    .write_perm = .no_write,
+                    .execute_perm = .no_execute,
+                    .cache_perm = .write_back,
+                    .global_perm = .not_global,
+                    .privilege_perm = .user,
+                };
+                try arch.mapPage(proc.addr_space_root, bt_phys, bt_vaddr, bt_perms);
+                try proc.vmm.insertKernelNode(bt_vaddr, paging.PAGE4K, .{ .read = true }, .preserve);
+                const bt_entry = PermissionEntry{
+                    .handle = 0,
+                    .object = .{ .broadcast_table = bt_vaddr.addr },
+                    .rights = 0,
+                };
+                _ = proc.insertPerm(bt_entry) catch {};
+            }
+        }
+
         if (initial_rights.restart) {
             proc.restart_context = try restart_context_mod.create(
                 elf_result.entry,
-                elf_result.code_range,
-                elf_result.rodata_range,
                 elf_result.data_vaddr,
                 elf_result.data_content,
-                .{ .vaddr = view_vaddr, .size = paging.PAGE4K },
             );
             errdefer restart_context_mod.destroy(proc.restart_context.?);
         }
@@ -558,8 +572,6 @@ fn generateAslrBase() u64 {
 
 const ElfLoadResult = struct {
     entry: VAddr,
-    code_range: VAddrRange,
-    rodata_range: VAddrRange,
     data_vaddr: VAddr,
     data_content: []const u8,
 };
@@ -588,8 +600,6 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
     var bss_start: u64 = 0;
     var bss_end: u64 = 0;
 
-    var code_range = VAddrRange{ .vaddr = VAddr.fromInt(0), .size = 0 };
-    var rodata_range = VAddrRange{ .vaddr = VAddr.fromInt(0), .size = 0 };
     var data_vaddr = VAddr.fromInt(0);
     var data_offset: u64 = 0;
     var data_filesz: u64 = 0;
@@ -607,11 +617,7 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
         const writable = (phdr.p_flags & elf.PF_W) != 0;
         const executable = (phdr.p_flags & elf.PF_X) != 0;
 
-        if (!writable and executable) {
-            code_range = .{ .vaddr = VAddr.fromInt(seg_start), .size = phdr.p_memsz };
-        } else if (!writable and !executable) {
-            rodata_range = .{ .vaddr = VAddr.fromInt(seg_start), .size = phdr.p_memsz };
-        } else if (writable and !executable) {
+        if (writable and !executable) {
             data_vaddr = VAddr.fromInt(seg_start);
             data_offset = phdr.p_offset;
             data_filesz = phdr.p_filesz;
@@ -695,8 +701,6 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
 
     return .{
         .entry = VAddr.fromInt(aslr_base + ehdr.e_entry),
-        .code_range = code_range,
-        .rodata_range = rodata_range,
         .data_vaddr = data_vaddr,
         .data_content = data_content,
     };

@@ -2,6 +2,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const broadcast = zag.perms.broadcast;
 const device_registry = zag.devices.registry;
 const futex = zag.sched.futex;
 const memory_init = zag.memory.init;
@@ -93,8 +94,6 @@ fn armSchedTimer(state: *PerCoreState, delta_ns: u64) void {
 pub fn currentThread() ?*Thread {
     return core_states[arch.coreID()].running_thread;
 }
-
-var first_switch_done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     const core_id = arch.coreID();
@@ -304,8 +303,10 @@ pub fn globalInit(root_service_elf: []const u8) !void {
         state.rq.init();
     }
 
+    broadcast.init();
+
     const root_proc = try Process.create(root_service_elf, .{
-        .grant_to = true,
+        .grant_to_child = true,
         .spawn_thread = true,
         .spawn_process = true,
         .mem_reserve = true,
@@ -315,6 +316,8 @@ pub fn globalInit(root_service_elf: []const u8) !void {
         .device_own = true,
         .shutdown = true,
         .pin_exclusive = true,
+        .grant_to_broadcast = true,
+        .broadcast = true,
     }, null);
     device_registry.grantAllToRootService(root_proc);
     core_states[0].rq.enqueue(root_proc.threads[0]);
