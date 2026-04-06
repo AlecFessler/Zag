@@ -19,26 +19,39 @@ pub const DeviceClass = enum(u8) {
     unknown = 0xFF,
 };
 
-pub const DeviceRegion = struct {
-    phys_base: PAddr,
-    size: u64,
-    base_port: u16,
-    port_count: u16,
-    device_type: DeviceType,
-    device_class: DeviceClass,
-    pci_vendor: u16,
-    pci_device: u16,
-    pci_class: u8,
-    pci_subclass: u8,
-    pci_bus: u8,
-    pci_dev: u8,
-    pci_func: u8,
+pub const Pci = struct {
+    vendor: u16,
+    device: u16,
+    class: u8,
+    subclass: u8,
+    bus: u8,
+    dev: u8,
+    func: u8,
     dma_page_table_root: PAddr,
     dma_cursor: u64,
-    fb_width: u16 = 0,
-    fb_height: u16 = 0,
-    fb_stride: u16 = 0,
-    fb_pixel_format: u8 = 0,
+};
+
+pub const Display = struct {
+    fb_width: u16,
+    fb_height: u16,
+    fb_stride: u16,
+    fb_pixel_format: u8,
+};
+
+pub const DeviceRegion = struct {
+    device_type: DeviceType,
+    device_class: DeviceClass,
+
+    access: union {
+        mmio: struct { phys_base: PAddr, size: u64 },
+        port_io: struct { base_port: u16, port_count: u16 },
+    },
+
+    detail: union {
+        pci: Pci,
+        display: Display,
+        none: void,
+    },
 };
 
 const DeviceRegionSlab = SlabAllocator(DeviceRegion, false, 0, 32, true);
@@ -66,21 +79,20 @@ pub fn createMmio(
     std.debug.assert(slab_initialized);
     const dr = try device_region_slab.allocator().create(DeviceRegion);
     dr.* = .{
-        .phys_base = phys_base,
-        .size = size,
-        .base_port = 0,
-        .port_count = 0,
         .device_type = .mmio,
         .device_class = device_class,
-        .pci_vendor = pci_vendor,
-        .pci_device = pci_device,
-        .pci_class = pci_class,
-        .pci_subclass = pci_subclass,
-        .pci_bus = pci_bus,
-        .pci_dev = pci_dev,
-        .pci_func = pci_func,
-        .dma_page_table_root = PAddr.fromInt(0),
-        .dma_cursor = 0x1000,
+        .access = .{ .mmio = .{ .phys_base = phys_base, .size = size } },
+        .detail = .{ .pci = .{
+            .vendor = pci_vendor,
+            .device = pci_device,
+            .class = pci_class,
+            .subclass = pci_subclass,
+            .bus = pci_bus,
+            .dev = pci_dev,
+            .func = pci_func,
+            .dma_page_table_root = PAddr.fromInt(0),
+            .dma_cursor = 0x1000,
+        } },
     };
     return dr;
 }
@@ -100,21 +112,20 @@ pub fn createPortIo(
     std.debug.assert(slab_initialized);
     const dr = try device_region_slab.allocator().create(DeviceRegion);
     dr.* = .{
-        .phys_base = PAddr.fromInt(0),
-        .size = 0,
-        .base_port = base_port,
-        .port_count = port_count,
         .device_type = .port_io,
         .device_class = device_class,
-        .pci_vendor = pci_vendor,
-        .pci_device = pci_device,
-        .pci_class = pci_class,
-        .pci_subclass = pci_subclass,
-        .pci_bus = pci_bus,
-        .pci_dev = pci_dev,
-        .pci_func = pci_func,
-        .dma_page_table_root = PAddr.fromInt(0),
-        .dma_cursor = 0,
+        .access = .{ .port_io = .{ .base_port = base_port, .port_count = port_count } },
+        .detail = .{ .pci = .{
+            .vendor = pci_vendor,
+            .device = pci_device,
+            .class = pci_class,
+            .subclass = pci_subclass,
+            .bus = pci_bus,
+            .dev = pci_dev,
+            .func = pci_func,
+            .dma_page_table_root = PAddr.fromInt(0),
+            .dma_cursor = 0,
+        } },
     };
     return dr;
 }
@@ -130,25 +141,15 @@ pub fn createDisplay(
     std.debug.assert(slab_initialized);
     const dr = try device_region_slab.allocator().create(DeviceRegion);
     dr.* = .{
-        .phys_base = phys_base,
-        .size = size,
-        .base_port = 0,
-        .port_count = 0,
         .device_type = .mmio,
         .device_class = .display,
-        .pci_vendor = 0,
-        .pci_device = 0,
-        .pci_class = 0,
-        .pci_subclass = 0,
-        .pci_bus = 0,
-        .pci_dev = 0,
-        .pci_func = 0,
-        .dma_page_table_root = PAddr.fromInt(0),
-        .dma_cursor = 0,
-        .fb_width = fb_width,
-        .fb_height = fb_height,
-        .fb_stride = fb_stride,
-        .fb_pixel_format = fb_pixel_format,
+        .access = .{ .mmio = .{ .phys_base = phys_base, .size = size } },
+        .detail = .{ .display = .{
+            .fb_width = fb_width,
+            .fb_height = fb_height,
+            .fb_stride = fb_stride,
+            .fb_pixel_format = fb_pixel_format,
+        } },
     };
     return dr;
 }

@@ -4,6 +4,7 @@ const device_region_mod = zag.memory.device_region;
 
 const DeviceClass = zag.memory.device_region.DeviceClass;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
+const Framebuffer = zag.boot.protocol.Framebuffer;
 const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Process = zag.sched.process.Process;
@@ -73,26 +74,19 @@ pub fn registerPortIoDevice(
     return dr;
 }
 
-pub fn registerDisplayDevice(
-    phys_base: PAddr,
-    size: u64,
-    fb_width: u16,
-    fb_height: u16,
-    fb_stride: u16,
-    fb_pixel_format: u8,
-) !*DeviceRegion {
-    if (device_count >= MAX_DEVICES) return error.TooManyDevices;
-    const dr = try device_region_mod.createDisplay(
-        phys_base,
-        size,
-        fb_width,
-        fb_height,
-        fb_stride,
-        fb_pixel_format,
-    );
+pub fn registerDisplayDevice(fb: Framebuffer) void {
+    if (fb.pixel_format == .none or fb.base.addr == 0) return;
+    if (device_count >= MAX_DEVICES) return;
+    const dr = device_region_mod.createDisplay(
+        fb.base,
+        fb.size,
+        @intCast(fb.width),
+        @intCast(fb.height),
+        @intCast(fb.stride),
+        @intFromEnum(fb.pixel_format),
+    ) catch return;
     device_table[device_count] = dr;
     device_count += 1;
-    return dr;
 }
 
 pub fn grantAllToRootService(root_proc: *Process) void {

@@ -50,5 +50,5 @@ pub fn main(perm_view: u64) void {
     syscall.write("\nAll test suites completed in ");
     t.printDec(elapsed_ms);
     syscall.write("ms\n");
-    syscall.shutdown();
+    syscall.thread_exit();
 }

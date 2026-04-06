@@ -20,9 +20,8 @@ pub const ProcessRights = packed struct(u16) {
     restart: bool = false,
     shm_create: bool = false,
     device_own: bool = false,
-    shutdown: bool = false,
     pin_exclusive: bool = false,
-    _reserved: u6 = 0,
+    _reserved: u7 = 0,
 
     pub fn bits(self: ProcessRights) u64 {
         return @intCast(@as(u16, @bitCast(self)));

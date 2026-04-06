@@ -6,6 +6,7 @@ const aarch64 = zag.arch.aarch64;
 const x64 = zag.arch.x64;
 
 const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
+const BootInfo = zag.boot.protocol.BootInfo;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
@@ -14,6 +15,35 @@ const SharedMemory = zag.memory.shared.SharedMemory;
 const Thread = zag.sched.thread.Thread;
 const Timer = zag.arch.timer.Timer;
 const VAddr = zag.memory.address.VAddr;
+
+pub inline fn kEntry(boot_info: *BootInfo, ktrampoline: *const fn (*BootInfo) callconv(cc()) noreturn) noreturn {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            asm volatile (
+                \\movq %[sp], %%rsp
+                \\movq %%rsp, %%rbp
+                \\movq %[arg], %%rdi
+                \\jmp *%[ktrampoline]
+                :
+                : [sp] "r" (boot_info.stack_top.addr),
+                  [arg] "r" (@intFromPtr(boot_info)),
+                  [ktrampoline] "r" (@intFromPtr(ktrampoline)),
+                : .{ .rsp = true, .rbp = true, .rdi = true }
+            );
+        },
+        .aarch64 => {},
+        else => unreachable,
+    }
+    unreachable;
+}
+
+pub fn cc() std.builtin.CallingConvention {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => .{ .x86_64_sysv = .{} },
+        .aarch64 => .{ .aarch64_aapcs = .{} },
+        else => unreachable,
+    };
+}
 
 pub fn init() void {
     switch (builtin.cpu.arch) {

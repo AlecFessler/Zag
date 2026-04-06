@@ -535,7 +535,7 @@ pub const VirtualMemoryManager = struct {
         defer self.lock.unlock();
 
         const range_start = VAddr.fromInt(original_start.addr + offset);
-        const range_size = device.size;
+        const range_size = device.access.mmio.size;
         const range_end_addr = range_start.addr + range_size;
         _ = vm_handle;
 
@@ -575,7 +575,7 @@ pub const VirtualMemoryManager = struct {
 
         var mapped: u64 = 0;
         while (mapped < range_size) : (mapped += paging.PAGE4K) {
-            const page_phys = PAddr.fromInt(device.phys_base.addr + mapped);
+            const page_phys = PAddr.fromInt(device.access.mmio.phys_base.addr + mapped);
             const page_virt = VAddr.fromInt(range_start.addr + mapped);
             arch.mapPage(self.addr_space_root, page_phys, page_virt, perms) catch {
                 var undo: u64 = 0;

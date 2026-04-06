@@ -765,9 +765,65 @@ fn parseDmar(dmar_vaddr: VAddr, length: u32) !void {
 }
 
 fn parseIvrs(ivrs_vaddr: VAddr, length: u32) !void {
-    // IOMMU disabled while debugging bare metal xHCI
-    _ = ivrs_vaddr;
-    _ = length;
+    // IVRS header is 48 bytes (standard ACPI header + IVinfo + reserved).
+    const header_size: u32 = 48;
+    if (length <= header_size) return;
+
+    var offset: u32 = header_size;
+    while (offset + 4 <= length) {
+        const entry_type = @as(*const volatile u8, @ptrFromInt(ivrs_vaddr.addr + offset)).*;
+        const entry_len = @as(*const volatile u16, @ptrFromInt(ivrs_vaddr.addr + offset + 2)).*;
+        if (entry_len == 0 or offset + entry_len > length) break;
+
+        // IVHD types: 0x10 (basic), 0x11 (extended), 0x40 (ACPI 6.0 extended).
+        // All share the same base layout with IOMMU base address at offset +8.
+        if ((entry_type == 0x10 or entry_type == 0x11 or entry_type == 0x40) and entry_len >= 24) {
+            const iommu_base = @as(*const volatile u64, @ptrFromInt(ivrs_vaddr.addr + offset + 8)).*;
+
+            if (iommu_base != 0) {
+                // Parse device entries within this IVHD block for alias mappings.
+                // Device entries start at offset +24 within the IVHD.
+                const dev_start: u32 = offset + 24;
+                var dev_off: u32 = dev_start;
+                while (dev_off < offset + entry_len) {
+                    const dev_type = @as(*const volatile u8, @ptrFromInt(ivrs_vaddr.addr + dev_off)).*;
+                    switch (dev_type) {
+                        // 4-byte device entries: all, select, range start/end
+                        1, 2, 3, 4 => dev_off += 4,
+                        // 8-byte alias entries: alias select (66), alias range start (67)
+                        66, 67 => {
+                            if (dev_off + 8 <= offset + entry_len) {
+                                const source = @as(*align(1) const u16, @ptrFromInt(ivrs_vaddr.addr + dev_off + 2)).*;
+                                const alias = @as(*align(1) const u16, @ptrFromInt(ivrs_vaddr.addr + dev_off + 4)).*;
+                                if (source != alias) {
+                                    iommu.addAmdAlias(source, alias);
+                                }
+                            }
+                            dev_off += 8;
+                        },
+                        // 8-byte special device entry (type 72)
+                        72 => dev_off += 8,
+                        // Variable-length extended entries (type 70, 71, 74, 75)
+                        70, 71, 74, 75 => {
+                            if (entry_type == 0x10) {
+                                dev_off += 4;
+                            } else {
+                                dev_off += 8;
+                            }
+                        },
+                        // Padding or unknown — skip 4 bytes
+                        0 => dev_off += 4,
+                        else => dev_off += 4,
+                    }
+                }
+
+                iommu.initAmd(PAddr.fromInt(iommu_base)) catch {};
+                break;
+            }
+        }
+
+        offset += entry_len;
+    }
 }
 
 fn initIommuDevices() void {
@@ -776,7 +832,7 @@ fn initIommuDevices() void {
     var i: u32 = 0;
     while (i < device_registry.count()) : (i += 1) {
         if (device_registry.getDevice(i)) |device| {
-            if (device.device_type == .mmio and (device.pci_bus != 0 or device.pci_dev != 0 or device.pci_func != 0)) {
+            if (device.device_type == .mmio and (device.detail.pci.bus != 0 or device.detail.pci.dev != 0 or device.detail.pci.func != 0)) {
                 iommu.setupDevice(device) catch {};
             }
         }

@@ -1,4 +1,3 @@
-const builtin = @import("builtin");
 const std = @import("std");
 const zag = @import("zag");
 
@@ -20,27 +19,11 @@ pub fn panic(
     zag.panic.panic(msg, error_return_trace, ret_addr);
 }
 
-export fn kEntry(boot_info: *BootInfo) callconv(.{ .x86_64_sysv = .{} }) noreturn {
-    switch (builtin.cpu.arch) {
-        .x86_64 => {
-            asm volatile (
-                \\movq %[sp], %%rsp
-                \\movq %%rsp, %%rbp
-                \\movq %[arg], %%rdi
-                \\jmp *%[ktrampoline]
-                :
-                : [sp] "r" (boot_info.stack_top.addr),
-                  [arg] "r" (@intFromPtr(boot_info)),
-                  [ktrampoline] "r" (@intFromPtr(&kTrampoline)),
-                : .{ .rsp = true, .rbp = true, .rdi = true });
-        },
-        .aarch64 => {},
-        else => unreachable,
-    }
-    unreachable;
+export fn kEntry(boot_info: *BootInfo) callconv(arch.cc()) noreturn {
+    arch.kEntry(boot_info, &kTrampoline);
 }
 
-export fn kTrampoline(boot_info: *BootInfo) noreturn {
+export fn kTrampoline(boot_info: *BootInfo) callconv(arch.cc()) noreturn {
     kMain(boot_info) catch {
         @panic("Exiting...");
     };
@@ -51,21 +34,9 @@ fn kMain(boot_info: *BootInfo) !void {
     arch.init();
     try memory.init(boot_info.mmap);
     try memory.initHeap();
-    _ = try debug.info.init(boot_info.elf_blob, memory.heap_allocator);
+    debug.info.init(boot_info.elf_blob, memory.heap_allocator);
     try arch.parseFirmwareTables(boot_info.xsdp_phys);
-
-    if (boot_info.framebuffer.pixel_format != .none and boot_info.framebuffer.base.addr != 0) {
-        const fb = &boot_info.framebuffer;
-        _ = device_registry.registerDisplayDevice(
-            fb.base,
-            fb.size,
-            @truncate(fb.width),
-            @truncate(fb.height),
-            @truncate(fb.stride),
-            @intFromEnum(fb.pixel_format),
-        ) catch {};
-    }
-
+    device_registry.registerDisplayDevice(boot_info.framebuffer);
     const rs_phys = PAddr.fromInt(@intFromPtr(boot_info.root_service.ptr));
     const rs_virt = VAddr.fromPAddr(rs_phys, null);
     const rs_ptr: [*]const u8 = @ptrFromInt(rs_virt.addr);

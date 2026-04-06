@@ -232,6 +232,11 @@ pub const Process = struct {
             return;
         }
 
+        // Root process (pid 1) exiting means the system should shut down.
+        if (self.pid == 1) {
+            arch.shutdown();
+        }
+
         self.cleanupPhase1();
 
         if (self.num_children == 0) {

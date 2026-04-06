@@ -27,7 +27,6 @@ pub const SyscallNum = enum(u64) {
     futex_wait,
     futex_wake,
     clock_gettime,
-    shutdown,
     ioport_read,
     ioport_write,
     dma_map,
@@ -118,10 +117,6 @@ pub fn futex_wait(_: *const u64, _: u64, _: u64) i64 {
 
 pub fn futex_wake(_: *const u64, _: u64) i64 {
     return -1;
-}
-
-pub fn shutdown() noreturn {
-    std.process.exit(0);
 }
 
 pub fn ioport_read(_: u64, _: u64, _: u64) i64 {

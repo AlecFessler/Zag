@@ -13,6 +13,12 @@ INSTALL_DIR = os.path.join(REPO_ROOT, "zig-out")
 IMG_DIR = "img"  # relative to zig-out, the FAT image dir used by QEMU
 OVMF_BIOS = "/usr/share/ovmf/x64/OVMF.4m.fd"
 
+IOMMU_TYPE = os.environ.get("ZAG_IOMMU", "intel")
+IOMMU_DEVICE = (
+    "-device intel-iommu,intremap=off" if IOMMU_TYPE == "intel"
+    else "-device amd-iommu"
+)
+
 QEMU_CMD = (
     "qemu-system-x86_64"
     " -m 1G"
@@ -23,7 +29,7 @@ QEMU_CMD = (
     " -no-reboot"
     " -enable-kvm -cpu host,+invtsc"
     " -machine q35"
-    " -device intel-iommu,intremap=off"
+    f" {IOMMU_DEVICE}"
     " -netdev tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=off"
     " -device e1000e,netdev=net0,mac=52:54:00:12:34:56"
     " -netdev tap,id=net1,ifname=tap1,script=no,downscript=no,vhost=off"
@@ -304,7 +310,7 @@ class QemuRouter:
             )
         # Build main project (copies ELF into FAT image, builds kernel+bootloader)
         result = subprocess.run(
-            ["zig", "build", "-Dprofile=router"],
+            ["zig", "build", "-Dprofile=router", f"-Diommu={IOMMU_TYPE}"],
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,

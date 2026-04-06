@@ -56,7 +56,6 @@ pub const SyscallNum = enum(u64) {
     futex_wait,
     futex_wake,
     clock_gettime,
-    shutdown,
     ioport_read,
     ioport_write,
     dma_map,
@@ -97,7 +96,6 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
         .futex_wait => .{ .rax = sysFutexWait(arg0, arg1, arg2) },
         .futex_wake => .{ .rax = sysFutexWake(arg0, arg1) },
         .clock_gettime => .{ .rax = sysClockGettime() },
-        .shutdown => sysShutdown(),
         .ioport_read => .{ .rax = sysIoportRead(arg0, arg1, arg2) },
         .ioport_write => .{ .rax = sysIoportWrite(arg0, arg1, arg2, arg3) },
         .dma_map => .{ .rax = sysDmaMap(arg0, arg1) },
@@ -294,7 +292,7 @@ fn sysMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
 
     const device = device_entry.object.device_region;
 
-    const range_end = std.math.add(u64, offset, device.size) catch return E_INVAL;
+    const range_end = std.math.add(u64, offset, device.access.mmio.size) catch return E_INVAL;
     if (range_end > vm_res.original_size) return E_INVAL;
 
     proc.vmm.mmio_map(
@@ -545,20 +543,6 @@ fn sysClockGettime() i64 {
     return @bitCast(arch.getMonotonicClock().now());
 }
 
-fn sysShutdown() noreturn {
-    const proc = currentProc();
-    const self_entry = proc.getPermByHandle(0);
-    if (self_entry) |entry| {
-        if (entry.processRights().shutdown) {
-            arch.shutdown();
-        }
-    }
-    while (true) {
-        arch.enableInterrupts();
-        asm volatile ("hlt");
-    }
-}
-
 fn sysIoportRead(device_handle: u64, port_offset: u64, width: u64) i64 {
     if (width != 1 and width != 2 and width != 4) return E_INVAL;
 
@@ -569,9 +553,9 @@ fn sysIoportRead(device_handle: u64, port_offset: u64, width: u64) i64 {
 
     const device = entry.object.device_region;
     if (device.device_type != .port_io) return E_INVAL;
-    if (port_offset + width > device.port_count) return E_INVAL;
+    if (port_offset + width > device.access.port_io.port_count) return E_INVAL;
 
-    const port: u16 = device.base_port + @as(u16, @truncate(port_offset));
+    const port: u16 = device.access.port_io.base_port + @as(u16, @truncate(port_offset));
     return @intCast(arch.ioportIn(port, @truncate(width)));
 }
 
@@ -585,9 +569,9 @@ fn sysIoportWrite(device_handle: u64, port_offset: u64, width: u64, value: u64) 
 
     const device = entry.object.device_region;
     if (device.device_type != .port_io) return E_INVAL;
-    if (port_offset + width > device.port_count) return E_INVAL;
+    if (port_offset + width > device.access.port_io.port_count) return E_INVAL;
 
-    const port: u16 = device.base_port + @as(u16, @truncate(port_offset));
+    const port: u16 = device.access.port_io.base_port + @as(u16, @truncate(port_offset));
     arch.ioportOut(port, @truncate(width), @truncate(value));
     return E_OK;
 }
@@ -609,15 +593,7 @@ fn sysDmaMap(device_handle: u64, shm_handle: u64) i64 {
         arch.enableDmaRemapping();
         proc.addDmaMapping(device, shm, dma_base, shm.pages.len) catch return E_NOMEM;
         return @bitCast(dma_base);
-    }
-
-    // No IOMMU fallback: requires contiguous physical pages
-    if (shm.pages.len == 0) return E_INVAL;
-    const base = shm.pages[0].addr;
-    for (shm.pages[1..], 1..) |p, i| {
-        if (p.addr != base + @as(u64, i) * paging.PAGE4K) return E_NOMEM;
-    }
-    return @bitCast(base);
+    } else return E_NOMEM;
 }
 
 fn sysPinExclusive() i64 {

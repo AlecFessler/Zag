@@ -13,14 +13,13 @@ pub var global_ptr: ?*std.debug.Dwarf = null;
 pub fn init(
     elf_blob: Blob,
     allocator: std.mem.Allocator,
-) !*ParsedElf {
-    const parsed_elf = try allocator.create(ParsedElf);
+) void {
+    const parsed_elf = allocator.create(ParsedElf) catch return;
     const elf_ptr_phys = PAddr.fromInt(@intFromPtr(elf_blob.ptr));
     const elf_ptr_virt = VAddr.fromPAddr(elf_ptr_phys, null);
     const elf_ptr: [*]u8 = @ptrFromInt(elf_ptr_virt.addr);
     const elf_bytes = elf_ptr[0..elf_blob.len];
-    try elf.parseElf(parsed_elf, elf_bytes);
-    try parsed_elf.dwarf.open(allocator);
+    elf.parseElf(parsed_elf, elf_bytes) catch return;
+    parsed_elf.dwarf.open(allocator) catch return;
     global_ptr = &parsed_elf.dwarf;
-    return parsed_elf;
 }

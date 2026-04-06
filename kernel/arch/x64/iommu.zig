@@ -20,6 +20,15 @@ pub fn initIntel(reg_base: PAddr) !void {
     active_type = .intel_vtd;
 }
 
+pub fn initAmd(reg_base: PAddr) !void {
+    try vi.init(reg_base);
+    active_type = .amd_vi;
+}
+
+pub fn addAmdAlias(source: u16, alias: u16) void {
+    vi.addAlias(source, alias);
+}
+
 pub fn setupDevice(device: *DeviceRegion) !void {
     switch (active_type) {
         .intel_vtd => try vtd.setupDevice(device),
@@ -34,7 +43,7 @@ pub fn setupDevice(device: *DeviceRegion) !void {
 pub fn enableTranslation() void {
     switch (active_type) {
         .intel_vtd => vtd.enableTranslation(),
-        .amd_vi => {}, // AMD-Vi enables during init()
+        .amd_vi => vi.enableTranslation(),
         .none => {},
     }
 }
@@ -42,7 +51,7 @@ pub fn enableTranslation() void {
 pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
     if (active_type == .none) return error.NoIommu;
 
-    const base_dma = device.dma_cursor;
+    const base_dma = device.detail.pci.dma_cursor;
     for (shm.pages, 0..) |phys, i| {
         const dma_addr = base_dma + @as(u64, i) * 0x1000;
         switch (active_type) {
@@ -51,7 +60,7 @@ pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
             .none => unreachable,
         }
     }
-    device.dma_cursor = base_dma + @as(u64, shm.pages.len) * 0x1000;
+    device.detail.pci.dma_cursor = base_dma + @as(u64, shm.pages.len) * 0x1000;
     switch (active_type) {
         .amd_vi => vi.flushDevice(device),
         .intel_vtd => vtd.invalidateIotlb(),

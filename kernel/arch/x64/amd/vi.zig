@@ -237,6 +237,15 @@ fn allocZeroedPage() !struct { phys: PAddr, virt: VAddr } {
     return .{ .phys = phys, .virt = virt };
 }
 
+/// Register an alias mapping from IVRS device entries.
+/// When the IOMMU sees DMA from `source`, it uses `alias` to index the Device Table.
+pub fn addAlias(source: u16, alias: u16) void {
+    if (alias_count < MAX_ALIASES) {
+        aliases[alias_count] = .{ .source = source, .alias = alias };
+        alias_count += 1;
+    }
+}
+
 /// Look up whether a device BDF has an alias (e.g., from IVRS ACPI table).
 /// Returns the alias DeviceID if found, otherwise the original BDF.
 fn lookupAlias(bdf: u16) u16 {
@@ -346,19 +355,21 @@ pub fn init(reg_base_phys: PAddr) !void {
     unit.writeReg64(MMIO_EVT_LOG_BASE, evt.phys.addr | (evt_len_bits << 56));
 
     // -----------------------------------------------------------------------
-    // Enable the IOMMU via the Control Register (MMIO Offset 0018h).
+    // Prepare the IOMMU Control Register (MMIO Offset 0018h).
+    //
+    // Enable the command buffer, event log, and coherent mode now so that
+    // setupDevice() can issue invalidation commands. IommuEn is deferred
+    // to enableTranslation() — enabling now with empty page tables would
+    // fault any early device DMA (same deferral strategy as Intel VT-d).
     //
     // Spec Section 3.3.1, MMIO Offset 0018h:
-    //   Bit  0: IommuEn    — master enable, all transactions processed
+    //   Bit  0: IommuEn    — master enable (deferred)
     //   Bit  2: EventLogEn — events written to the Event Log
     //   Bit 10: Coherent   — DTE reads are snooped (coherent with CPU caches)
     //   Bit 12: CmdBufEn   — start fetching commands from the command buffer
-    //
-    // Per spec Section 2.3.1, all base address registers and head/tail pointers
-    // must be configured before setting IommuEn=1.
     // -----------------------------------------------------------------------
     var ctrl = unit.readReg64(MMIO_CONTROL);
-    ctrl |= CTRL_IOMMU_EN | CTRL_CMD_BUF_EN | CTRL_EVT_LOG_EN | CTRL_COHERENT_EN;
+    ctrl |= CTRL_CMD_BUF_EN | CTRL_EVT_LOG_EN | CTRL_COHERENT_EN;
     unit.writeReg64(MMIO_CONTROL, ctrl);
 
     unit.active = true;
@@ -379,13 +390,14 @@ pub fn init(reg_base_phys: PAddr) !void {
 pub fn setupDevice(device: *DeviceRegion) !void {
     if (unit_count == 0) return;
 
-    const bdf = @as(u16, device.pci_bus) << 8 | @as(u16, device.pci_dev) << 3 | @as(u16, device.pci_func);
+    const pci = &device.detail.pci;
+    const bdf = @as(u16, pci.bus) << 8 | @as(u16, pci.dev) << 3 | @as(u16, pci.func);
     const device_id = lookupAlias(bdf);
     const entry_offset = @as(u64, device_id) * 32;
 
     // Allocate a zeroed 4KB page as the level-4 root of the I/O page table.
     const pt = try allocZeroedPage();
-    device.dma_page_table_root = pt.phys;
+    pci.dma_page_table_root = pt.phys;
 
     // -----------------------------------------------------------------------
     // Build the DTE quadwords (spec Figure 7, Table 7).
@@ -498,9 +510,9 @@ fn amdviPresent(entry: u64) bool {
 ///
 /// Each level uses 9 address bits to index into a 512-entry (4KB) page table.
 pub fn mapDmaPage(device: *DeviceRegion, dma_addr: u64, phys: PAddr) !void {
-    if (unit_count == 0 or device.dma_page_table_root.addr == 0) return error.NotSetup;
+    if (unit_count == 0 or device.detail.pci.dma_page_table_root.addr == 0) return error.NotSetup;
 
-    const pml4_virt = VAddr.fromPAddr(device.dma_page_table_root, null);
+    const pml4_virt = VAddr.fromPAddr(device.detail.pci.dma_page_table_root, null);
     const pml4: *[512]u64 = @ptrFromInt(pml4_virt.addr);
 
     const pml4_idx: u9 = @truncate((dma_addr >> 39) & 0x1FF);
@@ -539,9 +551,9 @@ pub fn mapDmaPage(device: *DeviceRegion, dma_addr: u64, phys: PAddr) !void {
 /// page table pages; the tree structure is retained for reuse.
 /// Caller must issue flushDevice() after unmapping to invalidate IOTLB entries.
 pub fn unmapDmaPage(device: *DeviceRegion, dma_addr: u64) void {
-    if (unit_count == 0 or device.dma_page_table_root.addr == 0) return;
+    if (unit_count == 0 or device.detail.pci.dma_page_table_root.addr == 0) return;
 
-    const pml4_virt = VAddr.fromPAddr(device.dma_page_table_root, null);
+    const pml4_virt = VAddr.fromPAddr(device.detail.pci.dma_page_table_root, null);
     const pml4: *[512]u64 = @ptrFromInt(pml4_virt.addr);
     const pml4_idx: u9 = @truncate((dma_addr >> 39) & 0x1FF);
     if (!amdviPresent(pml4[pml4_idx])) return;
@@ -569,7 +581,7 @@ pub fn unmapDmaPage(device: *DeviceRegion, dma_addr: u64) void {
 /// unmapDmaPage) to ensure the IOMMU re-walks the updated tables.
 pub fn flushDevice(device: *const DeviceRegion) void {
     if (unit_count == 0) return;
-    const bdf = @as(u16, device.pci_bus) << 8 | @as(u16, device.pci_dev) << 3 | @as(u16, device.pci_func);
+    const bdf = @as(u16, device.detail.pci.bus) << 8 | @as(u16, device.detail.pci.dev) << 3 | @as(u16, device.detail.pci.func);
     const domain_id = lookupAlias(bdf);
     for (units[0..unit_count]) |*unit| {
         if (unit.active) {
@@ -577,6 +589,26 @@ pub fn flushDevice(device: *const DeviceRegion) void {
             unit.completionWait();
         }
     }
+}
+
+var translation_enabled: bool = false;
+
+/// Enable DMA translation by setting IommuEn on all active units.
+///
+/// Called after the first dma_map syscall so that device page tables
+/// contain actual mappings before the IOMMU starts translating.
+/// Without this deferral, early device DMA would fault against
+/// empty page tables (same pattern as Intel VT-d's deferred TE).
+pub fn enableTranslation() void {
+    if (translation_enabled) return;
+    for (units[0..unit_count]) |*unit| {
+        if (unit.active) {
+            var ctrl = unit.readReg64(MMIO_CONTROL);
+            ctrl |= CTRL_IOMMU_EN;
+            unit.writeReg64(MMIO_CONTROL, ctrl);
+        }
+    }
+    translation_enabled = true;
 }
 
 pub fn isAvailable() bool {

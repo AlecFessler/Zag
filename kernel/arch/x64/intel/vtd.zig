@@ -277,7 +277,8 @@ pub fn setupDevice(device: *DeviceRegion) !void {
     if (!initialized) return;
 
     const root_entries: *[256]RootEntry = @ptrFromInt(root_table_virt.addr);
-    const bus = device.pci_bus;
+    const pci = &device.detail.pci;
+    const bus = pci.bus;
 
     if (!root_entries[bus].present) {
         const ctx = try allocZeroedPage();
@@ -291,11 +292,11 @@ pub fn setupDevice(device: *DeviceRegion) !void {
     const ctx_virt = VAddr.fromPAddr(ctx_phys, null);
     const ctx_entries: *[256]ContextEntry = @ptrFromInt(ctx_virt.addr);
     // Context index = dev[4:0] << 3 | func[2:0], matching PCI devfn encoding
-    const ctx_idx = @as(u8, device.pci_dev) * 8 + device.pci_func;
+    const ctx_idx = @as(u8, pci.dev) * 8 + pci.func;
 
     if (!ctx_entries[ctx_idx].present) {
         const pt = try allocZeroedPage();
-        device.dma_page_table_root = pt.phys;
+        pci.dma_page_table_root = pt.phys;
         ctx_entries[ctx_idx] = .{
             .present = true,
             .fault_disable = false,
@@ -305,7 +306,7 @@ pub fn setupDevice(device: *DeviceRegion) !void {
             .address_width = 2,
             .slptptr = @truncate(pt.phys.addr >> 12),
             // Domain ID: unique per device, using bus:devfn encoding
-            .domain_id = @as(u16, device.pci_bus) << 8 | @as(u16, ctx_idx),
+            .domain_id = @as(u16, pci.bus) << 8 | @as(u16, ctx_idx),
         };
 
         // Invalidate caches so the IOMMU picks up the new context entry.
@@ -338,9 +339,9 @@ pub fn setupDevice(device: *DeviceRegion) !void {
 ///   Bits 5:3 (EMT), bit 6 (IPAT), bit 11 (SNP) are 0 (defaults for
 ///   legacy mode where these fields are ignored or reserved).
 pub fn mapDmaPage(device: *DeviceRegion, dma_addr: u64, phys: PAddr) !void {
-    if (!initialized or device.dma_page_table_root.addr == 0) return error.NotSetup;
+    if (!initialized or device.detail.pci.dma_page_table_root.addr == 0) return error.NotSetup;
 
-    const pml4_virt = VAddr.fromPAddr(device.dma_page_table_root, null);
+    const pml4_virt = VAddr.fromPAddr(device.detail.pci.dma_page_table_root, null);
     const pml4: *[512]u64 = @ptrFromInt(pml4_virt.addr);
 
     const pml4_idx: u9 = @truncate((dma_addr >> 39) & 0x1FF);
@@ -381,9 +382,9 @@ pub fn mapDmaPage(device: *DeviceRegion, dma_addr: u64, phys: PAddr) !void {
 /// (Section 6.1: when CM=0, present→not-present transitions require
 /// invalidation before the change is guaranteed visible to hardware).
 pub fn unmapDmaPage(device: *DeviceRegion, dma_addr: u64) void {
-    if (!initialized or device.dma_page_table_root.addr == 0) return;
+    if (!initialized or device.detail.pci.dma_page_table_root.addr == 0) return;
 
-    const pml4_virt = VAddr.fromPAddr(device.dma_page_table_root, null);
+    const pml4_virt = VAddr.fromPAddr(device.detail.pci.dma_page_table_root, null);
     const pml4: *[512]u64 = @ptrFromInt(pml4_virt.addr);
     const pml4_idx: u9 = @truncate((dma_addr >> 39) & 0x1FF);
     if (pml4[pml4_idx] & 1 == 0) return;

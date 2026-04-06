@@ -39,11 +39,10 @@ pub const ProcessRights = packed struct(u16) {
     restart: bool = false,
     shm_create: bool = false,
     device_own: bool = false,
-    shutdown: bool = false,
     pin_exclusive: bool = false,
     grant_to_broadcast: bool = false,
     broadcast: bool = false,
-    _reserved: u4 = 0,
+    _reserved: u5 = 0,
 };
 
 pub const VmReservationRights = packed struct(u8) {
@@ -180,22 +179,25 @@ pub const UserViewEntry = extern struct {
                 .field0 = @as(u64, @intFromEnum(dr.device_type)) |
                     (@as(u64, @intFromEnum(dr.device_class)) << 8) |
                     (if (dr.device_type == .mmio)
-                        @as(u64, @truncate(dr.size)) << 32
+                        @as(u64, @truncate(dr.access.mmio.size)) << 32
                     else
-                        @as(u64, dr.port_count) << 32),
-                .field1 = if (dr.device_class == .display)
-                    @as(u64, dr.fb_width) |
-                        (@as(u64, dr.fb_height) << 16) |
-                        (@as(u64, dr.fb_stride) << 32) |
-                        (@as(u64, dr.fb_pixel_format) << 48)
-                else
-                    @as(u64, dr.pci_vendor) |
-                        (@as(u64, dr.pci_device) << 16) |
-                        (@as(u64, dr.pci_class) << 32) |
-                        (@as(u64, dr.pci_subclass) << 40) |
-                        (@as(u64, dr.pci_bus) << 48) |
-                        (@as(u64, dr.pci_dev) << 53) |
-                        (@as(u64, dr.pci_func) << 58),
+                        @as(u64, dr.access.port_io.port_count) << 32),
+                .field1 = if (dr.device_class == .display) blk: {
+                    const d = dr.detail.display;
+                    break :blk @as(u64, d.fb_width) |
+                        (@as(u64, d.fb_height) << 16) |
+                        (@as(u64, d.fb_stride) << 32) |
+                        (@as(u64, d.fb_pixel_format) << 48);
+                } else blk: {
+                    const p = dr.detail.pci;
+                    break :blk @as(u64, p.vendor) |
+                        (@as(u64, p.device) << 16) |
+                        (@as(u64, p.class) << 32) |
+                        (@as(u64, p.subclass) << 40) |
+                        (@as(u64, p.bus) << 48) |
+                        (@as(u64, p.dev) << 53) |
+                        (@as(u64, p.func) << 58);
+                },
             },
             .core_pin => |cp| .{
                 .handle = entry.handle,

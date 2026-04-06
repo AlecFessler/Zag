@@ -73,7 +73,6 @@ pub const SyscallNum = enum(u64) {
     futex_wait,
     futex_wake,
     clock_gettime,
-    shutdown,
     ioport_read,
     ioport_write,
     dma_map,
@@ -244,11 +243,6 @@ pub fn futex_wake(addr: *const u64, count: u64) SystemError!void {
 
 pub fn clock_gettime() u64 {
     return @intCast(syscall0(.clock_gettime));
-}
-
-pub fn shutdown() noreturn {
-    _ = syscall0(.shutdown);
-    unreachable;
 }
 
 pub fn ioport_read(device_handle: Handle, port_offset: u64, width: u64) SystemError!u64 {

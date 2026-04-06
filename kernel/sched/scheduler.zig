@@ -314,7 +314,6 @@ pub fn globalInit(root_service_elf: []const u8) !void {
         .restart = true,
         .shm_create = true,
         .device_own = true,
-        .shutdown = true,
         .pin_exclusive = true,
         .grant_to_broadcast = true,
         .broadcast = true,
