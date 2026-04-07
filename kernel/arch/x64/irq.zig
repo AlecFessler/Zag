@@ -89,14 +89,7 @@ fn schedTimerHandler(ctx: *cpu.Context) void {
 }
 
 fn syscallHandler(ctx: *cpu.Context) void {
-    const result = syscall.dispatch(
-        ctx.regs.rax,
-        ctx.regs.rdi,
-        ctx.regs.rsi,
-        ctx.regs.rdx,
-        ctx.regs.r10,
-        ctx.regs.r8,
-    );
+    const result = syscall.dispatch(ctx);
     ctx.regs.rax = @bitCast(result.rax);
     ctx.regs.rdx = result.rdx;
 }

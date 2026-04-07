@@ -15,27 +15,28 @@ fn recurse(depth: u64) u64 {
 
 pub fn main(perm_view_addr: u64) void {
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
+    const self_entry = view[0];
+    const restart_count = self_entry.processRestartCount();
 
-    // Find SHM granted by parent
+    if (restart_count == 0) {
+        // First boot: receive SHM handle via IPC, then trigger stack overflow
+        var msg: syscall.IpcMessage = .{};
+        if (syscall.ipc_recv(true, &msg) != 0) return;
+        _ = syscall.ipc_reply(&.{});
+    }
+
+    // Find SHM in perm view
     var shm_handle: u64 = 0;
     var shm_size: u64 = 0;
-    var attempts: u32 = 0;
-    while (attempts < 50_000) : (attempts += 1) {
-        shm_handle = 0;
-        shm_size = 0;
-        for (view) |*entry| {
-            if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY) {
-                shm_handle = entry.handle;
-                shm_size = entry.field0;
-                break;
-            }
+    for (view) |*entry| {
+        if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY) {
+            shm_handle = entry.handle;
+            shm_size = entry.field0;
+            break;
         }
-        if (shm_handle != 0) break;
-        syscall.thread_yield();
     }
     if (shm_handle == 0 or shm_size == 0) return;
 
-    // Map SHM
     const vm_rights = (perms.VmReservationRights{
         .read = true,
         .write = true,
@@ -48,7 +49,6 @@ pub fn main(perm_view_addr: u64) void {
     if (map_rc != 0) return;
 
     const base = vm_result.val2;
-    // SHM layout: [run_counter: u64][crash_reason: u64][restart_count: u64]
     const run_counter: *u64 = @ptrFromInt(base);
     const crash_reason_slot: *u64 = @ptrFromInt(base + 8);
     const restart_count_slot: *u64 = @ptrFromInt(base + 16);
@@ -60,16 +60,13 @@ pub fn main(perm_view_addr: u64) void {
         run_counter.* = 1;
         _ = syscall.futex_wake(@ptrFromInt(base), 1);
         _ = recurse(100_000);
-        // Should never reach here
         return;
     }
 
     // Restarted: read crash info from our own perm view slot 0
-    const self_entry = &view[0];
     crash_reason_slot.* = @intFromEnum(self_entry.processCrashReason());
     restart_count_slot.* = self_entry.processRestartCount();
     _ = syscall.futex_wake(@ptrFromInt(base + 8), 1);
 
-    // Disable restart so we can exit cleanly
     _ = syscall.disable_restart();
 }

@@ -7,23 +7,22 @@ const syscall = lib.syscall;
 const MAX_PERMS = 128;
 
 pub fn main(perm_view_addr: u64) void {
-    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
+    // Receive SHM handle via IPC from parent
+    var msg: syscall.IpcMessage = .{};
+    if (syscall.ipc_recv(true, &msg) != 0) return;
+    _ = syscall.ipc_reply(&.{});
 
+    // Find SHM in perm view
+    const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
     var shm_handle: u64 = 0;
     var shm_size: u64 = 0;
-    var attempts: u32 = 0;
-    while (attempts < 50_000) : (attempts += 1) {
-        for (view) |*entry| {
-            if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY) {
-                shm_handle = entry.handle;
-                shm_size = entry.field0;
-                break;
-            }
+    for (view) |*entry| {
+        if (entry.entry_type == pv.ENTRY_TYPE_SHARED_MEMORY) {
+            shm_handle = entry.handle;
+            shm_size = entry.field0;
+            break;
         }
-        if (shm_handle != 0) break;
-        syscall.thread_yield();
     }
-
     if (shm_handle == 0 or shm_size == 0) return;
 
     const vm_rights = (perms.VmReservationRights{

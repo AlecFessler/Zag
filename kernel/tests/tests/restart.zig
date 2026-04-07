@@ -40,7 +40,6 @@ fn testRestartWithVerification() void {
 
     const child_elf = embedded.child_restart_verify;
     const child_rights = (perms.ProcessRights{
-        .grant_to_child = true,
         .spawn_thread = true,
         .mem_reserve = true,
         .shm_create = true,
@@ -52,12 +51,15 @@ fn testRestartWithVerification() void {
         return;
     }
 
+    // Send SHM handle to child via IPC cap transfer
     const grant_rights = (perms.SharedMemoryRights{
         .read = true,
         .write = true,
         .grant = true,
     }).bits();
-    _ = syscall.grant_perm(@intCast(shm_handle), @intCast(proc_handle), grant_rights);
+    const words = [_]u64{ 0, @intCast(shm_handle), grant_rights };
+    var reply: syscall.IpcMessage = .{};
+    _ = syscall.ipc_call_cap(@intCast(proc_handle), &words, &reply);
 
     t.waitUntilAtLeast(run_counter, 2);
 

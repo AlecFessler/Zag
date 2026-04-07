@@ -19,7 +19,6 @@ pub const SyscallNum = enum(u64) {
     thread_exit,
     thread_yield,
     set_affinity,
-    grant_perm,
     revoke_perm,
     disable_restart,
     futex_wait,
@@ -30,7 +29,10 @@ pub const SyscallNum = enum(u64) {
     dma_map,
     dma_unmap,
     pin_exclusive,
-    broadcast,
+    ipc_send,
+    ipc_call,
+    ipc_recv,
+    ipc_reply,
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -150,10 +152,6 @@ pub fn set_affinity(core_mask: u64) i64 {
     return syscall1(.set_affinity, core_mask);
 }
 
-pub fn grant_perm(src_handle: u64, target_proc_handle: u64, rights_bits: u64) i64 {
-    return syscall3(.grant_perm, src_handle, target_proc_handle, rights_bits);
-}
-
 pub fn revoke_perm(handle: u64) i64 {
     return syscall1(.revoke_perm, handle);
 }
@@ -194,6 +192,170 @@ pub fn pin_exclusive() i64 {
     return syscall0(.pin_exclusive);
 }
 
-pub fn broadcast_syscall(payload: u64) i64 {
-    return syscall1(.broadcast, payload);
+// --- IPC Message Passing ---
+
+pub const IpcMessage = struct {
+    words: [5]u64 = .{0} ** 5,
+    word_count: u3 = 0,
+    from_call: bool = false,
+};
+
+pub fn ipc_send(target_handle: u64, words: []const u64) i64 {
+    return ipc_send_ex(target_handle, words, false);
+}
+
+pub fn ipc_send_cap(target_handle: u64, words: []const u64) i64 {
+    return ipc_send_ex(target_handle, words, true);
+}
+
+fn ipc_send_ex(target_handle: u64, words: []const u64, cap_transfer: bool) i64 {
+    var w: [5]u64 = .{0} ** 5;
+    const count: u3 = @intCast(@min(words.len, 5));
+    for (0..count) |i| w[i] = words[i];
+    const meta: u64 = @as(u64, count) | (if (cap_transfer) @as(u64, 0x8) else 0);
+
+    return asm volatile ("int $0x80"
+        : [ret] "={rax}" (-> i64),
+        : [num] "{rax}" (@intFromEnum(SyscallNum.ipc_send)),
+          [tgt] "{r13}" (target_handle),
+          [m] "{r14}" (meta),
+          [w0] "{rdi}" (w[0]),
+          [w1] "{rsi}" (w[1]),
+          [w2] "{rdx}" (w[2]),
+          [w3] "{r8}" (w[3]),
+          [w4] "{r9}" (w[4]),
+        : .{ .rcx = true, .r11 = true, .memory = true });
+}
+
+pub fn ipc_call(target_handle: u64, words: []const u64, reply: *IpcMessage) i64 {
+    return ipc_call_ex(target_handle, words, false, reply);
+}
+
+pub fn ipc_call_cap(target_handle: u64, words: []const u64, reply: *IpcMessage) i64 {
+    return ipc_call_ex(target_handle, words, true, reply);
+}
+
+fn ipc_call_ex(target_handle: u64, words: []const u64, cap_transfer: bool, reply: *IpcMessage) i64 {
+    var w: [5]u64 = .{0} ** 5;
+    const count: u3 = @intCast(@min(words.len, 5));
+    for (0..count) |i| w[i] = words[i];
+    const meta: u64 = @as(u64, count) | (if (cap_transfer) @as(u64, 0x8) else 0);
+
+    var r_rdi: u64 = undefined;
+    var r_rsi: u64 = undefined;
+    var r_rdx: u64 = undefined;
+    var r_r8: u64 = undefined;
+    var r_r9: u64 = undefined;
+    var r_r14: u64 = undefined;
+
+    const ret = asm volatile ("int $0x80"
+        : [ret] "={rax}" (-> i64),
+          [o0] "={rdi}" (r_rdi),
+          [o1] "={rsi}" (r_rsi),
+          [o2] "={rdx}" (r_rdx),
+          [o3] "={r8}" (r_r8),
+          [o4] "={r9}" (r_r9),
+          [om] "={r14}" (r_r14),
+        : [num] "{rax}" (@intFromEnum(SyscallNum.ipc_call)),
+          [tgt] "{r13}" (target_handle),
+          [m] "{r14}" (meta),
+          [w0] "{rdi}" (w[0]),
+          [w1] "{rsi}" (w[1]),
+          [w2] "{rdx}" (w[2]),
+          [w3] "{r8}" (w[3]),
+          [w4] "{r9}" (w[4]),
+        : .{ .rcx = true, .r11 = true, .memory = true });
+
+    reply.words = .{ r_rdi, r_rsi, r_rdx, r_r8, r_r9 };
+    reply.word_count = @truncate((r_r14 >> 1) & 0x7);
+    reply.from_call = (r_r14 & 1) != 0;
+    return ret;
+}
+
+pub fn ipc_recv(blocking: bool, msg: *IpcMessage) i64 {
+    const meta: u64 = if (blocking) 0x2 else 0;
+
+    var r_rdi: u64 = undefined;
+    var r_rsi: u64 = undefined;
+    var r_rdx: u64 = undefined;
+    var r_r8: u64 = undefined;
+    var r_r9: u64 = undefined;
+    var r_r14: u64 = undefined;
+
+    const ret = asm volatile ("int $0x80"
+        : [ret] "={rax}" (-> i64),
+          [o0] "={rdi}" (r_rdi),
+          [o1] "={rsi}" (r_rsi),
+          [o2] "={rdx}" (r_rdx),
+          [o3] "={r8}" (r_r8),
+          [o4] "={r9}" (r_r9),
+          [om] "={r14}" (r_r14),
+        : [num] "{rax}" (@intFromEnum(SyscallNum.ipc_recv)),
+          [m] "{r14}" (meta),
+        : .{ .rcx = true, .r11 = true, .r13 = true, .memory = true });
+
+    msg.words = .{ r_rdi, r_rsi, r_rdx, r_r8, r_r9 };
+    msg.word_count = @truncate((r_r14 >> 1) & 0x7);
+    msg.from_call = (r_r14 & 1) != 0;
+    return ret;
+}
+
+pub fn ipc_reply(words: []const u64) i64 {
+    return ipc_reply_ex(words, false, false);
+}
+
+pub fn ipc_reply_recv(words: []const u64, blocking: bool, msg: *IpcMessage) i64 {
+    var w: [5]u64 = .{0} ** 5;
+    const count: u3 = @intCast(@min(words.len, 5));
+    for (0..count) |i| w[i] = words[i];
+    const meta: u64 = @as(u64, count) << 2 | 0x1 | (if (blocking) @as(u64, 0x2) else 0);
+
+    var r_rdi: u64 = undefined;
+    var r_rsi: u64 = undefined;
+    var r_rdx: u64 = undefined;
+    var r_r8: u64 = undefined;
+    var r_r9: u64 = undefined;
+    var r_r14: u64 = undefined;
+
+    const ret = asm volatile ("int $0x80"
+        : [ret] "={rax}" (-> i64),
+          [o0] "={rdi}" (r_rdi),
+          [o1] "={rsi}" (r_rsi),
+          [o2] "={rdx}" (r_rdx),
+          [o3] "={r8}" (r_r8),
+          [o4] "={r9}" (r_r9),
+          [om] "={r14}" (r_r14),
+        : [num] "{rax}" (@intFromEnum(SyscallNum.ipc_reply)),
+          [m] "{r14}" (meta),
+          [w0] "{rdi}" (w[0]),
+          [w1] "{rsi}" (w[1]),
+          [w2] "{rdx}" (w[2]),
+          [w3] "{r8}" (w[3]),
+          [w4] "{r9}" (w[4]),
+        : .{ .rcx = true, .r11 = true, .r13 = true, .memory = true });
+
+    msg.words = .{ r_rdi, r_rsi, r_rdx, r_r8, r_r9 };
+    msg.word_count = @truncate((r_r14 >> 1) & 0x7);
+    msg.from_call = (r_r14 & 1) != 0;
+    return ret;
+}
+
+fn ipc_reply_ex(words: []const u64, atomic_recv: bool, recv_blocking: bool) i64 {
+    var w: [5]u64 = .{0} ** 5;
+    const count: u3 = @intCast(@min(words.len, 5));
+    for (0..count) |i| w[i] = words[i];
+    const meta: u64 = @as(u64, count) << 2 |
+        (if (atomic_recv) @as(u64, 0x1) else 0) |
+        (if (recv_blocking) @as(u64, 0x2) else 0);
+
+    return asm volatile ("int $0x80"
+        : [ret] "={rax}" (-> i64),
+        : [num] "{rax}" (@intFromEnum(SyscallNum.ipc_reply)),
+          [m] "{r14}" (meta),
+          [w0] "{rdi}" (w[0]),
+          [w1] "{rsi}" (w[1]),
+          [w2] "{rdx}" (w[2]),
+          [w3] "{r8}" (w[3]),
+          [w4] "{r9}" (w[4]),
+        : .{ .rcx = true, .r11 = true, .r13 = true, .memory = true });
 }

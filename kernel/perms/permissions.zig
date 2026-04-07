@@ -31,7 +31,6 @@ pub const DeadProcessInfo = struct {
 };
 
 pub const ProcessRights = packed struct(u16) {
-    grant_to_child: bool = false,
     spawn_thread: bool = false,
     spawn_process: bool = false,
     mem_reserve: bool = false,
@@ -40,9 +39,7 @@ pub const ProcessRights = packed struct(u16) {
     shm_create: bool = false,
     device_own: bool = false,
     pin_exclusive: bool = false,
-    grant_to_broadcast: bool = false,
-    broadcast: bool = false,
-    _reserved: u5 = 0,
+    _reserved: u8 = 0,
 };
 
 pub const VmReservationRights = packed struct(u8) {
@@ -70,6 +67,16 @@ pub const DeviceRegionRights = packed struct(u8) {
     _reserved: u5 = 0,
 };
 
+pub const ProcessHandleRights = packed struct(u16) {
+    send_words: bool = false,
+    send_shm: bool = false,
+    send_process: bool = false,
+    send_device: bool = false,
+    kill: bool = false,
+    grant: bool = false,
+    _reserved: u10 = 0,
+};
+
 pub const PermissionEntry = struct {
     handle: u64,
     object: KernelObject,
@@ -86,6 +93,10 @@ pub const PermissionEntry = struct {
     pub fn deviceRights(self: @This()) DeviceRegionRights {
         return @bitCast(@as(u8, @truncate(self.rights)));
     }
+
+    pub fn processHandleRights(self: @This()) ProcessHandleRights {
+        return @bitCast(self.rights);
+    }
 };
 
 pub const VmReservationObject = struct {
@@ -101,12 +112,11 @@ pub const CorePinObject = struct {
 
 pub const KernelObject = union(enum) {
     process: *Process,
-    dead_process: DeadProcessInfo,
+    dead_process: *Process,
     vm_reservation: VmReservationObject,
     shared_memory: *SharedMemory,
     device_region: *DeviceRegion,
     core_pin: CorePinObject,
-    broadcast_table: u64,
     empty: void,
 };
 
@@ -117,7 +127,6 @@ pub const UserViewEntryType = enum(u8) {
     device_region = 3,
     core_pin = 4,
     dead_process = 5,
-    broadcast_table = 6,
 };
 
 pub const UserViewEntry = extern struct {
@@ -151,11 +160,11 @@ pub const UserViewEntry = extern struct {
                 .field0 = processField0(p.crash_reason, p.restart_count),
                 .field1 = 0,
             },
-            .dead_process => |dp| .{
+            .dead_process => |p| .{
                 .handle = entry.handle,
                 .entry_type = @intFromEnum(UserViewEntryType.dead_process),
                 .rights = entry.rights,
-                .field0 = processField0(dp.crash_reason, dp.restart_count),
+                .field0 = processField0(p.crash_reason, p.restart_count),
                 .field1 = 0,
             },
             .vm_reservation => |vm| .{
@@ -205,13 +214,6 @@ pub const UserViewEntry = extern struct {
                 .rights = entry.rights,
                 .field0 = cp.core_id,
                 .field1 = cp.thread_tid,
-            },
-            .broadcast_table => |vaddr| .{
-                .handle = entry.handle,
-                .entry_type = @intFromEnum(UserViewEntryType.broadcast_table),
-                .rights = entry.rights,
-                .field0 = vaddr,
-                .field1 = 0,
             },
             .empty => EMPTY,
         };
