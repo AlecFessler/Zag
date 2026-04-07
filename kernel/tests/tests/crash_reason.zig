@@ -34,7 +34,6 @@ fn testStackOverflowCrashReason(perm_view_addr: u64) void {
     const base = vm_result.val2;
     syscall.write("crash_reason: setup done\n");
 
-    // Zero the SHM
     const run_counter: *u64 = @ptrFromInt(base);
     const crash_reason_slot: *u64 = @ptrFromInt(base + 8);
     const restart_count_slot: *u64 = @ptrFromInt(base + 16);
@@ -42,10 +41,8 @@ fn testStackOverflowCrashReason(perm_view_addr: u64) void {
     crash_reason_slot.* = 0;
     restart_count_slot.* = 0;
 
-    // Spawn restartable child
     const child_elf = embedded.child_stack_overflow_restart;
     const child_rights = (perms.ProcessRights{
-        .grant_to_child = true,
         .spawn_thread = true,
         .mem_reserve = true,
         .shm_create = true,
@@ -58,47 +55,47 @@ fn testStackOverflowCrashReason(perm_view_addr: u64) void {
     }
     syscall.write("crash_reason: child spawned\n");
 
-    // Grant SHM to child
+    // Send SHM handle to child via IPC cap transfer
     const grant_rights = (perms.SharedMemoryRights{
         .read = true,
         .write = true,
         .grant = true,
     }).bits();
-    _ = syscall.grant_perm(@intCast(shm_handle), @intCast(proc_handle), grant_rights);
+    const words = [_]u64{ 0, @intCast(shm_handle), grant_rights };
+    var reply: syscall.IpcMessage = .{};
+    _ = syscall.ipc_call_cap(@intCast(proc_handle), &words, &reply);
 
-    // Wait for child to report crash info (written after restart)
     t.waitUntilNonZero(crash_reason_slot);
 
     const crash_reason = crash_reason_slot.*;
     const restart_count = restart_count_slot.*;
 
-    // Verify crash_reason == stack_overflow (1)
     t.expectEqual("crash_reason is stack_overflow", @intFromEnum(pv.CrashReason.stack_overflow), @as(i64, @bitCast(crash_reason)));
 
-    // Verify restart_count >= 1
     if (restart_count >= 1) {
         t.pass("restart_count >= 1 after stack overflow restart");
     } else {
         t.failWithVal("restart_count should be >= 1", 1, @as(i64, @bitCast(restart_count)));
     }
 
-    // Wait for child to exit (it disables restart after reporting)
-    t.waitForCleanup(@intCast(proc_handle));
-
-    // After cleanup, check parent's perm view entry is now dead_process
+    // Check perm view for dead_process entry BEFORE waitForCleanup revokes it
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
     var found_dead = false;
-    for (view) |*entry| {
-        if (entry.handle == @as(u64, @intCast(proc_handle))) {
-            if (entry.entry_type == pv.ENTRY_TYPE_DEAD_PROCESS) {
-                found_dead = true;
+    // Poll briefly — child may still be mid-cleanup
+    var check: u32 = 0;
+    while (check < 10_000) : (check += 1) {
+        for (view) |*entry| {
+            if (entry.handle == @as(u64, @intCast(proc_handle))) {
+                if (entry.entry_type == pv.ENTRY_TYPE_DEAD_PROCESS) {
+                    found_dead = true;
+                }
+                break;
             }
-            break;
         }
+        if (found_dead) break;
+        syscall.thread_yield();
     }
 
-    // Note: waitForCleanup calls revoke_perm which clears the entry,
-    // so the dead_process entry may already be gone. That's fine — the
-    // crash info was already verified via SHM.
+    t.waitForCleanup(@intCast(proc_handle));
     t.pass("stack overflow crash reason tracking complete");
 }

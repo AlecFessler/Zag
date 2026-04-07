@@ -9,7 +9,7 @@ pub fn run() void {
     t.section("proc_create + cross-process SHM + revoke (S2.2, S2.4, S4)");
     testProcCreateBadElf();
     testProcCreateZeroLen();
-    testCrossProcessShmAndGrant();
+    testCrossProcessShm();
 }
 
 fn testProcCreateBadElf() void {
@@ -24,7 +24,7 @@ fn testProcCreateZeroLen() void {
     t.expectEqual("S4.proc_create: elf_len=0 returns E_INVAL", -1, rc);
 }
 
-fn testCrossProcessShmAndGrant() void {
+fn testCrossProcessShm() void {
     const shm_handle = syscall.shm_create(syscall.PAGE4K);
     if (shm_handle <= 0) {
         t.fail("setup failed");
@@ -52,7 +52,6 @@ fn testCrossProcessShmAndGrant() void {
 
     const child_elf = embedded.child_shm_counter;
     const child_rights = (perms.ProcessRights{
-        .grant_to_child = true,
         .spawn_thread = true,
         .mem_reserve = true,
         .shm_create = true,
@@ -64,13 +63,16 @@ fn testCrossProcessShmAndGrant() void {
     }
     t.pass("S2.1: proc_create returns handle, child starts with self-handle only");
 
+    // Send SHM handle to child via IPC cap transfer
     const grant_rights = (perms.SharedMemoryRights{
         .read = true,
         .write = true,
         .grant = true,
     }).bits();
-    const grant_rc = syscall.grant_perm(@intCast(shm_handle), @intCast(proc_handle), grant_rights);
-    t.expectEqual("S2.3: SHM grant inserts in child, increments refcount", 0, grant_rc);
+    const words = [_]u64{ 0, @intCast(shm_handle), grant_rights };
+    var reply: syscall.IpcMessage = .{};
+    const call_rc = syscall.ipc_call_cap(@intCast(proc_handle), &words, &reply);
+    t.expectEqual("S2.3: SHM cap transfer via IPC to child", 0, call_rc);
 
     t.waitUntilNonZero(parent_ptr);
 

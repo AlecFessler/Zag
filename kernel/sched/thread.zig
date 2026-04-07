@@ -46,6 +46,7 @@ pub const Thread = struct {
     pinned_exclusive: bool = false,
     futex_deadline_ns: u64 = 0,
     futex_paddr: PAddr = PAddr.fromInt(0),
+    ipc_server: ?*Process = null,
 
     pub fn deinit(self: *Thread) void {
         const proc = self.process;

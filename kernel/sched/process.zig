@@ -3,7 +3,6 @@ const zag = @import("zag");
 
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
-const broadcast = zag.perms.broadcast;
 const elf = std.elf;
 const futex = zag.sched.futex;
 const memory_init = zag.memory.init;
@@ -64,9 +63,16 @@ pub const Process = struct {
     perm_view_phys: PAddr,
     dma_mappings: [MAX_DMA_MAPPINGS]DmaMapping,
     num_dma_mappings: u32,
+    msg_waiters_head: ?*Thread = null,
+    msg_waiters_tail: ?*Thread = null,
+    receiver: ?*Thread = null,
+    pending_caller: ?*Thread = null,
+    pending_reply: bool = false,
     crash_reason: CrashReason,
     restart_count: u16,
     perm_view_gen: u64 = 0,
+    handle_refcount: u32 = 0,
+    cleanup_complete: bool = false,
 
     pub const MAX_THREADS = 64;
     pub const MAX_CHILDREN = 64;
@@ -120,6 +126,12 @@ pub const Process = struct {
                 slot.* = entry_in;
                 slot.handle = handle_id;
                 self.perm_count += 1;
+                // Increment refcount on referenced process
+                switch (entry_in.object) {
+                    .process => |p| _ = @atomicRmw(u32, &p.handle_refcount, .Add, 1, .acq_rel),
+                    .dead_process => |p| _ = @atomicRmw(u32, &p.handle_refcount, .Add, 1, .acq_rel),
+                    else => {},
+                }
                 self.syncUserView();
                 return handle_id;
             }
@@ -129,16 +141,30 @@ pub const Process = struct {
 
     pub fn removePerm(self: *Process, handle_id: u64) !void {
         if (handle_id == HANDLE_SELF) return error.CannotRevokeSelf;
+        var referenced_proc: ?*Process = null;
         self.perm_lock.lock();
-        defer self.perm_lock.unlock();
         for (self.perm_table[1..]) |*slot| {
             if (slot.object != .empty and slot.handle == handle_id) {
+                switch (slot.object) {
+                    .process => |p| referenced_proc = p,
+                    .dead_process => |p| referenced_proc = p,
+                    else => {},
+                }
                 slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
                 self.syncUserView();
+                self.perm_lock.unlock();
+                // Decrement refcount outside perm_lock to avoid lock ordering issues
+                if (referenced_proc) |p| {
+                    const prev = @atomicRmw(u32, &p.handle_refcount, .Sub, 1, .acq_rel);
+                    if (prev == 1 and p.cleanup_complete) {
+                        allocator.destroy(p);
+                    }
+                }
                 return;
             }
         }
+        self.perm_lock.unlock();
         return error.NotFound;
     }
 
@@ -255,6 +281,22 @@ pub const Process = struct {
 
         self.restart_count +%= 1;
 
+        // Preserve IPC wait list across restart. If there's a pending caller
+        // (message was delivered but not replied to), re-enqueue it at the
+        // head so the restarted process can recv it again.
+        self.lock.lock();
+        if (self.pending_caller) |pc| {
+            pc.next = self.msg_waiters_head;
+            self.msg_waiters_head = pc;
+            if (self.msg_waiters_tail == null) {
+                self.msg_waiters_tail = pc;
+            }
+            self.pending_caller = null;
+        }
+        self.pending_reply = false;
+        self.receiver = null; // old thread is dead
+        self.lock.unlock();
+
         self.vmm.resetForRestart();
 
         self.perm_lock.lock();
@@ -301,9 +343,77 @@ pub const Process = struct {
         }
     }
 
+    fn cleanupIpcState(self: *Process) void {
+        self.lock.lock();
+
+        // Unblock all message waiters with E_NOENT
+        var waiter = self.msg_waiters_head;
+        while (waiter) |w| {
+            const next_w = w.next;
+            w.ipc_server = null;
+            w.next = null;
+            w.ctx.regs.rax = @bitCast(@as(i64, -10));
+            while (w.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+            w.state = .ready;
+            const target_core = if (w.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+            sched.enqueueOnCore(target_core, w);
+            waiter = next_w;
+        }
+
+        // Unblock pending caller if any
+        if (self.pending_caller) |pc| {
+            pc.ipc_server = null;
+            pc.ctx.regs.rax = @bitCast(@as(i64, -10));
+            while (pc.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+            pc.state = .ready;
+            const target_core = if (pc.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+            sched.enqueueOnCore(target_core, pc);
+        }
+
+        self.msg_waiters_head = null;
+        self.msg_waiters_tail = null;
+        self.receiver = null;
+        self.pending_caller = null;
+        self.pending_reply = false;
+        self.lock.unlock();
+
+        // Clean up threads that are blocked waiting for reply from other processes
+        for (self.threads[0..self.num_threads]) |thread| {
+            if (thread.ipc_server) |server| {
+                server.lock.lock();
+                if (server.pending_caller == thread) {
+                    server.pending_caller = null;
+                    server.pending_reply = false;
+                } else {
+                    // Remove from server's wait queue
+                    var prev: ?*Thread = null;
+                    var cur = server.msg_waiters_head;
+                    while (cur) |t| {
+                        if (t == thread) {
+                            if (prev) |p| {
+                                p.next = t.next;
+                            } else {
+                                server.msg_waiters_head = t.next;
+                            }
+                            if (server.msg_waiters_tail == t) {
+                                server.msg_waiters_tail = prev;
+                            }
+                            t.next = null;
+                            break;
+                        }
+                        prev = t;
+                        cur = t.next;
+                    }
+                }
+                thread.ipc_server = null;
+                server.lock.unlock();
+            }
+        }
+    }
+
     fn cleanupPhase1(self: *Process) void {
+        self.cleanupIpcState();
         self.cleanupDmaMappings();
-        broadcast.removeByProcess(self);
         self.vmm.deinit();
 
         for (&self.perm_table) |*entry| {
@@ -315,12 +425,19 @@ pub const Process = struct {
                 .core_pin => |cp| {
                     sched.unpinByRevoke(cp.core_id, cp.thread_tid);
                 },
-                .broadcast_table => |vaddr| {
-                    // Unmap the shared broadcast table page before freeUserAddrSpace
-                    // so the shared physical page doesn't get freed with the process
-                    _ = arch.unmapPage(self.addr_space_root, VAddr.fromInt(vaddr));
+                .process => |p| {
+                    const prev = @atomicRmw(u32, &p.handle_refcount, .Sub, 1, .acq_rel);
+                    if (prev == 1 and p.cleanup_complete) {
+                        allocator.destroy(p);
+                    }
                 },
-                .vm_reservation, .process, .dead_process, .empty => {},
+                .dead_process => |p| {
+                    const prev = @atomicRmw(u32, &p.handle_refcount, .Sub, 1, .acq_rel);
+                    if (prev == 1 and p.cleanup_complete) {
+                        allocator.destroy(p);
+                    }
+                },
+                .vm_reservation, .empty => {},
             }
             entry.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
         }
@@ -339,7 +456,12 @@ pub const Process = struct {
         }
 
         if (self.restart_context) |rc| restart_context_mod.destroy(rc);
-        allocator.destroy(self);
+
+        self.cleanup_complete = true;
+        // Only free if no external handles remain
+        if (@atomicLoad(u32, &self.handle_refcount, .acquire) == 0) {
+            allocator.destroy(self);
+        }
     }
 
     fn convertToDeadProcess(parent: *Process, child: *Process) void {
@@ -351,10 +473,8 @@ pub const Process = struct {
                 else => false,
             };
             if (matches) {
-                slot.object = .{ .dead_process = .{
-                    .crash_reason = child.crash_reason,
-                    .restart_count = child.restart_count,
-                } };
+                // Refcount stays the same — still one reference, just different type
+                slot.object = .{ .dead_process = child };
                 parent.syncUserView();
                 if (parent.perm_view_phys.addr != 0) {
                     const field0_pa = PAddr.fromInt(parent.perm_view_phys.addr + idx * @sizeOf(UserViewEntry) + 16);
@@ -483,28 +603,6 @@ pub const Process = struct {
         proc.perm_view_phys = view_phys;
 
         proc.initPermTable(initial_rights);
-
-        if (initial_rights.grant_to_broadcast) {
-            const bt_phys = broadcast.physPage();
-            if (bt_phys.addr != 0) {
-                const bt_vaddr = try proc.vmm.allocateAfterCursor(paging.PAGE4K);
-                const bt_perms = MemoryPerms{
-                    .write_perm = .no_write,
-                    .execute_perm = .no_execute,
-                    .cache_perm = .write_back,
-                    .global_perm = .not_global,
-                    .privilege_perm = .user,
-                };
-                try arch.mapPage(proc.addr_space_root, bt_phys, bt_vaddr, bt_perms);
-                try proc.vmm.insertKernelNode(bt_vaddr, paging.PAGE4K, .{ .read = true }, .preserve);
-                const bt_entry = PermissionEntry{
-                    .handle = 0,
-                    .object = .{ .broadcast_table = bt_vaddr.addr },
-                    .rights = 0,
-                };
-                _ = proc.insertPerm(bt_entry) catch {};
-            }
-        }
 
         if (initial_rights.restart) {
             proc.restart_context = try restart_context_mod.create(

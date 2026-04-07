@@ -2,7 +2,6 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
-const broadcast = zag.perms.broadcast;
 const device_registry = zag.devices.registry;
 const futex = zag.sched.futex;
 const memory_init = zag.memory.init;
@@ -290,6 +289,98 @@ pub fn enqueueOnCore(core_index: u64, thread: *Thread) void {
     state.rq_lock.unlockIrqRestore(irq);
 }
 
+/// Pick best core for a thread. Prefers current_core if in affinity mask and not pinned.
+/// Returns null if all cores in the affinity mask are pinned.
+fn pickCoreForThread(thread: *Thread, current_core: u64) ?u64 {
+    const mask = thread.core_affinity orelse return current_core;
+    const current_bit = @as(u64, 1) << @intCast(current_core);
+    if (mask & current_bit != 0 and core_states[current_core].pinned_thread == null) {
+        return current_core;
+    }
+    const count = arch.coreCount();
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        const bit = @as(u64, 1) << @intCast(i);
+        if (mask & bit != 0 and core_states[i].pinned_thread == null) {
+            return i;
+        }
+    }
+    return null;
+}
+
+/// Switch to the next ready thread on the current core's run queue.
+/// Called from IPC syscalls that block the current thread.
+/// The caller must have already set the current thread's state and saved ctx.
+/// Does NOT return to the caller — switches stack and jumps to the next thread.
+pub fn switchToNextReady() noreturn {
+    const core_id = arch.coreID();
+    const state = &core_states[core_id];
+
+    state.rq_lock.lock();
+    const next = state.rq.dequeue() orelse &state.rq.sentinel;
+    if (next != &state.rq.sentinel) {
+        next.state = .running;
+        next.on_cpu.store(true, .release);
+    }
+    state.running_thread = next;
+    state.rq_lock.unlock();
+
+    armSchedTimer(state, SCHED_TIMESLICE_NS);
+    arch.switchTo(next);
+    unreachable;
+}
+
+/// Switch directly to a specific target thread. Used by IPC for direct handoff.
+/// Saves current thread's context, sets it to blocked/ready, and switches.
+/// If enqueue_current is true, the current thread is placed on the run queue
+/// after its context is saved (used by reply to keep the server runnable).
+/// If the target thread requires a different core (affinity), enqueues it remotely
+/// and sends an IPI, then runs next ready thread locally.
+/// Returns E_BUSY (-11) if all cores in target's affinity are pinned.
+/// Otherwise does NOT return — switches stack.
+pub fn switchToThread(current: *Thread, target: *Thread, ctx: *ArchCpuContext, enqueue_current: bool) i64 {
+    current.ctx = ctx;
+    current.on_cpu.store(false, .release);
+
+    const current_core = arch.coreID();
+    const target_core = pickCoreForThread(target, current_core) orelse {
+        // Undo — caller must handle this error
+        current.on_cpu.store(true, .release);
+        return -11; // E_BUSY
+    };
+
+    // Enqueue current thread after ctx is saved but before switching
+    if (enqueue_current) {
+        enqueueOnCore(current_core, current);
+    }
+
+    const state = &core_states[current_core];
+
+    if (target_core == current_core) {
+        target.state = .running;
+        target.on_cpu.store(true, .release);
+        state.running_thread = target;
+        armSchedTimer(state, SCHED_TIMESLICE_NS);
+        arch.switchTo(target);
+    } else {
+        target.state = .ready;
+        enqueueOnCore(target_core, target);
+        arch.triggerSchedulerInterrupt(target_core);
+        // Run next ready thread locally
+        state.rq_lock.lock();
+        const next = state.rq.dequeue() orelse &state.rq.sentinel;
+        if (next != &state.rq.sentinel) {
+            next.state = .running;
+            next.on_cpu.store(true, .release);
+        }
+        state.running_thread = next;
+        state.rq_lock.unlock();
+        armSchedTimer(state, SCHED_TIMESLICE_NS);
+        arch.switchTo(next);
+    }
+    unreachable;
+}
+
 pub fn globalInit(root_service_elf: []const u8) !void {
     proc_alloc_instance = try ProcessAllocator.init(memory_init.proc_slab_backing.allocator());
     process_mod.allocator = proc_alloc_instance.allocator();
@@ -303,10 +394,7 @@ pub fn globalInit(root_service_elf: []const u8) !void {
         state.rq.init();
     }
 
-    broadcast.init();
-
     const root_proc = try Process.create(root_service_elf, .{
-        .grant_to_child = true,
         .spawn_thread = true,
         .spawn_process = true,
         .mem_reserve = true,
@@ -315,8 +403,6 @@ pub fn globalInit(root_service_elf: []const u8) !void {
         .shm_create = true,
         .device_own = true,
         .pin_exclusive = true,
-        .grant_to_broadcast = true,
-        .broadcast = true,
     }, null);
     device_registry.grantAllToRootService(root_proc);
     core_states[0].rq.enqueue(root_proc.threads[0]);

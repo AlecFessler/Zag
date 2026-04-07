@@ -13,7 +13,6 @@ pub const VmReservationRights = packed struct(u8) {
 };
 
 pub const ProcessRights = packed struct(u16) {
-    grant_to_child: bool = false,
     spawn_thread: bool = false,
     spawn_process: bool = false,
     mem_reserve: bool = false,
@@ -22,9 +21,7 @@ pub const ProcessRights = packed struct(u16) {
     shm_create: bool = false,
     device_own: bool = false,
     pin_exclusive: bool = false,
-    grant_to_broadcast: bool = false,
-    broadcast: bool = false,
-    _reserved: u5 = 0,
+    _reserved: u8 = 0,
 
     pub fn bits(self: @This()) u64 {
         return @intCast(@as(u16, @bitCast(self)));
@@ -66,5 +63,19 @@ pub const DeviceRegionRights = packed struct(u8) {
 
     pub fn bits(self: @This()) u64 {
         return @intCast(@as(u8, @bitCast(self)));
+    }
+};
+
+pub const ProcessHandleRights = packed struct(u16) {
+    send_words: bool = false,
+    send_shm: bool = false,
+    send_process: bool = false,
+    send_device: bool = false,
+    kill: bool = false,
+    grant: bool = false,
+    _reserved: u10 = 0,
+
+    pub fn bits(self: @This()) u64 {
+        return @intCast(@as(u16, @bitCast(self)));
     }
 };

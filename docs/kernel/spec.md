@@ -9,7 +9,7 @@ Zag is a microkernel. Its responsibilities are:
 1. **Physical memory management** — Tracking, allocating, and freeing physical pages.
 2. **Virtual memory management** — Page tables, mappings, permissions, VA reservation tracking, address space lifecycle.
 3. **Execution management** — Scheduling, thread and process lifecycles.
-4. **Inter-process communication** — Shared memory regions mappable into multiple address spaces.
+4. **Inter-process communication** — Shared memory regions and synchronous message passing.
 5. **Device access** — Enumerating devices, mapping MMIO regions, device handle return via process tree.
 6. **Permission enforcement** — Capability-based access control over kernel objects.
 
@@ -25,7 +25,9 @@ An isolated execution environment.
 
 #### Process Tree
 
-Processes form a tree via parent/children links. A process is a **leaf** if its children list is empty. Only leaves can be fully freed. Non-leaf processes that exit become **zombies**: address space torn down, permissions table cleaned up, but process struct, tree position, and children list persist. Zombies hold no resources. Zombies never have restart contexts (a process with a restart context restarts instead of dying, so it never reaches zombie state).
+Processes form a tree via parent/children links. A process is a **leaf** if its children list is empty. Non-leaf processes that exit become **zombies**: address space torn down, permissions table cleaned up, but process struct, tree position, and children list persist. Zombies hold no resources. Zombies never have restart contexts (a process with a restart context restarts instead of dying, so it never reaches zombie state).
+
+**Reference counting:** Process structs are reference-counted by the number of handle entries (`.process` or `.dead_process`) across all processes' permission tables. The struct is freed only when cleanup is complete AND the reference count reaches zero. This prevents dangling pointers when process handles are transferred via message passing.
 
 **Device handle return:** When a device handle is returned (revoke, exit, cleanup), the kernel walks parent pointers to find the nearest ancestor that is alive and inserts the handle there. Zombies are always skipped. A process mid-restart is alive and is a valid destination. If the walk reaches root with no valid destination, the handle is dropped.
 
@@ -37,12 +39,12 @@ Read-only region mapped into the process's address space, mirroring the permissi
 
 Each entry is 32 bytes and contains:
 - `handle: u64` — monotonic ID. `U64_MAX` = empty slot.
-- `type: enum { process, vm_reservation, shared_memory, device_region, core_pin, dead_process, broadcast_table }`.
+- `type: enum { process, vm_reservation, shared_memory, device_region, core_pin, dead_process }`.
 - `rights: u16`.
 
 Type-specific fields:
 - `process`: `field0` encodes `crash_reason(u5, bits 0-4) | restart_count(u16, bits 16-31)`. On first boot, field0 = 0. After a restart, crash_reason reflects the fault that triggered the restart and restart_count increments.
-- `dead_process`: Same field0 encoding as `process`. This entry type replaces a `process` entry when the child dies without restarting. The parent may inspect the crash reason and restart count, then revoke the handle at its convenience.
+- `dead_process`: Same field0 encoding as `process`. This entry type replaces a `process` entry when the referenced process dies without restarting. Any handle holder may inspect the crash reason and restart count, then revoke the handle at its convenience to free the slot.
 - `vm_reservation`: `start: VAddr`, `size: u64` (original range).
 - `shared_memory`: `size: u64`.
 - `device_region`: `field0: u64`, `field1: u64` (see §2.7 Device Region for encoding).
@@ -101,13 +103,21 @@ Handle = monotonic u64 ID, unique across the lifetime of the process. Handle 0 (
 
 #### Rights
 
-**ProcessRights:** `grant_to_child`(0), `spawn_thread`(1), `spawn_process`(2), `mem_reserve`(3), `set_affinity`(4), `restart`(5), `shm_create`(6), `device_own`(7), `shutdown`(8), `pin_exclusive`(9), `grant_to_broadcast`(10), `broadcast`(11). Stored as `u16`. Note: `grant_to_child` and `grant_to_broadcast` are caller-side rights — they are checked on the calling process, not the target.
+**ProcessRights:** `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `shm_create`(5), `device_own`(6), `pin_exclusive`(7). Stored as `u16`. ProcessRights apply only to `HANDLE_SELF` (the process's own capability).
 
 - `restart`: can only be granted by a parent that itself has `restart`. Once cleared via `disable_restart`, cannot be re-enabled.
 - `shm_create`: required to create shared memory regions.
-- `device_own`: required to receive device handles via grant. The kernel checks this on the target process during device grant.
-- `shutdown`: required to invoke the `shutdown` syscall. Only the root service should hold this.
+- `device_own`: required to receive device handles via message passing. The kernel checks this on the target process during device transfer.
 - `pin_exclusive`: required to pin a thread exclusively to a core, making it non-preemptible.
+
+**ProcessHandleRights:** `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5). Stored as `u16`. These rights apply to handles referencing *other* processes (not `HANDLE_SELF`). They control what operations the handle holder may perform on the target process via message passing or revoke. `proc_create` grants the parent full `ProcessHandleRights` on the child handle.
+
+- `send_words`: can send word messages to this process.
+- `send_shm`: can pass SHM handles to this process via message passing.
+- `send_process`: can pass process handles to this process via message passing.
+- `send_device`: can pass device handles to this process via message passing (parent→child only).
+- `kill`: can trigger recursive kill of this process's subtree (via `revoke_perm`). Without this bit, revoking a process handle just drops the handle without killing.
+- `grant`: can re-transfer this process handle to another process via message passing capability transfer.
 
 **VmReservationRights:** `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4). `shareable` and `mmio` are mutually exclusive.
 
@@ -117,16 +127,13 @@ Handle = monotonic u64 ID, unique across the lifetime of the process. Handle 0 (
 
 #### Permission Rules
 
-1. **VM reservation handles** — acquired via `vm_reserve`. Not grantable.
-2. **Shared memory handles** — acquired via `shm_create` or grant. Grantable if `grant` bit set. Granting creates a copy in the target.
-3. **Process handles** — acquired by spawning. Not grantable. **Revoking kills the child's entire subtree** (§2.6).
-4. **Device region handles** — distributed to root service at boot. Exclusive: grant removes from parent, return walks up tree. Target must have `device_own`.
-5. **Caller-side grant checks** — the caller must have `grant_to_child` (when the target is a child process in the caller's perm view) or `grant_to_broadcast` (when the target is identified by a broadcast table handle). These rights are checked on the caller, not the target.
-6. **Subsets only** — granted rights must be a subset of source rights.
+1. **VM reservation handles** — acquired via `vm_reserve`. Not transferable.
+2. **Shared memory handles** — acquired via `shm_create` or message passing. Transferable via message passing if `grant` bit set. Transfer creates a copy in the target.
+3. **Process handles** — acquired by spawning. Transferable via message passing if `grant` bit set (§2.11). Rights use `ProcessHandleRights` encoding.
+4. **Device region handles** — distributed to root service at boot. Exclusive: transfer removes from source. Parent→child only. Target must have `device_own`.
+5. **Subsets only** — transferred rights must be a subset of source rights.
 
-#### Grant
-
-Validate: granted rights must be a subset of source rights, source must have `grant` bit. Caller must have `grant_to_child` if the target process handle is a child in the caller's perm view, or `grant_to_broadcast` if the target handle identifies a broadcast table entry. Device grants additionally require the target process has `device_own`. SHM: insert in target. Device: remove from source, insert in target (exclusive).
+All capability transfer is done via message passing (§2.11). There is no dedicated grant syscall.
 
 #### Revoke
 
@@ -134,7 +141,8 @@ Cannot revoke `HANDLE_SELF`. By type:
 - **VM reservation:** Free all pages in range, clear slot.
 - **Shared memory:** Unmap SHM PTEs within any reservation referencing this SharedMemory, revert to private. Clear slot.
 - **Device region:** Unmap MMIO PTEs, return handle up process tree (§2.1 device handle return). Clear slot in source.
-- **Process:** Recursively kill child's entire subtree (§2.6). Clear slot.
+- **Process (with `kill` right):** Recursively kill child's entire subtree (§2.6). Clear slot.
+- **Process (without `kill` right):** Drop handle only, no kill. Clear slot.
 
 ---
 
@@ -146,7 +154,7 @@ A unit of execution belonging to a Process.
 
 - **running** — actively executing on a core.
 - **ready** — waiting to be scheduled.
-- **blocked** — waiting on a futex.
+- **blocked** — waiting on a futex or message passing operation.
 - **exited** — terminated.
 
 #### Operations
@@ -167,7 +175,7 @@ The futex mechanism allows userspace synchronization primitives (mutexes, condit
 
 **wait(addr, expected, timeout_ns):** Compare the 64-bit value at `addr` against `expected`. If not equal: return `E_AGAIN`. If equal: block the calling thread until woken or the timeout expires. Address must be 8-byte aligned. Timeout: 0 = try-only (return `E_TIMEOUT` immediately), `MAX_U64` = indefinite wait, any other value = block for at most `timeout_ns` nanoseconds then return `E_TIMEOUT`. Timed waiters are checked every scheduler tick (~2ms). Cross-process futexes work over shared memory (two processes mapping the same SHM can synchronize via the same address).
 
-**wake(addr, count):** Wake up to `count` threads blocked on the physical address corresponding to `addr`. Returns number of threads woken.
+**wake(addr, count):** Wake up to `count` threads blocked on the physical address corresponding to `addr`. Waiters are woken in FIFO order. Returns number of threads woken.
 
 ---
 
@@ -179,7 +187,7 @@ Triggered when a process with a restart context terminates for any reason (last 
 
 The process remains alive throughout. Its permissions table and user view remain intact (except VM reservation entries, which are cleared). Each restart increments a restart count (`u16`, wraps to zero on overflow). The crash reason from the triggering fault is recorded in the process's user view field0.
 
-**Persists across restart:** code/rodata/data mappings (data content reloaded from original), user permissions view, BSS region (decommitted), SHM and device handle permissions table entries, process tree position, children, restart context.
+**Persists across restart:** code/rodata/data mappings (data content reloaded from original), user permissions view, BSS region (decommitted), SHM and device handle permissions table entries, process tree position, children, restart context, message passing wait queue. If a message was delivered but not replied to, the pending caller is re-enqueued at the head of the wait queue so the restarted process can `recv` it again.
 
 **Does not persist:** user-created VM reservations, VM reservation permissions table entries, user stacks, SHM/MMIO mappings within freed reservations, committed pages in decommitted regions, threads.
 
@@ -187,15 +195,15 @@ The process remains alive throughout. Its permissions table and user view remain
 
 #### Kill
 
-A process terminates only by: (a) last thread voluntarily exiting, (b) a fault, or (c) parent revoking its process handle. There is no `proc_kill` syscall.
+A process terminates only by: (a) last thread voluntarily exiting, (b) a fault, or (c) any handle holder with the `kill` right revoking a process handle. There is no `proc_kill` syscall.
 
 When a process is killed by a fault, the kernel records a **crash reason** (see §3 for the mapping). If the process has a restart context, it restarts and the crash reason and incremented restart count are written to both the process's own user view (slot 0 field0) and the parent's user view entry for this child. The kernel issues a futex wake on the parent's user view field0 for this entry.
 
-If the process does not have a restart context, it undergoes cleanup. The parent's permissions table entry is converted from `process` to `dead_process`, preserving the crash reason and restart count. The kernel issues a futex wake on the parent's user view field0. The parent may inspect the crash info via its user view and revoke the handle at its convenience to free the slot.
+If the process does not have a restart context, it undergoes cleanup. The parent's permissions table entry is converted from `process` to `dead_process`, preserving the crash reason and restart count. The kernel issues a futex wake on the parent's user view field0. Any handle holder may inspect the crash info via its user view and revoke the handle at its convenience to free the slot. Non-parent handle holders' entries are also converted to `dead_process` when they attempt IPC to the dead process (the entry type check in `send`/`call` returns `E_BADCAP`).
 
 **Non-recursive kill** (fault, voluntary exit): All threads are stopped and removed. If the process has a restart context, it restarts. Otherwise, it undergoes cleanup (becoming a zombie if it has children).
 
-**Recursive kill** (parent revokes child process handle): Depth-first post-order traversal of the entire subtree. For each process: stop all threads, then either restart (if restartable) or cleanup. Restartable processes get a forced restart, keeping device handles. Non-restartable processes die; device handles return up tree.
+**Recursive kill** (handle holder with `kill` right revokes process handle): Depth-first post-order traversal of the entire subtree. For each process: stop all threads, then either restart (if restartable) or cleanup. Restartable processes get a forced restart, keeping device handles. Non-restartable processes die; device handles return up tree.
 
 ---
 
@@ -257,19 +265,59 @@ A core pin object represents exclusive, non-preemptible ownership of a CPU core 
 
 ---
 
-### 2.11 Broadcast Table
+### 2.11 Message Passing
 
-A kernel-managed read-only region mapped into every process that has the `grant_to_broadcast` right. The table provides a discovery mechanism: processes with the `broadcast` right register themselves, and processes with `grant_to_broadcast` can see and grant permissions to those broadcasters.
+Synchronous, zero-buffered message passing between processes. Messages are transferred directly from sender registers to receiver registers with no kernel-internal queuing.
 
-**Structure:** 256 entries, each 16 bytes: `handle: u64` + `payload: u64`. Total size = 1 page (4096 bytes).
+#### Register Convention
 
-**Registration:** A process with the `broadcast` right may call `broadcast(payload)` to insert an entry containing its own process handle and the given payload. A process may broadcast multiple times with unique payloads.
+5 payload registers: `rdi`, `rsi`, `rdx`, `r8`, `r9` (in order, words 0-4). `r13` = target process handle (for `send`/`call`). `r14` = metadata flags. `rax` = syscall number (input) / status code (output). `rcx` and `r11` are reserved for future `syscall` instruction migration. Only caller-saved registers are used for payload to avoid save/restore overhead in userspace.
 
-**Death cleanup:** When a broadcaster dies, all its entries are removed and the table is compacted (the last entry fills each gap).
+#### r14 Metadata Encoding
 
-**Dead process restriction:** Dead processes cannot insert new entries.
+**For send/call (input):**
+- bits [2:0] — word count (0-5, number of payload registers to transfer)
+- bit 3 — capability transfer flag
 
-**User view:** A `broadcast_table` perm view entry type provides the virtual address of the mapping. `field0` = vaddr. Revocable.
+**For recv (output, set by kernel):**
+- bit 0 — 0 = message from `send`, 1 = message from `call`
+- bits [3:1] — word count
+
+**For reply (input):**
+- bit 0 — atomic recv flag (reply then immediately block on recv)
+- bit 1 — blocking flag for the atomic recv
+- bits [4:2] — reply word count
+
+#### Syscall Semantics
+
+**send** — Non-blocking fire-and-forget. If the target process has a thread blocked on `recv`, the payload is copied directly from the sender's registers to the receiver's registers. Otherwise returns `E_AGAIN`. The sender continues running.
+
+**call** — Blocking synchronous RPC. Same as `send` but the caller blocks until the receiver calls `reply`. The kernel performs a direct context switch to the receiver, giving it the caller's timeslice. If no receiver is waiting, the caller is added to the target's FIFO wait queue. Returns with the reply payload in the payload registers.
+
+**recv** — Receive a message. If the process's wait queue has a blocked `call` sender, dequeues the first one and copies its payload. If the queue is empty, blocks (if blocking flag set) or returns `E_AGAIN` (if non-blocking). Returns `E_BUSY` if a previous message has not been replied to. Only one thread per process may be blocked on `recv` at a time; a second thread calling `recv` gets `E_BUSY`.
+
+**reply** — Respond to a pending message. If the pending message was from a `call`, copies reply payload to the caller's registers and unblocks the caller via direct context switch. If from a `send`, clears the pending state (no one to unblock). The process must call `reply` before calling `recv` again. If the atomic recv flag is set, `reply` atomically transitions into a `recv` (reply to the current caller, then immediately wait for the next message).
+
+#### Wait Queue
+
+Each process has a FIFO queue of threads blocked on `call` to it. When a receiver calls `recv`, it dequeues the first waiter. The `send` syscall never queues — it returns `E_AGAIN` if no receiver is waiting.
+
+#### Capability Transfer
+
+When r14 bit 3 is set on `send` or `call`, the last 2 of the N payload words are interpreted as handle + rights. The kernel validates the sender's permissions and transfers the capability into the target process's permissions table at send time. The sender must have the appropriate `ProcessHandleRights` bit:
+- `send_shm` for shared memory handles (validates `grant` bit, rights subset, increments refcount)
+- `send_process` for process handles (inserts with `ProcessHandleRights` encoding)
+- `send_device` for device handles (parent→child only, exclusive transfer — removes from sender)
+
+#### Direct Context Switch
+
+`call` performs a direct context switch to the receiver, and `reply` performs a direct context switch back to the caller. This makes message passing behave like a userspace syscall — the caller's timeslice is donated to the server. The kernel respects thread core affinity: if the target thread requires a different core, the kernel enqueues it on the correct core and sends an IPI to preempt that core's current thread. If all cores in the target's affinity mask have pinned threads, the syscall returns `E_BUSY`.
+
+#### Process Death Cleanup
+
+When a process dies, all threads in its message wait queue are unblocked with `E_NOENT`. If a caller is blocked waiting for a reply (`pending_caller`), it is also unblocked with `E_NOENT`. Back-pointers (`ipc_server` on Thread) ensure bidirectional cleanup regardless of whether the server or caller dies first.
+
+A restarting process (`alive` remains true throughout restart) is always a valid message passing target. Messages queued in the wait list persist across restart (§2.6). IPC to a dead process (handle entry is `dead_process` type, not `process`) returns `E_BADCAP`.
 
 ---
 
@@ -433,27 +481,37 @@ The thread must have single-core affinity set. The target core must not already 
 **Returns:** Core pin handle ID (positive).
 **Errors:** `E_PERM` (no `pin_exclusive` right), `E_INVAL` (no affinity set, multi-core affinity, would pin all cores), `E_BUSY` (core already pinned), `E_MAXCAP`.
 
-### broadcast(payload) → result
+### send(r13=target_handle, r14=metadata, payload regs) → status
 
-Register in the global broadcast table. Inserts an entry with the calling process's handle and the given payload. A process may broadcast multiple times with unique payloads.
+Non-blocking message send. See §2.11 for register convention and semantics.
 
-**Permission:** `HANDLE_SELF.broadcast`.
+**Permission:** Target process handle must have `send_words` right. If capability transfer (r14 bit 3): `send_shm`, `send_process`, or `send_device` as appropriate.
+**Returns:** `E_OK` (message delivered to receiver).
+**Errors:** `E_BADCAP` (invalid target handle), `E_PERM` (missing rights), `E_AGAIN` (no receiver waiting), `E_MAXCAP` (capability transfer failed, target perm table full), `E_INVAL` (invalid capability transfer).
+
+### call(r13=target_handle, r14=metadata, payload regs) → status + reply payload
+
+Blocking synchronous RPC. See §2.11. Caller blocks until receiver replies. Direct context switch to receiver.
+
+**Permission:** Same as `send`.
+**Returns:** `E_OK` with reply payload in payload registers.
+**Errors:** `E_BADCAP`, `E_PERM`, `E_NOENT` (target process died while waiting), `E_BUSY` (target's affinity cores all pinned), `E_MAXCAP`, `E_INVAL`.
+
+### recv(r14=metadata) → status + message payload
+
+Receive a message. r14 bit 1 = blocking flag (1 = block if no message, 0 = return immediately).
+
+**Returns:** `E_OK` with message in payload registers and r14 set with sender metadata (send-vs-call indicator, word count).
+**Errors:** `E_AGAIN` (non-blocking, no message), `E_BUSY` (pending reply not cleared, or another thread already blocked on recv).
+
+### reply(r14=metadata, payload regs) → status
+
+Reply to a pending message. r14 bit 0 = atomic recv flag, r14 bit 1 = blocking flag for atomic recv, r14 bits [4:2] = reply word count.
+
 **Returns:** `E_OK`.
-**Errors:** `E_PERM` (no `broadcast` right), `E_NOMEM` (table full), `E_INVAL` (duplicate payload).
+**Errors:** `E_INVAL` (no pending message to reply to), `E_BUSY` (atomic recv: target affinity cores all pinned).
 
 ---
-
-### grant_perm(src_handle, target_proc_handle, granted_rights) → result
-
-Grant a capability to another process. `target_proc_handle` identifies the target: either a child process handle in the caller's perm view (requires caller has `grant_to_child`) or a broadcast table handle (requires caller has `grant_to_broadcast`). `granted_rights` must be a subset of `src_handle.rights`. Source must have `grant` bit set.
-
-- **SHM:** Insert copy in target. Source retains handle.
-- **Device:** Exclusive transfer — remove from source, insert in target. Target must have `device_own`.
-
-Only SHM and device handles are grantable. VM reservation and process handles are not grantable.
-
-**Returns:** `E_OK`.
-**Errors:** `E_BADCAP` (invalid src or target handle, target not a process), `E_PERM` (no `grant` bit, caller lacks `grant_to_child`/`grant_to_broadcast`, target lacks `device_own` for device grants, rights exceed source), `E_MAXCAP` (target permissions table full), `E_INVAL` (non-grantable handle type).
 
 ### revoke_perm(handle) → result
 
@@ -463,8 +521,8 @@ Cannot revoke `HANDLE_SELF`. Per-type behavior (§2.3):
 - **SHM:** Unmap SHM PTEs, revert mapped regions to private, clear slot.
 - **Device:** Unmap MMIO PTEs, return handle up process tree (§2.1 device handle return), clear slot in source.
 - **Core pin:** Unpin the thread, restore preemptive scheduling on the core, clear slot.
-- **Broadcast table:** Clear slot (process loses visibility into broadcast table).
-- **Process:** Recursively kill child's entire subtree (§2.6). Restartable children restart; non-restartable die. Clear slot.
+- **Process (with `kill` right):** Recursively kill child's entire subtree (§2.6). Restartable children restart; non-restartable die. Clear slot.
+- **Process (without `kill` right):** Drop handle only, no kill. Clear slot.
 - **Dead process:** Clear slot (process already dead, no further cleanup needed).
 
 **Returns:** `E_OK`.
@@ -495,13 +553,6 @@ Wake up to `count` threads blocked on `addr`.
 ### clock_gettime() → nanoseconds
 
 **Returns:** Monotonic nanoseconds since boot.
-
-### shutdown() → noreturn
-
-Immediately halt the machine.
-
-**Permission:** `HANDLE_SELF.shutdown`.
-**Errors:** `E_PERM`.
 
 ### dma_map(device_handle, shm_handle) → dma_addr
 
@@ -560,4 +611,3 @@ Write to a Port I/O device. Same validation as `ioport_read`.
 | Futex timed waiter slots | 64 |
 | User permissions view | 1 page (128 entries x 32 bytes) |
 | DMA mappings per process | 16 |
-| Broadcast table capacity | 256 slots |

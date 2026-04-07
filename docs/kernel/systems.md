@@ -282,19 +282,18 @@ PermissionEntry {
 ```
 KernelObject = union(enum) {
     process: *Process
-    dead_process: DeadProcessInfo { crash_reason: CrashReason, restart_count: u16 }
+    dead_process: *Process  // struct stays alive via handle_refcount
     vm_reservation: VmReservationObject { max_rights, original_start, original_size }
     shared_memory: *SharedMemory
     device_region: *DeviceRegion
     core_pin: CorePinObject { core_id, thread_tid }
-    broadcast_table: BroadcastTableObject { vaddr: VAddr }
     empty: void
 }
 ```
 
 ### Dead Process Entries
 
-When a non-restartable child process dies, `cleanupPhase2` calls `convertToDeadProcess` on the parent, which replaces the `.process` entry with `.dead_process` carrying the child's crash reason and restart count. This avoids a dangling `*Process` pointer after the process struct is freed. The kernel issues a `futex.wake` on the parent's user view field0 physical address for this entry so that watchdog threads blocked on the field are woken. The parent revokes the handle at its convenience via `revoke_perm`, which simply clears the slot.
+When a non-restartable child process dies, `cleanupPhase2` calls `convertToDeadProcess` on the parent, which replaces the `.process` entry with `.dead_process` storing a `*Process` pointer. The Process struct stays alive via `handle_refcount` until all handle holders revoke. Crash reason and restart count are read from the Process struct fields. The kernel issues a `futex.wake` on the parent's user view field0 physical address for this entry so that watchdog threads blocked on the field are woken. Any handle holder revokes at its convenience via `revoke_perm`, which clears the slot and decrements the refcount.
 
 ### Empty Slot Sentinel
 
@@ -336,13 +335,14 @@ UserViewEntry (extern struct, 32 bytes) {
 
 `EMPTY` sentinel: `handle = U64_MAX, entry_type = 0xFF, rights = 0, field0 = 0, field1 = 0`.
 
-Types: `process = 0, vm_reservation = 1, shared_memory = 2, device_region = 3, core_pin = 4, dead_process = 5, broadcast_table = 6`.
+Types: `process = 0, vm_reservation = 1, shared_memory = 2, device_region = 3, core_pin = 4, dead_process = 5`.
 
 ### Rights Types
 
 All rights are packed structs with bit fields:
 
-- `ProcessRights`: packed `u16` -- `grant_to_child`(0), `spawn_thread`(1), `spawn_process`(2), `mem_reserve`(3), `set_affinity`(4), `restart`(5), `shm_create`(6), `device_own`(7), `shutdown`(8), `pin_exclusive`(9), `grant_to_broadcast`(10), `broadcast`(11), 4 bits reserved.
+- `ProcessRights`: packed `u16` -- `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `shm_create`(5), `device_own`(6), `pin_exclusive`(7), 8 bits reserved.
+- `ProcessHandleRights`: packed `u16` -- `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5), 10 bits reserved. Used on handles to other processes (not HANDLE_SELF).
 - `VmReservationRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4), 3 bits reserved.
 - `SharedMemoryRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `grant`(3), 4 bits reserved.
 - `DeviceRegionRights`: packed `u8` -- `map`(0), `grant`(1), `dma`(2), 5 bits reserved.
@@ -783,7 +783,7 @@ After all threads are marked exited and removed from queues:
 - Destroy stacks, deregister stack guards.
 - Process exit logic runs.
 - If `restart_context` present: restart (process survives). `restart_count` is incremented with wrapping arithmetic (`+%=`). `crash_reason` and `restart_count` are written to the process's own user view (slot 0 field0) and the parent's user view entry via `updateParentView`, which also issues a `futex.wake` on the parent's field0 physical address.
-- If no restart context: cleanup. In `cleanupPhase2`, `convertToDeadProcess` replaces the parent's `.process` entry with `.dead_process` carrying `crash_reason` and `restart_count`, syncs the parent's user view, and issues a `futex.wake`.
+- If no restart context: cleanup. In `cleanupPhase2`, `convertToDeadProcess` replaces the parent's `.process` entry with `.dead_process` storing `*Process`, syncs the parent's user view, and issues a `futex.wake`. The Process struct remains alive until all handle holders revoke (`handle_refcount` reaches 0).
 
 ### Recursive Kill (Parent Revokes Child Process Handle)
 
@@ -1191,32 +1191,105 @@ HPET, LAPIC, and I/O APIC are discovered during ACPI parsing and mapped into ker
 
 ---
 
-## 16. Broadcast Table Internals
+## 16. Message Passing Internals
 
-### Storage
+### Overview
 
-Global singleton: one physical page (4096 bytes) allocated at boot during `globalInit`. User-visible entries occupy the page as a 256-element array of `BroadcastEntry { handle: u64, payload: u64 }`.
+Synchronous, zero-buffered IPC. Messages are transferred directly from sender registers to receiver registers via the saved CPU context on each thread's kernel stack. No kernel-internal message queues or buffers.
 
-A parallel kernel-only array `internal_procs: [256]?*Process` maps each slot to its owning process. A global `count: u32` tracks the number of active entries. A `SpinLock` serializes all mutations.
+Four syscalls: `send` (non-blocking fire-and-forget), `call` (blocking RPC), `recv` (receive with blocking/non-blocking flag), `reply` (respond to pending message, optional atomic recv).
 
-### Handle Disambiguation
+### Register Convention
 
-`BROADCAST_OFFSET = 0x8000_0000_0000_0000`. Broadcast table handles are `BROADCAST_OFFSET + slot_index`. Since per-process handle counters start at 1 and increment monotonically, they never reach `BROADCAST_OFFSET`. `grant_perm` uses `target_proc_handle >= BROADCAST_OFFSET` to distinguish broadcast targets from perm view targets.
+5 payload registers in order: `rdi`(0), `rsi`(1), `rdx`(2), `r8`(3), `r9`(4). Only caller-saved registers are used for payload. `r13` = target process handle. `r14` = metadata flags. `rax` = syscall number / return status. `rcx` and `r11` reserved for future `syscall` instruction.
 
-### Insert
+r14 encoding varies by syscall — see spec §2.12.
 
-Linear scan of `entries[0..count]` to enforce payload uniqueness. Rejects inserts from dead processes (`!proc.alive`). Appends at `entries[count]`, increments count.
+### Process Struct Fields
 
-### Compaction on Death
+```
+msg_waiters_head: ?*Thread    — head of FIFO queue of blocked call senders
+msg_waiters_tail: ?*Thread    — tail of FIFO queue
+receiver: ?*Thread            — thread currently blocked on recv (null if none)
+pending_caller: ?*Thread      — call sender whose message was delivered, awaiting reply
+pending_reply: bool           — true if a message has been received but not replied to
+```
 
-`removeByProcess(proc)` iterates backward-safe (index not incremented on match). For each matching slot: decrement count, copy last entry into gap (both user-visible and internal arrays), update moved entry's handle to reflect new slot index, zero the vacated last slot.
+All protected by the existing `process.lock` spinlock. No new lock introduced.
 
-Called from two paths:
-- `kill()` -- after setting threads to exited, before returning. Ensures broadcast entries are cleaned up before the parent's `waitForCleanup` loop returns.
-- `cleanupPhase1()` -- idempotent second call for the normal exit path.
+### Thread Struct Fields
 
-### Mapping into Processes
+```
+ipc_server: ?*Process         — back-pointer to process we're waiting for reply from (for cleanup)
+```
 
-During `Process.create`, if `initial_rights.grant_to_broadcast` is set, the broadcast table's physical page is mapped read-only into the process's address space (same pattern as the perm view page). A `broadcast_table` perm entry is inserted with `field0 = vaddr`. The VMM node uses `.preserve` restart policy so the mapping survives process restarts.
+### Process State Machine
 
-The physical page is shared across all processes with `grant_to_broadcast`. When a process dies, its `cleanupPhase1` unmaps the broadcast table PTE before `freeUserAddrSpace` runs, preventing the shared page from being freed with the dying process's address space.
+```
+Idle:            receiver=null, pending_reply=false, waiters empty
+Receiving:       receiver=thread, pending_reply=false (thread blocked on recv)
+Pending Reply:   receiver=null, pending_reply=true, pending_caller=thread|null
+```
+
+Transitions:
+- Idle → Receiving: thread calls blocking `recv` with empty queue
+- Idle/Receiving → Pending Reply: message delivered (from send/call to blocked receiver, or from queued caller to recv)
+- Pending Reply → Idle: `reply` called, clears pending state
+
+### Context Switch Strategy
+
+IPC syscalls use direct `arch.switchTo` calls, bypassing the scheduler interrupt. This preserves `thread.ctx` pointing at the int 0x80 frame, allowing `reply` to write directly into the caller's saved registers.
+
+`switchToThread(current, target, ctx, enqueue_current)`:
+1. Saves `current.ctx = ctx` and clears `on_cpu`
+2. If `enqueue_current`, places current on run queue (after ctx is saved, before switch)
+3. Picks target core respecting affinity via `pickCoreForThread`
+4. Same core (fast path): direct `switchTo`
+5. Different core: enqueue target remotely, IPI the target core, run next ready thread locally
+6. Returns `E_BUSY` if all affinity cores are pinned
+
+`switchToNextReady()`: dequeues from current core's run queue and switches. Used when blocking without a specific target.
+
+### Capability Transfer
+
+When r14 bit 3 is set, the last 2 payload words are `handle` + `rights`. The kernel validates the sender's permissions and transfers at send time (before the message is delivered to the receiver).
+
+Transfer rules by handle type:
+- **SHM**: validate `grant` bit on SHM handle, rights subset, `incRef`, `insertPerm` into target
+- **Process handles**: validate `grant` bit on process handle, rights subset, `insertPerm` into target
+- **Device handles**: validate `grant` bit on device handle, parent→child only, exclusive transfer (removed from sender)
+
+### ProcessHandleRights
+
+When a process holds a handle to another process (not `HANDLE_SELF`), the `rights` field uses `ProcessHandleRights` encoding: `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5). `proc_create` grants the parent full `ProcessHandleRights` on the child handle. The `grant` bit controls whether the handle can be re-transferred to another process via capability transfer. The `kill` bit controls whether `revoke_perm` triggers `killSubtree` or just drops the handle.
+
+### Cleanup on Process Death
+
+`cleanupIpcState()` runs at the beginning of `cleanupPhase1`:
+
+**Server dies (this process has waiters):**
+1. Walk `msg_waiters` list: set `waiter.ipc_server = null`, write `E_NOENT` to `waiter.ctx.regs.rax`, wake waiter
+2. If `pending_caller` non-null: same treatment
+3. Clear all IPC fields
+
+**Caller dies (this process has threads blocked on other processes):**
+1. For each thread with `ipc_server` set: lock the server, remove this thread from `pending_caller` or `msg_waiters`, clear `ipc_server`, unlock server
+
+Both sides clean up to prevent dangling pointers regardless of death order.
+
+### Restart Semantics
+
+On process restart, IPC state persists with adjustments:
+1. If `pending_caller` is set (message delivered but not replied to), the caller is re-enqueued at the head of `msg_waiters` so the restarted process can `recv` it again
+2. `pending_reply` cleared, `receiver` cleared (old thread is dead)
+3. `msg_waiters` queue persists untouched — callers from other processes remain blocked
+
+This allows a server to crash mid-handling, restart, and pick up right where it left off.
+
+### Process Handle Refcounting
+
+Each Process has a `handle_refcount: u32` tracking how many perm table entries across all processes reference it (both `.process` and `.dead_process` entries). Incremented atomically on `insertPerm` for process/dead_process entries, decremented on `removePerm` and during `cleanupPhase1` perm table teardown.
+
+`dead_process` KernelObject stores `*Process` (not just crash info), keeping the struct alive for refcount management. Crash reason and restart count are read directly from the Process struct fields.
+
+`cleanupPhase2` sets `cleanup_complete = true` and only calls `allocator.destroy` if `handle_refcount == 0`. If refcount > 0, the struct persists as a zombie — address space freed, perm table cleared, but the struct itself remains allocated. When the last handle holder calls `removePerm`, the decrement sees `cleanup_complete == true` and `handle_refcount == 0`, triggering `allocator.destroy`.

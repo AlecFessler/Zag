@@ -3,14 +3,16 @@ const zag = @import("zag");
 
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
-const broadcast_mod = zag.perms.broadcast;
 const futex = zag.sched.futex;
 const paging = zag.memory.paging;
 const sched = zag.sched.scheduler;
 
+const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
+const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Process = zag.sched.process.Process;
+const ProcessHandleRights = zag.perms.permissions.ProcessHandleRights;
 const ProcessRights = zag.perms.permissions.ProcessRights;
 const SharedMemory = zag.memory.shared.SharedMemory;
 const Thread = zag.sched.thread.Thread;
@@ -50,7 +52,6 @@ pub const SyscallNum = enum(u64) {
     thread_exit,
     thread_yield,
     set_affinity,
-    grant_perm,
     revoke_perm,
     disable_restart,
     futex_wait,
@@ -61,7 +62,10 @@ pub const SyscallNum = enum(u64) {
     dma_map,
     dma_unmap,
     pin_exclusive,
-    broadcast,
+    ipc_send,
+    ipc_call,
+    ipc_recv,
+    ipc_reply,
     _,
 };
 
@@ -73,8 +77,12 @@ fn isSubset(requested: u16, allowed: u16) bool {
     return (requested & ~allowed) == 0;
 }
 
-pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) SyscallResult {
-    _ = arg4;
+pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
+    const num = ctx.regs.rax;
+    const arg0 = ctx.regs.rdi;
+    const arg1 = ctx.regs.rsi;
+    const arg2 = ctx.regs.rdx;
+    const arg3 = ctx.regs.r10;
     const syscall_num: SyscallNum = @enumFromInt(num);
     return switch (syscall_num) {
         .write => sysWrite(arg0, arg1),
@@ -90,7 +98,6 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
         .thread_exit => sysThreadExit(),
         .thread_yield => .{ .rax = sysThreadYield() },
         .set_affinity => .{ .rax = sysSetAffinity(arg0) },
-        .grant_perm => .{ .rax = sysGrantPerm(arg0, arg1, arg2) },
         .revoke_perm => .{ .rax = sysRevokePerm(arg0) },
         .disable_restart => .{ .rax = sysDisableRestart() },
         .futex_wait => .{ .rax = sysFutexWait(arg0, arg1, arg2) },
@@ -101,7 +108,10 @@ pub fn dispatch(num: u64, arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64)
         .dma_map => .{ .rax = sysDmaMap(arg0, arg1) },
         .dma_unmap => .{ .rax = sysDmaUnmap(arg0, arg1) },
         .pin_exclusive => .{ .rax = sysPinExclusive() },
-        .broadcast => .{ .rax = sysBroadcast(arg0) },
+        .ipc_send => sysIpcSend(ctx),
+        .ipc_call => sysIpcCall(ctx),
+        .ipc_recv => sysIpcRecv(ctx),
+        .ipc_reply => sysIpcReply(ctx),
         _ => .{ .rax = E_INVAL },
     };
 }
@@ -349,10 +359,19 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms: u64) i64 {
         else => E_NOMEM,
     };
 
+    // Parent's handle to child uses ProcessHandleRights (all rights granted)
+    const parent_rights: u16 = @bitCast(ProcessHandleRights{
+        .send_words = true,
+        .send_shm = true,
+        .send_process = true,
+        .send_device = true,
+        .kill = true,
+        .grant = true,
+    });
     const child_entry = PermissionEntry{
         .handle = 0,
         .object = .{ .process = child },
-        .rights = @truncate(perms),
+        .rights = parent_rights,
     };
     const handle_id = proc.insertPerm(child_entry) catch {
         child.kill(.revoked);
@@ -413,62 +432,6 @@ fn sysSetAffinity(core_mask: u64) i64 {
     return E_OK;
 }
 
-fn sysGrantPerm(src_handle: u64, target_proc_handle: u64, granted_rights: u64) i64 {
-    const proc = currentProc();
-    const granted_u16: u16 = @truncate(granted_rights);
-
-    const src_entry = proc.getPermByHandle(src_handle) orelse return E_BADCAP;
-    const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
-    const self_rights = self_entry.processRights();
-
-    var target_proc: *Process = undefined;
-
-    if (target_proc_handle >= broadcast_mod.BROADCAST_OFFSET) {
-        if (!self_rights.grant_to_broadcast) return E_PERM;
-        target_proc = broadcast_mod.resolveHandle(target_proc_handle) orelse return E_BADCAP;
-    } else {
-        if (!self_rights.grant_to_child) return E_PERM;
-        const target_entry = proc.getPermByHandle(target_proc_handle) orelse return E_BADCAP;
-        if (target_entry.object != .process) return E_BADCAP;
-        target_proc = target_entry.object.process;
-    }
-
-    switch (src_entry.object) {
-        .shared_memory => |shm| {
-            if (!src_entry.shmRights().grant) return E_PERM;
-            if (!isSubset(granted_u16, src_entry.rights)) return E_PERM;
-
-            const new_entry = PermissionEntry{
-                .handle = 0,
-                .object = .{ .shared_memory = shm },
-                .rights = granted_u16,
-            };
-            shm.incRef();
-            _ = target_proc.insertPerm(new_entry) catch {
-                shm.decRef();
-                return E_MAXCAP;
-            };
-            return E_OK;
-        },
-        .device_region => |device| {
-            if (!src_entry.deviceRights().grant) return E_PERM;
-            if (!isSubset(granted_u16, src_entry.rights)) return E_PERM;
-            const target_self = target_proc.getPermByHandle(0) orelse return E_PERM;
-            if (!target_self.processRights().device_own) return E_PERM;
-
-            const new_entry = PermissionEntry{
-                .handle = 0,
-                .object = .{ .device_region = device },
-                .rights = granted_u16,
-            };
-            _ = target_proc.insertPerm(new_entry) catch return E_MAXCAP;
-            proc.removePerm(src_handle) catch {};
-            return E_OK;
-        },
-        else => return E_INVAL,
-    }
-}
-
 fn sysRevokePerm(handle: u64) i64 {
     if (handle == 0) return E_INVAL;
 
@@ -495,13 +458,12 @@ fn sysRevokePerm(handle: u64) i64 {
             proc.removePerm(handle) catch {};
         },
         .process => |child| {
-            child.killSubtree();
+            if (entry.processHandleRights().kill) {
+                child.killSubtree();
+            }
             proc.removePerm(handle) catch {};
         },
         .dead_process => {
-            proc.removePerm(handle) catch {};
-        },
-        .broadcast_table => {
             proc.removePerm(handle) catch {};
         },
         .empty => return E_BADCAP,
@@ -622,15 +584,426 @@ fn sysPinExclusive() i64 {
     return @intCast(handle_id);
 }
 
-fn sysBroadcast(payload: u64) i64 {
-    const proc = currentProc();
-    const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
-    if (!self_entry.processRights().broadcast) return E_PERM;
-    broadcast_mod.insert(proc, payload) catch |e| return switch (e) {
-        error.TableFull => E_NOMEM,
-        error.DuplicatePayload => E_INVAL,
+// --- IPC Message Passing ---
+
+fn copyPayload(dst: *ArchCpuContext, src: *const ArchCpuContext, word_count: u3) void {
+    if (word_count >= 1) dst.regs.rdi = src.regs.rdi;
+    if (word_count >= 2) dst.regs.rsi = src.regs.rsi;
+    if (word_count >= 3) dst.regs.rdx = src.regs.rdx;
+    if (word_count >= 4) dst.regs.r8 = src.regs.r8;
+    if (word_count >= 5) dst.regs.r9 = src.regs.r9;
+}
+
+const IpcMetadata = struct {
+    word_count: u3,
+    cap_transfer: bool,
+};
+
+fn parseIpcMetadata(r14: u64) IpcMetadata {
+    return .{
+        .word_count = @truncate(r14 & 0x7),
+        .cap_transfer = (r14 & 0x8) != 0,
     };
+}
+
+fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: u64, rights_val: u64) i64 {
+    const src_entry = sender_proc.getPermByHandle(handle_val) orelse return E_BADCAP;
+
+    switch (src_entry.object) {
+        .shared_memory => |shm| {
+            if (!src_entry.shmRights().grant) return E_PERM;
+            const granted_u16: u16 = @truncate(rights_val);
+            if (!isSubset(granted_u16, src_entry.rights)) return E_PERM;
+            const new_entry = PermissionEntry{
+                .handle = 0,
+                .object = .{ .shared_memory = shm },
+                .rights = granted_u16,
+            };
+            shm.incRef();
+            _ = target_proc.insertPerm(new_entry) catch {
+                shm.decRef();
+                return E_MAXCAP;
+            };
+            return E_OK;
+        },
+        .process => |proc_ptr| {
+            if (!src_entry.processHandleRights().grant) return E_PERM;
+            const granted_u16: u16 = @truncate(rights_val);
+            if (!isSubset(granted_u16, src_entry.rights)) return E_PERM;
+            const new_entry = PermissionEntry{
+                .handle = 0,
+                .object = .{ .process = proc_ptr },
+                .rights = granted_u16,
+            };
+            _ = target_proc.insertPerm(new_entry) catch return E_MAXCAP;
+            return E_OK;
+        },
+        .device_region => |device| {
+            if (!src_entry.deviceRights().grant) return E_PERM;
+            const granted_u16: u16 = @truncate(rights_val);
+            if (!isSubset(granted_u16, src_entry.rights)) return E_PERM;
+            // Device transfer is parent->child only
+            if (target_proc.parent != sender_proc) return E_PERM;
+            const target_self = target_proc.getPermByHandle(0) orelse return E_PERM;
+            if (!target_self.processRights().device_own) return E_PERM;
+            const new_entry = PermissionEntry{
+                .handle = 0,
+                .object = .{ .device_region = device },
+                .rights = granted_u16,
+            };
+            _ = target_proc.insertPerm(new_entry) catch return E_MAXCAP;
+            sender_proc.removePerm(handle_val) catch {};
+            return E_OK;
+        },
+        else => return E_INVAL,
+    }
+}
+
+/// Get payload registers for cap transfer (last 2 of N words)
+fn getCapPayload(ctx: *const ArchCpuContext, word_count: u3) struct { handle: u64, rights: u64 } {
+    const payload_regs = [5]u64{
+        ctx.regs.rdi, ctx.regs.rsi, ctx.regs.rdx,
+        ctx.regs.r8, ctx.regs.r9,
+    };
+    if (word_count < 2) return .{ .handle = 0, .rights = 0 };
+    return .{
+        .handle = payload_regs[word_count - 2],
+        .rights = payload_regs[word_count - 1],
+    };
+}
+
+fn validateIpcSendRights(entry: PermissionEntry, meta: IpcMetadata, sender_proc: *Process, src_ctx: *const ArchCpuContext) i64 {
+    const rights = entry.processHandleRights();
+    if (!rights.send_words) return E_PERM;
+    if (meta.cap_transfer) {
+        if (meta.word_count < 2) return E_INVAL;
+        const cap = getCapPayload(src_ctx, meta.word_count);
+        const cap_entry = sender_proc.getPermByHandle(cap.handle) orelse return E_BADCAP;
+        switch (cap_entry.object) {
+            .shared_memory => if (!rights.send_shm) return E_PERM,
+            .process => if (!rights.send_process) return E_PERM,
+            .device_region => if (!rights.send_device) return E_PERM,
+            else => return E_INVAL,
+        }
+    }
     return E_OK;
+}
+
+fn wakeThread(thread: *Thread) void {
+    while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+    thread.state = .ready;
+    const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+    sched.enqueueOnCore(target_core, thread);
+}
+
+fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
+    const thread = sched.currentThread().?;
+    const proc = thread.process;
+    const target_handle = ctx.regs.r13;
+    const meta = parseIpcMetadata(ctx.regs.r14);
+
+    // Look up target process
+    const target_entry = proc.getPermByHandle(target_handle) orelse return .{ .rax = E_BADCAP };
+    if (target_entry.object != .process) return .{ .rax = E_BADCAP };
+    const target_proc = target_entry.object.process;
+
+    // Validate rights
+    const rights_check = validateIpcSendRights(target_entry, meta, proc, ctx);
+    if (rights_check != E_OK) return .{ .rax = rights_check };
+
+    target_proc.lock.lock();
+
+    if (target_proc.receiver) |receiver| {
+        // Receiver is waiting — deliver directly
+        copyPayload(receiver.ctx, ctx, meta.word_count);
+        // Set recv metadata: bit 0 = 0 (from send), bits [3:1] = word_count
+        receiver.ctx.regs.r14 = @as(u64, meta.word_count) << 1;
+        receiver.ctx.regs.rax = @bitCast(E_OK);
+
+        // Handle capability transfer
+        if (meta.cap_transfer) {
+            const cap = getCapPayload(ctx, meta.word_count);
+            const cap_result = transferCapability(proc, target_proc, cap.handle, cap.rights);
+            if (cap_result != E_OK) {
+                target_proc.lock.unlock();
+                return .{ .rax = cap_result };
+            }
+        }
+
+        target_proc.pending_reply = true;
+        target_proc.pending_caller = null; // send has no caller to reply to
+        const recv_thread = receiver;
+        target_proc.receiver = null;
+        target_proc.lock.unlock();
+
+        wakeThread(recv_thread);
+        return .{ .rax = E_OK };
+    } else {
+        // No receiver waiting
+        target_proc.lock.unlock();
+        return .{ .rax = E_AGAIN };
+    }
+}
+
+fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
+    const thread = sched.currentThread().?;
+    const proc = thread.process;
+    const target_handle = ctx.regs.r13;
+    const meta = parseIpcMetadata(ctx.regs.r14);
+
+    const target_entry = proc.getPermByHandle(target_handle) orelse return .{ .rax = E_BADCAP };
+    if (target_entry.object != .process) return .{ .rax = E_BADCAP };
+    const target_proc = target_entry.object.process;
+
+    const rights_check = validateIpcSendRights(target_entry, meta, proc, ctx);
+    if (rights_check != E_OK) return .{ .rax = rights_check };
+
+    target_proc.lock.lock();
+
+    if (target_proc.receiver) |receiver| {
+        // Receiver is waiting — deliver directly and switch
+        copyPayload(receiver.ctx, ctx, meta.word_count);
+        receiver.ctx.regs.r14 = (@as(u64, meta.word_count) << 1) | 1; // bit 0 = 1 (from call)
+        receiver.ctx.regs.rax = @bitCast(E_OK);
+
+        if (meta.cap_transfer) {
+            const cap = getCapPayload(ctx, meta.word_count);
+            const cap_result = transferCapability(proc, target_proc, cap.handle, cap.rights);
+            if (cap_result != E_OK) {
+                target_proc.lock.unlock();
+                return .{ .rax = cap_result };
+            }
+        }
+
+        target_proc.pending_reply = true;
+        target_proc.pending_caller = thread;
+        thread.ipc_server = target_proc;
+        const recv_thread = receiver;
+        target_proc.receiver = null;
+        target_proc.lock.unlock();
+
+        // Block caller and switch directly to receiver
+        thread.state = .blocked;
+        // switchToThread saves ctx and does the switch — never returns on success
+        const result = sched.switchToThread(thread, recv_thread, ctx, false);
+        // If we get here, switchToThread returned an error (E_BUSY)
+        // Undo the IPC state
+        target_proc.lock.lock();
+        target_proc.pending_reply = false;
+        target_proc.pending_caller = null;
+        thread.ipc_server = null;
+        thread.state = .running;
+        // Re-block the receiver since we can't deliver
+        target_proc.receiver = recv_thread;
+        recv_thread.state = .blocked;
+        target_proc.lock.unlock();
+        return .{ .rax = result };
+    } else {
+        // No receiver — queue on wait list
+        thread.next = null;
+        if (target_proc.msg_waiters_tail) |tail| {
+            tail.next = thread;
+        } else {
+            target_proc.msg_waiters_head = thread;
+        }
+        target_proc.msg_waiters_tail = thread;
+        thread.ipc_server = target_proc;
+        target_proc.lock.unlock();
+
+        thread.state = .blocked;
+        // switchToNextReady saves ctx and never returns
+        thread.ctx = ctx;
+        thread.on_cpu.store(false, .release);
+        sched.switchToNextReady();
+        // Never reached — when reply wakes us, we resume from ctx (int 0x80 frame)
+        // with reply data already in registers
+    }
+}
+
+fn sysIpcRecv(ctx: *ArchCpuContext) SyscallResult {
+    const thread = sched.currentThread().?;
+    const proc = thread.process;
+    const blocking = (ctx.regs.r14 & 0x2) != 0;
+
+    // Must reply before receiving again
+    if (proc.pending_reply) return .{ .rax = E_BUSY };
+
+    proc.lock.lock();
+
+    // Check if another thread is already receiving
+    if (proc.receiver != null) {
+        proc.lock.unlock();
+        return .{ .rax = E_BUSY };
+    }
+
+    if (proc.msg_waiters_head) |waiter| {
+        // Dequeue first waiter
+        proc.msg_waiters_head = waiter.next;
+        if (proc.msg_waiters_head == null) {
+            proc.msg_waiters_tail = null;
+        }
+        waiter.next = null;
+
+        // Copy payload from waiter's saved context
+        const waiter_meta = parseIpcMetadata(waiter.ctx.regs.r14);
+        copyPayload(ctx, waiter.ctx, waiter_meta.word_count);
+
+        // Set recv metadata: bit 0 = 1 (always from call since send doesn't queue)
+        ctx.regs.r14 = (@as(u64, waiter_meta.word_count) << 1) | 1;
+
+        // Handle capability transfer
+        if (waiter_meta.cap_transfer) {
+            const cap = getCapPayload(waiter.ctx, waiter_meta.word_count);
+            const cap_result = transferCapability(waiter.process, proc, cap.handle, cap.rights);
+            if (cap_result != E_OK) {
+                // Put waiter back at head (it was already dequeued)
+                waiter.next = proc.msg_waiters_head;
+                proc.msg_waiters_head = waiter;
+                if (proc.msg_waiters_tail == null) {
+                    proc.msg_waiters_tail = waiter;
+                }
+                proc.lock.unlock();
+                return .{ .rax = cap_result };
+            }
+        }
+
+        proc.pending_reply = true;
+        proc.pending_caller = waiter;
+        proc.lock.unlock();
+
+        return .{ .rax = E_OK };
+    } else if (blocking) {
+        // Block on recv
+        proc.receiver = thread;
+        proc.lock.unlock();
+
+        thread.state = .blocked;
+        thread.ctx = ctx;
+        thread.on_cpu.store(false, .release);
+        sched.switchToNextReady();
+        // Never reached — sender delivers message and wakes us via switchTo
+    } else {
+        proc.lock.unlock();
+        return .{ .rax = E_AGAIN };
+    }
+}
+
+fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
+    const thread = sched.currentThread().?;
+    const proc = thread.process;
+    const r14 = ctx.regs.r14;
+    const atomic_recv = (r14 & 0x1) != 0;
+    const recv_blocking = (r14 & 0x2) != 0;
+    const reply_word_count: u3 = @truncate((r14 >> 2) & 0x7);
+
+    proc.lock.lock();
+
+    if (!proc.pending_reply) {
+        proc.lock.unlock();
+        return .{ .rax = E_INVAL };
+    }
+
+    var caller_thread: ?*Thread = null;
+
+    if (proc.pending_caller) |pc| {
+        // Reply to a call — copy reply payload to caller's saved context
+        copyPayload(pc.ctx, ctx, reply_word_count);
+        pc.ctx.regs.rax = @bitCast(E_OK);
+        // Copy reply metadata to caller
+        pc.ctx.regs.r14 = (@as(u64, reply_word_count) << 1) | 1;
+        pc.ipc_server = null;
+        caller_thread = pc;
+    }
+
+    proc.pending_caller = null;
+    proc.pending_reply = false;
+
+    if (atomic_recv) {
+        // Reply + recv atomically
+        if (proc.msg_waiters_head) |waiter| {
+            // There's a queued message — deliver it immediately
+            proc.msg_waiters_head = waiter.next;
+            if (proc.msg_waiters_head == null) {
+                proc.msg_waiters_tail = null;
+            }
+            waiter.next = null;
+
+            const waiter_meta = parseIpcMetadata(waiter.ctx.regs.r14);
+            copyPayload(ctx, waiter.ctx, waiter_meta.word_count);
+            ctx.regs.r14 = (@as(u64, waiter_meta.word_count) << 1) | 1;
+            ctx.regs.rax = @bitCast(E_OK);
+
+            if (waiter_meta.cap_transfer) {
+                const cap = getCapPayload(waiter.ctx, waiter_meta.word_count);
+                _ = transferCapability(waiter.process, proc, cap.handle, cap.rights);
+            }
+
+            proc.pending_reply = true;
+            proc.pending_caller = waiter;
+            proc.lock.unlock();
+
+            // Wake the previous caller if any
+            if (caller_thread) |ct| {
+                wakeThread(ct);
+            }
+
+            return .{ .rax = E_OK };
+        } else if (recv_blocking) {
+            // No queued message — block on recv
+            proc.receiver = thread;
+            proc.lock.unlock();
+
+            if (caller_thread) |ct| {
+                // Switch directly to the caller we just replied to
+                thread.state = .blocked;
+                const result = sched.switchToThread(thread, ct, ctx, false);
+                if (result != 0) {
+                    // Undo
+                    proc.lock.lock();
+                    proc.receiver = null;
+                    proc.lock.unlock();
+                    thread.state = .running;
+                    wakeThread(ct);
+                    return .{ .rax = E_OK }; // Reply succeeded, only recv failed
+                }
+                unreachable;
+            } else {
+                thread.state = .blocked;
+                thread.ctx = ctx;
+                thread.on_cpu.store(false, .release);
+                sched.switchToNextReady();
+                unreachable;
+            }
+        } else {
+            // Non-blocking recv, no message
+            proc.lock.unlock();
+            if (caller_thread) |ct| {
+                wakeThread(ct);
+            }
+            ctx.regs.rax = @bitCast(E_AGAIN);
+            return .{ .rax = E_AGAIN };
+        }
+    } else {
+        // Plain reply (no atomic recv)
+        proc.lock.unlock();
+
+        if (caller_thread) |ct| {
+            // Switch to caller, put self on run queue (enqueued inside switchToThread after ctx save)
+            thread.state = .ready;
+            ctx.regs.rax = @bitCast(E_OK);
+            const result = sched.switchToThread(thread, ct, ctx, true);
+            if (result != 0) {
+                // switchToThread failed (E_BUSY), just wake caller normally
+                thread.state = .running;
+                wakeThread(ct);
+                return .{ .rax = E_OK };
+            }
+            unreachable;
+        } else {
+            // Was a send, no one to switch to
+            return .{ .rax = E_OK };
+        }
+    }
 }
 
 fn sysDmaUnmap(device_handle: u64, shm_handle: u64) i64 {

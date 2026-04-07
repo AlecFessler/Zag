@@ -46,7 +46,6 @@ fn testZombieChain() void {
     signal_ptr.* = 0;
 
     const child_rights = (perms.ProcessRights{
-        .grant_to_child = true,
         .spawn_thread = true,
         .spawn_process = true,
         .mem_reserve = true,
@@ -58,13 +57,16 @@ fn testZombieChain() void {
         return;
     }
 
+    // Send SHM handle to spawner child via IPC cap transfer
     const grant_rights = (perms.SharedMemoryRights{
         .read = true,
         .write = true,
         .execute = true,
         .grant = true,
     }).bits();
-    _ = syscall.grant_perm(@intCast(shm_handle), @intCast(proc_handle), grant_rights);
+    const words = [_]u64{ 0, @intCast(shm_handle), grant_rights };
+    var reply: syscall.IpcMessage = .{};
+    _ = syscall.ipc_call_cap(@intCast(proc_handle), &words, &reply);
 
     t.waitUntilNonZero(signal_ptr);
 

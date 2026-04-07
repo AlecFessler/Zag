@@ -18,6 +18,7 @@ const MAX_TIMED_WAITERS = 64;
 const Bucket = struct {
     lock: SpinLock = .{},
     head: ?*Thread = null,
+    tail: ?*Thread = null,
 };
 
 var buckets: [BUCKET_COUNT]Bucket = [_]Bucket{.{}} ** BUCKET_COUNT;
@@ -30,8 +31,13 @@ fn bucketIdx(paddr: PAddr) usize {
 }
 
 fn pushWaiter(bucket: *Bucket, thread: *Thread) void {
-    thread.next = bucket.head;
-    bucket.head = thread;
+    thread.next = null;
+    if (bucket.tail) |t| {
+        t.next = thread;
+    } else {
+        bucket.head = thread;
+    }
+    bucket.tail = thread;
 }
 
 fn removeWaiter(bucket: *Bucket, target: *Thread) bool {
@@ -43,6 +49,9 @@ fn removeWaiter(bucket: *Bucket, target: *Thread) bool {
                 p.next = t.next;
             } else {
                 bucket.head = t.next;
+            }
+            if (bucket.tail == target) {
+                bucket.tail = prev;
             }
             t.next = null;
             return true;
@@ -137,6 +146,9 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
                 p.next = next;
             } else {
                 bucket.head = next;
+            }
+            if (bucket.tail == thread) {
+                bucket.tail = prev;
             }
             thread.next = null;
             while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
