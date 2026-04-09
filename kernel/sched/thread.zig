@@ -63,7 +63,7 @@ pub const Thread = struct {
 
         allocator.destroy(self);
 
-        if (is_last) proc.exit();
+        if (is_last) proc.lastThreadExited();
     }
 
     pub fn create(
@@ -72,7 +72,7 @@ pub const Thread = struct {
         arg: u64,
         num_stack_pages: u32,
     ) !*Thread {
-        if (proc.num_threads + 1 >= Process.MAX_THREADS) return error.MaxThreads;
+        if (proc.num_threads >= Process.MAX_THREADS) return error.MaxThreads;
 
         const thread = try allocator.create(Thread);
         errdefer allocator.destroy(thread);

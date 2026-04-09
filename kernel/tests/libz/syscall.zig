@@ -33,6 +33,7 @@ pub const SyscallNum = enum(u64) {
     ipc_call,
     ipc_recv,
     ipc_reply,
+    shutdown,
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -99,6 +100,10 @@ pub fn write(msg: []const u8) void {
     _ = syscall2(.write, @intFromPtr(msg.ptr), msg.len);
 }
 
+pub fn write_raw(ptr: u64, len: u64) i64 {
+    return syscall2(.write, ptr, len);
+}
+
 pub fn vm_reserve(hint: u64, size: u64, rights_bits: u64) SyscallResult2 {
     return syscall3_2(.vm_reserve, hint, size, rights_bits);
 }
@@ -148,6 +153,10 @@ pub fn thread_yield() void {
     _ = syscall0(.thread_yield);
 }
 
+pub fn thread_yield_raw() i64 {
+    return syscall0(.thread_yield);
+}
+
 pub fn set_affinity(core_mask: u64) i64 {
     return syscall1(.set_affinity, core_mask);
 }
@@ -190,6 +199,11 @@ pub fn dma_unmap(device_handle: u64, shm_handle: u64) i64 {
 
 pub fn pin_exclusive() i64 {
     return syscall0(.pin_exclusive);
+}
+
+pub fn shutdown() noreturn {
+    _ = syscall0(.shutdown);
+    unreachable;
 }
 
 // --- IPC Message Passing ---
@@ -301,7 +315,11 @@ pub fn ipc_recv(blocking: bool, msg: *IpcMessage) i64 {
 }
 
 pub fn ipc_reply(words: []const u64) i64 {
-    return ipc_reply_ex(words, false, false);
+    return ipc_reply_ex(words, false, false, false);
+}
+
+pub fn ipc_reply_cap(words: []const u64) i64 {
+    return ipc_reply_ex(words, false, false, true);
 }
 
 pub fn ipc_reply_recv(words: []const u64, blocking: bool, msg: *IpcMessage) i64 {
@@ -340,13 +358,14 @@ pub fn ipc_reply_recv(words: []const u64, blocking: bool, msg: *IpcMessage) i64 
     return ret;
 }
 
-fn ipc_reply_ex(words: []const u64, atomic_recv: bool, recv_blocking: bool) i64 {
+fn ipc_reply_ex(words: []const u64, atomic_recv: bool, recv_blocking: bool, cap_transfer: bool) i64 {
     var w: [5]u64 = .{0} ** 5;
     const count: u3 = @intCast(@min(words.len, 5));
     for (0..count) |i| w[i] = words[i];
     const meta: u64 = @as(u64, count) << 2 |
         (if (atomic_recv) @as(u64, 0x1) else 0) |
-        (if (recv_blocking) @as(u64, 0x2) else 0);
+        (if (recv_blocking) @as(u64, 0x2) else 0) |
+        (if (cap_transfer) @as(u64, 0x20) else 0);
 
     return asm volatile ("int $0x80"
         : [ret] "={rax}" (-> i64),

@@ -1,0 +1,19 @@
+const lib = @import("lib");
+
+const perms = lib.perms;
+const syscall = lib.syscall;
+const t = lib.testing;
+
+const E_BADHANDLE: i64 = -3;
+
+/// §4.8.2 — `mmio_map` with invalid `device_handle` returns `E_BADHANDLE`.
+pub fn main(pv: u64) void {
+    _ = pv;
+    const rights = perms.VmReservationRights{ .read = true, .write = true, .mmio = true };
+    const vm = syscall.vm_reserve(0, 4096, rights.bits());
+    const vm_handle: u64 = @bitCast(vm.val);
+
+    const ret = syscall.mmio_map(0xFFFFFFFF, vm_handle, 0);
+    t.expectEqual("§4.8.2", E_BADHANDLE, ret);
+    syscall.shutdown();
+}

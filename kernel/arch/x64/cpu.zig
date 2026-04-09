@@ -399,3 +399,16 @@ const PAT_VALUE: u64 = 0x00070106_00070406;
 pub fn initPat() void {
     wrmsr(IA32_PAT, PAT_VALUE);
 }
+
+/// Enable CR0.AM (bit 18) so user-mode alignment check exceptions (#AC) fire
+/// when RFLAGS.AC is set and an unaligned access occurs at CPL 3.
+pub fn enableAlignmentCheck() void {
+    var cr0 = asm ("mov %%cr0, %[cr0]"
+        : [cr0] "=r" (-> u64),
+    );
+    cr0 |= (1 << 18);
+    asm volatile ("mov %[cr0], %%cr0"
+        :
+        : [cr0] "r" (cr0),
+    );
+}

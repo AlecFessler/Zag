@@ -37,4 +37,5 @@ pub fn main(perm_view_addr: u64) void {
 
     const ptr: *u64 = @ptrFromInt(vm_result.val2);
     ptr.* = 0xDEAD_BEEF;
+    _ = syscall.futex_wake(@ptrCast(ptr), 1);
 }

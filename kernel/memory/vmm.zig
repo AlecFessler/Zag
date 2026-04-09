@@ -388,6 +388,19 @@ pub const VirtualMemoryManager = struct {
         try splitAtLocked(&self.tree, range_start);
         try splitAtLocked(&self.tree, VAddr.fromInt(range_end_addr));
 
+        // Reject if range contains non-private nodes (SHM/MMIO).
+        const CheckCtx = struct {
+            has_non_private: bool = false,
+            fn cb(ctx: *@This(), node: *VmNode) void {
+                if (node.kind != .private) ctx.has_non_private = true;
+            }
+        };
+        var check_ctx = CheckCtx{};
+        var cs = mkSentinel(range_start);
+        var ce = mkSentinel(VAddr.fromInt(range_end_addr));
+        self.tree.forEachInRange(&cs, &ce, &check_ctx, CheckCtx.cb);
+        if (check_ctx.has_non_private) return error.NonPrivateRange;
+
         const new_rights_page = PageRights{
             .read = new_rights.read,
             .write = new_rights.write,
@@ -672,44 +685,50 @@ pub const VirtualMemoryManager = struct {
         }
     }
 
-    pub fn revokeShmHandle(self: *VirtualMemoryManager, shm: *SharedMemory) void {
+    pub const ReservationInfo = struct {
+        start: u64,
+        end: u64,
+        rights: PageRights,
+    };
+
+    pub fn revokeShmHandle(self: *VirtualMemoryManager, shm: *SharedMemory, reservations: []const ReservationInfo) void {
         self.lock.lock();
         defer self.lock.unlock();
 
         var s = mkSentinel(self.range_start);
         var e = mkSentinel(self.range_end);
 
-        const Ctx = struct { target: *SharedMemory, root: PAddr };
-        var ctx = Ctx{ .target = shm, .root = self.addr_space_root };
+        const Ctx = struct { target: *SharedMemory, root: PAddr, res: []const ReservationInfo };
+        var ctx = Ctx{ .target = shm, .root = self.addr_space_root, .res = reservations };
         self.tree.forEachInRange(&s, &e, &ctx, struct {
             fn cb(c: *Ctx, node: *VmNode) void {
                 if (node.kind != .shared_memory) return;
                 if (node.kind.shared_memory != c.target) return;
                 unmapNodePages(node, c.root, false);
                 node.kind = .private;
-                node.rights = .{};
+                node.rights = findContainingRights(c.res, node.start.addr);
                 node.handle = HANDLE_NONE;
                 node.restart_policy = .free;
             }
         }.cb);
     }
 
-    pub fn revokeMmioHandle(self: *VirtualMemoryManager, device: *DeviceRegion) void {
+    pub fn revokeMmioHandle(self: *VirtualMemoryManager, device: *DeviceRegion, reservations: []const ReservationInfo) void {
         self.lock.lock();
         defer self.lock.unlock();
 
         var s = mkSentinel(self.range_start);
         var e = mkSentinel(self.range_end);
 
-        const Ctx = struct { target: *DeviceRegion, root: PAddr };
-        var ctx = Ctx{ .target = device, .root = self.addr_space_root };
+        const Ctx = struct { target: *DeviceRegion, root: PAddr, res: []const ReservationInfo };
+        var ctx = Ctx{ .target = device, .root = self.addr_space_root, .res = reservations };
         self.tree.forEachInRange(&s, &e, &ctx, struct {
             fn cb(c: *Ctx, node: *VmNode) void {
                 if (node.kind != .mmio) return;
                 if (node.kind.mmio != c.target) return;
                 unmapNodePages(node, c.root, false);
                 node.kind = .private;
-                node.rights = .{};
+                node.rights = findContainingRights(c.res, node.start.addr);
                 node.handle = HANDLE_NONE;
                 node.restart_policy = .free;
             }
@@ -757,6 +776,13 @@ pub const VirtualMemoryManager = struct {
         }
     }
 };
+
+fn findContainingRights(reservations: []const VirtualMemoryManager.ReservationInfo, addr: u64) PageRights {
+    for (reservations) |res| {
+        if (addr >= res.start and addr < res.end) return res.rights;
+    }
+    return .{ .read = true, .write = true, .execute = true };
+}
 
 fn findNodeLocked(tree: *VmTree, vaddr: VAddr) ?*VmNode {
     var sentinel = mkSentinel(vaddr);

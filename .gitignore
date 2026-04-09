@@ -13,3 +13,4 @@ __pycache__/
 qemu.log
 *.img
 *.pdf
+exploits/

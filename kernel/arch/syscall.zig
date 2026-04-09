@@ -12,11 +12,15 @@ const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Process = zag.sched.process.Process;
+const memory_init = zag.memory.init;
+const process_mod = zag.sched.process;
 const ProcessHandleRights = zag.perms.permissions.ProcessHandleRights;
 const ProcessRights = zag.perms.permissions.ProcessRights;
 const SharedMemory = zag.memory.shared.SharedMemory;
+const SharedMemoryRights = zag.perms.permissions.SharedMemoryRights;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
+const VirtualMemoryManager = zag.memory.vmm.VirtualMemoryManager;
 const VmReservationRights = zag.perms.permissions.VmReservationRights;
 
 const E_OK: i64 = 0;
@@ -32,6 +36,8 @@ const E_AGAIN: i64 = -9;
 const E_NOENT: i64 = -10;
 const E_BUSY: i64 = -11;
 const E_EXIST: i64 = -12;
+const E_NODEV: i64 = -13;
+const E_NORES: i64 = -14;
 
 pub const SyscallResult = struct {
     rax: i64,
@@ -66,6 +72,7 @@ pub const SyscallNum = enum(u64) {
     ipc_call,
     ipc_recv,
     ipc_reply,
+    shutdown,
     _,
 };
 
@@ -112,6 +119,7 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
         .ipc_call => sysIpcCall(ctx),
         .ipc_recv => sysIpcRecv(ctx),
         .ipc_reply => sysIpcReply(ctx),
+        .shutdown => sysShutdown(),
         _ => .{ .rax = E_INVAL },
     };
 }
@@ -132,6 +140,7 @@ fn sysVmReserve(hint: u64, size: u64, max_perms_bits: u64) SyscallResult {
 
     const max_rights: VmReservationRights = @bitCast(@as(u8, @truncate(max_perms_bits)));
     if (max_rights.shareable and max_rights.mmio) return .{ .rax = E_INVAL };
+    if (max_rights.write_combining and !max_rights.mmio) return .{ .rax = E_INVAL };
 
     const proc = currentProc();
     const self_entry = proc.getPermByHandle(0) orelse return .{ .rax = E_PERM };
@@ -193,6 +202,7 @@ fn sysShmCreate(size: u64, rights_bits: u64) i64 {
     if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) {
         return E_INVAL;
     }
+    if (rights_bits == 0) return E_INVAL;
 
     const proc = currentProc();
     const self_entry = proc.getPermByHandle(0) orelse {
@@ -206,7 +216,7 @@ fn sysShmCreate(size: u64, rights_bits: u64) i64 {
         return E_NOMEM;
     };
 
-    const rights: u16 = if (rights_bits == 0) 0b1111 else @truncate(rights_bits);
+    const rights: u16 = @truncate(rights_bits);
     const entry = PermissionEntry{
         .handle = 0,
         .object = .{ .shared_memory = shm },
@@ -225,8 +235,12 @@ fn sysShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
 
     const proc = currentProc();
 
-    const shm_entry = proc.getPermByHandle(shm_handle) orelse return E_BADCAP;
-    if (shm_entry.object != .shared_memory) return E_BADCAP;
+    // Atomically look up the SHM handle and bump its refcount while
+    // still holding perm_lock.  This prevents a concurrent revoke_perm
+    // from freeing the SharedMemory between lookup and use.
+    const acquired = proc.acquireShmByHandle(shm_handle) orelse return E_BADCAP;
+    const shm = acquired.shm;
+    defer shm.decRef();
 
     const vm_entry = proc.getPermByHandle(vm_handle) orelse return E_BADCAP;
     if (vm_entry.object != .vm_reservation) return E_BADCAP;
@@ -234,18 +248,18 @@ fn sysShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
     const vm_res = vm_entry.object.vm_reservation;
     if (!vm_res.max_rights.shareable) return E_PERM;
 
-    const shm = shm_entry.object.shared_memory;
-    const shm_rwx = shm_entry.rights & 0b111;
+    const shm_rwx = acquired.rights & 0b111;
     const max_rwx: u16 =
         @as(u16, @intFromBool(vm_res.max_rights.read)) |
         (@as(u16, @intFromBool(vm_res.max_rights.write)) << 1) |
         (@as(u16, @intFromBool(vm_res.max_rights.execute)) << 2);
     if (!isSubset(shm_rwx, max_rwx)) return E_PERM;
 
+    const shm_r: SharedMemoryRights = @bitCast(@as(u8, @truncate(acquired.rights)));
     const shm_map_rights = VmReservationRights{
-        .read = shm_entry.shmRights().read,
-        .write = shm_entry.shmRights().write,
-        .execute = shm_entry.shmRights().execute,
+        .read = shm_r.read,
+        .write = shm_r.write,
+        .execute = shm_r.execute,
     };
 
     const range_end = std.math.add(u64, offset, shm.size()) catch return E_INVAL;
@@ -338,24 +352,49 @@ fn sysMmioUnmap(device_handle: u64, vm_handle: u64) i64 {
     return E_OK;
 }
 
-fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms: u64) i64 {
+fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64) i64 {
     if (elf_len == 0) return E_INVAL;
     if (!address.AddrSpacePartition.user.contains(elf_ptr)) return E_BADADDR;
     const elf_end = std.math.add(u64, elf_ptr, elf_len) catch return E_BADADDR;
     if (!address.AddrSpacePartition.user.contains(elf_end -| 1)) return E_BADADDR;
 
     const proc = currentProc();
-    const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
-    if (!self_entry.processRights().spawn_process) return E_PERM;
 
-    const child_perms: ProcessRights = @bitCast(@as(u16, @truncate(perms)));
+    // Verify the entire ELF buffer is backed by mapped VMM nodes with read rights.
+    var check_addr = elf_ptr;
+    while (check_addr < elf_end) {
+        const node = proc.vmm.findNode(VAddr.fromInt(check_addr)) orelse return E_BADADDR;
+        if (!node.rights.read) return E_BADADDR;
+        check_addr = node.end();
+    }
+
+    const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
+    const parent_self_rights = self_entry.processRights();
+    if (!parent_self_rights.spawn_process) return E_PERM;
+
+    const child_perms: ProcessRights = @bitCast(@as(u16, @truncate(perms_arg)));
     if (child_perms.restart and proc.restart_context == null) return E_PERM;
 
-    const elf_bytes: [*]const u8 = @ptrFromInt(elf_ptr);
-    const elf_binary = elf_bytes[0..elf_len];
+    // Child permissions must be a subset of the parent's own process rights.
+    // This prevents privilege escalation where a limited parent grants its
+    // child rights the parent does not itself possess.
+    const child_bits: u8 = @truncate(@as(u16, @bitCast(child_perms)));
+    const parent_bits: u8 = @truncate(@as(u16, @bitCast(parent_self_rights)));
+    if (child_bits & ~parent_bits != 0) return E_PERM;
 
-    const child = Process.create(elf_binary, child_perms, proc) catch |e| return switch (e) {
+    // Copy ELF buffer into kernel memory to prevent TOCTOU races.
+    // Without this, a concurrent userspace thread could modify the ELF
+    // between validation and use (e.g. changing p_vaddr after bounds
+    // checking but before page mapping).
+    const kernel_alloc = memory_init.heap_allocator;
+    const elf_copy = kernel_alloc.alloc(u8, elf_len) catch return E_NOMEM;
+    defer kernel_alloc.free(elf_copy);
+    const user_bytes: [*]const u8 = @ptrFromInt(elf_ptr);
+    @memcpy(elf_copy, user_bytes[0..elf_len]);
+
+    const child = Process.create(elf_copy, child_perms, proc) catch |e| return switch (e) {
         error.InvalidElf => E_INVAL,
+        error.OutOfKernelStacks, error.TooManyChildren => E_NORES,
         else => E_NOMEM,
     };
 
@@ -394,11 +433,16 @@ fn sysThreadCreate(entry_addr: u64, arg: u64, num_stack_pages_u64: u64) i64 {
 
     const thread = Thread.create(proc, VAddr.fromInt(entry_addr), arg, num_stack_pages) catch |e| return switch (e) {
         error.MaxThreads => E_MAXTHREAD,
+        error.OutOfKernelStacks => E_NORES,
         else => E_NOMEM,
     };
     sched.enqueueOnCore(arch.coreID(), thread);
 
     return E_OK;
+}
+
+fn sysShutdown() noreturn {
+    arch.shutdown();
 }
 
 fn sysThreadExit() noreturn {
@@ -444,12 +488,14 @@ fn sysRevokePerm(handle: u64) i64 {
             proc.removePerm(handle) catch {};
         },
         .shared_memory => |shm| {
-            proc.vmm.revokeShmHandle(shm);
+            const res = collectReservations(proc);
+            proc.vmm.revokeShmHandle(shm, res.items());
             shm.decRef();
             proc.removePerm(handle) catch {};
         },
         .device_region => |device| {
-            proc.vmm.revokeMmioHandle(device);
+            const res = collectReservations(proc);
+            proc.vmm.revokeMmioHandle(device, res.items());
             Process.returnDeviceHandleUpTree(proc, entry.rights, device);
             proc.removePerm(handle) catch {};
         },
@@ -470,6 +516,40 @@ fn sysRevokePerm(handle: u64) i64 {
     }
 
     return E_OK;
+}
+
+const ReservationInfo = VirtualMemoryManager.ReservationInfo;
+const PageRights = zag.memory.vmm.PageRights;
+
+const ReservationCollection = struct {
+    buf: [128]ReservationInfo = undefined,
+    count: usize = 0,
+
+    fn items(self: *const ReservationCollection) []const ReservationInfo {
+        return self.buf[0..self.count];
+    }
+};
+
+fn collectReservations(proc: *Process) ReservationCollection {
+    var result = ReservationCollection{};
+    proc.perm_lock.lock();
+    defer proc.perm_lock.unlock();
+    for (proc.perm_table) |pe| {
+        if (pe.object == .vm_reservation) {
+            const vm_res = pe.object.vm_reservation;
+            result.buf[result.count] = .{
+                .start = vm_res.original_start.addr,
+                .end = vm_res.original_start.addr + vm_res.original_size,
+                .rights = .{
+                    .read = vm_res.max_rights.read,
+                    .write = vm_res.max_rights.write,
+                    .execute = vm_res.max_rights.execute,
+                },
+            };
+            result.count += 1;
+        }
+    }
+    return result;
 }
 
 fn sysDisableRestart() i64 {
@@ -553,7 +633,7 @@ fn sysDmaMap(device_handle: u64, shm_handle: u64) i64 {
     if (arch.isDmaRemapAvailable()) {
         const dma_base = arch.mapDmaPages(device, shm) catch return E_NOMEM;
         arch.enableDmaRemapping();
-        proc.addDmaMapping(device, shm, dma_base, shm.pages.len) catch return E_NOMEM;
+        proc.addDmaMapping(device, shm, dma_base, shm.pages.len) catch return E_NORES;
         return @bitCast(dma_base);
     } else return E_NOMEM;
 }
@@ -627,6 +707,22 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
             return E_OK;
         },
         .process => |proc_ptr| {
+            if (handle_val == 0) {
+                // Sending HANDLE_SELF: gives recipient a process handle to the sender.
+                // No grant check needed — a process can always share a handle to itself.
+                const granted_u16: u16 = @truncate(rights_val);
+                const new_entry = PermissionEntry{
+                    .handle = 0,
+                    .object = .{ .process = proc_ptr },
+                    .rights = granted_u16,
+                };
+                _ = @atomicRmw(u32, &proc_ptr.handle_refcount, .Add, 1, .acq_rel);
+                _ = target_proc.insertPerm(new_entry) catch {
+                    _ = @atomicRmw(u32, &proc_ptr.handle_refcount, .Sub, 1, .acq_rel);
+                    return E_MAXCAP;
+                };
+                return E_OK;
+            }
             if (!src_entry.processHandleRights().grant) return E_PERM;
             const granted_u16: u16 = @truncate(rights_val);
             if (!isSubset(granted_u16, src_entry.rights)) return E_PERM;
@@ -635,7 +731,11 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                 .object = .{ .process = proc_ptr },
                 .rights = granted_u16,
             };
-            _ = target_proc.insertPerm(new_entry) catch return E_MAXCAP;
+            _ = @atomicRmw(u32, &proc_ptr.handle_refcount, .Add, 1, .acq_rel);
+            _ = target_proc.insertPerm(new_entry) catch {
+                _ = @atomicRmw(u32, &proc_ptr.handle_refcount, .Sub, 1, .acq_rel);
+                return E_MAXCAP;
+            };
             return E_OK;
         },
         .device_region => |device| {
@@ -707,6 +807,12 @@ fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
     if (target_entry.object != .process) return .{ .rax = E_BADCAP };
     const target_proc = target_entry.object.process;
 
+    // §2.6.30: lazily convert dead process entries on IPC attempt.
+    if (!target_proc.alive) {
+        proc.convertToDeadProcess(target_proc);
+        return .{ .rax = E_BADCAP };
+    }
+
     // Validate rights
     const rights_check = validateIpcSendRights(target_entry, meta, proc, ctx);
     if (rights_check != E_OK) return .{ .rax = rights_check };
@@ -754,6 +860,12 @@ fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
     const target_entry = proc.getPermByHandle(target_handle) orelse return .{ .rax = E_BADCAP };
     if (target_entry.object != .process) return .{ .rax = E_BADCAP };
     const target_proc = target_entry.object.process;
+
+    // §2.6.30: lazily convert dead process entries on IPC attempt.
+    if (!target_proc.alive) {
+        proc.convertToDeadProcess(target_proc);
+        return .{ .rax = E_BADCAP };
+    }
 
     const rights_check = validateIpcSendRights(target_entry, meta, proc, ctx);
     if (rights_check != E_OK) return .{ .rax = rights_check };
@@ -895,6 +1007,7 @@ fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
     const atomic_recv = (r14 & 0x1) != 0;
     const recv_blocking = (r14 & 0x2) != 0;
     const reply_word_count: u3 = @truncate((r14 >> 2) & 0x7);
+    const reply_cap_transfer = (r14 & 0x20) != 0;
 
     proc.lock.lock();
 
@@ -911,6 +1024,13 @@ fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
         pc.ctx.regs.rax = @bitCast(E_OK);
         // Copy reply metadata to caller
         pc.ctx.regs.r14 = (@as(u64, reply_word_count) << 1) | 1;
+
+        // Handle capability transfer on reply
+        if (reply_cap_transfer) {
+            const cap = getCapPayload(ctx, reply_word_count);
+            _ = transferCapability(proc, pc.process, cap.handle, cap.rights);
+        }
+
         pc.ipc_server = null;
         caller_thread = pc;
     }

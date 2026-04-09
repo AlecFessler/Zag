@@ -11,6 +11,7 @@ const VAddr = zag.memory.address.VAddr;
 
 pub const E_AGAIN: i64 = -9;
 pub const E_TIMEOUT: i64 = -8;
+pub const E_NORES: i64 = -14;
 
 const BUCKET_COUNT = 256;
 const MAX_TIMED_WAITERS = 64;
@@ -62,15 +63,16 @@ fn removeWaiter(bucket: *Bucket, target: *Thread) bool {
     return false;
 }
 
-fn addTimedWaiter(thread: *Thread) void {
+fn addTimedWaiter(thread: *Thread) bool {
     const irq = timed_lock.lockIrqSave();
     defer timed_lock.unlockIrqRestore(irq);
     for (&timed_waiters) |*slot| {
         if (slot.* == null) {
             slot.* = thread;
-            return;
+            return true;
         }
     }
+    return false;
 }
 
 fn removeTimedWaiter(thread: *Thread) void {
@@ -82,6 +84,20 @@ fn removeTimedWaiter(thread: *Thread) void {
             return;
         }
     }
+}
+
+/// Remove a killed thread from its futex wait bucket.
+/// Called by Process.kill() for threads blocked on futex_wait.
+pub fn removeBlockedThread(thread: *Thread) void {
+    const bucket = &buckets[bucketIdx(thread.futex_paddr)];
+    const irq = bucket.lock.lockIrqSave();
+    _ = removeWaiter(bucket, thread);
+    if (thread.futex_deadline_ns != 0) {
+        thread.futex_deadline_ns = 0;
+        removeTimedWaiter(thread);
+    }
+    bucket.lock.unlockIrqRestore(irq);
+    thread.futex_paddr = PAddr.fromInt(0);
 }
 
 pub fn wait(paddr: PAddr, expected: u64, timeout_ns: u64, thread: *Thread) i64 {
@@ -117,7 +133,16 @@ pub fn wait(paddr: PAddr, expected: u64, timeout_ns: u64, thread: *Thread) i64 {
     bucket.lock.unlockIrqRestore(irq);
 
     if (thread.futex_deadline_ns != 0) {
-        addTimedWaiter(thread);
+        if (!addTimedWaiter(thread)) {
+            // All timed waiter slots are full. Undo the block.
+            const irq2 = bucket.lock.lockIrqSave();
+            _ = removeWaiter(bucket, thread);
+            bucket.lock.unlockIrqRestore(irq2);
+            thread.state = .running;
+            thread.futex_paddr = PAddr.fromInt(0);
+            thread.futex_deadline_ns = 0;
+            return E_NORES;
+        }
     }
 
     arch.enableInterrupts();

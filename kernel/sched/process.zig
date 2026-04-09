@@ -116,6 +116,39 @@ pub const Process = struct {
         return null;
     }
 
+    /// Look up two handles atomically under a single perm_lock acquisition.
+    /// Returns both entries or null if either handle is missing.
+    pub fn getPermByHandlePair(self: *Process, h1: u64, h2: u64) ?struct { first: PermissionEntry, second: PermissionEntry } {
+        self.perm_lock.lock();
+        defer self.perm_lock.unlock();
+        var e1: ?PermissionEntry = null;
+        var e2: ?PermissionEntry = null;
+        for (self.perm_table) |entry| {
+            if (entry.object == .empty) continue;
+            if (entry.handle == h1) e1 = entry;
+            if (entry.handle == h2) e2 = entry;
+        }
+        if (e1 != null and e2 != null) return .{ .first = e1.?, .second = e2.? };
+        return null;
+    }
+
+    /// Look up a shared_memory handle and atomically increment its refcount
+    /// while still holding perm_lock.  This prevents a concurrent revoke_perm
+    /// from freeing the SharedMemory between lookup and use.
+    pub fn acquireShmByHandle(self: *Process, handle_id: u64) ?struct { shm: *SharedMemory, rights: u16 } {
+        self.perm_lock.lock();
+        defer self.perm_lock.unlock();
+        for (self.perm_table) |entry| {
+            if (entry.object != .empty and entry.handle == handle_id) {
+                if (entry.object != .shared_memory) return null;
+                const shm = entry.object.shared_memory;
+                shm.incRef();
+                return .{ .shm = shm, .rights = entry.rights };
+            }
+        }
+        return null;
+    }
+
     pub fn insertPerm(self: *Process, entry_in: PermissionEntry) !u64 {
         self.perm_lock.lock();
         defer self.perm_lock.unlock();
@@ -204,15 +237,68 @@ pub const Process = struct {
             return;
         }
         self.crash_reason = reason;
-        if (self.restart_context == null) {
+        const should_restart = self.restart_context != null;
+        if (!should_restart) {
             self.alive = false;
         }
+
+        // Collect blocked threads before marking all as exited.
+        var blocked: [MAX_THREADS]*Thread = undefined;
+        var num_blocked: u32 = 0;
         for (self.threads[0..self.num_threads]) |thread| {
+            if (thread.state == .blocked) {
+                blocked[num_blocked] = thread;
+                num_blocked += 1;
+            }
             thread.state = .exited;
         }
         self.lock.unlock();
-        if (self.num_threads == 0) {
-            self.exit();
+
+        // Remove blocked threads from external wait structures and deinit them.
+        // Each deinit calls removeThread which decrements num_threads.
+        // The last thread's deinit triggers lastThreadExited.
+        for (blocked[0..num_blocked]) |thread| {
+            if (thread.futex_paddr.addr != 0) {
+                futex.removeBlockedThread(thread);
+            }
+            if (thread.ipc_server) |server| {
+                server.lock.lock();
+                if (server.pending_caller == thread) {
+                    server.pending_caller = null;
+                    server.pending_reply = false;
+                } else {
+                    var prev: ?*Thread = null;
+                    var cur = server.msg_waiters_head;
+                    while (cur) |t| {
+                        if (t == thread) {
+                            if (prev) |p| {
+                                p.next = t.next;
+                            } else {
+                                server.msg_waiters_head = t.next;
+                            }
+                            if (server.msg_waiters_tail == t) {
+                                server.msg_waiters_tail = prev;
+                            }
+                            t.next = null;
+                            break;
+                        }
+                        prev = t;
+                        cur = t.next;
+                    }
+                }
+                thread.ipc_server = null;
+                server.lock.unlock();
+            }
+            thread.deinit();
+        }
+
+        // Edge case: process had 0 threads (shouldn't happen normally).
+        if (self.num_threads == 0 and num_blocked == 0) {
+            if (should_restart) {
+                self.performRestart();
+            } else {
+                self.doExit();
+            }
         }
     }
 
@@ -238,6 +324,15 @@ pub const Process = struct {
         }
     }
 
+    pub fn lastThreadExited(self: *Process) void {
+        if (!self.alive) {
+            // Process was killed — cleanup was deferred until last thread deinit.
+            self.doExit();
+            return;
+        }
+        self.exit();
+    }
+
     pub fn exit(self: *Process) void {
         self.lock.lock();
         if (!self.alive) {
@@ -258,12 +353,16 @@ pub const Process = struct {
             return;
         }
 
-        // Root process (pid 1) exiting means the system should shut down.
-        if (self.pid == 1) {
-            arch.shutdown();
-        }
+        self.doExit();
+    }
 
+    fn doExit(self: *Process) void {
         self.cleanupPhase1();
+
+        // Convert parent's entry to dead_process even if we have children (zombie).
+        if (self.parent) |p| {
+            p.convertToDeadProcess(self);
+        }
 
         if (self.num_children == 0) {
             self.cleanupPhase2();
@@ -317,6 +416,23 @@ pub const Process = struct {
                 rc.data_segment.vaddr.addr,
                 rc.data_segment.ghost,
             );
+
+            // Zero partial-page BSS: the bytes between the end of initialized data
+            // and the next page boundary are BSS that lives on the same page as the
+            // data segment tail. The .decommit node only covers full BSS pages;
+            // this partial page is in the .preserve node and must be zeroed explicitly.
+            const data_end = rc.data_segment.vaddr.addr + rc.data_segment.ghost.len;
+            const next_page = std.mem.alignForward(u64, data_end, paging.PAGE4K);
+            const tail_len = next_page - data_end;
+            if (tail_len > 0 and tail_len < paging.PAGE4K) {
+                const page_base = std.mem.alignBackward(u64, data_end, paging.PAGE4K);
+                const page_offset = data_end - page_base;
+                if (arch.resolveVaddr(self.addr_space_root, VAddr.fromInt(page_base))) |paddr| {
+                    const physmap_addr = VAddr.fromPAddr(paddr, null).addr + page_offset;
+                    const dst: [*]u8 = @ptrFromInt(physmap_addr);
+                    @memset(dst[0..tail_len], 0);
+                }
+            }
         }
 
         const thread = thread_mod.Thread.create(self, rc.entry_point, self.perm_view_vaddr.addr, DEFAULT_STACK_PAGES) catch return;
@@ -464,7 +580,7 @@ pub const Process = struct {
         }
     }
 
-    fn convertToDeadProcess(parent: *Process, child: *Process) void {
+    pub fn convertToDeadProcess(parent: *Process, child: *Process) void {
         parent.perm_lock.lock();
         defer parent.perm_lock.unlock();
         for (parent.perm_table[1..], 1..) |*slot, idx| {
@@ -525,12 +641,15 @@ pub const Process = struct {
         var ancestor = source.parent;
         while (ancestor) |anc| {
             if (anc.alive) {
-                _ = anc.insertPerm(.{
+                if (anc.insertPerm(.{
                     .handle = 0,
                     .object = .{ .device_region = device },
                     .rights = rights,
-                }) catch {};
-                return;
+                })) |_| {
+                    return;
+                } else |_| {
+                    // Table full — continue walk to next ancestor (§2.1.11).
+                }
             }
             ancestor = anc.parent;
         }
@@ -679,6 +798,9 @@ const ElfLoadResult = struct {
     data_content: []const u8,
 };
 
+// Maximum total mapped size for a single process ELF (64 MB).
+const MAX_ELF_MAPPED_SIZE: u64 = 64 * 1024 * 1024;
+
 fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResult {
     if (elf_binary.len < @sizeOf(elf.Elf64_Ehdr)) return error.InvalidElf;
 
@@ -689,6 +811,11 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
     const phdr_offset = ehdr.e_phoff;
     const phdr_size = @as(u64, ehdr.e_phentsize);
     const phdr_count = @as(u64, ehdr.e_phnum);
+
+    // Reject undersized program header entries — the kernel reads
+    // @sizeOf(Elf64_Phdr) bytes at each offset, so the entry size
+    // must be at least that large to prevent out-of-bounds reads.
+    if (phdr_size < @sizeOf(elf.Elf64_Phdr)) return error.InvalidElf;
 
     const phdr_total = std.math.mul(u64, phdr_size, phdr_count) catch return error.InvalidElf;
     const phdr_end = std.math.add(u64, phdr_offset, phdr_total) catch return error.InvalidElf;
@@ -707,15 +834,37 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
     var data_offset: u64 = 0;
     var data_filesz: u64 = 0;
 
+    // Track PT_LOAD segments to detect overlaps.
+    const MAX_LOAD_SEGMENTS = 8;
+    var seg_ranges: [MAX_LOAD_SEGMENTS][2]u64 = undefined;
+    var num_load_segments: usize = 0;
+
     var i: u64 = 0;
     while (i < phdr_count) : (i += 1) {
         const off = phdr_offset + i * phdr_size;
         const phdr = std.mem.bytesAsValue(elf.Elf64_Phdr, elf_binary[off..][0..@sizeOf(elf.Elf64_Phdr)]);
         if (phdr.p_type != elf.PT_LOAD) continue;
 
-        const seg_start = aslr_base + phdr.p_vaddr;
-        const seg_file_end = seg_start + phdr.p_filesz;
-        const seg_mem_end = seg_start + phdr.p_memsz;
+        // Use checked arithmetic for all segment address computations
+        // to prevent overflow into kernel address space.
+        const seg_start = std.math.add(u64, aslr_base, phdr.p_vaddr) catch return error.InvalidElf;
+        const seg_file_end = std.math.add(u64, seg_start, phdr.p_filesz) catch return error.InvalidElf;
+        const seg_mem_end = std.math.add(u64, seg_start, phdr.p_memsz) catch return error.InvalidElf;
+
+        // All segment addresses must remain in user address space.
+        if (!address.AddrSpacePartition.user.contains(seg_start)) return error.InvalidElf;
+        if (seg_file_end > 0 and !address.AddrSpacePartition.user.contains(seg_file_end -| 1)) return error.InvalidElf;
+        if (seg_mem_end > 0 and !address.AddrSpacePartition.user.contains(seg_mem_end -| 1)) return error.InvalidElf;
+
+        // Reject overlapping PT_LOAD segments.
+        if (num_load_segments >= MAX_LOAD_SEGMENTS) return error.InvalidElf;
+        const page_aligned_start = std.mem.alignBackward(u64, seg_start, paging.PAGE4K);
+        const page_aligned_end = std.mem.alignForward(u64, seg_mem_end, paging.PAGE4K);
+        for (seg_ranges[0..num_load_segments]) |range| {
+            if (page_aligned_start < range[1] and page_aligned_end > range[0]) return error.InvalidElf;
+        }
+        seg_ranges[num_load_segments] = .{ page_aligned_start, page_aligned_end };
+        num_load_segments += 1;
 
         const writable = (phdr.p_flags & elf.PF_W) != 0;
         const executable = (phdr.p_flags & elf.PF_X) != 0;
@@ -742,6 +891,10 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
 
     const page_start = std.mem.alignBackward(u64, lowest_va, paging.PAGE4K);
     const page_end = std.mem.alignForward(u64, highest_va, paging.PAGE4K);
+
+    // Enforce a maximum on total mapped size to prevent memory exhaustion.
+    const total_mapped = (page_end - page_start) + (if (has_bss and bss_end > bss_start) bss_end - bss_start else 0);
+    if (total_mapped > MAX_ELF_MAPPED_SIZE) return error.InvalidElf;
 
     if (page_end > page_start) {
         try proc.vmm.insertKernelNode(
@@ -802,8 +955,12 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
     else
         &[_]u8{};
 
+    // Validate entry point lands in user address space.
+    const entry_addr = std.math.add(u64, aslr_base, ehdr.e_entry) catch return error.InvalidElf;
+    if (!address.AddrSpacePartition.user.contains(entry_addr)) return error.InvalidElf;
+
     return .{
-        .entry = VAddr.fromInt(aslr_base + ehdr.e_entry),
+        .entry = VAddr.fromInt(entry_addr),
         .data_vaddr = data_vaddr,
         .data_content = data_content,
     };
@@ -835,7 +992,14 @@ fn findRelaSection(elf_binary: []const u8, ehdr: *align(1) const elf.Elf64_Ehdr)
     const shdr_count = @as(u64, ehdr.e_shnum);
 
     if (shdr_offset == 0 or shdr_count == 0) return null;
-    if (shdr_offset + shdr_size * shdr_count > elf_binary.len) return null;
+
+    // Reject undersized section header entries.
+    if (shdr_size < @sizeOf(elf.Elf64_Shdr)) return null;
+
+    // Use checked arithmetic to prevent overflow in bounds computation.
+    const shdr_total = std.math.mul(u64, shdr_size, shdr_count) catch return null;
+    const shdr_end = std.math.add(u64, shdr_offset, shdr_total) catch return null;
+    if (shdr_end > elf_binary.len) return null;
 
     var s: u64 = 0;
     while (s < shdr_count) : (s += 1) {
@@ -852,16 +1016,23 @@ fn applyRelocations(proc: *Process, aslr_base: u64, elf_binary: []const u8, rela
     const entry_size = @sizeOf(elf.Elf64_Rela);
     const num_entries = rela_size / entry_size;
 
+    // Validate the entire rela table fits within the ELF binary.
+    const rela_total = std.math.mul(u64, num_entries, entry_size) catch return error.InvalidElf;
+    const rela_end = std.math.add(u64, rela_offset, rela_total) catch return error.InvalidElf;
+    if (rela_end > elf_binary.len) return error.InvalidElf;
+
     var r: u64 = 0;
     while (r < num_entries) : (r += 1) {
         const off = rela_offset + r * entry_size;
-        if (off + entry_size > elf_binary.len) return error.InvalidElf;
         const rela = std.mem.bytesAsValue(elf.Elf64_Rela, elf_binary[off..][0..entry_size]);
 
         const rela_type = @as(u32, @truncate(rela.r_info));
         if (rela_type != @intFromEnum(elf.R_X86_64.RELATIVE)) continue;
 
-        const target_vaddr = aslr_base + rela.r_offset;
+        // Validate relocation target stays in user address space.
+        const target_vaddr = std.math.add(u64, aslr_base, rela.r_offset) catch return error.InvalidElf;
+        if (!address.AddrSpacePartition.user.contains(target_vaddr)) return error.InvalidElf;
+
         const value: u64 = @bitCast(@as(i64, rela.r_addend) +% @as(i64, @bitCast(aslr_base)));
 
         const page_base = std.mem.alignBackward(u64, target_vaddr, paging.PAGE4K);

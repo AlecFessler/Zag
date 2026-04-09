@@ -17,4 +17,5 @@ pub fn init() void {
     exceptions.init();
     irq.init();
     cpu.initPat();
+    cpu.enableAlignmentCheck();
 }
