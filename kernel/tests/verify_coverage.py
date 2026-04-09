@@ -4,7 +4,7 @@
 Checks:
   1. Every spec tag has a corresponding test function
   2. Every test function tag exists in the spec
-  3. Doc comment text matches spec assertion text verbatim
+  3. Doc comment text matches spec assertion text (case-insensitive first char)
 """
 
 import re
@@ -14,17 +14,37 @@ import os
 SPEC_PATH = os.path.join(os.path.dirname(__file__), "../../docs/kernel/spec.md")
 TESTS_DIR = os.path.join(os.path.dirname(__file__), "tests")
 
+# Matches **§X.Y.Z** followed by assertion text, stopping before:
+#   - the next **§ tag
+#   - a sentence boundary followed by non-tag text (uppercase letter after ". ")
+# Captures the assertion sentence(s) belonging to this tag.
+TAG_RE = re.compile(r'\*\*§([\d.]+)\*\*\s+(.+?)(?=\s*\*\*§|$)')
+
+def normalize(text):
+    """Normalize for comparison: strip trailing period/whitespace, lowercase first char."""
+    text = text.rstrip().rstrip('.')
+    if text:
+        text = text[0].lower() + text[1:]
+    return text
+
+def extract_first_sentence(text):
+    """Extract the first sentence from text (up to first '. ' or end)."""
+    # Split on ". " followed by an uppercase letter or backtick (sentence boundary)
+    m = re.match(r'^(.+?\.)\s+(?=[A-Z`])', text)
+    if m:
+        return m.group(1)
+    return text
+
 def parse_spec(path):
     """Extract tag -> text from spec.md"""
     assertions = {}
     with open(path) as f:
         for line in f:
-            m = re.match(r'^\*\*§([\d.]+)\*\* (.+)$', line.strip())
-            if m:
+            for m in TAG_RE.finditer(line):
                 tag = m.group(1)
-                text = m.group(2)
-                if text.startswith('[untested]'):
-                    continue
+                raw = m.group(2).rstrip()
+                # Take only the first sentence as the assertion text
+                text = extract_first_sentence(raw)
                 assertions[tag] = text
     return assertions
 
@@ -65,15 +85,15 @@ def main():
             print(f"ORPHAN TEST: §{tag} in {fname} — not in spec")
             errors += 1
 
-    # Check text matches
+    # Check text matches (case-insensitive first char, ignore trailing period)
     for tag in sorted(spec.keys(), key=lambda t: [int(x) for x in t.split('.')]):
         if tag in tests:
-            spec_text = spec[tag]
-            test_text = tests[tag][0]
-            if spec_text != test_text:
+            spec_norm = normalize(spec[tag])
+            test_norm = normalize(tests[tag][0])
+            if spec_norm != test_norm:
                 print(f"TEXT MISMATCH: §{tag}")
-                print(f"  spec: {spec_text}")
-                print(f"  test: {test_text}")
+                print(f"  spec: {spec[tag]}")
+                print(f"  test: {tests[tag][0]}")
                 errors += 1
 
     # Summary

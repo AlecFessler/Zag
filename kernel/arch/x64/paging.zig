@@ -1,7 +1,9 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const apic = zag.arch.x64.apic;
 const cpu = zag.arch.x64.cpu;
+const interrupts = zag.arch.x64.interrupts;
 const paging = zag.memory.paging;
 const physmap = zag.memory.address.AddrSpacePartition.physmap;
 const pmm = zag.memory.pmm;
@@ -9,7 +11,44 @@ const pmm = zag.memory.pmm;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
+const SpinLock = zag.sched.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
+
+// TLB shootdown: per-core pending invalidation addresses.
+// Each core checks its slot before returning to userspace.
+var shootdown_lock: SpinLock = .{};
+var shootdown_addr: u64 = 0;
+
+/// IPI handler for TLB shootdown: invalidate the requested address.
+/// endOfInterrupt is called by dispatchInterrupt for .external vectors.
+pub fn tlbShootdownHandler(_: *cpu.Context) void {
+    cpu.invlpg(@atomicLoad(u64, &shootdown_addr, .acquire));
+}
+
+/// Flush a user virtual address from all cores' TLBs.
+/// The IPI is fire-and-forget: remote cores may have interrupts disabled
+/// (e.g. mid-syscall), but the IPI will be delivered before any userspace
+/// instruction executes (the pending interrupt fires on iret).  This is
+/// safe because the physical page is only freed after this function
+/// returns, and the remote core cannot touch the old mapping from
+/// userspace until after the IPI handler runs.
+fn flushRemoteTlb(virt_addr: u64) void {
+    const core_count = apic.coreCount();
+    if (core_count <= 1) return;
+
+    const self_id = apic.coreID();
+
+    shootdown_lock.lock();
+    defer shootdown_lock.unlock();
+
+    @atomicStore(u64, &shootdown_addr, virt_addr, .release);
+
+    const vec = @intFromEnum(interrupts.IntVecs.tlb_shootdown);
+    for (apic.lapics.?, 0..) |la, i| {
+        if (i == self_id) continue;
+        apic.sendIpi(@intCast(la.apic_id), vec);
+    }
+}
 
 pub const PageEntry = packed struct(u64) {
     present: bool = false,
@@ -276,6 +315,15 @@ pub fn unmapPage(
     const phys = l1_entry.getPAddr();
     l1_entry.* = DEFAULT_PAGE_ENTRY;
     cpu.invlpg(virt.addr);
+
+    // User-space pages may be cached in other cores' TLBs.  Flush them
+    // so that a freed physical page cannot be read through a stale TLB
+    // entry on a remote core.
+    const user_end = zag.memory.address.AddrSpacePartition.user.end;
+    if (virt.addr < user_end) {
+        flushRemoteTlb(virt.addr);
+    }
+
     return phys;
 }
 

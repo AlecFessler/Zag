@@ -6,6 +6,7 @@ const exceptions = zag.arch.x64.exceptions;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
+const paging_mod = zag.arch.x64.paging;
 const sched = zag.sched.scheduler;
 const syscall = zag.arch.syscall;
 
@@ -40,6 +41,20 @@ pub fn init() void {
     interrupts.registerVector(
         spurious_int_vec,
         spuriousHandler,
+        .external,
+    );
+
+    const tlb_vec = @intFromEnum(interrupts.IntVecs.tlb_shootdown);
+    idt.openInterruptGate(
+        tlb_vec,
+        interrupts.STUBS[tlb_vec],
+        gdt.KERNEL_CODE_OFFSET,
+        PrivilegeLevel.ring_0,
+        GateType.interrupt_gate,
+    );
+    interrupts.registerVector(
+        tlb_vec,
+        paging_mod.tlbShootdownHandler,
         .external,
     );
 

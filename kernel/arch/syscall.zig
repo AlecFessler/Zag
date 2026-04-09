@@ -17,7 +17,6 @@ const process_mod = zag.sched.process;
 const ProcessHandleRights = zag.perms.permissions.ProcessHandleRights;
 const ProcessRights = zag.perms.permissions.ProcessRights;
 const SharedMemory = zag.memory.shared.SharedMemory;
-const SharedMemoryRights = zag.perms.permissions.SharedMemoryRights;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 const VirtualMemoryManager = zag.memory.vmm.VirtualMemoryManager;
@@ -235,12 +234,8 @@ fn sysShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
 
     const proc = currentProc();
 
-    // Atomically look up the SHM handle and bump its refcount while
-    // still holding perm_lock.  This prevents a concurrent revoke_perm
-    // from freeing the SharedMemory between lookup and use.
-    const acquired = proc.acquireShmByHandle(shm_handle) orelse return E_BADCAP;
-    const shm = acquired.shm;
-    defer shm.decRef();
+    const shm_entry = proc.getPermByHandle(shm_handle) orelse return E_BADCAP;
+    if (shm_entry.object != .shared_memory) return E_BADCAP;
 
     const vm_entry = proc.getPermByHandle(vm_handle) orelse return E_BADCAP;
     if (vm_entry.object != .vm_reservation) return E_BADCAP;
@@ -248,18 +243,18 @@ fn sysShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
     const vm_res = vm_entry.object.vm_reservation;
     if (!vm_res.max_rights.shareable) return E_PERM;
 
-    const shm_rwx = acquired.rights & 0b111;
+    const shm = shm_entry.object.shared_memory;
+    const shm_rwx = shm_entry.rights & 0b111;
     const max_rwx: u16 =
         @as(u16, @intFromBool(vm_res.max_rights.read)) |
         (@as(u16, @intFromBool(vm_res.max_rights.write)) << 1) |
         (@as(u16, @intFromBool(vm_res.max_rights.execute)) << 2);
     if (!isSubset(shm_rwx, max_rwx)) return E_PERM;
 
-    const shm_r: SharedMemoryRights = @bitCast(@as(u8, @truncate(acquired.rights)));
     const shm_map_rights = VmReservationRights{
-        .read = shm_r.read,
-        .write = shm_r.write,
-        .execute = shm_r.execute,
+        .read = shm_entry.shmRights().read,
+        .write = shm_entry.shmRights().write,
+        .execute = shm_entry.shmRights().execute,
     };
 
     const range_end = std.math.add(u64, offset, shm.size()) catch return E_INVAL;

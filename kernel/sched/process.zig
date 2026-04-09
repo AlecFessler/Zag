@@ -110,6 +110,11 @@ pub const Process = struct {
     pub fn getPermByHandle(self: *Process, handle_id: u64) ?PermissionEntry {
         self.perm_lock.lock();
         defer self.perm_lock.unlock();
+        return self.getPermByHandleLocked(handle_id);
+    }
+
+    /// Look up a handle while the caller already holds perm_lock.
+    pub fn getPermByHandleLocked(self: *const Process, handle_id: u64) ?PermissionEntry {
         for (self.perm_table) |entry| {
             if (entry.object != .empty and entry.handle == handle_id) return entry;
         }
