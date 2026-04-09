@@ -34,6 +34,15 @@ pub const SyscallNum = enum(u64) {
     ipc_recv,
     ipc_reply,
     shutdown,
+    thread_self,
+    thread_suspend,
+    thread_resume,
+    thread_kill,
+    fault_recv,
+    fault_reply,
+    fault_read_mem,
+    fault_write_mem,
+    fault_set_thread_mode,
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -137,7 +146,11 @@ pub fn mmio_unmap(device_handle: u64, vm_handle: u64) i64 {
 }
 
 pub fn proc_create(elf_ptr: u64, elf_len: u64, rights_bits: u64) i64 {
-    return syscall3(.proc_create, elf_ptr, elf_len, rights_bits);
+    return syscall4(.proc_create, elf_ptr, elf_len, rights_bits, 0x0F); // full ThreadHandleRights
+}
+
+pub fn proc_create_with_thread_rights(elf_ptr: u64, elf_len: u64, rights_bits: u64, thread_rights: u64) i64 {
+    return syscall4(.proc_create, elf_ptr, elf_len, rights_bits, thread_rights);
 }
 
 pub fn thread_create(entry: *const fn () void, arg: u64, num_stack_pages: u64) i64 {
@@ -158,7 +171,13 @@ pub fn thread_yield_raw() i64 {
 }
 
 pub fn set_affinity(core_mask: u64) i64 {
-    return syscall1(.set_affinity, core_mask);
+    const th = thread_self();
+    if (th < 0) return th;
+    return set_affinity_thread(@intCast(th), core_mask);
+}
+
+pub fn set_affinity_thread(thread_handle: u64, core_mask: u64) i64 {
+    return syscall2(.set_affinity, thread_handle, core_mask);
 }
 
 pub fn revoke_perm(handle: u64) i64 {
@@ -198,7 +217,13 @@ pub fn dma_unmap(device_handle: u64, shm_handle: u64) i64 {
 }
 
 pub fn pin_exclusive() i64 {
-    return syscall0(.pin_exclusive);
+    const th = thread_self();
+    if (th < 0) return th;
+    return pin_exclusive_thread(@intCast(th));
+}
+
+pub fn pin_exclusive_thread(thread_handle: u64) i64 {
+    return syscall1(.pin_exclusive, thread_handle);
 }
 
 pub fn shutdown() noreturn {
@@ -357,6 +382,67 @@ pub fn ipc_reply_recv(words: []const u64, blocking: bool, msg: *IpcMessage) i64 
     msg.from_call = (r_r14 & 1) != 0;
     return ret;
 }
+
+// --- New Thread/Fault Syscalls ---
+
+pub fn thread_self() i64 {
+    return syscall0(.thread_self);
+}
+
+pub fn thread_suspend(thread_handle: u64) i64 {
+    return syscall1(.thread_suspend, thread_handle);
+}
+
+pub fn thread_resume(thread_handle: u64) i64 {
+    return syscall1(.thread_resume, thread_handle);
+}
+
+pub fn thread_kill(thread_handle: u64) i64 {
+    return syscall1(.thread_kill, thread_handle);
+}
+
+pub fn fault_recv(buf_ptr: u64, blocking: u64) i64 {
+    return syscall2(.fault_recv, buf_ptr, blocking);
+}
+
+pub fn fault_reply_action(token: u64, action: u64, modified_regs_ptr: u64) i64 {
+    return syscall3(.fault_reply, token, action, modified_regs_ptr);
+}
+
+pub fn fault_reply_simple(token: u64, action: u64) i64 {
+    return syscall3(.fault_reply, token, action, 0);
+}
+
+pub fn fault_read_mem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64 {
+    return syscall4(.fault_read_mem, proc_handle, vaddr, buf_ptr, len);
+}
+
+pub fn fault_write_mem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64 {
+    return syscall4(.fault_write_mem, proc_handle, vaddr, buf_ptr, len);
+}
+
+pub fn fault_set_thread_mode(thread_handle: u64, mode: u64) i64 {
+    return syscall2(.fault_set_thread_mode, thread_handle, mode);
+}
+
+pub const FAULT_KILL: u64 = 0;
+pub const FAULT_RESUME: u64 = 1;
+pub const FAULT_RESUME_MODIFIED: u64 = 2;
+
+pub const FAULT_MODE_STOP_ALL: u64 = 0;
+pub const FAULT_MODE_EXCLUDE_NEXT: u64 = 1;
+pub const FAULT_MODE_EXCLUDE_PERMANENT: u64 = 2;
+
+pub const FaultMessage = extern struct {
+    process_handle: u64,
+    thread_handle: u64,
+    fault_reason: u8,
+    _pad: [7]u8,
+    fault_addr: u64,
+    // SavedRegs area: kernel writes rip first.
+    rip: u64,
+    _regs_rest: [136]u8,
+};
 
 fn ipc_reply_ex(words: []const u64, atomic_recv: bool, recv_blocking: bool, cap_transfer: bool) i64 {
     var w: [5]u64 = .{0} ** 5;

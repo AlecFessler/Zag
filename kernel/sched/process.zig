@@ -12,13 +12,16 @@ const restart_context_mod = zag.sched.restart_context;
 const sched = zag.sched.scheduler;
 const thread_mod = zag.sched.thread;
 
-const CrashReason = zag.perms.permissions.CrashReason;
+const FaultReason = zag.perms.permissions.FaultReason;
+const CrashReason = FaultReason;
 const DeadProcessInfo = zag.perms.permissions.DeadProcessInfo;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
+const KernelObject = zag.perms.permissions.KernelObject;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const ProcessRights = zag.perms.permissions.ProcessRights;
+const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
 const RestartContext = zag.sched.restart_context.RestartContext;
 const SharedMemory = zag.memory.shared.SharedMemory;
 const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
@@ -68,11 +71,37 @@ pub const Process = struct {
     receiver: ?*Thread = null,
     pending_caller: ?*Thread = null,
     pending_reply: bool = false,
-    crash_reason: CrashReason,
+    fault_reason: FaultReason,
     restart_count: u16,
     perm_view_gen: u64 = 0,
     handle_refcount: u32 = 0,
     cleanup_complete: bool = false,
+    fault_handler_proc: ?*Process = null,
+    faulted_thread_slots: u64 = 0,
+    suspended_thread_slots: u64 = 0,
+    thread_handle_rights: ThreadHandleRights = ThreadHandleRights.full,
+    // FaultBox state (inline; supports a single pending fault for now)
+    fault_pending: bool = false,
+    fault_pending_tid: u64 = 0,
+    fault_pending_source: ?*Process = null,
+    fault_pending_thread: ?*Thread = null,
+    fault_pending_reason: u8 = 0,
+    fault_pending_addr: u64 = 0,
+    // Single-entry queue (we'll only support one queued fault for simplicity)
+    fault_queue_thread: ?*Thread = null,
+    fault_queue_reason: u8 = 0,
+    fault_queue_addr: u64 = 0,
+    fault_recv_waiter: ?*Thread = null,
+    fault_pending_delivered: bool = false,
+    fault_pending_proc_handle: u64 = 0,
+    // RIP at the time of the fault (for FaultMessage.regs.rip).
+    fault_pending_rip: u64 = 0,
+    // Back-pointer list of processes whose fault_handler_proc == self.
+    // Walked on handler death to revert targets to self-handling (§2.12.35).
+    // Protected by self.lock.
+    fault_handler_targets_head: ?*Process = null,
+    // Intrusive next-pointer for fault_handler_targets list of OUR handler.
+    fault_handler_targets_next: ?*Process = null,
 
     pub const MAX_THREADS = 64;
     pub const MAX_CHILDREN = 64;
@@ -90,7 +119,7 @@ pub const Process = struct {
         self.syncUserView();
     }
 
-    fn syncUserView(self: *Process) void {
+    pub fn syncUserView(self: *Process) void {
         if (self.perm_view_phys.addr == 0) return;
         const view_ptr: *[MAX_PERMS]UserViewEntry = @ptrFromInt(
             VAddr.fromPAddr(self.perm_view_phys, null).addr,
@@ -107,6 +136,260 @@ pub const Process = struct {
         _ = futex.wake(gen_paddr, 0xFFFF_FFFF);
     }
 
+    /// Insert a thread handle into this process's perm table.
+    /// Returns the handle ID on success.
+    pub fn insertThreadHandle(self: *Process, thread: *Thread, rights: ThreadHandleRights) !u64 {
+        return self.insertPerm(.{
+            .handle = 0,
+            .object = .{ .thread = thread },
+            .rights = @as(u16, @as(u8, @bitCast(rights))),
+        });
+    }
+
+    /// Insert a thread handle at a specific slot (used for initial thread at slot 1).
+    pub fn insertThreadHandleAtSlot(self: *Process, slot: usize, thread: *Thread, rights: ThreadHandleRights) void {
+        self.perm_lock.lock();
+        defer self.perm_lock.unlock();
+        const handle_id = self.handle_counter;
+        self.handle_counter += 1;
+        self.perm_table[slot] = .{
+            .handle = handle_id,
+            .object = .{ .thread = thread },
+            .rights = @as(u16, @as(u8, @bitCast(rights))),
+        };
+        self.perm_count += 1;
+        self.syncUserView();
+    }
+
+    /// Remove all thread handles for a specific thread from this process's perm table.
+    pub fn removeThreadHandle(self: *Process, thread: *Thread) void {
+        self.perm_lock.lock();
+        defer self.perm_lock.unlock();
+        for (&self.perm_table) |*slot| {
+            if (slot.object == .thread and slot.object.thread == thread) {
+                slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
+                self.perm_count -= 1;
+                break;
+            }
+        }
+        self.syncUserView();
+    }
+
+    /// Find the handle ID for a thread in this process's perm table.
+    pub fn findThreadHandle(self: *Process, thread: *Thread) ?u64 {
+        self.perm_lock.lock();
+        defer self.perm_lock.unlock();
+        for (self.perm_table) |slot| {
+            if (slot.object == .thread and slot.object.thread == thread) {
+                return slot.handle;
+            }
+        }
+        return null;
+    }
+
+    /// Release the fault-handler relationship between `self` (the handler)
+    /// and `target` without killing the target. Called when:
+    /// - the handler revokes its process handle to target with the fault_handler bit
+    /// - the handler dies (cleanupPhase1 walks fault_handler_targets)
+    /// - target dies (cleanup unlinks itself from handler's list)
+    pub fn releaseFaultHandler(self: *Process, target: *Process) void {
+        // Clear all thread-handle slots in self.perm_table that belong to target.
+        self.perm_lock.lock();
+        for (&self.perm_table) |*slot| {
+            if (slot.object == .thread and slot.object.thread.process == target) {
+                slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
+                self.perm_count -= 1;
+            }
+        }
+        self.syncUserView();
+        self.perm_lock.unlock();
+
+        // Clear target's pointer back to handler and restore fault_handler bit on slot 0.
+        target.perm_lock.lock();
+        target.fault_handler_proc = null;
+        var self_rights = target.perm_table[0].processRights();
+        self_rights.fault_handler = true;
+        target.perm_table[0].rights = @bitCast(self_rights);
+        target.syncUserView();
+        target.perm_lock.unlock();
+
+        // Drain pending fault from self if it points at target.
+        self.lock.lock();
+        if (self.fault_pending and self.fault_pending_source == target) {
+            self.fault_pending = false;
+            self.fault_pending_tid = 0;
+            self.fault_pending_source = null;
+            self.fault_pending_thread = null;
+            self.fault_pending_reason = 0;
+            self.fault_pending_addr = 0;
+            self.fault_pending_proc_handle = 0;
+            self.fault_pending_delivered = false;
+        }
+        self.lock.unlock();
+
+        // Unlink target from self.fault_handler_targets list.
+        self.unlinkFaultHandlerTarget(target);
+    }
+
+    /// Link a target process into this handler's fault_handler_targets list.
+    pub fn linkFaultHandlerTarget(self: *Process, target: *Process) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        // Avoid double-link
+        var cur = self.fault_handler_targets_head;
+        while (cur) |c| {
+            if (c == target) return;
+            cur = c.fault_handler_targets_next;
+        }
+        target.fault_handler_targets_next = self.fault_handler_targets_head;
+        self.fault_handler_targets_head = target;
+    }
+
+    /// Unlink a target from this handler's fault_handler_targets list.
+    pub fn unlinkFaultHandlerTarget(self: *Process, target: *Process) void {
+        self.lock.lock();
+        defer self.lock.unlock();
+        var prev: ?*Process = null;
+        var cur = self.fault_handler_targets_head;
+        while (cur) |c| {
+            if (c == target) {
+                if (prev) |p| {
+                    p.fault_handler_targets_next = c.fault_handler_targets_next;
+                } else {
+                    self.fault_handler_targets_head = c.fault_handler_targets_next;
+                }
+                target.fault_handler_targets_next = null;
+                return;
+            }
+            prev = c;
+            cur = c.fault_handler_targets_next;
+        }
+    }
+
+    /// Resolve the process that should handle this process's faults.
+    /// Returns null if no handler exists (caller must kill). Per
+    /// `systems.md:876`, a process with `fault_handler_proc == null`
+    /// self-handles iff it holds the `fault_handler` ProcessRight bit on
+    /// slot 0; otherwise it has no handler at all.
+    fn faultHandlerOf(self: *Process) ?*Process {
+        if (self.fault_handler_proc) |h| return h;
+        if (self.perm_table[0].processRights().fault_handler) return self;
+        return null;
+    }
+
+    /// Block the calling thread on a fault: deliver to handler if any,
+    /// suspend sibling threads (stop-all) for external handlers, mark this
+    /// thread .faulted, then yield. Returns true if the fault was queued
+    /// (caller should yield/halt forever); false if no handler or the
+    /// process must die immediately (§2.12.7 / §2.12.9).
+    pub fn faultBlock(self: *Process, thread: *Thread, reason: FaultReason, fault_addr: u64, rip: u64) bool {
+        const handler = self.faultHandlerOf() orelse return false;
+
+        if (handler == self) {
+            // Self-handling: §2.12.7 / §2.12.8 / §2.12.9. No stop-all — sibling
+            // threads continue running so they can call fault_recv on our own
+            // fault box.
+            self.lock.lock();
+            const faulted_now = @popCount(self.faulted_thread_slots);
+            const alive = self.num_threads - faulted_now;
+            if (alive <= 1) {
+                // §2.12.7 (only thread is the faulter) or §2.12.9 (this is
+                // the last alive thread; all others already faulted). With
+                // no surviving thread to call fault_recv, the spec mandates
+                // immediate kill/restart with no message delivered.
+                self.lock.unlock();
+                return false;
+            }
+            thread.state = .faulted;
+            self.faulted_thread_slots |= @as(u64, 1) << @intCast(thread.slot_index);
+            self.lock.unlock();
+
+            if (!self.deliverFault(thread, @intFromEnum(reason), fault_addr)) {
+                return false;
+            }
+            self.lock.lock();
+            self.fault_pending_rip = rip;
+            self.lock.unlock();
+            self.syncUserView();
+            return true;
+        }
+
+        // External handler path (§2.12.10): stop-all + enqueue.
+        if (!self.deliverFault(thread, @intFromEnum(reason), fault_addr)) {
+            return false;
+        }
+
+        // Store rip into the handler's pending fault for FaultMessage.regs.rip.
+        handler.lock.lock();
+        handler.fault_pending_rip = rip;
+        handler.lock.unlock();
+
+        // §2.12.23 stop-all: every sibling thread that is currently runnable
+        // (.ready or .running) is moved to .suspended; the scheduler will skip
+        // them on its next dequeue cycle.
+        self.lock.lock();
+        for (self.threads[0..self.num_threads]) |sib| {
+            if (sib == thread) continue;
+            if (sib.state == .running or sib.state == .ready) {
+                sib.state = .suspended;
+                self.suspended_thread_slots |= @as(u64, 1) << @intCast(sib.slot_index);
+            }
+        }
+        thread.state = .faulted;
+        self.faulted_thread_slots |= @as(u64, 1) << @intCast(thread.slot_index);
+        self.lock.unlock();
+        // Sync both views: the source's own perm_view and the handler's perm_view.
+        // The handler holds thread handles to the source's threads, so its
+        // user-visible thread states must reflect the new .suspended/.faulted.
+        self.syncUserView();
+        handler.perm_lock.lock();
+        handler.syncUserView();
+        handler.perm_lock.unlock();
+
+        return true;
+    }
+
+    /// Deliver a fault: route to fault_handler_proc if set, else self if the
+    /// process self-handles, else return false (kill). Enqueues a fault
+    /// message into the handler's fault box. The caller should still kill or
+    /// properly handle the thread afterward.
+    pub fn deliverFault(self: *Process, thread: *Thread, reason_val: u8, fault_addr: u64) bool {
+        const handler = self.faultHandlerOf() orelse return false;
+
+        // Find thread's perm entry in handler's perm table for handle IDs
+        handler.perm_lock.lock();
+        var thread_handle_id: u64 = 0;
+        var process_handle_id: u64 = 0;
+        for (&handler.perm_table) |*slot| {
+            if (slot.object == .thread and slot.object.thread == thread) {
+                thread_handle_id = slot.handle;
+            }
+            if (slot.object == .process and slot.object.process == self) {
+                process_handle_id = slot.handle;
+            }
+        }
+        handler.perm_lock.unlock();
+
+        // Enqueue fault into handler's fault box (store handle IDs only — no pointers,
+        // since the source process may be killed before fault_reply is called)
+        handler.lock.lock();
+        if (!handler.fault_pending) {
+            handler.fault_pending = true;
+            handler.fault_pending_tid = thread_handle_id;
+            // Store source so releaseFaultHandler / handler death can find it.
+            // The target's cleanupPhase1 unlinks itself, so this pointer
+            // remains valid for the lifetime of the relationship.
+            handler.fault_pending_source = self;
+            handler.fault_pending_thread = null;
+            handler.fault_pending_reason = reason_val;
+            handler.fault_pending_addr = fault_addr;
+            handler.fault_pending_proc_handle = process_handle_id;
+        }
+        handler.lock.unlock();
+
+        return true;
+    }
+
     pub fn getPermByHandle(self: *Process, handle_id: u64) ?PermissionEntry {
         self.perm_lock.lock();
         defer self.perm_lock.unlock();
@@ -117,39 +400,6 @@ pub const Process = struct {
     pub fn getPermByHandleLocked(self: *const Process, handle_id: u64) ?PermissionEntry {
         for (self.perm_table) |entry| {
             if (entry.object != .empty and entry.handle == handle_id) return entry;
-        }
-        return null;
-    }
-
-    /// Look up two handles atomically under a single perm_lock acquisition.
-    /// Returns both entries or null if either handle is missing.
-    pub fn getPermByHandlePair(self: *Process, h1: u64, h2: u64) ?struct { first: PermissionEntry, second: PermissionEntry } {
-        self.perm_lock.lock();
-        defer self.perm_lock.unlock();
-        var e1: ?PermissionEntry = null;
-        var e2: ?PermissionEntry = null;
-        for (self.perm_table) |entry| {
-            if (entry.object == .empty) continue;
-            if (entry.handle == h1) e1 = entry;
-            if (entry.handle == h2) e2 = entry;
-        }
-        if (e1 != null and e2 != null) return .{ .first = e1.?, .second = e2.? };
-        return null;
-    }
-
-    /// Look up a shared_memory handle and atomically increment its refcount
-    /// while still holding perm_lock.  This prevents a concurrent revoke_perm
-    /// from freeing the SharedMemory between lookup and use.
-    pub fn acquireShmByHandle(self: *Process, handle_id: u64) ?struct { shm: *SharedMemory, rights: u16 } {
-        self.perm_lock.lock();
-        defer self.perm_lock.unlock();
-        for (self.perm_table) |entry| {
-            if (entry.object != .empty and entry.handle == handle_id) {
-                if (entry.object != .shared_memory) return null;
-                const shm = entry.object.shared_memory;
-                shm.incRef();
-                return .{ .shm = shm, .rights = entry.rights };
-            }
         }
         return null;
     }
@@ -228,6 +478,7 @@ pub const Process = struct {
                 self.num_threads -= 1;
                 if (i < self.num_threads) {
                     self.threads[i] = self.threads[self.num_threads];
+                    self.threads[i].slot_index = @intCast(i);
                 }
                 return self.num_threads == 0;
             }
@@ -241,28 +492,41 @@ pub const Process = struct {
             self.lock.unlock();
             return;
         }
-        self.crash_reason = reason;
+        self.fault_reason = reason;
         const should_restart = self.restart_context != null;
         if (!should_restart) {
             self.alive = false;
         }
 
-        // Collect blocked threads before marking all as exited.
+        // Collect blocked/faulted/suspended threads before marking all exited.
+        // These are off-CPU and need explicit deinit (they won't be picked up
+        // by the scheduler-zombie path because they're not currently running).
         var blocked: [MAX_THREADS]*Thread = undefined;
         var num_blocked: u32 = 0;
         for (self.threads[0..self.num_threads]) |thread| {
-            if (thread.state == .blocked) {
+            if (thread.state == .blocked or thread.state == .faulted or thread.state == .suspended) {
                 blocked[num_blocked] = thread;
                 num_blocked += 1;
             }
             thread.state = .exited;
         }
+        self.faulted_thread_slots = 0;
+        self.suspended_thread_slots = 0;
         self.lock.unlock();
 
         // Remove blocked threads from external wait structures and deinit them.
         // Each deinit calls removeThread which decrements num_threads.
         // The last thread's deinit triggers lastThreadExited.
         for (blocked[0..num_blocked]) |thread| {
+            // Wait until the thread is fully off-CPU before freeing its
+            // kernel stack. .suspended and .faulted threads may still be in
+            // the middle of a syscall on their kernel stack.
+            while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+            // A thread that was .ready when stop-all marked it .suspended is
+            // still linked into a per-core run queue. Remove it before
+            // deinit, otherwise the dangling pointer in the queue is a UAF
+            // waiting to happen on the next dequeue.
+            sched.removeFromAnyRunQueue(thread);
             if (thread.futex_paddr.addr != 0) {
                 futex.removeBlockedThread(thread);
             }
@@ -344,8 +608,8 @@ pub const Process = struct {
             self.lock.unlock();
             return;
         }
-        if (self.crash_reason == .none) {
-            self.crash_reason = .normal_exit;
+        if (self.fault_reason == .none) {
+            self.fault_reason = .normal_exit;
         }
         const should_restart = self.restart_context != null;
         if (!should_restart) {
@@ -403,13 +667,31 @@ pub const Process = struct {
 
         self.vmm.resetForRestart();
 
+        // Clean up thread handles from own perm table and handler's perm table
+        if (self.fault_handler_proc) |handler| {
+            handler.perm_lock.lock();
+            for (&handler.perm_table) |*slot| {
+                if (slot.object == .thread) {
+                    const t = slot.object.thread;
+                    if (t.process == self) {
+                        slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
+                        handler.perm_count -= 1;
+                    }
+                }
+            }
+            handler.syncUserView();
+            handler.perm_lock.unlock();
+        }
+
         self.perm_lock.lock();
         for (&self.perm_table) |*entry| {
-            if (entry.object == .vm_reservation) {
+            if (entry.object == .vm_reservation or entry.object == .thread) {
                 entry.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
             }
         }
+        self.faulted_thread_slots = 0;
+        self.suspended_thread_slots = 0;
         self.syncUserView();
         self.perm_lock.unlock();
 
@@ -441,6 +723,15 @@ pub const Process = struct {
         }
 
         const thread = thread_mod.Thread.create(self, rc.entry_point, self.perm_view_vaddr.addr, DEFAULT_STACK_PAGES) catch return;
+
+        // Insert initial thread handle at slot 1
+        self.insertThreadHandleAtSlot(1, thread, self.thread_handle_rights);
+
+        // If external fault handler, insert thread handle into handler's perm table
+        if (self.fault_handler_proc) |handler| {
+            _ = handler.insertThreadHandle(thread, ThreadHandleRights.full) catch {};
+        }
+
         sched.enqueueOnCore(arch.coreID(), thread);
     }
 
@@ -456,7 +747,7 @@ pub const Process = struct {
             if (matches) {
                 parent.syncUserView();
                 if (parent.perm_view_phys.addr != 0) {
-                    const field0_pa = PAddr.fromInt(parent.perm_view_phys.addr + idx * @sizeOf(UserViewEntry) + 16);
+                    const field0_pa = PAddr.fromInt(parent.perm_view_phys.addr + idx * @sizeOf(UserViewEntry) + @offsetOf(UserViewEntry, "field0"));
                     _ = futex.wake(field0_pa, 1);
                 }
                 return;
@@ -533,6 +824,38 @@ pub const Process = struct {
     }
 
     fn cleanupPhase1(self: *Process) void {
+        // §2.12.35: if we are a fault handler for other processes, revert
+        // each target to self-handling before tearing down our perm table.
+        while (true) {
+            self.lock.lock();
+            const target = self.fault_handler_targets_head;
+            self.lock.unlock();
+            const t = target orelse break;
+            // releaseFaultHandler unlinks t from our list, so loop terminates.
+            self.releaseFaultHandler(t);
+        }
+
+        // If we have an external fault handler, unlink ourselves from its list
+        // and clear any fault_pending entry that references us. We do NOT call
+        // releaseFaultHandler on the handler because that would touch our
+        // own perm table while we're in the middle of cleanup; we just unhook.
+        if (self.fault_handler_proc) |handler| {
+            handler.unlinkFaultHandlerTarget(self);
+            handler.lock.lock();
+            if (handler.fault_pending and handler.fault_pending_source == self) {
+                handler.fault_pending = false;
+                handler.fault_pending_tid = 0;
+                handler.fault_pending_source = null;
+                handler.fault_pending_thread = null;
+                handler.fault_pending_reason = 0;
+                handler.fault_pending_addr = 0;
+                handler.fault_pending_proc_handle = 0;
+                handler.fault_pending_delivered = false;
+            }
+            handler.lock.unlock();
+            self.fault_handler_proc = null;
+        }
+
         self.cleanupIpcState();
         self.cleanupDmaMappings();
         self.vmm.deinit();
@@ -546,6 +869,7 @@ pub const Process = struct {
                 .core_pin => |cp| {
                     sched.unpinByRevoke(cp.core_id, cp.thread_tid);
                 },
+                .thread => {},
                 .process => |p| {
                     const prev = @atomicRmw(u32, &p.handle_refcount, .Sub, 1, .acq_rel);
                     if (prev == 1 and p.cleanup_complete) {
@@ -598,7 +922,7 @@ pub const Process = struct {
                 slot.object = .{ .dead_process = child };
                 parent.syncUserView();
                 if (parent.perm_view_phys.addr != 0) {
-                    const field0_pa = PAddr.fromInt(parent.perm_view_phys.addr + idx * @sizeOf(UserViewEntry) + 16);
+                    const field0_pa = PAddr.fromInt(parent.perm_view_phys.addr + idx * @sizeOf(UserViewEntry) + @offsetOf(UserViewEntry, "field0"));
                     _ = futex.wake(field0_pa, 1);
                 }
                 return;
@@ -660,7 +984,7 @@ pub const Process = struct {
         }
     }
 
-    pub fn create(elf_binary: []const u8, initial_rights: ProcessRights, parent: ?*Process) !*Process {
+    pub fn create(elf_binary: []const u8, initial_rights: ProcessRights, parent: ?*Process, thr_rights: ThreadHandleRights) !*Process {
         const proc = try allocator.create(Process);
         errdefer allocator.destroy(proc);
 
@@ -684,8 +1008,9 @@ pub const Process = struct {
             .perm_view_phys = PAddr.fromInt(0),
             .dma_mappings = undefined,
             .num_dma_mappings = 0,
-            .crash_reason = .none,
+            .fault_reason = .none,
             .restart_count = 0,
+            .thread_handle_rights = thr_rights,
         };
 
         const pmm_iface = pmm.global_pmm.?.allocator();
@@ -737,7 +1062,10 @@ pub const Process = struct {
             errdefer restart_context_mod.destroy(proc.restart_context.?);
         }
 
-        _ = try thread_mod.Thread.create(proc, elf_result.entry, proc.perm_view_vaddr.addr, DEFAULT_STACK_PAGES);
+        const initial_thread = try thread_mod.Thread.create(proc, elf_result.entry, proc.perm_view_vaddr.addr, DEFAULT_STACK_PAGES);
+
+        // Insert initial thread handle at slot 1
+        proc.insertThreadHandleAtSlot(1, initial_thread, thr_rights);
 
         if (parent) |p| {
             p.lock.lock();
@@ -779,7 +1107,7 @@ pub const Process = struct {
             .perm_view_phys = PAddr.fromInt(0),
             .dma_mappings = undefined,
             .num_dma_mappings = 0,
-            .crash_reason = .none,
+            .fault_reason = .none,
             .restart_count = 0,
         };
         proc.initPermTable(.{});

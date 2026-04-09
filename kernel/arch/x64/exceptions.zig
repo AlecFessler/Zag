@@ -8,7 +8,7 @@ const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const scheduler = zag.sched.scheduler;
 
-const CrashReason = zag.perms.permissions.CrashReason;
+const FaultReason = zag.perms.permissions.FaultReason;
 const GateType = zag.arch.x64.idt.GateType;
 const PageFaultContext = zag.arch.interrupts.PageFaultContext;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
@@ -115,7 +115,7 @@ pub fn init() void {
     }
 }
 
-fn exceptionCrashReason(vector: u5) ?CrashReason {
+fn exceptionFaultReason(vector: u5) ?FaultReason {
     return switch (@as(Exception, @enumFromInt(vector))) {
         .divide_by_zero, .overflow, .bound_range_exceeded => .arithmetic_fault,
         .x87_floating_point, .simd_floating_point => .arithmetic_fault,
@@ -124,7 +124,8 @@ fn exceptionCrashReason(vector: u5) ?CrashReason {
         .general_protection_fault, .stack_segment_fault => .protection_fault,
         .invalid_task_state_segment, .segment_not_pressent => .protection_fault,
         .virtualization, .security => .protection_fault,
-        .single_step_debug, .breakpoint_debug => null,
+        .single_step_debug => null,
+        .breakpoint_debug => .breakpoint,
         .double_fault, .machine_check => null,
         .non_maskable_interrupt, .coprocessor_segment_overrun => null,
         .page_fault => unreachable,
@@ -138,15 +139,20 @@ fn exceptionHandler(ctx: *cpu.Context) void {
     const from_user = (ctx.cs & ring_3) == ring_3;
 
     if (from_user) {
-        // Debug/breakpoint from userspace: no debugger attached, just resume.
-        if (exception == .single_step_debug or exception == .breakpoint_debug) return;
+        // Debug/single-step from userspace: just resume.
+        if (exception == .single_step_debug) return;
 
-        if (exceptionCrashReason(vector)) |reason| {
+        if (exceptionFaultReason(vector)) |reason| {
             const thread = scheduler.currentThread() orelse
                 @panic("user exception with no current thread");
             arch.print("K: EXCEPTION pid={d} vec={d} err=0x{x}\n", .{
                 thread.process.pid, vector, ctx.err_code,
             });
+            if (thread.process.faultBlock(thread, reason, ctx.rip, ctx.rip)) {
+                arch.enableInterrupts();
+                scheduler.yield();
+                return;
+            }
             thread.process.kill(reason);
             arch.enableInterrupts();
             while (true) arch.halt();
@@ -184,6 +190,7 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         .is_kernel_privilege = !from_user,
         .is_write = pf_err.is_write,
         .is_exec = pf_err.instr_fetch,
+        .rip = ctx.rip,
     };
     zag.arch.interrupts.handlePageFault(&pf_ctx);
 }

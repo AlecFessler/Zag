@@ -6,7 +6,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.6.25 — When a fault kills a process, the crash reason is recorded.
+/// §2.6.25 — When a fault kills a process, the fault reason is recorded.
 /// Verifies via the parent's perm_view entry for the child (not the child's own slot 0).
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);

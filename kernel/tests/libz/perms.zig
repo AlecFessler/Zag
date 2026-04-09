@@ -21,7 +21,8 @@ pub const ProcessRights = packed struct(u16) {
     shm_create: bool = false,
     device_own: bool = false,
     pin_exclusive: bool = false,
-    _reserved: u8 = 0,
+    fault_handler: bool = false,
+    _reserved: u7 = 0,
 
     pub fn bits(self: @This()) u64 {
         return @intCast(@as(u16, @bitCast(self)));
@@ -73,9 +74,29 @@ pub const ProcessHandleRights = packed struct(u16) {
     send_device: bool = false,
     kill: bool = false,
     grant: bool = false,
-    _reserved: u10 = 0,
+    fault_handler: bool = false,
+    _reserved: u9 = 0,
 
     pub fn bits(self: @This()) u64 {
         return @intCast(@as(u16, @bitCast(self)));
     }
+};
+
+pub const ThreadHandleRights = packed struct(u8) {
+    @"suspend": bool = false,
+    @"resume": bool = false,
+    kill: bool = false,
+    set_affinity: bool = false,
+    _reserved: u4 = 0,
+
+    pub fn bits(self: @This()) u64 {
+        return @intCast(@as(u8, @bitCast(self)));
+    }
+
+    pub const full = ThreadHandleRights{
+        .@"suspend" = true,
+        .@"resume" = true,
+        .kill = true,
+        .set_affinity = true,
+    };
 };

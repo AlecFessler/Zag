@@ -6,7 +6,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.6.24 — A process can detect restart via slot 0 `field0` (crash_reason or restart_count non-zero).
+/// §2.6.24 — A process can detect restart via slot 0 `field0` (fault_reason or restart_count non-zero).
 /// child_check_bss uses its own view[0].processRestartCount() to branch between first boot
 /// and restart behavior — proving the child can detect its own restart via slot 0.
 pub fn main(pv: u64) void {

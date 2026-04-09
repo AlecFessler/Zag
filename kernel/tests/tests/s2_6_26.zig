@@ -6,7 +6,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.6.26 — On restart, crash reason and restart count are written to both the process's own slot 0 and the parent's entry for the child.
+/// §2.6.26 — On restart, fault reason and restart count are written to both the process's own slot 0 and the parent's entry for the child.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 

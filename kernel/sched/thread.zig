@@ -22,6 +22,8 @@ pub const State = enum {
     running,
     ready,
     blocked,
+    faulted,
+    suspended,
     exited,
 };
 
@@ -47,9 +49,16 @@ pub const Thread = struct {
     futex_deadline_ns: u64 = 0,
     futex_paddr: PAddr = PAddr.fromInt(0),
     ipc_server: ?*Process = null,
+    slot_index: u8 = 0,
 
     pub fn deinit(self: *Thread) void {
         const proc = self.process;
+
+        // Remove thread handle from own perm table and handler's perm table
+        proc.removeThreadHandle(self);
+        if (proc.fault_handler_proc) |handler| {
+            handler.removeThreadHandle(self);
+        }
 
         stack_mod.destroyKernel(self.kernel_stack, memory_init.kernel_addr_space_root);
 
@@ -104,6 +113,7 @@ pub const Thread = struct {
         defer proc.lock.unlock();
 
         if (proc.num_threads >= Process.MAX_THREADS) return error.MaxThreads;
+        thread.slot_index = @intCast(proc.num_threads);
         proc.threads[proc.num_threads] = thread;
         proc.num_threads += 1;
 

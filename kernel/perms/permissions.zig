@@ -4,9 +4,10 @@ const zag = @import("zag");
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const Process = zag.sched.process.Process;
 const SharedMemory = zag.memory.shared.SharedMemory;
+const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 
-pub const CrashReason = enum(u5) {
+pub const FaultReason = enum(u5) {
     none = 0,
     stack_overflow = 1,
     stack_underflow = 2,
@@ -21,12 +22,14 @@ pub const CrashReason = enum(u5) {
     protection_fault = 11,
     normal_exit = 12,
     killed = 13,
-    revoked = 14,
+    breakpoint = 14,
     _,
 };
 
+pub const CrashReason = FaultReason;
+
 pub const DeadProcessInfo = struct {
-    crash_reason: CrashReason,
+    fault_reason: FaultReason,
     restart_count: u16,
 };
 
@@ -39,7 +42,8 @@ pub const ProcessRights = packed struct(u16) {
     shm_create: bool = false,
     device_own: bool = false,
     pin_exclusive: bool = false,
-    _reserved: u8 = 0,
+    fault_handler: bool = false,
+    _reserved: u7 = 0,
 };
 
 pub const VmReservationRights = packed struct(u8) {
@@ -74,13 +78,31 @@ pub const ProcessHandleRights = packed struct(u16) {
     send_device: bool = false,
     kill: bool = false,
     grant: bool = false,
-    _reserved: u10 = 0,
+    fault_handler: bool = false,
+    _reserved: u9 = 0,
+};
+
+pub const ThreadHandleRights = packed struct(u8) {
+    @"suspend": bool = false,
+    @"resume": bool = false,
+    kill: bool = false,
+    set_affinity: bool = false,
+    _reserved: u4 = 0,
+
+    pub const full = ThreadHandleRights{
+        .@"suspend" = true,
+        .@"resume" = true,
+        .kill = true,
+        .set_affinity = true,
+    };
 };
 
 pub const PermissionEntry = struct {
     handle: u64,
     object: KernelObject,
     rights: u16,
+    exclude_oneshot: bool = false,
+    exclude_permanent: bool = false,
 
     pub fn processRights(self: @This()) ProcessRights {
         return @bitCast(self.rights);
@@ -96,6 +118,10 @@ pub const PermissionEntry = struct {
 
     pub fn processHandleRights(self: @This()) ProcessHandleRights {
         return @bitCast(self.rights);
+    }
+
+    pub fn threadHandleRights(self: @This()) ThreadHandleRights {
+        return @bitCast(@as(u8, @truncate(self.rights)));
     }
 };
 
@@ -117,6 +143,7 @@ pub const KernelObject = union(enum) {
     shared_memory: *SharedMemory,
     device_region: *DeviceRegion,
     core_pin: CorePinObject,
+    thread: *Thread,
     empty: void,
 };
 
@@ -127,6 +154,7 @@ pub const UserViewEntryType = enum(u8) {
     device_region = 3,
     core_pin = 4,
     dead_process = 5,
+    thread = 6,
 };
 
 pub const UserViewEntry = extern struct {
@@ -146,9 +174,22 @@ pub const UserViewEntry = extern struct {
         .field1 = 0,
     };
 
-    fn processField0(crash_reason: CrashReason, restart_count: u16) u64 {
-        return @as(u64, @intFromEnum(crash_reason)) |
+    fn processField0(fault_reason: FaultReason, restart_count: u16) u64 {
+        return @as(u64, @intFromEnum(fault_reason)) |
             (@as(u64, restart_count) << 16);
+    }
+
+    fn threadField0(t: *Thread) u64 {
+        const state_val: u8 = switch (t.state) {
+            .ready => 0,
+            .running => 1,
+            .blocked => 2,
+            .faulted => 3,
+            .suspended => 4,
+            .exited => 5,
+        };
+        const core_id: u8 = if (t.core_affinity) |mask| @intCast(@as(u7, @truncate(@ctz(mask)))) else 0;
+        return @as(u64, state_val) | (@as(u64, core_id) << 8);
     }
 
     pub fn fromKernelEntry(entry: PermissionEntry) UserViewEntry {
@@ -157,14 +198,14 @@ pub const UserViewEntry = extern struct {
                 .handle = entry.handle,
                 .entry_type = @intFromEnum(UserViewEntryType.process),
                 .rights = entry.rights,
-                .field0 = processField0(p.crash_reason, p.restart_count),
+                .field0 = processField0(p.fault_reason, p.restart_count),
                 .field1 = 0,
             },
             .dead_process => |p| .{
                 .handle = entry.handle,
                 .entry_type = @intFromEnum(UserViewEntryType.dead_process),
                 .rights = entry.rights,
-                .field0 = processField0(p.crash_reason, p.restart_count),
+                .field0 = processField0(p.fault_reason, p.restart_count),
                 .field1 = 0,
             },
             .vm_reservation => |vm| .{
@@ -214,6 +255,13 @@ pub const UserViewEntry = extern struct {
                 .rights = entry.rights,
                 .field0 = cp.core_id,
                 .field1 = cp.thread_tid,
+            },
+            .thread => |t| .{
+                .handle = entry.handle,
+                .entry_type = @intFromEnum(UserViewEntryType.thread),
+                .rights = entry.rights,
+                .field0 = threadField0(t),
+                .field1 = 0,
             },
             .empty => EMPTY,
         };

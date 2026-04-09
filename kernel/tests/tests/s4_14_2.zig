@@ -7,7 +7,7 @@ const t = lib.testing;
 
 const E_PERM: i64 = -2;
 
-/// §4.14.2 — `set_affinity` requires `set_affinity` right — returns `E_PERM` without it.
+/// §4.14.2 — `set_affinity` requires both `ProcessRights.set_affinity` on slot 0 AND `ThreadHandleRights.set_affinity` on the `thread_handle`; returns `E_PERM` if either is absent.
 pub fn main(_: u64) void {
     // Spawn child WITHOUT set_affinity right
     const child_rights = perms.ProcessRights{};

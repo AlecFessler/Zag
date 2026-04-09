@@ -6,7 +6,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.1.21 — Process entry `field0` encodes `crash_reason(u5, bits 0-4) | restart_count(u16, bits 16-31)`.
+/// §2.1.21 — Process entry `field0` encodes `fault_reason(u5, bits 0-4) | restart_count(u16, bits 16-31)`.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
@@ -44,7 +44,7 @@ pub fn main(pv: u64) void {
     const crash_reason = view[slot].processCrashReason();
     const restart_count = view[slot].processRestartCount();
 
-    // After restart: crash_reason should be normal_exit (12), restart_count >= 1.
+    // After restart: fault_reason should be normal_exit (12), restart_count >= 1.
     if (crash_reason == .normal_exit and restart_count >= 1) {
         t.pass("§2.1.21");
     } else {

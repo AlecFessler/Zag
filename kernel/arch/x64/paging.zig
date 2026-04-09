@@ -388,6 +388,14 @@ pub fn updatePagePerms(
     l1_entry.user_accessible = new_perms.privilege_perm == .user;
 
     cpu.invlpg(virt.addr);
+
+    // User-space permission changes must be visible on all cores.
+    // Without this, a remote core's stale TLB entry retains the old
+    // permissions (e.g. writable) after they have been revoked.
+    const user_end = zag.memory.address.AddrSpacePartition.user.end;
+    if (virt.addr < user_end) {
+        flushRemoteTlb(virt.addr);
+    }
 }
 
 pub fn resolveVaddr(

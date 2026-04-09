@@ -30,9 +30,9 @@ The root service is the first userspace process, started by the kernel at boot. 
 
 Every process has a kernel-maintained read-only page called the **user permissions view** — a 128-entry table that mirrors the process's capability slots. Userspace reads this to discover what capabilities it holds. **§2.1.15** The user permissions view is a read-only region mapped into the process's address space. **§2.1.16** The user view is sized to maximum permissions table capacity. **§2.1.17** The kernel updates the user view on every permissions table mutation (insert, remove, type change).
 
-Each entry has a handle ID and a type tag. **§2.1.18** Each entry's handle field is a monotonic u64 ID; empty slots have handle = `U64_MAX`. **§2.1.19** Each entry has a type field: `process`, `vm_reservation`, `shared_memory`, `device_region`, `core_pin`, or `dead_process`. **§2.1.20** Slot 0 (`HANDLE_SELF`) rights are encoded as `ProcessRights`; all other process handle slots use `ProcessHandleRights`.
+Each entry has a handle ID and a type tag. **§2.1.18** Each entry's handle field is a monotonic u64 ID; empty slots have handle = `U64_MAX`. **§2.1.19** Each entry has a type field: `process`, `vm_reservation`, `shared_memory`, `device_region`, `core_pin`, `dead_process`, or `thread`. **§2.1.20** Slot 0 (`HANDLE_SELF`) rights are encoded as `ProcessRights`; all other process handle slots use `ProcessHandleRights`. Thread handle slots use `ThreadHandleRights`.
 
-The `field0` and `field1` fields carry type-specific metadata. For process entries: **§2.1.21** process entry `field0` encodes `crash_reason(u5, bits 0-4) | restart_count(u16, bits 16-31)`. **§2.1.22** On first boot, process entry `field0` = 0. **§2.1.23** After restart, `crash_reason` in `field0` reflects the triggering fault. **§2.1.24** After restart, `restart_count` in `field0` increments. **§2.1.25** `dead_process` entry has the same `field0` encoding as `process` (crash_reason + restart_count). **§2.1.26** Parent's `process` entry is converted to `dead_process` when the child dies without restarting.
+The `field0` and `field1` fields carry type-specific metadata. For process entries: **§2.1.21** process entry `field0` encodes `fault_reason(u5, bits 0-4) | restart_count(u16, bits 16-31)`. **§2.1.22** On first boot, process entry `field0` = 0. **§2.1.23** After restart, `fault_reason` in `field0` reflects the triggering fault. **§2.1.24** After restart, `restart_count` in `field0` increments. **§2.1.25** `dead_process` entry has the same `field0` encoding as `process` (fault_reason + restart_count). **§2.1.26** Parent's `process` entry is converted to `dead_process` when the child dies without restarting.
 
 For other types: **§2.1.27** `vm_reservation` entry: `field0` = start VAddr, `field1` = original size. **§2.1.28** `shared_memory` entry: `field0` = size. **§2.1.29** `device_region` entry: `field0` and `field1` follow §2.9 encoding.
 
@@ -43,6 +43,12 @@ For other types: **§2.1.27** `vm_reservation` entry: `field0` = start VAddr, `f
 The user half of the virtual address space is split into two zones. The lower ASLR zone is where the kernel places ELF segments and stacks at a randomized base. The upper static reservation zone is for `vm_reserve` with an explicit hint address at deterministic locations.
 
 **§2.1.31** User address space spans `[0, 0xFFFF_8000_0000_0000)`. **§2.1.32** ELF segments and stacks are never placed in the static reservation zone `[0x0000_1000_0000_0000, 0xFFFF_8000_0000_0000)`. **§2.1.33** `vm_reserve` with a hint in the static reservation zone uses that address (if no overlap). **§2.1.34** ELF segments and user stacks are placed in the ASLR zone `[0x0000_0000_0000_1000, 0x0000_1000_0000_0000)` with a randomized base. **§2.1.35** The first 4 KiB `[0, 0x1000)` is unmapped; accessing address 0 causes a fault. **§2.1.36** The ASLR base address is page-aligned.
+
+**§2.1.37** Thread entry `field0` encodes `state(u8, bits 0–7) | core_id(u8, bits 8–15)`. State values: 0 = ready, 1 = running, 2 = blocked, 3 = faulted, 4 = suspended, 5 = exited.
+
+**§2.1.38** Thread entry `field1` = 0 (reserved).
+
+**§2.1.39** The kernel updates a thread entry's `field0` in every permissions table that holds a handle to that thread on every thread state transition, and calls `syncUserView` on each such table.
 
 ---
 
@@ -70,7 +76,7 @@ All access to kernel objects is mediated by **capabilities** — handles with as
 
 **§2.3.1** Handles are monotonically increasing u64 IDs, unique per process lifetime. **§2.3.2** Handle 0 (`HANDLE_SELF`) exists at process creation and cannot be revoked.
 
-There are four rights types. **ProcessRights** (u16, slot 0 only): `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `shm_create`(5), `device_own`(6), `pin_exclusive`(7). **ProcessHandleRights** (u16, other process handles): `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5). **SharedMemoryRights** (u8): `read`(0), `write`(1), `execute`(2), `grant`(3). **DeviceRegionRights** (u8): `map`(0), `grant`(1), `dma`(2).
+There are five rights types. **ProcessRights** (u16, slot 0 only): `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `shm_create`(5), `device_own`(6), `pin_exclusive`(7), `fault_handler`(8). **ProcessHandleRights** (u16, other process handles): `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5), `fault_handler`(6). When `fault_handler` is set on a handle to process P, the holder receives P's fault messages in the holder's own fault box. At most one external process may hold this bit for any given process at a time. **SharedMemoryRights** (u8): `read`(0), `write`(1), `execute`(2), `grant`(3). **DeviceRegionRights** (u8): `map`(0), `grant`(1), `dma`(2). **ThreadHandleRights** (u8): `suspend`(0), `resume`(1), `kill`(2), `set_affinity`(3). 4 bits reserved.
 
 **§2.3.3** `restart` can only be granted by a parent that itself has restart capability. **§2.3.4** Once cleared via `disable_restart`, the restart capability cannot be re-enabled.
 
@@ -78,17 +84,68 @@ There are four rights types. **ProcessRights** (u16, slot 0 only): `spawn_thread
 
 **§2.3.5** VM reservation handles are not transferable via message passing. **§2.3.6** SHM handles are transferable if the `grant` bit is set. **§2.3.7** SHM transfer is non-exclusive (both sender and target retain handles). **§2.3.8** Process handles are transferable if the `grant` bit is set. **§2.3.9** Device transfer is exclusive (removed from sender on transfer). **§2.3.10** Transferred rights must be a subset of source rights.
 
+**§2.3.19** Thread handles are not transferable via message passing. The kernel is the sole distributor of thread handles — processes receive handles for their own threads via `thread_create`, and a fault handler receives handles for a debuggee's threads when `fault_handler` is acquired.
+
 #### Revoke
 
 Revoking a capability removes it from the permissions table. The cleanup depends on the type: **§2.3.11** revoking a VM reservation frees all pages in the range and clears the perm slot. **§2.3.12** Revoking SHM unmaps it from all reservations, reverts to private, and clears the slot. **§2.3.13** Revoking a device handle unmaps MMIO, returns handle up the process tree (§2.1), and clears the slot. **§2.3.14** Revoking a core pin unpins the thread, restores preemptive scheduling, and clears the slot. **§2.3.15** Revoking a process handle with `kill` right recursively kills the child's subtree. **§2.3.16** Revoking a process handle without `kill` right drops the handle without killing. **§2.3.17** Revoking a `dead_process` handle clears the slot. **§2.3.18** Sending `HANDLE_SELF` via capability transfer gives the recipient a process handle to the sender.
+
+**§2.3.20** Revoking a thread handle removes it from the permissions table without affecting the thread's execution or state.
 
 ---
 
 ### §2.4 Thread
 
-A thread is a unit of execution belonging to a process. All threads within a process share the same address space and permissions table. Observable states: running, ready, blocked (on futex or IPC), exited.
+A thread is a unit of execution belonging to a process. All threads within a process share the same address space and permissions table. Observable states: running, ready, blocked (on futex or IPC), faulted, suspended, exited.
 
-**§2.4.1** `thread_create` creates a new thread that begins executing at `entry_addr` with the specified `arg` value. `set_affinity` constrains a thread's core affinity; the change takes effect at the next scheduling decision.
+- `.faulted`: the thread has experienced a fault and is suspended awaiting fault handler reply; it is not scheduled.
+- `.suspended`: the thread has been explicitly suspended via stop-all or `thread_suspend`; it is not scheduled.
+
+**§2.4.1** `thread_create` returns the new thread's handle ID (positive u64) on success rather than `E_OK`. The handle is inserted into the calling process's permissions table with full `ThreadHandleRights`.
+
+**§2.4.2** `thread_create` inserts a thread handle into the calling process's permissions table with full `ThreadHandleRights` and returns the handle ID (positive u64) on success.
+
+**§2.4.3** The initial thread's handle is inserted at slot 1 of the child process's permissions table during `proc_create`, with `ThreadHandleRights` as specified by the `thread_rights` parameter to `proc_create`.
+
+**§2.4.4** `thread_self` returns the handle ID of the calling thread as it appears in the calling process's own permissions table. Always succeeds.
+
+**§2.4.5** Revoking a thread handle via `revoke_perm` removes the handle from the permissions table without killing or suspending the thread.
+
+**§2.4.6** When a thread exits, its handle entry is cleared from its owning process's permissions table. If an external process holds `fault_handler` for that process, the thread handle is also cleared from the handler's permissions table. `syncUserView` is called on all affected tables.
+
+**§2.4.7** The user permissions view `field0` for a thread entry is updated on every thread state transition.
+
+**§2.4.8** `thread_suspend` requires the `suspend` right on the thread handle; returns `E_PERM` without it.
+
+**§2.4.9** `thread_suspend` on a `.running` thread causes it to enter `.suspended` state; if running on a remote core, a scheduling IPI is issued to force the transition at the next scheduling point.
+
+**§2.4.10** `thread_suspend` on a `.ready` thread removes it from the run queue and enters `.suspended`.
+
+**§2.4.11** `thread_suspend` on a `.faulted` thread returns `E_BUSY`.
+
+**§2.4.12** `thread_suspend` on an already-`.suspended` thread returns `E_BUSY`.
+
+**§2.4.13** `thread_resume` requires the `resume` right on the thread handle; returns `E_PERM` without it.
+
+**§2.4.14** `thread_resume` on a `.suspended` thread moves it to `.ready` and re-enqueues it on the scheduler.
+
+**§2.4.15** `thread_resume` on a thread not in `.suspended` state returns `E_INVAL`.
+
+**§2.4.16** `thread_kill` requires the `kill` right on the thread handle; returns `E_PERM` without it.
+
+**§2.4.17** `thread_kill` on a `.faulted` thread returns `E_BUSY`; the fault must be resolved via `fault_reply` with `FAULT_KILL` before the thread can be killed.
+
+**§2.4.18** `thread_kill` on the last non-exited thread in a process triggers process exit or restart per §2.6 semantics.
+
+**§2.4.19** `set_affinity` requires both `ProcessRights.set_affinity` on slot 0 AND `ThreadHandleRights.set_affinity` on the target thread handle; returns `E_PERM` if either is absent.
+
+**§2.4.20** `pin_exclusive` requires both `ProcessRights.pin_exclusive` on slot 0 AND `ThreadHandleRights.set_affinity` on the thread handle; the thread handle must refer to the calling thread; returns `E_INVAL` if it refers to any other thread.
+
+**§2.4.21** A `.faulted` thread is not scheduled and does not appear on any run queue.
+
+**§2.4.22** A `.suspended` thread is not scheduled and does not appear on any run queue.
+
+`set_affinity` constrains a thread's core affinity; the change takes effect at the next scheduling decision.
 
 ---
 
@@ -108,19 +165,21 @@ A process with a **restart context** (set at creation time via the `restart` bit
 
 **§2.6.4** A restarting process remains alive throughout (IPC to it does not return `E_BADHANDLE`).
 
-Most state survives a restart. **§2.6.5** Permissions table persists across restart (except VM reservation entries). **§2.6.7** Restart count increments on each restart. Restart count wraps to zero on u16 overflow. **§2.6.9** Crash reason is recorded in slot 0 `field0` on restart. Code and rodata mappings persist across restart. **§2.6.11** Data mappings persist across restart; content is reloaded from original ELF. **§2.6.12** SHM handle entries persist across restart. **§2.6.13** Device handle entries persist across restart. **§2.6.14** Process tree position and children persist across restart. **§2.6.15** Restart context persists (process can restart again). **§2.6.16** Pending callers (received but not yet replied to) persist across restart. **§2.6.17** User permissions view (mapped read-only region) persists across restart.
+Most state survives a restart. **§2.6.5** Permissions table persists across restart (except VM reservation entries). **§2.6.7** Restart count increments on each restart. Restart count wraps to zero on u16 overflow. **§2.6.9** Fault reason is recorded in slot 0 `field0` on restart. Code and rodata mappings persist across restart. **§2.6.11** Data mappings persist across restart; content is reloaded from original ELF. **§2.6.12** SHM handle entries persist across restart. **§2.6.13** Device handle entries persist across restart. **§2.6.14** Process tree position and children persist across restart. **§2.6.15** Restart context persists (process can restart again). **§2.6.16** Pending callers (received but not yet replied to) persist across restart. **§2.6.17** User permissions view (mapped read-only region) persists across restart.
 
 What doesn't persist: **§2.6.6** VM reservation entries are cleared on restart. **§2.6.18** User-created VM reservations do not persist across restart. User stacks do not persist — a fresh one is allocated. **§2.6.20** SHM/MMIO mappings within freed reservations do not persist across restart. **§2.6.21** BSS is decommitted on restart. **§2.6.22** All threads are removed on restart; only a fresh initial thread runs.
 
-A restarted process can detect that it restarted by checking slot 0: **§2.6.23** on first boot, only `HANDLE_SELF` exists with `field0` = 0. **§2.6.24** A process can detect restart via slot 0 `field0` (crash_reason or restart_count non-zero).
+A restarted process can detect that it restarted by checking slot 0: **§2.6.23** on first boot, only `HANDLE_SELF` exists with `field0` = 0. **§2.6.24** A process can detect restart via slot 0 `field0` (fault_reason or restart_count non-zero).
 
 #### Kill and Death
 
-When a process is killed, the kernel records why and notifies the parent through the user permissions view. **§2.6.25** When a fault kills a process, the crash reason is recorded. **§2.6.26** On restart, crash reason and restart count are written to both the process's own slot 0 and the parent's entry for the child. **§2.6.27** The kernel issues a futex wake on the parent's user view `field0` for a restarted child. **§2.6.28** Non-restartable dead process: parent's entry converts to `dead_process` with crash reason and restart count. **§2.6.29** The kernel issues a futex wake on the parent's user view `field0` for a dead child.
+When a process is killed, the kernel records why and notifies the parent through the user permissions view. **§2.6.25** When a fault kills a process, the fault reason is recorded. **§2.6.26** On restart, fault reason and restart count are written to both the process's own slot 0 and the parent's entry for the child. **§2.6.27** The kernel issues a futex wake on the parent's user view `field0` for a restarted child. **§2.6.28** Non-restartable dead process: parent's entry converts to `dead_process` with fault reason and restart count. **§2.6.29** The kernel issues a futex wake on the parent's user view `field0` for a dead child.
 
 **§2.6.30** Non-parent holders' entries are lazily converted to `dead_process` on IPC attempt (`send`/`call` returns `E_BADHANDLE`).
 
 Recursive kill walks the subtree depth-first. **§2.6.31** Non-recursive kill of a non-restartable process with children makes it a zombie. **§2.6.32** Recursive kill traverses the entire subtree (depth-first post-order). **§2.6.33** Restartable processes in recursive kill restart and keep device handles. **§2.6.34** Non-restartable processes in recursive kill die; device handles return up tree.
+
+**§2.6.35** On restart of a process that has an external fault handler: all thread handles for that process are bulk-revoked from the handler's permissions table; the fresh initial thread handle is immediately inserted into the handler's permissions table with full `ThreadHandleRights`; the `fault_handler` relationship (fault_handler_proc pointer) persists across restart without requiring re-transfer.
 
 ---
 
@@ -132,7 +191,7 @@ A shared memory region is a set of physical pages that can be mapped into multip
 
 ### §2.8 Stack
 
-Each user stack is flanked by unmapped guard pages that catch overflow and underflow. **§2.8.1** Each user stack has a 1-page unmapped underflow guard below the usable region. The first page of the usable region is eagerly mapped; the rest are demand-paged. **§2.8.3** Each user stack has a 1-page unmapped overflow guard above the usable region. **§2.8.4** Fault on the underflow guard (below stack) kills with crash reason `stack_overflow` (§3). **§2.8.5** Fault on the overflow guard (above stack) kills with crash reason `stack_underflow` (§3).
+Each user stack is flanked by unmapped guard pages that catch overflow and underflow. **§2.8.1** Each user stack has a 1-page unmapped underflow guard below the usable region. The first page of the usable region is eagerly mapped; the rest are demand-paged. **§2.8.3** Each user stack has a 1-page unmapped overflow guard above the usable region. **§2.8.4** Fault on the underflow guard (below stack) kills with fault reason `stack_overflow` (§3). **§2.8.5** Fault on the overflow guard (above stack) kills with fault reason `stack_underflow` (§3).
 
 ---
 
@@ -192,9 +251,124 @@ When a process dies, blocked IPC threads are cleaned up. **§2.11.32** When a pr
 
 ---
 
-## §3 Crash Reasons
+### §2.12 Fault Handling
 
-Each fault or termination records a `CrashReason` (u5) in the process's slot 0 `field0` and the parent's user view entry:
+Zag provides a unified fault handling mechanism covering both in-process fault recovery and external process debugging. Every process has a **fault box** — a message box distinct from its IPC message box — to which fault messages are delivered. The `fault_handler` capability bit controls which process receives a given process's fault messages. Fault handling uses `fault_recv` and `fault_reply` syscalls that are entirely separate from `recv` and `reply`; their state does not interact.
+
+#### fault_handler Capability
+
+**§2.12.1** `ProcessRights` bit 8 is `fault_handler`. When set on a process's slot 0, the process handles its own faults in its own fault box. This bit is granted at `proc_create` time if included in the `process_rights` parameter.
+
+**§2.12.2** `ProcessHandleRights` bit 6 is `fault_handler`. When set on a handle to process P, the holder receives P's fault messages in the holder's own fault box. At most one process may hold `fault_handler` for a given process at a time.
+
+**§2.12.3** Transferring `HANDLE_SELF` via capability transfer with the `fault_handler` bit set atomically: if the recipient already holds a process handle to the sender, the `fault_handler` bit is added to that existing entry; otherwise a new process handle entry is inserted into the recipient's permissions table with `fault_handler` set. In both cases, `fault_handler` is cleared from the sender's slot 0 `ProcessRights`, and all subsequent faults from the sender are routed to the recipient's fault box. The sender's `syncUserView` is updated to reflect the cleared bit.
+
+**§2.12.4** When a process acquires `fault_handler` for a target, the kernel immediately inserts thread handles for all of the target's current threads into the acquirer's permissions table with full `ThreadHandleRights`.
+
+**§2.12.5** While a process holds `fault_handler` for a target, any new threads created in the target are immediately inserted into the handler's permissions table with full `ThreadHandleRights` upon `thread_create`.
+
+**§2.12.6** When `fault_handler` is released or the handler process dies, all thread handles belonging to the target are bulk-revoked from the handler's permissions table and `syncUserView` is called on the handler.
+
+#### Fault Delivery
+
+**§2.12.7** When a thread faults and the process is its own fault handler and only one thread exists (the faulting thread), the process is killed or restarted immediately per §2.6 semantics; no fault message is delivered.
+
+**§2.12.8** When a thread faults and the process is its own fault handler and multiple threads exist, the faulting thread enters `.faulted` state and a fault message is enqueued in the process's own fault box; all other threads continue running normally.
+
+**§2.12.9** When all threads in a self-handling process are simultaneously in `.faulted` state, the process is killed or restarted per §2.6 semantics; no additional fault messages are delivered.
+
+**§2.12.10** When a thread faults and an external process holds `fault_handler` for it, the faulting thread enters `.faulted` state; all other threads in the process that are `.running` or `.ready` enter `.suspended` state (stop-all); a fault message is enqueued in the handler's fault box.
+
+**§2.12.11** Before applying stop-all on an external fault, the kernel checks the faulting thread's `exclude_oneshot` and `exclude_permanent` flags on the thread's perm entry in the handler's permissions table. If either flag is set, only the faulting thread enters `.faulted` and all other threads continue running. If `exclude_oneshot` was set, it is cleared after the check (one-shot consumption); `exclude_permanent` is never cleared by the fault mechanism itself.
+
+**§2.12.12** A `#BP` (int3) exception delivers a fault message with `fault_reason = breakpoint` (14) rather than killing the process immediately. `fault_addr` contains the RIP at the time of the exception.
+
+#### FaultMessage Layout
+
+The `FaultMessage` struct written to the userspace buffer on `fault_recv`:
+
+```
+FaultMessage (extern struct):
+    process_handle: u64         // handle ID of source process in handler's perm table
+    thread_handle:  u64         // handle ID of faulting thread in handler's perm table
+    fault_reason:   u8          // FaultReason value
+    _pad:           [7]u8
+    fault_addr:     u64         // CR2 for page faults; RIP for all others
+    regs:           arch.SavedRegs  // arch-specific full register snapshot
+```
+
+**§2.12.13** `FaultMessage.process_handle` is the handle ID of the source process as it appears in the handler's own permissions table.
+
+**§2.12.14** `FaultMessage.thread_handle` is the handle ID of the faulting thread as it appears in the handler's own permissions table. This value is also the fault token returned by `fault_recv`.
+
+#### fault_recv
+
+**§2.12.15** `fault_recv` with the blocking flag set blocks until a fault message is available in the calling process's fault box.
+
+**§2.12.16** `fault_recv` with the blocking flag clear returns `E_AGAIN` if no fault message is pending.
+
+**§2.12.17** `fault_recv` returns `E_BUSY` if the fault box is already in `pending_reply` state.
+
+**§2.12.18** `fault_recv` returns `E_PERM` if the calling process holds neither its own `fault_handler` ProcessRights bit nor `fault_handler` on any process handle.
+
+**§2.12.19** On success, `fault_recv` writes a `FaultMessage` to the provided userspace buffer, transitions the fault box to `pending_reply` state, and returns the fault token (equal to `FaultMessage.thread_handle`) in `rax`.
+
+#### fault_reply
+
+Reply actions (encoded in r14 bits after the fault flag):
+- `FAULT_KILL` (0): kill the faulting thread.
+- `FAULT_RESUME` (1): resume the faulting thread with saved register state unchanged.
+- `FAULT_RESUME_MODIFIED` (2): resume the faulting thread with registers replaced from `modified_regs_ptr`.
+
+Reply flags (additional r14 bits):
+- `FAULT_EXCLUDE_NEXT`: sets `exclude_oneshot` on the faulting thread's perm entry; clears `exclude_permanent`.
+- `FAULT_EXCLUDE_PERMANENT`: sets `exclude_permanent` on the faulting thread's perm entry; clears `exclude_oneshot`.
+
+**§2.12.20** `fault_reply` returns `E_INVAL` if the fault box is not in `pending_reply` state.
+
+**§2.12.21** `fault_reply` returns `E_NOENT` if the fault token does not match the currently pending thread (i.e., the thread was killed externally while the fault was pending).
+
+**§2.12.22** `fault_reply` with both `FAULT_EXCLUDE_NEXT` and `FAULT_EXCLUDE_PERMANENT` set returns `E_INVAL`.
+
+**§2.12.23** On any `fault_reply`, all threads in the target process that are in `.suspended` state are moved to `.ready` and re-enqueued before the action on the faulting thread is applied.
+
+**§2.12.24** `fault_reply` with `FAULT_KILL` kills the faulting thread. If it is the last non-exited thread, process exit or restart proceeds per §2.6.
+
+**§2.12.25** `fault_reply` with `FAULT_RESUME` resumes the faulting thread with its register state unchanged.
+
+**§2.12.26** `fault_reply` with `FAULT_RESUME_MODIFIED` resumes the faulting thread with its register state replaced by the contents of `modified_regs_ptr` (must be a readable region of `sizeof(arch.SavedRegs)` bytes).
+
+**§2.12.27** `fault_reply` with `FAULT_EXCLUDE_NEXT` sets `exclude_oneshot` on the faulting thread's perm entry in the handler's table and clears `exclude_permanent`. `syncUserView` is called on the handler.
+
+**§2.12.28** `fault_reply` with `FAULT_EXCLUDE_PERMANENT` sets `exclude_permanent` on the faulting thread's perm entry in the handler's table and clears `exclude_oneshot`. `syncUserView` is called on the handler.
+
+#### fault_set_thread_mode
+
+**§2.12.29** `fault_set_thread_mode` with mode `stop_all` clears both `exclude_oneshot` and `exclude_permanent` on the thread's perm entry in the caller's permissions table.
+
+**§2.12.30** `fault_set_thread_mode` with mode `exclude_next` sets `exclude_oneshot` and clears `exclude_permanent`.
+
+**§2.12.31** `fault_set_thread_mode` with mode `exclude_permanent` sets `exclude_permanent` and clears `exclude_oneshot`.
+
+**§2.12.32** `fault_set_thread_mode` requires that the calling process holds `fault_handler` for the owning process of the target thread (the thread handle appears in the caller's perm table as a thread-type entry belonging to a process whose `fault_handler_proc == caller`). Returns `E_PERM` otherwise.
+
+#### Memory Access
+
+**§2.12.33** `fault_read_mem` reads bytes from the target process's virtual address space into the caller's buffer. Requires the `fault_handler` ProcessHandleRights bit on `proc_handle`. Valid regardless of target thread states.
+
+**§2.12.34** `fault_write_mem` writes bytes from the caller's buffer into the target process's virtual address space via physmap, bypassing the target's page table permission bits. Requires the `fault_handler` ProcessHandleRights bit on `proc_handle`. Writes to pages mapped read-only in the target succeed. Valid regardless of target thread states.
+
+#### Handler Death
+
+**§2.12.35** When the handler process dies, all processes that had it as fault handler revert to self-fault-handling: their `fault_handler` ProcessRights bit is restored and their `fault_handler_proc` is cleared. Pending fault messages in the dead handler's fault box are discarded. Threads in `.faulted` state in those processes are re-evaluated under self-handling semantics (§2.12.7 and §2.12.9). Threads in `.suspended` state are moved to `.ready` and re-enqueued.
+
+**§2.12.36** The fault box state is fully independent from the IPC message box state. `fault_recv` and `fault_reply` do not interact with `recv`/`reply` pending state; both boxes may be in `pending_reply` simultaneously.
+
+---
+
+## §3 Fault Reasons
+
+Each fault or termination records a `FaultReason` (u5) in the process's slot 0 `field0` and the parent's user view entry:
 
 | Value | Name | Trigger |
 |-------|------|---------|
@@ -212,6 +386,7 @@ Each fault or termination records a `CrashReason` (u5) in the process's slot 0 `
 | 11 | `protection_fault` | general protection fault |
 | 12 | `normal_exit` | last thread voluntarily exited |
 | 13 | `killed` | killed by parent via `kill` right |
+| 14 | `breakpoint` | int3 / #BP exception |
 
 **§3.1** Fault with no VMM node kills the process with `unmapped_access`. **§3.2** Fault on SHM/MMIO region kills with `invalid_read`/`invalid_write`/`invalid_execute` based on access type. **§3.3** Fault on a private region with wrong permissions kills with `invalid_read`/`invalid_write`/`invalid_execute`. **§3.4** Demand-paged private region: allocate zeroed page, map, resume. **§3.5** Demand page allocation failure kills with `out_of_memory`. **§3.6** Divide-by-zero kills with `arithmetic_fault`. **§3.7** Invalid opcode kills with `illegal_instruction`. **§3.8** Alignment check exception kills with `alignment_fault`. **§3.9** General protection fault kills with `protection_fault`. **§3.10** All user faults are non-recursive: killing a faulting process does not propagate to children.
 
@@ -275,13 +450,13 @@ Maps a device's MMIO region into a reservation. **§4.8.1** `mmio_map` returns `
 
 **§4.9.1** `mmio_unmap` returns `E_OK` on success. **§4.9.2** `mmio_unmap` with invalid handle returns `E_BADHANDLE`. **§4.9.3** `mmio_unmap` when MMIO is not mapped returns `E_NOENT`.
 
-### §4.10 proc_create(elf_ptr, elf_len, perms) → handle
+### §4.10 proc_create(elf_ptr, elf_len, process_rights, thread_rights) → handle
 
-Spawns a new child process from an ELF binary. The `perms` parameter sets the child's slot 0 `ProcessRights`. **§4.10.1** `proc_create` returns handle ID (positive) on success. **§4.10.2** `proc_create` child starts with only `HANDLE_SELF`. **§4.10.3** `proc_create` requires `spawn_process` right — returns `E_PERM` without it. **§4.10.4** `proc_create` with `restart` in perms without parent restart capability returns `E_PERM`. **§4.10.5** `proc_create` with invalid ELF returns `E_INVAL`. **§4.10.8** `proc_create` with invalid `elf_ptr` returns `E_BADADDR`. **§4.10.10** `proc_create` grants parent full `ProcessHandleRights` on the child handle. **§4.10.11** `proc_create` with child perms exceeding parent's own process rights returns `E_PERM`. Returns `E_NOMEM` on memory exhaustion, `E_MAXCAP` when the permissions table is full, or `E_NORES` on kernel stack exhaustion.
+Spawns a new child process from an ELF binary. The `process_rights` parameter sets the child's slot 0 `ProcessRights`. The `thread_rights` parameter specifies the `ThreadHandleRights` the child receives for its own thread handles (its initial thread handle at slot 1, and all subsequent thread handles from `thread_create`). **§4.10.1** `proc_create` returns handle ID (positive) on success. **§4.10.2** `proc_create` child starts with `HANDLE_SELF` at slot 0 and its initial thread handle at slot 1 with rights = `thread_rights`. **§4.10.3** `proc_create` requires `spawn_process` right — returns `E_PERM` without it. **§4.10.4** `proc_create` with `restart` in perms without parent restart capability returns `E_PERM`. **§4.10.5** `proc_create` with invalid ELF returns `E_INVAL`. **§4.10.8** `proc_create` with invalid `elf_ptr` returns `E_BADADDR`. **§4.10.10** `proc_create` grants parent full `ProcessHandleRights` on the child handle. **§4.10.11** `proc_create` with child perms exceeding parent's own process rights returns `E_PERM`. **§4.10.12** `proc_create` with `thread_rights` containing undefined bits returns `E_INVAL`. Returns `E_NOMEM` on memory exhaustion, `E_MAXCAP` when the permissions table is full, or `E_NORES` on kernel stack exhaustion.
 
-### §4.11 thread_create(entry, arg, num_stack_pages) → result
+### §4.11 thread_create(entry, arg, num_stack_pages) → handle
 
-Creates a new thread within the calling process. **§4.11.1** `thread_create` returns `E_OK` on success. **§4.11.2** `thread_create` requires `spawn_thread` right — returns `E_PERM` without it. **§4.11.3** `thread_create` with invalid entry returns `E_BADADDR`. **§4.11.4** `thread_create` with zero stack pages returns `E_INVAL`. Returns `E_NOMEM` on memory exhaustion, `E_MAXTHREAD` at the thread limit, or `E_NORES` on kernel stack exhaustion.
+Creates a new thread within the calling process. **§4.11.1** `thread_create` returns the new thread's handle ID (positive u64) on success. **§4.11.2** `thread_create` requires `spawn_thread` right — returns `E_PERM` without it. **§4.11.3** `thread_create` with invalid entry returns `E_BADADDR`. **§4.11.4** `thread_create` with zero stack pages returns `E_INVAL`. Returns `E_NOMEM` on memory exhaustion, `E_MAXTHREAD` at the thread limit, or `E_NORES` on kernel stack exhaustion.
 
 ### §4.12 thread_exit() → noreturn
 
@@ -291,13 +466,13 @@ Creates a new thread within the calling process. **§4.11.1** `thread_create` re
 
 **§4.13.1** `thread_yield` returns `E_OK`.
 
-### §4.14 set_affinity(core_mask) → result
+### §4.14 set_affinity(thread_handle, core_mask) → result
 
-Sets the calling thread's core affinity. **§4.14.1** `set_affinity` returns `E_OK` on success. **§4.14.2** `set_affinity` requires `set_affinity` right — returns `E_PERM` without it. **§4.14.3** `set_affinity` with empty mask returns `E_INVAL`. **§4.14.4** `set_affinity` with invalid core IDs returns `E_INVAL`.
+Sets a thread's core affinity. **§4.14.1** `set_affinity` returns `E_OK` on success. **§4.14.2** `set_affinity` requires both `ProcessRights.set_affinity` on slot 0 AND `ThreadHandleRights.set_affinity` on the `thread_handle`; returns `E_PERM` if either is absent. **§4.14.3** `set_affinity` with empty mask returns `E_INVAL`. **§4.14.4** `set_affinity` with invalid core IDs returns `E_INVAL`. **§4.14.5** `set_affinity` with an invalid or wrong-type `thread_handle` returns `E_BADHANDLE`.
 
-### §4.15 pin_exclusive() → handle
+### §4.15 pin_exclusive(thread_handle) → handle
 
-Pins the calling thread exclusively to its current core. **§4.15.1** `pin_exclusive` returns core_pin handle ID (positive) on success. **§4.15.2** `pin_exclusive` requires `pin_exclusive` right — returns `E_PERM` without it. **§4.15.3** `pin_exclusive` without single-core affinity returns `E_INVAL`. **§4.15.4** `pin_exclusive` with multi-core affinity returns `E_INVAL`. **§4.15.5** `pin_exclusive` that would pin all cores returns `E_INVAL`. **§4.15.6** `pin_exclusive` on already-pinned core returns `E_BUSY`. Returns `E_MAXCAP` when the permissions table is full.
+Pins the calling thread exclusively to its current core. **§4.15.1** `pin_exclusive` returns core_pin handle ID (positive) on success. **§4.15.2** `pin_exclusive` requires both `ProcessRights.pin_exclusive` on slot 0 AND `ThreadHandleRights.set_affinity` on the `thread_handle`; returns `E_PERM` if either is absent. **§4.15.3** `pin_exclusive` without single-core affinity returns `E_INVAL`. **§4.15.4** `pin_exclusive` with multi-core affinity returns `E_INVAL`. **§4.15.5** `pin_exclusive` that would pin all cores returns `E_INVAL`. **§4.15.6** `pin_exclusive` on already-pinned core returns `E_BUSY`. **§4.15.7** `pin_exclusive` with a `thread_handle` that does not refer to the calling thread returns `E_INVAL`. **§4.15.8** `pin_exclusive` with an invalid or wrong-type `thread_handle` returns `E_BADHANDLE`. Returns `E_MAXCAP` when the permissions table is full.
 
 ### §4.16 send(r13=target, r14=metadata, payload regs) → status
 
@@ -351,6 +526,46 @@ Reads from a Port I/O device register. Width is 1, 2, or 4 bytes. **§4.27.1** `
 
 Same validation as `ioport_read`. **§4.28.1** `ioport_write` returns `E_OK` on success. **§4.28.2** `ioport_write` with invalid handle returns `E_BADHANDLE`. **§4.28.3** `ioport_write` without `map` right returns `E_PERM`. **§4.28.4** `ioport_write` with bad width returns `E_INVAL`. **§4.28.5** `ioport_write` with `offset + width > port_count` returns `E_INVAL`. **§4.28.6** `ioport_write` on non-`port_io` device returns `E_INVAL`.
 
+### §4.29 thread_self() → handle
+
+**§4.29.1** `thread_self` returns the handle ID of the calling thread as it appears in the calling process's permissions table. No rights check required. Always succeeds with a positive u64.
+
+### §4.30 thread_suspend(thread_handle) → result
+
+**§4.30.1** `thread_suspend` returns `E_OK` on success. **§4.30.2** `thread_suspend` requires the `suspend` right on `thread_handle`; returns `E_PERM` without it. **§4.30.3** `thread_suspend` with invalid or wrong-type `thread_handle` returns `E_BADHANDLE`. **§4.30.4** `thread_suspend` on a thread in `.faulted` state returns `E_BUSY`. **§4.30.5** `thread_suspend` on a thread already in `.suspended` state returns `E_BUSY`. **§4.30.6** `thread_suspend` on a thread in `.exited` state returns `E_BADHANDLE`.
+
+### §4.31 thread_resume(thread_handle) → result
+
+**§4.31.1** `thread_resume` returns `E_OK` on success. **§4.31.2** `thread_resume` requires the `resume` right on `thread_handle`; returns `E_PERM` without it. **§4.31.3** `thread_resume` with invalid or wrong-type `thread_handle` returns `E_BADHANDLE`. **§4.31.4** `thread_resume` on a thread not in `.suspended` state returns `E_INVAL`.
+
+### §4.32 thread_kill(thread_handle) → result
+
+**§4.32.1** `thread_kill` returns `E_OK` on success. **§4.32.2** `thread_kill` requires the `kill` right on `thread_handle`; returns `E_PERM` without it. **§4.32.3** `thread_kill` with invalid or wrong-type `thread_handle` returns `E_BADHANDLE`. **§4.32.4** `thread_kill` on a thread in `.faulted` state returns `E_BUSY`. **§4.32.5** If the killed thread is the last non-exited thread in the process, process exit or restart proceeds per §2.6.
+
+### §4.33 fault_recv(buf_ptr, blocking) → fault_token
+
+**§4.33.1** `fault_recv` returns the fault token (positive u64, equal to the faulting thread's handle ID in the caller's perm table) on success and writes a `FaultMessage` to `buf_ptr`. **§4.33.2** `fault_recv` with `buf_ptr` not pointing to a writable region of at least `sizeof(FaultMessage)` bytes returns `E_BADADDR`. **§4.33.3** `fault_recv` with blocking flag set blocks when the fault box is empty. **§4.33.4** `fault_recv` with blocking flag clear returns `E_AGAIN` when the fault box is empty. **§4.33.5** `fault_recv` returns `E_BUSY` if the fault box is already in `pending_reply` state. **§4.33.6** `fault_recv` returns `E_PERM` if the calling process holds neither its own `fault_handler` ProcessRights nor `fault_handler` on any process handle.
+
+### §4.34 fault_reply(fault_token, action, modified_regs_ptr) → result
+
+`action` values: `FAULT_KILL` (0), `FAULT_RESUME` (1), `FAULT_RESUME_MODIFIED` (2). Flags in r14: `FAULT_EXCLUDE_NEXT`, `FAULT_EXCLUDE_PERMANENT`.
+
+**§4.34.1** `fault_reply` returns `E_OK` on success. **§4.34.2** `fault_reply` returns `E_INVAL` if the fault box is not in `pending_reply` state, if `action` is not a valid value (0, 1, or 2), or if both `FAULT_EXCLUDE_NEXT` and `FAULT_EXCLUDE_PERMANENT` flags are set simultaneously. **§4.34.3** `fault_reply` returns `E_NOENT` if `fault_token` does not match the currently pending thread. **§4.34.4** `fault_reply` with `FAULT_RESUME_MODIFIED` and an unreadable or insufficiently sized `modified_regs_ptr` returns `E_BADADDR`.
+
+### §4.35 fault_read_mem(proc_handle, vaddr, buf_ptr, len) → result
+
+**§4.35.1** `fault_read_mem` returns `E_OK` on success. **§4.35.2** `fault_read_mem` requires the `fault_handler` bit on `proc_handle`; returns `E_PERM` without it. **§4.35.3** `fault_read_mem` with invalid or wrong-type `proc_handle` returns `E_BADHANDLE`. **§4.35.4** `fault_read_mem` with `vaddr` not mapped in the target's address space returns `E_BADADDR`. **§4.35.5** `fault_read_mem` with `buf_ptr` not writable in the caller's address space returns `E_BADADDR`. **§4.35.6** `fault_read_mem` with `len` = 0 returns `E_INVAL`.
+
+### §4.36 fault_write_mem(proc_handle, vaddr, buf_ptr, len) → result
+
+**§4.36.1** `fault_write_mem` returns `E_OK` on success. **§4.36.2** `fault_write_mem` requires the `fault_handler` bit on `proc_handle`; returns `E_PERM` without it. **§4.36.3** `fault_write_mem` with invalid or wrong-type `proc_handle` returns `E_BADHANDLE`. **§4.36.4** `fault_write_mem` with `vaddr` not mapped in the target's address space returns `E_BADADDR`. **§4.36.5** `fault_write_mem` with `buf_ptr` not readable in the caller's address space returns `E_BADADDR`. **§4.36.6** `fault_write_mem` with `len` = 0 returns `E_INVAL`. **§4.36.7** `fault_write_mem` writes to pages mapped read-only in the target succeed; the write is performed via physmap and bypasses the target's page table permission bits.
+
+### §4.37 fault_set_thread_mode(thread_handle, mode) → result
+
+`mode` values: `stop_all` (0), `exclude_next` (1), `exclude_permanent` (2).
+
+**§4.37.1** `fault_set_thread_mode` returns `E_OK` on success. **§4.37.2** `fault_set_thread_mode` requires that the calling process holds `fault_handler` for the owning process of the target thread; returns `E_PERM` otherwise. **§4.37.3** `fault_set_thread_mode` with invalid or wrong-type `thread_handle` returns `E_BADHANDLE`. **§4.37.4** `fault_set_thread_mode` with invalid `mode` value returns `E_INVAL`.
+
 ---
 
 ## §5 System Limits
@@ -369,3 +584,4 @@ Same validation as `ioport_read`. **§4.28.1** `ioport_write` returns `E_OK` on 
 | Futex timed waiter slots | 64 |
 | User permissions view | 1 page (128 entries × 32 bytes) |
 | DMA mappings per process | 16 |
+| Thread handle rights bits | 4 (suspend, resume, kill, set_affinity) |

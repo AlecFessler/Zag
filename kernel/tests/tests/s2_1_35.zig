@@ -25,7 +25,7 @@ pub fn main(pv: u64) void {
         if (view[slot].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS) break;
         syscall.thread_yield();
     }
-    // Crash reason should be unmapped_access (6) since address 0 has no VMM node.
+    // Fault reason should be unmapped_access (6) since address 0 has no VMM node.
     const crash_reason = view[slot].processCrashReason();
     if (view[slot].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS and crash_reason == .unmapped_access) {
         t.pass("§2.1.35");

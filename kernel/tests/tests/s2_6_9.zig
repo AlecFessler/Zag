@@ -6,8 +6,8 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.6.9 — Crash reason is recorded in slot 0 `field0` on restart.
-/// Per §2.6.26, crash reason is written to BOTH the child's own slot 0 AND the
+/// §2.6.9 — Fault reason is recorded in slot 0 `field0` on restart.
+/// Per §2.6.26, fault reason is written to BOTH the child's own slot 0 AND the
 /// parent's entry for the child. Verified here from the parent side; the child's
 /// own slot 0 is verified by child_stack_overflow_restart's internal logic.
 pub fn main(pv: u64) void {

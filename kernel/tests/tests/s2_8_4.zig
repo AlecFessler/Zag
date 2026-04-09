@@ -6,7 +6,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.8.4 — Fault on the underflow guard (below stack) kills with crash reason `stack_overflow` (§3).
+/// §2.8.4 — Fault on the underflow guard (below stack) kills with fault reason `stack_overflow` (§3).
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 

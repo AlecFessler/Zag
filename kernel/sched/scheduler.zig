@@ -14,6 +14,7 @@ const ProcessAllocator = zag.sched.process.ProcessAllocator;
 const SpinLock = zag.sched.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 const ThreadAllocator = zag.sched.thread.ThreadAllocator;
+const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
 const Timer = zag.arch.timer.Timer;
 
 var proc_alloc_instance: ProcessAllocator = undefined;
@@ -54,15 +55,52 @@ const RunQueue = struct {
     }
 
     pub fn dequeue(self: *RunQueue) ?*Thread {
-        const first = self.head.next orelse return null;
-        if (self.tail == first) {
-            self.tail = self.head;
+        // Skip non-runnable threads (suspended, faulted).
+        // .exited is NOT skipped here — those threads continue running until
+        // they hit the scheduler-zombie path on the next preemption.
+        while (true) {
+            const first = self.head.next orelse return null;
+            if (self.tail == first) {
+                self.tail = self.head;
+            }
+            self.head.next = first.next;
+            first.next = null;
+            if (first.state == .suspended or first.state == .faulted) {
+                continue;
+            }
+            return first;
         }
-        self.head.next = first.next;
-        first.next = null;
-        return first;
+    }
+
+    /// Remove `thread` from this queue if present. Returns true if removed.
+    pub fn remove(self: *RunQueue, thread: *Thread) bool {
+        var prev: *Thread = self.head;
+        while (prev.next) |cur| {
+            if (cur == thread) {
+                prev.next = cur.next;
+                if (self.tail == cur) self.tail = prev;
+                cur.next = null;
+                return true;
+            }
+            prev = cur;
+        }
+        return false;
     }
 };
+
+/// Remove `thread` from any core's run queue. Used when a remote thread is
+/// killed while .ready (so we can deinit it without leaving a dangling pointer).
+pub fn removeFromAnyRunQueue(thread: *Thread) void {
+    const count = arch.coreCount();
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        const state = &core_states[i];
+        const irq = state.rq_lock.lockIrqSave();
+        const removed = state.rq.remove(thread);
+        state.rq_lock.unlockIrqRestore(irq);
+        if (removed) return;
+    }
+}
 
 const Zombie = struct {
     thread: *Thread,
@@ -98,11 +136,6 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     const core_id = arch.coreID();
     const state = &core_states[core_id];
 
-    if (state.zombie) |zombie| {
-        zombie.thread.deinit();
-        state.zombie = null;
-    }
-
     const preempted = state.running_thread.?;
 
     // Non-preemptible pinned threads: normally skip the context switch.
@@ -123,6 +156,18 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
 
     preempted.ctx = ctx.thread_ctx;
     preempted.on_cpu.store(false, .release);
+
+    // Clean up the previous-tick zombie AFTER clearing on_cpu. The zombie's
+    // deinit can cascade through lastThreadExited → exit → performRestart →
+    // updateParentView → futex.wake, which spins on the wake target's on_cpu.
+    // If the wake target happens to be the freshly-preempted thread on this
+    // very core (e.g., a parent waiting on the dying child's restart futex),
+    // and we still had on_cpu set, the wake spin would deadlock against
+    // ourselves. Clearing on_cpu first makes the wake's spin a no-op.
+    if (state.zombie) |zombie| {
+        zombie.thread.deinit();
+        state.zombie = null;
+    }
 
     state.rq_lock.lock();
 
@@ -403,7 +448,8 @@ pub fn globalInit(root_service_elf: []const u8) !void {
         .shm_create = true,
         .device_own = true,
         .pin_exclusive = true,
-    }, null);
+        .fault_handler = true,
+    }, null, ThreadHandleRights.full);
     device_registry.grantAllToRootService(root_proc);
     core_states[0].rq.enqueue(root_proc.threads[0]);
 

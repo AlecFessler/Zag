@@ -6,7 +6,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.6.28 — Non-restartable dead process: parent's entry converts to `dead_process` with crash reason and restart count.
+/// §2.6.28 — Non-restartable dead process: parent's entry converts to `dead_process` with fault reason and restart count.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
     // Spawn a non-restartable child that exits immediately

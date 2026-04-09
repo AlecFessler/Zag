@@ -110,6 +110,17 @@ pub fn build(b: *std.Build) void {
     const child_spawn_and_report_bin = buildChild(b, target, lib_mod, "child_spawn_and_report", "children/child_spawn_and_report.zig");
     const child_verify_proc_transfer_bin = buildChild(b, target, lib_mod, "child_verify_proc_transfer", "children/child_verify_proc_transfer.zig");
     const child_try_escalate_bin = buildChild(b, target, lib_mod, "child_try_escalate", "children/child_try_escalate.zig");
+    const child_breakpoint_bin = buildChild(b, target, lib_mod, "child_breakpoint", "children/child_breakpoint.zig");
+    const child_report_thread_self_bin = buildChild(b, target, lib_mod, "child_report_thread_self", "children/child_report_thread_self.zig");
+    const child_report_slot1_bin = buildChild(b, target, lib_mod, "child_report_slot1", "children/child_report_slot1.zig");
+    const child_check_thread_handle_bin = buildChild(b, target, lib_mod, "child_check_thread_handle", "children/child_check_thread_handle.zig");
+    const child_send_self_fault_handler_bin = buildChild(b, target, lib_mod, "child_send_self_fault_handler", "children/child_send_self_fault_handler.zig");
+    const child_fault_after_transfer_bin = buildChild(b, target, lib_mod, "child_fault_after_transfer", "children/child_fault_after_transfer.zig");
+    const child_multithread_fault_after_transfer_bin = buildChild(b, target, lib_mod, "child_multithread_fault_after_transfer", "children/child_multithread_fault_after_transfer.zig");
+    const child_try_fault_recv_bin = buildChild(b, target, lib_mod, "child_try_fault_recv", "children/child_try_fault_recv.zig");
+    const child_try_fault_set_thread_mode_bin = buildChild(b, target, lib_mod, "child_try_fault_set_thread_mode", "children/child_try_fault_set_thread_mode.zig");
+    const child_send_self_then_create_thread_bin = buildChild(b, target, lib_mod, "child_send_self_then_create_thread", "children/child_send_self_then_create_thread.zig");
+    const child_self_handle_multithread_fault_bin = buildChild(b, target, lib_mod, "child_self_handle_multithread_fault", "children/child_self_handle_multithread_fault.zig");
 
     const embedded_wf = b.addWriteFiles();
     _ = embedded_wf.addCopyFile(child_exit_bin, "child_exit.elf");
@@ -175,6 +186,17 @@ pub fn build(b: *std.Build) void {
     _ = embedded_wf.addCopyFile(child_spawn_and_report_bin, "child_spawn_and_report.elf");
     _ = embedded_wf.addCopyFile(child_verify_proc_transfer_bin, "child_verify_proc_transfer.elf");
     _ = embedded_wf.addCopyFile(child_try_escalate_bin, "child_try_escalate.elf");
+    _ = embedded_wf.addCopyFile(child_breakpoint_bin, "child_breakpoint.elf");
+    _ = embedded_wf.addCopyFile(child_report_thread_self_bin, "child_report_thread_self.elf");
+    _ = embedded_wf.addCopyFile(child_report_slot1_bin, "child_report_slot1.elf");
+    _ = embedded_wf.addCopyFile(child_check_thread_handle_bin, "child_check_thread_handle.elf");
+    _ = embedded_wf.addCopyFile(child_send_self_fault_handler_bin, "child_send_self_fault_handler.elf");
+    _ = embedded_wf.addCopyFile(child_fault_after_transfer_bin, "child_fault_after_transfer.elf");
+    _ = embedded_wf.addCopyFile(child_multithread_fault_after_transfer_bin, "child_multithread_fault_after_transfer.elf");
+    _ = embedded_wf.addCopyFile(child_try_fault_recv_bin, "child_try_fault_recv.elf");
+    _ = embedded_wf.addCopyFile(child_try_fault_set_thread_mode_bin, "child_try_fault_set_thread_mode.elf");
+    _ = embedded_wf.addCopyFile(child_send_self_then_create_thread_bin, "child_send_self_then_create_thread.elf");
+    _ = embedded_wf.addCopyFile(child_self_handle_multithread_fault_bin, "child_self_handle_multithread_fault.elf");
     const embed_src = embedded_wf.add("embedded_children.zig",
         \\pub const child_exit = @embedFile("child_exit.elf");
         \\pub const child_shm_counter = @embedFile("child_shm_counter.elf");
@@ -239,6 +261,17 @@ pub fn build(b: *std.Build) void {
         \\pub const child_spawn_and_report = @embedFile("child_spawn_and_report.elf");
         \\pub const child_verify_proc_transfer = @embedFile("child_verify_proc_transfer.elf");
         \\pub const child_try_escalate = @embedFile("child_try_escalate.elf");
+        \\pub const child_breakpoint = @embedFile("child_breakpoint.elf");
+        \\pub const child_report_thread_self = @embedFile("child_report_thread_self.elf");
+        \\pub const child_report_slot1 = @embedFile("child_report_slot1.elf");
+        \\pub const child_check_thread_handle = @embedFile("child_check_thread_handle.elf");
+        \\pub const child_send_self_fault_handler = @embedFile("child_send_self_fault_handler.elf");
+        \\pub const child_fault_after_transfer = @embedFile("child_fault_after_transfer.elf");
+        \\pub const child_multithread_fault_after_transfer = @embedFile("child_multithread_fault_after_transfer.elf");
+        \\pub const child_try_fault_recv = @embedFile("child_try_fault_recv.elf");
+        \\pub const child_try_fault_set_thread_mode = @embedFile("child_try_fault_set_thread_mode.elf");
+        \\pub const child_send_self_then_create_thread = @embedFile("child_send_self_then_create_thread.elf");
+        \\pub const child_self_handle_multithread_fault = @embedFile("child_self_handle_multithread_fault.elf");
         \\
     );
 

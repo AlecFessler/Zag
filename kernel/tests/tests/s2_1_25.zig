@@ -6,7 +6,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.1.25 — `dead_process` entry has the same `field0` encoding as `process` (crash_reason + restart_count).
+/// §2.1.25 — `dead_process` entry has the same `field0` encoding as `process` (fault_reason + restart_count).
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
     const child_rights = perms.ProcessRights{ .spawn_thread = true };
@@ -25,7 +25,7 @@ pub fn main(pv: u64) void {
         if (view[slot].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS) break;
         syscall.thread_yield();
     }
-    // Check field0 encoding: crash_reason(bits 0-4) = normal_exit(12), restart_count(bits 16-31) = 0.
+    // Check field0 encoding: fault_reason(bits 0-4) = normal_exit(12), restart_count(bits 16-31) = 0.
     const crash_reason = view[slot].processCrashReason();
     const restart_count = view[slot].processRestartCount();
     if (view[slot].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS and crash_reason == .normal_exit and restart_count == 0) {

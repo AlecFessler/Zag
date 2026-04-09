@@ -16,7 +16,7 @@ pub fn main(pv: u64) void {
     // which the kernel populates for the root service during boot.
     for (1..128) |i| {
         const etype = view[i].entry_type;
-        if (etype != perm_view.ENTRY_TYPE_EMPTY and etype != perm_view.ENTRY_TYPE_DEVICE_REGION) {
+        if (etype != perm_view.ENTRY_TYPE_EMPTY and etype != perm_view.ENTRY_TYPE_DEVICE_REGION and etype != perm_view.ENTRY_TYPE_THREAD) {
             t.fail("§2.6.23 unexpected non-empty slot");
             syscall.shutdown();
         }

@@ -4,6 +4,7 @@ pub const ENTRY_TYPE_SHARED_MEMORY: u8 = 2;
 pub const ENTRY_TYPE_DEVICE_REGION: u8 = 3;
 pub const ENTRY_TYPE_CORE_PIN: u8 = 4;
 pub const ENTRY_TYPE_DEAD_PROCESS: u8 = 5;
+pub const ENTRY_TYPE_THREAD: u8 = 6;
 pub const ENTRY_TYPE_EMPTY: u8 = 0xFF;
 
 pub const CrashReason = enum(u5) {
@@ -21,7 +22,7 @@ pub const CrashReason = enum(u5) {
     protection_fault = 11,
     normal_exit = 12,
     killed = 13,
-    revoked = 14,
+    breakpoint = 14,
     _,
 };
 
@@ -97,4 +98,14 @@ pub const UserViewEntry = extern struct {
     pub fn fbPixelFormat(self: *const UserViewEntry) u8 {
         return @truncate(self.field1 >> 48);
     }
+
+    pub fn threadState(self: *const UserViewEntry) u8 {
+        return @truncate(self.field0);
+    }
+
+    pub fn threadCoreId(self: *const UserViewEntry) u8 {
+        return @truncate(self.field0 >> 8);
+    }
 };
+
+pub const FaultReason = CrashReason;

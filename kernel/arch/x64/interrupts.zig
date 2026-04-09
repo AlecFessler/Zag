@@ -20,6 +20,7 @@ pub const PageFaultContext = struct {
     is_kernel_privilege: bool,
     is_write: bool,
     is_exec: bool,
+    rip: u64 = 0,
 };
 
 pub const IntVecs = enum(u8) {

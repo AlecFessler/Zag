@@ -7,7 +7,7 @@ const t = lib.testing;
 
 const E_PERM: i64 = -2;
 
-/// §4.15.2 — `pin_exclusive` requires `pin_exclusive` right — returns `E_PERM` without it.
+/// §4.15.2 — `pin_exclusive` requires both `ProcessRights.pin_exclusive` on slot 0 AND `ThreadHandleRights.set_affinity` on the `thread_handle`; returns `E_PERM` if either is absent.
 pub fn main(_: u64) void {
     // Spawn child WITHOUT pin_exclusive right (but with set_affinity for the pre-req)
     const child_rights = (perms.ProcessRights{ .set_affinity = true }).bits();

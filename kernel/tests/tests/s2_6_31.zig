@@ -8,7 +8,7 @@ const t = lib.testing;
 
 /// §2.6.31 — Non-recursive kill of a non-restartable process with children makes it a zombie.
 /// When a process with children exits (last thread exits), it becomes a zombie.
-/// Parent sees dead_process with crash_reason normal_exit. Then revoke cleans up.
+/// Parent sees dead_process with fault_reason normal_exit. Then revoke cleans up.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 

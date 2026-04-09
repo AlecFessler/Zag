@@ -5,6 +5,7 @@ const zag = @import("zag");
 const intrusive_freelist = zag.memory.intrusive_freelist;
 const rbt = zag.containers.red_black_tree;
 const slab_alloc = zag.memory.slab_allocator;
+const SpinLock = zag.sched.sync.SpinLock;
 
 pub const AllocFooter = packed struct(u64) {
     header: u64,
@@ -24,6 +25,7 @@ pub const HeapAllocator = struct {
     commit_end: u64,
     reserve_end: u64,
     free_tree: RedBlackTree,
+    lock: SpinLock = .{},
 
     pub fn init(
         reserve_start: u64,
@@ -64,6 +66,8 @@ pub const HeapAllocator = struct {
         _ = ret_addr;
 
         const self: *HeapAllocator = @ptrCast(@alignCast(ptr));
+        self.lock.lock();
+        defer self.lock.unlock();
 
         std.debug.assert(std.mem.isAligned(self.commit_end, HEADER_ALIGN));
 
@@ -374,6 +378,8 @@ pub const HeapAllocator = struct {
         _ = ret_addr;
 
         const self: *HeapAllocator = @ptrCast(@alignCast(ptr));
+        self.lock.lock();
+        defer self.lock.unlock();
 
         const user_base: u64 = @intCast(@intFromPtr(buf.ptr));
         const padding_base = user_base - PADDING_SIZE;

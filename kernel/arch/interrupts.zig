@@ -12,7 +12,7 @@ const scheduler = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
 const x64 = zag.arch.x64;
 
-const CrashReason = zag.perms.permissions.CrashReason;
+const FaultReason = zag.perms.permissions.FaultReason;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
@@ -53,13 +53,13 @@ fn demandPageKernel(faulting_virt: VAddr) void {
         @panic("mapPage failed in kernel demand page fault");
 }
 
-fn accessReason(is_write: bool, is_exec: bool) CrashReason {
+fn accessReason(is_write: bool, is_exec: bool) FaultReason {
     if (is_exec) return .invalid_execute;
     if (is_write) return .invalid_write;
     return .invalid_read;
 }
 
-fn guardPageReason(proc: anytype, node_start: u64) CrashReason {
+fn guardPageReason(proc: anytype, node_start: u64) FaultReason {
     const above = proc.vmm.findNode(VAddr.fromInt(node_start + paging.PAGE4K));
     if (above != null and above.?.rights.write) {
         return .stack_overflow;
@@ -107,6 +107,11 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
 
     const node = proc.vmm.findNode(faulting_virt) orelse {
         arch.print("K: USER_PF pid={d} addr=0x{x} w={} x={}\n", .{ proc.pid, faulting_virt.addr, is_write, is_exec });
+        if (proc.faultBlock(thread, .unmapped_access, faulting_virt.addr, fault.rip)) {
+            arch.enableInterrupts();
+            scheduler.yield();
+            return;
+        }
         proc.kill(.unmapped_access);
         arch.enableInterrupts();
         while (true) arch.halt();
@@ -114,7 +119,13 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
 
     switch (node.kind) {
         .shared_memory, .mmio => {
-            proc.kill(accessReason(is_write, is_exec));
+            const r = accessReason(is_write, is_exec);
+            if (proc.faultBlock(thread, r, faulting_virt.addr, fault.rip)) {
+                arch.enableInterrupts();
+                scheduler.yield();
+                return;
+            }
+            proc.kill(r);
             arch.enableInterrupts();
             while (true) arch.halt();
         },
@@ -126,11 +137,16 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
             };
 
             if (!rights_ok) {
-                if (!node.rights.read and !node.rights.write and !node.rights.execute and node.size == paging.PAGE4K) {
-                    proc.kill(guardPageReason(proc, node.start.addr));
-                } else {
-                    proc.kill(accessReason(is_write, is_exec));
+                const r2 = if (!node.rights.read and !node.rights.write and !node.rights.execute and node.size == paging.PAGE4K)
+                    guardPageReason(proc, node.start.addr)
+                else
+                    accessReason(is_write, is_exec);
+                if (proc.faultBlock(thread, r2, faulting_virt.addr, fault.rip)) {
+                    arch.enableInterrupts();
+                    scheduler.yield();
+                    return;
                 }
+                proc.kill(r2);
                 arch.enableInterrupts();
                 while (true) arch.halt();
             }

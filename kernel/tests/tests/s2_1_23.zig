@@ -6,7 +6,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.1.23 — After restart, `crash_reason` in `field0` reflects the triggering fault.
+/// §2.1.23 — After restart, `fault_reason` in `field0` reflects the triggering fault.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
@@ -26,7 +26,7 @@ pub fn main(pv: u64) void {
     var reply: syscall.IpcMessage = .{};
     _ = syscall.ipc_call_cap(child_handle, &.{ shm_handle, shm_rights.bits() }, &reply);
 
-    // Wait for child to report crash info after restart (crash_reason_slot at base+8).
+    // Wait for child to report fault info after restart (fault_reason_slot at base+8).
     const crash_reason_ptr: *u64 = @ptrFromInt(vm.val2 + 8);
     t.waitUntilNonZero(crash_reason_ptr);
 
@@ -40,7 +40,7 @@ pub fn main(pv: u64) void {
     }
     const parent_crash_reason = view[slot].processCrashReason();
 
-    // Stack overflow should give crash reason = stack_overflow (1).
+    // Stack overflow should give fault_reason = stack_overflow (1).
     if (parent_crash_reason == .stack_overflow) {
         t.pass("§2.1.23");
     } else {

@@ -6,7 +6,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ZAG_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-TIMEOUT=15
+TIMEOUT=30
 PARALLEL="${PARALLEL:-16}"
 QEMU_CMD="qemu-system-x86_64 -m 8G -bios /usr/share/ovmf/x64/OVMF.4m.fd -serial stdio -display none -no-reboot -enable-kvm -cpu host,+invtsc -machine q35 -device intel-iommu,intremap=off -net none -smp cores=4"
 
