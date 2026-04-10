@@ -8,7 +8,7 @@ const t = lib.testing;
 
 const E_AGAIN: i64 = -9;
 
-/// §2.12.1 — `ProcessRights` bit 8 is `fault_handler`.
+/// §2.12.1 — `ProcessRights` bit 7 is `fault_handler`.
 ///
 /// When set on a process's slot 0, the process handles its own faults in
 /// its own fault box. This bit is granted at `proc_create` time if
