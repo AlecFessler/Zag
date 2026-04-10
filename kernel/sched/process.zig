@@ -1158,25 +1158,28 @@ pub const Process = struct {
     /// `dead_process`. Called from doExit (zombie path) and cleanupPhase2
     /// (leaf path), and also lazily from IPC paths when a send/call
     /// discovers the target is dead.
+    /// Convert ALL live `process` entries for `child` in `holder`'s perm
+    /// table to `dead_process`. A holder can have multiple handles to the
+    /// same child (e.g. one from proc_create, another from cap transfer).
     pub fn convertToDeadProcess(holder: *Process, child: *Process) void {
         holder.perm_lock.lock();
         defer holder.perm_lock.unlock();
+        var converted = false;
         for (holder.perm_table[1..], 1..) |*slot, idx| {
             const matches = switch (slot.object) {
                 .process => |p| @intFromPtr(p) == @intFromPtr(child),
                 else => false,
             };
             if (matches) {
-                // Refcount stays the same — still one reference, just different type
                 slot.object = .{ .dead_process = child };
-                holder.syncUserView();
+                converted = true;
                 if (holder.perm_view_phys.addr != 0) {
                     const field0_pa = PAddr.fromInt(holder.perm_view_phys.addr + idx * @sizeOf(UserViewEntry) + @offsetOf(UserViewEntry, "field0"));
                     _ = futex.wake(field0_pa, 1);
                 }
-                return;
             }
         }
+        if (converted) holder.syncUserView();
     }
 
     pub fn addDmaMapping(self: *Process, device: *DeviceRegion, shm: *SharedMemory, dma_base: u64, num_pages: u64) !void {
