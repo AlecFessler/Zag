@@ -124,7 +124,7 @@ fn tryStealWork(my_core_id: u64) ?*Thread {
             if (i == my_core_id) continue;
             // Skip pinned cores
             if (pinned & (@as(u64, 1) << @intCast(i)) != 0) continue;
-            const candidate = core_states[i].rq.pq.peekHighestStealable(my_core_id);
+            const candidate = core_states[i].rq.pq.peekHighestStealable(@intCast(my_core_id));
             if (candidate) |c| {
                 if (best_thread == null) {
                     best_thread = c;
@@ -570,9 +570,8 @@ pub fn globalInit(root_service_elf: []const u8) !void {
         .restart = true,
         .shm_create = true,
         .device_own = true,
-        .pin_exclusive = true,
         .fault_handler = true,
-    }, null, ThreadHandleRights.full);
+    }, null, ThreadHandleRights.full, .pinned);
     device_registry.grantAllToRootService(root_proc);
     core_states[0].rq.enqueue(root_proc.threads[0]);
 

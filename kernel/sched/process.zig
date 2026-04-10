@@ -229,19 +229,7 @@ pub const Process = struct {
                 }
             }
         }
-        var prev: ?*Thread = null;
-        var cur = self.fault_box.queue_head;
-        while (cur) |t| {
-            const next_t = t.next;
-            if (t.process == target) {
-                if (prev) |p| p.next = next_t else self.fault_box.queue_head = next_t;
-                if (self.fault_box.queue_tail == t) self.fault_box.queue_tail = prev;
-                t.next = null;
-            } else {
-                prev = t;
-            }
-            cur = next_t;
-        }
+        self.fault_box.drainByProcessLocked(target);
         self.fault_box.lock.unlock();
 
         // §2.12.35: re-evaluate target's threads under self-handling.
@@ -854,11 +842,7 @@ pub const Process = struct {
         else
             null;
         if (restored_caller) |pc| {
-            pc.next = self.msg_box.queue_head;
-            self.msg_box.queue_head = pc;
-            if (self.msg_box.queue_tail == null) {
-                self.msg_box.queue_tail = pc;
-            }
+            self.msg_box.enqueueFrontLocked(pc);
         }
         if (self.msg_box.isReceiving()) {
             _ = self.msg_box.takeReceiverLocked();
@@ -894,19 +878,7 @@ pub const Process = struct {
                     }
                 }
             }
-            var prev: ?*Thread = null;
-            var cur = handler.fault_box.queue_head;
-            while (cur) |t| {
-                const next_t = t.next;
-                if (t.process == self) {
-                    if (prev) |p| p.next = next_t else handler.fault_box.queue_head = next_t;
-                    if (handler.fault_box.queue_tail == t) handler.fault_box.queue_tail = prev;
-                    t.next = null;
-                } else {
-                    prev = t;
-                }
-                cur = next_t;
-            }
+            handler.fault_box.drainByProcessLocked(self);
             handler.fault_box.lock.unlock();
         }
 
@@ -1077,19 +1049,7 @@ pub const Process = struct {
                 }
             }
             // Drain any of our queued threads from the handler's box.
-            var prev: ?*Thread = null;
-            var cur = handler.fault_box.queue_head;
-            while (cur) |t| {
-                const next_t = t.next;
-                if (t.process == self) {
-                    if (prev) |p| p.next = next_t else handler.fault_box.queue_head = next_t;
-                    if (handler.fault_box.queue_tail == t) handler.fault_box.queue_tail = prev;
-                    t.next = null;
-                } else {
-                    prev = t;
-                }
-                cur = next_t;
-            }
+            handler.fault_box.drainByProcessLocked(self);
             handler.fault_box.lock.unlock();
             self.fault_handler_proc = null;
         }

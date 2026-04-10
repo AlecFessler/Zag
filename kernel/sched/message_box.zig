@@ -63,6 +63,20 @@ pub const MessageBox = struct {
         return self.waiters.remove(target);
     }
 
+    /// Insert at the front of the thread's priority level in the wait
+    /// queue. Used when a dequeued waiter must be put back without
+    /// losing its place (e.g. IPC cap-transfer failure rollback).
+    /// Caller must hold `self.lock`.
+    pub fn enqueueFrontLocked(self: *MessageBox, sender: *Thread) void {
+        self.waiters.enqueueFront(sender);
+    }
+
+    /// Remove all threads belonging to `proc` from the wait queue.
+    /// Caller must hold `self.lock`.
+    pub fn drainByProcessLocked(self: *MessageBox, proc: anytype) void {
+        _ = self.waiters.removeByProcess(proc);
+    }
+
     /// Transition to `receiving` state with `thread` as the blocked
     /// receiver. Caller must hold `self.lock` and must have already
     /// verified `state == .idle` and the wait queue is empty.

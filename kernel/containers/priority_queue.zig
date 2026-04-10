@@ -86,6 +86,49 @@ pub const PriorityQueue = struct {
         return null;
     }
 
+    /// Insert at the front of the thread's priority level. Used when a
+    /// dequeued waiter must be re-queued without losing its place (e.g.
+    /// IPC cap-transfer failure rollback).
+    pub fn enqueueFront(self: *PriorityQueue, thread: *Thread) void {
+        std.debug.assert(thread.next == null);
+        const idx = @intFromEnum(thread.priority);
+        const level = &self.levels[idx];
+        thread.next = level.head;
+        level.head = thread;
+        if (level.tail == null) {
+            level.tail = thread;
+        }
+    }
+
+    /// Remove all threads belonging to `proc` from the queue.
+    /// Returns the number of threads removed.
+    pub fn removeByProcess(self: *PriorityQueue, proc: anytype) u32 {
+        var count: u32 = 0;
+        for (&self.levels) |*level| {
+            var prev: ?*Thread = null;
+            var cur = level.head;
+            while (cur) |c| {
+                const next = c.next;
+                if (c.process == proc) {
+                    if (prev) |p| {
+                        p.next = next;
+                    } else {
+                        level.head = next;
+                    }
+                    if (level.tail == c) {
+                        level.tail = prev;
+                    }
+                    c.next = null;
+                    count += 1;
+                } else {
+                    prev = c;
+                }
+                cur = next;
+            }
+        }
+        return count;
+    }
+
     pub fn isEmpty(self: *const PriorityQueue) bool {
         for (self.levels) |level| {
             if (level.head != null) return false;

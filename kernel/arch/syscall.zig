@@ -11,6 +11,7 @@ const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
+const Priority = zag.sched.thread.Priority;
 const Process = zag.sched.process.Process;
 const memory_init = zag.memory.init;
 const process_mod = zag.sched.process;
@@ -115,7 +116,7 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
         .thread_create => .{ .rax = sysThreadCreate(arg0, arg1, arg2) },
         .thread_exit => sysThreadExit(),
         .thread_yield => .{ .rax = sysThreadYield() },
-        .set_affinity => .{ .rax = sysSetAffinity(arg0, arg1) },
+        .set_affinity => .{ .rax = sysSetAffinity(arg0) },
         .revoke_perm => .{ .rax = sysRevokePerm(arg0) },
         .disable_restart => .{ .rax = sysDisableRestart() },
         .futex_wait => .{ .rax = sysFutexWait(arg0, arg1, arg2) },
@@ -125,7 +126,7 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
         .ioport_write => .{ .rax = sysIoportWrite(arg0, arg1, arg2, arg3) },
         .dma_map => .{ .rax = sysDmaMap(arg0, arg1) },
         .dma_unmap => .{ .rax = sysDmaUnmap(arg0, arg1) },
-        .pin_exclusive => .{ .rax = sysPinExclusive(arg0) },
+        .pin_exclusive => .{ .rax = sysSetPriority(arg0) },
         .ipc_send => sysIpcSend(ctx),
         .ipc_call => sysIpcCall(ctx),
         .ipc_recv => sysIpcRecv(ctx),
@@ -433,7 +434,7 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_arg: 
     const user_bytes: [*]const u8 = @ptrFromInt(elf_ptr);
     @memcpy(elf_copy, user_bytes[0..elf_len]);
 
-    const child = Process.create(elf_copy, child_perms, proc, thr_rights) catch |e| return switch (e) {
+    const child = Process.create(elf_copy, child_perms, proc, thr_rights, .normal) catch |e| return switch (e) {
         error.InvalidElf => E_INVAL,
         error.OutOfKernelStacks, error.TooManyChildren => E_NORES,
         else => E_NOMEM,
@@ -525,7 +526,7 @@ fn sysThreadYield() i64 {
     return E_OK;
 }
 
-fn sysSetAffinity(thread_handle: u64, core_mask: u64) i64 {
+fn sysSetAffinity(core_mask: u64) i64 {
     if (core_mask == 0) return E_INVAL;
     const count = arch.coreCount();
     const valid_mask: u64 = if (count >= 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(count)) - 1;
@@ -535,12 +536,11 @@ fn sysSetAffinity(thread_handle: u64, core_mask: u64) i64 {
     const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
     if (!self_entry.processRights().set_affinity) return E_PERM;
 
-    // Look up thread handle
-    const thr_entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
-    if (thr_entry.object != .thread) return E_BADCAP;
-    if (!thr_entry.threadHandleRights().set_affinity) return E_PERM;
+    const thread = sched.currentThread().?;
+    // Cannot change affinity while pinned
+    if (thread.priority == .pinned) return E_BUSY;
 
-    thr_entry.object.thread.core_affinity = core_mask;
+    thread.core_affinity = core_mask;
     return E_OK;
 }
 
@@ -575,7 +575,7 @@ fn sysRevokePerm(handle: u64) i64 {
             Process.returnDeviceHandleUpTree(proc, entry.rights, device);
         },
         .core_pin => |cp| {
-            sched.unpinByRevoke(cp.core_id, cp.thread_tid);
+            sched.unpinByRevoke(cp.core_id, 0);
             proc.removePerm(handle) catch {};
         },
         .process => |child| {
@@ -722,38 +722,91 @@ fn sysDmaMap(device_handle: u64, shm_handle: u64) i64 {
     } else return E_NOMEM;
 }
 
-fn sysPinExclusive(thread_handle: u64) i64 {
+fn sysSetPriority(priority_raw: u64) i64 {
+    if (priority_raw > 4) return E_INVAL;
+    const new_priority: Priority = @enumFromInt(@as(u3, @truncate(priority_raw)));
+
     const proc = currentProc();
     const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
-    if (!self_entry.processRights().pin_exclusive) return E_PERM;
-
-    // Look up thread handle
-    const thr_entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
-    if (thr_entry.object != .thread) return E_BADCAP;
-    if (!thr_entry.threadHandleRights().set_affinity) return E_PERM;
+    if (!self_entry.processRights().set_affinity) return E_PERM;
 
     const thread = sched.currentThread().?;
-    // Thread handle must refer to the calling thread
-    if (thr_entry.object.thread != thread) return E_INVAL;
 
-    const pin_result = sched.pinExclusive(thread);
-    if (pin_result < 0) return pin_result;
+    // Check against process ceiling
+    if (@intFromEnum(new_priority) > @intFromEnum(proc.max_thread_priority)) return E_PERM;
 
-    const core_id: u64 = @intCast(pin_result);
-    const entry = PermissionEntry{
-        .handle = 0,
-        .object = .{ .core_pin = .{
-            .core_id = core_id,
-            .thread_tid = thread.tid,
-        } },
-        .rights = 0,
-    };
-    const handle_id = proc.insertPerm(entry) catch {
-        _ = sched.unpinExclusive(thread);
-        return E_MAXCAP;
-    };
+    const currently_pinned = thread.priority == .pinned;
 
-    return @intCast(handle_id);
+    if (new_priority == .pinned) {
+        // Pinning: scan affinity mask ascending for available core
+        const affinity = thread.core_affinity orelse return E_INVAL;
+        if (affinity == 0) return E_INVAL;
+
+        // Save pre-pin state before modifying
+        thread.pre_pin_priority = thread.priority;
+        thread.pre_pin_affinity = thread.core_affinity;
+
+        // Find a single core in the affinity mask
+        var mask = affinity;
+        while (mask != 0) {
+            const core_idx: u6 = @truncate(@ctz(mask));
+            const core_bit = @as(u64, 1) << core_idx;
+
+            // Set single-core affinity for pinExclusive
+            thread.core_affinity = core_bit;
+            const pin_result = sched.pinExclusive(thread);
+            if (pin_result >= 0) {
+                thread.priority = .pinned;
+                const core_id: u64 = @intCast(pin_result);
+                const entry = PermissionEntry{
+                    .handle = 0,
+                    .object = .{ .core_pin = .{
+                        .core_id = core_id,
+                    } },
+                    .rights = 0,
+                };
+                const handle_id = proc.insertPerm(entry) catch {
+                    _ = sched.unpinExclusive(thread);
+                    thread.core_affinity = affinity;
+                    thread.priority = thread.pre_pin_priority;
+                    return E_MAXCAP;
+                };
+                return @intCast(handle_id);
+            }
+
+            // This core was busy, try next one in mask
+            mask &= ~core_bit;
+        }
+
+        // All affinity cores have pinned owners
+        thread.core_affinity = affinity;
+        return E_BUSY;
+    }
+
+    // Non-pinned priority level
+    if (currently_pinned) {
+        // Implicitly unpin: revoke core_pin, restore affinity, then apply new priority
+        // Find and revoke the core_pin handle
+        proc.perm_lock.lock();
+        for (&proc.perm_table) |*slot| {
+            if (slot.object == .core_pin) {
+                const cp = slot.object.core_pin;
+                sched.unpinByRevoke(cp.core_id, 0);
+                slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
+                proc.perm_count -= 1;
+                break;
+            }
+        }
+        proc.syncUserView();
+        proc.perm_lock.unlock();
+
+        // Restore saved affinity
+        thread.core_affinity = thread.pre_pin_affinity;
+        thread.pre_pin_affinity = null;
+    }
+
+    thread.priority = new_priority;
+    return E_OK;
 }
 
 // --- Thread Handle Syscalls ---
@@ -1872,11 +1925,7 @@ fn sysIpcRecv(ctx: *ArchCpuContext) SyscallResult {
             const cap_result = transferCapability(waiter.process, proc, cap.handle, cap.rights);
             if (cap_result != E_OK) {
                 // Put waiter back at head of the queue.
-                waiter.next = proc.msg_box.queue_head;
-                proc.msg_box.queue_head = waiter;
-                if (proc.msg_box.queue_tail == null) {
-                    proc.msg_box.queue_tail = waiter;
-                }
+                proc.msg_box.enqueueFrontLocked(waiter);
                 proc.msg_box.lock.unlock();
                 return .{ .rax = cap_result };
             }
@@ -1960,11 +2009,7 @@ fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
                 const cap = getCapPayload(waiter.ctx, waiter_meta.word_count);
                 const cap_result = transferCapability(waiter.process, proc, cap.handle, cap.rights);
                 if (cap_result != E_OK) {
-                    waiter.next = proc.msg_box.queue_head;
-                    proc.msg_box.queue_head = waiter;
-                    if (proc.msg_box.queue_tail == null) {
-                        proc.msg_box.queue_tail = waiter;
-                    }
+                    proc.msg_box.enqueueFrontLocked(waiter);
                     proc.msg_box.lock.unlock();
                     if (caller_thread) |ct| wakeThread(ct);
                     return .{ .rax = cap_result };
