@@ -3,37 +3,31 @@ const lib = @import("lib");
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const E_INVAL: i64 = -1;
+const E_MAXCAP: i64 = -9;
 
-var ready: u64 align(8) = 0;
+/// `set_priority(.pinned)` returns `E_MAXCAP` if the permissions table is full.
+pub fn main(perm_view: u64) void {
+    _ = perm_view;
 
-fn otherThread() void {
-    // Signal that this thread is running.
-    @as(*volatile u64, @ptrCast(&ready)).* = 1;
-    _ = syscall.futex_wake(@ptrCast(&ready), 1);
-    // Keep alive so the handle remains valid.
-    while (true) {
-        syscall.thread_yield();
-    }
-}
-
-/// §4.15.7 — `pin_exclusive` with a `thread_handle` that does not refer to the calling thread returns `E_INVAL`.
-pub fn main(_: u64) void {
-    // Set affinity to single core first (required for pin_exclusive).
-    _ = syscall.set_affinity_thread(@bitCast(syscall.thread_self()), 0b1);
-
-    // Create a second thread and get its handle.
-    const other_handle = syscall.thread_create(&otherThread, 0, 4);
-    if (other_handle <= 0) {
-        t.failWithVal("§4.15.7 thread_create", 1, other_handle);
-        syscall.shutdown();
+    // Fill the perm table by creating SHM handles. The table has 128 slots;
+    // some are already occupied (slot 0 = process, slot 1 = main thread, etc.).
+    // Create enough to fill it.
+    var created: u64 = 0;
+    for (0..128) |_| {
+        const ret = syscall.shm_create(syscall.PAGE4K);
+        if (ret < 0) break;
+        created += 1;
     }
 
-    // Wait for the other thread to be running.
-    t.waitUntilNonZero(&ready);
+    // Table should now be full. Try to pin → E_MAXCAP (needs a new slot for core_pin).
+    _ = syscall.set_affinity(0b1);
+    const ret = syscall.set_priority(syscall.PRIORITY_PINNED);
+    t.expectEqual("§4.15.7", E_MAXCAP, ret);
 
-    // Try to pin_exclusive with the other thread's handle (not the calling thread).
-    const ret = syscall.pin_exclusive_thread(@bitCast(other_handle));
-    t.expectEqual("§4.15.7", E_INVAL, ret);
+    // Verify we actually filled the table (sanity check).
+    if (created == 0) {
+        t.fail("§4.15.7 sanity: no SHM handles created");
+    }
+
     syscall.shutdown();
 }

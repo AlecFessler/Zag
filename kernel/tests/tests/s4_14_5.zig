@@ -3,17 +3,22 @@ const lib = @import("lib");
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const E_BADHANDLE: i64 = -3;
+const E_BUSY: i64 = -11;
 
-/// §4.14.5 — `set_affinity` with an invalid or wrong-type `thread_handle` returns `E_BADHANDLE`.
-pub fn main(_: u64) void {
-    // Test with a garbage handle value.
-    const ret1 = syscall.set_affinity_thread(0xDEAD, 0b1);
-    t.expectEqual("§4.14.5 garbage handle", E_BADHANDLE, ret1);
-
-    // Test with HANDLE_SELF (slot 0 = process handle, wrong type).
-    const ret2 = syscall.set_affinity_thread(0, 0b1);
-    t.expectEqual("§4.14.5 wrong type (process)", E_BADHANDLE, ret2);
-
+/// `set_affinity` returns `E_BUSY` if the calling thread is currently pinned.
+pub fn main(perm_view: u64) void {
+    _ = perm_view;
+    // Set single-core affinity, then pin.
+    _ = syscall.set_affinity(0b1);
+    const pin_ret = syscall.set_priority(syscall.PRIORITY_PINNED);
+    if (pin_ret <= 0) {
+        t.failWithVal("§4.14.5 setup pin", 1, pin_ret);
+        syscall.shutdown();
+    }
+    // Now try to change affinity while pinned.
+    const ret = syscall.set_affinity(0x1);
+    t.expectEqual("§4.14.5", E_BUSY, ret);
+    // Clean up: revoke pin handle.
+    _ = syscall.revoke_perm(@bitCast(pin_ret));
     syscall.shutdown();
 }

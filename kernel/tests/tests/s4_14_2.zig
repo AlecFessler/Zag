@@ -7,41 +7,18 @@ const t = lib.testing;
 
 const E_PERM: i64 = -2;
 
-/// §4.14.2 — `set_affinity` requires both `ProcessRights.set_affinity` on slot 0 AND `ThreadHandleRights.set_affinity` on the `thread_handle`; returns `E_PERM` if either is absent.
-///
-/// Covers both branches (process bit missing, then thread-handle bit missing).
+/// `set_affinity` requires `ProcessRights.set_affinity` on slot 0; returns `E_PERM` if absent.
 pub fn main(_: u64) void {
-    // -- Branch 1: missing ProcessRights.set_affinity (thread_rights full). --
-    const p1_rights = perms.ProcessRights{};
-    const ch1: u64 = @bitCast(@as(i64, syscall.proc_create_with_thread_rights(
+    // Spawn child WITHOUT ProcessRights.set_affinity.
+    const rights = perms.ProcessRights{};
+    const ch: u64 = @bitCast(@as(i64, syscall.proc_create(
         @intFromPtr(children.child_try_affinity.ptr),
         children.child_try_affinity.len,
-        p1_rights.bits(),
-        (perms.ThreadHandleRights.full).bits(),
+        rights.bits(),
     )));
-    var reply1: syscall.IpcMessage = .{};
-    _ = syscall.ipc_call(ch1, &.{}, &reply1);
-    const r1: i64 = @bitCast(reply1.words[0]);
-    t.expectEqual("§4.14.2 missing ProcessRights.set_affinity", E_PERM, r1);
-
-    // -- Branch 2: process has the bit, but the thread handle lacks it. --
-    const p2_rights = perms.ProcessRights{ .set_affinity = true };
-    const t2_rights = perms.ThreadHandleRights{
-        .@"suspend" = true,
-        .@"resume" = true,
-        .kill = true,
-        .set_affinity = false,
-    };
-    const ch2: u64 = @bitCast(@as(i64, syscall.proc_create_with_thread_rights(
-        @intFromPtr(children.child_try_affinity.ptr),
-        children.child_try_affinity.len,
-        p2_rights.bits(),
-        t2_rights.bits(),
-    )));
-    var reply2: syscall.IpcMessage = .{};
-    _ = syscall.ipc_call(ch2, &.{}, &reply2);
-    const r2: i64 = @bitCast(reply2.words[0]);
-    t.expectEqual("§4.14.2 missing ThreadHandleRights.set_affinity", E_PERM, r2);
-
+    var reply: syscall.IpcMessage = .{};
+    _ = syscall.ipc_call(ch, &.{}, &reply);
+    const result: i64 = @bitCast(reply.words[0]);
+    t.expectEqual("§4.14.2", E_PERM, result);
     syscall.shutdown();
 }

@@ -3,10 +3,9 @@ const lib = @import("lib");
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §4.14.1 — `set_affinity` returns `E_OK` on success.
+/// `set_affinity` returns `E_OK` on success.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
-    // Set affinity to core 0 only.
     const ret = syscall.set_affinity(0x1);
     t.expectEqual("§4.14.1", 0, ret);
     syscall.shutdown();

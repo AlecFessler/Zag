@@ -1,17 +1,24 @@
+const children = @import("embedded_children");
 const lib = @import("lib");
 
+const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §4.15.1 — `pin_exclusive` returns core_pin handle ID (positive) on success.
-pub fn main(perm_view: u64) void {
-    _ = perm_view;
-    _ = syscall.set_affinity(0b1);
-    const ret = syscall.pin_exclusive();
-    if (ret > 0) {
-        t.pass("§4.15.1");
-    } else {
-        t.failWithVal("§4.15.1", 1, ret);
-    }
+const E_PERM: i64 = -2;
+
+/// `set_priority` requires `ProcessRights.set_affinity` on slot 0; returns `E_PERM` if absent.
+pub fn main(_: u64) void {
+    // Spawn child WITHOUT ProcessRights.set_affinity.
+    const rights = perms.ProcessRights{};
+    const ch: u64 = @bitCast(@as(i64, syscall.proc_create(
+        @intFromPtr(children.child_sched_set_priority.ptr),
+        children.child_sched_set_priority.len,
+        rights.bits(),
+    )));
+    var reply: syscall.IpcMessage = .{};
+    _ = syscall.ipc_call(ch, &.{syscall.PRIORITY_NORMAL}, &reply);
+    const result: i64 = @bitCast(reply.words[0]);
+    t.expectEqual("§4.15.1", E_PERM, result);
     syscall.shutdown();
 }

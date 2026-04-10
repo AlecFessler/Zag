@@ -82,6 +82,7 @@ pub fn build(b: *std.Build) void {
     const child_try_thread_create_bin = buildChild(b, target, lib_mod, "child_try_thread_create", "children/child_try_thread_create.zig");
     const child_try_proc_create_bin = buildChild(b, target, lib_mod, "child_try_proc_create", "children/child_try_proc_create.zig");
     const child_try_pin_exclusive_bin = buildChild(b, target, lib_mod, "child_try_pin_exclusive", "children/child_try_pin_exclusive.zig");
+    const child_sched_set_priority_bin = buildChild(b, target, lib_mod, "child_sched_set_priority", "children/child_sched_set_priority.zig");
     const child_send_self_no_words_bin = buildChild(b, target, lib_mod, "child_send_self_no_words", "children/child_send_self_no_words.zig");
     const child_recv_device_exit_bin = buildChild(b, target, lib_mod, "child_recv_device_exit", "children/child_recv_device_exit.zig");
     const child_spawner_device_bin = buildChild(b, target, lib_mod, "child_spawner_device", "children/child_spawner_device.zig");
@@ -168,6 +169,7 @@ pub fn build(b: *std.Build) void {
     const child_iter1_c_late_recv_bin = buildChild(b, target, lib_mod, "child_iter1_c_late_recv", "children/child_iter1_c_late_recv.zig");
     const child_iter1_c_reply_clears_bin = buildChild(b, target, lib_mod, "child_iter1_c_reply_clears", "children/child_iter1_c_reply_clears.zig");
     const child_iter1_c_full_table_receiver_bin = buildChild(b, target, lib_mod, "child_iter1_c_full_table_receiver", "children/child_iter1_c_full_table_receiver.zig");
+    const child_try_set_priority_bin = buildChild(b, target, lib_mod, "child_try_set_priority", "children/child_try_set_priority.zig");
 
     const embedded_wf = b.addWriteFiles();
     _ = embedded_wf.addCopyFile(child_exit_bin, "child_exit.elf");
@@ -205,6 +207,7 @@ pub fn build(b: *std.Build) void {
     _ = embedded_wf.addCopyFile(child_try_thread_create_bin, "child_try_thread_create.elf");
     _ = embedded_wf.addCopyFile(child_try_proc_create_bin, "child_try_proc_create.elf");
     _ = embedded_wf.addCopyFile(child_try_pin_exclusive_bin, "child_try_pin_exclusive.elf");
+    _ = embedded_wf.addCopyFile(child_sched_set_priority_bin, "child_sched_set_priority.elf");
     _ = embedded_wf.addCopyFile(child_send_self_no_words_bin, "child_send_self_no_words.elf");
     _ = embedded_wf.addCopyFile(child_recv_device_exit_bin, "child_recv_device_exit.elf");
     _ = embedded_wf.addCopyFile(child_spawner_device_bin, "child_spawner_device.elf");
@@ -327,6 +330,7 @@ pub fn build(b: *std.Build) void {
         \\pub const child_try_thread_create = @embedFile("child_try_thread_create.elf");
         \\pub const child_try_proc_create = @embedFile("child_try_proc_create.elf");
         \\pub const child_try_pin_exclusive = @embedFile("child_try_pin_exclusive.elf");
+        \\pub const child_sched_set_priority = @embedFile("child_sched_set_priority.elf");
         \\pub const child_send_self_no_words = @embedFile("child_send_self_no_words.elf");
         \\pub const child_recv_device_exit = @embedFile("child_recv_device_exit.elf");
         \\pub const child_spawner_device = @embedFile("child_spawner_device.elf");
