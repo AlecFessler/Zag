@@ -1095,13 +1095,21 @@ fn sysFaultRecv(ctx: *ArchCpuContext, buf_ptr: u64, blocking: u64) SyscallResult
 }
 
 /// Read 144 bytes of FaultMessage saved-regs (rip + rflags + rsp + 15 GPRs)
-/// from `src_ptr` and apply them to `dst.ctx`. Layout matches writeFaultMessage.
+/// from `src_ptr` and apply them to the FAULTING thread's user iret frame.
+///
+/// `dst.ctx` is the kernel-mode context captured when the thread yielded
+/// out of `faultBlock` — writing to it has no effect on the user-mode
+/// resume because the kernel unwinds back through the original page fault
+/// frame, which is what iret reads. The original user-mode iret frame is
+/// stashed on `dst.fault_user_ctx` by `faultBlock` so we can target it
+/// here.
 fn applyModifiedRegs(dst: *Thread, src_ptr: u64) void {
+    const target = dst.fault_user_ctx orelse return;
     const buf: [*]const u8 = @ptrFromInt(src_ptr);
-    dst.ctx.rip = @as(*align(1) const u64, @ptrCast(buf + 0)).*;
-    dst.ctx.rflags = @as(*align(1) const u64, @ptrCast(buf + 8)).*;
-    dst.ctx.rsp = @as(*align(1) const u64, @ptrCast(buf + 16)).*;
-    const r = &dst.ctx.regs;
+    target.rip = @as(*align(1) const u64, @ptrCast(buf + 0)).*;
+    target.rflags = @as(*align(1) const u64, @ptrCast(buf + 8)).*;
+    target.rsp = @as(*align(1) const u64, @ptrCast(buf + 16)).*;
+    const r = &target.regs;
     var off: usize = 24;
     inline for (.{
         "r15", "r14", "r13", "r12", "r11", "r10", "r9",  "r8",
@@ -1249,6 +1257,10 @@ fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modified_r
             if (action == FAULT_RESUME_MODIFIED) {
                 applyModifiedRegs(pending, modified_regs_ptr);
             }
+            // Clear the user iret frame pointer — the unwind path is about
+            // to consume it via iret. Leaving a stale pointer would target
+            // a previous frame on the next fault.
+            pending.fault_user_ctx = null;
             src.lock.lock();
             pending.state = .ready;
             const faulted_bit = @as(u64, 1) << @intCast(pending.slot_index);
