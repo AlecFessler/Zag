@@ -80,6 +80,7 @@ kernel/
     memory.zig           -- MemoryPerms (PTE-level permission flags)
   containers/
     red_black_tree.zig   -- generic red-black tree
+    priority_queue.zig   -- 5-level priority queue (run queues, futex, IPC)
   devices/
     devices.zig          -- device module root
     registry.zig         -- device table and registration
@@ -120,6 +121,7 @@ Process {
     fault_reason: FaultReason              -- reason for last fault (u5, .none if no fault)
     restart_count: u16                     -- number of restarts (wraps on overflow)
     thread_handle_rights: ThreadHandleRights -- rights mask for thread handles in this process's own perm table
+    max_thread_priority: Priority           -- ceiling priority for threads in this process
 }
 ```
 
@@ -299,7 +301,7 @@ KernelObject = union(enum) {
     vm_reservation: VmReservationObject { max_rights, original_start, original_size }
     shared_memory: *SharedMemory
     device_region: *DeviceRegion
-    core_pin: CorePinObject { core_id, thread_tid }
+    core_pin: CorePinObject { core_id }
     thread: *Thread
     empty: void
 }
@@ -365,12 +367,12 @@ Field encoding for thread entries: `field0 = tid(u64)` (the thread's stable kern
 
 All rights are packed structs with bit fields:
 
-- `ProcessRights`: packed `u16` -- `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `shm_create`(5), `device_own`(6), `pin_exclusive`(7), `fault_handler`(8), 7 bits reserved.
+- `ProcessRights`: packed `u16` -- `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `shm_create`(5), `device_own`(6), `fault_handler`(7), 8 bits reserved.
 - `ProcessHandleRights`: packed `u16` -- `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5), `fault_handler`(6), 9 bits reserved. Used on handles to other processes (not HANDLE_SELF).
 - `VmReservationRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4), 3 bits reserved.
 - `SharedMemoryRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `grant`(3), 4 bits reserved.
 - `DeviceRegionRights`: packed `u8` -- `map`(0), `grant`(1), `dma`(2), 5 bits reserved.
-- `ThreadHandleRights`: packed `u8` -- `suspend`(0), `resume`(1), `kill`(2), `set_affinity`(3), 4 bits reserved.
+- `ThreadHandleRights`: packed `u8` -- `suspend`(0), `resume`(1), `kill`(2), 5 bits reserved.
 
 ---
 
@@ -393,6 +395,9 @@ Thread {
     last_in_proc: bool = false          -- true if this is the last thread in process
     on_cpu: atomic(bool) = false        -- set while thread is actively on a CPU
     slot_index: u8                      -- index of this thread in process.threads[], used for bitmask operations
+    priority: Priority                  -- current scheduling priority level (idle/low/normal/high/pinned)
+    pre_pin_priority: Priority          -- saved priority before core pin (restored on unpin)
+    pre_pin_affinity: ?u64              -- saved affinity mask before core pin (restored on unpin)
 }
 ```
 
@@ -493,21 +498,36 @@ x64.SavedRegs (extern struct) {
 
 ## 6. Run Queue
 
-### Structure
+### PriorityQueue
 
-Per-core singly-linked intrusive list with a sentinel node. Defined in `kernel/sched/scheduler.zig`:
+Defined in `kernel/containers/priority_queue.zig`. A unified data structure used by run queues, futex buckets, and IPC wait queues.
+
+The `PriorityQueue` has 5 per-level FIFO queues (one per priority level), each with a `head` and `tail` pointer. Enqueueing appends to the tail of the thread's level. Dequeueing scans from level 4 (pinned) down to level 0 (idle) and pops the head of the first non-empty level. FIFO order is preserved within each level. The structure has no locks — callers hold their own locks as before. It operates on `Thread.next` directly, same as the prior intrusive list approach. A thread is in at most one queue at a time, so sharing the `next` field across all three queue types (run queue, futex, IPC) remains safe.
 
 ```
-RunQueue {
-    sentinel: Thread       -- dummy head node (belongs to idle_process)
-    head: *Thread          -- points to sentinel
-    tail: *Thread          -- points to last enqueued thread (or sentinel if empty)
+PriorityQueue {
+    levels: [5]struct {
+        head: ?*Thread
+        tail: ?*Thread
+    }
 }
 ```
 
-The sentinel's `tid = U64_MAX`, `process = idle_process`, `state = .running`.
+Methods:
+- `enqueue(thread)` — append to the tail of `levels[thread.priority]`.
+- `dequeue() -> ?*Thread` — scan from level 4 down to 0, pop head of first non-empty level.
+- `remove(target) -> bool` — linear scan across all levels, unlink target.
+- `peekHighestStealable(core_id) -> ?*Thread` — scan levels 4→0, return the first thread whose affinity mask includes `core_id` and whose priority is not `pinned`. Called without holding a lock; the result is advisory only.
 
-`.faulted` and `.suspended` threads are never enqueued on any run queue. They are tracked exclusively via `process.faulted_thread_slots` and `process.suspended_thread_slots` bitmasks. The fault delivery path, `thread_suspend`, `thread_resume`, `fault_reply`, and the kill path use these bitmasks directly to locate and transition threads without scanning the threads array.
+### Structure
+
+Per-core `RunQueue` wraps `PriorityQueue`. The sentinel node approach is removed. The idle thread is a real thread at priority `idle`, re-enqueued after every timeslice when no real work exists.
+
+```
+RunQueue {
+    pq: PriorityQueue
+}
+```
 
 ### Per-Core State
 
@@ -516,8 +536,9 @@ PerCoreState {
     rq: RunQueue
     rq_lock: SpinLock
     running_thread: ?*Thread
+    pinned_thread: ?*Thread     -- thread (if any) that exclusively owns this core
     timer: Timer
-    zombie: ?Zombie        -- deferred thread cleanup
+    exited_thread: ?ExitedThread -- deferred thread cleanup (renamed from Zombie)
 }
 ```
 
@@ -525,26 +546,37 @@ Array of 64 `PerCoreState` structs (`MAX_CORES = 64`), aligned to `CACHE_LINE_SI
 
 ### enqueue(thread)
 
-Append to tail: `tail.next = thread; tail = thread; thread.next = null`.
+Delegates to `pq.enqueue(thread)`, which appends to the appropriate priority level's tail.
 
 ### dequeue() -> ?*Thread
 
-Pop from head: read `head.next`. If non-null, advance head's next pointer, handle tail update. Returns the dequeued thread or null if queue is empty (only sentinel present).
+Delegates to `pq.dequeue()`, which returns the highest-priority ready thread, or null if the queue is empty.
 
 ### Scheduler Timer Handler
 
 `schedTimerHandler(ctx)`:
-1. Clean up zombie from previous cycle (deferred `deinit`).
+1. Clean up exited thread from previous cycle (deferred `deinit`).
 2. Save preempted thread's context.
 3. Clear preempted thread's `on_cpu` flag.
 4. Acquire run queue lock.
-5. If preempted thread is not sentinel and still `running`, set to `ready` and re-enqueue.
-6. Dequeue next thread (or fall back to sentinel/idle).
-7. Set next thread to `running`, set `on_cpu = true`.
-8. If preempted thread is `exited`, store as zombie for deferred cleanup.
-9. Release run queue lock.
-10. Arm scheduler timer for next timeslice.
-11. If same thread, return. Otherwise, `arch.switchTo(next)`.
+5. If this core has a `pinned_thread` that is ready and not currently running: immediately preempt the current thread, attempt to migrate it to another core, and switch to the pinned thread.
+6. If the current thread is the pinned thread: never preempt, just re-arm the timer.
+7. Otherwise: priority-aware round-robin. If a higher priority thread is ready in the run queue, preempt current thread and switch. If same priority, re-enqueue current and switch. If current is highest, keep running.
+8. Set next thread to `running`, set `on_cpu = true`.
+9. If preempted thread is `exited`, store as exited_thread for deferred cleanup.
+10. Release run queue lock.
+11. Arm scheduler timer for next timeslice.
+12. If same thread, return. Otherwise, `arch.switchTo(next)`.
+
+### IPI on Thread Ready
+
+When any thread becomes ready (futex wake, IPC delivery, thread_resume), if its priority exceeds the priority of the currently running thread on an affinity-eligible non-pinned core, the kernel sends an IPI immediately to that core rather than waiting for the next timer tick. This ensures high-priority threads are scheduled without waiting for a timeslice boundary.
+
+### Pinned Core Scheduling Invariants
+
+A pinned core is never a target for proactive enqueue from other cores. Threads are only placed on a pinned core's run queue via work stealing, which is initiated by the pinned core itself when it goes idle (because the pinned thread is blocked).
+
+When a pinned thread becomes ready again after blocking, the kernel sends an IPI to the pinned core. Whatever thread is currently running on that core is preempted mid-timeslice regardless of its priority. The preempted thread is migrated to an affinity-eligible non-pinned core if one exists. If no eligible core exists, the thread remains in the pinned core's run queue and will only be scheduled again when the pinned thread next blocks.
 
 ### Timeslice
 
@@ -554,9 +586,22 @@ Pop from head: read `head.next`. If non-null, advance head's next pointer, handl
 
 `sched.yield()` triggers a self-IPI: `arch.triggerSchedulerInterrupt(arch.coreID())`. The scheduler timer handler runs, treating it as a preemption.
 
-### Zombie Deferred Cleanup
+### Work Stealing
 
-Exited threads cannot be freed inside the scheduler timer handler (they are running on the stack being freed). Instead, the thread is stored as a `Zombie { thread, last_in_proc }` and freed at the start of the next scheduler tick.
+When a core's run queue is empty after dequeueing, it attempts to steal work:
+
+1. Perform a non-locking peek across all other non-pinned cores using `peekHighestStealable(my_core_id)` to find the highest priority eligible thread.
+2. Once the best candidate and its home core are identified, lock that core's run queue and attempt to remove the candidate.
+3. If the candidate is still there, take it and return.
+4. If it was removed between peek and lock (another core stole it or it was scheduled), retry the entire scan.
+
+Pinned cores are skipped entirely — never steal from a pinned core's queue and never identify a pinned core as a target.
+
+Work stealing is purely reactive — it only happens when a core goes idle. There is no background balancing. NUMA and cache domain awareness are not implemented and are noted as future work.
+
+### ExitedThread Deferred Cleanup
+
+Exited threads cannot be freed inside the scheduler timer handler (they are running on the stack being freed). Instead, the thread is stored as an `ExitedThread { thread, last_in_proc }` and freed at the start of the next scheduler tick. (Renamed from `Zombie` to avoid confusion with the process zombie concept.)
 
 ---
 
@@ -571,7 +616,7 @@ buckets: [256]Bucket
 
 Bucket {
     lock: SpinLock
-    head: ?*Thread
+    pq: PriorityQueue
 }
 ```
 
@@ -583,15 +628,15 @@ The shift by 3 accounts for 8-byte alignment of futex addresses. Multiple physic
 
 ### pushWaiter(bucket, thread)
 
-Prepend to bucket's singly-linked list: `thread.next = bucket.head; bucket.head = thread`.
+Enqueue thread into the bucket's priority queue: `bucket.pq.enqueue(thread)`.
 
 ### popWaiter(bucket) -> ?*Thread
 
-Pop head: `thread = bucket.head; bucket.head = thread.next; thread.next = null`.
+Dequeue the highest-priority waiter from the bucket's priority queue: `bucket.pq.dequeue()`.
 
 ### removeWaiter(bucket, target) -> bool
 
-Linear scan of bucket list. Unlink target by updating predecessor's `next` pointer (or `bucket.head` if target is first). Returns true if found and removed.
+Remove target from the bucket's priority queue: `bucket.pq.remove(target)`. Returns true if found and removed.
 
 ### wait(paddr, expected, timeout_ns, thread) -> i64
 
@@ -861,9 +906,9 @@ After all threads are marked exited and removed from queues:
 
 Before the ELF reload step of the restart path, a thread handle cleanup phase runs:
 
-**Thread handle cleanup on restart**:
+**Thread handle and core_pin cleanup on restart**:
 1. If `proc.fault_handler_proc` is non-null: acquire handler's `perm_lock`, scan handler's perm table for all thread-type entries whose `object` pointer belongs to a thread in `proc`, clear those entries, call `syncUserView(handler)`, release `perm_lock`.
-2. Scan `proc`'s own perm table for all thread-type entries, clear them.
+2. Scan `proc`'s own perm table for all thread-type and core_pin-type entries. For core_pin entries, release the `PerCoreState.pinned_thread` on the referenced core (clearing the pin). Clear all matched entries.
 3. Clear `proc.faulted_thread_slots = 0` and `proc.suspended_thread_slots = 0`.
 
 After creating the fresh initial thread, a thread handle insertion phase runs:
@@ -876,7 +921,7 @@ After creating the fresh initial thread, a thread handle insertion phase runs:
 
 ### proc_create Internals
 
-**New parameter**: `thread_rights: ThreadHandleRights`. Stored on the Process struct as `thread_handle_rights: ThreadHandleRights` — this is the rights mask used whenever a new thread handle is inserted into this process's own perm table.
+**New parameters**: `thread_rights: ThreadHandleRights` and `max_thread_priority: Priority`. `thread_rights` is stored on the Process struct as `thread_handle_rights: ThreadHandleRights` — this is the rights mask used whenever a new thread handle is inserted into this process's own perm table. `max_thread_priority` is stored as `process.max_thread_priority: Priority` — this is the ceiling priority for any thread in the process. The kernel validates that `max_thread_priority` does not exceed the parent's own `max_thread_priority`.
 
 **Initial thread handle**: After `Thread.create` for the initial thread, call `insertPerm` to insert the thread handle at slot 1 of the child's perm table with rights = `thread_rights`. Call `syncUserView(child)`.
 
@@ -1344,19 +1389,19 @@ When a process holds a handle to another process (not `HANDLE_SELF`), the `right
 `cleanupIpcState()` runs at the beginning of `cleanupPhase1`:
 
 **Server dies (this process has waiters):**
-1. Walk `msg_box.waiters_head` list: set `waiter.ipc_server = null`, write `E_NOENT` to `waiter.ctx.regs.rax`, wake waiter
+1. Drain `msg_box.waiters` priority queue: for each dequeued waiter, set `waiter.ipc_server = null`, write `E_NOENT` to `waiter.ctx.regs.rax`, wake waiter
 2. If `msg_box.pending_caller` non-null: same treatment
 3. Clear all msg_box fields
 
 **Caller dies (this process has threads blocked on other processes):**
-1. For each thread with `ipc_server` set: lock the server, remove this thread from `msg_box.pending_caller` or `msg_box.waiters`, clear `ipc_server`, unlock server
+1. For each thread with `ipc_server` set: lock the server, remove this thread from `msg_box.pending_caller` or `msg_box.waiters` (via `removeLocked`), clear `ipc_server`, unlock server
 
 Both sides clean up to prevent dangling pointers regardless of death order.
 
 ### Restart Semantics
 
 On process restart, IPC state persists with adjustments:
-1. If `msg_box.pending_caller` is set (message delivered but not replied to), the caller is re-enqueued at the head of `msg_box.waiters` so the restarted process can `recv` it again
+1. If `msg_box.pending_caller` is set (message delivered but not replied to), the caller is re-enqueued into `msg_box.waiters` so the restarted process can `recv` it again
 2. `msg_box.pending_reply` cleared, `msg_box.receiver` cleared (old thread is dead)
 3. `msg_box.waiters` queue persists untouched — callers from other processes remain blocked
 
@@ -1383,18 +1428,17 @@ State = enum { idle, receiving, pending_reply }
 
 MessageBox {
     state:          State
-    queue_head:     ?*Thread     // FIFO of waiting senders (intrusive via thread.next)
-    queue_tail:     ?*Thread
-    receiver:       ?*Thread     // thread blocked on recv(), valid iff state == .receiving
-    pending_thread: ?*Thread     // thread that owns the currently-pending message,
-                                 // valid iff state == .pending_reply; for IPC this is
-                                 // the caller (or null for send-with-no-caller); for
-                                 // faults this is always the faulted thread itself
+    waiters:        PriorityQueue // priority-ordered queue of waiting senders (intrusive via thread.next)
+    receiver:       ?*Thread      // thread blocked on recv(), valid iff state == .receiving
+    pending_thread: ?*Thread      // thread that owns the currently-pending message,
+                                  // valid iff state == .pending_reply; for IPC this is
+                                  // the caller (or null for send-with-no-caller); for
+                                  // faults this is always the faulted thread itself
     lock:           SpinLock
 }
 ```
 
-The queued unit is `*Thread` for both uses. For IPC, the queued thread is the calling thread of `ipc_call`, and its payload lives in `thread.ctx.regs` (saved by the int 0x80 entry). For faults, the queued thread is the faulted thread itself; its payload is `thread.fault_reason` / `thread.fault_addr` / `thread.fault_rip` plus the register snapshot in `thread.ctx.regs`. The queue link reuses the existing `thread.next` pointer — safe because a thread is in at most one of {run queue, IPC waiters, fault box queue} at any moment.
+The queued unit is `*Thread` for both uses. For IPC, the queued thread is the calling thread of `ipc_call`, and its payload lives in `thread.ctx.regs` (saved by the int 0x80 entry). For faults, the queued thread is the faulted thread itself; its payload is `thread.fault_reason` / `thread.fault_addr` / `thread.fault_rip` plus the register snapshot in `thread.ctx.regs`. The `waiters` priority queue reuses the existing `thread.next` pointer — safe because a thread is in at most one of {run queue, IPC waiters, fault box queue} at any moment.
 
 ### State transitions
 
@@ -1410,9 +1454,9 @@ The queued unit is `*Thread` for both uses. For IPC, the queued thread is the ca
 
 All methods take a locked `MessageBox` (the `*Locked` suffix); the lock is the caller's responsibility.
 
-- `enqueueLocked(sender)` — append `sender` to the wait queue tail via `thread.next`. No state change.
-- `dequeueLocked() → ?*Thread` — pop and return queue head, or `null` if empty. No state change.
-- `removeLocked(target) → bool` — find and unlink `target` from the queue (used when a queued caller dies). Returns whether it was present.
+- `enqueueLocked(sender)` — enqueue `sender` into the `waiters` priority queue via `waiters.enqueue(sender)`. No state change.
+- `dequeueLocked() → ?*Thread` — dequeue the highest-priority waiter via `waiters.dequeue()`, or `null` if empty. No state change.
+- `removeLocked(target) → bool` — remove `target` from the `waiters` priority queue via `waiters.remove(target)` (used when a queued caller dies). Returns whether it was present.
 - `beginReceivingLocked(thread)` — assert `state == .idle && queue_head == null && receiver == null`, then set `receiver = thread`, `state = .receiving`.
 - `takeReceiverLocked() → *Thread` — assert `state == .receiving`, return and clear receiver, set `state = .idle`.
 - `beginPendingReplyLocked(?*Thread)` — assert `state != .pending_reply`, set `pending_thread`, `state = .pending_reply`.
@@ -1441,9 +1485,9 @@ The full saved register state lives in `thread.ctx.regs` (set by the exception e
 
 ### Cleanup paths
 
-`Process.cleanupIpcState` (called from `cleanupPhase1`) drains `msg_box`: each waiter is woken with `E_NOENT` in its saved rax, the receiver (if any) is dropped, the pending caller (if any) is woken with `E_NOENT`. Then for every thread in the dying process whose `ipc_server` points elsewhere, the corresponding entry is removed from that other process's `msg_box` (queue or pending) so no `*Thread` references the dying process.
+`Process.cleanupIpcState` (called from `cleanupPhase1`) drains `msg_box.waiters` priority queue: each dequeued waiter is woken with `E_NOENT` in its saved rax, the receiver (if any) is dropped, the pending caller (if any) is woken with `E_NOENT`. Then for every thread in the dying process whose `ipc_server` points elsewhere, the corresponding entry is removed from that other process's `msg_box` (via `removeLocked` or pending) so no `*Thread` references the dying process.
 
-`Process.releaseFaultHandler` and `cleanupPhase1` perform the analogous cleanup for `fault_box`: any thread in the queue or in `pending_thread` whose owning process matches is unlinked, so the box never holds a stale `*Thread`.
+`Process.releaseFaultHandler` and `cleanupPhase1` perform the analogous cleanup for `fault_box`: any thread in the `waiters` priority queue or in `pending_thread` whose owning process matches is removed (via `removeLocked`), so the box never holds a stale `*Thread`.
 
 ---
 

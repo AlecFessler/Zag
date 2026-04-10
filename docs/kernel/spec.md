@@ -8,6 +8,34 @@ Zag is a microkernel. It provides the minimal set of abstractions needed for iso
 
 ## §2 Kernel Objects
 
+### §2.0 Priority
+
+Every thread has a priority level that determines its scheduling order relative to other threads.
+
+**§2.0.1** There are five priority levels, represented as a `u3`:
+
+| Value | Name | Behavior |
+|-------|------|----------|
+| 0 | `idle` | Only runs when no other thread is ready on any core |
+| 1 | `normal` | Default for all newly created threads; round-robin among peers |
+| 2 | `high` | Preempts normal; round-robin among peers |
+| 3 | `realtime` | Preempts high and below; round-robin among peers |
+| 4 | `pinned` | Non-preemptible; exclusive core ownership |
+
+**§2.0.2** All newly created threads start at `normal` priority, including the initial thread of a new process.
+
+**§2.0.3** Every process has a `max_thread_priority` ceiling. Threads in that process cannot set their priority above this ceiling.
+
+**§2.0.4** `max_thread_priority` is set at `proc_create` time as an explicit parameter and is never implicitly inherited.
+
+**§2.0.5** A parent cannot grant a child a `max_thread_priority` higher than its own.
+
+**§2.0.6** Root service starts with `max_thread_priority` = `pinned`.
+
+**§2.0.7** Priority inheritance is not implemented.
+
+---
+
 ### §2.1 Process
 
 A process is an isolated execution environment with its own address space, permissions table, and set of threads. Processes form a tree: **§2.1.1** spawning a child via `proc_create` establishes a parent/children link (process tree).
@@ -76,7 +104,7 @@ All access to kernel objects is mediated by **capabilities** — handles with as
 
 **§2.3.1** Handles are monotonically increasing u64 IDs, unique per process lifetime. **§2.3.2** Handle 0 (`HANDLE_SELF`) exists at process creation and cannot be revoked.
 
-There are five rights types. **ProcessRights** (u16, slot 0 only): `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `shm_create`(5), `device_own`(6), `pin_exclusive`(7), `fault_handler`(8). **ProcessHandleRights** (u16, other process handles): `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5), `fault_handler`(6). When `fault_handler` is set on a handle to process P, the holder receives P's fault messages in the holder's own fault box. At most one external process may hold this bit for any given process at a time. **SharedMemoryRights** (u8): `read`(0), `write`(1), `execute`(2), `grant`(3). **DeviceRegionRights** (u8): `map`(0), `grant`(1), `dma`(2). **ThreadHandleRights** (u8): `suspend`(0), `resume`(1), `kill`(2), `set_affinity`(3). 4 bits reserved.
+There are five rights types. **ProcessRights** (u16, slot 0 only): `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `shm_create`(5), `device_own`(6), `fault_handler`(7). **ProcessHandleRights** (u16, other process handles): `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5), `fault_handler`(6). When `fault_handler` is set on a handle to process P, the holder receives P's fault messages in the holder's own fault box. At most one external process may hold this bit for any given process at a time. **SharedMemoryRights** (u8): `read`(0), `write`(1), `execute`(2), `grant`(3). **DeviceRegionRights** (u8): `map`(0), `grant`(1), `dma`(2). **ThreadHandleRights** (u8): `suspend`(0), `resume`(1), `kill`(2). 5 bits reserved.
 
 **§2.3.3** `restart` can only be granted by a parent that itself has restart capability. **§2.3.4** Once cleared via `disable_restart`, the restart capability cannot be re-enabled.
 
@@ -88,7 +116,7 @@ There are five rights types. **ProcessRights** (u16, slot 0 only): `spawn_thread
 
 #### Revoke
 
-Revoking a capability removes it from the permissions table. The cleanup depends on the type: **§2.3.11** revoking a VM reservation frees all pages in the range and clears the perm slot. **§2.3.12** Revoking SHM unmaps it from all reservations, reverts to private, and clears the slot. **§2.3.13** Revoking a device handle unmaps MMIO, returns handle up the process tree (§2.1), and clears the slot. **§2.3.14** Revoking a core pin unpins the thread, restores preemptive scheduling, and clears the slot. **§2.3.15** Revoking a process handle with `kill` right recursively kills the child's subtree. **§2.3.16** Revoking a process handle without `kill` right drops the handle without killing. **§2.3.17** Revoking a `dead_process` handle clears the slot. **§2.3.18** Sending `HANDLE_SELF` via capability transfer gives the recipient a process handle to the sender.
+Revoking a capability removes it from the permissions table. The cleanup depends on the type: **§2.3.11** revoking a VM reservation frees all pages in the range and clears the perm slot. **§2.3.12** Revoking SHM unmaps it from all reservations, reverts to private, and clears the slot. **§2.3.13** Revoking a device handle unmaps MMIO, returns handle up the process tree (§2.1), and clears the slot. **§2.3.14** Revoking a core pin unpins the thread, restores the thread's pre-pin affinity mask, drops the thread's priority to its pre-pin level, and clears the slot. **§2.3.15** Revoking a process handle with `kill` right recursively kills the child's subtree. **§2.3.16** Revoking a process handle without `kill` right drops the handle without killing. **§2.3.17** Revoking a `dead_process` handle clears the slot. **§2.3.18** Sending `HANDLE_SELF` via capability transfer gives the recipient a process handle to the sender.
 
 **§2.3.20** Revoking a thread handle removes it from the permissions table without affecting the thread's execution or state.
 
@@ -137,15 +165,25 @@ A thread is a unit of execution belonging to a process. All threads within a pro
 
 **§2.4.18** `thread_kill` on the last non-exited thread in a process triggers process exit or restart per §2.6 semantics.
 
-**§2.4.19** `set_affinity` requires both `ProcessRights.set_affinity` on slot 0 AND `ThreadHandleRights.set_affinity` on the target thread handle; returns `E_PERM` if either is absent.
+**§2.4.19** `set_affinity` is self-only (no thread handle parameter). It requires `ProcessRights.set_affinity` on slot 0; returns `E_PERM` if absent. Returns `E_BUSY` if the calling thread is currently pinned.
 
-**§2.4.20** `pin_exclusive` requires both `ProcessRights.pin_exclusive` on slot 0 AND `ThreadHandleRights.set_affinity` on the thread handle; the thread handle must refer to the calling thread; returns `E_INVAL` if it refers to any other thread.
+**§2.4.20** `set_priority` is self-only (no thread handle parameter). It requires `ProcessRights.set_affinity` on slot 0 and is bounded by the process's `max_thread_priority` ceiling; returns `E_PERM` if the right is absent or the requested priority exceeds the ceiling.
 
 **§2.4.21** A `.faulted` thread is not scheduled and does not appear on any run queue.
 
 **§2.4.22** A `.suspended` thread is not scheduled and does not appear on any run queue.
 
-`set_affinity` constrains a thread's core affinity; the change takes effect at the next scheduling decision.
+**§2.4.23** When a thread calls `set_priority(.pinned)`, the kernel scans the thread's current affinity mask in ascending core ID order for a core with no pinned owner. The first available core is claimed; a `core_pin` handle is inserted into the process's permissions table, and the syscall returns the handle ID. If no core in the affinity mask is available, returns `E_BUSY`. If the affinity mask is empty, returns `E_INVAL`.
+
+**§2.4.24** A pinned thread cannot call `set_affinity`; attempting it returns `E_BUSY`.
+
+**§2.4.25** There are two ways to unpin: (1) call `revoke_perm` on the `core_pin` handle, which restores the pre-pin affinity mask and drops priority to the pre-pin level; (2) call `set_priority` with any non-pinned level, which implicitly revokes the `core_pin` handle, restores affinity, and applies the new priority.
+
+**§2.4.26** When a pinned thread blocks (on a futex or IPC recv), it temporarily releases its core. Other threads may execute on that core while the pinned thread is blocked. The pin relationship persists.
+
+**§2.4.27** When a pinned thread becomes ready again (futex wake or IPC delivery), the kernel immediately preempts whatever thread is running on the pinned core regardless of that thread's priority. The preempted thread is migrated to an affinity-eligible non-pinned core if one exists; otherwise it remains in the pinned core's run queue until the pinned thread next blocks.
+
+**§2.4.28** `set_affinity` constrains the calling thread's core affinity; the change takes effect at the next scheduling decision.
 
 ---
 
@@ -153,7 +191,7 @@ A thread is a unit of execution belonging to a process. All threads within a pro
 
 The futex mechanism bridges userspace synchronization with the kernel scheduler. A thread atomically checks a memory location and sleeps if the value matches, avoiding busy-waiting.
 
-**§2.5.1** `futex_wait` blocks the calling thread when value at `addr` matches `expected`. **§2.5.2** `futex_wait` with timeout=0 returns `E_TIMEOUT` immediately (try-only). **§2.5.3** `futex_wait` with timeout=`MAX_U64` blocks indefinitely until woken. **§2.5.4** `futex_wait` with a finite timeout blocks for at least `timeout_ns` nanoseconds; actual expiry may be delayed until the next scheduler tick. **§2.5.5** Cross-process futexes work over shared memory (two processes mapping the same SHM can synchronize via the same address). **§2.5.6** `futex_wake` wakes up to `count` threads blocked on `addr`. **§2.5.7** Futex waiters are woken in FIFO order.
+**§2.5.1** `futex_wait` blocks the calling thread when value at `addr` matches `expected`. **§2.5.2** `futex_wait` with timeout=0 returns `E_TIMEOUT` immediately (try-only). **§2.5.3** `futex_wait` with timeout=`MAX_U64` blocks indefinitely until woken. **§2.5.4** `futex_wait` with a finite timeout blocks for at least `timeout_ns` nanoseconds; actual expiry may be delayed until the next scheduler tick. **§2.5.5** Cross-process futexes work over shared memory (two processes mapping the same SHM can synchronize via the same address). **§2.5.6** `futex_wake` wakes up to `count` threads blocked on `addr`. **§2.5.7** Futex waiters are woken in priority order (highest priority first), with FIFO ordering among waiters of the same priority level.
 
 ---
 
@@ -165,7 +203,7 @@ A process with a **restart context** (set at creation time via the `restart` bit
 
 **§2.6.4** A restarting process remains alive throughout (IPC to it does not return `E_BADHANDLE`).
 
-Most state survives a restart. **§2.6.5** Permissions table persists across restart (except VM reservation entries). **§2.6.7** Restart count increments on each restart. Restart count wraps to zero on u16 overflow. **§2.6.9** Fault reason is recorded in slot 0 `field0` on restart. Code and rodata mappings persist across restart. **§2.6.11** Data mappings persist across restart; content is reloaded from original ELF. **§2.6.12** SHM handle entries persist across restart. **§2.6.13** Device handle entries persist across restart. **§2.6.14** Process tree position and children persist across restart. **§2.6.15** Restart context persists (process can restart again). **§2.6.16** Pending callers (received but not yet replied to) persist across restart. **§2.6.17** User permissions view (mapped read-only region) persists across restart.
+Most state survives a restart. **§2.6.5** Permissions table persists across restart (except VM reservation entries). **§2.6.7** Restart count increments on each restart. Restart count wraps to zero on u16 overflow. **§2.6.9** Fault reason is recorded in slot 0 `field0` on restart. Code and rodata mappings persist across restart. **§2.6.11** Data mappings persist across restart; content is reloaded from original ELF. **§2.6.12** SHM handle entries persist across restart. **§2.6.13** Device handle entries persist across restart. Core_pin handles and thread handles do not persist across restart; they are cleared alongside VM reservation entries. **§2.6.14** Process tree position and children persist across restart. **§2.6.15** Restart context persists (process can restart again). **§2.6.16** Pending callers (received but not yet replied to) persist across restart. **§2.6.17** User permissions view (mapped read-only region) persists across restart.
 
 What doesn't persist: **§2.6.6** VM reservation entries are cleared on restart. **§2.6.18** User-created VM reservations do not persist across restart. User stacks do not persist — a fresh one is allocated. **§2.6.20** SHM/MMIO mappings within freed reservations do not persist across restart. **§2.6.21** BSS is decommitted on restart. **§2.6.22** All threads are removed on restart; only a fresh initial thread runs.
 
@@ -207,7 +245,7 @@ Device entries in the user view encode hardware identification: **§2.9.2** devi
 
 ### §2.10 Core Pin
 
-A core pin grants a thread exclusive, non-preemptible ownership of a CPU core — no other thread will be scheduled on that core until the pin is revoked. **§2.10.1** `pin_exclusive` grants exclusive, non-preemptible core ownership. **§2.10.2** Core pin is created via `pin_exclusive` and revoked via `revoke_perm`. A pinned thread runs uninterrupted until it voluntarily yields or is unpinned. **§2.10.4** After `pin_exclusive`, only the pinned thread executes on that core. **§2.10.5** Core pin user view `field0` = `core_id`. **§2.10.6** Core pin user view `field1` = `thread_tid`.
+A core pin grants a thread exclusive, non-preemptible ownership of a CPU core. The pin is created by calling `set_priority(.pinned)` and revoked via `revoke_perm` on the core_pin handle or by calling `set_priority` with any non-pinned level. **§2.10.1** `set_priority(.pinned)` grants exclusive, non-preemptible core ownership. **§2.10.2** Core pin is created via `set_priority(.pinned)` and revoked via `revoke_perm` or `set_priority` with a non-pinned level. **§2.10.3** The core_pin handle is a revocation token only; it carries no rights bits (rights = 0). The only syscall that accepts it as input is `revoke_perm`. **§2.10.4** While pinned, only the pinned thread executes on that core (except when the pinned thread is blocked, during which other threads may be work-stolen onto the core). **§2.10.5** Core pin user view `field0` = `core_id`. **§2.10.6** Core pin user view `field1` = 0.
 
 ---
 
@@ -237,7 +275,7 @@ Five payload registers carry message data: `rdi`, `rsi`, `rdx`, `r8`, `r9` (word
 
 #### Wait Queue
 
-**§2.11.21** The call wait queue is FIFO ordered. **§2.11.22** `send` never queues — it returns `E_AGAIN` if no receiver is waiting.
+**§2.11.21** The call wait queue is priority ordered (highest priority first), with FIFO ordering among callers of the same priority level. **§2.11.22** `send` never queues — it returns `E_AGAIN` if no receiver is waiting.
 
 #### Capability Transfer
 
@@ -450,9 +488,9 @@ Maps a device's MMIO region into a reservation. **§4.8.1** `mmio_map` returns `
 
 **§4.9.1** `mmio_unmap` returns `E_OK` on success. **§4.9.2** `mmio_unmap` with invalid handle returns `E_BADHANDLE`. **§4.9.3** `mmio_unmap` when MMIO is not mapped returns `E_NOENT`.
 
-### §4.10 proc_create(elf_ptr, elf_len, process_rights, thread_rights) → handle
+### §4.10 proc_create(elf_ptr, elf_len, process_rights, thread_rights, max_thread_priority) → handle
 
-Spawns a new child process from an ELF binary. The `process_rights` parameter sets the child's slot 0 `ProcessRights`. The `thread_rights` parameter specifies the `ThreadHandleRights` the child receives for its own thread handles (its initial thread handle at slot 1, and all subsequent thread handles from `thread_create`). **§4.10.1** `proc_create` returns handle ID (positive) on success. **§4.10.2** `proc_create` child starts with `HANDLE_SELF` at slot 0 and its initial thread handle at slot 1 with rights = `thread_rights`. **§4.10.3** `proc_create` requires `spawn_process` right — returns `E_PERM` without it. **§4.10.4** `proc_create` with `restart` in perms without parent restart capability returns `E_PERM`. **§4.10.5** `proc_create` with invalid ELF returns `E_INVAL`. **§4.10.8** `proc_create` with invalid `elf_ptr` returns `E_BADADDR`. **§4.10.10** `proc_create` grants parent every `ProcessHandleRights` bit on the child handle except `fault_handler` (exclusive: only one process holds it for a given target, and it must be explicitly transferred via `HANDLE_SELF` cap transfer). **§4.10.11** `proc_create` with child perms exceeding parent's own process rights returns `E_PERM`. **§4.10.12** `proc_create` with `thread_rights` containing undefined bits returns `E_INVAL`. Returns `E_NOMEM` on memory exhaustion, `E_MAXCAP` when the permissions table is full, or `E_NORES` on kernel stack exhaustion.
+Spawns a new child process from an ELF binary. The `process_rights` parameter sets the child's slot 0 `ProcessRights`. The `thread_rights` parameter specifies the `ThreadHandleRights` the child receives for its own thread handles (its initial thread handle at slot 1, and all subsequent thread handles from `thread_create`). The `max_thread_priority` parameter sets the ceiling for thread priority in the child process. **§4.10.1** `proc_create` returns handle ID (positive) on success. **§4.10.2** `proc_create` child starts with `HANDLE_SELF` at slot 0 and its initial thread handle at slot 1 with rights = `thread_rights`. **§4.10.3** `proc_create` requires `spawn_process` right — returns `E_PERM` without it. **§4.10.4** `proc_create` with `restart` in perms without parent restart capability returns `E_PERM`. **§4.10.5** `proc_create` with invalid ELF returns `E_INVAL`. **§4.10.8** `proc_create` with invalid `elf_ptr` returns `E_BADADDR`. **§4.10.10** `proc_create` grants parent every `ProcessHandleRights` bit on the child handle except `fault_handler` (exclusive: only one process holds it for a given target, and it must be explicitly transferred via `HANDLE_SELF` cap transfer). **§4.10.11** `proc_create` with child perms exceeding parent's own process rights returns `E_PERM`. **§4.10.12** `proc_create` with `thread_rights` containing undefined bits returns `E_INVAL`. **§4.10.13** `proc_create` with `max_thread_priority` exceeding the parent's own `max_thread_priority` returns `E_PERM`. **§4.10.14** `proc_create` with an invalid `max_thread_priority` value returns `E_INVAL`. Returns `E_NOMEM` on memory exhaustion, `E_MAXCAP` when the permissions table is full, or `E_NORES` on kernel stack exhaustion.
 
 ### §4.11 thread_create(entry, arg, num_stack_pages) → handle
 
@@ -466,13 +504,13 @@ Creates a new thread within the calling process. **§4.11.1** `thread_create` re
 
 **§4.13.1** `thread_yield` returns `E_OK`.
 
-### §4.14 set_affinity(thread_handle, core_mask) → result
+### §4.14 set_affinity(core_mask) → result
 
-Sets a thread's core affinity. **§4.14.1** `set_affinity` returns `E_OK` on success. **§4.14.2** `set_affinity` requires both `ProcessRights.set_affinity` on slot 0 AND `ThreadHandleRights.set_affinity` on the `thread_handle`; returns `E_PERM` if either is absent. **§4.14.3** `set_affinity` with empty mask returns `E_INVAL`. **§4.14.4** `set_affinity` with invalid core IDs returns `E_INVAL`. **§4.14.5** `set_affinity` with an invalid or wrong-type `thread_handle` returns `E_BADHANDLE`.
+Sets the calling thread's core affinity. Self-only; no thread handle parameter. **§4.14.1** `set_affinity` returns `E_OK` on success. **§4.14.2** `set_affinity` requires `ProcessRights.set_affinity` on slot 0; returns `E_PERM` if absent. **§4.14.3** `set_affinity` with empty mask returns `E_INVAL`. **§4.14.4** `set_affinity` with invalid core IDs returns `E_INVAL`. **§4.14.5** `set_affinity` returns `E_BUSY` if the calling thread is currently pinned.
 
-### §4.15 pin_exclusive(thread_handle) → handle
+### §4.15 set_priority(priority) → result
 
-Pins the calling thread exclusively to its current core. **§4.15.1** `pin_exclusive` returns core_pin handle ID (positive) on success. **§4.15.2** `pin_exclusive` requires both `ProcessRights.pin_exclusive` on slot 0 AND `ThreadHandleRights.set_affinity` on the `thread_handle`; returns `E_PERM` if either is absent. **§4.15.3** `pin_exclusive` without single-core affinity returns `E_INVAL`. **§4.15.4** `pin_exclusive` with multi-core affinity returns `E_INVAL`. **§4.15.5** `pin_exclusive` that would pin all cores returns `E_INVAL`. **§4.15.6** `pin_exclusive` on already-pinned core returns `E_BUSY`. **§4.15.7** `pin_exclusive` with a `thread_handle` that does not refer to the calling thread returns `E_INVAL`. **§4.15.8** `pin_exclusive` with an invalid or wrong-type `thread_handle` returns `E_BADHANDLE`. Returns `E_MAXCAP` when the permissions table is full.
+Sets the calling thread's priority. Self-only; no thread handle parameter. **§4.15.1** `set_priority` requires `ProcessRights.set_affinity` on slot 0; returns `E_PERM` if absent. **§4.15.2** `set_priority` with a priority exceeding the process's `max_thread_priority` returns `E_PERM`. **§4.15.3** For non-pinned levels, `set_priority` returns `E_OK` on success. The new priority takes effect at the next scheduling decision. **§4.15.4** For `pinned`, `set_priority` scans the calling thread's affinity mask in ascending core ID order for a core with no pinned owner; returns the `core_pin` handle ID (positive) on success. **§4.15.5** `set_priority(.pinned)` returns `E_BUSY` if all cores in the affinity mask are already owned by pinned threads. **§4.15.6** `set_priority(.pinned)` returns `E_INVAL` if the affinity mask is empty. **§4.15.7** `set_priority(.pinned)` returns `E_MAXCAP` if the permissions table is full. **§4.15.8** `set_priority` with a non-pinned level while currently pinned implicitly revokes the `core_pin` handle, restores the pre-pin affinity mask, and applies the new priority. **§4.15.9** `set_priority` with an invalid priority value returns `E_INVAL`.
 
 ### §4.16 send(r13=target, r14=metadata, payload regs) → status
 
@@ -584,4 +622,4 @@ Same validation as `ioport_read`. **§4.28.1** `ioport_write` returns `E_OK` on 
 | Futex timed waiter slots | 64 |
 | User permissions view | 1 page (128 entries × 32 bytes) |
 | DMA mappings per process | 16 |
-| Thread handle rights bits | 4 (suspend, resume, kill, set_affinity) |
+| Thread handle rights bits | 3 (suspend, resume, kill) |
