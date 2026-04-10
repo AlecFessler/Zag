@@ -14,12 +14,12 @@ fn try_run_on_core1() void {
     _ = syscall.futex_wake(@ptrCast(&ran_on_pinned_core), 1);
 }
 
-/// §2.10.4 — After `pin_exclusive`, only the pinned thread executes on that core.
+/// §2.10.4 — While pinned, only the pinned thread executes on that core (except when the pinned thread is blocked, during which other threads may be work-stolen onto the core).
 pub fn main(_: u64) void {
     // Pin main thread to core 1.
     _ = syscall.set_affinity(0x2);
     syscall.thread_yield();
-    const ret = syscall.pin_exclusive();
+    const ret = syscall.set_priority(syscall.PRIORITY_PINNED);
     if (ret < 0) {
         t.fail("§2.10.4");
         syscall.shutdown();

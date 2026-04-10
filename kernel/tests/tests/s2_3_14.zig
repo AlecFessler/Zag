@@ -7,32 +7,26 @@ const t = lib.testing;
 const ENTRY_TYPE_CORE_PIN: u8 = 4;
 
 var worker_counter: u64 align(8) = 0;
-var worker_handle_pub: u64 align(8) = 0;
 
 fn workerSpin() void {
-    const self_ret = syscall.thread_self();
-    if (self_ret > 0) {
-        const h: u64 = @bitCast(self_ret);
-        // Pin the worker to the same core (core 0) we'll exclusively own.
-        _ = syscall.set_affinity_thread(h, 0x1);
-        @atomicStore(u64, &worker_handle_pub, h, .release);
-    }
+    // Pin the worker to core 0 by affinity mask.
+    _ = syscall.set_affinity(0x1);
     while (true) {
         _ = @atomicRmw(u64, &worker_counter, .Add, 1, .monotonic);
         syscall.thread_yield();
     }
 }
 
-/// §2.3.14 — Revoking a core pin unpins the thread, restores preemptive scheduling, and clears the slot.
-/// scheduling, and clears the slot.
+/// §2.3.14 — Revoking a core pin unpins the thread, restores the thread's pre-pin affinity mask, drops the thread's priority to its pre-pin level, and clears the slot.
 ///
 /// Plan:
-///   1. Main thread set_affinity(core 0) and pin_exclusive on core 0.
+///   1. Main thread set_affinity(core 0) and set_priority(PINNED) on core 0.
 ///   2. Spawn a worker thread also pinned to core 0 by affinity mask.
 ///   3. While the pin is held, §2.10.4 says only the pinned thread runs on
 ///      that core — the worker must starve. Yield main a handful of times
 ///      and confirm worker_counter remains 0.
-///   4. Revoke the pin — scheduling on core 0 returns to preemptive.
+///   4. Revoke the pin — scheduling on core 0 returns to preemptive,
+///      and pre-pin affinity and priority are restored.
 ///   5. Yield main and confirm worker_counter advances.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
@@ -41,9 +35,9 @@ pub fn main(pv: u64) void {
     _ = syscall.set_affinity(0x1);
 
     // Take exclusive ownership of core 0.
-    const pin_ret = syscall.pin_exclusive();
+    const pin_ret = syscall.set_priority(syscall.PRIORITY_PINNED);
     if (pin_ret < 0) {
-        t.fail("§2.3.14 pin_exclusive failed");
+        t.fail("§2.3.14 set_priority(PINNED) failed");
         syscall.shutdown();
     }
     const pin_handle: u64 = @bitCast(pin_ret);
@@ -74,7 +68,7 @@ pub fn main(pv: u64) void {
     while (y < 50) : (y += 1) syscall.thread_yield();
     const counter_during_pin = @atomicLoad(u64, &worker_counter, .monotonic);
 
-    // Revoke the pin.
+    // Revoke the pin — pre-pin affinity and priority are restored.
     const revoke_ret = syscall.revoke_perm(pin_handle);
     if (revoke_ret != 0) {
         t.fail("§2.3.14 revoke");

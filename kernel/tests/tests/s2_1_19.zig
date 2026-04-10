@@ -46,9 +46,9 @@ pub fn main(pv: u64) void {
     // core_pin: set single-core affinity and pin.
     _ = syscall.set_affinity(0x2);
     syscall.thread_yield();
-    const pin_rc = syscall.pin_exclusive();
+    const pin_rc = syscall.set_priority(syscall.PRIORITY_PINNED);
     if (pin_rc < 0) {
-        t.fail("§2.1.19 pin_exclusive");
+        t.fail("§2.1.19 set_priority(PINNED)");
         syscall.shutdown();
     }
     const pin_handle: u64 = @bitCast(pin_rc);

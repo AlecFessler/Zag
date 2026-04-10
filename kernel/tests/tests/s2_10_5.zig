@@ -14,7 +14,7 @@ pub fn main(pv: u64) void {
     _ = syscall.set_affinity(0x2);
     syscall.thread_yield();
 
-    const ret = syscall.pin_exclusive();
+    const ret = syscall.set_priority(syscall.PRIORITY_PINNED);
     const pin_handle: u64 = @bitCast(ret);
 
     // Check field0 == core_id (should be 1).

@@ -12,7 +12,7 @@ fn spinThread() void {
     const self_ret = syscall.thread_self();
     if (self_ret > 0) {
         const h: u64 = @bitCast(self_ret);
-        _ = syscall.set_affinity_thread(h, 0x2);
+        _ = syscall.set_affinity(0x2);
         @atomicStore(u64, &worker_handle_pub, h, .release);
     }
     while (true) {
@@ -29,7 +29,7 @@ pub fn main(_: u64) void {
         t.fail("§2.4.9 thread_self main");
         syscall.shutdown();
     }
-    _ = syscall.set_affinity_thread(@bitCast(main_self_ret), 0x1);
+    _ = syscall.set_affinity(0x1);
 
     const ret = syscall.thread_create(&spinThread, 0, 4);
     if (ret < 0) {

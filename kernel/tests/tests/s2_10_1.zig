@@ -37,7 +37,7 @@ fn helper() void {
     }
 }
 
-/// §2.10.1 — `pin_exclusive` grants exclusive, non-preemptible core ownership.
+/// §2.10.1 — `set_priority(.pinned)` grants exclusive, non-preemptible core ownership.
 ///
 /// Spawns a helper thread affined to the same core as the pinned thread;
 /// while we hold the pin, the helper must make no progress (starved).
@@ -56,9 +56,9 @@ pub fn main(pv: u64) void {
     // Put main on core 1 and pin it.
     _ = syscall.set_affinity(0x2);
     syscall.thread_yield();
-    const ret = syscall.pin_exclusive();
+    const ret = syscall.set_priority(syscall.PRIORITY_PINNED);
     if (ret < 0) {
-        t.fail("§2.10.1 pin_exclusive failed");
+        t.fail("§2.10.1 set_priority(PINNED) failed");
         syscall.shutdown();
     }
     const pin_handle: u64 = @bitCast(ret);

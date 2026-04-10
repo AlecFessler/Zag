@@ -18,7 +18,6 @@ pub fn main(pv: u64) void {
         .restart = true,
         .shm_create = true,
         .device_own = true,
-        .pin_exclusive = true,
         .fault_handler = true,
     });
     const slot0_ok = view[0].handle == 0 and view[0].entry_type == perm_view.ENTRY_TYPE_PROCESS and view[0].rights == all_proc_rights;

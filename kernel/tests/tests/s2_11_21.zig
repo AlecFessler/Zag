@@ -9,46 +9,51 @@ const PAGE: u64 = 4096;
 const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 
 var child_h: u64 = 0;
-var result1: u64 = 0;
-var result2: u64 = 0;
-var queued1: u64 align(8) = 0;
-var queued2: u64 align(8) = 0;
-var done1: u64 align(8) = 0;
-var done2: u64 align(8) = 0;
+var result_idle: u64 = 0;
+var result_high: u64 = 0;
+var queued_idle: u64 align(8) = 0;
+var queued_high: u64 align(8) = 0;
+var done_idle: u64 align(8) = 0;
+var done_high: u64 align(8) = 0;
 
-fn caller1() void {
-    @atomicStore(u64, &queued1, 1, .release);
-    _ = syscall.futex_wake(@ptrCast(&queued1), 1);
+fn caller_idle() void {
+    // Set ourselves to idle priority before entering ipc_call.
+    _ = syscall.set_priority(syscall.PRIORITY_IDLE);
+    @atomicStore(u64, &queued_idle, 1, .release);
+    _ = syscall.futex_wake(@ptrCast(&queued_idle), 1);
     var reply: syscall.IpcMessage = .{};
     _ = syscall.ipc_call(@atomicLoad(u64, &child_h, .acquire), &.{0}, &reply);
-    @atomicStore(u64, &result1, reply.words[0], .release);
-    @atomicStore(u64, &done1, 1, .release);
-    _ = syscall.futex_wake(@ptrCast(&done1), 1);
+    @atomicStore(u64, &result_idle, reply.words[0], .release);
+    @atomicStore(u64, &done_idle, 1, .release);
+    _ = syscall.futex_wake(@ptrCast(&done_idle), 1);
 }
 
-fn caller2() void {
-    @atomicStore(u64, &queued2, 1, .release);
-    _ = syscall.futex_wake(@ptrCast(&queued2), 1);
+fn caller_high() void {
+    // Set ourselves to high priority before entering ipc_call.
+    _ = syscall.set_priority(syscall.PRIORITY_HIGH);
+    @atomicStore(u64, &queued_high, 1, .release);
+    _ = syscall.futex_wake(@ptrCast(&queued_high), 1);
     var reply: syscall.IpcMessage = .{};
     _ = syscall.ipc_call(@atomicLoad(u64, &child_h, .acquire), &.{0}, &reply);
-    @atomicStore(u64, &result2, reply.words[0], .release);
-    @atomicStore(u64, &done2, 1, .release);
-    _ = syscall.futex_wake(@ptrCast(&done2), 1);
+    @atomicStore(u64, &result_high, reply.words[0], .release);
+    @atomicStore(u64, &done_high, 1, .release);
+    _ = syscall.futex_wake(@ptrCast(&done_high), 1);
 }
 
-/// §2.11.21 — The call wait queue is FIFO ordered.
+/// §2.11.21 — The call wait queue is priority ordered (highest priority first), with FIFO ordering among callers of the same priority level.
 ///
 /// Ordering strategy: the server is gated — it maps SHM and blocks on a
-/// futex (buf[1]) until the parent has explicitly ordered caller1 into
-/// the kernel wait queue BEFORE caller2 by:
-///   1. spawning caller1 and waiting for caller1 to report it is about
-///      to enter ipc_call (queued1 = 1), then yielding many times to
-///      guarantee caller1 has actually entered the kernel wait queue,
-///   2. spawning caller2 and doing the same,
+/// futex (buf[1]) until the parent has explicitly ordered caller_idle into
+/// the kernel wait queue BEFORE caller_high by:
+///   1. spawning caller_idle (priority=idle) and waiting for it to report
+///      it is about to enter ipc_call (queued_idle = 1), then yielding
+///      many times to guarantee it has actually entered the kernel wait queue,
+///   2. spawning caller_high (priority=high) and doing the same,
 ///   3. waking the server, which then recvs + replies twice with a
 ///      monotonic counter.
-/// FIFO order is proven by caller1 receiving counter==1 and caller2
-/// receiving counter==2.
+/// Priority ordering is proven by caller_high receiving counter==1
+/// (served first) and caller_idle receiving counter==2 (served second),
+/// despite caller_idle entering the queue first.
 pub fn main(_: u64) void {
     const shm_rights = perms.SharedMemoryRights{ .read = true, .write = true, .grant = true };
     const shm: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(PAGE, shm_rights.bits())));
@@ -74,31 +79,31 @@ pub fn main(_: u64) void {
         _ = syscall.futex_wait(b0, 0, MAX_TIMEOUT);
     }
 
-    // Spawn caller1 first, wait for it to enter ipc_call, yield lots of
-    // times to ensure it is actually in the kernel wait queue.
-    _ = syscall.thread_create(&caller1, 0, 4);
-    t.waitUntilNonZero(&queued1);
+    // Spawn idle caller first (lower priority), wait for it to enter ipc_call.
+    _ = syscall.thread_create(&caller_idle, 0, 4);
+    t.waitUntilNonZero(&queued_idle);
     for (0..2000) |_| syscall.thread_yield();
 
-    // Then spawn caller2.
-    _ = syscall.thread_create(&caller2, 0, 4);
-    t.waitUntilNonZero(&queued2);
+    // Then spawn high caller (higher priority).
+    _ = syscall.thread_create(&caller_high, 0, 4);
+    t.waitUntilNonZero(&queued_high);
     for (0..2000) |_| syscall.thread_yield();
 
-    // Now wake the server — it will dequeue in FIFO order.
+    // Now wake the server — it will dequeue in priority order (high first).
     const b1: *u64 = @ptrCast(@volatileCast(&buf[1]));
     @atomicStore(u64, b1, 1, .release);
     _ = syscall.futex_wake(b1, 1);
 
-    t.waitUntilNonZero(&done1);
-    t.waitUntilNonZero(&done2);
+    t.waitUntilNonZero(&done_idle);
+    t.waitUntilNonZero(&done_high);
 
-    const r1 = @atomicLoad(u64, &result1, .acquire);
-    const r2 = @atomicLoad(u64, &result2, .acquire);
-    if (r1 == 1 and r2 == 2) {
+    const r_idle = @atomicLoad(u64, &result_idle, .acquire);
+    const r_high = @atomicLoad(u64, &result_high, .acquire);
+    // High priority caller should be served first (counter=1), idle second (counter=2).
+    if (r_high == 1 and r_idle == 2) {
         t.pass("§2.11.21");
     } else {
-        t.failWithVal("§2.11.21", 1, @bitCast(r1));
+        t.failWithVal("§2.11.21", 1, @bitCast(r_high));
     }
     syscall.shutdown();
 }

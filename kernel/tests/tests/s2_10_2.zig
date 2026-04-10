@@ -20,7 +20,7 @@ fn helper() void {
     }
 }
 
-/// §2.10.2 — Core pin is created via `pin_exclusive` and revoked via `revoke_perm`.
+/// §2.10.2 — Core pin is created via `set_priority(.pinned)` and revoked via `revoke_perm` or `set_priority` with a non-pinned level.
 /// After revoke, a second thread pinned to the same core can be scheduled.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
@@ -35,9 +35,9 @@ pub fn main(pv: u64) void {
     _ = syscall.set_affinity(0x2);
     syscall.thread_yield();
 
-    const ret = syscall.pin_exclusive();
+    const ret = syscall.set_priority(syscall.PRIORITY_PINNED);
     if (ret < 0) {
-        t.fail("§2.10.2 pin_exclusive failed");
+        t.fail("§2.10.2 set_priority(PINNED) failed");
         syscall.shutdown();
     }
     const pin_handle: u64 = @bitCast(ret);
