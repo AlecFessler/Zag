@@ -6,7 +6,7 @@ const t = lib.testing;
 
 const E_OK: i64 = 0;
 
-/// `set_priority` with a non-pinned level while currently pinned implicitly revokes the `core_pin` handle, restores the pre-pin affinity mask, and applies the new priority.
+/// §4.15.8 — `set_priority` with a non-pinned level while currently pinned implicitly revokes the `core_pin` handle, restores the pre-pin affinity mask, and applies the new priority.
 pub fn main(pv_addr: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv_addr);
 

@@ -5,7 +5,7 @@ const t = lib.testing;
 
 const E_OK: i64 = 0;
 
-/// For non-pinned levels, `set_priority` returns `E_OK` on success.
+/// §4.15.3 — For non-pinned levels, `set_priority` returns `E_OK` on success.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     const ret_high = syscall.set_priority(syscall.PRIORITY_HIGH);

@@ -3,7 +3,7 @@ const lib = @import("lib");
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// `set_priority(.pinned)` returns `E_INVAL` if the affinity mask is empty.
+/// §4.15.6 — `set_priority(.pinned)` returns `E_INVAL` if the affinity mask is empty.
 ///
 /// Note: `set_affinity(0)` returns `E_INVAL` (§4.14.3), so an empty affinity
 /// mask cannot be reached from userspace. This test verifies the contract holds

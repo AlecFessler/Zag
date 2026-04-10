@@ -5,7 +5,7 @@ const t = lib.testing;
 
 const E_INVAL: i64 = -1;
 
-/// `set_affinity` with invalid core IDs returns `E_INVAL`.
+/// §4.14.4 — `set_affinity` with invalid core IDs returns `E_INVAL`.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     // Bit 63 is far beyond any real core count.

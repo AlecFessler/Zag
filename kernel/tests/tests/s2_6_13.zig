@@ -6,7 +6,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.6.13 — Device handle entries persist across restart. Core_pin handles and thread handles do not persist across restart; they are cleared alongside VM reservation entries.
+/// §2.6.13 — Device handle entries persist across restart.
 ///
 /// Spawn a restartable child that receives a device, pins itself, then crashes.
 /// After restart, verify:

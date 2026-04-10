@@ -7,7 +7,7 @@ const t = lib.testing;
 
 const E_PERM: i64 = -2;
 
-/// §2.4.20 — `set_priority` is self-only (no thread handle parameter). It requires `ProcessRights.set_affinity` on slot 0 and is bounded by the process's `max_thread_priority` ceiling; returns `E_PERM` if the right is absent or the requested priority exceeds the ceiling.
+/// §2.4.20 — `set_priority` is self-only (no thread handle parameter).
 ///
 /// Tests:
 ///   1. Child without ProcessRights.set_affinity calling set_priority → E_PERM.

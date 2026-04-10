@@ -18,7 +18,7 @@ fn pinCore1() void {
     }
 }
 
-/// `set_priority(.pinned)` returns `E_BUSY` if all cores in the affinity mask are already owned by pinned threads.
+/// §4.15.5 — `set_priority(.pinned)` returns `E_BUSY` if all cores in the affinity mask are already owned by pinned threads.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     // Helper thread pins core 1.

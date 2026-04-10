@@ -8,7 +8,7 @@ const t = lib.testing;
 const E_PERM: i64 = -2;
 const E_BUSY: i64 = -9;
 
-/// §2.4.19 — `set_affinity` is self-only (no thread handle parameter). It requires `ProcessRights.set_affinity` on slot 0; returns `E_PERM` if absent. Returns `E_BUSY` if the calling thread is currently pinned.
+/// §2.4.19 — `set_affinity` is self-only (no thread handle parameter).
 pub fn main(_: u64) void {
     // Case 1: Child lacks ProcessRights.set_affinity. set_affinity must E_PERM.
     {

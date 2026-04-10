@@ -5,7 +5,7 @@ const t = lib.testing;
 
 const E_INVAL: i64 = -1;
 
-/// `set_priority` with an invalid priority value returns `E_INVAL`.
+/// §4.15.9 — `set_priority` with an invalid priority value returns `E_INVAL`.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     const ret1 = syscall.set_priority(5);

@@ -5,7 +5,7 @@ const t = lib.testing;
 
 const E_BUSY: i64 = -11;
 
-/// `set_affinity` returns `E_BUSY` if the calling thread is currently pinned.
+/// §4.14.5 — `set_affinity` returns `E_BUSY` if the calling thread is currently pinned.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     // Set single-core affinity, then pin.
