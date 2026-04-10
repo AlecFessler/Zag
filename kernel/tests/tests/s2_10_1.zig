@@ -25,7 +25,12 @@ fn helper() void {
     _ = syscall.set_affinity(0x2);
     @atomicStore(u64, &helper_affinity_set, 1, .release);
     _ = syscall.futex_wake(@ptrCast(&helper_affinity_set), 1);
-    // Once we ever run on core 1, bump the counter.
+    // Yield BEFORE touching the counter. We may currently be running on
+    // a non-pinned core (affinity was just changed); the scheduler's
+    // affinity check on the next tick migrates us to core 1's queue,
+    // where the pin starves us. Only after the pin is revoked can we
+    // actually bump the counter.
+    syscall.thread_yield();
     while (true) {
         _ = @atomicRmw(u64, &helper_counter, .Add, 1, .release);
         syscall.thread_yield();

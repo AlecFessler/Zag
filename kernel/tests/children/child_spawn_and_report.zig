@@ -67,6 +67,12 @@ pub fn main(perm_view_addr: u64) void {
     _ = syscall.ipc_reply_cap(&.{ gc_h, handle_rights });
 
     // 5. Stay alive (block on recv). This makes us a non-leaf process.
+    // Handshake with parent: set a flag in SHM at (shm_size - 16) so the
+    // parent can futex-wait on it rather than yield-polling. Parent watches
+    // for this flag before proceeding to revoke us.
+    const ready_ptr: *u64 = @ptrFromInt(elf_ptr + shm_size - 16);
+    ready_ptr.* = 1;
+    _ = syscall.futex_wake(ready_ptr, 1);
     var msg3: syscall.IpcMessage = .{};
     _ = syscall.ipc_recv(true, &msg3);
 }

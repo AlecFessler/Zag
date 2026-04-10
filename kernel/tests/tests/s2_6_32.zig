@@ -58,8 +58,9 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
 
-    // Wait for B to block on recv.
-    for (0..20) |_| syscall.thread_yield();
+    // Wait for B to reach its final blocking recv via a real SHM handshake.
+    const ready_ptr: *u64 = @ptrFromInt(vm.val2 + shm_size - 16);
+    t.waitUntilNonZero(ready_ptr);
 
     // Recursive kill via revoke.
     _ = syscall.revoke_perm(ch);

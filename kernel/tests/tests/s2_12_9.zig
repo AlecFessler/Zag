@@ -23,7 +23,17 @@ pub fn main(pv: u64) void {
     // Create a shared memory page so the child can deposit its
     // received-fault-token before it dies.
     const shm_bytes: u64 = 4096;
-    const shm_handle: u64 = @bitCast(syscall.shm_create(shm_bytes));
+    const shm_rights = (perms.SharedMemoryRights{
+        .read = true,
+        .write = true,
+        .grant = true,
+    }).bits();
+    const shm_res = syscall.shm_create_with_rights(shm_bytes, shm_rights);
+    if (shm_res < 0) {
+        t.fail("§2.12.9 shm_create");
+        syscall.shutdown();
+    }
+    const shm_handle: u64 = @intCast(shm_res);
 
     // Map SHM locally so we can read the deposited token.
     const vm_rights = (perms.VmReservationRights{

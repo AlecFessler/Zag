@@ -9,13 +9,21 @@ const t = lib.testing;
 const E_NOENT: i64 = -10;
 
 /// §2.12.21 — `fault_reply` returns `E_NOENT` if the fault token does not match the currently pending thread (i.e., the thread was killed externally while the fault was pending).
-/// match the currently pending thread (i.e., the thread was killed
-/// externally while the fault was pending).
 ///
-/// Strong test: use the ORIGINAL valid token after externally killing the
-/// faulting thread via `thread_kill`. This exercises the spec scenario
-/// exactly — rather than the previous weak test which passed `token+1`
-/// (a bogus token).
+/// A .faulted thread cannot be killed via `thread_kill` (§2.4.17 / §4.32.4
+/// return E_BUSY), and revoking the process handle tears down the
+/// fault-handler relationship (releaseFaultHandler) which drains the
+/// pending_reply state and would yield E_INVAL rather than E_NOENT.
+///
+/// The kernel's E_NOENT path fires whenever the faulting thread's handle
+/// is no longer locatable in the handler's perm table between fault_recv
+/// and fault_reply. We exercise that path directly by revoking the
+/// faulting thread's perm handle (revoke_perm on a thread entry is a
+/// pure handle clear per §2.4.5 and the kernel's .thread case — it does
+/// not touch the fault box). The pending_reply state is preserved, but
+/// findThreadHandle(pending) returns null, matching the kernel comment
+/// "If the source thread was killed externally between fault_recv and
+/// fault_reply, the handle was cleared" — same observable path.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
@@ -43,8 +51,6 @@ pub fn main(pv: u64) void {
     }
     const token_u: u64 = @bitCast(token);
 
-    // The token IS the thread handle for §2.12.14. Use thread_kill to
-    // externally kill the faulting thread while the fault is pending.
     // Sanity check: the thread entry must currently exist in our view.
     var thread_present_before = false;
     for (0..128) |i| {
@@ -58,9 +64,13 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
 
-    const kr = syscall.thread_kill(token_u);
+    // Revoke the faulting thread's perm handle directly — .thread case
+    // of sysRevokePerm is a pure handle clear that does NOT touch the
+    // fault box. This drives findThreadHandle(pending) to null, which
+    // is the exact path §2.12.21's E_NOENT comes through.
+    const kr = syscall.revoke_perm(token_u);
     if (kr != 0) {
-        t.failWithVal("§2.12.21 thread_kill", 0, kr);
+        t.failWithVal("§2.12.21 revoke_perm", 0, kr);
         syscall.shutdown();
     }
 

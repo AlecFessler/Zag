@@ -23,24 +23,20 @@ const PAGE: u64 = 4096;
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Collect available device handles (need at least two for the two parts).
-    var devs: [8]u64 = undefined;
-    var n_devs: usize = 0;
+    // Part A uses AHCI MMIO (stable QEMU q35 MMIO device).
+    // Part B uses the Bochs display MMIO BAR (second stable MMIO device).
+    const ahci_ent = t.requireDevice(view, "§2.3.13", t.AHCI_VENDOR, t.AHCI_DEVICE, 0);
+    const bochs_ent = t.requireDevice(view, "§2.3.13", t.BOCHS_VENDOR, t.BOCHS_DEVICE, 0);
+    // Total count of device-region entries at start, used as baseline for the
+    // tree-walk return check at the end of Part B.
+    var devs_at_start: usize = 0;
     for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION and view[i].deviceType() == 0) {
-            if (n_devs < devs.len) {
-                devs[n_devs] = view[i].handle;
-                n_devs += 1;
-            }
-        }
+        if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION) devs_at_start += 1;
     }
-    if (n_devs < 2) {
-        t.fail("§2.3.13");
-        syscall.shutdown();
-    }
+    const n_devs: usize = devs_at_start;
 
     // --- Part A: device A mapped, then revoked; verify slot gone + MMIO gone ---
-    const dev_a = devs[0];
+    const dev_a = ahci_ent.handle;
     const vm_rights = perms.VmReservationRights{
         .read = true,
         .write = true,
@@ -77,11 +73,11 @@ pub fn main(pv: u64) void {
     const mmio_gone = mmio_readback == 0xD15EA5E5_1234BEEF;
 
     // --- Part B: transfer dev_b to child, child exits; dev_b returns to us ---
-    const dev_b = devs[1];
-    const child_rights = perms.ProcessRights{ .spawn_thread = true };
+    const dev_b = bochs_ent.handle;
+    const child_rights = perms.ProcessRights{ .spawn_thread = true, .device_own = true };
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
-        @intFromPtr(children.child_recv_device_exit.ptr),
-        children.child_recv_device_exit.len,
+        @intFromPtr(children.child_recv_device_wait.ptr),
+        children.child_recv_device_wait.len,
         child_rights.bits(),
     )));
 
@@ -89,7 +85,9 @@ pub fn main(pv: u64) void {
     var reply: syscall.IpcMessage = .{};
     _ = syscall.ipc_call_cap(child_handle, &.{ dev_b, dev_transfer_rights }, &reply);
 
-    // After transfer, dev_b should be gone from parent (exclusive transfer).
+    // After transfer (child now blocked on its second recv, still holding
+    // dev_b), verify dev_b is gone from the parent — the exclusive transfer
+    // must have removed it from our table.
     var dev_b_present_after_xfer = false;
     for (0..128) |i| {
         if (view[i].handle == dev_b and view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION) {
@@ -97,6 +95,9 @@ pub fn main(pv: u64) void {
             break;
         }
     }
+
+    // Signal child to exit so the device walks back up the tree to us.
+    _ = syscall.ipc_call(child_handle, &.{}, &reply);
 
     // Wait for child to exit — its device should walk back up to us.
     var attempts: u32 = 0;

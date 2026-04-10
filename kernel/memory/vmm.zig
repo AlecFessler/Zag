@@ -347,13 +347,19 @@ pub const VirtualMemoryManager = struct {
 
         const node = findNodeLocked(&self.tree, fault_vaddr) orelse return error.NoMapping;
 
+        // Fast path: if the page is already backed (e.g., SHM/MMIO mapping,
+        // a previously faulted-in private page), this is a no-op. Check this
+        // before rejecting non-private nodes so callers can blindly pre-fault
+        // every page in an arbitrary user range (e.g., the proc_create ELF
+        // pre-fault loop that handles both demand-paged private sources and
+        // SHM-backed ELF sources).
+        const page_base = VAddr.fromInt(std.mem.alignBackward(u64, fault_vaddr.addr, paging.PAGE4K));
+        if (arch.resolveVaddr(self.addr_space_root, page_base) != null) return;
+
         if (node.kind != .private) return error.NotDemandPageable;
         if (is_write and !node.rights.write) return error.PermissionDenied;
         if (is_exec and !node.rights.execute) return error.PermissionDenied;
         if (!is_write and !is_exec and !node.rights.read) return error.PermissionDenied;
-
-        const page_base = VAddr.fromInt(std.mem.alignBackward(u64, fault_vaddr.addr, paging.PAGE4K));
-        if (arch.resolveVaddr(self.addr_space_root, page_base) != null) return;
 
         const pmm_iface = pmm.global_pmm.?.allocator();
         const page = pmm_iface.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
@@ -473,17 +479,25 @@ pub const VirtualMemoryManager = struct {
             .user,
         );
 
-        for (shm.pages, 0..) |phys, i| {
-            const page_virt = VAddr.fromInt(range_start.addr + @as(u64, i) * paging.PAGE4K);
-            arch.mapPage(self.addr_space_root, phys, page_virt, perms) catch {
-                var j: usize = 0;
-                while (j < i) : (j += 1) {
-                    _ = arch.unmapPage(self.addr_space_root, VAddr.fromInt(range_start.addr + @as(u64, j) * paging.PAGE4K));
-                }
-                _ = self.tree.remove(map_node) catch {};
-                freeVmNode(map_node);
-                return error.OutOfMemory;
-            };
+        // §3.2: if the SHM handle lacks `read`, leave the pages non-present
+        // so any access (read or write) traps into the page fault handler,
+        // which looks up the VMM node (kind = .shared_memory) and reports
+        // invalid_read / invalid_write based on the access type.  On x86
+        // there is no "no-read" PTE bit, so unmapping is the only way to
+        // make reads fault on SHM regions.
+        if (rights.read) {
+            for (shm.pages, 0..) |phys, i| {
+                const page_virt = VAddr.fromInt(range_start.addr + @as(u64, i) * paging.PAGE4K);
+                arch.mapPage(self.addr_space_root, phys, page_virt, perms) catch {
+                    var j: usize = 0;
+                    while (j < i) : (j += 1) {
+                        _ = arch.unmapPage(self.addr_space_root, VAddr.fromInt(range_start.addr + @as(u64, j) * paging.PAGE4K));
+                    }
+                    _ = self.tree.remove(map_node) catch {};
+                    freeVmNode(map_node);
+                    return error.OutOfMemory;
+                };
+            }
         }
     }
 
@@ -543,6 +557,7 @@ pub const VirtualMemoryManager = struct {
         offset: u64,
         device: *DeviceRegion,
         write_combining: bool,
+        rights: PageRights,
     ) !void {
         self.lock.lock();
         defer self.lock.unlock();
@@ -568,7 +583,7 @@ pub const VirtualMemoryManager = struct {
             .start = range_start,
             .size = range_size,
             .kind = .{ .mmio = device },
-            .rights = .{ .read = true, .write = true },
+            .rights = .{ .read = rights.read, .write = rights.write, .execute = rights.execute },
             .handle = device_handle,
             .restart_policy = .free,
         };
@@ -579,26 +594,32 @@ pub const VirtualMemoryManager = struct {
         };
 
         const perms = MemoryPerms{
-            .write_perm = .write,
-            .execute_perm = .no_execute,
+            .write_perm = if (rights.write) .write else .no_write,
+            .execute_perm = if (rights.execute) .execute else .no_execute,
             .cache_perm = if (write_combining) .write_combining else .not_cacheable,
             .global_perm = .not_global,
             .privilege_perm = .user,
         };
 
-        var mapped: u64 = 0;
-        while (mapped < range_size) : (mapped += paging.PAGE4K) {
-            const page_phys = PAddr.fromInt(device.access.mmio.phys_base.addr + mapped);
-            const page_virt = VAddr.fromInt(range_start.addr + mapped);
-            arch.mapPage(self.addr_space_root, page_phys, page_virt, perms) catch {
-                var undo: u64 = 0;
-                while (undo < mapped) : (undo += paging.PAGE4K) {
-                    _ = arch.unmapPage(self.addr_space_root, VAddr.fromInt(range_start.addr + undo));
-                }
-                _ = self.tree.remove(map_node) catch {};
-                freeVmNode(map_node);
-                return error.OutOfMemory;
-            };
+        // §3.2: leave MMIO pages non-present when the reservation lacks
+        // `read`, so any access traps into the page fault handler and is
+        // resolved against the VMM node's rights (.mmio kind) to report
+        // invalid_read / invalid_write / invalid_execute.
+        if (rights.read) {
+            var mapped: u64 = 0;
+            while (mapped < range_size) : (mapped += paging.PAGE4K) {
+                const page_phys = PAddr.fromInt(device.access.mmio.phys_base.addr + mapped);
+                const page_virt = VAddr.fromInt(range_start.addr + mapped);
+                arch.mapPage(self.addr_space_root, page_phys, page_virt, perms) catch {
+                    var undo: u64 = 0;
+                    while (undo < mapped) : (undo += paging.PAGE4K) {
+                        _ = arch.unmapPage(self.addr_space_root, VAddr.fromInt(range_start.addr + undo));
+                    }
+                    _ = self.tree.remove(map_node) catch {};
+                    freeVmNode(map_node);
+                    return error.OutOfMemory;
+                };
+            }
         }
     }
 

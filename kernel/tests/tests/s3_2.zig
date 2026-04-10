@@ -43,7 +43,7 @@ fn findMmioDevice(view: [*]const perm_view.UserViewEntry) u64 {
 fn runMmioChild(view: [*]const perm_view.UserViewEntry, elf: []const u8, dev_handle: u64) perm_view.CrashReason {
     const child_rights = (perms.ProcessRights{ .mem_reserve = true, .device_own = true }).bits();
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(@intFromPtr(elf.ptr), elf.len, child_rights)));
-    const dev_rights = (perms.DeviceRegionRights{ .map = true }).bits();
+    const dev_rights = (perms.DeviceRegionRights{ .map = true, .grant = true, .dma = true }).bits();
     var reply: syscall.IpcMessage = .{};
     _ = syscall.ipc_call_cap(child_handle, &.{ dev_handle, dev_rights }, &reply);
     return waitForDeath(view, child_handle);

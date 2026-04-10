@@ -85,7 +85,13 @@ pub fn main(pv: u64) void {
     var reply2: syscall.IpcMessage = .{};
     _ = syscall.ipc_call(child_handle, &.{}, &reply2);
 
-    // Receive the fault and reply kill so the child restarts.
+    // Receive the fault and reply FAULT_KILL — this kills only the faulting
+    // thread and releases all `.suspended` siblings back to `.ready` per
+    // §2.12.23. The parker workers then exist as alive threads, so the
+    // process doesn't restart yet. We then thread_kill the workers (via the
+    // handles we hold as external fault handler) — the last non-exited
+    // thread exiting triggers restart (§2.4.18), which is what we want to
+    // observe.
     var fault_buf: [256]u8 align(8) = undefined;
     const token = syscall.fault_recv(@intFromPtr(&fault_buf), 1);
     if (token <= 0) {
@@ -93,6 +99,15 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
     _ = syscall.fault_reply_simple(@bitCast(token), syscall.FAULT_KILL);
+    // Kill every pre-restart thread handle. The faulting thread is already
+    // gone so its handle returns an error, which we ignore; the two parkers
+    // get killed and the last one triggers restart.
+    {
+        var k: usize = 0;
+        while (k < n_pre) : (k += 1) {
+            _ = syscall.thread_kill(pre_ids[k]);
+        }
+    }
 
     // Wait for the child's restart_count to advance.
     var slot: usize = 0;

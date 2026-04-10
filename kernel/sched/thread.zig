@@ -173,4 +173,4 @@ fn unmapKernelStack(stack: Stack) void {
 }
 
 pub var allocator: std.mem.Allocator = undefined;
-var tid_counter: u64 = 0;
+var tid_counter: u64 = 1;

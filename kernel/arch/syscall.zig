@@ -354,6 +354,11 @@ fn sysMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
         offset,
         device,
         vm_res.max_rights.write_combining,
+        .{
+            .read = vm_res.max_rights.read,
+            .write = vm_res.max_rights.write,
+            .execute = vm_res.max_rights.execute,
+        },
     ) catch |e| return switch (e) {
         error.CommittedPages => E_EXIST,
         else => E_INVAL,

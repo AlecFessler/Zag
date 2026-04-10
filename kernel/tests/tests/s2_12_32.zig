@@ -10,15 +10,17 @@ const E_PERM: i64 = -2;
 const E_BADCAP: i64 = -3;
 
 /// §2.12.32 — `fault_set_thread_mode` requires that the calling process holds `fault_handler` for the owning process of the target thread (the thread handle appears in the caller's perm table as a thread-type entry belonging to a process whose `fault_handler_proc == caller`).
-/// holds `fault_handler` for the owning process of the target thread
-/// (external fault_handler relationship). Returns `E_PERM` otherwise.
+/// holds `fault_handler` for the owning process of the target thread.
+/// Returns `E_PERM` otherwise.
 ///
 /// Strong test: two scenarios.
 ///
 /// Scenario A (self case): root calls `fault_set_thread_mode` on its OWN
-/// thread handle. Root self-handles via slot-0 `fault_handler`, which is
-/// NOT the required external fault_handler relationship per §2.12.32 —
-/// expected E_PERM.
+/// thread handle. Root self-handles via slot-0 `fault_handler`, which
+/// satisfies §2.12.32's "caller holds fault_handler for the owning
+/// process of the target thread" — expected E_OK. (Self-handling is a
+/// valid fault_handler relationship; the exclude flags are still
+/// meaningful since a self-handler can use them on sibling threads.)
 ///
 /// Scenario B (canonical negative via stale thread handle): spawn a
 /// child, acquire fault_handler (so a thread handle is inserted into
@@ -39,8 +41,8 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
     const rc_a = syscall.fault_set_thread_mode(@bitCast(self_handle), syscall.FAULT_MODE_STOP_ALL);
-    if (rc_a != E_PERM) {
-        t.failWithVal("§2.12.32 A self", E_PERM, rc_a);
+    if (rc_a != 0) {
+        t.failWithVal("§2.12.32 A self", 0, rc_a);
         syscall.shutdown();
     }
 

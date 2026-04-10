@@ -53,7 +53,7 @@ pub fn main(perm_view_addr: u64) void {
         // shm_size - 2*PAGE4K bytes; last page reserved for scratch).
         const elf_len = shm_size - 2 * syscall.PAGE4K;
         const elf_ptr: [*]const u8 = @ptrFromInt(base);
-        const gc_rights = (perms.ProcessRights{}).bits();
+        const gc_rights = (perms.ProcessRights{ .spawn_thread = true }).bits();
         const gc = syscall.proc_create(@intFromPtr(elf_ptr), elf_len, gc_rights);
         if (gc <= 0) return;
         const gc_handle: u64 = @bitCast(gc);

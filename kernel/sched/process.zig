@@ -743,6 +743,16 @@ pub const Process = struct {
         }
         self.lock.unlock();
 
+        // §2.3.4: clear the restart bit from slot 0 of our own permission
+        // table and publish to the user view so userspace observes that the
+        // capability is gone.
+        self.perm_lock.lock();
+        var self_rights = self.perm_table[0].processRights();
+        self_rights.restart = false;
+        self.perm_table[0].rights = @bitCast(self_rights);
+        self.syncUserView();
+        self.perm_lock.unlock();
+
         var i: u64 = 0;
         while (i < self.num_children) : (i += 1) {
             self.children[i].disableRestart();
