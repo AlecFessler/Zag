@@ -325,8 +325,6 @@ pub fn pinExclusive(thread: *Thread) i64 {
     if (affinity == 0 or (affinity & (affinity - 1)) != 0) return -1; // E_INVAL: not single-core
 
     const core_bit = affinity;
-    const count = arch.coreCount();
-    const all_cores: u64 = if (count >= 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(count)) - 1;
 
     // Atomically try to claim this core
     while (true) {
