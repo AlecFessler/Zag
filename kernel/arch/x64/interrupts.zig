@@ -4,9 +4,8 @@ const zag = @import("zag");
 const apic = zag.arch.x64.apic;
 const arch = zag.arch.dispatch;
 const cpu = zag.arch.x64.cpu;
-const idt = zag.arch.x64.idt;
 const gdt = zag.arch.x64.gdt;
-
+const idt = zag.arch.x64.idt;
 const interruptHandler = idt.interruptHandler;
 
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;

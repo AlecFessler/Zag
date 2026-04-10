@@ -1,7 +1,6 @@
-const zag = @import("zag");
-
-const vtd = @import("intel/vtd.zig");
 const vi = @import("amd/vi.zig");
+const vtd = @import("intel/vtd.zig");
+const zag = @import("zag");
 
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const PAddr = zag.memory.address.PAddr;

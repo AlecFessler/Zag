@@ -5,7 +5,6 @@ const elf = std.elf;
 const paging = zag.memory.paging;
 
 const Dwarf = std.debug.Dwarf;
-
 const VAddr = zag.memory.address.VAddr;
 
 pub const ElfSection = enum {

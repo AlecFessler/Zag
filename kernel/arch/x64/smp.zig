@@ -1,8 +1,9 @@
+const trampoline_code = @import("embedded_bins").trampoline;
 const std = @import("std");
 const zag = @import("zag");
 
-const arch = zag.arch.dispatch;
 const apic = zag.arch.x64.apic;
+const arch = zag.arch.dispatch;
 const cpu = zag.arch.x64.cpu;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
@@ -17,8 +18,6 @@ const timers = zag.arch.x64.timers;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
-
-const trampoline_code = @import("embedded_bins").trampoline;
 
 const TrampolineParams = extern struct {
     cr3: u64,
