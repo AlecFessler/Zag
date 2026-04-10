@@ -14,7 +14,6 @@ pub fn main(_: u64) void {
         .@"suspend" = true,
         .@"resume" = true,
         .kill = false,
-        .set_affinity = false,
     };
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create_with_thread_rights(
         @intFromPtr(children.child_report_slot1.ptr),

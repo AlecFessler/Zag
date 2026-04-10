@@ -1,6 +1,4 @@
-const lib = @import("lib");
-
-const ThreadHandleRights = lib.perms.ThreadHandleRights;
+const perms = @import("perms.zig");
 
 pub const PAGE4K: u64 = 4096;
 
@@ -163,7 +161,7 @@ pub fn mmio_unmap(device_handle: u64, vm_handle: u64) i64 {
 }
 
 pub fn proc_create(elf_ptr: u64, elf_len: u64, rights_bits: u64) i64 {
-    return proc_create_with_opts(elf_ptr, elf_len, rights_bits, ThreadHandleRights.full.bits(), PRIORITY_NORMAL);
+    return proc_create_with_opts(elf_ptr, elf_len, rights_bits, perms.ThreadHandleRights.full.bits(), PRIORITY_NORMAL);
 }
 
 pub fn proc_create_with_thread_rights(elf_ptr: u64, elf_len: u64, rights_bits: u64, thread_rights: u64) i64 {
