@@ -1,6 +1,9 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const containers = zag.containers;
+
+const PriorityQueue = containers.priority_queue.PriorityQueue;
 const SpinLock = zag.sched.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 
@@ -27,8 +30,7 @@ const Thread = zag.sched.thread.Thread;
 /// state transitions.
 pub const MessageBox = struct {
     state: State = .idle,
-    queue_head: ?*Thread = null,
-    queue_tail: ?*Thread = null,
+    waiters: PriorityQueue = .{},
     /// Thread blocked on `recv`, valid iff `state == .receiving`.
     receiver: ?*Thread = null,
     /// Sender thread that owns the currently-pending message; valid iff
@@ -43,13 +45,7 @@ pub const MessageBox = struct {
     /// Append `sender` to the wait queue. Caller must hold `self.lock`.
     /// Used when no receiver is currently blocked on `recv`.
     pub fn enqueueLocked(self: *MessageBox, sender: *Thread) void {
-        sender.next = null;
-        if (self.queue_tail) |tail| {
-            tail.next = sender;
-        } else {
-            self.queue_head = sender;
-        }
-        self.queue_tail = sender;
+        self.waiters.enqueue(sender);
     }
 
     /// Pop the head of the wait queue, if any. Caller must hold `self.lock`.
@@ -57,38 +53,14 @@ pub const MessageBox = struct {
     /// `pending_reply` (normal recv path) or stay in current state (drain
     /// during cleanup).
     pub fn dequeueLocked(self: *MessageBox) ?*Thread {
-        const head = self.queue_head orelse return null;
-        self.queue_head = head.next;
-        if (self.queue_head == null) {
-            self.queue_tail = null;
-        }
-        head.next = null;
-        return head;
+        return self.waiters.dequeue();
     }
 
     /// Remove a specific thread from the wait queue if present. Returns
     /// true if removed. Caller must hold `self.lock`. Used when a queued
     /// caller dies before its message is delivered.
     pub fn removeLocked(self: *MessageBox, target: *Thread) bool {
-        var prev: ?*Thread = null;
-        var cur = self.queue_head;
-        while (cur) |t| {
-            if (t == target) {
-                if (prev) |p| {
-                    p.next = t.next;
-                } else {
-                    self.queue_head = t.next;
-                }
-                if (self.queue_tail == t) {
-                    self.queue_tail = prev;
-                }
-                t.next = null;
-                return true;
-            }
-            prev = t;
-            cur = t.next;
-        }
-        return false;
+        return self.waiters.remove(target);
     }
 
     /// Transition to `receiving` state with `thread` as the blocked
@@ -96,7 +68,7 @@ pub const MessageBox = struct {
     /// verified `state == .idle` and the wait queue is empty.
     pub fn beginReceivingLocked(self: *MessageBox, thread: *Thread) void {
         std.debug.assert(self.state == .idle);
-        std.debug.assert(self.queue_head == null);
+        std.debug.assert(self.waiters.isEmpty());
         std.debug.assert(self.receiver == null);
         self.state = .receiving;
         self.receiver = thread;

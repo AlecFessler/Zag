@@ -2,6 +2,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const containers = zag.containers;
 const device_registry = zag.devices.registry;
 const futex = zag.sched.futex;
 const memory_init = zag.memory.init;
@@ -9,6 +10,7 @@ const process_mod = zag.sched.process;
 const thread_mod = zag.sched.thread;
 
 const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
+const PriorityQueue = containers.priority_queue.PriorityQueue;
 const Process = zag.sched.process.Process;
 const ProcessAllocator = zag.sched.process.ProcessAllocator;
 const SpinLock = zag.sched.sync.SpinLock;
@@ -28,63 +30,22 @@ const MAX_CORES = 64;
 const SCHED_TIMESLICE_NS = 2_000_000;
 
 const RunQueue = struct {
-    sentinel: Thread,
-    head: *Thread,
-    tail: *Thread,
-
-    pub fn init(self: *RunQueue) void {
-        self.sentinel = .{
-            .tid = std.math.maxInt(u64),
-            .ctx = undefined,
-            .kernel_stack = undefined,
-            .user_stack = null,
-            .process = idle_process,
-            .next = null,
-            .core_affinity = null,
-            .state = .running,
-            .on_cpu = std.atomic.Value(bool).init(false),
-        };
-        self.head = &self.sentinel;
-        self.tail = &self.sentinel;
-    }
+    pq: PriorityQueue = .{},
 
     pub fn enqueue(self: *RunQueue, thread: *Thread) void {
-        thread.next = null;
-        self.tail.next = thread;
-        self.tail = thread;
+        self.pq.enqueue(thread);
     }
 
     pub fn dequeue(self: *RunQueue) ?*Thread {
-        // Skip non-runnable threads (suspended, faulted).
-        // .exited is NOT skipped here — those threads continue running until
-        // they hit the scheduler-zombie path on the next preemption.
-        while (true) {
-            const first = self.head.next orelse return null;
-            if (self.tail == first) {
-                self.tail = self.head;
-            }
-            self.head.next = first.next;
-            first.next = null;
-            if (first.state == .suspended or first.state == .faulted) {
-                continue;
-            }
-            return first;
-        }
+        return self.pq.dequeue();
     }
 
-    /// Remove `thread` from this queue if present. Returns true if removed.
     pub fn remove(self: *RunQueue, thread: *Thread) bool {
-        var prev: *Thread = self.head;
-        while (prev.next) |cur| {
-            if (cur == thread) {
-                prev.next = cur.next;
-                if (self.tail == cur) self.tail = prev;
-                cur.next = null;
-                return true;
-            }
-            prev = cur;
-        }
-        return false;
+        return self.pq.remove(thread);
+    }
+
+    pub fn isEmpty(self: *RunQueue) bool {
+        return self.pq.isEmpty();
     }
 };
 
@@ -114,17 +75,18 @@ pub fn removeFromAnyRunQueue(thread: *Thread) void {
     }
 }
 
-const Zombie = struct {
+const ExitedThread = struct {
     thread: *Thread,
 };
 
 const PerCoreState = struct {
-    rq: RunQueue = undefined,
+    rq: RunQueue = .{},
     rq_lock: SpinLock = .{},
     running_thread: ?*Thread = null,
-    timer: Timer = undefined,
-    zombie: ?Zombie = null,
     pinned_thread: ?*Thread = null,
+    timer: Timer = undefined,
+    exited_thread: ?ExitedThread = null,
+    idle_thread: ?*Thread = null,
 };
 
 var core_states: [MAX_CORES]PerCoreState align(CACHE_LINE_SIZE) = [_]PerCoreState{.{}} ** MAX_CORES;
@@ -144,6 +106,50 @@ pub fn currentThread() ?*Thread {
     return core_states[arch.coreID()].running_thread;
 }
 
+/// Attempt to steal a thread from another core's run queue.
+/// Called when the local run queue is empty. Returns the stolen thread or null.
+fn tryStealWork(my_core_id: u64) ?*Thread {
+    const count = arch.coreCount();
+    const pinned = pinned_cores.load(.acquire);
+
+    // Retry loop in case peek succeeds but removal fails (race with another stealer)
+    var attempts: u32 = 0;
+    while (attempts < 3) : (attempts += 1) {
+        var best_thread: ?*Thread = null;
+        var best_core: u64 = 0;
+
+        // Peek across all non-pinned cores for the highest priority stealable thread
+        var i: u64 = 0;
+        while (i < count) : (i += 1) {
+            if (i == my_core_id) continue;
+            // Skip pinned cores
+            if (pinned & (@as(u64, 1) << @intCast(i)) != 0) continue;
+            const candidate = core_states[i].rq.pq.peekHighestStealable(my_core_id);
+            if (candidate) |c| {
+                if (best_thread == null) {
+                    best_thread = c;
+                    best_core = i;
+                } else if (@intFromEnum(c.priority) > @intFromEnum(best_thread.?.priority)) {
+                    best_thread = c;
+                    best_core = i;
+                }
+            }
+        }
+
+        const steal_target = best_thread orelse return null;
+
+        // Lock the candidate's home core and try to remove
+        const victim_state = &core_states[best_core];
+        const irq = victim_state.rq_lock.lockIrqSave();
+        const removed = victim_state.rq.remove(steal_target);
+        victim_state.rq_lock.unlockIrqRestore(irq);
+
+        if (removed) return steal_target;
+        // Race: thread was scheduled or stolen by someone else, retry
+    }
+    return null;
+}
+
 pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     const core_id = arch.coreID();
     const state = &core_states[core_id];
@@ -152,7 +158,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
 
     // Non-preemptible pinned threads: normally skip the context switch.
     // But if the thread has been killed (.exited), unpin it and fall through
-    // to normal scheduling so it can be cleaned up as a zombie.
+    // to normal scheduling so it can be cleaned up as an exited thread.
     if (preempted.pinned_exclusive) {
         if (preempted.state == .exited) {
             _ = unpinExclusive(preempted);
@@ -169,21 +175,64 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     preempted.ctx = ctx.thread_ctx;
     preempted.on_cpu.store(false, .release);
 
-    // Clean up the previous-tick zombie AFTER clearing on_cpu. The zombie's
-    // deinit can cascade through lastThreadExited → exit → performRestart →
-    // updateParentView → futex.wake, which spins on the wake target's on_cpu.
+    // Clean up the previous-tick exited thread AFTER clearing on_cpu. The exited
+    // thread's deinit can cascade through lastThreadExited -> exit -> performRestart ->
+    // updateParentView -> futex.wake, which spins on the wake target's on_cpu.
     // If the wake target happens to be the freshly-preempted thread on this
     // very core (e.g., a parent waiting on the dying child's restart futex),
     // and we still had on_cpu set, the wake spin would deadlock against
     // ourselves. Clearing on_cpu first makes the wake's spin a no-op.
-    if (state.zombie) |zombie| {
-        zombie.thread.deinit();
-        state.zombie = null;
+    if (state.exited_thread) |exited| {
+        exited.thread.deinit();
+        state.exited_thread = null;
     }
 
     state.rq_lock.lock();
 
-    if (preempted != &state.rq.sentinel and preempted.state == .running) {
+    // Check if this core has a pinned_thread that is ready and not currently running
+    if (state.pinned_thread) |pinned| {
+        if (pinned != preempted and pinned.state == .ready) {
+            // Preempt current thread and switch to pinned thread
+            if (preempted.state == .running) {
+                preempted.state = .ready;
+                // Migrate preempted thread to another core
+                state.rq_lock.unlock();
+                migrateToEligibleCore(preempted, core_id);
+                state.rq_lock.lock();
+            }
+            pinned.state = .running;
+            pinned.on_cpu.store(true, .release);
+            state.running_thread = pinned;
+
+            if (preempted.state == .exited) {
+                state.exited_thread = .{ .thread = preempted };
+            }
+
+            state.rq_lock.unlock();
+            if (core_id == expire_core.load(.monotonic)) {
+                futex.expireTimedWaiters();
+                expire_core.store((core_id + 1) % arch.coreCount(), .monotonic);
+            }
+            armSchedTimer(state, SCHED_TIMESLICE_NS);
+            if (pinned == preempted) return;
+            arch.switchTo(pinned);
+            return;
+        }
+
+        // If current thread IS the pinned thread: never preempt
+        if (pinned == preempted) {
+            state.rq_lock.unlock();
+            if (core_id == expire_core.load(.monotonic)) {
+                futex.expireTimedWaiters();
+                expire_core.store((core_id + 1) % arch.coreCount(), .monotonic);
+            }
+            armSchedTimer(state, SCHED_TIMESLICE_NS);
+            return;
+        }
+    }
+
+    // Priority-aware round-robin
+    if (preempted.state == .running) {
         preempted.state = .ready;
         // If the thread has affinity that excludes this core, migrate it
         if (preempted.core_affinity) |aff| {
@@ -200,15 +249,27 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
         }
     }
 
-    const next = state.rq.dequeue() orelse &state.rq.sentinel;
-    if (next != &state.rq.sentinel) {
-        next.state = .running;
-        next.on_cpu.store(true, .release);
-    }
-    state.running_thread = next;
+    var next = state.rq.dequeue();
 
-    if (preempted != &state.rq.sentinel and preempted.state == .exited) {
-        state.zombie = .{ .thread = preempted };
+    // Work stealing: if local queue is empty, try to steal from other cores
+    if (next == null) {
+        state.rq_lock.unlock();
+        next = tryStealWork(core_id);
+        state.rq_lock.lock();
+    }
+
+    // Fall back to idle thread if nothing else is available
+    if (next == null) {
+        next = state.idle_thread;
+    }
+
+    const next_thread = next.?;
+    next_thread.state = .running;
+    next_thread.on_cpu.store(true, .release);
+    state.running_thread = next_thread;
+
+    if (preempted.state == .exited) {
+        state.exited_thread = .{ .thread = preempted };
     }
 
     state.rq_lock.unlock();
@@ -217,8 +278,8 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
         expire_core.store((core_id + 1) % arch.coreCount(), .monotonic);
     }
     armSchedTimer(state, SCHED_TIMESLICE_NS);
-    if (next == preempted) return;
-    arch.switchTo(next);
+    if (next_thread == preempted) return;
+    arch.switchTo(next_thread);
 }
 
 pub fn yield() void {
@@ -292,6 +353,27 @@ fn migrateThreadsOff(state: *PerCoreState, pinned_core: u64) void {
     }
 }
 
+/// Migrate a thread to an eligible non-pinned core. Used when a pinned thread
+/// preempts the current thread and needs to move it elsewhere.
+fn migrateToEligibleCore(thread: *Thread, exclude_core: u64) void {
+    const count = arch.coreCount();
+    const pinned = pinned_cores.load(.acquire);
+    var target: u64 = 0;
+    while (target < count) : (target += 1) {
+        if (target == exclude_core) continue;
+        if (pinned & (@as(u64, 1) << @intCast(target)) != 0) continue;
+        if (thread.core_affinity) |aff| {
+            if (aff & (@as(u64, 1) << @intCast(target)) == 0) continue;
+        }
+        break;
+    }
+    if (target >= count) {
+        // No eligible core found, enqueue on core 0 as fallback
+        target = 0;
+    }
+    enqueueOnCore(target, thread);
+}
+
 /// Unpin a previously pinned thread, restoring preemptive scheduling on its core.
 pub fn unpinExclusive(thread: *Thread) i64 {
     if (!thread.pinned_exclusive) return -1;
@@ -344,6 +426,15 @@ pub fn enqueueOnCore(core_index: u64, thread: *Thread) void {
     const irq = state.rq_lock.lockIrqSave();
     state.rq.enqueue(thread);
     state.rq_lock.unlockIrqRestore(irq);
+
+    // IPI on thread ready: if the enqueued thread's priority exceeds the
+    // currently running thread on this core, send an IPI to preempt immediately.
+    const running = @atomicLoad(?*Thread, &state.running_thread, .acquire);
+    if (running) |r| {
+        if (@intFromEnum(thread.priority) > @intFromEnum(r.priority)) {
+            arch.triggerSchedulerInterrupt(target);
+        }
+    }
 }
 
 /// Pick best core for a thread. Prefers current_core if in affinity mask and not pinned.
@@ -374,16 +465,28 @@ pub fn switchToNextReady() noreturn {
     const state = &core_states[core_id];
 
     state.rq_lock.lock();
-    const next = state.rq.dequeue() orelse &state.rq.sentinel;
-    if (next != &state.rq.sentinel) {
-        next.state = .running;
-        next.on_cpu.store(true, .release);
+    var next = state.rq.dequeue();
+
+    // Work stealing if local queue is empty
+    if (next == null) {
+        state.rq_lock.unlock();
+        next = tryStealWork(core_id);
+        state.rq_lock.lock();
     }
-    state.running_thread = next;
+
+    // Fall back to idle thread
+    if (next == null) {
+        next = state.idle_thread;
+    }
+
+    const next_thread = next.?;
+    next_thread.state = .running;
+    next_thread.on_cpu.store(true, .release);
+    state.running_thread = next_thread;
     state.rq_lock.unlock();
 
     armSchedTimer(state, SCHED_TIMESLICE_NS);
-    arch.switchTo(next);
+    arch.switchTo(next_thread);
     unreachable;
 }
 
@@ -425,15 +528,27 @@ pub fn switchToThread(current: *Thread, target: *Thread, ctx: *ArchCpuContext, e
         arch.triggerSchedulerInterrupt(target_core);
         // Run next ready thread locally
         state.rq_lock.lock();
-        const next = state.rq.dequeue() orelse &state.rq.sentinel;
-        if (next != &state.rq.sentinel) {
-            next.state = .running;
-            next.on_cpu.store(true, .release);
+        var next = state.rq.dequeue();
+
+        // Work stealing if local queue is empty
+        if (next == null) {
+            state.rq_lock.unlock();
+            next = tryStealWork(current_core);
+            state.rq_lock.lock();
         }
-        state.running_thread = next;
+
+        // Fall back to idle thread
+        if (next == null) {
+            next = state.idle_thread;
+        }
+
+        const next_thread = next.?;
+        next_thread.state = .running;
+        next_thread.on_cpu.store(true, .release);
+        state.running_thread = next_thread;
         state.rq_lock.unlock();
         armSchedTimer(state, SCHED_TIMESLICE_NS);
-        arch.switchTo(next);
+        arch.switchTo(next_thread);
     }
     unreachable;
 }
@@ -446,10 +561,6 @@ pub fn globalInit(root_service_elf: []const u8) !void {
     thread_mod.allocator = thread_alloc_instance.allocator();
 
     idle_process = try Process.createIdle();
-
-    for (&core_states) |*state| {
-        state.rq.init();
-    }
 
     const root_proc = try Process.create(root_service_elf, .{
         .spawn_thread = true,
@@ -469,8 +580,24 @@ pub fn globalInit(root_service_elf: []const u8) !void {
 }
 
 pub fn perCoreInit() void {
-    const state = &core_states[arch.coreID()];
-    state.running_thread = &state.rq.sentinel;
+    const core_id = arch.coreID();
+    const state = &core_states[core_id];
+
+    // Create a real idle thread for this core
+    const idle_thread = thread_mod.allocator.create(Thread) catch @panic("failed to allocate idle thread");
+    idle_thread.* = .{
+        .tid = std.math.maxInt(u64) - core_id,
+        .ctx = undefined,
+        .kernel_stack = undefined,
+        .user_stack = null,
+        .process = idle_process,
+        .state = .running,
+        .on_cpu = std.atomic.Value(bool).init(true),
+        .priority = .idle,
+    };
+    state.idle_thread = idle_thread;
+    state.running_thread = idle_thread;
+
     state.timer = arch.getPreemptionTimer();
     arch.enableInterrupts();
     armSchedTimer(state, SCHED_TIMESLICE_NS);

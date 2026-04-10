@@ -2,9 +2,11 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const containers = zag.containers;
 const sched = zag.sched.scheduler;
 
 const PAddr = zag.memory.address.PAddr;
+const PriorityQueue = containers.priority_queue.PriorityQueue;
 const SpinLock = zag.sched.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
@@ -18,8 +20,7 @@ const MAX_TIMED_WAITERS = 64;
 
 const Bucket = struct {
     lock: SpinLock = .{},
-    head: ?*Thread = null,
-    tail: ?*Thread = null,
+    pq: PriorityQueue = .{},
 };
 
 var buckets: [BUCKET_COUNT]Bucket = [_]Bucket{.{}} ** BUCKET_COUNT;
@@ -32,35 +33,11 @@ fn bucketIdx(paddr: PAddr) usize {
 }
 
 fn pushWaiter(bucket: *Bucket, thread: *Thread) void {
-    thread.next = null;
-    if (bucket.tail) |t| {
-        t.next = thread;
-    } else {
-        bucket.head = thread;
-    }
-    bucket.tail = thread;
+    bucket.pq.enqueue(thread);
 }
 
 fn removeWaiter(bucket: *Bucket, target: *Thread) bool {
-    var prev: ?*Thread = null;
-    var current = bucket.head;
-    while (current) |t| {
-        if (t == target) {
-            if (prev) |p| {
-                p.next = t.next;
-            } else {
-                bucket.head = t.next;
-            }
-            if (bucket.tail == target) {
-                bucket.tail = prev;
-            }
-            t.next = null;
-            return true;
-        }
-        prev = t;
-        current = t.next;
-    }
-    return false;
+    return bucket.pq.remove(target);
 }
 
 fn addTimedWaiter(thread: *Thread) bool {
@@ -159,23 +136,14 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
 
     const irq = bucket.lock.lockIrqSave();
 
-    // Walk the waiter list, waking only threads waiting on the target paddr
-    var prev: ?*Thread = null;
-    var current = bucket.head;
-    while (current) |thread| {
-        if (woken >= count) break;
-        const next = thread.next;
+    // Pop threads from the priority queue. Since multiple paddrs may hash to
+    // the same bucket, we must check each thread's futex_paddr. Non-matching
+    // threads are collected and re-enqueued after the wake loop.
+    var requeue: PriorityQueue = .{};
+
+    while (woken < count) {
+        const thread = bucket.pq.dequeue() orelse break;
         if (thread.futex_paddr.addr == paddr.addr) {
-            // Remove from list
-            if (prev) |p| {
-                p.next = next;
-            } else {
-                bucket.head = next;
-            }
-            if (bucket.tail == thread) {
-                bucket.tail = prev;
-            }
-            thread.next = null;
             while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
             if (thread.futex_deadline_ns != 0) {
                 thread.futex_deadline_ns = 0;
@@ -188,11 +156,14 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
                 arch.coreID();
             sched.enqueueOnCore(target_core, thread);
             woken += 1;
-            // Don't advance prev — it stays the same
         } else {
-            prev = thread;
+            requeue.enqueue(thread);
         }
-        current = next;
+    }
+
+    // Re-enqueue non-matching threads back into the bucket
+    while (requeue.dequeue()) |t| {
+        bucket.pq.enqueue(t);
     }
 
     bucket.lock.unlockIrqRestore(irq);
