@@ -9,8 +9,10 @@ const ENTRY_TYPE_CORE_PIN: u8 = 4;
 var worker_counter: u64 align(8) = 0;
 
 fn workerSpin() void {
-    // Pin the worker to core 0 by affinity mask.
+    // Pin the worker to core 0 by affinity mask, then yield so the
+    // scheduler migrates us there before we touch the counter.
     _ = syscall.set_affinity(0x1);
+    syscall.thread_yield();
     while (true) {
         _ = @atomicRmw(u64, &worker_counter, .Add, 1, .monotonic);
         syscall.thread_yield();

@@ -20,20 +20,21 @@ fn atomicInc(ptr: *u64) u64 {
 }
 
 fn waiterFn(my_turn: u64, id: u64, priority: u64) void {
-    // Set our priority level before entering the futex wait.
-    _ = syscall.set_priority(priority);
-    // Wait for our turn to enter the futex.
+    // Synchronize at default (normal) priority so main isn't starved.
     t.waitUntilAtLeast(&step, my_turn);
     // Signal main that we're about to enter futex_wait.
     step = my_turn + 1;
     _ = syscall.futex_wake(@ptrCast(&step), 10);
+    // Set our priority level — the futex PQ will order us correctly.
+    _ = syscall.set_priority(priority);
     // Enter the shared futex wait.
     _ = syscall.futex_wait(@ptrCast(&futex_val), 0, INF);
     // Record wake order.
     const idx = atomicInc(&order_idx);
     order[idx] = id;
     _ = syscall.futex_wake(@ptrCast(&order_idx), 1);
-    while (true) syscall.thread_yield();
+    // Exit cleanly so high-priority threads don't starve main.
+    syscall.thread_exit();
 }
 
 // id=1 idle, id=2 normal, id=3 high

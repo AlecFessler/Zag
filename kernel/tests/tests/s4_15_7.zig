@@ -14,7 +14,7 @@ pub fn main(perm_view: u64) void {
     // Create enough to fill it.
     var created: u64 = 0;
     for (0..128) |_| {
-        const ret = syscall.shm_create(syscall.PAGE4K);
+        const ret = syscall.shm_create_with_rights(syscall.PAGE4K, 0x3);
         if (ret < 0) break;
         created += 1;
     }
