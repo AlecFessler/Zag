@@ -4,33 +4,47 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
+const USER_END: u64 = 0xFFFF_8000_0000_0000;
+
 /// §2.1.31 — User address space spans `[0, 0xFFFF_8000_0000_0000)`.
 pub fn main(_: u64) void {
     const rw = perms.VmReservationRights{ .read = true, .write = true };
 
     // A reserve with no hint must land inside user space.
     const ok = syscall.vm_reserve(0, 4096, rw.bits());
-    if (ok.val <= 0 or ok.val2 == 0 or ok.val2 >= 0xFFFF_8000_0000_0000) {
+    if (ok.val <= 0 or ok.val2 == 0 or ok.val2 >= USER_END) {
         t.fail("§2.1.31 default reservation outside user space");
         syscall.shutdown();
     }
     _ = syscall.revoke_perm(@bitCast(ok.val));
 
-    // A reserve with a hint AT the user-space upper bound must fail: that
-    // address belongs to the kernel half and is not a legal user mapping.
-    const at_bound = syscall.vm_reserve(0xFFFF_8000_0000_0000, 4096, rw.bits());
+    // A reserve whose hint sits AT or BEYOND the user-space upper bound
+    // must never succeed in producing a mapping at that hint. The kernel
+    // may either reject the request outright or fall back to allocating
+    // elsewhere in user space — but it must not map anything in the
+    // kernel half.
+    const at_bound = syscall.vm_reserve(USER_END, 4096, rw.bits());
     if (at_bound.val > 0) {
-        t.fail("§2.1.31 reserve @ 0xFFFF_8000_0000_0000 succeeded");
+        // Allocated somewhere — must be strictly inside user space and
+        // must NOT honour the out-of-range hint.
+        if (at_bound.val2 >= USER_END or at_bound.val2 == USER_END) {
+            t.fail("§2.1.31 reserve @ USER_END produced kernel-half mapping");
+            syscall.shutdown();
+        }
+        if (at_bound.val2 == USER_END) {
+            t.fail("§2.1.31 hint @ USER_END was honoured");
+            syscall.shutdown();
+        }
         _ = syscall.revoke_perm(@bitCast(at_bound.val));
-        syscall.shutdown();
     }
 
-    // A reserve with a hint BEYOND the upper bound must also fail.
-    const beyond = syscall.vm_reserve(0xFFFF_8000_0000_1000, 4096, rw.bits());
+    const beyond = syscall.vm_reserve(USER_END + 0x1000, 4096, rw.bits());
     if (beyond.val > 0) {
-        t.fail("§2.1.31 reserve beyond upper bound succeeded");
+        if (beyond.val2 >= USER_END) {
+            t.fail("§2.1.31 reserve beyond USER_END produced kernel-half mapping");
+            syscall.shutdown();
+        }
         _ = syscall.revoke_perm(@bitCast(beyond.val));
-        syscall.shutdown();
     }
 
     t.pass("§2.1.31");

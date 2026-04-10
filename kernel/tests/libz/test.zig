@@ -1,6 +1,79 @@
+const perm_view = @import("perm_view.zig");
 const syscall = @import("syscall.zig");
 
 const hex_chars = "0123456789abcdef";
+
+// --- Device lookup helpers ---
+//
+// The test rig runs under QEMU q35 with a fixed set of PCI devices that the
+// kernel registers at boot. Tests that exercise device-region syscalls must
+// resolve a real device handle from the root service's permission view; any
+// loose filter ("find the first MMIO device") is fragile and silently passes
+// if the filter misses. `requireDevice*` helpers fail hard instead of skipping.
+//
+// Stable QEMU q35 devices (confirmed via inventory probe):
+//
+//   MMIO  vendor=0x8086 device=0x2922  Intel ICH9 AHCI (bus 0 dev 31 fn 2)
+//                                      4 KiB MBAR (pci_class=0x01/0x06)
+//   PIO   vendor=0x8086 device=0x2922  Intel ICH9 AHCI (same function)
+//                                      32 ports PIO BAR
+//   MMIO  vendor=0x1234 device=0x1111  QEMU stdvga / bochs display
+//                                      16 MiB BAR (pci_class=0x03/0x00)
+//   PIO   vendor=0x8086 device=0x2930  Intel ICH9 SMBus
+//                                      64 ports PIO BAR (pci_class=0x0c/0x05)
+//
+// Tests that need "some MMIO device" use the AHCI MMIO BAR; tests that need
+// "some PIO device" use the AHCI PIO BAR. Both live on the same PCI function
+// so an MMIO + PIO pair is always available simultaneously. DMA tests also
+// use the AHCI MMIO BAR (the AHCI controller supports bus-mastering and the
+// kernel grants the `dma` right on MMIO devices).
+
+pub const AHCI_VENDOR: u16 = 0x8086;
+pub const AHCI_DEVICE: u16 = 0x2922;
+pub const BOCHS_VENDOR: u16 = 0x1234;
+pub const BOCHS_DEVICE: u16 = 0x1111;
+
+fn dieMissingDevice(name: []const u8) noreturn {
+    syscall.write("[FAIL] ");
+    syscall.write(name);
+    syscall.write(" missing required device — test rig misconfigured (QEMU q35 device inventory changed?)\n");
+    syscall.shutdown();
+}
+
+/// Find a device entry matching the given PCI vendor/device IDs and device_type
+/// (0 = MMIO, 1 = port_io). Aborts the test with a hard failure if not found.
+pub fn requireDevice(
+    view: [*]const perm_view.UserViewEntry,
+    name: []const u8,
+    vendor: u16,
+    device: u16,
+    device_type: u8,
+) *const perm_view.UserViewEntry {
+    for (0..128) |i| {
+        const e = &view[i];
+        if (e.entry_type != perm_view.ENTRY_TYPE_DEVICE_REGION) continue;
+        if (e.deviceType() != device_type) continue;
+        if (e.pciVendor() != vendor) continue;
+        if (e.pciDevice() != device) continue;
+        return e;
+    }
+    dieMissingDevice(name);
+}
+
+/// Find an MMIO device (AHCI). Aborts the test if not found.
+pub fn requireMmioDevice(view: [*]const perm_view.UserViewEntry, name: []const u8) *const perm_view.UserViewEntry {
+    return requireDevice(view, name, AHCI_VENDOR, AHCI_DEVICE, 0);
+}
+
+/// Find a PIO device (AHCI PIO BAR). Aborts the test if not found.
+pub fn requirePioDevice(view: [*]const perm_view.UserViewEntry, name: []const u8) *const perm_view.UserViewEntry {
+    return requireDevice(view, name, AHCI_VENDOR, AHCI_DEVICE, 1);
+}
+
+/// Find any device region (defaults to MMIO AHCI). Aborts the test if not found.
+pub fn requireAnyDevice(view: [*]const perm_view.UserViewEntry, name: []const u8) *const perm_view.UserViewEntry {
+    return requireMmioDevice(view, name);
+}
 
 pub fn printHex(val: u64) void {
     var buf: [18]u8 = undefined;

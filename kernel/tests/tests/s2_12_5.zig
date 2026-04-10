@@ -6,7 +6,15 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.12.5 — While a process holds `fault_handler` for a target, any new threads created in the target are immediately inserted into the handler's permissions table with full `ThreadHandleRights` upon `thread_create`
+/// §2.12.5 — While a process holds `fault_handler` for a target, any new threads created in the target are immediately inserted into the handler's permissions table with full `ThreadHandleRights` upon `thread_create`.
+/// threads created in the target are immediately inserted into the handler's
+/// permissions table with full `ThreadHandleRights` upon `thread_create`.
+///
+/// Strong test: snapshot thread handle IDs both pre-acquisition and
+/// post-acquisition. After the child creates one new thread, find the
+/// single delta entry (compared to the post-acquisition snapshot) and
+/// verify ONLY that entry's rights — eliminating the weakness of
+/// accepting any pre-existing thread entry as "full rights found".
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
@@ -20,61 +28,64 @@ pub fn main(pv: u64) void {
         child_rights,
     )));
 
-    // First call: child transfers fault_handler back to us. After this, the
-    // kernel inserts the child's initial thread into our perm view per §2.12.4.
+    // First ipc_call: child cap-transfers HANDLE_SELF + fault_handler.
+    // Per §2.12.4 the child's initial thread handle now exists in our
+    // table.
     var reply: syscall.IpcMessage = .{};
     if (syscall.ipc_call(child_handle, &.{}, &reply) != 0) {
         t.fail("§2.12.5 first ipc_call");
         syscall.shutdown();
     }
 
-    var count_before: u64 = 0;
+    // Snapshot: thread handle IDs currently in our table (includes the
+    // child's initial thread and root's own initial thread).
+    var post_acq_ids: [128]u64 = .{0} ** 128;
+    var post_acq_count: u32 = 0;
     for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD) count_before += 1;
+        if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD) {
+            post_acq_ids[post_acq_count] = view[i].handle;
+            post_acq_count += 1;
+        }
     }
 
-    // Second call: child does thread_create on a new thread, then replies.
-    // The reply is the synchronization point — by the time we read the perm
-    // view next, the new thread must already exist.
+    // Second ipc_call: child calls thread_create on a new worker and then
+    // replies — the reply is the barrier, so by the time we read the perm
+    // view below, the new thread has definitely been inserted into our
+    // table per §2.12.5.
     if (syscall.ipc_call(child_handle, &.{}, &reply) != 0) {
         t.fail("§2.12.5 second ipc_call");
         syscall.shutdown();
     }
-    const new_thread_ret: i64 = @bitCast(reply.words[0]);
-    if (new_thread_ret <= 0) {
-        t.failWithVal("§2.12.5 child thread_create", 1, new_thread_ret);
-        syscall.shutdown();
-    }
-    const new_thread_handle: u64 = @bitCast(new_thread_ret);
-
-    var count_after: u64 = 0;
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD) count_after += 1;
-    }
-
-    if (count_after != count_before + 1) {
-        t.failWithVal("§2.12.5 thread count", @bitCast(count_before + 1), @bitCast(count_after));
+    const child_thread_create_ret: i64 = @bitCast(reply.words[0]);
+    if (child_thread_create_ret <= 0) {
+        t.failWithVal("§2.12.5 child thread_create", 1, child_thread_create_ret);
         syscall.shutdown();
     }
 
-    // The new entry must carry full ThreadHandleRights. The handle ID the
-    // child received from its own thread_create is its handle ID, not ours,
-    // so locate by "the entry that wasn't there before" — i.e., a thread
-    // entry that isn't the child's initial thread. We rely on count = +1.
-    const full_thread_rights: u16 = @truncate(perms.ThreadHandleRights.full.bits());
-    var found_full: bool = false;
-    for (0..128) |i| {
+    // Find the delta: the single new thread entry not present in the
+    // post-acquisition snapshot.
+    const full_rights: u16 = @truncate(perms.ThreadHandleRights.full.bits());
+    var delta_count: u32 = 0;
+    var delta_rights: u16 = 0;
+    outer: for (0..128) |i| {
         if (view[i].entry_type != perm_view.ENTRY_TYPE_THREAD) continue;
-        if ((view[i].rights & full_thread_rights) == full_thread_rights) {
-            found_full = true;
+        const h = view[i].handle;
+        for (0..post_acq_count) |k| {
+            if (post_acq_ids[k] == h) continue :outer;
         }
+        delta_count += 1;
+        delta_rights = view[i].rights;
     }
-    if (!found_full) {
-        t.fail("§2.12.5 new thread missing full ThreadHandleRights");
+
+    if (delta_count != 1) {
+        t.failWithVal("§2.12.5 delta count", 1, @bitCast(@as(u64, delta_count)));
+        syscall.shutdown();
+    }
+    if ((delta_rights & full_rights) != full_rights) {
+        t.failWithVal("§2.12.5 delta rights", @intCast(full_rights), @intCast(delta_rights));
         syscall.shutdown();
     }
 
-    _ = new_thread_handle;
     t.pass("§2.12.5");
     syscall.shutdown();
 }

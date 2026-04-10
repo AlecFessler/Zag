@@ -11,13 +11,8 @@ const E_PERM: i64 = -2;
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    var dev_handle: u64 = 0;
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION and view[i].deviceType() == 0) {
-            dev_handle = view[i].handle;
-            break;
-        }
-    }
+    const dev = t.requireMmioDevice(view, "§4.8.5");
+    const dev_handle = dev.handle;
 
     // Create reservation with read+write but WITHOUT mmio right.
     const rights = perms.VmReservationRights{ .read = true, .write = true };

@@ -6,78 +6,124 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
+const E_AGAIN: i64 = -9;
+
 /// §2.12.34 — `fault_write_mem` writes bytes from the caller's buffer into the target process's virtual address space via physmap, bypassing the target's page table permission bits.
-/// process's virtual address space via physmap, bypassing page table permission bits.
-/// Requires fault_handler ProcessHandleRights bit on proc_handle.
+/// bits, writing into read-only pages (including the text segment).
+///
+/// Strong test: patch the child's RO text — specifically the 3-byte
+/// `movb (%rax), %al` null-deref instruction at the fault RIP — with
+/// three `NOP` bytes (0x90). Then FAULT_RESUME the child. If the write
+/// took effect from the child's perspective, the child executes past
+/// the (now-NOP) faulting bytes without re-faulting at the same RIP
+/// and eventually falls through to `thread_exit` (the runtime's
+/// _start epilogue), becoming a `dead_process` in our table. A
+/// re-fault at the SAME RIP would prove the write was not visible
+/// from the child's side.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Spawn a child that transfers fault_handler then faults — gives us a known mapped RIP.
-    const child_rights = (perms.ProcessRights{
-        .fault_handler = true,
-    }).bits();
+    const child_rights = (perms.ProcessRights{ .fault_handler = true }).bits();
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
         @intFromPtr(children.child_fault_after_transfer.ptr),
         children.child_fault_after_transfer.len,
         child_rights,
     )));
 
-    // Acquire fault_handler for the child.
+    var child_slot: usize = 0;
+    for (0..128) |i| {
+        if (view[i].handle == child_handle) {
+            child_slot = i;
+            break;
+        }
+    }
+
     var reply: syscall.IpcMessage = .{};
     _ = syscall.ipc_call(child_handle, &.{}, &reply);
 
-    // Receive the child's fault to learn its RIP.
+    // Receive the first fault — RIP is the null-deref movb instruction.
     var fault_msg: syscall.FaultMessage = undefined;
-    const recv_ret = syscall.fault_recv(@intFromPtr(&fault_msg), 1);
-    if (recv_ret < 0) {
-        t.failWithVal("§2.12.34 fault_recv", 0, recv_ret);
+    const token1 = syscall.fault_recv(@intFromPtr(&fault_msg), 1);
+    if (token1 <= 0) {
+        t.failWithVal("§2.12.34 fault_recv", 0, token1);
         syscall.shutdown();
     }
+    const original_rip = fault_msg.rip;
 
-    // Find the process handle entry for the child with fault_handler bit.
-    const fault_handler_bit: u16 = @truncate((perms.ProcessHandleRights{ .fault_handler = true }).bits());
+    // Locate our process handle to the child with the fault_handler bit.
+    const fh_bit: u16 = @truncate((perms.ProcessHandleRights{ .fault_handler = true }).bits());
     var proc_handle: u64 = 0;
     for (0..128) |i| {
         if (view[i].entry_type == perm_view.ENTRY_TYPE_PROCESS and
             view[i].handle != 0 and
-            (view[i].rights & fault_handler_bit) != 0)
+            (view[i].rights & fh_bit) != 0)
         {
             proc_handle = view[i].handle;
             break;
         }
     }
-
     if (proc_handle == 0) {
-        t.fail("§2.12.34 no fault_handler proc handle");
+        t.fail("§2.12.34 no fh proc handle");
         syscall.shutdown();
     }
 
-    // Write 4 bytes to the child's address space, then read them back
-    // to verify the write succeeded.
-    const write_buf = [4]u8{ 0xDE, 0xAD, 0xBE, 0xEF };
-    var read_buf: [4]u8 = .{0} ** 4;
-
-    // Write to the child's RIP — guaranteed mapped (it's the faulting code).
-    const target_addr: u64 = fault_msg.rip;
-
-    const wrc = syscall.fault_write_mem(proc_handle, target_addr, @intFromPtr(&write_buf), 4);
+    // Patch the faulting instruction to 3 NOPs. The text segment is
+    // mapped RO in the child; fault_write_mem must bypass that.
+    const nop_bytes = [3]u8{ 0x90, 0x90, 0x90 };
+    const wrc = syscall.fault_write_mem(proc_handle, original_rip, @intFromPtr(&nop_bytes), 3);
     if (wrc != 0) {
-        t.failWithVal("§2.12.34 write", 0, wrc);
+        t.failWithVal("§2.12.34 fault_write_mem", 0, wrc);
+        _ = syscall.fault_reply_simple(@bitCast(token1), syscall.FAULT_KILL);
         syscall.shutdown();
     }
 
-    // Read back what we wrote to verify.
-    const rrc = syscall.fault_read_mem(proc_handle, target_addr, @intFromPtr(&read_buf), 4);
-    if (rrc != 0) {
-        t.failWithVal("§2.12.34 read", 0, rrc);
+    // Resume the child. If the patch took effect, the child executes
+    // NOP-NOP-NOP at original_rip and then continues through the
+    // asm-block epilogue, the main() return, and eventually the
+    // runtime's thread_exit — becoming dead_process.
+    const rr = syscall.fault_reply_simple(@bitCast(token1), syscall.FAULT_RESUME);
+    if (rr != 0) {
+        t.failWithVal("§2.12.34 fault_reply RESUME", 0, rr);
         syscall.shutdown();
     }
 
-    // Verify the data matches.
-    if (read_buf[0] == 0xDE and read_buf[1] == 0xAD and read_buf[2] == 0xBE and read_buf[3] == 0xEF) {
-        t.pass("§2.12.34");
-    } else {
-        t.fail("§2.12.34 data mismatch");
+    // Poll for either (a) a second fault at the SAME RIP (patch failed)
+    // or (b) the child becoming dead_process / still alive without
+    // re-faulting at original_rip (patch succeeded).
+    var saw_same_rip_refault = false;
+    var saw_dead = false;
+    var attempts: u32 = 0;
+    while (attempts < 200_000 and !saw_same_rip_refault and !saw_dead) : (attempts += 1) {
+        if (view[child_slot].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS) {
+            saw_dead = true;
+            break;
+        }
+        var buf2: syscall.FaultMessage = undefined;
+        const rc2 = syscall.fault_recv(@intFromPtr(&buf2), 0);
+        if (rc2 > 0) {
+            if (buf2.rip == original_rip) {
+                saw_same_rip_refault = true;
+                _ = syscall.fault_reply_simple(@bitCast(rc2), syscall.FAULT_KILL);
+            } else {
+                // Different RIP — the child advanced past the patched
+                // bytes and faulted later. Patch took effect; kill and
+                // accept as success.
+                _ = syscall.fault_reply_simple(@bitCast(rc2), syscall.FAULT_KILL);
+                break;
+            }
+        } else if (rc2 == E_AGAIN) {
+            syscall.thread_yield();
+        } else {
+            // Unexpected result.
+            break;
+        }
     }
+
+    if (saw_same_rip_refault) {
+        t.fail("§2.12.34 child re-faulted at same RIP — patch not visible");
+        syscall.shutdown();
+    }
+
+    t.pass("§2.12.34");
     syscall.shutdown();
 }

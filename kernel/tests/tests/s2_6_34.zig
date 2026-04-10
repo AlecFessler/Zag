@@ -10,20 +10,9 @@ const t = lib.testing;
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Find a device handle.
-    var dev_handle: u64 = 0;
-    var dev_field0: u64 = 0;
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION) {
-            dev_handle = view[i].handle;
-            dev_field0 = view[i].field0;
-            break;
-        }
-    }
-    if (dev_handle == 0) {
-        t.pass("§2.6.34");
-        syscall.shutdown();
-    }
+    const dev = t.requireMmioDevice(view, "§2.6.34");
+    const dev_handle = dev.handle;
+    const dev_field0 = dev.field0;
 
     // Spawn non-restartable child_ipc_server WITH device_own.
     const child_rights = perms.ProcessRights{ .spawn_thread = true, .device_own = true };

@@ -1,50 +1,65 @@
+const children = @import("embedded_children");
 const lib = @import("lib");
 
 const perm_view = lib.perm_view;
+const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
-
-fn threadFn() void {
-    syscall.thread_exit();
-}
 
 /// §2.1.39 — The user permissions view is kept in sync with the kernel permissions table.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
-    const ret = syscall.thread_create(&threadFn, 0, 4);
-    if (ret < 0) {
-        t.fail("§2.1.39 thread_create failed");
-        syscall.shutdown();
-    }
-    const handle: u64 = @bitCast(ret);
 
-    // Insert was a mutation: the new thread entry must be visible.
-    var idx: ?usize = null;
-    for (0..128) |i| {
-        if (view[i].handle == handle and view[i].entry_type == perm_view.ENTRY_TYPE_THREAD) {
-            idx = i;
+    // Spawn a child and acquire the fault_handler cap for it via cap transfer.
+    // Per §2.12.4 the kernel inserts handles to the child's threads into our
+    // permissions table; that insertion must be reflected in our user view.
+    const child_rights = (perms.ProcessRights{ .fault_handler = true }).bits();
+    const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
+        @intFromPtr(children.child_send_self_fault_handler.ptr),
+        children.child_send_self_fault_handler.len,
+        child_rights,
+    )));
+
+    var reply: syscall.IpcMessage = .{};
+    _ = syscall.ipc_call(child_handle, &.{}, &reply);
+
+    // Find the child's main thread handle now mirrored into our view.
+    // Skip slot 1 which is our own initial thread.
+    var child_thread_slot: usize = 128;
+    var child_thread: u64 = 0;
+    for (2..128) |i| {
+        if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD and view[i].handle != 0) {
+            child_thread_slot = i;
+            child_thread = view[i].handle;
             break;
         }
     }
-
-    if (idx == null) {
-        t.fail("§2.1.39 thread entry not found after insert");
+    if (child_thread == 0) {
+        t.fail("§2.1.39 child thread not mirrored into handler view");
         syscall.shutdown();
     }
 
-    const entry_idx = idx.?;
+    // Mutation of the target's table: kill the child's only thread. Per
+    // §2.4.6 the kernel clears the thread from both the target's table and
+    // the handler's table and calls syncUserView on both. Our (handler)
+    // view must reflect that cross-table sync.
+    const kill_rc = syscall.thread_kill(child_thread);
+    if (kill_rc != 0) {
+        t.failWithVal("§2.1.39 thread_kill", 0, kill_rc);
+        syscall.shutdown();
+    }
 
-    // Yield until the child thread exits — exit removes its perm slot, and
-    // removal is a table mutation that must sync the user view.
-    var attempts: u32 = 0;
-    while (attempts < 10000) : (attempts += 1) {
+    var iters: u32 = 0;
+    while (iters < 20000) : (iters += 1) {
         syscall.thread_yield();
-        if (view[entry_idx].entry_type != perm_view.ENTRY_TYPE_THREAD) {
+        if (view[child_thread_slot].entry_type != perm_view.ENTRY_TYPE_THREAD or
+            view[child_thread_slot].handle != child_thread)
+        {
             t.pass("§2.1.39");
             syscall.shutdown();
         }
     }
 
-    t.fail("§2.1.39");
+    t.fail("§2.1.39 handler view did not reflect target table mutation");
     syscall.shutdown();
 }

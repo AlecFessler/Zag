@@ -11,13 +11,8 @@ const E_INVAL: i64 = -1;
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    var dev_handle: u64 = 0;
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION and view[i].deviceType() == 0) {
-            dev_handle = view[i].handle;
-            break;
-        }
-    }
+    const dev = t.requireMmioDevice(view, "§4.8.7");
+    const dev_handle = dev.handle;
 
     const rights = perms.VmReservationRights{ .read = true, .write = true, .mmio = true };
     const vm = syscall.vm_reserve(0, 8192, rights.bits());

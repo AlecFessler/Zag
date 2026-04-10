@@ -13,18 +13,8 @@ const t = lib.testing;
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Find an MMIO device.
-    var dev_handle: u64 = 0;
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION and view[i].deviceType() == 0) {
-            dev_handle = view[i].handle;
-            break;
-        }
-    }
-    if (dev_handle == 0) {
-        t.pass("§4.16.6 [SKIP: no MMIO device]");
-        syscall.shutdown();
-    }
+    const dev = t.requireMmioDevice(view, "§4.16.6");
+    const dev_handle = dev.handle;
 
     // Spawn child with device_own.
     const child_rights = (perms.ProcessRights{ .spawn_thread = true, .device_own = true }).bits();

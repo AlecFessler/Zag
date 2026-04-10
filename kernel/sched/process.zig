@@ -12,6 +12,7 @@ const restart_context_mod = zag.sched.restart_context;
 const sched = zag.sched.scheduler;
 const thread_mod = zag.sched.thread;
 
+const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
 const FaultReason = zag.perms.permissions.FaultReason;
 const CrashReason = FaultReason;
 const DeadProcessInfo = zag.perms.permissions.DeadProcessInfo;
@@ -439,13 +440,18 @@ pub const Process = struct {
     /// thread itself is the queued unit on the fault box — `thread.next`
     /// links into the queue, and the saved register snapshot lives in
     /// `thread.ctx.regs` (already populated by the exception entry stub).
-    pub fn faultBlock(self: *Process, thread: *Thread, reason: FaultReason, fault_addr: u64, rip: u64) bool {
+    pub fn faultBlock(self: *Process, thread: *Thread, reason: FaultReason, fault_addr: u64, rip: u64, user_ctx: ?*ArchCpuContext) bool {
         const handler = self.faultHandlerOf() orelse return false;
 
         // Stamp the fault payload onto the thread itself.
         thread.fault_reason = reason;
         thread.fault_addr = fault_addr;
         thread.fault_rip = rip;
+        // Stash pointer to the user iret frame for FAULT_RESUME_MODIFIED.
+        // Once the scheduler yields out of this thread, `thread.ctx` will
+        // point at a kernel-mode context and no longer refers to the user
+        // frame that the stub will iret through on resume.
+        thread.fault_user_ctx = user_ctx;
 
         if (handler == self) {
             // Self-handling: §2.12.7 / §2.12.8 / §2.12.9. No stop-all — sibling

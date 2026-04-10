@@ -107,7 +107,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
 
     const node = proc.vmm.findNode(faulting_virt) orelse {
         arch.print("K: USER_PF pid={d} addr=0x{x} w={} x={}\n", .{ proc.pid, faulting_virt.addr, is_write, is_exec });
-        if (proc.faultBlock(thread, .unmapped_access, faulting_virt.addr, fault.rip)) {
+        if (proc.faultBlock(thread, .unmapped_access, faulting_virt.addr, fault.rip, fault.user_ctx)) {
             arch.enableInterrupts();
             scheduler.yield();
             return;
@@ -120,7 +120,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     switch (node.kind) {
         .shared_memory, .mmio => {
             const r = accessReason(is_write, is_exec);
-            if (proc.faultBlock(thread, r, faulting_virt.addr, fault.rip)) {
+            if (proc.faultBlock(thread, r, faulting_virt.addr, fault.rip, fault.user_ctx)) {
                 arch.enableInterrupts();
                 scheduler.yield();
                 return;
@@ -141,7 +141,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
                     guardPageReason(proc, node.start.addr)
                 else
                     accessReason(is_write, is_exec);
-                if (proc.faultBlock(thread, r2, faulting_virt.addr, fault.rip)) {
+                if (proc.faultBlock(thread, r2, faulting_virt.addr, fault.rip, fault.user_ctx)) {
                     arch.enableInterrupts();
                     scheduler.yield();
                     return;

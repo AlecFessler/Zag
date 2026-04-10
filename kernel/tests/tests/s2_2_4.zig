@@ -9,7 +9,7 @@ const PAGE: u64 = 4096;
 const N_PAGES: u64 = 8;
 const SHM_SIZE: u64 = PAGE * N_PAGES;
 
-/// §2.2.4 — `shm_map` maps the full SHM region at the specified offset; pages
+/// §2.2.4 — `shm_map` maps the full SHM region at the specified offset.
 /// are eagerly mapped (no demand-fault delay). We prove this cross-process:
 /// parent maps an 8-page SHM and writes a per-page marker on every page;
 /// immediately after, a child maps the same SHM and writes a second marker on

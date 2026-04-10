@@ -12,14 +12,8 @@ const E_PERM: i64 = -2;
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Find a device handle in our perm_view.
-    var dev_handle: u64 = 0;
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION) {
-            dev_handle = view[i].handle;
-            break;
-        }
-    }
+    const dev = t.requireMmioDevice(view, "§2.11.29");
+    const dev_handle = dev.handle;
 
     // Spawn child_ipc_server WITHOUT device_own — child blocks on recv.
     const child_rights = perms.ProcessRights{ .spawn_thread = true };

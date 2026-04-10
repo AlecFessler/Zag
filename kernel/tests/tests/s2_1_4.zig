@@ -10,21 +10,10 @@ const t = lib.testing;
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Find a device handle to transfer to the child.
-    var dev_handle: u64 = 0;
-    var dev_field0: u64 = 0;
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION) {
-            dev_handle = view[i].handle;
-            dev_field0 = view[i].field0;
-            break;
-        }
-    }
-
-    if (dev_handle == 0) {
-        t.pass("§2.1.4 [SKIP: no device]");
-        syscall.shutdown();
-    }
+    // Grab the AHCI MMIO device — stable on the QEMU q35 test rig.
+    const dev = t.requireMmioDevice(view, "§2.1.4");
+    const dev_handle = dev.handle;
+    const dev_field0 = dev.field0;
 
     // Use child_spawner_device: it receives SHM (spawns grandchild), then receives
     // a device handle, then exits. Since it has a grandchild, it becomes a zombie.

@@ -21,11 +21,12 @@ fn findFaultHandlerProcHandle(view: [*]const perm_view.UserViewEntry) u64 {
     return 0;
 }
 
-/// §4.36.7 — `fault_write_mem` writes to pages mapped read-only in the target succeed; the write is performed via physmap and bypasses the target's page table permission bits
+/// §4.36.7 — `fault_write_mem` writes to pages mapped read-only in the target succeed; the write is performed via physmap and bypasses the target's page table permission bits.
+///
+/// Verifies the bytes actually landed by reading them back via fault_read_mem.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Spawn child that transfers fault_handler then faults.
     const child_rights = perms.ProcessRights{
         .fault_handler = true,
     };
@@ -56,10 +57,18 @@ pub fn main(pv: u64) void {
     }
 
     // Write to the child's code section (read-only + execute in the target).
-    // fault_write_mem should succeed because it uses physmap, bypassing page permissions.
-    var buf: [4]u8 = .{ 0x90, 0x90, 0x90, 0x90 };
-    const write_ret = syscall.fault_write_mem(proc_handle, fault_msg.rip, @intFromPtr(&buf), 4);
-    t.expectEqual("§4.36.7", E_OK, write_ret);
+    const pattern: [4]u8 = .{ 0x90, 0x90, 0x90, 0x90 };
+    const write_ret = syscall.fault_write_mem(proc_handle, fault_msg.rip, @intFromPtr(&pattern), 4);
+    t.expectEqual("§4.36.7 write rc", E_OK, write_ret);
 
+    // Read back the same bytes from the child's (read-only) code and verify.
+    var check: [4]u8 = .{ 0, 0, 0, 0 };
+    const read_ret = syscall.fault_read_mem(proc_handle, fault_msg.rip, @intFromPtr(&check), 4);
+    t.expectEqual("§4.36.7 readback rc", E_OK, read_ret);
+    if (check[0] == 0x90 and check[1] == 0x90 and check[2] == 0x90 and check[3] == 0x90) {
+        t.pass("§4.36.7 bytes landed in RO page");
+    } else {
+        t.fail("§4.36.7 readback mismatch");
+    }
     syscall.shutdown();
 }

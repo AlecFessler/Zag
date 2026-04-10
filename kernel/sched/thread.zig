@@ -59,6 +59,13 @@ pub const Thread = struct {
     fault_reason: FaultReason = .none,
     fault_addr: u64 = 0,
     fault_rip: u64 = 0,
+    /// Pointer to the user iret frame (the `cpu.Context` captured at the
+    /// original fault entry stub) living deeper on this thread's kernel
+    /// stack. FAULT_RESUME_MODIFIED must write into this frame — NOT into
+    /// `thread.ctx`, which after `faultBlock` -> `scheduler.yield()` points
+    /// at a later kernel-mode context produced by the scheduler IPI.
+    /// Set by `faultBlock`, cleared on FAULT_RESUME / FAULT_RESUME_MODIFIED.
+    fault_user_ctx: ?*ArchCpuContext = null,
 
     pub fn deinit(self: *Thread) void {
         const proc = self.process;

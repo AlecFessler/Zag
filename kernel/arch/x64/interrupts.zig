@@ -21,6 +21,12 @@ pub const PageFaultContext = struct {
     is_write: bool,
     is_exec: bool,
     rip: u64 = 0,
+    /// Pointer to the user iret `cpu.Context` captured by the stub, i.e.
+    /// the actual register frame that will be restored by the stub epilogue
+    /// iret. Used so `fault_reply(FAULT_RESUME_MODIFIED)` can patch the
+    /// real user frame instead of `thread.ctx` (which after yield points at
+    /// a kernel-mode context). Null for kernel-mode faults.
+    user_ctx: ?*ArchCpuContext = null,
 };
 
 pub const IntVecs = enum(u8) {

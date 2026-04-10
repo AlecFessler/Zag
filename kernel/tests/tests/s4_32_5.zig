@@ -8,11 +8,13 @@ const t = lib.testing;
 
 const E_OK: i64 = 0;
 
-/// §4.32.5 — If the killed thread is the last non-exited thread in the process, process exit or restart proceeds per §2.6
+/// §4.32.5 — If the killed thread is the last non-exited thread in the process, process exit or restart proceeds per §2.6.
+///
+/// The child is spawned without `.restart` so we can assert the observable
+/// final state is DEAD_PROCESS (not a silent `t.pass` fall-through).
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Spawn a single-threaded child that stays alive.
     const child_rights = perms.ProcessRights{
         .spawn_thread = true,
         .fault_handler = true,
@@ -28,11 +30,10 @@ pub fn main(pv: u64) void {
     }
     const child_handle: u64 = @bitCast(child_ret);
 
-    // Acquire fault_handler via cap transfer to get thread handles.
     var reply: syscall.IpcMessage = .{};
     _ = syscall.ipc_call(child_handle, &.{}, &reply);
 
-    // Find the child's thread handle in perm_view (skip slot 1 = parent's own).
+    // Find the child's thread handle (skip slot 1 = parent's own thread).
     var thread_handle: u64 = 0;
     for (2..128) |i| {
         if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD) {
@@ -40,31 +41,37 @@ pub fn main(pv: u64) void {
             break;
         }
     }
-
     if (thread_handle == 0) {
         t.fail("§4.32.5 no thread handle found");
         syscall.shutdown();
     }
 
-    // Kill the only thread in the child process.
-    const kill_ret = syscall.thread_kill(thread_handle);
-    t.expectEqual("§4.32.5 kill last thread", E_OK, kill_ret);
-
-    // Yield to let the kernel process the exit/restart.
-    for (0..10) |_| syscall.thread_yield();
-
-    // Check that the child process entry is now dead or restarted.
+    // Locate the child's process slot.
+    var child_slot: usize = 0xFFFF;
     for (0..128) |i| {
-        if (view[i].handle == child_handle) {
-            if (view[i].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS) {
-                t.pass("§4.32.5 process exited");
-                syscall.shutdown();
-            }
-            // Process type still alive means it restarted, which also satisfies §2.6.
+        if (view[i].handle == child_handle and view[i].entry_type == perm_view.ENTRY_TYPE_PROCESS) {
+            child_slot = i;
             break;
         }
     }
+    if (child_slot == 0xFFFF) {
+        t.fail("§4.32.5 child slot not found");
+        syscall.shutdown();
+    }
 
-    t.pass("§4.32.5 process restart/exit proceeded");
+    const kill_ret = syscall.thread_kill(thread_handle);
+    t.expectEqual("§4.32.5 kill last thread", E_OK, kill_ret);
+
+    // Poll for the child's entry to flip to DEAD_PROCESS (non-restartable child).
+    var attempts: u32 = 0;
+    while (attempts < 100000) : (attempts += 1) {
+        if (view[child_slot].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS) {
+            t.pass("§4.32.5 process exited (DEAD_PROCESS)");
+            syscall.shutdown();
+        }
+        syscall.thread_yield();
+    }
+
+    t.fail("§4.32.5 entry did not become DEAD_PROCESS");
     syscall.shutdown();
 }

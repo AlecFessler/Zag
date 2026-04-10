@@ -13,21 +13,9 @@ const t = lib.testing;
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Find a device handle in our perm view.
-    var dev_handle: u64 = 0;
-    var dev_field0: u64 = 0;
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION) {
-            dev_handle = view[i].handle;
-            dev_field0 = view[i].field0;
-            break;
-        }
-    }
-
-    if (dev_handle == 0) {
-        t.pass("§2.6.13 [SKIP: no device handles in test QEMU]");
-        syscall.shutdown();
-    }
+    const dev = t.requireMmioDevice(view, "§2.6.13");
+    const dev_handle = dev.handle;
+    const dev_field0 = dev.field0;
 
     // Spawn restartable child_device_restart.
     const child_rights = perms.ProcessRights{ .spawn_thread = true, .device_own = true, .restart = true };

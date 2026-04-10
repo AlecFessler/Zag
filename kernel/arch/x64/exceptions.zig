@@ -148,7 +148,7 @@ fn exceptionHandler(ctx: *cpu.Context) void {
             arch.print("K: EXCEPTION pid={d} vec={d} err=0x{x}\n", .{
                 thread.process.pid, vector, ctx.err_code,
             });
-            if (thread.process.faultBlock(thread, reason, ctx.rip, ctx.rip)) {
+            if (thread.process.faultBlock(thread, reason, ctx.rip, ctx.rip, ctx)) {
                 arch.enableInterrupts();
                 scheduler.yield();
                 return;
@@ -191,6 +191,7 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         .is_write = pf_err.is_write,
         .is_exec = pf_err.instr_fetch,
         .rip = ctx.rip,
+        .user_ctx = if (from_user) ctx else null,
     };
     zag.arch.interrupts.handlePageFault(&pf_ctx);
 }

@@ -11,15 +11,9 @@ const E_EXIST: i64 = -12;
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    var dev_handle: u64 = 0;
-    var dev_size: u32 = 0;
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION and view[i].deviceType() == 0) {
-            dev_handle = view[i].handle;
-            dev_size = view[i].deviceSizeOrPortCount();
-            break;
-        }
-    }
+    const dev = t.requireMmioDevice(view, "§4.8.11");
+    const dev_handle = dev.handle;
+    const dev_size: u32 = dev.deviceSizeOrPortCount();
 
     const page_size: u64 = 4096;
     const size = ((@as(u64, dev_size) + page_size - 1) / page_size) * page_size;

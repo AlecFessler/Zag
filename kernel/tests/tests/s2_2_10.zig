@@ -7,7 +7,7 @@ const t = lib.testing;
 
 const PAGE: u64 = 4096;
 
-/// §2.2.10 — After `mmio_unmap`, the range reverts to private with max RWX
+/// §2.2.10 — After `mmio_unmap`, the range reverts to private with max RWX rights.
 /// rights. We reserve the region with read+write+execute (plus mmio so we
 /// can mmio_map it in the first place), map MMIO, unmap, then verify that
 /// every page of the range is writable AND readable as fresh private memory.

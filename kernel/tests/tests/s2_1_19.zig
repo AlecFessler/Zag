@@ -35,7 +35,8 @@ pub fn main(pv: u64) void {
     const vm_handle: u64 = @bitCast(vm_r.val);
 
     // shared_memory: create a SHM region.
-    const shm_rc = syscall.shm_create(4096);
+    const shm_rights = (perms.SharedMemoryRights{ .read = true, .write = true }).bits();
+    const shm_rc = syscall.shm_create_with_rights(4096, shm_rights);
     if (shm_rc <= 0) {
         t.fail("§2.1.19 shm_create");
         syscall.shutdown();

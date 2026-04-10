@@ -10,18 +10,8 @@ const E_INVAL: i64 = -1;
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    var dev_handle: u64 = 0;
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION and view[i].deviceType() == 0) {
-            dev_handle = view[i].handle;
-            break;
-        }
-    }
-
-    if (dev_handle == 0) {
-        t.pass("§4.28.6 [SKIP: no device]");
-        syscall.shutdown();
-    }
+    const dev = t.requireMmioDevice(view, "§4.28.6");
+    const dev_handle = dev.handle;
 
     const ret = syscall.ioport_write(dev_handle, 0, 1, 0);
     t.expectEqual("§4.28.6", E_INVAL, ret);

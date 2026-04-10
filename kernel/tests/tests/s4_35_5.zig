@@ -21,11 +21,15 @@ fn findFaultHandlerProcHandle(view: [*]const perm_view.UserViewEntry) u64 {
     return 0;
 }
 
-/// §4.35.5 — `fault_read_mem` with `buf_ptr` not writable in the caller's address space returns `E_BADADDR`
+/// §4.35.5 — `fault_read_mem` with `buf_ptr` not writable in the caller's address space returns `E_BADADDR`.
+///
+/// Uses `fault_msg.rip` (known mapped in the child) as the target vaddr so the
+/// validation failure can only come from `buf_ptr`. `buf_ptr` is set to an
+/// address in the kernel partition (0xFFFF_8000_0000_0000), which fails the
+/// kernel's `AddrSpacePartition.user.contains(buf_ptr)` check.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Spawn child and acquire fault_handler.
     const child_rights = perms.ProcessRights{
         .fault_handler = true,
     };
@@ -55,8 +59,10 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
 
-    // Pass an unmapped address as buf_ptr in the caller's address space.
-    const ret = syscall.fault_read_mem(proc_handle, 0x200000, 0xDEAD, 8);
+    // Kernel-partition address — not in user partition, so the buf_ptr check
+    // must fire regardless of anything else.
+    const kernel_buf: u64 = 0xFFFF_8000_0000_0000;
+    const ret = syscall.fault_read_mem(proc_handle, fault_msg.rip, kernel_buf, 8);
     t.expectEqual("§4.35.5", E_BADADDR, ret);
 
     syscall.shutdown();

@@ -1,25 +1,54 @@
 const lib = @import("lib");
 
 const perm_view = lib.perm_view;
+const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
 /// §2.9.2 — Device user view `field0` encodes: `device_type(u8) | device_class(u8) << 8 | size_or_port_count(u32) << 32`.
+/// Verify the encoding against the known-stable AHCI MMIO BAR (4 KiB, class storage).
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Find a device and verify field0 encoding makes sense.
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION) {
-            const dev_type = view[i].deviceType();
-            const size = view[i].deviceSizeOrPortCount();
-            // device_type must be 0 (MMIO) or 1 (port_io).
-            if (dev_type <= 1 and size > 0) {
-                t.pass("§2.9.2");
-                syscall.shutdown();
-            }
-        }
+    const mmio = t.requireMmioDevice(view, "§2.9.2 mmio");
+    // AHCI MMIO BAR: type=0 (MMIO), class=storage (2), size=4096.
+    const f0 = mmio.field0;
+    const expected_type: u8 = 0;
+    const expected_class: u8 = @intFromEnum(perms.DeviceClass.storage);
+    const expected_size: u32 = 4096;
+    const expected_f0: u64 = @as(u64, expected_type) |
+        (@as(u64, expected_class) << 8) |
+        (@as(u64, expected_size) << 32);
+    if (f0 != expected_f0) {
+        t.failWithVal("§2.9.2 mmio_f0", @bitCast(expected_f0), @bitCast(f0));
+        syscall.shutdown();
     }
-    t.fail("§2.9.2");
+    if (mmio.deviceType() != expected_type) {
+        t.fail("§2.9.2 mmio_type");
+        syscall.shutdown();
+    }
+    if (mmio.deviceClass() != expected_class) {
+        t.fail("§2.9.2 mmio_class");
+        syscall.shutdown();
+    }
+    if (mmio.deviceSizeOrPortCount() != expected_size) {
+        t.fail("§2.9.2 mmio_size");
+        syscall.shutdown();
+    }
+
+    const pio = t.requirePioDevice(view, "§2.9.2 pio");
+    // AHCI PIO BAR: type=1, class=storage (2), size=32 ports.
+    const pf0 = pio.field0;
+    const pexpected_type: u8 = 1;
+    const pexpected_size: u32 = 32;
+    const pexpected_f0: u64 = @as(u64, pexpected_type) |
+        (@as(u64, expected_class) << 8) |
+        (@as(u64, pexpected_size) << 32);
+    if (pf0 != pexpected_f0) {
+        t.failWithVal("§2.9.2 pio_f0", @bitCast(pexpected_f0), @bitCast(pf0));
+        syscall.shutdown();
+    }
+
+    t.pass("§2.9.2");
     syscall.shutdown();
 }

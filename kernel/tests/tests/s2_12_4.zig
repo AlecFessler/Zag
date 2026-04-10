@@ -6,62 +6,81 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.12.4 — When a process acquires `fault_handler` for a target, the kernel immediately inserts thread handles for all of the target's current threads into the acquirer's permissions table with full `ThreadHandleRights`
-/// inserts thread handles for all of the target's current threads into the acquirer's
-/// permissions table with full ThreadHandleRights.
+/// §2.12.4 — When a process acquires `fault_handler` for a target, the kernel immediately inserts thread handles for all of the target's current threads into the acquirer's permissions table with full `ThreadHandleRights`.
+/// kernel immediately inserts thread handles for ALL of the target's
+/// current threads into the acquirer's permissions table with full
+/// `ThreadHandleRights`.
+///
+/// Strong test: spawn a multi-threaded child (4 threads) BEFORE the
+/// acquisition. Snapshot pre-acquisition thread handle IDs. After the
+/// cap transfer, find the DELTA (newly inserted thread entries) and
+/// verify (a) exactly 4 new thread handles appeared, (b) each delta
+/// entry carries full `ThreadHandleRights`. This eliminates the
+/// weakness of scanning for "any entry with full rights" (which
+/// previously matched the parent's own initial thread).
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Spawn a child with fault_handler right so it can transfer it to us.
-    const child_rights = perms.ProcessRights{ .spawn_thread = true, .fault_handler = true };
+    const child_rights = (perms.ProcessRights{
+        .spawn_thread = true,
+        .fault_handler = true,
+    }).bits();
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
-        @intFromPtr(children.child_send_self_fault_handler.ptr),
-        children.child_send_self_fault_handler.len,
-        child_rights.bits(),
+        @intFromPtr(children.child_spawn_threads_then_transfer_fh.ptr),
+        children.child_spawn_threads_then_transfer_fh.len,
+        child_rights,
     )));
 
-    // Count thread entries before acquiring fault_handler.
-    var thread_count_before: u64 = 0;
+    // Snapshot thread handle IDs prior to acquisition. (The child creates
+    // its three workers before it ever calls ipc_recv, so by the time
+    // ipc_call returns below, all four threads already exist in the
+    // child — but their handles in *our* table only appear as a side
+    // effect of acquiring fault_handler.)
+    var pre_ids: [128]u64 = .{0} ** 128;
+    var pre_count: u32 = 0;
     for (0..128) |i| {
         if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD) {
-            thread_count_before += 1;
+            pre_ids[pre_count] = view[i].handle;
+            pre_count += 1;
         }
     }
 
-    // Call the child — it replies with HANDLE_SELF via cap transfer with fault_handler bit.
-    // This makes us the fault handler, which should insert thread handles.
+    // Acquire fault_handler via cap transfer.
     var reply: syscall.IpcMessage = .{};
-    _ = syscall.ipc_call(child_handle, &.{}, &reply);
+    if (syscall.ipc_call(child_handle, &.{}, &reply) != 0) {
+        t.fail("§2.12.4 ipc_call");
+        syscall.shutdown();
+    }
 
-    // Count thread entries after acquiring fault_handler.
-    // The child has 1 thread (its initial thread), so we should see 1 new ENTRY_TYPE_THREAD.
-    var thread_count_after: u64 = 0;
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD) {
-            thread_count_after += 1;
+    // Count delta thread entries — those that appear in our table now
+    // but whose handle IDs were not present pre-acquisition. Each must
+    // carry full ThreadHandleRights.
+    const full_rights: u16 = @truncate(perms.ThreadHandleRights.full.bits());
+    var delta_count: u32 = 0;
+    var delta_all_full = true;
+
+    outer: for (0..128) |i| {
+        if (view[i].entry_type != perm_view.ENTRY_TYPE_THREAD) continue;
+        const h = view[i].handle;
+        for (0..pre_count) |k| {
+            if (pre_ids[k] == h) continue :outer;
+        }
+        delta_count += 1;
+        if ((view[i].rights & full_rights) != full_rights) {
+            delta_all_full = false;
         }
     }
 
-    // Verify at least one new thread handle appeared.
-    if (thread_count_after > thread_count_before) {
-        // Also verify the thread handle has full ThreadHandleRights (0x0F).
-        const full_thread_rights: u16 = @truncate(perms.ThreadHandleRights.full.bits());
-        var has_full_rights = false;
-        for (0..128) |i| {
-            if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD and
-                (view[i].rights & full_thread_rights) == full_thread_rights)
-            {
-                has_full_rights = true;
-                break;
-            }
-        }
-        if (has_full_rights) {
-            t.pass("§2.12.4");
-        } else {
-            t.fail("§2.12.4");
-        }
-    } else {
-        t.failWithVal("§2.12.4", @bitCast(thread_count_before + 1), @bitCast(thread_count_after));
+    // Expect 4: the child's main thread + 3 workers.
+    if (delta_count != 4) {
+        t.failWithVal("§2.12.4 delta thread count", 4, @bitCast(@as(u64, delta_count)));
+        syscall.shutdown();
     }
+    if (!delta_all_full) {
+        t.fail("§2.12.4 delta threads missing full ThreadHandleRights");
+        syscall.shutdown();
+    }
+
+    t.pass("§2.12.4");
     syscall.shutdown();
 }

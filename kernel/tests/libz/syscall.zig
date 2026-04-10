@@ -413,6 +413,19 @@ pub fn fault_reply_simple(token: u64, action: u64) i64 {
     return syscall3(.fault_reply, token, action, 0);
 }
 
+/// Invoke `fault_reply` with explicit `flags` in r14 (e.g. FAULT_EXCLUDE_NEXT,
+/// FAULT_EXCLUDE_PERMANENT). `modified_regs_ptr` is passed via rdx.
+pub fn fault_reply_flags(token: u64, action: u64, modified_regs_ptr: u64, flags: u64) i64 {
+    return asm volatile ("int $0x80"
+        : [ret] "={rax}" (-> i64),
+        : [num] "{rax}" (@intFromEnum(SyscallNum.fault_reply)),
+          [a0] "{rdi}" (token),
+          [a1] "{rsi}" (action),
+          [a2] "{rdx}" (modified_regs_ptr),
+          [f] "{r14}" (flags),
+        : .{ .rcx = true, .r11 = true, .memory = true });
+}
+
 pub fn fault_read_mem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64 {
     return syscall4(.fault_read_mem, proc_handle, vaddr, buf_ptr, len);
 }

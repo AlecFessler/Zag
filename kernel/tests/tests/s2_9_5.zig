@@ -6,35 +6,53 @@ const syscall = lib.syscall;
 const t = lib.testing;
 
 /// §2.9.5 — Kernel-internal devices (HPET, LAPIC, I/O APIC) are not exposed in the user view.
+/// HPET is a legacy memory-mapped timer at 0xFED00000; LAPIC lives at 0xFEE00000
+/// and IOAPIC at 0xFEC00000. None of these are PCI devices — they should never
+/// appear in the root service's device table. Check both by device_class
+/// (nothing marked `timer`) and by PCI identification (no entry with vendor=0
+/// AND device=0 except the legacy 8250 serial, which IS expected).
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Check that no device has PCI class 0x08 (system peripheral — HPET is subclass 0x03)
-    // or class 0xFF with vendor 0 (LAPIC/IOAPIC are platform devices, not PCI).
-    // Also verify all device handles have non-zero sizes (they are real usable devices).
-    var bad_device = false;
+    // Sanity: the test rig must actually have some device entries. If not,
+    // inventory is broken — fail hard.
+    _ = t.requireMmioDevice(view, "§2.9.5 baseline");
+
+    var saw_any_device = false;
     for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION) {
-            const size = view[i].deviceSizeOrPortCount();
-            if (size == 0) {
-                bad_device = true;
-                break;
-            }
-            // LAPIC is at 0xFEE00000 (4KB), IOAPIC at 0xFEC00000 (4KB), HPET at 0xFED00000.
-            // These should NOT appear. We can't check physical addresses from userspace,
-            // but we can verify device_class is not "timer" for HPET.
-            const dev_class = view[i].deviceClass();
-            if (dev_class == @intFromEnum(perms.DeviceClass.timer)) {
-                bad_device = true;
-                break;
-            }
+        const e = &view[i];
+        if (e.entry_type != perm_view.ENTRY_TYPE_DEVICE_REGION) continue;
+        saw_any_device = true;
+
+        // (a) No kernel-internal timer should leak through as a device entry.
+        if (e.deviceClass() == @intFromEnum(perms.DeviceClass.timer)) {
+            t.fail("§2.9.5 timer_exposed");
+            syscall.shutdown();
+        }
+
+        // (b) Every exposed entry must have a non-zero size.
+        if (e.deviceSizeOrPortCount() == 0) {
+            t.fail("§2.9.5 zero_size");
+            syscall.shutdown();
+        }
+
+        // (c) No known fixed-address kernel device. We can't read the physical
+        //     address from userspace, but any device with `serial` class and
+        //     zero PCI IDs is the legacy COM port (allowed). Everything else
+        //     with zero PCI IDs would be suspicious.
+        const zero_pci = e.pciVendor() == 0 and e.pciDevice() == 0;
+        const is_legacy_serial = e.deviceClass() == @intFromEnum(perms.DeviceClass.serial);
+        if (zero_pci and !is_legacy_serial) {
+            t.fail("§2.9.5 non_pci_non_serial");
+            syscall.shutdown();
         }
     }
 
-    if (!bad_device) {
-        t.pass("§2.9.5");
-    } else {
-        t.fail("§2.9.5");
+    if (!saw_any_device) {
+        t.fail("§2.9.5 empty");
+        syscall.shutdown();
     }
+
+    t.pass("§2.9.5");
     syscall.shutdown();
 }
