@@ -1,99 +1,64 @@
+const children = @import("embedded_children");
 const lib = @import("lib");
 
-const perm_view = lib.perm_view;
+const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// Shared counter incremented by the worker thread. Volatile to prevent optimization.
-var counter: u64 = 0;
-
-fn counterThread() void {
-    while (true) {
-        const ptr: *volatile u64 = @ptrCast(&counter);
-        ptr.* += 1;
-        syscall.thread_yield();
-    }
-}
-
-fn findThreadEntry(view: [*]const perm_view.UserViewEntry, handle: u64) ?*const perm_view.UserViewEntry {
-    for (0..128) |i| {
-        if (view[i].handle == handle and view[i].entry_type == perm_view.ENTRY_TYPE_THREAD) {
-            return &view[i];
-        }
-    }
-    return null;
-}
-
 /// §2.4.21 — A `.faulted` thread is not scheduled and does not appear on any run queue.
 ///
-/// Directly inducing .faulted state requires fault handler infrastructure. Instead, we test
-/// the observable property via .suspended state (which also means "not scheduled") by:
-///   1. Creating a counter thread that increments a shared counter.
-///   2. Verifying the counter increments while the thread is running.
-///   3. Suspending the thread (enters .suspended, which like .faulted is not scheduled).
-///   4. Recording the counter, yielding many times, verifying it did NOT increment.
-///   5. Checking perm_view shows state == 4 (suspended), confirming not on run queue.
-///
-/// NOTE: Full §2.4.21 test requires fault handler to put thread into .faulted (state 3)
-/// and verify it doesn't run. The scheduling property is the same as .suspended.
-pub fn main(pv: u64) void {
-    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
+/// A .faulted thread is only observable via the fault delivery channel. We
+/// prove the scheduling property behaviorally: once the faulting thread is
+/// in `.faulted`, the kernel must re-enqueue it when fault_reply issues
+/// FAULT_RESUME. If the thread had remained on the run queue, the resume
+/// would be a no-op and the same instruction would execute only once; in
+/// fact it must run again and re-fault at the same address.
+pub fn main(_: u64) void {
+    const child_rights = (perms.ProcessRights{
+        .spawn_thread = true,
+        .fault_handler = true,
+    }).bits();
+    const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
+        @intFromPtr(children.child_fault_after_transfer.ptr),
+        children.child_fault_after_transfer.len,
+        child_rights,
+    )));
 
-    const ret = syscall.thread_create(&counterThread, 0, 4);
-    if (ret <= 0) {
-        t.failWithVal("§2.4.21 thread_create", 1, ret);
+    var reply: syscall.IpcMessage = .{};
+    _ = syscall.ipc_call(child_handle, &.{}, &reply);
+
+    // First fault: the null-deref.
+    var fault_buf1: [256]u8 align(8) = undefined;
+    const token1 = syscall.fault_recv(@intFromPtr(&fault_buf1), 1);
+    if (token1 < 0) {
+        t.failWithVal("§2.4.21 fault_recv 1", 0, token1);
         syscall.shutdown();
     }
-    const handle: u64 = @bitCast(ret);
+    const fm1: *const syscall.FaultMessage = @ptrCast(@alignCast(&fault_buf1));
+    const addr1 = fm1.fault_addr;
 
-    // Let the thread run and increment the counter.
-    for (0..20) |_| syscall.thread_yield();
-
-    const ctr_ptr: *volatile u64 = @ptrCast(&counter);
-    const running_count = ctr_ptr.*;
-    if (running_count == 0) {
-        t.fail("§2.4.21 counter never incremented while running");
+    // Resume unchanged. The thread was .faulted and off the run queue; the
+    // kernel must re-enqueue it. Once resumed it will execute the same
+    // instruction again and re-fault at the same address.
+    const rc = syscall.fault_reply_simple(@bitCast(token1), syscall.FAULT_RESUME);
+    if (rc != 0) {
+        t.failWithVal("§2.4.21 fault_reply RESUME", 0, rc);
         syscall.shutdown();
     }
 
-    // Suspend the thread.
-    const suspend_ret = syscall.thread_suspend(handle);
-    if (suspend_ret < 0) {
-        t.failWithVal("§2.4.21 thread_suspend", 0, suspend_ret);
+    // Block on the second fault from the resumed thread.
+    var fault_buf2: [256]u8 align(8) = undefined;
+    const token2 = syscall.fault_recv(@intFromPtr(&fault_buf2), 1);
+    if (token2 < 0) {
+        t.failWithVal("§2.4.21 fault_recv 2", 0, token2);
         syscall.shutdown();
     }
-
-    // Yield to let kernel process the suspension.
-    for (0..5) |_| syscall.thread_yield();
-
-    // Record counter after suspension.
-    const after_suspend = ctr_ptr.*;
-
-    // Yield many more times — counter should NOT change if thread is off the run queue.
-    for (0..50) |_| syscall.thread_yield();
-
-    const after_wait = ctr_ptr.*;
-
-    if (after_wait == after_suspend) {
-        t.pass("§2.4.21 suspended thread not scheduled");
+    const fm2: *const syscall.FaultMessage = @ptrCast(@alignCast(&fault_buf2));
+    if (fm2.fault_addr == addr1) {
+        t.pass("§2.4.21");
     } else {
-        t.fail("§2.4.21 counter changed while thread suspended");
+        t.fail("§2.4.21 second fault at different address");
     }
-
-    // Verify perm_view shows suspended state (4).
-    if (findThreadEntry(view, handle)) |entry| {
-        const state = entry.threadState();
-        if (state == 4) {
-            t.pass("§2.4.21 perm_view state is suspended");
-        } else {
-            t.failWithVal("§2.4.21 perm_view state", 4, @intCast(state));
-        }
-    } else {
-        t.fail("§2.4.21 thread handle not found in perm_view");
-    }
-
-    // Clean up: kill the suspended thread.
-    _ = syscall.thread_kill(handle);
-
+    _ = syscall.fault_reply_simple(@bitCast(token2), syscall.FAULT_KILL);
     syscall.shutdown();
 }

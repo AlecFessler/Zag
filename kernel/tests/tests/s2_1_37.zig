@@ -10,7 +10,7 @@ fn threadFn() void {
     syscall.thread_exit();
 }
 
-/// §2.1.37 — Thread entry `field0` encodes `state(u8, bits 0–7) | core_id(u8, bits 8–15)`.
+/// §2.1.37 — Thread entry `field0` is the thread's stable kernel-assigned thread id (`tid`, u64).
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
     const ret = syscall.thread_create(&threadFn, 0, 4);
@@ -23,11 +23,8 @@ pub fn main(pv: u64) void {
     var found = false;
     for (0..128) |i| {
         if (view[i].handle == handle and view[i].entry_type == perm_view.ENTRY_TYPE_THREAD) {
-            const state = view[i].threadState();
-            // A newly created thread should be ready (0) or running (1)
-            if (state <= 1) {
-                found = true;
-            }
+            // A valid thread must have a non-zero tid.
+            if (view[i].threadTid() != 0) found = true;
             break;
         }
     }

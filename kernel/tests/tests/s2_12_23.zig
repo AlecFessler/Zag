@@ -1,96 +1,99 @@
 const children = @import("embedded_children");
 const lib = @import("lib");
 
-const perm_view = lib.perm_view;
 const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const THREAD_STATE_SUSPENDED: u8 = 4;
-const THREAD_STATE_READY: u8 = 0;
+/// §2.12.23 — On any `fault_reply`, all threads in the target process that are in `.suspended` state are moved to `.ready` and re-enqueued before the action on the faulting thread is applied.
+pub fn main(_: u64) void {
+    // SHM page for the worker counter.
+    const shm_rights = (perms.SharedMemoryRights{
+        .read = true,
+        .write = true,
+        .grant = true,
+    }).bits();
+    const shm_handle: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(0x1000, shm_rights)));
 
-/// §2.12.23 — On any `fault_reply`, all threads in the target process that are in `.suspended` state are moved to `.ready` and re-enqueued before the action on the faulting thread is applied
-/// `.suspended` state are moved to `.ready` and re-enqueued before the action on
-/// the faulting thread is applied.
-pub fn main(pv: u64) void {
-    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
+    const vm_rights = (perms.VmReservationRights{
+        .read = true,
+        .write = true,
+        .shareable = true,
+    }).bits();
+    const vm_result = syscall.vm_reserve(0, 0x1000, vm_rights);
+    if (vm_result.val < 0) {
+        t.fail("§2.12.23 vm_reserve");
+        syscall.shutdown();
+    }
+    if (syscall.shm_map(shm_handle, @intCast(vm_result.val), 0) != 0) {
+        t.fail("§2.12.23 shm_map");
+        syscall.shutdown();
+    }
+    const counter_ptr: *volatile u64 = @ptrFromInt(vm_result.val2);
+    counter_ptr.* = 0;
 
-    // Spawn a multi-threaded child that transfers fault_handler then faults.
-    // The child spawns a worker thread, then its main thread null-derefs.
-    // On the fault, stop-all suspends the worker thread.
     const child_rights = (perms.ProcessRights{
         .spawn_thread = true,
+        .mem_reserve = true,
         .fault_handler = true,
     }).bits();
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
-        @intFromPtr(children.child_multithread_fault_after_transfer.ptr),
-        children.child_multithread_fault_after_transfer.len,
+        @intFromPtr(children.child_shm_counter_then_fault.ptr),
+        children.child_shm_counter_then_fault.len,
         child_rights,
     )));
 
-    // Acquire fault_handler for the child via cap transfer.
+    const shm_cap_rights: u64 = (perms.SharedMemoryRights{
+        .read = true,
+        .write = true,
+        .grant = true,
+    }).bits();
     var reply: syscall.IpcMessage = .{};
-    _ = syscall.ipc_call(child_handle, &.{}, &reply);
+    _ = syscall.ipc_call_cap(child_handle, &.{ shm_handle, shm_cap_rights }, &reply);
 
-    // Wait for the fault to arrive (blocking).
+    // Block until the fault arrives. At this point the worker is suspended
+    // by stop-all.
     var fault_buf: [256]u8 align(8) = undefined;
     const token = syscall.fault_recv(@intFromPtr(&fault_buf), 1);
-
     if (token < 0) {
-        t.fail("§2.12.23 fault_recv failed");
+        t.failWithVal("§2.12.23 fault_recv", 0, token);
         syscall.shutdown();
     }
 
-    // At this point, the child's worker thread should be in .suspended state
-    // due to stop-all. Scan all thread entries and look for any suspended one
-    // (skipping slot 1, which is the parent's own initial thread).
-    var found_suspended = false;
-    for (2..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD and
-            view[i].handle != 0 and
-            view[i].handle != @as(u64, @bitCast(token)) and
-            view[i].threadState() == THREAD_STATE_SUSPENDED)
-        {
-            found_suspended = true;
-            break;
-        }
+    // Confirm the worker is currently frozen (counter not advancing).
+    const before = counter_ptr.*;
+    for (0..30) |_| syscall.thread_yield();
+    const still = counter_ptr.*;
+    if (still != before) {
+        t.fail("§2.12.23 worker not suspended pre-reply");
+        _ = syscall.fault_reply_simple(@bitCast(token), syscall.FAULT_KILL);
+        syscall.shutdown();
     }
 
-    // Now reply with FAULT_KILL to resolve the fault. Per §2.12.23, all
-    // suspended threads should be moved to .ready before the kill is applied.
-    const rc = syscall.fault_reply_simple(@bitCast(token), syscall.FAULT_KILL);
-
+    // Reply with FAULT_RESUME — per §2.12.23, suspended threads must be
+    // moved to .ready BEFORE the resume action is applied. The worker
+    // should start running again.
+    const rc = syscall.fault_reply_simple(@bitCast(token), syscall.FAULT_RESUME);
     if (rc != 0) {
-        t.fail("§2.12.23 fault_reply failed");
+        t.failWithVal("§2.12.23 fault_reply", 0, rc);
         syscall.shutdown();
     }
 
-    // After fault_reply, check that the previously suspended thread is no
-    // longer suspended — it should have been moved to .ready.
-    // Give the kernel a moment to update the perm view.
-    syscall.thread_yield();
-    syscall.thread_yield();
-
-    var still_suspended = false;
-    for (2..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD and
-            view[i].handle != 0 and
-            view[i].handle != @as(u64, @bitCast(token)) and
-            view[i].threadState() == THREAD_STATE_SUSPENDED)
-        {
-            still_suspended = true;
-            break;
-        }
+    // The main thread will re-fault (same null deref) — drain that next.
+    // The worker should meanwhile be advancing the counter.
+    var fault_buf2: [256]u8 align(8) = undefined;
+    const token2 = syscall.fault_recv(@intFromPtr(&fault_buf2), 1);
+    if (token2 < 0) {
+        t.failWithVal("§2.12.23 fault_recv 2", 0, token2);
+        syscall.shutdown();
     }
 
-    // The suspended thread should have been resumed (moved to .ready).
-    if (found_suspended and !still_suspended) {
+    const after = counter_ptr.*;
+    if (after > still) {
         t.pass("§2.12.23");
-    } else if (!found_suspended) {
-        // Could not confirm the worker was suspended before reply — partial pass.
-        t.fail("§2.12.23 worker was not in suspended state before reply");
     } else {
-        t.fail("§2.12.23 worker still suspended after fault_reply");
+        t.fail("§2.12.23 worker did not resume");
     }
+    _ = syscall.fault_reply_simple(@bitCast(token2), syscall.FAULT_KILL);
     syscall.shutdown();
 }

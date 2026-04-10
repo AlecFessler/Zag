@@ -4,8 +4,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ZAG_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TIMEOUT=15
-PARALLEL="${PARALLEL:-4}"
-QEMU_CMD="qemu-system-x86_64 -m 8G -bios /usr/share/ovmf/x64/OVMF.4m.fd -serial stdio -display none -no-reboot -enable-kvm -cpu host,+invtsc -machine q35 -device intel-iommu,intremap=off -net none -smp cores=4"
+# Default to a single QEMU instance to keep agent runs from blowing up RAM.
+# Override interactively with `PARALLEL=4 bash run_some.sh ...` for fast local runs.
+PARALLEL="${PARALLEL:-1}"
+QEMU_CMD="qemu-system-x86_64 -m 2G -bios /usr/share/ovmf/x64/OVMF.4m.fd -serial stdio -display none -no-reboot -enable-kvm -cpu host,+invtsc -machine q35 -device intel-iommu,intremap=off -net none -smp cores=4"
 
 IMG_DIR="$ZAG_ROOT/zig-out/img"
 BIN_DIR="$SCRIPT_DIR/bin"

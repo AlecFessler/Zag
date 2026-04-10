@@ -179,17 +179,25 @@ pub const UserViewEntry = extern struct {
             (@as(u64, restart_count) << 16);
     }
 
+    /// For thread entries, field0 exposes the thread's stable kernel-assigned
+    /// thread id (`tid`). Transient scheduling state (.running/.ready/.blocked)
+    /// is intentionally NOT exposed — syncing it would require cross-core
+    /// cache bouncing on every dispatch. The observable state transitions
+    /// that matter to userspace (.faulted, .suspended, .exited) have their
+    /// own channels (fault_recv, syscall return codes, perm entry removal).
     fn threadField0(t: *Thread) u64 {
-        const state_val: u8 = switch (t.state) {
-            .ready => 0,
-            .running => 1,
-            .blocked => 2,
-            .faulted => 3,
-            .suspended => 4,
-            .exited => 5,
-        };
-        const core_id: u8 = if (t.core_affinity) |mask| @intCast(@as(u7, @truncate(@ctz(mask)))) else 0;
-        return @as(u64, state_val) | (@as(u64, core_id) << 8);
+        return t.tid;
+    }
+
+    /// For thread entries, field1 exposes the fault-handler exclude flags
+    /// stored on the perm slot. Bit 0 = exclude_oneshot, bit 1 = exclude_permanent.
+    /// This lets a userspace fault handler observe the result of
+    /// `fault_set_thread_mode` and `fault_reply` with FAULT_EXCLUDE_* flags.
+    fn threadField1(entry: PermissionEntry) u64 {
+        var v: u64 = 0;
+        if (entry.exclude_oneshot) v |= 0x1;
+        if (entry.exclude_permanent) v |= 0x2;
+        return v;
     }
 
     pub fn fromKernelEntry(entry: PermissionEntry) UserViewEntry {
@@ -261,7 +269,7 @@ pub const UserViewEntry = extern struct {
                 .entry_type = @intFromEnum(UserViewEntryType.thread),
                 .rights = entry.rights,
                 .field0 = threadField0(t),
-                .field1 = 0,
+                .field1 = threadField1(entry),
             },
             .empty => EMPTY,
         };

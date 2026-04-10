@@ -1,63 +1,80 @@
+const children = @import("embedded_children");
 const lib = @import("lib");
 
+const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-fn worker() void {
-    for (0..100) |_| syscall.thread_yield();
-    syscall.thread_exit();
-}
+const E_PERM: i64 = -2;
 
-/// §2.4.19 — `set_affinity` requires both `ProcessRights.set_affinity` on slot 0 AND `ThreadHandleRights.set_affinity` on the target thread handle; returns `E_PERM` if either is absent
-///           `ThreadHandleRights.set_affinity` on the target thread handle; returns `E_PERM`
-///           if either is absent.
-///
-/// Root has both ProcessRights.set_affinity and full ThreadHandleRights (including set_affinity),
-/// so set_affinity_thread should succeed. We test:
-///   1. set_affinity_thread with own thread handle (from thread_self) → E_OK
-///   2. set_affinity_thread with a created thread handle → E_OK
-///   3. set_affinity_thread with invalid handle → E_BADHANDLE (-3)
+/// §2.4.19 — `set_affinity` requires both `ProcessRights.set_affinity` on slot 0 AND `ThreadHandleRights.set_affinity` on the target thread handle; returns `E_PERM` if either is absent.
 pub fn main(_: u64) void {
-    // Get our own thread handle.
-    const self_ret = syscall.thread_self();
-    if (self_ret <= 0) {
-        t.failWithVal("§2.4.19 thread_self", 1, self_ret);
-        syscall.shutdown();
-    }
-    const self_handle: u64 = @bitCast(self_ret);
-
-    // Set affinity on self to core 0 (bit 0).
-    const aff_ret = syscall.set_affinity_thread(self_handle, 0x1);
-    if (aff_ret == 0) {
-        t.pass("§2.4.19 set_affinity self");
-    } else {
-        t.failWithVal("§2.4.19 set_affinity self", 0, aff_ret);
-    }
-
-    // Create a thread and set its affinity.
-    const create_ret = syscall.thread_create(&worker, 0, 4);
-    if (create_ret <= 0) {
-        t.failWithVal("§2.4.19 thread_create", 1, create_ret);
-        syscall.shutdown();
-    }
-    const thread_handle: u64 = @bitCast(create_ret);
-
-    const aff_ret2 = syscall.set_affinity_thread(thread_handle, 0x1);
-    if (aff_ret2 == 0) {
-        t.pass("§2.4.19 set_affinity other thread");
-    } else {
-        t.failWithVal("§2.4.19 set_affinity other thread", 0, aff_ret2);
-    }
-
-    // Invalid handle should return E_BADHANDLE, not E_PERM.
-    const bad_ret = syscall.set_affinity_thread(0xDEAD, 0x1);
-    if (bad_ret == -3) {
-        t.pass("§2.4.19 bad handle");
-    } else {
-        t.failWithVal("§2.4.19 bad handle", -3, bad_ret);
+    // Case 1: Child lacks ProcessRights.set_affinity but its slot-1 thread
+    // handle has ThreadHandleRights.set_affinity. set_affinity must E_PERM.
+    {
+        const child_proc_rights = perms.ProcessRights{
+            .spawn_thread = true,
+            .mem_reserve = true,
+            // set_affinity intentionally false
+        };
+        const thread_rights = perms.ThreadHandleRights{
+            .@"suspend" = true,
+            .@"resume" = true,
+            .kill = true,
+            .set_affinity = true,
+        };
+        const ch: u64 = @bitCast(@as(i64, syscall.proc_create_with_thread_rights(
+            @intFromPtr(children.child_report_slot1.ptr),
+            children.child_report_slot1.len,
+            child_proc_rights.bits(),
+            thread_rights.bits(),
+        )));
+        var reply: syscall.IpcMessage = .{};
+        const ret = syscall.ipc_call(ch, &.{4}, &reply);
+        if (ret != 0) {
+            t.failWithVal("§2.4.19 case1 ipc_call", 0, ret);
+            syscall.shutdown();
+        }
+        const rc: i64 = @bitCast(reply.words[3]);
+        if (rc != E_PERM) {
+            t.failWithVal("§2.4.19 case1 (no ProcessRights.set_affinity)", E_PERM, rc);
+            syscall.shutdown();
+        }
     }
 
-    // Clean up.
-    _ = syscall.thread_kill(thread_handle);
+    // Case 2: Child has ProcessRights.set_affinity but its slot-1 thread
+    // handle lacks ThreadHandleRights.set_affinity. set_affinity must E_PERM.
+    {
+        const child_proc_rights = perms.ProcessRights{
+            .spawn_thread = true,
+            .mem_reserve = true,
+            .set_affinity = true,
+        };
+        const thread_rights = perms.ThreadHandleRights{
+            .@"suspend" = true,
+            .@"resume" = true,
+            .kill = true,
+            .set_affinity = false,
+        };
+        const ch: u64 = @bitCast(@as(i64, syscall.proc_create_with_thread_rights(
+            @intFromPtr(children.child_report_slot1.ptr),
+            children.child_report_slot1.len,
+            child_proc_rights.bits(),
+            thread_rights.bits(),
+        )));
+        var reply: syscall.IpcMessage = .{};
+        const ret = syscall.ipc_call(ch, &.{4}, &reply);
+        if (ret != 0) {
+            t.failWithVal("§2.4.19 case2 ipc_call", 0, ret);
+            syscall.shutdown();
+        }
+        const rc: i64 = @bitCast(reply.words[3]);
+        if (rc != E_PERM) {
+            t.failWithVal("§2.4.19 case2 (no ThreadHandleRights.set_affinity)", E_PERM, rc);
+            syscall.shutdown();
+        }
+    }
+
+    t.pass("§2.4.19");
     syscall.shutdown();
 }

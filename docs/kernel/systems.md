@@ -73,8 +73,7 @@ kernel/
     restart_context.zig  -- restart context struct
     futex.zig            -- futex wait queue
     sync.zig             -- SpinLock
-    ipc.zig              -- MessageBox and FaultBox structs and state machines
-    fault.zig            -- FaultEntry, faultDeliverOrKill, fault routing path
+    message_box.zig      -- MessageBox struct (one type, two instances per Process: msg_box and fault_box)
   perms/
     permissions.zig      -- rights types, permission entry, user view entry
     privilege.zig        -- kernel/user privilege enum
@@ -148,7 +147,7 @@ Two locks per process: `lock` (general fields, thread list, children) and `perm_
 
 Writes all 128 entries from the kernel-side `perm_table` to the user-visible view via physmap. The user view physical address (`perm_view_phys`) is converted to a kernel VA via `VAddr.fromPAddr`, cast to a `*[MAX_PERMS]UserViewEntry`, and all entries are written using `UserViewEntry.fromKernelEntry`.
 
-Thread state transitions call the owner process's `syncUserView`. If `fault_handler_proc` is non-null, `syncUserView` is also called on the handler's permissions table for that thread entry.
+`syncUserView` fires only on kernel perm-table mutations: insert, remove, `KernelObject` type change (e.g. `process → dead_process`), and content changes to existing slots (rights bit updates, `restart_count`/`fault_reason` updates on process slot 0, `exclude_oneshot`/`exclude_permanent` toggles on thread slots). Transient thread scheduling-state transitions (`.running`/`.ready`/`.blocked`) do NOT trigger `syncUserView`; syncing them would require cache bouncing across every handle holder on every scheduler dispatch. Observable thread state transitions that userspace cares about have dedicated channels: `.faulted` via `fault_recv`, `.suspended` via the `thread_suspend` syscall return code, and `.exited` via perm entry removal (which IS a mutation, so sync fires).
 
 ### Handle Counter
 
@@ -352,7 +351,7 @@ UserViewEntry (extern struct, 32 bytes) {
 
 Types: `process = 0, vm_reservation = 1, shared_memory = 2, device_region = 3, core_pin = 4, dead_process = 5, thread = 6`.
 
-Field encoding for thread entries: `field0 = state(u8, bits 0–7) | core_id(u8, bits 8–15)`, `field1 = 0`.
+Field encoding for thread entries: `field0 = tid(u64)` (the thread's stable kernel-assigned thread id), `field1 = exclude_oneshot(bit 0) | exclude_permanent(bit 1)` reflecting the fault-handler exclude flags on the perm slot. Transient scheduling state is not exposed in the view.
 
 ### Rights Types
 
@@ -480,7 +479,7 @@ x64.SavedRegs (extern struct) {
 
 `aarch64.SavedRegs` is defined as an empty `extern struct` stub in `kernel/arch/aarch64/` (aarch64 fault delivery is not yet implemented; this stub prevents compile errors on the type reference).
 
-`FaultEntry` and `FaultMessage` use `arch.SavedRegs` directly.
+`FaultMessage` is materialized at `fault_recv` time from `thread.ctx.regs` (the saved exception entry frame) plus `thread.fault_reason` / `fault_addr` / `fault_rip`.
 
 ---
 
@@ -840,7 +839,7 @@ For each thread in the process's thread list:
 2. **running**: Mark `exited`. The thread is on a CPU -- it will be cleaned up by the scheduler timer handler on that core (stored as zombie, freed next tick). For remote cores, `arch.triggerSchedulerInterrupt(core_id)` sends an IPI to force a scheduling decision.
 3. **ready**: The thread is on a run queue. Remove from run queue, mark `exited`.
 4. **blocked**: The thread is in a futex bucket. Remove from bucket, mark `exited`.
-5. **faulted**: Mark `exited`, clear bit in `proc.faulted_thread_slots`. The pending fault message in the handler's fault box becomes stale — `fault_reply` will return `E_NOENT` when the token is used. Do not remove the FaultEntry from the queue; the stale check happens at `fault_reply` time.
+5. **faulted**: Mark `exited`, clear bit in `proc.faulted_thread_slots`. If the thread is queued or pending in some handler's `fault_box`, that reference becomes stale — `fault_reply` will return `E_NOENT` because `findThreadHandle` will fail (the thread's handle entry has been cleared). The dying side does not eagerly walk the handler's box; the stale check happens lazily at `fault_reply` time. (`releaseFaultHandler` and `cleanupPhase1` do walk the handler's box on the *handler* death and *target* death paths to drop dangling `*Thread` references.)
 6. **suspended**: Mark `exited`, clear bit in `proc.suspended_thread_slots`.
 7. **exited**: Already exited, skip.
 
@@ -1105,7 +1104,6 @@ In debug mode, tracks net allocations and asserts zero on `deinit`.
 - `DeviceRegionSlab`: `SlabAllocator(DeviceRegion, false, 0, 32)` -- device region objects.
 - `ProcessAllocator`: `SlabAllocator(Process, false, 0, 64)` -- process structs.
 - `ThreadAllocator`: `SlabAllocator(Thread, false, 0, 64)` -- thread structs.
-- `FaultEntrySlab`: `SlabAllocator(FaultEntry, false, 0, 64)` -- fault entry objects.
 
 ### Heap Allocator
 
@@ -1167,8 +1165,7 @@ Size: 32 GiB. Maps all physical memory (free and ACPI regions) using the largest
   [+shm_slab.end, +16 MiB)                         -- DeviceRegion slab
   [+device_region_slab.end, +16 MiB)               -- Process slab
   [+proc_slab.end, +16 MiB)                        -- Thread slab
-  [+thread_slab.end, +16 MiB)                      -- FaultEntry slab
-  [+fault_entry_slab.end, +1 GiB)                  -- Heap tree node slab
+  [+thread_slab.end, +1 GiB)                       -- Heap tree node slab
   [+heap_tree.end, +256 GiB)                       -- Kernel heap
 
 [0xFFFF_FF80_0000_0000, 0xFFFF_FF88_0000_0000)  -- Physmap (32 GiB)
@@ -1188,8 +1185,8 @@ Comptime assertions verify that no kernel VA regions overlap.
 7. Initialize buddy allocator spanning from smallest physical address to end of largest-address free region. Metadata allocated from bump allocator.
 8. Feed all free memory map regions into buddy allocator (excluding bump allocator's consumed range and low memory below 1 MiB).
 9. Initialize global PMM with buddy allocator as backing.
-10. Initialize slab bump allocators for each kernel object type (VmNode, VmTree, SHM, DeviceRegion, Process, Thread, FaultEntry) -- each gets a 16 MiB VA region.
-11. Initialize slabs: VmNode slab, VmTree slab, DeviceRegion slab, SharedMemory slab, FaultEntry slab.
+10. Initialize slab bump allocators for each kernel object type (VmNode, VmTree, SHM, DeviceRegion, Process, Thread) -- each gets a 16 MiB VA region.
+11. Initialize slabs: VmNode slab, VmTree slab, DeviceRegion slab, SharedMemory slab.
 
 `memory.initHeap()`:
 1. Initialize heap tree bump allocator (1 GiB region).
@@ -1367,152 +1364,165 @@ Each Process has a `handle_refcount: u32` tracking how many perm table entries a
 
 ---
 
-## 17. MessageBox and FaultBox Internals
+## 17. MessageBox Internals
 
-Both message box types follow the same three-state machine. They are defined in `kernel/sched/ipc.zig`.
+`kernel/sched/message_box.zig` defines a single `MessageBox` struct used for both IPC message passing and fault delivery. Each `Process` instantiates two of them: `proc.msg_box` for IPC, `proc.fault_box` for faults. The struct is payload-agnostic — it owns a state machine, a FIFO wait queue of `*Thread`, the blocked receiver slot, the pending-reply slot, and a lock. Callers (the IPC syscalls and the fault delivery path) extract payloads between state transitions.
 
-### MsgBoxState and MessageBox
+### MessageBox
 
 ```
-MsgBoxState = enum { idle, receiving, pending_reply }
+State = enum { idle, receiving, pending_reply }
 
 MessageBox {
-    state:          MsgBoxState
-    waiters_head:   ?*Thread      // FIFO queue head of blocked call() senders
-    waiters_tail:   ?*Thread      // FIFO queue tail
-    receiver:       ?*Thread      // thread blocked on recv(), null if none
-    pending_caller: ?*Thread      // sender of delivered message (null if from send())
+    state:          State
+    queue_head:     ?*Thread     // FIFO of waiting senders (intrusive via thread.next)
+    queue_tail:     ?*Thread
+    receiver:       ?*Thread     // thread blocked on recv(), valid iff state == .receiving
+    pending_thread: ?*Thread     // thread that owns the currently-pending message,
+                                 // valid iff state == .pending_reply; for IPC this is
+                                 // the caller (or null for send-with-no-caller); for
+                                 // faults this is always the faulted thread itself
     lock:           SpinLock
 }
 ```
 
-**MessageBox state transitions**:
+The queued unit is `*Thread` for both uses. For IPC, the queued thread is the calling thread of `ipc_call`, and its payload lives in `thread.ctx.regs` (saved by the int 0x80 entry). For faults, the queued thread is the faulted thread itself; its payload is `thread.fault_reason` / `thread.fault_addr` / `thread.fault_rip` plus the register snapshot in `thread.ctx.regs`. The queue link reuses the existing `thread.next` pointer — safe because a thread is in at most one of {run queue, IPC waiters, fault box queue} at any moment.
+
+### State transitions
 
 | From | To | Trigger |
 |---|---|---|
-| `idle` | `receiving` | Thread calls blocking `recv()` with empty queue |
-| `idle` | `pending_reply` | `recv()` dequeues from non-empty queue |
-| `receiving` | `pending_reply` | Message delivered directly to blocked receiver |
-| `pending_reply` | `idle` | `reply()` called; `pending_caller` unblocked if non-null |
-| `pending_reply` | `pending_reply` | Not valid — second `recv()` returns `E_BUSY` |
-| `receiving` | `idle` | Process dies; receiver unblocked with `E_NOENT` |
-| `pending_reply` | `idle` | Process dies; pending caller returns `E_NOENT` |
+| `idle` | `receiving` | `beginReceivingLocked(thread)` — caller blocks on recv with empty queue |
+| `idle` | `pending_reply` | `beginPendingReplyLocked(t)` — recv dequeued a sender, or send delivered to a non-blocked box |
+| `receiving` | `idle` | `takeReceiverLocked()` — sender takes the blocked receiver out of the box (followed by either direct delivery or queue) |
+| `pending_reply` | `idle` | `endPendingReplyLocked()` — reply was delivered |
+| `pending_reply` | `pending_reply` | Not valid — `recv` while pending returns `E_BUSY` |
 
-**Methods**:
-- `deliver(caller: ?*Thread, ctx)` — if `receiving`, transfer payload to receiver's saved ctx, set `pending_caller = caller`, transition to `pending_reply`, wake receiver; if `idle` or `pending_reply`, enqueue caller (blocking call) or return `E_AGAIN` (non-blocking send).
-- `recv(thread, blocking) → result` — if `pending_reply`, return `E_BUSY`; if queue non-empty, dequeue caller, transfer payload, set `pending_caller`, transition to `pending_reply`; if empty and blocking, set `receiver = thread`, transition to `receiving`, block thread; if empty and non-blocking, return `E_AGAIN`.
-- `reply(ctx) → result` — must be `pending_reply`; if `pending_caller` non-null, transfer reply payload to caller's saved ctx and unblock; transition to `idle`, clear `pending_caller`.
-- `cleanupOnDeath()` — drain `waiters` list: for each thread, write `E_NOENT` to ctx.rax and enqueue on run queue; if `receiver` non-null, same; clear all fields; set state = `idle`.
+### Methods
 
-### FaultBoxState and FaultBox
+All methods take a locked `MessageBox` (the `*Locked` suffix); the lock is the caller's responsibility.
 
+- `enqueueLocked(sender)` — append `sender` to the wait queue tail via `thread.next`. No state change.
+- `dequeueLocked() → ?*Thread` — pop and return queue head, or `null` if empty. No state change.
+- `removeLocked(target) → bool` — find and unlink `target` from the queue (used when a queued caller dies). Returns whether it was present.
+- `beginReceivingLocked(thread)` — assert `state == .idle && queue_head == null && receiver == null`, then set `receiver = thread`, `state = .receiving`.
+- `takeReceiverLocked() → *Thread` — assert `state == .receiving`, return and clear receiver, set `state = .idle`.
+- `beginPendingReplyLocked(?*Thread)` — assert `state != .pending_reply`, set `pending_thread`, `state = .pending_reply`.
+- `endPendingReplyLocked() → ?*Thread` — assert `state == .pending_reply`, return and clear pending_thread, set `state = .idle`.
+- `isPendingReply() / isReceiving() / hasQueuedLocked()` — state queries.
+
+### Process integration
+
+`Process` holds two instances:
 ```
-FaultBoxState = enum { idle, receiving, pending_reply }
-
-FaultBox {
-    state:           FaultBoxState
-    queue_head:      ?*FaultEntry  // FIFO queue head
-    queue_tail:      ?*FaultEntry  // FIFO queue tail
-    receiver:        ?*Thread      // thread blocked on fault_recv(), null if none
-    receiver_buf:    VAddr         // userspace buffer pointer for direct delivery
-    pending_tid:     u64           // thread handle ID of currently-pending faulted thread
-    pending_source:  ?*Process     // owning process of the faulted thread
-    lock:            SpinLock
-}
+msg_box:   MessageBox    // IPC; manipulated by sysIpcSend/Call/Recv/Reply
+fault_box: MessageBox    // faults; manipulated by faultBlock and sysFaultRecv/Reply
 ```
 
-**FaultBox state transitions**:
+The two instances are completely independent — they have their own locks, state, and queues. A process can have its IPC box in `pending_reply` and its fault box in `receiving` simultaneously with no interaction.
 
-| From | To | Trigger |
-|---|---|---|
-| `idle` | `receiving` | Thread calls blocking `fault_recv()` with empty queue |
-| `idle` | `pending_reply` | `fault_recv()` dequeues from non-empty queue |
-| `receiving` | `pending_reply` | Fault message delivered directly to blocked receiver |
-| `pending_reply` | `idle` | `fault_reply()` called |
-| `pending_reply` | `pending_reply` | Not valid — second `fault_recv()` returns `E_BUSY` |
-| `receiving` | `idle` | Handler process dies; receiver unblocked |
+### Per-thread fault metadata
 
-**Methods**:
-- `enqueue(entry: *FaultEntry)` — if `receiving`, deliver directly: write FaultMessage to `receiver_buf` in target address space (validating the pointer), set `pending_tid = entry.thread_handle`, `pending_source = entry.source_proc`, transition to `pending_reply`, wake receiver, free entry; else append to queue tail.
-- `recv(thread, buf_vaddr, blocking) → fault_token` — if `pending_reply`, return `E_BUSY`; if queue non-empty, dequeue head entry, write FaultMessage to `buf_vaddr`, set `pending_tid`, `pending_source`, transition to `pending_reply`, free entry, return `pending_tid`; if empty and blocking, set `receiver = thread`, `receiver_buf = buf_vaddr`, transition to `receiving`, block thread; if empty and non-blocking, return `E_AGAIN`.
-- `reply(token, action, flags, modified_regs_ptr) → result` — validate `pending_reply` and `token == pending_tid`; apply `FAULT_EXCLUDE_*` flags to the thread perm entry (under handler's `perm_lock`), call `syncUserView` if flags changed; release all `.suspended` threads in `pending_source` (iterate `suspended_thread_slots` bitmask: set state to `.ready`, enqueue, clear bit); apply action to faulting thread (identified by pending_tid in `pending_source.threads`); clear `pending_tid`, `pending_source`; set state = `idle`.
-- `cleanupOnDeath()` — for each queued FaultEntry: set the faulted thread back to its pre-fault kill/restart evaluation (treat as §2.12.7/§2.12.9), free FaultEntry; if `receiver` non-null, unblock with `E_AGAIN`; set state = `idle`.
-
-### FaultEntry
-
+When a thread enters `.faulted`, the fault payload is stamped onto the thread itself in `kernel/sched/thread.zig`:
 ```
-FaultEntry {
-    source_proc:    *Process
-    source_thread:  *Thread
-    process_handle: u64          // handle ID of source_proc in handler's perm table
-    thread_handle:  u64          // handle ID of source_thread in handler's perm table
-    fault_reason:   FaultReason
-    fault_addr:     u64
-    regs:           arch.SavedRegs
-    next:           ?*FaultEntry // intrusive list pointer
-}
+fault_reason: FaultReason   // none / unmapped_access / breakpoint / ...
+fault_addr:   u64           // CR2 for page faults; faulting RIP for non-PF exceptions
+fault_rip:    u64           // RIP at the moment of the fault
 ```
+The full saved register state lives in `thread.ctx.regs` (set by the exception entry stub before any kernel handler runs). Materializing a `FaultMessage` for userspace just reads these fields plus the perm-table handle IDs — no separate allocation.
 
-**FaultEntry slab**: `SlabAllocator(FaultEntry, false, 0, 64)` backed by a dedicated 16 MiB bump allocator region.
+### Cleanup paths
 
-**Lock ordering**: `fault_box.lock` must be acquired before `msg_box.lock` if both are ever needed simultaneously. In practice they should not be needed at the same time.
+`Process.cleanupIpcState` (called from `cleanupPhase1`) drains `msg_box`: each waiter is woken with `E_NOENT` in its saved rax, the receiver (if any) is dropped, the pending caller (if any) is woken with `E_NOENT`. Then for every thread in the dying process whose `ipc_server` points elsewhere, the corresponding entry is removed from that other process's `msg_box` (queue or pending) so no `*Thread` references the dying process.
+
+`Process.releaseFaultHandler` and `cleanupPhase1` perform the analogous cleanup for `fault_box`: any thread in the queue or in `pending_thread` whose owning process matches is unlinked, so the box never holds a stale `*Thread`.
 
 ---
 
 ## 18. Fault Routing Internals
 
-Defined in `kernel/sched/fault.zig`. The fault delivery path is called from `kernel/arch/x64/exceptions.zig` after a user fault is identified.
+Defined in `Process.faultBlock` (`kernel/sched/process.zig`). The fault delivery path is called from `kernel/arch/x64/exceptions.zig` (general exceptions) and `kernel/arch/interrupts.zig` (page faults) after the exception handler identifies a userspace fault.
 
-### faultDeliverOrKill(proc, thread, reason, fault_addr, regs)
+### faultBlock(self, thread, reason, fault_addr, rip) → bool
+
+Returns `true` if the fault was queued (caller should yield); `false` if the process must die immediately (§2.12.7 / §2.12.9). The caller — the exception handler — is responsible for stamping the metadata onto the thread *before* this function (or at function entry) and for either yielding or initiating kill on the return value.
 
 ```
-1. Determine handler:
-   handler = if proc.fault_handler_proc != null
-             then proc.fault_handler_proc
-             else proc
+1. Stamp metadata onto the thread:
+   thread.fault_reason = reason
+   thread.fault_addr   = fault_addr
+   thread.fault_rip    = rip
 
-2. If handler == proc (self-handling):
-   a. alive_count = num_threads - popcount(faulted_thread_slots) - exited_count
-   b. If alive_count == 1:
-      // Only the currently-faulting thread is alive; kill or restart immediately
-      goto normal kill/restart path with reason
-   c. Else:
-      thread.state = .faulted
-      set bit thread.slot_index in proc.faulted_thread_slots
-      syncUserView(proc) for this thread entry
-      if popcount(faulted_thread_slots) == alive_count:
-         // All alive threads now faulted simultaneously
-         goto normal kill/restart path with reason
-      Allocate FaultEntry, fill all fields (process_handle = HANDLE_SELF,
-        thread_handle = proc's perm table entry for thread)
-      proc.fault_box.enqueue(entry)  [acquires fault_box.lock]
+2. handler = self.faultHandlerOf()
+   - returns self.fault_handler_proc if non-null
+   - else returns self iff self holds the fault_handler ProcessRights bit on slot 0
+   - else returns null → return false (no handler, kill)
 
-3. If handler != proc (external fault handler):
-   a. Find thread's perm entry in handler's perm table (scan for object == thread)
-   b. If entry.exclude_oneshot or entry.exclude_permanent:
-      // Single-thread stop only
-      if entry.exclude_oneshot: clear it, syncUserView(handler)
+3. If handler == self (self-handling):
+   a. Lock self.lock.
+      alive = num_threads - popcount(faulted_thread_slots)
+      If alive <= 1:
+        unlock; return false  (§2.12.7 / §2.12.9 — no surviving thread to recv,
+                               immediate kill/restart)
+   b. thread.state = .faulted
+      set bit thread.slot_index in faulted_thread_slots
+      Unlock self.lock.
+   c. Lock self.fault_box.lock.
+      If self.fault_box.isReceiving():
+        Direct-deliver to the waiter (see §6 below).
+      Else:
+        self.fault_box.enqueueLocked(thread)
+      Unlock self.fault_box.lock.
+   d. return true
+
+4. If handler != self (external handler):
+   a. Lock self.lock.
+      For every other thread T in self:
+        if T.state == .running or T.state == .ready:
+          T.state = .suspended
+          set bit T.slot_index in self.suspended_thread_slots
       thread.state = .faulted
-      set bit thread.slot_index in proc.faulted_thread_slots
-      syncUserView(proc) for thread entry in proc's own table
-      syncUserView(handler) for thread entry in handler's table
-   c. Else (stop-all):
-      thread.state = .faulted
-      set bit thread.slot_index in proc.faulted_thread_slots
-      For each other thread T in proc where T.state == .running or .ready:
-         T.state = .suspended
-         set bit T.slot_index in proc.suspended_thread_slots
-         if .running on remote core: arch.triggerSchedulerInterrupt(core_id)
-         if .ready: remove from run queue
-         syncUserView(proc) for T's thread entry
-         syncUserView(handler) for T's thread entry in handler's table
-      syncUserView(proc) for faulting thread entry
-      syncUserView(handler) for faulting thread entry
-   d. Allocate FaultEntry from FaultEntrySlab
-   e. Fill: source_proc = proc, source_thread = thread, fault_reason = reason,
-      fault_addr, regs snapshot
-   f. Find proc's handle in handler's perm table → process_handle
-   g. Find thread's handle in handler's perm table → thread_handle
-   h. entry.process_handle = process_handle, entry.thread_handle = thread_handle
-   i. handler.fault_box.enqueue(entry)  [acquires handler.fault_box.lock]
+      set bit thread.slot_index in self.faulted_thread_slots
+      Unlock self.lock.
+   b. Lock handler.fault_box.lock.
+      If handler.fault_box.isReceiving():
+        Direct-deliver to the waiter.
+      Else:
+        handler.fault_box.enqueueLocked(thread)
+      Unlock handler.fault_box.lock.
+   c. return true
 ```
+
+**TODO (§2.12.11):** the external-handler branch should, *before* applying stop-all in step 4a, check the faulted thread's `exclude_oneshot` / `exclude_permanent` perm-entry flags in the handler's table and skip stop-all (and clear `exclude_oneshot`) if either is set. This is not yet wired up.
+
+### Direct delivery to a blocked receiver
+
+When the box is in `.receiving` state, the kernel cannot rely on the receiver to re-execute the dequeue logic on wake-up — `sysFaultRecv`'s blocking path saves the receiver's int 0x80 frame and calls `switchToNextReady`, so when the receiver is later resumed it returns straight to userspace through the syscall epilogue. The fault box therefore has to materialize the `FaultMessage` in the receiver's address space *before* waking it.
+
+`Process.deliverFaultToWaiter(handler, receiver, faulted)` does this:
+1. Read the receiver's user buffer pointer from `receiver.ctx.regs.rdi` (the saved arg from when the receiver entered `sysFaultRecv`).
+2. Look up the source thread's handle and the source process's handle in the handler's perm table (`lookupHandlesForFault`).
+3. Build the 176-byte `FaultMessage` in a stack-local buffer.
+4. Walk the receiver process's page table page-by-page (`arch.resolveVaddr` + physmap) and copy the message into the user buffer.
+5. Set `receiver.ctx.regs.rax = thread_handle` so the syscall returns the fault token.
+6. Wake the receiver via `wakeReceiver` (spin on `on_cpu`, mark `.ready`, enqueue on its core).
+
+This is the only place in the kernel that performs a cross-address-space write into another process's userspace buffer, and it's intentional — the alternative (have the receiver loop and re-dequeue after wake) would require either a setjmp/longjmp-style continuation or making `switchToNextReady` save a kernel RIP, neither of which the kernel has.
+
+### FaultMessage layout
+
+176-byte extern struct, matches `libz.FaultMessage`:
+```
+offset  size  field
+  0      8   process_handle  (handler's perm-table handle for source process)
+  8      8   thread_handle   (handler's perm-table handle for source thread; = fault token)
+ 16      1   fault_reason    (FaultReason u8)
+ 17      7   _pad
+ 24      8   fault_addr      (CR2 for page faults; faulting RIP otherwise)
+ 32      8   rip
+ 40      8   rflags
+ 48      8   rsp
+ 56    120   r15..rax        (15 GPRs in x64 Registers struct order)
+```
+
+Both the synchronous-dequeue path (`writeFaultMessage` in `arch/syscall.zig`) and the cross-AS direct delivery path (`writeFaultMessageInto` in `sched/process.zig`) build the same 176 bytes via a shared `buildFaultMessage` helper.

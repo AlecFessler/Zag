@@ -5,7 +5,11 @@ const syscall = lib.syscall;
 
 /// Checks perm_view slot 1 for a thread handle entry and reports via IPC.
 /// Optional action in request word 0:
-///   0 = none, 1 = thread_suspend(slot1), 2 = thread_resume(slot1)
+///   0 = none
+///   1 = thread_suspend(slot1)
+///   2 = thread_resume(slot1)
+///   3 = thread_kill(slot1)
+///   4 = set_affinity_thread(slot1, 0x1)
 /// Reply: entry_type, handle, rights, action_rc
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
@@ -19,6 +23,10 @@ pub fn main(pv: u64) void {
         action_rc = @bitCast(syscall.thread_suspend(entry.handle));
     } else if (action == 2) {
         action_rc = @bitCast(syscall.thread_resume(entry.handle));
+    } else if (action == 3) {
+        action_rc = @bitCast(syscall.thread_kill(entry.handle));
+    } else if (action == 4) {
+        action_rc = @bitCast(syscall.set_affinity_thread(entry.handle, 0x1));
     }
     _ = syscall.ipc_reply(&.{ entry.entry_type, entry.handle, entry.rights, action_rc });
 }

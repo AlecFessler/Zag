@@ -1,6 +1,7 @@
 const children = @import("embedded_children");
 const lib = @import("lib");
 
+const perm_view = lib.perm_view;
 const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
@@ -20,50 +21,64 @@ fn fault_reply_with_flags(token: u64, action: u64, modified_regs_ptr: u64, flags
         : .{ .rcx = true, .r11 = true, .memory = true });
 }
 
-/// §2.12.28 — `fault_reply` with `FAULT_EXCLUDE_PERMANENT` sets `exclude_permanent` on the faulting thread's perm entry in the handler's table and clears `exclude_oneshot`.
-/// the faulting thread's perm entry in the handler's table and clears `exclude_oneshot`.
-/// `syncUserView` is called on the handler.
-pub fn main(_: u64) void {
+fn findThreadEntry(view: [*]const perm_view.UserViewEntry, h: u64) ?*const perm_view.UserViewEntry {
+    for (0..128) |i| {
+        if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD and view[i].handle == h) {
+            return &view[i];
+        }
+    }
+    return null;
+}
 
-    // Spawn a child that transfers fault_handler then faults.
-    const child_rights = (perms.ProcessRights{
-        .spawn_thread = true,
-        .fault_handler = true,
-    }).bits();
+/// §2.12.28 — `fault_reply` with `FAULT_EXCLUDE_PERMANENT` sets `exclude_permanent` on the faulting thread's perm entry in the handler's table and clears `exclude_oneshot`.
+pub fn main(pv: u64) void {
+    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
+
+    const child_rights = (perms.ProcessRights{ .fault_handler = true }).bits();
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
         @intFromPtr(children.child_fault_after_transfer.ptr),
         children.child_fault_after_transfer.len,
         child_rights,
     )));
 
-    // Acquire fault_handler via cap transfer.
     var reply: syscall.IpcMessage = .{};
     _ = syscall.ipc_call(child_handle, &.{}, &reply);
 
-    // Receive the fault.
     var fault_buf: [256]u8 align(8) = undefined;
     const token = syscall.fault_recv(@intFromPtr(&fault_buf), 1);
-
     if (token < 0) {
         t.fail("§2.12.28 fault_recv failed");
         syscall.shutdown();
     }
+    const token_u: u64 = @bitCast(token);
 
-    // First set exclude_oneshot via fault_set_thread_mode so we can verify
-    // that FAULT_EXCLUDE_PERMANENT clears it.
-    _ = syscall.fault_set_thread_mode(@bitCast(token), syscall.FAULT_MODE_EXCLUDE_NEXT);
+    // Pre-seed exclude_oneshot so we can prove FAULT_EXCLUDE_PERMANENT clears it.
+    _ = syscall.fault_set_thread_mode(token_u, syscall.FAULT_MODE_EXCLUDE_NEXT);
+    if (findThreadEntry(view, token_u)) |e| {
+        if (!e.threadExcludeOneshot()) {
+            t.fail("§2.12.28 setup: exclude_oneshot not visible");
+            syscall.shutdown();
+        }
+    }
 
-    // Reply with FAULT_RESUME and FAULT_EXCLUDE_PERMANENT flag.
-    // Per §2.12.28, this sets exclude_permanent on the thread's perm entry
-    // and clears exclude_oneshot. syncUserView is called on the handler.
-    const rc = fault_reply_with_flags(@bitCast(token), syscall.FAULT_RESUME, 0, FAULT_EXCLUDE_PERMANENT);
-    t.expectEqual("§2.12.28", 0, rc);
+    const rc = fault_reply_with_flags(token_u, syscall.FAULT_RESUME, 0, FAULT_EXCLUDE_PERMANENT);
+    if (rc != 0) {
+        t.failWithVal("§2.12.28 fault_reply rc", 0, rc);
+        syscall.shutdown();
+    }
 
-    // Clean up: the child will fault again at the same instruction, kill it.
+    if (findThreadEntry(view, token_u)) |e| {
+        if (e.threadExcludePermanent() and !e.threadExcludeOneshot()) {
+            t.pass("§2.12.28");
+        } else {
+            t.fail("§2.12.28 wrong flag state after FAULT_EXCLUDE_PERMANENT");
+        }
+    } else {
+        t.fail("§2.12.28 thread entry vanished");
+    }
+
     var fault_buf2: [256]u8 align(8) = undefined;
     const token2 = syscall.fault_recv(@intFromPtr(&fault_buf2), 1);
-    if (token2 >= 0) {
-        _ = syscall.fault_reply_simple(@bitCast(token2), syscall.FAULT_KILL);
-    }
+    if (token2 >= 0) _ = syscall.fault_reply_simple(@bitCast(token2), syscall.FAULT_KILL);
     syscall.shutdown();
 }

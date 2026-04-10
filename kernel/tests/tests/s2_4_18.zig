@@ -1,72 +1,68 @@
+const children = @import("embedded_children");
 const lib = @import("lib");
 
 const perm_view = lib.perm_view;
+const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-fn worker() void {
-    // Stay alive until killed.
-    for (0..1000) |_| syscall.thread_yield();
-    syscall.thread_exit();
-}
-
-fn findThreadEntry(view: [*]const perm_view.UserViewEntry, handle: u64) bool {
-    for (0..128) |i| {
-        if (view[i].handle == handle and view[i].entry_type == perm_view.ENTRY_TYPE_THREAD) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/// §2.4.18 — `thread_kill` on the last non-exited thread in a process triggers process exit or restart per §2.6 semantics
-///           or restart per §2.6 semantics.
+/// §2.4.18 — `thread_kill` on the last non-exited thread in a process triggers process exit or restart per §2.6 semantics.
 ///
-/// We cannot kill our own last thread and still report results, so we test:
-///   1. Create 2 threads. Kill thread2 (not last) → E_OK, verify handle removed from perm view.
-///   2. Document that killing the last thread triggers process exit.
+/// We spawn a non-restartable, single-threaded child whose fault_handler
+/// relationship we acquire via cap transfer. Per §2.12.4 the kernel gives
+/// us a handle to the child's only thread. We then thread_kill that handle
+/// and observe the child's perm-view entry convert to `dead_process`.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Create two worker threads.
-    const ret1 = syscall.thread_create(&worker, 0, 4);
-    if (ret1 <= 0) {
-        t.failWithVal("§2.4.18 thread_create t1", 1, ret1);
+    const child_rights = (perms.ProcessRights{
+        .fault_handler = true,
+    }).bits();
+    const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
+        @intFromPtr(children.child_send_self_fault_handler.ptr),
+        children.child_send_self_fault_handler.len,
+        child_rights,
+    )));
+
+    // Acquire fault_handler for the child.
+    var reply: syscall.IpcMessage = .{};
+    _ = syscall.ipc_call(child_handle, &.{}, &reply);
+
+    // Find the child's main thread handle (inserted by §2.12.4). Skip
+    // slot 1 which is our own initial thread.
+    var child_thread: u64 = 0;
+    for (2..128) |i| {
+        if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD and view[i].handle != 0) {
+            child_thread = view[i].handle;
+            break;
+        }
+    }
+    if (child_thread == 0) {
+        t.fail("§2.4.18 no child thread handle");
         syscall.shutdown();
     }
-    const handle1: u64 = @bitCast(ret1);
 
-    const ret2 = syscall.thread_create(&worker, 0, 4);
-    if (ret2 <= 0) {
-        t.failWithVal("§2.4.18 thread_create t2", 1, ret2);
-        syscall.shutdown();
-    }
-    const handle2: u64 = @bitCast(ret2);
-
-    // Kill thread2 (not last) — should succeed.
-    const kill_ret = syscall.thread_kill(handle2);
-    if (kill_ret != 0) {
-        t.failWithVal("§2.4.18 kill non-last", 0, kill_ret);
+    // Kill the child's only thread. Per §2.4.18 this must trigger process
+    // death (the child has no restart context).
+    const rc = syscall.thread_kill(child_thread);
+    if (rc != 0) {
+        t.failWithVal("§2.4.18 thread_kill", 0, rc);
         syscall.shutdown();
     }
 
-    // Yield to let kernel process the kill.
-    for (0..10) |_| syscall.thread_yield();
-
-    // Verify thread2's handle is removed from perm view.
-    if (!findThreadEntry(view, handle2)) {
-        t.pass("§2.4.18 non-last kill removes handle");
-    } else {
-        t.fail("§2.4.18 killed thread handle still in perm view");
+    // Wait for the child's entry to flip to dead_process.
+    var iters: u32 = 0;
+    while (iters < 2000) : (iters += 1) {
+        syscall.thread_yield();
+        for (0..128) |i| {
+            if (view[i].handle == child_handle and
+                view[i].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS)
+            {
+                t.pass("§2.4.18");
+                syscall.shutdown();
+            }
+        }
     }
-
-    // Kill thread1 as well — after this, only the main thread remains.
-    // If we killed our own handle (the last thread), it would trigger process exit per §2.6.
-    // We can't observe that from within, so we just clean up.
-    _ = syscall.thread_kill(handle1);
-
-    // NOTE: Killing the very last thread (main thread via thread_self) would trigger
-    // process exit/restart per §2.6. That can only be observed by a parent process.
-
+    t.fail("§2.4.18 child never became dead_process");
     syscall.shutdown();
 }

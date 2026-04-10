@@ -7,8 +7,10 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ZAG_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 TIMEOUT=30
-PARALLEL="${PARALLEL:-16}"
-QEMU_CMD="qemu-system-x86_64 -m 8G -bios /usr/share/ovmf/x64/OVMF.4m.fd -serial stdio -display none -no-reboot -enable-kvm -cpu host,+invtsc -machine q35 -device intel-iommu,intremap=off -net none -smp cores=4"
+# Default to a single QEMU instance to keep agent runs from blowing up RAM.
+# Override interactively with `PARALLEL=16 bash run_tests.sh` for fast local runs.
+PARALLEL="${PARALLEL:-1}"
+QEMU_CMD="qemu-system-x86_64 -m 2G -bios /usr/share/ovmf/x64/OVMF.4m.fd -serial stdio -display none -no-reboot -enable-kvm -cpu host,+invtsc -machine q35 -device intel-iommu,intremap=off -net none -smp cores=4"
 
 # Verify spec coverage before running tests
 echo "Verifying spec/test coverage..."

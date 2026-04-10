@@ -7,90 +7,92 @@ const syscall = lib.syscall;
 const t = lib.testing;
 
 /// §2.12.35 — When the handler process dies, all processes that had it as fault handler revert to self-fault-handling: their `fault_handler` ProcessRights bit is restored and their `fault_handler_proc` is cleared.
-/// revert to self-fault-handling: their `fault_handler` ProcessRights bit is restored
-/// and their `fault_handler_proc` is cleared.
 pub fn main(pv: u64) void {
-    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
+    _ = pv;
 
-    // Strategy: We spawn a child and acquire fault_handler for it. Then we revoke
-    // the fault_handler permission to simulate the handler death cleanup path.
-    // Per §2.12.6, when fault_handler is released, thread handles belonging to
-    // the target are bulk-revoked from the handler's perm table. This exercises
-    // the same kernel cleanup logic as handler death (§2.12.35).
-    //
-    // A full integration test would require spawning a handler process that
-    // becomes fault handler for a target, then killing the handler and observing
-    // the target revert. That requires a more complex multi-process setup.
-
-    const child_rights = (perms.ProcessRights{
-        .spawn_thread = true,
-        .fault_handler = true,
+    // Spawn the middleman handler: it recvs one ipc call (the target's cap
+    // transfer), replies, then sleeps forever.
+    const handler_rights = (perms.ProcessRights{
+        .mem_reserve = true,
     }).bits();
-    const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
-        @intFromPtr(children.child_send_self_fault_handler.ptr),
-        children.child_send_self_fault_handler.len,
-        child_rights,
+    const handler_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
+        @intFromPtr(children.child_middleman_handler.ptr),
+        children.child_middleman_handler.len,
+        handler_rights,
     )));
 
-    // Acquire fault_handler for the child.
-    var reply: syscall.IpcMessage = .{};
-    _ = syscall.ipc_call(child_handle, &.{}, &reply);
+    // Spawn the target: it has fault_handler self-right initially, plus
+    // rights to receive the handler handle via cap transfer and to ipc_call.
+    const target_rights = (perms.ProcessRights{
+        .mem_reserve = true,
+        .fault_handler = true,
+    }).bits();
+    const target_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
+        @intFromPtr(children.child_fh_target_reporter.ptr),
+        children.child_fh_target_reporter.len,
+        target_rights,
+    )));
 
-    // Verify we now have thread handles for the child (proving we are its handler).
-    // Skip slot 1 which holds parent's own initial thread handle.
-    var thread_handle: u64 = 0;
-    for (2..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD and view[i].handle != 0) {
-            thread_handle = view[i].handle;
-            break;
-        }
-    }
-
-    if (thread_handle == 0) {
-        t.fail("§2.12.35 no thread handle after acquiring fault_handler");
+    // Call 1 (setup): give the target a handle to the handler via cap
+    // transfer. Rights on the transferred handle: send_words so target can
+    // ipc_call, and grant so it can transfer HANDLE_SELF.
+    const handler_cap_rights: u64 = (perms.ProcessHandleRights{
+        .send_words = true,
+        .send_process = true,
+        .grant = true,
+    }).bits();
+    var reply1: syscall.IpcMessage = .{};
+    const rc1 = syscall.ipc_call_cap(target_handle, &.{ handler_handle, handler_cap_rights }, &reply1);
+    if (rc1 != 0) {
+        t.failWithVal("§2.12.35 setup ipc_call", 0, rc1);
         syscall.shutdown();
     }
 
-    // Find the fault_handler process handle entry.
-    const fault_handler_bit: u16 = @truncate((perms.ProcessHandleRights{ .fault_handler = true }).bits());
-    var fh_handle: u64 = 0;
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_PROCESS and
-            view[i].handle != 0 and
-            (view[i].rights & fault_handler_bit) != 0)
-        {
-            fh_handle = view[i].handle;
-            break;
-        }
-    }
+    // After returning from call 1, the target will issue its own ipc_call
+    // to the handler with HANDLE_SELF+fault_handler. Give it time to run.
+    for (0..50) |_| syscall.thread_yield();
 
-    if (fh_handle == 0) {
-        t.fail("§2.12.35 no fault_handler handle");
+    // Call 2: ask the target to report its slot 0 rights. Should have
+    // fault_handler bit CLEARED now (handler owns it).
+    var reply2: syscall.IpcMessage = .{};
+    const rc2 = syscall.ipc_call(target_handle, &.{}, &reply2);
+    if (rc2 != 0) {
+        t.failWithVal("§2.12.35 report1 ipc_call", 0, rc2);
+        syscall.shutdown();
+    }
+    const fh_bit: u64 = (perms.ProcessRights{ .fault_handler = true }).bits();
+    const rights_before = reply2.words[0];
+    if ((rights_before & fh_bit) != 0) {
+        t.fail("§2.12.35 target still has fault_handler before handler death");
         syscall.shutdown();
     }
 
-    // Revoke the fault_handler permission to simulate handler death cleanup path.
-    // Per §2.12.6, when fault_handler is released, thread handles belonging to
-    // the target are bulk-revoked from the handler's perm table.
-    const revoke_rc = syscall.revoke_perm(fh_handle);
-
-    // After revoking, the thread handles should be removed from our perm table.
-    var thread_still_present = false;
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD and
-            view[i].handle == thread_handle)
-        {
-            thread_still_present = true;
-            break;
-        }
+    // Kill the handler process. We hold a handle with kill rights (proc_create
+    // grants full ProcessHandleRights per §4.10.10). Revoking with the kill
+    // bit set recursively kills the child (§2.3.15).
+    const rev_rc = syscall.revoke_perm(handler_handle);
+    if (rev_rc != 0) {
+        t.failWithVal("§2.12.35 revoke handler", 0, rev_rc);
+        syscall.shutdown();
     }
 
-    if (revoke_rc == 0 and !thread_still_present) {
+    // Give the kernel time to run releaseFaultHandler on the dying handler.
+    for (0..50) |_| syscall.thread_yield();
+
+    // Call 3: ask the target to report slot 0 rights again. Should have
+    // fault_handler bit RESTORED.
+    var reply3: syscall.IpcMessage = .{};
+    const rc3 = syscall.ipc_call(target_handle, &.{}, &reply3);
+    if (rc3 != 0) {
+        t.failWithVal("§2.12.35 report2 ipc_call", 0, rc3);
+        syscall.shutdown();
+    }
+    const rights_after = reply3.words[0];
+    if ((rights_after & fh_bit) != 0) {
         t.pass("§2.12.35");
-    } else if (revoke_rc != 0) {
-        t.failWithVal("§2.12.35 revoke", 0, revoke_rc);
     } else {
-        t.fail("§2.12.35 thread handle not cleaned up");
+        t.fail("§2.12.35 fault_handler bit not restored after handler death");
     }
+
     syscall.shutdown();
 }

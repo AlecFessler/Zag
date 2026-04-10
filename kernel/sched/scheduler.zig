@@ -88,6 +88,18 @@ const RunQueue = struct {
     }
 };
 
+/// Find the core ID currently running `thread`, or null if it's not
+/// dispatched anywhere. Used by thread_suspend so the kernel can IPI the
+/// right core regardless of whether the thread has explicit affinity.
+pub fn coreRunning(thread: *Thread) ?u64 {
+    const count = arch.coreCount();
+    var i: u64 = 0;
+    while (i < count) : (i += 1) {
+        if (core_states[i].running_thread == thread) return i;
+    }
+    return null;
+}
+
 /// Remove `thread` from any core's run queue. Used when a remote thread is
 /// killed while .ready (so we can deinit it without leaving a dangling pointer).
 pub fn removeFromAnyRunQueue(thread: *Thread) void {

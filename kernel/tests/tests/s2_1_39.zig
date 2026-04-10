@@ -8,7 +8,7 @@ fn threadFn() void {
     syscall.thread_exit();
 }
 
-/// §2.1.39 — The kernel updates a thread entry's `field0` in every permissions table that holds a handle to that thread on every thread state transition, and calls `syncUserView` on each such table
+/// §2.1.39 — The user permissions view is kept in sync with the kernel permissions table.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
     const ret = syscall.thread_create(&threadFn, 0, 4);
@@ -18,7 +18,7 @@ pub fn main(pv: u64) void {
     }
     const handle: u64 = @bitCast(ret);
 
-    // Find the thread entry index
+    // Insert was a mutation: the new thread entry must be visible.
     var idx: ?usize = null;
     for (0..128) |i| {
         if (view[i].handle == handle and view[i].entry_type == perm_view.ENTRY_TYPE_THREAD) {
@@ -28,31 +28,21 @@ pub fn main(pv: u64) void {
     }
 
     if (idx == null) {
-        t.fail("§2.1.39 thread entry not found");
+        t.fail("§2.1.39 thread entry not found after insert");
         syscall.shutdown();
     }
 
     const entry_idx = idx.?;
 
-    // Record the initial state
-    const initial_state = view[entry_idx].threadState();
-
-    // Yield repeatedly to give the child thread time to run and exit
+    // Yield until the child thread exits — exit removes its perm slot, and
+    // removal is a table mutation that must sync the user view.
     var attempts: u32 = 0;
     while (attempts < 10000) : (attempts += 1) {
         syscall.thread_yield();
-        const current_state = view[entry_idx].threadState();
-        if (current_state != initial_state) {
-            // State transitioned -- kernel updated field0
+        if (view[entry_idx].entry_type != perm_view.ENTRY_TYPE_THREAD) {
             t.pass("§2.1.39");
             syscall.shutdown();
         }
-    }
-
-    // If the entry was cleared (type changed to EMPTY), that also counts as an update
-    if (view[entry_idx].entry_type != perm_view.ENTRY_TYPE_THREAD) {
-        t.pass("§2.1.39");
-        syscall.shutdown();
     }
 
     t.fail("§2.1.39");

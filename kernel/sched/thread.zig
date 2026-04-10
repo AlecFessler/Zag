@@ -9,6 +9,7 @@ const pmm = zag.memory.pmm;
 const stack_mod = zag.memory.stack;
 
 const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
+const FaultReason = zag.perms.permissions.FaultReason;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const Process = zag.sched.process.Process;
@@ -50,6 +51,14 @@ pub const Thread = struct {
     futex_paddr: PAddr = PAddr.fromInt(0),
     ipc_server: ?*Process = null,
     slot_index: u8 = 0,
+    /// Fault metadata, valid iff thread.state == .faulted (or the thread
+    /// is queued in some fault box's wait queue / pending_thread slot).
+    /// Filled in by the exception handler before the thread is enqueued
+    /// on the fault box; consumed by sysFaultRecv when delivering the
+    /// FaultMessage to userspace, and by sysFaultReply for FAULT_RESUME.
+    fault_reason: FaultReason = .none,
+    fault_addr: u64 = 0,
+    fault_rip: u64 = 0,
 
     pub fn deinit(self: *Thread) void {
         const proc = self.process;

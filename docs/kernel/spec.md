@@ -44,11 +44,11 @@ The user half of the virtual address space is split into two zones. The lower AS
 
 **§2.1.31** User address space spans `[0, 0xFFFF_8000_0000_0000)`. **§2.1.32** ELF segments and stacks are never placed in the static reservation zone `[0x0000_1000_0000_0000, 0xFFFF_8000_0000_0000)`. **§2.1.33** `vm_reserve` with a hint in the static reservation zone uses that address (if no overlap). **§2.1.34** ELF segments and user stacks are placed in the ASLR zone `[0x0000_0000_0000_1000, 0x0000_1000_0000_0000)` with a randomized base. **§2.1.35** The first 4 KiB `[0, 0x1000)` is unmapped; accessing address 0 causes a fault. **§2.1.36** The ASLR base address is page-aligned.
 
-**§2.1.37** Thread entry `field0` encodes `state(u8, bits 0–7) | core_id(u8, bits 8–15)`. State values: 0 = ready, 1 = running, 2 = blocked, 3 = faulted, 4 = suspended, 5 = exited.
+**§2.1.37** Thread entry `field0` is the thread's stable kernel-assigned thread id (`tid`, u64).
 
 **§2.1.38** Thread entry `field1` = 0 (reserved).
 
-**§2.1.39** The kernel updates a thread entry's `field0` in every permissions table that holds a handle to that thread on every thread state transition, and calls `syncUserView` on each such table.
+**§2.1.39** The user permissions view is kept in sync with the kernel permissions table.
 
 ---
 
@@ -113,7 +113,7 @@ A thread is a unit of execution belonging to a process. All threads within a pro
 
 **§2.4.6** When a thread exits, its handle entry is cleared from its owning process's permissions table. If an external process holds `fault_handler` for that process, the thread handle is also cleared from the handler's permissions table. `syncUserView` is called on all affected tables.
 
-**§2.4.7** The user permissions view `field0` for a thread entry is updated on every thread state transition.
+**§2.4.7** A thread entry's `field0` in the user view exposes the thread's stable kernel-assigned thread id. Transient scheduling state is not published via the user view; observable thread state transitions are reported through their own channels (`fault_recv` for faults, the `thread_suspend` return code for suspension, and permission-entry removal for exit).
 
 **§2.4.8** `thread_suspend` requires the `suspend` right on the thread handle; returns `E_PERM` without it.
 
@@ -191,7 +191,7 @@ A shared memory region is a set of physical pages that can be mapped into multip
 
 ### §2.8 Stack
 
-Each user stack is flanked by unmapped guard pages that catch overflow and underflow. **§2.8.1** Each user stack has a 1-page unmapped underflow guard below the usable region. The first page of the usable region is eagerly mapped; the rest are demand-paged. **§2.8.3** Each user stack has a 1-page unmapped overflow guard above the usable region. **§2.8.4** Fault on the underflow guard (below stack) kills with fault reason `stack_overflow` (§3). **§2.8.5** Fault on the overflow guard (above stack) kills with fault reason `stack_underflow` (§3).
+Each user stack is flanked by unmapped guard pages that catch overflow and underflow. **§2.8.4** Fault on the underflow guard (below stack) kills with fault reason `stack_overflow` (§3). **§2.8.5** Fault on the overflow guard (above stack) kills with fault reason `stack_underflow` (§3).
 
 ---
 

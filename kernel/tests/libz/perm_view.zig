@@ -99,12 +99,22 @@ pub const UserViewEntry = extern struct {
         return @truncate(self.field1 >> 48);
     }
 
-    pub fn threadState(self: *const UserViewEntry) u8 {
-        return @truncate(self.field0);
+    /// The thread's stable kernel-assigned tid. Transient scheduling state
+    /// is not exposed via the user view — see `fault_recv` for `.faulted`,
+    /// syscall return codes for `.suspended`, and perm entry removal for
+    /// `.exited`.
+    pub fn threadTid(self: *const UserViewEntry) u64 {
+        return self.field0;
     }
 
-    pub fn threadCoreId(self: *const UserViewEntry) u8 {
-        return @truncate(self.field0 >> 8);
+    /// True if the perm slot for this thread has `exclude_oneshot` set.
+    pub fn threadExcludeOneshot(self: *const UserViewEntry) bool {
+        return (self.field1 & 0x1) != 0;
+    }
+
+    /// True if the perm slot for this thread has `exclude_permanent` set.
+    pub fn threadExcludePermanent(self: *const UserViewEntry) bool {
+        return (self.field1 & 0x2) != 0;
     }
 };
 

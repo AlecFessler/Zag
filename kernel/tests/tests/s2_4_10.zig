@@ -1,52 +1,56 @@
 const lib = @import("lib");
 
-const perm_view = lib.perm_view;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-fn childFn() void {
-    // Spin until suspended by the parent.
+var counter: u64 = 0;
+
+fn counterThread() void {
     while (true) {
-        syscall.thread_yield();
+        const p: *volatile u64 = @ptrCast(&counter);
+        p.* = p.* + 1;
     }
 }
 
-/// §2.4.10 — `thread_suspend` on a `.ready` thread removes it from the run queue and enters `.suspended`
-pub fn main(pv: u64) void {
-    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
-    const ret = syscall.thread_create(&childFn, 0, 4);
+/// §2.4.10 — `thread_suspend` on a `.ready` thread removes it from the run queue and enters `.suspended`.
+///
+/// Thread state is no longer exposed via the perm view, so we verify the
+/// behavioral contract: after thread_suspend succeeds, the target no longer
+/// runs (it's off the run queue). We create a thread that spins
+/// incrementing a shared counter without ever yielding, then suspend it and
+/// confirm the counter stops advancing.
+pub fn main(_: u64) void {
+    const ret = syscall.thread_create(&counterThread, 0, 4);
     if (ret < 0) {
         t.fail("§2.4.10 thread_create failed");
         syscall.shutdown();
     }
     const handle: u64 = @bitCast(ret);
 
-    // Yield a few times to let the child start and become ready/running.
-    syscall.thread_yield();
-    syscall.thread_yield();
+    // Let the counter thread actually start running so we're exercising
+    // the .ready/.running transition rather than a never-dispatched thread.
+    const ctr: *volatile u64 = @ptrCast(&counter);
+    while (ctr.* == 0) syscall.thread_yield();
 
-    // Suspend the child thread.
-    const suspend_ret = syscall.thread_suspend(handle);
-    if (suspend_ret != 0) {
-        t.failWithVal("§2.4.10 suspend", 0, suspend_ret);
+    const suspend_rc = syscall.thread_suspend(handle);
+    if (suspend_rc != 0) {
+        t.failWithVal("§2.4.10 thread_suspend", 0, suspend_rc);
         syscall.shutdown();
     }
 
-    // Verify thread state is suspended (4) via perm_view.
-    var found = false;
-    for (0..128) |i| {
-        if (view[i].handle == handle and view[i].entry_type == perm_view.ENTRY_TYPE_THREAD) {
-            if (view[i].threadState() == 4) {
-                found = true;
-            }
-            break;
-        }
-    }
+    // Give the kernel time to process the suspension, then snapshot the
+    // counter and verify it stops advancing across many yield cycles.
+    for (0..10) |_| syscall.thread_yield();
+    const after_suspend = ctr.*;
+    for (0..50) |_| syscall.thread_yield();
+    const after_wait = ctr.*;
 
-    if (found) {
+    if (after_wait == after_suspend) {
         t.pass("§2.4.10");
     } else {
-        t.fail("§2.4.10");
+        t.fail("§2.4.10 counter advanced after suspend");
     }
+
+    _ = syscall.thread_kill(handle);
     syscall.shutdown();
 }

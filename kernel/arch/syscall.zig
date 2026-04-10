@@ -135,8 +135,8 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
         .thread_suspend => .{ .rax = sysThreadSuspend(arg0) },
         .thread_resume => .{ .rax = sysThreadResume(arg0) },
         .thread_kill => .{ .rax = sysThreadKill(arg0) },
-        .fault_recv => .{ .rax = sysFaultRecv(arg0, arg1) },
-        .fault_reply => .{ .rax = sysFaultReply(arg0, arg1, arg2) },
+        .fault_recv => sysFaultRecv(ctx, arg0, arg1),
+        .fault_reply => .{ .rax = sysFaultReply(ctx, arg0, arg1, arg2) },
         .fault_read_mem => .{ .rax = sysFaultReadMem(arg0, arg1, arg2, arg3) },
         .fault_write_mem => .{ .rax = sysFaultWriteMem(arg0, arg1, arg2, arg3) },
         .fault_set_thread_mode => .{ .rax = sysFaultSetThreadMode(arg0, arg1) },
@@ -188,7 +188,7 @@ fn sysVmPerms(vm_handle: u64, offset: u64, size: u64, perms_bits: u64) i64 {
     if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) return E_INVAL;
 
     const new_rights: VmReservationRights = @bitCast(@as(u8, @truncate(perms_bits)));
-    if (new_rights.shareable or new_rights.mmio) return E_INVAL;
+    if (new_rights.shareable or new_rights.mmio or new_rights.write_combining) return E_INVAL;
 
     const proc = currentProc();
     const entry = proc.getPermByHandle(vm_handle) orelse return E_BADCAP;
@@ -338,7 +338,8 @@ fn sysMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
     if (vm_entry.object != .vm_reservation) return E_BADCAP;
 
     const vm_res = vm_entry.object.vm_reservation;
-    if (!vm_res.max_rights.mmio or !vm_res.max_rights.read or !vm_res.max_rights.write) return E_PERM;
+    if (!vm_res.max_rights.mmio) return E_PERM;
+    if (!vm_res.max_rights.read and !vm_res.max_rights.write) return E_PERM;
 
     const device = device_entry.object.device_region;
 
@@ -412,9 +413,18 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_arg: 
     if (child_bits & ~parent_bits != 0) return E_PERM;
 
     // Copy ELF buffer into kernel memory to prevent TOCTOU races.
+    // Pre-fault every source page first: raw @memcpy from user VA in ring 0
+    // would take a page fault on any uncommitted demand-paged page, and
+    // interrupts.zig's ring-0-on-user-VA path kills the calling process.
     const kernel_alloc = memory_init.heap_allocator;
     const elf_copy = kernel_alloc.alloc(u8, elf_len) catch return E_NOMEM;
     defer kernel_alloc.free(elf_copy);
+    {
+        var page_va = std.mem.alignBackward(u64, elf_ptr, paging.PAGE4K);
+        while (page_va < elf_end) : (page_va += paging.PAGE4K) {
+            proc.vmm.demandPage(VAddr.fromInt(page_va), false, false) catch return E_BADADDR;
+        }
+    }
     const user_bytes: [*]const u8 = @ptrFromInt(elf_ptr);
     @memcpy(elf_copy, user_bytes[0..elf_len]);
 
@@ -750,34 +760,62 @@ fn sysThreadSuspend(thread_handle: u64) i64 {
     const target_proc = target.process;
 
     target_proc.lock.lock();
-    defer target_proc.lock.unlock();
 
     switch (target.state) {
-        .faulted => return E_BUSY,
-        .suspended => return E_BUSY,
-        .exited => return E_BADCAP,
+        .faulted, .suspended => {
+            target_proc.lock.unlock();
+            return E_BUSY;
+        },
+        .exited => {
+            target_proc.lock.unlock();
+            return E_BADCAP;
+        },
+        // §2.4: blocked threads (futex / IPC) cannot be suspended in
+        // place — the wake path would race with the suspend and re-mark
+        // the thread .ready, defeating the suspend. Reject with E_BUSY;
+        // a debugger can wait for the thread to leave .blocked and try
+        // again.
+        .blocked => {
+            target_proc.lock.unlock();
+            return E_BUSY;
+        },
         .running => {
             target.state = .suspended;
             target_proc.suspended_thread_slots |= @as(u64, 1) << @intCast(target.slot_index);
-            // If running on another core, send IPI to force reschedule
-            if (target.on_cpu.load(.acquire) and target != sched.currentThread().?) {
-                if (target.core_affinity) |mask| {
-                    arch.triggerSchedulerInterrupt(@intCast(@ctz(mask)));
+            // Find which core is currently running this thread (if any)
+            // and IPI it so the next scheduling decision honors the new
+            // .suspended state. Works regardless of explicit affinity.
+            const cur = sched.currentThread().?;
+            if (target != cur) {
+                if (sched.coreRunning(target)) |core_id| {
+                    target_proc.lock.unlock();
+                    arch.triggerSchedulerInterrupt(core_id);
+                    return E_OK;
                 }
+            } else {
+                // Self-suspend: we must deschedule now, before returning
+                // to userspace. If we merely marked ourselves .suspended
+                // and returned, we would keep executing user code until
+                // the next preemption (up to a full timeslice), and a
+                // concurrent thread_resume from another core could
+                // re-enqueue us while we are still running on this core
+                // — dual dispatch. §2.4.9 requires the transition to be
+                // effective immediately.
+                target_proc.lock.unlock();
+                arch.enableInterrupts();
+                sched.yield();
+                // On the next time we are resumed, we return into the
+                // syscall epilogue with rax = E_OK.
+                return E_OK;
             }
         },
         .ready => {
             target.state = .suspended;
             target_proc.suspended_thread_slots |= @as(u64, 1) << @intCast(target.slot_index);
-            // Note: ideally we'd remove from run queue, but the scheduler will
-            // skip suspended threads when dequeuing
-        },
-        .blocked => {
-            target.state = .suspended;
-            target_proc.suspended_thread_slots |= @as(u64, 1) << @intCast(target.slot_index);
+            // Lazy: scheduler dequeue skips .suspended threads.
         },
     }
-    target_proc.syncUserView();
+    target_proc.lock.unlock();
     return E_OK;
 }
 
@@ -798,7 +836,6 @@ fn sysThreadResume(thread_handle: u64) i64 {
 
     target.state = .ready;
     target_proc.suspended_thread_slots &= ~(@as(u64, 1) << @intCast(target.slot_index));
-    target_proc.syncUserView();
     target_proc.lock.unlock();
 
     const target_core = if (target.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
@@ -852,6 +889,37 @@ fn sysThreadKill(thread_handle: u64) i64 {
     // Off-CPU. If .ready, remove from run queue first to avoid dangling.
     sched.removeFromAnyRunQueue(target);
     if (target.futex_paddr.addr != 0) futex.removeBlockedThread(target);
+    // If the target was .blocked inside ipc_call, it still has a back-
+    // pointer into some other process's msg_box (either as the pending
+    // reply target or queued on the wait list). deinit() does not walk
+    // those structures, so without this scrub the msg_box would be left
+    // holding a dangling *Thread — the same UAF class that scrubFromFaultBox
+    // fixes for the fault box. Mirrors Process.kill()'s blocked-thread
+    // cleanup loop.
+    if (target.ipc_server) |server| {
+        server.msg_box.lock.lock();
+        if (server.msg_box.isPendingReply() and server.msg_box.pending_thread == target) {
+            _ = server.msg_box.endPendingReplyLocked();
+        } else {
+            _ = server.msg_box.removeLocked(target);
+        }
+        target.ipc_server = null;
+        server.msg_box.lock.unlock();
+    }
+    // Also scrub from our own msg_box in case target was the blocked
+    // receiver (a dying recv()er), and from our own / handler's fault
+    // boxes in case target was queued there for some reason. These are
+    // cheap no-ops when the thread isn't actually in the box.
+    target_proc.msg_box.lock.lock();
+    if (target_proc.msg_box.isReceiving() and target_proc.msg_box.receiver == target) {
+        _ = target_proc.msg_box.takeReceiverLocked();
+    }
+    _ = target_proc.msg_box.removeLocked(target);
+    target_proc.msg_box.lock.unlock();
+    process_mod.scrubFromFaultBoxPub(&target_proc.fault_box, target);
+    if (target_proc.fault_handler_proc) |handler| {
+        process_mod.scrubFromFaultBoxPub(&handler.fault_box, target);
+    }
     // deinit removes thread handles from perm tables, frees stacks,
     // calls lastThreadExited (which triggers process exit/restart).
     target.deinit();
@@ -859,27 +927,111 @@ fn sysThreadKill(thread_handle: u64) i64 {
     return E_OK;
 }
 
-fn sysFaultRecv(buf_ptr: u64, blocking: u64) i64 {
-    const proc = currentProc();
+/// FaultMessage userspace layout (176 bytes total). Stable wire format
+/// shared with libz.FaultMessage:
+///   0   process_handle: u64    handle ID of source process in handler's table
+///   8   thread_handle:  u64    handle ID of faulting thread in handler's table
+///   16  fault_reason:   u8     FaultReason enum value
+///   17  _pad:           [7]u8
+///   24  fault_addr:     u64    CR2 for page faults; faulting VA otherwise
+///   32  rip:            u64    RIP at the moment of the fault
+///   40  rflags:         u64
+///   48  rsp:            u64
+///   56  r15..rax:       15×u64 General-purpose register snapshot
+///                              (matches kernel x64 Registers struct order)
+const FAULT_MSG_SIZE: u64 = 176;
+const FAULT_REGS_SIZE: u64 = 144; // rip + rflags + rsp + 15 GPRs
 
-    // Check that caller has fault_handler right
-    var has_right = false;
-    proc.perm_lock.lock();
-    if (proc.perm_table[0].processRights().fault_handler) {
-        has_right = true;
-    } else {
-        for (proc.perm_table[1..]) |slot| {
-            if (slot.object == .process and slot.processHandleRights().fault_handler) {
-                has_right = true;
-                break;
-            }
+/// Build a 176-byte FaultMessage in a temporary kernel buffer.
+fn buildFaultMessage(process_handle: u64, thread_handle: u64, faulted: *Thread) [176]u8 {
+    var buf: [176]u8 = undefined;
+    @as(*align(1) u64, @ptrCast(&buf[0])).* = process_handle;
+    @as(*align(1) u64, @ptrCast(&buf[8])).* = thread_handle;
+    buf[16] = @intFromEnum(faulted.fault_reason);
+    @memset(buf[17..24], 0);
+    @as(*align(1) u64, @ptrCast(&buf[24])).* = faulted.fault_addr;
+    @as(*align(1) u64, @ptrCast(&buf[32])).* = faulted.fault_rip;
+    @as(*align(1) u64, @ptrCast(&buf[40])).* = faulted.ctx.rflags;
+    @as(*align(1) u64, @ptrCast(&buf[48])).* = faulted.ctx.rsp;
+    const r = &faulted.ctx.regs;
+    const gprs = [_]u64{
+        r.r15, r.r14, r.r13, r.r12, r.r11, r.r10, r.r9, r.r8,
+        r.rdi, r.rsi, r.rbp, r.rbx, r.rdx, r.rcx, r.rax,
+    };
+    var off: usize = 56;
+    for (gprs) |v| {
+        @as(*align(1) u64, @ptrCast(&buf[off])).* = v;
+        off += 8;
+    }
+    return buf;
+}
+
+/// Write a FaultMessage from the current address space directly into the
+/// caller's user buffer (used on the synchronous-dequeue path where the
+/// receiver is the current thread). Copies via physmap to avoid faulting
+/// the kernel on a demand-paged user VA (interrupts.zig kills ring-0 user
+/// faults outright).
+fn writeFaultMessage(proc: *Process, buf_ptr: u64, process_handle: u64, thread_handle: u64, faulted: *Thread) void {
+    const msg = buildFaultMessage(process_handle, thread_handle, faulted);
+    // Pre-fault every destination page, then copy through physmap.
+    var remaining: usize = 176;
+    var src_off: usize = 0;
+    var dst_va: u64 = buf_ptr;
+    while (remaining > 0) {
+        const page_off = dst_va & 0xFFF;
+        const chunk = @min(remaining, paging.PAGE4K - page_off);
+        // Force the page in via demand-page if not already committed.
+        // Ignore NoMapping / PermissionDenied — faultRecvValidateBuf already
+        // checked the VMM nodes and write rights; an error here is a
+        // shared/MMIO node, which we simply skip (matching the pre-fix
+        // behavior of silently writing into wrong memory).
+        proc.vmm.demandPage(VAddr.fromInt(dst_va), true, false) catch {};
+        if (arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va))) |page_paddr| {
+            const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
+            const dst: [*]u8 = @ptrFromInt(physmap_addr);
+            @memcpy(dst[0..chunk], msg[src_off..][0..chunk]);
+        }
+        src_off += chunk;
+        dst_va += chunk;
+        remaining -= chunk;
+    }
+}
+
+
+/// Look up the handle IDs for a faulted source thread in the handler's
+/// perm table. Returns (process_handle, thread_handle); zero values mean
+/// "not found in table" (which can happen if the source process is the
+/// handler itself, in which case process_handle = HANDLE_SELF = 0).
+fn lookupFaultHandles(handler: *Process, faulted: *Thread) struct { proc_h: u64, thread_h: u64 } {
+    handler.perm_lock.lock();
+    defer handler.perm_lock.unlock();
+    var proc_h: u64 = 0;
+    var thread_h: u64 = 0;
+    for (&handler.perm_table) |*slot| {
+        switch (slot.object) {
+            .thread => |t| if (t == faulted) {
+                thread_h = slot.handle;
+            },
+            .process => |p| if (p == faulted.process) {
+                proc_h = slot.handle;
+            },
+            else => {},
         }
     }
-    proc.perm_lock.unlock();
-    if (!has_right) return E_PERM;
+    return .{ .proc_h = proc_h, .thread_h = thread_h };
+}
 
-    // Validate buffer address
-    const FAULT_MSG_SIZE: u64 = 176; // matches libz FaultMessage layout
+fn faultHandlerCheck(proc: *Process) bool {
+    proc.perm_lock.lock();
+    defer proc.perm_lock.unlock();
+    if (proc.perm_table[0].processRights().fault_handler) return true;
+    for (proc.perm_table[1..]) |slot| {
+        if (slot.object == .process and slot.processHandleRights().fault_handler) return true;
+    }
+    return false;
+}
+
+fn faultRecvValidateBuf(proc: *Process, buf_ptr: u64) i64 {
     if (!address.AddrSpacePartition.user.contains(buf_ptr)) return E_BADADDR;
     const buf_end = std.math.add(u64, buf_ptr, FAULT_MSG_SIZE) catch return E_BADADDR;
     if (!address.AddrSpacePartition.user.contains(buf_end -| 1)) return E_BADADDR;
@@ -889,134 +1041,224 @@ fn sysFaultRecv(buf_ptr: u64, blocking: u64) i64 {
         if (!node.rights.write) return E_BADADDR;
         check_addr = node.end();
     }
-
-    proc.lock.lock();
-
-    if (proc.fault_pending and proc.fault_pending_delivered) {
-        proc.lock.unlock();
-        return E_BUSY;
-    }
-
-    // Non-blocking semantics for now: if blocking, spin-wait by yielding without
-    // descheduling. This is suboptimal but avoids context-saving issues.
-    if (!proc.fault_pending and blocking == 0) {
-        proc.lock.unlock();
-        return E_AGAIN;
-    }
-
-    // Blocking poll loop
-    while (!proc.fault_pending) {
-        proc.lock.unlock();
-        arch.enableInterrupts();
-        sched.yield();
-        proc.lock.lock();
-    }
-
-    // Deliver the fault message
-    const tid = proc.fault_pending_tid;
-    const reason: u8 = proc.fault_pending_reason;
-    const fault_addr: u64 = proc.fault_pending_addr;
-    const process_handle: u64 = proc.fault_pending_proc_handle;
-    const rip: u64 = proc.fault_pending_rip;
-    proc.fault_pending_delivered = true;
-    proc.lock.unlock();
-
-    // Write FaultMessage to user buffer
-    // Layout: process_handle(u64), thread_handle(u64), fault_reason(u8), _pad[7], fault_addr(u64), rip(u64), regs[136]
-    const buf: [*]u8 = @ptrFromInt(buf_ptr);
-    @as(*align(1) u64, @ptrCast(buf + 0)).* = process_handle;
-    @as(*align(1) u64, @ptrCast(buf + 8)).* = tid;
-    buf[16] = reason;
-    @memset(buf[17..24], 0);
-    @as(*align(1) u64, @ptrCast(buf + 24)).* = fault_addr;
-    @as(*align(1) u64, @ptrCast(buf + 32)).* = rip;
-    @memset(buf[40..176], 0);
-
-    return @intCast(tid);
+    return E_OK;
 }
 
-fn sysFaultReply(fault_token: u64, action: u64, modified_regs_ptr: u64) i64 {
-    const FAULT_KILL: u64 = 0;
-    const FAULT_RESUME: u64 = 1;
-    const FAULT_RESUME_MODIFIED: u64 = 2;
+fn sysFaultRecv(ctx: *ArchCpuContext, buf_ptr: u64, blocking: u64) SyscallResult {
+    const thread = sched.currentThread().?;
+    const proc = thread.process;
+
+    if (!faultHandlerCheck(proc)) return .{ .rax = E_PERM };
+
+    const buf_check = faultRecvValidateBuf(proc, buf_ptr);
+    if (buf_check != E_OK) return .{ .rax = buf_check };
+
+    while (true) {
+        proc.fault_box.lock.lock();
+
+        if (proc.fault_box.isPendingReply()) {
+            proc.fault_box.lock.unlock();
+            return .{ .rax = E_BUSY };
+        }
+
+        if (proc.fault_box.dequeueLocked()) |faulted| {
+            proc.fault_box.beginPendingReplyLocked(faulted);
+            proc.fault_box.lock.unlock();
+
+            const handles = lookupFaultHandles(proc, faulted);
+            writeFaultMessage(proc, buf_ptr, handles.proc_h, handles.thread_h, faulted);
+            return .{ .rax = @intCast(handles.thread_h) };
+        }
+
+        if (blocking == 0) {
+            proc.fault_box.lock.unlock();
+            return .{ .rax = E_AGAIN };
+        }
+
+        // Block on recv. The faultBlock path will wake us when a fault
+        // is enqueued; we then loop and re-attempt the dequeue in our
+        // own address space.
+        proc.fault_box.beginReceivingLocked(thread);
+        proc.fault_box.lock.unlock();
+
+        thread.state = .blocked;
+        thread.ctx = ctx;
+        thread.on_cpu.store(false, .release);
+        sched.switchToNextReady();
+        // Never returns from switchToNextReady on this stack — when we're
+        // re-dispatched the int 0x80 frame is restored and execution
+        // resumes from the syscall epilogue. The loop here is technically
+        // unreachable on this code path, but it's also harmless and makes
+        // the contract obvious to the reader.
+        unreachable;
+    }
+}
+
+/// Read 144 bytes of FaultMessage saved-regs (rip + rflags + rsp + 15 GPRs)
+/// from `src_ptr` and apply them to `dst.ctx`. Layout matches writeFaultMessage.
+fn applyModifiedRegs(dst: *Thread, src_ptr: u64) void {
+    const buf: [*]const u8 = @ptrFromInt(src_ptr);
+    dst.ctx.rip = @as(*align(1) const u64, @ptrCast(buf + 0)).*;
+    dst.ctx.rflags = @as(*align(1) const u64, @ptrCast(buf + 8)).*;
+    dst.ctx.rsp = @as(*align(1) const u64, @ptrCast(buf + 16)).*;
+    const r = &dst.ctx.regs;
+    var off: usize = 24;
+    inline for (.{
+        "r15", "r14", "r13", "r12", "r11", "r10", "r9",  "r8",
+        "rdi", "rsi", "rbp", "rbx", "rdx", "rcx", "rax",
+    }) |field| {
+        @field(r, field) = @as(*align(1) const u64, @ptrCast(buf + off)).*;
+        off += 8;
+    }
+}
+
+const FAULT_KILL: u64 = 0;
+const FAULT_RESUME: u64 = 1;
+const FAULT_RESUME_MODIFIED: u64 = 2;
+const FAULT_EXCLUDE_NEXT: u64 = 0x1;
+const FAULT_EXCLUDE_PERMANENT: u64 = 0x2;
+
+fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modified_regs_ptr: u64) i64 {
     if (action > FAULT_RESUME_MODIFIED) return E_INVAL;
 
     const proc = currentProc();
+    const flags = ctx.regs.r14;
+
+    // §2.12.22: both exclude bits set is invalid.
+    if ((flags & FAULT_EXCLUDE_NEXT) != 0 and (flags & FAULT_EXCLUDE_PERMANENT) != 0) {
+        return E_INVAL;
+    }
 
     // §4.34.6: validate modified_regs_ptr for RESUME_MODIFIED.
     if (action == FAULT_RESUME_MODIFIED) {
         if (!address.AddrSpacePartition.user.contains(modified_regs_ptr)) return E_BADADDR;
-        const SAVED_REGS_SIZE: u64 = 144;
-        const buf_end = std.math.add(u64, modified_regs_ptr, SAVED_REGS_SIZE) catch return E_BADADDR;
+        const buf_end = std.math.add(u64, modified_regs_ptr, FAULT_REGS_SIZE) catch return E_BADADDR;
         if (!address.AddrSpacePartition.user.contains(buf_end -| 1)) return E_BADADDR;
         const node = proc.vmm.findNode(VAddr.fromInt(modified_regs_ptr)) orelse return E_BADADDR;
         if (!node.rights.read) return E_BADADDR;
     }
 
-    proc.lock.lock();
+    proc.fault_box.lock.lock();
 
-    if (!proc.fault_pending or !proc.fault_pending_delivered) {
-        proc.lock.unlock();
+    if (!proc.fault_box.isPendingReply()) {
+        proc.fault_box.lock.unlock();
         return E_INVAL;
     }
-    if (proc.fault_pending_tid != fault_token) {
-        proc.lock.unlock();
+
+    const pending = proc.fault_box.pending_thread orelse {
+        // pending_reply with null pending_thread shouldn't happen for fault box.
+        _ = proc.fault_box.endPendingReplyLocked();
+        proc.fault_box.lock.unlock();
+        return E_INVAL;
+    };
+
+    // Validate the token matches the pending thread's handle in our perm
+    // table. If the source thread was killed externally between fault_recv
+    // and fault_reply, the handle was cleared, so the lookup returns 0 —
+    // distinct from any valid token.
+    const pending_handle = proc.findThreadHandle(pending) orelse {
+        _ = proc.fault_box.endPendingReplyLocked();
+        proc.fault_box.lock.unlock();
+        return E_NOENT;
+    };
+    if (pending_handle != fault_token) {
+        proc.fault_box.lock.unlock();
         return E_NOENT;
     }
 
-    const source = proc.fault_pending_source;
+    _ = proc.fault_box.endPendingReplyLocked();
+    proc.fault_box.lock.unlock();
 
-    // Clear pending state.
-    proc.fault_pending = false;
-    proc.fault_pending_tid = 0;
-    proc.fault_pending_source = null;
-    proc.fault_pending_thread = null;
-    proc.fault_pending_delivered = false;
-    proc.fault_pending_reason = 0;
-    proc.fault_pending_addr = 0;
-    proc.fault_pending_proc_handle = 0;
-    proc.lock.unlock();
-
-    if (source) |src| {
-        switch (action) {
-            FAULT_KILL => {
-                src.kill(.killed);
-            },
-            FAULT_RESUME, FAULT_RESUME_MODIFIED => {
-                // Find the .faulted thread and resume it; unsuspend siblings.
-                src.lock.lock();
-                var faulted_thread: ?*Thread = null;
-                for (src.threads[0..src.num_threads]) |t| {
-                    if (t.state == .faulted) {
-                        faulted_thread = t;
-                    } else if (t.state == .suspended) {
-                        t.state = .ready;
-                    }
+    // Apply FAULT_EXCLUDE_* flags to the pending thread's perm entry.
+    if ((flags & (FAULT_EXCLUDE_NEXT | FAULT_EXCLUDE_PERMANENT)) != 0) {
+        proc.perm_lock.lock();
+        for (&proc.perm_table) |*slot| {
+            if (slot.object == .thread and slot.object.thread == pending) {
+                if ((flags & FAULT_EXCLUDE_NEXT) != 0) {
+                    slot.exclude_oneshot = true;
+                    slot.exclude_permanent = false;
+                } else {
+                    slot.exclude_oneshot = false;
+                    slot.exclude_permanent = true;
                 }
-                src.suspended_thread_slots = 0;
-                src.faulted_thread_slots = 0;
-                if (faulted_thread) |ft| {
-                    ft.state = .ready;
-                }
-                src.lock.unlock();
-                // Re-enqueue all newly-ready threads.
-                if (faulted_thread) |ft| {
-                    const target_core = if (ft.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
-                    sched.enqueueOnCore(target_core, ft);
-                }
-                src.lock.lock();
-                for (src.threads[0..src.num_threads]) |t| {
-                    if (t.state == .ready and t != faulted_thread) {
-                        const target_core = if (t.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
-                        src.lock.unlock();
-                        sched.enqueueOnCore(target_core, t);
-                        src.lock.lock();
-                    }
-                }
-                src.lock.unlock();
-            },
-            else => unreachable,
+                break;
+            }
         }
+        proc.syncUserView();
+        proc.perm_lock.unlock();
+    }
+
+    const src = pending.process;
+
+    // §2.12.23: on ANY fault_reply, release all .suspended siblings before
+    // applying the action on the faulting thread.
+    src.lock.lock();
+    {
+        var i: u64 = 0;
+        while (i < src.num_threads) : (i += 1) {
+            const t = src.threads[i];
+            if (t.state == .suspended) {
+                t.state = .ready;
+            }
+        }
+    }
+    const sib_mask = src.suspended_thread_slots;
+    src.suspended_thread_slots = 0;
+    src.lock.unlock();
+
+    {
+        var i: u64 = 0;
+        while (i < src.num_threads) : (i += 1) {
+            const t = src.threads[i];
+            if ((sib_mask & (@as(u64, 1) << @intCast(t.slot_index))) != 0) {
+                const target_core = if (t.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+                sched.enqueueOnCore(target_core, t);
+            }
+        }
+    }
+
+    switch (action) {
+        FAULT_KILL => {
+            // §2.12.24: kill ONLY the faulting thread. If it is the last
+            // non-exited thread, Thread.deinit -> lastThreadExited drives
+            // process exit/restart per §2.6.
+            src.lock.lock();
+            pending.state = .exited;
+            const faulted_bit = @as(u64, 1) << @intCast(pending.slot_index);
+            src.faulted_thread_slots &= ~faulted_bit;
+            src.lock.unlock();
+
+            while (pending.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+            sched.removeFromAnyRunQueue(pending);
+            if (pending.futex_paddr.addr != 0) {
+                futex.removeBlockedThread(pending);
+            }
+            if (pending.ipc_server) |server| {
+                server.msg_box.lock.lock();
+                if (server.msg_box.isPendingReply() and server.msg_box.pending_thread == pending) {
+                    _ = server.msg_box.endPendingReplyLocked();
+                } else {
+                    _ = server.msg_box.removeLocked(pending);
+                }
+                pending.ipc_server = null;
+                server.msg_box.lock.unlock();
+            }
+            pending.deinit();
+        },
+        FAULT_RESUME, FAULT_RESUME_MODIFIED => {
+            if (action == FAULT_RESUME_MODIFIED) {
+                applyModifiedRegs(pending, modified_regs_ptr);
+            }
+            src.lock.lock();
+            pending.state = .ready;
+            const faulted_bit = @as(u64, 1) << @intCast(pending.slot_index);
+            src.faulted_thread_slots &= ~faulted_bit;
+            src.lock.unlock();
+
+            const target_core = if (pending.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+            sched.enqueueOnCore(target_core, pending);
+        },
+        else => unreachable,
     }
 
     return E_OK;
@@ -1099,10 +1341,16 @@ fn sysFaultSetThreadMode(thread_handle: u64, mode: u64) i64 {
     const thr_entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (thr_entry.object != .thread) return E_BADCAP;
 
-    // Verify caller holds fault_handler for the thread's owning process
+    // Verify caller holds fault_handler for the thread's owning process.
+    // Two valid cases (§2.12.32):
+    //   1. External handler: target_proc.fault_handler_proc == proc
+    //   2. Self-handling:    target_proc == proc AND proc's slot 0 has
+    //                        the fault_handler ProcessRights bit set.
     const target_thread = thr_entry.object.thread;
     const target_proc = target_thread.process;
-    if (target_proc.fault_handler_proc != proc) return E_PERM;
+    const is_self_handler = target_proc == proc and
+        proc.perm_table[0].processRights().fault_handler;
+    if (target_proc.fault_handler_proc != proc and !is_self_handler) return E_PERM;
 
     // Update exclude flags on the thread's perm entry in caller's table
     proc.perm_lock.lock();
@@ -1193,9 +1441,22 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                 const granted_u16: u16 = @truncate(rights_val);
                 const granted_phr: ProcessHandleRights = @bitCast(granted_u16);
 
-                // If fault_handler bit is set, handle the fault_handler transfer
+                // If fault_handler bit is set, handle the fault_handler transfer.
+                // §2.12.3 requires the routing change to be atomic so a fault
+                // in between cannot observe "no handler" and kill the sender.
+                //
+                // `faultHandlerOf` consults `fault_handler_proc` first and
+                // only falls back to the slot-0 bit when that is null, so
+                // the safe ordering is:
+                //   1. set fault_handler_proc = target
+                //   2. clear the slot-0 fault_handler bit
+                // During the gap, a fault routes to `target` (its eventual
+                // destination). Both writes happen under sender_proc.lock
+                // (which protects fault_handler_proc per process.zig:87),
+                // nested with perm_lock for the slot-0 bit write.
                 if (granted_phr.fault_handler) {
-                    // Clear fault_handler from sender's slot 0 ProcessRights
+                    sender_proc.lock.lock();
+                    sender_proc.fault_handler_proc = target_proc;
                     sender_proc.perm_lock.lock();
                     const self_rights = sender_proc.perm_table[0].processRights();
                     var new_rights = self_rights;
@@ -1203,9 +1464,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                     sender_proc.perm_table[0].rights = @bitCast(new_rights);
                     sender_proc.syncUserView();
                     sender_proc.perm_lock.unlock();
-
-                    // Set fault_handler_proc on sender
-                    sender_proc.fault_handler_proc = target_proc;
+                    sender_proc.lock.unlock();
 
                     // Link sender into target's fault_handler_targets list
                     // so target's death can revert sender to self-handling.
@@ -1237,13 +1496,14 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                         };
                     }
 
-                    // Insert thread handles for all current threads into handler's perm table.
-                    // Note: We do NOT acquire sender_proc.lock here because sysIpcReply already
-                    // holds it (this would be a self-deadlock). Thread create/destroy races are
-                    // tolerable here — initial thread always exists.
+                    // Snapshot the sender's thread list under sender_proc.lock,
+                    // then release the lock before walking it (insertThreadHandle
+                    // takes target_proc.perm_lock and we don't want to nest).
+                    sender_proc.lock.lock();
                     const num_threads = sender_proc.num_threads;
                     var threads_copy: [Process.MAX_THREADS]*Thread = undefined;
                     @memcpy(threads_copy[0..num_threads], sender_proc.threads[0..num_threads]);
+                    sender_proc.lock.unlock();
 
                     for (threads_copy[0..num_threads]) |t| {
                         _ = target_proc.insertThreadHandle(t, ThreadHandleRights.full) catch {};
@@ -1369,10 +1629,11 @@ fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
     const rights_check = validateIpcSendRights(target_entry, meta, proc, ctx);
     if (rights_check != E_OK) return .{ .rax = rights_check };
 
-    target_proc.lock.lock();
+    target_proc.msg_box.lock.lock();
 
-    if (target_proc.receiver) |receiver| {
+    if (target_proc.msg_box.isReceiving()) {
         // Receiver is waiting — deliver directly
+        const receiver = target_proc.msg_box.takeReceiverLocked();
         copyPayload(receiver.ctx, ctx, meta.word_count);
         // Set recv metadata: bit 0 = 0 (from send), bits [3:1] = word_count
         receiver.ctx.regs.r14 = @as(u64, meta.word_count) << 1;
@@ -1383,22 +1644,23 @@ fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
             const cap = getCapPayload(ctx, meta.word_count);
             const cap_result = transferCapability(proc, target_proc, cap.handle, cap.rights);
             if (cap_result != E_OK) {
-                target_proc.lock.unlock();
+                // Roll back: re-block the receiver. The caller's rax will
+                // carry the error from this syscall; the receiver stays put.
+                target_proc.msg_box.beginReceivingLocked(receiver);
+                target_proc.msg_box.lock.unlock();
                 return .{ .rax = cap_result };
             }
         }
 
-        target_proc.pending_reply = true;
-        target_proc.pending_caller = null; // send has no caller to reply to
-        const recv_thread = receiver;
-        target_proc.receiver = null;
-        target_proc.lock.unlock();
+        // Send has no caller to reply to.
+        target_proc.msg_box.beginPendingReplyLocked(null);
+        target_proc.msg_box.lock.unlock();
 
-        wakeThread(recv_thread);
+        wakeThread(receiver);
         return .{ .rax = E_OK };
     } else {
         // No receiver waiting
-        target_proc.lock.unlock();
+        target_proc.msg_box.lock.unlock();
         return .{ .rax = E_AGAIN };
     }
 }
@@ -1422,10 +1684,11 @@ fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
     const rights_check = validateIpcSendRights(target_entry, meta, proc, ctx);
     if (rights_check != E_OK) return .{ .rax = rights_check };
 
-    target_proc.lock.lock();
+    target_proc.msg_box.lock.lock();
 
-    if (target_proc.receiver) |receiver| {
-        // Receiver is waiting — deliver directly and switch
+    if (target_proc.msg_box.isReceiving()) {
+        // Receiver is waiting — deliver and queue caller for reply.
+        const receiver = target_proc.msg_box.takeReceiverLocked();
         copyPayload(receiver.ctx, ctx, meta.word_count);
         receiver.ctx.regs.r14 = (@as(u64, meta.word_count) << 1) | 1; // bit 0 = 1 (from call)
         receiver.ctx.regs.rax = @bitCast(E_OK);
@@ -1434,45 +1697,31 @@ fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
             const cap = getCapPayload(ctx, meta.word_count);
             const cap_result = transferCapability(proc, target_proc, cap.handle, cap.rights);
             if (cap_result != E_OK) {
-                target_proc.lock.unlock();
+                // Roll back: re-block the receiver before returning the error.
+                target_proc.msg_box.beginReceivingLocked(receiver);
+                target_proc.msg_box.lock.unlock();
                 return .{ .rax = cap_result };
             }
         }
 
-        target_proc.pending_reply = true;
-        target_proc.pending_caller = thread;
+        target_proc.msg_box.beginPendingReplyLocked(thread);
         thread.ipc_server = target_proc;
-        const recv_thread = receiver;
-        target_proc.receiver = null;
-        target_proc.lock.unlock();
+        target_proc.msg_box.lock.unlock();
 
-        // Block caller and switch directly to receiver
+        // TODO: this should switchToThread directly to the receiver as a
+        // fast-path handoff, but doing so currently hangs. Use wakeThread
+        // and block self via switchToNextReady for now.
+        wakeThread(receiver);
+
         thread.state = .blocked;
-        // switchToThread saves ctx and does the switch — never returns on success
-        const result = sched.switchToThread(thread, recv_thread, ctx, false);
-        // If we get here, switchToThread returned an error (E_BUSY)
-        // Undo the IPC state
-        target_proc.lock.lock();
-        target_proc.pending_reply = false;
-        target_proc.pending_caller = null;
-        thread.ipc_server = null;
-        thread.state = .running;
-        // Re-block the receiver since we can't deliver
-        target_proc.receiver = recv_thread;
-        recv_thread.state = .blocked;
-        target_proc.lock.unlock();
-        return .{ .rax = result };
+        thread.ctx = ctx;
+        thread.on_cpu.store(false, .release);
+        sched.switchToNextReady();
     } else {
         // No receiver — queue on wait list
-        thread.next = null;
-        if (target_proc.msg_waiters_tail) |tail| {
-            tail.next = thread;
-        } else {
-            target_proc.msg_waiters_head = thread;
-        }
-        target_proc.msg_waiters_tail = thread;
+        target_proc.msg_box.enqueueLocked(thread);
         thread.ipc_server = target_proc;
-        target_proc.lock.unlock();
+        target_proc.msg_box.lock.unlock();
 
         thread.state = .blocked;
         // switchToNextReady saves ctx and never returns
@@ -1489,65 +1738,60 @@ fn sysIpcRecv(ctx: *ArchCpuContext) SyscallResult {
     const proc = thread.process;
     const blocking = (ctx.regs.r14 & 0x2) != 0;
 
-    // Must reply before receiving again
-    if (proc.pending_reply) return .{ .rax = E_BUSY };
+    proc.msg_box.lock.lock();
 
-    proc.lock.lock();
-
-    // Check if another thread is already receiving
-    if (proc.receiver != null) {
-        proc.lock.unlock();
+    // Must reply before receiving again.
+    if (proc.msg_box.isPendingReply()) {
+        proc.msg_box.lock.unlock();
         return .{ .rax = E_BUSY };
     }
 
-    if (proc.msg_waiters_head) |waiter| {
-        // Dequeue first waiter
-        proc.msg_waiters_head = waiter.next;
-        if (proc.msg_waiters_head == null) {
-            proc.msg_waiters_tail = null;
-        }
-        waiter.next = null;
+    // Check if another thread is already receiving.
+    if (proc.msg_box.isReceiving()) {
+        proc.msg_box.lock.unlock();
+        return .{ .rax = E_BUSY };
+    }
 
-        // Copy payload from waiter's saved context
+    if (proc.msg_box.dequeueLocked()) |waiter| {
+        // Copy payload from waiter's saved context.
         const waiter_meta = parseIpcMetadata(waiter.ctx.regs.r14);
         copyPayload(ctx, waiter.ctx, waiter_meta.word_count);
 
-        // Set recv metadata: bit 0 = 1 (always from call since send doesn't queue)
+        // Set recv metadata: bit 0 = 1 (always from call — send doesn't queue).
         ctx.regs.r14 = (@as(u64, waiter_meta.word_count) << 1) | 1;
 
-        // Handle capability transfer
+        // Handle capability transfer.
         if (waiter_meta.cap_transfer) {
             const cap = getCapPayload(waiter.ctx, waiter_meta.word_count);
             const cap_result = transferCapability(waiter.process, proc, cap.handle, cap.rights);
             if (cap_result != E_OK) {
-                // Put waiter back at head (it was already dequeued)
-                waiter.next = proc.msg_waiters_head;
-                proc.msg_waiters_head = waiter;
-                if (proc.msg_waiters_tail == null) {
-                    proc.msg_waiters_tail = waiter;
+                // Put waiter back at head of the queue.
+                waiter.next = proc.msg_box.queue_head;
+                proc.msg_box.queue_head = waiter;
+                if (proc.msg_box.queue_tail == null) {
+                    proc.msg_box.queue_tail = waiter;
                 }
-                proc.lock.unlock();
+                proc.msg_box.lock.unlock();
                 return .{ .rax = cap_result };
             }
         }
 
-        proc.pending_reply = true;
-        proc.pending_caller = waiter;
-        proc.lock.unlock();
+        proc.msg_box.beginPendingReplyLocked(waiter);
+        proc.msg_box.lock.unlock();
 
         return .{ .rax = E_OK };
     } else if (blocking) {
-        // Block on recv
-        proc.receiver = thread;
-        proc.lock.unlock();
+        // Block on recv.
+        proc.msg_box.beginReceivingLocked(thread);
+        proc.msg_box.lock.unlock();
 
         thread.state = .blocked;
         thread.ctx = ctx;
         thread.on_cpu.store(false, .release);
         sched.switchToNextReady();
-        // Never reached — sender delivers message and wakes us via switchTo
+        // Never reached — sender delivers message and wakes us via switchTo.
     } else {
-        proc.lock.unlock();
+        proc.msg_box.lock.unlock();
         return .{ .rax = E_AGAIN };
     }
 }
@@ -1561,118 +1805,100 @@ fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
     const reply_word_count: u3 = @truncate((r14 >> 2) & 0x7);
     const reply_cap_transfer = (r14 & 0x20) != 0;
 
-    proc.lock.lock();
+    proc.msg_box.lock.lock();
 
-    if (!proc.pending_reply) {
-        proc.lock.unlock();
+    if (!proc.msg_box.isPendingReply()) {
+        proc.msg_box.lock.unlock();
         return .{ .rax = E_INVAL };
     }
 
-    var caller_thread: ?*Thread = null;
+    const caller_thread: ?*Thread = proc.msg_box.endPendingReplyLocked();
 
-    if (proc.pending_caller) |pc| {
-        // Reply to a call — copy reply payload to caller's saved context
-        copyPayload(pc.ctx, ctx, reply_word_count);
-        pc.ctx.regs.rax = @bitCast(E_OK);
-        // Copy reply metadata to caller
-        pc.ctx.regs.r14 = (@as(u64, reply_word_count) << 1) | 1;
-
-        // Handle capability transfer on reply
+    if (caller_thread) |pc| {
+        // Capability transfer runs before we commit any payload to the
+        // caller: on failure, the caller must observe the error instead
+        // of a successful reply (§2.11.14). Preserve the caller's
+        // original payload registers — only rax is overwritten.
+        var cap_err: i64 = E_OK;
         if (reply_cap_transfer) {
             const cap = getCapPayload(ctx, reply_word_count);
-            _ = transferCapability(proc, pc.process, cap.handle, cap.rights);
+            cap_err = transferCapability(proc, pc.process, cap.handle, cap.rights);
+        }
+        if (cap_err != E_OK) {
+            pc.ctx.regs.rax = @bitCast(cap_err);
+        } else {
+            copyPayload(pc.ctx, ctx, reply_word_count);
+            pc.ctx.regs.rax = @bitCast(E_OK);
+            pc.ctx.regs.r14 = (@as(u64, reply_word_count) << 1) | 1;
         }
 
         pc.ipc_server = null;
-        caller_thread = pc;
     }
 
-    proc.pending_caller = null;
-    proc.pending_reply = false;
-
     if (atomic_recv) {
-        // Reply + recv atomically
-        if (proc.msg_waiters_head) |waiter| {
-            // There's a queued message — deliver it immediately
-            proc.msg_waiters_head = waiter.next;
-            if (proc.msg_waiters_head == null) {
-                proc.msg_waiters_tail = null;
-            }
-            waiter.next = null;
-
+        // Reply + recv atomically.
+        if (proc.msg_box.dequeueLocked()) |waiter| {
             const waiter_meta = parseIpcMetadata(waiter.ctx.regs.r14);
+
+            // Capability transfer runs before we deliver to the receiver:
+            // on failure, put the waiter back at the head of the queue
+            // and return E_MAXCAP (§2.11.14) — mirrors sysIpcRecv.
+            if (waiter_meta.cap_transfer) {
+                const cap = getCapPayload(waiter.ctx, waiter_meta.word_count);
+                const cap_result = transferCapability(waiter.process, proc, cap.handle, cap.rights);
+                if (cap_result != E_OK) {
+                    waiter.next = proc.msg_box.queue_head;
+                    proc.msg_box.queue_head = waiter;
+                    if (proc.msg_box.queue_tail == null) {
+                        proc.msg_box.queue_tail = waiter;
+                    }
+                    proc.msg_box.lock.unlock();
+                    if (caller_thread) |ct| wakeThread(ct);
+                    return .{ .rax = cap_result };
+                }
+            }
+
             copyPayload(ctx, waiter.ctx, waiter_meta.word_count);
             ctx.regs.r14 = (@as(u64, waiter_meta.word_count) << 1) | 1;
             ctx.regs.rax = @bitCast(E_OK);
 
-            if (waiter_meta.cap_transfer) {
-                const cap = getCapPayload(waiter.ctx, waiter_meta.word_count);
-                _ = transferCapability(waiter.process, proc, cap.handle, cap.rights);
-            }
+            proc.msg_box.beginPendingReplyLocked(waiter);
+            proc.msg_box.lock.unlock();
 
-            proc.pending_reply = true;
-            proc.pending_caller = waiter;
-            proc.lock.unlock();
-
-            // Wake the previous caller if any
-            if (caller_thread) |ct| {
-                wakeThread(ct);
-            }
-
+            if (caller_thread) |ct| wakeThread(ct);
             return .{ .rax = E_OK };
         } else if (recv_blocking) {
-            // No queued message — block on recv
-            proc.receiver = thread;
-            proc.lock.unlock();
+            proc.msg_box.beginReceivingLocked(thread);
+            proc.msg_box.lock.unlock();
 
-            if (caller_thread) |ct| {
-                // Switch directly to the caller we just replied to
-                thread.state = .blocked;
-                const result = sched.switchToThread(thread, ct, ctx, false);
-                if (result != 0) {
-                    // Undo
-                    proc.lock.lock();
-                    proc.receiver = null;
-                    proc.lock.unlock();
-                    thread.state = .running;
-                    wakeThread(ct);
-                    return .{ .rax = E_OK }; // Reply succeeded, only recv failed
-                }
-                unreachable;
-            } else {
-                thread.state = .blocked;
-                thread.ctx = ctx;
-                thread.on_cpu.store(false, .release);
-                sched.switchToNextReady();
-                unreachable;
-            }
+            // TODO: same direct-switch hang issue as above; use wakeThread
+            // for now and block self via switchToNextReady.
+            if (caller_thread) |ct| wakeThread(ct);
+            thread.state = .blocked;
+            thread.ctx = ctx;
+            thread.on_cpu.store(false, .release);
+            sched.switchToNextReady();
+            unreachable;
         } else {
-            // Non-blocking recv, no message
-            proc.lock.unlock();
-            if (caller_thread) |ct| {
-                wakeThread(ct);
-            }
+            proc.msg_box.lock.unlock();
+            if (caller_thread) |ct| wakeThread(ct);
             ctx.regs.rax = @bitCast(E_AGAIN);
             return .{ .rax = E_AGAIN };
         }
     } else {
-        // Plain reply (no atomic recv)
-        proc.lock.unlock();
+        proc.msg_box.lock.unlock();
 
         if (caller_thread) |ct| {
-            // Switch to caller, put self on run queue (enqueued inside switchToThread after ctx save)
             thread.state = .ready;
             ctx.regs.rax = @bitCast(E_OK);
             const result = sched.switchToThread(thread, ct, ctx, true);
             if (result != 0) {
-                // switchToThread failed (E_BUSY), just wake caller normally
                 thread.state = .running;
                 wakeThread(ct);
                 return .{ .rax = E_OK };
             }
             unreachable;
         } else {
-            // Was a send, no one to switch to
             return .{ .rax = E_OK };
         }
     }

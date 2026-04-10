@@ -7,75 +7,122 @@ const syscall = lib.syscall;
 const t = lib.testing;
 
 /// §2.12.11 — Before applying stop-all on an external fault, the kernel checks the faulting thread's `exclude_oneshot` and `exclude_permanent` flags on the thread's perm entry in the handler's permissions table.
-/// thread's `exclude_oneshot` and `exclude_permanent` flags on the thread's perm entry in the
-/// handler's permissions table. If either flag is set, only the faulting thread enters `.faulted`
-/// and all other threads continue running.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Step 1: Spawn child_send_self_fault_handler. It replies with HANDLE_SELF
-    // via cap transfer with fault_handler, making us the external fault handler.
+    // Shared memory region: [0]=fault signal, [8]=worker counter.
+    const shm_rights = (perms.SharedMemoryRights{
+        .read = true,
+        .write = true,
+        .grant = true,
+    }).bits();
+    const shm_handle: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(0x1000, shm_rights)));
+
+    const vm_rights = (perms.VmReservationRights{
+        .read = true,
+        .write = true,
+        .shareable = true,
+    }).bits();
+    const vm_result = syscall.vm_reserve(0, 0x1000, vm_rights);
+    if (vm_result.val < 0) {
+        t.fail("§2.12.11 vm_reserve");
+        syscall.shutdown();
+    }
+    if (syscall.shm_map(shm_handle, @intCast(vm_result.val), 0) != 0) {
+        t.fail("§2.12.11 shm_map");
+        syscall.shutdown();
+    }
+    const sig_ptr: *volatile u64 = @ptrFromInt(vm_result.val2);
+    const counter_ptr: *volatile u64 = @ptrFromInt(vm_result.val2 + 8);
+    sig_ptr.* = 0;
+    counter_ptr.* = 0;
+
     const child_rights = (perms.ProcessRights{
+        .spawn_thread = true,
+        .mem_reserve = true,
         .fault_handler = true,
     }).bits();
-    const child_proc_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
-        @intFromPtr(children.child_send_self_fault_handler.ptr),
-        children.child_send_self_fault_handler.len,
+    const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
+        @intFromPtr(children.child_multithread_fault_on_signal.ptr),
+        children.child_multithread_fault_on_signal.len,
         child_rights,
     )));
 
-    // Step 2: IPC call to trigger the cap transfer.
+    const shm_cap_rights: u64 = (perms.SharedMemoryRights{
+        .read = true,
+        .write = true,
+        .grant = true,
+    }).bits();
     var reply: syscall.IpcMessage = .{};
-    _ = syscall.ipc_call(child_proc_handle, &.{}, &reply);
+    _ = syscall.ipc_call_cap(child_handle, &.{ shm_handle, shm_cap_rights }, &reply);
 
-    // Step 3: Find the thread handle for the child's thread in our perm view.
-    // Per §2.12.4, acquiring fault_handler inserts thread handles.
-    var thread_handle: u64 = 0;
-    // Skip slot 1 (parent's own initial thread).
-    for (2..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD) {
-            thread_handle = view[i].handle;
-            break;
+    // Find the child's main thread handle (the one that will fault). It's
+    // inserted into our perm table at fault_handler acquire time per §2.12.4.
+    // The worker thread is created AFTER the reply, but should also appear
+    // due to §2.12.5. The faulting thread is the main thread — find the
+    // smallest tid (first inserted). We pick any non-self thread handle
+    // with the smallest tid.
+    var main_thread_handle: u64 = 0;
+    var main_tid: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+    var iter: u32 = 0;
+    while (iter < 1000) : (iter += 1) {
+        syscall.thread_yield();
+        main_thread_handle = 0;
+        main_tid = 0xFFFF_FFFF_FFFF_FFFF;
+        for (2..128) |i| {
+            if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD and view[i].handle != 0) {
+                const tid = view[i].threadTid();
+                if (tid < main_tid) {
+                    main_tid = tid;
+                    main_thread_handle = view[i].handle;
+                }
+            }
         }
+        // We want at least 2 child thread handles (main + worker) to be
+        // sure the worker was actually created before we fire the fault.
+        var count: u32 = 0;
+        for (2..128) |i| {
+            if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD and view[i].handle != 0) {
+                count += 1;
+            }
+        }
+        if (count >= 2) break;
     }
-
-    if (thread_handle == 0) {
-        t.fail("§2.12.11 no thread handle");
+    if (main_thread_handle == 0) {
+        t.fail("§2.12.11 no main thread handle");
         syscall.shutdown();
     }
 
-    // Step 4: Set exclude_permanent on the child's thread.
-    // This should prevent stop-all from being applied when this thread faults.
-    // fault_set_thread_mode(thread_handle, FAULT_MODE_EXCLUDE_PERMANENT)
-    const mode_rc = syscall.fault_set_thread_mode(thread_handle, syscall.FAULT_MODE_EXCLUDE_PERMANENT);
-
-    if (mode_rc < 0) {
-        t.fail("§2.12.11 fault_set_thread_mode failed");
+    // Set exclude_permanent on the main thread BEFORE signaling the fault.
+    const mode_rc = syscall.fault_set_thread_mode(main_thread_handle, syscall.FAULT_MODE_EXCLUDE_PERMANENT);
+    if (mode_rc != 0) {
+        t.failWithVal("§2.12.11 fault_set_thread_mode", 0, mode_rc);
         syscall.shutdown();
     }
 
-    // Step 5: Verify the mode was set by checking that fault_set_thread_mode succeeded.
-    // In a full test, we would then trigger a fault on this thread and verify
-    // that other threads continue running (not suspended by stop-all).
-    //
-    // Since child_send_self_fault_handler is blocked on futex_wait and won't fault,
-    // we verify the API call succeeded. The kernel should have set exclude_permanent
-    // on the thread's perm entry.
-    //
-    // Also test exclude_oneshot (FAULT_MODE_EXCLUDE_NEXT).
-    const mode_rc2 = syscall.fault_set_thread_mode(thread_handle, syscall.FAULT_MODE_EXCLUDE_NEXT);
-    if (mode_rc2 < 0) {
-        t.fail("§2.12.11 exclude_next failed");
+    // Signal the child to null-deref.
+    sig_ptr.* = 1;
+
+    // Block until the fault arrives.
+    var fault_buf: [256]u8 align(8) = undefined;
+    const token = syscall.fault_recv(@intFromPtr(&fault_buf), 1);
+    if (token < 0) {
+        t.failWithVal("§2.12.11 fault_recv", 0, token);
         syscall.shutdown();
     }
 
-    // Revert to stop_all to confirm clearing works too.
-    const mode_rc3 = syscall.fault_set_thread_mode(thread_handle, syscall.FAULT_MODE_STOP_ALL);
-    if (mode_rc3 < 0) {
-        t.fail("§2.12.11 stop_all failed");
-        syscall.shutdown();
+    // With exclude_permanent set, stop-all should have been SKIPPED. The
+    // worker must continue advancing the counter.
+    const snap1 = counter_ptr.*;
+    for (0..100) |_| syscall.thread_yield();
+    const snap2 = counter_ptr.*;
+
+    if (snap2 > snap1) {
+        t.pass("§2.12.11");
+    } else {
+        t.fail("§2.12.11 worker counter frozen (stop-all was not skipped)");
     }
 
-    t.pass("§2.12.11");
+    _ = syscall.fault_reply_simple(@bitCast(token), syscall.FAULT_KILL);
     syscall.shutdown();
 }

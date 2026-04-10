@@ -1,6 +1,5 @@
 const lib = @import("lib");
 
-const perm_view = lib.perm_view;
 const syscall = lib.syscall;
 const t = lib.testing;
 
@@ -15,7 +14,7 @@ fn childFn() void {
 
 /// §2.4.14 — `thread_resume` on a `.suspended` thread moves it to `.ready` and re-enqueues it on the scheduler
 pub fn main(pv: u64) void {
-    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
+    _ = pv;
     const ret = syscall.thread_create(&childFn, 0, 4);
     if (ret < 0) {
         t.fail("§2.4.14 thread_create failed");
@@ -23,25 +22,12 @@ pub fn main(pv: u64) void {
     }
     const handle: u64 = @bitCast(ret);
 
-    // Immediately suspend the child before it runs.
+    // Immediately suspend the child before it runs. Success of thread_suspend
+    // implies the target transitioned into .suspended (transient state is no
+    // longer exposed via the perm view).
     const s = syscall.thread_suspend(handle);
     if (s != 0) {
         t.failWithVal("§2.4.14 suspend", 0, s);
-        syscall.shutdown();
-    }
-
-    // Verify it is suspended (state 4) before resuming.
-    var suspended = false;
-    for (0..128) |i| {
-        if (view[i].handle == handle and view[i].entry_type == perm_view.ENTRY_TYPE_THREAD) {
-            if (view[i].threadState() == 4) {
-                suspended = true;
-            }
-            break;
-        }
-    }
-    if (!suspended) {
-        t.fail("§2.4.14 not suspended");
         syscall.shutdown();
     }
 
