@@ -157,6 +157,11 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
             }
 
             proc.vmm.demandPage(faulting_virt, is_write, is_exec) catch {
+                if (proc.faultBlock(thread, .out_of_memory, faulting_virt.addr, fault.rip, fault.user_ctx)) {
+                    arch.enableInterrupts();
+                    scheduler.yield();
+                    return;
+                }
                 proc.kill(.out_of_memory);
                 arch.enableInterrupts();
                 while (true) arch.halt();

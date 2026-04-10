@@ -1329,10 +1329,13 @@ fn sysFaultReadMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64 {
         const chunk = @min(remaining, paging.PAGE4K - page_offset);
         target.vmm.demandPage(VAddr.fromInt(src_addr), false, false) catch {};
         proc.vmm.demandPage(VAddr.fromInt(dst_addr), true, false) catch {};
-        const page_paddr = arch.resolveVaddr(target.addr_space_root, VAddr.fromInt(src_addr)) orelse return E_BADADDR;
-        const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_offset;
-        const src: [*]const u8 = @ptrFromInt(physmap_addr);
-        const dst: [*]u8 = @ptrFromInt(dst_addr);
+        const src_paddr = arch.resolveVaddr(target.addr_space_root, VAddr.fromInt(src_addr)) orelse return E_BADADDR;
+        const dst_paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_addr)) orelse return E_BADADDR;
+        const src_phys = VAddr.fromPAddr(src_paddr, null).addr + page_offset;
+        const dst_page_off = dst_addr & 0xFFF;
+        const dst_phys = VAddr.fromPAddr(dst_paddr, null).addr + dst_page_off;
+        const src: [*]const u8 = @ptrFromInt(src_phys);
+        const dst: [*]u8 = @ptrFromInt(dst_phys);
         @memcpy(dst[0..chunk], src[0..chunk]);
         remaining -= chunk;
         src_addr += chunk;

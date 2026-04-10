@@ -817,13 +817,17 @@ pub const Process = struct {
     fn doExit(self: *Process) void {
         self.cleanupPhase1();
 
-        // Convert parent's entry to dead_process even if we have children (zombie).
-        if (self.parent) |p| {
-            p.convertToDeadProcess(self);
-        }
-
         if (self.num_children == 0) {
+            // Leaf process: cleanupPhase2 runs immediately and handles
+            // the parent's convertToDeadProcess call internally.
             self.cleanupPhase2();
+        } else {
+            // Zombie: has children, so cleanupPhase2 is deferred until
+            // the last child's cleanupPhase2 cascades back to us. Convert
+            // the parent's entry now so the parent can observe the death.
+            if (self.parent) |p| {
+                p.convertToDeadProcess(self);
+            }
         }
     }
 
@@ -1150,10 +1154,14 @@ pub const Process = struct {
         }
     }
 
-    pub fn convertToDeadProcess(parent: *Process, child: *Process) void {
-        parent.perm_lock.lock();
-        defer parent.perm_lock.unlock();
-        for (parent.perm_table[1..], 1..) |*slot, idx| {
+    /// Convert a live `process` entry in `holder`'s perm table to
+    /// `dead_process`. Called from doExit (zombie path) and cleanupPhase2
+    /// (leaf path), and also lazily from IPC paths when a send/call
+    /// discovers the target is dead.
+    pub fn convertToDeadProcess(holder: *Process, child: *Process) void {
+        holder.perm_lock.lock();
+        defer holder.perm_lock.unlock();
+        for (holder.perm_table[1..], 1..) |*slot, idx| {
             const matches = switch (slot.object) {
                 .process => |p| @intFromPtr(p) == @intFromPtr(child),
                 else => false,
@@ -1161,9 +1169,9 @@ pub const Process = struct {
             if (matches) {
                 // Refcount stays the same — still one reference, just different type
                 slot.object = .{ .dead_process = child };
-                parent.syncUserView();
-                if (parent.perm_view_phys.addr != 0) {
-                    const field0_pa = PAddr.fromInt(parent.perm_view_phys.addr + idx * @sizeOf(UserViewEntry) + @offsetOf(UserViewEntry, "field0"));
+                holder.syncUserView();
+                if (holder.perm_view_phys.addr != 0) {
+                    const field0_pa = PAddr.fromInt(holder.perm_view_phys.addr + idx * @sizeOf(UserViewEntry) + @offsetOf(UserViewEntry, "field0"));
                     _ = futex.wake(field0_pa, 1);
                 }
                 return;
