@@ -52,5 +52,14 @@ pub fn main(pv_addr: u64) void {
         t.fail("§4.15.8 core_pin still present after unpin");
     }
 
+    // Verify the thread truly accepted a non-pinned priority and is not still
+    // internally pinned: cycle through HIGH and back to NORMAL. Both should
+    // succeed, proving the priority system treats the thread as unpinned.
+    const r_high = syscall.set_priority(syscall.PRIORITY_HIGH);
+    t.expectEqual("§4.15.8 set HIGH after unpin", E_OK, r_high);
+
+    const r_normal = syscall.set_priority(syscall.PRIORITY_NORMAL);
+    t.expectEqual("§4.15.8 set NORMAL after unpin", E_OK, r_normal);
+
     syscall.shutdown();
 }

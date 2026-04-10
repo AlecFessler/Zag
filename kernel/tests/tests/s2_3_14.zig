@@ -97,7 +97,11 @@ pub fn main(pv: u64) void {
         syscall.thread_yield();
     }
 
-    if (counter_during_pin == 0 and slot_gone and observed_progress) {
+    // Verify priority was restored to pre-pin level (NORMAL): set_priority(NORMAL)
+    // should succeed as a no-op, confirming we're no longer at pinned priority.
+    const pri_ret = syscall.set_priority(syscall.PRIORITY_NORMAL);
+
+    if (counter_during_pin == 0 and slot_gone and observed_progress and pri_ret == 0) {
         t.pass("§2.3.14");
     } else {
         t.fail("§2.3.14");

@@ -40,6 +40,16 @@ pub fn main(pv: u64) void {
     const aff_ret = syscall.set_affinity(0b1);
     t.expectOk("§2.4.25 path1 affinity restored", aff_ret);
 
+    // Verify priority is no longer pinned: set_priority(NORMAL) should succeed,
+    // confirming the thread accepted a non-pinned priority (pre-pin level restored).
+    const pri_ret = syscall.set_priority(syscall.PRIORITY_NORMAL);
+    t.expectOk("§2.4.25 path1 priority restored", pri_ret);
+
+    // Note: we cannot directly query current affinity or priority. The above checks
+    // confirm the thread is not locked (affinity settable) and not stuck at pinned
+    // priority. Verifying the exact pre-pin affinity mask was restored would require
+    // a get_affinity syscall which does not exist.
+
     // --- Path 2: set_priority to non-pinned ---
     _ = syscall.set_affinity(0b10);
     const pin2 = syscall.set_priority(syscall.PRIORITY_PINNED);
