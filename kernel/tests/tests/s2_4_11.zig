@@ -8,6 +8,18 @@ const t = lib.testing;
 
 const E_BUSY: i64 = -11;
 
+var blocked_ready: u64 = 0;
+var blocked_futex: u64 = 0;
+
+fn blockedThreadFn() void {
+    // Signal the parent we're about to block, then wait indefinitely on a
+    // futex whose value won't change until the parent wakes us.
+    const ready: *volatile u64 = @ptrCast(&blocked_ready);
+    ready.* = 1;
+    _ = syscall.futex_wait(@ptrCast(&blocked_futex), 0, @bitCast(@as(i64, -1)));
+    syscall.thread_exit();
+}
+
 /// §2.4.11 — `thread_suspend` on a `.faulted` or `.blocked` thread returns `E_BUSY`.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
@@ -53,6 +65,37 @@ pub fn main(pv: u64) void {
 
     // thread_suspend on a `.faulted` thread must return E_BUSY.
     const rc = syscall.thread_suspend(thread_handle);
-    t.expectEqual("§2.4.11", E_BUSY, rc);
+    if (rc != E_BUSY) {
+        t.failWithVal("§2.4.11 faulted", E_BUSY, rc);
+        syscall.shutdown();
+    }
+
+    // Sub-scenario B: `.blocked` thread must also return E_BUSY. Spawn a
+    // local thread that signals ready via SHM and then parks in futex_wait.
+    const tret = syscall.thread_create(&blockedThreadFn, 0, 4);
+    if (tret < 0) {
+        t.fail("§2.4.11 thread_create failed");
+        syscall.shutdown();
+    }
+    const blocked_handle: u64 = @bitCast(tret);
+
+    // Wait until the child thread is actually parked in futex_wait. Yielding
+    // gives the kernel a chance to dispatch it and run it up to the blocking
+    // syscall.
+    const ready: *volatile u64 = @ptrCast(&blocked_ready);
+    while (ready.* == 0) syscall.thread_yield();
+    for (0..10) |_| syscall.thread_yield();
+
+    const rc_blocked = syscall.thread_suspend(blocked_handle);
+    if (rc_blocked != E_BUSY) {
+        t.failWithVal("§2.4.11 blocked", E_BUSY, rc_blocked);
+        _ = syscall.futex_wake(@ptrCast(&blocked_futex), 1);
+        syscall.shutdown();
+    }
+
+    // Wake the blocked thread so it can exit cleanly.
+    _ = syscall.futex_wake(@ptrCast(&blocked_futex), 1);
+
+    t.pass("§2.4.11");
     syscall.shutdown();
 }

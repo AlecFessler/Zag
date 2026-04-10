@@ -11,9 +11,9 @@ const E_AGAIN: i64 = -9;
 /// §2.12.34 — `fault_write_mem` writes bytes from the caller's buffer into the target process's virtual address space via physmap, bypassing the target's page table permission bits.
 /// bits, writing into read-only pages (including the text segment).
 ///
-/// Strong test: patch the child's RO text — specifically the 3-byte
+/// Strong test: patch the child's RO text — specifically the 2-byte
 /// `movb (%rax), %al` null-deref instruction at the fault RIP — with
-/// three `NOP` bytes (0x90). Then FAULT_RESUME the child. If the write
+/// NOP bytes (0x90). Then FAULT_RESUME the child. If the write
 /// took effect from the child's perspective, the child executes past
 /// the (now-NOP) faulting bytes without re-faulting at the same RIP
 /// and eventually falls through to `thread_exit` (the runtime's
@@ -67,8 +67,9 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
 
-    // Patch the faulting instruction to 3 NOPs. The text segment is
-    // mapped RO in the child; fault_write_mem must bypass that.
+    // Patch the faulting 2-byte instruction (+ 1 extra byte) to 3 NOPs.
+    // The text segment is mapped RO in the child; fault_write_mem must
+    // bypass that.
     const nop_bytes = [3]u8{ 0x90, 0x90, 0x90 };
     const wrc = syscall.fault_write_mem(proc_handle, original_rip, @intFromPtr(&nop_bytes), 3);
     if (wrc != 0) {

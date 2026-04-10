@@ -5,6 +5,14 @@ const syscall = lib.syscall;
 const t = lib.testing;
 
 /// §2.2.7 — After `shm_unmap`, the range reverts to private with max RWX rights.
+///
+/// We reserve the range with read+write+execute so that "max RWX" means all
+/// three bits are observable post-unmap. After unmapping, we verify:
+///   - Read: fresh demand-paged page reads as zero (not the old SHM value).
+///   - Write: a new value written sticks.
+///   - Execute: we write a single `ret` (0xC3) into the page and invoke it
+///     via a function pointer. If execute rights did not revert with the
+///     page, this would take a #PF(xd) and crash the test.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     const shareable_rwx = perms.VmReservationRights{ .read = true, .write = true, .execute = true, .shareable = true };
@@ -20,12 +28,23 @@ pub fn main(perm_view: u64) void {
     _ = syscall.shm_unmap(shm_handle, vm_handle);
     // After unmap, range reverts to private demand-paged. Reading should yield zero
     // (fresh demand-paged page), NOT the old SHM data.
-    const val = ptr.*;
-    if (val == 0) {
-        t.pass("§2.2.7");
-    } else {
-        // If we read back the old SHM data, the unmap didn't properly revert to private.
-        t.failWithVal("§2.2.7", 0, @bitCast(val));
+    const read_val = ptr.*;
+    if (read_val != 0) {
+        t.failWithVal("§2.2.7", 0, @bitCast(read_val));
+        syscall.shutdown();
     }
+    // Write a fresh value and verify it sticks (write right present).
+    ptr.* = 0x1234_5678_9ABC_DEF0;
+    if (ptr.* != 0x1234_5678_9ABC_DEF0) {
+        t.fail("§2.2.7");
+        syscall.shutdown();
+    }
+    // Execute right: write a single RET (0xC3) and invoke via fn pointer.
+    // If execute rights failed to revert, this faults with invalid_execute.
+    const code_ptr: *volatile u8 = @ptrFromInt(vm.val2);
+    code_ptr.* = 0xC3;
+    const func: *const fn () void = @ptrFromInt(vm.val2);
+    func();
+    t.pass("§2.2.7");
     syscall.shutdown();
 }

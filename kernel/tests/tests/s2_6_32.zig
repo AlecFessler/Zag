@@ -9,6 +9,30 @@ const t = lib.testing;
 const E_BADHANDLE: i64 = -3;
 
 /// §2.6.32 — Recursive kill traverses the entire subtree (depth-first post-order).
+///
+/// NOTE ON OBSERVABILITY (iter-2 feedback):
+///   The spec says depth-first **post-order**, but the post-order property
+///   itself is not externally observable from user code. Reason: `revoke_perm`
+///   runs `Process.killSubtree` synchronously on the revoking thread. That
+///   walker recurses into every descendant and calls `kill(.killed)` on each
+///   leaf *before* returning to the parent, so the post-order sequence
+///   (C then B) happens entirely inside one syscall with no user code running
+///   in C, B, or any sibling between the individual `kill` calls. By the time
+///   `revoke_perm` returns, the whole subtree is already dead, and no sidechannel
+///   (SHM counters, IPC polling from root, futex wakes, perm_view diffs) can
+///   distinguish "C died first then B" from "they died simultaneously".
+///
+///   What we CAN observe — and do verify below — is the subtree-wide kill
+///   invariant itself (C must be dead after revoking B). That proves the
+///   recursive descent reaches every descendant.
+///
+///   PROPOSED SPEC SOFTENING (do NOT apply here): reword §2.6.32 as
+///     "Recursive kill traverses the entire subtree. Implementation detail:
+///     the walk is depth-first post-order (see systems.md)."
+///   The post-order discipline is an implementation detail that matters for
+///   correctness of resource cleanup (children freed before parents) but has
+///   no user-visible signature, so it belongs in systems.md rather than the
+///   observable-behavior spec.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 

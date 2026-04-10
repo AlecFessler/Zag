@@ -66,6 +66,15 @@ pub fn main(pv: u64) void {
         }
     }
 
+    // Execute right must also revert: write a single RET (0xC3) at the base
+    // of the first post-unmap page and invoke it via a function pointer. If
+    // the reservation did not revert to max RWX, this faults with
+    // invalid_execute.
+    const code_ptr: *volatile u8 = @ptrFromInt(base);
+    code_ptr.* = 0xC3;
+    const func: *const fn () void = @ptrFromInt(base);
+    func();
+
     t.pass("§2.2.10");
     syscall.shutdown();
 }

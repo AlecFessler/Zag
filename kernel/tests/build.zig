@@ -126,6 +126,7 @@ pub fn build(b: *std.Build) void {
     const child_double_fault_after_transfer_bin = buildChild(b, target, lib_mod, "child_double_fault_after_transfer", "children/child_double_fault_after_transfer.zig");
     const child_shm_counter_then_fault_bin = buildChild(b, target, lib_mod, "child_shm_counter_then_fault", "children/child_shm_counter_then_fault.zig");
     const child_multithread_fault_on_signal_bin = buildChild(b, target, lib_mod, "child_multithread_fault_on_signal", "children/child_multithread_fault_on_signal.zig");
+    const child_iter2_d_double_fault_on_signal_bin = buildChild(b, target, lib_mod, "child_iter2_d_double_fault_on_signal", "children/child_iter2_d_double_fault_on_signal.zig");
     const child_delayed_ipc_server_bin = buildChild(b, target, lib_mod, "child_delayed_ipc_server", "children/child_delayed_ipc_server.zig");
     const child_middleman_handler_bin = buildChild(b, target, lib_mod, "child_middleman_handler", "children/child_middleman_handler.zig");
     const child_fh_target_reporter_bin = buildChild(b, target, lib_mod, "child_fh_target_reporter", "children/child_fh_target_reporter.zig");
@@ -248,6 +249,7 @@ pub fn build(b: *std.Build) void {
     _ = embedded_wf.addCopyFile(child_double_fault_after_transfer_bin, "child_double_fault_after_transfer.elf");
     _ = embedded_wf.addCopyFile(child_shm_counter_then_fault_bin, "child_shm_counter_then_fault.elf");
     _ = embedded_wf.addCopyFile(child_multithread_fault_on_signal_bin, "child_multithread_fault_on_signal.elf");
+    _ = embedded_wf.addCopyFile(child_iter2_d_double_fault_on_signal_bin, "child_iter2_d_double_fault_on_signal.elf");
     _ = embedded_wf.addCopyFile(child_delayed_ipc_server_bin, "child_delayed_ipc_server.elf");
     _ = embedded_wf.addCopyFile(child_middleman_handler_bin, "child_middleman_handler.elf");
     _ = embedded_wf.addCopyFile(child_fh_target_reporter_bin, "child_fh_target_reporter.elf");
@@ -369,6 +371,7 @@ pub fn build(b: *std.Build) void {
         \\pub const child_double_fault_after_transfer = @embedFile("child_double_fault_after_transfer.elf");
         \\pub const child_shm_counter_then_fault = @embedFile("child_shm_counter_then_fault.elf");
         \\pub const child_multithread_fault_on_signal = @embedFile("child_multithread_fault_on_signal.elf");
+        \\pub const child_iter2_d_double_fault_on_signal = @embedFile("child_iter2_d_double_fault_on_signal.elf");
         \\pub const child_delayed_ipc_server = @embedFile("child_delayed_ipc_server.elf");
         \\pub const child_middleman_handler = @embedFile("child_middleman_handler.elf");
         \\pub const child_fh_target_reporter = @embedFile("child_fh_target_reporter.elf");

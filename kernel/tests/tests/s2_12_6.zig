@@ -15,14 +15,11 @@ const t = lib.testing;
 /// appear, then revokes the fault_handler process handle. All 4 delta
 /// thread entries must vanish atomically.
 ///
-/// Scenario B (handler-death cleanup, observed from the survivor side):
-/// Root spawns a middleman handler M, gives M an SHM and process-handle
-/// pair, then spawns a target T that becomes its own fault handler before
-/// we revoke M (grandchild-handler death path). M had no thread handles
-/// for T (M never acquired fault_handler), so instead we demonstrate the
-/// dual-revoke path: voluntarily release a *second* fault_handler and
-/// verify the delta goes away — proving release is idempotent and scales
-/// across distinct targets.
+/// Scenario B (second voluntary release on independent target):
+/// Acquire fault_handler for a second, single-threaded child, observe
+/// its thread entry appear, then revoke that handler. The delta thread
+/// entry must vanish — proving release is correct across distinct
+/// independent targets.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 

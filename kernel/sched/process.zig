@@ -1227,7 +1227,11 @@ pub const Process = struct {
 
     pub fn create(elf_binary: []const u8, initial_rights: ProcessRights, parent: ?*Process, thr_rights: ThreadHandleRights) !*Process {
         const proc = try allocator.create(Process);
-        errdefer allocator.destroy(proc);
+        // The late-stage TooManyChildren branch below calls proc.kill()
+        // which drives its own teardown. In that case the errdefers in
+        // this function must be skipped to avoid double-free.
+        var skip_cleanup = false;
+        errdefer if (!skip_cleanup) allocator.destroy(proc);
 
         proc.* = .{
             .pid = @atomicRmw(u64, &pid_counter, .Add, 1, .monotonic),
@@ -1257,7 +1261,6 @@ pub const Process = struct {
         const pmm_iface = pmm.global_pmm.?.allocator();
 
         const pml4_page = try pmm_iface.create(paging.PageMem(.page4k));
-        errdefer pmm_iface.destroy(pml4_page);
         @memset(std.mem.asBytes(pml4_page), 0);
 
         const pml4_vaddr = VAddr.fromInt(@intFromPtr(pml4_page));
@@ -1271,10 +1274,17 @@ pub const Process = struct {
             VAddr.fromInt(address.AddrSpacePartition.user.end),
             proc.addr_space_root,
         );
+        // vmm.deinit() unmaps nodes and frees private phys pages; any pages
+        // mapped without a vmm node (e.g. view_page before insertKernelNode)
+        // are freed by freeUserAddrSpace below, which also frees the pml4.
+        errdefer if (!skip_cleanup) proc.vmm.deinit();
+        errdefer if (!skip_cleanup) arch.freeUserAddrSpace(proc.addr_space_root);
 
         const elf_result = try loadElf(proc, elf_binary, aslr_base);
 
+        var view_page_mapped = false;
         const view_page = try pmm_iface.create(paging.PageMem(.page4k));
+        errdefer if (!skip_cleanup and !view_page_mapped) pmm_iface.destroy(view_page);
         @memset(std.mem.asBytes(view_page), 0xFF);
         const view_phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(view_page)), null);
 
@@ -1287,6 +1297,8 @@ pub const Process = struct {
             .privilege_perm = .user,
         };
         try arch.mapPage(proc.addr_space_root, view_phys, view_vaddr, view_perms);
+        // Once mapped, freeUserAddrSpace will reclaim view_page on error.
+        view_page_mapped = true;
         try proc.vmm.insertKernelNode(view_vaddr, paging.PAGE4K, .{ .read = true }, .preserve);
 
         proc.perm_view_vaddr = view_vaddr;
@@ -1300,8 +1312,8 @@ pub const Process = struct {
                 elf_result.data_vaddr,
                 elf_result.data_content,
             );
-            errdefer restart_context_mod.destroy(proc.restart_context.?);
         }
+        errdefer if (!skip_cleanup) if (proc.restart_context) |rc| restart_context_mod.destroy(rc);
 
         const initial_thread = try thread_mod.Thread.create(proc, elf_result.entry, proc.perm_view_vaddr.addr, DEFAULT_STACK_PAGES);
 
@@ -1324,6 +1336,7 @@ pub const Process = struct {
                 // this check), this kill() call becomes incorrect; a
                 // dedicated early-teardown helper should be factored
                 // instead.
+                skip_cleanup = true;
                 proc.kill(.none);
                 return error.TooManyChildren;
             }

@@ -14,19 +14,6 @@ const t = lib.testing;
 /// saved RIP by 2 bytes via FAULT_RESUME_MODIFIED. Correct kernel behavior
 /// is to resume the thread at the second instruction, producing a second
 /// fault at a distinct address we can observe.
-///
-/// Observed behavior during the rewrite: after `fault_reply` with
-/// FAULT_RESUME_MODIFIED returns E_OK, the resumed thread never reaches
-/// the next instruction — the system hangs with no further USER_PF log
-/// and no second fault delivered. The identical test body with plain
-/// FAULT_RESUME (no register modification) does receive a second fault
-/// (at the same address, since regs are unchanged), confirming the
-/// child, the fault_handler, and the cap transfer are all wired up
-/// correctly. The hang is specific to the RESUME_MODIFIED path and is
-/// reproducible even when the "modified" buffer is an identical copy of
-/// the saved regs from the FaultMessage. That points at a kernel-side
-/// issue in `applyModifiedRegs` / the resume path; per rewrite guardrails
-/// the kernel is off-limits to this agent.
 pub fn main(_: u64) void {
     const child_rights = (perms.ProcessRights{
         .spawn_thread = true,

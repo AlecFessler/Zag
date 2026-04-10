@@ -7,6 +7,16 @@ const syscall = lib.syscall;
 const t = lib.testing;
 
 /// §2.12.11 — Before applying stop-all on an external fault, the kernel checks the faulting thread's `exclude_oneshot` and `exclude_permanent` flags on the thread's perm entry in the handler's permissions table.
+///
+/// Three-phase test on a single child (main thread faults three times):
+///   Phase 1 — `exclude_permanent`: worker counter advances across the
+///             fault window (stop-all skipped).
+///   Phase 2 — `exclude_oneshot` (clears permanent per §2.12.30): worker
+///             counter advances across the fault window (stop-all
+///             skipped).  Oneshot is consumed by the kernel.
+///   Phase 3 — no flags set (oneshot was consumed): worker counter is
+///             frozen between fault_recv and fault_reply (stop-all
+///             applied), proving the oneshot was consumed.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
@@ -43,8 +53,8 @@ pub fn main(pv: u64) void {
         .fault_handler = true,
     }).bits();
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
-        @intFromPtr(children.child_multithread_fault_on_signal.ptr),
-        children.child_multithread_fault_on_signal.len,
+        @intFromPtr(children.child_iter2_d_double_fault_on_signal.ptr),
+        children.child_iter2_d_double_fault_on_signal.len,
         child_rights,
     )));
 
@@ -56,34 +66,24 @@ pub fn main(pv: u64) void {
     var reply: syscall.IpcMessage = .{};
     _ = syscall.ipc_call_cap(child_handle, &.{ shm_handle, shm_cap_rights }, &reply);
 
-    // Find the child's main thread handle (the one that will fault). It's
-    // inserted into our perm table at fault_handler acquire time per §2.12.4.
-    // The worker thread is created AFTER the reply, but should also appear
-    // due to §2.12.5. The faulting thread is the main thread — find the
-    // smallest tid (first inserted). We pick any non-self thread handle
-    // with the smallest tid.
+    // Find the child's main thread handle. Wait for both main + worker.
     var main_thread_handle: u64 = 0;
-    var main_tid: u64 = 0xFFFF_FFFF_FFFF_FFFF;
+    var main_thread_slot: usize = 0;
     var iter: u32 = 0;
     while (iter < 1000) : (iter += 1) {
         syscall.thread_yield();
         main_thread_handle = 0;
-        main_tid = 0xFFFF_FFFF_FFFF_FFFF;
-        for (2..128) |i| {
-            if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD and view[i].handle != 0) {
-                const tid = view[i].threadTid();
-                if (tid < main_tid) {
-                    main_tid = tid;
-                    main_thread_handle = view[i].handle;
-                }
-            }
-        }
-        // We want at least 2 child thread handles (main + worker) to be
-        // sure the worker was actually created before we fire the fault.
+        var main_tid: u64 = 0xFFFF_FFFF_FFFF_FFFF;
         var count: u32 = 0;
         for (2..128) |i| {
             if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD and view[i].handle != 0) {
                 count += 1;
+                const tid = view[i].threadTid();
+                if (tid < main_tid) {
+                    main_tid = tid;
+                    main_thread_handle = view[i].handle;
+                    main_thread_slot = i;
+                }
             }
         }
         if (count >= 2) break;
@@ -93,36 +93,108 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
 
-    // Set exclude_permanent on the main thread BEFORE signaling the fault.
-    const mode_rc = syscall.fault_set_thread_mode(main_thread_handle, syscall.FAULT_MODE_EXCLUDE_PERMANENT);
-    if (mode_rc != 0) {
-        t.failWithVal("§2.12.11 fault_set_thread_mode", 0, mode_rc);
+    // ================================================================
+    // Phase 1: exclude_permanent — stop-all must be skipped.
+    // ================================================================
+    const mode_rc_perm = syscall.fault_set_thread_mode(main_thread_handle, syscall.FAULT_MODE_EXCLUDE_PERMANENT);
+    if (mode_rc_perm != 0) {
+        t.failWithVal("§2.12.11 fault_set_thread_mode PERM", 0, mode_rc_perm);
+        syscall.shutdown();
+    }
+    if (!view[main_thread_slot].threadExcludePermanent()) {
+        t.fail("§2.12.11 phase1 exclude_permanent sanity");
         syscall.shutdown();
     }
 
-    // Signal the child to null-deref.
     sig_ptr.* = 1;
-
-    // Block until the fault arrives.
-    var fault_buf: [256]u8 align(8) = undefined;
-    const token = syscall.fault_recv(@intFromPtr(&fault_buf), 1);
-    if (token < 0) {
-        t.failWithVal("§2.12.11 fault_recv", 0, token);
+    var fault_buf1: [256]u8 align(8) = undefined;
+    const token1 = syscall.fault_recv(@intFromPtr(&fault_buf1), 1);
+    if (token1 < 0) {
+        t.failWithVal("§2.12.11 phase1 fault_recv", 0, token1);
+        syscall.shutdown();
+    }
+    // Worker must keep advancing — stop-all was skipped.
+    const snap1a = counter_ptr.*;
+    for (0..100) |_| syscall.thread_yield();
+    const snap1b = counter_ptr.*;
+    if (snap1b <= snap1a) {
+        t.fail("§2.12.11 phase1 worker frozen");
+        syscall.shutdown();
+    }
+    // Resume past the 2-byte movb null-deref.
+    const fm1: *const syscall.FaultMessage = @ptrCast(@alignCast(&fault_buf1));
+    var modregs1: [144]u8 align(8) = undefined;
+    @memcpy(modregs1[0..144], fault_buf1[32 .. 32 + 144]);
+    const rip_slot1: *align(8) u64 = @ptrCast(&modregs1[0]);
+    rip_slot1.* = fm1.rip + 2;
+    const rr1 = syscall.fault_reply_action(@bitCast(token1), syscall.FAULT_RESUME_MODIFIED, @intFromPtr(&modregs1));
+    if (rr1 != 0) {
+        t.failWithVal("§2.12.11 phase1 fault_reply", 0, rr1);
         syscall.shutdown();
     }
 
-    // With exclude_permanent set, stop-all should have been SKIPPED. The
-    // worker must continue advancing the counter.
-    const snap1 = counter_ptr.*;
-    for (0..100) |_| syscall.thread_yield();
-    const snap2 = counter_ptr.*;
-
-    if (snap2 > snap1) {
-        t.pass("§2.12.11");
-    } else {
-        t.fail("§2.12.11 worker counter frozen (stop-all was not skipped)");
+    // ================================================================
+    // Phase 2: exclude_oneshot — stop-all must be skipped.
+    // Kernel consumes the oneshot flag after the check.
+    // ================================================================
+    const mode_rc_one = syscall.fault_set_thread_mode(main_thread_handle, syscall.FAULT_MODE_EXCLUDE_NEXT);
+    if (mode_rc_one != 0) {
+        t.failWithVal("§2.12.11 phase2 fault_set_thread_mode NEXT", 0, mode_rc_one);
+        syscall.shutdown();
+    }
+    if (!view[main_thread_slot].threadExcludeOneshot()) {
+        t.fail("§2.12.11 phase2 oneshot sanity");
+        syscall.shutdown();
     }
 
-    _ = syscall.fault_reply_simple(@bitCast(token), syscall.FAULT_KILL);
+    sig_ptr.* = 1;
+    var fault_buf2: [256]u8 align(8) = undefined;
+    const token2 = syscall.fault_recv(@intFromPtr(&fault_buf2), 1);
+    if (token2 < 0) {
+        t.failWithVal("§2.12.11 phase2 fault_recv", 0, token2);
+        syscall.shutdown();
+    }
+    // Worker must keep advancing — stop-all was skipped.
+    const snap2a = counter_ptr.*;
+    for (0..100) |_| syscall.thread_yield();
+    const snap2b = counter_ptr.*;
+    if (snap2b <= snap2a) {
+        t.fail("§2.12.11 phase2 worker frozen");
+        syscall.shutdown();
+    }
+    const fm2: *const syscall.FaultMessage = @ptrCast(@alignCast(&fault_buf2));
+    var modregs2: [144]u8 align(8) = undefined;
+    @memcpy(modregs2[0..144], fault_buf2[32 .. 32 + 144]);
+    const rip_slot2: *align(8) u64 = @ptrCast(&modregs2[0]);
+    rip_slot2.* = fm2.rip + 2;
+    const rr2 = syscall.fault_reply_action(@bitCast(token2), syscall.FAULT_RESUME_MODIFIED, @intFromPtr(&modregs2));
+    if (rr2 != 0) {
+        t.failWithVal("§2.12.11 phase2 fault_reply", 0, rr2);
+        syscall.shutdown();
+    }
+
+    // ================================================================
+    // Phase 3: no flags — stop-all MUST be applied now, proving the
+    // kernel consumed the oneshot during phase 2.
+    // ================================================================
+    sig_ptr.* = 1;
+    var fault_buf3: [256]u8 align(8) = undefined;
+    const token3 = syscall.fault_recv(@intFromPtr(&fault_buf3), 1);
+    if (token3 < 0) {
+        t.failWithVal("§2.12.11 phase3 fault_recv", 0, token3);
+        syscall.shutdown();
+    }
+    // Worker must be FROZEN — stop-all was applied.
+    const snap3a = counter_ptr.*;
+    for (0..100) |_| syscall.thread_yield();
+    const snap3b = counter_ptr.*;
+    if (snap3b != snap3a) {
+        t.fail("§2.12.11 phase3 worker not suspended (oneshot not consumed)");
+        _ = syscall.fault_reply_simple(@bitCast(token3), syscall.FAULT_KILL);
+        syscall.shutdown();
+    }
+
+    _ = syscall.fault_reply_simple(@bitCast(token3), syscall.FAULT_KILL);
+    t.pass("§2.12.11");
     syscall.shutdown();
 }

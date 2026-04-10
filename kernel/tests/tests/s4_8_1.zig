@@ -26,7 +26,7 @@ pub fn main(pv: u64) void {
 
     // Confirm the mapped BAR is accessible — a volatile read must complete
     // without faulting. AHCI MMIO at offset 0 is the CAP register, always live.
-    const bar_ptr: *volatile u32 = @ptrFromInt(@as(u64, @bitCast(vm.val)));
+    const bar_ptr: *volatile u32 = @ptrFromInt(vm.val2);
     const cap = bar_ptr.*;
     // The value can legitimately be anything; just make sure the compiler
     // doesn't elide the load. Emit it to the sink so the read is observable.

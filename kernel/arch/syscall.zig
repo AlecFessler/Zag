@@ -568,8 +568,11 @@ fn sysRevokePerm(handle: u64) i64 {
         .device_region => |device| {
             const res = collectReservations(proc);
             proc.vmm.revokeMmioHandle(device, res.items());
-            Process.returnDeviceHandleUpTree(proc, entry.rights, device);
+            // Remove our slot first so there is no window where both
+            // our table and an ancestor's table hold the same device
+            // pointer (mirrors SHM revoke ordering above).
             proc.removePerm(handle) catch {};
+            Process.returnDeviceHandleUpTree(proc, entry.rights, device);
         },
         .core_pin => |cp| {
             sched.unpinByRevoke(cp.core_id, cp.thread_tid);
@@ -893,9 +896,11 @@ fn sysThreadKill(thread_handle: u64) i64 {
     }
 
     // If running on another core, IPI it; scheduler picks it up as zombie.
+    // Use coreRunning() to find the actual core (not the affinity mask),
+    // which handles multi-core affinity and null-affinity threads correctly.
     if (was_running) {
-        if (target.core_affinity) |mask| {
-            arch.triggerSchedulerInterrupt(@intCast(@ctz(mask)));
+        if (sched.coreRunning(target)) |core_id| {
+            arch.triggerSchedulerInterrupt(core_id);
         }
         return E_OK;
     }
@@ -1432,6 +1437,20 @@ fn copyPayload(dst: *ArchCpuContext, src: *const ArchCpuContext, word_count: u3)
     if (word_count >= 5) dst.regs.r9 = src.regs.r9;
 }
 
+const PayloadSnapshot = struct { rdi: u64, rsi: u64, rdx: u64, r8: u64, r9: u64 };
+
+fn savePayload(ctx: *const ArchCpuContext) PayloadSnapshot {
+    return .{ .rdi = ctx.regs.rdi, .rsi = ctx.regs.rsi, .rdx = ctx.regs.rdx, .r8 = ctx.regs.r8, .r9 = ctx.regs.r9 };
+}
+
+fn restorePayload(ctx: *ArchCpuContext, snap: PayloadSnapshot) void {
+    ctx.regs.rdi = snap.rdi;
+    ctx.regs.rsi = snap.rsi;
+    ctx.regs.rdx = snap.rdx;
+    ctx.regs.r8 = snap.r8;
+    ctx.regs.r9 = snap.r9;
+}
+
 const IpcMetadata = struct {
     word_count: u3,
     cap_transfer: bool,
@@ -1705,6 +1724,11 @@ fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
     if (target_proc.msg_box.isReceiving()) {
         // Receiver is waiting — deliver directly
         const receiver = target_proc.msg_box.takeReceiverLocked();
+        // Snapshot receiver regs that we're about to overwrite, so we can
+        // restore them if cap transfer fails and the receiver re-blocks.
+        const saved_rax = receiver.ctx.regs.rax;
+        const saved_r14 = receiver.ctx.regs.r14;
+        const saved_payload = savePayload(receiver.ctx);
         copyPayload(receiver.ctx, ctx, meta.word_count);
         // Set recv metadata: bit 0 = 0 (from send), bits [3:1] = word_count
         receiver.ctx.regs.r14 = @as(u64, meta.word_count) << 1;
@@ -1715,8 +1739,10 @@ fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
             const cap = getCapPayload(ctx, meta.word_count);
             const cap_result = transferCapability(proc, target_proc, cap.handle, cap.rights);
             if (cap_result != E_OK) {
-                // Roll back: re-block the receiver. The caller's rax will
-                // carry the error from this syscall; the receiver stays put.
+                // Roll back: restore receiver ctx and re-block.
+                receiver.ctx.regs.rax = saved_rax;
+                receiver.ctx.regs.r14 = saved_r14;
+                restorePayload(receiver.ctx, saved_payload);
                 target_proc.msg_box.beginReceivingLocked(receiver);
                 target_proc.msg_box.lock.unlock();
                 return .{ .rax = cap_result };
@@ -1760,6 +1786,9 @@ fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
     if (target_proc.msg_box.isReceiving()) {
         // Receiver is waiting — deliver and queue caller for reply.
         const receiver = target_proc.msg_box.takeReceiverLocked();
+        const saved_rax = receiver.ctx.regs.rax;
+        const saved_r14 = receiver.ctx.regs.r14;
+        const saved_payload = savePayload(receiver.ctx);
         copyPayload(receiver.ctx, ctx, meta.word_count);
         receiver.ctx.regs.r14 = (@as(u64, meta.word_count) << 1) | 1; // bit 0 = 1 (from call)
         receiver.ctx.regs.rax = @bitCast(E_OK);
@@ -1768,7 +1797,10 @@ fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
             const cap = getCapPayload(ctx, meta.word_count);
             const cap_result = transferCapability(proc, target_proc, cap.handle, cap.rights);
             if (cap_result != E_OK) {
-                // Roll back: re-block the receiver before returning the error.
+                // Roll back: restore receiver ctx and re-block.
+                receiver.ctx.regs.rax = saved_rax;
+                receiver.ctx.regs.r14 = saved_r14;
+                restorePayload(receiver.ctx, saved_payload);
                 target_proc.msg_box.beginReceivingLocked(receiver);
                 target_proc.msg_box.lock.unlock();
                 return .{ .rax = cap_result };
@@ -1892,18 +1924,18 @@ fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
 
     const caller_thread: ?*Thread = proc.msg_box.endPendingReplyLocked();
 
+    // Capability transfer runs before we commit any payload to the
+    // caller: on failure, both caller and replier must observe the
+    // error rather than a successful reply (§2.11.14). Preserve the
+    // caller's original payload registers — only rax is overwritten.
+    var reply_cap_err: i64 = E_OK;
     if (caller_thread) |pc| {
-        // Capability transfer runs before we commit any payload to the
-        // caller: on failure, the caller must observe the error instead
-        // of a successful reply (§2.11.14). Preserve the caller's
-        // original payload registers — only rax is overwritten.
-        var cap_err: i64 = E_OK;
         if (reply_cap_transfer) {
             const cap = getCapPayload(ctx, reply_word_count);
-            cap_err = transferCapability(proc, pc.process, cap.handle, cap.rights);
+            reply_cap_err = transferCapability(proc, pc.process, cap.handle, cap.rights);
         }
-        if (cap_err != E_OK) {
-            pc.ctx.regs.rax = @bitCast(cap_err);
+        if (reply_cap_err != E_OK) {
+            pc.ctx.regs.rax = @bitCast(reply_cap_err);
         } else {
             copyPayload(pc.ctx, ctx, reply_word_count);
             pc.ctx.regs.rax = @bitCast(E_OK);
@@ -1944,7 +1976,10 @@ fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
             proc.msg_box.lock.unlock();
 
             if (caller_thread) |ct| wakeThread(ct);
-            return .{ .rax = E_OK };
+            // reply_cap_err propagates reply-side cap-transfer failure
+            // to the replier; the recv half succeeded so we report the
+            // cap error (or E_OK) rather than silently swallowing it.
+            return .{ .rax = if (reply_cap_err != E_OK) reply_cap_err else E_OK };
         } else if (recv_blocking) {
             proc.msg_box.beginReceivingLocked(thread);
             proc.msg_box.lock.unlock();
@@ -1952,7 +1987,10 @@ fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
             // TODO: same direct-switch hang issue as above; use wakeThread
             // for now and block self via switchToNextReady.
             if (caller_thread) |ct| wakeThread(ct);
+            // If the reply-side cap transfer failed, the replier must
+            // observe the error when it resumes from blocking recv.
             thread.state = .blocked;
+            ctx.regs.rax = @bitCast(reply_cap_err);
             thread.ctx = ctx;
             thread.on_cpu.store(false, .release);
             sched.switchToNextReady();
@@ -1960,24 +1998,28 @@ fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
         } else {
             proc.msg_box.lock.unlock();
             if (caller_thread) |ct| wakeThread(ct);
-            ctx.regs.rax = @bitCast(E_AGAIN);
-            return .{ .rax = E_AGAIN };
+            // No message queued — E_AGAIN for the recv half, but if
+            // the reply-side cap transfer also failed, report that
+            // instead (higher severity).
+            const recv_err = if (reply_cap_err != E_OK) reply_cap_err else E_AGAIN;
+            ctx.regs.rax = @bitCast(recv_err);
+            return .{ .rax = recv_err };
         }
     } else {
         proc.msg_box.lock.unlock();
 
         if (caller_thread) |ct| {
             thread.state = .ready;
-            ctx.regs.rax = @bitCast(E_OK);
+            ctx.regs.rax = @bitCast(reply_cap_err);
             const result = sched.switchToThread(thread, ct, ctx, true);
             if (result != 0) {
                 thread.state = .running;
                 wakeThread(ct);
-                return .{ .rax = E_OK };
+                return .{ .rax = reply_cap_err };
             }
             unreachable;
         } else {
-            return .{ .rax = E_OK };
+            return .{ .rax = reply_cap_err };
         }
     }
 }
