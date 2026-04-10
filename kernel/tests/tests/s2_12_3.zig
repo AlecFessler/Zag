@@ -31,7 +31,7 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
     const pre_rights = reply.words[0];
-    const fh_bit_proc: u64 = 0x100;
+    const fh_bit_proc: u64 = 0x80;
     if ((pre_rights & fh_bit_proc) == 0) {
         t.fail("§2.12.3 pre-transfer child missing fault_handler bit");
         syscall.shutdown();

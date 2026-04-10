@@ -6,7 +6,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.12.2 — `ProcessHandleRights` bit 6 is `fault_handler`.
+/// §2.12.2 — `ProcessHandleRights` bit 7 is `fault_handler`.
 /// process may hold `fault_handler` for a given process at a time.
 ///
 /// Observable: spawn a child with the self-handling fault_handler bit.
@@ -36,7 +36,7 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
     const pre_child_rights = reply.words[0];
-    const fh_bit_proc: u64 = 0x100;
+    const fh_bit_proc: u64 = 0x80;
     if ((pre_child_rights & fh_bit_proc) == 0) {
         t.failWithVal("§2.12.2 pre-transfer child fh bit", @bitCast(fh_bit_proc), @bitCast(pre_child_rights));
         syscall.shutdown();
