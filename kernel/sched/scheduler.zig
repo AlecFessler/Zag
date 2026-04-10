@@ -332,9 +332,7 @@ pub fn pinExclusive(thread: *Thread) i64 {
     while (true) {
         const current = pinned_cores.load(.acquire);
         if (current & core_bit != 0) return -11; // E_BUSY: core already pinned
-        // At least one core must remain unpinned
         const new_pinned = current | core_bit;
-        if (new_pinned == all_cores) return -1; // E_INVAL: would pin all cores
         if (pinned_cores.cmpxchgWeak(current, new_pinned, .acq_rel, .acquire)) |_| {
             continue; // CAS failed, retry
         } else {

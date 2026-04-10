@@ -916,6 +916,11 @@ pub const Process = struct {
             if (entry.object == .vm_reservation or entry.object == .thread) {
                 entry.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
+            } else if (entry.object == .core_pin) {
+                const cp = entry.object.core_pin;
+                sched.unpinByRevoke(cp.core_id);
+                entry.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
+                self.perm_count -= 1;
             }
         }
         self.faulted_thread_slots = 0;

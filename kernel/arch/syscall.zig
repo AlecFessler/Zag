@@ -394,10 +394,10 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_arg: 
 
     // Validate thread_rights — upper 4 bits must be 0
     const thr_rights_raw: u8 = @truncate(thread_rights_arg);
-    if (thr_rights_raw & 0xF0 != 0) return E_INVAL;
+    if (thr_rights_raw & 0xF8 != 0) return E_INVAL;
     const thr_rights: ThreadHandleRights = @bitCast(thr_rights_raw);
 
-    if (max_priority_arg > 3) return E_INVAL;
+    if (max_priority_arg > 4) return E_INVAL;
     const child_max_priority: Priority = @enumFromInt(@as(u3, @truncate(max_priority_arg)));
 
     const proc = currentProc();
