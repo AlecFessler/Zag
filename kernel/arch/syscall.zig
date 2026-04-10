@@ -796,20 +796,12 @@ fn sysThreadSuspend(thread_handle: u64) i64 {
             target_proc.lock.unlock();
             return E_BUSY;
         },
-        .running => {
+        .running, .ready => {
             target.state = .suspended;
             target_proc.suspended_thread_slots |= @as(u64, 1) << @intCast(target.slot_index);
-            // Find which core is currently running this thread (if any)
-            // and IPI it so the next scheduling decision honors the new
-            // .suspended state. Works regardless of explicit affinity.
+
             const cur = sched.currentThread().?;
-            if (target != cur) {
-                if (sched.coreRunning(target)) |core_id| {
-                    target_proc.lock.unlock();
-                    arch.triggerSchedulerInterrupt(core_id);
-                    return E_OK;
-                }
-            } else {
+            if (target == cur) {
                 // Self-suspend: we must deschedule now, before returning
                 // to userspace. If we merely marked ourselves .suspended
                 // and returned, we would keep executing user code until
@@ -825,11 +817,22 @@ fn sysThreadSuspend(thread_handle: u64) i64 {
                 // syscall epilogue with rax = E_OK.
                 return E_OK;
             }
-        },
-        .ready => {
-            target.state = .suspended;
-            target_proc.suspended_thread_slots |= @as(u64, 1) << @intCast(target.slot_index);
-            // Lazy: scheduler dequeue skips .suspended threads.
+
+            target_proc.lock.unlock();
+
+            // The target may be in a run queue (.ready) or actively
+            // dispatched on a core (.running). Because the scheduler
+            // transitions .ready → .running without holding proc.lock,
+            // there is a TOCTOU race: the thread could have been
+            // dispatched between our state check and our write. Handle
+            // both cases: remove from any run queue (covers .ready /
+            // just-preempted), then IPI the core if it is on-cpu.
+            sched.removeFromAnyRunQueue(target);
+
+            if (sched.coreRunning(target)) |core_id| {
+                arch.triggerSchedulerInterrupt(core_id);
+            }
+            return E_OK;
         },
     }
     target_proc.lock.unlock();

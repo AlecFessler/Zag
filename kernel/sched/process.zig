@@ -550,6 +550,10 @@ pub const Process = struct {
 
         // §2.12.23 stop-all: every sibling thread that is currently runnable
         // (.ready or .running) is moved to .suspended.
+        // We collect suspended siblings so we can remove them from run
+        // queues and IPI their cores after releasing proc.lock.
+        var stopped: [MAX_THREADS]?*Thread = .{null} ** MAX_THREADS;
+        var stopped_count: u32 = 0;
         self.lock.lock();
         if (stop_all) {
             for (self.threads[0..self.num_threads]) |sib| {
@@ -557,12 +561,25 @@ pub const Process = struct {
                 if (sib.state == .running or sib.state == .ready) {
                     sib.state = .suspended;
                     self.suspended_thread_slots |= @as(u64, 1) << @intCast(sib.slot_index);
+                    stopped[stopped_count] = sib;
+                    stopped_count += 1;
                 }
             }
         }
         thread.state = .faulted;
         self.faulted_thread_slots |= @as(u64, 1) << @intCast(thread.slot_index);
         self.lock.unlock();
+
+        // Force-deschedule stopped siblings: remove from run queues
+        // (in case they were .ready) and IPI cores where they are
+        // dispatched (in case they were .running or raced to .running).
+        for (stopped[0..stopped_count]) |maybe_sib| {
+            const sib = maybe_sib orelse continue;
+            sched.removeFromAnyRunQueue(sib);
+            if (sched.coreRunning(sib)) |core_id| {
+                arch.triggerSchedulerInterrupt(core_id);
+            }
+        }
 
         handler.fault_box.lock.lock();
         if (handler.fault_box.isReceiving()) {
