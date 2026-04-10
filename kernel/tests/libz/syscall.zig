@@ -1,3 +1,7 @@
+const lib = @import("lib");
+
+const ThreadHandleRights = lib.perms.ThreadHandleRights;
+
 pub const PAGE4K: u64 = 4096;
 
 pub const SyscallResult2 = struct {
@@ -28,7 +32,7 @@ pub const SyscallNum = enum(u64) {
     ioport_write,
     dma_map,
     dma_unmap,
-    pin_exclusive,
+    set_priority,
     ipc_send,
     ipc_call,
     ipc_recv,
@@ -92,6 +96,19 @@ fn syscall4(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64) i64 {
         : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
 }
 
+fn syscall5(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) i64 {
+    return asm volatile (
+        \\int $0x80
+        : [ret] "={rax}" (-> i64),
+        : [num] "{rax}" (@intFromEnum(num)),
+          [a0] "{rdi}" (a0),
+          [a1] "{rsi}" (a1),
+          [a2] "{rdx}" (a2),
+          [a3] "{r10}" (a3),
+          [a4] "{r8}" (a4),
+        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
+}
+
 fn syscall3_2(num: SyscallNum, a0: u64, a1: u64, a2: u64) SyscallResult2 {
     var val2: u64 = undefined;
     const val = asm volatile ("int $0x80"
@@ -146,11 +163,15 @@ pub fn mmio_unmap(device_handle: u64, vm_handle: u64) i64 {
 }
 
 pub fn proc_create(elf_ptr: u64, elf_len: u64, rights_bits: u64) i64 {
-    return syscall4(.proc_create, elf_ptr, elf_len, rights_bits, 0x0F); // full ThreadHandleRights
+    return proc_create_with_opts(elf_ptr, elf_len, rights_bits, ThreadHandleRights.full.bits(), PRIORITY_NORMAL);
 }
 
 pub fn proc_create_with_thread_rights(elf_ptr: u64, elf_len: u64, rights_bits: u64, thread_rights: u64) i64 {
-    return syscall4(.proc_create, elf_ptr, elf_len, rights_bits, thread_rights);
+    return proc_create_with_opts(elf_ptr, elf_len, rights_bits, thread_rights, PRIORITY_NORMAL);
+}
+
+pub fn proc_create_with_opts(elf_ptr: u64, elf_len: u64, rights_bits: u64, thread_rights: u64, max_priority: u64) i64 {
+    return syscall5(.proc_create, elf_ptr, elf_len, rights_bits, thread_rights, max_priority);
 }
 
 pub fn thread_create(entry: *const fn () void, arg: u64, num_stack_pages: u64) i64 {
@@ -171,13 +192,7 @@ pub fn thread_yield_raw() i64 {
 }
 
 pub fn set_affinity(core_mask: u64) i64 {
-    const th = thread_self();
-    if (th < 0) return th;
-    return set_affinity_thread(@intCast(th), core_mask);
-}
-
-pub fn set_affinity_thread(thread_handle: u64, core_mask: u64) i64 {
-    return syscall2(.set_affinity, thread_handle, core_mask);
+    return syscall1(.set_affinity, core_mask);
 }
 
 pub fn revoke_perm(handle: u64) i64 {
@@ -216,14 +231,14 @@ pub fn dma_unmap(device_handle: u64, shm_handle: u64) i64 {
     return syscall2(.dma_unmap, device_handle, shm_handle);
 }
 
-pub fn pin_exclusive() i64 {
-    const th = thread_self();
-    if (th < 0) return th;
-    return pin_exclusive_thread(@intCast(th));
-}
+pub const PRIORITY_IDLE: u64 = 0;
+pub const PRIORITY_NORMAL: u64 = 1;
+pub const PRIORITY_HIGH: u64 = 2;
+pub const PRIORITY_REALTIME: u64 = 3;
+pub const PRIORITY_PINNED: u64 = 4;
 
-pub fn pin_exclusive_thread(thread_handle: u64) i64 {
-    return syscall1(.pin_exclusive, thread_handle);
+pub fn set_priority(priority: u64) i64 {
+    return syscall1(.set_priority, priority);
 }
 
 pub fn shutdown() noreturn {
