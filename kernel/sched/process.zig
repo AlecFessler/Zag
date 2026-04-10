@@ -540,33 +540,19 @@ pub const Process = struct {
 
         // §2.12.23 stop-all: every sibling thread that is currently runnable
         // (.ready or .running) is moved to .suspended.
-        //
-        // After marking each sibling .suspended we must also remove it from
-        // any run queue (.ready case) or IPI the core running it (.running
-        // case) so the scheduler cannot dequeue and dispatch it.
-        var ready_sibs: [MAX_THREADS]*Thread = undefined;
-        var n_ready: u32 = 0;
-        var ipi_cores: u64 = 0;
+        // We collect suspended siblings so we can remove them from run
+        // queues and IPI their cores after releasing proc.lock.
+        var stopped: [MAX_THREADS]?*Thread = .{null} ** MAX_THREADS;
+        var stopped_count: u32 = 0;
         self.lock.lock();
         if (stop_all) {
             for (self.threads[0..self.num_threads]) |sib| {
                 if (sib == thread) continue;
-                if (sib.state == .ready) {
+                if (sib.state == .ready or sib.state == .running) {
                     sib.state = .suspended;
                     self.suspended_thread_slots |= @as(u64, 1) << @intCast(sib.slot_index);
-                    ready_sibs[n_ready] = sib;
-                    n_ready += 1;
-                } else if (sib.state == .running) {
-                    sib.state = .suspended;
-                    self.suspended_thread_slots |= @as(u64, 1) << @intCast(sib.slot_index);
-                    if (sched.coreRunning(sib)) |core_id| {
-                        ipi_cores |= @as(u64, 1) << @intCast(core_id);
-                    } else {
-                        // Preempted between state check and coreRunning;
-                        // thread is now in a run queue.
-                        ready_sibs[n_ready] = sib;
-                        n_ready += 1;
-                    }
+                    stopped[stopped_count] = sib;
+                    stopped_count += 1;
                 }
             }
         }
@@ -574,17 +560,14 @@ pub const Process = struct {
         self.faulted_thread_slots |= @as(u64, 1) << @intCast(thread.slot_index);
         self.lock.unlock();
 
-        // Remove .ready siblings from run queues (outside process lock).
-        for (ready_sibs[0..n_ready]) |sib| {
+        // Force-deschedule stopped siblings: remove from run queues
+        // (in case they were .ready) and IPI cores where they are
+        // dispatched (in case they were .running or raced to .running).
+        for (stopped[0..stopped_count]) |maybe_sib| {
+            const sib = maybe_sib orelse continue;
             sched.removeFromAnyRunQueue(sib);
-        }
-        // IPI cores running .running siblings so they deschedule.
-        {
-            var core_mask = ipi_cores;
-            while (core_mask != 0) {
-                const core_id: u64 = @ctz(core_mask);
+            if (sched.coreRunning(sib)) |core_id| {
                 arch.triggerSchedulerInterrupt(core_id);
-                core_mask &= core_mask - 1;
             }
         }
 
