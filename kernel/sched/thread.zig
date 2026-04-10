@@ -19,6 +19,14 @@ const VAddr = zag.memory.address.VAddr;
 
 pub const ThreadAllocator = SlabAllocator(Thread, false, 0, 64, true);
 
+pub const Priority = enum(u3) {
+    idle = 0,
+    normal = 1,
+    high = 2,
+    realtime = 3,
+    pinned = 4,
+};
+
 pub const State = enum {
     running,
     ready,
@@ -43,6 +51,9 @@ pub const Thread = struct {
     user_stack: ?Stack,
     process: *Process,
     next: ?*Thread = null,
+    priority: Priority = .normal,
+    pre_pin_priority: Priority = .normal,
+    pre_pin_affinity: ?u64 = null,
     core_affinity: ?u64 = null,
     state: State = .ready,
     on_cpu: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),

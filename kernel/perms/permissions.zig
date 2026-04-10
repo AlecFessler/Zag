@@ -41,9 +41,8 @@ pub const ProcessRights = packed struct(u16) {
     restart: bool = false,
     shm_create: bool = false,
     device_own: bool = false,
-    pin_exclusive: bool = false,
     fault_handler: bool = false,
-    _reserved: u7 = 0,
+    _reserved: u8 = 0,
 };
 
 pub const VmReservationRights = packed struct(u8) {
@@ -86,14 +85,12 @@ pub const ThreadHandleRights = packed struct(u8) {
     @"suspend": bool = false,
     @"resume": bool = false,
     kill: bool = false,
-    set_affinity: bool = false,
-    _reserved: u4 = 0,
+    _reserved: u5 = 0,
 
     pub const full = ThreadHandleRights{
         .@"suspend" = true,
         .@"resume" = true,
         .kill = true,
-        .set_affinity = true,
     };
 };
 
@@ -133,7 +130,6 @@ pub const VmReservationObject = struct {
 
 pub const CorePinObject = struct {
     core_id: u64,
-    thread_tid: u64,
 };
 
 pub const KernelObject = union(enum) {
@@ -262,7 +258,7 @@ pub const UserViewEntry = extern struct {
                 .entry_type = @intFromEnum(UserViewEntryType.core_pin),
                 .rights = entry.rights,
                 .field0 = cp.core_id,
-                .field1 = cp.thread_tid,
+                .field1 = 0,
             },
             .thread => |t| .{
                 .handle = entry.handle,

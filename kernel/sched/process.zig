@@ -22,6 +22,7 @@ const MessageBox = zag.sched.message_box.MessageBox;
 const PAddr = zag.memory.address.PAddr;
 const KernelObject = zag.perms.permissions.KernelObject;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
+const Priority = zag.sched.thread.Priority;
 const ProcessRights = zag.perms.permissions.ProcessRights;
 const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
 const RestartContext = zag.sched.restart_context.RestartContext;
@@ -82,6 +83,7 @@ pub const Process = struct {
     faulted_thread_slots: u64 = 0,
     suspended_thread_slots: u64 = 0,
     thread_handle_rights: ThreadHandleRights = ThreadHandleRights.full,
+    max_thread_priority: Priority = .normal,
     // Back-pointer list of processes whose fault_handler_proc == self.
     // Walked on handler death to revert targets to self-handling (§2.12.35).
     // Protected by self.lock.
@@ -1110,7 +1112,7 @@ pub const Process = struct {
                     returnDeviceHandleUpTree(self, entry.rights, device);
                 },
                 .core_pin => |cp| {
-                    sched.unpinByRevoke(cp.core_id, cp.thread_tid);
+                    sched.unpinByRevoke(cp.core_id, 0);
                 },
                 .thread => {},
                 .process => |p| {
@@ -1236,7 +1238,7 @@ pub const Process = struct {
         }
     }
 
-    pub fn create(elf_binary: []const u8, initial_rights: ProcessRights, parent: ?*Process, thr_rights: ThreadHandleRights) !*Process {
+    pub fn create(elf_binary: []const u8, initial_rights: ProcessRights, parent: ?*Process, thr_rights: ThreadHandleRights, max_priority: Priority) !*Process {
         const proc = try allocator.create(Process);
         // The late-stage TooManyChildren branch below calls proc.kill()
         // which drives its own teardown. In that case the errdefers in
@@ -1267,6 +1269,7 @@ pub const Process = struct {
             .fault_reason = .none,
             .restart_count = 0,
             .thread_handle_rights = thr_rights,
+            .max_thread_priority = max_priority,
         };
 
         const pmm_iface = pmm.global_pmm.?.allocator();
