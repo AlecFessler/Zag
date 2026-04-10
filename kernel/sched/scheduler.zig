@@ -156,18 +156,45 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
 
     const preempted = state.running_thread.?;
 
-    // Non-preemptible pinned threads: normally skip the context switch.
-    // But if the thread has been killed (.exited), unpin it and fall through
-    // to normal scheduling so it can be cleaned up as an exited thread.
     if (preempted.pinned_exclusive) {
         if (preempted.state == .exited) {
             _ = unpinExclusive(preempted);
         } else {
+            const pinned_core = @ctz(preempted.core_affinity orelse 0);
+            if (pinned_core == core_id) {
+                if (core_id == expire_core.load(.monotonic)) {
+                    futex.expireTimedWaiters();
+                    expire_core.store((core_id + 1) % arch.coreCount(), .monotonic);
+                }
+                armSchedTimer(state, SCHED_TIMESLICE_NS);
+                return;
+            }
+            preempted.ctx = ctx.thread_ctx;
+            preempted.on_cpu.store(false, .release);
+            preempted.state = .ready;
+            enqueueOnCore(pinned_core, preempted);
+            state.rq_lock.lock();
+            var next = state.rq.dequeue();
+            if (next == null) {
+                state.rq_lock.unlock();
+                next = tryStealWork(core_id);
+                state.rq_lock.lock();
+            }
+            if (next == null) {
+                next = state.idle_thread;
+            }
+            const next_thread = next.?;
+            next_thread.state = .running;
+            next_thread.on_cpu.store(true, .release);
+            state.running_thread = next_thread;
+            state.rq_lock.unlock();
             if (core_id == expire_core.load(.monotonic)) {
                 futex.expireTimedWaiters();
                 expire_core.store((core_id + 1) % arch.coreCount(), .monotonic);
             }
             armSchedTimer(state, SCHED_TIMESLICE_NS);
+            if (next_thread == preempted) return;
+            arch.switchTo(next_thread);
             return;
         }
     }
@@ -387,17 +414,19 @@ pub fn unpinExclusive(thread: *Thread) i64 {
     return 0;
 }
 
-/// Unpin by core_id and thread_tid — called from revoke_perm on a core_pin handle.
-pub fn unpinByRevoke(core_id: u64, thread_tid: u64) void {
+/// Unpin by core_id — called from revoke_perm on a core_pin handle.
+/// Restores the thread's pre-pin priority and affinity.
+pub fn unpinByRevoke(core_id: u64) void {
     if (core_id >= MAX_CORES) return;
     const state = &core_states[core_id];
     if (state.pinned_thread) |pt| {
-        if (pt.tid == thread_tid) {
-            pt.pinned_exclusive = false;
-            state.pinned_thread = null;
-            const core_bit = @as(u64, 1) << @intCast(core_id);
-            _ = pinned_cores.fetchAnd(~core_bit, .release);
-        }
+        pt.pinned_exclusive = false;
+        pt.priority = pt.pre_pin_priority;
+        pt.core_affinity = pt.pre_pin_affinity;
+        pt.pre_pin_affinity = null;
+        state.pinned_thread = null;
+        const core_bit = @as(u64, 1) << @intCast(core_id);
+        _ = pinned_cores.fetchAnd(~core_bit, .release);
     }
 }
 

@@ -102,6 +102,7 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
     const arg1 = ctx.regs.rsi;
     const arg2 = ctx.regs.rdx;
     const arg3 = ctx.regs.r10;
+    const arg4 = ctx.regs.r8;
     const syscall_num: SyscallNum = @enumFromInt(num);
     return switch (syscall_num) {
         .write => sysWrite(arg0, arg1),
@@ -112,7 +113,7 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
         .shm_unmap => .{ .rax = sysShmUnmap(arg0, arg1) },
         .mmio_map => .{ .rax = sysMmioMap(arg0, arg1, arg2) },
         .mmio_unmap => .{ .rax = sysMmioUnmap(arg0, arg1) },
-        .proc_create => .{ .rax = sysProcCreate(arg0, arg1, arg2, arg3) },
+        .proc_create => .{ .rax = sysProcCreate(arg0, arg1, arg2, arg3, arg4) },
         .thread_create => .{ .rax = sysThreadCreate(arg0, arg1, arg2) },
         .thread_exit => sysThreadExit(),
         .thread_yield => .{ .rax = sysThreadYield() },
@@ -385,7 +386,7 @@ fn sysMmioUnmap(device_handle: u64, vm_handle: u64) i64 {
     return E_OK;
 }
 
-fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_arg: u64) i64 {
+fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_arg: u64, max_priority_arg: u64) i64 {
     if (elf_len == 0) return E_INVAL;
     if (!address.AddrSpacePartition.user.contains(elf_ptr)) return E_BADADDR;
     const elf_end = std.math.add(u64, elf_ptr, elf_len) catch return E_BADADDR;
@@ -395,6 +396,9 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_arg: 
     const thr_rights_raw: u8 = @truncate(thread_rights_arg);
     if (thr_rights_raw & 0xF0 != 0) return E_INVAL;
     const thr_rights: ThreadHandleRights = @bitCast(thr_rights_raw);
+
+    if (max_priority_arg > 3) return E_INVAL;
+    const child_max_priority: Priority = @enumFromInt(@as(u3, @truncate(max_priority_arg)));
 
     const proc = currentProc();
 
@@ -409,6 +413,8 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_arg: 
     const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
     const parent_self_rights = self_entry.processRights();
     if (!parent_self_rights.spawn_process) return E_PERM;
+
+    if (@intFromEnum(child_max_priority) > @intFromEnum(proc.max_thread_priority)) return E_PERM;
 
     const child_perms: ProcessRights = @bitCast(@as(u16, @truncate(perms_arg)));
     if (child_perms.restart and proc.restart_context == null) return E_PERM;
@@ -434,7 +440,7 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_arg: 
     const user_bytes: [*]const u8 = @ptrFromInt(elf_ptr);
     @memcpy(elf_copy, user_bytes[0..elf_len]);
 
-    const child = Process.create(elf_copy, child_perms, proc, thr_rights, .normal) catch |e| return switch (e) {
+    const child = Process.create(elf_copy, child_perms, proc, thr_rights, child_max_priority) catch |e| return switch (e) {
         error.InvalidElf => E_INVAL,
         error.OutOfKernelStacks, error.TooManyChildren => E_NORES,
         else => E_NOMEM,
@@ -575,7 +581,7 @@ fn sysRevokePerm(handle: u64) i64 {
             Process.returnDeviceHandleUpTree(proc, entry.rights, device);
         },
         .core_pin => |cp| {
-            sched.unpinByRevoke(cp.core_id, 0);
+            sched.unpinByRevoke(cp.core_id);
             proc.removePerm(handle) catch {};
         },
         .process => |child| {
@@ -738,8 +744,9 @@ fn sysSetPriority(priority_raw: u64) i64 {
     const currently_pinned = thread.priority == .pinned;
 
     if (new_priority == .pinned) {
-        // Pinning: scan affinity mask ascending for available core
-        const affinity = thread.core_affinity orelse return E_INVAL;
+        const count = arch.coreCount();
+        const all_cores: u64 = if (count >= 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(count)) - 1;
+        const affinity = thread.core_affinity orelse all_cores;
         if (affinity == 0) return E_INVAL;
 
         // Save pre-pin state before modifying
@@ -791,7 +798,7 @@ fn sysSetPriority(priority_raw: u64) i64 {
         for (&proc.perm_table) |*slot| {
             if (slot.object == .core_pin) {
                 const cp = slot.object.core_pin;
-                sched.unpinByRevoke(cp.core_id, 0);
+                sched.unpinByRevoke(cp.core_id);
                 slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 proc.perm_count -= 1;
                 break;
@@ -800,9 +807,6 @@ fn sysSetPriority(priority_raw: u64) i64 {
         proc.syncUserView();
         proc.perm_lock.unlock();
 
-        // Restore saved affinity
-        thread.core_affinity = thread.pre_pin_affinity;
-        thread.pre_pin_affinity = null;
     }
 
     thread.priority = new_priority;
@@ -862,6 +866,11 @@ fn sysThreadSuspend(thread_handle: u64) i64 {
                     arch.triggerSchedulerInterrupt(core_id);
                     return E_OK;
                 }
+                // Thread was preempted between state check and coreRunning —
+                // it is now in a run queue with .suspended state. Remove it.
+                target_proc.lock.unlock();
+                sched.removeFromAnyRunQueue(target);
+                return E_OK;
             } else {
                 // Self-suspend: we must deschedule now, before returning
                 // to userspace. If we merely marked ourselves .suspended
@@ -882,7 +891,11 @@ fn sysThreadSuspend(thread_handle: u64) i64 {
         .ready => {
             target.state = .suspended;
             target_proc.suspended_thread_slots |= @as(u64, 1) << @intCast(target.slot_index);
-            // Lazy: scheduler dequeue skips .suspended threads.
+            // The thread is sitting in some core's run queue — remove it
+            // so the scheduler cannot dequeue and dispatch it.
+            target_proc.lock.unlock();
+            sched.removeFromAnyRunQueue(target);
+            return E_OK;
         },
     }
     target_proc.lock.unlock();

@@ -6,7 +6,7 @@ const syscall = lib.syscall;
 const t = lib.testing;
 
 const E_PERM: i64 = -2;
-const E_BUSY: i64 = -9;
+const E_BUSY: i64 = -11;
 
 /// §2.4.19 — `set_affinity` is self-only (no thread handle parameter).
 pub fn main(_: u64) void {

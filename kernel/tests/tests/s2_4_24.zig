@@ -3,7 +3,7 @@ const lib = @import("lib");
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const E_BUSY: i64 = -7;
+const E_BUSY: i64 = -11;
 
 /// §2.4.24 — A pinned thread cannot call `set_affinity`; attempting it returns `E_BUSY`.
 pub fn main(_: u64) void {

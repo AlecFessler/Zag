@@ -3,7 +3,7 @@ const lib = @import("lib");
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const E_MAXCAP: i64 = -9;
+const E_MAXCAP: i64 = -5;
 
 /// §4.15.7 — `set_priority(.pinned)` returns `E_MAXCAP` if the permissions table is full.
 pub fn main(perm_view: u64) void {
