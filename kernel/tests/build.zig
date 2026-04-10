@@ -170,6 +170,8 @@ pub fn build(b: *std.Build) void {
     const child_iter1_c_reply_clears_bin = buildChild(b, target, lib_mod, "child_iter1_c_reply_clears", "children/child_iter1_c_reply_clears.zig");
     const child_iter1_c_full_table_receiver_bin = buildChild(b, target, lib_mod, "child_iter1_c_full_table_receiver", "children/child_iter1_c_full_table_receiver.zig");
     const child_try_set_priority_bin = buildChild(b, target, lib_mod, "child_try_set_priority", "children/child_try_set_priority.zig");
+    const child_pin_then_restart_bin = buildChild(b, target, lib_mod, "child_pin_then_restart", "children/child_pin_then_restart.zig");
+    const child_sched_try_create_with_priority_bin = buildChild(b, target, lib_mod, "child_sched_try_create_with_priority", "children/child_sched_try_create_with_priority.zig");
 
     const embedded_wf = b.addWriteFiles();
     _ = embedded_wf.addCopyFile(child_exit_bin, "child_exit.elf");
@@ -294,6 +296,9 @@ pub fn build(b: *std.Build) void {
     _ = embedded_wf.addCopyFile(child_iter1_c_late_recv_bin, "child_iter1_c_late_recv.elf");
     _ = embedded_wf.addCopyFile(child_iter1_c_reply_clears_bin, "child_iter1_c_reply_clears.elf");
     _ = embedded_wf.addCopyFile(child_iter1_c_full_table_receiver_bin, "child_iter1_c_full_table_receiver.elf");
+    _ = embedded_wf.addCopyFile(child_try_set_priority_bin, "child_try_set_priority.elf");
+    _ = embedded_wf.addCopyFile(child_pin_then_restart_bin, "child_pin_then_restart.elf");
+    _ = embedded_wf.addCopyFile(child_sched_try_create_with_priority_bin, "child_sched_try_create_with_priority.elf");
     const embed_src = embedded_wf.add("embedded_children.zig",
         \\pub const child_exit = @embedFile("child_exit.elf");
         \\pub const child_shm_counter = @embedFile("child_shm_counter.elf");
@@ -417,6 +422,9 @@ pub fn build(b: *std.Build) void {
         \\pub const child_iter1_c_late_recv = @embedFile("child_iter1_c_late_recv.elf");
         \\pub const child_iter1_c_reply_clears = @embedFile("child_iter1_c_reply_clears.elf");
         \\pub const child_iter1_c_full_table_receiver = @embedFile("child_iter1_c_full_table_receiver.elf");
+        \\pub const child_try_set_priority = @embedFile("child_try_set_priority.elf");
+        \\pub const child_pin_then_restart = @embedFile("child_pin_then_restart.elf");
+        \\pub const child_sched_try_create_with_priority = @embedFile("child_sched_try_create_with_priority.elf");
         \\
     );
 
