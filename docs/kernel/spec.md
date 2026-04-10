@@ -295,7 +295,7 @@ Zag provides a unified fault handling mechanism covering both in-process fault r
 
 #### fault_handler Capability
 
-**§2.12.1** `ProcessRights` bit 8 is `fault_handler`. When set on a process's slot 0, the process handles its own faults in its own fault box. This bit is granted at `proc_create` time if included in the `process_rights` parameter.
+**§2.12.1** `ProcessRights` bit 7 is `fault_handler`. When set on a process's slot 0, the process handles its own faults in its own fault box. This bit is granted at `proc_create` time if included in the `process_rights` parameter.
 
 **§2.12.2** `ProcessHandleRights` bit 6 is `fault_handler`. When set on a handle to process P, the holder receives P's fault messages in the holder's own fault box. At most one process may hold `fault_handler` for a given process at a time.
 

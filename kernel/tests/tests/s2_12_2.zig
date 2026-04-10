@@ -6,7 +6,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.12.2 — `ProcessHandleRights` bit 7 is `fault_handler`.
+/// §2.12.2 — `ProcessHandleRights` bit 6 is `fault_handler`.
 /// process may hold `fault_handler` for a given process at a time.
 ///
 /// Observable: spawn a child with the self-handling fault_handler bit.
