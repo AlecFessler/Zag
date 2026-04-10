@@ -74,6 +74,10 @@ pub fn main(pv: u64) void {
 
     // --- Part B: transfer dev_b to child, child exits; dev_b returns to us ---
     const dev_b = bochs_ent.handle;
+    // Capture dev_b's stable identification payload (device_type, device_class,
+    // size, PCI ids). This survives re-insert with a different handle id.
+    const dev_b_field0 = bochs_ent.field0;
+    const dev_b_field1 = bochs_ent.field1;
     const child_rights = perms.ProcessRights{ .spawn_thread = true, .device_own = true };
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
         @intFromPtr(children.child_recv_device_wait.ptr),
@@ -99,39 +103,26 @@ pub fn main(pv: u64) void {
     // Signal child to exit so the device walks back up the tree to us.
     _ = syscall.ipc_call(child_handle, &.{}, &reply);
 
-    // Wait for child to exit — its device should walk back up to us.
+    // Wait for child to exit — its device should walk back up to us.  We
+    // match on the device payload (field0/field1) rather than the old handle
+    // id, because a tree-walk return re-inserts with a fresh handle id.
     var attempts: u32 = 0;
     var dev_b_returned = false;
     while (attempts < 500000) : (attempts += 1) {
-        var found = false;
         for (0..128) |i| {
-            if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION and view[i].handle == dev_b) {
-                found = true;
+            if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION and
+                view[i].field0 == dev_b_field0 and
+                view[i].field1 == dev_b_field1)
+            {
+                dev_b_returned = true;
                 break;
             }
-            // A fresh device handle (different id, same device payload) would
-            // also indicate return-up — but since our device entry tracks by
-            // id, walk finds the existing slot cleared and re-inserts. In
-            // either case the device region count after child exit must be
-            // >= the count before transfer minus zero (i.e., it came back).
         }
-        if (found) {
-            dev_b_returned = true;
-            break;
-        }
+        if (dev_b_returned) break;
         syscall.thread_yield();
     }
-
-    // Count DEVICE_REGION entries as a fallback: we started with n_devs, gave
-    // one (dev_a) away to revoke, and transferred one (dev_b) to the child
-    // who exited. We should now have (n_devs - 1) devices back — dev_a stays
-    // revoked, but dev_b came back (possibly with a new id on re-insert).
-    var count_after: usize = 0;
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION) count_after += 1;
-    }
-    const expected_count = n_devs - 1;
-    const tree_walk_ok = dev_b_returned or count_after >= expected_count;
+    _ = n_devs;
+    const tree_walk_ok = dev_b_returned;
 
     if (!dev_a_found and mmio_gone and !dev_b_present_after_xfer and tree_walk_ok) {
         t.pass("§2.3.13");

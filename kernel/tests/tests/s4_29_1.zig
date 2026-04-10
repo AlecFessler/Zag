@@ -18,7 +18,7 @@ pub fn main(pv: u64) void {
 
     // Scan perm_view entries to find the matching thread handle.
     var found = false;
-    for (0..256) |i| {
+    for (0..128) |i| {
         const entry = view[i];
         if (entry.entry_type == perm_view.ENTRY_TYPE_EMPTY) break;
         if (entry.handle == handle_u64 and entry.entry_type == perm_view.ENTRY_TYPE_THREAD) {

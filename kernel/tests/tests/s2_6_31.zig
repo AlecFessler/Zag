@@ -7,7 +7,6 @@ const syscall = lib.syscall;
 const t = lib.testing;
 
 /// §2.6.31 — Non-recursive kill of a non-restartable process with children makes it a zombie.
-/// makes it a zombie.
 ///
 /// Plan:
 ///   1. Build an SHM carrying the grandchild ELF (child_ipc_counter).
@@ -15,15 +14,16 @@ const t = lib.testing;
 ///   3. Transfer the SHM to the spawner; the spawner spawns the grandchild
 ///      from the ELF and signals us via a futex cell in the SHM.
 ///   4. Call the spawner again; it replies with a cap transfer of the
-///      grandchild handle. Parent now holds a direct handle to the
-///      grandchild.
-///   5. The spawner then faults — this is a non-recursive fault kill. Since
-///      the spawner has a living child it must become a zombie
-///      (dead_process) rather than being fully cleaned up.
-///   6. Test root asserts:
+///      grandchild handle, then voluntarily `thread_exit`s. Voluntary exit
+///      of a non-restartable process terminates only that process (it is
+///      not a recursive kill sweep), so with a living child the spawner
+///      must become a zombie (dead_process). This exercises the
+///      "non-recursive kill" clause of §2.6.31 without going through a
+///      fault-kill path.
+///   5. Test root asserts:
 ///      a. Spawner slot is `dead_process`.
 ///      b. The grandchild still replies to IPC (proving it wasn't killed
-///         recursively along with the spawner).
+///         along with the spawner).
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
@@ -52,8 +52,8 @@ pub fn main(pv: u64) void {
         .shm_create = true,
     };
     const spawner: u64 = @bitCast(@as(i64, syscall.proc_create(
-        @intFromPtr(children.child_spawn_report_then_fault.ptr),
-        children.child_spawn_report_then_fault.len,
+        @intFromPtr(children.child_iter1_b_spawn_exit.ptr),
+        children.child_iter1_b_spawn_exit.len,
         spawner_rights.bits(),
     )));
 

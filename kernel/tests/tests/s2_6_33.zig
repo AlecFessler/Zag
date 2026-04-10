@@ -58,12 +58,13 @@ pub fn main(pv: u64) void {
     // Since device is exclusive, if the child restarted and kept it, the device
     // should NOT return to us.
 
-    // Give time for restart to happen.
-    syscall.thread_yield();
-    syscall.thread_yield();
-    syscall.thread_yield();
+    // Give the restart path time to run on a real bounded interval rather
+    // than three yields. Use a timed futex_wait on a local sentinel that
+    // will never be woken — so we sleep the full 500 ms. If the kernel were
+    // going to return the device to us, it would happen inside this window.
+    var sentinel: u64 align(8) = 0;
+    _ = syscall.futex_wait(@ptrCast(&sentinel), 0, 500_000_000);
 
-    // Device should NOT be back in our perm view (child kept it).
     var device_returned = false;
     for (0..128) |i| {
         if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION and view[i].field0 == dev_field0) {

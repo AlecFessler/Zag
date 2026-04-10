@@ -8,7 +8,7 @@ const t = lib.testing;
 
 const E_BUSY: i64 = -11;
 
-/// §2.4.11 — `thread_suspend` on a `.faulted` thread returns `E_BUSY`
+/// §2.4.11 — `thread_suspend` on a `.faulted` or `.blocked` thread returns `E_BUSY`.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 

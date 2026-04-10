@@ -95,7 +95,7 @@ pub fn coreRunning(thread: *Thread) ?u64 {
     const count = arch.coreCount();
     var i: u64 = 0;
     while (i < count) : (i += 1) {
-        if (core_states[i].running_thread == thread) return i;
+        if (@atomicLoad(?*Thread, &core_states[i].running_thread, .acquire) == thread) return i;
     }
     return null;
 }

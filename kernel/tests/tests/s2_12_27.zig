@@ -35,9 +35,14 @@ pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
     const child_rights = (perms.ProcessRights{ .fault_handler = true }).bits();
+    // Use the int3 child: #BP is a trap, so after FAULT_RESUME the RIP has
+    // already advanced past the int3 and the thread does NOT re-fault. This
+    // closes a TOCTOU window where a re-fault could fire §2.12.11 between
+    // our fault_reply and our perm-view observation, clearing
+    // `exclude_oneshot` before we see it.
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
-        @intFromPtr(children.child_fault_after_transfer.ptr),
-        children.child_fault_after_transfer.len,
+        @intFromPtr(children.child_int3_after_transfer.ptr),
+        children.child_int3_after_transfer.len,
         child_rights,
     )));
 
@@ -81,10 +86,5 @@ pub fn main(pv: u64) void {
         t.fail("§2.12.27 thread entry vanished");
     }
 
-    // Drain the next fault (the resumed thread re-faults at the same address)
-    // and kill so the test exits cleanly.
-    var fault_buf2: [256]u8 align(8) = undefined;
-    const token2 = syscall.fault_recv(@intFromPtr(&fault_buf2), 1);
-    if (token2 >= 0) _ = syscall.fault_reply_simple(@bitCast(token2), syscall.FAULT_KILL);
     syscall.shutdown();
 }

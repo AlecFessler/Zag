@@ -61,15 +61,46 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
 
-    // Verify both flags are now CLEAR in field1.
+    // Verify both flags are now CLEAR in field1 (sub-scenario A: permanent
+    // was seeded — proves stop_all clears `exclude_permanent`).
+    if (findThreadEntry(view, thread_handle)) |e| {
+        if (e.threadExcludeOneshot() or e.threadExcludePermanent()) {
+            t.fail("§2.12.29 A flags not cleared after stop_all");
+            syscall.shutdown();
+        }
+    } else {
+        t.fail("§2.12.29 A thread entry vanished after stop_all");
+        syscall.shutdown();
+    }
+
+    // Sub-scenario B: seed `exclude_oneshot`, then stop_all, and verify it
+    // is also cleared. Without this, the "clears oneshot" clause of
+    // §2.12.29 is vacuous (A only proves the permanent clause).
+    _ = syscall.fault_set_thread_mode(thread_handle, syscall.FAULT_MODE_EXCLUDE_NEXT);
+    if (findThreadEntry(view, thread_handle)) |e| {
+        if (!e.threadExcludeOneshot()) {
+            t.fail("§2.12.29 B setup: exclude_oneshot not visible");
+            syscall.shutdown();
+        }
+    } else {
+        t.fail("§2.12.29 B thread entry vanished during setup");
+        syscall.shutdown();
+    }
+
+    const rc2 = syscall.fault_set_thread_mode(thread_handle, syscall.FAULT_MODE_STOP_ALL);
+    if (rc2 != 0) {
+        t.failWithVal("§2.12.29 B stop_all rc", 0, rc2);
+        syscall.shutdown();
+    }
+
     if (findThreadEntry(view, thread_handle)) |e| {
         if (!e.threadExcludeOneshot() and !e.threadExcludePermanent()) {
             t.pass("§2.12.29");
         } else {
-            t.fail("§2.12.29 flags not cleared after stop_all");
+            t.fail("§2.12.29 B flags not cleared after stop_all");
         }
     } else {
-        t.fail("§2.12.29 thread entry vanished after stop_all");
+        t.fail("§2.12.29 B thread entry vanished after stop_all");
     }
     syscall.shutdown();
 }

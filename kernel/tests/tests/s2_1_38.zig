@@ -10,7 +10,7 @@ fn threadFn() void {
     syscall.thread_exit();
 }
 
-/// §2.1.38 — Thread entry `field1` = 0 (reserved)
+/// §2.1.38 — Thread entry `field1` exposes the fault-handler exclude flags: bit 0 = `exclude_oneshot`, bit 1 = `exclude_permanent`.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
     const ret = syscall.thread_create(&threadFn, 0, 4);

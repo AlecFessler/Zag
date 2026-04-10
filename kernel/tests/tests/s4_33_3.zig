@@ -13,9 +13,15 @@ const t = lib.testing;
 /// would be empty (E_AGAIN) — getting a valid token means the call actually
 /// blocked until the fault arrived.
 var sibling_done: u64 = 0;
+var main_in_recv: u64 align(8) = 0;
 
 fn siblingTrigger() void {
-    // Yield a few times so the main thread reaches fault_recv first.
+    // Wait on a futex until the main thread signals that it is about to call
+    // `fault_recv`. Replaces a bare yield-spin with a proper handshake.
+    while (@atomicLoad(u64, &main_in_recv, .acquire) == 0) {
+        _ = syscall.futex_wait(&main_in_recv, 0, @bitCast(@as(i64, -1)));
+    }
+    // Give main a few yields to cross into the blocking fault_recv syscall.
     for (0..20) |_| syscall.thread_yield();
 
     const child_rights = (perms.ProcessRights{
@@ -42,7 +48,12 @@ pub fn main(_: u64) void {
         syscall.shutdown();
     }
 
-    // Block in fault_recv. Box must be empty at this point — sibling is yielding.
+    // Release the sibling right before entering blocking fault_recv. The
+    // sibling still yields a few times before spawning the faulting child, so
+    // the box is empty when the kernel transitions us to the blocking path.
+    @atomicStore(u64, &main_in_recv, 1, .release);
+    _ = syscall.futex_wake(&main_in_recv, 1);
+
     var fault_buf: [256]u8 align(8) = undefined;
     const token = syscall.fault_recv(@intFromPtr(&fault_buf), 1);
     if (token < 0) {

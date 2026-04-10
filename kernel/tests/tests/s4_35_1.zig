@@ -58,10 +58,27 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
 
-    var buf: [4]u8 = .{0} ** 4;
-    // Read 4 bytes from the faulting child's RIP — guaranteed mapped code page.
-    const read_ret = syscall.fault_read_mem(proc_handle, fault_msg.rip, @intFromPtr(&buf), 4);
-    t.expectEqual("§4.35.1", E_OK, read_ret);
+    var buf: [8]u8 = .{0} ** 8;
+    // Read 8 bytes from the faulting child's RIP — guaranteed mapped code page.
+    const read_ret = syscall.fault_read_mem(proc_handle, fault_msg.rip, @intFromPtr(&buf), 8);
+    t.expectEqual("§4.35.1 rc", E_OK, read_ret);
+
+    // Verify bytes actually landed in our buffer. The child faulted via a null
+    // deref (mov (%rax), %al with rax=0). The faulting instruction sequence
+    // lives on a code page, so at least one byte must be non-zero — an all-zero
+    // readback would indicate the kernel returned E_OK without copying anything.
+    var any_nonzero = false;
+    for (buf) |b| {
+        if (b != 0) {
+            any_nonzero = true;
+            break;
+        }
+    }
+    if (any_nonzero) {
+        t.pass("§4.35.1 bytes landed");
+    } else {
+        t.fail("§4.35.1 buf all zero (bytes did not land)");
+    }
 
     syscall.shutdown();
 }

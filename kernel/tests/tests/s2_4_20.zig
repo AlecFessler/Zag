@@ -91,5 +91,38 @@ pub fn main(_: u64) void {
         t.failWithVal("§2.4.20 missing ProcessRights E_PERM", E_PERM, child_result);
     }
 
+    // 5. Missing ThreadHandleRights.set_affinity → E_PERM. Spawn the same
+    //    child_try_pin_exclusive helper via proc_create_with_thread_rights
+    //    granting full ProcessRights { set_affinity, pin_exclusive } but
+    //    thread_rights lacking set_affinity on slot 1. The child's
+    //    thread_self() returns slot 1 (§2.4.3), so pin_exclusive_thread
+    //    checks the missing ThreadHandleRights.set_affinity and returns
+    //    E_PERM.
+    const child_rights2 = (perms.ProcessRights{ .set_affinity = true, .pin_exclusive = true }).bits();
+    const thread_rights2 = (perms.ThreadHandleRights{
+        .@"suspend" = true,
+        .@"resume" = true,
+        .kill = true,
+        .set_affinity = false,
+    }).bits();
+    const ch2: u64 = @bitCast(@as(i64, syscall.proc_create_with_thread_rights(
+        @intFromPtr(children.child_try_pin_exclusive.ptr),
+        children.child_try_pin_exclusive.len,
+        child_rights2,
+        thread_rights2,
+    )));
+    var reply2: syscall.IpcMessage = .{};
+    const rc2 = syscall.ipc_call(ch2, &.{}, &reply2);
+    if (rc2 != 0) {
+        t.failWithVal("§2.4.20 child2 ipc_call", 0, rc2);
+        syscall.shutdown();
+    }
+    const child_result2: i64 = @bitCast(reply2.words[0]);
+    if (child_result2 == E_PERM) {
+        t.pass("§2.4.20 missing ThreadHandleRights E_PERM");
+    } else {
+        t.failWithVal("§2.4.20 missing ThreadHandleRights E_PERM", E_PERM, child_result2);
+    }
+
     syscall.shutdown();
 }

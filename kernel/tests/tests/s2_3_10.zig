@@ -16,11 +16,8 @@ pub fn main(perm_view: u64) void {
     // Spawn a child.
     const child_rights = perms.ProcessRights{ .spawn_thread = true, .shm_create = true };
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(@intFromPtr(children.child_send_self.ptr), children.child_send_self.len, child_rights.bits())));
-    // Let child start and block on recv.
-    syscall.thread_yield();
-    syscall.thread_yield();
-    syscall.thread_yield();
     // Try to transfer with execute right (not in source) — should fail with E_PERM.
+    // ipc_call_cap blocks until the child is ready to recv, so no yielding needed.
     const exceeding_rights: u64 = (perms.SharedMemoryRights{ .read = true, .write = true, .execute = true, .grant = true }).bits();
     var reply: syscall.IpcMessage = .{};
     const ret = syscall.ipc_call_cap(child_handle, &.{ shm_handle, exceeding_rights }, &reply);

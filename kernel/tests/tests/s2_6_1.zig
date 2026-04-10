@@ -6,6 +6,9 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
+const E_OK: i64 = 0;
+const E_AGAIN: i64 = -9;
+
 /// §2.6.1 — Restart is triggered when a process with a restart context terminates by voluntary exit (last thread calls `thread_exit`).
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
@@ -19,11 +22,14 @@ pub fn main(pv: u64) void {
             break;
         }
     }
-    // Wait for restart count to increment (child exits, kernel restarts it)
-    var attempts: u32 = 0;
-    while (attempts < 100000) : (attempts += 1) {
-        if (view[slot].processRestartCount() > 0) break;
-        syscall.thread_yield();
+    // Block on the parent view `field0` — per §2.6.27 the kernel issues a
+    // futex wake on this cell when the child restarts. E_OK = woken by
+    // kernel; E_AGAIN = field0 already changed before we entered wait.
+    const initial_field0 = @atomicLoad(u64, &view[slot].field0, .acquire);
+    const wait_rc = syscall.futex_wait(&view[slot].field0, initial_field0, 5_000_000_000);
+    if (wait_rc != E_OK and wait_rc != E_AGAIN) {
+        t.failWithVal("§2.6.1 futex_wait", E_OK, wait_rc);
+        syscall.shutdown();
     }
     if (view[slot].processRestartCount() > 0) {
         t.pass("§2.6.1");

@@ -129,6 +129,8 @@ pub fn build(b: *std.Build) void {
     const child_delayed_ipc_server_bin = buildChild(b, target, lib_mod, "child_delayed_ipc_server", "children/child_delayed_ipc_server.zig");
     const child_middleman_handler_bin = buildChild(b, target, lib_mod, "child_middleman_handler", "children/child_middleman_handler.zig");
     const child_fh_target_reporter_bin = buildChild(b, target, lib_mod, "child_fh_target_reporter", "children/child_fh_target_reporter.zig");
+    const child_iter1_d_call_parent_bin = buildChild(b, target, lib_mod, "child_iter1_d_call_parent", "children/child_iter1_d_call_parent.zig");
+    const child_iter1_d_mt_target_bin = buildChild(b, target, lib_mod, "child_iter1_d_mt_target", "children/child_iter1_d_mt_target.zig");
     const child_ipc_shm_recorder_bin = buildChild(b, target, lib_mod, "child_ipc_shm_recorder", "children/child_ipc_shm_recorder.zig");
     const child_ipc_five_word_echo_bin = buildChild(b, target, lib_mod, "child_ipc_five_word_echo", "children/child_ipc_five_word_echo.zig");
     const child_shm_no_read_bin = buildChild(b, target, lib_mod, "child_shm_no_read", "children/child_shm_no_read.zig");
@@ -156,6 +158,15 @@ pub fn build(b: *std.Build) void {
     const child_report_rights_then_fault_bin = buildChild(b, target, lib_mod, "child_report_rights_then_fault", "children/child_report_rights_then_fault.zig");
     const child_spawn_threads_then_transfer_fh_bin = buildChild(b, target, lib_mod, "child_spawn_threads_then_transfer_fh", "children/child_spawn_threads_then_transfer_fh.zig");
     const child_selfh_all_threads_fault_bin = buildChild(b, target, lib_mod, "child_selfh_all_threads_fault", "children/child_selfh_all_threads_fault.zig");
+    const child_iter1_b_restart_probe_bin = buildChild(b, target, lib_mod, "child_iter1_b_restart_probe", "children/child_iter1_b_restart_probe.zig");
+    const child_iter1_b_spawn_exit_bin = buildChild(b, target, lib_mod, "child_iter1_b_spawn_exit", "children/child_iter1_b_spawn_exit.zig");
+    const child_iter1_b_parked_tids_bin = buildChild(b, target, lib_mod, "child_iter1_b_parked_tids", "children/child_iter1_b_parked_tids.zig");
+    const child_iter1_b_restart_loop_rights_bin = buildChild(b, target, lib_mod, "child_iter1_b_restart_loop_rights", "children/child_iter1_b_restart_loop_rights.zig");
+    const child_iter1_c_delay_server_bin = buildChild(b, target, lib_mod, "child_iter1_c_delay_server", "children/child_iter1_c_delay_server.zig");
+    const child_iter1_c_gated_counter_bin = buildChild(b, target, lib_mod, "child_iter1_c_gated_counter", "children/child_iter1_c_gated_counter.zig");
+    const child_iter1_c_late_recv_bin = buildChild(b, target, lib_mod, "child_iter1_c_late_recv", "children/child_iter1_c_late_recv.zig");
+    const child_iter1_c_reply_clears_bin = buildChild(b, target, lib_mod, "child_iter1_c_reply_clears", "children/child_iter1_c_reply_clears.zig");
+    const child_iter1_c_full_table_receiver_bin = buildChild(b, target, lib_mod, "child_iter1_c_full_table_receiver", "children/child_iter1_c_full_table_receiver.zig");
 
     const embedded_wf = b.addWriteFiles();
     _ = embedded_wf.addCopyFile(child_exit_bin, "child_exit.elf");
@@ -240,6 +251,8 @@ pub fn build(b: *std.Build) void {
     _ = embedded_wf.addCopyFile(child_delayed_ipc_server_bin, "child_delayed_ipc_server.elf");
     _ = embedded_wf.addCopyFile(child_middleman_handler_bin, "child_middleman_handler.elf");
     _ = embedded_wf.addCopyFile(child_fh_target_reporter_bin, "child_fh_target_reporter.elf");
+    _ = embedded_wf.addCopyFile(child_iter1_d_call_parent_bin, "child_iter1_d_call_parent.elf");
+    _ = embedded_wf.addCopyFile(child_iter1_d_mt_target_bin, "child_iter1_d_mt_target.elf");
     _ = embedded_wf.addCopyFile(child_ipc_shm_recorder_bin, "child_ipc_shm_recorder.elf");
     _ = embedded_wf.addCopyFile(child_ipc_five_word_echo_bin, "child_ipc_five_word_echo.elf");
     _ = embedded_wf.addCopyFile(child_shm_no_read_bin, "child_shm_no_read.elf");
@@ -267,6 +280,15 @@ pub fn build(b: *std.Build) void {
     _ = embedded_wf.addCopyFile(child_report_rights_then_fault_bin, "child_report_rights_then_fault.elf");
     _ = embedded_wf.addCopyFile(child_spawn_threads_then_transfer_fh_bin, "child_spawn_threads_then_transfer_fh.elf");
     _ = embedded_wf.addCopyFile(child_selfh_all_threads_fault_bin, "child_selfh_all_threads_fault.elf");
+    _ = embedded_wf.addCopyFile(child_iter1_b_restart_probe_bin, "child_iter1_b_restart_probe.elf");
+    _ = embedded_wf.addCopyFile(child_iter1_b_spawn_exit_bin, "child_iter1_b_spawn_exit.elf");
+    _ = embedded_wf.addCopyFile(child_iter1_b_parked_tids_bin, "child_iter1_b_parked_tids.elf");
+    _ = embedded_wf.addCopyFile(child_iter1_b_restart_loop_rights_bin, "child_iter1_b_restart_loop_rights.elf");
+    _ = embedded_wf.addCopyFile(child_iter1_c_delay_server_bin, "child_iter1_c_delay_server.elf");
+    _ = embedded_wf.addCopyFile(child_iter1_c_gated_counter_bin, "child_iter1_c_gated_counter.elf");
+    _ = embedded_wf.addCopyFile(child_iter1_c_late_recv_bin, "child_iter1_c_late_recv.elf");
+    _ = embedded_wf.addCopyFile(child_iter1_c_reply_clears_bin, "child_iter1_c_reply_clears.elf");
+    _ = embedded_wf.addCopyFile(child_iter1_c_full_table_receiver_bin, "child_iter1_c_full_table_receiver.elf");
     const embed_src = embedded_wf.add("embedded_children.zig",
         \\pub const child_exit = @embedFile("child_exit.elf");
         \\pub const child_shm_counter = @embedFile("child_shm_counter.elf");
@@ -350,6 +372,8 @@ pub fn build(b: *std.Build) void {
         \\pub const child_delayed_ipc_server = @embedFile("child_delayed_ipc_server.elf");
         \\pub const child_middleman_handler = @embedFile("child_middleman_handler.elf");
         \\pub const child_fh_target_reporter = @embedFile("child_fh_target_reporter.elf");
+        \\pub const child_iter1_d_call_parent = @embedFile("child_iter1_d_call_parent.elf");
+        \\pub const child_iter1_d_mt_target = @embedFile("child_iter1_d_mt_target.elf");
         \\pub const child_ipc_shm_recorder = @embedFile("child_ipc_shm_recorder.elf");
         \\pub const child_ipc_five_word_echo = @embedFile("child_ipc_five_word_echo.elf");
         \\pub const child_shm_no_read = @embedFile("child_shm_no_read.elf");
@@ -377,6 +401,15 @@ pub fn build(b: *std.Build) void {
         \\pub const child_report_rights_then_fault = @embedFile("child_report_rights_then_fault.elf");
         \\pub const child_spawn_threads_then_transfer_fh = @embedFile("child_spawn_threads_then_transfer_fh.elf");
         \\pub const child_selfh_all_threads_fault = @embedFile("child_selfh_all_threads_fault.elf");
+        \\pub const child_iter1_b_restart_probe = @embedFile("child_iter1_b_restart_probe.elf");
+        \\pub const child_iter1_b_spawn_exit = @embedFile("child_iter1_b_spawn_exit.elf");
+        \\pub const child_iter1_b_parked_tids = @embedFile("child_iter1_b_parked_tids.elf");
+        \\pub const child_iter1_b_restart_loop_rights = @embedFile("child_iter1_b_restart_loop_rights.elf");
+        \\pub const child_iter1_c_delay_server = @embedFile("child_iter1_c_delay_server.elf");
+        \\pub const child_iter1_c_gated_counter = @embedFile("child_iter1_c_gated_counter.elf");
+        \\pub const child_iter1_c_late_recv = @embedFile("child_iter1_c_late_recv.elf");
+        \\pub const child_iter1_c_reply_clears = @embedFile("child_iter1_c_reply_clears.elf");
+        \\pub const child_iter1_c_full_table_receiver = @embedFile("child_iter1_c_full_table_receiver.elf");
         \\
     );
 

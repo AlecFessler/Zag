@@ -86,40 +86,42 @@ pub fn main(pv: u64) void {
 
     // MMIO invalid_{read,write,execute}: device is exclusively transferred
     // to each child; on child death the handle returns up to us with a
-    // fresh handle id, so we re-scan per iteration.
-    if (findMmioDevice(view) != 0) {
-        {
-            const dev = findMmioDevice(view);
-            const reason = runMmioChild(view, children.child_mmio_invalid_read, dev);
-            if (reason != .invalid_read) {
-                t.failWithVal("§3.2 mmio invalid_read", @intFromEnum(perm_view.CrashReason.invalid_read), @intFromEnum(reason));
+    // fresh handle id, so we re-scan per iteration. Hard-fail the test
+    // if no MMIO device is available — silently skipping the MMIO cases
+    // would hide coverage regressions.
+    _ = t.requireMmioDevice(view, "§3.2");
+
+    {
+        const dev = findMmioDevice(view);
+        const reason = runMmioChild(view, children.child_mmio_invalid_read, dev);
+        if (reason != .invalid_read) {
+            t.failWithVal("§3.2 mmio invalid_read", @intFromEnum(perm_view.CrashReason.invalid_read), @intFromEnum(reason));
+            passed = false;
+        }
+    }
+    {
+        const dev = findMmioDevice(view);
+        if (dev == 0) {
+            t.fail("§3.2 mmio device not returned");
+            passed = false;
+        } else {
+            const reason = runMmioChild(view, children.child_mmio_invalid_write, dev);
+            if (reason != .invalid_write) {
+                t.failWithVal("§3.2 mmio invalid_write", @intFromEnum(perm_view.CrashReason.invalid_write), @intFromEnum(reason));
                 passed = false;
             }
         }
-        {
-            const dev = findMmioDevice(view);
-            if (dev == 0) {
-                t.fail("§3.2 mmio device not returned");
+    }
+    {
+        const dev = findMmioDevice(view);
+        if (dev == 0) {
+            t.fail("§3.2 mmio device not returned");
+            passed = false;
+        } else {
+            const reason = runMmioChild(view, children.child_mmio_invalid_execute, dev);
+            if (reason != .invalid_execute) {
+                t.failWithVal("§3.2 mmio invalid_execute", @intFromEnum(perm_view.CrashReason.invalid_execute), @intFromEnum(reason));
                 passed = false;
-            } else {
-                const reason = runMmioChild(view, children.child_mmio_invalid_write, dev);
-                if (reason != .invalid_write) {
-                    t.failWithVal("§3.2 mmio invalid_write", @intFromEnum(perm_view.CrashReason.invalid_write), @intFromEnum(reason));
-                    passed = false;
-                }
-            }
-        }
-        {
-            const dev = findMmioDevice(view);
-            if (dev == 0) {
-                t.fail("§3.2 mmio device not returned");
-                passed = false;
-            } else {
-                const reason = runMmioChild(view, children.child_mmio_invalid_execute, dev);
-                if (reason != .invalid_execute) {
-                    t.failWithVal("§3.2 mmio invalid_execute", @intFromEnum(perm_view.CrashReason.invalid_execute), @intFromEnum(reason));
-                    passed = false;
-                }
             }
         }
     }

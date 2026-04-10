@@ -10,9 +10,11 @@ const t = lib.testing;
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Spawn child_send_self_no_kill — it replies with HANDLE_SELF without kill right.
+    // Spawn child_send_self_then_recv — it replies with HANDLE_SELF (send_words+grant,
+    // no kill right) then blocks on a second recv so we can do a round-trip
+    // ipc_call through h1 AFTER revoking h2 to prove the child is still alive.
     const child_rights = perms.ProcessRights{ .spawn_thread = true };
-    const h1: u64 = @bitCast(@as(i64, syscall.proc_create(@intFromPtr(children.child_send_self_no_kill.ptr), children.child_send_self_no_kill.len, child_rights.bits())));
+    const h1: u64 = @bitCast(@as(i64, syscall.proc_create(@intFromPtr(children.child_send_self_then_recv.ptr), children.child_send_self_then_recv.len, child_rights.bits())));
 
     // Call child — get second handle without kill right.
     var reply: syscall.IpcMessage = .{};
@@ -39,14 +41,12 @@ pub fn main(pv: u64) void {
         }
     }
 
-    // Verify child is still alive via h1 (original handle with kill right).
-    var h1_alive = false;
-    for (0..128) |i| {
-        if (view[i].handle == h1 and view[i].entry_type == perm_view.ENTRY_TYPE_PROCESS) {
-            h1_alive = true;
-            break;
-        }
-    }
+    // Direct liveness check: do an ipc_call round-trip through h1. If the
+    // child were dead, this would return E_BADHANDLE (§2.11.9); a successful
+    // round-trip proves the revoke on h2 did not kill the child.
+    var probe_reply: syscall.IpcMessage = .{};
+    const probe_rc = syscall.ipc_call(h1, &.{}, &probe_reply);
+    const h1_alive = probe_rc == 0;
 
     if (!h2_found and h1_alive) {
         t.pass("§2.3.16");

@@ -25,8 +25,10 @@ pub fn main(pv: u64) void {
     // Mid receives SHM, spawns grandchild, then receives device, then exits.
     // Mid becomes zombie (has grandchild). Device return should skip zombie mid → root.
 
-    // Prepare child_exit ELF in SHM for child_spawner_device to spawn.
-    const elf = children.child_exit;
+    // Prepare child_sleep ELF in SHM for child_spawner_device to spawn.
+    // Use child_sleep (not child_exit) so the grandchild is guaranteed alive
+    // when mid exits, making mid genuinely a zombie.
+    const elf = children.child_sleep;
     const elf_pages = (elf.len + 4095) / 4096;
     const shm_size = (elf_pages + 1) * 4096;
     const shm_rights = perms.SharedMemoryRights{ .read = true, .write = true, .grant = true };

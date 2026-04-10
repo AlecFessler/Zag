@@ -486,9 +486,18 @@ fn sysThreadCreate(entry_addr: u64, arg: u64, num_stack_pages_u64: u64) i64 {
         return E_MAXCAP;
     };
 
-    // If external fault handler, also insert into handler's perm table
+    // If external fault handler, also insert into handler's perm table.
+    // §2.12.5: the handle MUST be inserted; if the handler's table is full,
+    // roll back the new thread and return E_MAXCAP so userspace observes
+    // the failure instead of silently getting an unmanaged thread.
     if (proc.fault_handler_proc) |handler| {
-        _ = handler.insertThreadHandle(thread, ThreadHandleRights.full) catch {};
+        if (handler.insertThreadHandle(thread, ThreadHandleRights.full)) |_| {
+            // OK
+        } else |_| {
+            proc.removePerm(handle_id) catch {};
+            thread.deinit();
+            return E_MAXCAP;
+        }
     }
 
     sched.enqueueOnCore(arch.coreID(), thread);
@@ -1256,6 +1265,13 @@ fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modified_r
                 pending.ipc_server = null;
                 server.msg_box.lock.unlock();
             }
+            // Scrub any residual entries for `pending` from our own
+            // fault_box (the handler's box). endPendingReplyLocked above
+            // cleared the pending_reply slot, but a re-enqueued or queued
+            // entry could remain if the thread was handled in a nested
+            // context. Mirror what target.fault_box / msg_box scrubbing
+            // does in the intra-process case.
+            process_mod.scrubFromFaultBoxPub(&proc.fault_box, pending);
             pending.deinit();
         },
         FAULT_RESUME, FAULT_RESUME_MODIFIED => {
@@ -1296,13 +1312,18 @@ fn sysFaultReadMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64 {
     const buf_end = std.math.add(u64, buf_ptr, len) catch return E_BADADDR;
     if (!address.AddrSpacePartition.user.contains(buf_end -| 1)) return E_BADADDR;
 
-    // Read from target process's virtual address space via physmap
+    // Read from target process's virtual address space via physmap.
+    // Pre-fault both sides: demand-page the target page so debuggers can
+    // read uncommitted-yet-reserved pages, and demand-page the caller's
+    // destination so a ring-0 @memcpy doesn't take a user fault.
     var remaining = len;
     var src_addr = vaddr;
     var dst_addr = buf_ptr;
     while (remaining > 0) {
         const page_offset = src_addr & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_offset);
+        target.vmm.demandPage(VAddr.fromInt(src_addr), false, false) catch {};
+        proc.vmm.demandPage(VAddr.fromInt(dst_addr), true, false) catch {};
         const page_paddr = arch.resolveVaddr(target.addr_space_root, VAddr.fromInt(src_addr)) orelse return E_BADADDR;
         const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_offset;
         const src: [*]const u8 = @ptrFromInt(physmap_addr);
@@ -1331,13 +1352,18 @@ fn sysFaultWriteMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64 {
     const buf_end = std.math.add(u64, buf_ptr, len) catch return E_BADADDR;
     if (!address.AddrSpacePartition.user.contains(buf_end -| 1)) return E_BADADDR;
 
-    // Write to target process's virtual address space via physmap (bypasses page perms)
+    // Write to target process's virtual address space via physmap (bypasses page perms).
+    // Pre-fault both sides: demand-page the target page (even uncommitted
+    // pages within a reservation) and the caller's source buffer so
+    // ring-0 @memcpy never takes a user fault.
     var remaining = len;
     var dst_addr = vaddr;
     var src_addr = buf_ptr;
     while (remaining > 0) {
         const page_offset = dst_addr & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_offset);
+        target.vmm.demandPage(VAddr.fromInt(dst_addr), true, false) catch {};
+        proc.vmm.demandPage(VAddr.fromInt(src_addr), false, false) catch {};
         const page_paddr = arch.resolveVaddr(target.addr_space_root, VAddr.fromInt(dst_addr)) orelse return E_BADADDR;
         const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_offset;
         const src: [*]const u8 = @ptrFromInt(src_addr);
@@ -1452,8 +1478,8 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
             return E_OK;
         },
         .process => |proc_ptr| {
-            sender_proc.perm_lock.unlock();
             if (handle_val == 0) {
+                sender_proc.perm_lock.unlock();
                 // Sending HANDLE_SELF: gives recipient a process handle to the sender.
                 const granted_u16: u16 = @truncate(rights_val);
                 const granted_phr: ProcessHandleRights = @bitCast(granted_u16);
@@ -1476,6 +1502,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                     sender_proc.fault_handler_proc = target_proc;
                     sender_proc.perm_lock.lock();
                     const self_rights = sender_proc.perm_table[0].processRights();
+                    sender_proc.had_self_fault_handler = self_rights.fault_handler;
                     var new_rights = self_rights;
                     new_rights.fault_handler = false;
                     sender_proc.perm_table[0].rights = @bitCast(new_rights);
@@ -1485,7 +1512,24 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
 
                     // Link sender into target's fault_handler_targets list
                     // so target's death can revert sender to self-handling.
-                    target_proc.linkFaultHandlerTarget(sender_proc);
+                    // If target died in the window between our writes above
+                    // and now, its cleanupPhase1 has already walked an empty
+                    // list and will never unlink us. Roll back the transfer:
+                    // restore sender's slot-0 fault_handler bit and clear
+                    // fault_handler_proc so sender goes back to self-handling.
+                    if (!target_proc.linkFaultHandlerTarget(sender_proc)) {
+                        sender_proc.lock.lock();
+                        sender_proc.fault_handler_proc = null;
+                        sender_proc.perm_lock.lock();
+                        const r = sender_proc.perm_table[0].processRights();
+                        var rr = r;
+                        rr.fault_handler = true;
+                        sender_proc.perm_table[0].rights = @bitCast(rr);
+                        sender_proc.syncUserView();
+                        sender_proc.perm_lock.unlock();
+                        sender_proc.lock.unlock();
+                        return E_INVAL;
+                    }
 
                     // Check if target already has a handle to sender, add fault_handler bit
                     target_proc.perm_lock.lock();
@@ -1543,15 +1587,25 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                 };
                 return E_OK;
             }
-            if (!src_entry.processHandleRights().grant) return E_PERM;
+            // perm_lock still held — prevents concurrent revoke/decRef
+            // from racing with the refcount bump below (TOCTOU mirror
+            // of the SHM arm above).
+            if (!src_entry.processHandleRights().grant) {
+                sender_proc.perm_lock.unlock();
+                return E_PERM;
+            }
             const granted_u16: u16 = @truncate(rights_val);
-            if (!isSubset(granted_u16, src_entry.rights)) return E_PERM;
+            if (!isSubset(granted_u16, src_entry.rights)) {
+                sender_proc.perm_lock.unlock();
+                return E_PERM;
+            }
             const new_entry = PermissionEntry{
                 .handle = 0,
                 .object = .{ .process = proc_ptr },
                 .rights = granted_u16,
             };
             _ = @atomicRmw(u32, &proc_ptr.handle_refcount, .Add, 1, .acq_rel);
+            sender_proc.perm_lock.unlock();
             _ = target_proc.insertPerm(new_entry) catch {
                 _ = @atomicRmw(u32, &proc_ptr.handle_refcount, .Sub, 1, .acq_rel);
                 return E_MAXCAP;
@@ -1821,6 +1875,13 @@ fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
     const recv_blocking = (r14 & 0x2) != 0;
     const reply_word_count: u3 = @truncate((r14 >> 2) & 0x7);
     const reply_cap_transfer = (r14 & 0x20) != 0;
+
+    // §4.16.11: cap_transfer requires word_count >= 2 (payload carries
+    // handle+rights in the last two words). Reject early before touching
+    // msg_box state.
+    if (reply_cap_transfer and reply_word_count < 2) {
+        return .{ .rax = E_INVAL };
+    }
 
     proc.msg_box.lock.lock();
 

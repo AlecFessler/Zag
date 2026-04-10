@@ -57,10 +57,19 @@ pub fn main(pv: u64) void {
 
     var buf: [4]u8 = .{ 0x42, 0x42, 0x42, 0x42 };
     // Write 4 bytes to the faulting child's RIP — guaranteed mapped code page.
-    // Note: code pages are typically read-only; with physmap-bypass write the
-    // kernel can still write through, but the test only verifies the syscall succeeds.
+    // Code pages are read-only in the child; fault_write_mem bypasses via physmap.
     const write_ret = syscall.fault_write_mem(proc_handle, fault_msg.rip, @intFromPtr(&buf), 4);
-    t.expectEqual("§4.36.1", E_OK, write_ret);
+    t.expectEqual("§4.36.1 rc", E_OK, write_ret);
+
+    // Read the bytes back and verify the pattern actually landed.
+    var check: [4]u8 = .{ 0, 0, 0, 0 };
+    const read_ret = syscall.fault_read_mem(proc_handle, fault_msg.rip, @intFromPtr(&check), 4);
+    t.expectEqual("§4.36.1 readback rc", E_OK, read_ret);
+    if (check[0] == 0x42 and check[1] == 0x42 and check[2] == 0x42 and check[3] == 0x42) {
+        t.pass("§4.36.1 bytes landed");
+    } else {
+        t.fail("§4.36.1 readback mismatch");
+    }
 
     syscall.shutdown();
 }

@@ -46,7 +46,7 @@ The user half of the virtual address space is split into two zones. The lower AS
 
 **§2.1.37** Thread entry `field0` is the thread's stable kernel-assigned thread id (`tid`, u64).
 
-**§2.1.38** Thread entry `field1` = 0 (reserved).
+**§2.1.38** Thread entry `field1` exposes the fault-handler exclude flags: bit 0 = `exclude_oneshot`, bit 1 = `exclude_permanent`. All other bits are reserved (zero). These flags let a userspace fault handler observe the result of `fault_set_thread_mode` and `fault_reply` with `FAULT_EXCLUDE_*` flags.
 
 **§2.1.39** The user permissions view is kept in sync with the kernel permissions table.
 
@@ -121,7 +121,7 @@ A thread is a unit of execution belonging to a process. All threads within a pro
 
 **§2.4.10** `thread_suspend` on a `.ready` thread removes it from the run queue and enters `.suspended`.
 
-**§2.4.11** `thread_suspend` on a `.faulted` thread returns `E_BUSY`.
+**§2.4.11** `thread_suspend` on a `.faulted` or `.blocked` thread returns `E_BUSY`. A `.blocked` thread (waiting on a futex or IPC) can be suspended after it leaves `.blocked` by retrying the call.
 
 **§2.4.12** `thread_suspend` on an already-`.suspended` thread returns `E_BUSY`.
 

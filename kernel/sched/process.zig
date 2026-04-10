@@ -88,6 +88,11 @@ pub const Process = struct {
     fault_handler_targets_head: ?*Process = null,
     // Intrusive next-pointer for fault_handler_targets list of OUR handler.
     fault_handler_targets_next: ?*Process = null,
+    // Whether slot 0's fault_handler bit was set at the moment the
+    // relationship was established. releaseFaultHandler uses this to
+    // decide whether restoring the bit is semantically valid — we never
+    // want to synthesize a right the sender didn't have to begin with.
+    had_self_fault_handler: bool = true,
 
     pub const MAX_THREADS = 64;
     pub const MAX_CHILDREN = 64;
@@ -136,6 +141,11 @@ pub const Process = struct {
     pub fn insertThreadHandleAtSlot(self: *Process, slot: usize, thread: *Thread, rights: ThreadHandleRights) void {
         self.perm_lock.lock();
         defer self.perm_lock.unlock();
+        // Caller must guarantee the target slot is empty — initPermTable
+        // leaves slots 1..MAX_PERMS-1 empty, which is why this works for
+        // the initial thread at slot 1. If a future caller tries to
+        // overwrite an occupied slot we'd silently drop a reference.
+        std.debug.assert(self.perm_table[slot].object == .empty);
         const handle_id = self.handle_counter;
         self.handle_counter += 1;
         self.perm_table[slot] = .{
@@ -192,12 +202,17 @@ pub const Process = struct {
         self.syncUserView();
         self.perm_lock.unlock();
 
-        // Clear target's pointer back to handler and restore fault_handler bit on slot 0.
+        // Clear target's pointer back to handler and restore fault_handler
+        // bit on slot 0 — but only if the target originally had the bit.
+        // This prevents synthesizing a right that the sender didn't hold
+        // at the moment of the fault_handler transfer.
         target.perm_lock.lock();
         target.fault_handler_proc = null;
-        var self_rights = target.perm_table[0].processRights();
-        self_rights.fault_handler = true;
-        target.perm_table[0].rights = @bitCast(self_rights);
+        if (target.had_self_fault_handler) {
+            var self_rights = target.perm_table[0].processRights();
+            self_rights.fault_handler = true;
+            target.perm_table[0].rights = @bitCast(self_rights);
+        }
         target.syncUserView();
         target.perm_lock.unlock();
 
@@ -286,17 +301,25 @@ pub const Process = struct {
     }
 
     /// Link a target process into this handler's fault_handler_targets list.
-    pub fn linkFaultHandlerTarget(self: *Process, target: *Process) void {
+    /// Returns true on success; returns false if `self` (the handler) is no
+    /// longer alive, meaning the caller must roll the link back (revert
+    /// target->fault_handler_proc to self-handling). This races with
+    /// cleanupPhase1 of `self`; holding self.lock during the alive check
+    /// serializes us with kill() which transitions alive→false under the
+    /// same lock.
+    pub fn linkFaultHandlerTarget(self: *Process, target: *Process) bool {
         self.lock.lock();
         defer self.lock.unlock();
+        if (!self.alive) return false;
         // Avoid double-link
         var cur = self.fault_handler_targets_head;
         while (cur) |c| {
-            if (c == target) return;
+            if (c == target) return true;
             cur = c.fault_handler_targets_next;
         }
         target.fault_handler_targets_next = self.fault_handler_targets_head;
         self.fault_handler_targets_head = target;
+        return true;
     }
 
     /// Unlink a target from this handler's fault_handler_targets list.
@@ -937,9 +960,17 @@ pub const Process = struct {
         // Insert initial thread handle at slot 1
         self.insertThreadHandleAtSlot(1, thread, self.thread_handle_rights);
 
-        // If external fault handler, insert thread handle into handler's perm table
+        // If external fault handler, insert thread handle into handler's perm table.
+        // On E_MAXCAP (handler's table is full), fall back to self-fault-handling:
+        // revert the fault_handler relationship so the restarted process handles
+        // its own faults. Spec §2.6.35 / §2.12.5 require the thread handle to be
+        // inserted; if we can't, self-handling is the safe degradation.
         if (self.fault_handler_proc) |handler| {
-            _ = handler.insertThreadHandle(thread, ThreadHandleRights.full) catch {};
+            if (handler.insertThreadHandle(thread, ThreadHandleRights.full)) |_| {
+                // OK
+            } else |_| {
+                handler.releaseFaultHandler(self);
+            }
         }
 
         sched.enqueueOnCore(arch.coreID(), thread);
@@ -1281,6 +1312,18 @@ pub const Process = struct {
             p.lock.lock();
             defer p.lock.unlock();
             if (p.num_children >= MAX_CHILDREN) {
+                // INVARIANT: `proc` has been allocated and its initial
+                // thread created, but nothing outside this function
+                // references it yet (no scheduler dispatch, no parent
+                // children[] entry, no external handles). kill() runs
+                // the full teardown path, which is safe here precisely
+                // because of that invariant — no other CPU can observe
+                // proc and there are no cross-process references to
+                // reconcile. If future refactoring exposes `proc`
+                // earlier (e.g. adding it to parent.children before
+                // this check), this kill() call becomes incorrect; a
+                // dedicated early-teardown helper should be factored
+                // instead.
                 proc.kill(.none);
                 return error.TooManyChildren;
             }

@@ -37,8 +37,15 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
 
-    // Read the fault address from the first fault.
+    // Snapshot the RIP from the first fault. `fault_addr` for a page fault
+    // reports CR2 (the faulting data address) which is always 0 for a null
+    // deref — comparing that would be trivially equal regardless of whether
+    // the register state was actually preserved. RIP is the meaningful check
+    // because it reflects the faulting instruction pointer; if FAULT_RESUME
+    // leaves registers unchanged, the child re-executes the same instruction
+    // and faults again with the same RIP.
     const fault_msg1: *const syscall.FaultMessage = @ptrCast(@alignCast(&fault_buf));
+    const fault_rip1 = fault_msg1.rip;
     const fault_addr1 = fault_msg1.fault_addr;
 
     // Reply with FAULT_RESUME — register state unchanged, so the child should
@@ -61,13 +68,18 @@ pub fn main(pv: u64) void {
     }
 
     const fault_msg2: *const syscall.FaultMessage = @ptrCast(@alignCast(&fault_buf2));
+    const fault_rip2 = fault_msg2.rip;
     const fault_addr2 = fault_msg2.fault_addr;
 
-    // Same fault address confirms register state was unchanged.
-    if (fault_addr1 == fault_addr2) {
+    // Same RIP confirms register state was unchanged: the child re-executed
+    // the same faulting instruction. fault_addr is additionally checked as a
+    // sanity cross-check (both null derefs yield CR2 == 0).
+    if (fault_rip1 == fault_rip2 and fault_addr1 == fault_addr2) {
         t.pass("§2.12.25");
+    } else if (fault_rip1 != fault_rip2) {
+        t.failWithVal("§2.12.25 RIP changed after FAULT_RESUME", @bitCast(fault_rip1), @bitCast(fault_rip2));
     } else {
-        t.fail("§2.12.25 fault address changed after FAULT_RESUME");
+        t.fail("§2.12.25 fault_addr changed after FAULT_RESUME");
     }
 
     // Clean up: kill the faulting thread.

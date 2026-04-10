@@ -333,6 +333,14 @@ Scans all 128 slots, clears entries whose object pointer matches the given kerne
 
 After every mutation, the kernel writes all 128 entries to the user-visible view. The view is stored in physical pages mapped into the process's address space (read-only to userspace). The kernel writes via physmap using the stored `perm_view_phys` address.
 
+**Two wake channels.** There are two futex channels for observing permission-view changes, and they serve different roles:
+
+1. **Self-notification — slot-0 `field1` generation counter.** `syncUserView` bumps `perm_view_gen` on every mutation and writes it into slot 0's `field1` with release ordering, then futex-wakes that address. Threads within the owning process watch this address to block until *any* slot mutates. This is a broadcast channel scoped to the owning process.
+
+2. **Parent-observes-child — child-slot `field0`.** When a child process's state changes in a way the parent should observe (restart, death, fault — spec §2.6.27 and §2.6.29), the kernel writes the new `field0` (fault_reason / restart_count) into the parent's entry for the child and futex-wakes the parent's `field0` for that slot. Parents watch this address to block until a specific child's state changes.
+
+The two channels coexist: a restart of a child bumps both the parent's slot-0 `field1` (the parent saw *some* mutation) and the specific child-slot `field0` (that particular child changed state). Parents that only care about one child should prefer the child-slot `field0` wake; generic "something changed" observers use the slot-0 `field1` generation counter.
+
 ### UserViewEntry
 
 ```

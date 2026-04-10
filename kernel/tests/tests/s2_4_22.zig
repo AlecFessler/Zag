@@ -64,7 +64,6 @@ pub fn main(pv: u64) void {
         t.fail("§2.4.22 counter changed while suspended");
         syscall.shutdown();
     }
-    t.pass("§2.4.22 suspended not scheduled");
 
     // Resume the thread and verify it runs again.
     const resume_ret = syscall.thread_resume(handle);
@@ -77,16 +76,20 @@ pub fn main(pv: u64) void {
     for (0..20) |_| syscall.thread_yield();
 
     const after_resume = ctr_ptr.*;
-    if (after_resume > after_wait) {
-        t.pass("§2.4.22 resumes after unsuspend");
-    } else {
-        t.fail("§2.4.22 counter did not increment after resume");
-    }
 
     // Clean up.
     _ = syscall.thread_suspend(handle);
     for (0..5) |_| syscall.thread_yield();
     _ = syscall.thread_kill(handle);
+
+    // Single terminal pass/fail — the harness only reads the first PASS/FAIL
+    // line, so sub-asserts above must not call pass() (otherwise a later
+    // sub-fail would be masked).
+    if (after_resume > after_wait) {
+        t.pass("§2.4.22");
+    } else {
+        t.fail("§2.4.22 counter did not increment after resume");
+    }
 
     syscall.shutdown();
 }

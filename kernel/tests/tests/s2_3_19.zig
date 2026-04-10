@@ -5,7 +5,6 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const E_PERM: i64 = -2;
 const E_INVAL: i64 = -1;
 
 fn worker() void {
@@ -41,11 +40,13 @@ pub fn main(_: u64) void {
     var reply: syscall.IpcMessage = .{};
     const ret = syscall.ipc_call_cap(child_handle, &.{ thread_handle, thread_rights }, &reply);
 
-    // The kernel should reject the transfer with E_PERM or E_INVAL.
-    if (ret == E_PERM or ret == E_INVAL) {
+    // Kernel rejects thread-handle cap transfer in validateIpcSendRights via
+    // the `else` branch — the cap object is neither SHM nor process nor
+    // device_region, so E_INVAL is returned.
+    if (ret == E_INVAL) {
         t.pass("§2.3.19");
     } else {
-        t.failWithVal("§2.3.19", E_PERM, ret);
+        t.failWithVal("§2.3.19", E_INVAL, ret);
     }
     syscall.shutdown();
 }

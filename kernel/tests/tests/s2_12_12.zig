@@ -30,11 +30,22 @@ pub fn main(_: u64) void {
     }
 
     const fm: *const syscall.FaultMessage = @ptrCast(@alignCast(&fault_buf));
-    if (fm.fault_reason == FAULT_REASON_BREAKPOINT) {
-        t.pass("§2.12.12");
-    } else {
+    if (fm.fault_reason != FAULT_REASON_BREAKPOINT) {
         t.failWithVal("§2.12.12 fault_reason", FAULT_REASON_BREAKPOINT, @intCast(fm.fault_reason));
+        _ = syscall.fault_reply_simple(@bitCast(token), syscall.FAULT_KILL);
+        syscall.shutdown();
     }
+
+    // Second clause of §2.12.12: `fault_addr` contains the RIP at the time
+    // of the exception. Both `fault_addr` and `rip` are written by the
+    // kernel for #BP; they must match (both pointing at the int3 site).
+    if (fm.fault_addr != fm.rip) {
+        t.failWithVal("§2.12.12 fault_addr != rip", @bitCast(fm.rip), @bitCast(fm.fault_addr));
+        _ = syscall.fault_reply_simple(@bitCast(token), syscall.FAULT_KILL);
+        syscall.shutdown();
+    }
+
+    t.pass("§2.12.12");
 
     _ = syscall.fault_reply_simple(@bitCast(token), syscall.FAULT_KILL);
     syscall.shutdown();
