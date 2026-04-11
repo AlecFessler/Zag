@@ -589,15 +589,17 @@ Delegates to `pq.dequeue()`, which returns the highest-priority ready thread, or
 
 ### PMU Save/Restore Hooks
 
-When the scheduler actually switches threads (step 12 of `schedTimerHandler` and the IPC fast-path `switchToThread`), a pair of null-guarded calls bracket the `arch.switchTo`:
+When the scheduler actually switches threads (step 12 of `schedTimerHandler` and the IPC fast-path `switchToThread`), a pair of null-guarded calls bracket the `arch.switchTo` — both on the *outgoing* side of the switch:
 
 ```
 if (outgoing.pmu_state) |st| arch.pmuSave(st);
-arch.switchTo(next);
-if (next.pmu_state) |st| arch.pmuRestore(st);
+if (next.pmu_state)     |st| arch.pmuRestore(st);
+arch.switchTo(next);   // never returns — jmp's into next's interrupt frame
 ```
 
-Both checks are a single load-and-compare on the hot path. Threads without PMU state (the common case) pay only the null comparison and never touch the PMU hardware. Threads with PMU state round-trip their counter values through arch-specific MSRs on every context switch; this is the cost of making counts per-thread rather than per-core (§2.14.10). The save is sequenced *before* the switch so the final hardware counter values are captured under the outgoing thread's identity; the restore is sequenced *after* the switch so the counters are re-enabled under the incoming thread's identity with no window of mis-accounting.
+Both checks are a single load-and-compare on the hot path. Threads without PMU state (the common case) pay only the null comparison and never touch the PMU hardware. Threads with PMU state round-trip their counter values through arch-specific MSRs on every context switch; this is the cost of making counts per-thread rather than per-core (§2.14.10).
+
+`arch.switchTo` does not return to this frame — on x64 it mov's RSP to the incoming thread's interrupt frame and jmp's to `interruptStubEpilogue`, which iret's into the incoming thread. Any code placed after `switchTo` would be dead on the incoming side and would only run the next time the previously outgoing thread resumes (on its own core). PMU state is per-core MSR state, so the restore must happen *before* the switch, while the kernel is still running on the core the incoming thread will run on immediately. The save is sequenced first so hardware is quiet (the save zeroes `IA32_PERF_GLOBAL_CTRL`) before programming the incoming thread's counters.
 
 ### IPI on Thread Ready
 

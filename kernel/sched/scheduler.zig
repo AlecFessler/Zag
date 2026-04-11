@@ -70,17 +70,24 @@ pub fn coreRunning(thread: *Thread) ?u64 {
 /// null-guarded calls described in systems.md §6 "PMU Save/Restore Hooks"
 /// so every `switchTo` site in this file goes through the same pair.
 ///
-/// The save must fire under the outgoing thread's identity so the final
-/// hardware counter values are captured before the context switch, and
-/// the restore must fire under the incoming thread's identity so the
-/// counters are re-enabled with no mis-accounting window. `arch.switchTo`
-/// does not return to this frame — it jumps into the incoming thread's
-/// kernel stack. The "return" side of the restore is therefore actually
-/// executed the next time the *previously outgoing* thread resumes here.
+/// `arch.switchTo` does not return to this frame — on x64 it mov's RSP to
+/// the incoming thread's interrupt frame and jmp's to `interruptStubEpilogue`,
+/// which iret's into the incoming thread's userspace. Any code placed after
+/// `switchTo` is therefore dead on the incoming side and would only run the
+/// next time the *previously outgoing* thread resumes — on its own core, not
+/// the incoming thread's core. PMU state is per-core MSR state, so the
+/// restore must happen before the switch, while we are still on the core
+/// that the incoming thread will run on immediately.
+///
+/// Ordering: save the outgoing thread's counter values first (this also
+/// zeroes `IA32_PERF_GLOBAL_CTRL`, so hardware is quiet), then program the
+/// incoming thread's counters via restore, then jump into the incoming
+/// thread via `switchTo`. The iret at the end of `switchTo` resumes the
+/// incoming thread with its counters already running.
 inline fn switchToWithPmu(outgoing: *Thread, next: *Thread) void {
     if (outgoing.pmu_state) |st| arch.pmuSave(st);
-    arch.switchTo(next);
     if (next.pmu_state) |st| arch.pmuRestore(st);
+    arch.switchTo(next);
 }
 
 /// Remove `thread` from any core's run queue. Used when a remote thread is
