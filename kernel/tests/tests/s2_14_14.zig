@@ -40,7 +40,12 @@ pub fn main(pv: u64) void {
             // must be dead (not restarted) and the reason is the one
             // recorded by §3.11 / §2.12.7.
             const reason = e.processCrashReason();
-            _ = reason; // Spec only requires "killed" — don't over-constrain.
+            if (reason != perm_view.CrashReason.pmu_overflow) {
+                t.failWithVal("§2.14.14 wrong crash reason",
+                    @intFromEnum(perm_view.CrashReason.pmu_overflow),
+                    @intFromEnum(reason));
+                syscall.shutdown();
+            }
             t.pass("§2.14.14");
             syscall.shutdown();
         }
