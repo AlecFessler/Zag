@@ -49,26 +49,30 @@ pub fn main(_: u64) void {
     }
 
     // After pmu_start + pmu_stop round trip, the state should be freed
-    // and subsequent pmu_read must again return E_INVAL.
+    // and subsequent pmu_read must again return E_INVAL. Calling pmu_start
+    // successfully here also proves the thread remains usable after the
+    // earlier E_INVAL responses (indirect evidence of no leaked bookkeeping).
     var info: syscall.PmuInfo = undefined;
     _ = syscall.pmu_info(@intFromPtr(&info));
     if (info.num_counters > 0) {
-        var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
-        if (syscall.pmu_start(worker_h, @intFromPtr(&cfg), 1) != syscall.E_OK) {
-            t.fail("§2.14.8 pmu_start");
-            _ = syscall.thread_kill(worker_h);
-            syscall.shutdown();
-        }
-        if (syscall.pmu_stop(worker_h) != syscall.E_OK) {
-            t.fail("§2.14.8 pmu_stop after start");
-            _ = syscall.thread_kill(worker_h);
-            syscall.shutdown();
-        }
-        const read_after = syscall.pmu_read(worker_h, @intFromPtr(&sample));
-        if (read_after != syscall.E_INVAL) {
-            t.failWithVal("§2.14.8 pmu_read after stop", syscall.E_INVAL, read_after);
-            _ = syscall.thread_kill(worker_h);
-            syscall.shutdown();
+        if (syscall.pickSupportedEvent(info)) |evt| {
+            var cfg = syscall.PmuCounterConfig{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
+            if (syscall.pmu_start(worker_h, @intFromPtr(&cfg), 1) != syscall.E_OK) {
+                t.fail("§2.14.8 pmu_start");
+                _ = syscall.thread_kill(worker_h);
+                syscall.shutdown();
+            }
+            if (syscall.pmu_stop(worker_h) != syscall.E_OK) {
+                t.fail("§2.14.8 pmu_stop after start");
+                _ = syscall.thread_kill(worker_h);
+                syscall.shutdown();
+            }
+            const read_after = syscall.pmu_read(worker_h, @intFromPtr(&sample));
+            if (read_after != syscall.E_INVAL) {
+                t.failWithVal("§2.14.8 pmu_read after stop", syscall.E_INVAL, read_after);
+                _ = syscall.thread_kill(worker_h);
+                syscall.shutdown();
+            }
         }
     }
 

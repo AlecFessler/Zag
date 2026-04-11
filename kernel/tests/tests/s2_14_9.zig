@@ -26,20 +26,31 @@ fn shortLivedWorker() void {
 ///       gone — a natural exit causes the kernel to clear the slot, so
 ///       slot-disappearance is a robust "thread has actually exited" proof.
 /// Only once the exit is observed do we proceed to spin up the next worker.
-/// After 32 full create+start+exit cycles, if PMU state had leaked, the
-/// allocator would be exhausted — successful completion therefore proves
-/// auto-release.
+///
+/// Round count: the PmuStateAllocator is a SlabAllocator with a chunk size
+/// of 64 entries (kernel/sched/pmu.zig). We run 128 full create+start+exit
+/// cycles — twice the slab chunk size — so that a naive leak would either
+/// exhaust the first chunk or force allocation of a new chunk that would
+/// itself never be reclaimed. 128 rounds keeps the test duration bounded
+/// under QEMU while still crossing two chunk boundaries. A higher round
+/// count would catch a slower leak but increase test latency; this is the
+/// best available indirect evidence without kernel allocator-counter
+/// instrumentation exposed to userspace.
 pub fn main(pv: u64) void {
     var info: syscall.PmuInfo = undefined;
     if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or info.num_counters == 0) {
         t.pass("§2.14.9");
         syscall.shutdown();
     }
+    const evt = syscall.pickSupportedEvent(info) orelse {
+        t.pass("§2.14.9");
+        syscall.shutdown();
+    };
 
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
     var i: u64 = 0;
-    while (i < 32) : (i += 1) {
+    while (i < 128) : (i += 1) {
         @atomicStore(u64, &worker_ready, 0, .seq_cst);
         @atomicStore(u64, &worker_done, 0, .seq_cst);
 
@@ -53,7 +64,7 @@ pub fn main(pv: u64) void {
         // Wait until the worker is definitely running before starting PMU.
         while (@atomicLoad(u64, &worker_ready, .seq_cst) == 0) syscall.thread_yield();
 
-        var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
+        var cfg = syscall.PmuCounterConfig{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
         const start_rc = syscall.pmu_start(worker_h, @intFromPtr(&cfg), 1);
         // Race-tolerant: worker may already be in the done-window before we
         // issue pmu_start. Either E_OK (we started PMU on a live worker)
