@@ -2,6 +2,7 @@
 const lib = @import("lib");
 
 const perm_view = lib.perm_view;
+const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
@@ -50,7 +51,8 @@ pub fn main(pv: u64) void {
         if (existed) continue;
 
         // This is the new vCPU thread — verify it has full ThreadHandleRights.
-        if (view[i].rights == 0x07) {
+        const full_tr: u16 = @truncate(perms.ThreadHandleRights.full.bits());
+        if (view[i].rights == full_tr) {
             found_vcpu = true;
         }
         break;
