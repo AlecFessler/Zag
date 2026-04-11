@@ -419,10 +419,16 @@ fn pmuPmiHandler(ctx: *cpu.Context) void {
     );
 
     if (!delivered) {
-        // Step 6: no surviving handler — fall through to the same kill
-        // path the generic exception handler uses (§2.12.7 / §2.12.9).
+        // Step 6: no surviving handler — kill and halt. We must NOT return
+        // from the PMI handler on this path: returning would unwind through
+        // dispatchInterrupt and iret back to the killed thread's user RIP,
+        // letting it run freely until the next scheduler tick. Mirror the
+        // pattern in `exceptionHandler` (kernel/arch/x64/exceptions.zig) —
+        // enable interrupts so the next scheduler tick can dispatch another
+        // thread onto this core, and halt in place.
         thread.process.kill(.pmu_overflow);
-        return;
+        cpu.enableInterrupts();
+        cpu.halt();
     }
 
     // Step 7: yield so the scheduler picks a different thread; this
