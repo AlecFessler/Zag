@@ -427,9 +427,11 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_arg: 
     const elf_end = std.math.add(u64, elf_ptr, elf_len) catch return E_BADADDR;
     if (!address.AddrSpacePartition.user.contains(elf_end -| 1)) return E_BADADDR;
 
-    // Validate thread_rights — upper 4 bits must be 0
+    // Validate thread_rights — bit 3 is reserved for layout alignment and
+    // the upper 3 bits (5-7) are unused. Valid bits are suspend(0), resume(1),
+    // kill(2), pmu(4).
     const thr_rights_raw: u8 = @truncate(thread_rights_arg);
-    if (thr_rights_raw & 0xF8 != 0) return E_INVAL;
+    if (thr_rights_raw & 0xE8 != 0) return E_INVAL;
     const thr_rights: ThreadHandleRights = @bitCast(thr_rights_raw);
 
     if (max_priority_arg > 4) return E_INVAL;
