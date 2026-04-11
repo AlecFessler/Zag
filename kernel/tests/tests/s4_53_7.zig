@@ -46,8 +46,19 @@ pub fn main(_: u64) void {
         syscall.shutdown();
     }
 
-    // Unsupported event (mirrors §4.51.7).
-    var cfg_bad = syscall.PmuCounterConfig{ .event = @enumFromInt(99), .has_threshold = false, .overflow_threshold = 0 };
+    // Unsupported event (mirrors §4.51.7). Prefer a defined enum variant
+    // whose bit is clear in `supported_events` so we exercise the
+    // supported-events-bitmask check, not a separate enum-range check.
+    var unsupported: ?syscall.PmuEvent = null;
+    inline for (@typeInfo(syscall.PmuEvent).@"enum".fields) |f| {
+        const bit = @as(u64, 1) << f.value;
+        if ((info.supported_events & bit) == 0) {
+            unsupported = @enumFromInt(f.value);
+            break;
+        }
+    }
+    const bad_event = unsupported orelse @as(syscall.PmuEvent, @enumFromInt(99));
+    var cfg_bad = syscall.PmuCounterConfig{ .event = bad_event, .has_threshold = false, .overflow_threshold = 0 };
     const rc_event = syscall.pmu_reset(target, @intFromPtr(&cfg_bad), 1);
     if (rc_event != syscall.E_INVAL) {
         t.failWithVal("§4.53.7 bad event", syscall.E_INVAL, rc_event);
