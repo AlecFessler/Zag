@@ -23,7 +23,6 @@ pub const MmioOp = struct {
     reg: u4, // GPR index (destination for reads, source for register writes)
     value: u32, // Write value (from register or immediate)
     len: u8, // Total instruction length for RIP advancement
-    is_immediate: bool, // true = write value is an immediate, not from a register
 };
 
 // --- Guest virtual -> physical page table walk ---
@@ -60,17 +59,12 @@ fn guestVirtToPhys(vm: *const Vm, cr3: u64, vaddr: u64) ?u64 {
 }
 
 /// Read a u64 from guest physical memory via the VM's host RAM mapping.
+/// Delegates the bounds-checked guest-phys → host-VA translation to `Vm`
+/// so this module never touches `Vm`'s memory bookkeeping fields directly.
 fn readGuestPhysU64(vm: *const Vm, phys: u64) ?u64 {
-    if (phys + 8 > vm.guest_ram_size) return null;
-    const ptr: *const align(1) u64 = @ptrFromInt(vm.guest_ram_host_base + phys);
-    return ptr.*;
-}
-
-/// Read a slice from guest physical memory via the VM's host RAM mapping.
-fn readGuestPhysSlice(vm: *const Vm, phys: u64, len: u8) ?[]const u8 {
-    if (phys + len > vm.guest_ram_size) return null;
-    const ptr: [*]const u8 = @ptrFromInt(vm.guest_ram_host_base + phys);
-    return ptr[0..len];
+    const ptr = vm.guestPhysToHost(phys, 8) orelse return null;
+    const u64_ptr: *const align(1) u64 = @ptrCast(ptr);
+    return u64_ptr.*;
 }
 
 // --- Instruction fetch ---
@@ -84,14 +78,14 @@ fn fetchInsn(vm: *const Vm, cr0: u64, cr3: u64, rip: u64, buf: *[15]u8) ?u8 {
     const avail: u64 = 4096 - page_off;
     const first: u8 = @intCast(@min(15, avail));
 
-    const slice = readGuestPhysSlice(vm, phys, first) orelse return null;
+    const slice = vm.readGuestPhysSlice(phys, first) orelse return null;
     @memcpy(buf[0..first], slice);
 
     if (first < 15) {
         const next_vaddr = (rip & ~@as(u64, 0xFFF)) + 4096;
         const next_phys = if (cr0 & (1 << 31) == 0) next_vaddr else (guestVirtToPhys(vm, cr3, next_vaddr) orelse return first);
         const remaining: u8 = 15 - first;
-        if (readGuestPhysSlice(vm, next_phys, remaining)) |next_slice| {
+        if (vm.readGuestPhysSlice(next_phys, remaining)) |next_slice| {
             @memcpy(buf[first..15], next_slice);
             return 15;
         }
@@ -180,7 +174,6 @@ pub fn decode(vm: *const Vm, gs: *const GuestState) ?MmioOp {
                 .reg = reg_field,
                 .value = @truncate(readGpr(gs, reg_field)),
                 .len = i,
-                .is_immediate = false,
             };
         },
         // MOV r32, r/m32 -- MMIO read to register
@@ -192,7 +185,6 @@ pub fn decode(vm: *const Vm, gs: *const GuestState) ?MmioOp {
                 .reg = reg_field,
                 .value = 0,
                 .len = i,
-                .is_immediate = false,
             };
         },
         // MOV r/m32, imm32 -- MMIO write immediate
@@ -211,7 +203,6 @@ pub fn decode(vm: *const Vm, gs: *const GuestState) ?MmioOp {
                 .reg = 0,
                 .value = imm,
                 .len = i,
-                .is_immediate = true,
             };
         },
         // MOV r/m8, r8 -- MMIO write byte
@@ -221,7 +212,6 @@ pub fn decode(vm: *const Vm, gs: *const GuestState) ?MmioOp {
             .reg = reg_field,
             .value = @truncate(readGpr(gs, reg_field) & 0xFF),
             .len = i,
-            .is_immediate = false,
         },
         // MOV r8, r/m8 -- MMIO read byte
         0x8A => MmioOp{
@@ -230,7 +220,6 @@ pub fn decode(vm: *const Vm, gs: *const GuestState) ?MmioOp {
             .reg = reg_field,
             .value = 0,
             .len = i,
-            .is_immediate = false,
         },
         else => null,
     };

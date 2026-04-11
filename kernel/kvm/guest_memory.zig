@@ -36,19 +36,6 @@ pub const GuestMemory = struct {
         self.num_regions += 1;
     }
 
-    /// Check if a guest physical address falls within a mapped region.
-    pub fn findRegion(self: *const GuestMemory, guest_phys: u64) ?*const GuestRegion {
-        for (self.regions[0..self.num_regions]) |*region| {
-            if (!region.active) continue;
-            if (guest_phys >= region.guest_phys_start and
-                guest_phys < region.guest_phys_start + region.size)
-            {
-                return region;
-            }
-        }
-        return null;
-    }
-
     /// Tear down all guest memory mappings and free allocated pages.
     pub fn deinit(self: *GuestMemory, arch_structures: PAddr) void {
         // Unmap all guest physical pages from arch structures

@@ -3,8 +3,9 @@
 /// APIC registers are memory-mapped at base 0xFEE00000, 4 KiB region.
 /// All registers are 32-bit, aligned on 128-bit (16-byte) boundaries.
 /// Table 13-1: Local APIC Register Address Map.
+const zag = @import("zag");
 
-const Ioapic = @import("ioapic.zig").Ioapic;
+const Ioapic = zag.kvm.ioapic.Ioapic;
 
 pub const APIC_BASE: u64 = 0xFEE00000;
 
@@ -80,7 +81,7 @@ pub const Lapic = struct {
 
     /// Handle MMIO read at offset from APIC base 0xFEE00000.
     /// All APIC registers are 32-bit, 128-bit aligned (Table 13-1).
-    pub fn read(self: *const Lapic, offset: u32) u32 {
+    pub fn mmioRead(self: *const Lapic, offset: u32) u32 {
         return switch (offset) {
             REG_ID => self.apic_id,
             REG_VERSION => 0x00050014, // Version 0x14, Max LVT Entry = 5 (6 entries)
@@ -138,7 +139,7 @@ pub const Lapic = struct {
     }
 
     /// Handle MMIO write at offset from APIC base 0xFEE00000.
-    pub fn write(self: *Lapic, offset: u32, value: u32) void {
+    pub fn mmioWrite(self: *Lapic, offset: u32, value: u32) void {
         switch (offset) {
             REG_ID => self.apic_id = value & 0xFF000000, // Only bits 31:24 writable
             REG_TPR => self.tpr = value & 0xFF,

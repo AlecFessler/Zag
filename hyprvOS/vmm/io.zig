@@ -53,7 +53,6 @@ pub var pic2_vector_base: u8 = 0x70; // Default: IRQ8 → INT 0x70
 
 // PIT (8254) emulation state
 // PIT frequency: 1,193,182 Hz ≈ 838.1 ns per tick
-const PIT_FREQ_HZ: u64 = 1193182;
 const PIT_NS_PER_TICK: u64 = 838; // ~838.1 ns
 
 // Channel 0 state

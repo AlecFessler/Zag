@@ -133,7 +133,7 @@ Process {
     restart_count: u16                     -- number of restarts (wraps on overflow)
     thread_handle_rights: ThreadHandleRights -- rights mask for thread handles in this process's own perm table
     max_thread_priority: Priority           -- ceiling priority for threads in this process
-    vm: ?*kvm.Vm = null                     -- owned VM, if any (at most one per process)
+    vm: ?*kvm.vm.Vm = null                  -- owned VM, if any (at most one per process)
 }
 ```
 
@@ -1181,8 +1181,8 @@ In debug mode, tracks net allocations and asserts zero on `deinit`.
 - `DeviceRegionSlab`: `SlabAllocator(DeviceRegion, false, 0, 32)` -- device region objects.
 - `ProcessAllocator`: `SlabAllocator(Process, false, 0, 64)` -- process structs.
 - `ThreadAllocator`: `SlabAllocator(Thread, false, 0, 64)` -- thread structs.
-- `VmAllocator`: `SlabAllocator(kvm.Vm, false, 0, 64)` -- VM structs.
-- `VCpuAllocator`: `SlabAllocator(kvm.VCpu, false, 0, 64)` -- vCPU structs.
+- `VmAllocator`: `SlabAllocator(kvm.vm.Vm, false, 0, 64)` -- VM structs.
+- `VCpuAllocator`: `SlabAllocator(kvm.vcpu.VCpu, false, 0, 64)` -- vCPU structs.
 
 ### Heap Allocator
 
@@ -1685,6 +1685,14 @@ The Vm is not a perm table entry type — ownership is implicit via `proc.vm`. N
 
 `lapic` and `ioapic` cross-link in `vm_create`: `ioapic.init(&vm.lapic)` so the IOAPIC can deliver interrupts, and `lapic.init(&vm.ioapic)` so the LAPIC can notify the IOAPIC on EOI for level-triggered IRQs.
 
+The `Vm` struct exposes a small set of `pub fn` methods so callers (vcpu.zig, exit_handler.zig, mmio_decode.zig) never reach into the LAPIC/IOAPIC fields directly:
+- `exitBox()` — returns `*VmExitBox`. Used so callers don't need to know the box lives inside `Vm`.
+- `injectExternal(vector)` — wraps `lapic.injectExternal`. Single entry for routing an IRQ vector into the LAPIC IRR.
+- `tickInterruptControllers(elapsed_ns)` — wraps `lapic.tick`. Future timers (HPET/PIT) hook in here.
+- `deliverPendingInterrupts(*GuestState)` — checks LAPIC for a deliverable vector and, if guest IF=1 with no pending EVENTINJ, builds the EVENTINJ qword and accepts the vector. Called from the vCPU entry loop before VMRUN.
+- `tryHandleMmio(vcpu, guest_phys)` — if `guest_phys` falls in the LAPIC or IOAPIC page, decodes the faulting instruction at guest RIP, dispatches to the matching controller, writes any read result back, and advances RIP. Returns true if handled. Internal helpers `handleLapicMmio`/`handleIoapicMmio` are non-pub.
+- `guestPhysToHost(phys, len)` / `readGuestPhysSlice(phys, len)` — bounds-checked guest-phys → host-VA translation backed by `guest_ram_host_base`/`guest_ram_size`. Single home for the arithmetic so the bookkeeping is owned by `Vm`.
+
 ### VCpu Struct
 
 Defined in `kernel/kvm/vcpu.zig`:
@@ -1709,8 +1717,8 @@ State meanings:
 vCPU threads have a fixed kernel-managed entry point in `kernel/kvm/vcpu.zig` (`vcpuEntryPoint`). When scheduled, the entry loop:
 
 1. If state ≠ `running`, blocks the thread and yields. On wake, resets the TSC reference and continues.
-2. Reads TSC and ticks the in-kernel LAPIC by the elapsed nanoseconds. The TSC tick is treated as 1 ns (assumes a ~1 GHz bus clock). The LAPIC timer fires interrupts via its own IRR.
-3. Calls `lapic.getPendingVector()`. If a deliverable vector is pending, guest `IF=1`, and no `pending_eventinj` already queued, builds an EVENTINJ qword (vector | type=external | valid bit) into `guest_state.pending_eventinj` and calls `lapic.acceptInterrupt(vector)` to move the bit from IRR to ISR.
+2. Reads TSC and calls `vm.tickInterruptControllers(elapsed_ns)` to advance the in-kernel LAPIC timer. The TSC tick is treated as 1 ns (assumes a ~1 GHz bus clock).
+3. Calls `vm.deliverPendingInterrupts(&guest_state)`. If the LAPIC has a deliverable pending vector and guest `IF=1` with no prior `pending_eventinj`, the Vm method builds the EVENTINJ qword (vector | type=external | valid bit) and marks the vector accepted in the LAPIC.
 4. Calls `arch.vmResume(&guest_state, vm.arch_structures, &guest_fxsave)` to enter guest mode. The arch layer copies guest state into VMCB/VMCS, runs VMRUN/VMRESUME, and returns the exit reason on `#VMEXIT`.
 5. Stores the exit info in `last_exit_info` and calls `exit_handler.handleExit(vcpu, exit_info)`.
 6. Loops.
@@ -1754,7 +1762,7 @@ VmExitMessage {
 
 ```
 VmReplyAction = union(enum) {
-    resume:           arch.GuestState
+    resume_guest:     arch.GuestState
     inject_interrupt: arch.GuestInterrupt
     inject_exception: arch.GuestException
     map_memory: struct { host_vaddr: u64, guest_addr: u64, size: u64, rights: u8 }
@@ -1767,11 +1775,10 @@ VmReplyAction = union(enum) {
 Defined in `kernel/kvm/exit_handler.zig`. Called from the vCPU entry loop after `arch.vmResume()` returns. Classifies exits as kernel-handled or VMM-handled.
 
 **Kernel-handled inline** — resolved without VMM involvement, the entry loop re-enters the guest on return:
-- **EPT/NPT violations on the LAPIC page** (`0xFEE00000`): `handleLapicMmio` decodes the faulting instruction with `mmio_decode.decode`, dispatches read/write to the in-kernel `Lapic`, writes the result back to the destination GPR for reads, and advances RIP by the decoded instruction length.
-- **EPT/NPT violations on the IOAPIC page** (`0xFEC00000`): same, but dispatched to the in-kernel `Ioapic`.
-- **EPT/NPT violations on demand-paged guest regions**: `guest_memory.handleFault` resolves the page on the fly.
+- **EPT/NPT violations on the LAPIC or IOAPIC page** (`0xFEE00000` / `0xFEC00000`): the handler calls `vm.tryHandleMmio(vcpu, ept.guest_phys)`, which routes the access to the matching controller, decodes the instruction at guest RIP via `mmio_decode.decode`, writes any read result back into the destination GPR, and advances RIP by the decoded instruction length. The handler imports neither `lapic` nor `ioapic` directly — the only entry point is `Vm.tryHandleMmio`.
+- Guest memory is no longer demand-paged: all regions are eagerly mapped at `guest_map` time. EPT/NPT violations on truly unmapped regions fall through to the VMM as exits.
 - **`cpuid`** where `(leaf, subleaf)` matches an entry in `vm.policy.cpuid_responses`: the kernel writes the pre-configured `eax/ebx/ecx/edx` into guest GPRs and advances RIP by 2.
-- **`interrupt_window` (VMEXIT_VINTR)**: returns immediately so the entry loop checks `lapic.getPendingVector()` again now that guest `IF=1`.
+- **`interrupt_window` (VMEXIT_VINTR)**: returns immediately so the entry loop checks `vm.deliverPendingInterrupts` again now that guest `IF=1`.
 - **VMEXIT_INTR (0x060) / VMEXIT_NMI (0x061) / VMEXIT_VINTR (0x064)**: the host interrupt handler already ran on `#VMEXIT`. The kernel just returns so the entry loop re-enters the guest.
 
 **VMM-handled** — enqueued on VmExitBox:
@@ -1782,7 +1789,7 @@ Defined in `kernel/kvm/exit_handler.zig`. Called from the vCPU entry loop after 
 - `msr_read` / `msr_write` exits the kernel didn't intercept via the MSRPM passthrough bitmap.
 - `hlt`, `shutdown`, `triple_fault`, exceptions, and any other unclassified exits.
 
-For VMM-handled exits, the handler transitions the vCPU to `.exited`, then either delivers the exit message directly to a thread blocked on `vm_recv` (`deliverToReceiver`) or enqueues the vCPU thread on the `VmExitBox` for a later `vm_recv`. Direct delivery spins on `receiver.on_cpu` until the receiver is fully off-CPU, then writes the `VmExitMessage` into the receiver's saved `RDI` buffer pointer and re-enqueues it on the scheduler.
+For VMM-handled exits, the handler transitions the vCPU to `.exited` and calls `exit_box.queueOrDeliver(vm.exitBox(), vm, vcpu)`. That function takes the box lock and either delivers the exit message directly to a thread blocked on `vm_recv` (via the internal `deliverExit` helper) or enqueues the vCPU thread on the `VmExitBox` for a later `vm_recv`. Direct delivery spins on `receiver.on_cpu` until the receiver is fully off-CPU, then writes the `VmExitMessage` into the receiver's saved `RDI` buffer pointer and re-enqueues it on the scheduler.
 
 ### Guest Memory
 
@@ -1800,14 +1807,14 @@ Defined in `kernel/kvm/lapic.zig`. Single-vCPU xAPIC emulation per Intel SDM Vol
 
 State the `Lapic` struct holds: APIC ID, TPR, LDR/DFR, SVR, ESR (with shadow for accumulated errors), ICR_LO/HI, six LVT registers (timer/thermal/perf/LINT0/LINT1/error), timer ICR/CCR/DCR, a `timer_accum_ns` carry for fractional ticks between `tick()` calls, three 256-bit vectors `irr`/`isr`/`tmr`, and a back-pointer to the paired `Ioapic`.
 
-Public surface used by the rest of the kernel:
+Public surface used by the rest of the kernel (all called through `Vm` methods, never directly from outside `kvm/`):
 - `init(ioapic_ptr)` — reset to power-up state per SDM 13.4.7.1.
-- `read(offset)` / `write(offset, value)` — handle MMIO accesses dispatched from `exit_handler.handleLapicMmio`.
+- `mmioRead(offset)` / `mmioWrite(offset, value)` — handle MMIO accesses dispatched from `Vm.tryHandleMmio`.
 - `tick(elapsed_ns)` — advance the timer. Treats the bus clock as 1 GHz, decodes the divide config (table from Figure 13-10), counts down `timer_current_count`, and fires the LVT timer vector in one-shot or periodic mode. TSC-deadline mode is stubbed.
-- `getPendingVector()` — returns the highest-priority IRR vector that beats both ISR and TPR priority classes (and only if the APIC is software-enabled). Used by the vCPU entry loop to decide whether to inject before VMRUN.
+- `getPendingVector()` — returns the highest-priority IRR vector that beats both ISR and TPR priority classes (and only if the APIC is software-enabled). Used by `Vm.deliverPendingInterrupts` to decide whether to inject before VMRUN.
 - `acceptInterrupt(vector)` — moves a vector from IRR → ISR.
 - `injectExternal(vector)` — set IRR for an external IRQ delivered by the IOAPIC.
-- Internal: `handleEOI` clears the highest ISR bit and notifies the IOAPIC for level-triggered vectors via `tmr`. `handleICR` covers self-IPI delivery (only shorthand=01 fixed-mode IPIs are implemented; broadcast/init/SIPI are stubbed since this is single-vCPU).
+- Internal (non-pub): `handleEOI` clears the highest ISR bit and notifies the IOAPIC for level-triggered vectors via `tmr`. `handleICR` covers self-IPI delivery (only shorthand=01 fixed-mode IPIs are implemented; broadcast/init/SIPI are stubbed since this is single-vCPU).
 
 ### In-kernel IOAPIC
 
@@ -1817,15 +1824,15 @@ State the `Ioapic` struct holds: `ioregsel`, `ioapic_id`, the 24-entry `redir_ta
 
 Public surface:
 - `init(lapic_ptr)` — reset.
-- `read(offset)` / `write(offset, value)` — MMIO handlers used by `exit_handler.handleIoapicMmio`. Indirectly drive `readRegister`/`writeRegister`, which know about ID/VER/ARB and the 0x10..0x3F redirection-table window. Bits 12 (delivery status) and 14 (remote IRR) in the redirection table are read-only from the guest.
-- `assertIrq(irq)` — used by both the kernel-side serial path and the `ioapic_assert_irq` syscall. Honors the per-entry mask bit, debounces edges, and tracks remote IRR for level-triggered entries before calling `deliverInterrupt`.
+- `mmioRead(offset)` / `mmioWrite(offset, value)` — MMIO handlers used by `Vm.tryHandleMmio`. Indirectly drive internal `readRegister`/`writeRegister` helpers, which know about ID/VER/ARB and the 0x10..0x3F redirection-table window. Bits 12 (delivery status) and 14 (remote IRR) in the redirection table are read-only from the guest.
+- `assertIrq(irq)` — used by both the kernel-side serial path and the `ioapic_assert_irq` syscall. Honors the per-entry mask bit, debounces edges, and tracks remote IRR for level-triggered entries before calling the internal `deliverInterrupt`.
 - `deassertIrq(irq)` — clears the level bit for level-triggered re-delivery.
 - `handleEOI(vector)` — called by the LAPIC on EOI for level-triggered interrupts. Clears remote IRR and re-fires the entry if the line is still asserted.
-- Internal: `deliverInterrupt` reads the vector and delivery mode from the entry. Fixed/lowest-priority/ExtINT all just call `lapic.injectExternal`. SMI/NMI/INIT are stubbed.
+- Internal (non-pub): `deliverInterrupt` reads the vector and delivery mode from the entry. Fixed/lowest-priority/ExtINT all just call `lapic.injectExternal`. SMI/NMI/INIT are stubbed.
 
 ### MMIO Instruction Decoder
 
-Defined in `kernel/kvm/mmio_decode.zig`. Used by `exit_handler` to handle LAPIC/IOAPIC MMIO inline without bouncing to userspace.
+Defined in `kernel/kvm/mmio_decode.zig`. Used by `Vm.tryHandleMmio` (via the internal `handleLapicMmio`/`handleIoapicMmio` helpers) to handle LAPIC/IOAPIC MMIO inline without bouncing to userspace.
 
 Supported instruction patterns (the ones Linux's `readl`/`writel` and friends compile to):
 - `0x89` MOV r/m32, r32
@@ -1838,7 +1845,7 @@ ModR/M and SIB decoding handles all addressing forms Linux actually emits, inclu
 
 Returns a `MmioOp { is_write, size, reg, value, len, is_immediate }`. The exit handler dispatches to the device, then either calls `writeGpr(&guest_state, op.reg, value)` for reads or trusts the device to have stored `op.value` for writes, then advances RIP by `op.len`.
 
-Guest virtual → physical translation goes through `guestVirtToPhys`, which walks the guest's CR3 4-level page tables (handling 1 GiB and 2 MiB huge pages) by reading guest physical memory through `vm.guest_ram_host_base + phys`. When CR0.PG is clear (early boot in real/protected mode), guest virt = guest phys directly. The MMIO decoder reads instruction bytes via `readGuestPhysSlice`, which is also bounds-checked against `vm.guest_ram_size`.
+Guest virtual → physical translation goes through `guestVirtToPhys`, which walks the guest's CR3 4-level page tables (handling 1 GiB and 2 MiB huge pages) by reading guest physical memory through `Vm.guestPhysToHost`. When CR0.PG is clear (early boot in real/protected mode), guest virt = guest phys directly. The MMIO decoder reads instruction bytes via `Vm.readGuestPhysSlice`, which is also bounds-checked. The decoder never touches `Vm`'s memory bookkeeping fields directly — `guestPhysToHost`/`readGuestPhysSlice` are the single home for that arithmetic.
 
 ### MSR Passthrough
 
@@ -1860,8 +1867,8 @@ SYSENTER_CS / SYSENTER_ESP / SYSENTER_EIP
 ### Slab Allocators
 
 Two new slabs added to `kernel/memory/init.zig`, each with dedicated 16 MiB bump allocator backing regions:
-- `VmAllocator = SlabAllocator(kvm.Vm, false, 0, 64, true)` — Vm structs.
-- `VCpuAllocator = SlabAllocator(kvm.VCpu, false, 0, 64, true)` — VCpu structs.
+- `VmAllocator = SlabAllocator(kvm.vm.Vm, false, 0, 64, true)` — Vm structs.
+- `VCpuAllocator = SlabAllocator(kvm.vcpu.VCpu, false, 0, 64, true)` — VCpu structs.
 
 Initialized in `memory.init()` alongside the existing slabs.
 
@@ -1873,4 +1880,4 @@ The Vm struct has its own `lock: SpinLock` protecting vCPU list and VM-wide stat
 
 ### Module Root
 
-`kernel/kvm/kvm.zig` re-exports all kvm types: `Vm`, `VCpu`, `VmExitBox`, `VmExitMessage`, `VmReplyAction`, `GuestMemory`, `Lapic`, `Ioapic`, `MmioOp`, `ExitHandler`. Referenced by `kernel/zag.zig` as `pub const kvm = @import("kvm/kvm.zig")`.
+`kernel/kvm/kvm.zig` exports the kvm submodules and nothing else — `pub const exit_box`, `exit_handler`, `guest_memory`, `ioapic`, `lapic`, `mmio_decode`, `vcpu`, `vm`. No type re-exports: callers reach types through their owning submodule (`zag.kvm.vm.Vm`, `zag.kvm.vcpu.VCpu`, etc.), matching the pattern in `memory.zig`, `sched.zig`, and the other kernel module roots. Referenced by `kernel/zag.zig` as `pub const kvm = @import("kvm/kvm.zig")`.

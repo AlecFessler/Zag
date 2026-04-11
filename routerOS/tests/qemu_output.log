@@ -1,4 +1,1 @@
-[2J[01;01H[=3h[2J[01;01H[2J[01;01H[8;042;160t0[2J[01;01H[2J[01;01H[8;056;240t0[2J[01;01HBdsDxe: loading Boot0002 "UEFI QEMU HARDDISK QM00001 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x0,0xFFFF,0x0)
-BdsDxe: starting Boot0002 "UEFI QEMU HARDDISK QM00001 " from PciRoot(0x0)/Pci(0x1F,0x2)/Sata(0x0,0xFFFF,0x0)
-[2J[01;01Hnvme_driver: starting
-nvme_driver: no NVMe controllers found
+qemu-system-x86_64: -netdev tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=off: could not configure /dev/net/tun (tap0): Operation not permitted

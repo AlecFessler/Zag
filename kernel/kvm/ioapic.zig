@@ -4,8 +4,9 @@
 ///   IOREGSEL at 0xFEC00000 (selects register index)
 ///   IOWIN at 0xFEC00010 (reads/writes selected register)
 /// Section 3.0: Register Description.
+const zag = @import("zag");
 
-const Lapic = @import("lapic.zig").Lapic;
+const Lapic = zag.kvm.lapic.Lapic;
 
 pub const IOAPIC_BASE: u64 = 0xFEC00000;
 
@@ -43,7 +44,7 @@ pub const Ioapic = struct {
 
     /// Handle MMIO read at offset from IOAPIC base 0xFEC00000.
     /// Only IOREGSEL (offset 0x00) and IOWIN (offset 0x10) are accessible.
-    pub fn read(self: *const Ioapic, offset: u32) u32 {
+    pub fn mmioRead(self: *const Ioapic, offset: u32) u32 {
         return switch (offset) {
             IOREGSEL_OFF => self.ioregsel,
             IOWIN_OFF => self.readRegister(self.ioregsel),
@@ -52,7 +53,7 @@ pub const Ioapic = struct {
     }
 
     /// Handle MMIO write at offset from IOAPIC base 0xFEC00000.
-    pub fn write(self: *Ioapic, offset: u32, value: u32) void {
+    pub fn mmioWrite(self: *Ioapic, offset: u32, value: u32) void {
         switch (offset) {
             IOREGSEL_OFF => self.ioregsel = @truncate(value & 0xFF),
             IOWIN_OFF => self.writeRegister(self.ioregsel, value),
@@ -93,7 +94,9 @@ pub const Ioapic = struct {
     }
 
     /// Handle EOI from LAPIC for a level-triggered interrupt.
-    /// Clears Remote IRR (bit 14) in the matching redirection table entry.
+    /// Clears Remote IRR (bit 14) in all redirection-table entries that
+    /// map to this vector. Linux shares vectors across GSIs, so we must
+    /// scan every entry rather than stopping after the first match.
     pub fn handleEOI(self: *Ioapic, vector: u8) void {
         for (&self.redir_table, 0..) |*entry, i| {
             const entry_vector: u8 = @truncate(entry.* & 0xFF);
@@ -105,7 +108,7 @@ pub const Ioapic = struct {
                     entry.* |= (1 << 14);
                     self.deliverInterrupt(entry.*);
                 }
-                return;
+                // Do not return -- continue scanning for other entries sharing this vector.
             }
         }
     }

@@ -2,21 +2,27 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const exit_box_mod = zag.kvm.exit_box;
+const guest_memory = zag.kvm.guest_memory;
+const ioapic_mod = zag.kvm.ioapic;
+const lapic_mod = zag.kvm.lapic;
 const memory_init = zag.memory.init;
+const mmio_decode = zag.kvm.mmio_decode;
 const paging = zag.memory.paging;
 const sched = zag.sched.scheduler;
 const vcpu_mod = zag.kvm.vcpu;
 
-const Ioapic = zag.kvm.ioapic.Ioapic;
-const Lapic = zag.kvm.lapic.Lapic;
+const GuestMemory = guest_memory.GuestMemory;
+const Ioapic = ioapic_mod.Ioapic;
+const Lapic = lapic_mod.Lapic;
 const PAddr = zag.memory.address.PAddr;
 const Process = zag.sched.process.Process;
-const VAddr = zag.memory.address.VAddr;
 const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
 const SpinLock = zag.sched.sync.SpinLock;
 const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
+const VAddr = zag.memory.address.VAddr;
 const VCpu = vcpu_mod.VCpu;
-const VmExitBox = zag.kvm.exit_box.VmExitBox;
+const VmExitBox = exit_box_mod.VmExitBox;
 
 pub const MAX_VCPUS = 64;
 
@@ -35,7 +41,7 @@ pub const Vm = struct {
     lock: SpinLock = .{},
     vm_id: u64 = 0,
     arch_structures: PAddr = PAddr.fromInt(0),
-    guest_mem: zag.kvm.guest_memory.GuestMemory = .{},
+    guest_mem: GuestMemory = .{},
     /// Host virtual base and size of the main guest RAM region (from first guest_map).
     /// Used by MMIO decoder to read guest physical memory (page table walk).
     guest_ram_host_base: u64 = 0,
@@ -67,6 +73,96 @@ pub const Vm = struct {
 
         allocator.destroy(self);
     }
+
+    /// Returns a pointer to the VM's exit box. Used by `vcpu` and
+    /// `exit_handler` so neither has to know the box lives inside `Vm`.
+    pub fn exitBox(self: *Vm) *VmExitBox {
+        return &self.exit_box;
+    }
+
+    /// Inject an external-interrupt vector into the LAPIC IRR. Routes
+    /// `vcpu_interrupt` and IOAPIC delivery through a single Vm-level entry.
+    pub fn injectExternal(self: *Vm, vector: u8) void {
+        self.lapic.injectExternal(vector);
+    }
+
+    /// Advance every kernel-managed interrupt-controller timer by `elapsed_ns`.
+    /// Called from the vCPU entry loop before each VMRUN.
+    pub fn tickInterruptControllers(self: *Vm, elapsed_ns: u64) void {
+        self.lapic.tick(elapsed_ns);
+    }
+
+    /// If the LAPIC has a deliverable pending vector and the guest is ready
+    /// to accept it (IF=1, no prior pending EVENTINJ), build the EVENTINJ
+    /// word, mark the vector accepted in the LAPIC, and return.
+    /// AMD APM Vol 2, Section 15.20, Figure 15-4.
+    pub fn deliverPendingInterrupts(self: *Vm, gs: *arch.GuestState) void {
+        const vector = self.lapic.getPendingVector() orelse return;
+        const guest_if = gs.rflags & (1 << 9);
+        if (guest_if == 0 or gs.pending_eventinj != 0) return;
+        gs.pending_eventinj = @as(u64, vector) | (1 << 31);
+        self.lapic.acceptInterrupt(vector);
+    }
+
+    /// If `guest_phys` falls inside the in-kernel LAPIC or IOAPIC page,
+    /// decode the instruction at guest RIP, dispatch the access to the
+    /// matching controller, write any read result back into the guest GPR,
+    /// and advance RIP. Returns true if handled (the exit can be resumed
+    /// inline) or false if it should fall through to the VMM.
+    pub fn tryHandleMmio(self: *Vm, vcpu_obj: *VCpu, guest_phys: u64) bool {
+        if (guest_phys >= lapic_mod.APIC_BASE and guest_phys < lapic_mod.APIC_BASE + 0x1000) {
+            return self.handleLapicMmio(vcpu_obj, guest_phys);
+        }
+        if (guest_phys >= ioapic_mod.IOAPIC_BASE and guest_phys < ioapic_mod.IOAPIC_BASE + 0x1000) {
+            return self.handleIoapicMmio(vcpu_obj, guest_phys);
+        }
+        return false;
+    }
+
+    fn handleLapicMmio(self: *Vm, vcpu_obj: *VCpu, guest_phys: u64) bool {
+        const op = mmio_decode.decode(self, &vcpu_obj.guest_state) orelse return false;
+        const offset: u32 = @truncate(guest_phys - lapic_mod.APIC_BASE);
+        if (op.is_write) {
+            self.lapic.mmioWrite(offset, op.value);
+        } else {
+            const value = self.lapic.mmioRead(offset);
+            mmio_decode.writeGpr(&vcpu_obj.guest_state, op.reg, @as(u64, value));
+        }
+        vcpu_obj.guest_state.rip += op.len;
+        return true;
+    }
+
+    fn handleIoapicMmio(self: *Vm, vcpu_obj: *VCpu, guest_phys: u64) bool {
+        const op = mmio_decode.decode(self, &vcpu_obj.guest_state) orelse return false;
+        const offset: u32 = @truncate(guest_phys - ioapic_mod.IOAPIC_BASE);
+        if (op.is_write) {
+            self.ioapic.mmioWrite(offset, op.value);
+        } else {
+            const value = self.ioapic.mmioRead(offset);
+            mmio_decode.writeGpr(&vcpu_obj.guest_state, op.reg, @as(u64, value));
+        }
+        vcpu_obj.guest_state.rip += op.len;
+        return true;
+    }
+
+    /// Translate a guest-physical address backed by the main RAM region into
+    /// a host pointer. Returns null if the main-RAM-at-guest-phys-0 mapping
+    /// has not been established yet, or `[phys, phys+len)` is out of bounds.
+    /// Single home for guest-phys → host-VA arithmetic so the bookkeeping
+    /// fields stay private to `Vm`.
+    pub fn guestPhysToHost(self: *const Vm, phys: u64, len: usize) ?[*]u8 {
+        if (self.guest_ram_host_base == 0) return null;
+        if (self.guest_ram_size < len) return null;
+        if (phys > self.guest_ram_size - len) return null;
+        return @ptrFromInt(self.guest_ram_host_base + phys);
+    }
+
+    /// Read a slice from guest physical memory via the main RAM mapping.
+    /// Convenience wrapper around `guestPhysToHost`.
+    pub fn readGuestPhysSlice(self: *const Vm, phys: u64, len: usize) ?[]const u8 {
+        const ptr = self.guestPhysToHost(phys, len) orelse return null;
+        return ptr[0..len];
+    }
 };
 
 /// Syscall implementation: create a VM for the calling process.
@@ -94,6 +190,11 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
     if (!readUserStruct(proc, policy_ptr, &policy_buf)) return E_BADADDR;
     const user_policy = std.mem.bytesAsValue(arch.VmPolicy, &policy_buf);
 
+    // Reject oversized policy counts -- a malicious VMM could otherwise
+    // cause lookupCpuidPolicy/lookupCrPolicy to OOB-read the policy struct.
+    if (user_policy.num_cpuid_responses > arch.VmPolicy.MAX_CPUID_POLICIES) return E_INVAL;
+    if (user_policy.num_cr_policies > arch.VmPolicy.MAX_CR_POLICIES) return E_INVAL;
+
     // Allocate VM struct
     const vm_obj = allocator.create(Vm) catch return E_NOMEM;
 
@@ -116,11 +217,19 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
     vm_obj.ioapic.init(&vm_obj.lapic);
     vm_obj.lapic.init(&vm_obj.ioapic);
 
-    // Create vCPUs
+    // Create vCPUs. Track each inserted perm-table handle so we can roll
+    // back on partial failure without leaking dangling thread handles.
+    var inserted_handles: [MAX_VCPUS]u64 = undefined;
+    var inserted_count: u32 = 0;
     var i: u32 = 0;
     while (i < vcpu_count) : (i += 1) {
         const vcpu_obj = vcpu_mod.create(vm_obj) catch {
-            // Cleanup already-created vCPUs
+            // Cleanup already-inserted handles (before destroying their threads)
+            var k: u32 = 0;
+            while (k < inserted_count) : (k += 1) {
+                proc.removePerm(inserted_handles[k]) catch {};
+            }
+            // Destroy already-created vCPUs
             var j: u32 = 0;
             while (j < i) : (j += 1) {
                 vcpu_mod.destroy(vm_obj.vcpus[j]);
@@ -134,8 +243,13 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
         vm_obj.num_vcpus = i + 1;
 
         // Insert thread handle into caller's perm table
-        _ = proc.insertThreadHandle(vcpu_obj.thread, ThreadHandleRights.full) catch {
-            // Cleanup
+        const handle_id = proc.insertThreadHandle(vcpu_obj.thread, ThreadHandleRights.full) catch {
+            // Cleanup already-inserted handles
+            var k: u32 = 0;
+            while (k < inserted_count) : (k += 1) {
+                proc.removePerm(inserted_handles[k]) catch {};
+            }
+            // Destroy all vCPUs including the one whose handle failed to insert
             var j: u32 = 0;
             while (j <= i) : (j += 1) {
                 vcpu_mod.destroy(vm_obj.vcpus[j]);
@@ -144,6 +258,8 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
             allocator.destroy(vm_obj);
             return E_MAXCAP;
         };
+        inserted_handles[inserted_count] = handle_id;
+        inserted_count += 1;
     }
 
     proc.vm = vm_obj;
@@ -175,12 +291,11 @@ pub fn guestMap(proc: *Process, host_vaddr: u64, guest_addr: u64, size: u64, rig
     if (!zag.memory.address.AddrSpacePartition.user.contains(host_vaddr)) return E_BADADDR;
 
     // Guard LAPIC and IOAPIC pages -- these are handled in-kernel and
-    // must always NPT-fault to the kernel exit handler.
+    // must always NPT-fault to the kernel exit handler. Proper interval
+    // overlap check: [guest_addr, guest_end) vs [base, base+0x1000).
     const guest_end = guest_addr + size;
-    const lapic_base: u64 = 0xFEE00000;
-    const ioapic_base: u64 = 0xFEC00000;
-    if (guest_addr <= lapic_base and guest_end > lapic_base) return E_INVAL;
-    if (guest_addr <= ioapic_base and guest_end > ioapic_base) return E_INVAL;
+    if (guest_addr < lapic_mod.APIC_BASE + 0x1000 and guest_end > lapic_mod.APIC_BASE) return E_INVAL;
+    if (guest_addr < ioapic_mod.IOAPIC_BASE + 0x1000 and guest_end > ioapic_mod.IOAPIC_BASE) return E_INVAL;
 
     // Walk host pages and map each into guest EPT. Track progress for
     // rollback on partial failure.
@@ -237,6 +352,11 @@ pub fn msrPassthrough(proc: *Process, msr_num: u32, allow_read: bool, allow_writ
     // Refuse security-critical MSRs that must always be intercepted.
     if (isSecurityCriticalMsr(msr_num)) return E_PERM;
 
+    // Serialize the MSRPM bitwise RMW inside arch.vmMsrPassthrough --
+    // multiple threads in the same process could otherwise race.
+    vm_obj.lock.lock();
+    defer vm_obj.lock.unlock();
+
     // Access the MSRPM via the VMCB.
     arch.vmMsrPassthrough(vm_obj.arch_structures, msr_num, allow_read, allow_write);
     return 0; // E_OK
@@ -268,7 +388,7 @@ pub fn ioapicDeassertIrq(proc: *Process, irq_num: u64) i64 {
 /// forcing a VMEXIT so the vCPU re-enters VMRUN and checks pending interrupts.
 fn kickRunningVcpus(vm_obj: *Vm) void {
     for (vm_obj.vcpus[0..vm_obj.num_vcpus]) |vcpu_obj| {
-        if (vcpu_obj.state == .running) {
+        if (vcpu_obj.loadState() == .running) {
             if (sched.coreRunning(vcpu_obj.thread)) |core_id| {
                 arch.triggerSchedulerInterrupt(core_id);
             }

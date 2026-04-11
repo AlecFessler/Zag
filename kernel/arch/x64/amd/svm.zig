@@ -220,10 +220,6 @@ pub fn perCoreInit() void {
     host_vmcb_pa[core_id] = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(host_vmcb_page)), null).addr;
 }
 
-pub fn svmSupported() bool {
-    return svm_supported_flag;
-}
-
 /// Allocate VMCB + NPT PML4 for a new VM.
 /// AMD APM Vol 2, Section 15.5.1: VMCB is a 4KB-aligned page.
 /// Returns physical address of the VMCB page. The NPT PML4 physical

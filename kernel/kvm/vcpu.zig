@@ -19,9 +19,11 @@ const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 const Vm = vm_mod.Vm;
 
-pub const MAX_VCPUS = 64;
-
-pub const VCpuState = enum {
+/// State of a vCPU. The field is accessed from multiple threads:
+/// the vCPU's own thread, `kickRunningVcpus` (walks all vCPUs), the
+/// exit handler, and `vm_reply`. All reads/writes must use atomic
+/// load/store -- see `loadState`/`storeState` helpers on `VCpu`.
+pub const VCpuState = enum(u8) {
     idle,
     running,
     exited,
@@ -36,11 +38,22 @@ pub const VCpu = struct {
     thread: *Thread,
     vm: *Vm,
     guest_state: arch.GuestState = .{},
+    /// Atomic state. Use `loadState`/`storeState` -- direct `.state = ...`
+    /// writes are still allowed inside regions already holding `vm.lock`,
+    /// but every other site must go through the atomic helpers.
     state: VCpuState = .idle,
     last_exit_info: arch.VmExitInfo = .{ .unknown = 0 },
     /// Guest FPU/SSE state (FXSAVE format, 512 bytes, 16-byte aligned).
     /// Initialized with default MXCSR=0x1F80, FCW=0x037F.
     guest_fxsave: arch.FxsaveArea align(16) = arch.fxsaveInit(),
+
+    pub inline fn loadState(self: *const VCpu) VCpuState {
+        return @atomicLoad(VCpuState, &self.state, .acquire);
+    }
+
+    pub inline fn storeState(self: *VCpu, s: VCpuState) void {
+        @atomicStore(VCpuState, &self.state, s, .release);
+    }
 };
 
 /// Create a vCPU: allocate the struct, create a kernel thread, link them.
@@ -122,9 +135,9 @@ pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
 
     const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse return E_BADCAP;
 
-    if (vcpu_obj.state != .idle) return E_BUSY;
+    if (vcpu_obj.loadState() != .idle) return E_BUSY;
 
-    vcpu_obj.state = .running;
+    vcpu_obj.storeState(.running);
     const thread = vcpu_obj.thread;
     thread.state = .ready;
     const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
@@ -146,7 +159,7 @@ pub fn vcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
 
     const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse return E_BADCAP;
 
-    if (vcpu_obj.state != .idle) return E_BUSY;
+    if (vcpu_obj.loadState() != .idle) return E_BUSY;
 
     if (state_ptr == 0) return E_BADADDR;
     if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
@@ -173,8 +186,11 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     if (state_ptr == 0) return E_BADADDR;
     if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
 
+    // Snapshot the state once; avoid racing the vCPU's own writes.
+    const state_snapshot = vcpu_obj.loadState();
+
     // If running, IPI to suspend and snapshot
-    if (vcpu_obj.state == .running) {
+    if (state_snapshot == .running) {
         const thread = vcpu_obj.thread;
         if (sched.coreRunning(thread)) |core_id| {
             arch.triggerSchedulerInterrupt(core_id);
@@ -188,7 +204,7 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     if (!writeUserStruct(proc, state_ptr, src_bytes)) return E_BADADDR;
 
     // Resume if it was running
-    if (vcpu_obj.state == .running) {
+    if (state_snapshot == .running) {
         const thread = vcpu_obj.thread;
         thread.state = .ready;
         const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
@@ -218,21 +234,31 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     if (!readUserStruct(proc, interrupt_ptr, &int_buf)) return E_BADADDR;
     const interrupt = std.mem.bytesAsValue(arch.GuestInterrupt, &int_buf).*;
 
-    if (vcpu_obj.state == .running) {
+    if (vcpu_obj.loadState() == .running) {
         const thread = vcpu_obj.thread;
         // IPI to suspend
         if (sched.coreRunning(thread)) |core_id| {
             arch.triggerSchedulerInterrupt(core_id);
             while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
         }
-        // Inject and resume
-        arch.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
+        // If the vCPU entry loop (or a prior injection) already queued a
+        // vector in pending_eventinj, don't clobber it. Route this vector
+        // through the LAPIC IRR so the entry loop can pick it up next time.
+        if (vcpu_obj.guest_state.pending_eventinj != 0) {
+            vm_obj.injectExternal(interrupt.vector);
+        } else {
+            arch.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
+        }
         thread.state = .ready;
         const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
         sched.enqueueOnCore(target_core, thread);
     } else {
         // Not running — write pending interrupt into arch state
-        arch.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
+        if (vcpu_obj.guest_state.pending_eventinj != 0) {
+            vm_obj.injectExternal(interrupt.vector);
+        } else {
+            arch.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
+        }
     }
 
     return 0; // E_OK
@@ -257,7 +283,7 @@ fn vcpuEntryPoint() void {
     var last_tsc: u64 = arch.readTimestamp();
 
     while (true) {
-        if (vcpu_obj.state != .running) {
+        if (vcpu_obj.loadState() != .running) {
             // Block until the VMM resumes us via vm_reply.
             thread.state = .blocked;
             arch.enableInterrupts();
@@ -266,25 +292,16 @@ fn vcpuEntryPoint() void {
             continue;
         }
 
-        // Tick LAPIC timer with elapsed nanoseconds before each VMRUN.
-        // TSC ticks at ~1 GHz on most hardware; treat 1 tick = 1 ns.
+        // Tick interrupt-controller timers with elapsed nanoseconds before
+        // each VMRUN. TSC ticks at ~1 GHz on most hardware; treat 1 tick = 1 ns.
         const now_tsc = arch.readTimestamp();
         const elapsed_ns = now_tsc -% last_tsc;
         last_tsc = now_tsc;
-        vm_obj.lapic.tick(elapsed_ns);
+        vm_obj.tickInterruptControllers(elapsed_ns);
 
-        // Check for a pending deliverable interrupt vector from the LAPIC.
-        // If guest IF is set, build EVENTINJ and inject it before VMRUN.
-        if (vm_obj.lapic.getPendingVector()) |vector| {
-            const guest_if = vcpu_obj.guest_state.rflags & (1 << 9);
-            if (guest_if != 0 and vcpu_obj.guest_state.pending_eventinj == 0) {
-                // Build EVENTINJ: external interrupt (type=0), valid bit set.
-                // AMD APM Vol 2, Section 15.20, Figure 15-4.
-                const eventinj: u64 = @as(u64, vector) | (1 << 31);
-                vcpu_obj.guest_state.pending_eventinj = eventinj;
-                vm_obj.lapic.acceptInterrupt(vector);
-            }
-        }
+        // Inject any pending deliverable interrupt vector from the kernel
+        // interrupt controllers (gated on guest IF, no prior EVENTINJ).
+        vm_obj.deliverPendingInterrupts(&vcpu_obj.guest_state);
 
         // Enter guest mode
         const vm_structures = vm_obj.arch_structures;

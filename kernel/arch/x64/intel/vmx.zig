@@ -1109,13 +1109,6 @@ fn readGprFromGuest(gs: *const GuestState, gpr: u4) u64 {
 // EPT management
 // ---------------------------------------------------------------------------
 
-/// Allocate an EPT PML4 root page. Returns its physical address.
-pub fn allocEptRoot() ?PAddr {
-    const page = allocPage() orelse return null;
-    @memset(&page.mem, 0);
-    return pageToPhys(page);
-}
-
 /// Map a guest physical page in EPT (SDM Vol 3C, Section 29.3.2 "EPT
 /// Translation Mechanism", Tables 29-1 through 29-7 for entry formats).
 /// The ept_root parameter is actually the VMCS PAddr (arch_structures).

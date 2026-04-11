@@ -18,8 +18,6 @@ const perm_view = lib.perm_view;
 const perms = lib.perms;
 const syscall = lib.syscall;
 
-const SECTOR_SIZE: u64 = 512;
-
 pub const DiskImage = struct {
     bzimage_offset: u64,
     bzimage_size: u64,
@@ -119,15 +117,6 @@ pub fn loadToGuest(disk_offset: u64, size: u64, guest_phys: u64) bool {
         }
     }
     return true;
-}
-
-/// Read the first sector of the bzImage to extract setup_sects.
-/// Returns the setup header bytes needed for boot_params.
-pub fn readBzImageHeader() ?[]const u8 {
-    // Read sector 0 of the bzImage (which is at disk_offset / lba_size)
-    // Actually, the caller should have already loaded the bzImage to guest memory.
-    // We can read the setup header from guest memory instead.
-    return null; // Not needed if we read from guest memory
 }
 
 fn readU64(buf: [*]const u8, offset: usize) u64 {

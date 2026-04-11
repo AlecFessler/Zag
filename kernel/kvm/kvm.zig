@@ -6,14 +6,3 @@ pub const lapic = @import("lapic.zig");
 pub const mmio_decode = @import("mmio_decode.zig");
 pub const vcpu = @import("vcpu.zig");
 pub const vm = @import("vm.zig");
-
-pub const ExitHandler = exit_handler.ExitHandler;
-pub const GuestMemory = guest_memory.GuestMemory;
-pub const Ioapic = ioapic.Ioapic;
-pub const Lapic = lapic.Lapic;
-pub const MmioOp = mmio_decode.MmioOp;
-pub const VCpu = vcpu.VCpu;
-pub const Vm = vm.Vm;
-pub const VmExitBox = exit_box.VmExitBox;
-pub const VmExitMessage = exit_box.VmExitMessage;
-pub const VmReplyAction = exit_box.VmReplyAction;

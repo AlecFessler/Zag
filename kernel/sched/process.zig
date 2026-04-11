@@ -96,7 +96,7 @@ pub const Process = struct {
     // decide whether restoring the bit is semantically valid — we never
     // want to synthesize a right the sender didn't have to begin with.
     had_self_fault_handler: bool = true,
-    vm: ?*kvm.Vm = null,
+    vm: ?*kvm.vm.Vm = null,
 
     pub const MAX_THREADS = 64;
     pub const MAX_CHILDREN = 64;

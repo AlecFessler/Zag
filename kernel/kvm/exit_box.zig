@@ -5,6 +5,7 @@ const arch = zag.arch.dispatch;
 const paging = zag.memory.paging;
 const sched = zag.sched.scheduler;
 const vcpu_mod = zag.kvm.vcpu;
+const vm_mod = zag.kvm.vm;
 
 const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
 const PAddr = zag.memory.address.PAddr;
@@ -15,8 +16,9 @@ const SyscallResult = zag.arch.syscall.SyscallResult;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 const VCpu = vcpu_mod.VCpu;
+const Vm = vm_mod.Vm;
 
-pub const MAX_VCPUS = 64;
+const MAX_VCPUS = vm_mod.MAX_VCPUS;
 
 pub const VmExitBoxState = enum {
     idle,
@@ -45,7 +47,8 @@ pub const VmExitBox = struct {
     }
 
     /// Enqueue an exited vCPU thread for delivery. Caller must hold lock.
-    pub fn enqueueLocked(self: *VmExitBox, thread: *Thread) void {
+    /// Internal helper of queueOrDeliver — not for use across modules.
+    fn enqueueLocked(self: *VmExitBox, thread: *Thread) void {
         self.queue.enqueue(thread);
         if (self.state == .idle) {
             self.state = .pending_replies;
@@ -54,7 +57,8 @@ pub const VmExitBox = struct {
 
     /// Take the blocked receiver thread. Caller must hold lock.
     /// Transitions from receiving to pending_replies.
-    pub fn takeReceiverLocked(self: *VmExitBox) *Thread {
+    /// Internal helper of queueOrDeliver — not for use across modules.
+    fn takeReceiverLocked(self: *VmExitBox) *Thread {
         const r = self.receiver.?;
         self.receiver = null;
         self.state = .pending_replies;
@@ -62,15 +66,16 @@ pub const VmExitBox = struct {
     }
 
     /// Mark a vCPU slot as having a pending exit. Caller must hold lock.
-    pub fn markPendingLocked(self: *VmExitBox, vcpu_index: u32) void {
+    /// Internal helper — not for use across modules.
+    fn markPendingLocked(self: *VmExitBox, vcpu_index: u32) void {
         self.pending[vcpu_index] = true;
     }
 
     /// Clear a pending exit for a vCPU slot. Caller must hold lock.
-    /// If no more pending exits remain, transitions to idle.
-    pub fn clearPendingLocked(self: *VmExitBox, vcpu_index: u32) void {
+    /// If no more pending exits remain and the queue is empty, transitions to idle.
+    fn clearPendingLocked(self: *VmExitBox, vcpu_index: u32) void {
         self.pending[vcpu_index] = false;
-        if (!self.hasPendingExits() and self.queue.dequeue() == null) {
+        if (!self.hasPendingExits() and self.queue.isEmpty()) {
             self.state = .idle;
         }
     }
@@ -79,15 +84,15 @@ pub const VmExitBox = struct {
 /// Message written to userspace buffer on vm_recv.
 pub const VmExitMessage = struct {
     thread_handle: u64,
-    exit_info: zag.arch.dispatch.VmExitInfo,
-    guest_state: zag.arch.dispatch.GuestState,
+    exit_info: arch.VmExitInfo,
+    guest_state: arch.GuestState,
 };
 
 /// Action to take when replying to a VM exit.
 pub const VmReplyAction = union(enum) {
-    resume_guest: zag.arch.dispatch.GuestState,
-    inject_interrupt: zag.arch.dispatch.GuestInterrupt,
-    inject_exception: zag.arch.dispatch.GuestException,
+    resume_guest: arch.GuestState,
+    inject_interrupt: arch.GuestInterrupt,
+    inject_exception: arch.GuestException,
     map_memory: struct {
         host_vaddr: u64,
         guest_addr: u64,
@@ -95,8 +100,59 @@ pub const VmReplyAction = union(enum) {
         rights: u8,
     },
     kill: void,
-
 };
+
+/// Single home for "an exit happened, push it to userspace". Called by
+/// `exit_handler.handleExit` for every VMM-bound exit. Owns the lock,
+/// the queue/receiver bookkeeping, and (when a receiver is already
+/// blocked) the deliverExit handoff.
+pub fn queueOrDeliver(box: *VmExitBox, vm_obj: *Vm, vcpu_obj: *VCpu) void {
+    box.lock.lock();
+    if (box.isReceiving()) {
+        const receiver = box.takeReceiverLocked();
+        box.lock.unlock();
+        deliverExit(vm_obj, vcpu_obj, receiver);
+    } else {
+        box.enqueueLocked(vcpu_obj.thread);
+        box.lock.unlock();
+    }
+}
+
+/// Deliver an exit to a thread that is already blocked in `vm_recv`.
+/// Marks the vCPU pending, transitions it to .waiting_reply, writes the
+/// exit message to the receiver's saved buffer, and wakes the receiver.
+fn deliverExit(vm_obj: *Vm, vcpu_obj: *VCpu, receiver: *Thread) void {
+    const owner = vm_obj.owner;
+    const handle_id = owner.findThreadHandle(vcpu_obj.thread) orelse return;
+
+    // Find vCPU index and mark pending
+    for (vm_obj.vcpus[0..vm_obj.num_vcpus], 0..) |v, i| {
+        if (v == vcpu_obj) {
+            const box = vm_obj.exitBox();
+            box.lock.lock();
+            box.markPendingLocked(@intCast(i));
+            box.lock.unlock();
+            break;
+        }
+    }
+
+    vcpu_obj.storeState(.waiting_reply);
+
+    // Wait until receiver is off CPU and has saved its context.
+    while (receiver.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+
+    // Write exit info into receiver's saved buf_ptr (RDI from syscall entry).
+    const buf_ptr = receiver.ctx.regs.rdi;
+    writeExitMessageToUser(owner, buf_ptr, handle_id, vcpu_obj);
+
+    // Set return value
+    receiver.ctx.regs.rax = handle_id;
+
+    // Wake the receiver
+    receiver.state = .ready;
+    const target_core = if (receiver.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+    sched.enqueueOnCore(target_core, receiver);
+}
 
 /// Syscall implementation: dequeue from exit box, write VmExitMessage
 /// to userspace buffer, return exit token (= thread handle).
@@ -106,7 +162,7 @@ pub fn vmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContext, buf_ptr: u6
     const E_AGAIN: i64 = -9;
 
     const vm_obj = proc.vm orelse return .{ .rax = E_INVAL };
-    const box = &vm_obj.exit_box;
+    const box = vm_obj.exitBox();
 
     if (buf_ptr == 0) return .{ .rax = E_BADADDR };
     if (!zag.memory.address.AddrSpacePartition.user.contains(buf_ptr)) return .{ .rax = E_BADADDR };
@@ -162,7 +218,7 @@ pub fn vmReply(proc: *Process, exit_token: u64, action_ptr: u64) i64 {
     // Find which vCPU this thread belongs to
     const vcpu_obj = vcpu_mod.vcpuFromThread(vm_obj, thread) orelse return E_NOENT;
 
-    const box = &vm_obj.exit_box;
+    const box = vm_obj.exitBox();
     box.lock.lock();
 
     // Check this vCPU actually has a pending exit
@@ -210,38 +266,40 @@ pub fn vmReply(proc: *Process, exit_token: u64, action_ptr: u64) i64 {
         0 => {
             // resume_guest: payload is GuestState at offset 8
             vcpu_obj.guest_state = std.mem.bytesAsValue(arch.GuestState, action_buf[8..][0..@sizeOf(arch.GuestState)]).*;
-            vcpu_obj.state = .running;
+            vcpu_obj.storeState(.running);
             resumeVcpuThread(thread);
         },
         1 => {
             // inject_interrupt: payload is GuestInterrupt at offset 8
             const interrupt = std.mem.bytesAsValue(arch.GuestInterrupt, action_buf[8..][0..@sizeOf(arch.GuestInterrupt)]).*;
             arch.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
-            vcpu_obj.state = .running;
+            vcpu_obj.storeState(.running);
             resumeVcpuThread(thread);
         },
         2 => {
             // inject_exception: payload is GuestException at offset 8
             const exception = std.mem.bytesAsValue(arch.GuestException, action_buf[8..][0..@sizeOf(arch.GuestException)]).*;
             arch.vmInjectException(&vcpu_obj.guest_state, exception);
-            vcpu_obj.state = .running;
+            vcpu_obj.storeState(.running);
             resumeVcpuThread(thread);
         },
         3 => {
-            // map_memory: payload is {host_vaddr, guest_addr, size, rights} at offset 8
+            // map_memory: payload is {host_vaddr, guest_addr, size, rights} at offset 8.
+            // This is the intentional reply→syscall bridge: vm.guestMap is the public
+            // memory-mapping entry point, and the reply path forwards to it directly.
             const payload = action_buf[8..];
             const host_vaddr = std.mem.readInt(u64, payload[0..8], .little);
             const guest_addr = std.mem.readInt(u64, payload[8..16], .little);
             const map_size = std.mem.readInt(u64, payload[16..24], .little);
             const rights = payload[24];
-            const result = zag.kvm.vm.guestMap(proc, host_vaddr, guest_addr, map_size, @as(u64, rights));
+            const result = vm_mod.guestMap(proc, host_vaddr, guest_addr, map_size, @as(u64, rights));
             if (result != 0) return result;
-            vcpu_obj.state = .running;
+            vcpu_obj.storeState(.running);
             resumeVcpuThread(thread);
         },
         4 => {
             // kill
-            vcpu_obj.state = .exited;
+            vcpu_obj.storeState(.exited);
             thread.state = .exited;
         },
         else => return E_INVAL,
@@ -250,7 +308,7 @@ pub fn vmReply(proc: *Process, exit_token: u64, action_ptr: u64) i64 {
     return 0; // E_OK
 }
 
-fn deliverExitMessage(proc: *Process, vm_obj: *zag.kvm.Vm, thread: *Thread, buf_ptr: u64) i64 {
+fn deliverExitMessage(proc: *Process, vm_obj: *Vm, thread: *Thread, buf_ptr: u64) i64 {
     const E_BADADDR: i64 = -7;
 
     const vcpu_obj = vcpu_mod.vcpuFromThread(vm_obj, thread) orelse return E_BADADDR;
@@ -260,11 +318,12 @@ fn deliverExitMessage(proc: *Process, vm_obj: *zag.kvm.Vm, thread: *Thread, buf_
 
     // Mark this vCPU as pending
     const vcpu_index = vcpuIndex(vm_obj, vcpu_obj) orelse return E_BADADDR;
-    vm_obj.exit_box.lock.lock();
-    vm_obj.exit_box.markPendingLocked(vcpu_index);
-    vm_obj.exit_box.lock.unlock();
+    const box = vm_obj.exitBox();
+    box.lock.lock();
+    box.markPendingLocked(vcpu_index);
+    box.lock.unlock();
 
-    vcpu_obj.state = .waiting_reply;
+    vcpu_obj.storeState(.waiting_reply);
 
     // Write VmExitMessage to userspace via physmap
     writeExitMessageToUser(proc, buf_ptr, handle_id, vcpu_obj);
@@ -272,7 +331,7 @@ fn deliverExitMessage(proc: *Process, vm_obj: *zag.kvm.Vm, thread: *Thread, buf_
     return @intCast(handle_id);
 }
 
-pub fn writeExitMessageToUser(proc: *Process, buf_ptr: u64, handle_id: u64, vcpu_obj: *VCpu) void {
+fn writeExitMessageToUser(proc: *Process, buf_ptr: u64, handle_id: u64, vcpu_obj: *VCpu) void {
     // Write the message fields via physmap page-walking
     const msg = VmExitMessage{
         .thread_handle = handle_id,
@@ -319,7 +378,7 @@ fn readUserBytes(proc: *Process, user_va: u64, buf: []u8) bool {
     return true;
 }
 
-fn vcpuIndex(vm_obj: *zag.kvm.Vm, vcpu_obj: *VCpu) ?u32 {
+fn vcpuIndex(vm_obj: *Vm, vcpu_obj: *VCpu) ?u32 {
     for (vm_obj.vcpus[0..vm_obj.num_vcpus], 0..) |v, i| {
         if (v == vcpu_obj) return @intCast(i);
     }
