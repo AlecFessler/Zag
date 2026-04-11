@@ -57,6 +57,11 @@ pub const SyscallNum = enum(u64) {
     vm_msr_passthrough,
     vm_ioapic_assert_irq,
     vm_ioapic_deassert_irq,
+    pmu_info,
+    pmu_start,
+    pmu_read,
+    pmu_reset,
+    pmu_stop,
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -524,6 +529,69 @@ pub fn vm_ioapic_assert_irq(irq_num: u64) i64 {
 
 pub fn vm_ioapic_deassert_irq(irq_num: u64) i64 {
     return syscall1(.vm_ioapic_deassert_irq, irq_num);
+}
+
+// --- Performance Monitoring Unit (§2.14, §4.50–§4.54) ---
+
+pub const PMU_MAX_COUNTERS: usize = 8;
+
+pub const PmuEvent = enum(u32) {
+    cycles = 0,
+    instructions = 1,
+    cache_references = 2,
+    cache_misses = 3,
+    branch_instructions = 4,
+    branch_misses = 5,
+    bus_cycles = 6,
+    stalled_cycles_frontend = 7,
+    stalled_cycles_backend = 8,
+    _,
+};
+
+/// Configures one PMU counter. `overflow_threshold == 0` means precise counting
+/// (no overflow fault); a non-zero threshold selects sample-based profiling.
+/// Layout follows the observable contract in spec §2.14 — `event` first,
+/// `overflow_threshold` second. Impls may choose a concrete ABI for the
+/// spec's `?u64` overflow_threshold; tests here use the sentinel-zero form.
+pub const PmuCounterConfig = extern struct {
+    event: u32,
+    _pad0: u32 = 0,
+    overflow_threshold: u64 = 0,
+};
+
+pub const PmuInfo = extern struct {
+    num_counters: u8,
+    _pad0: [7]u8,
+    supported_events: u64,
+    overflow_support: u8,
+    _pad1: [7]u8,
+};
+
+pub const PmuSample = extern struct {
+    counters: [PMU_MAX_COUNTERS]u64,
+    timestamp: u64,
+};
+
+pub const FAULT_REASON_PMU_OVERFLOW: u8 = 15;
+
+pub fn pmu_info(info_ptr: u64) i64 {
+    return syscall1(.pmu_info, info_ptr);
+}
+
+pub fn pmu_start(thread_handle: u64, configs_ptr: u64, count: u64) i64 {
+    return syscall3(.pmu_start, thread_handle, configs_ptr, count);
+}
+
+pub fn pmu_read(thread_handle: u64, sample_ptr: u64) i64 {
+    return syscall2(.pmu_read, thread_handle, sample_ptr);
+}
+
+pub fn pmu_reset(thread_handle: u64, configs_ptr: u64, count: u64) i64 {
+    return syscall3(.pmu_reset, thread_handle, configs_ptr, count);
+}
+
+pub fn pmu_stop(thread_handle: u64) i64 {
+    return syscall1(.pmu_stop, thread_handle);
 }
 
 pub const FAULT_KILL: u64 = 0;

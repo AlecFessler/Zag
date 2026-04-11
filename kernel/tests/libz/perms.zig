@@ -21,7 +21,8 @@ pub const ProcessRights = packed struct(u16) {
     mem_shm_create: bool = false,
     device_own: bool = false,
     fault_handler: bool = false,
-    _reserved: u8 = 0,
+    pmu: bool = false,
+    _reserved: u7 = 0,
 
     pub fn bits(self: @This()) u64 {
         return @intCast(@as(u16, @bitCast(self)));
@@ -85,7 +86,9 @@ pub const ThreadHandleRights = packed struct(u8) {
     @"suspend": bool = false,
     @"resume": bool = false,
     kill: bool = false,
-    _reserved: u5 = 0,
+    _reserved_bit3: bool = false,
+    pmu: bool = false,
+    _reserved: u3 = 0,
 
     pub fn bits(self: @This()) u64 {
         return @intCast(@as(u8, @bitCast(self)));
@@ -95,5 +98,6 @@ pub const ThreadHandleRights = packed struct(u8) {
         .@"suspend" = true,
         .@"resume" = true,
         .kill = true,
+        .pmu = true,
     };
 };

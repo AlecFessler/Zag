@@ -23,6 +23,7 @@ pub const CrashReason = enum(u5) {
     normal_exit = 12,
     killed = 13,
     breakpoint = 14,
+    pmu_overflow = 15,
     _,
 };
 
