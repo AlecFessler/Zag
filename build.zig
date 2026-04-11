@@ -39,6 +39,13 @@ const profiles = struct {
         .iommu = "intel",
         .display = "gtk",
     };
+    const hyprvos = Profile{
+        .root_service = "hyprvOS/bin/hyprvOS.elf",
+        .net = "none",
+        .kvm = true,
+        .use_llvm = true,
+        .iommu = "intel",
+    };
 
 };
 
@@ -47,6 +54,7 @@ fn getProfile(name: []const u8) ?Profile {
     if (std.mem.eql(u8, name, "test")) return profiles.test_;
     if (std.mem.eql(u8, name, "bench")) return profiles.bench;
     if (std.mem.eql(u8, name, "desktop")) return profiles.desktop;
+    if (std.mem.eql(u8, name, "hyprvos")) return profiles.hyprvos;
 
     return null;
 }
@@ -205,7 +213,8 @@ pub fn build(b: *std.Build) void {
     else
         ""
     ;
-    const qemu_nvme_args: []const u8 = if (profile_name != null and std.mem.eql(u8, profile_name.?, "desktop"))
+    const qemu_nvme_args: []const u8 = if (profile_name != null and
+        (std.mem.eql(u8, profile_name.?, "desktop") or std.mem.eql(u8, profile_name.?, "hyprvos")))
         \\-drive file=nvme.img,format=raw,if=none,id=nvme0 \
         \\-device nvme,drive=nvme0,serial=zagdisk0
     else
