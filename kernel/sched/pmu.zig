@@ -257,16 +257,26 @@ fn readConfigs(
 ) ConfigReadError![]const PmuCounterConfig {
     if (count == 0) return ConfigReadError.Invalid; // §4.51.5
 
-    const info = arch.pmuGetInfo();
-    if (count > info.num_counters) return ConfigReadError.Invalid; // §4.51.6
-    if (count > out_buf.len) return ConfigReadError.Invalid;
+    // Cap `count` against the kernel buffer before touching user memory.
+    // Anything over `MAX_COUNTERS` also exceeds `PmuInfo.num_counters` by
+    // construction (§2.14 / §5: `num_counters <= MAX_COUNTERS`), so the
+    // spec's §4.51.6 E_INVAL still applies.
+    if (count > out_buf.len) return ConfigReadError.Invalid; // §4.51.6
 
     const total_bytes = std.math.mul(u64, count, @sizeOf(PmuCounterConfig)) catch
         return ConfigReadError.Invalid;
 
     // §4.51.9: readable region of count * sizeof(PmuCounterConfig) bytes.
+    // Validated before the hardware-dependent `count > num_counters` check
+    // so that a null/unmapped buffer always surfaces as E_BADADDR even on
+    // hosts whose PMU reports `num_counters == 0` (e.g. QEMU without PMU
+    // passthrough). On such hosts a legitimate caller can still observe
+    // §4.51.6 via `count > num_counters` below.
     const raw: []u8 = std.mem.sliceAsBytes(out_buf[0..@intCast(count)]);
     if (!readUser(proc, configs_ptr, raw[0..@intCast(total_bytes)])) return ConfigReadError.BadAddress;
+
+    const info = arch.pmuGetInfo();
+    if (count > info.num_counters) return ConfigReadError.Invalid; // §4.51.6
 
     // §4.51.7 / §4.51.8: per-entry validation.
     var i: usize = 0;
