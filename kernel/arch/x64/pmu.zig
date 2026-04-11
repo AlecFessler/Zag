@@ -491,6 +491,16 @@ fn pmuPmiHandler(ctx: *cpu.Context) void {
     // Step 7: yield so the scheduler picks a different thread; this
     // thread is now .faulted and the PMI handler must not return to the
     // interrupted RIP.
+    //
+    // Enable interrupts BEFORE calling yield: yield sends a self-IPI to
+    // trigger the context switch, but if IF=0 the IPI stays pending. The
+    // PMI handler would then return through dispatchInterrupt (which EOIs)
+    // and the stub's iret, letting the faulted thread briefly resume in
+    // user mode before the IPI finally lands. Matching the exception
+    // handler pattern in kernel/arch/x64/exceptions.zig, re-enabling
+    // interrupts here lets the self-IPI preempt the kernel handler
+    // immediately, so the thread never re-enters user space.
+    cpu.enableInterrupts();
     sched.yield();
 }
 
