@@ -602,19 +602,19 @@ CoreInfo (extern struct) {
 }
 ```
 
-`SysInfo.core_count` is the number of active CPU cores the kernel scheduled on at boot. It is a static property of a given boot and does not change between calls.
+**§2.15.1** `SysInfo.core_count` is the number of active CPU cores the kernel scheduled on at boot. It is a static property of a given boot and does not change between calls.
 
-`SysInfo.mem_total` is the total physical page count managed by the kernel.
+**§2.15.2** `SysInfo.mem_total` is the total physical page count managed by the kernel.
 
-`SysInfo.mem_free` is the number of physical pages currently free for allocation, sampled at the time of the call.
+**§2.15.3** `SysInfo.mem_free` is the number of physical pages currently free for allocation, sampled at the time of the call.
 
-`CoreInfo` entries are indexed by core ID: entry `i` describes core `i` for `i` in `[0, core_count)`.
+**§2.15.4** `CoreInfo` entries are indexed by core ID: entry `i` describes core `i` for `i` in `[0, core_count)`.
 
-`CoreInfo.freq_hz` is the current CPU frequency of the core in hertz.
+**§2.15.5** `CoreInfo.freq_hz` is the current CPU frequency of the core in hertz.
 
 `CoreInfo.temp_mc` is the current temperature of the core in milli-celsius (e.g. `45000` = 45.0°C). Milli-celsius is used in place of floating point so that sub-degree precision is preserved when the hardware exposes it.
 
-`CoreInfo.c_state` is the current CPU idle C-state level for the core. A value of `0` means the core is active; higher values indicate progressively deeper idle states.
+`CoreInfo.c_state` is the current CPU idle C-state level for the core. **§2.15.6** A value of `0` means the core is active; higher values indicate progressively deeper idle states.
 
 `CoreInfo.idle_ns` and `CoreInfo.busy_ns` are the nanoseconds the core spent running the idle thread and running real threads, respectively, accumulated since the last `sys_info` call that read per-core data for this core. Userspace computes utilization as `busy_ns / (idle_ns + busy_ns)`.
 
@@ -937,7 +937,7 @@ Writes system-wide information to `info_ptr` and, optionally, per-core informati
 
 Typical usage is a two-call pattern: first call with `cores_ptr = null` to obtain `SysInfo` and learn `core_count`, then allocate a buffer sized for `core_count` `CoreInfo` entries and call again in a poll loop with both pointers set to obtain live per-core data. The interval between consecutive calls with `cores_ptr != null` is the accounting window over which `idle_ns` and `busy_ns` are reported (§2.15).
 
-`sys_info` returns `E_OK` on success. `sys_info` requires no rights and is callable by any process. `sys_info` with `info_ptr` not pointing to a writable region of `sizeof(SysInfo)` bytes returns `E_BADADDR`. `sys_info` with `cores_ptr` null writes only `SysInfo`; no per-core data is written and no scheduler accounting counters are reset. `sys_info` with `cores_ptr` non-null must point to a writable region of `core_count * sizeof(CoreInfo)` bytes, where `core_count` is the value written to `info_ptr.core_count` by the same call; otherwise returns `E_BADADDR`. On success with `cores_ptr` non-null, `sys_info` writes `SysInfo` to `info_ptr` and a fully populated `CoreInfo` array to `cores_ptr`, and resets each core's `idle_ns` and `busy_ns` atomically as they are read.
+**§4.55.1** `sys_info` returns `E_OK` on success. **§4.55.2** `sys_info` requires no rights and is callable by any process. **§4.55.3** `sys_info` with `info_ptr` not pointing to a writable region of `sizeof(SysInfo)` bytes returns `E_BADADDR`. **§4.55.4** `sys_info` with `cores_ptr` null writes only `SysInfo`; no per-core data is written and no scheduler accounting counters are reset. **§4.55.5** `sys_info` with `cores_ptr` non-null must point to a writable region of `core_count * sizeof(CoreInfo)` bytes, where `core_count` is the value written to `info_ptr.core_count` by the same call; otherwise returns `E_BADADDR`. **§4.55.6** On success with `cores_ptr` non-null, `sys_info` writes `SysInfo` to `info_ptr` and a fully populated `CoreInfo` array to `cores_ptr`, and resets each core's `idle_ns` and `busy_ns` atomically as they are read.
 
 ---
 
