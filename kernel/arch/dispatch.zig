@@ -499,3 +499,81 @@ pub fn vmMsrPassthrough(vm_structures: PAddr, msr_num: u32, allow_read: bool, al
         else => unreachable,
     }
 }
+
+// --- PMU (performance monitoring unit) dispatch (systems.md §13, §20) ---
+
+pub const PmuState = switch (builtin.cpu.arch) {
+    .x86_64 => x64.pmu.PmuState,
+    .aarch64 => aarch64.pmu.PmuState,
+    else => @compileError("unsupported arch for PMU"),
+};
+
+/// Compile-time ceiling on the number of counter slots in `PmuSample`.
+/// Duplicated from `zag.sched.pmu.MAX_COUNTERS` so the arch dispatch
+/// layer does not force its callers to pull in `zag.sched.pmu` just to
+/// size a stack buffer.
+pub const pmu_max_counters: usize = 8;
+
+pub fn pmuInit() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.pmu.pmuInit(),
+        .aarch64 => aarch64.pmu.pmuInit(),
+        else => unreachable,
+    }
+}
+
+pub fn pmuGetInfo() zag.sched.pmu.PmuInfo {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.pmu.pmuGetInfo(),
+        .aarch64 => aarch64.pmu.pmuGetInfo(),
+        else => unreachable,
+    };
+}
+
+pub fn pmuSave(state: *PmuState) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.pmu.pmuSave(state),
+        .aarch64 => aarch64.pmu.pmuSave(state),
+        else => unreachable,
+    }
+}
+
+pub fn pmuRestore(state: *PmuState) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.pmu.pmuRestore(state),
+        .aarch64 => aarch64.pmu.pmuRestore(state),
+        else => unreachable,
+    }
+}
+
+pub fn pmuStart(state: *PmuState, configs: []const zag.sched.pmu.PmuCounterConfig) !void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => try x64.pmu.pmuStart(state, configs),
+        .aarch64 => try aarch64.pmu.pmuStart(state, configs),
+        else => unreachable,
+    }
+}
+
+pub fn pmuRead(state: *PmuState, sample: *zag.sched.pmu.PmuSample) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.pmu.pmuRead(state, sample),
+        .aarch64 => aarch64.pmu.pmuRead(state, sample),
+        else => unreachable,
+    }
+}
+
+pub fn pmuReset(state: *PmuState, configs: []const zag.sched.pmu.PmuCounterConfig) !void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => try x64.pmu.pmuReset(state, configs),
+        .aarch64 => try aarch64.pmu.pmuReset(state, configs),
+        else => unreachable,
+    }
+}
+
+pub fn pmuStop(state: *PmuState) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.pmu.pmuStop(state),
+        .aarch64 => aarch64.pmu.pmuStop(state),
+        else => unreachable,
+    }
+}

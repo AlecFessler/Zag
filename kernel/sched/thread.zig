@@ -78,9 +78,22 @@ pub const Thread = struct {
     /// at a later kernel-mode context produced by the scheduler IPI.
     /// Set by `faultBlock`, cleared on FAULT_RESUME / FAULT_RESUME_MODIFIED.
     fault_user_ctx: ?*ArchCpuContext = null,
+    /// Arch-specific PMU state (spec §2.14). `null` for threads that have
+    /// never called `pmu_start`; allocated lazily on first start and freed
+    /// on explicit `pmu_stop` or implicit release in `Thread.deinit`.
+    pmu_state: ?*arch.PmuState = null,
 
     pub fn deinit(self: *Thread) void {
         const proc = self.process;
+
+        // §2.14.9: automatic pmu_stop on thread exit. If the thread ever
+        // called pmu_start, tear down counters and return the state to the
+        // slab before we let the rest of cleanup proceed.
+        if (self.pmu_state) |state| {
+            arch.pmuStop(state);
+            zag.sched.pmu.allocator.destroy(state);
+            self.pmu_state = null;
+        }
 
         // Remove thread handle from own perm table and handler's perm table
         proc.removeThreadHandle(self);
