@@ -9,9 +9,12 @@ const boot = @import("boot.zig");
 const cpuid = @import("cpuid.zig");
 const disk = @import("disk.zig");
 const io = @import("io.zig");
+const ioapic = @import("ioapic.zig");
+const lapic = @import("lapic.zig");
 const log = @import("log.zig");
 const mem = @import("mem.zig");
 const msr = @import("msr.zig");
+const serial = @import("serial.zig");
 
 const perm_view = lib.perm_view;
 const syscall = lib.syscall;
@@ -111,6 +114,9 @@ pub fn main(pv: u64) void {
 
     const vcpu = findVcpuHandle(pv);
     if (vcpu == 0) { log.print("No vCPU\n"); syscall.shutdown(); }
+
+    // Init host serial for RX bridging
+    serial.init(pv);
 
     // Try NVMe for Linux boot, fall back to tiny test guest
     if (disk.init(pv)) {
@@ -223,7 +229,7 @@ noinline fn bootLinux() void {
     buildBootParams(hdr.initramfs_size);
 
     // Command line
-    boot.setupCmdline("console=ttyS0,115200 earlyprintk=serial,ttyS0,115200,keep earlycon=uart,io,0x3f8,115200n8 nokaslr nolapic noapic acpi=off nohpet nosmp ignore_loglevel tsc=reliable lpj=5000000");
+    boot.setupCmdline("console=ttyS0,115200n8 earlycon=uart,io,0x3f8,115200n8 earlyprintk=serial,ttyS0,115200,keep nokaslr nolapic noapic acpi=off nohpet nosmp ignore_loglevel tsc=reliable lpj=5000000 no_console_suspend keep_bootcon");
 
     // ACPI tables
     acpi.setupTables();
@@ -333,7 +339,7 @@ noinline fn setupLinuxState() void {
 /// VM exit handling loop — separate noinline to isolate stack frame.
 noinline fn exitLoop(vcpu_handle: u64) void {
     const start = syscall.clock_gettime();
-    const timeout_ns: u64 = 60_000_000_000; // 60 seconds
+    const timeout_ns: u64 = 600_000_000_000; // 10 minutes
 
     while (true) {
         const tok = syscall.vm_recv(@intFromPtr(&exit_buf), 0);
@@ -342,9 +348,9 @@ noinline fn exitLoop(vcpu_handle: u64) void {
                 log.print("TIMEOUT\n");
                 break;
             }
-            // While guest is running without exits, proactively inject timer
-            // interrupts by using vcpu_interrupt syscall (IPIs the vCPU core,
-            // suspends guest, injects EVENTINJ, resumes).
+            // Poll host serial for input while waiting
+            serial.pollHostRx();
+            // Proactively inject timer interrupts
             proactiveTimerInject(vcpu_handle);
             syscall.thread_yield();
             continue;
@@ -368,6 +374,13 @@ noinline fn exitLoop(vcpu_handle: u64) void {
 
         // Inject timer interrupt if due and guest has IF=1
         maybeInjectTimer(gs);
+
+        // Inject serial IRQ4 if pending and guest has IF=1
+        if (serial.irq_pending and gs.rflags & (1 << 9) != 0 and gs.pending_eventinj & (1 << 31) == 0) {
+            const vec: u8 = io.pic1_vector_base + 4; // IRQ4 = serial
+            gs.pending_eventinj = @as(u64, vec) | (1 << 31); // valid external interrupt
+            serial.irq_pending = false;
+        }
 
         // Resume guest
         @as(*align(1) u64, @ptrCast(&reply_buf)).* = REPLY_RESUME;
@@ -579,15 +592,14 @@ noinline fn handleTag(tag: u8, gs: *GuestState) bool {
     if (tag == EXIT_EPT) {
         const ept_addr = rdU64(&exit_buf, OFF_PAYLOAD);
         ept_count += 1;
-        if (ept_count <= 3) {
+        if (ept_count <= 10) {
             log.print("EPT@0x");
             log.hex64(ept_addr);
             log.print(" RIP=0x");
             log.hex64(gs.rip);
             log.print("\n");
         }
-        // Kill after many EPT violations — indicates a real problem
-        if (ept_count > 100) return true;
+        if (ept_count > 1000) return true;
         return false;
     }
     if (tag == EXIT_EXCEPT) {

@@ -84,6 +84,27 @@ pub noinline fn mapMmioStubs() void {
     }
 }
 
+/// Map a single page at a specific guest physical address and return the
+/// host virtual address. Used for MMIO device shadow pages (LAPIC, IOAPIC).
+pub noinline fn mapDevicePage(guest_phys: u64) ?[*]volatile u8 {
+    const result = syscall.vm_reserve(0, PAGE_SIZE, 0x7);
+    if (result.val < 0) return null;
+    const host_addr = result.val2;
+
+    const ptr: [*]u8 = @ptrFromInt(host_addr);
+    @memset(ptr[0..PAGE_SIZE], 0);
+
+    const mr = syscall.guest_map(host_addr, guest_phys, PAGE_SIZE, 0x7);
+    if (mr != syscall.E_OK) return null;
+
+    log.print("mem: device page at 0x");
+    log.hex64(guest_phys);
+    log.print(" -> host 0x");
+    log.hex64(host_addr);
+    log.print("\n");
+    return @ptrFromInt(host_addr);
+}
+
 /// Write data to guest physical memory via the host mapping.
 pub fn writeGuest(guest_phys: u64, data: []const u8) void {
     if (guest_phys + data.len > mapped_size) {

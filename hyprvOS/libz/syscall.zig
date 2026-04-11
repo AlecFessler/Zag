@@ -178,6 +178,14 @@ pub fn dma_map(device_handle: u64, shm_handle: u64) i64 {
     return syscall2(.dma_map, device_handle, shm_handle);
 }
 
+pub fn ioport_read(device_handle: u64, port_offset: u64, width: u64) i64 {
+    return syscall3(.ioport_read, device_handle, port_offset, width);
+}
+
+pub fn ioport_write(device_handle: u64, port_offset: u64, width: u64, value: u64) i64 {
+    return syscall4(.ioport_write, device_handle, port_offset, width, value);
+}
+
 pub fn vm_create(vcpu_count: u64, policy_ptr: u64) i64 {
     return syscall2(.vm_create, vcpu_count, policy_ptr);
 }
