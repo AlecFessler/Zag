@@ -364,3 +364,129 @@ pub fn enableDmaRemapping() void {
         else => unreachable,
     }
 }
+
+// --- VM (hardware virtualization) dispatch ---
+
+pub const GuestState = switch (builtin.cpu.arch) {
+    .x86_64 => x64.vm.GuestState,
+    .aarch64 => aarch64.vm.GuestState,
+    else => @compileError("unsupported arch for VM"),
+};
+
+pub const VmExitInfo = switch (builtin.cpu.arch) {
+    .x86_64 => x64.vm.VmExitInfo,
+    .aarch64 => aarch64.vm.VmExitInfo,
+    else => @compileError("unsupported arch for VM"),
+};
+
+pub const GuestInterrupt = switch (builtin.cpu.arch) {
+    .x86_64 => x64.vm.GuestInterrupt,
+    .aarch64 => aarch64.vm.GuestInterrupt,
+    else => @compileError("unsupported arch for VM"),
+};
+
+pub const GuestException = switch (builtin.cpu.arch) {
+    .x86_64 => x64.vm.GuestException,
+    .aarch64 => aarch64.vm.GuestException,
+    else => @compileError("unsupported arch for VM"),
+};
+
+pub const VmPolicy = switch (builtin.cpu.arch) {
+    .x86_64 => x64.vm.VmPolicy,
+    .aarch64 => aarch64.vm.VmPolicy,
+    else => @compileError("unsupported arch for VM"),
+};
+
+pub const FxsaveArea = switch (builtin.cpu.arch) {
+    .x86_64 => x64.vm.FxsaveArea,
+    .aarch64 => aarch64.vm.FxsaveArea,
+    else => @compileError("unsupported arch for VM"),
+};
+
+pub fn fxsaveInit() FxsaveArea {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm.fxsaveInit(),
+        .aarch64 => aarch64.vm.fxsaveInit(),
+        else => @compileError("unsupported arch for VM"),
+    };
+}
+
+pub fn vmInit() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm.vmInit(),
+        .aarch64 => aarch64.vm.vmInit(),
+        else => unreachable,
+    }
+}
+
+pub fn vmPerCoreInit() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm.vmPerCoreInit(),
+        .aarch64 => aarch64.vm.vmPerCoreInit(),
+        else => unreachable,
+    }
+}
+
+pub fn vmSupported() bool {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm.vmSupported(),
+        .aarch64 => aarch64.vm.vmSupported(),
+        else => unreachable,
+    };
+}
+
+pub fn vmResume(guest_state: *GuestState, vm_structures: PAddr, guest_fxsave: *align(16) FxsaveArea) VmExitInfo {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm.vmResume(guest_state, vm_structures, guest_fxsave),
+        .aarch64 => @panic("unimplemented"),
+        else => unreachable,
+    };
+}
+
+pub fn vmAllocStructures() ?PAddr {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm.vmAllocStructures(),
+        .aarch64 => null,
+        else => unreachable,
+    };
+}
+
+pub fn vmFreeStructures(paddr: PAddr) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm.vmFreeStructures(paddr),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
+pub fn mapGuestPage(vm_structures: PAddr, guest_phys: u64, host_phys: PAddr, rights: u8) !void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => try x64.vm.mapGuestPage(vm_structures, guest_phys, host_phys, rights),
+        .aarch64 => @panic("unimplemented"),
+        else => unreachable,
+    }
+}
+
+pub fn unmapGuestPage(vm_structures: PAddr, guest_phys: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm.unmapGuestPage(vm_structures, guest_phys),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
+pub fn vmInjectInterrupt(guest_state: *GuestState, interrupt: GuestInterrupt) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm.injectInterrupt(guest_state, interrupt),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
+pub fn vmInjectException(guest_state: *GuestState, exception: GuestException) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm.injectException(guest_state, exception),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}

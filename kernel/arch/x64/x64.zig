@@ -12,3 +12,4 @@ pub const paging = @import("paging.zig");
 pub const serial = @import("serial.zig");
 pub const smp = @import("smp.zig");
 pub const timers = @import("timers.zig");
+pub const vm = @import("vm.zig");

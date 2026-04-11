@@ -71,10 +71,16 @@ pub const CpuidLeaf = enum(u32) {
     basic_max = 0x00000000,
     basic_features = 0x00000001,
     ext_max = 0x80000000,
+    /// AMD extended features — ECX bit 2 = SVM support.
+    /// AMD APM Vol 2, Section 15.4, CPUID Fn 8000_0001h.
+    ext_features = 0x80000001,
     brand_0 = 0x80000002,
     brand_1 = 0x80000003,
     brand_2 = 0x80000004,
     ext_power = 0x80000007,
+    /// SVM revision and feature identification.
+    /// AMD APM Vol 2, Section 15.30.1, CPUID Fn 8000_000Ah.
+    svm_features = 0x8000000A,
 };
 
 pub const CpuidPowerEdx = enum(u32) {

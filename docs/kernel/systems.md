@@ -18,9 +18,10 @@ Zag is implemented in Zig, targeting x86_64 (with an aarch64 stub). The kernel i
    - `memory.initHeap()` -- Kernel heap allocator init.
    - `debug.info.init()` -- ELF symbol table for stack traces.
    - `arch.parseFirmwareTables(xsdp_phys)` -- ACPI parsing: MADT (cores, APIC), HPET, MCFG (PCI ECAM). PCI enumeration and serial port probing. Device registration.
+   - `arch.vmInit()` -- Detect hardware virtualization support via CPUID, cache availability flag. After firmware tables (needs CPUID), before scheduler.
    - `sched.globalInit()` -- Process/thread slab allocators, idle process, run queues, root service creation with all rights, device grant to root service, enqueue root service initial thread.
    - `arch.smpInit()` -- Secondary core bringup via INIT/SIPI IPI sequence with real-mode trampoline at physical address `0x8000`.
-   - `sched.perCoreInit()` -- Per-core scheduler state, preemption timer arm, enable interrupts.
+   - `sched.perCoreInit()` -- Per-core scheduler state, preemption timer arm, `arch.vmPerCoreInit()` (per-core VMX/SVM setup), enable interrupts.
    - `arch.halt()` -- Bootstrap core enters halt loop (scheduler takes over via timer interrupt).
 
 ### Architecture Dispatch Layer
@@ -84,6 +85,13 @@ kernel/
   devices/
     devices.zig          -- device module root
     registry.zig         -- device table and registration
+  kvm/
+    kvm.zig              -- module root (re-exports)
+    vm.zig               -- Vm struct, vm_create, vm_destroy, guest_map
+    vcpu.zig             -- VCpu struct, vcpu_run, vcpu_set_state, vcpu_get_state, vcpu_interrupt
+    exit_box.zig         -- VmExitBox, VmExitMessage, VmReplyAction, vm_recv, vm_reply
+    exit_handler.zig     -- VM exit dispatch (kernel-handled vs VMM-handled classification)
+    guest_memory.zig     -- guest physical address space tracking and cleanup
 ```
 
 ---
@@ -122,6 +130,7 @@ Process {
     restart_count: u16                     -- number of restarts (wraps on overflow)
     thread_handle_rights: ThreadHandleRights -- rights mask for thread handles in this process's own perm table
     max_thread_priority: Priority           -- ceiling priority for threads in this process
+    vm: ?*kvm.Vm = null                     -- owned VM, if any (at most one per process)
 }
 ```
 
@@ -919,6 +928,10 @@ After creating the fresh initial thread, a thread handle insertion phase runs:
 
 **`fault_handler_proc` is not cleared during restart.** The debugging relationship persists across restarts.
 
+### VM Cleanup on Process Exit
+
+If `proc.vm != null` when a process exits, the kernel calls `kvm.vm.destroy()` before address space teardown. This kills all vCPU threads, frees guest physical memory mappings, tears down arch-specific virtualization structures (VMCS/EPT on x64), frees the Vm and VCpu structs back to their slabs, and clears `proc.vm`. This ensures guest memory pages are freed before `freeUserAddrSpace` runs.
+
 ### proc_create Internals
 
 **New parameters**: `thread_rights: ThreadHandleRights` and `max_thread_priority: Priority`. `thread_rights` is stored on the Process struct as `thread_handle_rights: ThreadHandleRights` — this is the rights mask used whenever a new thread handle is inserted into this process's own perm table. `max_thread_priority` is stored as `process.max_thread_priority: Priority` — this is the ceiling priority for any thread in the process. The kernel validates that `max_thread_priority` does not exceed the parent's own `max_thread_priority`.
@@ -1033,6 +1046,14 @@ Portable dispatch layer in `kernel/arch/dispatch.zig`. All functions dispatch at
 **ioportIn(port: u16, width: u8) -> u32** -- `in` instruction. Width 1 = `inb`, 2 = `inw`, 4 = `ind`.
 
 **ioportOut(port: u16, width: u8, value: u32) -> void** -- `out` instruction. Width 1 = `outb`, 2 = `outw`, 4 = `outd`.
+
+### Virtual Machine
+
+**vmInit() -> void** -- Detect hardware virtualization support via CPUID (Intel VT-x or AMD-V). Cache availability in a global flag. Called once from `kMain` after `parseFirmwareTables`.
+
+**vmPerCoreInit() -> void** -- Per-core VM setup. On Intel: execute VMXON to enter VMX root operation. On AMD: set EFER.SVME. Called from `sched.perCoreInit()`.
+
+**vmSupported() -> bool** -- Returns the cached virtualization availability flag.
 
 ### Diagnostics
 
@@ -1157,6 +1178,8 @@ In debug mode, tracks net allocations and asserts zero on `deinit`.
 - `DeviceRegionSlab`: `SlabAllocator(DeviceRegion, false, 0, 32)` -- device region objects.
 - `ProcessAllocator`: `SlabAllocator(Process, false, 0, 64)` -- process structs.
 - `ThreadAllocator`: `SlabAllocator(Thread, false, 0, 64)` -- thread structs.
+- `VmAllocator`: `SlabAllocator(kvm.Vm, false, 0, 64)` -- VM structs.
+- `VCpuAllocator`: `SlabAllocator(kvm.VCpu, false, 0, 64)` -- vCPU structs.
 
 ### Heap Allocator
 
@@ -1218,7 +1241,9 @@ Size: 32 GiB. Maps all physical memory (free and ACPI regions) using the largest
   [+shm_slab.end, +16 MiB)                         -- DeviceRegion slab
   [+device_region_slab.end, +16 MiB)               -- Process slab
   [+proc_slab.end, +16 MiB)                        -- Thread slab
-  [+thread_slab.end, +1 GiB)                       -- Heap tree node slab
+  [+thread_slab.end, +16 MiB)                      -- Vm slab
+  [+vm_slab.end, +16 MiB)                          -- VCpu slab
+  [+vcpu_slab.end, +1 GiB)                         -- Heap tree node slab
   [+heap_tree.end, +256 GiB)                       -- Kernel heap
 
 [0xFFFF_FF80_0000_0000, 0xFFFF_FF88_0000_0000)  -- Physmap (32 GiB)
@@ -1238,8 +1263,8 @@ Comptime assertions verify that no kernel VA regions overlap.
 7. Initialize buddy allocator spanning from smallest physical address to end of largest-address free region. Metadata allocated from bump allocator.
 8. Feed all free memory map regions into buddy allocator (excluding bump allocator's consumed range and low memory below 1 MiB).
 9. Initialize global PMM with buddy allocator as backing.
-10. Initialize slab bump allocators for each kernel object type (VmNode, VmTree, SHM, DeviceRegion, Process, Thread) -- each gets a 16 MiB VA region.
-11. Initialize slabs: VmNode slab, VmTree slab, DeviceRegion slab, SharedMemory slab.
+10. Initialize slab bump allocators for each kernel object type (VmNode, VmTree, SHM, DeviceRegion, Process, Thread, Vm, VCpu) -- each gets a 16 MiB VA region.
+11. Initialize slabs: VmNode slab, VmTree slab, DeviceRegion slab, SharedMemory slab, Vm slab, VCpu slab.
 
 `memory.initHeap()`:
 1. Initialize heap tree bump allocator (1 GiB region).
@@ -1578,3 +1603,185 @@ offset  size  field
 ```
 
 Both the synchronous-dequeue path (`writeFaultMessage` in `arch/syscall.zig`) and the cross-AS direct delivery path (`writeFaultMessageInto` in `sched/process.zig`) build the same 176 bytes via a shared `buildFaultMessage` helper.
+
+---
+
+## 19. VM Internals
+
+### Architecture Layering
+
+The VM arch dispatch follows the same pattern as the rest of the kernel:
+
+```
+arch/dispatch.zig       — generic VM interface, comptime dispatch on arch
+arch/x64/vm.zig         — x64 VM interface, runtime dispatch on CPU vendor (Intel vs AMD)
+arch/x64/intel/vmx.zig  — Intel VT-x implementation
+arch/x64/amd/svm.zig    — AMD-V/SVM implementation (VMCB, NPT, VMRUN/#VMEXIT, MSR/IO intercepts)
+```
+
+The runtime vs comptime distinction matters: Intel vs AMD is a runtime check (CPUID vendor detection at boot) because the same kernel binary runs on both. x64 vs other architectures is comptime because you cross-compile for a target.
+
+Generic types exposed by `arch/dispatch.zig` for VM support:
+
+```zig
+pub const GuestState = switch (builtin.cpu.arch) {
+    .x86_64 => x64.GuestState,
+    .aarch64 => aarch64.GuestState,
+    else => @compileError("unsupported architecture"),
+};
+```
+
+Same pattern for `VmExitInfo`, `GuestInterrupt`, `GuestException`, `VmPolicy`. The aarch64 variants are empty struct stubs.
+
+Dispatch functions added to `arch/dispatch.zig`:
+- `pub fn vmInit() void` — dispatches to arch VM initialization (CPUID feature detection, global flag set).
+- `pub fn vmPerCoreInit() void` — dispatches to per-core arch VM setup (VMXON on Intel, EFER.SVME on AMD).
+- `pub fn vmSupported() bool` — returns whether hardware virtualization is available (cached from `vmInit`).
+
+Hardware virtualization availability is detected once at boot in `arch.vmInit()` and cached. `vm_create` checks this cached flag and returns `E_NODEV` if unavailable.
+
+### x64-Specific Types
+
+Defined in `kernel/arch/x64/vm.zig`:
+
+- `GuestState` — all x64 guest registers: GP regs (RAX-R15), RIP, RSP, RFLAGS, CR0/CR2/CR3/CR4, segment registers (CS/DS/ES/FS/GS/SS with selector, base, limit, access rights), MSRs that need saving.
+- `VmExitInfo` — tagged union of all x64 exit reasons with qualification data.
+- `GuestInterrupt` — x64 interrupt injection fields: vector, type, error code valid flag.
+- `GuestException` — x64 exception injection fields: vector, error code, fault address.
+- `VmPolicy` — x64 policy table: CPU feature query responses (CPUID leaf/subleaf → EAX/EBX/ECX/EDX), privileged register policy.
+
+`kernel/arch/x64/vm.zig` detects Intel vs AMD at runtime via CPUID vendor string and dispatches all VM operations to `intel/vmx.zig` or `amd/svm.zig`. Also handles per-core VMX/SVM initialization called from `sched.perCoreInit()`.
+
+### Vm Struct
+
+Defined in `kernel/kvm/vm.zig`:
+
+```
+Vm {
+    vcpus:      [MAX_VCPUS]*VCpu    -- MAX_VCPUS = 64
+    num_vcpus:  u32
+    owner:      *Process
+    exit_box:   VmExitBox
+    policy:     arch.VmPolicy       -- static, set at creation, never changes
+    lock:       SpinLock
+    vm_id:      u64                 -- monotonic ID
+}
+```
+
+`MAX_VCPUS` = 64, matching `MAX_THREADS`.
+
+The Vm is not a perm table entry type — ownership is implicit via `proc.vm`. No capability transfer of VM objects is supported.
+
+### VCpu Struct
+
+Defined in `kernel/kvm/vcpu.zig`:
+
+```
+VCpu {
+    thread:      *Thread
+    vm:          *Vm
+    guest_state: arch.GuestState    -- current guest register snapshot
+    state:       VCpuState          -- { idle, running, exited, waiting_reply }
+}
+```
+
+State meanings:
+- `idle` — created but not yet started via `vcpu_run`.
+- `running` — actively executing guest code or scheduled to do so.
+- `exited` — hit a VM exit, waiting for `vm_recv`.
+- `waiting_reply` — exit message delivered, pending reply.
+
+vCPU threads have a fixed kernel-managed entry point in `kernel/kvm/vcpu.zig`. When scheduled, they execute the arch equivalent of VMRESUME. When a VM exit fires, the hardware returns to host mode on that thread's kernel stack and the arch VM exit handler runs, calling `kernel/kvm/exit_handler.zig`.
+
+vCPU threads are allocated from the existing `ThreadAllocator` slab.
+
+### VmExitBox
+
+Defined in `kernel/kvm/exit_box.zig`:
+
+```
+VmExitBox {
+    state:    VmExitBoxState    -- { idle, receiving, pending_replies }
+    queue:    PriorityQueue     -- queued exited vCPUs waiting to be recv'd
+    receiver: ?*Thread          -- thread blocked on vm_recv
+    pending:  [MAX_VCPUS]bool   -- which vCPUs have unresolved exits
+    lock:     SpinLock
+}
+```
+
+Unlike FaultBox which has a single `pending_reply` constraint, VmExitBox tracks one pending exit per vCPU independently. Multiple vCPUs can exit simultaneously — each enqueues on the box. The VM manager dequeues and replies to each via the exit token (the vCPU's thread handle ID). The box moves to `idle` only when all pending exits are resolved.
+
+State transitions:
+- `idle` → `receiving`: VM manager calls blocking `vm_recv` with empty queue.
+- `idle` → `pending_replies`: first vCPU exit arrives, VM manager calls `vm_recv` and dequeues it.
+- `receiving` → `pending_replies`: vCPU exit delivered directly to blocked receiver.
+- `pending_replies` → `idle`: last pending exit resolved via `vm_reply`.
+- `pending_replies` → `pending_replies`: additional vCPU exits arrive or are resolved while others remain pending.
+
+### VmExitMessage and VmReplyAction
+
+Defined in `kernel/kvm/exit_box.zig`:
+
+```
+VmExitMessage {
+    thread_handle: u64              -- vCPU thread handle ID in caller's perm table
+    exit_info:     arch.VmExitInfo  -- arch-specific exit reason and qualification
+    guest_state:   arch.GuestState  -- full guest register snapshot at time of exit
+}
+```
+
+```
+VmReplyAction = union(enum) {
+    resume:           arch.GuestState
+    inject_interrupt: arch.GuestInterrupt
+    inject_exception: arch.GuestException
+    map_memory: struct { host_vaddr: u64, guest_addr: u64, size: u64, rights: u8 }
+    kill:             void
+}
+```
+
+### Exit Handler
+
+Defined in `kernel/kvm/exit_handler.zig`. Called by the arch layer when a VM exit fires. Classifies exits as kernel-handled or VMM-handled.
+
+**Kernel-handled inline** — resolved without VMM involvement:
+- Guest CPU feature queries where the queried feature is in `vm.policy` — kernel returns the pre-configured response.
+- Guest privileged register accesses where the register is in `vm.policy` — kernel returns/accepts the pre-configured value.
+
+**VMM-handled** — enqueued on VmExitBox:
+- Guest device I/O (port I/O, MMIO on unmapped regions).
+- Guest memory access on unmapped guest physical regions.
+- Guest CPU feature queries not in `vm.policy`.
+- Guest privileged register accesses not in `vm.policy`.
+- Guest halt.
+- Guest shutdown or unrecoverable fault.
+
+For VMM-handled exits, the handler snapshots guest state, enqueues on the exit box, and transitions the vCPU to `exited` state.
+
+### Guest Memory
+
+Defined in `kernel/kvm/guest_memory.zig`. Tracks guest physical memory regions for cleanup.
+
+Guest physical address space is managed separately from host virtual address space. The VM has its own arch-specific guest physical memory structures (EPT on x64, Stage-2 page tables on ARM).
+
+`guest_map(host_vaddr, guest_addr, size, rights)` maps an existing host virtual memory range into the guest's physical address space. The kernel walks the VMM process's page tables to resolve each host page to its physical address, then wires that physical page into the guest EPT at the corresponding guest physical address. The VMM retains host access to the pages. `rights` controls guest access permissions (read, write, execute) in EPT.
+
+EPT violations on unmapped guest physical regions are delivered to the VMM as exits. The VMM can respond by calling `guest_map` to wire more host pages, or by injecting a fault into the guest.
+
+### Slab Allocators
+
+Two new slabs added to `kernel/memory/init.zig`, each with dedicated 16 MiB bump allocator backing regions:
+- `VmAllocator = SlabAllocator(kvm.Vm, false, 0, 64)` — Vm structs.
+- `VCpuAllocator = SlabAllocator(kvm.VCpu, false, 0, 64)` — VCpu structs.
+
+Initialized in `memory.init()` alongside the existing slabs.
+
+### Locking
+
+VmExitBox lock ordering: acquire `exit_box.lock` before `fault_box.lock` if both are ever needed simultaneously. In practice they should never be needed at the same time.
+
+The Vm struct has its own `lock: SpinLock` protecting vCPU list and VM-wide state. Lock ordering: `vm.lock` before `exit_box.lock`.
+
+### Module Root
+
+`kernel/kvm/kvm.zig` re-exports all kvm types. Referenced by `kernel/zag.zig` as `pub const kvm = @import("kvm/kvm.zig")`.

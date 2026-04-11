@@ -1,0 +1,35 @@
+/// §4.40.1 — `guest_map` returns `E_OK` on success.
+const lib = @import("lib");
+
+const syscall = lib.syscall;
+const t = lib.testing;
+
+var policy: [4096]u8 align(4096) = .{0} ** 4096;
+
+pub fn main(_: u64) void {
+    const cr = syscall.vm_create(1, @intFromPtr(&policy));
+    if (cr == syscall.E_NODEV) {
+        t.pass("§4.40.1");
+        syscall.shutdown();
+    }
+    if (cr != syscall.E_OK) {
+        t.failWithVal("§4.40.1 create", syscall.E_OK, cr);
+        syscall.shutdown();
+    }
+
+    // Reserve a host buffer to back the guest mapping.
+    const res = syscall.vm_reserve(0, syscall.PAGE4K, 0x3);
+    const host_vaddr = res.val2;
+    if (res.val < 0) {
+        t.failWithVal("§4.40.1 reserve", 0, res.val);
+        _ = syscall.vm_destroy();
+        syscall.shutdown();
+    }
+
+    // Map host buffer into guest at guest physical 0x1000 with read rights.
+    const result = syscall.guest_map(host_vaddr, 0x1000, syscall.PAGE4K, 0x1);
+    t.expectEqual("§4.40.1", syscall.E_OK, result);
+
+    _ = syscall.vm_destroy();
+    syscall.shutdown();
+}

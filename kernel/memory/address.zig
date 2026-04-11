@@ -67,9 +67,17 @@ pub const KernelVA = struct {
             .start = proc_slab.end,
             .end = proc_slab.end + SLAB_RESERVATION,
         };
-        pub const heap_tree: Range = .{
+        pub const kvm_vm_slab: Range = .{
             .start = thread_slab.end,
-            .end = thread_slab.end + PAGE1G,
+            .end = thread_slab.end + SLAB_RESERVATION,
+        };
+        pub const kvm_vcpu_slab: Range = .{
+            .start = kvm_vm_slab.end,
+            .end = kvm_vm_slab.end + SLAB_RESERVATION,
+        };
+        pub const heap_tree: Range = .{
+            .start = kvm_vcpu_slab.end,
+            .end = kvm_vcpu_slab.end + PAGE1G,
         };
         pub const heap: Range = .{
             .start = heap_tree.end,

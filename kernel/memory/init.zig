@@ -5,6 +5,7 @@ const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const boot = zag.boot;
 const device_region_mod = zag.memory.device_region;
+const kvm = zag.kvm;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const shared = zag.memory.shared;
@@ -36,6 +37,8 @@ var device_region_slab_bump: BumpAllocator = undefined;
 
 pub var proc_slab_backing: BumpAllocator = undefined;
 pub var thread_slab_backing: BumpAllocator = undefined;
+pub var kvm_vm_slab_backing: BumpAllocator = undefined;
+pub var kvm_vcpu_slab_backing: BumpAllocator = undefined;
 
 var heap_tree_bump: BumpAllocator = undefined;
 var heap_tree_allocator: HeapTreeAllocator = undefined;
@@ -181,6 +184,8 @@ pub fn init(firmware_mmap: MMap) !void {
     device_region_slab_bump = BumpAllocator.init(KA.device_region_slab.start, KA.device_region_slab.end);
     proc_slab_backing = BumpAllocator.init(KA.proc_slab.start, KA.proc_slab.end);
     thread_slab_backing = BumpAllocator.init(KA.thread_slab.start, KA.thread_slab.end);
+    kvm_vm_slab_backing = BumpAllocator.init(KA.kvm_vm_slab.start, KA.kvm_vm_slab.end);
+    kvm_vcpu_slab_backing = BumpAllocator.init(KA.kvm_vcpu_slab.start, KA.kvm_vcpu_slab.end);
 
     try vmm_mod.initSlabs(vm_node_slab_bump.allocator(), vm_tree_slab_bump.allocator());
     try device_region_mod.initSlab(device_region_slab_bump.allocator());

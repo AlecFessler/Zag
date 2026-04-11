@@ -10,6 +10,7 @@ const stack_mod = zag.memory.stack;
 
 const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
 const FaultReason = zag.perms.permissions.FaultReason;
+const kvm = zag.kvm;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const Process = zag.sched.process.Process;
@@ -94,6 +95,46 @@ pub const Thread = struct {
         if (!is_last) {
             if (self.user_stack) |ustack| {
                 stack_mod.destroyUser(ustack, &proc.vmm);
+            }
+
+            // §2.13.2: When a user thread exits and only vCPU threads remain,
+            // destroy the VM (killing vCPU threads) and deinit them so the
+            // process can proceed to exit. Without this, blocked vCPU threads
+            // keep num_threads > 0 and lastThreadExited is never called.
+            if (proc.vm) |vm_obj| {
+                // Check if all remaining threads are vCPU threads.
+                var all_vcpu = true;
+                proc.lock.lock();
+                const remaining = proc.threads[0..proc.num_threads];
+                for (remaining) |t| {
+                    if (kvm.vcpu.vcpuFromThread(vm_obj, t) == null) {
+                        all_vcpu = false;
+                        break;
+                    }
+                }
+                proc.lock.unlock();
+
+                if (all_vcpu) {
+                    // Destroy the VM — marks all vCPU threads as exited and
+                    // removes them from run queues.
+                    vm_obj.destroy();
+
+                    // Deinit the vCPU threads. Each deinit calls removeThread;
+                    // the last one triggers lastThreadExited -> process exit.
+                    // Snapshot the list since deinit mutates it.
+                    proc.lock.lock();
+                    var vcpu_threads: [Process.MAX_THREADS]*Thread = undefined;
+                    var num_vcpu: u32 = 0;
+                    for (proc.threads[0..proc.num_threads]) |t| {
+                        vcpu_threads[num_vcpu] = t;
+                        num_vcpu += 1;
+                    }
+                    proc.lock.unlock();
+
+                    for (vcpu_threads[0..num_vcpu]) |t| {
+                        t.deinit();
+                    }
+                }
             }
         }
 
@@ -184,4 +225,4 @@ fn unmapKernelStack(stack: Stack) void {
 }
 
 pub var allocator: std.mem.Allocator = undefined;
-var tid_counter: u64 = 1;
+pub var tid_counter: u64 = 1;

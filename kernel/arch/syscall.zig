@@ -4,6 +4,7 @@ const zag = @import("zag");
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const futex = zag.sched.futex;
+const kvm = zag.kvm;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const process_mod = zag.sched.process;
@@ -84,6 +85,15 @@ pub const SyscallNum = enum(u64) {
     fault_read_mem,
     fault_write_mem,
     fault_set_thread_mode,
+    vm_create,
+    vm_destroy,
+    guest_map,
+    vm_recv,
+    vm_reply,
+    vcpu_set_state,
+    vcpu_get_state,
+    vcpu_run,
+    vcpu_interrupt,
     _,
 };
 
@@ -141,6 +151,15 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
         .fault_read_mem => .{ .rax = sysFaultReadMem(arg0, arg1, arg2, arg3) },
         .fault_write_mem => .{ .rax = sysFaultWriteMem(arg0, arg1, arg2, arg3) },
         .fault_set_thread_mode => .{ .rax = sysFaultSetThreadMode(arg0, arg1) },
+        .vm_create => .{ .rax = sysVmCreate(arg0, arg1) },
+        .vm_destroy => .{ .rax = sysVmDestroy() },
+        .guest_map => .{ .rax = sysGuestMap(arg0, arg1, arg2, arg3) },
+        .vm_recv => sysVmRecv(ctx, arg0, arg1),
+        .vm_reply => .{ .rax = sysVmReplyCall(arg0, arg1) },
+        .vcpu_set_state => .{ .rax = sysVcpuSetState(arg0, arg1) },
+        .vcpu_get_state => .{ .rax = sysVcpuGetState(arg0, arg1) },
+        .vcpu_run => .{ .rax = sysVcpuRun(arg0) },
+        .vcpu_interrupt => .{ .rax = sysVcpuInterrupt(arg0, arg1) },
         _ => .{ .rax = E_INVAL },
     };
 }
@@ -2097,4 +2116,53 @@ fn sysDmaUnmap(device_handle: u64, shm_handle: u64) i64 {
     const mapping = proc.removeDmaMapping(device, shm) orelse return E_NOENT;
     arch.unmapDmaPages(device, mapping.dma_base, mapping.num_pages);
     return E_OK;
+}
+
+// --- VM Syscalls ---
+
+fn sysVmCreate(vcpu_count: u64, policy_ptr: u64) i64 {
+    const proc = currentProc();
+    if (vcpu_count > std.math.maxInt(u32)) return E_INVAL;
+    return kvm.vm.vmCreate(proc, @intCast(vcpu_count), policy_ptr);
+}
+
+fn sysVmDestroy() i64 {
+    const proc = currentProc();
+    return kvm.vm.vmDestroy(proc);
+}
+
+fn sysGuestMap(host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
+    const proc = currentProc();
+    return kvm.vm.guestMap(proc, host_vaddr, guest_addr, size, rights);
+}
+
+fn sysVmRecv(ctx: *ArchCpuContext, buf_ptr: u64, blocking: u64) SyscallResult {
+    const thread = sched.currentThread().?;
+    const proc = thread.process;
+    return kvm.exit_box.vmRecv(proc, thread, ctx, buf_ptr, blocking != 0);
+}
+
+fn sysVmReplyCall(exit_token: u64, action_ptr: u64) i64 {
+    const proc = currentProc();
+    return kvm.exit_box.vmReply(proc, exit_token, action_ptr);
+}
+
+fn sysVcpuSetState(thread_handle: u64, state_ptr: u64) i64 {
+    const proc = currentProc();
+    return kvm.vcpu.vcpuSetState(proc, thread_handle, state_ptr);
+}
+
+fn sysVcpuGetState(thread_handle: u64, state_ptr: u64) i64 {
+    const proc = currentProc();
+    return kvm.vcpu.vcpuGetState(proc, thread_handle, state_ptr);
+}
+
+fn sysVcpuRun(thread_handle: u64) i64 {
+    const proc = currentProc();
+    return kvm.vcpu.vcpuRun(proc, thread_handle);
+}
+
+fn sysVcpuInterrupt(thread_handle: u64, interrupt_ptr: u64) i64 {
+    const proc = currentProc();
+    return kvm.vcpu.vcpuInterrupt(proc, thread_handle, interrupt_ptr);
 }

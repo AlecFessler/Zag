@@ -5,6 +5,7 @@ const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const elf = std.elf;
 const futex = zag.sched.futex;
+const kvm = zag.kvm;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
@@ -95,6 +96,7 @@ pub const Process = struct {
     // decide whether restoring the bit is semantically valid — we never
     // want to synthesize a right the sender didn't have to begin with.
     had_self_fault_handler: bool = true,
+    vm: ?*kvm.Vm = null,
 
     pub const MAX_THREADS = 64;
     pub const MAX_CHILDREN = 64;
@@ -1074,6 +1076,11 @@ pub const Process = struct {
             handler.fault_box.drainByProcessLocked(self);
             handler.fault_box.lock.unlock();
             self.fault_handler_proc = null;
+        }
+
+        if (self.vm) |vm_obj| {
+            vm_obj.destroy();
+            self.vm = null;
         }
 
         self.cleanupIpcState();

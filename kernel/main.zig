@@ -36,6 +36,7 @@ fn kMain(boot_info: *BootInfo) !void {
     try memory.initHeap();
     debug.info.init(boot_info.elf_blob, memory.heap_allocator);
     try arch.parseFirmwareTables(boot_info.xsdp_phys);
+    arch.vmInit();
     device_registry.registerDisplayDevice(boot_info.framebuffer);
     const rs_phys = PAddr.fromInt(@intFromPtr(boot_info.root_service.ptr));
     const rs_virt = VAddr.fromPAddr(rs_phys, null);

@@ -5,6 +5,7 @@ const arch = zag.arch.dispatch;
 const containers = zag.containers;
 const device_registry = zag.devices.registry;
 const futex = zag.sched.futex;
+const kvm = zag.kvm;
 const memory_init = zag.memory.init;
 const process_mod = zag.sched.process;
 const thread_mod = zag.sched.thread;
@@ -18,9 +19,13 @@ const Thread = zag.sched.thread.Thread;
 const ThreadAllocator = zag.sched.thread.ThreadAllocator;
 const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
 const Timer = zag.arch.timer.Timer;
+const VCpuAllocator = kvm.vcpu.VCpuAllocator;
+const VmAllocator = kvm.vm.VmAllocator;
 
 var proc_alloc_instance: ProcessAllocator = undefined;
 var thread_alloc_instance: ThreadAllocator = undefined;
+var vm_alloc_instance: VmAllocator = undefined;
+var vcpu_alloc_instance: VCpuAllocator = undefined;
 
 pub var idle_process: *Process = undefined;
 pub var initialized: bool = false;
@@ -585,6 +590,12 @@ pub fn globalInit(root_service_elf: []const u8) !void {
     thread_alloc_instance = try ThreadAllocator.init(memory_init.thread_slab_backing.allocator());
     thread_mod.allocator = thread_alloc_instance.allocator();
 
+    vm_alloc_instance = try VmAllocator.init(memory_init.kvm_vm_slab_backing.allocator());
+    kvm.vm.allocator = vm_alloc_instance.allocator();
+
+    vcpu_alloc_instance = try VCpuAllocator.init(memory_init.kvm_vcpu_slab_backing.allocator());
+    kvm.vcpu.allocator = vcpu_alloc_instance.allocator();
+
     idle_process = try Process.createIdle();
 
     const root_proc = try Process.create(root_service_elf, .{
@@ -622,6 +633,7 @@ pub fn perCoreInit() void {
     state.idle_thread = idle_thread;
     state.running_thread = idle_thread;
 
+    arch.vmPerCoreInit();
     state.timer = arch.getPreemptionTimer();
     arch.enableInterrupts();
     armSchedTimer(state, SCHED_TIMESLICE_NS);

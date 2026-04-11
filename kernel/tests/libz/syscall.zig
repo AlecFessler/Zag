@@ -45,6 +45,15 @@ pub const SyscallNum = enum(u64) {
     fault_read_mem,
     fault_write_mem,
     fault_set_thread_mode,
+    vm_create,
+    vm_destroy,
+    guest_map,
+    vm_recv,
+    vm_reply,
+    vcpu_set_state,
+    vcpu_get_state,
+    vcpu_run,
+    vcpu_interrupt,
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -449,6 +458,57 @@ pub fn fault_write_mem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64
 
 pub fn fault_set_thread_mode(thread_handle: u64, mode: u64) i64 {
     return syscall2(.fault_set_thread_mode, thread_handle, mode);
+}
+
+// --- VM / vCPU Syscalls ---
+
+pub const E_OK: i64 = 0;
+pub const E_INVAL: i64 = -1;
+pub const E_PERM: i64 = -2;
+pub const E_BADHANDLE: i64 = -3;
+pub const E_NOMEM: i64 = -4;
+pub const E_MAXCAP: i64 = -5;
+pub const E_BADADDR: i64 = -7;
+pub const E_TIMEOUT: i64 = -8;
+pub const E_AGAIN: i64 = -9;
+pub const E_NOENT: i64 = -10;
+pub const E_BUSY: i64 = -11;
+pub const E_NODEV: i64 = -13;
+
+pub fn vm_create(vcpu_count: u64, policy_ptr: u64) i64 {
+    return syscall2(.vm_create, vcpu_count, policy_ptr);
+}
+
+pub fn vm_destroy() i64 {
+    return syscall0(.vm_destroy);
+}
+
+pub fn guest_map(host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
+    return syscall4(.guest_map, host_vaddr, guest_addr, size, rights);
+}
+
+pub fn vm_recv(buf_ptr: u64, blocking: u64) i64 {
+    return syscall2(.vm_recv, buf_ptr, blocking);
+}
+
+pub fn vm_reply_action(exit_token: u64, action_ptr: u64) i64 {
+    return syscall2(.vm_reply, exit_token, action_ptr);
+}
+
+pub fn vcpu_set_state(thread_handle: u64, guest_state_ptr: u64) i64 {
+    return syscall2(.vcpu_set_state, thread_handle, guest_state_ptr);
+}
+
+pub fn vcpu_get_state(thread_handle: u64, guest_state_ptr: u64) i64 {
+    return syscall2(.vcpu_get_state, thread_handle, guest_state_ptr);
+}
+
+pub fn vcpu_run(thread_handle: u64) i64 {
+    return syscall1(.vcpu_run, thread_handle);
+}
+
+pub fn vcpu_interrupt(thread_handle: u64, interrupt_ptr: u64) i64 {
+    return syscall2(.vcpu_interrupt, thread_handle, interrupt_ptr);
 }
 
 pub const FAULT_KILL: u64 = 0;

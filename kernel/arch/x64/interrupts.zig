@@ -113,7 +113,11 @@ pub fn prepareThreadContext(
     } else {
         ctx.cs = gdt.KERNEL_CODE_OFFSET;
         ctx.ss = gdt.KERNEL_DATA_OFFSET;
-        ctx.rsp = ctx_addr;
+        // Subtract 8 to simulate a CALL instruction's return-address push,
+        // so the entry function sees RSP ≡ 8 (mod 16) per the SysV ABI.
+        // The slot at ctx_addr-8 falls in the (already-restored) FXSAVE area
+        // and is zero, which is fine — kernel entry points never return.
+        ctx.rsp = ctx_addr - 8;
     }
 
     return @ptrCast(ctx);

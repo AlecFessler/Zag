@@ -2,7 +2,7 @@
 
 ## §1 Scope
 
-Zag is a microkernel. It provides the minimal set of abstractions needed for isolated userspace processes to communicate and share hardware: physical memory management, virtual memory management, execution management, inter-process communication via shared memory and synchronous message passing, device access, and capability-based permission enforcement. Everything else lives in userspace.
+Zag is a microkernel. It provides the minimal set of abstractions needed for isolated userspace processes to communicate and share hardware: physical memory management, virtual memory management, execution management, inter-process communication via shared memory and synchronous message passing, device access, capability-based permission enforcement, and virtual machine hosting. Everything else lives in userspace.
 
 ---
 
@@ -404,6 +404,74 @@ Reply flags (additional r14 bits):
 
 ---
 
+### §2.13 Virtual Machine
+
+Zag supports hosting virtual machines via kernel-managed VM primitives. A userspace VM manager process creates and manages a VM, handles VM exits that require policy decisions or device emulation, and communicates with other Zag services for device I/O. The kernel handles low-level VM mechanics; policy lives in userspace.
+
+**§2.13.1** All VM syscalls (except `vm_create`) return `E_INVAL` if the calling process has no VM.
+
+**§2.13.2** When the VM manager process exits or is killed, the kernel destroys its VM as part of process cleanup: all vCPU threads are killed, guest memory is freed, and the VM is deallocated. This happens before the process's own address space is freed.
+
+#### vCPU
+
+A vCPU represents a virtual CPU. vCPU threads are created internally by the kernel during `vm_create`, not via `thread_create`. The scheduler treats vCPU threads like any other thread.
+
+**§2.13.3** vCPU threads appear in the VM manager process's permissions table as normal thread handles with full `ThreadHandleRights`.
+
+#### VmExitBox
+
+The VM has a dedicated exit box, separate from the VM manager process's fault box and IPC message box.
+
+**§2.13.4** Multiple vCPUs can exit simultaneously. Each exit is tracked independently per vCPU. The VM manager dequeues exits via `vm_recv` and replies to each via `vm_reply` using the exit token (the vCPU's thread handle ID).
+
+**§2.13.5** `vm_recv` writes a `VmExitMessage` to the caller's buffer and returns the exit token.
+
+#### VmExitMessage
+
+The `VmExitMessage` struct written to userspace on `vm_recv`:
+
+| Offset | Size | Field |
+|--------|------|-------|
+| 0 | 8 | `thread_handle` — vCPU thread handle ID in caller's perm table |
+| 8 | variable | `exit_info` — arch-specific exit reason and qualification (`arch.VmExitInfo`) |
+| 8+exit_info | variable | `guest_state` — full guest register snapshot (`arch.GuestState`) |
+
+**§2.13.6** The exit token returned by `vm_recv` equals `VmExitMessage.thread_handle`.
+
+#### VmReplyAction
+
+The action passed to `vm_reply`:
+
+| Variant | Payload | Behavior |
+|---------|---------|----------|
+| `resume_guest` | `arch.GuestState` | Resume with possibly modified guest state |
+| `inject_interrupt` | `arch.GuestInterrupt` | Resume with virtual interrupt pending |
+| `inject_exception` | `arch.GuestException` | Resume with exception pending |
+| `map_memory` | `host_vaddr: u64, guest_addr: u64, size: u64, rights: u8` | Map host memory as guest physical memory, then resume |
+| `kill` | (none) | Terminate the vCPU |
+
+**§2.13.7** A `vm_reply` with `map_memory` action maps host memory as guest physical memory at the specified address and resumes the vCPU.
+
+#### Guest Memory
+
+**§2.13.8** Guest memory access faults on unmapped guest physical regions are delivered to the VMM as exits, allowing the VMM to map the region or inject a fault.
+
+#### Kernel-Handled vs VMM-Handled Exits
+
+**§2.13.9** The kernel handles some exits inline without VMM involvement: CPU feature queries covered by the VM policy return the configured response and advance RIP. Privileged register accesses covered by the VM policy are also handled inline.
+
+**§2.13.10** All other exits are delivered to the VMM via the VmExitBox: device I/O, unmapped memory access, uncovered privileged register accesses, guest halt, guest shutdown, and unrecoverable faults.
+
+#### Interrupt Injection
+
+**§2.13.11** `vcpu_interrupt` injects a virtual interrupt into a vCPU. If the vCPU is running, the kernel IPIs its core, injects the interrupt, and immediately resumes.
+
+**§2.13.12** If the vCPU is not currently running, the kernel writes the pending interrupt into the vCPU's arch state for delivery on next resume.
+
+**§2.13.13** The `VmExitMessage.guest_state` snapshot reflects the guest register state at the point of exit, including the instruction pointer of the exiting instruction.
+
+---
+
 ## §3 Fault Reasons
 
 Each fault or termination records a `FaultReason` (u5) in the process's slot 0 `field0` and the parent's user view entry:
@@ -604,6 +672,60 @@ Same validation as `ioport_read`. **§4.28.1** `ioport_write` returns `E_OK` on 
 
 **§4.37.1** `fault_set_thread_mode` returns `E_OK` on success. **§4.37.2** `fault_set_thread_mode` requires that the calling process holds `fault_handler` for the owning process of the target thread; returns `E_PERM` otherwise. **§4.37.3** `fault_set_thread_mode` with invalid or wrong-type `thread_handle` returns `E_BADHANDLE`. **§4.37.4** `fault_set_thread_mode` with invalid `mode` value returns `E_INVAL`.
 
+### §4.38 vm_create(vcpu_count, policy_ptr) → result
+
+Creates a VM with the specified number of vCPUs and a static policy table. Creates vCPU threads with fixed kernel-managed entry points and inserts thread handles for all vCPUs into the calling process's permissions table with full `ThreadHandleRights`. Sets `proc.vm`.
+
+**§4.38.1** `vm_create` returns `E_OK` on success. **§4.38.2** `vm_create` with `vcpu_count` = 0 returns `E_INVAL`. **§4.38.3** `vm_create` with `vcpu_count` exceeding `MAX_VCPUS` (64) returns `E_INVAL`. **§4.38.4** `vm_create` when the calling process already has a VM returns `E_INVAL`. **§4.38.5** `vm_create` returns `E_NODEV` if hardware virtualization is not supported. **§4.38.6** `vm_create` returns `E_MAXCAP` if the permissions table cannot fit all vCPU thread handles. **§4.38.7** `vm_create` reads an `arch.VmPolicy` struct from `policy_ptr`. Returns `E_BADADDR` if `policy_ptr` is not readable.
+
+### §4.39 vm_destroy() → result
+
+Destroys the calling process's VM. Kills all vCPU threads, tears down guest memory mappings, frees arch-specific virtualization structures, and clears `proc.vm`.
+
+**§4.39.1** `vm_destroy` returns `E_OK` on success. **§4.39.2** `vm_destroy` with no VM returns `E_INVAL`. **§4.39.3** `vm_destroy` with running vCPUs returns `E_OK` and cleanly tears down the VM.
+
+### §4.40 guest_map(host_vaddr, guest_addr, size, rights) → result
+
+Maps a host virtual memory range as guest physical memory at the specified guest address. The kernel resolves the host pages and wires them into the guest's physical address space. The VMM process retains host access to the pages.
+
+**§4.40.1** `guest_map` returns `E_OK` on success. **§4.40.2** `guest_map` with zero size returns `E_INVAL`. **§4.40.3** `guest_map` with non-page-aligned `guest_addr` returns `E_INVAL`. **§4.40.4** `guest_map` with non-page-aligned `size` returns `E_INVAL`. **§4.40.5** `guest_map` with invalid rights bits returns `E_INVAL`. **§4.40.6** `guest_map` with non-page-aligned `host_vaddr` returns `E_INVAL`. **§4.40.7** `guest_map` with `host_vaddr` not pointing to a valid mapped region in the caller's address space returns `E_BADADDR`.
+
+### §4.41 vm_recv(buf_ptr, blocking) → exit_token
+
+Reads a VM exit from the calling process's VmExitBox. Writes a `VmExitMessage` to `buf_ptr`. Returns the exit token (vCPU thread handle ID) on success.
+
+**§4.41.1** `vm_recv` returns the exit token (positive u64) on success. **§4.41.2** `vm_recv` with blocking flag set blocks when no exits are pending. **§4.41.3** `vm_recv` with blocking flag clear returns `E_AGAIN` when no exits are pending. **§4.41.4** `vm_recv` with `buf_ptr` not pointing to a writable region of `sizeof(VmExitMessage)` bytes returns `E_BADADDR`.
+
+### §4.42 vm_reply(exit_token, action_ptr) → result
+
+Resolves a pending VM exit identified by `exit_token`. `action_ptr` points to a `VmReplyAction`.
+
+**§4.42.1** `vm_reply` returns `E_OK` on success. **§4.42.2** `vm_reply` with `exit_token` not matching any pending exit returns `E_NOENT`. **§4.42.3** `vm_reply` with `action_ptr` not readable returns `E_BADADDR`. **§4.42.4** `vm_reply` with invalid action type returns `E_INVAL`. **§4.42.5** `vm_reply` with `resume_guest` action resumes the guest with the provided guest state. The VMM is responsible for advancing RIP past the exiting instruction if needed. **§4.42.6** `vm_reply` with `resume_guest` applies modified guest state, including GPR changes, before resuming execution.
+
+### §4.43 vcpu_set_state(thread_handle, guest_state_ptr) → result
+
+Sets the full guest register state for a vCPU. Only valid when the vCPU is in `idle` state (before `vcpu_run`).
+
+**§4.43.1** `vcpu_set_state` returns `E_OK` on success. **§4.43.2** `vcpu_set_state` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`. **§4.43.3** `vcpu_set_state` when the vCPU is not in `idle` state returns `E_BUSY`. **§4.43.4** `vcpu_set_state` with `guest_state_ptr` not pointing to a readable region of `sizeof(arch.GuestState)` bytes returns `E_BADADDR`.
+
+### §4.44 vcpu_get_state(thread_handle, guest_state_ptr) → result
+
+Reads the full guest register state for a vCPU. If running, the kernel IPIs its core, suspends, snapshots, writes, and resumes.
+
+**§4.44.1** `vcpu_get_state` returns `E_OK` on success. **§4.44.2** `vcpu_get_state` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`. **§4.44.3** `vcpu_get_state` with `guest_state_ptr` not pointing to a writable region of `sizeof(arch.GuestState)` bytes returns `E_BADADDR`. **§4.44.4** `vcpu_get_state` after `vcpu_set_state` returns the same register values that were set.
+
+### §4.45 vcpu_run(thread_handle) → result
+
+Transitions a vCPU from `idle` to `running`, making its thread eligible for scheduling.
+
+**§4.45.1** `vcpu_run` returns `E_OK` on success. **§4.45.2** `vcpu_run` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`. **§4.45.3** `vcpu_run` when the vCPU is not in `idle` state returns `E_BUSY`.
+
+### §4.46 vcpu_interrupt(thread_handle, interrupt_ptr) → result
+
+Injects a virtual interrupt into a vCPU.
+
+**§4.46.1** `vcpu_interrupt` returns `E_OK` on success. **§4.46.2** `vcpu_interrupt` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`. **§4.46.3** `vcpu_interrupt` with `interrupt_ptr` not readable returns `E_BADADDR`.
+
 ---
 
 ## §5 System Limits
@@ -623,3 +745,4 @@ Same validation as `ioport_read`. **§4.28.1** `ioport_write` returns `E_OK` on 
 | User permissions view | 1 page (128 entries × 32 bytes) |
 | DMA mappings per process | 16 |
 | Thread handle rights bits | 3 (suspend, resume, kill) |
+| Max vCPUs per VM | 64 |

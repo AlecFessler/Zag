@@ -117,7 +117,7 @@ pub const BuddyAllocator = struct {
 
     fn recursiveSplit(self: *BuddyAllocator, order: u4) ?u64 {
         const addr_ptr = self.freelists[order].pop() orelse {
-            if (order == 10) return null;
+            if (order == MAX_ORDER) return null;
 
             const higher = order + 1;
             const recursive_addr = self.recursiveSplit(higher) orelse return null;
@@ -141,7 +141,7 @@ pub const BuddyAllocator = struct {
 
     fn recursiveMerge(self: *BuddyAllocator, addr: u64) struct { addr: u64, order: u4 } {
         const order = self.getOrder(addr);
-        if (order == 10) return .{ .addr = addr, .order = order };
+        if (order == MAX_ORDER) return .{ .addr = addr, .order = order };
 
         const rel = addr - self.start_addr;
         const buddy = self.start_addr + (rel ^ ORDERS[order]);
@@ -210,7 +210,7 @@ pub const BuddyAllocator = struct {
 
         const num_pages = len / PAGE_SIZE;
         const order: u4 = @intCast(@ctz(num_pages));
-        std.debug.assert(order < 11);
+        std.debug.assert(order < NUM_ORDERS);
 
         const addr = self.recursiveSplit(order) orelse return null;
         self.bitmap.setBit(addr, 0);
@@ -479,7 +479,8 @@ const IntrusiveFreeList = intrusive_freelist.IntrusiveFreeList(
     link_to_list,
 );
 
-const NUM_ORDERS = 11;
+const MAX_ORDER = 14;
+const NUM_ORDERS = MAX_ORDER + 1;
 const ORDERS = blk: {
     var arr: [NUM_ORDERS]u64 = undefined;
     for (0..NUM_ORDERS) |i| {

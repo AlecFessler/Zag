@@ -172,6 +172,7 @@ pub fn build(b: *std.Build) void {
     const child_try_set_priority_bin = buildChild(b, target, lib_mod, "child_try_set_priority", "children/child_try_set_priority.zig");
     const child_pin_then_restart_bin = buildChild(b, target, lib_mod, "child_pin_then_restart", "children/child_pin_then_restart.zig");
     const child_sched_try_create_with_priority_bin = buildChild(b, target, lib_mod, "child_sched_try_create_with_priority", "children/child_sched_try_create_with_priority.zig");
+    const child_vm_create_exit_bin = buildChild(b, target, lib_mod, "child_vm_create_exit", "children/child_vm_create_exit.zig");
 
     const embedded_wf = b.addWriteFiles();
     _ = embedded_wf.addCopyFile(child_exit_bin, "child_exit.elf");
@@ -299,6 +300,7 @@ pub fn build(b: *std.Build) void {
     _ = embedded_wf.addCopyFile(child_try_set_priority_bin, "child_try_set_priority.elf");
     _ = embedded_wf.addCopyFile(child_pin_then_restart_bin, "child_pin_then_restart.elf");
     _ = embedded_wf.addCopyFile(child_sched_try_create_with_priority_bin, "child_sched_try_create_with_priority.elf");
+    _ = embedded_wf.addCopyFile(child_vm_create_exit_bin, "child_vm_create_exit.elf");
     const embed_src = embedded_wf.add("embedded_children.zig",
         \\pub const child_exit = @embedFile("child_exit.elf");
         \\pub const child_shm_counter = @embedFile("child_shm_counter.elf");
@@ -425,6 +427,7 @@ pub fn build(b: *std.Build) void {
         \\pub const child_try_set_priority = @embedFile("child_try_set_priority.elf");
         \\pub const child_pin_then_restart = @embedFile("child_pin_then_restart.elf");
         \\pub const child_sched_try_create_with_priority = @embedFile("child_sched_try_create_with_priority.elf");
+        \\pub const child_vm_create_exit = @embedFile("child_vm_create_exit.elf");
         \\
     );
 
