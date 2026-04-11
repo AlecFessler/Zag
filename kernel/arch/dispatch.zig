@@ -522,6 +522,14 @@ pub fn pmuInit() void {
     }
 }
 
+pub fn pmuPerCoreInit() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.pmu.pmuPerCoreInit(),
+        .aarch64 => aarch64.pmu.pmuPerCoreInit(),
+        else => unreachable,
+    }
+}
+
 pub fn pmuGetInfo() zag.sched.pmu.PmuInfo {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.pmu.pmuGetInfo(),

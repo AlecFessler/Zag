@@ -1993,10 +1993,13 @@ x64.PmuState (extern struct) {
 
 **Initialization** (`x64.pmuInit`): reads CPUID leaf `0x0A` (Architectural Performance Monitoring). The `EAX` register returns the version ID in bits 0–7, the number of general-purpose counters per logical core in bits 8–15, and the bit width of each counter in bits 16–23. `EBX` bits 0–6 indicate which architectural events are *not* available (a 1 bit means the event is missing). From these the init routine:
 
-1. Caches the GP counter count as `PmuInfo.num_counters`.
-2. Walks the `PmuEvent` enum and, for each variant, checks whether the corresponding architectural event is available via the `EBX` inverse bitmap; sets the corresponding bit in `PmuInfo.supported_events`.
-3. Sets `PmuInfo.overflow_support = true` if the PMI LVT entry is wired up (it is — see below).
-4. Programs the LAPIC LVT performance-counter entry with the PMI vector and registers `x64.pmuPmiHandler` as the IDT handler for that vector.
+1. Rejects `version < 2`. `IA32_PERF_GLOBAL_CTRL`, `_STATUS`, and `_OVF_CTRL` are only guaranteed present on architectural PMU v2+ (Intel SDM Vol 3 §18.2.2); writing them on a v1-only CPU raises `#GP`. Zag therefore requires architectural PMU v2+ on x64 — on v1-only hardware the kernel bails out early with `num_counters = 0`, and the generic syscall layer rejects every `pmu_start`.
+2. Caches the GP counter count as `PmuInfo.num_counters`.
+3. Walks the `PmuEvent` enum and, for each variant, checks whether the corresponding architectural event is available via the `EBX` inverse bitmap; sets the corresponding bit in `PmuInfo.supported_events`.
+4. Sets `PmuInfo.overflow_support = true` if the PMI LVT entry is wired up (it is — see below).
+5. Registers `x64.pmuPmiHandler` as the IDT handler for the PMI vector. The LAPIC LVT performance-counter entry is programmed per-core by `pmuPerCoreInit`, not here.
+
+**Per-core init** (`x64.pmuPerCoreInit`): runs on every core (BSP and APs) from `sched.perCoreInit`. If `cached_info.num_counters == 0` it is a no-op. Otherwise it programs the LAPIC LVT performance-counter entry with the PMI vector (fixed delivery, unmasked) so overflows on this core deliver to `pmuPmiHandler`. Without this hook, secondary cores' LVT entries would never be programmed and PMIs there would be masked / misdelivered.
 
 **Event mapping**: each `PmuEvent` variant has a baked-in `(event_select, unit_mask)` pair matching the architectural events defined in Intel SDM Vol 3 Ch 18 and AMD APM Vol 2 Ch 13. For example, `PmuEvent.cycles` → `(0x3C, 0x00)` (`CPU_CLK_UNHALTED.THREAD`), `PmuEvent.instructions` → `(0xC0, 0x00)` (`INST_RETIRED.ANY_P`), etc. The mapping table lives in `arch/x64/pmu.zig` and is *not* visible to any other kernel file.
 

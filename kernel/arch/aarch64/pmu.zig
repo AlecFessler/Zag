@@ -16,6 +16,8 @@ pub const PmuState = extern struct {};
 
 pub fn pmuInit() void {}
 
+pub fn pmuPerCoreInit() void {}
+
 pub fn pmuGetInfo() pmu.PmuInfo {
     return .{
         .num_counters = 0,

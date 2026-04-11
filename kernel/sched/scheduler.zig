@@ -668,6 +668,7 @@ pub fn perCoreInit() void {
     state.running_thread = idle_thread;
 
     arch.vmPerCoreInit();
+    arch.pmuPerCoreInit();
     state.timer = arch.getPreemptionTimer();
     arch.enableInterrupts();
     armSchedTimer(state, SCHED_TIMESLICE_NS);

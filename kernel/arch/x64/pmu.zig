@@ -161,6 +161,12 @@ var counter_bitwidth: u8 = 0;
 /// One-time PMU bring-up on the bootstrap core. Intel SDM Vol 3 §18.2.2
 /// "CPUID leaf 0AH" describes the detection protocol. Called from `kMain`
 /// between `arch.vmInit()` and `sched.globalInit()`.
+///
+/// This routine runs once on the BSP only: it does the global CPUID
+/// detection, caches `PmuInfo`, and wires the PMI vector into the IDT /
+/// interrupts dispatch table. Per-core LAPIC LVT programming happens in
+/// `pmuPerCoreInit`, which is called from `sched.perCoreInit` on every
+/// core (BSP and APs).
 pub fn pmuInit() void {
     // CPUID.0AH.EAX[7:0] = version ID. 0 means architectural PMU absent.
     const max_basic = cpu.cpuid(.basic_max, 0).eax;
@@ -168,7 +174,10 @@ pub fn pmuInit() void {
 
     const leaf = cpu.cpuidRaw(0x0A, 0);
     const version: u8 = @truncate(leaf.eax & 0xFF);
-    if (version == 0) return;
+    // Intel SDM Vol 3 §18.2.2: IA32_PERF_GLOBAL_CTRL / _STATUS / _OVF_CTRL
+    // are only guaranteed present on architectural PMU version ≥ 2. Writing
+    // them on a v1-only CPU raises #GP. Refuse to enable the PMU on v1.
+    if (version < 2) return;
 
     const num_gp: u8 = @truncate((leaf.eax >> 8) & 0xFF);
     const width: u8 = @truncate((leaf.eax >> 16) & 0xFF);
@@ -220,9 +229,22 @@ pub fn pmuInit() void {
         .interrupt_gate,
     );
 
-    // Program the LAPIC LVT performance-counter entry with the PMI vector.
-    // Unmasked, fixed delivery. Intel SDM Vol 3 §10.5.1 "Local Vector Table"
-    // and §18.6.3 "Generating an Interrupt on Overflow".
+    // The BSP's LVT is programmed by its own pmuPerCoreInit() call from
+    // sched.perCoreInit(); we do not program it here.
+}
+
+/// Per-core PMU bring-up. Runs on every core (BSP and APs) from
+/// `sched.perCoreInit`. Programs the LAPIC LVT performance-counter entry
+/// with the PMI vector so overflows on this core are delivered to
+/// `pmuPmiHandler`. Intel SDM Vol 3 §10.5.1 "Local Vector Table" and
+/// §18.6.3 "Generating an Interrupt on Overflow".
+///
+/// Cheap enough to run unconditionally: if `pmuInit` bailed out
+/// (no PMU present or v1-only), `cached_info.num_counters == 0` and the
+/// generic syscall layer rejects every `pmu_start`, so the LVT entry is
+/// harmless even though counters can never overflow.
+pub fn pmuPerCoreInit() void {
+    if (cached_info.num_counters == 0) return;
     if (apic.x2Apic) {
         const lvt_val: u64 = PMI_VECTOR; // delivery mode = fixed (0), mask = 0
         cpu.wrmsr(
