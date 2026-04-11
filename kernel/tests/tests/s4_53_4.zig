@@ -7,7 +7,7 @@ const t = lib.testing;
 pub fn main(_: u64) void {
     var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
 
-    const rc_bad = syscall.pmu_reset(0xdead_beef, @intFromPtr(&cfg), 1);
+    const rc_bad = syscall.pmu_reset(t.BOGUS_HANDLE, @intFromPtr(&cfg), 1);
     if (rc_bad != syscall.E_BADHANDLE) {
         t.failWithVal("§4.53.4 bogus", syscall.E_BADHANDLE, rc_bad);
         syscall.shutdown();

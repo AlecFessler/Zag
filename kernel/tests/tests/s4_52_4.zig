@@ -7,7 +7,7 @@ const t = lib.testing;
 pub fn main(_: u64) void {
     var sample: syscall.PmuSample = undefined;
 
-    const rc_bad = syscall.pmu_read(0xdead_beef, @intFromPtr(&sample));
+    const rc_bad = syscall.pmu_read(t.BOGUS_HANDLE, @intFromPtr(&sample));
     if (rc_bad != syscall.E_BADHANDLE) {
         t.failWithVal("§4.52.4 bogus", syscall.E_BADHANDLE, rc_bad);
         syscall.shutdown();

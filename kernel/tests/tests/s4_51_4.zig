@@ -8,7 +8,7 @@ pub fn main(_: u64) void {
     var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
 
     // Bogus handle ID — never allocated.
-    const rc_bad = syscall.pmu_start(0xdead_beef, @intFromPtr(&cfg), 1);
+    const rc_bad = syscall.pmu_start(t.BOGUS_HANDLE, @intFromPtr(&cfg), 1);
     if (rc_bad != syscall.E_BADHANDLE) {
         t.failWithVal("§4.51.4 bogus", syscall.E_BADHANDLE, rc_bad);
         syscall.shutdown();
