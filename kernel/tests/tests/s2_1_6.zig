@@ -33,9 +33,9 @@ pub fn main(pv: u64) void {
     // Persistence check: perform several intervening operations and verify
     // the dead_process slot survives them untouched.
     const rw = perms.VmReservationRights{ .read = true, .write = true };
-    const r1 = syscall.vm_reserve(0, 4096, rw.bits());
+    const r1 = syscall.mem_reserve(0, 4096, rw.bits());
     const vm_handle: u64 = @bitCast(r1.val);
-    const shm_rc = syscall.shm_create(4096);
+    const shm_rc = syscall.mem_shm_create(4096);
     const shm_handle: u64 = @bitCast(shm_rc);
     for (0..10) |_| syscall.thread_yield();
     _ = syscall.revoke_perm(vm_handle);

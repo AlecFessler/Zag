@@ -1,4 +1,4 @@
-/// §4.47.4 — `msr_passthrough` with an MSR in the security blocklist returns `E_PERM`.
+/// §4.47.4 — `vm_msr_passthrough` with an MSR in the security blocklist returns `E_PERM`.
 const lib = @import("lib");
 
 const syscall = lib.syscall;
@@ -34,17 +34,17 @@ pub fn main(_: u64) void {
     var passed = true;
     for (blocklist) |msr| {
         // Try both read-only and write-only and read+write — all should be denied.
-        const r_ro = syscall.msr_passthrough(msr, 1, 0);
+        const r_ro = syscall.vm_msr_passthrough(msr, 1, 0);
         if (r_ro != syscall.E_PERM) {
             t.failWithVal("§4.47.4 ro", syscall.E_PERM, r_ro);
             passed = false;
         }
-        const r_wo = syscall.msr_passthrough(msr, 0, 1);
+        const r_wo = syscall.vm_msr_passthrough(msr, 0, 1);
         if (r_wo != syscall.E_PERM) {
             t.failWithVal("§4.47.4 wo", syscall.E_PERM, r_wo);
             passed = false;
         }
-        const r_rw = syscall.msr_passthrough(msr, 1, 1);
+        const r_rw = syscall.vm_msr_passthrough(msr, 1, 1);
         if (r_rw != syscall.E_PERM) {
             t.failWithVal("§4.47.4 rw", syscall.E_PERM, r_rw);
             passed = false;

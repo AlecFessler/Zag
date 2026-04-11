@@ -40,9 +40,9 @@ pub fn main(perm_view_addr: u64) void {
         .write = true,
         .shareable = true,
     }).bits();
-    const vm_result = syscall.vm_reserve(0, shm_size, vm_rights);
+    const vm_result = syscall.mem_reserve(0, shm_size, vm_rights);
     if (vm_result.val < 0) return;
-    if (syscall.shm_map(shm_handle, @bitCast(vm_result.val), 0) != 0) return;
+    if (syscall.mem_shm_map(shm_handle, @bitCast(vm_result.val), 0) != 0) return;
 
     // Counter lives in the first u64 of the trailing control page.
     const counter: *u64 = @ptrFromInt(vm_result.val2 + shm_size - syscall.PAGE4K);

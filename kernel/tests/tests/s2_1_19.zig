@@ -27,9 +27,9 @@ pub fn main(pv: u64) void {
 
     // vm_reservation: reserve a page.
     const rw = perms.VmReservationRights{ .read = true, .write = true };
-    const vm_r = syscall.vm_reserve(0, 4096, rw.bits());
+    const vm_r = syscall.mem_reserve(0, 4096, rw.bits());
     if (vm_r.val <= 0) {
-        t.fail("§2.1.19 vm_reserve");
+        t.fail("§2.1.19 mem_reserve");
         syscall.shutdown();
     }
     const vm_handle: u64 = @bitCast(vm_r.val);
@@ -38,7 +38,7 @@ pub fn main(pv: u64) void {
     const shm_rights = (perms.SharedMemoryRights{ .read = true, .write = true }).bits();
     const shm_rc = syscall.shm_create_with_rights(4096, shm_rights);
     if (shm_rc <= 0) {
-        t.fail("§2.1.19 shm_create");
+        t.fail("§2.1.19 mem_shm_create");
         syscall.shutdown();
     }
     const shm_handle: u64 = @bitCast(shm_rc);

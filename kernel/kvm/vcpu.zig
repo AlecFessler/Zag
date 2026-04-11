@@ -73,7 +73,7 @@ pub fn create(vm_obj: *Vm) !*VCpu {
         .kernel_stack = undefined,
         .user_stack = null,
         .process = proc,
-        .state = .blocked, // starts blocked until vcpu_run
+        .state = .blocked, // starts blocked until vm_vcpu_run
     };
 
     // Allocate kernel stack

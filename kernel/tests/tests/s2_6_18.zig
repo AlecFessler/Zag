@@ -19,9 +19,9 @@ pub fn main(pv: u64) void {
 
     // Map SHM in parent.
     const vm_rw_s = perms.VmReservationRights{ .read = true, .write = true, .shareable = true };
-    const vm = syscall.vm_reserve(0, 4096, vm_rw_s.bits());
+    const vm = syscall.mem_reserve(0, 4096, vm_rw_s.bits());
     const vm_handle: u64 = @bitCast(vm.val);
-    _ = syscall.shm_map(shm_handle, vm_handle, 0);
+    _ = syscall.mem_shm_map(shm_handle, vm_handle, 0);
 
     const base = vm.val2;
     const run_counter: *volatile u64 = @ptrFromInt(base);
@@ -31,7 +31,7 @@ pub fn main(pv: u64) void {
     for (0..4096) |i| dst[i] = 0;
 
     // Spawn restartable child_restart_verify.
-    const child_rights = perms.ProcessRights{ .spawn_thread = true, .mem_reserve = true, .shm_create = true, .restart = true };
+    const child_rights = perms.ProcessRights{ .spawn_thread = true, .mem_reserve = true, .mem_shm_create = true, .restart = true };
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(@intFromPtr(children.child_restart_verify.ptr), children.child_restart_verify.len, child_rights.bits())));
 
     // Send SHM to child on first boot.

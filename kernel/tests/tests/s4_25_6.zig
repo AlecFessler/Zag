@@ -7,7 +7,7 @@ const t = lib.testing;
 
 const E_INVAL: i64 = -1;
 
-/// §4.25.6 — `dma_map` with non-MMIO device returns `E_INVAL`.
+/// §4.25.6 — `mem_dma_map` with non-MMIO device returns `E_INVAL`.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
@@ -15,7 +15,7 @@ pub fn main(pv: u64) void {
     const dev_handle = dev.handle;
 
     const shm_h: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(4096, (perms.SharedMemoryRights{ .read = true, .write = true }).bits())));
-    const ret = syscall.dma_map(dev_handle, shm_h);
+    const ret = syscall.mem_dma_map(dev_handle, shm_h);
     t.expectEqual("§4.25.6", E_INVAL, ret);
     syscall.shutdown();
 }

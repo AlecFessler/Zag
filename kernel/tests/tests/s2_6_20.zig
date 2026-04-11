@@ -20,8 +20,8 @@ pub fn main(pv: u64) void {
     const shm_rights = perms.SharedMemoryRights{ .read = true, .write = true, .grant = true };
     const shm_handle: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(4096, shm_rights.bits())));
     const vm_rights_root = (perms.VmReservationRights{ .read = true, .write = true, .shareable = true }).bits();
-    const vm = syscall.vm_reserve(0, 4096, vm_rights_root);
-    _ = syscall.shm_map(shm_handle, @bitCast(vm.val), 0);
+    const vm = syscall.mem_reserve(0, 4096, vm_rights_root);
+    _ = syscall.mem_shm_map(shm_handle, @bitCast(vm.val), 0);
     const base = vm.val2;
     const run_counter: *volatile u64 = @ptrFromInt(base);
     const vm_before: *volatile u64 = @ptrFromInt(base + 8);
@@ -34,7 +34,7 @@ pub fn main(pv: u64) void {
         .restart = true,
         .spawn_thread = true,
         .mem_reserve = true,
-        .shm_create = true,
+        .mem_shm_create = true,
     };
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
         @intFromPtr(children.child_vm_count_after_restart.ptr),

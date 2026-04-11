@@ -24,7 +24,7 @@ pub fn main(pv: u64) void {
     const fill_rights = (perms.VmReservationRights{ .read = true, .write = true }).bits();
     var i: u32 = 0;
     while (i < 200) : (i += 1) {
-        const r = syscall.vm_reserve(0, 4096, fill_rights);
+        const r = syscall.mem_reserve(0, 4096, fill_rights);
         if (r.val < 0) break;
     }
 
@@ -34,7 +34,7 @@ pub fn main(pv: u64) void {
     _ = syscall.ipc_call_cap(ch, &.{ dev_handle, dev_rights }, &reply);
 
     // Fill the slot freed by device transfer.
-    _ = syscall.vm_reserve(0, 4096, fill_rights);
+    _ = syscall.mem_reserve(0, 4096, fill_rights);
 
     // Child exits after reply — device tries to return to root, but root table is full.
     // Device should be dropped (§2.1.12).

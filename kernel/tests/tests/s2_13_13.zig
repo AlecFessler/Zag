@@ -94,7 +94,7 @@ pub fn main(pv: u64) void {
     }
 
     // Reserve host buffer and write guest code.
-    const res = syscall.vm_reserve(0, syscall.PAGE4K, 0x3);
+    const res = syscall.mem_reserve(0, syscall.PAGE4K, 0x3);
     if (res.val < 0) {
         t.failWithVal("§2.13.13 reserve", 0, res.val);
         _ = syscall.vm_destroy();
@@ -105,9 +105,9 @@ pub fn main(pv: u64) void {
         host_ptr[i] = byte;
     }
 
-    const mr = syscall.guest_map(res.val2, 0x0, syscall.PAGE4K, 0x7);
+    const mr = syscall.vm_guest_map(res.val2, 0x0, syscall.PAGE4K, 0x7);
     if (mr != syscall.E_OK) {
-        t.failWithVal("§2.13.13 guest_map", syscall.E_OK, mr);
+        t.failWithVal("§2.13.13 vm_guest_map", syscall.E_OK, mr);
         _ = syscall.vm_destroy();
         syscall.shutdown();
     }
@@ -123,14 +123,14 @@ pub fn main(pv: u64) void {
     setupRealModeState(&guest_state);
     writeU64(&guest_state, OFF_RAX, 0);
 
-    const sr = syscall.vcpu_set_state(vcpu_handle, @intFromPtr(&guest_state));
+    const sr = syscall.vm_vcpu_set_state(vcpu_handle, @intFromPtr(&guest_state));
     if (sr != syscall.E_OK) {
         t.failWithVal("§2.13.13 set_state", syscall.E_OK, sr);
         _ = syscall.vm_destroy();
         syscall.shutdown();
     }
 
-    _ = syscall.vcpu_run(vcpu_handle);
+    _ = syscall.vm_vcpu_run(vcpu_handle);
 
     // Receive the HLT exit.
     const exit_token = syscall.vm_recv(@intFromPtr(&buf), 1);

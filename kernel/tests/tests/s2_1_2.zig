@@ -19,15 +19,15 @@ pub fn main(pv: u64) void {
 
     // Map SHM and copy ELF into it.
     const vm_rw_s = perms.VmReservationRights{ .read = true, .write = true, .shareable = true };
-    const vm = syscall.vm_reserve(0, shm_size, vm_rw_s.bits());
+    const vm = syscall.mem_reserve(0, shm_size, vm_rw_s.bits());
     const vm_handle: u64 = @bitCast(vm.val);
-    _ = syscall.shm_map(shm_handle, vm_handle, 0);
+    _ = syscall.mem_shm_map(shm_handle, vm_handle, 0);
     const dst: [*]u8 = @ptrFromInt(vm.val2);
     for (0..elf.len) |i| dst[i] = elf[i];
 
     // 2. Spawn child_spawner with spawn_process right.
     const spawner = children.child_spawner;
-    const child_rights = perms.ProcessRights{ .spawn_thread = true, .spawn_process = true, .mem_reserve = true, .shm_create = true };
+    const child_rights = perms.ProcessRights{ .spawn_thread = true, .spawn_process = true, .mem_reserve = true, .mem_shm_create = true };
     const child_handle_i = syscall.proc_create(@intFromPtr(spawner.ptr), spawner.len, child_rights.bits());
     const child_handle: u64 = @bitCast(child_handle_i);
 

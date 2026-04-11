@@ -66,9 +66,9 @@ pub fn main(perm_view_addr: u64) void {
             .write = true,
             .shareable = true,
         }).bits();
-        const vm_result = syscall.vm_reserve(0, shm_size, vm_rights);
+        const vm_result = syscall.mem_reserve(0, shm_size, vm_rights);
         if (vm_result.val < 0) return;
-        if (syscall.shm_map(shm_handle, @intCast(vm_result.val), 0) != 0) return;
+        if (syscall.mem_shm_map(shm_handle, @intCast(vm_result.val), 0) != 0) return;
 
         const base: u64 = vm_result.val2;
         const magic_ptr: *u64 = @ptrFromInt(base + 0);
@@ -118,9 +118,9 @@ pub fn main(perm_view_addr: u64) void {
         .write = true,
         .shareable = true,
     }).bits();
-    const vm_result = syscall.vm_reserve(0, shm_size, vm_rights);
+    const vm_result = syscall.mem_reserve(0, shm_size, vm_rights);
     if (vm_result.val < 0) return;
-    if (syscall.shm_map(shm_handle, @intCast(vm_result.val), 0) != 0) return;
+    if (syscall.mem_shm_map(shm_handle, @intCast(vm_result.val), 0) != 0) return;
     const base: u64 = vm_result.val2;
     const magic_ptr: *u64 = @ptrFromInt(base + 0);
     const pre_count_ptr: *u64 = @ptrFromInt(base + 8);

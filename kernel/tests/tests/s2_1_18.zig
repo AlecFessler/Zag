@@ -31,7 +31,7 @@ pub fn main(pv: u64) void {
     var monotonic_ok = true;
     var allocated: [5]u64 = undefined;
     for (0..5) |i| {
-        const r = syscall.vm_reserve(0, 4096, rw.bits());
+        const r = syscall.mem_reserve(0, 4096, rw.bits());
         if (r.val <= 0) {
             monotonic_ok = false;
             break;

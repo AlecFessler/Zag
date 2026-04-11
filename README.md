@@ -73,7 +73,7 @@ The kernel boots via UEFI, brings up all CPU cores, enumerates PCI devices and s
 
 ### Kernel test suite
 
-The test root service (`kernel/tests/`) exercises every syscall and validates kernel behavior against the specification. Tests reference specific spec sections (e.g., `S2.3`, `S4.vm_reserve`). 18 test modules with 9 embedded child processes.
+The test root service (`kernel/tests/`) exercises every syscall and validates kernel behavior against the specification. Tests reference specific spec sections (e.g., `S2.3`, `S4.mem_reserve`). 18 test modules with 9 embedded child processes.
 
 ```bash
 ./test.sh kernel

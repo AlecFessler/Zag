@@ -12,12 +12,12 @@ pub fn main(perm_view: u64) void {
     const shm_rights = perms.SharedMemoryRights{ .read = true, .write = true, .grant = true };
     const shm_handle: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(4096, shm_rights.bits())));
     const vm_rights = (perms.VmReservationRights{ .read = true, .write = true, .shareable = true }).bits();
-    const vm = syscall.vm_reserve(0, 4096, vm_rights);
+    const vm = syscall.mem_reserve(0, 4096, vm_rights);
     if (vm.val < 0) {
         t.fail("§2.3.6");
         syscall.shutdown();
     }
-    _ = syscall.shm_map(shm_handle, @bitCast(vm.val), 0);
+    _ = syscall.mem_shm_map(shm_handle, @bitCast(vm.val), 0);
     const ptr: *volatile u64 = @ptrFromInt(vm.val2);
     ptr.* = 0xBEEF_CAFE;
 

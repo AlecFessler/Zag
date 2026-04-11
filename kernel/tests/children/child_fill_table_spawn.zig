@@ -9,7 +9,7 @@ const MAX_PERMS = 128;
 /// 1st recv: SHM with grandchild ELF.
 /// 2nd recv: device handle (cap transfer).
 /// Spawns grandchild (child_recv_device_exit), transfers device to grandchild.
-/// Then fills own perm table with vm_reserve calls.
+/// Then fills own perm table with mem_reserve calls.
 /// Grandchild exits → device return walks up → this process table is full → skip to parent.
 pub fn main(perm_view_addr: u64) void {
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
@@ -33,9 +33,9 @@ pub fn main(perm_view_addr: u64) void {
 
     // Map SHM.
     const vm_rights = (perms.VmReservationRights{ .read = true, .write = true, .execute = true, .shareable = true }).bits();
-    const vm_result = syscall.vm_reserve(0, shm_size, vm_rights);
+    const vm_result = syscall.mem_reserve(0, shm_size, vm_rights);
     if (vm_result.val < 0) return;
-    _ = syscall.shm_map(shm_handle, @bitCast(vm_result.val), 0);
+    _ = syscall.mem_shm_map(shm_handle, @bitCast(vm_result.val), 0);
     const elf_ptr = vm_result.val2;
 
     // Spawn grandchild (child_recv_device_exit).
@@ -63,7 +63,7 @@ pub fn main(perm_view_addr: u64) void {
     const fill_rights = (perms.VmReservationRights{ .read = true, .write = true }).bits();
     var filled: u32 = 0;
     while (filled < 200) : (filled += 1) {
-        const r = syscall.vm_reserve(0, 4096, fill_rights);
+        const r = syscall.mem_reserve(0, 4096, fill_rights);
         if (r.val < 0) break;
     }
 
@@ -74,7 +74,7 @@ pub fn main(perm_view_addr: u64) void {
     _ = syscall.ipc_call_cap(gc_handle, &.{ dev_handle, dev_rights }, &gc_reply);
 
     // Fill the slot freed by device transfer.
-    _ = syscall.vm_reserve(0, 4096, fill_rights);
+    _ = syscall.mem_reserve(0, 4096, fill_rights);
 
     // Now tell grandchild to exit (2nd call triggers exit).
     _ = syscall.ipc_call(gc_handle, &.{}, &gc_reply);

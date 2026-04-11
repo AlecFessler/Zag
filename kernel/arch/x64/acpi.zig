@@ -838,7 +838,7 @@ fn initIommuDevices() void {
         }
     }
 
-    // Translation enable is deferred to the first dma_map syscall.
+    // Translation enable is deferred to the first mem_dma_map syscall.
     // Enabling now with empty page tables would fault any early device DMA.
 }
 

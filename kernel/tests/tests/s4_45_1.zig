@@ -1,4 +1,4 @@
-/// §4.45.1 — `vcpu_run` returns `E_OK` on success.
+/// §4.45.1 — `vm_vcpu_run` returns `E_OK` on success.
 const lib = @import("lib");
 
 const perm_view = lib.perm_view;
@@ -38,8 +38,8 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
 
-    // vCPU is idle after creation — vcpu_run should succeed.
-    const result = syscall.vcpu_run(vcpu_handle);
+    // vCPU is idle after creation — vm_vcpu_run should succeed.
+    const result = syscall.vm_vcpu_run(vcpu_handle);
     t.expectEqual("§4.45.1", syscall.E_OK, result);
 
     _ = syscall.vm_destroy();

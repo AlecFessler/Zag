@@ -24,9 +24,9 @@ pub fn main(perm_view_addr: u64) void {
     if (dev_handle == 0 or dev_size == 0) return;
 
     const vm_rights = (perms.VmReservationRights{ .read = true, .mmio = true }).bits();
-    const vm = syscall.vm_reserve(0, dev_size, vm_rights);
+    const vm = syscall.mem_reserve(0, dev_size, vm_rights);
     if (vm.val < 0) return;
-    if (syscall.mmio_map(dev_handle, @bitCast(vm.val), 0) != 0) return;
+    if (syscall.mem_mmio_map(dev_handle, @bitCast(vm.val), 0) != 0) return;
 
     const ptr: *volatile u8 = @ptrFromInt(vm.val2);
     ptr.* = 0;

@@ -32,9 +32,9 @@ pub fn main(perm_view_addr: u64) void {
 
     // Map SHM.
     const vm_rights = (perms.VmReservationRights{ .read = true, .write = true, .execute = true, .shareable = true }).bits();
-    const vm = syscall.vm_reserve(0, shm_size, vm_rights);
+    const vm = syscall.mem_reserve(0, shm_size, vm_rights);
     if (vm.val < 0) return;
-    if (syscall.shm_map(shm_handle, @bitCast(vm.val), 0) != 0) return;
+    if (syscall.mem_shm_map(shm_handle, @bitCast(vm.val), 0) != 0) return;
 
     // Spawn 4 grandchildren from the ELF (64 children × 4 grandchildren × 64 threads = 16,384 stacks).
     const child_rights = (perms.ProcessRights{ .spawn_thread = true }).bits();

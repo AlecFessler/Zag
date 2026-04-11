@@ -6,16 +6,16 @@ const t = lib.testing;
 
 const E_PERM: i64 = -2;
 
-/// §4.4.9 — `vm_perms` with perms exceeding `max_rights` returns `E_PERM`.
+/// §4.4.9 — `mem_perms` with perms exceeding `max_rights` returns `E_PERM`.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     // Create reservation with read-only max rights.
     const ro = perms.VmReservationRights{ .read = true };
-    const result = syscall.vm_reserve(0, 4096, ro.bits());
+    const result = syscall.mem_reserve(0, 4096, ro.bits());
     const handle: u64 = @bitCast(result.val);
     // Try to set write permission, which exceeds max_rights.
     const rw = perms.VmReservationRights{ .read = true, .write = true };
-    const ret = syscall.vm_perms(handle, 0, 4096, rw.bits());
+    const ret = syscall.mem_perms(handle, 0, 4096, rw.bits());
     t.expectEqual("§4.4.9", E_PERM, ret);
     syscall.shutdown();
 }

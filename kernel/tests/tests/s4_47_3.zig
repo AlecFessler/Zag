@@ -1,4 +1,4 @@
-/// §4.47.3 — `msr_passthrough` with `msr_num` outside the 32-bit MSR address range returns `E_INVAL`.
+/// §4.47.3 — `vm_msr_passthrough` with `msr_num` outside the 32-bit MSR address range returns `E_INVAL`.
 const lib = @import("lib");
 
 const syscall = lib.syscall;
@@ -20,21 +20,21 @@ pub fn main(_: u64) void {
     var passed = true;
 
     // msr_num just past u32 max (0x100000000) — first value outside the range.
-    const r_one_past = syscall.msr_passthrough(@as(u64, 1) << 32, 1, 1);
+    const r_one_past = syscall.vm_msr_passthrough(@as(u64, 1) << 32, 1, 1);
     if (r_one_past != syscall.E_INVAL) {
         t.failWithVal("§4.47.3 one_past", syscall.E_INVAL, r_one_past);
         passed = false;
     }
 
     // Largest possible u64.
-    const r_max_u64 = syscall.msr_passthrough(0xFFFF_FFFF_FFFF_FFFF, 1, 1);
+    const r_max_u64 = syscall.vm_msr_passthrough(0xFFFF_FFFF_FFFF_FFFF, 1, 1);
     if (r_max_u64 != syscall.E_INVAL) {
         t.failWithVal("§4.47.3 max_u64", syscall.E_INVAL, r_max_u64);
         passed = false;
     }
 
     // Arbitrary mid-range out-of-bounds value.
-    const r_mid = syscall.msr_passthrough(0xDEAD_BEEF_DEAD_BEEF, 1, 1);
+    const r_mid = syscall.vm_msr_passthrough(0xDEAD_BEEF_DEAD_BEEF, 1, 1);
     if (r_mid != syscall.E_INVAL) {
         t.failWithVal("§4.47.3 mid", syscall.E_INVAL, r_mid);
         passed = false;
@@ -44,7 +44,7 @@ pub fn main(_: u64) void {
     // must NOT return E_INVAL. The MSR need not actually exist; only the range
     // check is being exercised. The security blocklist (§4.47.4) contains no
     // values anywhere near 0xFFFFFFFF so there is no risk of E_PERM here.
-    const r_valid_edge = syscall.msr_passthrough(0xFFFFFFFF, 1, 1);
+    const r_valid_edge = syscall.vm_msr_passthrough(0xFFFFFFFF, 1, 1);
     if (r_valid_edge == syscall.E_INVAL) {
         t.failWithVal("§4.47.3 valid_edge", 0, r_valid_edge);
         passed = false;

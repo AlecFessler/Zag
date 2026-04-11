@@ -93,7 +93,7 @@ pub fn main(pv: u64) void {
     }
 
     // Reserve host buffer for guest code page (mapped at guest phys 0x0000).
-    const code_res = syscall.vm_reserve(0, syscall.PAGE4K, 0x3);
+    const code_res = syscall.mem_reserve(0, syscall.PAGE4K, 0x3);
     if (code_res.val < 0) {
         t.failWithVal("§2.13.7 reserve code", 0, code_res.val);
         _ = syscall.vm_destroy();
@@ -105,15 +105,15 @@ pub fn main(pv: u64) void {
     }
 
     // Map code page at guest phys 0x0000.
-    const mr = syscall.guest_map(code_res.val2, 0x0, syscall.PAGE4K, 0x7);
+    const mr = syscall.vm_guest_map(code_res.val2, 0x0, syscall.PAGE4K, 0x7);
     if (mr != syscall.E_OK) {
-        t.failWithVal("§2.13.7 guest_map code", syscall.E_OK, mr);
+        t.failWithVal("§2.13.7 vm_guest_map code", syscall.E_OK, mr);
         _ = syscall.vm_destroy();
         syscall.shutdown();
     }
 
     // Reserve a second host buffer for the data page (will be mapped via vm_reply).
-    const data_res = syscall.vm_reserve(0, syscall.PAGE4K, 0x3);
+    const data_res = syscall.mem_reserve(0, syscall.PAGE4K, 0x3);
     if (data_res.val < 0) {
         t.failWithVal("§2.13.7 reserve data", 0, data_res.val);
         _ = syscall.vm_destroy();
@@ -129,7 +129,7 @@ pub fn main(pv: u64) void {
 
     // Set up real-mode guest state.
     setupRealModeState(&guest_state);
-    const sr = syscall.vcpu_set_state(vcpu_handle, @intFromPtr(&guest_state));
+    const sr = syscall.vm_vcpu_set_state(vcpu_handle, @intFromPtr(&guest_state));
     if (sr != syscall.E_OK) {
         t.failWithVal("§2.13.7 set_state", syscall.E_OK, sr);
         _ = syscall.vm_destroy();
@@ -137,7 +137,7 @@ pub fn main(pv: u64) void {
     }
 
     // Run vCPU — guest will access 0x1000 which is unmapped, causing EPT violation.
-    _ = syscall.vcpu_run(vcpu_handle);
+    _ = syscall.vm_vcpu_run(vcpu_handle);
 
     // Receive exit (EPT violation on address 0x1000).
     const exit_token = syscall.vm_recv(@intFromPtr(&buf), 1);

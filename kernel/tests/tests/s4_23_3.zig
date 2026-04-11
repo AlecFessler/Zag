@@ -10,7 +10,7 @@ const E_INVAL: i64 = -1;
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     const rw = perms.VmReservationRights{ .read = true, .write = true };
-    const result = syscall.vm_reserve(0, 4096, rw.bits());
+    const result = syscall.mem_reserve(0, 4096, rw.bits());
     const misaligned_addr = result.val2 + 1;
     const ret = asm volatile ("int $0x80"
         : [ret] "={rax}" (-> i64),

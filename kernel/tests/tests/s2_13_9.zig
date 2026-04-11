@@ -115,7 +115,7 @@ pub fn main(pv: u64) void {
     }
 
     // Reserve host buffer and write guest code.
-    const res = syscall.vm_reserve(0, syscall.PAGE4K, 0x3);
+    const res = syscall.mem_reserve(0, syscall.PAGE4K, 0x3);
     if (res.val < 0) {
         t.failWithVal("§2.13.9 reserve", 0, res.val);
         _ = syscall.vm_destroy();
@@ -126,9 +126,9 @@ pub fn main(pv: u64) void {
         host_ptr[i] = byte;
     }
 
-    const mr = syscall.guest_map(res.val2, 0x0, syscall.PAGE4K, 0x7);
+    const mr = syscall.vm_guest_map(res.val2, 0x0, syscall.PAGE4K, 0x7);
     if (mr != syscall.E_OK) {
-        t.failWithVal("§2.13.9 guest_map", syscall.E_OK, mr);
+        t.failWithVal("§2.13.9 vm_guest_map", syscall.E_OK, mr);
         _ = syscall.vm_destroy();
         syscall.shutdown();
     }
@@ -142,7 +142,7 @@ pub fn main(pv: u64) void {
 
     // Set up real-mode guest state.
     setupRealModeState(&guest_state);
-    const sr = syscall.vcpu_set_state(vcpu_handle, @intFromPtr(&guest_state));
+    const sr = syscall.vm_vcpu_set_state(vcpu_handle, @intFromPtr(&guest_state));
     if (sr != syscall.E_OK) {
         t.failWithVal("§2.13.9 set_state", syscall.E_OK, sr);
         _ = syscall.vm_destroy();
@@ -150,7 +150,7 @@ pub fn main(pv: u64) void {
     }
 
     // Run vCPU — guest executes CPUID then HLT.
-    _ = syscall.vcpu_run(vcpu_handle);
+    _ = syscall.vm_vcpu_run(vcpu_handle);
 
     // Receive exit. If CPUID leaf 0 is handled inline by the kernel,
     // the exit should be HLT (not CPUID). We verify by checking that
@@ -165,7 +165,7 @@ pub fn main(pv: u64) void {
 
     // Read back guest state to check RIP — it should be at/past the HLT
     // instruction (offset 4), not at the CPUID instruction (offset 2).
-    const gr = syscall.vcpu_get_state(vcpu_handle, @intFromPtr(&read_state));
+    const gr = syscall.vm_vcpu_get_state(vcpu_handle, @intFromPtr(&read_state));
     if (gr != syscall.E_OK) {
         t.failWithVal("§2.13.9 get_state", syscall.E_OK, gr);
         _ = syscall.vm_destroy();

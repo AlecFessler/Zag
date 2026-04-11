@@ -35,14 +35,14 @@ pub fn main(pv: u64) void {
     const shm_h: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(shm_size, shm_rights.bits())));
 
     const vm_rw_s = perms.VmReservationRights{ .read = true, .write = true, .shareable = true };
-    const vm = syscall.vm_reserve(0, shm_size, vm_rw_s.bits());
+    const vm = syscall.mem_reserve(0, shm_size, vm_rw_s.bits());
     const vm_h: u64 = @bitCast(vm.val);
-    _ = syscall.shm_map(shm_h, vm_h, 0);
+    _ = syscall.mem_shm_map(shm_h, vm_h, 0);
     const dst: [*]u8 = @ptrFromInt(vm.val2);
     for (0..elf.len) |i| dst[i] = elf[i];
 
     // Spawn child_spawner_device with device_own + spawn_process.
-    const child_rights = perms.ProcessRights{ .spawn_thread = true, .spawn_process = true, .mem_reserve = true, .shm_create = true, .device_own = true };
+    const child_rights = perms.ProcessRights{ .spawn_thread = true, .spawn_process = true, .mem_reserve = true, .mem_shm_create = true, .device_own = true };
     const mid_h: u64 = @bitCast(@as(i64, syscall.proc_create(@intFromPtr(children.child_spawner_device.ptr), children.child_spawner_device.len, child_rights.bits())));
 
     // 1st IPC: send SHM with child_exit ELF.

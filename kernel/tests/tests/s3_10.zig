@@ -22,19 +22,19 @@ pub fn main(pv: u64) void {
     const shm_handle: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(shm_size, shm_rights.bits())));
 
     const vm_rights = (perms.VmReservationRights{ .read = true, .write = true, .execute = true, .shareable = true }).bits();
-    const vm_result = syscall.vm_reserve(0, shm_size, vm_rights);
+    const vm_result = syscall.mem_reserve(0, shm_size, vm_rights);
     if (vm_result.val < 0) {
-        t.fail("§3.10 vm_reserve");
+        t.fail("§3.10 mem_reserve");
         syscall.shutdown();
     }
-    if (syscall.shm_map(shm_handle, @bitCast(vm_result.val), 0) != 0) {
-        t.fail("§3.10 shm_map");
+    if (syscall.mem_shm_map(shm_handle, @bitCast(vm_result.val), 0) != 0) {
+        t.fail("§3.10 mem_shm_map");
         syscall.shutdown();
     }
     const dst: [*]u8 = @ptrFromInt(vm_result.val2);
     @memcpy(dst[0..elf.len], elf.ptr[0..elf.len]);
 
-    const b_rights = (perms.ProcessRights{ .spawn_process = true, .spawn_thread = true, .mem_reserve = true, .shm_create = true }).bits();
+    const b_rights = (perms.ProcessRights{ .spawn_process = true, .spawn_thread = true, .mem_reserve = true, .mem_shm_create = true }).bits();
     const b_handle: u64 = @bitCast(@as(i64, syscall.proc_create(@intFromPtr(children.child_middleman.ptr), children.child_middleman.len, b_rights)));
 
     var reply: syscall.IpcMessage = .{};

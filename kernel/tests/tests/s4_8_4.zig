@@ -6,16 +6,16 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §4.8.4 — `mmio_map` without `map` right returns `E_PERM`.
+/// §4.8.4 — `mem_mmio_map` without `map` right returns `E_PERM`.
 /// Transfer an MMIO device to child WITHOUT the `map` right.
-/// Child tries mmio_map → E_PERM.
+/// Child tries mem_mmio_map → E_PERM.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
     const dev = t.requireMmioDevice(view, "§4.8.4");
     const dev_handle = dev.handle;
 
-    // Spawn child with device_own + mem_reserve (needs vm_reserve for mmio_map).
+    // Spawn child with device_own + mem_reserve (needs mem_reserve for mem_mmio_map).
     const child_rights = (perms.ProcessRights{ .spawn_thread = true, .device_own = true, .mem_reserve = true }).bits();
     const ch: u64 = @bitCast(@as(i64, syscall.proc_create(
         @intFromPtr(children.child_try_mmio_map.ptr),

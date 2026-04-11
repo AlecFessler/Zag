@@ -1,8 +1,8 @@
 /// Guest physical address space management.
 ///
-/// Tracks guest physical memory regions (created via guest_map) for cleanup
+/// Tracks guest physical memory regions (created via vm_guest_map) for cleanup
 /// (unmapping from EPT on destroy). EPT faults are delivered to the VMM
-/// as exits — the VMM calls guest_map to wire host pages into guest EPT.
+/// as exits — the VMM calls vm_guest_map to wire host pages into guest EPT.
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
@@ -52,7 +52,7 @@ pub const GuestMemory = struct {
 };
 
 /// Handle a guest memory fault (EPT violation). Guest memory is no longer
-/// demand-paged — all mappings are established upfront via guest_map. Returns
+/// demand-paged — all mappings are established upfront via vm_guest_map. Returns
 /// false so the exit is delivered to the VMM.
 pub fn handleFault(guest_mem: *const GuestMemory, arch_structures: PAddr, guest_phys: u64) bool {
     _ = guest_mem;

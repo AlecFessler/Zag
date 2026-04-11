@@ -4,20 +4,20 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.2.6 — `shm_unmap` removes the SHM mapping from the reservation.
+/// §2.2.6 — `mem_shm_unmap` removes the SHM mapping from the reservation.
 ///
 /// After writing a magic value via the SHM mapping and unmapping, reading the
 /// same VA must no longer observe the SHM contents (the range reverts to
 /// private demand-paged per §2.2.7, so the fresh page is zeroed per §2.2.2).
 pub fn main(_: u64) void {
     const shareable_rw = perms.VmReservationRights{ .read = true, .write = true, .shareable = true };
-    const vm = syscall.vm_reserve(0, 4096, shareable_rw.bits());
+    const vm = syscall.mem_reserve(0, 4096, shareable_rw.bits());
     const vm_handle: u64 = @bitCast(vm.val);
 
     const shm_rights = perms.SharedMemoryRights{ .read = true, .write = true };
     const shm_handle: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(4096, shm_rights.bits())));
 
-    if (syscall.shm_map(shm_handle, vm_handle, 0) != 0) {
+    if (syscall.mem_shm_map(shm_handle, vm_handle, 0) != 0) {
         t.fail("§2.2.6");
         syscall.shutdown();
     }
@@ -31,7 +31,7 @@ pub fn main(_: u64) void {
     }
 
     // Unmap the SHM — the VA must no longer reach the SHM backing page.
-    if (syscall.shm_unmap(shm_handle, vm_handle) != 0) {
+    if (syscall.mem_shm_unmap(shm_handle, vm_handle) != 0) {
         t.fail("§2.2.6");
         syscall.shutdown();
     }
@@ -48,9 +48,9 @@ pub fn main(_: u64) void {
     // The SHM still exists and can be re-mapped elsewhere — verify it retains
     // the magic via a fresh reservation (proves the old VA no longer points
     // at the SHM physical page).
-    const vm2 = syscall.vm_reserve(0, 4096, shareable_rw.bits());
+    const vm2 = syscall.mem_reserve(0, 4096, shareable_rw.bits());
     const vm2_h: u64 = @bitCast(vm2.val);
-    if (syscall.shm_map(shm_handle, vm2_h, 0) != 0) {
+    if (syscall.mem_shm_map(shm_handle, vm2_h, 0) != 0) {
         t.fail("§2.2.6");
         syscall.shutdown();
     }

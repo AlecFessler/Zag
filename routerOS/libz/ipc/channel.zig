@@ -123,8 +123,8 @@ pub const Channel = extern struct {
     pub fn connectAsA(target_handle: u64, protocol: lib.Protocol, shm_size: u64) syscall.SystemError!Connection {
         const aligned_size = alignToPages(shm_size);
         const shm = try syscall.shm_create_with_rights(aligned_size, shm_rw_grant);
-        const vm = try syscall.vm_reserve(0, aligned_size, rw_shareable);
-        try syscall.shm_map(shm, vm.handle, 0);
+        const vm = try syscall.mem_reserve(0, aligned_size, rw_shareable);
+        try syscall.mem_shm_map(shm, vm.handle, 0);
 
         const region: [*]u8 = @ptrFromInt(vm.addr);
         const chan = Channel.init(region[0..aligned_size], @intFromEnum(protocol)) orelse
@@ -139,8 +139,8 @@ pub const Channel = extern struct {
     /// Maps a granted SHM handle and returns the Channel. Does not reinitialize.
     pub fn connectAsB(shm_handle: u64, shm_size: u64) syscall.SystemError!*Channel {
         const aligned_size = alignToPages(shm_size);
-        const vm = try syscall.vm_reserve(0, aligned_size, rw_shareable);
-        try syscall.shm_map(shm_handle, vm.handle, 0);
+        const vm = try syscall.mem_reserve(0, aligned_size, rw_shareable);
+        try syscall.mem_shm_map(shm_handle, vm.handle, 0);
 
         const chan: *Channel = @ptrFromInt(vm.addr);
         @atomicStore(u64, &chan.B_connected, 1, .release);

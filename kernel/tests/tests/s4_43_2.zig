@@ -1,4 +1,4 @@
-/// §4.43.2 — `vcpu_set_state` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`.
+/// §4.43.2 — `vm_vcpu_set_state` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`.
 const lib = @import("lib");
 
 const syscall = lib.syscall;
@@ -19,7 +19,7 @@ pub fn main(_: u64) void {
 
     // Use our own thread handle (not a vCPU) — should return E_BADHANDLE.
     const self_handle: u64 = @bitCast(syscall.thread_self());
-    const result = syscall.vcpu_set_state(self_handle, 0);
+    const result = syscall.vm_vcpu_set_state(self_handle, 0);
     t.expectEqual("§4.43.2", syscall.E_BADHANDLE, result);
 
     _ = syscall.vm_destroy();

@@ -21,12 +21,12 @@ pub fn main(pv: u64) void {
     const shm_rights = perms.SharedMemoryRights{ .read = true, .write = true, .execute = true, .grant = true };
     const gc_shm_h: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(gc_shm_size, shm_rights.bits())));
     const vm_rights = (perms.VmReservationRights{ .read = true, .write = true, .execute = true, .shareable = true }).bits();
-    const gc_vm = syscall.vm_reserve(0, gc_shm_size, vm_rights);
+    const gc_vm = syscall.mem_reserve(0, gc_shm_size, vm_rights);
     if (gc_vm.val < 0) {
         t.fail("§2.1.3");
         syscall.shutdown();
     }
-    _ = syscall.shm_map(gc_shm_h, @bitCast(gc_vm.val), 0);
+    _ = syscall.mem_shm_map(gc_shm_h, @bitCast(gc_vm.val), 0);
     const gc_dst: [*]u8 = @ptrFromInt(gc_vm.val2);
     @memcpy(gc_dst[0..gc_elf.len], gc_elf.ptr[0..gc_elf.len]);
 
@@ -35,7 +35,7 @@ pub fn main(pv: u64) void {
         .spawn_thread = true,
         .spawn_process = true,
         .mem_reserve = true,
-        .shm_create = true,
+        .mem_shm_create = true,
     };
     const b_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
         @intFromPtr(children.child_middleman.ptr),

@@ -40,7 +40,7 @@ pub fn main(pv: u64) void {
     }
 
     // Run vCPU — zeroed state causes immediate exit.
-    _ = syscall.vcpu_run(vcpu_handle);
+    _ = syscall.vm_vcpu_run(vcpu_handle);
 
     // Receive the exit.
     const exit_token = syscall.vm_recv(@intFromPtr(&buf), 1);

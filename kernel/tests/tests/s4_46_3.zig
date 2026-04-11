@@ -1,4 +1,4 @@
-/// §4.46.3 — `vcpu_interrupt` with `interrupt_ptr` not readable returns `E_BADADDR`.
+/// §4.46.3 — `vm_vcpu_interrupt` with `interrupt_ptr` not readable returns `E_BADADDR`.
 const lib = @import("lib");
 
 const perm_view = lib.perm_view;
@@ -39,7 +39,7 @@ pub fn main(pv: u64) void {
     }
 
     // Pass null interrupt_ptr — should return E_BADADDR.
-    const result = syscall.vcpu_interrupt(vcpu_handle, 0);
+    const result = syscall.vm_vcpu_interrupt(vcpu_handle, 0);
     t.expectEqual("§4.46.3", syscall.E_BADADDR, result);
 
     _ = syscall.vm_destroy();

@@ -7,7 +7,7 @@ const t = lib.testing;
 
 const E_PERM: i64 = -2;
 
-/// §4.3.5 — `vm_reserve` requires `mem_reserve` right — returns `E_PERM` without it.
+/// §4.3.5 — `mem_reserve` requires `mem_reserve` right — returns `E_PERM` without it.
 pub fn main(_: u64) void {
     // Spawn child WITHOUT mem_reserve right
     const child_rights = perms.ProcessRights{};

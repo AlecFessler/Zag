@@ -6,19 +6,19 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.2.3 — `vm_perms` with non-zero RWX takes effect: accessing the range respects the new permissions (e.g., writing to a read-only range faults).
+/// §2.2.3 — `mem_perms` with non-zero RWX takes effect: accessing the range respects the new permissions (e.g., writing to a read-only range faults).
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
     // Reserve a RW region, write to it, then change to read-only, verify read still works.
     const rw = perms.VmReservationRights{ .read = true, .write = true };
-    const result = syscall.vm_reserve(0, 4096, rw.bits());
+    const result = syscall.mem_reserve(0, 4096, rw.bits());
     const handle: u64 = @bitCast(result.val);
     const ptr: *volatile u64 = @ptrFromInt(result.val2);
     // Write while RW.
     ptr.* = 0xCAFEBABE;
     // Change to read-only.
     const ro = perms.VmReservationRights{ .read = true };
-    const ret = syscall.vm_perms(handle, 0, 4096, ro.bits());
+    const ret = syscall.mem_perms(handle, 0, 4096, ro.bits());
     // Read should still work after changing to read-only.
     if (ret != 0 or ptr.* != 0xCAFEBABE) {
         t.fail("§2.2.3");

@@ -1,4 +1,4 @@
-/// §4.47.1 — `msr_passthrough` returns `E_OK` on success.
+/// §4.47.1 — `vm_msr_passthrough` returns `E_OK` on success.
 const lib = @import("lib");
 
 const syscall = lib.syscall;
@@ -20,7 +20,7 @@ pub fn main(_: u64) void {
         syscall.shutdown();
     }
 
-    const result = syscall.msr_passthrough(MSR_IA32_TSC, 1, 1);
+    const result = syscall.vm_msr_passthrough(MSR_IA32_TSC, 1, 1);
     t.expectEqual("§4.47.1", syscall.E_OK, result);
 
     _ = syscall.vm_destroy();

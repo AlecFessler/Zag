@@ -25,15 +25,15 @@ pub fn main(pv_arg: u64) void {
     const shm_rights = perms.SharedMemoryRights{ .read = true, .write = true, .grant = true };
     const shm_handle: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(PAGE, shm_rights.bits())));
     const vm_rw_s = perms.VmReservationRights{ .read = true, .write = true, .shareable = true };
-    const vm = syscall.vm_reserve(0, PAGE, vm_rw_s.bits());
+    const vm = syscall.mem_reserve(0, PAGE, vm_rw_s.bits());
     const vm_handle: u64 = @bitCast(vm.val);
-    _ = syscall.shm_map(shm_handle, vm_handle, 0);
+    _ = syscall.mem_shm_map(shm_handle, vm_handle, 0);
 
     const base: u64 = vm.val2;
     const iter_ptr: *u64 = @ptrFromInt(base + 0);
     iter_ptr.* = 0;
 
-    const child_rights = perms.ProcessRights{ .spawn_thread = true, .mem_reserve = true, .shm_create = true, .restart = true };
+    const child_rights = perms.ProcessRights{ .spawn_thread = true, .mem_reserve = true, .mem_shm_create = true, .restart = true };
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
         @intFromPtr(children.child_iter1_b_restart_loop_rights.ptr),
         children.child_iter1_b_restart_loop_rights.len,

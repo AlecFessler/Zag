@@ -16,13 +16,13 @@ pub fn main(pv: u64) void {
 
     // Map SHM in parent to read the counter.
     const vm_rw_s = perms.VmReservationRights{ .read = true, .write = true, .shareable = true };
-    const vm = syscall.vm_reserve(0, 4096, vm_rw_s.bits());
+    const vm = syscall.mem_reserve(0, 4096, vm_rw_s.bits());
     const vm_handle: u64 = @bitCast(vm.val);
-    _ = syscall.shm_map(shm_handle, vm_handle, 0);
+    _ = syscall.mem_shm_map(shm_handle, vm_handle, 0);
     const counter: *u64 = @ptrFromInt(vm.val2);
 
     // Spawn child_restart_counter with restart enabled.
-    const child_rights = perms.ProcessRights{ .spawn_thread = true, .mem_reserve = true, .shm_create = true, .restart = true };
+    const child_rights = perms.ProcessRights{ .spawn_thread = true, .mem_reserve = true, .mem_shm_create = true, .restart = true };
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(@intFromPtr(children.child_restart_counter.ptr), children.child_restart_counter.len, child_rights.bits())));
 
     // Send SHM handle to child via IPC.

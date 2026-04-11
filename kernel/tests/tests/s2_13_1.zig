@@ -16,9 +16,9 @@ pub fn main(_: u64) void {
         all_pass = false;
     }
 
-    const r2 = syscall.guest_map(0, 0x1000, 0x1000, 0x1);
+    const r2 = syscall.vm_guest_map(0, 0x1000, 0x1000, 0x1);
     if (r2 != syscall.E_INVAL) {
-        t.failWithVal("§2.13.1 guest_map", syscall.E_INVAL, r2);
+        t.failWithVal("§2.13.1 vm_guest_map", syscall.E_INVAL, r2);
         all_pass = false;
     }
 
@@ -34,27 +34,27 @@ pub fn main(_: u64) void {
         all_pass = false;
     }
 
-    const r5 = syscall.vcpu_set_state(0xDEAD, 0);
+    const r5 = syscall.vm_vcpu_set_state(0xDEAD, 0);
     if (r5 != syscall.E_INVAL) {
-        t.failWithVal("§2.13.1 vcpu_set_state", syscall.E_INVAL, r5);
+        t.failWithVal("§2.13.1 vm_vcpu_set_state", syscall.E_INVAL, r5);
         all_pass = false;
     }
 
-    const r6 = syscall.vcpu_get_state(0xDEAD, 0);
+    const r6 = syscall.vm_vcpu_get_state(0xDEAD, 0);
     if (r6 != syscall.E_INVAL) {
-        t.failWithVal("§2.13.1 vcpu_get_state", syscall.E_INVAL, r6);
+        t.failWithVal("§2.13.1 vm_vcpu_get_state", syscall.E_INVAL, r6);
         all_pass = false;
     }
 
-    const r7 = syscall.vcpu_run(0xDEAD);
+    const r7 = syscall.vm_vcpu_run(0xDEAD);
     if (r7 != syscall.E_INVAL) {
-        t.failWithVal("§2.13.1 vcpu_run", syscall.E_INVAL, r7);
+        t.failWithVal("§2.13.1 vm_vcpu_run", syscall.E_INVAL, r7);
         all_pass = false;
     }
 
-    const r8 = syscall.vcpu_interrupt(0xDEAD, 0);
+    const r8 = syscall.vm_vcpu_interrupt(0xDEAD, 0);
     if (r8 != syscall.E_INVAL) {
-        t.failWithVal("§2.13.1 vcpu_interrupt", syscall.E_INVAL, r8);
+        t.failWithVal("§2.13.1 vm_vcpu_interrupt", syscall.E_INVAL, r8);
         all_pass = false;
     }
 

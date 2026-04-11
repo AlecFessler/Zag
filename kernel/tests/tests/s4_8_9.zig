@@ -7,7 +7,7 @@ const t = lib.testing;
 
 const E_INVAL: i64 = -1;
 
-/// §4.8.9 — `mmio_map` with duplicate device region returns `E_INVAL`.
+/// §4.8.9 — `mem_mmio_map` with duplicate device region returns `E_INVAL`.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
@@ -20,14 +20,14 @@ pub fn main(pv: u64) void {
     const rights = perms.VmReservationRights{ .read = true, .write = true, .mmio = true };
 
     // Create reservation big enough for two mappings.
-    const vm1 = syscall.vm_reserve(0, size * 2, rights.bits());
+    const vm1 = syscall.mem_reserve(0, size * 2, rights.bits());
     const vm_handle1: u64 = @bitCast(vm1.val);
 
     // First map at offset 0 should succeed.
-    _ = syscall.mmio_map(dev_handle, vm_handle1, 0);
+    _ = syscall.mem_mmio_map(dev_handle, vm_handle1, 0);
 
     // Second map of same device in same reservation should fail with E_INVAL.
-    const ret = syscall.mmio_map(dev_handle, vm_handle1, size);
+    const ret = syscall.mem_mmio_map(dev_handle, vm_handle1, size);
     t.expectEqual("§4.8.9", E_INVAL, ret);
     syscall.shutdown();
 }

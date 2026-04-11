@@ -11,7 +11,7 @@ const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
 /// Protocol:
 ///   1. Recv setup cap-transfer of a *control* SHM, reply empty.
 ///   2. Map the control SHM.
-///   3. Fill its own perm table with vm_reserve until it saturates.
+///   3. Fill its own perm table with mem_reserve until it saturates.
 ///   4. Set buf[0] = 1 ("table full, ready for parent to queue a caller").
 ///   5. Block on futex at buf[1] until parent signals "do recv now".
 ///   6. Do blocking recv; write rc to buf[2]; signal buf[3] = 1 done.
@@ -37,9 +37,9 @@ pub fn main(perm_view_addr: u64) void {
         .write = true,
         .shareable = true,
     }).bits();
-    const vm = syscall.vm_reserve(0, shm_size, vm_rights);
+    const vm = syscall.mem_reserve(0, shm_size, vm_rights);
     if (vm.val < 0) return;
-    if (syscall.shm_map(shm_handle, @intCast(vm.val), 0) != 0) return;
+    if (syscall.mem_shm_map(shm_handle, @intCast(vm.val), 0) != 0) return;
 
     const buf: [*]volatile u64 = @ptrFromInt(vm.val2);
 
@@ -47,7 +47,7 @@ pub fn main(perm_view_addr: u64) void {
     const rw = (perms.VmReservationRights{ .read = true, .write = true }).bits();
     var i: u32 = 0;
     while (i < 200) : (i += 1) {
-        const r = syscall.vm_reserve(0, 4096, rw);
+        const r = syscall.mem_reserve(0, 4096, rw);
         if (r.val < 0) break;
     }
 

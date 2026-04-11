@@ -595,7 +595,7 @@ var translation_enabled: bool = false;
 
 /// Enable DMA translation by setting IommuEn on all active units.
 ///
-/// Called after the first dma_map syscall so that device page tables
+/// Called after the first mem_dma_map syscall so that device page tables
 /// contain actual mappings before the IOMMU starts translating.
 /// Without this deferral, early device DMA would fault against
 /// empty page tables (same pattern as Intel VT-d's deferred TE).

@@ -16,8 +16,8 @@ pub fn main(_: u64) void {
     const shm: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(PAGE, shm_rights.bits())));
 
     const vm_rights = (perms.VmReservationRights{ .read = true, .write = true, .shareable = true }).bits();
-    const vm = syscall.vm_reserve(0, PAGE, vm_rights);
-    _ = syscall.shm_map(shm, @bitCast(vm.val), 0);
+    const vm = syscall.mem_reserve(0, PAGE, vm_rights);
+    _ = syscall.mem_shm_map(shm, @bitCast(vm.val), 0);
     const buf: [*]volatile u64 = @ptrFromInt(vm.val2);
 
     const child_rights = (perms.ProcessRights{ .mem_reserve = true }).bits();

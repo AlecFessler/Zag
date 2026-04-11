@@ -92,7 +92,7 @@ pub fn main(pv: u64) void {
     }
 
     // Reserve host buffer and write HLT guest code into it.
-    const res = syscall.vm_reserve(0, syscall.PAGE4K, 0x3);
+    const res = syscall.mem_reserve(0, syscall.PAGE4K, 0x3);
     if (res.val < 0) {
         t.failWithVal("§2.13.4 reserve", 0, res.val);
         _ = syscall.vm_destroy();
@@ -104,9 +104,9 @@ pub fn main(pv: u64) void {
     }
 
     // Map host buffer as guest physical memory at address 0.
-    const mr = syscall.guest_map(res.val2, 0x0, syscall.PAGE4K, 0x7);
+    const mr = syscall.vm_guest_map(res.val2, 0x0, syscall.PAGE4K, 0x7);
     if (mr != syscall.E_OK) {
-        t.failWithVal("§2.13.4 guest_map", syscall.E_OK, mr);
+        t.failWithVal("§2.13.4 vm_guest_map", syscall.E_OK, mr);
         _ = syscall.vm_destroy();
         syscall.shutdown();
     }
@@ -131,13 +131,13 @@ pub fn main(pv: u64) void {
 
     // Set up real-mode guest state with HLT code for both vCPUs.
     setupRealModeState(&guest_state);
-    var sr = syscall.vcpu_set_state(vcpu0, @intFromPtr(&guest_state));
+    var sr = syscall.vm_vcpu_set_state(vcpu0, @intFromPtr(&guest_state));
     if (sr != syscall.E_OK) {
         t.failWithVal("§2.13.4 set_state0", syscall.E_OK, sr);
         _ = syscall.vm_destroy();
         syscall.shutdown();
     }
-    sr = syscall.vcpu_set_state(vcpu1, @intFromPtr(&guest_state));
+    sr = syscall.vm_vcpu_set_state(vcpu1, @intFromPtr(&guest_state));
     if (sr != syscall.E_OK) {
         t.failWithVal("§2.13.4 set_state1", syscall.E_OK, sr);
         _ = syscall.vm_destroy();
@@ -145,8 +145,8 @@ pub fn main(pv: u64) void {
     }
 
     // Run both vCPUs — they will execute HLT and exit.
-    _ = syscall.vcpu_run(vcpu0);
-    _ = syscall.vcpu_run(vcpu1);
+    _ = syscall.vm_vcpu_run(vcpu0);
+    _ = syscall.vm_vcpu_run(vcpu1);
 
     // Receive both exits — both should be pending.
     const r1 = syscall.vm_recv(@intFromPtr(&buf), 1);

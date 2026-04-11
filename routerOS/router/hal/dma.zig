@@ -1,5 +1,5 @@
 /// Shared DMA region layout for dual-NIC zero-copy router.
-/// One SHM mapped to both devices via dma_map (IOMMU or physical passthrough).
+/// One SHM mapped to both devices via mem_dma_map (IOMMU or physical passthrough).
 const lib = @import("lib");
 
 const e1000 = @import("e1000.zig");
@@ -74,7 +74,7 @@ pub fn setup(wan_device_handle: u64, lan_device_handle: u64) ?DmaRegion {
     // Create SHM
     const shm_rights = (perms.SharedMemoryRights{ .read = true, .write = true, .grant = true }).bits();
     const shm_handle = syscall.shm_create_with_rights(TOTAL_SIZE, shm_rights) catch {
-        syscall.write("dma: shm_create failed\n");
+        syscall.write("dma: mem_shm_create failed\n");
         return null;
     };
 
@@ -84,12 +84,12 @@ pub fn setup(wan_device_handle: u64, lan_device_handle: u64) ?DmaRegion {
         .write = true,
         .shareable = true,
     }).bits();
-    const vm = syscall.vm_reserve(0, TOTAL_SIZE, vm_rights) catch {
-        syscall.write("dma: vm_reserve failed\n");
+    const vm = syscall.mem_reserve(0, TOTAL_SIZE, vm_rights) catch {
+        syscall.write("dma: mem_reserve failed\n");
         return null;
     };
-    syscall.shm_map(shm_handle, vm.handle, 0) catch {
-        syscall.write("dma: shm_map failed\n");
+    syscall.mem_shm_map(shm_handle, vm.handle, 0) catch {
+        syscall.write("dma: mem_shm_map failed\n");
         return null;
     };
 
@@ -100,12 +100,12 @@ pub fn setup(wan_device_handle: u64, lan_device_handle: u64) ?DmaRegion {
     @memset(ptr[0..TOTAL_SIZE], 0);
 
     // DMA-map to both devices (works with or without IOMMU)
-    const wan_dma_base = syscall.dma_map(wan_device_handle, shm_handle) catch {
-        syscall.write("dma: WAN dma_map failed\n");
+    const wan_dma_base = syscall.mem_dma_map(wan_device_handle, shm_handle) catch {
+        syscall.write("dma: WAN mem_dma_map failed\n");
         return null;
     };
 
-    const lan_dma_base = syscall.dma_map(lan_device_handle, shm_handle) catch wan_dma_base;
+    const lan_dma_base = syscall.mem_dma_map(lan_device_handle, shm_handle) catch wan_dma_base;
 
     return .{
         .virt_base = virt_base,
@@ -125,22 +125,22 @@ pub fn setupWan(wan_device_handle: u64, lan_device_handle: ?u64) ?DmaRegion {
         .write = true,
         .shareable = true,
     }).bits();
-    const vm = syscall.vm_reserve(0, TOTAL_SIZE, vm_rights) catch return null;
-    syscall.shm_map(shm_handle, vm.handle, 0) catch return null;
+    const vm = syscall.mem_reserve(0, TOTAL_SIZE, vm_rights) catch return null;
+    syscall.mem_shm_map(shm_handle, vm.handle, 0) catch return null;
 
     const virt_base = vm.addr;
     const ptr: [*]u8 = @ptrFromInt(virt_base);
     @memset(ptr[0..TOTAL_SIZE], 0);
 
-    const wan_dma_base = syscall.dma_map(wan_device_handle, shm_handle) catch {
-        syscall.write("dma: dma_map failed\n");
+    const wan_dma_base = syscall.mem_dma_map(wan_device_handle, shm_handle) catch {
+        syscall.write("dma: mem_dma_map failed\n");
         return null;
     };
 
     var lan_dma_base: u64 = 0;
     if (lan_device_handle) |lan_handle| {
-        lan_dma_base = syscall.dma_map(lan_handle, shm_handle) catch blk: {
-            syscall.write("dma: LAN dma_map failed\n");
+        lan_dma_base = syscall.mem_dma_map(lan_handle, shm_handle) catch blk: {
+            syscall.write("dma: LAN mem_dma_map failed\n");
             break :blk 0;
         };
     }

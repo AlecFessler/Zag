@@ -1,4 +1,4 @@
-/// §4.40.5 — `guest_map` with invalid rights bits returns `E_INVAL`.
+/// §4.40.5 — `vm_guest_map` with invalid rights bits returns `E_INVAL`.
 const lib = @import("lib");
 
 const syscall = lib.syscall;
@@ -18,7 +18,7 @@ pub fn main(_: u64) void {
     }
 
     // Valid guest_addr and size, but invalid rights bits (0xFF has undefined upper bits).
-    const result = syscall.guest_map(0, 0x1000, 0x1000, 0xFF);
+    const result = syscall.vm_guest_map(0, 0x1000, 0x1000, 0xFF);
     t.expectEqual("§4.40.5", syscall.E_INVAL, result);
 
     _ = syscall.vm_destroy();

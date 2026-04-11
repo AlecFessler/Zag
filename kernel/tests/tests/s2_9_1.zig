@@ -37,10 +37,10 @@ pub fn main(pv: u64) void {
 
     // (b) Access via the old handle must fail — the parent no longer owns it.
     const vm_rights = perms.VmReservationRights{ .read = true, .write = true, .mmio = true };
-    const vm = syscall.vm_reserve(0, 4096, vm_rights.bits());
+    const vm = syscall.mem_reserve(0, 4096, vm_rights.bits());
     const vm_handle: u64 = @bitCast(vm.val);
     const E_BADHANDLE: i64 = -3;
-    const rc = syscall.mmio_map(dev_handle, vm_handle, 0);
+    const rc = syscall.mem_mmio_map(dev_handle, vm_handle, 0);
     if (rc == E_BADHANDLE) {
         t.pass("§2.9.1");
     } else {

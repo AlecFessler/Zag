@@ -140,7 +140,7 @@ pub fn main(pv: u64) void {
         (perms.SharedMemoryRights{ .read = true, .write = true, .grant = true }).bits(),
     );
     if (shm_handle_raw < 0) {
-        t.fail("§2.12.35 B shm_create");
+        t.fail("§2.12.35 B mem_shm_create");
         syscall.shutdown();
     }
     const shm_handle: u64 = @bitCast(shm_handle_raw);
@@ -151,14 +151,14 @@ pub fn main(pv: u64) void {
         .write = true,
         .shareable = true,
     }).bits();
-    const vm_result = syscall.vm_reserve(0, shm_size, vm_rights);
+    const vm_result = syscall.mem_reserve(0, shm_size, vm_rights);
     if (vm_result.val < 0) {
-        t.fail("§2.12.35 B vm_reserve");
+        t.fail("§2.12.35 B mem_reserve");
         syscall.shutdown();
     }
     const vm_h: u64 = @intCast(vm_result.val);
-    if (syscall.shm_map(shm_handle, vm_h, 0) != 0) {
-        t.fail("§2.12.35 B shm_map");
+    if (syscall.mem_shm_map(shm_handle, vm_h, 0) != 0) {
+        t.fail("§2.12.35 B mem_shm_map");
         syscall.shutdown();
     }
     const counter_ptr: *volatile u64 = @ptrFromInt(vm_result.val2);
@@ -167,7 +167,7 @@ pub fn main(pv: u64) void {
     // Spawn the multi-thread target.
     const target2_rights = (perms.ProcessRights{
         .mem_reserve = true,
-        .shm_create = true,
+        .mem_shm_create = true,
         .spawn_thread = true,
     }).bits();
     const target2_handle: u64 = @bitCast(@as(i64, syscall.proc_create(

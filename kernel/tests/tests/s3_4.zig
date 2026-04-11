@@ -16,9 +16,9 @@ const N_PAGES: u64 = 4;
 /// (zero-fill guarantee).
 pub fn main(_: u64) void {
     const rights = (perms.VmReservationRights{ .read = true, .write = true }).bits();
-    const result = syscall.vm_reserve(0, PAGE * N_PAGES, rights);
+    const result = syscall.mem_reserve(0, PAGE * N_PAGES, rights);
     if (result.val < 0) {
-        t.fail("§3.4 vm_reserve");
+        t.fail("§3.4 mem_reserve");
         syscall.shutdown();
     }
 

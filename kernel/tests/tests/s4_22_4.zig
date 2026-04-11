@@ -11,7 +11,7 @@ pub fn main(perm_view: u64) void {
     _ = perm_view;
     // Use a valid page address + 1 to get misaligned addr.
     const rw = perms.VmReservationRights{ .read = true, .write = true };
-    const result = syscall.vm_reserve(0, 4096, rw.bits());
+    const result = syscall.mem_reserve(0, 4096, rw.bits());
     const misaligned_addr = result.val2 + 1;
     // Call futex_wait with raw misaligned address.
     const ret = asm volatile ("int $0x80"

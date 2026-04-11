@@ -4,7 +4,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §4.5.1 — `shm_create` returns handle ID (positive) on success.
+/// §4.5.1 — `mem_shm_create` returns handle ID (positive) on success.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     const rights = perms.SharedMemoryRights{ .read = true, .write = true };

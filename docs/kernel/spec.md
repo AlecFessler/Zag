@@ -68,9 +68,9 @@ For other types: **§2.1.27** `vm_reservation` entry: `field0` = start VAddr, `f
 
 #### Address Space Layout
 
-The user half of the virtual address space is split into two zones. The lower ASLR zone is where the kernel places ELF segments and stacks at a randomized base. The upper static reservation zone is for `vm_reserve` with an explicit hint address at deterministic locations.
+The user half of the virtual address space is split into two zones. The lower ASLR zone is where the kernel places ELF segments and stacks at a randomized base. The upper static reservation zone is for `mem_reserve` with an explicit hint address at deterministic locations.
 
-**§2.1.31** User address space spans `[0, 0xFFFF_8000_0000_0000)`. **§2.1.32** ELF segments and stacks are never placed in the static reservation zone `[0x0000_1000_0000_0000, 0xFFFF_8000_0000_0000)`. **§2.1.33** `vm_reserve` with a hint in the static reservation zone uses that address (if no overlap). **§2.1.34** ELF segments and user stacks are placed in the ASLR zone `[0x0000_0000_0000_1000, 0x0000_1000_0000_0000)` with a randomized base. **§2.1.35** The first 4 KiB `[0, 0x1000)` is unmapped; accessing address 0 causes a fault. **§2.1.36** The ASLR base address is page-aligned.
+**§2.1.31** User address space spans `[0, 0xFFFF_8000_0000_0000)`. **§2.1.32** ELF segments and stacks are never placed in the static reservation zone `[0x0000_1000_0000_0000, 0xFFFF_8000_0000_0000)`. **§2.1.33** `mem_reserve` with a hint in the static reservation zone uses that address (if no overlap). **§2.1.34** ELF segments and user stacks are placed in the ASLR zone `[0x0000_0000_0000_1000, 0x0000_1000_0000_0000)` with a randomized base. **§2.1.35** The first 4 KiB `[0, 0x1000)` is unmapped; accessing address 0 causes a fault. **§2.1.36** The ASLR base address is page-aligned.
 
 **§2.1.37** Thread entry `field0` is the thread's stable kernel-assigned thread id (`tid`, u64).
 
@@ -86,15 +86,15 @@ Virtual memory is managed per-process through **VM reservations** — contiguous
 
 `VmReservationRights` bits: `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4), `write_combining`(5). `shareable` and `mmio` are mutually exclusive. `write_combining` requires `mmio`.
 
-`vm_perms` adjusts the effective access rights on a sub-range within a reservation. **§2.2.1** Setting RWX = 0 via `vm_perms` decommits the range: pages are freed and the VA range returns to demand-paged state. **§2.2.2** Pages demand-paged after decommit are guaranteed to be zeroed. **§2.2.3** `vm_perms` with non-zero RWX takes effect: accessing the range respects the new permissions (e.g., writing to a read-only range faults).
+`mem_perms` adjusts the effective access rights on a sub-range within a reservation. **§2.2.1** Setting RWX = 0 via `mem_perms` decommits the range: pages are freed and the VA range returns to demand-paged state. **§2.2.2** Pages demand-paged after decommit are guaranteed to be zeroed. **§2.2.3** `mem_perms` with non-zero RWX takes effect: accessing the range respects the new permissions (e.g., writing to a read-only range faults).
 
-`shm_map` maps a shared memory region into a reservation at a specified offset. The reservation must have the `shareable` right, and the SHM's RWX rights must not exceed the reservation's max rights. **§2.2.4** `shm_map` maps the full SHM region at the specified offset. SHM pages are eagerly mapped — they're immediately accessible without demand-paging.
+`mem_shm_map` maps a shared memory region into a reservation at a specified offset. The reservation must have the `shareable` right, and the SHM's RWX rights must not exceed the reservation's max rights. **§2.2.4** `mem_shm_map` maps the full SHM region at the specified offset. SHM pages are eagerly mapped — they're immediately accessible without demand-paging.
 
-**§2.2.6** `shm_unmap` removes the SHM mapping from the reservation. **§2.2.7** After `shm_unmap`, the range reverts to private with max RWX rights.
+**§2.2.6** `mem_shm_unmap` removes the SHM mapping from the reservation. **§2.2.7** After `mem_shm_unmap`, the range reverts to private with max RWX rights.
 
-`mmio_map` maps a device's MMIO region into a reservation. The reservation must have the `mmio` right plus at least `read` or `write`. MMIO mappings use uncacheable attributes by default; if the reservation has the `write_combining` right, write-combining attributes are used instead.
+`mem_mmio_map` maps a device's MMIO region into a reservation. The reservation must have the `mmio` right plus at least `read` or `write`. MMIO mappings use uncacheable attributes by default; if the reservation has the `write_combining` right, write-combining attributes are used instead.
 
-**§2.2.10** After `mmio_unmap`, the range reverts to private with max RWX rights.
+**§2.2.10** After `mem_mmio_unmap`, the range reverts to private with max RWX rights.
 
 ---
 
@@ -104,7 +104,7 @@ All access to kernel objects is mediated by **capabilities** — handles with as
 
 **§2.3.1** Handles are monotonically increasing u64 IDs, unique per process lifetime. **§2.3.2** Handle 0 (`HANDLE_SELF`) exists at process creation and cannot be revoked.
 
-There are five rights types. **ProcessRights** (u16, slot 0 only): `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `shm_create`(5), `device_own`(6), `fault_handler`(7). **ProcessHandleRights** (u16, other process handles): `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5), `fault_handler`(6). When `fault_handler` is set on a handle to process P, the holder receives P's fault messages in the holder's own fault box. At most one external process may hold this bit for any given process at a time. **SharedMemoryRights** (u8): `read`(0), `write`(1), `execute`(2), `grant`(3). **DeviceRegionRights** (u8): `map`(0), `grant`(1), `dma`(2). **ThreadHandleRights** (u8): `suspend`(0), `resume`(1), `kill`(2). 5 bits reserved.
+There are five rights types. **ProcessRights** (u16, slot 0 only): `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `mem_shm_create`(5), `device_own`(6), `fault_handler`(7). **ProcessHandleRights** (u16, other process handles): `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5), `fault_handler`(6). When `fault_handler` is set on a handle to process P, the holder receives P's fault messages in the holder's own fault box. At most one external process may hold this bit for any given process at a time. **SharedMemoryRights** (u8): `read`(0), `write`(1), `execute`(2), `grant`(3). **DeviceRegionRights** (u8): `map`(0), `grant`(1), `dma`(2). **ThreadHandleRights** (u8): `suspend`(0), `resume`(1), `kill`(2). 5 bits reserved.
 
 **§2.3.3** `restart` can only be granted by a parent that itself has restart capability. **§2.3.4** Once cleared via `disable_restart`, the restart capability cannot be re-enabled.
 
@@ -235,7 +235,7 @@ Each user stack is flanked by unmapped guard pages that catch overflow and under
 
 ### §2.9 Device Region
 
-A device region represents a hardware device. Two types: **MMIO** (memory-mapped, accessed via `mmio_map`) and **Port I/O** (accessed via `ioport_read`/`ioport_write`). **§2.9.1** Device access is exclusive (only one process holds the handle at a time).
+A device region represents a hardware device. Two types: **MMIO** (memory-mapped, accessed via `mem_mmio_map`) and **Port I/O** (accessed via `ioport_read`/`ioport_write`). **§2.9.1** Device access is exclusive (only one process holds the handle at a time).
 
 Device entries in the user view encode hardware identification: **§2.9.2** device user view `field0` encodes: `device_type(u8) | device_class(u8) << 8 | size_or_port_count(u32) << 32`. **§2.9.3** Device user view `field1` encodes: `pci_vendor(u16) | pci_device(u16) << 16 | pci_class(u8) << 32 | pci_subclass(u8) << 40`.
 
@@ -464,7 +464,7 @@ The action passed to `vm_reply`:
 
 #### Interrupt Injection
 
-**§2.13.11** `vcpu_interrupt` injects a virtual interrupt into a vCPU. If the vCPU is running, the kernel IPIs its core, injects the interrupt, and immediately resumes.
+**§2.13.11** `vm_vcpu_interrupt` injects a virtual interrupt into a vCPU. If the vCPU is running, the kernel IPIs its core, injects the interrupt, and immediately resumes.
 
 **§2.13.12** If the vCPU is not currently running, the kernel writes the pending interrupt into the vCPU's arch state for delivery on next resume.
 
@@ -472,17 +472,17 @@ The action passed to `vm_reply`:
 
 #### In-Kernel LAPIC and IOAPIC
 
-The kernel emulates a single-vCPU Local APIC at guest physical `0xFEE00000` and a 24-pin I/O APIC at guest physical `0xFEC00000` for every VM. Guest reads and writes to either page are decoded and handled inline by the kernel without producing VM exits to the VMM. The LAPIC timer ticks against the host TSC each time a vCPU re-enters guest mode, and pending interrupt vectors are injected via the standard event-injection path. Because the kernel owns these pages, `guest_map` refuses any request whose guest physical region overlaps either of them (§4.40.8).
+The kernel emulates a single-vCPU Local APIC at guest physical `0xFEE00000` and a 24-pin I/O APIC at guest physical `0xFEC00000` for every VM. Guest reads and writes to either page are decoded and handled inline by the kernel without producing VM exits to the VMM. The LAPIC timer ticks against the host TSC each time a vCPU re-enters guest mode, and pending interrupt vectors are injected via the standard event-injection path. Because the kernel owns these pages, `vm_guest_map` refuses any request whose guest physical region overlaps either of them (§4.40.8).
 
 #### MSR Passthrough
 
-The VMM can request that specific MSRs be made directly accessible to the guest (no VM exit on RDMSR/WRMSR) via `msr_passthrough` (§4.47). The kernel maintains a hard blocklist of security-critical MSRs that must always be intercepted regardless of what the VMM requests:
+The VMM can request that specific MSRs be made directly accessible to the guest (no VM exit on RDMSR/WRMSR) via `vm_msr_passthrough` (§4.47). The kernel maintains a hard blocklist of security-critical MSRs that must always be intercepted regardless of what the VMM requests:
 
 `EFER` (`0xC0000080`), `STAR` (`0xC0000081`), `LSTAR` (`0xC0000082`), `CSTAR` (`0xC0000083`), `SFMASK` (`0xC0000084`), `IA32_APIC_BASE` (`0x1B`), `KERNEL_GS_BASE` (`0xC0000102`), `IA32_SYSENTER_CS` (`0x174`), `IA32_SYSENTER_ESP` (`0x175`), `IA32_SYSENTER_EIP` (`0x176`).
 
 #### Userspace IRQ Assertion
 
-`ioapic_assert_irq` (§4.48) and `ioapic_deassert_irq` (§4.49) let userspace device emulators drive the in-kernel IOAPIC directly. After a successful assert or de-assert, the kernel sends an inter-processor interrupt to any core currently running one of the VM's vCPUs so the vCPU re-enters its scheduling loop and observes the new interrupt state. This kick is what lets guests in tight polling loops see freshly asserted IRQs without waiting for a timer-induced exit; the end-to-end behavior is exercised by the Linux boot integration test (`./test.sh linux`).
+`vm_ioapic_assert_irq` (§4.48) and `vm_ioapic_deassert_irq` (§4.49) let userspace device emulators drive the in-kernel IOAPIC directly. After a successful assert or de-assert, the kernel sends an inter-processor interrupt to any core currently running one of the VM's vCPUs so the vCPU re-enters its scheduling loop and observes the new interrupt state. This kick is what lets guests in tight polling loops see freshly asserted IRQs without waiting for a timer-induced exit; the end-to-end behavior is exercised by the Linux boot integration test (`./test.sh linux`).
 
 ---
 
@@ -542,33 +542,33 @@ All syscalls return `i64`. Non-negative = success, negative = error code. Sizes 
 
 Debug-only serial output syscall. **§4.2.1** `write` returns the number of bytes written. **§4.2.2** `write` with `len == 0` is a no-op returning 0. **§4.2.3** `write` with `len > 4096` returns `E_INVAL`. **§4.2.4** `write` with invalid pointer returns `E_BADADDR`.
 
-### §4.3 vm_reserve(hint, size, max_perms) → handle
+### §4.3 mem_reserve(hint, size, max_perms) → handle
 
-Reserves a contiguous VA range, creating a private demand-paged region and a permissions table entry. **§4.3.1** `vm_reserve` returns handle ID (positive) on success. **§4.3.2** `vm_reserve` returns vaddr via second return register. **§4.3.3** `vm_reserve` with hint in the static reservation zone uses that address (if no overlap). **§4.3.4** `vm_reserve` with zero hint finds a free range. **§4.3.5** `vm_reserve` requires `mem_reserve` right — returns `E_PERM` without it. **§4.3.6** `vm_reserve` with zero size returns `E_INVAL`. **§4.3.7** `vm_reserve` with non-page-aligned size returns `E_INVAL`. **§4.3.8** `vm_reserve` with `shareable` + `mmio` both set returns `E_INVAL`. **§4.3.9** `vm_reserve` with `write_combining` without `mmio` returns `E_INVAL`. Returns `E_NOMEM` on memory exhaustion or `E_MAXCAP` when the permissions table is full.
+Reserves a contiguous VA range, creating a private demand-paged region and a permissions table entry. **§4.3.1** `mem_reserve` returns handle ID (positive) on success. **§4.3.2** `mem_reserve` returns vaddr via second return register. **§4.3.3** `mem_reserve` with hint in the static reservation zone uses that address (if no overlap). **§4.3.4** `mem_reserve` with zero hint finds a free range. **§4.3.5** `mem_reserve` requires `mem_reserve` right — returns `E_PERM` without it. **§4.3.6** `mem_reserve` with zero size returns `E_INVAL`. **§4.3.7** `mem_reserve` with non-page-aligned size returns `E_INVAL`. **§4.3.8** `mem_reserve` with `shareable` + `mmio` both set returns `E_INVAL`. **§4.3.9** `mem_reserve` with `write_combining` without `mmio` returns `E_INVAL`. Returns `E_NOMEM` on memory exhaustion or `E_MAXCAP` when the permissions table is full.
 
-### §4.4 vm_perms(vm_handle, offset, size, perms) → result
+### §4.4 mem_perms(vm_handle, offset, size, perms) → result
 
-Adjusts effective access rights on a sub-range within a VM reservation. **§4.4.1** `vm_perms` returns `E_OK` on success. **§4.4.2** `vm_perms` with invalid handle returns `E_BADHANDLE`. **§4.4.3** `vm_perms` with non-`vm_reservation` handle returns `E_BADHANDLE`. **§4.4.4** `vm_perms` with non-page-aligned offset returns `E_INVAL`. **§4.4.5** `vm_perms` with zero size returns `E_INVAL`. **§4.4.6** `vm_perms` with non-page-aligned size returns `E_INVAL`. **§4.4.7** `vm_perms` with `shareable`/`mmio`/`write_combining` bits returns `E_INVAL`. **§4.4.8** `vm_perms` with out-of-bounds range returns `E_INVAL`. **§4.4.9** `vm_perms` with perms exceeding `max_rights` returns `E_PERM`. **§4.4.10** `vm_perms` on a range containing SHM or MMIO nodes returns `E_INVAL`.
+Adjusts effective access rights on a sub-range within a VM reservation. **§4.4.1** `mem_perms` returns `E_OK` on success. **§4.4.2** `mem_perms` with invalid handle returns `E_BADHANDLE`. **§4.4.3** `mem_perms` with non-`vm_reservation` handle returns `E_BADHANDLE`. **§4.4.4** `mem_perms` with non-page-aligned offset returns `E_INVAL`. **§4.4.5** `mem_perms` with zero size returns `E_INVAL`. **§4.4.6** `mem_perms` with non-page-aligned size returns `E_INVAL`. **§4.4.7** `mem_perms` with `shareable`/`mmio`/`write_combining` bits returns `E_INVAL`. **§4.4.8** `mem_perms` with out-of-bounds range returns `E_INVAL`. **§4.4.9** `mem_perms` with perms exceeding `max_rights` returns `E_PERM`. **§4.4.10** `mem_perms` on a range containing SHM or MMIO nodes returns `E_INVAL`.
 
-### §4.5 shm_create(size, rights) → handle
+### §4.5 mem_shm_create(size, rights) → handle
 
-Creates a shared memory region backed by eagerly allocated zeroed pages. **§4.5.1** `shm_create` returns handle ID (positive) on success. **§4.5.2** `shm_create` requires `shm_create` right — returns `E_PERM` without it. **§4.5.3** `shm_create` with zero size returns `E_INVAL`. **§4.5.4** `shm_create` with zero rights returns `E_INVAL`. Returns `E_NOMEM` on memory exhaustion or `E_MAXCAP` when the permissions table is full.
+Creates a shared memory region backed by eagerly allocated zeroed pages. **§4.5.1** `mem_shm_create` returns handle ID (positive) on success. **§4.5.2** `mem_shm_create` requires `mem_shm_create` right — returns `E_PERM` without it. **§4.5.3** `mem_shm_create` with zero size returns `E_INVAL`. **§4.5.4** `mem_shm_create` with zero rights returns `E_INVAL`. Returns `E_NOMEM` on memory exhaustion or `E_MAXCAP` when the permissions table is full.
 
-### §4.6 shm_map(shm_handle, vm_handle, offset) → result
+### §4.6 mem_shm_map(shm_handle, vm_handle, offset) → result
 
-Maps a full SHM region into a reservation at the given offset. **§4.6.1** `shm_map` returns `E_OK` on success. **§4.6.2** `shm_map` with invalid `shm_handle` returns `E_BADHANDLE`. **§4.6.3** `shm_map` with invalid `vm_handle` returns `E_BADHANDLE`. **§4.6.4** `shm_map` without `shareable` right on reservation returns `E_PERM`. **§4.6.5** `shm_map` with SHM RWX exceeding reservation max returns `E_PERM`. **§4.6.6** `shm_map` with non-page-aligned offset returns `E_INVAL`. **§4.6.7** `shm_map` with out-of-bounds range returns `E_INVAL`. **§4.6.8** `shm_map` with duplicate SHM in same reservation returns `E_INVAL`. **§4.6.9** `shm_map` with committed pages in range returns `E_EXIST`.
+Maps a full SHM region into a reservation at the given offset. **§4.6.1** `mem_shm_map` returns `E_OK` on success. **§4.6.2** `mem_shm_map` with invalid `shm_handle` returns `E_BADHANDLE`. **§4.6.3** `mem_shm_map` with invalid `vm_handle` returns `E_BADHANDLE`. **§4.6.4** `mem_shm_map` without `shareable` right on reservation returns `E_PERM`. **§4.6.5** `mem_shm_map` with SHM RWX exceeding reservation max returns `E_PERM`. **§4.6.6** `mem_shm_map` with non-page-aligned offset returns `E_INVAL`. **§4.6.7** `mem_shm_map` with out-of-bounds range returns `E_INVAL`. **§4.6.8** `mem_shm_map` with duplicate SHM in same reservation returns `E_INVAL`. **§4.6.9** `mem_shm_map` with committed pages in range returns `E_EXIST`.
 
-### §4.7 shm_unmap(shm_handle, vm_handle) → result
+### §4.7 mem_shm_unmap(shm_handle, vm_handle) → result
 
-Removes an SHM mapping from a reservation. The process retains the handle. **§4.7.1** `shm_unmap` returns `E_OK` on success. **§4.7.2** `shm_unmap` with invalid handle returns `E_BADHANDLE`. **§4.7.3** `shm_unmap` when SHM is not mapped returns `E_NOENT`. **§4.7.4** Process retains SHM handle after `shm_unmap`.
+Removes an SHM mapping from a reservation. The process retains the handle. **§4.7.1** `mem_shm_unmap` returns `E_OK` on success. **§4.7.2** `mem_shm_unmap` with invalid handle returns `E_BADHANDLE`. **§4.7.3** `mem_shm_unmap` when SHM is not mapped returns `E_NOENT`. **§4.7.4** Process retains SHM handle after `mem_shm_unmap`.
 
-### §4.8 mmio_map(device_handle, vm_handle, offset) → result
+### §4.8 mem_mmio_map(device_handle, vm_handle, offset) → result
 
-Maps a device's MMIO region into a reservation. **§4.8.1** `mmio_map` returns `E_OK` on success. **§4.8.2** `mmio_map` with invalid `device_handle` returns `E_BADHANDLE`. **§4.8.3** `mmio_map` with invalid `vm_handle` returns `E_BADHANDLE`. **§4.8.4** `mmio_map` without `map` right returns `E_PERM`. **§4.8.5** `mmio_map` without `mmio` right on reservation returns `E_PERM`. **§4.8.6** `mmio_map` without `read` or `write` right on reservation returns `E_PERM`. **§4.8.7** `mmio_map` with non-page-aligned offset returns `E_INVAL`. **§4.8.8** `mmio_map` with out-of-bounds range returns `E_INVAL`. **§4.8.9** `mmio_map` with duplicate device region returns `E_INVAL`. **§4.8.10** `mmio_map` with non-MMIO device returns `E_INVAL`. **§4.8.11** `mmio_map` with committed pages in range returns `E_EXIST`.
+Maps a device's MMIO region into a reservation. **§4.8.1** `mem_mmio_map` returns `E_OK` on success. **§4.8.2** `mem_mmio_map` with invalid `device_handle` returns `E_BADHANDLE`. **§4.8.3** `mem_mmio_map` with invalid `vm_handle` returns `E_BADHANDLE`. **§4.8.4** `mem_mmio_map` without `map` right returns `E_PERM`. **§4.8.5** `mem_mmio_map` without `mmio` right on reservation returns `E_PERM`. **§4.8.6** `mem_mmio_map` without `read` or `write` right on reservation returns `E_PERM`. **§4.8.7** `mem_mmio_map` with non-page-aligned offset returns `E_INVAL`. **§4.8.8** `mem_mmio_map` with out-of-bounds range returns `E_INVAL`. **§4.8.9** `mem_mmio_map` with duplicate device region returns `E_INVAL`. **§4.8.10** `mem_mmio_map` with non-MMIO device returns `E_INVAL`. **§4.8.11** `mem_mmio_map` with committed pages in range returns `E_EXIST`.
 
-### §4.9 mmio_unmap(device_handle, vm_handle) → result
+### §4.9 mem_mmio_unmap(device_handle, vm_handle) → result
 
-**§4.9.1** `mmio_unmap` returns `E_OK` on success. **§4.9.2** `mmio_unmap` with invalid handle returns `E_BADHANDLE`. **§4.9.3** `mmio_unmap` when MMIO is not mapped returns `E_NOENT`.
+**§4.9.1** `mem_mmio_unmap` returns `E_OK` on success. **§4.9.2** `mem_mmio_unmap` with invalid handle returns `E_BADHANDLE`. **§4.9.3** `mem_mmio_unmap` when MMIO is not mapped returns `E_NOENT`.
 
 ### §4.10 proc_create(elf_ptr, elf_len, process_rights, thread_rights, max_thread_priority) → handle
 
@@ -630,13 +630,13 @@ Atomically checks the u64 at `addr` against `expected` and blocks if they match.
 
 **§4.24.1** `clock_gettime` returns monotonic nanoseconds since boot.
 
-### §4.25 dma_map(device_handle, shm_handle) → dma_addr
+### §4.25 mem_dma_map(device_handle, shm_handle) → dma_addr
 
-Maps SHM into the device's IOMMU address space. Requires an IOMMU. DMA mappings are tracked per-process and automatically unmapped on exit. **§4.25.1** `dma_map` returns DMA base address (positive) on success. **§4.25.2** `dma_map` with invalid device handle returns `E_BADHANDLE`. **§4.25.3** `dma_map` with invalid SHM handle returns `E_BADHANDLE`. **§4.25.4** `dma_map` without `dma` right returns `E_PERM`. **§4.25.6** `dma_map` with non-MMIO device returns `E_INVAL`. Returns `E_NORES` on DMA mapping table full. DMA mappings present contiguous addresses to the device.
+Maps SHM into the device's IOMMU address space. Requires an IOMMU. DMA mappings are tracked per-process and automatically unmapped on exit. **§4.25.1** `mem_dma_map` returns DMA base address (positive) on success. **§4.25.2** `mem_dma_map` with invalid device handle returns `E_BADHANDLE`. **§4.25.3** `mem_dma_map` with invalid SHM handle returns `E_BADHANDLE`. **§4.25.4** `mem_dma_map` without `dma` right returns `E_PERM`. **§4.25.6** `mem_dma_map` with non-MMIO device returns `E_INVAL`. Returns `E_NORES` on DMA mapping table full. DMA mappings present contiguous addresses to the device.
 
-### §4.26 dma_unmap(device_handle, shm_handle) → result
+### §4.26 mem_dma_unmap(device_handle, shm_handle) → result
 
-**§4.26.1** `dma_unmap` returns `E_OK` on success. **§4.26.2** `dma_unmap` with invalid handle returns `E_BADHANDLE`. **§4.26.3** `dma_unmap` with no mapping returns `E_NOENT`.
+**§4.26.1** `mem_dma_unmap` returns `E_OK` on success. **§4.26.2** `mem_dma_unmap` with invalid handle returns `E_BADHANDLE`. **§4.26.3** `mem_dma_unmap` with no mapping returns `E_NOENT`.
 
 ### §4.27 ioport_read(device_handle, port_offset, width) → value
 
@@ -698,11 +698,11 @@ Destroys the calling process's VM. Kills all vCPU threads, tears down guest memo
 
 **§4.39.1** `vm_destroy` returns `E_OK` on success. **§4.39.2** `vm_destroy` with no VM returns `E_INVAL`. **§4.39.3** `vm_destroy` with running vCPUs returns `E_OK` and cleanly tears down the VM.
 
-### §4.40 guest_map(host_vaddr, guest_addr, size, rights) → result
+### §4.40 vm_guest_map(host_vaddr, guest_addr, size, rights) → result
 
 Maps a host virtual memory range as guest physical memory at the specified guest address. The kernel resolves the host pages and wires them into the guest's physical address space. The VMM process retains host access to the pages.
 
-**§4.40.1** `guest_map` returns `E_OK` on success. **§4.40.2** `guest_map` with zero size returns `E_INVAL`. **§4.40.3** `guest_map` with non-page-aligned `guest_addr` returns `E_INVAL`. **§4.40.4** `guest_map` with non-page-aligned `size` returns `E_INVAL`. **§4.40.5** `guest_map` with invalid rights bits returns `E_INVAL`. **§4.40.6** `guest_map` with non-page-aligned `host_vaddr` returns `E_INVAL`. **§4.40.7** `guest_map` with `host_vaddr` not pointing to a valid mapped region in the caller's address space returns `E_BADADDR`. **§4.40.8** `guest_map` with a guest physical region overlapping the in-kernel LAPIC page (`0xFEE00000`) or IOAPIC page (`0xFEC00000`) returns `E_INVAL`.
+**§4.40.1** `vm_guest_map` returns `E_OK` on success. **§4.40.2** `vm_guest_map` with zero size returns `E_INVAL`. **§4.40.3** `vm_guest_map` with non-page-aligned `guest_addr` returns `E_INVAL`. **§4.40.4** `vm_guest_map` with non-page-aligned `size` returns `E_INVAL`. **§4.40.5** `vm_guest_map` with invalid rights bits returns `E_INVAL`. **§4.40.6** `vm_guest_map` with non-page-aligned `host_vaddr` returns `E_INVAL`. **§4.40.7** `vm_guest_map` with `host_vaddr` not pointing to a valid mapped region in the caller's address space returns `E_BADADDR`. **§4.40.8** `vm_guest_map` with a guest physical region overlapping the in-kernel LAPIC page (`0xFEE00000`) or IOAPIC page (`0xFEC00000`) returns `E_INVAL`.
 
 ### §4.41 vm_recv(buf_ptr, blocking) → exit_token
 
@@ -716,47 +716,47 @@ Resolves a pending VM exit identified by `exit_token`. `action_ptr` points to a 
 
 **§4.42.1** `vm_reply` returns `E_OK` on success. **§4.42.2** `vm_reply` with `exit_token` not matching any pending exit returns `E_NOENT`. **§4.42.3** `vm_reply` with `action_ptr` not readable returns `E_BADADDR`. **§4.42.4** `vm_reply` with invalid action type returns `E_INVAL`. **§4.42.5** `vm_reply` with `resume_guest` action resumes the guest with the provided guest state. The VMM is responsible for advancing RIP past the exiting instruction if needed. **§4.42.6** `vm_reply` with `resume_guest` applies modified guest state, including GPR changes, before resuming execution.
 
-### §4.43 vcpu_set_state(thread_handle, guest_state_ptr) → result
+### §4.43 vm_vcpu_set_state(thread_handle, guest_state_ptr) → result
 
-Sets the full guest register state for a vCPU. Only valid when the vCPU is in `idle` state (before `vcpu_run`).
+Sets the full guest register state for a vCPU. Only valid when the vCPU is in `idle` state (before `vm_vcpu_run`).
 
-**§4.43.1** `vcpu_set_state` returns `E_OK` on success. **§4.43.2** `vcpu_set_state` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`. **§4.43.3** `vcpu_set_state` when the vCPU is not in `idle` state returns `E_BUSY`. **§4.43.4** `vcpu_set_state` with `guest_state_ptr` not pointing to a readable region of `sizeof(arch.GuestState)` bytes returns `E_BADADDR`.
+**§4.43.1** `vm_vcpu_set_state` returns `E_OK` on success. **§4.43.2** `vm_vcpu_set_state` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`. **§4.43.3** `vm_vcpu_set_state` when the vCPU is not in `idle` state returns `E_BUSY`. **§4.43.4** `vm_vcpu_set_state` with `guest_state_ptr` not pointing to a readable region of `sizeof(arch.GuestState)` bytes returns `E_BADADDR`.
 
-### §4.44 vcpu_get_state(thread_handle, guest_state_ptr) → result
+### §4.44 vm_vcpu_get_state(thread_handle, guest_state_ptr) → result
 
 Reads the full guest register state for a vCPU. If running, the kernel IPIs its core, suspends, snapshots, writes, and resumes.
 
-**§4.44.1** `vcpu_get_state` returns `E_OK` on success. **§4.44.2** `vcpu_get_state` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`. **§4.44.3** `vcpu_get_state` with `guest_state_ptr` not pointing to a writable region of `sizeof(arch.GuestState)` bytes returns `E_BADADDR`. **§4.44.4** `vcpu_get_state` after `vcpu_set_state` returns the same register values that were set.
+**§4.44.1** `vm_vcpu_get_state` returns `E_OK` on success. **§4.44.2** `vm_vcpu_get_state` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`. **§4.44.3** `vm_vcpu_get_state` with `guest_state_ptr` not pointing to a writable region of `sizeof(arch.GuestState)` bytes returns `E_BADADDR`. **§4.44.4** `vm_vcpu_get_state` after `vm_vcpu_set_state` returns the same register values that were set.
 
-### §4.45 vcpu_run(thread_handle) → result
+### §4.45 vm_vcpu_run(thread_handle) → result
 
 Transitions a vCPU from `idle` to `running`, making its thread eligible for scheduling.
 
-**§4.45.1** `vcpu_run` returns `E_OK` on success. **§4.45.2** `vcpu_run` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`. **§4.45.3** `vcpu_run` when the vCPU is not in `idle` state returns `E_BUSY`.
+**§4.45.1** `vm_vcpu_run` returns `E_OK` on success. **§4.45.2** `vm_vcpu_run` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`. **§4.45.3** `vm_vcpu_run` when the vCPU is not in `idle` state returns `E_BUSY`.
 
-### §4.46 vcpu_interrupt(thread_handle, interrupt_ptr) → result
+### §4.46 vm_vcpu_interrupt(thread_handle, interrupt_ptr) → result
 
 Injects a virtual interrupt into a vCPU.
 
-**§4.46.1** `vcpu_interrupt` returns `E_OK` on success. **§4.46.2** `vcpu_interrupt` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`. **§4.46.3** `vcpu_interrupt` with `interrupt_ptr` not readable returns `E_BADADDR`.
+**§4.46.1** `vm_vcpu_interrupt` returns `E_OK` on success. **§4.46.2** `vm_vcpu_interrupt` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`. **§4.46.3** `vm_vcpu_interrupt` with `interrupt_ptr` not readable returns `E_BADADDR`.
 
-### §4.47 msr_passthrough(msr_num, allow_read, allow_write) → result
+### §4.47 vm_msr_passthrough(msr_num, allow_read, allow_write) → result
 
 Configures the calling process's VM to allow the guest to RDMSR and/or WRMSR the specified MSR directly without exiting. The kernel rejects security-critical MSRs (see the MSR Passthrough subsection of §2.13).
 
-**§4.47.1** `msr_passthrough` returns `E_OK` on success. **§4.47.2** `msr_passthrough` with no VM returns `E_INVAL`. **§4.47.3** `msr_passthrough` with `msr_num` outside the 32-bit MSR address range returns `E_INVAL`. **§4.47.4** `msr_passthrough` with an MSR in the security blocklist returns `E_PERM`.
+**§4.47.1** `vm_msr_passthrough` returns `E_OK` on success. **§4.47.2** `vm_msr_passthrough` with no VM returns `E_INVAL`. **§4.47.3** `vm_msr_passthrough` with `msr_num` outside the 32-bit MSR address range returns `E_INVAL`. **§4.47.4** `vm_msr_passthrough` with an MSR in the security blocklist returns `E_PERM`.
 
-### §4.48 ioapic_assert_irq(irq_num) → result
+### §4.48 vm_ioapic_assert_irq(irq_num) → result
 
 Asserts an IRQ line on the calling process's VM's in-kernel IOAPIC and kicks any running vCPU so the new interrupt state is observed promptly (see the Userspace IRQ Assertion subsection of §2.13).
 
-**§4.48.1** `ioapic_assert_irq` returns `E_OK` on success. **§4.48.2** `ioapic_assert_irq` with no VM returns `E_INVAL`. **§4.48.3** `ioapic_assert_irq` with `irq_num` greater than or equal to 24 returns `E_INVAL`.
+**§4.48.1** `vm_ioapic_assert_irq` returns `E_OK` on success. **§4.48.2** `vm_ioapic_assert_irq` with no VM returns `E_INVAL`. **§4.48.3** `vm_ioapic_assert_irq` with `irq_num` greater than or equal to 24 returns `E_INVAL`.
 
-### §4.49 ioapic_deassert_irq(irq_num) → result
+### §4.49 vm_ioapic_deassert_irq(irq_num) → result
 
 De-asserts an IRQ line on the calling process's VM's in-kernel IOAPIC and kicks any running vCPU so the new interrupt state is observed promptly (see the Userspace IRQ Assertion subsection of §2.13).
 
-**§4.49.1** `ioapic_deassert_irq` returns `E_OK` on success. **§4.49.2** `ioapic_deassert_irq` with no VM returns `E_INVAL`. **§4.49.3** `ioapic_deassert_irq` with `irq_num` greater than or equal to 24 returns `E_INVAL`.
+**§4.49.1** `vm_ioapic_deassert_irq` returns `E_OK` on success. **§4.49.2** `vm_ioapic_deassert_irq` with no VM returns `E_INVAL`. **§4.49.3** `vm_ioapic_deassert_irq` with `irq_num` greater than or equal to 24 returns `E_INVAL`.
 
 ---
 

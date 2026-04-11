@@ -38,9 +38,9 @@ pub fn main(perm_view_addr: u64) void {
         .write = true,
         .shareable = true,
     }).bits();
-    const vm = syscall.vm_reserve(0, shm_size, vm_rights);
+    const vm = syscall.mem_reserve(0, shm_size, vm_rights);
     if (vm.val < 0) return;
-    if (syscall.shm_map(shm_handle, @intCast(vm.val), 0) != 0) return;
+    if (syscall.mem_shm_map(shm_handle, @intCast(vm.val), 0) != 0) return;
 
     const buf: [*]volatile u64 = @ptrFromInt(vm.val2);
 

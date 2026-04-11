@@ -1,4 +1,4 @@
-/// §4.44.4 — `vcpu_get_state` after `vcpu_set_state` returns the same register values that were set.
+/// §4.44.4 — `vm_vcpu_get_state` after `vm_vcpu_set_state` returns the same register values that were set.
 const lib = @import("lib");
 
 const perm_view = lib.perm_view;
@@ -124,7 +124,7 @@ pub fn main(pv: u64) void {
     writeU64(&set_state, OFF_RBP, TEST_RBP);
     writeU64(&set_state, OFF_R8, TEST_R8);
 
-    const sr = syscall.vcpu_set_state(vcpu_handle, @intFromPtr(&set_state));
+    const sr = syscall.vm_vcpu_set_state(vcpu_handle, @intFromPtr(&set_state));
     if (sr != syscall.E_OK) {
         t.failWithVal("§4.44.4 set_state", syscall.E_OK, sr);
         _ = syscall.vm_destroy();
@@ -132,7 +132,7 @@ pub fn main(pv: u64) void {
     }
 
     // Read back the state immediately (vCPU is idle, never ran).
-    const gr = syscall.vcpu_get_state(vcpu_handle, @intFromPtr(&get_state));
+    const gr = syscall.vm_vcpu_get_state(vcpu_handle, @intFromPtr(&get_state));
     if (gr != syscall.E_OK) {
         t.failWithVal("§4.44.4 get_state", syscall.E_OK, gr);
         _ = syscall.vm_destroy();

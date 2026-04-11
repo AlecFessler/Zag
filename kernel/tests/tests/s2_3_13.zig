@@ -42,9 +42,9 @@ pub fn main(pv: u64) void {
         .write = true,
         .mmio = true,
     };
-    const vm = syscall.vm_reserve(0, PAGE, vm_rights.bits());
+    const vm = syscall.mem_reserve(0, PAGE, vm_rights.bits());
     const vm_h: u64 = @bitCast(vm.val);
-    if (syscall.mmio_map(dev_a, vm_h, 0) != 0) {
+    if (syscall.mem_mmio_map(dev_a, vm_h, 0) != 0) {
         t.fail("§2.3.13");
         syscall.shutdown();
     }

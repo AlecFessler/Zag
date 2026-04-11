@@ -257,5 +257,5 @@ ping 10.0.2.15
 ### 7.6 Known Issues
 
 - `cat` immediately after `put` may timeout due to serial protocol timing
-- QEMU IOMMU (VT-d/AMD-Vi) breaks e1000e RX DMA; `dma_map` falls back to physical addresses when no IOMMU is present
+- QEMU IOMMU (VT-d/AMD-Vi) breaks e1000e RX DMA; `mem_dma_map` falls back to physical addresses when no IOMMU is present
 - BSS section merged into .data in linker script to ensure zero-initialization (Zig `undefined` globals)

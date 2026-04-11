@@ -1,4 +1,4 @@
-/// §4.40.2 — `guest_map` with zero size returns `E_INVAL`.
+/// §4.40.2 — `vm_guest_map` with zero size returns `E_INVAL`.
 const lib = @import("lib");
 
 const syscall = lib.syscall;
@@ -19,7 +19,7 @@ pub fn main(_: u64) void {
     }
 
     // Zero size — should return E_INVAL (host_vaddr=0 doesn't matter, size checked first).
-    const result = syscall.guest_map(0, 0x1000, 0, 0x1);
+    const result = syscall.vm_guest_map(0, 0x1000, 0, 0x1);
     t.expectEqual("§4.40.2", syscall.E_INVAL, result);
 
     _ = syscall.vm_destroy();

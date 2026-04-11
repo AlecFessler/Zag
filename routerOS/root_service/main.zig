@@ -412,7 +412,7 @@ pub fn main(perm_view_addr: u64) void {
         .grant_to_child = true,
         .mem_reserve = true,
         .restart = true,
-        .shm_create = true,
+        .mem_shm_create = true,
         .grant_to_broadcast = true,
         .broadcast = true,
     }).bits();
@@ -422,7 +422,7 @@ pub fn main(perm_view_addr: u64) void {
         .mem_reserve = true,
         .device_own = true,
         .restart = true,
-        .shm_create = true,
+        .mem_shm_create = true,
         .grant_to_broadcast = true,
         .broadcast = true,
     }).bits();
@@ -432,7 +432,7 @@ pub fn main(perm_view_addr: u64) void {
         .spawn_thread = true,
         .mem_reserve = true,
         .set_affinity = true,
-        .shm_create = true,
+        .mem_shm_create = true,
         .device_own = true,
         .restart = true,
         .pin_exclusive = true,

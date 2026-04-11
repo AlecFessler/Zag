@@ -3,13 +3,13 @@ const lib = @import("lib");
 const perms = lib.perms;
 const syscall = lib.syscall;
 
-/// Fills own perm table with vm_reserve calls, then blocks on recv.
+/// Fills own perm table with mem_reserve calls, then blocks on recv.
 /// Used to test E_MAXCAP when parent sends/calls with cap transfer.
 pub fn main(_: u64) void {
     const rw = (perms.VmReservationRights{ .read = true, .write = true }).bits();
     var i: u32 = 0;
     while (i < 200) : (i += 1) {
-        const r = syscall.vm_reserve(0, 4096, rw);
+        const r = syscall.mem_reserve(0, 4096, rw);
         if (r.val < 0) break;
     }
     // Block on recv — parent can now send/call with cap transfer

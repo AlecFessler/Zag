@@ -7,9 +7,9 @@ const t = lib.testing;
 
 const PAGE: u64 = 4096;
 
-/// §2.2.10 — After `mmio_unmap`, the range reverts to private with max RWX rights.
+/// §2.2.10 — After `mem_mmio_unmap`, the range reverts to private with max RWX rights.
 /// rights. We reserve the region with read+write+execute (plus mmio so we
-/// can mmio_map it in the first place), map MMIO, unmap, then verify that
+/// can mem_mmio_map it in the first place), map MMIO, unmap, then verify that
 /// every page of the range is writable AND readable as fresh private memory.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
@@ -37,15 +37,15 @@ pub fn main(pv: u64) void {
         .execute = true,
         .mmio = true,
     };
-    const vm = syscall.vm_reserve(0, size, vm_rights.bits());
+    const vm = syscall.mem_reserve(0, size, vm_rights.bits());
     const vm_h: u64 = @bitCast(vm.val);
 
     // Map and unmap the MMIO region.
-    if (syscall.mmio_map(dev_handle, vm_h, 0) != 0) {
+    if (syscall.mem_mmio_map(dev_handle, vm_h, 0) != 0) {
         t.fail("§2.2.10");
         syscall.shutdown();
     }
-    if (syscall.mmio_unmap(dev_handle, vm_h) != 0) {
+    if (syscall.mem_mmio_unmap(dev_handle, vm_h) != 0) {
         t.fail("§2.2.10");
         syscall.shutdown();
     }

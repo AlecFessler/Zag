@@ -9,13 +9,13 @@ pub const SyscallResult2 = struct {
 
 pub const SyscallNum = enum(u64) {
     write,
-    vm_reserve,
-    vm_perms,
-    shm_create,
-    shm_map,
-    shm_unmap,
-    mmio_map,
-    mmio_unmap,
+    mem_reserve,
+    mem_perms,
+    mem_shm_create,
+    mem_shm_map,
+    mem_shm_unmap,
+    mem_mmio_map,
+    mem_mmio_unmap,
     proc_create,
     thread_create,
     thread_exit,
@@ -29,8 +29,8 @@ pub const SyscallNum = enum(u64) {
     clock_gettime,
     ioport_read,
     ioport_write,
-    dma_map,
-    dma_unmap,
+    mem_dma_map,
+    mem_dma_unmap,
     pci_enable_bus_master,
     pin_exclusive,
 };
@@ -49,15 +49,15 @@ pub fn clock_gettime() i64 {
 
 // ── Stubs (never called by processPacket path) ──
 
-pub fn vm_reserve(_: u64, _: u64, _: u64) SyscallResult2 {
+pub fn mem_reserve(_: u64, _: u64, _: u64) SyscallResult2 {
     return .{ .val = -1, .val2 = 0 };
 }
 
-pub fn vm_perms(_: u64, _: u64, _: u64, _: u64) i64 {
+pub fn mem_perms(_: u64, _: u64, _: u64, _: u64) i64 {
     return -1;
 }
 
-pub fn shm_create(_: u64) i64 {
+pub fn mem_shm_create(_: u64) i64 {
     return -1;
 }
 
@@ -65,19 +65,19 @@ pub fn shm_create_with_rights(_: u64, _: u64) i64 {
     return -1;
 }
 
-pub fn shm_map(_: u64, _: u64, _: u64) i64 {
+pub fn mem_shm_map(_: u64, _: u64, _: u64) i64 {
     return -1;
 }
 
-pub fn shm_unmap(_: u64, _: u64) i64 {
+pub fn mem_shm_unmap(_: u64, _: u64) i64 {
     return -1;
 }
 
-pub fn mmio_map(_: u64, _: u64, _: u64) i64 {
+pub fn mem_mmio_map(_: u64, _: u64, _: u64) i64 {
     return -1;
 }
 
-pub fn mmio_unmap(_: u64, _: u64) i64 {
+pub fn mem_mmio_unmap(_: u64, _: u64) i64 {
     return -1;
 }
 
@@ -127,7 +127,7 @@ pub fn ioport_write(_: u64, _: u64, _: u64, _: u64) i64 {
     return -1;
 }
 
-pub fn dma_map(_: u64, _: u64) i64 {
+pub fn mem_dma_map(_: u64, _: u64) i64 {
     return -1;
 }
 
@@ -135,7 +135,7 @@ pub fn pci_enable_bus_master(_: u64) i64 {
     return -1;
 }
 
-pub fn dma_unmap(_: u64, _: u64) i64 {
+pub fn mem_dma_unmap(_: u64, _: u64) i64 {
     return -1;
 }
 

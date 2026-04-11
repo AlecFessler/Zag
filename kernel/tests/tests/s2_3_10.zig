@@ -14,7 +14,7 @@ pub fn main(perm_view: u64) void {
     const shm_rights = perms.SharedMemoryRights{ .read = true, .write = true, .grant = true };
     const shm_handle: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(4096, shm_rights.bits())));
     // Spawn a child.
-    const child_rights = perms.ProcessRights{ .spawn_thread = true, .shm_create = true };
+    const child_rights = perms.ProcessRights{ .spawn_thread = true, .mem_shm_create = true };
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(@intFromPtr(children.child_send_self.ptr), children.child_send_self.len, child_rights.bits())));
     // Try to transfer with execute right (not in source) — should fail with E_PERM.
     // ipc_call_cap blocks until the child is ready to recv, so no yielding needed.

@@ -83,7 +83,7 @@ VCpu {
 }
 ```
 
-`VCpuState.idle` — created but not yet started via `vcpu_run`.
+`VCpuState.idle` — created but not yet started via `vm_vcpu_run`.
 `VCpuState.running` — actively executing guest code or scheduled to do so.
 `VCpuState.exited` — hit a VM exit, waiting for `vm_reply`.
 `VCpuState.waiting_reply` — exit message delivered, pending reply.
@@ -160,15 +160,15 @@ The policy table (`arch.VmPolicy`) is set at `vm_create` time and never changes.
 
 Guest physical address space is managed separately from host virtual address space. The VM has its own arch-specific guest physical memory structures (EPT on x64, Stage-2 page tables on ARM).
 
-`guest_map(addr, size, rights)` maps a range of guest physical address space backed by private demand-paged memory. The kernel allocates physical pages on access, same as host demand paging. `rights` controls guest access permissions (read, write, execute) in the guest physical memory structures. This is how the VMM establishes guest RAM before booting.
+`vm_guest_map(addr, size, rights)` maps a range of guest physical address space backed by private demand-paged memory. The kernel allocates physical pages on access, same as host demand paging. `rights` controls guest access permissions (read, write, execute) in the guest physical memory structures. This is how the VMM establishes guest RAM before booting.
 
-EPT violations (or equivalent) on demand-paged regions are handled inline by the kernel — no exit delivered to the VMM. EPT violations on unmapped regions are delivered to the VMM as exits, allowing the VMM to either call `guest_map` to back the region or inject a fault into the guest.
+EPT violations (or equivalent) on demand-paged regions are handled inline by the kernel — no exit delivered to the VMM. EPT violations on unmapped regions are delivered to the VMM as exits, allowing the VMM to either call `vm_guest_map` to back the region or inject a fault into the guest.
 
 ---
 
 ## Interrupt Injection
 
-The VMM can inject interrupts into a vCPU at any time via `vcpu_interrupt`. If the vCPU thread is currently running on a core, the kernel sends an IPI to that core, suspends the vCPU thread, injects the interrupt into the arch-specific interrupt injection mechanism, and immediately resumes the vCPU. From the guest's perspective the interrupt simply arrives. No VM exit is delivered to the VMM.
+The VMM can inject interrupts into a vCPU at any time via `vm_vcpu_interrupt`. If the vCPU thread is currently running on a core, the kernel sends an IPI to that core, suspends the vCPU thread, injects the interrupt into the arch-specific interrupt injection mechanism, and immediately resumes the vCPU. From the guest's perspective the interrupt simply arrives. No VM exit is delivered to the VMM.
 
 If the vCPU is not currently running (suspended or waiting for a vm_reply), the kernel writes the pending interrupt directly into the vCPU's arch state and it fires on next resume.
 
@@ -192,7 +192,7 @@ VmReplyAction = union(enum) {
 }
 ```
 
-`map_memory` is a convenience reply action that combines `guest_map` + resume in one round trip, for handling EPT violations on unmapped regions without a separate syscall.
+`map_memory` is a convenience reply action that combines `vm_guest_map` + resume in one round trip, for handling EPT violations on unmapped regions without a separate syscall.
 
 `arch.GuestException` is arch-specific and opaque to the generic kernel layer. It carries whatever the arch layer needs to inject an exception into the guest — vector, error code, fault address etc. The arch layer knows what to do with it.
 
@@ -208,7 +208,7 @@ Creates a Vm, initializes arch-specific hardware virtualization structures, crea
 **`vm_destroy() → result`**
 Kills all vCPU threads, tears down guest memory mappings, frees arch-specific virtualization structures, frees the Vm struct, clears `proc.vm`. Returns `E_OK` on success.
 
-**`guest_map(addr, size, rights) → result`**
+**`vm_guest_map(addr, size, rights) → result`**
 Maps a range of guest physical address space at `addr` with `size` bytes, backed by private demand-paged memory. `rights` is a bitmask of guest access permissions. Returns `E_INVAL` for zero size, non-page-aligned addr or size, or invalid rights bits. Returns `E_NOMEM` on allocation failure.
 
 **`vm_recv(buf_ptr, blocking) → exit_token`**
@@ -217,16 +217,16 @@ Reads from the VM's exit box. Writes a `VmExitMessage` to `buf_ptr`. Returns the
 **`vm_reply(exit_token, action_ptr) → result`**
 Resolves a pending VM exit identified by `exit_token`. `action_ptr` points to a `VmReplyAction`. Returns `E_NOENT` if `exit_token` does not match any pending exit. Returns `E_BADADDR` if `action_ptr` is not readable. Returns `E_INVAL` for invalid action type.
 
-**`vcpu_set_state(thread_handle, guest_state_ptr) → result`**
-Sets the full guest register state for a vCPU. Only valid when the vCPU is in `idle` state (before `vcpu_run`). Returns `E_BADHANDLE` if `thread_handle` does not refer to a vCPU thread. Returns `E_BUSY` if the vCPU is not in `idle` state. Returns `E_BADADDR` if `guest_state_ptr` is not a readable region of `sizeof(arch.GuestState)` bytes.
+**`vm_vcpu_set_state(thread_handle, guest_state_ptr) → result`**
+Sets the full guest register state for a vCPU. Only valid when the vCPU is in `idle` state (before `vm_vcpu_run`). Returns `E_BADHANDLE` if `thread_handle` does not refer to a vCPU thread. Returns `E_BUSY` if the vCPU is not in `idle` state. Returns `E_BADADDR` if `guest_state_ptr` is not a readable region of `sizeof(arch.GuestState)` bytes.
 
-**`vcpu_get_state(thread_handle, guest_state_ptr) → result`**
+**`vm_vcpu_get_state(thread_handle, guest_state_ptr) → result`**
 Reads the full guest register state for a vCPU. If the vCPU is currently running, the kernel IPIs its core, suspends it, snapshots the state, writes to `guest_state_ptr`, and immediately resumes. If the vCPU is already suspended, reads state directly. Returns `E_BADHANDLE` if `thread_handle` does not refer to a vCPU thread. Returns `E_BADADDR` if `guest_state_ptr` is not a writable region of `sizeof(arch.GuestState)` bytes.
 
-**`vcpu_run(thread_handle) → result`**
+**`vm_vcpu_run(thread_handle) → result`**
 Transitions a vCPU from `idle` to `running` state, making its thread eligible for scheduling. Returns `E_BADHANDLE` if `thread_handle` does not refer to a vCPU thread. Returns `E_BUSY` if the vCPU is not in `idle` state.
 
-**`vcpu_interrupt(thread_handle, interrupt_ptr) → result`**
+**`vm_vcpu_interrupt(thread_handle, interrupt_ptr) → result`**
 Injects a virtual interrupt into a vCPU. `interrupt_ptr` points to an `arch.GuestInterrupt`. If the vCPU is running, IPIs its core, injects the interrupt, resumes immediately. If the vCPU is suspended or waiting for a reply, writes the pending interrupt into its arch state for delivery on next resume. Returns `E_BADHANDLE` if `thread_handle` does not refer to a vCPU thread. Returns `E_BADADDR` if `interrupt_ptr` is not readable.
 
 ---
@@ -245,15 +245,15 @@ Every file listed here must be created as a new file. Do not add this code to ex
 
 This is the primary new directory. All VM and vCPU kernel logic lives here.
 
-**`kernel/kvm/vm.zig`** — `Vm` struct definition, `vm_create`, `vm_destroy`, `guest_map` implementations. Owns the Vm slab allocator. Handles process cleanup path (called from process exit to destroy the VM).
+**`kernel/kvm/vm.zig`** — `Vm` struct definition, `vm_create`, `vm_destroy`, `vm_guest_map` implementations. Owns the Vm slab allocator. Handles process cleanup path (called from process exit to destroy the VM).
 
-**`kernel/kvm/vcpu.zig`** — `VCpu` struct definition, `vcpu_run`, `vcpu_set_state`, `vcpu_get_state`, `vcpu_interrupt` implementations. Owns the VCpu slab allocator. Contains the fixed kernel-managed vCPU thread entry point that executes the arch resume instruction.
+**`kernel/kvm/vcpu.zig`** — `VCpu` struct definition, `vm_vcpu_run`, `vm_vcpu_set_state`, `vm_vcpu_get_state`, `vm_vcpu_interrupt` implementations. Owns the VCpu slab allocator. Contains the fixed kernel-managed vCPU thread entry point that executes the arch resume instruction.
 
 **`kernel/kvm/exit_box.zig`** — `VmExitBox` and `VmExitMessage` struct definitions. The exit box state machine (idle, receiving, pending_replies). `vm_recv` and `vm_reply` implementations. `VmReplyAction` tagged union definition.
 
 **`kernel/kvm/exit_handler.zig`** — the VM exit dispatch path. Called by the arch layer when a VM exit fires. Classifies exits as kernel-handled or VMM-handled. For kernel-handled exits, resolves inline and resumes. For VMM-handled exits, snapshots guest state, enqueues on the exit box, transitions vCPU to `exited` state.
 
-**`kernel/kvm/guest_memory.zig`** — guest physical address space management. Tracks guest physical memory mappings per Vm. Handles demand paging for `guest_map` regions — allocates physical pages on guest memory access fault, maps into arch-specific guest memory translation structures. Guest-physical analog of `kernel/memory/vmm.zig`.
+**`kernel/kvm/guest_memory.zig`** — guest physical address space management. Tracks guest physical memory mappings per Vm. Handles demand paging for `vm_guest_map` regions — allocates physical pages on guest memory access fault, maps into arch-specific guest memory translation structures. Guest-physical analog of `kernel/memory/vmm.zig`.
 
 **`kernel/kvm/kvm.zig`** — module root, re-exports all kvm types. Referenced by `kernel/zag.zig`.
 
@@ -291,7 +291,7 @@ The aarch64 variants are empty struct stubs that compile but have no implementat
 
 ### Additions to `kernel/arch/syscall.zig` — existing file, add new cases
 
-Add dispatch cases for the new VM syscalls: `vm_create`, `vm_destroy`, `guest_map`, `vm_recv`, `vm_reply`, `vcpu_set_state`, `vcpu_get_state`, `vcpu_run`, `vcpu_interrupt`. These dispatch to the implementations in `kernel/kvm/`.
+Add dispatch cases for the new VM syscalls: `vm_create`, `vm_destroy`, `vm_guest_map`, `vm_recv`, `vm_reply`, `vm_vcpu_set_state`, `vm_vcpu_get_state`, `vm_vcpu_run`, `vm_vcpu_interrupt`. These dispatch to the implementations in `kernel/kvm/`.
 
 ### Additions to `kernel/main.zig` — existing file, add init calls
 

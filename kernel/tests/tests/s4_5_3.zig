@@ -5,7 +5,7 @@ const t = lib.testing;
 
 const E_INVAL: i64 = -1;
 
-/// §4.5.3 — `shm_create` with zero size returns `E_INVAL`.
+/// §4.5.3 — `mem_shm_create` with zero size returns `E_INVAL`.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     const ret = syscall.shm_create_with_rights(0, 0x03);

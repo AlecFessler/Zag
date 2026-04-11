@@ -55,13 +55,13 @@ pub const SyscallResult2 = struct {
 // ── Syscall numbers ─────────────────────────────────────────────────
 pub const SyscallNum = enum(u64) {
     write,
-    vm_reserve,
-    vm_perms,
-    shm_create,
-    shm_map,
-    shm_unmap,
-    mmio_map,
-    mmio_unmap,
+    mem_reserve,
+    mem_perms,
+    mem_shm_create,
+    mem_shm_map,
+    mem_shm_unmap,
+    mem_mmio_map,
+    mem_mmio_unmap,
     proc_create,
     thread_create,
     thread_exit,
@@ -75,8 +75,8 @@ pub const SyscallNum = enum(u64) {
     clock_gettime,
     ioport_read,
     ioport_write,
-    dma_map,
-    dma_unmap,
+    mem_dma_map,
+    mem_dma_unmap,
     pin_exclusive,
     broadcast,
 };
@@ -148,18 +148,18 @@ pub fn write(msg: []const u8) void {
     _ = syscall2(.write, @intFromPtr(msg.ptr), msg.len);
 }
 
-pub fn vm_reserve(hint: u64, size: u64, rights_bits: u64) SystemError!VmResult {
-    const result = syscall3_2(.vm_reserve, hint, size, rights_bits);
+pub fn mem_reserve(hint: u64, size: u64, rights_bits: u64) SystemError!VmResult {
+    const result = syscall3_2(.mem_reserve, hint, size, rights_bits);
     if (result.val < 0) return mapError(result.val);
     return .{ .handle = @intCast(result.val), .addr = result.val2 };
 }
 
-pub fn vm_perms(vm_handle: Handle, offset: u64, size: u64, rights_bits: u64) SystemError!void {
-    const rc = syscall4(.vm_perms, vm_handle, offset, size, rights_bits);
+pub fn mem_perms(vm_handle: Handle, offset: u64, size: u64, rights_bits: u64) SystemError!void {
+    const rc = syscall4(.mem_perms, vm_handle, offset, size, rights_bits);
     if (rc < 0) return mapError(rc);
 }
 
-pub fn shm_create(size: u64) SystemError!Handle {
+pub fn mem_shm_create(size: u64) SystemError!Handle {
     return shm_create_with_rights(size, (perms_.SharedMemoryRights{
         .read = true,
         .write = true,
@@ -168,27 +168,27 @@ pub fn shm_create(size: u64) SystemError!Handle {
 }
 
 pub fn shm_create_with_rights(size: u64, rights: u64) SystemError!Handle {
-    const rc = syscall2(.shm_create, size, rights);
+    const rc = syscall2(.mem_shm_create, size, rights);
     if (rc < 0) return mapError(rc);
     return @intCast(rc);
 }
 
-pub fn shm_map(shm_handle: Handle, vm_handle: Handle, offset: u64) SystemError!void {
-    const rc = syscall3(.shm_map, shm_handle, vm_handle, offset);
+pub fn mem_shm_map(shm_handle: Handle, vm_handle: Handle, offset: u64) SystemError!void {
+    const rc = syscall3(.mem_shm_map, shm_handle, vm_handle, offset);
     if (rc < 0) return mapError(rc);
 }
 
-pub fn shm_unmap(shm_handle: Handle, vm_handle: Handle) void {
-    _ = syscall2(.shm_unmap, shm_handle, vm_handle);
+pub fn mem_shm_unmap(shm_handle: Handle, vm_handle: Handle) void {
+    _ = syscall2(.mem_shm_unmap, shm_handle, vm_handle);
 }
 
-pub fn mmio_map(device_handle: Handle, vm_handle: Handle, offset: u64) SystemError!void {
-    const rc = syscall3(.mmio_map, device_handle, vm_handle, offset);
+pub fn mem_mmio_map(device_handle: Handle, vm_handle: Handle, offset: u64) SystemError!void {
+    const rc = syscall3(.mem_mmio_map, device_handle, vm_handle, offset);
     if (rc < 0) return mapError(rc);
 }
 
-pub fn mmio_unmap(device_handle: Handle, vm_handle: Handle) void {
-    _ = syscall2(.mmio_unmap, device_handle, vm_handle);
+pub fn mem_mmio_unmap(device_handle: Handle, vm_handle: Handle) void {
+    _ = syscall2(.mem_mmio_unmap, device_handle, vm_handle);
 }
 
 pub fn proc_create(elf_ptr: u64, elf_len: u64, rights_bits: u64) SystemError!Handle {
@@ -256,14 +256,14 @@ pub fn ioport_write(device_handle: Handle, port_offset: u64, width: u64, value: 
     if (rc < 0) return mapError(rc);
 }
 
-pub fn dma_map(device_handle: Handle, shm_handle: Handle) SystemError!u64 {
-    const rc = syscall2(.dma_map, device_handle, shm_handle);
+pub fn mem_dma_map(device_handle: Handle, shm_handle: Handle) SystemError!u64 {
+    const rc = syscall2(.mem_dma_map, device_handle, shm_handle);
     if (rc < 0) return mapError(rc);
     return @intCast(rc);
 }
 
-pub fn dma_unmap(device_handle: Handle, shm_handle: Handle) void {
-    _ = syscall2(.dma_unmap, device_handle, shm_handle);
+pub fn mem_dma_unmap(device_handle: Handle, shm_handle: Handle) void {
+    _ = syscall2(.mem_dma_unmap, device_handle, shm_handle);
 }
 
 pub fn pin_exclusive() SystemError!void {

@@ -29,9 +29,9 @@ pub fn main(perm_view_addr: u64) void {
         .write = true,
         .shareable = true,
     }).bits();
-    const vm_result = syscall.vm_reserve(0, shm_size, vm_rights);
+    const vm_result = syscall.mem_reserve(0, shm_size, vm_rights);
     if (vm_result.val < 0) return;
-    if (syscall.shm_map(shm_handle, @intCast(vm_result.val), 0) != 0) return;
+    if (syscall.mem_shm_map(shm_handle, @intCast(vm_result.val), 0) != 0) return;
 
     const ptr: *volatile u8 = @ptrFromInt(vm_result.val2);
     ptr.* = 0xC3; // RET

@@ -93,11 +93,11 @@ const CompletionQueueEntry = extern struct {
 pub const InitError = enum {
     none,
     mmio_vm_reserve,
-    mmio_map,
+    mem_mmio_map,
     dma_shm_create,
     dma_vm_reserve,
     dma_shm_map,
-    dma_map,
+    mem_dma_map,
     controller_init,
 };
 
@@ -133,9 +133,9 @@ pub const Controller = struct {
             .write = true,
             .mmio = true,
         }).bits();
-        const mmio_vm = syscall.vm_reserve(0, aligned_mmio, mmio_vm_rights);
+        const mmio_vm = syscall.mem_reserve(0, aligned_mmio, mmio_vm_rights);
         if (mmio_vm.val < 0) return .mmio_vm_reserve;
-        if (syscall.mmio_map(device_handle, @intCast(mmio_vm.val), 0) != 0) return .mmio_map;
+        if (syscall.mem_mmio_map(device_handle, @intCast(mmio_vm.val), 0) != 0) return .mem_mmio_map;
         self.mmio_base = mmio_vm.val2;
 
         // Allocate DMA memory for queues and buffers
@@ -148,12 +148,12 @@ pub const Controller = struct {
             .write = true,
             .shareable = true,
         }).bits();
-        const dma_vm = syscall.vm_reserve(0, DMA_TOTAL, dma_vm_rights);
+        const dma_vm = syscall.mem_reserve(0, DMA_TOTAL, dma_vm_rights);
         if (dma_vm.val < 0) return .dma_vm_reserve;
-        if (syscall.shm_map(@intCast(dma_shm), @intCast(dma_vm.val), 0) != 0) return .dma_shm_map;
+        if (syscall.mem_shm_map(@intCast(dma_shm), @intCast(dma_vm.val), 0) != 0) return .dma_shm_map;
 
-        const dma_result = syscall.dma_map(device_handle, @intCast(dma_shm));
-        if (dma_result < 0) return .dma_map;
+        const dma_result = syscall.mem_dma_map(device_handle, @intCast(dma_shm));
+        if (dma_result < 0) return .mem_dma_map;
 
         self.dma_virt = dma_vm.val2;
         self.dma_phys = @bitCast(dma_result);

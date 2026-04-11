@@ -1,4 +1,4 @@
-/// §4.40.7 — `guest_map` with `host_vaddr` not pointing to a valid mapped region in the caller's address space returns `E_BADADDR`.
+/// §4.40.7 — `vm_guest_map` with `host_vaddr` not pointing to a valid mapped region in the caller's address space returns `E_BADADDR`.
 const lib = @import("lib");
 
 const syscall = lib.syscall;
@@ -19,7 +19,7 @@ pub fn main(_: u64) void {
 
     // Page-aligned host_vaddr pointing to unmapped memory in user address space.
     const unmapped_addr: u64 = 0x0000_7000_0000_0000;
-    const result = syscall.guest_map(unmapped_addr, 0x1000, 0x1000, 0x1);
+    const result = syscall.vm_guest_map(unmapped_addr, 0x1000, 0x1000, 0x1);
     t.expectEqual("§4.40.7", syscall.E_BADADDR, result);
 
     _ = syscall.vm_destroy();

@@ -4,12 +4,12 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §4.3.4 — `vm_reserve` with zero hint finds a free range.
+/// §4.3.4 — `mem_reserve` with zero hint finds a free range.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     const rw = perms.VmReservationRights{ .read = true, .write = true };
-    const r1 = syscall.vm_reserve(0, 4096, rw.bits());
-    const r2 = syscall.vm_reserve(0, 4096, rw.bits());
+    const r1 = syscall.mem_reserve(0, 4096, rw.bits());
+    const r2 = syscall.mem_reserve(0, 4096, rw.bits());
     if (r1.val <= 0 or r2.val <= 0 or r1.val2 == 0 or r2.val2 == 0) {
         t.fail("§4.3.4");
         syscall.shutdown();

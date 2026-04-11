@@ -121,8 +121,8 @@ pub fn main(pv: u64) void {
         bootLinuxEmbedded();
     }
 
-    _ = syscall.vcpu_set_state(vcpu, @intFromPtr(&guest_state));
-    _ = syscall.vcpu_run(vcpu);
+    _ = syscall.vm_vcpu_set_state(vcpu, @intFromPtr(&guest_state));
+    _ = syscall.vm_vcpu_run(vcpu);
     log.print("vCPU running\n");
     exitLoop(vcpu);
 
@@ -377,8 +377,8 @@ noinline fn exitLoop(_: u64) void {
             serial.pollHostRx();
             if (serial.irq_pending) {
                 serial.irq_pending = false;
-                _ = syscall.ioapic_assert_irq(4);
-                _ = syscall.ioapic_deassert_irq(4);
+                _ = syscall.vm_ioapic_assert_irq(4);
+                _ = syscall.vm_ioapic_deassert_irq(4);
             }
             // Tick PIT — fires IRQ0 (GSI2) when counter reaches 0
             io.pitCheckIrq();
@@ -405,8 +405,8 @@ noinline fn exitLoop(_: u64) void {
         // Route serial IRQ through kernel IOAPIC
         if (serial.irq_pending) {
             serial.irq_pending = false;
-            _ = syscall.ioapic_assert_irq(4);
-            _ = syscall.ioapic_deassert_irq(4);
+            _ = syscall.vm_ioapic_assert_irq(4);
+            _ = syscall.vm_ioapic_deassert_irq(4);
         }
 
         // Tick PIT — fires IRQ0 (GSI2) when counter reaches 0

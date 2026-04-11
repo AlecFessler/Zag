@@ -9,7 +9,7 @@ const PAGE: u64 = 4096;
 const N_PAGES: u64 = 8;
 const SHM_SIZE: u64 = PAGE * N_PAGES;
 
-/// §2.2.4 — `shm_map` maps the full SHM region at the specified offset.
+/// §2.2.4 — `mem_shm_map` maps the full SHM region at the specified offset.
 /// are eagerly mapped (no demand-fault delay). We prove this cross-process:
 /// parent maps an 8-page SHM and writes a per-page marker on every page;
 /// immediately after, a child maps the same SHM and writes a second marker on
@@ -22,9 +22,9 @@ pub fn main(_: u64) void {
     const shm_handle: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(SHM_SIZE, shm_rights.bits())));
 
     const vm_rights = (perms.VmReservationRights{ .read = true, .write = true, .shareable = true }).bits();
-    const vm = syscall.vm_reserve(0, SHM_SIZE, vm_rights);
+    const vm = syscall.mem_reserve(0, SHM_SIZE, vm_rights);
     const vm_h: u64 = @bitCast(vm.val);
-    if (syscall.shm_map(shm_handle, vm_h, 0) != 0) {
+    if (syscall.mem_shm_map(shm_handle, vm_h, 0) != 0) {
         t.fail("§2.2.4");
         syscall.shutdown();
     }
@@ -49,7 +49,7 @@ pub fn main(_: u64) void {
 
     // Spawn child that maps the same SHM and writes its own marker to every
     // page (at offset +8 within each page), then replies.
-    const child_rights = (perms.ProcessRights{ .spawn_thread = true, .mem_reserve = true, .shm_create = true }).bits();
+    const child_rights = (perms.ProcessRights{ .spawn_thread = true, .mem_reserve = true, .mem_shm_create = true }).bits();
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
         @intFromPtr(children.child_shm_touch_all_pages.ptr),
         children.child_shm_touch_all_pages.len,

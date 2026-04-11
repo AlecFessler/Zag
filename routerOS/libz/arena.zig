@@ -18,7 +18,7 @@ pub const Arena = struct {
             .read = true,
             .write = true,
         }).bits();
-        const result = syscall.vm_reserve(0, size, rights) catch return null;
+        const result = syscall.mem_reserve(0, size, rights) catch return null;
         return .{
             .start_addr = result.addr,
             .free_addr = result.addr,

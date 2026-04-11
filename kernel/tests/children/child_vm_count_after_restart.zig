@@ -62,9 +62,9 @@ pub fn main(perm_view_addr: u64) void {
             .write = true,
             .shareable = true,
         }).bits();
-        const vm = syscall.vm_reserve(0, shm_size, vm_rights);
+        const vm = syscall.mem_reserve(0, shm_size, vm_rights);
         if (vm.val < 0) return;
-        if (syscall.shm_map(shm_handle, @intCast(vm.val), 0) != 0) return;
+        if (syscall.mem_shm_map(shm_handle, @intCast(vm.val), 0) != 0) return;
 
         const base = vm.val2;
         const slot0: *volatile u64 = @ptrFromInt(base); // run counter
@@ -99,9 +99,9 @@ pub fn main(perm_view_addr: u64) void {
         if (entry.entry_type == pv.ENTRY_TYPE_VM_RESERVATION) vm_count_after += 1;
     }
 
-    const vm = syscall.vm_reserve(0, shm_size, vm_rights);
+    const vm = syscall.mem_reserve(0, shm_size, vm_rights);
     if (vm.val < 0) return;
-    if (syscall.shm_map(shm_handle, @intCast(vm.val), 0) != 0) return;
+    if (syscall.mem_shm_map(shm_handle, @intCast(vm.val), 0) != 0) return;
 
     const base = vm.val2;
     const slot2: *volatile u64 = @ptrFromInt(base + 16);

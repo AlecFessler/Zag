@@ -22,13 +22,13 @@ pub fn main(pv: u64) void {
     const shm_h: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(shm_size, shm_rights.bits())));
 
     const vm_rw_s = perms.VmReservationRights{ .read = true, .write = true, .shareable = true };
-    const vm = syscall.vm_reserve(0, shm_size, vm_rw_s.bits());
-    _ = syscall.shm_map(shm_h, @bitCast(vm.val), 0);
+    const vm = syscall.mem_reserve(0, shm_size, vm_rw_s.bits());
+    _ = syscall.mem_shm_map(shm_h, @bitCast(vm.val), 0);
     const dst: [*]u8 = @ptrFromInt(vm.val2);
     for (0..elf.len) |i| dst[i] = elf[i];
 
     // Spawn B (child_spawn_and_report stays alive after reporting).
-    const child_rights = perms.ProcessRights{ .spawn_thread = true, .spawn_process = true, .mem_reserve = true, .shm_create = true };
+    const child_rights = perms.ProcessRights{ .spawn_thread = true, .spawn_process = true, .mem_reserve = true, .mem_shm_create = true };
     const ch: u64 = @bitCast(@as(i64, syscall.proc_create(
         @intFromPtr(children.child_spawn_and_report.ptr),
         children.child_spawn_and_report.len,

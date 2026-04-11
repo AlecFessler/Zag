@@ -30,7 +30,7 @@ pub fn main(pv: u64) void {
     }).bits();
     const shm_res = syscall.shm_create_with_rights(shm_bytes, shm_rights);
     if (shm_res < 0) {
-        t.fail("§2.12.9 shm_create");
+        t.fail("§2.12.9 mem_shm_create");
         syscall.shutdown();
     }
     const shm_handle: u64 = @intCast(shm_res);
@@ -41,14 +41,14 @@ pub fn main(pv: u64) void {
         .write = true,
         .shareable = true,
     }).bits();
-    const vm_result = syscall.vm_reserve(0, shm_bytes, vm_rights);
+    const vm_result = syscall.mem_reserve(0, shm_bytes, vm_rights);
     if (vm_result.val < 0) {
-        t.fail("§2.12.9 vm_reserve");
+        t.fail("§2.12.9 mem_reserve");
         syscall.shutdown();
     }
     const vm_handle: u64 = @intCast(vm_result.val);
-    if (syscall.shm_map(shm_handle, vm_handle, 0) != 0) {
-        t.fail("§2.12.9 shm_map");
+    if (syscall.mem_shm_map(shm_handle, vm_handle, 0) != 0) {
+        t.fail("§2.12.9 mem_shm_map");
         syscall.shutdown();
     }
     const token_slot: *volatile u64 = @ptrFromInt(vm_result.val2);

@@ -7,7 +7,7 @@ const t = lib.testing;
 
 const E_PERM: i64 = -2;
 
-/// §4.8.5 — `mmio_map` without `mmio` right on reservation returns `E_PERM`.
+/// §4.8.5 — `mem_mmio_map` without `mmio` right on reservation returns `E_PERM`.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
@@ -16,10 +16,10 @@ pub fn main(pv: u64) void {
 
     // Create reservation with read+write but WITHOUT mmio right.
     const rights = perms.VmReservationRights{ .read = true, .write = true };
-    const vm = syscall.vm_reserve(0, 4096, rights.bits());
+    const vm = syscall.mem_reserve(0, 4096, rights.bits());
     const vm_handle: u64 = @bitCast(vm.val);
 
-    const ret = syscall.mmio_map(dev_handle, vm_handle, 0);
+    const ret = syscall.mem_mmio_map(dev_handle, vm_handle, 0);
     t.expectEqual("§4.8.5", E_PERM, ret);
     syscall.shutdown();
 }

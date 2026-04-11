@@ -1,4 +1,4 @@
-/// §2.13.11 — `vcpu_interrupt` injects a virtual interrupt into a vCPU.
+/// §2.13.11 — `vm_vcpu_interrupt` injects a virtual interrupt into a vCPU.
 const lib = @import("lib");
 
 const perm_view = lib.perm_view;
@@ -89,7 +89,7 @@ pub fn main(pv: u64) void {
     }
 
     // Reserve host buffer and write HLT guest code.
-    const res = syscall.vm_reserve(0, syscall.PAGE4K, 0x3);
+    const res = syscall.mem_reserve(0, syscall.PAGE4K, 0x3);
     if (res.val < 0) {
         t.failWithVal("§2.13.11 reserve", 0, res.val);
         _ = syscall.vm_destroy();
@@ -100,9 +100,9 @@ pub fn main(pv: u64) void {
         host_ptr[i] = byte;
     }
 
-    const mr = syscall.guest_map(res.val2, 0x0, syscall.PAGE4K, 0x7);
+    const mr = syscall.vm_guest_map(res.val2, 0x0, syscall.PAGE4K, 0x7);
     if (mr != syscall.E_OK) {
-        t.failWithVal("§2.13.11 guest_map", syscall.E_OK, mr);
+        t.failWithVal("§2.13.11 vm_guest_map", syscall.E_OK, mr);
         _ = syscall.vm_destroy();
         syscall.shutdown();
     }
@@ -116,7 +116,7 @@ pub fn main(pv: u64) void {
 
     // Set up real-mode guest state.
     setupRealModeState(&guest_state);
-    const sr = syscall.vcpu_set_state(vcpu_handle, @intFromPtr(&guest_state));
+    const sr = syscall.vm_vcpu_set_state(vcpu_handle, @intFromPtr(&guest_state));
     if (sr != syscall.E_OK) {
         t.failWithVal("§2.13.11 set_state", syscall.E_OK, sr);
         _ = syscall.vm_destroy();
@@ -124,7 +124,7 @@ pub fn main(pv: u64) void {
     }
 
     // Run vCPU — guest executes HLT, exit delivered to VMM.
-    _ = syscall.vcpu_run(vcpu_handle);
+    _ = syscall.vm_vcpu_run(vcpu_handle);
 
     const exit_token = syscall.vm_recv(@intFromPtr(&buf), 1);
     if (exit_token <= 0) {
@@ -146,7 +146,7 @@ pub fn main(pv: u64) void {
     // writing to an I/O port). However, setting up an IDT in real mode is
     // complex and orthogonal to this test. We verify the syscall succeeds
     // (E_OK), which confirms the kernel accepted the injection request.
-    const result = syscall.vcpu_interrupt(vcpu_handle, @intFromPtr(&interrupt_data));
+    const result = syscall.vm_vcpu_interrupt(vcpu_handle, @intFromPtr(&interrupt_data));
     t.expectEqual("§2.13.11", syscall.E_OK, result);
 
     _ = syscall.vm_destroy();

@@ -52,7 +52,7 @@ pub fn main(pv: u64) void {
     // Verifying actual delivery would require running the vCPU with an IDT
     // and a guest handler for vector 0x20. We verify the syscall succeeds,
     // confirming the kernel accepted the pending injection on an idle vCPU.
-    const result = syscall.vcpu_interrupt(vcpu_handle, @intFromPtr(&interrupt_data));
+    const result = syscall.vm_vcpu_interrupt(vcpu_handle, @intFromPtr(&interrupt_data));
     t.expectEqual("§2.13.12", syscall.E_OK, result);
 
     _ = syscall.vm_destroy();

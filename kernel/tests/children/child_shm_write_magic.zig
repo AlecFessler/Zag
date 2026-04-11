@@ -30,12 +30,12 @@ pub fn main(perm_view_addr: u64) void {
     }
 
     const vm_rights = (perms.VmReservationRights{ .read = true, .write = true, .shareable = true }).bits();
-    const vm_result = syscall.vm_reserve(0, shm_size, vm_rights);
+    const vm_result = syscall.mem_reserve(0, shm_size, vm_rights);
     if (vm_result.val < 0) {
         _ = syscall.ipc_reply(&.{0xDEAD});
         return;
     }
-    if (syscall.shm_map(shm_handle, @intCast(vm_result.val), 0) != 0) {
+    if (syscall.mem_shm_map(shm_handle, @intCast(vm_result.val), 0) != 0) {
         _ = syscall.ipc_reply(&.{0xDEAD});
         return;
     }

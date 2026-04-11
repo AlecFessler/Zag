@@ -8,9 +8,9 @@ const t = lib.testing;
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     const rw = perms.VmReservationRights{ .read = true, .write = true };
-    const r1 = syscall.vm_reserve(0, 4096, rw.bits());
-    const r2 = syscall.vm_reserve(0, 4096, rw.bits());
-    const r3 = syscall.vm_reserve(0, 4096, rw.bits());
+    const r1 = syscall.mem_reserve(0, 4096, rw.bits());
+    const r2 = syscall.mem_reserve(0, 4096, rw.bits());
+    const r3 = syscall.mem_reserve(0, 4096, rw.bits());
     const h1: u64 = @bitCast(r1.val);
     const h2: u64 = @bitCast(r2.val);
     const h3: u64 = @bitCast(r3.val);

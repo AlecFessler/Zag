@@ -1,4 +1,4 @@
-/// §4.43.3 — `vcpu_set_state` when the vCPU is not in `idle` state returns `E_BUSY`.
+/// §4.43.3 — `vm_vcpu_set_state` when the vCPU is not in `idle` state returns `E_BUSY`.
 const lib = @import("lib");
 
 const perm_view = lib.perm_view;
@@ -40,15 +40,15 @@ pub fn main(pv: u64) void {
     }
 
     // Start the vCPU — it transitions to running state.
-    const run_result = syscall.vcpu_run(vcpu_handle);
+    const run_result = syscall.vm_vcpu_run(vcpu_handle);
     if (run_result != syscall.E_OK) {
-        t.failWithVal("§4.43.3 vcpu_run", syscall.E_OK, run_result);
+        t.failWithVal("§4.43.3 vm_vcpu_run", syscall.E_OK, run_result);
         _ = syscall.vm_destroy();
         syscall.shutdown();
     }
 
-    // Immediately try vcpu_set_state while vCPU is not idle — should return E_BUSY.
-    const result = syscall.vcpu_set_state(vcpu_handle, @intFromPtr(&guest_state));
+    // Immediately try vm_vcpu_set_state while vCPU is not idle — should return E_BUSY.
+    const result = syscall.vm_vcpu_set_state(vcpu_handle, @intFromPtr(&guest_state));
     t.expectEqual("§4.43.3", syscall.E_BUSY, result);
 
     _ = syscall.vm_destroy();

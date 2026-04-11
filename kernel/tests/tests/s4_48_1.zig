@@ -1,4 +1,4 @@
-/// §4.48.1 — `ioapic_assert_irq` returns `E_OK` on success.
+/// §4.48.1 — `vm_ioapic_assert_irq` returns `E_OK` on success.
 const lib = @import("lib");
 
 const syscall = lib.syscall;
@@ -21,7 +21,7 @@ pub fn main(_: u64) void {
     var passed = true;
     var irq: u64 = 0;
     while (irq < 24) : (irq += 1) {
-        const result = syscall.ioapic_assert_irq(irq);
+        const result = syscall.vm_ioapic_assert_irq(irq);
         if (result != syscall.E_OK) {
             t.failWithVal("§4.48.1", syscall.E_OK, result);
             passed = false;

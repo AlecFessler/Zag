@@ -12,7 +12,7 @@ pub fn main(perm_view: u64) void {
     _ = perm_view;
     // Create a VM reservation.
     const rw = perms.VmReservationRights{ .read = true, .write = true };
-    const vm = syscall.vm_reserve(0, 4096, rw.bits());
+    const vm = syscall.mem_reserve(0, 4096, rw.bits());
     const vm_handle: u64 = @bitCast(vm.val);
     // Spawn a child to receive.
     const child_rights = perms.ProcessRights{ .spawn_thread = true };

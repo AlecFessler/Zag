@@ -1,6 +1,6 @@
 /// Guest physical memory management.
-/// Allocates host virtual pages via vm_reserve and maps them into the
-/// guest physical address space via guest_map.
+/// Allocates host virtual pages via mem_reserve and maps them into the
+/// guest physical address space via vm_guest_map.
 
 const lib = @import("lib");
 
@@ -17,9 +17,9 @@ var mapped_size: u64 = 0;
 /// physical address space starting at guest phys 0.
 pub fn setupGuestMemory(size: u64) void {
     // rights = 0x7 (read + write + execute) — we need execute for guest code pages
-    const result = syscall.vm_reserve(0, size, 0x7);
+    const result = syscall.mem_reserve(0, size, 0x7);
     if (result.val < 0) {
-        log.print("mem: vm_reserve failed: ");
+        log.print("mem: mem_reserve failed: ");
         log.dec(@as(u64, @bitCast(-result.val)));
         log.print("\n");
         syscall.shutdown();
@@ -34,10 +34,10 @@ pub fn setupGuestMemory(size: u64) void {
     log.print("\n");
 
     // Map into guest physical address space.
-    // guest_map supports multi-page sizes, so map the whole thing at once.
-    const mr = syscall.guest_map(host_base, 0, size, 0x7);
+    // vm_guest_map supports multi-page sizes, so map the whole thing at once.
+    const mr = syscall.vm_guest_map(host_base, 0, size, 0x7);
     if (mr != syscall.E_OK) {
-        log.print("mem: guest_map failed: ");
+        log.print("mem: vm_guest_map failed: ");
         log.dec(@as(u64, @bitCast(-mr)));
         log.print("\n");
         syscall.shutdown();
@@ -66,7 +66,7 @@ pub noinline fn mapMmioStubs() void {
 
     for (mmio_addrs) |addr| {
         // Allocate a host page and fill with 0xFF
-        const result = syscall.vm_reserve(0, PAGE_SIZE, 0x7);
+        const result = syscall.mem_reserve(0, PAGE_SIZE, 0x7);
         if (result.val < 0) continue;
         const host_addr = result.val2;
 
@@ -75,7 +75,7 @@ pub noinline fn mapMmioStubs() void {
         @memset(ptr[0..PAGE_SIZE], 0x00);
 
         // Map into guest physical address space
-        const mr = syscall.guest_map(host_addr, addr, PAGE_SIZE, 0x7);
+        const mr = syscall.vm_guest_map(host_addr, addr, PAGE_SIZE, 0x7);
         if (mr == syscall.E_OK) {
             log.print("mem: MMIO stub at 0x");
             log.hex64(addr);
@@ -87,14 +87,14 @@ pub noinline fn mapMmioStubs() void {
 /// Map a single page at a specific guest physical address and return the
 /// host virtual address. Used for MMIO device shadow pages (LAPIC, IOAPIC).
 pub noinline fn mapDevicePage(guest_phys: u64) ?[*]volatile u8 {
-    const result = syscall.vm_reserve(0, PAGE_SIZE, 0x7);
+    const result = syscall.mem_reserve(0, PAGE_SIZE, 0x7);
     if (result.val < 0) return null;
     const host_addr = result.val2;
 
     const ptr: [*]u8 = @ptrFromInt(host_addr);
     @memset(ptr[0..PAGE_SIZE], 0);
 
-    const mr = syscall.guest_map(host_addr, guest_phys, PAGE_SIZE, 0x7);
+    const mr = syscall.vm_guest_map(host_addr, guest_phys, PAGE_SIZE, 0x7);
     if (mr != syscall.E_OK) return null;
 
     log.print("mem: device page at 0x");

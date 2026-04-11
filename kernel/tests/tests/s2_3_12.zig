@@ -20,9 +20,9 @@ pub fn main(pv: u64) void {
 
     // Create two distinct VM reservations, both shareable + RW.
     const shareable_rw = perms.VmReservationRights{ .read = true, .write = true, .shareable = true };
-    const vm_a = syscall.vm_reserve(0, 4096, shareable_rw.bits());
+    const vm_a = syscall.mem_reserve(0, 4096, shareable_rw.bits());
     const vm_a_handle: u64 = @bitCast(vm_a.val);
-    const vm_b = syscall.vm_reserve(0, 4096, shareable_rw.bits());
+    const vm_b = syscall.mem_reserve(0, 4096, shareable_rw.bits());
     const vm_b_handle: u64 = @bitCast(vm_b.val);
 
     // Sanity: distinct reservations should have distinct base vaddrs.
@@ -34,11 +34,11 @@ pub fn main(pv: u64) void {
     // Create one SHM and map it into BOTH reservations.
     const shm_rights = perms.SharedMemoryRights{ .read = true, .write = true };
     const shm_handle: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(4096, shm_rights.bits())));
-    if (syscall.shm_map(shm_handle, vm_a_handle, 0) != 0) {
+    if (syscall.mem_shm_map(shm_handle, vm_a_handle, 0) != 0) {
         t.fail("§2.3.12");
         syscall.shutdown();
     }
-    if (syscall.shm_map(shm_handle, vm_b_handle, 0) != 0) {
+    if (syscall.mem_shm_map(shm_handle, vm_b_handle, 0) != 0) {
         t.fail("§2.3.12");
         syscall.shutdown();
     }

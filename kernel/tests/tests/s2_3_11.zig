@@ -15,7 +15,7 @@ const PAGES_PER_ROUND: u64 = 32;
 /// We prove pages are actually returned to the kernel's physical page
 /// allocator by repeatedly reserving a large region, faulting every page in,
 /// then revoking — many times. If the kernel leaked the pages, by round N
-/// the system would be out of memory and vm_reserve (or the first write)
+/// the system would be out of memory and mem_reserve (or the first write)
 /// would fail. We also verify that after each revoke the slot is clear and
 /// the demand-paged replacement is zeroed (no stale data).
 pub fn main(pv: u64) void {
@@ -25,7 +25,7 @@ pub fn main(pv: u64) void {
 
     var round: u64 = 0;
     while (round < ROUNDS) : (round += 1) {
-        const result = syscall.vm_reserve(0, region_size, rw.bits());
+        const result = syscall.mem_reserve(0, region_size, rw.bits());
         if (result.val < 0) {
             t.fail("§2.3.11");
             syscall.shutdown();
@@ -64,7 +64,7 @@ pub fn main(pv: u64) void {
     // now. As a final check, make one more reservation of the same size and
     // verify we can still write every page AND that the demand-paged pages
     // are zeroed (no stale data survived).
-    const final = syscall.vm_reserve(0, region_size, rw.bits());
+    const final = syscall.mem_reserve(0, region_size, rw.bits());
     if (final.val < 0) {
         t.fail("§2.3.11");
         syscall.shutdown();

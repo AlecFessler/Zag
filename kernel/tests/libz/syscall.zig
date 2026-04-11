@@ -9,13 +9,13 @@ pub const SyscallResult2 = struct {
 
 pub const SyscallNum = enum(u64) {
     write,
-    vm_reserve,
-    vm_perms,
-    shm_create,
-    shm_map,
-    shm_unmap,
-    mmio_map,
-    mmio_unmap,
+    mem_reserve,
+    mem_perms,
+    mem_shm_create,
+    mem_shm_map,
+    mem_shm_unmap,
+    mem_mmio_map,
+    mem_mmio_unmap,
     proc_create,
     thread_create,
     thread_exit,
@@ -28,8 +28,8 @@ pub const SyscallNum = enum(u64) {
     clock_gettime,
     ioport_read,
     ioport_write,
-    dma_map,
-    dma_unmap,
+    mem_dma_map,
+    mem_dma_unmap,
     set_priority,
     ipc_send,
     ipc_call,
@@ -47,16 +47,16 @@ pub const SyscallNum = enum(u64) {
     fault_set_thread_mode,
     vm_create,
     vm_destroy,
-    guest_map,
+    vm_guest_map,
     vm_recv,
     vm_reply,
-    vcpu_set_state,
-    vcpu_get_state,
-    vcpu_run,
-    vcpu_interrupt,
-    msr_passthrough,
-    ioapic_assert_irq,
-    ioapic_deassert_irq,
+    vm_vcpu_set_state,
+    vm_vcpu_get_state,
+    vm_vcpu_run,
+    vm_vcpu_interrupt,
+    vm_msr_passthrough,
+    vm_ioapic_assert_irq,
+    vm_ioapic_deassert_irq,
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -140,36 +140,36 @@ pub fn write_raw(ptr: u64, len: u64) i64 {
     return syscall2(.write, ptr, len);
 }
 
-pub fn vm_reserve(hint: u64, size: u64, rights_bits: u64) SyscallResult2 {
-    return syscall3_2(.vm_reserve, hint, size, rights_bits);
+pub fn mem_reserve(hint: u64, size: u64, rights_bits: u64) SyscallResult2 {
+    return syscall3_2(.mem_reserve, hint, size, rights_bits);
 }
 
-pub fn vm_perms(vm_handle: u64, offset: u64, size: u64, rights_bits: u64) i64 {
-    return syscall4(.vm_perms, vm_handle, offset, size, rights_bits);
+pub fn mem_perms(vm_handle: u64, offset: u64, size: u64, rights_bits: u64) i64 {
+    return syscall4(.mem_perms, vm_handle, offset, size, rights_bits);
 }
 
-pub fn shm_create(size: u64) i64 {
-    return syscall2(.shm_create, size, 0);
+pub fn mem_shm_create(size: u64) i64 {
+    return syscall2(.mem_shm_create, size, 0);
 }
 
 pub fn shm_create_with_rights(size: u64, rights: u64) i64 {
-    return syscall2(.shm_create, size, rights);
+    return syscall2(.mem_shm_create, size, rights);
 }
 
-pub fn shm_map(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
-    return syscall3(.shm_map, shm_handle, vm_handle, offset);
+pub fn mem_shm_map(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
+    return syscall3(.mem_shm_map, shm_handle, vm_handle, offset);
 }
 
-pub fn shm_unmap(shm_handle: u64, vm_handle: u64) i64 {
-    return syscall2(.shm_unmap, shm_handle, vm_handle);
+pub fn mem_shm_unmap(shm_handle: u64, vm_handle: u64) i64 {
+    return syscall2(.mem_shm_unmap, shm_handle, vm_handle);
 }
 
-pub fn mmio_map(device_handle: u64, vm_handle: u64, offset: u64) i64 {
-    return syscall3(.mmio_map, device_handle, vm_handle, offset);
+pub fn mem_mmio_map(device_handle: u64, vm_handle: u64, offset: u64) i64 {
+    return syscall3(.mem_mmio_map, device_handle, vm_handle, offset);
 }
 
-pub fn mmio_unmap(device_handle: u64, vm_handle: u64) i64 {
-    return syscall2(.mmio_unmap, device_handle, vm_handle);
+pub fn mem_mmio_unmap(device_handle: u64, vm_handle: u64) i64 {
+    return syscall2(.mem_mmio_unmap, device_handle, vm_handle);
 }
 
 pub fn proc_create(elf_ptr: u64, elf_len: u64, rights_bits: u64) i64 {
@@ -233,12 +233,12 @@ pub fn ioport_write(device_handle: u64, port_offset: u64, width: u64, value: u64
     return syscall4(.ioport_write, device_handle, port_offset, width, value);
 }
 
-pub fn dma_map(device_handle: u64, shm_handle: u64) i64 {
-    return syscall2(.dma_map, device_handle, shm_handle);
+pub fn mem_dma_map(device_handle: u64, shm_handle: u64) i64 {
+    return syscall2(.mem_dma_map, device_handle, shm_handle);
 }
 
-pub fn dma_unmap(device_handle: u64, shm_handle: u64) i64 {
-    return syscall2(.dma_unmap, device_handle, shm_handle);
+pub fn mem_dma_unmap(device_handle: u64, shm_handle: u64) i64 {
+    return syscall2(.mem_dma_unmap, device_handle, shm_handle);
 }
 
 pub const PRIORITY_IDLE: u64 = 0;
@@ -486,8 +486,8 @@ pub fn vm_destroy() i64 {
     return syscall0(.vm_destroy);
 }
 
-pub fn guest_map(host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
-    return syscall4(.guest_map, host_vaddr, guest_addr, size, rights);
+pub fn vm_guest_map(host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
+    return syscall4(.vm_guest_map, host_vaddr, guest_addr, size, rights);
 }
 
 pub fn vm_recv(buf_ptr: u64, blocking: u64) i64 {
@@ -498,32 +498,32 @@ pub fn vm_reply_action(exit_token: u64, action_ptr: u64) i64 {
     return syscall2(.vm_reply, exit_token, action_ptr);
 }
 
-pub fn vcpu_set_state(thread_handle: u64, guest_state_ptr: u64) i64 {
-    return syscall2(.vcpu_set_state, thread_handle, guest_state_ptr);
+pub fn vm_vcpu_set_state(thread_handle: u64, guest_state_ptr: u64) i64 {
+    return syscall2(.vm_vcpu_set_state, thread_handle, guest_state_ptr);
 }
 
-pub fn vcpu_get_state(thread_handle: u64, guest_state_ptr: u64) i64 {
-    return syscall2(.vcpu_get_state, thread_handle, guest_state_ptr);
+pub fn vm_vcpu_get_state(thread_handle: u64, guest_state_ptr: u64) i64 {
+    return syscall2(.vm_vcpu_get_state, thread_handle, guest_state_ptr);
 }
 
-pub fn vcpu_run(thread_handle: u64) i64 {
-    return syscall1(.vcpu_run, thread_handle);
+pub fn vm_vcpu_run(thread_handle: u64) i64 {
+    return syscall1(.vm_vcpu_run, thread_handle);
 }
 
-pub fn vcpu_interrupt(thread_handle: u64, interrupt_ptr: u64) i64 {
-    return syscall2(.vcpu_interrupt, thread_handle, interrupt_ptr);
+pub fn vm_vcpu_interrupt(thread_handle: u64, interrupt_ptr: u64) i64 {
+    return syscall2(.vm_vcpu_interrupt, thread_handle, interrupt_ptr);
 }
 
-pub fn msr_passthrough(msr_num: u64, allow_read: u64, allow_write: u64) i64 {
-    return syscall3(.msr_passthrough, msr_num, allow_read, allow_write);
+pub fn vm_msr_passthrough(msr_num: u64, allow_read: u64, allow_write: u64) i64 {
+    return syscall3(.vm_msr_passthrough, msr_num, allow_read, allow_write);
 }
 
-pub fn ioapic_assert_irq(irq_num: u64) i64 {
-    return syscall1(.ioapic_assert_irq, irq_num);
+pub fn vm_ioapic_assert_irq(irq_num: u64) i64 {
+    return syscall1(.vm_ioapic_assert_irq, irq_num);
 }
 
-pub fn ioapic_deassert_irq(irq_num: u64) i64 {
-    return syscall1(.ioapic_deassert_irq, irq_num);
+pub fn vm_ioapic_deassert_irq(irq_num: u64) i64 {
+    return syscall1(.vm_ioapic_deassert_irq, irq_num);
 }
 
 pub const FAULT_KILL: u64 = 0;

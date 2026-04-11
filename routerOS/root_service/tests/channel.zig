@@ -9,7 +9,7 @@ const perms = lib.perms;
 
 fn allocPage() ?[*]u8 {
     const vm_rights = (perms.VmReservationRights{ .read = true, .write = true }).bits();
-    const vm_result = syscall.vm_reserve(0, syscall.PAGE4K, vm_rights);
+    const vm_result = syscall.mem_reserve(0, syscall.PAGE4K, vm_rights);
     if (vm_result.val < 0) return null;
     return @ptrFromInt(vm_result.val2);
 }

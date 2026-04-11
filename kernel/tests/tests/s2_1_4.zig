@@ -25,8 +25,8 @@ pub fn main(pv: u64) void {
     const shm_handle: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(shm_size, shm_rights.bits())));
 
     const vm_rw_s = perms.VmReservationRights{ .read = true, .write = true, .shareable = true };
-    const vm = syscall.vm_reserve(0, shm_size, vm_rw_s.bits());
-    _ = syscall.shm_map(shm_handle, @bitCast(vm.val), 0);
+    const vm = syscall.mem_reserve(0, shm_size, vm_rw_s.bits());
+    _ = syscall.mem_shm_map(shm_handle, @bitCast(vm.val), 0);
     const dst: [*]u8 = @ptrFromInt(vm.val2);
     for (0..elf.len) |i| dst[i] = elf[i];
 
@@ -35,7 +35,7 @@ pub fn main(pv: u64) void {
         .spawn_thread = true,
         .spawn_process = true,
         .mem_reserve = true,
-        .shm_create = true,
+        .mem_shm_create = true,
         .device_own = true,
     };
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(

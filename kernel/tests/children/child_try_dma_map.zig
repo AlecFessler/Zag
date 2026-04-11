@@ -4,7 +4,7 @@ const perms = lib.perms;
 const pv = lib.perm_view;
 const syscall = lib.syscall;
 
-/// Receives device via cap transfer, tries dma_map, reports result via IPC.
+/// Receives device via cap transfer, tries mem_dma_map, reports result via IPC.
 pub fn main(perm_view_addr: u64) void {
     const view: *const [128]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
 
@@ -26,7 +26,7 @@ pub fn main(perm_view_addr: u64) void {
     const shm_rights = (perms.SharedMemoryRights{ .read = true, .write = true }).bits();
     const shm_h: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(4096, shm_rights)));
 
-    const result = syscall.dma_map(dev_handle, shm_h);
+    const result = syscall.mem_dma_map(dev_handle, shm_h);
 
     // Report result via IPC
     var msg2: syscall.IpcMessage = .{};

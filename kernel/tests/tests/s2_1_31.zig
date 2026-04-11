@@ -11,7 +11,7 @@ pub fn main(_: u64) void {
     const rw = perms.VmReservationRights{ .read = true, .write = true };
 
     // A reserve with no hint must land inside user space.
-    const ok = syscall.vm_reserve(0, 4096, rw.bits());
+    const ok = syscall.mem_reserve(0, 4096, rw.bits());
     if (ok.val <= 0 or ok.val2 == 0 or ok.val2 >= USER_END) {
         t.fail("§2.1.31 default reservation outside user space");
         syscall.shutdown();
@@ -23,7 +23,7 @@ pub fn main(_: u64) void {
     // may either reject the request outright or fall back to allocating
     // elsewhere in user space — but it must not map anything in the
     // kernel half.
-    const at_bound = syscall.vm_reserve(USER_END, 4096, rw.bits());
+    const at_bound = syscall.mem_reserve(USER_END, 4096, rw.bits());
     if (at_bound.val > 0) {
         // Allocated somewhere — must be strictly inside user space and
         // must NOT honour the out-of-range hint.
@@ -38,7 +38,7 @@ pub fn main(_: u64) void {
         _ = syscall.revoke_perm(@bitCast(at_bound.val));
     }
 
-    const beyond = syscall.vm_reserve(USER_END + 0x1000, 4096, rw.bits());
+    const beyond = syscall.mem_reserve(USER_END + 0x1000, 4096, rw.bits());
     if (beyond.val > 0) {
         if (beyond.val2 >= USER_END) {
             t.fail("§2.1.31 reserve beyond USER_END produced kernel-half mapping");

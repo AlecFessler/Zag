@@ -20,13 +20,13 @@ pub fn main(_: u64) void {
         .write = true,
         .shareable = true,
     }).bits();
-    const vm_result = syscall.vm_reserve(0, 0x1000, vm_rights);
+    const vm_result = syscall.mem_reserve(0, 0x1000, vm_rights);
     if (vm_result.val < 0) {
-        t.fail("§2.12.23 vm_reserve");
+        t.fail("§2.12.23 mem_reserve");
         syscall.shutdown();
     }
-    if (syscall.shm_map(shm_handle, @intCast(vm_result.val), 0) != 0) {
-        t.fail("§2.12.23 shm_map");
+    if (syscall.mem_shm_map(shm_handle, @intCast(vm_result.val), 0) != 0) {
+        t.fail("§2.12.23 mem_shm_map");
         syscall.shutdown();
     }
     const counter_ptr: *volatile u64 = @ptrFromInt(vm_result.val2);

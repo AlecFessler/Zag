@@ -374,7 +374,7 @@ pub const VirtualMemoryManager = struct {
         };
     }
 
-    pub fn vm_perms(
+    pub fn mem_perms(
         self: *VirtualMemoryManager,
         vm_handle: u64,
         original_start: VAddr,
@@ -430,7 +430,7 @@ pub const VirtualMemoryManager = struct {
         mergeRange(&self.tree, range_start, VAddr.fromInt(range_end_addr));
     }
 
-    pub fn shm_map(
+    pub fn mem_shm_map(
         self: *VirtualMemoryManager,
         shm_handle: u64,
         vm_handle: u64,
@@ -501,7 +501,7 @@ pub const VirtualMemoryManager = struct {
         }
     }
 
-    pub fn shm_unmap(
+    pub fn mem_shm_unmap(
         self: *VirtualMemoryManager,
         shm: *SharedMemory,
         vm_handle: u64,
@@ -548,7 +548,7 @@ pub const VirtualMemoryManager = struct {
         mergeRange(&self.tree, old_start, VAddr.fromInt(old_start.addr + old_size));
     }
 
-    pub fn mmio_map(
+    pub fn mem_mmio_map(
         self: *VirtualMemoryManager,
         device_handle: u64,
         vm_handle: u64,
@@ -623,7 +623,7 @@ pub const VirtualMemoryManager = struct {
         }
     }
 
-    pub fn mmio_unmap(
+    pub fn mem_mmio_unmap(
         self: *VirtualMemoryManager,
         device: *DeviceRegion,
         vm_handle: u64,

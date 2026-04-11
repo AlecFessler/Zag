@@ -19,9 +19,9 @@ pub fn main(pv: u64) void {
 
     // Parent maps the SHM and zeros the cell it expects the child to write.
     const vm_rights = (perms.VmReservationRights{ .read = true, .write = true, .shareable = true }).bits();
-    const vm = syscall.vm_reserve(0, 4096, vm_rights);
+    const vm = syscall.mem_reserve(0, 4096, vm_rights);
     const vm_h: u64 = @bitCast(vm.val);
-    if (syscall.shm_map(shm_handle, vm_h, 0) != 0) {
+    if (syscall.mem_shm_map(shm_handle, vm_h, 0) != 0) {
         t.fail("§2.3.7");
         syscall.shutdown();
     }
@@ -32,7 +32,7 @@ pub fn main(pv: u64) void {
     const child_rights = perms.ProcessRights{
         .spawn_thread = true,
         .mem_reserve = true,
-        .shm_create = true,
+        .mem_shm_create = true,
     };
     const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
         @intFromPtr(children.child_shm_write_magic.ptr),

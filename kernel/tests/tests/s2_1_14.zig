@@ -15,7 +15,7 @@ pub fn main(pv: u64) void {
         .mem_reserve = true,
         .set_affinity = true,
         .restart = true,
-        .shm_create = true,
+        .mem_shm_create = true,
         .device_own = true,
         .fault_handler = true,
     };

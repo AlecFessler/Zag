@@ -87,8 +87,8 @@ kernel/
     registry.zig         -- device table and registration
   kvm/
     kvm.zig              -- module root (re-exports)
-    vm.zig               -- Vm struct, vm_create, vm_destroy, guest_map, msr_passthrough, ioapic_assert/deassert_irq
-    vcpu.zig             -- VCpu struct, vcpu_run, vcpu_set_state, vcpu_get_state, vcpu_interrupt, vCPU entry loop
+    vm.zig               -- Vm struct, vm_create, vm_destroy, vm_guest_map, vm_msr_passthrough, ioapic_assert/deassert_irq
+    vcpu.zig             -- VCpu struct, vm_vcpu_run, vm_vcpu_set_state, vm_vcpu_get_state, vm_vcpu_interrupt, vCPU entry loop
     exit_box.zig         -- VmExitBox, VmExitMessage, VmReplyAction, vm_recv, vm_reply
     exit_handler.zig     -- VM exit dispatch (kernel-handled vs VMM-handled classification)
     guest_memory.zig     -- guest physical address space tracking and cleanup
@@ -272,7 +272,7 @@ The VMM cursor (`range_start` field, advanced during allocation) advances monoto
 
 ### splitNode
 
-Splits a VmNode at a page-aligned offset into two new nodes. Both halves inherit: `kind`, `rights`, `handle`, `restart_policy`. The original node is removed from the tree and replaced with two new nodes. Used by `vm_perms`, `shm_map`, `mmio_map` to operate on sub-ranges of reservations.
+Splits a VmNode at a page-aligned offset into two new nodes. Both halves inherit: `kind`, `rights`, `handle`, `restart_policy`. The original node is removed from the tree and replaced with two new nodes. Used by `mem_perms`, `mem_shm_map`, `mem_mmio_map` to operate on sub-ranges of reservations.
 
 ### Stack Reservation
 
@@ -379,7 +379,7 @@ Field encoding for thread entries: `field0 = tid(u64)` (the thread's stable kern
 
 All rights are packed structs with bit fields:
 
-- `ProcessRights`: packed `u16` -- `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `shm_create`(5), `device_own`(6), `fault_handler`(7), 8 bits reserved.
+- `ProcessRights`: packed `u16` -- `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `mem_shm_create`(5), `device_own`(6), `fault_handler`(7), 8 bits reserved.
 - `ProcessHandleRights`: packed `u16` -- `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5), `fault_handler`(6), 9 bits reserved. Used on handles to other processes (not HANDLE_SELF).
 - `VmReservationRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4), 3 bits reserved.
 - `SharedMemoryRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `grant`(3), 4 bits reserved.
@@ -1670,7 +1670,7 @@ Vm {
     vm_id:                u64                -- monotonic ID
     arch_structures:      PAddr              -- physical address of arch-specific VM structures (VMCB on AMD, VMCS+EPT on Intel)
     guest_mem:            GuestMemory        -- tracks guest physical regions for cleanup
-    guest_ram_host_base:  u64                -- host VA base of the main guest RAM region (first guest_map at guest_addr=0)
+    guest_ram_host_base:  u64                -- host VA base of the main guest RAM region (first vm_guest_map at guest_addr=0)
     guest_ram_size:       u64                -- size of that main guest RAM region
     lapic:                Lapic              -- in-kernel LAPIC emulation state
     ioapic:               Ioapic             -- in-kernel IOAPIC emulation state
@@ -1681,7 +1681,7 @@ Vm {
 
 The Vm is not a perm table entry type — ownership is implicit via `proc.vm`. No capability transfer of VM objects is supported.
 
-`guest_ram_host_base`/`guest_ram_size` are captured on the first `guest_map` call at `guest_addr=0` and exist so the kernel MMIO decoder can read guest physical memory directly (page table walks for instruction fetch and operand resolution) without going through the EPT.
+`guest_ram_host_base`/`guest_ram_size` are captured on the first `vm_guest_map` call at `guest_addr=0` and exist so the kernel MMIO decoder can read guest physical memory directly (page table walks for instruction fetch and operand resolution) without going through the EPT.
 
 `lapic` and `ioapic` cross-link in `vm_create`: `ioapic.init(&vm.lapic)` so the IOAPIC can deliver interrupts, and `lapic.init(&vm.ioapic)` so the LAPIC can notify the IOAPIC on EOI for level-triggered IRQs.
 
@@ -1709,7 +1709,7 @@ VCpu {
 ```
 
 State meanings:
-- `idle` — created but not yet started via `vcpu_run`.
+- `idle` — created but not yet started via `vm_vcpu_run`.
 - `running` — actively executing guest code or scheduled to do so.
 - `exited` — hit a VM exit, waiting for `vm_recv`.
 - `waiting_reply` — exit message delivered, pending reply.
@@ -1776,7 +1776,7 @@ Defined in `kernel/kvm/exit_handler.zig`. Called from the vCPU entry loop after 
 
 **Kernel-handled inline** — resolved without VMM involvement, the entry loop re-enters the guest on return:
 - **EPT/NPT violations on the LAPIC or IOAPIC page** (`0xFEE00000` / `0xFEC00000`): the handler calls `vm.tryHandleMmio(vcpu, ept.guest_phys)`, which routes the access to the matching controller, decodes the instruction at guest RIP via `mmio_decode.decode`, writes any read result back into the destination GPR, and advances RIP by the decoded instruction length. The handler imports neither `lapic` nor `ioapic` directly — the only entry point is `Vm.tryHandleMmio`.
-- Guest memory is no longer demand-paged: all regions are eagerly mapped at `guest_map` time. EPT/NPT violations on truly unmapped regions fall through to the VMM as exits.
+- Guest memory is no longer demand-paged: all regions are eagerly mapped at `vm_guest_map` time. EPT/NPT violations on truly unmapped regions fall through to the VMM as exits.
 - **`cpuid`** where `(leaf, subleaf)` matches an entry in `vm.policy.cpuid_responses`: the kernel writes the pre-configured `eax/ebx/ecx/edx` into guest GPRs and advances RIP by 2.
 - **`interrupt_window` (VMEXIT_VINTR)**: returns immediately so the entry loop checks `vm.deliverPendingInterrupts` again now that guest `IF=1`.
 - **VMEXIT_INTR (0x060) / VMEXIT_NMI (0x061) / VMEXIT_VINTR (0x064)**: the host interrupt handler already ran on `#VMEXIT`. The kernel just returns so the entry loop re-enters the guest.
@@ -1797,13 +1797,13 @@ Defined in `kernel/kvm/guest_memory.zig`. Tracks guest physical memory regions f
 
 Guest physical address space is managed separately from host virtual address space. The VM has its own arch-specific guest physical memory structures (EPT on x64, Stage-2 page tables on ARM).
 
-`guest_map(host_vaddr, guest_addr, size, rights)` maps an existing host virtual memory range into the guest's physical address space. The kernel walks the VMM process's page tables to resolve each host page to its physical address, then wires that physical page into the guest EPT at the corresponding guest physical address. The VMM retains host access to the pages. `rights` controls guest access permissions (read, write, execute) in EPT.
+`vm_guest_map(host_vaddr, guest_addr, size, rights)` maps an existing host virtual memory range into the guest's physical address space. The kernel walks the VMM process's page tables to resolve each host page to its physical address, then wires that physical page into the guest EPT at the corresponding guest physical address. The VMM retains host access to the pages. `rights` controls guest access permissions (read, write, execute) in EPT.
 
-EPT violations on unmapped guest physical regions are delivered to the VMM as exits. The VMM can respond by calling `guest_map` to wire more host pages, or by injecting a fault into the guest.
+EPT violations on unmapped guest physical regions are delivered to the VMM as exits. The VMM can respond by calling `vm_guest_map` to wire more host pages, or by injecting a fault into the guest.
 
 ### In-kernel LAPIC
 
-Defined in `kernel/kvm/lapic.zig`. Single-vCPU xAPIC emulation per Intel SDM Vol 3 Ch 13. APIC base is fixed at `0xFEE00000` (the kernel refuses to `guest_map` over this page in `vm.zig`). All registers are 32-bit on 16-byte boundaries.
+Defined in `kernel/kvm/lapic.zig`. Single-vCPU xAPIC emulation per Intel SDM Vol 3 Ch 13. APIC base is fixed at `0xFEE00000` (the kernel refuses to `vm_guest_map` over this page in `vm.zig`). All registers are 32-bit on 16-byte boundaries.
 
 State the `Lapic` struct holds: APIC ID, TPR, LDR/DFR, SVR, ESR (with shadow for accumulated errors), ICR_LO/HI, six LVT registers (timer/thermal/perf/LINT0/LINT1/error), timer ICR/CCR/DCR, a `timer_accum_ns` carry for fractional ticks between `tick()` calls, three 256-bit vectors `irr`/`isr`/`tmr`, and a back-pointer to the paired `Ioapic`.
 
@@ -1818,14 +1818,14 @@ Public surface used by the rest of the kernel (all called through `Vm` methods, 
 
 ### In-kernel IOAPIC
 
-Defined in `kernel/kvm/ioapic.zig`. 24-pin IOAPIC per Intel 82093AA datasheet. Base fixed at `0xFEC00000` (also guarded in `guest_map`). Register access is the standard indirect IOREGSEL (offset 0x00) / IOWIN (offset 0x10) protocol.
+Defined in `kernel/kvm/ioapic.zig`. 24-pin IOAPIC per Intel 82093AA datasheet. Base fixed at `0xFEC00000` (also guarded in `vm_guest_map`). Register access is the standard indirect IOREGSEL (offset 0x00) / IOWIN (offset 0x10) protocol.
 
 State the `Ioapic` struct holds: `ioregsel`, `ioapic_id`, the 24-entry `redir_table` (each entry 64 bits, all reset with the mask bit set), an `irq_level` bitmap tracking the last asserted state per pin (used to debounce edge-triggered IRQs and re-fire level-triggered IRQs after EOI), and a back-pointer to the paired `Lapic`.
 
 Public surface:
 - `init(lapic_ptr)` — reset.
 - `mmioRead(offset)` / `mmioWrite(offset, value)` — MMIO handlers used by `Vm.tryHandleMmio`. Indirectly drive internal `readRegister`/`writeRegister` helpers, which know about ID/VER/ARB and the 0x10..0x3F redirection-table window. Bits 12 (delivery status) and 14 (remote IRR) in the redirection table are read-only from the guest.
-- `assertIrq(irq)` — used by both the kernel-side serial path and the `ioapic_assert_irq` syscall. Honors the per-entry mask bit, debounces edges, and tracks remote IRR for level-triggered entries before calling the internal `deliverInterrupt`.
+- `assertIrq(irq)` — used by both the kernel-side serial path and the `vm_ioapic_assert_irq` syscall. Honors the per-entry mask bit, debounces edges, and tracks remote IRR for level-triggered entries before calling the internal `deliverInterrupt`.
 - `deassertIrq(irq)` — clears the level bit for level-triggered re-delivery.
 - `handleEOI(vector)` — called by the LAPIC on EOI for level-triggered interrupts. Clears remote IRR and re-fires the entry if the line is still asserted.
 - Internal (non-pub): `deliverInterrupt` reads the vector and delivery mode from the entry. Fixed/lowest-priority/ExtINT all just call `lapic.injectExternal`. SMI/NMI/INIT are stubbed.

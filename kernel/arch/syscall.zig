@@ -49,13 +49,13 @@ pub const SyscallResult = struct {
 
 pub const SyscallNum = enum(u64) {
     write,
-    vm_reserve,
-    vm_perms,
-    shm_create,
-    shm_map,
-    shm_unmap,
-    mmio_map,
-    mmio_unmap,
+    mem_reserve,
+    mem_perms,
+    mem_shm_create,
+    mem_shm_map,
+    mem_shm_unmap,
+    mem_mmio_map,
+    mem_mmio_unmap,
     proc_create,
     thread_create,
     thread_exit,
@@ -68,8 +68,8 @@ pub const SyscallNum = enum(u64) {
     clock_gettime,
     ioport_read,
     ioport_write,
-    dma_map,
-    dma_unmap,
+    mem_dma_map,
+    mem_dma_unmap,
     pin_exclusive,
     ipc_send,
     ipc_call,
@@ -87,16 +87,16 @@ pub const SyscallNum = enum(u64) {
     fault_set_thread_mode,
     vm_create,
     vm_destroy,
-    guest_map,
+    vm_guest_map,
     vm_recv,
     vm_reply,
-    vcpu_set_state,
-    vcpu_get_state,
-    vcpu_run,
-    vcpu_interrupt,
-    msr_passthrough,
-    ioapic_assert_irq,
-    ioapic_deassert_irq,
+    vm_vcpu_set_state,
+    vm_vcpu_get_state,
+    vm_vcpu_run,
+    vm_vcpu_interrupt,
+    vm_msr_passthrough,
+    vm_ioapic_assert_irq,
+    vm_ioapic_deassert_irq,
     _,
 };
 
@@ -118,13 +118,13 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
     const syscall_num: SyscallNum = @enumFromInt(num);
     return switch (syscall_num) {
         .write => sysWrite(arg0, arg1),
-        .vm_reserve => sysVmReserve(arg0, arg1, arg2),
-        .vm_perms => .{ .rax = sysVmPerms(arg0, arg1, arg2, arg3) },
-        .shm_create => .{ .rax = sysShmCreate(arg0, arg1) },
-        .shm_map => .{ .rax = sysShmMap(arg0, arg1, arg2) },
-        .shm_unmap => .{ .rax = sysShmUnmap(arg0, arg1) },
-        .mmio_map => .{ .rax = sysMmioMap(arg0, arg1, arg2) },
-        .mmio_unmap => .{ .rax = sysMmioUnmap(arg0, arg1) },
+        .mem_reserve => sysMemReserve(arg0, arg1, arg2),
+        .mem_perms => .{ .rax = sysMemPerms(arg0, arg1, arg2, arg3) },
+        .mem_shm_create => .{ .rax = sysMemShmCreate(arg0, arg1) },
+        .mem_shm_map => .{ .rax = sysMemShmMap(arg0, arg1, arg2) },
+        .mem_shm_unmap => .{ .rax = sysMemShmUnmap(arg0, arg1) },
+        .mem_mmio_map => .{ .rax = sysMemMmioMap(arg0, arg1, arg2) },
+        .mem_mmio_unmap => .{ .rax = sysMemMmioUnmap(arg0, arg1) },
         .proc_create => .{ .rax = sysProcCreate(arg0, arg1, arg2, arg3, arg4) },
         .thread_create => .{ .rax = sysThreadCreate(arg0, arg1, arg2) },
         .thread_exit => sysThreadExit(),
@@ -137,8 +137,8 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
         .clock_gettime => .{ .rax = sysClockGettime() },
         .ioport_read => .{ .rax = sysIoportRead(arg0, arg1, arg2) },
         .ioport_write => .{ .rax = sysIoportWrite(arg0, arg1, arg2, arg3) },
-        .dma_map => .{ .rax = sysDmaMap(arg0, arg1) },
-        .dma_unmap => .{ .rax = sysDmaUnmap(arg0, arg1) },
+        .mem_dma_map => .{ .rax = sysMemDmaMap(arg0, arg1) },
+        .mem_dma_unmap => .{ .rax = sysMemDmaUnmap(arg0, arg1) },
         .pin_exclusive => .{ .rax = sysSetPriority(arg0) },
         .ipc_send => sysIpcSend(ctx),
         .ipc_call => sysIpcCall(ctx),
@@ -156,16 +156,16 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
         .fault_set_thread_mode => .{ .rax = sysFaultSetThreadMode(arg0, arg1) },
         .vm_create => .{ .rax = sysVmCreate(arg0, arg1) },
         .vm_destroy => .{ .rax = sysVmDestroy() },
-        .guest_map => .{ .rax = sysGuestMap(arg0, arg1, arg2, arg3) },
+        .vm_guest_map => .{ .rax = sysVmGuestMap(arg0, arg1, arg2, arg3) },
         .vm_recv => sysVmRecv(ctx, arg0, arg1),
         .vm_reply => .{ .rax = sysVmReplyCall(arg0, arg1) },
-        .vcpu_set_state => .{ .rax = sysVcpuSetState(arg0, arg1) },
-        .vcpu_get_state => .{ .rax = sysVcpuGetState(arg0, arg1) },
-        .vcpu_run => .{ .rax = sysVcpuRun(arg0) },
-        .vcpu_interrupt => .{ .rax = sysVcpuInterrupt(arg0, arg1) },
-        .msr_passthrough => .{ .rax = sysMsrPassthrough(arg0, arg1, arg2) },
-        .ioapic_assert_irq => .{ .rax = sysIoapicAssertIrq(arg0) },
-        .ioapic_deassert_irq => .{ .rax = sysIoapicDeassertIrq(arg0) },
+        .vm_vcpu_set_state => .{ .rax = sysVmVcpuSetState(arg0, arg1) },
+        .vm_vcpu_get_state => .{ .rax = sysVmVcpuGetState(arg0, arg1) },
+        .vm_vcpu_run => .{ .rax = sysVmVcpuRun(arg0) },
+        .vm_vcpu_interrupt => .{ .rax = sysVmVcpuInterrupt(arg0, arg1) },
+        .vm_msr_passthrough => .{ .rax = sysVmMsrPassthrough(arg0, arg1, arg2) },
+        .vm_ioapic_assert_irq => .{ .rax = sysVmIoapicAssertIrq(arg0) },
+        .vm_ioapic_deassert_irq => .{ .rax = sysVmIoapicDeassertIrq(arg0) },
         _ => .{ .rax = E_INVAL },
     };
 }
@@ -181,7 +181,7 @@ fn sysWrite(ptr: u64, len: u64) SyscallResult {
     return .{ .rax = @intCast(len) };
 }
 
-fn sysVmReserve(hint: u64, size: u64, max_perms_bits: u64) SyscallResult {
+fn sysMemReserve(hint: u64, size: u64, max_perms_bits: u64) SyscallResult {
     if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) return .{ .rax = E_INVAL };
 
     const max_rights: VmReservationRights = @bitCast(@as(u8, @truncate(max_perms_bits)));
@@ -209,7 +209,7 @@ fn sysVmReserve(hint: u64, size: u64, max_perms_bits: u64) SyscallResult {
     return .{ .rax = @intCast(handle_id), .rdx = result.vaddr.addr };
 }
 
-fn sysVmPerms(vm_handle: u64, offset: u64, size: u64, perms_bits: u64) i64 {
+fn sysMemPerms(vm_handle: u64, offset: u64, size: u64, perms_bits: u64) i64 {
     if (!std.mem.isAligned(offset, paging.PAGE4K)) return E_INVAL;
     if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) return E_INVAL;
 
@@ -232,7 +232,7 @@ fn sysVmPerms(vm_handle: u64, offset: u64, size: u64, perms_bits: u64) i64 {
     const range_end = std.math.add(u64, offset, size) catch return E_INVAL;
     if (range_end > vm_res.original_size) return E_INVAL;
 
-    proc.vmm.vm_perms(
+    proc.vmm.mem_perms(
         vm_handle,
         vm_res.original_start,
         vm_res.original_size,
@@ -244,7 +244,7 @@ fn sysVmPerms(vm_handle: u64, offset: u64, size: u64, perms_bits: u64) i64 {
     return E_OK;
 }
 
-fn sysShmCreate(size: u64, rights_bits: u64) i64 {
+fn sysMemShmCreate(size: u64, rights_bits: u64) i64 {
     if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) {
         return E_INVAL;
     }
@@ -254,7 +254,7 @@ fn sysShmCreate(size: u64, rights_bits: u64) i64 {
     const self_entry = proc.getPermByHandle(0) orelse {
         return E_PERM;
     };
-    if (!self_entry.processRights().shm_create) {
+    if (!self_entry.processRights().mem_shm_create) {
         return E_PERM;
     }
 
@@ -276,15 +276,15 @@ fn sysShmCreate(size: u64, rights_bits: u64) i64 {
     return @intCast(handle_id);
 }
 
-fn sysShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
+fn sysMemShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
     if (!std.mem.isAligned(offset, paging.PAGE4K)) return E_INVAL;
 
     const proc = currentProc();
 
-    // Hold perm_lock across both lookups and the vmm.shm_map call to
+    // Hold perm_lock across both lookups and the vmm.mem_shm_map call to
     // prevent a concurrent revoke_perm from freeing the SharedMemory
     // while we are using its pointer.  Without this, there is a UAF:
-    // the revoke frees the SHM between getPermByHandle and vmm.shm_map.
+    // the revoke frees the SHM between getPermByHandle and vmm.mem_shm_map.
     //
     // Lock ordering: perm_lock → vmm.lock is safe because no code path
     // acquires vmm.lock before perm_lock.
@@ -317,7 +317,7 @@ fn sysShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
     const range_end = std.math.add(u64, offset, shm.size()) catch return E_INVAL;
     if (range_end > vm_res.original_size) return E_INVAL;
 
-    proc.vmm.shm_map(
+    proc.vmm.mem_shm_map(
         shm_handle,
         vm_handle,
         vm_res.original_start,
@@ -333,7 +333,7 @@ fn sysShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
     return E_OK;
 }
 
-fn sysShmUnmap(shm_handle: u64, vm_handle: u64) i64 {
+fn sysMemShmUnmap(shm_handle: u64, vm_handle: u64) i64 {
     const proc = currentProc();
 
     const shm_entry = proc.getPermByHandle(shm_handle) orelse return E_BADCAP;
@@ -345,12 +345,12 @@ fn sysShmUnmap(shm_handle: u64, vm_handle: u64) i64 {
     const vm_res = vm_entry.object.vm_reservation;
     const shm = shm_entry.object.shared_memory;
 
-    proc.vmm.shm_unmap(shm, vm_handle, vm_res.original_start, vm_res.original_size, vm_res.max_rights) catch return E_NOENT;
+    proc.vmm.mem_shm_unmap(shm, vm_handle, vm_res.original_start, vm_res.original_size, vm_res.max_rights) catch return E_NOENT;
 
     return E_OK;
 }
 
-fn sysMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
+fn sysMemMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
     if (!std.mem.isAligned(offset, paging.PAGE4K)) return E_INVAL;
 
     const proc = currentProc();
@@ -372,7 +372,7 @@ fn sysMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
     const range_end = std.math.add(u64, offset, device.access.mmio.size) catch return E_INVAL;
     if (range_end > vm_res.original_size) return E_INVAL;
 
-    proc.vmm.mmio_map(
+    proc.vmm.mem_mmio_map(
         device_handle,
         vm_handle,
         vm_res.original_start,
@@ -393,7 +393,7 @@ fn sysMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
     return E_OK;
 }
 
-fn sysMmioUnmap(device_handle: u64, vm_handle: u64) i64 {
+fn sysMemMmioUnmap(device_handle: u64, vm_handle: u64) i64 {
     const proc = currentProc();
 
     const device_entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
@@ -405,7 +405,7 @@ fn sysMmioUnmap(device_handle: u64, vm_handle: u64) i64 {
     const vm_res = vm_entry.object.vm_reservation;
     const device = device_entry.object.device_region;
 
-    proc.vmm.mmio_unmap(device, vm_handle, vm_res.original_start, vm_res.original_size, vm_res.max_rights) catch return E_NOENT;
+    proc.vmm.mem_mmio_unmap(device, vm_handle, vm_res.original_start, vm_res.original_size, vm_res.max_rights) catch return E_NOENT;
 
     return E_OK;
 }
@@ -587,8 +587,8 @@ fn sysRevokePerm(handle: u64) i64 {
         },
         .shared_memory => |shm| {
             // Remove the handle from the permission table BEFORE freeing
-            // the SHM.  This prevents a concurrent sysShmMap (which holds
-            // perm_lock across its lookup + vmm.shm_map) from finding the
+            // the SHM.  This prevents a concurrent sysMemShmMap (which holds
+            // perm_lock across its lookup + vmm.mem_shm_map) from finding the
             // entry after the SHM has been freed.
             proc.removePerm(handle) catch {};
             const res = collectReservations(proc);
@@ -732,7 +732,7 @@ fn sysIoportWrite(device_handle: u64, port_offset: u64, width: u64, value: u64) 
     return E_OK;
 }
 
-fn sysDmaMap(device_handle: u64, shm_handle: u64) i64 {
+fn sysMemDmaMap(device_handle: u64, shm_handle: u64) i64 {
     const proc = currentProc();
     const dev_entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
     if (dev_entry.object != .device_region) return E_BADCAP;
@@ -2103,7 +2103,7 @@ fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
     }
 }
 
-fn sysDmaUnmap(device_handle: u64, shm_handle: u64) i64 {
+fn sysMemDmaUnmap(device_handle: u64, shm_handle: u64) i64 {
     const proc = currentProc();
     const dev_entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
     if (dev_entry.object != .device_region) return E_BADCAP;
@@ -2137,7 +2137,7 @@ fn sysVmDestroy() i64 {
     return kvm.vm.vmDestroy(proc);
 }
 
-fn sysGuestMap(host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
+fn sysVmGuestMap(host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
     const proc = currentProc();
     return kvm.vm.guestMap(proc, host_vaddr, guest_addr, size, rights);
 }
@@ -2153,38 +2153,38 @@ fn sysVmReplyCall(exit_token: u64, action_ptr: u64) i64 {
     return kvm.exit_box.vmReply(proc, exit_token, action_ptr);
 }
 
-fn sysVcpuSetState(thread_handle: u64, state_ptr: u64) i64 {
+fn sysVmVcpuSetState(thread_handle: u64, state_ptr: u64) i64 {
     const proc = currentProc();
     return kvm.vcpu.vcpuSetState(proc, thread_handle, state_ptr);
 }
 
-fn sysVcpuGetState(thread_handle: u64, state_ptr: u64) i64 {
+fn sysVmVcpuGetState(thread_handle: u64, state_ptr: u64) i64 {
     const proc = currentProc();
     return kvm.vcpu.vcpuGetState(proc, thread_handle, state_ptr);
 }
 
-fn sysVcpuRun(thread_handle: u64) i64 {
+fn sysVmVcpuRun(thread_handle: u64) i64 {
     const proc = currentProc();
     return kvm.vcpu.vcpuRun(proc, thread_handle);
 }
 
-fn sysVcpuInterrupt(thread_handle: u64, interrupt_ptr: u64) i64 {
+fn sysVmVcpuInterrupt(thread_handle: u64, interrupt_ptr: u64) i64 {
     const proc = currentProc();
     return kvm.vcpu.vcpuInterrupt(proc, thread_handle, interrupt_ptr);
 }
 
-fn sysMsrPassthrough(msr_num: u64, allow_read: u64, allow_write: u64) i64 {
+fn sysVmMsrPassthrough(msr_num: u64, allow_read: u64, allow_write: u64) i64 {
     const proc = currentProc();
     if (msr_num > std.math.maxInt(u32)) return E_INVAL;
     return kvm.vm.msrPassthrough(proc, @truncate(msr_num), allow_read != 0, allow_write != 0);
 }
 
-fn sysIoapicAssertIrq(irq_num: u64) i64 {
+fn sysVmIoapicAssertIrq(irq_num: u64) i64 {
     const proc = currentProc();
     return kvm.vm.ioapicAssertIrq(proc, irq_num);
 }
 
-fn sysIoapicDeassertIrq(irq_num: u64) i64 {
+fn sysVmIoapicDeassertIrq(irq_num: u64) i64 {
     const proc = currentProc();
     return kvm.vm.ioapicDeassertIrq(proc, irq_num);
 }

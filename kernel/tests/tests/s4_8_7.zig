@@ -7,7 +7,7 @@ const t = lib.testing;
 
 const E_INVAL: i64 = -1;
 
-/// §4.8.7 — `mmio_map` with non-page-aligned offset returns `E_INVAL`.
+/// §4.8.7 — `mem_mmio_map` with non-page-aligned offset returns `E_INVAL`.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
@@ -15,10 +15,10 @@ pub fn main(pv: u64) void {
     const dev_handle = dev.handle;
 
     const rights = perms.VmReservationRights{ .read = true, .write = true, .mmio = true };
-    const vm = syscall.vm_reserve(0, 8192, rights.bits());
+    const vm = syscall.mem_reserve(0, 8192, rights.bits());
     const vm_handle: u64 = @bitCast(vm.val);
 
-    const ret = syscall.mmio_map(dev_handle, vm_handle, 1);
+    const ret = syscall.mem_mmio_map(dev_handle, vm_handle, 1);
     t.expectEqual("§4.8.7", E_INVAL, ret);
     syscall.shutdown();
 }

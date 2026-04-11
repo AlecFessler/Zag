@@ -6,11 +6,11 @@ const t = lib.testing;
 
 const E_INVAL: i64 = -1;
 
-/// §4.3.9 — `vm_reserve` with `write_combining` without `mmio` returns `E_INVAL`.
+/// §4.3.9 — `mem_reserve` with `write_combining` without `mmio` returns `E_INVAL`.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     const bad = perms.VmReservationRights{ .read = true, .write = true, .write_combining = true };
-    const result = syscall.vm_reserve(0, 4096, bad.bits());
+    const result = syscall.mem_reserve(0, 4096, bad.bits());
     t.expectEqual("§4.3.9", E_INVAL, result.val);
     syscall.shutdown();
 }

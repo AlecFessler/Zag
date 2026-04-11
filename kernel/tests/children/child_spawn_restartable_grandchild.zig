@@ -42,9 +42,9 @@ pub fn main(perm_view_addr: u64) void {
         .execute = true,
         .shareable = true,
     }).bits();
-    const vm_result = syscall.vm_reserve(0, shm_size, vm_rights);
+    const vm_result = syscall.mem_reserve(0, shm_size, vm_rights);
     if (vm_result.val < 0) return;
-    if (syscall.shm_map(shm_handle, @bitCast(vm_result.val), 0) != 0) return;
+    if (syscall.mem_shm_map(shm_handle, @bitCast(vm_result.val), 0) != 0) return;
 
     const elf_ptr = vm_result.val2;
     const elf_len = shm_size - syscall.PAGE4K;
@@ -52,7 +52,7 @@ pub fn main(perm_view_addr: u64) void {
     // NOTE: The child's requested rights must be a subset of this process's
     // own ProcessRights (per §4.10.11). Our parent (root) granted us only
     // `spawn_process`, `mem_reserve`, and `restart`, so the grandchild can
-    // only request from that set. It does not need `shm_create` — it only
+    // only request from that set. It does not need `mem_shm_create` — it only
     // maps the SHM handle that we forward to it via ipc_call_cap.
     const grand_rights = (perms.ProcessRights{
         .restart = true,

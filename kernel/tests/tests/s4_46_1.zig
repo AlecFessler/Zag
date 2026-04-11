@@ -1,4 +1,4 @@
-/// §4.46.1 — `vcpu_interrupt` returns `E_OK` on success.
+/// §4.46.1 — `vm_vcpu_interrupt` returns `E_OK` on success.
 const lib = @import("lib");
 
 const perm_view = lib.perm_view;
@@ -39,8 +39,8 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
 
-    // vCPU is idle — vcpu_interrupt writes the pending interrupt for delivery on next resume.
-    const result = syscall.vcpu_interrupt(vcpu_handle, @intFromPtr(&interrupt));
+    // vCPU is idle — vm_vcpu_interrupt writes the pending interrupt for delivery on next resume.
+    const result = syscall.vm_vcpu_interrupt(vcpu_handle, @intFromPtr(&interrupt));
     t.expectEqual("§4.46.1", syscall.E_OK, result);
 
     _ = syscall.vm_destroy();

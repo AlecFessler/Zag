@@ -112,8 +112,8 @@ pub fn isInLanSubnet(ip: [4]u8) bool {
 fn mmioMap(device_handle: u64, size: u64) ?u64 {
     const aligned = ((size + syscall.PAGE4K - 1) / syscall.PAGE4K) * syscall.PAGE4K;
     const vm_rights = (perms.VmReservationRights{ .read = true, .write = true, .mmio = true }).bits();
-    const vm = syscall.vm_reserve(0, aligned, vm_rights) catch return null;
-    syscall.mmio_map(device_handle, vm.handle, 0) catch return null;
+    const vm = syscall.mem_reserve(0, aligned, vm_rights) catch return null;
+    syscall.mem_mmio_map(device_handle, vm.handle, 0) catch return null;
     return vm.addr;
 }
 

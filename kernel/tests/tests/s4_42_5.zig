@@ -102,7 +102,7 @@ pub fn main(pv: u64) void {
     }
 
     // Reserve host buffer and write guest code (HLT; HLT).
-    const res = syscall.vm_reserve(0, syscall.PAGE4K, 0x3);
+    const res = syscall.mem_reserve(0, syscall.PAGE4K, 0x3);
     if (res.val < 0) {
         t.failWithVal("§4.42.5 reserve", 0, res.val);
         _ = syscall.vm_destroy();
@@ -113,9 +113,9 @@ pub fn main(pv: u64) void {
         host_ptr[i] = byte;
     }
 
-    const mr = syscall.guest_map(res.val2, 0x0, syscall.PAGE4K, 0x7);
+    const mr = syscall.vm_guest_map(res.val2, 0x0, syscall.PAGE4K, 0x7);
     if (mr != syscall.E_OK) {
-        t.failWithVal("§4.42.5 guest_map", syscall.E_OK, mr);
+        t.failWithVal("§4.42.5 vm_guest_map", syscall.E_OK, mr);
         _ = syscall.vm_destroy();
         syscall.shutdown();
     }
@@ -129,14 +129,14 @@ pub fn main(pv: u64) void {
 
     // Set up real-mode guest state and run.
     setupRealModeState(&guest_state);
-    const sr = syscall.vcpu_set_state(vcpu_handle, @intFromPtr(&guest_state));
+    const sr = syscall.vm_vcpu_set_state(vcpu_handle, @intFromPtr(&guest_state));
     if (sr != syscall.E_OK) {
         t.failWithVal("§4.42.5 set_state", syscall.E_OK, sr);
         _ = syscall.vm_destroy();
         syscall.shutdown();
     }
 
-    _ = syscall.vcpu_run(vcpu_handle);
+    _ = syscall.vm_vcpu_run(vcpu_handle);
 
     // --- First exit: HLT at offset 0 ---
     const exit1 = syscall.vm_recv(@intFromPtr(&buf), 1);
@@ -147,7 +147,7 @@ pub fn main(pv: u64) void {
     }
 
     // Read guest state after first exit.
-    const gr = syscall.vcpu_get_state(vcpu_handle, @intFromPtr(&state_after));
+    const gr = syscall.vm_vcpu_get_state(vcpu_handle, @intFromPtr(&state_after));
     if (gr != syscall.E_OK) {
         t.failWithVal("§4.42.5 get_state", syscall.E_OK, gr);
         _ = syscall.vm_destroy();
@@ -197,7 +197,7 @@ pub fn main(pv: u64) void {
     }
 
     // Verify second exit came from a different instruction by checking RIP.
-    const gr2 = syscall.vcpu_get_state(vcpu_handle, @intFromPtr(&state_after2));
+    const gr2 = syscall.vm_vcpu_get_state(vcpu_handle, @intFromPtr(&state_after2));
     if (gr2 != syscall.E_OK) {
         t.failWithVal("§4.42.5 get_state2", syscall.E_OK, gr2);
         _ = syscall.vm_destroy();

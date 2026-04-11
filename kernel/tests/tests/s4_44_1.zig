@@ -1,4 +1,4 @@
-/// §4.44.1 — `vcpu_get_state` returns `E_OK` on success.
+/// §4.44.1 — `vm_vcpu_get_state` returns `E_OK` on success.
 const lib = @import("lib");
 
 const perm_view = lib.perm_view;
@@ -40,7 +40,7 @@ pub fn main(pv: u64) void {
     }
 
     // vCPU is idle after creation — get_state should succeed.
-    const result = syscall.vcpu_get_state(vcpu_handle, @intFromPtr(&guest_state));
+    const result = syscall.vm_vcpu_get_state(vcpu_handle, @intFromPtr(&guest_state));
     t.expectEqual("§4.44.1", syscall.E_OK, result);
 
     _ = syscall.vm_destroy();

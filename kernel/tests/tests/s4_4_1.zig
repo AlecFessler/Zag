@@ -4,7 +4,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §4.4.1 — `vm_perms` returns `E_OK` on success.
+/// §4.4.1 — `mem_perms` returns `E_OK` on success.
 ///
 /// Verifies the permission change actually takes effect by cycling RW → RO → RW
 /// and writing through the page in the RW phases. A faulting write during RO
@@ -13,7 +13,7 @@ const t = lib.testing;
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     const rw = perms.VmReservationRights{ .read = true, .write = true };
-    const result = syscall.vm_reserve(0, 4096, rw.bits());
+    const result = syscall.mem_reserve(0, 4096, rw.bits());
     const handle: u64 = @bitCast(result.val);
     const vaddr: u64 = result.val2;
     const page: [*]volatile u8 = @ptrFromInt(vaddr);
@@ -27,7 +27,7 @@ pub fn main(perm_view: u64) void {
 
     // Downgrade to read-only.
     const read_only = perms.VmReservationRights{ .read = true };
-    const ret_ro = syscall.vm_perms(handle, 0, 4096, read_only.bits());
+    const ret_ro = syscall.mem_perms(handle, 0, 4096, read_only.bits());
     t.expectEqual("§4.4.1 RW→RO", 0, ret_ro);
 
     // Confirm the page is still readable at its prior value.
@@ -37,7 +37,7 @@ pub fn main(perm_view: u64) void {
     }
 
     // Re-grant write and make a visible change.
-    const ret_rw = syscall.vm_perms(handle, 0, 4096, rw.bits());
+    const ret_rw = syscall.mem_perms(handle, 0, 4096, rw.bits());
     t.expectEqual("§4.4.1 RO→RW", 0, ret_rw);
     page[0] = 0x55;
     if (page[0] != 0x55) {

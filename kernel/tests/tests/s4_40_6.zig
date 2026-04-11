@@ -1,4 +1,4 @@
-/// §4.40.6 — `guest_map` with non-page-aligned `host_vaddr` returns `E_INVAL`.
+/// §4.40.6 — `vm_guest_map` with non-page-aligned `host_vaddr` returns `E_INVAL`.
 const lib = @import("lib");
 
 const syscall = lib.syscall;
@@ -18,7 +18,7 @@ pub fn main(_: u64) void {
     }
 
     // Non-page-aligned host_vaddr (0x1001) with valid guest_addr, size, and rights.
-    const result = syscall.guest_map(0x1001, 0x1000, 0x1000, 0x1);
+    const result = syscall.vm_guest_map(0x1001, 0x1000, 0x1000, 0x1);
     t.expectEqual("§4.40.6", syscall.E_INVAL, result);
 
     _ = syscall.vm_destroy();

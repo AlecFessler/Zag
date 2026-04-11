@@ -11,7 +11,7 @@ pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
     // Insert: create a VM reservation and check it appears.
     const rw = perms.VmReservationRights{ .read = true, .write = true };
-    const result = syscall.vm_reserve(0, 4096, rw.bits());
+    const result = syscall.mem_reserve(0, 4096, rw.bits());
     const handle: u64 = @bitCast(result.val);
     var found_after_insert = false;
     for (0..128) |i| {

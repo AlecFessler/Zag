@@ -1,4 +1,4 @@
-/// §4.40.1 — `guest_map` returns `E_OK` on success.
+/// §4.40.1 — `vm_guest_map` returns `E_OK` on success.
 const lib = @import("lib");
 
 const syscall = lib.syscall;
@@ -18,7 +18,7 @@ pub fn main(_: u64) void {
     }
 
     // Reserve a host buffer to back the guest mapping.
-    const res = syscall.vm_reserve(0, syscall.PAGE4K, 0x3);
+    const res = syscall.mem_reserve(0, syscall.PAGE4K, 0x3);
     const host_vaddr = res.val2;
     if (res.val < 0) {
         t.failWithVal("§4.40.1 reserve", 0, res.val);
@@ -27,7 +27,7 @@ pub fn main(_: u64) void {
     }
 
     // Map host buffer into guest at guest physical 0x1000 with read rights.
-    const result = syscall.guest_map(host_vaddr, 0x1000, syscall.PAGE4K, 0x1);
+    const result = syscall.vm_guest_map(host_vaddr, 0x1000, syscall.PAGE4K, 0x1);
     t.expectEqual("§4.40.1", syscall.E_OK, result);
 
     _ = syscall.vm_destroy();
