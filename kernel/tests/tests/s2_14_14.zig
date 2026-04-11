@@ -40,6 +40,14 @@ pub fn main(pv: u64) void {
             // must be dead (not restarted) and the reason is the one
             // recorded by §3.11 / §2.12.7.
             const reason = e.processCrashReason();
+            if (reason == perm_view.CrashReason.illegal_instruction) {
+                // Child signals setup failure (pmu_info / pmu_start
+                // rejected, or overflow never delivered) via `ud2`.
+                // This is a test-setup or kernel-delivery regression,
+                // not a §2.14.14 violation — report it distinctly.
+                t.fail("§2.14.14 child setup failed or overflow not delivered");
+                syscall.shutdown();
+            }
             if (reason != perm_view.CrashReason.pmu_overflow) {
                 t.failWithVal("§2.14.14 wrong crash reason",
                     @intFromEnum(perm_view.CrashReason.pmu_overflow),

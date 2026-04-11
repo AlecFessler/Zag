@@ -4,16 +4,43 @@ const syscall = lib.syscall;
 
 /// Single-threaded child that is its own fault handler (no cap transfer
 /// to parent). Starts PMU with an overflow threshold on itself and burns
-/// instructions until the overflow fires. Per §2.14.14 the kernel must
-/// kill the process.
+/// events until the overflow fires. Per §2.14.14 the kernel must kill
+/// the process with CrashReason.pmu_overflow.
+///
+/// Setup failure signalling (§2.14.14 parent-test robustness): if
+/// `pmu_info` fails, no event is supported, or `pmu_start` returns
+/// non-zero, we execute `ud2` so the kernel kills the process with
+/// CrashReason.illegal_instruction. The parent test can then distinguish
+/// "setup failed" from "overflow kill worked". Similarly, if the work
+/// loop completes without being faulted (kernel regression — overflow
+/// never delivered), the final `ud2` gives the parent a clear
+/// illegal_instruction signal rather than leaving it to time out.
 pub fn main(_: u64) void {
+    var info: syscall.PmuInfo = undefined;
+    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK) {
+        asm volatile ("ud2" ::: .{ .memory = true });
+        unreachable;
+    }
+    const evt = syscall.pickSupportedEvent(info) orelse {
+        asm volatile ("ud2" ::: .{ .memory = true });
+        unreachable;
+    };
+
     const self_thread: u64 = @bitCast(syscall.thread_self());
     var cfg = syscall.PmuCounterConfig{
-        .event = .instructions,
+        .event = evt,
         .has_threshold = true,
         .overflow_threshold = 1024,
     };
-    _ = syscall.pmu_start(self_thread, @intFromPtr(&cfg), 1);
+    const start_rc = syscall.pmu_start(self_thread, @intFromPtr(&cfg), 1);
+    if (start_rc != syscall.E_OK) {
+        asm volatile ("ud2" ::: .{ .memory = true });
+    }
+
+    // Burn events until the overflow faults us. Bound the loop so a
+    // kernel regression where the overflow is never delivered surfaces
+    // as `ud2` → illegal_instruction rather than a silent hang.
     var x: u64 = 0;
-    while (true) : (x +%= 1) {}
+    while (x < 10_000_000) : (x +%= 1) {}
+    asm volatile ("ud2" ::: .{ .memory = true });
 }
