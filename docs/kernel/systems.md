@@ -472,7 +472,7 @@ Atomic boolean. Set to `true` when a thread is dispatched onto a CPU, set to `fa
 
 `Thread.deinit()`:
 1. Save `last_in_proc` flag.
-2. If `pmu_state != null`, call `arch.pmuStop(pmu_state)` to disable counters and free the PMU state back to `PmuStateAllocator`, then clear the field. This is the implicit `pmu_stop` on thread exit (§20).
+2. If `pmu_state != null`, call `arch.pmuClearState(pmu_state)` to zero the state struct without touching any MSRs, then free the PMU state back to `PmuStateAllocator` and clear the field. The dying thread is not running on any core at this point (exit paths leave the thread off its run queue before tearing it down), so MSR writes on the caller's core would either be a no-op against stale values or clobber the PMU state of whichever thread currently owns the hardware. Real hardware teardown for the dying thread happened at its last `pmuSave` on context switch away. This is the implicit `pmu_stop` on thread exit (§2.14.9, §20).
 3. Clear the thread handle entry from the owning process's perm table. If `fault_handler_proc` is non-null, also clear the thread handle entry from the handler's perm table. Call `syncUserView` on all affected tables.
 4. Destroy kernel stack (unmap committed pages, recycle slot).
 5. If not last thread: destroy user stack via process VMM.
@@ -2062,10 +2062,10 @@ The PMI handler does not program new counters; that is the profiler's job via `p
 3. Validate state constraints: `.faulted`/`.suspended` for `sysPmuRead`, `.faulted` for `sysPmuReset`, any-state-except-exited for `sysPmuStop`.
 4. Validate the userspace buffer pointer via the standard `validateUserReadable` / `validateUserWritable` helpers.
 5. Validate the config array against the cached `PmuInfo` (`count > 0`, `count <= num_counters`, every event bit set in `supported_events`, overflow thresholds only if `overflow_support`). Return `E_INVAL` on any failure.
-6. For `sysPmuStart`: if `thread.pmu_state == null`, allocate from `PmuStateAllocator`. `E_NOMEM` on allocation failure. Then call `arch.pmuStart(state, configs)`.
+6. For `sysPmuStart`: if `thread.pmu_state == null`, allocate from `PmuStateAllocator`. `E_NOMEM` on allocation failure. If `target == scheduler.currentThread()`, call `arch.pmuStart(state, configs)`; otherwise call `arch.pmuConfigureState(state, configs)` (stamp only, no MSR writes — see "Locking and Cross-Core Constraints" below).
 7. For `sysPmuRead`: call `arch.pmuRead(state, sample)` and fill `sample.timestamp` from `arch.getMonotonicClock().now()`.
-8. For `sysPmuReset`: call `arch.pmuReset(state, configs)`.
-9. For `sysPmuStop`: call `arch.pmuStop(state)`, clear `thread.pmu_state = null`, free to allocator.
+8. For `sysPmuReset`: same self/remote branch as `sysPmuStart` — `arch.pmuReset` on self, `arch.pmuConfigureState` on remote.
+9. For `sysPmuStop`: on self call `arch.pmuStop(state)`, on remote call `arch.pmuClearState(state)`. In both cases clear `thread.pmu_state = null` and free to allocator.
 
 All buffer writes into the caller's address space go through physmap. No direct user-pointer dereference in kernel mode, matching the existing convention.
 
@@ -2077,8 +2077,15 @@ When aarch64 PMU support is actually implemented (ARMv8-A has its own performanc
 
 ### Locking and Cross-Core Constraints
 
-PMU syscalls that take a thread handle always operate on a thread owned by a process whose perm table is locked while the thread is being accessed (the same lock discipline as `thread_suspend` / `thread_resume`). Because `pmu_read` is restricted to `.faulted` / `.suspended` threads (§2.14.11), the kernel never needs to interrupt a running remote core to read counters. `pmu_start` is special-cased for the self-thread path: the caller always operates on its own thread handle for start, so the hardware programming happens on the exact core the thread is running on, and the subsequent context-switch save/restore hooks take care of migration correctness.
+PMU syscalls that take a thread handle always operate on a thread owned by a process whose perm table is locked while the thread is being accessed (the same lock discipline as `thread_suspend` / `thread_resume`). Because `pmu_read` is restricted to `.faulted` / `.suspended` threads (§2.14.11), the kernel never needs to interrupt a running remote core to read counters.
 
-If a profiler (external handler) calls `pmu_start` on a target thread, the target thread is by definition in `.faulted` or `.suspended` state (otherwise the profiler has no way to observe it). The generic layer updates `state.configs` immediately; the next `pmuRestore` (when the thread is resumed) picks up the new configs and programs the hardware fresh. No cross-core IPI is needed.
+`pmu_start`, `pmu_reset`, and `pmu_stop` all branch on `target_thread == scheduler.currentThread()`:
 
-Overflow races: if a PMI fires on core A while the generic layer is mid-`pmu_stop` on core B, the PMI handler's `thread.pmu_state == null` check (step 5) falls through cleanly — the counters are already disabled globally by the save-on-switch-away that must have happened before the stop could run on a different core. The single cleared `IA32_PERF_GLOBAL_CTRL` in both paths is the serialization point.
+- **Self path** (target is the caller): the hardware is on this exact core. Call the full `arch.pmuStart` / `pmuReset` / `pmuStop`, which writes MSRs in place.
+- **Remote path** (target is a different thread): the target is by contract `.faulted` or `.suspended` (enforced for `pmu_reset` / `pmu_read`; `pmu_start` on a remote target is only meaningful when an external profiler is driving it, which requires the target to be observable and therefore stopped). The generic layer calls `arch.pmuConfigureState` / `arch.pmuClearState` instead — these stamp `state.configs` / `state.values` without touching any MSRs. The next `pmuRestore` (when the target is next scheduled onto a core) programs hardware fresh from the stamped state. No cross-core IPI is needed.
+
+Writing MSRs on the caller's core for a remote target would be doubly wrong: it would clobber the PMU state of whatever thread is currently running on the caller's core, and it would do nothing to the target's future core.
+
+`Thread.deinit` runs on the teardown path (timer handler deferred cleanup, etc.) and the thread being freed is by construction not running on any core. It always goes through `arch.pmuClearState` + slab destroy — never touches MSRs. Real hardware teardown for the dying thread happened at its last `pmuSave` on context switch away.
+
+Overflow races: if a PMI fires on core A while the generic layer is mid-`pmu_stop` on core B against a remote target, the PMI handler's `thread.pmu_state == null` check falls through cleanly. The remote `pmu_stop` never touches hardware on core A, so there is no cross-core serialization window to reason about.

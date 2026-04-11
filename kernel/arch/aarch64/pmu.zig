@@ -56,3 +56,14 @@ pub fn pmuStop(state: *PmuState) void {
     _ = state;
     unreachable;
 }
+
+pub fn pmuConfigureState(state: *PmuState, configs: []const pmu.PmuCounterConfig) void {
+    _ = state;
+    _ = configs;
+    unreachable;
+}
+
+pub fn pmuClearState(state: *PmuState) void {
+    _ = state;
+    unreachable;
+}

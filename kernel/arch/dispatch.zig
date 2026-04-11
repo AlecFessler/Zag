@@ -577,3 +577,26 @@ pub fn pmuStop(state: *PmuState) void {
         else => unreachable,
     }
 }
+
+/// Stamp `state` with `configs` without touching any hardware registers.
+/// Used by the generic PMU syscall layer when an external profiler calls
+/// pmu_start / pmu_reset on a non-running target thread; the target's
+/// next `pmuRestore` programs the hardware when it is rescheduled.
+pub fn pmuConfigureState(state: *PmuState, configs: []const zag.sched.pmu.PmuCounterConfig) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.pmu.pmuConfigureState(state, configs),
+        .aarch64 => aarch64.pmu.pmuConfigureState(state, configs),
+        else => unreachable,
+    }
+}
+
+/// Zero `state` for a non-running target without touching any hardware
+/// registers. Used by pmu_stop / Thread.deinit on remote targets and on
+/// thread teardown.
+pub fn pmuClearState(state: *PmuState) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.pmu.pmuClearState(state),
+        .aarch64 => aarch64.pmu.pmuClearState(state),
+        else => unreachable,
+    }
+}

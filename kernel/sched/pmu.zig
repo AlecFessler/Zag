@@ -19,6 +19,7 @@ const zag = @import("zag");
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const paging = zag.memory.paging;
+const scheduler = zag.sched.scheduler;
 const slab_allocator = zag.memory.slab_allocator;
 
 const Process = zag.sched.process.Process;
@@ -144,7 +145,17 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     }
     const state = target_thread.pmu_state.?;
 
-    arch.pmuStart(state, slice) catch return E_INVAL;
+    // Self vs. remote programming. Writing MSRs on the caller's core only
+    // makes sense if the caller *is* the target — otherwise we'd trash the
+    // caller's own PMU state and do nothing to the target's actual core.
+    // For remote targets the spec restricts pmu_start/reset to
+    // .faulted/.suspended (§2.14.11), so the target is not running; the
+    // next pmuRestore (when it's scheduled) picks up the stamped configs.
+    if (target_thread == scheduler.currentThread()) {
+        arch.pmuStart(state, slice) catch return E_INVAL;
+    } else {
+        arch.pmuConfigureState(state, slice);
+    }
     return E_OK;
 }
 
@@ -194,7 +205,16 @@ pub fn sysPmuReset(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
 
     const state = target_thread.pmu_state orelse return E_INVAL; // §4.53.6
 
-    arch.pmuReset(state, slice) catch return E_INVAL;
+    // Self vs. remote: a .faulted target can only be `currentThread()`
+    // if the thread is handling its own fault (thread-level self-handler,
+    // §2.12.7) — otherwise the faulted thread is sitting in its handler's
+    // fault box and we're the profiler. Branch so the hardware-programming
+    // path only runs when the target really is on this core.
+    if (target_thread == scheduler.currentThread()) {
+        arch.pmuReset(state, slice) catch return E_INVAL;
+    } else {
+        arch.pmuConfigureState(state, slice);
+    }
     return E_OK;
 }
 
@@ -210,7 +230,14 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
 
     const state = target_thread.pmu_state orelse return E_INVAL; // §4.54.5
 
-    arch.pmuStop(state);
+    // Self vs. remote: only touch hardware on the caller's core if the
+    // caller IS the target. Otherwise, the target isn't running here —
+    // pmuStop would write MSRs on the wrong core. Just drop state.
+    if (target_thread == scheduler.currentThread()) {
+        arch.pmuStop(state);
+    } else {
+        arch.pmuClearState(state);
+    }
     target_thread.pmu_state = null;
     allocator.destroy(state);
     return E_OK;

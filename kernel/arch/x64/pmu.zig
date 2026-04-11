@@ -262,6 +262,41 @@ pub fn pmuStop(state: *PmuState) void {
     state.num_counters = 0;
 }
 
+/// Stamp `state.configs` / `state.values` for a *non-running* target thread.
+/// Does NOT touch any MSRs. Used by the generic PMU syscall layer for
+/// external-profiler paths where the caller is not the target: when the
+/// target is next scheduled, `pmuRestore` picks up the stamped configs and
+/// preload values and programs hardware fresh at that point.
+///
+/// This mirrors the per-counter stamping done by `programCounters` but
+/// skips every `wrmsr` — programming MSRs on the caller's core would trash
+/// the caller's own PMU state and do nothing to the target's future core.
+pub fn pmuConfigureState(state: *PmuState, configs: []const PmuCounterConfig) void {
+    const n: u8 = @intCast(configs.len);
+    state.num_counters = n;
+    var i: u8 = 0;
+    while (i < n) : (i += 1) {
+        state.configs[i] = configs[i];
+        state.values[i] = preloadValue(configs[i]);
+    }
+    // Zero any tail slots so a later pmuSave/pmuRestore doesn't pick up
+    // stale values from a previous run with more counters.
+    while (i < state.values.len) : (i += 1) state.values[i] = 0;
+}
+
+/// Clear `state` for a *non-running* target thread without touching any
+/// MSRs. Used by `pmu_stop` / `Thread.deinit` when the target thread is
+/// not the caller — programming hardware is both meaningless (the target
+/// isn't running on this core) and destructive (it would clobber whatever
+/// PMU state the caller itself is using).
+pub fn pmuClearState(state: *PmuState) void {
+    state.num_counters = 0;
+    // Leaving configs/values as-is is safe — num_counters = 0 means every
+    // loop over them becomes a no-op. Zero values for defensiveness.
+    var i: usize = 0;
+    while (i < state.values.len) : (i += 1) state.values[i] = 0;
+}
+
 pub fn pmuSave(state: *PmuState) void {
     // Disable all counters first (Intel SDM Vol 3 §18.6.1) so the read of
     // each PMCx reflects the thread's exact end-of-timeslice value, not

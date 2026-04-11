@@ -86,11 +86,15 @@ pub const Thread = struct {
     pub fn deinit(self: *Thread) void {
         const proc = self.process;
 
-        // §2.14.9: automatic pmu_stop on thread exit. If the thread ever
-        // called pmu_start, tear down counters and return the state to the
-        // slab before we let the rest of cleanup proceed.
+        // §2.14.9: automatic pmu_stop on thread exit. The thread is no
+        // longer running on any core by the time deinit runs (exit paths
+        // leave the thread off its run queue before tearing it down), so
+        // touching MSRs here would either be a no-op or clobber the PMU
+        // state of whichever thread is currently running on the caller's
+        // core. Just zero and free the state struct — real hardware
+        // teardown happened at the latest pmuSave on context switch away.
         if (self.pmu_state) |state| {
-            arch.pmuStop(state);
+            arch.pmuClearState(state);
             zag.sched.pmu.allocator.destroy(state);
             self.pmu_state = null;
         }
