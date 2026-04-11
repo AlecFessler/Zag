@@ -321,6 +321,15 @@ pub fn injectException(guest_state: *GuestState, exception: GuestException) void
     }
 }
 
+/// Modify MSR passthrough bits in the VM's MSRPM.
+pub fn msrPassthrough(vm_structures: PAddr, msr_num: u32, allow_read: bool, allow_write: bool) void {
+    switch (active_backend) {
+        .amd_svm => svm.msrPassthrough(vm_structures, msr_num, allow_read, allow_write),
+        .intel_vmx => {}, // TODO: VMX MSR bitmap support
+        .none => {},
+    }
+}
+
 const Vendor = enum { intel, amd, unknown };
 
 fn detectVendor() Vendor {

@@ -94,6 +94,9 @@ pub const SyscallNum = enum(u64) {
     vcpu_get_state,
     vcpu_run,
     vcpu_interrupt,
+    msr_passthrough,
+    ioapic_assert_irq,
+    ioapic_deassert_irq,
     _,
 };
 
@@ -160,6 +163,9 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
         .vcpu_get_state => .{ .rax = sysVcpuGetState(arg0, arg1) },
         .vcpu_run => .{ .rax = sysVcpuRun(arg0) },
         .vcpu_interrupt => .{ .rax = sysVcpuInterrupt(arg0, arg1) },
+        .msr_passthrough => .{ .rax = sysMsrPassthrough(arg0, arg1, arg2) },
+        .ioapic_assert_irq => .{ .rax = sysIoapicAssertIrq(arg0) },
+        .ioapic_deassert_irq => .{ .rax = sysIoapicDeassertIrq(arg0) },
         _ => .{ .rax = E_INVAL },
     };
 }
@@ -2165,4 +2171,20 @@ fn sysVcpuRun(thread_handle: u64) i64 {
 fn sysVcpuInterrupt(thread_handle: u64, interrupt_ptr: u64) i64 {
     const proc = currentProc();
     return kvm.vcpu.vcpuInterrupt(proc, thread_handle, interrupt_ptr);
+}
+
+fn sysMsrPassthrough(msr_num: u64, allow_read: u64, allow_write: u64) i64 {
+    const proc = currentProc();
+    if (msr_num > std.math.maxInt(u32)) return E_INVAL;
+    return kvm.vm.msrPassthrough(proc, @truncate(msr_num), allow_read != 0, allow_write != 0);
+}
+
+fn sysIoapicAssertIrq(irq_num: u64) i64 {
+    const proc = currentProc();
+    return kvm.vm.ioapicAssertIrq(proc, irq_num);
+}
+
+fn sysIoapicDeassertIrq(irq_num: u64) i64 {
+    const proc = currentProc();
+    return kvm.vm.ioapicDeassertIrq(proc, irq_num);
 }

@@ -6,6 +6,8 @@ const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const vcpu_mod = zag.kvm.vcpu;
 
+const Ioapic = zag.kvm.ioapic.Ioapic;
+const Lapic = zag.kvm.lapic.Lapic;
 const PAddr = zag.memory.address.PAddr;
 const Process = zag.sched.process.Process;
 const VAddr = zag.memory.address.VAddr;
@@ -33,6 +35,10 @@ pub const Vm = struct {
     vm_id: u64 = 0,
     arch_structures: PAddr = PAddr.fromInt(0),
     guest_mem: zag.kvm.guest_memory.GuestMemory = .{},
+    /// In-kernel LAPIC emulation state.
+    lapic: Lapic = .{},
+    /// In-kernel IOAPIC emulation state.
+    ioapic: Ioapic = .{},
 
     /// Destroy this VM: kill all vCPU threads, free structures.
     pub fn destroy(self: *Vm) void {
@@ -99,6 +105,12 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
         .arch_structures = arch_structures,
     };
 
+    // Initialize in-kernel LAPIC and IOAPIC emulation.
+    // IOAPIC needs a pointer to LAPIC for interrupt delivery;
+    // LAPIC needs a pointer to IOAPIC for EOI notification.
+    vm_obj.ioapic.init(&vm_obj.lapic);
+    vm_obj.lapic.init(&vm_obj.ioapic);
+
     // Create vCPUs
     var i: u32 = 0;
     while (i < vcpu_count) : (i += 1) {
@@ -157,6 +169,14 @@ pub fn guestMap(proc: *Process, host_vaddr: u64, guest_addr: u64, size: u64, rig
     if (!std.mem.isAligned(host_vaddr, 0x1000)) return E_INVAL;
     if (!zag.memory.address.AddrSpacePartition.user.contains(host_vaddr)) return E_BADADDR;
 
+    // Guard LAPIC and IOAPIC pages -- these are handled in-kernel and
+    // must always NPT-fault to the kernel exit handler.
+    const guest_end = guest_addr + size;
+    const lapic_base: u64 = 0xFEE00000;
+    const ioapic_base: u64 = 0xFEC00000;
+    if (guest_addr <= lapic_base and guest_end > lapic_base) return E_INVAL;
+    if (guest_addr <= ioapic_base and guest_end > ioapic_base) return E_INVAL;
+
     // Walk host pages and map each into guest EPT. Track progress for
     // rollback on partial failure.
     var offset: u64 = 0;
@@ -192,6 +212,60 @@ fn rollbackGuestMap(vm_obj: *Vm, guest_addr: u64, mapped_size: u64) void {
     while (off < mapped_size) : (off += 0x1000) {
         arch.unmapGuestPage(vm_obj.arch_structures, guest_addr + off);
     }
+}
+
+/// Syscall implementation: allow/deny MSR passthrough for the calling process's VM.
+/// Modifies MSRPM bits in the VMCB. Refuses security-critical MSRs.
+pub fn msrPassthrough(proc: *Process, msr_num: u32, allow_read: bool, allow_write: bool) i64 {
+    const E_INVAL: i64 = -1;
+    const E_PERM: i64 = -2;
+
+    const vm_obj = proc.vm orelse return E_INVAL;
+
+    // Refuse security-critical MSRs that must always be intercepted.
+    if (isSecurityCriticalMsr(msr_num)) return E_PERM;
+
+    // Access the MSRPM via the VMCB.
+    arch.vmMsrPassthrough(vm_obj.arch_structures, msr_num, allow_read, allow_write);
+    return 0; // E_OK
+}
+
+/// Syscall implementation: assert an IRQ line on the in-kernel IOAPIC.
+pub fn ioapicAssertIrq(proc: *Process, irq_num: u64) i64 {
+    const E_INVAL: i64 = -1;
+
+    const vm_obj = proc.vm orelse return E_INVAL;
+    if (irq_num >= 24) return E_INVAL;
+    vm_obj.ioapic.assertIrq(@truncate(irq_num));
+    return 0; // E_OK
+}
+
+/// Syscall implementation: de-assert an IRQ line on the in-kernel IOAPIC.
+pub fn ioapicDeassertIrq(proc: *Process, irq_num: u64) i64 {
+    const E_INVAL: i64 = -1;
+
+    const vm_obj = proc.vm orelse return E_INVAL;
+    if (irq_num >= 24) return E_INVAL;
+    vm_obj.ioapic.deassertIrq(@truncate(irq_num));
+    return 0; // E_OK
+}
+
+/// Returns true if the MSR is security-critical and must always be intercepted.
+fn isSecurityCriticalMsr(msr: u32) bool {
+    return switch (msr) {
+        0xC0000080, // EFER
+        0xC0000081, // STAR
+        0xC0000082, // LSTAR
+        0xC0000083, // CSTAR
+        0xC0000084, // SFMASK
+        0x1B, // APIC_BASE
+        0xC0000102, // KERNEL_GS_BASE
+        0x174, // SYSENTER_CS
+        0x175, // SYSENTER_ESP
+        0x176, // SYSENTER_EIP
+        => true,
+        else => false,
+    };
 }
 
 /// Read a struct from userspace into a kernel buffer, handling cross-page boundaries.
