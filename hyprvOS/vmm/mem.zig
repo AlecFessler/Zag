@@ -48,6 +48,42 @@ pub fn setupGuestMemory(size: u64) void {
     log.print("\n");
 }
 
+/// Map MMIO stub pages at device addresses so the guest can probe them
+/// without causing NPT faults. Pages are filled with 0xFF (no device present).
+pub noinline fn mapMmioStubs() void {
+    // Common device MMIO ranges that Linux probes during boot:
+    // 0xFEC00000 - I/O APIC
+    // 0xFED00000 - HPET
+    // 0xFED80000 - Intel TPM/PTT
+    // 0xFEE00000 - Local APIC
+    // Note: Do NOT map Local APIC (0xFEE00000) or I/O APIC (0xFEC00000) —
+    // Linux reads specific registers from these and 0xFF responses cause
+    // incorrect behavior. Only map device stubs that Linux probes briefly.
+    const mmio_addrs = [_]u64{
+        0xFED00000, // HPET
+        0xFED80000, // Intel TPM / platform devices
+    };
+
+    for (mmio_addrs) |addr| {
+        // Allocate a host page and fill with 0xFF
+        const result = syscall.vm_reserve(0, PAGE_SIZE, 0x7);
+        if (result.val < 0) continue;
+        const host_addr = result.val2;
+
+        // Fill with 0x00 (safe default — no device capabilities)
+        const ptr: [*]u8 = @ptrFromInt(host_addr);
+        @memset(ptr[0..PAGE_SIZE], 0x00);
+
+        // Map into guest physical address space
+        const mr = syscall.guest_map(host_addr, addr, PAGE_SIZE, 0x7);
+        if (mr == syscall.E_OK) {
+            log.print("mem: MMIO stub at 0x");
+            log.hex64(addr);
+            log.print("\n");
+        }
+    }
+}
+
 /// Write data to guest physical memory via the host mapping.
 pub fn writeGuest(guest_phys: u64, data: []const u8) void {
     if (guest_phys + data.len > mapped_size) {

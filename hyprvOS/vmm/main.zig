@@ -4,6 +4,7 @@
 
 const lib = @import("lib");
 
+const acpi = @import("acpi.zig");
 const boot = @import("boot.zig");
 const cpuid = @import("cpuid.zig");
 const disk = @import("disk.zig");
@@ -55,6 +56,7 @@ const EXIT_MSR_R: u8 = 4;
 const EXIT_MSR_W: u8 = 5;
 const EXIT_EPT: u8 = 6;
 const EXIT_EXCEPT: u8 = 7;
+const EXIT_INTWIN: u8 = 8;
 const EXIT_HLT: u8 = 9;
 const EXIT_SHUTDOWN: u8 = 10;
 const EXIT_TRIPLE: u8 = 11;
@@ -87,7 +89,7 @@ var bp_buf: [4096]u8 align(8) = .{0} ** 4096;
 var guest_state: GuestState = .{};
 var exit_count: u64 = 0;
 var last_timer_ns: u64 = 0;
-const TIMER_INTERVAL_NS: u64 = 1_000_000; // 1ms = 1000 Hz
+const TIMER_INTERVAL_NS: u64 = 4_000_000; // 4ms = 250 Hz (matches Linux HZ=250)
 var cpuid_count: u64 = 0;
 var io_count: u64 = 0;
 var msr_r_count: u64 = 0;
@@ -95,6 +97,9 @@ var msr_w_count: u64 = 0;
 var cr_count: u64 = 0;
 var hlt_count: u64 = 0;
 var other_count: u64 = 0;
+var ept_count: u64 = 0;
+var intr_count: u64 = 0;
+var intwin_count: u64 = 0;
 
 pub fn main(pv: u64) void {
     log.print("\n=== hyprvOS ===\n");
@@ -117,7 +122,7 @@ pub fn main(pv: u64) void {
     _ = syscall.vcpu_set_state(vcpu, @intFromPtr(&guest_state));
     _ = syscall.vcpu_run(vcpu);
     log.print("vCPU running\n");
-    exitLoop();
+    exitLoop(vcpu);
 
     // Print exit stats
     log.print("\n=== ");
@@ -136,8 +141,18 @@ pub fn main(pv: u64) void {
     log.dec(hlt_count);
     log.print("/");
     log.dec(other_count);
-    log.print(") timer_inj=");
+    log.print(") intr=");
+    log.dec(intr_count);
+    log.print(" intwin=");
+    log.dec(intwin_count);
+    log.print(" timer_inj=");
     log.dec(timer_inject_count);
+    log.print(" proactive=");
+    log.dec(proactive_inject_count);
+    log.print(" IF1=");
+    log.dec(if_one_count);
+    log.print(" IF0=");
+    log.dec(if_zero_count);
     log.print(" ===\n");
     _ = syscall.vm_destroy();
     syscall.shutdown();
@@ -151,6 +166,7 @@ noinline fn bootLinux() void {
     };
 
     mem.setupGuestMemory(GUEST_RAM_LINUX);
+    mem.mapMmioStubs();
 
     // Load full bzImage to temp area, then split setup header + PM kernel
     log.print("Loading bzImage");
@@ -167,6 +183,17 @@ noinline fn bootLinux() void {
     }
     log.print(" done\n");
 
+    // Verify initramfs magic (gzip: 1f 8b)
+    const m0 = mem.readGuestByte(boot.INITRAMFS_ADDR);
+    const m1 = mem.readGuestByte(boot.INITRAMFS_ADDR + 1);
+    log.print("initramfs magic: ");
+    log.hex8(m0);
+    log.print(" ");
+    log.hex8(m1);
+    log.print(" size=");
+    log.dec(hdr.initramfs_size);
+    log.print("\n");
+
     // Parse setup header
     const ss = mem.readGuestByte(TEMP_ADDR + 0x1F1);
     const setup_sects: u32 = if (ss == 0) 4 else @as(u32, ss);
@@ -178,14 +205,28 @@ noinline fn bootLinux() void {
     // Copy PM kernel to 0x100000
     mem.copyGuest(boot.KERNEL_ADDR, TEMP_ADDR + setup_size, hdr.bzimage_size - setup_size);
 
+    // Log setup header protocol version and key fields
+    const proto_ver = @as(u16, mem.readGuestByte(TEMP_ADDR + 0x207)) << 8 | mem.readGuestByte(TEMP_ADDR + 0x206);
+    log.print("boot proto=0x");
+    log.hex16(proto_ver);
+    // init_size at offset 0x260
+    const init_size = @as(u32, mem.readGuestByte(TEMP_ADDR + 0x263)) << 24 |
+        @as(u32, mem.readGuestByte(TEMP_ADDR + 0x262)) << 16 |
+        @as(u32, mem.readGuestByte(TEMP_ADDR + 0x261)) << 8 |
+        mem.readGuestByte(TEMP_ADDR + 0x260);
+    log.print(" init_size=0x");
+    log.hex32(init_size);
+    // pref_address at offset 0x258
+    log.print("\n");
+
     // Build boot_params at 0x10000
     buildBootParams(hdr.initramfs_size);
 
     // Command line
-    boot.setupCmdline("console=ttyS0,115200 earlyprintk=serial,ttyS0,115200,keep nokaslr nolapic noapic acpi=off nohpet nosmp");
+    boot.setupCmdline("console=ttyS0,115200 earlyprintk=serial,ttyS0,115200,keep earlycon=uart,io,0x3f8,115200n8 nokaslr nolapic noapic acpi=off nohpet nosmp ignore_loglevel tsc=reliable lpj=5000000");
 
     // ACPI tables
-    boot.setupAcpiTables();
+    acpi.setupTables();
 
     // Guest state: 32-bit protected mode
     setupLinuxState();
@@ -219,8 +260,9 @@ noinline fn buildBootParams(initramfs_size: u64) void {
     @memset(&bp_buf, 0);
 
     // Copy setup header from bzImage in guest memory
-    const hdr_src = mem.readGuestSlice(TEMP_ADDR + 0x1F1, 0x268 - 0x1F1);
-    @memcpy(bp_buf[0x1F1..0x268], hdr_src);
+    // Extended to 0x290 to cover kernel_info_offset and potential newer fields
+    const hdr_src = mem.readGuestSlice(TEMP_ADDR + 0x1F1, 0x290 - 0x1F1);
+    @memcpy(bp_buf[0x1F1..0x290], hdr_src);
 
     bp_buf[0x210] = 0xFF; // type_of_loader
     // loadflags: LOADED_HIGH | KEEP_SEGMENTS | CAN_USE_HEAP
@@ -289,9 +331,9 @@ noinline fn setupLinuxState() void {
 }
 
 /// VM exit handling loop — separate noinline to isolate stack frame.
-noinline fn exitLoop() void {
+noinline fn exitLoop(vcpu_handle: u64) void {
     const start = syscall.clock_gettime();
-    const timeout_ns: u64 = 30_000_000_000; // 30 seconds
+    const timeout_ns: u64 = 60_000_000_000; // 60 seconds
 
     while (true) {
         const tok = syscall.vm_recv(@intFromPtr(&exit_buf), 0);
@@ -300,6 +342,10 @@ noinline fn exitLoop() void {
                 log.print("TIMEOUT\n");
                 break;
             }
+            // While guest is running without exits, proactively inject timer
+            // interrupts by using vcpu_interrupt syscall (IPIs the vCPU core,
+            // suspends guest, injects EVENTINJ, resumes).
+            proactiveTimerInject(vcpu_handle);
             syscall.thread_yield();
             continue;
         }
@@ -308,6 +354,8 @@ noinline fn exitLoop() void {
         exit_count += 1;
         const tag = exit_buf[OFF_TAG];
         const gs: *GuestState = @ptrCast(@alignCast(&exit_buf[OFF_GS]));
+
+        if (gs.rflags & (1 << 9) != 0) if_one_count += 1 else if_zero_count += 1;
 
         const kill = handleTag(tag, gs);
 
@@ -337,10 +385,13 @@ noinline fn handleTag(tag: u8, gs: *GuestState) bool {
     }
     if (tag == EXIT_IO) {
         io_count += 1;
-        const value = rdU32(&exit_buf, OFF_PAYLOAD);
-        const port = rdU16(&exit_buf, OFF_PAYLOAD + 4);
-        const size = exit_buf[OFF_PAYLOAD + 6];
-        const is_write = exit_buf[OFF_PAYLOAD + 7] != 0;
+        // IoExit layout (Zig struct, fields sorted by alignment):
+        // next_rip(u64) @ 0, value(u32) @ 8, port(u16) @ 12, size(u8) @ 14, is_write(bool) @ 15
+        const next_rip = rdU64(&exit_buf, OFF_PAYLOAD);
+        const value = rdU32(&exit_buf, OFF_PAYLOAD + 8);
+        const port = rdU16(&exit_buf, OFF_PAYLOAD + 12);
+        const size = exit_buf[OFF_PAYLOAD + 14];
+        const is_write = exit_buf[OFF_PAYLOAD + 15] != 0;
         if (is_write) {
             io.handleOut(port, size, value, gs);
         } else {
@@ -349,9 +400,9 @@ noinline fn handleTag(tag: u8, gs: *GuestState) bool {
             else if (size == 2) gs.rax = (gs.rax & ~@as(u64, 0xFFFF)) | @as(u64, v & 0xFFFF)
             else gs.rax = v;
         }
-        // Advance RIP by instruction length
-        const op = mem.readGuestByte(gs.rip);
-        gs.rip += if (op >= 0xEC and op <= 0xEF) @as(u64, 1) else @as(u64, 2);
+        // Advance RIP using next_rip from SVM EXITINFO2
+        // AMD APM Vol 2, Section 15.10.2: EXITINFO2 = next sequential RIP for IOIO exits
+        gs.rip = next_rip;
         return false;
     }
     if (tag == EXIT_MSR_R) {
@@ -387,9 +438,119 @@ noinline fn handleTag(tag: u8, gs: *GuestState) bool {
         gs.rip += 3;
         return false;
     }
+    if (tag == EXIT_INTWIN) {
+        // Guest just enabled IF — maybeInjectTimer (called after handleTag) will inject
+        intwin_count += 1;
+        return false;
+    }
     if (tag == EXIT_HLT) {
         hlt_count += 1;
-        if (hlt_count == 1 or (gs.rflags & (1 << 9) != 0 and hlt_count < 10)) {
+        if (hlt_count == 1) {
+            log.print("=== FIRST HLT ===\n");
+            log.print("RIP=0x");
+            log.hex64(gs.rip);
+            log.print(" RSP=0x");
+            log.hex64(gs.rsp);
+            log.print(" RFLAGS=0x");
+            log.hex64(gs.rflags);
+            log.print("\n");
+            log.print("CR0=0x");
+            log.hex64(gs.cr0);
+            log.print(" CR3=0x");
+            log.hex64(gs.cr3);
+            log.print(" CR4=0x");
+            log.hex64(gs.cr4);
+            log.print(" EFER=0x");
+            log.hex64(gs.efer);
+            log.print("\n");
+            log.print("RAX=0x");
+            log.hex64(gs.rax);
+            log.print(" RBX=0x");
+            log.hex64(gs.rbx);
+            log.print(" RCX=0x");
+            log.hex64(gs.rcx);
+            log.print(" RDX=0x");
+            log.hex64(gs.rdx);
+            log.print("\n");
+            log.print("RSI=0x");
+            log.hex64(gs.rsi);
+            log.print(" RDI=0x");
+            log.hex64(gs.rdi);
+            log.print(" RBP=0x");
+            log.hex64(gs.rbp);
+            log.print("\n");
+            log.print("CS: sel=0x");
+            log.hex16(gs.cs.selector);
+            log.print(" base=0x");
+            log.hex64(gs.cs.base);
+            log.print(" limit=0x");
+            log.hex32(gs.cs.limit);
+            log.print(" ar=0x");
+            log.hex16(gs.cs.access_rights);
+            log.print("\n");
+            log.print("SS: sel=0x");
+            log.hex16(gs.ss.selector);
+            log.print(" ar=0x");
+            log.hex16(gs.ss.access_rights);
+            log.print("\n");
+            // Try to read guest phys at RIP - kernel_base to see code bytes
+            // Standard kernel maps 0xFFFFFFFF81000000 → phys 0x1000000
+            const phys = gs.rip -% 0xFFFFFFFF80000000;
+            log.print("Phys of RIP=0x");
+            log.hex64(phys);
+            if (phys < 128 * 1024 * 1024) {
+                log.print(" bytes:");
+                // Dump 16 bytes at and around RIP
+                var bi: u64 = 0;
+                while (bi < 16) : (bi += 1) {
+                    log.print(" ");
+                    log.hex8(mem.readGuestByte(phys + bi));
+                }
+            }
+            log.print("\n");
+            // Try to read panic message or strings from various registers
+            // RSI often points to format string in panic()
+            dumpGuestString("RSI str", gs.rsi);
+            dumpGuestString("RDI str", gs.rdi);
+            // RBX might point to a struct or string
+            dumpGuestString("RBX str", gs.rbx);
+            // Stack[0] might be a return address — try to read string near it
+            const sp_phys = gs.rsp -% 0xFFFFFFFF80000000;
+            if (sp_phys < 128 * 1024 * 1024) {
+                log.print("Stack (8 qwords):");
+                var si: u64 = 0;
+                while (si < 64) : (si += 8) {
+                    log.print(" 0x");
+                    const b0: u64 = mem.readGuestByte(sp_phys + si);
+                    const b1: u64 = mem.readGuestByte(sp_phys + si + 1);
+                    const b2: u64 = mem.readGuestByte(sp_phys + si + 2);
+                    const b3: u64 = mem.readGuestByte(sp_phys + si + 3);
+                    const b4: u64 = mem.readGuestByte(sp_phys + si + 4);
+                    const b5: u64 = mem.readGuestByte(sp_phys + si + 5);
+                    const b6: u64 = mem.readGuestByte(sp_phys + si + 6);
+                    const b7: u64 = mem.readGuestByte(sp_phys + si + 7);
+                    log.hex64(b7 << 56 | b6 << 48 | b5 << 40 | b4 << 32 | b3 << 24 | b2 << 16 | b1 << 8 | b0);
+                }
+                log.print("\n");
+                // Try stack[0] as a return address — read string near it
+                const ret0_b0: u64 = mem.readGuestByte(sp_phys);
+                const ret0_b1: u64 = mem.readGuestByte(sp_phys + 1);
+                const ret0_b2: u64 = mem.readGuestByte(sp_phys + 2);
+                const ret0_b3: u64 = mem.readGuestByte(sp_phys + 3);
+                const ret0_b4: u64 = mem.readGuestByte(sp_phys + 4);
+                const ret0_b5: u64 = mem.readGuestByte(sp_phys + 5);
+                const ret0_b6: u64 = mem.readGuestByte(sp_phys + 6);
+                const ret0_b7: u64 = mem.readGuestByte(sp_phys + 7);
+                const ret0 = ret0_b7 << 56 | ret0_b6 << 48 | ret0_b5 << 40 | ret0_b4 << 32 | ret0_b3 << 24 | ret0_b2 << 16 | ret0_b1 << 8 | ret0_b0;
+                dumpGuestString("ret[0] str", ret0);
+            }
+            // Also scan stack for string pointers (addresses in 0xFFFFFFFF83D4XXXX range look like rodata)
+            // Stack values 0xFFFFFFFF83D4C0CE etc look like string pointers
+            dumpGuestString("StrA", 0xFFFFFFFF83D4C0CE);
+            dumpGuestString("StrB", 0xFFFFFFFF83D4C0C1);
+            dumpGuestString("StrC", 0xFFFFFFFF83D4C0DA);
+            dumpGuestString("StrD", 0xFFFFFFFF83CBC7DF);
+        } else if (hlt_count <= 3) {
             log.print("HLT #");
             log.dec(hlt_count);
             log.print(" RIP=0x");
@@ -416,12 +577,18 @@ noinline fn handleTag(tag: u8, gs: *GuestState) bool {
         return true;
     }
     if (tag == EXIT_EPT) {
-        log.print("EPT@0x");
-        log.hex64(rdU64(&exit_buf, OFF_PAYLOAD));
-        log.print(" RIP=0x");
-        log.hex64(gs.rip);
-        log.print("\n");
-        return true;
+        const ept_addr = rdU64(&exit_buf, OFF_PAYLOAD);
+        ept_count += 1;
+        if (ept_count <= 3) {
+            log.print("EPT@0x");
+            log.hex64(ept_addr);
+            log.print(" RIP=0x");
+            log.hex64(gs.rip);
+            log.print("\n");
+        }
+        // Kill after many EPT violations — indicates a real problem
+        if (ept_count > 100) return true;
+        return false;
     }
     if (tag == EXIT_EXCEPT) {
         log.print("#");
@@ -433,7 +600,10 @@ noinline fn handleTag(tag: u8, gs: *GuestState) bool {
     }
     if (tag == EXIT_UNKNOWN) {
         const code = rdU64(&exit_buf, OFF_PAYLOAD);
-        if (code == 0x060 or code == 0x061) return false; // INTR/NMI
+        if (code == 0x060 or code == 0x061) {
+            intr_count += 1;
+            return false;
+        }
         log.print("UNK 0x");
         log.hex64(code);
         log.print("\n");
@@ -446,6 +616,8 @@ noinline fn handleTag(tag: u8, gs: *GuestState) bool {
 }
 
 var timer_inject_count: u64 = 0;
+var if_one_count: u64 = 0;
+var if_zero_count: u64 = 0;
 
 /// Inject a timer interrupt (IRQ0) if enough time has passed and the guest
 /// has interrupts enabled (RFLAGS.IF=1). Uses the PIC's configured vector
@@ -469,6 +641,48 @@ noinline fn maybeInjectTimer(gs: *GuestState) void {
     timer_inject_count += 1;
 }
 
+/// GuestInterrupt — must match kernel's extern struct exactly.
+const GuestInterrupt = extern struct {
+    vector: u8,
+    interrupt_type: u8,
+    error_code_valid: bool,
+    _pad: [5]u8 = .{0} ** 5,
+    error_code: u32 = 0,
+};
+
+var proactive_inject_count: u64 = 0;
+var proactive_timer_intr: GuestInterrupt = .{
+    .vector = 0x20,
+    .interrupt_type = 0,
+    .error_code_valid = false,
+};
+
+/// Proactively inject a timer interrupt into a running guest via
+/// the vcpu_interrupt syscall. This is needed when the guest is in a
+/// computation loop without VM exits (e.g., xor benchmark, calibrate_delay).
+noinline fn proactiveTimerInject(vcpu_handle: u64) void {
+    // Don't inject until the PIC has been initialized by Linux
+    // (default vector base is 0x08, Linux remaps to 0x20)
+    if (io.pic1_vector_base == 0x08) return;
+
+    // Don't inject until we've seen the guest enable interrupts (IF=1).
+    // Before that, injections are wasted (IF=0 → processor ignores them)
+    // and the IPI-based suspend/resume disrupts the guest.
+    if (if_one_count == 0) return;
+
+    const now = syscall.clock_gettime();
+    if (now -% last_timer_ns < TIMER_INTERVAL_NS) return;
+    last_timer_ns = now;
+
+    proactive_timer_intr.vector = io.pic1_vector_base;
+
+    const r = syscall.vcpu_interrupt(vcpu_handle, @intFromPtr(&proactive_timer_intr));
+    if (r == syscall.E_OK) {
+        proactive_inject_count += 1;
+        timer_inject_count += 1;
+    }
+}
+
 fn findVcpuHandle(pv: u64) u64 {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
     const self: u64 = @bitCast(syscall.thread_self());
@@ -477,6 +691,28 @@ fn findVcpuHandle(pv: u64) u64 {
             return view[i].handle;
     }
     return 0;
+}
+
+noinline fn dumpGuestString(label: []const u8, vaddr: u64) void {
+    // Convert kernel virtual to physical (standard mapping)
+    const phys = vaddr -% 0xFFFFFFFF80000000;
+    if (phys >= 128 * 1024 * 1024) return;
+    log.print(label);
+    log.print("(0x");
+    log.hex64(vaddr);
+    log.print("): \"");
+    var i: u64 = 0;
+    while (i < 80) : (i += 1) {
+        const b = mem.readGuestByte(phys + i);
+        if (b == 0) break;
+        if (b >= 0x20 and b < 0x7F) {
+            const ch: [1]u8 = .{b};
+            log.print(&ch);
+        } else {
+            log.print(".");
+        }
+    }
+    log.print("\"\n");
 }
 
 fn writeGpr(s: *GuestState, gpr: u4, val: u64) void {

@@ -133,6 +133,7 @@ const CTRL1_INTERCEPT_INTR: u32 = 1 << 0;
 const CTRL1_INTERCEPT_NMI: u32 = 1 << 1;
 const CTRL1_INTERCEPT_SMI: u32 = 1 << 2;
 const CTRL1_INTERCEPT_INIT: u32 = 1 << 3;
+const CTRL1_INTERCEPT_VINTR: u32 = 1 << 4; // AMD APM Vol 2, Table B-1: virtual interrupt
 const CTRL1_INTERCEPT_CPUID: u32 = 1 << 18;
 const CTRL1_INTERCEPT_HLT: u32 = 1 << 24;
 const CTRL1_INTERCEPT_IOIO: u32 = 1 << 27;
@@ -306,6 +307,7 @@ pub fn allocVmStructures() ?PAddr {
     // Also intercept CPUID (required by KVM for nested operation) and
     // MSR (since MSRPM is all-1s, MSR accesses will intercept anyway).
     const ctrl1: u32 = CTRL1_INTERCEPT_INTR | CTRL1_INTERCEPT_NMI |
+        CTRL1_INTERCEPT_VINTR |
         CTRL1_INTERCEPT_HLT | CTRL1_INTERCEPT_SHUTDOWN |
         CTRL1_INTERCEPT_CPUID | CTRL1_INTERCEPT_MSR |
         CTRL1_INTERCEPT_IOIO;
@@ -348,6 +350,8 @@ pub fn allocVmStructures() ?PAddr {
     // Enable virtual interrupt masking so that the guest's EFLAGS.IF only
     // affects virtual (guest) interrupts, not physical (host) interrupts.
     // AMD APM Vol 2, Section 15.21.1: bit 24 of V_INTR (offset 0x060).
+    // V_INTR_MASKING: use virtual IF from VMCB instead of RFLAGS.IF.
+    // V_IRQ is NOT set initially — it gets armed in vmResume when needed.
     writeVmcb64(vmcb, Vmcb.V_INTR, @as(u64, 1) << 24);
 
     // Enable nested paging.
@@ -452,11 +456,26 @@ pub fn vmResume(guest_state: *GuestState, vmcb_phys: PAddr, guest_fxsave: *align
     // AMD APM Vol 2, Section 15.15.3.
     writeVmcb32(vmcb, Vmcb.VMCB_CLEAN, 0);
 
-    // Write pending event injection if any.
+    // Event injection and virtual interrupt management.
     // AMD APM Vol 2, Section 15.20: EVENTINJ at offset 0x0A8.
+    // Section 15.21.1: V_IRQ/V_INTR for interrupt window notification.
     if (guest_state.pending_eventinj != 0) {
-        writeVmcb64(vmcb, Vmcb.EVENTINJ, guest_state.pending_eventinj);
-        guest_state.pending_eventinj = 0;
+        // Check if the pending event is an external interrupt (type bits 10:8 == 0)
+        const event_type = (guest_state.pending_eventinj >> 8) & 0x7;
+        const guest_if = guest_state.rflags & (1 << 9);
+        if (event_type == 0 and guest_if == 0) {
+            // External interrupt but guest has IF=0 — can't deliver now.
+            // Arm V_IRQ to get VMEXIT_VINTR when guest enables IF.
+            // Keep pending_eventinj for later delivery.
+            writeVmcb64(vmcb, Vmcb.V_INTR, (@as(u64, 1) << 24) | (@as(u64, 1) << 8) | (@as(u64, 1) << 16) | (@as(u64, 0xF) << 12));
+        } else {
+            // Can deliver: either IF=1 or non-external-interrupt event
+            writeVmcb64(vmcb, Vmcb.EVENTINJ, guest_state.pending_eventinj);
+            guest_state.pending_eventinj = 0;
+            writeVmcb64(vmcb, Vmcb.V_INTR, @as(u64, 1) << 24);
+        }
+    } else {
+        writeVmcb64(vmcb, Vmcb.V_INTR, @as(u64, 1) << 24);
     }
 
     // No debug output in hot path — serial prints are too slow and cause
@@ -944,6 +963,7 @@ fn decodeExitReason(vmcb: [*]const u8, guest_state: *const GuestState) VmExitInf
             .size = size,
             .is_write = is_write,
             .value = @truncate(guest_state.rax),
+            .next_rip = exitinfo2, // AMD APM Vol 2, Section 15.10.2: EXITINFO2 = next sequential RIP
         } };
     }
 
@@ -1002,6 +1022,12 @@ fn decodeExitReason(vmcb: [*]const u8, guest_state: *const GuestState) VmExitInf
 
     if (exitcode == VMEXIT_INTR) {
         return .{ .unknown = VMEXIT_INTR };
+    }
+
+    // VMEXIT_VINTR: guest became interruptible (IF went from 0 to 1).
+    // Report as interrupt_window so VMM can inject pending interrupts.
+    if (exitcode == VMEXIT_VINTR) {
+        return .{ .interrupt_window = {} };
     }
 
     // AMD APM Vol 2, Section 15.9: NMI intercept (#VMEXIT code 0x061).

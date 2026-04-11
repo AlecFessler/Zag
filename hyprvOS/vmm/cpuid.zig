@@ -2,11 +2,34 @@
 /// Returns minimal but valid responses for all leaves Linux queries during
 /// early boot. Presents as AuthenticAMD with long mode, NX, SSE2, etc.
 
+const log = @import("log.zig");
+
 const GuestState = @import("main.zig").GuestState;
+
+// Track unique CPUID leaves seen (up to 64)
+var seen_leaves: [64]u32 = .{0} ** 64;
+var seen_count: usize = 0;
+
+fn logIfNew(leaf: u32, subleaf: u32) void {
+    // Check if we've already seen this leaf
+    for (seen_leaves[0..seen_count]) |s| {
+        if (s == leaf) return;
+    }
+    if (seen_count < seen_leaves.len) {
+        seen_leaves[seen_count] = leaf;
+        seen_count += 1;
+    }
+    log.print("CPUID leaf=0x");
+    log.hex32(leaf);
+    log.print(" sub=0x");
+    log.hex32(subleaf);
+    log.print("\n");
+}
 
 pub fn handle(state: *GuestState) void {
     const leaf: u32 = @truncate(state.rax);
     const subleaf: u32 = @truncate(state.rcx);
+    logIfNew(leaf, subleaf);
 
     switch (leaf) {
         // Basic CPUID: max leaf + "AuthenticAMD"
@@ -23,8 +46,13 @@ pub fn handle(state: *GuestState) void {
             // 1 logical processor, CLFLUSH 8 QWORDs, initial APIC ID 0
             state.rbx = 0x00010800;
             // ECX features: SSE3, PCLMUL, SSSE3, FMA, CX16, SSE4.1, SSE4.2,
-            // x2APIC, MOVBE, POPCNT, AES, XSAVE, OSXSAVE, AVX, F16C, RDRAND
-            state.rcx = 0x7ED8320B;
+            // x2APIC, MOVBE, POPCNT, AES, XSAVE, AVX, F16C, RDRAND
+            // NOTE: OSXSAVE (bit 27) is dynamic — reflects CR4.OSXSAVE state
+            var ecx: u32 = 0x76D8320B; // Same as before but OSXSAVE cleared
+            if (state.cr4 & (1 << 18) != 0) {
+                ecx |= (1 << 27); // Set OSXSAVE if guest has CR4.OSXSAVE=1
+            }
+            state.rcx = ecx;
             // EDX features: FPU, VME, DE, PSE, TSC, MSR, PAE, MCE, CX8, APIC,
             // SEP, MTRR, PGE, MCA, CMOV, PAT, PSE36, CLFSH, MMX, FXSR, SSE, SSE2
             state.rdx = 0x178BFBFF;
@@ -78,17 +106,27 @@ pub fn handle(state: *GuestState) void {
                 state.rdx = 0;
             }
         },
-        // XSAVE features
+        // XSAVE features (CPUID leaf 0xD)
+        // XCR0 = 0x7: bit 0 = x87, bit 1 = SSE, bit 2 = AVX
+        // XSAVE area layout: [0..511] = legacy (x87+SSE via FXSAVE), [512..575] = XSAVE header, [576..831] = AVX (YMM)
+        // Total = 832 bytes = 0x340
         0x0000000D => {
             if (subleaf == 0) {
-                state.rax = 0x7; // XCR0: x87 + SSE + AVX
-                state.rbx = 0x340; // current XSAVE area size
+                state.rax = 0x7; // XCR0 low: x87 + SSE + AVX
+                state.rbx = 0x340; // current XSAVE area size (832 bytes)
                 state.rcx = 0x340; // max XSAVE area size
-                state.rdx = 0;
+                state.rdx = 0; // XCR0 high
             } else if (subleaf == 1) {
-                state.rax = 0; // XSAVE features
-                state.rbx = 0;
-                state.rcx = 0;
+                // XSAVE extended features (XSAVEOPT, XSAVEC, XGETBV_ECX1, XSAVES)
+                state.rax = 0x1; // XSAVEOPT supported
+                state.rbx = 0; // size of XSAVE area used by all enabled features
+                state.rcx = 0; // supported XSS bits low
+                state.rdx = 0; // supported XSS bits high
+            } else if (subleaf == 2) {
+                // AVX state component (YMM high 128 bits for each of 16 regs)
+                state.rax = 256; // size of AVX state = 256 bytes
+                state.rbx = 576; // offset in XSAVE area = 576 (after legacy + header)
+                state.rcx = 0; // flags: not in XSS, not compacted-aligned
                 state.rdx = 0;
             } else {
                 state.rax = 0;

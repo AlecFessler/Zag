@@ -191,11 +191,12 @@ pub fn main(pv: u64) void {
     }
 
     // Parse VmExitMessage: verify I/O exit on port 0x80.
-    // VmExitInfo tag at offset 32, IoExit port at offset 12.
+    // VmExitInfo tag at offset 32, IoExit layout (sorted by alignment):
+    //   next_rip(u64) @ 0, value(u32) @ 8, port(u16) @ 12, size(u8) @ 14, is_write(bool) @ 15
     const EXIT_INFO_TAG_OFFSET = 8 + 24;
     const EXIT_TAG_IO = 1;
-    const IO_PORT_OFFSET = 8 + 4;
-    const IO_VALUE_OFFSET = 8;
+    const IO_PORT_OFFSET = 8 + 12;
+    const IO_VALUE_OFFSET = 8 + 8;
 
     const exit_tag = buf[EXIT_INFO_TAG_OFFSET];
     if (exit_tag != EXIT_TAG_IO) {

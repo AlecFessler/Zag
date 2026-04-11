@@ -146,13 +146,14 @@ pub fn main(pv: u64) void {
     //   0=cpuid, 1=io, 2=mmio, 3=cr_access, ...
     //
     // IoExit layout within payload (Zig auto-layout, sorted by decreasing alignment):
-    //   offset +0: value (u32, 4 bytes)
-    //   offset +4: port (u16, 2 bytes)
-    //   offset +6: size (u8, 1 byte)
-    //   offset +7: is_write (bool, 1 byte)
+    //   offset +0: next_rip (u64, 8 bytes)
+    //   offset +8: value (u32, 4 bytes)
+    //   offset +12: port (u16, 2 bytes)
+    //   offset +14: size (u8, 1 byte)
+    //   offset +15: is_write (bool, 1 byte)
     const EXIT_INFO_TAG_OFFSET = 8 + 24; // offset 32 in buffer
     const EXIT_TAG_IO = 1;
-    const IO_PORT_OFFSET = 8 + 4; // payload start + 4 (port is after value u32)
+    const IO_PORT_OFFSET = 8 + 12; // payload start + 12 (port is after next_rip u64 + value u32)
 
     const exit_tag = buf[EXIT_INFO_TAG_OFFSET];
     if (exit_tag != EXIT_TAG_IO) {

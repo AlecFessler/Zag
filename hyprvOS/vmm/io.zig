@@ -2,10 +2,13 @@
 /// Stubs for PIC, PIT, PS/2, CMOS, PCI, VGA, etc.
 /// These are needed because Linux probes many legacy devices during boot.
 
+const lib = @import("lib");
+
 const log = @import("log.zig");
 const serial = @import("serial.zig");
 
 const GuestState = @import("main.zig").GuestState;
+const syscall = lib.syscall;
 
 // PIC
 const PIC1_CMD: u16 = 0x20;
@@ -36,7 +39,7 @@ const PCI_CONFIG_DATA: u16 = 0xCFC;
 
 // Shadow state
 var cmos_index: u8 = 0;
-var pic1_mask: u8 = 0xFF;
+pub var pic1_mask: u8 = 0xFF;
 var pic2_mask: u8 = 0xFF;
 
 // PIC initialization tracking
@@ -44,10 +47,194 @@ var pic2_mask: u8 = 0xFF;
 const PicPhase = enum { ready, icw2, icw3, icw4 };
 var pic1_phase: PicPhase = .ready;
 var pic2_phase: PicPhase = .ready;
+var pci_config_addr: u32 = 0;
 pub var pic1_vector_base: u8 = 0x08; // Default: IRQ0 → INT 8
 pub var pic2_vector_base: u8 = 0x70; // Default: IRQ8 → INT 0x70
 
+// PIT (8254) emulation state
+// PIT frequency: 1,193,182 Hz ≈ 838.1 ns per tick
+const PIT_FREQ_HZ: u64 = 1193182;
+const PIT_NS_PER_TICK: u64 = 838; // ~838.1 ns
+
+// Channel 0 state
+var pit_ch0_reload: u16 = 0; // reload value (0 = 65536)
+var pit_ch0_start_ns: u64 = 0; // host timestamp when counter started
+var pit_ch0_latched: bool = false; // latch command pending
+var pit_ch0_latch_val: u16 = 0; // latched count value
+var pit_ch0_read_hi: bool = false; // next read is high byte (for lobyte/hibyte access)
+var pit_ch0_write_hi: bool = false; // next write is high byte
+var pit_ch0_mode: u8 = 0; // operating mode
+var pit_ch0_access: u8 = 3; // access mode: 3 = lobyte/hibyte
+
+// Channel 2 state (speaker/gate, used for calibration too)
+var pit_ch2_reload: u16 = 0;
+var pit_ch2_start_ns: u64 = 0;
+var pit_ch2_latched: bool = false;
+var pit_ch2_latch_val: u16 = 0;
+var pit_ch2_read_hi: bool = false;
+var pit_ch2_write_hi: bool = false;
+var pit_ch2_mode: u8 = 0;
+var pit_ch2_access: u8 = 3;
+var pit_ch2_gate: bool = false; // gate input (controlled via port 0x61 bit 0), default LOW on reset
+var port61_val: u8 = 0; // shadow of last value written to port 0x61
+
+noinline fn pitGetCount(reload: u16, start_ns: u64) u16 {
+    const now = syscall.clock_gettime();
+    const elapsed_ns = now -% start_ns;
+    const reload_val: u64 = if (reload == 0) 65536 else @as(u64, reload);
+    // How many ticks elapsed
+    const ticks = elapsed_ns / PIT_NS_PER_TICK;
+    // Current count = reload - (ticks mod reload)
+    const phase = ticks % reload_val;
+    const count = reload_val - phase;
+    return @truncate(if (count == reload_val) reload_val else count);
+}
+
+noinline fn handlePitCommand(value: u8) void {
+    const channel: u2 = @truncate((value >> 6) & 0x3);
+    const access: u2 = @truncate((value >> 4) & 0x3);
+    const mode: u3 = @truncate((value >> 1) & 0x7);
+
+    if (access == 0) {
+        // Latch command
+        if (channel == 0) {
+            pit_ch0_latch_val = pitGetCount(pit_ch0_reload, pit_ch0_start_ns);
+            pit_ch0_latched = true;
+            pit_ch0_read_hi = false;
+        } else if (channel == 2) {
+            pit_ch2_latch_val = pitGetCount(pit_ch2_reload, pit_ch2_start_ns);
+            pit_ch2_latched = true;
+            pit_ch2_read_hi = false;
+        }
+        return;
+    }
+
+    // Mode/access command
+    if (channel == 0) {
+        pit_ch0_access = access;
+        pit_ch0_mode = mode;
+        pit_ch0_write_hi = false;
+        pit_ch0_read_hi = false;
+    } else if (channel == 2) {
+        pit_ch2_access = access;
+        pit_ch2_mode = mode;
+        pit_ch2_write_hi = false;
+        pit_ch2_read_hi = false;
+    }
+}
+
+noinline fn handlePitWrite(channel: u2, value: u8) void {
+    if (channel == 0) {
+        if (pit_ch0_access == 3) {
+            // lobyte/hibyte
+            if (!pit_ch0_write_hi) {
+                pit_ch0_reload = (pit_ch0_reload & 0xFF00) | @as(u16, value);
+                pit_ch0_write_hi = true;
+            } else {
+                pit_ch0_reload = (pit_ch0_reload & 0x00FF) | (@as(u16, value) << 8);
+                pit_ch0_write_hi = false;
+                pit_ch0_start_ns = syscall.clock_gettime();
+            }
+        } else if (pit_ch0_access == 1) {
+            // lobyte only
+            pit_ch0_reload = value;
+            pit_ch0_start_ns = syscall.clock_gettime();
+        } else if (pit_ch0_access == 2) {
+            // hibyte only
+            pit_ch0_reload = @as(u16, value) << 8;
+            pit_ch0_start_ns = syscall.clock_gettime();
+        }
+    } else if (channel == 2) {
+        if (pit_ch2_access == 3) {
+            if (!pit_ch2_write_hi) {
+                pit_ch2_reload = (pit_ch2_reload & 0xFF00) | @as(u16, value);
+                pit_ch2_write_hi = true;
+            } else {
+                pit_ch2_reload = (pit_ch2_reload & 0x00FF) | (@as(u16, value) << 8);
+                pit_ch2_write_hi = false;
+                pit_ch2_start_ns = syscall.clock_gettime();
+            }
+        } else if (pit_ch2_access == 1) {
+            pit_ch2_reload = value;
+            pit_ch2_start_ns = syscall.clock_gettime();
+        } else if (pit_ch2_access == 2) {
+            pit_ch2_reload = @as(u16, value) << 8;
+            pit_ch2_start_ns = syscall.clock_gettime();
+        }
+    }
+}
+
+noinline fn handlePitRead(channel: u2) u32 {
+    if (channel == 0) {
+        var val: u16 = undefined;
+        if (pit_ch0_latched) {
+            val = pit_ch0_latch_val;
+        } else {
+            val = pitGetCount(pit_ch0_reload, pit_ch0_start_ns);
+        }
+        if (pit_ch0_access == 3) {
+            if (!pit_ch0_read_hi) {
+                pit_ch0_read_hi = true;
+                return val & 0xFF;
+            } else {
+                pit_ch0_read_hi = false;
+                if (pit_ch0_latched) pit_ch0_latched = false;
+                return (val >> 8) & 0xFF;
+            }
+        } else if (pit_ch0_access == 1) {
+            if (pit_ch0_latched) pit_ch0_latched = false;
+            return val & 0xFF;
+        } else {
+            if (pit_ch0_latched) pit_ch0_latched = false;
+            return (val >> 8) & 0xFF;
+        }
+    } else if (channel == 2) {
+        var val: u16 = undefined;
+        if (pit_ch2_latched) {
+            val = pit_ch2_latch_val;
+        } else {
+            val = pitGetCount(pit_ch2_reload, pit_ch2_start_ns);
+        }
+        if (pit_ch2_access == 3) {
+            if (!pit_ch2_read_hi) {
+                pit_ch2_read_hi = true;
+                return val & 0xFF;
+            } else {
+                pit_ch2_read_hi = false;
+                if (pit_ch2_latched) pit_ch2_latched = false;
+                return (val >> 8) & 0xFF;
+            }
+        } else if (pit_ch2_access == 1) {
+            if (pit_ch2_latched) pit_ch2_latched = false;
+            return val & 0xFF;
+        } else {
+            if (pit_ch2_latched) pit_ch2_latched = false;
+            return (val >> 8) & 0xFF;
+        }
+    }
+    return 0;
+}
+
+// Track unique IO ports seen
+var seen_io_ports: [64]u16 = .{0xFFFF} ** 64;
+var seen_io_count: usize = 0;
+
+fn logPortIfNew(port: u16, is_write: bool) void {
+    for (seen_io_ports[0..seen_io_count]) |s| {
+        if (s == port) return;
+    }
+    if (seen_io_count < seen_io_ports.len) {
+        seen_io_ports[seen_io_count] = port;
+        seen_io_count += 1;
+    }
+    if (is_write) log.print("IO_W ") else log.print("IO_R ");
+    log.print("port=0x");
+    log.hex16(port);
+    log.print("\n");
+}
+
 pub fn handleOut(port: u16, size: u8, value: u32, state: *GuestState) void {
+    logPortIfNew(port, true);
     _ = state;
     _ = size;
 
@@ -86,27 +273,38 @@ pub fn handleOut(port: u16, size: u8, value: u32, state: *GuestState) void {
                 .ready => { pic2_mask = v; },
             }
         },
-        PIT_CH0, PIT_CH1, PIT_CH2, PIT_CMD => {},
+        PIT_CMD => handlePitCommand(@truncate(value)),
+        PIT_CH0 => handlePitWrite(0, @truncate(value)),
+        PIT_CH2 => handlePitWrite(2, @truncate(value)),
+        PIT_CH1 => {}, // Channel 1 not used
         PS2_DATA, PS2_STATUS => {},
         CMOS_ADDR => cmos_index = @truncate(value & 0x7F),
         CMOS_DATA => {},
-        POST_PORT => {
-            // POST code — useful for debugging boot progress
-            log.print("POST: 0x");
-            log.hex8(@truncate(value));
-            log.print("\n");
-        },
+        POST_PORT => {}, // POST codes — silently ignore
         // VGA registers
         0x3C0...0x3DA => {},
         // PCI config
-        PCI_CONFIG_ADDR => {},
+        PCI_CONFIG_ADDR => {
+            pci_config_addr = value;
+        },
         PCI_CONFIG_DATA...PCI_CONFIG_DATA + 3 => {},
         // DMA controller
         0x00...0x0F => {},
         0xC0...0xDF => {},
         0x81...0x8F => {}, // DMA page registers (0x80 handled as POST_PORT above)
         // Port 0x61: NMI status / speaker
-        0x61 => {},
+        // Bit 0: Gate for PIT channel 2
+        // Bit 1: Speaker data enable
+        0x61 => {
+            const v: u8 = @truncate(value);
+            const old_gate = pit_ch2_gate;
+            pit_ch2_gate = (v & 1) != 0;
+            port61_val = v;
+            if (pit_ch2_gate and !old_gate) {
+                // Rising edge on gate restarts the counter
+                pit_ch2_start_ns = syscall.clock_gettime();
+            }
+        },
         // ELCR (edge/level control)
         0x4D0, 0x4D1 => {},
         else => {},
@@ -114,6 +312,7 @@ pub fn handleOut(port: u16, size: u8, value: u32, state: *GuestState) void {
 }
 
 pub fn handleIn(port: u16, size: u8, state: *GuestState) u32 {
+    logPortIfNew(port, false);
     _ = state;
     _ = size;
 
@@ -126,14 +325,43 @@ pub fn handleIn(port: u16, size: u8, state: *GuestState) u32 {
         PIC1_DATA => pic1_mask,
         PIC2_CMD => 0x00,
         PIC2_DATA => pic2_mask,
-        PIT_CH0, PIT_CH1, PIT_CH2 => 0x00,
+        PIT_CH0 => handlePitRead(0),
+        PIT_CH2 => handlePitRead(2),
+        PIT_CH1 => 0x00,
         PS2_STATUS => 0x00, // No PS/2 data
         PS2_DATA => 0x00,
         CMOS_DATA => handleCmosRead(cmos_index),
-        PCI_CONFIG_ADDR => 0x00,
+        PCI_CONFIG_ADDR...PCI_CONFIG_ADDR + 3 => 0x00, // PCI config address readback
         PCI_CONFIG_DATA...PCI_CONFIG_DATA + 3 => 0xFFFFFFFF, // No PCI devices
-        // Port 0x61
-        0x61 => 0x20, // Timer 2 output high
+        // Port 0x61: NMI status / speaker control readback
+        // Bit 0: Timer 2 gate status
+        // Bit 5: Timer 2 output status
+        0x61 => blk: {
+            var v: u32 = @as(u32, port61_val) & 0x03; // Return gate bits as written
+            // Timer 2 output (bit 5) depends on PIT mode
+            if (pit_ch2_reload > 0 and pit_ch2_gate) {
+                if (pit_ch2_mode == 0) {
+                    // Mode 0 (interrupt on terminal count): output starts LOW,
+                    // goes HIGH when count reaches 0.
+                    const now = syscall.clock_gettime();
+                    const elapsed_ns = now -% pit_ch2_start_ns;
+                    const reload_u64: u64 = if (pit_ch2_reload == 0) 65536 else @as(u64, pit_ch2_reload);
+                    const total_ns = reload_u64 * PIT_NS_PER_TICK;
+                    if (elapsed_ns >= total_ns) {
+                        v |= 0x20; // Output HIGH after terminal count
+                    }
+                } else if (pit_ch2_mode == 3 or pit_ch2_mode == 2) {
+                    // Mode 3 (square wave): output toggles at half the reload value
+                    // Mode 2 (rate generator): output is LOW for one tick, HIGH otherwise
+                    const count = pitGetCount(pit_ch2_reload, pit_ch2_start_ns);
+                    if (count > pit_ch2_reload / 2) v |= 0x20;
+                } else {
+                    // Other modes: report output high (safe default)
+                    v |= 0x20;
+                }
+            }
+            break :blk v;
+        },
         // VGA
         0x3C0...0x3DA => 0x00,
         // ELCR

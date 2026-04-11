@@ -129,6 +129,7 @@ pub const VmExitInfo = union(enum) {
         size: u8,
         is_write: bool,
         value: u32,
+        next_rip: u64,
     };
 
     pub const MmioExit = struct {

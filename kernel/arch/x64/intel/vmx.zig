@@ -1023,11 +1023,13 @@ fn decodeExitReason(guest_state: *const GuestState) VmExitInfo {
             };
             const is_in = (qualification & (1 << 3)) != 0;
             const port: u16 = @truncate((qualification >> 16) & 0xFFFF);
+            const instr_len = vmcsRead(VM_EXIT_INSTRUCTION_LEN);
             return .{ .io = .{
                 .port = port,
                 .size = size,
                 .is_write = !is_in,
                 .value = @truncate(guest_state.rax),
+                .next_rip = guest_state.rip + instr_len,
             } };
         },
         EXIT_REASON_CR_ACCESS => {

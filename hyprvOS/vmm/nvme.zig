@@ -46,6 +46,8 @@ const ADMIN_OPC_IDENTIFY: u8 = 0x06;
 const ADMIN_OPC_SET_FEATURES: u8 = 0x09;
 
 // ── NVM I/O Command Opcodes (NVM Command Set Spec) ────────────────
+const IO_OPC_FLUSH: u8 = 0x00;
+const IO_OPC_WRITE: u8 = 0x01;
 const IO_OPC_READ: u8 = 0x02;
 
 // ── Submission Queue Entry (Spec Section 4.1.1, Figure 92) ────────
@@ -539,6 +541,54 @@ pub const Controller = struct {
             return false;
         }
         return true;
+    }
+
+    // ── Write Sectors (NVM Command Set Spec, Section 6.3) ─────────
+    //
+    // "The Write command is used to write data and metadata, if
+    //  applicable, to the NVM controller for the specified logical
+    //  blocks."
+    //
+    pub fn writeSectors(self: *Controller, nsid: u32, lba: u64, count: u16) bool {
+        var sqe = SubmissionQueueEntry{};
+        sqe.cdw0 = buildCdw0(IO_OPC_WRITE, self.nextCid());
+        sqe.nsid = nsid;
+        const buf_phys = self.dma_phys + DMA_DATA;
+        sqe.prp1_lo = @truncate(buf_phys);
+        sqe.prp1_hi = @truncate(buf_phys >> 32);
+        sqe.cdw10 = @truncate(lba); // Starting LBA low
+        sqe.cdw11 = @truncate(lba >> 32); // Starting LBA high
+        sqe.cdw12 = count - 1; // NLB (0's based)
+
+        self.submitIo(sqe);
+        const status = self.pollIoCompletion();
+        if (status != 0) {
+            syscall.write("nvme: write failed status=");
+            writeU32(status);
+            syscall.write("\n");
+            return false;
+        }
+        return true;
+    }
+
+    // ── Flush (NVM Command Set Spec, Section 6.2) ────────────────
+    //
+    // "The Flush command shall commit data and metadata associated
+    //  with the specified namespace(s) to nonvolatile media."
+    //
+    pub fn flush(self: *Controller, nsid: u32) bool {
+        var sqe = SubmissionQueueEntry{};
+        sqe.cdw0 = buildCdw0(IO_OPC_FLUSH, self.nextCid());
+        sqe.nsid = nsid;
+
+        self.submitIo(sqe);
+        const status = self.pollIoCompletion();
+        return status == 0;
+    }
+
+    /// Get a mutable pointer to the DMA data buffer for writing sectors.
+    pub fn dataBufferMut(ctrl: *const Controller) [*]u8 {
+        return @ptrFromInt(ctrl.dma_virt + DMA_DATA);
     }
 
     // ── Doorbell Calculation (Spec Section 3.1.3, Figure 33-34) ───
