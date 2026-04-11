@@ -14,6 +14,10 @@ pub fn main(_: u64) void {
         t.pass("§4.53.1");
         syscall.shutdown();
     }
+    const evt = syscall.pickSupportedEvent(info) orelse {
+        t.pass("§4.53.1");
+        syscall.shutdown();
+    };
 
     const child_rights = perms.ProcessRights{
         .spawn_thread = true,
@@ -38,7 +42,7 @@ pub fn main(_: u64) void {
     const target = fm.thread_handle;
 
     var cfg = syscall.PmuCounterConfig{
-        .event = .instructions,
+        .event = evt,
         .has_threshold = true,
         .overflow_threshold = 2048,
     };

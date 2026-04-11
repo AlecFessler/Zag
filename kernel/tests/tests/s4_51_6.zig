@@ -12,8 +12,12 @@ pub fn main(_: u64) void {
     }
 
     const self_thread: u64 = @bitCast(syscall.thread_self());
+    // Use a supported event when available so this test exercises the
+    // `count > num_counters` check rather than falling through a
+    // supported-event check.
+    const evt: syscall.PmuEvent = syscall.pickSupportedEvent(info) orelse .cycles;
     var cfgs: [syscall.PMU_MAX_COUNTERS + 1]syscall.PmuCounterConfig = undefined;
-    for (&cfgs) |*c| c.* = .{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
+    for (&cfgs) |*c| c.* = .{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
 
     const excess: u64 = @as(u64, info.num_counters) + 1;
     const rc = syscall.pmu_start(self_thread, @intFromPtr(&cfgs), excess);

@@ -14,6 +14,10 @@ pub fn main(_: u64) void {
         t.pass("§2.14.13");
         syscall.shutdown();
     }
+    const evt = syscall.pickSupportedEvent(info) orelse {
+        t.pass("§2.14.13");
+        syscall.shutdown();
+    };
 
     const child_rights = perms.ProcessRights{
         .spawn_thread = true,
@@ -47,9 +51,9 @@ pub fn main(_: u64) void {
         syscall.shutdown();
     }
 
-    // Step 2: pmu_reset with a new threshold.
+    // Step 2: pmu_reset with a new threshold using a supported event.
     var cfg = syscall.PmuCounterConfig{
-        .event = .instructions,
+        .event = evt,
         .has_threshold = true,
         .overflow_threshold = 2048,
     };

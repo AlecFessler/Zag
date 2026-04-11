@@ -18,9 +18,13 @@ pub fn main(_: u64) void {
         t.pass("§4.54.5");
         syscall.shutdown();
     }
+    const evt = syscall.pickSupportedEvent(info) orelse {
+        t.pass("§4.54.5");
+        syscall.shutdown();
+    };
 
     // Case 2: start then stop then stop again.
-    var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
+    var cfg = syscall.PmuCounterConfig{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
     _ = syscall.pmu_start(self_thread, @intFromPtr(&cfg), 1);
     _ = syscall.pmu_stop(self_thread);
     const rc_twice = syscall.pmu_stop(self_thread);

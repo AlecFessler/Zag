@@ -18,12 +18,16 @@ pub fn main(_: u64) void {
         t.pass("§4.52.5");
         syscall.shutdown();
     }
+    const evt = syscall.pickSupportedEvent(info) orelse {
+        t.pass("§4.52.5");
+        syscall.shutdown();
+    };
 
     const h = syscall.thread_create(&spinLoop, 0, 4);
     const worker_h: u64 = @bitCast(h);
     while (@atomicLoad(u64, &worker_ready, .seq_cst) == 0) syscall.thread_yield();
 
-    var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
+    var cfg = syscall.PmuCounterConfig{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
     _ = syscall.pmu_start(worker_h, @intFromPtr(&cfg), 1);
 
     var sample: syscall.PmuSample = undefined;

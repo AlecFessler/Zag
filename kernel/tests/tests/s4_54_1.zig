@@ -25,6 +25,10 @@ pub fn main(_: u64) void {
         t.pass("§4.54.1");
         syscall.shutdown();
     }
+    const evt = syscall.pickSupportedEvent(info) orelse {
+        t.pass("§4.54.1");
+        syscall.shutdown();
+    };
 
     const h = syscall.thread_create(&worker, 0, 4);
     if (h <= 0) {
@@ -34,7 +38,7 @@ pub fn main(_: u64) void {
     const worker_h: u64 = @bitCast(h);
     while (@atomicLoad(u64, &worker_ready, .seq_cst) == 0) syscall.thread_yield();
 
-    var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
+    var cfg = syscall.PmuCounterConfig{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
     if (syscall.pmu_start(worker_h, @intFromPtr(&cfg), 1) != syscall.E_OK) {
         t.fail("§4.54.1 pmu_start");
         @atomicStore(u64, &worker_stop, 1, .seq_cst);

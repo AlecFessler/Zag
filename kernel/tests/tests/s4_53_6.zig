@@ -7,6 +7,15 @@ const t = lib.testing;
 
 /// §4.53.6 — `pmu_reset` on a thread with no PMU state returns `E_INVAL`.
 pub fn main(_: u64) void {
+    // Use a supported event for the bogus reset so we precisely exercise
+    // the "no PMU state" check rather than a supported-event rejection.
+    // On rigs with no counters we can still exercise the path because
+    // `no PMU state` does not depend on counter hardware; fall back to
+    // .cycles there.
+    var info: syscall.PmuInfo = undefined;
+    _ = syscall.pmu_info(@intFromPtr(&info));
+    const evt: syscall.PmuEvent = syscall.pickSupportedEvent(info) orelse .cycles;
+
     // Spawn a child that cap-transfers fault_handler and then int3s.
     // The child never calls pmu_start, so its thread has no PMU state.
     const child_rights = perms.ProcessRights{ .fault_handler = true };
@@ -27,7 +36,7 @@ pub fn main(_: u64) void {
     const fm: *const syscall.FaultMessage = @ptrCast(@alignCast(&fault_buf));
     const target = fm.thread_handle;
 
-    var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
+    var cfg = syscall.PmuCounterConfig{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
     const rc = syscall.pmu_reset(target, @intFromPtr(&cfg), 1);
     t.expectEqual("§4.53.6", syscall.E_INVAL, rc);
 
