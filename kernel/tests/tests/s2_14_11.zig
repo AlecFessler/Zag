@@ -21,7 +21,7 @@ fn spinLoop() void {
 }
 
 fn runningBusySubtest(info: syscall.PmuInfo) void {
-    _ = info;
+    const evt = syscall.pickSupportedEvent(info) orelse return;
     const worker = syscall.thread_create(&spinLoop, 0, 4);
     if (worker <= 0) {
         t.failWithVal("§2.14.11 thread_create", 1, worker);
@@ -32,7 +32,7 @@ fn runningBusySubtest(info: syscall.PmuInfo) void {
     // Race-free running signal.
     while (@atomicLoad(u64, &worker_ready, .seq_cst) == 0) syscall.thread_yield();
 
-    var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
+    var cfg = syscall.PmuCounterConfig{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
     if (syscall.pmu_start(worker_h, @intFromPtr(&cfg), 1) != syscall.E_OK) {
         t.fail("§2.14.11 pmu_start");
         @atomicStore(u64, &worker_stop, 1, .seq_cst);
