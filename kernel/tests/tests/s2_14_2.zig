@@ -32,12 +32,19 @@ pub fn main(_: u64) void {
     const reset_rc: i64 = @bitCast(reply.words[2]);
     const stop_rc: i64 = @bitCast(reply.words[3]);
 
-    if (start_rc != syscall.E_PERM or read_rc != syscall.E_PERM or
-        reset_rc != syscall.E_PERM or stop_rc != syscall.E_PERM)
-    {
+    if (start_rc != syscall.E_PERM) {
         t.failWithVal("§2.14.2 pmu_start", syscall.E_PERM, start_rc);
+        syscall.shutdown();
+    }
+    if (read_rc != syscall.E_PERM) {
         t.failWithVal("§2.14.2 pmu_read", syscall.E_PERM, read_rc);
+        syscall.shutdown();
+    }
+    if (reset_rc != syscall.E_PERM) {
         t.failWithVal("§2.14.2 pmu_reset", syscall.E_PERM, reset_rc);
+        syscall.shutdown();
+    }
+    if (stop_rc != syscall.E_PERM) {
         t.failWithVal("§2.14.2 pmu_stop", syscall.E_PERM, stop_rc);
         syscall.shutdown();
     }
