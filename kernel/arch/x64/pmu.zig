@@ -456,6 +456,19 @@ fn pmuPmiHandler(ctx: *cpu.Context) void {
     const thread = sched.currentThread() orelse return;
     const state_ptr = thread.pmu_state orelse return;
 
+    // Step 3a: stale-PMI filter. A counter can overflow on thread T just
+    // before pmuSave clears IA32_PERF_GLOBAL_CTRL; the LAPIC PMI pending
+    // bit is set but the interrupt is masked and doesn't fire until the
+    // core has context-switched to T'. If T' also has pmu_state, we'd
+    // mis-attribute the overflow to T'. Require at least one overflow bit
+    // to fall within the current thread's configured counter range — if
+    // none do, treat this as stale, leave counters disabled, return.
+    if (state_ptr.num_counters == 0) return;
+    const nbits: u6 = @intCast(state_ptr.num_counters);
+    // Counters occupy bits [0..nbits) of IA32_PERF_GLOBAL_STATUS.
+    const owned_mask: u64 = (@as(u64, 1) << nbits) - 1;
+    if ((status & owned_mask) == 0) return;
+
     // Step 4: snapshot the overflowed counter values into `state.values`
     // — same as `pmuSave`.
     var i: u8 = 0;
