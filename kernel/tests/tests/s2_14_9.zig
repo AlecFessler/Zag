@@ -28,7 +28,7 @@ pub fn main(_: u64) void {
         }
         const worker_h: u64 = @bitCast(h);
 
-        var cfg = syscall.PmuCounterConfig{ .event = @intFromEnum(syscall.PmuEvent.cycles) };
+        var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
         const start_rc = syscall.pmu_start(worker_h, @intFromPtr(&cfg), 1);
         // Might race with the worker exiting — accept either E_OK or
         // E_BADHANDLE (thread already exited). Either way the kernel

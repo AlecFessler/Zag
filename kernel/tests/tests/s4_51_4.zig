@@ -5,7 +5,7 @@ const t = lib.testing;
 
 /// §4.51.4 — `pmu_start` with invalid or wrong-type `thread_handle` returns `E_BADHANDLE`.
 pub fn main(_: u64) void {
-    var cfg = syscall.PmuCounterConfig{ .event = @intFromEnum(syscall.PmuEvent.cycles) };
+    var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
 
     // Bogus handle ID — never allocated.
     const rc_bad = syscall.pmu_start(0xdead_beef, @intFromPtr(&cfg), 1);

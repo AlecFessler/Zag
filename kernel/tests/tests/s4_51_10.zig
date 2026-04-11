@@ -24,7 +24,7 @@ pub fn main(_: u64) void {
         syscall.shutdown();
     }
 
-    var cfg = syscall.PmuCounterConfig{ .event = @intFromEnum(syscall.PmuEvent.cycles) };
+    var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
     var i: u64 = 0;
     while (i < 48) : (i += 1) {
         const h = syscall.thread_create(&parkWorker, 0, 4);

@@ -24,7 +24,7 @@ pub fn main(_: u64) void {
         syscall.shutdown();
     }
 
-    var cfg = syscall.PmuCounterConfig{ .event = @intFromEnum(syscall.PmuEvent.cycles) };
+    var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
     const start_rc = syscall.pmu_start(self_thread, @intFromPtr(&cfg), 1);
     if (start_rc != syscall.E_OK) {
         t.failWithVal("§2.14.5 pmu_start", syscall.E_OK, start_rc);

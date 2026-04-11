@@ -22,7 +22,7 @@ pub fn main(_: u64) void {
     const worker_h: u64 = @bitCast(h);
     while (@atomicLoad(u64, &worker_ready, .seq_cst) == 0) syscall.thread_yield();
 
-    var cfg = syscall.PmuCounterConfig{ .event = @intFromEnum(syscall.PmuEvent.cycles) };
+    var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
     _ = syscall.pmu_start(worker_h, @intFromPtr(&cfg), 1);
     for (0..100) |_| syscall.thread_yield();
     _ = syscall.thread_suspend(worker_h);

@@ -27,7 +27,7 @@ pub fn main(_: u64) void {
     const fm: *const syscall.FaultMessage = @ptrCast(@alignCast(&fault_buf));
     const target = fm.thread_handle;
 
-    var cfg = syscall.PmuCounterConfig{ .event = @intFromEnum(syscall.PmuEvent.cycles) };
+    var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
     const rc = syscall.pmu_reset(target, @intFromPtr(&cfg), 1);
     t.expectEqual("§4.53.6", syscall.E_INVAL, rc);
 

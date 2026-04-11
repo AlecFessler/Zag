@@ -48,7 +48,9 @@ pub fn main(_: u64) void {
 
     // Start PMU counting instructions on thread A only.
     var cfg = syscall.PmuCounterConfig{
-        .event = @intFromEnum(syscall.PmuEvent.instructions),
+        .event = .instructions,
+        .has_threshold = false,
+        .overflow_threshold = 0,
     };
     if (syscall.pmu_start(a_h, @intFromPtr(&cfg), 1) != syscall.E_OK) {
         t.fail("§2.14.10 pmu_start A");

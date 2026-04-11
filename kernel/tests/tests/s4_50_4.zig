@@ -9,7 +9,7 @@ pub fn main(_: u64) void {
     // Pre-poison to detect failure to write.
     info.num_counters = 0xff;
     info.supported_events = 0xffff_ffff_ffff_ffff;
-    info.overflow_support = 0xff;
+    info.overflow_support = true;
 
     const rc = syscall.pmu_info(@intFromPtr(&info));
     if (rc != syscall.E_OK) {
@@ -21,7 +21,7 @@ pub fn main(_: u64) void {
     // other fields be zero as well. On hardware with counters, this test
     // degrades to a smoke check and just verifies the syscall succeeded.
     if (info.num_counters == 0) {
-        if (info.supported_events != 0 or info.overflow_support != 0) {
+        if (info.supported_events != 0 or info.overflow_support) {
             t.fail("§4.50.4 no-counter fields not zero");
             syscall.shutdown();
         }

@@ -9,7 +9,7 @@ const t = lib.testing;
 pub fn main(_: u64) void {
     var info: syscall.PmuInfo = undefined;
     if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or
-        info.num_counters == 0 or info.overflow_support == 0)
+        info.num_counters == 0 or !info.overflow_support)
     {
         t.pass("§3.11");
         syscall.shutdown();

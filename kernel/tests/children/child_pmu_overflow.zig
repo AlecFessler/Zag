@@ -31,7 +31,8 @@ pub fn main(_: u64) void {
     // within a handful of retired instructions.
     const self_thread: u64 = @bitCast(syscall.thread_self());
     var cfg = syscall.PmuCounterConfig{
-        .event = @intFromEnum(syscall.PmuEvent.instructions),
+        .event = .instructions,
+        .has_threshold = true,
         .overflow_threshold = 1024,
     };
     _ = syscall.pmu_start(self_thread, @intFromPtr(&cfg), 1);

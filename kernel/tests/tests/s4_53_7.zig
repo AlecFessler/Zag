@@ -9,7 +9,7 @@ const t = lib.testing;
 pub fn main(_: u64) void {
     var info: syscall.PmuInfo = undefined;
     if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or
-        info.num_counters == 0 or info.overflow_support == 0)
+        info.num_counters == 0 or !info.overflow_support)
     {
         t.pass("§4.53.7");
         syscall.shutdown();
@@ -38,7 +38,7 @@ pub fn main(_: u64) void {
     const target = fm.thread_handle;
 
     // count == 0 is invalid (mirrors §4.51.5).
-    var cfg = syscall.PmuCounterConfig{ .event = @intFromEnum(syscall.PmuEvent.cycles) };
+    var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
     const rc_zero = syscall.pmu_reset(target, @intFromPtr(&cfg), 0);
     if (rc_zero != syscall.E_INVAL) {
         t.failWithVal("§4.53.7 count=0", syscall.E_INVAL, rc_zero);
@@ -47,7 +47,7 @@ pub fn main(_: u64) void {
     }
 
     // Unsupported event (mirrors §4.51.7).
-    var cfg_bad = syscall.PmuCounterConfig{ .event = 0xffff_ffff };
+    var cfg_bad = syscall.PmuCounterConfig{ .event = @enumFromInt(99), .has_threshold = false, .overflow_threshold = 0 };
     const rc_event = syscall.pmu_reset(target, @intFromPtr(&cfg_bad), 1);
     if (rc_event != syscall.E_INVAL) {
         t.failWithVal("§4.53.7 bad event", syscall.E_INVAL, rc_event);

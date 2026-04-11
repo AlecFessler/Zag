@@ -10,7 +10,7 @@ pub fn main(_: u64) void {
         t.pass("§4.51.8");
         syscall.shutdown();
     }
-    if (info.overflow_support != 0) {
+    if (info.overflow_support) {
         // Hardware supports overflow — this error path is unreachable on
         // this test rig. The assertion is still spec-tagged for coverage.
         t.pass("§4.51.8");
@@ -19,7 +19,8 @@ pub fn main(_: u64) void {
 
     const self_thread: u64 = @bitCast(syscall.thread_self());
     var cfg = syscall.PmuCounterConfig{
-        .event = @intFromEnum(syscall.PmuEvent.cycles),
+        .event = .cycles,
+        .has_threshold = true,
         .overflow_threshold = 1_000_000,
     };
     const rc = syscall.pmu_start(self_thread, @intFromPtr(&cfg), 1);

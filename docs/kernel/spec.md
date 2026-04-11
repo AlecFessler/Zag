@@ -525,6 +525,8 @@ PmuCounterConfig (extern struct) {
 }
 ```
 
+The concrete userspace ABI encodes the optional `overflow_threshold` as an explicit `has_threshold: bool` discriminator alongside a plain `overflow_threshold: u64`, since `?u64` is not FFI-safe in an `extern struct`. `has_threshold == false` denotes precise counting (the `overflow_threshold` field is ignored); `has_threshold == true` denotes sample-based profiling at the given threshold. The struct is 24 bytes: an 8-byte `event` slot (one byte of `PmuEvent` plus padding), an 8-byte `has_threshold` slot (one byte of `bool` plus padding), and the 8-byte `overflow_threshold`.
+
 `PmuInfo` describes the hardware's capabilities; userspace queries this before configuring counters.
 
 ```

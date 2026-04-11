@@ -13,7 +13,7 @@ pub fn main(_: u64) void {
 
     const self_thread: u64 = @bitCast(syscall.thread_self());
     var cfgs: [syscall.PMU_MAX_COUNTERS + 1]syscall.PmuCounterConfig = undefined;
-    for (&cfgs) |*c| c.* = .{ .event = @intFromEnum(syscall.PmuEvent.cycles) };
+    for (&cfgs) |*c| c.* = .{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
 
     const excess: u64 = @as(u64, info.num_counters) + 1;
     const rc = syscall.pmu_start(self_thread, @intFromPtr(&cfgs), excess);

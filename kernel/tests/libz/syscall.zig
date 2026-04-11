@@ -535,7 +535,7 @@ pub fn vm_ioapic_deassert_irq(irq_num: u64) i64 {
 
 pub const PMU_MAX_COUNTERS: usize = 8;
 
-pub const PmuEvent = enum(u32) {
+pub const PmuEvent = enum(u8) {
     cycles = 0,
     instructions = 1,
     cache_references = 2,
@@ -548,28 +548,28 @@ pub const PmuEvent = enum(u32) {
     _,
 };
 
-/// Configures one PMU counter. `overflow_threshold == 0` means precise counting
-/// (no overflow fault); a non-zero threshold selects sample-based profiling.
-/// Layout follows the observable contract in spec §2.14 — `event` first,
-/// `overflow_threshold` second. Impls may choose a concrete ABI for the
-/// spec's `?u64` overflow_threshold; tests here use the sentinel-zero form.
+/// Configures one PMU counter. `has_threshold == false` means precise counting
+/// (no overflow fault); `has_threshold == true` selects sample-based profiling
+/// at `overflow_threshold` events. Matches the kernel's canonical 24-byte
+/// extern layout (see kernel/sched/pmu.zig).
 pub const PmuCounterConfig = extern struct {
-    event: u32,
-    _pad0: u32 = 0,
-    overflow_threshold: u64 = 0,
+    event: PmuEvent,
+    _pad: [7]u8 = .{0} ** 7,
+    has_threshold: bool,
+    _pad2: [7]u8 = .{0} ** 7,
+    overflow_threshold: u64,
 };
 
 pub const PmuInfo = extern struct {
     num_counters: u8,
-    _pad0: [7]u8,
+    overflow_support: bool,
+    _pad: [6]u8 = .{0} ** 6,
     supported_events: u64,
-    overflow_support: u8,
-    _pad1: [7]u8,
 };
 
 pub const PmuSample = extern struct {
-    counters: [PMU_MAX_COUNTERS]u64,
-    timestamp: u64,
+    counters: [PMU_MAX_COUNTERS]u64 = .{0} ** PMU_MAX_COUNTERS,
+    timestamp: u64 = 0,
 };
 
 pub const FAULT_REASON_PMU_OVERFLOW: u8 = 15;

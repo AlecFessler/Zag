@@ -15,7 +15,7 @@ pub fn main(_: u64) void {
     // very-out-of-range numeric event id as a fallback when the kernel
     // reports every known event as supported.
     const self_thread: u64 = @bitCast(syscall.thread_self());
-    var cfg = syscall.PmuCounterConfig{ .event = 0xffff_ffff };
+    var cfg = syscall.PmuCounterConfig{ .event = @enumFromInt(99), .has_threshold = false, .overflow_threshold = 0 };
     const rc = syscall.pmu_start(self_thread, @intFromPtr(&cfg), 1);
     t.expectEqual("§4.51.7", syscall.E_INVAL, rc);
     syscall.shutdown();

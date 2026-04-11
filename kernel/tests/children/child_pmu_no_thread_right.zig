@@ -12,7 +12,7 @@ pub fn main(_: u64) void {
 
     const self_thread: u64 = @bitCast(syscall.thread_self());
 
-    var cfg = syscall.PmuCounterConfig{ .event = @intFromEnum(syscall.PmuEvent.cycles) };
+    var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
     const start_rc = syscall.pmu_start(self_thread, @intFromPtr(&cfg), 1);
 
     var sample: syscall.PmuSample = undefined;

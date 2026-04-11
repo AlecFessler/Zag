@@ -9,7 +9,7 @@ const t = lib.testing;
 pub fn main(_: u64) void {
     var info: syscall.PmuInfo = undefined;
     if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or
-        info.num_counters == 0 or info.overflow_support == 0)
+        info.num_counters == 0 or !info.overflow_support)
     {
         t.pass("§4.53.1");
         syscall.shutdown();
@@ -38,7 +38,8 @@ pub fn main(_: u64) void {
     const target = fm.thread_handle;
 
     var cfg = syscall.PmuCounterConfig{
-        .event = @intFromEnum(syscall.PmuEvent.instructions),
+        .event = .instructions,
+        .has_threshold = true,
         .overflow_threshold = 2048,
     };
     const rc = syscall.pmu_reset(target, @intFromPtr(&cfg), 1);
