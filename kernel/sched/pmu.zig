@@ -137,6 +137,22 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     target_proc.lock.lock();
     defer target_proc.lock.unlock();
 
+    // Self vs. remote programming. Writing MSRs on the caller's core only
+    // makes sense if the caller *is* the target — otherwise we'd trash the
+    // caller's own PMU state and do nothing to the target's actual core.
+    // For a remote target we stamp `state` from the caller's core, so the
+    // target must not be actively scheduled on another core at the same
+    // time — otherwise `pmuConfigureState` here races `pmuSave`/`pmuRestore`
+    // there. Require the target to be observable (.faulted or .suspended);
+    // return E_BUSY otherwise (§4.51.11).
+    const is_self = target_thread == scheduler.currentThread();
+    if (!is_self) {
+        switch (target_thread.state) {
+            .faulted, .suspended => {},
+            else => return E_BUSY,
+        }
+    }
+
     // Allocate PMU state lazily on first start (§2.14.8).
     if (target_thread.pmu_state == null) {
         const new_state = allocator.create(arch.PmuState) catch return E_NOMEM;
@@ -145,13 +161,7 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     }
     const state = target_thread.pmu_state.?;
 
-    // Self vs. remote programming. Writing MSRs on the caller's core only
-    // makes sense if the caller *is* the target — otherwise we'd trash the
-    // caller's own PMU state and do nothing to the target's actual core.
-    // For remote targets the spec restricts pmu_start/reset to
-    // .faulted/.suspended (§2.14.11), so the target is not running; the
-    // next pmuRestore (when it's scheduled) picks up the stamped configs.
-    if (target_thread == scheduler.currentThread()) {
+    if (is_self) {
         arch.pmuStart(state, slice) catch return E_INVAL;
     } else {
         arch.pmuConfigureState(state, slice);
@@ -228,12 +238,26 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
     target_proc.lock.lock();
     defer target_proc.lock.unlock();
 
-    const state = target_thread.pmu_state orelse return E_INVAL; // §4.54.5
-
     // Self vs. remote: only touch hardware on the caller's core if the
     // caller IS the target. Otherwise, the target isn't running here —
-    // pmuStop would write MSRs on the wrong core. Just drop state.
-    if (target_thread == scheduler.currentThread()) {
+    // pmuStop would write MSRs on the wrong core. For a remote target we
+    // take the pmuClearState path, which drops state without any MSR
+    // writes; but if the target is still running on its own core it will
+    // keep that core's IA32_PERFEVTSELx programmed with the old config
+    // until the next context switch, and `pmuSave` on that core would
+    // race our state mutation here. Require the target to be observable
+    // (.faulted or .suspended); return E_BUSY otherwise (§4.54.7).
+    const is_self = target_thread == scheduler.currentThread();
+    if (!is_self) {
+        switch (target_thread.state) {
+            .faulted, .suspended => {},
+            else => return E_BUSY,
+        }
+    }
+
+    const state = target_thread.pmu_state orelse return E_INVAL; // §4.54.5
+
+    if (is_self) {
         arch.pmuStop(state);
     } else {
         arch.pmuClearState(state);

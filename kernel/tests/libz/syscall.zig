@@ -594,6 +594,19 @@ pub fn pmu_stop(thread_handle: u64) i64 {
     return syscall1(.pmu_stop, thread_handle);
 }
 
+/// Returns the lowest-indexed event variant whose bit is set in
+/// `info.supported_events`, or null if no defined variants are supported on
+/// this hardware. Test helpers call this and skip the positive path when it
+/// returns null, so the same binary passes on both counter-capable hardware
+/// and stubbed/no-PMU rigs (see §2.14 and §4.50–§4.54).
+pub fn pickSupportedEvent(info: PmuInfo) ?PmuEvent {
+    inline for (@typeInfo(PmuEvent).@"enum".fields) |f| {
+        const bit = @as(u64, 1) << f.value;
+        if ((info.supported_events & bit) != 0) return @enumFromInt(f.value);
+    }
+    return null;
+}
+
 pub const FAULT_KILL: u64 = 0;
 pub const FAULT_RESUME: u64 = 1;
 pub const FAULT_RESUME_MODIFIED: u64 = 2;

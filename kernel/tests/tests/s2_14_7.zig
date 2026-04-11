@@ -21,6 +21,10 @@ pub fn main(_: u64) void {
         t.pass("§2.14.7");
         syscall.shutdown();
     }
+    const evt = syscall.pickSupportedEvent(info) orelse {
+        t.pass("§2.14.7");
+        syscall.shutdown();
+    };
 
     const worker = syscall.thread_create(&workerLoop, 0, 4);
     if (worker <= 0) {
@@ -31,7 +35,7 @@ pub fn main(_: u64) void {
 
     while (@atomicLoad(u64, &worker_ready, .seq_cst) == 0) syscall.thread_yield();
 
-    var cfg = syscall.PmuCounterConfig{ .event = .cycles, .has_threshold = false, .overflow_threshold = 0 };
+    var cfg = syscall.PmuCounterConfig{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
     if (syscall.pmu_start(worker_h, @intFromPtr(&cfg), 1) != syscall.E_OK) {
         t.fail("§2.14.7 pmu_start");
         syscall.shutdown();

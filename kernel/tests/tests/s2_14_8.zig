@@ -11,6 +11,14 @@ fn helperLoop() void {
 }
 
 /// §2.14.8 — PMU state on a thread is created lazily.
+///
+/// Note: this test verifies the observable consequences of lazy allocation
+/// (pmu_read / pmu_stop on a never-started thread return E_INVAL), not the
+/// allocation itself — the allocation side-effect is not directly observable
+/// from userspace without kernel instrumentation. After the never-started
+/// probes, we then call pmu_start on the same thread to confirm the thread
+/// is still in a usable post-E_INVAL state, which provides indirect evidence
+/// that no bookkeeping was leaked by the lazy-path failure.
 pub fn main(_: u64) void {
     // Spawn a helper thread that NEVER calls pmu_start. Any pmu_read or
     // pmu_stop on it must report "no PMU state" (E_INVAL) — proof that

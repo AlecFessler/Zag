@@ -3,6 +3,11 @@ const syscall = @import("syscall.zig");
 
 const hex_chars = "0123456789abcdef";
 
+/// Canonical "obviously-bogus" handle value for negative-path tests that need
+/// a never-allocated handle id. All-ones is chosen because the kernel handle
+/// table cannot plausibly produce this id and it's visually distinct in dumps.
+pub const BOGUS_HANDLE: u64 = ~@as(u64, 0);
+
 // --- Device lookup helpers ---
 //
 // The test rig runs under QEMU q35 with a fixed set of PCI devices that the
