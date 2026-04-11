@@ -13,10 +13,8 @@
 /// reading guest physical memory through the kernel physmap.
 const zag = @import("zag");
 
-const PAddr = zag.memory.address.PAddr;
-const VAddr = zag.memory.address.VAddr;
-
 const GuestState = zag.arch.dispatch.GuestState;
+const Vm = zag.kvm.vm.Vm;
 
 /// Result of decoding an MMIO instruction.
 pub const MmioOp = struct {
@@ -33,45 +31,45 @@ pub const MmioOp = struct {
 /// Translate guest virtual address to guest physical using CR3 4-level paging.
 /// AMD APM Vol 2, Section 5.3: Long-Mode Page Translation.
 /// Reads guest physical memory via the kernel physmap.
-fn guestVirtToPhys(cr3: u64, vaddr: u64) ?u64 {
+fn guestVirtToPhys(vm: *const Vm, cr3: u64, vaddr: u64) ?u64 {
     const pml4_base = cr3 & 0x000F_FFFF_FFFF_F000;
     const pml4_idx = (vaddr >> 39) & 0x1FF;
-    const pml4e = readGuestPhysU64(pml4_base + pml4_idx * 8) orelse return null;
+    const pml4e = readGuestPhysU64(vm, pml4_base + pml4_idx * 8) orelse return null;
     if (pml4e & 1 == 0) return null;
 
     const pdpt_base = pml4e & 0x000F_FFFF_FFFF_F000;
     const pdpt_idx = (vaddr >> 30) & 0x1FF;
-    const pdpte = readGuestPhysU64(pdpt_base + pdpt_idx * 8) orelse return null;
+    const pdpte = readGuestPhysU64(vm, pdpt_base + pdpt_idx * 8) orelse return null;
     if (pdpte & 1 == 0) return null;
     if (pdpte & 0x80 != 0) // 1 GB page (PS bit)
         return (pdpte & 0x000F_FFFF_C000_0000) | (vaddr & 0x3FFF_FFFF);
 
     const pd_base = pdpte & 0x000F_FFFF_FFFF_F000;
     const pd_idx = (vaddr >> 21) & 0x1FF;
-    const pde = readGuestPhysU64(pd_base + pd_idx * 8) orelse return null;
+    const pde = readGuestPhysU64(vm, pd_base + pd_idx * 8) orelse return null;
     if (pde & 1 == 0) return null;
     if (pde & 0x80 != 0) // 2 MB page (PS bit)
         return (pde & 0x000F_FFFF_FFE0_0000) | (vaddr & 0x1F_FFFF);
 
     const pt_base = pde & 0x000F_FFFF_FFFF_F000;
     const pt_idx = (vaddr >> 12) & 0x1FF;
-    const pte = readGuestPhysU64(pt_base + pt_idx * 8) orelse return null;
+    const pte = readGuestPhysU64(vm, pt_base + pt_idx * 8) orelse return null;
     if (pte & 1 == 0) return null;
 
     return (pte & 0x000F_FFFF_FFFF_F000) | (vaddr & 0xFFF);
 }
 
-/// Read a u64 from guest physical memory via the kernel physmap.
-fn readGuestPhysU64(phys: u64) ?u64 {
-    const host_vaddr = VAddr.fromPAddr(PAddr.fromInt(phys), null).addr;
-    const ptr: *const align(1) u64 = @ptrFromInt(host_vaddr);
+/// Read a u64 from guest physical memory via the VM's host RAM mapping.
+fn readGuestPhysU64(vm: *const Vm, phys: u64) ?u64 {
+    if (phys + 8 > vm.guest_ram_size) return null;
+    const ptr: *const align(1) u64 = @ptrFromInt(vm.guest_ram_host_base + phys);
     return ptr.*;
 }
 
-/// Read a slice from guest physical memory via the kernel physmap.
-fn readGuestPhysSlice(phys: u64, len: u8) []const u8 {
-    const host_vaddr = VAddr.fromPAddr(PAddr.fromInt(phys), null).addr;
-    const ptr: [*]const u8 = @ptrFromInt(host_vaddr);
+/// Read a slice from guest physical memory via the VM's host RAM mapping.
+fn readGuestPhysSlice(vm: *const Vm, phys: u64, len: u8) ?[]const u8 {
+    if (phys + len > vm.guest_ram_size) return null;
+    const ptr: [*]const u8 = @ptrFromInt(vm.guest_ram_host_base + phys);
     return ptr[0..len];
 }
 
@@ -79,20 +77,21 @@ fn readGuestPhysSlice(phys: u64, len: u8) []const u8 {
 
 /// Fetch up to 15 instruction bytes from guest virtual address.
 /// Returns number of bytes actually fetched, or null on translation failure.
-fn fetchInsn(cr3: u64, rip: u64, buf: *[15]u8) ?u8 {
-    const phys = guestVirtToPhys(cr3, rip) orelse return null;
+fn fetchInsn(vm: *const Vm, cr0: u64, cr3: u64, rip: u64, buf: *[15]u8) ?u8 {
+    // If paging is disabled (CR0.PG=0), guest virtual = guest physical
+    const phys = if (cr0 & (1 << 31) == 0) rip else (guestVirtToPhys(vm, cr3, rip) orelse return null);
     const page_off = phys & 0xFFF;
     const avail: u64 = 4096 - page_off;
     const first: u8 = @intCast(@min(15, avail));
 
-    const slice = readGuestPhysSlice(phys, first);
+    const slice = readGuestPhysSlice(vm, phys, first) orelse return null;
     @memcpy(buf[0..first], slice);
 
     if (first < 15) {
         const next_vaddr = (rip & ~@as(u64, 0xFFF)) + 4096;
-        if (guestVirtToPhys(cr3, next_vaddr)) |next_phys| {
-            const remaining: u8 = 15 - first;
-            const next_slice = readGuestPhysSlice(next_phys, remaining);
+        const next_phys = if (cr0 & (1 << 31) == 0) next_vaddr else (guestVirtToPhys(vm, cr3, next_vaddr) orelse return first);
+        const remaining: u8 = 15 - first;
+        if (readGuestPhysSlice(vm, next_phys, remaining)) |next_slice| {
             @memcpy(buf[first..15], next_slice);
             return 15;
         }
@@ -105,9 +104,9 @@ fn fetchInsn(cr3: u64, rip: u64, buf: *[15]u8) ?u8 {
 
 /// Decode the MMIO instruction at guest RIP.
 /// Returns the decoded operation, or null if the instruction is unrecognized.
-pub fn decode(gs: *const GuestState) ?MmioOp {
+pub fn decode(vm: *const Vm, gs: *const GuestState) ?MmioOp {
     var insn: [15]u8 = undefined;
-    const fetched = fetchInsn(gs.cr3, gs.rip, &insn) orelse return null;
+    const fetched = fetchInsn(vm, gs.cr0, gs.cr3, gs.rip, &insn) orelse return null;
     if (fetched < 2) return null;
 
     var i: u8 = 0;

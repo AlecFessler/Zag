@@ -10,11 +10,8 @@ const boot = @import("boot.zig");
 const cpuid = @import("cpuid.zig");
 const disk = @import("disk.zig");
 const io = @import("io.zig");
-const ioapic = @import("ioapic.zig");
-const lapic = @import("lapic.zig");
 const log = @import("log.zig");
 const mem = @import("mem.zig");
-const mmio = @import("mmio.zig");
 const msr = @import("msr.zig");
 const serial = @import("serial.zig");
 
@@ -93,8 +90,6 @@ var policy_buf: [4096]u8 align(4096) = .{0} ** 4096;
 var bp_buf: [4096]u8 align(8) = .{0} ** 4096;
 var guest_state: GuestState = .{};
 var exit_count: u64 = 0;
-var last_timer_ns: u64 = 0;
-const TIMER_INTERVAL_NS: u64 = 4_000_000; // 4ms = 250 Hz (matches Linux HZ=250)
 var cpuid_count: u64 = 0;
 var io_count: u64 = 0;
 var msr_r_count: u64 = 0;
@@ -104,7 +99,6 @@ var hlt_count: u64 = 0;
 var other_count: u64 = 0;
 var ept_count: u64 = 0;
 var intr_count: u64 = 0;
-var intwin_count: u64 = 0;
 
 pub fn main(pv: u64) void {
     log.print("\n=== hyprvOS ===\n");
@@ -149,19 +143,7 @@ pub fn main(pv: u64) void {
     log.dec(hlt_count);
     log.print("/");
     log.dec(other_count);
-    log.print(") intr=");
-    log.dec(intr_count);
-    log.print(" intwin=");
-    log.dec(intwin_count);
-    log.print(" timer_inj=");
-    log.dec(timer_inject_count);
-    log.print(" proactive=");
-    log.dec(proactive_inject_count);
-    log.print(" IF1=");
-    log.dec(if_one_count);
-    log.print(" IF0=");
-    log.dec(if_zero_count);
-    log.print(" ept=");
+    log.print(") ept=");
     log.dec(ept_count);
     log.print(" ===\n");
     _ = syscall.vm_destroy();
@@ -233,18 +215,11 @@ noinline fn bootLinux() void {
     buildBootParams(hdr.initramfs_size);
 
     // Command line
-    boot.setupCmdline("console=ttyS0,115200n8 console=ttyS0,115200n8 nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
+    boot.setupCmdline("console=ttyS0,115200n8 nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
 
-    // ACPI tables
+    // ACPI tables (kernel handles LAPIC/IOAPIC emulation)
     acpi.setupTables();
 
-    // LAPIC + IOAPIC emulation — map device pages so accesses cause EPT violations
-    // Do NOT map 0xFEE00000/0xFEC00000 into guest physical space; NPT faults
-    // will be delivered as EPT violation exits for us to emulate via MMIO decode.
-    lapic.init();
-    ioapic.init();
-
-    // Guest state: 32-bit protected mode
     setupLinuxState();
     log.print("Linux configured\n");
 }
@@ -283,13 +258,9 @@ noinline fn bootLinuxEmbedded() void {
     buildBootParams(initramfs_data.len);
 
     // Command line
-    boot.setupCmdline("console=ttyS0,115200n8 console=ttyS0,115200n8 nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
+    boot.setupCmdline("console=ttyS0,115200n8 nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
 
-    // ACPI tables + LAPIC/IOAPIC
     acpi.setupTables();
-    lapic.init();
-    ioapic.init();
-
     setupLinuxState();
     log.print("Linux configured (embedded)\n");
 }
@@ -392,9 +363,8 @@ noinline fn setupLinuxState() void {
 }
 
 /// VM exit handling loop — separate noinline to isolate stack frame.
-noinline fn exitLoop(vcpu_handle: u64) void {
+noinline fn exitLoop(_: u64) void {
     const start = syscall.clock_gettime();
-    last_timer_ns = start;
     const timeout_ns: u64 = 600_000_000_000; // 10 minutes
 
     while (true) {
@@ -404,12 +374,13 @@ noinline fn exitLoop(vcpu_handle: u64) void {
                 log.print("TIMEOUT\n");
                 break;
             }
-            // Poll host serial for input while waiting
             serial.pollHostRx();
-            // Check PIT timer for IOAPIC interrupts
-            io.pitCheckIrq();
-            // Proactively inject pending interrupts
-            proactiveTimerInject(vcpu_handle);
+            // Route serial IRQ through kernel IOAPIC
+            if (serial.irq_pending) {
+                serial.irq_pending = false;
+                _ = syscall.ioapic_assert_irq(4);
+                _ = syscall.ioapic_deassert_irq(4);
+            }
             syscall.thread_yield();
             continue;
         }
@@ -430,18 +401,12 @@ noinline fn exitLoop(vcpu_handle: u64) void {
             break;
         }
 
-        // Route serial IRQ4 through IOAPIC if pending
+        // Route serial IRQ through kernel IOAPIC
         if (serial.irq_pending) {
             serial.irq_pending = false;
-            ioapic.assertIrq(4);
-            ioapic.deassertIrq(4);
+            _ = syscall.ioapic_assert_irq(4);
+            _ = syscall.ioapic_deassert_irq(4);
         }
-
-        // Check PIT → IOAPIC (only active during boot, disabled once LAPIC timer starts)
-        io.pitCheckIrq();
-
-        // Tick LAPIC timer + inject pending LAPIC vector
-        maybeInjectLapic(gs);
 
         // Resume guest
         @as(*align(1) u64, @ptrCast(&reply_buf)).* = REPLY_RESUME;
@@ -513,8 +478,7 @@ noinline fn handleTag(tag: u8, gs: *GuestState) bool {
         return false;
     }
     if (tag == EXIT_INTWIN) {
-        // Guest just enabled IF — maybeInjectTimer (called after handleTag) will inject
-        intwin_count += 1;
+        // Kernel handles interrupt window injection
         return false;
     }
     if (tag == EXIT_HLT) {
@@ -566,137 +530,22 @@ noinline fn handleTag(tag: u8, gs: *GuestState) bool {
     return true;
 }
 
-/// Handle EPT violation (NPT fault). LAPIC/IOAPIC MMIO emulation.
-/// Returns true to kill guest (unhandled address).
+/// Handle EPT violation. LAPIC/IOAPIC are handled in-kernel now.
+/// Only unhandled EPT violations reach userspace.
 noinline fn handleEpt(guest_phys: u64, gs: *GuestState) bool {
-    const page = guest_phys & 0xFFFFF000;
-
-    if (page == lapic.APIC_BASE or page == ioapic.IOAPIC_BASE) {
-        const op = mmio.decode(gs) orelse {
-            if (ept_count <= 10) {
-                log.print("EPT: decode fail @0x");
-                log.hex64(guest_phys);
-                log.print(" RIP=0x");
-                log.hex64(gs.rip);
-                log.print("\n");
-            }
-            // Skip the instruction to avoid infinite loop — guess 4 bytes
-            gs.rip += 4;
-            return false;
-        };
-
-        const offset: u32 = @truncate(guest_phys & 0xFFF);
-
-        if (page == lapic.APIC_BASE) {
-            if (op.is_write) {
-                lapic.write(offset, op.value);
-            } else {
-                const val = lapic.read(offset);
-                writeGpr(gs, op.reg, @as(u64, val));
-            }
-        } else {
-            if (op.is_write) {
-                ioapic.write(offset, op.value);
-            } else {
-                const val = ioapic.read(offset);
-                writeGpr(gs, op.reg, @as(u64, val));
-            }
-        }
-
-        gs.rip += op.len;
-        return false;
-    }
-
-    // Unknown EPT address
+    _ = gs;
+    ept_count += 1;
     if (ept_count <= 10) {
         log.print("EPT@0x");
         log.hex64(guest_phys);
-        log.print(" RIP=0x");
-        log.hex64(gs.rip);
         log.print("\n");
     }
     if (ept_count > 1000) return true;
     return false;
 }
 
-var timer_inject_count: u64 = 0;
 var if_one_count: u64 = 0;
 var if_zero_count: u64 = 0;
-
-/// Tick LAPIC timer and inject highest-priority deliverable vector.
-noinline fn maybeInjectLapic(gs: *GuestState) void {
-    const now = syscall.clock_gettime();
-    const elapsed = now -% last_timer_ns;
-    last_timer_ns = now;
-
-    // Always tick the LAPIC timer so scheduling stays responsive.
-    // PIT coalescing (isVectorInFlight check) prevents timer starvation
-    // of lower-priority vectors like serial.
-    lapic.tick(elapsed);
-
-    if (lapic.getPendingVector()) |vec| {
-        injectVector(gs, vec);
-    }
-}
-
-fn injectVector(gs: *GuestState, vec: u8) void {
-    if (gs.pending_eventinj & (1 << 31) != 0) return; // slot occupied
-
-    // Set pending_eventinj — SVM hardware will deliver when IF=1,
-    // or defer via V_IRQ if IF=0. Don't skip on IF=0.
-    gs.pending_eventinj = @as(u64, vec) | (1 << 31);
-    lapic.acceptInterrupt(vec);
-    timer_inject_count += 1;
-}
-
-/// GuestInterrupt — must match kernel's extern struct exactly.
-const GuestInterrupt = extern struct {
-    vector: u8,
-    interrupt_type: u8,
-    error_code_valid: bool,
-    _pad: [5]u8 = .{0} ** 5,
-    error_code: u32 = 0,
-};
-
-var proactive_inject_count: u64 = 0;
-var proactive_timer_intr: GuestInterrupt = .{
-    .vector = 0x20,
-    .interrupt_type = 0,
-    .error_code_valid = false,
-};
-
-/// Proactively inject pending LAPIC vectors into a running guest via
-/// vcpu_interrupt. Needed when the guest runs without VM exits.
-noinline fn proactiveTimerInject(vcpu_handle: u64) void {
-    if (if_one_count == 0) return;
-
-    // Route pending serial IRQ into LAPIC IRR
-    if (serial.irq_pending) {
-        serial.irq_pending = false;
-        ioapic.assertIrq(4);
-        ioapic.deassertIrq(4);
-    }
-
-    // Tick LAPIC timer
-    const now = syscall.clock_gettime();
-    const elapsed = now -% last_timer_ns;
-    if (elapsed >= TIMER_INTERVAL_NS) {
-        last_timer_ns = now;
-        lapic.tick(elapsed);
-    }
-
-    const vec = lapic.getPendingVector() orelse return;
-
-    proactive_timer_intr.vector = vec;
-    proactive_timer_intr.interrupt_type = 0;
-
-    const r = syscall.vcpu_interrupt(vcpu_handle, @intFromPtr(&proactive_timer_intr));
-    if (r == syscall.E_OK) {
-        lapic.acceptInterrupt(vec);
-        proactive_inject_count += 1;
-        timer_inject_count += 1;
-    }
-}
 
 fn findVcpuHandle(pv: u64) u64 {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);

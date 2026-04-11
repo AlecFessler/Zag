@@ -186,29 +186,13 @@ pub noinline fn write(offset: u32, value: u32) void {
             handleICR();
         },
         REG_ICR_HI => icr_hi = value,
-        REG_LVT_TIMER => {
-            if (lvt_timer & 0x10000 != 0 and value & 0x10000 == 0) {
-                log.print("LAPIC: timer unmasked vec=0x");
-                log.hex8(@truncate(value & 0xFF));
-                log.print("\n");
-            }
-            lvt_timer = value;
-        },
+        REG_LVT_TIMER => lvt_timer = value,
         REG_LVT_THERMAL => lvt_thermal = value,
         REG_LVT_PERF => lvt_perf = value,
         REG_LVT_LINT0 => lvt_lint0 = value,
         REG_LVT_LINT1 => lvt_lint1 = value,
         REG_LVT_ERROR => lvt_error = value,
         REG_TIMER_ICR => {
-            if (timer_initial_count == 0 and value != 0) {
-                log.print("LAPIC: timer started icr=");
-                log.dec(value);
-                log.print(" div=");
-                log.dec(getTimerDivisor());
-                log.print(" lvt=0x");
-                log.hex32(lvt_timer);
-                log.print("\n");
-            }
             timer_initial_count = value;
             timer_current_count = value;
             timer_accum_ns = 0;

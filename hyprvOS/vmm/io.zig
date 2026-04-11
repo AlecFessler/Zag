@@ -4,8 +4,6 @@
 
 const lib = @import("lib");
 
-const ioapic = @import("ioapic.zig");
-const lapic = @import("lapic.zig");
 const log = @import("log.zig");
 const serial = @import("serial.zig");
 
@@ -234,15 +232,15 @@ pub noinline fn pitCheckIrq() void {
         if (pit_ch0_last_irq_ns == 0 and pit_ch0_start_ns > 0) {
             if (now -% pit_ch0_start_ns >= period_ns) {
                 pit_ch0_last_irq_ns = now;
-                ioapic.assertIrq(2);
+                _ = syscall.ioapic_assert_irq(2);
             }
         }
     } else {
         if (pit_ch0_start_ns == 0) return;
         if (now -% pit_ch0_last_irq_ns >= period_ns) {
             pit_ch0_last_irq_ns = now;
-            ioapic.assertIrq(2);
-            ioapic.deassertIrq(2);
+            _ = syscall.ioapic_assert_irq(2);
+            _ = syscall.ioapic_deassert_irq(2);
         }
     }
 }

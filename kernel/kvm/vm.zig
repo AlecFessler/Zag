@@ -35,6 +35,10 @@ pub const Vm = struct {
     vm_id: u64 = 0,
     arch_structures: PAddr = PAddr.fromInt(0),
     guest_mem: zag.kvm.guest_memory.GuestMemory = .{},
+    /// Host virtual base and size of the main guest RAM region (from first guest_map).
+    /// Used by MMIO decoder to read guest physical memory (page table walk).
+    guest_ram_host_base: u64 = 0,
+    guest_ram_size: u64 = 0,
     /// In-kernel LAPIC emulation state.
     lapic: Lapic = .{},
     /// In-kernel IOAPIC emulation state.
@@ -202,6 +206,13 @@ pub fn guestMap(proc: *Process, host_vaddr: u64, guest_addr: u64, size: u64, rig
         rollbackGuestMap(vm_obj, guest_addr, size);
         return E_NOMEM;
     };
+
+    // Track the main guest RAM region for MMIO instruction decode.
+    // First guest_map at guest_addr=0 is typically the main RAM region.
+    if (vm_obj.guest_ram_host_base == 0 and guest_addr == 0) {
+        vm_obj.guest_ram_host_base = host_vaddr;
+        vm_obj.guest_ram_size = size;
+    }
 
     return 0; // E_OK
 }

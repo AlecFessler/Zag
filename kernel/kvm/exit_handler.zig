@@ -109,7 +109,7 @@ pub fn handleExit(vcpu_obj: *VCpu, exit_info: arch.VmExitInfo) void {
 /// dispatches to the kernel LAPIC, writes the result back, and advances RIP.
 /// Returns true if handled, false to fall through to VMM.
 fn handleLapicMmio(vcpu_obj: *VCpu, guest_phys: u64) bool {
-    const op = mmio_decode.decode(&vcpu_obj.guest_state) orelse return false;
+    const op = mmio_decode.decode(vcpu_obj.vm, &vcpu_obj.guest_state) orelse return false;
     const offset: u32 = @truncate(guest_phys - lapic_mod.APIC_BASE);
     const vm_obj = vcpu_obj.vm;
 
@@ -127,7 +127,7 @@ fn handleLapicMmio(vcpu_obj: *VCpu, guest_phys: u64) bool {
 /// dispatches to the kernel IOAPIC, writes the result back, and advances RIP.
 /// Returns true if handled, false to fall through to VMM.
 fn handleIoapicMmio(vcpu_obj: *VCpu, guest_phys: u64) bool {
-    const op = mmio_decode.decode(&vcpu_obj.guest_state) orelse return false;
+    const op = mmio_decode.decode(vcpu_obj.vm, &vcpu_obj.guest_state) orelse return false;
     const offset: u32 = @truncate(guest_phys - ioapic_mod.IOAPIC_BASE);
     const vm_obj = vcpu_obj.vm;
 
