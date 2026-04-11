@@ -215,7 +215,7 @@ noinline fn bootLinux() void {
     buildBootParams(hdr.initramfs_size);
 
     // Command line
-    boot.setupCmdline("console=ttyS0,115200n8 nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
+    boot.setupCmdline("console=ttyS0,115200n8 earlycon=uart,io,0x3f8,115200n8 keep_bootcon nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
 
     // ACPI tables (kernel handles LAPIC/IOAPIC emulation)
     acpi.setupTables();
@@ -258,7 +258,7 @@ noinline fn bootLinuxEmbedded() void {
     buildBootParams(initramfs_data.len);
 
     // Command line
-    boot.setupCmdline("console=ttyS0,115200n8 nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
+    boot.setupCmdline("console=ttyS0,115200n8 earlycon=uart,io,0x3f8,115200n8 keep_bootcon nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
 
     acpi.setupTables();
     setupLinuxState();
@@ -375,12 +375,13 @@ noinline fn exitLoop(_: u64) void {
                 break;
             }
             serial.pollHostRx();
-            // Route serial IRQ through kernel IOAPIC
             if (serial.irq_pending) {
                 serial.irq_pending = false;
                 _ = syscall.ioapic_assert_irq(4);
                 _ = syscall.ioapic_deassert_irq(4);
             }
+            // Tick PIT — fires IRQ0 (GSI2) when counter reaches 0
+            io.pitCheckIrq();
             syscall.thread_yield();
             continue;
         }
@@ -407,6 +408,9 @@ noinline fn exitLoop(_: u64) void {
             _ = syscall.ioapic_assert_irq(4);
             _ = syscall.ioapic_deassert_irq(4);
         }
+
+        // Tick PIT — fires IRQ0 (GSI2) when counter reaches 0
+        io.pitCheckIrq();
 
         // Resume guest
         @as(*align(1) u64, @ptrCast(&reply_buf)).* = REPLY_RESUME;
