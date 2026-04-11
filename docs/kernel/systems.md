@@ -56,8 +56,10 @@ kernel/
       interrupts.zig     -- interrupt vectors, CpuContext
       exceptions.zig     -- fault handlers
       pmu.zig            -- PMU state, save/restore, PMI handler, event mapping
+      sysinfo.zig        -- x64 hardware reads for freq, temp, C-state
     aarch64/
       pmu.zig            -- aarch64 PMU stubs (unimplemented)
+      sysinfo.zig        -- aarch64 sysinfo stubs (unimplemented)
   memory/
     init.zig             -- memory subsystem initialization
     address.zig          -- VA/PA types, address space layout constants
@@ -558,10 +560,15 @@ PerCoreState {
     pinned_thread: ?*Thread     -- thread (if any) that exclusively owns this core
     timer: Timer
     exited_thread: ?ExitedThread -- deferred thread cleanup (renamed from Zombie)
+    idle_ns:      u64            -- accumulated idle nanoseconds since last sys_info read
+    busy_ns:      u64            -- accumulated busy nanoseconds since last sys_info read
+    last_tick_ns: u64            -- monotonic timestamp of last scheduler tick (for delta accounting)
 }
 ```
 
 Array of 64 `PerCoreState` structs (`MAX_CORES = 64`), aligned to `CACHE_LINE_SIZE = 64` bytes to avoid false sharing.
+
+The `idle_ns` / `busy_ns` / `last_tick_ns` fields back the per-core scheduler accounting consumed by `sys_info` (§21). They are updated on every scheduler timer tick and read-and-reset atomically by `sys_info` when `cores_ptr != null`.
 
 ### enqueue(thread)
 
@@ -586,6 +593,25 @@ Delegates to `pq.dequeue()`, which returns the highest-priority ready thread, or
 10. Release run queue lock.
 11. Arm scheduler timer for next timeslice.
 12. If same thread, return. Otherwise, `arch.switchTo(next)`.
+
+### Idle/Busy Accounting Hook
+
+At the top of `schedTimerHandler`, before any scheduling decision, the handler samples the monotonic clock and attributes the elapsed time since the previous tick to either `idle_ns` or `busy_ns` on the core's `PerCoreState`:
+
+```
+now = arch.getMonotonicClock().now()
+delta = now - per_core.last_tick_ns
+if (per_core.running_thread == per_core.idle_thread) {
+    per_core.idle_ns += delta
+} else {
+    per_core.busy_ns += delta
+}
+per_core.last_tick_ns = now
+```
+
+`running_thread` at handler entry is the thread that actually consumed the preceding timeslice, so the attribution decision is "was the idle thread running last tick". `last_tick_ns` is seeded from `arch.getMonotonicClock().now()` in `sched.perCoreInit` before the preemption timer is first armed; until that point `idle_ns` and `busy_ns` are zero.
+
+The counters are updated under `rq_lock` so the read-and-reset performed by `sys_info` (§21) sees a consistent snapshot without needing a second lock. Because accounting is sampled at scheduler tick granularity (`SCHED_TIMESLICE_NS = 2 ms`), the reported `idle_ns` / `busy_ns` are tick-quantized — the last partial timeslice before a `sys_info` read is attributed to whichever thread was running at the previous tick boundary, not to wall-clock time. Over any accounting window longer than a few timeslices this quantization is negligible, and `sys_info` does not attempt to reconcile it.
 
 ### PMU Save/Restore Hooks
 
@@ -1101,6 +1127,16 @@ Portable dispatch layer in `kernel/arch/dispatch.zig`. All functions dispatch at
 
 Hardware PMU availability is detected once at boot in `arch.pmuInit()` and cached. The cached `PmuInfo` is the single source of truth for the generic layer's syscall validation.
 
+### System Information
+
+**getCoreFreq(core_id: u64) -> u64** -- Reads the current operating frequency of the given core in hertz. Called once per core per `sys_info` invocation with a non-null `cores_ptr`. Dispatches to the arch-specific implementation (`arch/x64/sysinfo.zig` or `arch/aarch64/sysinfo.zig`).
+
+**getCoreTemp(core_id: u64) -> u32** -- Reads the current temperature of the given core in milli-celsius. Same dispatch pattern as `getCoreFreq`.
+
+**getCoreState(core_id: u64) -> u8** -- Reads the current C-state level of the given core. `0` means the core is active; higher values mean progressively deeper idle states. Same dispatch pattern.
+
+All three functions are side-effect free reads against the target core's hardware interface. See §21 for the x64 implementation details (the MSRs used, how TjMax is discovered, and how remote cores are polled).
+
 ### Diagnostics
 
 **print(format, args) -> void** -- Serial port output via `kernel/arch/x64/serial.zig`. Formats into a 256-byte stack buffer, writes byte-by-byte to the configured COM port. Protected by a global `print_lock` SpinLock. No-op in release builds (`builtin.mode != .Debug`).
@@ -1131,6 +1167,8 @@ PhysicalMemoryManager {
 ```
 
 Implements the `std.mem.Allocator` interface. The PMM wraps the buddy allocator with per-core page caches for fast single-page allocations.
+
+**freePageCount() -> u64** -- Returns the number of physical pages currently free. Acquires the PMM global lock, queries the buddy allocator's internal free page accounting (sum of the per-order free list lengths weighted by order), adds the pages sitting in all per-core page caches, and returns the total. Called by the `sys_info` syscall (§21) to populate `SysInfo.mem_free`. A companion `totalPageCount() -> u64` returns the static total page count established at buddy init time for `SysInfo.mem_total`.
 
 ### Per-Core Page Cache
 
@@ -2092,3 +2130,63 @@ Writing MSRs on the caller's core for a remote target would be doubly wrong: it 
 `Thread.deinit` runs on the teardown path (timer handler deferred cleanup, etc.) and the thread being freed is by construction not running on any core. It always goes through `arch.pmuClearState` + slab destroy — never touches MSRs. Real hardware teardown for the dying thread happened at its last `pmuSave` on context switch away.
 
 Overflow races: if a PMI fires on core A while the generic layer is mid-`pmu_stop` on core B against a remote target, the PMI handler's `thread.pmu_state == null` check falls through cleanly. The remote `pmu_stop` never touches hardware on core A, so there is no cross-core serialization window to reason about.
+
+---
+
+## 21. System Info Internals
+
+Per-process read access to system-wide and per-core hardware and scheduler state. The public contract is in spec §2.15 and spec §4.55. This section describes how the pieces fit together internally.
+
+### Layering
+
+```
+kernel/arch/dispatch.zig    -- generic sysinfo interface, comptime dispatch on arch
+kernel/arch/x64/sysinfo.zig -- x64 hardware reads (new file)
+kernel/arch/aarch64/sysinfo.zig -- aarch64 stubs (new file)
+```
+
+The generic layer follows the same split as PMU and VM: architecture-independent scheduler accounting and buffer validation live in the generic `sys_info` syscall handler in `kernel/arch/syscall.zig`, and all hardware-specific reads go through the `arch.getCoreFreq` / `arch.getCoreTemp` / `arch.getCoreState` dispatch functions in `kernel/arch/dispatch.zig` (§13). The generic layer never references MSRs, port I/O, or any vendor-specific encoding.
+
+### Module-Level Changes
+
+- **`kernel/arch/dispatch.zig`** — adds `getCoreFreq(core_id: u64) u64`, `getCoreTemp(core_id: u64) u32`, and `getCoreState(core_id: u64) u8` dispatch functions, each comptime-switched on `builtin.cpu.arch`.
+- **`kernel/arch/syscall.zig`** — adds a dispatch case for the `sys_info` syscall number. The handler is implemented directly in the syscall layer (not a separate `kernel/sched/sysinfo.zig` module) because the logic is small and touches only existing per-core scheduler state plus the PMM: validate pointers, sample the PMM for total/free pages, sample `PerCoreState` for each core with read-and-reset, invoke the arch dispatch functions for frequency/temperature/C-state, and write the result into the caller's address space via physmap.
+- **`kernel/sched/scheduler.zig`** — adds `idle_ns`, `busy_ns`, and `last_tick_ns` to `PerCoreState` (see §6) and the accounting hook at the top of `schedTimerHandler` (see §6). `last_tick_ns` is seeded in `sched.perCoreInit` after the monotonic clock is available and before the preemption timer is armed.
+- **`kernel/memory/pmm.zig`** — adds `freePageCount() u64` and `totalPageCount() u64` (see §14). Both read PMM and buddy-allocator state under `pmm.lock`.
+
+### sys_info Handler
+
+The handler runs entirely in the syscall layer. Its flow:
+
+1. Validate `info_ptr` as a writable region of `sizeof(SysInfo)` bytes via the standard `validateUserWritable` helper. Return `E_BADADDR` on failure.
+2. Read `arch.coreCount()` into a local `core_count`, `pmm.totalPageCount()` into `mem_total`, and `pmm.freePageCount()` into `mem_free`.
+3. If `cores_ptr` is null: write the assembled `SysInfo` into `info_ptr` via physmap and return `E_OK`. No per-core accounting is touched and no counters are reset.
+4. If `cores_ptr` is non-null: validate it as a writable region of `core_count * sizeof(CoreInfo)` bytes. Return `E_BADADDR` on failure. Then, for each core `i` in `[0, core_count)`:
+   - Acquire that core's `rq_lock`, atomically read `idle_ns` and `busy_ns` into locals, reset both to zero, release `rq_lock`.
+   - Call `arch.getCoreFreq(i)`, `arch.getCoreTemp(i)`, and `arch.getCoreState(i)` to populate the hardware fields.
+   - Stamp the `CoreInfo` entry for slot `i`.
+5. Write both `SysInfo` and the `CoreInfo` array into the caller's address space via physmap and return `E_OK`.
+
+The per-core read-and-reset is serialized against `schedTimerHandler` by `rq_lock`, which is the same lock the handler takes to update `idle_ns` / `busy_ns`. Scheduler ticks are 2 ms apart (§6, `SCHED_TIMESLICE_NS`), so the lock-hold time on either side is negligible.
+
+### x64 Hardware Reads
+
+Defined in `kernel/arch/x64/sysinfo.zig`. Each function issues a single MSR read or a short sequence of MSR reads against the target core's PMU/thermal interface. The Intel SDM references cited below are the load-bearing primary source for the encodings.
+
+**`getCoreFreq(core_id)`** reads the core's current operating frequency via `IA32_PERF_STATUS` (MSR `0x198`). The current performance state is encoded in the low 16 bits; the relevant frequency ratio is in bits 8–15 of the low dword. The returned hertz value is computed as `(ratio * base_bus_freq_hz)`, where the base bus frequency is the fixed platform bus clock (typically 100 MHz on modern Intel parts, discovered at boot via `MSR_PLATFORM_INFO` / `CPUID.16h`). See Intel SDM Vol 4 "Model-Specific Registers" table entry for `IA32_PERF_STATUS` and Vol 3 §15 "Power and Thermal Management".
+
+**`getCoreTemp(core_id)`** reads the core's current temperature via `IA32_THERM_STATUS` (MSR `0x19C`). The raw register encodes temperature as an *offset below* the thermal junction maximum (TjMax), not an absolute reading. Bit 31 indicates valid reading; bits 22–16 are the "digital readout" which is the number of degrees below TjMax. TjMax is discovered once at boot by reading `MSR_TEMPERATURE_TARGET` (`0x1A2`) bits 23–16. The returned milli-celsius value is computed as `(tjmax_c - offset_c) * 1000`, with `tjmax_c` cached per core since it does not change at runtime. See Intel SDM Vol 4 entries for `IA32_THERM_STATUS` and `MSR_TEMPERATURE_TARGET`, and Intel SDM Vol 3 §15.8 "Platform Specific Power Management Support".
+
+**`getCoreState(core_id)`** reports the core's current C-state idle level. The kernel derives this from the scheduler's view of whether the core is currently running the idle thread: if `per_core[core_id].running_thread == per_core[core_id].idle_thread`, the kernel treats the core as the package default idle level as discovered via `MSR_PKG_CST_CONFIG_CONTROL` (`0xE2`); otherwise it returns `0` (active). More fine-grained per-core C-state accounting via `MSR_CORE_C1_RES` / `MSR_CORE_C3_RES` / `MSR_CORE_C6_RES` / `MSR_CORE_C7_RES` is reserved for a future iteration; the current implementation returns a single-bit active/idle signal. See Intel SDM Vol 4 entry for `MSR_PKG_CST_CONFIG_CONTROL` and Vol 3 §15.5 "Thread and Core C-States".
+
+**Remote core reads.** `IA32_PERF_STATUS`, `IA32_THERM_STATUS`, and friends are core-local MSRs — the `rdmsr` instruction always reads the issuing core's own register. Reading a remote core's values therefore requires either an IPI to that core or running the read on that core during its next scheduler tick. The current x64 implementation uses the fast, lock-free approach: it reads *the calling core's* MSRs when asked for the calling core's ID, and returns cached values sampled at the target core's last scheduler tick for any remote core. The tick-sampled cache lives on `PerCoreState` alongside the accounting fields and is refreshed by `schedTimerHandler` before any ticks land on `last_tick_ns`. This keeps `sys_info` cheap (no cross-core IPIs) at the cost of up-to-2 ms staleness on remote-core frequency/temperature readings, which is acceptable for UI-grade polling.
+
+### aarch64 Stubs
+
+`kernel/arch/aarch64/sysinfo.zig` defines `getCoreFreq`, `getCoreTemp`, and `getCoreState` as stubs returning `0` for all values. The aarch64 port does not yet implement performance-counter or thermal MSR equivalents (ARMv8-A exposes frequency via `CNTFRQ_EL0` and thermal via platform-specific sideband, neither of which is wired up). The stubs exist so `kernel/arch/dispatch.zig` comptime switches compile on aarch64 and so `sys_info` returns a syntactically valid `CoreInfo` array (all hardware fields zero) rather than `@compileError`-ing the build. Scheduler accounting still works unchanged — `idle_ns` and `busy_ns` are produced by architecture-independent code.
+
+When aarch64 sysinfo support is implemented, it will replace the stubs in-place and the generic layer will need no changes.
+
+### Locking
+
+No new locks. `sys_info` takes each core's existing `rq_lock` in turn for the read-and-reset of the accounting fields; it never holds more than one `rq_lock` at a time, so deadlock is not a concern even if two callers sweep cores in opposite orders. The PMM lock is taken by `pmm.freePageCount()` for the duration of a single allocator query. The arch dispatch functions run without holding any kernel lock (the x64 implementation's remote-core cache is updated under the target core's `rq_lock` by the scheduler tick hook).

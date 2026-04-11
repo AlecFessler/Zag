@@ -572,6 +572,62 @@ PmuSample (extern struct) {
 
 ---
 
+### §2.15 System Information
+
+Zag exposes a read-only view of system-wide and per-core hardware and scheduler state through a single syscall, `sys_info`. The data is split into two structs: a system-wide `SysInfo` and an array of per-core `CoreInfo` entries. The call is unprivileged — any process may read system information without holding any capability.
+
+The design deliberately exposes raw scheduler accounting rather than precomputed percentages. Userspace decides the sampling window (by choosing how often to poll), divides `busy_ns / (idle_ns + busy_ns)` to get utilization, and picks whatever smoothing or rate-conversion strategy it prefers. The kernel never computes a utilization percentage on userspace's behalf.
+
+#### Observable Types
+
+`SysInfo` — system-wide static and dynamic properties:
+
+```
+SysInfo (extern struct) {
+    core_count: u64    // number of active CPU cores
+    mem_total:  u64    // total physical pages
+    mem_free:   u64    // currently free physical pages
+}
+```
+
+`CoreInfo` — per-core dynamic properties, one entry per core indexed by core ID:
+
+```
+CoreInfo (extern struct) {
+    idle_ns: u64    // nanoseconds spent idle in the last accounting window
+    busy_ns: u64    // nanoseconds spent busy in the last accounting window
+    freq_hz: u64    // current CPU frequency in Hz
+    temp_mc: u32    // current temperature in milli-celsius
+    c_state: u8     // current C-state idle level (0 = active)
+}
+```
+
+**§2.15.1** `SysInfo.core_count` is the number of active CPU cores the kernel scheduled on at boot. It is a static property of a given boot and does not change between calls.
+
+**§2.15.2** `SysInfo.mem_total` is the total physical page count managed by the kernel.
+
+**§2.15.3** `SysInfo.mem_free` is the number of physical pages currently free for allocation, sampled at the time of the call.
+
+**§2.15.4** `CoreInfo` entries are indexed by core ID: entry `i` describes core `i` for `i` in `[0, core_count)`.
+
+**§2.15.5** `CoreInfo.freq_hz` is the current CPU frequency of the core in hertz.
+
+**§2.15.6** `CoreInfo.temp_mc` is the current temperature of the core in milli-celsius (e.g. `45000` = 45.0°C). Milli-celsius is used in place of floating point so that sub-degree precision is preserved when the hardware exposes it.
+
+**§2.15.7** `CoreInfo.c_state` is the current CPU idle C-state level for the core. A value of `0` means the core is active; higher values indicate progressively deeper idle states.
+
+**§2.15.8** `CoreInfo.idle_ns` and `CoreInfo.busy_ns` are the nanoseconds the core spent running the idle thread and running real threads, respectively, accumulated since the last `sys_info` call that read per-core data for this core. Userspace computes utilization as `busy_ns / (idle_ns + busy_ns)`.
+
+#### Accounting Windows
+
+**§2.15.9** `idle_ns` and `busy_ns` are accumulated by the scheduler and delivered as raw counts; the kernel does not compute utilization percentages.
+
+**§2.15.10** On every `sys_info` call with a non-null `cores_ptr`, each core's `idle_ns` and `busy_ns` are read and reset atomically before the values are returned to userspace. The next call therefore sees the accounting window that started at the previous call's return. A call with a null `cores_ptr` does not touch per-core accounting and does not reset the counters.
+
+**§2.15.11** The accounting window size is userspace-controlled: the interval between consecutive `sys_info` calls with `cores_ptr != null` is the window over which `idle_ns` and `busy_ns` are reported.
+
+---
+
 ## §3 Fault Reasons
 
 Each fault or termination records a `FaultReason` (u5) in the process's slot 0 `field0` and the parent's user view entry:
@@ -875,6 +931,14 @@ Stops counters on the target thread and frees its PMU state. A thread may always
 
 **§4.54.1** `pmu_stop` returns `E_OK` on success. **§4.54.2** `pmu_stop` requires `ProcessRights.pmu` on slot 0; returns `E_PERM` without it. **§4.54.3** `pmu_stop` requires the `pmu` right on `thread_handle`; returns `E_PERM` without it. **§4.54.4** `pmu_stop` with invalid or wrong-type `thread_handle` returns `E_BADHANDLE`. **§4.54.5** `pmu_stop` on a thread with no PMU state (never started, or already stopped) returns `E_INVAL`. **§4.54.6** A thread's PMU state is automatically released on thread exit, so an explicit `pmu_stop` is not required before exit. **§4.54.7** `pmu_stop` on a target thread that is not the caller and not in `.faulted` or `.suspended` state returns `E_BUSY`. A remote target must be observably stopped so that clearing its PMU state does not race the save/restore hooks on the target's core; a thread may always stop its own PMU state.
 
+### §4.55 sys_info(info_ptr, cores_ptr) → result
+
+Writes system-wide information to `info_ptr` and, optionally, per-core information to `cores_ptr`. Any process may call this syscall regardless of rights — the returned information is purely observational and does not reveal any capability-gated state.
+
+Typical usage is a two-call pattern: first call with `cores_ptr = null` to obtain `SysInfo` and learn `core_count`, then allocate a buffer sized for `core_count` `CoreInfo` entries and call again in a poll loop with both pointers set to obtain live per-core data. The interval between consecutive calls with `cores_ptr != null` is the accounting window over which `idle_ns` and `busy_ns` are reported (§2.15.10, §2.15.11).
+
+**§4.55.1** `sys_info` returns `E_OK` on success. **§4.55.2** `sys_info` requires no rights and is callable by any process. **§4.55.3** `sys_info` with `info_ptr` not pointing to a writable region of `sizeof(SysInfo)` bytes returns `E_BADADDR`. **§4.55.4** `sys_info` with `cores_ptr` null writes only `SysInfo`; no per-core data is written and no scheduler accounting counters are reset. **§4.55.5** `sys_info` with `cores_ptr` non-null must point to a writable region of `core_count * sizeof(CoreInfo)` bytes, where `core_count` is the value written to `info_ptr.core_count` by the same call; otherwise returns `E_BADADDR`. **§4.55.6** On success with `cores_ptr` non-null, `sys_info` writes `SysInfo` to `info_ptr` and a fully populated `CoreInfo` array to `cores_ptr`, and resets each core's `idle_ns` and `busy_ns` atomically as they are read (§2.15.10).
+
 ---
 
 ## §5 System Limits
@@ -897,3 +961,4 @@ Stops counters on the target thread and frees its PMU state. A thread may always
 | Max vCPUs per VM | 64 |
 | PMU counters per thread | `PmuInfo.num_counters` (hardware-dependent) |
 | PMU counter slots in `PmuSample` | `MAX_COUNTERS` (kernel compile-time maximum across supported arches) |
+| Max `SysInfo.core_count` | 64 (matches Max CPU cores) |
