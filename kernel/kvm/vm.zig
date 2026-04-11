@@ -4,6 +4,7 @@ const zag = @import("zag");
 const arch = zag.arch.dispatch;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
+const sched = zag.sched.scheduler;
 const vcpu_mod = zag.kvm.vcpu;
 
 const Ioapic = zag.kvm.ioapic.Ioapic;
@@ -248,6 +249,7 @@ pub fn ioapicAssertIrq(proc: *Process, irq_num: u64) i64 {
     const vm_obj = proc.vm orelse return E_INVAL;
     if (irq_num >= 24) return E_INVAL;
     vm_obj.ioapic.assertIrq(@truncate(irq_num));
+    kickRunningVcpus(vm_obj);
     return 0; // E_OK
 }
 
@@ -258,7 +260,20 @@ pub fn ioapicDeassertIrq(proc: *Process, irq_num: u64) i64 {
     const vm_obj = proc.vm orelse return E_INVAL;
     if (irq_num >= 24) return E_INVAL;
     vm_obj.ioapic.deassertIrq(@truncate(irq_num));
+    kickRunningVcpus(vm_obj);
     return 0; // E_OK
+}
+
+/// Send an IPI to any core currently running a vCPU thread for this VM,
+/// forcing a VMEXIT so the vCPU re-enters VMRUN and checks pending interrupts.
+fn kickRunningVcpus(vm_obj: *Vm) void {
+    for (vm_obj.vcpus[0..vm_obj.num_vcpus]) |vcpu_obj| {
+        if (vcpu_obj.state == .running) {
+            if (sched.coreRunning(vcpu_obj.thread)) |core_id| {
+                arch.triggerSchedulerInterrupt(core_id);
+            }
+        }
+    }
 }
 
 /// Returns true if the MSR is security-critical and must always be intercepted.
