@@ -62,6 +62,7 @@ pub const SyscallNum = enum(u64) {
     pmu_read,
     pmu_reset,
     pmu_stop,
+    sys_info,
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -592,6 +593,41 @@ pub fn pmu_reset(thread_handle: u64, configs_ptr: u64, count: u64) i64 {
 
 pub fn pmu_stop(thread_handle: u64) i64 {
     return syscall1(.pmu_stop, thread_handle);
+}
+
+// --- System Information (§2.15, §4.55) ---
+
+/// Matches §5 "Max CPU cores" and "Max `SysInfo.core_count`". Tests use this
+/// as a worst-case bound when sizing stack-resident `CoreInfo` arrays without
+/// having to first poll `sys_info` for the actual count.
+pub const MAX_CPU_CORES: usize = 64;
+
+/// System-wide static and dynamic properties returned by `sys_info` in its
+/// `info_ptr` output. Matches the canonical extern layout defined in §2.15 of
+/// the spec.
+pub const SysInfo = extern struct {
+    core_count: u64,
+    mem_total: u64,
+    mem_free: u64,
+};
+
+/// Per-core dynamic properties returned by `sys_info` in its `cores_ptr`
+/// output, one entry per core indexed by core ID. Matches §2.15. The trailing
+/// explicit padding brings the struct to 8-byte alignment so a `[N]CoreInfo`
+/// array lays out predictably across the syscall boundary.
+pub const CoreInfo = extern struct {
+    idle_ns: u64,
+    busy_ns: u64,
+    freq_hz: u64,
+    temp_mc: u32,
+    c_state: u8,
+    _pad: [3]u8 = .{0} ** 3,
+};
+
+/// Invokes `sys_info(info_ptr, cores_ptr)`. Pass `0` for `cores_ptr` to read
+/// `SysInfo` without touching per-core scheduler accounting (§2.15, §4.55.4).
+pub fn sys_info(info_ptr: u64, cores_ptr: u64) i64 {
+    return syscall2(.sys_info, info_ptr, cores_ptr);
 }
 
 /// Returns the lowest-indexed event variant whose bit is set in
