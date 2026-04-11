@@ -312,23 +312,24 @@ fn readConfigs(
 ) ConfigReadError![]const PmuCounterConfig {
     if (count == 0) return ConfigReadError.Invalid; // §4.51.5
 
-    // Cap `count` against the kernel buffer before touching user memory.
-    // Anything over `MAX_COUNTERS` also exceeds `PmuInfo.num_counters` by
-    // construction (§2.14 / §5: `num_counters <= MAX_COUNTERS`), so the
-    // spec's §4.51.6 E_INVAL still applies.
-    if (count > out_buf.len) return ConfigReadError.Invalid; // §4.51.6
-
-    const total_bytes = std.math.mul(u64, count, @sizeOf(PmuCounterConfig)) catch
+    // §4.51.9 takes precedence over §4.51.6: a caller that passes an
+    // unmapped `configs_ptr` together with an absurd `count` (e.g. 10000)
+    // must observe E_BADADDR, not E_INVAL. Validate a readable slice
+    // covering *the portion of `count` we can actually read*
+    // (`min(count, out_buf.len)`) first so a bad pointer always surfaces
+    // as E_BADADDR; then apply the `count > out_buf.len` and
+    // `count > num_counters` bounds, which produce E_INVAL.
+    const read_count = @min(count, out_buf.len);
+    const read_bytes = std.math.mul(u64, read_count, @sizeOf(PmuCounterConfig)) catch
         return ConfigReadError.Invalid;
 
-    // §4.51.9: readable region of count * sizeof(PmuCounterConfig) bytes.
-    // Validated before the hardware-dependent `count > num_counters` check
-    // so that a null/unmapped buffer always surfaces as E_BADADDR even on
-    // hosts whose PMU reports `num_counters == 0` (e.g. QEMU without PMU
-    // passthrough). On such hosts a legitimate caller can still observe
-    // §4.51.6 via `count > num_counters` below.
-    const raw: []u8 = std.mem.sliceAsBytes(out_buf[0..@intCast(count)]);
-    if (!readUser(proc, configs_ptr, raw[0..@intCast(total_bytes)])) return ConfigReadError.BadAddress;
+    const raw: []u8 = std.mem.sliceAsBytes(out_buf[0..@intCast(read_count)]);
+    if (!readUser(proc, configs_ptr, raw[0..@intCast(read_bytes)])) return ConfigReadError.BadAddress;
+
+    // Cap `count` against the kernel buffer. Anything over `MAX_COUNTERS`
+    // also exceeds `PmuInfo.num_counters` by construction (§2.14 / §5:
+    // `num_counters <= MAX_COUNTERS`), so §4.51.6 E_INVAL applies.
+    if (count > out_buf.len) return ConfigReadError.Invalid; // §4.51.6
 
     const info = arch.pmuGetInfo();
     if (count > info.num_counters) return ConfigReadError.Invalid; // §4.51.6
