@@ -490,3 +490,12 @@ pub fn vmInjectException(guest_state: *GuestState, exception: GuestException) vo
         else => unreachable,
     }
 }
+
+/// Modify MSR passthrough bits in the VM's MSRPM.
+pub fn vmMsrPassthrough(vm_structures: PAddr, msr_num: u32, allow_read: bool, allow_write: bool) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.vm.msrPassthrough(vm_structures, msr_num, allow_read, allow_write),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}

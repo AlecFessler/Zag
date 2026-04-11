@@ -54,6 +54,9 @@ pub const SyscallNum = enum(u64) {
     vcpu_get_state,
     vcpu_run,
     vcpu_interrupt,
+    msr_passthrough,
+    ioapic_assert_irq,
+    ioapic_deassert_irq,
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -509,6 +512,18 @@ pub fn vcpu_run(thread_handle: u64) i64 {
 
 pub fn vcpu_interrupt(thread_handle: u64, interrupt_ptr: u64) i64 {
     return syscall2(.vcpu_interrupt, thread_handle, interrupt_ptr);
+}
+
+pub fn msr_passthrough(msr_num: u64, allow_read: u64, allow_write: u64) i64 {
+    return syscall3(.msr_passthrough, msr_num, allow_read, allow_write);
+}
+
+pub fn ioapic_assert_irq(irq_num: u64) i64 {
+    return syscall1(.ioapic_assert_irq, irq_num);
+}
+
+pub fn ioapic_deassert_irq(irq_num: u64) i64 {
+    return syscall1(.ioapic_deassert_irq, irq_num);
 }
 
 pub const FAULT_KILL: u64 = 0;

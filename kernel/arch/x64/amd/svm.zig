@@ -769,6 +769,48 @@ pub fn injectInterrupt(guest_state: *GuestState, interrupt: GuestInterrupt) void
 
 /// Inject an exception into the guest.
 /// AMD APM Vol 2, Section 15.20, Figure 15-4: EVENTINJ with TYPE=3 (exception).
+/// Modify MSR passthrough bits in the VM's MSRPM.
+/// AMD APM Vol 2, Section 15.10: MSRPM format.
+pub fn msrPassthrough(vmcb_phys: PAddr, msr_num: u32, allow_read: bool, allow_write: bool) void {
+    const vmcb_vaddr = VAddr.fromPAddr(vmcb_phys, null).addr;
+    const vmcb: [*]const u8 = @ptrFromInt(vmcb_vaddr);
+    const msrpm_phys_addr = readVmcb64(vmcb, Vmcb.MSRPM_BASE_PA);
+    if (msrpm_phys_addr == 0) return;
+    const msrpm_vaddr = VAddr.fromPAddr(PAddr.fromInt(msrpm_phys_addr), null).addr;
+    const msrpm: [*]u8 = @ptrFromInt(msrpm_vaddr);
+
+    var base_offset: usize = 0;
+    var msr_offset: u32 = msr_num;
+    if (msr_num >= 0xC0000000 and msr_num <= 0xC0001FFF) {
+        base_offset = 0x0800;
+        msr_offset = msr_num - 0xC0000000;
+    } else if (msr_num > 0x1FFF) {
+        return; // MSR not covered by MSRPM ranges
+    }
+    const bit_pos = @as(usize, msr_offset) * 2;
+    const byte_idx = base_offset + bit_pos / 8;
+    const bit_idx: u3 = @truncate(bit_pos % 8);
+
+    if (allow_read) {
+        // Clear read intercept bit
+        msrpm[byte_idx] &= ~(@as(u8, 1) << bit_idx);
+    } else {
+        // Set read intercept bit
+        msrpm[byte_idx] |= @as(u8, 1) << bit_idx;
+    }
+    if (allow_write) {
+        // Clear write intercept bit
+        const write_bit: u3 = @truncate((@as(usize, bit_idx) + 1) % 8);
+        const write_byte = byte_idx + (@as(usize, bit_idx) + 1) / 8;
+        msrpm[write_byte] &= ~(@as(u8, 1) << write_bit);
+    } else {
+        // Set write intercept bit
+        const write_bit: u3 = @truncate((@as(usize, bit_idx) + 1) % 8);
+        const write_byte = byte_idx + (@as(usize, bit_idx) + 1) / 8;
+        msrpm[write_byte] |= @as(u8, 1) << write_bit;
+    }
+}
+
 pub fn injectException(guest_state: *GuestState, exception: GuestException) void {
     // Set CR2 for page faults.
     if (exception.vector == 14) {

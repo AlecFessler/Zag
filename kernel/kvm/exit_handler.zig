@@ -1,4 +1,4 @@
-/// VM exit dispatch — called by the arch layer (via the vCPU entry point)
+/// VM exit dispatch -- called by the arch layer (via the vCPU entry point)
 /// when a VM exit fires. Classifies exits as kernel-handled or VMM-handled.
 const builtin = @import("builtin");
 const std = @import("std");
@@ -6,8 +6,12 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const guest_memory = zag.kvm.guest_memory;
+const mmio_decode = zag.kvm.mmio_decode;
 const sched = zag.sched.scheduler;
 const vcpu_mod = zag.kvm.vcpu;
+
+const ioapic_mod = zag.kvm.ioapic;
+const lapic_mod = zag.kvm.lapic;
 
 const Thread = zag.sched.thread.Thread;
 const VCpu = vcpu_mod.VCpu;
@@ -21,8 +25,9 @@ pub const ExitHandler = struct {
 /// Handle a VM exit. Called from the vCPU thread entry point after
 /// arch.vmResume() returns.
 ///
-/// If the exit can be handled inline (demand page, policy-covered CPUID/CR),
-/// resolves it and returns (the vCPU loop will re-enter guest mode).
+/// If the exit can be handled inline (demand page, policy-covered CPUID/CR,
+/// LAPIC/IOAPIC MMIO), resolves it and returns (the vCPU loop will re-enter
+/// guest mode).
 /// If the exit requires VMM involvement, snapshots state, enqueues on the
 /// exit box, and transitions the vCPU to .exited state.
 pub fn handleExit(vcpu_obj: *VCpu, exit_info: arch.VmExitInfo) void {
@@ -31,12 +36,20 @@ pub fn handleExit(vcpu_obj: *VCpu, exit_info: arch.VmExitInfo) void {
     // Try kernel-handled exits first
     switch (exit_info) {
         .ept_violation => |ept| {
+            // Check LAPIC page (0xFEE00000)
+            if (ept.guest_phys >= lapic_mod.APIC_BASE and ept.guest_phys < lapic_mod.APIC_BASE + 0x1000) {
+                if (handleLapicMmio(vcpu_obj, ept.guest_phys)) return;
+            }
+            // Check IOAPIC page (0xFEC00000)
+            if (ept.guest_phys >= ioapic_mod.IOAPIC_BASE and ept.guest_phys < ioapic_mod.IOAPIC_BASE + 0x1000) {
+                if (handleIoapicMmio(vcpu_obj, ept.guest_phys)) return;
+            }
             // Check if this is a demand-paged region
             if (guest_memory.handleFault(&vm_obj.guest_mem, vm_obj.arch_structures, ept.guest_phys)) {
-                // Handled inline — resume guest
+                // Handled inline -- resume guest
                 return;
             }
-            // Unmapped region — fall through to VMM delivery
+            // Unmapped region -- fall through to VMM delivery
         },
         .cpuid => |cpuid_exit| {
             // Check policy table for pre-configured response
@@ -49,7 +62,7 @@ pub fn handleExit(vcpu_obj: *VCpu, exit_info: arch.VmExitInfo) void {
                 vcpu_obj.guest_state.rip += 2;
                 return;
             }
-            // No policy match — fall through to VMM delivery
+            // No policy match -- fall through to VMM delivery
         },
         .cr_access => |cr_exit| {
             // TODO: implement inline CR policy handling (return configured
@@ -57,11 +70,19 @@ pub fn handleExit(vcpu_obj: *VCpu, exit_info: arch.VmExitInfo) void {
             // For now, all CR accesses fall through to VMM delivery.
             _ = cr_exit;
         },
+        .interrupt_window => {
+            // VMEXIT_VINTR: guest IF just became 1. Try to inject a pending
+            // interrupt. The vCPU entry loop will handle injection before
+            // the next VMRUN. Just return to re-enter the loop.
+            return;
+        },
         .unknown => |code| {
             // VMEXIT_INTR (0x060) / VMEXIT_NMI (0x061): physical interrupt
             // or NMI intercepted. The host handler has already executed on
-            // #VMEXIT — just return so the vCPU loop re-enters the guest.
+            // #VMEXIT -- just return so the vCPU loop re-enters the guest.
             if (code == 0x060 or code == 0x061) return;
+            // VMEXIT_VINTR (0x064): virtual interrupt window.
+            if (code == 0x064) return;
         },
         else => {},
     }
@@ -82,6 +103,42 @@ pub fn handleExit(vcpu_obj: *VCpu, exit_info: arch.VmExitInfo) void {
         box.enqueueLocked(vcpu_obj.thread);
         box.lock.unlock();
     }
+}
+
+/// Handle LAPIC MMIO access in-kernel. Decodes the instruction at guest RIP,
+/// dispatches to the kernel LAPIC, writes the result back, and advances RIP.
+/// Returns true if handled, false to fall through to VMM.
+fn handleLapicMmio(vcpu_obj: *VCpu, guest_phys: u64) bool {
+    const op = mmio_decode.decode(&vcpu_obj.guest_state) orelse return false;
+    const offset: u32 = @truncate(guest_phys - lapic_mod.APIC_BASE);
+    const vm_obj = vcpu_obj.vm;
+
+    if (op.is_write) {
+        vm_obj.lapic.write(offset, op.value);
+    } else {
+        const value = vm_obj.lapic.read(offset);
+        mmio_decode.writeGpr(&vcpu_obj.guest_state, op.reg, @as(u64, value));
+    }
+    vcpu_obj.guest_state.rip += op.len;
+    return true;
+}
+
+/// Handle IOAPIC MMIO access in-kernel. Decodes the instruction at guest RIP,
+/// dispatches to the kernel IOAPIC, writes the result back, and advances RIP.
+/// Returns true if handled, false to fall through to VMM.
+fn handleIoapicMmio(vcpu_obj: *VCpu, guest_phys: u64) bool {
+    const op = mmio_decode.decode(&vcpu_obj.guest_state) orelse return false;
+    const offset: u32 = @truncate(guest_phys - ioapic_mod.IOAPIC_BASE);
+    const vm_obj = vcpu_obj.vm;
+
+    if (op.is_write) {
+        vm_obj.ioapic.write(offset, op.value);
+    } else {
+        const value = vm_obj.ioapic.read(offset);
+        mmio_decode.writeGpr(&vcpu_obj.guest_state, op.reg, @as(u64, value));
+    }
+    vcpu_obj.guest_state.rip += op.len;
+    return true;
 }
 
 fn deliverToReceiver(vm_obj: *Vm, vcpu_obj: *VCpu, receiver: *Thread) void {

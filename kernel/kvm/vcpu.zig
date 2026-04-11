@@ -254,13 +254,36 @@ fn vcpuEntryPoint() void {
     const vm_obj = thread.process.vm.?;
     const vcpu_obj = vcpuFromThread(vm_obj, thread).?;
 
+    var last_tsc: u64 = arch.readTimestamp();
+
     while (true) {
         if (vcpu_obj.state != .running) {
             // Block until the VMM resumes us via vm_reply.
             thread.state = .blocked;
             arch.enableInterrupts();
             sched.yield();
+            last_tsc = arch.readTimestamp();
             continue;
+        }
+
+        // Tick LAPIC timer with elapsed nanoseconds before each VMRUN.
+        // TSC ticks at ~1 GHz on most hardware; treat 1 tick = 1 ns.
+        const now_tsc = arch.readTimestamp();
+        const elapsed_ns = now_tsc -% last_tsc;
+        last_tsc = now_tsc;
+        vm_obj.lapic.tick(elapsed_ns);
+
+        // Check for a pending deliverable interrupt vector from the LAPIC.
+        // If guest IF is set, build EVENTINJ and inject it before VMRUN.
+        if (vm_obj.lapic.getPendingVector()) |vector| {
+            const guest_if = vcpu_obj.guest_state.rflags & (1 << 9);
+            if (guest_if != 0 and vcpu_obj.guest_state.pending_eventinj == 0) {
+                // Build EVENTINJ: external interrupt (type=0), valid bit set.
+                // AMD APM Vol 2, Section 15.20, Figure 15-4.
+                const eventinj: u64 = @as(u64, vector) | (1 << 31);
+                vcpu_obj.guest_state.pending_eventinj = eventinj;
+                vm_obj.lapic.acceptInterrupt(vector);
+            }
         }
 
         // Enter guest mode
