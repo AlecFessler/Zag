@@ -19,6 +19,7 @@ Zag is implemented in Zig, targeting x86_64 (with an aarch64 stub). The kernel i
    - `debug.info.init()` -- ELF symbol table for stack traces.
    - `arch.parseFirmwareTables(xsdp_phys)` -- ACPI parsing: MADT (cores, APIC), HPET, MCFG (PCI ECAM). PCI enumeration and serial port probing. Device registration.
    - `arch.vmInit()` -- Detect hardware virtualization support via CPUID, cache availability flag. After firmware tables (needs CPUID), before scheduler.
+   - `arch.pmuInit()` -- Detect hardware PMU support via CPUID (x64) or stub (aarch64), cache `PmuInfo`, prime PMI handler vector. After firmware tables, before scheduler. See §20.
    - `sched.globalInit()` -- Process/thread slab allocators, idle process, run queues, root service creation with all rights, device grant to root service, enqueue root service initial thread.
    - `arch.smpInit()` -- Secondary core bringup via INIT/SIPI IPI sequence with real-mode trampoline at physical address `0x8000`.
    - `sched.perCoreInit()` -- Per-core scheduler state, preemption timer arm, `arch.vmPerCoreInit()` (per-core VMX/SVM setup), enable interrupts.
@@ -54,6 +55,9 @@ kernel/
       irq.zig            -- IRQ routing
       interrupts.zig     -- interrupt vectors, CpuContext
       exceptions.zig     -- fault handlers
+      pmu.zig            -- PMU state, save/restore, PMI handler, event mapping
+    aarch64/
+      pmu.zig            -- aarch64 PMU stubs (unimplemented)
   memory/
     init.zig             -- memory subsystem initialization
     address.zig          -- VA/PA types, address space layout constants
@@ -75,6 +79,7 @@ kernel/
     futex.zig            -- futex wait queue
     sync.zig             -- SpinLock
     message_box.zig      -- MessageBox struct (one type, two instances per Process: msg_box and fault_box)
+    pmu.zig              -- generic PMU syscall layer, PmuStateAllocator slab owner
   perms/
     permissions.zig      -- rights types, permission entry, user view entry
     privilege.zig        -- kernel/user privilege enum
@@ -379,12 +384,12 @@ Field encoding for thread entries: `field0 = tid(u64)` (the thread's stable kern
 
 All rights are packed structs with bit fields:
 
-- `ProcessRights`: packed `u16` -- `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `mem_shm_create`(5), `device_own`(6), `fault_handler`(7), 8 bits reserved.
+- `ProcessRights`: packed `u16` -- `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `mem_shm_create`(5), `device_own`(6), `fault_handler`(7), `pmu`(8), 7 bits reserved.
 - `ProcessHandleRights`: packed `u16` -- `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5), `fault_handler`(6), 9 bits reserved. Used on handles to other processes (not HANDLE_SELF).
 - `VmReservationRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4), 3 bits reserved.
 - `SharedMemoryRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `grant`(3), 4 bits reserved.
 - `DeviceRegionRights`: packed `u8` -- `map`(0), `grant`(1), `dma`(2), 5 bits reserved.
-- `ThreadHandleRights`: packed `u8` -- `suspend`(0), `resume`(1), `kill`(2), 5 bits reserved.
+- `ThreadHandleRights`: packed `u8` -- `suspend`(0), `resume`(1), `kill`(2), `pmu`(4), 4 bits reserved. Bit 3 is reserved for alignment with the public spec layout. The `pmu` bit is checked in addition to `ProcessRights.pmu` on every PMU syscall that takes a thread handle; see §20.
 
 ---
 
@@ -410,6 +415,7 @@ Thread {
     priority: Priority                  -- current scheduling priority level (idle/low/normal/high/pinned)
     pre_pin_priority: Priority          -- saved priority before core pin (restored on unpin)
     pre_pin_affinity: ?u64              -- saved affinity mask before core pin (restored on unpin)
+    pmu_state: ?*arch.PmuState = null   -- arch-specific PMU counter state; null until pmu_start; freed on pmu_stop or deinit
 }
 ```
 
@@ -466,11 +472,12 @@ Atomic boolean. Set to `true` when a thread is dispatched onto a CPU, set to `fa
 
 `Thread.deinit()`:
 1. Save `last_in_proc` flag.
-2. Clear the thread handle entry from the owning process's perm table. If `fault_handler_proc` is non-null, also clear the thread handle entry from the handler's perm table. Call `syncUserView` on all affected tables.
-3. Destroy kernel stack (unmap committed pages, recycle slot).
-4. If not last thread: destroy user stack via process VMM.
-5. Free Thread to slab.
-6. If last thread: call `proc.exit()` (triggers restart or cleanup).
+2. If `pmu_state != null`, call `arch.pmuStop(pmu_state)` to disable counters and free the PMU state back to `PmuStateAllocator`, then clear the field. This is the implicit `pmu_stop` on thread exit (§20).
+3. Clear the thread handle entry from the owning process's perm table. If `fault_handler_proc` is non-null, also clear the thread handle entry from the handler's perm table. Call `syncUserView` on all affected tables.
+4. Destroy kernel stack (unmap committed pages, recycle slot).
+5. If not last thread: destroy user stack via process VMM.
+6. Free Thread to slab.
+7. If last thread: call `proc.exit()` (triggers restart or cleanup).
 
 The last thread skips user stack destruction because the process exit path tears down the entire address space.
 
@@ -579,6 +586,18 @@ Delegates to `pq.dequeue()`, which returns the highest-priority ready thread, or
 10. Release run queue lock.
 11. Arm scheduler timer for next timeslice.
 12. If same thread, return. Otherwise, `arch.switchTo(next)`.
+
+### PMU Save/Restore Hooks
+
+When the scheduler actually switches threads (step 12 of `schedTimerHandler` and the IPC fast-path `switchToThread`), a pair of null-guarded calls bracket the `arch.switchTo`:
+
+```
+if (outgoing.pmu_state) |st| arch.pmuSave(st);
+arch.switchTo(next);
+if (next.pmu_state) |st| arch.pmuRestore(st);
+```
+
+Both checks are a single load-and-compare on the hot path. Threads without PMU state (the common case) pay only the null comparison and never touch the PMU hardware. Threads with PMU state round-trip their counter values through arch-specific MSRs on every context switch; this is the cost of making counts per-thread rather than per-core (§2.14.10). The save is sequenced *before* the switch so the final hardware counter values are captured under the outgoing thread's identity; the restore is sequenced *after* the switch so the counters are re-enabled under the incoming thread's identity with no window of mis-accounting.
 
 ### IPI on Thread Ready
 
@@ -1058,6 +1077,28 @@ Portable dispatch layer in `kernel/arch/dispatch.zig`. All functions dispatch at
 
 **vmSupported() -> bool** -- Returns the cached virtualization availability flag.
 
+### Performance Monitoring Unit
+
+**pmuInit() -> void** -- One-time PMU initialization on the bootstrap core. Performs feature detection (CPUID on x64), records the number of available counters and the supported-event bitmask into a cached `PmuInfo`, and primes the PMI handler vector. Called from `kMain` after `arch.init()`. On aarch64 this is a no-op stub.
+
+**pmuGetInfo() -> PmuInfo** -- Returns the cached `PmuInfo` computed by `pmuInit`. Used by the generic `pmu_info` syscall in `kernel/sched/pmu.zig`.
+
+**pmuSave(state: *PmuState) -> void** -- Called from the context switch path on the *outgoing* thread when `thread.pmu_state != null`. Reads the current hardware counter values into `state`, disables all counters. Leaves no counter running on the core.
+
+**pmuRestore(state: *PmuState) -> void** -- Called from the context switch path on the *incoming* thread when `thread.pmu_state != null`. Writes saved counter values back to hardware and re-enables the counters that were configured when the thread last called `pmu_start` / `pmu_reset`.
+
+**pmuStart(state: *PmuState, configs: []const PmuCounterConfig) -> error!void** -- Programs the hardware counters described by `configs` into the arch-specific state, clears the counter registers, and enables them. Only called while the state's owning thread is the current thread (the generic layer arranges this).
+
+**pmuRead(state: *PmuState, sample: *PmuSample) -> void** -- Snapshots the counter values stored in `state` into `sample.counters` in configuration order. Does *not* touch hardware — `pmu_read` is only ever called on a thread in `.faulted` or `.suspended` state (§2.14.11), so by the time the generic layer calls this the outgoing save has already pushed the final values into `state`.
+
+**pmuReset(state: *PmuState, configs: []const PmuCounterConfig) -> error!void** -- Same as `pmuStart` but for a thread that already has allocated state. Reprograms counters, writes the new overflow preload values, and re-enables.
+
+**pmuStop(state: *PmuState) -> void** -- Disables counters, tears down arch-specific bookkeeping, and returns `state` to `PmuStateAllocator`.
+
+**PmuState** -- `pub const PmuState = switch (builtin.cpu.arch) { .x86_64 => x64.PmuState, .aarch64 => aarch64.PmuState, else => @compileError(...) };`. The generic kernel only stores `*arch.PmuState` pointers and passes them opaquely to the dispatch functions above — it never inspects struct fields.
+
+Hardware PMU availability is detected once at boot in `arch.pmuInit()` and cached. The cached `PmuInfo` is the single source of truth for the generic layer's syscall validation.
+
 ### Diagnostics
 
 **print(format, args) -> void** -- Serial port output via `kernel/arch/x64/serial.zig`. Formats into a 256-byte stack buffer, writes byte-by-byte to the configured COM port. Protected by a global `print_lock` SpinLock. No-op in release builds (`builtin.mode != .Debug`).
@@ -1183,6 +1224,7 @@ In debug mode, tracks net allocations and asserts zero on `deinit`.
 - `ThreadAllocator`: `SlabAllocator(Thread, false, 0, 64)` -- thread structs.
 - `VmAllocator`: `SlabAllocator(kvm.vm.Vm, false, 0, 64)` -- VM structs.
 - `VCpuAllocator`: `SlabAllocator(kvm.vcpu.VCpu, false, 0, 64)` -- vCPU structs.
+- `PmuStateAllocator`: `SlabAllocator(arch.PmuState, false, 0, 64)` -- per-thread PMU state blocks. `arch.PmuState` is the arch-dispatched type (see §13 and §20); on aarch64 it is an empty struct stub so the allocator compiles but is never exercised.
 
 ### Heap Allocator
 
@@ -1246,7 +1288,8 @@ Size: 32 GiB. Maps all physical memory (free and ACPI regions) using the largest
   [+proc_slab.end, +16 MiB)                        -- Thread slab
   [+thread_slab.end, +16 MiB)                      -- Vm slab
   [+vm_slab.end, +16 MiB)                          -- VCpu slab
-  [+vcpu_slab.end, +1 GiB)                         -- Heap tree node slab
+  [+vcpu_slab.end, +16 MiB)                        -- PmuState slab
+  [+pmu_slab.end, +1 GiB)                          -- Heap tree node slab
   [+heap_tree.end, +256 GiB)                       -- Kernel heap
 
 [0xFFFF_FF80_0000_0000, 0xFFFF_FF88_0000_0000)  -- Physmap (32 GiB)
@@ -1266,8 +1309,8 @@ Comptime assertions verify that no kernel VA regions overlap.
 7. Initialize buddy allocator spanning from smallest physical address to end of largest-address free region. Metadata allocated from bump allocator.
 8. Feed all free memory map regions into buddy allocator (excluding bump allocator's consumed range and low memory below 1 MiB).
 9. Initialize global PMM with buddy allocator as backing.
-10. Initialize slab bump allocators for each kernel object type (VmNode, VmTree, SHM, DeviceRegion, Process, Thread, Vm, VCpu) -- each gets a 16 MiB VA region.
-11. Initialize slabs: VmNode slab, VmTree slab, DeviceRegion slab, SharedMemory slab, Vm slab, VCpu slab.
+10. Initialize slab bump allocators for each kernel object type (VmNode, VmTree, SHM, DeviceRegion, Process, Thread, Vm, VCpu, PmuState) -- each gets a 16 MiB VA region.
+11. Initialize slabs: VmNode slab, VmTree slab, DeviceRegion slab, SharedMemory slab, Vm slab, VCpu slab, PmuState slab.
 
 `memory.initHeap()`:
 1. Initialize heap tree bump allocator (1 GiB region).
@@ -1881,3 +1924,153 @@ The Vm struct has its own `lock: SpinLock` protecting vCPU list and VM-wide stat
 ### Module Root
 
 `kernel/kvm/kvm.zig` exports the kvm submodules and nothing else — `pub const exit_box`, `exit_handler`, `guest_memory`, `ioapic`, `lapic`, `mmio_decode`, `vcpu`, `vm`. No type re-exports: callers reach types through their owning submodule (`zag.kvm.vm.Vm`, `zag.kvm.vcpu.VCpu`, etc.), matching the pattern in `memory.zig`, `sched.zig`, and the other kernel module roots. Referenced by `kernel/zag.zig` as `pub const kvm = @import("kvm/kvm.zig")`.
+
+---
+
+## 20. PMU Internals
+
+Per-thread performance monitoring unit support. The public contract is in spec §2.14 and spec §4.50–§4.54. This section describes how the pieces fit together internally.
+
+### Layering
+
+```
+kernel/sched/pmu.zig        -- generic PMU syscall layer, owns PmuStateAllocator slab
+kernel/arch/dispatch.zig    -- PmuState type alias, pmuInit/pmuGetInfo/pmuSave/
+                               pmuRestore/pmuStart/pmuRead/pmuReset/pmuStop
+kernel/arch/x64/pmu.zig     -- x64 PMU implementation (PmuState, MSR programming,
+                               CPUID detection, PMI handler)
+kernel/arch/aarch64/pmu.zig -- aarch64 stubs (unimplemented)
+```
+
+The generic layer (`kernel/sched/pmu.zig`) is architecture-agnostic. It validates syscall arguments, enforces the capability model, looks up thread handles, manages `PmuStateAllocator`, and calls into `arch.pmuXxx` for all hardware touching. It never references MSRs, event select registers, or vendor-specific encodings. Adding a new architecture only requires implementing the `arch/<arch>/pmu.zig` module; the generic layer is untouched.
+
+### Module-Level Changes
+
+- **`kernel/zag.zig`** — re-exports `pub const pmu = @import("sched/pmu.zig")` so the syscall dispatch in `kernel/arch/syscall.zig` can reach the generic syscall entry points.
+- **`kernel/main.zig`** — calls `arch.pmuInit()` once after `arch.vmInit()` and before `sched.globalInit()`, mirroring the VM init ordering.
+- **`kernel/arch/dispatch.zig`** — adds the `PmuState` comptime type alias and the `pmuInit`/`pmuGetInfo`/`pmuSave`/`pmuRestore`/`pmuStart`/`pmuRead`/`pmuReset`/`pmuStop` functions (see §13).
+- **`kernel/arch/syscall.zig`** — adds dispatch cases for syscall numbers `pmu_info`, `pmu_start`, `pmu_read`, `pmu_reset`, and `pmu_stop`. Each case decodes arguments from the syscall entry frame and forwards to the corresponding `pmu.sysPmuXxx` entry point in `kernel/sched/pmu.zig`. No arg validation happens in the dispatch layer; validation lives in the generic layer so all arches share it.
+- **`kernel/sched/thread.zig`** — adds the `pmu_state: ?*arch.PmuState = null` field (see §5) and the PMU-free step in `Thread.deinit` (automatic `pmu_stop` on thread exit, §2.14.9).
+- **`kernel/sched/scheduler.zig`** — context switch paths (`schedTimerHandler` and IPC `switchToThread`) add the null-guarded `arch.pmuSave` / `arch.pmuRestore` calls around `arch.switchTo` (see §6). All other scheduler logic is unchanged.
+- **`kernel/memory/init.zig`** — adds `PmuStateAllocator = SlabAllocator(arch.PmuState, false, 0, 64)` with a dedicated 16 MiB bump region between the VCpu slab region and the heap tree slab region. Initialized in `memory.init()` alongside the other slabs.
+- **`kernel/perms/permissions.zig`** — adds `pmu` bit (bit 8) on `ProcessRights` and `pmu` bit (bit 4) on `ThreadHandleRights` (see §4). No other rights types are touched.
+
+### PmuStateAllocator
+
+`PmuStateAllocator = SlabAllocator(arch.PmuState, false, 0, 64)`. One dedicated 16 MiB bump region in the kernel VA layout (§14). Chunk size 64 matches the other slab allocators.
+
+Allocation is lazy: a thread that never calls `pmu_start` never touches the allocator. The first `pmu_start` call in a thread's lifetime calls `PmuStateAllocator.create()`, stores the pointer on `thread.pmu_state`, and programs the hardware via `arch.pmuStart`. `pmu_stop` and `Thread.deinit` call `arch.pmuStop` (which disables counters) and `PmuStateAllocator.destroy(state)`.
+
+Because allocation happens in the syscall path and deallocation happens either in the syscall path or in `Thread.deinit`, the allocator is touched under the process perm lock (for syscall paths) or the thread cleanup path — both serialized against concurrent PMU syscalls on the same thread. No extra PMU-specific locking is needed.
+
+### Arch-Dispatched PmuState Type
+
+`arch.PmuState` is exposed via `kernel/arch/dispatch.zig` as a comptime switch, exactly like `arch.SavedRegs`, `arch.GuestState`, etc.:
+
+```zig
+pub const PmuState = switch (builtin.cpu.arch) {
+    .x86_64 => x64.PmuState,
+    .aarch64 => aarch64.PmuState,
+    else => @compileError("unsupported architecture"),
+};
+```
+
+The generic layer stores only `*arch.PmuState`. It never dereferences the struct or inspects its fields. All reads/writes happen inside `arch.pmuXxx` functions. This keeps x86-specific types (MSR register numbers, event select bitfields, vendor quirks) out of `kernel/sched/pmu.zig`.
+
+### x64 PmuState and MSR Programming
+
+Defined in `kernel/arch/x64/pmu.zig`. The struct holds one entry per configured counter:
+
+```
+x64.PmuState (extern struct) {
+    num_counters: u8
+    configs:      [MAX_COUNTERS]PmuCounterConfig
+    values:       [MAX_COUNTERS]u64   // last-saved counter values
+}
+```
+
+**Initialization** (`x64.pmuInit`): reads CPUID leaf `0x0A` (Architectural Performance Monitoring). The `EAX` register returns the version ID in bits 0–7, the number of general-purpose counters per logical core in bits 8–15, and the bit width of each counter in bits 16–23. `EBX` bits 0–6 indicate which architectural events are *not* available (a 1 bit means the event is missing). From these the init routine:
+
+1. Caches the GP counter count as `PmuInfo.num_counters`.
+2. Walks the `PmuEvent` enum and, for each variant, checks whether the corresponding architectural event is available via the `EBX` inverse bitmap; sets the corresponding bit in `PmuInfo.supported_events`.
+3. Sets `PmuInfo.overflow_support = true` if the PMI LVT entry is wired up (it is — see below).
+4. Programs the LAPIC LVT performance-counter entry with the PMI vector and registers `x64.pmuPmiHandler` as the IDT handler for that vector.
+
+**Event mapping**: each `PmuEvent` variant has a baked-in `(event_select, unit_mask)` pair matching the architectural events defined in Intel SDM Vol 3 Ch 18 and AMD APM Vol 2 Ch 13. For example, `PmuEvent.cycles` → `(0x3C, 0x00)` (`CPU_CLK_UNHALTED.THREAD`), `PmuEvent.instructions` → `(0xC0, 0x00)` (`INST_RETIRED.ANY_P`), etc. The mapping table lives in `arch/x64/pmu.zig` and is *not* visible to any other kernel file.
+
+**MSRs used**:
+- `IA32_PERFEVTSELx` (`0x186 + x`) — per-counter event select register: event number, unit mask, `USR`/`OS` bits, `EN` bit, `INT` bit (enables PMI on overflow).
+- `IA32_PMCx` (`0xC1 + x`) — per-counter value register.
+- `IA32_PERF_GLOBAL_CTRL` (`0x38F`) — global enable bitmask.
+- `IA32_PERF_GLOBAL_STATUS` (`0x38E`) — overflow status bits used by the PMI handler to identify which counter overflowed.
+- `IA32_PERF_GLOBAL_OVF_CTRL` (`0x390`) — write-1-to-clear register for the global status bits.
+
+**`pmuStart(state, configs)`**: zero `IA32_PERF_GLOBAL_CTRL`, copy `configs` into `state.configs`, for each config write the mapped `(event_select, unit_mask, USR, EN, INT_if_overflow_threshold_set)` into `IA32_PERFEVTSELx`, preload `IA32_PMCx` with `(counter_max - overflow_threshold)` so the counter overflows exactly at the threshold (or zero if no threshold), then write the enable bitmask into `IA32_PERF_GLOBAL_CTRL`.
+
+**`pmuSave(state)`**: write `0` to `IA32_PERF_GLOBAL_CTRL` (disable all), then for each configured counter read `IA32_PMCx` and store into `state.values[i]`.
+
+**`pmuRestore(state)`**: for each configured counter write `state.values[i]` back into `IA32_PMCx`, re-write `IA32_PERFEVTSELx` (event select is not changed by save/restore, but rewriting is idempotent and cheap), then write the enable bitmask into `IA32_PERF_GLOBAL_CTRL`.
+
+**`pmuRead(state, sample)`**: `pmu_read` is only legal on a thread that is `.faulted` or `.suspended` (§2.14.11), which means the outgoing save has already run and pushed hardware values into `state.values`. `pmuRead` simply copies `state.values[0..state.num_counters]` into `sample.counters` and zero-fills the remainder; `sample.timestamp` is filled in by the generic layer via `arch.getMonotonicClock().now()`.
+
+**`pmuReset(state, configs)`**: same as `pmuStart` but assumes `state` is already allocated; overwrites the configs and preload values, clears any stale overflow status bits in `IA32_PERF_GLOBAL_STATUS` via `IA32_PERF_GLOBAL_OVF_CTRL`, and re-enables.
+
+**`pmuStop(state)`**: zero `IA32_PERF_GLOBAL_CTRL`, zero each `IA32_PERFEVTSELx` for configured counters (so leftover state cannot re-enable), clear overflow status bits, return `state` to `PmuStateAllocator`.
+
+### PMI Handler Flow
+
+`x64.pmuPmiHandler` runs from the IDT vector wired up by `pmuInit`. PMIs are level-triggered via the LAPIC LVT performance-counter entry. The handler's job is to convert a counter overflow into a fault delivered through the existing fault path. It runs in the context of the thread whose counter overflowed (PMIs are per-core interrupts delivered to the core where the overflow happened, which is always the same core the thread is running on at that instant).
+
+```
+pmuPmiHandler(frame):
+    1. Acknowledge the PMI at the LAPIC (EOI).
+    2. Read IA32_PERF_GLOBAL_STATUS; the set bits identify which counters overflowed.
+    3. Write those bits to IA32_PERF_GLOBAL_OVF_CTRL to clear them.
+    4. Write 0 to IA32_PERF_GLOBAL_CTRL to stop all counters on this core immediately.
+       (This prevents another PMI from firing while we're delivering the fault.)
+    5. Read the current thread from per-core state. If thread.pmu_state == null
+       (race: pmu_stop completed between overflow and PMI), return to the
+       interrupted context with counters disabled — no fault delivered.
+    6. Save the overflowed counter values into state.values (same as pmuSave).
+    7. Call proc.faultBlock(thread, .pmu_overflow, rip_at_pmi, rip_at_pmi).
+       The existing fault delivery path (§18) handles single-thread-self-handler
+       kill (§2.12.7), external-handler stop-all, and enqueue into the handler's
+       fault_box. FaultMessage.fault_addr and FaultMessage.regs.rip are both
+       the instruction pointer at the time of overflow — this is the sample.
+    8. If faultBlock returned false (no surviving handler), proceed with the
+       normal kill path from the interrupt frame.
+    9. If faultBlock returned true, yield into the scheduler. The thread is now
+       in .faulted state; the PMI handler does not return to the interrupted RIP.
+```
+
+The PMI handler does not program new counters; that is the profiler's job via `pmu_reset`. When the profiler eventually calls `fault_reply` with `FAULT_RESUME`, the scheduler resumes the thread via the normal context switch path, which calls `arch.pmuRestore` and re-enables the (now reprogrammed) counters. No special "resume from PMI" path is needed.
+
+### Generic Syscall Layer
+
+`kernel/sched/pmu.zig` implements `sysPmuInfo`, `sysPmuStart`, `sysPmuRead`, `sysPmuReset`, and `sysPmuStop`. Each follows the same shape:
+
+1. Look up the target thread via `getPermByHandle` on the calling process's perm table. Validate that the entry is a thread-type entry.
+2. Check `ProcessRights.pmu` on slot 0 of the calling process, then check `ThreadHandleRights.pmu` on the thread entry. `E_PERM` if either is missing. (`sysPmuInfo` skips both checks — see spec §2.14.1 and §4.50.2.)
+3. Validate state constraints: `.faulted`/`.suspended` for `sysPmuRead`, `.faulted` for `sysPmuReset`, any-state-except-exited for `sysPmuStop`.
+4. Validate the userspace buffer pointer via the standard `validateUserReadable` / `validateUserWritable` helpers.
+5. Validate the config array against the cached `PmuInfo` (`count > 0`, `count <= num_counters`, every event bit set in `supported_events`, overflow thresholds only if `overflow_support`). Return `E_INVAL` on any failure.
+6. For `sysPmuStart`: if `thread.pmu_state == null`, allocate from `PmuStateAllocator`. `E_NOMEM` on allocation failure. Then call `arch.pmuStart(state, configs)`.
+7. For `sysPmuRead`: call `arch.pmuRead(state, sample)` and fill `sample.timestamp` from `arch.getMonotonicClock().now()`.
+8. For `sysPmuReset`: call `arch.pmuReset(state, configs)`.
+9. For `sysPmuStop`: call `arch.pmuStop(state)`, clear `thread.pmu_state = null`, free to allocator.
+
+All buffer writes into the caller's address space go through physmap. No direct user-pointer dereference in kernel mode, matching the existing convention.
+
+### aarch64 Stub Policy
+
+`kernel/arch/aarch64/pmu.zig` defines `PmuState` as an empty `extern struct {}`, `pmuInit` as a no-op, and `pmuGetInfo` as returning `PmuInfo{ .num_counters = 0, .supported_events = 0, .overflow_support = false }`. The other functions (`pmuSave`, `pmuRestore`, `pmuStart`, `pmuRead`, `pmuReset`, `pmuStop`) are `unreachable`: with `num_counters = 0`, the generic syscall layer rejects every `pmu_start` call at the validation step, so the allocation path and all arch hardware entry points are statically unreachable. The stubs exist so `kernel/arch/dispatch.zig` comptime switches compile on aarch64 and so the PMU syscalls return `E_INVAL` cleanly instead of `@compileError`-ing the build.
+
+When aarch64 PMU support is actually implemented (ARMv8-A has its own performance monitor architecture — `PMCR_EL0`, `PMEVCNTRn_EL0`, `PMEVTYPERn_EL0`, per-CPU counter overflow interrupt), it will replace the stubs in-place and the generic layer will need no changes.
+
+### Locking and Cross-Core Constraints
+
+PMU syscalls that take a thread handle always operate on a thread owned by a process whose perm table is locked while the thread is being accessed (the same lock discipline as `thread_suspend` / `thread_resume`). Because `pmu_read` is restricted to `.faulted` / `.suspended` threads (§2.14.11), the kernel never needs to interrupt a running remote core to read counters. `pmu_start` is special-cased for the self-thread path: the caller always operates on its own thread handle for start, so the hardware programming happens on the exact core the thread is running on, and the subsequent context-switch save/restore hooks take care of migration correctness.
+
+If a profiler (external handler) calls `pmu_start` on a target thread, the target thread is by definition in `.faulted` or `.suspended` state (otherwise the profiler has no way to observe it). The generic layer updates `state.configs` immediately; the next `pmuRestore` (when the thread is resumed) picks up the new configs and programs the hardware fresh. No cross-core IPI is needed.
+
+Overflow races: if a PMI fires on core A while the generic layer is mid-`pmu_stop` on core B, the PMI handler's `thread.pmu_state == null` check (step 5) falls through cleanly — the counters are already disabled globally by the save-on-switch-away that must have happened before the stop could run on a different core. The single cleared `IA32_PERF_GLOBAL_CTRL` in both paths is the serialization point.

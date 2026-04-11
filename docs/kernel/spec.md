@@ -104,7 +104,7 @@ All access to kernel objects is mediated by **capabilities** — handles with as
 
 **§2.3.1** Handles are monotonically increasing u64 IDs, unique per process lifetime. **§2.3.2** Handle 0 (`HANDLE_SELF`) exists at process creation and cannot be revoked.
 
-There are five rights types. **ProcessRights** (u16, slot 0 only): `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `mem_shm_create`(5), `device_own`(6), `fault_handler`(7). **ProcessHandleRights** (u16, other process handles): `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5), `fault_handler`(6). When `fault_handler` is set on a handle to process P, the holder receives P's fault messages in the holder's own fault box. At most one external process may hold this bit for any given process at a time. **SharedMemoryRights** (u8): `read`(0), `write`(1), `execute`(2), `grant`(3). **DeviceRegionRights** (u8): `map`(0), `grant`(1), `dma`(2). **ThreadHandleRights** (u8): `suspend`(0), `resume`(1), `kill`(2). 5 bits reserved.
+There are five rights types. **ProcessRights** (u16, slot 0 only): `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `mem_shm_create`(5), `device_own`(6), `fault_handler`(7), `pmu`(8). **ProcessHandleRights** (u16, other process handles): `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5), `fault_handler`(6). When `fault_handler` is set on a handle to process P, the holder receives P's fault messages in the holder's own fault box. At most one external process may hold this bit for any given process at a time. **SharedMemoryRights** (u8): `read`(0), `write`(1), `execute`(2), `grant`(3). **DeviceRegionRights** (u8): `map`(0), `grant`(1), `dma`(2). **ThreadHandleRights** (u8): `suspend`(0), `resume`(1), `kill`(2), `pmu`(4). 4 bits reserved. The `pmu` bit gates access to a specific thread's performance monitoring state (§2.14).
 
 **§2.3.3** `restart` can only be granted by a parent that itself has restart capability. **§2.3.4** Once cleared via `disable_restart`, the restart capability cannot be re-enabled.
 
@@ -486,6 +486,88 @@ The VMM can request that specific MSRs be made directly accessible to the guest 
 
 ---
 
+### §2.14 Performance Monitoring Unit
+
+Zag exposes hardware performance counters to userspace as a kernel-managed per-thread resource. The PMU model is intentionally generic: userspace requests counter configurations in terms of named event types, and the kernel maps them onto whatever performance monitoring hardware the machine actually has. No arch-specific detail (model-specific registers, event select encodings, vendor quirks) is visible through the syscall interface.
+
+Two use cases drive the design. **Precise counting** is a thread configuring counters on itself, running a unit of work, reading the counters back, and inspecting the exact event totals — the measurement target is always the caller itself, and no thread suspension occurs beyond the normal syscall boundary. **Sample-based profiling** configures counters with an overflow threshold; when a counter crosses the threshold the thread faults, a fault message is delivered to the fault handler (typically an external profiler), and the profiler reads the instruction pointer out of the fault message's register snapshot to record a sample before resetting the counters and resuming. Both use cases share the same `pmu_start` / `pmu_read` / `pmu_reset` / `pmu_stop` primitives; whether sampling occurs is determined solely by whether a counter's overflow threshold is set.
+
+#### Capability Model
+
+PMU access is dual-gated. **§2.14.1** `ProcessRights.pmu` gates whether a process may call any PMU syscall that operates on thread state; without it, `pmu_start`, `pmu_read`, `pmu_reset`, and `pmu_stop` return `E_PERM`. The informational `pmu_info` syscall is not gated. **§2.14.2** `ThreadHandleRights.pmu` gates whether the caller may operate on a specific thread's PMU state; it is required in addition to `ProcessRights.pmu` for every PMU syscall that takes a thread handle. **§2.14.3** Root service holds `ProcessRights.pmu` at boot. **§2.14.4** `ProcessRights.pmu` flows to child processes via the `process_rights` parameter of `proc_create` under the usual subset rule.
+
+**§2.14.5** A thread may profile itself by passing its own handle from `thread_self` to the PMU syscalls, but this still requires `ProcessRights.pmu` on the calling process — there is no special self-access path. **§2.14.6** The only way a process may hold `ThreadHandleRights.pmu` on another process's threads is to hold `fault_handler` for that process. When `fault_handler` is acquired, the thread handles the kernel inserts into the handler's permissions table carry full `ThreadHandleRights` including `pmu`. Thread handles are not transferable via IPC, so this is the sole mechanism.
+
+#### Observable Types
+
+`PmuEvent` is the set of named event types the kernel understands. Userspace selects events by variant; the kernel maps each variant to the appropriate hardware configuration for the host machine.
+
+```
+PmuEvent = enum {
+    cycles,
+    instructions,
+    cache_references,
+    cache_misses,
+    branch_instructions,
+    branch_misses,
+    bus_cycles,
+    stalled_cycles_frontend,
+    stalled_cycles_backend,
+}
+```
+
+`PmuCounterConfig` describes one counter. A null `overflow_threshold` means the counter is used for precise counting and never overflows; a non-null threshold selects sample-based profiling, with a PMI-driven fault delivered when the counter reaches the threshold.
+
+```
+PmuCounterConfig (extern struct) {
+    event:              PmuEvent
+    overflow_threshold: ?u64
+}
+```
+
+`PmuInfo` describes the hardware's capabilities; userspace queries this before configuring counters.
+
+```
+PmuInfo (extern struct) {
+    num_counters:     u8     // number of hardware counters available
+    supported_events: u64    // bitmask, one bit per PmuEvent variant
+    overflow_support: bool   // whether overflow interrupts are supported
+}
+```
+
+`PmuSample` is the snapshot of counter state returned by `pmu_read`.
+
+```
+PmuSample (extern struct) {
+    counters:  [MAX_COUNTERS]u64   // one u64 per configured counter, in config order
+    timestamp: u64                  // monotonic nanoseconds at time of read
+}
+```
+
+`MAX_COUNTERS` is fixed at the kernel's maximum counter count across supported architectures. Entries beyond the hardware's `num_counters` are zero. Userspace should use `PmuInfo.num_counters` to know how many slots are meaningful.
+
+**§2.14.7** `PmuSample.timestamp` is a monotonic nanosecond reading consistent with `clock_gettime`, sampled at the moment the counters are read.
+
+#### State Model
+
+**§2.14.8** PMU state on a thread is created lazily. A thread that has never called `pmu_start` has no PMU state and no PMU-related context switch overhead. `pmu_start` allocates PMU state for the thread on first call. `pmu_stop` frees it. **§2.14.9** A thread's PMU state is automatically released on thread exit.
+
+**§2.14.10** PMU counters on a thread are preserved across context switches: when the thread is descheduled the current counter values are saved, and when it is redispatched they are restored. Counts are therefore per-thread, not per-core, and unrelated threads cannot corrupt one another's counters.
+
+#### pmu_read Constraints
+
+**§2.14.11** `pmu_read` is only valid when the target thread is in `.faulted` or `.suspended` state. Reading counters from a running thread on another core would require a cross-core IPI and mid-execution snapshot; this complexity is avoided because profilers always have a natural suspension point at which to read — either the PMU overflow fault, or an explicit `thread_suspend`. Reading a running thread returns `E_BUSY`.
+
+#### PMU Overflow Fault Delivery
+
+**§2.14.12** When a counter configured with an overflow threshold reaches that threshold the hardware raises a PMU interrupt. The kernel disables all of the thread's counters, transitions the thread to `.faulted`, and delivers a fault to the thread's fault handler with `fault_reason = pmu_overflow` (§3). The faulting thread's full register snapshot is included in the fault message, so the profiler reads the instruction pointer at the time of overflow directly from `FaultMessage.regs` — no separate sample ring buffer is required or provided.
+
+**§2.14.13** On a PMU overflow fault, a profiler typically calls `pmu_read` to retrieve the final counter values, `pmu_reset` to reconfigure counters with the next threshold, and `fault_reply` with `FAULT_RESUME` to resume the thread. Counter configurations set by `pmu_reset` take effect when the thread is resumed.
+
+**§2.14.14** A single-threaded process that is its own fault handler cannot use sample-based profiling: when its only thread overflows, the normal single-thread-fault semantics (§2.12.7) apply and the process is killed (or restarted). Sample-based self-profiling requires either at least two threads in the process, or an external fault handler. Precise counting, which does not set any overflow threshold, has no such limitation.
+
+---
+
 ## §3 Fault Reasons
 
 Each fault or termination records a `FaultReason` (u5) in the process's slot 0 `field0` and the parent's user view entry:
@@ -507,8 +589,9 @@ Each fault or termination records a `FaultReason` (u5) in the process's slot 0 `
 | 12 | `normal_exit` | last thread voluntarily exited |
 | 13 | `killed` | killed by parent via `kill` right |
 | 14 | `breakpoint` | int3 / #BP exception |
+| 15 | `pmu_overflow` | PMU counter overflow (sample-based profiling, §2.14) |
 
-**§3.1** Fault with no VMM node kills the process with `unmapped_access`. **§3.2** Fault on SHM/MMIO region kills with `invalid_read`/`invalid_write`/`invalid_execute` based on access type. **§3.3** Fault on a private region with wrong permissions kills with `invalid_read`/`invalid_write`/`invalid_execute`. **§3.4** Demand-paged private region: allocate zeroed page, map, resume. **§3.5** Demand page allocation failure kills with `out_of_memory`. **§3.6** Divide-by-zero kills with `arithmetic_fault`. **§3.7** Invalid opcode kills with `illegal_instruction`. **§3.8** Alignment check exception kills with `alignment_fault`. **§3.9** General protection fault kills with `protection_fault`. **§3.10** All user faults are non-recursive: killing a faulting process does not propagate to children.
+**§3.1** Fault with no VMM node kills the process with `unmapped_access`. **§3.2** Fault on SHM/MMIO region kills with `invalid_read`/`invalid_write`/`invalid_execute` based on access type. **§3.3** Fault on a private region with wrong permissions kills with `invalid_read`/`invalid_write`/`invalid_execute`. **§3.4** Demand-paged private region: allocate zeroed page, map, resume. **§3.5** Demand page allocation failure kills with `out_of_memory`. **§3.6** Divide-by-zero kills with `arithmetic_fault`. **§3.7** Invalid opcode kills with `illegal_instruction`. **§3.8** Alignment check exception kills with `alignment_fault`. **§3.9** General protection fault kills with `protection_fault`. **§3.10** All user faults are non-recursive: killing a faulting process does not propagate to children. **§3.11** A counter overflow on a thread with PMU state configured for sample-based profiling delivers a fault with reason `pmu_overflow`; `FaultMessage.fault_addr` contains the faulting RIP and the full register snapshot in `FaultMessage.regs` is the sample.
 
 ---
 
@@ -758,6 +841,36 @@ De-asserts an IRQ line on the calling process's VM's in-kernel IOAPIC and kicks 
 
 **§4.49.1** `vm_ioapic_deassert_irq` returns `E_OK` on success. **§4.49.2** `vm_ioapic_deassert_irq` with no VM returns `E_INVAL`. **§4.49.3** `vm_ioapic_deassert_irq` with `irq_num` greater than or equal to 24 returns `E_INVAL`.
 
+### §4.50 pmu_info(info_ptr) → result
+
+Writes a `PmuInfo` describing the hardware PMU capabilities of the host machine into `info_ptr`. Any process may call this syscall regardless of rights — the returned information is required in order to decide whether PMU features are worth attempting.
+
+**§4.50.1** `pmu_info` returns `E_OK` on success. **§4.50.2** `pmu_info` requires no rights and is callable by any process. **§4.50.3** `pmu_info` with `info_ptr` not pointing to a writable region of `sizeof(PmuInfo)` bytes returns `E_BADADDR`. **§4.50.4** On hardware with no supported performance counters, `pmu_info` succeeds and writes `num_counters = 0`, `supported_events = 0`, `overflow_support = false`.
+
+### §4.51 pmu_start(thread_handle, configs_ptr, count) → result
+
+Configures and starts PMU counters on the target thread, allocating PMU state for the thread if it has none. `configs_ptr` points to an array of `count` `PmuCounterConfig` structs; each entry maps to one hardware counter in array order.
+
+**§4.51.1** `pmu_start` returns `E_OK` on success. **§4.51.2** `pmu_start` requires `ProcessRights.pmu` on slot 0; returns `E_PERM` without it. **§4.51.3** `pmu_start` requires the `pmu` right on `thread_handle`; returns `E_PERM` without it. **§4.51.4** `pmu_start` with invalid or wrong-type `thread_handle` returns `E_BADHANDLE`. **§4.51.5** `pmu_start` with `count == 0` returns `E_INVAL`. **§4.51.6** `pmu_start` with `count` exceeding `PmuInfo.num_counters` returns `E_INVAL`. **§4.51.7** `pmu_start` with an event not set in `PmuInfo.supported_events` returns `E_INVAL`. **§4.51.8** `pmu_start` with a non-null `overflow_threshold` when `PmuInfo.overflow_support` is false returns `E_INVAL`. **§4.51.9** `pmu_start` with `configs_ptr` not pointing to a readable region of `count * sizeof(PmuCounterConfig)` bytes returns `E_BADADDR`. **§4.51.10** `pmu_start` returns `E_NOMEM` if allocation of PMU state for the target thread fails.
+
+### §4.52 pmu_read(thread_handle, sample_ptr) → result
+
+Reads the current counter values for the target thread into a `PmuSample` at `sample_ptr`. The target thread must be in `.faulted` or `.suspended` state (§2.14.11) — reading counters from a running thread is not supported.
+
+**§4.52.1** `pmu_read` returns `E_OK` on success. **§4.52.2** `pmu_read` requires `ProcessRights.pmu` on slot 0; returns `E_PERM` without it. **§4.52.3** `pmu_read` requires the `pmu` right on `thread_handle`; returns `E_PERM` without it. **§4.52.4** `pmu_read` with invalid or wrong-type `thread_handle` returns `E_BADHANDLE`. **§4.52.5** `pmu_read` on a thread that is not in `.faulted` or `.suspended` state returns `E_BUSY`. **§4.52.6** `pmu_read` on a thread that has no PMU state (no prior `pmu_start`) returns `E_INVAL`. **§4.52.7** `pmu_read` with `sample_ptr` not pointing to a writable region of `sizeof(PmuSample)` bytes returns `E_BADADDR`. **§4.52.8** Counter entries beyond `PmuInfo.num_counters` in the returned `PmuSample` are zero.
+
+### §4.53 pmu_reset(thread_handle, configs_ptr, count) → result
+
+Resets counters and applies new overflow thresholds on the target thread. Typically called by a profiler during fault handling before replying to resume the thread after a `pmu_overflow` fault. The target thread must be in `.faulted` state — `pmu_reset` is only meaningful when the thread is suspended in fault delivery. Validation of `configs_ptr` and its contents follows the same rules as `pmu_start`.
+
+**§4.53.1** `pmu_reset` returns `E_OK` on success. **§4.53.2** `pmu_reset` requires `ProcessRights.pmu` on slot 0; returns `E_PERM` without it. **§4.53.3** `pmu_reset` requires the `pmu` right on `thread_handle`; returns `E_PERM` without it. **§4.53.4** `pmu_reset` with invalid or wrong-type `thread_handle` returns `E_BADHANDLE`. **§4.53.5** `pmu_reset` on a thread not in `.faulted` state returns `E_INVAL`. **§4.53.6** `pmu_reset` on a thread with no PMU state returns `E_INVAL`. **§4.53.7** `pmu_reset` with invalid configuration (same rules as `pmu_start`: bad `count`, unsupported event, overflow unsupported) returns `E_INVAL`. **§4.53.8** `pmu_reset` with `configs_ptr` not pointing to a readable region of `count * sizeof(PmuCounterConfig)` bytes returns `E_BADADDR`.
+
+### §4.54 pmu_stop(thread_handle) → result
+
+Stops counters on the target thread and frees its PMU state. Valid in any non-exited thread state — `pmu_stop` tears down bookkeeping regardless of whether the thread is currently running, ready, suspended, or faulted.
+
+**§4.54.1** `pmu_stop` returns `E_OK` on success. **§4.54.2** `pmu_stop` requires `ProcessRights.pmu` on slot 0; returns `E_PERM` without it. **§4.54.3** `pmu_stop` requires the `pmu` right on `thread_handle`; returns `E_PERM` without it. **§4.54.4** `pmu_stop` with invalid or wrong-type `thread_handle` returns `E_BADHANDLE`. **§4.54.5** `pmu_stop` on a thread with no PMU state (never started, or already stopped) returns `E_INVAL`. **§4.54.6** A thread's PMU state is automatically released on thread exit, so an explicit `pmu_stop` is not required before exit.
+
 ---
 
 ## §5 System Limits
@@ -776,5 +889,7 @@ De-asserts an IRQ line on the calling process's VM's in-kernel IOAPIC and kicks 
 | Futex timed waiter slots | 64 |
 | User permissions view | 1 page (128 entries × 32 bytes) |
 | DMA mappings per process | 16 |
-| Thread handle rights bits | 3 (suspend, resume, kill) |
+| Thread handle rights bits | 4 (suspend, resume, kill, pmu) |
 | Max vCPUs per VM | 64 |
+| PMU counters per thread | `PmuInfo.num_counters` (hardware-dependent) |
+| PMU counter slots in `PmuSample` | `MAX_COUNTERS` (kernel compile-time maximum across supported arches) |
