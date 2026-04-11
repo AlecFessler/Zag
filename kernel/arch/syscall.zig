@@ -10,6 +10,7 @@ const paging = zag.memory.paging;
 const pmu = zag.sched.pmu;
 const process_mod = zag.sched.process;
 const sched = zag.sched.scheduler;
+const sysinfo = zag.sched.sysinfo;
 
 const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
@@ -103,6 +104,7 @@ pub const SyscallNum = enum(u64) {
     pmu_read,
     pmu_reset,
     pmu_stop,
+    sys_info,
     _,
 };
 
@@ -177,6 +179,7 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
         .pmu_read => .{ .rax = sysPmuRead(arg0, arg1) },
         .pmu_reset => .{ .rax = sysPmuReset(arg0, arg1, arg2) },
         .pmu_stop => .{ .rax = sysPmuStop(arg0) },
+        .sys_info => .{ .rax = sysSysInfo(arg0, arg1) },
         _ => .{ .rax = E_INVAL },
     };
 }
@@ -2218,6 +2221,10 @@ fn sysPmuRead(thread_handle: u64, sample_ptr: u64) i64 {
 
 fn sysPmuReset(thread_handle: u64, configs_ptr: u64, count: u64) i64 {
     return pmu.sysPmuReset(currentProc(), thread_handle, configs_ptr, count);
+}
+
+fn sysSysInfo(info_ptr: u64, cores_ptr: u64) i64 {
+    return sysinfo.sysSysInfo(currentProc(), info_ptr, cores_ptr);
 }
 
 fn sysPmuStop(thread_handle: u64) i64 {

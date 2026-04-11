@@ -1,4 +1,5 @@
 pub const pmu = @import("pmu.zig");
+pub const sysinfo = @import("sysinfo.zig");
 
 pub const vm = struct {
     pub const GuestState = struct {};
