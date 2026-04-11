@@ -309,7 +309,13 @@ fn readConfigs(
     var i: usize = 0;
     while (i < count) : (i += 1) {
         const cfg = out_buf[i];
-        const ev_bit_idx: u6 = @intCast(@intFromEnum(cfg.event));
+        // `PmuEvent` is an open `enum(u8)`, so userspace can pass any value
+        // 0..255. `supported_events` is a u64 bitmask (bit i = variant i), so
+        // any event value ≥ 64 is definitionally unsupported — reject up front
+        // rather than `@intCast`-panicking on a value that doesn't fit u6.
+        const ev_raw: u8 = @intFromEnum(cfg.event);
+        if (ev_raw >= 64) return ConfigReadError.Invalid; // §4.51.7
+        const ev_bit_idx: u6 = @intCast(ev_raw);
         const event_bit = @as(u64, 1) << ev_bit_idx;
         if ((info.supported_events & event_bit) == 0) return ConfigReadError.Invalid;
         if (cfg.has_threshold and !info.overflow_support) return ConfigReadError.Invalid;
