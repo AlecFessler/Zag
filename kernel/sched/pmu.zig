@@ -277,14 +277,18 @@ fn lookupThread(proc: *Process, thread_handle: u64) ?*Thread {
 }
 
 /// Dual-gated rights check. Returns null on success, error code on failure.
-/// The function looks up slot 0 for `ProcessRights.pmu` and the thread
-/// entry for `ThreadHandleRights.pmu`; both must be present.
+/// Ordering: (a) look up the thread handle and type-check it first so an
+/// invalid handle always surfaces as `E_BADCAP`, regardless of whether the
+/// caller also lacks `ProcessRights.pmu`; (b) check `ProcessRights.pmu`
+/// on slot 0; (c) check `ThreadHandleRights.pmu` on the thread entry.
+/// (a) maps to §4.5{1,2,3,4}.4, (b) to §4.5{1,2,3,4}.2, (c) to §4.5{1,2,3,4}.3.
 fn checkRights(proc: *Process, thread_handle: u64) ?i64 {
+    const thread_entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
+    if (thread_entry.object != .thread) return E_BADCAP;
+
     const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
     if (!self_entry.processRights().pmu) return E_PERM;
 
-    const thread_entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
-    if (thread_entry.object != .thread) return E_BADCAP;
     if (!thread_entry.threadHandleRights().pmu) return E_PERM;
     return null;
 }
