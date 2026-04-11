@@ -26,7 +26,10 @@ const Process = zag.sched.process.Process;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 
-// ── Error codes (match kernel/arch/syscall.zig) ─────────────────────────
+// KEEP IN SYNC with kernel/arch/syscall.zig ──────────────────────────────
+// Duplicated here (rather than imported) so this file has no dependency
+// on the arch-layer syscall dispatch module; if you add or renumber any
+// error code in `kernel/arch/syscall.zig` mirror it here.
 const E_OK: i64 = 0;
 const E_INVAL: i64 = -1;
 const E_PERM: i64 = -2;
@@ -81,16 +84,13 @@ pub const PmuInfo = extern struct {
     supported_events: u64,
 };
 
-/// Snapshot of counter state returned by `pmu_read`.
-///
-/// `MAX_COUNTERS` is the kernel compile-time ceiling (`arch.pmu.MAX_COUNTERS`,
-/// currently 8 — sized to fit Intel architectural PMU v4+ and AMD PerfMonV2).
-/// Slots beyond `PmuInfo.num_counters` are zero.
 /// Compile-time ceiling on the number of hardware counter slots exposed
 /// through `PmuSample`. Sized to fit Intel architectural PMU v4+ and AMD
 /// PerfMonV2, both of which cap general-purpose counters at 8 per logical
-/// core (Intel SDM Vol 3 §18.2.5 / AMD APM Vol 2 §13.2.1). `arch.PmuState`
-/// sizes its own per-counter arrays against this same constant.
+/// core (Intel SDM Vol 3 §18.2.5 / AMD APM Vol 2 §13.2.1). Re-exported to
+/// the dispatch layer as `arch.dispatch.pmu_max_counters`, and mirrored by
+/// each arch's `PmuState` (see `arch/x64/pmu.zig:MAX_COUNTERS`).
+/// Slots beyond `PmuInfo.num_counters` in a `PmuSample` are zero.
 pub const MAX_COUNTERS: u8 = 8;
 
 pub const PmuSample = extern struct {

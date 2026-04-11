@@ -67,12 +67,12 @@ const PERFEVTSEL_OS: u64 = 1 << 17;
 const PERFEVTSEL_INT: u64 = 1 << 20;
 const PERFEVTSEL_EN: u64 = 1 << 22;
 
-/// PMI vector. Vectors 0x20..0x7F are reserved for external hardware IRQs;
-/// 0x80 is the syscall gate; 0x81..0xFC are available. 0xFB is below the
-/// scheduler/TLB vectors (0xFD/0xFE) and above the external IRQ range, so
-/// it lands cleanly outside the existing x64 IntVecs enum without
-/// colliding with anything already registered.
-const PMI_VECTOR: u8 = 0xFB;
+/// PMI vector. Registered in the shared `IntVecs` enum
+/// (`kernel/arch/x64/interrupts.zig`) at 0xFB — below the scheduler/TLB
+/// vectors (0xFD/0xFE) and above the external IRQ range (0x20..0x7F),
+/// outside the syscall gate (0x80), so it collides with nothing already
+/// allocated.
+const PMI_VECTOR: u8 = @intFromEnum(interrupts.IntVecs.pmu);
 
 /// Architectural event index (CPUID.0AH:EBX bits [6:0], 1 bit per
 /// architectural event; bit set means event is NOT available).
@@ -320,6 +320,10 @@ pub fn pmuClearState(state: *PmuState) void {
 }
 
 pub fn pmuSave(state: *PmuState) void {
+    // A thread with PMU state allocated but no counters configured (e.g.
+    // between pmu_stop and the next pmu_start, or a remote profiler that
+    // stamped then cleared) pays nothing on the hot context-switch path.
+    if (state.num_counters == 0) return;
     // Disable all counters first (Intel SDM Vol 3 §18.6.1) so the read of
     // each PMCx reflects the thread's exact end-of-timeslice value, not
     // something that crept up between the read and the next instruction.

@@ -30,6 +30,7 @@ pub const PageFaultContext = struct {
 
 pub const IntVecs = enum(u8) {
     syscall = 0x80,
+    pmu = 0xFB,
     tlb_shootdown = 0xFD,
     sched = 0xFE,
     spurious = 0xFF,
