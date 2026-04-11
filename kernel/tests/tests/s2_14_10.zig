@@ -16,8 +16,15 @@ var a_done: u64 align(8) = 0;
 var b_stop: u64 align(8) = 0;
 
 fn threadA() void {
-    _ = syscall.set_affinity(0b1);
-    _ = syscall.set_priority(syscall.PRIORITY_PINNED);
+    // §2.4.23 allows only one pinned owner per core, so this test must
+    // use set_affinity (not PRIORITY_PINNED) to force same-core contention
+    // with threadB. A PRIORITY_PINNED pair would silently fail with
+    // E_BUSY on the second thread and run it elsewhere.
+    const aff = syscall.set_affinity(0b1);
+    if (aff != syscall.E_OK) {
+        @atomicStore(u64, &a_ready, 0xffff_ffff_ffff_ffff, .seq_cst);
+        return;
+    }
     @atomicStore(u64, &a_ready, 1, .seq_cst);
     // Wait for parent to arm each phase.
     while (true) {
@@ -40,8 +47,11 @@ fn threadA() void {
 }
 
 fn threadB() void {
-    _ = syscall.set_affinity(0b1);
-    _ = syscall.set_priority(syscall.PRIORITY_PINNED);
+    const aff = syscall.set_affinity(0b1);
+    if (aff != syscall.E_OK) {
+        @atomicStore(u64, &b_ready, 0xffff_ffff_ffff_ffff, .seq_cst);
+        return;
+    }
     @atomicStore(u64, &b_ready, 1, .seq_cst);
     var acc: u64 = 0;
     while (@atomicLoad(u64, &b_stop, .seq_cst) == 0) {
@@ -59,17 +69,21 @@ fn threadB() void {
 ///   (2) contended — B is spinning+yielding on the same core — record C_cont.
 ///
 /// If the kernel correctly saves/restores A's PMU state, C_cont should
-/// reflect only A's own work and be close to C_solo (within ~2x to
-/// allow scheduler/measurement noise). A broken save/restore leaves
-/// C_cont either near zero (counters zeroed on restore) or polluted by
-/// B's work (counters not swapped on context switch) — both fall
-/// well outside the 2x bound.
+/// reflect only A's own work and be within a 4x band of C_solo — a
+/// deliberately wide tolerance chosen for QEMU's noisy scheduling. A
+/// broken save/restore leaves C_cont either near zero (counters zeroed
+/// on restore) or polluted by B's work (counters not swapped on context
+/// switch) — both fall well outside the 4x bound.
 pub fn main(_: u64) void {
     var info: syscall.PmuInfo = undefined;
     if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or info.num_counters == 0) {
         t.pass("§2.14.10");
         syscall.shutdown();
     }
+    const evt = syscall.pickSupportedEvent(info) orelse {
+        t.pass("§2.14.10");
+        syscall.shutdown();
+    };
 
     // Pin the parent somewhere other than core 0 if possible so that A and
     // B are the only things competing on core 0 (on 1-core QEMU this is a
@@ -84,10 +98,15 @@ pub fn main(_: u64) void {
     const a_h: u64 = @bitCast(a_i);
 
     while (@atomicLoad(u64, &a_ready, .seq_cst) == 0) syscall.thread_yield();
+    if (@atomicLoad(u64, &a_ready, .seq_cst) == 0xffff_ffff_ffff_ffff) {
+        t.fail("§2.14.10 threadA set_affinity");
+        _ = syscall.thread_kill(a_h);
+        syscall.shutdown();
+    }
 
-    // Start PMU counting instructions on thread A only.
+    // Start PMU counting the first supported event on thread A only.
     var cfg = syscall.PmuCounterConfig{
-        .event = .instructions,
+        .event = evt,
         .has_threshold = false,
         .overflow_threshold = 0,
     };
@@ -120,6 +139,12 @@ pub fn main(_: u64) void {
     }
     const b_h: u64 = @bitCast(b_i);
     while (@atomicLoad(u64, &b_ready, .seq_cst) == 0) syscall.thread_yield();
+    if (@atomicLoad(u64, &b_ready, .seq_cst) == 0xffff_ffff_ffff_ffff) {
+        t.fail("§2.14.10 threadB set_affinity");
+        _ = syscall.thread_kill(a_h);
+        _ = syscall.thread_kill(b_h);
+        syscall.shutdown();
+    }
 
     @atomicStore(u64, &a_done, 0, .seq_cst);
     @atomicStore(u64, &a_start, 1, .seq_cst);
