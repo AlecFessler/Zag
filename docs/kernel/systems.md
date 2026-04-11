@@ -2025,24 +2025,30 @@ x64.PmuState (extern struct) {
 
 ```
 pmuPmiHandler(frame):
-    1. Acknowledge the PMI at the LAPIC (EOI).
-    2. Read IA32_PERF_GLOBAL_STATUS; the set bits identify which counters overflowed.
-    3. Write those bits to IA32_PERF_GLOBAL_OVF_CTRL to clear them.
-    4. Write 0 to IA32_PERF_GLOBAL_CTRL to stop all counters on this core immediately.
+    1. Read IA32_PERF_GLOBAL_STATUS; the set bits identify which counters overflowed.
+       Write those bits to IA32_PERF_GLOBAL_OVF_CTRL to clear them.
+    2. Write 0 to IA32_PERF_GLOBAL_CTRL to stop all counters on this core immediately.
        (This prevents another PMI from firing while we're delivering the fault.)
-    5. Read the current thread from per-core state. If thread.pmu_state == null
+    3. Read the current thread from per-core state. If thread.pmu_state == null
        (race: pmu_stop completed between overflow and PMI), return to the
        interrupted context with counters disabled — no fault delivered.
-    6. Save the overflowed counter values into state.values (same as pmuSave).
-    7. Call proc.faultBlock(thread, .pmu_overflow, rip_at_pmi, rip_at_pmi).
+    4. Save the overflowed counter values into state.values (same as pmuSave).
+    5. Call proc.faultBlock(thread, .pmu_overflow, rip_at_pmi, rip_at_pmi).
        The existing fault delivery path (§18) handles single-thread-self-handler
        kill (§2.12.7), external-handler stop-all, and enqueue into the handler's
        fault_box. FaultMessage.fault_addr and FaultMessage.regs.rip are both
        the instruction pointer at the time of overflow — this is the sample.
-    8. If faultBlock returned false (no surviving handler), proceed with the
-       normal kill path from the interrupt frame.
-    9. If faultBlock returned true, yield into the scheduler. The thread is now
+    6. If faultBlock returned false (no surviving handler), kill the process
+       and halt this core in a `sti; hlt` loop. The handler must NOT return
+       from this path — returning would iret back to the killed thread's user
+       RIP. Same pattern as exceptionHandler's unhandled-user-fault path.
+    7. If faultBlock returned true, yield into the scheduler. The thread is now
        in .faulted state; the PMI handler does not return to the interrupted RIP.
+
+The PMI vector is registered as `.external` in `pmuInit`, so
+`dispatchInterrupt` issues the LAPIC EOI after the handler returns. The
+handler itself must not EOI — doing so would pop an extra ISR bit and
+could mis-acknowledge an unrelated lower-priority pending interrupt.
 ```
 
 The PMI handler does not program new counters; that is the profiler's job via `pmu_reset`. When the profiler eventually calls `fault_reply` with `FAULT_RESUME`, the scheduler resumes the thread via the normal context switch path, which calls `arch.pmuRestore` and re-enables the (now reprogrammed) counters. No special "resume from PMI" path is needed.

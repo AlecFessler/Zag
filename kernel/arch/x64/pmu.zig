@@ -375,36 +375,38 @@ fn clearAllOverflowStatus(num_counters: u8) void {
 /// EOIs, saves counter values, disables the global PMU, and hands the
 /// thread off to the fault delivery machinery with reason `pmu_overflow`.
 fn pmuPmiHandler(ctx: *cpu.Context) void {
-    // Step 1: ack the interrupt at the LAPIC. The dispatch path also
-    // does this for external vectors, but doing it explicitly here keeps
-    // the save/fault sequence self-contained and matches the ordering
-    // described in systems.md §20.
-    apic.endOfInterrupt();
-
-    // Step 2–3: read which counters overflowed, then clear those status
+    // The PMI vector is registered as `.external` in `pmuInit`, so
+    // `dispatchInterrupt` already issues `apic.endOfInterrupt()` after this
+    // handler returns. Do NOT EOI here — a second EOI would pop an extra
+    // ISR bit and could mis-acknowledge an unrelated lower-priority
+    // pending interrupt. The delivery order is therefore:
+    //     save + clear overflow status + disable global PMU → faultBlock →
+    //     dispatchInterrupt's post-handler EOI → iret.
+    //
+    // Step 1: read which counters overflowed, then clear those status
     // bits. Per Intel SDM Vol 3 §18.2.3 the global status register is
     // write-1-to-clear via IA32_PERF_GLOBAL_OVF_CTRL.
     const status = cpu.rdmsr(IA32_PERF_GLOBAL_STATUS);
     cpu.wrmsr(IA32_PERF_GLOBAL_OVF_CTRL, status);
 
-    // Step 4: stop all counters on this core so no second PMI can fire
+    // Step 2: stop all counters on this core so no second PMI can fire
     // between here and the fault delivery.
     cpu.wrmsr(IA32_PERF_GLOBAL_CTRL, 0);
 
-    // Step 5: find the thread that owns the overflow. If it has no PMU
+    // Step 3: find the thread that owns the overflow. If it has no PMU
     // state (race: pmu_stop completed between overflow and PMI), we just
     // return to the interrupted context with counters already disabled.
     const thread = sched.currentThread() orelse return;
     const state_ptr = thread.pmu_state orelse return;
 
-    // Step 6: snapshot the overflowed counter values into `state.values`
+    // Step 4: snapshot the overflowed counter values into `state.values`
     // — same as `pmuSave`.
     var i: u8 = 0;
     while (i < state_ptr.num_counters) : (i += 1) {
         state_ptr.values[i] = cpu.rdmsr(IA32_PMC_BASE + @as(u32, i));
     }
 
-    // Step 7: faultBlock delivers a fault message to the configured
+    // Step 5: faultBlock delivers a fault message to the configured
     // handler. FaultMessage.fault_addr and regs.rip are both the RIP at
     // the time of overflow, which is the profiler's sample.
     const rip_at_pmi = ctx.rip;
@@ -417,13 +419,13 @@ fn pmuPmiHandler(ctx: *cpu.Context) void {
     );
 
     if (!delivered) {
-        // Step 8: no surviving handler — fall through to the same kill
+        // Step 6: no surviving handler — fall through to the same kill
         // path the generic exception handler uses (§2.12.7 / §2.12.9).
         thread.process.kill(.pmu_overflow);
         return;
     }
 
-    // Step 9: yield so the scheduler picks a different thread; this
+    // Step 7: yield so the scheduler picks a different thread; this
     // thread is now .faulted and the PMI handler must not return to the
     // interrupted RIP.
     sched.yield();
