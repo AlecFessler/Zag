@@ -23,6 +23,7 @@ pub const FaultReason = enum(u5) {
     normal_exit = 12,
     killed = 13,
     breakpoint = 14,
+    pmu_overflow = 15,
     _,
 };
 
@@ -42,7 +43,8 @@ pub const ProcessRights = packed struct(u16) {
     mem_shm_create: bool = false,
     device_own: bool = false,
     fault_handler: bool = false,
-    _reserved: u8 = 0,
+    pmu: bool = false,
+    _reserved: u7 = 0,
 };
 
 pub const VmReservationRights = packed struct(u8) {
@@ -85,12 +87,18 @@ pub const ThreadHandleRights = packed struct(u8) {
     @"suspend": bool = false,
     @"resume": bool = false,
     kill: bool = false,
-    _reserved: u5 = 0,
+    /// Bit 3 is reserved for layout alignment with the public spec layout
+    /// (see systems.md §4). Keep this as a _reserved single-bit slot so
+    /// `pmu` lands on bit 4 as the spec requires.
+    _reserved_bit3: u1 = 0,
+    pmu: bool = false,
+    _reserved: u3 = 0,
 
     pub const full = ThreadHandleRights{
         .@"suspend" = true,
         .@"resume" = true,
         .kill = true,
+        .pmu = true,
     };
 };
 

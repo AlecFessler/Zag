@@ -7,6 +7,7 @@ const futex = zag.sched.futex;
 const kvm = zag.kvm;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
+const pmu = zag.sched.pmu;
 const process_mod = zag.sched.process;
 const sched = zag.sched.scheduler;
 
@@ -97,6 +98,11 @@ pub const SyscallNum = enum(u64) {
     vm_msr_passthrough,
     vm_ioapic_assert_irq,
     vm_ioapic_deassert_irq,
+    pmu_info,
+    pmu_start,
+    pmu_read,
+    pmu_reset,
+    pmu_stop,
     _,
 };
 
@@ -166,6 +172,11 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
         .vm_msr_passthrough => .{ .rax = sysVmMsrPassthrough(arg0, arg1, arg2) },
         .vm_ioapic_assert_irq => .{ .rax = sysVmIoapicAssertIrq(arg0) },
         .vm_ioapic_deassert_irq => .{ .rax = sysVmIoapicDeassertIrq(arg0) },
+        .pmu_info => .{ .rax = sysPmuInfo(arg0) },
+        .pmu_start => .{ .rax = sysPmuStart(arg0, arg1, arg2) },
+        .pmu_read => .{ .rax = sysPmuRead(arg0, arg1) },
+        .pmu_reset => .{ .rax = sysPmuReset(arg0, arg1, arg2) },
+        .pmu_stop => .{ .rax = sysPmuStop(arg0) },
         _ => .{ .rax = E_INVAL },
     };
 }
@@ -2187,4 +2198,26 @@ fn sysVmIoapicAssertIrq(irq_num: u64) i64 {
 fn sysVmIoapicDeassertIrq(irq_num: u64) i64 {
     const proc = currentProc();
     return kvm.vm.ioapicDeassertIrq(proc, irq_num);
+}
+
+// --- PMU (§4.50–§4.54) ---
+
+fn sysPmuInfo(info_ptr: u64) i64 {
+    return pmu.sysPmuInfo(currentProc(), info_ptr);
+}
+
+fn sysPmuStart(thread_handle: u64, configs_ptr: u64, count: u64) i64 {
+    return pmu.sysPmuStart(currentProc(), thread_handle, configs_ptr, count);
+}
+
+fn sysPmuRead(thread_handle: u64, sample_ptr: u64) i64 {
+    return pmu.sysPmuRead(currentProc(), thread_handle, sample_ptr);
+}
+
+fn sysPmuReset(thread_handle: u64, configs_ptr: u64, count: u64) i64 {
+    return pmu.sysPmuReset(currentProc(), thread_handle, configs_ptr, count);
+}
+
+fn sysPmuStop(thread_handle: u64) i64 {
+    return pmu.sysPmuStop(currentProc(), thread_handle);
 }

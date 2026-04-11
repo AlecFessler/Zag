@@ -9,6 +9,7 @@ pub const interrupts = @import("interrupts.zig");
 pub const iommu = @import("iommu.zig");
 pub const irq = @import("irq.zig");
 pub const paging = @import("paging.zig");
+pub const pmu = @import("pmu.zig");
 pub const serial = @import("serial.zig");
 pub const smp = @import("smp.zig");
 pub const timers = @import("timers.zig");

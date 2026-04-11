@@ -75,9 +75,13 @@ pub const KernelVA = struct {
             .start = kvm_vm_slab.end,
             .end = kvm_vm_slab.end + SLAB_RESERVATION,
         };
-        pub const heap_tree: Range = .{
+        pub const pmu_state_slab: Range = .{
             .start = kvm_vcpu_slab.end,
-            .end = kvm_vcpu_slab.end + PAGE1G,
+            .end = kvm_vcpu_slab.end + SLAB_RESERVATION,
+        };
+        pub const heap_tree: Range = .{
+            .start = pmu_state_slab.end,
+            .end = pmu_state_slab.end + PAGE1G,
         };
         pub const heap: Range = .{
             .start = heap_tree.end,

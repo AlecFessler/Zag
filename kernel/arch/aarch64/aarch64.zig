@@ -1,3 +1,5 @@
+pub const pmu = @import("pmu.zig");
+
 pub const vm = struct {
     pub const GuestState = struct {};
     pub const VmExitInfo = struct {};

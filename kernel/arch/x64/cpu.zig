@@ -154,6 +154,30 @@ pub fn cpuid(eax: CpuidLeaf, ecx: u32) struct {
     return .{ .eax = a, .ebx = b, .ecx = c, .edx = d };
 }
 
+/// Raw CPUID for arbitrary leaf/subleaf numbers. Used by the PMU detection
+/// path which needs leaf `0x0A` (architectural performance monitoring,
+/// Intel SDM Vol 3 §18.2.2) — not worth broadening `CpuidLeaf` for.
+pub fn cpuidRaw(leaf: u32, subleaf: u32) struct {
+    eax: u32,
+    ebx: u32,
+    ecx: u32,
+    edx: u32,
+} {
+    var a: u32 = leaf;
+    var b: u32 = 0;
+    var c: u32 = subleaf;
+    var d: u32 = 0;
+    asm volatile ("cpuid"
+        : [a] "={eax}" (a),
+          [b] "={ebx}" (b),
+          [c] "={ecx}" (c),
+          [d] "={edx}" (d),
+        : [in_a] "{eax}" (leaf),
+          [in_c] "{ecx}" (subleaf),
+    );
+    return .{ .eax = a, .ebx = b, .ecx = c, .edx = d };
+}
+
 pub fn enableInterrupts() void {
     asm volatile ("sti");
 }

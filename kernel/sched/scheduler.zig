@@ -66,6 +66,23 @@ pub fn coreRunning(thread: *Thread) ?u64 {
     return null;
 }
 
+/// PMU save/restore hook around `arch.switchTo`. Centralizes the
+/// null-guarded calls described in systems.md §6 "PMU Save/Restore Hooks"
+/// so every `switchTo` site in this file goes through the same pair.
+///
+/// The save must fire under the outgoing thread's identity so the final
+/// hardware counter values are captured before the context switch, and
+/// the restore must fire under the incoming thread's identity so the
+/// counters are re-enabled with no mis-accounting window. `arch.switchTo`
+/// does not return to this frame — it jumps into the incoming thread's
+/// kernel stack. The "return" side of the restore is therefore actually
+/// executed the next time the *previously outgoing* thread resumes here.
+inline fn switchToWithPmu(outgoing: *Thread, next: *Thread) void {
+    if (outgoing.pmu_state) |st| arch.pmuSave(st);
+    arch.switchTo(next);
+    if (next.pmu_state) |st| arch.pmuRestore(st);
+}
+
 /// Remove `thread` from any core's run queue. Used when a remote thread is
 /// killed while .ready (so we can deinit it without leaving a dangling pointer).
 pub fn removeFromAnyRunQueue(thread: *Thread) void {
@@ -199,7 +216,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
             }
             armSchedTimer(state, SCHED_TIMESLICE_NS);
             if (next_thread == preempted) return;
-            arch.switchTo(next_thread);
+            switchToWithPmu(preempted, next_thread);
             return;
         }
     }
@@ -247,7 +264,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
             }
             armSchedTimer(state, SCHED_TIMESLICE_NS);
             if (pinned == preempted) return;
-            arch.switchTo(pinned);
+            switchToWithPmu(preempted, pinned);
             return;
         }
 
@@ -311,7 +328,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     }
     armSchedTimer(state, SCHED_TIMESLICE_NS);
     if (next_thread == preempted) return;
-    arch.switchTo(next_thread);
+    switchToWithPmu(preempted, next_thread);
 }
 
 pub fn yield() void {
@@ -493,6 +510,11 @@ fn pickCoreForThread(thread: *Thread, current_core: u64) ?u64 {
 pub fn switchToNextReady() noreturn {
     const core_id = arch.coreID();
     const state = &core_states[core_id];
+    // Outgoing is whoever was running on this core before the caller
+    // flipped its state to .blocked. We read it *before* overwriting
+    // `state.running_thread` so the PMU save fires under the outgoing
+    // thread's identity (systems.md §6 "PMU Save/Restore Hooks").
+    const outgoing: ?*Thread = @atomicLoad(?*Thread, &state.running_thread, .acquire);
 
     state.rq_lock.lock();
     var next = state.rq.dequeue();
@@ -516,7 +538,11 @@ pub fn switchToNextReady() noreturn {
     state.rq_lock.unlock();
 
     armSchedTimer(state, SCHED_TIMESLICE_NS);
-    arch.switchTo(next_thread);
+    if (outgoing) |out| {
+        switchToWithPmu(out, next_thread);
+    } else {
+        arch.switchTo(next_thread);
+    }
     unreachable;
 }
 
@@ -551,7 +577,7 @@ pub fn switchToThread(current: *Thread, target: *Thread, ctx: *ArchCpuContext, e
         target.on_cpu.store(true, .release);
         state.running_thread = target;
         armSchedTimer(state, SCHED_TIMESLICE_NS);
-        arch.switchTo(target);
+        switchToWithPmu(current, target);
     } else {
         target.state = .ready;
         enqueueOnCore(target_core, target);
@@ -578,7 +604,7 @@ pub fn switchToThread(current: *Thread, target: *Thread, ctx: *ArchCpuContext, e
         state.running_thread = next_thread;
         state.rq_lock.unlock();
         armSchedTimer(state, SCHED_TIMESLICE_NS);
-        arch.switchTo(next_thread);
+        switchToWithPmu(current, next_thread);
     }
     unreachable;
 }
