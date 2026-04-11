@@ -18,6 +18,7 @@ pub fn main(pv: u64) void {
         .mem_shm_create = true,
         .device_own = true,
         .fault_handler = true,
+        .pmu = true,
     };
     if (slot0.entry_type == perm_view.ENTRY_TYPE_PROCESS and slot0.rights == @as(u16, @bitCast(all_rights))) {
         t.pass("§2.1.14");
