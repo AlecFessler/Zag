@@ -16,11 +16,13 @@ usage() {
 Usage: ./test.sh [target] [options]
 
 Targets:
-  kernel          Run kernel integration tests (QEMU)
+  kernel          Run kernel integration tests (QEMU, 473 tests)
   router          Run router integration tests (pytest)
+  linux           Boot Linux guest in hyprvOS, verify shell prompt
+  pre-commit      Run kernel + linux + router (gate before commit)
   kernel-fuzz     Run all kernel fuzzers (buddy, heap, vmm, rbt)
   router-fuzz     Run router packet processing fuzzer
-  all             Run kernel + router tests (default)
+  all             Run kernel + linux + router tests (default)
 
 Options:
   -h, --help        Show this help
@@ -112,7 +114,46 @@ clean_nvvars() {
 run_kernel_tests() {
     echo "=== Kernel Tests ==="
     clean_nvvars
-    zig build run -Dprofile=test
+    PARALLEL="${PARALLEL:-8}" bash "$SCRIPT_DIR/kernel/tests/run_tests.sh"
+}
+
+run_linux_boot_test() {
+    echo "=== Linux VM Boot Test ==="
+    clean_nvvars
+
+    (cd "$SCRIPT_DIR/hyprvOS" && zig build) || { echo "hyprvOS build failed"; return 1; }
+    (cd "$SCRIPT_DIR" && zig build -Dprofile=hyprvos -Diommu=amd) || { echo "kernel build failed"; return 1; }
+
+    local qemu_log
+    qemu_log=$(mktemp)
+    (cd "$SCRIPT_DIR" && timeout 90 zig build run -Dprofile=hyprvos -Diommu=amd -- -display none) > "$qemu_log" 2>&1 &
+    local qemu_pid=$!
+
+    local found=0
+    for _ in $(seq 1 90); do
+        if grep -q "=== Zag VM Shell ===" "$qemu_log" 2>/dev/null; then
+            found=1
+            break
+        fi
+        sleep 1
+    done
+
+    kill -TERM $qemu_pid 2>/dev/null || true
+    pkill -f "qemu-system-x86_64" 2>/dev/null || true
+    wait $qemu_pid 2>/dev/null || true
+
+    if [[ $found -eq 1 ]]; then
+        echo "[PASS] Linux booted to shell"
+        rm -f "$qemu_log"
+        return 0
+    else
+        echo "[FAIL] Linux did not reach shell within 90s"
+        echo "--- last 30 lines of QEMU output ---"
+        tail -30 "$qemu_log"
+        echo "--- end ---"
+        rm -f "$qemu_log"
+        return 1
+    fi
 }
 
 run_router_tests() {
@@ -164,14 +205,24 @@ case "$TARGET" in
     router)
         run_router_tests
         ;;
+    linux)
+        run_linux_boot_test
+        ;;
     kernel-fuzz)
         run_kernel_fuzzers
         ;;
     router-fuzz)
         run_router_fuzzer
         ;;
+    pre-commit)
+        # Required gate before any agent commits — fails fast on the first failure.
+        run_kernel_tests || exit 1
+        run_linux_boot_test || exit 1
+        run_router_tests || exit 1
+        ;;
     all)
         run_kernel_tests
+        run_linux_boot_test
         run_router_tests
         ;;
     *)
