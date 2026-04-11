@@ -215,7 +215,7 @@ noinline fn bootLinux() void {
     buildBootParams(hdr.initramfs_size);
 
     // Command line
-    boot.setupCmdline("console=ttyS0,115200n8 earlycon=uart,io,0x3f8,115200n8 keep_bootcon nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
+    boot.setupCmdline("console=ttyS0,115200n8 nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
 
     // ACPI tables (kernel handles LAPIC/IOAPIC emulation)
     acpi.setupTables();
@@ -258,7 +258,7 @@ noinline fn bootLinuxEmbedded() void {
     buildBootParams(initramfs_data.len);
 
     // Command line
-    boot.setupCmdline("console=ttyS0,115200n8 earlycon=uart,io,0x3f8,115200n8 keep_bootcon nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
+    boot.setupCmdline("console=ttyS0,115200n8 nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
 
     acpi.setupTables();
     setupLinuxState();

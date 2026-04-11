@@ -470,6 +470,28 @@ The action passed to `vm_reply`:
 
 **§2.13.13** The `VmExitMessage.guest_state` snapshot reflects the guest register state at the point of exit, including the instruction pointer of the exiting instruction.
 
+#### In-Kernel LAPIC and IOAPIC
+
+The kernel emulates a single-vCPU Local APIC at guest physical `0xFEE00000` and a 24-pin I/O APIC at guest physical `0xFEC00000` for every VM. Guest accesses to either page are handled inline by the kernel without exiting to the VMM.
+
+**§2.13.14** `guest_map` returns `E_INVAL` if the requested guest physical region overlaps the LAPIC page (`0xFEE00000`) or the IOAPIC page (`0xFEC00000`).
+
+**§2.13.15** Guest reads and writes to LAPIC and IOAPIC MMIO are handled inline by the kernel and do not produce VM exits to the VMM.
+
+#### MSR Passthrough
+
+The VMM can request that specific MSRs be made directly accessible to the guest (no VM exit on RDMSR/WRMSR). The kernel maintains a hard blocklist of security-critical MSRs that must always be intercepted regardless of VMM request.
+
+**§2.13.16** The MSR passthrough security blocklist contains: `EFER` (`0xC0000080`), `STAR` (`0xC0000081`), `LSTAR` (`0xC0000082`), `CSTAR` (`0xC0000083`), `SFMASK` (`0xC0000084`), `IA32_APIC_BASE` (`0x1B`), `KERNEL_GS_BASE` (`0xC0000102`), `IA32_SYSENTER_CS` (`0x174`), `IA32_SYSENTER_ESP` (`0x175`), and `IA32_SYSENTER_EIP` (`0x176`).
+
+#### Userspace IRQ Assertion
+
+`ioapic_assert_irq` and `ioapic_deassert_irq` let userspace device emulators drive the in-kernel IOAPIC directly.
+
+**§2.13.17** `ioapic_assert_irq` and `ioapic_deassert_irq` accept IRQ line numbers in the range `[0, 24)` matching the in-kernel IOAPIC's 24 redirection table entries.
+
+After a successful `ioapic_assert_irq` or `ioapic_deassert_irq`, the kernel sends an inter-processor interrupt to any core currently executing one of the VM's vCPUs so the vCPU re-enters its scheduling loop and observes the new interrupt state. This kick is what allows guests in tight polling loops to see freshly asserted IRQs without waiting for a timer-induced exit; the end-to-end behavior is exercised by the Linux boot integration test (`./test.sh linux`).
+
 ---
 
 ## §3 Fault Reasons
@@ -725,6 +747,24 @@ Transitions a vCPU from `idle` to `running`, making its thread eligible for sche
 Injects a virtual interrupt into a vCPU.
 
 **§4.46.1** `vcpu_interrupt` returns `E_OK` on success. **§4.46.2** `vcpu_interrupt` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`. **§4.46.3** `vcpu_interrupt` with `interrupt_ptr` not readable returns `E_BADADDR`.
+
+### §4.47 msr_passthrough(msr_num, allow_read, allow_write) → result
+
+Configures the calling process's VM to allow the guest to RDMSR and/or WRMSR the specified MSR directly without exiting. The kernel rejects security-critical MSRs (§2.13.16).
+
+**§4.47.1** `msr_passthrough` returns `E_OK` on success. **§4.47.2** `msr_passthrough` with no VM returns `E_INVAL`. **§4.47.3** `msr_passthrough` with `msr_num` outside the 32-bit MSR address range returns `E_INVAL`. **§4.47.4** `msr_passthrough` with an MSR in the security blocklist (§2.13.16) returns `E_PERM`.
+
+### §4.48 ioapic_assert_irq(irq_num) → result
+
+Asserts an IRQ line on the calling process's VM's in-kernel IOAPIC and kicks any running vCPU so the new interrupt state is observed promptly (§2.13.18).
+
+**§4.48.1** `ioapic_assert_irq` returns `E_OK` on success. **§4.48.2** `ioapic_assert_irq` with no VM returns `E_INVAL`. **§4.48.3** `ioapic_assert_irq` with `irq_num` greater than or equal to 24 returns `E_INVAL`.
+
+### §4.49 ioapic_deassert_irq(irq_num) → result
+
+De-asserts an IRQ line on the calling process's VM's in-kernel IOAPIC and kicks any running vCPU so the new interrupt state is observed promptly (§2.13.18).
+
+**§4.49.1** `ioapic_deassert_irq` returns `E_OK` on success. **§4.49.2** `ioapic_deassert_irq` with no VM returns `E_INVAL`. **§4.49.3** `ioapic_deassert_irq` with `irq_num` greater than or equal to 24 returns `E_INVAL`.
 
 ---
 

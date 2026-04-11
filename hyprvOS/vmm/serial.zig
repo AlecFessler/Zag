@@ -91,18 +91,27 @@ pub noinline fn init(pv: u64) void {
 
 /// Poll host serial for available data and buffer it.
 /// Call this periodically from the exit loop.
+/// If RX interrupts are enabled (IER bit 0) and we got data, set irq_pending
+/// so the exit loop routes IRQ4 through the IOAPIC.
 pub fn pollHostRx() void {
     if (host_serial_handle == 0) return;
 
-    // Check host LSR for data ready
-    const lsr_val = syscall.ioport_read(host_serial_handle, REG_LSR, 1);
-    if (lsr_val < 0) return;
-    if (@as(u8, @truncate(@as(u64, @bitCast(lsr_val)))) & LSR_DATA_READY == 0) return;
+    var got_data = false;
+    while (true) {
+        const lsr_val = syscall.ioport_read(host_serial_handle, REG_LSR, 1);
+        if (lsr_val < 0) return;
+        if (@as(u8, @truncate(@as(u64, @bitCast(lsr_val)))) & LSR_DATA_READY == 0) break;
 
-    // Read the byte
-    const data_val = syscall.ioport_read(host_serial_handle, REG_DATA, 1);
-    if (data_val < 0) return;
-    rxPush(@truncate(@as(u64, @bitCast(data_val))));
+        const data_val = syscall.ioport_read(host_serial_handle, REG_DATA, 1);
+        if (data_val < 0) return;
+        rxPush(@truncate(@as(u64, @bitCast(data_val))));
+        got_data = true;
+    }
+
+    // Trigger RX data available interrupt if enabled
+    if (got_data and ier & 0x01 != 0) {
+        irq_pending = true;
+    }
 }
 
 pub fn isSerialPort(port: u16) bool {
