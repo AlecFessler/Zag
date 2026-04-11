@@ -22,10 +22,14 @@ pub fn build(b: *std.Build) void {
     });
     app_mod.addImport("lib", lib_mod);
 
-    // Assets module disabled — using NVMe disk loading instead
-    // const embedded_wf = b.addWriteFiles();
-    // ...
-    // app_mod.addImport("assets", assets_mod);
+    // Embedded assets for QEMU fallback (NVMe may not work in emulation)
+    const assets_mod = b.createModule(.{
+        .root_source_file = b.path("assets/assets.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .pic = true,
+    });
+    app_mod.addImport("assets", assets_mod);
 
     const start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "libz/start.zig" },

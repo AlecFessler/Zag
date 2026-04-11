@@ -74,6 +74,12 @@ var timer_initial_count: u32 = 0;
 var timer_current_count: u32 = 0;
 var timer_divide_config: u32 = 0;
 
+/// Returns true once Linux has programmed the LAPIC timer (initial count != 0).
+/// Used to disable PIT IRQ generation — PIT is only needed for boot-time check_timer().
+pub fn timerActive() bool {
+    return timer_initial_count != 0;
+}
+
 /// Timer accumulator: fractional nanoseconds carried between tick() calls.
 var timer_accum_ns: u64 = 0;
 
@@ -180,17 +186,32 @@ pub noinline fn write(offset: u32, value: u32) void {
             handleICR();
         },
         REG_ICR_HI => icr_hi = value,
-        REG_LVT_TIMER => lvt_timer = value,
+        REG_LVT_TIMER => {
+            if (lvt_timer & 0x10000 != 0 and value & 0x10000 == 0) {
+                log.print("LAPIC: timer unmasked vec=0x");
+                log.hex8(@truncate(value & 0xFF));
+                log.print("\n");
+            }
+            lvt_timer = value;
+        },
         REG_LVT_THERMAL => lvt_thermal = value,
         REG_LVT_PERF => lvt_perf = value,
         REG_LVT_LINT0 => lvt_lint0 = value,
         REG_LVT_LINT1 => lvt_lint1 = value,
         REG_LVT_ERROR => lvt_error = value,
         REG_TIMER_ICR => {
+            if (timer_initial_count == 0 and value != 0) {
+                log.print("LAPIC: timer started icr=");
+                log.dec(value);
+                log.print(" div=");
+                log.dec(getTimerDivisor());
+                log.print(" lvt=0x");
+                log.hex32(lvt_timer);
+                log.print("\n");
+            }
             timer_initial_count = value;
             timer_current_count = value;
             timer_accum_ns = 0;
-            // Writing 0 stops the timer (Section 13.5.4)
         },
         REG_TIMER_DCR => timer_divide_config = value & 0x0B, // Only bits 3, 1:0 used
         else => {
@@ -263,8 +284,6 @@ pub fn getPendingVector() ?u8 {
     const irr_vec = highestSetBit(&irr) orelse return null;
     const isr_vec = highestSetBit(&isr) orelse 0;
 
-    // Priority class = vector >> 4. An interrupt is deliverable if its
-    // priority class is greater than both the ISR priority and TPR priority.
     const irr_prio = irr_vec >> 4;
     const isr_prio = isr_vec >> 4;
     const tpr_prio: u8 = @truncate((tpr >> 4) & 0xF);
@@ -276,10 +295,14 @@ pub fn getPendingVector() ?u8 {
 }
 
 /// Accept an interrupt vector: move from IRR to ISR.
-/// Called after the VMM injects the interrupt into the guest via VMCB.
 pub fn acceptInterrupt(vector: u8) void {
     clearBit(&irr, vector);
     setBit(&isr, vector);
+}
+
+/// Check if a vector is pending in IRR or active in ISR.
+pub fn isVectorInFlight(vector: u8) bool {
+    return getBit(&irr, vector) or getBit(&isr, vector);
 }
 
 /// Set the IRR bit for an external interrupt vector.

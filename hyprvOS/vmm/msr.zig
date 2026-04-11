@@ -35,30 +35,7 @@ var shadow_tsc_aux: u64 = 0;
 var shadow_fs_base: u64 = 0;
 var shadow_gs_base: u64 = 0;
 
-// Track unique MSRs seen
-var seen_msr_r: [32]u32 = .{0xFFFFFFFF} ** 32;
-var seen_msr_r_count: usize = 0;
-var seen_msr_w: [32]u32 = .{0xFFFFFFFF} ** 32;
-var seen_msr_w_count: usize = 0;
-
-fn logMsrIfNew(msr_num: u32, is_write: bool) void {
-    const seen = if (is_write) &seen_msr_w else &seen_msr_r;
-    const count = if (is_write) &seen_msr_w_count else &seen_msr_r_count;
-    for (seen.*[0..count.*]) |s| {
-        if (s == msr_num) return;
-    }
-    if (count.* < seen.*.len) {
-        seen.*[count.*] = msr_num;
-        count.* += 1;
-    }
-    if (is_write) log.print("MSR_W ") else log.print("MSR_R ");
-    log.print("0x");
-    log.hex32(msr_num);
-    log.print("\n");
-}
-
 pub fn handleRead(msr_num: u32, state: *GuestState) void {
-    logMsrIfNew(msr_num, false);
     const value: u64 = switch (msr_num) {
         IA32_EFER => state.efer,
         IA32_STAR => state.star,
@@ -92,7 +69,7 @@ pub fn handleRead(msr_num: u32, state: *GuestState) void {
 }
 
 pub fn handleWrite(msr_num: u32, state: *GuestState) void {
-    logMsrIfNew(msr_num, true);
+
     // WRMSR reads value from EDX:EAX
     const value: u64 = (@as(u64, @as(u32, @truncate(state.rdx))) << 32) | @as(u64, @as(u32, @truncate(state.rax)));
 

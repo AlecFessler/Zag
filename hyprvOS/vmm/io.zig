@@ -4,6 +4,8 @@
 
 const lib = @import("lib");
 
+const ioapic = @import("ioapic.zig");
+const lapic = @import("lapic.zig");
 const log = @import("log.zig");
 const serial = @import("serial.zig");
 
@@ -59,6 +61,7 @@ const PIT_NS_PER_TICK: u64 = 838; // ~838.1 ns
 // Channel 0 state
 var pit_ch0_reload: u16 = 0; // reload value (0 = 65536)
 var pit_ch0_start_ns: u64 = 0; // host timestamp when counter started
+var pit_ch0_last_irq_ns: u64 = 0; // last time we fired IRQ
 var pit_ch0_latched: bool = false; // latch command pending
 var pit_ch0_latch_val: u16 = 0; // latched count value
 var pit_ch0_read_hi: bool = false; // next read is high byte (for lobyte/hibyte access)
@@ -215,26 +218,38 @@ noinline fn handlePitRead(channel: u2) u32 {
     return 0;
 }
 
-// Track unique IO ports seen
-var seen_io_ports: [64]u16 = .{0xFFFF} ** 64;
-var seen_io_count: usize = 0;
+/// Check if PIT channel 0 has fired and assert IOAPIC IRQ if so.
+/// ACPI MADT has IRQ0→GSI2 override, so we assert IOAPIC pin 2.
+/// Coalesces: won't re-fire if the previous timer vector is still in the
+/// LAPIC pipeline (IRR or ISR), preventing timer starvation of serial.
+pub noinline fn pitCheckIrq() void {
+    if (pit_ch0_reload == 0 and pit_ch0_mode == 0) return;
+    if (pit_ch0_mode != 2 and pit_ch0_mode != 3 and pit_ch0_mode != 0) return;
 
-fn logPortIfNew(port: u16, is_write: bool) void {
-    for (seen_io_ports[0..seen_io_count]) |s| {
-        if (s == port) return;
+    const reload_val: u64 = if (pit_ch0_reload == 0) 65536 else @as(u64, pit_ch0_reload);
+    const period_ns = reload_val * PIT_NS_PER_TICK;
+    const now = syscall.clock_gettime();
+
+    if (pit_ch0_mode == 0) {
+        if (pit_ch0_last_irq_ns == 0 and pit_ch0_start_ns > 0) {
+            if (now -% pit_ch0_start_ns >= period_ns) {
+                pit_ch0_last_irq_ns = now;
+                ioapic.assertIrq(2);
+            }
+        }
+    } else {
+        if (pit_ch0_start_ns == 0) return;
+        if (now -% pit_ch0_last_irq_ns >= period_ns) {
+            pit_ch0_last_irq_ns = now;
+            ioapic.assertIrq(2);
+            ioapic.deassertIrq(2);
+        }
     }
-    if (seen_io_count < seen_io_ports.len) {
-        seen_io_ports[seen_io_count] = port;
-        seen_io_count += 1;
-    }
-    if (is_write) log.print("IO_W ") else log.print("IO_R ");
-    log.print("port=0x");
-    log.hex16(port);
-    log.print("\n");
 }
 
+
+
 pub fn handleOut(port: u16, size: u8, value: u32, state: *GuestState) void {
-    logPortIfNew(port, true);
     _ = state;
     _ = size;
 
@@ -312,7 +327,6 @@ pub fn handleOut(port: u16, size: u8, value: u32, state: *GuestState) void {
 }
 
 pub fn handleIn(port: u16, size: u8, state: *GuestState) u32 {
-    logPortIfNew(port, false);
     _ = state;
     _ = size;
 

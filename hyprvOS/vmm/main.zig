@@ -5,6 +5,7 @@
 const lib = @import("lib");
 
 const acpi = @import("acpi.zig");
+const assets = @import("assets");
 const boot = @import("boot.zig");
 const cpuid = @import("cpuid.zig");
 const disk = @import("disk.zig");
@@ -13,6 +14,7 @@ const ioapic = @import("ioapic.zig");
 const lapic = @import("lapic.zig");
 const log = @import("log.zig");
 const mem = @import("mem.zig");
+const mmio = @import("mmio.zig");
 const msr = @import("msr.zig");
 const serial = @import("serial.zig");
 
@@ -118,11 +120,11 @@ pub fn main(pv: u64) void {
     // Init host serial for RX bridging
     serial.init(pv);
 
-    // Try NVMe for Linux boot, fall back to tiny test guest
+    // Try NVMe for Linux boot, fall back to embedded assets
     if (disk.init(pv)) {
         bootLinux();
     } else {
-        bootTinyGuest();
+        bootLinuxEmbedded();
     }
 
     _ = syscall.vcpu_set_state(vcpu, @intFromPtr(&guest_state));
@@ -159,6 +161,8 @@ pub fn main(pv: u64) void {
     log.dec(if_one_count);
     log.print(" IF0=");
     log.dec(if_zero_count);
+    log.print(" ept=");
+    log.dec(ept_count);
     log.print(" ===\n");
     _ = syscall.vm_destroy();
     syscall.shutdown();
@@ -229,14 +233,65 @@ noinline fn bootLinux() void {
     buildBootParams(hdr.initramfs_size);
 
     // Command line
-    boot.setupCmdline("console=ttyS0,115200n8 earlycon=uart,io,0x3f8,115200n8 earlyprintk=serial,ttyS0,115200,keep nokaslr nolapic noapic acpi=off nohpet nosmp ignore_loglevel tsc=reliable lpj=5000000 no_console_suspend keep_bootcon");
+    boot.setupCmdline("console=ttyS0,115200n8 console=ttyS0,115200n8 nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
 
     // ACPI tables
     acpi.setupTables();
 
+    // LAPIC + IOAPIC emulation — map device pages so accesses cause EPT violations
+    // Do NOT map 0xFEE00000/0xFEC00000 into guest physical space; NPT faults
+    // will be delivered as EPT violation exits for us to emulate via MMIO decode.
+    lapic.init();
+    ioapic.init();
+
     // Guest state: 32-bit protected mode
     setupLinuxState();
     log.print("Linux configured\n");
+}
+
+/// Embedded assets fallback — loads bzImage/initramfs from ELF when NVMe unavailable.
+noinline fn bootLinuxEmbedded() void {
+    log.print("Using embedded assets\n");
+    mem.setupGuestMemory(GUEST_RAM_LINUX);
+    mem.mapMmioStubs();
+
+    const bzimage = assets.bzimage;
+    const initramfs_data = assets.initramfs;
+
+    // Parse setup header from embedded bzImage
+    const ss = bzimage[0x1F1];
+    const setup_sects: u32 = if (ss == 0) 4 else @as(u32, ss);
+    const setup_size: u64 = (@as(u64, setup_sects) + 1) * 512;
+    log.print("setup_sects=");
+    log.dec(setup_sects);
+    log.print("\n");
+
+    // Copy protected-mode kernel to 0x100000
+    const pm_kernel = bzimage[setup_size..];
+    mem.writeGuest(boot.KERNEL_ADDR, pm_kernel);
+
+    // Copy setup header to temp area for buildBootParams to read
+    mem.writeGuest(TEMP_ADDR, bzimage[0..setup_size]);
+
+    // Copy initramfs
+    mem.writeGuest(boot.INITRAMFS_ADDR, initramfs_data);
+    log.print("initramfs size=");
+    log.dec(initramfs_data.len);
+    log.print("\n");
+
+    // Build boot_params
+    buildBootParams(initramfs_data.len);
+
+    // Command line
+    boot.setupCmdline("console=ttyS0,115200n8 console=ttyS0,115200n8 nokaslr nohpet maxcpus=1 tsc=reliable lpj=5000000");
+
+    // ACPI tables + LAPIC/IOAPIC
+    acpi.setupTables();
+    lapic.init();
+    ioapic.init();
+
+    setupLinuxState();
+    log.print("Linux configured (embedded)\n");
 }
 
 noinline fn bootTinyGuest() void {
@@ -339,6 +394,7 @@ noinline fn setupLinuxState() void {
 /// VM exit handling loop — separate noinline to isolate stack frame.
 noinline fn exitLoop(vcpu_handle: u64) void {
     const start = syscall.clock_gettime();
+    last_timer_ns = start;
     const timeout_ns: u64 = 600_000_000_000; // 10 minutes
 
     while (true) {
@@ -350,7 +406,9 @@ noinline fn exitLoop(vcpu_handle: u64) void {
             }
             // Poll host serial for input while waiting
             serial.pollHostRx();
-            // Proactively inject timer interrupts
+            // Check PIT timer for IOAPIC interrupts
+            io.pitCheckIrq();
+            // Proactively inject pending interrupts
             proactiveTimerInject(vcpu_handle);
             syscall.thread_yield();
             continue;
@@ -372,15 +430,18 @@ noinline fn exitLoop(vcpu_handle: u64) void {
             break;
         }
 
-        // Inject timer interrupt if due and guest has IF=1
-        maybeInjectTimer(gs);
-
-        // Inject serial IRQ4 if pending and guest has IF=1
-        if (serial.irq_pending and gs.rflags & (1 << 9) != 0 and gs.pending_eventinj & (1 << 31) == 0) {
-            const vec: u8 = io.pic1_vector_base + 4; // IRQ4 = serial
-            gs.pending_eventinj = @as(u64, vec) | (1 << 31); // valid external interrupt
+        // Route serial IRQ4 through IOAPIC if pending
+        if (serial.irq_pending) {
             serial.irq_pending = false;
+            ioapic.assertIrq(4);
+            ioapic.deassertIrq(4);
         }
+
+        // Check PIT → IOAPIC (only active during boot, disabled once LAPIC timer starts)
+        io.pitCheckIrq();
+
+        // Tick LAPIC timer + inject pending LAPIC vector
+        maybeInjectLapic(gs);
 
         // Resume guest
         @as(*align(1) u64, @ptrCast(&reply_buf)).* = REPLY_RESUME;
@@ -458,120 +519,6 @@ noinline fn handleTag(tag: u8, gs: *GuestState) bool {
     }
     if (tag == EXIT_HLT) {
         hlt_count += 1;
-        if (hlt_count == 1) {
-            log.print("=== FIRST HLT ===\n");
-            log.print("RIP=0x");
-            log.hex64(gs.rip);
-            log.print(" RSP=0x");
-            log.hex64(gs.rsp);
-            log.print(" RFLAGS=0x");
-            log.hex64(gs.rflags);
-            log.print("\n");
-            log.print("CR0=0x");
-            log.hex64(gs.cr0);
-            log.print(" CR3=0x");
-            log.hex64(gs.cr3);
-            log.print(" CR4=0x");
-            log.hex64(gs.cr4);
-            log.print(" EFER=0x");
-            log.hex64(gs.efer);
-            log.print("\n");
-            log.print("RAX=0x");
-            log.hex64(gs.rax);
-            log.print(" RBX=0x");
-            log.hex64(gs.rbx);
-            log.print(" RCX=0x");
-            log.hex64(gs.rcx);
-            log.print(" RDX=0x");
-            log.hex64(gs.rdx);
-            log.print("\n");
-            log.print("RSI=0x");
-            log.hex64(gs.rsi);
-            log.print(" RDI=0x");
-            log.hex64(gs.rdi);
-            log.print(" RBP=0x");
-            log.hex64(gs.rbp);
-            log.print("\n");
-            log.print("CS: sel=0x");
-            log.hex16(gs.cs.selector);
-            log.print(" base=0x");
-            log.hex64(gs.cs.base);
-            log.print(" limit=0x");
-            log.hex32(gs.cs.limit);
-            log.print(" ar=0x");
-            log.hex16(gs.cs.access_rights);
-            log.print("\n");
-            log.print("SS: sel=0x");
-            log.hex16(gs.ss.selector);
-            log.print(" ar=0x");
-            log.hex16(gs.ss.access_rights);
-            log.print("\n");
-            // Try to read guest phys at RIP - kernel_base to see code bytes
-            // Standard kernel maps 0xFFFFFFFF81000000 → phys 0x1000000
-            const phys = gs.rip -% 0xFFFFFFFF80000000;
-            log.print("Phys of RIP=0x");
-            log.hex64(phys);
-            if (phys < 128 * 1024 * 1024) {
-                log.print(" bytes:");
-                // Dump 16 bytes at and around RIP
-                var bi: u64 = 0;
-                while (bi < 16) : (bi += 1) {
-                    log.print(" ");
-                    log.hex8(mem.readGuestByte(phys + bi));
-                }
-            }
-            log.print("\n");
-            // Try to read panic message or strings from various registers
-            // RSI often points to format string in panic()
-            dumpGuestString("RSI str", gs.rsi);
-            dumpGuestString("RDI str", gs.rdi);
-            // RBX might point to a struct or string
-            dumpGuestString("RBX str", gs.rbx);
-            // Stack[0] might be a return address — try to read string near it
-            const sp_phys = gs.rsp -% 0xFFFFFFFF80000000;
-            if (sp_phys < 128 * 1024 * 1024) {
-                log.print("Stack (8 qwords):");
-                var si: u64 = 0;
-                while (si < 64) : (si += 8) {
-                    log.print(" 0x");
-                    const b0: u64 = mem.readGuestByte(sp_phys + si);
-                    const b1: u64 = mem.readGuestByte(sp_phys + si + 1);
-                    const b2: u64 = mem.readGuestByte(sp_phys + si + 2);
-                    const b3: u64 = mem.readGuestByte(sp_phys + si + 3);
-                    const b4: u64 = mem.readGuestByte(sp_phys + si + 4);
-                    const b5: u64 = mem.readGuestByte(sp_phys + si + 5);
-                    const b6: u64 = mem.readGuestByte(sp_phys + si + 6);
-                    const b7: u64 = mem.readGuestByte(sp_phys + si + 7);
-                    log.hex64(b7 << 56 | b6 << 48 | b5 << 40 | b4 << 32 | b3 << 24 | b2 << 16 | b1 << 8 | b0);
-                }
-                log.print("\n");
-                // Try stack[0] as a return address — read string near it
-                const ret0_b0: u64 = mem.readGuestByte(sp_phys);
-                const ret0_b1: u64 = mem.readGuestByte(sp_phys + 1);
-                const ret0_b2: u64 = mem.readGuestByte(sp_phys + 2);
-                const ret0_b3: u64 = mem.readGuestByte(sp_phys + 3);
-                const ret0_b4: u64 = mem.readGuestByte(sp_phys + 4);
-                const ret0_b5: u64 = mem.readGuestByte(sp_phys + 5);
-                const ret0_b6: u64 = mem.readGuestByte(sp_phys + 6);
-                const ret0_b7: u64 = mem.readGuestByte(sp_phys + 7);
-                const ret0 = ret0_b7 << 56 | ret0_b6 << 48 | ret0_b5 << 40 | ret0_b4 << 32 | ret0_b3 << 24 | ret0_b2 << 16 | ret0_b1 << 8 | ret0_b0;
-                dumpGuestString("ret[0] str", ret0);
-            }
-            // Also scan stack for string pointers (addresses in 0xFFFFFFFF83D4XXXX range look like rodata)
-            // Stack values 0xFFFFFFFF83D4C0CE etc look like string pointers
-            dumpGuestString("StrA", 0xFFFFFFFF83D4C0CE);
-            dumpGuestString("StrB", 0xFFFFFFFF83D4C0C1);
-            dumpGuestString("StrC", 0xFFFFFFFF83D4C0DA);
-            dumpGuestString("StrD", 0xFFFFFFFF83CBC7DF);
-        } else if (hlt_count <= 3) {
-            log.print("HLT #");
-            log.dec(hlt_count);
-            log.print(" RIP=0x");
-            log.hex64(gs.rip);
-            log.print(" IF=");
-            log.dec((gs.rflags >> 9) & 1);
-            log.print("\n");
-        }
         gs.rip += 1;
         return false;
     }
@@ -592,15 +539,7 @@ noinline fn handleTag(tag: u8, gs: *GuestState) bool {
     if (tag == EXIT_EPT) {
         const ept_addr = rdU64(&exit_buf, OFF_PAYLOAD);
         ept_count += 1;
-        if (ept_count <= 10) {
-            log.print("EPT@0x");
-            log.hex64(ept_addr);
-            log.print(" RIP=0x");
-            log.hex64(gs.rip);
-            log.print("\n");
-        }
-        if (ept_count > 1000) return true;
-        return false;
+        return handleEpt(ept_addr, gs);
     }
     if (tag == EXIT_EXCEPT) {
         log.print("#");
@@ -627,29 +566,86 @@ noinline fn handleTag(tag: u8, gs: *GuestState) bool {
     return true;
 }
 
+/// Handle EPT violation (NPT fault). LAPIC/IOAPIC MMIO emulation.
+/// Returns true to kill guest (unhandled address).
+noinline fn handleEpt(guest_phys: u64, gs: *GuestState) bool {
+    const page = guest_phys & 0xFFFFF000;
+
+    if (page == lapic.APIC_BASE or page == ioapic.IOAPIC_BASE) {
+        const op = mmio.decode(gs) orelse {
+            if (ept_count <= 10) {
+                log.print("EPT: decode fail @0x");
+                log.hex64(guest_phys);
+                log.print(" RIP=0x");
+                log.hex64(gs.rip);
+                log.print("\n");
+            }
+            // Skip the instruction to avoid infinite loop — guess 4 bytes
+            gs.rip += 4;
+            return false;
+        };
+
+        const offset: u32 = @truncate(guest_phys & 0xFFF);
+
+        if (page == lapic.APIC_BASE) {
+            if (op.is_write) {
+                lapic.write(offset, op.value);
+            } else {
+                const val = lapic.read(offset);
+                writeGpr(gs, op.reg, @as(u64, val));
+            }
+        } else {
+            if (op.is_write) {
+                ioapic.write(offset, op.value);
+            } else {
+                const val = ioapic.read(offset);
+                writeGpr(gs, op.reg, @as(u64, val));
+            }
+        }
+
+        gs.rip += op.len;
+        return false;
+    }
+
+    // Unknown EPT address
+    if (ept_count <= 10) {
+        log.print("EPT@0x");
+        log.hex64(guest_phys);
+        log.print(" RIP=0x");
+        log.hex64(gs.rip);
+        log.print("\n");
+    }
+    if (ept_count > 1000) return true;
+    return false;
+}
+
 var timer_inject_count: u64 = 0;
 var if_one_count: u64 = 0;
 var if_zero_count: u64 = 0;
 
-/// Inject a timer interrupt (IRQ0) if enough time has passed and the guest
-/// has interrupts enabled (RFLAGS.IF=1). Uses the PIC's configured vector
-/// offset (typically 0x20 after Linux remaps the PIC).
-/// SVM EVENTINJ format: vector[7:0] | type[10:8] | EV[11] | valid[31]
-noinline fn maybeInjectTimer(gs: *GuestState) void {
+/// Tick LAPIC timer and inject highest-priority deliverable vector.
+noinline fn maybeInjectLapic(gs: *GuestState) void {
     const now = syscall.clock_gettime();
-    if (now -% last_timer_ns < TIMER_INTERVAL_NS) return;
+    const elapsed = now -% last_timer_ns;
     last_timer_ns = now;
 
-    // Only inject if guest has IF=1 (bit 9 of RFLAGS)
-    if (gs.rflags & (1 << 9) == 0) return;
+    // Always tick the LAPIC timer so scheduling stays responsive.
+    // PIT coalescing (isVectorInFlight check) prevents timer starvation
+    // of lower-priority vectors like serial.
+    lapic.tick(elapsed);
 
-    // Don't overwrite a pending event
-    if (gs.pending_eventinj & (1 << 31) != 0) return;
+    if (lapic.getPendingVector()) |vec| {
+        injectVector(gs, vec);
+    }
+}
 
-    // IRQ0 → vector from PIC1 base (typically 0x20 after Linux remaps)
-    const vector: u8 = io.pic1_vector_base;
-    // EVENTINJ: vector | type=0 (external) | EV=0 | valid=1
-    gs.pending_eventinj = @as(u64, vector) | (1 << 31);
+fn injectVector(gs: *GuestState, vec: u8) void {
+    if (gs.pending_eventinj & (1 << 31) != 0) return; // slot occupied
+
+    // Set pending_eventinj — SVM hardware will deliver when IF=1,
+    // or defer via V_IRQ if IF=0. Don't skip on IF=0.
+    gs.pending_eventinj = @as(u64, vec) | (1 << 31);
+    lapic.acceptInterrupt(vec);
     timer_inject_count += 1;
 }
 
@@ -669,27 +665,34 @@ var proactive_timer_intr: GuestInterrupt = .{
     .error_code_valid = false,
 };
 
-/// Proactively inject a timer interrupt into a running guest via
-/// the vcpu_interrupt syscall. This is needed when the guest is in a
-/// computation loop without VM exits (e.g., xor benchmark, calibrate_delay).
+/// Proactively inject pending LAPIC vectors into a running guest via
+/// vcpu_interrupt. Needed when the guest runs without VM exits.
 noinline fn proactiveTimerInject(vcpu_handle: u64) void {
-    // Don't inject until the PIC has been initialized by Linux
-    // (default vector base is 0x08, Linux remaps to 0x20)
-    if (io.pic1_vector_base == 0x08) return;
-
-    // Don't inject until we've seen the guest enable interrupts (IF=1).
-    // Before that, injections are wasted (IF=0 → processor ignores them)
-    // and the IPI-based suspend/resume disrupts the guest.
     if (if_one_count == 0) return;
 
-    const now = syscall.clock_gettime();
-    if (now -% last_timer_ns < TIMER_INTERVAL_NS) return;
-    last_timer_ns = now;
+    // Route pending serial IRQ into LAPIC IRR
+    if (serial.irq_pending) {
+        serial.irq_pending = false;
+        ioapic.assertIrq(4);
+        ioapic.deassertIrq(4);
+    }
 
-    proactive_timer_intr.vector = io.pic1_vector_base;
+    // Tick LAPIC timer
+    const now = syscall.clock_gettime();
+    const elapsed = now -% last_timer_ns;
+    if (elapsed >= TIMER_INTERVAL_NS) {
+        last_timer_ns = now;
+        lapic.tick(elapsed);
+    }
+
+    const vec = lapic.getPendingVector() orelse return;
+
+    proactive_timer_intr.vector = vec;
+    proactive_timer_intr.interrupt_type = 0;
 
     const r = syscall.vcpu_interrupt(vcpu_handle, @intFromPtr(&proactive_timer_intr));
     if (r == syscall.E_OK) {
+        lapic.acceptInterrupt(vec);
         proactive_inject_count += 1;
         timer_inject_count += 1;
     }
@@ -703,28 +706,6 @@ fn findVcpuHandle(pv: u64) u64 {
             return view[i].handle;
     }
     return 0;
-}
-
-noinline fn dumpGuestString(label: []const u8, vaddr: u64) void {
-    // Convert kernel virtual to physical (standard mapping)
-    const phys = vaddr -% 0xFFFFFFFF80000000;
-    if (phys >= 128 * 1024 * 1024) return;
-    log.print(label);
-    log.print("(0x");
-    log.hex64(vaddr);
-    log.print("): \"");
-    var i: u64 = 0;
-    while (i < 80) : (i += 1) {
-        const b = mem.readGuestByte(phys + i);
-        if (b == 0) break;
-        if (b >= 0x20 and b < 0x7F) {
-            const ch: [1]u8 = .{b};
-            log.print(&ch);
-        } else {
-            log.print(".");
-        }
-    }
-    log.print("\"\n");
 }
 
 fn writeGpr(s: *GuestState, gpr: u4, val: u64) void {

@@ -34,11 +34,12 @@ var lcr: u8 = 0;
 var mcr: u8 = 0;
 var ier: u8 = 0;
 
-// Interrupt pending flag — set when we need to inject IRQ4
+// IOAPIC interrupt routing flag — set when we need to assert IRQ4 on IOAPIC
 pub var irq_pending: bool = false;
 var dll: u8 = 0;
 var dlm: u8 = 0;
 var scr: u8 = 0;
+var fcr: u8 = 0; // FIFO Control Register (write-only, shadows for IIR FIFO bits)
 
 // Host serial device handle (0 = not found)
 var host_serial_handle: u64 = 0;
@@ -114,10 +115,13 @@ pub fn handleOut(port: u16, value: u8) void {
             if (dlab()) {
                 dll = value;
             } else {
-                // TX: forward to Zag serial
+                // TX: forward to Zag serial instantly.
                 const ch: [1]u8 = .{value};
                 syscall.write(&ch);
-                // Signal TX complete interrupt if IER has THRE enabled (bit 1)
+                // THR is immediately empty again (instant TX). If THRE
+                // interrupts are enabled, route IRQ through IOAPIC so the
+                // guest can send the next byte(s). The IIR handler always
+                // reports THRE when IER bit 1 is set (THR is always empty).
                 if (ier & 0x02 != 0) {
                     irq_pending = true;
                 }
@@ -127,10 +131,17 @@ pub fn handleOut(port: u16, value: u8) void {
             if (dlab()) {
                 dlm = value;
             } else {
+                const old_ier = ier;
                 ier = value;
+                // If THRE interrupt just got enabled and THR is empty (always true
+                // in our emulation), trigger an immediate THRE interrupt.
+                // This is how the 8250 driver kicks off the first TX.
+                if (value & 0x02 != 0 and old_ier & 0x02 == 0) {
+                    irq_pending = true;
+                }
             }
         },
-        COM1_IIR => {},
+        COM1_IIR => fcr = value, // Write to 0x3FA = FCR (FIFO Control Register)
         COM1_LCR => lcr = value,
         COM1_MCR => mcr = value,
         COM1_SCR => scr = value,
@@ -150,14 +161,21 @@ pub fn handleIn(port: u16) u32 {
         COM1_IER => if (dlab()) @as(u32, dlm) else @as(u32, ier),
         COM1_IIR => blk: {
             // IIR: bits 3:1 = interrupt ID, bit 0 = 0 if interrupt pending
-            if (irq_pending) {
-                irq_pending = false; // Reading IIR clears the interrupt
-                break :blk @as(u32, 0x02); // TX holding register empty interrupt
-            }
+            // Priority: RX data (highest) > THRE > modem status (lowest)
+            // Bits 7:6 reflect FIFO state (0b11 when FIFOs enabled).
+            const fifo_bits: u32 = if (fcr & 0x01 != 0) 0xC0 else 0x00;
             if (rxHasData() and (ier & 0x01 != 0)) {
-                break :blk @as(u32, 0x04); // RX data available interrupt
+                break :blk fifo_bits | 0x04; // RX data available interrupt
             }
-            break :blk @as(u32, 0x01); // No interrupt pending
+            // THRE: THR is always empty in our instant-TX emulation, so
+            // THRE interrupt is pending whenever IER bit 1 (THRE IE) is set.
+            // The 8250 driver clears IER bit 1 via __stop_tx() when it has
+            // no more data to send, which makes this report "no interrupt"
+            // and lets the ISR loop terminate naturally.
+            if (ier & 0x02 != 0) {
+                break :blk fifo_bits | 0x02; // TX holding register empty
+            }
+            break :blk fifo_bits | 0x01; // No interrupt pending
         },
         COM1_LCR => lcr,
         COM1_MCR => mcr,

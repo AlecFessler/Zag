@@ -86,6 +86,12 @@ pub noinline fn write(offset: u32, value: u32) void {
     }
 }
 
+/// Get the vector for a given IRQ pin from the redirection table.
+pub fn getVector(irq: u5) u8 {
+    if (irq >= NUM_REDIR_ENTRIES) return 0;
+    return @truncate(redir_table[irq] & 0xFF);
+}
+
 /// Assert an IRQ line. Routes through the redirection table to the LAPIC.
 /// Section 3.2.4: Redirection table entry format.
 pub noinline fn assertIrq(irq: u5) void {
@@ -100,16 +106,12 @@ pub noinline fn assertIrq(irq: u5) void {
 
     if (trigger_mode == 0) {
         // Edge-triggered: deliver on rising edge (transition from 0 to 1).
-        // Section 3.2.4: "A new edge on that Interrupt input pin will not be
-        // recognized until the IOAPIC broadcasts the corresponding message."
-        if (irq_level & irq_bit != 0) return; // Already asserted, no new edge
+        if (irq_level & irq_bit != 0) return;
         irq_level |= irq_bit;
     } else {
         // Level-triggered: deliver if not already pending (remote IRR = 0).
-        // Bit 14: Remote IRR
-        if (entry & (1 << 14) != 0) return; // Already accepted, waiting for EOI
+        if (entry & (1 << 14) != 0) return;
         irq_level |= irq_bit;
-        // Set Remote IRR (bit 14) to indicate delivery in progress
         redir_table[irq] |= (1 << 14);
     }
 
@@ -171,8 +173,8 @@ fn readRegister(index: u8) u32 {
 /// Write an IOAPIC register by index (via IOREGSEL).
 fn writeRegister(index: u8, value: u32) void {
     switch (index) {
-        REG_ID => ioapic_id = value & 0x0F000000, // Only bits 27:24 writable
-        REG_VER, REG_ARB => {}, // Read-only registers, writes ignored
+        REG_ID => ioapic_id = value & 0x0F000000,
+        REG_VER, REG_ARB => {},
         REG_REDTBL_BASE...0x3F => {
             const reg_off = index - REG_REDTBL_BASE;
             const entry_idx = reg_off / 2;

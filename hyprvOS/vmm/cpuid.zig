@@ -6,30 +6,9 @@ const log = @import("log.zig");
 
 const GuestState = @import("main.zig").GuestState;
 
-// Track unique CPUID leaves seen (up to 64)
-var seen_leaves: [64]u32 = .{0} ** 64;
-var seen_count: usize = 0;
-
-fn logIfNew(leaf: u32, subleaf: u32) void {
-    // Check if we've already seen this leaf
-    for (seen_leaves[0..seen_count]) |s| {
-        if (s == leaf) return;
-    }
-    if (seen_count < seen_leaves.len) {
-        seen_leaves[seen_count] = leaf;
-        seen_count += 1;
-    }
-    log.print("CPUID leaf=0x");
-    log.hex32(leaf);
-    log.print(" sub=0x");
-    log.hex32(subleaf);
-    log.print("\n");
-}
-
 pub fn handle(state: *GuestState) void {
     const leaf: u32 = @truncate(state.rax);
     const subleaf: u32 = @truncate(state.rcx);
-    logIfNew(leaf, subleaf);
 
     switch (leaf) {
         // Basic CPUID: max leaf + "AuthenticAMD"
