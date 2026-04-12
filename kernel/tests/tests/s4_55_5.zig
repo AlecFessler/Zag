@@ -6,9 +6,12 @@ const t = lib.testing;
 /// §4.55.5 — `sys_info` with `cores_ptr` non-null must point to a writable region of `core_count * sizeof(CoreInfo)` bytes, where `core_count` is the value written to `info_ptr.core_count` by the same call; otherwise returns `E_BADADDR`.
 ///
 /// Pass a valid `info_ptr` but a definitively non-writable `cores_ptr`
-/// (null). §4.55.5 requires `E_BADADDR`. Using null guarantees that the
-/// failure can't be attributed to anything else — a non-null but
-/// unmapped address would also work but is redundant.
+/// (address `1`: non-null, unaligned, and guaranteed unmapped — this
+/// slips past the kernel's purely-symbolic `validateUserWritable`
+/// range check and only fails at the page-walking `probeUserWritable`
+/// helper, which is the exact path that satisfies §4.55.5 together
+/// with the "no partial write to `info_ptr` on E_BADADDR" invariant).
+/// §4.55.5 requires `E_BADADDR`.
 pub fn main(_: u64) void {
     var info: syscall.SysInfo = undefined;
     // info_ptr intentionally valid. We use a sentinel so we can also

@@ -157,11 +157,25 @@ pub fn currentThread() ?*Thread {
 /// is therefore not a transactional snapshot — a reader can see a tick's
 /// increment attributed to one side without yet seeing the other. This is
 /// acceptable because the drift between sides is bounded by one tick
-/// (~2 ms) and far below any reasonable polling cadence. `rq_lock` is
-/// still acquired here to serialize concurrent `sys_info` callers and to
-/// keep the read-and-reset interleaving with the scheduler tick coherent
-/// at IRQ-disabled granularity, but it does not provide a multi-counter
-/// transaction.
+/// (~2 ms) and far below any reasonable polling cadence.
+///
+/// `rq_lock.lockIrqSave()` is still acquired here for two purposes, both
+/// narrower than a multi-counter transaction:
+///
+///   * When `core_id` is the caller's own core, IRQ-disable prevents the
+///     LOCAL scheduler tick from firing between the `idle_ns` Xchg and
+///     the `busy_ns` Xchg and attributing the same tick to both sides.
+///     This tightens the per-counter guarantee into a "one tick gap at
+///     most" for the local case.
+///   * For any `core_id`, the lock serializes concurrent `sys_info`
+///     callers sweeping the same core so they don't race each other and
+///     lose an accounting window.
+///
+/// It does NOT stop a REMOTE core's scheduler tick from executing its
+/// own `@atomicRmw(.Add, .monotonic)` while the caller's Xchg is in
+/// flight — IRQ-disable is scoped to the caller's core only. Cross-core
+/// concurrency between this function and `schedTimerHandler` is covered
+/// purely by the per-counter atomicity of the RMW pair.
 ///
 /// Returns a pair of (idle_ns, busy_ns) covering the accounting window
 /// that ended at this call.

@@ -116,13 +116,18 @@ pub fn main(_: u64) void {
         total += cores[k].idle_ns + cores[k].busy_ns;
     }
 
-    // Threshold: 1 ms of aggregate accounting. The burn in step (2) is
-    // tens of ms of wall-time; with `core_count` cores running in
-    // parallel, the aggregate idle+busy accounting easily exceeds
-    // hundreds of ms. 1 ms is far above any plausible pure-syscall-
-    // overhead gap between steps (4) and (5), so a reset on the null
-    // call would shrink the total well below this threshold.
-    const MIN_TOTAL_NS: u64 = 1_000_000;
+    // Threshold: 50 ms of aggregate accounting. The scheduler tick is
+    // 2 ms (§6, `SCHED_TIMESLICE_NS`), so a SINGLE tick landing between
+    // steps (4) and (5) on a busy rig could contribute up to ~2 ms per
+    // core × core_count — on a 4-core QEMU that is already ~8 ms of
+    // noise from one tick, and VM-scheduling jitter can push it higher.
+    // A 1 ms threshold is therefore too tight: a buggy kernel that
+    // reset on the null call could still scrape above 1 ms from a
+    // single stray tick attributed to idle_ns. 50 ms is comfortably
+    // above that noise floor while still being an order of magnitude
+    // below the tens-to-hundreds of ms of burn accounting step (2)
+    // produces on any realistic host — headroom is ~10x either way.
+    const MIN_TOTAL_NS: u64 = 50_000_000;
     if (total < MIN_TOTAL_NS) {
         t.failWithVal(
             "§4.55.4 null call appears to have reset accounting",
