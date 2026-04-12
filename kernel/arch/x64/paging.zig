@@ -14,18 +14,32 @@ const PageSize = zag.memory.paging.PageSize;
 const SpinLock = zag.utils.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
 
-// TLB shootdown: per-core pending invalidation addresses.
-// Each core checks its slot before returning to userspace.
+/// TLB shootdown: per-core pending invalidation addresses.
+/// Each core checks its slot before returning to userspace.
+///
+/// Intel SDM Vol 3A, Section 5.10.5 "Propagation of Paging-Structure Changes to
+/// Multiple Processors" requires software to broadcast invalidations; this is
+/// implemented via IPI + INVLPG on each remote core.
 var shootdown_lock: SpinLock = .{};
 var shootdown_addr: u64 = 0;
 
 /// IPI handler for TLB shootdown: invalidate the requested address.
 /// endOfInterrupt is called by dispatchInterrupt for .external vectors.
+///
+/// Intel SDM Vol 3A, Section 5.10.4.1 -- INVLPG invalidates any TLB entries
+/// for the page containing the operand address, including global entries.
 pub fn tlbShootdownHandler(_: *cpu.Context) void {
     cpu.invlpg(@atomicLoad(u64, &shootdown_addr, .acquire));
 }
 
-/// Flush a user virtual address from all cores' TLBs.
+/// Flush a virtual address from all cores' TLBs.
+///
+/// Intel SDM Vol 3A, Section 5.10.5 -- when a paging-structure entry is
+/// modified on one logical processor, software must propagate the
+/// invalidation to other processors that may have cached the old
+/// translation. This is done here by broadcasting an IPI that executes
+/// INVLPG on each remote core (Section 5.10.4.1).
+///
 /// The IPI is fire-and-forget: remote cores may have interrupts disabled
 /// (e.g. mid-syscall), but the IPI will be delivered before any userspace
 /// instruction executes (the pending interrupt fires on iret).  This is
@@ -50,19 +64,43 @@ fn flushRemoteTlb(virt_addr: u64) void {
     }
 }
 
+/// Page-table entry for 4-level paging.
+///
+/// Intel SDM Vol 3A, Table 5-20 "Format of a Page-Table Entry that Maps a
+/// 4-KByte Page". The same layout is used for non-leaf entries that reference
+/// the next paging structure (Tables 5-15, 5-17, 5-19) with minor field
+/// reinterpretation (e.g. bit 7 is PS instead of PAT in directory entries).
 pub const PageEntry = packed struct(u64) {
+    /// Bit 0 (P) -- Intel SDM Vol 3A, Table 5-20: must be 1 to map a page.
     present: bool = false,
+    /// Bit 1 (R/W) -- Intel SDM Vol 3A, Table 5-20: if 0, writes are not allowed.
     writable: bool = false,
+    /// Bit 2 (U/S) -- Intel SDM Vol 3A, Table 5-20: if 0, user-mode accesses are not allowed.
     user_accessible: bool = false,
+    /// Bit 3 (PWT) -- Intel SDM Vol 3A, Table 5-20: page-level write-through.
     write_through: bool = false,
+    /// Bit 4 (PCD) -- Intel SDM Vol 3A, Table 5-20: page-level cache disable.
     not_cacheable: bool = false,
+    /// Bit 5 (A) -- Intel SDM Vol 3A, Table 5-20: set by hardware on access.
     accessed: bool = false,
+    /// Bit 6 (D) -- Intel SDM Vol 3A, Table 5-20: set by hardware on write.
     dirty: bool = false,
+    /// Bit 7 -- Intel SDM Vol 3A, Table 5-20: PAT bit for 4-KByte PTEs;
+    /// Table 5-18: PS (page size) for PDEs that map 2-MByte pages.
+    /// In leaf L1 entries this kernel uses it as the PAT index bit to select
+    /// write-combining memory type (Section 5.9.2).
     huge_page: bool = false,
+    /// Bit 8 (G) -- Intel SDM Vol 3A, Table 5-20: global; if CR4.PGE = 1,
+    /// the translation is not invalidated on MOV to CR3 (Section 5.10).
     global: bool = false,
+    /// Bits 10:9 -- ignored by hardware.
     ignored: u3 = 0,
+    /// Bits M-1:12 -- Intel SDM Vol 3A, Table 5-20: physical address of the
+    /// 4-KByte page (or next paging structure for non-leaf entries).
     addr: u40 = 0,
     _res: u11 = 0,
+    /// Bit 63 (XD) -- Intel SDM Vol 3A, Table 5-20: execute-disable when
+    /// IA32_EFER.NXE = 1; instruction fetches are not allowed from the page.
     not_executable: bool = false,
 
     pub fn setPAddr(self: *PageEntry, paddr: PAddr) void {
@@ -80,6 +118,15 @@ const DEFAULT_PAGE_ENTRY = PageEntry{};
 
 const PAGE_ENTRY_TABLE_SIZE = 512;
 
+/// Level shift constants for 4-level paging linear-address translation.
+///
+/// Intel SDM Vol 3A, Figure 5-8 "Linear-Address Translation to a 4-KByte
+/// Page Using 4-Level Paging":
+///   - Bits 47:39 index the PML4 table  (L4SH = 39)
+///   - Bits 38:30 index the PDPT         (L3SH = 30)
+///   - Bits 29:21 index the page directory (L2SH = 21)
+///   - Bits 20:12 index the page table    (L1SH = 12)
+///   - Bits 11:0  are the page offset
 const L4SH: u6 = 39;
 const L3SH: u6 = 30;
 const L2SH: u6 = 21;
@@ -101,16 +148,31 @@ fn l1Idx(virt: VAddr) u9 {
     return @truncate(virt.addr >> L1SH);
 }
 
+/// Return the physical address of the current PML4 table from CR3.
+///
+/// Intel SDM Vol 3A, Table 5-12 "Use of CR3 with 4-Level Paging and
+/// 5-Level Paging and CR4.PCIDE = 0": bits M-1:12 hold the physical
+/// address of the 4-KByte aligned PML4 table.
 pub fn getAddrSpaceRoot() PAddr {
     const cr3 = cpu.readCr3();
     const mask: u64 = 0xFFF;
     return PAddr.fromInt(cr3 & ~mask);
 }
 
+/// Load a new PML4 table address into CR3, switching the active address space.
+///
+/// Intel SDM Vol 3A, Table 5-12; Section 5.10.4.1 -- MOV to CR3 also
+/// invalidates all non-global TLB entries for the current PCID.
 pub fn swapAddrSpace(root: PAddr) void {
     cpu.writeCr3(root.addr);
 }
 
+/// Copy the upper-half (kernel) PML4 entries from the current address space
+/// into a new PML4 table. Entries 256..511 cover the kernel's virtual
+/// address range (bits 47:39 >= 256, i.e. canonical high-half addresses).
+///
+/// Intel SDM Vol 3A, Section 5.5.4, Figure 5-8 -- bits 47:39 of the linear
+/// address select the PML4 entry; the upper 256 entries map the kernel half.
 pub fn copyKernelMappings(root: VAddr) void {
     const src_root_phys = getAddrSpaceRoot();
     const src_root_virt = VAddr.fromPAddr(src_root_phys, null);
@@ -122,6 +184,11 @@ pub fn copyKernelMappings(root: VAddr) void {
     }
 }
 
+/// Clear the lower-half (user/identity) PML4 entries and flush the TLB
+/// by reloading CR3.
+///
+/// Intel SDM Vol 3A, Section 5.10.4.1 -- MOV to CR3 invalidates all
+/// non-global TLB entries for the current PCID.
 pub fn dropIdentityMapping() void {
     const root_phys = getAddrSpaceRoot();
     const root_virt = VAddr.fromPAddr(root_phys, null);
@@ -134,6 +201,11 @@ pub fn dropIdentityMapping() void {
     cpu.writeCr3(root_phys.addr);
 }
 
+/// Map a 4-KByte physical page at the given virtual address.
+///
+/// Intel SDM Vol 3A, Section 5.5.4 "Linear-Address Translation with 4-Level
+/// Paging and 5-Level Paging" -- walks PML4 -> PDPT -> PD -> PT, allocating
+/// intermediate tables as needed, then writes the leaf PTE (Table 5-20).
 pub fn mapPage(
     addr_space_root: PAddr,
     phys: PAddr,
@@ -194,6 +266,11 @@ pub fn mapPage(
     l1_entry.setPAddr(phys);
 }
 
+/// Boot-time page mapping supporting 4-KByte, 2-MByte, and 1-GByte pages.
+///
+/// Intel SDM Vol 3A, Section 5.5.4 -- walks the paging hierarchy, with
+/// early termination for huge pages (Table 5-16 for 1-GByte PDPTE with
+/// PS=1, Table 5-18 for 2-MByte PDE with PS=1).
 pub fn mapPageBoot(
     addr_space_root: VAddr,
     phys: PAddr,
@@ -294,6 +371,12 @@ pub fn mapPageBoot(
     }
 }
 
+/// Unmap a 4-KByte page and return its physical address, or null if not mapped.
+///
+/// Intel SDM Vol 3A, Section 5.5.4 -- walks PML4 -> PDPT -> PD -> PT to find
+/// the leaf PTE, clears it, then invalidates the local TLB with INVLPG
+/// (Section 5.10.4.1) and broadcasts a shootdown IPI to remote cores
+/// (Section 5.10.5).
 pub fn unmapPage(
     addr_space_root: PAddr,
     virt: VAddr,
@@ -385,6 +468,11 @@ pub fn freeUserAddrSpace(addr_space_root: PAddr) void {
     freeTablePage(root, pmm_iface);
 }
 
+/// Update permission bits on an existing leaf PTE and invalidate the TLB.
+///
+/// Intel SDM Vol 3A, Section 5.10.4.2 -- after modifying a paging-structure
+/// entry that maps a page, software should execute INVLPG for any linear
+/// address whose translation uses that entry.
 pub fn updatePagePerms(
     addr_space_root: PAddr,
     virt: VAddr,
@@ -423,6 +511,11 @@ pub fn updatePagePerms(
     }
 }
 
+/// Walk the 4-level paging hierarchy and return the physical address mapped
+/// at the given virtual address, or null if not mapped.
+///
+/// Intel SDM Vol 3A, Section 5.5.4 -- performs a software page-table walk
+/// through PML4 -> PDPT -> PD -> PT (Tables 5-15, 5-17, 5-19, 5-20).
 pub fn resolveVaddr(
     addr_space_root: PAddr,
     virt: VAddr,
