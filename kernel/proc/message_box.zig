@@ -4,7 +4,7 @@ const zag = @import("zag");
 const containers = zag.containers;
 
 const PriorityQueue = containers.priority_queue.PriorityQueue;
-const SpinLock = zag.sched.sync.SpinLock;
+const SpinLock = zag.utils.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 
 /// A unified message box used for both IPC message passing and fault delivery.

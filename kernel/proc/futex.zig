@@ -7,7 +7,7 @@ const sched = zag.sched.scheduler;
 
 const PAddr = zag.memory.address.PAddr;
 const PriorityQueue = containers.priority_queue.PriorityQueue;
-const SpinLock = zag.sched.sync.SpinLock;
+const SpinLock = zag.utils.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 

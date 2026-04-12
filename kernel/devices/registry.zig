@@ -7,7 +7,7 @@ const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const Framebuffer = zag.boot.protocol.Framebuffer;
 const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
-const Process = zag.sched.process.Process;
+const Process = zag.proc.process.Process;
 
 const MAX_DEVICES = 128;
 

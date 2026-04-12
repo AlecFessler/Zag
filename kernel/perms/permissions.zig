@@ -2,7 +2,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
-const Process = zag.sched.process.Process;
+const Process = zag.proc.process.Process;
 const SharedMemory = zag.memory.shared.SharedMemory;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;

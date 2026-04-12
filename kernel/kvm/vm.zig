@@ -16,7 +16,7 @@ const GuestMemory = guest_memory.GuestMemory;
 const Ioapic = ioapic_mod.Ioapic;
 const Lapic = lapic_mod.Lapic;
 const PAddr = zag.memory.address.PAddr;
-const Process = zag.sched.process.Process;
+const Process = zag.proc.process.Process;
 const SlabAllocator = zag.memory.allocators.slab.SlabAllocator;
 const SpinLock = zag.sched.sync.SpinLock;
 const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
@@ -181,7 +181,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
     if (proc.vm != null) return E_INVAL;
 
     // Check we have room in perm table for all vCPU thread handles
-    if (proc.perm_count + vcpu_count > zag.sched.process.MAX_PERMS) return E_MAXCAP;
+    if (proc.perm_count + vcpu_count > zag.proc.process.MAX_PERMS) return E_MAXCAP;
 
     // Read policy from userspace via physmap, handling cross-page boundaries.
     if (policy_ptr == 0) return E_BADADDR;

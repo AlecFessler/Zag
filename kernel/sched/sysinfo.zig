@@ -19,7 +19,7 @@ const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const scheduler = zag.sched.scheduler;
 
-const Process = zag.sched.process.Process;
+const Process = zag.proc.process.Process;
 const VAddr = zag.memory.address.VAddr;
 
 // KEEP IN SYNC with kernel/arch/syscall.zig ──────────────────────────────

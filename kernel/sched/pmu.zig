@@ -20,9 +20,9 @@ const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const paging = zag.memory.paging;
 const scheduler = zag.sched.scheduler;
-const slab_allocator = zag.memory.slab_allocator;
+const slab_alloc = zag.memory.allocators.slab;
 
-const Process = zag.sched.process.Process;
+const Process = zag.proc.process.Process;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 
@@ -103,7 +103,7 @@ pub const PmuSample = extern struct {
 /// Lazily-allocated per-thread PMU state. Chunk size matches the other
 /// per-thread slabs (64). `arch.PmuState` is the arch-dispatched type
 /// (empty stub on aarch64, ~200 B on x64).
-pub const PmuStateAllocator = slab_allocator.SlabAllocator(arch.PmuState, false, 0, 64, true);
+pub const PmuStateAllocator = slab_alloc.SlabAllocator(arch.PmuState, false, 0, 64, true);
 
 pub var allocator: std.mem.Allocator = undefined;
 var slab_instance: PmuStateAllocator = undefined;

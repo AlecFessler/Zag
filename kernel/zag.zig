@@ -7,5 +7,6 @@ pub const kvm = @import("kvm/kvm.zig");
 pub const memory = @import("memory/memory.zig");
 pub const panic = @import("panic.zig");
 pub const perms = @import("perms/perms.zig");
+pub const proc = @import("proc/proc.zig");
 pub const sched = @import("sched/sched.zig");
 pub const utils = @import("utils/utils.zig");
