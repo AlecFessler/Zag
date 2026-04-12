@@ -18,12 +18,14 @@ const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const FaultReason = zag.perms.permissions.FaultReason;
 const KernelObject = zag.perms.permissions.KernelObject;
 const PAddr = zag.memory.address.PAddr;
+const PageRights = zag.memory.vmm.PageRights;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const PowerAction = zag.arch.dispatch.PowerAction;
 const Priority = zag.sched.thread.Priority;
 const Process = zag.proc.process.Process;
 const ProcessHandleRights = zag.perms.permissions.ProcessHandleRights;
 const ProcessRights = zag.perms.permissions.ProcessRights;
+const ReservationInfo = VirtualMemoryManager.ReservationInfo;
 const SharedMemory = zag.memory.shared.SharedMemory;
 const Thread = zag.sched.thread.Thread;
 const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
@@ -500,8 +502,9 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_arg: 
     defer kernel_alloc.free(elf_copy);
     {
         var page_va = std.mem.alignBackward(u64, elf_ptr, paging.PAGE4K);
-        while (page_va < elf_end) : (page_va += paging.PAGE4K) {
+        while (page_va < elf_end) {
             proc.vmm.demandPage(VAddr.fromInt(page_va), false, false) catch return E_BADADDR;
+            page_va += paging.PAGE4K;
         }
     }
     const user_bytes: [*]const u8 = @ptrFromInt(elf_ptr);
@@ -676,9 +679,6 @@ fn sysRevokePerm(handle: u64) i64 {
 
     return E_OK;
 }
-
-const ReservationInfo = VirtualMemoryManager.ReservationInfo;
-const PageRights = zag.memory.vmm.PageRights;
 
 const ReservationCollection = struct {
     buf: [128]ReservationInfo = undefined,
@@ -1353,11 +1353,12 @@ fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modified_r
     src.lock.lock();
     {
         var i: u64 = 0;
-        while (i < src.num_threads) : (i += 1) {
+        while (i < src.num_threads) {
             const t = src.threads[i];
             if (t.state == .suspended) {
                 t.state = .ready;
             }
+            i += 1;
         }
     }
     const sib_mask = src.suspended_thread_slots;
@@ -1366,12 +1367,13 @@ fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modified_r
 
     {
         var i: u64 = 0;
-        while (i < src.num_threads) : (i += 1) {
+        while (i < src.num_threads) {
             const t = src.threads[i];
             if ((sib_mask & (@as(u64, 1) << @intCast(t.slot_index))) != 0) {
                 const target_core = if (t.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
                 sched.enqueueOnCore(target_core, t);
             }
+            i += 1;
         }
     }
 
