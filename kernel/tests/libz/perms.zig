@@ -22,7 +22,9 @@ pub const ProcessRights = packed struct(u16) {
     device_own: bool = false,
     fault_handler: bool = false,
     pmu: bool = false,
-    _reserved: u7 = 0,
+    set_time: bool = false,
+    power: bool = false,
+    _reserved: u5 = 0,
 
     pub fn bits(self: @This()) u64 {
         return @intCast(@as(u16, @bitCast(self)));
@@ -60,7 +62,8 @@ pub const DeviceRegionRights = packed struct(u8) {
     map: bool = false,
     grant: bool = false,
     dma: bool = false,
-    _reserved: u5 = 0,
+    irq: bool = false,
+    _reserved: u4 = 0,
 
     pub fn bits(self: @This()) u64 {
         return @intCast(@as(u8, @bitCast(self)));

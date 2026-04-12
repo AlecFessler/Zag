@@ -63,6 +63,13 @@ pub const SyscallNum = enum(u64) {
     pmu_reset,
     pmu_stop,
     sys_info,
+    clock_getwall,
+    clock_setwall,
+    getrandom,
+    notify_wait,
+    irq_ack,
+    sys_power,
+    sys_cpu_power,
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -650,6 +657,55 @@ pub fn pickSupportedEvent(info: PmuInfo) ?PmuEvent {
         if ((info.supported_events & bit) != 0) return @enumFromInt(f.value);
     }
     return null;
+}
+
+// --- Wall Clock (§2.16, §4.56–§4.57) ---
+
+pub fn clock_getwall() i64 {
+    return syscall0(.clock_getwall);
+}
+
+pub fn clock_setwall(nanos: u64) i64 {
+    return syscall1(.clock_setwall, nanos);
+}
+
+// --- Randomness (§2.17, §4.58) ---
+
+pub fn getrandom(buf: [*]u8, len: u64) i64 {
+    return syscall2(.getrandom, @intFromPtr(buf), len);
+}
+
+pub fn getrandom_raw(buf_addr: u64, len: u64) i64 {
+    return syscall2(.getrandom, buf_addr, len);
+}
+
+// --- IRQ Notifications (§2.18, §4.59–§4.60) ---
+
+pub fn notify_wait(timeout_ns: u64) i64 {
+    return syscall1(.notify_wait, timeout_ns);
+}
+
+pub fn irq_ack(handle: u64) i64 {
+    return syscall1(.irq_ack, handle);
+}
+
+// --- Power Control (§2.19, §4.61–§4.62) ---
+
+pub const POWER_SHUTDOWN: u64 = 0;
+pub const POWER_REBOOT: u64 = 1;
+pub const POWER_SLEEP: u64 = 2;
+pub const POWER_HIBERNATE: u64 = 3;
+pub const POWER_SCREEN_OFF: u64 = 4;
+
+pub const CPU_POWER_SET_FREQ: u64 = 0;
+pub const CPU_POWER_SET_IDLE: u64 = 1;
+
+pub fn sys_power(action: u64) i64 {
+    return syscall1(.sys_power, action);
+}
+
+pub fn sys_cpu_power(action: u64, value: u64) i64 {
+    return syscall2(.sys_cpu_power, action, value);
 }
 
 pub const FAULT_KILL: u64 = 0;

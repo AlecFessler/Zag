@@ -180,6 +180,12 @@ pub fn build(b: *std.Build) void {
     const child_pmu_overflow_bin = buildChild(b, target, lib_mod, "child_pmu_overflow", "children/child_pmu_overflow.zig");
     const child_pmu_overflow_self_bin = buildChild(b, target, lib_mod, "child_pmu_overflow_self", "children/child_pmu_overflow_self.zig");
     const child_try_sys_info_bin = buildChild(b, target, lib_mod, "child_try_sys_info", "children/child_try_sys_info.zig");
+    const child_try_clock_getwall_bin = buildChild(b, target, lib_mod, "child_try_clock_getwall", "children/child_try_clock_getwall.zig");
+    const child_try_clock_setwall_bin = buildChild(b, target, lib_mod, "child_try_clock_setwall", "children/child_try_clock_setwall.zig");
+    const child_try_getrandom_bin = buildChild(b, target, lib_mod, "child_try_getrandom", "children/child_try_getrandom.zig");
+    const child_try_notify_wait_bin = buildChild(b, target, lib_mod, "child_try_notify_wait", "children/child_try_notify_wait.zig");
+    const child_try_sys_power_bin = buildChild(b, target, lib_mod, "child_try_sys_power", "children/child_try_sys_power.zig");
+    const child_try_sys_cpu_power_bin = buildChild(b, target, lib_mod, "child_try_sys_cpu_power", "children/child_try_sys_cpu_power.zig");
 
     const embedded_wf = b.addWriteFiles();
     _ = embedded_wf.addCopyFile(child_exit_bin, "child_exit.elf");
@@ -315,6 +321,12 @@ pub fn build(b: *std.Build) void {
     _ = embedded_wf.addCopyFile(child_pmu_overflow_bin, "child_pmu_overflow.elf");
     _ = embedded_wf.addCopyFile(child_pmu_overflow_self_bin, "child_pmu_overflow_self.elf");
     _ = embedded_wf.addCopyFile(child_try_sys_info_bin, "child_try_sys_info.elf");
+    _ = embedded_wf.addCopyFile(child_try_clock_getwall_bin, "child_try_clock_getwall.elf");
+    _ = embedded_wf.addCopyFile(child_try_clock_setwall_bin, "child_try_clock_setwall.elf");
+    _ = embedded_wf.addCopyFile(child_try_getrandom_bin, "child_try_getrandom.elf");
+    _ = embedded_wf.addCopyFile(child_try_notify_wait_bin, "child_try_notify_wait.elf");
+    _ = embedded_wf.addCopyFile(child_try_sys_power_bin, "child_try_sys_power.elf");
+    _ = embedded_wf.addCopyFile(child_try_sys_cpu_power_bin, "child_try_sys_cpu_power.elf");
     const embed_src = embedded_wf.add("embedded_children.zig",
         \\pub const child_exit = @embedFile("child_exit.elf");
         \\pub const child_shm_counter = @embedFile("child_shm_counter.elf");
@@ -449,6 +461,12 @@ pub fn build(b: *std.Build) void {
         \\pub const child_pmu_overflow = @embedFile("child_pmu_overflow.elf");
         \\pub const child_pmu_overflow_self = @embedFile("child_pmu_overflow_self.elf");
         \\pub const child_try_sys_info = @embedFile("child_try_sys_info.elf");
+        \\pub const child_try_clock_getwall = @embedFile("child_try_clock_getwall.elf");
+        \\pub const child_try_clock_setwall = @embedFile("child_try_clock_setwall.elf");
+        \\pub const child_try_getrandom = @embedFile("child_try_getrandom.elf");
+        \\pub const child_try_notify_wait = @embedFile("child_try_notify_wait.elf");
+        \\pub const child_try_sys_power = @embedFile("child_try_sys_power.elf");
+        \\pub const child_try_sys_cpu_power = @embedFile("child_try_sys_cpu_power.elf");
         \\
     );
 
