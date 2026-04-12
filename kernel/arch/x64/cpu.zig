@@ -300,6 +300,30 @@ pub fn halt() noreturn {
 }
 
 pub fn qemuShutdown() noreturn {
+    // Drain COM1 before cutting power. `writeByte` in `serial.zig`
+    // only waits for the Transmit Holding Register to empty (LSR
+    // bit 5) between bytes — that guarantees the kernel never
+    // overwrites bytes the UART hasn't picked up yet, but the FINAL
+    // byte of the last `serial.print` is still shifting out when we
+    // return. Poking `0x604` here immediately powers off the VM, so
+    // without this wait QEMU cuts the chardev mid-shift and the
+    // tail of the line is lost. Test `s2_4_9` flaked on this for a
+    // long time — `[PASS] §2.4.9` would show up as a truncated
+    // `[PAS` in ~40% of runs.
+    //
+    // Wait for LSR bit 6 ("Transmitter Empty", TEMT) which is the
+    // strictly stronger signal: BOTH the THR AND the Transmitter
+    // Shift Register are empty, i.e. the wire is actually idle.
+    // COM1's LSR is at 0x3F8 + 5 = 0x3FD; drain is bounded so a
+    // wedged UART can't hang the shutdown path forever.
+    const COM1_LSR: u16 = 0x3FD;
+    const TRANSMITTER_EMPTY: u8 = 0b0100_0000;
+    var spins: u32 = 0;
+    while ((inb(COM1_LSR) & TRANSMITTER_EMPTY) == 0) {
+        spins += 1;
+        if (spins >= 10_000_000) break;
+    }
+
     asm volatile ("outw %[val], %[port]"
         :
         : [val] "{ax}" (@as(u16, 0x2000)),
