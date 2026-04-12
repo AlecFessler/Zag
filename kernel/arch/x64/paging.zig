@@ -441,35 +441,65 @@ pub fn unmapPage(
 /// is PML4 → PDPT → PD → PT; each table is a 4-KB page of 512 eight-byte
 /// entries. Only PML4 entries 0–255 cover user space (canonical low half).
 pub fn freeUserAddrSpace(addr_space_root: PAddr) void {
+    const Level = enum { l4, l3, l2, l1 };
+    const Cursor = struct {
+        table: *[page_entry_table_size]PageEntry,
+        idx: usize,
+    };
+
     const pmm_iface = pmm.global_pmm.?.allocator();
     const root_virt = VAddr.fromPAddr(addr_space_root, null);
     const root: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
 
-    for (root[0..256]) |*l4_entry| {
-        if (!l4_entry.present) continue;
-        std.debug.assert(!l4_entry.huge_page);
-        const l3_table = entryToTable(l4_entry);
+    // stack[0] = L4, stack[1] = L3, stack[2] = L2, stack[3] = L1
+    var stack = [4]Cursor{
+        .{ .table = root, .idx = 0 },
+        .{ .table = undefined, .idx = 0 },
+        .{ .table = undefined, .idx = 0 },
+        .{ .table = undefined, .idx = 0 },
+    };
+    var level: Level = .l4;
 
-        for (l3_table) |*l3_entry| {
-            if (!l3_entry.present) continue;
-            std.debug.assert(!l3_entry.huge_page);
-            const l2_table = entryToTable(l3_entry);
+    while (true) {
+        const depth: usize = @intFromEnum(level);
+        const cur = &stack[depth];
 
-            for (l2_table) |*l2_entry| {
-                if (!l2_entry.present) continue;
-                std.debug.assert(!l2_entry.huge_page);
-                const l1_table = entryToTable(l2_entry);
+        // Determine how many entries to scan at this level.
+        // L4 only covers the user half (indices 0–255); all others scan all 512.
+        const limit: usize = if (level == .l4) 256 else page_entry_table_size;
 
-                for (l1_table) |*l1_entry| {
-                    if (!l1_entry.present) continue;
-                    freePhysPage(l1_entry.getPAddr(), pmm_iface);
-                }
-                freeTablePage(l1_table, pmm_iface);
-            }
-            freeTablePage(l2_table, pmm_iface);
+        // Exhausted this table — pop back up (freeing non-root tables).
+        if (cur.idx >= limit) {
+            if (level == .l4) break;
+            freeTablePage(cur.table, pmm_iface);
+            level = @enumFromInt(depth - 1);
+            stack[depth - 1].idx += 1;
+            continue;
         }
-        freeTablePage(l3_table, pmm_iface);
+
+        const entry = &cur.table[cur.idx];
+
+        // Not present — skip this entry.
+        if (!entry.present) {
+            cur.idx += 1;
+            continue;
+        }
+
+        // Leaf level: free the physical page and advance.
+        if (level == .l1) {
+            freePhysPage(entry.getPAddr(), pmm_iface);
+            cur.idx += 1;
+            continue;
+        }
+
+        // Interior level: descend into the child table.
+        std.debug.assert(!entry.huge_page);
+        const child_table = entryToTable(entry);
+        const next_depth = depth + 1;
+        stack[next_depth] = .{ .table = child_table, .idx = 0 };
+        level = @enumFromInt(next_depth);
     }
+
     freeTablePage(root, pmm_iface);
 }
 
