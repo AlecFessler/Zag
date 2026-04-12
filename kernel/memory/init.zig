@@ -9,7 +9,7 @@ const KA = address.KernelVA.KernelAllocators;
 const kvm = zag.kvm;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
-const pmu_mod = zag.sched.pmu;
+const pmu_mod = zag.syscall.pmu;
 const shared = zag.memory.shared;
 const vmm_mod = zag.memory.vmm;
 

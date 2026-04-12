@@ -15,6 +15,7 @@ const zag = @import("zag");
 
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
+const errors = zag.syscall.errors;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const scheduler = zag.sched.scheduler;
@@ -22,9 +23,8 @@ const scheduler = zag.sched.scheduler;
 const Process = zag.proc.process.Process;
 const VAddr = zag.memory.address.VAddr;
 
-// KEEP IN SYNC with kernel/arch/syscall.zig ──────────────────────────────
-const E_OK: i64 = 0;
-const E_BADADDR: i64 = -7;
+const E_OK = errors.E_OK;
+const E_BADADDR = errors.E_BADADDR;
 
 // ── Observable types (spec §2.15) ───────────────────────────────────────
 

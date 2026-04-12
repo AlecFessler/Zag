@@ -10,9 +10,9 @@ const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
-const PmuCounterConfig = zag.sched.pmu.PmuCounterConfig;
-const PmuInfo = zag.sched.pmu.PmuInfo;
-const PmuSample = zag.sched.pmu.PmuSample;
+const PmuCounterConfig = zag.syscall.pmu.PmuCounterConfig;
+const PmuInfo = zag.syscall.pmu.PmuInfo;
+const PmuSample = zag.syscall.pmu.PmuSample;
 const SharedMemory = zag.memory.shared.SharedMemory;
 const Thread = zag.sched.thread.Thread;
 const Timer = zag.arch.timer.Timer;
@@ -543,8 +543,8 @@ pub const PmuState = switch (builtin.cpu.arch) {
 };
 
 /// Compile-time ceiling on the number of counter slots in `PmuSample`.
-/// Duplicated from `zag.sched.pmu.MAX_COUNTERS` so the arch dispatch
-/// layer does not force its callers to pull in `zag.sched.pmu` just to
+/// Duplicated from `zag.syscall.pmu.MAX_COUNTERS` so the arch dispatch
+/// layer does not force its callers to pull in `zag.syscall.pmu` just to
 /// size a stack buffer.
 pub const pmu_max_counters: usize = 8;
 

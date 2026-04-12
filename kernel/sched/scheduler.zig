@@ -2,7 +2,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
-const containers = zag.containers;
+const containers = zag.utils.containers;
 const device_registry = zag.devices.registry;
 const futex = zag.proc.futex;
 const kvm = zag.kvm;
@@ -146,6 +146,10 @@ fn armSchedTimer(state: *PerCoreState, delta_ns: u64) void {
 
 pub fn currentThread() ?*Thread {
     return core_states[arch.coreID()].running_thread;
+}
+
+pub fn currentProc() *Process {
+    return currentThread().?.process;
 }
 
 /// Snapshot the idle/busy nanosecond accounting for `core_id`, zeroing

@@ -20,7 +20,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const rbt_mod = b.addModule("red_black_tree", .{
-        .root_source_file = b.path("../../kernel/containers/red_black_tree.zig"),
+        .root_source_file = b.path("../../kernel/utils/containers/red_black_tree.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -52,6 +52,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "containers", .module = containers_shim_mod },
             .{ .name = "range", .module = range_mod },
             .{ .name = "sync", .module = sync_shim_mod },
         },
@@ -119,7 +120,6 @@ pub fn build(b: *std.Build) void {
 
     // Wire up zag's imports
     zag_mod.addImport("memory", memory_shim_mod);
-    zag_mod.addImport("containers", containers_shim_mod);
     zag_mod.addImport("sched", sched_shim_mod);
     zag_mod.addImport("utils", utils_shim_mod);
 

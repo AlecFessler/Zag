@@ -297,3 +297,8 @@ pub const UserViewEntry = extern struct {
         };
     }
 };
+
+/// Returns true if every bit set in `requested` is also set in `allowed`.
+pub fn isSubset(requested: u16, allowed: u16) bool {
+    return (requested & ~allowed) == 0;
+}

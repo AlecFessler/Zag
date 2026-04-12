@@ -3,15 +3,15 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const builtin = std.builtin;
-const debug = zag.debug;
+const debug_info = zag.utils.debug_info;
 
 pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) noreturn {
     @branchHint(.cold);
     _ = trace;
 
     if (ret_addr) |ra| {
-        if (debug.info.global_ptr) |dbg_info| {
-            const sym_name = dbg_info.getSymbolName(ra - debug.info.kaslr_slide);
+        if (debug_info.global_ptr) |dbg_info| {
+            const sym_name = dbg_info.getSymbolName(ra - debug_info.kaslr_slide);
             if (sym_name) |sym| {
                 arch.print("KERNEL PANIC: {s} @ {s}\n", .{ msg, sym });
             }
@@ -30,8 +30,8 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) n
     while (frames < 64) : (frames += 1) {
         const pc = it.next() orelse break;
 
-        if (debug.info.global_ptr) |dbg_info| {
-            const sym_name = dbg_info.getSymbolName(pc - debug.info.kaslr_slide);
+        if (debug_info.global_ptr) |dbg_info| {
+            const sym_name = dbg_info.getSymbolName(pc - debug_info.kaslr_slide);
             if (sym_name) |sym| {
                 arch.print("{s}\n", .{sym});
             }

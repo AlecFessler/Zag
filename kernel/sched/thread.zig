@@ -99,7 +99,7 @@ pub const Thread = struct {
         // teardown happened at the latest pmuSave on context switch away.
         if (self.pmu_state) |state| {
             arch.pmuClearState(state);
-            zag.sched.pmu.allocator.destroy(state);
+            zag.syscall.pmu.allocator.destroy(state);
             self.pmu_state = null;
         }
 

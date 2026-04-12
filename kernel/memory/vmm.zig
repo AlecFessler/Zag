@@ -2,7 +2,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
-const containers = zag.containers;
+const containers = zag.utils.containers;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const slab_mod = zag.memory.allocators.slab;

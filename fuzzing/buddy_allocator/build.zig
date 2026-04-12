@@ -42,30 +42,13 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // Containers shim (not needed for buddy but zag shim expects it)
-    const rbt_mod = b.addModule("red_black_tree", .{
-        .root_source_file = b.path("../../kernel/containers/red_black_tree.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const containers_shim_mod = b.addModule("containers", .{
-        .root_source_file = b.path("../shims/containers.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{
-            .{ .name = "red_black_tree", .module = rbt_mod },
-        },
-    });
-
-    // Zag shim (provides zag.memory.* and zag.containers.*)
+    // Zag shim (provides zag.memory.*)
     const zag_mod = b.addModule("zag", .{
         .root_source_file = b.path("../shims/zag.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "memory", .module = memory_shim_mod },
-            .{ .name = "containers", .module = containers_shim_mod },
         },
     });
 

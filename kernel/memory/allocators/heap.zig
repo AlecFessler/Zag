@@ -3,7 +3,7 @@ const builtin = @import("builtin");
 const zag = @import("zag");
 
 const intrusive_freelist = zag.memory.allocators.intrusive_freelist;
-const rbt = zag.containers.red_black_tree;
+const rbt = zag.utils.containers.red_black_tree;
 const slab_alloc = zag.memory.allocators.slab;
 
 const SpinLock = zag.utils.sync.SpinLock;

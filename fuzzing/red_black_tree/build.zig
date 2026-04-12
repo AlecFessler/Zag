@@ -7,7 +7,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const rbt_mod = b.addModule("red_black_tree", .{
-        .root_source_file = b.path("../../kernel/containers/red_black_tree.zig"),
+        .root_source_file = b.path("../../kernel/utils/containers/red_black_tree.zig"),
         .target = target,
         .optimize = optimize,
     });

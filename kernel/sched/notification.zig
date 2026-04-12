@@ -5,7 +5,7 @@ const arch = zag.arch.dispatch;
 const futex_mod = zag.proc.futex;
 const sched = zag.sched.scheduler;
 
-const PriorityQueue = zag.containers.priority_queue.PriorityQueue;
+const PriorityQueue = zag.utils.containers.priority_queue.PriorityQueue;
 const SpinLock = zag.utils.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 

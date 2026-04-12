@@ -2,7 +2,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
-const containers = zag.containers;
+const containers = zag.utils.containers;
 const sched = zag.sched.scheduler;
 
 const NotificationBox = zag.sched.notification.NotificationBox;

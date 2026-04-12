@@ -10,7 +10,7 @@
 
 const zag = @import("zag");
 
-const pmu = zag.sched.pmu;
+const pmu = zag.syscall.pmu;
 
 pub const PmuState = extern struct {};
 

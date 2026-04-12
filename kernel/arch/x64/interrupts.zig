@@ -97,7 +97,7 @@ pub fn updateScratchKernelRsp(core_id: u64, kernel_rsp: u64) void {
 /// Syscall dispatch — exported so the SYSCALL asm entry can call it.
 /// Wraps the generic syscall.dispatch and writes results back to ctx.
 export fn syscallDispatch(ctx: *cpu.Context) void {
-    const result = zag.syscall.dispatch(ctx);
+    const result = zag.syscall.dispatch.dispatch(ctx);
     ctx.regs.rax = @bitCast(result.rax);
     ctx.regs.rdx = result.rdx;
 }

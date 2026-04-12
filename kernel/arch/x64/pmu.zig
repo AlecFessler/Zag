@@ -31,7 +31,7 @@ const apic = zag.arch.x64.apic;
 const cpu = zag.arch.x64.cpu;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
-const pmu_sched = zag.sched.pmu;
+const pmu_sched = zag.syscall.pmu;
 const sched = zag.sched.scheduler;
 
 const PmuCounterConfig = pmu_sched.PmuCounterConfig;
@@ -40,7 +40,7 @@ const PmuInfo = pmu_sched.PmuInfo;
 const PmuSample = pmu_sched.PmuSample;
 
 /// Per-arch alias for the generic compile-time ceiling. See
-/// `zag.sched.pmu.MAX_COUNTERS` for the rationale.
+/// `zag.syscall.pmu.MAX_COUNTERS` for the rationale.
 pub const MAX_COUNTERS: u8 = pmu_sched.MAX_COUNTERS;
 
 // ── MSR numbers (Intel SDM Vol 4) ──────────────────────────────────────

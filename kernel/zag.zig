@@ -1,7 +1,5 @@
 pub const arch = @import("arch/arch.zig");
 pub const boot = @import("boot/boot.zig");
-pub const containers = @import("containers/containers.zig");
-pub const debug = @import("debug/debug.zig");
 pub const devices = @import("devices/devices.zig");
 pub const kvm = @import("kvm/kvm.zig");
 pub const memory = @import("memory/memory.zig");
@@ -9,5 +7,5 @@ pub const panic = @import("panic.zig");
 pub const perms = @import("perms/perms.zig");
 pub const proc = @import("proc/proc.zig");
 pub const sched = @import("sched/sched.zig");
-pub const syscall = @import("syscall.zig");
+pub const syscall = @import("syscall/syscall.zig");
 pub const utils = @import("utils/utils.zig");

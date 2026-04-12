@@ -1,7 +1,7 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const containers = zag.containers;
+const containers = zag.utils.containers;
 
 const PriorityQueue = containers.priority_queue.PriorityQueue;
 const SpinLock = zag.utils.sync.SpinLock;

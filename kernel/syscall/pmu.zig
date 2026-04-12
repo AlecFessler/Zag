@@ -18,6 +18,7 @@ const zag = @import("zag");
 
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
+const errors = zag.syscall.errors;
 const paging = zag.memory.paging;
 const scheduler = zag.sched.scheduler;
 const slab_alloc = zag.memory.allocators.slab;
@@ -26,17 +27,13 @@ const Process = zag.proc.process.Process;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 
-// KEEP IN SYNC with kernel/arch/syscall.zig ──────────────────────────────
-// Duplicated here (rather than imported) so this file has no dependency
-// on the arch-layer syscall dispatch module; if you add or renumber any
-// error code in `kernel/arch/syscall.zig` mirror it here.
-const E_OK: i64 = 0;
-const E_INVAL: i64 = -1;
-const E_PERM: i64 = -2;
-const E_BADCAP: i64 = -3;
-const E_NOMEM: i64 = -4;
-const E_BADADDR: i64 = -7;
-const E_BUSY: i64 = -11;
+const E_OK = errors.E_OK;
+const E_INVAL = errors.E_INVAL;
+const E_PERM = errors.E_PERM;
+const E_BADCAP = errors.E_BADCAP;
+const E_NOMEM = errors.E_NOMEM;
+const E_BADADDR = errors.E_BADADDR;
+const E_BUSY = errors.E_BUSY;
 
 // ── Observable types (spec §2.14) ───────────────────────────────────────
 
