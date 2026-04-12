@@ -21,6 +21,7 @@ Zag is implemented in Zig, targeting x86_64 (with an aarch64 stub). The kernel i
    - `arch.parseFirmwareTables(xsdp_phys)` -- ACPI parsing: MADT (cores, APIC), HPET, MCFG (PCI ECAM). PCI enumeration and serial port probing. Device registration.
    - `arch.vmInit()` -- Detect hardware virtualization support via CPUID, cache availability flag. After firmware tables (needs CPUID), before scheduler.
    - `arch.pmuInit()` -- Detect hardware PMU support via CPUID (x64) or stub (aarch64), cache `PmuInfo`, prime PMI handler vector. After firmware tables, before scheduler. See §20.
+   - Wall clock offset init: `arch.readRtc()` reads the CMOS RTC (x64) and the kernel computes `wall_offset = rtc_nanos - monotonic_now`. See §22.
    - `sched.globalInit()` -- Process/thread slab allocators, idle process, run queues, root service creation with all rights, device grant to root service, enqueue root service initial thread.
    - `arch.smpInit()` -- Secondary core bringup via INIT/SIPI IPI sequence with real-mode trampoline at physical address `0x8000`.
    - `sched.perCoreInit()` -- Per-core scheduler state, preemption timer arm, `arch.vmPerCoreInit()` (per-core VMX/SVM setup), enable interrupts.
@@ -57,6 +58,8 @@ kernel/
       exceptions.zig     -- fault handlers
       pmu.zig            -- PMU state, save/restore, PMI handler, event mapping
       sysinfo.zig        -- x64 hardware reads for freq, temp, C-state
+      rtc.zig            -- CMOS RTC read, BCD-to-Unix conversion
+      power.zig          -- ACPI power states, CPU freq/idle control
     aarch64/
       pmu.zig            -- aarch64 PMU stubs (unimplemented)
       sysinfo.zig        -- aarch64 sysinfo stubs (unimplemented)
@@ -87,6 +90,7 @@ kernel/
     thread.zig           -- thread struct, creation, deinit
     pmu.zig              -- generic PMU syscall layer, PmuStateAllocator slab owner
     sysinfo.zig          -- generic sys_info syscall layer
+    notification.zig     -- NotificationBox struct and methods (signal, wait, cleanup)
   perms/
     permissions.zig      -- rights types, permission entry, user view entry
     privilege.zig        -- kernel/user privilege enum
@@ -150,6 +154,8 @@ Process {
     thread_handle_rights: ThreadHandleRights -- rights mask for thread handles in this process's own perm table
     max_thread_priority: Priority           -- ceiling priority for threads in this process
     vm: ?*kvm.vm.Vm = null                  -- owned VM, if any (at most one per process)
+    notification_box: NotificationBox       -- IRQ notification delivery (§24)
+    badge_counter: u6 = 0                   -- monotonic mod-64 counter for badge bit assignment (§24)
 }
 ```
 
@@ -430,7 +436,7 @@ All rights are packed structs with bit fields:
 - `ProcessHandleRights`: packed `u16` -- `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5), `fault_handler`(6), 9 bits reserved. Used on handles to other processes (not HANDLE_SELF).
 - `VmReservationRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4), 3 bits reserved.
 - `SharedMemoryRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `grant`(3), 4 bits reserved.
-- `DeviceRegionRights`: packed `u8` -- `map`(0), `grant`(1), `dma`(2), `irq`(3), 4 bits reserved.
+- `DeviceRegionRights`: packed `u8` -- `map`(0), `grant`(1), `dma`(2), `irq`(3), 4 bits reserved. The `irq` bit gates `irq_ack` (§24).
 - `ThreadHandleRights`: packed `u8` -- `suspend`(0), `resume`(1), `kill`(2), `pmu`(4), 4 bits reserved. Bit 3 is reserved for alignment with the public spec layout. The `pmu` bit is checked in addition to `ProcessRights.pmu` on every PMU syscall that takes a thread handle; see §20.
 
 ---
@@ -1134,6 +1140,22 @@ Portable dispatch layer in `kernel/arch/dispatch.zig`. All functions dispatch at
 **readTimestamp() -> u64** -- Raw `RDTSC` instruction. Architecture-specific cycle counter. Used for ASLR entropy at process creation time.
 
 **randomSeed() -> ?u64** -- Hardware-sourced random value. On x86_64 executes `RDRAND`; returns null if the entropy source is unavailable or temporarily exhausted. On aarch64 returns null (stub).
+
+**readRtc() -> u64** -- Reads the hardware RTC and returns nanoseconds since the Unix epoch. On x86_64: reads CMOS RTC via ports 0x70/0x71, converts BCD to binary, computes Unix nanoseconds. On aarch64: returns 0 (no RTC). Called once during boot to initialize the wall clock offset (§22).
+
+**getRandom() -> ?u64** -- Returns 8 bytes of hardware-sourced randomness. On x86_64: executes RDRAND. On aarch64: returns null. Used by the `getrandom` syscall (§23). Distinct from `randomSeed()` which is the boot-time entropy source.
+
+### IRQ Control
+
+**maskIrq(irq: u8) -> void** -- Masks (disables) the given IRQ line. On x86_64: sets the mask bit in the I/O APIC redirection table entry. On aarch64: no-op. Called from the IRQ handler path after identifying the interrupting device (§24).
+
+**unmaskIrq(irq: u8) -> void** -- Unmasks (enables) the given IRQ line. On x86_64: clears the mask bit in the I/O APIC redirection table entry. On aarch64: no-op. Called from the `irq_ack` syscall handler (§24).
+
+### Power Control
+
+**powerAction(action: PowerAction) -> i64** -- Performs a system-wide power action. On x86_64: dispatches to ACPI sleep states, keyboard controller reset, or DPMS blanking per action variant. On aarch64: returns E_NODEV. `shutdown` and `reboot` do not return on success. See §25.
+
+**cpuPowerAction(action: CpuPowerAction, value: u64) -> i64** -- Performs a per-CPU power control action. On x86_64: programs `IA32_PERF_CTL` for `set_freq`, configures MWAIT C-state hints for `set_idle`. On aarch64: returns E_NODEV. See §25.
 
 ### Identification
 
@@ -2265,3 +2287,502 @@ No new locks. `sys_info` takes each core's existing `rq_lock` in turn for the re
 The PMM lock is taken by `pmm.freePageCount()` for its global free-list query, but the per-core PMM caches (`count`) are read on the alloc/free fast path without `pmm.lock` and without IRQ-disabling on the owning core. As a result the `mem_free` value reported by `sys_info` may be off by a few pages per core. This is acceptable for UI-grade reporting — the userspace consumer is a periodic dashboard sampler, not a transactional accounting system.
 
 The arch dispatch functions run without holding any kernel lock; the x64 implementation's remote-core cache is updated by the owning core's scheduler tick hook via lock-free atomic stores, and read by any core via lock-free atomic loads.
+
+---
+
+## 22. Wall Clock Time Internals
+
+Wall clock time as an offset from the monotonic clock. The public contract is in spec §2.16 and spec §4.56--§4.57. This section describes how the pieces fit together internally.
+
+### Layering
+
+```
+kernel/arch/x64/rtc.zig        -- CMOS RTC hardware read, BCD-to-Unix conversion
+kernel/arch/dispatch.zig        -- readRtc() dispatch function
+kernel/syscall.zig              -- clock_getwall / clock_setwall dispatch cases
+```
+
+The wall clock subsystem has no generic layer file — the two syscalls are simple enough to live inline in the syscall dispatch. All hardware access is confined to `arch/x64/rtc.zig`.
+
+### Boot Sequence
+
+During `kMain`, after `arch.init()` and before `sched.globalInit()`:
+
+1. `arch.readRtc()` reads the CMOS RTC registers and returns Unix nanoseconds.
+2. The kernel computes `wall_offset = rtc_nanos - monotonic_now`, where `monotonic_now` comes from `arch.getMonotonicClock().now()`.
+3. `wall_offset` is stored in a global `i64` variable (`var wall_offset: i64`), accessed atomically.
+
+The RTC is read exactly once. All subsequent wall clock queries derive from the monotonic clock plus the offset.
+
+### Global State
+
+```
+var wall_offset: i64    -- atomic, initialized at boot from RTC
+```
+
+Accessed via `@atomicLoad(.monotonic)` for reads and `@atomicStore(.monotonic)` for writes. No lock is needed — single-word atomic operations on `i64` are sufficient for the offset update to be tear-free.
+
+### clock_getwall Handler
+
+Inline in `kernel/syscall.zig`:
+
+```
+monotonic_now = arch.getMonotonicClock().now()
+offset = @atomicLoad(&wall_offset, .monotonic)
+return @as(i64, monotonic_now) +% offset
+```
+
+No rights check. Always succeeds. The wrapping add (`+%`) handles the signed/unsigned boundary correctly.
+
+### clock_setwall Handler
+
+Inline in `kernel/syscall.zig`:
+
+```
+1. Check ProcessRights.set_time on slot 0. Return E_PERM if absent.
+2. new_offset = @as(i64, requested_nanos) -% @as(i64, arch.getMonotonicClock().now())
+3. @atomicStore(&wall_offset, new_offset, .monotonic)
+4. Return E_OK.
+```
+
+The offset recomputation is atomic in the sense that concurrent `clock_getwall` calls see either the old or the new offset, never a torn value (single-word atomic store).
+
+### Arch Layer: readRtc
+
+**`arch/dispatch.zig`** adds:
+
+```
+pub fn readRtc() u64 {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return x64.rtc.readRtc(),
+        .aarch64 => return 0,
+        else => unreachable,
+    }
+}
+```
+
+The aarch64 stub returns 0. On aarch64, the wall clock offset starts at `-(monotonic_now)`, meaning `clock_getwall` returns approximately 0 (the Unix epoch) until userspace calls `clock_setwall` with a real time. This is the correct fallback — a system with no RTC has no wall clock until one is set.
+
+### x64 RTC Read
+
+Defined in `kernel/arch/x64/rtc.zig`. Reads the MC146818-compatible CMOS real-time clock via I/O ports `0x70` (address) and `0x71` (data).
+
+**Register map** (CMOS RAM offsets):
+
+| Offset | Field |
+|--------|-------|
+| 0x00 | Seconds |
+| 0x02 | Minutes |
+| 0x04 | Hours |
+| 0x07 | Day of month |
+| 0x08 | Month |
+| 0x09 | Year |
+| 0x0A | Status Register A (bit 7 = update-in-progress) |
+| 0x0B | Status Register B (bit 1 = 24h mode, bit 2 = binary mode) |
+| 0x32 | Century (if available) |
+
+**Read procedure**:
+
+1. Spin until Status Register A bit 7 (UIP) is clear — the RTC is not mid-update.
+2. Read seconds, minutes, hours, day, month, year, century.
+3. Re-read all fields and compare; if any differ, loop back to step 1 (update race).
+4. Check Status Register B bit 2: if clear, values are BCD-encoded — convert each field from BCD to binary via `(val & 0x0F) + ((val >> 4) * 10)`.
+5. Check Status Register B bit 1: if clear, hours are in 12-hour format — convert PM hours (bit 7 set) to 24-hour.
+6. Compose the full year: `century * 100 + year`. If century register reads 0 (not available), assume century = 20.
+7. Convert the calendar date/time to Unix nanoseconds using a standard days-since-epoch calculation (accounting for leap years).
+
+The function returns `u64` nanoseconds since 1970-01-01T00:00:00Z. Precision is 1 second (the RTC has no sub-second granularity). The monotonic clock provides sub-nanosecond precision for all subsequent queries.
+
+### Module-Level Changes
+
+- **`kernel/arch/dispatch.zig`** — adds `readRtc() u64` dispatch function.
+- **`kernel/main.zig`** — calls `arch.readRtc()` during boot to initialize `wall_offset`. Placed after `arch.init()` (needs port I/O) and after `arch.getMonotonicClock()` is available (needs TSC/HPET).
+- **`kernel/syscall.zig`** — adds dispatch cases for `clock_getwall` and `clock_setwall` syscall numbers.
+- **`kernel/perms/permissions.zig`** — adds `set_time` bit (bit 9) on `ProcessRights`. Root service slot 0 is initialized with this bit set.
+
+---
+
+## 23. Randomness Internals
+
+Hardware-sourced random bytes for userspace. The public contract is in spec §2.17 and spec §4.58. This section describes how the pieces fit together internally.
+
+### Layering
+
+```
+kernel/arch/x64/cpu.zig         -- getRandom() via RDRAND
+kernel/arch/dispatch.zig        -- getRandom() dispatch function
+kernel/syscall.zig              -- getrandom dispatch case
+```
+
+Like wall clock time, the `getrandom` syscall is simple enough to live inline in the syscall dispatch. No generic layer file is needed.
+
+### Arch Layer: getRandom
+
+**`arch/dispatch.zig`** adds:
+
+```
+pub fn getRandom() ?u64 {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return x64.cpu.getRandom(),
+        .aarch64 => return null,
+        else => unreachable,
+    }
+}
+```
+
+The aarch64 stub returns `null`, causing `getrandom` to return `E_NODEV` (no hardware RNG).
+
+### x64 RDRAND
+
+Defined in `kernel/arch/x64/cpu.zig`. The `getRandom()` function uses the `RDRAND` instruction to obtain a 64-bit random value from the on-chip Digital Random Number Generator (DRNG).
+
+```
+pub fn getRandom() ?u64 {
+    var value: u64 = undefined;
+    var success: u8 = undefined;
+    asm volatile ("rdrand %[val]"
+        : [val] "=r" (value),
+          [cf] "={@ccc}" (success),
+    );
+    return if (success != 0) value else null;
+}
+```
+
+RDRAND sets the carry flag (CF=1) on success and clears it (CF=0) when the hardware entropy source is temporarily exhausted. The inline assembly captures CF via the `@ccc` constraint. Returning `null` on failure maps to `E_AGAIN` in the syscall handler.
+
+RDRAND availability is determined by CPUID leaf 1, ECX bit 30. If unavailable on the host CPU, the function returns `null` unconditionally. The CPUID check can be done once at boot and cached, but the current implementation checks RDRAND availability implicitly: if the instruction is not supported, the `#UD` exception handler would fire. In practice, all x86_64 CPUs that Zag targets (Ivy Bridge and later) support RDRAND.
+
+### getrandom Handler
+
+Inline in `kernel/syscall.zig`:
+
+```
+1. Validate len: if len == 0 or len > 4096, return E_INVAL.
+2. Validate buf_ptr: validateUserWritable(buf_ptr, len). Return E_BADADDR on failure.
+3. Loop: fill the buffer 8 bytes at a time via arch.getRandom().
+   - If getRandom() returns null on the first attempt, return E_AGAIN.
+   - For each successful 8-byte read, write to the user buffer via physmap.
+   - Handle the final partial chunk (if len is not a multiple of 8) by reading
+     one more u64 and copying only the needed bytes.
+4. Return E_OK.
+```
+
+The buffer is written through physmap (resolve user VA to PA, convert PA to physmap VA, memcpy). This follows the same convention as `sys_info` and PMU buffer writes — no direct user-pointer dereference in kernel mode.
+
+The maximum of 4096 bytes per call means at most 512 RDRAND invocations. RDRAND throughput on modern x86 is approximately 500 MB/s, so a full 4096-byte fill takes roughly 8 microseconds — well within syscall latency expectations.
+
+### Module-Level Changes
+
+- **`kernel/arch/x64/cpu.zig`** — adds `getRandom() ?u64` using RDRAND.
+- **`kernel/arch/dispatch.zig`** — adds `getRandom() ?u64` dispatch function.
+- **`kernel/syscall.zig`** — adds dispatch case for the `getrandom` syscall number.
+
+---
+
+## 24. IRQ Notification Delivery Internals
+
+Asynchronous kernel-to-userspace IRQ notification via a per-process bitmask. The public contract is in spec §2.18 and spec §4.59--§4.60. This section describes how the pieces fit together internally.
+
+### Layering
+
+```
+kernel/sched/notification.zig   -- NotificationBox struct and methods
+kernel/arch/x64/irq.zig         -- IRQ masking/unmasking, irq_table
+kernel/arch/dispatch.zig        -- maskIrq/unmaskIrq dispatch functions
+kernel/proc/process.zig         -- notification_box field on Process
+kernel/perms/permissions.zig    -- badge_bit on PermissionEntry, badge_counter on Process
+kernel/syscall.zig              -- notify_wait / irq_ack dispatch cases
+```
+
+### NotificationBox Struct
+
+Defined in `kernel/sched/notification.zig`:
+
+```
+NotificationBox {
+    word:    atomic(u64)     -- accumulated notification bitmask
+    waiters: PriorityQueue   -- threads blocked on notify_wait
+    lock:    SpinLock
+}
+```
+
+Added to `Process` alongside `msg_box` and `fault_box`:
+
+```
+notification_box: NotificationBox = .{
+    .word = @as(atomic(u64), 0),
+    .waiters = .{},
+    .lock = .{},
+}
+```
+
+The `word` field accumulates IRQ notifications via atomic OR. The `waiters` priority queue holds threads blocked on `notify_wait`. The `lock` protects the queue and the read-and-clear operation on `word`.
+
+### Badge Bit Assignment
+
+Each `Process` has a `badge_counter: u6` field, initialized to 0. When a device region handle is inserted into the process's permissions table (via `insertPerm` for device_region entries), the current `badge_counter` value is assigned as the badge bit for that entry, and the counter is incremented mod 64.
+
+The badge bit is stored on the `PermissionEntry` struct. For device_region entries, it is packed into the upper bits of `field0` in the user permissions view so userspace can map notification bits to device handles without a syscall. Specifically, `field0` bits 56--61 carry the 6-bit badge value (the existing device type, class, and size fields occupy bits 0--55).
+
+```
+device_region field0 encoding (updated):
+  bits 0-7:   device_type (u8)
+  bits 8-15:  device_class (u8)
+  bits 32-55: size_or_port_count (u24, truncated from u32)
+  bits 56-61: badge_bit (u6)
+  bits 62-63: reserved (0)
+```
+
+### NotificationBox Methods
+
+**`signal(box: *NotificationBox, badge_bit: u6)`** — Called from the IRQ handler path. Atomically ORs `(1 << badge_bit)` into `box.word` via `@atomicRmw(.Or, .monotonic)`. Then acquires `box.lock`, drains all waiters from the priority queue, and wakes each one (spin on `on_cpu`, set `.ready`, enqueue on target core). Releases `box.lock`.
+
+The `@atomicRmw(.Or)` is lock-free; the lock is only held for the waiter drain. This means multiple IRQs from different devices can accumulate concurrently without contention on the signal path — only the waiter wake needs serialization.
+
+**`wait(box: *NotificationBox, thread: *Thread, timeout_ns: u64) -> i64`** — Called from the `notify_wait` syscall handler.
+
+```
+1. Acquire box.lock.
+2. Read word = @atomicLoad(&box.word, .monotonic).
+3. If word != 0:
+   - @atomicStore(&box.word, 0, .monotonic)  // clear
+   - Release box.lock.
+   - Return @as(i64, word).
+4. If timeout_ns == 0:
+   - Release box.lock.
+   - Return E_AGAIN.
+5. Set thread.state = .blocked.
+6. Enqueue thread on box.waiters.
+7. Release box.lock.
+8. Yield to scheduler.
+9. On wake: re-read and clear word atomically (same as step 2-3).
+   Return the bitmask, or E_TIMEOUT if woken by timeout expiry.
+```
+
+The read-and-clear is atomic with respect to concurrent `signal` calls because the lock serializes the "check zero + enqueue" path, and `signal` drains all waiters after the OR. Between the OR and the drain, additional signals may accumulate — this is correct because `notify_wait` returns the full accumulated bitmask.
+
+**`cleanup_on_death(box: *NotificationBox)`** — Called from `cleanupPhase1` when a process dies. Acquires `box.lock`, drains all waiters (waking each with `E_NOENT` in `rax`), clears `word`, releases lock. Prevents dangling thread pointers in the queue.
+
+### Kernel IRQ Handler Path
+
+When a device IRQ fires on x86, the interrupt vector handler in `kernel/arch/x64/irq.zig` executes:
+
+```
+1. Identify the IRQ line from the interrupt vector number (vector - IRQ_BASE_VECTOR).
+2. Look up irq_table[irq_line]. If null (no registered device), send EOI and return.
+3. Mask the IRQ line via I/O APIC redirection table (set the mask bit).
+4. Send LAPIC EOI.
+5. Look up the owning process: irq_table[irq_line] -> *DeviceRegion -> owner_proc.
+6. Look up the badge_bit from the PermissionEntry for this device in the owner's perm table.
+7. Call notification_box.signal(badge_bit) on the owner process's notification_box.
+```
+
+The IRQ line remains masked until userspace calls `irq_ack`, which unmasks it. This prevents interrupt storms while the driver is processing the previous interrupt.
+
+### IRQ Table
+
+Defined in `kernel/arch/x64/irq.zig`:
+
+```
+var irq_table: [256]?*DeviceRegion = [_]?*DeviceRegion{null} ** 256
+```
+
+Populated during firmware table parsing (ACPI MADT interrupt source overrides, PCI INTx routing). Each entry maps an IRQ line number to the `DeviceRegion` that owns it. The table is static after boot — entries are not modified at runtime.
+
+### I/O APIC Masking
+
+**`maskIrq(irq: u8)`** — Reads the I/O APIC redirection table entry for `irq`, sets bit 16 (mask bit), writes back. The I/O APIC is accessed via its MMIO registers (IOREGSEL at base+0x00, IOWIN at base+0x10).
+
+**`unmaskIrq(irq: u8)`** — Same read-modify-write, but clears bit 16.
+
+Both operations are protected by the existing I/O APIC lock to prevent concurrent redirection table corruption.
+
+### Arch Dispatch
+
+**`arch/dispatch.zig`** adds:
+
+```
+pub fn maskIrq(irq: u8) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.irq.maskIrq(irq),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
+pub fn unmaskIrq(irq: u8) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.irq.unmaskIrq(irq),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+```
+
+The aarch64 stubs are no-ops.
+
+### irq_ack Handler
+
+In `kernel/syscall.zig`:
+
+```
+1. Look up device_handle in caller's perm table. Return E_BADHANDLE if not found or not device_region.
+2. Check DeviceRegionRights.irq. Return E_PERM if absent.
+3. Look up the device's IRQ line. Return E_INVAL if the device has no associated IRQ.
+4. Call arch.unmaskIrq(irq_line).
+5. Return E_OK.
+```
+
+### Process Struct Additions
+
+```
+Process {
+    ...
+    notification_box: NotificationBox    -- IRQ notification delivery
+    badge_counter: u6 = 0               -- monotonic mod-64 counter for badge assignment
+    ...
+}
+```
+
+### Module-Level Changes
+
+- **`kernel/sched/notification.zig`** — new file. `NotificationBox` struct, `signal`, `wait`, `cleanup_on_death`.
+- **`kernel/arch/x64/irq.zig`** — adds `maskIrq(u8)`, `unmaskIrq(u8)` via I/O APIC. Adds global `irq_table: [256]?*DeviceRegion` populated during firmware table parsing. Adds the device IRQ dispatch path in the IRQ handler.
+- **`kernel/arch/dispatch.zig`** — adds `maskIrq(u8)`, `unmaskIrq(u8)` dispatch functions.
+- **`kernel/proc/process.zig`** — adds `notification_box: NotificationBox` and `badge_counter: u6` fields. `cleanupPhase1` calls `notification_box.cleanup_on_death()`.
+- **`kernel/perms/permissions.zig`** — adds `irq` bit (bit 3) on `DeviceRegionRights`. `insertPerm` for device_region entries assigns the badge bit from `process.badge_counter` and increments. `UserViewEntry.fromKernelEntry` packs the badge bit into `field0` bits 56--61.
+- **`kernel/syscall.zig`** — adds dispatch cases for `notify_wait` and `irq_ack` syscall numbers.
+- **`kernel/devices/registry.zig`** — `grantAllToRootService` grants device handles with rights `0b1111` (map + grant + dma + irq) instead of `0b111`.
+
+### Timeout Integration
+
+`notify_wait` with a finite timeout uses the same timed-waiter mechanism as `futex_wait`: the thread is placed on both the notification box queue and a global timed-waiter slot. The scheduler tick handler checks timed waiters and wakes expired ones with `E_TIMEOUT`. When a notification signal wakes the thread first, the timed-waiter slot is cleared. This reuses the existing futex timeout infrastructure rather than adding a new timer mechanism.
+
+### Locking
+
+The notification box lock ordering is: acquire `notification_box.lock` before `rq_lock` (same as `fault_box.lock`). The `signal` path acquires `notification_box.lock` to drain waiters, then for each waiter acquires the target core's `rq_lock` to enqueue. No other kernel lock is held when `notification_box.lock` is taken.
+
+The IRQ handler path runs with interrupts disabled on the current core (standard x86 interrupt gate behavior). It acquires `notification_box.lock` briefly for the waiter drain. This is safe because `notification_box.lock` is never held with interrupts enabled on the same core that handles IRQs (the `wait` path disables interrupts via `lockIrqSave`).
+
+---
+
+## 25. Power Control Internals
+
+System-wide and per-CPU power management. The public contract is in spec §2.19 and spec §4.61--§4.62. This section describes how the pieces fit together internally.
+
+### Layering
+
+```
+kernel/arch/x64/power.zig       -- x64 power state implementations
+kernel/arch/dispatch.zig         -- powerAction/cpuPowerAction dispatch functions
+kernel/syscall.zig               -- sys_power / sys_cpu_power dispatch cases
+```
+
+Like wall clock and randomness, the power control syscalls are simple enough to live inline in the syscall dispatch. The arch layer does all the real work.
+
+### PowerAction and CpuPowerAction Enums
+
+Defined in `kernel/syscall.zig` (or a shared types file):
+
+```
+PowerAction = enum(u8) {
+    shutdown = 0,
+    reboot = 1,
+    sleep = 2,
+    hibernate = 3,
+    screen_off = 4,
+}
+
+CpuPowerAction = enum(u8) {
+    set_freq = 0,
+    set_idle = 1,
+}
+```
+
+### sys_power Handler
+
+In `kernel/syscall.zig`:
+
+```
+1. Check ProcessRights.power on slot 0. Return E_PERM if absent.
+2. Decode action from arg register. Return E_INVAL if not a valid PowerAction variant.
+3. Call arch.powerAction(action). The arch layer returns E_OK or E_NODEV.
+4. For shutdown/reboot: arch.powerAction does not return.
+5. For sleep/hibernate/screen_off: return the arch layer's result (E_OK after resume, or E_NODEV).
+```
+
+### sys_cpu_power Handler
+
+In `kernel/syscall.zig`:
+
+```
+1. Check ProcessRights.power on slot 0. Return E_PERM if absent.
+2. Decode action from arg register. Return E_INVAL if not a valid CpuPowerAction variant.
+3. Decode value from second arg register.
+4. Call arch.cpuPowerAction(action, value). Returns E_OK or E_NODEV.
+5. Return result.
+```
+
+### Arch Dispatch
+
+**`arch/dispatch.zig`** adds:
+
+```
+pub fn powerAction(action: PowerAction) noreturn | i64 {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return x64.power.powerAction(action),
+        .aarch64 => return E_NODEV,
+        else => unreachable,
+    }
+}
+
+pub fn cpuPowerAction(action: CpuPowerAction, value: u64) i64 {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return x64.power.cpuPowerAction(action, value),
+        .aarch64 => return E_NODEV,
+        else => unreachable,
+    }
+}
+```
+
+The aarch64 stubs return `E_NODEV` for all actions.
+
+### x64 Power State Implementations
+
+Defined in `kernel/arch/x64/power.zig`. Each action maps to a specific hardware mechanism:
+
+**`shutdown`** — ACPI S5 (soft-off) sleep state. Writes to the PM1a control register with the SLP_TYP value for S5 and the SLP_EN bit. The PM1a control port and SLP_TYP are discovered during ACPI FADT parsing at boot. Fallback: write `0x2000` to port `0x604` (QEMU-specific shutdown). Does not return.
+
+**`reboot`** — Three fallback strategies:
+1. Keyboard controller reset: write `0xFE` to port `0x64`.
+2. ACPI reset register: if FADT advertises a reset register, write the reset value to it.
+3. Triple fault: load a zero-length IDT and trigger an interrupt.
+Does not return.
+
+**`sleep`** (S3 — suspend to RAM) — Saves CPU state (registers, GDT, IDT, CR0/CR3/CR4), writes the S3 SLP_TYP to PM1a control with SLP_EN, CPU halts. On resume, firmware jumps to the FACS waking vector. The kernel restores CPU state, re-enables paging, and returns `E_OK`. Returns `E_NODEV` if ACPI does not advertise S3 support.
+
+**`hibernate`** (S4 — suspend to disk) — Similar to S3 but with S4 SLP_TYP. The actual save-to-disk is a userspace responsibility (the kernel only manages the power state transition). Returns `E_NODEV` if S4 is not supported.
+
+**`screen_off`** — DPMS (Display Power Management Signaling) off via VGA register writes: read port `0x3DA` to reset the attribute controller flip-flop, write `0x00` to port `0x3C0` to blank the display. For modern systems, this may also involve writing to the GPU's power management registers if a display device region is available. Returns `E_OK`.
+
+**`set_freq`** — Per-CPU frequency control via `IA32_PERF_CTL` MSR (`0x199`). The target frequency in hertz is converted to a P-state ratio using the base bus frequency (same as §21's `getCoreFreq`). The ratio is written to bits 8--15 of `IA32_PERF_CTL`. The hardware adjusts to the nearest achievable frequency. Returns `E_NODEV` if P-state control is not supported (checked via CPUID).
+
+**`set_idle`** — Per-CPU maximum C-state level. The value is stored in a per-core variable that the idle loop consults. When the idle thread runs, it uses `MWAIT` with the C-state hint corresponding to the configured maximum level (C-state sub-state encoding per Intel SDM Vol 2 "MWAIT" instruction). If `MWAIT` is not supported (CPUID leaf 5), falls back to `HLT`. Returns `E_NODEV` if `MWAIT` is not supported and value > 0.
+
+### ACPI Table Dependencies
+
+The power subsystem depends on information discovered during `arch.parseFirmwareTables`:
+
+- **FADT (Fixed ACPI Description Table)**: PM1a control block address, PM1a event block address, SLP_TYP values for S3/S4/S5, reset register address and value, FACS physical address.
+- **FACS (Firmware ACPI Control Structure)**: waking vector for S3 resume.
+- **DSDT/SSDT**: SLP_TYP values are encoded in the `\_S3`, `\_S4`, `\_S5` objects in the DSDT. The kernel extracts these during ACPI parsing.
+
+These values are cached in a global `AcpiPowerInfo` struct populated during `parseFirmwareTables` and consulted by `power.zig` at syscall time.
+
+### Module-Level Changes
+
+- **`kernel/arch/x64/power.zig`** — new file. Implements `powerAction(PowerAction)` and `cpuPowerAction(CpuPowerAction, u64)`.
+- **`kernel/arch/dispatch.zig`** — adds `powerAction` and `cpuPowerAction` dispatch functions.
+- **`kernel/arch/x64/acpi.zig`** — extracts and caches FADT power management fields (PM1a control port, SLP_TYP values, reset register, FACS waking vector) in a global `AcpiPowerInfo` struct.
+- **`kernel/syscall.zig`** — adds dispatch cases for `sys_power` and `sys_cpu_power` syscall numbers.
+- **`kernel/perms/permissions.zig`** — adds `power` bit (bit 10) on `ProcessRights`. Root service slot 0 is initialized with this bit set.
