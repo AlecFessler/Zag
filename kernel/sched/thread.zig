@@ -61,6 +61,10 @@ pub const Thread = struct {
     pinned_exclusive: bool = false,
     futex_deadline_ns: u64 = 0,
     futex_paddr: PAddr = PAddr.fromInt(0),
+    /// True when this thread is blocked in NotificationBox.wait with a timeout.
+    /// Used by expireTimedWaiters to drain from the notification box instead of
+    /// a futex bucket. Set before addTimedWaiter, cleared on wake.
+    notification_waiter: bool = false,
     ipc_server: ?*Process = null,
     slot_index: u8 = 0,
     /// Fault metadata, valid iff thread.state == .faulted (or the thread

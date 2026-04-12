@@ -168,7 +168,9 @@ pub const UserViewEntryType = enum(u8) {
 pub const UserViewEntry = extern struct {
     handle: u64,
     entry_type: u8,
-    _pad0: u8 = 0,
+    /// For device_region entries, holds the badge_bit (u6, §2.18.3).
+    /// Zero for all other entry types.
+    badge_byte: u8 = 0,
     rights: u16,
     _pad: [4]u8 = .{ 0, 0, 0, 0 },
     field0: u64,
@@ -241,14 +243,14 @@ pub const UserViewEntry = extern struct {
             .device_region => |dr| .{
                 .handle = entry.handle,
                 .entry_type = @intFromEnum(UserViewEntryType.device_region),
+                .badge_byte = entry.badge_bit,
                 .rights = entry.rights,
                 .field0 = @as(u64, @intFromEnum(dr.device_type)) |
                     (@as(u64, @intFromEnum(dr.device_class)) << 8) |
                     (if (dr.device_type == .mmio)
                         @as(u64, @truncate(dr.access.mmio.size)) << 32
                     else
-                        @as(u64, dr.access.port_io.port_count) << 32) |
-                    (@as(u64, entry.badge_bit) << 56),
+                        @as(u64, dr.access.port_io.port_count) << 32),
                 .field1 = if (dr.device_class == .display) blk: {
                     const d = dr.detail.display;
                     break :blk @as(u64, d.fb_width) |

@@ -90,12 +90,20 @@ pub fn registerDisplayDevice(fb: Framebuffer) void {
 }
 
 pub fn grantAllToRootService(root_proc: *Process) void {
+    const DeviceRegionRights = zag.perms.permissions.DeviceRegionRights;
     var i: u32 = 0;
     while (i < device_count) : (i += 1) {
+        const dev = device_table[i];
+        // Display devices (e.g. VGA framebuffer) have no IRQ line, so don't
+        // grant the irq right. All other devices get full rights.
+        const rights: DeviceRegionRights = if (dev.device_class == .display)
+            .{ .map = true, .grant = true, .dma = true }
+        else
+            .{ .map = true, .grant = true, .dma = true, .irq = true };
         const entry = PermissionEntry{
             .handle = 0,
-            .object = .{ .device_region = device_table[i] },
-            .rights = 0b1111,
+            .object = .{ .device_region = dev },
+            .rights = @as(u16, @as(u8, @bitCast(rights))),
         };
         _ = root_proc.insertPerm(entry) catch {};
     }

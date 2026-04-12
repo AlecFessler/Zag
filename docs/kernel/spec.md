@@ -670,7 +670,7 @@ Each device handle in a process's permissions table has an associated `badge_bit
 
 <!-- spec:test:2.18.2 -->**§2.18.2** The badge bit is stored on the `PermissionEntry` for device region entries and exposed in the user permissions view so userspace can map notification bits to device handles without a syscall.
 
-<!-- spec:test:2.18.3 -->**§2.18.3** The badge bit is packed into the upper bits of the device entry `field0` in the user permissions view.
+<!-- spec:test:2.18.3 -->**§2.18.3** The badge bit is stored in the `badge_byte` field (offset 9, the byte after `entry_type`) of the device entry in the user permissions view.
 
 #### Notification Delivery
 

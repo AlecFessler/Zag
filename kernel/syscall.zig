@@ -45,7 +45,7 @@ const E_NOENT: i64 = -10;
 const E_BUSY: i64 = -11;
 const E_EXIST: i64 = -12;
 const E_NORES: i64 = -14;
-const E_NODEV: i64 = -15;
+const E_NODEV: i64 = -13;
 
 /// Wall clock offset: difference between RTC-derived Unix nanoseconds
 /// and the monotonic clock. Initialized at boot from the CMOS RTC.

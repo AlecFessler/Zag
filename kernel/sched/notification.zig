@@ -70,11 +70,13 @@ pub const NotificationBox = struct {
         if (timeout_ns != std.math.maxInt(u64)) {
             const now_ns = arch.getMonotonicClock().now();
             thread.futex_deadline_ns = now_ns + timeout_ns;
+            thread.notification_waiter = true;
             // Use the futex timed-waiter infrastructure.
             const futex_mod = zag.proc.futex;
             if (!futex_mod.addTimedWaiterPublic(thread)) {
                 // No timed waiter slots available; wake immediately with timeout.
                 thread.state = .ready;
+                thread.notification_waiter = false;
                 self.lock.unlockIrqRestore(irq);
                 return E_TIMEOUT;
             }
@@ -88,6 +90,7 @@ pub const NotificationBox = struct {
         sched.yield();
 
         // On wake: check if we were woken by timeout or by signal.
+        thread.notification_waiter = false;
         const deadline = thread.futex_deadline_ns;
         if (deadline != 0) {
             thread.futex_deadline_ns = 0;

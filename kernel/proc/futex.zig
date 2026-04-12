@@ -5,6 +5,7 @@ const arch = zag.arch.dispatch;
 const containers = zag.containers;
 const sched = zag.sched.scheduler;
 
+const NotificationBox = zag.sched.notification.NotificationBox;
 const PAddr = zag.memory.address.PAddr;
 const PriorityQueue = containers.priority_queue.PriorityQueue;
 const SpinLock = zag.utils.sync.SpinLock;
@@ -191,14 +192,26 @@ pub fn expireTimedWaiters() void {
         const thread = slot.* orelse continue;
         if (thread.futex_deadline_ns == 0 or now_ns < thread.futex_deadline_ns) continue;
 
-        const bucket = &buckets[bucketIdx(thread.futex_paddr)];
-        const birq = bucket.lock.lockIrqSave();
-        const removed = removeWaiter(bucket, thread);
-        bucket.lock.unlockIrqRestore(birq);
+        var removed: bool = false;
+
+        if (thread.notification_waiter) {
+            // Thread is blocked in NotificationBox.wait — remove from the
+            // process's notification box waiter queue instead of a futex bucket.
+            const nbox = &thread.process.notification_box;
+            const nirq = nbox.lock.lockIrqSave();
+            removed = nbox.waiters.remove(thread);
+            nbox.lock.unlockIrqRestore(nirq);
+        } else {
+            const bucket = &buckets[bucketIdx(thread.futex_paddr)];
+            const birq = bucket.lock.lockIrqSave();
+            removed = removeWaiter(bucket, thread);
+            bucket.lock.unlockIrqRestore(birq);
+        }
 
         if (removed) {
             while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
             thread.futex_deadline_ns = @bitCast(E_TIMEOUT);
+            thread.notification_waiter = false;
             thread.state = .ready;
             const target = if (thread.core_affinity) |mask|
                 @as(u64, @ctz(mask))

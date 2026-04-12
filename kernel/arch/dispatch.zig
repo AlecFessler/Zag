@@ -704,7 +704,7 @@ pub const CpuPowerAction = switch (builtin.cpu.arch) {
 pub fn powerAction(action: PowerAction) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.power.powerAction(action),
-        .aarch64 => -15, // E_NODEV
+        .aarch64 => -13, // E_NODEV
         else => unreachable,
     };
 }
@@ -712,7 +712,7 @@ pub fn powerAction(action: PowerAction) i64 {
 pub fn cpuPowerAction(action: CpuPowerAction, value: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.power.cpuPowerAction(action, value),
-        .aarch64 => -15, // E_NODEV
+        .aarch64 => -13, // E_NODEV
         else => unreachable,
     };
 }
