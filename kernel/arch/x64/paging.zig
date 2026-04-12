@@ -435,6 +435,11 @@ pub fn unmapPage(
     return phys;
 }
 
+/// Recursively walk the 4-level paging hierarchy for the user half of the
+/// address space (PML4 indices 0–255) and free all leaf pages and table pages.
+/// Intel SDM Vol 3A, §4.5 "4-Level Paging and 5-Level Paging" — the hierarchy
+/// is PML4 → PDPT → PD → PT; each table is a 4-KB page of 512 eight-byte
+/// entries. Only PML4 entries 0–255 cover user space (canonical low half).
 pub fn freeUserAddrSpace(addr_space_root: PAddr) void {
     const pmm_iface = pmm.global_pmm.?.allocator();
     const root_virt = VAddr.fromPAddr(addr_space_root, null);
@@ -537,6 +542,11 @@ pub fn resolveVaddr(
     return l1_entry.getPAddr();
 }
 
+/// Extract the physical address from a non-leaf page-table entry and return a
+/// pointer to the next-level table it points to.
+/// Intel SDM Vol 3A, §4.5 — bits 51:12 of a non-leaf entry hold the 4-KB-
+/// aligned physical address of the next paging structure (Tables 4-15 through
+/// 4-18).
 fn entryToTable(entry: *const PageEntry) *[page_entry_table_size]PageEntry {
     const virt = VAddr.fromPAddr(entry.getPAddr(), null);
     return @ptrFromInt(virt.addr);

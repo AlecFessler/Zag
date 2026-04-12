@@ -317,6 +317,9 @@ pub fn readTimestamp() u64 {
     }
 }
 
+/// Read a value from an x86 I/O port.
+/// Intel SDM Vol 1, §18.2 "I/O Port Addressing" — IN instruction reads 8, 16,
+/// or 32 bits from the port address specified in DX (or an immediate byte).
 pub fn ioportIn(port: u16, width: u8) u32 {
     return switch (builtin.cpu.arch) {
         .x86_64 => switch (width) {
@@ -329,6 +332,9 @@ pub fn ioportIn(port: u16, width: u8) u32 {
     };
 }
 
+/// Write a value to an x86 I/O port.
+/// Intel SDM Vol 1, §18.2 "I/O Port Addressing" — OUT instruction writes 8,
+/// 16, or 32 bits to the port address specified in DX (or an immediate byte).
 pub fn ioportOut(port: u16, width: u8, value: u32) void {
     switch (builtin.cpu.arch) {
         .x86_64 => switch (width) {
@@ -510,7 +516,13 @@ pub fn vmInjectException(guest_state: *GuestState, exception: GuestException) vo
     }
 }
 
-/// Modify MSR passthrough bits in the VM's MSRPM.
+/// Modify MSR passthrough bits in the VM's MSR permission map.
+/// On AMD SVM: AMD APM Vol 2, §15.10 "MSR Intercepts" — the MSRPM is an 8-KB
+/// bitmap; two bits per MSR (bit 0 = read intercept, bit 1 = write intercept);
+/// 0 = passthrough, 1 = intercept. MSRs 0x0000–0x1FFF at byte offset 0x000;
+/// MSRs 0xC0000000–0xC0001FFF at byte offset 0x800.
+/// On Intel VMX: Intel SDM Vol 3C, §24.6.9 "MSR-Bitmap Address" — a 4-KB
+/// bitmap with four 1-KB regions for RDMSR/WRMSR on low/high MSR ranges.
 pub fn vmMsrPassthrough(vm_structures: PAddr, msr_num: u32, allow_read: bool, allow_write: bool) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.vm.msrPassthrough(vm_structures, msr_num, allow_read, allow_write),

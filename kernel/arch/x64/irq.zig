@@ -124,9 +124,11 @@ pub fn setIoapicBase(phys_addr: u32) void {
     ioapic_base = VAddr.fromPAddr(phys, null).addr;
 }
 
-/// Mask an IRQ line by setting bit 16 of the I/O APIC redirection table entry.
-/// I/O APIC accessed via MMIO: IOREGSEL at base+0x00, IOWIN at base+0x10.
-/// Systems.md §24.
+/// Mask an IRQ line by setting bit 16 (interrupt mask) of the low dword of
+/// the I/O APIC redirection table entry for the given IRQ.
+/// 82093AA I/O APIC Datasheet, §3.2.4 "I/O Redirection Table Registers" —
+/// bit 16 of the low dword is the Interrupt Mask bit; 1 = masked.
+/// Redirection table entry n occupies registers 0x10+2n (low) and 0x11+2n (high).
 pub fn maskIrq(irq_line: u8) void {
     if (ioapic_base == 0) return;
     const reg = @as(u32, 0x10) + @as(u32, irq_line) * 2;
@@ -136,8 +138,10 @@ pub fn maskIrq(irq_line: u8) void {
     ioapic_lock.unlockIrqRestore(irq_state);
 }
 
-/// Unmask an IRQ line by clearing bit 16 of the I/O APIC redirection table entry.
-/// Systems.md §24.
+/// Unmask an IRQ line by clearing bit 16 (interrupt mask) of the low dword of
+/// the I/O APIC redirection table entry for the given IRQ.
+/// 82093AA I/O APIC Datasheet, §3.2.4 "I/O Redirection Table Registers" —
+/// bit 16 of the low dword is the Interrupt Mask bit; 0 = unmasked.
 pub fn unmaskIrq(irq_line: u8) void {
     if (ioapic_base == 0) return;
     const reg = @as(u32, 0x10) + @as(u32, irq_line) * 2;
@@ -147,6 +151,9 @@ pub fn unmaskIrq(irq_line: u8) void {
     ioapic_lock.unlockIrqRestore(irq_state);
 }
 
+/// Read a 32-bit register from the I/O APIC via the indirect MMIO interface.
+/// 82093AA I/O APIC Datasheet, §3.1 "I/O APIC Registers" — IOREGSEL at
+/// base+0x00 selects the register index; IOWIN at base+0x10 is the data window.
 fn ioapicRead(reg: u32) u32 {
     const sel: *volatile u32 = @ptrFromInt(ioapic_base);
     const win: *const volatile u32 = @ptrFromInt(ioapic_base + 0x10);
@@ -154,6 +161,9 @@ fn ioapicRead(reg: u32) u32 {
     return win.*;
 }
 
+/// Write a 32-bit register to the I/O APIC via the indirect MMIO interface.
+/// 82093AA I/O APIC Datasheet, §3.1 "I/O APIC Registers" — IOREGSEL at
+/// base+0x00 selects the register index; IOWIN at base+0x10 is the data window.
 fn ioapicWrite(reg: u32, val: u32) void {
     const sel: *volatile u32 = @ptrFromInt(ioapic_base);
     const win: *volatile u32 = @ptrFromInt(ioapic_base + 0x10);

@@ -7,6 +7,12 @@ const cpu = zag.arch.x64.cpu;
 ///
 /// MC146818-compatible real-time clock accessed via I/O ports 0x70 (address)
 /// and 0x71 (data). Precision is 1 second (RTC has no sub-second granularity).
+/// MC146818A Datasheet, §2 "Register Description":
+///   Register A (0x0A): bit 7 = Update-In-Progress (UIP) flag.
+///   Register B (0x0B): bit 2 = Data Mode (0=BCD, 1=binary);
+///                       bit 1 = 24/12-hour mode (0=12-hour, 1=24-hour).
+///   Time/date registers: 0x00=seconds, 0x02=minutes, 0x04=hours,
+///     0x07=day-of-month, 0x08=month, 0x09=year, 0x32=century (ACPI extension).
 pub fn readRtc() u64 {
     // Spin until the Update-In-Progress (UIP) bit is clear.
     while (readCmosReg(0x0A) & 0x80 != 0) std.atomic.spinLoopHint();

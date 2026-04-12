@@ -59,7 +59,12 @@ pub fn cpuPowerAction(action: CpuPowerAction, value: u64) i64 {
     }
 }
 
-/// ACPI S5 shutdown. Falls back to QEMU port 0x604.
+/// Shut down the system. Attempts ACPI S5 soft-off; falls back to QEMU's
+/// debug-exit I/O port if ACPI FADT parsing has not been performed.
+/// ACPI Specification §16.1 "System \_S5 State" — writing the SLP_TYPx value
+/// for S5 with SLP_EN=1 to PM1_CNT triggers soft-off.
+/// QEMU fallback: writing 0x2000 to I/O port 0x604 triggers QEMU's isa-debug-
+/// exit device shutdown (QEMU source: hw/misc/debugexit.c).
 /// Does not return.
 fn doShutdown() noreturn {
     // Fallback: QEMU shutdown via debug exit port.
@@ -68,7 +73,14 @@ fn doShutdown() noreturn {
     while (true) cpu.halt();
 }
 
-/// Reboot via keyboard controller reset, then triple fault.
+/// Reboot the system via the keyboard controller reset line, falling back to a
+/// triple fault if the keyboard controller does not respond.
+/// PS/2 Controller Specification (Intel 8042): port 0x64 is the command port;
+/// command 0xFE pulses the CPU reset line (RESET#) low for approximately 6 μs,
+/// causing a hard reset. Triple-fault is a last-resort: loading a zero-size IDT
+/// and triggering any interrupt causes the CPU to triple-fault and reset.
+/// Intel SDM Vol 3A, §2.1.3 "Halt and Shutdown" — a triple fault causes the
+/// processor to perform a machine shutdown, resetting RESET# externally.
 /// Does not return.
 fn doReboot() noreturn {
     // Strategy 1: Keyboard controller reset — write 0xFE to port 0x64.
