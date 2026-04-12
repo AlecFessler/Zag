@@ -727,6 +727,7 @@ pub fn globalInit(root_service_elf: []const u8) !void {
         .pmu = true,
         .set_time = true,
         .power = true,
+        .vm_create = true,
     }, null, ThreadHandleRights.full, .pinned);
     device_registry.grantAllToRootService(root_proc);
     core_states[0].rq.enqueue(root_proc.threads[0]);

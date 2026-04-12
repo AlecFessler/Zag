@@ -143,8 +143,9 @@ fn deliverExit(vm_obj: *Vm, vcpu_obj: *VCpu, receiver: *Thread) void {
     // Wait until receiver is off CPU and has saved its context.
     while (receiver.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
 
-    // Write exit info into receiver's saved buf_ptr (RDI from syscall entry).
-    const buf_ptr = receiver.ctx.regs.rdi;
+    // Write exit info into receiver's saved buf_ptr (RSI from syscall entry;
+    // RDI is the vm_handle after the handle refactor).
+    const buf_ptr = receiver.ctx.regs.rsi;
     writeExitMessageToUser(owner, buf_ptr, handle_id, vcpu_obj);
 
     // Set return value

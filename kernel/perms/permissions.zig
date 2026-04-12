@@ -47,7 +47,8 @@ pub const ProcessRights = packed struct(u16) {
     pmu: bool = false,
     set_time: bool = false,
     power: bool = false,
-    _reserved: u5 = 0,
+    vm_create: bool = false,
+    _reserved: u4 = 0,
 };
 
 pub const VmReservationRights = packed struct(u8) {

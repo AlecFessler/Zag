@@ -170,10 +170,15 @@ pub const Vm = struct {
 /// Syscall implementation: create a VM for the calling process.
 pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
     const E_INVAL: i64 = -1;
+    const E_PERM: i64 = -2;
     const E_NOMEM: i64 = -4;
     const E_MAXCAP: i64 = -5;
     const E_BADADDR: i64 = -7;
     const E_NODEV: i64 = -13;
+
+    // Check ProcessRights.vm_create on slot 0
+    const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
+    if (!self_entry.processRights().vm_create) return E_PERM;
 
     // Check hardware support
     if (!arch.vmSupported()) return E_NODEV;

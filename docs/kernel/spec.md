@@ -408,7 +408,7 @@ Reply flags (additional r14 bits):
 
 Zag supports hosting virtual machines via kernel-managed VM primitives. A userspace VM manager process creates and manages a VM, handles VM exits that require policy decisions or device emulation, and communicates with other Zag services for device I/O. The kernel handles low-level VM mechanics; policy lives in userspace.
 
-**§2.13.1** All VM syscalls (except `vm_create`) return `E_INVAL` if the calling process has no VM.
+**§2.13.1** All VM syscalls with an invalid handle return `E_BADCAP`.
 
 **§2.13.2** When the VM manager process exits or is killed, the kernel destroys its VM as part of process cleanup: all vCPU threads are killed, guest memory is freed, and the VM is deallocated. This happens before the process's own address space is freed.
 
@@ -940,13 +940,13 @@ Same validation as `ioport_read`. **§4.28.1** `ioport_write` returns `E_OK` on 
 
 Creates a VM with the specified number of vCPUs and a static policy table. Creates vCPU threads with fixed kernel-managed entry points and inserts thread handles for all vCPUs into the calling process's permissions table with full `ThreadHandleRights`. Sets `proc.vm`.
 
-**§4.38.1** `vm_create` returns `E_OK` on success. **§4.38.2** `vm_create` with `vcpu_count` = 0 returns `E_INVAL`. **§4.38.3** `vm_create` with `vcpu_count` exceeding `MAX_VCPUS` (64) returns `E_INVAL`. **§4.38.4** `vm_create` when the calling process already has a VM returns `E_INVAL`. **§4.38.5** `vm_create` returns `E_NODEV` if hardware virtualization is not supported. **§4.38.6** `vm_create` returns `E_MAXCAP` if the permissions table cannot fit all vCPU thread handles. **§4.38.7** `vm_create` reads an `arch.VmPolicy` struct from `policy_ptr`. Returns `E_BADADDR` if `policy_ptr` is not readable.
+**§4.38.1** `vm_create` returns a positive handle on success. **§4.38.2** `vm_create` with `vcpu_count` = 0 returns `E_INVAL`. **§4.38.3** `vm_create` with `vcpu_count` exceeding `MAX_VCPUS` (64) returns `E_INVAL`. **§4.38.4** `vm_create` when the calling process already has a VM returns `E_INVAL`. **§4.38.5** `vm_create` returns `E_NODEV` if hardware virtualization is not supported. **§4.38.6** `vm_create` returns `E_MAXCAP` if the permissions table cannot fit all vCPU thread handles. **§4.38.7** `vm_create` reads an `arch.VmPolicy` struct from `policy_ptr`. Returns `E_BADADDR` if `policy_ptr` is not readable.
 
 ### §4.39 vm_destroy() → result
 
 Destroys the calling process's VM. Kills all vCPU threads, tears down guest memory mappings, frees arch-specific virtualization structures, and clears `proc.vm`.
 
-**§4.39.1** `vm_destroy` returns `E_OK` on success. **§4.39.2** `vm_destroy` with no VM returns `E_INVAL`. **§4.39.3** `vm_destroy` with running vCPUs returns `E_OK` and cleanly tears down the VM.
+**§4.39.1** `vm_destroy` returns `E_OK` on success. **§4.39.2** `vm_destroy` syscall always returns `E_INVAL` (deprecated, use revoke_perm). **§4.39.3** `vm_destroy` with running vCPUs returns `E_OK` and cleanly tears down the VM.
 
 ### §4.40 vm_guest_map(host_vaddr, guest_addr, size, rights) → result
 
@@ -994,19 +994,19 @@ Injects a virtual interrupt into a vCPU.
 
 Configures the calling process's VM to allow the guest to RDMSR and/or WRMSR the specified MSR directly without exiting. The kernel rejects security-critical MSRs (see the MSR Passthrough subsection of §2.13).
 
-**§4.47.1** `vm_msr_passthrough` returns `E_OK` on success. **§4.47.2** `vm_msr_passthrough` with no VM returns `E_INVAL`. **§4.47.3** `vm_msr_passthrough` with `msr_num` outside the 32-bit MSR address range returns `E_INVAL`. **§4.47.4** `vm_msr_passthrough` with an MSR in the security blocklist returns `E_PERM`.
+**§4.47.1** `vm_msr_passthrough` returns `E_OK` on success. **§4.47.2** `vm_msr_passthrough` with an invalid VM handle returns `E_BADCAP`. **§4.47.3** `vm_msr_passthrough` with `msr_num` outside the 32-bit MSR address range returns `E_INVAL`. **§4.47.4** `vm_msr_passthrough` with an MSR in the security blocklist returns `E_PERM`.
 
 ### §4.48 vm_ioapic_assert_irq(irq_num) → result
 
 Asserts an IRQ line on the calling process's VM's in-kernel IOAPIC and kicks any running vCPU so the new interrupt state is observed promptly (see the Userspace IRQ Assertion subsection of §2.13).
 
-**§4.48.1** `vm_ioapic_assert_irq` returns `E_OK` on success. **§4.48.2** `vm_ioapic_assert_irq` with no VM returns `E_INVAL`. **§4.48.3** `vm_ioapic_assert_irq` with `irq_num` greater than or equal to 24 returns `E_INVAL`.
+**§4.48.1** `vm_ioapic_assert_irq` returns `E_OK` on success. **§4.48.2** `vm_ioapic_assert_irq` with an invalid VM handle returns `E_BADCAP`. **§4.48.3** `vm_ioapic_assert_irq` with `irq_num` greater than or equal to 24 returns `E_INVAL`.
 
 ### §4.49 vm_ioapic_deassert_irq(irq_num) → result
 
 De-asserts an IRQ line on the calling process's VM's in-kernel IOAPIC and kicks any running vCPU so the new interrupt state is observed promptly (see the Userspace IRQ Assertion subsection of §2.13).
 
-**§4.49.1** `vm_ioapic_deassert_irq` returns `E_OK` on success. **§4.49.2** `vm_ioapic_deassert_irq` with no VM returns `E_INVAL`. **§4.49.3** `vm_ioapic_deassert_irq` with `irq_num` greater than or equal to 24 returns `E_INVAL`.
+**§4.49.1** `vm_ioapic_deassert_irq` returns `E_OK` on success. **§4.49.2** `vm_ioapic_deassert_irq` with an invalid VM handle returns `E_BADCAP`. **§4.49.3** `vm_ioapic_deassert_irq` with `irq_num` greater than or equal to 24 returns `E_INVAL`.
 
 ### §4.50 pmu_info(info_ptr) → result
 
