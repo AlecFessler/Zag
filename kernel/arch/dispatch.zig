@@ -317,14 +317,6 @@ pub fn readTimestamp() u64 {
     }
 }
 
-pub fn shutdown() noreturn {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.cpu.qemuShutdown(),
-        .aarch64 => aarch64.cpu.halt(),
-        else => unreachable,
-    }
-}
-
 pub fn ioportIn(port: u16, width: u8) u32 {
     return switch (builtin.cpu.arch) {
         .x86_64 => switch (width) {

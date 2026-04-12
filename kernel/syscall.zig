@@ -167,7 +167,7 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
         .ipc_call => sysIpcCall(ctx),
         .ipc_recv => sysIpcRecv(ctx),
         .ipc_reply => sysIpcReply(ctx),
-        .shutdown => sysShutdown(),
+        .shutdown => .{ .rax = sysSysPower(0) },
         .thread_self => .{ .rax = sysThreadSelf() },
         .thread_suspend => .{ .rax = sysThreadSuspend(arg0) },
         .thread_resume => .{ .rax = sysThreadResume(arg0) },
@@ -578,10 +578,6 @@ fn sysThreadCreate(entry_addr: u64, arg: u64, num_stack_pages_u64: u64) i64 {
 
     sched.enqueueOnCore(arch.coreID(), thread);
     return @intCast(handle_id);
-}
-
-fn sysShutdown() noreturn {
-    arch.shutdown();
 }
 
 fn sysThreadExit() noreturn {
