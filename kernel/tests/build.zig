@@ -95,7 +95,7 @@ pub fn build(b: *std.Build) void {
     const child_fill_table_recv_bin = buildChild(b, target, lib_mod, "child_fill_table_recv", "children/child_fill_table_recv.zig");
     const child_try_mmio_map_bin = buildChild(b, target, lib_mod, "child_try_mmio_map", "children/child_try_mmio_map.zig");
     const child_try_dma_map_bin = buildChild(b, target, lib_mod, "child_try_dma_map", "children/child_try_dma_map.zig");
-    const child_try_ioport_bin = buildChild(b, target, lib_mod, "child_try_ioport", "children/child_try_ioport.zig");
+
     const child_call_parent_with_device_bin = buildChild(b, target, lib_mod, "child_call_parent_with_device", "children/child_call_parent_with_device.zig");
     const child_call_parent_with_self_bin = buildChild(b, target, lib_mod, "child_call_parent_with_self", "children/child_call_parent_with_self.zig");
     const child_check_bss_bin = buildChild(b, target, lib_mod, "child_check_bss", "children/child_check_bss.zig");
@@ -186,6 +186,8 @@ pub fn build(b: *std.Build) void {
     const child_try_notify_wait_bin = buildChild(b, target, lib_mod, "child_try_notify_wait", "children/child_try_notify_wait.zig");
     const child_try_sys_power_bin = buildChild(b, target, lib_mod, "child_try_sys_power", "children/child_try_sys_power.zig");
     const child_try_sys_cpu_power_bin = buildChild(b, target, lib_mod, "child_try_sys_cpu_power", "children/child_try_sys_cpu_power.zig");
+    const child_vbar_non_mov_bin = buildChild(b, target, lib_mod, "child_vbar_non_mov", "children/child_vbar_non_mov.zig");
+    const child_vbar_oob_read_bin = buildChild(b, target, lib_mod, "child_vbar_oob_read", "children/child_vbar_oob_read.zig");
 
     const embedded_wf = b.addWriteFiles();
     _ = embedded_wf.addCopyFile(child_exit_bin, "child_exit.elf");
@@ -236,7 +238,7 @@ pub fn build(b: *std.Build) void {
     _ = embedded_wf.addCopyFile(child_fill_table_recv_bin, "child_fill_table_recv.elf");
     _ = embedded_wf.addCopyFile(child_try_mmio_map_bin, "child_try_mmio_map.elf");
     _ = embedded_wf.addCopyFile(child_try_dma_map_bin, "child_try_dma_map.elf");
-    _ = embedded_wf.addCopyFile(child_try_ioport_bin, "child_try_ioport.elf");
+
     _ = embedded_wf.addCopyFile(child_call_parent_with_device_bin, "child_call_parent_with_device.elf");
     _ = embedded_wf.addCopyFile(child_call_parent_with_self_bin, "child_call_parent_with_self.elf");
     _ = embedded_wf.addCopyFile(child_check_bss_bin, "child_check_bss.elf");
@@ -327,6 +329,8 @@ pub fn build(b: *std.Build) void {
     _ = embedded_wf.addCopyFile(child_try_notify_wait_bin, "child_try_notify_wait.elf");
     _ = embedded_wf.addCopyFile(child_try_sys_power_bin, "child_try_sys_power.elf");
     _ = embedded_wf.addCopyFile(child_try_sys_cpu_power_bin, "child_try_sys_cpu_power.elf");
+    _ = embedded_wf.addCopyFile(child_vbar_non_mov_bin, "child_vbar_non_mov.elf");
+    _ = embedded_wf.addCopyFile(child_vbar_oob_read_bin, "child_vbar_oob_read.elf");
     const embed_src = embedded_wf.add("embedded_children.zig",
         \\pub const child_exit = @embedFile("child_exit.elf");
         \\pub const child_shm_counter = @embedFile("child_shm_counter.elf");
@@ -376,7 +380,7 @@ pub fn build(b: *std.Build) void {
         \\pub const child_fill_table_recv = @embedFile("child_fill_table_recv.elf");
         \\pub const child_try_mmio_map = @embedFile("child_try_mmio_map.elf");
         \\pub const child_try_dma_map = @embedFile("child_try_dma_map.elf");
-        \\pub const child_try_ioport = @embedFile("child_try_ioport.elf");
+
         \\pub const child_call_parent_with_device = @embedFile("child_call_parent_with_device.elf");
         \\pub const child_call_parent_with_self = @embedFile("child_call_parent_with_self.elf");
         \\pub const child_check_bss = @embedFile("child_check_bss.elf");
@@ -467,6 +471,8 @@ pub fn build(b: *std.Build) void {
         \\pub const child_try_notify_wait = @embedFile("child_try_notify_wait.elf");
         \\pub const child_try_sys_power = @embedFile("child_try_sys_power.elf");
         \\pub const child_try_sys_cpu_power = @embedFile("child_try_sys_cpu_power.elf");
+        \\pub const child_vbar_non_mov = @embedFile("child_vbar_non_mov.elf");
+        \\pub const child_vbar_oob_read = @embedFile("child_vbar_oob_read.elf");
         \\
     );
 

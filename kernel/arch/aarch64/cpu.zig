@@ -37,13 +37,18 @@ pub fn enableInterrupts() void {
 pub fn saveAndDisableInterrupts() u64 {
     // Read DAIF, then set PSTATE.I to mask IRQs.
     var daif: u64 = undefined;
-    asm volatile ("mrs %[daif], daif" : [daif] "=r" (daif));
+    asm volatile ("mrs %[daif], daif"
+        : [daif] "=r" (daif),
+    );
     asm volatile ("msr daifset, #0x2");
     return daif;
 }
 
 pub fn restoreInterrupts(state: u64) void {
-    asm volatile ("msr daif, %[state]" : : [state] "r" (state));
+    asm volatile ("msr daif, %[state]"
+        :
+        : [state] "r" (state),
+    );
 }
 
 /// Disable PAN — allow kernel to access user pages.
@@ -64,7 +69,7 @@ pub inline fn panEnable() void {
 pub inline fn readCntvct() u64 {
     var val: u64 = undefined;
     asm volatile ("mrs %[val], cntvct_el0"
-        : [val] "=r" (val)
+        : [val] "=r" (val),
     );
     return val;
 }

@@ -115,6 +115,19 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
             arch.enableInterrupts();
             while (true) arch.halt();
         },
+        .virtual_bar => {
+            // Virtual BAR faults should be intercepted by the arch-specific
+            // page fault handler. Reaching here means something unexpected
+            // happened (e.g., present-page protection fault).
+            if (proc.faultBlock(thread, .protection_fault, faulting_virt.addr, fault.rip, fault.user_ctx)) {
+                arch.enableInterrupts();
+                scheduler.yield();
+                return;
+            }
+            proc.kill(.protection_fault);
+            arch.enableInterrupts();
+            while (true) arch.halt();
+        },
         .private => {
             const rights_ok = blk: {
                 if (is_exec) break :blk node.rights.execute;

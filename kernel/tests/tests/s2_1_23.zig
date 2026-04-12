@@ -6,31 +6,19 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.1.23 — After restart, `fault_reason` in `field0` reflects the triggering fault.
+/// §2.1.23 — Data mappings persist across restart; content is reloaded from original ELF.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
-
-    // Create SHM for communication.
-    const shm_rights = perms.SharedMemoryRights{ .read = true, .write = true, .grant = true };
-    const shm_handle: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(4096, shm_rights.bits())));
-    const vm_rw_s = perms.VmReservationRights{ .read = true, .write = true, .shareable = true };
-    const vm = syscall.mem_reserve(0, 4096, vm_rw_s.bits());
-    const vm_handle: u64 = @bitCast(vm.val);
-    _ = syscall.mem_shm_map(shm_handle, vm_handle, 0);
-
-    // Spawn restartable child that causes stack overflow.
-    const child_rights = perms.ProcessRights{ .spawn_thread = true, .mem_reserve = true, .mem_shm_create = true, .restart = true };
-    const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(@intFromPtr(children.child_stack_overflow_restart.ptr), children.child_stack_overflow_restart.len, child_rights.bits())));
-
-    // Send SHM to child.
-    var reply: syscall.IpcMessage = .{};
-    _ = syscall.ipc_call_cap(child_handle, &.{ shm_handle, shm_rights.bits() }, &reply);
-
-    // Wait for child to report fault info after restart (fault_reason_slot at base+8).
-    const crash_reason_ptr: *u64 = @ptrFromInt(vm.val2 + 8);
-    t.waitUntilNonZero(crash_reason_ptr);
-
-    // Also check the PARENT's view of the child's entry.
+    // child_check_data_reload has an initialized .data variable (0xCAFE_BABE_DEAD_BEEF).
+    // On first boot it corrupts it, then exits → restart.
+    // On second boot it reads the value — if data was reloaded from ELF, it should
+    // be back to the original value (0xCAFE_BABE_DEAD_BEEF), not the corrupted value.
+    const child_rights = (perms.ProcessRights{ .restart = true }).bits();
+    const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
+        @intFromPtr(children.child_check_data_reload.ptr),
+        children.child_check_data_reload.len,
+        child_rights,
+    )));
     var slot: usize = 0;
     for (0..128) |i| {
         if (view[i].handle == child_handle) {
@@ -38,13 +26,23 @@ pub fn main(pv: u64) void {
             break;
         }
     }
-    const parent_crash_reason = view[slot].processCrashReason();
-
-    // Stack overflow should give fault_reason = stack_overflow (1).
-    if (parent_crash_reason == .stack_overflow) {
+    // Wait for restart.
+    var attempts: u32 = 0;
+    while (attempts < 500000) : (attempts += 1) {
+        if (view[slot].processRestartCount() > 0) break;
+        syscall.thread_yield();
+    }
+    if (view[slot].processRestartCount() == 0) {
+        t.fail("§2.1.23");
+        syscall.shutdown();
+    }
+    // Call child — it replies with its .data sentinel value.
+    var reply: syscall.IpcMessage = .{};
+    const rc = syscall.ipc_call(child_handle, &.{}, &reply);
+    if (rc == 0 and reply.words[0] == 0xCAFE_BABE_DEAD_BEEF) {
         t.pass("§2.1.23");
     } else {
-        t.fail("§2.1.23");
+        t.failWithVal("§2.1.23", @bitCast(@as(u64, 0xCAFE_BABE_DEAD_BEEF)), @bitCast(reply.words[0]));
     }
     syscall.shutdown();
 }

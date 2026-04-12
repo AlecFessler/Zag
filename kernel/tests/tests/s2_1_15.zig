@@ -6,39 +6,32 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.1.15 — The user permissions view is a read-only region mapped into the process's address space.
+const E_OK: i64 = 0;
+const E_AGAIN: i64 = -9;
+
+/// §2.1.15 — Restart is triggered when a process with a restart context terminates by voluntary exit (last thread calls `thread_exit`).
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
-    // Verify we can read from perm_view (slot 0 = HANDLE_SELF).
-    if (pv == 0 or view[0].entry_type != perm_view.ENTRY_TYPE_PROCESS) {
-        t.fail("§2.1.15");
-        syscall.shutdown();
-    }
-    // Spawn child_write_perm_view — it writes to its perm_view, which should fault.
-    const child_rights = perms.ProcessRights{};
-    const ch: u64 = @bitCast(@as(i64, syscall.proc_create(
-        @intFromPtr(children.child_write_perm_view.ptr),
-        children.child_write_perm_view.len,
-        child_rights.bits(),
-    )));
-    // Sync: call child so it knows to proceed.
-    var reply: syscall.IpcMessage = .{};
-    _ = syscall.ipc_call(ch, &.{}, &reply);
-    // Wait for child to die from write fault.
+    // Spawn a restartable child that exits normally — it should restart
+    const child_rights = (perms.ProcessRights{ .restart = true }).bits();
+    const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(@intFromPtr(children.child_exit.ptr), children.child_exit.len, child_rights)));
     var slot: usize = 0;
     for (0..128) |i| {
-        if (view[i].handle == ch) {
+        if (view[i].handle == child_handle) {
             slot = i;
             break;
         }
     }
-    var attempts: u32 = 0;
-    while (attempts < 100000) : (attempts += 1) {
-        if (view[slot].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS) break;
-        syscall.thread_yield();
+    // Block on the parent view `field0` — per §2.6.27 the kernel issues a
+    // futex wake on this cell when the child restarts. E_OK = woken by
+    // kernel; E_AGAIN = field0 already changed before we entered wait.
+    const initial_field0 = @atomicLoad(u64, &view[slot].field0, .acquire);
+    const wait_rc = syscall.futex_wait(&view[slot].field0, initial_field0, 5_000_000_000);
+    if (wait_rc != E_OK and wait_rc != E_AGAIN) {
+        t.failWithVal("§2.1.15 futex_wait", E_OK, wait_rc);
+        syscall.shutdown();
     }
-    // Child should have died with invalid_write from writing to read-only perm_view.
-    if (view[slot].processCrashReason() == .invalid_write) {
+    if (view[slot].processRestartCount() > 0) {
         t.pass("§2.1.15");
     } else {
         t.fail("§2.1.15");

@@ -4,61 +4,34 @@ const perm_view = lib.perm_view;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-var counter: u64 align(8) = 0;
+const ENTRY_TYPE_CORE_PIN: u8 = 4;
 
-fn incrementer() void {
-    while (true) {
-        _ = @atomicRmw(u64, &counter, .Add, 1, .acq_rel);
-        _ = syscall.futex_wake(@ptrCast(&counter), 1);
-        syscall.thread_yield();
-    }
-}
-
-/// §2.4.5 — Revoking a thread handle via `revoke_perm` removes the handle from the permissions table without killing or suspending the thread
+/// §2.4.5 — Core pin user view `field0` = `core_id`.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Create a thread that continuously increments a counter.
-    const handle_ret = syscall.thread_create(&incrementer, 0, 4);
-    if (handle_ret <= 0) {
-        t.failWithVal("§2.4.5 thread_create", 1, handle_ret);
-        syscall.shutdown();
-    }
-    const thread_handle: u64 = @bitCast(handle_ret);
+    // Pin to core 1.
+    _ = syscall.set_affinity(0x2);
+    syscall.thread_yield();
 
-    // Wait for the thread to start running.
-    t.waitUntilNonZero(&counter);
+    const ret = syscall.set_priority(syscall.PRIORITY_PINNED);
+    const pin_handle: u64 = @bitCast(ret);
 
-    // Revoke the thread handle.
-    const revoke_ret = syscall.revoke_perm(thread_handle);
-    if (revoke_ret != 0) {
-        t.failWithVal("§2.4.5 revoke_perm", 0, revoke_ret);
-        syscall.shutdown();
-    }
-
-    // Verify handle is gone from perm view.
-    var found = false;
+    // Check field0 == core_id (should be 1).
+    var core_id: u64 = 0xFFFF;
     for (0..128) |i| {
-        if (view[i].handle == thread_handle and view[i].entry_type == perm_view.ENTRY_TYPE_THREAD) {
-            found = true;
+        if (view[i].handle == pin_handle and view[i].entry_type == ENTRY_TYPE_CORE_PIN) {
+            core_id = view[i].field0;
             break;
         }
     }
-    if (found) {
-        t.fail("§2.4.5 handle still in perm view after revoke");
-        syscall.shutdown();
-    }
 
-    // Record counter and yield to let the thread run more.
-    const before = @atomicLoad(u64, &counter, .acquire);
-    for (0..10) |_| syscall.thread_yield();
-    const after = @atomicLoad(u64, &counter, .acquire);
+    _ = syscall.revoke_perm(pin_handle);
 
-    // Thread must still be running (counter must have incremented).
-    if (after > before) {
+    if (core_id == 1) {
         t.pass("§2.4.5");
     } else {
-        t.fail("§2.4.5 thread stopped after handle revoke");
+        t.fail("§2.4.5");
     }
     syscall.shutdown();
 }

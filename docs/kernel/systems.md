@@ -129,7 +129,7 @@ kernel/
     guest_memory.zig     -- guest physical address space tracking and cleanup
     lapic.zig            -- in-kernel Local APIC emulation (xAPIC, timer, IRR/ISR/TMR, EOI, ICR)
     ioapic.zig           -- in-kernel I/O APIC emulation (24-entry redirection table, level/edge)
-  arch/x64/mmio_decode.zig -- x86-64 MMIO instruction decoder — shared by VM LAPIC/IOAPIC handlers and virtual BAR emulation. Exports decodeBytes, GprArray, writeGpr, readGpr
+  arch/x64/mmio_decode.zig -- x86-64 MMIO instruction decoder — shared by VM LAPIC/IOAPIC handlers and virtual BAR emulation. Exports decodeBytes (byte-buffer API) and MmioOp; GPR read/write is caller-specific
 ```
 
 ---
@@ -988,9 +988,9 @@ Emulation path:
 2. Call `mmio_decode.decodeBytes(buf)`. On decode error or unsupported instruction, kill with `protection_fault`.
 3. Compute `port_offset = fault_addr - node.start.addr`. If `port_offset + op.size > device.port_count`, kill with `invalid_read` or `invalid_write`.
 4. Compute `port = device.base_port + port_offset`.
-5. Execute `arch.ioportOut` or `arch.ioportIn`.
-6. For reads, call `writeGpr(frame.gprs(), op.reg, op.size, value)`.
-7. Advance `frame.rip += op.len`. Return.
+5. Execute `cpu.outb`/`outw`/`outd` or `cpu.inb`/`inw`/`ind` directly.
+6. For reads, call `writeContextGpr(ctx, op.reg, op.size, value)` — a local helper in `exceptions.zig` that maps ModRM register indices to `cpu.Context` fields, respecting x86-64 partial register write semantics (8/16-bit writes preserve upper bits; 32-bit writes zero-extend).
+7. Advance `ctx.rip += op.len`. Return.
 
 Note: two VMM lookups occur for non-virtual-BAR faults — one in the x64 intercept check, one in the generic handler. Acceptable for now; branch prediction trains to the fast-miss case.
 
@@ -1291,6 +1291,144 @@ All three functions are side-effect free reads against the target core's hardwar
 - Bit 63: NX (no-execute).
 
 Level shifts: L4 = 39, L3 = 30, L2 = 21, L1 = 12. Index extraction: `@truncate(vaddr >> shift)` gives 9-bit index.
+
+### AArch64 Architecture Details
+
+All aarch64 code lives in `kernel/arch/aarch64/`. The module index (`aarch64.zig`) exports 16 submodules mirroring the x64 structure. Key differences from x64 are documented below.
+
+#### Reference Manuals
+
+PDFs in `docs/aarch64/`:
+- **DDI0487** (ARM ARM): paging, exceptions, system registers, generic timer, EL2 virtualization.
+- **IHI0069** (GICv3): interrupt controller.
+- **IHI0070** (SMMUv3): IOMMU.
+- **DEN0022** (PSCI): power management, SMP boot.
+- **DDI0183** (PL011): UART.
+- **DEN0049** (IORT): IO remapping table.
+
+#### Build
+
+`zig build -Darch=arm` cross-compiles for `aarch64-freestanding` targeting `cortex-a76` (ARMv8.2, required for PAN). Produces `BOOTAA64.EFI` and `kernel.elf`. QEMU: `zig build run -Darch=arm` launches `qemu-system-aarch64 -M virt,gic-version=3`.
+
+#### Exception Model
+
+ARM uses a vector table (VBAR_EL1) with 16 entries of 0x80 bytes each, replacing x86's IDT. Four exception groups × four types (Synchronous, IRQ, FIQ, SError). ESR_EL1 bits [31:26] encode the Exception Class (EC): 0x15=SVC (syscall), 0x24=Data Abort from EL0, 0x20=Instruction Abort from EL0. FAR_EL1 holds the faulting VA (equivalent of CR2). ARM ARM D1.10, D13.2.37.
+
+Each 0x80-byte vector entry saves x0/x30, loads a handler address, and branches to a shared trampoline that saves all 31 GPRs + SP_EL0 + ELR_EL1 + SPSR_EL1 in ArchCpuContext layout (272 bytes), calls the handler, restores state, and ERETs. File: `exceptions.zig`.
+
+#### ArchCpuContext Layout
+
+```
+offset  size  field
+  0     248   x0-x30 (31 GPRs × 8 bytes, Registers extern struct)
+248       8   sp_el0 (user stack pointer)
+256       8   elr_el1 (exception link register — return address for ERET)
+264       8   spsr_el1 (saved processor state — mode, DAIF, condition flags)
+Total: 272 bytes
+```
+
+SPSR_EL1 values: EL0t (user) = 0x000, EL1h (kernel) = 0x004, DAIF mask = 0x3C0. File: `interrupts.zig`.
+
+#### Syscall/IPC Register Mapping
+
+```
+x8  = syscall number     (x86: rax)
+x0  = arg0 / return      (x86: rdi / rax)
+x1  = arg1 / return2     (x86: rsi / rdx)
+x2  = arg2               (x86: rdx)
+x3  = arg3               (x86: r10)
+x4  = arg4               (x86: r8)
+x5  = IPC handle          (x86: r13)
+x6  = IPC metadata        (x86: r14)
+x0-x4 = IPC payload words (x86: rdi,rsi,rdx,r8,r9)
+```
+
+#### FaultRegSnapshot
+
+Arch-dependent GPR count: 31 on aarch64 (x0-x30), 15 on x86-64. `arch.fault_gpr_count`, `arch.fault_regs_size` (272 bytes), `arch.fault_msg_size` (304 bytes) are derived comptime constants. See `dispatch.zig`.
+
+#### Page Tables (VMSAv8-64)
+
+4-level tables with 4KB granule, same depth as x86 PML4 but different entry format. Split address space: TTBR0_EL1 for user VA (lower half), TTBR1_EL1 for kernel VA (upper half). This means `copyKernelMappings()` is a no-op — kernel pages are always visible via TTBR1.
+
+PageEntry (packed struct, 64 bits): valid(1), is_table(1), AttrIndx(3), NS(1), AP(2), SH(2), AF(1), nG(1), addr(36), res(4), contiguous(1), PXN(1), XN(1), sw(4), ignored(4), res(1).
+
+AP encoding (ARM ARM D5.4, Table D5-34):
+- 0b00 = EL1 RW, EL0 none
+- 0b01 = EL1 RW, EL0 RW
+- 0b10 = EL1 RO, EL0 none
+- 0b11 = EL1 RO, EL0 RO
+
+MAIR_EL1 indices: 0 = Device-nGnRnE, 1 = Normal WB. AF bit always set. SH = Inner Shareable (0b11) for normal memory.
+
+TLB maintenance: `DSB ISHST → TLBI VAE1IS → DSB ISH → ISB`. ARM broadcasts TLBI across all cores in the inner shareable domain — no software IPI shootdown needed (unlike x86 `invlpg` which is local).
+
+Level shifts: L3 (level 0) = 39, L2 (level 1) = 30, L1 (level 2) = 21, L0 (level 3) = 12. File: `paging.zig`.
+
+#### Address Space Layout
+
+```
+0x0000_0000_0000_0000 – 0x0001_0000_0000_0000  user (TTBR0, 16 TB)
+0xFFFF_0000_0000_0000 – 0xFFFF_0000_4000_0000  kernel_code (TTBR1, 1 GB)
+0xFFFF_0000_4000_0000 – 0xFFFF_0400_0000_0000  kernel heap/data (TTBR1, ~4 TB)
+0xFFFF_FF80_0000_0000 – 0xFFFF_FF88_0000_0000  physmap (TTBR1, 32 GB)
+```
+
+Linker script: `kernel/linker-aarch64.ld`, base at `0xFFFF_0000_0000_0000`.
+
+#### GIC (Generic Interrupt Controller)
+
+GICv3 driver replacing x86's APIC. Three components: Distributor (GICD, global MMIO), Redistributor (GICR, per-core MMIO), CPU Interface (ICC system registers). IHI 0069H.
+
+Interrupt ID ranges: SGI 0-15 (IPIs), PPI 16-31 (per-core timer/PMU), SPI 32-1019 (devices). Scheduler IPI uses SGI 0. Timer interrupt is PPI 30 (physical timer).
+
+Discovery: ACPI MADT GICD (type 0x0C) for distributor base, GICR (type 0x0E) for redistributor ranges, GICC (type 0x0B) for core count and MPIDR values.
+
+Init sequence: `initDistributor()` (enable ARE, Group 1, route all SPIs to core 0), `initRedistributor(0)` (wake BSP's redistributor, enable SGIs), `initCpuInterface()` (enable ICC_SRE_EL1, set PMR=0xFF, enable Group 1). Secondary cores call `initSecondaryCoreGic()` (redistributor + CPU interface only). File: `gic.zig`.
+
+#### PAN (Privileged Access Never)
+
+ARM equivalent of x86 SMAP. PSTATE.PAN prevents EL1 from accessing EL0 pages. `userAccessBegin()` clears PAN (`MSR PAN, #0`), `userAccessEnd()` sets PAN (`MSR PAN, #1`). Requires ARMv8.1 (Cortex-A76+). ARM ARM D5.4.6. File: `cpu.zig`.
+
+#### Timers
+
+ARM Generic Timer replaces x86's HPET + LAPIC timer + TSC. Single hardware block provides both monotonic clock and per-core preemption timer. ARM ARM D11.2.
+
+- **Monotonic clock**: reads CNTVCT_EL0 (virtual counter), converts to nanoseconds via CNTFRQ_EL0.
+- **Preemption timer**: writes CNTP_CVAL_EL0 (physical timer comparator), enables via CNTP_CTL_EL0 (ENABLE=1, IMASK=0). Timer fires as PPI 30.
+- **readTimestamp()**: reads CNTVCT_EL0 (equivalent of RDTSC).
+
+File: `timers.zig`.
+
+#### Serial (PL011 UART)
+
+Replaces x86 NS16550 COM port. MMIO at base address from ACPI SPCR. UEFI firmware initializes baud rate and enables the UART. Driver polls UARTFR.TXFF (offset 0x018, bit 5) and writes UARTDR (offset 0x000). DDI0183. File: `serial.zig`.
+
+#### ACPI Parsing
+
+Same XSDT walk as x64. ARM-specific MADT entry types: GICC (0x0B, 80 bytes — CPU Interface Number at offset 4, Flags at offset 12, MPIDR at offset 68), GICD (0x0C — Physical Base Address at offset 8), GICR (0x0E — Discovery Range Base at offset 4). SPCR table provides PL011 UART base. Two-pass MADT parsing: first pass counts cores and stores MPIDRs, second pass extracts GICD/GICR addresses. ACPI 6.5 Tables 5-45/5-47/5-49. File: `acpi.zig`.
+
+#### SMP Boot (PSCI)
+
+ARM uses PSCI CPU_ON (DEN0022D Section 5.1.4) instead of x86's INIT-SIPI-SIPI. No assembly trampoline needed. Sequence: for each secondary core, allocate kernel stack, call `power.cpuOn(target_mpidr, entry_paddr, core_idx)` via SMC #0. Secondary core wakes at the entry point in EL1, sets SP from pre-allocated stack, installs VBAR_EL1, initializes GIC, signals BSP via atomic counter, enters scheduler.
+
+MPIDR values from ACPI MADT GICC entries, stored in `smp.mpidr_table`. Fallback: flat topology (Aff0 = core_idx). File: `smp.zig`.
+
+#### Power Management (PSCI)
+
+PSCI via SMC/HVC replaces x86 ACPI PM1/keyboard controller. Function IDs: SYSTEM_OFF (0x84000008), SYSTEM_RESET (0x84000009), CPU_ON (0xC4000003), CPU_SUSPEND (0xC4000001), SYSTEM_SUSPEND (0xC400000E). SMC/HVC clobbers x0-x3 (args/return) and x4-x17 (caller-saved per SMCCC DEN0028E). File: `power.zig`.
+
+#### VM Stubs
+
+ARM virtualization (EL2) is not yet implemented. `vmSupported()` returns false, all KVM syscalls return E_NOSYS. Stub types in `vm.zig` and dispatch.zig.
+
+#### IOMMU Stubs
+
+ARM SMMU (IHI0070) is not yet implemented. `isDmaRemapAvailable()` returns false. Stub in `iommu.zig`.
+
+#### PMU / SysInfo Stubs
+
+`pmuGetInfo()` reports 0 counters. `PmuState` is a 32-byte stub (minimum for slab allocator intrusive freelist). SysInfo returns zero for frequency/temperature/C-state. Files: `pmu.zig`, `sysinfo.zig`.
 
 ---
 
@@ -2073,16 +2211,17 @@ Supported instruction patterns (the ones Linux's `readl`/`writel` and friends co
 - `0x89` MOV r/m32, r32
 - `0x8B` MOV r32, r/m32
 - `0xC7` MOV r/m32, imm32
+- `0xC6` MOV r/m8, imm8
 - `0x88` MOV r/m8, r8
 - `0x8A` MOV r8, r/m8
 
-ModR/M and SIB decoding handles all addressing forms Linux actually emits, including the `mod=00 rm=100 base=101` SIB-with-disp32 form needed for PIE kernels. Operand-size prefix `0x66` and REX prefixes are decoded for register selection and operand width.
+ModR/M and SIB decoding handles all addressing forms Linux actually emits, including the `mod=00 rm=100 base=101` SIB-with-disp32 form needed for PIE kernels. Operand-size prefix `0x66` and REX prefixes are decoded for register selection and operand width. REX.W (64-bit operand size) on 0x89/0x8B/0xC7 returns `UnsupportedInstruction` — port I/O only supports 1/2/4-byte widths.
 
 `decodeBytes(buf: []const u8) DecodeError!MmioOp` takes a pre-fetched byte slice rather than requiring a `*Vm` pointer. Both the VM path and the virtual BAR path pre-fetch instruction bytes into a local buffer, then call this shared decoder.
 
 Returns a `MmioOp { is_write, size, reg, value, len, is_immediate }`. The caller dispatches to the device, then either calls `writeGpr` for reads or trusts the device to have stored `op.value` for writes, then advances RIP by `op.len`.
 
-`GprArray` is a pointer to 16 `u64` values in ModRM canonical order (rax=0, rcx=1, rdx=2, rbx=3, rsp=4, rbp=5, rsi=6, rdi=7, r8–r15=8–15). `writeGpr(gprs: *GprArray, reg: u4, size: u8, value: u64) void` writes a value into the specified register slot at the given width. `readGpr(gprs: *GprArray, reg: u4, size: u8) u64` reads a value from the specified register slot. `SavedRegs` / `CpuContext` in `interrupts.zig` exposes `gprs() *GprArray`. `GuestState` in the KVM guest state file exposes `gprs() *GprArray`.
+GPR read/write is caller-specific because the two register layouts differ structurally. The VM path uses `mmio_decode.writeGpr(*GuestState, reg, value)` and `readGpr(*const GuestState, reg)` which operate on named fields in the flat `GuestState` struct. The virtual BAR path uses `writeContextGpr(*cpu.Context, reg, size, value)` and `readContextGpr(*const cpu.Context, reg)` in `exceptions.zig` which operate on the packed `Registers` struct pushed by the ISR stub, with `rsp` in the iret frame. A shared abstraction is not used because the ISR push order and the GuestState field layout are dictated by different hardware constraints.
 
 Guest virtual → physical translation goes through `guestVirtToPhys`, which walks the guest's CR3 4-level page tables (handling 1 GiB and 2 MiB huge pages) by reading guest physical memory through `Vm.guestPhysToHost`. When CR0.PG is clear (early boot in real/protected mode), guest virt = guest phys directly. The existing `guestVirtToPhys` logic stays in the VM path (it needs `*Vm` for guest page tables), but instruction decoding itself is now arch-generic via `decodeBytes`. The decoder never touches `Vm`'s memory bookkeeping fields directly — `guestPhysToHost`/`readGuestPhysSlice` are the single home for that arithmetic.
 

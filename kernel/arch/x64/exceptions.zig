@@ -1,18 +1,22 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const cpu = zag.arch.x64.cpu;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
+const mmio_decode = zag.arch.x64.mmio_decode;
 const scheduler = zag.sched.scheduler;
 
 const FaultReason = zag.perms.permissions.FaultReason;
 const GateType = zag.arch.x64.idt.GateType;
 const PageFaultContext = zag.arch.dispatch.PageFaultContext;
+const PAddr = zag.memory.address.PAddr;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 const VAddr = zag.memory.address.VAddr;
+const VmNode = zag.memory.vmm.VmNode;
 
 /// Intel SDM Vol 3A, Table 7-1 — Protected-Mode Exceptions and Interrupts.
 /// Vector assignments for architecturally defined exceptions (0-31).
@@ -202,6 +206,20 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     const faulting_addr = cpu.readCr2();
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
     const from_user = (ctx.cs & ring_3) == ring_3;
+
+    // Intercept virtual_bar faults from userspace before the generic handler.
+    // These intentionally have no PTEs — the kernel decodes the faulting
+    // instruction and performs the port I/O on behalf of the process.
+    if (from_user and !pf_err.present) {
+        const thread = scheduler.currentThread() orelse
+            @panic("user page fault with no current thread");
+        const node = thread.process.vmm.findNode(VAddr.fromInt(faulting_addr));
+        if (node != null and node.?.kind == .virtual_bar) {
+            emulateVirtualBar(ctx, node.?, faulting_addr, thread.process);
+            return;
+        }
+    }
+
     const pf_ctx = PageFaultContext{
         .faulting_address = faulting_addr,
         .is_kernel_privilege = !from_user,
@@ -211,4 +229,136 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         .user_ctx = if (from_user) ctx else null,
     };
     zag.memory.fault.handlePageFault(&pf_ctx);
+}
+
+/// Emulate a port I/O access through a virtual BAR mapping.
+/// Decodes the faulting instruction, performs the port I/O, writes back
+/// the result (for reads), and advances RIP past the instruction.
+fn emulateVirtualBar(ctx: *cpu.Context, node: *const VmNode, faulting_addr: u64, proc: anytype) void {
+    const device = node.kind.virtual_bar;
+
+    // Fetch instruction bytes from user RIP via the process page tables.
+    const rip = ctx.rip;
+    const page_off = rip & 0xFFF;
+    // max_bytes is always >= 1 since page_off is in [0, 4095].
+    // An instruction whose encoding straddles the page boundary will be
+    // truncated here; decodeBytes returns IncompleteDecode if it runs short.
+    const max_bytes: u8 = @intCast(@min(15, 4096 - page_off));
+
+    const rip_page = VAddr.fromInt(rip & ~@as(u64, 0xFFF));
+    const phys = arch.resolveVaddr(proc.addr_space_root, rip_page) orelse {
+        proc.kill(.protection_fault);
+        arch.enableInterrupts();
+        while (true) arch.halt();
+    };
+
+    const physmap_base = VAddr.fromPAddr(phys, null).addr + page_off;
+    const insn_ptr: [*]const u8 = @ptrFromInt(physmap_base);
+    var buf: [15]u8 = undefined;
+    @memcpy(buf[0..max_bytes], insn_ptr[0..max_bytes]);
+
+    // Decode the instruction
+    const op = mmio_decode.decodeBytes(buf[0..max_bytes]) catch {
+        proc.kill(.protection_fault);
+        arch.enableInterrupts();
+        while (true) arch.halt();
+    };
+
+    // Compute the port offset and validate bounds
+    const port_offset = faulting_addr - node.start.addr;
+    if (port_offset + op.size > device.access.port_io.port_count) {
+        const reason: FaultReason = if (op.is_write) .invalid_write else .invalid_read;
+        proc.kill(reason);
+        arch.enableInterrupts();
+        while (true) arch.halt();
+    }
+
+    const port: u16 = device.access.port_io.base_port + @as(u16, @truncate(port_offset));
+
+    if (op.is_write) {
+        const value: u32 = if (op.is_immediate)
+            op.value
+        else
+            @truncate(readContextGpr(ctx, op.reg));
+
+        switch (op.size) {
+            1 => cpu.outb(@truncate(value), port),
+            2 => cpu.outw(@truncate(value), port),
+            4 => cpu.outd(value, port),
+            else => {
+                proc.kill(.protection_fault);
+                arch.enableInterrupts();
+                while (true) arch.halt();
+            },
+        }
+    } else {
+        const result: u32 = switch (op.size) {
+            1 => @as(u32, cpu.inb(port)),
+            2 => @as(u32, cpu.inw(port)),
+            4 => cpu.ind(port),
+            else => {
+                proc.kill(.protection_fault);
+                arch.enableInterrupts();
+                while (true) arch.halt();
+            },
+        };
+        writeContextGpr(ctx, op.reg, op.size, result);
+    }
+
+    ctx.rip += op.len;
+}
+
+/// Read a general-purpose register from the interrupt context by ModRM index.
+/// Intel SDM Vol 2A, Table 2-2 — 64-bit ModRM.reg encoding.
+fn readContextGpr(ctx: *const cpu.Context, reg: u4) u64 {
+    return switch (reg) {
+        0 => ctx.regs.rax,
+        1 => ctx.regs.rcx,
+        2 => ctx.regs.rdx,
+        3 => ctx.regs.rbx,
+        4 => ctx.rsp,
+        5 => ctx.regs.rbp,
+        6 => ctx.regs.rsi,
+        7 => ctx.regs.rdi,
+        8 => ctx.regs.r8,
+        9 => ctx.regs.r9,
+        10 => ctx.regs.r10,
+        11 => ctx.regs.r11,
+        12 => ctx.regs.r12,
+        13 => ctx.regs.r13,
+        14 => ctx.regs.r14,
+        15 => ctx.regs.r15,
+    };
+}
+
+/// Write a port I/O read result to a GPR in the interrupt context by ModRM
+/// index. Follows x86-64 partial register write semantics (Intel SDM Vol 1,
+/// §3.4.1.1): 32-bit writes zero-extend to 64 bits; 8-bit and 16-bit writes
+/// preserve the upper bits of the destination register.
+fn writeContextGpr(ctx: *cpu.Context, reg: u4, size: u8, value: u32) void {
+    const prev = readContextGpr(ctx, reg);
+    const merged: u64 = switch (size) {
+        1 => (prev & ~@as(u64, 0xFF)) | @as(u64, @as(u8, @truncate(value))),
+        2 => (prev & ~@as(u64, 0xFFFF)) | @as(u64, @as(u16, @truncate(value))),
+        4 => @as(u64, value),
+        else => unreachable,
+    };
+    switch (reg) {
+        0 => ctx.regs.rax = merged,
+        1 => ctx.regs.rcx = merged,
+        2 => ctx.regs.rdx = merged,
+        3 => ctx.regs.rbx = merged,
+        4 => ctx.rsp = merged,
+        5 => ctx.regs.rbp = merged,
+        6 => ctx.regs.rsi = merged,
+        7 => ctx.regs.rdi = merged,
+        8 => ctx.regs.r8 = merged,
+        9 => ctx.regs.r9 = merged,
+        10 => ctx.regs.r10 = merged,
+        11 => ctx.regs.r11 = merged,
+        12 => ctx.regs.r12 = merged,
+        13 => ctx.regs.r13 = merged,
+        14 => ctx.regs.r14 = merged,
+        15 => ctx.regs.r15 = merged,
+    }
 }

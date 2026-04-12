@@ -19,7 +19,7 @@ const PageAllocator = page_allocator.PageAllocator;
 const ParsedElf = zag.utils.elf.ParsedElf;
 const VAddr = zag.memory.address.VAddr;
 
-const KEntryType = fn (*BootInfo) callconv(.{ .x86_64_sysv = .{} }) noreturn;
+const KEntryType = fn (*BootInfo) callconv(zag.arch.dispatch.cc()) noreturn;
 
 fn computeKaslrSlide(parsed_elf: *const ParsedElf) u64 {
     const link_base = address.AddrSpacePartition.kernel_code.start;
@@ -90,52 +90,100 @@ fn applyKaslrRelocations(file_bytes: []u8, slide: u64) !void {
             );
             const rtype: u32 = @truncate(rela.r_info);
 
-            if (rtype == @intFromEnum(std_elf.R_X86_64.PC32) or
-                rtype == @intFromEnum(std_elf.R_X86_64.PLT32) or
-                rtype == @intFromEnum(std_elf.R_X86_64.NONE)) continue;
-
             if (rela.r_offset < target_base_addr) return error.InvalidElf;
             const file_off = target_base_file_offset + (rela.r_offset - target_base_addr);
 
-            if (rtype == @intFromEnum(std_elf.R_X86_64.@"64")) {
-                if (file_off + 8 > file_bytes.len) return error.InvalidElf;
-                const slot: *align(1) u64 = @ptrCast(file_bytes.ptr + file_off);
-                slot.* +%= slide;
-            } else if (rtype == @intFromEnum(std_elf.R_X86_64.@"32S")) {
-                if (file_off + 4 > file_bytes.len) return error.InvalidElf;
-                const slot: *align(1) i32 = @ptrCast(file_bytes.ptr + file_off);
-                const new_val: i64 = @as(i64, slot.*) +% @as(i64, @bitCast(slide));
-                slot.* = @truncate(new_val);
-            } else {
-                return error.InvalidElf;
+            switch (arch.classifyRelocation(rtype)) {
+                .skip => continue,
+                .abs64 => {
+                    if (file_off + 8 > file_bytes.len) return error.InvalidElf;
+                    const slot: *align(1) u64 = @ptrCast(file_bytes.ptr + file_off);
+                    slot.* +%= slide;
+                },
+                .abs32 => {
+                    if (file_off + 4 > file_bytes.len) return error.InvalidElf;
+                    const slot: *align(1) i32 = @ptrCast(file_bytes.ptr + file_off);
+                    const new_val: i64 = @as(i64, slot.*) +% @as(i64, @bitCast(slide));
+                    slot.* = @truncate(new_val);
+                },
+                .unsupported => return error.InvalidElf,
             }
         }
     }
 }
 
+fn puts(msg: [*:0]const u16) void {
+    if (uefi.system_table.con_out) |out| {
+        _ = out.outputString(msg) catch {};
+    }
+}
+
+
+const dbg = struct {
+    const boot_start = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] boot start\r\n");
+    const page_tables = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] page tables\r\n");
+    const physmap = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] physmap\r\n");
+    const loading = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] loading files\r\n");
+    const kernel_elf = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] kernel.elf\r\n");
+    const rs_elf = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] root_service\r\n");
+    const elf_parsed = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] ELF parsed\r\n");
+    const kaslr1 = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] KASLR slide\r\n");
+    const kaslr2 = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] KASLR reloc\r\n");
+    const sections = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] sections\r\n");
+    const sections_done = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] mapped\r\n");
+    const stack = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] stack\r\n");
+    const exit_bs = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] exit BS\r\n");
+    const jump = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] jump\r\n");
+};
+
 pub fn main() uefi.Status {
     const boot_services: *uefi.tables.BootServices = uefi.system_table.boot_services orelse return .aborted;
     uefi.system_table.con_out.?.clearScreen() catch return .aborted;
+    puts(dbg.boot_start);
 
     var page_alloc = PageAllocator.init(boot_services, .acpi_reclaim_memory);
     const page_alloc_iface = page_alloc.allocator();
 
-    const addr_space_root_phys = arch.getAddrSpaceRoot();
-    const addr_space_root_bytes_ptr = addr_space_root_phys.getPtr([*]u8);
-    const addr_space_root_bytes_slice = addr_space_root_bytes_ptr[0..paging.PAGE4K];
-    const new_addr_space_root = page_alloc_iface.alignedAlloc(
-        u8,
-        paging.pageAlign(.page4k),
-        paging.PAGE4K,
-    ) catch return .aborted;
-    @memcpy(new_addr_space_root, addr_space_root_bytes_slice);
-    const new_addr_space_root_phys = PAddr.fromInt(@intFromPtr(new_addr_space_root.ptr));
-    arch.swapAddrSpace(new_addr_space_root_phys);
+    puts(dbg.page_tables);
 
+    // Set up the kernel page table root. enableKernelTranslation() is a no-op
+    // on x86-64 (CR3 covers both halves) and configures TCR_EL1 TTBR1 on
+    // aarch64. getKernelAddrSpaceRoot() returns CR3 on x86 / TTBR1 on aarch64.
+    arch.enableKernelTranslation();
+
+    // Copy or allocate the kernel page table root. On x86-64, the UEFI
+    // identity-mapped CR3 covers both halves so we copy it and keep using it.
+    // On aarch64 TTBR1 may be uninitialized, but getKernelAddrSpaceRoot still
+    // returns whatever is there — allocate a fresh table regardless, set it as
+    // the kernel root, then use it for all kernel-range mappings.
+    const kernel_table_root_phys: PAddr = blk: {
+        const fresh = page_alloc_iface.alignedAlloc(
+            u8,
+            paging.pageAlign(.page4k),
+            paging.PAGE4K,
+        ) catch return .aborted;
+
+        // On x86-64 (shared CR3): copy UEFI's identity-mapped table so the
+        // bootloader keeps running from the same mappings.
+        // On aarch64 (split TTBR0/TTBR1): start with a clean kernel table.
+        if (arch.kernel_shares_user_table) {
+            const current = arch.getKernelAddrSpaceRoot();
+            const src = current.getPtr([*]u8);
+            @memcpy(fresh, src[0..paging.PAGE4K]);
+        } else {
+            @memset(fresh, 0);
+        }
+
+        const phys = PAddr.fromInt(@intFromPtr(fresh.ptr));
+        arch.setKernelAddrSpace(phys);
+        break :blk phys;
+    };
+
+    puts(dbg.physmap);
     const identity_mapping = 0;
-    const new_addr_space_root_virt = VAddr.fromPAddr(new_addr_space_root_phys, identity_mapping);
+    const new_addr_space_root_virt = VAddr.fromPAddr(kernel_table_root_phys, identity_mapping);
 
-    const new_addr_space_root_virt_physmapped = VAddr.fromPAddr(new_addr_space_root_phys, null);
+    const new_addr_space_root_virt_physmapped = VAddr.fromPAddr(kernel_table_root_phys, null);
     const addr_space_root_perms: MemoryPerms = .{
         .write_perm = .write,
         .execute_perm = .no_execute,
@@ -145,13 +193,14 @@ pub fn main() uefi.Status {
     };
     arch.mapPageBoot(
         new_addr_space_root_virt,
-        new_addr_space_root_phys,
+        kernel_table_root_phys,
         new_addr_space_root_virt_physmapped,
         .page4k,
         addr_space_root_perms,
         page_alloc_iface,
     ) catch return .aborted;
 
+    puts(dbg.loading);
     const loaded_image = boot_services.handleProtocol(
         uefi.protocol.LoadedImage,
         uefi.handle,
@@ -169,16 +218,22 @@ pub fn main() uefi.Status {
     const root_dir: *uefi.protocol.File = fs.openVolume() catch return .aborted;
     const kernel_file = fs_mod.openFile(root_dir, "kernel.elf") catch return .aborted;
     const file_bytes = fs_mod.readFile(kernel_file, boot_services) catch return .aborted;
+    puts(dbg.kernel_elf);
 
     const rs_file = fs_mod.openFile(root_dir, "root_service.elf") catch return .aborted;
     const rs_bytes = fs_mod.readFile(rs_file, boot_services) catch return .aborted;
+    puts(dbg.rs_elf);
 
     const parsed_elf_mem = boot_services.allocatePool(.loader_data, @sizeOf(ParsedElf)) catch return .aborted;
     const parsed_elf: *ParsedElf = @ptrCast(parsed_elf_mem.ptr);
     elf.parseElf(parsed_elf, file_bytes) catch return .aborted;
+    puts(dbg.elf_parsed);
 
     const kaslr_slide = computeKaslrSlide(parsed_elf);
+    puts(dbg.kaslr1);
     applyKaslrRelocations(file_bytes, kaslr_slide) catch return .aborted;
+    puts(dbg.kaslr2);
+    puts(dbg.sections);
 
     const num_sections = @intFromEnum(ElfSection.num_sections);
     for (0..num_sections) |i| {
@@ -243,6 +298,7 @@ pub fn main() uefi.Status {
         }
     }
 
+    puts(dbg.sections_done);
     const xsdp_addr = boot_protocol.findXSDP() catch return .aborted;
     const xsdp_phys = PAddr.fromInt(xsdp_addr);
 
@@ -268,6 +324,7 @@ pub fn main() uefi.Status {
         .pixel_format = .none,
     };
 
+    puts(dbg.stack);
     const stack_pages = page_alloc_iface.alignedAlloc(
         u8,
         paging.pageAlign(.page4k),
@@ -311,6 +368,7 @@ pub fn main() uefi.Status {
     boot_info.stack_top = aligned_stack_top_virt;
     boot_info.framebuffer = framebuffer;
     boot_info.kaslr_slide = kaslr_slide;
+    puts(dbg.exit_bs);
     boot_info.mmap = boot_protocol.getMmap(boot_services) orelse return .aborted;
     boot_services.exitBootServices(
         uefi.handle,
@@ -323,6 +381,9 @@ pub fn main() uefi.Status {
         ) catch return .aborted;
     };
 
+    // Final TLB flush after exitBootServices ensures all TTBR1 page table
+    // entries are visible to the hardware walker before jumping to the kernel.
+    arch.setKernelAddrSpace(kernel_table_root_phys);
     const kEntry: *KEntryType = @ptrFromInt(parsed_elf.entry.addr + kaslr_slide);
     kEntry(boot_info);
     unreachable;

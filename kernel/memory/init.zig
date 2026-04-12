@@ -70,7 +70,7 @@ pub fn init(firmware_mmap: MMap) !void {
     bump_allocator = BumpAllocator.init(bump_alloc_start_phys.addr, bump_alloc_end_phys.addr);
     const bump_alloc_iface: std.mem.Allocator = bump_allocator.allocator();
 
-    const addr_space_root_phys = arch.getAddrSpaceRoot();
+    const addr_space_root_phys = arch.getKernelAddrSpaceRoot();
     kernel_addr_space_root = addr_space_root_phys;
     const addr_space_root_id_virt = VAddr.fromPAddr(addr_space_root_phys, 0);
 

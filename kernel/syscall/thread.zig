@@ -73,7 +73,7 @@ pub fn sysThreadExit() noreturn {
     sched.yield();
     while (true) {
         arch.enableInterrupts();
-        asm volatile ("hlt");
+        arch.halt();
     }
 }
 

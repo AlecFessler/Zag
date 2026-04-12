@@ -20,11 +20,11 @@ const PowerAction = zag.arch.dispatch.PowerAction;
 const SyscallResult = zag.syscall.dispatch.SyscallResult;
 
 pub fn sysWrite(ptr: u64, len: u64) SyscallResult {
-    if (len == 0) return .{ .rax = 0 };
-    if (len > 4096) return .{ .rax = E_INVAL };
-    if (!address.AddrSpacePartition.user.contains(ptr)) return .{ .rax = E_BADADDR };
-    const end = std.math.add(u64, ptr, len) catch return .{ .rax = E_BADADDR };
-    if (!address.AddrSpacePartition.user.contains(end -| 1)) return .{ .rax = E_BADADDR };
+    if (len == 0) return .{ .ret = 0 };
+    if (len > 4096) return .{ .ret = E_INVAL };
+    if (!address.AddrSpacePartition.user.contains(ptr)) return .{ .ret = E_BADADDR };
+    const end = std.math.add(u64, ptr, len) catch return .{ .ret = E_BADADDR };
+    if (!address.AddrSpacePartition.user.contains(end -| 1)) return .{ .ret = E_BADADDR };
     // SMAP: print reads the user buffer while formatting, so the AC=1
     // window must span the entire print call rather than just the slice
     // construction.
@@ -32,7 +32,7 @@ pub fn sysWrite(ptr: u64, len: u64) SyscallResult {
     const msg: []const u8 = @as([*]const u8, @ptrFromInt(ptr))[0..len];
     arch.print("{s}", .{msg});
     arch.userAccessEnd();
-    return .{ .rax = @intCast(len) };
+    return .{ .ret = @intCast(len) };
 }
 
 pub fn sysGetrandom(buf_ptr: u64, len: u64) i64 {

@@ -1,33 +1,34 @@
 const lib = @import("lib");
 
-const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.2.1 — Setting RWX = 0 via `mem_perms` decommits the range: pages are freed and the VA range returns to demand-paged state.
-pub fn main(perm_view: u64) void {
-    _ = perm_view;
-    const rw = perms.VmReservationRights{ .read = true, .write = true };
-    const result = syscall.mem_reserve(0, 4096, rw.bits());
-    const handle: u64 = @bitCast(result.val);
-    const ptr: *volatile u64 = @ptrFromInt(result.val2);
-    // Write to commit the page.
-    ptr.* = 0xDEADBEEF;
-    // Decommit with RWX = 0.
-    const zero = perms.VmReservationRights{};
-    const ret = syscall.mem_perms(handle, 0, 4096, zero.bits());
-    if (ret == 0) {
-        // Re-enable RW to re-access the page.
-        _ = syscall.mem_perms(handle, 0, 4096, rw.bits());
-        // After decommit + recommit, page should be zeroed (demand-paged fresh).
-        const val = ptr.*;
-        if (val == 0) {
-            t.pass("§2.2.1");
-        } else {
-            t.fail("§2.2.1");
-        }
-    } else {
-        t.fail("§2.2.1");
+/// §2.2.1 — There are five priority levels, represented as a `u3`:
+pub fn main(_: u64) void {
+    // Verify each valid priority level (0-4) can be set successfully.
+    const r0 = syscall.set_priority(syscall.PRIORITY_IDLE);
+    t.expectOk("§2.2.1 idle(0)", r0);
+
+    const r1 = syscall.set_priority(syscall.PRIORITY_NORMAL);
+    t.expectOk("§2.2.1 normal(1)", r1);
+
+    const r2 = syscall.set_priority(syscall.PRIORITY_HIGH);
+    t.expectOk("§2.2.1 high(2)", r2);
+
+    const r3 = syscall.set_priority(syscall.PRIORITY_REALTIME);
+    t.expectOk("§2.2.1 realtime(3)", r3);
+
+    // Pinned returns a positive handle ID, not E_OK.
+    const r4 = syscall.set_priority(syscall.PRIORITY_PINNED);
+    if (r4 <= 0) {
+        t.failWithVal("§2.2.1 pinned(4)", 1, r4);
+        syscall.shutdown();
     }
+    t.pass("§2.2.1 pinned(4)");
+
+    // Clean up the core_pin handle.
+    const handle: u64 = @bitCast(r4);
+    _ = syscall.revoke_perm(handle);
+
     syscall.shutdown();
 }

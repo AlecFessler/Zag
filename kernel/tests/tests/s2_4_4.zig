@@ -1,74 +1,56 @@
 const lib = @import("lib");
 
-const perm_view = lib.perm_view;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-var worker_self: u64 = 0;
-var worker_done: u64 = 0;
+var ran_on_pinned_core: u64 align(8) = 0;
 
-fn workerThread() void {
-    const s = syscall.thread_self();
-    if (s > 0) worker_self = @bitCast(s);
-    @atomicStore(u64, &worker_done, 1, .release);
-    syscall.thread_exit();
+fn try_run_on_core1() void {
+    // Restrict to core 1 only, then yield to move there.
+    _ = syscall.set_affinity(0x2);
+    syscall.thread_yield();
+    // If we reach here, we're running on core 1.
+    @atomicStore(u64, &ran_on_pinned_core, 1, .release);
+    _ = syscall.futex_wake(@ptrCast(&ran_on_pinned_core), 1);
 }
 
-/// §2.4.4 — `thread_self` returns the handle ID of the calling thread as it appears in the calling process's own permissions table.
-pub fn main(pv: u64) void {
-    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
-
-    const main_self_ret = syscall.thread_self();
-    if (main_self_ret <= 0) {
-        t.failWithVal("§2.4.4 thread_self main", 1, main_self_ret);
+/// §2.4.4 — While pinned, only the pinned thread executes on that core (except when the pinned thread is blocked, during which other threads may be work-stolen onto the core).
+pub fn main(_: u64) void {
+    // Pin main thread to core 1.
+    _ = syscall.set_affinity(0x2);
+    syscall.thread_yield();
+    const ret = syscall.set_priority(syscall.PRIORITY_PINNED);
+    if (ret < 0) {
+        t.fail("§2.4.4");
         syscall.shutdown();
     }
-    const main_self: u64 = @bitCast(main_self_ret);
+    const pin_handle: u64 = @bitCast(ret);
 
-    const worker_ret = syscall.thread_create(&workerThread, 0, 4);
-    if (worker_ret <= 0) {
-        t.failWithVal("§2.4.4 thread_create", 1, worker_ret);
-        syscall.shutdown();
-    }
-    const worker_handle: u64 = @bitCast(worker_ret);
+    // Spawn thread that tries to run on core 1.
+    // It sets affinity to core 1 and yields — but core 1 is exclusively pinned,
+    // so the scheduler can't place it there. It stays in the ready queue.
+    _ = syscall.thread_create(&try_run_on_core1, 0, 4);
 
-    // Wait for the worker to publish its thread_self result.
-    var iters: u32 = 0;
-    while (iters < 100000) : (iters += 1) {
-        if (@atomicLoad(u64, &worker_done, .acquire) != 0) break;
+    // Give scheduler many chances to schedule the thread on core 1.
+    for (0..100) |_| syscall.thread_yield();
+
+    // Thread should NOT have reached its flag-set code (core 1 is exclusive).
+    const ran_while_pinned = @atomicLoad(u64, &ran_on_pinned_core, .acquire) != 0;
+
+    // Unpin core 1.
+    _ = syscall.revoke_perm(pin_handle);
+
+    // Now the thread can be scheduled on core 1. Wait for it.
+    var attempts: u32 = 0;
+    while (@atomicLoad(u64, &ran_on_pinned_core, .acquire) == 0 and attempts < 100000) : (attempts += 1) {
         syscall.thread_yield();
     }
-    if (@atomicLoad(u64, &worker_done, .acquire) == 0) {
-        t.fail("§2.4.4 worker never ran");
-        syscall.shutdown();
-    }
+    const ran_after_unpin = @atomicLoad(u64, &ran_on_pinned_core, .acquire) != 0;
 
-    // Each thread's self-handle must be distinct.
-    if (main_self == worker_self) {
-        t.fail("§2.4.4 main and worker saw identical thread_self handles");
-        syscall.shutdown();
-    }
-
-    // The worker's thread_self value must match the handle the kernel
-    // returned from thread_create, and both must exist as THREAD entries
-    // in our own perm view.
-    if (worker_self != worker_handle) {
-        t.fail("§2.4.4 worker thread_self != thread_create return");
-        syscall.shutdown();
-    }
-
-    var saw_main = false;
-    var saw_worker = false;
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD) {
-            if (view[i].handle == main_self) saw_main = true;
-            if (view[i].handle == worker_self) saw_worker = true;
-        }
-    }
-    if (saw_main and saw_worker) {
+    if (!ran_while_pinned and ran_after_unpin) {
         t.pass("§2.4.4");
     } else {
-        t.fail("§2.4.4 thread handles not found in perm view");
+        t.fail("§2.4.4");
     }
     syscall.shutdown();
 }

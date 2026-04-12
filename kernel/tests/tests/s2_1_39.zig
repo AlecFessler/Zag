@@ -6,60 +6,33 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.1.39 — The user permissions view is kept in sync with the kernel permissions table.
+/// §2.1.39 — Non-restartable dead process: parent's entry converts to `dead_process` with fault reason and restart count.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
-
-    // Spawn a child and acquire the fault_handler cap for it via cap transfer.
-    // Per §2.12.4 the kernel inserts handles to the child's threads into our
-    // permissions table; that insertion must be reflected in our user view.
-    const child_rights = (perms.ProcessRights{ .fault_handler = true }).bits();
-    const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
-        @intFromPtr(children.child_send_self_fault_handler.ptr),
-        children.child_send_self_fault_handler.len,
-        child_rights,
-    )));
-
-    var reply: syscall.IpcMessage = .{};
-    _ = syscall.ipc_call(child_handle, &.{}, &reply);
-
-    // Find the child's main thread handle now mirrored into our view.
-    // Skip slot 1 which is our own initial thread.
-    var child_thread_slot: usize = 128;
-    var child_thread: u64 = 0;
-    for (2..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_THREAD and view[i].handle != 0) {
-            child_thread_slot = i;
-            child_thread = view[i].handle;
+    // Spawn a non-restartable child that exits immediately
+    const child_rights = (perms.ProcessRights{}).bits();
+    const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(@intFromPtr(children.child_exit.ptr), children.child_exit.len, child_rights)));
+    var slot: usize = 0;
+    for (0..128) |i| {
+        if (view[i].handle == child_handle) {
+            slot = i;
             break;
         }
     }
-    if (child_thread == 0) {
-        t.fail("§2.1.39 child thread not mirrored into handler view");
-        syscall.shutdown();
-    }
-
-    // Mutation of the target's table: kill the child's only thread. Per
-    // §2.4.6 the kernel clears the thread from both the target's table and
-    // the handler's table and calls syncUserView on both. Our (handler)
-    // view must reflect that cross-table sync.
-    const kill_rc = syscall.thread_kill(child_thread);
-    if (kill_rc != 0) {
-        t.failWithVal("§2.1.39 thread_kill", 0, kill_rc);
-        syscall.shutdown();
-    }
-
-    var iters: u32 = 0;
-    while (iters < 20000) : (iters += 1) {
+    // Wait for entry to become ENTRY_TYPE_DEAD_PROCESS
+    var attempts: u32 = 0;
+    while (attempts < 100000) : (attempts += 1) {
+        if (view[slot].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS) break;
         syscall.thread_yield();
-        if (view[child_thread_slot].entry_type != perm_view.ENTRY_TYPE_THREAD or
-            view[child_thread_slot].handle != child_thread)
-        {
-            t.pass("§2.1.39");
-            syscall.shutdown();
-        }
     }
-
-    t.fail("§2.1.39 handler view did not reflect target table mutation");
+    // Verify: entry type is dead_process, crash reason is normal_exit, restart count is 0
+    const is_dead = view[slot].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS;
+    const reason = view[slot].processCrashReason();
+    const restart_count = view[slot].processRestartCount();
+    if (is_dead and reason == .normal_exit and restart_count == 0) {
+        t.pass("§2.1.39");
+    } else {
+        t.fail("§2.1.39");
+    }
     syscall.shutdown();
 }

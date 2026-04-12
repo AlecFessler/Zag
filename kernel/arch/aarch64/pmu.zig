@@ -12,7 +12,11 @@ const zag = @import("zag");
 
 const pmu = zag.syscall.pmu;
 
-pub const PmuState = extern struct {};
+/// Stub PMU state. Must be large enough for the slab allocator's intrusive
+/// freelist node (24 bytes in Debug: magic + next + base pointer).
+pub const PmuState = extern struct {
+    _reserved: [4]u64 = .{ 0, 0, 0, 0 },
+};
 
 pub fn pmuInit() void {}
 

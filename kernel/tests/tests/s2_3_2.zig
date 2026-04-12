@@ -1,19 +1,31 @@
 const lib = @import("lib");
 
-const perm_view = lib.perm_view;
+const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const E_INVAL: i64 = -1;
-
-/// §2.3.2 — Handle 0 (`HANDLE_SELF`) exists at process creation and cannot be revoked.
-pub fn main(pv: u64) void {
-    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
-    // Verify handle 0 exists.
-    const exists = view[0].handle == 0 and view[0].entry_type == perm_view.ENTRY_TYPE_PROCESS;
-    // Attempt to revoke handle 0 — should return E_INVAL.
-    const revoke_ret = syscall.revoke_perm(0);
-    if (exists and revoke_ret == E_INVAL) {
+/// §2.3.2 — Pages demand-paged after decommit are guaranteed to be zeroed.
+pub fn main(perm_view: u64) void {
+    _ = perm_view;
+    const rw = perms.VmReservationRights{ .read = true, .write = true };
+    const result = syscall.mem_reserve(0, 4096, rw.bits());
+    const handle: u64 = @bitCast(result.val);
+    const ptr: [*]volatile u8 = @ptrFromInt(result.val2);
+    // Write non-zero data to commit the page.
+    for (0..4096) |i| ptr[i] = 0xAA;
+    // Decommit.
+    _ = syscall.mem_perms(handle, 0, 4096, (perms.VmReservationRights{}).bits());
+    // Recommit.
+    _ = syscall.mem_perms(handle, 0, 4096, rw.bits());
+    // Verify all zeroed.
+    var all_zero = true;
+    for (0..4096) |i| {
+        if (ptr[i] != 0) {
+            all_zero = false;
+            break;
+        }
+    }
+    if (all_zero) {
         t.pass("§2.3.2");
     } else {
         t.fail("§2.3.2");

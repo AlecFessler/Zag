@@ -1,3 +1,4 @@
+const children = @import("embedded_children");
 const lib = @import("lib");
 
 const perm_view = lib.perm_view;
@@ -5,50 +6,42 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const U64_MAX: u64 = 0xFFFFFFFFFFFFFFFF;
+const E_BADHANDLE: i64 = -3;
 
-/// §2.1.18 — Each entry's handle field is a monotonic u64 ID; empty slots have handle = `U64_MAX`.
+/// §2.1.18 — A restarting process remains alive throughout (IPC to it does not return `E_BADHANDLE`).
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
-
-    // Empty-slot invariant: every ENTRY_TYPE_EMPTY slot must carry U64_MAX.
-    var empty_checked: u32 = 0;
-    var empties_ok = true;
+    // Spawn restartable child_check_data_reload.
+    // On first boot: corrupts .data and exits → triggers restart.
+    // On second boot: waits for IPC and replies with .data sentinel.
+    const child_rights = (perms.ProcessRights{ .restart = true }).bits();
+    const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
+        @intFromPtr(children.child_check_data_reload.ptr),
+        children.child_check_data_reload.len,
+        child_rights,
+    )));
+    var slot: usize = 0;
     for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_EMPTY) {
-            empty_checked += 1;
-            if (view[i].handle != U64_MAX) {
-                empties_ok = false;
-                break;
-            }
-        }
-    }
-
-    // Monotonic allocation: allocate several handles in sequence and verify
-    // each newly-minted ID is strictly greater than the previous one.
-    const rw = perms.VmReservationRights{ .read = true, .write = true };
-    var prev: u64 = 0;
-    var monotonic_ok = true;
-    var allocated: [5]u64 = undefined;
-    for (0..5) |i| {
-        const r = syscall.mem_reserve(0, 4096, rw.bits());
-        if (r.val <= 0) {
-            monotonic_ok = false;
+        if (view[i].handle == child_handle) {
+            slot = i;
             break;
         }
-        const h: u64 = @bitCast(r.val);
-        if (h <= prev) {
-            monotonic_ok = false;
-            break;
-        }
-        allocated[i] = h;
-        prev = h;
     }
-    for (allocated) |h| {
-        _ = syscall.revoke_perm(h);
+    // Wait for the child to restart (first boot exits, triggering restart).
+    var attempts: u32 = 0;
+    while (attempts < 500000) : (attempts += 1) {
+        if (view[slot].processRestartCount() > 0) break;
+        syscall.thread_yield();
     }
-
-    if (empties_ok and empty_checked > 0 and monotonic_ok) {
+    if (view[slot].processRestartCount() == 0) {
+        t.fail("§2.1.18");
+        syscall.shutdown();
+    }
+    // After restart, IPC to the process should still work (not E_BADHANDLE).
+    // The child on second boot waits for an IPC call and replies.
+    var reply: syscall.IpcMessage = .{};
+    const rc = syscall.ipc_call(child_handle, &.{}, &reply);
+    if (rc != E_BADHANDLE and rc == 0) {
         t.pass("§2.1.18");
     } else {
         t.fail("§2.1.18");

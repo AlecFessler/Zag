@@ -31,6 +31,7 @@ pub const VmNode = struct {
         private: void,
         shared_memory: *SharedMemory,
         mmio: *DeviceRegion,
+        virtual_bar: *DeviceRegion,
     },
     rights: VmReservationRights,
     handle: u64,
@@ -614,6 +615,55 @@ pub const VirtualMemoryManager = struct {
         }
     }
 
+    pub fn memVirtualBarMap(
+        self: *VirtualMemoryManager,
+        device_handle: u64,
+        vm_handle: u64,
+        original_start: VAddr,
+        original_size: u64,
+        offset: u64,
+        device: *DeviceRegion,
+        rights: VmReservationRights,
+    ) !void {
+        self.lock.lock();
+        defer self.lock.unlock();
+
+        const range_start = VAddr.fromInt(original_start.addr + offset);
+        const range_size = std.mem.alignForward(u64, device.access.port_io.port_count, paging.PAGE4K);
+        const range_end_addr = range_start.addr + range_size;
+        _ = vm_handle;
+
+        if (hasDuplicateVirtualBar(&self.tree, original_start, original_size, device))
+            return error.DuplicateMapping;
+
+        try splitAtLocked(&self.tree, range_start);
+        try splitAtLocked(&self.tree, VAddr.fromInt(range_end_addr));
+
+        if (hasCommittedPages(&self.tree, self.addr_space_root, range_start, range_end_addr))
+            return error.CommittedPages;
+
+        try removeRange(&self.tree, range_start, range_end_addr);
+
+        const map_node = try allocVmNode();
+        map_node.* = .{
+            .start = range_start,
+            .size = range_size,
+            .kind = .{ .virtual_bar = device },
+            .rights = .{ .read = rights.read, .write = rights.write, .execute = rights.execute },
+            .handle = device_handle,
+            .restart_policy = .free,
+        };
+
+        self.tree.insert(map_node) catch |e| {
+            freeVmNode(map_node);
+            return e;
+        };
+
+        // No page mapping — PTEs are left absent intentionally so that
+        // every access traps into the page fault handler, which decodes
+        // the faulting instruction and performs the port I/O.
+    }
+
     pub fn memMmioUnmap(
         self: *VirtualMemoryManager,
         device: *DeviceRegion,
@@ -631,11 +681,15 @@ pub const VirtualMemoryManager = struct {
         const map_node = inOrderFind(&self.tree, struct {
             target: *DeviceRegion,
             fn match(ctx: *const @This(), node: *VmNode) bool {
-                return node.kind == .mmio and node.kind.mmio == ctx.target;
+                return (node.kind == .mmio and node.kind.mmio == ctx.target) or
+                    (node.kind == .virtual_bar and node.kind.virtual_bar == ctx.target);
             }
         }{ .target = device }) orelse return error.NotFound;
 
-        unmapNodePages(map_node, self.addr_space_root, false);
+        // virtual_bar nodes have no mapped pages; only unmap for mmio
+        if (map_node.kind == .mmio) {
+            unmapNodePages(map_node, self.addr_space_root, false);
+        }
 
         const old_start = map_node.start;
         const old_size = map_node.size;
@@ -736,9 +790,10 @@ pub const VirtualMemoryManager = struct {
         var ctx = Ctx{ .target = device, .root = self.addr_space_root, .res = reservations };
         self.tree.forEachInRange(&s, &e, &ctx, struct {
             fn cb(c: *Ctx, node: *VmNode) void {
-                if (node.kind != .mmio) return;
-                if (node.kind.mmio != c.target) return;
-                unmapNodePages(node, c.root, false);
+                const is_mmio = node.kind == .mmio and node.kind.mmio == c.target;
+                const is_vbar = node.kind == .virtual_bar and node.kind.virtual_bar == c.target;
+                if (!is_mmio and !is_vbar) return;
+                if (is_mmio) unmapNodePages(node, c.root, false);
                 node.kind = .private;
                 node.rights = findContainingRights(c.res, node.start.addr);
                 node.handle = HANDLE_NONE;
@@ -900,6 +955,20 @@ fn hasDuplicateShm(tree: *VmTree, res_start: VAddr, res_size: u64, shm: *SharedM
     return found;
 }
 
+fn hasDuplicateVirtualBar(tree: *VmTree, res_start: VAddr, res_size: u64, device: *DeviceRegion) bool {
+    var found = false;
+    const Ctx = struct { target: *DeviceRegion, found: *bool };
+    var ctx = Ctx{ .target = device, .found = &found };
+    var s = mkSentinel(res_start);
+    var e = mkSentinel(VAddr.fromInt(res_start.addr + res_size));
+    tree.forEachInRange(&s, &e, &ctx, struct {
+        fn cb(c: *Ctx, node: *VmNode) void {
+            if (node.kind == .virtual_bar and node.kind.virtual_bar == c.target) c.found.* = true;
+        }
+    }.cb);
+    return found;
+}
+
 fn hasDuplicateMmio(tree: *VmTree, res_start: VAddr, res_size: u64, device: *DeviceRegion) bool {
     var found = false;
     const Ctx = struct { target: *DeviceRegion, found: *bool };
@@ -973,6 +1042,9 @@ fn inOrderFind(tree: *VmTree, ctx: anytype) ?*VmNode {
 }
 
 fn unmapNodePages(node: *VmNode, addr_space_root: PAddr, free_phys: bool) void {
+    // virtual_bar nodes have no mapped pages — PTEs are intentionally absent
+    if (node.kind == .virtual_bar) return;
+
     const pmm_iface = pmm.global_pmm.?.allocator();
     var page_addr = node.start.addr;
     while (page_addr < node.end()) {

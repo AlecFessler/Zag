@@ -4,81 +4,107 @@ const perm_view = lib.perm_view;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-fn workerThread() void {
+const ENTRY_TYPE_CORE_PIN: u8 = 4;
+
+var worker_counter: u64 align(8) = 0;
+
+fn workerSpin() void {
+    // Pin the worker to core 0 by affinity mask, then yield so the
+    // scheduler migrates us there before we touch the counter.
+    _ = syscall.set_affinity(0x1);
+    syscall.thread_yield();
     while (true) {
+        _ = @atomicRmw(u64, &worker_counter, .Add, 1, .monotonic);
         syscall.thread_yield();
     }
 }
 
-fn findThreadEntry(view: [*]const perm_view.UserViewEntry, handle: u64) ?*const perm_view.UserViewEntry {
-    for (0..128) |i| {
-        if (view[i].handle == handle and view[i].entry_type == perm_view.ENTRY_TYPE_THREAD) {
-            return &view[i];
-        }
-    }
-    return null;
-}
-
-/// §2.4.7 — A thread entry's `field0` in the user view exposes the thread's stable kernel-assigned thread id.
+/// §2.4.7 — Revoking a core pin unpins the thread, restores the thread's pre-pin affinity mask, drops the thread's priority to its pre-pin level, and clears the slot.
+///
+/// Plan:
+///   1. Main thread set_affinity(core 0) and set_priority(PINNED) on core 0.
+///   2. Spawn a worker thread also pinned to core 0 by affinity mask.
+///   3. While the pin is held, §2.10.4 says only the pinned thread runs on
+///      that core — the worker must starve. Yield main a handful of times
+///      and confirm worker_counter remains 0.
+///   4. Revoke the pin — scheduling on core 0 returns to preemptive,
+///      and pre-pin affinity and priority are restored.
+///   5. Yield main and confirm worker_counter advances.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Self thread's entry must have a non-zero tid.
-    const self_ret = syscall.thread_self();
-    if (self_ret < 0) {
-        t.fail("§2.4.7 thread_self failed");
-        syscall.shutdown();
-    }
-    const self_handle: u64 = @bitCast(self_ret);
-    const self_entry = findThreadEntry(view, self_handle) orelse {
-        t.fail("§2.4.7 self thread entry missing");
-        syscall.shutdown();
-    };
-    const self_tid = self_entry.threadTid();
-    if (self_tid == 0) {
-        t.fail("§2.4.7 self tid is 0");
-        syscall.shutdown();
-    }
+    // Pin main to core 0.
+    _ = syscall.set_affinity(0x1);
 
-    // A freshly spawned thread has its own distinct tid.
-    const ret = syscall.thread_create(&workerThread, 0, 4);
-    if (ret < 0) {
-        t.fail("§2.4.7 thread_create failed");
+    // Take exclusive ownership of core 0.
+    const pin_ret = syscall.set_priority(syscall.PRIORITY_PINNED);
+    if (pin_ret < 0) {
+        t.fail("§2.4.7 set_priority(PINNED) failed");
         syscall.shutdown();
     }
-    const handle: u64 = @bitCast(ret);
+    const pin_handle: u64 = @bitCast(pin_ret);
 
-    const entry = findThreadEntry(view, handle) orelse {
-        t.fail("§2.4.7 spawned thread entry missing");
-        syscall.shutdown();
-    };
-    const spawned_tid = entry.threadTid();
-    if (spawned_tid == 0) {
-        t.fail("§2.4.7 spawned tid is 0");
-        syscall.shutdown();
-    }
-    if (spawned_tid == self_tid) {
-        t.fail("§2.4.7 spawned tid collides with self tid");
-        syscall.shutdown();
-    }
-
-    // The tid is stable — repeated observations (even across a suspend
-    // which used to mutate the old state field) return the same value.
-    const suspend_ret = syscall.thread_suspend(handle);
-    if (suspend_ret < 0) {
-        t.fail("§2.4.7 thread_suspend failed");
-        syscall.shutdown();
-    }
-    if (findThreadEntry(view, handle)) |e2| {
-        if (e2.threadTid() != spawned_tid) {
-            t.fail("§2.4.7 tid changed after suspend");
-            syscall.shutdown();
+    // Verify the pin slot is present.
+    var pin_found = false;
+    for (0..128) |i| {
+        if (view[i].handle == pin_handle and view[i].entry_type == ENTRY_TYPE_CORE_PIN) {
+            pin_found = true;
+            break;
         }
-    } else {
-        t.fail("§2.4.7 spawned entry missing after suspend");
+    }
+    if (!pin_found) {
+        t.fail("§2.4.7 pin slot missing");
         syscall.shutdown();
     }
 
-    t.pass("§2.4.7");
+    // Spawn worker.
+    const worker_ret = syscall.thread_create(&workerSpin, 0, 4);
+    if (worker_ret < 0) {
+        t.fail("§2.4.7 thread_create");
+        syscall.shutdown();
+    }
+
+    // Under exclusive pin on core 0, the worker (also affined to core 0) cannot
+    // run. Yield and check the counter stays at zero.
+    var y: u32 = 0;
+    while (y < 50) : (y += 1) syscall.thread_yield();
+    const counter_during_pin = @atomicLoad(u64, &worker_counter, .monotonic);
+
+    // Revoke the pin — pre-pin affinity and priority are restored.
+    const revoke_ret = syscall.revoke_perm(pin_handle);
+    if (revoke_ret != 0) {
+        t.fail("§2.4.7 revoke");
+        syscall.shutdown();
+    }
+
+    // Slot must be gone.
+    var slot_gone = true;
+    for (0..128) |i| {
+        if (view[i].handle == pin_handle and view[i].entry_type == ENTRY_TYPE_CORE_PIN) {
+            slot_gone = false;
+            break;
+        }
+    }
+
+    // Preemptive scheduling restored: the worker should now be able to run.
+    var observed_progress = false;
+    var attempts: u32 = 0;
+    while (attempts < 200000) : (attempts += 1) {
+        if (@atomicLoad(u64, &worker_counter, .monotonic) > counter_during_pin) {
+            observed_progress = true;
+            break;
+        }
+        syscall.thread_yield();
+    }
+
+    // Verify priority was restored to pre-pin level (NORMAL): set_priority(NORMAL)
+    // should succeed as a no-op, confirming we're no longer at pinned priority.
+    const pri_ret = syscall.set_priority(syscall.PRIORITY_NORMAL);
+
+    if (counter_during_pin == 0 and slot_gone and observed_progress and pri_ret == 0) {
+        t.pass("§2.4.7");
+    } else {
+        t.fail("§2.4.7");
+    }
     syscall.shutdown();
 }

@@ -164,17 +164,17 @@ pub fn vmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContext, vm_handle: 
     const E_BADADDR: i64 = -7;
     const E_AGAIN: i64 = -9;
 
-    const vm_obj = resolveVmHandle(proc, vm_handle) orelse return .{ .rax = E_BADCAP };
+    const vm_obj = resolveVmHandle(proc, vm_handle) orelse return .{ .ret = E_BADCAP };
     const box = vm_obj.exitBox();
 
-    if (buf_ptr == 0) return .{ .rax = E_BADADDR };
-    if (!zag.memory.address.AddrSpacePartition.user.contains(buf_ptr)) return .{ .rax = E_BADADDR };
+    if (buf_ptr == 0) return .{ .ret = E_BADADDR };
+    if (!zag.memory.address.AddrSpacePartition.user.contains(buf_ptr)) return .{ .ret = E_BADADDR };
 
     // Pre-fault all buffer pages the VmExitMessage may touch.
     const msg_size: u64 = @sizeOf(VmExitMessage);
     var prefault_va = buf_ptr;
     while (prefault_va < buf_ptr + msg_size) {
-        proc.vmm.demandPage(VAddr.fromInt(prefault_va), true, false) catch return .{ .rax = E_BADADDR };
+        proc.vmm.demandPage(VAddr.fromInt(prefault_va), true, false) catch return .{ .ret = E_BADADDR };
         prefault_va += paging.PAGE4K;
     }
 
@@ -184,12 +184,12 @@ pub fn vmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContext, vm_handle: 
     if (box.queue.dequeue()) |exited_thread| {
         box.lock.unlock();
         const result = deliverExitMessage(proc, vm_obj, exited_thread, buf_ptr);
-        return .{ .rax = result };
+        return .{ .ret = result };
     }
 
     if (!blocking) {
         box.lock.unlock();
-        return .{ .rax = E_AGAIN };
+        return .{ .ret = E_AGAIN };
     }
 
     // Block: set receiver and switch away. When a vCPU exit is delivered

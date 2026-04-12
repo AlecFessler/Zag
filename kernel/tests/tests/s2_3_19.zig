@@ -1,52 +1,50 @@
-const children = @import("embedded_children");
 const lib = @import("lib");
 
 const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const E_INVAL: i64 = -1;
+/// §2.3.19 — `mem_perms` returns `E_OK` on success.
+///
+/// Verifies the permission change actually takes effect by cycling RW → RO → RW
+/// and writing through the page in the RW phases. A faulting write during RO
+/// would crash the process — the fact that we reach shutdown after the RW
+/// re-grant proves the kernel honored both perm changes and remapped the page.
+pub fn main(perm_view: u64) void {
+    _ = perm_view;
+    const rw = perms.VmReservationRights{ .read = true, .write = true };
+    const result = syscall.mem_reserve(0, 4096, rw.bits());
+    const handle: u64 = @bitCast(result.val);
+    const vaddr: u64 = result.val2;
+    const page: [*]volatile u8 = @ptrFromInt(vaddr);
 
-fn worker() void {
-    while (true) {
-        syscall.thread_yield();
-    }
-}
-
-/// §2.3.19 — Thread handles are not transferable via message passing.
-pub fn main(_: u64) void {
-    // Create a second thread so we have a thread handle to attempt transferring.
-    const handle_ret = syscall.thread_create(&worker, 0, 4);
-    if (handle_ret <= 0) {
-        t.failWithVal("§2.3.19 thread_create", 1, handle_ret);
+    // Initial write (page RW) — commits the page.
+    page[0] = 0xAA;
+    if (page[0] != 0xAA) {
+        t.fail("§2.3.19 initial write lost");
         syscall.shutdown();
     }
-    const thread_handle: u64 = @bitCast(handle_ret);
 
-    // Spawn a child process to act as the IPC target.
-    const child_rights = perms.ProcessRights{ .spawn_thread = true };
-    const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
-        @intFromPtr(children.child_ipc_server.ptr),
-        children.child_ipc_server.len,
-        child_rights.bits(),
-    )));
+    // Downgrade to read-only.
+    const read_only = perms.VmReservationRights{ .read = true };
+    const ret_ro = syscall.mem_perms(handle, 0, 4096, read_only.bits());
+    t.expectEqual("§2.3.19 RW→RO", 0, ret_ro);
 
-    // Let child start and block on recv.
-    for (0..5) |_| syscall.thread_yield();
-
-    // Attempt to transfer the thread handle via cap transfer — should fail.
-    // Cap transfer sends word[0] = handle, word[1] = rights.
-    const thread_rights: u64 = perms.ThreadHandleRights.full.bits();
-    var reply: syscall.IpcMessage = .{};
-    const ret = syscall.ipc_call_cap(child_handle, &.{ thread_handle, thread_rights }, &reply);
-
-    // Kernel rejects thread-handle cap transfer in validateIpcSendRights via
-    // the `else` branch — the cap object is neither SHM nor process nor
-    // device_region, so E_INVAL is returned.
-    if (ret == E_INVAL) {
-        t.pass("§2.3.19");
-    } else {
-        t.failWithVal("§2.3.19", E_INVAL, ret);
+    // Confirm the page is still readable at its prior value.
+    if (page[0] != 0xAA) {
+        t.fail("§2.3.19 read-after-RO value changed");
+        syscall.shutdown();
     }
+
+    // Re-grant write and make a visible change.
+    const ret_rw = syscall.mem_perms(handle, 0, 4096, rw.bits());
+    t.expectEqual("§2.3.19 RO→RW", 0, ret_rw);
+    page[0] = 0x55;
+    if (page[0] != 0x55) {
+        t.fail("§2.3.19 write after RO→RW lost");
+        syscall.shutdown();
+    }
+
+    t.pass("§2.3.19");
     syscall.shutdown();
 }

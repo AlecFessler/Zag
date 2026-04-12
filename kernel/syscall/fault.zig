@@ -139,17 +139,17 @@ pub fn sysFaultRecv(ctx: *ArchCpuContext, buf_ptr: u64, blocking: u64) SyscallRe
     const thread = sched.currentThread().?;
     const proc = thread.process;
 
-    if (!faultHandlerCheck(proc)) return .{ .rax = E_PERM };
+    if (!faultHandlerCheck(proc)) return .{ .ret = E_PERM };
 
     const buf_check = faultRecvValidateBuf(proc, buf_ptr);
-    if (buf_check != E_OK) return .{ .rax = buf_check };
+    if (buf_check != E_OK) return .{ .ret = buf_check };
 
     while (true) {
         proc.fault_box.lock.lock();
 
         if (proc.fault_box.isPendingReply()) {
             proc.fault_box.lock.unlock();
-            return .{ .rax = E_BUSY };
+            return .{ .ret = E_BUSY };
         }
 
         if (proc.fault_box.dequeueLocked()) |faulted| {
@@ -158,12 +158,12 @@ pub fn sysFaultRecv(ctx: *ArchCpuContext, buf_ptr: u64, blocking: u64) SyscallRe
 
             const handles = lookupFaultHandles(proc, faulted);
             writeFaultMessage(proc, buf_ptr, handles.proc_h, handles.thread_h, faulted);
-            return .{ .rax = @intCast(handles.thread_h) };
+            return .{ .ret = @intCast(handles.thread_h) };
         }
 
         if (blocking == 0) {
             proc.fault_box.lock.unlock();
-            return .{ .rax = E_AGAIN };
+            return .{ .ret = E_AGAIN };
         }
 
         // Block on recv. The faultBlock path will wake us when a fault

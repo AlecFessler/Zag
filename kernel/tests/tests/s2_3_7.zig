@@ -1,4 +1,3 @@
-const children = @import("embedded_children");
 const lib = @import("lib");
 
 const perm_view = lib.perm_view;
@@ -6,62 +5,76 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.3.7 — SHM transfer is non-exclusive (both sender and target retain handles).
-/// handles). Parent creates an SHM, maps it, transfers it with cap transfer
-/// to a child. Child maps the same SHM and writes a distinguishing magic.
-/// Parent, through its retained mapping, reads the child's magic — proving
-/// both sides share the backing and neither lost the handle.
+const PAGE: u64 = 4096;
+
+/// §2.3.7 — After `mem_mmio_unmap`, the range reverts to private with max RWX rights.
+/// rights. We reserve the region with read+write+execute (plus mmio so we
+/// can mem_mmio_map it in the first place), map MMIO, unmap, then verify that
+/// every page of the range is writable AND readable as fresh private memory.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    const shm_rights = perms.SharedMemoryRights{ .read = true, .write = true, .grant = true };
-    const shm_handle: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(4096, shm_rights.bits())));
-
-    // Parent maps the SHM and zeros the cell it expects the child to write.
-    const vm_rights = (perms.VmReservationRights{ .read = true, .write = true, .shareable = true }).bits();
-    const vm = syscall.mem_reserve(0, 4096, vm_rights);
-    const vm_h: u64 = @bitCast(vm.val);
-    if (syscall.mem_shm_map(shm_handle, vm_h, 0) != 0) {
-        t.fail("§2.3.7");
-        syscall.shutdown();
-    }
-    const cell: *volatile u64 = @ptrFromInt(vm.val2);
-    cell.* = 0;
-
-    // Spawn a child with enough rights to map the transferred SHM.
-    const child_rights = perms.ProcessRights{
-        .spawn_thread = true,
-        .mem_reserve = true,
-        .mem_shm_create = true,
-    };
-    const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
-        @intFromPtr(children.child_shm_write_magic.ptr),
-        children.child_shm_write_magic.len,
-        child_rights.bits(),
-    )));
-
-    // Transfer the SHM via cap transfer. The child writes magic; reply
-    // confirms completion.
-    var reply: syscall.IpcMessage = .{};
-    _ = syscall.ipc_call_cap(child_handle, &.{ shm_handle, shm_rights.bits() }, &reply);
-
-    // Sender retains its SHM slot.
-    var sender_still_has = false;
+    // Find an MMIO device.
+    var dev_handle: u64 = 0;
+    var dev_size: u32 = 0;
     for (0..128) |i| {
-        if (view[i].handle == shm_handle and view[i].entry_type == perm_view.ENTRY_TYPE_SHARED_MEMORY) {
-            sender_still_has = true;
+        if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION and view[i].deviceType() == 0) {
+            dev_handle = view[i].handle;
+            dev_size = view[i].deviceSizeOrPortCount();
             break;
         }
     }
-
-    // And the child's write is visible through the retained mapping.
-    const observed = cell.*;
-    const observed_expected = observed == 0xBEEF_F00D_CAFE_1234;
-
-    if (sender_still_has and observed_expected) {
-        t.pass("§2.3.7");
-    } else {
+    if (dev_handle == 0) {
         t.fail("§2.3.7");
+        syscall.shutdown();
     }
+
+    // Reserve at least one page, rounded to page size.
+    const size: u64 = @max(PAGE, @as(u64, dev_size + 4095) & ~@as(u64, 4095));
+    const vm_rights = perms.VmReservationRights{
+        .read = true,
+        .write = true,
+        .execute = true,
+        .mmio = true,
+    };
+    const vm = syscall.mem_reserve(0, size, vm_rights.bits());
+    const vm_h: u64 = @bitCast(vm.val);
+
+    // Map and unmap the MMIO region.
+    if (syscall.mem_mmio_map(dev_handle, vm_h, 0) != 0) {
+        t.fail("§2.3.7");
+        syscall.shutdown();
+    }
+    if (syscall.mem_mmio_unmap(dev_handle, vm_h) != 0) {
+        t.fail("§2.3.7");
+        syscall.shutdown();
+    }
+
+    // Post-unmap: every page must be writable+readable as fresh private
+    // memory. If the reservation did not revert to max RWX, writes would
+    // fault on non-writable pages.
+    const base = vm.val2;
+    const n_pages = size / PAGE;
+    var i: u64 = 0;
+    while (i < n_pages) : (i += 1) {
+        const ptr: *volatile u64 = @ptrFromInt(base + i * PAGE);
+        const magic: u64 = 0xBADB_0000 + i;
+        ptr.* = magic;
+        if (ptr.* != magic) {
+            t.fail("§2.3.7");
+            syscall.shutdown();
+        }
+    }
+
+    // Execute right must also revert: write a single RET (0xC3) at the base
+    // of the first post-unmap page and invoke it via a function pointer. If
+    // the reservation did not revert to max RWX, this faults with
+    // invalid_execute.
+    const code_ptr: *volatile u8 = @ptrFromInt(base);
+    code_ptr.* = 0xC3;
+    const func: *const fn () void = @ptrFromInt(base);
+    func();
+
+    t.pass("§2.3.7");
     syscall.shutdown();
 }

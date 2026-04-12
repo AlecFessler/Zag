@@ -183,14 +183,16 @@ pub const addr_space = switch (builtin.cpu.arch) {
             .start = 0x0000_0000_0000_0000,
             .end = 0x0001_0000_0000_0000,
         };
+        // Kernel heap/data (above kernel_code).
         pub const kernel: Range = .{
-            .start = 0xFFFF_0000_0000_0000,
+            .start = 0xFFFF_0000_4000_0000,
             .end = 0xFFFF_0400_0000_0000,
         };
         pub const physmap: Range = .{
             .start = 0xFFFF_FF80_0000_0000,
             .end = 0xFFFF_FF88_0000_0000,
         };
+        // Kernel text/rodata (bottom of TTBR1 range).
         pub const kernel_code: Range = .{
             .start = 0xFFFF_0000_0000_0000,
             .end = 0xFFFF_0000_4000_0000,
@@ -223,6 +225,47 @@ pub fn isRelativeRelocation(rela_type: u32) bool {
     };
 }
 
+/// Classification of ELF relocation types for KASLR slide application.
+pub const RelocAction = enum { skip, abs64, abs32, unsupported };
+
+/// Classify a relocation type for KASLR processing.
+pub fn classifyRelocation(rtype: u32) RelocAction {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => {
+            if (rtype == @intFromEnum(std.elf.R_X86_64.PC32) or
+                rtype == @intFromEnum(std.elf.R_X86_64.PLT32) or
+                rtype == @intFromEnum(std.elf.R_X86_64.NONE)) return .skip;
+            if (rtype == @intFromEnum(std.elf.R_X86_64.@"64")) return .abs64;
+            if (rtype == @intFromEnum(std.elf.R_X86_64.@"32S")) return .abs32;
+            return .unsupported;
+        },
+        .aarch64 => {
+            const R = std.elf.R_AARCH64;
+            // PC-relative: no adjustment needed (both sides move by slide).
+            // LO12: low 12 bits unchanged with page-aligned slide.
+            if (rtype == @intFromEnum(R.NONE) or
+                rtype == @intFromEnum(R.PREL32) or
+                rtype == @intFromEnum(R.PREL64) or
+                rtype == @intFromEnum(R.ADR_PREL_PG_HI21) or
+                rtype == @intFromEnum(R.ADR_PREL_PG_HI21_NC) or
+                rtype == @intFromEnum(R.ADR_PREL_LO21) or
+                rtype == @intFromEnum(R.ADD_ABS_LO12_NC) or
+                rtype == @intFromEnum(R.CALL26) or
+                rtype == @intFromEnum(R.JUMP26) or
+                rtype == @intFromEnum(R.LDST8_ABS_LO12_NC) or
+                rtype == @intFromEnum(R.LDST16_ABS_LO12_NC) or
+                rtype == @intFromEnum(R.LDST32_ABS_LO12_NC) or
+                rtype == @intFromEnum(R.LDST64_ABS_LO12_NC) or
+                rtype == @intFromEnum(R.LDST128_ABS_LO12_NC)) return .skip;
+            if (rtype == @intFromEnum(R.ABS64) or
+                rtype == @intFromEnum(R.RELATIVE)) return .abs64;
+            if (rtype == @intFromEnum(R.ABS32)) return .abs32;
+            return .unsupported;
+        },
+        else => unreachable,
+    };
+}
+
 pub fn alignStack(stack_top: VAddr) VAddr {
     const aligned = std.mem.alignBackward(u64, stack_top.addr, 16);
     const adjusted = switch (builtin.cpu.arch) {
@@ -248,7 +291,23 @@ pub inline fn kEntry(boot_info: *BootInfo, ktrampoline: *const fn (*BootInfo) ca
                 : .{ .rsp = true, .rbp = true, .rdi = true }
             );
         },
-        .aarch64 => {},
+        .aarch64 => {
+            // Switch to kernel stack and jump to trampoline.
+            // MAIR is set by arch.init() (paging.setMair) once the kernel
+            // is running — until then, UEFI's MAIR is used (likely index 1
+            // = Normal NC, which is sufficient for instruction fetch and
+            // stack access).
+            asm volatile (
+                \\mov sp, %[sp]
+                \\mov x0, %[arg]
+                \\br %[target]
+                :
+                : [sp] "r" (boot_info.stack_top.addr),
+                  [arg] "r" (@intFromPtr(boot_info)),
+                  [target] "r" (@intFromPtr(ktrampoline)),
+                : .{ .x0 = true, .memory = true }
+            );
+        },
         else => unreachable,
     }
     unreachable;
@@ -368,6 +427,108 @@ pub fn swapAddrSpace(root: PAddr) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.paging.swapAddrSpace(root),
         .aarch64 => aarch64.paging.swapAddrSpace(root),
+        else => unreachable,
+    }
+}
+
+/// Read the Memory Attribute Indirection Register.
+/// On aarch64: MAIR_EL1. On x86-64: returns 0 (not applicable).
+pub fn readMair() u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => 0,
+        .aarch64 => asm volatile ("mrs %[ret], mair_el1"
+            : [ret] "=r" (-> u64),
+        ),
+        else => unreachable,
+    };
+}
+
+/// Read the Translation Control Register.
+/// On aarch64: TCR_EL1. On x86-64: returns 0.
+pub fn readTcr() u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => 0,
+        .aarch64 => asm volatile ("mrs %[ret], tcr_el1"
+            : [ret] "=r" (-> u64),
+        ),
+        else => unreachable,
+    };
+}
+
+/// Write a single character to the platform's early debug output.
+/// On x86-64: serial port 0x3F8. On aarch64: PL011 at physmap + 0x09000000.
+/// Used before the serial driver is initialized. The physmap VA is used
+/// because the identity mapping may have been dropped.
+pub inline fn earlyDebugChar(c: u8) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            asm volatile ("outb %[val], %[port]"
+                :
+                : [val] "{al}" (c),
+                  [port] "N{dx}" (@as(u16, 0x3F8)),
+            );
+        },
+        .aarch64 => {
+            // PL011 at physical 0x09000000 via TTBR0 identity mapping.
+            // Only works before dropIdentityMapping() in memory.init.
+            const uart: *volatile u32 = @ptrFromInt(0x09000000);
+            uart.* = c;
+        },
+        else => unreachable,
+    }
+}
+
+/// Enable kernel-space translation. On aarch64 this configures TCR_EL1 to
+/// enable TTBR1 walks with 48-bit VA and 4KB granule. On x86-64 this is a
+/// no-op since CR3 already covers the full address space.
+pub fn enableKernelTranslation() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => aarch64.paging.enableKernelTranslation(),
+        else => unreachable,
+    }
+}
+
+/// Set the memory attribute indirection register to our expected values.
+/// On aarch64 this writes MAIR_EL1 (index 0 = Device, index 1 = Normal WB).
+/// Must be called after UEFI boot services exit, before jumping to the kernel.
+/// On x86-64 this is a no-op (PAT is set up by the kernel).
+pub fn setMemoryAttributes() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => aarch64.paging.setMair(),
+        else => unreachable,
+    }
+}
+
+/// Whether the kernel page table root is the same as the user table.
+/// On x86-64 (single CR3) the bootloader must copy the UEFI identity map
+/// into the new kernel table. On aarch64 (split TTBR0/TTBR1) the kernel
+/// table is independent and should start clean.
+pub const kernel_shares_user_table: bool = switch (builtin.cpu.arch) {
+    .x86_64 => true,
+    .aarch64 => false,
+    else => unreachable,
+};
+
+/// Return the physical address of the kernel page table root.
+/// On x86-64 this is the same as getAddrSpaceRoot() since CR3 covers both
+/// halves. On aarch64 this reads TTBR1_EL1 (upper/kernel VA range).
+pub fn getKernelAddrSpaceRoot() PAddr {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.getAddrSpaceRoot(),
+        .aarch64 => aarch64.paging.getKernelAddrSpaceRoot(),
+        else => unreachable,
+    };
+}
+
+/// Set the kernel page table root.
+/// On x86-64 this is swapAddrSpace (same CR3). On aarch64 this writes
+/// TTBR1_EL1 (upper/kernel VA range).
+pub fn setKernelAddrSpace(root: PAddr) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.swapAddrSpace(root),
+        .aarch64 => aarch64.paging.setKernelAddrSpace(root),
         else => unreachable,
     }
 }
@@ -621,16 +782,29 @@ pub fn enableDmaRemapping() void {
 
 pub const Vm = switch (builtin.cpu.arch) {
     .x86_64 => x64.kvm.vm.Vm,
+    .aarch64 => struct {
+        pub fn destroy(_: *@This()) void {}
+    },
     else => @compileError("unsupported arch for VM"),
 };
 
 pub const VmAllocator = switch (builtin.cpu.arch) {
     .x86_64 => x64.kvm.vm.VmAllocator,
+    .aarch64 => struct {
+        backing: std.mem.Allocator = undefined,
+        pub fn init(alloc: std.mem.Allocator) !@This() { return .{ .backing = alloc }; }
+        pub fn allocator(self: @This()) std.mem.Allocator { return self.backing; }
+    },
     else => @compileError("unsupported arch for VM"),
 };
 
 pub const VCpuAllocator = switch (builtin.cpu.arch) {
     .x86_64 => x64.kvm.vcpu.VCpuAllocator,
+    .aarch64 => struct {
+        backing: std.mem.Allocator = undefined,
+        pub fn init(alloc: std.mem.Allocator) !@This() { return .{ .backing = alloc }; }
+        pub fn allocator(self: @This()) std.mem.Allocator { return self.backing; }
+    },
     else => @compileError("unsupported arch for VM"),
 };
 
@@ -935,20 +1109,20 @@ pub fn findIrqForDevice(device: *DeviceRegion) ?u8 {
 
 pub const PowerAction = switch (builtin.cpu.arch) {
     .x86_64 => x64.power.PowerAction,
-    .aarch64 => enum(u8) { shutdown = 0, reboot = 1, sleep = 2, hibernate = 3, screen_off = 4 },
+    .aarch64 => aarch64.power.PowerAction,
     else => unreachable,
 };
 
 pub const CpuPowerAction = switch (builtin.cpu.arch) {
     .x86_64 => x64.power.CpuPowerAction,
-    .aarch64 => enum(u8) { set_freq = 0, set_idle = 1 },
+    .aarch64 => aarch64.power.CpuPowerAction,
     else => unreachable,
 };
 
 pub fn powerAction(action: PowerAction) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.power.powerAction(action),
-        .aarch64 => -13, // E_NODEV
+        .aarch64 => aarch64.power.powerAction(action),
         else => unreachable,
     };
 }
@@ -956,7 +1130,7 @@ pub fn powerAction(action: PowerAction) i64 {
 pub fn cpuPowerAction(action: CpuPowerAction, value: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.power.cpuPowerAction(action, value),
-        .aarch64 => -13, // E_NODEV
+        .aarch64 => aarch64.power.cpuPowerAction(action, value),
         else => unreachable,
     };
 }
@@ -1050,7 +1224,7 @@ pub fn kvmGuestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: 
 pub fn kvmVmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContextLocal, vm_handle: u64, buf_ptr: u64, blocking: bool) SyscallResult {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.exit_box.vmRecv(proc, thread, ctx, vm_handle, buf_ptr, blocking),
-        else => .{ .rax = -14 },
+        else => .{ .ret = -14 },
     };
 }
 

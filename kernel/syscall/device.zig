@@ -26,7 +26,6 @@ pub fn sysMemMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
     const device_entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
     if (device_entry.object != .device_region) return E_BADCAP;
     if (!device_entry.deviceRights().map) return E_PERM;
-    if (device_entry.object.device_region.device_type != .mmio) return E_INVAL;
 
     const vm_entry = proc.getPermByHandle(vm_handle) orelse return E_BADCAP;
     if (vm_entry.object != .vm_reservation) return E_BADCAP;
@@ -36,6 +35,37 @@ pub fn sysMemMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
     if (!vm_res.max_rights.read and !vm_res.max_rights.write) return E_PERM;
 
     const device = device_entry.object.device_region;
+
+    if (device.device_type == .port_io) {
+        // Port I/O devices use virtual BAR — write_combining is invalid
+        if (vm_res.max_rights.write_combining) return E_INVAL;
+
+        const map_size = std.mem.alignForward(u64, device.access.port_io.port_count, paging.PAGE4K);
+        const range_end = std.math.add(u64, offset, map_size) catch return E_INVAL;
+        if (range_end > vm_res.original_size) return E_INVAL;
+
+        proc.vmm.memVirtualBarMap(
+            device_handle,
+            vm_handle,
+            vm_res.original_start,
+            vm_res.original_size,
+            offset,
+            device,
+            .{
+                .read = vm_res.max_rights.read,
+                .write = vm_res.max_rights.write,
+                .execute = vm_res.max_rights.execute,
+            },
+        ) catch |e| return switch (e) {
+            error.CommittedPages => E_EXIST,
+            else => E_INVAL,
+        };
+
+        return E_OK;
+    }
+
+    // MMIO device path
+    if (device.device_type != .mmio) return E_INVAL;
 
     const range_end = std.math.add(u64, offset, device.access.mmio.size) catch return E_INVAL;
     if (range_end > vm_res.original_size) return E_INVAL;
@@ -75,39 +105,6 @@ pub fn sysMemMmioUnmap(device_handle: u64, vm_handle: u64) i64 {
 
     proc.vmm.memMmioUnmap(device, vm_handle, vm_res.original_start, vm_res.original_size, vm_res.max_rights) catch return E_NOENT;
 
-    return E_OK;
-}
-
-pub fn sysIoportRead(device_handle: u64, port_offset: u64, width: u64) i64 {
-    if (width != 1 and width != 2 and width != 4) return E_INVAL;
-
-    const proc = sched.currentProc();
-    const entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
-    if (entry.object != .device_region) return E_BADCAP;
-    if (!entry.deviceRights().map) return E_PERM;
-
-    const device = entry.object.device_region;
-    if (device.device_type != .port_io) return E_INVAL;
-    if (port_offset + width > device.access.port_io.port_count) return E_INVAL;
-
-    const port: u16 = device.access.port_io.base_port + @as(u16, @truncate(port_offset));
-    return @intCast(arch.ioportIn(port, @truncate(width)));
-}
-
-pub fn sysIoportWrite(device_handle: u64, port_offset: u64, width: u64, value: u64) i64 {
-    if (width != 1 and width != 2 and width != 4) return E_INVAL;
-
-    const proc = sched.currentProc();
-    const entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
-    if (entry.object != .device_region) return E_BADCAP;
-    if (!entry.deviceRights().map) return E_PERM;
-
-    const device = entry.object.device_region;
-    if (device.device_type != .port_io) return E_INVAL;
-    if (port_offset + width > device.access.port_io.port_count) return E_INVAL;
-
-    const port: u16 = device.access.port_io.base_port + @as(u16, @truncate(port_offset));
-    arch.ioportOut(port, @truncate(width), @truncate(value));
     return E_OK;
 }
 

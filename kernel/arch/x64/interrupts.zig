@@ -98,8 +98,8 @@ pub fn updateScratchKernelRsp(core_id: u64, kernel_rsp: u64) void {
 /// Wraps the generic syscall.dispatch and writes results back to ctx.
 export fn syscallDispatch(ctx: *cpu.Context) void {
     const result = zag.syscall.dispatch.dispatch(ctx);
-    ctx.regs.rax = @bitCast(result.rax);
-    ctx.regs.rdx = result.rdx;
+    ctx.regs.rax = @bitCast(result.ret);
+    ctx.regs.rdx = result.ret2;
 }
 
 /// SYSCALL entry point. Builds an iret-compatible cpu.Context frame so

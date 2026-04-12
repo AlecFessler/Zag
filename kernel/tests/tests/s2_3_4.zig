@@ -1,64 +1,78 @@
 const children = @import("embedded_children");
 const lib = @import("lib");
 
-const perm_view = lib.perm_view;
 const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const E_PERM: i64 = -2;
+const PAGE: u64 = 4096;
+const N_PAGES: u64 = 8;
+const SHM_SIZE: u64 = PAGE * N_PAGES;
 
-/// §2.3.4 — Once cleared via `disable_restart`, the restart capability cannot be re-enabled.
-/// be re-enabled.
-///
-/// We check three paths:
-///   1) A second `disable_restart` call returns E_PERM (already cleared).
-///   2) Attempting to create a child with `.restart = true` fails E_PERM
-///      (you cannot grant what you do not have).
-///   3) Receiving a capability transfer from a child (HANDLE_SELF) is NOT a
-///      loophole: ProcessHandleRights carried on that handle never touch the
-///      recipient's slot-0 `ProcessRights`. After the transfer slot 0's
-///      `restart` bit remains clear.
-pub fn main(pv: u64) void {
-    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
+/// §2.3.4 — `mem_shm_map` maps the full SHM region at the specified offset.
+/// are eagerly mapped (no demand-fault delay). We prove this cross-process:
+/// parent maps an 8-page SHM and writes a per-page marker on every page;
+/// immediately after, a child maps the same SHM and writes a second marker on
+/// every page; parent reads them back without delay. If any page were not
+/// eagerly mapped, either writer would demand-fault new zero pages and the
+/// other side would not see the expected value.
+pub fn main(_: u64) void {
+    // Create SHM and map it at offset 0.
+    const shm_rights = perms.SharedMemoryRights{ .read = true, .write = true, .grant = true };
+    const shm_handle: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(SHM_SIZE, shm_rights.bits())));
 
-    // Restart must be set on slot 0 at boot (root service has full
-    // ProcessRights per §2.1.14).
-    const restart_bit: u16 = @truncate((perms.ProcessRights{ .restart = true }).bits());
-    const had_restart = (view[0].rights & restart_bit) != 0;
+    const vm_rights = (perms.VmReservationRights{ .read = true, .write = true, .shareable = true }).bits();
+    const vm = syscall.mem_reserve(0, SHM_SIZE, vm_rights);
+    const vm_h: u64 = @bitCast(vm.val);
+    if (syscall.mem_shm_map(shm_handle, vm_h, 0) != 0) {
+        t.fail("§2.3.4");
+        syscall.shutdown();
+    }
 
-    // Clear it.
-    _ = syscall.disable_restart();
-    const cleared_after_disable = (view[0].rights & restart_bit) == 0;
+    // Parent touches every page with a distinguishing marker.
+    const base = vm.val2;
+    var i: u64 = 0;
+    while (i < N_PAGES) : (i += 1) {
+        const marker_ptr: *volatile u64 = @ptrFromInt(base + i * PAGE + 0);
+        marker_ptr.* = 0xA_0000 + i;
+    }
 
-    // (2) Cannot create a restartable child once restart is cleared.
-    const child_rights = perms.ProcessRights{ .spawn_thread = true, .restart = true };
-    const create_ret = syscall.proc_create(@intFromPtr(children.child_exit.ptr), children.child_exit.len, child_rights.bits());
+    // Sanity: every parent marker readable from the same mapping.
+    i = 0;
+    while (i < N_PAGES) : (i += 1) {
+        const marker_ptr: *volatile u64 = @ptrFromInt(base + i * PAGE + 0);
+        if (marker_ptr.* != 0xA_0000 + i) {
+            t.fail("§2.3.4");
+            syscall.shutdown();
+        }
+    }
 
-    // (1) disable_restart twice → E_PERM.
-    const second_disable = syscall.disable_restart();
-
-    // (3) Cap-transfer path: spawn a plain child and have it send back
-    // HANDLE_SELF with all ProcessHandleRights. The transfer grants us a
-    // ProcessHandleRights handle on the child — nothing about this should
-    // touch our own slot 0.
-    const plain_rights = perms.ProcessRights{ .spawn_thread = true };
-    const plain_child: u64 = @bitCast(@as(i64, syscall.proc_create(
-        @intFromPtr(children.child_send_self.ptr),
-        children.child_send_self.len,
-        plain_rights.bits(),
+    // Spawn child that maps the same SHM and writes its own marker to every
+    // page (at offset +8 within each page), then replies.
+    const child_rights = (perms.ProcessRights{ .spawn_thread = true, .mem_reserve = true, .mem_shm_create = true }).bits();
+    const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
+        @intFromPtr(children.child_shm_touch_all_pages.ptr),
+        children.child_shm_touch_all_pages.len,
+        child_rights,
     )));
+
+    // The child's touch loop writes to offset 0 of every page (overwrites the
+    // parent's marker with its own). After the child replies, parent reads
+    // every page and expects the child's marker to be present on each.
     var reply: syscall.IpcMessage = .{};
-    _ = syscall.ipc_call(plain_child, &.{}, &reply);
+    _ = syscall.ipc_call_cap(child_handle, &.{ shm_handle, shm_rights.bits() }, &reply);
 
-    const still_cleared = (view[0].rights & restart_bit) == 0;
+    var all_ok = true;
+    i = 0;
+    while (i < N_PAGES) : (i += 1) {
+        const marker_ptr: *volatile u64 = @ptrFromInt(base + i * PAGE + 0);
+        if (marker_ptr.* != 0x1000_0000 + i + 1) {
+            all_ok = false;
+            break;
+        }
+    }
 
-    if (had_restart and
-        cleared_after_disable and
-        create_ret == E_PERM and
-        second_disable == E_PERM and
-        still_cleared)
-    {
+    if (all_ok) {
         t.pass("§2.3.4");
     } else {
         t.fail("§2.3.4");

@@ -6,45 +6,51 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.1.20 — Slot 0 (`HANDLE_SELF`) rights are encoded as `ProcessRights`; all other process handle slots use `ProcessHandleRights`.
+/// §2.1.20 — VM reservation entries are cleared on restart.
+/// Uses child_restart_verify which reports whether any VM reservation entries
+/// exist in its perm_view after restart. On restart, vm_res_slot should be 0
+/// because user-created VM reservations are cleared.
 pub fn main(pv: u64) void {
-    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
-    // Slot 0 should be ProcessRights (all bits set for root service).
-    const all_proc_rights: u16 = @bitCast(perms.ProcessRights{
-        .spawn_thread = true,
-        .spawn_process = true,
-        .mem_reserve = true,
-        .set_affinity = true,
-        .restart = true,
-        .mem_shm_create = true,
-        .device_own = true,
-        .fault_handler = true,
-        .pmu = true,
-        .set_time = true,
-        .power = true,
-        .vm_create = true,
-    });
-    const slot0_ok = view[0].handle == 0 and view[0].entry_type == perm_view.ENTRY_TYPE_PROCESS and view[0].rights == all_proc_rights;
+    _ = pv;
 
-    // Spawn a child and check the child handle uses ProcessHandleRights.
-    const child_rights = perms.ProcessRights{ .spawn_thread = true };
-    const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(@intFromPtr(children.child_exit.ptr), children.child_exit.len, child_rights.bits())));
-    const full_handle_rights: u16 = @bitCast(perms.ProcessHandleRights{
-        .send_words = true,
-        .send_shm = true,
-        .send_process = true,
-        .send_device = true,
-        .kill = true,
-        .grant = true,
-    });
-    var child_slot_ok = false;
-    for (0..128) |i| {
-        if (view[i].handle == child_handle and view[i].entry_type == perm_view.ENTRY_TYPE_PROCESS) {
-            child_slot_ok = view[i].rights == full_handle_rights;
-            break;
-        }
+    // Create SHM large enough for child_restart_verify's data layout.
+    // Layout: base[0]=run_counter, base[8+run*16]=shm_count, base[16+run*16]=vm_res_present
+    const shm_rights = perms.SharedMemoryRights{ .read = true, .write = true, .grant = true };
+    const shm_handle: u64 = @bitCast(@as(i64, syscall.shm_create_with_rights(4096, shm_rights.bits())));
+
+    // Map SHM in parent to read results.
+    const vm_rw_s = perms.VmReservationRights{ .read = true, .write = true, .shareable = true };
+    const vm = syscall.mem_reserve(0, 4096, vm_rw_s.bits());
+    const vm_handle: u64 = @bitCast(vm.val);
+    _ = syscall.mem_shm_map(shm_handle, vm_handle, 0);
+
+    const base = vm.val2;
+    const run_counter: *volatile u64 = @ptrFromInt(base);
+
+    // Zero the SHM.
+    const dst: [*]volatile u8 = @ptrFromInt(base);
+    for (0..4096) |i| dst[i] = 0;
+
+    // Spawn restartable child_restart_verify.
+    const child_rights = perms.ProcessRights{ .spawn_thread = true, .mem_reserve = true, .mem_shm_create = true, .restart = true };
+    const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(@intFromPtr(children.child_restart_verify.ptr), children.child_restart_verify.len, child_rights.bits())));
+
+    // Send SHM to child on first boot via IPC.
+    var reply: syscall.IpcMessage = .{};
+    _ = syscall.ipc_call_cap(child_handle, &.{ shm_handle, shm_rights.bits() }, &reply);
+
+    // Wait for child to have run at least twice (first boot + one restart).
+    const no_timeout: u64 = @bitCast(@as(i64, -1));
+    while (run_counter.* < 2) {
+        _ = syscall.futex_wait(@ptrFromInt(base), @intCast(run_counter.*), no_timeout);
     }
-    if (slot0_ok and child_slot_ok) {
+
+    // After restart (run_counter >= 2), check vm_res_slot for run 1 (the restart run).
+    // run 0 = first boot, run 1 = after restart
+    // vm_res_slot for run 1 is at base + 16 + 1*16 = base + 32
+    const vm_res_after_restart: *volatile u64 = @ptrFromInt(base + 16 + 1 * 16);
+
+    if (vm_res_after_restart.* == 0) {
         t.pass("§2.1.20");
     } else {
         t.fail("§2.1.20");

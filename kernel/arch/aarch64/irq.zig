@@ -24,16 +24,16 @@
 
 const zag = @import("zag");
 
+const gic = zag.arch.aarch64.gic;
+
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 
 pub fn maskIrq(irq: u8) void {
-    _ = irq;
-    @panic("aarch64 IRQ masking not implemented");
+    gic.maskIrq(@as(u32, irq) + 32);
 }
 
 pub fn unmaskIrq(irq: u8) void {
-    _ = irq;
-    @panic("aarch64 IRQ unmasking not implemented");
+    gic.unmaskIrq(@as(u32, irq) + 32);
 }
 
 pub fn findIrqForDevice(device: *DeviceRegion) ?u8 {

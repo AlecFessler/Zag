@@ -25,6 +25,12 @@ pub const MmioOp = struct {
     reg: u4, // GPR index (destination for reads, source for register writes)
     value: u32, // Write value (from register or immediate)
     len: u8, // Total instruction length for RIP advancement
+    is_immediate: bool = false, // true for MOV imm (0xC7), false for register-source writes
+};
+
+pub const DecodeError = error{
+    UnsupportedInstruction,
+    IncompleteDecode,
 };
 
 // --- Guest virtual -> physical page table walk ---
@@ -111,22 +117,26 @@ fn fetchInsn(vm: *const Vm, cr0: u64, cr3: u64, rip: u64, buf: *[15]u8) ?u8 {
 
 // --- Instruction decode ---
 
-/// Decode the MMIO instruction at guest RIP.
-/// Returns the decoded operation, or null if the instruction is unrecognized.
-pub fn decode(vm: *const Vm, gs: *const GuestState) ?MmioOp {
-    var insn: [15]u8 = undefined;
-    const fetched = fetchInsn(vm, gs.cr0, gs.cr3, gs.rip, &insn) orelse return null;
-    if (fetched < 2) return null;
+/// Decode MMIO/port I/O instruction from a pre-fetched byte buffer.
+/// Returns the decoded operation or an error if the instruction is
+/// unsupported or the buffer is too short.
+///
+/// For register-source writes (0x89, 0x88), `is_immediate` is false and
+/// `value` is 0 — the caller must read the source register via `reg`.
+pub fn decodeBytes(buf: []const u8) DecodeError!MmioOp {
+    if (buf.len < 2) return DecodeError.IncompleteDecode;
 
     var i: u8 = 0;
     var rex: u8 = 0;
     var has_66: bool = false;
+    var has_rex_w: bool = false;
 
     // Parse legacy + REX prefixes
-    while (i < fetched) {
-        switch (insn[i]) {
+    while (i < buf.len) {
+        switch (buf[i]) {
             0x40...0x4F => {
-                rex = insn[i];
+                rex = buf[i];
+                has_rex_w = (rex & 0x08) != 0;
                 i += 1;
             },
             0x66 => {
@@ -141,12 +151,12 @@ pub fn decode(vm: *const Vm, gs: *const GuestState) ?MmioOp {
         }
     }
 
-    if (i >= fetched) return null;
-    const opcode = insn[i];
+    if (i >= buf.len) return DecodeError.IncompleteDecode;
+    const opcode = buf[i];
     i += 1;
 
-    if (i >= fetched) return null;
-    const modrm = insn[i];
+    if (i >= buf.len) return DecodeError.IncompleteDecode;
+    const modrm = buf[i];
     i += 1;
 
     const mod_field: u2 = @truncate(modrm >> 6);
@@ -157,8 +167,8 @@ pub fn decode(vm: *const Vm, gs: *const GuestState) ?MmioOp {
     // Skip SIB byte if present (mod != 11 and r/m == 100)
     var has_sib_disp32 = false;
     if (mod_field != 0b11 and rm_field == 0b100) {
-        if (i >= fetched) return null;
-        const sib = insn[i];
+        if (i >= buf.len) return DecodeError.IncompleteDecode;
+        const sib = buf[i];
         i += 1; // SIB
         const sib_base: u3 = @truncate(sib & 7);
         if (mod_field == 0b00 and sib_base == 0b101) {
@@ -177,40 +187,50 @@ pub fn decode(vm: *const Vm, gs: *const GuestState) ?MmioOp {
         i += 4; // disp32
     }
 
-    if (i > fetched) return null;
+    if (i > buf.len) return DecodeError.IncompleteDecode;
 
     return switch (opcode) {
-        // MOV r/m32, r32 -- MMIO write from register
-        0x89 => blk: {
-            const size: u8 = if (has_66) 2 else 4;
+        // MOV r/m32, r32 -- write from register
+        0x89 => if (has_rex_w) DecodeError.UnsupportedInstruction else MmioOp{
+            .is_write = true,
+            .size = if (has_66) 2 else 4,
+            .reg = reg_field,
+            .value = 0,
+            .len = i,
+            .is_immediate = false,
+        },
+        // MOV r32, r/m32 -- read to register
+        0x8B => if (has_rex_w) DecodeError.UnsupportedInstruction else MmioOp{
+            .is_write = false,
+            .size = if (has_66) 2 else 4,
+            .reg = reg_field,
+            .value = 0,
+            .len = i,
+        },
+        // MOV r/m8, imm8 -- write byte immediate
+        0xC6 => blk: {
+            if (i + 1 > buf.len) break :blk DecodeError.IncompleteDecode;
+            const imm: u32 = buf[i];
+            i += 1;
             break :blk MmioOp{
                 .is_write = true,
-                .size = size,
-                .reg = reg_field,
-                .value = @truncate(readGpr(gs, reg_field)),
+                .size = 1,
+                .reg = 0,
+                .value = imm,
                 .len = i,
+                .is_immediate = true,
             };
         },
-        // MOV r32, r/m32 -- MMIO read to register
-        0x8B => blk: {
-            const size: u8 = if (has_66) 2 else 4;
-            break :blk MmioOp{
-                .is_write = false,
-                .size = size,
-                .reg = reg_field,
-                .value = 0,
-                .len = i,
-            };
-        },
-        // MOV r/m32, imm32 -- MMIO write immediate
+        // MOV r/m32, imm32 -- write immediate
         0xC7 => blk: {
+            if (has_rex_w) break :blk DecodeError.UnsupportedInstruction;
             const imm_size: u8 = if (has_66) 2 else 4;
-            if (i + imm_size > fetched) break :blk null;
+            if (i + imm_size > buf.len) break :blk DecodeError.IncompleteDecode;
             var imm: u32 = 0;
-            if (imm_size >= 1) imm |= @as(u32, insn[i]);
-            if (imm_size >= 2) imm |= @as(u32, insn[i + 1]) << 8;
-            if (imm_size >= 3) imm |= @as(u32, insn[i + 2]) << 16;
-            if (imm_size >= 4) imm |= @as(u32, insn[i + 3]) << 24;
+            if (imm_size >= 1) imm |= @as(u32, buf[i]);
+            if (imm_size >= 2) imm |= @as(u32, buf[i + 1]) << 8;
+            if (imm_size >= 3) imm |= @as(u32, buf[i + 2]) << 16;
+            if (imm_size >= 4) imm |= @as(u32, buf[i + 3]) << 24;
             i += imm_size;
             break :blk MmioOp{
                 .is_write = true,
@@ -218,17 +238,19 @@ pub fn decode(vm: *const Vm, gs: *const GuestState) ?MmioOp {
                 .reg = 0,
                 .value = imm,
                 .len = i,
+                .is_immediate = true,
             };
         },
-        // MOV r/m8, r8 -- MMIO write byte
+        // MOV r/m8, r8 -- write byte from register
         0x88 => MmioOp{
             .is_write = true,
             .size = 1,
             .reg = reg_field,
-            .value = @truncate(readGpr(gs, reg_field) & 0xFF),
+            .value = 0,
             .len = i,
+            .is_immediate = false,
         },
-        // MOV r8, r/m8 -- MMIO read byte
+        // MOV r8, r/m8 -- read byte to register
         0x8A => MmioOp{
             .is_write = false,
             .size = 1,
@@ -236,8 +258,25 @@ pub fn decode(vm: *const Vm, gs: *const GuestState) ?MmioOp {
             .value = 0,
             .len = i,
         },
-        else => null,
+        else => DecodeError.UnsupportedInstruction,
     };
+}
+
+/// Decode the MMIO instruction at guest RIP.
+/// Returns the decoded operation, or null if the instruction is unrecognized.
+pub fn decode(vm: *const Vm, gs: *const GuestState) ?MmioOp {
+    var insn: [15]u8 = undefined;
+    const fetched = fetchInsn(vm, gs.cr0, gs.cr3, gs.rip, &insn) orelse return null;
+    if (fetched < 2) return null;
+
+    var op = decodeBytes(insn[0..fetched]) catch return null;
+
+    // For register-source writes, fill in the value from guest state
+    if (op.is_write and !op.is_immediate) {
+        op.value = @truncate(readGpr(gs, op.reg));
+    }
+
+    return op;
 }
 
 fn readGpr(gs: *const GuestState, reg: u4) u64 {

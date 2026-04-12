@@ -86,11 +86,16 @@ pub fn build(b: *std.Build) void {
             @panic("Unsupported target architecture");
     };
     const optimize = b.standardOptimizeOption(.{});
+    const cpu_model: std.Target.Query.CpuModel = if (arch == .aarch64)
+        .{ .explicit = &std.Target.aarch64.cpu.cortex_a76 }
+    else
+        .determined_by_arch_os;
     const zag_mod = b.addModule("zag", .{
         .root_source_file = b.path("kernel/zag.zig"),
         .target = b.resolveTargetQuery(.{
             .cpu_arch = arch,
             .os_tag = .freestanding,
+            .cpu_model = cpu_model,
         }),
         .optimize = optimize,
     });
@@ -98,35 +103,44 @@ pub fn build(b: *std.Build) void {
     zag_mod.red_zone = false;
     zag_mod.addImport("zag", zag_mod);
 
-    // ── SMP trampoline (only remaining embedded binary) ─────────────────
+    // ── SMP trampoline (x86-only; aarch64 uses PSCI CPU_ON) ────────────
     const embedded_wf = b.addWriteFiles();
-    const nasm_step = b.addSystemCommand(&.{
-        "nasm",                    "-f", "bin",
-        "kernel/arch/x64/smp.asm", "-o",
-    });
-    const trampoline_output = nasm_step.addOutputFileArg("trampoline.bin");
-    _ = embedded_wf.addCopyFile(trampoline_output, "trampoline.bin");
+    if (arch == .x86_64) {
+        const nasm_step = b.addSystemCommand(&.{
+            "nasm",                    "-f", "bin",
+            "kernel/arch/x64/smp.asm", "-o",
+        });
+        const trampoline_output = nasm_step.addOutputFileArg("trampoline.bin");
+        _ = embedded_wf.addCopyFile(trampoline_output, "trampoline.bin");
+    }
     const embedded_bins_mod = b.createModule(.{
         .root_source_file = embedded_wf.add("embedded_bins.zig",
-            \\pub const trampoline = @embedFile("trampoline.bin");
-            \\
+            if (arch == .x86_64)
+                \\pub const trampoline = @embedFile("trampoline.bin");
+                \\
+            else
+                \\pub const trampoline: []const u8 = &.{};
+                \\
         ),
         .target = b.resolveTargetQuery(.{
             .cpu_arch = arch,
             .os_tag = .freestanding,
+            .cpu_model = cpu_model,
         }),
         .optimize = optimize,
     });
     zag_mod.addImport("embedded_bins", embedded_bins_mod);
 
     // ── Bootloader ──────────────────────────────────────────────────────
+    const loader_name = if (arch == .x86_64) "BOOTX64.EFI" else "BOOTAA64.EFI";
     const loader = b.addExecutable(.{
-        .name = "BOOTX64.EFI",
+        .name = loader_name,
         .root_module = b.createModule(.{
             .root_source_file = b.path("bootloader/main.zig"),
             .target = b.resolveTargetQuery(.{
                 .cpu_arch = arch,
                 .os_tag = .uefi,
+                .cpu_model = cpu_model,
             }),
             .optimize = optimize,
         }),
@@ -154,9 +168,10 @@ pub fn build(b: *std.Build) void {
                 .cpu_arch = arch,
                 .os_tag = .freestanding,
                 .ofmt = .elf,
+                .cpu_model = cpu_model,
             }),
             .optimize = optimize,
-            .code_model = .kernel,
+            .code_model = if (arch == .x86_64) .kernel else .small,
         }),
         .linkage = .static,
     });
@@ -168,7 +183,7 @@ pub fn build(b: *std.Build) void {
     kernel.root_module.omit_frame_pointer = false;
     kernel.root_module.red_zone = false;
     kernel.root_module.addImport("zag", zag_mod);
-    kernel.setLinkerScript(b.path("kernel/linker.ld"));
+    kernel.setLinkerScript(b.path(if (arch == .x86_64) "kernel/linker.ld" else "kernel/linker-aarch64.ld"));
     // Preserve relocation info so the bootloader can apply a random KASLR
     // slide to kernel text/rodata/data at load time. Without --emit-relocs
     // the .rela.* sections are stripped and absolute references bake in
@@ -193,73 +208,92 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&install_root_service.step);
 
     // ── QEMU ────────────────────────────────────────────────────────────
-    const qemu_accel_args: []const u8 = if (kvm)
-        \\-enable-kvm \
-        \\-cpu host,+invtsc
-    else
-        \\-machine accel=tcg \
-        \\-cpu qemu64,+invtsc \
-        \\-d int,cpu_reset \
-        \\-no-shutdown \
-        \\-D qemu.log
-    ;
-    const qemu_machine_args: []const u8 = 
-        \\-machine q35
-    ;
-    const qemu_iommu_args: []const u8 = if (std.mem.eql(u8, iommu_type, "intel"))
-        "-device intel-iommu,intremap=off"
-    else
-        "-device amd-iommu"
-    ;
-    const qemu_usb_args: []const u8 = if (profile_name != null and std.mem.eql(u8, profile_name.?, "desktop"))
-        \\-device qemu-xhci,id=xhci \
-        \\-device usb-kbd,bus=xhci.0 \
-        \\-device usb-mouse,bus=xhci.0
-    else
-        ""
-    ;
-    const qemu_nvme_args: []const u8 = if (profile_name != null and
-        (std.mem.eql(u8, profile_name.?, "desktop") or std.mem.eql(u8, profile_name.?, "hyprvos")))
-        \\-drive file=nvme.img,format=raw,if=none,id=nvme0 \
-        \\-device nvme,drive=nvme0,serial=zagdisk0
-    else
-        ""
-    ;
-    const qemu_net_args: []const u8 = if (std.mem.eql(u8, net_type, "tap"))
-        \\-netdev tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=off \
-        \\-device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
-        \\-netdev tap,id=net1,ifname=tap1,script=no,downscript=no,vhost=off \
-        \\-device e1000e,netdev=net1,mac=52:54:00:12:34:57
-    else if (std.mem.eql(u8, net_type, "passthrough"))
-        \\-net none \
-        \\-device pcie-root-port,id=rp1,slot=1 \
-        \\-device pcie-pci-bridge,id=br1,bus=rp1 \
-        \\-device vfio-pci,host=05:00.0,bus=br1,addr=1.0 \
-        \\-device vfio-pci,host=05:00.1,bus=br1,addr=2.0
-    else if (std.mem.eql(u8, net_type, "user"))
-        \\-netdev user,id=net0 \
-        \\-device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
-        \\-netdev user,id=net1 \
-        \\-device e1000e,netdev=net1,mac=52:54:00:12:34:57
-    else
-        \\-net none
-    ;
-    const qemu_cmdline = b.fmt(
-        \\exec qemu-system-x86_64 \
-        \\ -m 1G \
-        \\ -bios /usr/share/ovmf/x64/OVMF.4m.fd \
-        \\ -drive file=fat:rw:{s}/{s},format=raw \
-        \\ -serial mon:stdio \
-        \\ -display {s} \
-        \\ -no-reboot \
-        \\ {s} \
-        \\ {s} \
-        \\ {s} \
-        \\ {s} \
-        \\ {s} \
-        \\ {s} \
-        \\ -smp cores=4
-    , .{ b.install_path, out_dir, display_type, qemu_accel_args, qemu_machine_args, qemu_iommu_args, qemu_net_args, qemu_usb_args, qemu_nvme_args });
+    const qemu_cmdline = if (arch == .aarch64) blk: {
+        const accel = if (kvm)
+            "-enable-kvm -cpu host"
+        else
+            "-machine accel=tcg -cpu cortex-a72 -d int,cpu_reset -no-shutdown -D qemu.log";
+        break :blk b.fmt(
+            \\exec qemu-system-aarch64 \
+            \\ -M virt,gic-version=3 \
+            \\ -m 1G \
+            \\ -bios /usr/share/AAVMF/AAVMF_CODE.fd \
+            \\ -drive file=fat:rw:{s}/{s},format=raw \
+            \\ -serial mon:stdio \
+            \\ -display {s} \
+            \\ -no-reboot \
+            \\ {s} \
+            \\ -smp cores=4
+        , .{ b.install_path, out_dir, display_type, accel });
+    } else blk: {
+        const qemu_accel_args: []const u8 = if (kvm)
+            \\-enable-kvm \
+            \\-cpu host,+invtsc
+        else
+            \\-machine accel=tcg \
+            \\-cpu qemu64,+invtsc \
+            \\-d int,cpu_reset \
+            \\-no-shutdown \
+            \\-D qemu.log
+        ;
+        const qemu_machine_args: []const u8 =
+            \\-machine q35
+        ;
+        const qemu_iommu_args: []const u8 = if (std.mem.eql(u8, iommu_type, "intel"))
+            "-device intel-iommu,intremap=off"
+        else
+            "-device amd-iommu"
+        ;
+        const qemu_usb_args: []const u8 = if (profile_name != null and std.mem.eql(u8, profile_name.?, "desktop"))
+            \\-device qemu-xhci,id=xhci \
+            \\-device usb-kbd,bus=xhci.0 \
+            \\-device usb-mouse,bus=xhci.0
+        else
+            ""
+        ;
+        const qemu_nvme_args: []const u8 = if (profile_name != null and
+            (std.mem.eql(u8, profile_name.?, "desktop") or std.mem.eql(u8, profile_name.?, "hyprvos")))
+            \\-drive file=nvme.img,format=raw,if=none,id=nvme0 \
+            \\-device nvme,drive=nvme0,serial=zagdisk0
+        else
+            ""
+        ;
+        const qemu_net_args: []const u8 = if (std.mem.eql(u8, net_type, "tap"))
+            \\-netdev tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=off \
+            \\-device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
+            \\-netdev tap,id=net1,ifname=tap1,script=no,downscript=no,vhost=off \
+            \\-device e1000e,netdev=net1,mac=52:54:00:12:34:57
+        else if (std.mem.eql(u8, net_type, "passthrough"))
+            \\-net none \
+            \\-device pcie-root-port,id=rp1,slot=1 \
+            \\-device pcie-pci-bridge,id=br1,bus=rp1 \
+            \\-device vfio-pci,host=05:00.0,bus=br1,addr=1.0 \
+            \\-device vfio-pci,host=05:00.1,bus=br1,addr=2.0
+        else if (std.mem.eql(u8, net_type, "user"))
+            \\-netdev user,id=net0 \
+            \\-device e1000e,netdev=net0,mac=52:54:00:12:34:56 \
+            \\-netdev user,id=net1 \
+            \\-device e1000e,netdev=net1,mac=52:54:00:12:34:57
+        else
+            \\-net none
+        ;
+        break :blk b.fmt(
+            \\exec qemu-system-x86_64 \
+            \\ -m 1G \
+            \\ -bios /usr/share/ovmf/x64/OVMF.4m.fd \
+            \\ -drive file=fat:rw:{s}/{s},format=raw \
+            \\ -serial mon:stdio \
+            \\ -display {s} \
+            \\ -no-reboot \
+            \\ {s} \
+            \\ {s} \
+            \\ {s} \
+            \\ {s} \
+            \\ {s} \
+            \\ {s} \
+            \\ -smp cores=4
+        , .{ b.install_path, out_dir, display_type, qemu_accel_args, qemu_machine_args, qemu_iommu_args, qemu_net_args, qemu_usb_args, qemu_nvme_args });
+    };
     // Create NVMe disk image if it doesn't exist
     const create_nvme_img = b.addSystemCommand(&[_][]const u8{
         "sh", "-c", "test -f nvme.img || dd if=/dev/zero of=nvme.img bs=1M count=64 2>/dev/null",

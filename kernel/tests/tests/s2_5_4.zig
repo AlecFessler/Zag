@@ -1,24 +1,24 @@
 const lib = @import("lib");
 
+const perm_view = lib.perm_view;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const E_TIMEOUT: i64 = -8;
+/// §2.5.4 — At boot, the kernel inserts all device handles into the root service's permissions table.
+/// The test rig (QEMU q35) registers a known set of devices; verify every expected
+/// device actually appears in the root service's user view.
+pub fn main(pv: u64) void {
+    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-/// §2.5.4 — `futex_wait` with a finite timeout blocks for at least `timeout_ns` nanoseconds; actual expiry may be delayed until the next scheduler tick.
-pub fn main(perm_view: u64) void {
-    _ = perm_view;
-    var val: u64 align(8) = 0;
-    const timeout_ns: u64 = 10_000_000; // 10ms
-    const before = syscall.clock_gettime();
-    const ret = syscall.futex_wait(@ptrCast(&val), 0, timeout_ns);
-    const after = syscall.clock_gettime();
-    const elapsed: u64 = @bitCast(after - before);
-    // Should return E_TIMEOUT, and elapsed should be >= timeout_ns.
-    if (ret == E_TIMEOUT and elapsed >= timeout_ns) {
-        t.pass("§2.5.4");
-    } else {
-        t.fail("§2.5.4");
-    }
+    // All four expected devices must be present. requireDevice aborts if any
+    // are missing.
+    _ = t.requireDevice(view, "§2.5.4 ahci_mmio", t.AHCI_VENDOR, t.AHCI_DEVICE, 0);
+    _ = t.requireDevice(view, "§2.5.4 ahci_pio", t.AHCI_VENDOR, t.AHCI_DEVICE, 1);
+    _ = t.requireDevice(view, "§2.5.4 bochs_mmio", t.BOCHS_VENDOR, t.BOCHS_DEVICE, 0);
+
+    // Also check at least one PIO device is exposed (SMBus 0x8086/0x2930).
+    _ = t.requireDevice(view, "§2.5.4 smbus_pio", 0x8086, 0x2930, 1);
+
+    t.pass("§2.5.4");
     syscall.shutdown();
 }

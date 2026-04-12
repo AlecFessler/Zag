@@ -275,26 +275,26 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
     const meta = parseIpcMetadata(arch.getIpcMetadata(ctx));
 
     // Look up target process
-    const target_entry = proc.getPermByHandle(target_handle) orelse return .{ .rax = E_BADCAP };
-    if (target_entry.object != .process) return .{ .rax = E_BADCAP };
+    const target_entry = proc.getPermByHandle(target_handle) orelse return .{ .ret = E_BADCAP };
+    if (target_entry.object != .process) return .{ .ret = E_BADCAP };
     const target_proc = target_entry.object.process;
 
     // §2.6.30: lazily convert dead process entries on IPC attempt.
     if (!target_proc.alive) {
         proc.convertToDeadProcess(target_proc);
-        return .{ .rax = E_BADCAP };
+        return .{ .ret = E_BADCAP };
     }
 
     // Validate rights
     const rights_check = validateIpcSendRights(target_entry, meta, proc, ctx);
-    if (rights_check != E_OK) return .{ .rax = rights_check };
+    if (rights_check != E_OK) return .{ .ret = rights_check };
 
     target_proc.msg_box.lock.lock();
 
     if (!target_proc.msg_box.isReceiving()) {
         // No receiver waiting
         target_proc.msg_box.lock.unlock();
-        return .{ .rax = E_AGAIN };
+        return .{ .ret = E_AGAIN };
     }
 
     // Receiver is waiting — deliver directly
@@ -320,7 +320,7 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
             arch.restoreIpcPayload(receiver.ctx, saved_payload);
             target_proc.msg_box.beginReceivingLocked(receiver);
             target_proc.msg_box.lock.unlock();
-            return .{ .rax = cap_result };
+            return .{ .ret = cap_result };
         }
     }
 
@@ -329,7 +329,7 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
     target_proc.msg_box.lock.unlock();
 
     wakeThread(receiver);
-    return .{ .rax = E_OK };
+    return .{ .ret = E_OK };
 }
 
 pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
@@ -338,18 +338,18 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
     const target_handle = arch.getIpcHandle(ctx);
     const meta = parseIpcMetadata(arch.getIpcMetadata(ctx));
 
-    const target_entry = proc.getPermByHandle(target_handle) orelse return .{ .rax = E_BADCAP };
-    if (target_entry.object != .process) return .{ .rax = E_BADCAP };
+    const target_entry = proc.getPermByHandle(target_handle) orelse return .{ .ret = E_BADCAP };
+    if (target_entry.object != .process) return .{ .ret = E_BADCAP };
     const target_proc = target_entry.object.process;
 
     // §2.6.30: lazily convert dead process entries on IPC attempt.
     if (!target_proc.alive) {
         proc.convertToDeadProcess(target_proc);
-        return .{ .rax = E_BADCAP };
+        return .{ .ret = E_BADCAP };
     }
 
     const rights_check = validateIpcSendRights(target_entry, meta, proc, ctx);
-    if (rights_check != E_OK) return .{ .rax = rights_check };
+    if (rights_check != E_OK) return .{ .ret = rights_check };
 
     target_proc.msg_box.lock.lock();
 
@@ -373,7 +373,7 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
                 arch.restoreIpcPayload(receiver.ctx, saved_payload);
                 target_proc.msg_box.beginReceivingLocked(receiver);
                 target_proc.msg_box.lock.unlock();
-                return .{ .rax = cap_result };
+                return .{ .ret = cap_result };
             }
         }
 
@@ -416,19 +416,19 @@ pub fn sysIpcRecv(ctx: *ArchCpuContext) SyscallResult {
     // Must reply before receiving again.
     if (proc.msg_box.isPendingReply()) {
         proc.msg_box.lock.unlock();
-        return .{ .rax = E_BUSY };
+        return .{ .ret = E_BUSY };
     }
 
     // Check if another thread is already receiving.
     if (proc.msg_box.isReceiving()) {
         proc.msg_box.lock.unlock();
-        return .{ .rax = E_BUSY };
+        return .{ .ret = E_BUSY };
     }
 
     const waiter = proc.msg_box.dequeueLocked() orelse {
         if (!blocking) {
             proc.msg_box.lock.unlock();
-            return .{ .rax = E_AGAIN };
+            return .{ .ret = E_AGAIN };
         }
         // Block on recv.
         proc.msg_box.beginReceivingLocked(thread);
@@ -439,7 +439,7 @@ pub fn sysIpcRecv(ctx: *ArchCpuContext) SyscallResult {
         thread.on_cpu.store(false, .release);
         sched.switchToNextReady();
         // Never reached — sender delivers message and wakes us via switchTo.
-        return .{ .rax = E_OK };
+        return .{ .ret = E_OK };
     };
 
     // Copy payload from waiter's saved context.
@@ -457,14 +457,14 @@ pub fn sysIpcRecv(ctx: *ArchCpuContext) SyscallResult {
             // Put waiter back at head of the queue.
             proc.msg_box.enqueueFrontLocked(waiter);
             proc.msg_box.lock.unlock();
-            return .{ .rax = cap_result };
+            return .{ .ret = cap_result };
         }
     }
 
     proc.msg_box.beginPendingReplyLocked(waiter);
     proc.msg_box.lock.unlock();
 
-    return .{ .rax = E_OK };
+    return .{ .ret = E_OK };
 }
 
 pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
@@ -480,14 +480,14 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
     // handle+rights in the last two words). Reject early before touching
     // msg_box state.
     if (reply_cap_transfer and reply_word_count < 2) {
-        return .{ .rax = E_INVAL };
+        return .{ .ret = E_INVAL };
     }
 
     proc.msg_box.lock.lock();
 
     if (!proc.msg_box.isPendingReply()) {
         proc.msg_box.lock.unlock();
-        return .{ .rax = E_INVAL };
+        return .{ .ret = E_INVAL };
     }
 
     const caller_thread: ?*Thread = proc.msg_box.endPendingReplyLocked();
@@ -528,7 +528,7 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
                     proc.msg_box.enqueueFrontLocked(waiter);
                     proc.msg_box.lock.unlock();
                     if (caller_thread) |ct| wakeThread(ct);
-                    return .{ .rax = cap_result };
+                    return .{ .ret = cap_result };
                 }
             }
 
@@ -540,7 +540,7 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
             proc.msg_box.lock.unlock();
 
             if (caller_thread) |ct| wakeThread(ct);
-            return .{ .rax = if (reply_cap_err != E_OK) reply_cap_err else E_OK };
+            return .{ .ret = if (reply_cap_err != E_OK) reply_cap_err else E_OK };
         } else if (recv_blocking) {
             proc.msg_box.beginReceivingLocked(thread);
             proc.msg_box.lock.unlock();
@@ -559,12 +559,12 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
             if (caller_thread) |ct| wakeThread(ct);
             const recv_err = if (reply_cap_err != E_OK) reply_cap_err else E_AGAIN;
             arch.setSyscallReturn(ctx, @bitCast(recv_err));
-            return .{ .rax = recv_err };
+            return .{ .ret = recv_err };
         }
     } else {
         proc.msg_box.lock.unlock();
 
-        if (caller_thread == null) return .{ .rax = reply_cap_err };
+        if (caller_thread == null) return .{ .ret = reply_cap_err };
 
         const ct = caller_thread.?;
         thread.state = .ready;
@@ -573,7 +573,7 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
         if (result != 0) {
             thread.state = .running;
             wakeThread(ct);
-            return .{ .rax = reply_cap_err };
+            return .{ .ret = reply_cap_err };
         }
         unreachable;
     }

@@ -24,17 +24,17 @@ const E_PERM = errors.E_PERM;
 const SyscallResult = zag.syscall.dispatch.SyscallResult;
 
 pub fn sysMemReserve(hint: u64, size: u64, max_perms_bits: u64) SyscallResult {
-    if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) return .{ .rax = E_INVAL };
+    if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) return .{ .ret = E_INVAL };
 
     const max_rights: VmReservationRights = @bitCast(@as(u8, @truncate(max_perms_bits)));
-    if (max_rights.shareable and max_rights.mmio) return .{ .rax = E_INVAL };
-    if (max_rights.write_combining and !max_rights.mmio) return .{ .rax = E_INVAL };
+    if (max_rights.shareable and max_rights.mmio) return .{ .ret = E_INVAL };
+    if (max_rights.write_combining and !max_rights.mmio) return .{ .ret = E_INVAL };
 
     const proc = sched.currentProc();
-    const self_entry = proc.getPermByHandle(0) orelse return .{ .rax = E_PERM };
-    if (!self_entry.processRights().mem_reserve) return .{ .rax = E_PERM };
+    const self_entry = proc.getPermByHandle(0) orelse return .{ .ret = E_PERM };
+    if (!self_entry.processRights().mem_reserve) return .{ .ret = E_PERM };
 
-    const result = proc.vmm.reserve(VAddr.fromInt(hint), size, max_rights) catch return .{ .rax = E_NOMEM };
+    const result = proc.vmm.reserve(VAddr.fromInt(hint), size, max_rights) catch return .{ .ret = E_NOMEM };
 
     const entry = PermissionEntry{
         .handle = 0,
@@ -45,10 +45,10 @@ pub fn sysMemReserve(hint: u64, size: u64, max_perms_bits: u64) SyscallResult {
         } },
         .rights = @truncate(max_perms_bits),
     };
-    const handle_id = proc.insertPerm(entry) catch return .{ .rax = E_MAXCAP };
+    const handle_id = proc.insertPerm(entry) catch return .{ .ret = E_MAXCAP };
     result.node.handle = handle_id;
 
-    return .{ .rax = @intCast(handle_id), .rdx = result.vaddr.addr };
+    return .{ .ret = @intCast(handle_id), .ret2 = result.vaddr.addr };
 }
 
 pub fn sysMemPerms(vm_handle: u64, offset: u64, size: u64, perms_bits: u64) i64 {

@@ -6,63 +6,52 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.1.17 — The kernel updates the user view on every permissions table mutation (insert, remove, type change).
+/// §2.1.17 — Restart is triggered when a process with a restart context terminates by parent-initiated kill.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
-    // Insert: create a VM reservation and check it appears.
-    const rw = perms.VmReservationRights{ .read = true, .write = true };
-    const result = syscall.mem_reserve(0, 4096, rw.bits());
-    const handle: u64 = @bitCast(result.val);
-    var found_after_insert = false;
-    for (0..128) |i| {
-        if (view[i].handle == handle and view[i].entry_type == perm_view.ENTRY_TYPE_VM_RESERVATION) {
-            found_after_insert = true;
-            break;
-        }
-    }
-    // Remove: revoke and check it disappears.
-    _ = syscall.revoke_perm(handle);
-    var found_after_remove = false;
-    for (0..128) |i| {
-        if (view[i].handle == handle) {
-            found_after_remove = true;
-            break;
-        }
-    }
 
-    // Type change: spawn a non-restartable child and let it exit. The kernel
-    // converts the `process` entry to `dead_process` in place — a type-change
-    // mutation that must also sync the user view.
-    const child_rights = perms.ProcessRights{ .spawn_thread = true };
-    const child_handle: u64 = @bitCast(@as(i64, syscall.proc_create(
-        @intFromPtr(children.child_exit.ptr),
-        children.child_exit.len,
-        child_rights.bits(),
+    // Spawn restartable child_send_self.
+    const child_rights = (perms.ProcessRights{ .spawn_thread = true, .restart = true }).bits();
+    const h_parent: u64 = @bitCast(@as(i64, syscall.proc_create(
+        @intFromPtr(children.child_send_self.ptr),
+        children.child_send_self.len,
+        child_rights,
     )));
-    var child_slot: usize = 128;
+
+    // Call child — it replies with HANDLE_SELF via cap transfer.
+    // Now we have h_parent (from proc_create) and a second handle (from cap transfer).
+    var reply: syscall.IpcMessage = .{};
+    _ = syscall.ipc_call(h_parent, &.{}, &reply);
+
+    // Find the cap-transferred handle (different from h_parent, process type).
+    var h_child: u64 = 0;
+    var h_child_slot: usize = 0;
     for (0..128) |i| {
-        if (view[i].handle == child_handle and view[i].entry_type == perm_view.ENTRY_TYPE_PROCESS) {
-            child_slot = i;
+        if (view[i].handle != 0 and view[i].handle != h_parent and view[i].entry_type == perm_view.ENTRY_TYPE_PROCESS) {
+            h_child = view[i].handle;
+            h_child_slot = i;
             break;
         }
     }
-    if (child_slot == 128) {
-        t.fail("§2.1.17 child process entry not found after insert");
+    if (h_child == 0) {
+        t.fail("§2.1.17");
         syscall.shutdown();
     }
-    var iters: u32 = 0;
-    var saw_type_change = false;
-    while (iters < 100000) : (iters += 1) {
-        if (view[child_slot].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS and
-            view[child_slot].handle == child_handle)
-        {
-            saw_type_change = true;
-            break;
-        }
+
+    const rc_before = view[h_child_slot].processRestartCount();
+
+    // Kill child via revoke of parent handle.
+    // Child is restartable, so kill() triggers performRestart.
+    _ = syscall.revoke_perm(h_parent);
+
+    // Wait for restart_count to increment.
+    var attempts: u32 = 0;
+    while (attempts < 100000) : (attempts += 1) {
+        if (view[h_child_slot].processRestartCount() > rc_before) break;
         syscall.thread_yield();
     }
 
-    if (found_after_insert and !found_after_remove and saw_type_change) {
+    if (view[h_child_slot].processRestartCount() > rc_before) {
         t.pass("§2.1.17");
     } else {
         t.fail("§2.1.17");

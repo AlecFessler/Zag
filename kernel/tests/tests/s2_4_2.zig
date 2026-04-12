@@ -1,49 +1,82 @@
 const lib = @import("lib");
 
 const perm_view = lib.perm_view;
-const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-fn worker() void {
-    // Stay alive long enough for the parent to inspect perm view.
-    for (0..20) |_| syscall.thread_yield();
-    syscall.thread_exit();
+const MAX_TIMEOUT: u64 = @bitCast(@as(i64, -1));
+
+var helper_counter: u64 align(8) = 0;
+var helper_release: u64 align(8) = 0;
+
+fn helper() void {
+    while (@atomicLoad(u64, &helper_release, .acquire) == 0) {
+        _ = syscall.futex_wait(@ptrCast(&helper_release), 0, MAX_TIMEOUT);
+    }
+    _ = syscall.set_affinity(0x2);
+    while (true) {
+        _ = @atomicRmw(u64, &helper_counter, .Add, 1, .release);
+        syscall.thread_yield();
+    }
 }
 
-/// §2.4.2 — `thread_create` inserts a thread handle into the calling process's permissions table with full `ThreadHandleRights` and returns the handle ID (positive u64) on success
+/// §2.4.2 — Core pin is created via `set_priority(.pinned)` and revoked via `revoke_perm` or `set_priority` with a non-pinned level.
+/// After revoke, a second thread pinned to the same core can be scheduled.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    const ret = syscall.thread_create(&worker, 0, 4);
-    if (ret <= 0) {
-        t.failWithVal("§2.4.2 thread_create", 1, ret);
+    // Spawn helper before pinning so its initial placement is not core 1.
+    const h_ret = syscall.thread_create(&helper, 0, 4);
+    if (h_ret < 0) {
+        t.fail("§2.4.2 thread_create failed");
         syscall.shutdown();
     }
-    const thread_handle: u64 = @bitCast(ret);
 
-    // Scan perm view for the returned handle.
-    var found = false;
-    var correct_type = false;
-    var correct_rights = false;
+    _ = syscall.set_affinity(0x2);
+    syscall.thread_yield();
+
+    const ret = syscall.set_priority(syscall.PRIORITY_PINNED);
+    if (ret < 0) {
+        t.fail("§2.4.2 set_priority(PINNED) failed");
+        syscall.shutdown();
+    }
+    const pin_handle: u64 = @bitCast(ret);
+
+    // Revoke the core pin.
+    const revoke_ret = syscall.revoke_perm(pin_handle);
+    if (revoke_ret != 0) {
+        t.fail("§2.4.2 revoke failed");
+        syscall.shutdown();
+    }
+
+    // Verify the slot is cleared.
+    var still_exists = false;
     for (0..128) |i| {
-        if (view[i].handle == thread_handle) {
-            found = true;
-            correct_type = view[i].entry_type == perm_view.ENTRY_TYPE_THREAD;
-            const expected_rights: u16 = @as(u16, @as(u8, @bitCast(perms.ThreadHandleRights.full)));
-            correct_rights = view[i].rights == expected_rights;
+        if (view[i].handle == pin_handle and view[i].entry_type == perm_view.ENTRY_TYPE_CORE_PIN) {
+            still_exists = true;
             break;
         }
     }
-
-    if (found and correct_type and correct_rights) {
-        t.pass("§2.4.2");
-    } else if (!found) {
-        t.fail("§2.4.2 handle not found in perm view");
-    } else if (!correct_type) {
-        t.fail("§2.4.2 wrong entry type");
-    } else {
-        t.fail("§2.4.2 wrong rights");
+    if (still_exists) {
+        t.fail("§2.4.2 pin entry persisted after revoke");
+        syscall.shutdown();
     }
+
+    // Release the helper. It will set affinity to core 1 and must now run,
+    // proving core 1 is schedulable again after revoke.
+    @atomicStore(u64, &helper_release, 1, .release);
+    _ = syscall.futex_wake(@ptrCast(&helper_release), 1);
+
+    var attempts: u32 = 0;
+    while (attempts < 1000000) : (attempts += 1) {
+        if (@atomicLoad(u64, &helper_counter, .acquire) > 0) break;
+        syscall.thread_yield();
+    }
+    if (@atomicLoad(u64, &helper_counter, .acquire) == 0) {
+        t.fail("§2.4.2 second thread could not run on unpinned core");
+        syscall.shutdown();
+    }
+
+    t.pass("§2.4.2");
     syscall.shutdown();
 }
