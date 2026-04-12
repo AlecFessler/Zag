@@ -14,7 +14,7 @@ pub fn main(perm_view: u64) void {
     const result = syscall.mem_reserve(0, 4096, rw.bits());
     const misaligned_addr = result.val2 + 1;
     // Call futex_wait with raw misaligned address.
-    const ret = asm volatile ("int $0x80"
+    const ret = asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(syscall.SyscallNum.futex_wait)),
           [a0] "{rdi}" (misaligned_addr),

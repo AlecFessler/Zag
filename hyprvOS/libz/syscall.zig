@@ -74,14 +74,14 @@ pub const SyscallNum = enum(u64) {
 
 // Raw syscall wrappers
 fn syscall0(num: SyscallNum) i64 {
-    return asm volatile ("int $0x80"
+    return asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(num)),
         : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
 }
 
 fn syscall1(num: SyscallNum, a0: u64) i64 {
-    return asm volatile ("int $0x80"
+    return asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(num)),
           [a0] "{rdi}" (a0),
@@ -89,7 +89,7 @@ fn syscall1(num: SyscallNum, a0: u64) i64 {
 }
 
 fn syscall2(num: SyscallNum, a0: u64, a1: u64) i64 {
-    return asm volatile ("int $0x80"
+    return asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(num)),
           [a0] "{rdi}" (a0),
@@ -99,7 +99,7 @@ fn syscall2(num: SyscallNum, a0: u64, a1: u64) i64 {
 
 fn syscall3(num: SyscallNum, a0: u64, a1: u64, a2: u64) i64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(num)),
           [a0] "{rdi}" (a0),
@@ -110,7 +110,7 @@ fn syscall3(num: SyscallNum, a0: u64, a1: u64, a2: u64) i64 {
 
 fn syscall4(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64) i64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(num)),
           [a0] "{rdi}" (a0),
@@ -122,7 +122,7 @@ fn syscall4(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64) i64 {
 
 fn syscall3_2(num: SyscallNum, a0: u64, a1: u64, a2: u64) SyscallResult2 {
     var val2: u64 = undefined;
-    const val = asm volatile ("int $0x80"
+    const val = asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
           [out2] "={rdx}" (val2),
         : [num] "{rax}" (@intFromEnum(num)),

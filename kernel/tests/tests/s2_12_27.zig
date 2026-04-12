@@ -11,7 +11,7 @@ const FAULT_EXCLUDE_NEXT: u64 = 0x1;
 
 /// Raw fault_reply syscall that passes flags in r14.
 fn fault_reply_with_flags(token: u64, action: u64, modified_regs_ptr: u64, flags: u64) i64 {
-    return asm volatile ("int $0x80"
+    return asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(syscall.SyscallNum.fault_reply)),
           [a0] "{rdi}" (token),

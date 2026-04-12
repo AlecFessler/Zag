@@ -29,7 +29,6 @@ pub const PageFaultContext = struct {
 };
 
 pub const IntVecs = enum(u8) {
-    syscall = 0x80,
     pmu = 0xFB,
     tlb_shootdown = 0xFD,
     sched = 0xFE,
@@ -72,6 +71,168 @@ const PUSHES_ERR = blk: {
 };
 
 var vector_table: [256]VectorEntry = .{VectorEntry{}} ** 256;
+
+/// Per-CPU scratch space for SYSCALL entry. SWAPGS gives us access to
+/// this via the GS segment base. Layout: [0]=kernel_rsp, [8]=user_rsp.
+pub const SyscallScratch = extern struct {
+    kernel_rsp: u64,
+    user_rsp: u64,
+};
+
+pub var per_cpu_scratch: [64]SyscallScratch = [_]SyscallScratch{.{ .kernel_rsp = 0, .user_rsp = 0 }} ** 64;
+
+/// Set KernelGsBase MSR for this core so SWAPGS can access per-CPU scratch.
+/// Must be called on each core during init, after APIC is available.
+pub fn initSyscallScratch(core_id: u64) void {
+    const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
+    cpu.wrmsr(IA32_KERNEL_GS_BASE, @intFromPtr(&per_cpu_scratch[core_id]));
+}
+
+/// Update per-CPU scratch kernel_rsp. Called from switchTo on every
+/// context switch, mirroring the TSS.RSP0 update.
+pub fn updateScratchKernelRsp(core_id: u64, kernel_rsp: u64) void {
+    per_cpu_scratch[core_id].kernel_rsp = kernel_rsp;
+}
+
+/// Syscall dispatch — exported so the SYSCALL asm entry can call it.
+/// Wraps the generic syscall.dispatch and writes results back to ctx.
+export fn syscallDispatch(ctx: *cpu.Context) void {
+    const result = zag.syscall.dispatch(ctx);
+    ctx.regs.rax = @bitCast(result.rax);
+    ctx.regs.rdx = result.rdx;
+}
+
+/// SYSCALL entry point. Builds an iret-compatible cpu.Context frame so
+/// the existing dispatch and context-switch paths work unchanged.
+///
+/// On entry (Intel SDM Vol 2B, "SYSCALL—Fast System Call"):
+///   RCX = user RIP, R11 = user RFLAGS, RSP = user stack (unchanged).
+///   CS/SS loaded from IA32_STAR[47:32]. RFLAGS masked by IA32_FMASK.
+///
+/// SWAPGS (Intel SDM Vol 3A §5.8.8) swaps GS.base ↔ IA32_KERNEL_GS_BASE.
+/// KernelGsBase points to per-CPU SyscallScratch: [0]=kernel_rsp, [8]=scratch.
+///
+/// On exit (Intel SDM Vol 2B, "SYSRET—Return From Fast System Call"):
+///   RIP=RCX, RFLAGS=R11&3C7FD7H|2, CS=STAR[63:48]+16|3, SS=STAR[63:48]+8|3.
+///   Non-canonical RCX → #GP at CPL3 on kernel stack; checked before SYSRET.
+pub export fn syscallEntry() callconv(.naked) void {
+    // cpu.Context layout (low addr → high addr, each field 8 bytes):
+    //   [RSP+0]   r15          ─┐
+    //   [RSP+8]   r14           │
+    //   [RSP+16]  r13           │
+    //   [RSP+24]  r12           │
+    //   [RSP+32]  r11           │ Registers (15 GPRs = 120 bytes)
+    //   [RSP+40]  r10           │
+    //   [RSP+48]  r9            │
+    //   [RSP+56]  r8            │
+    //   [RSP+64]  rdi           │
+    //   [RSP+72]  rsi           │
+    //   [RSP+80]  rbp           │
+    //   [RSP+88]  rbx           │
+    //   [RSP+96]  rdx           │
+    //   [RSP+104] rcx           │
+    //   [RSP+112] rax          ─┘
+    //   [RSP+120] int_num       ─┐ stub fields (16 bytes)
+    //   [RSP+128] err_code      ─┘
+    //   [RSP+136] rip           ─┐
+    //   [RSP+144] cs             │ iret frame (40 bytes)
+    //   [RSP+152] rflags         │
+    //   [RSP+160] rsp            │
+    //   [RSP+168] ss            ─┘
+    asm volatile (
+        // ── Stack switch via SWAPGS (Intel SDM Vol 3A §5.8.8) ────────
+        \\swapgs                       // GS.base → per-CPU SyscallScratch
+        \\movq %%rsp, %%gs:8          // scratch.user_rsp = user RSP
+        \\movq %%gs:0, %%rsp          // RSP = kernel stack top
+
+        // Allocate the full Context frame (176 bytes).
+        \\subq $176, %%rsp
+
+        // Save user RBP to its slot FIRST, so we can use RBP as scratch.
+        \\movq %%rbp, 80(%%rsp)       // ctx.regs.rbp = user RBP
+
+        // Ferry user RSP from gs:scratch into the frame via RBP.
+        \\movq %%gs:8, %%rbp          // RBP = user RSP (from scratch)
+        \\movq %%rbp, 160(%%rsp)      // ctx.rsp = user RSP
+
+        // Done with per-CPU data. Restore user GS base so kernel code
+        // that context-switches (IRETQ path) leaves GS in the right state.
+        \\swapgs                       // GS.base restored to user value
+
+        // ── Write iret frame + stub fields ───────────────────────────
+        \\movq $0x1b, 168(%%rsp)      // ctx.ss  = USER_DATA(0x18) | RPL3
+        \\movq %%r11, 152(%%rsp)      // ctx.rflags = R11 (SYSCALL saved)
+        \\movq $0x23, 144(%%rsp)      // ctx.cs  = USER_CODE(0x20) | RPL3
+        \\movq %%rcx, 136(%%rsp)      // ctx.rip = RCX (SYSCALL saved)
+        \\movq $0, 128(%%rsp)         // ctx.err_code = 0
+        \\movq $0x80, 120(%%rsp)      // ctx.int_num  = 0x80
+
+        // ── Write remaining 14 GPRs (RBP already saved above) ───────
+        \\movq %%rax, 112(%%rsp)      // ctx.regs.rax
+        \\movq %%rcx, 104(%%rsp)      // ctx.regs.rcx
+        \\movq %%rdx, 96(%%rsp)       // ctx.regs.rdx
+        \\movq %%rbx, 88(%%rsp)       // ctx.regs.rbx
+        // rbp already at 80(%%rsp)
+        \\movq %%rsi, 72(%%rsp)       // ctx.regs.rsi
+        \\movq %%rdi, 64(%%rsp)       // ctx.regs.rdi
+        \\movq %%r8,  56(%%rsp)       // ctx.regs.r8
+        \\movq %%r9,  48(%%rsp)       // ctx.regs.r9
+        \\movq %%r10, 40(%%rsp)       // ctx.regs.r10
+        \\movq %%r11, 32(%%rsp)       // ctx.regs.r11
+        \\movq %%r12, 24(%%rsp)       // ctx.regs.r12
+        \\movq %%r13, 16(%%rsp)       // ctx.regs.r13
+        \\movq %%r14, 8(%%rsp)        // ctx.regs.r14
+        \\movq %%r15, 0(%%rsp)        // ctx.regs.r15
+
+        // ── FXSAVE (Intel SDM Vol 1 §10.5) ──────────────────────────
+        \\subq $512, %%rsp
+        \\fxsave (%%rsp)
+
+        // ── Dispatch ─────────────────────────────────────────────────
+        \\lea 512(%%rsp), %%rdi       // RDI = &Context
+        \\call syscallDispatch
+
+        // ── Restore FPU + GPRs ───────────────────────────────────────
+        \\fxrstor (%%rsp)
+        \\addq $512, %%rsp
+        \\movq 0(%%rsp), %%r15
+        \\movq 8(%%rsp), %%r14
+        \\movq 16(%%rsp), %%r13
+        \\movq 24(%%rsp), %%r12
+        // Skip r11 (32) and r10-rdi — restored below from iret frame or kept.
+        \\movq 40(%%rsp), %%r10
+        \\movq 48(%%rsp), %%r9
+        \\movq 56(%%rsp), %%r8
+        \\movq 64(%%rsp), %%rdi
+        \\movq 72(%%rsp), %%rsi
+        \\movq 80(%%rsp), %%rbp
+        \\movq 88(%%rsp), %%rbx
+        \\movq 96(%%rsp), %%rdx
+        // Skip rcx (104) — will be loaded from ctx.rip for SYSRET.
+        \\movq 112(%%rsp), %%rax
+
+        // ── SYSRET exit (Intel SDM Vol 2B, "SYSRET") ────────────────
+        // Canonical check BEFORE loading RCX. Non-canonical RCX causes
+        // #GP(0) at CPL3 on kernel stack (Intel SDM Vol 2B, SYSRET #GP).
+        \\testb $0x80, 141(%%rsp)     // bit 47 of ctx.rip = byte 5, bit 7
+        \\jnz .Lsysret_iret_fallback
+
+        // Fast path: load SYSRET registers from the iret frame.
+        \\movq 136(%%rsp), %%rcx      // RCX = user RIP
+        \\movq 152(%%rsp), %%r11      // R11 = user RFLAGS
+        \\movq 160(%%rsp), %%rsp      // RSP = user RSP (last — clobbers frame)
+        \\sysretq
+
+    \\.Lsysret_iret_fallback:
+        // Non-canonical RIP. Restore R11 and use IRETQ via interruptStubEpilogue.
+        // Advance RSP past GPRs to the int_num slot so the epilogue layout matches.
+        \\movq 32(%%rsp), %%r11
+        \\movq 104(%%rsp), %%rcx
+        \\addq $120, %%rsp             // RSP now at int_num
+        \\addq $16, %%rsp              // skip int_num + err_code → iret frame
+        \\iretq
+    );
+}
 
 pub fn prepareThreadContext(
     kstack_top: VAddr,
@@ -125,7 +286,10 @@ pub fn prepareThreadContext(
 }
 
 pub fn switchTo(thread: *Thread) void {
-    gdt.coreTss(apic.coreID()).rsp0 = thread.kernel_stack.top.addr;
+    const core_id = apic.coreID();
+    const kstack = thread.kernel_stack.top.addr;
+    gdt.coreTss(core_id).rsp0 = kstack;
+    updateScratchKernelRsp(core_id, kstack);
 
     const new_root = thread.process.addr_space_root;
     if (new_root.addr != arch.getAddrSpaceRoot().addr) {

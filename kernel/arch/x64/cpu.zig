@@ -456,6 +456,33 @@ pub fn initPat() void {
 
 /// Enable CR0.AM (bit 18) so user-mode alignment check exceptions (#AC) fire
 /// when RFLAGS.AC is set and an unaligned access occurs at CPL 3.
+/// Initialize SYSCALL/SYSRET MSRs. Must be called on every core.
+///
+/// Intel SDM Vol 3B §5.8.8; AMD APM Vol 2 §6.1.1.
+///
+/// STAR[47:32]  = kernel CS for SYSCALL entry (0x08).
+/// STAR[63:48]  = base for SYSRET segment arithmetic (0x10):
+///   SYSRET loads CS = base+16 = 0x20 (USER_CODE), SS = base+8 = 0x18 (USER_DATA).
+/// LSTAR        = kernel entry point RIP (syscallEntry in interrupts.zig).
+/// FMASK        = RFLAGS bits cleared on SYSCALL: IF(9), DF(10), AC(18).
+/// EFER.SCE     = bit 0, enables SYSCALL/SYSRET instructions.
+pub fn initSyscall(entry: u64) void {
+    const IA32_STAR: u32 = 0xC0000081;
+    const IA32_LSTAR: u32 = 0xC0000082;
+    const IA32_FMASK: u32 = 0xC0000084;
+    const IA32_EFER: u32 = 0xC0000080;
+
+    const kernel_cs: u64 = 0x08;
+    const sysret_base: u64 = 0x10;
+    wrmsr(IA32_STAR, (sysret_base << 48) | (kernel_cs << 32));
+    wrmsr(IA32_LSTAR, entry);
+    wrmsr(IA32_FMASK, (1 << 9) | (1 << 10) | (1 << 18)); // IF | DF | AC
+
+    var efer = rdmsr(IA32_EFER);
+    efer |= (1 << 0); // SCE
+    wrmsr(IA32_EFER, efer);
+}
+
 pub fn enableAlignmentCheck() void {
     var cr0 = asm ("mov %%cr0, %[cr0]"
         : [cr0] "=r" (-> u64),

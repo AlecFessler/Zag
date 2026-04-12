@@ -1078,6 +1078,40 @@ Portable dispatch layer in `kernel/arch/dispatch.zig`. All functions dispatch at
 - Fallback: if MCFG not present or no devices found, legacy PCI config space enumeration.
 - Serial port probing.
 
+### SYSCALL/SYSRET Entry Path
+
+The kernel uses the SYSCALL/SYSRET instruction pair (Intel SDM Vol 2B "SYSCALL", "SYSRET"; Vol 3A §5.8.8) instead of INT 0x80 for syscall entry. This is ~2.5x faster than the interrupt gate path.
+
+**GDT Layout** — SYSRET loads CS = STAR[63:48]+16, SS = STAR[63:48]+8 (Intel SDM Vol 2B "SYSRET" Operation). This requires user data to precede user code in the GDT:
+
+```
+0x08  KERNEL_CODE
+0x10  KERNEL_DATA
+0x18  USER_DATA     ← SYSRET SS = 0x10+8 = 0x18 | RPL3 = 0x1B
+0x20  USER_CODE     ← SYSRET CS = 0x10+16 = 0x20 | RPL3 = 0x23
+0x28  TSS
+```
+
+**MSR Configuration** (`cpu.initSyscall`, called per-core from `init.zig` and `smp.zig:coreInit`):
+- IA32_STAR (0xC0000081): [47:32]=0x08 (kernel CS for SYSCALL), [63:48]=0x10 (base for SYSRET)
+- IA32_LSTAR (0xC0000082): address of `syscallEntry` in `interrupts.zig`
+- IA32_FMASK (0xC0000084): clears IF(9), DF(10), AC(18) on entry
+- IA32_EFER (0xC0000080): set SCE (bit 0) to enable SYSCALL/SYSRET
+
+**SWAPGS Stack Switch** — `kernel/arch/x64/interrupts.zig:syscallEntry` uses SWAPGS (Intel SDM Vol 3A §5.8.8) to access per-CPU data for the kernel stack pointer. Each core's IA32_KERNEL_GS_BASE MSR (0xC0000102) is set during init to point to a `SyscallScratch` struct: `[0]=kernel_rsp, [8]=user_rsp_scratch`. The `kernel_rsp` field is updated on every context switch alongside TSS.RSP0.
+
+Entry sequence:
+1. SWAPGS — GS base → per-CPU SyscallScratch
+2. Save user RSP to gs:8, load kernel RSP from gs:0
+3. Save user RBP to its stack slot, use RBP to ferry user RSP from gs:8
+4. SWAPGS — restore user GS base (safe for context switches)
+5. Build iret-compatible `cpu.Context` frame on kernel stack
+6. FXSAVE, call `syscallDispatch`, FXRSTOR
+7. Load RCX=RIP, R11=RFLAGS, RSP=user RSP from frame
+8. Canonical check (bit 47 of RCX) — SYSRETQ fast path, or IRETQ fallback for non-canonical RIP
+
+The canonical check addresses the Intel erratum where SYSRET with non-canonical RCX causes #GP(0) at CPL 3 but on the kernel stack (Intel SDM Vol 2B "SYSRET" 64-Bit Mode Exceptions). User addresses always have bit 47 clear, so the SYSRETQ path is taken.
+
 **smpInit() -> void** -- Bring up secondary cores:
 1. Initialize per-core GDT/TSS for all cores.
 2. Map real-mode trampoline code at physical 0x8000.

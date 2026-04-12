@@ -9,7 +9,7 @@ const E_INVAL: i64 = -1;
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     // No wrapper exists for an invalid syscall number, so raw asm is needed.
-    const ret = asm volatile ("int $0x80"
+    const ret = asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@as(u64, 9999)),
         : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }

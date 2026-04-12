@@ -5,6 +5,7 @@ const cpu = zag.arch.x64.cpu;
 const exceptions = zag.arch.x64.exceptions;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
+const interrupts = zag.arch.x64.interrupts;
 const irq = zag.arch.x64.irq;
 const serial = zag.arch.x64.serial;
 
@@ -16,6 +17,8 @@ pub fn init() void {
     idt.init();
     exceptions.init();
     irq.init();
+    cpu.initSyscall(@intFromPtr(&interrupts.syscallEntry));
+    interrupts.initSyscallScratch(0);
     cpu.initPat();
     cpu.enableAlignmentCheck();
     cpu.enableSmapSmep();

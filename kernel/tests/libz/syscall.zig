@@ -66,14 +66,14 @@ pub const SyscallNum = enum(u64) {
 };
 
 fn syscall0(num: SyscallNum) i64 {
-    return asm volatile ("int $0x80"
+    return asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(num)),
         : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
 }
 
 fn syscall1(num: SyscallNum, a0: u64) i64 {
-    return asm volatile ("int $0x80"
+    return asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(num)),
           [a0] "{rdi}" (a0),
@@ -81,7 +81,7 @@ fn syscall1(num: SyscallNum, a0: u64) i64 {
 }
 
 fn syscall2(num: SyscallNum, a0: u64, a1: u64) i64 {
-    return asm volatile ("int $0x80"
+    return asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(num)),
           [a0] "{rdi}" (a0),
@@ -91,7 +91,7 @@ fn syscall2(num: SyscallNum, a0: u64, a1: u64) i64 {
 
 fn syscall3(num: SyscallNum, a0: u64, a1: u64, a2: u64) i64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(num)),
           [a0] "{rdi}" (a0),
@@ -102,7 +102,7 @@ fn syscall3(num: SyscallNum, a0: u64, a1: u64, a2: u64) i64 {
 
 fn syscall4(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64) i64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(num)),
           [a0] "{rdi}" (a0),
@@ -114,7 +114,7 @@ fn syscall4(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64) i64 {
 
 fn syscall5(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) i64 {
     return asm volatile (
-        \\int $0x80
+        \\syscall
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(num)),
           [a0] "{rdi}" (a0),
@@ -127,7 +127,7 @@ fn syscall5(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) i64 {
 
 fn syscall3_2(num: SyscallNum, a0: u64, a1: u64, a2: u64) SyscallResult2 {
     var val2: u64 = undefined;
-    const val = asm volatile ("int $0x80"
+    const val = asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
           [out2] "={rdx}" (val2),
         : [num] "{rax}" (@intFromEnum(num)),
@@ -284,7 +284,7 @@ fn ipc_send_ex(target_handle: u64, words: []const u64, cap_transfer: bool) i64 {
     for (0..count) |i| w[i] = words[i];
     const meta: u64 = @as(u64, count) | (if (cap_transfer) @as(u64, 0x8) else 0);
 
-    return asm volatile ("int $0x80"
+    return asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(SyscallNum.ipc_send)),
           [tgt] "{r13}" (target_handle),
@@ -318,7 +318,7 @@ fn ipc_call_ex(target_handle: u64, words: []const u64, cap_transfer: bool, reply
     var r_r9: u64 = undefined;
     var r_r14: u64 = undefined;
 
-    const ret = asm volatile ("int $0x80"
+    const ret = asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
           [o0] "={rdi}" (r_rdi),
           [o1] "={rsi}" (r_rsi),
@@ -352,7 +352,7 @@ pub fn ipc_recv(blocking: bool, msg: *IpcMessage) i64 {
     var r_r9: u64 = undefined;
     var r_r14: u64 = undefined;
 
-    const ret = asm volatile ("int $0x80"
+    const ret = asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
           [o0] "={rdi}" (r_rdi),
           [o1] "={rsi}" (r_rsi),
@@ -391,7 +391,7 @@ pub fn ipc_reply_recv(words: []const u64, blocking: bool, msg: *IpcMessage) i64 
     var r_r9: u64 = undefined;
     var r_r14: u64 = undefined;
 
-    const ret = asm volatile ("int $0x80"
+    const ret = asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
           [o0] "={rdi}" (r_rdi),
           [o1] "={rsi}" (r_rsi),
@@ -447,7 +447,7 @@ pub fn fault_reply_simple(token: u64, action: u64) i64 {
 /// Invoke `fault_reply` with explicit `flags` in r14 (e.g. FAULT_EXCLUDE_NEXT,
 /// FAULT_EXCLUDE_PERMANENT). `modified_regs_ptr` is passed via rdx.
 pub fn fault_reply_flags(token: u64, action: u64, modified_regs_ptr: u64, flags: u64) i64 {
-    return asm volatile ("int $0x80"
+    return asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(SyscallNum.fault_reply)),
           [a0] "{rdi}" (token),
@@ -680,7 +680,7 @@ fn ipc_reply_ex(words: []const u64, atomic_recv: bool, recv_blocking: bool, cap_
         (if (recv_blocking) @as(u64, 0x2) else 0) |
         (if (cap_transfer) @as(u64, 0x20) else 0);
 
-    return asm volatile ("int $0x80"
+    return asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
         : [num] "{rax}" (@intFromEnum(SyscallNum.ipc_reply)),
           [m] "{r14}" (meta),
