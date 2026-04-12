@@ -9,14 +9,14 @@ const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const stack_mod = zag.memory.stack;
 
-const ArchCpuContext = zag.arch.dispatch.ArchCpuContext;
+const ArchCpuContext = arch.ArchCpuContext;
 const FaultReason = zag.perms.permissions.FaultReason;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
-const PAddr = zag.memory.address.PAddr;
+const PAddr = address.PAddr;
 const Process = zag.proc.process.Process;
 const SlabAllocator = zag.memory.allocators.slab.SlabAllocator;
-const Stack = zag.memory.stack.Stack;
-const VAddr = zag.memory.address.VAddr;
+const Stack = stack_mod.Stack;
+const VAddr = address.VAddr;
 
 pub const ThreadAllocator = SlabAllocator(Thread, false, 0, 64, true);
 

@@ -29,7 +29,7 @@ pub const Exception = enum(u5) {
     double_fault = 8, // #DF — Abort, error code (zero)
     coprocessor_segment_overrun = 9, // reserved (Fault, no error code)
     invalid_task_state_segment = 10, // #TS — Fault, error code
-    segment_not_pressent = 11, // #NP — Fault, error code
+    segment_not_present = 11, // #NP — Fault, error code
     stack_segment_fault = 12, // #SS — Fault, error code
     general_protection_fault = 13, // #GP — Fault, error code
     page_fault = 14, // #PF — Fault, error code (see PFErrCode)
@@ -112,7 +112,7 @@ pub fn init() void {
         @intFromEnum(Exception.double_fault),
         @intFromEnum(Exception.coprocessor_segment_overrun),
         @intFromEnum(Exception.invalid_task_state_segment),
-        @intFromEnum(Exception.segment_not_pressent),
+        @intFromEnum(Exception.segment_not_present),
         @intFromEnum(Exception.stack_segment_fault),
         @intFromEnum(Exception.general_protection_fault),
         // page_fault already registered above
@@ -136,7 +136,7 @@ fn exceptionFaultReason(vector: u5) ?FaultReason {
         .invalid_opcode, .device_not_available => .illegal_instruction,
         .alignment_check => .alignment_fault,
         .general_protection_fault, .stack_segment_fault => .protection_fault,
-        .invalid_task_state_segment, .segment_not_pressent => .protection_fault,
+        .invalid_task_state_segment, .segment_not_present => .protection_fault,
         .virtualization, .security => .protection_fault,
         .single_step_debug => null,
         .breakpoint_debug => .breakpoint,

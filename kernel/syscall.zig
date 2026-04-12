@@ -1087,8 +1087,8 @@ fn sysThreadKill(thread_handle: u64) i64 {
 ///   48  rsp:            u64
 ///   56  r15..rax:       15×u64 General-purpose register snapshot
 ///                              (matches kernel x64 Registers struct order)
-const FAULT_MSG_SIZE: u64 = 176;
-const FAULT_REGS_SIZE: u64 = 144; // rip + rflags + rsp + 15 GPRs
+const fault_msg_size: u64 = 176;
+const fault_regs_size: u64 = 144; // rip + rflags + rsp + 15 GPRs
 
 /// Build a 176-byte FaultMessage in a temporary kernel buffer.
 fn buildFaultMessage(process_handle: u64, thread_handle: u64, faulted: *Thread) [176]u8 {
@@ -1181,7 +1181,7 @@ fn faultHandlerCheck(proc: *Process) bool {
 
 fn faultRecvValidateBuf(proc: *Process, buf_ptr: u64) i64 {
     if (!address.AddrSpacePartition.user.contains(buf_ptr)) return E_BADADDR;
-    const buf_end = std.math.add(u64, buf_ptr, FAULT_MSG_SIZE) catch return E_BADADDR;
+    const buf_end = std.math.add(u64, buf_ptr, fault_msg_size) catch return E_BADADDR;
     if (!address.AddrSpacePartition.user.contains(buf_end -| 1)) return E_BADADDR;
     var check_addr = buf_ptr;
     while (check_addr < buf_end) {
@@ -1270,27 +1270,27 @@ fn applyModifiedRegs(dst: *Thread, src_ptr: u64) void {
     }
 }
 
-const FAULT_KILL: u64 = 0;
-const FAULT_RESUME: u64 = 1;
-const FAULT_RESUME_MODIFIED: u64 = 2;
-const FAULT_EXCLUDE_NEXT: u64 = 0x1;
-const FAULT_EXCLUDE_PERMANENT: u64 = 0x2;
+const fault_kill: u64 = 0;
+const fault_resume: u64 = 1;
+const fault_resume_modified: u64 = 2;
+const fault_exclude_next: u64 = 0x1;
+const fault_exclude_permanent: u64 = 0x2;
 
 fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modified_regs_ptr: u64) i64 {
-    if (action > FAULT_RESUME_MODIFIED) return E_INVAL;
+    if (action > fault_resume_modified) return E_INVAL;
 
     const proc = currentProc();
     const flags = ctx.regs.r14;
 
     // §2.12.22: both exclude bits set is invalid.
-    if ((flags & FAULT_EXCLUDE_NEXT) != 0 and (flags & FAULT_EXCLUDE_PERMANENT) != 0) {
+    if ((flags & fault_exclude_next) != 0 and (flags & fault_exclude_permanent) != 0) {
         return E_INVAL;
     }
 
     // §4.34.6: validate modified_regs_ptr for RESUME_MODIFIED.
-    if (action == FAULT_RESUME_MODIFIED) {
+    if (action == fault_resume_modified) {
         if (!address.AddrSpacePartition.user.contains(modified_regs_ptr)) return E_BADADDR;
-        const buf_end = std.math.add(u64, modified_regs_ptr, FAULT_REGS_SIZE) catch return E_BADADDR;
+        const buf_end = std.math.add(u64, modified_regs_ptr, fault_regs_size) catch return E_BADADDR;
         if (!address.AddrSpacePartition.user.contains(buf_end -| 1)) return E_BADADDR;
         const node = proc.vmm.findNode(VAddr.fromInt(modified_regs_ptr)) orelse return E_BADADDR;
         if (!node.rights.read) return E_BADADDR;
@@ -1328,11 +1328,11 @@ fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modified_r
     proc.fault_box.lock.unlock();
 
     // Apply FAULT_EXCLUDE_* flags to the pending thread's perm entry.
-    if ((flags & (FAULT_EXCLUDE_NEXT | FAULT_EXCLUDE_PERMANENT)) != 0) {
+    if ((flags & (fault_exclude_next | fault_exclude_permanent)) != 0) {
         proc.perm_lock.lock();
         for (&proc.perm_table) |*slot| {
             if (slot.object == .thread and slot.object.thread == pending) {
-                if ((flags & FAULT_EXCLUDE_NEXT) != 0) {
+                if ((flags & fault_exclude_next) != 0) {
                     slot.exclude_oneshot = true;
                     slot.exclude_permanent = false;
                 } else {
@@ -1378,7 +1378,7 @@ fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modified_r
     }
 
     switch (action) {
-        FAULT_KILL => {
+        fault_kill => {
             // §2.12.24: kill ONLY the faulting thread. If it is the last
             // non-exited thread, Thread.deinit -> lastThreadExited drives
             // process exit/restart per §2.6.
@@ -1412,8 +1412,8 @@ fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modified_r
             process_mod.scrubFromFaultBoxPub(&proc.fault_box, pending);
             pending.deinit();
         },
-        FAULT_RESUME, FAULT_RESUME_MODIFIED => {
-            if (action == FAULT_RESUME_MODIFIED) {
+        fault_resume, fault_resume_modified => {
+            if (action == fault_resume_modified) {
                 applyModifiedRegs(pending, modified_regs_ptr);
             }
             // Clear the user iret frame pointer — the unwind path is about

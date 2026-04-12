@@ -10,6 +10,9 @@ const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
+const PmuCounterConfig = PmuCounterConfig;
+const PmuInfo = PmuInfo;
+const PmuSample = PmuSample;
 const SharedMemory = zag.memory.shared.SharedMemory;
 const Thread = zag.sched.thread.Thread;
 const Timer = zag.arch.timer.Timer;
@@ -561,7 +564,7 @@ pub fn pmuPerCoreInit() void {
     }
 }
 
-pub fn pmuGetInfo() zag.sched.pmu.PmuInfo {
+pub fn pmuGetInfo() PmuInfo {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.pmu.pmuGetInfo(),
         .aarch64 => aarch64.pmu.pmuGetInfo(),
@@ -585,7 +588,7 @@ pub fn pmuRestore(state: *PmuState) void {
     }
 }
 
-pub fn pmuStart(state: *PmuState, configs: []const zag.sched.pmu.PmuCounterConfig) !void {
+pub fn pmuStart(state: *PmuState, configs: []const PmuCounterConfig) !void {
     switch (builtin.cpu.arch) {
         .x86_64 => try x64.pmu.pmuStart(state, configs),
         .aarch64 => try aarch64.pmu.pmuStart(state, configs),
@@ -593,7 +596,7 @@ pub fn pmuStart(state: *PmuState, configs: []const zag.sched.pmu.PmuCounterConfi
     }
 }
 
-pub fn pmuRead(state: *PmuState, sample: *zag.sched.pmu.PmuSample) void {
+pub fn pmuRead(state: *PmuState, sample: *PmuSample) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.pmu.pmuRead(state, sample),
         .aarch64 => aarch64.pmu.pmuRead(state, sample),
@@ -601,7 +604,7 @@ pub fn pmuRead(state: *PmuState, sample: *zag.sched.pmu.PmuSample) void {
     }
 }
 
-pub fn pmuReset(state: *PmuState, configs: []const zag.sched.pmu.PmuCounterConfig) !void {
+pub fn pmuReset(state: *PmuState, configs: []const PmuCounterConfig) !void {
     switch (builtin.cpu.arch) {
         .x86_64 => try x64.pmu.pmuReset(state, configs),
         .aarch64 => try aarch64.pmu.pmuReset(state, configs),
@@ -621,7 +624,7 @@ pub fn pmuStop(state: *PmuState) void {
 /// Used by the generic PMU syscall layer when an external profiler calls
 /// pmu_start / pmu_reset on a non-running target thread; the target's
 /// next `pmuRestore` programs the hardware when it is rescheduled.
-pub fn pmuConfigureState(state: *PmuState, configs: []const zag.sched.pmu.PmuCounterConfig) void {
+pub fn pmuConfigureState(state: *PmuState, configs: []const PmuCounterConfig) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.pmu.pmuConfigureState(state, configs),
         .aarch64 => aarch64.pmu.pmuConfigureState(state, configs),

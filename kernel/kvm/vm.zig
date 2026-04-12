@@ -230,7 +230,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
     var inserted_handles: [MAX_VCPUS]u64 = undefined;
     var inserted_count: u32 = 0;
     var i: u32 = 0;
-    while (i < vcpu_count) : (i += 1) {
+    while (i < vcpu_count) {
         const vcpu_obj = vcpu_mod.create(vm_obj) catch {
             // Cleanup already-inserted handles (before destroying their threads)
             var k: u32 = 0;
@@ -272,6 +272,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
         };
         inserted_handles[inserted_count] = handle_id;
         inserted_count += 1;
+        i += 1;
     }
 
     proc.vm = vm_obj;

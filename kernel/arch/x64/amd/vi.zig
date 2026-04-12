@@ -273,10 +273,14 @@ pub fn init(reg_base_phys: PAddr) !void {
     // (command/event pointer registers), so 4 pages covers it.
     const num_mmio_pages: u32 = 4;
     var i: u32 = 0;
-    while (i < num_mmio_pages) : (i += 1) {
+    while (i < num_mmio_pages) {
         const page_phys = PAddr.fromInt(reg_base_phys.addr + @as(u64, i) * paging.PAGE4K);
         const page_virt = VAddr.fromPAddr(page_phys, null);
-        arch.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS) catch continue;
+        arch.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS) catch {
+            i += 1;
+            continue;
+        };
+        i += 1;
     }
     unit.base = VAddr.fromPAddr(reg_base_phys, null).addr;
 
@@ -306,10 +310,11 @@ pub fn init(reg_base_phys: PAddr) !void {
     // target-aborted by the IOMMU.
     {
         var dte_idx: u64 = 0;
-        while (dte_idx < 65536) : (dte_idx += 1) {
+        while (dte_idx < 65536) {
             const dte: *volatile u64 = @ptrFromInt(@intFromPtr(dt_mem) + dte_idx * 32);
             // V=1 (bit 0), TV=1 (bit 1) — blocks all DMA with IR=0, IW=0.
             dte.* = 0x3;
+            dte_idx += 1;
         }
     }
     const dt_virt = VAddr.fromInt(@intFromPtr(dt_mem));
