@@ -94,6 +94,8 @@ Virtual memory is managed per-process through **VM reservations** — contiguous
 
 `mem_mmio_map` maps a device's MMIO region into a reservation. The reservation must have the `mmio` right plus at least `read` or `write`. MMIO mappings use uncacheable attributes by default; if the reservation has the `write_combining` right, write-combining attributes are used instead.
 
+Mapping a `port_io` device via `mem_mmio_map` creates a virtual BAR. The reservation must have `mmio` plus at least `read` or `write`. The `write_combining` right is incompatible with virtual BAR mappings and returns `E_INVAL`. Virtual BAR mappings appear as a normal RW region in the VMM tree and user permissions view. PTEs are intentionally absent.
+
 **§2.2.10** After `mem_mmio_unmap`, the range reverts to private with max RWX rights.
 
 ---
@@ -235,7 +237,11 @@ Each user stack is flanked by unmapped guard pages that catch overflow and under
 
 ### §2.9 Device Region
 
-A device region represents a hardware device. Two types: **MMIO** (memory-mapped, accessed via `mem_mmio_map`) and **Port I/O** (accessed via `ioport_read`/`ioport_write`). **§2.9.1** Device access is exclusive (only one process holds the handle at a time).
+A device region represents a hardware device. There are two internal types — **MMIO** and **Port I/O** — but from userspace's perspective there is a single device access interface: both types are accessed via `mem_mmio_map`. The `port_io` type still exists in the kernel but is not a user-visible distinction in the access interface. **§2.9.1** Device access is exclusive (only one process holds the handle at a time).
+
+Port I/O device regions support virtual BAR mapping via `mem_mmio_map`. The mapped VA region has size `ceil(port_count / PAGE_SIZE) * PAGE_SIZE` (always at least one page). Page table entries are never populated; every access traps to the kernel for emulation. The kernel translates a virtual BAR access as `port = device.base_port + (fault_addr - bar_base)`. Width and direction are decoded from the faulting instruction. Read results are written back into the faulting thread's saved register state.
+
+Accessing a virtual BAR with any instruction other than a plain scalar MOV kills with `protection_fault`. Accessing a virtual BAR at a byte offset beyond `port_count` kills with `invalid_read` or `invalid_write` based on access direction. An instruction whose encoding straddles a page boundary at RIP kills with `protection_fault`. Compilers never emit this in normal code.
 
 Device entries in the user view encode hardware identification: **§2.9.2** device user view `field0` encodes: `device_type(u8) | device_class(u8) << 8 | size_or_port_count(u32) << 32`. **§2.9.3** Device user view `field1` encodes: `pci_vendor(u16) | pci_device(u16) << 16 | pci_class(u8) << 32 | pci_subclass(u8) << 40`.
 
@@ -758,6 +764,8 @@ Each fault or termination records a `FaultReason` (u5) in the process's slot 0 `
 | 14 | `breakpoint` | int3 / #BP exception |
 | 15 | `pmu_overflow` | PMU counter overflow (sample-based profiling, §2.14) |
 
+`protection_fault` covers unsupported instruction and page-boundary-straddle cases for virtual BAR access. `invalid_read`/`invalid_write` cover out-of-bounds port offset in virtual BAR access.
+
 **§3.1** Fault with no VMM node kills the process with `unmapped_access`. **§3.2** Fault on SHM/MMIO region kills with `invalid_read`/`invalid_write`/`invalid_execute` based on access type. **§3.3** Fault on a private region with wrong permissions kills with `invalid_read`/`invalid_write`/`invalid_execute`. **§3.4** Demand-paged private region: allocate zeroed page, map, resume. **§3.5** Demand page allocation failure kills with `out_of_memory`. **§3.6** Divide-by-zero kills with `arithmetic_fault`. **§3.7** Invalid opcode kills with `illegal_instruction`. **§3.8** Alignment check exception kills with `alignment_fault`. **§3.9** General protection fault kills with `protection_fault`. **§3.10** All user faults are non-recursive: killing a faulting process does not propagate to children. **§3.11** A counter overflow on a thread with PMU state configured for sample-based profiling delivers a fault with reason `pmu_overflow`; `FaultMessage.fault_addr` contains the faulting RIP and the full register snapshot in `FaultMessage.regs` is the sample.
 
 ---
@@ -814,7 +822,7 @@ Removes an SHM mapping from a reservation. The process retains the handle. **§4
 
 ### §4.8 mem_mmio_map(device_handle, vm_handle, offset) → result
 
-Maps a device's MMIO region into a reservation. **§4.8.1** `mem_mmio_map` returns `E_OK` on success. **§4.8.2** `mem_mmio_map` with invalid `device_handle` returns `E_BADHANDLE`. **§4.8.3** `mem_mmio_map` with invalid `vm_handle` returns `E_BADHANDLE`. **§4.8.4** `mem_mmio_map` without `map` right returns `E_PERM`. **§4.8.5** `mem_mmio_map` without `mmio` right on reservation returns `E_PERM`. **§4.8.6** `mem_mmio_map` without `read` or `write` right on reservation returns `E_PERM`. **§4.8.7** `mem_mmio_map` with non-page-aligned offset returns `E_INVAL`. **§4.8.8** `mem_mmio_map` with out-of-bounds range returns `E_INVAL`. **§4.8.9** `mem_mmio_map` with duplicate device region returns `E_INVAL`. **§4.8.10** `mem_mmio_map` with non-MMIO device returns `E_INVAL`. **§4.8.11** `mem_mmio_map` with committed pages in range returns `E_EXIST`.
+Maps a device's MMIO region into a reservation. **§4.8.1** `mem_mmio_map` returns `E_OK` on success. **§4.8.2** `mem_mmio_map` with invalid `device_handle` returns `E_BADHANDLE`. **§4.8.3** `mem_mmio_map` with invalid `vm_handle` returns `E_BADHANDLE`. **§4.8.4** `mem_mmio_map` without `map` right returns `E_PERM`. **§4.8.5** `mem_mmio_map` without `mmio` right on reservation returns `E_PERM`. **§4.8.6** `mem_mmio_map` without `read` or `write` right on reservation returns `E_PERM`. **§4.8.7** `mem_mmio_map` with non-page-aligned offset returns `E_INVAL`. **§4.8.8** `mem_mmio_map` with out-of-bounds range returns `E_INVAL`. **§4.8.9** `mem_mmio_map` with duplicate device region returns `E_INVAL`. **§4.8.10** `port_io` devices are valid targets for `mem_mmio_map`; the mapped size for `port_io` devices is `ceil(port_count / PAGE_SIZE) * PAGE_SIZE`. `mem_mmio_map` with `write_combining` reservation right on a `port_io` device returns `E_INVAL`. **§4.8.11** `mem_mmio_map` with committed pages in range returns `E_EXIST`.
 
 ### §4.9 mem_mmio_unmap(device_handle, vm_handle) → result
 
@@ -888,13 +896,9 @@ Maps SHM into the device's IOMMU address space. Requires an IOMMU. DMA mappings 
 
 **§4.26.1** `mem_dma_unmap` returns `E_OK` on success. **§4.26.2** `mem_dma_unmap` with invalid handle returns `E_BADHANDLE`. **§4.26.3** `mem_dma_unmap` with no mapping returns `E_NOENT`.
 
-### §4.27 ioport_read(device_handle, port_offset, width) → value
+### §4.27–§4.28 (removed)
 
-Reads from a Port I/O device register. Width is 1, 2, or 4 bytes. **§4.27.1** `ioport_read` returns value (non-negative) on success. **§4.27.2** `ioport_read` with invalid handle returns `E_BADHANDLE`. **§4.27.3** `ioport_read` without `map` right returns `E_PERM`. **§4.27.4** `ioport_read` with bad width (not 1, 2, or 4) returns `E_INVAL`. **§4.27.5** `ioport_read` with `offset + width > port_count` returns `E_INVAL`. **§4.27.6** `ioport_read` on non-`port_io` device returns `E_INVAL`.
-
-### §4.28 ioport_write(device_handle, port_offset, width, value) → result
-
-Same validation as `ioport_read`. **§4.28.1** `ioport_write` returns `E_OK` on success. **§4.28.2** `ioport_write` with invalid handle returns `E_BADHANDLE`. **§4.28.3** `ioport_write` without `map` right returns `E_PERM`. **§4.28.4** `ioport_write` with bad width returns `E_INVAL`. **§4.28.5** `ioport_write` with `offset + width > port_count` returns `E_INVAL`. **§4.28.6** `ioport_write` on non-`port_io` device returns `E_INVAL`.
+Port I/O devices are now accessed via virtual BAR mapping through `mem_mmio_map` (§4.8). The `ioport_read` and `ioport_write` syscalls no longer exist.
 
 ### §4.29 thread_self() → handle
 

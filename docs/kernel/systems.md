@@ -92,7 +92,7 @@ kernel/
     dispatch.zig         -- SyscallNum enum, SyscallResult type, dispatch switch table
     errors.zig           -- syscall error code constants (E_OK, E_INVAL, etc.)
     clock.zig            -- clock_gettime, clock_getwall, clock_setwall, wall_offset
-    device.zig           -- mmio_map/unmap, ioport_read/write, irq_ack, dma_map/unmap
+    device.zig           -- mmio_map/unmap, irq_ack, dma_map/unmap
     fault.zig            -- fault_recv, fault_reply, fault_read_mem, fault_write_mem, fault_set_thread_mode
     futex.zig            -- futex_wait, futex_wake
     ipc.zig              -- ipc_send, ipc_call, ipc_recv, ipc_reply, capability transfer
@@ -129,7 +129,7 @@ kernel/
     guest_memory.zig     -- guest physical address space tracking and cleanup
     lapic.zig            -- in-kernel Local APIC emulation (xAPIC, timer, IRR/ISR/TMR, EOI, ICR)
     ioapic.zig           -- in-kernel I/O APIC emulation (24-entry redirection table, level/edge)
-  arch/x64/mmio_decode.zig -- x86-64 MMIO instruction decoder used by kernel LAPIC/IOAPIC handlers
+  arch/x64/mmio_decode.zig -- x86-64 MMIO instruction decoder — shared by VM LAPIC/IOAPIC handlers and virtual BAR emulation. Exports decodeBytes, GprArray, writeGpr, readGpr
 ```
 
 ---
@@ -289,6 +289,7 @@ VmNode {
         private: void
         shared_memory: *SharedMemory
         mmio: *DeviceRegion
+        virtual_bar: *DeviceRegion
     }
     rights: VmReservationRights   -- only rwx bits used at the page level
     handle: u64               -- HANDLE_NONE (U64_MAX) for kernel-internal nodes
@@ -297,6 +298,8 @@ VmNode {
 ```
 
 `VmNode.end()` returns `start.addr + size`.
+
+`virtual_bar` nodes get `restart_policy = .free` — cleared on restart, device handle persists.
 
 ### Sentinel Nodes
 
@@ -332,7 +335,7 @@ Two adjacent nodes merge iff all of:
 - Same `restart_policy`
 - Contiguous (first node's end == second node's start)
 
-Never merge across reservation boundaries (different handles).
+Never merge across reservation boundaries (different handles). `virtual_bar` nodes never merge with anything.
 
 ### Bump Cursor
 
@@ -975,6 +978,21 @@ The HPET is used as the reference clock for TSC and LAPIC timer calibration.
 ---
 
 ## 11. Page Fault Handling Internals
+
+### Virtual BAR Interception
+
+The x64 exception entry path checks the faulting address against the current process's VMM tree before dispatching to the generic fault handler. If the node kind is `virtual_bar`, the x64 handler emulates the access inline and returns without calling the generic handler. The generic handler's decision tree is unchanged.
+
+Emulation path:
+1. Fetch up to `min(15, PAGE_SIZE - (rip & 0xFFF))` instruction bytes from user RIP via `resolveVaddr` + physmap. If RIP is unmapped, kill with `protection_fault`.
+2. Call `mmio_decode.decodeBytes(buf)`. On decode error or unsupported instruction, kill with `protection_fault`.
+3. Compute `port_offset = fault_addr - node.start.addr`. If `port_offset + op.size > device.port_count`, kill with `invalid_read` or `invalid_write`.
+4. Compute `port = device.base_port + port_offset`.
+5. Execute `arch.ioportOut` or `arch.ioportIn`.
+6. For reads, call `writeGpr(frame.gprs(), op.reg, op.size, value)`.
+7. Advance `frame.rip += op.len`. Return.
+
+Note: two VMM lookups occur for non-virtual-BAR faults — one in the x64 intercept check, one in the generic handler. Acceptable for now; branch prediction trains to the fast-miss case.
 
 ### User Faults
 
@@ -1907,7 +1925,7 @@ The `Vm` struct exposes a small set of `pub fn` methods so callers (vcpu.zig, ex
 - `injectExternal(vector)` — wraps `lapic.injectExternal`. Single entry for routing an IRQ vector into the LAPIC IRR.
 - `tickInterruptControllers(elapsed_ns)` — wraps `lapic.tick`. Future timers (HPET/PIT) hook in here.
 - `deliverPendingInterrupts(*GuestState)` — checks LAPIC for a deliverable vector and, if guest IF=1 with no pending EVENTINJ, builds the EVENTINJ qword and accepts the vector. Called from the vCPU entry loop before VMRUN.
-- `tryHandleMmio(vcpu, guest_phys)` — if `guest_phys` falls in the LAPIC or IOAPIC page, decodes the faulting instruction at guest RIP, dispatches to the matching controller, writes any read result back, and advances RIP. Returns true if handled. Internal helpers `handleLapicMmio`/`handleIoapicMmio` are non-pub.
+- `tryHandleMmio(vcpu, guest_phys)` — if `guest_phys` falls in the LAPIC or IOAPIC page, pre-fetches instruction bytes from guest RIP and calls `mmio_decode.decodeBytes(buf)` to decode the faulting instruction, dispatches to the matching controller, writes any read result back via `writeGpr`, and advances RIP. Returns true if handled. Internal helpers `handleLapicMmio`/`handleIoapicMmio` are non-pub.
 - `guestPhysToHost(phys, len)` / `readGuestPhysSlice(phys, len)` — bounds-checked guest-phys → host-VA translation backed by `guest_ram_host_base`/`guest_ram_size`. Single home for the arithmetic so the bookkeeping is owned by `Vm`.
 
 ### VCpu Struct
@@ -1992,7 +2010,7 @@ VmReplyAction = union(enum) {
 Defined in `kernel/arch/x64/kvm/exit_handler.zig`. Called from the vCPU entry loop after `arch.vmResume()` returns. Classifies exits as kernel-handled or VMM-handled.
 
 **Kernel-handled inline** — resolved without VMM involvement, the entry loop re-enters the guest on return:
-- **EPT/NPT violations on the LAPIC or IOAPIC page** (`0xFEE00000` / `0xFEC00000`): the handler calls `vm.tryHandleMmio(vcpu, ept.guest_phys)`, which routes the access to the matching controller, decodes the instruction at guest RIP via `mmio_decode.decode`, writes any read result back into the destination GPR, and advances RIP by the decoded instruction length. The handler imports neither `lapic` nor `ioapic` directly — the only entry point is `Vm.tryHandleMmio`.
+- **EPT/NPT violations on the LAPIC or IOAPIC page** (`0xFEE00000` / `0xFEC00000`): the handler calls `vm.tryHandleMmio(vcpu, ept.guest_phys)`, which routes the access to the matching controller, pre-fetches instruction bytes and decodes via `mmio_decode.decodeBytes`, writes any read result back into the destination GPR via `writeGpr`, and advances RIP by the decoded instruction length. The handler imports neither `lapic` nor `ioapic` directly — the only entry point is `Vm.tryHandleMmio`.
 - Guest memory is no longer demand-paged: all regions are eagerly mapped at `vm_guest_map` time. EPT/NPT violations on truly unmapped regions fall through to the VMM as exits.
 - **`cpuid`** where `(leaf, subleaf)` matches an entry in `vm.policy.cpuid_responses`: the kernel writes the pre-configured `eax/ebx/ecx/edx` into guest GPRs and advances RIP by 2.
 - **`interrupt_window` (VMEXIT_VINTR)**: returns immediately so the entry loop checks `vm.deliverPendingInterrupts` again now that guest `IF=1`.
@@ -2049,7 +2067,7 @@ Public surface:
 
 ### MMIO Instruction Decoder
 
-Defined in `kernel/arch/x64/mmio_decode.zig`. Used by `Vm.tryHandleMmio` (via the internal `handleLapicMmio`/`handleIoapicMmio` helpers) to handle LAPIC/IOAPIC MMIO inline without bouncing to userspace.
+Defined in `kernel/arch/x64/mmio_decode.zig`. Shared by VM LAPIC/IOAPIC handlers and virtual BAR emulation.
 
 Supported instruction patterns (the ones Linux's `readl`/`writel` and friends compile to):
 - `0x89` MOV r/m32, r32
@@ -2060,9 +2078,13 @@ Supported instruction patterns (the ones Linux's `readl`/`writel` and friends co
 
 ModR/M and SIB decoding handles all addressing forms Linux actually emits, including the `mod=00 rm=100 base=101` SIB-with-disp32 form needed for PIE kernels. Operand-size prefix `0x66` and REX prefixes are decoded for register selection and operand width.
 
-Returns a `MmioOp { is_write, size, reg, value, len, is_immediate }`. The exit handler dispatches to the device, then either calls `writeGpr(&guest_state, op.reg, value)` for reads or trusts the device to have stored `op.value` for writes, then advances RIP by `op.len`.
+`decodeBytes(buf: []const u8) DecodeError!MmioOp` takes a pre-fetched byte slice rather than requiring a `*Vm` pointer. Both the VM path and the virtual BAR path pre-fetch instruction bytes into a local buffer, then call this shared decoder.
 
-Guest virtual → physical translation goes through `guestVirtToPhys`, which walks the guest's CR3 4-level page tables (handling 1 GiB and 2 MiB huge pages) by reading guest physical memory through `Vm.guestPhysToHost`. When CR0.PG is clear (early boot in real/protected mode), guest virt = guest phys directly. The MMIO decoder reads instruction bytes via `Vm.readGuestPhysSlice`, which is also bounds-checked. The decoder never touches `Vm`'s memory bookkeeping fields directly — `guestPhysToHost`/`readGuestPhysSlice` are the single home for that arithmetic.
+Returns a `MmioOp { is_write, size, reg, value, len, is_immediate }`. The caller dispatches to the device, then either calls `writeGpr` for reads or trusts the device to have stored `op.value` for writes, then advances RIP by `op.len`.
+
+`GprArray` is a pointer to 16 `u64` values in ModRM canonical order (rax=0, rcx=1, rdx=2, rbx=3, rsp=4, rbp=5, rsi=6, rdi=7, r8–r15=8–15). `writeGpr(gprs: *GprArray, reg: u4, size: u8, value: u64) void` writes a value into the specified register slot at the given width. `readGpr(gprs: *GprArray, reg: u4, size: u8) u64` reads a value from the specified register slot. `SavedRegs` / `CpuContext` in `interrupts.zig` exposes `gprs() *GprArray`. `GuestState` in the KVM guest state file exposes `gprs() *GprArray`.
+
+Guest virtual → physical translation goes through `guestVirtToPhys`, which walks the guest's CR3 4-level page tables (handling 1 GiB and 2 MiB huge pages) by reading guest physical memory through `Vm.guestPhysToHost`. When CR0.PG is clear (early boot in real/protected mode), guest virt = guest phys directly. The existing `guestVirtToPhys` logic stays in the VM path (it needs `*Vm` for guest page tables), but instruction decoding itself is now arch-generic via `decodeBytes`. The decoder never touches `Vm`'s memory bookkeeping fields directly — `guestPhysToHost`/`readGuestPhysSlice` are the single home for that arithmetic.
 
 ### MSR Passthrough
 
