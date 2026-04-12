@@ -466,3 +466,96 @@ pub fn enableAlignmentCheck() void {
         : [cr0] "r" (cr0),
     );
 }
+
+/// Enable CR4.SMEP (bit 20) and CR4.SMAP (bit 21) when supported.
+///
+/// SMEP: Supervisor Mode Execution Prevention. With SMEP set, an instruction
+/// fetch from a user-mode page while running at CPL 0 raises #PF, foiling
+/// the classic "point RIP at user memory" exploit chain.
+///
+/// SMAP: Supervisor Mode Access Prevention. With SMAP set, a data access to
+/// a user-mode page while running at CPL 0 raises #PF unless RFLAGS.AC is 1
+/// (set/cleared via STAC/CLAC). Kernel code that intentionally touches a
+/// user buffer must bracket the access with `stac()` / `clac()`.
+///
+/// Feature bits: CPUID.(EAX=7,ECX=0):EBX bit 7 = SMEP, bit 20 = SMAP
+/// (Intel SDM Vol 2A, CPUID — Structured Extended Feature Flags).
+/// CR4 bit assignments: Intel SDM Vol 3A §2.5.
+pub fn enableSmapSmep() void {
+    const feat = cpuidRaw(0x7, 0);
+    const SMEP_BIT: u32 = 1 << 7;
+    const SMAP_BIT: u32 = 1 << 20;
+    const has_smep = (feat.ebx & SMEP_BIT) != 0;
+    const has_smap = (feat.ebx & SMAP_BIT) != 0;
+
+    var cr4 = asm ("mov %%cr4, %[cr4]"
+        : [cr4] "=r" (-> u64),
+    );
+    if (has_smep) cr4 |= (1 << 20);
+    if (has_smap) cr4 |= (1 << 21);
+    asm volatile ("mov %[cr4], %%cr4"
+        :
+        : [cr4] "r" (cr4),
+    );
+}
+
+/// Set RFLAGS.AC so the current core may read/write user pages under SMAP.
+/// Must be paired with `clac()`; keep the window as short as possible.
+pub inline fn stac() void {
+    asm volatile ("stac");
+}
+
+/// Clear RFLAGS.AC. Re-arms SMAP protection after a bracketed user access.
+pub inline fn clac() void {
+    asm volatile ("clac");
+}
+
+/// Enable speculative execution barriers (IBRS, STIBP) when supported.
+///
+/// IBRS (Indirect Branch Restricted Speculation): prevents indirect branch
+/// predictions made at a lower privilege level from influencing execution at
+/// a higher privilege level. Enhanced IBRS (eIBRS, "IBRS_ALL") is a
+/// set-once-at-boot variant with zero ongoing overhead — available on
+/// Coffee Lake Refresh / Zen 2 and later.
+///
+/// STIBP (Single Thread Indirect Branch Predictors): prevents one logical
+/// processor from influencing the branch predictions of its sibling
+/// hyperthread. Set alongside IBRS when supported.
+///
+/// Detection:
+///   CPUID.(EAX=7,ECX=0):EDX bit 26 = IBRS/IBPB supported
+///   CPUID.(EAX=7,ECX=0):EDX bit 27 = STIBP supported
+///   IA32_ARCH_CAPABILITIES (MSR 0x10A) bit 2 = IBRS_ALL (eIBRS)
+///
+/// Intel SDM Vol 3A §4.10.1; AMD APM Vol 2 §3.2.8.
+pub fn enableSpeculationBarriers() void {
+    const feat = cpuidRaw(0x7, 0);
+    const IBRS_BIT: u32 = 1 << 26;
+    const STIBP_BIT: u32 = 1 << 27;
+    const has_ibrs = (feat.edx & IBRS_BIT) != 0;
+    const has_stibp = (feat.edx & STIBP_BIT) != 0;
+
+    if (!has_ibrs and !has_stibp) return;
+
+    const IA32_SPEC_CTRL: u32 = 0x48;
+    var spec_ctrl: u64 = 0;
+    if (has_ibrs) spec_ctrl |= (1 << 0); // IBRS
+    if (has_stibp) spec_ctrl |= (1 << 1); // STIBP
+    wrmsr(IA32_SPEC_CTRL, spec_ctrl);
+}
+
+/// Execute RDRAND and return a 64-bit hardware random value, or null if the
+/// entropy source is unavailable or temporarily exhausted (CF=0).
+///
+/// Intel SDM Vol 1 §7.3.17; AMD APM Vol 3, RDRAND instruction reference.
+pub fn rdrand() ?u64 {
+    var value: u64 = 0;
+    var success: u8 = 0;
+    asm volatile (
+        \\rdrand %[val]
+        \\setc %[ok]
+        : [val] "=r" (value),
+          [ok] "=r" (success),
+    );
+    return if (success != 0) value else null;
+}

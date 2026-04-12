@@ -8,6 +8,7 @@ const address = zag.memory.address;
 const boot_protocol = zag.boot.protocol;
 const elf = zag.utils.elf;
 const paging = zag.memory.paging;
+const std_elf = std.elf;
 const uefi = std.os.uefi;
 
 const BootInfo = boot_protocol.BootInfo;
@@ -19,6 +20,98 @@ const ParsedElf = zag.utils.elf.ParsedElf;
 const VAddr = zag.memory.address.VAddr;
 
 const KEntryType = fn (*BootInfo) callconv(.{ .x86_64_sysv = .{} }) noreturn;
+
+fn computeKaslrSlide(parsed_elf: *const ParsedElf) u64 {
+    const link_base = address.AddrSpacePartition.kernel_code.start;
+    const kaslr_end = address.AddrSpacePartition.kernel_code.end;
+
+    var image_end: u64 = 0;
+    const num_sections = @intFromEnum(ElfSection.num_sections);
+    for (0..num_sections) |i| {
+        const section = parsed_elf.sections[i];
+        const section_end = section.vaddr + section.size;
+        if (section_end > image_end) image_end = section_end;
+    }
+    const image_size = std.mem.alignForward(u64, image_end - link_base, paging.PAGE4K);
+    const max_slide = kaslr_end - link_base - image_size;
+    const slide_pages = max_slide / paging.PAGE4K;
+
+    const entropy = arch.readTimestamp();
+    const offset_pages = entropy % slide_pages;
+    return offset_pages * paging.PAGE4K;
+}
+
+fn applyKaslrRelocations(file_bytes: []u8, slide: u64) !void {
+    if (slide == 0) return;
+    if (file_bytes.len < @sizeOf(std_elf.Elf64_Ehdr)) return error.InvalidElf;
+
+    const ehdr = std.mem.bytesAsValue(
+        std_elf.Elf64_Ehdr,
+        file_bytes[0..@sizeOf(std_elf.Elf64_Ehdr)],
+    );
+    const shdr_size: u64 = ehdr.e_shentsize;
+    const shdr_count: u64 = ehdr.e_shnum;
+
+    if (ehdr.e_shoff == 0 or shdr_count == 0) return;
+    if (shdr_size < @sizeOf(std_elf.Elf64_Shdr)) return;
+
+    var s: u64 = 0;
+    while (s < shdr_count) : (s += 1) {
+        const off = ehdr.e_shoff + s * shdr_size;
+        const shdr = std.mem.bytesAsValue(
+            std_elf.Elf64_Shdr,
+            file_bytes[off..][0..@sizeOf(std_elf.Elf64_Shdr)],
+        );
+        if (shdr.sh_type != std_elf.SHT_RELA) continue;
+
+        const target_idx: u64 = shdr.sh_info;
+        if (target_idx == 0 or target_idx >= shdr_count) continue;
+
+        const target_off = ehdr.e_shoff + target_idx * shdr_size;
+        const target_shdr = std.mem.bytesAsValue(
+            std_elf.Elf64_Shdr,
+            file_bytes[target_off..][0..@sizeOf(std_elf.Elf64_Shdr)],
+        );
+
+        if ((target_shdr.sh_flags & std_elf.SHF_ALLOC) == 0) continue;
+
+        const target_base_addr = target_shdr.sh_addr;
+        const target_base_file_offset = target_shdr.sh_offset;
+
+        const entry_size: u64 = @sizeOf(std_elf.Elf64_Rela);
+        const num_entries = shdr.sh_size / entry_size;
+
+        var r: u64 = 0;
+        while (r < num_entries) : (r += 1) {
+            const rela_off = shdr.sh_offset + r * entry_size;
+            const rela = std.mem.bytesAsValue(
+                std_elf.Elf64_Rela,
+                file_bytes[rela_off..][0..entry_size],
+            );
+            const rtype: u32 = @truncate(rela.r_info);
+
+            if (rtype == @intFromEnum(std_elf.R_X86_64.PC32) or
+                rtype == @intFromEnum(std_elf.R_X86_64.PLT32) or
+                rtype == @intFromEnum(std_elf.R_X86_64.NONE)) continue;
+
+            if (rela.r_offset < target_base_addr) return error.InvalidElf;
+            const file_off = target_base_file_offset + (rela.r_offset - target_base_addr);
+
+            if (rtype == @intFromEnum(std_elf.R_X86_64.@"64")) {
+                if (file_off + 8 > file_bytes.len) return error.InvalidElf;
+                const slot: *align(1) u64 = @ptrCast(file_bytes.ptr + file_off);
+                slot.* +%= slide;
+            } else if (rtype == @intFromEnum(std_elf.R_X86_64.@"32S")) {
+                if (file_off + 4 > file_bytes.len) return error.InvalidElf;
+                const slot: *align(1) i32 = @ptrCast(file_bytes.ptr + file_off);
+                const new_val: i64 = @as(i64, slot.*) +% @as(i64, @bitCast(slide));
+                slot.* = @truncate(new_val);
+            } else {
+                return error.InvalidElf;
+            }
+        }
+    }
+}
 
 pub fn main() uefi.Status {
     const boot_services: *uefi.tables.BootServices = uefi.system_table.boot_services orelse return .aborted;
@@ -84,6 +177,9 @@ pub fn main() uefi.Status {
     const parsed_elf: *ParsedElf = @ptrCast(parsed_elf_mem.ptr);
     elf.parseElf(parsed_elf, file_bytes) catch return .aborted;
 
+    const kaslr_slide = computeKaslrSlide(parsed_elf);
+    applyKaslrRelocations(file_bytes, kaslr_slide) catch return .aborted;
+
     const num_sections = @intFromEnum(ElfSection.num_sections);
     for (0..num_sections) |i| {
         const section_idx: ElfSection = @enumFromInt(i);
@@ -113,8 +209,8 @@ pub fn main() uefi.Status {
         };
 
         const section = parsed_elf.sections[i];
-        const start_vaddr = section.vaddr;
-        const end_vaddr = section.vaddr + section.size;
+        const start_vaddr = section.vaddr + kaslr_slide;
+        const end_vaddr = section.vaddr + section.size + kaslr_slide;
         var current_vaddr = start_vaddr;
         var file_offset = section.offset;
         while (current_vaddr < end_vaddr) {
@@ -214,6 +310,7 @@ pub fn main() uefi.Status {
     boot_info.xsdp_phys = xsdp_phys;
     boot_info.stack_top = aligned_stack_top_virt;
     boot_info.framebuffer = framebuffer;
+    boot_info.kaslr_slide = kaslr_slide;
     boot_info.mmap = boot_protocol.getMmap(boot_services) orelse return .aborted;
     boot_services.exitBootServices(
         uefi.handle,
@@ -226,7 +323,7 @@ pub fn main() uefi.Status {
         ) catch return .aborted;
     };
 
-    const kEntry: *KEntryType = @ptrFromInt(parsed_elf.entry.addr);
+    const kEntry: *KEntryType = @ptrFromInt(parsed_elf.entry.addr + kaslr_slide);
     kEntry(boot_info);
     unreachable;
 }

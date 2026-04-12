@@ -9,11 +9,14 @@ const ParsedElf = zag.utils.elf.ParsedElf;
 const VAddr = zag.memory.address.VAddr;
 
 pub var global_ptr: ?*std.debug.Dwarf = null;
+pub var kaslr_slide: u64 = 0;
 
 pub fn init(
     elf_blob: Blob,
+    slide: u64,
     allocator: std.mem.Allocator,
 ) void {
+    kaslr_slide = slide;
     const parsed_elf = allocator.create(ParsedElf) catch return;
     const elf_ptr_phys = PAddr.fromInt(@intFromPtr(elf_blob.ptr));
     const elf_ptr_virt = VAddr.fromPAddr(elf_ptr_phys, null);

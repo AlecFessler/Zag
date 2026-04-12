@@ -11,7 +11,7 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) n
 
     if (ret_addr) |ra| {
         if (debug.info.global_ptr) |dbg_info| {
-            const sym_name = dbg_info.getSymbolName(ra);
+            const sym_name = dbg_info.getSymbolName(ra - debug.info.kaslr_slide);
             if (sym_name) |sym| {
                 arch.print("KERNEL PANIC: {s} @ {s}\n", .{ msg, sym });
             }
@@ -31,7 +31,7 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) n
         const pc = it.next() orelse break;
 
         if (debug.info.global_ptr) |dbg_info| {
-            const sym_name = dbg_info.getSymbolName(pc);
+            const sym_name = dbg_info.getSymbolName(pc - debug.info.kaslr_slide);
             if (sym_name) |sym| {
                 arch.print("{s}\n", .{sym});
             }

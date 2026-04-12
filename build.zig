@@ -169,6 +169,11 @@ pub fn build(b: *std.Build) void {
     kernel.root_module.red_zone = false;
     kernel.root_module.addImport("zag", zag_mod);
     kernel.setLinkerScript(b.path("kernel/linker.ld"));
+    // Preserve relocation info so the bootloader can apply a random KASLR
+    // slide to kernel text/rodata/data at load time. Without --emit-relocs
+    // the .rela.* sections are stripped and absolute references bake in
+    // the link-time base address.
+    kernel.link_emit_relocs = true;
     b.installArtifact(kernel);
     const install_kernel = b.addInstallFile(
         kernel.getEmittedBin(),

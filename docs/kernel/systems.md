@@ -10,13 +10,14 @@ Zag is implemented in Zig, targeting x86_64 (with an aarch64 stub). The kernel i
 
 ### Boot Sequence
 
-1. `kEntry` -- Bootloader entry point. Switches to the bootloader-provided stack and jumps to `kTrampoline`.
-2. `kTrampoline` -- Calls `kMain`, panics on error.
-3. `kMain` executes the following in order:
+1. **Bootloader KASLR** -- Before entering the kernel, the bootloader picks a random page-aligned slide within `AddrSpacePartition.kernel_code`, patches all absolute relocations in the kernel ELF (`R_X86_64_64`, `R_X86_64_32S`) by adding the slide, maps each PT_LOAD segment at `vaddr + slide`, and passes the slide to the kernel via `BootInfo.kaslr_slide`. See §KASLR below.
+2. `kEntry` -- Bootloader entry point (at relocated address). Switches to the bootloader-provided stack and jumps to `kTrampoline`.
+3. `kTrampoline` -- Calls `kMain`, panics on error.
+4. `kMain` executes the following in order:
    - `arch.init()` -- IDT, GDT, segment registers, CPU features (bootstrap core only).
    - `memory.init(boot_info.mmap)` -- Physmap setup, buddy allocator init, PMM init, slab allocator init for VMM nodes, tree nodes, SHM objects, device regions, processes, and threads.
    - `memory.initHeap()` -- Kernel heap allocator init.
-   - `debug.info.init()` -- ELF symbol table for stack traces.
+   - `debug.info.init()` -- ELF symbol table for stack traces. Receives the KASLR slide so DWARF lookups can translate runtime PCs back to link-time addresses.
    - `arch.parseFirmwareTables(xsdp_phys)` -- ACPI parsing: MADT (cores, APIC), HPET, MCFG (PCI ECAM). PCI enumeration and serial port probing. Device registration.
    - `arch.vmInit()` -- Detect hardware virtualization support via CPUID, cache availability flag. After firmware tables (needs CPUID), before scheduler.
    - `arch.pmuInit()` -- Detect hardware PMU support via CPUID (x64) or stub (aarch64), cache `PmuInfo`, prime PMI handler vector. After firmware tables, before scheduler. See §20.
@@ -36,10 +37,9 @@ kernel/
   main.zig              -- entry point, boot sequence
   zag.zig               -- module root (re-exports)
   panic.zig             -- kernel panic handler
+  syscall.zig           -- syscall dispatch and validation
   arch/
-    dispatch.zig         -- architecture dispatch layer
-    interrupts.zig       -- ArchCpuContext type dispatch
-    syscall.zig          -- syscall dispatch and validation
+    dispatch.zig         -- architecture dispatch layer, ArchCpuContext/PageFaultContext types
     timer.zig            -- Timer vtable interface
     x64/
       init.zig           -- GDT, IDT, CPU features
@@ -63,25 +63,30 @@ kernel/
   memory/
     init.zig             -- memory subsystem initialization
     address.zig          -- VA/PA types, address space layout constants
+    fault.zig            -- page fault handler (demand paging)
     pmm.zig              -- physical memory manager with per-core page caches
-    buddy_allocator.zig  -- buddy allocator (PMM backing)
-    bump_allocator.zig   -- bump allocator (early boot, slab backing)
-    slab_allocator.zig   -- generic typed slab allocator
-    heap_allocator.zig   -- general-purpose kernel heap
     vmm.zig              -- virtual memory manager (red-black tree)
     stack.zig            -- kernel and user stack management
     shared.zig           -- shared memory objects
     device_region.zig    -- device region objects
     paging.zig           -- page size constants
-  sched/
-    scheduler.zig        -- run queues, context switch, timer handler
+    allocators/
+      buddy.zig          -- buddy allocator (PMM backing)
+      bump.zig           -- bump allocator (early boot, slab backing)
+      slab.zig           -- generic typed slab allocator
+      heap.zig           -- general-purpose kernel heap
+      bitmap_freelist.zig -- bitmap-based free list
+      intrusive_freelist.zig -- intrusive linked-list allocator
+  proc/
     process.zig          -- process struct, creation, exit, permissions
-    thread.zig           -- thread struct, creation, deinit
     restart_context.zig  -- restart context struct
     futex.zig            -- futex wait queue
-    sync.zig             -- SpinLock
     message_box.zig      -- MessageBox struct (one type, two instances per Process: msg_box and fault_box)
+  sched/
+    scheduler.zig        -- run queues, context switch, timer handler
+    thread.zig           -- thread struct, creation, deinit
     pmu.zig              -- generic PMU syscall layer, PmuStateAllocator slab owner
+    sysinfo.zig          -- generic sys_info syscall layer
   perms/
     permissions.zig      -- rights types, permission entry, user view entry
     privilege.zig        -- kernel/user privilege enum
@@ -89,6 +94,10 @@ kernel/
   containers/
     red_black_tree.zig   -- generic red-black tree
     priority_queue.zig   -- 5-level priority queue (run queues, futex, IPC)
+  utils/
+    sync.zig             -- SpinLock
+    range.zig            -- range utilities
+    elf.zig              -- ELF parsing utilities
   devices/
     devices.zig          -- device module root
     registry.zig         -- device table and registration
@@ -110,7 +119,7 @@ kernel/
 
 ### Process Struct
 
-Defined in `kernel/sched/process.zig`:
+Defined in `kernel/proc/process.zig`:
 
 ```
 Process {
@@ -186,7 +195,7 @@ Restart policy assignment:
 
 ### Restart Context
 
-Defined in `kernel/sched/restart_context.zig`:
+Defined in `kernel/proc/restart_context.zig`:
 
 ```
 RestartContext {
@@ -207,6 +216,37 @@ Allocated on the kernel heap (`memory_init.heap_allocator`). The ghost copy (`gh
 ### ASLR PRNG
 
 The VMM cursor starts at a random page-aligned offset within the ASLR zone `[0x0000_0000_0000_1000, 0x0000_1000_0000_0000)`. Entropy is sourced from `arch.readTimestamp()` (RDTSC on x86_64) at process creation time. The randomized base is page-aligned.
+
+### KASLR
+
+Kernel Address Space Layout Randomization is applied by the bootloader before entering the kernel.
+
+**Build prerequisite**: The kernel is built with `--emit-relocs` (`kernel.link_emit_relocs = true` in build.zig), which preserves `.rela.text` and `.rela.rodata` sections in the final ELF. The kernel retains `.code_model = .kernel` (x86_64 `-mcmodel=kernel`), so all absolute references use sign-extended 32-bit immediates (`R_X86_64_32S`) or 64-bit absolute values (`R_X86_64_64`).
+
+**Slide computation** (`bootloader/main.zig:computeKaslrSlide`):
+1. Compute kernel image size from parsed ELF sections (text + rodata + data + bss, page-aligned).
+2. Available slide range = `kernel_code.end - kernel_code.start - image_size`.
+3. Entropy: `arch.readTimestamp()` (RDTSC).
+4. Slide = `(entropy % (range / PAGE4K)) * PAGE4K` -- page-aligned.
+
+**Slide range**: `AddrSpacePartition.kernel_code` = `[0xFFFF_FFFF_8000_0000, 0xFFFF_FFFF_C000_0000)`. The kernel is linked at the start of this range. Maximum slide ≈ 1 GiB minus image size (≈ 18 bits of entropy at 4K granularity).
+
+**Relocation fixup** (`bootloader/main.zig:applyKaslrRelocations`): The bootloader walks all `.rela.*` section headers. For each RELA section whose target section has `SHF_ALLOC` set (i.e., loaded into memory):
+- `R_X86_64_64`: 8-byte slot at file offset += slide (wrapping add).
+- `R_X86_64_32S`: 4-byte slot sign-extended to 64-bit, += slide, truncated back to 32-bit. Safe because the slide keeps values in the -2 GiB..0 canonical window.
+- `R_X86_64_PC32`, `R_X86_64_PLT32`, `R_X86_64_NONE`: skipped (PC-relative; uniform slide preserves relative distances).
+- Non-allocated section relocations (debug sections): skipped entirely.
+
+Relocations are applied to `file_bytes` in place before the bootloader copies segment data to the mapped destination pages.
+
+**Section mapping**: Each kernel section is mapped at `section.vaddr + slide` instead of `section.vaddr`.
+
+**Entry point**: The bootloader calls `entry + slide`.
+
+**Kernel-side integration**:
+- `BootInfo.kaslr_slide` carries the slide into the kernel.
+- `debug.info.kaslr_slide` stores it for DWARF symbol resolution; `panic.zig` subtracts the slide from runtime PCs before calling `getSymbolName`.
+- SMP: The BSP writes relocated function addresses (taken at runtime, post-slide) into the trampoline parameter block. No special SMP handling required.
 
 ---
 
@@ -1017,7 +1057,11 @@ Portable dispatch layer in `kernel/arch/dispatch.zig`. All functions dispatch at
 
 ### Boot
 
-**init() -> void** -- IDT, GDT/TSS (per-core), segment registers, SYSCALL/SYSRET MSRs, CPU features (NX, SMEP, SMAP, etc.). Once on bootstrap core.
+**init() -> void** -- IDT, GDT/TSS (per-core), segment registers, SYSCALL/SYSRET MSRs, PAT, CR0.AM alignment check, SMEP/SMAP (see below), speculation barriers (see below). Once on bootstrap core. Secondary cores repeat the SMEP/SMAP and speculation barrier enables in `coreInit` after loading GDT/IDT.
+
+**SMEP/SMAP** -- `enableSmapSmep()` probes CPUID.(EAX=7,ECX=0):EBX bits 7 (SMEP) and 20 (SMAP), then sets the corresponding CR4 bits (20 and 21). SMEP prevents CPL-0 instruction fetch from user pages. SMAP prevents CPL-0 data access to user pages unless RFLAGS.AC=1. The interrupt stub prologue emits `CLAC` as its first instruction so handlers always enter with AC=0 regardless of the interrupted context's AC value (IRETQ restores the saved RFLAGS on return). Kernel code that must read/write user-mode buffers brackets the access with `userAccessBegin()` / `userAccessEnd()` (STAC / CLAC).
+
+**Speculation Barriers (IBRS/STIBP)** -- `enableSpeculationBarriers()` probes CPUID.(EAX=7,ECX=0):EDX bit 26 (IBRS/IBPB) and bit 27 (STIBP), then programs `IA32_SPEC_CTRL` MSR (0x48). IBRS (Indirect Branch Restricted Speculation) prevents indirect branch predictions made at a lower privilege level from influencing speculative execution at a higher privilege level — mitigates Spectre v2 (Branch Target Injection). STIBP (Single Thread Indirect Branch Predictors) prevents one logical processor from influencing its sibling hyperthread's branch predictions. On CPUs with enhanced IBRS (eIBRS, available Coffee Lake Refresh / Zen 2 and later), the MSR is set once at boot with zero ongoing overhead. On older CPUs with basic IBRS, the same set-once approach is used — acceptable for a microkernel since the MSR persists across privilege transitions. Both bits are set per-core on BSP and all APs. Intel SDM Vol 3A §4.10.1; AMD APM Vol 2 §3.2.8.
 
 **parseFirmwareTables(firmware_table_paddr: PAddr) -> void** -- Parse ACPI tables:
 - XSDP validation (signature, checksum).
@@ -1077,6 +1121,10 @@ Portable dispatch layer in `kernel/arch/dispatch.zig`. All functions dispatch at
 
 **triggerSchedulerInterrupt(core_id: u64) -> void** -- Send an IPI (inter-processor interrupt) to the specified core. Self-IPI for yield (`core_id == current core`), remote IPI for kill. Writes to LAPIC ICR (Interrupt Command Register) or x2APIC MSR.
 
+**userAccessBegin() -> void** -- On x86_64, executes `STAC` to set RFLAGS.AC=1, allowing the current core to access user-mode pages under SMAP. Must be paired with `userAccessEnd()` on every return path. On aarch64, this is a no-op. Keep the window as tight as possible — it suppresses SMAP protection for the duration on the issuing core.
+
+**userAccessEnd() -> void** -- On x86_64, executes `CLAC` to clear RFLAGS.AC, re-arming SMAP protection after a bracketed user access.
+
 ### Timing
 
 **getPreemptionTimer() -> Timer** -- Returns a LAPIC timer instance configured for one-shot mode. Used for per-core scheduler preemption. The LAPIC timer frequency is calibrated against HPET at boot.
@@ -1084,6 +1132,8 @@ Portable dispatch layer in `kernel/arch/dispatch.zig`. All functions dispatch at
 **getMonotonicClock() -> Timer** -- Returns a TSC-based timer for monotonic nanosecond timestamps. Used by `clock_gettime` syscall and futex timeout logic.
 
 **readTimestamp() -> u64** -- Raw `RDTSC` instruction. Architecture-specific cycle counter. Used for ASLR entropy at process creation time.
+
+**randomSeed() -> ?u64** -- Hardware-sourced random value. On x86_64 executes `RDRAND`; returns null if the entropy source is unavailable or temporarily exhausted. On aarch64 returns null (stub).
 
 ### Identification
 
@@ -1195,7 +1245,7 @@ PerCorePageCache {
 
 ### Buddy Allocator
 
-Defined in `kernel/memory/buddy_allocator.zig`. Backing allocator for the PMM.
+Defined in `kernel/memory/allocators/buddy.zig`. Backing allocator for the PMM.
 
 ```
 BuddyAllocator {
@@ -1216,7 +1266,7 @@ Uses a bitmap to track allocation state and per-order intrusive freelists for O(
 
 ### Bump Allocator
 
-Defined in `kernel/memory/bump_allocator.zig`. Simple monotonic allocator.
+Defined in `kernel/memory/allocators/bump.zig`. Simple monotonic allocator.
 
 ```
 BumpAllocator {
@@ -1232,7 +1282,7 @@ Allocation: align `free_addr` to requested alignment, advance by `len`. Returns 
 
 ### Slab Allocator
 
-Defined in `kernel/memory/slab_allocator.zig`. Generic, comptime-parameterized.
+Defined in `kernel/memory/allocators/slab.zig`. Generic, comptime-parameterized.
 
 ```
 SlabAllocator(T, stack_bootstrap, stack_size, allocation_chunk_size) {
@@ -1268,7 +1318,7 @@ In debug mode, tracks net allocations and asserts zero on `deinit`.
 
 ### Heap Allocator
 
-Defined in `kernel/memory/heap_allocator.zig`. General-purpose kernel heap for variable-size allocations.
+Defined in `kernel/memory/allocators/heap.zig`. General-purpose kernel heap for variable-size allocations.
 
 ```
 HeapAllocator {
@@ -1333,6 +1383,10 @@ Size: 32 GiB. Maps all physical memory (free and ACPI regions) using the largest
   [+heap_tree.end, +256 GiB)                       -- Kernel heap
 
 [0xFFFF_FF80_0000_0000, 0xFFFF_FF88_0000_0000)  -- Physmap (32 GiB)
+
+[0xFFFF_FFFF_8000_0000, 0xFFFF_FFFF_C000_0000)  -- Kernel code (KASLR range, 1 GiB)
+  Kernel image (.text, .rodata, .data, .bss) loaded at a random
+  page-aligned offset within this range by the bootloader.
 ```
 
 Comptime assertions verify that no kernel VA regions overlap.
@@ -1530,7 +1584,7 @@ Each Process has a `handle_refcount: u32` tracking how many perm table entries a
 
 ## 17. MessageBox Internals
 
-`kernel/sched/message_box.zig` defines a single `MessageBox` struct used for both IPC message passing and fault delivery. Each `Process` instantiates two of them: `proc.msg_box` for IPC, `proc.fault_box` for faults. The struct is payload-agnostic — it owns a state machine, a FIFO wait queue of `*Thread`, the blocked receiver slot, the pending-reply slot, and a lock. Callers (the IPC syscalls and the fault delivery path) extract payloads between state transitions.
+`kernel/proc/message_box.zig` defines a single `MessageBox` struct used for both IPC message passing and fault delivery. Each `Process` instantiates two of them: `proc.msg_box` for IPC, `proc.fault_box` for faults. The struct is payload-agnostic — it owns a state machine, a FIFO wait queue of `*Thread`, the blocked receiver slot, the pending-reply slot, and a lock. Callers (the IPC syscalls and the fault delivery path) extract payloads between state transitions.
 
 ### MessageBox
 
@@ -1604,7 +1658,7 @@ The full saved register state lives in `thread.ctx.regs` (set by the exception e
 
 ## 18. Fault Routing Internals
 
-Defined in `Process.faultBlock` (`kernel/sched/process.zig`). The fault delivery path is called from `kernel/arch/x64/exceptions.zig` (general exceptions) and `kernel/arch/interrupts.zig` (page faults) after the exception handler identifies a userspace fault.
+Defined in `Process.faultBlock` (`kernel/proc/process.zig`). The fault delivery path is called from `kernel/arch/x64/exceptions.zig` (general exceptions) and `kernel/memory/fault.zig` (page faults) after the exception handler identifies a userspace fault.
 
 ### faultBlock(self, thread, reason, fault_addr, rip) → bool
 
@@ -1688,7 +1742,7 @@ offset  size  field
  56    120   r15..rax        (15 GPRs in x64 Registers struct order)
 ```
 
-Both the synchronous-dequeue path (`writeFaultMessage` in `arch/syscall.zig`) and the cross-AS direct delivery path (`writeFaultMessageInto` in `sched/process.zig`) build the same 176 bytes via a shared `buildFaultMessage` helper.
+Both the synchronous-dequeue path (`writeFaultMessage` in `syscall.zig`) and the cross-AS direct delivery path (`writeFaultMessageInto` in `proc/process.zig`) build the same 176 bytes via a shared `buildFaultMessage` helper.
 
 ---
 
@@ -1986,10 +2040,10 @@ The generic layer (`kernel/sched/pmu.zig`) is architecture-agnostic. It validate
 
 ### Module-Level Changes
 
-- **`kernel/zag.zig`** — re-exports `pub const pmu = @import("sched/pmu.zig")` so the syscall dispatch in `kernel/arch/syscall.zig` can reach the generic syscall entry points.
+- **`kernel/zag.zig`** — module root. Re-exports `arch`, `memory`, `proc`, `sched`, `syscall`, `utils`, etc. The syscall dispatch in `kernel/syscall.zig` reaches the generic PMU entry points through `zag.sched.pmu`.
 - **`kernel/main.zig`** — calls `arch.pmuInit()` once after `arch.vmInit()` and before `sched.globalInit()`, mirroring the VM init ordering.
 - **`kernel/arch/dispatch.zig`** — adds the `PmuState` comptime type alias and the `pmuInit`/`pmuGetInfo`/`pmuSave`/`pmuRestore`/`pmuStart`/`pmuRead`/`pmuReset`/`pmuStop` functions (see §13).
-- **`kernel/arch/syscall.zig`** — adds dispatch cases for syscall numbers `pmu_info`, `pmu_start`, `pmu_read`, `pmu_reset`, and `pmu_stop`. Each case decodes arguments from the syscall entry frame and forwards to the corresponding `pmu.sysPmuXxx` entry point in `kernel/sched/pmu.zig`. No arg validation happens in the dispatch layer; validation lives in the generic layer so all arches share it.
+- **`kernel/syscall.zig`** — adds dispatch cases for syscall numbers `pmu_info`, `pmu_start`, `pmu_read`, `pmu_reset`, and `pmu_stop`. Each case decodes arguments from the syscall entry frame and forwards to the corresponding `pmu.sysPmuXxx` entry point in `kernel/sched/pmu.zig`. No arg validation happens in the dispatch layer; validation lives in the generic layer so all arches share it.
 - **`kernel/sched/thread.zig`** — adds the `pmu_state: ?*arch.PmuState = null` field (see §5) and the PMU-free step in `Thread.deinit` (automatic `pmu_stop` on thread exit, §2.14.9).
 - **`kernel/sched/scheduler.zig`** — context switch paths (`schedTimerHandler` and IPC `switchToThread`) add the null-guarded `arch.pmuSave` / `arch.pmuRestore` calls around `arch.switchTo` (see §6). All other scheduler logic is unchanged.
 - **`kernel/memory/init.zig`** — adds `PmuStateAllocator = SlabAllocator(arch.PmuState, false, 0, 64)` with a dedicated 16 MiB bump region between the VCpu slab region and the heap tree slab region. Initialized in `memory.init()` alongside the other slabs.
@@ -2150,7 +2204,7 @@ The generic layer follows the same split as PMU and VM: architecture-independent
 ### Module-Level Changes
 
 - **`kernel/arch/dispatch.zig`** — adds `getCoreFreq(core_id: u64) u64`, `getCoreTemp(core_id: u64) u32`, and `getCoreState(core_id: u64) u8` dispatch functions, each comptime-switched on `builtin.cpu.arch`.
-- **`kernel/arch/syscall.zig`** — adds a dispatch case for the `sys_info` syscall number that forwards directly to `kernel/sched/sysinfo.zig::sysSysInfo`.
+- **`kernel/syscall.zig`** — adds a dispatch case for the `sys_info` syscall number that forwards directly to `kernel/sched/sysinfo.zig::sysSysInfo`.
 - **`kernel/sched/sysinfo.zig`** — owns the observable `SysInfo` / `CoreInfo` extern types, the `sysSysInfo` entry point, the user-pointer validation/write helpers (a local copy of the same `validateUserWritable` / `writeUser` helpers used by the PMU module — duplicated to keep sysinfo free of any cross-dependency on PMU — plus a `probeUserWritable` helper that walks a range via `demandPage` + `resolveVaddr` without writing, used to reject partition-contained-but-unmapped `cores_ptr` addresses before any state is committed), the per-core read-and-reset of the scheduler accounting fields, and the physmap writes that stamp the result into the caller's address space.
 - **`kernel/sched/scheduler.zig`** — adds `idle_ns`, `busy_ns`, and `last_tick_ns` to `PerCoreState` (see §6) and the accounting hook at the top of `schedTimerHandler` (see §6). `last_tick_ns` is seeded in `sched.perCoreInit` after the monotonic clock is available and before the preemption timer is armed.
 - **`kernel/memory/pmm.zig`** — adds `freePageCount() u64` and `totalPageCount() u64` (see §14). Both read PMM and buddy-allocator state under `pmm.lock`.

@@ -13,6 +13,8 @@
 /// reading guest physical memory through the kernel physmap.
 const zag = @import("zag");
 
+const arch = zag.arch.dispatch;
+
 const GuestState = zag.arch.dispatch.GuestState;
 const Vm = zag.kvm.vm.Vm;
 
@@ -61,9 +63,15 @@ fn guestVirtToPhys(vm: *const Vm, cr3: u64, vaddr: u64) ?u64 {
 /// Read a u64 from guest physical memory via the VM's host RAM mapping.
 /// Delegates the bounds-checked guest-phys → host-VA translation to `Vm`
 /// so this module never touches `Vm`'s memory bookkeeping fields directly.
+///
+/// `guestPhysToHost` returns a *user-mode* virtual address (the VMM's own
+/// mapping of guest RAM), so the dereference must be bracketed by
+/// userAccessBegin/userAccessEnd to satisfy SMAP at CPL 0.
 fn readGuestPhysU64(vm: *const Vm, phys: u64) ?u64 {
     const ptr = vm.guestPhysToHost(phys, 8) orelse return null;
     const u64_ptr: *const align(1) u64 = @ptrCast(ptr);
+    arch.userAccessBegin();
+    defer arch.userAccessEnd();
     return u64_ptr.*;
 }
 
@@ -78,15 +86,22 @@ fn fetchInsn(vm: *const Vm, cr0: u64, cr3: u64, rip: u64, buf: *[15]u8) ?u8 {
     const avail: u64 = 4096 - page_off;
     const first: u8 = @intCast(@min(15, avail));
 
+    // readGuestPhysSlice returns a slice backed by a user-mode VA (the
+    // VMM's mapping of guest RAM), so the @memcpy reads must run with
+    // SMAP disarmed. Keep the window scoped to the copy itself.
     const slice = vm.readGuestPhysSlice(phys, first) orelse return null;
+    arch.userAccessBegin();
     @memcpy(buf[0..first], slice);
+    arch.userAccessEnd();
 
     if (first < 15) {
         const next_vaddr = (rip & ~@as(u64, 0xFFF)) + 4096;
         const next_phys = if (cr0 & (1 << 31) == 0) next_vaddr else (guestVirtToPhys(vm, cr3, next_vaddr) orelse return first);
         const remaining: u8 = 15 - first;
         if (vm.readGuestPhysSlice(next_phys, remaining)) |next_slice| {
+            arch.userAccessBegin();
             @memcpy(buf[first..15], next_slice);
+            arch.userAccessEnd();
             return 15;
         }
         return first;

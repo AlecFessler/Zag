@@ -43,6 +43,7 @@ pub const BootInfo = extern struct {
     root_service: Blob,
     stack_top: VAddr,
     xsdp_phys: PAddr,
+    kaslr_slide: u64,
     mmap: MMap,
     framebuffer: Framebuffer,
 };

@@ -267,6 +267,22 @@ pub fn restoreInterrupts(state: u64) void {
     }
 }
 
+pub inline fn userAccessBegin() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.stac(),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
+pub inline fn userAccessEnd() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.clac(),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
 pub fn triggerSchedulerInterrupt(core_id: u64) void {
     switch (builtin.cpu.arch) {
         .x86_64 => {

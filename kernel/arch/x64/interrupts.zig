@@ -181,7 +181,17 @@ pub fn registerVector(
 }
 
 export fn interruptStubPrologue() callconv(.naked) void {
+    // Re-arm SMAP before any kernel work runs. CLAC is a no-op on CPUs
+    // that lack SMAP (RFLAGS.AC is already 0 for CPL-0 code that never
+    // set it) but critically defends against an adversarial user that
+    // sets RFLAGS.AC=1 via POPFQ before issuing a syscall — without this
+    // the syscall dispatch would run with AC=1 and bypass SMAP for every
+    // raw user pointer access. IRETQ in `interruptStubEpilogue` restores
+    // the interrupted context's RFLAGS (including AC) from the iret
+    // frame, so kernel code interrupted mid-`userAccessBegin` resumes
+    // with AC=1 as expected. Single-byte-equivalent, no register clobber.
     asm volatile (
+        \\clac
         \\pushq %rax
         \\pushq %rcx
         \\pushq %rdx

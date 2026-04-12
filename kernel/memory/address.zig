@@ -27,6 +27,16 @@ pub const AddrSpacePartition = struct {
         .start = 0xFFFF_FF80_0000_0000,
         .end = 0xFFFF_FF88_0000_0000,
     };
+    // Region where the kernel image may land under KASLR. The `.kernel`
+    // code model requires all absolute references to sign-extend into the
+    // high -2 GB..0 canonical window, so the slide range sits at the
+    // bottom of that window. The kernel is linked at the start of this
+    // range; the bootloader picks a random page-aligned slide within it
+    // and patches relocations accordingly.
+    pub const kernel_code: Range = .{
+        .start = 0xFFFF_FFFF_8000_0000,
+        .end = 0xFFFF_FFFF_C000_0000,
+    };
 };
 
 pub const UserVA = struct {

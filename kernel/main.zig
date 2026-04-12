@@ -34,7 +34,7 @@ fn kMain(boot_info: *BootInfo) !void {
     arch.init();
     try memory.init(boot_info.mmap);
     try memory.initHeap();
-    debug.info.init(boot_info.elf_blob, memory.heap_allocator);
+    debug.info.init(boot_info.elf_blob, boot_info.kaslr_slide, memory.heap_allocator);
     try arch.parseFirmwareTables(boot_info.xsdp_phys);
     arch.vmInit();
     arch.pmuInit();

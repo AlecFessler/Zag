@@ -18,4 +18,6 @@ pub fn init() void {
     irq.init();
     cpu.initPat();
     cpu.enableAlignmentCheck();
+    cpu.enableSmapSmep();
+    cpu.enableSpeculationBarriers();
 }

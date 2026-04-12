@@ -190,8 +190,13 @@ fn sysWrite(ptr: u64, len: u64) SyscallResult {
     if (!address.AddrSpacePartition.user.contains(ptr)) return .{ .rax = E_BADADDR };
     const end = std.math.add(u64, ptr, len) catch return .{ .rax = E_BADADDR };
     if (!address.AddrSpacePartition.user.contains(end -| 1)) return .{ .rax = E_BADADDR };
+    // SMAP: print reads the user buffer while formatting, so the AC=1
+    // window must span the entire print call rather than just the slice
+    // construction.
+    arch.userAccessBegin();
     const msg: []const u8 = @as([*]const u8, @ptrFromInt(ptr))[0..len];
     arch.print("{s}", .{msg});
+    arch.userAccessEnd();
     return .{ .rax = @intCast(len) };
 }
 
@@ -478,7 +483,9 @@ fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_arg: 
         }
     }
     const user_bytes: [*]const u8 = @ptrFromInt(elf_ptr);
+    arch.userAccessBegin();
     @memcpy(elf_copy, user_bytes[0..elf_len]);
+    arch.userAccessEnd();
 
     const child = Process.create(elf_copy, child_perms, proc, thr_rights, child_max_priority) catch |e| return switch (e) {
         error.InvalidElf => E_INVAL,
@@ -1225,6 +1232,8 @@ fn sysFaultRecv(ctx: *ArchCpuContext, buf_ptr: u64, blocking: u64) SyscallResult
 fn applyModifiedRegs(dst: *Thread, src_ptr: u64) void {
     const target = dst.fault_user_ctx orelse return;
     const buf: [*]const u8 = @ptrFromInt(src_ptr);
+    arch.userAccessBegin();
+    defer arch.userAccessEnd();
     target.rip = @as(*align(1) const u64, @ptrCast(buf + 0)).*;
     target.rflags = @as(*align(1) const u64, @ptrCast(buf + 8)).*;
     target.rsp = @as(*align(1) const u64, @ptrCast(buf + 16)).*;
@@ -1476,7 +1485,11 @@ fn sysFaultWriteMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64 {
         const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_offset;
         const src: [*]const u8 = @ptrFromInt(src_addr);
         const dst: [*]u8 = @ptrFromInt(physmap_addr);
+        // `dst` is a kernel physmap address; only `src` is a raw user VA,
+        // so the SMAP window only needs to cover the read side of the copy.
+        arch.userAccessBegin();
         @memcpy(dst[0..chunk], src[0..chunk]);
+        arch.userAccessEnd();
         remaining -= chunk;
         dst_addr += chunk;
         src_addr += chunk;

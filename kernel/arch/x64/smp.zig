@@ -140,6 +140,8 @@ fn coreInit() callconv(.c) noreturn {
     cpu.ltr(gdt.TSS_OFFSET);
 
     cpu.initPat();
+    cpu.enableSmapSmep();
+    cpu.enableSpeculationBarriers();
     _ = cores_online.fetchAdd(1, .release);
     sched.perCoreInit();
     arch.halt();
