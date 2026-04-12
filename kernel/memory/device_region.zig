@@ -2,7 +2,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const PAddr = zag.memory.address.PAddr;
-const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
+const SlabAllocator = zag.memory.allocators.slab.SlabAllocator;
 
 pub const DeviceType = enum(u8) {
     mmio = 0,

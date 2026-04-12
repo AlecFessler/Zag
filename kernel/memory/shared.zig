@@ -5,7 +5,7 @@ const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 
 const PAddr = zag.memory.address.PAddr;
-const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
+const SlabAllocator = zag.memory.allocators.slab.SlabAllocator;
 const VAddr = zag.memory.address.VAddr;
 
 pub const SharedMemoryAllocator = SlabAllocator(SharedMemory, false, 0, 64, true);

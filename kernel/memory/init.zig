@@ -12,10 +12,10 @@ const pmu_mod = zag.sched.pmu;
 const shared = zag.memory.shared;
 const vmm_mod = zag.memory.vmm;
 
-const BuddyAllocator = zag.memory.buddy_allocator.BuddyAllocator;
-const BumpAllocator = zag.memory.bump_allocator.BumpAllocator;
-const HeapAllocator = zag.memory.heap_allocator.HeapAllocator;
-const HeapTreeAllocator = zag.memory.heap_allocator.TreeAllocator;
+const BuddyAllocator = zag.memory.allocators.buddy.BuddyAllocator;
+const BumpAllocator = zag.memory.allocators.bump.BumpAllocator;
+const HeapAllocator = zag.memory.allocators.heap.HeapAllocator;
+const HeapTreeAllocator = zag.memory.allocators.heap.TreeAllocator;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const MMap = zag.boot.protocol.MMap;
 const MMapEntry = zag.boot.protocol.MMapEntry;

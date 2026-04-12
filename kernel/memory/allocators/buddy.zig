@@ -1,8 +1,8 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const bitmap_freelist = zag.memory.bitmap_freelist;
-const intrusive_freelist = zag.memory.intrusive_freelist;
+const bitmap_freelist = zag.memory.allocators.bitmap_freelist;
+const intrusive_freelist = zag.memory.allocators.intrusive_freelist;
 
 pub const BuddyAllocator = struct {
     start_addr: u64,

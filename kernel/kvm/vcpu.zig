@@ -13,7 +13,7 @@ const vm_mod = zag.kvm.vm;
 
 const PAddr = zag.memory.address.PAddr;
 const Process = zag.sched.process.Process;
-const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
+const SlabAllocator = zag.memory.allocators.slab.SlabAllocator;
 const SpinLock = zag.sched.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;

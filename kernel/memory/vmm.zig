@@ -5,7 +5,7 @@ const arch = zag.arch.dispatch;
 const containers = zag.containers;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
-const slab_mod = zag.memory.slab_allocator;
+const slab_mod = zag.memory.allocators.slab;
 
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const MemoryPerms = zag.perms.memory.MemoryPerms;

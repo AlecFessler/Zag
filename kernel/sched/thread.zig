@@ -14,7 +14,7 @@ const kvm = zag.kvm;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const Process = zag.sched.process.Process;
-const SlabAllocator = zag.memory.slab_allocator.SlabAllocator;
+const SlabAllocator = zag.memory.allocators.slab.SlabAllocator;
 const Stack = zag.memory.stack.Stack;
 const VAddr = zag.memory.address.VAddr;
 

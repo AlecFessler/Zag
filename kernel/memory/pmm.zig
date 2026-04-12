@@ -5,7 +5,7 @@ const arch = zag.arch.dispatch;
 const paging = zag.memory.paging;
 const sched = zag.sched.scheduler;
 
-const BuddyAllocator = zag.memory.buddy_allocator.BuddyAllocator;
+const BuddyAllocator = zag.memory.allocators.buddy.BuddyAllocator;
 const SpinLock = zag.sched.sync.SpinLock;
 
 const MAX_CORES = 64;
