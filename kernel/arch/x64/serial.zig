@@ -1,4 +1,3 @@
-const builtin = @import("builtin");
 const std = @import("std");
 const zag = @import("zag");
 
@@ -24,7 +23,11 @@ const offsets = struct {
 var g_port: Ports = .com1;
 
 pub fn init(port: Ports, baud: u32) void {
-    if (builtin.mode != .Debug) return;
+    // Serial init is unconditional: the kernel test harness captures
+    // `[PASS] §X.Y.Z` messages off COM1 regardless of optimize mode, so
+    // we cannot gate this on `.Debug`. The earlier gate existed because
+    // production kernels want serial stripped, but that's a policy the
+    // test/bench profiles override — see also `print` below.
     const p = @intFromEnum(port);
     cpu.outb(0b00_000_0_00, p + offsets.lcr);
     cpu.outb(0, p + offsets.ier);
@@ -46,7 +49,8 @@ pub fn print(
     comptime format: []const u8,
     args: anytype,
 ) void {
-    if (builtin.mode != .Debug) return;
+    // No optimize-mode gate: see `init` above. Test output and debug
+    // panics both rely on this path in every build mode.
     var temp_buffer: [256]u8 = undefined;
     const s = std.fmt.bufPrint(
         temp_buffer[0..],
