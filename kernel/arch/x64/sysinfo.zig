@@ -74,6 +74,31 @@ var core_cache: [MAX_CORES]CoreCache align(64) = [_]CoreCache{.{}} ** MAX_CORES;
 /// `IA32_PERF_STATUS` ratio into an absolute frequency.
 var bus_freq_hz: u64 = DEFAULT_BUS_FREQ_HZ;
 
+/// True when the running CPU is `GenuineIntel` and the Intel-specific
+/// thermal/perf MSRs (`IA32_PERF_STATUS`, `IA32_THERM_STATUS`,
+/// `MSR_TEMPERATURE_TARGET`) are architecturally guaranteed to be present.
+/// Set once in `sysInfoInit` on the bootstrap core and read (never written)
+/// by every other core during `sysInfoPerCoreInit` / `sampleCoreHwState`.
+///
+/// On AMD (or any non-Intel vendor) these MSRs raise `#GP` — AMD exposes
+/// frequency/thermal data through a different MSR family (e.g. the MPERF/
+/// APERF pair and `HWCR`). Wiring up AMD-native sources is tracked for a
+/// future iteration; until then the cache stays at its zero-initialised
+/// state on AMD and `getCoreFreq` / `getCoreTemp` / `getCoreState` all
+/// return `0`, matching the aarch64 stub behaviour documented in
+/// `systems.md §21 "System Info Internals"`.
+var intel_msrs_available: bool = false;
+
+/// Detect `GenuineIntel` via CPUID leaf 0 (Intel SDM Vol 2 "CPUID"). The
+/// three-dword vendor string lives in `EBX:EDX:ECX`; 0x756e6547/0x49656e69/
+/// 0x6c65746e spells "Genu"/"ineI"/"ntel". Duplicates the tiny check from
+/// `arch/x64/vm.zig` rather than making that file's `Vendor` enum public —
+/// sysinfo only needs a boolean and has no business importing VM internals.
+fn isGenuineIntel() bool {
+    const r = cpu.cpuid(.basic_max, 0);
+    return r.ebx == 0x756e6547 and r.edx == 0x49656e69 and r.ecx == 0x6c65746e;
+}
+
 /// One-time system-info bring-up on the bootstrap core. Discovers the
 /// bus frequency via `CPUID.16h` (Intel SDM Vol 2 "CPUID" leaf 0x16)
 /// if available, falling back to `MSR_PLATFORM_INFO` bits 15:8 × 100 MHz
@@ -82,6 +107,15 @@ var bus_freq_hz: u64 = DEFAULT_BUS_FREQ_HZ;
 /// Called from `kMain` after `arch.pmuInit()` and before
 /// `sched.globalInit()`.
 pub fn sysInfoInit() void {
+    // On non-Intel vendors (AMD, etc.) the thermal/perf MSRs used by
+    // `sampleCoreHwState` are not architecturally defined and reading them
+    // raises `#GP`. Leave `intel_msrs_available = false`, skip the bus-
+    // frequency probe below, and let `sysInfoPerCoreInit` / `sampleCoreHwState`
+    // short-circuit so every `CoreInfo` field except the scheduler-sourced
+    // `idle_ns` / `busy_ns` reports 0. This mirrors the aarch64 stub.
+    if (!isGenuineIntel()) return;
+    intel_msrs_available = true;
+
     // Prefer CPUID.16h if the CPU advertises leaf 0x16. EAX[15:0] is the
     // base processor frequency in MHz and ECX[15:0] is the bus frequency
     // in MHz. When available, ECX is the authoritative bus clock used by
@@ -115,6 +149,10 @@ pub fn sysInfoPerCoreInit() void {
     const core_id = zag.arch.x64.apic.coreID();
     if (core_id >= MAX_CORES) return;
 
+    // On non-Intel vendors the MSRs below `#GP`; `sysInfoInit` left the
+    // cache slot zero-initialised, which is the agreed "unavailable" value.
+    if (!intel_msrs_available) return;
+
     const tt = cpu.rdmsr(MSR_TEMPERATURE_TARGET);
     const tjmax: u8 = @truncate((tt >> 16) & 0xFF);
     core_cache[core_id].tjmax_c = tjmax;
@@ -132,6 +170,13 @@ pub fn sysInfoPerCoreInit() void {
 pub fn sampleCoreHwState() void {
     const core_id = zag.arch.x64.apic.coreID();
     if (core_id >= MAX_CORES) return;
+
+    // Short-circuit on non-Intel: reading `IA32_PERF_STATUS` /
+    // `IA32_THERM_STATUS` here would `#GP` on AMD. Leaving the cache slot
+    // untouched (zero) matches the aarch64 stub and is what the `sys_info`
+    // tests already accept as "unvirtualised" (see §2.15.5 test body).
+    if (!intel_msrs_available) return;
+
     const slot = &core_cache[core_id];
 
     // ── Frequency: IA32_PERF_STATUS (MSR 0x198) ─────────────────────────
