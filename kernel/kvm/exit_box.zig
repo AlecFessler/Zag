@@ -18,6 +18,8 @@ const VAddr = zag.memory.address.VAddr;
 const VCpu = vcpu_mod.VCpu;
 const Vm = vm_mod.Vm;
 
+const KernelObject = zag.perms.permissions.KernelObject;
+
 const MAX_VCPUS = vm_mod.MAX_VCPUS;
 
 pub const VmExitBoxState = enum {
@@ -156,12 +158,12 @@ fn deliverExit(vm_obj: *Vm, vcpu_obj: *VCpu, receiver: *Thread) void {
 
 /// Syscall implementation: dequeue from exit box, write VmExitMessage
 /// to userspace buffer, return exit token (= thread handle).
-pub fn vmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContext, buf_ptr: u64, blocking: bool) SyscallResult {
-    const E_INVAL: i64 = -1;
+pub fn vmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContext, vm_handle: u64, buf_ptr: u64, blocking: bool) SyscallResult {
+    const E_BADCAP: i64 = -3;
     const E_BADADDR: i64 = -7;
     const E_AGAIN: i64 = -9;
 
-    const vm_obj = proc.vm orelse return .{ .rax = E_INVAL };
+    const vm_obj = resolveVmHandle(proc, vm_handle) orelse return .{ .rax = E_BADCAP };
     const box = vm_obj.exitBox();
 
     if (buf_ptr == 0) return .{ .rax = E_BADADDR };
@@ -203,12 +205,13 @@ pub fn vmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContext, buf_ptr: u6
 }
 
 /// Syscall implementation: resolve a pending exit by token.
-pub fn vmReply(proc: *Process, exit_token: u64, action_ptr: u64) i64 {
+pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64) i64 {
     const E_INVAL: i64 = -1;
+    const E_BADCAP: i64 = -3;
     const E_BADADDR: i64 = -7;
     const E_NOENT: i64 = -10;
 
-    const vm_obj = proc.vm orelse return E_INVAL;
+    const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
 
     // Find the vCPU by thread handle (check exit_token validity first)
     const entry = proc.getPermByHandle(exit_token) orelse return E_NOENT;
@@ -292,7 +295,7 @@ pub fn vmReply(proc: *Process, exit_token: u64, action_ptr: u64) i64 {
             const guest_addr = std.mem.readInt(u64, payload[8..16], .little);
             const map_size = std.mem.readInt(u64, payload[16..24], .little);
             const rights = payload[24];
-            const result = vm_mod.guestMap(proc, host_vaddr, guest_addr, map_size, @as(u64, rights));
+            const result = vm_mod.guestMap(proc, vm_handle, host_vaddr, guest_addr, map_size, @as(u64, rights));
             if (result != 0) return result;
             vcpu_obj.storeState(.running);
             resumeVcpuThread(thread);
@@ -390,4 +393,13 @@ fn resumeVcpuThread(thread: *Thread) void {
     thread.state = .ready;
     const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
     sched.enqueueOnCore(target_core, thread);
+}
+
+/// Resolve a VM handle from the process's perm table. Returns the *Vm or null.
+fn resolveVmHandle(proc: *Process, vm_handle: u64) ?*Vm {
+    const entry = proc.getPermByHandle(vm_handle) orelse return null;
+    return switch (entry.object) {
+        .vm => |v| v,
+        else => null,
+    };
 }

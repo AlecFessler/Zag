@@ -178,17 +178,17 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
         .fault_write_mem => .{ .rax = sysFaultWriteMem(arg0, arg1, arg2, arg3) },
         .fault_set_thread_mode => .{ .rax = sysFaultSetThreadMode(arg0, arg1) },
         .vm_create => .{ .rax = sysVmCreate(arg0, arg1) },
-        .vm_destroy => .{ .rax = sysVmDestroy() },
-        .vm_guest_map => .{ .rax = sysVmGuestMap(arg0, arg1, arg2, arg3) },
-        .vm_recv => sysVmRecv(ctx, arg0, arg1),
-        .vm_reply => .{ .rax = sysVmReplyCall(arg0, arg1) },
+        .vm_destroy => .{ .rax = E_INVAL },
+        .vm_guest_map => .{ .rax = sysVmGuestMap(arg0, arg1, arg2, arg3, arg4) },
+        .vm_recv => sysVmRecv(ctx, arg0, arg1, arg2),
+        .vm_reply => .{ .rax = sysVmReplyCall(arg0, arg1, arg2) },
         .vm_vcpu_set_state => .{ .rax = sysVmVcpuSetState(arg0, arg1) },
         .vm_vcpu_get_state => .{ .rax = sysVmVcpuGetState(arg0, arg1) },
         .vm_vcpu_run => .{ .rax = sysVmVcpuRun(arg0) },
         .vm_vcpu_interrupt => .{ .rax = sysVmVcpuInterrupt(arg0, arg1) },
-        .vm_msr_passthrough => .{ .rax = sysVmMsrPassthrough(arg0, arg1, arg2) },
-        .vm_ioapic_assert_irq => .{ .rax = sysVmIoapicAssertIrq(arg0) },
-        .vm_ioapic_deassert_irq => .{ .rax = sysVmIoapicDeassertIrq(arg0) },
+        .vm_msr_passthrough => .{ .rax = sysVmMsrPassthrough(arg0, arg1, arg2, arg3) },
+        .vm_ioapic_assert_irq => .{ .rax = sysVmIoapicAssertIrq(arg0, arg1) },
+        .vm_ioapic_deassert_irq => .{ .rax = sysVmIoapicDeassertIrq(arg0, arg1) },
         .pmu_info => .{ .rax = sysPmuInfo(arg0) },
         .pmu_start => .{ .rax = sysPmuStart(arg0, arg1, arg2) },
         .pmu_read => .{ .rax = sysPmuRead(arg0, arg1) },
@@ -665,6 +665,10 @@ fn sysRevokePerm(handle: u64) i64 {
         },
         .thread => {
             // Revoking a thread handle just clears the slot, doesn't affect the thread
+            proc.removePerm(handle) catch {};
+        },
+        .vm => |vm_obj| {
+            vm_obj.destroy();
             proc.removePerm(handle) catch {};
         },
         .empty => return E_BADCAP,
@@ -2179,25 +2183,20 @@ fn sysVmCreate(vcpu_count: u64, policy_ptr: u64) i64 {
     return kvm.vm.vmCreate(proc, @intCast(vcpu_count), policy_ptr);
 }
 
-fn sysVmDestroy() i64 {
+fn sysVmGuestMap(vm_handle: u64, host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
     const proc = currentProc();
-    return kvm.vm.vmDestroy(proc);
+    return kvm.vm.guestMap(proc, vm_handle, host_vaddr, guest_addr, size, rights);
 }
 
-fn sysVmGuestMap(host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
-    const proc = currentProc();
-    return kvm.vm.guestMap(proc, host_vaddr, guest_addr, size, rights);
-}
-
-fn sysVmRecv(ctx: *ArchCpuContext, buf_ptr: u64, blocking: u64) SyscallResult {
+fn sysVmRecv(ctx: *ArchCpuContext, vm_handle: u64, buf_ptr: u64, blocking: u64) SyscallResult {
     const thread = sched.currentThread().?;
     const proc = thread.process;
-    return kvm.exit_box.vmRecv(proc, thread, ctx, buf_ptr, blocking != 0);
+    return kvm.exit_box.vmRecv(proc, thread, ctx, vm_handle, buf_ptr, blocking != 0);
 }
 
-fn sysVmReplyCall(exit_token: u64, action_ptr: u64) i64 {
+fn sysVmReplyCall(vm_handle: u64, exit_token: u64, action_ptr: u64) i64 {
     const proc = currentProc();
-    return kvm.exit_box.vmReply(proc, exit_token, action_ptr);
+    return kvm.exit_box.vmReply(proc, vm_handle, exit_token, action_ptr);
 }
 
 fn sysVmVcpuSetState(thread_handle: u64, state_ptr: u64) i64 {
@@ -2220,20 +2219,20 @@ fn sysVmVcpuInterrupt(thread_handle: u64, interrupt_ptr: u64) i64 {
     return kvm.vcpu.vcpuInterrupt(proc, thread_handle, interrupt_ptr);
 }
 
-fn sysVmMsrPassthrough(msr_num: u64, allow_read: u64, allow_write: u64) i64 {
+fn sysVmMsrPassthrough(vm_handle: u64, msr_num: u64, allow_read: u64, allow_write: u64) i64 {
     const proc = currentProc();
     if (msr_num > std.math.maxInt(u32)) return E_INVAL;
-    return kvm.vm.msrPassthrough(proc, @truncate(msr_num), allow_read != 0, allow_write != 0);
+    return kvm.vm.msrPassthrough(proc, vm_handle, @truncate(msr_num), allow_read != 0, allow_write != 0);
 }
 
-fn sysVmIoapicAssertIrq(irq_num: u64) i64 {
+fn sysVmIoapicAssertIrq(vm_handle: u64, irq_num: u64) i64 {
     const proc = currentProc();
-    return kvm.vm.ioapicAssertIrq(proc, irq_num);
+    return kvm.vm.ioapicAssertIrq(proc, vm_handle, irq_num);
 }
 
-fn sysVmIoapicDeassertIrq(irq_num: u64) i64 {
+fn sysVmIoapicDeassertIrq(vm_handle: u64, irq_num: u64) i64 {
     const proc = currentProc();
-    return kvm.vm.ioapicDeassertIrq(proc, irq_num);
+    return kvm.vm.ioapicDeassertIrq(proc, vm_handle, irq_num);
 }
 
 // --- PMU (§4.50–§4.54) ---

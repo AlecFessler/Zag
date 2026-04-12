@@ -1,4 +1,4 @@
-/// §2.13.1 — All VM syscalls (except `vm_create`) return `E_INVAL` if the calling process has no VM.
+/// §2.13.1 — All VM syscalls with an invalid handle return `E_BADCAP`.
 const lib = @import("lib");
 
 const syscall = lib.syscall;
@@ -7,8 +7,9 @@ const t = lib.testing;
 var buf: [4096]u8 align(8) = .{0} ** 4096;
 
 pub fn main(_: u64) void {
-    // Process has no VM. All VM syscalls except vm_create should return E_INVAL.
+    // Process has no VM. Use a bogus handle. All VM handle syscalls should return E_BADCAP.
     var all_pass = true;
+    const bad_handle: u64 = 0xDEAD;
 
     const r1 = syscall.vm_destroy();
     if (r1 != syscall.E_INVAL) {
@@ -16,21 +17,21 @@ pub fn main(_: u64) void {
         all_pass = false;
     }
 
-    const r2 = syscall.vm_guest_map(0, 0x1000, 0x1000, 0x1);
-    if (r2 != syscall.E_INVAL) {
-        t.failWithVal("§2.13.1 vm_guest_map", syscall.E_INVAL, r2);
+    const r2 = syscall.vm_guest_map(bad_handle, 0, 0x1000, 0x1000, 0x1);
+    if (r2 != syscall.E_BADHANDLE) {
+        t.failWithVal("§2.13.1 vm_guest_map", syscall.E_BADHANDLE, r2);
         all_pass = false;
     }
 
-    const r3 = syscall.vm_recv(@intFromPtr(&buf), 0);
-    if (r3 != syscall.E_INVAL) {
-        t.failWithVal("§2.13.1 vm_recv", syscall.E_INVAL, r3);
+    const r3 = syscall.vm_recv(bad_handle, @intFromPtr(&buf), 0);
+    if (r3 != syscall.E_BADHANDLE) {
+        t.failWithVal("§2.13.1 vm_recv", syscall.E_BADHANDLE, r3);
         all_pass = false;
     }
 
-    const r4 = syscall.vm_reply_action(0, 0);
-    if (r4 != syscall.E_INVAL) {
-        t.failWithVal("§2.13.1 vm_reply", syscall.E_INVAL, r4);
+    const r4 = syscall.vm_reply_action(bad_handle, 0, 0);
+    if (r4 != syscall.E_BADHANDLE) {
+        t.failWithVal("§2.13.1 vm_reply", syscall.E_BADHANDLE, r4);
         all_pass = false;
     }
 

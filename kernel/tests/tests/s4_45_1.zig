@@ -26,7 +26,7 @@ pub fn main(pv: u64) void {
         t.pass("§4.45.1");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§4.45.1 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
@@ -34,7 +34,7 @@ pub fn main(pv: u64) void {
     const vcpu_handle = findVcpuHandle(view, self_handle);
     if (vcpu_handle == 0) {
         t.fail("§4.45.1 no vCPU handle");
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -42,6 +42,6 @@ pub fn main(pv: u64) void {
     const result = syscall.vm_vcpu_run(vcpu_handle);
     t.expectEqual("§4.45.1", syscall.E_OK, result);
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

@@ -12,16 +12,16 @@ pub fn main(_: u64) void {
         t.pass("§4.40.7");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§4.40.7 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
 
     // Page-aligned host_vaddr pointing to unmapped memory in user address space.
     const unmapped_addr: u64 = 0x0000_7000_0000_0000;
-    const result = syscall.vm_guest_map(unmapped_addr, 0x1000, 0x1000, 0x1);
+    const result = syscall.vm_guest_map(@bitCast(cr), unmapped_addr, 0x1000, 0x1000, 0x1);
     t.expectEqual("§4.40.7", syscall.E_BADADDR, result);
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

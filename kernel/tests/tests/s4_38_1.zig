@@ -1,4 +1,4 @@
-/// §4.38.1 — `vm_create` returns `E_OK` on success.
+/// §4.38.1 — `vm_create` returns a positive handle on success.
 const lib = @import("lib");
 
 const syscall = lib.syscall;
@@ -13,11 +13,11 @@ pub fn main(_: u64) void {
         t.pass("§4.38.1");
         syscall.shutdown();
     }
-    if (result == syscall.E_OK) {
+    if (result > 0) {
         t.pass("§4.38.1");
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(result));
     } else {
-        t.failWithVal("§4.38.1", syscall.E_OK, result);
+        t.failWithVal("§4.38.1", 1, result);
     }
     syscall.shutdown();
 }

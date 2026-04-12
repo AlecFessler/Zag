@@ -12,7 +12,7 @@ pub fn main(_: u64) void {
         t.pass("§4.49.1");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§4.49.1 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
@@ -21,7 +21,7 @@ pub fn main(_: u64) void {
     var passed = true;
     var irq: u64 = 0;
     while (irq < 24) : (irq += 1) {
-        const result = syscall.vm_ioapic_deassert_irq(irq);
+        const result = syscall.vm_ioapic_deassert_irq(@bitCast(cr), irq);
         if (result != syscall.E_OK) {
             t.failWithVal("§4.49.1", syscall.E_OK, result);
             passed = false;
@@ -32,6 +32,6 @@ pub fn main(_: u64) void {
         t.pass("§4.49.1");
     }
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

@@ -27,7 +27,7 @@ pub fn main(pv: u64) void {
         t.pass("§4.42.3");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§4.42.3 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
@@ -35,7 +35,7 @@ pub fn main(pv: u64) void {
     const vcpu_handle = findVcpuHandle(view, self_handle);
     if (vcpu_handle == 0) {
         t.fail("§4.42.3 no vCPU handle");
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -43,17 +43,17 @@ pub fn main(pv: u64) void {
     _ = syscall.vm_vcpu_run(vcpu_handle);
 
     // Receive the exit.
-    const exit_token = syscall.vm_recv(@intFromPtr(&buf), 1);
+    const exit_token = syscall.vm_recv(@bitCast(cr), @intFromPtr(&buf), 1);
     if (exit_token <= 0) {
         t.failWithVal("§4.42.3 recv", 1, exit_token);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
     // Reply with null action_ptr — should return E_BADADDR.
-    const result = syscall.vm_reply_action(@bitCast(exit_token), 0);
+    const result = syscall.vm_reply_action(@bitCast(cr), @bitCast(exit_token), 0);
     t.expectEqual("§4.42.3", syscall.E_BADADDR, result);
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

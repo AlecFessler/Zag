@@ -12,16 +12,16 @@ pub fn main(_: u64) void {
         t.pass("§4.42.2");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§4.42.2 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
 
     // Use a bogus exit_token — no pending exits, so E_NOENT.
     // action_ptr=0 may also be bad, but token check comes first.
-    const result = syscall.vm_reply_action(0xDEAD, 0);
+    const result = syscall.vm_reply_action(@bitCast(cr), 0xDEAD, 0);
     t.expectEqual("§4.42.2", syscall.E_NOENT, result);
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

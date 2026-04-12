@@ -14,8 +14,8 @@ pub fn main(_: u64) void {
         t.pass("§4.38.4");
         syscall.shutdown();
     }
-    if (r1 != syscall.E_OK) {
-        t.failWithVal("§4.38.4 first create", syscall.E_OK, r1);
+    if (r1 < 0) {
+        t.failWithVal("§4.38.4 first create", 1, r1);
         syscall.shutdown();
     }
 
@@ -24,6 +24,6 @@ pub fn main(_: u64) void {
     t.expectEqual("§4.38.4", syscall.E_INVAL, r2);
 
     // Clean up.
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(r1));
     syscall.shutdown();
 }

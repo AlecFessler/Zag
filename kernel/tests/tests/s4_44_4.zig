@@ -82,7 +82,7 @@ pub fn main(pv: u64) void {
         t.pass("§4.44.4");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§4.44.4 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
@@ -90,7 +90,7 @@ pub fn main(pv: u64) void {
     const vcpu_handle = findVcpuHandle(view, self_handle);
     if (vcpu_handle == 0) {
         t.fail("§4.44.4 no vCPU handle");
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -127,7 +127,7 @@ pub fn main(pv: u64) void {
     const sr = syscall.vm_vcpu_set_state(vcpu_handle, @intFromPtr(&set_state));
     if (sr != syscall.E_OK) {
         t.failWithVal("§4.44.4 set_state", syscall.E_OK, sr);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -135,7 +135,7 @@ pub fn main(pv: u64) void {
     const gr = syscall.vm_vcpu_get_state(vcpu_handle, @intFromPtr(&get_state));
     if (gr != syscall.E_OK) {
         t.failWithVal("§4.44.4 get_state", syscall.E_OK, gr);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -180,6 +180,6 @@ pub fn main(pv: u64) void {
         }
     }
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

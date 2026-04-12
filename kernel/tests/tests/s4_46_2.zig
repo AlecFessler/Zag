@@ -12,7 +12,7 @@ pub fn main(_: u64) void {
         t.pass("§4.46.2");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§4.46.2 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
@@ -22,6 +22,6 @@ pub fn main(_: u64) void {
     const result = syscall.vm_vcpu_interrupt(self_handle, 0);
     t.expectEqual("§4.46.2", syscall.E_BADHANDLE, result);
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

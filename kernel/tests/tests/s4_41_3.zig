@@ -13,15 +13,15 @@ pub fn main(_: u64) void {
         t.pass("§4.41.3");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§4.41.3 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
 
     // Non-blocking vm_recv with valid buf — no exits pending → E_AGAIN.
-    const result = syscall.vm_recv(@intFromPtr(&buf), 0);
+    const result = syscall.vm_recv(@bitCast(cr), @intFromPtr(&buf), 0);
     t.expectEqual("§4.41.3", syscall.E_AGAIN, result);
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

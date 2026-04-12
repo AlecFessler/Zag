@@ -15,14 +15,14 @@ pub fn main(_: u64) void {
         t.pass("§4.47.1");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§4.47.1 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
 
-    const result = syscall.vm_msr_passthrough(MSR_IA32_TSC, 1, 1);
+    const result = syscall.vm_msr_passthrough(@bitCast(cr), MSR_IA32_TSC, 1, 1);
     t.expectEqual("§4.47.1", syscall.E_OK, result);
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

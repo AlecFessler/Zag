@@ -109,7 +109,7 @@ pub fn main(pv: u64) void {
         t.pass("§2.13.9");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§2.13.9 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
@@ -118,7 +118,7 @@ pub fn main(pv: u64) void {
     const res = syscall.mem_reserve(0, syscall.PAGE4K, 0x3);
     if (res.val < 0) {
         t.failWithVal("§2.13.9 reserve", 0, res.val);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
     const host_ptr: [*]u8 = @ptrFromInt(res.val2);
@@ -126,17 +126,17 @@ pub fn main(pv: u64) void {
         host_ptr[i] = byte;
     }
 
-    const mr = syscall.vm_guest_map(res.val2, 0x0, syscall.PAGE4K, 0x7);
+    const mr = syscall.vm_guest_map(@bitCast(cr), res.val2, 0x0, syscall.PAGE4K, 0x7);
     if (mr != syscall.E_OK) {
         t.failWithVal("§2.13.9 vm_guest_map", syscall.E_OK, mr);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
     const vcpu_handle = findVcpuHandle(view, self_handle);
     if (vcpu_handle == 0) {
         t.fail("§2.13.9 no vCPU handle");
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -145,7 +145,7 @@ pub fn main(pv: u64) void {
     const sr = syscall.vm_vcpu_set_state(vcpu_handle, @intFromPtr(&guest_state));
     if (sr != syscall.E_OK) {
         t.failWithVal("§2.13.9 set_state", syscall.E_OK, sr);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -156,10 +156,10 @@ pub fn main(pv: u64) void {
     // the exit should be HLT (not CPUID). We verify by checking that
     // the guest RIP is at or past the HLT instruction (offset 4),
     // proving the guest continued past CPUID without a VMM exit.
-    const exit_token = syscall.vm_recv(@intFromPtr(&buf), 1);
+    const exit_token = syscall.vm_recv(@bitCast(cr), @intFromPtr(&buf), 1);
     if (exit_token <= 0) {
         t.failWithVal("§2.13.9 recv", 1, exit_token);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -168,7 +168,7 @@ pub fn main(pv: u64) void {
     const gr = syscall.vm_vcpu_get_state(vcpu_handle, @intFromPtr(&read_state));
     if (gr != syscall.E_OK) {
         t.failWithVal("§2.13.9 get_state", syscall.E_OK, gr);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -184,6 +184,6 @@ pub fn main(pv: u64) void {
         t.failWithVal("§2.13.9 rip", 4, @as(i64, @bitCast(guest_rip)));
     }
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

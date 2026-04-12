@@ -14,8 +14,10 @@ const vcpu_mod = zag.kvm.vcpu;
 
 const GuestMemory = guest_memory.GuestMemory;
 const Ioapic = ioapic_mod.Ioapic;
+const KernelObject = zag.perms.permissions.KernelObject;
 const Lapic = lapic_mod.Lapic;
 const PAddr = zag.memory.address.PAddr;
+const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Process = zag.proc.process.Process;
 const SlabAllocator = zag.memory.allocators.slab.SlabAllocator;
 const SpinLock = zag.utils.sync.SpinLock;
@@ -180,8 +182,8 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
     if (vcpu_count == 0 or vcpu_count > MAX_VCPUS) return E_INVAL;
     if (proc.vm != null) return E_INVAL;
 
-    // Check we have room in perm table for all vCPU thread handles
-    if (proc.perm_count + vcpu_count > zag.proc.process.MAX_PERMS) return E_MAXCAP;
+    // Check we have room in perm table for all vCPU thread handles + 1 VM handle
+    if (proc.perm_count + vcpu_count + 1 > zag.proc.process.MAX_PERMS) return E_MAXCAP;
 
     // Read policy from userspace via physmap, handling cross-page boundaries.
     if (policy_ptr == 0) return E_BADADDR;
@@ -263,7 +265,23 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
     }
 
     proc.vm = vm_obj;
-    return 0; // E_OK
+
+    // Insert VM handle into caller's perm table
+    const vm_handle_id = proc.insertPerm(PermissionEntry{
+        .handle = 0, // will be assigned by insertPerm
+        .object = KernelObject{ .vm = vm_obj },
+        .rights = 0xFFFF,
+    }) catch {
+        // Cleanup on failure: remove all vCPU thread handles, destroy VM
+        var k: u32 = 0;
+        while (k < inserted_count) : (k += 1) {
+            proc.removePerm(inserted_handles[k]) catch {};
+        }
+        vm_obj.destroy();
+        return E_MAXCAP;
+    };
+
+    return @bitCast(vm_handle_id);
 }
 
 /// Syscall implementation: destroy the calling process's VM.
@@ -276,12 +294,13 @@ pub fn vmDestroy(proc: *Process) i64 {
 }
 
 /// Syscall implementation: map host virtual memory into guest physical address space (EPT).
-pub fn guestMap(proc: *Process, host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
+pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
     const E_INVAL: i64 = -1;
+    const E_BADCAP: i64 = -3;
     const E_NOMEM: i64 = -4;
     const E_BADADDR: i64 = -7;
 
-    const vm_obj = proc.vm orelse return E_INVAL;
+    const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
 
     if (size == 0) return E_INVAL;
     if (!std.mem.isAligned(guest_addr, 0x1000)) return E_INVAL;
@@ -343,11 +362,11 @@ fn rollbackGuestMap(vm_obj: *Vm, guest_addr: u64, mapped_size: u64) void {
 
 /// Syscall implementation: allow/deny MSR passthrough for the calling process's VM.
 /// Modifies MSRPM bits in the VMCB. Refuses security-critical MSRs.
-pub fn msrPassthrough(proc: *Process, msr_num: u32, allow_read: bool, allow_write: bool) i64 {
-    const E_INVAL: i64 = -1;
+pub fn msrPassthrough(proc: *Process, vm_handle: u64, msr_num: u32, allow_read: bool, allow_write: bool) i64 {
+    const E_BADCAP: i64 = -3;
     const E_PERM: i64 = -2;
 
-    const vm_obj = proc.vm orelse return E_INVAL;
+    const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
 
     // Refuse security-critical MSRs that must always be intercepted.
     if (isSecurityCriticalMsr(msr_num)) return E_PERM;
@@ -363,10 +382,11 @@ pub fn msrPassthrough(proc: *Process, msr_num: u32, allow_read: bool, allow_writ
 }
 
 /// Syscall implementation: assert an IRQ line on the in-kernel IOAPIC.
-pub fn ioapicAssertIrq(proc: *Process, irq_num: u64) i64 {
+pub fn ioapicAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
     const E_INVAL: i64 = -1;
+    const E_BADCAP: i64 = -3;
 
-    const vm_obj = proc.vm orelse return E_INVAL;
+    const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
     if (irq_num >= 24) return E_INVAL;
     vm_obj.ioapic.assertIrq(@truncate(irq_num));
     kickRunningVcpus(vm_obj);
@@ -374,10 +394,11 @@ pub fn ioapicAssertIrq(proc: *Process, irq_num: u64) i64 {
 }
 
 /// Syscall implementation: de-assert an IRQ line on the in-kernel IOAPIC.
-pub fn ioapicDeassertIrq(proc: *Process, irq_num: u64) i64 {
+pub fn ioapicDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
     const E_INVAL: i64 = -1;
+    const E_BADCAP: i64 = -3;
 
-    const vm_obj = proc.vm orelse return E_INVAL;
+    const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
     if (irq_num >= 24) return E_INVAL;
     vm_obj.ioapic.deassertIrq(@truncate(irq_num));
     kickRunningVcpus(vm_obj);
@@ -411,6 +432,15 @@ fn isSecurityCriticalMsr(msr: u32) bool {
         0x176, // SYSENTER_EIP
         => true,
         else => false,
+    };
+}
+
+/// Resolve a VM handle from the process's perm table. Returns the *Vm or null.
+fn resolveVmHandle(proc: *Process, vm_handle: u64) ?*Vm {
+    const entry = proc.getPermByHandle(vm_handle) orelse return null;
+    return switch (entry.object) {
+        .vm => |v| v,
+        else => null,
     };
 }
 

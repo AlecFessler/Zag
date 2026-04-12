@@ -12,15 +12,15 @@ pub fn main(_: u64) void {
         t.pass("§4.40.5");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§4.40.5 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
 
     // Valid guest_addr and size, but invalid rights bits (0xFF has undefined upper bits).
-    const result = syscall.vm_guest_map(0, 0x1000, 0x1000, 0xFF);
+    const result = syscall.vm_guest_map(@bitCast(cr), 0, 0x1000, 0x1000, 0xFF);
     t.expectEqual("§4.40.5", syscall.E_INVAL, result);
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

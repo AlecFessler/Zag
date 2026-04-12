@@ -26,7 +26,7 @@ pub fn main(_: u64) void {
         t.pass("§4.47.4");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§4.47.4 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
@@ -34,17 +34,17 @@ pub fn main(_: u64) void {
     var passed = true;
     for (blocklist) |msr| {
         // Try both read-only and write-only and read+write — all should be denied.
-        const r_ro = syscall.vm_msr_passthrough(msr, 1, 0);
+        const r_ro = syscall.vm_msr_passthrough(@bitCast(cr), msr, 1, 0);
         if (r_ro != syscall.E_PERM) {
             t.failWithVal("§4.47.4 ro", syscall.E_PERM, r_ro);
             passed = false;
         }
-        const r_wo = syscall.vm_msr_passthrough(msr, 0, 1);
+        const r_wo = syscall.vm_msr_passthrough(@bitCast(cr), msr, 0, 1);
         if (r_wo != syscall.E_PERM) {
             t.failWithVal("§4.47.4 wo", syscall.E_PERM, r_wo);
             passed = false;
         }
-        const r_rw = syscall.vm_msr_passthrough(msr, 1, 1);
+        const r_rw = syscall.vm_msr_passthrough(@bitCast(cr), msr, 1, 1);
         if (r_rw != syscall.E_PERM) {
             t.failWithVal("§4.47.4 rw", syscall.E_PERM, r_rw);
             passed = false;
@@ -55,6 +55,6 @@ pub fn main(_: u64) void {
         t.pass("§4.47.4");
     }
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

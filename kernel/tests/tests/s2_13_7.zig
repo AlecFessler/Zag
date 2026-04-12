@@ -87,7 +87,7 @@ pub fn main(pv: u64) void {
         t.pass("§2.13.7");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§2.13.7 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
@@ -96,7 +96,7 @@ pub fn main(pv: u64) void {
     const code_res = syscall.mem_reserve(0, syscall.PAGE4K, 0x3);
     if (code_res.val < 0) {
         t.failWithVal("§2.13.7 reserve code", 0, code_res.val);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
     const code_ptr: [*]u8 = @ptrFromInt(code_res.val2);
@@ -105,10 +105,10 @@ pub fn main(pv: u64) void {
     }
 
     // Map code page at guest phys 0x0000.
-    const mr = syscall.vm_guest_map(code_res.val2, 0x0, syscall.PAGE4K, 0x7);
+    const mr = syscall.vm_guest_map(@bitCast(cr), code_res.val2, 0x0, syscall.PAGE4K, 0x7);
     if (mr != syscall.E_OK) {
         t.failWithVal("§2.13.7 vm_guest_map code", syscall.E_OK, mr);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -116,14 +116,14 @@ pub fn main(pv: u64) void {
     const data_res = syscall.mem_reserve(0, syscall.PAGE4K, 0x3);
     if (data_res.val < 0) {
         t.failWithVal("§2.13.7 reserve data", 0, data_res.val);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
     const vcpu_handle = findVcpuHandle(view, self_handle);
     if (vcpu_handle == 0) {
         t.fail("§2.13.7 no vCPU handle");
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -132,7 +132,7 @@ pub fn main(pv: u64) void {
     const sr = syscall.vm_vcpu_set_state(vcpu_handle, @intFromPtr(&guest_state));
     if (sr != syscall.E_OK) {
         t.failWithVal("§2.13.7 set_state", syscall.E_OK, sr);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -140,10 +140,10 @@ pub fn main(pv: u64) void {
     _ = syscall.vm_vcpu_run(vcpu_handle);
 
     // Receive exit (EPT violation on address 0x1000).
-    const exit_token = syscall.vm_recv(@intFromPtr(&buf), 1);
+    const exit_token = syscall.vm_recv(@bitCast(cr), @intFromPtr(&buf), 1);
     if (exit_token <= 0) {
         t.failWithVal("§2.13.7 recv", 1, exit_token);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -157,17 +157,17 @@ pub fn main(pv: u64) void {
     // rights is u8 but padded — write as u64 for simplicity.
     action_words[4] = 0x3; // rights (read|write)
 
-    const rr = syscall.vm_reply_action(@bitCast(exit_token), @intFromPtr(&reply_action));
+    const rr = syscall.vm_reply_action(@bitCast(cr), @bitCast(exit_token), @intFromPtr(&reply_action));
     if (rr != syscall.E_OK) {
         // Reply may fail if action layout differs — still validates the path.
         t.failWithVal("§2.13.7 reply", syscall.E_OK, rr);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
     // After successful map_memory reply, vCPU resumes and hits HLT.
     // Receive the second exit (HLT).
-    const exit_token2 = syscall.vm_recv(@intFromPtr(&buf), 1);
+    const exit_token2 = syscall.vm_recv(@bitCast(cr), @intFromPtr(&buf), 1);
     if (exit_token2 > 0) {
         // vCPU resumed after map_memory and ran to HLT.
         t.pass("§2.13.7");
@@ -175,6 +175,6 @@ pub fn main(pv: u64) void {
         t.failWithVal("§2.13.7 recv2", 1, exit_token2);
     }
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

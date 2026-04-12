@@ -28,7 +28,7 @@ pub fn main(pv: u64) void {
         t.pass("§2.13.3");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§2.13.3 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
@@ -64,6 +64,6 @@ pub fn main(pv: u64) void {
         t.fail("§2.13.3 vCPU thread missing full rights");
     }
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

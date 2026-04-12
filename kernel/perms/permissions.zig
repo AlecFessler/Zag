@@ -6,6 +6,7 @@ const Process = zag.proc.process.Process;
 const SharedMemory = zag.memory.shared.SharedMemory;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
+const Vm = zag.kvm.vm.Vm;
 
 pub const FaultReason = enum(u5) {
     none = 0,
@@ -152,6 +153,7 @@ pub const KernelObject = union(enum) {
     device_region: *DeviceRegion,
     core_pin: CorePinObject,
     thread: *Thread,
+    vm: *Vm,
     empty: void,
 };
 
@@ -163,6 +165,7 @@ pub const UserViewEntryType = enum(u8) {
     core_pin = 4,
     dead_process = 5,
     thread = 6,
+    vm = 7,
 };
 
 pub const UserViewEntry = extern struct {
@@ -281,6 +284,13 @@ pub const UserViewEntry = extern struct {
                 .rights = entry.rights,
                 .field0 = threadField0(t),
                 .field1 = threadField1(entry),
+            },
+            .vm => .{
+                .handle = entry.handle,
+                .entry_type = @intFromEnum(UserViewEntryType.vm),
+                .rights = entry.rights,
+                .field0 = 0,
+                .field1 = 0,
             },
             .empty => EMPTY,
         };

@@ -495,20 +495,21 @@ pub fn vm_create(vcpu_count: u64, policy_ptr: u64) i64 {
     return syscall2(.vm_create, vcpu_count, policy_ptr);
 }
 
+/// Deprecated: always returns E_INVAL. Use revoke_vm() instead.
 pub fn vm_destroy() i64 {
     return syscall0(.vm_destroy);
 }
 
-pub fn vm_guest_map(host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
-    return syscall4(.vm_guest_map, host_vaddr, guest_addr, size, rights);
+pub fn vm_guest_map(vm_handle_arg: u64, host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
+    return syscall5(.vm_guest_map, vm_handle_arg, host_vaddr, guest_addr, size, rights);
 }
 
-pub fn vm_recv(buf_ptr: u64, blocking: u64) i64 {
-    return syscall2(.vm_recv, buf_ptr, blocking);
+pub fn vm_recv(vm_handle_arg: u64, buf_ptr: u64, blocking: u64) i64 {
+    return syscall3(.vm_recv, vm_handle_arg, buf_ptr, blocking);
 }
 
-pub fn vm_reply_action(exit_token: u64, action_ptr: u64) i64 {
-    return syscall2(.vm_reply, exit_token, action_ptr);
+pub fn vm_reply_action(vm_handle_arg: u64, exit_token: u64, action_ptr: u64) i64 {
+    return syscall3(.vm_reply, vm_handle_arg, exit_token, action_ptr);
 }
 
 pub fn vm_vcpu_set_state(thread_handle: u64, guest_state_ptr: u64) i64 {
@@ -527,16 +528,20 @@ pub fn vm_vcpu_interrupt(thread_handle: u64, interrupt_ptr: u64) i64 {
     return syscall2(.vm_vcpu_interrupt, thread_handle, interrupt_ptr);
 }
 
-pub fn vm_msr_passthrough(msr_num: u64, allow_read: u64, allow_write: u64) i64 {
-    return syscall3(.vm_msr_passthrough, msr_num, allow_read, allow_write);
+pub fn vm_msr_passthrough(vm_handle_arg: u64, msr_num: u64, allow_read: u64, allow_write: u64) i64 {
+    return syscall4(.vm_msr_passthrough, vm_handle_arg, msr_num, allow_read, allow_write);
 }
 
-pub fn vm_ioapic_assert_irq(irq_num: u64) i64 {
-    return syscall1(.vm_ioapic_assert_irq, irq_num);
+pub fn vm_ioapic_assert_irq(vm_handle_arg: u64, irq_num: u64) i64 {
+    return syscall2(.vm_ioapic_assert_irq, vm_handle_arg, irq_num);
 }
 
-pub fn vm_ioapic_deassert_irq(irq_num: u64) i64 {
-    return syscall1(.vm_ioapic_deassert_irq, irq_num);
+pub fn vm_ioapic_deassert_irq(vm_handle_arg: u64, irq_num: u64) i64 {
+    return syscall2(.vm_ioapic_deassert_irq, vm_handle_arg, irq_num);
+}
+
+pub fn revoke_vm(vm_handle_arg: u64) i64 {
+    return syscall1(.revoke_perm, vm_handle_arg);
 }
 
 // --- Performance Monitoring Unit (§2.14, §4.50–§4.54) ---

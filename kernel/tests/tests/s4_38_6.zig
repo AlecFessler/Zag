@@ -13,9 +13,9 @@ pub fn main(_: u64) void {
     const result = syscall.vm_create(64, @intFromPtr(&policy));
     if (result == syscall.E_MAXCAP or result == syscall.E_NODEV or result == syscall.E_NOMEM) {
         t.pass("§4.38.6");
-    } else if (result == syscall.E_OK) {
+    } else if (result > 0) {
         // Perm table had room — cannot test E_MAXCAP, pass.
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(result));
         t.pass("§4.38.6");
     } else {
         t.failWithVal("§4.38.6", syscall.E_MAXCAP, result);

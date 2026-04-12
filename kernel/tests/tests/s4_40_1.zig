@@ -12,7 +12,7 @@ pub fn main(_: u64) void {
         t.pass("§4.40.1");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§4.40.1 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
@@ -22,14 +22,14 @@ pub fn main(_: u64) void {
     const host_vaddr = res.val2;
     if (res.val < 0) {
         t.failWithVal("§4.40.1 reserve", 0, res.val);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
     // Map host buffer into guest at guest physical 0x1000 with read rights.
-    const result = syscall.vm_guest_map(host_vaddr, 0x1000, syscall.PAGE4K, 0x1);
+    const result = syscall.vm_guest_map(@bitCast(cr), host_vaddr, 0x1000, syscall.PAGE4K, 0x1);
     t.expectEqual("§4.40.1", syscall.E_OK, result);
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

@@ -35,7 +35,7 @@ pub fn setupGuestMemory(size: u64) void {
 
     // Map into guest physical address space.
     // vm_guest_map supports multi-page sizes, so map the whole thing at once.
-    const mr = syscall.vm_guest_map(host_base, 0, size, 0x7);
+    const mr = syscall.vm_guest_map(@import("main.zig").vm_handle, host_base, 0, size, 0x7);
     if (mr != syscall.E_OK) {
         log.print("mem: vm_guest_map failed: ");
         log.dec(@as(u64, @bitCast(-mr)));
@@ -75,7 +75,7 @@ pub noinline fn mapMmioStubs() void {
         @memset(ptr[0..PAGE_SIZE], 0x00);
 
         // Map into guest physical address space
-        const mr = syscall.vm_guest_map(host_addr, addr, PAGE_SIZE, 0x7);
+        const mr = syscall.vm_guest_map(@import("main.zig").vm_handle, host_addr, addr, PAGE_SIZE, 0x7);
         if (mr == syscall.E_OK) {
             log.print("mem: MMIO stub at 0x");
             log.hex64(addr);
@@ -94,7 +94,7 @@ pub noinline fn mapDevicePage(guest_phys: u64) ?[*]volatile u8 {
     const ptr: [*]u8 = @ptrFromInt(host_addr);
     @memset(ptr[0..PAGE_SIZE], 0);
 
-    const mr = syscall.vm_guest_map(host_addr, guest_phys, PAGE_SIZE, 0x7);
+    const mr = syscall.vm_guest_map(@import("main.zig").vm_handle, host_addr, guest_phys, PAGE_SIZE, 0x7);
     if (mr != syscall.E_OK) return null;
 
     log.print("mem: device page at 0x");

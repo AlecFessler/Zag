@@ -15,21 +15,21 @@ pub fn main(_: u64) void {
         t.pass("§4.39.1");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§4.39.1 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
 
     // Destroy it.
-    const result = syscall.vm_destroy();
+    const result = syscall.revoke_vm(@bitCast(cr));
     if (result != syscall.E_OK) {
         t.failWithVal("§4.39.1", syscall.E_OK, result);
         syscall.shutdown();
     }
 
-    // vm_recv after vm_destroy must return E_INVAL since the VM no longer exists.
-    const recv_result = syscall.vm_recv(@intFromPtr(&buf), 0);
-    t.expectEqual("§4.39.1", syscall.E_INVAL, recv_result);
+    // vm_recv after revoke must return E_BADCAP since the handle is gone.
+    const recv_result = syscall.vm_recv(@bitCast(cr), @intFromPtr(&buf), 0);
+    t.expectEqual("§4.39.1", syscall.E_BADHANDLE, recv_result);
 
     syscall.shutdown();
 }

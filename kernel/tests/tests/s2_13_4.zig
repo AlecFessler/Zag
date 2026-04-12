@@ -86,7 +86,7 @@ pub fn main(pv: u64) void {
         t.pass("§2.13.4");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§2.13.4 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
@@ -95,7 +95,7 @@ pub fn main(pv: u64) void {
     const res = syscall.mem_reserve(0, syscall.PAGE4K, 0x3);
     if (res.val < 0) {
         t.failWithVal("§2.13.4 reserve", 0, res.val);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
     const host_ptr: [*]u8 = @ptrFromInt(res.val2);
@@ -104,10 +104,10 @@ pub fn main(pv: u64) void {
     }
 
     // Map host buffer as guest physical memory at address 0.
-    const mr = syscall.vm_guest_map(res.val2, 0x0, syscall.PAGE4K, 0x7);
+    const mr = syscall.vm_guest_map(@bitCast(cr), res.val2, 0x0, syscall.PAGE4K, 0x7);
     if (mr != syscall.E_OK) {
         t.failWithVal("§2.13.4 vm_guest_map", syscall.E_OK, mr);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -122,7 +122,7 @@ pub fn main(pv: u64) void {
     }
     if (total_threads < threads_before + 2) {
         t.fail("§2.13.4 not enough vCPU threads");
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
     // Take the last 2 thread entries as vCPU handles.
@@ -134,13 +134,13 @@ pub fn main(pv: u64) void {
     var sr = syscall.vm_vcpu_set_state(vcpu0, @intFromPtr(&guest_state));
     if (sr != syscall.E_OK) {
         t.failWithVal("§2.13.4 set_state0", syscall.E_OK, sr);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
     sr = syscall.vm_vcpu_set_state(vcpu1, @intFromPtr(&guest_state));
     if (sr != syscall.E_OK) {
         t.failWithVal("§2.13.4 set_state1", syscall.E_OK, sr);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -149,30 +149,30 @@ pub fn main(pv: u64) void {
     _ = syscall.vm_vcpu_run(vcpu1);
 
     // Receive both exits — both should be pending.
-    const r1 = syscall.vm_recv(@intFromPtr(&buf), 1);
+    const r1 = syscall.vm_recv(@bitCast(cr), @intFromPtr(&buf), 1);
     if (r1 <= 0) {
         t.failWithVal("§2.13.4 recv1", 1, r1);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
-    const r2 = syscall.vm_recv(@intFromPtr(&buf), 1);
+    const r2 = syscall.vm_recv(@bitCast(cr), @intFromPtr(&buf), 1);
     if (r2 <= 0) {
         t.failWithVal("§2.13.4 recv2", 1, r2);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
     // Verify two distinct vCPU exits — tokens must differ.
     if (r1 == r2) {
         t.fail("§2.13.4 same token for both exits");
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
     // Both exits received successfully with distinct tokens — they exited simultaneously.
     t.pass("§2.13.4");
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

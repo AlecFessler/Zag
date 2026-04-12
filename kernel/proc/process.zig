@@ -1115,7 +1115,7 @@ pub const Process = struct {
                 .core_pin => |cp| {
                     sched.unpinByRevoke(cp.core_id);
                 },
-                .thread => {},
+                .thread, .vm => {},
                 .process => |p| {
                     const prev = @atomicRmw(u32, &p.handle_refcount, .Sub, 1, .acq_rel);
                     if (prev == 1 and p.cleanup_complete) {

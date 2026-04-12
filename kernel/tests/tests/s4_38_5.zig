@@ -11,10 +11,10 @@ pub fn main(_: u64) void {
     // returns E_NODEV when hardware virt is unavailable. Both outcomes
     // confirm the E_NODEV path is implemented.
     const result = syscall.vm_create(1, @intFromPtr(&policy));
-    if (result == syscall.E_NODEV or result == syscall.E_OK) {
+    if (result == syscall.E_NODEV or result > 0) {
         t.pass("§4.38.5");
-        if (result == syscall.E_OK) {
-            _ = syscall.vm_destroy();
+        if (result > 0) {
+            _ = syscall.revoke_vm(@bitCast(result));
         }
     } else {
         t.failWithVal("§4.38.5", syscall.E_NODEV, result);

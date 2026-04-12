@@ -96,7 +96,7 @@ pub fn main(pv: u64) void {
         t.pass("§4.42.5");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§4.42.5 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
@@ -105,7 +105,7 @@ pub fn main(pv: u64) void {
     const res = syscall.mem_reserve(0, syscall.PAGE4K, 0x3);
     if (res.val < 0) {
         t.failWithVal("§4.42.5 reserve", 0, res.val);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
     const host_ptr: [*]u8 = @ptrFromInt(res.val2);
@@ -113,17 +113,17 @@ pub fn main(pv: u64) void {
         host_ptr[i] = byte;
     }
 
-    const mr = syscall.vm_guest_map(res.val2, 0x0, syscall.PAGE4K, 0x7);
+    const mr = syscall.vm_guest_map(@bitCast(cr), res.val2, 0x0, syscall.PAGE4K, 0x7);
     if (mr != syscall.E_OK) {
         t.failWithVal("§4.42.5 vm_guest_map", syscall.E_OK, mr);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
     const vcpu_handle = findVcpuHandle(view, self_handle);
     if (vcpu_handle == 0) {
         t.fail("§4.42.5 no vCPU handle");
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -132,17 +132,17 @@ pub fn main(pv: u64) void {
     const sr = syscall.vm_vcpu_set_state(vcpu_handle, @intFromPtr(&guest_state));
     if (sr != syscall.E_OK) {
         t.failWithVal("§4.42.5 set_state", syscall.E_OK, sr);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
     _ = syscall.vm_vcpu_run(vcpu_handle);
 
     // --- First exit: HLT at offset 0 ---
-    const exit1 = syscall.vm_recv(@intFromPtr(&buf), 1);
+    const exit1 = syscall.vm_recv(@bitCast(cr), @intFromPtr(&buf), 1);
     if (exit1 <= 0) {
         t.failWithVal("§4.42.5 recv1", 1, exit1);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -150,7 +150,7 @@ pub fn main(pv: u64) void {
     const gr = syscall.vm_vcpu_get_state(vcpu_handle, @intFromPtr(&state_after));
     if (gr != syscall.E_OK) {
         t.failWithVal("§4.42.5 get_state", syscall.E_OK, gr);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -181,18 +181,18 @@ pub fn main(pv: u64) void {
         action_payload[i] = state_after[i];
     }
 
-    const rr = syscall.vm_reply_action(@bitCast(exit1), @intFromPtr(&reply_action));
+    const rr = syscall.vm_reply_action(@bitCast(cr), @bitCast(exit1), @intFromPtr(&reply_action));
     if (rr != syscall.E_OK) {
         t.failWithVal("§4.42.5 reply", syscall.E_OK, rr);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
     // --- Second exit: HLT at offset 1 ---
-    const exit2 = syscall.vm_recv(@intFromPtr(&buf), 1);
+    const exit2 = syscall.vm_recv(@bitCast(cr), @intFromPtr(&buf), 1);
     if (exit2 <= 0) {
         t.failWithVal("§4.42.5 recv2", 1, exit2);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -200,7 +200,7 @@ pub fn main(pv: u64) void {
     const gr2 = syscall.vm_vcpu_get_state(vcpu_handle, @intFromPtr(&state_after2));
     if (gr2 != syscall.E_OK) {
         t.failWithVal("§4.42.5 get_state2", syscall.E_OK, gr2);
-        _ = syscall.vm_destroy();
+        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -216,8 +216,8 @@ pub fn main(pv: u64) void {
     // Clean up with kill reply for exit2.
     const kill_words: [*]u64 = @alignCast(@ptrCast(&kill_action));
     kill_words[0] = 4; // kill variant
-    _ = syscall.vm_reply_action(@bitCast(exit2), @intFromPtr(&kill_action));
+    _ = syscall.vm_reply_action(@bitCast(cr), @bitCast(exit2), @intFromPtr(&kill_action));
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

@@ -12,15 +12,15 @@ pub fn main(_: u64) void {
         t.pass("§4.41.4");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§4.41.4 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
 
     // Pass null buf_ptr — should return E_BADADDR.
-    const result = syscall.vm_recv(0, 0);
+    const result = syscall.vm_recv(@bitCast(cr), 0, 0);
     t.expectEqual("§4.41.4", syscall.E_BADADDR, result);
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

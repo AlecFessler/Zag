@@ -12,7 +12,7 @@ pub fn main(_: u64) void {
         t.pass("§4.47.3");
         syscall.shutdown();
     }
-    if (cr != syscall.E_OK) {
+    if (cr < 0) {
         t.failWithVal("§4.47.3 create", syscall.E_OK, cr);
         syscall.shutdown();
     }
@@ -20,21 +20,21 @@ pub fn main(_: u64) void {
     var passed = true;
 
     // msr_num just past u32 max (0x100000000) — first value outside the range.
-    const r_one_past = syscall.vm_msr_passthrough(@as(u64, 1) << 32, 1, 1);
+    const r_one_past = syscall.vm_msr_passthrough(@bitCast(cr), @as(u64, 1) << 32, 1, 1);
     if (r_one_past != syscall.E_INVAL) {
         t.failWithVal("§4.47.3 one_past", syscall.E_INVAL, r_one_past);
         passed = false;
     }
 
     // Largest possible u64.
-    const r_max_u64 = syscall.vm_msr_passthrough(0xFFFF_FFFF_FFFF_FFFF, 1, 1);
+    const r_max_u64 = syscall.vm_msr_passthrough(@bitCast(cr), 0xFFFF_FFFF_FFFF_FFFF, 1, 1);
     if (r_max_u64 != syscall.E_INVAL) {
         t.failWithVal("§4.47.3 max_u64", syscall.E_INVAL, r_max_u64);
         passed = false;
     }
 
     // Arbitrary mid-range out-of-bounds value.
-    const r_mid = syscall.vm_msr_passthrough(0xDEAD_BEEF_DEAD_BEEF, 1, 1);
+    const r_mid = syscall.vm_msr_passthrough(@bitCast(cr), 0xDEAD_BEEF_DEAD_BEEF, 1, 1);
     if (r_mid != syscall.E_INVAL) {
         t.failWithVal("§4.47.3 mid", syscall.E_INVAL, r_mid);
         passed = false;
@@ -44,7 +44,7 @@ pub fn main(_: u64) void {
     // must NOT return E_INVAL. The MSR need not actually exist; only the range
     // check is being exercised. The security blocklist (§4.47.4) contains no
     // values anywhere near 0xFFFFFFFF so there is no risk of E_PERM here.
-    const r_valid_edge = syscall.vm_msr_passthrough(0xFFFFFFFF, 1, 1);
+    const r_valid_edge = syscall.vm_msr_passthrough(@bitCast(cr), 0xFFFFFFFF, 1, 1);
     if (r_valid_edge == syscall.E_INVAL) {
         t.failWithVal("§4.47.3 valid_edge", 0, r_valid_edge);
         passed = false;
@@ -54,6 +54,6 @@ pub fn main(_: u64) void {
         t.pass("§4.47.3");
     }
 
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_vm(@bitCast(cr));
     syscall.shutdown();
 }

@@ -120,6 +120,19 @@ fn syscall4(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64) i64 {
         : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
 }
 
+fn syscall5(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) i64 {
+    return asm volatile (
+        \\syscall
+        : [ret] "={rax}" (-> i64),
+        : [num] "{rax}" (@intFromEnum(num)),
+          [a0] "{rdi}" (a0),
+          [a1] "{rsi}" (a1),
+          [a2] "{rdx}" (a2),
+          [a3] "{r10}" (a3),
+          [a4] "{r8}" (a4),
+        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
+}
+
 fn syscall3_2(num: SyscallNum, a0: u64, a1: u64, a2: u64) SyscallResult2 {
     var val2: u64 = undefined;
     const val = asm volatile ("syscall"
@@ -193,20 +206,20 @@ pub fn vm_create(vcpu_count: u64, policy_ptr: u64) i64 {
     return syscall2(.vm_create, vcpu_count, policy_ptr);
 }
 
-pub fn vm_destroy() i64 {
-    return syscall0(.vm_destroy);
+pub fn vm_guest_map(vm_handle: u64, host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
+    return syscall5(.vm_guest_map, vm_handle, host_vaddr, guest_addr, size, rights);
 }
 
-pub fn vm_guest_map(host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
-    return syscall4(.vm_guest_map, host_vaddr, guest_addr, size, rights);
+pub fn vm_recv(vm_handle: u64, buf_ptr: u64, blocking: u64) i64 {
+    return syscall3(.vm_recv, vm_handle, buf_ptr, blocking);
 }
 
-pub fn vm_recv(buf_ptr: u64, blocking: u64) i64 {
-    return syscall2(.vm_recv, buf_ptr, blocking);
+pub fn vm_reply_action(vm_handle: u64, exit_token: u64, action_ptr: u64) i64 {
+    return syscall3(.vm_reply, vm_handle, exit_token, action_ptr);
 }
 
-pub fn vm_reply_action(exit_token: u64, action_ptr: u64) i64 {
-    return syscall2(.vm_reply, exit_token, action_ptr);
+pub fn revoke_perm(handle: u64) i64 {
+    return syscall1(.revoke_perm, handle);
 }
 
 pub fn vm_vcpu_set_state(thread_handle: u64, guest_state_ptr: u64) i64 {
@@ -225,10 +238,10 @@ pub fn vm_vcpu_interrupt(thread_handle: u64, interrupt_ptr: u64) i64 {
     return syscall2(.vm_vcpu_interrupt, thread_handle, interrupt_ptr);
 }
 
-pub fn vm_ioapic_assert_irq(irq_num: u64) i64 {
-    return syscall1(.vm_ioapic_assert_irq, irq_num);
+pub fn vm_ioapic_assert_irq(vm_handle: u64, irq_num: u64) i64 {
+    return syscall2(.vm_ioapic_assert_irq, vm_handle, irq_num);
 }
 
-pub fn vm_ioapic_deassert_irq(irq_num: u64) i64 {
-    return syscall1(.vm_ioapic_deassert_irq, irq_num);
+pub fn vm_ioapic_deassert_irq(vm_handle: u64, irq_num: u64) i64 {
+    return syscall2(.vm_ioapic_deassert_irq, vm_handle, irq_num);
 }

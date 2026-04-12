@@ -89,6 +89,7 @@ var reply_buf: [512]u8 align(8) = .{0} ** 512;
 var policy_buf: [4096]u8 align(4096) = .{0} ** 4096;
 var bp_buf: [4096]u8 align(8) = .{0} ** 4096;
 var guest_state: GuestState = .{};
+pub var vm_handle: u64 = 0;
 var exit_count: u64 = 0;
 var cpuid_count: u64 = 0;
 var io_count: u64 = 0;
@@ -106,7 +107,8 @@ pub fn main(pv: u64) void {
     // Create VM with empty policy
     const cr = syscall.vm_create(1, @intFromPtr(&policy_buf));
     if (cr == syscall.E_NODEV) { log.print("No virt support\n"); syscall.shutdown(); }
-    if (cr != syscall.E_OK) { log.print("vm_create failed\n"); syscall.shutdown(); }
+    if (cr < 0) { log.print("vm_create failed\n"); syscall.shutdown(); }
+    vm_handle = @bitCast(cr);
 
     const vcpu = findVcpuHandle(pv);
     if (vcpu == 0) { log.print("No vCPU\n"); syscall.shutdown(); }
@@ -146,7 +148,7 @@ pub fn main(pv: u64) void {
     log.print(") ept=");
     log.dec(ept_count);
     log.print(" ===\n");
-    _ = syscall.vm_destroy();
+    _ = syscall.revoke_perm(vm_handle);
     syscall.shutdown();
 }
 
@@ -368,7 +370,7 @@ noinline fn exitLoop(_: u64) void {
     const timeout_ns: u64 = 600_000_000_000; // 10 minutes
 
     while (true) {
-        const tok = syscall.vm_recv(@intFromPtr(&exit_buf), 0);
+        const tok = syscall.vm_recv(vm_handle, @intFromPtr(&exit_buf), 0);
         if (tok == syscall.E_AGAIN) {
             if (syscall.clock_gettime() -% start > timeout_ns) {
                 log.print("TIMEOUT\n");
@@ -377,8 +379,8 @@ noinline fn exitLoop(_: u64) void {
             serial.pollHostRx();
             if (serial.irq_pending) {
                 serial.irq_pending = false;
-                _ = syscall.vm_ioapic_assert_irq(4);
-                _ = syscall.vm_ioapic_deassert_irq(4);
+                _ = syscall.vm_ioapic_assert_irq(vm_handle, 4);
+                _ = syscall.vm_ioapic_deassert_irq(vm_handle, 4);
             }
             // Tick PIT — fires IRQ0 (GSI2) when counter reaches 0
             io.pitCheckIrq();
@@ -398,15 +400,15 @@ noinline fn exitLoop(_: u64) void {
 
         if (kill) {
             @as(*align(1) u64, @ptrCast(&reply_buf)).* = REPLY_KILL;
-            _ = syscall.vm_reply_action(@bitCast(tok), @intFromPtr(&reply_buf));
+            _ = syscall.vm_reply_action(vm_handle, @bitCast(tok), @intFromPtr(&reply_buf));
             break;
         }
 
         // Route serial IRQ through kernel IOAPIC
         if (serial.irq_pending) {
             serial.irq_pending = false;
-            _ = syscall.vm_ioapic_assert_irq(4);
-            _ = syscall.vm_ioapic_deassert_irq(4);
+            _ = syscall.vm_ioapic_assert_irq(vm_handle, 4);
+            _ = syscall.vm_ioapic_deassert_irq(vm_handle, 4);
         }
 
         // Tick PIT — fires IRQ0 (GSI2) when counter reaches 0
@@ -415,7 +417,7 @@ noinline fn exitLoop(_: u64) void {
         // Resume guest
         @as(*align(1) u64, @ptrCast(&reply_buf)).* = REPLY_RESUME;
         @memcpy(reply_buf[8..][0..GS_SIZE], @as([*]const u8, @ptrCast(gs))[0..GS_SIZE]);
-        if (syscall.vm_reply_action(@bitCast(tok), @intFromPtr(&reply_buf)) != syscall.E_OK) break;
+        if (syscall.vm_reply_action(vm_handle, @bitCast(tok), @intFromPtr(&reply_buf)) != syscall.E_OK) break;
     }
 }
 
