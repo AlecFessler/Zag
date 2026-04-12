@@ -316,13 +316,38 @@ pub fn unmapPage(
     l1_entry.* = DEFAULT_PAGE_ENTRY;
     cpu.invlpg(virt.addr);
 
-    // User-space pages may be cached in other cores' TLBs.  Flush them
-    // so that a freed physical page cannot be read through a stale TLB
-    // entry on a remote core.
-    const user_end = zag.memory.address.AddrSpacePartition.user.end;
-    if (virt.addr < user_end) {
-        flushRemoteTlb(virt.addr);
-    }
+    // Shoot down remote TLBs on every unmap, user-space AND kernel-space.
+    //
+    // The earlier version only shot down for user addresses, on the
+    // assumption that kernel mappings were identical across cores and
+    // therefore couldn't go stale. That assumption is wrong: when
+    // `thread_kill` tears down a kernel thread (`stack.destroyKernel`),
+    // it unmaps the dying thread's kernel-stack pages from the killer
+    // core and frees the physical pages back to the PMM. The physical
+    // pages are immediately reusable — a subsequent allocation can
+    // hand them out to a completely unrelated kernel data structure.
+    // Meanwhile, any OTHER core that had those old kernel-stack VAs
+    // cached in its TLB (because the dying thread last ran there)
+    // still translates the old VA to the now-reused physical page. If
+    // that remote core touches anything in that old VA range before
+    // its TLB happens to evict the entry, it reads/writes a completely
+    // unrelated kernel object — silent cross-core memory corruption.
+    //
+    // This is the root cause of the long-standing `s2_4_9` flake. The
+    // test pins a spinning worker to core 1 via `set_affinity`,
+    // suspends it (cross-core IPI), then `thread_kill`s it from core 0.
+    // `thread_kill` runs `deinit -> destroyKernel -> unmapPage` on
+    // core 0; the worker's kernel stack pages are unmapped locally on
+    // core 0 but core 1's TLB still maps them. The freed pages land
+    // wherever PMM's next allocation sends them, and the resulting
+    // corruption manifests as a hang on the subsequent `serial.write`
+    // path in ~60% of multi-core runs (see commit message for the
+    // visible symptom on `[PASS] §2.4.9` truncation).
+    //
+    // Paying for a remote-TLB shootdown on every unmap is fine because
+    // the kernel rarely unmaps pages outside of process teardown and
+    // stack destruction — both are already slow-path operations.
+    flushRemoteTlb(virt.addr);
 
     return phys;
 }
