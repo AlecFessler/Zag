@@ -9,9 +9,13 @@ const interrupts = zag.arch.x64.interrupts;
 const paging_mod = zag.arch.x64.paging;
 const sched = zag.sched.scheduler;
 
+const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const GateType = zag.arch.x64.idt.GateType;
+const PAddr = zag.memory.address.PAddr;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 const SchedInterruptContext = zag.sched.scheduler.SchedInterruptContext;
+const SpinLock = zag.utils.sync.SpinLock;
+const VAddr = zag.memory.address.VAddr;
 
 /// 16 IRQ lines (vectors 32-47) — legacy ISA IRQs remapped above the 32 exception
 /// vectors reserved by the architecture.
@@ -20,6 +24,15 @@ const SchedInterruptContext = zag.sched.scheduler.SchedInterruptContext;
 const NUM_IRQ_ENTRIES = 16;
 
 var spurious_interrupts: u64 = 0;
+
+/// Maps IRQ line numbers to the DeviceRegion that owns each line.
+/// Populated during firmware table parsing. Static after boot.
+/// Systems.md §24.
+pub var irq_table: [256]?*DeviceRegion = [_]?*DeviceRegion{null} ** 256;
+
+/// I/O APIC MMIO base virtual address. Set during ACPI parsing.
+var ioapic_base: u64 = 0;
+var ioapic_lock: SpinLock = .{};
 
 /// Sets up IDT gates for hardware IRQs, the spurious interrupt vector, the TLB
 /// shootdown IPI vector, and the scheduler timer vector.
@@ -105,3 +118,45 @@ fn schedTimerHandler(ctx: *cpu.Context) void {
     sched.schedTimerHandler(sched_interrupt_ctx);
 }
 
+/// Set the I/O APIC MMIO base address. Called during ACPI parsing.
+pub fn setIoapicBase(phys_addr: u32) void {
+    const phys = PAddr.fromInt(@as(u64, phys_addr));
+    ioapic_base = VAddr.fromPAddr(phys, null).addr;
+}
+
+/// Mask an IRQ line by setting bit 16 of the I/O APIC redirection table entry.
+/// I/O APIC accessed via MMIO: IOREGSEL at base+0x00, IOWIN at base+0x10.
+/// Systems.md §24.
+pub fn maskIrq(irq_line: u8) void {
+    if (ioapic_base == 0) return;
+    const reg = @as(u32, 0x10) + @as(u32, irq_line) * 2;
+    const irq_state = ioapic_lock.lockIrqSave();
+    const val = ioapicRead(reg);
+    ioapicWrite(reg, val | (1 << 16));
+    ioapic_lock.unlockIrqRestore(irq_state);
+}
+
+/// Unmask an IRQ line by clearing bit 16 of the I/O APIC redirection table entry.
+/// Systems.md §24.
+pub fn unmaskIrq(irq_line: u8) void {
+    if (ioapic_base == 0) return;
+    const reg = @as(u32, 0x10) + @as(u32, irq_line) * 2;
+    const irq_state = ioapic_lock.lockIrqSave();
+    const val = ioapicRead(reg);
+    ioapicWrite(reg, val & ~@as(u32, 1 << 16));
+    ioapic_lock.unlockIrqRestore(irq_state);
+}
+
+fn ioapicRead(reg: u32) u32 {
+    const sel: *volatile u32 = @ptrFromInt(ioapic_base);
+    const win: *const volatile u32 = @ptrFromInt(ioapic_base + 0x10);
+    sel.* = reg;
+    return win.*;
+}
+
+fn ioapicWrite(reg: u32, val: u32) void {
+    const sel: *volatile u32 = @ptrFromInt(ioapic_base);
+    const win: *volatile u32 = @ptrFromInt(ioapic_base + 0x10);
+    sel.* = reg;
+    win.* = val;
+}

@@ -636,6 +636,87 @@ pub fn pmuClearState(state: *PmuState) void {
     }
 }
 
+// --- Wall clock (systems.md §22) ---
+
+pub fn readRtc() u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.rtc.readRtc(),
+        .aarch64 => 0,
+        else => unreachable,
+    };
+}
+
+// --- Randomness (systems.md §23) ---
+
+pub fn getRandom() ?u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.rdrand(),
+        .aarch64 => null,
+        else => unreachable,
+    };
+}
+
+// --- IRQ notification (systems.md §24) ---
+
+pub fn maskIrq(irq: u8) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.irq.maskIrq(irq),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
+pub fn unmaskIrq(irq: u8) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.irq.unmaskIrq(irq),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
+pub fn findIrqForDevice(device: *DeviceRegion) ?u8 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => {
+            for (x64.irq.irq_table, 0..) |dev_ptr, i| {
+                if (dev_ptr == device) return @truncate(i);
+            }
+            return null;
+        },
+        .aarch64 => null,
+        else => unreachable,
+    };
+}
+
+// --- Power control (systems.md §25) ---
+
+pub const PowerAction = switch (builtin.cpu.arch) {
+    .x86_64 => x64.power.PowerAction,
+    .aarch64 => enum(u8) { shutdown = 0, reboot = 1, sleep = 2, hibernate = 3, screen_off = 4 },
+    else => unreachable,
+};
+
+pub const CpuPowerAction = switch (builtin.cpu.arch) {
+    .x86_64 => x64.power.CpuPowerAction,
+    .aarch64 => enum(u8) { set_freq = 0, set_idle = 1 },
+    else => unreachable,
+};
+
+pub fn powerAction(action: PowerAction) i64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.power.powerAction(action),
+        .aarch64 => -15, // E_NODEV
+        else => unreachable,
+    };
+}
+
+pub fn cpuPowerAction(action: CpuPowerAction, value: u64) i64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.power.cpuPowerAction(action, value),
+        .aarch64 => -15, // E_NODEV
+        else => unreachable,
+    };
+}
+
 // --- System info (sys_info) dispatch (systems.md §13, §21) ---
 
 /// One-time system-info bring-up on the bootstrap core. Called from `kMain`

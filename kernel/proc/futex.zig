@@ -63,6 +63,18 @@ fn removeTimedWaiter(thread: *Thread) void {
     }
 }
 
+/// Public wrapper for addTimedWaiter, used by notification.zig for
+/// notify_wait timeout support. See systems.md §24 "Timeout Integration".
+pub fn addTimedWaiterPublic(thread: *Thread) bool {
+    return addTimedWaiter(thread);
+}
+
+/// Public wrapper for removeTimedWaiter, used by notification.zig for
+/// notify_wait timeout cleanup.
+pub fn removeTimedWaiterPublic(thread: *Thread) void {
+    removeTimedWaiter(thread);
+}
+
 /// Remove a killed thread from its futex wait bucket.
 /// Called by Process.kill() for threads blocked on futex_wait.
 pub fn removeBlockedThread(thread: *Thread) void {

@@ -6,6 +6,7 @@ const debug = zag.debug;
 const device_registry = zag.devices.registry;
 const memory = zag.memory.init;
 const sched = zag.sched.scheduler;
+const syscall = zag.syscall;
 
 const BootInfo = zag.boot.protocol.BootInfo;
 const PAddr = zag.memory.address.PAddr;
@@ -39,6 +40,10 @@ fn kMain(boot_info: *BootInfo) !void {
     arch.vmInit();
     arch.pmuInit();
     arch.sysInfoInit();
+    // Wall clock offset init: read RTC once at boot (systems.md §22).
+    const rtc_nanos = arch.readRtc();
+    const monotonic_now = arch.getMonotonicClock().now();
+    syscall.wall_offset = @as(i64, @bitCast(rtc_nanos)) -% @as(i64, @bitCast(monotonic_now));
     device_registry.registerDisplayDevice(boot_info.framebuffer);
     const rs_phys = PAddr.fromInt(@intFromPtr(boot_info.root_service.ptr));
     const rs_virt = VAddr.fromPAddr(rs_phys, null);

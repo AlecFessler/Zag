@@ -95,7 +95,7 @@ pub fn grantAllToRootService(root_proc: *Process) void {
         const entry = PermissionEntry{
             .handle = 0,
             .object = .{ .device_region = device_table[i] },
-            .rights = 0b111,
+            .rights = 0b1111,
         };
         _ = root_proc.insertPerm(entry) catch {};
     }

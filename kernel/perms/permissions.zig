@@ -44,7 +44,9 @@ pub const ProcessRights = packed struct(u16) {
     device_own: bool = false,
     fault_handler: bool = false,
     pmu: bool = false,
-    _reserved: u7 = 0,
+    set_time: bool = false,
+    power: bool = false,
+    _reserved: u5 = 0,
 };
 
 pub const VmReservationRights = packed struct(u8) {
@@ -69,7 +71,8 @@ pub const DeviceRegionRights = packed struct(u8) {
     map: bool = false,
     grant: bool = false,
     dma: bool = false,
-    _reserved: u5 = 0,
+    irq: bool = false,
+    _reserved: u4 = 0,
 };
 
 pub const ProcessHandleRights = packed struct(u16) {
@@ -108,6 +111,7 @@ pub const PermissionEntry = struct {
     rights: u16,
     exclude_oneshot: bool = false,
     exclude_permanent: bool = false,
+    badge_bit: u6 = 0,
 
     pub fn processRights(self: @This()) ProcessRights {
         return @bitCast(self.rights);
@@ -243,7 +247,8 @@ pub const UserViewEntry = extern struct {
                     (if (dr.device_type == .mmio)
                         @as(u64, @truncate(dr.access.mmio.size)) << 32
                     else
-                        @as(u64, dr.access.port_io.port_count) << 32),
+                        @as(u64, dr.access.port_io.port_count) << 32) |
+                    (@as(u64, entry.badge_bit) << 56),
                 .field1 = if (dr.device_class == .display) blk: {
                     const d = dr.detail.display;
                     break :blk @as(u64, d.fb_width) |

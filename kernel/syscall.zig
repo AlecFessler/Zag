@@ -13,11 +13,13 @@ const sched = zag.sched.scheduler;
 const sysinfo = zag.sched.sysinfo;
 
 const ArchCpuContext = zag.arch.dispatch.ArchCpuContext;
+const CpuPowerAction = zag.arch.dispatch.CpuPowerAction;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const FaultReason = zag.perms.permissions.FaultReason;
 const KernelObject = zag.perms.permissions.KernelObject;
 const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
+const PowerAction = zag.arch.dispatch.PowerAction;
 const Priority = zag.sched.thread.Priority;
 const Process = zag.proc.process.Process;
 const ProcessHandleRights = zag.perms.permissions.ProcessHandleRights;
@@ -43,6 +45,12 @@ const E_NOENT: i64 = -10;
 const E_BUSY: i64 = -11;
 const E_EXIST: i64 = -12;
 const E_NORES: i64 = -14;
+const E_NODEV: i64 = -15;
+
+/// Wall clock offset: difference between RTC-derived Unix nanoseconds
+/// and the monotonic clock. Initialized at boot from the CMOS RTC.
+/// Spec §2.16; systems.md §22.
+pub var wall_offset: i64 = 0;
 
 pub const SyscallResult = struct {
     rax: i64,
@@ -105,6 +113,13 @@ pub const SyscallNum = enum(u64) {
     pmu_reset,
     pmu_stop,
     sys_info,
+    clock_getwall,
+    clock_setwall,
+    getrandom,
+    notify_wait,
+    irq_ack,
+    sys_power,
+    sys_cpu_power,
     _,
 };
 
@@ -180,6 +195,13 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
         .pmu_reset => .{ .rax = sysPmuReset(arg0, arg1, arg2) },
         .pmu_stop => .{ .rax = sysPmuStop(arg0) },
         .sys_info => .{ .rax = sysSysInfo(arg0, arg1) },
+        .clock_getwall => .{ .rax = sysClockGetwall() },
+        .clock_setwall => .{ .rax = sysClockSetwall(arg0) },
+        .getrandom => .{ .rax = sysGetrandom(arg0, arg1) },
+        .notify_wait => .{ .rax = sysNotifyWait(arg0) },
+        .irq_ack => .{ .rax = sysIrqAck(arg0) },
+        .sys_power => .{ .rax = sysSysPower(arg0) },
+        .sys_cpu_power => .{ .rax = sysSysCpuPower(arg0, arg1) },
         _ => .{ .rax = E_INVAL },
     };
 }
@@ -2242,4 +2264,105 @@ fn sysSysInfo(info_ptr: u64, cores_ptr: u64) i64 {
 
 fn sysPmuStop(thread_handle: u64) i64 {
     return pmu.sysPmuStop(currentProc(), thread_handle);
+}
+
+// --- Wall Clock (§4.56–§4.57, systems.md §22) ---
+
+fn sysClockGetwall() i64 {
+    const monotonic_now = arch.getMonotonicClock().now();
+    const offset = @atomicLoad(i64, &wall_offset, .monotonic);
+    return @as(i64, @bitCast(monotonic_now)) +% offset;
+}
+
+fn sysClockSetwall(requested_nanos: u64) i64 {
+    const proc = currentProc();
+    const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
+    if (!self_entry.processRights().set_time) return E_PERM;
+    const new_offset = @as(i64, @bitCast(requested_nanos)) -% @as(i64, @bitCast(arch.getMonotonicClock().now()));
+    @atomicStore(i64, &wall_offset, new_offset, .monotonic);
+    return E_OK;
+}
+
+// --- Randomness (§4.58, systems.md §23) ---
+
+fn sysGetrandom(buf_ptr: u64, len: u64) i64 {
+    if (len == 0 or len > 4096) return E_INVAL;
+
+    // Validate buffer address range.
+    if (!address.AddrSpacePartition.user.contains(buf_ptr)) return E_BADADDR;
+    const end = std.math.add(u64, buf_ptr, len) catch return E_BADADDR;
+    if (!address.AddrSpacePartition.user.contains(end -| 1)) return E_BADADDR;
+
+    const proc = currentProc();
+    var remaining: u64 = len;
+    var dst_va: u64 = buf_ptr;
+
+    while (remaining > 0) {
+        const rand_val = arch.getRandom() orelse {
+            // If we haven't written anything yet, return E_AGAIN.
+            if (remaining == len) return E_AGAIN;
+            // Otherwise return E_AGAIN (partial fill not supported).
+            return E_AGAIN;
+        };
+
+        const page_off = dst_va & 0xFFF;
+        const chunk = @min(remaining, 8);
+        const page_chunk = @min(chunk, paging.PAGE4K - page_off);
+
+        // Demand-page the destination.
+        proc.vmm.demandPage(VAddr.fromInt(dst_va), true, false) catch return E_BADADDR;
+        const page_paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return E_BADADDR;
+        const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
+
+        const bytes: [8]u8 = @bitCast(rand_val);
+        const write_len = @min(page_chunk, chunk);
+        const dst: [*]u8 = @ptrFromInt(physmap_addr);
+        @memcpy(dst[0..write_len], bytes[0..write_len]);
+
+        dst_va += write_len;
+        remaining -= write_len;
+    }
+
+    return E_OK;
+}
+
+// --- IRQ Notification (§4.59–§4.60, systems.md §24) ---
+
+fn sysNotifyWait(timeout_ns: u64) i64 {
+    const proc = currentProc();
+    const thread = sched.currentThread().?;
+    return proc.notification_box.wait(thread, timeout_ns);
+}
+
+fn sysIrqAck(device_handle: u64) i64 {
+    const proc = currentProc();
+    const entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
+    if (entry.object != .device_region) return E_BADCAP;
+    if (!entry.deviceRights().irq) return E_PERM;
+
+    // Look up the device's IRQ line and unmask it.
+    const device = entry.object.device_region;
+    const irq_line = arch.findIrqForDevice(device) orelse return E_INVAL;
+    arch.unmaskIrq(irq_line);
+    return E_OK;
+}
+
+// --- Power Control (§4.61–§4.62, systems.md §25) ---
+
+fn sysSysPower(action_raw: u64) i64 {
+    const proc = currentProc();
+    const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
+    if (!self_entry.processRights().power) return E_PERM;
+
+    const action = std.meta.intToEnum(PowerAction, @as(u8, @truncate(action_raw))) catch return E_INVAL;
+    return arch.powerAction(action);
+}
+
+fn sysSysCpuPower(action_raw: u64, value: u64) i64 {
+    const proc = currentProc();
+    const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
+    if (!self_entry.processRights().power) return E_PERM;
+
+    const action = std.meta.intToEnum(CpuPowerAction, @as(u8, @truncate(action_raw))) catch return E_INVAL;
+    return arch.cpuPowerAction(action, value);
 }
