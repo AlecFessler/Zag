@@ -29,6 +29,8 @@ def normalize(text):
 
 def extract_first_sentence(text):
     """Extract the first sentence from text (up to first '. ' or end)."""
+    # Strip inline HTML comments (spec:test tags)
+    text = re.sub(r'\s*<!--.*?-->\s*', ' ', text).strip()
     # Split on ". " followed by an uppercase letter or backtick (sentence boundary)
     m = re.match(r'^(.+?\.)\s+(?=[A-Z`])', text)
     if m:

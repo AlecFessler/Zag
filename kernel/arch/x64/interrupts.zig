@@ -199,7 +199,7 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\movq 8(%%rsp), %%r14
         \\movq 16(%%rsp), %%r13
         \\movq 24(%%rsp), %%r12
-        // Skip r11 (32) and r10-rdi — restored below from iret frame or kept.
+        \\movq 32(%%rsp), %%r11
         \\movq 40(%%rsp), %%r10
         \\movq 48(%%rsp), %%r9
         \\movq 56(%%rsp), %%r8
@@ -208,27 +208,15 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\movq 80(%%rsp), %%rbp
         \\movq 88(%%rsp), %%rbx
         \\movq 96(%%rsp), %%rdx
-        // Skip rcx (104) — will be loaded from ctx.rip for SYSRET.
+        \\movq 104(%%rsp), %%rcx
         \\movq 112(%%rsp), %%rax
 
-        // ── SYSRET exit (Intel SDM Vol 2B, "SYSRET") ────────────────
-        // Canonical check BEFORE loading RCX. Non-canonical RCX causes
-        // #GP(0) at CPL3 on kernel stack (Intel SDM Vol 2B, SYSRET #GP).
-        \\testb $0x80, 141(%%rsp)     // bit 47 of ctx.rip = byte 5, bit 7
-        \\jnz .Lsysret_iret_fallback
-
-        // Fast path: load SYSRET registers from the iret frame.
-        \\movq 136(%%rsp), %%rcx      // RCX = user RIP
-        \\movq 152(%%rsp), %%r11      // R11 = user RFLAGS
-        \\movq 160(%%rsp), %%rsp      // RSP = user RSP (last — clobbers frame)
-        \\sysretq
-
-    \\.Lsysret_iret_fallback:
-        // Non-canonical RIP. Restore R11 and use IRETQ via interruptStubEpilogue.
-        // Advance RSP past GPRs to the int_num slot so the epilogue layout matches.
-        \\movq 32(%%rsp), %%r11
-        \\movq 104(%%rsp), %%rcx
-        \\addq $120, %%rsp             // RSP now at int_num
+        // ── Return to userspace via IRETQ ─────────────────────��──────
+        // IRETQ properly loads CS/SS from the stack frame, avoiding
+        // SYSRET's reliance on the hidden descriptor cache which is
+        // unreliable under KVM. SYSCALL entry is still used for the
+        // fast entry path; only the return uses IRETQ.
+        \\addq $120, %%rsp             // skip GPRs (RSP now at int_num)
         \\addq $16, %%rsp              // skip int_num + err_code → iret frame
         \\iretq
     );
