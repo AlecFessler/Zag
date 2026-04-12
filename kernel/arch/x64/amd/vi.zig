@@ -428,39 +428,37 @@ pub fn setupDevice(device: *DeviceRegion) !void {
         if (!unit.active) continue;
 
         // Write DTE at the alias DeviceID index.
-        if (entry_offset + 32 <= unit.dev_table_size) {
-            const entry_base: [*]volatile u64 = @ptrFromInt(unit.dev_table_virt.addr + entry_offset);
+        if (entry_offset + 32 > unit.dev_table_size) continue;
+        const entry_base: [*]volatile u64 = @ptrFromInt(unit.dev_table_virt.addr + entry_offset);
 
-            // Spec Section 2.2.2.2: When V=1 before the change, clear V first
-            // to prevent the IOMMU from seeing a partially-updated DTE.
-            entry_base[0] = 0;
-            entry_base[3] = 0;
-            entry_base[2] = 0;
-            entry_base[1] = qw1;
-            // Write qw0 last — this sets V=1, making the entry live.
-            entry_base[0] = qw0;
+        // Spec Section 2.2.2.2: When V=1 before the change, clear V first
+        // to prevent the IOMMU from seeing a partially-updated DTE.
+        entry_base[0] = 0;
+        entry_base[3] = 0;
+        entry_base[2] = 0;
+        entry_base[1] = qw1;
+        // Write qw0 last — this sets V=1, making the entry live.
+        entry_base[0] = qw0;
 
-            unit.invalidateDeviceEntry(device_id);
-            unit.invalidatePages(device_id);
-            unit.completionWait();
-        }
+        unit.invalidateDeviceEntry(device_id);
+        unit.invalidatePages(device_id);
+        unit.completionWait();
 
         // If this device has an alias, also program the DTE at the original BDF
         // so the IOMMU handles both the aliased and original requester IDs.
-        if (device_id != bdf) {
-            const bdf_offset = @as(u64, bdf) * 32;
-            if (bdf_offset + 32 <= unit.dev_table_size) {
-                const bdf_entry: [*]volatile u64 = @ptrFromInt(unit.dev_table_virt.addr + bdf_offset);
-                bdf_entry[0] = 0;
-                bdf_entry[3] = 0;
-                bdf_entry[2] = 0;
-                bdf_entry[1] = qw1;
-                bdf_entry[0] = qw0;
+        if (device_id == bdf) continue;
+        const bdf_offset = @as(u64, bdf) * 32;
+        if (bdf_offset + 32 <= unit.dev_table_size) {
+            const bdf_entry: [*]volatile u64 = @ptrFromInt(unit.dev_table_virt.addr + bdf_offset);
+            bdf_entry[0] = 0;
+            bdf_entry[3] = 0;
+            bdf_entry[2] = 0;
+            bdf_entry[1] = qw1;
+            bdf_entry[0] = qw0;
 
-                unit.invalidateDeviceEntry(bdf);
-                unit.invalidatePages(bdf);
-                unit.completionWait();
-            }
+            unit.invalidateDeviceEntry(bdf);
+            unit.invalidatePages(bdf);
+            unit.completionWait();
         }
     }
 }
@@ -584,10 +582,9 @@ pub fn flushDevice(device: *const DeviceRegion) void {
     const bdf = @as(u16, device.detail.pci.bus) << 8 | @as(u16, device.detail.pci.dev) << 3 | @as(u16, device.detail.pci.func);
     const domain_id = lookupAlias(bdf);
     for (units[0..unit_count]) |*unit| {
-        if (unit.active) {
-            unit.invalidatePages(domain_id);
-            unit.completionWait();
-        }
+        if (!unit.active) continue;
+        unit.invalidatePages(domain_id);
+        unit.completionWait();
     }
 }
 
