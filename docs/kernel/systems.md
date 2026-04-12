@@ -1078,9 +1078,9 @@ Portable dispatch layer in `kernel/arch/dispatch.zig`. All functions dispatch at
 - Fallback: if MCFG not present or no devices found, legacy PCI config space enumeration.
 - Serial port probing.
 
-### SYSCALL/SYSRET Entry Path
+### SYSCALL Entry / IRETQ Return Path
 
-The kernel uses the SYSCALL/SYSRET instruction pair (Intel SDM Vol 2B "SYSCALL", "SYSRET"; Vol 3A §5.8.8) instead of INT 0x80 for syscall entry. This is ~2.5x faster than the interrupt gate path.
+The kernel uses SYSCALL for fast entry and IRETQ for return (Intel SDM Vol 2B "SYSCALL"; Vol 3A §5.8.8). This avoids the SYSRET SS selector issue under KVM, where SYSRET's reliance on the hidden descriptor cache is unreliable. Entry via SYSCALL is ~2.5x faster than the interrupt gate path.
 
 **GDT Layout** — SYSRET loads CS = STAR[63:48]+16, SS = STAR[63:48]+8 (Intel SDM Vol 2B "SYSRET" Operation). This requires user data to precede user code in the GDT:
 
@@ -1107,10 +1107,10 @@ Entry sequence:
 4. SWAPGS — restore user GS base (safe for context switches)
 5. Build iret-compatible `cpu.Context` frame on kernel stack
 6. FXSAVE, call `syscallDispatch`, FXRSTOR
-7. Load RCX=RIP, R11=RFLAGS, RSP=user RSP from frame
-8. Canonical check (bit 47 of RCX) — SYSRETQ fast path, or IRETQ fallback for non-canonical RIP
+7. Restore GPRs from saved frame
+8. IRETQ — return to userspace using the iret frame (RIP, CS, RFLAGS, RSP, SS)
 
-The canonical check addresses the Intel erratum where SYSRET with non-canonical RCX causes #GP(0) at CPL 3 but on the kernel stack (Intel SDM Vol 2B "SYSRET" 64-Bit Mode Exceptions). User addresses always have bit 47 clear, so the SYSRETQ path is taken.
+The return always uses IRETQ, which properly loads CS/SS from the stack frame. SYSRET is not used because its hidden descriptor cache behavior is unreliable under KVM (Intel SDM Vol 2B "SYSRET" 64-Bit Mode Exceptions). The GDT layout still supports SYSRET (user data before user code) but only the MSR configuration for SYSCALL entry is active.
 
 **smpInit() -> void** -- Bring up secondary cores:
 1. Initialize per-core GDT/TSS for all cores.
@@ -1184,6 +1184,8 @@ The canonical check addresses the Intel erratum where SYSRET with non-canonical 
 **maskIrq(irq: u8) -> void** -- Masks (disables) the given IRQ line. On x86_64: sets the mask bit in the I/O APIC redirection table entry. On aarch64: no-op. Called from the IRQ handler path after identifying the interrupting device (§24).
 
 **unmaskIrq(irq: u8) -> void** -- Unmasks (enables) the given IRQ line. On x86_64: clears the mask bit in the I/O APIC redirection table entry. On aarch64: no-op. Called from the `irq_ack` syscall handler (§24).
+
+**findIrqForDevice(device: *DeviceRegion) -> ?u8** -- Linearly scans irq_table to find the IRQ line number for a device. On x86_64: iterates `irq_table[0..256]`, returns the index where the entry matches `device`, or null if not found. On aarch64: returns null. Used by the `irq_ack` syscall handler (§24).
 
 ### Power Control
 
@@ -2471,20 +2473,24 @@ The aarch64 stub returns `null`, causing `getrandom` to return `E_NODEV` (no har
 Defined in `kernel/arch/x64/cpu.zig`. The `getRandom()` function uses the `RDRAND` instruction to obtain a 64-bit random value from the on-chip Digital Random Number Generator (DRNG).
 
 ```
-pub fn getRandom() ?u64 {
-    var value: u64 = undefined;
-    var success: u8 = undefined;
-    asm volatile ("rdrand %[val]"
+pub fn rdrand() ?u64 {
+    var value: u64 = 0;
+    var success: u8 = 0;
+    asm volatile (
+        \\rdrand %[val]
+        \\setc %[ok]
         : [val] "=r" (value),
-          [cf] "={@ccc}" (success),
+          [ok] "=r" (success),
     );
     return if (success != 0) value else null;
 }
 ```
 
-RDRAND sets the carry flag (CF=1) on success and clears it (CF=0) when the hardware entropy source is temporarily exhausted. The inline assembly captures CF via the `@ccc` constraint. Returning `null` on failure maps to `E_AGAIN` in the syscall handler.
+RDRAND sets the carry flag (CF=1) on success and clears it (CF=0) when the hardware entropy source is temporarily exhausted. The inline assembly uses `setc` to capture CF into a general-purpose register. Returning `null` on failure maps to `E_AGAIN` in the syscall handler.
 
 RDRAND availability is determined by CPUID leaf 1, ECX bit 30. If unavailable on the host CPU, the function returns `null` unconditionally. The CPUID check can be done once at boot and cached, but the current implementation checks RDRAND availability implicitly: if the instruction is not supported, the `#UD` exception handler would fire. In practice, all x86_64 CPUs that Zag targets (Ivy Bridge and later) support RDRAND.
+
+**E_NODEV limitation:** The current implementation cannot distinguish "hardware RNG temporarily exhausted" (E_AGAIN) from "no hardware RNG at all" (E_NODEV). On architectures without RDRAND, `getRandom()` returns null, and the handler returns E_AGAIN. A future enhancement could check CPUID for RDRAND support at boot and return E_NODEV if absent.
 
 ### getrandom Handler
 
@@ -2556,15 +2562,17 @@ The `word` field accumulates IRQ notifications via atomic OR. The `waiters` prio
 
 Each `Process` has a `badge_counter: u6` field, initialized to 0. When a device region handle is inserted into the process's permissions table (via `insertPerm` for device_region entries), the current `badge_counter` value is assigned as the badge bit for that entry, and the counter is incremented mod 64.
 
-The badge bit is stored on the `PermissionEntry` struct. For device_region entries, it is packed into the upper bits of `field0` in the user permissions view so userspace can map notification bits to device handles without a syscall. Specifically, `field0` bits 56--61 carry the 6-bit badge value (the existing device type, class, and size fields occupy bits 0--55).
+The badge bit is stored on the `PermissionEntry` struct. For device_region entries, it is exposed in the dedicated `badge_byte` field of `UserViewEntry` (offset 9, the byte after `entry_type`) so userspace can map notification bits to device handles without a syscall (spec §2.18.3). The `field0` encoding is unchanged and carries only device type, class, and size:
 
 ```
-device_region field0 encoding (updated):
-  bits 0-7:   device_type (u8)
-  bits 8-15:  device_class (u8)
-  bits 32-55: size_or_port_count (u24, truncated from u32)
-  bits 56-61: badge_bit (u6)
-  bits 62-63: reserved (0)
+UserViewEntry layout (device_region):
+  handle:     u64  (offset 0)
+  entry_type: u8   (offset 8)  — ENTRY_TYPE_DEVICE_REGION (3)
+  badge_byte: u8   (offset 9)  — badge_bit (u6, 0-63)
+  rights:     u16  (offset 10)
+  _pad:       [4]u8
+  field0:     u64  (offset 16) — device_type[0:7], device_class[8:15], size_or_port_count[32:55]
+  field1:     u64  (offset 24) — PCI topology
 ```
 
 ### NotificationBox Methods

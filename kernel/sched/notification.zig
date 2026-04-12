@@ -89,9 +89,15 @@ pub const NotificationBox = struct {
         arch.enableInterrupts();
         sched.yield();
 
-        // On wake: check if we were woken by timeout or by signal.
+        // On wake: check if we were woken by cleanup (E_NOENT sentinel),
+        // timeout, or signal.
         thread.notification_waiter = false;
         const deadline = thread.futex_deadline_ns;
+        const noent_sentinel: u64 = @bitCast(E_NOENT);
+        if (deadline == noent_sentinel) {
+            thread.futex_deadline_ns = 0;
+            return E_NOENT;
+        }
         if (deadline != 0) {
             thread.futex_deadline_ns = 0;
             const futex_mod = zag.proc.futex;
