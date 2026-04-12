@@ -426,11 +426,11 @@ Field encoding for thread entries: `field0 = tid(u64)` (the thread's stable kern
 
 All rights are packed structs with bit fields:
 
-- `ProcessRights`: packed `u16` -- `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `mem_shm_create`(5), `device_own`(6), `fault_handler`(7), `pmu`(8), 7 bits reserved.
+- `ProcessRights`: packed `u16` -- `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `mem_shm_create`(5), `device_own`(6), `fault_handler`(7), `pmu`(8), `set_time`(9), `power`(10), 5 bits reserved.
 - `ProcessHandleRights`: packed `u16` -- `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5), `fault_handler`(6), 9 bits reserved. Used on handles to other processes (not HANDLE_SELF).
 - `VmReservationRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4), 3 bits reserved.
 - `SharedMemoryRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `grant`(3), 4 bits reserved.
-- `DeviceRegionRights`: packed `u8` -- `map`(0), `grant`(1), `dma`(2), 5 bits reserved.
+- `DeviceRegionRights`: packed `u8` -- `map`(0), `grant`(1), `dma`(2), `irq`(3), 4 bits reserved.
 - `ThreadHandleRights`: packed `u8` -- `suspend`(0), `resume`(1), `kill`(2), `pmu`(4), 4 bits reserved. Bit 3 is reserved for alignment with the public spec layout. The `pmu` bit is checked in addition to `ProcessRights.pmu` on every PMU syscall that takes a thread handle; see §20.
 
 ---

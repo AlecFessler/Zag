@@ -1046,6 +1046,48 @@ Typical usage is a two-call pattern: first call with `cores_ptr = null` to obtai
 
 **§4.55.1** `sys_info` returns `E_OK` on success. **§4.55.2** `sys_info` requires no rights and is callable by any process. **§4.55.3** `sys_info` with `info_ptr` not pointing to a writable region of `sizeof(SysInfo)` bytes returns `E_BADADDR`. **§4.55.4** `sys_info` with `cores_ptr` null writes only `SysInfo`; no per-core data is written and no scheduler accounting counters are reset. **§4.55.5** `sys_info` with `cores_ptr` non-null must point to a writable region of `core_count * sizeof(CoreInfo)` bytes, where `core_count` is the value written to `info_ptr.core_count` by the same call; otherwise returns `E_BADADDR`. **§4.55.6** On success with `cores_ptr` non-null, `sys_info` writes `SysInfo` to `info_ptr` and a fully populated `CoreInfo` array to `cores_ptr`, and resets each core's `idle_ns` and `busy_ns` atomically as they are read.
 
+### §4.56 clock_getwall() → nanoseconds
+
+Returns the current wall clock time as nanoseconds since the Unix epoch (1970-01-01T00:00:00Z). The value is computed as the monotonic clock plus a kernel-maintained offset initialized from the hardware RTC at boot (§2.16).
+
+**§4.56.1** `clock_getwall` returns a positive i64 representing nanoseconds since the Unix epoch. **§4.56.2** `clock_getwall` requires no rights and is callable by any process. **§4.56.3** `clock_getwall` always succeeds.
+
+### §4.57 clock_setwall(nanoseconds) → result
+
+Sets the wall clock time by recomputing the kernel's internal wall clock offset so that the next `clock_getwall` returns the specified time (§2.16).
+
+**§4.57.1** `clock_setwall` returns `E_OK` on success. **§4.57.2** `clock_setwall` requires `ProcessRights.set_time` on slot 0; returns `E_PERM` without it. **§4.57.3** The offset update is atomic: concurrent `clock_getwall` calls on other threads see either the old or the new time, never a torn value.
+
+### §4.58 getrandom(buf_ptr, len) → result
+
+Fills a userspace buffer with hardware-sourced random bytes (§2.17).
+
+**§4.58.1** `getrandom` returns `E_OK` on success. **§4.58.2** `getrandom` requires no rights and is callable by any process. **§4.58.3** `getrandom` with `len == 0` returns `E_INVAL`. **§4.58.4** `getrandom` with `len > 4096` returns `E_INVAL`. **§4.58.5** `getrandom` with `buf_ptr` not pointing to a writable region of `len` bytes returns `E_BADADDR`. **§4.58.6** `getrandom` returns `E_AGAIN` if the hardware RNG is temporarily unavailable. **§4.58.7** On `E_NODEV`, the hardware has no RNG support at all.
+
+### §4.59 notify_wait(timeout_ns) → bitmask
+
+Waits for the calling process's notification word to become non-zero, then atomically reads and clears it (§2.18).
+
+**§4.59.1** `notify_wait` returns the notification bitmask (positive u64) on success. **§4.59.2** `notify_wait` requires no rights and is callable by any process. **§4.59.3** `notify_wait` with `timeout_ns = 0` is non-blocking: returns `E_AGAIN` if the notification word is zero. **§4.59.4** `notify_wait` with `timeout_ns = MAX_U64` blocks indefinitely until the notification word becomes non-zero. **§4.59.5** `notify_wait` with a finite `timeout_ns` returns `E_TIMEOUT` if the notification word remains zero for the duration.
+
+### §4.60 irq_ack(device_handle) → result
+
+Unmasks the IRQ line for the device associated with `device_handle`, allowing future interrupts to be delivered (§2.18).
+
+**§4.60.1** `irq_ack` returns `E_OK` on success. **§4.60.2** `irq_ack` with invalid or wrong-type `device_handle` returns `E_BADHANDLE`. **§4.60.3** `irq_ack` without `DeviceRegionRights.irq` on the device handle returns `E_PERM`. **§4.60.4** `irq_ack` on a device with no associated IRQ line returns `E_INVAL`.
+
+### §4.61 sys_power(action) → result
+
+Performs a system-wide power action (§2.19). `action` is a `PowerAction` enum value.
+
+**§4.61.1** `sys_power` returns `E_OK` on success (for actions that return). **§4.61.2** `sys_power` requires `ProcessRights.power` on slot 0; returns `E_PERM` without it. **§4.61.3** `sys_power` with an invalid `action` value returns `E_INVAL`. **§4.61.4** `sys_power` with `shutdown` or `reboot` does not return on success. **§4.61.5** `sys_power` with `sleep`, `hibernate`, or `screen_off` returns `E_OK` after the system resumes or the action completes. **§4.61.6** `sys_power` returns `E_NODEV` if the hardware does not support the requested action.
+
+### §4.62 sys_cpu_power(action, value) → result
+
+Performs a per-CPU power control action (§2.19). `action` is a `CpuPowerAction` enum value.
+
+**§4.62.1** `sys_cpu_power` returns `E_OK` on success. **§4.62.2** `sys_cpu_power` requires `ProcessRights.power` on slot 0; returns `E_PERM` without it. **§4.62.3** `sys_cpu_power` with an invalid `action` value returns `E_INVAL`. **§4.62.4** `sys_cpu_power` with `set_freq` uses `value` as the target frequency in hertz. **§4.62.5** `sys_cpu_power` with `set_idle` uses `value` as the maximum C-state level. **§4.62.6** `sys_cpu_power` returns `E_NODEV` if the hardware does not support the requested action.
+
 ---
 
 ## §5 System Limits
@@ -1069,3 +1111,6 @@ Typical usage is a two-call pattern: first call with `cores_ptr = null` to obtai
 | PMU counters per thread | `PmuInfo.num_counters` (hardware-dependent) |
 | PMU counter slots in `PmuSample` | `MAX_COUNTERS` (kernel compile-time maximum across supported arches) |
 | Max `SysInfo.core_count` | 64 (matches Max CPU cores) |
+| `getrandom` max buffer size | 4096 bytes |
+| Notification badge bits | 64 (u6, one per device handle) |
+| IRQ table entries | 256 |
