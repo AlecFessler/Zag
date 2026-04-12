@@ -25,6 +25,9 @@ const TrampolineParams = extern struct {
     entry_point: u64,
 };
 
+/// Trampoline must reside below 1 MiB — the SIPI vector encodes the page-aligned
+/// start address as VV in 000VV000H.
+/// Intel SDM Vol 3A, §11.4.4 "MP Initialization Example", step 10.
 const TRAMPOLINE_PHYS: u64 = 0x8000;
 const TRAMPOLINE_VECTOR: u8 = @intCast(TRAMPOLINE_PHYS >> 12);
 const params_offset = trampoline_code.len - @sizeOf(TrampolineParams);
@@ -39,6 +42,10 @@ const KERNEL_PERMS = MemoryPerms{
 
 var cores_online: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
 
+/// Boots all application processors via the INIT-SIPI-SIPI sequence.
+/// Intel SDM Vol 3A, §11.4.3 "MP Initialization Protocol Algorithm for MP Systems"
+/// Intel SDM Vol 3A, §11.4.4 "MP Initialization Example", Table 11-1 — INIT-SIPI-SIPI
+/// sequence with 10 ms delay between INIT and first SIPI.
 pub fn smpInit() !void {
     for (0..apic.coreCount()) |i| {
         gdt.initForCore(i);
@@ -104,6 +111,9 @@ pub fn smpInit() !void {
         params.stack_top = zag.memory.address.alignStack(ap_stack.top).addr;
 
         const expected = cores_online.load(.acquire);
+        // Intel SDM Vol 3A, §11.4.4, Table 11-1: send INIT IPI, wait 10 ms,
+        // then send SIPI. A second SIPI is not sent; we rely on the 100 ms
+        // timeout to detect APs that fail to come online.
         apic.sendInitIpi(la.apic_id);
 
         const start = hpet_iface.now();
@@ -124,6 +134,8 @@ pub fn smpInit() !void {
     }
 }
 
+/// AP initialization entry point — corresponds to the "Typical AP Initialization Sequence"
+/// in Intel SDM Vol 3A, §11.4.4.2.
 fn coreInit() callconv(.c) noreturn {
     gdt.loadGdt(0);
     gdt.reloadSegments();
@@ -139,6 +151,8 @@ fn coreInit() callconv(.c) noreturn {
     gdt.loadGdt(core_id);
     cpu.ltr(gdt.TSS_OFFSET);
 
+    cpu.initSyscall(@intFromPtr(&interrupts.syscallEntry));
+    interrupts.initSyscallScratch(core_id);
     cpu.initPat();
     cpu.enableSmapSmep();
     cpu.enableSpeculationBarriers();

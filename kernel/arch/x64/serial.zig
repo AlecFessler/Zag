@@ -4,6 +4,8 @@ const zag = @import("zag");
 const cpu = zag.arch.x64.cpu;
 const sync = zag.utils.sync;
 
+/// Standard ISA I/O base addresses for COM1-COM4.
+/// These are the conventional PC/AT port assignments for 16550-compatible UARTs.
 const Ports = enum(u16) {
     com1 = 0x3F8,
     com2 = 0x2F8,
@@ -11,6 +13,14 @@ const Ports = enum(u16) {
     com4 = 0x2E8,
 };
 
+/// NS16550 / TL16C550C register offsets from the base I/O port.
+/// TL16C550C datasheet, §8 "Register Descriptions":
+///   DLL (offset 0) — Divisor Latch LSB (DLAB=1)
+///   IER (offset 1) — Interrupt Enable Register (DLAB=0)
+///   DLH (offset 1) — Divisor Latch MSB (DLAB=1)
+///   FCR (offset 2) — FIFO Control Register (write-only)
+///   LCR (offset 3) — Line Control Register
+///   LSR (offset 5) — Line Status Register
 const offsets = struct {
     const dll = 0;
     const ier = 1;
@@ -22,6 +32,10 @@ const offsets = struct {
 
 var g_port: Ports = .com1;
 
+/// Initializes a 16550 UART: sets 8N1 line protocol, disables interrupts and FIFOs,
+/// then programs the baud rate divisor via DLL/DLH with DLAB set.
+/// TL16C550C datasheet, §8.4 "Line Control Register" — DLAB bit (bit 7) gates
+/// access to the divisor latch registers at offsets 0 and 1.
 pub fn init(port: Ports, baud: u32) void {
     // Serial init is unconditional: the kernel test harness captures
     // `[PASS] §X.Y.Z` messages off COM1 regardless of optimize mode, so
@@ -66,6 +80,8 @@ pub fn print(
     }
 }
 
+/// Polls LSR bit 5 (Transmitter Holding Register Empty) before writing.
+/// TL16C550C datasheet, §8.6 "Line Status Register" — bit 5 indicates THR is empty.
 fn writeByte(
     byte: u8,
     port: Ports,

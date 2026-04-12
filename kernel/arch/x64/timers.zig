@@ -11,7 +11,10 @@ const VAddr = zag.memory.address.VAddr;
 var tsc_timer_instance: Tsc = undefined;
 var lapic_timer_instance: Lapic = undefined;
 
+/// High Precision Event Timer (HPET).
+/// IA-PC HPET Spec 1.0a, §2.3 "Timer Register Space" — register offsets and layout.
 pub const Hpet = struct {
+    /// IA-PC HPET Spec 1.0a, §2.3.1 "General Capabilities and ID Register"
     pub const GenCapsAndId = packed struct(u64) {
         revision_id: u8,
         num_timers_minus_one: u5,
@@ -22,21 +25,25 @@ pub const Hpet = struct {
         counter_clock_period: u32,
     };
 
+    /// IA-PC HPET Spec 1.0a, §2.3.2 "General Configuration Register"
     pub const GenConfig = packed struct(u64) {
         enable: bool,
         legacy_mapping: bool,
         _res: u62 = 0,
     };
 
+    /// IA-PC HPET Spec 1.0a, §2.3.3 "General Interrupt Status Register"
     pub const GenIntStatus = packed struct(u64) {
         level_triggered_timer_active: bool,
         _res: u63 = 0,
     };
 
+    /// IA-PC HPET Spec 1.0a, §2.3.4 "Main Counter Value Register"
     pub const MainCounterVal = packed struct(u64) {
         val: u64,
     };
 
+    /// IA-PC HPET Spec 1.0a, §2.3, Table 2 — register offsets from HPET base address.
     pub const Register = enum(u64) {
         gen_caps_and_id = 0x0,
         gen_config = 0x10,
@@ -91,11 +98,18 @@ pub const Hpet = struct {
     }
 };
 
+/// Local APIC one-shot timer.
+/// Intel SDM Vol 3A, §13.5.4 "APIC Timer" — 32-bit programmable count-down timer.
+/// Intel SDM Vol 3A, Figure 13-10 "Divide Configuration Register" — divider encoding.
+/// Intel SDM Vol 3A, Figure 13-11 "Initial Count and Current Count Registers"
 pub const Lapic = struct {
     freq_hz: u64,
     divider: u32,
     vector: u8,
 
+    /// Calibrates the LAPIC timer frequency by counting ticks against the HPET over
+    /// three 10ms samples. The divide configuration register encoding 0b011 selects
+    /// divide-by-16 per Intel SDM Vol 3A, Figure 13-10.
     pub fn init(hpet: *Hpet, int_vec: u8) Lapic {
         const DIV_CODE: u32 = 0b011;
         const DIVIDER: u32 = 16;
@@ -196,6 +210,11 @@ pub const Lapic = struct {
     }
 };
 
+/// Time-Stamp Counter (TSC) based timer.
+/// Intel SDM Vol 3B, §20.17 "Time-Stamp Counter" — RDTSC/RDTSCP monotonic counter.
+/// Intel SDM Vol 3B, §20.17.1 "Invariant TSC" — constant rate across P-states.
+/// Intel SDM Vol 3A, §13.5.4.1 "TSC-Deadline Mode" — IA32_TSC_DEADLINE MSR (6E0H)
+/// arms a one-shot interrupt at an absolute TSC value.
 pub const Tsc = struct {
     freq_hz: u64,
 
@@ -245,6 +264,9 @@ pub const Tsc = struct {
         };
     }
 
+    /// Arms a one-shot interrupt via IA32_TSC_DEADLINE MSR.
+    /// Intel SDM Vol 3A, §13.5.4.1 — writes an absolute TSC target; the timer fires
+    /// when TSC >= target and then disarms itself.
     fn armInterruptTimer(ctx: *anyopaque, timer_val_ns: u64) void {
         const self: *Tsc = @ptrCast(@alignCast(ctx));
         const delta_ticks: u64 = timer_mod.ticksFromNanosCeil(self.freq_hz, timer_val_ns);

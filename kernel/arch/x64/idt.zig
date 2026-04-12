@@ -5,18 +5,27 @@ const cpu = zag.arch.x64.cpu;
 
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 
+/// Intel SDM Vol 3A, Table 3-2 — System-Segment and Gate-Descriptor Types.
+/// In IA-32e mode: 0xE = 64-bit Interrupt Gate, 0xF = 64-bit Trap Gate.
+/// Task gates (0x5) are reserved/unsupported in IA-32e mode.
 pub const GateType = enum(u4) {
     task_gate = 0x5,
     interrupt_gate = 0xE,
     trap_gate = 0xF,
 };
 
+/// Intel SDM Vol 3A §7.14.1, Figure 7-8 — 64-Bit IDT Gate Descriptor.
+/// Each entry is 16 bytes (128 bits), holding a full 64-bit offset to
+/// the interrupt service routine and an IST index for stack switching.
+/// The IDT index is formed by scaling the interrupt vector by 16 (§7.10).
 const IDTEntry = packed struct(u128) {
     isr_base_low: u16,
     code_segment: u16,
+    /// Interrupt Stack Table index (§7.14.5). 0 = use legacy stack switch.
     ist: u3 = 0,
     _res0: u5 = 0,
     gate_type: GateType,
+    /// Must be 0 for interrupt/trap gates in IA-32e mode.
     storage_segment: u1,
     privilege: PrivilegeLevel,
     present: bool,
@@ -25,6 +34,7 @@ const IDTEntry = packed struct(u128) {
     _res1: u32 = 0,
 };
 
+/// Intel SDM Vol 3A §7.10, Figure 7-1 — IDTR holds base and limit of the IDT.
 const IDTPtr = packed struct {
     limit: u16,
     base: u64,
@@ -32,6 +42,8 @@ const IDTPtr = packed struct {
 
 pub const interruptHandler = *const fn () callconv(.naked) void;
 
+/// Intel SDM Vol 3A §7.10 — The IDT can contain up to 256 entries,
+/// one per interrupt/exception vector.
 const NUM_IDT_ENTRIES: u64 = 256;
 const TABLE_SIZE: u16 = @sizeOf(IDTEntry) * NUM_IDT_ENTRIES - 1;
 

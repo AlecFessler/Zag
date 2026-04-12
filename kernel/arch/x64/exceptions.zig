@@ -14,30 +14,42 @@ const PageFaultContext = zag.arch.dispatch.PageFaultContext;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 const VAddr = zag.memory.address.VAddr;
 
+/// Intel SDM Vol 3A, Table 7-1 — Protected-Mode Exceptions and Interrupts.
+/// Vector assignments for architecturally defined exceptions (0-31).
+/// Vector 15 is reserved; vectors 21-29 are reserved; vector 31 is reserved.
 pub const Exception = enum(u5) {
-    divide_by_zero = 0,
-    single_step_debug = 1,
-    non_maskable_interrupt = 2,
-    breakpoint_debug = 3,
-    overflow = 4,
-    bound_range_exceeded = 5,
-    invalid_opcode = 6,
-    device_not_available = 7,
-    double_fault = 8,
-    coprocessor_segment_overrun = 9,
-    invalid_task_state_segment = 10,
-    segment_not_pressent = 11,
-    stack_segment_fault = 12,
-    general_protection_fault = 13,
-    page_fault = 14,
-    x87_floating_point = 16,
-    alignment_check = 17,
-    machine_check = 18,
-    simd_floating_point = 19,
-    virtualization = 20,
-    security = 30,
+    divide_by_zero = 0, // #DE — Fault, no error code
+    single_step_debug = 1, // #DB — Fault/Trap, no error code
+    non_maskable_interrupt = 2, // NMI — Interrupt, no error code
+    breakpoint_debug = 3, // #BP — Trap, no error code
+    overflow = 4, // #OF — Trap, no error code
+    bound_range_exceeded = 5, // #BR — Fault, no error code
+    invalid_opcode = 6, // #UD — Fault, no error code
+    device_not_available = 7, // #NM — Fault, no error code
+    double_fault = 8, // #DF — Abort, error code (zero)
+    coprocessor_segment_overrun = 9, // reserved (Fault, no error code)
+    invalid_task_state_segment = 10, // #TS — Fault, error code
+    segment_not_pressent = 11, // #NP — Fault, error code
+    stack_segment_fault = 12, // #SS — Fault, error code
+    general_protection_fault = 13, // #GP — Fault, error code
+    page_fault = 14, // #PF — Fault, error code (see PFErrCode)
+    x87_floating_point = 16, // #MF — Fault, no error code
+    alignment_check = 17, // #AC — Fault, error code (zero)
+    machine_check = 18, // #MC — Abort, no error code
+    simd_floating_point = 19, // #XM — Fault, no error code
+    virtualization = 20, // #VE — Fault, no error code
+    security = 30, // #SX — Fault, error code
 };
 
+/// Intel SDM Vol 3A §5.7, Figure 5-12 — Page-Fault Error Code.
+/// Bit 0 (P): 0 = non-present page, 1 = protection violation.
+/// Bit 1 (W/R): 0 = read access, 1 = write access.
+/// Bit 2 (U/S): 0 = supervisor-mode access, 1 = user-mode access.
+/// Bit 3 (RSVD): 1 = reserved bit set in paging-structure entry.
+/// Bit 4 (I/D): 1 = instruction fetch (requires NXE=1 or SMEP=1).
+/// Bit 5 (PK): 1 = protection-key violation.
+/// Bit 6 (SS): 1 = shadow-stack access.
+/// Bit 15 (SGX): 1 = SGX-specific access-control violation.
 const PFErrCode = struct {
     present: bool,
     is_write: bool,
@@ -62,6 +74,8 @@ const PFErrCode = struct {
     }
 };
 
+/// Intel SDM Vol 3A §7.2 — Vectors 0-31 are reserved for exceptions
+/// and NMI; vectors 32-255 are available for external interrupts.
 pub const NUM_ISR_ENTRIES = 32;
 
 pub fn init() void {
@@ -177,6 +191,9 @@ fn exceptionHandler(ctx: *cpu.Context) void {
     }
 }
 
+/// Intel SDM Vol 3A §5.7 — #PF handler. CR2 holds the faulting linear
+/// address; the error code on the stack encodes the fault reason per
+/// Figure 5-12.
 fn pageFaultHandler(ctx: *cpu.Context) void {
     const pf_err = PFErrCode.from(ctx.err_code);
     if (pf_err.rsvd_violation) {
