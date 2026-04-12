@@ -1,21 +1,16 @@
+pub const acpi = @import("acpi.zig");
+pub const cpu = @import("cpu.zig");
+pub const exceptions = @import("exceptions.zig");
+pub const gic = @import("gic.zig");
+pub const init = @import("init.zig");
+pub const interrupts = @import("interrupts.zig");
+pub const iommu = @import("iommu.zig");
+pub const irq = @import("irq.zig");
+pub const paging = @import("paging.zig");
 pub const pmu = @import("pmu.zig");
+pub const power = @import("power.zig");
+pub const serial = @import("serial.zig");
+pub const smp = @import("smp.zig");
 pub const sysinfo = @import("sysinfo.zig");
-
-pub const vm = struct {
-    pub const GuestState = struct {};
-    pub const VmExitInfo = struct {};
-    pub const GuestInterrupt = struct {};
-    pub const GuestException = struct {};
-    pub const VmPolicy = struct {};
-    pub const FxsaveArea = [512]u8;
-
-    pub fn fxsaveInit() FxsaveArea {
-        return .{0} ** 512;
-    }
-
-    pub fn vmInit() void {}
-    pub fn vmPerCoreInit() void {}
-    pub fn vmSupported() bool {
-        return false;
-    }
-};
+pub const timers = @import("timers.zig");
+pub const vm = @import("vm.zig");

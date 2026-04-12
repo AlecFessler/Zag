@@ -6,9 +6,7 @@
 /// Section 3.0: Register Description.
 const zag = @import("zag");
 
-const Lapic = zag.kvm.lapic.Lapic;
-
-pub const IOAPIC_BASE: u64 = 0xFEC00000;
+const Lapic = zag.arch.x64.kvm.lapic.Lapic;
 
 // Memory-mapped register offsets (Table 1)
 const IOREGSEL_OFF: u32 = 0x00;

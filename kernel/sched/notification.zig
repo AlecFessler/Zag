@@ -5,7 +5,7 @@ const arch = zag.arch.dispatch;
 const futex_mod = zag.proc.futex;
 const sched = zag.sched.scheduler;
 
-const PriorityQueue = zag.utils.containers.priority_queue.PriorityQueue;
+const ThreadPriorityQueue = zag.sched.thread.ThreadPriorityQueue;
 const SpinLock = zag.utils.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 
@@ -21,7 +21,7 @@ const E_NOENT: i64 = -10;
 /// Spec §2.18; systems.md §24.
 pub const NotificationBox = struct {
     word: u64 = 0,
-    waiters: PriorityQueue = .{},
+    waiters: ThreadPriorityQueue = .{},
     lock: SpinLock = .{},
 
     /// Called from the IRQ handler path (interrupts disabled).

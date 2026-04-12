@@ -399,6 +399,52 @@ export fn interruptStubEpilogue() callconv(.naked) void {
     );
 }
 
+pub fn serializeFaultRegs(ctx: *const ArchCpuContext) arch.FaultRegSnapshot {
+    const r = &ctx.regs;
+    return .{
+        .ip = ctx.rip,
+        .flags = ctx.rflags,
+        .sp = ctx.rsp,
+        .gprs = .{
+            r.r15, r.r14, r.r13, r.r12, r.r11, r.r10, r.r9, r.r8,
+            r.rdi, r.rsi, r.rbp, r.rbx, r.rdx, r.rcx, r.rax,
+        },
+    };
+}
+
+pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
+    ctx.regs.rax = value;
+}
+
+pub fn copyIpcPayload(dst: *ArchCpuContext, src: *const ArchCpuContext, word_count: u3) void {
+    if (word_count >= 1) dst.regs.rdi = src.regs.rdi;
+    if (word_count >= 2) dst.regs.rsi = src.regs.rsi;
+    if (word_count >= 3) dst.regs.rdx = src.regs.rdx;
+    if (word_count >= 4) dst.regs.r8 = src.regs.r8;
+    if (word_count >= 5) dst.regs.r9 = src.regs.r9;
+}
+
+pub fn restoreIpcPayload(ctx: *ArchCpuContext, words: [5]u64) void {
+    ctx.regs.rdi = words[0];
+    ctx.regs.rsi = words[1];
+    ctx.regs.rdx = words[2];
+    ctx.regs.r8 = words[3];
+    ctx.regs.r9 = words[4];
+}
+
+pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: arch.FaultRegSnapshot) void {
+    ctx.rip = snapshot.ip;
+    ctx.rflags = snapshot.flags;
+    ctx.rsp = snapshot.sp;
+    const r = &ctx.regs;
+    inline for (.{
+        "r15", "r14", "r13", "r12", "r11", "r10", "r9", "r8",
+        "rdi", "rsi", "rbp", "rbx", "rdx", "rcx", "rax",
+    }, 0..) |field, i| {
+        @field(r, field) = snapshot.gprs[i];
+    }
+}
+
 export fn dispatchInterrupt(ctx: *cpu.Context) void {
     if (vector_table[ctx.int_num].handler) |h| {
         h(ctx);

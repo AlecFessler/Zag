@@ -7,6 +7,7 @@ const x64 = zag.arch.x64;
 
 const BootInfo = zag.boot.protocol.BootInfo;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
+const Range = zag.utils.range.Range;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
@@ -17,6 +18,30 @@ const SharedMemory = zag.memory.shared.SharedMemory;
 const Thread = zag.sched.thread.Thread;
 const Timer = zag.arch.timer.Timer;
 const VAddr = zag.memory.address.VAddr;
+
+/// Number of general-purpose registers saved in a fault snapshot.
+/// x86-64: 15 (rax-r15 minus rsp). aarch64: 31 (x0-x30).
+pub const fault_gpr_count: usize = switch (builtin.cpu.arch) {
+    .x86_64 => 15,
+    .aarch64 => 31,
+    else => unreachable,
+};
+
+/// Size of the register portion of a FaultMessage: ip + flags + sp + GPRs.
+pub const fault_regs_size: usize = (3 + fault_gpr_count) * @sizeOf(u64);
+
+/// Total size of a FaultMessage written to userspace (32-byte header + regs).
+pub const fault_msg_size: usize = 32 + fault_regs_size;
+
+/// Architecture-neutral snapshot of a faulted thread's registers.
+/// Used by fault delivery to serialize register state without the
+/// generic kernel referencing arch-specific register names.
+pub const FaultRegSnapshot = struct {
+    ip: u64,
+    flags: u64,
+    sp: u64,
+    gprs: [fault_gpr_count]u64,
+};
 
 pub const ArchCpuContext = switch (builtin.cpu.arch) {
     .x86_64 => x64.interrupts.ArchCpuContext,
@@ -29,6 +54,184 @@ pub const PageFaultContext = switch (builtin.cpu.arch) {
     .aarch64 => aarch64.interrupts.PageFaultContext,
     else => unreachable,
 };
+
+// ── Syscall / IPC Register Abstraction ───────────────────────────────────
+// These helpers let generic kernel code access syscall arguments and IPC
+// payload registers without naming architecture-specific register fields.
+
+pub const SyscallArgs = struct {
+    num: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+};
+
+pub fn getSyscallArgs(ctx: *const ArchCpuContext) SyscallArgs {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => .{
+            .num = ctx.regs.rax,
+            .arg0 = ctx.regs.rdi,
+            .arg1 = ctx.regs.rsi,
+            .arg2 = ctx.regs.rdx,
+            .arg3 = ctx.regs.r10,
+            .arg4 = ctx.regs.r8,
+        },
+        .aarch64 => .{
+            .num = ctx.regs.x8,
+            .arg0 = ctx.regs.x0,
+            .arg1 = ctx.regs.x1,
+            .arg2 = ctx.regs.x2,
+            .arg3 = ctx.regs.x3,
+            .arg4 = ctx.regs.x4,
+        },
+        else => unreachable,
+    };
+}
+
+pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => ctx.regs.r13,
+        .aarch64 => ctx.regs.x5,
+        else => unreachable,
+    };
+}
+
+pub fn getIpcMetadata(ctx: *const ArchCpuContext) u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => ctx.regs.r14,
+        .aarch64 => ctx.regs.x6,
+        else => unreachable,
+    };
+}
+
+pub fn setIpcMetadata(ctx: *ArchCpuContext, value: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => ctx.regs.r14 = value,
+        .aarch64 => ctx.regs.x6 = value,
+        else => unreachable,
+    }
+}
+
+pub fn getIpcPayloadWords(ctx: *const ArchCpuContext) [5]u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => .{ ctx.regs.rdi, ctx.regs.rsi, ctx.regs.rdx, ctx.regs.r8, ctx.regs.r9 },
+        .aarch64 => .{ ctx.regs.x0, ctx.regs.x1, ctx.regs.x2, ctx.regs.x3, ctx.regs.x4 },
+        else => unreachable,
+    };
+}
+
+pub fn copyIpcPayload(dst: *ArchCpuContext, src: *const ArchCpuContext, word_count: u3) void {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.copyIpcPayload(dst, src, word_count),
+        .aarch64 => aarch64.interrupts.copyIpcPayload(dst, src, word_count),
+        else => unreachable,
+    };
+}
+
+pub const IpcPayloadSnapshot = struct { words: [5]u64 };
+
+pub fn saveIpcPayload(ctx: *const ArchCpuContext) IpcPayloadSnapshot {
+    return .{ .words = getIpcPayloadWords(ctx) };
+}
+
+pub fn restoreIpcPayload(ctx: *ArchCpuContext, snap: IpcPayloadSnapshot) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.restoreIpcPayload(ctx, snap.words),
+        .aarch64 => aarch64.interrupts.restoreIpcPayload(ctx, snap.words),
+        else => unreachable,
+    }
+}
+
+/// Apply a modified register snapshot from userspace to a faulted thread's
+/// saved context. Reverse of serializeFaultRegs. The caller is responsible
+/// for SMAP (userAccessBegin/End) around the buffer read.
+pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: FaultRegSnapshot) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.applyFaultRegs(ctx, snapshot),
+        .aarch64 => aarch64.interrupts.applyFaultRegs(ctx, snapshot),
+        else => unreachable,
+    }
+}
+
+// ── Address Space Layout ────────────────────────────────────────────────
+// Architecture-specific virtual address space boundaries. These define
+// the user/kernel split, physmap location, and kernel code range.
+
+pub const addr_space = switch (builtin.cpu.arch) {
+    .x86_64 => struct {
+        pub const user: Range = .{
+            .start = 0x0000_0000_0000_0000,
+            .end = 0xFFFF_8000_0000_0000,
+        };
+        pub const kernel: Range = .{
+            .start = 0xFFFF_8000_0000_0000,
+            .end = 0xFFFF_8400_0000_0000,
+        };
+        pub const physmap: Range = .{
+            .start = 0xFFFF_FF80_0000_0000,
+            .end = 0xFFFF_FF88_0000_0000,
+        };
+        pub const kernel_code: Range = .{
+            .start = 0xFFFF_FFFF_8000_0000,
+            .end = 0xFFFF_FFFF_C000_0000,
+        };
+    },
+    .aarch64 => struct {
+        pub const user: Range = .{
+            .start = 0x0000_0000_0000_0000,
+            .end = 0x0001_0000_0000_0000,
+        };
+        pub const kernel: Range = .{
+            .start = 0xFFFF_0000_0000_0000,
+            .end = 0xFFFF_0400_0000_0000,
+        };
+        pub const physmap: Range = .{
+            .start = 0xFFFF_FF80_0000_0000,
+            .end = 0xFFFF_FF88_0000_0000,
+        };
+        pub const kernel_code: Range = .{
+            .start = 0xFFFF_0000_0000_0000,
+            .end = 0xFFFF_0000_4000_0000,
+        };
+    },
+    else => unreachable,
+};
+
+/// ASLR range for userspace allocations (subset of addr_space.user).
+pub const user_aslr: Range = switch (builtin.cpu.arch) {
+    .x86_64 => .{
+        .start = 0x0000_0000_0000_1000,
+        .end = 0x0000_1000_0000_0000,
+    },
+    .aarch64 => .{
+        .start = 0x0000_0000_0000_1000,
+        .end = 0x0000_1000_0000_0000,
+    },
+    else => unreachable,
+};
+
+/// Align a stack pointer for the target architecture's calling convention.
+/// x86-64: 16-byte aligned minus 8 (simulates the return address push by `call`).
+/// aarch64: 16-byte aligned (SP must be 16-byte aligned at all times).
+pub fn isRelativeRelocation(rela_type: u32) bool {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => rela_type == @intFromEnum(std.elf.R_X86_64.RELATIVE),
+        .aarch64 => rela_type == @intFromEnum(std.elf.R_AARCH64.RELATIVE),
+        else => unreachable,
+    };
+}
+
+pub fn alignStack(stack_top: VAddr) VAddr {
+    const aligned = std.mem.alignBackward(u64, stack_top.addr, 16);
+    const adjusted = switch (builtin.cpu.arch) {
+        .x86_64 => aligned - 8,
+        .aarch64 => aligned,
+        else => unreachable,
+    };
+    return VAddr.fromInt(adjusted);
+}
 
 pub inline fn kEntry(boot_info: *BootInfo, ktrampoline: *const fn (*BootInfo) callconv(cc()) noreturn) noreturn {
     switch (builtin.cpu.arch) {
@@ -172,7 +375,7 @@ pub fn swapAddrSpace(root: PAddr) void {
 pub fn coreCount() u64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.apic.coreCount(),
-        .aarch64 => aarch64.apic.coreCount(),
+        .aarch64 => aarch64.gic.coreCount(),
         else => unreachable,
     };
 }
@@ -180,7 +383,7 @@ pub fn coreCount() u64 {
 pub fn coreID() u64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.apic.coreID(),
-        .aarch64 => aarch64.apic.coreID(),
+        .aarch64 => aarch64.gic.coreID(),
         else => unreachable,
     };
 }
@@ -210,6 +413,30 @@ pub fn prepareThreadContext(
     switch (builtin.cpu.arch) {
         .x86_64 => return x64.interrupts.prepareThreadContext(kstack_top, ustack_top, entry, arg),
         .aarch64 => return aarch64.interrupts.prepareThreadContext(kstack_top, ustack_top, entry, arg),
+        else => unreachable,
+    }
+}
+
+pub fn serializeFaultRegs(ctx: *const ArchCpuContext) FaultRegSnapshot {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.serializeFaultRegs(ctx),
+        .aarch64 => aarch64.interrupts.serializeFaultRegs(ctx),
+        else => unreachable,
+    };
+}
+
+pub fn getSyscallReturn(ctx: *const ArchCpuContext) u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => ctx.regs.rax,
+        .aarch64 => ctx.regs.x0,
+        else => unreachable,
+    };
+}
+
+pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.setSyscallReturn(ctx, value),
+        .aarch64 => aarch64.interrupts.setSyscallReturn(ctx, value),
         else => unreachable,
     }
 }
@@ -270,54 +497,49 @@ pub fn restoreInterrupts(state: u64) void {
     }
 }
 
+/// Temporarily allow kernel access to user pages.
+/// x86: STAC (clear AC flag, disabling SMAP).
+/// aarch64: clear PSTATE.PAN (disabling Privileged Access Never).
 pub inline fn userAccessBegin() void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.cpu.stac(),
-        .aarch64 => {},
+        .aarch64 => aarch64.cpu.panDisable(),
         else => unreachable,
     }
 }
 
+/// Re-enable kernel protection from user page access.
+/// x86: CLAC (set AC flag, enabling SMAP).
+/// aarch64: set PSTATE.PAN (enabling Privileged Access Never).
 pub inline fn userAccessEnd() void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.cpu.clac(),
-        .aarch64 => {},
+        .aarch64 => aarch64.cpu.panEnable(),
         else => unreachable,
     }
 }
 
+const sched_ipi_vector: u8 = switch (builtin.cpu.arch) {
+    .x86_64 => @intFromEnum(x64.interrupts.IntVecs.sched),
+    // ARM GIC SGI 0 — Software Generated Interrupts use IDs 0-15.
+    .aarch64 => 0,
+    else => unreachable,
+};
+
 pub fn triggerSchedulerInterrupt(core_id: u64) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => {
-            if (core_id == x64.apic.coreID()) {
-                x64.apic.sendSelfIpi(@intFromEnum(x64.interrupts.IntVecs.sched));
-            } else {
-                x64.apic.sendIpi(
-                    @intCast(x64.apic.lapics.?[core_id].apic_id),
-                    @intFromEnum(x64.interrupts.IntVecs.sched),
-                );
-            }
-        },
-        .aarch64 => {
-            if (core_id == aarch64.apic.coreID()) {
-                aarch64.apic.sendSelfIpi(@intFromEnum(aarch64.interrupts.IntVecs.sched));
-            } else {
-                aarch64.apic.sendIpi(
-                    @intCast(aarch64.apic.lapics.?[core_id].apic_id),
-                    @intFromEnum(aarch64.interrupts.IntVecs.sched),
-                );
-            }
-        },
+        .x86_64 => x64.apic.sendIpiToCore(core_id, sched_ipi_vector),
+        .aarch64 => aarch64.gic.sendIpiToCore(core_id, sched_ipi_vector),
         else => unreachable,
     }
 }
 
 pub fn readTimestamp() u64 {
-    switch (builtin.cpu.arch) {
-        .x86_64 => return x64.cpu.rdtscLFenced(),
-        .aarch64 => return 0,
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.rdtscLFenced(),
+        .aarch64 => aarch64.cpu.readCntvct(),
         else => unreachable,
-    }
+    };
 }
 
 /// Read a value from an x86 I/O port.
@@ -364,7 +586,7 @@ pub fn print(
 pub fn isDmaRemapAvailable() bool {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.iommu.isAvailable(),
-        .aarch64 => false,
+        .aarch64 => aarch64.iommu.isAvailable(),
         else => unreachable,
     };
 }
@@ -372,7 +594,7 @@ pub fn isDmaRemapAvailable() bool {
 pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.iommu.mapDmaPages(device, shm),
-        .aarch64 => @panic("unimplemented"),
+        .aarch64 => aarch64.iommu.mapDmaPages(device, shm),
         else => unreachable,
     };
 }
@@ -380,7 +602,7 @@ pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
 pub fn unmapDmaPages(device: *DeviceRegion, dma_base: u64, num_pages: u64) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.iommu.unmapDmaPages(device, dma_base, num_pages),
-        .aarch64 => @panic("unimplemented"),
+        .aarch64 => aarch64.iommu.unmapDmaPages(device, dma_base, num_pages),
         else => unreachable,
     }
 }
@@ -388,12 +610,29 @@ pub fn unmapDmaPages(device: *DeviceRegion, dma_base: u64, num_pages: u64) void 
 pub fn enableDmaRemapping() void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.iommu.enableTranslation(),
-        .aarch64 => @panic("unimplemented"),
+        .aarch64 => aarch64.iommu.enableTranslation(),
         else => unreachable,
     }
 }
 
 // --- VM (hardware virtualization) dispatch ---
+
+// --- KVM types dispatched from arch/x64/kvm/ ---
+
+pub const Vm = switch (builtin.cpu.arch) {
+    .x86_64 => x64.kvm.vm.Vm,
+    else => @compileError("unsupported arch for VM"),
+};
+
+pub const VmAllocator = switch (builtin.cpu.arch) {
+    .x86_64 => x64.kvm.vm.VmAllocator,
+    else => @compileError("unsupported arch for VM"),
+};
+
+pub const VCpuAllocator = switch (builtin.cpu.arch) {
+    .x86_64 => x64.kvm.vcpu.VCpuAllocator,
+    else => @compileError("unsupported arch for VM"),
+};
 
 pub const GuestState = switch (builtin.cpu.arch) {
     .x86_64 => x64.vm.GuestState,
@@ -534,6 +773,9 @@ pub fn vmMsrPassthrough(vm_structures: PAddr, msr_num: u32, allow_read: bool, al
     }
 }
 
+
+
+
 // --- PMU (performance monitoring unit) dispatch (systems.md §13, §20) ---
 
 pub const PmuState = switch (builtin.cpu.arch) {
@@ -658,7 +900,7 @@ pub fn readRtc() u64 {
 pub fn getRandom() ?u64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.cpu.rdrand(),
-        .aarch64 => null,
+        .aarch64 => aarch64.cpu.rndr(),
         else => unreachable,
     };
 }
@@ -668,7 +910,7 @@ pub fn getRandom() ?u64 {
 pub fn maskIrq(irq: u8) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.irq.maskIrq(irq),
-        .aarch64 => {},
+        .aarch64 => aarch64.irq.maskIrq(irq),
         else => unreachable,
     }
 }
@@ -676,20 +918,15 @@ pub fn maskIrq(irq: u8) void {
 pub fn unmaskIrq(irq: u8) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.irq.unmaskIrq(irq),
-        .aarch64 => {},
+        .aarch64 => aarch64.irq.unmaskIrq(irq),
         else => unreachable,
     }
 }
 
 pub fn findIrqForDevice(device: *DeviceRegion) ?u8 {
     return switch (builtin.cpu.arch) {
-        .x86_64 => {
-            for (x64.irq.irq_table, 0..) |dev_ptr, i| {
-                if (dev_ptr == device) return @truncate(i);
-            }
-            return null;
-        },
-        .aarch64 => null,
+        .x86_64 => x64.irq.findIrqForDevice(device),
+        .aarch64 => aarch64.irq.findIrqForDevice(device),
         else => unreachable,
     };
 }
@@ -785,4 +1022,111 @@ pub fn getCoreState(core_id: u64) u8 {
         .aarch64 => aarch64.sysinfo.getCoreState(core_id),
         else => unreachable,
     };
+}
+
+// --- KVM syscall dispatch ---
+// These dispatch the syscall-facing KVM operations through the arch boundary.
+// The KVM implementation lives in arch/x64/kvm/ and is inherently x86-specific;
+// only this thin syscall interface is abstracted.
+
+const ArchCpuContextLocal = ArchCpuContext;
+const SyscallResult = zag.syscall.dispatch.SyscallResult;
+const Process = zag.proc.process.Process;
+
+pub fn kvmVmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vm.vmCreate(proc, vcpu_count, policy_ptr),
+        else => -14, // E_NOSYS
+    };
+}
+
+pub fn kvmGuestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vm.guestMap(proc, vm_handle, host_vaddr, guest_addr, size, rights),
+        else => -14,
+    };
+}
+
+pub fn kvmVmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContextLocal, vm_handle: u64, buf_ptr: u64, blocking: bool) SyscallResult {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.exit_box.vmRecv(proc, thread, ctx, vm_handle, buf_ptr, blocking),
+        else => .{ .rax = -14 },
+    };
+}
+
+pub fn kvmVmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64) i64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.exit_box.vmReply(proc, vm_handle, exit_token, action_ptr),
+        else => -14,
+    };
+}
+
+pub fn kvmVcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vcpu.vcpuSetState(proc, thread_handle, state_ptr),
+        else => -14,
+    };
+}
+
+pub fn kvmVcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vcpu.vcpuGetState(proc, thread_handle, state_ptr),
+        else => -14,
+    };
+}
+
+pub fn kvmVcpuRun(proc: *Process, thread_handle: u64) i64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vcpu.vcpuRun(proc, thread_handle),
+        else => -14,
+    };
+}
+
+pub fn kvmVcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vcpu.vcpuInterrupt(proc, thread_handle, interrupt_ptr),
+        else => -14,
+    };
+}
+
+pub fn kvmMsrPassthrough(proc: *Process, vm_handle: u64, msr_num: u32, allow_read: bool, allow_write: bool) i64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vm.msrPassthrough(proc, vm_handle, msr_num, allow_read, allow_write),
+        else => -14,
+    };
+}
+
+pub fn kvmIoapicAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vm.ioapicAssertIrq(proc, vm_handle, irq_num),
+        else => -14,
+    };
+}
+
+pub fn kvmIoapicDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vm.ioapicDeassertIrq(proc, vm_handle, irq_num),
+        else => -14,
+    };
+}
+
+pub fn kvmVcpuFromThread(vm_obj: *Vm, thread: *Thread) ?*x64.kvm.vcpu.VCpu {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vcpu.vcpuFromThread(vm_obj, thread),
+        else => null,
+    };
+}
+
+pub fn kvmSetVmAllocator(alloc: std.mem.Allocator) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vm.allocator = alloc,
+        else => {},
+    }
+}
+
+pub fn kvmSetVcpuAllocator(alloc: std.mem.Allocator) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.kvm.vcpu.allocator = alloc,
+        else => {},
+    }
 }

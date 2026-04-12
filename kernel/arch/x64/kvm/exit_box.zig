@@ -2,15 +2,17 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const vm_hw = zag.arch.x64.vm;
 const paging = zag.memory.paging;
 const sched = zag.sched.scheduler;
-const vcpu_mod = zag.kvm.vcpu;
-const vm_mod = zag.kvm.vm;
+const kvm = zag.arch.x64.kvm;
+const vcpu_mod = kvm.vcpu;
+const vm_mod = kvm.vm;
 
 const ArchCpuContext = zag.arch.dispatch.ArchCpuContext;
 const KernelObject = zag.perms.permissions.KernelObject;
 const PAddr = zag.memory.address.PAddr;
-const PriorityQueue = zag.utils.containers.priority_queue.PriorityQueue;
+const ThreadPriorityQueue = zag.sched.thread.ThreadPriorityQueue;
 const Process = zag.proc.process.Process;
 const SpinLock = zag.utils.sync.SpinLock;
 const SyscallResult = zag.syscall.dispatch.SyscallResult;
@@ -29,7 +31,7 @@ pub const VmExitBoxState = enum {
 
 pub const VmExitBox = struct {
     state: VmExitBoxState = .idle,
-    queue: PriorityQueue = .{},
+    queue: ThreadPriorityQueue = .{},
     receiver: ?*Thread = null,
     pending: [MAX_VCPUS]bool = .{false} ** MAX_VCPUS,
     lock: SpinLock = .{},
@@ -85,15 +87,15 @@ pub const VmExitBox = struct {
 /// Message written to userspace buffer on vm_recv.
 pub const VmExitMessage = struct {
     thread_handle: u64,
-    exit_info: arch.VmExitInfo,
-    guest_state: arch.GuestState,
+    exit_info: vm_hw.VmExitInfo,
+    guest_state: vm_hw.GuestState,
 };
 
 /// Action to take when replying to a VM exit.
 pub const VmReplyAction = union(enum) {
-    resume_guest: arch.GuestState,
-    inject_interrupt: arch.GuestInterrupt,
-    inject_exception: arch.GuestException,
+    resume_guest: vm_hw.GuestState,
+    inject_interrupt: vm_hw.GuestInterrupt,
+    inject_exception: vm_hw.GuestException,
     map_memory: struct {
         host_vaddr: u64,
         guest_addr: u64,
@@ -142,13 +144,12 @@ fn deliverExit(vm_obj: *Vm, vcpu_obj: *VCpu, receiver: *Thread) void {
     // Wait until receiver is off CPU and has saved its context.
     while (receiver.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
 
-    // Write exit info into receiver's saved buf_ptr (RSI from syscall entry;
-    // RDI is the vm_handle after the handle refactor).
-    const buf_ptr = receiver.ctx.regs.rsi;
-    writeExitMessageToUser(owner, buf_ptr, handle_id, vcpu_obj);
+    // Write exit info into receiver's saved buf_ptr (syscall arg1).
+    const saved_args = arch.getSyscallArgs(receiver.ctx);
+    writeExitMessageToUser(owner, saved_args.arg1, handle_id, vcpu_obj);
 
     // Set return value
-    receiver.ctx.regs.rax = handle_id;
+    arch.setSyscallReturn(receiver.ctx, handle_id);
 
     // Wake the receiver
     receiver.state = .ready;
@@ -245,7 +246,7 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
     // Read the action from userspace via physmap, handling cross-page boundaries.
     // Wire format: u64 tag at offset 0, payload at offset 8.
     // Max size is tag(8) + GuestState (largest payload).
-    const max_action_size = 8 + @sizeOf(arch.GuestState);
+    const max_action_size = 8 + @sizeOf(vm_hw.GuestState);
     var action_buf: [max_action_size]u8 = undefined;
 
     // First read just the tag to determine payload size.
@@ -254,9 +255,9 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
 
     // Determine total size based on tag, then read the full action.
     const total_size: usize = switch (raw_tag) {
-        0 => 8 + @sizeOf(arch.GuestState),
-        1 => 8 + @sizeOf(arch.GuestInterrupt),
-        2 => 8 + @sizeOf(arch.GuestException),
+        0 => 8 + @sizeOf(vm_hw.GuestState),
+        1 => 8 + @sizeOf(vm_hw.GuestInterrupt),
+        2 => 8 + @sizeOf(vm_hw.GuestException),
         3 => 8 + 25, // host_vaddr(8) + guest_addr(8) + size(8) + rights(1)
         4 => 8, // kill: tag only
         else => return E_INVAL,
@@ -269,20 +270,20 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
     switch (raw_tag) {
         0 => {
             // resume_guest: payload is GuestState at offset 8
-            vcpu_obj.guest_state = std.mem.bytesAsValue(arch.GuestState, action_buf[8..][0..@sizeOf(arch.GuestState)]).*;
+            vcpu_obj.guest_state = std.mem.bytesAsValue(vm_hw.GuestState, action_buf[8..][0..@sizeOf(vm_hw.GuestState)]).*;
             vcpu_obj.storeState(.running);
             resumeVcpuThread(thread);
         },
         1 => {
             // inject_interrupt: payload is GuestInterrupt at offset 8
-            const interrupt = std.mem.bytesAsValue(arch.GuestInterrupt, action_buf[8..][0..@sizeOf(arch.GuestInterrupt)]).*;
+            const interrupt = std.mem.bytesAsValue(vm_hw.GuestInterrupt, action_buf[8..][0..@sizeOf(vm_hw.GuestInterrupt)]).*;
             arch.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
             vcpu_obj.storeState(.running);
             resumeVcpuThread(thread);
         },
         2 => {
             // inject_exception: payload is GuestException at offset 8
-            const exception = std.mem.bytesAsValue(arch.GuestException, action_buf[8..][0..@sizeOf(arch.GuestException)]).*;
+            const exception = std.mem.bytesAsValue(vm_hw.GuestException, action_buf[8..][0..@sizeOf(vm_hw.GuestException)]).*;
             arch.vmInjectException(&vcpu_obj.guest_state, exception);
             vcpu_obj.storeState(.running);
             resumeVcpuThread(thread);

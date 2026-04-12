@@ -18,12 +18,6 @@ const VmReservationRights = zag.perms.permissions.VmReservationRights;
 
 pub const HANDLE_NONE: u64 = std.math.maxInt(u64);
 
-pub const PageRights = struct {
-    read: bool = false,
-    write: bool = false,
-    execute: bool = false,
-};
-
 pub const RestartPolicy = enum {
     free,
     decommit,
@@ -38,7 +32,7 @@ pub const VmNode = struct {
         shared_memory: *SharedMemory,
         mmio: *DeviceRegion,
     },
-    rights: PageRights,
+    rights: VmReservationRights,
     handle: u64,
     restart_policy: RestartPolicy,
 
@@ -119,7 +113,7 @@ pub const VirtualMemoryManager = struct {
         }
     }
 
-    pub fn insertKernelNode(self: *VirtualMemoryManager, start: VAddr, size: u64, rights: PageRights, policy: RestartPolicy) !void {
+    pub fn insertKernelNode(self: *VirtualMemoryManager, start: VAddr, size: u64, rights: VmReservationRights, policy: RestartPolicy) !void {
         self.lock.lock();
         defer self.lock.unlock();
 
@@ -407,14 +401,8 @@ pub const VirtualMemoryManager = struct {
         self.tree.forEachInRange(&cs, &ce, &check_ctx, CheckCtx.cb);
         if (check_ctx.has_non_private) return error.NonPrivateRange;
 
-        const new_rights_page = PageRights{
-            .read = new_rights.read,
-            .write = new_rights.write,
-            .execute = new_rights.execute,
-        };
-
         const Ctx = struct {
-            rights: PageRights,
+            rights: VmReservationRights,
             root: PAddr,
             fn cb(ctx: *@This(), node: *VmNode) void {
                 if (node.kind != .private) return;
@@ -422,7 +410,7 @@ pub const VirtualMemoryManager = struct {
                 updateCommittedPages(node, ctx.root, ctx.rights, .user);
             }
         };
-        var ctx = Ctx{ .rights = new_rights_page, .root = self.addr_space_root };
+        var ctx = Ctx{ .rights = new_rights, .root = self.addr_space_root };
         var s = mkSentinel(range_start);
         var e = mkSentinel(VAddr.fromInt(range_end_addr));
         self.tree.forEachInRange(&s, &e, &ctx, Ctx.cb);
@@ -558,7 +546,7 @@ pub const VirtualMemoryManager = struct {
         offset: u64,
         device: *DeviceRegion,
         write_combining: bool,
-        rights: PageRights,
+        rights: VmReservationRights,
     ) !void {
         self.lock.lock();
         defer self.lock.unlock();
@@ -712,7 +700,7 @@ pub const VirtualMemoryManager = struct {
     pub const ReservationInfo = struct {
         start: u64,
         end: u64,
-        rights: PageRights,
+        rights: VmReservationRights,
     };
 
     pub fn revokeShmHandle(self: *VirtualMemoryManager, shm: *SharedMemory, reservations: []const ReservationInfo) void {
@@ -801,7 +789,7 @@ pub const VirtualMemoryManager = struct {
     }
 };
 
-fn findContainingRights(reservations: []const VirtualMemoryManager.ReservationInfo, addr: u64) PageRights {
+fn findContainingRights(reservations: []const VirtualMemoryManager.ReservationInfo, addr: u64) VmReservationRights {
     for (reservations) |res| {
         if (addr >= res.start and addr < res.end) return res.rights;
     }
@@ -1001,7 +989,7 @@ fn unmapNodePages(node: *VmNode, addr_space_root: PAddr, free_phys: bool) void {
 fn updateCommittedPages(
     node: *VmNode,
     addr_space_root: PAddr,
-    rights: PageRights,
+    rights: VmReservationRights,
     privilege: PrivilegePerm,
 ) void {
     const is_decommit = !rights.read and !rights.write and !rights.execute;
@@ -1032,7 +1020,7 @@ fn updateCommittedPages(
     }
 }
 
-fn rightsToMemPerms(rights: PageRights, privilege: PrivilegePerm) MemoryPerms {
+fn rightsToMemPerms(rights: VmReservationRights, privilege: PrivilegePerm) MemoryPerms {
     return .{
         .write_perm = if (rights.write) .write else .no_write,
         .execute_perm = if (rights.execute) .execute else .no_execute,

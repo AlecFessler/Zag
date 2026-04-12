@@ -2,25 +2,21 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
-const containers = zag.utils.containers;
-const device_registry = zag.devices.registry;
 const futex = zag.proc.futex;
-const kvm = zag.kvm;
 const memory_init = zag.memory.init;
 const process_mod = zag.proc.process;
 const thread_mod = zag.sched.thread;
 
 const ArchCpuContext = arch.ArchCpuContext;
-const PriorityQueue = containers.priority_queue.PriorityQueue;
+const ThreadPriorityQueue = thread_mod.ThreadPriorityQueue;
 const Process = process_mod.Process;
 const ProcessAllocator = process_mod.ProcessAllocator;
 const SpinLock = zag.utils.sync.SpinLock;
 const Thread = thread_mod.Thread;
 const ThreadAllocator = thread_mod.ThreadAllocator;
-const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
 const Timer = zag.arch.timer.Timer;
-const VCpuAllocator = kvm.vcpu.VCpuAllocator;
-const VmAllocator = kvm.vm.VmAllocator;
+const VCpuAllocator = arch.VCpuAllocator;
+const VmAllocator = arch.VmAllocator;
 
 var proc_alloc_instance: ProcessAllocator = undefined;
 var thread_alloc_instance: ThreadAllocator = undefined;
@@ -35,7 +31,7 @@ const MAX_CORES = 64;
 const SCHED_TIMESLICE_NS = 2_000_000;
 
 const RunQueue = struct {
-    pq: PriorityQueue = .{},
+    pq: ThreadPriorityQueue = .{},
 
     pub fn enqueue(self: *RunQueue, thread: *Thread) void {
         self.pq.enqueue(thread);
@@ -195,6 +191,25 @@ pub fn perCoreReadAndResetAccounting(core_id: u64) struct { idle_ns: u64, busy_n
     return .{ .idle_ns = idle, .busy_ns = busy };
 }
 
+fn peekHighestStealable(pq: *const ThreadPriorityQueue, core_id: u6) ?*Thread {
+    const core_bit = @as(u64, 1) << core_id;
+    var idx: usize = pq.levels.len;
+    while (idx > 0) {
+        idx -= 1;
+        if (idx == @intFromEnum(thread_mod.Priority.pinned)) continue;
+        var cur = pq.levels[idx].head;
+        while (cur) |c| {
+            if (c.core_affinity) |aff| {
+                if (aff & core_bit != 0) return c;
+            } else {
+                return c;
+            }
+            cur = c.next;
+        }
+    }
+    return null;
+}
+
 /// Attempt to steal a thread from another core's run queue.
 /// Called when the local run queue is empty. Returns the stolen thread or null.
 fn tryStealWork(my_core_id: u64) ?*Thread {
@@ -219,7 +234,7 @@ fn tryStealWork(my_core_id: u64) ?*Thread {
                 i += 1;
                 continue;
             }
-            const candidate = core_states[i].rq.pq.peekHighestStealable(@intCast(my_core_id));
+            const candidate = peekHighestStealable(&core_states[i].rq.pq, @intCast(my_core_id));
             if (candidate) |c| {
                 if (best_thread == null) {
                     best_thread = c;
@@ -739,7 +754,7 @@ pub fn switchToThread(current: *Thread, target: *Thread, ctx: *ArchCpuContext, e
     unreachable;
 }
 
-pub fn globalInit(root_service_elf: []const u8) !void {
+pub fn globalInit() !void {
     proc_alloc_instance = try ProcessAllocator.init(memory_init.proc_slab_backing.allocator());
     process_mod.allocator = proc_alloc_instance.allocator();
 
@@ -747,29 +762,12 @@ pub fn globalInit(root_service_elf: []const u8) !void {
     thread_mod.allocator = thread_alloc_instance.allocator();
 
     vm_alloc_instance = try VmAllocator.init(memory_init.kvm_vm_slab_backing.allocator());
-    kvm.vm.allocator = vm_alloc_instance.allocator();
+    arch.kvmSetVmAllocator(vm_alloc_instance.allocator());
 
     vcpu_alloc_instance = try VCpuAllocator.init(memory_init.kvm_vcpu_slab_backing.allocator());
-    kvm.vcpu.allocator = vcpu_alloc_instance.allocator();
+    arch.kvmSetVcpuAllocator(vcpu_alloc_instance.allocator());
 
     idle_process = try Process.createIdle();
-
-    const root_proc = try Process.create(root_service_elf, .{
-        .spawn_thread = true,
-        .spawn_process = true,
-        .mem_reserve = true,
-        .set_affinity = true,
-        .restart = true,
-        .mem_shm_create = true,
-        .device_own = true,
-        .fault_handler = true,
-        .pmu = true,
-        .set_time = true,
-        .power = true,
-        .vm_create = true,
-    }, null, ThreadHandleRights.full, .pinned);
-    device_registry.grantAllToRootService(root_proc);
-    core_states[0].rq.enqueue(root_proc.threads[0]);
 
     initialized = true;
 }

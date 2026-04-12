@@ -2,12 +2,10 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
-const containers = zag.utils.containers;
 const sched = zag.sched.scheduler;
 
-const NotificationBox = zag.sched.notification.NotificationBox;
 const PAddr = zag.memory.address.PAddr;
-const PriorityQueue = containers.priority_queue.PriorityQueue;
+const ThreadPriorityQueue = zag.sched.thread.ThreadPriorityQueue;
 const SpinLock = zag.utils.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
@@ -21,7 +19,7 @@ const MAX_TIMED_WAITERS = 64;
 
 const Bucket = struct {
     lock: SpinLock = .{},
-    pq: PriorityQueue = .{},
+    pq: ThreadPriorityQueue = .{},
 };
 
 var buckets: [BUCKET_COUNT]Bucket = [_]Bucket{.{}} ** BUCKET_COUNT;
@@ -152,7 +150,7 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
     // Pop threads from the priority queue. Since multiple paddrs may hash to
     // the same bucket, we must check each thread's futex_paddr. Non-matching
     // threads are collected and re-enqueued after the wake loop.
-    var requeue: PriorityQueue = .{};
+    var requeue: ThreadPriorityQueue = .{};
 
     while (woken < count) {
         const thread = bucket.pq.dequeue() orelse break;

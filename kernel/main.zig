@@ -7,6 +7,7 @@ const device_registry = zag.devices.registry;
 const memory = zag.memory.init;
 const sched = zag.sched.scheduler;
 const syscall = zag.syscall;
+const userspace_init = zag.boot.userspace_init;
 
 const BootInfo = zag.boot.protocol.BootInfo;
 const PAddr = zag.memory.address.PAddr;
@@ -35,7 +36,7 @@ fn kMain(boot_info: *BootInfo) !void {
     arch.init();
     try memory.init(boot_info.mmap);
     try memory.initHeap();
-    debug_info.init(boot_info.elf_blob, boot_info.kaslr_slide, memory.heap_allocator);
+    debug_info.init(boot_info.elf_blob.ptr, boot_info.elf_blob.len, boot_info.kaslr_slide, memory.heap_allocator);
     try arch.parseFirmwareTables(boot_info.xsdp_phys);
     arch.vmInit();
     arch.pmuInit();
@@ -45,10 +46,11 @@ fn kMain(boot_info: *BootInfo) !void {
     const monotonic_now = arch.getMonotonicClock().now();
     syscall.clock.wall_offset = @as(i64, @bitCast(rtc_nanos)) -% @as(i64, @bitCast(monotonic_now));
     device_registry.registerDisplayDevice(boot_info.framebuffer);
+    try sched.globalInit();
     const rs_phys = PAddr.fromInt(@intFromPtr(boot_info.root_service.ptr));
     const rs_virt = VAddr.fromPAddr(rs_phys, null);
     const rs_ptr: [*]const u8 = @ptrFromInt(rs_virt.addr);
-    try sched.globalInit(rs_ptr[0..boot_info.root_service.len]);
+    try userspace_init.init(rs_ptr[0..boot_info.root_service.len]);
     try arch.smpInit();
     sched.perCoreInit();
     arch.halt();

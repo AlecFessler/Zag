@@ -4,11 +4,8 @@ const device_region_mod = zag.memory.device_region;
 
 const DeviceClass = zag.memory.device_region.DeviceClass;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
-const DeviceRegionRights = zag.perms.permissions.DeviceRegionRights;
 const Framebuffer = zag.boot.protocol.Framebuffer;
 const PAddr = zag.memory.address.PAddr;
-const PermissionEntry = zag.perms.permissions.PermissionEntry;
-const Process = zag.proc.process.Process;
 
 const MAX_DEVICES = 128;
 
@@ -88,26 +85,6 @@ pub fn registerDisplayDevice(fb: Framebuffer) void {
     ) catch return;
     device_table[device_count] = dr;
     device_count += 1;
-}
-
-pub fn grantAllToRootService(root_proc: *Process) void {
-    var i: u32 = 0;
-    while (i < device_count) {
-        const dev = device_table[i];
-        // Display devices (e.g. VGA framebuffer) have no IRQ line, so don't
-        // grant the irq right. All other devices get full rights.
-        const rights: DeviceRegionRights = if (dev.device_class == .display)
-            .{ .map = true, .grant = true, .dma = true }
-        else
-            .{ .map = true, .grant = true, .dma = true, .irq = true };
-        const entry = PermissionEntry{
-            .handle = 0,
-            .object = .{ .device_region = dev },
-            .rights = @as(u16, @as(u8, @bitCast(rights))),
-        };
-        _ = root_proc.insertPerm(entry) catch {};
-        i += 1;
-    }
 }
 
 pub fn count() u32 {

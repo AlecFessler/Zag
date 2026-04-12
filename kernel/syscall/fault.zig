@@ -24,39 +24,34 @@ const E_NOENT = errors.E_NOENT;
 const E_OK = errors.E_OK;
 const E_PERM = errors.E_PERM;
 
-/// FaultMessage userspace layout (176 bytes total). Stable wire format
-/// shared with libz.FaultMessage:
+/// FaultMessage userspace layout (arch.fault_msg_size bytes). Stable wire
+/// format shared with libz.FaultMessage:
 ///   0   process_handle: u64    handle ID of source process in handler's table
 ///   8   thread_handle:  u64    handle ID of faulting thread in handler's table
 ///   16  fault_reason:   u8     FaultReason enum value
 ///   17  _pad:           [7]u8
-///   24  fault_addr:     u64    CR2 for page faults; faulting VA otherwise
-///   32  rip:            u64    RIP at the moment of the fault
-///   40  rflags:         u64
-///   48  rsp:            u64
-///   56  r15..rax:       15×u64 General-purpose register snapshot
-///                              (matches kernel x64 Registers struct order)
-const fault_msg_size: u64 = 176;
-const fault_regs_size: u64 = 144; // rip + rflags + rsp + 15 GPRs
+///   24  fault_addr:     u64    fault VA (CR2 on x86, FAR_EL1 on aarch64)
+///   32  ip:             u64    instruction pointer at fault
+///   40  flags:          u64    flags register (RFLAGS / SPSR_EL1)
+///   48  sp:             u64    stack pointer
+///   56  gprs:           N×u64  GPR snapshot (15 on x86-64, 31 on aarch64)
+const fault_msg_size = arch.fault_msg_size;
+const fault_regs_size = arch.fault_regs_size;
 
-/// Build a 176-byte FaultMessage in a temporary kernel buffer.
-fn buildFaultMessage(process_handle: u64, thread_handle: u64, faulted: *Thread) [176]u8 {
-    var buf: [176]u8 = undefined;
+/// Build a FaultMessage in a temporary kernel buffer.
+fn buildFaultMessage(process_handle: u64, thread_handle: u64, faulted: *Thread) [fault_msg_size]u8 {
+    var buf: [fault_msg_size]u8 = undefined;
     @as(*align(1) u64, @ptrCast(&buf[0])).* = process_handle;
     @as(*align(1) u64, @ptrCast(&buf[8])).* = thread_handle;
     buf[16] = @intFromEnum(faulted.fault_reason);
     @memset(buf[17..24], 0);
     @as(*align(1) u64, @ptrCast(&buf[24])).* = faulted.fault_addr;
-    @as(*align(1) u64, @ptrCast(&buf[32])).* = faulted.fault_rip;
-    @as(*align(1) u64, @ptrCast(&buf[40])).* = faulted.ctx.rflags;
-    @as(*align(1) u64, @ptrCast(&buf[48])).* = faulted.ctx.rsp;
-    const r = &faulted.ctx.regs;
-    const gprs = [_]u64{
-        r.r15, r.r14, r.r13, r.r12, r.r11, r.r10, r.r9, r.r8,
-        r.rdi, r.rsi, r.rbp, r.rbx, r.rdx, r.rcx, r.rax,
-    };
+    const snap = arch.serializeFaultRegs(faulted.ctx);
+    @as(*align(1) u64, @ptrCast(&buf[32])).* = snap.ip;
+    @as(*align(1) u64, @ptrCast(&buf[40])).* = snap.flags;
+    @as(*align(1) u64, @ptrCast(&buf[48])).* = snap.sp;
     var off: usize = 56;
-    for (gprs) |v| {
+    for (snap.gprs) |v| {
         @as(*align(1) u64, @ptrCast(&buf[off])).* = v;
         off += 8;
     }
@@ -71,7 +66,7 @@ fn buildFaultMessage(process_handle: u64, thread_handle: u64, faulted: *Thread) 
 fn writeFaultMessage(proc: *Process, buf_ptr: u64, process_handle: u64, thread_handle: u64, faulted: *Thread) void {
     const msg = buildFaultMessage(process_handle, thread_handle, faulted);
     // Pre-fault every destination page, then copy through physmap.
-    var remaining: usize = 176;
+    var remaining: usize = fault_msg_size;
     var src_off: usize = 0;
     var dst_va: u64 = buf_ptr;
     while (remaining > 0) {
@@ -190,8 +185,8 @@ pub fn sysFaultRecv(ctx: *ArchCpuContext, buf_ptr: u64, blocking: u64) SyscallRe
     }
 }
 
-/// Read 144 bytes of FaultMessage saved-regs (rip + rflags + rsp + 15 GPRs)
-/// from `src_ptr` and apply them to the FAULTING thread's user iret frame.
+/// Read fault_regs_size bytes of FaultMessage saved-regs (ip + flags + sp +
+/// GPRs) from `src_ptr` and apply them to the FAULTING thread's user frame.
 ///
 /// `dst.ctx` is the kernel-mode context captured when the thread yielded
 /// out of `faultBlock` — writing to it has no effect on the user-mode
@@ -203,19 +198,17 @@ fn applyModifiedRegs(dst: *Thread, src_ptr: u64) void {
     const target = dst.fault_user_ctx orelse return;
     const buf: [*]const u8 = @ptrFromInt(src_ptr);
     arch.userAccessBegin();
-    defer arch.userAccessEnd();
-    target.rip = @as(*align(1) const u64, @ptrCast(buf + 0)).*;
-    target.rflags = @as(*align(1) const u64, @ptrCast(buf + 8)).*;
-    target.rsp = @as(*align(1) const u64, @ptrCast(buf + 16)).*;
-    const r = &target.regs;
+    var snapshot: arch.FaultRegSnapshot = undefined;
+    snapshot.ip = @as(*align(1) const u64, @ptrCast(buf + 0)).*;
+    snapshot.flags = @as(*align(1) const u64, @ptrCast(buf + 8)).*;
+    snapshot.sp = @as(*align(1) const u64, @ptrCast(buf + 16)).*;
     var off: usize = 24;
-    inline for (.{
-        "r15", "r14", "r13", "r12", "r11", "r10", "r9",  "r8",
-        "rdi", "rsi", "rbp", "rbx", "rdx", "rcx", "rax",
-    }) |field| {
-        @field(r, field) = @as(*align(1) const u64, @ptrCast(buf + off)).*;
+    for (&snapshot.gprs) |*gpr| {
+        gpr.* = @as(*align(1) const u64, @ptrCast(buf + off)).*;
         off += 8;
     }
+    arch.userAccessEnd();
+    arch.applyFaultRegs(target, snapshot);
 }
 
 const fault_kill: u64 = 0;
@@ -228,7 +221,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
     if (action > fault_resume_modified) return E_INVAL;
 
     const proc = sched.currentProc();
-    const flags = ctx.regs.r14;
+    const flags = arch.getIpcMetadata(ctx);
 
     // §2.12.22: both exclude bits set is invalid.
     if ((flags & fault_exclude_next) != 0 and (flags & fault_exclude_permanent) != 0) {

@@ -356,6 +356,19 @@ pub fn sendSipi(apic_id_target: u8, vector: u8) void {
     }
 }
 
+/// Send an IPI to the given logical core, looking up its APIC ID from the lapics table.
+/// If the target is the current core, uses the self-IPI fast path.
+pub fn sendIpiToCore(core_id: u64, vector: u8) void {
+    if (core_id == coreID()) {
+        sendSelfIpi(vector);
+    } else {
+        sendIpi(
+            @intCast(lapics.?[core_id].apic_id),
+            vector,
+        );
+    }
+}
+
 /// Send a self-IPI. In x2APIC mode uses the dedicated Self IPI Register (MSR 83FH).
 /// In xAPIC mode uses the ICR with shorthand destination "self" (bits [19:18] = 01b).
 /// Intel SDM Vol 3A, Section 13.12.11 "SELF IPI Register", Figure 13-30.

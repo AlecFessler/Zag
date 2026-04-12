@@ -5,9 +5,7 @@
 /// Table 13-1: Local APIC Register Address Map.
 const zag = @import("zag");
 
-const Ioapic = zag.kvm.ioapic.Ioapic;
-
-pub const APIC_BASE: u64 = 0xFEE00000;
+const Ioapic = zag.arch.x64.kvm.ioapic.Ioapic;
 
 // Register offsets from APIC base (Table 13-1)
 const REG_ID: u32 = 0x020; // Local APIC ID Register -- R/W

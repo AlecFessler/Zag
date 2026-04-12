@@ -1,10 +1,11 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const arch = zag.arch.dispatch;
+
 const Range = zag.utils.range.Range;
 
 const PAGE4K: u64 = 0x1000;
-const PAGE2M: u64 = 0x200000;
 const PAGE1G: u64 = 0x40000000;
 
 const MAX_KERNEL_STACKS: u64 = 16384;
@@ -14,36 +15,10 @@ pub const KERNEL_STACK_SLOT_SIZE: u64 = (KERNEL_STACK_PAGES + 1) * PAGE4K;
 const KERNEL_STACKS_RESERVATION: u64 = std.mem.alignForward(u64, MAX_KERNEL_STACKS * KERNEL_STACK_SLOT_SIZE, PAGE1G);
 const SLAB_RESERVATION: u64 = 16 * 1024 * 1024;
 
-pub const AddrSpacePartition = struct {
-    pub const user: Range = .{
-        .start = 0x0000_0000_0000_0000,
-        .end = 0xFFFF_8000_0000_0000,
-    };
-    pub const kernel: Range = .{
-        .start = 0xFFFF_8000_0000_0000,
-        .end = 0xFFFF_8400_0000_0000,
-    };
-    pub const physmap: Range = .{
-        .start = 0xFFFF_FF80_0000_0000,
-        .end = 0xFFFF_FF88_0000_0000,
-    };
-    // Region where the kernel image may land under KASLR. The `.kernel`
-    // code model requires all absolute references to sign-extend into the
-    // high -2 GB..0 canonical window, so the slide range sits at the
-    // bottom of that window. The kernel is linked at the start of this
-    // range; the bootloader picks a random page-aligned slide within it
-    // and patches relocations accordingly.
-    pub const kernel_code: Range = .{
-        .start = 0xFFFF_FFFF_8000_0000,
-        .end = 0xFFFF_FFFF_C000_0000,
-    };
-};
+pub const AddrSpacePartition = arch.addr_space;
 
 pub const UserVA = struct {
-    pub const aslr: Range = .{
-        .start = 0x0000_0000_0000_1000,
-        .end = 0x0000_1000_0000_0000,
-    };
+    pub const aslr: Range = arch.user_aslr;
 };
 
 pub const KernelVA = struct {
@@ -169,12 +144,7 @@ pub const PAddr = extern struct {
     }
 
     pub fn fromVAddr(vaddr: VAddr, addr_space_base: ?u64) PAddr {
-        const base = blk: {
-            if (addr_space_base) |b|
-                break :blk b
-            else
-                break :blk AddrSpacePartition.physmap.start;
-        };
+        const base = addr_space_base orelse AddrSpacePartition.physmap.start;
         return .{ .addr = vaddr.addr - base };
     }
 
@@ -191,12 +161,7 @@ pub const VAddr = extern struct {
     }
 
     pub fn fromPAddr(paddr: PAddr, addr_space_base: ?u64) VAddr {
-        const base = blk: {
-            if (addr_space_base) |b|
-                break :blk b
-            else
-                break :blk AddrSpacePartition.physmap.start;
-        };
+        const base = addr_space_base orelse AddrSpacePartition.physmap.start;
         return .{ .addr = paddr.addr + base };
     }
 
@@ -205,7 +170,4 @@ pub const VAddr = extern struct {
     }
 };
 
-pub fn alignStack(stack_top: VAddr) VAddr {
-    const aligned = std.mem.alignBackward(u64, stack_top.addr, 16) - 8;
-    return VAddr.fromInt(aligned);
-}
+pub const alignStack = arch.alignStack;

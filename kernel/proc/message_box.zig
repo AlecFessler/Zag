@@ -1,9 +1,7 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const containers = zag.utils.containers;
-
-const PriorityQueue = containers.priority_queue.PriorityQueue;
+const ThreadPriorityQueue = zag.sched.thread.ThreadPriorityQueue;
 const SpinLock = zag.utils.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 
@@ -30,7 +28,7 @@ const Thread = zag.sched.thread.Thread;
 /// state transitions.
 pub const MessageBox = struct {
     state: State = .idle,
-    waiters: PriorityQueue = .{},
+    waiters: ThreadPriorityQueue = .{},
     /// Thread blocked on `recv`, valid iff `state == .receiving`.
     receiver: ?*Thread = null,
     /// Sender thread that owns the currently-pending message; valid iff
@@ -74,7 +72,27 @@ pub const MessageBox = struct {
     /// Remove all threads belonging to `proc` from the wait queue.
     /// Caller must hold `self.lock`.
     pub fn drainByProcessLocked(self: *MessageBox, proc: anytype) void {
-        _ = self.waiters.removeByProcess(proc);
+        for (&self.waiters.levels) |*level| {
+            var prev: ?*Thread = null;
+            var cur = level.head;
+            while (cur) |c| {
+                const next = c.next;
+                if (c.process == proc) {
+                    if (prev) |p| {
+                        p.next = next;
+                    } else {
+                        level.head = next;
+                    }
+                    if (level.tail == c) {
+                        level.tail = prev;
+                    }
+                    c.next = null;
+                } else {
+                    prev = c;
+                }
+                cur = next;
+            }
+        }
     }
 
     /// Transition to `receiving` state with `thread` as the blocked

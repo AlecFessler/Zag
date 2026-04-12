@@ -3,7 +3,6 @@ const zag = @import("zag");
 
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
-const kvm = zag.kvm;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
@@ -27,6 +26,13 @@ pub const Priority = enum(u3) {
     realtime = 3,
     pinned = 4,
 };
+
+pub const ThreadPriorityQueue = zag.utils.containers.priority_queue.PriorityQueue(
+    Thread,
+    "next",
+    "priority",
+    std.meta.fields(Priority).len,
+);
 
 pub const State = enum {
     running,
@@ -128,7 +134,7 @@ pub const Thread = struct {
                 proc.lock.lock();
                 const remaining = proc.threads[0..proc.num_threads];
                 for (remaining) |t| {
-                    if (kvm.vcpu.vcpuFromThread(vm_obj, t) == null) {
+                    if (arch.kvmVcpuFromThread(vm_obj, t) == null) {
                         all_vcpu = false;
                         break;
                     }

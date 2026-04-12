@@ -5,7 +5,7 @@
 /// as exits — the VMM calls vm_guest_map to wire host pages into guest EPT.
 const zag = @import("zag");
 
-const arch = zag.arch.dispatch;
+const vm_hw = zag.arch.x64.vm;
 const paging = zag.memory.paging;
 
 const PAddr = zag.memory.address.PAddr;
@@ -43,7 +43,7 @@ pub const GuestMemory = struct {
             if (!region.active) continue;
             var offset: u64 = 0;
             while (offset < region.size) : (offset += paging.PAGE4K) {
-                arch.unmapGuestPage(arch_structures, region.guest_phys_start + offset);
+                vm_hw.unmapGuestPage(arch_structures, region.guest_phys_start + offset);
             }
             region.active = false;
         }

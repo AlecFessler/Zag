@@ -90,13 +90,13 @@ pub const SyscallNum = enum(u64) {
 };
 
 pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
-    const num = ctx.regs.rax;
-    const arg0 = ctx.regs.rdi;
-    const arg1 = ctx.regs.rsi;
-    const arg2 = ctx.regs.rdx;
-    const arg3 = ctx.regs.r10;
-    const arg4 = ctx.regs.r8;
-    const syscall_num: SyscallNum = @enumFromInt(num);
+    const args = zag.arch.dispatch.getSyscallArgs(ctx);
+    const arg0 = args.arg0;
+    const arg1 = args.arg1;
+    const arg2 = args.arg2;
+    const arg3 = args.arg3;
+    const arg4 = args.arg4;
+    const syscall_num: SyscallNum = @enumFromInt(args.num);
     return switch (syscall_num) {
         .write => system.sysWrite(arg0, arg1),
         .mem_reserve => memory.sysMemReserve(arg0, arg1, arg2),

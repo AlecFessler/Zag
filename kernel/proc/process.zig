@@ -5,7 +5,6 @@ const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const elf = std.elf;
 const futex = zag.proc.futex;
-const kvm = zag.kvm;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
@@ -97,7 +96,7 @@ pub const Process = struct {
     // decide whether restoring the bit is semantically valid — we never
     // want to synthesize a right the sender didn't have to begin with.
     had_self_fault_handler: bool = true,
-    vm: ?*kvm.vm.Vm = null,
+    vm: ?*arch.Vm = null,
     /// IRQ notification delivery — per-process bitmask box (spec §2.18).
     notification_box: NotificationBox = .{},
     /// Monotonic mod-64 counter for badge bit assignment (spec §2.18.1).
@@ -352,21 +351,18 @@ pub const Process = struct {
         thread_handle: u64,
         faulted: *Thread,
     ) void {
-        // Layout matches libz.FaultMessage. 176 bytes total.
-        var msg: [176]u8 = undefined;
+        // Layout matches libz.FaultMessage. Size is arch-dependent.
+        var msg: [arch.fault_msg_size]u8 = undefined;
         @as(*align(1) u64, @ptrCast(&msg[0])).* = process_handle;
         @as(*align(1) u64, @ptrCast(&msg[8])).* = thread_handle;
         msg[16] = @intFromEnum(faulted.fault_reason);
         @memset(msg[17..24], 0);
         @as(*align(1) u64, @ptrCast(&msg[24])).* = faulted.fault_addr;
         @as(*align(1) u64, @ptrCast(&msg[32])).* = faulted.fault_rip;
-        @as(*align(1) u64, @ptrCast(&msg[40])).* = faulted.ctx.rflags;
-        @as(*align(1) u64, @ptrCast(&msg[48])).* = faulted.ctx.rsp;
-        const r = &faulted.ctx.regs;
-        const gprs = [_]u64{
-            r.r15, r.r14, r.r13, r.r12, r.r11, r.r10, r.r9, r.r8,
-            r.rdi, r.rsi, r.rbp, r.rbx, r.rdx, r.rcx, r.rax,
-        };
+        const snap = arch.serializeFaultRegs(faulted.ctx);
+        @as(*align(1) u64, @ptrCast(&msg[40])).* = snap.flags;
+        @as(*align(1) u64, @ptrCast(&msg[48])).* = snap.sp;
+        const gprs = snap.gprs;
         var off: usize = 56;
         for (gprs) |v| {
             @as(*align(1) u64, @ptrCast(&msg[off])).* = v;
@@ -374,7 +370,7 @@ pub const Process = struct {
         }
 
         // Walk the receiver's page table and copy the message via physmap.
-        var remaining: usize = 176;
+        var remaining: usize = arch.fault_msg_size;
         var src_off: usize = 0;
         var dst_va: u64 = buf_ptr;
         while (remaining > 0) {
@@ -419,13 +415,13 @@ pub const Process = struct {
     /// saved rax to the fault token (= thread handle), and wakes it.
     fn deliverFaultToWaiter(handler: *Process, receiver: *Thread, faulted: *Thread) void {
         // The receiver was blocked inside sysFaultRecv. The buf_ptr arg
-        // is in receiver.ctx.regs.rdi (preserved from int 0x80 entry).
-        const buf_ptr = receiver.ctx.regs.rdi;
+        // is the first syscall argument (preserved from syscall entry).
+        const buf_ptr = arch.getSyscallArgs(receiver.ctx).arg0;
         const handles = lookupHandlesForFault(handler, faulted);
         writeFaultMessageInto(receiver.process, buf_ptr, handles.proc_h, handles.thread_h, faulted);
         // Set the syscall return value: fault_recv returns the thread
         // handle (= the fault token) on success.
-        receiver.ctx.regs.rax = handles.thread_h;
+        arch.setSyscallReturn(receiver.ctx, handles.thread_h);
         wakeReceiver(receiver);
     }
 
@@ -1016,7 +1012,7 @@ pub const Process = struct {
         // Drain all queued waiters with E_NOENT.
         while (self.msg_box.dequeueLocked()) |w| {
             w.ipc_server = null;
-            w.ctx.regs.rax = @bitCast(@as(i64, -10));
+            arch.setSyscallReturn(w.ctx, @bitCast(@as(i64, -10)));
             while (w.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
             w.state = .ready;
             const target_core = if (w.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
@@ -1027,7 +1023,7 @@ pub const Process = struct {
         if (self.msg_box.isPendingReply()) {
             if (self.msg_box.endPendingReplyLocked()) |pc| {
                 pc.ipc_server = null;
-                pc.ctx.regs.rax = @bitCast(@as(i64, -10));
+                arch.setSyscallReturn(pc.ctx, @bitCast(@as(i64, -10)));
                 while (pc.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
                 pc.state = .ready;
                 const target_core = if (pc.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
@@ -1674,7 +1670,7 @@ fn applyRelocations(proc: *Process, aslr_base: u64, elf_binary: []const u8, rela
         const rela = std.mem.bytesAsValue(elf.Elf64_Rela, elf_binary[off..][0..entry_size]);
 
         const rela_type = @as(u32, @truncate(rela.r_info));
-        if (rela_type != @intFromEnum(elf.R_X86_64.RELATIVE)) {
+        if (!arch.isRelativeRelocation(rela_type)) {
             r += 1;
             continue;
         }

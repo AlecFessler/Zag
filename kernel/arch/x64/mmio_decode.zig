@@ -16,7 +16,7 @@ const zag = @import("zag");
 const arch = zag.arch.dispatch;
 
 const GuestState = zag.arch.dispatch.GuestState;
-const Vm = zag.kvm.vm.Vm;
+const Vm = zag.arch.x64.kvm.vm.Vm;
 
 /// Result of decoding an MMIO instruction.
 pub const MmioOp = struct {

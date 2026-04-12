@@ -3,10 +3,11 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const arch = zag.arch.dispatch;
-const exit_box = zag.kvm.exit_box;
-const guest_memory = zag.kvm.guest_memory;
-const vcpu_mod = zag.kvm.vcpu;
+const vm_hw = zag.arch.x64.vm;
+const kvm = zag.arch.x64.kvm;
+const exit_box = kvm.exit_box;
+const guest_memory = kvm.guest_memory;
+const vcpu_mod = kvm.vcpu;
 
 const VCpu = vcpu_mod.VCpu;
 
@@ -18,7 +19,7 @@ const VCpu = vcpu_mod.VCpu;
 /// guest mode).
 /// If the exit requires VMM involvement, snapshots state, enqueues on the
 /// exit box, and transitions the vCPU to .exited state.
-pub fn handleExit(vcpu_obj: *VCpu, exit_info: arch.VmExitInfo) void {
+pub fn handleExit(vcpu_obj: *VCpu, exit_info: vm_hw.VmExitInfo) void {
     const vm_obj = vcpu_obj.vm;
 
     // Try kernel-handled exits first
@@ -59,12 +60,11 @@ pub fn handleExit(vcpu_obj: *VCpu, exit_info: arch.VmExitInfo) void {
             return;
         },
         .unknown => |code| {
-            // VMEXIT_INTR (0x060) / VMEXIT_NMI (0x061): physical interrupt
-            // or NMI intercepted. The host handler has already executed on
-            // #VMEXIT -- just return so the vCPU loop re-enters the guest.
-            if (code == 0x060 or code == 0x061) return;
-            // VMEXIT_VINTR (0x064): virtual interrupt window.
-            if (code == 0x064) return;
+            // Host physical interrupt, NMI, or virtual interrupt window.
+            // The host handler has already executed on #VMEXIT -- just
+            // return so the vCPU loop re-enters the guest.
+            // AMD APM Vol 2, Appendix C: 0x060=VMEXIT_INTR, 0x061=VMEXIT_NMI, 0x064=VMEXIT_VINTR
+            if (code == 0x060 or code == 0x061 or code == 0x064) return;
         },
         else => {},
     }
@@ -74,7 +74,7 @@ pub fn handleExit(vcpu_obj: *VCpu, exit_info: arch.VmExitInfo) void {
     exit_box.queueOrDeliver(vm_obj.exitBox(), vm_obj, vcpu_obj);
 }
 
-fn lookupCpuidPolicy(policy: *const arch.VmPolicy, leaf: u32, subleaf: u32) ?arch.VmPolicy.CpuidPolicy {
+fn lookupCpuidPolicy(policy: *const vm_hw.VmPolicy, leaf: u32, subleaf: u32) ?vm_hw.VmPolicy.CpuidPolicy {
     for (policy.cpuid_responses[0..policy.num_cpuid_responses]) |entry| {
         if (entry.leaf == leaf and entry.subleaf == subleaf) return entry;
     }

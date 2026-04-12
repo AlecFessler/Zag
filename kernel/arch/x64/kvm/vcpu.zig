@@ -2,14 +2,17 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
-const exit_handler = zag.kvm.exit_handler;
+const kvm = zag.arch.x64.kvm;
+const interrupts = zag.arch.x64.interrupts;
+const vm_hw = zag.arch.x64.vm;
+const exit_handler = kvm.exit_handler;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const sched = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
 const thread_mod = zag.sched.thread;
-const vm_mod = zag.kvm.vm;
+const vm_mod = kvm.vm;
 
 const PAddr = zag.memory.address.PAddr;
 const Process = zag.proc.process.Process;
@@ -37,15 +40,15 @@ pub var allocator: std.mem.Allocator = undefined;
 pub const VCpu = struct {
     thread: *Thread,
     vm: *Vm,
-    guest_state: arch.GuestState = .{},
+    guest_state: vm_hw.GuestState = .{},
     /// Atomic state. Use `loadState`/`storeState` -- direct `.state = ...`
     /// writes are still allowed inside regions already holding `vm.lock`,
     /// but every other site must go through the atomic helpers.
     state: VCpuState = .idle,
-    last_exit_info: arch.VmExitInfo = .{ .unknown = 0 },
+    last_exit_info: vm_hw.VmExitInfo = .{ .unknown = 0 },
     /// Guest FPU/SSE state (FXSAVE format, 512 bytes, 16-byte aligned).
     /// Initialized with default MXCSR=0x1F80, FCW=0x037F.
-    guest_fxsave: arch.FxsaveArea align(16) = arch.fxsaveInit(),
+    guest_fxsave: vm_hw.FxsaveArea align(16) = vm_hw.fxsaveInit(),
 
     pub inline fn loadState(self: *const VCpu) VCpuState {
         return @atomicLoad(VCpuState, &self.state, .acquire);
@@ -84,7 +87,7 @@ pub fn create(vm_obj: *Vm) !*VCpu {
 
     // Set up the thread context with the vCPU entry point
     const kstack_top = zag.memory.address.alignStack(thread.kernel_stack.top);
-    thread.ctx = arch.prepareThreadContext(kstack_top, null, &vcpuEntryPoint, 0);
+    thread.ctx = interrupts.prepareThreadContext(kstack_top, null, &vcpuEntryPoint, 0);
 
     // Add thread to process thread list
     proc.lock.lock();
@@ -165,9 +168,9 @@ pub fn vcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
 
     // Read guest state from userspace via physmap, handling cross-page boundaries.
-    var buf: [@sizeOf(arch.GuestState)]u8 = undefined;
+    var buf: [@sizeOf(vm_hw.GuestState)]u8 = undefined;
     if (!readUserStruct(proc, state_ptr, &buf)) return E_BADADDR;
-    vcpu_obj.guest_state = std.mem.bytesAsValue(arch.GuestState, &buf).*;
+    vcpu_obj.guest_state = std.mem.bytesAsValue(vm_hw.GuestState, &buf).*;
     return 0; // E_OK
 }
 
@@ -230,9 +233,9 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     if (!zag.memory.address.AddrSpacePartition.user.contains(interrupt_ptr)) return E_BADADDR;
 
     // Read interrupt from userspace via physmap, handling cross-page boundaries.
-    var int_buf: [@sizeOf(arch.GuestInterrupt)]u8 = undefined;
+    var int_buf: [@sizeOf(vm_hw.GuestInterrupt)]u8 = undefined;
     if (!readUserStruct(proc, interrupt_ptr, &int_buf)) return E_BADADDR;
-    const interrupt = std.mem.bytesAsValue(arch.GuestInterrupt, &int_buf).*;
+    const interrupt = std.mem.bytesAsValue(vm_hw.GuestInterrupt, &int_buf).*;
 
     if (vcpu_obj.loadState() == .running) {
         const thread = vcpu_obj.thread;
@@ -273,7 +276,7 @@ pub fn vcpuFromThread(vm_obj: *Vm, thread: *Thread) ?*VCpu {
 }
 
 /// The kernel-managed vCPU thread entry point.
-/// When scheduled, enters guest mode via arch.vmResume() in a loop.
+/// When scheduled, enters guest mode via vm_hw.vmResume() in a loop.
 fn vcpuEntryPoint() void {
     // Look up our VCpu by finding the current thread in the VM's vcpu array.
     const thread = sched.currentThread().?;
@@ -305,7 +308,7 @@ fn vcpuEntryPoint() void {
 
         // Enter guest mode
         const vm_structures = vm_obj.arch_structures;
-        const exit_info = arch.vmResume(&vcpu_obj.guest_state, vm_structures, &vcpu_obj.guest_fxsave);
+        const exit_info = vm_hw.vmResume(&vcpu_obj.guest_state, vm_structures, &vcpu_obj.guest_fxsave);
 
         // Handle the exit
         vcpu_obj.last_exit_info = exit_info;

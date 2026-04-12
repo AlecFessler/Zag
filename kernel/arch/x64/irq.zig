@@ -151,6 +151,14 @@ pub fn unmaskIrq(irq_line: u8) void {
     ioapic_lock.unlockIrqRestore(irq_state);
 }
 
+/// Look up which IRQ line, if any, is assigned to the given device region.
+pub fn findIrqForDevice(device: *DeviceRegion) ?u8 {
+    for (irq_table, 0..) |dev_ptr, i| {
+        if (dev_ptr == device) return @truncate(i);
+    }
+    return null;
+}
+
 /// Read a 32-bit register from the I/O APIC via the indirect MMIO interface.
 /// 82093AA I/O APIC Datasheet, §3.1 "I/O APIC Registers" — IOREGSEL at
 /// base+0x00 selects the register index; IOWIN at base+0x10 is the data window.

@@ -2,15 +2,17 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
-const exit_box_mod = zag.kvm.exit_box;
-const guest_memory = zag.kvm.guest_memory;
-const ioapic_mod = zag.kvm.ioapic;
-const lapic_mod = zag.kvm.lapic;
+const kvm = zag.arch.x64.kvm;
+const mmio_decode = zag.arch.x64.mmio_decode;
+const vm_hw = zag.arch.x64.vm;
+const exit_box_mod = kvm.exit_box;
+const guest_memory = kvm.guest_memory;
+const ioapic_mod = kvm.ioapic;
+const lapic_mod = kvm.lapic;
 const memory_init = zag.memory.init;
-const mmio_decode = zag.kvm.mmio_decode;
 const paging = zag.memory.paging;
 const sched = zag.sched.scheduler;
-const vcpu_mod = zag.kvm.vcpu;
+const vcpu_mod = kvm.vcpu;
 
 const GuestMemory = guest_memory.GuestMemory;
 const Ioapic = ioapic_mod.Ioapic;
@@ -28,6 +30,11 @@ const VmExitBox = exit_box_mod.VmExitBox;
 
 pub const MAX_VCPUS = 64;
 
+/// Intel SDM Vol 3, Section 13.4.1: default APIC base.
+const LAPIC_BASE: u64 = 0xFEE00000;
+/// Intel 82093AA datasheet, Section 3.0: default IOAPIC base.
+const IOAPIC_BASE: u64 = 0xFEC00000;
+
 pub const VmAllocator = SlabAllocator(Vm, false, 0, 64, true);
 
 pub var allocator: std.mem.Allocator = undefined;
@@ -39,7 +46,7 @@ pub const Vm = struct {
     num_vcpus: u32 = 0,
     owner: *Process,
     exit_box: VmExitBox = .{},
-    policy: arch.VmPolicy = .{},
+    policy: vm_hw.VmPolicy = .{},
     lock: SpinLock = .{},
     vm_id: u64 = 0,
     arch_structures: PAddr = PAddr.fromInt(0),
@@ -68,7 +75,7 @@ pub const Vm = struct {
 
         // Free arch-specific structures
         if (self.arch_structures.addr != 0) {
-            arch.vmFreeStructures(self.arch_structures);
+            vm_hw.vmFreeStructures(self.arch_structures);
         }
 
         // Clear owner's vm pointer
@@ -99,7 +106,7 @@ pub const Vm = struct {
     /// to accept it (IF=1, no prior pending EVENTINJ), build the EVENTINJ
     /// word, mark the vector accepted in the LAPIC, and return.
     /// AMD APM Vol 2, Section 15.20, Figure 15-4.
-    pub fn deliverPendingInterrupts(self: *Vm, gs: *arch.GuestState) void {
+    pub fn deliverPendingInterrupts(self: *Vm, gs: *vm_hw.GuestState) void {
         const vector = self.lapic.getPendingVector() orelse return;
         const guest_if = gs.rflags & (1 << 9);
         if (guest_if == 0 or gs.pending_eventinj != 0) return;
@@ -113,10 +120,10 @@ pub const Vm = struct {
     /// and advance RIP. Returns true if handled (the exit can be resumed
     /// inline) or false if it should fall through to the VMM.
     pub fn tryHandleMmio(self: *Vm, vcpu_obj: *VCpu, guest_phys: u64) bool {
-        if (guest_phys >= lapic_mod.APIC_BASE and guest_phys < lapic_mod.APIC_BASE + 0x1000) {
+        if (guest_phys >= LAPIC_BASE and guest_phys < LAPIC_BASE + 0x1000) {
             return self.handleLapicMmio(vcpu_obj, guest_phys);
         }
-        if (guest_phys >= ioapic_mod.IOAPIC_BASE and guest_phys < ioapic_mod.IOAPIC_BASE + 0x1000) {
+        if (guest_phys >= IOAPIC_BASE and guest_phys < IOAPIC_BASE + 0x1000) {
             return self.handleIoapicMmio(vcpu_obj, guest_phys);
         }
         return false;
@@ -124,7 +131,7 @@ pub const Vm = struct {
 
     fn handleLapicMmio(self: *Vm, vcpu_obj: *VCpu, guest_phys: u64) bool {
         const op = mmio_decode.decode(self, &vcpu_obj.guest_state) orelse return false;
-        const offset: u32 = @truncate(guest_phys - lapic_mod.APIC_BASE);
+        const offset: u32 = @truncate(guest_phys - LAPIC_BASE);
         if (op.is_write) {
             self.lapic.mmioWrite(offset, op.value);
         } else {
@@ -137,7 +144,7 @@ pub const Vm = struct {
 
     fn handleIoapicMmio(self: *Vm, vcpu_obj: *VCpu, guest_phys: u64) bool {
         const op = mmio_decode.decode(self, &vcpu_obj.guest_state) orelse return false;
-        const offset: u32 = @truncate(guest_phys - ioapic_mod.IOAPIC_BASE);
+        const offset: u32 = @truncate(guest_phys - IOAPIC_BASE);
         if (op.is_write) {
             self.ioapic.mmioWrite(offset, op.value);
         } else {
@@ -182,7 +189,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
     if (!self_entry.processRights().vm_create) return E_PERM;
 
     // Check hardware support
-    if (!arch.vmSupported()) return E_NODEV;
+    if (!vm_hw.vmSupported()) return E_NODEV;
 
     // Validate arguments
     if (vcpu_count == 0 or vcpu_count > MAX_VCPUS) return E_INVAL;
@@ -194,20 +201,20 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
     // Read policy from userspace via physmap, handling cross-page boundaries.
     if (policy_ptr == 0) return E_BADADDR;
     if (!zag.memory.address.AddrSpacePartition.user.contains(policy_ptr)) return E_BADADDR;
-    var policy_buf: [@sizeOf(arch.VmPolicy)]u8 = undefined;
+    var policy_buf: [@sizeOf(vm_hw.VmPolicy)]u8 = undefined;
     if (!readUserStruct(proc, policy_ptr, &policy_buf)) return E_BADADDR;
-    const user_policy = std.mem.bytesAsValue(arch.VmPolicy, &policy_buf);
+    const user_policy = std.mem.bytesAsValue(vm_hw.VmPolicy, &policy_buf);
 
     // Reject oversized policy counts -- a malicious VMM could otherwise
     // cause lookupCpuidPolicy/lookupCrPolicy to OOB-read the policy struct.
-    if (user_policy.num_cpuid_responses > arch.VmPolicy.MAX_CPUID_POLICIES) return E_INVAL;
-    if (user_policy.num_cr_policies > arch.VmPolicy.MAX_CR_POLICIES) return E_INVAL;
+    if (user_policy.num_cpuid_responses > vm_hw.VmPolicy.MAX_CPUID_POLICIES) return E_INVAL;
+    if (user_policy.num_cr_policies > vm_hw.VmPolicy.MAX_CR_POLICIES) return E_INVAL;
 
     // Allocate VM struct
     const vm_obj = allocator.create(Vm) catch return E_NOMEM;
 
     // Allocate arch-specific structures
-    const arch_structures = arch.vmAllocStructures() orelse {
+    const arch_structures = vm_hw.vmAllocStructures() orelse {
         allocator.destroy(vm_obj);
         return E_NOMEM;
     };
@@ -244,7 +251,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
                 vcpu_mod.destroy(vm_obj.vcpus[j]);
                 j += 1;
             }
-            arch.vmFreeStructures(arch_structures);
+            vm_hw.vmFreeStructures(arch_structures);
             allocator.destroy(vm_obj);
             return E_NOMEM;
         };
@@ -266,7 +273,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
                 vcpu_mod.destroy(vm_obj.vcpus[j]);
                 j += 1;
             }
-            arch.vmFreeStructures(arch_structures);
+            vm_hw.vmFreeStructures(arch_structures);
             allocator.destroy(vm_obj);
             return E_MAXCAP;
         };
@@ -296,15 +303,6 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
     return @bitCast(vm_handle_id);
 }
 
-/// Syscall implementation: destroy the calling process's VM.
-pub fn vmDestroy(proc: *Process) i64 {
-    const E_INVAL: i64 = -1;
-
-    const vm_obj = proc.vm orelse return E_INVAL;
-    vm_obj.destroy();
-    return 0; // E_OK
-}
-
 /// Syscall implementation: map host virtual memory into guest physical address space (EPT).
 pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
     const E_INVAL: i64 = -1;
@@ -325,8 +323,8 @@ pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64
     // must always NPT-fault to the kernel exit handler. Proper interval
     // overlap check: [guest_addr, guest_end) vs [base, base+0x1000).
     const guest_end = guest_addr + size;
-    if (guest_addr < lapic_mod.APIC_BASE + 0x1000 and guest_end > lapic_mod.APIC_BASE) return E_INVAL;
-    if (guest_addr < ioapic_mod.IOAPIC_BASE + 0x1000 and guest_end > ioapic_mod.IOAPIC_BASE) return E_INVAL;
+    if (guest_addr < LAPIC_BASE + 0x1000 and guest_end > LAPIC_BASE) return E_INVAL;
+    if (guest_addr < IOAPIC_BASE + 0x1000 and guest_end > IOAPIC_BASE) return E_INVAL;
 
     // Walk host pages and map each into guest EPT. Track progress for
     // rollback on partial failure.
@@ -342,7 +340,7 @@ pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64
             rollbackGuestMap(vm_obj, guest_addr, offset);
             return E_BADADDR;
         };
-        arch.mapGuestPage(vm_obj.arch_structures, guest_addr + offset, host_phys, @truncate(rights)) catch {
+        vm_hw.mapGuestPage(vm_obj.arch_structures, guest_addr + offset, host_phys, @truncate(rights)) catch {
             rollbackGuestMap(vm_obj, guest_addr, offset);
             return E_NOMEM;
         };
@@ -369,7 +367,7 @@ pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64
 fn rollbackGuestMap(vm_obj: *Vm, guest_addr: u64, mapped_size: u64) void {
     var off: u64 = 0;
     while (off < mapped_size) {
-        arch.unmapGuestPage(vm_obj.arch_structures, guest_addr + off);
+        vm_hw.unmapGuestPage(vm_obj.arch_structures, guest_addr + off);
         off += 0x1000;
     }
 }
@@ -431,24 +429,6 @@ fn kickRunningVcpus(vm_obj: *Vm) void {
     }
 }
 
-/// Returns true if the MSR is security-critical and must always be intercepted.
-fn isSecurityCriticalMsr(msr: u32) bool {
-    return switch (msr) {
-        0xC0000080, // EFER
-        0xC0000081, // STAR
-        0xC0000082, // LSTAR
-        0xC0000083, // CSTAR
-        0xC0000084, // SFMASK
-        0x1B, // APIC_BASE
-        0xC0000102, // KERNEL_GS_BASE
-        0x174, // SYSENTER_CS
-        0x175, // SYSENTER_ESP
-        0x176, // SYSENTER_EIP
-        => true,
-        else => false,
-    };
-}
-
 /// Resolve a VM handle from the process's perm table. Returns the *Vm or null.
 fn resolveVmHandle(proc: *Process, vm_handle: u64) ?*Vm {
     const entry = proc.getPermByHandle(vm_handle) orelse return null;
@@ -476,4 +456,23 @@ fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
         remaining -= chunk;
     }
     return true;
+}
+
+/// AMD APM Vol 2, §15.10; Intel SDM Vol 3C, §24.6.9.
+/// MSRs that must always be intercepted by the hypervisor.
+fn isSecurityCriticalMsr(msr: u32) bool {
+    return switch (msr) {
+        0xC0000080, // EFER
+        0xC0000081, // STAR
+        0xC0000082, // LSTAR
+        0xC0000083, // CSTAR
+        0xC0000084, // SFMASK
+        0x1B, // APIC_BASE
+        0xC0000102, // KERNEL_GS_BASE
+        0x174, // SYSENTER_CS
+        0x175, // SYSENTER_ESP
+        0x176, // SYSENTER_EIP
+        => true,
+        else => false,
+    };
 }
