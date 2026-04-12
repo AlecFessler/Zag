@@ -70,18 +70,39 @@ comptime {
 ///      and reset each core's `idle_ns`/`busy_ns` atomically; the
 ///      interval between such calls is the accounting window.
 ///
-/// Ordering for the two-pointer case: pointer ranges for both `info_ptr`
-/// and `cores_ptr` are validated up front, then the `SysInfo` write into
-/// `info_ptr` is performed BEFORE the per-core read-and-reset loop. If
-/// the info-pointer write fails (e.g. a late page-out race after the
-/// up-front validation), no accounting state has been touched yet and
-/// the syscall returns `E_BADADDR` cleanly. Only after the info write
-/// succeeds do we walk the cores, atomically draining each core's
-/// `idle_ns`/`busy_ns` and sampling the per-core hardware triple. If the
-/// final `cores_ptr` write itself fails, the accounting window has
-/// already been consumed — the caller did get `SysInfo` and we have
-/// committed to the reset at that point. This is acceptable for the
-/// rare late-page-out failure mode.
+/// Ordering for the two-pointer case, chosen to satisfy two independent
+/// invariants from §4.55:
+///
+///   (a) **No partial `info_ptr` write on an `E_BADADDR` path** — if
+///       `cores_ptr` is invalid the caller's `SysInfo` buffer must not
+///       be touched (tested by §4.55.5).
+///   (b) **No accounting loss on a late `info_ptr` write failure** — if
+///       `info_ptr` looks valid up front but the write itself later
+///       fails (e.g. a racing unmap between validation and commit), the
+///       per-core `idle_ns`/`busy_ns` accounting must not have been
+///       consumed yet.
+///
+/// To satisfy (a) we cannot commit `info_ptr` before we know the
+/// `cores_ptr` range is writable, and `validateUserWritable` is a purely
+/// symbolic range check — it does not walk the page tables, so a
+/// partition-contained-but-unmapped pointer (e.g. address `1`) slips
+/// through it. We therefore *probe* the `cores_ptr` range with
+/// `probeUserWritable`, which faults in / resolves every page in the
+/// range exactly the way `writeUser` would, but without the memcpy. If
+/// that probe fails we return `E_BADADDR` before either write happens.
+///
+/// Once the probe succeeds, we write `info_ptr` before draining the
+/// per-core accounting — that satisfies (b), because a late write
+/// failure on `info_ptr` leaves the accounting untouched. Only after
+/// both the probe and the info write succeed do we atomically drain each
+/// core's `idle_ns`/`busy_ns`, sample the hardware triple, and write the
+/// freshly assembled `CoreInfo` array into the (already-faulted-in)
+/// `cores_ptr` pages. That final write is virtually guaranteed to
+/// succeed because `probeUserWritable` has already populated the
+/// mappings; if it still fails (another racing unmap), the accounting
+/// window has already been consumed — the caller did receive `SysInfo`
+/// and we have committed to the reset at that point. This is acceptable
+/// for the rare late-page-out failure mode.
 pub fn sysSysInfo(proc: *Process, info_ptr: u64, cores_ptr: u64) i64 {
     // §4.55.3: `info_ptr` must point to a writable region of
     // `sizeof(SysInfo)` bytes.
@@ -99,19 +120,27 @@ pub fn sysSysInfo(proc: *Process, info_ptr: u64, cores_ptr: u64) i64 {
     }
 
     // §4.55.5: `cores_ptr` must point to a writable region of
-    // `core_count * sizeof(CoreInfo)` bytes. Validate the full range up
-    // front via a one-byte-span probe so a bad pointer is reported as
-    // E_BADADDR before any accounting is reset.
+    // `core_count * sizeof(CoreInfo)` bytes. Symbolic range check
+    // first (catches wraparound / kernel-partition / null), then a
+    // real demand-page walk via `probeUserWritable` so an in-partition
+    // but unmapped pointer is rejected BEFORE `info_ptr` is written.
+    // Without the probe, §4.55.5 can't be satisfied together with
+    // §4.55.3's "no partial info_ptr write on E_BADADDR" invariant.
     const total_bytes = std.math.mul(u64, core_count, @sizeOf(CoreInfo)) catch
         return E_BADADDR;
     if (!validateUserWritable(cores_ptr, total_bytes)) return E_BADADDR;
 
-    // Info pointer also has to be writable (§4.55.3). Validate it here
-    // after `cores_ptr` so neither side gets to touch state on a bad
-    // address.
+    // Info pointer also has to be writable (§4.55.3). Symbolic check
+    // only — the actual write below is allowed to race with a late
+    // unmap, which bails cleanly without touching accounting.
     if (!validateUserWritable(info_ptr, @sizeOf(SysInfo))) return E_BADADDR;
 
-    // Write `SysInfo` first. If a late page-out race causes this write
+    // Demand-page / resolve every page of the `cores_ptr` range without
+    // writing. If any page fails to resolve, the pointer is bad and we
+    // return E_BADADDR before `info_ptr` has been touched.
+    if (!probeUserWritable(proc, cores_ptr, total_bytes)) return E_BADADDR;
+
+    // Write `SysInfo` now. If a late page-out race causes this write
     // to fail, no accounting state has been touched yet and the syscall
     // bails with `E_BADADDR` cleanly. Only after this succeeds do we
     // commit to the per-core read-and-reset.
@@ -168,6 +197,39 @@ fn validateUserWritable(user_va: u64, len: u64) bool {
     if (!address.AddrSpacePartition.user.contains(user_va)) return false;
     const end = std.math.add(u64, user_va, len) catch return false;
     if (!address.AddrSpacePartition.user.contains(end -| 1)) return false;
+    return true;
+}
+
+/// Walk a user-space range page-by-page, demand-paging and resolving
+/// each covered page the same way `writeUser` would, but without any
+/// memcpy. Used by `sysSysInfo` to probe the `cores_ptr` range before
+/// committing a write to `info_ptr` — the plain `validateUserWritable`
+/// check only rejects wraparound / kernel-partition / null addresses,
+/// so an in-partition but unmapped pointer would otherwise slip through
+/// and allow a partial-write leak onto `info_ptr`. Returns `false` on
+/// any of: zero address, partition boundary violation, wraparound, a
+/// demand-page failure, or a post-demand-page resolve miss. After a
+/// successful probe the range is guaranteed to have physical backing,
+/// so the subsequent `writeUser` on the same range is almost always
+/// infallible — a concurrent unmap between the probe and the write is
+/// the only remaining failure mode.
+fn probeUserWritable(proc: *Process, user_va: u64, len: u64) bool {
+    if (len == 0) return true;
+    if (user_va == 0) return false;
+    if (!address.AddrSpacePartition.user.contains(user_va)) return false;
+    const end = std.math.add(u64, user_va, len) catch return false;
+    if (!address.AddrSpacePartition.user.contains(end -| 1)) return false;
+
+    var remaining: usize = len;
+    var dst_va: u64 = user_va;
+    while (remaining > 0) {
+        const page_off = dst_va & 0xFFF;
+        const chunk = @min(remaining, paging.PAGE4K - page_off);
+        proc.vmm.demandPage(VAddr.fromInt(dst_va), true, false) catch return false;
+        _ = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return false;
+        dst_va += chunk;
+        remaining -= chunk;
+    }
     return true;
 }
 

@@ -13,37 +13,38 @@ const t = lib.testing;
 /// direct "no per-core data is written" assertion.
 ///
 /// **Half B — accounting counters are not reset.** A buggy kernel that
-/// reset `idle_ns`/`busy_ns` even on a null `cores_ptr` call would still
-/// pass a "totals nonzero" check, so we have to construct a stronger one:
-///   1) Burn CPU on the parent thread (burst 1).
-///   2) Read accounting with `cores_ptr` non-null — capture
-///      `total_after_burn1 = sum(idle_ns + busy_ns)`. (This *does* reset
-///      the per-core counters per §4.55.6.)
-///   3) Call `sys_info` with `cores_ptr = 0`. This is the call under test:
-///      it must NOT touch the per-core accounting.
-///   4) Burn CPU again (burst 2).
-///   5) Read accounting with `cores_ptr` non-null — capture
-///      `total_after_burn2`.
-///   6) Assert `total_after_burn2 > total_after_burn1`.
+/// reset `idle_ns`/`busy_ns` on a null `cores_ptr` call would wipe the
+/// counters between two back-to-back reads where no other time has
+/// elapsed. We exploit that:
 ///
-/// Step (2) drained the counters, so without the null call (3) the only
-/// accounting that step (5) could see is whatever burst 2 + the sys_info
-/// itself accumulated since (2). But because step (3) must NOT reset, the
-/// counters at step (5) reflect the residual that was already accumulating
-/// since step (2), PLUS burst 2's work — strictly more than just the
-/// post-(2) residual would be on its own. The inequality is conservative:
-/// it would catch a buggy kernel that wiped counters on the null call,
-/// because then step (5) would see only the (much smaller) gap between
-/// (3) and (5), which could plausibly be smaller than the gap between
-/// (2) and (3) measured in step 2's reading.
+///   1) Drain accounting with a non-null `sys_info` call (per §4.55.6
+///      this zeroes each core's `idle_ns` / `busy_ns`). Discard the
+///      values — this is the baseline.
+///   2) Burn a large amount of CPU on the parent thread so many
+///      scheduler ticks land, accumulating tens of ms of accounting on
+///      the busy core and idle_ns on the others.
+///   3) `yield` once to make sure a tick has definitely landed after
+///      the burn loop.
+///   4) Call `sys_info` with `cores_ptr = 0`. This is the call under
+///      test — it MUST NOT reset the accounting that step (2) built up.
+///   5) *Immediately* call `sys_info` with `cores_ptr` non-null and sum
+///      `idle_ns + busy_ns` across cores.
 ///
-/// Reading the inequality more directly: the totals at step (5) MUST be
-/// strictly larger than at step (2) because more wall-time has elapsed
-/// AND the null call (3) is forbidden from clearing them. A reset would
-/// shrink the (5) total to "burst 2 only", which is on the same order of
-/// magnitude as the (2) total — and on a fast host could come in lower.
-/// Calibrating burst 2 to be at least as long as burst 1 ensures the
-/// non-buggy path is monotonic.
+/// There is essentially zero wall-time between steps (4) and (5) — one
+/// kernel exit and one kernel entry, no yield, no burn. So:
+///
+///   - A correct kernel leaves the step-(2) accounting in place across
+///     the null call, and step (5) captures ~tens of ms of accumulated
+///     time (burst duration × core_count, minus whatever the baseline
+///     drain in step 1 wrote to zero).
+///   - A buggy kernel that reset on the null call would shrink the
+///     step-(5) total to "time elapsed between steps (4) and (5)", which
+///     is nanoseconds of syscall overhead — several orders of magnitude
+///     below a millisecond.
+///
+/// A 1 ms total-time threshold is comfortably above kernel-entry overhead
+/// and comfortably below the burst's wall-clock duration on any host
+/// QEMU runs on.
 pub fn main(_: u64) void {
     var info: syscall.SysInfo = undefined;
     var cores: [syscall.MAX_CPU_CORES]syscall.CoreInfo = undefined;
@@ -73,59 +74,60 @@ pub fn main(_: u64) void {
     }
 
     // ── Half B: null call must not reset per-core accounting. ────────
-    //
-    // Burst 1: accumulate accounting on at least one core.
-    burnCycles(2_000_000);
+
+    // Step 1: drain the per-core counters via a non-null read.
+    // (Discard the drained values — this establishes a zeroed baseline
+    // so step (5)'s total is bounded below by whatever the burn in
+    // step (2) produces, NOT by arbitrary boot-time accumulation.)
+    if (syscall.sys_info(@intFromPtr(&info), @intFromPtr(&cores)) != syscall.E_OK) {
+        t.fail("§4.55.4 drain sys_info");
+        syscall.shutdown();
+    }
+
+    // Step 2: burn a lot of wall-time so many scheduler ticks land and
+    // fresh accounting accumulates on every core (busy_ns on this core,
+    // idle_ns on the others).
+    burnCycles(20_000_000);
+
+    // Step 3: yield once to guarantee at least one scheduler tick has
+    // attributed elapsed time to the running thread after the burn.
     syscall.thread_yield();
 
-    // Sample 1 (this drains counters per §4.55.6).
-    if (syscall.sys_info(@intFromPtr(&info), @intFromPtr(&cores)) != syscall.E_OK) {
-        t.fail("§4.55.4 sample1 sys_info");
-        syscall.shutdown();
-    }
-    var total_after_burn1: u64 = 0;
-    var k: u64 = 0;
-    while (k < info.core_count) : (k += 1) {
-        total_after_burn1 += cores[k].idle_ns + cores[k].busy_ns;
-    }
-    if (total_after_burn1 == 0) {
-        t.fail("§4.55.4 sample1 zero accounting");
-        syscall.shutdown();
-    }
-
-    // Null-cores_ptr call — the call under test. Must not reset.
+    // Step 4: the call under test. A null `cores_ptr` call MUST NOT
+    // reset the per-core accounting that step (2) built up.
     if (syscall.sys_info(@intFromPtr(&info), 0) != syscall.E_OK) {
         t.fail("§4.55.4 null-cores sys_info (mid-test)");
         syscall.shutdown();
     }
 
-    // Burst 2: keep at least as much work as burst 1 so the non-buggy
-    // path is reliably monotonic on fast hosts.
-    burnCycles(2_000_000);
-    syscall.thread_yield();
-
-    // Sample 2.
+    // Step 5: immediately read accounting with a non-null `cores_ptr`.
+    // There is essentially zero wall-time between steps (4) and (5) —
+    // one kernel exit and one kernel entry, no yield, no burn. A
+    // correct kernel reports the tens of ms of accounting that step (2)
+    // built up; a buggy kernel that reset on step (4) reports only the
+    // tiny syscall-overhead gap between the two calls.
     if (syscall.sys_info(@intFromPtr(&info), @intFromPtr(&cores)) != syscall.E_OK) {
-        t.fail("§4.55.4 sample2 sys_info");
+        t.fail("§4.55.4 post-null sys_info");
         syscall.shutdown();
     }
-    var total_after_burn2: u64 = 0;
-    var m: u64 = 0;
-    while (m < info.core_count) : (m += 1) {
-        total_after_burn2 += cores[m].idle_ns + cores[m].busy_ns;
+    var total: u64 = 0;
+    var k: u64 = 0;
+    while (k < info.core_count) : (k += 1) {
+        total += cores[k].idle_ns + cores[k].busy_ns;
     }
 
-    // The decisive check: a kernel that incorrectly reset accounting on
-    // the null call would have to make burst 2 alone exceed
-    // total_after_burn1, which is unrelated to burst 2's work. For
-    // calibrated equal-length bursts the strict inequality holds because
-    // burst 2's accounting is *added* to the residual that was already
-    // building between sample 1 and the null call.
-    if (total_after_burn2 <= total_after_burn1) {
+    // Threshold: 1 ms of aggregate accounting. The burn in step (2) is
+    // tens of ms of wall-time; with `core_count` cores running in
+    // parallel, the aggregate idle+busy accounting easily exceeds
+    // hundreds of ms. 1 ms is far above any plausible pure-syscall-
+    // overhead gap between steps (4) and (5), so a reset on the null
+    // call would shrink the total well below this threshold.
+    const MIN_TOTAL_NS: u64 = 1_000_000;
+    if (total < MIN_TOTAL_NS) {
         t.failWithVal(
             "§4.55.4 null call appears to have reset accounting",
-            @intCast(total_after_burn1),
-            @intCast(total_after_burn2),
+            @intCast(MIN_TOTAL_NS),
+            @intCast(total),
         );
         syscall.shutdown();
     }
