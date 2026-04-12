@@ -611,7 +611,7 @@ per_core.last_tick_ns = now
 
 `running_thread` at handler entry is the thread that actually consumed the preceding timeslice, so the attribution decision is "was the idle thread running last tick". `last_tick_ns` is seeded from `arch.getMonotonicClock().now()` in `sched.perCoreInit` before the preemption timer is first armed; until that point `idle_ns` and `busy_ns` are zero.
 
-The counters are updated under `rq_lock` so the read-and-reset performed by `sys_info` (§21) sees a consistent snapshot without needing a second lock. Because accounting is sampled at scheduler tick granularity (`SCHED_TIMESLICE_NS = 2 ms`), the reported `idle_ns` / `busy_ns` are tick-quantized — the last partial timeslice before a `sys_info` read is attributed to whichever thread was running at the previous tick boundary, not to wall-clock time. Over any accounting window longer than a few timeslices this quantization is negligible, and `sys_info` does not attempt to reconcile it.
+Each counter is atomically updated via a single `@atomicRmw(.Add, .monotonic)` from the tick hook. The scheduler does NOT hold `rq_lock` for these updates; we rely on per-counter atomicity. The pair (`idle_ns`, `busy_ns`) is therefore not a transactional snapshot for `sys_info` readers — a reader can see a tick's increment attributed to one side without yet seeing the other. This is acceptable because the drift between sides is bounded by one tick (~2 ms), which is far below any reasonable polling cadence. Because accounting is also sampled at scheduler tick granularity (`SCHED_TIMESLICE_NS = 2 ms`), the reported `idle_ns` / `busy_ns` are tick-quantized — the last partial timeslice before a `sys_info` read is attributed to whichever thread was running at the previous tick boundary, not to wall-clock time. Over any accounting window longer than a few timeslices both effects are negligible, and `sys_info` does not attempt to reconcile them.
 
 ### PMU Save/Restore Hooks
 
@@ -2145,12 +2145,13 @@ kernel/arch/x64/sysinfo.zig -- x64 hardware reads (new file)
 kernel/arch/aarch64/sysinfo.zig -- aarch64 stubs (new file)
 ```
 
-The generic layer follows the same split as PMU and VM: architecture-independent scheduler accounting and buffer validation live in the generic `sys_info` syscall handler in `kernel/arch/syscall.zig`, and all hardware-specific reads go through the `arch.getCoreFreq` / `arch.getCoreTemp` / `arch.getCoreState` dispatch functions in `kernel/arch/dispatch.zig` (§13). The generic layer never references MSRs, port I/O, or any vendor-specific encoding.
+The generic layer follows the same split as PMU and VM: architecture-independent scheduler accounting, buffer validation, and the observable `SysInfo`/`CoreInfo` extern types live in `kernel/sched/sysinfo.zig`, and all hardware-specific reads go through the `arch.getCoreFreq` / `arch.getCoreTemp` / `arch.getCoreState` dispatch functions in `kernel/arch/dispatch.zig` (§13). The generic layer never references MSRs, port I/O, or any vendor-specific encoding.
 
 ### Module-Level Changes
 
 - **`kernel/arch/dispatch.zig`** — adds `getCoreFreq(core_id: u64) u64`, `getCoreTemp(core_id: u64) u32`, and `getCoreState(core_id: u64) u8` dispatch functions, each comptime-switched on `builtin.cpu.arch`.
-- **`kernel/arch/syscall.zig`** — adds a dispatch case for the `sys_info` syscall number. The handler is implemented directly in the syscall layer (not a separate `kernel/sched/sysinfo.zig` module) because the logic is small and touches only existing per-core scheduler state plus the PMM: validate pointers, sample the PMM for total/free pages, sample `PerCoreState` for each core with read-and-reset, invoke the arch dispatch functions for frequency/temperature/C-state, and write the result into the caller's address space via physmap.
+- **`kernel/arch/syscall.zig`** — adds a dispatch case for the `sys_info` syscall number that forwards directly to `kernel/sched/sysinfo.zig::sysSysInfo`.
+- **`kernel/sched/sysinfo.zig`** — owns the observable `SysInfo` / `CoreInfo` extern types, the `sysSysInfo` entry point, the user-pointer validation/write helpers (a local copy of the same `validateUserWritable` / `writeUser` helpers used by the PMU module — duplicated to keep sysinfo free of any cross-dependency on PMU), the per-core read-and-reset of the scheduler accounting fields, and the physmap writes that stamp the result into the caller's address space.
 - **`kernel/sched/scheduler.zig`** — adds `idle_ns`, `busy_ns`, and `last_tick_ns` to `PerCoreState` (see §6) and the accounting hook at the top of `schedTimerHandler` (see §6). `last_tick_ns` is seeded in `sched.perCoreInit` after the monotonic clock is available and before the preemption timer is armed.
 - **`kernel/memory/pmm.zig`** — adds `freePageCount() u64` and `totalPageCount() u64` (see §14). Both read PMM and buddy-allocator state under `pmm.lock`.
 
@@ -2158,7 +2159,7 @@ The generic layer follows the same split as PMU and VM: architecture-independent
 
 The handler runs entirely in the syscall layer. Its flow:
 
-1. Validate `info_ptr` as a writable region of `sizeof(SysInfo)` bytes via the standard `validateUserWritable` helper. Return `E_BADADDR` on failure.
+1. Validate `info_ptr` as a writable region of `sizeof(SysInfo)` bytes via a local copy of the same `validateUserWritable` helper used by the PMU module. Return `E_BADADDR` on failure.
 2. Read `arch.coreCount()` into a local `core_count`, `pmm.totalPageCount()` into `mem_total`, and `pmm.freePageCount()` into `mem_free`.
 3. If `cores_ptr` is null: write the assembled `SysInfo` into `info_ptr` via physmap and return `E_OK`. No per-core accounting is touched and no counters are reset.
 4. If `cores_ptr` is non-null: validate it as a writable region of `core_count * sizeof(CoreInfo)` bytes. Return `E_BADADDR` on failure. Then, for each core `i` in `[0, core_count)`:
@@ -2189,4 +2190,8 @@ When aarch64 sysinfo support is implemented, it will replace the stubs in-place 
 
 ### Locking
 
-No new locks. `sys_info` takes each core's existing `rq_lock` in turn for the read-and-reset of the accounting fields; it never holds more than one `rq_lock` at a time, so deadlock is not a concern even if two callers sweep cores in opposite orders. The PMM lock is taken by `pmm.freePageCount()` for the duration of a single allocator query. The arch dispatch functions run without holding any kernel lock (the x64 implementation's remote-core cache is updated under the target core's `rq_lock` by the scheduler tick hook).
+No new locks. `sys_info` takes each core's existing `rq_lock` in turn for the read-and-reset of the accounting fields; it never holds more than one `rq_lock` at a time, so deadlock is not a concern even if two callers sweep cores in opposite orders. The accounting fields themselves are updated lock-free from the scheduler tick hook via `@atomicRmw(.Add, .monotonic)` (see §6 "Idle/Busy Accounting Hook" for the per-counter coherence story).
+
+The PMM lock is taken by `pmm.freePageCount()` for its global free-list query, but the per-core PMM caches (`count`) are read on the alloc/free fast path without `pmm.lock` and without IRQ-disabling on the owning core. As a result the `mem_free` value reported by `sys_info` may be off by a few pages per core. This is acceptable for UI-grade reporting — the userspace consumer is a periodic dashboard sampler, not a transactional accounting system.
+
+The arch dispatch functions run without holding any kernel lock; the x64 implementation's remote-core cache is updated by the owning core's scheduler tick hook via lock-free atomic stores, and read by any core via lock-free atomic loads.

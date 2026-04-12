@@ -3,9 +3,9 @@
 //!
 //! Implements the arch-dispatched interface documented in systems.md §13
 //! "System Information" and §21 "System Info Internals". All x86-specific
-//! concepts (IA32_PERF_STATUS, IA32_THERM_STATUS, MSR_PLATFORM_INFO,
-//! MSR_TEMPERATURE_TARGET, MSR_PKG_CST_CONFIG_CONTROL, CPUID leaf 0x16)
-//! live in this file and are never visible to generic kernel code.
+//! concepts (IA32_PERF_STATUS, IA32_THERM_STATUS, MSR_TEMPERATURE_TARGET,
+//! CPUID leaf 0x16) live in this file and are never visible to generic
+//! kernel code.
 //!
 //! Remote-core reads are served from a tick-sampled cache: each core's
 //! `schedTimerHandler` calls `sampleCoreHwState()` on its own scheduler
@@ -17,6 +17,15 @@
 //! loads/stores with `.monotonic` ordering prevent tearing across cores
 //! without a lock.
 //!
+//! Vendor gate: every thermal/perf MSR read in this file is gated on the
+//! `intel_msrs_available` flag, which is set in `sysInfoInit` only when
+//! `isGenuineIntel()` returns true (CPUID leaf 0 vendor-string match).
+//! On AMD or any other non-Intel vendor `IA32_PERF_STATUS` and friends
+//! are not architecturally defined and would `#GP`, so the per-core
+//! cache is left at its zero-initialised state and the
+//! `getCoreFreq`/`getCoreTemp`/`getCoreState` readers return zero
+//! ("unavailable").
+//!
 //! Spec references:
 //!   * Intel SDM Vol 3, Ch 15 "Power and Thermal Management"
 //!     - §15.5  Thread and Core C-States
@@ -26,8 +35,6 @@
 //!     - IA32_PERF_STATUS          (MSR 0x198)
 //!     - IA32_THERM_STATUS         (MSR 0x19C)
 //!     - MSR_TEMPERATURE_TARGET    (MSR 0x1A2)
-//!     - MSR_PLATFORM_INFO         (MSR 0xCE)
-//!     - MSR_PKG_CST_CONFIG_CONTROL (MSR 0xE2)
 //!   * Intel SDM Vol 2 "CPUID":
 //!     - Leaf 0x16 "Processor Frequency Information"
 
@@ -42,13 +49,11 @@ const MAX_CORES: usize = 64;
 const IA32_PERF_STATUS: u32 = 0x198;
 const IA32_THERM_STATUS: u32 = 0x19C;
 const MSR_TEMPERATURE_TARGET: u32 = 0x1A2;
-const MSR_PLATFORM_INFO: u32 = 0xCE;
-const MSR_PKG_CST_CONFIG_CONTROL: u32 = 0xE2;
 
-/// Fallback bus frequency if neither `CPUID.16h` nor `MSR_PLATFORM_INFO`
-/// yield a usable value. 100 MHz matches the external bus clock on every
-/// mainstream Intel part since Nehalem (Intel SDM Vol 3 §15.7
-/// "Processor-Specific Power Management").
+/// Fallback bus frequency when `CPUID.16h` does not advertise a value.
+/// 100 MHz matches the external bus clock on every mainstream Intel part
+/// since Nehalem (Intel SDM Vol 3 §15.7 "Processor-Specific Power
+/// Management").
 const DEFAULT_BUS_FREQ_HZ: u64 = 100_000_000;
 
 /// Cached per-CPU state sampled at scheduler-tick granularity. Reads from
@@ -87,6 +92,10 @@ var bus_freq_hz: u64 = DEFAULT_BUS_FREQ_HZ;
 /// state on AMD and `getCoreFreq` / `getCoreTemp` / `getCoreState` all
 /// return `0`, matching the aarch64 stub behaviour documented in
 /// `systems.md §21 "System Info Internals"`.
+///
+/// Plain `var bool`, not `std.atomic.Value`: written exactly once on the
+/// bootstrap core during `sysInfoInit` (before any AP is brought up) and
+/// only read thereafter, so no atomic ordering is required.
 var intel_msrs_available: bool = false;
 
 /// Detect `GenuineIntel` via CPUID leaf 0 (Intel SDM Vol 2 "CPUID"). The
@@ -100,9 +109,10 @@ fn isGenuineIntel() bool {
 }
 
 /// One-time system-info bring-up on the bootstrap core. Discovers the
-/// bus frequency via `CPUID.16h` (Intel SDM Vol 2 "CPUID" leaf 0x16)
-/// if available, falling back to `MSR_PLATFORM_INFO` bits 15:8 × 100 MHz
-/// (Intel SDM Vol 3 §15.7), and finally to a 100 MHz default.
+/// bus frequency via `CPUID.16h` (Intel SDM Vol 2 "CPUID" leaf 0x16) if
+/// available, otherwise falls back to `DEFAULT_BUS_FREQ_HZ` (100 MHz).
+/// Wiring up `MSR_PLATFORM_INFO` (MSR 0xCE) as a sanity check is future
+/// work.
 ///
 /// Called from `kMain` after `arch.pmuInit()` and before
 /// `sched.globalInit()`.
@@ -130,13 +140,9 @@ pub fn sysInfoInit() void {
         }
     }
 
-    // `MSR_PLATFORM_INFO` bits 15:8 carry the "maximum non-turbo ratio"
-    // relative to a fixed 100 MHz bus clock on every Intel part that
-    // implements this MSR (Intel SDM Vol 3 §15.7 / Vol 4 MSR table).
-    // The ratio itself isn't the bus clock, but its presence confirms the
-    // 100 MHz default — leave `bus_freq_hz = DEFAULT_BUS_FREQ_HZ`.
-    _ = MSR_PLATFORM_INFO;
-    // bus_freq_hz stays at DEFAULT_BUS_FREQ_HZ.
+    // On CPUs without CPUID.16h, fall back to `DEFAULT_BUS_FREQ_HZ`
+    // (100 MHz). Wiring up `MSR_PLATFORM_INFO` as a sanity check is
+    // future work; `bus_freq_hz` stays at `DEFAULT_BUS_FREQ_HZ`.
 }
 
 /// Per-core system-info bring-up. Runs on every core (BSP and APs) from
@@ -204,21 +210,10 @@ pub fn sampleCoreHwState() void {
         }
     }
 
-    // ── C-state: derived from scheduler view ────────────────────────────
-    // §2.15.6 only requires a minimal active/idle signal: 0 = active,
-    // non-zero = idle at some package-default depth. More granular
-    // per-core C-state residency MSRs (MSR_CORE_C{1,3,6,7}_RES) are a
-    // future refinement per systems.md §21. We rely on the scheduler's
-    // `idle_ns` accounting (updated right before this hook) to tell the
-    // difference: if the outgoing thread was the idle thread, this core
-    // was effectively idle across the previous tick — report the
-    // package-default idle level read from `MSR_PKG_CST_CONFIG_CONTROL`.
-    // For the active case we unconditionally return 0 here and let the
-    // idle path overwrite it. The package C-state config bits are in
-    // bits [2:0] of MSR 0xE2 (Intel SDM Vol 4 MSR table). `MSR_PKG_CST`
-    // is written by firmware and may raise #GP on exotic SKUs — fall
-    // back to 1 (C1) if the read path is unusable.
-    _ = MSR_PKG_CST_CONFIG_CONTROL;
+    // ── C-state ─────────────────────────────────────────────────────────
+    // `c_state` is currently always `0` (active). Spec §2.15.6 permits
+    // this; finer-grained per-core C-state accounting via
+    // `MSR_CORE_C{1,3,6,7}_RES` is future work.
     const c_state: u8 = 0;
 
     // Atomic stores so cross-core readers (`getCoreFreq` et al. running

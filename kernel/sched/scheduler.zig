@@ -149,11 +149,22 @@ pub fn currentThread() ?*Thread {
 /// Snapshot the idle/busy nanosecond accounting for `core_id`, zeroing
 /// both counters atomically as they are read. Used by `sys_info` to
 /// deliver per-core utilization data to userspace on every call with a
-/// non-null `cores_ptr` (§2.15.10, §2.15.11, §21). Holding `rq_lock` for
-/// the swap serializes against the scheduler-tick accounting hook in
-/// `schedTimerHandler`, which updates the same fields under the same
-/// lock. Returns a pair of (idle_ns, busy_ns) covering the accounting
-/// window that ended at this call.
+/// non-null `cores_ptr` (see spec §2.15 and §21).
+///
+/// Each counter is atomically updated via `@atomicRmw` from the scheduler
+/// tick hook in `schedTimerHandler`. The lock is NOT held for those
+/// updates; we rely on per-counter atomicity. The pair (idle_ns, busy_ns)
+/// is therefore not a transactional snapshot — a reader can see a tick's
+/// increment attributed to one side without yet seeing the other. This is
+/// acceptable because the drift between sides is bounded by one tick
+/// (~2 ms) and far below any reasonable polling cadence. `rq_lock` is
+/// still acquired here to serialize concurrent `sys_info` callers and to
+/// keep the read-and-reset interleaving with the scheduler tick coherent
+/// at IRQ-disabled granularity, but it does not provide a multi-counter
+/// transaction.
+///
+/// Returns a pair of (idle_ns, busy_ns) covering the accounting window
+/// that ended at this call.
 pub fn perCoreReadAndResetAccounting(core_id: u64) struct { idle_ns: u64, busy_ns: u64 } {
     if (core_id >= MAX_CORES) return .{ .idle_ns = 0, .busy_ns = 0 };
     const state = &core_states[core_id];
@@ -217,11 +228,16 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     // Idle/busy accounting hook (§6, §21). Attribute the elapsed time
     // since the previous tick to either `idle_ns` or `busy_ns` based on
     // whether the thread that just consumed the preceding timeslice was
-    // the idle thread. We update under `rq_lock` via atomic RMWs so the
-    // `sys_info` read-and-reset (which holds `rq_lock`) sees a consistent
-    // snapshot without needing a second lock. `last_tick_ns` was seeded
-    // in `perCoreInit` before the first preemption timer was armed, so
-    // the first delta is well-defined.
+    // the idle thread. Each counter is updated via a single
+    // `@atomicRmw(.Add, .monotonic)`; the lock is NOT held for these
+    // updates — we rely on per-counter atomicity. The pair
+    // (idle_ns, busy_ns) is therefore not a transactional snapshot for
+    // `sys_info` readers: a reader can see a tick's increment attributed
+    // to one side without yet seeing the other. This is acceptable
+    // because the drift between sides is bounded by one tick (~2 ms),
+    // which is far below any reasonable polling cadence. `last_tick_ns`
+    // was seeded in `perCoreInit` before the first preemption timer was
+    // armed, so the first delta is well-defined.
     const mono = arch.getMonotonicClock();
     const now = mono.now();
     const delta: u64 = now -| state.last_tick_ns;

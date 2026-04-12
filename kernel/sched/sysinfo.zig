@@ -37,7 +37,7 @@ pub const SysInfo = extern struct {
 };
 
 /// Per-core dynamic properties, one entry per core indexed by core ID
-/// (spec §2.15.4–§2.15.8). Field order matches the spec's prose:
+/// (see spec §2.15). Field order matches the spec's prose:
 /// scheduler-accounting pair first, then the hardware-sampled triple.
 ///
 /// Padding at the tail brings the struct to an 8-byte-aligned size so
@@ -69,6 +69,19 @@ comptime {
 ///   2. Subsequent calls with both pointers set obtain live per-core data
 ///      and reset each core's `idle_ns`/`busy_ns` atomically; the
 ///      interval between such calls is the accounting window.
+///
+/// Ordering for the two-pointer case: pointer ranges for both `info_ptr`
+/// and `cores_ptr` are validated up front, then the `SysInfo` write into
+/// `info_ptr` is performed BEFORE the per-core read-and-reset loop. If
+/// the info-pointer write fails (e.g. a late page-out race after the
+/// up-front validation), no accounting state has been touched yet and
+/// the syscall returns `E_BADADDR` cleanly. Only after the info write
+/// succeeds do we walk the cores, atomically draining each core's
+/// `idle_ns`/`busy_ns` and sampling the per-core hardware triple. If the
+/// final `cores_ptr` write itself fails, the accounting window has
+/// already been consumed — the caller did get `SysInfo` and we have
+/// committed to the reset at that point. This is acceptable for the
+/// rare late-page-out failure mode.
 pub fn sysSysInfo(proc: *Process, info_ptr: u64, cores_ptr: u64) i64 {
     // §4.55.3: `info_ptr` must point to a writable region of
     // `sizeof(SysInfo)` bytes.
@@ -98,6 +111,12 @@ pub fn sysSysInfo(proc: *Process, info_ptr: u64, cores_ptr: u64) i64 {
     // address.
     if (!validateUserWritable(info_ptr, @sizeOf(SysInfo))) return E_BADADDR;
 
+    // Write `SysInfo` first. If a late page-out race causes this write
+    // to fail, no accounting state has been touched yet and the syscall
+    // bails with `E_BADADDR` cleanly. Only after this succeeds do we
+    // commit to the per-core read-and-reset.
+    if (!writeUser(proc, info_ptr, std.mem.asBytes(&info))) return E_BADADDR;
+
     // §4.55.6: read-and-reset the accounting pair, read the hardware
     // triple, and stamp one `CoreInfo` entry per core. The array is
     // assembled in a local buffer and bulk-copied into userspace in a
@@ -119,8 +138,10 @@ pub fn sysSysInfo(proc: *Process, info_ptr: u64, cores_ptr: u64) i64 {
         };
     }
 
-    if (!writeUser(proc, info_ptr, std.mem.asBytes(&info))) return E_BADADDR;
-
+    // If this final write fails (late page-out after up-front
+    // validation), the accounting window has already been consumed —
+    // the caller did receive `SysInfo` and we have committed to the
+    // reset at that point.
     const cores_bytes = std.mem.sliceAsBytes(entries[0..@intCast(core_count)]);
     if (!writeUser(proc, cores_ptr, cores_bytes)) return E_BADADDR;
 
