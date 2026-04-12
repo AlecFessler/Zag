@@ -116,6 +116,17 @@ const PerCoreState = struct {
     timer: Timer = undefined,
     exited_thread: ?ExitedThread = null,
     idle_thread: ?*Thread = null,
+    /// Nanoseconds spent running the idle thread since the last
+    /// `sys_info` read-and-reset (§2.15, §6 Idle/Busy Accounting Hook).
+    idle_ns: u64 = 0,
+    /// Nanoseconds spent running real threads since the last
+    /// `sys_info` read-and-reset.
+    busy_ns: u64 = 0,
+    /// Monotonic-clock timestamp of the previous scheduler tick on this
+    /// core. Seeded in `perCoreInit` before the preemption timer is armed;
+    /// updated at the top of `schedTimerHandler` when delta is attributed
+    /// to `idle_ns` / `busy_ns`.
+    last_tick_ns: u64 = 0,
 };
 
 var core_states: [MAX_CORES]PerCoreState align(CACHE_LINE_SIZE) = [_]PerCoreState{.{}} ** MAX_CORES;
@@ -133,6 +144,24 @@ fn armSchedTimer(state: *PerCoreState, delta_ns: u64) void {
 
 pub fn currentThread() ?*Thread {
     return core_states[arch.coreID()].running_thread;
+}
+
+/// Snapshot the idle/busy nanosecond accounting for `core_id`, zeroing
+/// both counters atomically as they are read. Used by `sys_info` to
+/// deliver per-core utilization data to userspace on every call with a
+/// non-null `cores_ptr` (§2.15.10, §2.15.11, §21). Holding `rq_lock` for
+/// the swap serializes against the scheduler-tick accounting hook in
+/// `schedTimerHandler`, which updates the same fields under the same
+/// lock. Returns a pair of (idle_ns, busy_ns) covering the accounting
+/// window that ended at this call.
+pub fn perCoreReadAndResetAccounting(core_id: u64) struct { idle_ns: u64, busy_ns: u64 } {
+    if (core_id >= MAX_CORES) return .{ .idle_ns = 0, .busy_ns = 0 };
+    const state = &core_states[core_id];
+    const irq = state.rq_lock.lockIrqSave();
+    defer state.rq_lock.unlockIrqRestore(irq);
+    const idle = @atomicRmw(u64, &state.idle_ns, .Xchg, 0, .monotonic);
+    const busy = @atomicRmw(u64, &state.busy_ns, .Xchg, 0, .monotonic);
+    return .{ .idle_ns = idle, .busy_ns = busy };
 }
 
 /// Attempt to steal a thread from another core's run queue.
@@ -184,6 +213,31 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     const state = &core_states[core_id];
 
     const preempted = state.running_thread.?;
+
+    // Idle/busy accounting hook (§6, §21). Attribute the elapsed time
+    // since the previous tick to either `idle_ns` or `busy_ns` based on
+    // whether the thread that just consumed the preceding timeslice was
+    // the idle thread. We update under `rq_lock` via atomic RMWs so the
+    // `sys_info` read-and-reset (which holds `rq_lock`) sees a consistent
+    // snapshot without needing a second lock. `last_tick_ns` was seeded
+    // in `perCoreInit` before the first preemption timer was armed, so
+    // the first delta is well-defined.
+    const mono = arch.getMonotonicClock();
+    const now = mono.now();
+    const delta: u64 = now -| state.last_tick_ns;
+    const was_idle = (state.idle_thread != null and preempted == state.idle_thread.?);
+    if (was_idle) {
+        _ = @atomicRmw(u64, &state.idle_ns, .Add, delta, .monotonic);
+    } else {
+        _ = @atomicRmw(u64, &state.busy_ns, .Add, delta, .monotonic);
+    }
+    state.last_tick_ns = now;
+
+    // Refresh the per-core hardware-state cache (frequency / temperature /
+    // C-state) on this core so that `sys_info` reads from any core see a
+    // value at most one tick stale. Must run on the owning core because
+    // the underlying `rdmsr` instructions are core-local (§21).
+    arch.sampleCoreHwState();
 
     if (preempted.pinned_exclusive) {
         if (preempted.state == .exited) {
@@ -669,7 +723,15 @@ pub fn perCoreInit() void {
 
     arch.vmPerCoreInit();
     arch.pmuPerCoreInit();
+    arch.sysInfoPerCoreInit();
     state.timer = arch.getPreemptionTimer();
+
+    // Seed `last_tick_ns` from the monotonic clock before the preemption
+    // timer is armed (§6 Idle/Busy Accounting Hook). Until this point
+    // `idle_ns` and `busy_ns` are zero; the first tick's delta lands
+    // cleanly on a well-defined prior timestamp.
+    state.last_tick_ns = arch.getMonotonicClock().now();
+
     arch.enableInterrupts();
     armSchedTimer(state, SCHED_TIMESLICE_NS);
 }

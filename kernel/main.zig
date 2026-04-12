@@ -38,6 +38,7 @@ fn kMain(boot_info: *BootInfo) !void {
     try arch.parseFirmwareTables(boot_info.xsdp_phys);
     arch.vmInit();
     arch.pmuInit();
+    arch.sysInfoInit();
     device_registry.registerDisplayDevice(boot_info.framebuffer);
     const rs_phys = PAddr.fromInt(@intFromPtr(boot_info.root_service.ptr));
     const rs_virt = VAddr.fromPAddr(rs_phys, null);

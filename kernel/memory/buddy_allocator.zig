@@ -11,6 +11,16 @@ pub const BuddyAllocator = struct {
     page_pair_orders: []PagePairOrders = undefined,
     bitmap: BitmapFreeList = undefined,
     freelists: [NUM_ORDERS]IntrusiveFreeList = [_]IntrusiveFreeList{IntrusiveFreeList{}} ** NUM_ORDERS,
+    /// Static total page count, established by `addRegion`. Accessed
+    /// via `totalPageCount()` for the `sys_info` syscall (§2.15.2).
+    total_pages: u64 = 0,
+    /// Current free page count across all order-N freelists. Incremented
+    /// in `free`/`addRegion` and decremented in `alloc`. Does **not** account
+    /// for pages that were allocated from the buddy but are sitting in
+    /// `pmm.PhysicalMemoryManager`'s per-core page caches — those are
+    /// observed as free by userspace and must be added back in by
+    /// `pmm.freePageCount()` (§21 "pmm.freePageCount").
+    free_pages: u64 = 0,
 
     pub fn init(
         start_addr: u64,
@@ -61,6 +71,11 @@ pub const BuddyAllocator = struct {
         const aligned_start = std.mem.alignForward(u64, start_addr, PAGE_SIZE);
         const aligned_end = std.mem.alignBackward(u64, end_addr, PAGE_SIZE);
         std.debug.assert(aligned_end > aligned_start);
+
+        // Each single-page free below increments `free_pages`; track the
+        // static `total_pages` ceiling here so `pmm.totalPageCount()` can
+        // return the buddy's full managed range. (§14, §21.)
+        self.total_pages += (aligned_end - aligned_start) / PAGE_SIZE;
 
         var current_addr = aligned_start;
         while (current_addr < aligned_end) {
@@ -215,6 +230,14 @@ pub const BuddyAllocator = struct {
         const addr = self.recursiveSplit(order) orelse return null;
         self.bitmap.setBit(addr, 0);
 
+        // Accounting for pmm.freePageCount (§14, §21). Every successful
+        // alloc removes `num_pages` pages from the free pool.
+        if (self.free_pages >= num_pages) {
+            self.free_pages -= num_pages;
+        } else {
+            self.free_pages = 0;
+        }
+
         return @ptrFromInt(addr);
     }
 
@@ -261,6 +284,13 @@ pub const BuddyAllocator = struct {
         const result = self.recursiveMerge(addr);
         self.bitmap.setBit(result.addr, 1);
         self.freelists[result.order].push(@ptrFromInt(result.addr));
+
+        // Accounting for pmm.freePageCount (§14, §21). `buf.len` covers the
+        // full allocated block regardless of whether `recursiveMerge` then
+        // coalesced with a sibling; the coalesced sibling was already
+        // counted when it was originally freed.
+        const num_pages = buf.len / PAGE_SIZE;
+        self.free_pages += num_pages;
     }
 
     pub const AllocationMap = std.HashMap(
