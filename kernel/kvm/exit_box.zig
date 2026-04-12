@@ -8,6 +8,7 @@ const vcpu_mod = zag.kvm.vcpu;
 const vm_mod = zag.kvm.vm;
 
 const ArchCpuContext = zag.arch.dispatch.ArchCpuContext;
+const KernelObject = zag.perms.permissions.KernelObject;
 const PAddr = zag.memory.address.PAddr;
 const PriorityQueue = zag.containers.priority_queue.PriorityQueue;
 const Process = zag.proc.process.Process;
@@ -17,8 +18,6 @@ const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 const VCpu = vcpu_mod.VCpu;
 const Vm = vm_mod.Vm;
-
-const KernelObject = zag.perms.permissions.KernelObject;
 
 const MAX_VCPUS = vm_mod.MAX_VCPUS;
 
@@ -173,8 +172,9 @@ pub fn vmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContext, vm_handle: 
     // Pre-fault all buffer pages the VmExitMessage may touch.
     const msg_size: u64 = @sizeOf(VmExitMessage);
     var prefault_va = buf_ptr;
-    while (prefault_va < buf_ptr + msg_size) : (prefault_va += paging.PAGE4K) {
+    while (prefault_va < buf_ptr + msg_size) {
         proc.vmm.demandPage(VAddr.fromInt(prefault_va), true, false) catch return .{ .rax = E_BADADDR };
+        prefault_va += paging.PAGE4K;
     }
 
     box.lock.lock();

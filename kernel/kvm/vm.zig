@@ -57,8 +57,9 @@ pub const Vm = struct {
     pub fn destroy(self: *Vm) void {
         // Kill all vCPU threads
         var i: u32 = 0;
-        while (i < self.num_vcpus) : (i += 1) {
+        while (i < self.num_vcpus) {
             vcpu_mod.destroy(self.vcpus[i]);
+            i += 1;
         }
         self.num_vcpus = 0;
 
@@ -233,13 +234,15 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
         const vcpu_obj = vcpu_mod.create(vm_obj) catch {
             // Cleanup already-inserted handles (before destroying their threads)
             var k: u32 = 0;
-            while (k < inserted_count) : (k += 1) {
+            while (k < inserted_count) {
                 proc.removePerm(inserted_handles[k]) catch {};
+                k += 1;
             }
             // Destroy already-created vCPUs
             var j: u32 = 0;
-            while (j < i) : (j += 1) {
+            while (j < i) {
                 vcpu_mod.destroy(vm_obj.vcpus[j]);
+                j += 1;
             }
             arch.vmFreeStructures(arch_structures);
             allocator.destroy(vm_obj);
@@ -253,13 +256,15 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
         const handle_id = proc.insertThreadHandle(vcpu_obj.thread, ThreadHandleRights.full) catch {
             // Cleanup already-inserted handles
             var k: u32 = 0;
-            while (k < inserted_count) : (k += 1) {
+            while (k < inserted_count) {
                 proc.removePerm(inserted_handles[k]) catch {};
+                k += 1;
             }
             // Destroy all vCPUs including the one whose handle failed to insert
             var j: u32 = 0;
-            while (j <= i) : (j += 1) {
+            while (j <= i) {
                 vcpu_mod.destroy(vm_obj.vcpus[j]);
+                j += 1;
             }
             arch.vmFreeStructures(arch_structures);
             allocator.destroy(vm_obj);
@@ -279,8 +284,9 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
     }) catch {
         // Cleanup on failure: remove all vCPU thread handles, destroy VM
         var k: u32 = 0;
-        while (k < inserted_count) : (k += 1) {
+        while (k < inserted_count) {
             proc.removePerm(inserted_handles[k]) catch {};
+            k += 1;
         }
         vm_obj.destroy();
         return E_MAXCAP;
@@ -324,7 +330,7 @@ pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64
     // Walk host pages and map each into guest EPT. Track progress for
     // rollback on partial failure.
     var offset: u64 = 0;
-    while (offset < size) : (offset += 0x1000) {
+    while (offset < size) {
         const vaddr = VAddr.fromInt(host_vaddr + offset);
         // Pre-fault demand-paged host pages before resolving their physical address.
         proc.vmm.demandPage(vaddr, false, false) catch {
@@ -339,6 +345,7 @@ pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64
             rollbackGuestMap(vm_obj, guest_addr, offset);
             return E_NOMEM;
         };
+        offset += 0x1000;
     }
 
     // Record the region only after all pages are successfully mapped.
@@ -360,8 +367,9 @@ pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64
 /// Unmap pages that were successfully mapped during a partial guestMap.
 fn rollbackGuestMap(vm_obj: *Vm, guest_addr: u64, mapped_size: u64) void {
     var off: u64 = 0;
-    while (off < mapped_size) : (off += 0x1000) {
+    while (off < mapped_size) {
         arch.unmapGuestPage(vm_obj.arch_structures, guest_addr + off);
+        off += 0x1000;
     }
 }
 

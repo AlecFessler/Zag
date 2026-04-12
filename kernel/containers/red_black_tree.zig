@@ -93,8 +93,8 @@ pub fn RedBlackTree(
 
         /// Node color.
         pub const Color = enum {
-            Red,
-            Black,
+            red,
+            black,
 
             /// Summary:
             /// Returns the opposite color.
@@ -112,8 +112,8 @@ pub fn RedBlackTree(
             /// - None.
             fn flip(c: Color) Color {
                 return switch (c) {
-                    Color.Red => Color.Black,
-                    Color.Black => Color.Red,
+                    Color.red => Color.black,
+                    Color.black => Color.red,
                 };
             }
         };
@@ -171,7 +171,7 @@ pub fn RedBlackTree(
             fn create(allocator: std.mem.Allocator, data: T) !*Node {
                 const ptr = try allocator.create(Node);
                 ptr.* = .{
-                    .color = Color.Red,
+                    .color = Color.red,
                     .children = .{ null, null },
                     .parent = null,
                     .data = data,
@@ -485,14 +485,14 @@ pub fn RedBlackTree(
             if (parent) |p| {
                 std.debug.assert(p.getChild(dir) == null);
 
-                node.color = Color.Red;
+                node.color = Color.red;
                 p.setParentChildRelation(node, dir);
 
-                if (p.color == Color.Red) {
+                if (p.color == Color.red) {
                     self.insertFix(node);
                 }
             } else {
-                node.color = Color.Black;
+                node.color = Color.black;
                 self.root = node;
             }
             self.count += 1;
@@ -517,27 +517,27 @@ pub fn RedBlackTree(
         fn insertFix(self: *Self, node: *Node) void {
             var current = node;
             while (current.parent) |p| {
-                if (p.color == Color.Black) break;
+                if (p.color == Color.black) break;
 
                 var gp = current.getGrandparent() orelse break;
                 const uncle = current.getUncle();
                 const d = if (p == gp.getChild(Direction.left)) Direction.left else Direction.right;
 
                 if (uncle) |u| {
-                    if (u.color == Color.Red) {
-                        p.color = Color.Black;
-                        u.color = Color.Black;
-                        gp.color = Color.Red;
+                    if (u.color == Color.red) {
+                        p.color = Color.black;
+                        u.color = Color.black;
+                        gp.color = Color.red;
                         current = gp;
                     } else {
                         if (current == p.getChild(d.flip())) {
                             self.rotate(p, d);
                             current = p;
-                            current.parent.?.color = Color.Black;
+                            current.parent.?.color = Color.black;
                         } else {
-                            p.color = Color.Black;
+                            p.color = Color.black;
                         }
-                        gp.color = Color.Red;
+                        gp.color = Color.red;
                         self.rotate(gp, d.flip());
                         break;
                     }
@@ -545,17 +545,17 @@ pub fn RedBlackTree(
                     if (current == p.getChild(d.flip())) {
                         self.rotate(p, d);
                         current = p;
-                        current.parent.?.color = Color.Black;
+                        current.parent.?.color = Color.black;
                     } else {
-                        p.color = Color.Black;
+                        p.color = Color.black;
                     }
-                    gp.color = Color.Red;
+                    gp.color = Color.red;
                     self.rotate(gp, d.flip());
                     break;
                 }
             }
 
-            self.root.?.color = Color.Black;
+            self.root.?.color = Color.black;
         }
 
         /// Summary:
@@ -624,7 +624,7 @@ pub fn RedBlackTree(
                     self.root = child_replacement;
                     if (child_replacement) |r| {
                         r.parent = null;
-                        r.color = Color.Black;
+                        r.color = Color.black;
                     }
                 } else {
                     const direction_from_parent: Direction =
@@ -632,9 +632,9 @@ pub fn RedBlackTree(
 
                     parent_of_target.?.setParentChildRelation(child_replacement, direction_from_parent);
 
-                    if (target_node.color == Color.Black) {
+                    if (target_node.color == Color.black) {
                         if (child_replacement) |r| {
-                            if (r.color == Color.Red) r.color = Color.Black;
+                            if (r.color == Color.red) r.color = Color.black;
                         } else {
                             self.removeFix(parent_of_target.?, direction_from_parent);
                         }
@@ -674,12 +674,12 @@ pub fn RedBlackTree(
 
                 target_node.destroy(self.allocator);
 
-                if (original_color_of_successor == .Black) {
+                if (original_color_of_successor == .black) {
                     const double_black_parent: *Node = if (parent_of_successor) |pos| pos else successor_node;
                     const double_black_side: Direction = if (parent_of_successor != null) Direction.left else Direction.right;
                     if (replacement_subchild) |child| {
-                        if (child.color == .Red) {
-                            child.color = .Black;
+                        if (child.color == .red) {
+                            child.color = .black;
                         } else {
                             self.removeFix(double_black_parent, double_black_side);
                         }
@@ -720,16 +720,16 @@ pub fn RedBlackTree(
                 const deficit_node = current_parent.getChild(deficit_side);
 
                 if (deficit_node) |node_with_deficit| {
-                    if (node_with_deficit.color == .Red) {
-                        node_with_deficit.color = .Black;
+                    if (node_with_deficit.color == .red) {
+                        node_with_deficit.color = .black;
                         break;
                     }
                 }
 
                 const sibling_opt = current_parent.getChild(deficit_side.flip());
                 if (sibling_opt == null) {
-                    if (current_parent.color == .Red) {
-                        current_parent.color = Color.Black;
+                    if (current_parent.color == .red) {
+                        current_parent.color = Color.black;
                         break;
                     }
                     const grand_opt = current_parent.parent;
@@ -744,19 +744,19 @@ pub fn RedBlackTree(
                 const near_child = sibling.getChild(deficit_side);
                 const far_child = sibling.getChild(deficit_side.flip());
 
-                if (sibling.color == .Red) {
+                if (sibling.color == .red) {
                     self.rotate(current_parent, deficit_side);
-                    sibling.color = Color.Black;
-                    current_parent.color = Color.Red;
+                    sibling.color = Color.black;
+                    current_parent.color = Color.red;
                     continue;
                 } else {
-                    const far_is_red = if (far_child) |f| f.color == .Red else false;
-                    const near_is_red = if (near_child) |n| n.color == .Red else false;
+                    const far_is_red = if (far_child) |f| f.color == .red else false;
+                    const near_is_red = if (near_child) |n| n.color == .red else false;
 
                     if (!far_is_red and !near_is_red) {
-                        sibling.color = Color.Red;
-                        if (current_parent.color == .Red) {
-                            current_parent.color = Color.Black;
+                        sibling.color = Color.red;
+                        if (current_parent.color == .red) {
+                            current_parent.color = Color.black;
                             break;
                         }
                         const grand_opt = current_parent.parent;
@@ -767,20 +767,20 @@ pub fn RedBlackTree(
                         continue;
                     } else if (far_is_red) {
                         sibling.color = current_parent.color;
-                        current_parent.color = Color.Black;
-                        far_child.?.color = Color.Black;
+                        current_parent.color = Color.black;
+                        far_child.?.color = Color.black;
                         self.rotate(current_parent, deficit_side);
                         break;
                     } else {
-                        sibling.color = Color.Red;
-                        near_child.?.color = Color.Black;
+                        sibling.color = Color.red;
+                        near_child.?.color = Color.black;
                         self.rotate(sibling, deficit_side.flip());
                         continue;
                     }
                 }
             }
 
-            if (self.root) |root_node| root_node.color = Color.Black;
+            if (self.root) |root_node| root_node.color = Color.black;
         }
 
         /// Summary:
@@ -939,7 +939,7 @@ pub fn RedBlackTree(
                     std.debug.print("Reason: {s}\n", .{reason});
                     std.debug.print("Node @ {x}\n", .{@intFromPtr(node_ptr)});
                     std.debug.print("  data = {}\n", .{node_ptr.data});
-                    std.debug.print("  color = {s}\n", .{if (node_ptr.color == .Red) "Red" else "Black"});
+                    std.debug.print("  color = {s}\n", .{if (node_ptr.color == .red) "Red" else "Black"});
 
                     if (node_ptr.parent) |p| {
                         std.debug.print("  parent @ {x}, data = {}\n", .{ @intFromPtr(p), p.data });
@@ -1007,15 +1007,15 @@ pub fn RedBlackTree(
             }
 
             // Invariant: red node never has a red child
-            if (n.color == .Red) {
+            if (n.color == .red) {
                 if (n.getChild(.left)) |left| {
-                    if (left.color == .Red) {
+                    if (left.color == .red) {
                         fail.dump(n, "Red node has red left child");
                         return .{ .valid = false, .black_height = 0 };
                     }
                 }
                 if (n.getChild(.right)) |right| {
-                    if (right.color == .Red) {
+                    if (right.color == .red) {
                         fail.dump(n, "Red node has red right child");
                         return .{ .valid = false, .black_height = 0 };
                     }
@@ -1035,7 +1035,7 @@ pub fn RedBlackTree(
                 return .{ .valid = false, .black_height = 0 };
             }
 
-            const black_contribution: i32 = if (n.color == .Black) 1 else 0;
+            const black_contribution: i32 = if (n.color == .black) 1 else 0;
             return .{
                 .valid = true,
                 .black_height = left_result.black_height + black_contribution,
@@ -1123,50 +1123,50 @@ test "insertFix case 1: recoloring when uncle is red" {
 
     gp.* = .{
         .data = 10,
-        .color = .Black,
+        .color = .black,
         .children = .{ parent, uncle },
         .parent = null,
     };
     parent.* = .{
         .data = 5,
-        .color = .Red,
+        .color = .red,
         .children = .{ new_node, null },
         .parent = gp,
     };
     uncle.* = .{
         .data = 15,
-        .color = .Red,
+        .color = .red,
         .children = .{ null, null },
         .parent = gp,
     };
     new_node.* = .{
         .data = 2,
-        .color = .Red,
+        .color = .red,
         .children = .{ null, null },
         .parent = parent,
     };
 
     gp_expected.* = .{
         .data = 10,
-        .color = .Black,
+        .color = .black,
         .children = .{ parent_expected, uncle_expected },
         .parent = null,
     };
     parent_expected.* = .{
         .data = 5,
-        .color = .Black,
+        .color = .black,
         .children = .{ new_node_expected, null },
         .parent = gp_expected,
     };
     uncle_expected.* = .{
         .data = 15,
-        .color = .Black,
+        .color = .black,
         .children = .{ null, null },
         .parent = gp_expected,
     };
     new_node_expected.* = .{
         .data = 2,
-        .color = .Red,
+        .color = .red,
         .children = .{ null, null },
         .parent = parent_expected,
     };
@@ -1200,38 +1200,38 @@ test "insertFix case 2a: triangle (rotate parent)" {
 
     grand.* = .{
         .data = 10,
-        .color = .Black,
+        .color = .black,
         .children = .{ parent, null },
         .parent = null,
     };
     parent.* = .{
         .data = 5,
-        .color = .Red,
+        .color = .red,
         .children = .{ null, new_node },
         .parent = grand,
     };
     new_node.* = .{
         .data = 7,
-        .color = .Red,
+        .color = .red,
         .children = .{ null, null },
         .parent = parent,
     };
 
     grand_expected.* = .{
         .data = 7,
-        .color = .Black,
+        .color = .black,
         .children = .{ left_expected, right_expected },
         .parent = null,
     };
     left_expected.* = .{
         .data = 5,
-        .color = .Red,
+        .color = .red,
         .children = .{ null, null },
         .parent = grand_expected,
     };
     right_expected.* = .{
         .data = 10,
-        .color = .Red,
+        .color = .red,
         .children = .{ null, null },
         .parent = grand_expected,
     };
@@ -1265,38 +1265,38 @@ test "insertFix case 2b: line (rotate grandparent)" {
 
     grand.* = .{
         .data = 10,
-        .color = .Black,
+        .color = .black,
         .children = .{ parent, null },
         .parent = null,
     };
     parent.* = .{
         .data = 5,
-        .color = .Red,
+        .color = .red,
         .children = .{ new_node, null },
         .parent = grand,
     };
     new_node.* = .{
         .data = 2,
-        .color = .Red,
+        .color = .red,
         .children = .{ null, null },
         .parent = parent,
     };
 
     root_expected.* = .{
         .data = 5,
-        .color = .Black,
+        .color = .black,
         .children = .{ left_expected, right_expected },
         .parent = null,
     };
     left_expected.* = .{
         .data = 2,
-        .color = .Red,
+        .color = .red,
         .children = .{ null, null },
         .parent = root_expected,
     };
     right_expected.* = .{
         .data = 10,
-        .color = .Red,
+        .color = .red,
         .children = .{ null, null },
         .parent = root_expected,
     };
@@ -1325,26 +1325,26 @@ test "removeFix case 1: red sibling" {
 
     parent.* = .{
         .data = 10,
-        .color = .Black,
+        .color = .black,
         .children = .{ null, sibling },
         .parent = null,
     };
     sibling.* = .{
         .data = 15,
-        .color = .Red,
+        .color = .red,
         .children = .{ null, null },
         .parent = parent,
     };
 
     new_root.* = .{
         .data = 15,
-        .color = .Black,
+        .color = .black,
         .children = .{ left_of_root, null },
         .parent = null,
     };
     left_of_root.* = .{
         .data = 10,
-        .color = .Black,
+        .color = .black,
         .children = .{ null, null },
         .parent = new_root,
     };
@@ -1377,38 +1377,38 @@ test "removeFix case 2: black sibling, red far child" {
 
     parent.* = .{
         .data = 10,
-        .color = .Black,
+        .color = .black,
         .children = .{ null, sibling },
         .parent = null,
     };
     sibling.* = .{
         .data = 15,
-        .color = .Black,
+        .color = .black,
         .children = .{ null, far },
         .parent = parent,
     };
     far.* = .{
         .data = 20,
-        .color = .Red,
+        .color = .red,
         .children = .{ null, null },
         .parent = sibling,
     };
 
     new_root.* = .{
         .data = 15,
-        .color = .Black,
+        .color = .black,
         .children = .{ left, far_expected },
         .parent = null,
     };
     left.* = .{
         .data = 10,
-        .color = .Black,
+        .color = .black,
         .children = .{ null, null },
         .parent = new_root,
     };
     far_expected.* = .{
         .data = 20,
-        .color = .Black,
+        .color = .black,
         .children = .{ null, null },
         .parent = new_root,
     };
@@ -1441,38 +1441,38 @@ test "removeFix case 3: black sibling, red near child" {
 
     parent.* = .{
         .data = 10,
-        .color = .Black,
+        .color = .black,
         .children = .{ null, sibling },
         .parent = null,
     };
     sibling.* = .{
         .data = 15,
-        .color = .Black,
+        .color = .black,
         .children = .{ near, null },
         .parent = parent,
     };
     near.* = .{
         .data = 12,
-        .color = .Red,
+        .color = .red,
         .children = .{ null, null },
         .parent = sibling,
     };
 
     root_expected.* = .{
         .data = 12,
-        .color = .Black,
+        .color = .black,
         .children = .{ left_expected, right_expected },
         .parent = null,
     };
     left_expected.* = .{
         .data = 10,
-        .color = .Black,
+        .color = .black,
         .children = .{ null, null },
         .parent = root_expected,
     };
     right_expected.* = .{
         .data = 15,
-        .color = .Black,
+        .color = .black,
         .children = .{ null, null },
         .parent = root_expected,
     };
@@ -1501,26 +1501,26 @@ test "removeFix case 4: black sibling, black children" {
 
     parent.* = .{
         .data = 10,
-        .color = .Black,
+        .color = .black,
         .children = .{ null, sibling },
         .parent = null,
     };
     sibling.* = .{
         .data = 15,
-        .color = .Black,
+        .color = .black,
         .children = .{ null, null },
         .parent = parent,
     };
 
     parent_expected.* = .{
         .data = 10,
-        .color = .Black,
+        .color = .black,
         .children = .{ null, sibling_expected },
         .parent = null,
     };
     sibling_expected.* = .{
         .data = 15,
-        .color = .Red,
+        .color = .red,
         .children = .{ null, null },
         .parent = parent_expected,
     };
@@ -1569,7 +1569,7 @@ test "insert remove insert cycles maintain red-black tree invariants" {
     // Validate red-black tree invariants
     if (tree.root) |root| {
         // Invariant 1: Root is black
-        try std.testing.expect(root.color == .Black);
+        try std.testing.expect(root.color == .black);
 
         // Validate all invariants
         const result = Tree.validateRedBlackTree(

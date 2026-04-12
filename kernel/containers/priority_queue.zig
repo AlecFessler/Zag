@@ -4,7 +4,7 @@ const zag = @import("zag");
 const Priority = zag.sched.thread.Priority;
 const Thread = zag.sched.thread.Thread;
 
-const NUM_LEVELS = std.meta.fields(Priority).len;
+const num_levels = std.meta.fields(Priority).len;
 
 const Level = struct {
     head: ?*Thread = null,
@@ -12,7 +12,7 @@ const Level = struct {
 };
 
 pub const PriorityQueue = struct {
-    levels: [NUM_LEVELS]Level = [_]Level{.{}} ** NUM_LEVELS,
+    levels: [num_levels]Level = [_]Level{.{}} ** num_levels,
 
     pub fn enqueue(self: *PriorityQueue, thread: *Thread) void {
         std.debug.assert(thread.next == null);
@@ -28,7 +28,7 @@ pub const PriorityQueue = struct {
     }
 
     pub fn dequeue(self: *PriorityQueue) ?*Thread {
-        var idx: usize = NUM_LEVELS;
+        var idx: usize = num_levels;
         while (idx > 0) {
             idx -= 1;
             const level = &self.levels[idx];
@@ -69,7 +69,7 @@ pub const PriorityQueue = struct {
 
     pub fn peekHighestStealable(self: *const PriorityQueue, core_id: u6) ?*Thread {
         const core_bit = @as(u64, 1) << core_id;
-        var idx: usize = NUM_LEVELS;
+        var idx: usize = num_levels;
         while (idx > 0) {
             idx -= 1;
             if (idx == @intFromEnum(Priority.pinned)) continue;

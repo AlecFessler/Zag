@@ -358,7 +358,7 @@ fn writeUserStruct(proc: *Process, user_va: u64, data: []const u8) bool {
 fn mapKernelStack(stack: zag.memory.stack.Stack) !void {
     const pmm_iface = pmm.global_pmm.?.allocator();
     var page_addr = stack.base.addr;
-    while (page_addr < stack.top.addr) : (page_addr += paging.PAGE4K) {
+    while (page_addr < stack.top.addr) {
         const kpage = try pmm_iface.create(paging.PageMem(.page4k));
         @memset(std.mem.asBytes(kpage), 0);
         const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
@@ -369,5 +369,6 @@ fn mapKernelStack(stack: zag.memory.stack.Stack) !void {
             .global_perm = .global,
             .privilege_perm = .kernel,
         });
+        page_addr += paging.PAGE4K;
     }
 }
