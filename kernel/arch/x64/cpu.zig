@@ -178,10 +178,16 @@ pub fn cpuidRaw(leaf: u32, subleaf: u32) struct {
     return .{ .eax = a, .ebx = b, .ecx = c, .edx = d };
 }
 
+/// Intel SDM Vol 2B, "STI — Set Interrupt Flag" — sets RFLAGS.IF, enabling
+/// maskable hardware interrupts after the next instruction completes.
 pub fn enableInterrupts() void {
     asm volatile ("sti");
 }
 
+/// Intel SDM Vol 3A, Section 10.12.1 "Detecting and Enabling x2APIC Mode" —
+/// sets IA32_APIC_BASE[10] (x2APIC enable) and IA32_APIC_BASE[11] (APIC global
+/// enable), then programs the Spurious-Interrupt Vector Register via x2APIC MSR
+/// 80FH. Intel SDM Vol 3A, Section 10.9, Figure 10-23 (SVR layout).
 pub fn enableX2Apic(spurious_vector: u8) bool {
     std.debug.assert(spurious_vector >= 0x10);
 
@@ -217,6 +223,10 @@ pub fn hasPowerFeatureEdx(reg: u32, feat: CpuidPowerEdx) bool {
     return (reg & @intFromEnum(feat)) != 0;
 }
 
+/// Intel SDM Vol 2B, "RDTSC — Read Time-Stamp Counter" — loads EDX:EAX with
+/// the 64-bit TSC value. The preceding LFENCE serializes instruction retirement
+/// so no prior load reorders past the counter read.
+/// Intel SDM Vol 3B, Section 17.17 "Time-Stamp Counter"; §17.17.1 "Invariant TSC".
 pub fn rdtscLFenced() u64 {
     var a: u32 = 0;
     var d: u32 = 0;
@@ -230,6 +240,11 @@ pub fn rdtscLFenced() u64 {
     return (@as(u64, d) << 32) | a;
 }
 
+/// Intel SDM Vol 2B, "RDTSCP — Read Time-Stamp Counter and Processor ID" —
+/// atomically loads the TSC into EDX:EAX and the IA32_TSC_AUX MSR into ECX.
+/// Acts as a partial serializing instruction: all prior instructions must retire
+/// before the counter is sampled, but subsequent instructions may begin speculatively.
+/// Intel SDM Vol 3B, Section 17.17 "Time-Stamp Counter".
 pub fn rdtscp() u64 {
     var a: u32 = 0;
     var d: u32 = 0;
@@ -244,6 +259,10 @@ pub fn rdtscp() u64 {
     return (@as(u64, d) << 32) | a;
 }
 
+/// Intel SDM Vol 2B, "RDTSCP — Read Time-Stamp Counter and Processor ID" —
+/// samples the TSC after all prior instructions retire; the trailing LFENCE
+/// prevents subsequent loads from executing before the counter read completes.
+/// Intel SDM Vol 3B, Section 17.17 "Time-Stamp Counter".
 pub fn rdtscpLFenced() u64 {
     var a: u32 = 0;
     var d: u32 = 0;
@@ -259,6 +278,10 @@ pub fn rdtscpLFenced() u64 {
     return (@as(u64, d) << 32) | a;
 }
 
+/// Intel SDM Vol 3A, Section 2.3 "System Flags and Fields in the EFLAGS Register" —
+/// CR2 holds the 64-bit linear address that caused the most recent #PF exception.
+/// Intel SDM Vol 3A, Section 5.7 "Exceptions and Interrupts" — the page-fault
+/// handler reads CR2 before re-enabling interrupts to capture the faulting address.
 pub fn readCr2() u64 {
     var vaddr: u64 = 0;
     asm volatile ("mov %%cr2, %[addr]"
@@ -267,6 +290,9 @@ pub fn readCr2() u64 {
     return vaddr;
 }
 
+/// Intel SDM Vol 2A, "PUSHFQ" — saves RFLAGS to the stack; Vol 2A, "CLI/STI" —
+/// clears/sets RFLAGS.IF (bit 9). Together these implement a save-and-restore
+/// critical-section bracket. Intel SDM Vol 3A, Section 2.3 (RFLAGS.IF definition).
 pub fn restoreInterrupts(saved_rflags: u64) void {
     const IF: u64 = 1 << 9;
     if ((saved_rflags & IF) != 0) {
@@ -276,6 +302,10 @@ pub fn restoreInterrupts(saved_rflags: u64) void {
     }
 }
 
+/// Intel SDM Vol 2A, "PUSHFQ" / "CLI" — atomically captures RFLAGS (including
+/// IF bit 9) then clears the interrupt flag. Caller must pass the returned value
+/// to `restoreInterrupts` to re-arm interrupts only if they were previously enabled.
+/// Intel SDM Vol 3A, Section 2.3 (RFLAGS layout).
 pub fn saveAndDisableInterrupts() u64 {
     var rflags: u64 = 0;
     asm volatile ("pushfq; pop %[out]"
@@ -285,6 +315,11 @@ pub fn saveAndDisableInterrupts() u64 {
     return rflags;
 }
 
+/// Intel SDM Vol 2A, "INVLPG — Invalidate TLB Entry" — invalidates any TLB
+/// entries covering the 4-KByte page that contains `vaddr`, including global
+/// entries (regardless of CR4.PGE). Also invalidates paging-structure caches.
+/// Intel SDM Vol 3A, Section 4.10.4.1 "Operations that Invalidate TLBs and
+/// Paging-Structure Caches".
 pub fn invlpg(vaddr: u64) void {
     asm volatile (
         \\invlpg (%[a])
@@ -332,6 +367,9 @@ pub fn qemuShutdown() noreturn {
     unreachable;
 }
 
+/// Intel SDM Vol 3A, Section 2.5 "Control Registers" — CR3 holds the physical
+/// base address of the top-level paging structure (PML4 with 4-level paging).
+/// Intel SDM Vol 3A, Table 4-12 "Use of CR3 with 4-Level Paging and CR4.PCIDE=0".
 pub fn readCr3() u64 {
     var value: u64 = 0;
     asm volatile ("mov %%cr3, %[out]"
@@ -340,6 +378,9 @@ pub fn readCr3() u64 {
     return value;
 }
 
+/// Intel SDM Vol 3A, Section 4.10.4.1 — MOV to CR3 invalidates all TLB entries
+/// except global pages (CR4.PGE=1) and reloads the page-directory base.
+/// Intel SDM Vol 3A, Table 4-12 "Use of CR3 with 4-Level Paging and CR4.PCIDE=0".
 pub fn writeCr3(value: u64) void {
     asm volatile ("mov %[val], %%cr3"
         :
@@ -347,6 +388,9 @@ pub fn writeCr3(value: u64) void {
     );
 }
 
+/// Intel SDM Vol 2A, "IN — Input from Port" / "OUT — Output to Port" —
+/// byte (8-bit), word (16-bit), and doubleword (32-bit) variants of the x86
+/// port I/O instructions. Port address is supplied in DX; data in AL/AX/EAX.
 pub fn inb(port: u16) u8 {
     return asm volatile (
         \\inb %[port], %[ret]
@@ -398,6 +442,11 @@ pub fn outd(value: u32, port: u16) void {
         : .{ .dx = true });
 }
 
+/// Intel SDM Vol 2A, "LGDT/LIDT — Load Global/Interrupt Descriptor Table Register" —
+/// loads the GDTR or IDTR from a 10-byte memory operand (2-byte limit, 8-byte base).
+/// Intel SDM Vol 2B, "LTR — Load Task Register" — loads the TR from a 16-bit
+/// selector; marks the TSS descriptor in the GDT as busy.
+/// Intel SDM Vol 3A, Section 3.5.1 "Segment Descriptor Tables" (GDTR/IDTR format).
 pub fn lgdt(desc: *const anyopaque) void {
     asm volatile (
         \\lgdt (%[ptr])
@@ -422,6 +471,11 @@ pub fn lidt(desc: *const anyopaque) void {
     );
 }
 
+/// Intel SDM Vol 2B, "WRMSR — Write to Model Specific Register" — writes EDX:EAX
+/// to the MSR specified in ECX. Raises #GP(0) if the MSR is unimplemented or the
+/// value violates reserved-bit constraints.
+/// Intel SDM Vol 2A, "RDMSR — Read from Model Specific Register" — loads the MSR
+/// in ECX into EDX:EAX. Intel SDM Vol 3A, Section 9.4 "Model-Specific Registers".
 pub fn wrmsr(msr: u32, value: u64) void {
     const lo: u32 = @truncate(value);
     const hi: u32 = @truncate(value >> 32);
@@ -450,6 +504,10 @@ const IA32_PAT: u32 = 0x277;
 // PAT0=WB, PAT1=WT, PAT2=UC-, PAT3=UC, PAT4=WB, PAT5=WC, PAT6=UC-, PAT7=UC
 const PAT_VALUE: u64 = 0x00070106_00070406;
 
+/// Intel SDM Vol 3A, Section 11.12 "Page Attribute Table (PAT)" — programs
+/// IA32_PAT MSR (277H) with eight 3-bit memory-type fields (PAT0–PAT7).
+/// The PAT index for a page is formed by {PAT, PCD, PWT} bits in the PTE.
+/// Intel SDM Vol 3A, Table 11-10 "Selection of PAT Entries with PAT, PCD, and PWT Flags".
 pub fn initPat() void {
     wrmsr(IA32_PAT, PAT_VALUE);
 }
@@ -483,6 +541,10 @@ pub fn initSyscall(entry: u64) void {
     wrmsr(ia32_efer, efer);
 }
 
+/// Intel SDM Vol 3A, Section 2.5 "Control Registers" — sets CR0.AM (bit 18),
+/// which enables alignment check exceptions (#AC, vector 17) when RFLAGS.AC is
+/// also set and the current privilege level is 3. Without CR0.AM the RFLAGS.AC
+/// bit has no effect. Intel SDM Vol 3A, Table 2-2 "System Flags and Fields in CR0".
 pub fn enableAlignmentCheck() void {
     var cr0 = asm ("mov %%cr0, %[cr0]"
         : [cr0] "=r" (-> u64),
