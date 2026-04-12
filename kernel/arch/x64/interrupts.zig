@@ -48,15 +48,15 @@ const VectorEntry = struct {
 
 const Handler = *const fn (*cpu.Context) void;
 
-pub const STUBS: [256]interruptHandler = blk: {
+pub const stubs: [256]interruptHandler = blk: {
     var arr: [256]interruptHandler = undefined;
     for (0..256) |i| {
-        arr[i] = getInterruptStub(i, PUSHES_ERR[i]);
+        arr[i] = getInterruptStub(i, pushes_err[i]);
     }
     break :blk arr;
 };
 
-const PUSHES_ERR = blk: {
+const pushes_err = blk: {
     var a: [256]bool = .{false} ** 256;
     a[8] = true;
     a[10] = true;
@@ -84,8 +84,8 @@ pub var per_cpu_scratch: [64]SyscallScratch = [_]SyscallScratch{.{ .kernel_rsp =
 /// Set KernelGsBase MSR for this core so SWAPGS can access per-CPU scratch.
 /// Must be called on each core during init, after APIC is available.
 pub fn initSyscallScratch(core_id: u64) void {
-    const IA32_KERNEL_GS_BASE: u32 = 0xC0000102;
-    cpu.wrmsr(IA32_KERNEL_GS_BASE, @intFromPtr(&per_cpu_scratch[core_id]));
+    const ia32_kernel_gs_base: u32 = 0xC0000102;
+    cpu.wrmsr(ia32_kernel_gs_base, @intFromPtr(&per_cpu_scratch[core_id]));
 }
 
 /// Update per-CPU scratch kernel_rsp. Called from switchTo on every
@@ -237,7 +237,7 @@ pub fn prepareThreadContext(
     // Undo the -8 from alignStack:
     const raw_top: u64 = (kstack_top.addr + 8 + 15) & ~@as(u64, 15);
     const ctx_addr: u64 = raw_top - @sizeOf(cpu.Context);
-    const fxsave_addr: u64 = ctx_addr - cpu.FXSAVE_SIZE;
+    const fxsave_addr: u64 = ctx_addr - cpu.fxsave_size;
     var ctx: *cpu.Context = @ptrFromInt(ctx_addr);
 
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
@@ -245,7 +245,7 @@ pub fn prepareThreadContext(
     // Zero the entire region (FXSAVE area + Context) to avoid movaps
     // alignment issues and to give a clean initial SSE state.
     const full_bytes: [*]u8 = @ptrFromInt(fxsave_addr);
-    @memset(full_bytes[0 .. cpu.FXSAVE_SIZE + @sizeOf(cpu.Context)], 0);
+    @memset(full_bytes[0 .. cpu.fxsave_size + @sizeOf(cpu.Context)], 0);
 
     // Set FXSAVE defaults: FCW=0x037F (mask all FPU exceptions),
     // MXCSR=0x1F80 (mask all SSE exceptions, round-to-nearest)
@@ -297,10 +297,10 @@ pub fn switchTo(thread: *Thread) void {
     );
 }
 
-pub fn getInterruptStub(comptime int_num: u8, comptime pushes_err: bool) interruptHandler {
+pub fn getInterruptStub(comptime int_num: u8, comptime does_push_err: bool) interruptHandler {
     return struct {
         fn stub() callconv(.naked) void {
-            if (pushes_err) {
+            if (does_push_err) {
                 asm volatile (
                     \\pushq %[num]
                     \\jmp interruptStubPrologue

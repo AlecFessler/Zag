@@ -88,7 +88,7 @@ pub fn init() void {
         };
         idt.openInterruptGate(
             @intCast(i),
-            interrupts.STUBS[i],
+            interrupts.stubs[i],
             gdt.KERNEL_CODE_OFFSET,
             privilege,
             GateType.interrupt_gate,

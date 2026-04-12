@@ -21,7 +21,7 @@ const VAddr = zag.memory.address.VAddr;
 /// vectors reserved by the architecture.
 /// Intel SDM Vol 3A, §7.2 "Exception and Interrupt Vectors", Table 7-1 — vectors
 /// 0-31 are reserved for exceptions; external device interrupts start at vector 32.
-const NUM_IRQ_ENTRIES = 16;
+const num_irq_entries = 16;
 
 var spurious_interrupts: u64 = 0;
 
@@ -38,10 +38,10 @@ var ioapic_lock: SpinLock = .{};
 /// shootdown IPI vector, and the scheduler timer vector.
 pub fn init() void {
     const offset = exceptions.NUM_ISR_ENTRIES;
-    for (offset..offset + NUM_IRQ_ENTRIES) |i| {
+    for (offset..offset + num_irq_entries) |i| {
         idt.openInterruptGate(
             @intCast(i),
-            interrupts.STUBS[i],
+            interrupts.stubs[i],
             gdt.KERNEL_CODE_OFFSET,
             PrivilegeLevel.ring_0,
             GateType.interrupt_gate,
@@ -55,7 +55,7 @@ pub fn init() void {
     const spurious_int_vec = @intFromEnum(interrupts.IntVecs.spurious);
     idt.openInterruptGate(
         @intCast(spurious_int_vec),
-        interrupts.STUBS[spurious_int_vec],
+        interrupts.stubs[spurious_int_vec],
         gdt.KERNEL_CODE_OFFSET,
         PrivilegeLevel.ring_0,
         GateType.interrupt_gate,
@@ -69,7 +69,7 @@ pub fn init() void {
     const tlb_vec = @intFromEnum(interrupts.IntVecs.tlb_shootdown);
     idt.openInterruptGate(
         tlb_vec,
-        interrupts.STUBS[tlb_vec],
+        interrupts.stubs[tlb_vec],
         gdt.KERNEL_CODE_OFFSET,
         PrivilegeLevel.ring_0,
         GateType.interrupt_gate,
@@ -83,7 +83,7 @@ pub fn init() void {
     const sched_int_vec = @intFromEnum(interrupts.IntVecs.sched);
     idt.openInterruptGate(
         @intCast(sched_int_vec),
-        interrupts.STUBS[sched_int_vec],
+        interrupts.stubs[sched_int_vec],
         gdt.KERNEL_CODE_OFFSET,
         PrivilegeLevel.ring_0,
         GateType.interrupt_gate,

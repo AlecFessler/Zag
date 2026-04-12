@@ -60,8 +60,9 @@ const RunQueue = struct {
 pub fn coreRunning(thread: *Thread) ?u64 {
     const count = arch.coreCount();
     var i: u64 = 0;
-    while (i < count) : (i += 1) {
+    while (i < count) {
         if (@atomicLoad(?*Thread, &core_states[i].running_thread, .acquire) == thread) return i;
+        i += 1;
     }
     return null;
 }
@@ -95,12 +96,13 @@ inline fn switchToWithPmu(outgoing: *Thread, next: *Thread) void {
 pub fn removeFromAnyRunQueue(thread: *Thread) void {
     const count = arch.coreCount();
     var i: u64 = 0;
-    while (i < count) : (i += 1) {
+    while (i < count) {
         const state = &core_states[i];
         const irq = state.rq_lock.lockIrqSave();
         const removed = state.rq.remove(thread);
         state.rq_lock.unlockIrqRestore(irq);
         if (removed) return;
+        i += 1;
     }
 }
 
@@ -197,16 +199,22 @@ fn tryStealWork(my_core_id: u64) ?*Thread {
 
     // Retry loop in case peek succeeds but removal fails (race with another stealer)
     var attempts: u32 = 0;
-    while (attempts < 3) : (attempts += 1) {
+    while (attempts < 3) {
         var best_thread: ?*Thread = null;
         var best_core: u64 = 0;
 
         // Peek across all non-pinned cores for the highest priority stealable thread
         var i: u64 = 0;
-        while (i < count) : (i += 1) {
-            if (i == my_core_id) continue;
+        while (i < count) {
+            if (i == my_core_id) {
+                i += 1;
+                continue;
+            }
             // Skip pinned cores
-            if (pinned & (@as(u64, 1) << @intCast(i)) != 0) continue;
+            if (pinned & (@as(u64, 1) << @intCast(i)) != 0) {
+                i += 1;
+                continue;
+            }
             const candidate = core_states[i].rq.pq.peekHighestStealable(@intCast(my_core_id));
             if (candidate) |c| {
                 if (best_thread == null) {
@@ -217,6 +225,7 @@ fn tryStealWork(my_core_id: u64) ?*Thread {
                     best_core = i;
                 }
             }
+            i += 1;
         }
 
         const steal_target = best_thread orelse return null;
@@ -229,6 +238,7 @@ fn tryStealWork(my_core_id: u64) ?*Thread {
 
         if (removed) return steal_target;
         // Race: thread was scheduled or stolen by someone else, retry
+        attempts += 1;
     }
     return null;
 }
@@ -471,13 +481,22 @@ fn migrateThreadsOff(state: *PerCoreState, pinned_core: u64) void {
     while (state.rq.dequeue()) |t| {
         // Find an unpinned core to enqueue this thread on
         var target: u64 = 0;
-        while (target < count) : (target += 1) {
-            if (target == pinned_core) continue;
+        while (target < count) {
+            if (target == pinned_core) {
+                target += 1;
+                continue;
+            }
             const target_bit = @as(u64, 1) << @intCast(target);
-            if (pinned_cores.load(.acquire) & target_bit != 0) continue;
+            if (pinned_cores.load(.acquire) & target_bit != 0) {
+                target += 1;
+                continue;
+            }
             // If thread has affinity, respect it
             if (t.core_affinity) |aff| {
-                if (aff & target_bit == 0) continue;
+                if (aff & target_bit == 0) {
+                    target += 1;
+                    continue;
+                }
             }
             break;
         }
@@ -495,11 +514,20 @@ fn migrateToEligibleCore(thread: *Thread, exclude_core: u64) void {
     const count = arch.coreCount();
     const pinned = pinned_cores.load(.acquire);
     var target: u64 = 0;
-    while (target < count) : (target += 1) {
-        if (target == exclude_core) continue;
-        if (pinned & (@as(u64, 1) << @intCast(target)) != 0) continue;
+    while (target < count) {
+        if (target == exclude_core) {
+            target += 1;
+            continue;
+        }
+        if (pinned & (@as(u64, 1) << @intCast(target)) != 0) {
+            target += 1;
+            continue;
+        }
         if (thread.core_affinity) |aff| {
-            if (aff & (@as(u64, 1) << @intCast(target)) == 0) continue;
+            if (aff & (@as(u64, 1) << @intCast(target)) == 0) {
+                target += 1;
+                continue;
+            }
         }
         break;
     }
@@ -549,10 +577,16 @@ pub fn enqueueOnCore(core_index: u64, thread: *Thread) void {
             // Find an unpinned core
             const count = arch.coreCount();
             var i: u64 = 0;
-            while (i < count) : (i += 1) {
-                if (pinned & (@as(u64, 1) << @intCast(i)) != 0) continue;
+            while (i < count) {
+                if (pinned & (@as(u64, 1) << @intCast(i)) != 0) {
+                    i += 1;
+                    continue;
+                }
                 if (thread.core_affinity) |aff| {
-                    if (aff & (@as(u64, 1) << @intCast(i)) == 0) continue;
+                    if (aff & (@as(u64, 1) << @intCast(i)) == 0) {
+                        i += 1;
+                        continue;
+                    }
                 }
                 target = i;
                 break;
@@ -585,11 +619,12 @@ fn pickCoreForThread(thread: *Thread, current_core: u64) ?u64 {
     }
     const count = arch.coreCount();
     var i: u64 = 0;
-    while (i < count) : (i += 1) {
+    while (i < count) {
         const bit = @as(u64, 1) << @intCast(i);
         if (mask & bit != 0 and core_states[i].pinned_thread == null) {
             return i;
         }
+        i += 1;
     }
     return null;
 }

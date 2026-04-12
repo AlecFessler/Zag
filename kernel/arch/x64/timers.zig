@@ -133,7 +133,7 @@ pub const Lapic = struct {
         var estimate: u64 = 0;
 
         for (0..3) |i| {
-            if (apic.x2Apic) {
+            if (apic.x2_apic) {
                 cpu.wrmsr(
                     @intFromEnum(apic.X2ApicMsr.timer_initial_count_register),
                     0xFFFF_FFFF,
@@ -147,14 +147,14 @@ pub const Lapic = struct {
             const target_ns = timer_mod.TEN_MILLION_NS;
             while ((now_ns - start_ns) < target_ns) now_ns = hpet_iface.now();
 
-            const cur: u64 = if (apic.x2Apic)
+            const cur: u64 = if (apic.x2_apic)
                 cpu.rdmsr(@intFromEnum(apic.X2ApicMsr.timer_current_count_register))
             else
                 apic.readReg(.curr_count_reg);
 
             const elapsed: u64 = 0xFFFF_FFFF - cur;
 
-            if (apic.x2Apic) {
+            if (apic.x2_apic) {
                 cpu.wrmsr(
                     @intFromEnum(apic.X2ApicMsr.timer_initial_count_register),
                     0,

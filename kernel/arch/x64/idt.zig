@@ -44,10 +44,10 @@ pub const interruptHandler = *const fn () callconv(.naked) void;
 
 /// Intel SDM Vol 3A §7.10 — The IDT can contain up to 256 entries,
 /// one per interrupt/exception vector.
-const NUM_IDT_ENTRIES: u64 = 256;
-const TABLE_SIZE: u16 = @sizeOf(IDTEntry) * NUM_IDT_ENTRIES - 1;
+const num_idt_entries: u64 = 256;
+const table_size: u16 = @sizeOf(IDTEntry) * num_idt_entries - 1;
 
-var idt: [NUM_IDT_ENTRIES]IDTEntry = [_]IDTEntry{.{
+var idt: [num_idt_entries]IDTEntry = [_]IDTEntry{.{
     .isr_base_low = 0,
     .code_segment = 0,
     .gate_type = .interrupt_gate,
@@ -56,10 +56,10 @@ var idt: [NUM_IDT_ENTRIES]IDTEntry = [_]IDTEntry{.{
     .present = false,
     .isr_base_mid = 0,
     .isr_base_high = 0,
-}} ** NUM_IDT_ENTRIES;
+}} ** num_idt_entries;
 
 pub var idt_ptr: IDTPtr = .{
-    .limit = TABLE_SIZE,
+    .limit = table_size,
     .base = 0,
 };
 
@@ -75,7 +75,7 @@ pub fn openInterruptGate(
     privilege: PrivilegeLevel,
     gate_type: GateType,
 ) void {
-    std.debug.assert(int_num < NUM_IDT_ENTRIES);
+    std.debug.assert(int_num < num_idt_entries);
     std.debug.assert(idt[int_num].present == false);
 
     const addr = @intFromPtr(handler);

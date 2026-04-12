@@ -3,6 +3,7 @@ const zag = @import("zag");
 
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
+const kvm = zag.kvm;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
@@ -10,7 +11,6 @@ const stack_mod = zag.memory.stack;
 
 const ArchCpuContext = zag.arch.dispatch.ArchCpuContext;
 const FaultReason = zag.perms.permissions.FaultReason;
-const kvm = zag.kvm;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const Process = zag.proc.process.Process;
@@ -217,31 +217,34 @@ fn mapKernelStack(stack: Stack) !void {
     errdefer {
         var undo = stack.base.addr;
         var i: usize = 0;
-        while (i < mapped) : (i += 1) {
+        while (i < mapped) {
             if (arch.unmapPage(memory_init.kernel_addr_space_root, VAddr.fromInt(undo))) |paddr| {
                 const pg: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
                 pmm_iface.destroy(pg);
             }
             undo += paging.PAGE4K;
+            i += 1;
         }
     }
-    while (page_addr < stack.top.addr) : (page_addr += paging.PAGE4K) {
+    while (page_addr < stack.top.addr) {
         const kpage = try pmm_iface.create(paging.PageMem(.page4k));
         @memset(std.mem.asBytes(kpage), 0);
         const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
         try arch.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS);
         mapped += 1;
+        page_addr += paging.PAGE4K;
     }
 }
 
 fn unmapKernelStack(stack: Stack) void {
     const pmm_iface = pmm.global_pmm.?.allocator();
     var page_addr = stack.base.addr;
-    while (page_addr < stack.top.addr) : (page_addr += paging.PAGE4K) {
+    while (page_addr < stack.top.addr) {
         if (arch.unmapPage(memory_init.kernel_addr_space_root, VAddr.fromInt(page_addr))) |paddr| {
             const pg: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
             pmm_iface.destroy(pg);
         }
+        page_addr += paging.PAGE4K;
     }
 }
 

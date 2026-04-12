@@ -89,7 +89,7 @@ pub fn smpInit() !void {
 
         var page_addr = ap_stack.base.addr;
         var map_ok = true;
-        while (page_addr < ap_stack.top.addr) : (page_addr += paging.PAGE4K) {
+        while (page_addr < ap_stack.top.addr) {
             const kpage = pmm_iface.create(paging.PageMem(.page4k)) catch {
                 map_ok = false;
                 break;
@@ -101,6 +101,7 @@ pub fn smpInit() !void {
                 map_ok = false;
                 break;
             };
+            page_addr += paging.PAGE4K;
         }
 
         if (!map_ok) {
@@ -141,7 +142,7 @@ fn coreInit() callconv(.c) noreturn {
     gdt.reloadSegments();
     cpu.lidt(&idt.idt_ptr);
 
-    if (apic.x2Apic) {
+    if (apic.x2_apic) {
         _ = cpu.enableX2Apic(@intFromEnum(interrupts.IntVecs.spurious));
     } else {
         apic.enableSpuriousVector(@intFromEnum(interrupts.IntVecs.spurious));

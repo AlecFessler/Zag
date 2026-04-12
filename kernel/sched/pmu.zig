@@ -336,7 +336,7 @@ fn readConfigs(
 
     // §4.51.7 / §4.51.8: per-entry validation.
     var i: usize = 0;
-    while (i < count) : (i += 1) {
+    while (i < count) {
         const cfg = out_buf[i];
         // `PmuEvent` is an open `enum(u8)`, so userspace can pass any value
         // 0..255. `supported_events` is a u64 bitmask (bit i = variant i), so
@@ -348,6 +348,7 @@ fn readConfigs(
         const event_bit = @as(u64, 1) << ev_bit_idx;
         if ((info.supported_events & event_bit) == 0) return ConfigReadError.Invalid;
         if (cfg.has_threshold and !info.overflow_support) return ConfigReadError.Invalid;
+        i += 1;
     }
     return out_buf[0..@intCast(count)];
 }

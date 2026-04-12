@@ -2,6 +2,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const futex_mod = zag.proc.futex;
 const sched = zag.sched.scheduler;
 
 const PriorityQueue = zag.containers.priority_queue.PriorityQueue;
@@ -72,7 +73,6 @@ pub const NotificationBox = struct {
             thread.futex_deadline_ns = now_ns + timeout_ns;
             thread.notification_waiter = true;
             // Use the futex timed-waiter infrastructure.
-            const futex_mod = zag.proc.futex;
             if (!futex_mod.addTimedWaiterPublic(thread)) {
                 // No timed waiter slots available; wake immediately with timeout.
                 thread.state = .ready;
@@ -100,7 +100,6 @@ pub const NotificationBox = struct {
         }
         if (deadline != 0) {
             thread.futex_deadline_ns = 0;
-            const futex_mod = zag.proc.futex;
             futex_mod.removeTimedWaiterPublic(thread);
         }
 

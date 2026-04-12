@@ -156,7 +156,7 @@ pub fn sysSysInfo(proc: *Process, info_ptr: u64, cores_ptr: u64) i64 {
     // SysInfo.core_count"); this matches the scheduler's `MAX_CORES`.
     var entries: [MAX_CORES]CoreInfo = undefined;
     var i: u64 = 0;
-    while (i < core_count and i < MAX_CORES) : (i += 1) {
+    while (i < core_count and i < MAX_CORES) {
         const acct = scheduler.perCoreReadAndResetAccounting(i);
         entries[i] = .{
             .idle_ns = acct.idle_ns,
@@ -165,6 +165,7 @@ pub fn sysSysInfo(proc: *Process, info_ptr: u64, cores_ptr: u64) i64 {
             .temp_mc = arch.getCoreTemp(i),
             .c_state = arch.getCoreState(i),
         };
+        i += 1;
     }
 
     // If this final write fails (late page-out after up-front

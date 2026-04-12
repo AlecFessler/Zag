@@ -108,7 +108,7 @@ pub const Context = packed struct {
 
 /// Size of FXSAVE area allocated below Context on kernel stack.
 /// FXSAVE/FXRSTOR is handled in assembly prologue/epilogue.
-pub const FXSAVE_SIZE: u64 = 512;
+pub const fxsave_size: u64 = 512;
 
 pub const Registers = packed struct {
     r15: u64,
@@ -189,18 +189,18 @@ pub fn enableX2Apic(spurious_vector: u8) bool {
     if (!hasFeatureEdx(feat.edx, .lapic)) return false;
     if (!hasFeatureEcx(feat.ecx, .x2apic)) return false;
 
-    const IA32_APIC_BASE: u32 = 0x1B;
-    const APIC_EN: u64 = 1 << 11;
-    const X2APIC_EN: u64 = 1 << 10;
+    const ia32_apic_base: u32 = 0x1B;
+    const apic_en: u64 = 1 << 11;
+    const x2apic_en: u64 = 1 << 10;
 
-    var apic_base = rdmsr(IA32_APIC_BASE);
-    apic_base |= (APIC_EN | X2APIC_EN);
-    wrmsr(IA32_APIC_BASE, apic_base);
+    var apic_base = rdmsr(ia32_apic_base);
+    apic_base |= (apic_en | x2apic_en);
+    wrmsr(ia32_apic_base, apic_base);
 
-    const X2APIC_SVR: u32 = 0x80F;
-    const SVR_APIC_ENABLE: u64 = 1 << 8;
-    const svr_value: u64 = SVR_APIC_ENABLE | (@as(u64, spurious_vector));
-    wrmsr(X2APIC_SVR, svr_value);
+    const x2apic_svr: u32 = 0x80F;
+    const svr_apic_enable: u64 = 1 << 8;
+    const svr_value: u64 = svr_apic_enable | (@as(u64, spurious_vector));
+    wrmsr(x2apic_svr, svr_value);
 
     return true;
 }
@@ -316,10 +316,10 @@ pub fn qemuShutdown() noreturn {
     // Shift Register are empty, i.e. the wire is actually idle.
     // COM1's LSR is at 0x3F8 + 5 = 0x3FD; drain is bounded so a
     // wedged UART can't hang the shutdown path forever.
-    const COM1_LSR: u16 = 0x3FD;
-    const TRANSMITTER_EMPTY: u8 = 0b0100_0000;
+    const com1_lsr: u16 = 0x3FD;
+    const transmitter_empty: u8 = 0b0100_0000;
     var spins: u32 = 0;
-    while ((inb(COM1_LSR) & TRANSMITTER_EMPTY) == 0) {
+    while ((inb(com1_lsr) & transmitter_empty) == 0) {
         spins += 1;
         if (spins >= 10_000_000) break;
     }
@@ -467,20 +467,20 @@ pub fn initPat() void {
 /// FMASK        = RFLAGS bits cleared on SYSCALL: IF(9), DF(10), AC(18).
 /// EFER.SCE     = bit 0, enables SYSCALL/SYSRET instructions.
 pub fn initSyscall(entry: u64) void {
-    const IA32_STAR: u32 = 0xC0000081;
-    const IA32_LSTAR: u32 = 0xC0000082;
-    const IA32_FMASK: u32 = 0xC0000084;
-    const IA32_EFER: u32 = 0xC0000080;
+    const ia32_star: u32 = 0xC0000081;
+    const ia32_lstar: u32 = 0xC0000082;
+    const ia32_fmask: u32 = 0xC0000084;
+    const ia32_efer: u32 = 0xC0000080;
 
     const kernel_cs: u64 = 0x08;
     const sysret_base: u64 = 0x10;
-    wrmsr(IA32_STAR, (sysret_base << 48) | (kernel_cs << 32));
-    wrmsr(IA32_LSTAR, entry);
-    wrmsr(IA32_FMASK, (1 << 9) | (1 << 10) | (1 << 18)); // IF | DF | AC
+    wrmsr(ia32_star, (sysret_base << 48) | (kernel_cs << 32));
+    wrmsr(ia32_lstar, entry);
+    wrmsr(ia32_fmask, (1 << 9) | (1 << 10) | (1 << 18)); // IF | DF | AC
 
-    var efer = rdmsr(IA32_EFER);
+    var efer = rdmsr(ia32_efer);
     efer |= (1 << 0); // SCE
-    wrmsr(IA32_EFER, efer);
+    wrmsr(ia32_efer, efer);
 }
 
 pub fn enableAlignmentCheck() void {
@@ -510,10 +510,10 @@ pub fn enableAlignmentCheck() void {
 /// CR4 bit assignments: Intel SDM Vol 3A §2.5.
 pub fn enableSmapSmep() void {
     const feat = cpuidRaw(0x7, 0);
-    const SMEP_BIT: u32 = 1 << 7;
-    const SMAP_BIT: u32 = 1 << 20;
-    const has_smep = (feat.ebx & SMEP_BIT) != 0;
-    const has_smap = (feat.ebx & SMAP_BIT) != 0;
+    const smep_bit: u32 = 1 << 7;
+    const smap_bit: u32 = 1 << 20;
+    const has_smep = (feat.ebx & smep_bit) != 0;
+    const has_smap = (feat.ebx & smap_bit) != 0;
 
     var cr4 = asm ("mov %%cr4, %[cr4]"
         : [cr4] "=r" (-> u64),
@@ -557,18 +557,18 @@ pub inline fn clac() void {
 /// Intel SDM Vol 3A §4.10.1; AMD APM Vol 2 §3.2.8.
 pub fn enableSpeculationBarriers() void {
     const feat = cpuidRaw(0x7, 0);
-    const IBRS_BIT: u32 = 1 << 26;
-    const STIBP_BIT: u32 = 1 << 27;
-    const has_ibrs = (feat.edx & IBRS_BIT) != 0;
-    const has_stibp = (feat.edx & STIBP_BIT) != 0;
+    const ibrs_bit: u32 = 1 << 26;
+    const stibp_bit: u32 = 1 << 27;
+    const has_ibrs = (feat.edx & ibrs_bit) != 0;
+    const has_stibp = (feat.edx & stibp_bit) != 0;
 
     if (!has_ibrs and !has_stibp) return;
 
-    const IA32_SPEC_CTRL: u32 = 0x48;
+    const ia32_spec_ctrl: u32 = 0x48;
     var spec_ctrl: u64 = 0;
     if (has_ibrs) spec_ctrl |= (1 << 0); // IBRS
     if (has_stibp) spec_ctrl |= (1 << 1); // STIBP
-    wrmsr(IA32_SPEC_CTRL, spec_ctrl);
+    wrmsr(ia32_spec_ctrl, spec_ctrl);
 }
 
 /// Execute RDRAND and return a 64-bit hardware random value, or null if the

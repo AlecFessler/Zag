@@ -223,7 +223,7 @@ pub fn pmuInit() void {
     interrupts.registerVector(PMI_VECTOR, pmuPmiHandler, .external);
     idt.openInterruptGate(
         PMI_VECTOR,
-        interrupts.STUBS[PMI_VECTOR],
+        interrupts.stubs[PMI_VECTOR],
         zag.arch.x64.gdt.KERNEL_CODE_OFFSET,
         .ring_0,
         .interrupt_gate,
@@ -245,7 +245,7 @@ pub fn pmuInit() void {
 /// harmless even though counters can never overflow.
 pub fn pmuPerCoreInit() void {
     if (cached_info.num_counters == 0) return;
-    if (apic.x2Apic) {
+    if (apic.x2_apic) {
         const lvt_val: u64 = PMI_VECTOR; // delivery mode = fixed (0), mask = 0
         cpu.wrmsr(
             @intFromEnum(apic.X2ApicMsr.local_vector_table_performance_monitor_register),
@@ -276,9 +276,10 @@ pub fn pmuStop(state: *PmuState) void {
     // an in-flight PMI cannot fire while we're mid-reconfiguration.
     cpu.wrmsr(IA32_PERF_GLOBAL_CTRL, 0);
     var i: u8 = 0;
-    while (i < state.num_counters) : (i += 1) {
+    while (i < state.num_counters) {
         cpu.wrmsr(IA32_PERFEVTSEL_BASE + @as(u32, i), 0);
         cpu.wrmsr(IA32_PMC_BASE + @as(u32, i), 0);
+        i += 1;
     }
     clearAllOverflowStatus(state.num_counters);
     state.num_counters = 0;
@@ -297,13 +298,17 @@ pub fn pmuConfigureState(state: *PmuState, configs: []const PmuCounterConfig) vo
     const n: u8 = @intCast(configs.len);
     state.num_counters = n;
     var i: u8 = 0;
-    while (i < n) : (i += 1) {
+    while (i < n) {
         state.configs[i] = configs[i];
         state.values[i] = preloadValue(configs[i]);
+        i += 1;
     }
     // Zero any tail slots so a later pmuSave/pmuRestore doesn't pick up
     // stale values from a previous run with more counters.
-    while (i < state.values.len) : (i += 1) state.values[i] = 0;
+    while (i < state.values.len) {
+        state.values[i] = 0;
+        i += 1;
+    }
 }
 
 /// Clear `state` for a *non-running* target thread without touching any
@@ -316,7 +321,10 @@ pub fn pmuClearState(state: *PmuState) void {
     // Leaving configs/values as-is is safe — num_counters = 0 means every
     // loop over them becomes a no-op. Zero values for defensiveness.
     var i: usize = 0;
-    while (i < state.values.len) : (i += 1) state.values[i] = 0;
+    while (i < state.values.len) {
+        state.values[i] = 0;
+        i += 1;
+    }
 }
 
 pub fn pmuSave(state: *PmuState) void {
@@ -329,8 +337,9 @@ pub fn pmuSave(state: *PmuState) void {
     // something that crept up between the read and the next instruction.
     cpu.wrmsr(IA32_PERF_GLOBAL_CTRL, 0);
     var i: u8 = 0;
-    while (i < state.num_counters) : (i += 1) {
+    while (i < state.num_counters) {
         state.values[i] = cpu.rdmsr(IA32_PMC_BASE + @as(u32, i));
+        i += 1;
     }
 }
 
@@ -340,13 +349,14 @@ pub fn pmuRestore(state: *PmuState) void {
     cpu.wrmsr(IA32_PERF_GLOBAL_CTRL, 0);
     var enable_mask: u64 = 0;
     var i: u8 = 0;
-    while (i < state.num_counters) : (i += 1) {
+    while (i < state.num_counters) {
         const cfg = state.configs[i];
         const enc = eventEncoding(cfg.event);
         cpu.wrmsr(IA32_PERFEVTSEL_BASE + @as(u32, i), perfevtselWord(enc, cfg));
         cpu.wrmsr(IA32_PMC_BASE + @as(u32, i), state.values[i]);
         const shift_i: u6 = @intCast(i);
         enable_mask |= @as(u64, 1) << shift_i;
+        i += 1;
     }
     cpu.wrmsr(IA32_PERF_GLOBAL_CTRL, enable_mask);
 }
@@ -356,9 +366,15 @@ pub fn pmuRead(state: *PmuState, sample: *PmuSample) void {
     // which means the outgoing save has already pushed fresh hardware values
     // into state.values. We therefore copy from the state — not from MSRs.
     var i: usize = 0;
-    while (i < sample.counters.len) : (i += 1) sample.counters[i] = 0;
+    while (i < sample.counters.len) {
+        sample.counters[i] = 0;
+        i += 1;
+    }
     i = 0;
-    while (i < state.num_counters) : (i += 1) sample.counters[i] = state.values[i];
+    while (i < state.num_counters) {
+        sample.counters[i] = state.values[i];
+        i += 1;
+    }
 }
 
 /// Shared implementation for `pmu_start` and `pmu_reset`: copy the configs
@@ -370,24 +386,29 @@ fn programCounters(state: *PmuState, configs: []const PmuCounterConfig) void {
     const n: u8 = @intCast(configs.len);
     state.num_counters = n;
     var i: u8 = 0;
-    while (i < n) : (i += 1) {
+    while (i < n) {
         state.configs[i] = configs[i];
         const enc = eventEncoding(configs[i].event);
         cpu.wrmsr(IA32_PERFEVTSEL_BASE + @as(u32, i), perfevtselWord(enc, configs[i]));
         const preload = preloadValue(configs[i]);
         cpu.wrmsr(IA32_PMC_BASE + @as(u32, i), preload);
         state.values[i] = preload;
+        i += 1;
     }
     // Zero any tail slots so a later pmuSave doesn't read stale hardware.
-    while (i < state.values.len) : (i += 1) state.values[i] = 0;
+    while (i < state.values.len) {
+        state.values[i] = 0;
+        i += 1;
+    }
 
     if (n == 0) return;
 
     var enable_mask: u64 = 0;
     var j: u8 = 0;
-    while (j < n) : (j += 1) {
+    while (j < n) {
         const sh: u6 = @intCast(j);
         enable_mask |= @as(u64, 1) << sh;
+        j += 1;
     }
     cpu.wrmsr(IA32_PERF_GLOBAL_CTRL, enable_mask);
 }
@@ -424,9 +445,10 @@ fn clearAllOverflowStatus(num_counters: u8) void {
     if (num_counters == 0) return;
     var mask: u64 = 0;
     var i: u8 = 0;
-    while (i < num_counters) : (i += 1) {
+    while (i < num_counters) {
         const sh: u6 = @intCast(i);
         mask |= @as(u64, 1) << sh;
+        i += 1;
     }
     cpu.wrmsr(IA32_PERF_GLOBAL_OVF_CTRL, mask);
 }
@@ -476,8 +498,9 @@ fn pmuPmiHandler(ctx: *cpu.Context) void {
     // Step 4: snapshot the overflowed counter values into `state.values`
     // — same as `pmuSave`.
     var i: u8 = 0;
-    while (i < state_ptr.num_counters) : (i += 1) {
+    while (i < state_ptr.num_counters) {
         state_ptr.values[i] = cpu.rdmsr(IA32_PMC_BASE + @as(u32, i));
+        i += 1;
     }
 
     // Step 5: faultBlock delivers a fault message to the configured

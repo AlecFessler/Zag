@@ -105,47 +105,47 @@ pub const PageEntry = packed struct(u64) {
 
     pub fn setPAddr(self: *PageEntry, paddr: PAddr) void {
         std.debug.assert(std.mem.isAligned(paddr.addr, paging.PAGE4K));
-        self.addr = @intCast(paddr.addr >> L1SH);
+        self.addr = @intCast(paddr.addr >> l1sh);
     }
 
     pub fn getPAddr(self: *const PageEntry) PAddr {
-        const addr = @as(u64, self.addr) << L1SH;
+        const addr = @as(u64, self.addr) << l1sh;
         return PAddr.fromInt(addr);
     }
 };
 
-const DEFAULT_PAGE_ENTRY = PageEntry{};
+const default_page_entry = PageEntry{};
 
-const PAGE_ENTRY_TABLE_SIZE = 512;
+const page_entry_table_size = 512;
 
 /// Level shift constants for 4-level paging linear-address translation.
 ///
 /// Intel SDM Vol 3A, Figure 5-8 "Linear-Address Translation to a 4-KByte
 /// Page Using 4-Level Paging":
-///   - Bits 47:39 index the PML4 table  (L4SH = 39)
-///   - Bits 38:30 index the PDPT         (L3SH = 30)
-///   - Bits 29:21 index the page directory (L2SH = 21)
-///   - Bits 20:12 index the page table    (L1SH = 12)
+///   - Bits 47:39 index the PML4 table  (l4sh = 39)
+///   - Bits 38:30 index the PDPT         (l3sh = 30)
+///   - Bits 29:21 index the page directory (l2sh = 21)
+///   - Bits 20:12 index the page table    (l1sh = 12)
 ///   - Bits 11:0  are the page offset
-const L4SH: u6 = 39;
-const L3SH: u6 = 30;
-const L2SH: u6 = 21;
-const L1SH: u6 = 12;
+const l4sh: u6 = 39;
+const l3sh: u6 = 30;
+const l2sh: u6 = 21;
+const l1sh: u6 = 12;
 
 fn l4Idx(virt: VAddr) u9 {
-    return @truncate(virt.addr >> L4SH);
+    return @truncate(virt.addr >> l4sh);
 }
 
 fn l3Idx(virt: VAddr) u9 {
-    return @truncate(virt.addr >> L3SH);
+    return @truncate(virt.addr >> l3sh);
 }
 
 fn l2Idx(virt: VAddr) u9 {
-    return @truncate(virt.addr >> L2SH);
+    return @truncate(virt.addr >> l2sh);
 }
 
 fn l1Idx(virt: VAddr) u9 {
-    return @truncate(virt.addr >> L1SH);
+    return @truncate(virt.addr >> l1sh);
 }
 
 /// Return the physical address of the current PML4 table from CR3.
@@ -179,7 +179,7 @@ pub fn copyKernelMappings(root: VAddr) void {
     const src = src_root_virt.getPtr([*]PageEntry);
     const dst = root.getPtr([*]PageEntry);
 
-    for (256..PAGE_ENTRY_TABLE_SIZE) |i| {
+    for (256..page_entry_table_size) |i| {
         dst[i] = src[i];
     }
 }
@@ -195,7 +195,7 @@ pub fn dropIdentityMapping() void {
     const root = root_virt.getPtr([*]PageEntry);
 
     for (0..256) |i| {
-        root[i] = DEFAULT_PAGE_ENTRY;
+        root[i] = default_page_entry;
     }
 
     cpu.writeCr3(root_phys.addr);
@@ -244,7 +244,7 @@ pub fn mapPage(
     };
 
     const root_virt = VAddr.fromPAddr(addr_space_root, null);
-    var table: *[PAGE_ENTRY_TABLE_SIZE]PageEntry = @ptrFromInt(root_virt.addr);
+    var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
 
     const walk_indices = [_]u9{ l4Idx(virt), l3Idx(virt), l2Idx(virt) };
     for (walk_indices) |idx| {
@@ -313,7 +313,7 @@ pub fn mapPageBoot(
     const l2_idx = l2Idx(virt);
     const l1_idx = l1Idx(virt);
 
-    var table: *[PAGE_ENTRY_TABLE_SIZE]PageEntry = @ptrFromInt(addr_space_root.addr);
+    var table: *[page_entry_table_size]PageEntry = @ptrFromInt(addr_space_root.addr);
     var entry = &table[l4_idx];
     var level_entry_size: PageSize = .page1g;
     const use_physmap = physmap.contains(addr_space_root.addr);
@@ -323,9 +323,9 @@ pub fn mapPageBoot(
             const new_entry: []align(paging.PAGE4K) PageEntry = try allocator.alignedAlloc(
                 PageEntry,
                 paging.pageAlign(.page4k),
-                PAGE_ENTRY_TABLE_SIZE,
+                page_entry_table_size,
             );
-            @memset(new_entry, DEFAULT_PAGE_ENTRY);
+            @memset(new_entry, default_page_entry);
             entry.* = parent_entry;
 
             const new_entry_virt = VAddr.fromInt(@intFromPtr(new_entry.ptr));
@@ -382,7 +382,7 @@ pub fn unmapPage(
     virt: VAddr,
 ) ?PAddr {
     const root_virt = VAddr.fromPAddr(addr_space_root, null);
-    var table: *[PAGE_ENTRY_TABLE_SIZE]PageEntry = @ptrFromInt(root_virt.addr);
+    var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
 
     const walk_indices = [_]u9{ l4Idx(virt), l3Idx(virt), l2Idx(virt) };
     for (walk_indices) |idx| {
@@ -396,7 +396,7 @@ pub fn unmapPage(
     const l1_entry = &table[l1Idx(virt)];
     if (!l1_entry.present) return null;
     const phys = l1_entry.getPAddr();
-    l1_entry.* = DEFAULT_PAGE_ENTRY;
+    l1_entry.* = default_page_entry;
     cpu.invlpg(virt.addr);
 
     // Shoot down remote TLBs on every unmap, user-space AND kernel-space.
@@ -438,7 +438,7 @@ pub fn unmapPage(
 pub fn freeUserAddrSpace(addr_space_root: PAddr) void {
     const pmm_iface = pmm.global_pmm.?.allocator();
     const root_virt = VAddr.fromPAddr(addr_space_root, null);
-    const root: *[PAGE_ENTRY_TABLE_SIZE]PageEntry = @ptrFromInt(root_virt.addr);
+    const root: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
 
     for (root[0..256]) |*l4_entry| {
         if (!l4_entry.present) continue;
@@ -479,7 +479,7 @@ pub fn updatePagePerms(
     new_perms: MemoryPerms,
 ) void {
     const root_virt = VAddr.fromPAddr(addr_space_root, null);
-    var table: *[PAGE_ENTRY_TABLE_SIZE]PageEntry = @ptrFromInt(root_virt.addr);
+    var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
 
     const walk_indices = [_]u9{ l4Idx(virt), l3Idx(virt), l2Idx(virt) };
     for (walk_indices) |idx| {
@@ -521,7 +521,7 @@ pub fn resolveVaddr(
     virt: VAddr,
 ) ?PAddr {
     const root_virt = VAddr.fromPAddr(addr_space_root, null);
-    var table: *[PAGE_ENTRY_TABLE_SIZE]PageEntry = @ptrFromInt(root_virt.addr);
+    var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
 
     const walk_indices = [_]u9{ l4Idx(virt), l3Idx(virt), l2Idx(virt) };
     for (walk_indices) |idx| {
@@ -537,7 +537,7 @@ pub fn resolveVaddr(
     return l1_entry.getPAddr();
 }
 
-fn entryToTable(entry: *const PageEntry) *[PAGE_ENTRY_TABLE_SIZE]PageEntry {
+fn entryToTable(entry: *const PageEntry) *[page_entry_table_size]PageEntry {
     const virt = VAddr.fromPAddr(entry.getPAddr(), null);
     return @ptrFromInt(virt.addr);
 }
@@ -548,7 +548,7 @@ fn freePhysPage(paddr: PAddr, pmm_iface: std.mem.Allocator) void {
     pmm_iface.destroy(page);
 }
 
-fn freeTablePage(table: *[PAGE_ENTRY_TABLE_SIZE]PageEntry, pmm_iface: std.mem.Allocator) void {
+fn freeTablePage(table: *[page_entry_table_size]PageEntry, pmm_iface: std.mem.Allocator) void {
     const page: *paging.PageMem(.page4k) = @ptrCast(@alignCast(table));
     pmm_iface.destroy(page);
 }
