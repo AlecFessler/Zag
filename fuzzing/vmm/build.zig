@@ -3,18 +3,18 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{
-        .preferred_optimize_mode = .Debug,
+        .preferred_optimize_mode = .ReleaseSafe,
     });
 
     // Pure kernel source modules
     const bitmap_freelist_mod = b.addModule("bitmap_freelist", .{
-        .root_source_file = b.path("../../kernel/memory/bitmap_freelist.zig"),
+        .root_source_file = b.path("../../kernel/memory/allocators/bitmap_freelist.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     const intrusive_freelist_mod = b.addModule("intrusive_freelist", .{
-        .root_source_file = b.path("../../kernel/memory/intrusive_freelist.zig"),
+        .root_source_file = b.path("../../kernel/memory/allocators/intrusive_freelist.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -45,18 +45,23 @@ pub fn build(b: *std.Build) void {
         .imports = &.{.{ .name = "red_black_tree", .module = rbt_mod }},
     });
 
-    const utils_shim = b.addModule("utils", .{
-        .root_source_file = b.path("../shims/utils.zig"),
-        .target = target,
-        .optimize = optimize,
-        .imports = &.{.{ .name = "range", .module = range_mod }},
-    });
-
     const sync_shim = b.addModule("sync", .{
         .root_source_file = b.path("../shims/sync.zig"),
         .target = target,
         .optimize = optimize,
     });
+
+    const utils_shim = b.addModule("utils", .{
+        .root_source_file = b.path("../shims/utils.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "range", .module = range_mod },
+            .{ .name = "sync", .module = sync_shim },
+        },
+    });
+
+    // sync_shim already declared above for utils
 
     const sched_shim = b.addModule("sched", .{
         .root_source_file = b.path("../shims/sched.zig"),
@@ -110,7 +115,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const slab_allocator_mod = b.addModule("slab_allocator", .{
-        .root_source_file = b.path("../../kernel/memory/slab_allocator.zig"),
+        .root_source_file = b.path("../../kernel/memory/allocators/slab.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{.{ .name = "zag", .module = zag_mod }},
@@ -153,8 +158,21 @@ pub fn build(b: *std.Build) void {
         },
     });
 
+    // Allocators shim
+    const allocators_shim = b.addModule("allocators", .{
+        .root_source_file = b.path("../shims/allocators.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "bitmap_freelist", .module = bitmap_freelist_mod },
+            .{ .name = "intrusive_freelist", .module = intrusive_freelist_mod },
+            .{ .name = "slab_allocator", .module = slab_allocator_mod },
+        },
+    });
+
     // Wire up memory shim imports
     memory_shim.addImport("address", address_mod);
+    memory_shim.addImport("allocators", allocators_shim);
     memory_shim.addImport("bitmap_freelist", bitmap_freelist_mod);
     memory_shim.addImport("device_region", device_region_mod);
     memory_shim.addImport("intrusive_freelist", intrusive_freelist_mod);

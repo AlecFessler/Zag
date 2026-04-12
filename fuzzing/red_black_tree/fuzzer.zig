@@ -49,7 +49,7 @@ fn validate(tree: *RBTree) bool {
     }
 
     if (tree.root) |root| {
-        if (root.color != .Black) {
+        if (root.color != .black) {
             std.debug.print("[RBTree Fuzzer] Root is not black\n", .{});
             return false;
         }

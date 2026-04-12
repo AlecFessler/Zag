@@ -3,20 +3,31 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{
-        .preferred_optimize_mode = .Debug,
+        .preferred_optimize_mode = .ReleaseSafe,
     });
 
     // Kernel source modules (pure, std-only)
     const bitmap_freelist_mod = b.addModule("bitmap_freelist", .{
-        .root_source_file = b.path("../../kernel/memory/bitmap_freelist.zig"),
+        .root_source_file = b.path("../../kernel/memory/allocators/bitmap_freelist.zig"),
         .target = target,
         .optimize = optimize,
     });
 
     const intrusive_freelist_mod = b.addModule("intrusive_freelist", .{
-        .root_source_file = b.path("../../kernel/memory/intrusive_freelist.zig"),
+        .root_source_file = b.path("../../kernel/memory/allocators/intrusive_freelist.zig"),
         .target = target,
         .optimize = optimize,
+    });
+
+    // Allocators shim
+    const allocators_shim_mod = b.addModule("allocators", .{
+        .root_source_file = b.path("../shims/allocators.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "bitmap_freelist", .module = bitmap_freelist_mod },
+            .{ .name = "intrusive_freelist", .module = intrusive_freelist_mod },
+        },
     });
 
     // Memory shim (re-exports bitmap_freelist + intrusive_freelist)
@@ -25,6 +36,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
+            .{ .name = "allocators", .module = allocators_shim_mod },
             .{ .name = "bitmap_freelist", .module = bitmap_freelist_mod },
             .{ .name = "intrusive_freelist", .module = intrusive_freelist_mod },
         },
@@ -59,7 +71,7 @@ pub fn build(b: *std.Build) void {
 
     // The buddy_allocator module from the kernel
     const buddy_mod = b.addModule("buddy_allocator", .{
-        .root_source_file = b.path("../../kernel/memory/buddy_allocator.zig"),
+        .root_source_file = b.path("../../kernel/memory/allocators/buddy.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{

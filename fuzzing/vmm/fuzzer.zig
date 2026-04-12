@@ -54,7 +54,7 @@ fn vmmPerms(self: *VirtualMemoryManager, idx_raw: u64) !void {
     const sub_pages = @max(1, rng.random().int(u8) % @as(u8, @intCast(@max(1, remaining / PAGE4K))));
     const sub_size: u64 = @as(u64, sub_pages) * PAGE4K;
 
-    self.mem_perms(HANDLE_NONE, VAddr.fromInt(res.start), res.size, offset, sub_size, .{
+    self.memPerms(HANDLE_NONE, VAddr.fromInt(res.start), res.size, offset, sub_size, .{
         .read = rng.random().boolean(),
         .write = rng.random().boolean(),
         .execute = rng.random().boolean(),
