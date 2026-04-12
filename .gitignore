@@ -15,3 +15,4 @@ qemu.log
 *.pdf
 exploits/
 CLAUDE.md
+.claude/

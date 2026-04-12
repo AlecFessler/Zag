@@ -104,7 +104,7 @@ All access to kernel objects is mediated by **capabilities** — handles with as
 
 **§2.3.1** Handles are monotonically increasing u64 IDs, unique per process lifetime. **§2.3.2** Handle 0 (`HANDLE_SELF`) exists at process creation and cannot be revoked.
 
-There are five rights types. **ProcessRights** (u16, slot 0 only): `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `mem_shm_create`(5), `device_own`(6), `fault_handler`(7), `pmu`(8). **ProcessHandleRights** (u16, other process handles): `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5), `fault_handler`(6). When `fault_handler` is set on a handle to process P, the holder receives P's fault messages in the holder's own fault box. At most one external process may hold this bit for any given process at a time. **SharedMemoryRights** (u8): `read`(0), `write`(1), `execute`(2), `grant`(3). **DeviceRegionRights** (u8): `map`(0), `grant`(1), `dma`(2). **ThreadHandleRights** (u8): `suspend`(0), `resume`(1), `kill`(2), `pmu`(4). 4 bits reserved. The `pmu` bit gates access to a specific thread's performance monitoring state (§2.14).
+There are five rights types. **ProcessRights** (u16, slot 0 only): `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `mem_shm_create`(5), `device_own`(6), `fault_handler`(7), `pmu`(8), `set_time`(9), `power`(10). **ProcessHandleRights** (u16, other process handles): `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5), `fault_handler`(6). When `fault_handler` is set on a handle to process P, the holder receives P's fault messages in the holder's own fault box. At most one external process may hold this bit for any given process at a time. **SharedMemoryRights** (u8): `read`(0), `write`(1), `execute`(2), `grant`(3). **DeviceRegionRights** (u8): `map`(0), `grant`(1), `dma`(2), `irq`(3). **ThreadHandleRights** (u8): `suspend`(0), `resume`(1), `kill`(2), `pmu`(4). 4 bits reserved. The `pmu` bit gates access to a specific thread's performance monitoring state (§2.14). The `set_time` ProcessRights bit gates `clock_setwall` (§2.16). The `power` ProcessRights bit gates `sys_power` and `sys_cpu_power` (§2.19). The `irq` DeviceRegionRights bit gates `irq_ack` (§2.18).
 
 **§2.3.3** `restart` can only be granted by a parent that itself has restart capability. **§2.3.4** Once cleared via `disable_restart`, the restart capability cannot be re-enabled.
 
@@ -625,6 +625,113 @@ CoreInfo (extern struct) {
 On every `sys_info` call with a non-null `cores_ptr`, each core's `idle_ns` and `busy_ns` are read and reset atomically before the values are returned to userspace. The next call therefore sees the accounting window that started at the previous call's return. A call with a null `cores_ptr` does not touch per-core accounting and does not reset the counters.
 
 The accounting window size is userspace-controlled: the interval between consecutive `sys_info` calls with `cores_ptr != null` is the window over which `idle_ns` and `busy_ns` are reported.
+
+---
+
+### §2.16 Wall Clock Time
+
+Zag exposes wall clock (real) time as an offset from the monotonic clock. The kernel reads the hardware RTC once at boot to compute an initial offset. `clock_getwall` returns the current wall time by adding the offset to the monotonic clock. `clock_setwall` allows a privileged process to adjust the offset.
+
+**§2.16.1** `clock_getwall` returns nanoseconds since the Unix epoch (1970-01-01T00:00:00Z). No rights check is required. Always succeeds.
+
+**§2.16.2** `clock_setwall` requires `ProcessRights.set_time` on slot 0; returns `E_PERM` without it.
+
+**§2.16.3** `clock_setwall` atomically updates the wall clock offset so that subsequent `clock_getwall` calls reflect the new time.
+
+**§2.16.4** `clock_getwall` precision is limited by the underlying monotonic clock source (TSC on x86). The wall clock does not drift independently of the monotonic clock.
+
+**§2.16.5** Root service holds `ProcessRights.set_time` at boot.
+
+---
+
+### §2.17 Randomness
+
+Zag exposes hardware-sourced random bytes to userspace via `getrandom`. The kernel reads directly from the CPU's hardware RNG (RDRAND on x86) with no intermediate entropy pool or blocking.
+
+**§2.17.1** `getrandom` fills a userspace buffer with cryptographically random bytes sourced from the hardware RNG. No rights check is required.
+
+**§2.17.2** `getrandom` is non-blocking. If the hardware RNG is temporarily unavailable, it returns `E_AGAIN` rather than waiting.
+
+**§2.17.3** The maximum buffer size per call is 4096 bytes. Requests for more return `E_INVAL`.
+
+**§2.17.4** Requests with zero length return `E_INVAL`.
+
+---
+
+### §2.18 IRQ Notification Delivery
+
+Zag provides an asynchronous kernel-to-userspace notification mechanism for device interrupt delivery. Each process has a **notification box** containing a 64-bit bitmask word. When a device IRQ fires, the kernel atomically ORs a badge bit into the owning process's notification word and wakes any threads waiting on it. Multiple IRQs accumulate via OR — no notifications are dropped.
+
+#### Badge Bits
+
+Each device handle in a process's permissions table has an associated `badge_bit` (u6, range 0--63). When the kernel delivers an IRQ for that device, it sets the corresponding bit in the process's notification word. Userspace reads the notification word via `notify_wait` to determine which devices have pending interrupts.
+
+**§2.18.1** Badge bits are assigned incrementally (mod 64) per process as device handles are inserted into the permissions table. The `badge_counter` increments on each device handle insertion.
+
+**§2.18.2** The badge bit is stored on the `PermissionEntry` for device region entries and exposed in the user permissions view so userspace can map notification bits to device handles without a syscall.
+
+**§2.18.3** The badge bit is packed into the upper bits of the device entry `field0` in the user permissions view.
+
+#### Notification Delivery
+
+**§2.18.4** When a device IRQ fires, the kernel masks the IRQ line, identifies the owning process via the device region, atomically ORs `(1 << badge_bit)` into the process's notification word, and wakes all threads waiting on the notification box.
+
+**§2.18.5** `notify_wait` atomically reads and clears the notification word. On success, it returns the bitmask of all accumulated notifications since the last read.
+
+**§2.18.6** `notify_wait` with `timeout_ns = 0` is non-blocking: returns `E_AGAIN` if the notification word is zero.
+
+**§2.18.7** `notify_wait` with `timeout_ns = MAX_U64` blocks indefinitely until the notification word becomes non-zero.
+
+**§2.18.8** `notify_wait` with a finite timeout returns `E_TIMEOUT` if the notification word remains zero for the duration.
+
+**§2.18.9** `irq_ack` unmasks the IRQ line for the device associated with the given handle. Requires `DeviceRegionRights.irq` on the device handle.
+
+**§2.18.10** The typical driver flow is: `notify_wait` to sleep until an IRQ fires, handle the interrupt in userspace, call `irq_ack` to unmask the line and allow future interrupts.
+
+---
+
+### §2.19 Power Control
+
+Zag provides two syscalls for system-wide and per-CPU power management, both gated on the `ProcessRights.power` capability bit.
+
+**§2.19.1** `ProcessRights.power` gates both `sys_power` and `sys_cpu_power`. Root service holds this bit at boot.
+
+#### PowerAction
+
+`PowerAction` is the set of system-wide power actions:
+
+```
+PowerAction = enum {
+    shutdown,
+    reboot,
+    sleep,
+    hibernate,
+    screen_off,
+}
+```
+
+**§2.19.2** `sys_power` with `shutdown` or `reboot` does not return on success.
+
+**§2.19.3** `sys_power` with `sleep`, `hibernate`, or `screen_off` returns `E_OK` after the system resumes (or the action completes).
+
+**§2.19.4** `sys_power` returns `E_NODEV` if the hardware does not support the requested action.
+
+#### CpuPowerAction
+
+`CpuPowerAction` is the set of per-CPU power actions:
+
+```
+CpuPowerAction = enum {
+    set_freq,
+    set_idle,
+}
+```
+
+**§2.19.5** `sys_cpu_power` with `set_freq` sets the target CPU frequency in hertz. The kernel programs the nearest achievable frequency.
+
+**§2.19.6** `sys_cpu_power` with `set_idle` sets the maximum C-state idle level for the calling core.
+
+**§2.19.7** `sys_cpu_power` returns `E_NODEV` if the hardware does not support the requested action.
 
 ---
 
