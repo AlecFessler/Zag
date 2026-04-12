@@ -2,7 +2,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
-const sync = zag.sched.sync;
+const sync = zag.utils.sync;
 
 const Ports = enum(u16) {
     com1 = 0x3F8,

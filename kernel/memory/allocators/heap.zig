@@ -6,7 +6,7 @@ const intrusive_freelist = zag.memory.allocators.intrusive_freelist;
 const rbt = zag.containers.red_black_tree;
 const slab_alloc = zag.memory.allocators.slab;
 
-const SpinLock = zag.sched.sync.SpinLock;
+const SpinLock = zag.utils.sync.SpinLock;
 
 pub const AllocFooter = packed struct(u64) {
     header: u64,

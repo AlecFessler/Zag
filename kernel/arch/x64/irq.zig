@@ -8,7 +8,7 @@ const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const paging_mod = zag.arch.x64.paging;
 const sched = zag.sched.scheduler;
-const syscall = zag.arch.syscall;
+const syscall = zag.syscall;
 
 const GateType = zag.arch.x64.idt.GateType;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;

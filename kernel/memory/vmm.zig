@@ -12,7 +12,7 @@ const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PrivilegePerm = zag.perms.privilege.PrivilegePerm;
 const SharedMemory = zag.memory.shared.SharedMemory;
-const SpinLock = zag.sched.sync.SpinLock;
+const SpinLock = zag.utils.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
 const VmReservationRights = zag.perms.permissions.VmReservationRights;
 

@@ -7,7 +7,7 @@ const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 
 const PAddr = zag.memory.address.PAddr;
-const SpinLock = zag.sched.sync.SpinLock;
+const SpinLock = zag.utils.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
 
 const STACK_RANGE_START: u64 = address.KernelVA.kernel_stacks.start;

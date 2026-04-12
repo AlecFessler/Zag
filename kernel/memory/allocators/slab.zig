@@ -4,7 +4,7 @@ const zag = @import("zag");
 
 const intrusive_freelist = zag.memory.allocators.intrusive_freelist;
 
-const SpinLock = zag.sched.sync.SpinLock;
+const SpinLock = zag.utils.sync.SpinLock;
 
 const DBG = builtin.mode == .Debug;
 

@@ -11,7 +11,7 @@ const pmm = zag.memory.pmm;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageSize = zag.memory.paging.PageSize;
-const SpinLock = zag.sched.sync.SpinLock;
+const SpinLock = zag.utils.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
 
 // TLB shootdown: per-core pending invalidation addresses.

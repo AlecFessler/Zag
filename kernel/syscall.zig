@@ -3,23 +3,23 @@ const zag = @import("zag");
 
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
-const futex = zag.sched.futex;
+const futex = zag.proc.futex;
 const kvm = zag.kvm;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmu = zag.sched.pmu;
-const process_mod = zag.sched.process;
+const process_mod = zag.proc.process;
 const sched = zag.sched.scheduler;
 const sysinfo = zag.sched.sysinfo;
 
-const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
+const ArchCpuContext = zag.arch.dispatch.ArchCpuContext;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const FaultReason = zag.perms.permissions.FaultReason;
 const KernelObject = zag.perms.permissions.KernelObject;
 const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Priority = zag.sched.thread.Priority;
-const Process = zag.sched.process.Process;
+const Process = zag.proc.process.Process;
 const ProcessHandleRights = zag.perms.permissions.ProcessHandleRights;
 const ProcessRights = zag.perms.permissions.ProcessRights;
 const SharedMemory = zag.memory.shared.SharedMemory;
