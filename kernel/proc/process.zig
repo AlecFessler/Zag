@@ -771,8 +771,9 @@ pub const Process = struct {
 
     pub fn killSubtree(self: *Process) void {
         var i: u64 = 0;
-        while (i < self.num_children) : (i += 1) {
+        while (i < self.num_children) {
             self.children[i].killSubtree();
+            i += 1;
         }
         self.kill(.killed);
     }
@@ -796,8 +797,9 @@ pub const Process = struct {
         self.perm_lock.unlock();
 
         var i: u64 = 0;
-        while (i < self.num_children) : (i += 1) {
+        while (i < self.num_children) {
             self.children[i].disableRestart();
+            i += 1;
         }
     }
 
@@ -1472,10 +1474,13 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
     var num_load_segments: usize = 0;
 
     var i: u64 = 0;
-    while (i < phdr_count) : (i += 1) {
+    while (i < phdr_count) {
         const off = phdr_offset + i * phdr_size;
         const phdr = std.mem.bytesAsValue(elf.Elf64_Phdr, elf_binary[off..][0..@sizeOf(elf.Elf64_Phdr)]);
-        if (phdr.p_type != elf.PT_LOAD) continue;
+        if (phdr.p_type != elf.PT_LOAD) {
+            i += 1;
+            continue;
+        }
 
         // Use checked arithmetic for all segment address computations
         // to prevent overflow into kernel address space.
@@ -1517,6 +1522,7 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
             if (!has_bss or this_bss_start < bss_start) bss_start = this_bss_start;
             has_bss = true;
         }
+        i += 1;
     }
 
     if (lowest_va >= highest_va and !has_bss) return error.InvalidElf;
@@ -1545,24 +1551,32 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
         };
 
         var page_va = page_start;
-        while (page_va < page_end) : (page_va += paging.PAGE4K) {
+        while (page_va < page_end) {
             const page = try pmm_iface.create(paging.PageMem(.page4k));
             @memset(std.mem.asBytes(page), 0);
             const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
             try arch.mapPage(proc.addr_space_root, phys, VAddr.fromInt(page_va), load_perms);
+            page_va += paging.PAGE4K;
         }
 
         i = 0;
-        while (i < phdr_count) : (i += 1) {
+        while (i < phdr_count) {
             const off = phdr_offset + i * phdr_size;
             const phdr = std.mem.bytesAsValue(elf.Elf64_Phdr, elf_binary[off..][0..@sizeOf(elf.Elf64_Phdr)]);
-            if (phdr.p_type != elf.PT_LOAD) continue;
-            if (phdr.p_filesz == 0) continue;
+            if (phdr.p_type != elf.PT_LOAD) {
+                i += 1;
+                continue;
+            }
+            if (phdr.p_filesz == 0) {
+                i += 1;
+                continue;
+            }
 
             const seg_vaddr = aslr_base + phdr.p_vaddr;
             if (phdr.p_offset + phdr.p_filesz > elf_binary.len) return error.InvalidElf;
 
             writeToUserPages(proc.addr_space_root, seg_vaddr, elf_binary[phdr.p_offset..][0..phdr.p_filesz]);
+            i += 1;
         }
     }
 
@@ -1634,12 +1648,13 @@ fn findRelaSection(elf_binary: []const u8, ehdr: *align(1) const elf.Elf64_Ehdr)
     if (shdr_end > elf_binary.len) return null;
 
     var s: u64 = 0;
-    while (s < shdr_count) : (s += 1) {
+    while (s < shdr_count) {
         const off = shdr_offset + s * shdr_size;
         const shdr = std.mem.bytesAsValue(elf.Elf64_Shdr, elf_binary[off..][0..@sizeOf(elf.Elf64_Shdr)]);
         if (shdr.sh_type == elf.SHT_RELA) {
             return .{ .offset = shdr.sh_offset, .size = shdr.sh_size };
         }
+        s += 1;
     }
     return null;
 }
@@ -1654,12 +1669,15 @@ fn applyRelocations(proc: *Process, aslr_base: u64, elf_binary: []const u8, rela
     if (rela_end > elf_binary.len) return error.InvalidElf;
 
     var r: u64 = 0;
-    while (r < num_entries) : (r += 1) {
+    while (r < num_entries) {
         const off = rela_offset + r * entry_size;
         const rela = std.mem.bytesAsValue(elf.Elf64_Rela, elf_binary[off..][0..entry_size]);
 
         const rela_type = @as(u32, @truncate(rela.r_info));
-        if (rela_type != @intFromEnum(elf.R_X86_64.RELATIVE)) continue;
+        if (rela_type != @intFromEnum(elf.R_X86_64.RELATIVE)) {
+            r += 1;
+            continue;
+        }
 
         // Validate relocation target stays in user address space.
         const target_vaddr = std.math.add(u64, aslr_base, rela.r_offset) catch return error.InvalidElf;
@@ -1672,6 +1690,7 @@ fn applyRelocations(proc: *Process, aslr_base: u64, elf_binary: []const u8, rela
         const physmap_addr = VAddr.fromPAddr(paddr, null).addr + (target_vaddr - page_base);
         const ptr: *u64 = @ptrFromInt(physmap_addr);
         ptr.* = value;
+        r += 1;
     }
 }
 
