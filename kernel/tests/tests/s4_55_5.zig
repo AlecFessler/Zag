@@ -21,6 +21,21 @@ pub fn main(_: u64) void {
     // A non-null but definitely unwritable cores_ptr: use address 1 so it
     // is both non-null and guaranteed unaligned / unmapped.
     const rc = syscall.sys_info(@intFromPtr(&info), 1);
-    t.expectEqual("§4.55.5", syscall.E_BADADDR, rc);
+    if (rc != syscall.E_BADADDR) {
+        t.failWithVal("§4.55.5", syscall.E_BADADDR, rc);
+        syscall.shutdown();
+    }
+
+    // Confirm no partial write to info_ptr on the failure path. The
+    // handler is required to validate cores_ptr before committing any
+    // write to info_ptr — if it didn't, core_count (and the other two
+    // fields) would have been overwritten with the kernel's actual
+    // values, which would never equal our sentinel.
+    if (info.core_count != sentinel or info.mem_total != sentinel or info.mem_free != sentinel) {
+        t.fail("§4.55.5 info_ptr was partially written on E_BADADDR path");
+        syscall.shutdown();
+    }
+
+    t.pass("§4.55.5");
     syscall.shutdown();
 }

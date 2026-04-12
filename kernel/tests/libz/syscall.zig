@@ -624,6 +624,15 @@ pub const CoreInfo = extern struct {
     _pad: [3]u8 = .{0} ** 3,
 };
 
+// ABI guard against drift from the kernel side, which asserts the same
+// sizes in `kernel/sched/sysinfo.zig`. The struct layout is part of the
+// observable §2.15 contract, so any change here must be matched on both
+// sides.
+comptime {
+    if (@sizeOf(SysInfo) != 24) @compileError("SysInfo must be 24 bytes (§2.15)");
+    if (@sizeOf(CoreInfo) != 32) @compileError("CoreInfo must be 32 bytes (§2.15)");
+}
+
 /// Invokes `sys_info(info_ptr, cores_ptr)`. Pass `0` for `cores_ptr` to read
 /// `SysInfo` without touching per-core scheduler accounting (§2.15, §4.55.4).
 pub fn sys_info(info_ptr: u64, cores_ptr: u64) i64 {
