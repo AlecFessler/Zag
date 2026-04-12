@@ -11,6 +11,8 @@ const VAddr = zag.memory.address.VAddr;
 
 // ── Register offsets (xAPIC MMIO) ────────────────────────────────
 
+/// xAPIC MMIO register offsets relative to the APIC base address.
+/// Intel SDM Vol 3A, Section 13.4, Table 13-1 "Local APIC Register Address Map".
 pub const Register = enum(u32) {
     lapic_id_reg = 0x20,
     lapic_version_reg = 0x30,
@@ -69,6 +71,9 @@ pub const Register = enum(u32) {
 
 // ── x2APIC MSR addresses ────────────────────────────────────────
 
+/// x2APIC MSR address space. Each register is accessed via RDMSR/WRMSR
+/// at MSR addresses 800H-8FFH.
+/// Intel SDM Vol 3A, Section 13.12.1.2, Table 13-6 "Local APIC Register Address Map Supported by x2APIC".
 pub const X2ApicMsr = enum(u32) {
     local_apic_id_register = 0x802,
     local_apic_version_register = 0x803,
@@ -127,6 +132,9 @@ pub const X2ApicMsr = enum(u32) {
 
 // ── Packed struct types (used only for @bitCast, never via pointer deref) ──
 
+/// LVT Timer Register layout. Bits [18:17] select the timer mode (one-shot,
+/// periodic, or TSC-deadline). Bit 16 is the mask bit.
+/// Intel SDM Vol 3A, Section 13.5.1, Figure 13-8 "Local Vector Table (LVT)".
 pub const LvtTimer = packed struct(u32) {
     vector: u8,
     _res0: u4 = 0,
@@ -137,6 +145,9 @@ pub const LvtTimer = packed struct(u32) {
     _res2: u13 = 0,
 };
 
+/// Spurious-Interrupt Vector Register (SVR). Bit 8 is the APIC software
+/// enable/disable flag. Bit 12 controls EOI-broadcast suppression.
+/// Intel SDM Vol 3A, Section 13.9, Figure 13-23 "Spurious-Interrupt Vector Register".
 pub const SpuriousIntVec = packed struct(u32) {
     spurious_vector: u8,
     apic_enable: bool,
@@ -146,6 +157,9 @@ pub const SpuriousIntVec = packed struct(u32) {
     _res1: u19 = 0,
 };
 
+/// Divide Configuration Register. Bits [3,1:0] encode the timer divide value
+/// (1, 2, 4, 8, 16, 32, 64, or 128).
+/// Intel SDM Vol 3A, Section 13.5.4, Figure 13-10 "Divide Configuration Register".
 pub const DivConfig = packed struct(u32) {
     div0: u1,
     div1: u1,
@@ -182,10 +196,16 @@ pub fn writeReg(reg: Register, val: u32) void {
 
 // ── Public API ───────────────────────────────────────────────────
 
+/// Write a TSC deadline value to IA32_TSC_DEADLINE MSR (6E0H). The timer fires
+/// when the TSC reaches this value.
+/// Intel SDM Vol 3A, Section 13.5.4.1 "TSC-Deadline Mode".
 pub fn armTscDeadline(deadline_tsc: u64) void {
     cpu.wrmsr(tsc_deadline_msr, deadline_tsc);
 }
 
+/// Signal end-of-interrupt by writing 0 to the EOI register. For level-triggered
+/// interrupts, this also causes an EOI message to be broadcast to I/O APICs.
+/// Intel SDM Vol 3A, Section 13.8.5 "Signaling Interrupt Servicing Completion", Figure 13-21.
 pub fn endOfInterrupt() void {
     if (x2Apic) {
         cpu.wrmsr(@intFromEnum(X2ApicMsr.end_of_interrupt_register), 0);
@@ -194,6 +214,9 @@ pub fn endOfInterrupt() void {
     }
 }
 
+/// Configure the local APIC timer in TSC-deadline mode. Returns false if the
+/// processor does not support TSC-deadline or invariant TSC.
+/// Intel SDM Vol 3A, Section 13.5.4.1 "TSC-Deadline Mode", Figure 13-8.
 pub fn programLocalApicTimerTscDeadline(vector: u8) bool {
     const feat = cpu.cpuid(.basic_features, 0);
     if (!cpu.hasFeatureEcx(feat.ecx, .tsc_deadline)) return false;
@@ -215,16 +238,22 @@ pub fn programLocalApicTimerTscDeadline(vector: u8) bool {
 }
 
 pub fn init(lapic_base_virt: VAddr) void {
-    // disable PIC
+    // Mask all legacy 8259 PIC interrupts by writing 0xFF to both the
+    // master (port 0x21) and slave (port 0xA1) PIC data registers.
+    // This ensures no spurious PIC interrupts fire after switching to APIC mode.
     cpu.outb(0xFF, 0x21);
     cpu.outb(0xFF, 0xA1);
 
+    // Intel SDM Vol 3A, Section 13.12.1 "Detecting and Enabling x2APIC Mode".
     x2Apic = cpu.enableX2Apic(@intFromEnum(interrupts.IntVecs.spurious));
     if (x2Apic) return;
 
     lapic_base = lapic_base_virt.addr;
 }
 
+/// Initialize the local APIC timer in one-shot mode with the given divide
+/// configuration and vector. See DivConfig and LvtTimer for register layouts.
+/// Intel SDM Vol 3A, Section 13.5.4 "APIC Timer", Figures 13-8 and 13-10.
 pub fn initLapicTimer(div_code: u32, vector: u8, masked: bool) void {
     if (x2Apic) {
         const m: u64 =
@@ -249,6 +278,9 @@ pub fn initLapicTimer(div_code: u32, vector: u8, masked: bool) void {
     }
 }
 
+/// Arm the local APIC timer in one-shot mode with an initial count. Writing
+/// a non-zero value to the initial-count register starts the countdown.
+/// Intel SDM Vol 3A, Section 13.5.4 "APIC Timer", Figure 13-11.
 pub fn armLapicOneShot(ticks: u32, vector: u8) void {
     if (x2Apic) {
         const m: u64 = vector | (@as(u64, LVT_MODE_ONE_SHOT) << LVT_MODE_SHIFT);
@@ -286,6 +318,9 @@ pub fn coreID() u64 {
     unreachable;
 }
 
+/// Poll the ICR delivery status bit (bit 12) until it clears, indicating
+/// the IPI has been sent. Only needed in xAPIC mode; x2APIC writes are atomic.
+/// Intel SDM Vol 3A, Section 13.6.1, Figure 13-12 (Delivery Status field).
 pub fn waitForDelivery() void {
     if (x2Apic) return;
     while (readReg(.int_cmd_low_reg) & (1 << 12) != 0) {
@@ -293,6 +328,9 @@ pub fn waitForDelivery() void {
     }
 }
 
+/// Send an INIT IPI to the target processor. Sets delivery mode to INIT (101b),
+/// level assert, and edge trigger in the ICR.
+/// Intel SDM Vol 3A, Section 13.6.1 "Interrupt Command Register (ICR)", Figure 13-12.
 pub fn sendInitIpi(apic_id_target: u8) void {
     if (x2Apic) {
         const icr: u64 = (@as(u64, apic_id_target) << 32) | (0b101 << 8) | (1 << 14) | (1 << 15);
@@ -304,6 +342,9 @@ pub fn sendInitIpi(apic_id_target: u8) void {
     }
 }
 
+/// Send a Startup IPI (SIPI) to the target processor. Sets delivery mode to
+/// Start Up (110b) with the vector specifying the real-mode entry page.
+/// Intel SDM Vol 3A, Section 13.6.1 "Interrupt Command Register (ICR)", Figure 13-12.
 pub fn sendSipi(apic_id_target: u8, vector: u8) void {
     if (x2Apic) {
         const icr: u64 = (@as(u64, apic_id_target) << 32) | (0b110 << 8) | vector;
@@ -315,6 +356,9 @@ pub fn sendSipi(apic_id_target: u8, vector: u8) void {
     }
 }
 
+/// Send a self-IPI. In x2APIC mode uses the dedicated Self IPI Register (MSR 83FH).
+/// In xAPIC mode uses the ICR with shorthand destination "self" (bits [19:18] = 01b).
+/// Intel SDM Vol 3A, Section 13.12.11 "SELF IPI Register", Figure 13-30.
 pub fn sendSelfIpi(vector: u8) void {
     if (x2Apic) {
         cpu.wrmsr(@intFromEnum(X2ApicMsr.self_interrupt_register), vector);
@@ -324,6 +368,8 @@ pub fn sendSelfIpi(vector: u8) void {
     }
 }
 
+/// Send a fixed-delivery IPI to the target processor with the given vector.
+/// Intel SDM Vol 3A, Section 13.6.1 "Interrupt Command Register (ICR)", Figure 13-12.
 pub fn sendIpi(apic_id_target: u8, vector: u8) void {
     if (x2Apic) {
         const icr: u64 = (@as(u64, apic_id_target) << 32) | (1 << 14) | @as(u64, vector);
@@ -335,6 +381,9 @@ pub fn sendIpi(apic_id_target: u8, vector: u8) void {
     }
 }
 
+/// Program the spurious-interrupt vector register to enable the local APIC
+/// and set the spurious interrupt vector number.
+/// Intel SDM Vol 3A, Section 13.9 "Spurious Interrupt", Figure 13-23.
 pub fn enableSpuriousVector(vector: u8) void {
     if (x2Apic) {
         _ = cpu.enableX2Apic(vector);
