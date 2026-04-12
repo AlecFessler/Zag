@@ -121,28 +121,28 @@ pub fn SlabAllocator(
             if (maybe_slab) |slab| {
                 if (DBG) self.allocations += 1;
                 return @ptrCast(slab);
-            } else {
-                const slice = self.backing_allocator.alloc(T, allocation_chunk_size) catch return null;
-
-                const alloc_header = self.backing_allocator.create(AllocHeader) catch {
-                    self.backing_allocator.free(slice);
-                    return null;
-                };
-                alloc_header.* = .{
-                    .ptr = slice.ptr,
-                    .len = slice.len,
-                    .next = self.alloc_headers,
-                };
-                self.alloc_headers = alloc_header;
-
-                const new_slab = &slice[0];
-                for (slice[1..]) |*slab| {
-                    self.freelist.push(slab);
-                }
-
-                if (DBG) self.allocations += 1;
-                return @ptrCast(new_slab);
             }
+
+            const slice = self.backing_allocator.alloc(T, allocation_chunk_size) catch return null;
+
+            const alloc_header = self.backing_allocator.create(AllocHeader) catch {
+                self.backing_allocator.free(slice);
+                return null;
+            };
+            alloc_header.* = .{
+                .ptr = slice.ptr,
+                .len = slice.len,
+                .next = self.alloc_headers,
+            };
+            self.alloc_headers = alloc_header;
+
+            const new_slab = &slice[0];
+            for (slice[1..]) |*slab| {
+                self.freelist.push(slab);
+            }
+
+            if (DBG) self.allocations += 1;
+            return @ptrCast(new_slab);
         }
 
         fn resize(

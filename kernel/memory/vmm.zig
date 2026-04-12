@@ -1018,16 +1018,17 @@ fn updateCommittedPages(
             }
             page_addr += paging.PAGE4K;
         }
-    } else {
-        const perms = rightsToMemPerms(rights, privilege);
-        var page_addr = node.start.addr;
-        while (page_addr < node.end()) {
-            const vaddr = VAddr.fromInt(page_addr);
-            if (arch.resolveVaddr(addr_space_root, vaddr) != null) {
-                arch.updatePagePerms(addr_space_root, vaddr, perms);
-            }
-            page_addr += paging.PAGE4K;
+        return;
+    }
+
+    const perms = rightsToMemPerms(rights, privilege);
+    var page_addr = node.start.addr;
+    while (page_addr < node.end()) {
+        const vaddr = VAddr.fromInt(page_addr);
+        if (arch.resolveVaddr(addr_space_root, vaddr) != null) {
+            arch.updatePagePerms(addr_space_root, vaddr, perms);
         }
+        page_addr += paging.PAGE4K;
     }
 }
 

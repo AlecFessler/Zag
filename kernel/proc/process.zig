@@ -1534,50 +1534,50 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
     const total_mapped = (page_end - page_start) + (if (has_bss and bss_end > bss_start) bss_end - bss_start else 0);
     if (total_mapped > MAX_ELF_MAPPED_SIZE) return error.InvalidElf;
 
-    if (page_end > page_start) {
-        try proc.vmm.insertKernelNode(
-            VAddr.fromInt(page_start),
-            page_end - page_start,
-            .{ .read = true, .write = true, .execute = true },
-            .preserve,
-        );
+    if (page_end <= page_start) return error.InvalidElf;
 
-        const load_perms = MemoryPerms{
-            .write_perm = .write,
-            .execute_perm = .execute,
-            .cache_perm = .write_back,
-            .global_perm = .not_global,
-            .privilege_perm = .user,
-        };
+    try proc.vmm.insertKernelNode(
+        VAddr.fromInt(page_start),
+        page_end - page_start,
+        .{ .read = true, .write = true, .execute = true },
+        .preserve,
+    );
 
-        var page_va = page_start;
-        while (page_va < page_end) {
-            const page = try pmm_iface.create(paging.PageMem(.page4k));
-            @memset(std.mem.asBytes(page), 0);
-            const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
-            try arch.mapPage(proc.addr_space_root, phys, VAddr.fromInt(page_va), load_perms);
-            page_va += paging.PAGE4K;
-        }
+    const load_perms = MemoryPerms{
+        .write_perm = .write,
+        .execute_perm = .execute,
+        .cache_perm = .write_back,
+        .global_perm = .not_global,
+        .privilege_perm = .user,
+    };
 
-        i = 0;
-        while (i < phdr_count) {
-            const off = phdr_offset + i * phdr_size;
-            const phdr = std.mem.bytesAsValue(elf.Elf64_Phdr, elf_binary[off..][0..@sizeOf(elf.Elf64_Phdr)]);
-            if (phdr.p_type != elf.PT_LOAD) {
-                i += 1;
-                continue;
-            }
-            if (phdr.p_filesz == 0) {
-                i += 1;
-                continue;
-            }
+    var page_va = page_start;
+    while (page_va < page_end) {
+        const page = try pmm_iface.create(paging.PageMem(.page4k));
+        @memset(std.mem.asBytes(page), 0);
+        const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
+        try arch.mapPage(proc.addr_space_root, phys, VAddr.fromInt(page_va), load_perms);
+        page_va += paging.PAGE4K;
+    }
 
-            const seg_vaddr = aslr_base + phdr.p_vaddr;
-            if (phdr.p_offset + phdr.p_filesz > elf_binary.len) return error.InvalidElf;
-
-            writeToUserPages(proc.addr_space_root, seg_vaddr, elf_binary[phdr.p_offset..][0..phdr.p_filesz]);
+    i = 0;
+    while (i < phdr_count) {
+        const off = phdr_offset + i * phdr_size;
+        const phdr = std.mem.bytesAsValue(elf.Elf64_Phdr, elf_binary[off..][0..@sizeOf(elf.Elf64_Phdr)]);
+        if (phdr.p_type != elf.PT_LOAD) {
             i += 1;
+            continue;
         }
+        if (phdr.p_filesz == 0) {
+            i += 1;
+            continue;
+        }
+
+        const seg_vaddr = aslr_base + phdr.p_vaddr;
+        if (phdr.p_offset + phdr.p_filesz > elf_binary.len) return error.InvalidElf;
+
+        writeToUserPages(proc.addr_space_root, seg_vaddr, elf_binary[phdr.p_offset..][0..phdr.p_filesz]);
+        i += 1;
     }
 
     if (has_bss and bss_end > bss_start) {

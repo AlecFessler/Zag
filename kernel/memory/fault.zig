@@ -60,15 +60,15 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     const is_write = fault.is_write;
     const is_exec = fault.is_exec;
 
-    if (is_kernel_privilege) {
-        if (is_user_va) {
-            const thread = scheduler.currentThread() orelse @panic("kernel page fault on user VA with no current thread");
-            arch.print("K: PAGEFAULT pid={d} addr=0x{x} w={} x={}\n", .{ thread.process.pid, fault.faulting_address, is_write, is_exec });
-            thread.process.kill(accessReason(is_write, is_exec));
-            arch.enableInterrupts();
-            while (true) arch.halt();
-        }
+    if (is_kernel_privilege and is_user_va) {
+        const thread = scheduler.currentThread() orelse @panic("kernel page fault on user VA with no current thread");
+        arch.print("K: PAGEFAULT pid={d} addr=0x{x} w={} x={}\n", .{ thread.process.pid, fault.faulting_address, is_write, is_exec });
+        thread.process.kill(accessReason(is_write, is_exec));
+        arch.enableInterrupts();
+        while (true) arch.halt();
+    }
 
+    if (is_kernel_privilege) {
         switch (stack_mod.isKernelStackPage(faulting_virt)) {
             .usable => {
                 demandPageKernel(faulting_virt);
