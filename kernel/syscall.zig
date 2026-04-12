@@ -1861,45 +1861,45 @@ fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
 
     target_proc.msg_box.lock.lock();
 
-    if (target_proc.msg_box.isReceiving()) {
-        // Receiver is waiting — deliver directly
-        const receiver = target_proc.msg_box.takeReceiverLocked();
-        // Snapshot receiver regs that we're about to overwrite, so we can
-        // restore them if cap transfer fails and the receiver re-blocks.
-        const saved_rax = receiver.ctx.regs.rax;
-        const saved_r14 = receiver.ctx.regs.r14;
-        const saved_payload = savePayload(receiver.ctx);
-        copyPayload(receiver.ctx, ctx, meta.word_count);
-        // Set recv metadata: bit 0 = 0 (from send), bits [3:1] = word_count
-        receiver.ctx.regs.r14 = @as(u64, meta.word_count) << 1;
-        receiver.ctx.regs.rax = @bitCast(E_OK);
-
-        // Handle capability transfer
-        if (meta.cap_transfer) {
-            const cap = getCapPayload(ctx, meta.word_count);
-            const cap_result = transferCapability(proc, target_proc, cap.handle, cap.rights);
-            if (cap_result != E_OK) {
-                // Roll back: restore receiver ctx and re-block.
-                receiver.ctx.regs.rax = saved_rax;
-                receiver.ctx.regs.r14 = saved_r14;
-                restorePayload(receiver.ctx, saved_payload);
-                target_proc.msg_box.beginReceivingLocked(receiver);
-                target_proc.msg_box.lock.unlock();
-                return .{ .rax = cap_result };
-            }
-        }
-
-        // Send has no caller to reply to.
-        target_proc.msg_box.beginPendingReplyLocked(null);
-        target_proc.msg_box.lock.unlock();
-
-        wakeThread(receiver);
-        return .{ .rax = E_OK };
-    } else {
+    if (!target_proc.msg_box.isReceiving()) {
         // No receiver waiting
         target_proc.msg_box.lock.unlock();
         return .{ .rax = E_AGAIN };
     }
+
+    // Receiver is waiting — deliver directly
+    const receiver = target_proc.msg_box.takeReceiverLocked();
+    // Snapshot receiver regs that we're about to overwrite, so we can
+    // restore them if cap transfer fails and the receiver re-blocks.
+    const saved_rax = receiver.ctx.regs.rax;
+    const saved_r14 = receiver.ctx.regs.r14;
+    const saved_payload = savePayload(receiver.ctx);
+    copyPayload(receiver.ctx, ctx, meta.word_count);
+    // Set recv metadata: bit 0 = 0 (from send), bits [3:1] = word_count
+    receiver.ctx.regs.r14 = @as(u64, meta.word_count) << 1;
+    receiver.ctx.regs.rax = @bitCast(E_OK);
+
+    // Handle capability transfer
+    if (meta.cap_transfer) {
+        const cap = getCapPayload(ctx, meta.word_count);
+        const cap_result = transferCapability(proc, target_proc, cap.handle, cap.rights);
+        if (cap_result != E_OK) {
+            // Roll back: restore receiver ctx and re-block.
+            receiver.ctx.regs.rax = saved_rax;
+            receiver.ctx.regs.r14 = saved_r14;
+            restorePayload(receiver.ctx, saved_payload);
+            target_proc.msg_box.beginReceivingLocked(receiver);
+            target_proc.msg_box.lock.unlock();
+            return .{ .rax = cap_result };
+        }
+    }
+
+    // Send has no caller to reply to.
+    target_proc.msg_box.beginPendingReplyLocked(null);
+    target_proc.msg_box.lock.unlock();
+
+    wakeThread(receiver);
+    return .{ .rax = E_OK };
 }
 
 fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
@@ -1995,31 +1995,11 @@ fn sysIpcRecv(ctx: *ArchCpuContext) SyscallResult {
         return .{ .rax = E_BUSY };
     }
 
-    if (proc.msg_box.dequeueLocked()) |waiter| {
-        // Copy payload from waiter's saved context.
-        const waiter_meta = parseIpcMetadata(waiter.ctx.regs.r14);
-        copyPayload(ctx, waiter.ctx, waiter_meta.word_count);
-
-        // Set recv metadata: bit 0 = 1 (always from call — send doesn't queue).
-        ctx.regs.r14 = (@as(u64, waiter_meta.word_count) << 1) | 1;
-
-        // Handle capability transfer.
-        if (waiter_meta.cap_transfer) {
-            const cap = getCapPayload(waiter.ctx, waiter_meta.word_count);
-            const cap_result = transferCapability(waiter.process, proc, cap.handle, cap.rights);
-            if (cap_result != E_OK) {
-                // Put waiter back at head of the queue.
-                proc.msg_box.enqueueFrontLocked(waiter);
-                proc.msg_box.lock.unlock();
-                return .{ .rax = cap_result };
-            }
+    const waiter = proc.msg_box.dequeueLocked() orelse {
+        if (!blocking) {
+            proc.msg_box.lock.unlock();
+            return .{ .rax = E_AGAIN };
         }
-
-        proc.msg_box.beginPendingReplyLocked(waiter);
-        proc.msg_box.lock.unlock();
-
-        return .{ .rax = E_OK };
-    } else if (blocking) {
         // Block on recv.
         proc.msg_box.beginReceivingLocked(thread);
         proc.msg_box.lock.unlock();
@@ -2029,10 +2009,32 @@ fn sysIpcRecv(ctx: *ArchCpuContext) SyscallResult {
         thread.on_cpu.store(false, .release);
         sched.switchToNextReady();
         // Never reached — sender delivers message and wakes us via switchTo.
-    } else {
-        proc.msg_box.lock.unlock();
-        return .{ .rax = E_AGAIN };
+        return .{ .rax = E_OK };
+    };
+
+    // Copy payload from waiter's saved context.
+    const waiter_meta = parseIpcMetadata(waiter.ctx.regs.r14);
+    copyPayload(ctx, waiter.ctx, waiter_meta.word_count);
+
+    // Set recv metadata: bit 0 = 1 (always from call — send doesn't queue).
+    ctx.regs.r14 = (@as(u64, waiter_meta.word_count) << 1) | 1;
+
+    // Handle capability transfer.
+    if (waiter_meta.cap_transfer) {
+        const cap = getCapPayload(waiter.ctx, waiter_meta.word_count);
+        const cap_result = transferCapability(waiter.process, proc, cap.handle, cap.rights);
+        if (cap_result != E_OK) {
+            // Put waiter back at head of the queue.
+            proc.msg_box.enqueueFrontLocked(waiter);
+            proc.msg_box.lock.unlock();
+            return .{ .rax = cap_result };
+        }
     }
+
+    proc.msg_box.beginPendingReplyLocked(waiter);
+    proc.msg_box.lock.unlock();
+
+    return .{ .rax = E_OK };
 }
 
 fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
@@ -2140,19 +2142,18 @@ fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
     } else {
         proc.msg_box.lock.unlock();
 
-        if (caller_thread) |ct| {
-            thread.state = .ready;
-            ctx.regs.rax = @bitCast(reply_cap_err);
-            const result = sched.switchToThread(thread, ct, ctx, true);
-            if (result != 0) {
-                thread.state = .running;
-                wakeThread(ct);
-                return .{ .rax = reply_cap_err };
-            }
-            unreachable;
-        } else {
+        if (caller_thread == null) return .{ .rax = reply_cap_err };
+
+        const ct = caller_thread.?;
+        thread.state = .ready;
+        ctx.regs.rax = @bitCast(reply_cap_err);
+        const result = sched.switchToThread(thread, ct, ctx, true);
+        if (result != 0) {
+            thread.state = .running;
+            wakeThread(ct);
             return .{ .rax = reply_cap_err };
         }
+        unreachable;
     }
 }
 
