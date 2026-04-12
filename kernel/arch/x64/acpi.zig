@@ -462,26 +462,34 @@ fn parseMcfg(mcfg_vaddr: VAddr, length: u32) !void {
 
     const num_entries = (length - header_size) / entry_size;
     var i: u32 = 0;
-    while (i < num_entries) : (i += 1) {
+    while (i < num_entries) {
         const entry_addr = mcfg_vaddr.addr + header_size + @as(u64, i) * entry_size;
         const bytes: [*]const u8 = @ptrFromInt(entry_addr);
         const base_address = std.mem.readInt(u64, bytes[0..8], .little);
         const start_bus = bytes[10];
         const end_bus = bytes[11];
 
-        if (base_address == 0) continue;
+        if (base_address == 0) {
+            i += 1;
+            continue;
+        }
 
         const ecam_phys = PAddr.fromInt(base_address);
         const ecam_size = (@as(u64, end_bus) - @as(u64, start_bus) + 1) << 20;
 
         var offset: u64 = 0;
-        while (offset < ecam_size) : (offset += paging.PAGE4K) {
+        while (offset < ecam_size) {
             const page_phys = PAddr.fromInt(base_address + offset);
             const page_virt = VAddr.fromPAddr(page_phys, null);
-            arch.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS) catch continue;
+            arch.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS) catch {
+                offset += paging.PAGE4K;
+                continue;
+            };
+            offset += paging.PAGE4K;
         }
 
         enumeratePci(VAddr.fromPAddr(ecam_phys, null), start_bus, end_bus);
+        i += 1;
     }
 }
 
@@ -532,50 +540,71 @@ fn pciClassToDeviceClass(class: u8, subclass: u8) DeviceClass {
 
 fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
     var bus: u16 = start_bus;
-    while (bus <= end_bus) : (bus += 1) {
+    while (bus <= end_bus) {
         var dev: u8 = 0;
-        while (dev < 32) : (dev += 1) {
+        while (dev < 32) {
             const vendor_device = pciConfigRead32(ecam_base, @intCast(bus), @intCast(dev), 0, 0);
             const vendor: u16 = @truncate(vendor_device);
-            if (vendor == 0xFFFF) continue;
+            if (vendor == 0xFFFF) {
+                dev += 1;
+                continue;
+            }
 
             const header_type = @as(u8, @truncate(pciConfigRead32(ecam_base, @intCast(bus), @intCast(dev), 0, 0x0C) >> 16));
             const max_func: u8 = if (header_type & 0x80 != 0) 8 else 1;
 
             var func: u8 = 0;
-            while (func < max_func) : (func += 1) {
+            while (func < max_func) {
                 const vd = pciConfigRead32(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), 0);
                 const v: u16 = @truncate(vd);
                 const d: u16 = @truncate(vd >> 16);
-                if (v == 0xFFFF) continue;
+                if (v == 0xFFFF) {
+                    func += 1;
+                    continue;
+                }
 
                 const class_reg = pciConfigRead32(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), 0x08);
                 const class_code: u8 = @truncate(class_reg >> 24);
                 const subclass: u8 = @truncate(class_reg >> 16);
 
-                if (class_code == 0x06) continue;
+                if (class_code == 0x06) {
+                    func += 1;
+                    continue;
+                }
 
                 const device_class = pciClassToDeviceClass(class_code, subclass);
 
-                if (header_type & 0x7F != 0) continue;
+                if (header_type & 0x7F != 0) {
+                    func += 1;
+                    continue;
+                }
 
                 // Enable bus mastering and memory space for all devices
                 const cmd_reg = pciConfigRead32(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), 0x04);
                 pciConfigWrite32(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), 0x04, cmd_reg | 0x06);
 
                 var bar_idx: u12 = 0;
-                while (bar_idx < 6) : (bar_idx += 1) {
+                while (bar_idx < 6) {
                     const bar_offset: u12 = 0x10 + bar_idx * 4;
                     const bar_val = pciConfigRead32(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), bar_offset);
 
-                    if (bar_val == 0) continue;
+                    if (bar_val == 0) {
+                        bar_idx += 1;
+                        continue;
+                    }
 
                     if (bar_val & 1 != 0) {
                         const port_base: u16 = @truncate(bar_val & 0xFFFC);
-                        if (port_base == 0) continue;
+                        if (port_base == 0) {
+                            bar_idx += 1;
+                            continue;
+                        }
                         const port_size = pciEcamProbeBarSize(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), bar_offset);
                         const port_count: u16 = if (port_size > 0) @truncate(port_size) else 32;
-                        _ = device_registry.registerPortIoDevice(port_base, port_count, device_class, v, d, class_code, subclass, @intCast(bus), @intCast(dev), @intCast(func)) catch continue;
+                        _ = device_registry.registerPortIoDevice(port_base, port_count, device_class, v, d, class_code, subclass, @intCast(bus), @intCast(dev), @intCast(func)) catch {
+                            bar_idx += 1;
+                            continue;
+                        };
                     } else {
                         const bar_type = (bar_val >> 1) & 0x3;
                         var phys_addr: u64 = bar_val & 0xFFFFFFF0;
@@ -586,7 +615,10 @@ fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
                             bar_idx += 1;
                         }
 
-                        if (phys_addr == 0) continue;
+                        if (phys_addr == 0) {
+                            bar_idx += 1;
+                            continue;
+                        }
 
                         const bar_size = pciEcamProbeBarSize(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), bar_offset);
                         const aligned_size = if (bar_size >= paging.PAGE4K)
@@ -605,14 +637,21 @@ fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
                             @intCast(bus),
                             @intCast(dev),
                             @intCast(func),
-                        ) catch continue;
+                        ) catch {
+                            bar_idx += 1;
+                            continue;
+                        };
 
                         // Only register the first MMIO BAR per PCI function.
                         break;
                     }
+                    bar_idx += 1;
                 }
+                func += 1;
             }
+            dev += 1;
         }
+        bus += 1;
     }
 }
 
@@ -655,53 +694,77 @@ fn pciLegacyRead32(bus: u8, dev: u5, func: u3, offset: u8) u32 {
 
 fn enumeratePciLegacy() void {
     var bus: u16 = 0;
-    while (bus < 256) : (bus += 1) {
+    while (bus < 256) {
         var dev: u8 = 0;
-        while (dev < 32) : (dev += 1) {
+        while (dev < 32) {
             const vendor_device = pciLegacyRead32(@intCast(bus), @intCast(dev), 0, 0);
             const vendor: u16 = @truncate(vendor_device);
-            if (vendor == 0xFFFF) continue;
+            if (vendor == 0xFFFF) {
+                dev += 1;
+                continue;
+            }
 
             const header_type = @as(u8, @truncate(pciLegacyRead32(@intCast(bus), @intCast(dev), 0, 0x0C) >> 16));
             const max_func: u8 = if (header_type & 0x80 != 0) 8 else 1;
 
             var func: u8 = 0;
-            while (func < max_func) : (func += 1) {
+            while (func < max_func) {
                 const vd = pciLegacyRead32(@intCast(bus), @intCast(dev), @intCast(func), 0);
                 const v: u16 = @truncate(vd);
                 const d: u16 = @truncate(vd >> 16);
-                if (v == 0xFFFF) continue;
+                if (v == 0xFFFF) {
+                    func += 1;
+                    continue;
+                }
 
                 const class_reg = pciLegacyRead32(@intCast(bus), @intCast(dev), @intCast(func), 0x08);
                 const class_code: u8 = @truncate(class_reg >> 24);
                 const subclass: u8 = @truncate(class_reg >> 16);
 
-                if (class_code == 0x06) continue;
+                if (class_code == 0x06) {
+                    func += 1;
+                    continue;
+                }
 
                 const device_class = pciClassToDeviceClass(class_code, subclass);
 
-                if (header_type & 0x7F != 0) continue;
+                if (header_type & 0x7F != 0) {
+                    func += 1;
+                    continue;
+                }
 
                 // Enable bus mastering and memory space for all devices
                 const cmd_reg = pciLegacyRead32(@intCast(bus), @intCast(dev), @intCast(func), 0x04);
                 pciLegacyWrite32(@intCast(bus), @intCast(dev), @intCast(func), 0x04, cmd_reg | 0x06);
 
                 var bar_idx: u8 = 0;
-                while (bar_idx < 6) : (bar_idx += 1) {
+                while (bar_idx < 6) {
                     const bar_offset: u8 = 0x10 + bar_idx * 4;
                     const bar_val = pciLegacyRead32(@intCast(bus), @intCast(dev), @intCast(func), bar_offset);
 
-                    if (bar_val == 0) continue;
+                    if (bar_val == 0) {
+                        bar_idx += 1;
+                        continue;
+                    }
 
                     if (bar_val & 1 != 0) {
                         const port_base: u16 = @truncate(bar_val & 0xFFFC);
-                        if (port_base == 0) continue;
+                        if (port_base == 0) {
+                            bar_idx += 1;
+                            continue;
+                        }
                         const port_size = pciProbeBarSize(@intCast(bus), @intCast(dev), @intCast(func), bar_offset);
                         const port_count: u16 = if (port_size > 0) @truncate(port_size) else 32;
-                        _ = device_registry.registerPortIoDevice(port_base, port_count, device_class, v, d, class_code, subclass, @intCast(bus), @intCast(dev), @intCast(func)) catch continue;
+                        _ = device_registry.registerPortIoDevice(port_base, port_count, device_class, v, d, class_code, subclass, @intCast(bus), @intCast(dev), @intCast(func)) catch {
+                            bar_idx += 1;
+                            continue;
+                        };
                     } else {
                         const phys_addr: u64 = bar_val & 0xFFFFFFF0;
-                        if (phys_addr == 0) continue;
+                        if (phys_addr == 0) {
+                            bar_idx += 1;
+                            continue;
+                        }
                         const bar_size = pciProbeBarSize(@intCast(bus), @intCast(dev), @intCast(func), bar_offset);
                         const aligned_size = if (bar_size >= paging.PAGE4K)
                             std.mem.alignForward(u64, bar_size, paging.PAGE4K)
@@ -719,14 +782,21 @@ fn enumeratePciLegacy() void {
                             @intCast(bus),
                             @intCast(dev),
                             @intCast(func),
-                        ) catch continue;
+                        ) catch {
+                            bar_idx += 1;
+                            continue;
+                        };
 
                         // Only register the first MMIO BAR per PCI function.
                         break;
                     }
+                    bar_idx += 1;
                 }
+                func += 1;
             }
+            dev += 1;
         }
+        bus += 1;
     }
 }
 
@@ -830,12 +900,13 @@ fn initIommuDevices() void {
     if (!iommu.isAvailable()) return;
 
     var i: u32 = 0;
-    while (i < device_registry.count()) : (i += 1) {
+    while (i < device_registry.count()) {
         if (device_registry.getDevice(i)) |device| {
             if (device.device_type == .mmio and (device.detail.pci.bus != 0 or device.detail.pci.dev != 0 or device.detail.pci.func != 0)) {
                 iommu.setupDevice(device) catch {};
             }
         }
+        i += 1;
     }
 
     // Translation enable is deferred to the first mem_dma_map syscall.

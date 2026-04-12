@@ -70,13 +70,14 @@ pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
 
 pub fn unmapDmaPages(device: *DeviceRegion, dma_base: u64, num_pages: u64) void {
     var i: u64 = 0;
-    while (i < num_pages) : (i += 1) {
+    while (i < num_pages) {
         const dma_addr = dma_base + i * 0x1000;
         switch (active_type) {
             .intel_vtd => vtd.unmapDmaPage(device, dma_addr),
             .amd_vi => vi.unmapDmaPage(device, dma_addr),
             .none => {},
         }
+        i += 1;
     }
     switch (active_type) {
         .amd_vi => vi.flushDevice(device),

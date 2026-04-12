@@ -186,8 +186,9 @@ fn issueGlobalCommand(cmd_bit: u32, status_bit: u32) void {
     const current = readReg32(REG_GSTS) & GSTS_CMD_MASK;
     writeReg32(REG_GCMD, current | cmd_bit);
     var timeout: u32 = 0;
-    while (timeout < 1000000) : (timeout += 1) {
+    while (timeout < 1000000) {
         if (readReg32(REG_GSTS) & status_bit != 0) break;
+        timeout += 1;
     }
 }
 
@@ -422,9 +423,10 @@ fn invalidateContextCache() void {
     // ICC=1 (bit 63), CIRG=01 (bit 61) = global invalidation
     writeReg64(REG_CCMD, (@as(u64, 1) << 63) | (@as(u64, 1) << 61));
     var timeout: u32 = 0;
-    while (timeout < 1000000) : (timeout += 1) {
+    while (timeout < 1000000) {
         const val = @as(*const volatile u64, @ptrFromInt(iommu_base + REG_CCMD)).*;
         if (val & (@as(u64, 1) << 63) == 0) break;
+        timeout += 1;
     }
 }
 
@@ -447,8 +449,9 @@ pub fn invalidateIotlb() void {
     // IVT=1 (bit 63), IIRG=01 (bit 60) = global invalidation
     writeReg64(reg, @as(u64, 1) << 63 | @as(u64, 1) << 60);
     var timeout: u32 = 0;
-    while (timeout < 1000000) : (timeout += 1) {
+    while (timeout < 1000000) {
         const val = @as(*const volatile u64, @ptrFromInt(iommu_base + reg)).*;
         if (val & (@as(u64, 1) << 63) == 0) break;
+        timeout += 1;
     }
 }
