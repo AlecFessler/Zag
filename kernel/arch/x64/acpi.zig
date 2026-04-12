@@ -45,6 +45,7 @@ pub const GenericAddressStruct = packed struct {
     address: u64,
 };
 
+/// IA-PC HPET Specification §3.2.4 — HPET Description Table layout.
 pub const HpetTable = packed struct {
     signature: u32,
     length: u32,
@@ -110,6 +111,7 @@ pub const LocalApic = packed struct {
     flags: u32,
 };
 
+/// ACPI Specification §5.2.12 — Multiple APIC Description Table (MADT).
 pub const Madt = packed struct {
     signature: u32,
     length: u32,
@@ -205,6 +207,7 @@ pub const Sdt = packed struct {
     }
 };
 
+/// ACPI Specification §5.2.5.3 — Extended System Description Pointer (XSDP).
 pub const Xsdp = packed struct {
     signature: u64,
     checksum20: u8,
@@ -245,6 +248,7 @@ pub const Xsdp = packed struct {
     }
 };
 
+/// ACPI Specification §5.2.8 — Extended System Description Table (XSDT).
 pub const Xsdt = packed struct {
     signature: u32,
     length: u32,
@@ -455,6 +459,7 @@ const MMIO_PERMS: MemoryPerms = .{
     .privilege_perm = .kernel,
 };
 
+/// PCI Firmware Specification §4.1.2 — MCFG table; maps ECAM base addresses per segment/bus range.
 fn parseMcfg(mcfg_vaddr: VAddr, length: u32) !void {
     const header_size: u32 = 44;
     const entry_size: u32 = 16;
@@ -493,6 +498,7 @@ fn parseMcfg(mcfg_vaddr: VAddr, length: u32) !void {
     }
 }
 
+/// PCI Express Base Specification §7.2.2 — ECAM config space read (32-bit).
 fn pciConfigRead32(ecam_base: VAddr, bus: u8, dev: u5, func: u3, offset: u12) u32 {
     const addr = ecam_base.addr +
         (@as(u64, bus) << 20) |
@@ -502,6 +508,7 @@ fn pciConfigRead32(ecam_base: VAddr, bus: u8, dev: u5, func: u3, offset: u12) u3
     return @as(*const volatile u32, @ptrFromInt(addr)).*;
 }
 
+/// PCI Express Base Specification §7.2.2 — ECAM config space write (32-bit).
 fn pciConfigWrite32(ecam_base: VAddr, bus: u8, dev: u5, func: u3, offset: u12, value: u32) void {
     const addr = ecam_base.addr +
         (@as(u64, bus) << 20) |
@@ -511,6 +518,7 @@ fn pciConfigWrite32(ecam_base: VAddr, bus: u8, dev: u5, func: u3, offset: u12, v
     @as(*volatile u32, @ptrFromInt(addr)).* = value;
 }
 
+/// PCI Local Bus Specification §6.2.5.1 — BAR sizing via all-ones write/readback.
 fn pciEcamProbeBarSize(ecam_base: VAddr, bus: u8, dev: u5, func: u3, bar_offset: u12) u64 {
     const original = pciConfigRead32(ecam_base, bus, dev, func, bar_offset);
     pciConfigWrite32(ecam_base, bus, dev, func, bar_offset, 0xFFFFFFFF);
@@ -605,47 +613,48 @@ fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
                             bar_idx += 1;
                             continue;
                         };
-                    } else {
-                        const bar_type = (bar_val >> 1) & 0x3;
-                        var phys_addr: u64 = bar_val & 0xFFFFFFF0;
-
-                        if (bar_type == 2 and bar_idx < 5) {
-                            const bar_high = pciConfigRead32(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), bar_offset + 4);
-                            phys_addr |= @as(u64, bar_high) << 32;
-                            bar_idx += 1;
-                        }
-
-                        if (phys_addr == 0) {
-                            bar_idx += 1;
-                            continue;
-                        }
-
-                        const bar_size = pciEcamProbeBarSize(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), bar_offset);
-                        const aligned_size = if (bar_size >= paging.PAGE4K)
-                            std.mem.alignForward(u64, bar_size, paging.PAGE4K)
-                        else
-                            paging.PAGE4K;
-
-                        _ = device_registry.registerMmioDevice(
-                            PAddr.fromInt(phys_addr),
-                            aligned_size,
-                            device_class,
-                            v,
-                            d,
-                            class_code,
-                            subclass,
-                            @intCast(bus),
-                            @intCast(dev),
-                            @intCast(func),
-                        ) catch {
-                            bar_idx += 1;
-                            continue;
-                        };
-
-                        // Only register the first MMIO BAR per PCI function.
-                        break;
+                        bar_idx += 1;
+                        continue;
                     }
-                    bar_idx += 1;
+
+                    const bar_type = (bar_val >> 1) & 0x3;
+                    var phys_addr: u64 = bar_val & 0xFFFFFFF0;
+
+                    if (bar_type == 2 and bar_idx < 5) {
+                        const bar_high = pciConfigRead32(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), bar_offset + 4);
+                        phys_addr |= @as(u64, bar_high) << 32;
+                        bar_idx += 1;
+                    }
+
+                    if (phys_addr == 0) {
+                        bar_idx += 1;
+                        continue;
+                    }
+
+                    const bar_size = pciEcamProbeBarSize(ecam_base, @intCast(bus), @intCast(dev), @intCast(func), bar_offset);
+                    const aligned_size = if (bar_size >= paging.PAGE4K)
+                        std.mem.alignForward(u64, bar_size, paging.PAGE4K)
+                    else
+                        paging.PAGE4K;
+
+                    _ = device_registry.registerMmioDevice(
+                        PAddr.fromInt(phys_addr),
+                        aligned_size,
+                        device_class,
+                        v,
+                        d,
+                        class_code,
+                        subclass,
+                        @intCast(bus),
+                        @intCast(dev),
+                        @intCast(func),
+                    ) catch {
+                        bar_idx += 1;
+                        continue;
+                    };
+
+                    // Only register the first MMIO BAR per PCI function.
+                    break;
                 }
                 func += 1;
             }
@@ -655,6 +664,7 @@ fn enumeratePci(ecam_base: VAddr, start_bus: u8, end_bus: u8) void {
     }
 }
 
+/// PCI Local Bus Specification §3.2.2.3.2 — Configuration Mechanism #1; ports 0xCF8/0xCFC write.
 fn pciLegacyWrite32(bus: u8, dev: u5, func: u3, offset: u8, value: u32) void {
     const addr: u32 = 0x80000000 |
         (@as(u32, bus) << 16) |
@@ -665,6 +675,7 @@ fn pciLegacyWrite32(bus: u8, dev: u5, func: u3, offset: u8, value: u32) void {
     cpu.outd(value, 0xCFC);
 }
 
+/// PCI Local Bus Specification §6.2.5.1 — BAR sizing via all-ones write/readback.
 fn pciProbeBarSize(bus: u8, dev: u5, func: u3, bar_offset: u8) u64 {
     const original = pciLegacyRead32(bus, dev, func, bar_offset);
     pciLegacyWrite32(bus, dev, func, bar_offset, 0xFFFFFFFF);
@@ -682,6 +693,7 @@ fn pciProbeBarSize(bus: u8, dev: u5, func: u3, bar_offset: u8) u64 {
     }
 }
 
+/// PCI Local Bus Specification §3.2.2.3.2 — Configuration Mechanism #1; ports 0xCF8/0xCFC read.
 fn pciLegacyRead32(bus: u8, dev: u5, func: u3, offset: u8) u32 {
     const addr: u32 = 0x80000000 |
         (@as(u32, bus) << 16) |
@@ -759,38 +771,39 @@ fn enumeratePciLegacy() void {
                             bar_idx += 1;
                             continue;
                         };
-                    } else {
-                        const phys_addr: u64 = bar_val & 0xFFFFFFF0;
-                        if (phys_addr == 0) {
-                            bar_idx += 1;
-                            continue;
-                        }
-                        const bar_size = pciProbeBarSize(@intCast(bus), @intCast(dev), @intCast(func), bar_offset);
-                        const aligned_size = if (bar_size >= paging.PAGE4K)
-                            std.mem.alignForward(u64, bar_size, paging.PAGE4K)
-                        else
-                            paging.PAGE4K;
-
-                        _ = device_registry.registerMmioDevice(
-                            PAddr.fromInt(phys_addr),
-                            aligned_size,
-                            device_class,
-                            v,
-                            d,
-                            class_code,
-                            subclass,
-                            @intCast(bus),
-                            @intCast(dev),
-                            @intCast(func),
-                        ) catch {
-                            bar_idx += 1;
-                            continue;
-                        };
-
-                        // Only register the first MMIO BAR per PCI function.
-                        break;
+                        bar_idx += 1;
+                        continue;
                     }
-                    bar_idx += 1;
+
+                    const phys_addr: u64 = bar_val & 0xFFFFFFF0;
+                    if (phys_addr == 0) {
+                        bar_idx += 1;
+                        continue;
+                    }
+                    const bar_size = pciProbeBarSize(@intCast(bus), @intCast(dev), @intCast(func), bar_offset);
+                    const aligned_size = if (bar_size >= paging.PAGE4K)
+                        std.mem.alignForward(u64, bar_size, paging.PAGE4K)
+                    else
+                        paging.PAGE4K;
+
+                    _ = device_registry.registerMmioDevice(
+                        PAddr.fromInt(phys_addr),
+                        aligned_size,
+                        device_class,
+                        v,
+                        d,
+                        class_code,
+                        subclass,
+                        @intCast(bus),
+                        @intCast(dev),
+                        @intCast(func),
+                    ) catch {
+                        bar_idx += 1;
+                        continue;
+                    };
+
+                    // Only register the first MMIO BAR per PCI function.
+                    break;
                 }
                 func += 1;
             }
@@ -812,6 +825,7 @@ fn probeSerialPorts() void {
     }
 }
 
+/// Intel VT-d Specification §8.1 — DMA Remapping Reporting (DMAR) structure; finds DRHD unit.
 fn parseDmar(dmar_vaddr: VAddr, length: u32) !void {
     const header_size: u32 = 48;
     if (length <= header_size) return;
@@ -822,18 +836,23 @@ fn parseDmar(dmar_vaddr: VAddr, length: u32) !void {
         const entry_len = @as(*const volatile u16, @ptrFromInt(dmar_vaddr.addr + offset + 2)).*;
         if (entry_len == 0) break;
 
-        if (entry_type == 0 and entry_len >= 16) {
-            const reg_base = @as(*const volatile u64, @ptrFromInt(dmar_vaddr.addr + offset + 8)).*;
-            if (reg_base != 0) {
-                iommu.initIntel(PAddr.fromInt(reg_base)) catch {};
-                break;
-            }
+        if (entry_type != 0 or entry_len < 16) {
+            offset += entry_len;
+            continue;
         }
 
-        offset += entry_len;
+        const reg_base = @as(*const volatile u64, @ptrFromInt(dmar_vaddr.addr + offset + 8)).*;
+        if (reg_base == 0) {
+            offset += entry_len;
+            continue;
+        }
+
+        iommu.initIntel(PAddr.fromInt(reg_base)) catch {};
+        break;
     }
 }
 
+/// AMD I/O Virtualization Technology Specification §5.2 — I/O Virtualization Reporting Structure (IVRS).
 fn parseIvrs(ivrs_vaddr: VAddr, length: u32) !void {
     // IVRS header is 48 bytes (standard ACPI header + IVinfo + reserved).
     const header_size: u32 = 48;
