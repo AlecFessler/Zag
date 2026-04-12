@@ -632,15 +632,15 @@ The accounting window size is userspace-controlled: the interval between consecu
 
 Zag exposes wall clock (real) time as an offset from the monotonic clock. The kernel reads the hardware RTC once at boot to compute an initial offset. `clock_getwall` returns the current wall time by adding the offset to the monotonic clock. `clock_setwall` allows a privileged process to adjust the offset.
 
-**§2.16.1** `clock_getwall` returns nanoseconds since the Unix epoch (1970-01-01T00:00:00Z). No rights check is required. Always succeeds.
+<!-- spec:test:2.16.1 -->**§2.16.1** `clock_getwall` returns nanoseconds since the Unix epoch (1970-01-01T00:00:00Z). No rights check is required. Always succeeds.
 
-**§2.16.2** `clock_setwall` requires `ProcessRights.set_time` on slot 0; returns `E_PERM` without it.
+<!-- spec:test:2.16.2 -->**§2.16.2** `clock_setwall` requires `ProcessRights.set_time` on slot 0; returns `E_PERM` without it.
 
-**§2.16.3** `clock_setwall` atomically updates the wall clock offset so that subsequent `clock_getwall` calls reflect the new time.
+<!-- spec:test:2.16.3 -->**§2.16.3** `clock_setwall` atomically updates the wall clock offset so that subsequent `clock_getwall` calls reflect the new time.
 
 **§2.16.4** `clock_getwall` precision is limited by the underlying monotonic clock source (TSC on x86). The wall clock does not drift independently of the monotonic clock.
 
-**§2.16.5** Root service holds `ProcessRights.set_time` at boot.
+<!-- spec:test:2.16.5 -->**§2.16.5** Root service holds `ProcessRights.set_time` at boot.
 
 ---
 
@@ -648,13 +648,13 @@ Zag exposes wall clock (real) time as an offset from the monotonic clock. The ke
 
 Zag exposes hardware-sourced random bytes to userspace via `getrandom`. The kernel reads directly from the CPU's hardware RNG (RDRAND on x86) with no intermediate entropy pool or blocking.
 
-**§2.17.1** `getrandom` fills a userspace buffer with cryptographically random bytes sourced from the hardware RNG. No rights check is required.
+<!-- spec:test:2.17.1 -->**§2.17.1** `getrandom` fills a userspace buffer with cryptographically random bytes sourced from the hardware RNG. No rights check is required.
 
 **§2.17.2** `getrandom` is non-blocking. If the hardware RNG is temporarily unavailable, it returns `E_AGAIN` rather than waiting.
 
-**§2.17.3** The maximum buffer size per call is 4096 bytes. Requests for more return `E_INVAL`.
+<!-- spec:test:2.17.3 -->**§2.17.3** The maximum buffer size per call is 4096 bytes. Requests for more return `E_INVAL`.
 
-**§2.17.4** Requests with zero length return `E_INVAL`.
+<!-- spec:test:2.17.4 -->**§2.17.4** Requests with zero length return `E_INVAL`.
 
 ---
 
@@ -666,25 +666,25 @@ Zag provides an asynchronous kernel-to-userspace notification mechanism for devi
 
 Each device handle in a process's permissions table has an associated `badge_bit` (u6, range 0--63). When the kernel delivers an IRQ for that device, it sets the corresponding bit in the process's notification word. Userspace reads the notification word via `notify_wait` to determine which devices have pending interrupts.
 
-**§2.18.1** Badge bits are assigned incrementally (mod 64) per process as device handles are inserted into the permissions table. The `badge_counter` increments on each device handle insertion.
+<!-- spec:test:2.18.1 -->**§2.18.1** Badge bits are assigned incrementally (mod 64) per process as device handles are inserted into the permissions table. The `badge_counter` increments on each device handle insertion.
 
-**§2.18.2** The badge bit is stored on the `PermissionEntry` for device region entries and exposed in the user permissions view so userspace can map notification bits to device handles without a syscall.
+<!-- spec:test:2.18.2 -->**§2.18.2** The badge bit is stored on the `PermissionEntry` for device region entries and exposed in the user permissions view so userspace can map notification bits to device handles without a syscall.
 
-**§2.18.3** The badge bit is packed into the upper bits of the device entry `field0` in the user permissions view.
+<!-- spec:test:2.18.3 -->**§2.18.3** The badge bit is packed into the upper bits of the device entry `field0` in the user permissions view.
 
 #### Notification Delivery
 
-**§2.18.4** When a device IRQ fires, the kernel masks the IRQ line, identifies the owning process via the device region, atomically ORs `(1 << badge_bit)` into the process's notification word, and wakes all threads waiting on the notification box.
+<!-- spec:test:2.18.4 -->**§2.18.4** When a device IRQ fires, the kernel masks the IRQ line, identifies the owning process via the device region, atomically ORs `(1 << badge_bit)` into the process's notification word, and wakes all threads waiting on the notification box.
 
-**§2.18.5** `notify_wait` atomically reads and clears the notification word. On success, it returns the bitmask of all accumulated notifications since the last read.
+<!-- spec:test:2.18.5 -->**§2.18.5** `notify_wait` atomically reads and clears the notification word. On success, it returns the bitmask of all accumulated notifications since the last read.
 
-**§2.18.6** `notify_wait` with `timeout_ns = 0` is non-blocking: returns `E_AGAIN` if the notification word is zero.
+<!-- spec:test:2.18.6 -->**§2.18.6** `notify_wait` with `timeout_ns = 0` is non-blocking: returns `E_AGAIN` if the notification word is zero.
 
 **§2.18.7** `notify_wait` with `timeout_ns = MAX_U64` blocks indefinitely until the notification word becomes non-zero.
 
-**§2.18.8** `notify_wait` with a finite timeout returns `E_TIMEOUT` if the notification word remains zero for the duration.
+<!-- spec:test:2.18.8 -->**§2.18.8** `notify_wait` with a finite timeout returns `E_TIMEOUT` if the notification word remains zero for the duration.
 
-**§2.18.9** `irq_ack` unmasks the IRQ line for the device associated with the given handle. Requires `DeviceRegionRights.irq` on the device handle.
+<!-- spec:test:2.18.9 -->**§2.18.9** `irq_ack` unmasks the IRQ line for the device associated with the given handle. Requires `DeviceRegionRights.irq` on the device handle.
 
 **§2.18.10** The typical driver flow is: `notify_wait` to sleep until an IRQ fires, handle the interrupt in userspace, call `irq_ack` to unmask the line and allow future interrupts.
 
@@ -694,7 +694,7 @@ Each device handle in a process's permissions table has an associated `badge_bit
 
 Zag provides two syscalls for system-wide and per-CPU power management, both gated on the `ProcessRights.power` capability bit.
 
-**§2.19.1** `ProcessRights.power` gates both `sys_power` and `sys_cpu_power`. Root service holds this bit at boot.
+<!-- spec:test:2.19.1 -->**§2.19.1** `ProcessRights.power` gates both `sys_power` and `sys_cpu_power`. Root service holds this bit at boot.
 
 #### PowerAction
 
@@ -714,7 +714,7 @@ PowerAction = enum {
 
 **§2.19.3** `sys_power` with `sleep`, `hibernate`, or `screen_off` returns `E_OK` after the system resumes (or the action completes).
 
-**§2.19.4** `sys_power` returns `E_NODEV` if the hardware does not support the requested action.
+<!-- spec:test:2.19.4 -->**§2.19.4** `sys_power` returns `E_NODEV` if the hardware does not support the requested action.
 
 #### CpuPowerAction
 
@@ -731,7 +731,7 @@ CpuPowerAction = enum {
 
 **§2.19.6** `sys_cpu_power` with `set_idle` sets the maximum C-state idle level for the calling core.
 
-**§2.19.7** `sys_cpu_power` returns `E_NODEV` if the hardware does not support the requested action.
+<!-- spec:test:2.19.7 -->**§2.19.7** `sys_cpu_power` returns `E_NODEV` if the hardware does not support the requested action.
 
 ---
 
@@ -1050,43 +1050,43 @@ Typical usage is a two-call pattern: first call with `cores_ptr = null` to obtai
 
 Returns the current wall clock time as nanoseconds since the Unix epoch (1970-01-01T00:00:00Z). The value is computed as the monotonic clock plus a kernel-maintained offset initialized from the hardware RTC at boot (§2.16).
 
-**§4.56.1** `clock_getwall` returns a positive i64 representing nanoseconds since the Unix epoch. **§4.56.2** `clock_getwall` requires no rights and is callable by any process. **§4.56.3** `clock_getwall` always succeeds.
+<!-- spec:test:4.56.1 -->**§4.56.1** `clock_getwall` returns a positive i64 representing nanoseconds since the Unix epoch. <!-- spec:test:4.56.2 -->**§4.56.2** `clock_getwall` requires no rights and is callable by any process. <!-- spec:test:4.56.3 -->**§4.56.3** `clock_getwall` always succeeds.
 
 ### §4.57 clock_setwall(nanoseconds) → result
 
 Sets the wall clock time by recomputing the kernel's internal wall clock offset so that the next `clock_getwall` returns the specified time (§2.16).
 
-**§4.57.1** `clock_setwall` returns `E_OK` on success. **§4.57.2** `clock_setwall` requires `ProcessRights.set_time` on slot 0; returns `E_PERM` without it. **§4.57.3** The offset update is atomic: concurrent `clock_getwall` calls on other threads see either the old or the new time, never a torn value.
+<!-- spec:test:4.57.1 -->**§4.57.1** `clock_setwall` returns `E_OK` on success. <!-- spec:test:4.57.2 -->**§4.57.2** `clock_setwall` requires `ProcessRights.set_time` on slot 0; returns `E_PERM` without it. **§4.57.3** The offset update is atomic: concurrent `clock_getwall` calls on other threads see either the old or the new time, never a torn value.
 
 ### §4.58 getrandom(buf_ptr, len) → result
 
 Fills a userspace buffer with hardware-sourced random bytes (§2.17).
 
-**§4.58.1** `getrandom` returns `E_OK` on success. **§4.58.2** `getrandom` requires no rights and is callable by any process. **§4.58.3** `getrandom` with `len == 0` returns `E_INVAL`. **§4.58.4** `getrandom` with `len > 4096` returns `E_INVAL`. **§4.58.5** `getrandom` with `buf_ptr` not pointing to a writable region of `len` bytes returns `E_BADADDR`. **§4.58.6** `getrandom` returns `E_AGAIN` if the hardware RNG is temporarily unavailable. **§4.58.7** On `E_NODEV`, the hardware has no RNG support at all.
+<!-- spec:test:4.58.1 -->**§4.58.1** `getrandom` returns `E_OK` on success. <!-- spec:test:4.58.2 -->**§4.58.2** `getrandom` requires no rights and is callable by any process. <!-- spec:test:4.58.3 -->**§4.58.3** `getrandom` with `len == 0` returns `E_INVAL`. <!-- spec:test:4.58.4 -->**§4.58.4** `getrandom` with `len > 4096` returns `E_INVAL`. <!-- spec:test:4.58.5 -->**§4.58.5** `getrandom` with `buf_ptr` not pointing to a writable region of `len` bytes returns `E_BADADDR`. **§4.58.6** `getrandom` returns `E_AGAIN` if the hardware RNG is temporarily unavailable. **§4.58.7** On `E_NODEV`, the hardware has no RNG support at all.
 
 ### §4.59 notify_wait(timeout_ns) → bitmask
 
 Waits for the calling process's notification word to become non-zero, then atomically reads and clears it (§2.18).
 
-**§4.59.1** `notify_wait` returns the notification bitmask (positive u64) on success. **§4.59.2** `notify_wait` requires no rights and is callable by any process. **§4.59.3** `notify_wait` with `timeout_ns = 0` is non-blocking: returns `E_AGAIN` if the notification word is zero. **§4.59.4** `notify_wait` with `timeout_ns = MAX_U64` blocks indefinitely until the notification word becomes non-zero. **§4.59.5** `notify_wait` with a finite `timeout_ns` returns `E_TIMEOUT` if the notification word remains zero for the duration.
+<!-- spec:test:4.59.1 -->**§4.59.1** `notify_wait` returns the notification bitmask (positive u64) on success. <!-- spec:test:4.59.2 -->**§4.59.2** `notify_wait` requires no rights and is callable by any process. <!-- spec:test:4.59.3 -->**§4.59.3** `notify_wait` with `timeout_ns = 0` is non-blocking: returns `E_AGAIN` if the notification word is zero. **§4.59.4** `notify_wait` with `timeout_ns = MAX_U64` blocks indefinitely until the notification word becomes non-zero. <!-- spec:test:4.59.5 -->**§4.59.5** `notify_wait` with a finite `timeout_ns` returns `E_TIMEOUT` if the notification word remains zero for the duration.
 
 ### §4.60 irq_ack(device_handle) → result
 
 Unmasks the IRQ line for the device associated with `device_handle`, allowing future interrupts to be delivered (§2.18).
 
-**§4.60.1** `irq_ack` returns `E_OK` on success. **§4.60.2** `irq_ack` with invalid or wrong-type `device_handle` returns `E_BADHANDLE`. **§4.60.3** `irq_ack` without `DeviceRegionRights.irq` on the device handle returns `E_PERM`. **§4.60.4** `irq_ack` on a device with no associated IRQ line returns `E_INVAL`.
+<!-- spec:test:4.60.1 -->**§4.60.1** `irq_ack` returns `E_OK` on success. <!-- spec:test:4.60.2 -->**§4.60.2** `irq_ack` with invalid or wrong-type `device_handle` returns `E_BADHANDLE`. <!-- spec:test:4.60.3 -->**§4.60.3** `irq_ack` without `DeviceRegionRights.irq` on the device handle returns `E_PERM`. <!-- spec:test:4.60.4 -->**§4.60.4** `irq_ack` on a device with no associated IRQ line returns `E_INVAL`.
 
 ### §4.61 sys_power(action) → result
 
 Performs a system-wide power action (§2.19). `action` is a `PowerAction` enum value.
 
-**§4.61.1** `sys_power` returns `E_OK` on success (for actions that return). **§4.61.2** `sys_power` requires `ProcessRights.power` on slot 0; returns `E_PERM` without it. **§4.61.3** `sys_power` with an invalid `action` value returns `E_INVAL`. **§4.61.4** `sys_power` with `shutdown` or `reboot` does not return on success. **§4.61.5** `sys_power` with `sleep`, `hibernate`, or `screen_off` returns `E_OK` after the system resumes or the action completes. **§4.61.6** `sys_power` returns `E_NODEV` if the hardware does not support the requested action.
+**§4.61.1** `sys_power` returns `E_OK` on success (for actions that return). <!-- spec:test:4.61.2 -->**§4.61.2** `sys_power` requires `ProcessRights.power` on slot 0; returns `E_PERM` without it. <!-- spec:test:4.61.3 -->**§4.61.3** `sys_power` with an invalid `action` value returns `E_INVAL`. **§4.61.4** `sys_power` with `shutdown` or `reboot` does not return on success. **§4.61.5** `sys_power` with `sleep`, `hibernate`, or `screen_off` returns `E_OK` after the system resumes or the action completes. <!-- spec:test:4.61.6 -->**§4.61.6** `sys_power` returns `E_NODEV` if the hardware does not support the requested action.
 
 ### §4.62 sys_cpu_power(action, value) → result
 
 Performs a per-CPU power control action (§2.19). `action` is a `CpuPowerAction` enum value.
 
-**§4.62.1** `sys_cpu_power` returns `E_OK` on success. **§4.62.2** `sys_cpu_power` requires `ProcessRights.power` on slot 0; returns `E_PERM` without it. **§4.62.3** `sys_cpu_power` with an invalid `action` value returns `E_INVAL`. **§4.62.4** `sys_cpu_power` with `set_freq` uses `value` as the target frequency in hertz. **§4.62.5** `sys_cpu_power` with `set_idle` uses `value` as the maximum C-state level. **§4.62.6** `sys_cpu_power` returns `E_NODEV` if the hardware does not support the requested action.
+**§4.62.1** `sys_cpu_power` returns `E_OK` on success. <!-- spec:test:4.62.2 -->**§4.62.2** `sys_cpu_power` requires `ProcessRights.power` on slot 0; returns `E_PERM` without it. <!-- spec:test:4.62.3 -->**§4.62.3** `sys_cpu_power` with an invalid `action` value returns `E_INVAL`. **§4.62.4** `sys_cpu_power` with `set_freq` uses `value` as the target frequency in hertz. **§4.62.5** `sys_cpu_power` with `set_idle` uses `value` as the maximum C-state level. <!-- spec:test:4.62.6 -->**§4.62.6** `sys_cpu_power` returns `E_NODEV` if the hardware does not support the requested action.
 
 ---
 
