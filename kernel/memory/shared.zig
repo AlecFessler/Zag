@@ -1,6 +1,7 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const arch = zag.arch.dispatch;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 
@@ -28,7 +29,6 @@ pub const SharedMemory = struct {
         );
         if (num_pages > MAX_PAGES) return error.TooManyPages;
 
-        const arch = @import("zag").arch.dispatch;
         const shm = allocator.create(SharedMemory) catch {
             arch.print("K: SHM slab alloc fail\n", .{});
             return error.OutOfMemory;

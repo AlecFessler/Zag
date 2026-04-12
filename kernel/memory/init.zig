@@ -5,6 +5,7 @@ const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const boot = zag.boot;
 const device_region_mod = zag.memory.device_region;
+const KA = address.KernelVA.KernelAllocators;
 const kvm = zag.kvm;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
@@ -23,8 +24,6 @@ const PAddr = zag.memory.address.PAddr;
 const PhysicalMemoryManager = zag.memory.pmm.PhysicalMemoryManager;
 const Range = zag.utils.range.Range;
 const VAddr = zag.memory.address.VAddr;
-
-const KA = address.KernelVA.KernelAllocators;
 
 pub var kernel_addr_space_root: PAddr = undefined;
 

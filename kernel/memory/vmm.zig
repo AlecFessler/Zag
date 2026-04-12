@@ -374,7 +374,7 @@ pub const VirtualMemoryManager = struct {
         };
     }
 
-    pub fn mem_perms(
+    pub fn memPerms(
         self: *VirtualMemoryManager,
         vm_handle: u64,
         original_start: VAddr,
@@ -430,7 +430,7 @@ pub const VirtualMemoryManager = struct {
         mergeRange(&self.tree, range_start, VAddr.fromInt(range_end_addr));
     }
 
-    pub fn mem_shm_map(
+    pub fn memShmMap(
         self: *VirtualMemoryManager,
         shm_handle: u64,
         vm_handle: u64,
@@ -490,8 +490,9 @@ pub const VirtualMemoryManager = struct {
                 const page_virt = VAddr.fromInt(range_start.addr + @as(u64, i) * paging.PAGE4K);
                 arch.mapPage(self.addr_space_root, phys, page_virt, perms) catch {
                     var j: usize = 0;
-                    while (j < i) : (j += 1) {
+                    while (j < i) {
                         _ = arch.unmapPage(self.addr_space_root, VAddr.fromInt(range_start.addr + @as(u64, j) * paging.PAGE4K));
+                        j += 1;
                     }
                     _ = self.tree.remove(map_node) catch {};
                     freeVmNode(map_node);
@@ -501,7 +502,7 @@ pub const VirtualMemoryManager = struct {
         }
     }
 
-    pub fn mem_shm_unmap(
+    pub fn memShmUnmap(
         self: *VirtualMemoryManager,
         shm: *SharedMemory,
         vm_handle: u64,
@@ -548,7 +549,7 @@ pub const VirtualMemoryManager = struct {
         mergeRange(&self.tree, old_start, VAddr.fromInt(old_start.addr + old_size));
     }
 
-    pub fn mem_mmio_map(
+    pub fn memMmioMap(
         self: *VirtualMemoryManager,
         device_handle: u64,
         vm_handle: u64,
@@ -607,23 +608,25 @@ pub const VirtualMemoryManager = struct {
         // invalid_read / invalid_write / invalid_execute.
         if (rights.read) {
             var mapped: u64 = 0;
-            while (mapped < range_size) : (mapped += paging.PAGE4K) {
+            while (mapped < range_size) {
                 const page_phys = PAddr.fromInt(device.access.mmio.phys_base.addr + mapped);
                 const page_virt = VAddr.fromInt(range_start.addr + mapped);
                 arch.mapPage(self.addr_space_root, page_phys, page_virt, perms) catch {
                     var undo: u64 = 0;
-                    while (undo < mapped) : (undo += paging.PAGE4K) {
+                    while (undo < mapped) {
                         _ = arch.unmapPage(self.addr_space_root, VAddr.fromInt(range_start.addr + undo));
+                        undo += paging.PAGE4K;
                     }
                     _ = self.tree.remove(map_node) catch {};
                     freeVmNode(map_node);
                     return error.OutOfMemory;
                 };
+                mapped += paging.PAGE4K;
             }
         }
     }
 
-    pub fn mem_mmio_unmap(
+    pub fn memMmioUnmap(
         self: *VirtualMemoryManager,
         device: *DeviceRegion,
         vm_handle: u64,
@@ -984,13 +987,14 @@ fn inOrderFind(tree: *VmTree, ctx: anytype) ?*VmNode {
 fn unmapNodePages(node: *VmNode, addr_space_root: PAddr, free_phys: bool) void {
     const pmm_iface = pmm.global_pmm.?.allocator();
     var page_addr = node.start.addr;
-    while (page_addr < node.end()) : (page_addr += paging.PAGE4K) {
+    while (page_addr < node.end()) {
         if (arch.unmapPage(addr_space_root, VAddr.fromInt(page_addr))) |paddr| {
             if (free_phys and node.kind == .private) {
                 const page: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
                 pmm_iface.destroy(page);
             }
         }
+        page_addr += paging.PAGE4K;
     }
 }
 
@@ -1005,22 +1009,24 @@ fn updateCommittedPages(
     if (is_decommit) {
         const pmm_iface = pmm.global_pmm.?.allocator();
         var page_addr = node.start.addr;
-        while (page_addr < node.end()) : (page_addr += paging.PAGE4K) {
+        while (page_addr < node.end()) {
             if (arch.unmapPage(addr_space_root, VAddr.fromInt(page_addr))) |paddr| {
                 if (node.kind == .private) {
                     const page: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
                     pmm_iface.destroy(page);
                 }
             }
+            page_addr += paging.PAGE4K;
         }
     } else {
         const perms = rightsToMemPerms(rights, privilege);
         var page_addr = node.start.addr;
-        while (page_addr < node.end()) : (page_addr += paging.PAGE4K) {
+        while (page_addr < node.end()) {
             const vaddr = VAddr.fromInt(page_addr);
             if (arch.resolveVaddr(addr_space_root, vaddr) != null) {
                 arch.updatePagePerms(addr_space_root, vaddr, perms);
             }
+            page_addr += paging.PAGE4K;
         }
     }
 }

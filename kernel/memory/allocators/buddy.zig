@@ -121,10 +121,11 @@ pub const BuddyAllocator = struct {
         var current_addr = addr;
         const end_addr = addr + ORDERS[order];
         const block_size = ORDERS[split_order];
-        while (current_addr < end_addr) : (current_addr += block_size) {
+        while (current_addr < end_addr) {
             self.setOrder(current_addr, split_order);
             self.bitmap.setBit(current_addr, 0);
             batch.push(@ptrFromInt(current_addr));
+            current_addr += block_size;
         }
 
         return batch;
@@ -354,7 +355,7 @@ pub const BuddyAllocator = struct {
         defer free_map.deinit();
 
         var order: u64 = 0;
-        while (order < NUM_ORDERS) : (order += 1) {
+        while (order < NUM_ORDERS) {
             const blk_size = ORDERS[order];
             var node = self.freelists[order].head;
 
@@ -403,7 +404,7 @@ pub const BuddyAllocator = struct {
 
                 // Interior pages of a free block must *not* be individually marked free.
                 var inner = base + PAGE_SIZE;
-                while (inner < end_addr) : (inner += PAGE_SIZE) {
+                while (inner < end_addr) {
                     if (self.bitmap.isFree(inner))
                         return Helper.fail("interior page of a free block marked free", .{
                             .addr = inner,
@@ -411,16 +412,18 @@ pub const BuddyAllocator = struct {
                             .extra_a = base,
                             .extra_b = end_addr,
                         });
+                    inner += PAGE_SIZE;
                 }
 
                 node = n.next;
             }
+            order += 1;
         }
 
         // Page-level scan
         const total_pages = (end - start) / PAGE_SIZE;
         var page_idx: u64 = 0;
-        while (page_idx < total_pages) : (page_idx += 1) {
+        while (page_idx < total_pages) {
             const addr = start + page_idx * PAGE_SIZE;
             const ord: u64 = self.getOrder(addr);
             const is_free = self.bitmap.isFree(addr);
@@ -443,6 +446,7 @@ pub const BuddyAllocator = struct {
                             .expected_order = expected,
                         });
                 }
+                page_idx += 1;
                 continue;
             }
 
@@ -468,6 +472,7 @@ pub const BuddyAllocator = struct {
                     }
                 }
             }
+            page_idx += 1;
         }
 
         return true;

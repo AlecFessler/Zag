@@ -130,13 +130,14 @@ pub const PhysicalMemoryManager = struct {
 
             self.lock.lock();
             var i: u32 = 0;
-            while (i < CACHE_MAX_PAGES / 2) : (i += 1) {
+            while (i < CACHE_MAX_PAGES / 2) {
                 const page = cache.pop().?;
                 self.backing_allocator.rawFree(
                     page[0..paging.PAGE4K],
                     std.mem.Alignment.fromByteUnits(paging.PAGE4K),
                     ret_addr,
                 );
+                i += 1;
             }
             self.lock.unlock();
 
@@ -209,8 +210,9 @@ pub fn freePageCount() u64 {
     // `splitAllocation`) and are observably free to userspace. Each
     // cache node is a 4 KiB page; `count` is the number of nodes.
     var i: usize = 0;
-    while (i < MAX_CORES) : (i += 1) {
+    while (i < MAX_CORES) {
         total += page_caches[i].count;
+        i += 1;
     }
     return total;
 }

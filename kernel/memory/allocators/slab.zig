@@ -1,5 +1,5 @@
-const builtin = @import("builtin");
 const std = @import("std");
+const builtin = @import("builtin");
 const zag = @import("zag");
 
 const intrusive_freelist = zag.memory.allocators.intrusive_freelist;

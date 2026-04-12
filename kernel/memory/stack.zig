@@ -76,12 +76,13 @@ pub fn createKernel() !Stack {
 
 pub fn destroyKernel(stack: Stack, addr_space_root: PAddr) void {
     var page_addr = stack.base.addr;
-    while (page_addr < stack.top.addr) : (page_addr += paging.PAGE4K) {
+    while (page_addr < stack.top.addr) {
         if (arch.unmapPage(addr_space_root, VAddr.fromInt(page_addr))) |paddr| {
             const pmm_iface = pmm.global_pmm.?.allocator();
             const page: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
             pmm_iface.destroy(page);
         }
+        page_addr += paging.PAGE4K;
     }
     recycleSlot(stack.slot);
 }

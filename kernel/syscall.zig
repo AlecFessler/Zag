@@ -275,7 +275,7 @@ fn sysMemPerms(vm_handle: u64, offset: u64, size: u64, perms_bits: u64) i64 {
     const range_end = std.math.add(u64, offset, size) catch return E_INVAL;
     if (range_end > vm_res.original_size) return E_INVAL;
 
-    proc.vmm.mem_perms(
+    proc.vmm.memPerms(
         vm_handle,
         vm_res.original_start,
         vm_res.original_size,
@@ -360,7 +360,7 @@ fn sysMemShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
     const range_end = std.math.add(u64, offset, shm.size()) catch return E_INVAL;
     if (range_end > vm_res.original_size) return E_INVAL;
 
-    proc.vmm.mem_shm_map(
+    proc.vmm.memShmMap(
         shm_handle,
         vm_handle,
         vm_res.original_start,
@@ -388,7 +388,7 @@ fn sysMemShmUnmap(shm_handle: u64, vm_handle: u64) i64 {
     const vm_res = vm_entry.object.vm_reservation;
     const shm = shm_entry.object.shared_memory;
 
-    proc.vmm.mem_shm_unmap(shm, vm_handle, vm_res.original_start, vm_res.original_size, vm_res.max_rights) catch return E_NOENT;
+    proc.vmm.memShmUnmap(shm, vm_handle, vm_res.original_start, vm_res.original_size, vm_res.max_rights) catch return E_NOENT;
 
     return E_OK;
 }
@@ -415,7 +415,7 @@ fn sysMemMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
     const range_end = std.math.add(u64, offset, device.access.mmio.size) catch return E_INVAL;
     if (range_end > vm_res.original_size) return E_INVAL;
 
-    proc.vmm.mem_mmio_map(
+    proc.vmm.memMmioMap(
         device_handle,
         vm_handle,
         vm_res.original_start,
@@ -448,7 +448,7 @@ fn sysMemMmioUnmap(device_handle: u64, vm_handle: u64) i64 {
     const vm_res = vm_entry.object.vm_reservation;
     const device = device_entry.object.device_region;
 
-    proc.vmm.mem_mmio_unmap(device, vm_handle, vm_res.original_start, vm_res.original_size, vm_res.max_rights) catch return E_NOENT;
+    proc.vmm.memMmioUnmap(device, vm_handle, vm_res.original_start, vm_res.original_size, vm_res.max_rights) catch return E_NOENT;
 
     return E_OK;
 }

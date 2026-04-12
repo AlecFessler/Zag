@@ -1,5 +1,5 @@
-const builtin = @import("builtin");
 const std = @import("std");
+const builtin = @import("builtin");
 const zag = @import("zag");
 
 const intrusive_freelist = zag.memory.allocators.intrusive_freelist;
@@ -70,10 +70,10 @@ pub const HeapAllocator = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        std.debug.assert(std.mem.isAligned(self.commit_end, HEADER_ALIGN));
+        std.debug.assert(std.mem.isAligned(self.commit_end, header_align));
 
-        const user_size: u64 = @max(MIN_USER_SIZE, @as(u64, @intCast(len)));
-        const user_align: u64 = @max(MIN_USER_ALIGN, @as(u64, @intCast(alignment.toByteUnits())));
+        const user_size: u64 = @max(min_user_size, @as(u64, @intCast(len)));
+        const user_align: u64 = @max(min_user_align, @as(u64, @intCast(alignment.toByteUnits())));
 
         var block_base: u64 = 0;
         var user_block_base: u64 = 0;
@@ -85,7 +85,7 @@ pub const HeapAllocator = struct {
         const key = TreeEntry{ .bucket_size = user_size, .freelist = undefined };
         var maybe_tree_entry = findBestFitLowerBound(self.free_tree.root, key);
         tree_walk: while (maybe_tree_entry) |tree_entry| {
-            if (DBG) {
+            if (dbg) {
                 outer_iterations += 1;
                 if (outer_iterations >= upper_bound_iterations) @panic("Non exitting loop");
             }
@@ -93,7 +93,7 @@ pub const HeapAllocator = struct {
             var inner_iterations: u64 = 0;
             var maybe_list_entry: ?*Freelist.FreeNode = tree_entry.data.freelist.head;
             list_walk: while (maybe_list_entry) |list_entry| {
-                if (DBG) {
+                if (dbg) {
                     inner_iterations += 1;
                     if (inner_iterations >= upper_bound_iterations) @panic("Non exitting loop");
                 }
@@ -113,10 +113,10 @@ pub const HeapAllocator = struct {
                     continue :list_walk;
                 }
 
-                const footer_ptr: *AllocFooter = @ptrFromInt(block_end - FOOTER_SIZE);
+                const footer_ptr: *AllocFooter = @ptrFromInt(block_end - footer_size);
                 @prefetch(footer_ptr, .{});
 
-                const list_entry_base = block_base + PREFIX_SIZE;
+                const list_entry_base = block_base + prefix_size;
                 _ = tree_entry.data.freelist.popSpecific(@ptrFromInt(list_entry_base)).?;
                 const bucket_is_now_empty = tree_entry.data.freelist.head == null;
                 if (bucket_is_now_empty) {
@@ -124,7 +124,7 @@ pub const HeapAllocator = struct {
                 }
 
                 const split_size = header.bucket_size - bucket_size;
-                const can_split = split_size >= MIN_BLOCK_SIZE;
+                const can_split = split_size >= min_block_size;
                 if (can_split) {
                     var split_block_base: u64 = undefined;
                     var split_entry_base: u64 = undefined;
@@ -149,7 +149,7 @@ pub const HeapAllocator = struct {
                     block_end = split_block_base;
                 } else {
                     bucket_size = header.bucket_size;
-                    block_end = block_base + PREFIX_SIZE + bucket_size;
+                    block_end = block_base + prefix_size + bucket_size;
                 }
                 break :tree_walk;
             }
@@ -158,26 +158,26 @@ pub const HeapAllocator = struct {
         }
 
         if (bucket_size == 0) {
-            const list_entry = self.commit_end + PREFIX_SIZE;
+            const list_entry = self.commit_end + prefix_size;
             block_base, user_block_base, block_end, bucket_size = getBlockMetadata(
                 list_entry,
                 user_size,
                 user_align,
             );
             if (block_end > self.reserve_end) return null;
-            self.commit_end += PREFIX_SIZE + bucket_size;
+            self.commit_end += prefix_size + bucket_size;
         }
 
-        const padding_base = user_block_base - PADDING_SIZE;
+        const padding_base = user_block_base - padding_size;
         std.debug.assert(std.mem.isAligned(
             padding_base,
-            PADDING_ALIGN,
+            padding_align,
         ));
 
-        const footer_base = block_end - FOOTER_SIZE;
+        const footer_base = block_end - footer_size;
         std.debug.assert(std.mem.isAligned(
             footer_base,
-            FOOTER_ALIGN,
+            footer_align,
         ));
 
         const header: *AllocHeader = @ptrFromInt(block_base);
@@ -204,7 +204,7 @@ pub const HeapAllocator = struct {
         var best_fit_lower_bound: ?*RedBlackTree.Node = null;
         var maybe_tree_entry = maybe_root;
         while (maybe_tree_entry) |tree_entry| {
-            if (DBG) {
+            if (dbg) {
                 num_iterations += 1;
                 if (num_iterations >= upper_bound_iterations) @panic("Non exitting loop");
             }
@@ -230,21 +230,21 @@ pub const HeapAllocator = struct {
         u64,
         u64,
     } {
-        const block_base = freelist_entry_base - PREFIX_SIZE;
+        const block_base = freelist_entry_base - prefix_size;
         std.debug.assert(std.mem.isAligned(
             block_base,
-            HEADER_ALIGN,
+            header_align,
         ));
 
         const user_block_base = std.mem.alignForward(u64, freelist_entry_base, user_align);
         const user_block_end = user_block_base + user_size;
 
-        const footer_base = std.mem.alignForward(u64, user_block_end, FOOTER_ALIGN);
+        const footer_base = std.mem.alignForward(u64, user_block_end, footer_align);
 
-        const block_end = footer_base + FOOTER_SIZE;
+        const block_end = footer_base + footer_size;
         std.debug.assert(std.mem.isAligned(
             block_end,
-            HEADER_ALIGN,
+            header_align,
         ));
 
         const bucket_size = block_end - freelist_entry_base;
@@ -267,35 +267,35 @@ pub const HeapAllocator = struct {
         u64,
         u64,
     } {
-        std.debug.assert(split_size >= MIN_BLOCK_SIZE);
+        std.debug.assert(split_size >= min_block_size);
 
-        const split_block_base = block_base + PREFIX_SIZE + bucket_size;
+        const split_block_base = block_base + prefix_size + bucket_size;
         std.debug.assert(std.mem.isAligned(
             split_block_base,
-            HEADER_ALIGN,
+            header_align,
         ));
 
         const split_block_ptr: [*]u8 = @ptrFromInt(split_block_base);
         @prefetch(split_block_ptr, .{});
 
-        const split_bucket_size = split_size - PREFIX_SIZE;
+        const split_bucket_size = split_size - prefix_size;
 
-        const split_entry_base = split_block_base + PREFIX_SIZE;
+        const split_entry_base = split_block_base + prefix_size;
         std.debug.assert(std.mem.isAligned(
             split_entry_base,
-            FREELIST_ENTRY_ALIGN,
+            freelist_entry_align,
         ));
 
         const split_block_end = split_block_base + split_size;
         std.debug.assert(std.mem.isAligned(
             split_block_end,
-            HEADER_ALIGN,
+            header_align,
         ));
 
-        const split_footer_base = split_block_end - FOOTER_SIZE;
+        const split_footer_base = split_block_end - footer_size;
         std.debug.assert(std.mem.isAligned(
             split_footer_base,
-            FOOTER_ALIGN,
+            footer_align,
         ));
 
         return .{
@@ -313,7 +313,7 @@ pub const HeapAllocator = struct {
         if (tree_entry.getChild(.right)) |right_child| {
             var iterator = right_child;
             while (iterator.getChild(.left)) |left_child| {
-                if (DBG) {
+                if (dbg) {
                     num_iterations += 1;
                     if (num_iterations >= upper_bound_iterations) @panic("Non exitting loop");
                 }
@@ -325,7 +325,7 @@ pub const HeapAllocator = struct {
             var maybe_parent = tree_entry.parent;
             var child: *RedBlackTree.Node = tree_entry;
             while (maybe_parent) |parent| {
-                if (DBG) {
+                if (dbg) {
                     num_iterations += 1;
                     if (num_iterations >= upper_bound_iterations) @panic("Non exitting loop");
                 }
@@ -383,7 +383,7 @@ pub const HeapAllocator = struct {
         defer self.lock.unlock();
 
         const user_base: u64 = @intCast(@intFromPtr(buf.ptr));
-        const padding_base = user_base - PADDING_SIZE;
+        const padding_base = user_base - padding_size;
         const padding: *AllocPadding = @ptrFromInt(padding_base);
 
         var header_base = user_base - padding.header_offset;
@@ -391,23 +391,23 @@ pub const HeapAllocator = struct {
         std.debug.assert(!header.is_free);
         header.is_free = true;
 
-        const block_end = header_base + PREFIX_SIZE + header.bucket_size;
+        const block_end = header_base + prefix_size + header.bucket_size;
 
         const next_header: *AllocHeader = @ptrFromInt(block_end);
         @prefetch(next_header, .{});
 
-        const block_footer: *AllocFooter = @ptrFromInt(block_end - FOOTER_SIZE);
+        const block_footer: *AllocFooter = @ptrFromInt(block_end - footer_size);
         @prefetch(block_footer, .{});
 
         // Prefetch prev footer for merge_prev path
-        const prev_footer_ptr: *AllocFooter = @ptrFromInt(header_base - FOOTER_SIZE);
+        const prev_footer_ptr: *AllocFooter = @ptrFromInt(header_base - footer_size);
         @prefetch(prev_footer_ptr, .{});
 
         merge_prev: {
-            const prev_footer_base = header_base - FOOTER_SIZE;
+            const prev_footer_base = header_base - footer_size;
             std.debug.assert(std.mem.isAligned(
                 prev_footer_base,
-                FOOTER_ALIGN,
+                footer_align,
             ));
             const prev_footer_within_bounds = prev_footer_base > self.reserve_start;
             if (!prev_footer_within_bounds) break :merge_prev;
@@ -418,7 +418,7 @@ pub const HeapAllocator = struct {
             const prev_header: *AllocHeader = @ptrFromInt(prev_footer.header);
             if (!prev_header.is_free) break :merge_prev;
 
-            const prev_entry_base: u64 = prev_footer.header + PREFIX_SIZE;
+            const prev_entry_base: u64 = prev_footer.header + prefix_size;
             const prev_node: *Freelist.FreeNode = @ptrFromInt(prev_entry_base);
             const prev_list: *Freelist = prev_node.base;
 
@@ -442,23 +442,23 @@ pub const HeapAllocator = struct {
         merge_next: {
             std.debug.assert(std.mem.isAligned(
                 block_end,
-                HEADER_ALIGN,
+                header_align,
             ));
             const next_header_within_bounds = block_end <= self.reserve_end;
             if (!next_header_within_bounds) break :merge_next;
             if (!next_header.is_free) break :merge_next;
 
-            const next_end: u64 = block_end + PREFIX_SIZE + next_header.bucket_size;
+            const next_end: u64 = block_end + prefix_size + next_header.bucket_size;
             std.debug.assert(std.mem.isAligned(
                 next_end,
-                HEADER_ALIGN,
+                header_align,
             ));
 
-            const footer_base = next_end - FOOTER_SIZE;
+            const footer_base = next_end - footer_size;
             const footer_ptr: *AllocFooter = @ptrFromInt(footer_base);
             @prefetch(footer_ptr, .{});
 
-            const next_entry_base: u64 = block_end + PREFIX_SIZE;
+            const next_entry_base: u64 = block_end + prefix_size;
             const next_node: *Freelist.FreeNode = @ptrFromInt(next_entry_base);
             const next_list: *Freelist = next_node.base;
 
@@ -471,21 +471,21 @@ pub const HeapAllocator = struct {
             }
 
             next_header.is_free = false;
-            const absorbed_footer_base = block_end - FOOTER_SIZE;
+            const absorbed_footer_base = block_end - footer_size;
             const absorbed_footer: *AllocFooter = @ptrFromInt(absorbed_footer_base);
             absorbed_footer.header = 0;
 
-            header.bucket_size = @intCast(next_end - (header_base + PREFIX_SIZE));
+            header.bucket_size = @intCast(next_end - (header_base + prefix_size));
         }
 
-        const coalesced_prefix_end = header_base + PREFIX_SIZE;
+        const coalesced_prefix_end = header_base + prefix_size;
         const coalesced_block_end = coalesced_prefix_end + header.bucket_size;
 
-        const footer_base = coalesced_block_end - FOOTER_SIZE;
+        const footer_base = coalesced_block_end - footer_size;
         const footer: *AllocFooter = @ptrFromInt(footer_base);
         footer.header = header_base;
 
-        const freelist_entry_base = header_base + PREFIX_SIZE;
+        const freelist_entry_base = header_base + prefix_size;
         const freelist_entry: *FreelistEntry = @ptrFromInt(freelist_entry_base);
 
         self.treeInsert(header.bucket_size, freelist_entry);
@@ -596,11 +596,11 @@ pub const HeapAllocator = struct {
             }
         };
 
-        var cur: u64 = std.mem.alignForward(u64, self.reserve_start, HEADER_ALIGN);
+        var cur: u64 = std.mem.alignForward(u64, self.reserve_start, header_align);
 
         var prev_was_free = false;
         while (cur < self.commit_end) {
-            if (cur + HEADER_SIZE > self.commit_end)
+            if (cur + header_size > self.commit_end)
                 return Helper.fail("header beyond commit_end", .{
                     .reserve_start = self.reserve_start,
                     .commit_end = self.commit_end,
@@ -609,7 +609,7 @@ pub const HeapAllocator = struct {
 
             const h = Helper.hdr(cur).*;
 
-            if (h.bucket_size < (MIN_USER_SIZE + FOOTER_SIZE))
+            if (h.bucket_size < (min_user_size + footer_size))
                 return Helper.fail("bucket_size < MIN_LEN", .{
                     .reserve_start = self.reserve_start,
                     .commit_end = self.commit_end,
@@ -618,7 +618,7 @@ pub const HeapAllocator = struct {
                     .is_free = h.is_free,
                 });
 
-            const block_end: u64 = cur + PREFIX_SIZE + h.bucket_size;
+            const block_end: u64 = cur + prefix_size + h.bucket_size;
             if (block_end > self.commit_end)
                 return Helper.fail("block end > commit_end", .{
                     .reserve_start = self.reserve_start,
@@ -629,7 +629,7 @@ pub const HeapAllocator = struct {
                     .is_free = h.is_free,
                 });
 
-            const footer_addr: u64 = block_end - FOOTER_SIZE;
+            const footer_addr: u64 = block_end - footer_size;
             if (h.is_free) {
                 const ft = Helper.ftr(footer_addr).*;
                 if (ft.header != cur) {
@@ -660,7 +660,7 @@ pub const HeapAllocator = struct {
                     .is_free = h.is_free,
                 });
 
-            const entry_addr: u64 = cur + PREFIX_SIZE;
+            const entry_addr: u64 = cur + prefix_size;
             const info = BlockInfo{
                 .header_addr = cur,
                 .entry_addr = entry_addr,
@@ -690,7 +690,7 @@ pub const HeapAllocator = struct {
 
             prev_was_free = h.is_free;
 
-            const next = std.mem.alignForward(u64, block_end, HEADER_ALIGN);
+            const next = std.mem.alignForward(u64, block_end, header_align);
             if (next <= cur)
                 return Helper.fail("non-progressing linear walk", .{
                     .reserve_start = self.reserve_start,
@@ -746,9 +746,9 @@ pub const HeapAllocator = struct {
                         });
 
                     const entry_addr_u64: u64 = @intCast(@intFromPtr(fnode));
-                    const header_addr: u64 = entry_addr_u64 - PREFIX_SIZE;
+                    const header_addr: u64 = entry_addr_u64 - prefix_size;
 
-                    if (header_addr < self.reserve_start or header_addr + HEADER_SIZE > self.commit_end)
+                    if (header_addr < self.reserve_start or header_addr + header_size > self.commit_end)
                         return Helper.fail("freelist-derived header out of bounds", .{
                             .reserve_start = self.reserve_start,
                             .commit_end = self.commit_end,
@@ -777,7 +777,7 @@ pub const HeapAllocator = struct {
                             .extra_a = entry_ptr.bucket_size,
                         });
 
-                    const bend: u64 = header_addr + PREFIX_SIZE + hptr.bucket_size;
+                    const bend: u64 = header_addr + prefix_size + hptr.bucket_size;
                     if (bend > self.commit_end)
                         return Helper.fail("block end (from freelist) > commit_end", .{
                             .reserve_start = self.reserve_start,
@@ -788,7 +788,7 @@ pub const HeapAllocator = struct {
                             .is_free = hptr.is_free,
                         });
 
-                    const ft = Helper.ftr(bend - FOOTER_SIZE).*;
+                    const ft = Helper.ftr(bend - footer_size).*;
                     if (ft.header != header_addr)
                         return Helper.fail("footer backlink mismatch (from freelist)", .{
                             .reserve_start = self.reserve_start,
@@ -887,7 +887,7 @@ pub const TreeEntry = struct {
 };
 
 const FreelistEntry = struct {
-    bytes: [FREELIST_ENTRY_SIZE]u8 align(FREELIST_ENTRY_ALIGN),
+    bytes: [freelist_entry_size]u8 align(freelist_entry_align),
 };
 
 const using_popSpecific = true;
@@ -916,26 +916,26 @@ pub const TreeAllocator = slab_alloc.SlabAllocator(
     true,
 );
 
-const DBG = builtin.mode == .Debug;
+const dbg = builtin.mode == .Debug;
 
-const HEADER_SIZE = @sizeOf(AllocHeader);
-const HEADER_ALIGN = @alignOf(AllocHeader);
+const header_size = @sizeOf(AllocHeader);
+const header_align = @alignOf(AllocHeader);
 
-const PADDING_SIZE = @sizeOf(AllocPadding);
-const PADDING_ALIGN = @alignOf(AllocPadding);
+const padding_size = @sizeOf(AllocPadding);
+const padding_align = @alignOf(AllocPadding);
 
-const PREFIX_SIZE = HEADER_SIZE + PADDING_SIZE;
+const prefix_size = header_size + padding_size;
 
-const FOOTER_SIZE = @sizeOf(AllocFooter);
-const FOOTER_ALIGN = @alignOf(AllocFooter);
+const footer_size = @sizeOf(AllocFooter);
+const footer_align = @alignOf(AllocFooter);
 
-const FREELIST_ENTRY_ALIGN = @alignOf(u64);
-const FREELIST_ENTRY_SIZE = @sizeOf(usize) * 4;
+const freelist_entry_align = @alignOf(u64);
+const freelist_entry_size = @sizeOf(usize) * 4;
 
-const MIN_USER_SIZE = FREELIST_ENTRY_SIZE;
-const MIN_USER_ALIGN = FREELIST_ENTRY_ALIGN;
+const min_user_size = freelist_entry_size;
+const min_user_align = freelist_entry_align;
 
-const MIN_BLOCK_SIZE = PREFIX_SIZE + MIN_USER_SIZE + FOOTER_SIZE;
+const min_block_size = prefix_size + min_user_size + footer_size;
 
 test "tree contains after free, then removed after re-alloc (exact fit)" {
     const testing_allocator = std.testing.allocator;
