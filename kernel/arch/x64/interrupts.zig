@@ -6,8 +6,8 @@ const arch = zag.arch.dispatch;
 const cpu = zag.arch.x64.cpu;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
-const interruptHandler = idt.interruptHandler;
 
+const InterruptHandler = idt.interruptHandler;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
@@ -48,8 +48,8 @@ const VectorEntry = struct {
 
 const Handler = *const fn (*cpu.Context) void;
 
-pub const stubs: [256]interruptHandler = blk: {
-    var arr: [256]interruptHandler = undefined;
+pub const stubs: [256]InterruptHandler = blk: {
+    var arr: [256]InterruptHandler = undefined;
     for (0..256) |i| {
         arr[i] = getInterruptStub(i, pushes_err[i]);
     }
@@ -297,7 +297,7 @@ pub fn switchTo(thread: *Thread) void {
     );
 }
 
-pub fn getInterruptStub(comptime int_num: u8, comptime does_push_err: bool) interruptHandler {
+pub fn getInterruptStub(comptime int_num: u8, comptime does_push_err: bool) InterruptHandler {
     return struct {
         fn stub() callconv(.naked) void {
             if (does_push_err) {

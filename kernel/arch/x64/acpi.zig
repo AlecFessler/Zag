@@ -15,7 +15,7 @@ const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
 
-const validationError = error{
+const ValidationError = error{
     InvalidSignature,
     InvalidSize,
     InvalidChecksum,
@@ -69,7 +69,7 @@ pub const HpetTable = packed struct {
 
     pub fn validate(self: *const HpetTable) !void {
         if (!std.mem.eql(u8, @ptrCast(&self.signature), "HPET")) {
-            return validationError.InvalidSignature;
+            return ValidationError.InvalidSignature;
         }
         var sum: u8 = 0;
         const bytes = @as([*]const u8, @ptrCast(self))[0..self.length];
@@ -77,10 +77,10 @@ pub const HpetTable = packed struct {
             sum +%= b;
         }
         if (sum != 0) {
-            return validationError.InvalidChecksum;
+            return ValidationError.InvalidChecksum;
         }
         if (self.base_address.address_space_id != 0) {
-            return validationError.InvalidSize;
+            return ValidationError.InvalidSize;
         }
     }
 };
@@ -130,7 +130,7 @@ pub const Madt = packed struct {
 
     pub fn validate(self: *const Madt) !void {
         if (!std.mem.eql(u8, @ptrCast(&self.signature), "APIC")) {
-            return validationError.InvalidSignature;
+            return ValidationError.InvalidSignature;
         }
 
         var sum: u8 = 0;
@@ -138,7 +138,7 @@ pub const Madt = packed struct {
             sum +%= b;
         }
         if (sum != 0) {
-            return validationError.InvalidChecksum;
+            return ValidationError.InvalidChecksum;
         }
     }
 
@@ -223,11 +223,11 @@ pub const Xsdp = packed struct {
 
     pub fn validate(self: *const Xsdp) !void {
         if (!std.mem.eql(u8, @ptrCast(&self.signature), "RSD PTR ")) {
-            return validationError.InvalidSignature;
+            return ValidationError.InvalidSignature;
         }
 
         if (self.length < 36) {
-            return validationError.InvalidSize;
+            return ValidationError.InvalidSize;
         }
 
         var sum: u8 = 0;
@@ -235,7 +235,7 @@ pub const Xsdp = packed struct {
             sum +%= b;
         }
         if (sum != 0) {
-            return validationError.InvalidChecksum;
+            return ValidationError.InvalidChecksum;
         }
     }
 
@@ -264,12 +264,12 @@ pub const Xsdt = packed struct {
 
     pub fn validate(self: *const Xsdt) !void {
         if (!std.mem.eql(u8, @ptrCast(&self.signature), "XSDT")) {
-            return validationError.InvalidSignature;
+            return ValidationError.InvalidSignature;
         }
 
         var sum: u8 = 0;
         for (self.asBytes(self.length)) |b| sum +%= b;
-        if (sum != 0) return validationError.InvalidChecksum;
+        if (sum != 0) return ValidationError.InvalidChecksum;
     }
 
     pub const Iterator = struct {

@@ -6,10 +6,9 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const svm = @import("amd/svm.zig");
-const vmx = @import("intel/vmx.zig");
-
 const cpu = zag.arch.x64.cpu;
+const svm = zag.arch.x64.amd.svm;
+const vmx = zag.arch.x64.intel.vmx;
 
 const PAddr = zag.memory.address.PAddr;
 

@@ -1,6 +1,7 @@
-const trampoline_code = @import("embedded_bins").trampoline;
 const std = @import("std");
 const zag = @import("zag");
+
+const trampoline_code = @import("embedded_bins").trampoline;
 
 const apic = zag.arch.x64.apic;
 const arch = zag.arch.dispatch;

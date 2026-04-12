@@ -5,10 +5,11 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const apic = zag.arch.x64.apic;
+const cpu = zag.arch.x64.cpu;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
-
-const vm_mod = @import("../vm.zig");
+const vm_mod = zag.arch.x64.vm;
 
 const GuestException = vm_mod.GuestException;
 const GuestInterrupt = vm_mod.GuestInterrupt;
@@ -16,9 +17,6 @@ const GuestState = vm_mod.GuestState;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
 const VmExitInfo = vm_mod.VmExitInfo;
-
-const apic = zag.arch.x64.apic;
-const cpu = zag.arch.x64.cpu;
 
 // ---------------------------------------------------------------------------
 // MSR addresses — AMD APM Vol 2, Section 15.28, Table 15-9
