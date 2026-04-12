@@ -621,7 +621,16 @@ pub fn vmResume(guest_state: *GuestState, vmcb_phys: PAddr, guest_fxsave: *align
         : [guest_pa] "{rsi}" (vmcb_phys.addr),
           [host_pa] "{rdi}" (host_pa),
           [gs_ptr] "{rdx}" (gs_ptr),
-        : .{ .memory = true, .rax = true, .rcx = true, .rdx = true, .rsi = true, .rdi = true, .rbp = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true, .r12 = true, .r13 = true, .r14 = true, .r15 = true }
+          // rbx, rbp, r12-r15 are NOT clobber-listed: the asm manually
+          // pushes/pops them on entry/exit. Listing a manually-saved
+          // callee-saved register as a clobber forces LLVM to allocate
+          // a scratch register for it — and with `omit_frame_pointer =
+          // false` plus the {rsi}/{rdi}/{rdx} input constraints below,
+          // there are no free GPRs left in ReleaseSafe/Fast, so LLVM
+          // aborts with "inline assembly requires more registers than
+          // available". See the matching comment on the VMX VMLAUNCH/
+          // VMRESUME asm in `intel/vmx.zig`.
+        : .{ .memory = true, .rax = true, .rcx = true, .rdx = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true }
     );
 
     // Save guest FPU/SSE state and restore host FPU/SSE state.
