@@ -5,7 +5,6 @@ const zag = @import("zag");
 const aarch64 = zag.arch.aarch64;
 const x64 = zag.arch.x64;
 
-const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
 const BootInfo = zag.boot.protocol.BootInfo;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
@@ -15,6 +14,18 @@ const SharedMemory = zag.memory.shared.SharedMemory;
 const Thread = zag.sched.thread.Thread;
 const Timer = zag.arch.timer.Timer;
 const VAddr = zag.memory.address.VAddr;
+
+pub const ArchCpuContext = switch (builtin.cpu.arch) {
+    .x86_64 => x64.interrupts.ArchCpuContext,
+    .aarch64 => aarch64.interrupts.ArchCpuContext,
+    else => unreachable,
+};
+
+pub const PageFaultContext = switch (builtin.cpu.arch) {
+    .x86_64 => x64.interrupts.PageFaultContext,
+    .aarch64 => aarch64.interrupts.PageFaultContext,
+    else => unreachable,
+};
 
 pub inline fn kEntry(boot_info: *BootInfo, ktrampoline: *const fn (*BootInfo) callconv(cc()) noreturn) noreturn {
     switch (builtin.cpu.arch) {

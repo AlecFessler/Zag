@@ -7,7 +7,7 @@ const sched = zag.sched.scheduler;
 const vcpu_mod = zag.kvm.vcpu;
 const vm_mod = zag.kvm.vm;
 
-const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
+const ArchCpuContext = zag.arch.dispatch.ArchCpuContext;
 const PAddr = zag.memory.address.PAddr;
 const PriorityQueue = zag.containers.priority_queue.PriorityQueue;
 const Process = zag.sched.process.Process;

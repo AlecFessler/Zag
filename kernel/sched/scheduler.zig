@@ -10,7 +10,7 @@ const memory_init = zag.memory.init;
 const process_mod = zag.sched.process;
 const thread_mod = zag.sched.thread;
 
-const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
+const ArchCpuContext = zag.arch.dispatch.ArchCpuContext;
 const PriorityQueue = containers.priority_queue.PriorityQueue;
 const Process = zag.sched.process.Process;
 const ProcessAllocator = zag.sched.process.ProcessAllocator;

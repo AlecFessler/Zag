@@ -8,7 +8,7 @@ const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const stack_mod = zag.memory.stack;
 
-const ArchCpuContext = zag.arch.interrupts.ArchCpuContext;
+const ArchCpuContext = zag.arch.dispatch.ArchCpuContext;
 const FaultReason = zag.perms.permissions.FaultReason;
 const kvm = zag.kvm;
 const MemoryPerms = zag.perms.memory.MemoryPerms;

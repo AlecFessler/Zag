@@ -1,8 +1,6 @@
-const builtin = @import("builtin");
 const std = @import("std");
 const zag = @import("zag");
 
-const aarch64 = zag.arch.aarch64;
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const memory_init = zag.memory.init;
@@ -10,24 +8,12 @@ const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const scheduler = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
-const x64 = zag.arch.x64;
 
 const FaultReason = zag.perms.permissions.FaultReason;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
+const PageFaultContext = zag.arch.dispatch.PageFaultContext;
 const VAddr = zag.memory.address.VAddr;
-
-pub const ArchCpuContext = switch (builtin.cpu.arch) {
-    .x86_64 => x64.interrupts.ArchCpuContext,
-    .aarch64 => aarch64.interrupts.ArchCpuContext,
-    else => unreachable,
-};
-
-pub const PageFaultContext = switch (builtin.cpu.arch) {
-    .x86_64 => x64.interrupts.PageFaultContext,
-    .aarch64 => aarch64.interrupts.PageFaultContext,
-    else => unreachable,
-};
 
 const KERNEL_PERMS = MemoryPerms{
     .write_perm = .write,

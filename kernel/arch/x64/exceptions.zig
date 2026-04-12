@@ -10,7 +10,7 @@ const scheduler = zag.sched.scheduler;
 
 const FaultReason = zag.perms.permissions.FaultReason;
 const GateType = zag.arch.x64.idt.GateType;
-const PageFaultContext = zag.arch.interrupts.PageFaultContext;
+const PageFaultContext = zag.arch.dispatch.PageFaultContext;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 const VAddr = zag.memory.address.VAddr;
 
@@ -193,5 +193,5 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         .rip = ctx.rip,
         .user_ctx = if (from_user) ctx else null,
     };
-    zag.arch.interrupts.handlePageFault(&pf_ctx);
+    zag.memory.fault.handlePageFault(&pf_ctx);
 }
