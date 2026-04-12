@@ -15,8 +15,8 @@ pub fn main(pv: u64) void {
     for (0..128) |i| {
         const e = &view[i];
         if (e.entry_type != perm_view.ENTRY_TYPE_DEVICE_REGION) continue;
-        // Badge bit is packed into upper bits of field0 (§2.18.3)
-        const badge = e.field0 >> 56;
+        // Badge bit is in badge_byte (§2.18.3)
+        const badge: u64 = e.badge_byte;
         if (found == 0) {
             first_badge = badge;
             found = 1;
