@@ -213,10 +213,11 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     if (from_user and !pf_err.present) {
         const thread = scheduler.currentThread() orelse
             @panic("user page fault with no current thread");
-        const node = thread.process.vmm.findNode(VAddr.fromInt(faulting_addr));
-        if (node != null and node.?.kind == .virtual_bar) {
-            emulateVirtualBar(ctx, node.?, faulting_addr, thread.process);
-            return;
+        if (thread.process.vmm.findNode(VAddr.fromInt(faulting_addr))) |node| {
+            if (node.kind == .virtual_bar) {
+                emulateVirtualBar(ctx, &node, faulting_addr, thread.process);
+                return;
+            }
         }
     }
 
