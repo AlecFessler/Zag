@@ -72,22 +72,48 @@ pub const BuddyAllocator = struct {
         const aligned_end = std.mem.alignBackward(u64, end_addr, PAGE_SIZE);
         std.debug.assert(aligned_end > aligned_start);
 
-        // Each single-page free below increments `free_pages`; track the
-        // static `total_pages` ceiling here so `pmm.totalPageCount()` can
-        // return the buddy's full managed range. (§14, §21.)
-        self.total_pages += (aligned_end - aligned_start) / PAGE_SIZE;
+        const num_pages = (aligned_end - aligned_start) / PAGE_SIZE;
+        self.total_pages += num_pages;
+        self.free_pages += num_pages;
 
+        // Bulk path: directly compute the largest aligned buddy blocks that
+        // tile the contiguous range, avoiding per-page free() + recursiveMerge.
+        // For each position, find the highest order block that is both
+        // naturally aligned (relative to self.start_addr) and fits within
+        // the remaining range. Then attempt to merge each placed block with
+        // its buddy (which may have been freed by a prior addRegion call)
+        // to maintain the coalescing invariant.
         var current_addr = aligned_start;
         while (current_addr < aligned_end) {
-            const ptr: [*]u8 = @ptrFromInt(current_addr);
-            const slice = ptr[0..PAGE_SIZE];
-            BuddyAllocator.free(
-                @ptrCast(self),
-                slice,
-                std.mem.Alignment.fromByteUnits(PAGE_SIZE),
-                @returnAddress(),
-            );
-            current_addr += PAGE_SIZE;
+            const remaining = aligned_end - current_addr;
+            const rel = current_addr - self.start_addr;
+
+            // Find the highest order we can place here:
+            // 1) Block size must fit in remaining space
+            // 2) Address must be naturally aligned for that order
+            //    (relative to allocator base)
+            // 3) Block must not extend past allocator end_addr
+            var order: u4 = MAX_ORDER;
+            while (order > 0) {
+                const block_size = ORDERS[order];
+                if (block_size <= remaining and
+                    (rel & (block_size - 1)) == 0 and
+                    current_addr + block_size <= self.end_addr)
+                {
+                    break;
+                }
+                order -= 1;
+            }
+
+            self.setOrder(current_addr, order);
+            self.bitmap.setBit(current_addr, 1);
+            self.freelists[order].push(@ptrFromInt(current_addr));
+
+            // Attempt to merge this block with its buddy recursively,
+            // handling the case where a prior addRegion freed adjacent memory.
+            self.mergeFromFreelist(current_addr);
+
+            current_addr += ORDERS[order];
         }
     }
 
@@ -153,6 +179,41 @@ pub const BuddyAllocator = struct {
 
         const addr = @intFromPtr(addr_ptr);
         return addr;
+    }
+
+    /// Attempt to merge a block that is already on its freelist with its
+    /// buddy. Used by the bulk addRegion path where blocks are placed
+    /// directly and may be mergeable with blocks from a prior addRegion.
+    fn mergeFromFreelist(self: *BuddyAllocator, addr: u64) void {
+        var current = addr;
+        while (true) {
+            const order = self.getOrder(current);
+            if (order == MAX_ORDER) return;
+
+            const rel = current - self.start_addr;
+            const buddy = self.start_addr + (rel ^ ORDERS[order]);
+
+            if (buddy < self.start_addr or buddy >= self.end_addr) return;
+            if (!self.bitmap.isFree(buddy)) return;
+            if (self.getOrder(buddy) != order) return;
+
+            // Both current and buddy are free at the same order — merge.
+            // Remove both from the freelist.
+            const removed_buddy = self.freelists[order].popSpecific(@ptrFromInt(buddy));
+            std.debug.assert(removed_buddy != null);
+            const removed_self = self.freelists[order].popSpecific(@ptrFromInt(current));
+            std.debug.assert(removed_self != null);
+
+            const lower = @min(current, buddy);
+            const upper = @max(current, buddy);
+            self.bitmap.setBit(lower, 1);
+            self.bitmap.setBit(upper, 0);
+
+            const higher = order + 1;
+            self.setOrder(lower, higher);
+            self.freelists[higher].push(@ptrFromInt(lower));
+            current = lower;
+        }
     }
 
     fn recursiveMerge(self: *BuddyAllocator, addr: u64) struct { addr: u64, order: u4 } {
