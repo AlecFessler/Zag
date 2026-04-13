@@ -50,7 +50,9 @@ pub fn sysFutexWaitVal(addrs_ptr: u64, expected_ptr: u64, count: u64, timeout_ns
     }
 
     if (cnt == 1) {
-        return futex.wait(paddrs[0], expected[0], timeout_ns, thread);
+        const result = futex.wait(paddrs[0], expected[0], timeout_ns, thread);
+        // futex.wait returns E_AGAIN on mismatch; convert to index 0 per spec.
+        return if (result == futex.E_AGAIN) 0 else result;
     }
     return futex.waitVal(paddrs[0..cnt], expected[0..cnt], cnt, timeout_ns, thread);
 }

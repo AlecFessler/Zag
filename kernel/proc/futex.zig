@@ -216,8 +216,9 @@ fn removeFromOtherBuckets(thread: *Thread, except_paddr: PAddr) void {
 }
 
 /// Multi-address futex wait with expected values.
-/// Returns the index of the first mismatched address (as negative), or:
-///   0..count-1 (as positive i64) = index of the address that was woken,
+/// Returns:
+///   0..count-1 = index of the first mismatched address (mismatch, no block), or
+///   0..count-1 = index of the address that was woken (after blocking),
 ///   E_TIMEOUT if timeout expired, E_NORES if no timed waiter slot.
 pub fn waitVal(addrs: []const PAddr, expected: []const u64, count: usize, timeout_ns: u64, thread: *Thread) i64 {
     // Sort bucket indices for consistent lock ordering to prevent deadlock.
@@ -234,7 +235,7 @@ pub fn waitVal(addrs: []const PAddr, expected: []const u64, count: usize, timeou
         const value_ptr: *const u64 = @ptrFromInt(vaddr.addr);
         if (@atomicLoad(u64, value_ptr, .acquire) != expected[i]) {
             releaseBucketLocks(&lock_state);
-            return E_AGAIN;
+            return @intCast(i);
         }
     }
 
