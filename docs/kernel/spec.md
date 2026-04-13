@@ -141,7 +141,7 @@ Every thread has a priority level that determines its scheduling order relative 
 
 **§2.2.28** A `.faulted` thread is not scheduled and does not appear on any run queue. **§2.2.29** A `.suspended` thread is not scheduled and does not appear on any run queue.
 
-<!-- s2_2_30 -->**§2.2.30** When a thread calls `set_priority(.pinned)`, the kernel scans the thread's current affinity mask in ascending core ID order for a core with no pinned owner. The first available core is claimed, and the syscall returns the pinned core ID in rax. The thread's user view entry `field1` is updated with the pinned core ID. If no core in the affinity mask is available, returns `E_BUSY`. If the affinity mask is empty, returns `E_INVAL`. <!-- s2_2_31 -->**§2.2.31** A pinned thread cannot call `set_affinity`; attempting it returns `E_BUSY`. <!-- s2_2_32 -->**§2.2.32** There are two ways to unpin: (1) call `thread_unpin` on the thread's handle, which restores the pre-pin affinity mask and drops priority to the pre-pin level; (2) call `set_priority` with any non-pinned level, which implicitly unpins, restores affinity, and applies the new priority.
+<!-- s2_2_30 -->**§2.2.30** When a thread calls `set_priority(.pinned)`, the kernel scans the thread's current affinity mask in ascending core ID order for a core with no pinned owner. The first available core is claimed, and the syscall returns the pinned core ID in rax. The thread's user view entry `field1` is updated with the pinned core ID. If no core in the affinity mask is available, returns `E_BUSY`. If the affinity mask is empty, returns `E_INVAL`. <!-- s2_2_31 -->**§2.2.31** A pinned thread cannot call `set_affinity`; attempting it returns `E_BUSY`. <!-- s2_2_32 -->**§2.2.32** The only way to unpin is `set_priority` with any non-pinned level, which implicitly unpins, restores the pre-pin affinity mask, and applies the new priority.
 
 <!-- s2_2_33 -->**§2.2.33** When a pinned thread blocks (on a futex or IPC recv), it temporarily releases its core. Other threads may execute on that core while the pinned thread is blocked. The pin relationship persists. <!-- s2_2_34 -->**§2.2.34** When a pinned thread becomes ready again (futex wake or IPC delivery), the kernel immediately preempts whatever thread is running on the pinned core regardless of that thread's priority. The preempted thread is migrated to an affinity-eligible non-pinned core if one exists; otherwise it remains in the pinned core's run queue until the pinned thread next blocks. **§2.2.35** `set_affinity` constrains the calling thread's core affinity; the change takes effect at the next scheduling decision.
 
@@ -151,7 +151,7 @@ Each user stack is flanked by unmapped guard pages that catch overflow and under
 
 #### Thread Handle Rights
 
-`ThreadHandleRights` (u8): `suspend`(0), `resume`(1), `kill`(2), `unpin`(3), `pmu`(4). 3 bits reserved. The `unpin` bit gates the `thread_unpin` syscall. The `pmu` bit gates access to a specific thread's performance monitoring state (§4.1).
+`ThreadHandleRights` (u8): `suspend`(0), `resume`(1), `kill`(2), `pmu`(4). Bit 3 reserved. The `pmu` bit gates access to a specific thread's performance monitoring state (§4.1).
 
 **§2.2.38** Thread handles are not transferable via message passing. The kernel is the sole distributor of thread handles — processes receive handles for their own threads via `thread_create`, and a fault handler receives handles for a debuggee's threads when `fault_handler` is acquired. **§2.2.39** Revoking a thread handle removes it from the permissions table without affecting the thread's execution or state.
 
@@ -190,10 +190,6 @@ Sets the calling thread's core affinity. Self-only; no thread handle parameter. 
 #### set_priority(priority) → result
 
 Sets the calling thread's priority. Self-only; no thread handle parameter. **§2.2.68** `set_priority` requires `ProcessRights.set_affinity` on slot 0; returns `E_PERM` if absent. **§2.2.69** `set_priority` with a priority exceeding the process's `max_thread_priority` returns `E_PERM`. **§2.2.70** For non-pinned levels, `set_priority` returns `E_OK` on success. The new priority takes effect at the next scheduling decision. <!-- s2_2_71 -->**§2.2.71** For `pinned`, `set_priority` scans the calling thread's affinity mask in ascending core ID order for a core with no pinned owner; returns the pinned core ID (non-negative) in rax on success. The thread's user view entry `field1` is updated with the pinned core ID. <!-- s2_2_72 -->**§2.2.72** `set_priority(.pinned)` returns `E_BUSY` if all cores in the affinity mask are already owned by pinned threads. <!-- s2_2_73 -->**§2.2.73** `set_priority(.pinned)` returns `E_INVAL` if the affinity mask is empty. <!-- s2_2_74 -->**§2.2.74** `set_priority` with a non-pinned level while currently pinned implicitly unpins the thread, restores the pre-pin affinity mask, clears `field1` in the thread's user view entry, and applies the new priority. <!-- s2_2_76 -->**§2.2.76** `set_priority` with an invalid priority value returns `E_INVAL`.
-
-#### thread_unpin(thread_handle) → result
-
-Unpins a pinned thread, restoring its pre-pin affinity mask and dropping its priority to the pre-pin level. A process may unpin its own threads by passing its own thread handle from `thread_self`. <!-- s2_2_77 -->**§2.2.77** `thread_unpin` returns `E_OK` on success. <!-- s2_2_78 -->**§2.2.78** `thread_unpin` requires the `unpin` right on `thread_handle`; returns `E_PERM` without it. <!-- s2_2_79 -->**§2.2.79** `thread_unpin` with invalid or wrong-type `thread_handle` returns `E_BADHANDLE`. <!-- s2_2_80 -->**§2.2.80** `thread_unpin` on a thread that is not currently pinned returns `E_INVAL`. <!-- s2_2_81 -->**§2.2.81** On success, `thread_unpin` restores the thread's pre-pin affinity mask, drops its priority to the pre-pin level, and clears `field1` in the thread's user view entry.
 
 ---
 
@@ -1002,7 +998,7 @@ All syscalls return `i64`. Non-negative = success, negative = error code. Sizes 
 | 60 | `irq_ack` | §2.4 |
 | 61 | `sys_power` | §5.4 |
 | 62 | `sys_cpu_power` | §5.4 |
-| 63 | `thread_unpin` | §2.2 |
+| 63 | `_thread_unpin_removed` | -- |
 | 64 | `futex_wait_change` | §3.2 |
 
 ---

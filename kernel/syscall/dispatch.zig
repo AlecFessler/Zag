@@ -86,7 +86,7 @@ pub const SyscallNum = enum(u64) {
     irq_ack,
     sys_power,
     sys_cpu_power,
-    thread_unpin,
+    _thread_unpin_removed,
     futex_wait_change,
     _,
 };
@@ -162,7 +162,7 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
         .irq_ack => .{ .ret = device.sysIrqAck(arg0) },
         .sys_power => .{ .ret = system.sysSysPower(arg0) },
         .sys_cpu_power => .{ .ret = system.sysSysCpuPower(arg0, arg1) },
-        .thread_unpin => .{ .ret = thread.sysThreadUnpin(arg0) },
+        ._thread_unpin_removed => .{ .ret = E_INVAL },
         .futex_wait_change => .{ .ret = futex.sysFutexWaitChange(arg0, arg1, arg2) },
         _ => .{ .ret = E_INVAL },
     };
