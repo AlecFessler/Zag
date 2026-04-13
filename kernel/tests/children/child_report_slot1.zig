@@ -10,7 +10,6 @@ const syscall = lib.syscall;
 ///   2 = thread_resume(slot1)
 ///   3 = thread_kill(slot1)
 ///   4 = set_affinity(0x1)  (self-only, ignores slot1)
-///   5 = thread_unpin(slot1)
 /// Reply: entry_type, handle, rights, action_rc
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
@@ -28,8 +27,6 @@ pub fn main(pv: u64) void {
         action_rc = @bitCast(syscall.thread_kill(entry.handle));
     } else if (action == 4) {
         action_rc = @bitCast(syscall.set_affinity(0x1));
-    } else if (action == 5) {
-        action_rc = @bitCast(syscall.thread_unpin(entry.handle));
     }
     _ = syscall.ipc_reply(&.{ entry.entry_type, entry.handle, entry.rights, action_rc });
 }

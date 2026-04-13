@@ -100,7 +100,7 @@ kernel/
     process.zig          -- proc_create, revoke_perm, disable_restart
     sysinfo.zig          -- generic sys_info syscall layer
     system.zig           -- write, getrandom, sys_power, sys_cpu_power
-    thread.zig           -- thread_create/exit/yield, set_affinity/priority, suspend/resume/kill, thread_unpin
+    thread.zig           -- thread_create/exit/yield, set_affinity/priority, suspend/resume/kill
     vm.zig               -- vm_create, vm_guest_map, vm_recv/reply, vcpu_set/get_state, vcpu_run/interrupt, msr_passthrough, ioapic_assert/deassert_irq
   perms/
     permissions.zig      -- rights types, permission entry, user view entry, isSubset helper
@@ -465,7 +465,7 @@ All rights are packed structs with bit fields:
 - `VmReservationRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4), 3 bits reserved.
 - `SharedMemoryRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `grant`(3), 4 bits reserved.
 - `DeviceRegionRights`: packed `u8` -- `map`(0), `grant`(1), `dma`(2), `irq`(3), 4 bits reserved. The `irq` bit gates `irq_ack` (§24).
-- `ThreadHandleRights`: packed `u8` -- `suspend`(0), `resume`(1), `kill`(2), `unpin`(3), `pmu`(4), 3 bits reserved. The `unpin` bit gates the `thread_unpin` syscall. The `pmu` bit is checked in addition to `ProcessRights.pmu` on every PMU syscall that takes a thread handle; see §20.
+- `ThreadHandleRights`: packed `u8` -- `suspend`(0), `resume`(1), `kill`(2), `pmu`(4), bit 3 reserved. The `pmu` bit is checked in addition to `ProcessRights.pmu` on every PMU syscall that takes a thread handle; see §20.
 
 ---
 
@@ -556,22 +556,6 @@ Atomic boolean. Set to `true` when a thread is dispatched onto a CPU, set to `fa
 7. If last thread: call `proc.exit()` (triggers restart or cleanup).
 
 The last thread skips user stack destruction because the process exit path tears down the entire address space.
-
-### thread_unpin Implementation
-
-`sysThreadUnpin(thread_handle)`:
-1. Look up `thread_handle` in the calling process's perm table. Return `E_BADHANDLE` if not found or not a thread-type entry.
-2. Check `ThreadHandleRights.unpin` on the entry. Return `E_PERM` if absent.
-3. Resolve the thread pointer from the entry's kernel object.
-4. Check that the thread's priority is `pinned`. Return `E_INVAL` if not pinned.
-5. Clear `PerCoreState.pinned_thread` on the thread's pinned core.
-6. Restore the thread's `pre_pin_affinity` to `core_affinity`.
-7. Restore the thread's `pre_pin_priority` to `priority`.
-8. Clear `field1` (pinned core ID) in the thread's user view entry. Call `syncUserView` on the target thread's owning process. If the caller is a different process (cross-process unpin), also call `syncUserView` on the caller's process.
-9. If the thread is currently running on the previously pinned core, send a scheduling IPI so the scheduler can re-evaluate placement.
-10. Return `E_OK`.
-
-A process may unpin its own threads by passing its own thread handle obtained from `thread_self`. A fault handler may unpin a debuggee's thread via a cross-process thread handle.
 
 ---
 
