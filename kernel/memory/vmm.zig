@@ -515,19 +515,11 @@ pub const VirtualMemoryManager = struct {
         try splitAtLocked(&self.tree, range_start);
         try splitAtLocked(&self.tree, VAddr.fromInt(range_end_addr));
 
-        // VALIDATION PASS: After splitting, any non-private node visited by
-        // forEachInRange is fully contained. If one exists, reject.
-        const ValidCtx = struct {
-            has_non_private: bool = false,
-            fn cb(ctx: *@This(), node: *VmNode) void {
-                if (node.kind != .private) ctx.has_non_private = true;
-            }
-        };
-        var valid_ctx = ValidCtx{};
-        var vs = mkSentinel(range_start);
-        var ve = mkSentinel(VAddr.fromInt(range_end_addr));
-        self.tree.forEachInRange(&vs, &ve, &valid_ctx, ValidCtx.cb);
-        if (valid_ctx.has_non_private) return error.PartialOverlap;
+        // After splitting at both boundaries, every node visited by
+        // forEachInRange is fully contained within the range — partial overlaps
+        // cannot exist. Non-private nodes that are fully contained are valid
+        // unmap targets per §2.3.5/§2.3.6 (they get replaced with private
+        // demand-paged nodes). No validation rejection is needed here.
 
         // UNMAP PASS: Collect non-private nodes to replace, and update private nodes.
         var to_replace: [128]*VmNode = undefined;

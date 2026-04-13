@@ -197,10 +197,7 @@ pub fn sysMemUnmap(vm_handle: u64, offset: u64, size: u64) i64 {
         offset,
         size,
         vm_res.max_rights,
-    ) catch |e| return switch (e) {
-        error.PartialOverlap => E_INVAL,
-        else => E_INVAL,
-    };
+    ) catch return E_INVAL;
 
     return E_OK;
 }
