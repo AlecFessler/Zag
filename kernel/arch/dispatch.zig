@@ -950,7 +950,7 @@ pub fn vmMsrPassthrough(vm_structures: PAddr, msr_num: u32, allow_read: bool, al
 
 
 
-// --- PMU (performance monitoring unit) dispatch (systems.md §13, §20) ---
+// --- PMU (performance monitoring unit) dispatch (systems.md §arch-interface, §pmu) ---
 
 pub const PmuState = switch (builtin.cpu.arch) {
     .x86_64 => x64.pmu.PmuState,
@@ -1059,7 +1059,7 @@ pub fn pmuClearState(state: *PmuState) void {
     }
 }
 
-// --- Wall clock (systems.md §22) ---
+// --- Wall clock (systems.md §wall-clock) ---
 
 pub fn readRtc() u64 {
     return switch (builtin.cpu.arch) {
@@ -1069,7 +1069,7 @@ pub fn readRtc() u64 {
     };
 }
 
-// --- Randomness (systems.md §23) ---
+// --- Randomness (systems.md §randomness) ---
 
 pub fn getRandom() ?u64 {
     return switch (builtin.cpu.arch) {
@@ -1079,7 +1079,7 @@ pub fn getRandom() ?u64 {
     };
 }
 
-// --- IRQ notification (systems.md §24) ---
+// --- IRQ notification (systems.md §irq-delivery) ---
 
 pub fn maskIrq(irq: u8) void {
     switch (builtin.cpu.arch) {
@@ -1121,7 +1121,7 @@ pub fn registerIrqOwner(irq_line: u8, proc: *zag.proc.process.Process, slot_inde
     }
 }
 
-// --- Power control (systems.md §25) ---
+// --- Power control (systems.md §power) ---
 
 pub const PowerAction = switch (builtin.cpu.arch) {
     .x86_64 => x64.power.PowerAction,
@@ -1151,7 +1151,7 @@ pub fn cpuPowerAction(action: CpuPowerAction, value: u64) i64 {
     };
 }
 
-// --- System info (sys_info) dispatch (systems.md §13, §21) ---
+// --- System info (sys_info) dispatch (systems.md §arch-interface, §sysinfo) ---
 
 /// One-time system-info bring-up on the bootstrap core. Called from `kMain`
 /// after `arch.pmuInit()` and before `sched.globalInit()`.
@@ -1185,7 +1185,7 @@ pub fn sampleCoreHwState() void {
 }
 
 /// Read the cached current frequency of `core_id` in hertz. Up to one
-/// scheduler tick stale for remote cores. See systems.md §21 for the
+/// scheduler tick stale for remote cores. See systems.md §sysinfo for the
 /// tick-sampled cache design.
 pub fn getCoreFreq(core_id: u64) u64 {
     return switch (builtin.cpu.arch) {

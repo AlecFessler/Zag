@@ -18,7 +18,7 @@ const E_NOENT: i64 = -10;
 /// field. Threads waiting via `notify_wait` block on the `waiters` queue
 /// and are woken when `signal` fires.
 ///
-/// Spec §2.18; systems.md §24.
+/// Spec §2.18; systems.md §irq-delivery.
 pub const NotificationBox = struct {
     word: u64 = 0,
     waiters: ThreadPriorityQueue = .{},

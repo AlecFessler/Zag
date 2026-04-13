@@ -1,6 +1,6 @@
 //! aarch64 PMU stubs (unimplemented).
 //!
-//! Per systems.md §20 "aarch64 Stub Policy": the stub exists so
+//! Per systems.md §pmu "aarch64 Stub Policy": the stub exists so
 //! `kernel/arch/dispatch.zig` comptime switches compile on aarch64 and so
 //! the PMU syscalls return `E_INVAL` cleanly instead of `@compileError`-ing
 //! the build. Because `pmuGetInfo` reports `num_counters = 0`, the generic

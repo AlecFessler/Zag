@@ -4,7 +4,7 @@
 //! `PmuInfo`, `PmuSample`) and implements `sysPmuInfo`, `sysPmuStart`,
 //! `sysPmuRead`, `sysPmuReset`, `sysPmuStop`. All hardware touching is
 //! delegated to `arch.pmuXxx`; this file contains zero x86-specific state
-//! or MSR references (see systems.md §20).
+//! or MSR references (see systems.md §pmu).
 //!
 //! Capability model (spec §2.14.1–§2.14.6):
 //!   * `ProcessRights.pmu` on slot 0 of the calling process gates every

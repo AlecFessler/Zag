@@ -24,7 +24,7 @@ pub const CpuPowerAction = enum(u8) {
 };
 
 /// Perform a system-wide power action.
-/// Spec §4.61; systems.md §25.
+/// Spec §4.61; systems.md §power.
 pub fn powerAction(action: PowerAction) i64 {
     switch (action) {
         .shutdown => doShutdown(),
@@ -42,7 +42,7 @@ pub fn powerAction(action: PowerAction) i64 {
 }
 
 /// Perform a per-CPU power action.
-/// Spec §4.62; systems.md §25.
+/// Spec §4.62; systems.md §power.
 pub fn cpuPowerAction(action: CpuPowerAction, value: u64) i64 {
     switch (action) {
         .set_freq => {

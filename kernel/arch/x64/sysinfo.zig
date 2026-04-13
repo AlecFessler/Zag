@@ -1,7 +1,7 @@
 //! x86_64 system-information (frequency, temperature, C-state) reads for
 //! the `sys_info` syscall.
 //!
-//! Implements the arch-dispatched interface documented in systems.md §13
+//! Implements the arch-dispatched interface documented in systems.md §arch-interface
 //! "System Information" and §21 "System Info Internals". All x86-specific
 //! concepts (IA32_PERF_STATUS, IA32_THERM_STATUS, MSR_TEMPERATURE_TARGET,
 //! CPUID leaf 0x16) live in this file and are never visible to generic
@@ -91,7 +91,7 @@ var bus_freq_hz: u64 = DEFAULT_BUS_FREQ_HZ;
 /// future iteration; until then the cache stays at its zero-initialised
 /// state on AMD and `getCoreFreq` / `getCoreTemp` / `getCoreState` all
 /// return `0`, matching the aarch64 stub behaviour documented in
-/// `systems.md §21 "System Info Internals"`.
+/// `systems.md §sysinfo "System Info Internals"`.
 ///
 /// Plain `var bool`, not `std.atomic.Value`: written exactly once on the
 /// bootstrap core during `sysInfoInit` (before any AP is brought up) and
@@ -168,7 +168,7 @@ pub fn sysInfoPerCoreInit() void {
 
 /// Sample this core's frequency, temperature, and C-state into the core's
 /// cache slot. Called from `schedTimerHandler` on every scheduler tick
-/// before any `running_thread` transition (systems.md §21).
+/// before any `running_thread` transition (systems.md §sysinfo).
 ///
 /// `rdmsr` reads the issuing core's MSRs, so this function **must** run on
 /// the target core. Remote cores read the cache slot populated by this

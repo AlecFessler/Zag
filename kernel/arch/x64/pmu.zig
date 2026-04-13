@@ -454,7 +454,7 @@ fn clearAllOverflowStatus(num_counters: u8) void {
 }
 
 /// PMI handler. Runs on the core whose counter overflowed. The handler
-/// path is documented in systems.md §20 "PMI Handler Flow"; in summary it
+/// path is documented in systems.md §pmu "PMI Handler Flow"; in summary it
 /// EOIs, saves counter values, disables the global PMU, and hands the
 /// thread off to the fault delivery machinery with reason `pmu_overflow`.
 fn pmuPmiHandler(ctx: *cpu.Context) void {

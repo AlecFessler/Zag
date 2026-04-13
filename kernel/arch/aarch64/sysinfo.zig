@@ -1,6 +1,6 @@
 //! aarch64 system-information stubs (unimplemented).
 //!
-//! Per systems.md §21 "aarch64 Stubs": the stub exists so
+//! Per systems.md §sysinfo "aarch64 Stubs": the stub exists so
 //! `kernel/arch/dispatch.zig`'s comptime switches compile on aarch64 and
 //! so `sys_info` returns a syntactically valid `CoreInfo` array (all
 //! hardware fields zero) instead of `@compileError`-ing the build.

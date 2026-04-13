@@ -41,7 +41,7 @@ fn kMain(boot_info: *BootInfo) !void {
     arch.vmInit();
     arch.pmuInit();
     arch.sysInfoInit();
-    // Wall clock offset init: read RTC once at boot (systems.md §22).
+    // Wall clock offset init: read RTC once at boot (systems.md §wall-clock).
     const rtc_nanos = arch.readRtc();
     const monotonic_now = arch.getMonotonicClock().now();
     syscall.clock.wall_offset = @as(i64, @bitCast(rtc_nanos)) -% @as(i64, @bitCast(monotonic_now));

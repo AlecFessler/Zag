@@ -64,7 +64,7 @@ pub fn coreRunning(thread: *Thread) ?u64 {
 }
 
 /// PMU save/restore hook around `arch.switchTo`. Centralizes the
-/// null-guarded calls described in systems.md §6 "PMU Save/Restore Hooks"
+/// null-guarded calls described in systems.md §run-queue "PMU Save/Restore Hooks"
 /// so every `switchTo` site in this file goes through the same pair.
 ///
 /// `arch.switchTo` does not return to this frame — on x64 it mov's RSP to
@@ -658,7 +658,7 @@ pub fn switchToNextReady() noreturn {
     // Outgoing is whoever was running on this core before the caller
     // flipped its state to .blocked. We read it *before* overwriting
     // `state.running_thread` so the PMU save fires under the outgoing
-    // thread's identity (systems.md §6 "PMU Save/Restore Hooks").
+    // thread's identity (systems.md §run-queue "PMU Save/Restore Hooks").
     const outgoing: ?*Thread = @atomicLoad(?*Thread, &state.running_thread, .acquire);
 
     state.rq_lock.lock();

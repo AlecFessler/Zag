@@ -8,7 +8,7 @@
 //!
 //! Public contract is in spec §2.15 (observable types and accounting
 //! window semantics) and spec §4.55 (the syscall itself). Internals are
-//! documented in systems.md §21 "System Info Internals".
+//! documented in systems.md §sysinfo "System Info Internals".
 
 const std = @import("std");
 const zag = @import("zag");

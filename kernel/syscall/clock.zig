@@ -9,7 +9,7 @@ const E_PERM = errors.E_PERM;
 
 /// Wall clock offset: difference between RTC-derived Unix nanoseconds
 /// and the monotonic clock. Initialized at boot from the CMOS RTC.
-/// Spec §2.16; systems.md §22.
+/// Spec §2.16; systems.md §wall-clock.
 pub var wall_offset: i64 = 0;
 
 pub fn sysClockGettime() i64 {
