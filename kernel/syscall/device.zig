@@ -91,23 +91,6 @@ pub fn sysMemMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
     return E_OK;
 }
 
-pub fn sysMemMmioUnmap(device_handle: u64, vm_handle: u64) i64 {
-    const proc = sched.currentProc();
-
-    const device_entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
-    if (device_entry.object != .device_region) return E_BADCAP;
-
-    const vm_entry = proc.getPermByHandle(vm_handle) orelse return E_BADCAP;
-    if (vm_entry.object != .vm_reservation) return E_BADCAP;
-
-    const vm_res = vm_entry.object.vm_reservation;
-    const device = device_entry.object.device_region;
-
-    proc.vmm.memMmioUnmap(device, vm_handle, vm_res.original_start, vm_res.original_size, vm_res.max_rights) catch return E_NOENT;
-
-    return E_OK;
-}
-
 pub fn sysIrqAck(device_handle: u64) i64 {
     const proc = sched.currentProc();
     const entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;

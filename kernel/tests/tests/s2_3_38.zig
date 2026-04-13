@@ -4,7 +4,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.3.38 — `mem_shm_unmap` returns `E_OK` on success.
+/// §2.3.38 — `mem_unmap` returns `E_OK` on success.
 ///
 /// After unmap, the page must become zero-filled demand-paged private memory
 /// per §2.2.7. We write a pattern through the SHM mapping, unmap, then touch
@@ -23,7 +23,7 @@ pub fn main(perm_view: u64) void {
     const buf: [*]volatile u8 = @ptrFromInt(vaddr);
     for (0..64) |i| buf[i] = 0xCC;
 
-    const ret = syscall.mem_shm_unmap(shm_handle, vm_handle);
+    const ret = syscall.mem_unmap(vm_handle, 0, 4096);
     t.expectEqual("§2.3.38", 0, ret);
 
     // Touching the page now should fault-in zeroed private memory.

@@ -7,7 +7,7 @@ const t = lib.testing;
 
 const E_OK: i64 = 0;
 
-/// §2.3.54 — `mem_mmio_unmap` returns `E_OK` on success.
+/// §2.3.54 — `mem_unmap` on MMIO mapping returns `E_OK` on success.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
@@ -22,7 +22,7 @@ pub fn main(pv: u64) void {
     const vm_handle: u64 = @bitCast(vm.val);
 
     _ = syscall.mem_mmio_map(dev_handle, vm_handle, 0);
-    const ret = syscall.mem_mmio_unmap(dev_handle, vm_handle);
+    const ret = syscall.mem_unmap(vm_handle, 0, size);
     t.expectEqual("§2.3.54", E_OK, ret);
     syscall.shutdown();
 }

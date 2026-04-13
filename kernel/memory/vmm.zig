@@ -491,51 +491,110 @@ pub const VirtualMemoryManager = struct {
         }
     }
 
-    pub fn memShmUnmap(
+    pub fn memUnmap(
         self: *VirtualMemoryManager,
-        shm: *SharedMemory,
         vm_handle: u64,
         original_start: VAddr,
         original_size: u64,
+        offset: u64,
+        size: u64,
         max_rights: VmReservationRights,
     ) !void {
         self.lock.lock();
         defer self.lock.unlock();
         _ = vm_handle;
-        _ = original_start;
         _ = original_size;
 
-        const map_node = inOrderFind(&self.tree, struct {
-            target: *SharedMemory,
-            fn match(ctx: *const @This(), node: *VmNode) bool {
-                return node.kind == .shared_memory and node.kind.shared_memory == ctx.target;
+        const range_start = VAddr.fromInt(original_start.addr + offset);
+        const range_end_addr = range_start.addr + size;
+
+        // VALIDATION PASS: Check that all non-private nodes are fully contained.
+        // Any shm/mmio/virtual_bar node must have start >= range_start AND
+        // start + size <= range_end_addr. If partially overlapping, reject.
+        const ValidCtx = struct {
+            range_start_addr: u64,
+            range_end_addr: u64,
+            has_partial: bool = false,
+            fn cb(ctx: *@This(), node: *VmNode) void {
+                if (node.kind == .private) return;
+                if (node.start.addr < ctx.range_start_addr or node.end() > ctx.range_end_addr) {
+                    ctx.has_partial = true;
+                }
             }
-        }{ .target = shm }) orelse return error.NotFound;
-
-        unmapNodePages(map_node, self.addr_space_root, false);
-
-        const old_start = map_node.start;
-        const old_size = map_node.size;
-        const old_handle = map_node.handle;
-        _ = self.tree.remove(map_node) catch {};
-        freeVmNode(map_node);
-
-        const replacement = try allocVmNode();
-        replacement.* = .{
-            .start = old_start,
-            .size = old_size,
-            .kind = .private,
-            .rights = .{
-                .read = max_rights.read,
-                .write = max_rights.write,
-                .execute = max_rights.execute,
-            },
-            .handle = old_handle,
-            .restart_policy = .free,
         };
-        self.tree.insert(replacement) catch freeVmNode(replacement);
+        var valid_ctx = ValidCtx{ .range_start_addr = range_start.addr, .range_end_addr = range_end_addr };
+        var vs = mkSentinel(range_start);
+        var ve = mkSentinel(VAddr.fromInt(range_end_addr));
+        self.tree.forEachInRange(&vs, &ve, &valid_ctx, ValidCtx.cb);
+        if (valid_ctx.has_partial) return error.PartialOverlap;
 
-        mergeRange(&self.tree, old_start, VAddr.fromInt(old_start.addr + old_size));
+        // Split at boundaries (only needed for private nodes at the edges).
+        try splitAtLocked(&self.tree, range_start);
+        try splitAtLocked(&self.tree, VAddr.fromInt(range_end_addr));
+
+        // UNMAP PASS: Collect non-private nodes to replace, and update private nodes.
+        var to_replace: [64]*VmNode = undefined;
+        var replace_count: usize = 0;
+
+        const UnmapCtx = struct {
+            root: PAddr,
+            rights: VmReservationRights,
+            buf: *[64]*VmNode,
+            count: *usize,
+            fn cb(ctx: *@This(), node: *VmNode) void {
+                switch (node.kind) {
+                    .private => {
+                        unmapNodePages(node, ctx.root, true);
+                        node.rights = ctx.rights;
+                    },
+                    .shared_memory, .mmio, .virtual_bar => {
+                        if (node.kind != .virtual_bar) {
+                            unmapNodePages(node, ctx.root, false);
+                        }
+                        if (ctx.count.* < 64) {
+                            ctx.buf.*[ctx.count.*] = node;
+                            ctx.count.* += 1;
+                        }
+                    },
+                }
+            }
+        };
+        var unmap_ctx = UnmapCtx{
+            .root = self.addr_space_root,
+            .rights = .{ .read = max_rights.read, .write = max_rights.write, .execute = max_rights.execute },
+            .buf = &to_replace,
+            .count = &replace_count,
+        };
+        var us = mkSentinel(range_start);
+        var ue = mkSentinel(VAddr.fromInt(range_end_addr));
+        self.tree.forEachInRange(&us, &ue, &unmap_ctx, UnmapCtx.cb);
+
+        // Replace non-private nodes with private nodes.
+        for (to_replace[0..replace_count]) |node| {
+            const old_start = node.start;
+            const old_size = node.size;
+            const old_handle = node.handle;
+            _ = self.tree.remove(node) catch {};
+            freeVmNode(node);
+
+            const replacement = allocVmNode() catch continue;
+            replacement.* = .{
+                .start = old_start,
+                .size = old_size,
+                .kind = .private,
+                .rights = .{
+                    .read = max_rights.read,
+                    .write = max_rights.write,
+                    .execute = max_rights.execute,
+                },
+                .handle = old_handle,
+                .restart_policy = .free,
+            };
+            self.tree.insert(replacement) catch freeVmNode(replacement);
+        }
+
+        // Merge adjacent private nodes.
+        mergeRange(&self.tree, range_start, VAddr.fromInt(range_end_addr));
     }
 
     pub fn memMmioMap(
@@ -662,57 +721,6 @@ pub const VirtualMemoryManager = struct {
         // No page mapping — PTEs are left absent intentionally so that
         // every access traps into the page fault handler, which decodes
         // the faulting instruction and performs the port I/O.
-    }
-
-    pub fn memMmioUnmap(
-        self: *VirtualMemoryManager,
-        device: *DeviceRegion,
-        vm_handle: u64,
-        original_start: VAddr,
-        original_size: u64,
-        max_rights: VmReservationRights,
-    ) !void {
-        self.lock.lock();
-        defer self.lock.unlock();
-        _ = vm_handle;
-        _ = original_start;
-        _ = original_size;
-
-        const map_node = inOrderFind(&self.tree, struct {
-            target: *DeviceRegion,
-            fn match(ctx: *const @This(), node: *VmNode) bool {
-                return (node.kind == .mmio and node.kind.mmio == ctx.target) or
-                    (node.kind == .virtual_bar and node.kind.virtual_bar == ctx.target);
-            }
-        }{ .target = device }) orelse return error.NotFound;
-
-        // virtual_bar nodes have no mapped pages; only unmap for mmio
-        if (map_node.kind == .mmio) {
-            unmapNodePages(map_node, self.addr_space_root, false);
-        }
-
-        const old_start = map_node.start;
-        const old_size = map_node.size;
-        const old_handle = map_node.handle;
-        _ = self.tree.remove(map_node) catch {};
-        freeVmNode(map_node);
-
-        const replacement = try allocVmNode();
-        replacement.* = .{
-            .start = old_start,
-            .size = old_size,
-            .kind = .private,
-            .rights = .{
-                .read = max_rights.read,
-                .write = max_rights.write,
-                .execute = max_rights.execute,
-            },
-            .handle = old_handle,
-            .restart_policy = .free,
-        };
-        self.tree.insert(replacement) catch freeVmNode(replacement);
-
-        mergeRange(&self.tree, old_start, VAddr.fromInt(old_start.addr + old_size));
     }
 
     pub fn revokeReservation(

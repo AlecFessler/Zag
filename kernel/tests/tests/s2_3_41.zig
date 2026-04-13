@@ -5,7 +5,7 @@ const perm_view = lib.perm_view;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.3.41 — Process retains SHM handle after `mem_shm_unmap`.
+/// §2.3.41 — Process retains SHM handle after `mem_unmap`.
 pub fn main(pv: u64) void {
     const shareable_rw = perms.VmReservationRights{ .read = true, .write = true, .shareable = true };
     const vm = syscall.mem_reserve(0, 4096, shareable_rw.bits());
@@ -14,7 +14,7 @@ pub fn main(pv: u64) void {
     const shm_ret = syscall.shm_create_with_rights(4096, shm_rights.bits());
     const shm_handle: u64 = @bitCast(shm_ret);
     _ = syscall.mem_shm_map(shm_handle, vm_handle, 0);
-    _ = syscall.mem_shm_unmap(shm_handle, vm_handle);
+    _ = syscall.mem_unmap(vm_handle, 0, 4096);
     // Verify handle still exists in user view.
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
     var found = false;

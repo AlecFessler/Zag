@@ -65,6 +65,8 @@ pub fn sysMemPerms(vm_handle: u64, offset: u64, size: u64, perms_bits: u64) i64 
     const vm_res = entry.object.vm_reservation;
 
     const new_rwx = @as(u16, @truncate(perms_bits)) & 0b111;
+    if (new_rwx == 0) return E_INVAL;
+
     const max_rwx =
         @as(u16, @intFromBool(vm_res.max_rights.read)) |
         (@as(u16, @intFromBool(vm_res.max_rights.write)) << 1) |
@@ -175,19 +177,30 @@ pub fn sysMemShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
     return E_OK;
 }
 
-pub fn sysMemShmUnmap(shm_handle: u64, vm_handle: u64) i64 {
+pub fn sysMemUnmap(vm_handle: u64, offset: u64, size: u64) i64 {
+    if (!std.mem.isAligned(offset, paging.PAGE4K)) return E_INVAL;
+    if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) return E_INVAL;
+
     const proc = sched.currentProc();
+    const entry = proc.getPermByHandle(vm_handle) orelse return E_BADCAP;
+    if (entry.object != .vm_reservation) return E_BADCAP;
 
-    const shm_entry = proc.getPermByHandle(shm_handle) orelse return E_BADCAP;
-    if (shm_entry.object != .shared_memory) return E_BADCAP;
+    const vm_res = entry.object.vm_reservation;
 
-    const vm_entry = proc.getPermByHandle(vm_handle) orelse return E_BADCAP;
-    if (vm_entry.object != .vm_reservation) return E_BADCAP;
+    const range_end = std.math.add(u64, offset, size) catch return E_INVAL;
+    if (range_end > vm_res.original_size) return E_INVAL;
 
-    const vm_res = vm_entry.object.vm_reservation;
-    const shm = shm_entry.object.shared_memory;
-
-    proc.vmm.memShmUnmap(shm, vm_handle, vm_res.original_start, vm_res.original_size, vm_res.max_rights) catch return E_NOENT;
+    proc.vmm.memUnmap(
+        vm_handle,
+        vm_res.original_start,
+        vm_res.original_size,
+        offset,
+        size,
+        vm_res.max_rights,
+    ) catch |e| return switch (e) {
+        error.PartialOverlap => E_INVAL,
+        else => E_INVAL,
+    };
 
     return E_OK;
 }

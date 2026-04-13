@@ -13,9 +13,9 @@ pub const SyscallNum = enum(u64) {
     mem_perms,
     mem_shm_create,
     mem_shm_map,
-    mem_shm_unmap,
+    mem_unmap,
     mem_mmio_map,
-    mem_mmio_unmap,
+    _mem_mmio_unmap_removed,
     proc_create,
     thread_create,
     thread_exit,
@@ -173,16 +173,12 @@ pub fn mem_shm_map(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
     return syscall3(.mem_shm_map, shm_handle, vm_handle, offset);
 }
 
-pub fn mem_shm_unmap(shm_handle: u64, vm_handle: u64) i64 {
-    return syscall2(.mem_shm_unmap, shm_handle, vm_handle);
+pub fn mem_unmap(vm_handle: u64, offset: u64, size: u64) i64 {
+    return syscall3(.mem_unmap, vm_handle, offset, size);
 }
 
 pub fn mem_mmio_map(device_handle: u64, vm_handle: u64, offset: u64) i64 {
     return syscall3(.mem_mmio_map, device_handle, vm_handle, offset);
-}
-
-pub fn mem_mmio_unmap(device_handle: u64, vm_handle: u64) i64 {
-    return syscall2(.mem_mmio_unmap, device_handle, vm_handle);
 }
 
 pub fn proc_create(elf_ptr: u64, elf_len: u64, rights_bits: u64) i64 {

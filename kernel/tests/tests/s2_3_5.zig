@@ -4,7 +4,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.3.5 — `mem_shm_unmap` removes the SHM mapping from the reservation.
+/// §2.3.5 — `mem_unmap` removes the SHM mapping from the reservation.
 ///
 /// After writing a magic value via the SHM mapping and unmapping, reading the
 /// same VA must no longer observe the SHM contents (the range reverts to
@@ -31,7 +31,7 @@ pub fn main(_: u64) void {
     }
 
     // Unmap the SHM — the VA must no longer reach the SHM backing page.
-    if (syscall.mem_shm_unmap(shm_handle, vm_handle) != 0) {
+    if (syscall.mem_unmap(vm_handle, 0, 4096) != 0) {
         t.fail("§2.3.5");
         syscall.shutdown();
     }

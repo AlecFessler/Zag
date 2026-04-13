@@ -4,7 +4,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.3.6 — After `mem_shm_unmap`, the range reverts to private with max RWX rights.
+/// §2.3.6 — After `mem_unmap`, the range reverts to private with max RWX rights.
 ///
 /// We reserve the range with read+write+execute so that "max RWX" means all
 /// three bits are observable post-unmap. After unmapping, we verify:
@@ -25,7 +25,7 @@ pub fn main(perm_view: u64) void {
     const ptr: *volatile u64 = @ptrFromInt(vm.val2);
     ptr.* = 0xDEAD_BEEF_CAFE_BABE;
     // Unmap SHM.
-    _ = syscall.mem_shm_unmap(shm_handle, vm_handle);
+    _ = syscall.mem_unmap(vm_handle, 0, 4096);
     // After unmap, range reverts to private demand-paged. Reading should yield zero
     // (fresh demand-paged page), NOT the old SHM data.
     const read_val = ptr.*;
