@@ -6,13 +6,7 @@ const syscall = lib.syscall;
 const t = lib.testing;
 
 var policy: [4096]u8 align(4096) = .{0} ** 4096;
-// GuestInterrupt: vector(u8), interrupt_type(u8), error_code_valid(u8), ...
-// Set vector = 0x20 (32, first valid external vector per Intel SDM §6.3.1).
-var interrupt: [64]u8 align(8) = blk: {
-    var buf: [64]u8 = .{0} ** 64;
-    buf[0] = 0x20;
-    break :blk buf;
-};
+var interrupt: [64]u8 align(8) = .{0} ** 64;
 
 fn findVcpuHandle(view: [*]const perm_view.UserViewEntry, skip_handle: u64) u64 {
     for (0..128) |i| {

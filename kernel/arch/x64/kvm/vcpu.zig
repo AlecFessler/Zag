@@ -254,14 +254,6 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     if (!readUserStruct(proc, interrupt_ptr, &int_buf)) return E_BADADDR;
     const interrupt = std.mem.bytesAsValue(vm_hw.GuestInterrupt, &int_buf).*;
 
-    // Reject reserved architectural exception vectors 0-31 (Intel SDM Vol 3A,
-    // §6.3.1 "External Interrupts" and Table 6-1). External interrupts must
-    // use vectors >= 32; injecting 0-15 (faults) or 16-31 (reserved) via the
-    // VM-entry event-injection path (bypassing the LAPIC) would let an
-    // attacker VMM corrupt guest exception handling by writing an illegal
-    // vector directly to VMCS VM_ENTRY_INTR_INFO.
-    if (interrupt.vector < 32) return E_INVAL;
-
     if (vcpu_obj.loadState() == .running) {
         const thread = vcpu_obj.thread;
         // IPI to suspend
