@@ -7,13 +7,7 @@ const t = lib.testing;
 
 /// §4.1.48 — When a counter configured with an overflow threshold reaches that threshold the hardware raises a PMU interrupt.
 pub fn main(_: u64) void {
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or
-        info.num_counters == 0 or !info.overflow_support)
-    {
-        t.pass("§4.1.48");
-        syscall.shutdown();
-    }
+    _ = t.requirePmuOverflow("§4.1.48");
 
     const child_rights = perms.ProcessRights{
         .spawn_thread = true,

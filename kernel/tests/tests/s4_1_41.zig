@@ -10,25 +10,8 @@ pub fn main(_: u64) void {
     // via thread_self should succeed.
     const self_thread: u64 = @bitCast(syscall.thread_self());
 
-    // Query capabilities to pick a valid event.
-    var info: syscall.PmuInfo = undefined;
-    const info_rc = syscall.pmu_info(@intFromPtr(&info));
-    if (info_rc != syscall.E_OK) {
-        t.failWithVal("§4.1.41 pmu_info", syscall.E_OK, info_rc);
-        syscall.shutdown();
-    }
-    if (info.num_counters == 0) {
-        // No hardware counters — §4.1.41 self-access path is untestable
-        // but the rights path was exercised via pmu_info succeeding.
-        t.pass("§4.1.41");
-        syscall.shutdown();
-    }
-    const evt = syscall.pickSupportedEvent(info) orelse {
-        t.pass("§4.1.41");
-        syscall.shutdown();
-    };
-
-    var cfg = syscall.PmuCounterConfig{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
+    const pmu = t.requirePmu("§4.1.41");
+    var cfg = syscall.PmuCounterConfig{ .event = pmu.event, .has_threshold = false, .overflow_threshold = 0 };
     const start_rc = syscall.pmu_start(self_thread, @intFromPtr(&cfg), 1);
     if (start_rc != syscall.E_OK) {
         t.failWithVal("§4.1.41 pmu_start", syscall.E_OK, start_rc);

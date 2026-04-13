@@ -5,14 +5,16 @@ const syscall = lib.syscall;
 const t = lib.testing;
 
 var worker_ready: u64 align(8) = 0;
+var worker_go_exit: u64 align(8) = 0;
 var worker_done: u64 align(8) = 0;
 
 fn shortLivedWorker() void {
     @atomicStore(u64, &worker_ready, 1, .seq_cst);
-    // Signal the parent that we are about to call thread_exit. The parent
-    // then polls the perm view until our slot disappears — that transition
-    // is what proves the thread actually exited (not merely that
-    // revoke_perm cleared our handle from the parent's table).
+    // Spin until the parent tells us to exit. This gives the parent a
+    // deterministic window to suspend us, start PMU, and resume — which
+    // is required because remote pmu_start rejects non-suspended targets
+    // with E_BUSY (kernel/syscall/pmu.zig:149).
+    while (@atomicLoad(u64, &worker_go_exit, .seq_cst) == 0) syscall.thread_yield();
     @atomicStore(u64, &worker_done, 1, .seq_cst);
     syscall.thread_exit();
 }
@@ -37,21 +39,14 @@ fn shortLivedWorker() void {
 /// best available indirect evidence without kernel allocator-counter
 /// instrumentation exposed to userspace.
 pub fn main(pv: u64) void {
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or info.num_counters == 0) {
-        t.pass("§4.1.45");
-        syscall.shutdown();
-    }
-    const evt = syscall.pickSupportedEvent(info) orelse {
-        t.pass("§4.1.45");
-        syscall.shutdown();
-    };
+    const pmu = t.requirePmu("§4.1.45");
 
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
     var i: u64 = 0;
     while (i < 128) : (i += 1) {
         @atomicStore(u64, &worker_ready, 0, .seq_cst);
+        @atomicStore(u64, &worker_go_exit, 0, .seq_cst);
         @atomicStore(u64, &worker_done, 0, .seq_cst);
 
         const h = syscall.thread_create(&shortLivedWorker, 0, 4);
@@ -64,16 +59,23 @@ pub fn main(pv: u64) void {
         // Wait until the worker is definitely running before starting PMU.
         while (@atomicLoad(u64, &worker_ready, .seq_cst) == 0) syscall.thread_yield();
 
-        var cfg = syscall.PmuCounterConfig{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
+        // Remote pmu_start requires target suspended; worker spins on
+        // worker_go_exit until we release it, so suspend/start/resume is
+        // deterministic.
+        if (syscall.thread_suspend(worker_h) != syscall.E_OK) {
+            t.fail("§4.1.45 thread_suspend");
+            syscall.shutdown();
+        }
+        var cfg = syscall.PmuCounterConfig{ .event = pmu.event, .has_threshold = false, .overflow_threshold = 0 };
         const start_rc = syscall.pmu_start(worker_h, @intFromPtr(&cfg), 1);
-        // Race-tolerant: worker may already be in the done-window before we
-        // issue pmu_start. Either E_OK (we started PMU on a live worker)
-        // or E_BADHANDLE (worker exited already) is acceptable — both
-        // paths must not leak PMU state.
-        if (start_rc != syscall.E_OK and start_rc != syscall.E_BADHANDLE) {
+        if (start_rc != syscall.E_OK) {
             t.failWithVal("§4.1.45 pmu_start", syscall.E_OK, start_rc);
             syscall.shutdown();
         }
+        _ = syscall.thread_resume(worker_h);
+
+        // Release the worker — it now signals done and calls thread_exit.
+        @atomicStore(u64, &worker_go_exit, 1, .seq_cst);
 
         // Wait for the worker's done-flag (it's about to thread_exit).
         while (@atomicLoad(u64, &worker_done, .seq_cst) == 0) syscall.thread_yield();

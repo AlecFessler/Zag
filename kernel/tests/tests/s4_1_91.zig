@@ -26,18 +26,9 @@ const t = lib.testing;
 /// uncovered; this file exists to preserve tag-binding for the coverage
 /// matrix.
 pub fn main(_: u64) void {
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or info.num_counters == 0) {
-        t.pass("§4.1.91");
-        syscall.shutdown();
-    }
-    const evt: syscall.PmuEvent = syscall.pickSupportedEvent(info) orelse {
-        t.pass("§4.1.91");
-        syscall.shutdown();
-    };
-
+    const pmu = t.requirePmu("§4.1.91");
     const self_thread: u64 = @bitCast(syscall.thread_self());
-    var cfg = syscall.PmuCounterConfig{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
+    var cfg = syscall.PmuCounterConfig{ .event = pmu.event, .has_threshold = false, .overflow_threshold = 0 };
     const rc = syscall.pmu_start(self_thread, @intFromPtr(&cfg), 1);
     if (rc != syscall.E_OK and rc != syscall.E_NOMEM and rc != syscall.E_INVAL) {
         t.failWithVal("§4.1.91 unexpected", 0, rc);

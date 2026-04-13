@@ -13,18 +13,10 @@ pub fn main(_: u64) void {
         syscall.shutdown();
     }
 
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or info.num_counters == 0) {
-        t.pass("§4.1.113");
-        syscall.shutdown();
-    }
-    const evt = syscall.pickSupportedEvent(info) orelse {
-        t.pass("§4.1.113");
-        syscall.shutdown();
-    };
+    const pmu = t.requirePmu("§4.1.113");
 
     // Case 2: start then stop then stop again.
-    var cfg = syscall.PmuCounterConfig{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
+    var cfg = syscall.PmuCounterConfig{ .event = pmu.event, .has_threshold = false, .overflow_threshold = 0 };
     _ = syscall.pmu_start(self_thread, @intFromPtr(&cfg), 1);
     _ = syscall.pmu_stop(self_thread);
     const rc_twice = syscall.pmu_stop(self_thread);

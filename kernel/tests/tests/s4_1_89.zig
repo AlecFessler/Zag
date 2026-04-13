@@ -33,15 +33,9 @@ fn workerLoop() void {
 }
 
 pub fn main(_: u64) void {
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or info.num_counters == 0) {
-        t.pass("§4.1.89");
-        syscall.shutdown();
-    }
-    const evt = syscall.pickSupportedEvent(info) orelse {
-        t.pass("§4.1.89");
-        syscall.shutdown();
-    };
+    const pmu = t.requirePmu("§4.1.89");
+    const info = pmu.info;
+    const evt = pmu.event;
 
     if (info.overflow_support) {
         // Positive path: spawn a helper worker and start PMU on it with
@@ -58,6 +52,14 @@ pub fn main(_: u64) void {
         const worker_h: u64 = @bitCast(h);
         while (@atomicLoad(u64, &worker_ready, .seq_cst) == 0) syscall.thread_yield();
 
+        // Remote pmu_start requires target to be .faulted or .suspended
+        // (kernel/syscall/pmu.zig — E_BUSY otherwise).
+        if (syscall.thread_suspend(worker_h) != syscall.E_OK) {
+            t.fail("§4.1.89 thread_suspend");
+            @atomicStore(u64, &worker_stop, 1, .seq_cst);
+            _ = syscall.thread_kill(worker_h);
+            syscall.shutdown();
+        }
         var cfg = syscall.PmuCounterConfig{
             .event = evt,
             .has_threshold = true,
@@ -67,9 +69,11 @@ pub fn main(_: u64) void {
         if (rc != syscall.E_OK) {
             t.failWithVal("§4.1.89 overflow-supported positive", syscall.E_OK, rc);
             @atomicStore(u64, &worker_stop, 1, .seq_cst);
+            _ = syscall.thread_resume(worker_h);
             _ = syscall.thread_kill(worker_h);
             syscall.shutdown();
         }
+        _ = syscall.thread_resume(worker_h);
         _ = syscall.pmu_stop(worker_h);
         @atomicStore(u64, &worker_stop, 1, .seq_cst);
         _ = syscall.thread_kill(worker_h);

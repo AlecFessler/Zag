@@ -75,15 +75,7 @@ fn threadB() void {
 /// on restore) or polluted by B's work (counters not swapped on context
 /// switch) — both fall well outside the 4x bound.
 pub fn main(_: u64) void {
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or info.num_counters == 0) {
-        t.pass("§4.1.46");
-        syscall.shutdown();
-    }
-    const evt = syscall.pickSupportedEvent(info) orelse {
-        t.pass("§4.1.46");
-        syscall.shutdown();
-    };
+    const pmu = t.requirePmu("§4.1.46");
 
     // Pin the parent somewhere other than core 0 if possible so that A and
     // B are the only things competing on core 0 (on 1-core QEMU this is a
@@ -105,8 +97,10 @@ pub fn main(_: u64) void {
     }
 
     // Start PMU counting the first supported event on thread A only.
+    // Remote pmu_start requires the target suspended (kernel/syscall/pmu.zig:149).
+    _ = syscall.thread_suspend(a_h);
     var cfg = syscall.PmuCounterConfig{
-        .event = evt,
+        .event = pmu.event,
         .has_threshold = false,
         .overflow_threshold = 0,
     };
@@ -115,6 +109,7 @@ pub fn main(_: u64) void {
         _ = syscall.thread_kill(a_h);
         syscall.shutdown();
     }
+    _ = syscall.thread_resume(a_h);
 
     // --- Phase 1: solo run of A's workload ---
     @atomicStore(u64, &a_done, 0, .seq_cst);

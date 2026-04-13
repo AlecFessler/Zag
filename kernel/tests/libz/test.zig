@@ -181,3 +181,54 @@ pub fn waitForCleanup(handle: u64) void {
         syscall.thread_yield();
     }
 }
+
+// --- PMU test prerequisites ---
+//
+// The test rig runs under QEMU with KVM on Intel and AMD hosts, both of
+// which expose a performance monitoring unit (architectural PMU on Intel,
+// AMD PerfCtr/PerfEvtSel on AMD). A PMU test that silently skips with
+// `t.pass()` when `pmu_info` returns `num_counters == 0` hides real
+// regressions: any break in vendor detection, CPUID reading, or KVM PMU
+// emulation would turn into a green run. `requirePmu` and
+// `requirePmuOverflow` hard-fail instead, matching the `requireDevice*`
+// philosophy above — the rig is known-good, so absence is a misconfig.
+
+pub const PmuPrereq = struct {
+    info: syscall.PmuInfo,
+    event: syscall.PmuEvent,
+};
+
+/// Require PMU support with at least one supported event. Hard-fails the
+/// test (no output pass) if pmu_info errors, num_counters is zero, or no
+/// event is supported.
+pub fn requirePmu(name: []const u8) PmuPrereq {
+    var info: syscall.PmuInfo = undefined;
+    const rc = syscall.pmu_info(@intFromPtr(&info));
+    if (rc != syscall.E_OK) {
+        failWithVal(name, syscall.E_OK, rc);
+        syscall.shutdown();
+    }
+    if (info.num_counters == 0) {
+        fail(name);
+        syscall.write("  requirePmu: num_counters == 0 — test rig misconfigured (PMU absent on KVM x86_64?)\n");
+        syscall.shutdown();
+    }
+    const evt = syscall.pickSupportedEvent(info) orelse {
+        fail(name);
+        syscall.write("  requirePmu: no supported events — test rig misconfigured\n");
+        syscall.shutdown();
+    };
+    return .{ .info = info, .event = evt };
+}
+
+/// Require PMU support AND overflow-capable counters. Used by overflow /
+/// sampling-profiler tests.
+pub fn requirePmuOverflow(name: []const u8) PmuPrereq {
+    const r = requirePmu(name);
+    if (!r.info.overflow_support) {
+        fail(name);
+        syscall.write("  requirePmuOverflow: overflow_support == false — test rig misconfigured\n");
+        syscall.shutdown();
+    }
+    return r;
+}

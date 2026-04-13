@@ -7,17 +7,8 @@ const t = lib.testing;
 
 /// §4.1.101 — `pmu_reset` returns `E_OK` on success.
 pub fn main(_: u64) void {
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or
-        info.num_counters == 0 or !info.overflow_support)
-    {
-        t.pass("§4.1.101");
-        syscall.shutdown();
-    }
-    const evt = syscall.pickSupportedEvent(info) orelse {
-        t.pass("§4.1.101");
-        syscall.shutdown();
-    };
+    const pmu = t.requirePmuOverflow("§4.1.101");
+    const evt = pmu.event;
 
     const child_rights = perms.ProcessRights{
         .spawn_thread = true,

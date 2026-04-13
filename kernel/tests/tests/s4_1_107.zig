@@ -7,13 +7,8 @@ const t = lib.testing;
 
 /// §4.1.107 — `pmu_reset` with invalid configuration (same rules as `pmu_start`: bad `count`, unsupported event, overflow unsupported) returns `E_INVAL`.
 pub fn main(_: u64) void {
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or
-        info.num_counters == 0 or !info.overflow_support)
-    {
-        t.pass("§4.1.107");
-        syscall.shutdown();
-    }
+    const pmu = t.requirePmuOverflow("§4.1.107");
+    const info = pmu.info;
 
     const child_rights = perms.ProcessRights{
         .spawn_thread = true,

@@ -7,17 +7,8 @@ const t = lib.testing;
 
 /// §4.1.49 — On a PMU overflow fault, a profiler typically calls `pmu_read` to retrieve the final counter values, `pmu_reset` to reconfigure counters with the next threshold, and `fault_reply` with `FAULT_RESUME` to resume the thread.
 pub fn main(_: u64) void {
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or
-        info.num_counters == 0 or !info.overflow_support)
-    {
-        t.pass("§4.1.49");
-        syscall.shutdown();
-    }
-    const evt = syscall.pickSupportedEvent(info) orelse {
-        t.pass("§4.1.49");
-        syscall.shutdown();
-    };
+    const pmu = t.requirePmuOverflow("§4.1.49");
+    const evt = pmu.event;
 
     const child_rights = perms.ProcessRights{
         .spawn_thread = true,

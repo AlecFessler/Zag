@@ -7,13 +7,7 @@ const t = lib.testing;
 
 /// §6.11 — A counter overflow on a thread with PMU state configured for sample-based profiling delivers a fault with reason `pmu_overflow`; `FaultMessage.fault_addr` contains the faulting RIP and the full register snapshot in `FaultMessage.regs` is the sample.
 pub fn main(_: u64) void {
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or
-        info.num_counters == 0 or !info.overflow_support)
-    {
-        t.pass("§6.11");
-        syscall.shutdown();
-    }
+    _ = t.requirePmuOverflow("§6.11");
 
     const child_rights = perms.ProcessRights{
         .spawn_thread = true,

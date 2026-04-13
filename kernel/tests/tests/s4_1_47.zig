@@ -20,8 +20,7 @@ fn spinLoop() void {
     }
 }
 
-fn runningBusySubtest(info: syscall.PmuInfo) void {
-    const evt = syscall.pickSupportedEvent(info) orelse return;
+fn runningBusySubtest(evt: syscall.PmuEvent) void {
     const worker = syscall.thread_create(&spinLoop, 0, 4);
     if (worker <= 0) {
         t.failWithVal("§4.1.47 thread_create", 1, worker);
@@ -32,6 +31,8 @@ fn runningBusySubtest(info: syscall.PmuInfo) void {
     // Race-free running signal.
     while (@atomicLoad(u64, &worker_ready, .seq_cst) == 0) syscall.thread_yield();
 
+    // Remote pmu_start requires suspended target (kernel/syscall/pmu.zig:149).
+    _ = syscall.thread_suspend(worker_h);
     var cfg = syscall.PmuCounterConfig{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
     if (syscall.pmu_start(worker_h, @intFromPtr(&cfg), 1) != syscall.E_OK) {
         t.fail("§4.1.47 pmu_start");
@@ -39,6 +40,7 @@ fn runningBusySubtest(info: syscall.PmuInfo) void {
         _ = syscall.thread_kill(worker_h);
         syscall.shutdown();
     }
+    _ = syscall.thread_resume(worker_h);
 
     // Running thread -> E_BUSY.
     var sample: syscall.PmuSample = undefined;
@@ -115,15 +117,11 @@ fn faultedSubtest() void {
 ///       is the `.faulted` half of the §4.1.47 positive path that was
 ///       not previously exercised here (only implicitly by §2.14.13).
 pub fn main(_: u64) void {
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or info.num_counters == 0) {
-        t.pass("§4.1.47");
-        syscall.shutdown();
-    }
+    const pmu = t.requirePmu("§4.1.47");
 
-    runningBusySubtest(info);
+    runningBusySubtest(pmu.event);
 
-    if (info.overflow_support) {
+    if (pmu.info.overflow_support) {
         faultedSubtest();
     }
 

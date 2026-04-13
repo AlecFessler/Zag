@@ -18,15 +18,7 @@ fn workerLoop() void {
 }
 
 pub fn main(_: u64) void {
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or info.num_counters == 0) {
-        t.pass("§4.1.92");
-        syscall.shutdown();
-    }
-    const evt = syscall.pickSupportedEvent(info) orelse {
-        t.pass("§4.1.92");
-        syscall.shutdown();
-    };
+    const pmu = t.requirePmu("§4.1.92");
 
     const h = syscall.thread_create(&workerLoop, 0, 4);
     if (h <= 0) {
@@ -38,7 +30,7 @@ pub fn main(_: u64) void {
 
     // Worker is running, not faulted or suspended — pmu_start on it
     // from the parent must return E_BUSY.
-    var cfg = syscall.PmuCounterConfig{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
+    var cfg = syscall.PmuCounterConfig{ .event = pmu.event, .has_threshold = false, .overflow_threshold = 0 };
     const rc = syscall.pmu_start(worker_h, @intFromPtr(&cfg), 1);
     if (rc != syscall.E_BUSY) {
         t.failWithVal("§4.1.92", syscall.E_BUSY, rc);

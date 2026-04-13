@@ -14,20 +14,8 @@ const t = lib.testing;
 /// The child starts PMU on itself with an overflow threshold and is
 /// multi-threaded so overflow faults deliver to this external handler.
 pub fn main(_: u64) void {
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or
-        info.num_counters == 0 or !info.overflow_support)
-    {
-        syscall.write("[PROF] profiler SKIP no PMU overflow support\n");
-        t.pass("perf_profiler");
-        syscall.shutdown();
-    }
-
-    const evt = syscall.pickSupportedEvent(info) orelse {
-        syscall.write("[PROF] profiler SKIP no supported events\n");
-        t.pass("perf_profiler");
-        syscall.shutdown();
-    };
+    const pmu = t.requirePmuOverflow("perf_profiler");
+    const evt = pmu.event;
 
     const child_rights = perms.ProcessRights{
         .spawn_thread = true,

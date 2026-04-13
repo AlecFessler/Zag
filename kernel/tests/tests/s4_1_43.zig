@@ -16,15 +16,7 @@ fn workerLoop() void {
 
 /// §4.1.43 — `PmuSample.timestamp` is a monotonic nanosecond reading consistent with `clock_gettime`, sampled at the moment the counters are read.
 pub fn main(_: u64) void {
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or info.num_counters == 0) {
-        t.pass("§4.1.43");
-        syscall.shutdown();
-    }
-    const evt = syscall.pickSupportedEvent(info) orelse {
-        t.pass("§4.1.43");
-        syscall.shutdown();
-    };
+    const pmu = t.requirePmu("§4.1.43");
 
     const worker = syscall.thread_create(&workerLoop, 0, 4);
     if (worker <= 0) {
@@ -35,11 +27,18 @@ pub fn main(_: u64) void {
 
     while (@atomicLoad(u64, &worker_ready, .seq_cst) == 0) syscall.thread_yield();
 
-    var cfg = syscall.PmuCounterConfig{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
+    // Remote pmu_start requires target to be .faulted or .suspended
+    // (kernel/syscall/pmu.zig:149 — E_BUSY otherwise).
+    if (syscall.thread_suspend(worker_h) != syscall.E_OK) {
+        t.fail("§4.1.43 thread_suspend pre-start");
+        syscall.shutdown();
+    }
+    var cfg = syscall.PmuCounterConfig{ .event = pmu.event, .has_threshold = false, .overflow_threshold = 0 };
     if (syscall.pmu_start(worker_h, @intFromPtr(&cfg), 1) != syscall.E_OK) {
         t.fail("§4.1.43 pmu_start");
         syscall.shutdown();
     }
+    _ = syscall.thread_resume(worker_h);
 
     // Let the worker run, then suspend and read timestamps.
     for (0..100) |_| syscall.thread_yield();

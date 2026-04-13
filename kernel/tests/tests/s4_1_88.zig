@@ -11,11 +11,8 @@ const t = lib.testing;
 /// and pass it through. Only if literally every defined variant is
 /// supported do we fall back to an out-of-enum id.
 pub fn main(_: u64) void {
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or info.num_counters == 0) {
-        t.pass("§4.1.88");
-        syscall.shutdown();
-    }
+    const pmu = t.requirePmu("§4.1.88");
+    const info = pmu.info;
 
     var unsupported: ?syscall.PmuEvent = null;
     inline for (@typeInfo(syscall.PmuEvent).@"enum".fields) |f| {

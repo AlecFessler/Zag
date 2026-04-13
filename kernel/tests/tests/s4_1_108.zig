@@ -7,13 +7,7 @@ const t = lib.testing;
 
 /// §4.1.108 — `pmu_reset` with `configs_ptr` not pointing to a readable region of `count * sizeof(PmuCounterConfig)` bytes returns `E_BADADDR`.
 pub fn main(_: u64) void {
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or
-        info.num_counters == 0 or !info.overflow_support)
-    {
-        t.pass("§4.1.108");
-        syscall.shutdown();
-    }
+    _ = t.requirePmuOverflow("§4.1.108");
 
     const child_rights = perms.ProcessRights{
         .spawn_thread = true,

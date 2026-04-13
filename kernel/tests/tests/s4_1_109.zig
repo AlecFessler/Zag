@@ -20,15 +20,7 @@ fn worker() void {
 /// a running thread per §2.14.11) — hence a helper worker rather than
 /// self-thread.
 pub fn main(_: u64) void {
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or info.num_counters == 0) {
-        t.pass("§4.1.109");
-        syscall.shutdown();
-    }
-    const evt = syscall.pickSupportedEvent(info) orelse {
-        t.pass("§4.1.109");
-        syscall.shutdown();
-    };
+    const pmu = t.requirePmu("§4.1.109");
 
     const h = syscall.thread_create(&worker, 0, 4);
     if (h <= 0) {
@@ -38,17 +30,23 @@ pub fn main(_: u64) void {
     const worker_h: u64 = @bitCast(h);
     while (@atomicLoad(u64, &worker_ready, .seq_cst) == 0) syscall.thread_yield();
 
-    var cfg = syscall.PmuCounterConfig{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
-    if (syscall.pmu_start(worker_h, @intFromPtr(&cfg), 1) != syscall.E_OK) {
-        t.fail("§4.1.109 pmu_start");
+    // Remote pmu_start requires target to be .faulted or .suspended. The
+    // worker needs to stay suspended through pmu_stop + pmu_read below, so
+    // we just leave it suspended and never resume.
+    if (syscall.thread_suspend(worker_h) != syscall.E_OK) {
+        t.fail("§4.1.109 thread_suspend pre-start");
         @atomicStore(u64, &worker_stop, 1, .seq_cst);
         _ = syscall.thread_kill(worker_h);
         syscall.shutdown();
     }
-
-    // Suspend so pmu_stop + subsequent pmu_read are both valid on the
-    // thread (running threads would return E_BUSY on pmu_read).
-    _ = syscall.thread_suspend(worker_h);
+    var cfg = syscall.PmuCounterConfig{ .event = pmu.event, .has_threshold = false, .overflow_threshold = 0 };
+    if (syscall.pmu_start(worker_h, @intFromPtr(&cfg), 1) != syscall.E_OK) {
+        t.fail("§4.1.109 pmu_start");
+        @atomicStore(u64, &worker_stop, 1, .seq_cst);
+        _ = syscall.thread_resume(worker_h);
+        _ = syscall.thread_kill(worker_h);
+        syscall.shutdown();
+    }
 
     const rc = syscall.pmu_stop(worker_h);
     if (rc != syscall.E_OK) {

@@ -34,15 +34,7 @@ fn shortWorker() void {
 /// The per-worker observable is still the perm-view thread-slot
 /// disappearance: natural exit clears the slot.
 pub fn main(pv: u64) void {
-    var info: syscall.PmuInfo = undefined;
-    if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or info.num_counters == 0) {
-        t.pass("§4.1.114");
-        syscall.shutdown();
-    }
-    const evt = syscall.pickSupportedEvent(info) orelse {
-        t.pass("§4.1.114");
-        syscall.shutdown();
-    };
+    const pmu = t.requirePmu("§4.1.114");
 
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
@@ -60,7 +52,13 @@ pub fn main(pv: u64) void {
         const worker_h: u64 = @bitCast(h);
         while (@atomicLoad(u64, &worker_ready, .seq_cst) == 0) syscall.thread_yield();
 
-        var cfg = syscall.PmuCounterConfig{ .event = evt, .has_threshold = false, .overflow_threshold = 0 };
+        // Remote pmu_start requires target to be .faulted or .suspended.
+        // The worker spins on worker_exit so suspend/resume is deterministic.
+        if (syscall.thread_suspend(worker_h) != syscall.E_OK) {
+            t.fail("§4.1.114 thread_suspend pre-start");
+            syscall.shutdown();
+        }
+        var cfg = syscall.PmuCounterConfig{ .event = pmu.event, .has_threshold = false, .overflow_threshold = 0 };
         const start_rc = syscall.pmu_start(worker_h, @intFromPtr(&cfg), 1);
         if (start_rc != syscall.E_OK) {
             // A leak from a prior iteration would typically surface here
@@ -69,6 +67,7 @@ pub fn main(pv: u64) void {
             t.failWithVal("§4.1.114 pmu_start", syscall.E_OK, start_rc);
             syscall.shutdown();
         }
+        _ = syscall.thread_resume(worker_h);
 
         // Tell worker to exit. The kernel must free its PMU state without
         // requiring an explicit pmu_stop.
