@@ -11,6 +11,9 @@ const ITERATIONS: u32 = 5000;
 /// no receiver) vs ipc_send to a bogus handle (E_BADHANDLE).
 /// The difference isolates capability table scan cost.
 pub fn main(_: u64) void {
+    // Drop root's default .pinned priority before set_affinity; see
+    // kernel/syscall/thread.zig:98 (set_affinity is E_BUSY while pinned).
+    _ = syscall.set_priority(syscall.PRIORITY_NORMAL);
     _ = syscall.set_affinity(1);
     _ = syscall.set_priority(syscall.PRIORITY_REALTIME);
 

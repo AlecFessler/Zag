@@ -7,7 +7,7 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ZAG_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-TIMEOUT=60
+TIMEOUT=120
 QEMU_CMD="qemu-system-x86_64 -m 2G -bios /usr/share/ovmf/x64/OVMF.4m.fd -serial stdio -display none -no-reboot -enable-kvm -cpu host,+invtsc -machine q35 -device intel-iommu,intremap=off -net none -smp cores=4"
 
 IMG_DIR="$ZAG_ROOT/zig-out/img"

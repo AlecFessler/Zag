@@ -9,6 +9,9 @@ const ITERATIONS: u32 = 1000;
 /// 1. mem_reserve for a single 4K page (allocation cost)
 /// 2. First write to the page (demand paging / page fault cost)
 pub fn main(_: u64) void {
+    // Drop root's default .pinned priority before set_affinity; see
+    // kernel/syscall/thread.zig:98 (set_affinity is E_BUSY while pinned).
+    _ = syscall.set_priority(syscall.PRIORITY_NORMAL);
     _ = syscall.set_affinity(1);
     _ = syscall.set_priority(syscall.PRIORITY_REALTIME);
 

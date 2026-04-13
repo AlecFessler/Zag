@@ -45,11 +45,15 @@ pub fn main(_: u64) void {
     }
     const child_handle: u64 = @bitCast(ch_rc);
 
-    // Sync with child — it replies with hot loop addr and main addr
+    // First round: child replies with hot loop addr and main addr.
     var reply: syscall.IpcMessage = .{};
     _ = syscall.ipc_call(child_handle, &.{}, &reply);
     const hot_loop_addr = reply.words[0];
     const child_main_addr = reply.words[1];
+
+    // Second round: child cap-transfers fault_handler to us so PMU overflow
+    // faults route to our fault_box instead of the child's (unread) one.
+    _ = syscall.ipc_call(child_handle, &.{}, &reply);
 
     // Emit load base for resolve_symbols.sh ASLR adjustment
     syscall.write("[PROF] profiler_workload load_base=");

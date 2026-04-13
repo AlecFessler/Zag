@@ -25,6 +25,9 @@ const Shared = extern struct {
 /// - wake_one_cross_core: cross-process wake (shm), waiter on different core
 /// - wake_one_same_core: cross-process wake (shm), waiter on same core
 pub fn main(_: u64) void {
+    // Drop root's default .pinned priority before set_affinity; see
+    // kernel/syscall/thread.zig:98 (set_affinity is E_BUSY while pinned).
+    _ = syscall.set_priority(syscall.PRIORITY_NORMAL);
     _ = syscall.set_affinity(1);
 
     benchUncontendedWait();

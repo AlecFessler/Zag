@@ -12,8 +12,11 @@ var child_timestamp: u64 = 0;
 /// and exits. Parent measures from before thread_create to child's
 /// first TSC reading.
 pub fn main(_: u64) void {
+    // Stay at NORMAL so the child thread (also NORMAL, enqueued on this
+    // core by sysThreadCreate:65) can round-robin with us via yield.
+    // Raising to REALTIME would starve the child because enqueueOnCore
+    // only sends a preempting IPI when newpri > curpri.
     _ = syscall.set_affinity(1);
-    _ = syscall.set_priority(syscall.PRIORITY_REALTIME);
 
     // Warmup
     var w: u32 = 0;

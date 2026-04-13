@@ -46,7 +46,11 @@ pub const BenchResult = struct {
 /// The sample buffer is allocated via `mem_reserve` (demand-paged)
 /// to avoid stack overflow.
 pub fn runBench(config: BenchConfig, comptime body: fn () void) BenchResult {
-    // Pin to core 0, raise priority to minimize jitter.
+    // Drop root's default .pinned priority first — sysSetAffinity rejects
+    // affinity changes on a pinned thread (kernel/syscall/thread.zig:98),
+    // so set_priority must come first to implicitly unpin. Then restrict
+    // to core 0 and raise back to REALTIME for low-jitter measurement.
+    _ = syscall.set_priority(syscall.PRIORITY_NORMAL);
     _ = syscall.set_affinity(1);
     _ = syscall.set_priority(syscall.PRIORITY_REALTIME);
 
