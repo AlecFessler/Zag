@@ -103,6 +103,9 @@ export fn earlyVbarTable() align(2048) callconv(.naked) noreturn {
         // x2/x3 = hex loop scratch. No stack, no memory except UART.
         \\10:
         \\  mov x10, #0x09000000
+        // Save caller's LR (x30) and FP (x29) before bl clobbers them.
+        \\  mov x11, x30
+        \\  mov x12, x29
         // Marker: "!F\n"
         \\  mov w0, #0x21
         \\  str w0, [x10]
@@ -143,6 +146,24 @@ export fn earlyVbarTable() align(2048) callconv(.naked) noreturn {
         \\  mov w0, #0x3D
         \\  str w0, [x10]
         \\  mov x1, sp
+        \\  bl 20f
+        \\  mov w0, #0x0A
+        \\  str w0, [x10]
+        // "R=" caller's LR at time of fault
+        \\  mov w0, #0x52
+        \\  str w0, [x10]
+        \\  mov w0, #0x3D
+        \\  str w0, [x10]
+        \\  mov x1, x11
+        \\  bl 20f
+        \\  mov w0, #0x0A
+        \\  str w0, [x10]
+        // "P=" caller's FP at time of fault
+        \\  mov w0, #0x50
+        \\  str w0, [x10]
+        \\  mov w0, #0x3D
+        \\  str w0, [x10]
+        \\  mov x1, x12
         \\  bl 20f
         \\  mov w0, #0x0A
         \\  str w0, [x10]
