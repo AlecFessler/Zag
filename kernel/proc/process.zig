@@ -130,6 +130,28 @@ pub const Process = struct {
         _ = futex.wake(gen_paddr, 0xFFFF_FFFF);
     }
 
+    /// Targeted sync for the hot insert/remove path: write only the
+    /// slot that just changed, bump the generation counter, and wake
+    /// any userspace waiters. Equivalent to `syncUserView` but O(1)
+    /// instead of O(MAX_PERMS). Readers use the generation counter to
+    /// detect racing updates and re-read any entries they care about,
+    /// so a one-slot write produces a consistent view as long as the
+    /// generation bump happens after the slot write and before the wake.
+    fn syncUserViewSlot(self: *Process, slot_index: usize) void {
+        if (self.perm_view_phys.addr == 0) return;
+        const view_ptr: *[MAX_PERMS]UserViewEntry = @ptrFromInt(
+            VAddr.fromPAddr(self.perm_view_phys, null).addr,
+        );
+        view_ptr[slot_index] = UserViewEntry.fromKernelEntry(self.perm_table[slot_index]);
+        self.perm_view_gen += 1;
+        // Generation lives in the self-entry (slot 0) regardless of which
+        // slot changed, so writing it also overwrites anything fromKernelEntry
+        // wrote into view_ptr[0].field1 when slot_index == 0.
+        @atomicStore(u64, &view_ptr[0].field1, self.perm_view_gen, .release);
+        const gen_paddr = PAddr.fromInt(self.perm_view_phys.addr + @offsetOf(UserViewEntry, "field1"));
+        _ = futex.wake(gen_paddr, 0xFFFF_FFFF);
+    }
+
     /// Insert a thread handle into this process's perm table.
     /// Returns the handle ID on success.
     pub fn insertThreadHandle(self: *Process, thread: *Thread, rights: ThreadHandleRights) !u64 {
@@ -675,7 +697,7 @@ pub const Process = struct {
     pub fn insertPerm(self: *Process, entry_in: PermissionEntry) !u64 {
         self.perm_lock.lock();
         defer self.perm_lock.unlock();
-        for (self.perm_table[1..]) |*slot| {
+        for (self.perm_table[1..], 1..) |*slot, slot_index| {
             if (slot.object == .empty) {
                 const handle_id = self.handle_counter;
                 self.handle_counter += 1;
@@ -689,7 +711,7 @@ pub const Process = struct {
                     .thread => |t| _ = t.handle_refcount.fetchAdd(1, .acq_rel),
                     else => {},
                 }
-                self.syncUserView();
+                self.syncUserViewSlot(slot_index);
                 return handle_id;
             }
         }
@@ -701,7 +723,7 @@ pub const Process = struct {
         var referenced_proc: ?*Process = null;
         var referenced_thread: ?*Thread = null;
         self.perm_lock.lock();
-        for (self.perm_table[1..]) |*slot| {
+        for (self.perm_table[1..], 1..) |*slot, slot_index| {
             if (slot.object != .empty and slot.handle == handle_id) {
                 switch (slot.object) {
                     .process => |p| referenced_proc = p,
@@ -711,7 +733,7 @@ pub const Process = struct {
                 }
                 slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
-                self.syncUserView();
+                self.syncUserViewSlot(slot_index);
                 self.perm_lock.unlock();
                 // Decrement refcount outside perm_lock to avoid lock ordering issues
                 if (referenced_proc) |p| {
