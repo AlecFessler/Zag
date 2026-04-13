@@ -154,6 +154,7 @@ pub fn init(firmware_mmap: MMap) !void {
     arch.earlyDebugChar('e');
 
     for (mmap) |entry| {
+        arch.earlyDebugChar('0' + @as(u8, @truncate(@intFromEnum(entry.type) & 0xF)));
         if (entry.type != .free) continue;
 
         const entry_start_virt = VAddr.fromPAddr(PAddr.fromInt(entry.start_paddr), null);
