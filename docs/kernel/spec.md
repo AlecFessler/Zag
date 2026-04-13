@@ -207,9 +207,9 @@ Virtual memory is managed per-process through **VM reservations** — contiguous
 
 Mapping a `port_io` device via `mem_mmio_map` creates a virtual BAR. The reservation must have `mmio` plus at least `read` or `write`. The `write_combining` right is incompatible with virtual BAR mappings and returns `E_INVAL`. Virtual BAR mappings appear as a normal RW region in the VMM tree and user permissions view. PTEs are intentionally absent.
 
-`mem_unmap` strips all PTEs from a specified range within a reservation, reverting every node in the range to private demand-paged state. <!-- s2_3_5 -->**§2.3.5** After `mem_unmap`, unmapped private nodes revert to demand-paged state with max RWX rights. <!-- s2_3_6 -->**§2.3.6** After `mem_unmap`, pages demand-paged into the unmapped range are guaranteed to be zeroed. <!-- s2_3_7 -->**§2.3.7** SHM, MMIO, and virtual BAR nodes must be fully contained within the `mem_unmap` range — partial overlap with any such node returns `E_INVAL`. The operation is all-or-nothing per non-private node. <!-- s2_3_8 -->**§2.3.8** Private nodes may be partially unmapped — the VMM split logic handles boundary splitting as it does for `mem_perms`. <!-- s2_3_9 -->**§2.3.9** The process retains all associated handles (SHM handles, device handles) after `mem_unmap`.
+`mem_unmap` strips all PTEs from a specified range within a reservation, reverting every node in the range to private demand-paged state. <!-- s2_3_5 -->**§2.3.5** After `mem_unmap`, unmapped private nodes revert to demand-paged state with max RWX rights. <!-- s2_3_6 -->**§2.3.6** After `mem_unmap`, pages demand-paged into the unmapped range are guaranteed to be zeroed. <!-- s2_3_9 -->**§2.3.9** The process retains all associated handles (SHM handles, device handles) after `mem_unmap`.
 
-<!-- s2_3_10 -->**§2.3.10** Revoking a VM reservation frees all pages in the range and clears the perm slot. The process retains the VM reservation handle after `mem_unmap` — only `revoke_perm` performs full reservation teardown.
+<!-- s2_3_10 -->**§2.3.10** Revoking a VM reservation frees all pages in the range and clears the perm slot.
 
 **§2.3.11** VM reservation handles are not transferable via message passing.
 
@@ -454,7 +454,7 @@ Reply flags (additional r14 bits):
 
 #### Handler Death
 
-**§4.1.35** When the handler process dies, all processes that had it as fault handler revert to self-fault-handling: their `fault_handler` ProcessRights bit is restored and their `fault_handler_proc` is cleared. Pending fault messages in the dead handler's fault box are discarded. Threads in `.faulted` state in those processes are re-evaluated under self-handling semantics (§2.12.7 and §2.12.9). Threads in `.suspended` state are moved to `.ready` and re-enqueued.
+**§4.1.35** When the handler process dies, all processes that had it as fault handler revert to self-fault-handling: their `fault_handler` ProcessRights bit is restored and their `fault_handler_proc` is cleared. Pending fault messages in the dead handler's fault box are discarded. Threads in `.faulted` state in those processes are re-evaluated under self-handling semantics (§4.1.7 and §4.1.9). Threads in `.suspended` state are moved to `.ready` and re-enqueued.
 
 **§4.1.36** The fault box state is fully independent from the IPC message box state. `fault_recv` and `fault_reply` do not interact with `recv`/`reply` pending state; both boxes may be in `pending_reply` simultaneously.
 
@@ -540,7 +540,7 @@ PmuSample (extern struct) {
 
 **§4.1.49** On a PMU overflow fault, a profiler typically calls `pmu_read` to retrieve the final counter values, `pmu_reset` to reconfigure counters with the next threshold, and `fault_reply` with `FAULT_RESUME` to resume the thread. Counter configurations set by `pmu_reset` take effect when the thread is resumed.
 
-**§4.1.50** A single-threaded process that is its own fault handler cannot use sample-based profiling: when its only thread overflows, the normal single-thread-fault semantics (§2.12.7) apply and the process is killed (or restarted). Sample-based self-profiling requires either at least two threads in the process, or an external fault handler. Precise counting, which does not set any overflow threshold, has no such limitation.
+**§4.1.50** A single-threaded process that is its own fault handler cannot use sample-based profiling: when its only thread overflows, the normal single-thread-fault semantics (§4.1.7) apply and the process is killed (or restarted). Sample-based self-profiling requires either at least two threads in the process, or an external fault handler. Precise counting, which does not set any overflow threshold, has no such limitation.
 
 #### fault_recv(buf_ptr, blocking) → fault_token
 

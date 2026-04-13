@@ -48,7 +48,7 @@ pub fn main(pv: u64) void {
     if (view[slot].processRestartCount() < 1) {
         // No restart means the child is stuck in .faulted waiting for a fault
         // message that nobody can handle — i.e., a fault message WAS delivered,
-        // contradicting §2.12.7.
+        // contradicting §4.1.7.
         t.fail("§4.1.7 child did not restart");
         syscall.shutdown();
     }

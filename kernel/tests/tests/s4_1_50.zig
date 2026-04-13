@@ -6,7 +6,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §4.1.50 — A single-threaded process that is its own fault handler cannot use sample-based profiling: when its only thread overflows, the normal single-thread-fault semantics (§2.12.7) apply and the process is killed (or restarted).
+/// §4.1.50 — A single-threaded process that is its own fault handler cannot use sample-based profiling: when its only thread overflows, the normal single-thread-fault semantics (§4.1.7) apply and the process is killed (or restarted).
 pub fn main(pv: u64) void {
     var info: syscall.PmuInfo = undefined;
     if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK or
@@ -38,7 +38,7 @@ pub fn main(pv: u64) void {
             // Found — child is dead. §4.1.50 says it is killed or
             // restarted; we spawned without ProcessRights.restart so it
             // must be dead (not restarted) and the reason is the one
-            // recorded by §3.11 / §2.12.7.
+            // recorded by §4.1.7.
             const reason = e.processCrashReason();
             if (reason == perm_view.CrashReason.illegal_instruction) {
                 // Child signals setup failure (pmu_info / pmu_start
