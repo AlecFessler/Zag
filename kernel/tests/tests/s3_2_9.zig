@@ -5,7 +5,7 @@ const t = lib.testing;
 
 const E_AGAIN: i64 = -9;
 
-/// §3.2.9 — `futex_wait` returns `E_AGAIN` on value mismatch.
+/// §3.2.9 — `futex_wait_val` returns the index of the mismatched address immediately when any `addrs[i]` does not match `expected[i]` at call time.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     var val: u64 = 42;

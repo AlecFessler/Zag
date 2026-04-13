@@ -5,7 +5,7 @@ const t = lib.testing;
 
 const E_TIMEOUT: i64 = -8;
 
-/// §3.2.2 — `futex_wait` with timeout=0 returns `E_TIMEOUT` immediately (try-only).
+/// §3.2.2 — `futex_wait_val` with timeout=0 is non-blocking: returns immediately without blocking (try-only check).
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     var val: u64 align(8) = 0;

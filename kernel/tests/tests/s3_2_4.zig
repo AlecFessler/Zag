@@ -5,7 +5,7 @@ const t = lib.testing;
 
 const E_TIMEOUT: i64 = -8;
 
-/// §3.2.4 — `futex_wait` with a finite timeout blocks for at least `timeout_ns` nanoseconds; actual expiry may be delayed until the next scheduler tick.
+/// §3.2.4 — `futex_wait_val` with a finite timeout blocks for at least `timeout_ns` nanoseconds; actual expiry may be delayed until the next scheduler tick.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     var val: u64 align(8) = 0;

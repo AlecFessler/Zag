@@ -5,7 +5,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.5.2 — Device user view `field0` encodes: `device_type(u8) | device_class(u8) << 8 | size_or_port_count(u32) << 32`.
+/// §2.5.2 — device user view `field0` encodes: `device_type(u8, bits 0-7) | device_class(u8, bits 8-15) | irq_pending(bit 16) | reserved_zero(bits 17-31) | size_or_port_count(u32, bits 32-63)`.
 /// Verify the encoding against the known-stable AHCI MMIO BAR (4 KiB, class storage).
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);

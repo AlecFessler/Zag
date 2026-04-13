@@ -6,7 +6,7 @@ const t = lib.testing;
 
 const E_INVAL: i64 = -1;
 
-/// §3.2.11 — `futex_wait_val` with non-8-byte-aligned addr returns `E_INVAL`.
+/// §3.2.11 — `futex_wait_val` with any non-8-byte-aligned address in the array returns `E_INVAL`.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     // Use a valid page address + 1 to get misaligned addr.

@@ -3,7 +3,7 @@ const lib = @import("lib");
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §3.2.12 — `futex_wait_val` with invalid addr returns `E_BADADDR`.
+/// §3.2.12 — `futex_wait_val` with any invalid address in the array returns `E_BADADDR`.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     const E_BADADDR: i64 = -7;

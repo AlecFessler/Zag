@@ -13,7 +13,7 @@ fn waker() void {
     _ = syscall.futex_wake(@ptrCast(&futex_val), 1);
 }
 
-/// §3.2.8 — `futex_wait` returns `E_OK` when woken.
+/// §3.2.8 — `futex_wait_val` returns the index (non-negative) of the first address that changed or was woken on success.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     _ = syscall.thread_create(&waker, 0, 4);

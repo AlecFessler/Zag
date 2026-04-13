@@ -4,19 +4,19 @@ const perm_view = lib.perm_view;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.5.14 — Device region entries have a reserved byte (formerly badge_bit) at offset 9 that is always zero.
+/// §2.5.14 — When a device IRQ fires, the kernel masks the IRQ line, identifies the owning process via the device region, and atomically sets bit 16 of the device's `field0` in the user permissions view via physmap.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
-    // Find a device region entry and verify the reserved byte is zero.
+    // We cannot trigger a real IRQ in the test harness, but we can verify
+    // that bit 16 of field0 is initially clear (no pending IRQ at boot).
     for (0..128) |i| {
         const e = &view[i];
         if (e.entry_type != perm_view.ENTRY_TYPE_DEVICE_REGION) continue;
-        if (e._reserved_byte == 0) {
-            t.pass("§2.5.14");
-            syscall.shutdown();
-        }
+        const irq_pending = (e.field0 >> 16) & 1;
+        t.expectEqual("§2.5.14", 0, @as(i64, @intCast(irq_pending)));
+        syscall.shutdown();
     }
-    // No device entries found — pass since there's nothing to validate.
+    // No device entries — pass vacuously.
     t.pass("§2.5.14");
     syscall.shutdown();
 }
