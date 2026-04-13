@@ -14,9 +14,5 @@ pub fn main(_: u64) void {
     }).bits();
     _ = syscall.ipc_reply_cap(&.{ 0, rights });
     // Null dereference — triggers a fault routed to the parent (our fault handler).
-    _ = asm volatile ("movb (%%rax), %%al"
-        : [ret] "={al}" (-> u8),
-        : [addr] "{rax}" (@as(u64, 0)),
-        : .{ .memory = true }
-    );
+    lib.fault.nullDeref();
 }

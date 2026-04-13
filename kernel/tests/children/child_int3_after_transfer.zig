@@ -15,5 +15,5 @@ pub fn main(_: u64) void {
         .fault_handler = true,
     }).bits();
     _ = syscall.ipc_reply_cap(&.{ 0, rights });
-    asm volatile ("int3");
+    lib.fault.breakpoint();
 }

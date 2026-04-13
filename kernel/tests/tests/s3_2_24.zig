@@ -12,13 +12,21 @@ pub fn main(perm_view: u64) void {
     const rw = perms.VmReservationRights{ .read = true, .write = true };
     const result = syscall.mem_reserve(0, 4096, rw.bits());
     const misaligned_addr = result.val2 + 1;
-    const ret = asm volatile ("syscall"
-        : [ret] "={rax}" (-> i64),
-        : [num] "{rax}" (@intFromEnum(syscall.SyscallNum.futex_wake)),
-          [a0] "{rdi}" (misaligned_addr),
-          [a1] "{rsi}" (@as(u64, 1)),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }
-    );
+    const ret = switch (@import("builtin").cpu.arch) {
+        .x86_64 => asm volatile ("syscall"
+            : [ret] "={rax}" (-> i64),
+            : [num] "{rax}" (@intFromEnum(syscall.SyscallNum.futex_wake)),
+              [a0] "{rdi}" (misaligned_addr),
+              [a1] "{rsi}" (@as(u64, 1)),
+            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+            : [num] "{x8}" (@intFromEnum(syscall.SyscallNum.futex_wake)),
+              [a0] "{x0}" (misaligned_addr),
+              [a1] "{x1}" (@as(u64, 1)),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
     t.expectEqual("§3.2.24", E_INVAL, ret);
     syscall.shutdown();
 }

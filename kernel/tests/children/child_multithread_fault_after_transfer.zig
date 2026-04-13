@@ -32,9 +32,5 @@ pub fn main(_: u64) void {
     for (0..10) |_| syscall.thread_yield();
 
     // Trigger a null dereference fault on the main thread.
-    _ = asm volatile ("movb (%%rax), %%al"
-        : [ret] "={al}" (-> u8),
-        : [addr] "{rax}" (@as(u64, 0)),
-        : .{ .memory = true }
-    );
+    lib.fault.nullDeref();
 }

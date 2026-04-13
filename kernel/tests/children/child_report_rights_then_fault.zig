@@ -27,8 +27,5 @@ pub fn main(pv: u64) void {
     _ = syscall.ipc_reply(&.{post_rights});
 
     // Null-deref — fault routes to the caller's fault box per §2.12.3.
-    _ = asm volatile ("movb (%%rax), %%al"
-        : [ret] "={al}" (-> u8),
-        : [addr] "{rax}" (@as(u64, 0)),
-        : .{ .memory = true });
+    lib.fault.nullDeref();
 }

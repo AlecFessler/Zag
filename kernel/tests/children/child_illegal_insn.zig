@@ -1,7 +1,6 @@
 const lib = @import("lib");
 
-/// Triggers an illegal instruction fault via UD2.
+/// Triggers an illegal instruction fault (UD2 / UDF).
 pub fn main(_: u64) void {
-    _ = lib;
-    asm volatile ("ud2");
+    lib.fault.illegalInstruction();
 }

@@ -67,9 +67,5 @@ pub fn main(pv: u64) void {
     for (0..20) |_| syscall.thread_yield();
 
     // Main thread null-derefs — triggers the fault routed to the parent.
-    _ = asm volatile ("movb (%%rax), %%al"
-        : [ret] "={al}" (-> u8),
-        : [addr] "{rax}" (@as(u64, 0)),
-        : .{ .memory = true }
-    );
+    lib.fault.nullDeref();
 }

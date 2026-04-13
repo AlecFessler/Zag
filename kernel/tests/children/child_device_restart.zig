@@ -18,6 +18,6 @@ pub fn main(perm_view_addr: u64) void {
         _ = syscall.ipc_reply(&.{});
     }
 
-    // Crash via UD2 — triggers restart, device should persist.
-    asm volatile ("ud2");
+    // Crash via illegal instruction — triggers restart, device should persist.
+    lib.fault.illegalInstruction();
 }

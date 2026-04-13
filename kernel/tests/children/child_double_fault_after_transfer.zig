@@ -18,14 +18,11 @@ pub fn main(_: u64) void {
     }).bits();
     _ = syscall.ipc_reply_cap(&.{ 0, rights });
 
-    // Two consecutive 2-byte null-deref instructions at distinct addresses.
-    // `movb (%rax), %al` — encodes as 0x8a 0x00 (2 bytes). The parent will
-    // skip past the first by advancing RIP by 2.
-    asm volatile (
-        \\movb (%%rax), %%al
-        \\movb (%%rbx), %%al
-        :
-        : [a] "{rax}" (@as(u64, 0)),
-          [b] "{rbx}" (@as(u64, 0xCAFE0000)),
-        : .{ .memory = true });
+    // Two consecutive null-deref faults at distinct addresses. The parent
+    // will skip past the first by advancing the faulting thread's PC via
+    // FAULT_RESUME_MODIFIED.
+    const a: *allowzero volatile u8 = @ptrFromInt(0);
+    _ = a.*;
+    const b: *volatile u8 = @ptrFromInt(0xCAFE0000);
+    _ = b.*;
 }

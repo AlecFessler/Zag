@@ -5,11 +5,8 @@ const syscall = lib.syscall;
 fn faulterThread() void {
     // Null pointer dereference — generates a fault routed to our own fault
     // box (we self-handle per §2.12.8).
-    _ = asm volatile ("movb (%%rax), %%al"
-        : [ret] "={al}" (-> u8),
-        : [addr] "{rax}" (@as(u64, 0)),
-        : .{ .memory = true });
-    while (true) asm volatile ("pause");
+    lib.fault.nullDeref();
+    while (true) lib.fault.cpuPause();
 }
 
 /// Verifies §2.12.8 from inside the child:

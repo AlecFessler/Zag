@@ -24,8 +24,8 @@ pub fn main(perm_view_addr: u64) void {
         syscall.thread_yield();
         _ = syscall.set_priority(syscall.PRIORITY_PINNED);
 
-        // Crash via UD2 — triggers restart.
-        asm volatile ("ud2");
+        // Crash via illegal instruction — triggers restart.
+        lib.fault.illegalInstruction();
     }
 
     // Second+ boot: check that pin state was cleared (field1 == 0 on our thread entry).

@@ -5,7 +5,7 @@ const syscall = lib.syscall;
 
 fn dummyThread() void {
     while (true) {
-        asm volatile ("pause");
+        lib.fault.cpuPause();
     }
 }
 

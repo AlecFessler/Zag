@@ -68,5 +68,5 @@ pub fn main(perm_view_addr: u64) void {
     _ = syscall.ipc_call_cap(@bitCast(c_handle), &.{ a_handle, grant_rights }, &msg);
 
     // Crash — fault kills only this process, not children (§3.22)
-    asm volatile ("ud2");
+    lib.fault.illegalInstruction();
 }

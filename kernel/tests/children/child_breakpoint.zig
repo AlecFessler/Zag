@@ -1,7 +1,6 @@
 const lib = @import("lib");
 
-/// Executes int3 to trigger a breakpoint fault.
+/// Executes a breakpoint instruction to trigger a #BP/BRK fault.
 pub fn main(_: u64) void {
-    _ = lib;
-    asm volatile ("int3");
+    lib.fault.breakpoint();
 }

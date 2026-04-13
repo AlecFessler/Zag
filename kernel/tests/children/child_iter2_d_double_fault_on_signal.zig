@@ -73,12 +73,8 @@ pub fn main(pv: u64) void {
         const sig_clear: *volatile u64 = @ptrFromInt(shm_va);
         sig_clear.* = 0;
 
-        // 2-byte null-deref. Parent advances RIP past this via
+        // Null-deref. Parent advances the faulting thread past this via
         // FAULT_RESUME_MODIFIED.
-        _ = asm volatile ("movb (%%rax), %%al"
-            : [ret] "={al}" (-> u8),
-            : [addr] "{rax}" (@as(u64, 0)),
-            : .{ .memory = true }
-        );
+        lib.fault.nullDeref();
     }
 }

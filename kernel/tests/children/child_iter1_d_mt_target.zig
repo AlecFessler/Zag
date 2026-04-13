@@ -101,9 +101,5 @@ pub fn main(pv: u64) void {
     // §2.12.10, main thread enters .faulted and the worker enters
     // .suspended (stop-all). The middleman does NOT call fault_recv, so
     // the fault message sits pending in its fault_box until it dies.
-    _ = asm volatile ("movb (%%rax), %%al"
-        : [ret] "={al}" (-> u8),
-        : [addr] "{rax}" (@as(u64, 0)),
-        : .{ .memory = true }
-    );
+    lib.fault.nullDeref();
 }

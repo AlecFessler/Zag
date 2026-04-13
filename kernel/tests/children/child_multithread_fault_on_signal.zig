@@ -67,9 +67,5 @@ pub fn main(pv: u64) void {
     }
 
     // Null-deref to trigger the fault.
-    _ = asm volatile ("movb (%%rax), %%al"
-        : [ret] "={al}" (-> u8),
-        : [addr] "{rax}" (@as(u64, 0)),
-        : .{ .memory = true }
-    );
+    lib.fault.nullDeref();
 }

@@ -8,7 +8,7 @@ const E_OK: i64 = 0;
 
 fn loopForever() void {
     while (true) {
-        asm volatile ("pause");
+        lib.fault.cpuPause();
     }
 }
 

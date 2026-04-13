@@ -17,11 +17,8 @@ const syscall = lib.syscall;
 var shm_va: u64 = 0;
 
 fn faulterA() void {
-    _ = asm volatile ("movb (%%rax), %%al"
-        : [ret] "={al}" (-> u8),
-        : [addr] "{rax}" (@as(u64, 0)),
-        : .{ .memory = true });
-    while (true) asm volatile ("pause");
+    lib.fault.nullDeref();
+    while (true) lib.fault.cpuPause();
 }
 
 fn faulterB() void {
@@ -29,11 +26,8 @@ fn faulterB() void {
     // worker's fault before this one enters .faulted.
     var i: u32 = 0;
     while (i < 1000) : (i += 1) syscall.thread_yield();
-    _ = asm volatile ("movb (%%rax), %%al"
-        : [ret] "={al}" (-> u8),
-        : [addr] "{rax}" (@as(u64, 0)),
-        : .{ .memory = true });
-    while (true) asm volatile ("pause");
+    lib.fault.nullDeref();
+    while (true) lib.fault.cpuPause();
 }
 
 /// Self-handling multi-thread child for §2.12.9.
@@ -97,8 +91,5 @@ pub fn main(pv: u64) void {
     while (i < 5000) : (i += 1) syscall.thread_yield();
 
     // Main null-derefs. Three threads now in .faulted — §2.12.9 fires.
-    _ = asm volatile ("movb (%%rax), %%al"
-        : [ret] "={al}" (-> u8),
-        : [addr] "{rax}" (@as(u64, 0)),
-        : .{ .memory = true });
+    lib.fault.nullDeref();
 }

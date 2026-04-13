@@ -7,7 +7,7 @@ const E_INVAL: i64 = -1;
 
 fn loopForever() void {
     while (true) {
-        asm volatile ("pause");
+        lib.fault.cpuPause();
     }
 }
 

@@ -4,7 +4,7 @@ const syscall = lib.syscall;
 
 fn loopForever() void {
     while (true) {
-        asm volatile ("pause");
+        lib.fault.cpuPause();
     }
 }
 

@@ -18,11 +18,11 @@ const syscall = lib.syscall;
 pub fn main(_: u64) void {
     var info: syscall.PmuInfo = undefined;
     if (syscall.pmu_info(@intFromPtr(&info)) != syscall.E_OK) {
-        asm volatile ("ud2" ::: .{ .memory = true });
+        lib.fault.illegalInstruction();
         unreachable;
     }
     const evt = syscall.pickSupportedEvent(info) orelse {
-        asm volatile ("ud2" ::: .{ .memory = true });
+        lib.fault.illegalInstruction();
         unreachable;
     };
 
@@ -34,7 +34,7 @@ pub fn main(_: u64) void {
     };
     const start_rc = syscall.pmu_start(self_thread, @intFromPtr(&cfg), 1);
     if (start_rc != syscall.E_OK) {
-        asm volatile ("ud2" ::: .{ .memory = true });
+        lib.fault.illegalInstruction();
     }
 
     // Burn events until the overflow faults us. Bound the loop so a
@@ -42,5 +42,5 @@ pub fn main(_: u64) void {
     // as `ud2` → illegal_instruction rather than a silent hang.
     var x: u64 = 0;
     while (x < 10_000_000) : (x +%= 1) {}
-    asm volatile ("ud2" ::: .{ .memory = true });
+    lib.fault.illegalInstruction();
 }

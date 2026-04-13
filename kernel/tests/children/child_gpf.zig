@@ -1,7 +1,6 @@
 const lib = @import("lib");
 
-/// Triggers a general protection fault by executing a privileged instruction (CLI).
+/// Triggers a general protection fault by executing a privileged instruction.
 pub fn main(_: u64) void {
-    _ = lib;
-    asm volatile ("cli");
+    lib.fault.privilegedInstruction();
 }
