@@ -110,13 +110,15 @@ pub const UserViewEntry = extern struct {
     }
 
     /// True if the perm slot for this thread has `exclude_oneshot` set.
+    /// Packed in field0 bit 32.
     pub fn threadExcludeOneshot(self: *const UserViewEntry) bool {
-        return (self.field1 & 0x1) != 0;
+        return (self.field0 >> 32 & 0x1) != 0;
     }
 
     /// True if the perm slot for this thread has `exclude_permanent` set.
+    /// Packed in field0 bit 33.
     pub fn threadExcludePermanent(self: *const UserViewEntry) bool {
-        return (self.field1 & 0x2) != 0;
+        return (self.field0 >> 33 & 0x1) != 0;
     }
 };
 

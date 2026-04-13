@@ -1,37 +1,58 @@
 const lib = @import("lib");
 
 const perm_view = lib.perm_view;
+const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const ENTRY_TYPE_CORE_PIN: u8 = 4;
-
-/// §2.4.5 — Core pin user view `field0` = `core_id`.
+/// §2.4.5 — Kernel-internal devices (HPET, LAPIC, I/O APIC) are not exposed in the user view.
+/// HPET is a legacy memory-mapped timer at 0xFED00000; LAPIC lives at 0xFEE00000
+/// and IOAPIC at 0xFEC00000. None of these are PCI devices — they should never
+/// appear in the root service's device table. Check both by device_class
+/// (nothing marked `timer`) and by PCI identification (no entry with vendor=0
+/// AND device=0 except the legacy 8250 serial, which IS expected).
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    // Pin to core 1.
-    _ = syscall.set_affinity(0x2);
-    syscall.thread_yield();
+    // Sanity: the test rig must actually have some device entries. If not,
+    // inventory is broken — fail hard.
+    _ = t.requireMmioDevice(view, "§2.4.5 baseline");
 
-    const ret = syscall.set_priority(syscall.PRIORITY_PINNED);
-    const pin_handle: u64 = @bitCast(ret);
-
-    // Check field0 == core_id (should be 1).
-    var core_id: u64 = 0xFFFF;
+    var saw_any_device = false;
     for (0..128) |i| {
-        if (view[i].handle == pin_handle and view[i].entry_type == ENTRY_TYPE_CORE_PIN) {
-            core_id = view[i].field0;
-            break;
+        const e = &view[i];
+        if (e.entry_type != perm_view.ENTRY_TYPE_DEVICE_REGION) continue;
+        saw_any_device = true;
+
+        // (a) No kernel-internal timer should leak through as a device entry.
+        if (e.deviceClass() == @intFromEnum(perms.DeviceClass.timer)) {
+            t.fail("§2.4.5 timer_exposed");
+            syscall.shutdown();
+        }
+
+        // (b) Every exposed entry must have a non-zero size.
+        if (e.deviceSizeOrPortCount() == 0) {
+            t.fail("§2.4.5 zero_size");
+            syscall.shutdown();
+        }
+
+        // (c) No known fixed-address kernel device. We can't read the physical
+        //     address from userspace, but any device with `serial` class and
+        //     zero PCI IDs is the legacy COM port (allowed). Everything else
+        //     with zero PCI IDs would be suspicious.
+        const zero_pci = e.pciVendor() == 0 and e.pciDevice() == 0;
+        const is_legacy_serial = e.deviceClass() == @intFromEnum(perms.DeviceClass.serial);
+        if (zero_pci and !is_legacy_serial) {
+            t.fail("§2.4.5 non_pci_non_serial");
+            syscall.shutdown();
         }
     }
 
-    _ = syscall.revoke_perm(pin_handle);
-
-    if (core_id == 1) {
-        t.pass("§2.4.5");
-    } else {
-        t.fail("§2.4.5");
+    if (!saw_any_device) {
+        t.fail("§2.4.5 empty");
+        syscall.shutdown();
     }
+
+    t.pass("§2.4.5");
     syscall.shutdown();
 }

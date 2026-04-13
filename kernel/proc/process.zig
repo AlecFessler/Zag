@@ -923,12 +923,16 @@ pub const Process = struct {
 
         self.perm_lock.lock();
         for (&self.perm_table) |*entry| {
-            if (entry.object == .vm_reservation or entry.object == .thread) {
+            if (entry.object == .vm_reservation) {
                 entry.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
-            } else if (entry.object == .core_pin) {
-                const cp = entry.object.core_pin;
-                sched.unpinByRevoke(cp.core_id);
+            } else if (entry.object == .thread) {
+                // Unpin any pinned threads before clearing the entry
+                const t = entry.object.thread;
+                if (t.priority == .pinned) {
+                    const core_id = @ctz(t.core_affinity orelse 0);
+                    sched.unpinByRevoke(core_id);
+                }
                 entry.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
             }
@@ -1110,10 +1114,13 @@ pub const Process = struct {
                 .device_region => |device| {
                     returnDeviceHandleUpTree(self, entry.rights, device);
                 },
-                .core_pin => |cp| {
-                    sched.unpinByRevoke(cp.core_id);
+                .thread => |t| {
+                    if (t.priority == .pinned) {
+                        const core_id = @ctz(t.core_affinity orelse 0);
+                        sched.unpinByRevoke(core_id);
+                    }
                 },
-                .thread, .vm => {},
+                .vm => {},
                 .process => |p| {
                     const prev = @atomicRmw(u32, &p.handle_refcount, .Sub, 1, .acq_rel);
                     if (prev == 1 and p.cleanup_complete) {

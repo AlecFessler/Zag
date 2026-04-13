@@ -1,56 +1,24 @@
 const lib = @import("lib");
 
+const perm_view = lib.perm_view;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-var ran_on_pinned_core: u64 align(8) = 0;
+/// §2.4.4 — At boot, the kernel inserts all device handles into the root service's permissions table.
+/// The test rig (QEMU q35) registers a known set of devices; verify every expected
+/// device actually appears in the root service's user view.
+pub fn main(pv: u64) void {
+    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-fn try_run_on_core1() void {
-    // Restrict to core 1 only, then yield to move there.
-    _ = syscall.set_affinity(0x2);
-    syscall.thread_yield();
-    // If we reach here, we're running on core 1.
-    @atomicStore(u64, &ran_on_pinned_core, 1, .release);
-    _ = syscall.futex_wake(@ptrCast(&ran_on_pinned_core), 1);
-}
+    // All four expected devices must be present. requireDevice aborts if any
+    // are missing.
+    _ = t.requireDevice(view, "§2.4.4 ahci_mmio", t.AHCI_VENDOR, t.AHCI_DEVICE, 0);
+    _ = t.requireDevice(view, "§2.4.4 ahci_pio", t.AHCI_VENDOR, t.AHCI_DEVICE, 1);
+    _ = t.requireDevice(view, "§2.4.4 bochs_mmio", t.BOCHS_VENDOR, t.BOCHS_DEVICE, 0);
 
-/// §2.4.4 — While pinned, only the pinned thread executes on that core (except when the pinned thread is blocked, during which other threads may be work-stolen onto the core).
-pub fn main(_: u64) void {
-    // Pin main thread to core 1.
-    _ = syscall.set_affinity(0x2);
-    syscall.thread_yield();
-    const ret = syscall.set_priority(syscall.PRIORITY_PINNED);
-    if (ret < 0) {
-        t.fail("§2.4.4");
-        syscall.shutdown();
-    }
-    const pin_handle: u64 = @bitCast(ret);
+    // Also check at least one PIO device is exposed (SMBus 0x8086/0x2930).
+    _ = t.requireDevice(view, "§2.4.4 smbus_pio", 0x8086, 0x2930, 1);
 
-    // Spawn thread that tries to run on core 1.
-    // It sets affinity to core 1 and yields — but core 1 is exclusively pinned,
-    // so the scheduler can't place it there. It stays in the ready queue.
-    _ = syscall.thread_create(&try_run_on_core1, 0, 4);
-
-    // Give scheduler many chances to schedule the thread on core 1.
-    for (0..100) |_| syscall.thread_yield();
-
-    // Thread should NOT have reached its flag-set code (core 1 is exclusive).
-    const ran_while_pinned = @atomicLoad(u64, &ran_on_pinned_core, .acquire) != 0;
-
-    // Unpin core 1.
-    _ = syscall.revoke_perm(pin_handle);
-
-    // Now the thread can be scheduled on core 1. Wait for it.
-    var attempts: u32 = 0;
-    while (@atomicLoad(u64, &ran_on_pinned_core, .acquire) == 0 and attempts < 100000) : (attempts += 1) {
-        syscall.thread_yield();
-    }
-    const ran_after_unpin = @atomicLoad(u64, &ran_on_pinned_core, .acquire) != 0;
-
-    if (!ran_while_pinned and ran_after_unpin) {
-        t.pass("§2.4.4");
-    } else {
-        t.fail("§2.4.4");
-    }
+    t.pass("§2.4.4");
     syscall.shutdown();
 }

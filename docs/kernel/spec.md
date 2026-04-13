@@ -32,7 +32,7 @@ A process with a **restart context** (set at creation time via the `restart` bit
 
 **§2.1.18** A restarting process remains alive throughout (IPC to it does not return `E_BADHANDLE`).
 
-Most state survives a restart. **§2.1.19** Permissions table persists across restart (except VM reservation entries). **§2.1.21** Restart count increments on each restart. Restart count wraps to zero on u16 overflow. **§2.1.22** Fault reason is recorded in slot 0 `field0` on restart. Code and rodata mappings persist across restart. **§2.1.23** Data mappings persist across restart; content is reloaded from original ELF. **§2.1.24** SHM handle entries persist across restart. **§2.1.25** Device handle entries persist across restart. Core_pin handles and thread handles do not persist across restart; they are cleared alongside VM reservation entries. **§2.1.26** Process tree position and children persist across restart. **§2.1.27** Restart context persists (process can restart again). **§2.1.28** Pending callers (received but not yet replied to) persist across restart. **§2.1.29** User permissions view (mapped read-only region) persists across restart.
+Most state survives a restart. **§2.1.19** Permissions table persists across restart (except VM reservation entries). **§2.1.21** Restart count increments on each restart. Restart count wraps to zero on u16 overflow. **§2.1.22** Fault reason is recorded in slot 0 `field0` on restart. Code and rodata mappings persist across restart. **§2.1.23** Data mappings persist across restart; content is reloaded from original ELF. **§2.1.24** SHM handle entries persist across restart. **§2.1.25** Device handle entries persist across restart. Thread handles do not persist across restart; they are cleared alongside VM reservation entries. **§2.1.26** Process tree position and children persist across restart. **§2.1.27** Restart context persists (process can restart again). **§2.1.28** Pending callers (received but not yet replied to) persist across restart. **§2.1.29** User permissions view (mapped read-only region) persists across restart.
 
 What doesn't persist: **§2.1.20** VM reservation entries are cleared on restart. **§2.1.30** User-created VM reservations do not persist across restart. User stacks do not persist — a fresh one is allocated. **§2.1.31** SHM/MMIO mappings within freed reservations do not persist across restart. **§2.1.32** BSS is decommitted on restart. **§2.1.33** All threads are removed on restart; only a fresh initial thread runs.
 
@@ -66,7 +66,7 @@ All access to kernel objects is mediated by **capabilities** — handles with as
 
 Every process has a kernel-maintained read-only page called the **user permissions view** — a 128-entry table that mirrors the process's capability slots. Userspace reads this to discover what capabilities it holds. **§2.1.55** The user permissions view is a read-only region mapped into the process's address space. **§2.1.56** The user view is sized to maximum permissions table capacity. **§2.1.57** The kernel updates the user view on every permissions table mutation (insert, remove, type change).
 
-Each entry has a handle ID and a type tag. **§2.1.58** Each entry's handle field is a monotonic u64 ID; empty slots have handle = `U64_MAX`. **§2.1.59** Each entry has a type field: `process`, `vm_reservation`, `shared_memory`, `device_region`, `core_pin`, `dead_process`, or `thread`. **§2.1.60** Slot 0 (`HANDLE_SELF`) rights are encoded as `ProcessRights`; all other process handle slots use `ProcessHandleRights`. Thread handle slots use `ThreadHandleRights`.
+Each entry has a handle ID and a type tag. **§2.1.58** Each entry's handle field is a monotonic u64 ID; empty slots have handle = `U64_MAX`. **§2.1.59** Each entry has a type field: `process`, `vm_reservation`, `shared_memory`, `device_region`, `dead_process`, or `thread`. **§2.1.60** Slot 0 (`HANDLE_SELF`) rights are encoded as `ProcessRights`; all other process handle slots use `ProcessHandleRights`. Thread handle slots use `ThreadHandleRights`.
 
 The `field0` and `field1` fields carry type-specific metadata. For process entries: **§2.1.61** process entry `field0` encodes `fault_reason(u5, bits 0-4) | restart_count(u16, bits 16-31)`. **§2.1.62** On first boot, process entry `field0` = 0. **§2.1.63** After restart, `fault_reason` in `field0` reflects the triggering fault. **§2.1.64** After restart, `restart_count` in `field0` increments. **§2.1.65** `dead_process` entry has the same `field0` encoding as `process` (fault_reason + restart_count). **§2.1.66** Parent's `process` entry is converted to `dead_process` when the child dies without restarting.
 
@@ -80,9 +80,9 @@ The user half of the virtual address space is split into two zones. The lower AS
 
 **§2.1.71** User address space spans `[0, 0xFFFF_8000_0000_0000)`. **§2.1.72** ELF segments and stacks are never placed in the static reservation zone `[0x0000_1000_0000_0000, 0xFFFF_8000_0000_0000)`. **§2.1.73** `mem_reserve` with a hint in the static reservation zone uses that address (if no overlap). **§2.1.74** ELF segments and user stacks are placed in the ASLR zone `[0x0000_0000_0000_1000, 0x0000_1000_0000_0000)` with a randomized base. **§2.1.75** The first 4 KiB `[0, 0x1000)` is unmapped; accessing address 0 causes a fault. **§2.1.76** The ASLR base address is page-aligned.
 
-**§2.1.77** Thread entry `field0` is the thread's stable kernel-assigned thread id (`tid`, u64).
+<!-- s2_1_77 -->**§2.1.77** Thread entry `field0` encodes: `tid(u32, bits 0-31) | exclude_oneshot(bit 32) | exclude_permanent(bit 33)`. The `tid` is the thread's stable kernel-assigned thread id. Bits 32-33 expose the fault-handler exclude flags, letting a userspace fault handler observe the result of `fault_set_thread_mode` and `fault_reply` with `FAULT_EXCLUDE_*` flags. All other bits are reserved (zero).
 
-**§2.1.78** Thread entry `field1` exposes the fault-handler exclude flags: bit 0 = `exclude_oneshot`, bit 1 = `exclude_permanent`. All other bits are reserved (zero). These flags let a userspace fault handler observe the result of `fault_set_thread_mode` and `fault_reply` with `FAULT_EXCLUDE_*` flags.
+<!-- s2_1_78 -->**§2.1.78** Thread entry `field1` encodes the pinned core ID when the thread is pinned, or zero when the thread is not pinned.
 
 **§2.1.79** The user permissions view is kept in sync with the kernel permissions table.
 
@@ -129,7 +129,7 @@ Every thread has a priority level that determines its scheduling order relative 
 
 **§2.2.11** `thread_self` returns the handle ID of the calling thread as it appears in the calling process's own permissions table. Always succeeds.
 
-**§2.2.12** Revoking a thread handle via `revoke_perm` removes the handle from the permissions table without killing or suspending the thread. **§2.2.13** When a thread exits, its handle entry is cleared from its owning process's permissions table. If an external process holds `fault_handler` for that process, the thread handle is also cleared from the handler's permissions table. `syncUserView` is called on all affected tables. **§2.2.14** A thread entry's `field0` in the user view exposes the thread's stable kernel-assigned thread id. Transient scheduling state is not published via the user view; observable thread state transitions are reported through their own channels (`fault_recv` for faults, the `thread_suspend` return code for suspension, and permission-entry removal for exit).
+**§2.2.12** Revoking a thread handle via `revoke_perm` removes the handle from the permissions table without killing or suspending the thread. **§2.2.13** When a thread exits, its handle entry is cleared from its owning process's permissions table. If an external process holds `fault_handler` for that process, the thread handle is also cleared from the handler's permissions table. `syncUserView` is called on all affected tables. **§2.2.14** A thread entry's `field0` in the user view exposes the thread's stable kernel-assigned thread id in bits 0-31 and fault-handler exclude flags in bits 32-33. `field1` exposes the pinned core ID when pinned, or zero when not pinned. Transient scheduling state is not published via the user view; observable thread state transitions are reported through their own channels (`fault_recv` for faults, the `thread_suspend` return code for suspension, and permission-entry removal for exit).
 
 **§2.2.15** `thread_suspend` requires the `suspend` right on the thread handle; returns `E_PERM` without it. **§2.2.16** `thread_suspend` on a `.running` thread causes it to enter `.suspended` state; if running on a remote core, a scheduling IPI is issued to force the transition at the next scheduling point. **§2.2.17** `thread_suspend` on a `.ready` thread removes it from the run queue and enters `.suspended`. **§2.2.18** `thread_suspend` on a `.faulted` or `.blocked` thread returns `E_BUSY`. A `.blocked` thread (waiting on a futex or IPC) can be suspended after it leaves `.blocked` by retrying the call. **§2.2.19** `thread_suspend` on an already-`.suspended` thread returns `E_BUSY`.
 
@@ -141,9 +141,9 @@ Every thread has a priority level that determines its scheduling order relative 
 
 **§2.2.28** A `.faulted` thread is not scheduled and does not appear on any run queue. **§2.2.29** A `.suspended` thread is not scheduled and does not appear on any run queue.
 
-**§2.2.30** When a thread calls `set_priority(.pinned)`, the kernel scans the thread's current affinity mask in ascending core ID order for a core with no pinned owner. The first available core is claimed; a `core_pin` handle is inserted into the process's permissions table, and the syscall returns the handle ID. If no core in the affinity mask is available, returns `E_BUSY`. If the affinity mask is empty, returns `E_INVAL`. **§2.2.31** A pinned thread cannot call `set_affinity`; attempting it returns `E_BUSY`. **§2.2.32** There are two ways to unpin: (1) call `revoke_perm` on the `core_pin` handle, which restores the pre-pin affinity mask and drops priority to the pre-pin level; (2) call `set_priority` with any non-pinned level, which implicitly revokes the `core_pin` handle, restores affinity, and applies the new priority.
+<!-- s2_2_30 -->**§2.2.30** When a thread calls `set_priority(.pinned)`, the kernel scans the thread's current affinity mask in ascending core ID order for a core with no pinned owner. The first available core is claimed, and the syscall returns the pinned core ID in rax. The thread's user view entry `field1` is updated with the pinned core ID. If no core in the affinity mask is available, returns `E_BUSY`. If the affinity mask is empty, returns `E_INVAL`. <!-- s2_2_31 -->**§2.2.31** A pinned thread cannot call `set_affinity`; attempting it returns `E_BUSY`. <!-- s2_2_32 -->**§2.2.32** There are two ways to unpin: (1) call `thread_unpin` on the thread's handle, which restores the pre-pin affinity mask and drops priority to the pre-pin level; (2) call `set_priority` with any non-pinned level, which implicitly unpins, restores affinity, and applies the new priority.
 
-**§2.2.33** When a pinned thread blocks (on a futex or IPC recv), it temporarily releases its core. Other threads may execute on that core while the pinned thread is blocked. The pin relationship persists. **§2.2.34** When a pinned thread becomes ready again (futex wake or IPC delivery), the kernel immediately preempts whatever thread is running on the pinned core regardless of that thread's priority. The preempted thread is migrated to an affinity-eligible non-pinned core if one exists; otherwise it remains in the pinned core's run queue until the pinned thread next blocks. **§2.2.35** `set_affinity` constrains the calling thread's core affinity; the change takes effect at the next scheduling decision.
+<!-- s2_2_33 -->**§2.2.33** When a pinned thread blocks (on a futex or IPC recv), it temporarily releases its core. Other threads may execute on that core while the pinned thread is blocked. The pin relationship persists. <!-- s2_2_34 -->**§2.2.34** When a pinned thread becomes ready again (futex wake or IPC delivery), the kernel immediately preempts whatever thread is running on the pinned core regardless of that thread's priority. The preempted thread is migrated to an affinity-eligible non-pinned core if one exists; otherwise it remains in the pinned core's run queue until the pinned thread next blocks. **§2.2.35** `set_affinity` constrains the calling thread's core affinity; the change takes effect at the next scheduling decision.
 
 #### Stack Guards
 
@@ -151,7 +151,7 @@ Each user stack is flanked by unmapped guard pages that catch overflow and under
 
 #### Thread Handle Rights
 
-`ThreadHandleRights` (u8): `suspend`(0), `resume`(1), `kill`(2), `pmu`(4). 4 bits reserved. The `pmu` bit gates access to a specific thread's performance monitoring state (§4.1).
+`ThreadHandleRights` (u8): `suspend`(0), `resume`(1), `kill`(2), `unpin`(3), `pmu`(4). 3 bits reserved. The `unpin` bit gates the `thread_unpin` syscall. The `pmu` bit gates access to a specific thread's performance monitoring state (§4.1).
 
 **§2.2.38** Thread handles are not transferable via message passing. The kernel is the sole distributor of thread handles — processes receive handles for their own threads via `thread_create`, and a fault handler receives handles for a debuggee's threads when `fault_handler` is acquired. **§2.2.39** Revoking a thread handle removes it from the permissions table without affecting the thread's execution or state.
 
@@ -185,11 +185,15 @@ Creates a new thread within the calling process. **§2.2.40** `thread_create` re
 
 #### set_affinity(core_mask) → result
 
-Sets the calling thread's core affinity. Self-only; no thread handle parameter. **§2.2.63** `set_affinity` returns `E_OK` on success. **§2.2.64** `set_affinity` requires `ProcessRights.set_affinity` on slot 0; returns `E_PERM` if absent. **§2.2.65** `set_affinity` with empty mask returns `E_INVAL`. **§2.2.66** `set_affinity` with invalid core IDs returns `E_INVAL`. **§2.2.67** `set_affinity` returns `E_BUSY` if the calling thread is currently pinned.
+Sets the calling thread's core affinity. Self-only; no thread handle parameter. **§2.2.63** `set_affinity` returns `E_OK` on success. **§2.2.64** `set_affinity` requires `ProcessRights.set_affinity` on slot 0; returns `E_PERM` if absent. **§2.2.65** `set_affinity` with empty mask returns `E_INVAL`. **§2.2.66** `set_affinity` with invalid core IDs returns `E_INVAL`. <!-- s2_2_67 -->**§2.2.67** `set_affinity` returns `E_BUSY` if the calling thread is currently pinned.
 
 #### set_priority(priority) → result
 
-Sets the calling thread's priority. Self-only; no thread handle parameter. **§2.2.68** `set_priority` requires `ProcessRights.set_affinity` on slot 0; returns `E_PERM` if absent. **§2.2.69** `set_priority` with a priority exceeding the process's `max_thread_priority` returns `E_PERM`. **§2.2.70** For non-pinned levels, `set_priority` returns `E_OK` on success. The new priority takes effect at the next scheduling decision. **§2.2.71** For `pinned`, `set_priority` scans the calling thread's affinity mask in ascending core ID order for a core with no pinned owner; returns the `core_pin` handle ID (positive) on success. **§2.2.72** `set_priority(.pinned)` returns `E_BUSY` if all cores in the affinity mask are already owned by pinned threads. **§2.2.73** `set_priority(.pinned)` returns `E_INVAL` if the affinity mask is empty. **§2.2.74** `set_priority(.pinned)` returns `E_MAXCAP` if the permissions table is full. **§2.2.75** `set_priority` with a non-pinned level while currently pinned implicitly revokes the `core_pin` handle, restores the pre-pin affinity mask, and applies the new priority. **§2.2.76** `set_priority` with an invalid priority value returns `E_INVAL`.
+Sets the calling thread's priority. Self-only; no thread handle parameter. **§2.2.68** `set_priority` requires `ProcessRights.set_affinity` on slot 0; returns `E_PERM` if absent. **§2.2.69** `set_priority` with a priority exceeding the process's `max_thread_priority` returns `E_PERM`. **§2.2.70** For non-pinned levels, `set_priority` returns `E_OK` on success. The new priority takes effect at the next scheduling decision. <!-- s2_2_71 -->**§2.2.71** For `pinned`, `set_priority` scans the calling thread's affinity mask in ascending core ID order for a core with no pinned owner; returns the pinned core ID (positive) in rax on success. The thread's user view entry `field1` is updated with the pinned core ID. <!-- s2_2_72 -->**§2.2.72** `set_priority(.pinned)` returns `E_BUSY` if all cores in the affinity mask are already owned by pinned threads. <!-- s2_2_73 -->**§2.2.73** `set_priority(.pinned)` returns `E_INVAL` if the affinity mask is empty. <!-- s2_2_74 -->**§2.2.74** `set_priority` with a non-pinned level while currently pinned implicitly unpins the thread, restores the pre-pin affinity mask, clears `field1` in the thread's user view entry, and applies the new priority. <!-- s2_2_76 -->**§2.2.76** `set_priority` with an invalid priority value returns `E_INVAL`.
+
+#### thread_unpin(thread_handle) → result
+
+Unpins a pinned thread, restoring its pre-pin affinity mask and dropping its priority to the pre-pin level. A process may unpin its own threads by passing its own thread handle from `thread_self`. <!-- s2_2_77 -->**§2.2.77** `thread_unpin` returns `E_OK` on success. <!-- s2_2_78 -->**§2.2.78** `thread_unpin` requires the `unpin` right on `thread_handle`; returns `E_PERM` without it. <!-- s2_2_79 -->**§2.2.79** `thread_unpin` with invalid or wrong-type `thread_handle` returns `E_BADHANDLE`. <!-- s2_2_80 -->**§2.2.80** `thread_unpin` on a thread that is not currently pinned returns `E_INVAL`. <!-- s2_2_81 -->**§2.2.81** On success, `thread_unpin` restores the thread's pre-pin affinity mask, drops its priority to the pre-pin level, and clears `field1` in the thread's user view entry.
 
 ---
 
@@ -235,31 +239,23 @@ Maps a device's MMIO region into a reservation. **§2.3.50** `mem_mmio_map` retu
 
 ---
 
-### §2.4 Core Pin
+### §2.4 Device Region
 
-A core pin grants a thread exclusive, non-preemptible ownership of a CPU core. The pin is created by calling `set_priority(.pinned)` and revoked via `revoke_perm` on the core_pin handle or by calling `set_priority` with any non-pinned level. **§2.4.1** `set_priority(.pinned)` grants exclusive, non-preemptible core ownership. **§2.4.2** Core pin is created via `set_priority(.pinned)` and revoked via `revoke_perm` or `set_priority` with a non-pinned level. **§2.4.3** The core_pin handle is a revocation token only; it carries no rights bits (rights = 0). The only syscall that accepts it as input is `revoke_perm`. **§2.4.4** While pinned, only the pinned thread executes on that core (except when the pinned thread is blocked, during which other threads may be work-stolen onto the core). **§2.4.5** Core pin user view `field0` = `core_id`. **§2.4.6** Core pin user view `field1` = 0.
+A device region represents a hardware device. There are two internal types — **MMIO** and **Port I/O** — but from userspace's perspective there is a single device access interface: both types are accessed via `mem_mmio_map`. The `port_io` type still exists in the kernel but is not a user-visible distinction in the access interface. **§2.4.1** Device access is exclusive (only one process holds the handle at a time).
 
-**§2.4.7** Revoking a core pin unpins the thread, restores the thread's pre-pin affinity mask, drops the thread's priority to its pre-pin level, and clears the slot.
+Port I/O device regions support virtual BAR mapping via `mem_mmio_map`. The mapped VA region has size `ceil(port_count / PAGE_SIZE) * PAGE_SIZE` (always at least one page). Page table entries are never populated; every access traps to the kernel for emulation. The kernel translates a virtual BAR access as `port = device.base_port + (fault_addr - bar_base)`. Width and direction are decoded from the faulting instruction. **§2.4.6** Virtual BAR read: the kernel writes the decoded port read result back into the faulting thread's register state. **§2.4.7** Virtual BAR write: the kernel executes the port write using the value decoded from the faulting instruction.
 
----
+**§2.4.8** Virtual BAR access with a non-MOV instruction kills the process with `protection_fault`. **§2.4.9** Virtual BAR access that begins at or extends beyond `port_count` kills the process with `invalid_read` or `invalid_write`. An instruction whose encoding straddles a page boundary at RIP kills the process with `protection_fault`; compilers never emit this in normal code.
 
-### §2.5 Device Region
+Device entries in the user view encode hardware identification: **§2.4.2** device user view `field0` encodes: `device_type(u8) | device_class(u8) << 8 | size_or_port_count(u32) << 32`. **§2.4.3** Device user view `field1` encodes: `pci_vendor(u16) | pci_device(u16) << 16 | pci_class(u8) << 32 | pci_subclass(u8) << 40`.
 
-A device region represents a hardware device. There are two internal types — **MMIO** and **Port I/O** — but from userspace's perspective there is a single device access interface: both types are accessed via `mem_mmio_map`. The `port_io` type still exists in the kernel but is not a user-visible distinction in the access interface. **§2.5.1** Device access is exclusive (only one process holds the handle at a time).
+**§2.4.4** At boot, the kernel inserts all device handles into the root service's permissions table. **§2.4.5** Kernel-internal devices (HPET, LAPIC, I/O APIC) are not exposed in the user view.
 
-Port I/O device regions support virtual BAR mapping via `mem_mmio_map`. The mapped VA region has size `ceil(port_count / PAGE_SIZE) * PAGE_SIZE` (always at least one page). Page table entries are never populated; every access traps to the kernel for emulation. The kernel translates a virtual BAR access as `port = device.base_port + (fault_addr - bar_base)`. Width and direction are decoded from the faulting instruction. **§2.5.6** Virtual BAR read: the kernel writes the decoded port read result back into the faulting thread's register state. **§2.5.7** Virtual BAR write: the kernel executes the port write using the value decoded from the faulting instruction.
-
-**§2.5.8** Virtual BAR access with a non-MOV instruction kills the process with `protection_fault`. **§2.5.9** Virtual BAR access that begins at or extends beyond `port_count` kills the process with `invalid_read` or `invalid_write`. An instruction whose encoding straddles a page boundary at RIP kills the process with `protection_fault`; compilers never emit this in normal code.
-
-Device entries in the user view encode hardware identification: **§2.5.2** device user view `field0` encodes: `device_type(u8) | device_class(u8) << 8 | size_or_port_count(u32) << 32`. **§2.5.3** Device user view `field1` encodes: `pci_vendor(u16) | pci_device(u16) << 16 | pci_class(u8) << 32 | pci_subclass(u8) << 40`.
-
-**§2.5.4** At boot, the kernel inserts all device handles into the root service's permissions table. **§2.5.5** Kernel-internal devices (HPET, LAPIC, I/O APIC) are not exposed in the user view.
-
-**§2.5.11** Revoking a device handle unmaps MMIO, returns handle up the process tree (§2.1), and clears the slot.
+**§2.4.11** Revoking a device handle unmaps MMIO, returns handle up the process tree (§2.1), and clears the slot.
 
 `DeviceRegionRights` (u8): `map`(0), `grant`(1), `dma`(2), `irq`(3). The `irq` DeviceRegionRights bit gates `irq_ack`.
 
-**§2.5.12** Device transfer is exclusive (removed from sender on transfer). **§2.5.13** Transferred rights must be a subset of source rights.
+**§2.4.12** Device transfer is exclusive (removed from sender on transfer). **§2.4.13** Transferred rights must be a subset of source rights.
 
 #### IRQ Notification Delivery
 
@@ -269,27 +265,27 @@ Zag provides an asynchronous kernel-to-userspace notification mechanism for devi
 
 Each device handle in a process's permissions table has an associated `badge_bit` (u6, range 0--63). When the kernel delivers an IRQ for that device, it sets the corresponding bit in the process's notification word. Userspace reads the notification word via `notify_wait` to determine which devices have pending interrupts.
 
-<!-- spec:test:2.5.14 -->**§2.5.14** Badge bits are assigned incrementally (mod 64) per process as device handles are inserted into the permissions table. The `badge_counter` increments on each device handle insertion. <!-- spec:test:2.5.15 -->**§2.5.15** The badge bit is stored on the `PermissionEntry` for device region entries and exposed in the user permissions view so userspace can map notification bits to device handles without a syscall. <!-- spec:test:2.5.16 -->**§2.5.16** The badge bit is stored in the `badge_byte` field (offset 9, the byte after `entry_type`) of the device entry in the user permissions view.
+<!-- spec:test:2.5.14 -->**§2.4.14** Badge bits are assigned incrementally (mod 64) per process as device handles are inserted into the permissions table. The `badge_counter` increments on each device handle insertion. <!-- spec:test:2.5.15 -->**§2.4.15** The badge bit is stored on the `PermissionEntry` for device region entries and exposed in the user permissions view so userspace can map notification bits to device handles without a syscall. <!-- spec:test:2.5.16 -->**§2.4.16** The badge bit is stored in the `badge_byte` field (offset 9, the byte after `entry_type`) of the device entry in the user permissions view.
 
 #### Notification Delivery
 
-<!-- spec:test:2.5.17 -->**§2.5.17** When a device IRQ fires, the kernel masks the IRQ line, identifies the owning process via the device region, atomically ORs `(1 << badge_bit)` into the process's notification word, and wakes all threads waiting on the notification box. <!-- spec:test:2.5.18 -->**§2.5.18** `notify_wait` atomically reads and clears the notification word. On success, it returns the bitmask of all accumulated notifications since the last read. <!-- spec:test:2.5.19 -->**§2.5.19** `notify_wait` with `timeout_ns = 0` is non-blocking: returns `E_AGAIN` if the notification word is zero. **§2.5.20** `notify_wait` with `timeout_ns = MAX_U64` blocks indefinitely until the notification word becomes non-zero. <!-- spec:test:2.5.21 -->**§2.5.21** `notify_wait` with a finite timeout returns `E_TIMEOUT` if the notification word remains zero for the duration. <!-- spec:test:2.5.22 -->**§2.5.22** `irq_ack` unmasks the IRQ line for the device associated with the given handle. Requires `DeviceRegionRights.irq` on the device handle. **§2.5.23** The typical driver flow is: `notify_wait` to sleep until an IRQ fires, handle the interrupt in userspace, call `irq_ack` to unmask the line and allow future interrupts.
+<!-- spec:test:2.5.17 -->**§2.4.17** When a device IRQ fires, the kernel masks the IRQ line, identifies the owning process via the device region, atomically ORs `(1 << badge_bit)` into the process's notification word, and wakes all threads waiting on the notification box. <!-- spec:test:2.5.18 -->**§2.4.18** `notify_wait` atomically reads and clears the notification word. On success, it returns the bitmask of all accumulated notifications since the last read. <!-- spec:test:2.5.19 -->**§2.4.19** `notify_wait` with `timeout_ns = 0` is non-blocking: returns `E_AGAIN` if the notification word is zero. **§2.4.20** `notify_wait` with `timeout_ns = MAX_U64` blocks indefinitely until the notification word becomes non-zero. <!-- spec:test:2.5.21 -->**§2.4.21** `notify_wait` with a finite timeout returns `E_TIMEOUT` if the notification word remains zero for the duration. <!-- spec:test:2.5.22 -->**§2.4.22** `irq_ack` unmasks the IRQ line for the device associated with the given handle. Requires `DeviceRegionRights.irq` on the device handle. **§2.4.23** The typical driver flow is: `notify_wait` to sleep until an IRQ fires, handle the interrupt in userspace, call `irq_ack` to unmask the line and allow future interrupts.
 
 #### irq_ack(device_handle) → result
 
-Unmasks the IRQ line for the device associated with `device_handle`, allowing future interrupts to be delivered. <!-- spec:test:2.5.24 -->**§2.5.24** `irq_ack` returns `E_OK` on success. <!-- spec:test:2.5.25 -->**§2.5.25** `irq_ack` with invalid or wrong-type `device_handle` returns `E_BADHANDLE`. <!-- spec:test:2.5.26 -->**§2.5.26** `irq_ack` without `DeviceRegionRights.irq` on the device handle returns `E_PERM`. <!-- spec:test:2.5.27 -->**§2.5.27** `irq_ack` on a device with no associated IRQ line returns `E_INVAL`.
+Unmasks the IRQ line for the device associated with `device_handle`, allowing future interrupts to be delivered. <!-- spec:test:2.5.24 -->**§2.4.24** `irq_ack` returns `E_OK` on success. <!-- spec:test:2.5.25 -->**§2.4.25** `irq_ack` with invalid or wrong-type `device_handle` returns `E_BADHANDLE`. <!-- spec:test:2.5.26 -->**§2.4.26** `irq_ack` without `DeviceRegionRights.irq` on the device handle returns `E_PERM`. <!-- spec:test:2.5.27 -->**§2.4.27** `irq_ack` on a device with no associated IRQ line returns `E_INVAL`.
 
 #### notify_wait(timeout_ns) → bitmask
 
-Waits for the calling process's notification word to become non-zero, then atomically reads and clears it. <!-- spec:test:2.5.28 -->**§2.5.28** `notify_wait` returns the notification bitmask (positive u64) on success. <!-- spec:test:2.5.29 -->**§2.5.29** `notify_wait` requires no rights and is callable by any process. <!-- spec:test:2.5.30 -->**§2.5.30** `notify_wait` with `timeout_ns = 0` is non-blocking: returns `E_AGAIN` if the notification word is zero. **§2.5.31** `notify_wait` with `timeout_ns = MAX_U64` blocks indefinitely until the notification word becomes non-zero. <!-- spec:test:2.5.32 -->**§2.5.32** `notify_wait` with a finite `timeout_ns` returns `E_TIMEOUT` if the notification word remains zero for the duration.
+Waits for the calling process's notification word to become non-zero, then atomically reads and clears it. <!-- spec:test:2.5.28 -->**§2.4.28** `notify_wait` returns the notification bitmask (positive u64) on success. <!-- spec:test:2.5.29 -->**§2.4.29** `notify_wait` requires no rights and is callable by any process. <!-- spec:test:2.5.30 -->**§2.4.30** `notify_wait` with `timeout_ns = 0` is non-blocking: returns `E_AGAIN` if the notification word is zero. **§2.4.31** `notify_wait` with `timeout_ns = MAX_U64` blocks indefinitely until the notification word becomes non-zero. <!-- spec:test:2.5.32 -->**§2.4.32** `notify_wait` with a finite `timeout_ns` returns `E_TIMEOUT` if the notification word remains zero for the duration.
 
 #### mem_dma_map(device_handle, shm_handle) → dma_addr
 
-Maps SHM into the device's IOMMU address space. Requires an IOMMU. DMA mappings are tracked per-process and automatically unmapped on exit. **§2.5.33** `mem_dma_map` returns DMA base address (positive) on success. **§2.5.34** `mem_dma_map` with invalid device handle returns `E_BADHANDLE`. **§2.5.35** `mem_dma_map` with invalid SHM handle returns `E_BADHANDLE`. **§2.5.36** `mem_dma_map` without `dma` right returns `E_PERM`. **§2.5.37** `mem_dma_map` with non-MMIO device returns `E_INVAL`. Returns `E_NORES` on DMA mapping table full. DMA mappings present contiguous addresses to the device.
+Maps SHM into the device's IOMMU address space. Requires an IOMMU. DMA mappings are tracked per-process and automatically unmapped on exit. **§2.4.33** `mem_dma_map` returns DMA base address (positive) on success. **§2.4.34** `mem_dma_map` with invalid device handle returns `E_BADHANDLE`. **§2.4.35** `mem_dma_map` with invalid SHM handle returns `E_BADHANDLE`. **§2.4.36** `mem_dma_map` without `dma` right returns `E_PERM`. **§2.4.37** `mem_dma_map` with non-MMIO device returns `E_INVAL`. Returns `E_NORES` on DMA mapping table full. DMA mappings present contiguous addresses to the device.
 
 #### mem_dma_unmap(device_handle, shm_handle) → result
 
-**§2.5.38** `mem_dma_unmap` returns `E_OK` on success. **§2.5.39** `mem_dma_unmap` with invalid handle returns `E_BADHANDLE`. **§2.5.40** `mem_dma_unmap` with no mapping returns `E_NOENT`.
+**§2.4.38** `mem_dma_unmap` returns `E_OK` on success. **§2.4.39** `mem_dma_unmap` with invalid handle returns `E_BADHANDLE`. **§2.4.40** `mem_dma_unmap` with no mapping returns `E_NOENT`.
 
 ---
 
@@ -972,8 +968,8 @@ All syscalls return `i64`. Non-negative = success, negative = error code. Sizes 
 | 22 | `futex_wait` | §3.2 |
 | 23 | `futex_wake` | §3.2 |
 | 24 | `clock_gettime` | §5.1 |
-| 25 | `mem_dma_map` | §2.5 |
-| 26 | `mem_dma_unmap` | §2.5 |
+| 25 | `mem_dma_map` | §2.4 |
+| 26 | `mem_dma_unmap` | §2.4 |
 | 29 | `thread_self` | §2.2 |
 | 30 | `thread_suspend` | §2.2 |
 | 31 | `thread_resume` | §2.2 |
@@ -1004,10 +1000,11 @@ All syscalls return `i64`. Non-negative = success, negative = error code. Sizes 
 | 56 | `clock_getwall` | §5.1 |
 | 57 | `clock_setwall` | §5.1 |
 | 58 | `getrandom` | §5.2 |
-| 59 | `notify_wait` | §2.5 |
-| 60 | `irq_ack` | §2.5 |
+| 59 | `notify_wait` | §2.4 |
+| 60 | `irq_ack` | §2.4 |
 | 61 | `sys_power` | §5.4 |
 | 62 | `sys_cpu_power` | §5.4 |
+| 63 | `thread_unpin` | §2.2 |
 
 ---
 
@@ -1051,7 +1048,7 @@ All syscalls return `i64`. Non-negative = success, negative = error code. Sizes 
 | Futex timed waiter slots | 64 |
 | User permissions view | 1 page (128 entries × 32 bytes) |
 | DMA mappings per process | 16 |
-| Thread handle rights bits | 4 (suspend, resume, kill, pmu) |
+| Thread handle rights bits | 5 (suspend, resume, kill, unpin, pmu) |
 | Max vCPUs per VM | 64 |
 | PMU counters per thread | `PmuInfo.num_counters` (hardware-dependent) |
 | PMU counter slots in `PmuSample` | `MAX_COUNTERS` (kernel compile-time maximum across supported arches) |

@@ -33,11 +33,10 @@ pub fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_a
     const elf_end = std.math.add(u64, elf_ptr, elf_len) catch return E_BADADDR;
     if (!address.AddrSpacePartition.user.contains(elf_end -| 1)) return E_BADADDR;
 
-    // Validate thread_rights — bit 3 is reserved for layout alignment and
-    // the upper 3 bits (5-7) are unused. Valid bits are suspend(0), resume(1),
-    // kill(2), pmu(4).
+    // Validate thread_rights — the upper 3 bits (5-7) are unused.
+    // Valid bits are suspend(0), resume(1), kill(2), unpin(3), pmu(4).
     const thr_rights_raw: u8 = @truncate(thread_rights_arg);
-    if (thr_rights_raw & 0xE8 != 0) return E_INVAL;
+    if (thr_rights_raw & 0xE0 != 0) return E_INVAL;
     const thr_rights: ThreadHandleRights = @bitCast(thr_rights_raw);
 
     if (max_priority_arg > 4) return E_INVAL;
@@ -147,10 +146,6 @@ pub fn sysRevokePerm(handle: u64) i64 {
             proc.removePerm(handle) catch {};
             Process.returnDeviceHandleUpTree(proc, entry.rights, device);
         },
-        .core_pin => |cp| {
-            sched.unpinByRevoke(cp.core_id);
-            proc.removePerm(handle) catch {};
-        },
         .process => |child| {
             // §2.12.6: revoking a handle with the fault_handler bit releases
             // the fault-handler relationship without killing the target.
@@ -165,8 +160,14 @@ pub fn sysRevokePerm(handle: u64) i64 {
         .dead_process => {
             proc.removePerm(handle) catch {};
         },
-        .thread => {
-            // Revoking a thread handle just clears the slot, doesn't affect the thread
+        .thread => |t| {
+            // If the thread is pinned, release the core pin before removing
+            // the handle. Otherwise PerCoreState.pinned_thread is orphaned
+            // and that core is deadlocked for preemptive scheduling.
+            if (t.priority == .pinned) {
+                const core_id = @ctz(t.core_affinity orelse 0);
+                sched.unpinByRevoke(core_id);
+            }
             proc.removePerm(handle) catch {};
         },
         .vm => |vm_obj| {

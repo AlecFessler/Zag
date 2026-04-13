@@ -19,7 +19,7 @@ fn findThreadEntry(view: [*]const perm_view.UserViewEntry, handle: u64) ?*const 
     return null;
 }
 
-/// §2.2.14 — A thread entry's `field0` in the user view exposes the thread's stable kernel-assigned thread id.
+/// §2.2.14 — A thread entry's `field0` in the user view exposes the thread's stable kernel-assigned thread id in bits 0-31 and fault-handler exclude flags in bits 32-33.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 

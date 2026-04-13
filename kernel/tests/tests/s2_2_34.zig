@@ -24,9 +24,10 @@ fn helper() void {
     // If the pinned thread preempts us immediately, we won't
     // get many iterations before it sets pinned_woke.
     var i: u64 = 0;
-    while (@atomicLoad(u64, &pinned_woke, .seq_cst) == 0) : (i += 1) {
+    while (@atomicLoad(u64, &pinned_woke, .seq_cst) == 0) {
         // Tight loop — no yield. If pinned thread preempts us,
         // we stop counting.
+        i += 1;
     }
     @atomicStore(u64, &helper_counter, i, .seq_cst);
     while (true) syscall.thread_yield();
@@ -40,7 +41,7 @@ fn helper() void {
 pub fn main(_: u64) void {
     _ = syscall.set_affinity(0b1);
     const pin_ret = syscall.set_priority(syscall.PRIORITY_PINNED);
-    if (pin_ret <= 0) {
+    if (pin_ret < 0) {
         t.failWithVal("§2.2.34 pin failed", 1, pin_ret);
         syscall.shutdown();
     }

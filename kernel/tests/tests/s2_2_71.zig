@@ -4,7 +4,7 @@ const perm_view = lib.perm_view;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.2.71 — For `pinned`, `set_priority` scans the calling thread's affinity mask in ascending core ID order for a core with no pinned owner; returns the `core_pin` handle ID (positive) on success.
+/// §2.2.71 — For `pinned`, `set_priority` scans the calling thread's affinity mask in ascending core ID order for a core with no pinned owner; returns the pinned core ID (positive) in rax on success.
 pub fn main(pv_addr: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv_addr);
 

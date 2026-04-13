@@ -90,7 +90,7 @@ pub const ThreadHandleRights = packed struct(u8) {
     @"suspend": bool = false,
     @"resume": bool = false,
     kill: bool = false,
-    _reserved_bit3: bool = false,
+    unpin: bool = false,
     pmu: bool = false,
     _reserved: u3 = 0,
 
@@ -102,6 +102,7 @@ pub const ThreadHandleRights = packed struct(u8) {
         .@"suspend" = true,
         .@"resume" = true,
         .kill = true,
+        .unpin = true,
         .pmu = true,
     };
 };

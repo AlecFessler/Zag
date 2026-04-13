@@ -86,6 +86,7 @@ pub const SyscallNum = enum(u64) {
     irq_ack,
     sys_power,
     sys_cpu_power,
+    thread_unpin,
     _,
 };
 
@@ -160,6 +161,7 @@ pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
         .irq_ack => .{ .ret = device.sysIrqAck(arg0) },
         .sys_power => .{ .ret = system.sysSysPower(arg0) },
         .sys_cpu_power => .{ .ret = system.sysSysCpuPower(arg0, arg1) },
+        .thread_unpin => .{ .ret = thread.sysThreadUnpin(arg0) },
         _ => .{ .ret = E_INVAL },
     };
 }

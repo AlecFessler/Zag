@@ -8,7 +8,6 @@ const futex = zag.proc.futex;
 const process_mod = zag.proc.process;
 const sched = zag.sched.scheduler;
 
-const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Priority = zag.sched.thread.Priority;
 const Process = zag.proc.process.Process;
 const Thread = zag.sched.thread.Thread;
@@ -137,21 +136,11 @@ pub fn sysSetPriority(priority_raw: u64) i64 {
             const pin_result = sched.pinExclusive(thread);
             if (pin_result >= 0) {
                 thread.priority = .pinned;
-                const core_id: u64 = @intCast(pin_result);
-                const entry = PermissionEntry{
-                    .handle = 0,
-                    .object = .{ .core_pin = .{
-                        .core_id = core_id,
-                    } },
-                    .rights = 0,
-                };
-                const handle_id = proc.insertPerm(entry) catch {
-                    _ = sched.unpinExclusive(thread);
-                    thread.core_affinity = affinity;
-                    thread.priority = thread.pre_pin_priority;
-                    return E_MAXCAP;
-                };
-                return @intCast(handle_id);
+                // Sync user view so thread entry field1 reflects pinned core
+                proc.perm_lock.lock();
+                proc.syncUserView();
+                proc.perm_lock.unlock();
+                return pin_result;
             }
 
             // This core was busy, try next one in mask
@@ -165,21 +154,8 @@ pub fn sysSetPriority(priority_raw: u64) i64 {
 
     // Non-pinned priority level
     if (currently_pinned) {
-        // Implicitly unpin: revoke core_pin, restore affinity, then apply new priority
-        // Find and revoke the core_pin handle
-        proc.perm_lock.lock();
-        for (&proc.perm_table) |*slot| {
-            if (slot.object == .core_pin) {
-                const cp = slot.object.core_pin;
-                sched.unpinByRevoke(cp.core_id);
-                slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
-                proc.perm_count -= 1;
-                break;
-            }
-        }
-        proc.syncUserView();
-        proc.perm_lock.unlock();
-
+        // Implicitly unpin: restore affinity, then apply new priority
+        sched.unpinByRevoke(@ctz(thread.core_affinity orelse 0));
     }
 
     thread.priority = new_priority;
@@ -373,6 +349,41 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
     // deinit removes thread handles from perm tables, frees stacks,
     // calls lastThreadExited (which triggers process exit/restart).
     target.deinit();
+
+    return E_OK;
+}
+
+pub fn sysThreadUnpin(thread_handle: u64) i64 {
+    const proc = sched.currentProc();
+    const thr_entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
+    if (thr_entry.object != .thread) return E_BADCAP;
+    if (!thr_entry.threadHandleRights().unpin) return E_PERM;
+
+    const target = thr_entry.object.thread;
+    // The check and unpinByRevoke are not under a single lock, but this is
+    // safe: unpinByRevoke is idempotent (checks pinned_thread for null), so
+    // a concurrent sysSetPriority that already unpinned just makes this a
+    // no-op returning E_OK, which is benign.
+    if (target.priority != .pinned) return E_INVAL;
+
+    const core_id = @ctz(target.core_affinity orelse return E_INVAL);
+    sched.unpinByRevoke(core_id);
+
+    // Sync user view on the target thread's owning process, not the caller's
+    // process, so the perm view reflects the unpinned state even for cross-
+    // process unpins (e.g., fault handler unpinning a debuggee's thread).
+    const target_proc = target.process;
+    target_proc.perm_lock.lock();
+    target_proc.syncUserView();
+    target_proc.perm_lock.unlock();
+
+    // Also sync the caller's view if it differs from the target's process,
+    // since the caller also holds a thread handle entry that shows pin state.
+    if (target_proc != proc) {
+        proc.perm_lock.lock();
+        proc.syncUserView();
+        proc.perm_lock.unlock();
+    }
 
     return E_OK;
 }

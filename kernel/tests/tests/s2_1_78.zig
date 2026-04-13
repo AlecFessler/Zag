@@ -15,7 +15,7 @@ fn findThreadEntry(view: [*]const perm_view.UserViewEntry, h: u64) ?*const perm_
     return null;
 }
 
-/// §2.1.78 — Thread entry `field1` exposes the fault-handler exclude flags: bit 0 = `exclude_oneshot`, bit 1 = `exclude_permanent`.
+/// §2.1.78 — Thread entry `field1` encodes the pinned core ID when the thread is pinned, or zero when the thread is not pinned.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 

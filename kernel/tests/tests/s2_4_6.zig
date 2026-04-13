@@ -1,37 +1,40 @@
 const lib = @import("lib");
 
 const perm_view = lib.perm_view;
+const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.4.6 — Core pin user view `field1` = 0.
+/// §2.4.6 — Virtual BAR read: the kernel writes the decoded port read result back into the faulting thread's register state.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    _ = syscall.set_affinity(0x2);
-    syscall.thread_yield();
+    const pio = t.requirePioDevice(view, "§2.4.6");
+    const pio_handle = pio.handle;
 
-    const ret = syscall.set_priority(syscall.PRIORITY_PINNED);
-    if (ret < 0) {
-        t.fail("§2.4.6 set_priority(PINNED) failed");
+    // Create a VM reservation with mmio + read + write rights.
+    const rights = perms.VmReservationRights{ .read = true, .write = true, .mmio = true };
+    const vm = syscall.mem_reserve(0, 4096, rights.bits());
+    if (vm.val < 0) {
+        t.fail("§2.4.6 mem_reserve");
         syscall.shutdown();
     }
-    const pin_handle: u64 = @bitCast(ret);
+    const vm_handle: u64 = @bitCast(vm.val);
+    const bar_base: u64 = vm.val2;
 
-    var field1: u64 = 0xDEADBEEF;
-    for (0..128) |i| {
-        if (view[i].handle == pin_handle and view[i].entry_type == perm_view.ENTRY_TYPE_CORE_PIN) {
-            field1 = view[i].field1;
-            break;
-        }
+    // Map the PIO device into the reservation.
+    const ret = syscall.mem_mmio_map(pio_handle, vm_handle, 0);
+    if (ret != 0) {
+        t.failWithVal("§2.4.6 mem_mmio_map", 0, ret);
+        syscall.shutdown();
     }
 
-    _ = syscall.revoke_perm(pin_handle);
+    // Volatile read from the virtual BAR — traps to kernel, kernel decodes
+    // the MOV, performs port I/O read, writes result back to register, and
+    // advances RIP. If we reach the next line, emulation succeeded.
+    const ptr: *volatile u8 = @ptrFromInt(bar_base);
+    _ = ptr.*;
 
-    if (field1 == 0) {
-        t.pass("§2.4.6");
-    } else {
-        t.failWithVal("§2.4.6", 0, @bitCast(field1));
-    }
+    t.pass("§2.4.6");
     syscall.shutdown();
 }

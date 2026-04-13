@@ -11,7 +11,7 @@ pub fn main(perm_view: u64) void {
     // Set single-core affinity, then pin.
     _ = syscall.set_affinity(0b1);
     const pin_ret = syscall.set_priority(syscall.PRIORITY_PINNED);
-    if (pin_ret <= 0) {
+    if (pin_ret < 0) {
         t.failWithVal("§2.2.67 setup pin", 1, pin_ret);
         syscall.shutdown();
     }
