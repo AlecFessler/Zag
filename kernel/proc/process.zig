@@ -648,44 +648,6 @@ pub const Process = struct {
         return .{ .entry = entry, .thread = t };
     }
 
-    /// Look up a handle and, if it references a live or dead Process, pin
-    /// the `*Process` so it cannot be freed out from under the caller while
-    /// the caller is still using the entry snapshot. Callers MUST invoke
-    /// `Process.releaseRef` on the returned process pointer once they are
-    /// done operating on it (e.g. via `defer`).
-    ///
-    /// Returns `null` on handle-not-found or when the entry is neither
-    /// `.process` nor `.dead_process`. Fixes a TOCTOU UAF where a
-    /// concurrent `removePerm` on the same handle dropped the last
-    /// external ref and destroyed the target process between
-    /// `getPermByHandle` returning its snapshot and the caller
-    /// dereferencing the embedded `*Process`.
-    pub fn acquireProcessRef(self: *Process, handle_id: u64) ?struct {
-        entry: PermissionEntry,
-        process: *Process,
-    } {
-        self.perm_lock.lock();
-        defer self.perm_lock.unlock();
-        const entry = self.getPermByHandleLocked(handle_id) orelse return null;
-        const p: *Process = switch (entry.object) {
-            .process => |pp| pp,
-            .dead_process => |pp| pp,
-            else => return null,
-        };
-        _ = @atomicRmw(u32, &p.handle_refcount, .Add, 1, .acq_rel);
-        return .{ .entry = entry, .process = p };
-    }
-
-    /// Drop a reference acquired via `acquireProcessRef`. If this was the
-    /// last external ref AND the process has already run cleanupPhase2,
-    /// finalize destruction.
-    pub fn releaseRef(self: *Process) void {
-        const prev = @atomicRmw(u32, &self.handle_refcount, .Sub, 1, .acq_rel);
-        if (prev == 1 and @atomicLoad(bool, &self.cleanup_complete, .acquire)) {
-            allocator.destroy(self);
-        }
-    }
-
     /// Look up a handle while the caller already holds perm_lock.
     pub fn getPermByHandleLocked(self: *const Process, handle_id: u64) ?PermissionEntry {
         for (self.perm_table) |entry| {
