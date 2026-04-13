@@ -1,6 +1,7 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const errors = zag.syscall.errors;
 const futex = zag.proc.futex;
@@ -21,6 +22,17 @@ pub fn sysFutexWaitVal(addrs_ptr: u64, expected_ptr: u64, count: u64, timeout_ns
     const thread = sched.currentThread().?;
     const cnt: usize = @intCast(count);
 
+    // Bound and wrap-check the two user arrays before touching them.
+    // Without this, an addrs_ptr near ~0 wraps into the low half on each
+    // iteration and bypasses any partition check.
+    const total_bytes = cnt * 8;
+    const addrs_end = std.math.add(u64, addrs_ptr, total_bytes) catch return E_BADADDR;
+    const expected_end = std.math.add(u64, expected_ptr, total_bytes) catch return E_BADADDR;
+    if (!address.AddrSpacePartition.user.contains(addrs_ptr) or
+        !address.AddrSpacePartition.user.contains(addrs_end - 1)) return E_BADADDR;
+    if (!address.AddrSpacePartition.user.contains(expected_ptr) or
+        !address.AddrSpacePartition.user.contains(expected_end - 1)) return E_BADADDR;
+
     // Read user addresses and expected values, resolve to physical.
     var paddrs: [MAX_FUTEX_ADDRS]PAddr = undefined;
     var expected: [MAX_FUTEX_ADDRS]u64 = undefined;
@@ -36,6 +48,7 @@ pub fn sysFutexWaitVal(addrs_ptr: u64, expected_ptr: u64, count: u64, timeout_ns
         const user_addr = @as(*const u64, @ptrFromInt(addr_physmap)).*;
 
         if (!std.mem.isAligned(user_addr, 8)) return E_INVAL;
+        if (!address.AddrSpacePartition.user.contains(user_addr)) return E_BADADDR;
 
         // Read the expected value.
         proc.vmm.demandPage(VAddr.fromInt(exp_va), false, false) catch return E_BADADDR;
@@ -64,6 +77,11 @@ pub fn sysFutexWaitChange(addrs_ptr: u64, count: u64, timeout_ns: u64) i64 {
     const thread = sched.currentThread().?;
     const cnt: usize = @intCast(count);
 
+    const total_bytes = cnt * 8;
+    const addrs_end = std.math.add(u64, addrs_ptr, total_bytes) catch return E_BADADDR;
+    if (!address.AddrSpacePartition.user.contains(addrs_ptr) or
+        !address.AddrSpacePartition.user.contains(addrs_end - 1)) return E_BADADDR;
+
     var paddrs: [MAX_FUTEX_ADDRS]PAddr = undefined;
 
     for (0..cnt) |i| {
@@ -76,6 +94,7 @@ pub fn sysFutexWaitChange(addrs_ptr: u64, count: u64, timeout_ns: u64) i64 {
         const user_addr = @as(*const u64, @ptrFromInt(addr_physmap)).*;
 
         if (!std.mem.isAligned(user_addr, 8)) return E_INVAL;
+        if (!address.AddrSpacePartition.user.contains(user_addr)) return E_BADADDR;
 
         // Resolve the target futex address to physical.
         proc.vmm.demandPage(VAddr.fromInt(user_addr), false, false) catch return E_BADADDR;
@@ -88,6 +107,11 @@ pub fn sysFutexWaitChange(addrs_ptr: u64, count: u64, timeout_ns: u64) i64 {
 
 pub fn sysFutexWake(addr: u64, count: u64) i64 {
     if (!std.mem.isAligned(addr, 8)) return E_INVAL;
+    // Without a user-partition check, a malicious caller could pass a
+    // kernel VA and use the E_BADADDR / success distinction as a KASLR
+    // oracle — and would also feed arbitrary kernel paddrs into futex
+    // bucket lookups.
+    if (!address.AddrSpacePartition.user.contains(addr)) return E_BADADDR;
 
     const proc = sched.currentProc();
     const vaddr = VAddr.fromInt(addr);
