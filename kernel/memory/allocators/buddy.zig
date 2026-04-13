@@ -77,7 +77,9 @@ pub const BuddyAllocator = struct {
         // return the buddy's full managed range. (§14, §21.)
         self.total_pages += (aligned_end - aligned_start) / PAGE_SIZE;
 
+        const dispatch = zag.arch.dispatch;
         var current_addr = aligned_start;
+        var progress: u64 = 0;
         while (current_addr < aligned_end) {
             const ptr: [*]u8 = @ptrFromInt(current_addr);
             const slice = ptr[0..PAGE_SIZE];
@@ -88,6 +90,8 @@ pub const BuddyAllocator = struct {
                 @returnAddress(),
             );
             current_addr += PAGE_SIZE;
+            progress += 1;
+            if (progress & 0x3FF == 0) dispatch.earlyDebugChar('p');
         }
     }
 

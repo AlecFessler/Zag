@@ -34,10 +34,7 @@ pub fn init() void {
     // indices and use them for page-table attr_indx fields.
     paging.initMairIndices();
     dispatch.earlyDebugChar('2');
-    // DEBUG: exceptions.install() deferred so the bootloader's early
-    // fault handler stays active through memory.init — otherwise any
-    // fault there hits the real handler which silently no-ops in
-    // serial.print (pre-ACPI) and appears as a hang.
+    exceptions.install();
     dispatch.earlyDebugChar('3');
     serial.init();
     dispatch.earlyDebugChar('4');

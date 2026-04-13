@@ -190,11 +190,16 @@ pub fn init(firmware_mmap: MMap) !void {
         arch.earlyDebugChar('-');
         arch.earlyDebugHex(useable_range.end);
         arch.earlyDebugChar('>');
-        buddy_allocator.addRegion(useable_range.start, useable_range.end);
+        // DEBUG: cap addRegion to first 1 MB of each range on aarch64 so
+        // the Pi-KVM Debug-mode buddy free loop completes in seconds rather
+        // than minutes. Revert before shipping.
+        const max_end = @min(useable_range.end, useable_range.start + 0x100000);
+        buddy_allocator.addRegion(useable_range.start, max_end);
     }
     arch.earlyDebugChar('f');
 
     pmm.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
+    arch.earlyDebugChar('g');
 
     vm_node_slab_bump = BumpAllocator.init(KA.vm_node_slab.start, KA.vm_node_slab.end);
     vm_tree_slab_bump = BumpAllocator.init(KA.vm_tree_slab.start, KA.vm_tree_slab.end);
@@ -205,8 +210,10 @@ pub fn init(firmware_mmap: MMap) !void {
     kvm_vm_slab_backing = BumpAllocator.init(KA.kvm_vm_slab.start, KA.kvm_vm_slab.end);
     kvm_vcpu_slab_backing = BumpAllocator.init(KA.kvm_vcpu_slab.start, KA.kvm_vcpu_slab.end);
     pmu_state_slab_backing = BumpAllocator.init(KA.pmu_state_slab.start, KA.pmu_state_slab.end);
+    arch.earlyDebugChar('i');
 
     try vmm_mod.initSlabs(vm_node_slab_bump.allocator(), vm_tree_slab_bump.allocator());
+    arch.earlyDebugChar('j');
     try device_region_mod.initSlab(device_region_slab_bump.allocator());
 
     shared.slab_allocator_instance = try shared.SharedMemoryAllocator.init(shm_slab_bump.allocator());

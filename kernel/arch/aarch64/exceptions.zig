@@ -109,10 +109,9 @@ fn isWriteFault(esr: u64) bool {
 /// handler address, and branches to the shared trampoline.
 ///
 /// ARM ARM D1.10.2, Table D1-7.
-fn exceptionVectorTable() callconv(.naked) void {
+fn exceptionVectorTable() align(2048) callconv(.naked) void {
     // 0x000: Current EL SP0, Synchronous -- should not happen.
     asm volatile (
-        \\.balign 0x800
         \\stp x0, x30, [sp, #-16]!
         \\adrp x0, %[unexpected]
         \\add x0, x0, :lo12:%[unexpected]
