@@ -17,12 +17,13 @@ const t = lib.testing;
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     // With default (non-empty) affinity, pinning should succeed.
+    // Returns pinned core ID (>= 0) on success, negative on error.
     const ret = syscall.set_priority(syscall.PRIORITY_PINNED);
-    if (ret > 0) {
+    if (ret >= 0) {
         t.pass("§2.2.73 pinned with default affinity");
-        _ = syscall.revoke_perm(@bitCast(ret));
+        _ = syscall.set_priority(syscall.PRIORITY_NORMAL);
     } else {
-        t.failWithVal("§2.2.73 default affinity", 1, ret);
+        t.failWithVal("§2.2.73 default affinity", 0, ret);
         syscall.shutdown();
     }
 
@@ -31,11 +32,11 @@ pub fn main(perm_view: u64) void {
     t.expectOk("§2.2.73 set_affinity", aff_ret);
 
     const ret2 = syscall.set_priority(syscall.PRIORITY_PINNED);
-    if (ret2 > 0) {
+    if (ret2 >= 0) {
         t.pass("§2.2.73 pinned with explicit affinity");
-        _ = syscall.revoke_perm(@bitCast(ret2));
+        _ = syscall.set_priority(syscall.PRIORITY_NORMAL);
     } else {
-        t.failWithVal("§2.2.73 explicit affinity", 1, ret2);
+        t.failWithVal("§2.2.73 explicit affinity", 0, ret2);
     }
 
     syscall.shutdown();

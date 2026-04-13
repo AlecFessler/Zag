@@ -4,11 +4,11 @@ const pv = lib.perm_view;
 const syscall = lib.syscall;
 
 const MAX_PERMS = 128;
-const ENTRY_TYPE_CORE_PIN: u8 = 4;
 
 /// First boot: pins itself, then crashes (ud2). Restarts.
-/// Second boot: receives device via IPC on first boot (already done),
-/// checks perm_view for core_pin entries and reports count via IPC.
+/// Second boot: checks perm_view for thread pin state and device entries,
+/// reports counts via IPC. After restart, the thread should NOT be pinned
+/// (field1 == 0 on the thread entry).
 pub fn main(perm_view_addr: u64) void {
     const view: *const [MAX_PERMS]pv.UserViewEntry = @ptrFromInt(perm_view_addr);
     const restart_count = view[0].processRestartCount();
@@ -28,11 +28,17 @@ pub fn main(perm_view_addr: u64) void {
         asm volatile ("ud2");
     }
 
-    // Second+ boot: check for core_pin entries in our perm_view.
-    var core_pin_count: u64 = 0;
+    // Second+ boot: check that pin state was cleared (field1 == 0 on our thread entry).
+    // The thread entry for the main thread is always at a known position; we look for
+    // the self handle.
+    const self_handle: u64 = @bitCast(syscall.thread_self());
+    var pinned_after_restart: u64 = 0;
     for (view) |*entry| {
-        if (entry.entry_type == ENTRY_TYPE_CORE_PIN) {
-            core_pin_count += 1;
+        if (entry.entry_type == pv.ENTRY_TYPE_THREAD and entry.handle == self_handle) {
+            if (entry.field1 != 0) {
+                pinned_after_restart = 1;
+            }
+            break;
         }
     }
 
@@ -44,8 +50,8 @@ pub fn main(perm_view_addr: u64) void {
         }
     }
 
-    // Report via IPC: word0 = core_pin_count, word1 = device_count
+    // Report via IPC: word0 = pinned_after_restart (0 = good), word1 = device_count
     var msg: syscall.IpcMessage = .{};
     _ = syscall.ipc_recv(true, &msg);
-    _ = syscall.ipc_reply(&.{ core_pin_count, device_count });
+    _ = syscall.ipc_reply(&.{ pinned_after_restart, device_count });
 }

@@ -4,70 +4,70 @@ const perm_view = lib.perm_view;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const E_BADHANDLE: i64 = -3;
-
-fn findCorePinEntry(view: [*]const perm_view.UserViewEntry, handle: u64) bool {
-    for (0..128) |i| {
-        const e = &view[i];
-        if (e.entry_type == perm_view.ENTRY_TYPE_CORE_PIN and e.handle == handle)
-            return true;
-    }
-    return false;
-}
-
 /// §2.2.32 — There are two ways to unpin: (1) call `thread_unpin` on the thread's handle, which restores the pre-pin affinity mask and drops priority to the pre-pin level; (2) call `set_priority` with any non-pinned level, which implicitly unpins, restores affinity, and applies the new priority.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
+    const self_handle: u64 = @bitCast(syscall.thread_self());
 
-    // --- Path 1: revoke_perm on the core_pin handle ---
+    // --- Path 1: thread_unpin ---
     _ = syscall.set_affinity(0b10);
     const pin1 = syscall.set_priority(syscall.PRIORITY_PINNED);
-    if (pin1 <= 0) {
-        t.failWithVal("§2.2.32 pin1 failed", 1, pin1);
+    if (pin1 < 0) {
+        t.failWithVal("§2.2.32 pin1 failed", 0, pin1);
         syscall.shutdown();
     }
-    const handle1: u64 = @bitCast(pin1);
 
-    // Revoke the core_pin handle to unpin.
-    const revoke_ret = syscall.revoke_perm(handle1);
-    t.expectOk("§2.2.32 path1 revoke_perm", revoke_ret);
+    // Unpin via thread_unpin.
+    const unpin_ret = syscall.thread_unpin(self_handle);
+    t.expectOk("§2.2.32 path1 thread_unpin", unpin_ret);
 
-    // Verify handle is gone (revoke again should fail).
-    const revoke2 = syscall.revoke_perm(handle1);
-    t.expectEqual("§2.2.32 path1 handle gone", E_BADHANDLE, revoke2);
+    // Verify field1 is cleared (no longer pinned).
+    var field1_cleared = false;
+    for (0..128) |i| {
+        const e = &view[i];
+        if (e.entry_type == perm_view.ENTRY_TYPE_THREAD and e.handle == self_handle) {
+            field1_cleared = (e.field1 == 0);
+            break;
+        }
+    }
+    if (!field1_cleared) {
+        t.fail("§2.2.32 path1 field1 not cleared after unpin");
+        syscall.shutdown();
+    }
 
     // Verify we can set_affinity again (no longer pinned).
     const aff_ret = syscall.set_affinity(0b1);
     t.expectOk("§2.2.32 path1 affinity restored", aff_ret);
 
-    // Verify priority is no longer pinned: set_priority(NORMAL) should succeed,
-    // confirming the thread accepted a non-pinned priority (pre-pin level restored).
+    // Verify priority is no longer pinned: set_priority(NORMAL) should succeed.
     const pri_ret = syscall.set_priority(syscall.PRIORITY_NORMAL);
     t.expectOk("§2.2.32 path1 priority restored", pri_ret);
-
-    // Note: we cannot directly query current affinity or priority. The above checks
-    // confirm the thread is not locked (affinity settable) and not stuck at pinned
-    // priority. Verifying the exact pre-pin affinity mask was restored would require
-    // a get_affinity syscall which does not exist.
 
     // --- Path 2: set_priority to non-pinned ---
     _ = syscall.set_affinity(0b10);
     const pin2 = syscall.set_priority(syscall.PRIORITY_PINNED);
-    if (pin2 <= 0) {
-        t.failWithVal("§2.2.32 pin2 failed", 1, pin2);
+    if (pin2 < 0) {
+        t.failWithVal("§2.2.32 pin2 failed", 0, pin2);
         syscall.shutdown();
     }
-    const handle2: u64 = @bitCast(pin2);
 
-    // Set to NORMAL — should implicitly revoke the core_pin handle.
+    // Set to NORMAL — should implicitly unpin.
     const set_ret = syscall.set_priority(syscall.PRIORITY_NORMAL);
     t.expectOk("§2.2.32 path2 set_priority NORMAL", set_ret);
 
-    // The core_pin handle should be gone from the perm_view.
-    if (!findCorePinEntry(view, handle2)) {
-        t.pass("§2.2.32 path2 core_pin handle revoked");
+    // Verify field1 is cleared in the thread's perm_view entry.
+    var field1_gone = false;
+    for (0..128) |i| {
+        const e = &view[i];
+        if (e.entry_type == perm_view.ENTRY_TYPE_THREAD and e.handle == self_handle) {
+            field1_gone = (e.field1 == 0);
+            break;
+        }
+    }
+    if (field1_gone) {
+        t.pass("§2.2.32 path2 field1 cleared after implicit unpin");
     } else {
-        t.fail("§2.2.32 path2 core_pin handle still present");
+        t.fail("§2.2.32 path2 field1 still set after implicit unpin");
     }
 
     syscall.shutdown();

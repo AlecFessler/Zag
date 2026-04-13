@@ -15,7 +15,7 @@ pub fn main(pv: u64) void {
 
     // Pin — should return the pinned core ID.
     const pin_ret = syscall.set_priority(syscall.PRIORITY_PINNED);
-    if (pin_ret <= 0) {
+    if (pin_ret < 0) {
         t.failWithVal("§2.2.81 setup pin", 1, pin_ret);
         syscall.shutdown();
     }

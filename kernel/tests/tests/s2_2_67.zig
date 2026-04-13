@@ -18,7 +18,7 @@ pub fn main(perm_view: u64) void {
     // Now try to change affinity while pinned.
     const ret = syscall.set_affinity(0x1);
     t.expectEqual("§2.2.67", E_BUSY, ret);
-    // Clean up: revoke pin handle.
-    _ = syscall.revoke_perm(@bitCast(pin_ret));
+    // Clean up: unpin by setting back to normal.
+    _ = syscall.set_priority(syscall.PRIORITY_NORMAL);
     syscall.shutdown();
 }

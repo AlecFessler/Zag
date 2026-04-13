@@ -45,9 +45,8 @@ pub fn main(_: u64) void {
             t.failWithVal("§2.2.26 pin", 0, pin_ret);
             syscall.shutdown();
         }
-        const pin_handle: u64 = @bitCast(pin_ret);
         const aff_ret = syscall.set_affinity(0x1);
-        _ = syscall.revoke_perm(pin_handle);
+        _ = syscall.set_priority(syscall.PRIORITY_NORMAL);
         if (aff_ret != E_BUSY) {
             t.failWithVal("§2.2.26 case2 (E_BUSY while pinned)", E_BUSY, aff_ret);
             syscall.shutdown();
