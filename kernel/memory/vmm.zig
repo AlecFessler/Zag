@@ -508,38 +508,35 @@ pub const VirtualMemoryManager = struct {
         const range_start = VAddr.fromInt(original_start.addr + offset);
         const range_end_addr = range_start.addr + size;
 
-        // VALIDATION PASS: Check that all non-private nodes are fully contained.
-        // Any shm/mmio/virtual_bar node must have start >= range_start AND
-        // start + size <= range_end_addr. If partially overlapping, reject.
-        const ValidCtx = struct {
-            range_start_addr: u64,
-            range_end_addr: u64,
-            has_partial: bool = false,
-            fn cb(ctx: *@This(), node: *VmNode) void {
-                if (node.kind == .private) return;
-                if (node.start.addr < ctx.range_start_addr or node.end() > ctx.range_end_addr) {
-                    ctx.has_partial = true;
-                }
-            }
-        };
-        var valid_ctx = ValidCtx{ .range_start_addr = range_start.addr, .range_end_addr = range_end_addr };
-        var vs = mkSentinel(range_start);
-        var ve = mkSentinel(VAddr.fromInt(range_end_addr));
-        self.tree.forEachInRange(&vs, &ve, &valid_ctx, ValidCtx.cb);
-        if (valid_ctx.has_partial) return error.PartialOverlap;
-
-        // Split at boundaries (only needed for private nodes at the edges).
+        // Split at boundaries first so that forEachInRange sees all overlapping
+        // nodes with start >= range_start. Without this, a non-private node
+        // starting before range_start would be missed by the validation pass,
+        // allowing a partial unmap that violates §2.3.7/§2.3.47.
         try splitAtLocked(&self.tree, range_start);
         try splitAtLocked(&self.tree, VAddr.fromInt(range_end_addr));
 
+        // VALIDATION PASS: After splitting, any non-private node visited by
+        // forEachInRange is fully contained. If one exists, reject.
+        const ValidCtx = struct {
+            has_non_private: bool = false,
+            fn cb(ctx: *@This(), node: *VmNode) void {
+                if (node.kind != .private) ctx.has_non_private = true;
+            }
+        };
+        var valid_ctx = ValidCtx{};
+        var vs = mkSentinel(range_start);
+        var ve = mkSentinel(VAddr.fromInt(range_end_addr));
+        self.tree.forEachInRange(&vs, &ve, &valid_ctx, ValidCtx.cb);
+        if (valid_ctx.has_non_private) return error.PartialOverlap;
+
         // UNMAP PASS: Collect non-private nodes to replace, and update private nodes.
-        var to_replace: [64]*VmNode = undefined;
+        var to_replace: [128]*VmNode = undefined;
         var replace_count: usize = 0;
 
         const UnmapCtx = struct {
             root: PAddr,
             rights: VmReservationRights,
-            buf: *[64]*VmNode,
+            buf: *[128]*VmNode,
             count: *usize,
             fn cb(ctx: *@This(), node: *VmNode) void {
                 switch (node.kind) {
@@ -551,7 +548,7 @@ pub const VirtualMemoryManager = struct {
                         if (node.kind != .virtual_bar) {
                             unmapNodePages(node, ctx.root, false);
                         }
-                        if (ctx.count.* < 64) {
+                        if (ctx.count.* < 128) {
                             ctx.buf.*[ctx.count.*] = node;
                             ctx.count.* += 1;
                         }
