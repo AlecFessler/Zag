@@ -1,0 +1,502 @@
+[PERF] cap_lookup_valid min=4592 cycles
+[PERF] cap_lookup_valid median=4746 cycles
+[PERF] cap_lookup_valid mean=4971 cycles
+[PERF] cap_lookup_valid p99=6594 cycles
+[PERF] cap_lookup_valid max=113708 cycles
+[PERF] cap_lookup_valid stddev=2182 cycles
+[PERF] cap_lookup_valid iterations=5000
+[PERF] cap_lookup_invalid min=5460 cycles
+[PERF] cap_lookup_invalid median=5558 cycles
+[PERF] cap_lookup_invalid mean=5647 cycles
+[PERF] cap_lookup_invalid p99=5656 cycles
+[PERF] cap_lookup_invalid max=117628 cycles
+[PERF] cap_lookup_invalid stddev=2644 cycles
+[PERF] cap_lookup_invalid iterations=5000
+[PERF] clock_gettime min=38052 cycles
+[PERF] clock_gettime median=38612 cycles
+[PERF] clock_gettime mean=39257 cycles
+[PERF] clock_gettime p99=55300 cycles
+[PERF] clock_gettime max=165970 cycles
+[PERF] clock_gettime stddev=6698 cycles
+[PERF] clock_gettime iterations=10000
+[PERF] clock_gettime cycles_per_op=0
+[PERF] clock_gettime instructions_per_op=0
+[PERF] clock_gettime cache_misses_per_op=0
+[PERF] ctx_switch_yield_pair min=142786 cycles
+[PERF] ctx_switch_yield_pair median=143220 cycles
+[PERF] ctx_switch_yield_pair mean=144553 cycles
+[PERF] ctx_switch_yield_pair p99=183106 cycles
+[PERF] ctx_switch_yield_pair max=296968 cycles
+[PERF] ctx_switch_yield_pair stddev=6420 cycles
+[PERF] ctx_switch_yield_pair iterations=10000
+[PERF] ctx_switch_yield_pair per_switch_median=71610 cycles
+[PERF] ioport_read min=616 cycles
+[PERF] ioport_read median=658 cycles
+[PERF] ioport_read mean=688 cycles
+[PERF] ioport_read p99=784 cycles
+[PERF] ioport_read max=37128 cycles
+[PERF] ioport_read stddev=400 cycles
+[PERF] ioport_read iterations=10000
+[PERF] ioport_write min=616 cycles
+[PERF] ioport_write median=630 cycles
+[PERF] ioport_write mean=648 cycles
+[PERF] ioport_write p99=658 cycles
+[PERF] ioport_write max=118384 cycles
+[PERF] ioport_write stddev=1264 cycles
+[PERF] ioport_write iterations=10000
+[PERF] mmio_map min=9604 cycles
+[PERF] mmio_map median=9996 cycles
+[PERF] mmio_map mean=10158 cycles
+[PERF] mmio_map p99=13832 cycles
+[PERF] mmio_map max=106638 cycles
+[PERF] mmio_map stddev=2559 cycles
+[PERF] mmio_map iterations=2000
+[PERF] fault_cycle_int3 min=1604890 cycles
+[PERF] fault_cycle_int3 median=1621830 cycles
+[PERF] fault_cycle_int3 mean=1629951 cycles
+[PERF] fault_cycle_int3 p99=1686202 cycles
+[PERF] fault_cycle_int3 max=1809318 cycles
+[PERF] fault_cycle_int3 stddev=19410 cycles
+[PERF] fault_cycle_int3 iterations=2000
+[PERF] fault_debugger_cycle min=1764728 cycles
+[PERF] fault_debugger_cycle median=1796088 cycles
+[PERF] fault_debugger_cycle mean=1800528 cycles
+[PERF] fault_debugger_cycle p99=1877204 cycles
+[PERF] fault_debugger_cycle max=2027172 cycles
+[PERF] fault_debugger_cycle stddev=28181 cycles
+[PERF] fault_debugger_cycle iterations=1000
+[PERF] fault_read_mem_8 min=5964 cycles
+[PERF] fault_read_mem_8 median=6384 cycles
+[PERF] fault_read_mem_8 mean=6486 cycles
+[PERF] fault_read_mem_8 p99=6860 cycles
+[PERF] fault_read_mem_8 max=92246 cycles
+[PERF] fault_read_mem_8 stddev=2072 cycles
+[PERF] fault_read_mem_8 iterations=2000
+[PERF] fault_read_mem_64 min=5950 cycles
+[PERF] fault_read_mem_64 median=6272 cycles
+[PERF] fault_read_mem_64 mean=6350 cycles
+[PERF] fault_read_mem_64 p99=6538 cycles
+[PERF] fault_read_mem_64 max=91014 cycles
+[PERF] fault_read_mem_64 stddev=2021 cycles
+[PERF] fault_read_mem_64 iterations=2000
+[PERF] fault_read_mem_512 min=6034 cycles
+[PERF] fault_read_mem_512 median=6356 cycles
+[PERF] fault_read_mem_512 mean=6494 cycles
+[PERF] fault_read_mem_512 p99=7518 cycles
+[PERF] fault_read_mem_512 max=115990 cycles
+[PERF] fault_read_mem_512 stddev=3003 cycles
+[PERF] fault_read_mem_512 iterations=2000
+[PERF] fault_read_mem_4096 min=6440 cycles
+[PERF] fault_read_mem_4096 median=6790 cycles
+[PERF] fault_read_mem_4096 mean=6908 cycles
+[PERF] fault_read_mem_4096 p99=7084 cycles
+[PERF] fault_read_mem_4096 max=115766 cycles
+[PERF] fault_read_mem_4096 stddev=2991 cycles
+[PERF] fault_read_mem_4096 iterations=2000
+[PERF] fault_read_mem_16384 min=8932 cycles
+[PERF] fault_read_mem_16384 median=9394 cycles
+[PERF] fault_read_mem_16384 mean=9560 cycles
+[PERF] fault_read_mem_16384 p99=9982 cycles
+[PERF] fault_read_mem_16384 max=118468 cycles
+[PERF] fault_read_mem_16384 stddev=3011 cycles
+[PERF] fault_read_mem_16384 iterations=2000
+[PERF] fault_write_mem_8 min=5810 cycles
+[PERF] fault_write_mem_8 median=6076 cycles
+[PERF] fault_write_mem_8 mean=6147 cycles
+[PERF] fault_write_mem_8 p99=6328 cycles
+[PERF] fault_write_mem_8 max=89978 cycles
+[PERF] fault_write_mem_8 stddev=2000 cycles
+[PERF] fault_write_mem_8 iterations=2000
+[PERF] fault_write_mem_64 min=5810 cycles
+[PERF] fault_write_mem_64 median=6090 cycles
+[PERF] fault_write_mem_64 mean=6188 cycles
+[PERF] fault_write_mem_64 p99=6342 cycles
+[PERF] fault_write_mem_64 max=101360 cycles
+[PERF] fault_write_mem_64 stddev=2394 cycles
+[PERF] fault_write_mem_64 iterations=2000
+[PERF] fault_write_mem_512 min=5866 cycles
+[PERF] fault_write_mem_512 median=6118 cycles
+[PERF] fault_write_mem_512 mean=6251 cycles
+[PERF] fault_write_mem_512 p99=7686 cycles
+[PERF] fault_write_mem_512 max=115612 cycles
+[PERF] fault_write_mem_512 stddev=2981 cycles
+[PERF] fault_write_mem_512 iterations=2000
+[PERF] fault_write_mem_4096 min=6244 cycles
+[PERF] fault_write_mem_4096 median=6566 cycles
+[PERF] fault_write_mem_4096 mean=6674 cycles
+[PERF] fault_write_mem_4096 p99=6874 cycles
+[PERF] fault_write_mem_4096 max=116130 cycles
+[PERF] fault_write_mem_4096 stddev=2832 cycles
+[PERF] fault_write_mem_4096 iterations=2000
+[PERF] fault_write_mem_16384 min=8316 cycles
+[PERF] fault_write_mem_16384 median=8722 cycles
+[PERF] fault_write_mem_16384 mean=8853 cycles
+[PERF] fault_write_mem_16384 p99=9044 cycles
+[PERF] fault_write_mem_16384 max=117138 cycles
+[PERF] fault_write_mem_16384 stddev=2982 cycles
+[PERF] fault_write_mem_16384 iterations=2000
+[PERF] futex_uncontended_wait min=9380 cycles
+[PERF] futex_uncontended_wait median=9688 cycles
+[PERF] futex_uncontended_wait mean=9840 cycles
+[PERF] futex_uncontended_wait p99=10038 cycles
+[PERF] futex_uncontended_wait max=119126 cycles
+[PERF] futex_uncontended_wait stddev=3118 cycles
+[PERF] futex_uncontended_wait iterations=10000
+[PERF] futex_wake_no_waiters min=4452 cycles
+[PERF] futex_wake_no_waiters median=4536 cycles
+[PERF] futex_wake_no_waiters mean=4611 cycles
+[PERF] futex_wake_no_waiters p99=4690 cycles
+[PERF] futex_wake_no_waiters max=118160 cycles
+[PERF] futex_wake_no_waiters stddev=2205 cycles
+[PERF] futex_wake_no_waiters iterations=10000
+[PERF] futex_wake_one_cross_core min=92974 cycles
+[PERF] futex_wake_one_cross_core median=104720 cycles
+[PERF] futex_wake_one_cross_core mean=108355 cycles
+[PERF] futex_wake_one_cross_core p99=161616 cycles
+[PERF] futex_wake_one_cross_core max=199444 cycles
+[PERF] futex_wake_one_cross_core stddev=11960 cycles
+[PERF] futex_wake_one_cross_core iterations=1000
+[PERF] futex_wake_one_same_core min=82530 cycles
+[PERF] futex_wake_one_same_core median=82810 cycles
+[PERF] futex_wake_one_same_core mean=83739 cycles
+[PERF] futex_wake_one_same_core p99=111888 cycles
+[PERF] futex_wake_one_same_core max=122752 cycles
+[PERF] futex_wake_one_same_core stddev=4801 cycles
+[PERF] futex_wake_one_same_core iterations=1000
+[PERF] ipc_call_reply_cross min=177856 cycles
+[PERF] ipc_call_reply_cross median=226646 cycles
+[PERF] ipc_call_reply_cross mean=230914 cycles
+[PERF] ipc_call_reply_cross p99=274400 cycles
+[PERF] ipc_call_reply_cross max=593166 cycles
+[PERF] ipc_call_reply_same min=38024 cycles
+[PERF] ipc_call_reply_same median=38458 cycles
+[PERF] ipc_call_reply_same mean=38789 cycles
+[PERF] ipc_call_reply_same p99=49770 cycles
+[PERF] ipc_call_reply_same max=96852 cycles
+[PERF] ipc_call_replyrecv_cross min=156408 cycles
+[PERF] ipc_call_replyrecv_cross median=157724 cycles
+[PERF] ipc_call_replyrecv_cross mean=160750 cycles
+[PERF] ipc_call_replyrecv_cross p99=200998 cycles
+[PERF] ipc_call_replyrecv_cross max=401352 cycles
+[PERF] ipc_call_replyrecv_same min=33558 cycles
+[PERF] ipc_call_replyrecv_same median=33936 cycles
+[PERF] ipc_call_replyrecv_same mean=34446 cycles
+[PERF] ipc_call_replyrecv_same p99=44422 cycles
+[PERF] ipc_call_replyrecv_same max=112182 cycles
+[PERF] mem_perms_toggle_1page min=34818 cycles
+[PERF] mem_perms_toggle_1page median=36288 cycles
+[PERF] mem_perms_toggle_1page mean=36883 cycles
+[PERF] mem_perms_toggle_1page p99=49000 cycles
+[PERF] mem_perms_toggle_1page max=167160 cycles
+[PERF] mem_perms_toggle_1page stddev=6349 cycles
+[PERF] mem_perms_toggle_1page iterations=5000
+[PERF] mem_perms_wide_4page min=95900 cycles
+[PERF] mem_perms_wide_4page median=98616 cycles
+[PERF] mem_perms_wide_4page mean=100196 cycles
+[PERF] mem_perms_wide_4page p99=175378 cycles
+[PERF] mem_perms_wide_4page max=227696 cycles
+[PERF] mem_perms_wide_4page stddev=10940 cycles
+[PERF] mem_perms_wide_4page iterations=2000
+[PERF] mem_reserve min=13006 cycles
+[PERF] mem_reserve median=13356 cycles
+[PERF] mem_reserve mean=13777 cycles
+[PERF] mem_reserve p99=19642 cycles
+[PERF] mem_reserve max=97748 cycles
+[PERF] mem_reserve stddev=3884 cycles
+[PERF] mem_reserve iterations=1000
+[PERF] page_fault min=13272 cycles
+[PERF] page_fault median=13930 cycles
+[PERF] page_fault mean=18443 cycles
+[PERF] page_fault p99=99400 cycles
+[PERF] page_fault max=99400 cycles
+[PERF] page_fault stddev=17414 cycles
+[PERF] page_fault iterations=100
+[PERF] pmu_start_stop_self_cold min=38892 cycles
+[PERF] pmu_start_stop_self_cold median=39480 cycles
+[PERF] pmu_start_stop_self_cold mean=40321 cycles
+[PERF] pmu_start_stop_self_cold p99=55734 cycles
+[PERF] pmu_start_stop_self_cold max=155680 cycles
+[PERF] pmu_start_stop_self_cold stddev=6576 cycles
+[PERF] pmu_start_stop_self_cold iterations=2000
+[PROF] profiler_workload load_base=0x0000037bded1a000
+[PROF] profiler_workload total_samples=500
+[PROF] profiler_workload 0x0000037bded1a1a6 count=66 pct=13.2
+[PROF] profiler_workload 0x0000037bded1a167 count=60 pct=12.0
+[PROF] profiler_workload 0x0000037bded1a164 count=58 pct=11.6
+[PROF] profiler_workload 0x0000037bded1a1a9 count=58 pct=11.6
+[PROF] profiler_workload 0x0000037bded1a176 count=57 pct=11.4
+[PROF] profiler_workload 0x0000037bded1a1a2 count=45 pct=9.0
+[PROF] profiler_workload 0x0000037bded1a1c6 count=36 pct=7.2
+[PROF] profiler_workload 0x0000037bded1a1b8 count=25 pct=5.0
+[PROF] profiler_workload 0x0000037bded1a18c count=17 pct=3.4
+[PROF] profiler_workload 0x0000037bded1a17a count=17 pct=3.4
+[PROF] profiler_workload 0x0000037bded1a193 count=16 pct=3.2
+[PROF] profiler_workload 0x0000037bded1a1c3 count=16 pct=3.2
+[PROF] profiler_workload 0x0000037bded1a190 count=14 pct=2.8
+[PROF] profiler_workload 0x0000037bded1a181 count=11 pct=2.2
+[PROF] profiler_workload 0x0000037bded1a1ad count=2 pct=0.4
+[PROF] profiler_workload 0x0000037bded1a1bb count=1 pct=0.2
+[PROF] profiler_workload 0x0000037bded1a17d count=1 pct=0.2
+[PASS] perf_profiler
+[PROF] profiler_workload load_base=0x0000038c8f0c2000
+[PROF] profiler_workload 0x0000038c8f0c2164 count=86 pct=17.2
+[PROF] profiler_workload 0x0000038c8f0c21c6 count=78 pct=15.6
+[PROF] profiler_workload 0x0000038c8f0c2167 count=61 pct=12.2
+[PROF] profiler_workload 0x0000038c8f0c21b8 count=53 pct=10.6
+[PROF] profiler_workload 0x0000038c8f0c2176 count=42 pct=8.4
+[PROF] profiler_workload 0x0000038c8f0c21c3 count=42 pct=8.4
+[PROF] profiler_workload 0x0000038c8f0c2190 count=30 pct=6.0
+[PROF] profiler_workload 0x0000038c8f0c218c count=23 pct=4.6
+[PROF] profiler_workload 0x0000038c8f0c2193 count=21 pct=4.2
+[PROF] profiler_workload 0x0000038c8f0c217a count=18 pct=3.6
+[PROF] profiler_workload 0x0000038c8f0c2181 count=16 pct=3.2
+[PROF] profiler_workload 0x0000038c8f0c21a6 count=10 pct=2.0
+[PROF] profiler_workload 0x0000038c8f0c21a9 count=9 pct=1.8
+[PROF] profiler_workload 0x0000038c8f0c21a2 count=5 pct=1.0
+[PROF] profiler_workload 0x0000038c8f0c21ad count=3 pct=0.6
+[PROF] profiler_workload 0x0000038c8f0c217d count=1 pct=0.2
+[PROF] profiler_workload 0x0000038c8f0c21bb count=1 pct=0.2
+[PROF] profiler_workload 0x0000038c8f0c2197 count=1 pct=0.2
+[PROF] profiler_workload load_base=0x00000372318c0000
+[PROF] profiler_workload 0x00000372318c0164 count=93 pct=18.6
+[PROF] profiler_workload 0x00000372318c01c6 count=74 pct=14.8
+[PROF] profiler_workload 0x00000372318c0167 count=55 pct=11.0
+[PROF] profiler_workload 0x00000372318c01c3 count=48 pct=9.6
+[PROF] profiler_workload 0x00000372318c01b8 count=45 pct=9.0
+[PROF] profiler_workload 0x00000372318c0176 count=32 pct=6.4
+[PROF] profiler_workload 0x00000372318c01a6 count=29 pct=5.8
+[PROF] profiler_workload 0x00000372318c0190 count=26 pct=5.2
+[PROF] profiler_workload 0x00000372318c0193 count=19 pct=3.8
+[PROF] profiler_workload 0x00000372318c018c count=19 pct=3.8
+[PROF] profiler_workload 0x00000372318c01a9 count=18 pct=3.6
+[PROF] profiler_workload 0x00000372318c01a2 count=17 pct=3.4
+[PROF] profiler_workload 0x00000372318c017a count=17 pct=3.4
+[PROF] profiler_workload 0x00000372318c0181 count=8 pct=1.6
+[PERF] shm_create min=13496 cycles
+[PERF] shm_create median=13916 cycles
+[PERF] shm_create mean=14200 cycles
+[PERF] shm_create p99=18424 cycles
+[PERF] shm_create max=111748 cycles
+[PERF] shm_create stddev=3626 cycles
+[PERF] shm_create iterations=2000
+[PERF] shm_map min=9044 cycles
+[PERF] shm_map median=9492 cycles
+[PERF] shm_map mean=9764 cycles
+[PERF] shm_map p99=16002 cycles
+[PERF] shm_map max=92596 cycles
+[PERF] shm_map stddev=3258 cycles
+[PERF] shm_map iterations=2000
+[PERF] shm_full_cycle min=78078 cycles
+[PERF] shm_full_cycle median=80934 cycles
+[PERF] shm_full_cycle mean=83192 cycles
+[PERF] shm_full_cycle p99=151508 cycles
+[PERF] shm_full_cycle max=226492 cycles
+[PERF] shm_full_cycle stddev=11214 cycles
+[PERF] shm_full_cycle iterations=2000
+[PERF] syscall_thread_self min=7868 cycles
+[PERF] syscall_thread_self median=7994 cycles
+[PERF] syscall_thread_self mean=8121 cycles
+[PERF] syscall_thread_self p99=8190 cycles
+[PERF] syscall_thread_self max=119658 cycles
+[PERF] syscall_thread_self stddev=2705 cycles
+[PERF] syscall_thread_self iterations=10000
+[PERF] syscall_clock_getwall min=37632 cycles
+[PERF] syscall_clock_getwall median=38234 cycles
+[PERF] syscall_clock_getwall mean=38940 cycles
+[PERF] syscall_clock_getwall p99=54992 cycles
+[PERF] syscall_clock_getwall max=164556 cycles
+[PERF] syscall_clock_getwall stddev=6540 cycles
+[PERF] syscall_clock_getwall iterations=10000
+[PERF] syscall_sys_info min=5390 cycles
+[PERF] syscall_sys_info median=5544 cycles
+[PERF] syscall_sys_info mean=5657 cycles
+[PERF] syscall_sys_info p99=7140 cycles
+[PERF] syscall_sys_info max=121926 cycles
+[PERF] syscall_sys_info stddev=2544 cycles
+[PERF] syscall_sys_info iterations=10000
+[PERF] syscall_pmu_info min=4746 cycles
+[PERF] syscall_pmu_info median=4886 cycles
+[PERF] syscall_pmu_info mean=4959 cycles
+[PERF] syscall_pmu_info p99=5054 cycles
+[PERF] syscall_pmu_info max=117390 cycles
+[PERF] syscall_pmu_info stddev=2266 cycles
+[PERF] syscall_pmu_info iterations=10000
+[PERF] syscall_getrandom_8 min=4844 cycles
+[PERF] syscall_getrandom_8 median=5026 cycles
+[PERF] syscall_getrandom_8 mean=5090 cycles
+[PERF] syscall_getrandom_8 p99=5194 cycles
+[PERF] syscall_getrandom_8 max=114436 cycles
+[PERF] syscall_getrandom_8 stddev=2325 cycles
+[PERF] syscall_getrandom_8 iterations=10000
+[PERF] syscall_set_priority_same min=7910 cycles
+[PERF] syscall_set_priority_same median=8064 cycles
+[PERF] syscall_set_priority_same mean=8177 cycles
+[PERF] syscall_set_priority_same p99=8218 cycles
+[PERF] syscall_set_priority_same max=120890 cycles
+[PERF] syscall_set_priority_same stddev=2914 cycles
+[PERF] syscall_set_priority_same iterations=10000
+[PERF] syscall_set_affinity_same min=7882 cycles
+[PERF] syscall_set_affinity_same median=7980 cycles
+[PERF] syscall_set_affinity_same mean=8116 cycles
+[PERF] syscall_set_affinity_same p99=8176 cycles
+[PERF] syscall_set_affinity_same max=118958 cycles
+[PERF] syscall_set_affinity_same stddev=3076 cycles
+[PERF] syscall_set_affinity_same iterations=10000
+[PERF] syscall_revoke_badh min=5474 cycles
+[PERF] syscall_revoke_badh median=5544 cycles
+[PERF] syscall_revoke_badh mean=5667 cycles
+[PERF] syscall_revoke_badh p99=6454 cycles
+[PERF] syscall_revoke_badh max=126280 cycles
+[PERF] syscall_revoke_badh stddev=2630 cycles
+[PERF] syscall_revoke_badh iterations=10000
+[PERF] syscall_thread_suspend_badh min=5488 cycles
+[PERF] syscall_thread_suspend_badh median=5544 cycles
+[PERF] syscall_thread_suspend_badh mean=5639 cycles
+[PERF] syscall_thread_suspend_badh p99=5670 cycles
+[PERF] syscall_thread_suspend_badh max=117726 cycles
+[PERF] syscall_thread_suspend_badh stddev=2545 cycles
+[PERF] syscall_thread_suspend_badh iterations=10000
+[PERF] syscall_thread_resume_badh min=5460 cycles
+[PERF] syscall_thread_resume_badh median=5544 cycles
+[PERF] syscall_thread_resume_badh mean=5676 cycles
+[PERF] syscall_thread_resume_badh p99=6440 cycles
+[PERF] syscall_thread_resume_badh max=121940 cycles
+[PERF] syscall_thread_resume_badh stddev=2850 cycles
+[PERF] syscall_thread_resume_badh iterations=10000
+[PERF] syscall_thread_kill_badh min=5516 cycles
+[PERF] syscall_thread_kill_badh median=5586 cycles
+[PERF] syscall_thread_kill_badh mean=5674 cycles
+[PERF] syscall_thread_kill_badh p99=5670 cycles
+[PERF] syscall_thread_kill_badh max=121632 cycles
+[PERF] syscall_thread_kill_badh stddev=2651 cycles
+[PERF] syscall_thread_kill_badh iterations=10000
+[PERF] syscall_mem_perms_badh min=5642 cycles
+[PERF] syscall_mem_perms_badh median=5698 cycles
+[PERF] syscall_mem_perms_badh mean=5805 cycles
+[PERF] syscall_mem_perms_badh p99=5838 cycles
+[PERF] syscall_mem_perms_badh max=116900 cycles
+[PERF] syscall_mem_perms_badh stddev=2649 cycles
+[PERF] syscall_mem_perms_badh iterations=10000
+[PERF] syscall_mem_shm_map_badh min=5516 cycles
+[PERF] syscall_mem_shm_map_badh median=5586 cycles
+[PERF] syscall_mem_shm_map_badh mean=5680 cycles
+[PERF] syscall_mem_shm_map_badh p99=5684 cycles
+[PERF] syscall_mem_shm_map_badh max=120442 cycles
+[PERF] syscall_mem_shm_map_badh stddev=2552 cycles
+[PERF] syscall_mem_shm_map_badh iterations=10000
+[PERF] syscall_mem_mmio_map_badh min=5558 cycles
+[PERF] syscall_mem_mmio_map_badh median=5642 cycles
+[PERF] syscall_mem_mmio_map_badh mean=5732 cycles
+[PERF] syscall_mem_mmio_map_badh p99=5754 cycles
+[PERF] syscall_mem_mmio_map_badh max=115878 cycles
+[PERF] syscall_mem_mmio_map_badh stddev=2428 cycles
+[PERF] syscall_mem_mmio_map_badh iterations=10000
+[PERF] syscall_mem_dma_map_badh min=5544 cycles
+[PERF] syscall_mem_dma_map_badh median=5628 cycles
+[PERF] syscall_mem_dma_map_badh mean=5706 cycles
+[PERF] syscall_mem_dma_map_badh p99=5698 cycles
+[PERF] syscall_mem_dma_map_badh max=116368 cycles
+[PERF] syscall_mem_dma_map_badh stddev=2408 cycles
+[PERF] syscall_mem_dma_map_badh iterations=10000
+[PERF] syscall_ioport_read_badh min=602 cycles
+[PERF] syscall_ioport_read_badh median=630 cycles
+[PERF] syscall_ioport_read_badh mean=640 cycles
+[PERF] syscall_ioport_read_badh p99=644 cycles
+[PERF] syscall_ioport_read_badh max=98490 cycles
+[PERF] syscall_ioport_read_badh stddev=1003 cycles
+[PERF] syscall_ioport_read_badh iterations=10000
+[PERF] syscall_ioport_write_badh min=616 cycles
+[PERF] syscall_ioport_write_badh median=630 cycles
+[PERF] syscall_ioport_write_badh mean=644 cycles
+[PERF] syscall_ioport_write_badh p99=658 cycles
+[PERF] syscall_ioport_write_badh max=110628 cycles
+[PERF] syscall_ioport_write_badh stddev=1129 cycles
+[PERF] syscall_ioport_write_badh iterations=10000
+[PERF] syscall_irq_ack_badh min=5502 cycles
+[PERF] syscall_irq_ack_badh median=5586 cycles
+[PERF] syscall_irq_ack_badh mean=5685 cycles
+[PERF] syscall_irq_ack_badh p99=5698 cycles
+[PERF] syscall_irq_ack_badh max=120960 cycles
+[PERF] syscall_irq_ack_badh stddev=2660 cycles
+[PERF] syscall_irq_ack_badh iterations=10000
+[PERF] syscall_pmu_start_badh min=5516 cycles
+[PERF] syscall_pmu_start_badh median=5600 cycles
+[PERF] syscall_pmu_start_badh mean=5701 cycles
+[PERF] syscall_pmu_start_badh p99=5810 cycles
+[PERF] syscall_pmu_start_badh max=116102 cycles
+[PERF] syscall_pmu_start_badh stddev=2614 cycles
+[PERF] syscall_pmu_start_badh iterations=10000
+[PERF] syscall_pmu_read_badh min=5558 cycles
+[PERF] syscall_pmu_read_badh median=5656 cycles
+[PERF] syscall_pmu_read_badh mean=5755 cycles
+[PERF] syscall_pmu_read_badh p99=5782 cycles
+[PERF] syscall_pmu_read_badh max=118454 cycles
+[PERF] syscall_pmu_read_badh stddev=2516 cycles
+[PERF] syscall_pmu_read_badh iterations=10000
+[PERF] syscall_pmu_reset_badh min=5544 cycles
+[PERF] syscall_pmu_reset_badh median=5600 cycles
+[PERF] syscall_pmu_reset_badh mean=5714 cycles
+[PERF] syscall_pmu_reset_badh p99=5754 cycles
+[PERF] syscall_pmu_reset_badh max=116340 cycles
+[PERF] syscall_pmu_reset_badh stddev=2522 cycles
+[PERF] syscall_pmu_reset_badh iterations=10000
+[PERF] syscall_pmu_stop_badh min=5516 cycles
+[PERF] syscall_pmu_stop_badh median=5586 cycles
+[PERF] syscall_pmu_stop_badh mean=5687 cycles
+[PERF] syscall_pmu_stop_badh p99=5712 cycles
+[PERF] syscall_pmu_stop_badh max=120400 cycles
+[PERF] syscall_pmu_stop_badh stddev=2608 cycles
+[PERF] syscall_pmu_stop_badh iterations=10000
+[PERF] syscall_fault_recv_nonblock min=4480 cycles
+[PERF] syscall_fault_recv_nonblock median=4522 cycles
+[PERF] syscall_fault_recv_nonblock mean=4612 cycles
+[PERF] syscall_fault_recv_nonblock p99=4816 cycles
+[PERF] syscall_fault_recv_nonblock max=120848 cycles
+[PERF] syscall_fault_recv_nonblock stddev=2432 cycles
+[PERF] syscall_fault_recv_nonblock iterations=10000
+[PERF] syscall_ipc_recv_nonblock min=4172 cycles
+[PERF] syscall_ipc_recv_nonblock median=4242 cycles
+[PERF] syscall_ipc_recv_nonblock mean=4307 cycles
+[PERF] syscall_ipc_recv_nonblock p99=4312 cycles
+[PERF] syscall_ipc_recv_nonblock max=113442 cycles
+[PERF] syscall_ipc_recv_nonblock stddev=2225 cycles
+[PERF] syscall_ipc_recv_nonblock iterations=10000
+[PERF] syscall_notify_wait_zero min=630 cycles
+[PERF] syscall_notify_wait_zero median=630 cycles
+[PERF] syscall_notify_wait_zero mean=646 cycles
+[PERF] syscall_notify_wait_zero p99=672 cycles
+[PERF] syscall_notify_wait_zero max=50232 cycles
+[PERF] syscall_notify_wait_zero stddev=539 cycles
+[PERF] syscall_notify_wait_zero iterations=10000
+[PERF] syscall_null_entry min=630 cycles
+[PERF] syscall_null_entry median=630 cycles
+[PERF] syscall_null_entry mean=647 cycles
+[PERF] syscall_null_entry p99=672 cycles
+[PERF] syscall_null_entry max=84868 cycles
+[PERF] syscall_null_entry stddev=869 cycles
+[PERF] syscall_null_entry iterations=10000
+[PERF] syscall_yield min=69720 cycles
+[PERF] syscall_yield median=70000 cycles
+[PERF] syscall_yield mean=70745 cycles
+[PERF] syscall_yield p99=95648 cycles
+[PERF] syscall_yield max=171906 cycles
+[PERF] syscall_yield stddev=4317 cycles
+[PERF] syscall_yield iterations=10000
+[PERF] syscall_yield cycles_per_op=0
+[PERF] syscall_yield instructions_per_op=0
+[PERF] syscall_yield cache_misses_per_op=0
+[PERF] thread_create min=402192 cycles
+[PERF] thread_create median=408996 cycles
+[PERF] thread_create mean=415781 cycles
+[PERF] thread_create p99=487298 cycles
+[PERF] thread_create max=516124 cycles
+[PERF] thread_create stddev=18049 cycles
+[PERF] thread_create iterations=1000
+[PERF] vm_exit_cycle min=153384 cycles
+[PERF] vm_exit_cycle median=154336 cycles
+[PERF] vm_exit_cycle mean=155902 cycles
+[PERF] vm_exit_cycle p99=194040 cycles
+[PERF] vm_exit_cycle max=223188 cycles
+[PERF] vm_exit_cycle stddev=6369 cycles
+[PERF] vm_exit_cycle iterations=1024
+[PASS] perf_vm_exit

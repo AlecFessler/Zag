@@ -57,6 +57,6 @@ fn parkLoop() void {
 /// Breakpoint target. Parent reads the first byte via `fault_read_mem`
 /// at runtime so the exact prologue doesn't matter — parent restores
 /// whatever was there before patching 0xCC in.
-fn hotLoop() void {
+noinline fn hotLoop() void {
     asm volatile ("nop" ::: .{ .memory = true });
 }

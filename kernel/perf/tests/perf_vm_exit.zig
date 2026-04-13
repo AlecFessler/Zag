@@ -22,6 +22,7 @@
 
 const lib = @import("lib");
 
+const bench = lib.bench;
 const perm_view = lib.perm_view;
 const syscall = lib.syscall;
 const testing = lib.testing;
@@ -80,16 +81,6 @@ var samples: [ITERS]u64 = .{0} ** ITERS;
 // Minimal guest: hlt; jmp $-3 (loops back to hlt after we advance rip past it).
 const tiny_guest = [_]u8{ 0xF4, 0xEB, 0xFD };
 
-inline fn rdtsc() u64 {
-    var lo: u32 = undefined;
-    var hi: u32 = undefined;
-    asm volatile ("rdtsc"
-        : [lo] "={eax}" (lo),
-          [hi] "={edx}" (hi),
-    );
-    return (@as(u64, hi) << 32) | @as(u64, lo);
-}
-
 fn die(msg: []const u8) noreturn {
     testing.fail("perf_vm_exit");
     syscall.write(msg);
@@ -124,40 +115,6 @@ fn setRealModeSegs(gs: *GuestState) void {
     gs.pat = 0x0007040600070406;
     gs.dr6 = 0xFFFF0FF0;
     gs.dr7 = 0x400;
-}
-
-fn cmpU64(_: void, a: u64, b: u64) bool {
-    return a < b;
-}
-
-fn sort(buf: []u64) void {
-    // Insertion sort — fine for a few thousand samples on a serial-bound
-    // microbench. Avoids pulling std.sort into a freestanding bin.
-    var i: usize = 1;
-    while (i < buf.len) {
-        const x = buf[i];
-        var j: usize = i;
-        while (j > 0 and buf[j - 1] > x) {
-            buf[j] = buf[j - 1];
-            j -= 1;
-        }
-        buf[j] = x;
-        i += 1;
-    }
-}
-
-fn perfLine(metric: []const u8, median: u64, p10: u64, p90: u64) void {
-    syscall.write("[PERF] ");
-    syscall.write(metric);
-    syscall.write(" median=");
-    testing.printDec(median);
-    syscall.write(" p10=");
-    testing.printDec(p10);
-    syscall.write(" p90=");
-    testing.printDec(p90);
-    syscall.write(" iters=");
-    testing.printDec(ITERS);
-    syscall.write(" cycles\n");
 }
 
 pub fn main(pv: u64) void {
@@ -200,20 +157,15 @@ pub fn main(pv: u64) void {
     // 6. Measurement loop — one rdtsc sample per full round trip.
     var i: u32 = 0;
     while (i < ITERS) {
-        const t0 = rdtsc();
+        const t0 = bench.rdtscp();
         if (!oneRoundTrip(vm_handle)) die("[PERF] vm_exit FAIL measured roundtrip");
-        const t1 = rdtsc();
+        const t1 = bench.rdtscp();
         samples[i] = t1 -% t0;
         i += 1;
     }
 
-    // 7. Report median / p10 / p90. Sorting in place is fine — we only
-    //    need the stats.
-    sort(samples[0..]);
-    const median = samples[ITERS / 2];
-    const p10 = samples[ITERS / 10];
-    const p90 = samples[(ITERS * 9) / 10];
-    perfLine("vm_exit_cycle", median, p10, p90);
+    // 7. Report using standard bench format.
+    bench.report("vm_exit_cycle", bench.computeStats(samples[0..], ITERS));
 
     testing.pass("perf_vm_exit");
     syscall.shutdown();

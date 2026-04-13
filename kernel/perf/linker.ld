@@ -1,0 +1,1 @@
+../tests/linker.ld

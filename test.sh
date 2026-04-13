@@ -190,7 +190,7 @@ run_router_tests() {
 run_perf_tests() {
     echo "=== Performance Tests ==="
     clean_nvvars
-    bash "$SCRIPT_DIR/kernel/tests/run_perf.sh"
+    bash "$SCRIPT_DIR/kernel/perf/run_perf.sh"
 }
 
 run_kernel_fuzzers() {

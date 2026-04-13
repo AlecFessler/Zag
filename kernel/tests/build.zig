@@ -202,12 +202,6 @@ pub fn build(b: *std.Build) void {
     const child_try_sys_cpu_power_bin = buildChild(b, target, lib_mod, "child_try_sys_cpu_power", "children/child_try_sys_cpu_power.zig");
     const child_vbar_non_mov_bin = buildChild(b, target, lib_mod, "child_vbar_non_mov", "children/child_vbar_non_mov.zig");
     const child_vbar_oob_read_bin = buildChild(b, target, lib_mod, "child_vbar_oob_read", "children/child_vbar_oob_read.zig");
-    const child_perf_ipc_echo_bin = buildChild(b, target, lib_mod, "child_perf_ipc_echo", "children/child_perf_ipc_echo.zig");
-    const child_perf_ipc_client_bin = buildChild(b, target, lib_mod, "child_perf_ipc_client", "children/child_perf_ipc_client.zig");
-    const child_perf_futex_waiter_bin = buildChild(b, target, lib_mod, "child_perf_futex_waiter", "children/child_perf_futex_waiter.zig");
-    const child_perf_workload_bin = buildChild(b, target, lib_mod, "child_perf_workload", "children/child_perf_workload.zig");
-    const child_perf_fault_int3_bin = buildChild(b, target, lib_mod, "child_perf_fault_int3", "children/child_perf_fault_int3.zig");
-    const child_perf_debug_target_bin = buildChild(b, target, lib_mod, "child_perf_debug_target", "children/child_perf_debug_target.zig");
 
     const embedded_wf = b.addWriteFiles();
     _ = embedded_wf.addCopyFile(child_exit_bin, "child_exit.elf");
@@ -351,12 +345,6 @@ pub fn build(b: *std.Build) void {
     _ = embedded_wf.addCopyFile(child_try_sys_cpu_power_bin, "child_try_sys_cpu_power.elf");
     _ = embedded_wf.addCopyFile(child_vbar_non_mov_bin, "child_vbar_non_mov.elf");
     _ = embedded_wf.addCopyFile(child_vbar_oob_read_bin, "child_vbar_oob_read.elf");
-    _ = embedded_wf.addCopyFile(child_perf_ipc_echo_bin, "child_perf_ipc_echo.elf");
-    _ = embedded_wf.addCopyFile(child_perf_ipc_client_bin, "child_perf_ipc_client.elf");
-    _ = embedded_wf.addCopyFile(child_perf_futex_waiter_bin, "child_perf_futex_waiter.elf");
-    _ = embedded_wf.addCopyFile(child_perf_workload_bin, "child_perf_workload.elf");
-    _ = embedded_wf.addCopyFile(child_perf_fault_int3_bin, "child_perf_fault_int3.elf");
-    _ = embedded_wf.addCopyFile(child_perf_debug_target_bin, "child_perf_debug_target.elf");
     const embed_src = embedded_wf.add("embedded_children.zig",
         \\pub const child_exit = @embedFile("child_exit.elf");
         \\pub const child_shm_counter = @embedFile("child_shm_counter.elf");
@@ -499,12 +487,6 @@ pub fn build(b: *std.Build) void {
         \\pub const child_try_sys_cpu_power = @embedFile("child_try_sys_cpu_power.elf");
         \\pub const child_vbar_non_mov = @embedFile("child_vbar_non_mov.elf");
         \\pub const child_vbar_oob_read = @embedFile("child_vbar_oob_read.elf");
-        \\pub const child_perf_ipc_echo = @embedFile("child_perf_ipc_echo.elf");
-        \\pub const child_perf_ipc_client = @embedFile("child_perf_ipc_client.elf");
-        \\pub const child_perf_futex_waiter = @embedFile("child_perf_futex_waiter.elf");
-        \\pub const child_perf_workload = @embedFile("child_perf_workload.elf");
-        \\pub const child_perf_fault_int3 = @embedFile("child_perf_fault_int3.elf");
-        \\pub const child_perf_debug_target = @embedFile("child_perf_debug_target.elf");
         \\
     );
 
@@ -523,8 +505,7 @@ pub fn build(b: *std.Build) void {
     while (it.next() catch @panic("Failed to iterate tests/")) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
-        if (!std.mem.startsWith(u8, entry.name, "s") and
-            !std.mem.startsWith(u8, entry.name, "perf_")) continue;
+        if (!std.mem.startsWith(u8, entry.name, "s")) continue;
 
         const stem = entry.name[0 .. entry.name.len - 4];
 

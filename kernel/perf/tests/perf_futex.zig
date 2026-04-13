@@ -150,31 +150,50 @@ fn benchCrossProcessWake(name: []const u8, waiter_affinity: u64) void {
     // Warmup
     var w: u32 = 0;
     while (w < 100) {
-        wakeOnce(shared);
+        _ = wakeOnce(shared);
         w += 1;
     }
 
-    // Measurement
+    // Measurement. Discard racy iterations where the waker beat the
+    // waiter into futex_wait — futex_wake returns 0, the waiter's wait
+    // fast-fails with E_AGAIN, and the measured delta is a tiny rdtscp
+    // pair instead of a real wake path. Without this guard, `min` is
+    // dominated by race samples (e.g. 1000 cycles vs ~90k for a real
+    // wake).
     var i: u32 = 0;
-    while (i < ITERATIONS) {
-        wakeOnce(shared);
+    var attempts: u32 = 0;
+    const MAX_ATTEMPTS: u32 = ITERATIONS * 4;
+    while (i < ITERATIONS and attempts < MAX_ATTEMPTS) {
+        attempts += 1;
+        if (!wakeOnce(shared)) continue;
         buf[i] = @atomicLoad(u64, &shared.measured_delta, .acquire);
         i += 1;
     }
+    const actual_iterations = i;
 
     // Tell waiter to exit
     @atomicStore(u64, &shared.exit, 1, .release);
     @atomicStore(u64, &shared.futex_val, 1, .release);
     _ = syscall.futex_wake(@ptrCast(&shared.futex_val), 1);
 
-    const result = bench.computeStats(buf, ITERATIONS);
-    bench.report(name, result);
+    if (actual_iterations > 0) {
+        const result = bench.computeStats(buf[0..actual_iterations], actual_iterations);
+        bench.report(name, result);
+    }
 
     _ = syscall.revoke_perm(waiter_handle);
     _ = syscall.revoke_perm(shm_handle);
 }
 
-fn wakeOnce(shared: *Shared) void {
+/// One wake round trip. Returns true if the wake actually woke a waiter.
+///
+/// The waiter sets `waiter_ready=1` BEFORE calling futex_wait (it can't
+/// signal from inside the kernel), so the waker can beat the waiter to
+/// sleep. When that happens futex_wake returns 0 (nobody queued) and the
+/// waiter's futex_wait fast-fails with E_AGAIN; the measured delta from
+/// that iteration is just "two rdtscps apart" cycles, not a real wake.
+/// Return the woken count so the caller can discard races.
+fn wakeOnce(shared: *Shared) bool {
     // Wait for waiter to announce it is armed in futex_wait.
     while (@atomicLoad(u64, &shared.waiter_ready, .acquire) == 0) {
         syscall.thread_yield();
@@ -183,7 +202,7 @@ fn wakeOnce(shared: *Shared) void {
 
     @atomicStore(u64, &shared.wake_timestamp, bench.rdtscp(), .release);
     @atomicStore(u64, &shared.futex_val, 1, .release);
-    _ = syscall.futex_wake(@ptrCast(&shared.futex_val), 1);
+    const woken = syscall.futex_wake(@ptrCast(&shared.futex_val), 1);
 
     // Wait for the waiter to record its delta for this round.
     while (@atomicLoad(u64, &shared.waiter_done, .acquire) == 0) {
@@ -196,4 +215,6 @@ fn wakeOnce(shared: *Shared) void {
     // with E_AGAIN and we never block on the real wake path.
     @atomicStore(u64, &shared.futex_val, 0, .release);
     @atomicStore(u64, &shared.waiter_done, 0, .release);
+
+    return woken > 0;
 }
