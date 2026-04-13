@@ -146,21 +146,10 @@ pub const VirtualMemoryManager = struct {
         }
     }
 
-    /// Returns a snapshot (value copy) of the VmNode covering `vaddr`,
-    /// if any. The snapshot is taken while holding `self.lock` so its
-    /// fields are consistent, but the returned value is decoupled from
-    /// the slab-allocated node — callers never dereference a stale
-    /// pointer if another core concurrently frees the node via
-    /// `sysMemUnmap`, `resetForRestart`, or VM teardown. The VmNode
-    /// slab (`type-stable` reuse) would otherwise race with page-fault
-    /// handlers and perms-walking syscalls and let them dispatch on
-    /// half-recycled freelist bytes (wrong-tag union read = arbitrary
-    /// kernel control flow).
-    pub fn findNode(self: *VirtualMemoryManager, vaddr: VAddr) ?VmNode {
+    pub fn findNode(self: *VirtualMemoryManager, vaddr: VAddr) ?*VmNode {
         self.lock.lock();
         defer self.lock.unlock();
-        const node = findNodeLocked(&self.tree, vaddr) orelse return null;
-        return node.*;
+        return findNodeLocked(&self.tree, vaddr);
     }
 
     fn findFreeRange(self: *VirtualMemoryManager, size: u64) !VAddr {
