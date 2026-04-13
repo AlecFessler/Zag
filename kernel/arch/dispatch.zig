@@ -276,6 +276,19 @@ pub fn alignStack(stack_top: VAddr) VAddr {
     return VAddr.fromInt(adjusted);
 }
 
+/// Install an early fault handler for boot-time exception capture.
+/// Used by the bootloader to catch faults during the exitBootServices →
+/// kernel handoff window. On x86-64 this is a no-op (UEFI's exception
+/// handler is adequate); on aarch64 it installs a minimal VBAR_EL1 that
+/// dumps ESR_EL1, FAR_EL1, ELR_EL1 to the PL011 UART and halts.
+pub fn installEarlyFaultHandler() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => aarch64.early_fault.installEarlyVbar(),
+        else => unreachable,
+    }
+}
+
 /// Called by the kernel entry point after the bootloader has already set SP
 /// to the kernel stack (via switchStackAndCall). Jumps to the trampoline
 /// with boot_info as the first argument.
@@ -311,18 +324,18 @@ pub inline fn switchStackAndCall(stack_top: VAddr, arg: u64, entry: u64) noretur
             );
         },
         .aarch64 => {
-            // Set MAIR_EL1 to our expected values before entering the kernel.
-            // UEFI's MAIR may have index 1 = Normal NC (0x44); ours needs
-            // index 0 = Device (0x00), index 1 = Normal WB (0xFF).
-            // The ISB + TLBI ensure the new MAIR takes effect and stale
-            // TLB entries using the old MAIR interpretation are flushed.
+            // Mask IRQ/FIQ/SError (UEFI's VBAR may be stale after exitBS),
+            // install our MAIR (index 1 = Normal WB), and flush TLBs so
+            // the first TTBR1 walk after this point uses our attributes.
+            // Then switch SP and branch to the kernel entry point.
             const mair: u64 = 0x00000000_0000FF00;
             asm volatile (
+                \\msr daifset, #0x7
+                \\isb
                 \\msr mair_el1, %[mair]
                 \\isb
-                \\dsb ishst
-                \\tlbi vmalle1is
-                \\dsb ish
+                \\tlbi vmalle1
+                \\dsb nsh
                 \\isb
                 \\mov sp, %[sp]
                 \\mov x0, %[arg]

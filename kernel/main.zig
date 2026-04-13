@@ -22,10 +22,12 @@ pub fn panic(
 }
 
 export fn kEntry(boot_info: *BootInfo) callconv(arch.cc()) noreturn {
+    arch.earlyDebugChar('K');
     arch.kEntry(boot_info, &kTrampoline);
 }
 
 export fn kTrampoline(boot_info: *BootInfo) callconv(arch.cc()) noreturn {
+    arch.earlyDebugChar('T');
     kMain(boot_info) catch {
         @panic("Exiting...");
     };
@@ -33,8 +35,11 @@ export fn kTrampoline(boot_info: *BootInfo) callconv(arch.cc()) noreturn {
 }
 
 fn kMain(boot_info: *BootInfo) !void {
+    arch.earlyDebugChar('M');
     arch.init();
+    arch.earlyDebugChar('m');
     try memory.init(boot_info.mmap);
+    arch.earlyDebugChar('h');
     try memory.initHeap();
     debug_info.init(boot_info.elf_blob.ptr, boot_info.elf_blob.len, boot_info.kaslr_slide, memory.heap_allocator);
     try arch.parseFirmwareTables(boot_info.xsdp_phys);

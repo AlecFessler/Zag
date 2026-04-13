@@ -689,9 +689,7 @@ pub fn enableKernelTranslation() void {
 }
 
 /// Set MAIR_EL1 to our expected attribute configuration and flush TLB.
-/// Must be called after UEFI boot services have exited, since changing MAIR
-/// invalidates the meaning of attr_indx in all existing PTEs (including
-/// UEFI's identity mapping in TTBR0).
+/// Called from arch.init() after the kernel is running on its own stack.
 ///
 /// MAIR_EL1 attribute indices (ARM ARM D13.2.97):
 ///   Index 0 = Device-nGnRnE (0x00)

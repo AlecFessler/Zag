@@ -368,6 +368,7 @@ pub fn main() uefi.Status {
     boot_info.stack_top = aligned_stack_top_virt;
     boot_info.framebuffer = framebuffer;
     boot_info.kaslr_slide = kaslr_slide;
+
     puts(dbg.exit_bs);
     boot_info.mmap = boot_protocol.getMmap(boot_services) orelse return .aborted;
     boot_services.exitBootServices(
@@ -381,6 +382,12 @@ pub fn main() uefi.Status {
         ) catch return .aborted;
     };
 
+    // Install our early fault handler only after exitBootServices.
+    // Replacing firmware exception vectors while boot services are
+    // still live can hijack the firmware's own internal exception
+    // paths and turn recoverable events into halts.
+    arch.installEarlyFaultHandler();
+
     // Final TLB flush after exitBootServices ensures all TTBR1 page table
     // entries are visible to the hardware walker before jumping to the kernel.
     arch.setKernelAddrSpace(kernel_table_root_phys);
@@ -388,7 +395,7 @@ pub fn main() uefi.Status {
     // the UEFI stack (loader_data) may be reclaimed — writing to it would
     // fault on KVM where memory is real hardware.
     arch.switchStackAndCall(
-        boot_info.stack_top,
+        aligned_stack_top_virt,
         @intFromPtr(boot_info),
         parsed_elf.entry.addr + kaslr_slide,
     );
