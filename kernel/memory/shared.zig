@@ -24,6 +24,11 @@ pub const SharedMemory = struct {
 
     pub fn create(num_bytes: u64) !*SharedMemory {
         if (num_bytes == 0) return error.InvalidSize;
+        // Bound num_bytes before narrowing to u32: a raw @intCast of
+        // `(num_bytes + PAGE4K - 1) / PAGE4K` panics for any num_bytes
+        // ≥ 2^44 in safety-checked builds (ring-0 DoS from any caller
+        // with mem_shm_create).
+        if (num_bytes > @as(u64, MAX_PAGES) * paging.PAGE4K) return error.TooManyPages;
         const num_pages: u32 = @intCast(
             std.mem.alignForward(u64, num_bytes, paging.PAGE4K) / paging.PAGE4K,
         );
