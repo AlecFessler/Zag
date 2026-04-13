@@ -316,9 +316,21 @@ fn vcpuEntryPoint() void {
     }
 }
 
+/// Verify [user_va, user_va+len) is entirely inside the user partition.
+/// Catches length overflow and the "last byte of user page, rest spills
+/// into kernel partition" case that the per-page walk would otherwise
+/// advance into blindly.
+fn checkUserRange(user_va: u64, len: usize) bool {
+    const end = std.math.add(u64, user_va, len) catch return false;
+    if (!zag.memory.address.AddrSpacePartition.user.contains(user_va)) return false;
+    if (end != user_va and !zag.memory.address.AddrSpacePartition.user.contains(end - 1)) return false;
+    return true;
+}
+
 /// Read a struct from userspace into a kernel buffer, handling cross-page boundaries.
 /// Pre-faults pages and resolves each page's physical address independently.
 fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
+    if (!checkUserRange(user_va, buf.len)) return false;
     var remaining: usize = buf.len;
     var dst_off: usize = 0;
     var src_va: u64 = user_va;
@@ -340,6 +352,7 @@ fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
 /// Write a kernel buffer to userspace, handling cross-page boundaries.
 /// Pre-faults pages and resolves each page's physical address independently.
 fn writeUserStruct(proc: *Process, user_va: u64, data: []const u8) bool {
+    if (!checkUserRange(user_va, data.len)) return false;
     var remaining: usize = data.len;
     var src_off: usize = 0;
     var dst_va: u64 = user_va;

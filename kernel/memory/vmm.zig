@@ -342,6 +342,19 @@ pub const VirtualMemoryManager = struct {
 
         const node = findNodeLocked(&self.tree, fault_vaddr) orelse return error.NoMapping;
 
+        // Rights check lives *above* the already-resolved fast path on
+        // purpose. Callers pre-fault with (is_write, is_exec) reflecting
+        // the access the kernel is about to make on behalf of the user
+        // (e.g. vmRecv pre-faults with is_write=true because it's going
+        // to physmap-write the exit message into the buffer). For
+        // already-backed SHM nodes the fast path would otherwise return
+        // ok without ever comparing those intent bits to node.rights,
+        // letting a process with R/O SHM use any "pre-fault + physmap
+        // write" syscall path to write through its own R/O mapping.
+        if (is_write and !node.rights.write) return error.PermissionDenied;
+        if (is_exec and !node.rights.execute) return error.PermissionDenied;
+        if (!is_write and !is_exec and !node.rights.read) return error.PermissionDenied;
+
         // Fast path: if the page is already backed (e.g., SHM/MMIO mapping,
         // a previously faulted-in private page), this is a no-op. Check this
         // before rejecting non-private nodes so callers can blindly pre-fault
@@ -352,9 +365,6 @@ pub const VirtualMemoryManager = struct {
         if (arch.resolveVaddr(self.addr_space_root, page_base) != null) return;
 
         if (node.kind != .private) return error.NotDemandPageable;
-        if (is_write and !node.rights.write) return error.PermissionDenied;
-        if (is_exec and !node.rights.execute) return error.PermissionDenied;
-        if (!is_write and !is_exec and !node.rights.read) return error.PermissionDenied;
 
         const pmm_iface = pmm.global_pmm.?.allocator();
         const page = pmm_iface.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
