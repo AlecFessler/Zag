@@ -16,9 +16,11 @@ pub fn main(_: u64) void {
     var msg: syscall.IpcMessage = .{};
     if (syscall.ipc_recv(true, &msg) != 0) return;
 
-    // Reply with hot loop address so parent can verify profiler accuracy
+    // Reply with hot loop address and main address so parent can
+    // verify profiler accuracy and compute ASLR load base
     const loop_addr = @intFromPtr(&hotLoop);
-    _ = syscall.ipc_reply(&.{loop_addr});
+    const main_addr = @intFromPtr(&main);
+    _ = syscall.ipc_reply(&.{ loop_addr, main_addr });
 
     // Start PMU with overflow threshold
     var info: syscall.PmuInfo = undefined;

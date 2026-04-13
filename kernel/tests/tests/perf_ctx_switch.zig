@@ -2,17 +2,27 @@ const lib = @import("lib");
 
 const bench = lib.bench;
 const syscall = lib.syscall;
-const t = lib.testing;
 
 const ITERATIONS: u32 = 5000;
 
+const Shared = struct {
+    partner_ready: u64 = 0,
+    timestamp: u64 = 0,
+    partner_timestamp: u64 = 0,
+    phase: u64 = 0,
+    done: u64 = 0,
+};
+
+var shared: Shared = .{};
+
 /// Measures context switch cost between two threads on the same core.
 /// Thread A writes TSC, yields. Thread B reads A's timestamp and writes
-/// its own, yields back. The delta is one context switch.
+/// its own, yields back. The delta is one yield-to-execute latency
+/// (includes syscall entry, scheduler decision, and context switch).
 pub fn main(_: u64) void {
-    var shared = Shared{};
+    shared = .{};
 
-    const rc = syscall.thread_create(&partnerEntry, @intFromPtr(&shared), 4);
+    const rc = syscall.thread_create(&partnerEntry, 0, 4);
     if (rc < 0) {
         syscall.write("[PERF] ctx_switch SKIP thread_create failed\n");
         syscall.shutdown();
@@ -59,19 +69,7 @@ pub fn main(_: u64) void {
     syscall.shutdown();
 }
 
-const Shared = struct {
-    partner_ready: u64 = 0,
-    timestamp: u64 = 0,
-    partner_timestamp: u64 = 0,
-    phase: u64 = 0,
-    done: u64 = 0,
-};
-
 fn partnerEntry() void {
-    const shared: *Shared = @ptrFromInt(asm volatile (""
-        : [ret] "={rdi}" (-> u64),
-    ));
-
     _ = syscall.set_affinity(1);
     _ = syscall.set_priority(syscall.PRIORITY_REALTIME);
 

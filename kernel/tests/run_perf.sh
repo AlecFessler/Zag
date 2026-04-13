@@ -18,7 +18,7 @@ mkdir -p "$RESULTS_DIR"
 # Build all test ELFs
 echo "Building test ELFs..."
 cd "$SCRIPT_DIR"
-zig build 2>/dev/null
+zig build
 
 # Create placeholder root_service.elf for kernel build
 first_elf=$(find "$BIN_DIR" -name 'perf_*.elf' | head -1)
@@ -31,7 +31,7 @@ cp "$first_elf" "$BIN_DIR/root_service.elf"
 # Build kernel
 echo "Building kernel..."
 cd "$ZAG_ROOT"
-zig build -Dprofile=test 2>/dev/null
+zig build -Dprofile=test
 echo ""
 
 run_one_bench() {

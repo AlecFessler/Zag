@@ -18,18 +18,14 @@ pub fn main(_: u64) void {
     };
     const buf = buf_ptr[0..ITERATIONS];
 
-    // Also need an array of addresses for the page fault benchmark
-    const addr_ptr = bench.allocBuf(ITERATIONS) orelse {
-        syscall.write("[PERF] mem_reserve SKIP alloc2 failed\n");
-        syscall.shutdown();
-    };
-    const addrs = addr_ptr[0..ITERATIONS];
-
     // --- mem_reserve benchmark ---
-    // Warmup
+    // Warmup (revoke handles to avoid exhausting 128-handle cap)
     var w: u32 = 0;
     while (w < 50) {
-        _ = syscall.mem_reserve(0, syscall.PAGE4K, 0x7);
+        const result = syscall.mem_reserve(0, syscall.PAGE4K, 0x7);
+        if (result.val >= 0) {
+            _ = syscall.revoke_perm(@intCast(result.val));
+        }
         w += 1;
     }
 
@@ -40,6 +36,8 @@ pub fn main(_: u64) void {
         const t1 = bench.rdtscp();
         if (result.val < 0) break;
         buf[i] = t1 -% t0;
+        // Free the handle so we don't exhaust the cap table
+        _ = syscall.revoke_perm(@intCast(result.val));
         i += 1;
     }
 
@@ -49,9 +47,18 @@ pub fn main(_: u64) void {
     }
 
     // --- Page fault benchmark ---
-    // Pre-reserve all pages
+    // Reserve pages (keep handles alive — we need the pages mapped).
+    // Limited to 100 iterations to stay within 128-handle cap
+    // (2 handles used by allocBuf above).
+    const FAULT_ITERS: u32 = 100;
+    const addr_ptr = bench.allocBuf(FAULT_ITERS) orelse {
+        syscall.write("[PERF] page_fault SKIP alloc failed\n");
+        syscall.shutdown();
+    };
+    const addrs = addr_ptr[0..FAULT_ITERS];
+
     var j: u32 = 0;
-    while (j < ITERATIONS) {
+    while (j < FAULT_ITERS) {
         const result = syscall.mem_reserve(0, syscall.PAGE4K, 0x7);
         if (result.val < 0) break;
         addrs[j] = result.val2;

@@ -63,6 +63,10 @@ pub fn runBench(config: BenchConfig, comptime body: fn () void) BenchResult {
     const buf_ptr: [*]u64 = @ptrFromInt(reserve_result.val2);
     const buf = buf_ptr[0..config.iterations];
 
+    // Pre-fault every page so demand paging doesn't pollute cache/TLB
+    // state between measurement iterations.
+    prefault(buf_ptr, config.iterations);
+
     // Warmup
     var w: u32 = 0;
     while (w < config.warmup) {
@@ -117,14 +121,28 @@ pub fn runBench(config: BenchConfig, comptime body: fn () void) BenchResult {
     return result;
 }
 
-/// Allocate a demand-paged buffer for sample storage.
+/// Allocate a demand-paged buffer for sample storage and pre-fault
+/// every page to avoid cache/TLB pollution during measurements.
 /// Returns null if allocation fails.
 pub fn allocBuf(count: u32) ?[*]u64 {
     const buf_bytes = @as(u64, count) * @sizeOf(u64);
     const buf_pages = (buf_bytes + syscall.PAGE4K - 1) / syscall.PAGE4K;
     const result = syscall.mem_reserve(0, buf_pages * syscall.PAGE4K, 0x3);
     if (result.val < 0) return null;
-    return @ptrFromInt(result.val2);
+    const ptr: [*]u64 = @ptrFromInt(result.val2);
+    prefault(ptr, count);
+    return ptr;
+}
+
+/// Touch one byte per page to fault in all backing pages.
+fn prefault(ptr: [*]u64, count: u32) void {
+    const base: [*]volatile u8 = @ptrCast(ptr);
+    const total_bytes = @as(u64, count) * @sizeOf(u64);
+    var off: u64 = 0;
+    while (off < total_bytes) {
+        _ = base[off];
+        off += syscall.PAGE4K;
+    }
 }
 
 // --- Statistics ---

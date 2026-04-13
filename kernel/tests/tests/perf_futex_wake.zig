@@ -2,17 +2,27 @@ const lib = @import("lib");
 
 const bench = lib.bench;
 const syscall = lib.syscall;
-const t = lib.testing;
 
 const ITERATIONS: u32 = 5000;
 
-/// Measures futex wake latency.
-/// Thread B futex_waits. Thread A stores TSC, futex_wakes.
+const Shared = struct {
+    futex_val: u64 = 0,
+    wake_timestamp: u64 = 0,
+    measured_delta: u64 = 0,
+    waiter_ready: u64 = 0,
+    waiter_done: u64 = 0,
+    exit: u64 = 0,
+};
+
+var shared: Shared = .{};
+
+/// Measures cross-core futex wake latency.
+/// Thread B (core 1) futex_waits. Thread A (core 0) stores TSC, futex_wakes.
 /// Thread B reads TSC on wake, stores delta.
 pub fn main(_: u64) void {
-    var shared = Shared{};
+    shared = .{};
 
-    const rc = syscall.thread_create(&waiterEntry, @intFromPtr(&shared), 4);
+    const rc = syscall.thread_create(&waiterEntry, 0, 4);
     if (rc < 0) {
         syscall.write("[PERF] futex_wake SKIP thread_create failed\n");
         syscall.shutdown();
@@ -75,20 +85,7 @@ pub fn main(_: u64) void {
     syscall.shutdown();
 }
 
-const Shared = struct {
-    futex_val: u64 = 0,
-    wake_timestamp: u64 = 0,
-    measured_delta: u64 = 0,
-    waiter_ready: u64 = 0,
-    waiter_done: u64 = 0,
-    exit: u64 = 0,
-};
-
 fn waiterEntry() void {
-    const shared: *Shared = @ptrFromInt(asm volatile (""
-        : [ret] "={rdi}" (-> u64),
-    ));
-
     _ = syscall.set_affinity(2);
     _ = syscall.set_priority(syscall.PRIORITY_REALTIME);
 

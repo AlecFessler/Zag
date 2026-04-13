@@ -12,12 +12,14 @@ pub const Profiler = struct {
     samples: [MAX_UNIQUE_SAMPLES]ProfileSample,
     num_unique: usize,
     total_samples: u64,
+    dropped_samples: u64,
 
     pub fn init() Profiler {
         return .{
             .samples = [_]ProfileSample{.{ .rip = 0, .count = 0 }} ** MAX_UNIQUE_SAMPLES,
             .num_unique = 0,
             .total_samples = 0,
+            .dropped_samples = 0,
         };
     }
 
@@ -36,6 +38,8 @@ pub const Profiler = struct {
         if (self.num_unique < MAX_UNIQUE_SAMPLES) {
             self.samples[self.num_unique] = .{ .rip = rip, .count = 1 };
             self.num_unique += 1;
+        } else {
+            self.dropped_samples += 1;
         }
     }
 
@@ -59,6 +63,10 @@ pub const Profiler = struct {
         syscall.write(name);
         syscall.write(" total_samples=");
         t.printDec(self.total_samples);
+        if (self.dropped_samples > 0) {
+            syscall.write(" dropped=");
+            t.printDec(self.dropped_samples);
+        }
         syscall.write("\n");
 
         // Top 20 entries
