@@ -154,7 +154,6 @@ pub fn init(firmware_mmap: MMap) !void {
     arch.earlyDebugChar('e');
 
     for (mmap) |entry| {
-        arch.earlyDebugChar('0' + @as(u8, @intFromEnum(entry.type)));
         if (entry.type != .free) continue;
 
         const entry_start_virt = VAddr.fromPAddr(PAddr.fromInt(entry.start_paddr), null);
@@ -186,11 +185,7 @@ pub fn init(firmware_mmap: MMap) !void {
             useable_range = entry_range.removeOverlap(low_memory_range);
         }
 
-        arch.earlyDebugChar('R');
-        arch.earlyDebugHex((useable_range.end - useable_range.start) / paging.PAGE4K);
-        arch.earlyDebugChar(':');
         buddy_allocator.addRegion(useable_range.start, useable_range.end);
-        arch.earlyDebugChar('/');
     }
     arch.earlyDebugChar('f');
 
