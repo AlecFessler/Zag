@@ -6,7 +6,14 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ZAG_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-TIMEOUT=30
+## Per-test QEMU wall-clock budget. Individual tests are tiny (boot kernel,
+## run one assertion, shutdown), so ~2s is plenty on an idle host — but
+## under `PARALLEL=8` on a 16-core / 32-thread box, 8x4=32 vCPUs oversubscribe
+## the host and a single assertion has been observed to take >30s to reach
+## its first serial write. The timeout needs to be large enough to absorb
+## that scheduling delay without masking real regressions; 120s is well
+## above anything a healthy assertion has produced in practice.
+TIMEOUT=120
 # Default to a single QEMU instance to keep agent runs from blowing up RAM.
 # Override interactively with `PARALLEL=16 bash run_tests.sh` for fast local runs.
 PARALLEL="${PARALLEL:-1}"

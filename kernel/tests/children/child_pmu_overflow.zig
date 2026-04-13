@@ -45,11 +45,16 @@ pub fn main(_: u64) void {
     };
     _ = syscall.pmu_start(self_thread, @intFromPtr(&cfg), 1);
 
-    // Burn cycles until the overflow faults us. Bound the loop so a
-    // kernel regression (overflow never delivered) surfaces as a
-    // thread_exit rather than a QEMU timeout — the parent test can
-    // then fail with a clear diagnostic.
-    var x: u64 = 0;
-    while (x < 10_000_000) : (x +%= 1) {}
-    syscall.thread_exit();
+    // Burn cycles until the overflow faults us. The loop is unbounded
+    // on purpose: under `PARALLEL=8` the host is oversubscribed and KVM
+    // can defer virtual-PMI injection long past any fixed iteration
+    // budget, causing the child to finish its work loop before the
+    // overflow ever reflects into the guest — which then surfaces as
+    // either a `thread_exit`-induced hang in the parent's blocking
+    // `fault_recv` or (for the self-handler variant) a spurious
+    // `illegal_instruction` trailer. If PMU delivery is truly broken,
+    // the per-assertion QEMU timeout in `run_tests.sh` is our backstop.
+    while (true) {
+        asm volatile ("pause" ::: .{ .memory = true });
+    }
 }

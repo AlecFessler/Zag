@@ -37,10 +37,7 @@ pub fn main(_: u64) void {
         lib.fault.illegalInstruction();
     }
 
-    // Burn events until the overflow faults us. Bound the loop so a
-    // kernel regression where the overflow is never delivered surfaces
-    // as `ud2` → illegal_instruction rather than a silent hang.
-    var x: u64 = 0;
-    while (x < 10_000_000) : (x +%= 1) {}
-    lib.fault.illegalInstruction();
+    while (true) {
+        asm volatile ("pause" ::: .{ .memory = true });
+    }
 }
