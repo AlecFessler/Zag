@@ -22,9 +22,12 @@ pub fn main(pv: u64) void {
     )));
 
     // Poll until the child transitions to dead_process (field0 is the
-    // CrashReason).
-    var spins: u64 = 0;
-    while (spins < 2_000_000) : (spins += 1) {
+    // CrashReason). The outer loop is unbounded on purpose: under
+    // `PARALLEL=8` host oversubscription can defer the virtual PMI for
+    // an arbitrarily long wall-clock window, and any fixed spin budget
+    // flakes as "child not killed". The per-assertion QEMU timeout in
+    // `run_tests.sh` is the backstop for a real kernel regression.
+    while (true) {
         for (0..128) |i| {
             const e = &view[i];
             if (e.entry_type != perm_view.ENTRY_TYPE_DEAD_PROCESS) continue;
@@ -53,7 +56,4 @@ pub fn main(pv: u64) void {
         }
         syscall.thread_yield();
     }
-
-    t.fail("§4.1.50 child not killed");
-    syscall.shutdown();
 }

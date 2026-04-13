@@ -369,8 +369,6 @@ fn pmiHandler(ctx: *cpu.Context) void {
 
     if (!delivered) {
         thread.process.kill(.pmu_overflow);
-        cpu.enableInterrupts();
-        cpu.halt();
     }
 
     cpu.enableInterrupts();
