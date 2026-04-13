@@ -185,16 +185,7 @@ pub fn init(firmware_mmap: MMap) !void {
             useable_range = entry_range.removeOverlap(low_memory_range);
         }
 
-        arch.earlyDebugChar('<');
-        arch.earlyDebugHex(useable_range.start);
-        arch.earlyDebugChar('-');
-        arch.earlyDebugHex(useable_range.end);
-        arch.earlyDebugChar('>');
-        // DEBUG: cap addRegion to first 1 MB of each range on aarch64 so
-        // the Pi-KVM Debug-mode buddy free loop completes in seconds rather
-        // than minutes. Revert before shipping.
-        const max_end = @min(useable_range.end, useable_range.start + 0x100000);
-        buddy_allocator.addRegion(useable_range.start, max_end);
+        buddy_allocator.addRegion(useable_range.start, useable_range.end);
     }
     arch.earlyDebugChar('f');
 
