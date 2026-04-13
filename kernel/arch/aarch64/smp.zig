@@ -251,15 +251,32 @@ fn createIdentityMapping(trampoline_pa: u64) !u64 {
 /// The entry_point is the physical address of secondaryEntry; context_id carries
 /// the physical address of SecondaryBootParams so the secondary can configure
 /// its MMU before accessing kernel VA code.
+///
+/// TODO(aarch64-smp): The MMU-enable trampoline (secondaryEntry +
+/// createIdentityMapping below) is WIP and not wired end-to-end. Secondaries
+/// that reach kernel VA code fault because the kernel uses high-VA while PSCI
+/// delivers the core with MMU off. Until the trampoline is finished, force
+/// BSP-only boot on aarch64 so the kernel test suite can run. This compiles
+/// out the secondary bringup loop while preserving the WIP code for a future
+/// iteration. `smpInitFull` is called only when `BSP_ONLY` is false.
+const BSP_ONLY: bool = true;
+
 pub fn smpInit() !void {
     arch.earlyDebugChar('S');
     arch.earlyDebugChar('m');
     arch.earlyDebugChar('p');
+    if (BSP_ONLY) {
+        arch.earlyDebugChar('1');
+        return;
+    }
+    try smpInitFull();
+}
+
+fn smpInitFull() !void {
     const core_count = gic.coreCount();
     arch.earlyDebugChar('c');
     arch.earlyDebugChar('=');
     arch.earlyDebugChar('0' + @as(u8, @intCast(core_count & 0xF)));
-    if (core_count <= 1) return;
 
     arch.earlyDebugChar('a');
     const pmm_iface = pmm.global_pmm.?.allocator();
