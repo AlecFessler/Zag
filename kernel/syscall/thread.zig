@@ -174,11 +174,10 @@ pub fn sysThreadSelf() i64 {
 
 pub fn sysThreadSuspend(thread_handle: u64) i64 {
     const proc = sched.currentProc();
-    const thr_entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
-    if (thr_entry.object != .thread) return E_BADCAP;
-    if (!thr_entry.threadHandleRights().@"suspend") return E_PERM;
-
-    const target = thr_entry.object.thread;
+    const pinned = proc.acquireThreadRef(thread_handle) orelse return E_BADCAP;
+    const target = pinned.thread;
+    defer target.releaseRef();
+    if (!pinned.entry.threadHandleRights().@"suspend") return E_PERM;
     const target_proc = target.process;
 
     target_proc.lock.lock();
@@ -246,11 +245,10 @@ pub fn sysThreadSuspend(thread_handle: u64) i64 {
 
 pub fn sysThreadResume(thread_handle: u64) i64 {
     const proc = sched.currentProc();
-    const thr_entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
-    if (thr_entry.object != .thread) return E_BADCAP;
-    if (!thr_entry.threadHandleRights().@"resume") return E_PERM;
-
-    const target = thr_entry.object.thread;
+    const pinned = proc.acquireThreadRef(thread_handle) orelse return E_BADCAP;
+    const target = pinned.thread;
+    defer target.releaseRef();
+    if (!pinned.entry.threadHandleRights().@"resume") return E_PERM;
     const target_proc = target.process;
 
     target_proc.lock.lock();
@@ -270,11 +268,10 @@ pub fn sysThreadResume(thread_handle: u64) i64 {
 
 pub fn sysThreadKill(thread_handle: u64) i64 {
     const proc = sched.currentProc();
-    const thr_entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
-    if (thr_entry.object != .thread) return E_BADCAP;
-    if (!thr_entry.threadHandleRights().kill) return E_PERM;
-
-    const target = thr_entry.object.thread;
+    const pinned = proc.acquireThreadRef(thread_handle) orelse return E_BADCAP;
+    const target = pinned.thread;
+    defer target.releaseRef();
+    if (!pinned.entry.threadHandleRights().kill) return E_PERM;
     const target_proc = target.process;
     const cur = sched.currentThread().?;
 

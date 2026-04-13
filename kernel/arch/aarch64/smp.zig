@@ -1,25 +1,25 @@
 //! AArch64 SMP (Symmetric Multi-Processing) initialization via PSCI.
 //!
 //! ARM secondary core bringup uses PSCI CPU_ON, which is fundamentally
-//! different from x86's INIT-SIPI-SIPI sequence. There is no assembly
-//! trampoline — PSCI takes a target MPIDR and an entry point address,
-//! and firmware brings the core to that entry in EL1.
+//! different from x86's INIT-SIPI-SIPI sequence. PSCI takes a target MPIDR
+//! and a physical entry point address, and firmware brings the core to that
+//! entry in EL1 with the MMU off.
+//!
+//! Because the secondary starts with MMU disabled, a trampoline is needed
+//! to configure TTBR0 (identity mapping), TTBR1 (kernel mapping), TCR,
+//! MAIR, and SCTLR before jumping to kernel VA code. This is analogous
+//! to Linux's __secondary_switch / __enable_mmu sequence (arch/arm64/kernel/head.S).
 //!
 //! Boot sequence:
 //! 1. BSP discovers cores from ACPI MADT GIC CPU Interface structures.
-//! 2. For each secondary core:
+//! 2. BSP creates a minimal identity mapping (TTBR0) covering the trampoline PA.
+//! 3. BSP captures system register state (TCR, MAIR, SCTLR, TTBR1, VBAR).
+//! 4. For each secondary core:
 //!    a. Allocate a per-core kernel stack.
-//!    b. Call PSCI CPU_ON (function ID 0xC4000003):
-//!       - x0 = function ID (0xC4000003 for 64-bit)
-//!       - x1 = target MPIDR (affinity fields from MADT)
-//!       - x2 = entry point address (kernel function pointer)
-//!       - x3 = context ID (passed to entry as x0, can be per-core data ptr)
-//!       Invoke via SMC or HVC depending on PSCI conduit.
-//!    c. Secondary wakes in EL1 at the entry point with MMU state
-//!       determined by firmware (usually MMU off — the entry stub must
-//!       enable it and install the kernel page tables).
-//! 3. Secondary core initializes: install VBAR_EL1, configure TTBR1_EL1,
-//!    enable GIC CPU interface, then enter scheduler.
+//!    b. Fill SecondaryBootParams with stack VA and core index.
+//!    c. Call PSCI CPU_ON with the trampoline PA as entry and params PA
+//!       as context_id (delivered in x0).
+//!    d. Trampoline enables MMU, then branches to kernel VA secondarySetup.
 //!
 //! PSCI CPU_ON return values (DEN0022D, Table 10):
 //!   0            = SUCCESS
@@ -32,11 +32,16 @@
 //! References:
 //! - ARM DEN 0022D: PSCI 1.1, Section 5.4 (CPU_ON)
 //! - ACPI 6.5, Table 5-45: MADT GIC CPU Interface Structure
+//! - ARM ARM D13.2.118: SCTLR_EL1
+//! - ARM ARM D13.2.131: TCR_EL1
+//! - ARM ARM D13.2.97: MAIR_EL1
+//! - ARM ARM D13.2.136: TTBR0_EL1, TTBR1_EL1
 
 const std = @import("std");
 const zag = @import("zag");
 
 // Module aliases — alphabetical
+const aarch64_paging = zag.arch.aarch64.paging;
 const arch = zag.arch.dispatch;
 const cpu = zag.arch.aarch64.cpu;
 const exceptions = zag.arch.aarch64.exceptions;
@@ -51,6 +56,7 @@ const stack_mod = zag.memory.stack;
 // Type aliases — alphabetical
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
+const PageEntry = aarch64_paging.PageEntry;
 const VAddr = zag.memory.address.VAddr;
 
 /// Maximum number of cores supported.
@@ -64,8 +70,7 @@ var mpidr_table: [MAX_CORES]u64 = [_]u64{0} ** MAX_CORES;
 /// Whether each MPIDR entry has been set by ACPI parsing.
 var mpidr_valid: [MAX_CORES]bool = [_]bool{false} ** MAX_CORES;
 
-/// Per-core stack top addresses, passed via context_id to the secondary entry point.
-/// DEN0022D, Section 5.1.4: context_id is delivered in x0 to the target core.
+/// Per-core stack top addresses (kernel VA), indexed by logical core ID.
 var core_stack_tops: [MAX_CORES]u64 = [_]u64{0} ** MAX_CORES;
 
 /// Number of secondary cores successfully brought online.
@@ -78,6 +83,28 @@ const KERNEL_PERMS = MemoryPerms{
     .global_perm = .global,
     .privilege_perm = .kernel,
 };
+
+/// Boot parameters passed to secondary cores via PSCI context_id (x0).
+/// The secondary reads this struct at its physical address with MMU off,
+/// then uses the values to configure system registers and enable the MMU.
+///
+/// Field offsets must match the assembly in secondaryEntry exactly.
+const SecondaryBootParams = extern struct {
+    ttbr0: u64, // offset 0:  Identity mapping page table PA (TTBR0_EL1)
+    ttbr1: u64, // offset 8:  Kernel page table PA (TTBR1_EL1)
+    tcr: u64, // offset 16: TCR_EL1 value
+    mair: u64, // offset 24: MAIR_EL1 value
+    sctlr: u64, // offset 32: SCTLR_EL1 value (MMU enabled)
+    sp: u64, // offset 40: Stack pointer (kernel VA, 16-byte aligned)
+    entry: u64, // offset 48: secondarySetup function pointer (kernel VA)
+    core_idx: u64, // offset 56: Logical core index
+    vbar: u64, // offset 64: VBAR_EL1 value (exception vector table)
+};
+
+/// Boot params — static global, PA resolved via page table walk.
+/// Using a static avoids potential PMM/physmap VA→PA translation issues.
+var boot_params_storage: SecondaryBootParams align(64) = std.mem.zeroes(SecondaryBootParams);
+var boot_params_pa: u64 = 0;
 
 /// Store the MPIDR affinity value for a core. Called by ACPI MADT parsing
 /// when processing GIC CPU Interface structures (ACPI 6.5, Table 5-45).
@@ -102,16 +129,128 @@ fn getMpidr(core_idx: usize) u64 {
     return core_idx;
 }
 
+// ── System register readers ─────────────────────────────────────────────
+
+/// ARM ARM D13.2.131: TCR_EL1 — Translation Control Register.
+fn readTcr() u64 {
+    return asm volatile ("mrs %[ret], tcr_el1"
+        : [ret] "=r" (-> u64),
+    );
+}
+
+/// ARM ARM D13.2.97: MAIR_EL1 — Memory Attribute Indirection Register.
+fn readMair() u64 {
+    return asm volatile ("mrs %[ret], mair_el1"
+        : [ret] "=r" (-> u64),
+    );
+}
+
+/// ARM ARM D13.2.118: SCTLR_EL1 — System Control Register.
+fn readSctlr() u64 {
+    return asm volatile ("mrs %[ret], sctlr_el1"
+        : [ret] "=r" (-> u64),
+    );
+}
+
+/// ARM ARM D1.10.2: VBAR_EL1 — Vector Base Address Register.
+fn readVbar() u64 {
+    return asm volatile ("mrs %[ret], vbar_el1"
+        : [ret] "=r" (-> u64),
+    );
+}
+
+// ── Identity mapping ────────────────────────────────────────────────────
+
+/// Create a minimal identity mapping for the trampoline's physical address
+/// and the first 1GB (containing PL011 UART at PA 0x09000000).
+///
+/// Allocates two pages: an L0 (PGD) table and an L1 (PUD) table. The L1
+/// table contains 1GB block descriptors that identity-map the GB containing
+/// the trampoline PA as Normal memory, and the [0, 1GB) range as Device
+/// memory (for PL011 UART access via earlyDebugChar).
+///
+/// This identity mapping is loaded into TTBR0_EL1 on the secondary so that
+/// after the MMU is enabled, instruction fetch continues at the same PA
+/// and early debug output via PL011 at 0x09000000 still works.
+///
+/// ARM ARM D5.3, Table D5-15: Level 1 block descriptors map 1GB regions.
+fn createIdentityMapping(trampoline_pa: u64) !u64 {
+    const pmm_iface = pmm.global_pmm.?.allocator();
+
+    // Allocate and zero L0 table (PGD)
+    const l0_page = try pmm_iface.create(paging.PageMem(.page4k));
+    @memset(std.mem.asBytes(l0_page), 0);
+    const l0_va = @intFromPtr(l0_page);
+    const l0_pa = PAddr.fromVAddr(VAddr.fromInt(l0_va), null).addr;
+
+    // Allocate and zero L1 table (PUD)
+    const l1_page = try pmm_iface.create(paging.PageMem(.page4k));
+    @memset(std.mem.asBytes(l1_page), 0);
+    const l1_va = @intFromPtr(l1_page);
+    const l1_pa = PAddr.fromVAddr(VAddr.fromInt(l1_va), null).addr;
+
+    // L0 table descriptor pointing to L1.
+    // ARM ARM D5.3: Table descriptor at level 0 — bits [1:0] = 0b11.
+    const l0_idx: usize = @intCast(trampoline_pa >> 39);
+    const l0_table: *[512]PageEntry = @ptrFromInt(l0_va);
+    var l0_entry = PageEntry{
+        .valid = true,
+        .is_table = true,
+        .af = true,
+    };
+    l0_entry.setPAddr(PAddr.fromInt(l1_pa));
+    l0_table[l0_idx] = l0_entry;
+
+    const l1_table: *[512]PageEntry = @ptrFromInt(l1_va);
+
+    // L1 block descriptor: 1GB identity mapping for the trampoline code.
+    // ARM ARM D5.3: Block descriptor at level 1 — bits [1:0] = 0b01.
+    // AttrIndx=1 (Normal WB, matching our MAIR layout).
+    const l1_idx: usize = @intCast((trampoline_pa >> 30) & 0x1FF);
+    const block_pa = trampoline_pa & ~@as(u64, 0x3FFFFFFF); // 1GB aligned
+    var l1_entry = PageEntry{
+        .valid = true,
+        .is_table = false, // Block descriptor, not table
+        .attr_indx = 1, // Normal Write-Back (MAIR index 1)
+        .ap = 0b00, // EL1 RW, EL0 no access
+        .sh = 0b11, // Inner Shareable
+        .af = true, // Access Flag set
+    };
+    l1_entry.setPAddr(PAddr.fromInt(block_pa));
+    l1_table[l1_idx] = l1_entry;
+
+    // Also identity-map [0, 1GB) as Device memory so earlyDebugChar can
+    // write to PL011 at PA 0x09000000 after the secondary enables MMU.
+    // On QEMU virt, the [0, 1GB) range contains MMIO devices, not RAM.
+    if (l1_idx != 0) {
+        var dev_entry = PageEntry{
+            .valid = true,
+            .is_table = false, // Block descriptor
+            .attr_indx = 0, // Device-nGnRnE (MAIR index 0)
+            .ap = 0b00, // EL1 RW, EL0 no access
+            .sh = 0b00, // Non-shareable (device memory)
+            .af = true, // Access Flag set
+            .xn = true, // Execute Never (device MMIO)
+            .pxn = true, // Privileged Execute Never
+        };
+        dev_entry.setPAddr(PAddr.fromInt(0));
+        l1_table[0] = dev_entry;
+    }
+
+    return l0_pa;
+}
+
 /// Boot all secondary cores discovered by ACPI via PSCI CPU_ON.
 ///
 /// For each secondary core (1..N-1):
 /// 1. Allocate and map a per-core kernel stack.
-/// 2. Issue PSCI CPU_ON with the core's MPIDR and the secondary entry point.
+/// 2. Issue PSCI CPU_ON with the core's MPIDR and the trampoline entry point.
 /// 3. Wait for the core to signal it is online.
 ///
 /// DEN0022D, Section 5.1.4: CPU_ON takes target_mpidr, entry_point, context_id.
 /// The entry_point is the physical address of secondaryEntry; context_id carries
-/// the core index so the secondary can locate its stack.
+/// the physical address of SecondaryBootParams so the secondary can configure
+/// its MMU before accessing kernel VA code.
 pub fn smpInit() !void {
     arch.earlyDebugChar('S');
     arch.earlyDebugChar('m');
@@ -126,10 +265,9 @@ pub fn smpInit() !void {
     const pmm_iface = pmm.global_pmm.?.allocator();
     arch.earlyDebugChar('b');
 
-    // The secondary entry must be called at its physical address since
-    // firmware may deliver the core with MMU off. secondaryEntry lives in the
-    // kernel_code VA range (TTBR1), so walk the kernel page tables to find
-    // its physical load address (cannot use physmap subtraction here).
+    // Resolve the trampoline's physical address. secondaryEntry is linked at
+    // a kernel VA (TTBR1 range) — walk the kernel page tables to find the PA
+    // that PSCI needs for the entry_point argument.
     const entry_vaddr = @intFromPtr(&secondaryEntry);
     arch.earlyDebugChar('c');
     arch.earlyDebugHex(entry_vaddr);
@@ -144,6 +282,56 @@ pub fn smpInit() !void {
     const entry_paddr = entry_page_paddr.addr | (entry_vaddr & 0xFFF);
     arch.earlyDebugChar('d');
     arch.earlyDebugHex(entry_paddr);
+
+    // Create a minimal identity mapping so the trampoline can still execute
+    // after enabling the MMU (TTBR0 maps the trampoline PA as VA == PA).
+    const idmap_ttbr0 = createIdentityMapping(entry_paddr) catch {
+        arch.earlyDebugChar('!');
+        arch.earlyDebugChar('I');
+        return;
+    };
+    arch.earlyDebugChar('e');
+    arch.earlyDebugHex(idmap_ttbr0);
+
+    // Resolve the PA of the static boot params struct by walking the
+    // kernel page tables. This avoids relying on physmap VA→PA arithmetic
+    // which may produce a PA the secondary can't read with MMU off.
+    const params_vaddr = @intFromPtr(&boot_params_storage);
+    const params_page_paddr = arch.resolveVaddr(
+        memory_init.kernel_addr_space_root,
+        VAddr.fromInt(params_vaddr),
+    ) orelse {
+        arch.earlyDebugChar('!');
+        arch.earlyDebugChar('P');
+        return;
+    };
+    boot_params_pa = params_page_paddr.addr | (params_vaddr & 0xFFF);
+    arch.earlyDebugChar('f');
+    arch.earlyDebugHex(boot_params_pa);
+
+    // Capture BSP system register state for secondaries.
+    boot_params_storage.ttbr0 = idmap_ttbr0;
+    boot_params_storage.ttbr1 = aarch64_paging.readTtbr1();
+    boot_params_storage.tcr = readTcr();
+    boot_params_storage.mair = readMair();
+    boot_params_storage.sctlr = readSctlr();
+    boot_params_storage.entry = @intFromPtr(&secondarySetup);
+    boot_params_storage.vbar = readVbar();
+    arch.earlyDebugChar('g');
+    arch.earlyDebugHex(boot_params_storage.entry);
+
+    // Flush the params to main memory so the secondary can read them
+    // with MMU off. DC CVAC cleans the cache line to the Point of Coherency.
+    var clean_addr = params_vaddr;
+    while (clean_addr < params_vaddr + @sizeOf(SecondaryBootParams)) {
+        asm volatile ("dc cvac, %[va]"
+            :
+            : [va] "r" (clean_addr),
+            : .{ .memory = true }
+        );
+        clean_addr += 64;
+    }
+    asm volatile ("dsb ish" ::: .{ .memory = true });
 
     var core_idx: usize = 1;
     while (core_idx < core_count) {
@@ -185,13 +373,29 @@ pub fn smpInit() !void {
             continue;
         }
 
-        // Store the aligned stack top for the secondary to pick up.
-        // AArch64 requires 16-byte stack alignment (AAPCS64, Section 6.2.2).
-        core_stack_tops[core_idx] = arch.alignStack(ap_stack.top).addr;
+        // Fill in per-core boot params. AArch64 requires 16-byte stack
+        // alignment (AAPCS64, Section 6.2.2).
+        boot_params_storage.sp = arch.alignStack(ap_stack.top).addr;
+        boot_params_storage.core_idx = core_idx;
+
+        // Flush the updated params to main memory so the secondary can
+        // read them with MMU off (non-cacheable access).
+        {
+            const pva = @intFromPtr(&boot_params_storage);
+            var ca = pva;
+            while (ca < pva + @sizeOf(SecondaryBootParams)) {
+                asm volatile ("dc cvac, %[va]"
+                    :
+                    : [va] "r" (ca),
+                    : .{ .memory = true }
+                );
+                ca += 64;
+            }
+        }
+        asm volatile ("dsb ish" ::: .{ .memory = true });
 
         // DEN0022D, Section 5.1.4: CPU_ON — context_id (x3) is passed to the
-        // target core in x0. We pass the core index so the secondary can
-        // retrieve its stack and identify itself.
+        // target core in x0. We pass the PA of the boot params struct.
         const expected = cores_online.load(.acquire);
         arch.earlyDebugChar('[');
         arch.earlyDebugChar('0' + @as(u8, @intCast(core_idx & 0xF)));
@@ -199,7 +403,7 @@ pub fn smpInit() !void {
         arch.earlyDebugHex(target_mpidr);
         arch.earlyDebugChar('e');
         arch.earlyDebugHex(entry_paddr);
-        const ret = power.cpuOn(target_mpidr, entry_paddr, @intCast(core_idx));
+        const ret = power.cpuOn(target_mpidr, entry_paddr, boot_params_pa);
         arch.earlyDebugChar('r');
         arch.earlyDebugHex(@as(u64, @bitCast(ret)));
         arch.earlyDebugChar(']');
@@ -214,9 +418,11 @@ pub fn smpInit() !void {
         // Spin-wait for the secondary to signal it is online.
         // Use a bounded wait to avoid hanging if a core fails to start.
         var spin_count: u64 = 0;
-        const max_spins: u64 = 1_000_000;
+        const max_spins: u64 = 10_000_000;
         while (cores_online.load(.acquire) == expected) {
             if (spin_count >= max_spins) {
+                arch.earlyDebugChar('!');
+                arch.earlyDebugChar('T');
                 stack_mod.destroyKernel(ap_stack, memory_init.kernel_addr_space_root);
                 break;
             }
@@ -228,49 +434,96 @@ pub fn smpInit() !void {
     }
 }
 
-/// Secondary core entry point (naked). Called by firmware after PSCI CPU_ON.
+/// Secondary core MMU-enable trampoline (naked).
+///
+/// Called by firmware after PSCI CPU_ON with MMU off. x0 holds the
+/// physical address of SecondaryBootParams (passed as context_id).
 ///
 /// DEN0022D, Section 5.1.4: The target core begins execution at the entry
-/// point address with context_id in x0. The core is in AArch64 EL1 with
-/// MMU state determined by firmware.
+/// point address with context_id in x0, in AArch64 EL1 with MMU off.
 ///
-/// This is naked because we must set up the stack before any Zig code
-/// can run. x0 = core_idx (context_id from CPU_ON).
+/// The trampoline:
+/// 1. Loads all boot params from the struct at PA in x0.
+/// 2. Configures MAIR, TCR, TTBR0 (identity mapping), TTBR1 (kernel).
+/// 3. Enables the MMU via SCTLR_EL1.
+/// 4. Installs VBAR_EL1, sets SP, and branches to secondarySetup at kernel VA.
 fn secondaryEntry() callconv(.naked) noreturn {
-    // x0 = core_idx from PSCI. Load the pre-allocated stack top and set SP,
-    // then branch to the Zig setup function with core_idx still in x0.
-    //
-    // Instrumentation: write directly to PL011 at PA 0x09000000. Works with
-    // MMU off (PA == VA) and with MMU on if the BSP's mappings also cover it.
     asm volatile (
-        \\mov x9, #0x09000000
-        \\mov w10, #0x21      // '!'
-        \\str w10, [x9]
-        \\adrp x1, %[stacks]
-        \\add x1, x1, :lo12:%[stacks]
-        \\ldr x1, [x1, x0, lsl #3]
-        \\mov w10, #0x40      // '@'
-        \\str w10, [x9]
-        \\mov sp, x1
-        \\mov w10, #0x23      // '#'
-        \\str w10, [x9]
-        \\b %[setup]
-        :
-        : [stacks] "S" (&core_stack_tops),
-          [setup] "S" (&secondarySetup),
+    // x0 = PA of SecondaryBootParams (from PSCI context_id)
+    // MMU is off — all memory access uses physical addresses.
+    // Debug: PL011 UART at PA 0x09000000 (QEMU virt machine).
+        \\mov x10, #0x09000000
+        \\mov w11, #0x61             // 'a' — trampoline entered
+        \\str w11, [x10]
+        \\
+    // Load all params into registers before touching system registers.
+    // SecondaryBootParams layout: ttbr0(0), ttbr1(8), tcr(16), mair(24),
+    // sctlr(32), sp(40), entry(48), core_idx(56), vbar(64).
+        \\ldp x1, x2, [x0, #0]
+        \\ldp x3, x4, [x0, #16]
+        \\ldp x5, x6, [x0, #32]
+        \\ldp x7, x8, [x0, #48]
+        \\ldr x9, [x0, #64]
+        \\mov w11, #0x62             // 'b' — params loaded
+        \\str w11, [x10]
+        \\
+        // Configure memory attributes (ARM ARM D13.2.97).
+        \\msr mair_el1, x4
+        \\isb
+        \\mov w11, #0x63             // 'c' — MAIR set
+        \\str w11, [x10]
+        \\
+        // Configure translation control (ARM ARM D13.2.131).
+        \\msr tcr_el1, x3
+        \\isb
+        \\mov w11, #0x64             // 'd' — TCR set
+        \\str w11, [x10]
+        \\
+        // Install page tables (ARM ARM D13.2.136).
+        // TTBR0: identity mapping (VA == PA for this trampoline).
+        // TTBR1: kernel mapping (same as BSP).
+        \\msr ttbr0_el1, x1
+        \\msr ttbr1_el1, x2
+        \\isb
+        \\mov w11, #0x65             // 'e' — TTBRs set
+        \\str w11, [x10]
+        \\
+        // Enable MMU. SCTLR_EL1.M (bit 0) = 1.
+        // The identity mapping in TTBR0 ensures the next instruction
+        // fetch succeeds at the same PA after translation is enabled.
+        \\msr sctlr_el1, x5
+        \\isb
+        \\mov w11, #0x66             // 'f' — MMU enabled
+        \\str w11, [x10]
+        \\
+        // MMU is now on. PC is still at the trampoline's PA, which is
+        // identity-mapped via TTBR0. Install exception vectors, set
+        // the kernel stack, and jump to kernel VA.
+        \\msr vbar_el1, x9
+        \\mov sp, x6
+        \\mov x0, x8
+        \\mov w11, #0x67             // 'g' — about to jump to VA
+        \\str w11, [x10]
+        \\
+        // Test stack access before jumping to VA. Store and load
+        // a word at [sp, #-16] to verify the stack mapping works.
+        \\mov x12, #0xDEAD
+        \\str x12, [sp, #-16]!
+        \\ldr x13, [sp], #16
+        \\mov w11, #0x68             // 'h' — stack access OK
+        \\str w11, [x10]
+        \\br x7
     );
 }
 
-/// Secondary core setup after stack is established.
-/// Called from secondaryEntry with core_idx in x0.
+/// Secondary core setup after MMU is enabled and stack is established.
+/// Called from secondaryEntry with core_idx in x0, running at kernel VA.
 fn secondarySetup(core_idx: u64) callconv(.c) noreturn {
     arch.earlyDebugChar('$');
-    // Install exception vectors for this core (each core has its own VBAR_EL1).
-    exceptions.install();
-    arch.earlyDebugChar('%');
 
     // Initialize the GIC redistributor and CPU interface for this core.
     gic.initSecondaryCoreGic(@intCast(core_idx));
+    arch.earlyDebugChar('%');
 
     // Signal to the BSP that this core is online.
     _ = cores_online.fetchAdd(1, .release);
@@ -278,7 +531,6 @@ fn secondarySetup(core_idx: u64) callconv(.c) noreturn {
     // Initialize per-core scheduler state (idle thread, running thread).
     sched.perCoreInit();
 
-    // Enter the idle loop. Full scheduler integration will replace this
-    // with the scheduler's own idle path.
+    // Enter the idle loop.
     cpu.halt();
 }

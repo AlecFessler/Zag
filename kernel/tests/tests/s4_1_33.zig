@@ -47,9 +47,11 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
 
-    // Read 2 bytes from the faulting RIP. They must be the null-deref opcode
-    // `movb (%rax), %al` (0x8a 0x00). A stub returning E_OK with zeros would
-    // get 0x00 in buf[0] and fail this check.
+    // Read 2 bytes from the faulting RIP. The null-deref is a volatile byte
+    // load: `movb (reg), %al` which encodes as 0x8a followed by a ModRM byte.
+    // The ModRM byte depends on register allocation (0x00 for %rax, 0x02 for
+    // %rdx, etc.), so we only check the opcode. A stub returning E_OK with
+    // zeros would get 0x00 in buf[0] and fail this check.
     var buf: [2]u8 = .{ 0xff, 0xff };
     const rc = syscall.fault_read_mem(proc_handle, fault_msg.rip, @intFromPtr(&buf), 2);
     if (rc != 0) {
@@ -58,7 +60,7 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
 
-    if (buf[0] == 0x8a and buf[1] == 0x00) {
+    if (buf[0] == 0x8a) {
         t.pass("§4.1.33");
     } else {
         t.fail("§4.1.33 wrong bytes read");
