@@ -394,13 +394,18 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
 pub fn sysFaultReadMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64 {
     const proc = sched.currentProc();
     if (proc_handle == 0) return E_PERM;
-    const entry = proc.getPermByHandle(proc_handle) orelse return E_BADCAP;
+    // Pin the target Process across the whole read: a racing revoke_perm
+    // on the same handle could otherwise drop the last external ref and
+    // free the target out from under our physmap walk.
+    const ref = proc.acquireProcessRef(proc_handle) orelse return E_BADCAP;
+    defer ref.process.releaseRef();
+    const entry = ref.entry;
     if (entry.object != .process) return E_BADCAP;
     if (!entry.processHandleRights().fault_handler) return E_PERM;
 
     if (len == 0) return E_INVAL;
 
-    const target = entry.object.process;
+    const target = ref.process;
 
     // Validate target vaddr is within user address space
     if (!address.AddrSpacePartition.user.contains(vaddr)) return E_BADADDR;
@@ -443,13 +448,16 @@ pub fn sysFaultReadMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64
 pub fn sysFaultWriteMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64 {
     const proc = sched.currentProc();
     if (proc_handle == 0) return E_PERM;
-    const entry = proc.getPermByHandle(proc_handle) orelse return E_BADCAP;
+    // Pin the target Process across the whole write — see sysFaultReadMem.
+    const ref = proc.acquireProcessRef(proc_handle) orelse return E_BADCAP;
+    defer ref.process.releaseRef();
+    const entry = ref.entry;
     if (entry.object != .process) return E_BADCAP;
     if (!entry.processHandleRights().fault_handler) return E_PERM;
 
     if (len == 0) return E_INVAL;
 
-    const target = entry.object.process;
+    const target = ref.process;
 
     // Validate target vaddr is within user address space
     if (!address.AddrSpacePartition.user.contains(vaddr)) return E_BADADDR;

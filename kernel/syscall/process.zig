@@ -121,7 +121,23 @@ pub fn sysRevokePerm(handle: u64) i64 {
     if (handle == 0) return E_INVAL;
 
     const proc = sched.currentProc();
-    const entry = proc.getPermByHandle(handle) orelse return E_BADCAP;
+
+    // Snapshot the permission entry. For .process / .dead_process arms we
+    // additionally pin the target Process across the operation: a racing
+    // removePerm on the same handle on another core could otherwise drop
+    // the last external ref to the target process between this snapshot
+    // and our later dereferences (releaseFaultHandler, killSubtree), and
+    // if the target had already finished cleanupPhase2 the backing struct
+    // would be freed — classic TOCTOU UAF.
+    var pinned_proc: ?*Process = null;
+    defer if (pinned_proc) |p| p.releaseRef();
+    const entry = blk: {
+        if (proc.acquireProcessRef(handle)) |ref| {
+            pinned_proc = ref.process;
+            break :blk ref.entry;
+        }
+        break :blk proc.getPermByHandle(handle) orelse return E_BADCAP;
+    };
 
     switch (entry.object) {
         .vm_reservation => |vm_res| {

@@ -338,10 +338,14 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
     const target_handle = arch.getIpcHandle(ctx);
     const meta = parseIpcMetadata(arch.getIpcMetadata(ctx));
 
-    // Look up target process
-    const target_entry = proc.getPermByHandle(target_handle) orelse return .{ .ret = E_BADCAP };
+    // Look up target process and pin it for the duration of this send so
+    // a concurrent revoke_perm on another core cannot drop the last
+    // external ref and free target_proc mid-operation (TOCTOU UAF).
+    const target_ref = proc.acquireProcessRef(target_handle) orelse return .{ .ret = E_BADCAP };
+    defer target_ref.process.releaseRef();
+    const target_entry = target_ref.entry;
     if (target_entry.object != .process) return .{ .ret = E_BADCAP };
-    const target_proc = target_entry.object.process;
+    const target_proc = target_ref.process;
 
     // §2.6.30: lazily convert dead process entries on IPC attempt.
     if (!target_proc.alive) {
