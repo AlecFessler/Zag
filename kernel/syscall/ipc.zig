@@ -72,21 +72,6 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
         },
         .process => |proc_ptr| {
             if (handle_val == 0) {
-                // Red-team Finding -3 (5c80fe4): self-cap-transfer is a
-                // no-op semantically — the sender already holds the cap.
-                // Allowing it here composes with the slot-0 rights pun in
-                // validateIpcSendRights to yield a handle-table
-                // corruption primitive: the fault_handler branch of this
-                // arm walks sender_proc.threads[] and inserts duplicate
-                // thread handles into target_proc.perm_table, which is
-                // the SAME table when target_proc == sender_proc. The
-                // stale duplicates then survive Thread.deinit and give
-                // any caller a UAF on sysThreadKill / sysPmuStop etc.
-                // Reject outright.
-                if (target_proc == sender_proc) {
-                    sender_proc.perm_lock.unlock();
-                    return E_INVAL;
-                }
                 // Sending HANDLE_SELF: gives recipient a process handle to the sender.
                 // §4.1.2 restricts the `fault_handler` ProcessHandleRights bit to
                 // "at most one external process per target" — and §4.1.3 describes
@@ -314,20 +299,6 @@ fn getCapPayload(ctx: *const ArchCpuContext, word_count: u3) struct { handle: u6
 }
 
 fn validateIpcSendRights(entry: PermissionEntry, meta: IpcMetadata, sender_proc: *Process, src_ctx: *const ArchCpuContext) i64 {
-    // Red-team Finding -3: self-send is allowed (same-process IPC between
-    // threads is a valid pattern — see §3.3.16) but cap-transfer to
-    // HANDLE_SELF is not. The slot-0 entry stores ProcessRights, not
-    // ProcessHandleRights — the bit layouts are incompatible, and
-    // reinterpreting one as the other lets ProcessRights.spawn_thread
-    // (bit 0) masquerade as send_words and ProcessRights.mem_reserve
-    // (bit 2) masquerade as send_process, passing every send-side gate
-    // with no send_* capability actually held. Coupled with
-    // transferCapability's HANDLE_SELF fault_handler arm this yields a
-    // self-directed thread-handle duplication primitive; block it here
-    // as a second line of defense after the `target_proc == sender_proc`
-    // check in transferCapability below.
-    const self_send = entry.object == .process and entry.object.process == sender_proc;
-    if (self_send and meta.cap_transfer) return E_INVAL;
     const rights = entry.processHandleRights();
     if (!rights.send_words) return E_PERM;
     if (meta.cap_transfer) {
