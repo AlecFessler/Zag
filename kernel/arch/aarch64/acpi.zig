@@ -22,12 +22,48 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const arch = zag.arch.dispatch;
 const gic = zag.arch.aarch64.gic;
+const memory_init = zag.memory.init;
+const paging = zag.memory.paging;
 const serial = zag.arch.aarch64.serial;
 const smp = zag.arch.aarch64.smp;
 
+const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
+
+/// Map an MMIO region as Device memory into the kernel's physmap range
+/// (TTBR1). Returns the physmap VA that corresponds to `phys_start`.
+///
+/// The initial physmap built in memory.init() only covers RAM regions
+/// reported as free/ACPI in the UEFI memory map, so low MMIO like the
+/// GIC distributor at PA 0x08000000 has no valid translation in TTBR1
+/// until we add one here. We map Device memory (not_cacheable) because
+/// the regions are peripheral MMIO.
+fn mapDeviceRange(phys_start: u64, length: u64) !u64 {
+    const perms: MemoryPerms = .{
+        .write_perm = .write,
+        .execute_perm = .no_execute,
+        .cache_perm = .not_cacheable,
+        .global_perm = .global,
+        .privilege_perm = .kernel,
+    };
+    const page = paging.PAGE4K;
+    const start_aligned = std.mem.alignBackward(u64, phys_start, page);
+    const end_aligned = std.mem.alignForward(u64, phys_start + length, page);
+    var pa: u64 = start_aligned;
+    while (pa < end_aligned) {
+        try arch.mapPage(
+            memory_init.kernel_addr_space_root,
+            PAddr.fromInt(pa),
+            VAddr.fromPAddr(PAddr.fromInt(pa), null),
+            perms,
+        );
+        pa += page;
+    }
+    return VAddr.fromPAddr(PAddr.fromInt(phys_start), null).addr;
+}
 
 const ValidationError = error{
     InvalidSignature,
@@ -385,6 +421,11 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
             parseSpcr(sdt_virt);
         }
     }
+
+    // GIC init must happen after MADT parsing so that gicd_base /
+    // gicr_bases / core_count are populated. init.zig runs before ACPI
+    // parsing, so it cannot do this itself.
+    gic.init();
 }
 
 /// Parse MADT to discover GIC components and core count.
@@ -429,17 +470,43 @@ fn parseMadt(madt_virt: VAddr) !void {
         const entry = decodeMadt(e) orelse continue;
         switch (entry) {
             .gicd => |gicd_entry| {
-                const base_vaddr = VAddr.fromPAddr(PAddr.fromInt(gicd_entry.physical_base_address), null);
-                gic.setDistributorBase(base_vaddr.addr);
+                // GICv3 distributor occupies 64KB. Map into the physmap
+                // range as Device memory so MMIO reads/writes translate.
+                // The physmap built in memory.init() only covers RAM
+                // regions, so low [0, 1GB) MMIO on QEMU virt needs an
+                // explicit mapping here.
+                // IHI 0069H, Section 8.1.
+                const gicd_va = try mapDeviceRange(gicd_entry.physical_base_address, 64 * 1024);
+                gic.setDistributorBase(gicd_va);
             },
             .gicr => |gicr_entry| {
-                // GICR discovery ranges may cover multiple redistributors.
-                // For now, add the base of each range. A more complete
-                // implementation would iterate the range at 128KB stride
-                // (2 x 64KB frames per redistributor).
-                const base_vaddr = VAddr.fromPAddr(PAddr.fromInt(gicr_entry.discovery_range_base), null);
-                gic.addRedistributor(base_vaddr.addr);
-                redist_idx += 1;
+                // A GICR discovery range covers one or more redistributors
+                // back-to-back. Each GICv3 redistributor occupies two 64KB
+                // frames (RD_base + SGI_base) for a total 128KB stride.
+                // IHI 0069H, Section 9.1.1 and Section 10.1.
+                const stride: u64 = 128 * 1024;
+                // Each GICv3 redistributor occupies two 64KB frames
+                // (RD_base + SGI_base) for a total 128KB stride. Use
+                // the ACPI-reported discovery-range length (rounded
+                // up to a whole frame) as the source of truth, and
+                // fall back to `core_count * stride` when ACPI leaves
+                // the field unpopulated — some firmware/emulators
+                // report 0 here.
+                const reported_len: u64 = gicr_entry.discovery_range_length;
+                const cores_for_redist: u64 = @max(@as(u64, 1), core_count);
+                const range_len: u64 = if (reported_len >= stride)
+                    std.mem.alignForward(u64, reported_len, stride)
+                else
+                    cores_for_redist * stride;
+                // Map the entire discovery range into the physmap as
+                // Device memory and hand back the physmap VA per frame.
+                const gicr_va_base = try mapDeviceRange(gicr_entry.discovery_range_base, range_len);
+                var offset: u64 = 0;
+                while (offset + stride <= range_len) {
+                    gic.addRedistributor(gicr_va_base + offset);
+                    redist_idx += 1;
+                    offset += stride;
+                }
             },
             else => {},
         }

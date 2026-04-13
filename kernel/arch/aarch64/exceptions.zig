@@ -525,14 +525,14 @@ fn handleUnexpected(ctx: *ArchCpuContext) callconv(.c) void {
 /// LAPIC-timer IDT vector.
 fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.PrivilegePerm) void {
     switch (intid) {
-        30 => {
-            // Mask the physical timer while we run the scheduler tick.
+        27 => {
+            // Mask the virtual timer while we run the scheduler tick.
             // schedTimerHandler will re-arm via `armInterruptTimer`
             // which writes ENABLE=1, IMASK=0 and thereby unmasks again.
             // Without masking first, ISTATUS stays asserted and the
             // GIC would immediately re-deliver the PPI after EOI.
-            // ARM ARM D13.8.7: CNTP_CTL_EL0 IMASK (bit 1).
-            asm volatile ("msr cntp_ctl_el0, %[val]"
+            // ARM ARM D13.8.20: CNTV_CTL_EL0 IMASK (bit 1).
+            asm volatile ("msr cntv_ctl_el0, %[val]"
                 :
                 : [val] "r" (@as(u64, 0x3)), // ENABLE=1, IMASK=1
             );

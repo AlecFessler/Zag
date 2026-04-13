@@ -60,33 +60,28 @@ inline fn readCntfrq() u64 {
     return freq;
 }
 
-/// Write CNTP_CVAL_EL0 — set the physical timer comparator value.
-/// ARM ARM D13.8.9: CNTP_CVAL_EL0, Counter-timer Physical Timer CompareValue register.
-/// The timer fires when CNTPCT_EL0 >= CVAL.
-inline fn writeCntpCval(val: u64) void {
-    asm volatile ("msr cntp_cval_el0, %[val]"
-        :
-        : [val] "r" (val),
-    );
-}
-
-/// Write CNTP_TVAL_EL0 — set the physical timer 32-bit downcounter.
-/// ARM ARM D13.8.10: Writing TVAL sets CVAL = CNTPCT + TVAL. Convenient
-/// for arming a relative deadline without separately reading CNTPCT.
-inline fn writeCntpTval(val: u32) void {
-    asm volatile ("msr cntp_tval_el0, %[val]"
+/// Write CNTV_TVAL_EL0 — virtual timer 32-bit downcounter.
+///
+/// We use the virtual timer (PPI 27) rather than the physical timer
+/// (PPI 30) because the virtual timer is always accessible from EL1
+/// and does not require EL2-level configuration of CNTHCTL_EL2 to
+/// route the interrupt. On QEMU virt with UEFI AAVMF, the physical
+/// timer interrupt is delivered to EL2 and not forwarded to EL1 unless
+/// the firmware has explicitly enabled EL1PCEN, which it does not
+/// reliably do across AAVMF versions.
+///
+/// ARM ARM D13.8.21: CNTV_TVAL_EL0. Writing TVAL sets CVAL = CNTVCT + TVAL.
+inline fn writeCntvTval(val: u32) void {
+    asm volatile ("msr cntv_tval_el0, %[val]"
         :
         : [val] "r" (@as(u64, val)),
     );
 }
 
-/// Write CNTP_CTL_EL0 — physical timer control register.
-/// ARM ARM D13.8.7: CNTP_CTL_EL0, Counter-timer Physical Timer Control register.
-/// Bit 0: ENABLE — enables the timer.
-/// Bit 1: IMASK — interrupt mask (0 = unmasked, 1 = masked).
-/// Bit 2: ISTATUS — read-only interrupt status.
-inline fn writeCntpCtl(val: u64) void {
-    asm volatile ("msr cntp_ctl_el0, %[val]"
+/// Write CNTV_CTL_EL0 — virtual timer control register.
+/// ARM ARM D13.8.20: CNTV_CTL_EL0. Same bit layout as CNTP_CTL_EL0.
+inline fn writeCntvCtl(val: u64) void {
+    asm volatile ("msr cntv_ctl_el0, %[val]"
         :
         : [val] "r" (val),
     );
@@ -97,7 +92,16 @@ fn ensureFreqCached() void {
     cached_freq_hz = readCntfrq();
 }
 
-/// Physical timer for preemption — arms a deadline interrupt via CNTP_CVAL_EL0.
+/// Virtual timer for preemption — arms a deadline interrupt via CNTV_TVAL_EL0.
+///
+/// We use the virtual timer (INTID 27) instead of the physical timer
+/// (INTID 30) because the virtual timer is always accessible from EL1
+/// without EL2 firmware having to set CNTHCTL_EL2.EL1PCEN. Some QEMU
+/// AAVMF images drop to EL1 without enabling EL1 access to the physical
+/// timer, and every PPI 30 interrupt is silently discarded. The virtual
+/// timer has no such gating and is the conventional choice for guest
+/// kernels on GICv3 (see Linux arm64 arch_timer_kvm_info).
+///
 /// ARM ARM D11.2.4: Timer conditions and timer interrupts.
 const PreemptionTimer = struct {
     fn timer(self: *PreemptionTimer) Timer {
@@ -120,19 +124,19 @@ const PreemptionTimer = struct {
     ///
     /// The `Timer` vtable contract (shared with x64 LAPIC/HPET) treats
     /// `timer_val_ns` as a RELATIVE delta, not an absolute deadline. The
-    /// ARM generic timer provides CNTP_TVAL_EL0 which internally computes
-    /// CVAL = CNTPCT + TVAL, so we clamp the delta to 32 bits and let
+    /// ARM generic timer provides CNTV_TVAL_EL0 which internally computes
+    /// CVAL = CNTVCT + TVAL, so we clamp the delta to 32 bits and let
     /// hardware do the offset math.
     ///
-    /// ARM ARM D13.8.10: CNTP_TVAL_EL0.
-    /// ARM ARM D13.8.7: CNTP_CTL_EL0 — ENABLE=1, IMASK=0.
+    /// ARM ARM D13.8.21: CNTV_TVAL_EL0.
+    /// ARM ARM D13.8.20: CNTV_CTL_EL0 — ENABLE=1, IMASK=0.
     fn armInterruptTimer(_: *anyopaque, delta_ns: u64) void {
         var delta_ticks = timer_mod.ticksFromNanosCeil(cached_freq_hz, delta_ns);
         if (delta_ticks == 0) delta_ticks = 1;
         if (delta_ticks > 0x7FFF_FFFF) delta_ticks = 0x7FFF_FFFF;
-        writeCntpTval(@intCast(delta_ticks));
+        writeCntvTval(@intCast(delta_ticks));
         // ENABLE=1 (bit 0), IMASK=0 (bit 1 clear)
-        writeCntpCtl(0x1);
+        writeCntvCtl(0x1);
     }
 };
 

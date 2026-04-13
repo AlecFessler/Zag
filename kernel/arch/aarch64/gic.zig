@@ -87,10 +87,13 @@ const GicdReg = enum(u32) {
     /// Software Generated Interrupt Register (GICv2 only).
     /// IHI 0048B, Section 4.3.15: bits [3:0] = INTID, [23:16] = target CPU list.
     sgir = 0x0F00,
-    /// Peripheral ID2 Register — contains ArchRev in bits [7:4].
-    /// IHI 0069H, Section 8.9.15 / IHI 0048B, Section 4.3.17.
-    /// ArchRev: 1=GICv1, 2=GICv2, 3=GICv3/v4.
+    /// Peripheral ID2 Register — GICv2 variant at offset 0x0FE8.
+    /// IHI 0048B, Section 4.3.17. ArchRev in bits [7:4]: 2=GICv2.
     pidr2 = 0x0FE8,
+    /// Peripheral ID2 Register — GICv3/v4 variant at offset 0xFFE8.
+    /// IHI 0069H, Section 12.8 (GICD_IDREGS). ArchRev in bits [7:4]:
+    /// 3=GICv3, 4=GICv4.
+    pidr2_v3 = 0xFFE8,
     /// Interrupt Routing Registers (base, GICv3 only).
     /// IHI 0069H, Section 8.9.13.
     /// GICD_IROUTER<n> at offset 0x6100 + 8*n, 64 bits per SPI (INTID 32+).
@@ -192,9 +195,14 @@ var gicc_base: u64 = 0;
 /// GICR base virtual addresses, one per core. Populated by acpi.zig via addRedistributor().
 var gicr_bases: [max_redist]u64 = [_]u64{0} ** max_redist;
 
-/// Number of redistributors (cores) discovered from MADT.
-/// Starts at 0; incremented by addRedistributor(). Defaults to 1 after init()
-/// if no redistributors were explicitly added (BSP-only fallback).
+/// Number of redistributors populated in `gicr_bases`. Separate from
+/// `core_count` (which tracks enabled CPU cores from MADT GICC entries)
+/// so that setCoreCount + addRedistributor can be called in any order
+/// without the two counters clobbering each other.
+var redist_count: u64 = 0;
+
+/// Number of cores discovered from MADT. Starts at 0; set via setCoreCount().
+/// Defaults to 1 after init() if no cores were explicitly added (BSP-only fallback).
 var core_count: u64 = 0;
 
 /// Number of SPI lines supported by this GICD, derived from GICD_TYPER.
@@ -369,10 +377,10 @@ pub fn setGiccBase(addr: u64) void {
 ///
 /// Must be called in core index order (core 0, core 1, ...).
 pub fn addRedistributor(addr: u64) void {
-    const idx: usize = @intCast(core_count);
+    const idx: usize = @intCast(redist_count);
     if (idx >= max_redist) return;
     gicr_bases[idx] = addr;
-    core_count += 1;
+    redist_count += 1;
 }
 
 /// Set the core count directly (e.g., from counting MADT GICC structures).
@@ -405,9 +413,16 @@ pub fn initDistributor() void {
     if (gicd_base == 0) return;
 
     // Detect GIC version from GICD_PIDR2.ArchRev [7:4].
-    // IHI 0069H, Section 8.9.15 / IHI 0048B, Section 4.3.17.
-    const pidr2 = gicdRead(.pidr2);
-    const arch_rev = (pidr2 >> 4) & 0xF;
+    // GICv2 exposes PIDR2 at offset 0x0FE8 (IHI 0048B, Section 4.3.17).
+    // GICv3/v4 relocates PIDR2 to offset 0xFFE8 (IHI 0069H, Section 12.8);
+    // offset 0x0FE8 on a GICv3 is reserved and typically reads back as 0.
+    // Prefer the GICv3 location; fall back to v2 if the v3 slot reads
+    // back an unsupported ArchRev.
+    const pidr2_v3_val = gicdRead(.pidr2_v3);
+    const pidr2_v2_val = gicdRead(.pidr2);
+    const arch_rev_v3 = (pidr2_v3_val >> 4) & 0xF;
+    const arch_rev_v2 = (pidr2_v2_val >> 4) & 0xF;
+    const arch_rev = if (arch_rev_v3 >= 3) arch_rev_v3 else arch_rev_v2;
     gicv3 = (arch_rev >= 3);
 
     // Disable the distributor while reconfiguring.
@@ -518,8 +533,10 @@ pub fn initRedistributor(core_idx: usize) void {
         // Enable SGIs (INTID 0-15) and the generic timer PPIs
         // (27 = CNTV, 29 = CNTHP, 30 = CNTP) via GICR_ISENABLER0.
         // IHI 0069H, Section 9.5.6: GICR_ISENABLER0 — bit n enables INTID n.
-        // ARM ARM D11.2.4: the ARM generic timer delivers its interrupt
-        // as a PPI; this kernel uses CNTP (PPI 30) as the preemption timer.
+        // The scheduler uses the virtual timer (CNTV, PPI 27) because it
+        // is always accessible from EL1 without EL2 having to enable
+        // CNTHCTL_EL2.EL1PCEN. The physical timer PPI (30) is kept
+        // enabled as well for generic timer support.
         gicrSgiWrite(core_idx, .isenabler0, 0x0000FFFF | (1 << 27) | (1 << 29) | (1 << 30));
 
         // Set all SGI/PPI priorities to 0x80. On GICv3 ICC_PMR_EL1 is
@@ -527,10 +544,15 @@ pub fn initRedistributor(core_idx: usize) void {
         // Section 12.11.2), so writing 0xFF into IPRIORITYR would silently
         // suppress every PPI — including the preemption timer. 0x80 is
         // well below the mask.
-        // IHI 0069H, Section 9.5.8: GICR_IPRIORITYR<n>.
+        // IHI 0069H, Section 9.5.8: GICR_IPRIORITYR<n>. Write via raw
+        // pointer arithmetic rather than @enumFromInt on an offset that
+        // is not one of GicrSgiReg's named members (the enum is
+        // exhaustive, so a synthetic value is undefined behaviour).
         var n: u32 = 0;
         while (n < 8) {
-            gicrSgiWrite(core_idx, @enumFromInt(@intFromEnum(GicrSgiReg.ipriorityr0) + n * 4), 0x80808080);
+            const addr = gicr_bases[core_idx] + 0x10000 + @intFromEnum(GicrSgiReg.ipriorityr0) + n * 4;
+            const ptr: *volatile u32 = @ptrFromInt(addr);
+            ptr.* = 0x80808080;
             n += 1;
         }
     } else {
