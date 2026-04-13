@@ -14,7 +14,7 @@ A process is an isolated execution environment with its own address space, permi
 
 #### Zombies
 
-**§2.1.2** A non-leaf process (has children) that exits becomes a zombie: its parent's entry converts to `dead_process`. Zombies exist so that handles to their children remain valid — Zombies exist so that handles to their children remain valid — **§2.1.3** a zombie's children remain in the process tree and can still be addressed via their handles. **§2.1.4** Zombies hold no resources (no VM reservations, SHM, or device handles). **§2.1.5** A process with a restart context restarts instead of becoming a zombie.
+**§2.1.2** A non-leaf process (has children) that exits becomes a zombie: its parent's entry converts to `dead_process`. Zombies exist so that handles to their children remain valid — **§2.1.3** a zombie's children remain in the process tree and can still be addressed via their handles. **§2.1.4** Zombies hold no resources (no VM reservations, SHM, or device handles). **§2.1.5** A process with a restart context restarts instead of becoming a zombie.
 
 A zombie's handle sticks around until someone cleans it up: **§2.1.6** a `dead_process` handle remains valid until explicitly revoked. **§2.1.7** If multiple processes hold handles to a dead process, revoking one does not invalidate the others.
 
@@ -357,15 +357,15 @@ When a process dies, blocked IPC threads are cleaned up. **§3.3.26** When a pro
 
 #### send(r13=target, r14=metadata, payload regs) → status
 
-**§3.3.29** `send` returns `E_OK` on successful delivery. **§3.3.30** `send` with invalid target handle returns `E_BADHANDLE`. **§3.3.31** `send` to `dead_process` returns `E_BADHANDLE`. **§3.3.32** `send` without `send_words` right returns `E_PERM`. **§3.3.33** `send` cap transfer without appropriate `send_shm`/`send_process`/`send_device` right returns `E_PERM`. **§3.3.34** `send` device cap transfer not parent→child returns `E_PERM`. **§3.3.35** `send` device cap transfer: target lacks `device_own` returns `E_PERM`. **§3.3.36** `send` cap transfer: source lacks `grant` on transferred handle returns `E_PERM`. **§3.3.37** `send` with no receiver waiting returns `E_AGAIN`. Cap transfer with a full target table returns `E_MAXCAP`. Cap transfer with a full target table returns `E_MAXCAP`. **§3.3.38** `send` cap transfer with fewer than 2 words returns `E_INVAL`.
+**§3.3.29** `send` returns `E_OK` on successful delivery. **§3.3.30** `send` with invalid target handle returns `E_BADHANDLE`. **§3.3.31** `send` to `dead_process` returns `E_BADHANDLE`. **§3.3.32** `send` without `send_words` right returns `E_PERM`. **§3.3.33** `send` cap transfer without appropriate `send_shm`/`send_process`/`send_device` right returns `E_PERM`. **§3.3.34** `send` device cap transfer not parent→child returns `E_PERM`. **§3.3.35** `send` device cap transfer: target lacks `device_own` returns `E_PERM`. **§3.3.36** `send` cap transfer: source lacks `grant` on transferred handle returns `E_PERM`. **§3.3.37** `send` with no receiver waiting returns `E_AGAIN`. Cap transfer with a full target table returns `E_MAXCAP`. **§3.3.38** `send` cap transfer with fewer than 2 words returns `E_INVAL`.
 
 #### call(r13=target, r14=metadata, payload regs) → status + reply
 
-**§3.3.39** `call` returns `E_OK` with reply payload on success. **§3.3.40** `call` with invalid target handle returns `E_BADHANDLE`. **§3.3.41** `call` to `dead_process` returns `E_BADHANDLE`. **§3.3.42** `call` without required rights returns `E_PERM`. **§3.3.43** `call`: target dies while caller is waiting returns `E_NOENT`. Cap transfer failure returns `E_MAXCAP`. Cap transfer failure returns `E_MAXCAP`. **§3.3.44** `call` cap transfer invalid payload returns `E_INVAL`.
+**§3.3.39** `call` returns `E_OK` with reply payload on success. **§3.3.40** `call` with invalid target handle returns `E_BADHANDLE`. **§3.3.41** `call` to `dead_process` returns `E_BADHANDLE`. **§3.3.42** `call` without required rights returns `E_PERM`. **§3.3.43** `call`: target dies while caller is waiting returns `E_NOENT`. Cap transfer failure returns `E_MAXCAP`. **§3.3.44** `call` cap transfer invalid payload returns `E_INVAL`.
 
 #### recv(r14=metadata) → status + message
 
-**§3.3.45** `recv` returns `E_OK` with payload and r14 sender metadata on success. **§3.3.46** `recv` non-blocking with no message returns `E_AGAIN`. **§3.3.47** `recv` with pending reply returns `E_BUSY`. **§3.3.48** `recv` with another thread already blocked returns `E_BUSY`. Cap transfer failure returns `E_MAXCAP`. Cap transfer failure returns `E_MAXCAP`.
+**§3.3.45** `recv` returns `E_OK` with payload and r14 sender metadata on success. **§3.3.46** `recv` non-blocking with no message returns `E_AGAIN`. **§3.3.47** `recv` with pending reply returns `E_BUSY`. **§3.3.48** `recv` with another thread already blocked returns `E_BUSY`. Cap transfer failure returns `E_MAXCAP`.
 
 #### reply(r14=metadata, payload regs) → status
 
