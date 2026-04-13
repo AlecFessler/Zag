@@ -20,11 +20,13 @@ Zag is implemented in Zig, targeting x86_64 (with an aarch64 stub). The kernel i
    - `arch.init()` -- IDT, GDT, segment registers, CPU features (bootstrap core only).
    - `memory.init(boot_info.mmap)` -- Physmap setup, buddy allocator init, PMM init, slab allocator init for VMM nodes, tree nodes, SHM objects, device regions, processes, and threads.
    - `memory.initHeap()` -- Kernel heap allocator init.
-   - `debug.info.init()` -- ELF symbol table for stack traces. Receives the KASLR slide so DWARF lookups can translate runtime PCs back to link-time addresses.
+   - `debug_info.init()` -- ELF symbol table for stack traces. Receives the KASLR slide so DWARF lookups can translate runtime PCs back to link-time addresses.
    - `arch.parseFirmwareTables(xsdp_phys)` -- ACPI parsing: MADT (cores, APIC), HPET, MCFG (PCI ECAM). PCI enumeration and serial port probing. Device registration.
    - `arch.vmInit()` -- Detect hardware virtualization support via CPUID, cache availability flag. After firmware tables (needs CPUID), before scheduler.
    - `arch.pmuInit()` -- Detect hardware PMU support via CPUID (x64) or stub (aarch64), cache `PmuInfo`, prime PMI handler vector. After firmware tables, before scheduler. See §20.
+   - `arch.sysInfoInit()` -- Cache `SysInfoCaps` (per-CPU MSR/MWAIT availability flags) used by the sys_info syscall. See §21.
    - Wall clock offset init: `arch.readRtc()` reads the CMOS RTC (x64) and the kernel computes `wall_offset = rtc_nanos - monotonic_now`. See §22.
+   - `device_registry.registerDisplayDevice()` -- Registers the bootloader-provided framebuffer (if present) as a display device in the device registry so userspace can claim it via mmio_map.
    - `sched.globalInit()` -- Process/thread slab allocators, idle process, run queues, root service creation with all rights, device grant to root service, enqueue root service initial thread.
    - `arch.smpInit()` -- Secondary core bringup via INIT/SIPI IPI sequence with real-mode trampoline at physical address `0x8000`.
    - `sched.perCoreInit()` -- Per-core scheduler state, preemption timer arm, `arch.vmPerCoreInit()` (per-core VMX/SVM setup), enable interrupts.
@@ -122,6 +124,7 @@ kernel/
     registry.zig         -- device table and registration
   boot/
     protocol.zig         -- boot protocol struct (bootloader <-> kernel)
+    userspace_init.zig   -- root service ELF loading and initial thread setup
   arch/x64/kvm/         -- VM guest support (x86-specific: VT-x/AMD-V, EPT/NPT, VMCB)
     kvm.zig              -- module root (re-exports)
     vm.zig               -- Vm struct, vm_create, vm_guest_map, vm_msr_passthrough, ioapic_assert/deassert_irq
@@ -496,7 +499,7 @@ PhysicalMemoryManager {
 
 Implements the `std.mem.Allocator` interface. The PMM wraps the buddy allocator with per-core page caches for fast single-page allocations.
 
-**freePageCount() -> u64** -- Returns the number of physical pages currently free. Acquires the PMM global lock, queries the buddy allocator's internal free page accounting (sum of the per-order free list lengths weighted by order), adds the pages sitting in all per-core page caches, and returns the total. Called by the `sys_info` syscall (§21) to populate `SysInfo.mem_free`. A companion `totalPageCount() -> u64` returns the static total page count established at buddy init time for `SysInfo.mem_total`.
+**freePageCount() -> u64** -- Returns the number of physical pages currently free. Acquires the PMM global lock, reads the buddy allocator's `free_pages` running counter directly (no freelist traversal), adds the pages sitting in all per-core page caches, and returns the total. Called by the `sys_info` syscall (§21) to populate `SysInfo.mem_free`. A companion `totalPageCount() -> u64` returns the static total page count established at buddy init time for `SysInfo.mem_total`.
 
 ### Per-Core Page Cache
 
@@ -509,7 +512,8 @@ PerCorePageCache {
 
 - `MAX_CORES = 64`
 - `CACHE_REFILL_ORDER = 4` (refill 16 pages at a time)
-- `CACHE_MAX_PAGES = 64` (not currently enforced as a drain threshold)
+- `CACHE_MAX_PAGES = 64` (drain threshold)
+- `CACHE_DRAIN_PAGES = 32` (half of `CACHE_MAX_PAGES`)
 
 **Allocation path** (single page, scheduler initialized):
 1. Disable interrupts, read core ID.
@@ -519,7 +523,7 @@ PerCorePageCache {
 5. Pop one page from cache, unlock, restore interrupts.
 6. Fallback: if bulk alloc fails, try single-page alloc from buddy under lock.
 
-**Free path**: Push page onto per-core cache (interrupt-safe).
+**Free path**: Push page onto per-core cache (interrupt-safe). If the cache count reaches `CACHE_MAX_PAGES` (64), drain `CACHE_DRAIN_PAGES` (32) pages back to the buddy allocator under the PMM global lock before pushing the new page, so cache occupancy oscillates around the midpoint instead of growing unbounded.
 
 ### Buddy Allocator
 
@@ -563,7 +567,7 @@ Allocation: align `free_addr` to requested alignment, advance by `len`. Returns 
 Defined in `kernel/memory/allocators/slab.zig`. Generic, comptime-parameterized.
 
 ```
-SlabAllocator(T, stack_bootstrap, stack_size, allocation_chunk_size) {
+SlabAllocator(T, stack_bootstrap, stack_size, allocation_chunk_size, use_lock) {
     backing_allocator: std.mem.Allocator
     freelist: IntrusiveFreeList
     alloc_headers: ?*AllocHeader           -- linked list of chunk allocations
@@ -576,6 +580,7 @@ Parameters:
 - `stack_bootstrap`: if true, pre-allocate a small stack-resident array (used for bootstrapping before heap is available).
 - `stack_size`: size of stack array (0 if not bootstrapping).
 - `allocation_chunk_size`: number of elements per backing allocation (e.g., 64).
+- `use_lock`: if true, every alloc/free acquires the slab's `SpinLock`; if false, the slab is single-threaded (no lock field generated). Globally shared slabs use `true`; per-thread/per-CPU slabs use `false`.
 
 **Allocation**: Pop from freelist. If empty, allocate a new chunk of `allocation_chunk_size` elements from the backing allocator, push all onto freelist, then pop one. Track chunks via `AllocHeader` linked list for cleanup.
 
@@ -584,15 +589,15 @@ Parameters:
 In debug mode, tracks net allocations and asserts zero on `deinit`.
 
 **Slab instances** (each backed by a dedicated 16 MiB bump allocator region):
-- `VmNodeSlab`: `SlabAllocator(VmNode, false, 0, 64)` -- VMM tree data nodes.
-- `VmTreeSlab`: `SlabAllocator(VmTree.Node, false, 0, 64)` -- red-black tree nodes.
-- `SharedMemoryAllocator`: `SlabAllocator(SharedMemory, false, 0, 64)` -- SHM objects.
-- `DeviceRegionSlab`: `SlabAllocator(DeviceRegion, false, 0, 32)` -- device region objects.
-- `ProcessAllocator`: `SlabAllocator(Process, false, 0, 64)` -- process structs.
-- `ThreadAllocator`: `SlabAllocator(Thread, false, 0, 64)` -- thread structs.
-- `VmAllocator`: `SlabAllocator(arch.Vm, false, 0, 64)` -- VM structs (dispatched from arch/x64/kvm/).
-- `VCpuAllocator`: `SlabAllocator(arch.VCpu, false, 0, 64)` -- vCPU structs (dispatched from arch/x64/kvm/).
-- `PmuStateAllocator`: `SlabAllocator(arch.PmuState, false, 0, 64)` -- per-thread PMU state blocks. `arch.PmuState` is the arch-dispatched type (see §13 and §20); on aarch64 it is an empty struct stub so the allocator compiles but is never exercised.
+- `VmNodeSlab`: `SlabAllocator(VmNode, false, 0, 64, true)` -- VMM tree data nodes.
+- `VmTreeSlab`: `SlabAllocator(VmTree.Node, false, 0, 64, true)` -- red-black tree nodes.
+- `SharedMemoryAllocator`: `SlabAllocator(SharedMemory, false, 0, 64, true)` -- SHM objects.
+- `DeviceRegionSlab`: `SlabAllocator(DeviceRegion, false, 0, 32, true)` -- device region objects.
+- `ProcessAllocator`: `SlabAllocator(Process, false, 0, 64, true)` -- process structs.
+- `ThreadAllocator`: `SlabAllocator(Thread, false, 0, 64, true)` -- thread structs.
+- `VmAllocator`: `SlabAllocator(arch.Vm, false, 0, 64, true)` -- VM structs (dispatched from arch/x64/kvm/).
+- `VCpuAllocator`: `SlabAllocator(arch.VCpu, false, 0, 64, true)` -- vCPU structs (dispatched from arch/x64/kvm/).
+- `PmuStateAllocator`: `SlabAllocator(arch.PmuState, false, 0, 64, true)` -- per-thread PMU state blocks. `arch.PmuState` is the arch-dispatched type (see §13 and §20); on aarch64 it is an empty struct stub so the allocator compiles but is never exercised.
 
 ### Heap Allocator
 
@@ -681,8 +686,8 @@ Comptime assertions verify that no kernel VA regions overlap.
 7. Initialize buddy allocator spanning from smallest physical address to end of largest-address free region. Metadata allocated from bump allocator.
 8. Feed all free memory map regions into buddy allocator (excluding bump allocator's consumed range and low memory below 1 MiB).
 9. Initialize global PMM with buddy allocator as backing.
-10. Initialize slab bump allocators for each kernel object type (VmNode, VmTree, SHM, DeviceRegion, Process, Thread, Vm, VCpu, PmuState) -- each gets a 16 MiB VA region.
-11. Initialize slabs: VmNode slab, VmTree slab, DeviceRegion slab, SharedMemory slab, Vm slab, VCpu slab, PmuState slab.
+10. Initialize slab bump allocators for each kernel object type (VmNode, VmTree, SHM, DeviceRegion, Process, Thread, Vm, VCpu, PmuState) -- each gets a 16 MiB VA region. Process/Thread/Vm/VCpu slab bumps are exported as `pub var` so the scheduler and KVM modules can construct their slab instances later in `sched.globalInit()`.
+11. Initialize slabs that `memory.init` itself owns: VmNode and VmTree slabs (`vmm.initSlabs`), DeviceRegion slab (`device_region.initSlab`), SharedMemory slab, and the PMU state slab (`pmu.initSlab`). Process, Thread, Vm, and VCpu slabs are constructed later by their owning subsystems.
 
 `memory.initHeap()`:
 1. Initialize heap tree bump allocator (1 GiB region).
@@ -722,6 +727,8 @@ Fault handler receives faulting address, error code, and privilege level from th
 
 **Path 5 -- Private node, access permitted**: Demand-page. Allocate a zeroed physical page from PMM, `arch.mapPage` with the node's rights, resume execution.
 
+Before any kill in paths 1-4, the fault handler invokes `proc.faultBlock(thread, reason, fault_addr, rip)`. If a fault handler is registered (process- or thread-level) and not excluded for this reason, `faultBlock` parks the thread on the fault target's `MessageBox` and returns true; the fault handler then returns to the scheduler without killing. Only when `faultBlock` returns false does the kill path run. See §18 for the supervision routing details.
+
 ### Kill Path
 
 Check the stack guard registry for `(pid, fault_addr)`. If found, emit stack overflow/underflow diagnostic. Otherwise, emit access violation diagnostic. Then kill the process (non-recursive).
@@ -731,7 +738,7 @@ Check the stack guard registry for `(pid, fault_addr)`. If found, emit stack ove
 `isKernelStackPage(fault_addr)`:
 - `usable`: Demand-page the kernel stack page. Allocate from PMM, map with kernel RW permissions.
 - `guard`: Kernel stack overflow. **Panic**.
-- `not_stack`: Unexpected kernel fault. **Panic**.
+- `not_stack`: If `fault_addr` lies inside `KernelVA.KernelAllocators` (the kernel heap / slab VA window), call `demandPageKernel(fault_addr)` -- allocate a zeroed physical page from PMM and map it RW kernel global. Otherwise, unexpected kernel fault → **panic**.
 
 ---
 
@@ -747,7 +754,7 @@ Allocated from the process VMM as three contiguous kernel-internal tree nodes (`
 
 `createUser(proc_vmm, num_pages)` calls `proc_vmm.reserveStack(num_pages)` which inserts the three VMM nodes and returns `StackResult { guard, base, top }`. The stack grows downward; `top` is the highest address (initial stack pointer), `base` is the lowest usable address.
 
-`destroyUser(stack, proc_vmm)` walks PTEs in the usable range, unmaps and frees committed pages, removes all three VMM nodes.
+`destroyUser(stack, proc_vmm)` calls `proc_vmm.reclaimStack(stack)`, which removes the three VMM nodes (underflow guard, usable region, overflow guard) and unmaps/frees the committed physical pages within the usable range. The stack module itself does not walk PTEs directly; reclamation lives in the VMM so the same code path can be used by process teardown and explicit stack destruction.
 
 ### Kernel Stacks
 
@@ -802,6 +809,8 @@ User stack guard pages are VMM reservation nodes with all-zero rights (`read=fal
 3. If the node above is a writable region, the guard is below the usable stack → `stack_overflow` (stack grew past bottom).
 4. Otherwise, the guard is above the usable stack → `stack_underflow` (popped past top).
 
+As with other user faults, `faultBlock` is consulted before killing: if a fault handler is installed and accepts `stack_overflow`/`stack_underflow`, the thread is parked on the fault box instead of being killed.
+
 ### createKernel() -> Stack
 
 Allocate a slot. Compute addresses:
@@ -845,11 +854,19 @@ Process {
     handle_counter: u64                    -- monotonic, per-process
     perm_view_vaddr: VAddr
     perm_view_phys: PAddr                  -- physmap address for kernel writes
+    perm_view_gen: u64                     -- monotonic generation; bumped on every syncUserView write
+    handle_refcount: u32                   -- count of outstanding kernel handles to this Process
+    cleanup_complete: bool                 -- set once final teardown has run; gates last-reference free
+    dma_mappings: [MAX_DMA_MAPPINGS]DmaMapping
+    num_dma_mappings: u32
     msg_box: MessageBox                    -- encapsulates all IPC message passing state
-    fault_box: FaultBox                    -- encapsulates all fault message state
+    fault_box: MessageBox                  -- fault-channel MessageBox (separate instance, same type)
     fault_handler_proc: ?*Process          -- null = self-handling
-    faulted_thread_slots: u64             -- bitmask: bit i set = threads[i] in .faulted state
-    suspended_thread_slots: u64           -- bitmask: bit i set = threads[i] in .suspended state
+    fault_handler_targets_head: ?*Process  -- head of intrusive list of processes whose fault_handler_proc points at us
+    fault_handler_targets_next: ?*Process  -- next link in the above list
+    had_self_fault_handler: bool           -- snapshot used during restart to know whether the process originally supervised itself
+    faulted_thread_slots: u64              -- bitmask: bit i set = threads[i] in .faulted state
+    suspended_thread_slots: u64            -- bitmask: bit i set = threads[i] in .suspended state
     fault_reason: FaultReason              -- reason for last fault (u5, .none if no fault)
     restart_count: u16                     -- number of restarts (wraps on overflow)
     thread_handle_rights: ThreadHandleRights -- rights mask for thread handles in this process's own perm table
@@ -864,11 +881,11 @@ Process {
 - `MAX_CHILDREN = 64` -- maximum child processes.
 - `MAX_PERMS = 128` -- maximum permissions table entries.
 - `HANDLE_SELF = 0` -- reserved self-handle at slot 0.
-- `DEFAULT_STACK_PAGES = 4` -- default user stack size.
+- `DEFAULT_STACK_PAGES = 8` -- default user stack size.
 
 ### Allocation
 
-Processes are allocated from a `SlabAllocator(Process, false, 0, 64)` -- a slab allocator with 64-element chunks, backed by a bump allocator over the process slab VA region.
+Processes are allocated from a `SlabAllocator(Process, false, 0, 64, true)` -- a slab allocator with 64-element chunks and locking enabled, backed by a bump allocator over the process slab VA region.
 
 ### Locking Order
 
@@ -920,7 +937,7 @@ Allocated on the kernel heap (`memory_init.heap_allocator`). The ghost copy (`gh
 
 ### ASLR PRNG
 
-The VMM cursor starts at a random page-aligned offset within the ASLR zone `[0x0000_0000_0000_1000, 0x0000_1000_0000_0000)`. Entropy is sourced from `arch.readTimestamp()` (RDTSC on x86_64) at process creation time. The randomized base is page-aligned.
+The VMM cursor starts at a random page-aligned offset within the ASLR zone `[0x0000_0000_0000_1000, 0x0000_1000_0000_0000)`. Entropy is sourced from `arch.readTimestamp()` (RDTSC on x86_64, CNTVCT_EL0 on aarch64) at process creation time. The randomized base is page-aligned.
 
 ### KASLR
 
@@ -931,16 +948,24 @@ Kernel Address Space Layout Randomization is applied by the bootloader before en
 **Slide computation** (`bootloader/main.zig:computeKaslrSlide`):
 1. Compute kernel image size from parsed ELF sections (text + rodata + data + bss, page-aligned).
 2. Available slide range = `kernel_code.end - kernel_code.start - image_size`.
-3. Entropy: `arch.readTimestamp()` (RDTSC).
+3. Entropy: `arch.readTimestamp()` (RDTSC on x86_64, CNTVCT_EL0 on aarch64).
 4. Slide = `(entropy % (range / PAGE4K)) * PAGE4K` -- page-aligned.
 
 **Slide range**: `AddrSpacePartition.kernel_code` = `[0xFFFF_FFFF_8000_0000, 0xFFFF_FFFF_C000_0000)`. The kernel is linked at the start of this range. Maximum slide ≈ 1 GiB minus image size (≈ 18 bits of entropy at 4K granularity).
 
-**Relocation fixup** (`bootloader/main.zig:applyKaslrRelocations`): The bootloader walks all `.rela.*` section headers. For each RELA section whose target section has `SHF_ALLOC` set (i.e., loaded into memory):
+**Relocation fixup** (`bootloader/main.zig:applyKaslrRelocations`): The bootloader walks all `.rela.*` section headers and dispatches relocation patching to the architecture-specific applier (`arch.applyRelocation`). For each RELA section whose target section has `SHF_ALLOC` set (i.e., loaded into memory):
+
+x86_64 relocation types handled:
 - `R_X86_64_64`: 8-byte slot at file offset += slide (wrapping add).
 - `R_X86_64_32S`: 4-byte slot sign-extended to 64-bit, += slide, truncated back to 32-bit. Safe because the slide keeps values in the -2 GiB..0 canonical window.
 - `R_X86_64_PC32`, `R_X86_64_PLT32`, `R_X86_64_NONE`: skipped (PC-relative; uniform slide preserves relative distances).
-- Non-allocated section relocations (debug sections): skipped entirely.
+
+aarch64 relocation types handled:
+- `R_AARCH64_ABS64` / `R_AARCH64_RELATIVE`: 8-byte slot += slide.
+- `R_AARCH64_ABS32`: 4-byte slot += slide (truncated).
+- PC-relative ADR/ADRP/CALL relocations: skipped (uniform slide preserves relative distances).
+
+Non-allocated section relocations (debug sections) are skipped entirely on both architectures.
 
 Relocations are applied to `file_bytes` in place before the bootloader copies segment data to the mapped destination pages.
 
@@ -1018,9 +1043,9 @@ Depth-first post-order traversal of the child's entire subtree:
 
 When killing a thread that is `running` on another core, the kernel sends an inter-processor interrupt via `arch.triggerSchedulerInterrupt(core_id)`. This forces the target core's scheduler timer handler to run, which will observe the thread's `exited` state and switch away from it. The `on_cpu` atomic flag is used by futex wake to wait until a thread has fully yielded before re-enqueuing.
 
-### last_in_proc Flag
+### Last-Thread Detection
 
-When the process kill path determines which thread is the last one, it sets `thread.last_in_proc = true`. The scheduler's zombie cleanup path checks this flag to trigger `proc.exit()` after the last thread's `deinit`.
+There is no per-thread `last_in_proc` flag. `Thread.deinit` calls `proc.removeThread(self)`, which atomically removes the thread from the process slot table and returns `is_last = (num_threads == 0)`. If `is_last` is true, the deinit path skips user-stack destruction (the process exit path tears down the entire address space) and triggers `proc.exit()` to run restart-or-cleanup. This avoids the historical race where a stale `last_in_proc` flag could be observed after the thread had already been freed.
 
 ---
 
@@ -1040,19 +1065,35 @@ Thread {
     next: ?*Thread = null               -- intrusive singly-linked list pointer
     core_affinity: ?u64 = null          -- core mask (bit per core)
     state: State = .ready               -- { running, ready, blocked, faulted, suspended, exited }
-    last_in_proc: bool = false          -- true if this is the last thread in process
     on_cpu: atomic(bool) = false        -- set while thread is actively on a CPU
+    pinned_exclusive: bool = false      -- hard-pin: when true, scheduler always picks this thread on its core, bypassing the run queue entirely
     slot_index: u8                      -- index of this thread in process.threads[], used for bitmask operations
-    priority: Priority                  -- current scheduling priority level (idle/low/normal/high/pinned)
+    priority: Priority                  -- current scheduling priority level (idle/normal/high/realtime/pinned)
     pre_pin_priority: Priority          -- saved priority before core pin (restored on unpin)
     pre_pin_affinity: ?u64              -- saved affinity mask before core pin (restored on unpin)
+
+    // Multi-address futex wait state
+    futex_deadline_ns: u64              -- absolute deadline in monotonic ns; 0 = no timeout
+    futex_paddr: PAddr                  -- single-address legacy fast path; physical address being waited on
+    futex_paddrs: [64]PAddr             -- physical addresses for multi-address waits; thread is enqueued in all corresponding buckets simultaneously
+    futex_bucket_count: u8              -- number of valid entries in futex_paddrs
+    futex_wake_index: u8                -- index of the address that woke this thread; set by wake() and read after resume
+
+    ipc_server: ?*Process               -- if set, thread is currently servicing an ipc_call from this client process
+
+    // Fault metadata, valid iff state == .faulted (or queued in some fault box)
+    fault_reason: FaultReason           -- reason set by exception handler
+    fault_addr: u64                     -- faulting virtual address
+    fault_rip: u64                      -- instruction pointer at fault
+    fault_user_ctx: ?*ArchCpuContext    -- pointer to the user iret frame for FAULT_RESUME_MODIFIED writes; cleared on resume
+
     pmu_state: ?*arch.PmuState = null   -- arch-specific PMU counter state; null until pmu_start; freed on pmu_stop or deinit
 }
 ```
 
 ### Allocation
 
-Threads are allocated from `SlabAllocator(Thread, false, 0, 64)`, backed by a bump allocator over the thread slab VA region (16 MiB).
+Threads are allocated from `SlabAllocator(Thread, false, 0, 64, true)`, backed by a bump allocator over the thread slab VA region (16 MiB).
 
 ### Thread ID
 
@@ -1102,10 +1143,10 @@ Atomic boolean. Set to `true` when a thread is dispatched onto a CPU, set to `fa
 ### Thread Deinit
 
 `Thread.deinit()`:
-1. Save `last_in_proc` flag.
-2. If `pmu_state != null`, call `arch.pmuClearState(pmu_state)` to zero the state struct without touching any MSRs, then free the PMU state back to `PmuStateAllocator` and clear the field. The dying thread is not running on any core at this point (exit paths leave the thread off its run queue before tearing it down), so MSR writes on the caller's core would either be a no-op against stale values or clobber the PMU state of whichever thread currently owns the hardware. Real hardware teardown for the dying thread happened at its last `pmuSave` on context switch away. This is the implicit `pmu_stop` on thread exit (§2.14.9, §20).
-3. Clear the thread handle entry from the owning process's perm table. If `fault_handler_proc` is non-null, also clear the thread handle entry from the handler's perm table. Call `syncUserView` on all affected tables.
-4. Destroy kernel stack (unmap committed pages, recycle slot).
+1. If `pmu_state != null`, call `arch.pmuClearState(pmu_state)` to zero the state struct without touching any MSRs, then free the PMU state back to `PmuStateAllocator` and clear the field. The dying thread is not running on any core at this point (exit paths leave the thread off its run queue before tearing it down), so MSR writes on the caller's core would either be a no-op against stale values or clobber the PMU state of whichever thread currently owns the hardware. Real hardware teardown for the dying thread happened at its last `pmuSave` on context switch away. This is the implicit `pmu_stop` on thread exit (§2.14.9, §20).
+2. Clear the thread handle entry from the owning process's perm table. If `fault_handler_proc` is non-null, also clear the thread handle entry from the handler's perm table. Call `syncUserView` on all affected tables.
+3. Destroy kernel stack (unmap committed pages, recycle slot).
+4. Call `proc.removeThread(self)` to remove the thread from the process slot table; receive `is_last` as the return value.
 5. If not last thread: destroy user stack via process VMM.
 6. Free Thread to slab.
 7. If last thread: call `proc.exit()` (triggers restart or cleanup).
@@ -1150,7 +1191,7 @@ x64.SavedRegs (extern struct) {
 
 ### Red-Black Tree
 
-The VMM uses a `RedBlackTree(*VmNode, vmNodeCmp, true)` where `vmNodeCmp` orders by `start.addr`. The third parameter (`true`) enables duplicate handling. Tree nodes are allocated from `VmTreeSlab = SlabAllocator(VmTree.Node, false, 0, 64)`. VM data nodes are allocated from `VmNodeSlab = SlabAllocator(VmNode, false, 0, 64)`.
+The VMM uses a `RedBlackTree(*VmNode, vmNodeCmp, true)` where `vmNodeCmp` orders by `start.addr`. The third parameter (`true`) enables duplicate handling. Tree nodes are allocated from `VmTreeSlab = SlabAllocator(VmTree.Node, false, 0, 64, true)`. VM data nodes are allocated from `VmNodeSlab = SlabAllocator(VmNode, false, 0, 64, true)`.
 
 Both slabs are initialized at boot from dedicated bump allocator regions (16 MiB each).
 
@@ -1270,20 +1311,41 @@ device_count: u32
 
 ```
 DeviceRegion {
-    phys_base: PAddr
-    size: u64
-    base_port: u16
-    port_count: u16
-    device_type: DeviceType { mmio, port_io }
+    access: union(enum) {
+        mmio: struct {
+            phys_base: PAddr
+            size: u64
+        }
+        port_io: struct {
+            base_port: u16
+            port_count: u16
+        }
+    }
     device_class: DeviceClass { network, serial, storage, display, timer, usb, unknown }
-    pci_vendor: u16
-    pci_device: u16
-    pci_class: u8
-    pci_subclass: u8
+    detail: union(enum) {
+        pci: Pci {
+            vendor: u16
+            device: u16
+            class: u8
+            subclass: u8
+            bus: u8
+            dev: u8
+            func: u8
+            // DMA support
+            dma_window_base: PAddr   // 0 = no DMA window assigned
+            dma_window_size: u64
+            dma_owner: ?*Process     // null if no current owner
+        }
+        display: Display {
+            subtype: DisplaySubtype { framebuffer, gpu }
+            // bootloader-handed framebuffer parameters when subtype == framebuffer
+        }
+        none: void
+    }
 }
 ```
 
-Allocated from `SlabAllocator(DeviceRegion, false, 0, 32)`.
+The nested-union layout means MMIO and port-I/O regions share the same struct without wasted fields, and PCI metadata (BDF, DMA window state, ownership) lives only on entries where it makes sense. Display devices carry framebuffer info inline. Allocated from `SlabAllocator(DeviceRegion, false, 0, 32, true)`.
 
 ### PCI Enumeration -- ECAM (Enhanced Configuration Access Mechanism)
 
@@ -1359,6 +1421,7 @@ KernelObject = union(enum) {
     shared_memory: *SharedMemory
     device_region: *DeviceRegion
     thread: *Thread
+    vm: *Vm
     empty: void
 }
 ```
@@ -1415,7 +1478,7 @@ UserViewEntry (extern struct, 32 bytes) {
 
 `EMPTY` sentinel: `handle = U64_MAX, entry_type = 0xFF, rights = 0, field0 = 0, field1 = 0`.
 
-Types: `process = 0, vm_reservation = 1, shared_memory = 2, device_region = 3, dead_process = 4, thread = 5`.
+Types: `process = 0, vm_reservation = 1, shared_memory = 2, device_region = 3, dead_process = 5, thread = 6, vm = 7`. (Type 4 is reserved for historical reasons.)
 
 Field encoding for thread entries: `field0 = tid(u32, bits 0-31) | exclude_oneshot(bit 32) | exclude_permanent(bit 33)` where the tid is the thread's stable kernel-assigned thread id and bits 32-33 reflect the fault-handler exclude flags on the perm slot. `field1 = pinned_core_id` when the thread is pinned, or zero when not pinned. Transient scheduling state is not exposed in the view.
 
@@ -1423,9 +1486,9 @@ Field encoding for thread entries: `field0 = tid(u32, bits 0-31) | exclude_onesh
 
 All rights are packed structs with bit fields:
 
-- `ProcessRights`: packed `u16` -- `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `mem_shm_create`(5), `device_own`(6), `fault_handler`(7), `pmu`(8), `set_time`(9), `power`(10), 5 bits reserved.
+- `ProcessRights`: packed `u16` -- `spawn_thread`(0), `spawn_process`(1), `mem_reserve`(2), `set_affinity`(3), `restart`(4), `mem_shm_create`(5), `device_own`(6), `fault_handler`(7), `pmu`(8), `set_time`(9), `power`(10), `vm_create`(11), 4 bits reserved.
 - `ProcessHandleRights`: packed `u16` -- `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5), `fault_handler`(6), 9 bits reserved. Used on handles to other processes (not HANDLE_SELF).
-- `VmReservationRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4), 3 bits reserved.
+- `VmReservationRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4), `write_combining`(5), 2 bits reserved.
 - `SharedMemoryRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `grant`(3), 4 bits reserved.
 - `DeviceRegionRights`: packed `u8` -- `map`(0), `grant`(1), `dma`(2), `irq`(3), 4 bits reserved. The `irq` bit gates `irq_ack` (§24).
 - `ThreadHandleRights`: packed `u8` -- `suspend`(0), `resume`(1), `kill`(2), `pmu`(4), bit 3 reserved. The `pmu` bit is checked in addition to `ProcessRights.pmu` on every PMU syscall that takes a thread handle; see §20.
@@ -1456,7 +1519,8 @@ Methods:
 - `enqueue(thread)` — append to the tail of `levels[thread.priority]`.
 - `dequeue() -> ?*Thread` — scan from level 4 down to 0, pop head of first non-empty level.
 - `remove(target) -> bool` — linear scan across all levels, unlink target.
-- `peekHighestStealable(core_id) -> ?*Thread` — scan levels 4→0, return the first thread whose affinity mask includes `core_id` and whose priority is not `pinned`. Called without holding a lock; the result is advisory only.
+
+Work-stealing's "is there anything stealable on the victim core" peek is **not** a `PriorityQueue` method. It lives as a private function `peekHighestStealable(victim_state, thief_core_id) -> ?*Thread` in `kernel/sched/scheduler.zig`, which scans the victim core's `RunQueue` levels 4→0 and returns the first thread whose affinity mask includes `thief_core_id` and whose priority is not `pinned`. It is called without holding the victim's `rq_lock` and the result is advisory only — the actual steal then re-acquires the lock and re-checks under it.
 
 ### Structure
 
@@ -1475,6 +1539,7 @@ PerCoreState {
     rq: RunQueue
     rq_lock: SpinLock
     running_thread: ?*Thread
+    idle_thread: ?*Thread       -- per-core idle thread, real Thread at priority idle, allocated in perCoreInit
     pinned_thread: ?*Thread     -- thread (if any) that exclusively owns this core
     timer: Timer
     exited_thread: ?ExitedThread -- deferred thread cleanup (renamed from Zombie)
@@ -1499,18 +1564,21 @@ Delegates to `pq.dequeue()`, which returns the highest-priority ready thread, or
 ### Scheduler Timer Handler
 
 `schedTimerHandler(ctx)`:
-1. Clean up exited thread from previous cycle (deferred `deinit`).
-2. Save preempted thread's context.
-3. Clear preempted thread's `on_cpu` flag.
-4. Acquire run queue lock.
-5. If this core has a `pinned_thread` that is ready and not currently running: immediately preempt the current thread, attempt to migrate it to another core, and switch to the pinned thread.
-6. If the current thread is the pinned thread: never preempt, just re-arm the timer.
-7. Otherwise: priority-aware round-robin. If a higher priority thread is ready in the run queue, preempt current thread and switch. If same priority, re-enqueue current and switch. If current is highest, keep running.
-8. Set next thread to `running`, set `on_cpu = true`.
-9. If preempted thread is `exited`, store as exited_thread for deferred cleanup.
-10. Release run queue lock.
-11. Arm scheduler timer for next timeslice.
-12. If same thread, return. Otherwise, `arch.switchTo(next)`.
+1. Run the idle/busy accounting hook (sample monotonic clock, attribute the elapsed time since the previous tick to either `idle_ns` or `busy_ns`, update `last_tick_ns`). This must run before any reschedule decision so the attribution is against the thread that actually consumed the timeslice.
+2. If the *current* thread (`running_thread`) has `pinned_exclusive == true`, this is a hard-pin: the scheduler always picks this thread on this core, bypassing the run queue entirely. Re-arm the timer and return without any context-switch work.
+3. Save preempted thread's context.
+4. Clear preempted thread's `on_cpu` flag.
+5. Now that `on_cpu` is clear, if the preempted thread's state is `.exited`, stash it as `exited_thread` for deferred cleanup on the next tick (the previous tick's exited thread is freed here too — deferred so we never deinit the kernel stack we are running on).
+6. Acquire run queue lock.
+7. If this core has a soft `pinned_thread` that is ready and not currently running: immediately preempt the current thread, attempt to migrate it to another core, and switch to the pinned thread.
+8. If the current thread is that pinned thread: never preempt, just re-arm the timer.
+9. Otherwise: priority-aware round-robin. If a higher priority thread is ready in the run queue, preempt current thread and switch. If same priority, re-enqueue current and switch. If current is highest, keep running.
+10. Set next thread to `running`, set `on_cpu = true`.
+11. Release run queue lock.
+12. Arm scheduler timer for next timeslice.
+13. If same thread, return. Otherwise, `arch.switchTo(next)`.
+
+The hard-pin path (`pinned_exclusive`) is checked *before* the soft-pin `pinned_thread` field. Hard pin means the thread bypasses the run queue entirely on this core; soft pin means a regular run-queue thread is the preferred occupant of the core but other threads can run there when it blocks.
 
 ### Idle/Busy Accounting Hook
 
@@ -1572,13 +1640,15 @@ When a core's run queue is empty after dequeueing, it attempts to steal work:
 3. If the candidate is still there, take it and return.
 4. If it was removed between peek and lock (another core stole it or it was scheduled), retry the entire scan.
 
+Retry is bounded: at most **3 attempts** per call into the work-stealing path. If three consecutive scans race and lose, the calling core gives up for this tick, runs its idle thread, and tries again on the next tick. Without a cap, two cores chasing the same victim can livelock the steal loop on contended workloads.
+
 Pinned cores are skipped entirely — never steal from a pinned core's queue and never identify a pinned core as a target.
 
 Work stealing is purely reactive — it only happens when a core goes idle. There is no background balancing. NUMA and cache domain awareness are not implemented and are noted as future work.
 
 ### ExitedThread Deferred Cleanup
 
-Exited threads cannot be freed inside the scheduler timer handler (they are running on the stack being freed). Instead, the thread is stored as an `ExitedThread { thread, last_in_proc }` and freed at the start of the next scheduler tick. (Renamed from `Zombie` to avoid confusion with the process zombie concept.)
+Exited threads cannot be freed inside the scheduler timer handler (they are running on the stack being freed). Instead, the thread is stored as an `ExitedThread { thread: *Thread }` and freed at the start of the next scheduler tick. There is no `last_in_proc` field on the wrapper; last-thread detection is the return value of `proc.removeThread` inside `Thread.deinit`. (Renamed from `Zombie` to avoid confusion with the process zombie concept.)
 
 ---
 
@@ -1593,22 +1663,25 @@ Exited threads cannot be freed inside the scheduler timer handler (they are runn
 SharedMemory {
     pages: []PAddr          -- slice of physical page addresses
     refcount: atomic(u32)   -- atomic reference count
+    alloc_order: u4         -- buddy order of the contiguous allocation that backs `pages`,
+                            -- or 0 if the pages were allocated one at a time
 }
 ```
 
-`MAX_PAGES = 256` (1 MiB maximum SHM size at 4K pages).
+`MAX_PAGES = 4096` (16 MiB maximum SHM size at 4K pages).
 
 ### Allocation
 
-SharedMemory objects are allocated from `SlabAllocator(SharedMemory, false, 0, 64)`, backed by a bump allocator over the SHM slab VA region (16 MiB). The `pages` slice is allocated from a separate pages allocator.
+SharedMemory objects are allocated from `SlabAllocator(SharedMemory, false, 0, 64, true)`, backed by a bump allocator over the SHM slab VA region (16 MiB). The `pages` slice is allocated from a separate pages allocator.
 
 ### create(num_bytes) -> *SharedMemory
 
 1. Validate size > 0 and page count <= MAX_PAGES.
 2. Allocate SharedMemory struct from slab.
 3. Allocate `pages` slice from pages allocator.
-4. For each page: allocate from PMM, zero the page, store PAddr.
-5. Set `refcount = 1`.
+4. **Try contiguous buddy allocation first.** Compute the smallest buddy order `o` such that `(1 << o) >= num_pages`, capped at `MAX_BUDDY_ORDER = 10` (1024 pages = 4 MiB). Ask the buddy allocator for one `2^o`-page block. If it succeeds, fan the block out into `pages` (one PAddr per 4 KiB page), zero each page, and stamp `alloc_order = o`. This is the fast path because it gives the caller physically contiguous memory, which both reduces TLB pressure and lets DMA-capable devices use the same backing without scatter/gather.
+5. **Fall back to per-page allocation.** If the contiguous attempt fails (fragmentation), allocate each page individually from the PMM, zero it, store its PAddr, and stamp `alloc_order = 0`. The caller cannot tell the difference at the SHM API level — only `destroy` cares.
+6. Set `refcount = 1`.
 
 ### incRef
 
@@ -1616,11 +1689,11 @@ SharedMemory objects are allocated from `SlabAllocator(SharedMemory, false, 0, 6
 
 ### decRef
 
-`fetchSub(1, .release)`. If previous value was 1 (now 0): acquire fence, then `destroy()`.
+`fetchSub(1, .acq_rel)`. After the decrement, the kernel **loads the new refcount with `.acquire`** (rather than relying on a standalone fence) and, if the loaded value is zero, calls `destroy()`. The acquire load synchronizes with any prior release from another decrementer so the destroying thread observes a consistent view of the SHM struct.
 
 ### destroy
 
-1. Free all physical pages back to PMM.
+1. If `alloc_order > 0`: free the single contiguous block back to the buddy allocator at the recorded order. Otherwise: free each page individually back to PMM.
 2. Free the `pages` slice.
 3. Free the SharedMemory struct back to slab.
 
@@ -1684,8 +1757,8 @@ Multi-address futex wait with snapshot-under-lock semantics. Same `MAX_FUTEX_WAI
 
 1. Same address resolution and validation as `waitVal` (steps 1-2).
 2. Acquire all relevant bucket locks in sorted order.
-3. For each `i` in `[0, count)`: atomic load of `*paddr[i]` with acquire ordering and store as `snapshot[i]`. These snapshot values serve as the expected values.
-4. If `timeout_ns == 0` (non-blocking), release all bucket locks and return `E_TIMEOUT` (no change can have occurred under the locks).
+3. For each `i` in `[0, count)`: atomic load of `*paddr[i]` with acquire ordering and store as `snapshot[i]`. These snapshot values serve as the expected values. The snapshots are read **after** the bucket locks are acquired, so their values are consistent with respect to any concurrent `wake` on the same buckets.
+4. If `timeout_ns == 0` (non-blocking), release all bucket locks and return `E_TIMEOUT`. Note that the snapshot reads in step 3 still happen — `waitChange` does not have an early-return shortcut that skips the locked snapshot, because callers can rely on the snapshot side effect as a fenced read against waker stores even on the timeout=0 path.
 5. Set thread state to `blocked`.
 6. Enqueue the thread on all relevant buckets.
 7. Release all bucket locks with IRQ restore.
@@ -1709,6 +1782,25 @@ When a thread waits on multiple addresses that hash to different buckets, all re
 ### Multi-Bucket Cleanup on Wake
 
 When a thread is woken from one bucket, it must remove itself from all other buckets in its wait set. The waking path sets `futex_wake_index` and wakes the thread. The thread then iterates its wait set and removes itself from each remaining bucket (acquiring each bucket lock individually). This cleanup is safe because the thread is no longer blocked -- concurrent wake attempts on other buckets will find the thread already removed or in a non-blocked state.
+
+### Syscall Layer Address Resolution
+
+The wait syscalls take **two levels of indirection** in user memory. `sysFutexWaitVal(addrs_ptr, expected_ptr, count, timeout_ns)` (and the parallel `sysFutexWaitChange`) gets a user pointer to an array of futex addresses, and each entry in that array is itself a user pointer to a `u64`. The syscall layer is responsible for resolving **both** levels:
+
+1. `resolveVaddr(thread, addrs_ptr, count * sizeof(*u64))` to walk the page tables for the address-array pointer itself, returning the kernel physical address of that array.
+2. For each entry `i` in the array, `resolveVaddr(thread, addrs_array[i], sizeof(u64))` to walk the page tables for the actual futex word at that address, returning the physical address that goes into `futex_paddrs[i]`.
+
+Either lookup can fail with `E_BADADDR` (entry unmapped) or `E_INVAL` (misaligned). The resolved physical addresses are passed down to the futex core (`futex.waitVal` / `futex.waitChange`), which never touches user pointers itself — it only operates on PAddrs.
+
+### count == 1 Fast Path
+
+`sysFutexWaitVal` checks for `count == 1` and short-circuits to the legacy single-address `futex.wait` path. This avoids allocating any of the multi-address bookkeeping (sorted bucket list, multi-bucket cleanup) for the overwhelmingly common single-address case. The legacy path returns:
+
+- `E_OK` (0) on a normal wake → the syscall returns 0 (the index of the address that woke us).
+- `E_AGAIN` if the value mismatch was detected before sleeping → the syscall converts this to a return of `0` (index of the only address), matching the multi-address contract where the index of a stale-value address is returned as the result.
+- `E_TIMEOUT` / `E_INTR` are passed through unchanged.
+
+The conversion of `E_AGAIN` → `0` is the only behavioral wrinkle of the fast path; everything else is a direct alias for the legacy single-address API.
 
 ---
 
@@ -1834,8 +1926,10 @@ The queued unit is `*Thread` for both uses. For IPC, the queued thread is the ca
 All methods take a locked `MessageBox` (the `*Locked` suffix); the lock is the caller's responsibility.
 
 - `enqueueLocked(sender)` — enqueue `sender` into the `waiters` priority queue via `waiters.enqueue(sender)`. No state change.
+- `enqueueFrontLocked(sender)` — push `sender` onto the head of its priority level instead of the tail, so it is dequeued before other same-priority waiters. Used by the fault-reply restart path to put a faulted thread back at the front of the box ahead of newer waiters when its supervisor decides to retry the original message.
 - `dequeueLocked() → ?*Thread` — dequeue the highest-priority waiter via `waiters.dequeue()`, or `null` if empty. No state change.
 - `removeLocked(target) → bool` — remove `target` from the `waiters` priority queue via `waiters.remove(target)` (used when a queued caller dies). Returns whether it was present.
+- `drainByProcessLocked(owner) → void` — walk the `waiters` priority queue and remove every thread whose `process == owner`. Called during `cleanupIpcState` / `releaseFaultHandler` when a process dies, so the dying process's threads are scrubbed out of every other box that references them in O(box-size) per affected box rather than per-thread.
 - `beginReceivingLocked(thread)` — assert `state == .idle && queue_head == null && receiver == null`, then set `receiver = thread`, `state = .receiving`.
 - `takeReceiverLocked() → *Thread` — assert `state == .receiving`, return and clear receiver, set `state = .idle`.
 - `beginPendingReplyLocked(?*Thread)` — assert `state != .pending_reply`, set `pending_thread`, `state = .pending_reply`.
@@ -1882,15 +1976,21 @@ Defined in `Process.faultBlock` (`kernel/proc/process.zig`). The fault delivery 
 Returns `true` if the fault was queued (caller should yield); `false` if the process must die immediately (§2.12.7 / §2.12.9). The caller — the exception handler — is responsible for stamping the metadata onto the thread *before* this function (or at function entry) and for either yielding or initiating kill on the return value.
 
 ```
-1. Stamp metadata onto the thread:
+1. handler = self.faultHandlerOf(reason)
+   - if self.fault_handler_proc is non-null → returns it
+   - else scans self's perm_table for any non-zero slot whose entry is a process
+     entry holding the fault_handler ProcessRights bit, and returns that process
+     (this is how a process can install a peer handler without it being its parent)
+   - else returns self iff self holds the fault_handler ProcessRights bit on slot 0
+   - else returns null → return false (no handler, kill)
+   The reason argument lets faultHandlerOf consult per-thread `exclude_oneshot` /
+   `exclude_permanent` flags before returning a handler.
+
+2. Stamp metadata onto the thread (only after a handler has been found):
    thread.fault_reason = reason
    thread.fault_addr   = fault_addr
    thread.fault_rip    = rip
-
-2. handler = self.faultHandlerOf()
-   - returns self.fault_handler_proc if non-null
-   - else returns self iff self holds the fault_handler ProcessRights bit on slot 0
-   - else returns null → return false (no handler, kill)
+   thread.fault_user_ctx = current iret frame pointer
 
 3. If handler == self (self-handling):
    a. Lock self.lock.
@@ -1927,14 +2027,14 @@ Returns `true` if the fault was queued (caller should yield); `false` if the pro
    c. return true
 ```
 
-**TODO (§2.12.11):** the external-handler branch should, *before* applying stop-all in step 4a, check the faulted thread's `exclude_oneshot` / `exclude_permanent` perm-entry flags in the handler's table and skip stop-all (and clear `exclude_oneshot`) if either is set. This is not yet wired up.
+The external-handler branch checks the faulted thread's `exclude_oneshot` / `exclude_permanent` perm-entry flags in the handler's table *before* applying stop-all in step 4a. If either flag is set, stop-all is skipped for this fault delivery, and `exclude_oneshot` is cleared so the next fault from the same thread sees stop-all again. `exclude_permanent` is sticky.
 
 ### Direct delivery to a blocked receiver
 
 When the box is in `.receiving` state, the kernel cannot rely on the receiver to re-execute the dequeue logic on wake-up — `sysFaultRecv`'s blocking path saves the receiver's int 0x80 frame and calls `switchToNextReady`, so when the receiver is later resumed it returns straight to userspace through the syscall epilogue. The fault box therefore has to materialize the `FaultMessage` in the receiver's address space *before* waking it.
 
 `Process.deliverFaultToWaiter(handler, receiver, faulted)` does this:
-1. Read the receiver's user buffer pointer from `receiver.ctx.regs.rdi` (the saved arg from when the receiver entered `sysFaultRecv`).
+1. Read the receiver's user buffer pointer from `receiver.ctx.syscallArg(0)` — the first syscall argument register on the host architecture, retrieved through an arch-dispatched accessor on the saved `ArchCpuContext` (RDI on x86-64, X0 on aarch64).
 2. Look up the source thread's handle and the source process's handle in the handler's perm table (`lookupHandlesForFault`).
 3. Build the `arch.fault_msg_size`-byte `FaultMessage` in a stack-local buffer.
 4. Walk the receiver process's page table page-by-page (`arch.resolveVaddr` + physmap) and copy the message into the user buffer.
@@ -2075,6 +2175,8 @@ State meanings:
 - `exited` — hit a VM exit, waiting for `vm_recv`.
 - `waiting_reply` — exit message delivered, pending reply.
 
+`VCpu.state` is read and written through `loadState` / `storeState` helpers that wrap `@atomicLoad` and `@atomicStore` (release/acquire ordering) so transitions are visible across cores without taking the Vm lock. Direct field access is forbidden — every code path goes through the helpers, including the entry loop and `vm_vcpu_interrupt`. The atomicity is required because vCPU kicks and `vm_vcpu_interrupt` can read `state` from a different core than the one running the vCPU.
+
 vCPU threads have a fixed kernel-managed entry point in `kernel/arch/x64/kvm/vcpu.zig` (`vcpuEntryPoint`). When scheduled, the entry loop:
 
 1. If state ≠ `running`, blocks the thread and yields. On wake, resets the TSC reference and continues.
@@ -2137,7 +2239,7 @@ Defined in `kernel/arch/x64/kvm/exit_handler.zig`. Called from the vCPU entry lo
 
 **Kernel-handled inline** — resolved without VMM involvement, the entry loop re-enters the guest on return:
 - **EPT/NPT violations on the LAPIC or IOAPIC page** (`0xFEE00000` / `0xFEC00000`): the handler calls `vm.tryHandleMmio(vcpu, ept.guest_phys)`, which routes the access to the matching controller, pre-fetches instruction bytes and decodes via `mmio_decode.decodeBytes`, writes any read result back into the destination GPR via `writeGpr`, and advances RIP by the decoded instruction length. The handler imports neither `lapic` nor `ioapic` directly — the only entry point is `Vm.tryHandleMmio`.
-- Guest memory is no longer demand-paged: all regions are eagerly mapped at `vm_guest_map` time. EPT/NPT violations on truly unmapped regions fall through to the VMM as exits.
+- **EPT/NPT violations on a guest-mapped, not-yet-faulted-in page**: `exit_handler.zig` calls `handleFault` on the violation address, which performs demand paging through the same `Vm.handleFault` path used at boot time. Truly unmapped regions (no `vm_guest_map` covering them) fall through to the VMM as exits; in-range pages that simply haven't been demand-paged yet are handled inline and the entry loop re-enters the guest.
 - **`cpuid`** where `(leaf, subleaf)` matches an entry in `vm.policy.cpuid_responses`: the kernel writes the pre-configured `eax/ebx/ecx/edx` into guest GPRs and advances RIP by 2.
 - **`interrupt_window` (VMEXIT_VINTR)**: returns immediately so the entry loop checks `vm.deliverPendingInterrupts` again now that guest `IF=1`.
 - **VMEXIT_INTR (0x060) / VMEXIT_NMI (0x061) / VMEXIT_VINTR (0x064)**: the host interrupt handler already ran on `#VMEXIT`. The kernel just returns so the entry loop re-enters the guest.
@@ -2146,7 +2248,7 @@ Defined in `kernel/arch/x64/kvm/exit_handler.zig`. Called from the vCPU entry lo
 - Guest device I/O (port I/O, MMIO on unmapped regions other than LAPIC/IOAPIC).
 - EPT/NPT violations on truly unmapped guest physical regions.
 - `cpuid` not in `vm.policy`.
-- `cr_access` (CR policy lookup is stubbed; all CR exits currently fall through to the VMM).
+- `cr_access` (CR policy lookup is **not yet implemented**; all CR exits fall through to the VMM until the policy table is wired up).
 - `msr_read` / `msr_write` exits the kernel didn't intercept via the MSRPM passthrough bitmap.
 - `hlt`, `shutdown`, `triple_fault`, exceptions, and any other unclassified exits.
 
@@ -2275,12 +2377,12 @@ The generic layer (`kernel/syscall/pmu.zig`) is architecture-agnostic. It valida
 - **`kernel/syscall/dispatch.zig`** — dispatch cases for syscall numbers `pmu_info`, `pmu_start`, `pmu_read`, `pmu_reset`, and `pmu_stop` forward to the corresponding `pmu.sysPmuXxx` entry point in `kernel/syscall/pmu.zig`. No arg validation happens in the dispatch layer; validation lives in the generic layer so all arches share it.
 - **`kernel/sched/thread.zig`** — adds the `pmu_state: ?*arch.PmuState = null` field (see §5) and the PMU-free step in `Thread.deinit` (automatic `pmu_stop` on thread exit, §2.14.9).
 - **`kernel/sched/scheduler.zig`** — context switch paths (`schedTimerHandler` and IPC `switchToThread`) add the null-guarded `arch.pmuSave` / `arch.pmuRestore` calls around `arch.switchTo` (see §6). All other scheduler logic is unchanged.
-- **`kernel/memory/init.zig`** — adds `PmuStateAllocator = SlabAllocator(arch.PmuState, false, 0, 64)` with a dedicated 16 MiB bump region between the VCpu slab region and the heap tree slab region. Initialized in `memory.init()` alongside the other slabs.
+- **`kernel/memory/init.zig`** — adds `PmuStateAllocator = SlabAllocator(arch.PmuState, false, 0, 64, true)` with a dedicated 16 MiB bump region between the VCpu slab region and the heap tree slab region. Initialized in `memory.init()` alongside the other slabs.
 - **`kernel/perms/permissions.zig`** — adds `pmu` bit (bit 8) on `ProcessRights` and `pmu` bit (bit 4) on `ThreadHandleRights` (see §4). No other rights types are touched.
 
 ### PmuStateAllocator
 
-`PmuStateAllocator = SlabAllocator(arch.PmuState, false, 0, 64)`. One dedicated 16 MiB bump region in the kernel VA layout (§14). Chunk size 64 matches the other slab allocators.
+`PmuStateAllocator = SlabAllocator(arch.PmuState, false, 0, 64, true)`. One dedicated 16 MiB bump region in the kernel VA layout (§14). Chunk size 64 matches the other slab allocators.
 
 Allocation is lazy: a thread that never calls `pmu_start` never touches the allocator. The first `pmu_start` call in a thread's lifetime calls `PmuStateAllocator.create()`, stores the pointer on `thread.pmu_state`, and programs the hardware via `arch.pmuStart`. `pmu_stop` and `Thread.deinit` call `arch.pmuStop` (which disables counters) and `PmuStateAllocator.destroy(state)`.
 
@@ -2333,7 +2435,7 @@ x64.PmuState (extern struct) {
 
 **`pmuStart(state, configs)`**: zero `IA32_PERF_GLOBAL_CTRL`, copy `configs` into `state.configs`, for each config write the mapped `(event_select, unit_mask, USR, EN, INT_if_overflow_threshold_set)` into `IA32_PERFEVTSELx`, preload `IA32_PMCx` with `(counter_max - overflow_threshold)` so the counter overflows exactly at the threshold (or zero if no threshold), then write the enable bitmask into `IA32_PERF_GLOBAL_CTRL`.
 
-**`pmuSave(state)`**: write `0` to `IA32_PERF_GLOBAL_CTRL` (disable all), then for each configured counter read `IA32_PMCx` and store into `state.values[i]`.
+**`pmuSave(state)`**: if `state.num_counters == 0` (allocated state but no counters configured yet), return immediately — no MSRs are touched. This early-exit keeps the context-switch hot path off the PMU MSRs for threads that have allocated state via `pmu_start` only to then call `pmu_stop` without programming a new event set. Otherwise, write `0` to `IA32_PERF_GLOBAL_CTRL` (disable all), then for each configured counter read `IA32_PMCx` and store into `state.values[i]`.
 
 **`pmuRestore(state)`**: for each configured counter write `state.values[i]` back into `IA32_PMCx`, re-write `IA32_PERFEVTSELx` (event select is not changed by save/restore, but rewriting is idempotent and cheap), then write the enable bitmask into `IA32_PERF_GLOBAL_CTRL`.
 
@@ -2341,7 +2443,7 @@ x64.PmuState (extern struct) {
 
 **`pmuReset(state, configs)`**: same as `pmuStart` but assumes `state` is already allocated; overwrites the configs and preload values, clears any stale overflow status bits in `IA32_PERF_GLOBAL_STATUS` via `IA32_PERF_GLOBAL_OVF_CTRL`, and re-enables.
 
-**`pmuStop(state)`**: zero `IA32_PERF_GLOBAL_CTRL`, zero each `IA32_PERFEVTSELx` for configured counters (so leftover state cannot re-enable), clear overflow status bits, return `state` to `PmuStateAllocator`.
+**`pmuStop(state)`**: zero `IA32_PERF_GLOBAL_CTRL`, zero each `IA32_PERFEVTSELx` for configured counters (so leftover state cannot re-enable), zero each `IA32_PMCx` for configured counters (so the next thread to be scheduled in does not inherit a stale counter value if it ever programs the same physical counter index), clear overflow status bits, return `state` to `PmuStateAllocator`.
 
 ### PMI Handler Flow
 
@@ -2349,6 +2451,13 @@ x64.PmuState (extern struct) {
 
 ```
 pmuPmiHandler(frame):
+    0. Read IA32_PERF_GLOBAL_STATUS and mask it against the bitmask of counter
+       indices configured for this thread (0..state.num_counters - 1). If no
+       overflow bits in the configured range are set, this is a stale PMI
+       (counter overflowed before pmuStop / context switch but the PMI was
+       delivered to a core/thread that no longer owns those counters). Clear
+       any unrelated overflow bits via IA32_PERF_GLOBAL_OVF_CTRL and return
+       to the interrupted context without delivering a fault.
     1. Read IA32_PERF_GLOBAL_STATUS; the set bits identify which counters overflowed.
        Write those bits to IA32_PERF_GLOBAL_OVF_CTRL to clear them.
     2. Write 0 to IA32_PERF_GLOBAL_CTRL to stop all counters on this core immediately.
@@ -2483,9 +2592,9 @@ The HPET is used as the reference clock for TSC and LAPIC timer calibration.
 
 ### Timer Selection
 
-- **Preemption timer** (`getPreemptionTimer`): LAPIC timer (one-shot mode) for per-core scheduling interrupts.
-- **Monotonic clock** (`getMonotonicClock`): TSC-based for `clock_gettime` and futex timeouts. Falls back to HPET if TSC is unavailable.
-- **ASLR entropy** (`readTimestamp`): raw RDTSC value.
+- **Preemption timer** (`getPreemptionTimer`): LAPIC timer (one-shot mode) for per-core scheduling interrupts. The TSC is used **only** as the LAPIC timer's underlying time base when TSC-deadline mode is available; it is not used as a clock source by anything in the generic kernel.
+- **Monotonic clock** (`getMonotonicClock`): **HPET**, not TSC. Used by `clock_gettime`, futex timeouts, the scheduler accounting hook, and the wall clock offset computation. The HPET is chosen because it is invariant across cores and frequency-stable, where TSC would require per-core invariance flags and DVFS adjustments. TSC remains the source for the preemption timer's deadline programming because LAPIC TSC-deadline mode operates directly against the local TSC.
+- **ASLR entropy** (`readTimestamp`): raw RDTSC value (x86-64) or CNTVCT_EL0 (aarch64). This is the only place the generic kernel reads the TSC directly.
 
 ---
 
@@ -2636,35 +2745,45 @@ Userspace derives the `field0` address as `perm_view_vaddr + slot_index * 32 + 1
 
 ### Kernel IRQ Handler Path
 
-When a device IRQ fires on x86, the interrupt vector handler in `kernel/arch/x64/irq.zig` executes:
+When a device IRQ fires on x86, the interrupt vector handler `deviceIrqHandler` in `kernel/arch/x64/irq.zig` executes:
 
 ```
-1. Identify the IRQ line from the interrupt vector number (vector - IRQ_BASE_VECTOR).
-2. Look up irq_table[irq_line]. If null (no registered device), send EOI and return.
-3. Mask the IRQ line via I/O APIC redirection table (set the mask bit).
-4. Send LAPIC EOI.
-5. Look up the owning process: irq_table[irq_line] -> *DeviceRegion -> owner_proc.
-6. Locate the device's slot in the owner's perm table and compute the field0 physical address
-   from perm_view_phys + slot_index * 32 + 16.
-7. Atomically set bit 16 of field0 via CAS on the physmap VA:
-   a. Read current value via physmap.
-   b. CAS(current, current | (1 << 16)). If CAS fails (racing IRQ or irq_ack), re-read and retry.
-8. Call futex.wake on the field0 physical address to wake any threads waiting on it.
+1. Compute irq_line = vector - 32 (ISA IRQ remapping; vectors 32-47 are wired to deviceIrqHandler).
+2. Mask the IRQ line via I/O APIC redirection table (maskIrq) so it cannot re-fire until userspace
+   acknowledges it. (The .external interrupt-vector dispatcher will issue the LAPIC EOI on its own
+   after the handler returns. The handler must NOT call EOI itself.)
+3. Look up irq_owners[irq_line]. If null (no registered owner), return — masking has already happened.
+4. setIrqPendingBitForOwner(owner): compute the physical address of field0 in the owner's user view
+   entry slot via perm_view_phys + slot_index * sizeof(UserViewEntry) + offsetOf(field0). Reach the
+   word through physmap.
+5. Set bit 16 of field0 via @atomicRmw(.Or, IRQ_PENDING_BIT, .release). Single atomic OR — no
+   compare-and-swap loop is needed because there is no value-dependent read.
+6. Call futex.wake on the field0 physical address to wake any threads waiting on it.
 ```
 
-The CAS-and-retry loop is necessary because `irq_ack` may be concurrently clearing bit 16, or another IRQ for a device in the same process may be concurrently modifying the same word (though in practice each device has its own `field0`). The retry is bounded because only two writers exist (the IRQ handler setting bit 16 and `irq_ack` clearing it).
+The corresponding clear path in `clearIrqPendingBit` (called by `irq_ack`) uses the same trick: `@atomicRmw(.And, ~IRQ_PENDING_BIT, .release)`. There is no CAS loop on either side because set and clear are independent bitwise operations on the same word; concurrent set-and-clear racing would naturally serialize on the cache line and both updates would land.
 
 The IRQ line remains masked until userspace calls `irq_ack`, which unmasks it. This prevents interrupt storms while the driver is processing the previous interrupt.
 
-### IRQ Table
+### IRQ Tables
 
-Defined in `kernel/arch/x64/irq.zig`:
+Defined in `kernel/arch/x64/irq.zig`. There are **two** parallel 256-entry tables, both indexed by IRQ line number:
 
 ```
-var irq_table: [256]?*DeviceRegion = [_]?*DeviceRegion{null} ** 256
+pub var irq_table:  [256]?*DeviceRegion = [_]?*DeviceRegion{null} ** 256;
+pub var irq_owners: [256]?IrqOwner      = [_]?IrqOwner{null} ** 256;
+
+pub const IrqOwner = struct {
+    process:    *Process,  // the process currently holding the IRQ-rights handle
+    slot_index: u16,       // slot in the owning process's perm table — used to compute
+                           // the field0 physmap address for the IRQ pending bit
+};
 ```
 
-Populated during firmware table parsing (ACPI MADT interrupt source overrides, PCI INTx routing). Each entry maps an IRQ line number to the `DeviceRegion` that owns it. The table is static after boot -- entries are not modified at runtime.
+- `irq_table` is populated during firmware-table parsing (ACPI MADT interrupt source overrides, PCI INTx routing) and maps IRQ lines to the `DeviceRegion` describing the underlying hardware. Static after boot.
+- `irq_owners` is populated at runtime by `registerIrqOwner(irq_line, proc, slot_index)`, which is called from the device-handle insertion path in the perm table whenever a process receives a device handle that has the `irq` right bit set. It is reset to `null` when the process releases the handle. The IRQ handler reads from `irq_owners`, **not** `irq_table`, so the pending-bit update lands in whatever process currently owns the IRQ — which can change at runtime as the device handle is granted between processes.
+
+`registerIrqOwner` is the only public mutator on `irq_owners`. It is called under the owning process's perm lock so the slot_index is consistent with the perm table state visible to other readers.
 
 ### I/O APIC Masking
 
@@ -2717,10 +2836,10 @@ No futex wake is issued on the clear -- only the set path wakes waiters.
 
 ### Module-Level Changes
 
-- **`kernel/arch/x64/irq.zig`** -- `maskIrq(u8)`, `unmaskIrq(u8)` via I/O APIC. Global `irq_table: [256]?*DeviceRegion` populated during firmware table parsing. IRQ handler sets bit 16 of device `field0` via CAS and calls `futex.wake`.
+- **`kernel/arch/x64/irq.zig`** -- `maskIrq(u8)`, `unmaskIrq(u8)` via I/O APIC. Two parallel global tables: `irq_table: [256]?*DeviceRegion` populated during firmware table parsing, and `irq_owners: [256]?IrqOwner` populated at runtime by `registerIrqOwner` whenever a process receives an IRQ-rights device handle. The `deviceIrqHandler` looks up `irq_owners[irq_line]`, sets bit 16 of the owner's `field0` via `@atomicRmw(.Or, ...)`, and calls `futex.wake`. EOI is issued automatically by the `.external` interrupt-vector dispatcher; the handler does not call EOI itself.
 - **`kernel/arch/dispatch.zig`** -- `maskIrq(u8)`, `unmaskIrq(u8)` dispatch functions.
 - **`kernel/perms/permissions.zig`** -- `UserViewEntry.fromKernelEntry` initializes bit 16 of `field0` to 0 for device entries. No badge bit or badge_counter.
-- **`kernel/syscall/device.zig`** -- `irq_ack` handler clears bit 16 of `field0` via CAS before unmasking the IRQ line.
+- **`kernel/syscall/device.zig`** -- `irq_ack` handler clears bit 16 of `field0` via `@atomicRmw(.And, ~IRQ_PENDING_BIT, .release)` before unmasking the IRQ line.
 - **`kernel/devices/registry.zig`** -- `grantAllToRootService` grants device handles with rights `0b1111` (map + grant + dma + irq).
 
 ### Process Death Cleanup
@@ -2978,23 +3097,24 @@ The aarch64 stubs return `E_NODEV` for all actions.
 
 Defined in `kernel/arch/x64/power.zig`. Each action maps to a specific hardware mechanism:
 
-**`shutdown`** — ACPI S5 (soft-off) sleep state. Writes to the PM1a control register with the SLP_TYP value for S5 and the SLP_EN bit. The PM1a control port and SLP_TYP are discovered during ACPI FADT parsing at boot. Fallback: write `0x2000` to port `0x604` (QEMU-specific shutdown). Does not return.
+**`shutdown`** — Currently uses the QEMU debug-exit fallback path: write `0x2000` to I/O port `0x604` (QEMU's `isa-debug-exit` device, hw/misc/debugexit.c). If the host is real hardware (or QEMU without the device), the write is a no-op and the function falls through to `while (true) cpu.halt()`. ACPI S5 soft-off via PM1a control register / SLP_TYP is **future work** — the FADT parsing needed to discover the PM1a control port and S5 SLP_TYP is not yet wired into the power module. Does not return.
 
-**`reboot`** — Three fallback strategies:
+**`reboot`** — Two fallback strategies, attempted in order:
 1. Keyboard controller reset: write `0xFE` to port `0x64`.
-2. ACPI reset register: if FADT advertises a reset register, write the reset value to it.
-3. Triple fault: load a zero-length IDT and trigger an interrupt.
-Does not return.
+2. Triple fault: load a zero-length IDT and trigger `int $3`.
+ACPI reset register support is future work and is not currently attempted. Does not return.
 
-**`sleep`** (S3 — suspend to RAM) — Saves CPU state (registers, GDT, IDT, CR0/CR3/CR4), writes the S3 SLP_TYP to PM1a control with SLP_EN, CPU halts. On resume, firmware jumps to the FACS waking vector. The kernel restores CPU state, re-enables paging, and returns `E_OK`. Returns `E_NODEV` if ACPI does not advertise S3 support.
+**`sleep`** (S3 — suspend to RAM) — **Not yet implemented.** Returns `E_NODEV`. Requires ACPI FADT parsing for PM1a control and S3 SLP_TYP, plus S3 resume trampoline at the FACS waking vector. Listed here as a known stub.
 
-**`hibernate`** (S4 — suspend to disk) — Similar to S3 but with S4 SLP_TYP. The actual save-to-disk is a userspace responsibility (the kernel only manages the power state transition). Returns `E_NODEV` if S4 is not supported.
+**`hibernate`** (S4 — suspend to disk) — **Not yet implemented.** Returns `E_NODEV`. Same FADT-parsing prerequisite as S3.
 
-**`screen_off`** — DPMS (Display Power Management Signaling) off via VGA register writes: read port `0x3DA` to reset the attribute controller flip-flop, write `0x00` to port `0x3C0` to blank the display. For modern systems, this may also involve writing to the GPU's power management registers if a display device region is available. Returns `E_OK`.
+**`screen_off`** — DPMS (Display Power Management Signaling) off via VGA register writes: read port `0x3DA` to reset the attribute controller flip-flop, write `0x00` to port `0x3C0` to blank the display. Returns `E_OK`. This is the only `PowerAction` that has a real implementation today.
 
-**`set_freq`** — Per-CPU frequency control via `IA32_PERF_CTL` MSR (`0x199`). The target frequency in hertz is converted to a P-state ratio using the base bus frequency (same as §21's `getCoreFreq`). The ratio is written to bits 8--15 of `IA32_PERF_CTL`. The hardware adjusts to the nearest achievable frequency. Returns `E_NODEV` if P-state control is not supported (checked via CPUID).
+**`set_freq`** — **Not yet implemented.** Returns `E_NODEV`. The IA32_PERF_CTL programming logic is sketched but the CPUID-gated availability check and bus-frequency lookup are not wired up.
 
-**`set_idle`** — Per-CPU maximum C-state level. The value is stored in a per-core variable that the idle loop consults. When the idle thread runs, it uses `MWAIT` with the C-state hint corresponding to the configured maximum level (C-state sub-state encoding per Intel SDM Vol 2 "MWAIT" instruction). If `MWAIT` is not supported (CPUID leaf 5), falls back to `HLT`. Returns `E_NODEV` if `MWAIT` is not supported and value > 0.
+**`set_idle`** — **Not yet implemented.** Returns `E_NODEV`. MWAIT C-state control requires a CPUID leaf 5 check that is not yet wired up.
+
+The "not yet implemented" stubs exist as named cases in the dispatch switch so userspace gets a stable `E_NODEV` rather than `E_INVAL`. Replacing them with real ACPI/MWAIT-based implementations is a follow-up.
 
 ### ACPI Table Dependencies
 
