@@ -730,7 +730,7 @@ Transitions a vCPU from `idle` to `running`, making its thread eligible for sche
 
 Injects a virtual interrupt into a vCPU.
 
-**§4.2.53** `vm_vcpu_interrupt` returns `E_OK` on success. **§4.2.54** `vm_vcpu_interrupt` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`. **§4.2.55** `vm_vcpu_interrupt` with `interrupt_ptr` not readable returns `E_BADADDR`.
+**§4.2.53** `vm_vcpu_interrupt` returns `E_OK` on success. **§4.2.54** `vm_vcpu_interrupt` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`. **§4.2.55** `vm_vcpu_interrupt` with `interrupt_ptr` not readable returns `E_BADADDR`. **§4.2.66** `vm_vcpu_interrupt` with `vector` less than 32 (i.e., a reserved architectural exception vector 0-31) returns `E_INVAL`.
 
 #### vm_msr_passthrough(msr_num, allow_read, allow_write) → result
 

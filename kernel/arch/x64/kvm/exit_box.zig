@@ -286,6 +286,12 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
         1 => {
             // inject_interrupt: payload is GuestInterrupt at offset 8
             const interrupt = std.mem.bytesAsValue(vm_hw.GuestInterrupt, action_buf[8..][0..@sizeOf(vm_hw.GuestInterrupt)]).*;
+            // Reject reserved architectural exception vectors 0-31 (Intel SDM
+            // Vol 3A §6.3.1 / Table 6-1). External interrupts injected via
+            // VMCS VM-entry event-injection must use vectors >= 32; otherwise
+            // an attacker VMM could write an illegal vector directly into
+            // VM_ENTRY_INTR_INFO and corrupt guest exception handling.
+            if (interrupt.vector < 32) return E_INVAL;
             arch.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
             vcpu_obj.storeState(.running);
             resumeVcpuThread(thread);
