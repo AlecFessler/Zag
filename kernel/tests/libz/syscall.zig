@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const perms = @import("perms.zig");
 
 pub const PAGE4K: u64 = 4096;
@@ -75,75 +76,144 @@ pub const SyscallNum = enum(u64) {
 };
 
 fn syscall0(num: SyscallNum) i64 {
-    return asm volatile ("syscall"
-        : [ret] "={rax}" (-> i64),
-        : [num] "{rax}" (@intFromEnum(num)),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
+    return switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("syscall"
+            : [ret] "={rax}" (-> i64),
+            : [num] "{rax}" (@intFromEnum(num)),
+            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+            : [num] "{x8}" (@intFromEnum(num)),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
 }
 
 fn syscall1(num: SyscallNum, a0: u64) i64 {
-    return asm volatile ("syscall"
-        : [ret] "={rax}" (-> i64),
-        : [num] "{rax}" (@intFromEnum(num)),
-          [a0] "{rdi}" (a0),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
+    return switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("syscall"
+            : [ret] "={rax}" (-> i64),
+            : [num] "{rax}" (@intFromEnum(num)),
+              [a0] "{rdi}" (a0),
+            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+            : [num] "{x8}" (@intFromEnum(num)),
+              [a0] "{x0}" (a0),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
 }
 
 fn syscall2(num: SyscallNum, a0: u64, a1: u64) i64 {
-    return asm volatile ("syscall"
-        : [ret] "={rax}" (-> i64),
-        : [num] "{rax}" (@intFromEnum(num)),
-          [a0] "{rdi}" (a0),
-          [a1] "{rsi}" (a1),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
+    return switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("syscall"
+            : [ret] "={rax}" (-> i64),
+            : [num] "{rax}" (@intFromEnum(num)),
+              [a0] "{rdi}" (a0),
+              [a1] "{rsi}" (a1),
+            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+            : [num] "{x8}" (@intFromEnum(num)),
+              [a0] "{x0}" (a0),
+              [a1] "{x1}" (a1),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
 }
 
 fn syscall3(num: SyscallNum, a0: u64, a1: u64, a2: u64) i64 {
-    return asm volatile (
-        \\syscall
-        : [ret] "={rax}" (-> i64),
-        : [num] "{rax}" (@intFromEnum(num)),
-          [a0] "{rdi}" (a0),
-          [a1] "{rsi}" (a1),
-          [a2] "{rdx}" (a2),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
+    return switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile (
+            \\syscall
+            : [ret] "={rax}" (-> i64),
+            : [num] "{rax}" (@intFromEnum(num)),
+              [a0] "{rdi}" (a0),
+              [a1] "{rsi}" (a1),
+              [a2] "{rdx}" (a2),
+            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+            : [num] "{x8}" (@intFromEnum(num)),
+              [a0] "{x0}" (a0),
+              [a1] "{x1}" (a1),
+              [a2] "{x2}" (a2),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
 }
 
 fn syscall4(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64) i64 {
-    return asm volatile (
-        \\syscall
-        : [ret] "={rax}" (-> i64),
-        : [num] "{rax}" (@intFromEnum(num)),
-          [a0] "{rdi}" (a0),
-          [a1] "{rsi}" (a1),
-          [a2] "{rdx}" (a2),
-          [a3] "{r10}" (a3),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
+    return switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile (
+            \\syscall
+            : [ret] "={rax}" (-> i64),
+            : [num] "{rax}" (@intFromEnum(num)),
+              [a0] "{rdi}" (a0),
+              [a1] "{rsi}" (a1),
+              [a2] "{rdx}" (a2),
+              [a3] "{r10}" (a3),
+            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+            : [num] "{x8}" (@intFromEnum(num)),
+              [a0] "{x0}" (a0),
+              [a1] "{x1}" (a1),
+              [a2] "{x2}" (a2),
+              [a3] "{x3}" (a3),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
 }
 
 fn syscall5(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) i64 {
-    return asm volatile (
-        \\syscall
-        : [ret] "={rax}" (-> i64),
-        : [num] "{rax}" (@intFromEnum(num)),
-          [a0] "{rdi}" (a0),
-          [a1] "{rsi}" (a1),
-          [a2] "{rdx}" (a2),
-          [a3] "{r10}" (a3),
-          [a4] "{r8}" (a4),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
+    return switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile (
+            \\syscall
+            : [ret] "={rax}" (-> i64),
+            : [num] "{rax}" (@intFromEnum(num)),
+              [a0] "{rdi}" (a0),
+              [a1] "{rsi}" (a1),
+              [a2] "{rdx}" (a2),
+              [a3] "{r10}" (a3),
+              [a4] "{r8}" (a4),
+            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+            : [num] "{x8}" (@intFromEnum(num)),
+              [a0] "{x0}" (a0),
+              [a1] "{x1}" (a1),
+              [a2] "{x2}" (a2),
+              [a3] "{x3}" (a3),
+              [a4] "{x4}" (a4),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
 }
 
 fn syscall3_2(num: SyscallNum, a0: u64, a1: u64, a2: u64) SyscallResult2 {
     var val2: u64 = undefined;
-    const val = asm volatile ("syscall"
-        : [ret] "={rax}" (-> i64),
-          [out2] "={rdx}" (val2),
-        : [num] "{rax}" (@intFromEnum(num)),
-          [a0] "{rdi}" (a0),
-          [a1] "{rsi}" (a1),
-          [a2] "{rdx}" (a2),
-        : .{ .rcx = true, .r11 = true, .memory = true });
+    const val = switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("syscall"
+            : [ret] "={rax}" (-> i64),
+              [out2] "={rdx}" (val2),
+            : [num] "{rax}" (@intFromEnum(num)),
+              [a0] "{rdi}" (a0),
+              [a1] "{rsi}" (a1),
+              [a2] "{rdx}" (a2),
+            : .{ .rcx = true, .r11 = true, .memory = true }),
+        // aarch64: kernel writes ret2 to x1 (see kernel/arch/aarch64/exceptions.zig).
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+              [out2] "={x1}" (val2),
+            : [num] "{x8}" (@intFromEnum(num)),
+              [a0] "{x0}" (a0),
+              [a1] "{x1}" (a1),
+              [a2] "{x2}" (a2),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
     return .{ .val = val, .val2 = val2 };
 }
 
@@ -303,17 +373,31 @@ fn ipc_send_ex(target_handle: u64, words: []const u64, cap_transfer: bool) i64 {
     for (0..count) |i| w[i] = words[i];
     const meta: u64 = @as(u64, count) | (if (cap_transfer) @as(u64, 0x8) else 0);
 
-    return asm volatile ("syscall"
-        : [ret] "={rax}" (-> i64),
-        : [num] "{rax}" (@intFromEnum(SyscallNum.ipc_send)),
-          [tgt] "{r13}" (target_handle),
-          [m] "{r14}" (meta),
-          [w0] "{rdi}" (w[0]),
-          [w1] "{rsi}" (w[1]),
-          [w2] "{rdx}" (w[2]),
-          [w3] "{r8}" (w[3]),
-          [w4] "{r9}" (w[4]),
-        : .{ .rcx = true, .r11 = true, .memory = true });
+    return switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("syscall"
+            : [ret] "={rax}" (-> i64),
+            : [num] "{rax}" (@intFromEnum(SyscallNum.ipc_send)),
+              [tgt] "{r13}" (target_handle),
+              [m] "{r14}" (meta),
+              [w0] "{rdi}" (w[0]),
+              [w1] "{rsi}" (w[1]),
+              [w2] "{rdx}" (w[2]),
+              [w3] "{r8}" (w[3]),
+              [w4] "{r9}" (w[4]),
+            : .{ .rcx = true, .r11 = true, .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+            : [num] "{x8}" (@intFromEnum(SyscallNum.ipc_send)),
+              [tgt] "{x5}" (target_handle),
+              [m] "{x6}" (meta),
+              [w0] "{x0}" (w[0]),
+              [w1] "{x1}" (w[1]),
+              [w2] "{x2}" (w[2]),
+              [w3] "{x3}" (w[3]),
+              [w4] "{x4}" (w[4]),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
 }
 
 pub fn ipc_call(target_handle: u64, words: []const u64, reply: *IpcMessage) i64 {
@@ -337,7 +421,7 @@ fn ipc_call_ex(target_handle: u64, words: []const u64, cap_transfer: bool, reply
     var r_r9: u64 = undefined;
     var r_r14: u64 = undefined;
 
-    const ret = asm volatile ("syscall"
+    const ret: i64 = if (builtin.cpu.arch == .x86_64) asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
           [o0] "={rdi}" (r_rdi),
           [o1] "={rsi}" (r_rsi),
@@ -353,7 +437,28 @@ fn ipc_call_ex(target_handle: u64, words: []const u64, cap_transfer: bool, reply
           [w2] "{rdx}" (w[2]),
           [w3] "{r8}" (w[3]),
           [w4] "{r9}" (w[4]),
-        : .{ .rcx = true, .r11 = true, .memory = true });
+        : .{ .rcx = true, .r11 = true, .memory = true }) else blk: {
+        // aarch64: x0 is both syscall return and reply word 0 — capture once,
+        // mirror into r_rdi after the asm.
+        const r = asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+              [o1] "={x1}" (r_rsi),
+              [o2] "={x2}" (r_rdx),
+              [o3] "={x3}" (r_r8),
+              [o4] "={x4}" (r_r9),
+              [om] "={x6}" (r_r14),
+            : [num] "{x8}" (@intFromEnum(SyscallNum.ipc_call)),
+              [tgt] "{x5}" (target_handle),
+              [m] "{x6}" (meta),
+              [w0] "{x0}" (w[0]),
+              [w1] "{x1}" (w[1]),
+              [w2] "{x2}" (w[2]),
+              [w3] "{x3}" (w[3]),
+              [w4] "{x4}" (w[4]),
+            : .{ .memory = true });
+        r_rdi = @bitCast(r);
+        break :blk r;
+    };
 
     reply.words = .{ r_rdi, r_rsi, r_rdx, r_r8, r_r9 };
     reply.word_count = @truncate((r_r14 >> 1) & 0x7);
@@ -371,7 +476,7 @@ pub fn ipc_recv(blocking: bool, msg: *IpcMessage) i64 {
     var r_r9: u64 = undefined;
     var r_r14: u64 = undefined;
 
-    const ret = asm volatile ("syscall"
+    const ret: i64 = if (builtin.cpu.arch == .x86_64) asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
           [o0] "={rdi}" (r_rdi),
           [o1] "={rsi}" (r_rsi),
@@ -381,7 +486,20 @@ pub fn ipc_recv(blocking: bool, msg: *IpcMessage) i64 {
           [om] "={r14}" (r_r14),
         : [num] "{rax}" (@intFromEnum(SyscallNum.ipc_recv)),
           [m] "{r14}" (meta),
-        : .{ .rcx = true, .r11 = true, .r13 = true, .memory = true });
+        : .{ .rcx = true, .r11 = true, .r13 = true, .memory = true }) else blk: {
+        const r = asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+              [o1] "={x1}" (r_rsi),
+              [o2] "={x2}" (r_rdx),
+              [o3] "={x3}" (r_r8),
+              [o4] "={x4}" (r_r9),
+              [om] "={x6}" (r_r14),
+            : [num] "{x8}" (@intFromEnum(SyscallNum.ipc_recv)),
+              [m] "{x6}" (meta),
+            : .{ .memory = true });
+        r_rdi = @bitCast(r);
+        break :blk r;
+    };
 
     msg.words = .{ r_rdi, r_rsi, r_rdx, r_r8, r_r9 };
     msg.word_count = @truncate((r_r14 >> 1) & 0x7);
@@ -410,7 +528,7 @@ pub fn ipc_reply_recv(words: []const u64, blocking: bool, msg: *IpcMessage) i64 
     var r_r9: u64 = undefined;
     var r_r14: u64 = undefined;
 
-    const ret = asm volatile ("syscall"
+    const ret: i64 = if (builtin.cpu.arch == .x86_64) asm volatile ("syscall"
         : [ret] "={rax}" (-> i64),
           [o0] "={rdi}" (r_rdi),
           [o1] "={rsi}" (r_rsi),
@@ -425,7 +543,25 @@ pub fn ipc_reply_recv(words: []const u64, blocking: bool, msg: *IpcMessage) i64 
           [w2] "{rdx}" (w[2]),
           [w3] "{r8}" (w[3]),
           [w4] "{r9}" (w[4]),
-        : .{ .rcx = true, .r11 = true, .r13 = true, .memory = true });
+        : .{ .rcx = true, .r11 = true, .r13 = true, .memory = true }) else blk: {
+        const r = asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+              [o1] "={x1}" (r_rsi),
+              [o2] "={x2}" (r_rdx),
+              [o3] "={x3}" (r_r8),
+              [o4] "={x4}" (r_r9),
+              [om] "={x6}" (r_r14),
+            : [num] "{x8}" (@intFromEnum(SyscallNum.ipc_reply)),
+              [m] "{x6}" (meta),
+              [w0] "{x0}" (w[0]),
+              [w1] "{x1}" (w[1]),
+              [w2] "{x2}" (w[2]),
+              [w3] "{x3}" (w[3]),
+              [w4] "{x4}" (w[4]),
+            : .{ .memory = true });
+        r_rdi = @bitCast(r);
+        break :blk r;
+    };
 
     msg.words = .{ r_rdi, r_rsi, r_rdx, r_r8, r_r9 };
     msg.word_count = @truncate((r_r14 >> 1) & 0x7);
@@ -466,14 +602,25 @@ pub fn fault_reply_simple(token: u64, action: u64) i64 {
 /// Invoke `fault_reply` with explicit `flags` in r14 (e.g. FAULT_EXCLUDE_NEXT,
 /// FAULT_EXCLUDE_PERMANENT). `modified_regs_ptr` is passed via rdx.
 pub fn fault_reply_flags(token: u64, action: u64, modified_regs_ptr: u64, flags: u64) i64 {
-    return asm volatile ("syscall"
-        : [ret] "={rax}" (-> i64),
-        : [num] "{rax}" (@intFromEnum(SyscallNum.fault_reply)),
-          [a0] "{rdi}" (token),
-          [a1] "{rsi}" (action),
-          [a2] "{rdx}" (modified_regs_ptr),
-          [f] "{r14}" (flags),
-        : .{ .rcx = true, .r11 = true, .memory = true });
+    return switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("syscall"
+            : [ret] "={rax}" (-> i64),
+            : [num] "{rax}" (@intFromEnum(SyscallNum.fault_reply)),
+              [a0] "{rdi}" (token),
+              [a1] "{rsi}" (action),
+              [a2] "{rdx}" (modified_regs_ptr),
+              [f] "{r14}" (flags),
+            : .{ .rcx = true, .r11 = true, .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+            : [num] "{x8}" (@intFromEnum(SyscallNum.fault_reply)),
+              [a0] "{x0}" (token),
+              [a1] "{x1}" (action),
+              [a2] "{x2}" (modified_regs_ptr),
+              [f] "{x6}" (flags),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
 }
 
 pub fn fault_read_mem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64 {
@@ -754,14 +901,27 @@ fn ipc_reply_ex(words: []const u64, atomic_recv: bool, recv_blocking: bool, cap_
         (if (recv_blocking) @as(u64, 0x2) else 0) |
         (if (cap_transfer) @as(u64, 0x20) else 0);
 
-    return asm volatile ("syscall"
-        : [ret] "={rax}" (-> i64),
-        : [num] "{rax}" (@intFromEnum(SyscallNum.ipc_reply)),
-          [m] "{r14}" (meta),
-          [w0] "{rdi}" (w[0]),
-          [w1] "{rsi}" (w[1]),
-          [w2] "{rdx}" (w[2]),
-          [w3] "{r8}" (w[3]),
-          [w4] "{r9}" (w[4]),
-        : .{ .rcx = true, .r11 = true, .r13 = true, .memory = true });
+    return switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("syscall"
+            : [ret] "={rax}" (-> i64),
+            : [num] "{rax}" (@intFromEnum(SyscallNum.ipc_reply)),
+              [m] "{r14}" (meta),
+              [w0] "{rdi}" (w[0]),
+              [w1] "{rsi}" (w[1]),
+              [w2] "{rdx}" (w[2]),
+              [w3] "{r8}" (w[3]),
+              [w4] "{r9}" (w[4]),
+            : .{ .rcx = true, .r11 = true, .r13 = true, .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+            : [num] "{x8}" (@intFromEnum(SyscallNum.ipc_reply)),
+              [m] "{x6}" (meta),
+              [w0] "{x0}" (w[0]),
+              [w1] "{x1}" (w[1]),
+              [w2] "{x2}" (w[2]),
+              [w3] "{x3}" (w[3]),
+              [w4] "{x4}" (w[4]),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
 }
