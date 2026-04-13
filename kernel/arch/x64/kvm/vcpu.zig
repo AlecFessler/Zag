@@ -87,7 +87,7 @@ pub fn create(vm_obj: *Vm) !*VCpu {
 
     // Set up the thread context with the vCPU entry point
     const kstack_top = zag.memory.address.alignStack(thread.kernel_stack.top);
-    thread.ctx = interrupts.prepareThreadContext(kstack_top, null, &vcpuEntryPoint, 0);
+    thread.ctx = interrupts.prepareThreadContext(kstack_top, null, &vcpuEntryPoint, @intFromPtr(vcpu_obj));
 
     // Add thread to process thread list
     proc.lock.lock();
