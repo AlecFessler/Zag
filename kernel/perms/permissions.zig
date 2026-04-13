@@ -92,10 +92,7 @@ pub const ThreadHandleRights = packed struct(u8) {
     @"suspend": bool = false,
     @"resume": bool = false,
     kill: bool = false,
-    /// Bit 3 is reserved for layout alignment with the public spec layout
-    /// (see systems.md §4). Keep this as a _reserved single-bit slot so
-    /// `pmu` lands on bit 4 as the spec requires.
-    _reserved_bit3: u1 = 0,
+    unpin: bool = false,
     pmu: bool = false,
     _reserved: u3 = 0,
 
@@ -103,6 +100,7 @@ pub const ThreadHandleRights = packed struct(u8) {
         .@"suspend" = true,
         .@"resume" = true,
         .kill = true,
+        .unpin = true,
         .pmu = true,
     };
 };
@@ -142,17 +140,12 @@ pub const VmReservationObject = struct {
     original_size: u64,
 };
 
-pub const CorePinObject = struct {
-    core_id: u64,
-};
-
 pub const KernelObject = union(enum) {
     process: *Process,
     dead_process: *Process,
     vm_reservation: VmReservationObject,
     shared_memory: *SharedMemory,
     device_region: *DeviceRegion,
-    core_pin: CorePinObject,
     thread: *Thread,
     vm: *Vm,
     empty: void,
@@ -163,7 +156,6 @@ pub const UserViewEntryType = enum(u8) {
     vm_reservation = 1,
     shared_memory = 2,
     device_region = 3,
-    core_pin = 4,
     dead_process = 5,
     thread = 6,
     vm = 7,
@@ -199,19 +191,22 @@ pub const UserViewEntry = extern struct {
     /// cache bouncing on every dispatch. The observable state transitions
     /// that matter to userspace (.faulted, .suspended, .exited) have their
     /// own channels (fault_recv, syscall return codes, perm entry removal).
-    fn threadField0(t: *Thread) u64 {
-        return t.tid;
+    /// For thread entries, field0 packs: tid (bits 0-31), exclude_oneshot (bit 32),
+    /// exclude_permanent (bit 33).
+    fn threadField0(t: *Thread, entry: PermissionEntry) u64 {
+        return @as(u64, @as(u32, @truncate(t.tid))) |
+            (@as(u64, @intFromBool(entry.exclude_oneshot)) << 32) |
+            (@as(u64, @intFromBool(entry.exclude_permanent)) << 33);
     }
 
-    /// For thread entries, field1 exposes the fault-handler exclude flags
-    /// stored on the perm slot. Bit 0 = exclude_oneshot, bit 1 = exclude_permanent.
-    /// This lets a userspace fault handler observe the result of
-    /// `fault_set_thread_mode` and `fault_reply` with FAULT_EXCLUDE_* flags.
-    fn threadField1(entry: PermissionEntry) u64 {
-        var v: u64 = 0;
-        if (entry.exclude_oneshot) v |= 0x1;
-        if (entry.exclude_permanent) v |= 0x2;
-        return v;
+    /// For thread entries, field1 exposes the pinned core ID when the thread
+    /// is pinned, or zero when not pinned.
+    fn threadField1(t: *Thread) u64 {
+        if (t.priority == .pinned) {
+            const affinity = t.core_affinity orelse return 0;
+            return @ctz(affinity);
+        }
+        return 0;
     }
 
     pub fn fromKernelEntry(entry: PermissionEntry) UserViewEntry {
@@ -272,19 +267,12 @@ pub const UserViewEntry = extern struct {
                         (@as(u64, p.func) << 58);
                 },
             },
-            .core_pin => |cp| .{
-                .handle = entry.handle,
-                .entry_type = @intFromEnum(UserViewEntryType.core_pin),
-                .rights = entry.rights,
-                .field0 = cp.core_id,
-                .field1 = 0,
-            },
             .thread => |t| .{
                 .handle = entry.handle,
                 .entry_type = @intFromEnum(UserViewEntryType.thread),
                 .rights = entry.rights,
-                .field0 = threadField0(t),
-                .field1 = threadField1(entry),
+                .field0 = threadField0(t, entry),
+                .field1 = threadField1(t),
             },
             .vm => .{
                 .handle = entry.handle,
