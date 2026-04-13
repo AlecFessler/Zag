@@ -202,17 +202,27 @@ pub const Lapic = struct {
                 self.timer_current_count -= @truncate(ticks_elapsed);
             }
         } else if (timer_mode == 1) {
-            // Periodic: count down, reload from initial count, repeat
-            var remaining = ticks_elapsed;
-            while (remaining > 0) {
-                if (remaining >= self.timer_current_count) {
-                    remaining -= self.timer_current_count;
-                    self.timer_current_count = self.timer_initial_count;
-                    self.fireTimerInterrupt();
-                } else {
-                    self.timer_current_count -= @truncate(remaining);
-                    remaining = 0;
-                }
+            // Periodic: use O(1) modular arithmetic instead of iterating
+            // per-tick to prevent guest DoS (divisor=1, initial_count=1
+            // would otherwise cause ~1 billion iterations per second).
+            if (ticks_elapsed >= self.timer_current_count) {
+                // First period completes the current countdown.
+                const after_first = ticks_elapsed - self.timer_current_count;
+                // Remaining full periods after the first reload.
+                // Guard against initial_count == 0 (should not happen since
+                // we return early above, but be defensive).
+                const ic: u64 = self.timer_initial_count;
+                if (ic == 0) return;
+                const extra_fires = after_first / ic;
+                const leftover = after_first % ic;
+                // Total fires = 1 (first) + extra_fires.
+                // The interrupt only needs to fire once (or a small
+                // bounded number) — the IRR bit is idempotent.
+                _ = extra_fires;
+                self.timer_current_count = @truncate(ic - leftover);
+                self.fireTimerInterrupt();
+            } else {
+                self.timer_current_count -= @truncate(ticks_elapsed);
             }
         }
     }
