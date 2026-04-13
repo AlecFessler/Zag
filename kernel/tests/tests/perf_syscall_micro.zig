@@ -77,7 +77,6 @@ pub fn main(_: u64) void {
     _ = bench.runBench(.{ .name = "syscall_thread_kill_badh", .warmup = 1000, .iterations = 10000 }, benchKillBad);
     _ = bench.runBench(.{ .name = "syscall_mem_perms_badh", .warmup = 1000, .iterations = 10000 }, benchMemPermsBad);
     _ = bench.runBench(.{ .name = "syscall_mem_shm_map_badh", .warmup = 1000, .iterations = 10000 }, benchShmMapBad);
-    _ = bench.runBench(.{ .name = "syscall_mem_shm_unmap_badh", .warmup = 1000, .iterations = 10000 }, benchShmUnmapBad);
     _ = bench.runBench(.{ .name = "syscall_mem_mmio_map_badh", .warmup = 1000, .iterations = 10000 }, benchMmioMapBad);
     _ = bench.runBench(.{ .name = "syscall_mem_dma_map_badh", .warmup = 1000, .iterations = 10000 }, benchDmaMapBad);
     _ = bench.runBench(.{ .name = "syscall_ioport_read_badh", .warmup = 1000, .iterations = 10000 }, benchIoportReadBad);
@@ -158,10 +157,6 @@ fn benchMemPermsBad() void {
 
 fn benchShmMapBad() void {
     _ = syscall.mem_shm_map(t.BOGUS_HANDLE, t.BOGUS_HANDLE, 0);
-}
-
-fn benchShmUnmapBad() void {
-    _ = syscall.mem_shm_unmap(t.BOGUS_HANDLE, t.BOGUS_HANDLE);
 }
 
 fn benchMmioMapBad() void {

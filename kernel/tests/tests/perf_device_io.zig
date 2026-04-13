@@ -89,28 +89,34 @@ pub fn main(pv: u64) void {
     _ = syscall.set_affinity(1);
     _ = syscall.set_priority(syscall.PRIORITY_REALTIME);
 
+    // mem_mmio_unmap was removed; unmapping requires revoking the VM.
+    // Each iteration: reserve → mmio_map → revoke.
     var w: u32 = 0;
     while (w < 200) {
-        _ = syscall.mem_mmio_map(mmio_handle, vm_handle, 0);
-        _ = syscall.mem_mmio_unmap(mmio_handle, vm_handle);
+        const vm2 = syscall.mem_reserve(0, size, vm_rights);
+        if (vm2.val >= 0) {
+            _ = syscall.mem_mmio_map(mmio_handle, @bitCast(vm2.val), 0);
+            _ = syscall.revoke_perm(@bitCast(vm2.val));
+        }
         w += 1;
     }
 
     var i: u32 = 0;
     while (i < ITERATIONS) {
+        const vm2 = syscall.mem_reserve(0, size, vm_rights);
+        if (vm2.val < 0) break;
+        const vm2_h: u64 = @bitCast(vm2.val);
         const t0 = bench.rdtscp();
-        const map_rc = syscall.mem_mmio_map(mmio_handle, vm_handle, 0);
-        const unmap_rc = syscall.mem_mmio_unmap(mmio_handle, vm_handle);
+        const map_rc = syscall.mem_mmio_map(mmio_handle, vm2_h, 0);
         const t1 = bench.rdtscp();
-        if (map_rc != 0 or unmap_rc != 0) break;
+        _ = syscall.revoke_perm(vm2_h);
+        if (map_rc != 0) break;
         buf[i] = t1 -% t0;
         i += 1;
     }
     if (i > 0) {
-        bench.report("mmio_map_unmap", bench.computeStats(buf[0..i], @intCast(i)));
+        bench.report("mmio_map", bench.computeStats(buf[0..i], @intCast(i)));
     }
-
-    _ = syscall.revoke_perm(vm_handle);
     syscall.shutdown();
 }
 

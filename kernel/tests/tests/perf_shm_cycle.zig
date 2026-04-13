@@ -64,7 +64,10 @@ pub fn main(_: u64) void {
         bench.report("shm_create", bench.computeStats(buf[0..i], @intCast(i)));
     }
 
-    // --- shm_map / shm_unmap bench: steady-state shm + VM ---
+    // --- shm_map bench: map into a fresh VM reservation each iter ---
+    // mem_shm_unmap was removed from the API; unmapping requires
+    // revoking the VM reservation. So each iteration is:
+    // mem_reserve → mem_shm_map → revoke_perm(vm_h).
     const shm_rc = syscall.shm_create_with_rights(shm_size, shm_rights);
     if (shm_rc < 0) {
         syscall.write("[PERF] shm_map SKIP create failed\n");
@@ -72,40 +75,33 @@ pub fn main(_: u64) void {
     }
     const shm_handle: u64 = @bitCast(shm_rc);
 
-    // Measure map+unmap as a pair on a stable VM reservation. Reusing
-    // one VM slot keeps the kernel's VA allocator state fixed across
-    // iterations so we measure the shm_map/unmap fast path, not the
-    // mem_reserve steady-state churn.
-    const stable_vm = syscall.mem_reserve(0, shm_size, vm_rights);
-    if (stable_vm.val < 0) {
-        syscall.write("[PERF] shm_map SKIP mem_reserve failed\n");
-        _ = syscall.revoke_perm(shm_handle);
-        syscall.shutdown();
-    }
-    const stable_vm_h: u64 = @bitCast(stable_vm.val);
-
     w = 0;
     while (w < 100) {
-        _ = syscall.mem_shm_map(shm_handle, stable_vm_h, 0);
-        _ = syscall.mem_shm_unmap(shm_handle, stable_vm_h);
+        const vm2 = syscall.mem_reserve(0, shm_size, vm_rights);
+        if (vm2.val >= 0) {
+            _ = syscall.mem_shm_map(shm_handle, @bitCast(vm2.val), 0);
+            _ = syscall.revoke_perm(@bitCast(vm2.val));
+        }
         w += 1;
     }
 
     i = 0;
     while (i < ITERATIONS) {
+        const vm2 = syscall.mem_reserve(0, shm_size, vm_rights);
+        if (vm2.val < 0) break;
+        const vm2_h: u64 = @bitCast(vm2.val);
         const t0 = bench.rdtscp();
-        const map_rc = syscall.mem_shm_map(shm_handle, stable_vm_h, 0);
-        const unmap_rc = syscall.mem_shm_unmap(shm_handle, stable_vm_h);
+        const map_rc = syscall.mem_shm_map(shm_handle, vm2_h, 0);
         const t1 = bench.rdtscp();
-        if (map_rc != 0 or unmap_rc != 0) break;
+        _ = syscall.revoke_perm(vm2_h);
+        if (map_rc != 0) break;
         buf[i] = t1 -% t0;
         i += 1;
     }
     if (i > 0) {
-        bench.report("shm_map_unmap_pair", bench.computeStats(buf[0..i], @intCast(i)));
+        bench.report("shm_map", bench.computeStats(buf[0..i], @intCast(i)));
     }
 
-    _ = syscall.revoke_perm(stable_vm_h);
     _ = syscall.revoke_perm(shm_handle);
 
     // --- Full cycle: what a transient zero-copy channel costs ---
@@ -122,7 +118,6 @@ pub fn main(_: u64) void {
         }
         const vm_h: u64 = @bitCast(vm.val);
         _ = syscall.mem_shm_map(c_h, vm_h, 0);
-        _ = syscall.mem_shm_unmap(c_h, vm_h);
         _ = syscall.revoke_perm(vm_h);
         _ = syscall.revoke_perm(c_h);
         const t1 = bench.rdtscp();
