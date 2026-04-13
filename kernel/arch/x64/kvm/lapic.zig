@@ -254,8 +254,24 @@ pub const Lapic = struct {
     }
 
     /// Set the IRR bit for an external interrupt vector.
-    /// Used by the IOAPIC to deliver interrupts to this LAPIC.
+    /// Used by the IOAPIC and the `vm_vcpu_interrupt` syscall to deliver
+    /// interrupts to this LAPIC.
+    ///
+    /// Intel SDM Vol 3A §10.5.2 ("Valid Interrupt Vectors"): only vectors
+    /// 16..255 are legal for the Local APIC. Vectors 0..15 are reserved
+    /// for processor-defined exceptions. §10.5.3 (ESR, Figure 10-9)
+    /// specifies that a LAPIC which *receives* an illegal vector must
+    /// set ESR bit 6 ("Received Illegal Vector") and drop the
+    /// interrupt. This mirrors the sibling `fireTimerInterrupt` check,
+    /// which uses ESR bit 5 ("Send Illegal Vector") because that path
+    /// is the LAPIC sending to itself.
     pub fn injectExternal(self: *Lapic, vector: u8) void {
+        if (vector < 16) {
+            // Illegal vector -- set ESR bit 6 (received illegal vector)
+            // and drop the interrupt without modifying IRR.
+            self.esr_shadow |= (1 << 6);
+            return;
+        }
         setBit(&self.irr, vector);
     }
 

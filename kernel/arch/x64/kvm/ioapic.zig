@@ -174,7 +174,13 @@ pub const Ioapic = struct {
                 self.lapic.injectExternal(vector);
             },
             0b111 => {
-                // ExtINT -- deliver as external interrupt
+                // ExtINT -- deliver as external interrupt.
+                // Intel SDM Vol 3A §10.5.2: vectors 0..15 are illegal
+                // for the LAPIC regardless of delivery mode. Drop to
+                // match the Fixed/Lowest-Priority path above; the
+                // receiving LAPIC would otherwise latch the bogus
+                // vector in IRR.
+                if (vector < 16) return;
                 self.lapic.injectExternal(vector);
             },
             else => {}, // SMI, NMI, INIT -- stubbed
