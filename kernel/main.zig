@@ -55,22 +55,33 @@ fn kMain(boot_info: *BootInfo) !void {
     try memory.init(boot_info.mmap);
     arch.earlyDebugChar('h');
     try memory.initHeap();
+    arch.earlyDebugChar('H');
     debug_info.init(boot_info.elf_blob.ptr, boot_info.elf_blob.len, boot_info.kaslr_slide, memory.heap_allocator);
+    arch.earlyDebugChar('I');
     try arch.parseFirmwareTables(boot_info.xsdp_phys);
+    arch.earlyDebugChar('J');
     arch.vmInit();
+    arch.earlyDebugChar('K');
     arch.pmuInit();
+    arch.earlyDebugChar('L');
     arch.sysInfoInit();
-    // Wall clock offset init: read RTC once at boot (systems.md §22).
+    arch.earlyDebugChar('N');
     const rtc_nanos = arch.readRtc();
     const monotonic_now = arch.getMonotonicClock().now();
     syscall.clock.wall_offset = @as(i64, @bitCast(rtc_nanos)) -% @as(i64, @bitCast(monotonic_now));
+    arch.earlyDebugChar('O');
     device_registry.registerDisplayDevice(boot_info.framebuffer);
+    arch.earlyDebugChar('P');
     try sched.globalInit();
+    arch.earlyDebugChar('Q');
     const rs_phys = PAddr.fromInt(@intFromPtr(boot_info.root_service.ptr));
     const rs_virt = VAddr.fromPAddr(rs_phys, null);
     const rs_ptr: [*]const u8 = @ptrFromInt(rs_virt.addr);
     try userspace_init.init(rs_ptr[0..boot_info.root_service.len]);
+    arch.earlyDebugChar('R');
     try arch.smpInit();
+    arch.earlyDebugChar('S');
     sched.perCoreInit();
+    arch.earlyDebugChar('U');
     arch.halt();
 }
