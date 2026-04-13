@@ -452,7 +452,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
 }
 
 pub fn yield() void {
-    arch.triggerSchedulerInterrupt(arch.coreID());
+    arch.triggerSchedulerInterruptSelf();
 }
 
 /// Pin the calling thread exclusively to a single core. The thread becomes

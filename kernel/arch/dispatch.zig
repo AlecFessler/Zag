@@ -815,6 +815,20 @@ pub fn triggerSchedulerInterrupt(core_id: u64) void {
     }
 }
 
+/// Fast-path self-scheduler-interrupt for the local core. Used by `yield()`
+/// to skip the APIC self-IPI path, which on x2APIC issues a WRMSR that
+/// typically causes a KVM vm-exit (~5K cycles round trip). On x86-64 we
+/// instead execute `int 0xFE` — a software interrupt directly dispatched
+/// through the IDT in guest mode without a vm-exit. On aarch64 there is no
+/// analogous cheap path, so we fall back to the GIC SGI sender.
+pub inline fn triggerSchedulerInterruptSelf() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("int $0xFE" ::: .{ .memory = true }),
+        .aarch64 => aarch64.gic.sendIpiToCore(coreID(), sched_ipi_vector),
+        else => unreachable,
+    }
+}
+
 pub fn readTimestamp() u64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.cpu.rdtscLFenced(),
