@@ -72,23 +72,10 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
         },
         .process => |proc_ptr| {
             if (handle_val == 0) {
+                sender_proc.perm_lock.unlock();
                 // Sending HANDLE_SELF: gives recipient a process handle to the sender.
-                // §4.1.2 restricts the `fault_handler` ProcessHandleRights bit to
-                // "at most one external process per target" — and §4.1.3 describes
-                // the transfer as moving a right the sender *held*. A sender that
-                // does not currently hold `ProcessRights.fault_handler` on slot 0
-                // cannot grant it away; doing so would let an unprivileged process
-                // install an arbitrary receiver as its own fault handler, letting
-                // the receiver acquire thread handles with full ThreadHandleRights
-                // including `pmu` (§4.1.42). Reject with E_PERM — mirrors the
-                // grant check in the SHM and external-process arms.
                 const granted_u16: u16 = @truncate(rights_val);
                 const granted_phr: ProcessHandleRights = @bitCast(granted_u16);
-                if (granted_phr.fault_handler and !sender_proc.perm_table[0].processRights().fault_handler) {
-                    sender_proc.perm_lock.unlock();
-                    return E_PERM;
-                }
-                sender_proc.perm_lock.unlock();
 
                 // If fault_handler bit is set, handle the fault_handler transfer.
                 // §2.12.3 requires the routing change to be atomic so a fault
@@ -158,47 +145,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                             .object = .{ .process = proc_ptr },
                             .rights = granted_u16,
                         }) catch {
-                            // Rollback the partially committed fault_handler
-                            // transfer in reverse order of commit. Without
-                            // this, the sender is left with
-                            // `fault_handler_proc = target_proc` and a cleared
-                            // slot-0 bit, linked into target's
-                            // fault_handler_targets list — but no handle to
-                            // the sender exists in target. Subsequent faults
-                            // would route to target with no way for target to
-                            // receive them, and releaseFaultHandler on target
-                            // death would restore the slot-0 bit using
-                            // had_self_fault_handler while target never had
-                            // the relationship reflected in its perm table.
                             _ = @atomicRmw(u32, &proc_ptr.handle_refcount, .Sub, 1, .acq_rel);
-
-                            // 1. Unlink sender from target's fault_handler_targets list.
-                            target_proc.unlinkFaultHandlerTarget(sender_proc);
-
-                            // 2. Restore sender's slot-0 fault_handler bit and
-                            //    clear fault_handler_proc, reverting to
-                            //    self-handling. Ordering mirrors the
-                            //    linkFaultHandlerTarget-failure rollback
-                            //    above: under sender_proc.lock nested with
-                            //    perm_lock.
-                            sender_proc.lock.lock();
-                            sender_proc.fault_handler_proc = null;
-                            sender_proc.perm_lock.lock();
-                            var rb_rights = sender_proc.perm_table[0].processRights();
-                            // Only restore the bit if the sender originally
-                            // had it — mirrors releaseFaultHandler semantics
-                            // so we don't synthesize a right that wasn't held
-                            // at the moment of transfer. Bug A's check above
-                            // ensures had_self_fault_handler was true when we
-                            // reach this path, but we stay consistent with
-                            // the released-handler invariant.
-                            if (sender_proc.had_self_fault_handler) {
-                                rb_rights.fault_handler = true;
-                                sender_proc.perm_table[0].rights = @bitCast(rb_rights);
-                                sender_proc.syncUserView();
-                            }
-                            sender_proc.perm_lock.unlock();
-                            sender_proc.lock.unlock();
                             return E_MAXCAP;
                         };
                     }
