@@ -722,7 +722,7 @@ pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
     }
 }
 
-pub fn getPreemptionTimer() Timer {
+pub inline fn getPreemptionTimer() Timer {
     switch (builtin.cpu.arch) {
         .x86_64 => return x64.timers.getPreemptionTimer(),
         .aarch64 => return aarch64.timers.getPreemptionTimer(),
@@ -730,7 +730,7 @@ pub fn getPreemptionTimer() Timer {
     }
 }
 
-pub fn getMonotonicClock() Timer {
+pub inline fn getMonotonicClock() Timer {
     switch (builtin.cpu.arch) {
         .x86_64 => return x64.timers.getMonotonicClock(),
         .aarch64 => return aarch64.timers.getMonotonicClock(),

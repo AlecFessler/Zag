@@ -38,7 +38,9 @@ pub fn init() void {
     dispatch.earlyDebugChar('3');
     serial.init();
     dispatch.earlyDebugChar('4');
-    gic.init();
+    // NOTE: GIC init is deferred to acpi.parseAcpi() — the distributor
+    // and redistributor base addresses come from MADT, which has not
+    // been parsed yet at this point.
     dispatch.earlyDebugChar('5');
 }
 

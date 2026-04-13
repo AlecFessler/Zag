@@ -560,11 +560,8 @@ fn secondaryEntry() callconv(.naked) noreturn {
 /// Secondary core setup after MMU is enabled and stack is established.
 /// Called from secondaryEntry with core_idx in x0, running at kernel VA.
 fn secondarySetup(core_idx: u64) callconv(.c) noreturn {
-    arch.earlyDebugChar('$');
-
     // Initialize the GIC redistributor and CPU interface for this core.
     gic.initSecondaryCoreGic(@intCast(core_idx));
-    arch.earlyDebugChar('%');
 
     // Signal to the BSP that this core is online.
     _ = cores_online.fetchAdd(1, .release);
