@@ -78,7 +78,11 @@ fn kMain(boot_info: *BootInfo) !void {
     const rs_phys = PAddr.fromInt(@intFromPtr(boot_info.root_service.ptr));
     const rs_virt = VAddr.fromPAddr(rs_phys, null);
     const rs_ptr: [*]const u8 = @ptrFromInt(rs_virt.addr);
-    try userspace_init.init(rs_ptr[0..boot_info.root_service.len]);
+    userspace_init.init(rs_ptr[0..boot_info.root_service.len]) catch |e| {
+        arch.earlyDebugChar('!');
+        _ = e;
+        return error.InitFailed;
+    };
     arch.earlyDebugChar('R');
     try arch.smpInit();
     arch.earlyDebugChar('S');
