@@ -199,45 +199,39 @@ Virtual memory is managed per-process through **VM reservations** — contiguous
 
 `VmReservationRights` bits: `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4), `write_combining`(5). `shareable` and `mmio` are mutually exclusive. `write_combining` requires `mmio`.
 
-`mem_perms` adjusts the effective access rights on a sub-range within a reservation. **§2.3.1** Setting RWX = 0 via `mem_perms` decommits the range: pages are freed and the VA range returns to demand-paged state. **§2.3.2** Pages demand-paged after decommit are guaranteed to be zeroed. **§2.3.3** `mem_perms` with non-zero RWX takes effect: accessing the range respects the new permissions (e.g., writing to a read-only range faults).
+`mem_perms` adjusts the effective access rights on a sub-range within a reservation. **§2.3.1** `mem_perms` with RWX = 0 returns `E_INVAL`. **§2.3.2** Pages demand-paged after unmap are guaranteed to be zeroed. **§2.3.3** `mem_perms` with non-zero RWX takes effect: accessing the range respects the new permissions (e.g., writing to a read-only range faults).
 
 `mem_shm_map` maps a shared memory region into a reservation at a specified offset. The reservation must have the `shareable` right, and the SHM's RWX rights must not exceed the reservation's max rights. **§2.3.4** `mem_shm_map` maps the full SHM region at the specified offset. SHM pages are eagerly mapped — they're immediately accessible without demand-paging.
-
-**§2.3.5** `mem_shm_unmap` removes the SHM mapping from the reservation. **§2.3.6** After `mem_shm_unmap`, the range reverts to private with max RWX rights.
 
 `mem_mmio_map` maps a device's MMIO region into a reservation. The reservation must have the `mmio` right plus at least `read` or `write`. MMIO mappings use uncacheable attributes by default; if the reservation has the `write_combining` right, write-combining attributes are used instead.
 
 Mapping a `port_io` device via `mem_mmio_map` creates a virtual BAR. The reservation must have `mmio` plus at least `read` or `write`. The `write_combining` right is incompatible with virtual BAR mappings and returns `E_INVAL`. Virtual BAR mappings appear as a normal RW region in the VMM tree and user permissions view. PTEs are intentionally absent.
 
-**§2.3.7** After `mem_mmio_unmap`, the range reverts to private with max RWX rights.
+`mem_unmap` strips all PTEs from a specified range within a reservation, reverting every node in the range to private demand-paged state. **§2.3.5** After `mem_unmap`, unmapped private nodes revert to demand-paged state with max RWX rights. **§2.3.6** After `mem_unmap`, pages demand-paged into the unmapped range are guaranteed to be zeroed. **§2.3.7** SHM, MMIO, and virtual BAR nodes must be fully contained within the `mem_unmap` range — partial overlap with any such node returns `E_INVAL`. The operation is all-or-nothing per non-private node. **§2.3.8** Private nodes may be partially unmapped — the VMM split logic handles boundary splitting as it does for `mem_perms`. **§2.3.9** The process retains all associated handles (SHM handles, device handles) after `mem_unmap`.
 
-**§2.3.8** revoking a VM reservation frees all pages in the range and clears the perm slot.
+**§2.3.10** Revoking a VM reservation frees all pages in the range and clears the perm slot. The process retains the VM reservation handle after `mem_unmap` — only `revoke_perm` performs full reservation teardown.
 
-**§2.3.9** VM reservation handles are not transferable via message passing.
+**§2.3.11** VM reservation handles are not transferable via message passing.
 
 #### mem_reserve(hint, size, max_perms) → handle
 
-Reserves a contiguous VA range, creating a private demand-paged region and a permissions table entry. **§2.3.10** `mem_reserve` returns handle ID (positive) on success. **§2.3.11** `mem_reserve` returns vaddr via second return register. **§2.3.12** `mem_reserve` with hint in the static reservation zone uses that address (if no overlap). **§2.3.13** `mem_reserve` with zero hint finds a free range. **§2.3.14** `mem_reserve` requires `mem_reserve` right — returns `E_PERM` without it. **§2.3.15** `mem_reserve` with zero size returns `E_INVAL`. **§2.3.16** `mem_reserve` with non-page-aligned size returns `E_INVAL`. **§2.3.17** `mem_reserve` with `shareable` + `mmio` both set returns `E_INVAL`. **§2.3.18** `mem_reserve` with `write_combining` without `mmio` returns `E_INVAL`. Returns `E_NOMEM` on memory exhaustion or `E_MAXCAP` when the permissions table is full.
+Reserves a contiguous VA range, creating a private demand-paged region and a permissions table entry. **§2.3.12** `mem_reserve` returns handle ID (positive) on success. **§2.3.13** `mem_reserve` returns vaddr via second return register. **§2.3.14** `mem_reserve` with hint in the static reservation zone uses that address (if no overlap). **§2.3.15** `mem_reserve` with zero hint finds a free range. **§2.3.16** `mem_reserve` requires `mem_reserve` right — returns `E_PERM` without it. **§2.3.17** `mem_reserve` with zero size returns `E_INVAL`. **§2.3.18** `mem_reserve` with non-page-aligned size returns `E_INVAL`. **§2.3.19** `mem_reserve` with `shareable` + `mmio` both set returns `E_INVAL`. **§2.3.20** `mem_reserve` with `write_combining` without `mmio` returns `E_INVAL`. Returns `E_NOMEM` on memory exhaustion or `E_MAXCAP` when the permissions table is full.
 
 #### mem_perms(vm_handle, offset, size, perms) → result
 
-Adjusts effective access rights on a sub-range within a VM reservation. **§2.3.19** `mem_perms` returns `E_OK` on success. **§2.3.20** `mem_perms` with invalid handle returns `E_BADHANDLE`. **§2.3.21** `mem_perms` with non-`vm_reservation` handle returns `E_BADHANDLE`. **§2.3.22** `mem_perms` with non-page-aligned offset returns `E_INVAL`. **§2.3.23** `mem_perms` with zero size returns `E_INVAL`. **§2.3.24** `mem_perms` with non-page-aligned size returns `E_INVAL`. **§2.3.25** `mem_perms` with `shareable`/`mmio`/`write_combining` bits returns `E_INVAL`. **§2.3.26** `mem_perms` with out-of-bounds range returns `E_INVAL`. **§2.3.27** `mem_perms` with perms exceeding `max_rights` returns `E_PERM`. **§2.3.28** `mem_perms` on a range containing SHM or MMIO nodes returns `E_INVAL`.
+Adjusts effective access rights on a sub-range within a VM reservation. **§2.3.21** `mem_perms` returns `E_OK` on success. **§2.3.22** `mem_perms` with invalid handle returns `E_BADHANDLE`. **§2.3.23** `mem_perms` with non-`vm_reservation` handle returns `E_BADHANDLE`. **§2.3.24** `mem_perms` with non-page-aligned offset returns `E_INVAL`. **§2.3.25** `mem_perms` with zero size returns `E_INVAL`. **§2.3.26** `mem_perms` with non-page-aligned size returns `E_INVAL`. **§2.3.27** `mem_perms` with `shareable`/`mmio`/`write_combining` bits returns `E_INVAL`. **§2.3.28** `mem_perms` with out-of-bounds range returns `E_INVAL`. **§2.3.29** `mem_perms` with perms exceeding `max_rights` returns `E_PERM`. **§2.3.30** `mem_perms` on a range containing SHM or MMIO nodes returns `E_INVAL`. **§2.3.31** `mem_perms` with RWX = 0 returns `E_INVAL`.
 
 #### mem_shm_map(shm_handle, vm_handle, offset) → result
 
-Maps a full SHM region into a reservation at the given offset. **§2.3.29** `mem_shm_map` returns `E_OK` on success. **§2.3.30** `mem_shm_map` with invalid `shm_handle` returns `E_BADHANDLE`. **§2.3.31** `mem_shm_map` with invalid `vm_handle` returns `E_BADHANDLE`. **§2.3.32** `mem_shm_map` without `shareable` right on reservation returns `E_PERM`. **§2.3.33** `mem_shm_map` with SHM RWX exceeding reservation max returns `E_PERM`. **§2.3.34** `mem_shm_map` with non-page-aligned offset returns `E_INVAL`. **§2.3.35** `mem_shm_map` with out-of-bounds range returns `E_INVAL`. **§2.3.36** `mem_shm_map` with duplicate SHM in same reservation returns `E_INVAL`. **§2.3.37** `mem_shm_map` with committed pages in range returns `E_EXIST`.
+Maps a full SHM region into a reservation at the given offset. **§2.3.32** `mem_shm_map` returns `E_OK` on success. **§2.3.33** `mem_shm_map` with invalid `shm_handle` returns `E_BADHANDLE`. **§2.3.34** `mem_shm_map` with invalid `vm_handle` returns `E_BADHANDLE`. **§2.3.35** `mem_shm_map` without `shareable` right on reservation returns `E_PERM`. **§2.3.36** `mem_shm_map` with SHM RWX exceeding reservation max returns `E_PERM`. **§2.3.37** `mem_shm_map` with non-page-aligned offset returns `E_INVAL`. **§2.3.38** `mem_shm_map` with out-of-bounds range returns `E_INVAL`. **§2.3.39** `mem_shm_map` with duplicate SHM in same reservation returns `E_INVAL`. **§2.3.40** `mem_shm_map` with committed pages in range returns `E_EXIST`.
 
-#### mem_shm_unmap(shm_handle, vm_handle) → result
+#### mem_unmap(vm_handle, offset, size) → result
 
-Removes an SHM mapping from a reservation. The process retains the handle. **§2.3.38** `mem_shm_unmap` returns `E_OK` on success. **§2.3.39** `mem_shm_unmap` with invalid handle returns `E_BADHANDLE`. **§2.3.40** `mem_shm_unmap` when SHM is not mapped returns `E_NOENT`. **§2.3.41** Process retains SHM handle after `mem_shm_unmap`.
+Strips all PTEs from the specified range within a reservation, reverting every node in the range to private demand-paged state. The process retains all associated handles (SHM handles, device handles) after unmap. **§2.3.41** `mem_unmap` returns `E_OK` on success. **§2.3.42** `mem_unmap` with invalid or non-`vm_reservation` `vm_handle` returns `E_BADHANDLE`. **§2.3.43** `mem_unmap` with non-page-aligned `offset` returns `E_INVAL`. **§2.3.44** `mem_unmap` with zero `size` returns `E_INVAL`. **§2.3.45** `mem_unmap` with non-page-aligned `size` returns `E_INVAL`. **§2.3.46** `mem_unmap` with out-of-bounds range returns `E_INVAL`. **§2.3.47** `mem_unmap` where the range partially overlaps an SHM, MMIO, or virtual BAR node returns `E_INVAL`. **§2.3.48** Private nodes may be partially unmapped; the VMM split logic handles boundary splitting. **§2.3.49** The process retains the VM reservation handle after `mem_unmap` — only `revoke_perm` performs full reservation teardown.
 
 #### mem_mmio_map(device_handle, vm_handle, offset) → result
 
-Maps a device's MMIO region into a reservation. **§2.3.42** `mem_mmio_map` returns `E_OK` on success. **§2.3.43** `mem_mmio_map` with invalid `device_handle` returns `E_BADHANDLE`. **§2.3.44** `mem_mmio_map` with invalid `vm_handle` returns `E_BADHANDLE`. **§2.3.45** `mem_mmio_map` without `map` right returns `E_PERM`. **§2.3.46** `mem_mmio_map` without `mmio` right on reservation returns `E_PERM`. **§2.3.47** `mem_mmio_map` without `read` or `write` right on reservation returns `E_PERM`. **§2.3.48** `mem_mmio_map` with non-page-aligned offset returns `E_INVAL`. **§2.3.49** `mem_mmio_map` with out-of-bounds range returns `E_INVAL`. **§2.3.50** `mem_mmio_map` with duplicate device region returns `E_INVAL`. **§2.3.51** `port_io` devices are valid targets for `mem_mmio_map`; the mapped size for `port_io` devices is `ceil(port_count / PAGE_SIZE) * PAGE_SIZE`. **§2.3.52** `mem_mmio_map` with committed pages in range returns `E_EXIST`. **§2.3.53** `mem_mmio_map` with `write_combining` reservation right on a `port_io` device returns `E_INVAL`.
-
-#### mem_mmio_unmap(device_handle, vm_handle) → result
-
-**§2.3.54** `mem_mmio_unmap` returns `E_OK` on success. **§2.3.55** `mem_mmio_unmap` with invalid handle returns `E_BADHANDLE`. **§2.3.56** `mem_mmio_unmap` when MMIO is not mapped returns `E_NOENT`.
+Maps a device's MMIO region into a reservation. **§2.3.50** `mem_mmio_map` returns `E_OK` on success. **§2.3.51** `mem_mmio_map` with invalid `device_handle` returns `E_BADHANDLE`. **§2.3.52** `mem_mmio_map` with invalid `vm_handle` returns `E_BADHANDLE`. **§2.3.53** `mem_mmio_map` without `map` right returns `E_PERM`. **§2.3.54** `mem_mmio_map` without `mmio` right on reservation returns `E_PERM`. **§2.3.55** `mem_mmio_map` without `read` or `write` right on reservation returns `E_PERM`. **§2.3.56** `mem_mmio_map` with non-page-aligned offset returns `E_INVAL`. **§2.3.57** `mem_mmio_map` with out-of-bounds range returns `E_INVAL`. **§2.3.58** `mem_mmio_map` with duplicate device region returns `E_INVAL`. **§2.3.59** `port_io` devices are valid targets for `mem_mmio_map`; the mapped size for `port_io` devices is `ceil(port_count / PAGE_SIZE) * PAGE_SIZE`. **§2.3.60** `mem_mmio_map` with committed pages in range returns `E_EXIST`. **§2.3.61** `mem_mmio_map` with `write_combining` reservation right on a `port_io` device returns `E_INVAL`.
 
 ---
 
@@ -961,9 +955,8 @@ All syscalls return `i64`. Non-negative = success, negative = error code. Sizes 
 | 4 | `mem_perms` | §2.3 |
 | 5 | `mem_shm_create` | §3.1 |
 | 6 | `mem_shm_map` | §2.3 |
-| 7 | `mem_shm_unmap` | §2.3 |
+| 7 | `mem_unmap` | §2.3 |
 | 8 | `mem_mmio_map` | §2.3 |
-| 9 | `mem_mmio_unmap` | §2.3 |
 | 10 | `proc_create` | §2.1 |
 | 11 | `thread_create` | §2.2 |
 | 12 | `thread_exit` | §2.2 |

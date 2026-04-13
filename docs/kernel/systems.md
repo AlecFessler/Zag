@@ -92,11 +92,11 @@ kernel/
     dispatch.zig         -- SyscallNum enum, SyscallResult type, dispatch switch table
     errors.zig           -- syscall error code constants (E_OK, E_INVAL, etc.)
     clock.zig            -- clock_gettime, clock_getwall, clock_setwall, wall_offset
-    device.zig           -- mmio_map/unmap, irq_ack, dma_map/unmap
+    device.zig           -- mmio_map, irq_ack, dma_map/unmap
     fault.zig            -- fault_recv, fault_reply, fault_read_mem, fault_write_mem, fault_set_thread_mode
     futex.zig            -- futex_wait, futex_wake
     ipc.zig              -- ipc_send, ipc_call, ipc_recv, ipc_reply, capability transfer
-    memory.zig           -- mem_reserve, mem_perms, shm_create/map/unmap
+    memory.zig           -- mem_reserve, mem_perms, mem_unmap, shm_create/map
     pmu.zig              -- generic PMU syscall layer, PmuStateAllocator slab owner
     process.zig          -- proc_create, revoke_perm, disable_restart
     sysinfo.zig          -- generic sys_info syscall layer
@@ -343,7 +343,21 @@ The VMM cursor (`range_start` field, advanced during allocation) advances monoto
 
 ### splitNode
 
-Splits a VmNode at a page-aligned offset into two new nodes. Both halves inherit: `kind`, `rights`, `handle`, `restart_policy`. The original node is removed from the tree and replaced with two new nodes. Used by `mem_perms`, `mem_shm_map`, `mem_mmio_map` to operate on sub-ranges of reservations.
+Splits a VmNode at a page-aligned offset into two new nodes. Both halves inherit: `kind`, `rights`, `handle`, `restart_policy`. The original node is removed from the tree and replaced with two new nodes. Used by `mem_perms`, `mem_unmap`, `mem_shm_map`, `mem_mmio_map` to operate on sub-ranges of reservations.
+
+### mem_unmap
+
+`mem_unmap` operates in two passes:
+
+1. **Validation pass**: Iterates all nodes in the range. For each non-private node (SHM, MMIO, virtual BAR), verifies that the node is fully contained within the requested range. If any non-private node is only partially overlapped, the syscall returns `E_INVAL` without modifying any state. This makes the operation all-or-nothing with respect to non-private nodes.
+
+2. **Unmap pass**: Iterates all nodes in the range. For private nodes at the boundaries, `splitNode` is used to split at the range edges (same logic as `mem_perms`). For each node in the range:
+   - Private nodes: PTEs are stripped and committed pages are freed. The node reverts to demand-paged state with the reservation's max RWX rights.
+   - SHM nodes: PTEs are stripped, the SHM backing is detached from the node, and the node kind is set to `private` with the reservation's max RWX rights. The SHM handle remains in the process's permissions table.
+   - MMIO nodes: PTEs are stripped, the device region backing is detached, and the node kind is set to `private` with the reservation's max RWX rights. The device handle remains in the process's permissions table.
+   - Virtual BAR nodes: The node kind is set to `private` with the reservation's max RWX rights (virtual BAR nodes have no PTEs to strip). The device handle remains in the process's permissions table.
+
+After the unmap pass, adjacent private nodes that share the same handle, rights, and restart policy are merged per the standard merge rules.
 
 ### Stack Reservation
 
