@@ -12,7 +12,7 @@ fn waker() void {
     _ = syscall.futex_wake(@ptrCast(&futex_val), 1);
 }
 
-/// §3.2.1 — `futex_wait` blocks the calling thread when value at `addr` matches `expected`.
+/// §3.2.1 — `futex_wait_val` blocks the calling thread when the value at every `addrs[i]` matches `expected[i]`.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     _ = syscall.thread_create(&waker, 0, 4);

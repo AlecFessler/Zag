@@ -20,7 +20,6 @@ const FaultReason = zag.perms.permissions.FaultReason;
 const KernelObject = zag.perms.permissions.KernelObject;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const MessageBox = zag.proc.message_box.MessageBox;
-const NotificationBox = zag.sched.notification.NotificationBox;
 const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Priority = zag.sched.thread.Priority;
@@ -97,10 +96,6 @@ pub const Process = struct {
     // want to synthesize a right the sender didn't have to begin with.
     had_self_fault_handler: bool = true,
     vm: ?*arch.Vm = null,
-    /// IRQ notification delivery — per-process bitmask box (spec §2.18).
-    notification_box: NotificationBox = .{},
-    /// Monotonic mod-64 counter for badge bit assignment (spec §2.18.1).
-    badge_counter: u6 = 0,
 
     pub const MAX_THREADS = 64;
     pub const MAX_CHILDREN = 64;
@@ -611,11 +606,6 @@ pub const Process = struct {
                 self.handle_counter += 1;
                 slot.* = entry_in;
                 slot.handle = handle_id;
-                // Assign badge bit for device_region entries (spec §2.18.1).
-                if (entry_in.object == .device_region) {
-                    slot.badge_bit = self.badge_counter;
-                    self.badge_counter +%= 1;
-                }
                 self.perm_count += 1;
                 // Increment refcount on referenced process
                 switch (entry_in.object) {
@@ -1094,8 +1084,6 @@ pub const Process = struct {
             vm_obj.destroy();
             self.vm = null;
         }
-
-        self.notification_box.cleanupOnDeath();
 
         self.cleanupIpcState();
         self.cleanupDmaMappings();

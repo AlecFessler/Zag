@@ -3,6 +3,7 @@ const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
 const exceptions = zag.arch.x64.exceptions;
+const futex = zag.proc.futex;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
@@ -12,9 +13,11 @@ const sched = zag.sched.scheduler;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const GateType = zag.arch.x64.idt.GateType;
 const PAddr = zag.memory.address.PAddr;
+const Process = zag.proc.process.Process;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 const SchedInterruptContext = zag.sched.scheduler.SchedInterruptContext;
 const SpinLock = zag.utils.sync.SpinLock;
+const UserViewEntry = zag.perms.permissions.UserViewEntry;
 const VAddr = zag.memory.address.VAddr;
 
 /// 16 IRQ lines (vectors 32-47) — legacy ISA IRQs remapped above the 32 exception
@@ -29,6 +32,15 @@ var spurious_interrupts: u64 = 0;
 /// Populated during firmware table parsing. Static after boot.
 /// Systems.md §24.
 pub var irq_table: [256]?*DeviceRegion = [_]?*DeviceRegion{null} ** 256;
+
+/// Per-IRQ-line owner info for the IRQ pending bit path.
+/// Set by registerIrqOwner when a process takes ownership of a device IRQ.
+pub const IrqOwner = struct {
+    process: *Process,
+    slot_index: u16,
+};
+
+pub var irq_owners: [256]?IrqOwner = [_]?IrqOwner{null} ** 256;
 
 /// I/O APIC MMIO base virtual address. Set during ACPI parsing.
 var ioapic_base: u64 = 0;
@@ -94,10 +106,90 @@ pub fn init() void {
         .external,
     );
 
+    // Register device IRQ handlers for vectors 32-47 (ISA IRQ lines 0-15).
+    // Intel SDM Vol 3A, §7.2 — vectors 32+ are available for external interrupts.
+    for (offset..offset + num_irq_entries) |i| {
+        interrupts.registerVector(
+            @intCast(i),
+            deviceIrqHandler,
+            .external,
+        );
+    }
+
     // SYSCALL/SYSRET replaces the old INT 0x80 path. The SYSCALL entry
     // point is set via MSR_LSTAR in cpu.initSyscall(); no IDT gate needed.
     // Intel SDM Vol 3A, §8.5.4 "SYSCALL and SYSENTER" — SYSCALL transfers
     // control without the IDT, using IA32_LSTAR for the entry point RIP.
+}
+
+/// IRQ pending bit position within the user view entry's field0.
+/// Bit 16 is used because the lower bits carry device_type/device_class
+/// metadata; bit 16 is otherwise unused padding in the device entry layout.
+const IRQ_PENDING_BIT: u64 = 1 << 16;
+
+/// Device IRQ handler — called for vectors 32-47 (ISA IRQ lines 0-15).
+/// Masks the IRQ line, sets bit 16 of field0 in the device's user view entry
+/// to signal the pending IRQ, and wakes any futex waiters on that address.
+fn deviceIrqHandler(ctx: *cpu.Context) void {
+    // The vector number is embedded in the Context by the interrupt stub.
+    // IRQ line = vector - 32 (ISA IRQ remapping).
+    const vector: u8 = @truncate(ctx.int_num);
+    const irq_line = vector - 32;
+
+    // Mask the IRQ to prevent re-entry until userspace acknowledges.
+    maskIrq(irq_line);
+
+    // Look up the owner info for this IRQ line.
+    const owner = irq_owners[irq_line] orelse return;
+    setIrqPendingBitForOwner(owner);
+}
+
+/// Set bit 16 of field0 in the device's user view entry via atomic OR,
+/// then wake any futex waiters on that physical address.
+/// Called from the device IRQ handler (interrupts disabled).
+fn setIrqPendingBitForOwner(owner: IrqOwner) void {
+    const proc = owner.process;
+    if (proc.perm_view_phys.addr == 0) return;
+
+    // Calculate physical address of field0 in the user view entry.
+    // Each UserViewEntry is 32 bytes; field0 is at offset 16.
+    const field0_paddr = PAddr.fromInt(
+        proc.perm_view_phys.addr + @as(u64, owner.slot_index) * @sizeOf(UserViewEntry) + @offsetOf(UserViewEntry, "field0"),
+    );
+    const field0_vaddr = VAddr.fromPAddr(field0_paddr, null);
+    const field0_ptr: *u64 = @ptrFromInt(field0_vaddr.addr);
+
+    // Atomic OR to set bit 16.
+    _ = @atomicRmw(u64, field0_ptr, .Or, IRQ_PENDING_BIT, .release);
+
+    // Wake all futex waiters on the physical address of field0.
+    _ = futex.wake(field0_paddr, std.math.maxInt(u32));
+}
+
+/// Clear bit 16 of field0 in the device's user view entry via atomic AND.
+/// Called from sysIrqAck after unmasking the IRQ line.
+pub fn clearIrqPendingBit(irq_line: u8) void {
+    const owner = irq_owners[irq_line] orelse return;
+    const proc = owner.process;
+    if (proc.perm_view_phys.addr == 0) return;
+
+    const field0_paddr = PAddr.fromInt(
+        proc.perm_view_phys.addr + @as(u64, owner.slot_index) * @sizeOf(UserViewEntry) + @offsetOf(UserViewEntry, "field0"),
+    );
+    const field0_vaddr = VAddr.fromPAddr(field0_paddr, null);
+    const field0_ptr: *u64 = @ptrFromInt(field0_vaddr.addr);
+
+    // Atomic AND to clear bit 16.
+    _ = @atomicRmw(u64, field0_ptr, .And, ~IRQ_PENDING_BIT, .release);
+}
+
+/// Register the IRQ owner info for a device. Called when a process receives
+/// a device handle with IRQ rights.
+pub fn registerIrqOwner(irq_line: u8, proc: *Process, slot_index: u16) void {
+    irq_owners[irq_line] = .{
+        .process = proc,
+        .slot_index = slot_index,
+    };
 }
 
 /// Intel SDM Vol 3A, §13.9 — spurious interrupt handler must return without EOI

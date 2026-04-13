@@ -23,7 +23,7 @@ pub const SyscallNum = enum(u64) {
     set_affinity,
     revoke_perm,
     disable_restart,
-    futex_wait,
+    futex_wait_val,
     futex_wake,
     clock_gettime,
     ioport_read,
@@ -66,11 +66,12 @@ pub const SyscallNum = enum(u64) {
     clock_getwall,
     clock_setwall,
     getrandom,
-    notify_wait,
+    _notify_wait_removed,
     irq_ack,
     sys_power,
     sys_cpu_power,
     thread_unpin,
+    futex_wait_change,
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -223,8 +224,22 @@ pub fn disable_restart() i64 {
     return syscall0(.disable_restart);
 }
 
+/// Backwards-compatible single-address futex wait.
+/// Wraps futex_wait_val with count=1.
 pub fn futex_wait(addr: *const u64, expected: u64, timeout_ns: u64) i64 {
-    return syscall3(.futex_wait, @intFromPtr(addr), expected, timeout_ns);
+    var addrs = [1]u64{@intFromPtr(addr)};
+    var expecteds = [1]u64{expected};
+    return syscall4(.futex_wait_val, @intFromPtr(&addrs), @intFromPtr(&expecteds), 1, timeout_ns);
+}
+
+/// Multi-address futex wait with expected values.
+pub fn futex_wait_val(addrs_ptr: u64, expected_ptr: u64, count: u64, timeout_ns: u64) i64 {
+    return syscall4(.futex_wait_val, addrs_ptr, expected_ptr, count, timeout_ns);
+}
+
+/// Multi-address futex wait that reads current values under lock.
+pub fn futex_wait_change(addrs_ptr: u64, count: u64, timeout_ns: u64) i64 {
+    return syscall3(.futex_wait_change, addrs_ptr, count, timeout_ns);
 }
 
 pub fn futex_wake(addr: *const u64, count: u64) i64 {
@@ -687,8 +702,9 @@ pub fn getrandom_raw(buf_addr: u64, len: u64) i64 {
 
 // --- IRQ Notifications (§2.18, §4.59–§4.60) ---
 
+/// Removed — always returns E_INVAL.
 pub fn notify_wait(timeout_ns: u64) i64 {
-    return syscall1(.notify_wait, timeout_ns);
+    return syscall1(._notify_wait_removed, timeout_ns);
 }
 
 pub fn irq_ack(handle: u64) i64 {

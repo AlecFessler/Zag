@@ -5,7 +5,7 @@ const t = lib.testing;
 
 const E_TIMEOUT: i64 = -8;
 
-/// §3.2.10 — `futex_wait` returns `E_TIMEOUT` on timeout expiry.
+/// §3.2.10 — `futex_wait_val` returns `E_TIMEOUT` on timeout expiry.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     var val: u64 = 0;

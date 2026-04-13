@@ -97,9 +97,10 @@ pub fn sysIrqAck(device_handle: u64) i64 {
     if (entry.object != .device_region) return E_BADCAP;
     if (!entry.deviceRights().irq) return E_PERM;
 
-    // Look up the device's IRQ line and unmask it.
+    // Look up the device's IRQ line, clear the pending bit, and unmask.
     const device = entry.object.device_region;
     const irq_line = arch.findIrqForDevice(device) orelse return E_INVAL;
+    arch.clearIrqPendingBit(irq_line);
     arch.unmaskIrq(irq_line);
     return E_OK;
 }

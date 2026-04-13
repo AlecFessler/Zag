@@ -12,7 +12,7 @@ fn waker() void {
     _ = syscall.futex_wake(@ptrCast(&futex_val), 1);
 }
 
-/// §3.2.3 — `futex_wait` with timeout=`MAX_U64` blocks indefinitely until woken.
+/// §3.2.3 — `futex_wait_val` with timeout=`MAX_U64` blocks indefinitely until woken.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     _ = syscall.thread_create(&waker, 0, 4);

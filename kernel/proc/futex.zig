@@ -62,29 +62,28 @@ fn removeTimedWaiter(thread: *Thread) void {
     }
 }
 
-/// Public wrapper for addTimedWaiter, used by notification.zig for
-/// notify_wait timeout support. See systems.md §24 "Timeout Integration".
-pub fn addTimedWaiterPublic(thread: *Thread) bool {
-    return addTimedWaiter(thread);
-}
-
-/// Public wrapper for removeTimedWaiter, used by notification.zig for
-/// notify_wait timeout cleanup.
-pub fn removeTimedWaiterPublic(thread: *Thread) void {
-    removeTimedWaiter(thread);
-}
-
-/// Remove a killed thread from its futex wait bucket.
+/// Remove a killed thread from its futex wait bucket(s).
 /// Called by Process.kill() for threads blocked on futex_wait.
 pub fn removeBlockedThread(thread: *Thread) void {
-    const bucket = &buckets[bucketIdx(thread.futex_paddr)];
-    const irq = bucket.lock.lockIrqSave();
-    _ = removeWaiter(bucket, thread);
+    if (thread.futex_bucket_count > 0) {
+        // Multi-address wait: remove from all buckets
+        for (thread.futex_paddrs[0..thread.futex_bucket_count]) |pa| {
+            const bucket = &buckets[bucketIdx(pa)];
+            const irq = bucket.lock.lockIrqSave();
+            _ = removeWaiter(bucket, thread);
+            bucket.lock.unlockIrqRestore(irq);
+        }
+        thread.futex_bucket_count = 0;
+    } else {
+        const bucket = &buckets[bucketIdx(thread.futex_paddr)];
+        const irq = bucket.lock.lockIrqSave();
+        _ = removeWaiter(bucket, thread);
+        bucket.lock.unlockIrqRestore(irq);
+    }
     if (thread.futex_deadline_ns != 0) {
         thread.futex_deadline_ns = 0;
         removeTimedWaiter(thread);
     }
-    bucket.lock.unlockIrqRestore(irq);
     thread.futex_paddr = PAddr.fromInt(0);
 }
 
@@ -154,22 +153,43 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
 
     while (woken < count) {
         const thread = bucket.pq.dequeue() orelse break;
-        if (thread.futex_paddr.addr == paddr.addr) {
-            while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
-            if (thread.futex_deadline_ns != 0) {
-                thread.futex_deadline_ns = 0;
-                removeTimedWaiter(thread);
+
+        // For multi-address waits, check if any of the thread's addresses match.
+        if (thread.futex_bucket_count > 0) {
+            var matched = false;
+            for (thread.futex_paddrs[0..thread.futex_bucket_count], 0..) |pa, idx| {
+                if (pa.addr == paddr.addr) {
+                    thread.futex_wake_index = @intCast(idx);
+                    matched = true;
+                    break;
+                }
             }
-            thread.state = .ready;
-            const target_core = if (thread.core_affinity) |mask|
-                @as(u64, @ctz(mask))
-            else
-                arch.coreID();
-            sched.enqueueOnCore(target_core, thread);
-            woken += 1;
+            if (!matched) {
+                requeue.enqueue(thread);
+                continue;
+            }
+            // Remove from all OTHER buckets
+            removeFromOtherBuckets(thread, paddr);
+        } else if (thread.futex_paddr.addr == paddr.addr) {
+            thread.futex_wake_index = 0;
         } else {
             requeue.enqueue(thread);
+            continue;
         }
+
+        while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+        if (thread.futex_deadline_ns != 0) {
+            thread.futex_deadline_ns = 0;
+            removeTimedWaiter(thread);
+        }
+        thread.futex_bucket_count = 0;
+        thread.state = .ready;
+        const target_core = if (thread.core_affinity) |mask|
+            @as(u64, @ctz(mask))
+        else
+            arch.coreID();
+        sched.enqueueOnCore(target_core, thread);
+        woken += 1;
     }
 
     // Re-enqueue non-matching threads back into the bucket
@@ -181,6 +201,224 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
     return woken;
 }
 
+/// Remove a thread from all futex buckets except the one matching `except_paddr`.
+/// Called while the bucket for `except_paddr` is already locked.
+fn removeFromOtherBuckets(thread: *Thread, except_paddr: PAddr) void {
+    const except_idx = bucketIdx(except_paddr);
+    for (thread.futex_paddrs[0..thread.futex_bucket_count]) |pa| {
+        const idx = bucketIdx(pa);
+        if (idx == except_idx) continue;
+        const bucket = &buckets[idx];
+        const birq = bucket.lock.lockIrqSave();
+        _ = removeWaiter(bucket, thread);
+        bucket.lock.unlockIrqRestore(birq);
+    }
+}
+
+/// Multi-address futex wait with expected values.
+/// Returns:
+///   0..count-1 = index of the first mismatched address (mismatch, no block), or
+///   0..count-1 = index of the address that was woken (after blocking),
+///   E_TIMEOUT if timeout expired, E_NORES if no timed waiter slot.
+pub fn waitVal(addrs: []const PAddr, expected: []const u64, count: usize, timeout_ns: u64, thread: *Thread) i64 {
+    // Sort bucket indices for consistent lock ordering to prevent deadlock.
+    var sorted: [64]u8 = undefined;
+    for (0..count) |i| sorted[i] = @intCast(i);
+    sortByBucket(sorted[0..count], addrs);
+
+    // Acquire all bucket locks in sorted order.
+    const lock_state = acquireBucketLocks(sorted[0..count], addrs);
+
+    // Check all addresses against expected values.
+    for (0..count) |i| {
+        const vaddr = VAddr.fromPAddr(addrs[i], null);
+        const value_ptr: *const u64 = @ptrFromInt(vaddr.addr);
+        if (@atomicLoad(u64, value_ptr, .acquire) != expected[i]) {
+            releaseBucketLocks(&lock_state);
+            return @intCast(i);
+        }
+    }
+
+    if (timeout_ns == 0) {
+        releaseBucketLocks(&lock_state);
+        return E_TIMEOUT;
+    }
+
+    // Set up timeout.
+    const max_timeout: u64 = @bitCast(@as(i64, -1));
+    if (timeout_ns != max_timeout) {
+        const now_ns = arch.getMonotonicClock().now();
+        thread.futex_deadline_ns = now_ns +| timeout_ns;
+    } else {
+        thread.futex_deadline_ns = 0;
+    }
+
+    // Store addresses and enqueue in all buckets.
+    thread.futex_bucket_count = @intCast(count);
+    for (0..count) |i| {
+        thread.futex_paddrs[i] = addrs[i];
+    }
+    // Also set futex_paddr to first addr for backwards compat.
+    thread.futex_paddr = addrs[0];
+    thread.state = .blocked;
+
+    for (0..count) |i| {
+        pushWaiter(&buckets[bucketIdx(addrs[i])], thread);
+    }
+
+    releaseBucketLocks(&lock_state);
+
+    if (thread.futex_deadline_ns != 0) {
+        if (!addTimedWaiter(thread)) {
+            // Undo: remove from all buckets.
+            for (0..count) |i| {
+                const bucket = &buckets[bucketIdx(addrs[i])];
+                const irq2 = bucket.lock.lockIrqSave();
+                _ = removeWaiter(bucket, thread);
+                bucket.lock.unlockIrqRestore(irq2);
+            }
+            thread.state = .running;
+            thread.futex_paddr = PAddr.fromInt(0);
+            thread.futex_bucket_count = 0;
+            thread.futex_deadline_ns = 0;
+            return E_NORES;
+        }
+    }
+
+    arch.enableInterrupts();
+    sched.yield();
+
+    const was_timeout: bool = thread.futex_deadline_ns == @as(u64, @bitCast(E_TIMEOUT));
+    thread.futex_deadline_ns = 0;
+    thread.futex_bucket_count = 0;
+    if (was_timeout) return E_TIMEOUT;
+    return @intCast(thread.futex_wake_index);
+}
+
+/// Multi-address futex wait that reads current values under lock.
+/// Same as waitVal but uses current memory values as expected.
+pub fn waitChange(addrs: []const PAddr, count: usize, timeout_ns: u64, thread: *Thread) i64 {
+    // Sort bucket indices for consistent lock ordering.
+    var sorted: [64]u8 = undefined;
+    for (0..count) |i| sorted[i] = @intCast(i);
+    sortByBucket(sorted[0..count], addrs);
+
+    // Acquire all bucket locks in sorted order.
+    const lock_state = acquireBucketLocks(sorted[0..count], addrs);
+
+    // Read current values under locks.
+    var current: [64]u64 = undefined;
+    for (0..count) |i| {
+        const vaddr = VAddr.fromPAddr(addrs[i], null);
+        const value_ptr: *const u64 = @ptrFromInt(vaddr.addr);
+        current[i] = @atomicLoad(u64, value_ptr, .acquire);
+    }
+
+    if (timeout_ns == 0) {
+        releaseBucketLocks(&lock_state);
+        return E_TIMEOUT;
+    }
+
+    // Set up timeout.
+    const max_timeout: u64 = @bitCast(@as(i64, -1));
+    if (timeout_ns != max_timeout) {
+        const now_ns = arch.getMonotonicClock().now();
+        thread.futex_deadline_ns = now_ns +| timeout_ns;
+    } else {
+        thread.futex_deadline_ns = 0;
+    }
+
+    // Store addresses and enqueue in all buckets.
+    thread.futex_bucket_count = @intCast(count);
+    for (0..count) |i| {
+        thread.futex_paddrs[i] = addrs[i];
+    }
+    thread.futex_paddr = addrs[0];
+    thread.state = .blocked;
+
+    for (0..count) |i| {
+        pushWaiter(&buckets[bucketIdx(addrs[i])], thread);
+    }
+
+    releaseBucketLocks(&lock_state);
+
+    if (thread.futex_deadline_ns != 0) {
+        if (!addTimedWaiter(thread)) {
+            for (0..count) |i| {
+                const bucket = &buckets[bucketIdx(addrs[i])];
+                const irq2 = bucket.lock.lockIrqSave();
+                _ = removeWaiter(bucket, thread);
+                bucket.lock.unlockIrqRestore(irq2);
+            }
+            thread.state = .running;
+            thread.futex_paddr = PAddr.fromInt(0);
+            thread.futex_bucket_count = 0;
+            thread.futex_deadline_ns = 0;
+            return E_NORES;
+        }
+    }
+
+    arch.enableInterrupts();
+    sched.yield();
+
+    const was_timeout: bool = thread.futex_deadline_ns == @as(u64, @bitCast(E_TIMEOUT));
+    thread.futex_deadline_ns = 0;
+    thread.futex_bucket_count = 0;
+    if (was_timeout) return E_TIMEOUT;
+    return @intCast(thread.futex_wake_index);
+}
+
+/// Holds lock state for multi-bucket acquisition.
+const BucketLockState = struct {
+    /// Unique bucket indices in sorted order.
+    unique_indices: [64]usize = undefined,
+    /// Saved IRQ state per unique bucket.
+    irq_states: [64]u64 = undefined,
+    /// Number of unique buckets locked.
+    count: usize = 0,
+};
+
+/// Sort indices by bucket index for consistent lock acquisition order.
+fn sortByBucket(indices: []u8, addrs: []const PAddr) void {
+    // Simple insertion sort — count is at most 64.
+    var i: usize = 1;
+    while (i < indices.len) {
+        var j = i;
+        while (j > 0 and bucketIdx(addrs[indices[j]]) < bucketIdx(addrs[indices[j - 1]])) {
+            const tmp = indices[j];
+            indices[j] = indices[j - 1];
+            indices[j - 1] = tmp;
+            j -= 1;
+        }
+        i += 1;
+    }
+}
+
+/// Acquire bucket locks in sorted order, skipping duplicates.
+fn acquireBucketLocks(sorted: []const u8, addrs: []const PAddr) BucketLockState {
+    var state = BucketLockState{};
+    var prev_idx: usize = std.math.maxInt(usize);
+    for (sorted) |si| {
+        const idx = bucketIdx(addrs[si]);
+        if (idx == prev_idx) continue;
+        const irq = buckets[idx].lock.lockIrqSave();
+        state.unique_indices[state.count] = idx;
+        state.irq_states[state.count] = irq;
+        state.count += 1;
+        prev_idx = idx;
+    }
+    return state;
+}
+
+/// Release bucket locks in reverse order.
+fn releaseBucketLocks(lock_state: *const BucketLockState) void {
+    var i: usize = lock_state.count;
+    while (i > 0) {
+        i -= 1;
+        buckets[lock_state.unique_indices[i]].lock.unlockIrqRestore(lock_state.irq_states[i]);
+    }
+}
+
 pub fn expireTimedWaiters() void {
     const now_ns = arch.getMonotonicClock().now();
 
@@ -190,15 +428,16 @@ pub fn expireTimedWaiters() void {
         const thread = slot.* orelse continue;
         if (thread.futex_deadline_ns == 0 or now_ns < thread.futex_deadline_ns) continue;
 
+        // Remove from all futex buckets this thread is waiting on.
         var removed: bool = false;
-
-        if (thread.notification_waiter) {
-            // Thread is blocked in NotificationBox.wait — remove from the
-            // process's notification box waiter queue instead of a futex bucket.
-            const nbox = &thread.process.notification_box;
-            const nirq = nbox.lock.lockIrqSave();
-            removed = nbox.waiters.remove(thread);
-            nbox.lock.unlockIrqRestore(nirq);
+        if (thread.futex_bucket_count > 0) {
+            // Multi-address wait: remove from all buckets
+            for (thread.futex_paddrs[0..thread.futex_bucket_count]) |pa| {
+                const bucket = &buckets[bucketIdx(pa)];
+                const birq = bucket.lock.lockIrqSave();
+                if (removeWaiter(bucket, thread)) removed = true;
+                bucket.lock.unlockIrqRestore(birq);
+            }
         } else {
             const bucket = &buckets[bucketIdx(thread.futex_paddr)];
             const birq = bucket.lock.lockIrqSave();
@@ -209,7 +448,6 @@ pub fn expireTimedWaiters() void {
         if (removed) {
             while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
             thread.futex_deadline_ns = @bitCast(E_TIMEOUT);
-            thread.notification_waiter = false;
             thread.state = .ready;
             const target = if (thread.core_affinity) |mask|
                 @as(u64, @ctz(mask))

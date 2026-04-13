@@ -76,12 +76,6 @@ pub fn sysGetrandom(buf_ptr: u64, len: u64) i64 {
     return E_OK;
 }
 
-pub fn sysNotifyWait(timeout_ns: u64) i64 {
-    const proc = sched.currentProc();
-    const thread = sched.currentThread().?;
-    return proc.notification_box.wait(thread, timeout_ns);
-}
-
 pub fn sysSysPower(action_raw: u64) i64 {
     const proc = sched.currentProc();
     const self_entry = proc.getPermByHandle(0) orelse return E_PERM;

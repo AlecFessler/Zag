@@ -1105,6 +1105,22 @@ pub fn findIrqForDevice(device: *DeviceRegion) ?u8 {
     };
 }
 
+pub fn clearIrqPendingBit(irq_line: u8) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.irq.clearIrqPendingBit(irq_line),
+        .aarch64 => {}, // stub
+        else => unreachable,
+    }
+}
+
+pub fn registerIrqOwner(irq_line: u8, proc: *zag.proc.process.Process, slot_index: u16) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.irq.registerIrqOwner(irq_line, proc, slot_index),
+        .aarch64 => {}, // stub
+        else => unreachable,
+    }
+}
+
 // --- Power control (systems.md §25) ---
 
 pub const PowerAction = switch (builtin.cpu.arch) {

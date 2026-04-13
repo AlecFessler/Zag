@@ -87,20 +87,19 @@ kernel/
   sched/
     scheduler.zig        -- run queues, context switch, timer handler
     thread.zig           -- thread struct, creation, deinit
-    notification.zig     -- NotificationBox struct and methods (signal, wait, cleanup)
   syscall/
     dispatch.zig         -- SyscallNum enum, SyscallResult type, dispatch switch table
     errors.zig           -- syscall error code constants (E_OK, E_INVAL, etc.)
     clock.zig            -- clock_gettime, clock_getwall, clock_setwall, wall_offset
     device.zig           -- mmio_map, irq_ack, dma_map/unmap
     fault.zig            -- fault_recv, fault_reply, fault_read_mem, fault_write_mem, fault_set_thread_mode
-    futex.zig            -- futex_wait, futex_wake
+    futex.zig            -- futex_wait_val, futex_wait_change, futex_wake
     ipc.zig              -- ipc_send, ipc_call, ipc_recv, ipc_reply, capability transfer
     memory.zig           -- mem_reserve, mem_perms, mem_unmap, shm_create/map
     pmu.zig              -- generic PMU syscall layer, PmuStateAllocator slab owner
     process.zig          -- proc_create, revoke_perm, disable_restart
     sysinfo.zig          -- generic sys_info syscall layer
-    system.zig           -- write, getrandom, notify_wait, sys_power, sys_cpu_power
+    system.zig           -- write, getrandom, sys_power, sys_cpu_power
     thread.zig           -- thread_create/exit/yield, set_affinity/priority, suspend/resume/kill, thread_unpin
     vm.zig               -- vm_create, vm_guest_map, vm_recv/reply, vcpu_set/get_state, vcpu_run/interrupt, msr_passthrough, ioapic_assert/deassert_irq
   perms/
@@ -169,8 +168,6 @@ Process {
     thread_handle_rights: ThreadHandleRights -- rights mask for thread handles in this process's own perm table
     max_thread_priority: Priority           -- ceiling priority for threads in this process
     vm: ?*arch.Vm = null                     -- owned VM, if any (at most one per process; dispatched type)
-    notification_box: NotificationBox       -- IRQ notification delivery (§24)
-    badge_counter: u6 = 0                   -- monotonic mod-64 counter for badge bit assignment (§24)
 }
 ```
 
@@ -778,6 +775,10 @@ Bucket {
 
 The shift by 3 accounts for 8-byte alignment of futex addresses. Multiple physical addresses may hash to the same bucket; wake matches on the thread's stored physical address, not just the bucket.
 
+### Thread Fields for Multi-Address Waiting
+
+`Thread` has a `futex_wake_index: u8` field, set by the waking bucket before the thread is woken, so the thread knows which address in its multi-address wait set changed. For single-address waits (`count = 1`), this is always 0.
+
 ### pushWaiter(bucket, thread)
 
 Enqueue thread into the bucket's priority queue: `bucket.pq.enqueue(thread)`.
@@ -790,26 +791,52 @@ Dequeue the highest-priority waiter from the bucket's priority queue: `bucket.pq
 
 Remove target from the bucket's priority queue: `bucket.pq.remove(target)`. Returns true if found and removed.
 
-### wait(paddr, expected, timeout_ns, thread) -> i64
+### waitVal(addrs, expected, count, timeout_ns, thread) -> i64
 
-1. Compute bucket index from paddr.
-2. Convert paddr to kernel VA via physmap (`VAddr.fromPAddr`).
-3. Acquire bucket lock with IRQ save (`lockIrqSave`).
-4. Atomic load of `*paddr` with acquire ordering. If not equal to `expected`, unlock and return `E_AGAIN` (-9).
-5. If `timeout_ns == 0` (try-only), unlock and return `E_TIMEOUT` (-8).
+Multi-address futex wait with explicit expected values. `MAX_FUTEX_WAIT = 64`.
+
+1. For each `i` in `[0, count)`: call `resolveVaddr` on `addrs[i]` to get the physical address. Return `E_BADADDR` if any address is unmapped. Return `E_INVAL` if any address is not 8-byte aligned.
+2. Compute bucket indices for all physical addresses. Sort the unique bucket indices in ascending order for consistent lock ordering (prevents deadlock when multiple threads wait on overlapping address sets).
+3. Acquire all relevant bucket locks in sorted order, using IRQ save on the first lock.
+4. For each `i` in `[0, count)`: atomic load of `*paddr[i]` with acquire ordering. If not equal to `expected[i]`, release all bucket locks and return `i` (the index of the mismatched address).
+5. If `timeout_ns == 0` (non-blocking), release all bucket locks and return `E_TIMEOUT`.
 6. Set thread state to `blocked`.
-7. Push thread onto bucket.
-8. Unlock bucket with IRQ restore.
+7. Enqueue the thread on all relevant buckets (the thread appears in every bucket corresponding to its wait set).
+8. Release all bucket locks with IRQ restore.
 9. Enable interrupts and yield. The thread will be descheduled.
-10. On wake, return 0.
+10. On wake: the waking bucket sets `thread.futex_wake_index` before waking. The thread removes itself from all other buckets (acquires each bucket lock, calls `removeWaiter`). Return `futex_wake_index`.
+
+### waitChange(addrs, count, timeout_ns, thread) -> i64
+
+Multi-address futex wait with snapshot-under-lock semantics. Same `MAX_FUTEX_WAIT = 64` limit.
+
+1. Same address resolution and validation as `waitVal` (steps 1-2).
+2. Acquire all relevant bucket locks in sorted order.
+3. For each `i` in `[0, count)`: atomic load of `*paddr[i]` with acquire ordering and store as `snapshot[i]`. These snapshot values serve as the expected values.
+4. If `timeout_ns == 0` (non-blocking), release all bucket locks and return `E_TIMEOUT` (no change can have occurred under the locks).
+5. Set thread state to `blocked`.
+6. Enqueue the thread on all relevant buckets.
+7. Release all bucket locks with IRQ restore.
+8. Enable interrupts and yield.
+9. On wake: same as `waitVal` step 10 -- return `futex_wake_index` after removing from other buckets.
+
+The key difference from `waitVal` is that the expected values are not provided by userspace -- they are atomically read under the bucket locks. This means a wake cannot be missed between the read and the enqueue.
 
 ### wake(paddr, count) -> u64
 
 1. Compute bucket index.
 2. Acquire bucket lock with IRQ save.
-3. Pop up to `count` waiters from the bucket.
-4. For each popped thread: spin until `on_cpu` is false, set state to `ready`, determine target core (from affinity mask via `@ctz`, or current core), enqueue on target core's run queue.
+3. Pop up to `count` waiters from the bucket whose stored physical address matches `paddr`.
+4. For each popped thread: set `thread.futex_wake_index` to the thread's index for this address in its wait set, spin until `on_cpu` is false, set state to `ready`, determine target core (from affinity mask via `@ctz`, or current core), enqueue on target core's run queue.
 5. Unlock, return number woken.
+
+### Multi-Bucket Locking
+
+When a thread waits on multiple addresses that hash to different buckets, all relevant bucket locks must be held simultaneously to ensure atomicity of the value check. Bucket indices are sorted in ascending order before acquisition to prevent ABBA deadlocks. If two threads wait on overlapping but differently ordered address sets, they both acquire locks in the same global order.
+
+### Multi-Bucket Cleanup on Wake
+
+When a thread is woken from one bucket, it must remove itself from all other buckets in its wait set. The waking path sets `futex_wake_index` and wakes the thread. The thread then iterates its wait set and removes itself from each remaining bucket (acquiring each bucket lock individually). This cleanup is safe because the thread is no longer blocked -- concurrent wake attempts on other buckets will find the thread already removed or in a non-blocked state.
 
 ---
 
@@ -2733,93 +2760,37 @@ The maximum of 4096 bytes per call means at most 512 RDRAND invocations. RDRAND 
 
 ---
 
-## 24. IRQ Notification Delivery Internals
+## 24. IRQ Pending Bit and Delivery Internals
 
-Asynchronous kernel-to-userspace IRQ notification via a per-process bitmask. The public contract is in spec §2.18 and spec §4.59--§4.60. This section describes how the pieces fit together internally.
+IRQ delivery via a pending bit in the device's user view entry, waking futex waiters. The public contract is in spec §2.5. This section describes how the pieces fit together internally.
 
 ### Layering
 
 ```
-kernel/sched/notification.zig   -- NotificationBox struct and methods
-kernel/arch/x64/irq.zig         -- IRQ masking/unmasking, irq_table
-kernel/arch/dispatch.zig        -- maskIrq/unmaskIrq dispatch functions
-kernel/proc/process.zig         -- notification_box field on Process
-kernel/perms/permissions.zig    -- badge_bit on PermissionEntry, badge_counter on Process
-kernel/syscall/system.zig       -- notify_wait handler
+kernel/arch/x64/irq.zig         -- IRQ masking/unmasking, irq_table, IRQ handler path
+kernel/arch/dispatch.zig         -- maskIrq/unmaskIrq dispatch functions
+kernel/perms/permissions.zig    -- UserViewEntry field0 bit 16 (IRQ pending bit)
+kernel/proc/futex.zig           -- futex wake on field0 address
 kernel/syscall/device.zig       -- irq_ack handler
 kernel/syscall/dispatch.zig     -- dispatch cases
 ```
 
-### NotificationBox Struct
+### IRQ Pending Bit
 
-Defined in `kernel/sched/notification.zig`:
-
-```
-NotificationBox {
-    word:    atomic(u64)     -- accumulated notification bitmask
-    waiters: PriorityQueue   -- threads blocked on notify_wait
-    lock:    SpinLock
-}
-```
-
-Added to `Process` alongside `msg_box` and `fault_box`:
-
-```
-notification_box: NotificationBox = .{
-    .word = @as(atomic(u64), 0),
-    .waiters = .{},
-    .lock = .{},
-}
-```
-
-The `word` field accumulates IRQ notifications via atomic OR. The `waiters` priority queue holds threads blocked on `notify_wait`. The `lock` protects the queue and the read-and-clear operation on `word`.
-
-### Badge Bit Assignment
-
-Each `Process` has a `badge_counter: u6` field, initialized to 0. When a device region handle is inserted into the process's permissions table (via `insertPerm` for device_region entries), the current `badge_counter` value is assigned as the badge bit for that entry, and the counter is incremented mod 64.
-
-The badge bit is stored on the `PermissionEntry` struct. For device_region entries, it is exposed in the dedicated `badge_byte` field of `UserViewEntry` (offset 9, the byte after `entry_type`) so userspace can map notification bits to device handles without a syscall (spec §2.18.3). The `field0` encoding is unchanged and carries only device type, class, and size:
+Bit 16 of `field0` in the `UserViewEntry` for device entries is the IRQ pending bit. The kernel sets it when the device's IRQ fires and clears it when `irq_ack` is called.
 
 ```
 UserViewEntry layout (device_region):
   handle:     u64  (offset 0)
-  entry_type: u8   (offset 8)  — ENTRY_TYPE_DEVICE_REGION (3)
-  badge_byte: u8   (offset 9)  — badge_bit (u6, 0-63)
+  entry_type: u8   (offset 8)  -- ENTRY_TYPE_DEVICE_REGION (3)
+  _reserved:  u8   (offset 9)
   rights:     u16  (offset 10)
   _pad:       [4]u8
-  field0:     u64  (offset 16) — device_type[0:7], device_class[8:15], size_or_port_count[32:55]
-  field1:     u64  (offset 24) — PCI topology
+  field0:     u64  (offset 16) -- device_type[0:7], device_class[8:15], irq_pending[16], reserved_zero[17:31], size_or_port_count[32:63]
+  field1:     u64  (offset 24) -- PCI topology
 ```
 
-### NotificationBox Methods
-
-**`signal(box: *NotificationBox, badge_bit: u6)`** — Called from the IRQ handler path. Atomically ORs `(1 << badge_bit)` into `box.word` via `@atomicRmw(.Or, .monotonic)`. Then acquires `box.lock`, drains all waiters from the priority queue, and wakes each one (spin on `on_cpu`, set `.ready`, enqueue on target core). Releases `box.lock`.
-
-The `@atomicRmw(.Or)` is lock-free; the lock is only held for the waiter drain. This means multiple IRQs from different devices can accumulate concurrently without contention on the signal path — only the waiter wake needs serialization.
-
-**`wait(box: *NotificationBox, thread: *Thread, timeout_ns: u64) -> i64`** — Called from the `notify_wait` syscall handler.
-
-```
-1. Acquire box.lock.
-2. Read word = @atomicLoad(&box.word, .monotonic).
-3. If word != 0:
-   - @atomicStore(&box.word, 0, .monotonic)  // clear
-   - Release box.lock.
-   - Return @as(i64, word).
-4. If timeout_ns == 0:
-   - Release box.lock.
-   - Return E_AGAIN.
-5. Set thread.state = .blocked.
-6. Enqueue thread on box.waiters.
-7. Release box.lock.
-8. Yield to scheduler.
-9. On wake: re-read and clear word atomically (same as step 2-3).
-   Return the bitmask, or E_TIMEOUT if woken by timeout expiry.
-```
-
-The read-and-clear is atomic with respect to concurrent `signal` calls because the lock serializes the "check zero + enqueue" path, and `signal` drains all waiters after the OR. Between the OR and the drain, additional signals may accumulate — this is correct because `notify_wait` returns the full accumulated bitmask.
-
-**`cleanup_on_death(box: *NotificationBox)`** — Called from `cleanupPhase1` when a process dies. Acquires `box.lock`, drains all waiters (waking each with `E_NOENT` in `rax`), clears `word`, releases lock. Prevents dangling thread pointers in the queue.
+Userspace derives the `field0` address as `perm_view_vaddr + slot_index * 32 + 16` and uses it directly as a futex wait target.
 
 ### Kernel IRQ Handler Path
 
@@ -2831,9 +2802,15 @@ When a device IRQ fires on x86, the interrupt vector handler in `kernel/arch/x64
 3. Mask the IRQ line via I/O APIC redirection table (set the mask bit).
 4. Send LAPIC EOI.
 5. Look up the owning process: irq_table[irq_line] -> *DeviceRegion -> owner_proc.
-6. Look up the badge_bit from the PermissionEntry for this device in the owner's perm table.
-7. Call notification_box.signal(badge_bit) on the owner process's notification_box.
+6. Locate the device's slot in the owner's perm table and compute the field0 physical address
+   from perm_view_phys + slot_index * 32 + 16.
+7. Atomically set bit 16 of field0 via CAS on the physmap VA:
+   a. Read current value via physmap.
+   b. CAS(current, current | (1 << 16)). If CAS fails (racing IRQ or irq_ack), re-read and retry.
+8. Call futex.wake on the field0 physical address to wake any threads waiting on it.
 ```
+
+The CAS-and-retry loop is necessary because `irq_ack` may be concurrently clearing bit 16, or another IRQ for a device in the same process may be concurrently modifying the same word (though in practice each device has its own `field0`). The retry is bounded because only two writers exist (the IRQ handler setting bit 16 and `irq_ack` clearing it).
 
 The IRQ line remains masked until userspace calls `irq_ack`, which unmasks it. This prevents interrupt storms while the driver is processing the previous interrupt.
 
@@ -2845,19 +2822,19 @@ Defined in `kernel/arch/x64/irq.zig`:
 var irq_table: [256]?*DeviceRegion = [_]?*DeviceRegion{null} ** 256
 ```
 
-Populated during firmware table parsing (ACPI MADT interrupt source overrides, PCI INTx routing). Each entry maps an IRQ line number to the `DeviceRegion` that owns it. The table is static after boot — entries are not modified at runtime.
+Populated during firmware table parsing (ACPI MADT interrupt source overrides, PCI INTx routing). Each entry maps an IRQ line number to the `DeviceRegion` that owns it. The table is static after boot -- entries are not modified at runtime.
 
 ### I/O APIC Masking
 
-**`maskIrq(irq: u8)`** — Reads the I/O APIC redirection table entry for `irq`, sets bit 16 (mask bit), writes back. The I/O APIC is accessed via its MMIO registers (IOREGSEL at base+0x00, IOWIN at base+0x10).
+**`maskIrq(irq: u8)`** -- Reads the I/O APIC redirection table entry for `irq`, sets bit 16 (mask bit), writes back. The I/O APIC is accessed via its MMIO registers (IOREGSEL at base+0x00, IOWIN at base+0x10).
 
-**`unmaskIrq(irq: u8)`** — Same read-modify-write, but clears bit 16.
+**`unmaskIrq(irq: u8)`** -- Same read-modify-write, but clears bit 16.
 
 Both operations are protected by the existing I/O APIC lock to prevent concurrent redirection table corruption.
 
 ### Arch Dispatch
 
-**`arch/dispatch.zig`** adds:
+**`arch/dispatch.zig`** provides:
 
 ```
 pub fn maskIrq(irq: u8) void {
@@ -2887,41 +2864,26 @@ In `kernel/syscall/device.zig`:
 1. Look up device_handle in caller's perm table. Return E_BADHANDLE if not found or not device_region.
 2. Check DeviceRegionRights.irq. Return E_PERM if absent.
 3. Look up the device's IRQ line. Return E_INVAL if the device has no associated IRQ.
-4. Call arch.unmaskIrq(irq_line).
-5. Return E_OK.
+4. Atomically clear bit 16 of the device's field0 in the user view via physmap:
+   a. Compute field0 physical address from perm_view_phys + slot_index * 32 + 16.
+   b. Read current value, CAS(current, current & ~(1 << 16)). Retry on failure.
+5. Call arch.unmaskIrq(irq_line).
+6. Return E_OK.
 ```
 
-### Process Struct Additions
-
-```
-Process {
-    ...
-    notification_box: NotificationBox    -- IRQ notification delivery
-    badge_counter: u6 = 0               -- monotonic mod-64 counter for badge assignment
-    ...
-}
-```
+No futex wake is issued on the clear -- only the set path wakes waiters.
 
 ### Module-Level Changes
 
-- **`kernel/sched/notification.zig`** — new file. `NotificationBox` struct, `signal`, `wait`, `cleanup_on_death`.
-- **`kernel/arch/x64/irq.zig`** — adds `maskIrq(u8)`, `unmaskIrq(u8)` via I/O APIC. Adds global `irq_table: [256]?*DeviceRegion` populated during firmware table parsing. Adds the device IRQ dispatch path in the IRQ handler.
-- **`kernel/arch/dispatch.zig`** — adds `maskIrq(u8)`, `unmaskIrq(u8)` dispatch functions.
-- **`kernel/proc/process.zig`** — adds `notification_box: NotificationBox` and `badge_counter: u6` fields. `cleanupPhase1` calls `notification_box.cleanup_on_death()`.
-- **`kernel/perms/permissions.zig`** — adds `irq` bit (bit 3) on `DeviceRegionRights`. `insertPerm` for device_region entries assigns the badge bit from `process.badge_counter` and increments. `UserViewEntry.fromKernelEntry` packs the badge bit into `field0` bits 56--61.
-- **`kernel/syscall/system.zig`** — implements the `notify_wait` handler.
-- **`kernel/syscall/device.zig`** — implements the `irq_ack` handler.
-- **`kernel/devices/registry.zig`** — `grantAllToRootService` grants device handles with rights `0b1111` (map + grant + dma + irq) instead of `0b111`.
+- **`kernel/arch/x64/irq.zig`** -- `maskIrq(u8)`, `unmaskIrq(u8)` via I/O APIC. Global `irq_table: [256]?*DeviceRegion` populated during firmware table parsing. IRQ handler sets bit 16 of device `field0` via CAS and calls `futex.wake`.
+- **`kernel/arch/dispatch.zig`** -- `maskIrq(u8)`, `unmaskIrq(u8)` dispatch functions.
+- **`kernel/perms/permissions.zig`** -- `UserViewEntry.fromKernelEntry` initializes bit 16 of `field0` to 0 for device entries. No badge bit or badge_counter.
+- **`kernel/syscall/device.zig`** -- `irq_ack` handler clears bit 16 of `field0` via CAS before unmasking the IRQ line.
+- **`kernel/devices/registry.zig`** -- `grantAllToRootService` grants device handles with rights `0b1111` (map + grant + dma + irq).
 
-### Timeout Integration
+### Process Death Cleanup
 
-`notify_wait` with a finite timeout uses the same timed-waiter mechanism as `futex_wait`: the thread is placed on both the notification box queue and a global timed-waiter slot. The scheduler tick handler checks timed waiters and wakes expired ones with `E_TIMEOUT`. When a notification signal wakes the thread first, the timed-waiter slot is cleared. This reuses the existing futex timeout infrastructure rather than adding a new timer mechanism.
-
-### Locking
-
-The notification box lock ordering is: acquire `notification_box.lock` before `rq_lock` (same as `fault_box.lock`). The `signal` path acquires `notification_box.lock` to drain waiters, then for each waiter acquires the target core's `rq_lock` to enqueue. No other kernel lock is held when `notification_box.lock` is taken.
-
-The IRQ handler path runs with interrupts disabled on the current core (standard x86 interrupt gate behavior). It acquires `notification_box.lock` briefly for the waiter drain. This is safe because `notification_box.lock` is never held with interrupts enabled on the same core that handles IRQs (the `wait` path disables interrupts via `lockIrqSave`).
+No special cleanup is needed for the IRQ pending bit on process death. The user view page is freed as part of normal address space teardown. Futex waiters on device entry addresses are cleaned up by the existing futex death cleanup path (which removes the thread from all futex bucket queues).
 
 ---
 
