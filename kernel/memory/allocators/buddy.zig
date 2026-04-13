@@ -91,7 +91,7 @@ pub const BuddyAllocator = struct {
             );
             current_addr += PAGE_SIZE;
             progress += 1;
-            if (progress & 0x3FF == 0) dispatch.earlyDebugChar('p');
+            if (progress & 0xFF == 0) dispatch.earlyDebugChar('p');
         }
     }
 
