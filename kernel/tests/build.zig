@@ -206,6 +206,8 @@ pub fn build(b: *std.Build) void {
     const child_perf_ipc_client_bin = buildChild(b, target, lib_mod, "child_perf_ipc_client", "children/child_perf_ipc_client.zig");
     const child_perf_futex_waiter_bin = buildChild(b, target, lib_mod, "child_perf_futex_waiter", "children/child_perf_futex_waiter.zig");
     const child_perf_workload_bin = buildChild(b, target, lib_mod, "child_perf_workload", "children/child_perf_workload.zig");
+    const child_perf_fault_int3_bin = buildChild(b, target, lib_mod, "child_perf_fault_int3", "children/child_perf_fault_int3.zig");
+    const child_perf_debug_target_bin = buildChild(b, target, lib_mod, "child_perf_debug_target", "children/child_perf_debug_target.zig");
 
     const embedded_wf = b.addWriteFiles();
     _ = embedded_wf.addCopyFile(child_exit_bin, "child_exit.elf");
@@ -353,6 +355,8 @@ pub fn build(b: *std.Build) void {
     _ = embedded_wf.addCopyFile(child_perf_ipc_client_bin, "child_perf_ipc_client.elf");
     _ = embedded_wf.addCopyFile(child_perf_futex_waiter_bin, "child_perf_futex_waiter.elf");
     _ = embedded_wf.addCopyFile(child_perf_workload_bin, "child_perf_workload.elf");
+    _ = embedded_wf.addCopyFile(child_perf_fault_int3_bin, "child_perf_fault_int3.elf");
+    _ = embedded_wf.addCopyFile(child_perf_debug_target_bin, "child_perf_debug_target.elf");
     const embed_src = embedded_wf.add("embedded_children.zig",
         \\pub const child_exit = @embedFile("child_exit.elf");
         \\pub const child_shm_counter = @embedFile("child_shm_counter.elf");
@@ -499,6 +503,8 @@ pub fn build(b: *std.Build) void {
         \\pub const child_perf_ipc_client = @embedFile("child_perf_ipc_client.elf");
         \\pub const child_perf_futex_waiter = @embedFile("child_perf_futex_waiter.elf");
         \\pub const child_perf_workload = @embedFile("child_perf_workload.elf");
+        \\pub const child_perf_fault_int3 = @embedFile("child_perf_fault_int3.elf");
+        \\pub const child_perf_debug_target = @embedFile("child_perf_debug_target.elf");
         \\
     );
 
