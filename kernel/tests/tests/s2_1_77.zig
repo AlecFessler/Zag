@@ -10,7 +10,7 @@ fn threadFn() void {
     syscall.thread_exit();
 }
 
-/// §2.1.77 — Thread entry `field0` is the thread's stable kernel-assigned thread id (`tid`, u64).
+/// §2.1.77 — Thread entry `field0` encodes: `tid(u32, bits 0-31) | exclude_oneshot(bit 32) | exclude_permanent(bit 33)`.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
     const ret = syscall.thread_create(&threadFn, 0, 4);

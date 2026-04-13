@@ -15,7 +15,7 @@ fn findCorePinEntry(view: [*]const perm_view.UserViewEntry, handle: u64) bool {
     return false;
 }
 
-/// §2.2.32 — There are two ways to unpin: (1) call `revoke_perm` on the `core_pin` handle, which restores the pre-pin affinity mask and drops priority to the pre-pin level; (2) call `set_priority` with any non-pinned level, which implicitly revokes the `core_pin` handle, restores affinity, and applies the new priority.
+/// §2.2.32 — There are two ways to unpin: (1) call `thread_unpin` on the thread's handle, which restores the pre-pin affinity mask and drops priority to the pre-pin level; (2) call `set_priority` with any non-pinned level, which implicitly unpins, restores affinity, and applies the new priority.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 

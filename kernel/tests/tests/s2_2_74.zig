@@ -5,7 +5,7 @@ const t = lib.testing;
 
 const E_MAXCAP: i64 = -5;
 
-/// §2.2.74 — `set_priority(.pinned)` returns `E_MAXCAP` if the permissions table is full.
+/// §2.2.74 — `set_priority` with a non-pinned level while currently pinned implicitly unpins the thread, restores the pre-pin affinity mask, clears `field1` in the thread's user view entry, and applies the new priority.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
 

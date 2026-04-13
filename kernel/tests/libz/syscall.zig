@@ -70,6 +70,7 @@ pub const SyscallNum = enum(u64) {
     irq_ack,
     sys_power,
     sys_cpu_power,
+    thread_unpin,
 };
 
 fn syscall0(num: SyscallNum) i64 {
@@ -437,6 +438,10 @@ pub fn thread_resume(thread_handle: u64) i64 {
 
 pub fn thread_kill(thread_handle: u64) i64 {
     return syscall1(.thread_kill, thread_handle);
+}
+
+pub fn thread_unpin(thread_handle: u64) i64 {
+    return syscall1(.thread_unpin, thread_handle);
 }
 
 pub fn fault_recv(buf_ptr: u64, blocking: u64) i64 {
