@@ -20,7 +20,6 @@ const VirtualMemoryManager = zag.memory.vmm.VirtualMemoryManager;
 
 const E_BADADDR = errors.E_BADADDR;
 const E_BADCAP = errors.E_BADCAP;
-const E_BUSY = errors.E_BUSY;
 const E_INVAL = errors.E_INVAL;
 const E_MAXCAP = errors.E_MAXCAP;
 const E_NOMEM = errors.E_NOMEM;
@@ -129,19 +128,6 @@ pub fn sysRevokePerm(handle: u64) i64 {
             proc.removePerm(handle) catch {};
         },
         .shared_memory => |shm| {
-            // DMA mappings of this SHM pin the kernel-side `*SharedMemory`
-            // via a raw pointer in `proc.dma_mappings` (no counted ref).
-            // If we dropped the perm-table ref here while a DMA mapping
-            // still pointed at `shm`, `shm.decRef()` could destroy the
-            // SharedMemory and free its backing pages while the IOMMU
-            // page table still routes device DMA at those phys frames —
-            // a device-driven arbitrary-physical-memory write on any
-            // frame the PMM subsequently hands out. Refuse the revoke
-            // until the caller explicitly `mem_dma_unmap`s the SHM.
-            // See exploits/dma_revoke_stale_iommu.
-            for (proc.dma_mappings[0..proc.num_dma_mappings]) |*m| {
-                if (m.active and m.shm == shm) return E_BUSY;
-            }
             // Remove the handle from the permission table BEFORE freeing
             // the SHM.  This prevents a concurrent sysMemShmMap (which holds
             // perm_lock across its lookup + vmm.mem_shm_map) from finding the
