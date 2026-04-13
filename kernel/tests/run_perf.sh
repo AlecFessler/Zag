@@ -96,3 +96,43 @@ done
 echo "================================"
 echo "Results written to: $RESULTS_DIR/latest.txt"
 echo "Total benchmarks: $total"
+
+# --- Auto-resolve profiler symbols ---
+if grep -q '^\[PROF\]' "$RESULTS_DIR/latest.txt" 2>/dev/null; then
+    echo ""
+    echo "=== Resolving profiler symbols ==="
+    # The profiler samples RIPs from the *child* workload process, not
+    # the parent profiler. Resolve against the child's ELF.
+    local child_elf="$BIN_DIR/child_perf_workload.elf"
+    if [ ! -f "$child_elf" ]; then
+        child_elf="$BIN_DIR/perf_profiler.elf"
+    fi
+    bash "$SCRIPT_DIR/resolve_symbols.sh" "$RESULTS_DIR/latest.txt" "$child_elf" 2>/dev/null || true
+fi
+
+# --- Auto-compare against baseline ---
+BASELINE="$SCRIPT_DIR/perf_baseline.txt"
+if [ -f "$BASELINE" ]; then
+    echo ""
+    echo "=== Regression check vs baseline ==="
+    bash "$SCRIPT_DIR/compare_perf.sh" "$BASELINE" "$RESULTS_DIR/latest.txt" 15 || true
+    echo ""
+fi
+
+# --- Outlier summary for agents ---
+# Ranks all benchmarks by median cycles, highlights the top 10 most
+# expensive operations as optimization targets.
+echo ""
+echo "=== Top 10 most expensive operations (by median cycles) ==="
+printf "%-35s %12s\n" "Benchmark" "Median"
+printf "%-35s %12s\n" "-----------------------------------" "------------"
+grep '^\[PERF\] .* median=' "$RESULTS_DIR/latest.txt" 2>/dev/null | \
+    awk '{
+        name=$2;
+        for(i=3;i<=NF;i++){
+            if($i ~ /^median=/){
+                split($i,a,"=");
+                printf "%-35s %12s\n", name, a[2]
+            }
+        }
+    }' | sort -t' ' -k2 -rn | head -10
