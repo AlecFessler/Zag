@@ -302,6 +302,18 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
 
     target_proc.msg_box.lock.lock();
 
+    // Re-check liveness under msg_box.lock. kill() sets `alive = false`
+    // under both self.lock and msg_box.lock (see process.zig), and then
+    // drains msg_box under msg_box.lock before deinit'ing threads. This
+    // re-check closes a TOCTOU where the line 294 check above observed
+    // `alive == true` before another core ran killSubtree and began
+    // tearing the receiver thread down.
+    if (!target_proc.alive) {
+        target_proc.msg_box.lock.unlock();
+        proc.convertToDeadProcess(target_proc);
+        return .{ .ret = E_BADCAP };
+    }
+
     if (!target_proc.msg_box.isReceiving()) {
         // No receiver waiting
         target_proc.msg_box.lock.unlock();
@@ -337,9 +349,18 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
 
     // Send has no caller to reply to.
     target_proc.msg_box.beginPendingReplyLocked(null);
-    target_proc.msg_box.lock.unlock();
 
+    // Wake the receiver while still holding msg_box.lock. kill() on the
+    // target process will eventually acquire this lock via cleanupIpcState
+    // before deinit'ing blocked threads — holding the lock across wakeThread
+    // ensures the receiver's Thread struct cannot be freed between the
+    // takeReceiverLocked above and the cmpxchg+enqueue inside wakeThread.
+    // The cmpxchg in wakeThread still protects against the case where kill()
+    // marked the receiver .exited before we got here (races with kill's
+    // self.lock scan, not msg_box.lock).
     wakeThread(receiver);
+
+    target_proc.msg_box.lock.unlock();
     return .{ .ret = E_OK };
 }
 
@@ -363,6 +384,15 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
     if (rights_check != E_OK) return .{ .ret = rights_check };
 
     target_proc.msg_box.lock.lock();
+
+    // Re-check liveness under msg_box.lock. See sysIpcSend for rationale —
+    // closes a TOCTOU where the line 357 check above observed alive before
+    // a concurrent kill() tore the target's msg_box state down.
+    if (!target_proc.alive) {
+        target_proc.msg_box.lock.unlock();
+        proc.convertToDeadProcess(target_proc);
+        return .{ .ret = E_BADCAP };
+    }
 
     if (target_proc.msg_box.isReceiving()) {
         // Receiver is waiting — deliver and queue caller for reply.
@@ -390,12 +420,18 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
 
         target_proc.msg_box.beginPendingReplyLocked(thread);
         thread.ipc_server = target_proc;
-        target_proc.msg_box.lock.unlock();
 
         // TODO: this should switchToThread directly to the receiver as a
         // fast-path handoff, but doing so currently hangs. Use wakeThread
         // and block self via switchToNextReady for now.
+        //
+        // Wake the receiver while still holding msg_box.lock — see
+        // sysIpcSend for rationale. Keeps the receiver Thread struct
+        // reachable from target_proc's msg_box state machine until the
+        // wake has committed the cmpxchg and enqueue.
         wakeThread(receiver);
+
+        target_proc.msg_box.lock.unlock();
 
         thread.state = .blocked;
         thread.ctx = ctx;

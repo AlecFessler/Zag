@@ -748,6 +748,33 @@ pub const Process = struct {
         self.suspended_thread_slots = 0;
         self.lock.unlock();
 
+        // Drain msg_box and fault_box state BEFORE deinit'ing blocked
+        // threads. Any concurrent sysIpcSend/sysIpcCall that observed
+        // `state == .receiving` and took the receiver out via
+        // takeReceiverLocked will still be inside its msg_box.lock crit
+        // section (the wakeThread call has been moved inside the lock as
+        // of the companion ipc.zig fix). Taking msg_box.lock here waits
+        // for that crit section to finish before we proceed to deinit
+        // the receiver thread — without this barrier, kill could free
+        // the Thread struct while another core is still writing to its
+        // ctx/state through the takeReceiver'd pointer. After we drain,
+        // msg_box.receiver is null and any new sysIpcSend arrival will
+        // re-check `alive` under msg_box.lock and bail with E_BADCAP.
+        //
+        // fault_box gets the same treatment — sysFaultRecv/Reply paths
+        // have the same shape.
+        self.msg_box.lock.lock();
+        if (self.msg_box.isReceiving()) {
+            _ = self.msg_box.takeReceiverLocked();
+        }
+        self.msg_box.lock.unlock();
+
+        self.fault_box.lock.lock();
+        if (self.fault_box.isReceiving()) {
+            _ = self.fault_box.takeReceiverLocked();
+        }
+        self.fault_box.lock.unlock();
+
         // Remove blocked threads from external wait structures and deinit them.
         // Each deinit calls removeThread which decrements num_threads.
         // The last thread's deinit triggers lastThreadExited.
