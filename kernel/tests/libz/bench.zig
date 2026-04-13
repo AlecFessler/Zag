@@ -134,13 +134,16 @@ pub fn allocBuf(count: u32) ?[*]u64 {
     return ptr;
 }
 
-/// Touch one byte per page to fault in all backing pages.
+/// Write one byte per page to fault in all backing pages.
+/// Must be a WRITE, not a read — reads of zero-fill pages hit the
+/// shared zero page via COW without materializing a real page, so
+/// the first write during measurement would still fault.
 fn prefault(ptr: [*]u64, count: u32) void {
     const base: [*]volatile u8 = @ptrCast(ptr);
     const total_bytes = @as(u64, count) * @sizeOf(u64);
     var off: u64 = 0;
     while (off < total_bytes) {
-        _ = base[off];
+        base[off] = 0;
         off += syscall.PAGE4K;
     }
 }
