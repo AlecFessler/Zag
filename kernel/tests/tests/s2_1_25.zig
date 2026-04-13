@@ -11,7 +11,7 @@ const t = lib.testing;
 /// Spawn a restartable child that receives a device, pins itself, then crashes.
 /// After restart, verify:
 ///   - Device handle persisted (child still has it, not returned to parent).
-///   - Core_pin handle was cleared (child reports zero core_pin entries).
+///   - Pin state was cleared (child reports not pinned after restart).
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
@@ -54,7 +54,7 @@ pub fn main(pv: u64) void {
         t.failWithVal("§2.1.25 ipc_call to restarted child", 0, ipc_ret);
         syscall.shutdown();
     }
-    const core_pin_count = report.words[0];
+    const pinned_after_restart = report.words[0];
     const device_count = report.words[1];
 
     // Device should NOT have returned to us — it persisted with the child.
@@ -68,7 +68,7 @@ pub fn main(pv: u64) void {
 
     const child_alive = view[slot].entry_type == perm_view.ENTRY_TYPE_PROCESS;
 
-    if (!device_returned and child_alive and device_count > 0 and core_pin_count == 0) {
+    if (!device_returned and child_alive and device_count > 0 and pinned_after_restart == 0) {
         t.pass("§2.1.25");
     } else {
         t.fail("§2.1.25");

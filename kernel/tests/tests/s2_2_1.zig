@@ -18,17 +18,16 @@ pub fn main(_: u64) void {
     const r3 = syscall.set_priority(syscall.PRIORITY_REALTIME);
     t.expectOk("§2.2.1 realtime(3)", r3);
 
-    // Pinned returns a positive handle ID, not E_OK.
+    // Pinned returns the pinned core ID (>= 0) on success.
     const r4 = syscall.set_priority(syscall.PRIORITY_PINNED);
-    if (r4 <= 0) {
-        t.failWithVal("§2.2.1 pinned(4)", 1, r4);
+    if (r4 < 0) {
+        t.failWithVal("§2.2.1 pinned(4)", 0, r4);
         syscall.shutdown();
     }
     t.pass("§2.2.1 pinned(4)");
 
-    // Clean up the core_pin handle.
-    const handle: u64 = @bitCast(r4);
-    _ = syscall.revoke_perm(handle);
+    // Unpin by setting back to normal.
+    _ = syscall.set_priority(syscall.PRIORITY_NORMAL);
 
     syscall.shutdown();
 }
