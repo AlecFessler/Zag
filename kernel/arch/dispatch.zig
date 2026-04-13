@@ -584,13 +584,27 @@ pub inline fn earlyDebugChar(c: u8) void {
     }
 }
 
+pub fn earlyDebugHex(v: u64) void {
+    var shift: u6 = 60;
+    while (true) {
+        const nibble: u8 = @intCast((v >> shift) & 0xF);
+        const ch: u8 = if (nibble < 10) '0' + nibble else 'A' + (nibble - 10);
+        earlyDebugChar(ch);
+        if (shift == 0) break;
+        shift -= 4;
+    }
+}
+
 /// Enable kernel-space translation. On aarch64 this configures TCR_EL1 to
 /// enable TTBR1 walks with 48-bit VA and 4KB granule. On x86-64 this is a
 /// no-op since CR3 already covers the full address space.
 pub fn enableKernelTranslation() void {
     switch (builtin.cpu.arch) {
         .x86_64 => {},
-        .aarch64 => aarch64.paging.enableKernelTranslation(),
+        .aarch64 => {
+            aarch64.paging.initMairIndices();
+            aarch64.paging.enableKernelTranslation();
+        },
         else => unreachable,
     }
 }

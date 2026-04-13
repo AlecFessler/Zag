@@ -27,11 +27,12 @@ const serial = zag.arch.aarch64.serial;
 pub fn init() void {
     const dispatch = zag.arch.dispatch;
     dispatch.earlyDebugChar('1');
-    // NOTE: setMair() must run inside a proper MMU-off → clean → MAIR
-    // write → MMU-on cycle, not in place here. Linux arm64 follows the
-    // same rule (proc.S __cpu_setup). For now we stay on UEFI's MAIR
-    // throughout boot; the kernel will perform the cycle before any
-    // code path that requires Write-Back attributes.
+    // Resolve MAIR attribute indices against whatever layout the
+    // firmware/bootloader left in MAIR_EL1. We cannot safely rewrite
+    // MAIR_EL1 under a live MMU (Linux arm64 head.S / proc.S only
+    // writes MAIR with the MMU disabled), so we adopt the firmware
+    // indices and use them for page-table attr_indx fields.
+    paging.initMairIndices();
     dispatch.earlyDebugChar('2');
     // DEBUG: exceptions.install() deferred so the bootloader's early
     // fault handler stays active through memory.init — otherwise any

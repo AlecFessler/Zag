@@ -36,9 +36,9 @@ fn computeKaslrSlide(parsed_elf: *const ParsedElf) u64 {
     const max_slide = kaslr_end - link_base - image_size;
     const slide_pages = max_slide / paging.PAGE4K;
 
-    const entropy = arch.readTimestamp();
-    const offset_pages = entropy % slide_pages;
-    return offset_pages * paging.PAGE4K;
+    _ = slide_pages;
+    _ = arch.readTimestamp();
+    return 0;
 }
 
 fn applyKaslrRelocations(file_bytes: []u8, slide: u64) !void {
