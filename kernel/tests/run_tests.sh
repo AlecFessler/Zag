@@ -10,7 +10,18 @@ TIMEOUT=30
 # Default to a single QEMU instance to keep agent runs from blowing up RAM.
 # Override interactively with `PARALLEL=16 bash run_tests.sh` for fast local runs.
 PARALLEL="${PARALLEL:-1}"
-QEMU_CMD="qemu-system-x86_64 -m 2G -bios /usr/share/ovmf/x64/OVMF.4m.fd -serial stdio -display none -no-reboot -enable-kvm -cpu host,+invtsc -machine q35 -device intel-iommu,intremap=off -net none -smp cores=4"
+# Target architecture — "x64" (default) or "arm" (aarch64 via qemu-system-aarch64 + TCG)
+ARCH="${ARCH:-x64}"
+
+if [ "$ARCH" = "arm" ]; then
+    QEMU_CMD="qemu-system-aarch64 -M virt,gic-version=3 -m 1G -bios /usr/share/AAVMF/AAVMF_CODE.fd -serial stdio -display none -no-reboot -machine accel=tcg -cpu cortex-a72 -smp cores=1"
+    BUILD_ARCH_FLAG="-Darch=arm"
+    LOADER="BOOTAA64.EFI"
+else
+    QEMU_CMD="qemu-system-x86_64 -m 2G -bios /usr/share/ovmf/x64/OVMF.4m.fd -serial stdio -display none -no-reboot -enable-kvm -cpu host,+invtsc -machine q35 -device intel-iommu,intremap=off -net none -smp cores=4"
+    BUILD_ARCH_FLAG=""
+    LOADER="BOOTX64.EFI"
+fi
 
 # Verify spec coverage before running tests
 echo "Verifying spec/test coverage..."
@@ -25,18 +36,26 @@ BIN_DIR="$SCRIPT_DIR/bin"
 RESULTS_DIR=$(mktemp -d)
 
 # Build all test ELFs
-echo "Building test ELFs..."
+echo "Building test ELFs ($ARCH)..."
 cd "$SCRIPT_DIR"
-zig build 2>/dev/null
+if [ -n "$BUILD_ARCH_FLAG" ]; then
+    zig build $BUILD_ARCH_FLAG 2>/dev/null
+else
+    zig build 2>/dev/null
+fi
 
 # Create placeholder root_service.elf for kernel build
 first_elf=$(find "$BIN_DIR" -name 's*.elf' | head -1)
 cp "$first_elf" "$BIN_DIR/root_service.elf"
 
 # Build kernel (creates zig-out/img/ with kernel.elf, efi/, etc.)
-echo "Building kernel..."
+echo "Building kernel ($ARCH)..."
 cd "$ZAG_ROOT"
-zig build -Dprofile=test 2>/dev/null
+if [ -n "$BUILD_ARCH_FLAG" ]; then
+    zig build $BUILD_ARCH_FLAG -Dprofile=test 2>/dev/null
+else
+    zig build -Dprofile=test 2>/dev/null
+fi
 echo ""
 
 run_one_test() {
@@ -46,7 +65,7 @@ run_one_test() {
 
     # Set up FAT image directory
     mkdir -p "$workdir/efi/boot"
-    ln -s "$IMG_DIR/efi/boot/BOOTX64.EFI" "$workdir/efi/boot/"
+    ln -s "$IMG_DIR/efi/boot/$LOADER" "$workdir/efi/boot/"
     ln -s "$IMG_DIR/kernel.elf" "$workdir/"
     cp "$IMG_DIR/NvVars" "$workdir/" 2>/dev/null || true
     cp "$elf" "$workdir/root_service.elf"
@@ -71,7 +90,7 @@ run_one_test() {
 }
 
 export -f run_one_test
-export IMG_DIR TIMEOUT QEMU_CMD RESULTS_DIR
+export IMG_DIR TIMEOUT QEMU_CMD RESULTS_DIR LOADER
 
 # Collect all test ELFs, sorted
 mapfile -t test_elfs < <(find "$BIN_DIR" -name 's*.elf' | sort)
