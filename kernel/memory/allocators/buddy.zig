@@ -94,8 +94,8 @@ pub const BuddyAllocator = struct {
             if (progress & 0xFF == 0) dispatch.earlyDebugChar('p');
             // Watchdog: detect infinite stalls by printing a tick every 4 pages
             // in the final stretch (after 2040 pages in a region).
-            if (progress > 2040 and progress < 2060) {
-                dispatch.earlyDebugChar('0' + @as(u8, @truncate(progress & 0xF)));
+            if (progress >= 2048 and progress & 0x1F == 0) {
+                dispatch.earlyDebugChar('.');
             }
         }
     }

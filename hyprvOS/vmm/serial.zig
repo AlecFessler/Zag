@@ -44,6 +44,9 @@ var fcr: u8 = 0; // FIFO Control Register (write-only, shadows for IIR FIFO bits
 // Host serial device handle (0 = not found)
 var host_serial_handle: u64 = 0;
 
+// Virtual BAR base address for host serial port IO (0 = not mapped)
+var host_serial_base: u64 = 0;
+
 // RX buffer: circular buffer for host→guest data
 var rx_buf: [256]u8 = undefined;
 var rx_head: u8 = 0; // next write position
@@ -71,7 +74,7 @@ fn rxPop() u8 {
     return byte;
 }
 
-/// Initialize: find the host serial device handle from perm_view.
+/// Initialize: find the host serial device handle from perm_view and map its IO ports.
 pub noinline fn init(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
     for (0..128) |i| {
@@ -83,10 +86,38 @@ pub noinline fn init(pv: u64) void {
             log.print("serial: host handle=");
             log.dec(host_serial_handle);
             log.print("\n");
+
+            // Map the port IO region as a virtual BAR
+            const port_count = view[i].deviceSizeOrPortCount();
+            const aligned_size = ((port_count + 4095) / 4096) * 4096;
+            const vm_rights = (perms.VmReservationRights{ .read = true, .write = true, .mmio = true }).bits();
+            const res = syscall.mem_reserve(0, aligned_size, vm_rights);
+            if (res.val < 0) {
+                log.print("serial: mem_reserve failed\n");
+                return;
+            }
+            const vm_handle: u64 = @bitCast(res.val);
+            host_serial_base = res.val2;
+
+            const rc = syscall.mem_mmio_map(host_serial_handle, vm_handle, 0);
+            if (rc < 0) {
+                log.print("serial: mmio_map failed\n");
+                host_serial_base = 0;
+                return;
+            }
+            log.print("serial: mapped at 0x");
+            log.hex64(host_serial_base);
+            log.print("\n");
             return;
         }
     }
     log.print("serial: no host serial device found\n");
+}
+
+/// Read a byte from the host serial port via the virtual BAR mapping.
+fn hostPortRead(offset: u64) u8 {
+    const ptr: *volatile u8 = @ptrFromInt(host_serial_base + offset);
+    return ptr.*;
 }
 
 /// Poll host serial for available data and buffer it.
@@ -94,17 +125,15 @@ pub noinline fn init(pv: u64) void {
 /// If RX interrupts are enabled (IER bit 0) and we got data, set irq_pending
 /// so the exit loop routes IRQ4 through the IOAPIC.
 pub fn pollHostRx() void {
-    if (host_serial_handle == 0) return;
+    if (host_serial_base == 0) return;
 
     var got_data = false;
     while (true) {
-        const lsr_val = syscall.ioport_read(host_serial_handle, REG_LSR, 1);
-        if (lsr_val < 0) return;
-        if (@as(u8, @truncate(@as(u64, @bitCast(lsr_val)))) & LSR_DATA_READY == 0) break;
+        const lsr_val = hostPortRead(REG_LSR);
+        if (lsr_val & LSR_DATA_READY == 0) break;
 
-        const data_val = syscall.ioport_read(host_serial_handle, REG_DATA, 1);
-        if (data_val < 0) return;
-        rxPush(@truncate(@as(u64, @bitCast(data_val))));
+        const data_val = hostPortRead(REG_DATA);
+        rxPush(data_val);
         got_data = true;
     }
 
