@@ -3,6 +3,7 @@ const zag = @import("zag");
 
 const PAddr = zag.memory.address.PAddr;
 const SlabAllocator = zag.memory.allocators.slab.SlabAllocator;
+const SpinLock = zag.utils.sync.SpinLock;
 
 pub const DeviceType = enum(u8) {
     mmio = 0,
@@ -29,6 +30,15 @@ pub const Pci = struct {
     func: u8,
     dma_page_table_root: PAddr,
     dma_cursor: u64,
+    /// Serializes `arch.mapDmaPages` / `arch.unmapDmaPages` for this
+    /// device. Without this lock, two threads sharing a device cap with
+    /// the `dma` right can race in the iommu walk, read the same
+    /// `dma_cursor`, install overlapping leaf PTEs, and return the
+    /// same `dma_base` for two different SHMs — a subsequent unmap of
+    /// either mapping then tears down PTEs that still back the other
+    /// and pmm-frees frames that the device is still programmed to
+    /// DMA into (kernel-RAM pivot). See exploits/dma_map_race_iova_alias.
+    dma_lock: SpinLock,
 };
 
 pub const Display = struct {
@@ -92,6 +102,7 @@ pub fn createMmio(
             .func = pci_func,
             .dma_page_table_root = PAddr.fromInt(0),
             .dma_cursor = 0x1000,
+            .dma_lock = .{},
         } },
     };
     return dr;
@@ -125,6 +136,7 @@ pub fn createPortIo(
             .func = pci_func,
             .dma_page_table_root = PAddr.fromInt(0),
             .dma_cursor = 0,
+            .dma_lock = .{},
         } },
     };
     return dr;
