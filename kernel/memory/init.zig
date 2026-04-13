@@ -47,8 +47,11 @@ var heap_allocator_instance: HeapAllocator = undefined;
 pub var heap_allocator: std.mem.Allocator = undefined;
 
 pub fn init(firmware_mmap: MMap) !void {
+    arch.earlyDebugChar('a');
     var mmap_entries: [boot.protocol.MAX_MMAP_ENTRIES]MMapEntry = undefined;
+    arch.earlyDebugChar('A');
     const mmap = boot.protocol.collapseMMap(&firmware_mmap, &mmap_entries);
+    arch.earlyDebugChar('b');
 
     var smallest_addr_region: MMapEntry = .{ .start_paddr = std.math.maxInt(u64), .num_pages = 0, .type = .free };
     var largest_addr_free_region: MMapEntry = .{ .start_paddr = 0, .num_pages = 0, .type = .free };
@@ -121,7 +124,9 @@ pub fn init(firmware_mmap: MMap) !void {
     bump_allocator.free_addr = bump_alloc_free_virt.addr;
     bump_allocator.end_addr = bump_alloc_end_virt.addr;
 
+    arch.earlyDebugChar('c');
     arch.dropIdentityMapping();
+    arch.earlyDebugChar('d');
     const buddy_alloc_start_virt = VAddr.fromPAddr(
         PAddr.fromInt(std.mem.alignForward(u64, smallest_addr_region.start_paddr, paging.PAGE4K)),
         null,
@@ -140,6 +145,7 @@ pub fn init(firmware_mmap: MMap) !void {
         bump_alloc_iface,
     );
     const buddy_alloc_iface = buddy_allocator.allocator();
+    arch.earlyDebugChar('e');
 
     for (mmap) |entry| {
         if (entry.type != .free) continue;
@@ -175,6 +181,7 @@ pub fn init(firmware_mmap: MMap) !void {
 
         buddy_allocator.addRegion(useable_range.start, useable_range.end);
     }
+    arch.earlyDebugChar('f');
 
     pmm.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
 

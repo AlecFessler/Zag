@@ -289,6 +289,76 @@ pub fn installEarlyFaultHandler() void {
     }
 }
 
+/// Synchronize the instruction cache with the data cache after writing
+/// new executable code to memory. On x86-64 this is a no-op (coherent
+/// I-cache). On aarch64 the I/D caches are separate and loader code must
+/// explicitly invalidate the I-cache before fetching freshly written
+/// instructions, or stale bytes can be decoded as garbage.
+pub fn syncInstructionCache() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => asm volatile (
+            \\ic ialluis
+            \\dsb ish
+            \\isb
+            ::: .{ .memory = true }),
+        else => unreachable,
+    }
+}
+
+/// Clean + invalidate the data cache over the given byte range to the
+/// point of coherency. On x86-64 this is a no-op (coherent D-cache). On
+/// aarch64 this is required when memory is reconfigured from Normal
+/// Non-cacheable to Normal Write-Back (e.g., when the kernel installs
+/// its own MAIR_EL1 over UEFI's), otherwise stale cache lines from a
+/// prior cacheable view can shadow freshly written NC data.
+pub fn cleanInvalidateDcacheRange(start: u64, len: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => {
+            // Drain any pending Normal Non-cacheable stores from the
+            // write buffer to RAM before we start cleaning the cache.
+            // Without this, NC writes may still be in flight when DC
+            // CIVAC runs, and subsequent WB reads can race past the
+            // pending writes.
+            asm volatile ("dsb sy" ::: .{ .memory = true });
+            // 64-byte cache line on Cortex-A72. Use a conservative
+            // fixed line size rather than reading CTR_EL0 here.
+            const line: u64 = 64;
+            const end = start + len;
+            var addr = start & ~(line - 1);
+            while (addr < end) : (addr += line) {
+                asm volatile ("dc civac, %[a]"
+                    :
+                    : [a] "r" (addr),
+                    : .{ .memory = true }
+                );
+            }
+            asm volatile (
+                \\dsb sy
+                \\isb
+                ::: .{ .memory = true });
+        },
+        else => unreachable,
+    }
+}
+
+/// Map any device MMIO the early fault handler needs to reach into the
+/// kernel page tables. On x86-64 this is a no-op (IO is via port
+/// instructions, no translation needed). On aarch64 this identity-maps
+/// the PL011 UART so the early fault handler can dump registers even
+/// after UEFI's TTBR0 identity mapping has been flushed or dropped.
+pub fn mapEarlyDebugDevices(
+    addr_space_root: VAddr,
+    allocator: std.mem.Allocator,
+) !void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => try aarch64.early_fault.mapUart(addr_space_root, allocator),
+        else => unreachable,
+    }
+}
+
 /// Called by the kernel entry point after the bootloader has already set SP
 /// to the kernel stack (via switchStackAndCall). Jumps to the trampoline
 /// with boot_info as the first argument.
@@ -324,18 +394,22 @@ pub inline fn switchStackAndCall(stack_top: VAddr, arg: u64, entry: u64) noretur
             );
         },
         .aarch64 => {
-            // Mask IRQ/FIQ/SError (UEFI's VBAR may be stale after exitBS),
-            // install our MAIR (index 1 = Normal WB), and flush TLBs so
-            // the first TTBR1 walk after this point uses our attributes.
-            // Then switch SP and branch to the kernel entry point.
-            const mair: u64 = 0x00000000_0000FF00;
+            // Follow Linux arm64's rule: MAIR_EL1 is only ever written
+            // with the MMU disabled. We stay on UEFI's MAIR here —
+            // changing it while the MMU is on and stale WB cache lines
+            // may exist at our physical pages produces "constrained
+            // unpredictable" reads on Cortex-A72 KVM (head.S:85-131,
+            // proc.S:__cpu_setup). Our kernel-side page tables use
+            // attr_indx=1 which under UEFI's MAIR is Normal NC — that
+            // is slower but correct. If/when the kernel needs Write-
+            // Back performance, it must perform the proper MMU-off →
+            // clean → MAIR write → MMU-on cycle from its own code.
+            //
+            // Mask IRQ/FIQ/SError so no stale firmware interrupt can
+            // reach its VBAR between here and the kernel installing
+            // its real exception vectors.
             asm volatile (
                 \\msr daifset, #0x7
-                \\isb
-                \\msr mair_el1, %[mair]
-                \\isb
-                \\tlbi vmalle1
-                \\dsb nsh
                 \\isb
                 \\mov sp, %[sp]
                 \\mov x0, %[arg]
@@ -344,7 +418,6 @@ pub inline fn switchStackAndCall(stack_top: VAddr, arg: u64, entry: u64) noretur
                 : [sp] "r" (stack_top.addr),
                   [arg] "r" (arg),
                   [entry] "r" (entry),
-                  [mair] "r" (mair),
                 : .{ .x0 = true, .memory = true }
             );
         },
@@ -501,8 +574,9 @@ pub inline fn earlyDebugChar(c: u8) void {
             );
         },
         .aarch64 => {
-            // PL011 at physical 0x09000000 via TTBR0 identity mapping.
-            // Only works before dropIdentityMapping() in memory.init.
+            // PL011 at physical 0x09000000 via TTBR0 identity mapping
+            // (UEFI firmware) or via mapEarlyDebugDevices() which
+            // identity-maps it into our kernel page table too.
             const uart: *volatile u32 = @ptrFromInt(0x09000000);
             uart.* = c;
         },

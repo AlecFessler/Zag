@@ -27,9 +27,16 @@ const serial = zag.arch.aarch64.serial;
 pub fn init() void {
     const dispatch = zag.arch.dispatch;
     dispatch.earlyDebugChar('1');
-    paging.setMair();
+    // NOTE: setMair() must run inside a proper MMU-off → clean → MAIR
+    // write → MMU-on cycle, not in place here. Linux arm64 follows the
+    // same rule (proc.S __cpu_setup). For now we stay on UEFI's MAIR
+    // throughout boot; the kernel will perform the cycle before any
+    // code path that requires Write-Back attributes.
     dispatch.earlyDebugChar('2');
-    exceptions.install();
+    // DEBUG: exceptions.install() deferred so the bootloader's early
+    // fault handler stays active through memory.init — otherwise any
+    // fault there hits the real handler which silently no-ops in
+    // serial.print (pre-ACPI) and appears as a hang.
     dispatch.earlyDebugChar('3');
     serial.init();
     dispatch.earlyDebugChar('4');

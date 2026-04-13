@@ -38,6 +38,20 @@ fn kMain(boot_info: *BootInfo) !void {
     arch.earlyDebugChar('M');
     arch.init();
     arch.earlyDebugChar('m');
+    // DEBUG: print boot_info.mmap.num_descriptors as seen from kMain
+    // to detect a compiler spill corrupting the boot_info.mmap read.
+    {
+        const n = boot_info.mmap.num_descriptors;
+        var shift: u6 = 12;
+        while (true) {
+            const nibble: u8 = @intCast((n >> shift) & 0xF);
+            const ch: u8 = if (nibble < 10) '0' + nibble else 'A' + (nibble - 10);
+            arch.earlyDebugChar(ch);
+            if (shift == 0) break;
+            shift -= 4;
+        }
+        arch.earlyDebugChar('|');
+    }
     try memory.init(boot_info.mmap);
     arch.earlyDebugChar('h');
     try memory.initHeap();

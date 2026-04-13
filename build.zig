@@ -87,7 +87,7 @@ pub fn build(b: *std.Build) void {
     };
     const optimize = b.standardOptimizeOption(.{});
     const cpu_model: std.Target.Query.CpuModel = if (arch == .aarch64)
-        .{ .explicit = &std.Target.aarch64.cpu.cortex_a76 }
+        .{ .explicit = &std.Target.aarch64.cpu.cortex_a72 }
     else
         .determined_by_arch_os;
     const zag_mod = b.addModule("zag", .{
