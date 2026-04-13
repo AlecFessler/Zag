@@ -113,30 +113,58 @@ fn getMpidr(core_idx: usize) u64 {
 /// The entry_point is the physical address of secondaryEntry; context_id carries
 /// the core index so the secondary can locate its stack.
 pub fn smpInit() !void {
+    arch.earlyDebugChar('S');
+    arch.earlyDebugChar('m');
+    arch.earlyDebugChar('p');
     const core_count = gic.coreCount();
+    arch.earlyDebugChar('c');
+    arch.earlyDebugChar('=');
+    arch.earlyDebugChar('0' + @as(u8, @intCast(core_count & 0xF)));
     if (core_count <= 1) return;
 
+    arch.earlyDebugChar('a');
     const pmm_iface = pmm.global_pmm.?.allocator();
+    arch.earlyDebugChar('b');
 
     // The secondary entry must be called at its physical address since
-    // firmware may deliver the core with MMU off.
+    // firmware may deliver the core with MMU off. secondaryEntry lives in the
+    // kernel_code VA range (TTBR1), so walk the kernel page tables to find
+    // its physical load address (cannot use physmap subtraction here).
     const entry_vaddr = @intFromPtr(&secondaryEntry);
-    const entry_paddr = PAddr.fromVAddr(VAddr.fromInt(entry_vaddr), null).addr;
+    arch.earlyDebugChar('c');
+    arch.earlyDebugHex(entry_vaddr);
+    const entry_page_paddr = arch.resolveVaddr(
+        memory_init.kernel_addr_space_root,
+        VAddr.fromInt(entry_vaddr),
+    ) orelse {
+        arch.earlyDebugChar('!');
+        arch.earlyDebugChar('R');
+        return;
+    };
+    const entry_paddr = entry_page_paddr.addr | (entry_vaddr & 0xFFF);
+    arch.earlyDebugChar('d');
+    arch.earlyDebugHex(entry_paddr);
 
     var core_idx: usize = 1;
     while (core_idx < core_count) {
+        arch.earlyDebugChar('L');
+        arch.earlyDebugChar('0' + @as(u8, @intCast(core_idx & 0xF)));
         const target_mpidr = getMpidr(core_idx);
+        arch.earlyDebugChar('M');
 
         // Allocate a kernel stack for this secondary core.
         const ap_stack = stack_mod.createKernel() catch {
+            arch.earlyDebugChar('!');
             core_idx += 1;
             continue;
         };
+        arch.earlyDebugChar('N');
 
         // Map physical pages for the stack.
         var page_addr = ap_stack.base.addr;
         var map_ok = true;
         while (page_addr < ap_stack.top.addr) {
+            arch.earlyDebugChar('.');
             const kpage = pmm_iface.create(paging.PageMem(.page4k)) catch {
                 map_ok = false;
                 break;
@@ -165,7 +193,16 @@ pub fn smpInit() !void {
         // target core in x0. We pass the core index so the secondary can
         // retrieve its stack and identify itself.
         const expected = cores_online.load(.acquire);
+        arch.earlyDebugChar('[');
+        arch.earlyDebugChar('0' + @as(u8, @intCast(core_idx & 0xF)));
+        arch.earlyDebugChar('m');
+        arch.earlyDebugHex(target_mpidr);
+        arch.earlyDebugChar('e');
+        arch.earlyDebugHex(entry_paddr);
         const ret = power.cpuOn(target_mpidr, entry_paddr, @intCast(core_idx));
+        arch.earlyDebugChar('r');
+        arch.earlyDebugHex(@as(u64, @bitCast(ret)));
+        arch.earlyDebugChar(']');
 
         if (ret != 0) {
             // CPU_ON failed — clean up the stack.
@@ -177,7 +214,7 @@ pub fn smpInit() !void {
         // Spin-wait for the secondary to signal it is online.
         // Use a bounded wait to avoid hanging if a core fails to start.
         var spin_count: u64 = 0;
-        const max_spins: u64 = 100_000_000;
+        const max_spins: u64 = 1_000_000;
         while (cores_online.load(.acquire) == expected) {
             if (spin_count >= max_spins) {
                 stack_mod.destroyKernel(ap_stack, memory_init.kernel_addr_space_root);
@@ -202,11 +239,21 @@ pub fn smpInit() !void {
 fn secondaryEntry() callconv(.naked) noreturn {
     // x0 = core_idx from PSCI. Load the pre-allocated stack top and set SP,
     // then branch to the Zig setup function with core_idx still in x0.
+    //
+    // Instrumentation: write directly to PL011 at PA 0x09000000. Works with
+    // MMU off (PA == VA) and with MMU on if the BSP's mappings also cover it.
     asm volatile (
+        \\mov x9, #0x09000000
+        \\mov w10, #0x21      // '!'
+        \\str w10, [x9]
         \\adrp x1, %[stacks]
         \\add x1, x1, :lo12:%[stacks]
         \\ldr x1, [x1, x0, lsl #3]
+        \\mov w10, #0x40      // '@'
+        \\str w10, [x9]
         \\mov sp, x1
+        \\mov w10, #0x23      // '#'
+        \\str w10, [x9]
         \\b %[setup]
         :
         : [stacks] "S" (&core_stack_tops),
@@ -217,8 +264,10 @@ fn secondaryEntry() callconv(.naked) noreturn {
 /// Secondary core setup after stack is established.
 /// Called from secondaryEntry with core_idx in x0.
 fn secondarySetup(core_idx: u64) callconv(.c) noreturn {
+    arch.earlyDebugChar('$');
     // Install exception vectors for this core (each core has its own VBAR_EL1).
     exceptions.install();
+    arch.earlyDebugChar('%');
 
     // Initialize the GIC redistributor and CPU interface for this core.
     gic.initSecondaryCoreGic(@intCast(core_idx));
