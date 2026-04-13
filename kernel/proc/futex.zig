@@ -117,20 +117,20 @@ pub fn wait(paddr: PAddr, expected: u64, timeout_ns: u64, thread: *Thread) i64 {
     thread.state = .blocked;
     pushWaiter(bucket, thread);
 
-    bucket.lock.unlockIrqRestore(irq);
-
     if (thread.futex_deadline_ns != 0) {
         if (!addTimedWaiter(thread)) {
-            // All timed waiter slots are full. Undo the block.
-            const irq2 = bucket.lock.lockIrqSave();
+            // All timed waiter slots are full. Undo while still holding lock
+            // to avoid deadlock with concurrent wake() spinning on on_cpu.
             _ = removeWaiter(bucket, thread);
-            bucket.lock.unlockIrqRestore(irq2);
+            bucket.lock.unlockIrqRestore(irq);
             thread.state = .running;
             thread.futex_paddr = PAddr.fromInt(0);
             thread.futex_deadline_ns = 0;
             return E_NORES;
         }
     }
+
+    bucket.lock.unlockIrqRestore(irq);
 
     arch.enableInterrupts();
     sched.yield();
@@ -266,17 +266,14 @@ pub fn waitVal(addrs: []const PAddr, expected: []const u64, count: usize, timeou
         pushWaiter(&buckets[bucketIdx(addrs[i])], thread);
     }
 
-    releaseBucketLocks(&lock_state);
-
     if (thread.futex_deadline_ns != 0) {
         if (!addTimedWaiter(thread)) {
-            // Undo: remove from all buckets.
+            // Undo while still holding bucket locks to avoid deadlock with
+            // concurrent wake() spinning on on_cpu.
             for (0..count) |i| {
-                const bucket = &buckets[bucketIdx(addrs[i])];
-                const irq2 = bucket.lock.lockIrqSave();
-                _ = removeWaiter(bucket, thread);
-                bucket.lock.unlockIrqRestore(irq2);
+                _ = removeWaiter(&buckets[bucketIdx(addrs[i])], thread);
             }
+            releaseBucketLocks(&lock_state);
             thread.state = .running;
             thread.futex_paddr = PAddr.fromInt(0);
             thread.futex_bucket_count = 0;
@@ -284,6 +281,8 @@ pub fn waitVal(addrs: []const PAddr, expected: []const u64, count: usize, timeou
             return E_NORES;
         }
     }
+
+    releaseBucketLocks(&lock_state);
 
     arch.enableInterrupts();
     sched.yield();
@@ -340,16 +339,14 @@ pub fn waitChange(addrs: []const PAddr, count: usize, timeout_ns: u64, thread: *
         pushWaiter(&buckets[bucketIdx(addrs[i])], thread);
     }
 
-    releaseBucketLocks(&lock_state);
-
     if (thread.futex_deadline_ns != 0) {
         if (!addTimedWaiter(thread)) {
+            // Undo while still holding bucket locks to avoid deadlock with
+            // concurrent wake() spinning on on_cpu.
             for (0..count) |i| {
-                const bucket = &buckets[bucketIdx(addrs[i])];
-                const irq2 = bucket.lock.lockIrqSave();
-                _ = removeWaiter(bucket, thread);
-                bucket.lock.unlockIrqRestore(irq2);
+                _ = removeWaiter(&buckets[bucketIdx(addrs[i])], thread);
             }
+            releaseBucketLocks(&lock_state);
             thread.state = .running;
             thread.futex_paddr = PAddr.fromInt(0);
             thread.futex_bucket_count = 0;
@@ -357,6 +354,8 @@ pub fn waitChange(addrs: []const PAddr, count: usize, timeout_ns: u64, thread: *
             return E_NORES;
         }
     }
+
+    releaseBucketLocks(&lock_state);
 
     arch.enableInterrupts();
     sched.yield();
