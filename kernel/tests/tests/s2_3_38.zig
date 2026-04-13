@@ -4,35 +4,18 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.3.38 — `mem_unmap` returns `E_OK` on success.
-///
-/// After unmap, the page must become zero-filled demand-paged private memory
-/// per §2.2.7. We write a pattern through the SHM mapping, unmap, then touch
-/// the same VA and confirm it reads back as zero.
+const E_INVAL: i64 = -1;
+
+/// §2.3.38 — `mem_shm_map` with out-of-bounds range returns `E_INVAL`.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
+    // Reservation is 4096 bytes, SHM is 4096 bytes, offset 4096 would go out of bounds.
     const shareable_rw = perms.VmReservationRights{ .read = true, .write = true, .shareable = true };
     const vm = syscall.mem_reserve(0, 4096, shareable_rw.bits());
     const vm_handle: u64 = @bitCast(vm.val);
-    const vaddr: u64 = vm.val2;
     const shm_rights = perms.SharedMemoryRights{ .read = true, .write = true };
     const shm_handle: u64 = @bitCast(syscall.shm_create_with_rights(4096, shm_rights.bits()));
-    _ = syscall.mem_shm_map(shm_handle, vm_handle, 0);
-
-    // Stamp a non-zero pattern through the SHM.
-    const buf: [*]volatile u8 = @ptrFromInt(vaddr);
-    for (0..64) |i| buf[i] = 0xCC;
-
-    const ret = syscall.mem_unmap(vm_handle, 0, 4096);
-    t.expectEqual("§2.3.38", 0, ret);
-
-    // Touching the page now should fault-in zeroed private memory.
-    for (0..64) |i| {
-        if (buf[i] != 0) {
-            t.fail("§2.3.38 page not zero-filled after unmap");
-            syscall.shutdown();
-        }
-    }
-    t.pass("§2.3.38 post-unmap page zero-filled");
+    const ret = syscall.mem_shm_map(shm_handle, vm_handle, 4096);
+    t.expectEqual("§2.3.38", E_INVAL, ret);
     syscall.shutdown();
 }

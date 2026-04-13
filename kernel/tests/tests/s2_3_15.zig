@@ -4,13 +4,26 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const E_INVAL: i64 = -1;
-
-/// §2.3.15 — `mem_reserve` with zero size returns `E_INVAL`.
+/// §2.3.15 — `mem_reserve` with zero hint finds a free range.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     const rw = perms.VmReservationRights{ .read = true, .write = true };
-    const result = syscall.mem_reserve(0, 0, rw.bits());
-    t.expectEqual("§2.3.15", E_INVAL, result.val);
+    const r1 = syscall.mem_reserve(0, 4096, rw.bits());
+    const r2 = syscall.mem_reserve(0, 4096, rw.bits());
+    if (r1.val <= 0 or r2.val <= 0 or r1.val2 == 0 or r2.val2 == 0) {
+        t.fail("§2.3.15");
+        syscall.shutdown();
+    }
+
+    // Two zero-hint reserves should get different addresses, both usable.
+    const p1: *volatile u64 = @ptrFromInt(r1.val2);
+    const p2: *volatile u64 = @ptrFromInt(r2.val2);
+    p1.* = 0xAAAA;
+    p2.* = 0xBBBB;
+    if (r1.val2 != r2.val2 and p1.* == 0xAAAA and p2.* == 0xBBBB) {
+        t.pass("§2.3.15");
+    } else {
+        t.fail("§2.3.15");
+    }
     syscall.shutdown();
 }

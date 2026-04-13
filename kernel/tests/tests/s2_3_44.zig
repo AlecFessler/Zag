@@ -1,19 +1,21 @@
 const lib = @import("lib");
 
-const perm_view = lib.perm_view;
+const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const E_BADHANDLE: i64 = -3;
+const E_INVAL: i64 = -1;
 
-/// §2.3.44 — `mem_mmio_map` with invalid `vm_handle` returns `E_BADHANDLE`.
+/// §2.3.44 — `mem_unmap` with zero `size` returns `E_INVAL`.
 pub fn main(pv: u64) void {
-    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
+    _ = pv;
 
-    const dev_entry = t.requireMmioDevice(view, "§2.3.44");
-    const dev_handle = dev_entry.handle;
+    const rights = perms.VmReservationRights{ .read = true, .write = true };
+    const vm = syscall.mem_reserve(0, 4096, rights.bits());
+    const vm_handle: u64 = @bitCast(vm.val);
 
-    const ret = syscall.mem_mmio_map(dev_handle, 0xFFFFFFFF, 0);
-    t.expectEqual("§2.3.44", E_BADHANDLE, ret);
+    // size=0 is invalid.
+    const ret = syscall.mem_unmap(vm_handle, 0, 0);
+    t.expectEqual("§2.3.44", E_INVAL, ret);
     syscall.shutdown();
 }

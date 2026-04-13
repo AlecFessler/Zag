@@ -1,20 +1,19 @@
-const children = @import("embedded_children");
 const lib = @import("lib");
 
 const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const E_PERM: i64 = -2;
-
-/// §2.3.14 — `mem_reserve` requires `mem_reserve` right — returns `E_PERM` without it.
-pub fn main(_: u64) void {
-    // Spawn child WITHOUT mem_reserve right
-    const child_rights = perms.ProcessRights{};
-    const ch: u64 = @bitCast(@as(i64, syscall.proc_create(@intFromPtr(children.child_try_vm_reserve.ptr), children.child_try_vm_reserve.len, child_rights.bits())));
-    var reply: syscall.IpcMessage = .{};
-    _ = syscall.ipc_call(ch, &.{}, &reply);
-    const child_result: i64 = @bitCast(reply.words[0]);
-    t.expectEqual("§2.3.14", E_PERM, child_result);
+/// §2.3.14 — `mem_reserve` with hint in the static reservation zone uses that address (if no overlap).
+pub fn main(perm_view: u64) void {
+    _ = perm_view;
+    const rw = perms.VmReservationRights{ .read = true, .write = true };
+    const hint: u64 = 0x0000_1000_0000_0000;
+    const result = syscall.mem_reserve(hint, 4096, rw.bits());
+    if (result.val > 0 and result.val2 == hint) {
+        t.pass("§2.3.14");
+    } else {
+        t.fail("§2.3.14");
+    }
     syscall.shutdown();
 }

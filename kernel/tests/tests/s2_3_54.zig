@@ -5,24 +5,21 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const E_OK: i64 = 0;
+const E_PERM: i64 = -2;
 
-/// §2.3.54 — `mem_unmap` on MMIO mapping returns `E_OK` on success.
+/// §2.3.54 — `mem_mmio_map` without `mmio` right on reservation returns `E_PERM`.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
     const dev = t.requireMmioDevice(view, "§2.3.54");
     const dev_handle = dev.handle;
-    const dev_size: u32 = dev.deviceSizeOrPortCount();
 
-    const page_size: u64 = 4096;
-    const size = ((@as(u64, dev_size) + page_size - 1) / page_size) * page_size;
-    const rights = perms.VmReservationRights{ .read = true, .write = true, .mmio = true };
-    const vm = syscall.mem_reserve(0, size, rights.bits());
+    // Create reservation with read+write but WITHOUT mmio right.
+    const rights = perms.VmReservationRights{ .read = true, .write = true };
+    const vm = syscall.mem_reserve(0, 4096, rights.bits());
     const vm_handle: u64 = @bitCast(vm.val);
 
-    _ = syscall.mem_mmio_map(dev_handle, vm_handle, 0);
-    const ret = syscall.mem_unmap(vm_handle, 0, size);
-    t.expectEqual("§2.3.54", E_OK, ret);
+    const ret = syscall.mem_mmio_map(dev_handle, vm_handle, 0);
+    t.expectEqual("§2.3.54", E_PERM, ret);
     syscall.shutdown();
 }

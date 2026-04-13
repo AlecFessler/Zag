@@ -1,21 +1,24 @@
 const lib = @import("lib");
 
+const perm_view = lib.perm_view;
 const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
 const E_INVAL: i64 = -1;
 
-/// §2.3.56 — `mem_unmap` with size=0 returns `E_INVAL`.
+/// §2.3.56 — `mem_mmio_map` with non-page-aligned offset returns `E_INVAL`.
 pub fn main(pv: u64) void {
-    _ = pv;
+    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
-    const rights = perms.VmReservationRights{ .read = true, .write = true };
-    const vm = syscall.mem_reserve(0, 4096, rights.bits());
+    const dev = t.requireMmioDevice(view, "§2.3.56");
+    const dev_handle = dev.handle;
+
+    const rights = perms.VmReservationRights{ .read = true, .write = true, .mmio = true };
+    const vm = syscall.mem_reserve(0, 8192, rights.bits());
     const vm_handle: u64 = @bitCast(vm.val);
 
-    // size=0 is invalid.
-    const ret = syscall.mem_unmap(vm_handle, 0, 0);
+    const ret = syscall.mem_mmio_map(dev_handle, vm_handle, 1);
     t.expectEqual("§2.3.56", E_INVAL, ret);
     syscall.shutdown();
 }

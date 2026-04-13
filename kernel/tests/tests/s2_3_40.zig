@@ -4,16 +4,21 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const E_INVAL: i64 = -1;
+const E_EXIST: i64 = -12;
 
-/// §2.3.40 — `mem_unmap` with invalid offset/size returns `E_INVAL`.
+/// §2.3.40 — `mem_shm_map` with committed pages in range returns `E_EXIST`.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
     const shareable_rw = perms.VmReservationRights{ .read = true, .write = true, .shareable = true };
     const vm = syscall.mem_reserve(0, 4096, shareable_rw.bits());
     const vm_handle: u64 = @bitCast(vm.val);
-    // Unmap beyond reservation bounds — should fail with E_INVAL.
-    const ret = syscall.mem_unmap(vm_handle, 0, 8192);
-    t.expectEqual("§2.3.40", E_INVAL, ret);
+    // Touch the page to commit it via demand-paging.
+    const ptr: *volatile u8 = @ptrFromInt(vm.val2);
+    ptr.* = 42;
+    // Now mem_shm_map should fail because the page is committed.
+    const shm_rights = perms.SharedMemoryRights{ .read = true, .write = true };
+    const shm_handle: u64 = @bitCast(syscall.shm_create_with_rights(4096, shm_rights.bits()));
+    const ret = syscall.mem_shm_map(shm_handle, vm_handle, 0);
+    t.expectEqual("§2.3.40", E_EXIST, ret);
     syscall.shutdown();
 }

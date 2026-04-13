@@ -1,80 +1,43 @@
 const lib = @import("lib");
 
-const perm_view = lib.perm_view;
 const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const PAGE: u64 = 4096;
+const E_INVAL: i64 = -1;
 
-/// §2.3.7 — After `mem_unmap`, the MMIO range reverts to private with max RWX rights.
-/// We reserve the region with read+write+execute (plus mmio so we
-/// can mem_mmio_map it in the first place), map MMIO, unmap, then verify that
-/// every page of the range is writable AND readable as fresh private memory.
-pub fn main(pv: u64) void {
-    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
+/// §2.3.7 — SHM, MMIO, and virtual BAR nodes must be fully contained within the `mem_unmap` range — partial overlap with any such node returns `E_INVAL`.
+///
+/// We map an SHM at offset 4096 within a 3-page reservation, then try to unmap
+/// only the first 2 pages (offset 0, size 8192). The SHM at page 1 is fully
+/// contained, so that should work. Then we re-map and try to unmap a range that
+/// only partially overlaps the SHM — that must return E_INVAL.
+pub fn main(perm_view: u64) void {
+    _ = perm_view;
+    const shareable_rw = perms.VmReservationRights{ .read = true, .write = true, .shareable = true };
+    const vm = syscall.mem_reserve(0, 3 * 4096, shareable_rw.bits());
+    const vm_handle: u64 = @bitCast(vm.val);
 
-    // Find an MMIO device.
-    var dev_handle: u64 = 0;
-    var dev_size: u32 = 0;
-    for (0..128) |i| {
-        if (view[i].entry_type == perm_view.ENTRY_TYPE_DEVICE_REGION and view[i].deviceType() == 0) {
-            dev_handle = view[i].handle;
-            dev_size = view[i].deviceSizeOrPortCount();
-            break;
-        }
-    }
-    if (dev_handle == 0) {
-        t.fail("§2.3.7");
+    const shm_rights = perms.SharedMemoryRights{ .read = true, .write = true };
+    // Create a 2-page SHM to allow partial overlap testing.
+    const shm_handle: u64 = @bitCast(syscall.shm_create_with_rights(2 * 4096, shm_rights.bits()));
+
+    // Map the 2-page SHM at offset 4096 (pages 1-2 of the 3-page reservation).
+    if (syscall.mem_shm_map(shm_handle, vm_handle, 4096) != 0) {
+        t.fail("§2.3.7 setup shm_map");
         syscall.shutdown();
     }
 
-    // Reserve at least one page, rounded to page size.
-    const size: u64 = @max(PAGE, @as(u64, dev_size + 4095) & ~@as(u64, 4095));
-    const vm_rights = perms.VmReservationRights{
-        .read = true,
-        .write = true,
-        .execute = true,
-        .mmio = true,
-    };
-    const vm = syscall.mem_reserve(0, size, vm_rights.bits());
-    const vm_h: u64 = @bitCast(vm.val);
-
-    // Map and unmap the MMIO region.
-    if (syscall.mem_mmio_map(dev_handle, vm_h, 0) != 0) {
-        t.fail("§2.3.7");
-        syscall.shutdown();
-    }
-    if (syscall.mem_unmap(vm_h, 0, size) != 0) {
-        t.fail("§2.3.7");
+    // Unmap only page 0 (offset 0, size 4096) — no SHM overlap, should succeed.
+    const ret_private = syscall.mem_unmap(vm_handle, 0, 4096);
+    if (ret_private != 0) {
+        t.fail("§2.3.7 private-only unmap");
         syscall.shutdown();
     }
 
-    // Post-unmap: every page must be writable+readable as fresh private
-    // memory. If the reservation did not revert to max RWX, writes would
-    // fault on non-writable pages.
-    const base = vm.val2;
-    const n_pages = size / PAGE;
-    var i: u64 = 0;
-    while (i < n_pages) : (i += 1) {
-        const ptr: *volatile u64 = @ptrFromInt(base + i * PAGE);
-        const magic: u64 = 0xBADB_0000 + i;
-        ptr.* = magic;
-        if (ptr.* != magic) {
-            t.fail("§2.3.7");
-            syscall.shutdown();
-        }
-    }
-
-    // Execute right must also revert: write a single RET (0xC3) at the base
-    // of the first post-unmap page and invoke it via a function pointer. If
-    // the reservation did not revert to max RWX, this faults with
-    // invalid_execute.
-    const code_ptr: *volatile u8 = @ptrFromInt(base);
-    code_ptr.* = 0xC3;
-    const func: *const fn () void = @ptrFromInt(base);
-    func();
-
-    t.pass("§2.3.7");
+    // Try to unmap just page 1 (offset 4096, size 4096) — partial overlap with
+    // the 2-page SHM node. Must return E_INVAL.
+    const ret_partial = syscall.mem_unmap(vm_handle, 4096, 4096);
+    t.expectEqual("§2.3.7", E_INVAL, ret_partial);
     syscall.shutdown();
 }

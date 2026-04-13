@@ -6,11 +6,11 @@ const t = lib.testing;
 
 const E_INVAL: i64 = -1;
 
-/// §2.3.17 — `mem_reserve` with `shareable` + `mmio` both set returns `E_INVAL`.
+/// §2.3.17 — `mem_reserve` with zero size returns `E_INVAL`.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
-    const bad = perms.VmReservationRights{ .read = true, .write = true, .shareable = true, .mmio = true };
-    const result = syscall.mem_reserve(0, 4096, bad.bits());
+    const rw = perms.VmReservationRights{ .read = true, .write = true };
+    const result = syscall.mem_reserve(0, 0, rw.bits());
     t.expectEqual("§2.3.17", E_INVAL, result.val);
     syscall.shutdown();
 }

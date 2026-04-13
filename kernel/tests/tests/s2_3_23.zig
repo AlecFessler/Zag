@@ -4,15 +4,14 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const E_INVAL: i64 = -1;
+const E_BADHANDLE: i64 = -3;
 
-/// §2.3.23 — `mem_perms` with zero size returns `E_INVAL`.
+/// §2.3.23 — `mem_perms` with non-`vm_reservation` handle returns `E_BADHANDLE`.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
-    const rw = perms.VmReservationRights{ .read = true, .write = true };
-    const result = syscall.mem_reserve(0, 4096, rw.bits());
-    const handle: u64 = @bitCast(result.val);
-    const ret = syscall.mem_perms(handle, 0, 0, rw.bits());
-    t.expectEqual("§2.3.23", E_INVAL, ret);
+    // Handle 0 is HANDLE_SELF (a process handle, not vm_reservation).
+    const rw = perms.VmReservationRights{ .read = true };
+    const ret = syscall.mem_perms(0, 0, 4096, rw.bits());
+    t.expectEqual("§2.3.23", E_BADHANDLE, ret);
     syscall.shutdown();
 }

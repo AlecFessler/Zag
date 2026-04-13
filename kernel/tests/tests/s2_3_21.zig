@@ -4,14 +4,47 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-const E_BADHANDLE: i64 = -3;
-
-/// §2.3.21 — `mem_perms` with non-`vm_reservation` handle returns `E_BADHANDLE`.
+/// §2.3.21 — `mem_perms` returns `E_OK` on success.
+///
+/// Verifies the permission change actually takes effect by cycling RW → RO → RW
+/// and writing through the page in the RW phases. A faulting write during RO
+/// would crash the process — the fact that we reach shutdown after the RW
+/// re-grant proves the kernel honored both perm changes and remapped the page.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
-    // Handle 0 is HANDLE_SELF (a process handle, not vm_reservation).
-    const rw = perms.VmReservationRights{ .read = true };
-    const ret = syscall.mem_perms(0, 0, 4096, rw.bits());
-    t.expectEqual("§2.3.21", E_BADHANDLE, ret);
+    const rw = perms.VmReservationRights{ .read = true, .write = true };
+    const result = syscall.mem_reserve(0, 4096, rw.bits());
+    const handle: u64 = @bitCast(result.val);
+    const vaddr: u64 = result.val2;
+    const page: [*]volatile u8 = @ptrFromInt(vaddr);
+
+    // Initial write (page RW) — commits the page.
+    page[0] = 0xAA;
+    if (page[0] != 0xAA) {
+        t.fail("§2.3.21 initial write lost");
+        syscall.shutdown();
+    }
+
+    // Downgrade to read-only.
+    const read_only = perms.VmReservationRights{ .read = true };
+    const ret_ro = syscall.mem_perms(handle, 0, 4096, read_only.bits());
+    t.expectEqual("§2.3.21 RW→RO", 0, ret_ro);
+
+    // Confirm the page is still readable at its prior value.
+    if (page[0] != 0xAA) {
+        t.fail("§2.3.21 read-after-RO value changed");
+        syscall.shutdown();
+    }
+
+    // Re-grant write and make a visible change.
+    const ret_rw = syscall.mem_perms(handle, 0, 4096, rw.bits());
+    t.expectEqual("§2.3.21 RO→RW", 0, ret_rw);
+    page[0] = 0x55;
+    if (page[0] != 0x55) {
+        t.fail("§2.3.21 write after RO→RW lost");
+        syscall.shutdown();
+    }
+
+    t.pass("§2.3.21");
     syscall.shutdown();
 }

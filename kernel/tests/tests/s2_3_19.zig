@@ -4,47 +4,13 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.3.19 — `mem_perms` returns `E_OK` on success.
-///
-/// Verifies the permission change actually takes effect by cycling RW → RO → RW
-/// and writing through the page in the RW phases. A faulting write during RO
-/// would crash the process — the fact that we reach shutdown after the RW
-/// re-grant proves the kernel honored both perm changes and remapped the page.
+const E_INVAL: i64 = -1;
+
+/// §2.3.19 — `mem_reserve` with `shareable` + `mmio` both set returns `E_INVAL`.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
-    const rw = perms.VmReservationRights{ .read = true, .write = true };
-    const result = syscall.mem_reserve(0, 4096, rw.bits());
-    const handle: u64 = @bitCast(result.val);
-    const vaddr: u64 = result.val2;
-    const page: [*]volatile u8 = @ptrFromInt(vaddr);
-
-    // Initial write (page RW) — commits the page.
-    page[0] = 0xAA;
-    if (page[0] != 0xAA) {
-        t.fail("§2.3.19 initial write lost");
-        syscall.shutdown();
-    }
-
-    // Downgrade to read-only.
-    const read_only = perms.VmReservationRights{ .read = true };
-    const ret_ro = syscall.mem_perms(handle, 0, 4096, read_only.bits());
-    t.expectEqual("§2.3.19 RW→RO", 0, ret_ro);
-
-    // Confirm the page is still readable at its prior value.
-    if (page[0] != 0xAA) {
-        t.fail("§2.3.19 read-after-RO value changed");
-        syscall.shutdown();
-    }
-
-    // Re-grant write and make a visible change.
-    const ret_rw = syscall.mem_perms(handle, 0, 4096, rw.bits());
-    t.expectEqual("§2.3.19 RO→RW", 0, ret_rw);
-    page[0] = 0x55;
-    if (page[0] != 0x55) {
-        t.fail("§2.3.19 write after RO→RW lost");
-        syscall.shutdown();
-    }
-
-    t.pass("§2.3.19");
+    const bad = perms.VmReservationRights{ .read = true, .write = true, .shareable = true, .mmio = true };
+    const result = syscall.mem_reserve(0, 4096, bad.bits());
+    t.expectEqual("§2.3.19", E_INVAL, result.val);
     syscall.shutdown();
 }
