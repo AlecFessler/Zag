@@ -1,6 +1,7 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const address = zag.memory.address;
 const errors = zag.syscall.errors;
 const paging = zag.memory.paging;
 const sched = zag.sched.scheduler;
@@ -25,6 +26,18 @@ const SyscallResult = zag.syscall.dispatch.SyscallResult;
 
 pub fn sysMemReserve(hint: u64, size: u64, max_perms_bits: u64) SyscallResult {
     if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) return .{ .ret = E_INVAL };
+
+    // Bound hint + size up front so `VirtualMemoryManager.reserve` can
+    // never see an overflowing pair. The sibling VM syscalls in this
+    // file (sysMemPerms, sysMemShmMap, sysMemUnmap) use the same idiom.
+    // hint == 0 means "no hint — pick any free range", and is handled
+    // by vmm.reserve's hint-path guard (`hint.addr != 0`) below, so we
+    // only partition-check when the caller actually supplied one.
+    if (hint != 0) {
+        const end = std.math.add(u64, hint, size) catch return .{ .ret = E_INVAL };
+        if (!address.AddrSpacePartition.user.contains(hint)) return .{ .ret = E_INVAL };
+        if (!address.AddrSpacePartition.user.contains(end -| 1)) return .{ .ret = E_INVAL };
+    }
 
     const max_rights: VmReservationRights = @bitCast(@as(u8, @truncate(max_perms_bits)));
     if (max_rights.shareable and max_rights.mmio) return .{ .ret = E_INVAL };

@@ -189,10 +189,17 @@ pub const VirtualMemoryManager = struct {
         defer self.lock.unlock();
 
         const chosen = blk: {
+            // Overflow-checked end of the hinted range. If this wraps,
+            // fall straight through to findFreeRange — callers that
+            // reach here with a wrapping pair would have been rejected
+            // at the syscall layer, but we guard in depth to keep
+            // `vmm.reserve` safe against any future in-kernel caller.
+            const hint_end = std.math.add(u64, hint.addr, size) catch 0;
             if (hint.addr != 0 and
+                hint_end != 0 and
                 std.mem.isAligned(hint.addr, paging.PAGE4K) and
                 hint.addr >= self.range_start.addr and
-                hint.addr + size <= self.range_end.addr)
+                hint_end <= self.range_end.addr)
             {
                 var sentinel = mkSentinel(hint);
                 const neighbors = self.tree.findNeighbors(&sentinel);
@@ -205,7 +212,7 @@ pub const VirtualMemoryManager = struct {
 
                 // Check no existing node starts inside [hint, hint+size) (upper bound)
                 const range_clear = if (neighbors.upper) |upper|
-                    upper.start.addr >= hint.addr + size
+                    upper.start.addr >= hint_end
                 else
                     true;
 
