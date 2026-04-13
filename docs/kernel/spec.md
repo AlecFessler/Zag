@@ -965,7 +965,6 @@ All syscalls return `i64`. Non-negative = success, negative = error code. Sizes 
 | 21 | `disable_restart` | §2.1 |
 | 22 | `futex_wait_val` | §3.2 |
 | 23 | `futex_wake` | §3.2 |
-| 27 | `futex_wait_change` | §3.2 |
 | 24 | `clock_gettime` | §5.1 |
 | 25 | `mem_dma_map` | §2.4 |
 | 26 | `mem_dma_unmap` | §2.4 |
