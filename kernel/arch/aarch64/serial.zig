@@ -49,9 +49,15 @@ pub fn setBase(addr: u64) void {
 }
 
 /// Initialize the PL011 UART for transmit.
-/// Currently a no-op because UEFI firmware configures baud rate, line
-/// control (UARTLCR_H), and enables the UART (UARTCR) before handoff.
-pub fn init() void {}
+/// If ACPI SPCR didn't set the base address, fall back to the QEMU
+/// virt PL011 at physmap + 0x09000000. UEFI firmware configures baud
+/// rate, line control, and enables the UART before handoff.
+pub fn init() void {
+    if (base_addr == null) {
+        const physmap_start = zag.arch.dispatch.addr_space.physmap.start;
+        base_addr = physmap_start + 0x09000000;
+    }
+}
 
 /// Format and transmit a string over the PL011 UART.
 /// Silently returns if the base address has not yet been set (early boot

@@ -1484,13 +1484,11 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
         if (seg_file_end > 0 and !address.AddrSpacePartition.user.contains(seg_file_end -| 1)) return error.InvalidElf;
         if (seg_mem_end > 0 and !address.AddrSpacePartition.user.contains(seg_mem_end -| 1)) return error.InvalidElf;
 
-        // Reject overlapping PT_LOAD segments.
+        // Track segments. Adjacent PT_LOAD segments sharing a boundary page
+        // is normal on aarch64 (ELF p_align=64KB, kernel page=4KB).
         if (num_load_segments >= MAX_LOAD_SEGMENTS) return error.InvalidElf;
         const page_aligned_start = std.mem.alignBackward(u64, seg_start, paging.PAGE4K);
         const page_aligned_end = std.mem.alignForward(u64, seg_mem_end, paging.PAGE4K);
-        for (seg_ranges[0..num_load_segments]) |range| {
-            if (page_aligned_start < range[1] and page_aligned_end > range[0]) return error.InvalidElf;
-        }
         seg_ranges[num_load_segments] = .{ page_aligned_start, page_aligned_end };
         num_load_segments += 1;
 
