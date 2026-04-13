@@ -556,11 +556,11 @@ The last thread skips user stack destruction because the process exit path tears
 5. Clear `PerCoreState.pinned_thread` on the thread's pinned core.
 6. Restore the thread's `pre_pin_affinity` to `core_affinity`.
 7. Restore the thread's `pre_pin_priority` to `priority`.
-8. Clear `field1` (pinned core ID) in the thread's user view entry. Call `syncUserView`.
+8. Clear `field1` (pinned core ID) in the thread's user view entry. Call `syncUserView` on the target thread's owning process. If the caller is a different process (cross-process unpin), also call `syncUserView` on the caller's process.
 9. If the thread is currently running on the previously pinned core, send a scheduling IPI so the scheduler can re-evaluate placement.
 10. Return `E_OK`.
 
-A process may unpin its own threads by passing its own thread handle obtained from `thread_self`.
+A process may unpin its own threads by passing its own thread handle obtained from `thread_self`. A fault handler may unpin a debuggee's thread via a cross-process thread handle.
 
 ---
 

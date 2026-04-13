@@ -160,8 +160,14 @@ pub fn sysRevokePerm(handle: u64) i64 {
         .dead_process => {
             proc.removePerm(handle) catch {};
         },
-        .thread => {
-            // Revoking a thread handle just clears the slot, doesn't affect the thread
+        .thread => |t| {
+            // If the thread is pinned, release the core pin before removing
+            // the handle. Otherwise PerCoreState.pinned_thread is orphaned
+            // and that core is deadlocked for preemptive scheduling.
+            if (t.priority == .pinned) {
+                const core_id = @ctz(t.core_affinity orelse 0);
+                sched.unpinByRevoke(core_id);
+            }
             proc.removePerm(handle) catch {};
         },
         .vm => |vm_obj| {

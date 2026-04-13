@@ -360,15 +360,30 @@ pub fn sysThreadUnpin(thread_handle: u64) i64 {
     if (!thr_entry.threadHandleRights().unpin) return E_PERM;
 
     const target = thr_entry.object.thread;
+    // The check and unpinByRevoke are not under a single lock, but this is
+    // safe: unpinByRevoke is idempotent (checks pinned_thread for null), so
+    // a concurrent sysSetPriority that already unpinned just makes this a
+    // no-op returning E_OK, which is benign.
     if (target.priority != .pinned) return E_INVAL;
 
     const core_id = @ctz(target.core_affinity orelse return E_INVAL);
     sched.unpinByRevoke(core_id);
 
-    // Sync user view so thread entry field1 reflects unpinned state
-    proc.perm_lock.lock();
-    proc.syncUserView();
-    proc.perm_lock.unlock();
+    // Sync user view on the target thread's owning process, not the caller's
+    // process, so the perm view reflects the unpinned state even for cross-
+    // process unpins (e.g., fault handler unpinning a debuggee's thread).
+    const target_proc = target.process;
+    target_proc.perm_lock.lock();
+    target_proc.syncUserView();
+    target_proc.perm_lock.unlock();
+
+    // Also sync the caller's view if it differs from the target's process,
+    // since the caller also holds a thread handle entry that shows pin state.
+    if (target_proc != proc) {
+        proc.perm_lock.lock();
+        proc.syncUserView();
+        proc.perm_lock.unlock();
+    }
 
     return E_OK;
 }
