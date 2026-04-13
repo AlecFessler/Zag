@@ -52,6 +52,7 @@ pub fn init(firmware_mmap: MMap) !void {
     arch.earlyDebugChar('A');
     const mmap = boot.protocol.collapseMMap(&firmware_mmap, &mmap_entries);
     arch.earlyDebugChar('b');
+    arch.earlyDebugChar('0');
 
     var smallest_addr_region: MMapEntry = .{ .start_paddr = std.math.maxInt(u64), .num_pages = 0, .type = .free };
     var largest_addr_free_region: MMapEntry = .{ .start_paddr = 0, .num_pages = 0, .type = .free };
@@ -68,22 +69,27 @@ pub fn init(firmware_mmap: MMap) !void {
         }
     }
 
+    arch.earlyDebugChar('1');
     const bump_alloc_start_phys = PAddr.fromInt(largest_free_region.start_paddr);
     const bump_alloc_end_phys = PAddr.fromInt(largest_free_region.start_paddr + largest_free_region.num_pages * paging.PAGE4K);
     bump_allocator = BumpAllocator.init(bump_alloc_start_phys.addr, bump_alloc_end_phys.addr);
     const bump_alloc_iface: std.mem.Allocator = bump_allocator.allocator();
+    arch.earlyDebugChar('2');
 
     const addr_space_root_phys = arch.getKernelAddrSpaceRoot();
     kernel_addr_space_root = addr_space_root_phys;
     const addr_space_root_id_virt = VAddr.fromPAddr(addr_space_root_phys, 0);
+    arch.earlyDebugChar('3');
 
     var physmap_page_count: u64 = 0;
     for (mmap) |entry| {
         if (entry.type != .free and entry.type != .acpi) continue;
+        arch.earlyDebugChar('E');
 
         const end_phys = PAddr.fromInt(entry.start_paddr + entry.num_pages * paging.PAGE4K);
         var current_phys = PAddr.fromInt(entry.start_paddr);
         while (current_phys.addr < end_phys.addr) {
+            arch.earlyDebugChar('.');
             const physmap_virt = VAddr.fromPAddr(current_phys, null);
             const remaining = end_phys.addr - current_phys.addr;
             const chosen_size = blk: {
