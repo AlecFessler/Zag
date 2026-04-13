@@ -109,35 +109,18 @@ pub fn create(vm_obj: *Vm) !*VCpu {
 }
 
 /// Destroy a vCPU: kill its thread and free the struct.
-///
-/// Must be safe to call from another core while the vCPU is executing
-/// guest mode. The caller (typically `Vm.destroy`, reached via
-/// `Thread.deinit`'s all-vCPU branch) is about to free the backing
-/// `Vm`, `guest_mem`, and arch structures that the vCPU entry loop
-/// dereferences on every iteration, so this function must guarantee
-/// that the vCPU thread has completed its current iteration and will
-/// not start another before we return.
-///
-/// Ordering mirrors `vcpuGetState` and `vcpuInterrupt`:
-///   1. `storeState(.exited)` — next loop iter in `vcpuEntryPoint`
-///      blocks instead of re-entering `vmResume` / touching `vm_obj`.
-///   2. `thread.state = .exited` — scheduler will not re-dispatch.
-///   3. IPI the core currently running the thread, then spin on
-///      `thread.on_cpu` until the scheduler has preempted it off.
-///      After this, any in-flight `exit_handler.handleExit` has fully
-///      returned and the thread is no longer executing on any core.
-///   4. Remove from run queues and free the VCpu slab entry.
 pub fn destroy(vcpu_obj: *VCpu) void {
     const thread = vcpu_obj.thread;
 
-    vcpu_obj.storeState(.exited);
+    // Mark thread as exited so scheduler won't run it
     thread.state = .exited;
 
+    // If on a CPU, IPI to force off
     if (sched.coreRunning(thread)) |core_id| {
         arch.triggerSchedulerInterrupt(core_id);
-        while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
     }
 
+    // Remove from run queues
     sched.removeFromAnyRunQueue(thread);
 
     allocator.destroy(vcpu_obj);
