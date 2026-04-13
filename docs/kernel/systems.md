@@ -4,7 +4,7 @@ Internal implementation details. This document describes HOW the kernel is built
 
 ---
 
-## 1. Internal Architecture Overview
+## overview. Internal Architecture Overview
 
 Zag is implemented in Zig, targeting x86_64 (with an aarch64 stub). The kernel is a single binary loaded by a bootloader that provides a `BootInfo` structure containing the memory map, XSDP physical address, ELF debug blob, and initial stack pointer.
 
@@ -20,8 +20,8 @@ Zag is implemented in Zig, targeting x86_64 (with an aarch64 stub). The kernel i
    - `debug.info.init()` -- ELF symbol table for stack traces. Receives the KASLR slide so DWARF lookups can translate runtime PCs back to link-time addresses.
    - `arch.parseFirmwareTables(xsdp_phys)` -- ACPI parsing: MADT (cores, APIC), HPET, MCFG (PCI ECAM). PCI enumeration and serial port probing. Device registration.
    - `arch.vmInit()` -- Detect hardware virtualization support via CPUID, cache availability flag. After firmware tables (needs CPUID), before scheduler.
-   - `arch.pmuInit()` -- Detect hardware PMU support via CPUID (x64) or stub (aarch64), cache `PmuInfo`, prime PMI handler vector. After firmware tables, before scheduler. See §20.
-   - Wall clock offset init: `arch.readRtc()` reads the CMOS RTC (x64) and the kernel computes `wall_offset = rtc_nanos - monotonic_now`. See §22.
+   - `arch.pmuInit()` -- Detect hardware PMU support via CPUID (x64) or stub (aarch64), cache `PmuInfo`, prime PMI handler vector. After firmware tables, before scheduler. See §pmu.
+   - Wall clock offset init: `arch.readRtc()` reads the CMOS RTC (x64) and the kernel computes `wall_offset = rtc_nanos - monotonic_now`. See §wall-clock.
    - `sched.globalInit()` -- Process/thread slab allocators, idle process, run queues, root service creation with all rights, device grant to root service, enqueue root service initial thread.
    - `arch.smpInit()` -- Secondary core bringup via INIT/SIPI IPI sequence with real-mode trampoline at physical address `0x8000`.
    - `sched.perCoreInit()` -- Per-core scheduler state, preemption timer arm, `arch.vmPerCoreInit()` (per-core VMX/SVM setup), enable interrupts.
@@ -133,7 +133,7 @@ kernel/
 
 ---
 
-## 2. Process Internals
+## process. Process Internals
 
 ### Process Struct
 
@@ -268,7 +268,7 @@ Relocations are applied to `file_bytes` in place before the bootloader copies se
 
 ---
 
-## 3. VMM Internals
+## vmm. VMM Internals
 
 ### Red-Black Tree
 
@@ -367,7 +367,7 @@ Returns `StackResult { guard, base, top }`.
 
 ---
 
-## 4. Permissions Table Internals
+## permissions. Permissions Table Internals
 
 ### Storage
 
@@ -464,12 +464,12 @@ All rights are packed structs with bit fields:
 - `ProcessHandleRights`: packed `u16` -- `send_words`(0), `send_shm`(1), `send_process`(2), `send_device`(3), `kill`(4), `grant`(5), `fault_handler`(6), 9 bits reserved. Used on handles to other processes (not HANDLE_SELF).
 - `VmReservationRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `shareable`(3), `mmio`(4), 3 bits reserved.
 - `SharedMemoryRights`: packed `u8` -- `read`(0), `write`(1), `execute`(2), `grant`(3), 4 bits reserved.
-- `DeviceRegionRights`: packed `u8` -- `map`(0), `grant`(1), `dma`(2), `irq`(3), 4 bits reserved. The `irq` bit gates `irq_ack` (§24).
-- `ThreadHandleRights`: packed `u8` -- `suspend`(0), `resume`(1), `kill`(2), `pmu`(4), bit 3 reserved. The `pmu` bit is checked in addition to `ProcessRights.pmu` on every PMU syscall that takes a thread handle; see §20.
+- `DeviceRegionRights`: packed `u8` -- `map`(0), `grant`(1), `dma`(2), `irq`(3), 4 bits reserved. The `irq` bit gates `irq_ack` (§irq-delivery).
+- `ThreadHandleRights`: packed `u8` -- `suspend`(0), `resume`(1), `kill`(2), `pmu`(4), bit 3 reserved. The `pmu` bit is checked in addition to `ProcessRights.pmu` on every PMU syscall that takes a thread handle; see §pmu.
 
 ---
 
-## 5. Thread Internals
+## thread. Thread Internals
 
 ### Thread Struct
 
@@ -548,7 +548,7 @@ Atomic boolean. Set to `true` when a thread is dispatched onto a CPU, set to `fa
 
 `Thread.deinit()`:
 1. Save `last_in_proc` flag.
-2. If `pmu_state != null`, call `arch.pmuClearState(pmu_state)` to zero the state struct without touching any MSRs, then free the PMU state back to `PmuStateAllocator` and clear the field. The dying thread is not running on any core at this point (exit paths leave the thread off its run queue before tearing it down), so MSR writes on the caller's core would either be a no-op against stale values or clobber the PMU state of whichever thread currently owns the hardware. Real hardware teardown for the dying thread happened at its last `pmuSave` on context switch away. This is the implicit `pmu_stop` on thread exit (§2.14.9, §20).
+2. If `pmu_state != null`, call `arch.pmuClearState(pmu_state)` to zero the state struct without touching any MSRs, then free the PMU state back to `PmuStateAllocator` and clear the field. The dying thread is not running on any core at this point (exit paths leave the thread off its run queue before tearing it down), so MSR writes on the caller's core would either be a no-op against stale values or clobber the PMU state of whichever thread currently owns the hardware. Real hardware teardown for the dying thread happened at its last `pmuSave` on context switch away. This is the implicit `pmu_stop` on thread exit (§2.14.9, §pmu).
 3. Clear the thread handle entry from the owning process's perm table. If `fault_handler_proc` is non-null, also clear the thread handle entry from the handler's perm table. Call `syncUserView` on all affected tables.
 4. Destroy kernel stack (unmap committed pages, recycle slot).
 5. If not last thread: destroy user stack via process VMM.
@@ -559,7 +559,7 @@ The last thread skips user stack destruction because the process exit path tears
 
 ---
 
-## 5a. arch/dispatch.zig: SavedRegs
+## saved-regs. arch/dispatch.zig: SavedRegs
 
 `kernel/arch/dispatch.zig` provides a comptime dispatch for `SavedRegs`:
 
@@ -591,7 +591,7 @@ x64.SavedRegs (extern struct) {
 
 ---
 
-## 6. Run Queue
+## run-queue. Run Queue
 
 ### PriorityQueue
 
@@ -642,7 +642,7 @@ PerCoreState {
 
 Array of 64 `PerCoreState` structs (`MAX_CORES = 64`), aligned to `CACHE_LINE_SIZE = 64` bytes to avoid false sharing.
 
-The `idle_ns` / `busy_ns` / `last_tick_ns` fields back the per-core scheduler accounting consumed by `sys_info` (§21). They are updated on every scheduler timer tick and read-and-reset atomically by `sys_info` when `cores_ptr != null`.
+The `idle_ns` / `busy_ns` / `last_tick_ns` fields back the per-core scheduler accounting consumed by `sys_info` (§sysinfo). They are updated on every scheduler timer tick and read-and-reset atomically by `sys_info` when `cores_ptr != null`.
 
 ### enqueue(thread)
 
@@ -738,7 +738,7 @@ Exited threads cannot be freed inside the scheduler timer handler (they are runn
 
 ---
 
-## 7. Futex Internals
+## futex. Futex Internals
 
 ### Hash Table
 
@@ -824,7 +824,7 @@ When a thread is woken from one bucket, it must remove itself from all other buc
 
 ---
 
-## 8. SHM Internals
+## shm. SHM Internals
 
 ### SharedMemory Struct
 
@@ -865,7 +865,7 @@ SharedMemory objects are allocated from `SlabAllocator(SharedMemory, false, 0, 6
 
 ---
 
-## 9. Stack Internals
+## stack. Stack Internals
 
 ### User Stacks
 
@@ -947,7 +947,7 @@ Walk from `base` to `top` in PAGE4K increments. For each page, `arch.unmapPage` 
 
 ---
 
-## 10. Timer Internals
+## timer. Timer Internals
 
 ### Timer Interface
 
@@ -1017,7 +1017,7 @@ The HPET is used as the reference clock for TSC and LAPIC timer calibration.
 
 ---
 
-## 11. Page Fault Handling Internals
+## page-fault. Page Fault Handling Internals
 
 ### Virtual BAR Interception
 
@@ -1061,7 +1061,7 @@ Check the stack guard registry for `(pid, fault_addr)`. If found, emit stack ove
 
 ---
 
-## 12. Process Kill Internals
+## process-kill. Process Kill Internals
 
 ### Non-Recursive Kill (Fault, Voluntary Exit)
 
@@ -1130,7 +1130,7 @@ When the process kill path determines which thread is the last one, it sets `thr
 
 ---
 
-## 13. Architecture Interface
+## arch-interface. Architecture Interface
 
 Portable dispatch layer in `kernel/arch/dispatch.zig`. All functions dispatch at comptime via `builtin.cpu.arch` to architecture-specific implementations.
 
@@ -1248,23 +1248,23 @@ The return always uses IRETQ, which properly loads CS/SS from the stack frame. S
 
 **randomSeed() -> ?u64** -- Hardware-sourced random value. On x86_64 executes `RDRAND`; returns null if the entropy source is unavailable or temporarily exhausted. On aarch64 returns null (stub).
 
-**readRtc() -> u64** -- Reads the hardware RTC and returns nanoseconds since the Unix epoch. On x86_64: reads CMOS RTC via ports 0x70/0x71, converts BCD to binary, computes Unix nanoseconds. On aarch64: returns 0 (no RTC). Called once during boot to initialize the wall clock offset (§22).
+**readRtc() -> u64** -- Reads the hardware RTC and returns nanoseconds since the Unix epoch. On x86_64: reads CMOS RTC via ports 0x70/0x71, converts BCD to binary, computes Unix nanoseconds. On aarch64: returns 0 (no RTC). Called once during boot to initialize the wall clock offset (§wall-clock).
 
-**getRandom() -> ?u64** -- Returns 8 bytes of hardware-sourced randomness. On x86_64: executes RDRAND. On aarch64: returns null. Used by the `getrandom` syscall (§23). Distinct from `randomSeed()` which is the boot-time entropy source.
+**getRandom() -> ?u64** -- Returns 8 bytes of hardware-sourced randomness. On x86_64: executes RDRAND. On aarch64: returns null. Used by the `getrandom` syscall (§randomness). Distinct from `randomSeed()` which is the boot-time entropy source.
 
 ### IRQ Control
 
-**maskIrq(irq: u8) -> void** -- Masks (disables) the given IRQ line. On x86_64: sets the mask bit in the I/O APIC redirection table entry. On aarch64: no-op. Called from the IRQ handler path after identifying the interrupting device (§24).
+**maskIrq(irq: u8) -> void** -- Masks (disables) the given IRQ line. On x86_64: sets the mask bit in the I/O APIC redirection table entry. On aarch64: no-op. Called from the IRQ handler path after identifying the interrupting device (§irq-delivery).
 
-**unmaskIrq(irq: u8) -> void** -- Unmasks (enables) the given IRQ line. On x86_64: clears the mask bit in the I/O APIC redirection table entry. On aarch64: no-op. Called from the `irq_ack` syscall handler (§24).
+**unmaskIrq(irq: u8) -> void** -- Unmasks (enables) the given IRQ line. On x86_64: clears the mask bit in the I/O APIC redirection table entry. On aarch64: no-op. Called from the `irq_ack` syscall handler (§irq-delivery).
 
-**findIrqForDevice(device: *DeviceRegion) -> ?u8** -- Linearly scans irq_table to find the IRQ line number for a device. On x86_64: iterates `irq_table[0..256]`, returns the index where the entry matches `device`, or null if not found. On aarch64: returns null. Used by the `irq_ack` syscall handler (§24).
+**findIrqForDevice(device: *DeviceRegion) -> ?u8** -- Linearly scans irq_table to find the IRQ line number for a device. On x86_64: iterates `irq_table[0..256]`, returns the index where the entry matches `device`, or null if not found. On aarch64: returns null. Used by the `irq_ack` syscall handler (§irq-delivery).
 
 ### Power Control
 
-**powerAction(action: PowerAction) -> i64** -- Performs a system-wide power action. On x86_64: dispatches to ACPI sleep states, keyboard controller reset, or DPMS blanking per action variant. On aarch64: returns E_NODEV. `shutdown` and `reboot` do not return on success. See §25.
+**powerAction(action: PowerAction) -> i64** -- Performs a system-wide power action. On x86_64: dispatches to ACPI sleep states, keyboard controller reset, or DPMS blanking per action variant. On aarch64: returns E_NODEV. `shutdown` and `reboot` do not return on success. See §power.
 
-**cpuPowerAction(action: CpuPowerAction, value: u64) -> i64** -- Performs a per-CPU power control action. On x86_64: programs `IA32_PERF_CTL` for `set_freq`, configures MWAIT C-state hints for `set_idle`. On aarch64: returns E_NODEV. See §25.
+**cpuPowerAction(action: CpuPowerAction, value: u64) -> i64** -- Performs a per-CPU power control action. On x86_64: programs `IA32_PERF_CTL` for `set_freq`, configures MWAIT C-state hints for `set_idle`. On aarch64: returns E_NODEV. See §power.
 
 ### Identification
 
@@ -1316,7 +1316,7 @@ Hardware PMU availability is detected once at boot in `arch.pmuInit()` and cache
 
 **getCoreState(core_id: u64) -> u8** -- Reads the current C-state level of the given core. `0` means the core is active; higher values mean progressively deeper idle states. Same dispatch pattern.
 
-All three functions are side-effect free reads against the target core's hardware interface. See §21 for the x64 implementation details (the MSRs used, how TjMax is discovered, and how remote cores are polled).
+All three functions are side-effect free reads against the target core's hardware interface. See §sysinfo for the x64 implementation details (the MSRs used, how TjMax is discovered, and how remote cores are polled).
 
 ### Diagnostics
 
@@ -1472,7 +1472,7 @@ ARM SMMU (IHI0070) is not yet implemented. `isDmaRemapAvailable()` returns false
 
 ---
 
-## 14. Memory Management Internals
+## memory. Memory Management Internals
 
 ### Physical Memory Manager (PMM)
 
@@ -1487,7 +1487,7 @@ PhysicalMemoryManager {
 
 Implements the `std.mem.Allocator` interface. The PMM wraps the buddy allocator with per-core page caches for fast single-page allocations.
 
-**freePageCount() -> u64** -- Returns the number of physical pages currently free. Acquires the PMM global lock, queries the buddy allocator's internal free page accounting (sum of the per-order free list lengths weighted by order), adds the pages sitting in all per-core page caches, and returns the total. Called by the `sys_info` syscall (§21) to populate `SysInfo.mem_free`. A companion `totalPageCount() -> u64` returns the static total page count established at buddy init time for `SysInfo.mem_total`.
+**freePageCount() -> u64** -- Returns the number of physical pages currently free. Acquires the PMM global lock, queries the buddy allocator's internal free page accounting (sum of the per-order free list lengths weighted by order), adds the pages sitting in all per-core page caches, and returns the total. Called by the `sys_info` syscall (§sysinfo) to populate `SysInfo.mem_free`. A companion `totalPageCount() -> u64` returns the static total page count established at buddy init time for `SysInfo.mem_total`.
 
 ### Per-Core Page Cache
 
@@ -1583,7 +1583,7 @@ In debug mode, tracks net allocations and asserts zero on `deinit`.
 - `ThreadAllocator`: `SlabAllocator(Thread, false, 0, 64)` -- thread structs.
 - `VmAllocator`: `SlabAllocator(arch.Vm, false, 0, 64)` -- VM structs (dispatched from arch/x64/kvm/).
 - `VCpuAllocator`: `SlabAllocator(arch.VCpu, false, 0, 64)` -- vCPU structs (dispatched from arch/x64/kvm/).
-- `PmuStateAllocator`: `SlabAllocator(arch.PmuState, false, 0, 64)` -- per-thread PMU state blocks. `arch.PmuState` is the arch-dispatched type (see §13 and §20); on aarch64 it is an empty struct stub so the allocator compiles but is never exercised.
+- `PmuStateAllocator`: `SlabAllocator(arch.PmuState, false, 0, 64)` -- per-thread PMU state blocks. `arch.PmuState` is the arch-dispatched type (see §arch-interface and §pmu); on aarch64 it is an empty struct stub so the allocator compiles but is never exercised.
 
 ### Heap Allocator
 
@@ -1682,7 +1682,7 @@ Comptime assertions verify that no kernel VA regions overlap.
 
 ---
 
-## 15. Device Enumeration
+## device-enum. Device Enumeration
 
 ### Overview
 
@@ -1767,7 +1767,7 @@ HPET, LAPIC, and I/O APIC are discovered during ACPI parsing and mapped into ker
 
 ---
 
-## 16. Message Passing Internals
+## message-passing. Message Passing Internals
 
 ### Overview
 
@@ -1783,7 +1783,7 @@ r14 encoding varies by syscall — see spec §2.11.
 
 ### MessageBox
 
-IPC message passing state is encapsulated in the `MessageBox` struct on each Process, accessed as `proc.msg_box`. See §17 for details.
+IPC message passing state is encapsulated in the `MessageBox` struct on each Process, accessed as `proc.msg_box`. See §message-box for details.
 
 ### Thread Struct Fields
 
@@ -1851,7 +1851,7 @@ Each Process has a `handle_refcount: u32` tracking how many perm table entries a
 
 ---
 
-## 17. MessageBox Internals
+## message-box. MessageBox Internals
 
 `kernel/proc/message_box.zig` defines a single `MessageBox` struct used for both IPC message passing and fault delivery. Each `Process` instantiates two of them: `proc.msg_box` for IPC, `proc.fault_box` for faults. The struct is payload-agnostic — it owns a state machine, a FIFO wait queue of `*Thread`, the blocked receiver slot, the pending-reply slot, and a lock. Callers (the IPC syscalls and the fault delivery path) extract payloads between state transitions.
 
@@ -1925,7 +1925,7 @@ The full saved register state lives in `thread.ctx.regs` (set by the exception e
 
 ---
 
-## 18. Fault Routing Internals
+## fault-routing. Fault Routing Internals
 
 Defined in `Process.faultBlock` (`kernel/proc/process.zig`). The fault delivery path is called from `kernel/arch/x64/exceptions.zig` (general exceptions) and `kernel/memory/fault.zig` (page faults) after the exception handler identifies a userspace fault.
 
@@ -1955,7 +1955,7 @@ Returns `true` if the fault was queued (caller should yield); `false` if the pro
       Unlock self.lock.
    c. Lock self.fault_box.lock.
       If self.fault_box.isReceiving():
-        Direct-deliver to the waiter (see §6 below).
+        Direct-deliver to the waiter (see §run-queue below).
       Else:
         self.fault_box.enqueueLocked(thread)
       Unlock self.fault_box.lock.
@@ -2022,7 +2022,7 @@ Both the synchronous-dequeue path (`writeFaultMessage` in `syscall.zig`) and the
 
 ---
 
-## 19. VM Internals
+## vm-internals. VM Internals
 
 ### Architecture Layering
 
@@ -2302,7 +2302,7 @@ The Vm struct has its own `lock: SpinLock` protecting vCPU list and VM-wide stat
 
 ---
 
-## 20. PMU Internals
+## pmu. PMU Internals
 
 Per-thread performance monitoring unit support. The public contract is in spec §2.14 and spec §4.50–§4.54. This section describes how the pieces fit together internally.
 
@@ -2323,16 +2323,16 @@ The generic layer (`kernel/syscall/pmu.zig`) is architecture-agnostic. It valida
 
 - **`kernel/zag.zig`** — module root. Re-exports `arch`, `memory`, `proc`, `sched`, `syscall`, `utils`, etc. The syscall dispatch in `kernel/syscall/dispatch.zig` reaches the generic PMU entry points through `zag.syscall.pmu`.
 - **`kernel/main.zig`** — calls `arch.pmuInit()` once after `arch.vmInit()` and before `sched.globalInit()`, mirroring the VM init ordering.
-- **`kernel/arch/dispatch.zig`** — adds the `PmuState` comptime type alias and the `pmuInit`/`pmuGetInfo`/`pmuSave`/`pmuRestore`/`pmuStart`/`pmuRead`/`pmuReset`/`pmuStop` functions (see §13).
+- **`kernel/arch/dispatch.zig`** — adds the `PmuState` comptime type alias and the `pmuInit`/`pmuGetInfo`/`pmuSave`/`pmuRestore`/`pmuStart`/`pmuRead`/`pmuReset`/`pmuStop` functions (see §arch-interface).
 - **`kernel/syscall/dispatch.zig`** — dispatch cases for syscall numbers `pmu_info`, `pmu_start`, `pmu_read`, `pmu_reset`, and `pmu_stop` forward to the corresponding `pmu.sysPmuXxx` entry point in `kernel/syscall/pmu.zig`. No arg validation happens in the dispatch layer; validation lives in the generic layer so all arches share it.
-- **`kernel/sched/thread.zig`** — adds the `pmu_state: ?*arch.PmuState = null` field (see §5) and the PMU-free step in `Thread.deinit` (automatic `pmu_stop` on thread exit, §2.14.9).
-- **`kernel/sched/scheduler.zig`** — context switch paths (`schedTimerHandler` and IPC `switchToThread`) add the null-guarded `arch.pmuSave` / `arch.pmuRestore` calls around `arch.switchTo` (see §6). All other scheduler logic is unchanged.
+- **`kernel/sched/thread.zig`** — adds the `pmu_state: ?*arch.PmuState = null` field (see §thread) and the PMU-free step in `Thread.deinit` (automatic `pmu_stop` on thread exit, §2.14.9).
+- **`kernel/sched/scheduler.zig`** — context switch paths (`schedTimerHandler` and IPC `switchToThread`) add the null-guarded `arch.pmuSave` / `arch.pmuRestore` calls around `arch.switchTo` (see §run-queue). All other scheduler logic is unchanged.
 - **`kernel/memory/init.zig`** — adds `PmuStateAllocator = SlabAllocator(arch.PmuState, false, 0, 64)` with a dedicated 16 MiB bump region between the VCpu slab region and the heap tree slab region. Initialized in `memory.init()` alongside the other slabs.
-- **`kernel/perms/permissions.zig`** — adds `pmu` bit (bit 8) on `ProcessRights` and `pmu` bit (bit 4) on `ThreadHandleRights` (see §4). No other rights types are touched.
+- **`kernel/perms/permissions.zig`** — adds `pmu` bit (bit 8) on `ProcessRights` and `pmu` bit (bit 4) on `ThreadHandleRights` (see §permissions). No other rights types are touched.
 
 ### PmuStateAllocator
 
-`PmuStateAllocator = SlabAllocator(arch.PmuState, false, 0, 64)`. One dedicated 16 MiB bump region in the kernel VA layout (§14). Chunk size 64 matches the other slab allocators.
+`PmuStateAllocator = SlabAllocator(arch.PmuState, false, 0, 64)`. One dedicated 16 MiB bump region in the kernel VA layout (§memory). Chunk size 64 matches the other slab allocators.
 
 Allocation is lazy: a thread that never calls `pmu_start` never touches the allocator. The first `pmu_start` call in a thread's lifetime calls `PmuStateAllocator.create()`, stores the pointer on `thread.pmu_state`, and programs the hardware via `arch.pmuStart`. `pmu_stop` and `Thread.deinit` call `arch.pmuStop` (which disables counters) and `PmuStateAllocator.destroy(state)`.
 
@@ -2410,7 +2410,7 @@ pmuPmiHandler(frame):
        interrupted context with counters disabled — no fault delivered.
     4. Save the overflowed counter values into state.values (same as pmuSave).
     5. Call proc.faultBlock(thread, .pmu_overflow, rip_at_pmi, rip_at_pmi).
-       The existing fault delivery path (§18) handles single-thread-self-handler
+       The existing fault delivery path (§fault-routing) handles single-thread-self-handler
        kill (§2.12.7), external-handler stop-all, and enqueue into the handler's
        fault_box. FaultMessage.fault_addr and FaultMessage.regs.rip are both
        the instruction pointer at the time of overflow — this is the sample.
@@ -2468,7 +2468,7 @@ Overflow races: if a PMI fires on core A while the generic layer is mid-`pmu_sto
 
 ---
 
-## 21. System Info Internals
+## sysinfo. System Info Internals
 
 Per-process read access to system-wide and per-core hardware and scheduler state. The public contract is in spec §2.15 and spec §4.55. This section describes how the pieces fit together internally.
 
@@ -2480,15 +2480,15 @@ kernel/arch/x64/sysinfo.zig -- x64 hardware reads (new file)
 kernel/arch/aarch64/sysinfo.zig -- aarch64 stubs (new file)
 ```
 
-The generic layer follows the same split as PMU and VM: architecture-independent scheduler accounting, buffer validation, and the observable `SysInfo`/`CoreInfo` extern types live in `kernel/syscall/sysinfo.zig`, and all hardware-specific reads go through the `arch.getCoreFreq` / `arch.getCoreTemp` / `arch.getCoreState` dispatch functions in `kernel/arch/dispatch.zig` (§13). The generic layer never references MSRs, port I/O, or any vendor-specific encoding.
+The generic layer follows the same split as PMU and VM: architecture-independent scheduler accounting, buffer validation, and the observable `SysInfo`/`CoreInfo` extern types live in `kernel/syscall/sysinfo.zig`, and all hardware-specific reads go through the `arch.getCoreFreq` / `arch.getCoreTemp` / `arch.getCoreState` dispatch functions in `kernel/arch/dispatch.zig` (§arch-interface). The generic layer never references MSRs, port I/O, or any vendor-specific encoding.
 
 ### Module-Level Changes
 
 - **`kernel/arch/dispatch.zig`** — adds `getCoreFreq(core_id: u64) u64`, `getCoreTemp(core_id: u64) u32`, and `getCoreState(core_id: u64) u8` dispatch functions, each comptime-switched on `builtin.cpu.arch`.
 - **`kernel/syscall/dispatch.zig`** — dispatch case for the `sys_info` syscall number forwards directly to `kernel/syscall/sysinfo.zig::sysSysInfo`.
 - **`kernel/syscall/sysinfo.zig`** — owns the observable `SysInfo` / `CoreInfo` extern types, the `sysSysInfo` entry point, the user-pointer validation/write helpers (a local copy of the same `validateUserWritable` / `writeUser` helpers used by the PMU module — duplicated to keep sysinfo free of any cross-dependency on PMU — plus a `probeUserWritable` helper that walks a range via `demandPage` + `resolveVaddr` without writing, used to reject partition-contained-but-unmapped `cores_ptr` addresses before any state is committed), the per-core read-and-reset of the scheduler accounting fields, and the physmap writes that stamp the result into the caller's address space.
-- **`kernel/sched/scheduler.zig`** — adds `idle_ns`, `busy_ns`, and `last_tick_ns` to `PerCoreState` (see §6) and the accounting hook at the top of `schedTimerHandler` (see §6). `last_tick_ns` is seeded in `sched.perCoreInit` after the monotonic clock is available and before the preemption timer is armed.
-- **`kernel/memory/pmm.zig`** — adds `freePageCount() u64` and `totalPageCount() u64` (see §14). Both read PMM and buddy-allocator state under `pmm.lock`.
+- **`kernel/sched/scheduler.zig`** — adds `idle_ns`, `busy_ns`, and `last_tick_ns` to `PerCoreState` (see §run-queue) and the accounting hook at the top of `schedTimerHandler` (see §run-queue). `last_tick_ns` is seeded in `sched.perCoreInit` after the monotonic clock is available and before the preemption timer is armed.
+- **`kernel/memory/pmm.zig`** — adds `freePageCount() u64` and `totalPageCount() u64` (see §memory). Both read PMM and buddy-allocator state under `pmm.lock`.
 
 ### sys_info Handler
 
@@ -2506,12 +2506,12 @@ To satisfy both, the handler uses a probe-before-write ordering:
 5. **Probe** the `cores_ptr` range with `probeUserWritable` — this walks every page of the range via `proc.vmm.demandPage` and `arch.resolveVaddr` without writing. The symbolic validator in step 3 is a purely range-based check; a partition-contained but unmapped pointer (e.g. `0x1`) slips through it and would otherwise only fail at the final `writeUser(cores_ptr)`, after `info_ptr` had already been committed — violating §4.55.5. The probe forces the fault-or-fail decision up front. Returns `E_BADADDR` on any page-walk failure.
 6. Write `SysInfo` into `info_ptr` via physmap. A late page-out race between step 4 and this write still fails cleanly here because we haven't touched accounting yet — §4.55.6 is preserved.
 7. For each core `i` in `[0, core_count)`:
-   - Acquire that core's `rq_lock`, `@atomicRmw(.Xchg, .monotonic)` both `idle_ns` and `busy_ns` to zero, release `rq_lock`. Each counter is independently atomic with the scheduler tick hook's `@atomicRmw(.Add, .monotonic)`; see §6 for the per-counter coherence story.
+   - Acquire that core's `rq_lock`, `@atomicRmw(.Xchg, .monotonic)` both `idle_ns` and `busy_ns` to zero, release `rq_lock`. Each counter is independently atomic with the scheduler tick hook's `@atomicRmw(.Add, .monotonic)`; see §run-queue for the per-counter coherence story.
    - Call `arch.getCoreFreq(i)`, `arch.getCoreTemp(i)`, and `arch.getCoreState(i)` to populate the hardware fields.
    - Stamp the `CoreInfo` entry for slot `i` in a local stack buffer sized by `MAX_CORES = 64` (spec §5 "Max SysInfo.core_count").
 8. Write the `CoreInfo` array into the caller's address space via physmap. After step 5's probe the pages are guaranteed-faulted-in, so this write is essentially infallible — only a concurrent unmap can still fail it, in which case the accounting window has already been consumed (the caller did receive `SysInfo`, and step 7 has already committed the reset). This is the one remaining "accounting loss on late failure" corner the doc comment on `sysSysInfo` explicitly acknowledges.
 
-The read-and-reset at step 7 is the only place the handler holds `rq_lock`, and it's held for at most two atomic exchanges per core. Scheduler ticks are 2 ms apart (§6, `SCHED_TIMESLICE_NS`), so the lock-hold time on either side is a couple of cache-line updates.
+The read-and-reset at step 7 is the only place the handler holds `rq_lock`, and it's held for at most two atomic exchanges per core. Scheduler ticks are 2 ms apart (§run-queue, `SCHED_TIMESLICE_NS`), so the lock-hold time on either side is a couple of cache-line updates.
 
 ### x64 Hardware Reads
 
@@ -2541,7 +2541,7 @@ When aarch64 sysinfo support is implemented, it will replace the stubs in-place 
 
 ### Locking
 
-No new locks. `sys_info` takes each core's existing `rq_lock` in turn for the read-and-reset of the accounting fields; it never holds more than one `rq_lock` at a time, so deadlock is not a concern even if two callers sweep cores in opposite orders. The accounting fields themselves are updated lock-free from the scheduler tick hook via `@atomicRmw(.Add, .monotonic)` (see §6 "Idle/Busy Accounting Hook" for the per-counter coherence story).
+No new locks. `sys_info` takes each core's existing `rq_lock` in turn for the read-and-reset of the accounting fields; it never holds more than one `rq_lock` at a time, so deadlock is not a concern even if two callers sweep cores in opposite orders. The accounting fields themselves are updated lock-free from the scheduler tick hook via `@atomicRmw(.Add, .monotonic)` (see §run-queue "Idle/Busy Accounting Hook" for the per-counter coherence story).
 
 The PMM lock is taken by `pmm.freePageCount()` for its global free-list query, but the per-core PMM caches (`count`) are read on the alloc/free fast path without `pmm.lock` and without IRQ-disabling on the owning core. As a result the `mem_free` value reported by `sys_info` may be off by a few pages per core. This is acceptable for UI-grade reporting — the userspace consumer is a periodic dashboard sampler, not a transactional accounting system.
 
@@ -2549,7 +2549,7 @@ The arch dispatch functions run without holding any kernel lock; the x64 impleme
 
 ---
 
-## 22. Wall Clock Time Internals
+## wall-clock. Wall Clock Time Internals
 
 Wall clock time as an offset from the monotonic clock. The public contract is in spec §2.16 and spec §4.56--§4.57. This section describes how the pieces fit together internally.
 
@@ -2662,7 +2662,7 @@ The function returns `u64` nanoseconds since 1970-01-01T00:00:00Z. Precision is 
 
 ---
 
-## 23. Randomness Internals
+## randomness. Randomness Internals
 
 Hardware-sourced random bytes for userspace. The public contract is in spec §2.17 and spec §4.58. This section describes how the pieces fit together internally.
 
@@ -2744,7 +2744,7 @@ The maximum of 4096 bytes per call means at most 512 RDRAND invocations. RDRAND 
 
 ---
 
-## 24. IRQ Pending Bit and Delivery Internals
+## irq-delivery. IRQ Pending Bit and Delivery Internals
 
 IRQ delivery via a pending bit in the device's user view entry, waking futex waiters. The public contract is in spec §2.5. This section describes how the pieces fit together internally.
 
@@ -2871,7 +2871,7 @@ No special cleanup is needed for the IRQ pending bit on process death. The user 
 
 ---
 
-## 25. Power Control Internals
+## power. Power Control Internals
 
 System-wide and per-CPU power management. The public contract is in spec §2.19 and spec §4.61--§4.62. This section describes how the pieces fit together internally.
 
@@ -2971,7 +2971,7 @@ Does not return.
 
 **`screen_off`** — DPMS (Display Power Management Signaling) off via VGA register writes: read port `0x3DA` to reset the attribute controller flip-flop, write `0x00` to port `0x3C0` to blank the display. For modern systems, this may also involve writing to the GPU's power management registers if a display device region is available. Returns `E_OK`.
 
-**`set_freq`** — Per-CPU frequency control via `IA32_PERF_CTL` MSR (`0x199`). The target frequency in hertz is converted to a P-state ratio using the base bus frequency (same as §21's `getCoreFreq`). The ratio is written to bits 8--15 of `IA32_PERF_CTL`. The hardware adjusts to the nearest achievable frequency. Returns `E_NODEV` if P-state control is not supported (checked via CPUID).
+**`set_freq`** — Per-CPU frequency control via `IA32_PERF_CTL` MSR (`0x199`). The target frequency in hertz is converted to a P-state ratio using the base bus frequency (same as §sysinfo's `getCoreFreq`). The ratio is written to bits 8--15 of `IA32_PERF_CTL`. The hardware adjusts to the nearest achievable frequency. Returns `E_NODEV` if P-state control is not supported (checked via CPUID).
 
 **`set_idle`** — Per-CPU maximum C-state level. The value is stored in a per-core variable that the idle loop consults. When the idle thread runs, it uses `MWAIT` with the C-state hint corresponding to the configured maximum level (C-state sub-state encoding per Intel SDM Vol 2 "MWAIT" instruction). If `MWAIT` is not supported (CPUID leaf 5), falls back to `HLT`. Returns `E_NODEV` if `MWAIT` is not supported and value > 0.
 
