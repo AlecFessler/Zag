@@ -427,21 +427,9 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
     const target_handle = arch.getIpcHandle(ctx);
     const meta = parseIpcMetadata(arch.getIpcMetadata(ctx));
 
-    // Pin target_proc for the duration of this call. Mirrors the fix in
-    // sysIpcSend: without this, a concurrent revoke_perm on another core
-    // can drop the last external ref between getPermByHandle and
-    // msg_box.lock.lock(), freeing target_proc mid-operation. Note: on
-    // the blocking paths below we must release this ref explicitly
-    // before switchToNextReady, because that call never returns and the
-    // `defer` would never fire. This leaves the pre-existing F2 concern
-    // (thread.ipc_server back-pointer lifetime) as a separate latent
-    // issue, but closes the primary lookup-to-lock-acquire TOCTOU.
-    const target_ref = proc.acquireProcessRef(target_handle) orelse return .{ .ret = E_BADCAP };
-    var released = false;
-    defer if (!released) target_ref.process.releaseRef();
-    const target_entry = target_ref.entry;
+    const target_entry = proc.getPermByHandle(target_handle) orelse return .{ .ret = E_BADCAP };
     if (target_entry.object != .process) return .{ .ret = E_BADCAP };
-    const target_proc = target_ref.process;
+    const target_proc = target_entry.object.process;
 
     // §2.6.30: lazily convert dead process entries on IPC attempt.
     if (!target_proc.alive) {
@@ -505,10 +493,6 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
         thread.state = .blocked;
         thread.ctx = ctx;
         thread.on_cpu.store(false, .release);
-        // Release the pin explicitly — switchToNextReady never returns,
-        // so defer would leak the ref.
-        released = true;
-        target_ref.process.releaseRef();
         sched.switchToNextReady();
     } else {
         // No receiver — queue on wait list
@@ -520,8 +504,6 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
         // switchToNextReady saves ctx and never returns
         thread.ctx = ctx;
         thread.on_cpu.store(false, .release);
-        released = true;
-        target_ref.process.releaseRef();
         sched.switchToNextReady();
         // Never reached — when reply wakes us, we resume from ctx (int 0x80 frame)
         // with reply data already in registers
