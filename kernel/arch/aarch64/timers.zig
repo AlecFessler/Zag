@@ -87,7 +87,7 @@ inline fn writeCntvCtl(val: u64) void {
     );
 }
 
-fn ensureFreqCached() void {
+inline fn ensureFreqCached() void {
     if (cached_freq_hz != 0) return;
     cached_freq_hz = readCntfrq();
 }
@@ -165,12 +165,45 @@ const MonotonicClock = struct {
     }
 };
 
-pub fn getPreemptionTimer() Timer {
+// Module-scope const vtables. Keeping them here (rather than in an
+// anonymous `&.{...}` literal inside a method) means the address is
+// taken at comptime rather than through any runtime pool, and the
+// resulting `Timer` can be returned by value through a single register
+// pair with no per-call ABI struct-return shuffling — see the note on
+// `getPreemptionTimer` below.
+const preemption_vtable: timer_mod.VTable = .{
+    .now = PreemptionTimer.now,
+    .armInterruptTimer = PreemptionTimer.armInterruptTimer,
+};
+
+const monotonic_vtable: timer_mod.VTable = .{
+    .now = MonotonicClock.now,
+    .armInterruptTimer = MonotonicClock.armInterruptTimer,
+};
+
+/// `inline` is load-bearing on aarch64 + TCG SMP. When this function is
+/// emitted as a free-standing out-of-line body, secondary cores brought
+/// up via PSCI CPU_ON hang somewhere between its prologue and the caller
+/// receiving the returned `Timer` (observed with earlyDebugChar markers:
+/// core 0 completes the call, cores 1..N enter but never return to the
+/// caller). The exact miscompile is not pinned down — it may be an
+/// LLVM/Zig ABI issue with 16-byte struct returns, KASLR-relocated .text
+/// calls, or a TCG GICv3/Cortex-A72 interaction — but `inline` makes the
+/// call disappear entirely at the call site and SMP bring-up succeeds.
+/// `getMonotonicClock` is inlined for symmetry and to avoid any latent
+/// variant of the same miscompile.
+pub inline fn getPreemptionTimer() Timer {
     ensureFreqCached();
-    return preemption_timer_instance.timer();
+    return .{
+        .ptr = &preemption_timer_instance,
+        .vtable = &preemption_vtable,
+    };
 }
 
-pub fn getMonotonicClock() Timer {
+pub inline fn getMonotonicClock() Timer {
     ensureFreqCached();
-    return monotonic_clock_instance.timer();
+    return .{
+        .ptr = &monotonic_clock_instance,
+        .vtable = &monotonic_vtable,
+    };
 }
