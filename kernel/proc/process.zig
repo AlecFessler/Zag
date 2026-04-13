@@ -161,6 +161,13 @@ pub const Process = struct {
     }
 
     /// Remove all thread handles for a specific thread from this process's perm table.
+    /// Clears every matching slot — there should only ever be one under the
+    /// handle-table invariant ("each live thread has at most one perm slot
+    /// per owning process"), but a stale duplicate from any future invariant
+    /// break (see red-team Finding -3: self-cap-transfer fault_handler arm)
+    /// would otherwise leave a dangling `*Thread` for `Thread.deinit` to
+    /// hand back to the next syscall that takes a thread handle. Walking the
+    /// whole table is O(MAX_PERMS) and thread exit is already not hot.
     pub fn removeThreadHandle(self: *Process, thread: *Thread) void {
         self.perm_lock.lock();
         defer self.perm_lock.unlock();
@@ -170,7 +177,6 @@ pub const Process = struct {
                 slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
                 removed = true;
-                break;
             }
         }
         if (removed) self.syncUserView();
