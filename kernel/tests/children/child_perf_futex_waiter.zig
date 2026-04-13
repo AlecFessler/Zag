@@ -48,9 +48,19 @@ pub fn main(pv: u64) void {
     const shared: *Shared = @ptrFromInt(vm.val2);
 
     _ = syscall.set_affinity(@atomicLoad(u64, &shared.affinity, .acquire));
-    _ = syscall.set_priority(syscall.PRIORITY_REALTIME);
 
     while (@atomicLoad(u64, &shared.exit, .acquire) == 0) {
+        // Wait for the parent to consume the previous round's delta and
+        // reset futex_val to 0 before re-arming. If we re-arm too early,
+        // futex_val is still 1 from the prior wake and futex_wait
+        // fast-fails with E_AGAIN — leaving the parent blocked waiting
+        // for a real block/wake that never happens, since on the next
+        // loop it sees a stale waiter_ready and wakes an empty bucket.
+        while (@atomicLoad(u64, &shared.waiter_done, .acquire) != 0) {
+            if (@atomicLoad(u64, &shared.exit, .acquire) != 0) break;
+            syscall.thread_yield();
+        }
+
         @atomicStore(u64, &shared.waiter_ready, 1, .release);
         _ = syscall.futex_wait(@ptrCast(&shared.futex_val), 0, ~@as(u64, 0));
 

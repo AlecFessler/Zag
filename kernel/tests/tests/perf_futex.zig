@@ -175,6 +175,7 @@ fn benchCrossProcessWake(name: []const u8, waiter_affinity: u64) void {
 }
 
 fn wakeOnce(shared: *Shared) void {
+    // Wait for waiter to announce it is armed in futex_wait.
     while (@atomicLoad(u64, &shared.waiter_ready, .acquire) == 0) {
         syscall.thread_yield();
     }
@@ -184,9 +185,15 @@ fn wakeOnce(shared: *Shared) void {
     @atomicStore(u64, &shared.futex_val, 1, .release);
     _ = syscall.futex_wake(@ptrCast(&shared.futex_val), 1);
 
+    // Wait for the waiter to record its delta for this round.
     while (@atomicLoad(u64, &shared.waiter_done, .acquire) == 0) {
         syscall.thread_yield();
     }
-    @atomicStore(u64, &shared.waiter_done, 0, .release);
+    // Re-arm for the next round BEFORE clearing waiter_done. Clearing
+    // waiter_done is what the waiter polls on after its rearm handshake,
+    // so futex_val must already be back to 0 when the waiter observes
+    // waiter_done==0; otherwise the waiter's next futex_wait fast-fails
+    // with E_AGAIN and we never block on the real wake path.
     @atomicStore(u64, &shared.futex_val, 0, .release);
+    @atomicStore(u64, &shared.waiter_done, 0, .release);
 }
