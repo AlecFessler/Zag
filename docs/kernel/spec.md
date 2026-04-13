@@ -387,6 +387,8 @@ Zag provides a unified fault handling mechanism covering both in-process fault r
 
 **§4.1.3** Transferring `HANDLE_SELF` via capability transfer with the `fault_handler` bit set atomically: if the recipient already holds a process handle to the sender, the `fault_handler` bit is added to that existing entry; otherwise a new process handle entry is inserted into the recipient's permissions table with `fault_handler` set. In both cases, `fault_handler` is cleared from the sender's slot 0 `ProcessRights`, and all subsequent faults from the sender are routed to the recipient's fault box. The sender's `syncUserView` is updated to reflect the cleared bit.
 
+**§4.1.116** Transferring `HANDLE_SELF` via capability transfer with the `fault_handler` bit set requires the sender to currently hold `ProcessRights.fault_handler` on its slot 0; a sender without that right receives `E_PERM` from the originating IPC syscall and no state on sender, target, or any perm table is modified.
+
 **§4.1.4** When a process acquires `fault_handler` for a target, the kernel immediately inserts thread handles for all of the target's current threads into the acquirer's permissions table with full `ThreadHandleRights`.
 
 **§4.1.5** While a process holds `fault_handler` for a target, any new threads created in the target are immediately inserted into the handler's permissions table with full `ThreadHandleRights` upon `thread_create`.
