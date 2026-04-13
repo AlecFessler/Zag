@@ -30,8 +30,7 @@ pub const CrashReason = enum(u5) {
 pub const UserViewEntry = extern struct {
     handle: u64,
     entry_type: u8,
-    /// For device_region entries, holds the badge_bit (u6, §2.18.3).
-    badge_byte: u8,
+    _reserved_byte: u8,
     rights: u16,
     _pad: [4]u8,
     field0: u64,

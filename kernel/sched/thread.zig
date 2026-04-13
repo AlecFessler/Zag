@@ -67,10 +67,14 @@ pub const Thread = struct {
     pinned_exclusive: bool = false,
     futex_deadline_ns: u64 = 0,
     futex_paddr: PAddr = PAddr.fromInt(0),
-    /// True when this thread is blocked in NotificationBox.wait with a timeout.
-    /// Used by expireTimedWaiters to drain from the notification box instead of
-    /// a futex bucket. Set before addTimedWaiter, cleared on wake.
-    notification_waiter: bool = false,
+    /// Index of the address that woke this thread from a multi-address futex wait.
+    /// Set by wake() before waking; read by the thread after resuming.
+    futex_wake_index: u8 = 0,
+    /// Physical addresses this thread is waiting on in a multi-address futex wait.
+    /// The thread is enqueued in all corresponding buckets simultaneously.
+    futex_paddrs: [64]PAddr = [_]PAddr{PAddr.fromInt(0)} ** 64,
+    /// Number of addresses in the current multi-address futex wait.
+    futex_bucket_count: u8 = 0,
     ipc_server: ?*Process = null,
     slot_index: u8 = 0,
     /// Fault metadata, valid iff thread.state == .faulted (or the thread

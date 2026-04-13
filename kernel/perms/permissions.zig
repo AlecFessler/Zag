@@ -113,7 +113,6 @@ pub const PermissionEntry = struct {
     rights: u16,
     exclude_oneshot: bool = false,
     exclude_permanent: bool = false,
-    badge_bit: u6 = 0,
 
     pub fn processRights(self: @This()) ProcessRights {
         return @bitCast(self.rights);
@@ -172,9 +171,7 @@ pub const UserViewEntryType = enum(u8) {
 pub const UserViewEntry = extern struct {
     handle: u64,
     entry_type: u8,
-    /// For device_region entries, holds the badge_bit (u6, §2.18.3).
-    /// Zero for all other entry types.
-    badge_byte: u8 = 0,
+    _reserved_byte: u8 = 0,
     rights: u16,
     _pad: [4]u8 = .{ 0, 0, 0, 0 },
     field0: u64,
@@ -247,7 +244,6 @@ pub const UserViewEntry = extern struct {
             .device_region => |dr| .{
                 .handle = entry.handle,
                 .entry_type = @intFromEnum(UserViewEntryType.device_region),
-                .badge_byte = entry.badge_bit,
                 .rights = entry.rights,
                 .field0 = @as(u64, @intFromEnum(dr.device_type)) |
                     (@as(u64, @intFromEnum(dr.device_class)) << 8) |

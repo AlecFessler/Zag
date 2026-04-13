@@ -1,17 +1,13 @@
 const lib = @import("lib");
 
-const perm_view = lib.perm_view;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.5.17 — When a device IRQ fires, the kernel masks the IRQ line, identifies the owning process via the device region, atomically ORs `(1 << badge_bit)` into the process's notification word, and wakes all threads waiting on the notification box.
+/// §2.5.17 — When a device IRQ fires, the kernel masks the IRQ line, sets bit 16 of field0 in the device's user view entry, and wakes futex waiters on that address.
 pub fn main(pv: u64) void {
     _ = pv;
-    // This assertion describes the kernel's internal IRQ delivery path.
-    // We cannot directly trigger a real device IRQ in the test environment,
-    // but we can verify the observable side: notify_wait with timeout 0
-    // returns E_AGAIN when no IRQs have fired (no bits set).
+    // The old notify_wait syscall is removed; verify it returns E_INVAL.
     const rc = syscall.notify_wait(0);
-    t.expectEqual("§2.5.17", syscall.E_AGAIN, rc);
+    t.expectEqual("§2.5.17", syscall.E_INVAL, rc);
     syscall.shutdown();
 }

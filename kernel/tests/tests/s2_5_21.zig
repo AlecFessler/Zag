@@ -3,11 +3,10 @@ const lib = @import("lib");
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.5.21 — `notify_wait` with a finite timeout returns `E_TIMEOUT` if the notification word remains zero for the duration.
+/// §2.5.21 — The removed `notify_wait` syscall returns `E_INVAL` instead of timing out.
 pub fn main(perm_view: u64) void {
     _ = perm_view;
-    // Use a short timeout (1 ms = 1_000_000 ns) so the test doesn't hang.
     const rc = syscall.notify_wait(1_000_000);
-    t.expectEqual("§2.5.21", syscall.E_TIMEOUT, rc);
+    t.expectEqual("§2.5.21", syscall.E_INVAL, rc);
     syscall.shutdown();
 }
