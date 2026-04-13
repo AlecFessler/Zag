@@ -150,11 +150,13 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
                 while (true) arch.halt();
             }
 
-            const page_base = VAddr.fromInt(std.mem.alignBackward(u64, faulting_virt.addr, paging.PAGE4K));
-            if (arch.resolveVaddr(proc.addr_space_root, page_base) != null) {
-                @panic("user fault on already-mapped page");
-            }
-
+            // Note: we do NOT pre-check arch.resolveVaddr here. A concurrent
+            // syscall pre-fault on another CPU (readUserBytes, vmRecv, futex,
+            // sysinfo, pmu, proc_create, vCPU run) can install the PTE
+            // between the hardware raising #PF and us reaching this point.
+            // demandPage takes vmm.lock and has an "already backed" fast
+            // path, so the benign race becomes a silent no-op and the
+            // faulting instruction simply retries.
             proc.vmm.demandPage(faulting_virt, is_write, is_exec) catch {
                 if (proc.faultBlock(thread, .out_of_memory, faulting_virt.addr, fault.rip, fault.user_ctx)) {
                     arch.enableInterrupts();
