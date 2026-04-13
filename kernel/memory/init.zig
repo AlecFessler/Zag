@@ -185,7 +185,11 @@ pub fn init(firmware_mmap: MMap) !void {
             useable_range = entry_range.removeOverlap(low_memory_range);
         }
 
+        arch.earlyDebugChar('R');
+        arch.earlyDebugHex((useable_range.end - useable_range.start) / paging.PAGE4K);
+        arch.earlyDebugChar(':');
         buddy_allocator.addRegion(useable_range.start, useable_range.end);
+        arch.earlyDebugChar('/');
     }
     arch.earlyDebugChar('f');
 
