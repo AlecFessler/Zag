@@ -107,102 +107,33 @@ pub fn sysIrqAck(device_handle: u64) i64 {
 
 pub fn sysMemDmaMap(device_handle: u64, shm_handle: u64) i64 {
     const proc = sched.currentProc();
-
-    // Both handle lookups and the shm refcount bump must happen under
-    // perm_lock so a concurrent revoke_perm on the SHM handle cannot
-    // decRef the SharedMemory between the lookup and arch.mapDmaPages.
-    // Without this, the captured `*SharedMemory` becomes a UAF the
-    // moment the racing revoke drops the last reference — mapDmaPages
-    // then iterates a freed `shm.pages` slice. See exploits/dma_map_uaf.
-    //
-    // Lock ordering: perm_lock -> iommu locks is safe because no IOMMU
-    // path reaches back into perm_lock.
-    proc.perm_lock.lock();
-
-    const dev_entry = proc.getPermByHandleLocked(device_handle) orelse {
-        proc.perm_lock.unlock();
-        return E_BADCAP;
-    };
-    if (dev_entry.object != .device_region) {
-        proc.perm_lock.unlock();
-        return E_BADCAP;
-    }
-    if (!dev_entry.deviceRights().dma) {
-        proc.perm_lock.unlock();
-        return E_PERM;
-    }
+    const dev_entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
+    if (dev_entry.object != .device_region) return E_BADCAP;
+    if (!dev_entry.deviceRights().dma) return E_PERM;
     const device = dev_entry.object.device_region;
-    if (device.device_type != .mmio) {
-        proc.perm_lock.unlock();
-        return E_INVAL;
-    }
+    if (device.device_type != .mmio) return E_INVAL;
 
-    const shm_entry = proc.getPermByHandleLocked(shm_handle) orelse {
-        proc.perm_lock.unlock();
-        return E_BADCAP;
-    };
-    if (shm_entry.object != .shared_memory) {
-        proc.perm_lock.unlock();
-        return E_BADCAP;
-    }
+    const shm_entry = proc.getPermByHandle(shm_handle) orelse return E_BADCAP;
+    if (shm_entry.object != .shared_memory) return E_BADCAP;
     const shm = shm_entry.object.shared_memory;
 
-    // Keep the SHM alive for the duration of this syscall regardless
-    // of a concurrent revoke.
-    shm.incRef();
-    proc.perm_lock.unlock();
-
-    if (!arch.isDmaRemapAvailable()) {
-        shm.decRef();
-        return E_NOMEM;
-    }
-
-    const dma_base = arch.mapDmaPages(device, shm) catch {
-        shm.decRef();
-        return E_NOMEM;
-    };
-    arch.enableDmaRemapping();
-    proc.addDmaMapping(device, shm, dma_base, shm.pages.len) catch {
-        arch.unmapDmaPages(device, dma_base, shm.pages.len);
-        shm.decRef();
-        return E_NORES;
-    };
-    shm.decRef();
-    return @bitCast(dma_base);
+    if (arch.isDmaRemapAvailable()) {
+        const dma_base = arch.mapDmaPages(device, shm) catch return E_NOMEM;
+        arch.enableDmaRemapping();
+        proc.addDmaMapping(device, shm, dma_base, shm.pages.len) catch return E_NORES;
+        return @bitCast(dma_base);
+    } else return E_NOMEM;
 }
 
 pub fn sysMemDmaUnmap(device_handle: u64, shm_handle: u64) i64 {
     const proc = sched.currentProc();
-
-    // Same perm_lock discipline as sysMemDmaMap. removeDmaMapping uses
-    // `shm` only as a pointer-equality key, but a concurrent revoke +
-    // slab reuse could hand out the same pointer to a different SHM
-    // and falsely match an unrelated mapping. Look up + consume the
-    // mapping with the SHM pinned by refcount.
-    proc.perm_lock.lock();
-
-    const dev_entry = proc.getPermByHandleLocked(device_handle) orelse {
-        proc.perm_lock.unlock();
-        return E_BADCAP;
-    };
-    if (dev_entry.object != .device_region) {
-        proc.perm_lock.unlock();
-        return E_BADCAP;
-    }
+    const dev_entry = proc.getPermByHandle(device_handle) orelse return E_BADCAP;
+    if (dev_entry.object != .device_region) return E_BADCAP;
     const device = dev_entry.object.device_region;
 
-    const shm_entry = proc.getPermByHandleLocked(shm_handle) orelse {
-        proc.perm_lock.unlock();
-        return E_BADCAP;
-    };
-    if (shm_entry.object != .shared_memory) {
-        proc.perm_lock.unlock();
-        return E_BADCAP;
-    }
+    const shm_entry = proc.getPermByHandle(shm_handle) orelse return E_BADCAP;
+    if (shm_entry.object != .shared_memory) return E_BADCAP;
     const shm = shm_entry.object.shared_memory;
-    shm.incRef();
-    proc.perm_lock.unlock();
-    defer shm.decRef();
 
     if (!arch.isDmaRemapAvailable()) {
         // No IOMMU: no page table entries to clean up, just remove tracking
