@@ -508,18 +508,22 @@ pub const VirtualMemoryManager = struct {
         const range_start = VAddr.fromInt(original_start.addr + offset);
         const range_end_addr = range_start.addr + size;
 
-        // Split at boundaries first so that forEachInRange sees all overlapping
-        // nodes with start >= range_start. Without this, a non-private node
-        // starting before range_start would be missed by the validation pass,
-        // allowing a partial unmap that violates §2.3.7/§2.3.47.
+        // §2.3.7/§2.3.47: SHM, MMIO, and virtual BAR nodes must be fully
+        // contained — partial overlap returns E_INVAL. Check the boundary
+        // nodes BEFORE splitting (splitAtLocked would split non-private
+        // nodes, corrupting them).
+        if (findNodeLocked(&self.tree, range_start)) |node| {
+            if (node.kind != .private and node.start.addr < range_start.addr)
+                return error.PartialOverlap;
+        }
+        if (findNodeLocked(&self.tree, VAddr.fromInt(range_end_addr -| 1))) |node| {
+            if (node.kind != .private and node.start.addr + node.size > range_end_addr)
+                return error.PartialOverlap;
+        }
+
+        // Split private nodes at range boundaries.
         try splitAtLocked(&self.tree, range_start);
         try splitAtLocked(&self.tree, VAddr.fromInt(range_end_addr));
-
-        // After splitting at both boundaries, every node visited by
-        // forEachInRange is fully contained within the range — partial overlaps
-        // cannot exist. Non-private nodes that are fully contained are valid
-        // unmap targets per §2.3.5/§2.3.6 (they get replaced with private
-        // demand-paged nodes). No validation rejection is needed here.
 
         // UNMAP PASS: Collect non-private nodes to replace, and update private nodes.
         var to_replace: [128]*VmNode = undefined;
