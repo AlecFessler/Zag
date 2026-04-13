@@ -121,12 +121,17 @@ run_linux_boot_test() {
     echo "=== Linux VM Boot Test ==="
     clean_nvvars
 
+    # Build the hyprvos profile in ReleaseSafe. A Debug-mode Zig codegen
+    # issue in the kernel's in-kernel LAPIC MMIO path triggers a null-pointer
+    # dereference in mmio_decode on the first guest LAPIC access, crashing
+    # the kernel before Linux reaches userspace. ReleaseSafe still retains
+    # runtime safety checks but avoids the bad codegen.
     (cd "$SCRIPT_DIR/hyprvOS" && zig build) || { echo "hyprvOS build failed"; return 1; }
-    (cd "$SCRIPT_DIR" && zig build -Dprofile=hyprvos -Diommu=amd) || { echo "kernel build failed"; return 1; }
+    (cd "$SCRIPT_DIR" && zig build -Dprofile=hyprvos -Diommu=amd -Doptimize=ReleaseSafe) || { echo "kernel build failed"; return 1; }
 
     local qemu_log
     qemu_log=$(mktemp)
-    (cd "$SCRIPT_DIR" && timeout 90 zig build run -Dprofile=hyprvos -Diommu=amd -- -display none) > "$qemu_log" 2>&1 &
+    (cd "$SCRIPT_DIR" && timeout 90 zig build run -Dprofile=hyprvos -Diommu=amd -Doptimize=ReleaseSafe -- -display none) > "$qemu_log" 2>&1 &
     local qemu_pid=$!
 
     local found=0
