@@ -10,7 +10,7 @@ fn threadFn() void {
     while (true) syscall.thread_yield();
 }
 
-/// §2.1.59 — Each entry has a type field: `process`, `vm_reservation`, `shared_memory`, `device_region`, `core_pin`, `dead_process`, or `thread`.
+/// §2.1.59 — Each entry has a type field: `process`, `vm_reservation`, `shared_memory`, `device_region`, `dead_process`, or `thread`.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
@@ -43,16 +43,6 @@ pub fn main(pv: u64) void {
     }
     const shm_handle: u64 = @bitCast(shm_rc);
 
-    // core_pin: set single-core affinity and pin.
-    _ = syscall.set_affinity(0x2);
-    syscall.thread_yield();
-    const pin_rc = syscall.set_priority(syscall.PRIORITY_PINNED);
-    if (pin_rc < 0) {
-        t.fail("§2.1.59 set_priority(PINNED)");
-        syscall.shutdown();
-    }
-    const pin_handle: u64 = @bitCast(pin_rc);
-
     // dead_process: spawn a non-restartable child that exits, so its entry
     // flips to dead_process.
     const child_rights = perms.ProcessRights{ .spawn_thread = true };
@@ -74,12 +64,11 @@ pub fn main(pv: u64) void {
         syscall.thread_yield();
     }
 
-    // Sweep the view and collect which of the 7 type tags we observed.
+    // Sweep the view and collect which of the 6 type tags we observed.
     var seen_process = false;
     var seen_vm = false;
     var seen_shm = false;
     var seen_dev = false;
-    var seen_pin = false;
     var seen_dead = false;
     var seen_thread = false;
     for (0..128) |i| {
@@ -92,9 +81,6 @@ pub fn main(pv: u64) void {
                 if (view[i].handle == shm_handle) seen_shm = true;
             },
             perm_view.ENTRY_TYPE_DEVICE_REGION => seen_dev = true,
-            perm_view.ENTRY_TYPE_CORE_PIN => {
-                if (view[i].handle == pin_handle) seen_pin = true;
-            },
             perm_view.ENTRY_TYPE_DEAD_PROCESS => {
                 if (view[i].handle == child_handle) seen_dead = true;
             },
@@ -105,7 +91,7 @@ pub fn main(pv: u64) void {
         }
     }
 
-    if (seen_process and seen_vm and seen_shm and seen_dev and seen_pin and seen_dead and seen_thread) {
+    if (seen_process and seen_vm and seen_shm and seen_dev and seen_dead and seen_thread) {
         t.pass("§2.1.59");
     } else {
         t.fail("§2.1.59");
