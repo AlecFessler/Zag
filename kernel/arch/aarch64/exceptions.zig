@@ -445,8 +445,14 @@ fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     // No EOI needed for spurious interrupts.
     if (intid == 1023) return;
 
-    dispatchIrq(intid, ctx, .user);
+    // EOI must be issued BEFORE dispatchIrq because the timer / scheduler
+    // IPI paths can call `scheduler.switchTo`, which is `noreturn` and
+    // ERETs to a different thread. Anything queued after dispatchIrq is
+    // unreachable on a context switch, leaving the interrupt permanently
+    // in the active state and masking every subsequent delivery of that
+    // same priority (IHI 0069H §4.6: an active interrupt blocks pending).
     gic.endOfInterrupt(intid);
+    dispatchIrq(intid, ctx, .user);
 }
 
 /// Handler for synchronous exceptions from Current EL (kernel-mode).
@@ -500,8 +506,9 @@ fn handleIrqCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
 
     if (intid == 1023) return;
 
-    dispatchIrq(intid, ctx, .kernel);
+    // EOI before dispatch — see handleIrqLowerEl for rationale.
     gic.endOfInterrupt(intid);
+    dispatchIrq(intid, ctx, .kernel);
 }
 
 /// Panic handler for unexpected/unimplemented vector entries.
@@ -525,6 +532,18 @@ fn handleUnexpected(ctx: *ArchCpuContext) callconv(.c) void {
 /// LAPIC-timer IDT vector.
 fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.PrivilegePerm) void {
     switch (intid) {
+        // SGI 0 — scheduler IPI raised by `triggerSchedulerInterrupt` on
+        // aarch64 (see `arch/dispatch.zig sched_ipi_vector`). Used by both
+        // explicit `thread_yield` syscalls and cross-core wake-ups. Dispatch
+        // it through the same path as the timer tick so the scheduler picks
+        // a new runnable thread on this core.
+        0 => {
+            const sched_ctx = scheduler.SchedInterruptContext{
+                .privilege = privilege,
+                .thread_ctx = ctx,
+            };
+            scheduler.schedTimerHandler(sched_ctx);
+        },
         27 => {
             // Mask the virtual timer while we run the scheduler tick.
             // schedTimerHandler will re-arm via `armInterruptTimer`
