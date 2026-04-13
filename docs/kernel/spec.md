@@ -257,7 +257,7 @@ Port I/O device regions support virtual BAR mapping via `mem_mmio_map`. The mapp
 
 **§2.5.8** Virtual BAR access with a non-MOV instruction kills the process with `protection_fault`. **§2.5.9** Virtual BAR access that begins at or extends beyond `port_count` kills the process with `invalid_read` or `invalid_write`. An instruction whose encoding straddles a page boundary at RIP kills the process with `protection_fault`; compilers never emit this in normal code.
 
-Device entries in the user view encode hardware identification: <!-- spec:test:2.5.2 -->**§2.5.2** device user view `field0` encodes: `device_type(u8, bits 0-7) | device_class(u8, bits 8-15) | irq_pending(bit 16) | reserved_zero(bits 17-31) | size_or_port_count(u32, bits 32-63)`. Bit 16 is the IRQ pending bit (see IRQ Pending Bit below). **§2.5.3** Device user view `field1` encodes: `pci_vendor(u16) | pci_device(u16) << 16 | pci_class(u8) << 32 | pci_subclass(u8) << 40`.
+Device entries in the user view encode hardware identification: <!-- s2_5_2 -->**§2.5.2** device user view `field0` encodes: `device_type(u8, bits 0-7) | device_class(u8, bits 8-15) | irq_pending(bit 16) | reserved_zero(bits 17-31) | size_or_port_count(u32, bits 32-63)`. Bit 16 is the IRQ pending bit (see IRQ Pending Bit below). **§2.5.3** Device user view `field1` encodes: `pci_vendor(u16) | pci_device(u16) << 16 | pci_class(u8) << 32 | pci_subclass(u8) << 40`.
 
 **§2.5.4** At boot, the kernel inserts all device handles into the root service's permissions table. **§2.5.5** Kernel-internal devices (HPET, LAPIC, I/O APIC) are not exposed in the user view.
 
@@ -271,13 +271,13 @@ Device entries in the user view encode hardware identification: <!-- spec:test:2
 
 When a device IRQ fires, the kernel sets bit 16 (the IRQ pending bit) in the device's `field0` in the owning process's user permissions view. Userspace can use the `field0` address as a futex wait target to sleep until the next IRQ.
 
-<!-- spec:test:2.5.14 -->**§2.5.14** When a device IRQ fires, the kernel masks the IRQ line, identifies the owning process via the device region, and atomically sets bit 16 of the device's `field0` in the user permissions view via physmap. If the compare-and-swap fails (due to a racing IRQ or `irq_ack`), the kernel re-reads and retries. After setting the bit, the kernel calls `futex_wake` on the `field0` physical address to wake any thread waiting on it. <!-- spec:test:2.5.15 -->**§2.5.15** Userspace derives the `field0` address of a device entry as `perm_view_vaddr + slot_index * 32 + 16` and uses it directly as a futex wait target (via `futex_wait_val` or `futex_wait_change`). <!-- spec:test:2.5.16 -->**§2.5.16** `irq_ack` atomically clears bit 16 of the device's `field0` in the user permissions view via physmap. No futex wake is issued on clear.
+<!-- s2_5_14 -->**§2.5.14** When a device IRQ fires, the kernel masks the IRQ line, identifies the owning process via the device region, and atomically sets bit 16 of the device's `field0` in the user permissions view via physmap. If the compare-and-swap fails (due to a racing IRQ or `irq_ack`), the kernel re-reads and retries. After setting the bit, the kernel calls `futex_wake` on the `field0` physical address to wake any thread waiting on it. <!-- s2_5_15 -->**§2.5.15** Userspace derives the `field0` address of a device entry as `perm_view_vaddr + slot_index * 32 + 16` and uses it directly as a futex wait target (via `futex_wait_val` or `futex_wait_change`). <!-- s2_5_16 -->**§2.5.16** `irq_ack` atomically clears bit 16 of the device's `field0` in the user permissions view via physmap. No futex wake is issued on clear.
 
-<!-- spec:test:2.5.17 -->**§2.5.17** `DeviceRegionRights.irq` gates both `irq_ack` and meaningful use of the IRQ pending bit. <!-- spec:test:2.5.18 -->**§2.5.18** The typical driver flow is: read `field0`, call `futex_wait_val` on the `field0` address with the current value as expected (the thread wakes when bit 16 is set by the kernel), handle the interrupt in userspace, call `irq_ack` to clear the pending bit and unmask the line.
+<!-- s2_5_17 -->**§2.5.17** `DeviceRegionRights.irq` gates both `irq_ack` and meaningful use of the IRQ pending bit. <!-- s2_5_18 -->**§2.5.18** The typical driver flow is: read `field0`, call `futex_wait_val` on the `field0` address with the current value as expected (the thread wakes when bit 16 is set by the kernel), handle the interrupt in userspace, call `irq_ack` to clear the pending bit and unmask the line.
 
 #### irq_ack(device_handle) → result
 
-Clears the IRQ pending bit (bit 16 of the device's `field0` in the user permissions view) and unmasks the IRQ line for the device associated with `device_handle`, allowing future interrupts to be delivered. <!-- spec:test:2.5.24 -->**§2.5.24** `irq_ack` returns `E_OK` on success. <!-- spec:test:2.5.25 -->**§2.5.25** `irq_ack` with invalid or wrong-type `device_handle` returns `E_BADHANDLE`. <!-- spec:test:2.5.26 -->**§2.5.26** `irq_ack` without `DeviceRegionRights.irq` on the device handle returns `E_PERM`. <!-- spec:test:2.5.27 -->**§2.5.27** `irq_ack` on a device with no associated IRQ line returns `E_INVAL`.
+Clears the IRQ pending bit (bit 16 of the device's `field0` in the user permissions view) and unmasks the IRQ line for the device associated with `device_handle`, allowing future interrupts to be delivered. <!-- s2_5_24 -->**§2.5.24** `irq_ack` returns `E_OK` on success. <!-- s2_5_25 -->**§2.5.25** `irq_ack` with invalid or wrong-type `device_handle` returns `E_BADHANDLE`. <!-- s2_5_26 -->**§2.5.26** `irq_ack` without `DeviceRegionRights.irq` on the device handle returns `E_PERM`. <!-- s2_5_27 -->**§2.5.27** `irq_ack` on a device with no associated IRQ line returns `E_INVAL`.
 
 #### mem_dma_map(device_handle, shm_handle) → dma_addr
 
@@ -311,23 +311,23 @@ Creates a shared memory region backed by eagerly allocated zeroed pages. **§3.1
 
 The futex mechanism bridges userspace synchronization with the kernel scheduler. A thread atomically checks one or more memory locations and sleeps if the values match, avoiding busy-waiting.
 
-<!-- spec:test:3.2.1 -->**§3.2.1** `futex_wait_val` blocks the calling thread when the value at every `addrs[i]` matches `expected[i]`. <!-- spec:test:3.2.2 -->**§3.2.2** `futex_wait_val` with timeout=0 is non-blocking: returns immediately without blocking (try-only check). <!-- spec:test:3.2.3 -->**§3.2.3** `futex_wait_val` with timeout=`MAX_U64` blocks indefinitely until woken. <!-- spec:test:3.2.4 -->**§3.2.4** `futex_wait_val` with a finite timeout blocks for at least `timeout_ns` nanoseconds; actual expiry may be delayed until the next scheduler tick. <!-- spec:test:3.2.5 -->**§3.2.5** Cross-process futexes work over shared memory (two processes mapping the same SHM can synchronize via the same address). <!-- spec:test:3.2.6 -->**§3.2.6** `futex_wake` wakes up to `count` threads blocked on `addr`. <!-- spec:test:3.2.7 -->**§3.2.7** Futex waiters are woken in priority order (highest priority first), with FIFO ordering among waiters of the same priority level.
+<!-- s3_2_1 -->**§3.2.1** `futex_wait_val` blocks the calling thread when the value at every `addrs[i]` matches `expected[i]`. <!-- s3_2_2 -->**§3.2.2** `futex_wait_val` with timeout=0 is non-blocking: returns immediately without blocking (try-only check). <!-- s3_2_3 -->**§3.2.3** `futex_wait_val` with timeout=`MAX_U64` blocks indefinitely until woken. <!-- s3_2_4 -->**§3.2.4** `futex_wait_val` with a finite timeout blocks for at least `timeout_ns` nanoseconds; actual expiry may be delayed until the next scheduler tick. <!-- s3_2_5 -->**§3.2.5** Cross-process futexes work over shared memory (two processes mapping the same SHM can synchronize via the same address). <!-- s3_2_6 -->**§3.2.6** `futex_wake` wakes up to `count` threads blocked on `addr`. <!-- s3_2_7 -->**§3.2.7** Futex waiters are woken in priority order (highest priority first), with FIFO ordering among waiters of the same priority level.
 
 #### futex_wait_val(addrs_ptr, expected_ptr, count, timeout_ns) → index
 
 Atomically checks `count` u64 values: for each `i` in `[0, count)`, checks the u64 at `addrs[i]` against `expected[i]`. If any word already differs from its expected value, returns that index immediately without blocking. If all words match, the thread blocks until any address is woken by `futex_wake`, then returns the index of the woken address. With `count = 1`, this is a direct replacement for single-address futex waiting.
 
-<!-- spec:test:3.2.8 -->**§3.2.8** `futex_wait_val` returns the index (non-negative) of the first address that changed or was woken on success. <!-- spec:test:3.2.9 -->**§3.2.9** `futex_wait_val` returns the index of the mismatched address immediately when any `addrs[i]` does not match `expected[i]` at call time. <!-- spec:test:3.2.10 -->**§3.2.10** `futex_wait_val` returns `E_TIMEOUT` on timeout expiry. <!-- spec:test:3.2.11 -->**§3.2.11** `futex_wait_val` with any non-8-byte-aligned address in the array returns `E_INVAL`. <!-- spec:test:3.2.12 -->**§3.2.12** `futex_wait_val` with any invalid address in the array returns `E_BADADDR`. <!-- spec:test:3.2.13 -->**§3.2.13** `futex_wait_val` with `count = 0` returns `E_INVAL`. <!-- spec:test:3.2.14 -->**§3.2.14** `futex_wait_val` with `count` exceeding `MAX_FUTEX_WAIT` (64) returns `E_INVAL`. Returns `E_NORES` on futex slot exhaustion.
+<!-- s3_2_8 -->**§3.2.8** `futex_wait_val` returns the index (non-negative) of the first address that changed or was woken on success. <!-- s3_2_9 -->**§3.2.9** `futex_wait_val` returns the index of the mismatched address immediately when any `addrs[i]` does not match `expected[i]` at call time. <!-- s3_2_10 -->**§3.2.10** `futex_wait_val` returns `E_TIMEOUT` on timeout expiry. <!-- s3_2_11 -->**§3.2.11** `futex_wait_val` with any non-8-byte-aligned address in the array returns `E_INVAL`. <!-- s3_2_12 -->**§3.2.12** `futex_wait_val` with any invalid address in the array returns `E_BADADDR`. <!-- s3_2_13 -->**§3.2.13** `futex_wait_val` with `count = 0` returns `E_INVAL`. <!-- s3_2_14 -->**§3.2.14** `futex_wait_val` with `count` exceeding `MAX_FUTEX_WAIT` (64) returns `E_INVAL`. Returns `E_NORES` on futex slot exhaustion.
 
 #### futex_wait_change(addrs_ptr, count, timeout_ns) → index
 
 Atomically reads the current values of all `count` addresses under their bucket locks, then blocks until any address changes from those snapshot values. Returns the index of the first address that changed. This is useful when the caller does not know or care about the specific expected value, only that something changed.
 
-<!-- spec:test:3.2.15 -->**§3.2.15** `futex_wait_change` returns the index (non-negative) of the first address that changed on success. <!-- spec:test:3.2.16 -->**§3.2.16** `futex_wait_change` returns `E_TIMEOUT` on timeout expiry. <!-- spec:test:3.2.17 -->**§3.2.17** `futex_wait_change` with any non-8-byte-aligned address in the array returns `E_INVAL`. <!-- spec:test:3.2.18 -->**§3.2.18** `futex_wait_change` with any invalid address in the array returns `E_BADADDR`. <!-- spec:test:3.2.19 -->**§3.2.19** `futex_wait_change` with `count = 0` returns `E_INVAL`. <!-- spec:test:3.2.20 -->**§3.2.20** `futex_wait_change` with `count` exceeding `MAX_FUTEX_WAIT` (64) returns `E_INVAL`. <!-- spec:test:3.2.21 -->**§3.2.21** `futex_wait_change` has the same timeout semantics as `futex_wait_val`: `0` is non-blocking, `MAX_U64` is indefinite, finite blocks for at least that duration. Returns `E_NORES` on futex slot exhaustion.
+<!-- s3_2_15 -->**§3.2.15** `futex_wait_change` returns the index (non-negative) of the first address that changed on success. <!-- s3_2_16 -->**§3.2.16** `futex_wait_change` returns `E_TIMEOUT` on timeout expiry. <!-- s3_2_17 -->**§3.2.17** `futex_wait_change` with any non-8-byte-aligned address in the array returns `E_INVAL`. <!-- s3_2_18 -->**§3.2.18** `futex_wait_change` with any invalid address in the array returns `E_BADADDR`. <!-- s3_2_19 -->**§3.2.19** `futex_wait_change` with `count = 0` returns `E_INVAL`. <!-- s3_2_20 -->**§3.2.20** `futex_wait_change` with `count` exceeding `MAX_FUTEX_WAIT` (64) returns `E_INVAL`. <!-- s3_2_21 -->**§3.2.21** `futex_wait_change` has the same timeout semantics as `futex_wait_val`: `0` is non-blocking, `MAX_U64` is indefinite, finite blocks for at least that duration. Returns `E_NORES` on futex slot exhaustion.
 
 #### futex_wake(addr, count) → result
 
-<!-- spec:test:3.2.22 -->**§3.2.22** `futex_wake` returns number of threads woken (non-negative). <!-- spec:test:3.2.23 -->**§3.2.23** `futex_wake` with invalid addr returns `E_BADADDR`. <!-- spec:test:3.2.24 -->**§3.2.24** `futex_wake` with non-8-byte-aligned addr returns `E_INVAL`.
+<!-- s3_2_22 -->**§3.2.22** `futex_wake` returns number of threads woken (non-negative). <!-- s3_2_23 -->**§3.2.23** `futex_wake` with invalid addr returns `E_BADADDR`. <!-- s3_2_24 -->**§3.2.24** `futex_wake` with non-8-byte-aligned addr returns `E_INVAL`.
 
 ---
 
@@ -772,7 +772,7 @@ De-asserts an IRQ line on the calling process's VM's in-kernel IOAPIC and kicks 
 
 Zag exposes wall clock (real) time as an offset from the monotonic clock. The kernel reads the hardware RTC once at boot to compute an initial offset. `clock_getwall` returns the current wall time by adding the offset to the monotonic clock. `clock_setwall` allows a privileged process to adjust the offset.
 
-<!-- spec:test:5.1.1 -->**§5.1.1** `clock_getwall` returns nanoseconds since the Unix epoch (1970-01-01T00:00:00Z). No rights check is required. Always succeeds. <!-- spec:test:5.1.2 -->**§5.1.2** `clock_setwall` requires `ProcessRights.set_time` on slot 0; returns `E_PERM` without it. <!-- spec:test:5.1.3 -->**§5.1.3** `clock_setwall` atomically updates the wall clock offset so that subsequent `clock_getwall` calls reflect the new time. **§5.1.4** `clock_getwall` precision is limited by the underlying monotonic clock source (TSC on x86). The wall clock does not drift independently of the monotonic clock. <!-- spec:test:5.1.5 -->**§5.1.5** Root service holds `ProcessRights.set_time` at boot.
+<!-- s5_1_1 -->**§5.1.1** `clock_getwall` returns nanoseconds since the Unix epoch (1970-01-01T00:00:00Z). No rights check is required. Always succeeds. <!-- s5_1_2 -->**§5.1.2** `clock_setwall` requires `ProcessRights.set_time` on slot 0; returns `E_PERM` without it. <!-- s5_1_3 -->**§5.1.3** `clock_setwall` atomically updates the wall clock offset so that subsequent `clock_getwall` calls reflect the new time. **§5.1.4** `clock_getwall` precision is limited by the underlying monotonic clock source (TSC on x86). The wall clock does not drift independently of the monotonic clock. <!-- s5_1_5 -->**§5.1.5** Root service holds `ProcessRights.set_time` at boot.
 
 #### clock_gettime() → nanoseconds
 
@@ -782,13 +782,13 @@ Zag exposes wall clock (real) time as an offset from the monotonic clock. The ke
 
 Returns the current wall clock time as nanoseconds since the Unix epoch (1970-01-01T00:00:00Z). The value is computed as the monotonic clock plus a kernel-maintained offset initialized from the hardware RTC at boot.
 
-<!-- spec:test:5.1.7 -->**§5.1.7** `clock_getwall` returns a positive i64 representing nanoseconds since the Unix epoch. <!-- spec:test:5.1.8 -->**§5.1.8** `clock_getwall` requires no rights and is callable by any process. <!-- spec:test:5.1.9 -->**§5.1.9** `clock_getwall` always succeeds.
+<!-- s5_1_7 -->**§5.1.7** `clock_getwall` returns a positive i64 representing nanoseconds since the Unix epoch. <!-- s5_1_8 -->**§5.1.8** `clock_getwall` requires no rights and is callable by any process. <!-- s5_1_9 -->**§5.1.9** `clock_getwall` always succeeds.
 
 #### clock_setwall(nanoseconds) → result
 
 Sets the wall clock time by recomputing the kernel's internal wall clock offset so that the next `clock_getwall` returns the specified time.
 
-<!-- spec:test:5.1.10 -->**§5.1.10** `clock_setwall` returns `E_OK` on success. <!-- spec:test:5.1.11 -->**§5.1.11** `clock_setwall` requires `ProcessRights.set_time` on slot 0; returns `E_PERM` without it. **§5.1.12** The offset update is atomic: concurrent `clock_getwall` calls on other threads see either the old or the new time, never a torn value.
+<!-- s5_1_10 -->**§5.1.10** `clock_setwall` returns `E_OK` on success. <!-- s5_1_11 -->**§5.1.11** `clock_setwall` requires `ProcessRights.set_time` on slot 0; returns `E_PERM` without it. **§5.1.12** The offset update is atomic: concurrent `clock_getwall` calls on other threads see either the old or the new time, never a torn value.
 
 ---
 
@@ -796,13 +796,13 @@ Sets the wall clock time by recomputing the kernel's internal wall clock offset 
 
 Zag exposes hardware-sourced random bytes to userspace via `getrandom`. The kernel reads directly from the CPU's hardware RNG (RDRAND on x86) with no intermediate entropy pool or blocking.
 
-<!-- spec:test:5.2.1 -->**§5.2.1** `getrandom` fills a userspace buffer with cryptographically random bytes sourced from the hardware RNG. No rights check is required. **§5.2.2** `getrandom` is non-blocking. If the hardware RNG is temporarily unavailable, it returns `E_AGAIN` rather than waiting. <!-- spec:test:5.2.3 -->**§5.2.3** The maximum buffer size per call is 4096 bytes. Requests for more return `E_INVAL`. <!-- spec:test:5.2.4 -->**§5.2.4** Requests with zero length return `E_INVAL`.
+<!-- s5_2_1 -->**§5.2.1** `getrandom` fills a userspace buffer with cryptographically random bytes sourced from the hardware RNG. No rights check is required. **§5.2.2** `getrandom` is non-blocking. If the hardware RNG is temporarily unavailable, it returns `E_AGAIN` rather than waiting. <!-- s5_2_3 -->**§5.2.3** The maximum buffer size per call is 4096 bytes. Requests for more return `E_INVAL`. <!-- s5_2_4 -->**§5.2.4** Requests with zero length return `E_INVAL`.
 
 #### getrandom(buf_ptr, len) → result
 
 Fills a userspace buffer with hardware-sourced random bytes.
 
-<!-- spec:test:5.2.5 -->**§5.2.5** `getrandom` returns `E_OK` on success. <!-- spec:test:5.2.6 -->**§5.2.6** `getrandom` requires no rights and is callable by any process. <!-- spec:test:5.2.7 -->**§5.2.7** `getrandom` with `len == 0` returns `E_INVAL`. <!-- spec:test:5.2.8 -->**§5.2.8** `getrandom` with `len > 4096` returns `E_INVAL`. <!-- spec:test:5.2.9 -->**§5.2.9** `getrandom` with `buf_ptr` not pointing to a writable region of `len` bytes returns `E_BADADDR`. **§5.2.10** `getrandom` returns `E_AGAIN` if the hardware RNG is temporarily unavailable. **§5.2.11** On `E_NODEV`, the hardware has no RNG support at all.
+<!-- s5_2_5 -->**§5.2.5** `getrandom` returns `E_OK` on success. <!-- s5_2_6 -->**§5.2.6** `getrandom` requires no rights and is callable by any process. <!-- s5_2_7 -->**§5.2.7** `getrandom` with `len == 0` returns `E_INVAL`. <!-- s5_2_8 -->**§5.2.8** `getrandom` with `len > 4096` returns `E_INVAL`. <!-- s5_2_9 -->**§5.2.9** `getrandom` with `buf_ptr` not pointing to a writable region of `len` bytes returns `E_BADADDR`. **§5.2.10** `getrandom` returns `E_AGAIN` if the hardware RNG is temporarily unavailable. **§5.2.11** On `E_NODEV`, the hardware has no RNG support at all.
 
 ---
 
@@ -866,7 +866,7 @@ Typical usage is a two-call pattern: first call with `cores_ptr = null` to obtai
 
 Zag provides two syscalls for system-wide and per-CPU power management, both gated on the `ProcessRights.power` capability bit.
 
-<!-- spec:test:5.4.1 -->**§5.4.1** `ProcessRights.power` gates both `sys_power` and `sys_cpu_power`. Root service holds this bit at boot.
+<!-- s5_4_1 -->**§5.4.1** `ProcessRights.power` gates both `sys_power` and `sys_cpu_power`. Root service holds this bit at boot.
 
 #### PowerAction
 
@@ -882,7 +882,7 @@ PowerAction = enum {
 }
 ```
 
-**§5.4.2** `sys_power` with `shutdown` or `reboot` does not return on success. **§5.4.3** `sys_power` with `sleep`, `hibernate`, or `screen_off` returns `E_OK` after the system resumes (or the action completes). <!-- spec:test:5.4.4 -->**§5.4.4** `sys_power` returns `E_NODEV` if the hardware does not support the requested action.
+**§5.4.2** `sys_power` with `shutdown` or `reboot` does not return on success. **§5.4.3** `sys_power` with `sleep`, `hibernate`, or `screen_off` returns `E_OK` after the system resumes (or the action completes). <!-- s5_4_4 -->**§5.4.4** `sys_power` returns `E_NODEV` if the hardware does not support the requested action.
 
 #### CpuPowerAction
 
@@ -895,19 +895,19 @@ CpuPowerAction = enum {
 }
 ```
 
-**§5.4.5** `sys_cpu_power` with `set_freq` sets the target CPU frequency in hertz. The kernel programs the nearest achievable frequency. **§5.4.6** `sys_cpu_power` with `set_idle` sets the maximum C-state idle level for the calling core. <!-- spec:test:5.4.7 -->**§5.4.7** `sys_cpu_power` returns `E_NODEV` if the hardware does not support the requested action.
+**§5.4.5** `sys_cpu_power` with `set_freq` sets the target CPU frequency in hertz. The kernel programs the nearest achievable frequency. **§5.4.6** `sys_cpu_power` with `set_idle` sets the maximum C-state idle level for the calling core. <!-- s5_4_7 -->**§5.4.7** `sys_cpu_power` returns `E_NODEV` if the hardware does not support the requested action.
 
 #### sys_power(action) → result
 
 Performs a system-wide power action. `action` is a `PowerAction` enum value.
 
-**§5.4.8** `sys_power` returns `E_OK` on success (for actions that return). <!-- spec:test:5.4.9 -->**§5.4.9** `sys_power` requires `ProcessRights.power` on slot 0; returns `E_PERM` without it. <!-- spec:test:5.4.10 -->**§5.4.10** `sys_power` with an invalid `action` value returns `E_INVAL`. **§5.4.11** `sys_power` with `shutdown` or `reboot` does not return on success. **§5.4.12** `sys_power` with `sleep`, `hibernate`, or `screen_off` returns `E_OK` after the system resumes or the action completes. <!-- spec:test:5.4.13 -->**§5.4.13** `sys_power` returns `E_NODEV` if the hardware does not support the requested action.
+**§5.4.8** `sys_power` returns `E_OK` on success (for actions that return). <!-- s5_4_9 -->**§5.4.9** `sys_power` requires `ProcessRights.power` on slot 0; returns `E_PERM` without it. <!-- s5_4_10 -->**§5.4.10** `sys_power` with an invalid `action` value returns `E_INVAL`. **§5.4.11** `sys_power` with `shutdown` or `reboot` does not return on success. **§5.4.12** `sys_power` with `sleep`, `hibernate`, or `screen_off` returns `E_OK` after the system resumes or the action completes. <!-- s5_4_13 -->**§5.4.13** `sys_power` returns `E_NODEV` if the hardware does not support the requested action.
 
 #### sys_cpu_power(action, value) → result
 
 Performs a per-CPU power control action. `action` is a `CpuPowerAction` enum value.
 
-**§5.4.14** `sys_cpu_power` returns `E_OK` on success. <!-- spec:test:5.4.15 -->**§5.4.15** `sys_cpu_power` requires `ProcessRights.power` on slot 0; returns `E_PERM` without it. <!-- spec:test:5.4.16 -->**§5.4.16** `sys_cpu_power` with an invalid `action` value returns `E_INVAL`. **§5.4.17** `sys_cpu_power` with `set_freq` uses `value` as the target frequency in hertz. **§5.4.18** `sys_cpu_power` with `set_idle` uses `value` as the maximum C-state level. <!-- spec:test:5.4.19 -->**§5.4.19** `sys_cpu_power` returns `E_NODEV` if the hardware does not support the requested action.
+**§5.4.14** `sys_cpu_power` returns `E_OK` on success. <!-- s5_4_15 -->**§5.4.15** `sys_cpu_power` requires `ProcessRights.power` on slot 0; returns `E_PERM` without it. <!-- s5_4_16 -->**§5.4.16** `sys_cpu_power` with an invalid `action` value returns `E_INVAL`. **§5.4.17** `sys_cpu_power` with `set_freq` uses `value` as the target frequency in hertz. **§5.4.18** `sys_cpu_power` with `set_idle` uses `value` as the maximum C-state level. <!-- s5_4_19 -->**§5.4.19** `sys_cpu_power` returns `E_NODEV` if the hardware does not support the requested action.
 
 ---
 
