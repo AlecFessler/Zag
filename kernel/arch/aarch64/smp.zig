@@ -211,7 +211,7 @@ fn createIdentityMapping(trampoline_pa: u64) !u64 {
     var l1_entry = PageEntry{
         .valid = true,
         .is_table = false, // Block descriptor, not table
-        .attr_indx = 1, // Normal Write-Back (MAIR index 1)
+        .attr_indx = aarch64_paging.mair_normal, // Normal Write-Back
         .ap = 0b00, // EL1 RW, EL0 no access
         .sh = 0b11, // Inner Shareable
         .af = true, // Access Flag set
@@ -226,7 +226,7 @@ fn createIdentityMapping(trampoline_pa: u64) !u64 {
         var dev_entry = PageEntry{
             .valid = true,
             .is_table = false, // Block descriptor
-            .attr_indx = 0, // Device-nGnRnE (MAIR index 0)
+            .attr_indx = aarch64_paging.mair_device, // Device-nGnRnE
             .ap = 0b00, // EL1 RW, EL0 no access
             .sh = 0b00, // Non-shareable (device memory)
             .af = true, // Access Flag set
@@ -236,6 +236,32 @@ fn createIdentityMapping(trampoline_pa: u64) !u64 {
         dev_entry.setPAddr(PAddr.fromInt(0));
         l1_table[0] = dev_entry;
     }
+
+    // The secondary core reads these pages with the MMU disabled, which on
+    // AArch64 is Normal Non-Cacheable. Clean the two table pages to the
+    // Point of Coherency so the secondary sees the descriptors we just wrote.
+    // ARM ARM D5.9: DC CVAC + DSB ISH makes cacheable stores visible to
+    // non-cacheable observers at PoC.
+    const page_size = paging.PAGE4K;
+    var clean_va: u64 = l0_va;
+    while (clean_va < l0_va + page_size) {
+        asm volatile ("dc cvac, %[va]"
+            :
+            : [va] "r" (clean_va),
+            : .{ .memory = true }
+        );
+        clean_va += 64;
+    }
+    clean_va = l1_va;
+    while (clean_va < l1_va + page_size) {
+        asm volatile ("dc cvac, %[va]"
+            :
+            : [va] "r" (clean_va),
+            : .{ .memory = true }
+        );
+        clean_va += 64;
+    }
+    asm volatile ("dsb ish" ::: .{ .memory = true });
 
     return l0_pa;
 }
@@ -252,23 +278,10 @@ fn createIdentityMapping(trampoline_pa: u64) !u64 {
 /// the physical address of SecondaryBootParams so the secondary can configure
 /// its MMU before accessing kernel VA code.
 ///
-/// TODO(aarch64-smp): The MMU-enable trampoline (secondaryEntry +
-/// createIdentityMapping below) is WIP and not wired end-to-end. Secondaries
-/// that reach kernel VA code fault because the kernel uses high-VA while PSCI
-/// delivers the core with MMU off. Until the trampoline is finished, force
-/// BSP-only boot on aarch64 so the kernel test suite can run. This compiles
-/// out the secondary bringup loop while preserving the WIP code for a future
-/// iteration. `smpInitFull` is called only when `BSP_ONLY` is false.
-const BSP_ONLY: bool = true;
-
 pub fn smpInit() !void {
     arch.earlyDebugChar('S');
     arch.earlyDebugChar('m');
     arch.earlyDebugChar('p');
-    if (BSP_ONLY) {
-        arch.earlyDebugChar('1');
-        return;
-    }
     try smpInitFull();
 }
 
@@ -349,6 +362,13 @@ fn smpInitFull() !void {
         clean_addr += 64;
     }
     asm volatile ("dsb ish" ::: .{ .memory = true });
+
+    // QEMU virt's AAVMF firmware does not implement an SMC PSCI handler;
+    // secondary bringup on the TCG virt machine requires HVC. On bare metal
+    // with TF-A, SMC is the correct conduit — this should eventually be
+    // driven off the ACPI FADT ARM Boot Architecture Flags / PSCI node.
+    // TODO(aarch64): drive conduit from FADT instead of hard-coding HVC.
+    power.setConduit(.hvc);
 
     var core_idx: usize = 1;
     while (core_idx < core_count) {
@@ -435,7 +455,11 @@ fn smpInitFull() !void {
         // Spin-wait for the secondary to signal it is online.
         // Use a bounded wait to avoid hanging if a core fails to start.
         var spin_count: u64 = 0;
-        const max_spins: u64 = 10_000_000;
+        // Bounded wait so the BSP can make forward progress even when a
+        // secondary stalls inside per-core GIC init. TCG spin iters are
+        // slow, so keep this small enough that N cores still fit under
+        // the kernel test timeout.
+        const max_spins: u64 = 500_000;
         while (cores_online.load(.acquire) == expected) {
             if (spin_count >= max_spins) {
                 arch.earlyDebugChar('!');
@@ -467,11 +491,18 @@ fn smpInitFull() !void {
 fn secondaryEntry() callconv(.naked) noreturn {
     asm volatile (
     // x0 = PA of SecondaryBootParams (from PSCI context_id)
-    // MMU is off — all memory access uses physical addresses.
+    // MMU is off — all memory access uses physical addresses and is
+    // treated as Normal Non-Cacheable (ARM ARM D5.2.9).
+    //
     // Debug: PL011 UART at PA 0x09000000 (QEMU virt machine).
         \\mov x10, #0x09000000
         \\mov w11, #0x61             // 'a' — trampoline entered
         \\str w11, [x10]
+        \\
+        // Mask DAIF: SError, IRQ, FIQ, Debug. We do not want any
+        // spurious interrupt delivered while the MMU is off and
+        // VBAR still points where firmware left it.
+        \\msr daifset, #0xF
         \\
     // Load all params into registers before touching system registers.
     // SecondaryBootParams layout: ttbr0(0), ttbr1(8), tcr(16), mair(24),
@@ -486,26 +517,31 @@ fn secondaryEntry() callconv(.naked) noreturn {
         \\
         // Configure memory attributes (ARM ARM D13.2.97).
         \\msr mair_el1, x4
-        \\isb
-        \\mov w11, #0x63             // 'c' — MAIR set
-        \\str w11, [x10]
         \\
         // Configure translation control (ARM ARM D13.2.131).
         \\msr tcr_el1, x3
-        \\isb
-        \\mov w11, #0x64             // 'd' — TCR set
-        \\str w11, [x10]
         \\
         // Install page tables (ARM ARM D13.2.136).
         // TTBR0: identity mapping (VA == PA for this trampoline).
         // TTBR1: kernel mapping (same as BSP).
         \\msr ttbr0_el1, x1
         \\msr ttbr1_el1, x2
+        \\
+        // Install exception vectors before enabling the MMU so any
+        // fault during the MMU-enable window lands somewhere sane.
+        \\msr vbar_el1, x9
         \\isb
-        \\mov w11, #0x65             // 'e' — TTBRs set
+        \\
+        // Invalidate local TLB for EL1&0 to drop any stale entries
+        // inherited from firmware. ARM ARM D5.10.2.
+        \\tlbi vmalle1
+        \\dsb nsh
+        \\isb
+        \\
+        \\mov w11, #0x63             // 'c' — sysregs primed
         \\str w11, [x10]
         \\
-        // Enable MMU. SCTLR_EL1.M (bit 0) = 1.
+        // Enable MMU. SCTLR_EL1 from the BSP already has M|C|I set.
         // The identity mapping in TTBR0 ensures the next instruction
         // fetch succeeds at the same PA after translation is enabled.
         \\msr sctlr_el1, x5
@@ -513,21 +549,12 @@ fn secondaryEntry() callconv(.naked) noreturn {
         \\mov w11, #0x66             // 'f' — MMU enabled
         \\str w11, [x10]
         \\
-        // MMU is now on. PC is still at the trampoline's PA, which is
-        // identity-mapped via TTBR0. Install exception vectors, set
-        // the kernel stack, and jump to kernel VA.
-        \\msr vbar_el1, x9
+        // MMU is on. PC is still at the trampoline's PA, which is
+        // identity-mapped via TTBR0. Set the kernel stack and jump
+        // to the kernel VA entry.
         \\mov sp, x6
         \\mov x0, x8
         \\mov w11, #0x67             // 'g' — about to jump to VA
-        \\str w11, [x10]
-        \\
-        // Test stack access before jumping to VA. Store and load
-        // a word at [sp, #-16] to verify the stack mapping works.
-        \\mov x12, #0xDEAD
-        \\str x12, [sp, #-16]!
-        \\ldr x13, [sp], #16
-        \\mov w11, #0x68             // 'h' — stack access OK
         \\str w11, [x10]
         \\br x7
     );

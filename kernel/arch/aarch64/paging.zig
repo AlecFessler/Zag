@@ -173,8 +173,8 @@ fn l0Idx(virt: VAddr) u9 {
 /// Default values are a fallback only — `initMairIndices()` must
 /// be called before any mapping is built.
 /// ARM ARM D13.2.97 — MAIR_EL1 layout.
-var mair_device: u3 = 0;
-var mair_normal: u3 = 1;
+pub var mair_device: u3 = 0;
+pub var mair_normal: u3 = 1;
 
 pub fn initMairIndices() void {
     var mair: u64 = undefined;

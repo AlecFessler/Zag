@@ -14,7 +14,7 @@ PARALLEL="${PARALLEL:-1}"
 ARCH="${ARCH:-x64}"
 
 if [ "$ARCH" = "arm" ]; then
-    QEMU_CMD="qemu-system-aarch64 -M virt,gic-version=3 -m 1G -bios /usr/share/AAVMF/AAVMF_CODE.fd -serial stdio -display none -no-reboot -machine accel=tcg -cpu cortex-a72 -smp cores=1"
+    QEMU_CMD="qemu-system-aarch64 -M virt,gic-version=3 -m 1G -bios /usr/share/AAVMF/AAVMF_CODE.fd -serial stdio -display none -no-reboot -machine accel=tcg -cpu cortex-a72 -smp cores=4"
     BUILD_ARCH_FLAG="-Darch=arm"
     LOADER="BOOTAA64.EFI"
 else
