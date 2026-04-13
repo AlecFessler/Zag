@@ -1177,6 +1177,46 @@ fn mapEptPageInner(pml4_phys: PAddr, guest_phys: u64, host_phys: PAddr, rights: 
 /// Unmap a guest physical page from EPT and invalidate stale TLB entries
 /// via INVEPT (SDM Vol 3C, Section 29.4.3.4 "Guidelines for Use of the
 /// INVEPT Instruction"). Uses single-context invalidation (type 1).
+///
+/// IMPORTANT — TLB shootdown scope: INVEPT is per-logical-processor. This
+/// call only invalidates EPT TLB entries on the current core. Remote cores
+/// that previously executed vCPUs of this VM may still cache guest-physical
+/// EPT mappings (EPT TLB entries are tagged by EPTP and are NOT flushed on
+/// VMX transitions; SDM 28.3.3.1). VPID is currently not enabled, which
+/// changes linear/combined mapping invalidation but not EPT-only mappings.
+///
+/// Caller contract (per Zag's current kvm architecture, see
+/// `kernel/arch/x64/kvm/vm.zig` and `guest_memory.zig`):
+///
+///   1. `guest_mem.deinit` teardown path — called only from `Vm.destroy`,
+///      which first sets every vCPU to `.exited` and spins on
+///      `thread.on_cpu` until no vCPU is executing on any core
+///      (`vcpu.destroy` loop). After this, the VM is permanently dead:
+///      no vCPU will ever re-enter VMX non-root with this EPTP, so stale
+///      remote EPT TLB entries are never consulted again. `freeVmStructures`
+///      currently leaks the EPT page tables until process-exit address-space
+///      teardown, so the backing physical pages are not handed to another
+///      security domain until after that process dies entirely (at which
+///      point no core holds a cached EPTP matching this VM).
+///
+///   2. `rollbackGuestMap` partial-failure path — called synchronously
+///      inside `guestMap` to undo pages this same syscall just mapped.
+///      Remote vCPUs of the same VM may still cache EPT entries for those
+///      pages. However, the host pages being "unmapped" here are pages
+///      from the caller's OWN process address space (resolved via
+///      `arch.resolveVaddr(proc.addr_space_root, ...)`) and are NOT
+///      freed — only their EPT leaf is cleared. A stale remote EPT TLB
+///      entry therefore only lets a vCPU of the SAME process continue to
+///      read/write a host page the same process already owns. This is not
+///      a cross-security-domain leak.
+///
+/// If a future caller needs to unmap EPT pages while other vCPUs of the
+/// same VM are actively executing AND the host page must be reused across
+/// security domains (e.g., an eventual `vm_guest_unmap` syscall that
+/// frees the host page back to PMM), this function is NOT sufficient:
+/// it must be paired with an IPI-driven INVEPT shootdown on every core
+/// that may hold stale entries for this EPTP (canonical TLB shootdown),
+/// or the VM must be fully quiesced (all vCPUs forced off-cpu) first.
 pub fn unmapEptPage(ept_root: PAddr, guest_phys: u64) void {
     // Load the VMCS to read the EPTP
     asm volatile (

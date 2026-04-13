@@ -37,6 +37,14 @@ pub const GuestMemory = struct {
     }
 
     /// Tear down all guest memory mappings and free allocated pages.
+    ///
+    /// INVARIANT: caller must ensure no vCPU of this VM is executing guest
+    /// mode on any core. `Vm.destroy` enforces this by setting each vCPU
+    /// to `.exited` and spinning on `thread.on_cpu` (see `vcpu.destroy`).
+    /// Without this, remote cores may hold stale EPT TLB entries tagged
+    /// by this VM's EPTP — `unmapEptPage` only invalidates the local
+    /// core's EPT TLB. See `unmapEptPage` doc comment for the full
+    /// caller-contract analysis.
     pub fn deinit(self: *GuestMemory, arch_structures: PAddr) void {
         // Unmap all guest physical pages from arch structures
         for (self.regions[0..self.num_regions]) |*region| {
