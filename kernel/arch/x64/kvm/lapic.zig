@@ -311,19 +311,6 @@ pub const Lapic = struct {
             0b01 => {
                 // Self IPI
                 if (delivery_mode == 0b000) { // Fixed
-                    // Intel SDM Vol 3A §10.5.2 ("Valid Interrupt Vectors"):
-                    // vectors 0..15 are reserved for processor-defined
-                    // exceptions and are illegal for the Local APIC.
-                    // §10.5.3 (ESR, Figure 10-9) requires the receiving
-                    // LAPIC to set bit 6 ("Received Illegal Vector") and
-                    // drop the interrupt. Mirrors the sibling check in
-                    // `injectExternal`; `fireTimerInterrupt` uses ESR
-                    // bit 5 because that path is the LAPIC sending to
-                    // itself via its own LVT.
-                    if (vector < 16) {
-                        self.esr_shadow |= (1 << 6);
-                        return;
-                    }
                     setBit(&self.irr, vector);
                 }
             },
