@@ -20,7 +20,17 @@
 //! - ARM ARM C5.2: AArch64 System Instructions
 //! - ARM ARM D1.7: Interrupt masking
 
+const std = @import("std");
+const builtin = @import("builtin");
 const zag = @import("zag");
+
+/// True when the target CPU advertises the ARMv8.1 PAN (Privileged
+/// Access Never) feature. Cortex-A72 is ARMv8.0 and lacks PAN; the
+/// `msr pan, #imm` mnemonic is UNDEFINED there and must not execute.
+const has_pan = std.Target.aarch64.featureSetHas(
+    builtin.cpu.features,
+    .pan,
+);
 
 pub fn halt() noreturn {
     while (true) {
@@ -53,14 +63,17 @@ pub fn restoreInterrupts(state: u64) void {
 
 /// Disable PAN — allow kernel to access user pages.
 /// ARM ARM D5.4.6: MSR PAN, #0 clears PSTATE.PAN.
+/// No-op on ARMv8.0 targets without PAN (kernel always can access
+/// user pages, no SMAP-equivalent enforcement).
 pub inline fn panDisable() void {
-    asm volatile ("msr pan, #0");
+    if (has_pan) asm volatile ("msr pan, #0");
 }
 
 /// Enable PAN — block kernel access to user pages.
 /// ARM ARM D5.4.6: MSR PAN, #1 sets PSTATE.PAN.
+/// No-op on ARMv8.0 targets without PAN.
 pub inline fn panEnable() void {
-    asm volatile ("msr pan, #1");
+    if (has_pan) asm volatile ("msr pan, #1");
 }
 
 /// Read the virtual counter (CNTVCT_EL0).

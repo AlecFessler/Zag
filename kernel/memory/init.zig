@@ -47,8 +47,12 @@ var heap_allocator_instance: HeapAllocator = undefined;
 pub var heap_allocator: std.mem.Allocator = undefined;
 
 pub fn init(firmware_mmap: MMap) !void {
+    arch.earlyDebugChar('a');
     var mmap_entries: [boot.protocol.MAX_MMAP_ENTRIES]MMapEntry = undefined;
+    arch.earlyDebugChar('A');
     const mmap = boot.protocol.collapseMMap(&firmware_mmap, &mmap_entries);
+    arch.earlyDebugChar('b');
+    arch.earlyDebugChar('0');
 
     var smallest_addr_region: MMapEntry = .{ .start_paddr = std.math.maxInt(u64), .num_pages = 0, .type = .free };
     var largest_addr_free_region: MMapEntry = .{ .start_paddr = 0, .num_pages = 0, .type = .free };
@@ -65,22 +69,27 @@ pub fn init(firmware_mmap: MMap) !void {
         }
     }
 
+    arch.earlyDebugChar('1');
     const bump_alloc_start_phys = PAddr.fromInt(largest_free_region.start_paddr);
     const bump_alloc_end_phys = PAddr.fromInt(largest_free_region.start_paddr + largest_free_region.num_pages * paging.PAGE4K);
     bump_allocator = BumpAllocator.init(bump_alloc_start_phys.addr, bump_alloc_end_phys.addr);
     const bump_alloc_iface: std.mem.Allocator = bump_allocator.allocator();
+    arch.earlyDebugChar('2');
 
     const addr_space_root_phys = arch.getKernelAddrSpaceRoot();
     kernel_addr_space_root = addr_space_root_phys;
     const addr_space_root_id_virt = VAddr.fromPAddr(addr_space_root_phys, 0);
+    arch.earlyDebugChar('3');
 
     var physmap_page_count: u64 = 0;
     for (mmap) |entry| {
         if (entry.type != .free and entry.type != .acpi) continue;
+        arch.earlyDebugChar('E');
 
         const end_phys = PAddr.fromInt(entry.start_paddr + entry.num_pages * paging.PAGE4K);
         var current_phys = PAddr.fromInt(entry.start_paddr);
         while (current_phys.addr < end_phys.addr) {
+            arch.earlyDebugChar('.');
             const physmap_virt = VAddr.fromPAddr(current_phys, null);
             const remaining = end_phys.addr - current_phys.addr;
             const chosen_size = blk: {
@@ -121,7 +130,9 @@ pub fn init(firmware_mmap: MMap) !void {
     bump_allocator.free_addr = bump_alloc_free_virt.addr;
     bump_allocator.end_addr = bump_alloc_end_virt.addr;
 
+    arch.earlyDebugChar('c');
     arch.dropIdentityMapping();
+    arch.earlyDebugChar('d');
     const buddy_alloc_start_virt = VAddr.fromPAddr(
         PAddr.fromInt(std.mem.alignForward(u64, smallest_addr_region.start_paddr, paging.PAGE4K)),
         null,
@@ -140,6 +151,7 @@ pub fn init(firmware_mmap: MMap) !void {
         bump_alloc_iface,
     );
     const buddy_alloc_iface = buddy_allocator.allocator();
+    arch.earlyDebugChar('e');
 
     for (mmap) |entry| {
         if (entry.type != .free) continue;
@@ -173,10 +185,21 @@ pub fn init(firmware_mmap: MMap) !void {
             useable_range = entry_range.removeOverlap(low_memory_range);
         }
 
-        buddy_allocator.addRegion(useable_range.start, useable_range.end);
+        arch.earlyDebugChar('<');
+        arch.earlyDebugHex(useable_range.start);
+        arch.earlyDebugChar('-');
+        arch.earlyDebugHex(useable_range.end);
+        arch.earlyDebugChar('>');
+        // DEBUG: cap addRegion to first 1 MB of each range on aarch64 so
+        // the Pi-KVM Debug-mode buddy free loop completes in seconds rather
+        // than minutes. Revert before shipping.
+        const max_end = @min(useable_range.end, useable_range.start + 0x100000);
+        buddy_allocator.addRegion(useable_range.start, max_end);
     }
+    arch.earlyDebugChar('f');
 
     pmm.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
+    arch.earlyDebugChar('g');
 
     vm_node_slab_bump = BumpAllocator.init(KA.vm_node_slab.start, KA.vm_node_slab.end);
     vm_tree_slab_bump = BumpAllocator.init(KA.vm_tree_slab.start, KA.vm_tree_slab.end);
@@ -187,8 +210,10 @@ pub fn init(firmware_mmap: MMap) !void {
     kvm_vm_slab_backing = BumpAllocator.init(KA.kvm_vm_slab.start, KA.kvm_vm_slab.end);
     kvm_vcpu_slab_backing = BumpAllocator.init(KA.kvm_vcpu_slab.start, KA.kvm_vcpu_slab.end);
     pmu_state_slab_backing = BumpAllocator.init(KA.pmu_state_slab.start, KA.pmu_state_slab.end);
+    arch.earlyDebugChar('i');
 
     try vmm_mod.initSlabs(vm_node_slab_bump.allocator(), vm_tree_slab_bump.allocator());
+    arch.earlyDebugChar('j');
     try device_region_mod.initSlab(device_region_slab_bump.allocator());
 
     shared.slab_allocator_instance = try shared.SharedMemoryAllocator.init(shm_slab_bump.allocator());

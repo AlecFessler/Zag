@@ -276,41 +276,95 @@ pub fn alignStack(stack_top: VAddr) VAddr {
     return VAddr.fromInt(adjusted);
 }
 
-pub inline fn kEntry(boot_info: *BootInfo, ktrampoline: *const fn (*BootInfo) callconv(cc()) noreturn) noreturn {
+/// Install an early fault handler for boot-time exception capture.
+/// Used by the bootloader to catch faults during the exitBootServices →
+/// kernel handoff window. On x86-64 this is a no-op (UEFI's exception
+/// handler is adequate); on aarch64 it installs a minimal VBAR_EL1 that
+/// dumps ESR_EL1, FAR_EL1, ELR_EL1 to the PL011 UART and halts.
+pub fn installEarlyFaultHandler() void {
     switch (builtin.cpu.arch) {
-        .x86_64 => {
-            asm volatile (
-                \\movq %[sp], %%rsp
-                \\movq %%rsp, %%rbp
-                \\movq %[arg], %%rdi
-                \\jmp *%[ktrampoline]
-                :
-                : [sp] "r" (boot_info.stack_top.addr),
-                  [arg] "r" (@intFromPtr(boot_info)),
-                  [ktrampoline] "r" (@intFromPtr(ktrampoline)),
-                : .{ .rsp = true, .rbp = true, .rdi = true }
-            );
-        },
+        .x86_64 => {},
+        .aarch64 => aarch64.early_fault.installEarlyVbar(),
+        else => unreachable,
+    }
+}
+
+/// Synchronize the instruction cache with the data cache after writing
+/// new executable code to memory. On x86-64 this is a no-op (coherent
+/// I-cache). On aarch64 the I/D caches are separate and loader code must
+/// explicitly invalidate the I-cache before fetching freshly written
+/// instructions, or stale bytes can be decoded as garbage.
+pub fn syncInstructionCache() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => asm volatile (
+            \\ic ialluis
+            \\dsb ish
+            \\isb
+            ::: .{ .memory = true }),
+        else => unreachable,
+    }
+}
+
+/// Clean + invalidate the data cache over the given byte range to the
+/// point of coherency. On x86-64 this is a no-op (coherent D-cache). On
+/// aarch64 this is required when memory is reconfigured from Normal
+/// Non-cacheable to Normal Write-Back (e.g., when the kernel installs
+/// its own MAIR_EL1 over UEFI's), otherwise stale cache lines from a
+/// prior cacheable view can shadow freshly written NC data.
+pub fn cleanInvalidateDcacheRange(start: u64, len: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
         .aarch64 => {
-            // Switch to kernel stack and jump to trampoline.
-            // MAIR is set by arch.init() (paging.setMair) once the kernel
-            // is running — until then, UEFI's MAIR is used (likely index 1
-            // = Normal NC, which is sufficient for instruction fetch and
-            // stack access).
+            // Drain any pending Normal Non-cacheable stores from the
+            // write buffer to RAM before we start cleaning the cache.
+            // Without this, NC writes may still be in flight when DC
+            // CIVAC runs, and subsequent WB reads can race past the
+            // pending writes.
+            asm volatile ("dsb sy" ::: .{ .memory = true });
+            // 64-byte cache line on Cortex-A72. Use a conservative
+            // fixed line size rather than reading CTR_EL0 here.
+            const line: u64 = 64;
+            const end = start + len;
+            var addr = start & ~(line - 1);
+            while (addr < end) : (addr += line) {
+                asm volatile ("dc civac, %[a]"
+                    :
+                    : [a] "r" (addr),
+                    : .{ .memory = true }
+                );
+            }
             asm volatile (
-                \\mov sp, %[sp]
-                \\mov x0, %[arg]
-                \\br %[target]
-                :
-                : [sp] "r" (boot_info.stack_top.addr),
-                  [arg] "r" (@intFromPtr(boot_info)),
-                  [target] "r" (@intFromPtr(ktrampoline)),
-                : .{ .x0 = true, .memory = true }
-            );
+                \\dsb sy
+                \\isb
+                ::: .{ .memory = true });
         },
         else => unreachable,
     }
-    unreachable;
+}
+
+/// Map any device MMIO the early fault handler needs to reach into the
+/// kernel page tables. On x86-64 this is a no-op (IO is via port
+/// instructions, no translation needed). On aarch64 this identity-maps
+/// the PL011 UART so the early fault handler can dump registers even
+/// after UEFI's TTBR0 identity mapping has been flushed or dropped.
+pub fn mapEarlyDebugDevices(
+    addr_space_root: VAddr,
+    allocator: std.mem.Allocator,
+) !void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => try aarch64.early_fault.mapUart(addr_space_root, allocator),
+        else => unreachable,
+    }
+}
+
+/// Called by the kernel entry point after the bootloader has already set SP
+/// to the kernel stack (via switchStackAndCall). Jumps to the trampoline
+/// with boot_info as the first argument.
+pub inline fn kEntry(boot_info: *BootInfo, ktrampoline: *const fn (*BootInfo) callconv(cc()) noreturn) noreturn {
+    // The bootloader already switched SP. Just tail-call the trampoline.
+    ktrampoline(boot_info);
 }
 
 pub fn cc() std.builtin.CallingConvention {
@@ -319,6 +373,57 @@ pub fn cc() std.builtin.CallingConvention {
         .aarch64 => .{ .aarch64_aapcs = .{} },
         else => unreachable,
     };
+}
+
+/// Switch SP to a new stack and call a function. Used by the bootloader to
+/// switch from the UEFI stack (which may be invalid after exitBootServices)
+/// to the kernel stack before entering the kernel.
+pub inline fn switchStackAndCall(stack_top: VAddr, arg: u64, entry: u64) noreturn {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            asm volatile (
+                \\movq %[sp], %%rsp
+                \\movq %%rsp, %%rbp
+                \\movq %[arg], %%rdi
+                \\jmp *%[entry]
+                :
+                : [sp] "r" (stack_top.addr),
+                  [arg] "r" (arg),
+                  [entry] "r" (entry),
+                : .{ .rsp = true, .rbp = true, .rdi = true }
+            );
+        },
+        .aarch64 => {
+            // Follow Linux arm64's rule: MAIR_EL1 is only ever written
+            // with the MMU disabled. We stay on UEFI's MAIR here —
+            // changing it while the MMU is on and stale WB cache lines
+            // may exist at our physical pages produces "constrained
+            // unpredictable" reads on Cortex-A72 KVM (head.S:85-131,
+            // proc.S:__cpu_setup). Our kernel-side page tables use
+            // attr_indx=1 which under UEFI's MAIR is Normal NC — that
+            // is slower but correct. If/when the kernel needs Write-
+            // Back performance, it must perform the proper MMU-off →
+            // clean → MAIR write → MMU-on cycle from its own code.
+            //
+            // Mask IRQ/FIQ/SError so no stale firmware interrupt can
+            // reach its VBAR between here and the kernel installing
+            // its real exception vectors.
+            asm volatile (
+                \\msr daifset, #0x7
+                \\isb
+                \\mov sp, %[sp]
+                \\mov x0, %[arg]
+                \\br %[entry]
+                :
+                : [sp] "r" (stack_top.addr),
+                  [arg] "r" (arg),
+                  [entry] "r" (entry),
+                : .{ .x0 = true, .memory = true }
+            );
+        },
+        else => unreachable,
+    }
+    unreachable;
 }
 
 pub fn init() void {
@@ -469,12 +574,24 @@ pub inline fn earlyDebugChar(c: u8) void {
             );
         },
         .aarch64 => {
-            // PL011 at physical 0x09000000 via TTBR0 identity mapping.
-            // Only works before dropIdentityMapping() in memory.init.
+            // PL011 at physical 0x09000000 via TTBR0 identity mapping
+            // (UEFI firmware) or via mapEarlyDebugDevices() which
+            // identity-maps it into our kernel page table too.
             const uart: *volatile u32 = @ptrFromInt(0x09000000);
             uart.* = c;
         },
         else => unreachable,
+    }
+}
+
+pub fn earlyDebugHex(v: u64) void {
+    var shift: u6 = 60;
+    while (true) {
+        const nibble: u8 = @intCast((v >> shift) & 0xF);
+        const ch: u8 = if (nibble < 10) '0' + nibble else 'A' + (nibble - 10);
+        earlyDebugChar(ch);
+        if (shift == 0) break;
+        shift -= 4;
     }
 }
 
@@ -484,7 +601,10 @@ pub inline fn earlyDebugChar(c: u8) void {
 pub fn enableKernelTranslation() void {
     switch (builtin.cpu.arch) {
         .x86_64 => {},
-        .aarch64 => aarch64.paging.enableKernelTranslation(),
+        .aarch64 => {
+            aarch64.paging.initMairIndices();
+            aarch64.paging.enableKernelTranslation();
+        },
         else => unreachable,
     }
 }

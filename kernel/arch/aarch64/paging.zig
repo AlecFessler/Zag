@@ -161,10 +161,34 @@ fn l0Idx(virt: VAddr) u9 {
     return @truncate(virt.addr >> l0sh);
 }
 
-/// MAIR_EL1 attribute indices (ARM ARM D13.2.97).
-/// Index 0 = Device-nGnRnE (0x00), Index 1 = Normal WB cacheable (0xFF).
-const mair_device: u3 = 0;
-const mair_normal: u3 = 1;
+/// MAIR_EL1 attribute indices resolved at boot against whatever
+/// MAIR layout the firmware/UEFI left in place. We cannot safely
+/// rewrite MAIR_EL1 under a live MMU (Linux arm64 head.S / proc.S
+/// only ever writes MAIR with the MMU disabled), so instead we
+/// walk the live MAIR, find the index holding Normal WB (0xFF) and
+/// the index holding Device-nGnRnE (0x00), and cache them here.
+/// Page table entries built after `initMairIndices` use these
+/// firmware-matched indices.
+///
+/// Default values are a fallback only — `initMairIndices()` must
+/// be called before any mapping is built.
+/// ARM ARM D13.2.97 — MAIR_EL1 layout.
+var mair_device: u3 = 0;
+var mair_normal: u3 = 1;
+
+pub fn initMairIndices() void {
+    var mair: u64 = undefined;
+    asm volatile ("mrs %[v], mair_el1"
+        : [v] "=r" (mair),
+    );
+    var i: u6 = 0;
+    while (i < 8) {
+        const attr: u8 = @truncate((mair >> (i * 8)) & 0xFF);
+        if (attr == 0xFF) mair_normal = @intCast(i);
+        if (attr == 0x00) mair_device = @intCast(i);
+        i += 1;
+    }
+}
 
 /// Return the physical address of the current user page table from TTBR0_EL1.
 ///
@@ -689,9 +713,7 @@ pub fn enableKernelTranslation() void {
 }
 
 /// Set MAIR_EL1 to our expected attribute configuration and flush TLB.
-/// Must be called after UEFI boot services have exited, since changing MAIR
-/// invalidates the meaning of attr_indx in all existing PTEs (including
-/// UEFI's identity mapping in TTBR0).
+/// Called from arch.init() after the kernel is running on its own stack.
 ///
 /// MAIR_EL1 attribute indices (ARM ARM D13.2.97):
 ///   Index 0 = Device-nGnRnE (0x00)

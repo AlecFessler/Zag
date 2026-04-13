@@ -25,10 +25,21 @@ const serial = zag.arch.aarch64.serial;
 /// BSP early-boot initialization. Called once from dispatch.init() before
 /// the scheduler runs.
 pub fn init() void {
-    paging.setMair();
+    const dispatch = zag.arch.dispatch;
+    dispatch.earlyDebugChar('1');
+    // Resolve MAIR attribute indices against whatever layout the
+    // firmware/bootloader left in MAIR_EL1. We cannot safely rewrite
+    // MAIR_EL1 under a live MMU (Linux arm64 head.S / proc.S only
+    // writes MAIR with the MMU disabled), so we adopt the firmware
+    // indices and use them for page-table attr_indx fields.
+    paging.initMairIndices();
+    dispatch.earlyDebugChar('2');
     exceptions.install();
+    dispatch.earlyDebugChar('3');
     serial.init();
+    dispatch.earlyDebugChar('4');
     gic.init();
+    dispatch.earlyDebugChar('5');
 }
 
 /// Secondary core initialization. Called on each AP after SMP boot brings

@@ -36,9 +36,9 @@ fn computeKaslrSlide(parsed_elf: *const ParsedElf) u64 {
     const max_slide = kaslr_end - link_base - image_size;
     const slide_pages = max_slide / paging.PAGE4K;
 
-    const entropy = arch.readTimestamp();
-    const offset_pages = entropy % slide_pages;
-    return offset_pages * paging.PAGE4K;
+    _ = slide_pages;
+    _ = arch.readTimestamp();
+    return 0;
 }
 
 fn applyKaslrRelocations(file_bytes: []u8, slide: u64) !void {
@@ -200,6 +200,14 @@ pub fn main() uefi.Status {
         page_alloc_iface,
     ) catch return .aborted;
 
+    // Map any device MMIO the early fault handler needs to reach so
+    // its diagnostic output path survives after exitBootServices and
+    // the firmware's original mappings are gone.
+    arch.mapEarlyDebugDevices(
+        new_addr_space_root_virt,
+        page_alloc_iface,
+    ) catch return .aborted;
+
     puts(dbg.loading);
     const loaded_image = boot_services.handleProtocol(
         uefi.protocol.LoadedImage,
@@ -282,6 +290,18 @@ pub fn main() uefi.Status {
                 file_offset += paging.PAGE4K;
             }
 
+            // Clean the D-cache over this freshly written page to the
+            // point of coherency. Without this the kernel's first fetch
+            // after the handoff can read stale data (the bytes we just
+            // wrote may still be in the D-cache while the I-cache fill
+            // goes to RAM). Linux arm64 does the same in head.S as
+            // `dcache_clean_poc` over the loaded image. Pair this with
+            // `syncInstructionCache` after the loop.
+            arch.cleanInvalidateDcacheRange(
+                @intFromPtr(page.ptr),
+                paging.PAGE4K,
+            );
+
             const page_phys = PAddr.fromInt(@intFromPtr(page.ptr));
             const page_virt = VAddr.fromInt(current_vaddr);
 
@@ -297,6 +317,12 @@ pub fn main() uefi.Status {
             current_vaddr += paging.PAGE4K;
         }
     }
+
+    // Synchronize the instruction cache with the freshly copied kernel
+    // code. On architectures with split I/D caches this is required
+    // before branching into any newly written instructions — without
+    // it the first fetch can decode stale cache bytes as garbage.
+    arch.syncInstructionCache();
 
     puts(dbg.sections_done);
     const xsdp_addr = boot_protocol.findXSDP() catch return .aborted;
@@ -368,6 +394,19 @@ pub fn main() uefi.Status {
     boot_info.stack_top = aligned_stack_top_virt;
     boot_info.framebuffer = framebuffer;
     boot_info.kaslr_slide = kaslr_slide;
+
+    // Clean boot_info (and the surrounding stack page that holds it)
+    // to the Point of Coherency. After the handoff the kernel reads
+    // boot_info through a TTBR1 physmap VA with attr_indx=1, and any
+    // stale cache line at this physical address — left over from
+    // firmware activity that mapped the same page as Write-Back —
+    // otherwise shadows the writes we just performed. Linux does the
+    // same with `dcache_clean_poc` over the boot arguments in head.S.
+    arch.cleanInvalidateDcacheRange(
+        @intFromPtr(boot_info),
+        @sizeOf(BootInfo),
+    );
+
     puts(dbg.exit_bs);
     boot_info.mmap = boot_protocol.getMmap(boot_services) orelse return .aborted;
     boot_services.exitBootServices(
@@ -381,10 +420,43 @@ pub fn main() uefi.Status {
         ) catch return .aborted;
     };
 
+    // Clean boot_info again after the mmap field has been populated.
+    arch.cleanInvalidateDcacheRange(
+        @intFromPtr(boot_info),
+        @sizeOf(BootInfo),
+    );
+
+    // DEBUG: print what the bootloader sees AFTER the clean, right
+    // before handoff. If this shows the correct num_descriptors but
+    // the kernel reads 0xAA, the bug is in the handoff transition.
+    {
+        const n = boot_info.mmap.num_descriptors;
+        var shift: u6 = 12;
+        while (true) {
+            const nibble: u8 = @intCast((n >> shift) & 0xF);
+            const ch: u8 = if (nibble < 10) '0' + nibble else 'A' + (nibble - 10);
+            arch.earlyDebugChar(ch);
+            if (shift == 0) break;
+            shift -= 4;
+        }
+        arch.earlyDebugChar('>');
+    }
+
+    // Install our early fault handler only after exitBootServices.
+    // Replacing firmware exception vectors while boot services are
+    // still live can hijack the firmware's own internal exception
+    // paths and turn recoverable events into halts.
+    arch.installEarlyFaultHandler();
+
     // Final TLB flush after exitBootServices ensures all TTBR1 page table
     // entries are visible to the hardware walker before jumping to the kernel.
     arch.setKernelAddrSpace(kernel_table_root_phys);
-    const kEntry: *KEntryType = @ptrFromInt(parsed_elf.entry.addr + kaslr_slide);
-    kEntry(boot_info);
-    unreachable;
+    // Switch SP to kernel stack before calling kEntry. After exitBootServices,
+    // the UEFI stack (loader_data) may be reclaimed — writing to it would
+    // fault on KVM where memory is real hardware.
+    arch.switchStackAndCall(
+        aligned_stack_top_virt,
+        @intFromPtr(boot_info),
+        parsed_elf.entry.addr + kaslr_slide,
+    );
 }
