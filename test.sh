@@ -20,6 +20,7 @@ Targets:
   router          Run router integration tests (pytest)
   linux           Boot Linux guest in hyprvOS, verify shell prompt
   pre-commit      Run kernel + linux + router (gate before commit)
+  perf            Run kernel performance benchmarks (sequential)
   kernel-fuzz     Run all kernel fuzzers (buddy, heap, vmm, rbt)
   router-fuzz     Run router packet processing fuzzer
   all             Run kernel + linux + router tests (default)
@@ -186,6 +187,12 @@ run_router_tests() {
     "$SCRIPT_DIR/routerOS/tests/.venv/bin/pytest" "${pytest_args[@]}"
 }
 
+run_perf_tests() {
+    echo "=== Performance Tests ==="
+    clean_nvvars
+    bash "$SCRIPT_DIR/kernel/tests/run_perf.sh"
+}
+
 run_kernel_fuzzers() {
     local fuzz_args=("--" "-s" "$SEED" "-i" "$ITERATIONS")
     local fuzzers=(buddy_allocator heap_allocator vmm red_black_tree)
@@ -212,6 +219,9 @@ case "$TARGET" in
         ;;
     linux)
         run_linux_boot_test
+        ;;
+    perf)
+        run_perf_tests
         ;;
     kernel-fuzz)
         run_kernel_fuzzers

@@ -202,6 +202,8 @@ pub fn build(b: *std.Build) void {
     const child_try_sys_cpu_power_bin = buildChild(b, target, lib_mod, "child_try_sys_cpu_power", "children/child_try_sys_cpu_power.zig");
     const child_vbar_non_mov_bin = buildChild(b, target, lib_mod, "child_vbar_non_mov", "children/child_vbar_non_mov.zig");
     const child_vbar_oob_read_bin = buildChild(b, target, lib_mod, "child_vbar_oob_read", "children/child_vbar_oob_read.zig");
+    const child_perf_ipc_echo_bin = buildChild(b, target, lib_mod, "child_perf_ipc_echo", "children/child_perf_ipc_echo.zig");
+    const child_perf_workload_bin = buildChild(b, target, lib_mod, "child_perf_workload", "children/child_perf_workload.zig");
 
     const embedded_wf = b.addWriteFiles();
     _ = embedded_wf.addCopyFile(child_exit_bin, "child_exit.elf");
@@ -345,6 +347,8 @@ pub fn build(b: *std.Build) void {
     _ = embedded_wf.addCopyFile(child_try_sys_cpu_power_bin, "child_try_sys_cpu_power.elf");
     _ = embedded_wf.addCopyFile(child_vbar_non_mov_bin, "child_vbar_non_mov.elf");
     _ = embedded_wf.addCopyFile(child_vbar_oob_read_bin, "child_vbar_oob_read.elf");
+    _ = embedded_wf.addCopyFile(child_perf_ipc_echo_bin, "child_perf_ipc_echo.elf");
+    _ = embedded_wf.addCopyFile(child_perf_workload_bin, "child_perf_workload.elf");
     const embed_src = embedded_wf.add("embedded_children.zig",
         \\pub const child_exit = @embedFile("child_exit.elf");
         \\pub const child_shm_counter = @embedFile("child_shm_counter.elf");
@@ -487,6 +491,8 @@ pub fn build(b: *std.Build) void {
         \\pub const child_try_sys_cpu_power = @embedFile("child_try_sys_cpu_power.elf");
         \\pub const child_vbar_non_mov = @embedFile("child_vbar_non_mov.elf");
         \\pub const child_vbar_oob_read = @embedFile("child_vbar_oob_read.elf");
+        \\pub const child_perf_ipc_echo = @embedFile("child_perf_ipc_echo.elf");
+        \\pub const child_perf_workload = @embedFile("child_perf_workload.elf");
         \\
     );
 
@@ -505,7 +511,8 @@ pub fn build(b: *std.Build) void {
     while (it.next() catch @panic("Failed to iterate tests/")) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
-        if (!std.mem.startsWith(u8, entry.name, "s")) continue;
+        if (!std.mem.startsWith(u8, entry.name, "s") and
+            !std.mem.startsWith(u8, entry.name, "perf_")) continue;
 
         const stem = entry.name[0 .. entry.name.len - 4];
 
