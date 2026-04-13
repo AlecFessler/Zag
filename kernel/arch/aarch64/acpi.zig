@@ -77,6 +77,10 @@ const Gicc = struct {
     cpu_interface_number: u32,
     acpi_processor_uid: u32,
     flags: u32,
+    /// Physical base address of the GICv2 CPU interface registers (GICC).
+    /// Zero on GICv3 systems (where the CPU interface is accessed via
+    /// system registers rather than MMIO). ACPI 6.5 Table 5-45 offset 32.
+    physical_base_address: u64,
     mpidr: u64,
 };
 
@@ -357,6 +361,7 @@ pub const Xsdt = packed struct {
 ///   - offset 4:  u32 CPU Interface Number  (p + 2)
 ///   - offset 8:  u32 ACPI Processor UID    (p + 6)
 ///   - offset 12: u32 Flags (bit 0 = enabled) (p + 10)
+///   - offset 32: u64 Physical Base Address (GICv2 GICC MMIO) (p + 30)
 ///   - offset 68: u64 MPIDR                 (p + 66)
 ///
 /// MADT GICD (type 0x0C, 24 bytes): ACPI 6.5, Table 5-47.
@@ -373,6 +378,7 @@ pub fn decodeMadt(e: Madt.Entry) ?AnyMadt {
                 .cpu_interface_number = std.mem.readInt(u32, @ptrCast(p.ptr + 2), .little),
                 .acpi_processor_uid = std.mem.readInt(u32, @ptrCast(p.ptr + 6), .little),
                 .flags = std.mem.readInt(u32, @ptrCast(p.ptr + 10), .little),
+                .physical_base_address = std.mem.readInt(u64, @ptrCast(p.ptr + 30), .little),
                 .mpidr = std.mem.readInt(u64, @ptrCast(p.ptr + 66), .little),
             },
         },
@@ -500,11 +506,14 @@ fn parseMadt(madt_virt: VAddr) !void {
     const madt = Madt.fromVAddr(madt_virt);
     try madt.validate();
 
-    // First pass: count enabled cores and store MPIDR values.
-    // This must happen before addRedistributor since GIC uses core_count
-    // as the redistributor index.
+    // First pass: count enabled cores, store MPIDR values, and capture
+    // the GICv2 GICC CPU-interface MMIO base if present. On GICv3 the
+    // per-GICC physical_base_address field is zero because the CPU
+    // interface is accessed via system registers, so we only record it
+    // when non-zero.
     var madt_iter = madt.iter();
     var core_count: u64 = 0;
+    var gicc_mmio_phys: u64 = 0;
 
     while (madt_iter.next()) |e| {
         const entry = decodeMadt(e) orelse continue;
@@ -513,9 +522,18 @@ fn parseMadt(madt_virt: VAddr) !void {
                 if (gicc_entry.flags & 0x1 == 0) continue;
                 smp.setMpidr(@intCast(core_count), gicc_entry.mpidr);
                 core_count += 1;
+                if (gicc_mmio_phys == 0 and gicc_entry.physical_base_address != 0) {
+                    gicc_mmio_phys = gicc_entry.physical_base_address;
+                }
             },
             else => {},
         }
+    }
+
+    if (gicc_mmio_phys != 0) {
+        // GICv2 CPU interface is spec'd as an 8KB region (IHI 0048B §5.3).
+        const gicc_va = try mapDeviceRange(gicc_mmio_phys, 8 * 1024);
+        gic.setGiccBase(gicc_va);
     }
 
     // Second pass: extract distributor and redistributor base addresses.
