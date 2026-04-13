@@ -3,6 +3,7 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const errors = zag.syscall.errors;
+const kprof = zag.kprof.trace_id;
 const sched = zag.sched.scheduler;
 
 const ArchCpuContext = arch.ArchCpuContext;
@@ -43,6 +44,8 @@ pub fn sysVmVcpuGetState(thread_handle: u64, state_ptr: u64) i64 {
 }
 
 pub fn sysVmVcpuRun(thread_handle: u64) i64 {
+    kprof.enter(.sys_vm_vcpu_run);
+    defer kprof.exit(.sys_vm_vcpu_run);
     const proc = sched.currentProc();
     return arch.kvmVcpuRun(proc, thread_handle);
 }

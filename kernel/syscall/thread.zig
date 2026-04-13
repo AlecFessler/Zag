@@ -5,6 +5,7 @@ const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const errors = zag.syscall.errors;
 const futex = zag.proc.futex;
+const kprof = zag.kprof.trace_id;
 const process_mod = zag.proc.process;
 const sched = zag.sched.scheduler;
 
@@ -27,6 +28,8 @@ const E_OK = errors.E_OK;
 const E_PERM = errors.E_PERM;
 
 pub fn sysThreadCreate(entry_addr: u64, arg: u64, num_stack_pages_u64: u64) i64 {
+    kprof.enter(.sys_thread_create);
+    defer kprof.exit(.sys_thread_create);
     if (num_stack_pages_u64 == 0 or num_stack_pages_u64 > std.math.maxInt(u32)) return E_INVAL;
     const num_stack_pages: u32 = @intCast(num_stack_pages_u64);
 
@@ -67,6 +70,8 @@ pub fn sysThreadCreate(entry_addr: u64, arg: u64, num_stack_pages_u64: u64) i64 
 }
 
 pub fn sysThreadExit() noreturn {
+    kprof.enter(.sys_thread_exit);
+    defer kprof.exit(.sys_thread_exit);
     const thread = sched.currentThread().?;
     thread.state = .exited;
     arch.enableInterrupts();
@@ -173,6 +178,8 @@ pub fn sysThreadSelf() i64 {
 }
 
 pub fn sysThreadSuspend(thread_handle: u64) i64 {
+    kprof.enter(.sys_thread_suspend);
+    defer kprof.exit(.sys_thread_suspend);
     const proc = sched.currentProc();
     const pinned = proc.acquireThreadRef(thread_handle) orelse return E_BADCAP;
     const target = pinned.thread;
@@ -244,6 +251,8 @@ pub fn sysThreadSuspend(thread_handle: u64) i64 {
 }
 
 pub fn sysThreadResume(thread_handle: u64) i64 {
+    kprof.enter(.sys_thread_resume);
+    defer kprof.exit(.sys_thread_resume);
     const proc = sched.currentProc();
     const pinned = proc.acquireThreadRef(thread_handle) orelse return E_BADCAP;
     const target = pinned.thread;
@@ -267,6 +276,8 @@ pub fn sysThreadResume(thread_handle: u64) i64 {
 }
 
 pub fn sysThreadKill(thread_handle: u64) i64 {
+    kprof.enter(.sys_thread_kill);
+    defer kprof.exit(.sys_thread_kill);
     const proc = sched.currentProc();
     const pinned = proc.acquireThreadRef(thread_handle) orelse return E_BADCAP;
     const target = pinned.thread;

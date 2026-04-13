@@ -3,6 +3,7 @@ const zag = @import("zag");
 
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
+const kprof = zag.kprof.trace_id;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
@@ -54,6 +55,9 @@ fn guardPageReason(proc: anytype, node_start: u64) FaultReason {
 }
 
 pub fn handlePageFault(fault: *const PageFaultContext) void {
+    kprof.enter(.handle_page_fault);
+    defer kprof.exit(.handle_page_fault);
+    kprof.point(.handle_page_fault, fault.faulting_address);
     const faulting_virt = VAddr.fromInt(fault.faulting_address);
     const is_kernel_privilege = fault.is_kernel_privilege;
     const is_user_va = faulting_virt.addr < address.AddrSpacePartition.user.end;

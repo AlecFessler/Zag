@@ -669,6 +669,14 @@ pub fn coreID() u64 {
     };
 }
 
+pub inline fn rdtscp() u64 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.rdtscp(),
+        .aarch64 => aarch64.cpu.readCntvct(),
+        else => unreachable,
+    };
+}
+
 pub fn copyKernelMappings(root: VAddr) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.paging.copyKernelMappings(root),

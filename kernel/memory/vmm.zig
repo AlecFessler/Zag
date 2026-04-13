@@ -3,6 +3,7 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const containers = zag.utils.containers;
+const kprof = zag.kprof.trace_id;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const slab_mod = zag.memory.allocators.slab;
@@ -1016,6 +1017,8 @@ fn hasCommittedPages(tree: *VmTree, root: PAddr, range_start: VAddr, range_end_a
 }
 
 fn removeRange(tree: *VmTree, range_start: VAddr, range_end_addr: u64) !void {
+    kprof.enter(.vmm_remove_range);
+    defer kprof.exit(.vmm_remove_range);
     var to_remove: [64]*VmNode = undefined;
     var count: usize = 0;
 

@@ -7,6 +7,7 @@ const cpu = zag.arch.x64.cpu;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
+const kprof = zag.kprof.trace_id;
 const mmio_decode = zag.arch.x64.mmio_decode;
 const scheduler = zag.sched.scheduler;
 
@@ -204,6 +205,7 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         @panic("Page tables have reserved bits set (RSVD).");
     }
     const faulting_addr = cpu.readCr2();
+    kprof.point(.page_fault_hw, faulting_addr);
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
     const from_user = (ctx.cs & ring_3) == ring_3;
 

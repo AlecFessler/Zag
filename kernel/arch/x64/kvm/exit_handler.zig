@@ -3,6 +3,7 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const kprof = zag.kprof.trace_id;
 const vm_hw = zag.arch.x64.vm;
 const kvm = zag.arch.x64.kvm;
 const exit_box = kvm.exit_box;
@@ -20,6 +21,9 @@ const VCpu = vcpu_mod.VCpu;
 /// If the exit requires VMM involvement, snapshots state, enqueues on the
 /// exit box, and transitions the vCPU to .exited state.
 pub fn handleExit(vcpu_obj: *VCpu, exit_info: vm_hw.VmExitInfo) void {
+    kprof.enter(.vm_exit);
+    defer kprof.exit(.vm_exit);
+    kprof.point(.vm_exit, @intFromEnum(std.meta.activeTag(exit_info)));
     const vm_obj = vcpu_obj.vm;
 
     // Try kernel-handled exits first

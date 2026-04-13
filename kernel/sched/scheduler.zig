@@ -3,6 +3,7 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const futex = zag.proc.futex;
+const kprof = zag.kprof.trace_id;
 const memory_init = zag.memory.init;
 const process_mod = zag.proc.process;
 const thread_mod = zag.sched.thread;
@@ -82,6 +83,8 @@ pub fn coreRunning(thread: *Thread) ?u64 {
 /// thread via `switchTo`. The iret at the end of `switchTo` resumes the
 /// incoming thread with its counters already running.
 inline fn switchToWithPmu(outgoing: *Thread, next: *Thread) void {
+    kprof.enter(.sched_switch_pmu);
+    defer kprof.exit(.sched_switch_pmu);
     if (outgoing.pmu_state) |st| arch.pmuSave(st);
     if (next.pmu_state) |st| arch.pmuRestore(st);
     arch.switchTo(next);
@@ -90,6 +93,7 @@ inline fn switchToWithPmu(outgoing: *Thread, next: *Thread) void {
 /// Remove `thread` from any core's run queue. Used when a remote thread is
 /// killed while .ready (so we can deinit it without leaving a dangling pointer).
 pub fn removeFromAnyRunQueue(thread: *Thread) void {
+    kprof.point(.sched_remove_run_queue, 0);
     const count = arch.coreCount();
     var i: u64 = 0;
     while (i < count) {
@@ -137,6 +141,7 @@ pub const SchedInterruptContext = struct {
 };
 
 fn armSchedTimer(state: *PerCoreState, delta_ns: u64) void {
+    kprof.point(.sched_arm_timer, delta_ns);
     state.timer.armInterruptTimer(delta_ns);
 }
 
@@ -213,6 +218,8 @@ fn peekHighestStealable(pq: *const ThreadPriorityQueue, core_id: u6) ?*Thread {
 /// Attempt to steal a thread from another core's run queue.
 /// Called when the local run queue is empty. Returns the stolen thread or null.
 fn tryStealWork(my_core_id: u64) ?*Thread {
+    kprof.enter(.sched_try_steal);
+    defer kprof.exit(.sched_try_steal);
     const count = arch.coreCount();
     const pinned = pinned_cores.load(.acquire);
 
@@ -263,6 +270,7 @@ fn tryStealWork(my_core_id: u64) ?*Thread {
 }
 
 pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
+    kprof.point(.sched_timer_tick, 0);
     const core_id = arch.coreID();
     const state = &core_states[core_id];
 
@@ -452,6 +460,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
 }
 
 pub fn yield() void {
+    kprof.point(.sched_yield, 0);
     arch.triggerSchedulerInterruptSelf();
 }
 
@@ -462,6 +471,8 @@ pub fn yield() void {
 /// - At least one core must remain unpinned for preemptive scheduling
 /// Returns 0 on success, negative error code on failure.
 pub fn pinExclusive(thread: *Thread) i64 {
+    kprof.enter(.sched_pin_exclusive);
+    defer kprof.exit(.sched_pin_exclusive);
     const affinity = thread.core_affinity orelse return -1; // E_INVAL: no affinity set
     // Must be exactly one core (power of 2)
     if (affinity == 0 or (affinity & (affinity - 1)) != 0) return -1; // E_INVAL: not single-core
@@ -559,6 +570,8 @@ fn migrateToEligibleCore(thread: *Thread, exclude_core: u64) void {
 
 /// Unpin a previously pinned thread, restoring preemptive scheduling on its core.
 pub fn unpinExclusive(thread: *Thread) i64 {
+    kprof.enter(.sched_unpin_exclusive);
+    defer kprof.exit(.sched_unpin_exclusive);
     if (!thread.pinned_exclusive) return -1;
     const affinity = thread.core_affinity orelse return -1;
     const core_bit = affinity;
@@ -573,6 +586,8 @@ pub fn unpinExclusive(thread: *Thread) i64 {
 /// Unpin by core_id — called from revoke_perm on a core_pin handle.
 /// Restores the thread's pre-pin priority and affinity.
 pub fn unpinByRevoke(core_id: u64) void {
+    kprof.enter(.sched_unpin_revoke);
+    defer kprof.exit(.sched_unpin_revoke);
     if (core_id >= MAX_CORES) return;
     const state = &core_states[core_id];
     if (state.pinned_thread) |pt| {
@@ -587,6 +602,7 @@ pub fn unpinByRevoke(core_id: u64) void {
 }
 
 pub fn enqueueOnCore(core_index: u64, thread: *Thread) void {
+    kprof.point(.sched_enqueue, core_index);
     var target = core_index;
 
     // If the target core is pinned and this isn't the pinned thread, redirect
@@ -653,6 +669,8 @@ fn pickCoreForThread(thread: *Thread, current_core: u64) ?u64 {
 /// The caller must have already set the current thread's state and saved ctx.
 /// Does NOT return to the caller — switches stack and jumps to the next thread.
 pub fn switchToNextReady() noreturn {
+    kprof.enter(.sched_switch);
+    defer kprof.exit(.sched_switch);
     const core_id = arch.coreID();
     const state = &core_states[core_id];
     // Outgoing is whoever was running on this core before the caller
@@ -700,6 +718,8 @@ pub fn switchToNextReady() noreturn {
 /// Returns E_BUSY (-11) if all cores in target's affinity are pinned.
 /// Otherwise does NOT return — switches stack.
 pub fn switchToThread(current: *Thread, target: *Thread, ctx: *ArchCpuContext, enqueue_current: bool) i64 {
+    kprof.enter(.sched_switch_direct);
+    defer kprof.exit(.sched_switch_direct);
     current.ctx = ctx;
     current.on_cpu.store(false, .release);
 

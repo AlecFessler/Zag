@@ -5,6 +5,7 @@ const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const elf = std.elf;
 const futex = zag.proc.futex;
+const kprof = zag.kprof.trace_id;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
@@ -1491,6 +1492,8 @@ const ElfLoadResult = struct {
 const MAX_ELF_MAPPED_SIZE: u64 = 64 * 1024 * 1024;
 
 fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResult {
+    kprof.enter(.proc_load_elf);
+    defer kprof.exit(.proc_load_elf);
     if (elf_binary.len < @sizeOf(elf.Elf64_Ehdr)) return error.InvalidElf;
 
     const ehdr = std.mem.bytesAsValue(elf.Elf64_Ehdr, elf_binary[0..@sizeOf(elf.Elf64_Ehdr)]);
@@ -1714,6 +1717,8 @@ fn findRelaSection(elf_binary: []const u8, ehdr: *align(1) const elf.Elf64_Ehdr)
 }
 
 fn applyRelocations(proc: *Process, aslr_base: u64, elf_binary: []const u8, rela_offset: u64, rela_size: u64) !void {
+    kprof.enter(.proc_apply_relocations);
+    defer kprof.exit(.proc_apply_relocations);
     const entry_size = @sizeOf(elf.Elf64_Rela);
     const num_entries = rela_size / entry_size;
 

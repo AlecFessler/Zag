@@ -4,6 +4,7 @@ const zag = @import("zag");
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const errors = zag.syscall.errors;
+const kprof_dump = zag.kprof.dump;
 const paging = zag.memory.paging;
 const sched = zag.sched.scheduler;
 
@@ -82,6 +83,11 @@ pub fn sysSysPower(action_raw: u64) i64 {
     if (!self_entry.processRights().power) return E_PERM;
 
     const action = std.meta.intToEnum(PowerAction, @as(u8, @truncate(action_raw))) catch return E_INVAL;
+    // Kernel profiling: root exiting the system is our cue to flush the
+    // trace/sample log to serial before the machine powers off.
+    if (action == .shutdown or action == .reboot) {
+        kprof_dump.end(.root_exit);
+    }
     return arch.powerAction(action);
 }
 

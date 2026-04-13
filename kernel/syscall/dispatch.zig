@@ -6,6 +6,7 @@ const errors = zag.syscall.errors;
 const fault = zag.syscall.fault;
 const futex = zag.syscall.futex;
 const ipc = zag.syscall.ipc;
+const kprof = zag.kprof.trace_id;
 const memory = zag.syscall.memory;
 const pmu = zag.syscall.pmu;
 const process = zag.syscall.process;
@@ -92,6 +93,8 @@ pub const SyscallNum = enum(u64) {
 };
 
 pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
+    kprof.enter(.syscall_dispatch);
+    defer kprof.exit(.syscall_dispatch);
     const args = zag.arch.dispatch.getSyscallArgs(ctx);
     const arg0 = args.arg0;
     const arg1 = args.arg1;

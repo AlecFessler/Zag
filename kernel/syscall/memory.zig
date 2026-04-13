@@ -3,6 +3,7 @@ const zag = @import("zag");
 
 const address = zag.memory.address;
 const errors = zag.syscall.errors;
+const kprof = zag.kprof.trace_id;
 const paging = zag.memory.paging;
 const sched = zag.sched.scheduler;
 
@@ -25,6 +26,8 @@ const E_PERM = errors.E_PERM;
 const SyscallResult = zag.syscall.dispatch.SyscallResult;
 
 pub fn sysMemReserve(hint: u64, size: u64, max_perms_bits: u64) SyscallResult {
+    kprof.enter(.sys_mem_reserve);
+    defer kprof.exit(.sys_mem_reserve);
     if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) return .{ .ret = E_INVAL };
 
     // Bound hint + size up front so `VirtualMemoryManager.reserve` can
@@ -191,6 +194,8 @@ pub fn sysMemShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
 }
 
 pub fn sysMemUnmap(vm_handle: u64, offset: u64, size: u64) i64 {
+    kprof.enter(.sys_mem_unmap);
+    defer kprof.exit(.sys_mem_unmap);
     if (!std.mem.isAligned(offset, paging.PAGE4K)) return E_INVAL;
     if (size == 0 or !std.mem.isAligned(size, paging.PAGE4K)) return E_INVAL;
 

@@ -4,6 +4,7 @@ const zag = @import("zag");
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const errors = zag.syscall.errors;
+const kprof = zag.kprof.trace_id;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const process_mod = zag.proc.process;
@@ -29,6 +30,8 @@ const E_OK = errors.E_OK;
 const E_PERM = errors.E_PERM;
 
 pub fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_arg: u64, max_priority_arg: u64) i64 {
+    kprof.enter(.sys_proc_create);
+    defer kprof.exit(.sys_proc_create);
     if (elf_len == 0) return E_INVAL;
     if (!address.AddrSpacePartition.user.contains(elf_ptr)) return E_BADADDR;
     const elf_end = std.math.add(u64, elf_ptr, elf_len) catch return E_BADADDR;
@@ -118,6 +121,8 @@ pub fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_a
 }
 
 pub fn sysRevokePerm(handle: u64) i64 {
+    kprof.enter(.sys_revoke_perm);
+    defer kprof.exit(.sys_revoke_perm);
     if (handle == 0) return E_INVAL;
 
     const proc = sched.currentProc();

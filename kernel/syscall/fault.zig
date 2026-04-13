@@ -5,6 +5,7 @@ const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const errors = zag.syscall.errors;
 const futex = zag.proc.futex;
+const kprof = zag.kprof.trace_id;
 const paging = zag.memory.paging;
 const process_mod = zag.proc.process;
 const sched = zag.sched.scheduler;
@@ -136,6 +137,8 @@ fn faultRecvValidateBuf(proc: *Process, buf_ptr: u64) i64 {
 }
 
 pub fn sysFaultRecv(ctx: *ArchCpuContext, buf_ptr: u64, blocking: u64) SyscallResult {
+    kprof.enter(.sys_fault_recv);
+    defer kprof.exit(.sys_fault_recv);
     const thread = sched.currentThread().?;
     const proc = thread.process;
 
@@ -218,6 +221,8 @@ const fault_exclude_next: u64 = 0x1;
 const fault_exclude_permanent: u64 = 0x2;
 
 pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modified_regs_ptr: u64) i64 {
+    kprof.enter(.sys_fault_reply);
+    defer kprof.exit(.sys_fault_reply);
     if (action > fault_resume_modified) return E_INVAL;
 
     const proc = sched.currentProc();

@@ -3,6 +3,7 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const errors = zag.syscall.errors;
+const kprof = zag.kprof.trace_id;
 const sched = zag.sched.scheduler;
 
 const isSubset = zag.perms.permissions.isSubset;
@@ -333,6 +334,8 @@ fn wakeThread(thread: *Thread) void {
 }
 
 pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
+    kprof.enter(.sys_ipc_send);
+    defer kprof.exit(.sys_ipc_send);
     const thread = sched.currentThread().?;
     const proc = thread.process;
     const target_handle = arch.getIpcHandle(ctx);
@@ -397,6 +400,8 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
 }
 
 pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
+    kprof.enter(.sys_ipc_call);
+    defer kprof.exit(.sys_ipc_call);
     const thread = sched.currentThread().?;
     const proc = thread.process;
     const target_handle = arch.getIpcHandle(ctx);
@@ -471,6 +476,8 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
 }
 
 pub fn sysIpcRecv(ctx: *ArchCpuContext) SyscallResult {
+    kprof.enter(.sys_ipc_recv);
+    defer kprof.exit(.sys_ipc_recv);
     const thread = sched.currentThread().?;
     const proc = thread.process;
     const blocking = (arch.getIpcMetadata(ctx) & 0x2) != 0;
@@ -532,6 +539,8 @@ pub fn sysIpcRecv(ctx: *ArchCpuContext) SyscallResult {
 }
 
 pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
+    kprof.enter(.sys_ipc_reply);
+    defer kprof.exit(.sys_ipc_reply);
     const thread = sched.currentThread().?;
     const proc = thread.process;
     const reply_meta = arch.getIpcMetadata(ctx);

@@ -4,6 +4,7 @@ const zag = @import("zag");
 const apic = zag.arch.x64.apic;
 const cpu = zag.arch.x64.cpu;
 const interrupts = zag.arch.x64.interrupts;
+const kprof = zag.kprof.trace_id;
 const paging = zag.memory.paging;
 const physmap = zag.memory.address.AddrSpacePartition.physmap;
 const pmm = zag.memory.pmm;
@@ -29,6 +30,7 @@ var shootdown_addr: u64 = 0;
 /// Intel SDM Vol 3A, Section 5.10.4.1 -- INVLPG invalidates any TLB entries
 /// for the page containing the operand address, including global entries.
 pub fn tlbShootdownHandler(_: *cpu.Context) void {
+    kprof.point(.tlb_shootdown, 0);
     cpu.invlpg(@atomicLoad(u64, &shootdown_addr, .acquire));
 }
 
@@ -212,6 +214,7 @@ pub fn mapPage(
     virt: VAddr,
     perms: MemoryPerms,
 ) !void {
+    kprof.point(.map_page, virt.addr);
     std.debug.assert(std.mem.isAligned(phys.addr, paging.PAGE4K));
     std.debug.assert(std.mem.isAligned(virt.addr, paging.PAGE4K));
 
@@ -381,6 +384,7 @@ pub fn unmapPage(
     addr_space_root: PAddr,
     virt: VAddr,
 ) ?PAddr {
+    kprof.point(.unmap_page, virt.addr);
     const root_virt = VAddr.fromPAddr(addr_space_root, null);
     var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
 

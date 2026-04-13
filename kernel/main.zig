@@ -4,6 +4,7 @@ const zag = @import("zag");
 const arch = zag.arch.dispatch;
 const debug_info = zag.utils.debug_info;
 const device_registry = zag.devices.registry;
+const kprof_log = zag.kprof.log;
 const memory = zag.memory.init;
 const sched = zag.sched.scheduler;
 const syscall = zag.syscall;
@@ -84,5 +85,7 @@ fn kMain(boot_info: *BootInfo) !void {
     arch.earlyDebugChar('S');
     sched.perCoreInit();
     arch.earlyDebugChar('U');
+    try kprof_log.init();
+    kprof_log.start();
     arch.halt();
 }

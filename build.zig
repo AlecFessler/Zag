@@ -76,6 +76,13 @@ pub fn build(b: *std.Build) void {
         if (profile) |p| p.display else "none";
     const net_type = b.option([]const u8, "net", "Network: tap, user, or none (default: user)") orelse
         if (profile) |p| p.net else "user";
+    const kernel_profile = b.option([]const u8, "kernel_profile", "Kernel profiling mode: none, trace, or sample (default: none)") orelse "none";
+    if (!std.mem.eql(u8, kernel_profile, "none") and
+        !std.mem.eql(u8, kernel_profile, "trace") and
+        !std.mem.eql(u8, kernel_profile, "sample"))
+    {
+        @panic("-Dkernel_profile must be one of: none, trace, sample");
+    }
 
     const arch: std.Target.Cpu.Arch = blk: {
         break :blk if (std.mem.eql(u8, target_arch, "x64"))
@@ -102,6 +109,10 @@ pub fn build(b: *std.Build) void {
     zag_mod.omit_frame_pointer = false;
     zag_mod.red_zone = false;
     zag_mod.addImport("zag", zag_mod);
+
+    const build_opts = b.addOptions();
+    build_opts.addOption([]const u8, "kernel_profile", kernel_profile);
+    zag_mod.addImport("build_options", build_opts.createModule());
 
     // ── SMP trampoline (x86-only; aarch64 uses PSCI CPU_ON) ────────────
     const embedded_wf = b.addWriteFiles();
