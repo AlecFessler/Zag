@@ -407,6 +407,7 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
     const xsdt = Xsdt.fromVAddr(xsdt_virt);
     try xsdt.validate();
 
+    var saw_spcr = false;
     var xsdt_iter = xsdt.iter();
     while (xsdt_iter.next()) |sdt_paddr| {
         const sdt_phys = PAddr.fromInt(sdt_paddr);
@@ -419,7 +420,20 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
 
         if (std.mem.eql(u8, @ptrCast(&sdt.signature), "SPCR")) {
             parseSpcr(sdt_virt);
+            saw_spcr = true;
         }
+    }
+
+    // If SPCR was absent (some firmware omits it), fall back to the QEMU
+    // virt PL011 at PA 0x09000000 and map it into physmap so the serial
+    // driver's upper-half VA is translatable. serial.init() already set
+    // base_addr to physmap+0x09000000 as a placeholder, but that VA is
+    // not mapped until we do it here: memory.init() skips MMIO pages
+    // when populating the physmap.
+    if (!saw_spcr) {
+        const pl011_phys: u64 = 0x09000000;
+        const uart_vaddr = mapDeviceRange(pl011_phys, 0x1000) catch 0;
+        if (uart_vaddr != 0) serial.setBase(uart_vaddr);
     }
 
     // GIC init must happen after MADT parsing so that gicd_base /
@@ -518,6 +532,14 @@ fn parseMadt(madt_virt: VAddr) !void {
 /// ACPI 6.5, Section 5.2.32 — SPCR layout:
 ///   - offset 36: u8 Interface Type
 ///   - offset 40: GenericAddressStruct (12 bytes) containing UART base address.
+///
+/// The PL011 MMIO page is not included in the physmap built by memory.init()
+/// (the physmap only covers RAM reported as free/ACPI in the UEFI memory map),
+/// so we must explicitly map it as Device memory into the kernel address
+/// space root before handing its physmap VA to the serial driver. Without
+/// this, the first `arch.print` from a syscall (e.g. sysWrite) translation
+/// faults on the upper-half VA and the kernel hangs in a nested exception
+/// loop.
 fn parseSpcr(spcr_virt: VAddr) void {
     const spcr = SpcrTable.fromVAddr(spcr_virt);
     spcr.validate() catch return;
@@ -525,6 +547,6 @@ fn parseSpcr(spcr_virt: VAddr) void {
     const uart_paddr = spcr.base_address.address;
     if (uart_paddr == 0) return;
 
-    const uart_vaddr = VAddr.fromPAddr(PAddr.fromInt(uart_paddr), null);
-    serial.setBase(uart_vaddr.addr);
+    const uart_vaddr_base = mapDeviceRange(uart_paddr, 0x1000) catch return;
+    serial.setBase(uart_vaddr_base);
 }
