@@ -157,6 +157,7 @@ pub const Process = struct {
             .rights = @as(u16, @as(u8, @bitCast(rights))),
         };
         self.perm_count += 1;
+        _ = thread.handle_refcount.fetchAdd(1, .acq_rel);
         self.syncUserView();
     }
 
@@ -170,16 +171,21 @@ pub const Process = struct {
     /// whole table is O(MAX_PERMS) and thread exit is already not hot.
     pub fn removeThreadHandle(self: *Process, thread: *Thread) void {
         self.perm_lock.lock();
-        defer self.perm_lock.unlock();
-        var removed = false;
+        var drop: u32 = 0;
         for (&self.perm_table) |*slot| {
             if (slot.object == .thread and slot.object.thread == thread) {
                 slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
-                removed = true;
+                drop += 1;
             }
         }
-        if (removed) self.syncUserView();
+        if (drop != 0) self.syncUserView();
+        self.perm_lock.unlock();
+        var i: u32 = 0;
+        while (i < drop) {
+            thread.releaseRef();
+            i += 1;
+        }
     }
 
     /// Find the handle ID for a thread in this process's perm table.
@@ -201,15 +207,20 @@ pub const Process = struct {
     /// - target dies (cleanup unlinks itself from handler's list)
     pub fn releaseFaultHandler(self: *Process, target: *Process) void {
         // Clear all thread-handle slots in self.perm_table that belong to target.
+        var drained: [MAX_PERMS]*Thread = undefined;
+        var drained_n: usize = 0;
         self.perm_lock.lock();
         for (&self.perm_table) |*slot| {
             if (slot.object == .thread and slot.object.thread.process == target) {
+                drained[drained_n] = slot.object.thread;
+                drained_n += 1;
                 slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
             }
         }
         self.syncUserView();
         self.perm_lock.unlock();
+        for (drained[0..drained_n]) |t| t.releaseRef();
 
         // Clear target's pointer back to handler and restore fault_handler
         // bit on slot 0 — but only if the target originally had the bit.
@@ -595,6 +606,26 @@ pub const Process = struct {
         return self.getPermByHandleLocked(handle_id);
     }
 
+    /// Look up a handle and, if it references a thread, pin the *Thread
+    /// so it cannot be freed out from under the caller. Callers MUST
+    /// invoke `Thread.releaseRef` on the returned thread once they are
+    /// done operating on it. Returns the permission entry snapshot plus
+    /// the pinned thread pointer; returns null on handle-not-found or
+    /// when the entry is not a thread. Fixes red-team finding Cap-F2
+    /// (thread-handle TOCTOU UAF).
+    pub fn acquireThreadRef(self: *Process, handle_id: u64) ?struct {
+        entry: PermissionEntry,
+        thread: *Thread,
+    } {
+        self.perm_lock.lock();
+        defer self.perm_lock.unlock();
+        const entry = self.getPermByHandleLocked(handle_id) orelse return null;
+        if (entry.object != .thread) return null;
+        const t = entry.object.thread;
+        _ = t.handle_refcount.fetchAdd(1, .acq_rel);
+        return .{ .entry = entry, .thread = t };
+    }
+
     /// Look up a handle while the caller already holds perm_lock.
     pub fn getPermByHandleLocked(self: *const Process, handle_id: u64) ?PermissionEntry {
         for (self.perm_table) |entry| {
@@ -613,10 +644,11 @@ pub const Process = struct {
                 slot.* = entry_in;
                 slot.handle = handle_id;
                 self.perm_count += 1;
-                // Increment refcount on referenced process
+                // Increment refcount on referenced object
                 switch (entry_in.object) {
                     .process => |p| _ = @atomicRmw(u32, &p.handle_refcount, .Add, 1, .acq_rel),
                     .dead_process => |p| _ = @atomicRmw(u32, &p.handle_refcount, .Add, 1, .acq_rel),
+                    .thread => |t| _ = t.handle_refcount.fetchAdd(1, .acq_rel),
                     else => {},
                 }
                 self.syncUserView();
@@ -629,12 +661,14 @@ pub const Process = struct {
     pub fn removePerm(self: *Process, handle_id: u64) !void {
         if (handle_id == HANDLE_SELF) return error.CannotRevokeSelf;
         var referenced_proc: ?*Process = null;
+        var referenced_thread: ?*Thread = null;
         self.perm_lock.lock();
         for (self.perm_table[1..]) |*slot| {
             if (slot.object != .empty and slot.handle == handle_id) {
                 switch (slot.object) {
                     .process => |p| referenced_proc = p,
                     .dead_process => |p| referenced_proc = p,
+                    .thread => |t| referenced_thread = t,
                     else => {},
                 }
                 slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
@@ -648,6 +682,7 @@ pub const Process = struct {
                         allocator.destroy(p);
                     }
                 }
+                if (referenced_thread) |t| t.releaseRef();
                 return;
             }
         }
@@ -1113,6 +1148,7 @@ pub const Process = struct {
                         const core_id = @ctz(t.core_affinity orelse 0);
                         sched.unpinByRevoke(core_id);
                     }
+                    t.releaseRef();
                 },
                 .vm => {},
                 .process => |p| {

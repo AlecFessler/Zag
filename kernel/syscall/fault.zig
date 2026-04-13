@@ -516,15 +516,15 @@ pub fn sysFaultSetThreadMode(thread_handle: u64, mode: u64) i64 {
     if (mode > 2) return E_INVAL;
 
     const proc = sched.currentProc();
-    const thr_entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
-    if (thr_entry.object != .thread) return E_BADCAP;
+    const pinned = proc.acquireThreadRef(thread_handle) orelse return E_BADCAP;
+    const target_thread = pinned.thread;
+    defer target_thread.releaseRef();
 
     // Verify caller holds fault_handler for the thread's owning process.
     // Two valid cases (§2.12.32):
     //   1. External handler: target_proc.fault_handler_proc == proc
     //   2. Self-handling:    target_proc == proc AND proc's slot 0 has
     //                        the fault_handler ProcessRights bit set.
-    const target_thread = thr_entry.object.thread;
     const target_proc = target_thread.process;
     const is_self_handler = target_proc == proc and
         proc.perm_table[0].processRights().fault_handler;

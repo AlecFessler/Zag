@@ -126,6 +126,7 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     const rights_err = checkRights(proc, thread_handle);
     if (rights_err) |e| return e;
     const target_thread = lookupThread(proc, thread_handle) orelse return E_BADCAP;
+    defer target_thread.releaseRef();
 
     var configs: [arch.pmu_max_counters]PmuCounterConfig = undefined;
     const slice = readConfigs(proc, configs_ptr, count, &configs) catch |err| return configErrToCode(err);
@@ -171,6 +172,7 @@ pub fn sysPmuRead(proc: *Process, thread_handle: u64, sample_ptr: u64) i64 {
     const rights_err = checkRights(proc, thread_handle);
     if (rights_err) |e| return e;
     const target_thread = lookupThread(proc, thread_handle) orelse return E_BADCAP;
+    defer target_thread.releaseRef();
 
     const target_proc = target_thread.process;
     target_proc.lock.lock();
@@ -199,6 +201,7 @@ pub fn sysPmuReset(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     const rights_err = checkRights(proc, thread_handle);
     if (rights_err) |e| return e;
     const target_thread = lookupThread(proc, thread_handle) orelse return E_BADCAP;
+    defer target_thread.releaseRef();
 
     var configs: [arch.pmu_max_counters]PmuCounterConfig = undefined;
     const slice = readConfigs(proc, configs_ptr, count, &configs) catch |err| return configErrToCode(err);
@@ -230,6 +233,7 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
     const rights_err = checkRights(proc, thread_handle);
     if (rights_err) |e| return e;
     const target_thread = lookupThread(proc, thread_handle) orelse return E_BADCAP;
+    defer target_thread.releaseRef();
 
     const target_proc = target_thread.process;
     target_proc.lock.lock();
@@ -267,10 +271,11 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
 // ── Internal helpers ────────────────────────────────────────────────────
 
 /// Look up a thread handle and verify the entry is actually a thread.
+/// Returns a pinned `*Thread` reference; callers MUST call `releaseRef`
+/// once they are done operating on the thread (red-team Cap-F2 fix).
 fn lookupThread(proc: *Process, thread_handle: u64) ?*Thread {
-    const entry = proc.getPermByHandle(thread_handle) orelse return null;
-    if (entry.object != .thread) return null;
-    return entry.object.thread;
+    const pinned = proc.acquireThreadRef(thread_handle) orelse return null;
+    return pinned.thread;
 }
 
 /// Dual-gated rights check. Returns null on success, error code on failure.
