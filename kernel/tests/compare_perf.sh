@@ -15,7 +15,7 @@ fi
 
 BASELINE="$1"
 CURRENT="$2"
-THRESHOLD="${3:-15}"
+THRESHOLD="${3:-1}"
 
 if [ ! -f "$BASELINE" ]; then
     echo "Error: baseline file not found: $BASELINE"

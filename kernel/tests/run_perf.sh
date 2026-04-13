@@ -115,7 +115,7 @@ BASELINE="$SCRIPT_DIR/perf_baseline.txt"
 if [ -f "$BASELINE" ]; then
     echo ""
     echo "=== Regression check vs baseline ==="
-    bash "$SCRIPT_DIR/compare_perf.sh" "$BASELINE" "$RESULTS_DIR/latest.txt" 15 || true
+    bash "$SCRIPT_DIR/compare_perf.sh" "$BASELINE" "$RESULTS_DIR/latest.txt" 1 || true
     echo ""
 fi
 
