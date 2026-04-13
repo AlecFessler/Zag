@@ -515,28 +515,36 @@ pub fn initRedistributor(core_idx: usize) void {
     if (gicv3) {
         wakeRedistributor(core_idx);
 
-        // Enable all SGIs (INTID 0-15) by writing to the SGI_base ISENABLER0.
-        // IHI 0069H, Section 9.5.6: GICR_ISENABLER0 — bits [15:0] are SGIs.
-        gicrSgiWrite(core_idx, .isenabler0, 0x0000FFFF);
+        // Enable SGIs (INTID 0-15) and the generic timer PPIs
+        // (27 = CNTV, 29 = CNTHP, 30 = CNTP) via GICR_ISENABLER0.
+        // IHI 0069H, Section 9.5.6: GICR_ISENABLER0 — bit n enables INTID n.
+        // ARM ARM D11.2.4: the ARM generic timer delivers its interrupt
+        // as a PPI; this kernel uses CNTP (PPI 30) as the preemption timer.
+        gicrSgiWrite(core_idx, .isenabler0, 0x0000FFFF | (1 << 27) | (1 << 29) | (1 << 30));
 
-        // Set all SGI/PPI priorities to lowest.
+        // Set all SGI/PPI priorities to 0x80. On GICv3 ICC_PMR_EL1 is
+        // 0xFF and interrupts with priority >= PMR are masked (IHI 0069H,
+        // Section 12.11.2), so writing 0xFF into IPRIORITYR would silently
+        // suppress every PPI — including the preemption timer. 0x80 is
+        // well below the mask.
         // IHI 0069H, Section 9.5.8: GICR_IPRIORITYR<n>.
         var n: u32 = 0;
         while (n < 8) {
-            gicrSgiWrite(core_idx, @enumFromInt(@intFromEnum(GicrSgiReg.ipriorityr0) + n * 4), 0xFFFFFFFF);
+            gicrSgiWrite(core_idx, @enumFromInt(@intFromEnum(GicrSgiReg.ipriorityr0) + n * 4), 0x80808080);
             n += 1;
         }
     } else {
         // GICv2: SGI/PPI registers are in GICD, banked per-CPU.
-        // Enable all SGIs (INTID 0-15).
-        // IHI 0048B, Section 4.3.5: GICD_ISENABLER0 bits [15:0].
-        gicdWriteOffset(.isenabler0, 0, 0x0000FFFF);
+        // Enable SGIs (INTID 0-15) and timer PPIs (27, 29, 30) via the
+        // banked GICD_ISENABLER0.
+        // IHI 0048B, Section 4.3.5.
+        gicdWriteOffset(.isenabler0, 0, 0x0000FFFF | (1 << 27) | (1 << 29) | (1 << 30));
 
-        // Set all SGI/PPI priorities to lowest.
+        // Set all SGI/PPI priorities to 0x80 (see GICv3 note above).
         // IHI 0048B, Section 4.3.11: GICD_IPRIORITYR0-7 (banked per-CPU).
         var n: u32 = 0;
         while (n < 8) {
-            gicdWriteOffset(.ipriorityr0, n * 4, 0xFFFFFFFF);
+            gicdWriteOffset(.ipriorityr0, n * 4, 0x80808080);
             n += 1;
         }
     }

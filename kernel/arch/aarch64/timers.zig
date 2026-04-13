@@ -70,6 +70,16 @@ inline fn writeCntpCval(val: u64) void {
     );
 }
 
+/// Write CNTP_TVAL_EL0 — set the physical timer 32-bit downcounter.
+/// ARM ARM D13.8.10: Writing TVAL sets CVAL = CNTPCT + TVAL. Convenient
+/// for arming a relative deadline without separately reading CNTPCT.
+inline fn writeCntpTval(val: u32) void {
+    asm volatile ("msr cntp_tval_el0, %[val]"
+        :
+        : [val] "r" (@as(u64, val)),
+    );
+}
+
 /// Write CNTP_CTL_EL0 — physical timer control register.
 /// ARM ARM D13.8.7: CNTP_CTL_EL0, Counter-timer Physical Timer Control register.
 /// Bit 0: ENABLE — enables the timer.
@@ -106,14 +116,21 @@ const PreemptionTimer = struct {
         return timer_mod.nanosFromTicksFloor(cached_freq_hz, cpu.readCntvct());
     }
 
-    /// Arm a one-shot interrupt at an absolute nanosecond deadline.
-    /// Converts the deadline to ticks via ticksFromNanosCeil, writes
-    /// CNTP_CVAL_EL0, and enables the physical timer with IMASK cleared.
-    /// ARM ARM D13.8.9: CNTP_CVAL_EL0 — comparator fires when CNTPCT >= CVAL.
+    /// Arm a one-shot interrupt `delta_ns` nanoseconds from now.
+    ///
+    /// The `Timer` vtable contract (shared with x64 LAPIC/HPET) treats
+    /// `timer_val_ns` as a RELATIVE delta, not an absolute deadline. The
+    /// ARM generic timer provides CNTP_TVAL_EL0 which internally computes
+    /// CVAL = CNTPCT + TVAL, so we clamp the delta to 32 bits and let
+    /// hardware do the offset math.
+    ///
+    /// ARM ARM D13.8.10: CNTP_TVAL_EL0.
     /// ARM ARM D13.8.7: CNTP_CTL_EL0 — ENABLE=1, IMASK=0.
-    fn armInterruptTimer(_: *anyopaque, deadline_ns: u64) void {
-        const deadline_ticks = timer_mod.ticksFromNanosCeil(cached_freq_hz, deadline_ns);
-        writeCntpCval(deadline_ticks);
+    fn armInterruptTimer(_: *anyopaque, delta_ns: u64) void {
+        var delta_ticks = timer_mod.ticksFromNanosCeil(cached_freq_hz, delta_ns);
+        if (delta_ticks == 0) delta_ticks = 1;
+        if (delta_ticks > 0x7FFF_FFFF) delta_ticks = 0x7FFF_FFFF;
+        writeCntpTval(@intCast(delta_ticks));
         // ENABLE=1 (bit 0), IMASK=0 (bit 1 clear)
         writeCntpCtl(0x1);
     }

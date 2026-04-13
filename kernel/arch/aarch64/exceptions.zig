@@ -439,14 +439,13 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
 /// ICC_IAR1_EL1), dispatches to the registered device handler, and
 /// signals end-of-interrupt (ICC_EOIR1_EL1).
 fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
-    _ = ctx;
     const intid = gic.acknowledgeInterrupt();
 
     // INTID 1023 = spurious interrupt (IHI 0069H, Section 12.11.1).
     // No EOI needed for spurious interrupts.
     if (intid == 1023) return;
 
-    dispatchIrq(intid);
+    dispatchIrq(intid, ctx, .user);
     gic.endOfInterrupt(intid);
 }
 
@@ -497,12 +496,11 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
 /// Handler for IRQ from Current EL (kernel-mode).
 /// ARM ARM D1.10.2, offset 0x280.
 fn handleIrqCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
-    _ = ctx;
     const intid = gic.acknowledgeInterrupt();
 
     if (intid == 1023) return;
 
-    dispatchIrq(intid);
+    dispatchIrq(intid, ctx, .kernel);
     gic.endOfInterrupt(intid);
 }
 
@@ -520,10 +518,34 @@ fn handleUnexpected(ctx: *ArchCpuContext) callconv(.c) void {
 ///   0-15:    SGI (Software Generated Interrupts / IPIs)
 ///   16-31:   PPI (Private Peripheral Interrupts, e.g. timer)
 ///   32-1019: SPI (Shared Peripheral Interrupts, e.g. devices)
-fn dispatchIrq(intid: u32) void {
-    // TODO: route intid to registered device handlers via irq_table.
-    // For now, log unhandled interrupts.
-    arch.print("K: IRQ intid={d} (unhandled)\n", .{intid});
+///
+/// PPI 30 is the non-secure EL1 physical timer interrupt (ARM ARM
+/// D11.2.4); this is the scheduler's preemption tick. It is routed
+/// directly to `sched.schedTimerHandler`, equivalent of the x64
+/// LAPIC-timer IDT vector.
+fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.PrivilegePerm) void {
+    switch (intid) {
+        30 => {
+            // Mask the physical timer while we run the scheduler tick.
+            // schedTimerHandler will re-arm via `armInterruptTimer`
+            // which writes ENABLE=1, IMASK=0 and thereby unmasks again.
+            // Without masking first, ISTATUS stays asserted and the
+            // GIC would immediately re-deliver the PPI after EOI.
+            // ARM ARM D13.8.7: CNTP_CTL_EL0 IMASK (bit 1).
+            asm volatile ("msr cntp_ctl_el0, %[val]"
+                :
+                : [val] "r" (@as(u64, 0x3)), // ENABLE=1, IMASK=1
+            );
+            const sched_ctx = scheduler.SchedInterruptContext{
+                .privilege = privilege,
+                .thread_ctx = ctx,
+            };
+            scheduler.schedTimerHandler(sched_ctx);
+        },
+        else => {
+            arch.print("K: IRQ intid={d} (unhandled)\n", .{intid});
+        },
+    }
 }
 
 /// Attempt to notify the process's fault handler; if none is registered,
