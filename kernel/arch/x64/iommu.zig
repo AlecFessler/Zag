@@ -51,17 +51,6 @@ pub fn enableTranslation() void {
 pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
     if (active_type == .none) return error.NoIommu;
 
-    // Serialize concurrent mapDmaPages/unmapDmaPages on this device.
-    // The `dma_cursor` bump, the leaf-PTE walk+install, and the IOTLB
-    // invalidation must all be atomic with respect to other threads
-    // holding the same device cap — otherwise two mappers read the
-    // same cursor, install overlapping PTEs, and hand two SHMs the
-    // same `dma_base`. An unmap of either mapping later tears down
-    // the shared leaf PTEs and pmm-frees frames the device is still
-    // programmed to DMA into. See exploits/dma_map_race_iova_alias.
-    device.detail.pci.dma_lock.lock();
-    defer device.detail.pci.dma_lock.unlock();
-
     const base_dma = device.detail.pci.dma_cursor;
     for (shm.pages, 0..) |phys, i| {
         const dma_addr = base_dma + @as(u64, i) * 0x1000;
@@ -81,14 +70,6 @@ pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
 }
 
 pub fn unmapDmaPages(device: *DeviceRegion, dma_base: u64, num_pages: u64) void {
-    // Same per-device lock as mapDmaPages — a concurrent map on this
-    // device must not observe partial PTE teardown, and two concurrent
-    // unmaps of overlapping ranges (only possible if the map path also
-    // raced, but patched here for belt-and-suspenders) must not corrupt
-    // the page-table walk.
-    device.detail.pci.dma_lock.lock();
-    defer device.detail.pci.dma_lock.unlock();
-
     var i: u64 = 0;
     while (i < num_pages) {
         const dma_addr = dma_base + i * 0x1000;
