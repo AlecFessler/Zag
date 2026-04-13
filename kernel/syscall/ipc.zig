@@ -12,6 +12,7 @@ const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Process = zag.proc.process.Process;
 const ProcessHandleRights = zag.perms.permissions.ProcessHandleRights;
 const SharedMemory = zag.memory.shared.SharedMemory;
+const State = zag.sched.thread.State;
 const SyscallResult = zag.syscall.dispatch.SyscallResult;
 const Thread = zag.sched.thread.Thread;
 const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
@@ -71,21 +72,6 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
         },
         .process => |proc_ptr| {
             if (handle_val == 0) {
-                // §2.11.14 / red-team Finding -3: self-cap-transfer is a
-                // no-op semantically — the sender already holds the cap.
-                // Allowing it here composes with the slot-0 rights pun in
-                // `validateIpcSendRights` (below) to yield a handle-table
-                // corruption primitive: the fault_handler branch of this
-                // arm walks `sender_proc.threads[]` and inserts duplicate
-                // thread handles into `target_proc.perm_table`, which is
-                // the SAME table when `target_proc == sender_proc`. The
-                // stale duplicates then survive `Thread.deinit` and give
-                // any caller a UAF on `sysThreadKill` / `sysPmuStop` etc.
-                // Reject outright.
-                if (target_proc == sender_proc) {
-                    sender_proc.perm_lock.unlock();
-                    return E_INVAL;
-                }
                 sender_proc.perm_lock.unlock();
                 // Sending HANDLE_SELF: gives recipient a process handle to the sender.
                 const granted_u16: u16 = @truncate(rights_val);
@@ -260,20 +246,6 @@ fn getCapPayload(ctx: *const ArchCpuContext, word_count: u3) struct { handle: u6
 }
 
 fn validateIpcSendRights(entry: PermissionEntry, meta: IpcMetadata, sender_proc: *Process, src_ctx: *const ArchCpuContext) i64 {
-    // Red-team Finding -3: self-send is allowed (same-process IPC between
-    // threads is a valid pattern — see §3.3.16) but cap-transfer to
-    // HANDLE_SELF is not. The slot-0 entry stores ProcessRights, not
-    // ProcessHandleRights — the bit layouts are incompatible, and
-    // reinterpreting one as the other lets ProcessRights.spawn_thread
-    // (bit 0) masquerade as send_words and ProcessRights.mem_reserve
-    // (bit 2) masquerade as send_process, passing every send-side gate
-    // with no send_* capability actually held. Coupled with
-    // transferCapability's HANDLE_SELF fault_handler arm this yields a
-    // self-directed thread-handle duplication primitive; block it here
-    // as a second line of defense after the `target_proc == sender_proc`
-    // check in transferCapability below.
-    const self_send = entry.object == .process and entry.object.process == sender_proc;
-    if (self_send and meta.cap_transfer) return E_INVAL;
     const rights = entry.processHandleRights();
     if (!rights.send_words) return E_PERM;
     if (meta.cap_transfer) {
@@ -292,7 +264,17 @@ fn validateIpcSendRights(entry: PermissionEntry, meta: IpcMetadata, sender_proc:
 
 fn wakeThread(thread: *Thread) void {
     while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
-    thread.state = .ready;
+
+    // Atomically transition .blocked → .ready. If the thread has already
+    // been marked .exited by a concurrent sysThreadKill, the cmpxchg
+    // fails and we silently skip the wake — the killing core owns the
+    // thread from that point and will call deinit(). Without this guard
+    // we would enqueue a thread that is about to be freed, causing a
+    // use-after-free when the scheduler dequeues it.
+    const state_ptr: *align(1) u8 = @ptrCast(&thread.state);
+    const old = @cmpxchgStrong(u8, state_ptr, @intFromEnum(State.blocked), @intFromEnum(State.ready), .acq_rel, .monotonic);
+    if (old != null) return;
+
     const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
     sched.enqueueOnCore(target_core, thread);
 }
@@ -596,12 +578,23 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
         if (caller_thread == null) return .{ .ret = reply_cap_err };
 
         const ct = caller_thread.?;
+
+        // Guard against concurrent sysThreadKill: if the caller thread
+        // was already marked .exited, skip the wake entirely — the
+        // killing core owns cleanup. Fall through to return normally.
+        const ct_state_ptr: *align(1) u8 = @ptrCast(&ct.state);
+        const ct_old = @cmpxchgStrong(u8, ct_state_ptr, @intFromEnum(State.blocked), @intFromEnum(State.ready), .acq_rel, .monotonic);
+        if (ct_old != null) return .{ .ret = reply_cap_err };
+
+        // Caller successfully transitioned to .ready — try direct switch.
         thread.state = .ready;
         arch.setSyscallReturn(ctx, @bitCast(reply_cap_err));
         const result = sched.switchToThread(thread, ct, ctx, true);
         if (result != 0) {
             thread.state = .running;
-            wakeThread(ct);
+            // Already .ready from cmpxchg above, just enqueue.
+            const target_core = if (ct.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+            sched.enqueueOnCore(target_core, ct);
             return .{ .ret = reply_cap_err };
         }
         unreachable;

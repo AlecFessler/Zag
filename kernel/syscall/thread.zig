@@ -10,6 +10,7 @@ const sched = zag.sched.scheduler;
 
 const Priority = zag.sched.thread.Priority;
 const Process = zag.proc.process.Process;
+const State = zag.sched.thread.State;
 const Thread = zag.sched.thread.Thread;
 const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
 const VAddr = zag.memory.address.VAddr;
@@ -173,11 +174,11 @@ pub fn sysThreadSelf() i64 {
 
 pub fn sysThreadSuspend(thread_handle: u64) i64 {
     const proc = sched.currentProc();
-    const pinned = proc.acquireThreadRef(thread_handle) orelse return E_BADCAP;
-    const target = pinned.thread;
-    defer target.releaseRef();
-    if (!pinned.entry.threadHandleRights().@"suspend") return E_PERM;
+    const thr_entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
+    if (thr_entry.object != .thread) return E_BADCAP;
+    if (!thr_entry.threadHandleRights().@"suspend") return E_PERM;
 
+    const target = thr_entry.object.thread;
     const target_proc = target.process;
 
     target_proc.lock.lock();
@@ -245,11 +246,11 @@ pub fn sysThreadSuspend(thread_handle: u64) i64 {
 
 pub fn sysThreadResume(thread_handle: u64) i64 {
     const proc = sched.currentProc();
-    const pinned = proc.acquireThreadRef(thread_handle) orelse return E_BADCAP;
-    const target = pinned.thread;
-    defer target.releaseRef();
-    if (!pinned.entry.threadHandleRights().@"resume") return E_PERM;
+    const thr_entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
+    if (thr_entry.object != .thread) return E_BADCAP;
+    if (!thr_entry.threadHandleRights().@"resume") return E_PERM;
 
+    const target = thr_entry.object.thread;
     const target_proc = target.process;
 
     target_proc.lock.lock();
@@ -269,31 +270,30 @@ pub fn sysThreadResume(thread_handle: u64) i64 {
 
 pub fn sysThreadKill(thread_handle: u64) i64 {
     const proc = sched.currentProc();
-    const pinned = proc.acquireThreadRef(thread_handle) orelse return E_BADCAP;
-    const target = pinned.thread;
-    if (!pinned.entry.threadHandleRights().kill) {
-        target.releaseRef();
-        return E_PERM;
-    }
+    const thr_entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
+    if (thr_entry.object != .thread) return E_BADCAP;
+    if (!thr_entry.threadHandleRights().kill) return E_PERM;
 
+    const target = thr_entry.object.thread;
     const target_proc = target.process;
     const cur = sched.currentThread().?;
 
     target_proc.lock.lock();
     if (target.state == .faulted) {
         target_proc.lock.unlock();
-        target.releaseRef();
         return E_BUSY;
     }
     if (target.state == .exited) {
         target_proc.lock.unlock();
-        target.releaseRef();
         return E_BADCAP;
     }
 
     const was_running = target.state == .running;
     const is_self = target == cur;
-    target.state = .exited;
+    // Use atomic store so concurrent wakeThread's cmpxchg on
+    // thread.state observes .exited and skips the wake.
+    const state_ptr: *align(1) u8 = @ptrCast(&target.state);
+    @atomicStore(u8, state_ptr, @intFromEnum(State.exited), .release);
     // Clear bitmask bits
     target_proc.faulted_thread_slots &= ~(@as(u64, 1) << @intCast(target.slot_index));
     target_proc.suspended_thread_slots &= ~(@as(u64, 1) << @intCast(target.slot_index));
@@ -301,7 +301,6 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
 
     // Self-kill: fall through to scheduler-zombie cleanup path.
     if (is_self) {
-        target.releaseRef();
         arch.enableInterrupts();
         sched.yield();
         while (true) arch.halt();
@@ -314,7 +313,6 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
         if (sched.coreRunning(target)) |core_id| {
             arch.triggerSchedulerInterrupt(core_id);
         }
-        target.releaseRef();
         return E_OK;
     }
 
@@ -354,10 +352,7 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
     }
     // deinit removes thread handles from perm tables, frees stacks,
     // calls lastThreadExited (which triggers process exit/restart).
-    // Our pin keeps the Thread struct alive across deinit's final
-    // destroy check; releaseRef performs the actual free.
     target.deinit();
-    target.releaseRef();
 
     return E_OK;
 }
