@@ -1778,11 +1778,20 @@ fn applyRelocations(proc: *Process, aslr_base: u64, elf_binary: []const u8, rela
 
         // Validate relocation target stays in user address space.
         const target_vaddr = std.math.add(u64, aslr_base, rela.r_offset) catch return error.InvalidElf;
+        const target_end = std.math.add(u64, target_vaddr, 8) catch return error.InvalidElf;
         if (!address.AddrSpacePartition.user.contains(target_vaddr)) return error.InvalidElf;
+        if (!address.AddrSpacePartition.user.contains(target_end - 1)) return error.InvalidElf;
+
+        // The 8-byte write is addressed through the physmap of a single
+        // resolved page. If target_vaddr straddles a page boundary, bytes
+        // past the first page would land in the PHYSICALLY-adjacent frame
+        // (whatever the PMM placed next to this one) — an arbitrary kernel
+        // write primitive. Require the write to stay within one page.
+        const page_base = std.mem.alignBackward(u64, target_vaddr, paging.PAGE4K);
+        if (target_end - page_base > paging.PAGE4K) return error.InvalidElf;
 
         const value: u64 = @bitCast(@as(i64, rela.r_addend) +% @as(i64, @bitCast(aslr_base)));
 
-        const page_base = std.mem.alignBackward(u64, target_vaddr, paging.PAGE4K);
         const paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(page_base)) orelse return error.InvalidElf;
         const physmap_addr = VAddr.fromPAddr(paddr, null).addr + (target_vaddr - page_base);
         const ptr: *u64 = @ptrFromInt(physmap_addr);
