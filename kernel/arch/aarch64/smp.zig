@@ -363,12 +363,9 @@ fn smpInitFull() !void {
     }
     asm volatile ("dsb ish" ::: .{ .memory = true });
 
-    // QEMU virt's AAVMF firmware does not implement an SMC PSCI handler;
-    // secondary bringup on the TCG virt machine requires HVC. On bare metal
-    // with TF-A, SMC is the correct conduit — this should eventually be
-    // driven off the ACPI FADT ARM Boot Architecture Flags / PSCI node.
-    // TODO(aarch64): drive conduit from FADT instead of hard-coding HVC.
-    power.setConduit(.hvc);
+    // PSCI conduit (SMC vs HVC) was selected from the FADT ARM Boot
+    // Architecture Flags during ACPI parsing. See acpi.zig parseFadt
+    // and ACPI 6.5, Section 5.2.9, Table 5-34.
 
     var core_idx: usize = 1;
     while (core_idx < core_count) {
@@ -571,9 +568,11 @@ fn secondarySetup(core_idx: u64) callconv(.c) noreturn {
 
     // Signal to the BSP that this core is online.
     _ = cores_online.fetchAdd(1, .release);
+    arch.earlyDebugChar('^');
 
     // Initialize per-core scheduler state (idle thread, running thread).
     sched.perCoreInit();
+    arch.earlyDebugChar('&');
 
     // Enter the idle loop.
     cpu.halt();

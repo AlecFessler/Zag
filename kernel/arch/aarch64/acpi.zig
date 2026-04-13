@@ -23,6 +23,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const gic = zag.arch.aarch64.gic;
+const power = zag.arch.aarch64.power;
 const serial = zag.arch.aarch64.serial;
 const smp = zag.arch.aarch64.smp;
 
@@ -361,6 +362,7 @@ pub fn decodeMadt(e: Madt.Entry) ?AnyMadt {
 /// Walks the XSDT to find:
 /// - MADT ("APIC"): GIC distributor, redistributor, and CPU interface discovery.
 /// - SPCR: PL011 UART base address for serial output.
+/// - FADT ("FACP"): ARM Boot Architecture Flags → PSCI conduit (SMC vs HVC).
 pub fn parseAcpi(xsdp_phys: PAddr) !void {
     const xsdp_virt = VAddr.fromPAddr(xsdp_phys, null);
     const xsdp = Xsdp.fromVAddr(xsdp_virt);
@@ -384,6 +386,50 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
         if (std.mem.eql(u8, @ptrCast(&sdt.signature), "SPCR")) {
             parseSpcr(sdt_virt);
         }
+
+        if (std.mem.eql(u8, @ptrCast(&sdt.signature), "FACP")) {
+            parseFadt(sdt_virt);
+        }
+    }
+}
+
+// FADT (ACPI 6.5, Section 5.2.9, Table 5-34) — ARM Boot Architecture Flags.
+// Located at offset 129 (decimal) into the FADT, length 2 bytes (u16).
+// Bit 0: PSCI_COMPLIANT — firmware implements PSCI.
+// Bit 1: PSCI_USE_HVC   — when set, PSCI calls must use HVC; otherwise SMC.
+const FADT_ARM_BOOT_FLAGS_OFFSET: usize = 129;
+const FADT_ARM_BOOT_FLAG_PSCI_COMPLIANT: u16 = 1 << 0;
+const FADT_ARM_BOOT_FLAG_PSCI_USE_HVC: u16 = 1 << 1;
+
+/// Parse FADT ARM Boot Architecture Flags to determine the PSCI conduit.
+///
+/// ACPI 6.5, Section 5.2.9, Table 5-34:
+///   - offset 129, u16: ARM Boot Architecture Flags
+///       bit 0 = PSCI_COMPLIANT
+///       bit 1 = PSCI_USE_HVC (set → HVC, clear → SMC)
+///
+/// Behaviour:
+///   - PSCI_COMPLIANT && PSCI_USE_HVC  → conduit = HVC
+///   - PSCI_COMPLIANT && !PSCI_USE_HVC → conduit = SMC
+///   - !PSCI_COMPLIANT                  → leave conduit at its default (SMC);
+///     the caller has no PSCI to talk to anyway.
+///
+/// Older FADT revisions predating ACPI 5.1 do not have this field; guard on
+/// table length so we never read past the end of the FADT.
+fn parseFadt(fadt_virt: VAddr) void {
+    const sdt = Sdt.fromVAddr(fadt_virt);
+    const length = sdt.length;
+    if (length < FADT_ARM_BOOT_FLAGS_OFFSET + @sizeOf(u16)) return;
+
+    const base: [*]const u8 = @ptrFromInt(fadt_virt.addr);
+    const flags = std.mem.readInt(u16, @ptrCast(base + FADT_ARM_BOOT_FLAGS_OFFSET), .little);
+
+    if ((flags & FADT_ARM_BOOT_FLAG_PSCI_COMPLIANT) == 0) return;
+
+    if ((flags & FADT_ARM_BOOT_FLAG_PSCI_USE_HVC) != 0) {
+        power.setConduit(.hvc);
+    } else {
+        power.setConduit(.smc);
     }
 }
 
@@ -417,11 +463,11 @@ fn parseMadt(madt_virt: VAddr) !void {
         }
     }
 
-    if (core_count > 0) {
-        gic.setCoreCount(core_count);
-    }
-
     // Second pass: extract distributor and redistributor base addresses.
+    // addRedistributor increments gic.core_count internally, so we must
+    // call setCoreCount AFTER this pass — otherwise the redistributor
+    // additions would push core_count past the true MADT GICC count
+    // (one phantom core per redistributor entry).
     madt_iter = madt.iter();
     var redist_idx: u64 = 0;
 
@@ -443,6 +489,10 @@ fn parseMadt(madt_virt: VAddr) !void {
             },
             else => {},
         }
+    }
+
+    if (core_count > 0) {
+        gic.setCoreCount(core_count);
     }
 }
 
