@@ -137,6 +137,10 @@ const GicrReg = enum(u32) {
 /// SGI_base frame offsets (at RD_base + 0x10000).
 /// IHI 0069H, Section 9.5, Table 9-2 "GICR_SGI_base register summary".
 const GicrSgiReg = enum(u32) {
+    /// SGI/PPI Interrupt Group Register. IHI 0069H, Section 9.5.2.
+    /// Bit n = 0 → INTID n is Group 0 (secure);
+    /// Bit n = 1 → INTID n is Group 1 Non-secure.
+    igroupr0 = 0x0080,
     /// SGI/PPI Set-Enable Register. IHI 0069H, Section 9.5.6.
     isenabler0 = 0x0100,
     /// SGI/PPI Clear-Enable Register. IHI 0069H, Section 9.5.7.
@@ -529,6 +533,13 @@ pub fn initRedistributor(core_idx: usize) void {
     if (gicd_base == 0) return;
     if (gicv3) {
         wakeRedistributor(core_idx);
+
+        // Assign all SGIs/PPIs to Group 1 Non-secure. After reset
+        // GICR_IGROUPR0 is UNKNOWN and some implementations leave every
+        // INTID in Group 0. We only enable ICC_IGRPEN1_EL1 on the CPU
+        // interface, so any PPI left in Group 0 (notably CNTV PPI 27)
+        // would be silently dropped. IHI 0069H, Section 9.5.2.
+        gicrSgiWrite(core_idx, .igroupr0, 0xFFFFFFFF);
 
         // Enable SGIs (INTID 0-15) and the generic timer PPIs
         // (27 = CNTV, 29 = CNTHP, 30 = CNTP) via GICR_ISENABLER0.
