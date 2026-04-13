@@ -64,6 +64,13 @@ const GicdReg = enum(u32) {
     /// Distributor Implementer Identification Register.
     /// IHI 0069H, Section 8.9.6 / IHI 0048B, Section 4.3.4.
     iidr = 0x0008,
+    /// Interrupt Group Registers (base).
+    /// IHI 0069H, Section 8.9.10 / IHI 0048B, Section 4.3.10.
+    /// GICD_IGROUPR<n> at offset 0x0080 + 4*n, one bit per INTID.
+    /// Bit = 0 → Group 0, bit = 1 → Group 1 (non-secure).
+    /// On both GICv2 and GICv3 the first register (IGROUPR0, INTIDs 0-31)
+    /// is banked per-CPU, so each core writes its own copy.
+    igroupr0 = 0x0080,
     /// Interrupt Set-Enable Registers (base).
     /// IHI 0069H, Section 8.9.7 / IHI 0048B, Section 4.3.5.
     /// GICD_ISENABLER<n> at offset 0x0100 + 4*n, each bit enables one INTID.
@@ -113,11 +120,21 @@ const GiccReg = enum(u32) {
     /// Binary Point Register. IHI 0048B, Section 4.4.3.
     bpr = 0x0008,
     /// Interrupt Acknowledge Register. IHI 0048B, Section 4.4.4.
-    /// Returns the INTID of the highest priority pending interrupt.
+    /// Acknowledges the highest priority pending Group 0 interrupt.
     iar = 0x000C,
     /// End of Interrupt Register. IHI 0048B, Section 4.4.5.
-    /// Write the INTID to signal completion.
+    /// Signals completion of the Group 0 interrupt.
     eoir = 0x0010,
+    /// Aliased Interrupt Acknowledge Register. IHI 0048B, Section 4.4.11.
+    /// Acknowledges the highest priority pending Group 1 interrupt. When
+    /// GICC_IAR is read and the pending interrupt is Group 1, it returns
+    /// the spurious INTID 1022 instead — GICC_AIAR is the correct ack
+    /// path for Group 1 interrupts.
+    aiar = 0x0020,
+    /// Aliased End of Interrupt Register. IHI 0048B, Section 4.4.12.
+    /// Signals completion of the Group 1 interrupt previously returned
+    /// by GICC_AIAR.
+    aeoir = 0x0024,
 };
 
 // ── GICR register offsets (IHI 0069H, Section 9.5) ─────────────
@@ -568,6 +585,15 @@ pub fn initRedistributor(core_idx: usize) void {
         }
     } else {
         // GICv2: SGI/PPI registers are in GICD, banked per-CPU.
+        //
+        // Assign all SGIs/PPIs to Group 1 Non-secure via the banked
+        // GICD_IGROUPR0. After reset this register is UNKNOWN (KVM
+        // GICv2 emulation + AAVMF leaves every INTID in Group 0). The
+        // CPU interface is enabled for Group 1, so any PPI left in
+        // Group 0 — notably the CNTV preemption timer PPI 27 — would
+        // be silently dropped. IHI 0048B, Section 4.3.10.
+        gicdWriteOffset(.igroupr0, 0, 0xFFFFFFFF);
+
         // Enable SGIs (INTID 0-15) and timer PPIs (27, 29, 30) via the
         // banked GICD_ISENABLER0.
         // IHI 0048B, Section 4.3.5.
@@ -627,9 +653,13 @@ pub fn initCpuInterface() void {
         // IHI 0048B, Section 4.4.3: GICC_BPR.
         giccWrite(.bpr, 0);
 
-        // Enable the CPU interface (Group 1).
-        // IHI 0048B, Section 4.4.1: GICC_CTLR, bit 0 = Enable.
-        giccWrite(.ctlr, 1);
+        // Enable the CPU interface for Group 1 non-secure. All SGIs/PPIs
+        // and SPIs are assigned to Group 1 in the distributor path, so we
+        // set EnableGrp1 (bit 1). Setting only EnableGrp0 (bit 0) as a
+        // naive "enable" would silently drop every Group 1 interrupt.
+        // IHI 0048B, Section 4.4.1: GICC_CTLR, bit 0 = EnableGrp0,
+        //   bit 1 = EnableGrp1.
+        giccWrite(.ctlr, 0x2);
     }
 }
 
@@ -673,18 +703,22 @@ pub fn coreID() u64 {
 /// Acknowledge the highest priority pending interrupt.
 ///
 /// On GICv3: reads ICC_IAR1_EL1 (IHI 0069H, Section 12.11.1).
-/// On GICv2: reads GICC_IAR (IHI 0048B, Section 4.4.4).
+/// On GICv2: reads GICC_AIAR. The driver assigns every INTID to Group 1
+/// non-secure, so GICC_IAR (Group 0 ack) would return the spurious
+/// INTID 1022 whenever a Group 1 interrupt is pending.
+/// IHI 0048B, Section 4.4.11 (aliased IAR).
 ///
 /// Returns the INTID, or `spurious_intid` (1023) if no interrupt is pending.
 pub fn acknowledgeInterrupt() u32 {
     if (gicv3) return readIccIar1();
-    return giccRead(.iar) & 0x3FF; // IHI 0048B: INTID in bits [9:0].
+    return giccRead(.aiar) & 0x3FF; // IHI 0048B: INTID in bits [9:0].
 }
 
 /// Signal end of interrupt processing for the given INTID.
 ///
 /// On GICv3: writes ICC_EOIR1_EL1 (IHI 0069H, Section 12.11.1).
-/// On GICv2: writes GICC_EOIR (IHI 0048B, Section 4.4.5).
+/// On GICv2: writes GICC_AEOIR (IHI 0048B, Section 4.4.12), the Group 1
+/// pair to GICC_AIAR.
 ///
 /// Must be called after the interrupt handler completes. For level-triggered
 /// SPIs, the peripheral must deassert the interrupt line before EOI to
@@ -693,7 +727,7 @@ pub fn endOfInterrupt(intid: u32) void {
     if (gicv3) {
         writeIccEoir1(intid);
     } else {
-        giccWrite(.eoir, intid);
+        giccWrite(.aeoir, intid);
     }
 }
 
