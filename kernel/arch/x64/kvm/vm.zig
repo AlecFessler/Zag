@@ -319,10 +319,23 @@ pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64
     if (!std.mem.isAligned(host_vaddr, 0x1000)) return E_INVAL;
     if (!zag.memory.address.AddrSpacePartition.user.contains(host_vaddr)) return E_BADADDR;
 
+    // Reject any (guest_addr, size) whose sum wraps u64. Without this
+    // check:
+    //   - In safety-checked builds, `guest_addr + size` below panics
+    //     the kernel from unprivileged userspace (single-syscall DoS
+    //     reachable by any process with vm_create rights).
+    //   - In unchecked builds, the sum wraps and folds a wrapping
+    //     range down into a small inner `guest_end`, so the
+    //     LAPIC/IOAPIC overlap check below can return false even when
+    //     the wrap-covered range includes one of those pages. The
+    //     recorded GuestMemory region would also have
+    //     guest_phys_start + size > 2^64, which deinit then sweeps by
+    //     wrapping into unrelated guest-phys pages.
+    const guest_end = std.math.add(u64, guest_addr, size) catch return E_INVAL;
+
     // Guard LAPIC and IOAPIC pages -- these are handled in-kernel and
     // must always NPT-fault to the kernel exit handler. Proper interval
     // overlap check: [guest_addr, guest_end) vs [base, base+0x1000).
-    const guest_end = guest_addr + size;
     if (guest_addr < LAPIC_BASE + 0x1000 and guest_end > LAPIC_BASE) return E_INVAL;
     if (guest_addr < IOAPIC_BASE + 0x1000 and guest_end > IOAPIC_BASE) return E_INVAL;
 
@@ -440,6 +453,15 @@ fn resolveVmHandle(proc: *Process, vm_handle: u64) ?*Vm {
 
 /// Read a struct from userspace into a kernel buffer, handling cross-page boundaries.
 fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
+    // Enforce full-range user-partition membership locally. The
+    // per-page walk below advances `src_va` across page boundaries
+    // without re-checking, and the point check at the caller is not
+    // enough to keep a near-top-of-user buffer from spilling into
+    // the kernel half.
+    const end = std.math.add(u64, user_va, buf.len) catch return false;
+    if (!zag.memory.address.AddrSpacePartition.user.contains(user_va)) return false;
+    if (end != user_va and !zag.memory.address.AddrSpacePartition.user.contains(end - 1)) return false;
+
     var remaining: usize = buf.len;
     var dst_off: usize = 0;
     var src_va: u64 = user_va;
@@ -460,6 +482,15 @@ fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
 
 /// AMD APM Vol 2, §15.10; Intel SDM Vol 3C, §24.6.9.
 /// MSRs that must always be intercepted by the hypervisor.
+///
+/// FS_BASE (0xC0000100) and GS_BASE (0xC0000101) are intentionally
+/// NOT in this list. On SVM the VMCB host-state save area saves and
+/// restores both across VMRUN, and on VMX the host-state MSR fields
+/// do the same; real guests (Linux) write these on every task
+/// switch, so forcing an intercept here collapses scheduler
+/// throughput without buying any ring-0 protection. KERNEL_GS_BASE
+/// is different: it survives SWAPGS and the host depends on it for
+/// per-CPU data, which is why that one stays intercepted.
 fn isSecurityCriticalMsr(msr: u32) bool {
     return switch (msr) {
         0xC0000080, // EFER

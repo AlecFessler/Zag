@@ -170,10 +170,19 @@ pub fn vmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContext, vm_handle: 
     if (buf_ptr == 0) return .{ .ret = E_BADADDR };
     if (!zag.memory.address.AddrSpacePartition.user.contains(buf_ptr)) return .{ .ret = E_BADADDR };
 
-    // Pre-fault all buffer pages the VmExitMessage may touch.
+    // Validate the full [buf_ptr, buf_ptr + msg_size) range fits in the
+    // user partition before pre-faulting. Without an end check, a
+    // buf_ptr near the top of user space plus the exit message size
+    // can overflow or span into the kernel half, which the pre-fault
+    // loop and downstream writeExitMessageToUser would then walk
+    // blindly.
     const msg_size: u64 = @sizeOf(VmExitMessage);
+    const buf_end = std.math.add(u64, buf_ptr, msg_size) catch return .{ .ret = E_BADADDR };
+    if (!zag.memory.address.AddrSpacePartition.user.contains(buf_end - 1)) return .{ .ret = E_BADADDR };
+
+    // Pre-fault all buffer pages the VmExitMessage may touch.
     var prefault_va = buf_ptr;
-    while (prefault_va < buf_ptr + msg_size) {
+    while (prefault_va < buf_end) {
         proc.vmm.demandPage(VAddr.fromInt(prefault_va), true, false) catch return .{ .ret = E_BADADDR };
         prefault_va += paging.PAGE4K;
     }
@@ -365,6 +374,14 @@ fn writeExitMessageToUser(proc: *Process, buf_ptr: u64, handle_id: u64, vcpu_obj
 
 /// Read bytes from userspace into a kernel buffer, handling cross-page boundaries.
 fn readUserBytes(proc: *Process, user_va: u64, buf: []u8) bool {
+    // Enforce full-range user-partition membership here. Callers
+    // (e.g. vmReply) only point-check the start, and the per-page
+    // walk below advances `src_va` across boundaries without
+    // re-checking.
+    const end = std.math.add(u64, user_va, buf.len) catch return false;
+    if (!zag.memory.address.AddrSpacePartition.user.contains(user_va)) return false;
+    if (end != user_va and !zag.memory.address.AddrSpacePartition.user.contains(end - 1)) return false;
+
     var remaining: usize = buf.len;
     var dst_off: usize = 0;
     var src_va: u64 = user_va;

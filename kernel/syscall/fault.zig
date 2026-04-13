@@ -229,12 +229,27 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
     }
 
     // §4.34.6: validate modified_regs_ptr for RESUME_MODIFIED.
+    //
+    // The 144-byte register buffer can straddle a VMM-node boundary.
+    // `findNode` returns the node containing the first byte only, so
+    // walk every 4 KiB page the buffer covers and verify each one is
+    // backed by a readable node. Without this, `applyModifiedRegs`
+    // dereferences the tail bytes directly under userAccessBegin,
+    // and an unmapped / non-readable tail page faults the kernel.
     if (action == fault_resume_modified) {
         if (!address.AddrSpacePartition.user.contains(modified_regs_ptr)) return E_BADADDR;
         const buf_end = std.math.add(u64, modified_regs_ptr, fault_regs_size) catch return E_BADADDR;
-        if (!address.AddrSpacePartition.user.contains(buf_end -| 1)) return E_BADADDR;
-        const node = proc.vmm.findNode(VAddr.fromInt(modified_regs_ptr)) orelse return E_BADADDR;
-        if (!node.rights.read) return E_BADADDR;
+        if (buf_end == modified_regs_ptr) return E_BADADDR;
+        if (!address.AddrSpacePartition.user.contains(buf_end - 1)) return E_BADADDR;
+        const first_page = std.mem.alignBackward(u64, modified_regs_ptr, paging.PAGE4K);
+        const last_page = std.mem.alignBackward(u64, buf_end - 1, paging.PAGE4K);
+        var page = first_page;
+        while (true) {
+            const node = proc.vmm.findNode(VAddr.fromInt(page)) orelse return E_BADADDR;
+            if (!node.rights.read) return E_BADADDR;
+            if (page == last_page) break;
+            page += paging.PAGE4K;
+        }
     }
 
     proc.fault_box.lock.lock();
