@@ -1043,7 +1043,7 @@ All syscalls return `i64`. Non-negative = success, negative = error code. Sizes 
 | Futex timed waiter slots | 64 |
 | User permissions view | 1 page (128 entries × 32 bytes) |
 | DMA mappings per process | 16 |
-| Thread handle rights bits | 5 (suspend, resume, kill, unpin, pmu) |
+| Thread handle rights bits | 4 (suspend, resume, kill, pmu) |
 | Max vCPUs per VM | 64 |
 | PMU counters per thread | `PmuInfo.num_counters` (hardware-dependent) |
 | PMU counter slots in `PmuSample` | `MAX_COUNTERS` (kernel compile-time maximum across supported arches) |
