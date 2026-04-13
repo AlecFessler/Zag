@@ -70,7 +70,7 @@ Each entry has a handle ID and a type tag. **§2.1.58** Each entry's handle fiel
 
 The `field0` and `field1` fields carry type-specific metadata. For process entries: **§2.1.61** process entry `field0` encodes `fault_reason(u5, bits 0-4) | restart_count(u16, bits 16-31)`. **§2.1.62** On first boot, process entry `field0` = 0. **§2.1.63** After restart, `fault_reason` in `field0` reflects the triggering fault. **§2.1.64** After restart, `restart_count` in `field0` increments. **§2.1.65** `dead_process` entry has the same `field0` encoding as `process` (fault_reason + restart_count). **§2.1.66** Parent's `process` entry is converted to `dead_process` when the child dies without restarting.
 
-For other types: **§2.1.67** `vm_reservation` entry: `field0` = start VAddr, `field1` = original size. **§2.1.68** `shared_memory` entry: `field0` = size. **§2.1.69** `device_region` entry: `field0` and `field1` follow §2.9 encoding.
+For other types: **§2.1.67** `vm_reservation` entry: `field0` = start VAddr, `field1` = original size. **§2.1.68** `shared_memory` entry: `field0` = size. **§2.1.69** `device_region` entry: `field0` and `field1` follow §2.5 encoding.
 
 **§2.1.70** The initial thread receives the user view pointer via the `arg` register at launch.
 
@@ -257,37 +257,27 @@ Port I/O device regions support virtual BAR mapping via `mem_mmio_map`. The mapp
 
 **§2.5.8** Virtual BAR access with a non-MOV instruction kills the process with `protection_fault`. **§2.5.9** Virtual BAR access that begins at or extends beyond `port_count` kills the process with `invalid_read` or `invalid_write`. An instruction whose encoding straddles a page boundary at RIP kills the process with `protection_fault`; compilers never emit this in normal code.
 
-Device entries in the user view encode hardware identification: **§2.5.2** device user view `field0` encodes: `device_type(u8) | device_class(u8) << 8 | size_or_port_count(u32) << 32`. **§2.5.3** Device user view `field1` encodes: `pci_vendor(u16) | pci_device(u16) << 16 | pci_class(u8) << 32 | pci_subclass(u8) << 40`.
+Device entries in the user view encode hardware identification: **§2.5.2** device user view `field0` encodes: `device_type(u8, bits 0-7) | device_class(u8, bits 8-15) | irq_pending(bit 16) | reserved_zero(bits 17-31) | size_or_port_count(u32, bits 32-63)`. Bit 16 is the IRQ pending bit (see IRQ Pending Bit below). **§2.5.3** Device user view `field1` encodes: `pci_vendor(u16) | pci_device(u16) << 16 | pci_class(u8) << 32 | pci_subclass(u8) << 40`.
 
 **§2.5.4** At boot, the kernel inserts all device handles into the root service's permissions table. **§2.5.5** Kernel-internal devices (HPET, LAPIC, I/O APIC) are not exposed in the user view.
 
 **§2.5.11** Revoking a device handle unmaps MMIO, returns handle up the process tree (§2.1), and clears the slot.
 
-`DeviceRegionRights` (u8): `map`(0), `grant`(1), `dma`(2), `irq`(3). The `irq` DeviceRegionRights bit gates `irq_ack`.
+`DeviceRegionRights` (u8): `map`(0), `grant`(1), `dma`(2), `irq`(3). The `irq` DeviceRegionRights bit gates `irq_ack` and meaningful use of the IRQ pending bit.
 
 **§2.5.12** Device transfer is exclusive (removed from sender on transfer). **§2.5.13** Transferred rights must be a subset of source rights.
 
-#### IRQ Notification Delivery
+#### IRQ Pending Bit
 
-Zag provides an asynchronous kernel-to-userspace notification mechanism for device interrupt delivery. Each process has a **notification box** containing a 64-bit bitmask word. When a device IRQ fires, the kernel atomically ORs a badge bit into the owning process's notification word and wakes any threads waiting on it. Multiple IRQs accumulate via OR — no notifications are dropped.
+When a device IRQ fires, the kernel sets bit 16 (the IRQ pending bit) in the device's `field0` in the owning process's user permissions view. Userspace can use the `field0` address as a futex wait target to sleep until the next IRQ.
 
-#### Badge Bits
+**§2.5.14** When a device IRQ fires, the kernel masks the IRQ line, identifies the owning process via the device region, and atomically sets bit 16 of the device's `field0` in the user permissions view via physmap. If the compare-and-swap fails (due to a racing IRQ or `irq_ack`), the kernel re-reads and retries. After setting the bit, the kernel calls `futex_wake` on the `field0` physical address to wake any thread waiting on it. **§2.5.15** Userspace derives the `field0` address of a device entry as `perm_view_vaddr + slot_index * 32 + 16` and uses it directly as a futex wait target (via `futex_wait_val` or `futex_wait_change`). **§2.5.16** `irq_ack` atomically clears bit 16 of the device's `field0` in the user permissions view via physmap. No futex wake is issued on clear.
 
-Each device handle in a process's permissions table has an associated `badge_bit` (u6, range 0--63). When the kernel delivers an IRQ for that device, it sets the corresponding bit in the process's notification word. Userspace reads the notification word via `notify_wait` to determine which devices have pending interrupts.
-
-<!-- spec:test:2.5.14 -->**§2.5.14** Badge bits are assigned incrementally (mod 64) per process as device handles are inserted into the permissions table. The `badge_counter` increments on each device handle insertion. <!-- spec:test:2.5.15 -->**§2.5.15** The badge bit is stored on the `PermissionEntry` for device region entries and exposed in the user permissions view so userspace can map notification bits to device handles without a syscall. <!-- spec:test:2.5.16 -->**§2.5.16** The badge bit is stored in the `badge_byte` field (offset 9, the byte after `entry_type`) of the device entry in the user permissions view.
-
-#### Notification Delivery
-
-<!-- spec:test:2.5.17 -->**§2.5.17** When a device IRQ fires, the kernel masks the IRQ line, identifies the owning process via the device region, atomically ORs `(1 << badge_bit)` into the process's notification word, and wakes all threads waiting on the notification box. <!-- spec:test:2.5.18 -->**§2.5.18** `notify_wait` atomically reads and clears the notification word. On success, it returns the bitmask of all accumulated notifications since the last read. <!-- spec:test:2.5.19 -->**§2.5.19** `notify_wait` with `timeout_ns = 0` is non-blocking: returns `E_AGAIN` if the notification word is zero. **§2.5.20** `notify_wait` with `timeout_ns = MAX_U64` blocks indefinitely until the notification word becomes non-zero. <!-- spec:test:2.5.21 -->**§2.5.21** `notify_wait` with a finite timeout returns `E_TIMEOUT` if the notification word remains zero for the duration. <!-- spec:test:2.5.22 -->**§2.5.22** `irq_ack` unmasks the IRQ line for the device associated with the given handle. Requires `DeviceRegionRights.irq` on the device handle. **§2.5.23** The typical driver flow is: `notify_wait` to sleep until an IRQ fires, handle the interrupt in userspace, call `irq_ack` to unmask the line and allow future interrupts.
+**§2.5.17** `DeviceRegionRights.irq` gates both `irq_ack` and meaningful use of the IRQ pending bit. **§2.5.18** The typical driver flow is: read `field0`, call `futex_wait_val` on the `field0` address with the current value as expected (the thread wakes when bit 16 is set by the kernel), handle the interrupt in userspace, call `irq_ack` to clear the pending bit and unmask the line.
 
 #### irq_ack(device_handle) → result
 
-Unmasks the IRQ line for the device associated with `device_handle`, allowing future interrupts to be delivered. <!-- spec:test:2.5.24 -->**§2.5.24** `irq_ack` returns `E_OK` on success. <!-- spec:test:2.5.25 -->**§2.5.25** `irq_ack` with invalid or wrong-type `device_handle` returns `E_BADHANDLE`. <!-- spec:test:2.5.26 -->**§2.5.26** `irq_ack` without `DeviceRegionRights.irq` on the device handle returns `E_PERM`. <!-- spec:test:2.5.27 -->**§2.5.27** `irq_ack` on a device with no associated IRQ line returns `E_INVAL`.
-
-#### notify_wait(timeout_ns) → bitmask
-
-Waits for the calling process's notification word to become non-zero, then atomically reads and clears it. <!-- spec:test:2.5.28 -->**§2.5.28** `notify_wait` returns the notification bitmask (positive u64) on success. <!-- spec:test:2.5.29 -->**§2.5.29** `notify_wait` requires no rights and is callable by any process. <!-- spec:test:2.5.30 -->**§2.5.30** `notify_wait` with `timeout_ns = 0` is non-blocking: returns `E_AGAIN` if the notification word is zero. **§2.5.31** `notify_wait` with `timeout_ns = MAX_U64` blocks indefinitely until the notification word becomes non-zero. <!-- spec:test:2.5.32 -->**§2.5.32** `notify_wait` with a finite `timeout_ns` returns `E_TIMEOUT` if the notification word remains zero for the duration.
+Clears the IRQ pending bit (bit 16 of the device's `field0` in the user permissions view) and unmasks the IRQ line for the device associated with `device_handle`, allowing future interrupts to be delivered. <!-- spec:test:2.5.24 -->**§2.5.24** `irq_ack` returns `E_OK` on success. <!-- spec:test:2.5.25 -->**§2.5.25** `irq_ack` with invalid or wrong-type `device_handle` returns `E_BADHANDLE`. <!-- spec:test:2.5.26 -->**§2.5.26** `irq_ack` without `DeviceRegionRights.irq` on the device handle returns `E_PERM`. <!-- spec:test:2.5.27 -->**§2.5.27** `irq_ack` on a device with no associated IRQ line returns `E_INVAL`.
 
 #### mem_dma_map(device_handle, shm_handle) → dma_addr
 
@@ -319,17 +309,25 @@ Creates a shared memory region backed by eagerly allocated zeroed pages. **§3.1
 
 ### §3.2 Futex
 
-The futex mechanism bridges userspace synchronization with the kernel scheduler. A thread atomically checks a memory location and sleeps if the value matches, avoiding busy-waiting.
+The futex mechanism bridges userspace synchronization with the kernel scheduler. A thread atomically checks one or more memory locations and sleeps if the values match, avoiding busy-waiting.
 
-**§3.2.1** `futex_wait` blocks the calling thread when value at `addr` matches `expected`. **§3.2.2** `futex_wait` with timeout=0 returns `E_TIMEOUT` immediately (try-only). **§3.2.3** `futex_wait` with timeout=`MAX_U64` blocks indefinitely until woken. **§3.2.4** `futex_wait` with a finite timeout blocks for at least `timeout_ns` nanoseconds; actual expiry may be delayed until the next scheduler tick. **§3.2.5** Cross-process futexes work over shared memory (two processes mapping the same SHM can synchronize via the same address). **§3.2.6** `futex_wake` wakes up to `count` threads blocked on `addr`. **§3.2.7** Futex waiters are woken in priority order (highest priority first), with FIFO ordering among waiters of the same priority level.
+**§3.2.1** `futex_wait_val` blocks the calling thread when the value at every `addrs[i]` matches `expected[i]`. **§3.2.2** `futex_wait_val` with timeout=0 is non-blocking: returns immediately without blocking (try-only check). **§3.2.3** `futex_wait_val` with timeout=`MAX_U64` blocks indefinitely until woken. **§3.2.4** `futex_wait_val` with a finite timeout blocks for at least `timeout_ns` nanoseconds; actual expiry may be delayed until the next scheduler tick. **§3.2.5** Cross-process futexes work over shared memory (two processes mapping the same SHM can synchronize via the same address). **§3.2.6** `futex_wake` wakes up to `count` threads blocked on `addr`. **§3.2.7** Futex waiters are woken in priority order (highest priority first), with FIFO ordering among waiters of the same priority level.
 
-#### futex_wait(addr, expected, timeout_ns) → result
+#### futex_wait_val(addrs_ptr, expected_ptr, count, timeout_ns) → index
 
-Atomically checks the u64 at `addr` against `expected` and blocks if they match. **§3.2.8** `futex_wait` returns `E_OK` when woken. **§3.2.9** `futex_wait` returns `E_AGAIN` on value mismatch. **§3.2.10** `futex_wait` returns `E_TIMEOUT` on timeout expiry. **§3.2.11** `futex_wait` with non-8-byte-aligned addr returns `E_INVAL`. **§3.2.12** `futex_wait` with invalid addr returns `E_BADADDR`. Returns `E_NORES` on futex slot exhaustion.
+Atomically checks `count` u64 values: for each `i` in `[0, count)`, checks the u64 at `addrs[i]` against `expected[i]`. If any word already differs from its expected value, returns that index immediately without blocking. If all words match, the thread blocks until any address is woken by `futex_wake`, then returns the index of the woken address. With `count = 1`, this is a direct replacement for single-address futex waiting.
+
+**§3.2.8** `futex_wait_val` returns the index (non-negative) of the first address that changed or was woken on success. **§3.2.9** `futex_wait_val` returns the index of the mismatched address immediately when any `addrs[i]` does not match `expected[i]` at call time. **§3.2.10** `futex_wait_val` returns `E_TIMEOUT` on timeout expiry. **§3.2.11** `futex_wait_val` with any non-8-byte-aligned address in the array returns `E_INVAL`. **§3.2.12** `futex_wait_val` with any invalid address in the array returns `E_BADADDR`. **§3.2.13** `futex_wait_val` with `count = 0` returns `E_INVAL`. **§3.2.14** `futex_wait_val` with `count` exceeding `MAX_FUTEX_WAIT` (64) returns `E_INVAL`. Returns `E_NORES` on futex slot exhaustion.
+
+#### futex_wait_change(addrs_ptr, count, timeout_ns) → index
+
+Atomically reads the current values of all `count` addresses under their bucket locks, then blocks until any address changes from those snapshot values. Returns the index of the first address that changed. This is useful when the caller does not know or care about the specific expected value, only that something changed.
+
+**§3.2.15** `futex_wait_change` returns the index (non-negative) of the first address that changed on success. **§3.2.16** `futex_wait_change` returns `E_TIMEOUT` on timeout expiry. **§3.2.17** `futex_wait_change` with any non-8-byte-aligned address in the array returns `E_INVAL`. **§3.2.18** `futex_wait_change` with any invalid address in the array returns `E_BADADDR`. **§3.2.19** `futex_wait_change` with `count = 0` returns `E_INVAL`. **§3.2.20** `futex_wait_change` with `count` exceeding `MAX_FUTEX_WAIT` (64) returns `E_INVAL`. **§3.2.21** `futex_wait_change` has the same timeout semantics as `futex_wait_val`: `0` is non-blocking, `MAX_U64` is indefinite, finite blocks for at least that duration. Returns `E_NORES` on futex slot exhaustion.
 
 #### futex_wake(addr, count) → result
 
-**§3.2.13** `futex_wake` returns number of threads woken (non-negative). **§3.2.14** `futex_wake` with invalid addr returns `E_BADADDR`. **§3.2.15** `futex_wake` with non-8-byte-aligned addr returns `E_INVAL`.
+**§3.2.22** `futex_wake` returns number of threads woken (non-negative). **§3.2.23** `futex_wake` with invalid addr returns `E_BADADDR`. **§3.2.24** `futex_wake` with non-8-byte-aligned addr returns `E_INVAL`.
 
 ---
 
@@ -976,8 +974,9 @@ All syscalls return `i64`. Non-negative = success, negative = error code. Sizes 
 | 19 | `reply` | §3.3 |
 | 20 | `revoke_perm` | §2.1 |
 | 21 | `disable_restart` | §2.1 |
-| 22 | `futex_wait` | §3.2 |
+| 22 | `futex_wait_val` | §3.2 |
 | 23 | `futex_wake` | §3.2 |
+| 27 | `futex_wait_change` | §3.2 |
 | 24 | `clock_gettime` | §5.1 |
 | 25 | `mem_dma_map` | §2.5 |
 | 26 | `mem_dma_unmap` | §2.5 |
@@ -1011,7 +1010,6 @@ All syscalls return `i64`. Non-negative = success, negative = error code. Sizes 
 | 56 | `clock_getwall` | §5.1 |
 | 57 | `clock_setwall` | §5.1 |
 | 58 | `getrandom` | §5.2 |
-| 59 | `notify_wait` | §2.5 |
 | 60 | `irq_ack` | §2.5 |
 | 61 | `sys_power` | §5.4 |
 | 62 | `sys_cpu_power` | §5.4 |
@@ -1064,5 +1062,5 @@ All syscalls return `i64`. Non-negative = success, negative = error code. Sizes 
 | PMU counter slots in `PmuSample` | `MAX_COUNTERS` (kernel compile-time maximum across supported arches) |
 | Max `SysInfo.core_count` | 64 (matches Max CPU cores) |
 | `getrandom` max buffer size | 4096 bytes |
-| Notification badge bits | 64 (u6, one per device handle) |
+| Max futex wait addresses | 64 (`MAX_FUTEX_WAIT`) |
 | IRQ table entries | 256 |
