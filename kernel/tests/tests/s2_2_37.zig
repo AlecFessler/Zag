@@ -6,7 +6,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.2.37 — Fault on the overflow guard (above stack) kills with fault reason `stack_underflow` (§3).
+/// §2.2.37 — Fault on the overflow guard (above stack) kills with fault reason `stack_underflow` (§6).
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 

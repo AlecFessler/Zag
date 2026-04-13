@@ -1,4 +1,4 @@
-/// §4.2.61 — `vm_ioapic_assert_irq` with an invalid VM handle returns `E_BADCAP`.
+/// §4.2.61 — `vm_ioapic_assert_irq` with an invalid VM handle returns `E_BADHANDLE`.
 const lib = @import("lib");
 
 const syscall = lib.syscall;

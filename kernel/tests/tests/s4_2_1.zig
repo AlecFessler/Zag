@@ -1,4 +1,4 @@
-/// §4.2.1 — All VM syscalls with an invalid handle return `E_BADCAP`.
+/// §4.2.1 — All VM syscalls with an invalid handle return `E_BADHANDLE`.
 const lib = @import("lib");
 
 const syscall = lib.syscall;

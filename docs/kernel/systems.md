@@ -2003,7 +2003,7 @@ Returns `true` if the fault was queued (caller should yield); `false` if the pro
       Unlock self.lock.
    c. Lock self.fault_box.lock.
       If self.fault_box.isReceiving():
-        Direct-deliver to the waiter (see §6 below).
+        Direct-deliver to the waiter (see Direct delivery to a blocked receiver below).
       Else:
         self.fault_box.enqueueLocked(thread)
       Unlock self.fault_box.lock.

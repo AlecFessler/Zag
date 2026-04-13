@@ -6,8 +6,8 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §4.1.7 — When a thread faults and the process is its own fault handler and only one thread exists (the faulting thread), the process is killed or restarted immediately per §2.6 semantics; no fault message is delivered
-/// exists (the faulting thread), the process is killed or restarted immediately per §2.6
+/// §4.1.7 — When a thread faults and the process is its own fault handler and only one thread exists (the faulting thread), the process is killed or restarted immediately per §2.1 semantics; no fault message is delivered
+/// exists (the faulting thread), the process is killed or restarted immediately per §2.1
 /// semantics; no fault message is delivered.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);

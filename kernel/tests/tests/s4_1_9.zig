@@ -6,8 +6,8 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §4.1.9 — When all threads in a self-handling process are simultaneously in `.faulted` state, the process is killed or restarted per §2.6 semantics; no additional fault messages are delivered.
-/// in `.faulted` state, the process is killed or restarted per §2.6
+/// §4.1.9 — When all threads in a self-handling process are simultaneously in `.faulted` state, the process is killed or restarted per §2.1 semantics; no additional fault messages are delivered.
+/// in `.faulted` state, the process is killed or restarted per §2.1
 /// semantics; no additional fault messages are delivered.
 ///
 /// Strong test: spawn a self-handling multi-thread child. Two workers
