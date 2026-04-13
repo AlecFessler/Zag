@@ -307,7 +307,7 @@ The return always uses IRETQ, which properly loads CS/SS from the stack frame. S
 
 **pmuStart(state: *PmuState, configs: []const PmuCounterConfig) -> error!void** -- Programs the hardware counters described by `configs` into the arch-specific state, clears the counter registers, and enables them. Only called while the state's owning thread is the current thread (the generic layer arranges this).
 
-**pmuRead(state: *PmuState, sample: *PmuSample) -> void** -- Snapshots the counter values stored in `state` into `sample.counters` in configuration order. Does *not* touch hardware — `pmu_read` is only ever called on a thread in `.faulted` or `.suspended` state (§2.14.11), so by the time the generic layer calls this the outgoing save has already pushed the final values into `state`.
+**pmuRead(state: *PmuState, sample: *PmuSample) -> void** -- Snapshots the counter values stored in `state` into `sample.counters` in configuration order. Does *not* touch hardware — `pmu_read` is only ever called on a thread in `.faulted` or `.suspended` state (§4.1.47), so by the time the generic layer calls this the outgoing save has already pushed the final values into `state`.
 
 **pmuReset(state: *PmuState, configs: []const PmuCounterConfig) -> error!void** -- Same as `pmuStart` but for a thread that already has allocated state. Reprograms counters, writes the new overflow preload values, and re-enables.
 
@@ -1143,7 +1143,7 @@ Atomic boolean. Set to `true` when a thread is dispatched onto a CPU, set to `fa
 ### Thread Deinit
 
 `Thread.deinit()`:
-1. If `pmu_state != null`, call `arch.pmuClearState(pmu_state)` to zero the state struct without touching any MSRs, then free the PMU state back to `PmuStateAllocator` and clear the field. The dying thread is not running on any core at this point (exit paths leave the thread off its run queue before tearing it down), so MSR writes on the caller's core would either be a no-op against stale values or clobber the PMU state of whichever thread currently owns the hardware. Real hardware teardown for the dying thread happened at its last `pmuSave` on context switch away. This is the implicit `pmu_stop` on thread exit (§2.14.9, §20).
+1. If `pmu_state != null`, call `arch.pmuClearState(pmu_state)` to zero the state struct without touching any MSRs, then free the PMU state back to `PmuStateAllocator` and clear the field. The dying thread is not running on any core at this point (exit paths leave the thread off its run queue before tearing it down), so MSR writes on the caller's core would either be a no-op against stale values or clobber the PMU state of whichever thread currently owns the hardware. Real hardware teardown for the dying thread happened at its last `pmuSave` on context switch away. This is the implicit `pmu_stop` on thread exit (§4.1.45, §20).
 2. Clear the thread handle entry from the owning process's perm table. If `fault_handler_proc` is non-null, also clear the thread handle entry from the handler's perm table. Call `syncUserView` on all affected tables.
 3. Destroy kernel stack (unmap committed pages, recycle slot).
 4. Call `proc.removeThread(self)` to remove the thread from the process slot table; receive `is_last` as the return value.
@@ -1458,7 +1458,7 @@ After every mutation, the kernel writes all 128 entries to the user-visible view
 
 1. **Self-notification — slot-0 `field1` generation counter.** `syncUserView` bumps `perm_view_gen` on every mutation and writes it into slot 0's `field1` with release ordering, then futex-wakes that address. Threads within the owning process watch this address to block until *any* slot mutates. This is a broadcast channel scoped to the owning process.
 
-2. **Parent-observes-child — child-slot `field0`.** When a child process's state changes in a way the parent should observe (restart, death, fault — spec §2.6.27 and §2.6.29), the kernel writes the new `field0` (fault_reason / restart_count) into the parent's entry for the child and futex-wakes the parent's `field0` for that slot. Parents watch this address to block until a specific child's state changes.
+2. **Parent-observes-child — child-slot `field0`.** When a child process's state changes in a way the parent should observe (restart, death, fault — spec §2.1.38 and §2.1.40), the kernel writes the new `field0` (fault_reason / restart_count) into the parent's entry for the child and futex-wakes the parent's `field0` for that slot. Parents watch this address to block until a specific child's state changes.
 
 The two channels coexist: a restart of a child bumps both the parent's slot-0 `field1` (the parent saw *some* mutation) and the specific child-slot `field0` (that particular child changed state). Parents that only care about one child should prefer the child-slot `field0` wake; generic "something changed" observers use the slot-0 `field1` generation counter.
 
@@ -1609,7 +1609,7 @@ if (next.pmu_state)     |st| arch.pmuRestore(st);
 arch.switchTo(next);   // never returns — jmp's into next's interrupt frame
 ```
 
-Both checks are a single load-and-compare on the hot path. Threads without PMU state (the common case) pay only the null comparison and never touch the PMU hardware. Threads with PMU state round-trip their counter values through arch-specific MSRs on every context switch; this is the cost of making counts per-thread rather than per-core (§2.14.10).
+Both checks are a single load-and-compare on the hot path. Threads without PMU state (the common case) pay only the null comparison and never touch the PMU hardware. Threads with PMU state round-trip their counter values through arch-specific MSRs on every context switch; this is the cost of making counts per-thread rather than per-core (§4.1.46).
 
 `arch.switchTo` does not return to this frame — on x64 it mov's RSP to the incoming thread's interrupt frame and jmp's to `interruptStubEpilogue`, which iret's into the incoming thread. Any code placed after `switchTo` would be dead on the incoming side and would only run the next time the previously outgoing thread resumes (on its own core). PMU state is per-core MSR state, so the restore must happen *before* the switch, while the kernel is still running on the core the incoming thread will run on immediately. The save is sequenced first so hardware is quiet (the save zeroes `IA32_PERF_GLOBAL_CTRL`) before programming the incoming thread's counters.
 
@@ -1816,7 +1816,7 @@ Four syscalls: `send` (non-blocking fire-and-forget), `call` (blocking RPC), `re
 
 5 payload registers in order: `rdi`(0), `rsi`(1), `rdx`(2), `r8`(3), `r9`(4). Only caller-saved registers are used for payload. `r13` = target process handle. `r14` = metadata flags. `rax` = syscall number / return status. `rcx` and `r11` reserved for future `syscall` instruction.
 
-r14 encoding varies by syscall — see spec §2.11.
+r14 encoding varies by syscall — see spec §3.3 Message Passing (register convention).
 
 ### MessageBox
 
@@ -1973,7 +1973,7 @@ Defined in `Process.faultBlock` (`kernel/proc/process.zig`). The fault delivery 
 
 ### faultBlock(self, thread, reason, fault_addr, rip) → bool
 
-Returns `true` if the fault was queued (caller should yield); `false` if the process must die immediately (§2.12.7 / §2.12.9). The caller — the exception handler — is responsible for stamping the metadata onto the thread *before* this function (or at function entry) and for either yielding or initiating kill on the return value.
+Returns `true` if the fault was queued (caller should yield); `false` if the process must die immediately (§4.1.7 / §4.1.9). The caller — the exception handler — is responsible for stamping the metadata onto the thread *before* this function (or at function entry) and for either yielding or initiating kill on the return value.
 
 ```
 1. handler = self.faultHandlerOf(reason)
@@ -1996,14 +1996,14 @@ Returns `true` if the fault was queued (caller should yield); `false` if the pro
    a. Lock self.lock.
       alive = num_threads - popcount(faulted_thread_slots)
       If alive <= 1:
-        unlock; return false  (§2.12.7 / §2.12.9 — no surviving thread to recv,
+        unlock; return false  (§4.1.7 / §4.1.9 — no surviving thread to recv,
                                immediate kill/restart)
    b. thread.state = .faulted
       set bit thread.slot_index in faulted_thread_slots
       Unlock self.lock.
    c. Lock self.fault_box.lock.
       If self.fault_box.isReceiving():
-        Direct-deliver to the waiter (see §6 below).
+        Direct-deliver to the waiter (see Direct delivery to a blocked receiver below).
       Else:
         self.fault_box.enqueueLocked(thread)
       Unlock self.fault_box.lock.
@@ -2354,7 +2354,7 @@ The Vm struct has its own `lock: SpinLock` protecting vCPU list and VM-wide stat
 
 ## 20. PMU Internals
 
-Per-thread performance monitoring unit support. The public contract is in spec §2.14 and spec §4.50–§4.54. This section describes how the pieces fit together internally.
+Per-thread performance monitoring unit support. The public contract is in spec §4.1 Performance Monitoring Unit (capability model, syscalls `pmu_info` / `pmu_start` / `pmu_read` / `pmu_reset` / `pmu_stop`). This section describes how the pieces fit together internally.
 
 ### Layering
 
@@ -2375,7 +2375,7 @@ The generic layer (`kernel/syscall/pmu.zig`) is architecture-agnostic. It valida
 - **`kernel/main.zig`** — calls `arch.pmuInit()` once after `arch.vmInit()` and before `sched.globalInit()`, mirroring the VM init ordering.
 - **`kernel/arch/dispatch.zig`** — adds the `PmuState` comptime type alias and the `pmuInit`/`pmuGetInfo`/`pmuSave`/`pmuRestore`/`pmuStart`/`pmuRead`/`pmuReset`/`pmuStop` functions (see §13).
 - **`kernel/syscall/dispatch.zig`** — dispatch cases for syscall numbers `pmu_info`, `pmu_start`, `pmu_read`, `pmu_reset`, and `pmu_stop` forward to the corresponding `pmu.sysPmuXxx` entry point in `kernel/syscall/pmu.zig`. No arg validation happens in the dispatch layer; validation lives in the generic layer so all arches share it.
-- **`kernel/sched/thread.zig`** — adds the `pmu_state: ?*arch.PmuState = null` field (see §5) and the PMU-free step in `Thread.deinit` (automatic `pmu_stop` on thread exit, §2.14.9).
+- **`kernel/sched/thread.zig`** — adds the `pmu_state: ?*arch.PmuState = null` field (see §5) and the PMU-free step in `Thread.deinit` (automatic `pmu_stop` on thread exit, §4.1.45).
 - **`kernel/sched/scheduler.zig`** — context switch paths (`schedTimerHandler` and IPC `switchToThread`) add the null-guarded `arch.pmuSave` / `arch.pmuRestore` calls around `arch.switchTo` (see §6). All other scheduler logic is unchanged.
 - **`kernel/memory/init.zig`** — adds `PmuStateAllocator = SlabAllocator(arch.PmuState, false, 0, 64, true)` with a dedicated 16 MiB bump region between the VCpu slab region and the heap tree slab region. Initialized in `memory.init()` alongside the other slabs.
 - **`kernel/perms/permissions.zig`** — adds `pmu` bit (bit 8) on `ProcessRights` and `pmu` bit (bit 4) on `ThreadHandleRights` (see §4). No other rights types are touched.
@@ -2439,7 +2439,7 @@ x64.PmuState (extern struct) {
 
 **`pmuRestore(state)`**: for each configured counter write `state.values[i]` back into `IA32_PMCx`, re-write `IA32_PERFEVTSELx` (event select is not changed by save/restore, but rewriting is idempotent and cheap), then write the enable bitmask into `IA32_PERF_GLOBAL_CTRL`.
 
-**`pmuRead(state, sample)`**: `pmu_read` is only legal on a thread that is `.faulted` or `.suspended` (§2.14.11), which means the outgoing save has already run and pushed hardware values into `state.values`. `pmuRead` simply copies `state.values[0..state.num_counters]` into `sample.counters` and zero-fills the remainder; `sample.timestamp` is filled in by the generic layer via `arch.getMonotonicClock().now()`.
+**`pmuRead(state, sample)`**: `pmu_read` is only legal on a thread that is `.faulted` or `.suspended` (§4.1.47), which means the outgoing save has already run and pushed hardware values into `state.values`. `pmuRead` simply copies `state.values[0..state.num_counters]` into `sample.counters` and zero-fills the remainder; `sample.timestamp` is filled in by the generic layer via `arch.getMonotonicClock().now()`.
 
 **`pmuReset(state, configs)`**: same as `pmuStart` but assumes `state` is already allocated; overwrites the configs and preload values, clears any stale overflow status bits in `IA32_PERF_GLOBAL_STATUS` via `IA32_PERF_GLOBAL_OVF_CTRL`, and re-enables.
 
@@ -2468,7 +2468,7 @@ pmuPmiHandler(frame):
     4. Save the overflowed counter values into state.values (same as pmuSave).
     5. Call proc.faultBlock(thread, .pmu_overflow, rip_at_pmi, rip_at_pmi).
        The existing fault delivery path (§18) handles single-thread-self-handler
-       kill (§2.12.7), external-handler stop-all, and enqueue into the handler's
+       kill (§4.1.7), external-handler stop-all, and enqueue into the handler's
        fault_box. FaultMessage.fault_addr and FaultMessage.regs.rip are both
        the instruction pointer at the time of overflow — this is the sample.
     6. If faultBlock returned false (no surviving handler), kill the process
@@ -2491,7 +2491,7 @@ The PMI handler does not program new counters; that is the profiler's job via `p
 `kernel/syscall/pmu.zig` implements `sysPmuInfo`, `sysPmuStart`, `sysPmuRead`, `sysPmuReset`, and `sysPmuStop`. Each follows the same shape:
 
 1. Look up the target thread via `getPermByHandle` on the calling process's perm table. Validate that the entry is a thread-type entry.
-2. Check `ProcessRights.pmu` on slot 0 of the calling process, then check `ThreadHandleRights.pmu` on the thread entry. `E_PERM` if either is missing. (`sysPmuInfo` skips both checks — see spec §2.14.1 and §4.50.2.)
+2. Check `ProcessRights.pmu` on slot 0 of the calling process, then check `ThreadHandleRights.pmu` on the thread entry. `E_PERM` if either is missing. (`sysPmuInfo` skips both checks — see spec §4.1.79 (`pmu_info` requires no rights).)
 3. Validate state constraints: `.faulted`/`.suspended` for `sysPmuRead`, `.faulted` for `sysPmuReset`, any-state-except-exited for `sysPmuStop`.
 4. Validate the userspace buffer pointer via the standard `validateUserReadable` / `validateUserWritable` helpers.
 5. Validate the config array against the cached `PmuInfo` (`count > 0`, `count <= num_counters`, every event bit set in `supported_events`, overflow thresholds only if `overflow_support`). Return `E_INVAL` on any failure.
@@ -2510,12 +2510,12 @@ When aarch64 PMU support is actually implemented (ARMv8-A has its own performanc
 
 ### Locking and Cross-Core Constraints
 
-PMU syscalls that take a thread handle always operate on a thread owned by a process whose perm table is locked while the thread is being accessed (the same lock discipline as `thread_suspend` / `thread_resume`). Because `pmu_read` is restricted to `.faulted` / `.suspended` threads (§2.14.11), the kernel never needs to interrupt a running remote core to read counters.
+PMU syscalls that take a thread handle always operate on a thread owned by a process whose perm table is locked while the thread is being accessed (the same lock discipline as `thread_suspend` / `thread_resume`). Because `pmu_read` is restricted to `.faulted` / `.suspended` threads (§4.1.47), the kernel never needs to interrupt a running remote core to read counters.
 
 `pmu_start`, `pmu_reset`, and `pmu_stop` all branch on `target_thread == scheduler.currentThread()`:
 
 - **Self path** (target is the caller): the hardware is on this exact core. Call the full `arch.pmuStart` / `pmuReset` / `pmuStop`, which writes MSRs in place.
-- **Remote path** (target is a different thread): the target is required by the generic layer to be `.faulted` or `.suspended` before any stamping happens — `pmu_start` / `pmu_stop` return `E_BUSY` (spec §4.51.11 / §4.54.7) and `pmu_reset` returns `E_INVAL` (spec §4.53.5, .faulted-only) otherwise. This is enforced *before* touching `state`, so stamping can never race `pmuSave` / `pmuRestore` on the target's core. The generic layer then calls `arch.pmuConfigureState` / `arch.pmuClearState` — these stamp `state.configs` / `state.values` without touching any MSRs. The next `pmuRestore` (when the target is next scheduled onto a core) programs hardware fresh from the stamped state. No cross-core IPI is needed.
+- **Remote path** (target is a different thread): the target is required by the generic layer to be `.faulted` or `.suspended` before any stamping happens — `pmu_start` / `pmu_stop` return `E_BUSY` (spec §4.1.92 / §4.1.115) and `pmu_reset` returns `E_INVAL` (spec §4.1.105, .faulted-only) otherwise. This is enforced *before* touching `state`, so stamping can never race `pmuSave` / `pmuRestore` on the target's core. The generic layer then calls `arch.pmuConfigureState` / `arch.pmuClearState` — these stamp `state.configs` / `state.values` without touching any MSRs. The next `pmuRestore` (when the target is next scheduled onto a core) programs hardware fresh from the stamped state. No cross-core IPI is needed.
 
 Writing MSRs on the caller's core for a remote target would be doubly wrong: it would clobber the PMU state of whatever thread is currently running on the caller's core, and it would do nothing to the target's future core.
 
@@ -2600,7 +2600,7 @@ The HPET is used as the reference clock for TSC and LAPIC timer calibration.
 
 ## 22. Wall Clock Time Internals
 
-Wall clock time as an offset from the monotonic clock. The public contract is in spec §2.16 and spec §4.56--§4.57. This section describes how the pieces fit together internally.
+Wall clock time as an offset from the monotonic clock. The public contract is in spec §5.1 Clock (`clock_getwall` / `clock_setwall`). This section describes how the pieces fit together internally.
 
 ### Layering
 
@@ -2713,7 +2713,7 @@ The function returns `u64` nanoseconds since 1970-01-01T00:00:00Z. Precision is 
 
 ## 24. IRQ Pending Bit and Delivery Internals
 
-IRQ delivery via a pending bit in the device's user view entry, waking futex waiters. The public contract is in spec §2.5. This section describes how the pieces fit together internally.
+IRQ delivery via a pending bit in the device's user view entry, waking futex waiters. The public contract is in spec §2.4 Device Region (IRQ Pending Bit). This section describes how the pieces fit together internally.
 
 ### Layering
 
@@ -2850,7 +2850,7 @@ No special cleanup is needed for the IRQ pending bit on process death. The user 
 
 ## 23. Randomness Internals
 
-Hardware-sourced random bytes for userspace. The public contract is in spec §2.17 and spec §4.58. This section describes how the pieces fit together internally.
+Hardware-sourced random bytes for userspace. The public contract is in spec §5.2 Randomness (`getrandom`). This section describes how the pieces fit together internally.
 
 ### Layering
 
@@ -2932,7 +2932,7 @@ The maximum of 4096 bytes per call means at most 512 RDRAND invocations. RDRAND 
 
 ## 21. System Info Internals
 
-Per-process read access to system-wide and per-core hardware and scheduler state. The public contract is in spec §2.15 and spec §4.55. This section describes how the pieces fit together internally.
+Per-process read access to system-wide and per-core hardware and scheduler state. The public contract is in spec §5.3 System Info (`sys_info`). This section describes how the pieces fit together internally.
 
 ### Layering
 
@@ -2954,19 +2954,19 @@ The generic layer follows the same split as PMU and VM: architecture-independent
 
 ### sys_info Handler
 
-The handler runs entirely in `kernel/syscall/sysinfo.zig::sysSysInfo` (the syscall dispatch layer just forwards to it). The flow must satisfy two independent §4.55 invariants:
+The handler runs entirely in `kernel/syscall/sysinfo.zig::sysSysInfo` (the syscall dispatch layer just forwards to it). The flow must satisfy two independent §5.3 invariants:
 
-  * **§4.55.5** — a bad `cores_ptr` returns `E_BADADDR` without leaving a partial write in `info_ptr`.
-  * **§4.55.6** — if the `info_ptr` write itself fails after up-front validation (a late page-out race), the per-core `idle_ns` / `busy_ns` accounting must not have been consumed.
+  * **§5.3.11** — a bad `cores_ptr` returns `E_BADADDR` without leaving a partial write in `info_ptr`.
+  * **§5.3.9** — if the `info_ptr` write itself fails after up-front validation (a late page-out race), the per-core `idle_ns` / `busy_ns` accounting must not have been consumed.
 
 To satisfy both, the handler uses a probe-before-write ordering:
 
 1. Read `arch.coreCount()` into a local `core_count`, `pmm.totalPageCount()` into `mem_total`, and `pmm.freePageCount()` into `mem_free`. These populate the `SysInfo` struct that will be written to `info_ptr`.
-2. If `cores_ptr` is null: write the assembled `SysInfo` into `info_ptr` via physmap and return `E_OK`. No per-core accounting is touched and no counters are reset. (This is the §4.55.4 short-circuit path — nothing below this point executes.)
+2. If `cores_ptr` is null: write the assembled `SysInfo` into `info_ptr` via physmap and return `E_OK`. No per-core accounting is touched and no counters are reset. (This is the §5.3.10 short-circuit path — nothing below this point executes.)
 3. Otherwise, symbolically validate `cores_ptr` as a writable region of `core_count * sizeof(CoreInfo)` bytes via the local `validateUserWritable` helper. Return `E_BADADDR` on partition-boundary / wraparound / null rejection.
 4. Symbolically validate `info_ptr` as a writable region of `sizeof(SysInfo)` bytes via the same helper. Return `E_BADADDR` on failure.
-5. **Probe** the `cores_ptr` range with `probeUserWritable` — this walks every page of the range via `proc.vmm.demandPage` and `arch.resolveVaddr` without writing. The symbolic validator in step 3 is a purely range-based check; a partition-contained but unmapped pointer (e.g. `0x1`) slips through it and would otherwise only fail at the final `writeUser(cores_ptr)`, after `info_ptr` had already been committed — violating §4.55.5. The probe forces the fault-or-fail decision up front. Returns `E_BADADDR` on any page-walk failure.
-6. Write `SysInfo` into `info_ptr` via physmap. A late page-out race between step 4 and this write still fails cleanly here because we haven't touched accounting yet — §4.55.6 is preserved.
+5. **Probe** the `cores_ptr` range with `probeUserWritable` — this walks every page of the range via `proc.vmm.demandPage` and `arch.resolveVaddr` without writing. The symbolic validator in step 3 is a purely range-based check; a partition-contained but unmapped pointer (e.g. `0x1`) slips through it and would otherwise only fail at the final `writeUser(cores_ptr)`, after `info_ptr` had already been committed — violating §5.3.11. The probe forces the fault-or-fail decision up front. Returns `E_BADADDR` on any page-walk failure.
+6. Write `SysInfo` into `info_ptr` via physmap. A late page-out race between step 4 and this write still fails cleanly here because we haven't touched accounting yet — §5.3.9 is preserved.
 7. For each core `i` in `[0, core_count)`:
    - Acquire that core's `rq_lock`, `@atomicRmw(.Xchg, .monotonic)` both `idle_ns` and `busy_ns` to zero, release `rq_lock`. Each counter is independently atomic with the scheduler tick hook's `@atomicRmw(.Add, .monotonic)`; see §6 for the per-counter coherence story.
    - Call `arch.getCoreFreq(i)`, `arch.getCoreTemp(i)`, and `arch.getCoreState(i)` to populate the hardware fields.
@@ -2985,7 +2985,7 @@ All three MSR reads are gated behind an `intel_msrs_available` flag that is latc
 
 **`getCoreTemp(core_id)`** reads the core's current temperature via `IA32_THERM_STATUS` (MSR `0x19C`). The raw register encodes temperature as an *offset below* the thermal junction maximum (TjMax), not an absolute reading. Bit 31 indicates valid reading; bits 22–16 are the "digital readout" which is the number of degrees below TjMax. TjMax is discovered once at boot by reading `MSR_TEMPERATURE_TARGET` (`0x1A2`) bits 23–16. The returned milli-celsius value is computed as `(tjmax_c - offset_c) * 1000`, with `tjmax_c` cached per core since it does not change at runtime. See Intel SDM Vol 4 entries for `IA32_THERM_STATUS` and `MSR_TEMPERATURE_TARGET`, and Intel SDM Vol 3 §15.8 "Platform Specific Power Management Support".
 
-**`getCoreState(core_id)`** currently always returns `0` (active). §2.15.6 permits this — the spec tag says "0 means active, non-zero means idle at some package-default depth" but does not require any particular non-zero value to be reachable. Finer-grained per-core C-state accounting via `MSR_CORE_C1_RES` / `MSR_CORE_C3_RES` / `MSR_CORE_C6_RES` / `MSR_CORE_C7_RES` is reserved for a future iteration; the scheduler already knows whether a core is currently running the idle thread, so wiring up a simple active/idle signal is a small follow-up. See Intel SDM Vol 3 §15.5 "Thread and Core C-States".
+**`getCoreState(core_id)`** currently always returns `0` (active). §5.3.6 permits this — the spec tag says "0 means active, non-zero means idle at some package-default depth" but does not require any particular non-zero value to be reachable. Finer-grained per-core C-state accounting via `MSR_CORE_C1_RES` / `MSR_CORE_C3_RES` / `MSR_CORE_C6_RES` / `MSR_CORE_C7_RES` is reserved for a future iteration; the scheduler already knows whether a core is currently running the idle thread, so wiring up a simple active/idle signal is a small follow-up. See Intel SDM Vol 3 §15.5 "Thread and Core C-States".
 
 **Remote core reads (and the cache).** `IA32_PERF_STATUS`, `IA32_THERM_STATUS`, and friends are core-local MSRs — the `rdmsr` instruction always reads the issuing core's own register, so reading a remote core's values would normally require either a cross-core IPI or running the read on that core during its next scheduler tick. The current x64 implementation uses the tick-sampled approach and exposes it **uniformly** for local AND remote reads:
 
@@ -3013,7 +3013,7 @@ The arch dispatch functions run without holding any kernel lock; the x64 impleme
 
 ## 25. Power Control Internals
 
-System-wide and per-CPU power management. The public contract is in spec §2.19 and spec §4.61--§4.62. This section describes how the pieces fit together internally.
+System-wide and per-CPU power management. The public contract is in spec §5.4 Power (`sys_power` / `sys_cpu_power`). This section describes how the pieces fit together internally.
 
 ### Layering
 

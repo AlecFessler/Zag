@@ -6,7 +6,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.2.25 — `thread_kill` on the last non-exited thread in a process triggers process exit or restart per §2.6 semantics.
+/// §2.2.25 — `thread_kill` on the last non-exited thread in a process triggers process exit or restart per §2.1 semantics.
 ///
 /// We spawn a non-restartable, single-threaded child whose fault_handler
 /// relationship we acquire via cap transfer. Per §2.12.4 the kernel gives

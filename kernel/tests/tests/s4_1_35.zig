@@ -12,7 +12,7 @@ const t = lib.testing;
 ///   (a) `fault_handler` ProcessRights bit restored on the reverted target
 ///   (b) `fault_handler_proc` cleared
 ///   (c) pending fault messages in the dead handler's fault_box discarded
-///   (d) `.faulted` threads re-evaluated under §2.12.7 / §2.12.9
+///   (d) `.faulted` threads re-evaluated under §4.1.7 / §4.1.9
 ///   (e) `.suspended` threads moved to `.ready` and re-enqueued
 ///
 /// Sub-scenario A (single-thread reporter) exercises clause (a) via

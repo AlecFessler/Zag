@@ -4,7 +4,7 @@ const perm_view = lib.perm_view;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.1.69 — `device_region` entry: `field0` and `field1` follow §2.5 encoding.
+/// §2.1.69 — `device_region` entry: `field0` and `field1` follow §2.4 encoding.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
     // Find a device region entry and verify field0/field1 encoding by decoding

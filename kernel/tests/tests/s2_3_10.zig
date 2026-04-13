@@ -10,7 +10,6 @@ const ROUNDS: u64 = 64;
 const PAGES_PER_ROUND: u64 = 32;
 
 /// §2.3.10 — Revoking a VM reservation frees all pages in the range and clears the perm slot.
-/// clears the perm slot.
 ///
 /// We prove pages are actually returned to the kernel's physical page
 /// allocator by repeatedly reserving a large region, faulting every page in,

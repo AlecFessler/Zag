@@ -8,7 +8,7 @@ const t = lib.testing;
 
 const E_OK: i64 = 0;
 
-/// §2.2.62 — If the killed thread is the last non-exited thread in the process, process exit or restart proceeds per §2.6.
+/// §2.2.62 — If the killed thread is the last non-exited thread in the process, process exit or restart proceeds per §2.1.
 ///
 /// The child is spawned without `.restart` so we can assert the observable
 /// final state is DEAD_PROCESS (not a silent `t.pass` fall-through).

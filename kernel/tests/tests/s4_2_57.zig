@@ -1,4 +1,4 @@
-/// §4.2.57 — `vm_msr_passthrough` with an invalid VM handle returns `E_BADCAP`.
+/// §4.2.57 — `vm_msr_passthrough` with an invalid VM handle returns `E_BADHANDLE`.
 const lib = @import("lib");
 
 const syscall = lib.syscall;

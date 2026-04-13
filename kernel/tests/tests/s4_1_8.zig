@@ -15,7 +15,7 @@ pub fn main(pv: u64) void {
     // §4.1.8 holds, fault_recv returns the fault token, proving (a) a fault
     // message was enqueued in the process's own box, (b) the faulting thread
     // entered `.faulted` (the process wasn't killed/restarted as it would be
-    // under §2.12.7), and (c) the main thread continued running normally
+    // under §4.1.7), and (c) the main thread continued running normally
     // (it was not stop-all'd). The child reports the token back via IPC.
     const child_rights = (perms.ProcessRights{
         .spawn_thread = true,
