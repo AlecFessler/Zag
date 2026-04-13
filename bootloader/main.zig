@@ -384,7 +384,12 @@ pub fn main() uefi.Status {
     // Final TLB flush after exitBootServices ensures all TTBR1 page table
     // entries are visible to the hardware walker before jumping to the kernel.
     arch.setKernelAddrSpace(kernel_table_root_phys);
-    const kEntry: *KEntryType = @ptrFromInt(parsed_elf.entry.addr + kaslr_slide);
-    kEntry(boot_info);
-    unreachable;
+    // Switch SP to kernel stack before calling kEntry. After exitBootServices,
+    // the UEFI stack (loader_data) may be reclaimed — writing to it would
+    // fault on KVM where memory is real hardware.
+    arch.switchStackAndCall(
+        boot_info.stack_top,
+        @intFromPtr(boot_info),
+        parsed_elf.entry.addr + kaslr_slide,
+    );
 }

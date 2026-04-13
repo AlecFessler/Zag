@@ -276,41 +276,12 @@ pub fn alignStack(stack_top: VAddr) VAddr {
     return VAddr.fromInt(adjusted);
 }
 
+/// Called by the kernel entry point after the bootloader has already set SP
+/// to the kernel stack (via switchStackAndCall). Jumps to the trampoline
+/// with boot_info as the first argument.
 pub inline fn kEntry(boot_info: *BootInfo, ktrampoline: *const fn (*BootInfo) callconv(cc()) noreturn) noreturn {
-    switch (builtin.cpu.arch) {
-        .x86_64 => {
-            asm volatile (
-                \\movq %[sp], %%rsp
-                \\movq %%rsp, %%rbp
-                \\movq %[arg], %%rdi
-                \\jmp *%[ktrampoline]
-                :
-                : [sp] "r" (boot_info.stack_top.addr),
-                  [arg] "r" (@intFromPtr(boot_info)),
-                  [ktrampoline] "r" (@intFromPtr(ktrampoline)),
-                : .{ .rsp = true, .rbp = true, .rdi = true }
-            );
-        },
-        .aarch64 => {
-            // Switch to kernel stack and jump to trampoline.
-            // MAIR is set by arch.init() (paging.setMair) once the kernel
-            // is running — until then, UEFI's MAIR is used (likely index 1
-            // = Normal NC, which is sufficient for instruction fetch and
-            // stack access).
-            asm volatile (
-                \\mov sp, %[sp]
-                \\mov x0, %[arg]
-                \\br %[target]
-                :
-                : [sp] "r" (boot_info.stack_top.addr),
-                  [arg] "r" (@intFromPtr(boot_info)),
-                  [target] "r" (@intFromPtr(ktrampoline)),
-                : .{ .x0 = true, .memory = true }
-            );
-        },
-        else => unreachable,
-    }
-    unreachable;
+    // The bootloader already switched SP. Just tail-call the trampoline.
+    ktrampoline(boot_info);
 }
 
 pub fn cc() std.builtin.CallingConvention {
@@ -319,6 +290,54 @@ pub fn cc() std.builtin.CallingConvention {
         .aarch64 => .{ .aarch64_aapcs = .{} },
         else => unreachable,
     };
+}
+
+/// Switch SP to a new stack and call a function. Used by the bootloader to
+/// switch from the UEFI stack (which may be invalid after exitBootServices)
+/// to the kernel stack before entering the kernel.
+pub inline fn switchStackAndCall(stack_top: VAddr, arg: u64, entry: u64) noreturn {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            asm volatile (
+                \\movq %[sp], %%rsp
+                \\movq %%rsp, %%rbp
+                \\movq %[arg], %%rdi
+                \\jmp *%[entry]
+                :
+                : [sp] "r" (stack_top.addr),
+                  [arg] "r" (arg),
+                  [entry] "r" (entry),
+                : .{ .rsp = true, .rbp = true, .rdi = true }
+            );
+        },
+        .aarch64 => {
+            // Set MAIR_EL1 to our expected values before entering the kernel.
+            // UEFI's MAIR may have index 1 = Normal NC (0x44); ours needs
+            // index 0 = Device (0x00), index 1 = Normal WB (0xFF).
+            // The ISB + TLBI ensure the new MAIR takes effect and stale
+            // TLB entries using the old MAIR interpretation are flushed.
+            const mair: u64 = 0x00000000_0000FF00;
+            asm volatile (
+                \\msr mair_el1, %[mair]
+                \\isb
+                \\dsb ishst
+                \\tlbi vmalle1is
+                \\dsb ish
+                \\isb
+                \\mov sp, %[sp]
+                \\mov x0, %[arg]
+                \\br %[entry]
+                :
+                : [sp] "r" (stack_top.addr),
+                  [arg] "r" (arg),
+                  [entry] "r" (entry),
+                  [mair] "r" (mair),
+                : .{ .x0 = true, .memory = true }
+            );
+        },
+        else => unreachable,
+    }
+    unreachable;
 }
 
 pub fn init() void {
