@@ -791,6 +791,394 @@ pub fn vmResume(
 }
 
 // ===========================================================================
+// EL2 hyp world-switch handlers
+// ===========================================================================
+//
+// These mirror the x64 inline-asm vmResume structure (see x64/intel/vmx.zig)
+// but with one architectural twist: ARMv8 EL1↔EL2 transitions are mediated
+// by the EL2 vector table, not by a single instruction. The vector table
+// itself still lives in start.S because each entry must be at a fixed
+// `.org`-aligned offset, but every handler the table dispatches to is
+// expressed below as a Zig naked function with `linksection(".text.boot")`
+// so it lands at low PA where EL2 (running with SCTLR_EL2.M=0, MMU off)
+// can reach it via direct branch.
+//
+// Symbols defined here (referenced from `__hyp_vectors` in start.S):
+//   hyp_sync_lower_a64   — dispatcher: tpidr_el2 != 0 → guest exit;
+//                          else decode ESR_EL2.EC == HVC and dispatch x0.
+//   hvc_noop             — id=0 round-trip smoke test (returns x1 ^ 1).
+//   hvc_vcpu_run         — id=1 entry path: save host, load guest, ERET.
+//   guest_exit_entry     — exit path: save guest, restore host, ERET.
+//   hyp_halt             — wfe loop for unrecognised exceptions.
+//
+// All four handlers run with EL2 MMU off, so:
+//   - PAs only — no high-VA dereferences.
+//   - SP_EL2 is the active SP (set in start.S to __hyp_stack_top).
+//   - tpidr_el2 doubles as "currently active WorldSwitchCtx PA" marker.
+
+export fn hyp_sync_lower_a64() linksection(".text.boot") callconv(.naked) noreturn {
+    asm volatile (
+        \\  // If tpidr_el2 != 0 we were running a guest; this is a VM exit.
+        \\  mrs     x18, tpidr_el2
+        \\  cbnz    x18, guest_exit_entry
+        \\
+        \\  // Host hypercall path. Decode ESR_EL2.EC; we only support EC=0x16.
+        \\  mrs     x18, esr_el2
+        \\  lsr     x18, x18, #26
+        \\  and     x18, x18, #0x3F
+        \\  cmp     x18, #0x16
+        \\  b.ne    hyp_halt
+        \\
+        \\  // Dispatch by x0.
+        \\  cmp     x0, #0
+        \\  b.eq    hvc_noop
+        \\  cmp     x0, #1
+        \\  b.eq    hvc_vcpu_run
+        \\  // Unknown id — return -1.
+        \\  mov     x0, #-1
+        \\  eret
+    );
+}
+
+export fn hvc_noop() linksection(".text.boot") callconv(.naked) noreturn {
+    asm volatile (
+        \\  // Return arg^1 so the caller can verify the round-trip changed x0.
+        \\  eor     x0, x1, #1
+        \\  eret
+    );
+}
+
+// hvc_vcpu_run — Phase B: world-switch entry.
+//
+// On entry:
+//   x1 = PA of a WorldSwitchCtx (offsets pinned by comptime asserts above).
+//   x0 = HypCallId.vcpu_run (1) — discarded.
+//
+// Saves host callee-saved GPRs + EL1 sysregs into ctx.host_save, programs
+// per-VM EL2 state (HCR/VTCR/VTTBR/CNTVOFF), loads guest EL1 sysregs and
+// GPRs from ctx.guest_state, sets tpidr_el2 = ctx_pa as the "guest active"
+// marker, and ERETs to the guest at guest.pc / guest.pstate.
+export fn hvc_vcpu_run() linksection(".text.boot") callconv(.naked) noreturn {
+    asm volatile (
+        \\  // x1 = ctx PA. Preserve it in x18 across sysreg work.
+        \\  mov     x18, x1
+        \\
+        \\  // Stash host ELR_EL2 / SPSR_EL2 into the ctx so the exit path can
+        \\  // ERET back to the host kernel (after the `hvc #0` in hypCall).
+        \\  // Without this the exit ERET would use whatever the guest exit
+        \\  // wrote into these regs.
+        \\  mrs     x3, elr_el2
+        \\  str     x3, [x18, #0x48]
+        \\  mrs     x3, spsr_el2
+        \\  str     x3, [x18, #0x50]
+        \\
+        \\  // ---- Save host callee-saved GPRs + EL1 sysregs to host_save ----
+        \\  ldr     x2, [x18, #0x08]        // host_save_pa
+        \\  stp     x19, x20, [x2, #0x00]
+        \\  stp     x21, x22, [x2, #0x10]
+        \\  stp     x23, x24, [x2, #0x20]
+        \\  stp     x25, x26, [x2, #0x30]
+        \\  stp     x27, x28, [x2, #0x40]
+        \\  stp     x29, x30, [x2, #0x50]
+        \\
+        \\  mrs     x3, sp_el1
+        \\  str     x3, [x2, #0x60]
+        \\  mrs     x3, sp_el0
+        \\  str     x3, [x2, #0x68]
+        \\  mrs     x3, tpidr_el1
+        \\  str     x3, [x2, #0x70]
+        \\  mrs     x3, sctlr_el1
+        \\  str     x3, [x2, #0x78]
+        \\  mrs     x3, tcr_el1
+        \\  str     x3, [x2, #0x80]
+        \\  mrs     x3, ttbr0_el1
+        \\  str     x3, [x2, #0x88]
+        \\  mrs     x3, ttbr1_el1
+        \\  str     x3, [x2, #0x90]
+        \\  mrs     x3, mair_el1
+        \\  str     x3, [x2, #0x98]
+        \\  mrs     x3, vbar_el1
+        \\  str     x3, [x2, #0xA0]
+        \\  mrs     x3, cpacr_el1
+        \\  str     x3, [x2, #0xA8]
+        \\  mrs     x3, contextidr_el1
+        \\  str     x3, [x2, #0xB0]
+        \\  mrs     x3, tpidr_el0
+        \\  str     x3, [x2, #0xB8]
+        \\  mrs     x3, tpidrro_el0
+        \\  str     x3, [x2, #0xC0]
+        \\  mrs     x3, cntkctl_el1
+        \\  str     x3, [x2, #0xC8]
+        \\  mrs     x3, elr_el1
+        \\  str     x3, [x2, #0xD0]
+        \\  mrs     x3, spsr_el1
+        \\  str     x3, [x2, #0xD8]
+        \\  mrs     x3, esr_el1
+        \\  str     x3, [x2, #0xE0]
+        \\  mrs     x3, far_el1
+        \\  str     x3, [x2, #0xE8]
+        \\
+        \\  // ---- Program per-VM EL2 state ----
+        \\  ldr     x3, [x18, #0x28]        // hcr_el2
+        \\  msr     hcr_el2, x3
+        \\  ldr     x3, [x18, #0x20]        // vtcr_el2
+        \\  msr     vtcr_el2, x3
+        \\  ldr     x3, [x18, #0x18]        // vttbr_el2
+        \\  msr     vttbr_el2, x3
+        \\  msr     cntvoff_el2, xzr
+        \\  isb
+        \\
+        \\  // Stage-2 TLB invalidate for the fresh VMID (cheap; just VMALLS12E1IS).
+        \\  tlbi    vmalls12e1is
+        \\  dsb     ish
+        \\  isb
+        \\
+        \\  // ---- Load guest EL1 sysregs from GuestState ----
+        \\  ldr     x2, [x18, #0x00]        // guest_state_pa
+        \\  ldr     x3, [x2, #0x118]        // sctlr_el1
+        \\  msr     sctlr_el1, x3
+        \\  ldr     x3, [x2, #0x120]        // ttbr0_el1
+        \\  msr     ttbr0_el1, x3
+        \\  ldr     x3, [x2, #0x128]        // ttbr1_el1
+        \\  msr     ttbr1_el1, x3
+        \\  ldr     x3, [x2, #0x130]        // tcr_el1
+        \\  msr     tcr_el1, x3
+        \\  ldr     x3, [x2, #0x138]        // mair_el1
+        \\  msr     mair_el1, x3
+        \\  ldr     x3, [x2, #0x148]        // cpacr_el1
+        \\  msr     cpacr_el1, x3
+        \\  ldr     x3, [x2, #0x150]        // contextidr_el1
+        \\  msr     contextidr_el1, x3
+        \\  ldr     x3, [x2, #0x158]        // tpidr_el0
+        \\  msr     tpidr_el0, x3
+        \\  ldr     x3, [x2, #0x160]        // tpidr_el1
+        \\  msr     tpidr_el1, x3
+        \\  ldr     x3, [x2, #0x168]        // tpidrro_el0
+        \\  msr     tpidrro_el0, x3
+        \\  ldr     x3, [x2, #0x170]        // vbar_el1
+        \\  msr     vbar_el1, x3
+        \\  ldr     x3, [x2, #0x178]        // elr_el1
+        \\  msr     elr_el1, x3
+        \\  ldr     x3, [x2, #0x180]        // spsr_el1
+        \\  msr     spsr_el1, x3
+        \\  ldr     x3, [x2, #0x188]        // esr_el1
+        \\  msr     esr_el1, x3
+        \\  ldr     x3, [x2, #0x190]        // far_el1
+        \\  msr     far_el1, x3
+        \\  ldr     x3, [x2, #0x0F8]        // sp_el0
+        \\  msr     sp_el0, x3
+        \\  ldr     x3, [x2, #0x100]        // sp_el1
+        \\  msr     sp_el1, x3
+        \\  isb
+        \\
+        \\  // ---- Program ELR_EL2 / SPSR_EL2 from guest.pc / guest.pstate ----
+        \\  ldr     x3, [x2, #0x108]        // guest.pc
+        \\  msr     elr_el2, x3
+        \\  ldr     x3, [x2, #0x110]        // guest.pstate
+        \\  msr     spsr_el2, x3
+        \\
+        \\  // ---- Mark active ctx so exits take the guest_exit path ----
+        \\  msr     tpidr_el2, x18
+        \\  isb
+        \\
+        \\  // ---- Load guest GPRs x0..x30 from GuestState ----
+        \\  // x2 holds guest_state_pa; keep it live until the last load.
+        \\  ldp     x0, x1, [x2, #0x00]
+        \\  ldp     x3, x4, [x2, #0x18]
+        \\  ldp     x5, x6, [x2, #0x28]
+        \\  ldp     x7, x8, [x2, #0x38]
+        \\  ldp     x9, x10, [x2, #0x48]
+        \\  ldp     x11, x12, [x2, #0x58]
+        \\  ldp     x13, x14, [x2, #0x68]
+        \\  ldp     x15, x16, [x2, #0x78]
+        \\  ldp     x17, x18, [x2, #0x88]
+        \\  ldp     x19, x20, [x2, #0x98]
+        \\  ldp     x21, x22, [x2, #0xA8]
+        \\  ldp     x23, x24, [x2, #0xB8]
+        \\  ldp     x25, x26, [x2, #0xC8]
+        \\  ldp     x27, x28, [x2, #0xD8]
+        \\  ldp     x29, x30, [x2, #0xE8]
+        \\  // x2 is still live; reload final (x2) value last.
+        \\  ldr     x2, [x2, #0x10]
+        \\  eret
+    );
+}
+
+// guest_exit_entry — Phase C: world-switch exit.
+//
+// On entry: guest was running at EL1, took an exception to EL2.
+//   tpidr_el2 = PA of the active WorldSwitchCtx.
+//   All GPRs still hold guest values.
+//
+// Saves guest GPRs and EL1 sysregs into ctx.guest_state, populates
+// ctx.exit_{esr,far,hpfar}, restores host EL1 sysregs and callee-saved
+// GPRs, clears tpidr_el2, restores host ELR_EL2/SPSR_EL2 stashed at entry,
+// and ERETs back to the host (instruction after `hvc #0` in hypCall).
+export fn guest_exit_entry() linksection(".text.boot") callconv(.naked) noreturn {
+    asm volatile (
+        \\  // Reclaim ctx pointer from tpidr_el2 without clobbering x0..x17.
+        \\  // Use SP_EL2 as a two-slot scratch to free up x17/x18.
+        \\  sub     sp, sp, #16
+        \\  str     x18, [sp]
+        \\  mrs     x18, tpidr_el2          // x18 = ctx_pa
+        \\  str     x17, [sp, #8]
+        \\  ldr     x17, [x18, #0x00]       // x17 = guest_state_pa
+        \\
+        \\  // Store guest x0..x16 into GuestState x0..x16 slots.
+        \\  stp     x0, x1, [x17, #0x00]
+        \\  stp     x2, x3, [x17, #0x10]
+        \\  stp     x4, x5, [x17, #0x20]
+        \\  stp     x6, x7, [x17, #0x30]
+        \\  stp     x8, x9, [x17, #0x40]
+        \\  stp     x10, x11, [x17, #0x50]
+        \\  stp     x12, x13, [x17, #0x60]
+        \\  stp     x14, x15, [x17, #0x70]
+        \\  // x16 and guest-x17 (stashed on stack at sp+8).
+        \\  ldr     x0, [sp, #8]            // guest x17
+        \\  stp     x16, x0, [x17, #0x80]
+        \\  // guest x18 stashed at sp+0.
+        \\  ldr     x0, [sp, #0]            // guest x18
+        \\  str     x0, [x17, #0x90]
+        \\  add     sp, sp, #16
+        \\  // x19..x30 are still guest values (we haven't touched them yet).
+        \\  stp     x19, x20, [x17, #0x98]
+        \\  stp     x21, x22, [x17, #0xA8]
+        \\  stp     x23, x24, [x17, #0xB8]
+        \\  stp     x25, x26, [x17, #0xC8]
+        \\  stp     x27, x28, [x17, #0xD8]
+        \\  stp     x29, x30, [x17, #0xE8]
+        \\
+        \\  // ---- Save guest pc/pstate from ELR/SPSR_EL2 ----
+        \\  mrs     x0, elr_el2
+        \\  str     x0, [x17, #0x108]
+        \\  mrs     x0, spsr_el2
+        \\  str     x0, [x17, #0x110]
+        \\
+        \\  // ---- Save guest EL1 sysregs back into GuestState ----
+        \\  mrs     x0, sp_el0
+        \\  str     x0, [x17, #0x0F8]
+        \\  mrs     x0, sp_el1
+        \\  str     x0, [x17, #0x100]
+        \\  mrs     x0, sctlr_el1
+        \\  str     x0, [x17, #0x118]
+        \\  mrs     x0, ttbr0_el1
+        \\  str     x0, [x17, #0x120]
+        \\  mrs     x0, ttbr1_el1
+        \\  str     x0, [x17, #0x128]
+        \\  mrs     x0, tcr_el1
+        \\  str     x0, [x17, #0x130]
+        \\  mrs     x0, mair_el1
+        \\  str     x0, [x17, #0x138]
+        \\  mrs     x0, cpacr_el1
+        \\  str     x0, [x17, #0x148]
+        \\  mrs     x0, contextidr_el1
+        \\  str     x0, [x17, #0x150]
+        \\  mrs     x0, tpidr_el0
+        \\  str     x0, [x17, #0x158]
+        \\  mrs     x0, tpidr_el1
+        \\  str     x0, [x17, #0x160]
+        \\  mrs     x0, tpidrro_el0
+        \\  str     x0, [x17, #0x168]
+        \\  mrs     x0, vbar_el1
+        \\  str     x0, [x17, #0x170]
+        \\  mrs     x0, elr_el1
+        \\  str     x0, [x17, #0x178]
+        \\  mrs     x0, spsr_el1
+        \\  str     x0, [x17, #0x180]
+        \\  mrs     x0, esr_el1
+        \\  str     x0, [x17, #0x188]
+        \\  mrs     x0, far_el1
+        \\  str     x0, [x17, #0x190]
+        \\
+        \\  // ---- Populate ctx.exit_esr / exit_far / exit_hpfar ----
+        \\  mrs     x0, esr_el2
+        \\  str     x0, [x18, #0x30]
+        \\  mrs     x0, far_el2
+        \\  str     x0, [x18, #0x38]
+        \\  mrs     x0, hpfar_el2
+        \\  str     x0, [x18, #0x40]
+        \\
+        \\  // ---- Reload host EL1 sysregs from host_save ----
+        \\  ldr     x2, [x18, #0x08]        // host_save_pa
+        \\  ldr     x3, [x2, #0x60]
+        \\  msr     sp_el1, x3
+        \\  ldr     x3, [x2, #0x68]
+        \\  msr     sp_el0, x3
+        \\  ldr     x3, [x2, #0x70]
+        \\  msr     tpidr_el1, x3
+        \\  ldr     x3, [x2, #0x78]
+        \\  msr     sctlr_el1, x3
+        \\  ldr     x3, [x2, #0x80]
+        \\  msr     tcr_el1, x3
+        \\  ldr     x3, [x2, #0x88]
+        \\  msr     ttbr0_el1, x3
+        \\  ldr     x3, [x2, #0x90]
+        \\  msr     ttbr1_el1, x3
+        \\  ldr     x3, [x2, #0x98]
+        \\  msr     mair_el1, x3
+        \\  ldr     x3, [x2, #0xA0]
+        \\  msr     vbar_el1, x3
+        \\  ldr     x3, [x2, #0xA8]
+        \\  msr     cpacr_el1, x3
+        \\  ldr     x3, [x2, #0xB0]
+        \\  msr     contextidr_el1, x3
+        \\  ldr     x3, [x2, #0xB8]
+        \\  msr     tpidr_el0, x3
+        \\  ldr     x3, [x2, #0xC0]
+        \\  msr     tpidrro_el0, x3
+        \\  ldr     x3, [x2, #0xC8]
+        \\  msr     cntkctl_el1, x3
+        \\  ldr     x3, [x2, #0xD0]
+        \\  msr     elr_el1, x3
+        \\  ldr     x3, [x2, #0xD8]
+        \\  msr     spsr_el1, x3
+        \\  ldr     x3, [x2, #0xE0]
+        \\  msr     esr_el1, x3
+        \\  ldr     x3, [x2, #0xE8]
+        \\  msr     far_el1, x3
+        \\
+        \\  // ---- Disable stage-2 so host EL1 runs unpaginated-by-S2 ----
+        \\  // HCR_EL2 = RW(31)=1 only, same as boot default.
+        \\  mov     x3, #1
+        \\  lsl     x3, x3, #31
+        \\  msr     hcr_el2, x3
+        \\  msr     vttbr_el2, xzr
+        \\  isb
+        \\  tlbi    vmalle1
+        \\  dsb     ish
+        \\  isb
+        \\
+        \\  // ---- Restore host callee-saved GPRs x19..x30 ----
+        \\  ldp     x19, x20, [x2, #0x00]
+        \\  ldp     x21, x22, [x2, #0x10]
+        \\  ldp     x23, x24, [x2, #0x20]
+        \\  ldp     x25, x26, [x2, #0x30]
+        \\  ldp     x27, x28, [x2, #0x40]
+        \\  ldp     x29, x30, [x2, #0x50]
+        \\
+        \\  // Clear active-ctx marker and return 0 (success) in x0.
+        \\  msr     tpidr_el2, xzr
+        \\  mov     x0, #0
+        \\
+        \\  // Restore host ELR_EL2 / SPSR_EL2 stashed by hvc_vcpu_run on entry
+        \\  // (the guest exit clobbered them with guest pc/pstate, which we
+        \\  // already saved into GuestState above).
+        \\  ldr     x3, [x18, #0x48]        // host return elr
+        \\  msr     elr_el2, x3
+        \\  ldr     x3, [x18, #0x50]        // host return spsr
+        \\  msr     spsr_el2, x3
+        \\  eret
+    );
+}
+
+export fn hyp_halt() linksection(".text.boot") callconv(.naked) noreturn {
+    asm volatile (
+        \\1:wfe
+        \\  b       1b
+    );
+}
+
+// ===========================================================================
 // Per-VM arch structures (stage-2 root + trap config)
 // ===========================================================================
 
