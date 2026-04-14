@@ -559,16 +559,235 @@ pub inline fn hypCall(id: HypCallId, arg: u64) u64 {
 ///   - ARM ARM D13.2.151    VTTBR_EL2
 ///   - ARM ARM D13.2.150    VTCR_EL2
 ///   - 102142  §2.3         "Entry to and exit from a guest"
+/// World-switch context passed by PA to the EL2 hyp dispatcher. Field
+/// offsets are HARDCODED in `boot/start.S` (hvc_vcpu_run /
+/// guest_exit_entry) — keep them in sync with the comment table in
+/// that file. Enforced at comptime below.
+pub const WorldSwitchCtx = extern struct {
+    /// Physical address of the GuestState the dispatcher should swap
+    /// in on entry and back out on exit.
+    guest_state_pa: u64 = 0,
+    /// Physical address of the HostSave struct (host callee-saved
+    /// GPRs + host EL1 sysreg snapshot).
+    host_save_pa: u64 = 0,
+    /// Physical address of the stage-2 root (for reference; the
+    /// dispatcher loads `vttbr_el2` directly).
+    stage2_root_pa: u64 = 0,
+    /// VTTBR_EL2 value: VMID << 48 | stage2_root_pa.
+    vttbr_el2: u64 = 0,
+    /// VTCR_EL2 value: stage-2 translation control.
+    vtcr_el2: u64 = 0,
+    /// HCR_EL2 value to load on guest entry.
+    hcr_el2: u64 = 0,
+    /// Populated on guest exit: ESR_EL2, FAR_EL2, HPFAR_EL2.
+    exit_esr: u64 = 0,
+    exit_far: u64 = 0,
+    exit_hpfar: u64 = 0,
+    /// Stashed host ELR_EL2 / SPSR_EL2 (= host return address and
+    /// PSTATE from the `hvc #0` that entered this path). The exit
+    /// path restores these before its final ERET so control lands
+    /// on the instruction after the host's hvc.
+    host_elr_el2: u64 = 0,
+    host_spsr_el2: u64 = 0,
+    _pad: u64 = 0,
+};
+
+comptime {
+    std.debug.assert(@offsetOf(WorldSwitchCtx, "guest_state_pa") == 0x00);
+    std.debug.assert(@offsetOf(WorldSwitchCtx, "host_save_pa") == 0x08);
+    std.debug.assert(@offsetOf(WorldSwitchCtx, "stage2_root_pa") == 0x10);
+    std.debug.assert(@offsetOf(WorldSwitchCtx, "vttbr_el2") == 0x18);
+    std.debug.assert(@offsetOf(WorldSwitchCtx, "vtcr_el2") == 0x20);
+    std.debug.assert(@offsetOf(WorldSwitchCtx, "hcr_el2") == 0x28);
+    std.debug.assert(@offsetOf(WorldSwitchCtx, "exit_esr") == 0x30);
+    std.debug.assert(@offsetOf(WorldSwitchCtx, "exit_far") == 0x38);
+    std.debug.assert(@offsetOf(WorldSwitchCtx, "exit_hpfar") == 0x40);
+    std.debug.assert(@offsetOf(WorldSwitchCtx, "host_elr_el2") == 0x48);
+    std.debug.assert(@offsetOf(WorldSwitchCtx, "host_spsr_el2") == 0x50);
+
+    // GuestState offsets hardcoded in start.S.
+    std.debug.assert(@offsetOf(GuestState, "x0") == 0x00);
+    std.debug.assert(@offsetOf(GuestState, "x30") == 0xF0);
+    std.debug.assert(@offsetOf(GuestState, "sp_el0") == 0xF8);
+    std.debug.assert(@offsetOf(GuestState, "sp_el1") == 0x100);
+    std.debug.assert(@offsetOf(GuestState, "pc") == 0x108);
+    std.debug.assert(@offsetOf(GuestState, "pstate") == 0x110);
+    std.debug.assert(@offsetOf(GuestState, "sctlr_el1") == 0x118);
+    std.debug.assert(@offsetOf(GuestState, "ttbr0_el1") == 0x120);
+    std.debug.assert(@offsetOf(GuestState, "ttbr1_el1") == 0x128);
+    std.debug.assert(@offsetOf(GuestState, "tcr_el1") == 0x130);
+    std.debug.assert(@offsetOf(GuestState, "mair_el1") == 0x138);
+    std.debug.assert(@offsetOf(GuestState, "amair_el1") == 0x140);
+    std.debug.assert(@offsetOf(GuestState, "cpacr_el1") == 0x148);
+    std.debug.assert(@offsetOf(GuestState, "contextidr_el1") == 0x150);
+    std.debug.assert(@offsetOf(GuestState, "tpidr_el0") == 0x158);
+    std.debug.assert(@offsetOf(GuestState, "tpidr_el1") == 0x160);
+    std.debug.assert(@offsetOf(GuestState, "tpidrro_el0") == 0x168);
+    std.debug.assert(@offsetOf(GuestState, "vbar_el1") == 0x170);
+    std.debug.assert(@offsetOf(GuestState, "elr_el1") == 0x178);
+    std.debug.assert(@offsetOf(GuestState, "spsr_el1") == 0x180);
+    std.debug.assert(@offsetOf(GuestState, "esr_el1") == 0x188);
+    std.debug.assert(@offsetOf(GuestState, "far_el1") == 0x190);
+}
+
+/// HostSave layout — matches offsets hardcoded in start.S. Holds the
+/// host's callee-saved GPRs and EL1 sysregs across a guest run.
+pub const HostSave = extern struct {
+    x19: u64 = 0,
+    x20: u64 = 0,
+    x21: u64 = 0,
+    x22: u64 = 0,
+    x23: u64 = 0,
+    x24: u64 = 0,
+    x25: u64 = 0,
+    x26: u64 = 0,
+    x27: u64 = 0,
+    x28: u64 = 0,
+    x29: u64 = 0,
+    x30: u64 = 0,
+    sp_el1: u64 = 0,
+    sp_el0: u64 = 0,
+    tpidr_el1: u64 = 0,
+    sctlr_el1: u64 = 0,
+    tcr_el1: u64 = 0,
+    ttbr0_el1: u64 = 0,
+    ttbr1_el1: u64 = 0,
+    mair_el1: u64 = 0,
+    vbar_el1: u64 = 0,
+    cpacr_el1: u64 = 0,
+    contextidr_el1: u64 = 0,
+    tpidr_el0: u64 = 0,
+    tpidrro_el0: u64 = 0,
+    cntkctl_el1: u64 = 0,
+    elr_el1: u64 = 0,
+    spsr_el1: u64 = 0,
+    esr_el1: u64 = 0,
+    far_el1: u64 = 0,
+};
+
+comptime {
+    std.debug.assert(@offsetOf(HostSave, "x19") == 0x00);
+    std.debug.assert(@offsetOf(HostSave, "x30") == 0x58);
+    std.debug.assert(@offsetOf(HostSave, "sp_el1") == 0x60);
+    std.debug.assert(@offsetOf(HostSave, "sp_el0") == 0x68);
+    std.debug.assert(@offsetOf(HostSave, "tpidr_el1") == 0x70);
+    std.debug.assert(@offsetOf(HostSave, "sctlr_el1") == 0x78);
+    std.debug.assert(@offsetOf(HostSave, "tcr_el1") == 0x80);
+    std.debug.assert(@offsetOf(HostSave, "far_el1") == 0xE8);
+}
+
+// HCR_EL2 bits (ARM ARM D13.2.46).
+pub const HCR_EL2_VM: u64 = 1 << 0; // stage-2 enable
+pub const HCR_EL2_FMO: u64 = 1 << 3; // route vFIQ
+pub const HCR_EL2_IMO: u64 = 1 << 4; // route vIRQ
+pub const HCR_EL2_AMO: u64 = 1 << 5; // route vSError
+pub const HCR_EL2_RW: u64 = 1 << 31; // EL1 is AArch64
+
+/// VTCR_EL2 value for our stage-2 config: 4K granule, T0SZ=34 (1 GiB
+/// IPA), SL0=00 (start at level 2), shareability/cacheability
+/// inner-shareable WB, PS=40-bit output. ARM ARM D13.2.150.
+pub fn vtcrEl2Value() u64 {
+    const t0sz: u64 = STAGE2_T0SZ; // 34
+    const sl0: u64 = 0;             // start at level 2 (w/ 4K, T0SZ=34)
+    const irgn0: u64 = 0b01;        // Normal WB WA cacheable
+    const orgn0: u64 = 0b01;
+    const sh0: u64 = 0b11;          // Inner shareable
+    const tg0: u64 = 0b00;          // 4 KiB granule
+    const ps: u64 = 0b010;          // 40-bit PA
+    return t0sz |
+        (sl0 << 6) |
+        (irgn0 << 8) |
+        (orgn0 << 10) |
+        (sh0 << 12) |
+        (tg0 << 14) |
+        (ps << 16);
+}
+
+/// Decode ESR_EL2 into a typed VmExitInfo. Covers the minimum set of
+/// exception classes needed for nop-guest bring-up; deep ISS decode is
+/// left to later waves.
+///
+/// ARM ARM D13.2.39 Table D13-45.
+pub fn decodeEsrEl2(esr: u64, far: u64, hpfar: u64) VmExitInfo {
+    const ec: u8 = @intCast((esr >> 26) & 0x3F);
+    const iss: u32 = @intCast(esr & 0x01FF_FFFF);
+    return switch (ec) {
+        0x01 => .{ .wfi_wfe = .{ .is_wfe = (iss & 1) != 0 } },
+        0x16 => .{ .hvc = .{ .imm = @intCast(iss & 0xFFFF) } },
+        0x17 => .{ .smc = .{ .imm = @intCast(iss & 0xFFFF) } },
+        0x18 => .{ .sysreg_trap = .{
+            .iss = iss,
+            .op0 = @intCast((iss >> 20) & 0x3),
+            .op1 = @intCast((iss >> 14) & 0x7),
+            .crn = @intCast((iss >> 10) & 0xF),
+            .crm = @intCast((iss >> 1) & 0xF),
+            .op2 = @intCast((iss >> 17) & 0x7),
+            .rt = @intCast((iss >> 5) & 0x1F),
+            .is_read = (iss & 1) != 0,
+        } },
+        0x20, 0x24 => blk: {
+            const guest_phys = ((hpfar & 0x0FFF_FFFF_FFF0) << 8) | (far & 0xFFF);
+            const iss_valid = (iss & (1 << 24)) != 0;
+            break :blk .{ .stage2_fault = .{
+                .guest_phys = guest_phys,
+                .guest_virt = far,
+                .is_instruction = ec == 0x20,
+                .is_write = (iss & (1 << 6)) != 0,
+                .access_size = @intCast((iss >> 22) & 0x3),
+                .srt = @intCast((iss >> 16) & 0x1F),
+                .iss_valid = iss_valid,
+            } };
+        },
+        0x00 => .{ .unknown_ec = 0 },
+        else => .{ .unknown = esr },
+    };
+}
+
+/// Scratch page used to hold both the `WorldSwitchCtx` and `HostSave`
+/// for a single vmResume call. Allocated lazily from the PMM on first
+/// use so its backing memory lives in physmap and `PAddr.fromVAddr`
+/// is a valid VA → PA translation. Real KVM will own these per-vCPU.
+var smoke_scratch_page: ?*paging.PageMem(.page4k) = null;
+
+fn smokeScratchInit() !*paging.PageMem(.page4k) {
+    if (smoke_scratch_page) |p| return p;
+    const alloc = pmm.global_pmm.?.allocator();
+    const page = try alloc.create(paging.PageMem(.page4k));
+    @memset(std.mem.asBytes(page), 0);
+    smoke_scratch_page = page;
+    return page;
+}
+
 pub fn vmResume(
     guest_state: *GuestState,
     vm_structures: PAddr,
     guest_fxsave: *align(16) FxsaveArea,
 ) VmExitInfo {
-    // TODO(impl): full assembly + sysreg dance as described above.
-    _ = guest_state;
-    _ = vm_structures;
-    _ = guest_fxsave;
-    return .{ .unknown = 0 };
+    _ = guest_fxsave; // FPSIMD save/restore TODO (smoke test is GPR-only).
+
+    const scratch = smokeScratchInit() catch return .{ .unknown = 0xDEAD_0001 };
+    const scratch_bytes = std.mem.asBytes(scratch);
+
+    // First half of the page → WorldSwitchCtx; second half → HostSave.
+    const ctx: *WorldSwitchCtx = @ptrCast(@alignCast(&scratch_bytes[0]));
+    const host_save: *HostSave = @ptrCast(@alignCast(&scratch_bytes[@sizeOf(WorldSwitchCtx)]));
+    ctx.* = .{};
+    host_save.* = .{};
+
+    const gs_pa = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(guest_state)), null);
+    const hs_pa = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(host_save)), null);
+    const ctx_pa = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(ctx)), null);
+
+    ctx.guest_state_pa = gs_pa.addr;
+    ctx.host_save_pa = hs_pa.addr;
+    ctx.stage2_root_pa = vm_structures.addr;
+    ctx.vttbr_el2 = vm_structures.addr; // VMID = 0 for the smoke test.
+    ctx.vtcr_el2 = vtcrEl2Value();
+    ctx.hcr_el2 = HCR_EL2_VM | HCR_EL2_RW | HCR_EL2_IMO | HCR_EL2_FMO | HCR_EL2_AMO;
+
+    _ = hypCall(.vcpu_run, ctx_pa.addr);
+
+    return decodeEsrEl2(ctx.exit_esr, ctx.exit_far, ctx.exit_hpfar);
 }
 
 // ===========================================================================

@@ -98,6 +98,9 @@ fn kMain(boot_info: *BootInfo) !void {
     arch.earlyDebugChar('S');
     sched.perCoreInit();
     arch.earlyDebugChar('U');
+    if (@import("builtin").cpu.arch == .aarch64) {
+        @import("arch/aarch64/kvm/smoke.zig").runVcpuNopSmoke();
+    }
     try kprof_log.init();
     kprof_log.start();
     arch.halt();
