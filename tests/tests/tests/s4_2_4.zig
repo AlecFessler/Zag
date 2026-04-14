@@ -83,10 +83,7 @@ pub fn main(pv: u64) void {
 
     // Create VM with 2 vCPUs.
     const cr = syscall.vm_create(2, @intFromPtr(&policy));
-    if (cr == syscall.E_NODEV) {
-        t.pass("§4.2.4");
-        syscall.shutdown();
-    }
+    t.skipIfNoVm("§4.2.4", cr);
     if (cr < 0) {
         t.failWithVal("§4.2.4 create", syscall.E_OK, cr);
         syscall.shutdown();

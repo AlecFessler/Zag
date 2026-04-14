@@ -9,10 +9,7 @@ var policy: [4096]u8 align(4096) = .{0} ** 4096;
 pub fn main(_: u64) void {
     t.skipNoAarch64Vm("§4.2.27");
     const cr = syscall.vm_create(1, @intFromPtr(&policy));
-    if (cr == syscall.E_NODEV) {
-        t.pass("§4.2.27");
-        syscall.shutdown();
-    }
+    t.skipIfNoVm("§4.2.27", cr);
     if (cr < 0) {
         t.failWithVal("§4.2.27 create", syscall.E_OK, cr);
         syscall.shutdown();

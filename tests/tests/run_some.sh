@@ -25,7 +25,7 @@ run_one_test() {
     local output
     output=$(timeout "$TIMEOUT" $QEMU_CMD -drive "file=fat:rw:$workdir,format=raw" 2>/dev/null || true)
     local result
-    result=$(echo "$output" | grep -m1 '\[PASS\]\|\[FAIL\]' || true)
+    result=$(echo "$output" | grep -m1 '\[PASS\]\|\[FAIL\]\|\[SKIP\]' || true)
     result=$(echo "$result" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
     if [ -z "$result" ]; then
         echo "[FAIL] $name (no output)" > "$RESULTS_DIR/$name"
@@ -47,10 +47,17 @@ printf '%s\n' "${test_elfs[@]}" | xargs -n1 -P"$PARALLEL" -I{} bash -c 'run_one_
 
 pass=0
 fail=0
+skip=0
 for r in "$RESULTS_DIR"/*; do
     line=$(cat "$r")
     echo "$line"
-    if echo "$line" | grep -q '\[PASS\]'; then pass=$((pass+1)); else fail=$((fail+1)); fi
+    if echo "$line" | grep -q '\[PASS\]'; then
+        pass=$((pass+1))
+    elif echo "$line" | grep -q '\[SKIP\]'; then
+        skip=$((skip+1))
+    else
+        fail=$((fail+1))
+    fi
 done
-echo "Pass: $pass  Fail: $fail"
+echo "Pass: $pass  Skip: $skip  Fail: $fail"
 rm -rf "$RESULTS_DIR"

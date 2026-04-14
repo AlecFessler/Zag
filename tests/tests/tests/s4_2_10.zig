@@ -82,10 +82,7 @@ pub fn main(pv: u64) void {
     const self_handle: u64 = @bitCast(syscall.thread_self());
 
     const cr = syscall.vm_create(1, @intFromPtr(&policy));
-    if (cr == syscall.E_NODEV) {
-        t.pass("§4.2.10");
-        syscall.shutdown();
-    }
+    t.skipIfNoVm("§4.2.10", cr);
     if (cr < 0) {
         t.failWithVal("§4.2.10 create", syscall.E_OK, cr);
         syscall.shutdown();

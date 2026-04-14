@@ -21,7 +21,7 @@ PARALLEL="${PARALLEL:-1}"
 ARCH="${ARCH:-x64}"
 
 if [ "$ARCH" = "arm" ]; then
-    QEMU_CMD="qemu-system-aarch64 -M virt,gic-version=3 -m 1G -bios /usr/share/AAVMF/AAVMF_CODE.fd -serial stdio -display none -no-reboot -machine accel=tcg -cpu cortex-a72,pmu=on -smp cores=4"
+    QEMU_CMD="qemu-system-aarch64 -M virt,gic-version=3 -m 1G -bios /usr/share/AAVMF/AAVMF_CODE.fd -serial stdio -display none -no-reboot -machine accel=tcg -cpu cortex-a72 -smp cores=4"
     BUILD_ARCH_FLAG="-Darch=arm"
     LOADER="BOOTAA64.EFI"
 else
@@ -114,6 +114,7 @@ pass=0
 fail=0
 skip=0
 failures=""
+skips=""
 
 for f in $(ls "$RESULTS_DIR"/ | sort); do
     result=$(cat "$RESULTS_DIR/$f")
@@ -121,6 +122,7 @@ for f in $(ls "$RESULTS_DIR"/ | sort); do
         pass=$((pass + 1))
     elif echo "$result" | grep -q '\[SKIP\]'; then
         skip=$((skip + 1))
+        skips="$skips\n  $result"
     else
         fail=$((fail + 1))
         failures="$failures\n  $result"
@@ -130,7 +132,10 @@ done
 rm -rf "$RESULTS_DIR"
 
 echo "================================"
-echo "Total: $pass pass, $fail fail, $skip skip out of $((pass + fail + skip))"
+echo "Total: $pass pass, $skip skip, $fail fail out of $((pass + skip + fail))"
+if [ "$skip" -gt 0 ]; then
+    echo -e "Skipped:$skips"
+fi
 if [ "$fail" -eq 0 ]; then
     echo "All tests passed!"
 else
