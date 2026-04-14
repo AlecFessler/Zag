@@ -46,6 +46,13 @@ const profiles = struct {
         .use_llvm = true,
         .iommu = "intel",
     };
+    const prof = Profile{
+        .root_service = "tests/prof/bin/root_service.elf",
+        .net = "none",
+        .kvm = true,
+        .use_llvm = true,
+        .iommu = "intel",
+    };
 
 };
 
@@ -55,6 +62,7 @@ fn getProfile(name: []const u8) ?Profile {
     if (std.mem.eql(u8, name, "bench")) return profiles.bench;
     if (std.mem.eql(u8, name, "desktop")) return profiles.desktop;
     if (std.mem.eql(u8, name, "hyprvos")) return profiles.hyprvos;
+    if (std.mem.eql(u8, name, "prof")) return profiles.prof;
 
     return null;
 }
