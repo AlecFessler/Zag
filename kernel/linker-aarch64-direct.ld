@@ -44,6 +44,15 @@ SECTIONS {
         *(.text.boot*)
     } :boot
 
+    /* Boot-time data: bootstrap stack + initial page tables + any
+     * other low-PA storage touched before TTBR1 is set up. Shares the
+     * same `boot` PT_LOAD as .text.boot because the MMU is off while
+     * we execute from it — the PHDR's uniform RWX permissions are
+     * irrelevant to the hardware protection at that point. */
+    .data.boot ALIGN(4K) : {
+        *(.data.boot*)
+    } :boot
+
     _boot_end_lma = .;
 
     /* Kernel image: linked at high VA, LMA continues right after the
@@ -71,6 +80,6 @@ SECTIONS {
 }
 
 PHDRS {
-    boot   PT_LOAD FLAGS(5); /* R + X */
+    boot   PT_LOAD FLAGS(7); /* R + W + X — MMU is off while executing from here */
     kernel PT_LOAD FLAGS(7); /* R + W + X — single PT_LOAD for all kernel sections */
 }
