@@ -5,9 +5,10 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §2.4.5 — Kernel-internal devices (HPET, LAPIC, I/O APIC) are not exposed in the user view.
-/// HPET is a legacy memory-mapped timer at 0xFED00000; LAPIC lives at 0xFEE00000
-/// and IOAPIC at 0xFEC00000. None of these are PCI devices — they should never
+/// §2.4.5 — Kernel-internal devices (platform timer, interrupt controller) are not exposed in the user view.
+/// The kernel owns the platform timer (x86: HPET at 0xFED00000; ARM: arch timer)
+/// and the interrupt controller (x86: LAPIC@0xFEE00000 + IOAPIC@0xFEC00000;
+/// ARM: GICv2/v3). None of these are PCI devices — they should never
 /// appear in the root service's device table. Check both by device_class
 /// (nothing marked `timer`) and by PCI identification (no entry with vendor=0
 /// AND device=0 except the legacy 8250 serial, which IS expected).

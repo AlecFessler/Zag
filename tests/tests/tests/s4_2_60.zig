@@ -1,4 +1,4 @@
-/// §4.2.60 — `vm_ioapic_assert_irq` returns `E_OK` on success.
+/// §4.2.60 — `vm_intc_assert_irq` returns `E_OK` on success.
 const lib = @import("lib");
 
 const syscall = lib.syscall;
@@ -19,7 +19,7 @@ pub fn main(_: u64) void {
     var passed = true;
     var irq: u64 = 0;
     while (irq < 24) : (irq += 1) {
-        const result = syscall.vm_ioapic_assert_irq(@bitCast(cr), irq);
+        const result = syscall.vm_intc_assert_irq(@bitCast(cr), irq);
         if (result != syscall.E_OK) {
             t.failWithVal("§4.2.60", syscall.E_OK, result);
             passed = false;

@@ -245,7 +245,7 @@ Port I/O device regions support virtual BAR mapping via `mem_mmio_map`. The mapp
 
 Device entries in the user view encode hardware identification: <!-- s2_4_2 -->**§2.4.2** device user view `field0` encodes: `device_type(u8, bits 0-7) | device_class(u8, bits 8-15) | irq_pending(bit 16) | reserved_zero(bits 17-31) | size_or_port_count(u32, bits 32-63)`. Bit 16 is the IRQ pending bit (see IRQ Pending Bit below). **§2.4.3** Device user view `field1` encodes: `pci_vendor(u16) | pci_device(u16) << 16 | pci_class(u8) << 32 | pci_subclass(u8) << 40`.
 
-**§2.4.4** At boot, the kernel inserts all device handles into the root service's permissions table. **§2.4.5** Kernel-internal devices (HPET, LAPIC, I/O APIC) are not exposed in the user view.
+**§2.4.4** At boot, the kernel inserts all device handles into the root service's permissions table. **§2.4.5** Kernel-internal devices (platform timer, interrupt controller) are not exposed in the user view.
 
 **§2.4.11** Revoking a device handle unmaps MMIO, returns handle up the process tree (§2.1), and clears the slot.
 
@@ -664,19 +664,21 @@ The action passed to `vm_reply`:
 
 **§4.2.13** The `VmExitMessage.guest_state` snapshot reflects the guest register state at the point of exit, including the instruction pointer of the exiting instruction.
 
-#### In-Kernel LAPIC and IOAPIC
+#### In-Kernel Interrupt Controller
 
-The kernel emulates a single-vCPU Local APIC at guest physical `0xFEE00000` and a 24-pin I/O APIC at guest physical `0xFEC00000` for every VM. Guest reads and writes to either page are decoded and handled inline by the kernel without producing VM exits to the VMM. The LAPIC timer ticks against the host TSC each time a vCPU re-enters guest mode, and pending interrupt vectors are injected via the standard event-injection path. Because the kernel owns these pages, `vm_guest_map` refuses any request whose guest physical region overlaps either of them.
+The kernel emulates an in-kernel interrupt controller for every VM. Guest reads and writes to its MMIO pages are decoded and handled inline by the kernel without producing VM exits to the VMM, and pending interrupts are injected via the standard event-injection path. The exact MMIO layout and timer plumbing are architecture-specific: on x86-64 a Local APIC at guest physical `0xFEE00000` and a 24-pin I/O APIC at `0xFEC00000` driven by the host TSC; on ARMv8 a GICv2/v3 distributor/redistributor driven by the virtual timer. Because the kernel owns these pages, `vm_guest_map` refuses any request whose guest physical region overlaps the arch-specific in-kernel interrupt controller region.
 
-#### MSR Passthrough
+#### System Register Passthrough
 
-The VMM can request that specific MSRs be made directly accessible to the guest (no VM exit on RDMSR/WRMSR) via `vm_msr_passthrough`. The kernel maintains a hard blocklist of security-critical MSRs that must always be intercepted regardless of what the VMM requests:
+The VMM can request that specific guest system registers be made directly accessible (no VM exit on guest read/write) via `vm_sysreg_passthrough`. The `sysreg_id` parameter is an arch-specific 32-bit identifier — on x86-64 it is the MSR address; on ARMv8 it is a packed `(op0,op1,CRn,CRm,op2)` encoding. The kernel maintains a hard blocklist of security-critical system registers that must always be intercepted regardless of what the VMM requests.
 
-`EFER` (`0xC0000080`), `STAR` (`0xC0000081`), `LSTAR` (`0xC0000082`), `CSTAR` (`0xC0000083`), `SFMASK` (`0xC0000084`), `IA32_APIC_BASE` (`0x1B`), `KERNEL_GS_BASE` (`0xC0000102`), `IA32_SYSENTER_CS` (`0x174`), `IA32_SYSENTER_ESP` (`0x175`), `IA32_SYSENTER_EIP` (`0x176`).
+The x86-64 blocklist is: `EFER` (`0xC0000080`), `STAR` (`0xC0000081`), `LSTAR` (`0xC0000082`), `CSTAR` (`0xC0000083`), `SFMASK` (`0xC0000084`), `IA32_APIC_BASE` (`0x1B`), `KERNEL_GS_BASE` (`0xC0000102`), `IA32_SYSENTER_CS` (`0x174`), `IA32_SYSENTER_ESP` (`0x175`), `IA32_SYSENTER_EIP` (`0x176`).
+
+The ARMv8 blocklist covers every EL2/EL3 system register (any encoding with `Op1 >= 4`) and every AArch64 ID register (`Op0=3, Op1=0, CRn=0, CRm<=7`), because these either belong to the hypervisor regime or carry the feature bits that `VmPolicy` decisions depend on.
 
 #### Userspace IRQ Assertion
 
-`vm_ioapic_assert_irq` and `vm_ioapic_deassert_irq` let userspace device emulators drive the in-kernel IOAPIC directly. After a successful assert or de-assert, the kernel sends an inter-processor interrupt to any core currently running one of the VM's vCPUs so the vCPU re-enters its scheduling loop and observes the new interrupt state. This kick is what lets guests in tight polling loops see freshly asserted IRQs without waiting for a timer-induced exit; the end-to-end behavior is exercised by the Linux boot integration test (`./test.sh linux`).
+`vm_intc_assert_irq` and `vm_intc_deassert_irq` let userspace device emulators drive the in-kernel interrupt controller directly. After a successful assert or de-assert, the kernel sends an inter-processor interrupt to any core currently running one of the VM's vCPUs so the vCPU re-enters its scheduling loop and observes the new interrupt state. This kick is what lets guests in tight polling loops see freshly asserted IRQs without waiting for a timer-induced exit; the end-to-end behavior is exercised by the Linux boot integration test (`./test.sh linux`).
 
 #### vm_create(vcpu_count, policy_ptr) → result
 
@@ -694,7 +696,7 @@ Destroys the calling process's VM. Kills all vCPU threads, tears down guest memo
 
 Maps a host virtual memory range as guest physical memory at the specified guest address. The kernel resolves the host pages and wires them into the guest's physical address space. The VMM process retains host access to the pages.
 
-**§4.2.24** `vm_guest_map` returns `E_OK` on success. **§4.2.25** `vm_guest_map` with zero size returns `E_INVAL`. **§4.2.26** `vm_guest_map` with non-page-aligned `guest_addr` returns `E_INVAL`. **§4.2.27** `vm_guest_map` with non-page-aligned `size` returns `E_INVAL`. **§4.2.28** `vm_guest_map` with invalid rights bits returns `E_INVAL`. **§4.2.29** `vm_guest_map` with non-page-aligned `host_vaddr` returns `E_INVAL`. **§4.2.30** `vm_guest_map` with `host_vaddr` not pointing to a valid mapped region in the caller's address space returns `E_BADADDR`. **§4.2.31** `vm_guest_map` with a guest physical region overlapping the in-kernel LAPIC page (`0xFEE00000`) or IOAPIC page (`0xFEC00000`) returns `E_INVAL`.
+**§4.2.24** `vm_guest_map` returns `E_OK` on success. **§4.2.25** `vm_guest_map` with zero size returns `E_INVAL`. **§4.2.26** `vm_guest_map` with non-page-aligned `guest_addr` returns `E_INVAL`. **§4.2.27** `vm_guest_map` with non-page-aligned `size` returns `E_INVAL`. **§4.2.28** `vm_guest_map` with invalid rights bits returns `E_INVAL`. **§4.2.29** `vm_guest_map` with non-page-aligned `host_vaddr` returns `E_INVAL`. **§4.2.30** `vm_guest_map` with `host_vaddr` not pointing to a valid mapped region in the caller's address space returns `E_BADADDR`. **§4.2.31** `vm_guest_map` with a guest physical region overlapping any MMIO page reserved by the in-kernel interrupt controller returns `E_INVAL`.
 
 #### vm_recv(buf_ptr, blocking) → exit_token
 
@@ -732,23 +734,23 @@ Injects a virtual interrupt into a vCPU.
 
 **§4.2.53** `vm_vcpu_interrupt` returns `E_OK` on success. **§4.2.54** `vm_vcpu_interrupt` with `thread_handle` not referring to a vCPU thread returns `E_BADHANDLE`. **§4.2.55** `vm_vcpu_interrupt` with `interrupt_ptr` not readable returns `E_BADADDR`.
 
-#### vm_msr_passthrough(msr_num, allow_read, allow_write) → result
+#### vm_sysreg_passthrough(sysreg_id, allow_read, allow_write) → result
 
-Configures the calling process's VM to allow the guest to RDMSR and/or WRMSR the specified MSR directly without exiting. The kernel rejects security-critical MSRs (see the MSR Passthrough subsection above).
+Configures the calling process's VM to allow the guest to read and/or write the specified system register directly without exiting. `sysreg_id` is an arch-specific 32-bit identifier (x86-64: MSR address; ARMv8: packed `(op0,op1,CRn,CRm,op2)` encoding). The kernel rejects security-critical system registers (see the System Register Passthrough subsection above).
 
-**§4.2.56** `vm_msr_passthrough` returns `E_OK` on success. **§4.2.57** `vm_msr_passthrough` with an invalid VM handle returns `E_BADHANDLE`. **§4.2.58** `vm_msr_passthrough` with `msr_num` outside the 32-bit MSR address range returns `E_INVAL`. **§4.2.59** `vm_msr_passthrough` with an MSR in the security blocklist returns `E_PERM`.
+**§4.2.56** `vm_sysreg_passthrough` returns `E_OK` on success. **§4.2.57** `vm_sysreg_passthrough` with an invalid VM handle returns `E_BADHANDLE`. **§4.2.58** `vm_sysreg_passthrough` with `sysreg_id` outside the 32-bit identifier range returns `E_INVAL`. **§4.2.59** `vm_sysreg_passthrough` with a system register in the security blocklist returns `E_PERM`.
 
-#### vm_ioapic_assert_irq(irq_num) → result
+#### vm_intc_assert_irq(irq_num) → result
 
-Asserts an IRQ line on the calling process's VM's in-kernel IOAPIC and kicks any running vCPU so the new interrupt state is observed promptly.
+Asserts an IRQ line on the calling process's VM's in-kernel interrupt controller and kicks any running vCPU so the new interrupt state is observed promptly.
 
-**§4.2.60** `vm_ioapic_assert_irq` returns `E_OK` on success. **§4.2.61** `vm_ioapic_assert_irq` with an invalid VM handle returns `E_BADHANDLE`. **§4.2.62** `vm_ioapic_assert_irq` with `irq_num` greater than or equal to 24 returns `E_INVAL`.
+**§4.2.60** `vm_intc_assert_irq` returns `E_OK` on success. **§4.2.61** `vm_intc_assert_irq` with an invalid VM handle returns `E_BADHANDLE`. **§4.2.62** `vm_intc_assert_irq` with `irq_num` greater than or equal to 24 returns `E_INVAL`.
 
-#### vm_ioapic_deassert_irq(irq_num) → result
+#### vm_intc_deassert_irq(irq_num) → result
 
-De-asserts an IRQ line on the calling process's VM's in-kernel IOAPIC and kicks any running vCPU so the new interrupt state is observed promptly.
+De-asserts an IRQ line on the calling process's VM's in-kernel interrupt controller and kicks any running vCPU so the new interrupt state is observed promptly.
 
-**§4.2.63** `vm_ioapic_deassert_irq` returns `E_OK` on success. **§4.2.64** `vm_ioapic_deassert_irq` with an invalid VM handle returns `E_BADHANDLE`. **§4.2.65** `vm_ioapic_deassert_irq` with `irq_num` greater than or equal to 24 returns `E_INVAL`.
+**§4.2.63** `vm_intc_deassert_irq` returns `E_OK` on success. **§4.2.64** `vm_intc_deassert_irq` with an invalid VM handle returns `E_BADHANDLE`. **§4.2.65** `vm_intc_deassert_irq` with `irq_num` greater than or equal to 24 returns `E_INVAL`.
 
 ---
 
@@ -986,9 +988,9 @@ All syscalls return `i64`. Non-negative = success, negative = error code. Sizes 
 | 43 | `vm_vcpu_get_state` | §4.2 |
 | 44 | `vm_vcpu_run` | §4.2 |
 | 45 | `vm_vcpu_interrupt` | §4.2 |
-| 46 | `vm_msr_passthrough` | §4.2 |
-| 47 | `vm_ioapic_assert_irq` | §4.2 |
-| 48 | `vm_ioapic_deassert_irq` | §4.2 |
+| 46 | `vm_sysreg_passthrough` | §4.2 |
+| 47 | `vm_intc_assert_irq` | §4.2 |
+| 48 | `vm_intc_deassert_irq` | §4.2 |
 | 49 | `pmu_info` | §4.1 |
 | 50 | `pmu_start` | §4.1 |
 | 51 | `pmu_read` | §4.1 |

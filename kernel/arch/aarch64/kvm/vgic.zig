@@ -498,8 +498,8 @@ pub fn initVcpu(state: *VcpuState, dist: *Vgic, vcpu_index: u32) void {
 // ===========================================================================
 
 /// Assert an SPI line (INTID 32..MAX_SPIS+31). Called by
-/// `kvm.vm.ioapicAssertIrq` (the cross-arch syscall name is "ioapic" but
-/// on aarch64 it routes here).
+/// `kvm.vm.intcAssertIrq`, which is the cross-arch `vm_intc_assert_irq`
+/// syscall dispatched to the aarch64 backend.
 ///
 /// Sets the pending state in the distributor for the given INTID. The
 /// caller is responsible for kicking the targeted vCPU if it is currently

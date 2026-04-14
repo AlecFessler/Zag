@@ -67,9 +67,9 @@ pub const SyscallNum = enum(u64) {
     vm_vcpu_get_state, // 43
     vm_vcpu_run, // 44
     vm_vcpu_interrupt, // 45
-    vm_msr_passthrough, // 46
-    vm_ioapic_assert_irq, // 47
-    vm_ioapic_deassert_irq, // 48
+    vm_sysreg_passthrough, // 46
+    vm_intc_assert_irq, // 47
+    vm_intc_deassert_irq, // 48
 };
 
 // Raw syscall wrappers
@@ -238,10 +238,10 @@ pub fn vm_vcpu_interrupt(thread_handle: u64, interrupt_ptr: u64) i64 {
     return syscall2(.vm_vcpu_interrupt, thread_handle, interrupt_ptr);
 }
 
-pub fn vm_ioapic_assert_irq(vm_handle: u64, irq_num: u64) i64 {
-    return syscall2(.vm_ioapic_assert_irq, vm_handle, irq_num);
+pub fn vm_intc_assert_irq(vm_handle: u64, irq_num: u64) i64 {
+    return syscall2(.vm_intc_assert_irq, vm_handle, irq_num);
 }
 
-pub fn vm_ioapic_deassert_irq(vm_handle: u64, irq_num: u64) i64 {
-    return syscall2(.vm_ioapic_deassert_irq, vm_handle, irq_num);
+pub fn vm_intc_deassert_irq(vm_handle: u64, irq_num: u64) i64 {
+    return syscall2(.vm_intc_deassert_irq, vm_handle, irq_num);
 }

@@ -1154,16 +1154,18 @@ pub fn vmInjectException(guest_state: *GuestState, exception: GuestException) vo
     }
 }
 
-/// Modify MSR passthrough bits in the VM's MSR permission map.
+/// Modify system-register passthrough bits in the VM's per-sysreg trap map.
 /// On AMD SVM: AMD APM Vol 2, §15.10 "MSR Intercepts" — the MSRPM is an 8-KB
 /// bitmap; two bits per MSR (bit 0 = read intercept, bit 1 = write intercept);
 /// 0 = passthrough, 1 = intercept. MSRs 0x0000–0x1FFF at byte offset 0x000;
 /// MSRs 0xC0000000–0xC0001FFF at byte offset 0x800.
 /// On Intel VMX: Intel SDM Vol 3C, §24.6.9 "MSR-Bitmap Address" — a 4-KB
 /// bitmap with four 1-KB regions for RDMSR/WRMSR on low/high MSR ranges.
-pub fn vmMsrPassthrough(vm_structures: PAddr, msr_num: u32, allow_read: bool, allow_write: bool) void {
+/// On ARMv8: HCR_EL2/CPTR_EL2/MDCR_EL2/CNTHCTL_EL2 trap bits per register class
+/// (ARM ARM D13) — `sysreg_id` is a packed (op0,op1,CRn,CRm,op2) encoding.
+pub fn vmSysregPassthrough(vm_structures: PAddr, sysreg_id: u32, allow_read: bool, allow_write: bool) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.vm.msrPassthrough(vm_structures, msr_num, allow_read, allow_write),
+        .x86_64 => x64.vm.sysregPassthrough(vm_structures, sysreg_id, allow_read, allow_write),
         .aarch64 => {},
         else => unreachable,
     }
@@ -1591,26 +1593,26 @@ pub fn kvmVcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) 
     };
 }
 
-pub fn kvmMsrPassthrough(proc: *Process, vm_handle: u64, msr_num: u32, allow_read: bool, allow_write: bool) i64 {
+pub fn kvmSysregPassthrough(proc: *Process, vm_handle: u64, sysreg_id: u32, allow_read: bool, allow_write: bool) i64 {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.msrPassthrough(proc, vm_handle, msr_num, allow_read, allow_write),
-        .aarch64 => aarch64.kvm.vm.msrPassthrough(proc, vm_handle, msr_num, allow_read, allow_write),
+        .x86_64 => x64.kvm.vm.sysregPassthrough(proc, vm_handle, sysreg_id, allow_read, allow_write),
+        .aarch64 => aarch64.kvm.vm.sysregPassthrough(proc, vm_handle, sysreg_id, allow_read, allow_write),
         else => -14,
     };
 }
 
-pub fn kvmIoapicAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
+pub fn kvmIntcAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.ioapicAssertIrq(proc, vm_handle, irq_num),
-        .aarch64 => aarch64.kvm.vm.ioapicAssertIrq(proc, vm_handle, irq_num),
+        .x86_64 => x64.kvm.vm.intcAssertIrq(proc, vm_handle, irq_num),
+        .aarch64 => aarch64.kvm.vm.intcAssertIrq(proc, vm_handle, irq_num),
         else => -14,
     };
 }
 
-pub fn kvmIoapicDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
+pub fn kvmIntcDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.ioapicDeassertIrq(proc, vm_handle, irq_num),
-        .aarch64 => aarch64.kvm.vm.ioapicDeassertIrq(proc, vm_handle, irq_num),
+        .x86_64 => x64.kvm.vm.intcDeassertIrq(proc, vm_handle, irq_num),
+        .aarch64 => aarch64.kvm.vm.intcDeassertIrq(proc, vm_handle, irq_num),
         else => -14,
     };
 }

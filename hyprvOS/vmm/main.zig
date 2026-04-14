@@ -379,8 +379,8 @@ noinline fn exitLoop(_: u64) void {
             serial.pollHostRx();
             if (serial.irq_pending) {
                 serial.irq_pending = false;
-                _ = syscall.vm_ioapic_assert_irq(vm_handle, 4);
-                _ = syscall.vm_ioapic_deassert_irq(vm_handle, 4);
+                _ = syscall.vm_intc_assert_irq(vm_handle, 4);
+                _ = syscall.vm_intc_deassert_irq(vm_handle, 4);
             }
             // Tick PIT — fires IRQ0 (GSI2) when counter reaches 0
             io.pitCheckIrq();
@@ -407,8 +407,8 @@ noinline fn exitLoop(_: u64) void {
         // Route serial IRQ through kernel IOAPIC
         if (serial.irq_pending) {
             serial.irq_pending = false;
-            _ = syscall.vm_ioapic_assert_irq(vm_handle, 4);
-            _ = syscall.vm_ioapic_deassert_irq(vm_handle, 4);
+            _ = syscall.vm_intc_assert_irq(vm_handle, 4);
+            _ = syscall.vm_intc_deassert_irq(vm_handle, 4);
         }
 
         // Tick PIT — fires IRQ0 (GSI2) when counter reaches 0

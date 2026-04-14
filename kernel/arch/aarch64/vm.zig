@@ -1539,14 +1539,14 @@ pub fn injectException(guest_state: *GuestState, exception: GuestException) void
 }
 
 // ===========================================================================
-// Sysreg passthrough (x86 "MSR passthrough" equivalent)
+// Sysreg passthrough
 // ===========================================================================
 
 /// Enable/disable trap-free access to a system register for the guest.
 ///
 /// The x86 MSR bitmap does not exist on ARM; instead each class of register
 /// has its own trap bit in HCR_EL2/CPTR_EL2/MDCR_EL2/CNTHCTL_EL2. This
-/// function decodes `msr_num` as a packed (op0,op1,crn,crm,op2) key and
+/// function decodes `sysreg_id` as a packed (op0,op1,crn,crm,op2) key and
 /// flips the relevant trap bit in the VM control block.
 ///
 /// Encoding used by userspace:
@@ -1555,11 +1555,9 @@ pub fn injectException(guest_state: *GuestState, exception: GuestException) void
 ///   bits [10:7]  CRn
 ///   bits [6:3]   CRm
 ///   bits [2:0]   Op2
-///
-/// (The `msr_num` parameter name is kept for dispatch ABI parity with x86.)
-pub fn msrPassthrough(vm_structures: PAddr, msr_num: u32, allow_read: bool, allow_write: bool) void {
+pub fn sysregPassthrough(vm_structures: PAddr, sysreg_id: u32, allow_read: bool, allow_write: bool) void {
     _ = vm_structures;
-    _ = msr_num;
+    _ = sysreg_id;
     _ = allow_read;
     _ = allow_write;
 }

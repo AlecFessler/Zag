@@ -321,10 +321,11 @@ pub fn injectException(guest_state: *GuestState, exception: GuestException) void
     }
 }
 
-/// Modify MSR passthrough bits in the VM's MSRPM.
-pub fn msrPassthrough(vm_structures: PAddr, msr_num: u32, allow_read: bool, allow_write: bool) void {
+/// Modify system-register passthrough bits in the VM's MSRPM. On x86 a
+/// "sysreg" is an MSR; `sysreg_id` is the 32-bit MSR address.
+pub fn sysregPassthrough(vm_structures: PAddr, sysreg_id: u32, allow_read: bool, allow_write: bool) void {
     switch (active_backend) {
-        .amd_svm => svm.msrPassthrough(vm_structures, msr_num, allow_read, allow_write),
+        .amd_svm => svm.msrPassthrough(vm_structures, sysreg_id, allow_read, allow_write),
         .intel_vmx => {}, // TODO: VMX MSR bitmap support
         .none => {},
     }

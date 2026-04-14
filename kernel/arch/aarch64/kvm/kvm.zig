@@ -7,8 +7,8 @@
 //!
 //! File breakdown (see each file's module-level doc comment for detail):
 //!
-//!   vm.zig            Vm object + vm_create / vm_guest_map / vm_msr_passthrough /
-//!                     vm_ioapic_{assert,deassert}_irq syscall implementations.
+//!   vm.zig            Vm object + vm_create / vm_guest_map / vm_sysreg_passthrough /
+//!                     vm_intc_{assert,deassert}_irq syscall implementations.
 //!
 //!   vcpu.zig          VCpu object + vm_vcpu_{run,set_state,get_state,interrupt}
 //!                     syscall implementations, plus the per-vCPU run loop

@@ -7,7 +7,7 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §6.6 — Divide-by-zero kills the child via a synchronous CPU fault.
+/// §6.6 — Divide-by-zero kills with `arithmetic_fault`.
 ///
 /// On x86 `div`-by-zero raises #DE, which the kernel maps to
 /// `arithmetic_fault`. On aarch64 integer division by zero is defined to

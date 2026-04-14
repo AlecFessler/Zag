@@ -127,7 +127,7 @@ kernel/
     userspace_init.zig   -- root service ELF loading and initial thread setup
   arch/x64/kvm/         -- VM guest support (x86-specific: VT-x/AMD-V, EPT/NPT, VMCB)
     kvm.zig              -- module root (re-exports)
-    vm.zig               -- Vm struct, vm_create, vm_guest_map, vm_msr_passthrough, ioapic_assert/deassert_irq
+    vm.zig               -- Vm struct, vm_create, vm_guest_map, vm_sysreg_passthrough, intc_assert/deassert_irq
     vcpu.zig             -- VCpu struct, vm_vcpu_run, vm_vcpu_set_state, vm_vcpu_get_state, vm_vcpu_interrupt, vCPU entry loop
     exit_box.zig         -- VmExitBox, VmExitMessage, VmReplyAction, vm_recv, vm_reply
     exit_handler.zig     -- VM exit dispatch (kernel-handled vs VMM-handled classification)
@@ -2288,7 +2288,7 @@ State the `Ioapic` struct holds: `ioregsel`, `ioapic_id`, the 24-entry `redir_ta
 Public surface:
 - `init(lapic_ptr)` — reset.
 - `mmioRead(offset)` / `mmioWrite(offset, value)` — MMIO handlers used by `Vm.tryHandleMmio`. Indirectly drive internal `readRegister`/`writeRegister` helpers, which know about ID/VER/ARB and the 0x10..0x3F redirection-table window. Bits 12 (delivery status) and 14 (remote IRR) in the redirection table are read-only from the guest.
-- `assertIrq(irq)` — used by both the kernel-side serial path and the `vm_ioapic_assert_irq` syscall. Honors the per-entry mask bit, debounces edges, and tracks remote IRR for level-triggered entries before calling the internal `deliverInterrupt`.
+- `assertIrq(irq)` — used by both the kernel-side serial path and the `vm_intc_assert_irq` syscall. Honors the per-entry mask bit, debounces edges, and tracks remote IRR for level-triggered entries before calling the internal `deliverInterrupt`.
 - `deassertIrq(irq)` — clears the level bit for level-triggered re-delivery.
 - `handleEOI(vector)` — called by the LAPIC on EOI for level-triggered interrupts. Clears remote IRR and re-fires the entry if the line is still asserted.
 - Internal (non-pub): `deliverInterrupt` reads the vector and delivery mode from the entry. Fixed/lowest-priority/ExtINT all just call `lapic.injectExternal`. SMI/NMI/INIT are stubbed.
@@ -2315,9 +2315,11 @@ GPR read/write is caller-specific because the two register layouts differ struct
 
 Guest virtual → physical translation goes through `guestVirtToPhys`, which walks the guest's CR3 4-level page tables (handling 1 GiB and 2 MiB huge pages) by reading guest physical memory through `Vm.guestPhysToHost`. When CR0.PG is clear (early boot in real/protected mode), guest virt = guest phys directly. The existing `guestVirtToPhys` logic stays in the VM path (it needs `*Vm` for guest page tables), but instruction decoding itself is now arch-generic via `decodeBytes`. The decoder never touches `Vm`'s memory bookkeeping fields directly — `guestPhysToHost`/`readGuestPhysSlice` are the single home for that arithmetic.
 
-### MSR Passthrough
+### Sysreg Passthrough
 
-`vm.msrPassthrough(msr_num, allow_read, allow_write)` flips bits in the VMCB MSRPM via `arch.vmMsrPassthrough` so the guest can directly RDMSR/WRMSR a given MSR without an exit. The kernel maintains a hard blocklist of security-critical MSRs (`isSecurityCriticalMsr`) and returns `E_PERM` for any of them — these always trap to the kernel/VMM regardless of what userspace requests:
+`vm.sysregPassthrough(sysreg_id, allow_read, allow_write)` flips per-register trap bits so the guest can access a given system register without exiting. On x86-64 this modifies the VMCB/VMCS MSR bitmap via `arch.vmSysregPassthrough`; on ARMv8 it will modify HCR_EL2/CPTR_EL2/MDCR_EL2/CNTHCTL_EL2 bits (wiring tracked in task #85). The kernel maintains a hard blocklist of security-critical sysregs (`isSecurityCriticalSysreg`) and returns `E_PERM` for any of them — these always trap to the kernel/VMM regardless of what userspace requests.
+
+The x86-64 blocklist:
 
 ```
 EFER, STAR, LSTAR, CSTAR, SFMASK,
@@ -2326,9 +2328,11 @@ KERNEL_GS_BASE,
 SYSENTER_CS / SYSENTER_ESP / SYSENTER_EIP
 ```
 
-### IOAPIC IRQ Syscalls and vCPU Kick
+The ARMv8 blocklist covers every EL2/EL3 sysreg (Op1 >= 4) and every AArch64 ID register (Op0=3, Op1=0, CRn=0, CRm<=7).
 
-`vm.ioapicAssertIrq(irq)` and `vm.ioapicDeassertIrq(irq)` give userspace device emulators direct access to the kernel IOAPIC. Both syscalls validate that `irq < 24`, call the corresponding `Ioapic` method, and then call `kickRunningVcpus(vm)`.
+### Interrupt Controller IRQ Syscalls and vCPU Kick
+
+`vm.intcAssertIrq(irq)` and `vm.intcDeassertIrq(irq)` give userspace device emulators direct access to the in-kernel interrupt controller — IOAPIC on x86-64, vGIC on ARMv8. Both syscalls validate that `irq < 24`, call the corresponding arch-specific controller method (IOAPIC `assertIrq`/`deassertIrq` on x86-64; `vgic.assertSpi`/`deassertSpi` with `irq_num + 32` on ARMv8), and then call `kickRunningVcpus(vm)`.
 
 `kickRunningVcpus` walks `vm.vcpus[0..num_vcpus]` and, for any vCPU in the `running` state that is currently scheduled on a core (`sched.coreRunning(thread)` returns the core ID), calls `arch.triggerSchedulerInterrupt(core_id)`. The IPI forces a `#VMEXIT` so the entry loop runs again, ticks the LAPIC, and notices the new pending vector before re-entering the guest. Without the kick, a guest in a tight HLT-less polling loop would never see the new IRQ until its next timer-induced exit.
 

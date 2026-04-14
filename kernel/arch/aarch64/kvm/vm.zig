@@ -371,30 +371,30 @@ fn rollbackGuestMap(vm_obj: *Vm, guest_addr: u64, mapped_size: u64) void {
     }
 }
 
-/// `vm_msr_passthrough` — on ARM the "msr_num" parameter is a packed
-/// (op0,op1,crn,crm,op2) sysreg encoding (see `vm_hw.msrPassthrough`
+/// `vm_sysreg_passthrough` — on ARM the `sysreg_id` parameter is a packed
+/// (op0,op1,crn,crm,op2) sysreg encoding (see `vm_hw.sysregPassthrough`
 /// header). The kernel refuses security-critical sysregs that would
 /// allow the guest to escape EL1 confinement.
-pub fn msrPassthrough(proc: *Process, vm_handle: u64, msr_num: u32, allow_read: bool, allow_write: bool) i64 {
+pub fn sysregPassthrough(proc: *Process, vm_handle: u64, sysreg_id: u32, allow_read: bool, allow_write: bool) i64 {
     const E_PERM: i64 = -2;
     const E_BADCAP: i64 = -3;
 
     const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
 
-    if (isSecurityCriticalSysreg(msr_num)) return E_PERM;
+    if (isSecurityCriticalSysreg(sysreg_id)) return E_PERM;
 
     vm_obj.lock.lock();
     defer vm_obj.lock.unlock();
 
-    arch.vmMsrPassthrough(vm_obj.arch_structures, msr_num, allow_read, allow_write);
+    arch.vmSysregPassthrough(vm_obj.arch_structures, sysreg_id, allow_read, allow_write);
     return 0; // E_OK
 }
 
-/// `vm_ioapic_assert_irq` — assert an SPI line on the in-kernel vGIC.
-/// Spec §4.2.62 keeps the irq_num < 24 limit for cross-arch parity with
-/// the x86 IOAPIC. SPIs in GICv3 are INTID 32..1019; we expose them as
+/// `vm_intc_assert_irq` — assert an SPI line on the in-kernel vGIC.
+/// The spec bounds irq_num < 24 for cross-arch parity with the x86 IOAPIC
+/// pin count; SPIs in GICv3 are INTID 32..1019, exposed here as
 /// `irq_num + 32`.
-pub fn ioapicAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
+pub fn intcAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
     const E_INVAL: i64 = -1;
     const E_BADCAP: i64 = -3;
 
@@ -405,7 +405,7 @@ pub fn ioapicAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
     return 0; // E_OK
 }
 
-pub fn ioapicDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
+pub fn intcDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
     const E_INVAL: i64 = -1;
     const E_BADCAP: i64 = -3;
 
@@ -477,11 +477,11 @@ fn writeGuestGpr(gs: *vm_hw.GuestState, n: u8, value: u64) void {
     base[n] = value;
 }
 
-/// Sysreg blocklist for `vm_msr_passthrough`. Refuses anything that would
+/// Sysreg blocklist for `vm_sysreg_passthrough`. Refuses anything that would
 /// let the guest reach EL2 / EL3 state, plus the ID registers we depend on
 /// for VmPolicy decisions.
 ///
-/// The encoding scheme matches the doc comment on `vm_hw.msrPassthrough`:
+/// The encoding scheme matches the doc comment on `vm_hw.sysregPassthrough`:
 ///   bits [15:14] Op0
 ///   bits [13:11] Op1
 ///   bits [10:7]  CRn

@@ -1,4 +1,5 @@
-/// §4.2.31 — `vm_guest_map` with a guest physical region overlapping the in-kernel LAPIC page (`0xFEE00000`) or IOAPIC page (`0xFEC00000`) returns `E_INVAL`.
+/// §4.2.31 — `vm_guest_map` with a guest physical region overlapping any MMIO page reserved by the in-kernel interrupt controller returns `E_INVAL`.
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const syscall = lib.syscall;
@@ -6,11 +7,21 @@ const t = lib.testing;
 
 var policy: [4096]u8 align(4096) = .{0} ** 4096;
 
-const LAPIC_BASE: u64 = 0xFEE00000;
-const IOAPIC_BASE: u64 = 0xFEC00000;
+// Arch-specific MMIO pages owned by the in-kernel interrupt controller.
+// These must match the kernel's reserved regions — any overlap with a
+// `vm_guest_map` request must return E_INVAL.
+//
+// x86-64: LAPIC @ 0xFEE00000 + IOAPIC @ 0xFEC00000 (single 4K page each).
+// ARMv8:  vGIC distributor/redistributor pages owned by the kernel vGIC.
+//         We sample each by base address; the kernel reserves at least one
+//         4K page at each of these bases.
+const INTC_BASES: []const u64 = switch (builtin.cpu.arch) {
+    .x86_64 => &.{ 0xFEE00000, 0xFEC00000 },
+    .aarch64 => &.{ 0x08000000, 0x080A0000 },
+    else => @compileError("unsupported arch"),
+};
 
 pub fn main(_: u64) void {
-    t.skipNoAarch64Vm("§4.2.31");
     const cr = syscall.vm_create(1, @intFromPtr(&policy));
     t.skipIfNoVm("§4.2.31", cr);
     if (cr < 0) {
@@ -29,63 +40,38 @@ pub fn main(_: u64) void {
 
     var passed = true;
 
-    // Region exactly at LAPIC base.
-    const r_lapic_exact = syscall.vm_guest_map(@bitCast(cr), host_va, LAPIC_BASE, syscall.PAGE4K, 0x7);
-    if (r_lapic_exact != syscall.E_INVAL) {
-        t.failWithVal("§4.2.31 lapic_exact", syscall.E_INVAL, r_lapic_exact);
-        passed = false;
-    }
+    for (INTC_BASES) |base| {
+        // Region exactly at the intc page.
+        const r_exact = syscall.vm_guest_map(@bitCast(cr), host_va, base, syscall.PAGE4K, 0x7);
+        if (r_exact != syscall.E_INVAL) {
+            t.failWithVal("§4.2.31 exact", syscall.E_INVAL, r_exact);
+            passed = false;
+        }
 
-    // Region exactly at IOAPIC base.
-    const r_ioapic_exact = syscall.vm_guest_map(@bitCast(cr), host_va, IOAPIC_BASE, syscall.PAGE4K, 0x7);
-    if (r_ioapic_exact != syscall.E_INVAL) {
-        t.failWithVal("§4.2.31 ioapic_exact", syscall.E_INVAL, r_ioapic_exact);
-        passed = false;
-    }
+        // Region starting one page below the intc page, two pages long — straddles it.
+        const r_straddle = syscall.vm_guest_map(@bitCast(cr), host_va, base - syscall.PAGE4K, 2 * syscall.PAGE4K, 0x7);
+        if (r_straddle != syscall.E_INVAL) {
+            t.failWithVal("§4.2.31 straddle", syscall.E_INVAL, r_straddle);
+            passed = false;
+        }
 
-    // Region starting one page below LAPIC, two pages long — overlaps LAPIC.
-    const r_lapic_straddle = syscall.vm_guest_map(@bitCast(cr), host_va, LAPIC_BASE - syscall.PAGE4K, 2 * syscall.PAGE4K, 0x7);
-    if (r_lapic_straddle != syscall.E_INVAL) {
-        t.failWithVal("§4.2.31 lapic_straddle", syscall.E_INVAL, r_lapic_straddle);
-        passed = false;
-    }
+        // Upper-edge straddle: guest_addr begins inside the intc page and
+        // extends past it. Targets a known-bug class where only
+        // `guest_addr <= base` was checked. A non-page-aligned guest_addr
+        // also violates §4.2.26, so either rule returning E_INVAL is
+        // acceptable — the test only asserts E_INVAL.
+        const r_midpage = syscall.vm_guest_map(@bitCast(cr), host_va, base + 0x800, syscall.PAGE4K, 0x7);
+        if (r_midpage != syscall.E_INVAL) {
+            t.failWithVal("§4.2.31 midpage", syscall.E_INVAL, r_midpage);
+            passed = false;
+        }
 
-    // Region starting one page below IOAPIC, two pages long — overlaps IOAPIC.
-    const r_ioapic_straddle = syscall.vm_guest_map(@bitCast(cr), host_va, IOAPIC_BASE - syscall.PAGE4K, 2 * syscall.PAGE4K, 0x7);
-    if (r_ioapic_straddle != syscall.E_INVAL) {
-        t.failWithVal("§4.2.31 ioapic_straddle", syscall.E_INVAL, r_ioapic_straddle);
-        passed = false;
-    }
-
-    // Upper-edge straddle: guest_addr begins inside the LAPIC/IOAPIC page and
-    // extends past it. These specifically target a known kernel bug where only
-    // `guest_addr <= mmio_base` was checked, letting mid-page starts slip through.
-    // (A non-page-aligned guest_addr also violates §4.40.3, so either rule
-    // returning E_INVAL is acceptable — the test only asserts E_INVAL.)
-    const r_lapic_midpage = syscall.vm_guest_map(@bitCast(cr), host_va, LAPIC_BASE + 0x800, syscall.PAGE4K, 0x7);
-    if (r_lapic_midpage != syscall.E_INVAL) {
-        t.failWithVal("§4.2.31 lapic_midpage", syscall.E_INVAL, r_lapic_midpage);
-        passed = false;
-    }
-
-    const r_ioapic_midpage = syscall.vm_guest_map(@bitCast(cr), host_va, IOAPIC_BASE + 0x800, syscall.PAGE4K, 0x7);
-    if (r_ioapic_midpage != syscall.E_INVAL) {
-        t.failWithVal("§4.2.31 ioapic_midpage", syscall.E_INVAL, r_ioapic_midpage);
-        passed = false;
-    }
-
-    // Region wholly contains the LAPIC page: starts one page below, three pages long.
-    const r_lapic_contain = syscall.vm_guest_map(@bitCast(cr), host_va, LAPIC_BASE - syscall.PAGE4K, 3 * syscall.PAGE4K, 0x7);
-    if (r_lapic_contain != syscall.E_INVAL) {
-        t.failWithVal("§4.2.31 lapic_contain", syscall.E_INVAL, r_lapic_contain);
-        passed = false;
-    }
-
-    // Region wholly contains the IOAPIC page.
-    const r_ioapic_contain = syscall.vm_guest_map(@bitCast(cr), host_va, IOAPIC_BASE - syscall.PAGE4K, 3 * syscall.PAGE4K, 0x7);
-    if (r_ioapic_contain != syscall.E_INVAL) {
-        t.failWithVal("§4.2.31 ioapic_contain", syscall.E_INVAL, r_ioapic_contain);
-        passed = false;
+        // Region wholly contains the intc page: starts one page below, three pages long.
+        const r_contain = syscall.vm_guest_map(@bitCast(cr), host_va, base - syscall.PAGE4K, 3 * syscall.PAGE4K, 0x7);
+        if (r_contain != syscall.E_INVAL) {
+            t.failWithVal("§4.2.31 contain", syscall.E_INVAL, r_contain);
+            passed = false;
+        }
     }
 
     if (passed) {
