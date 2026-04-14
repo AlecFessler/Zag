@@ -445,6 +445,41 @@ pub const VcpuState = struct {
     needs_refill: bool = false,
 };
 
+/// EL2 sysreg shadow handed to the `hvc_vgic_prepare_entry` /
+/// `hvc_vgic_save_exit` hyp stubs. `extern struct` with hardcoded
+/// field offsets because the stub uses `ldr/str [x1, #IMM]`.
+///
+/// The stubs always load/store all 16 LR slots — slots beyond
+/// `num_lrs` are left zero (LR.State = 0b00 Invalid, GICv3 §11.2.5,
+/// which is "no pending/active entry") so they are architecturally
+/// harmless.
+pub const VcpuHwShadow = extern struct {
+    /// ICH_LR0..15_EL2 (ARM ARM D13.8.51, Table D13-65).
+    lrs: [MAX_LRS]u64 = .{0} ** MAX_LRS,
+    /// ICH_HCR_EL2 value to load. Caller forces EN=1 before hvc.
+    /// GICv3 §12.5.7.
+    hcr: u64 = 0,
+    /// ICH_VMCR_EL2 (GICv3 §12.5.27).
+    vmcr: u64 = 0,
+    /// ICH_AP0R0_EL2 (GICv3 §12.5.2 / ARM ARM D13.8.42).
+    ap0r0: u64 = 0,
+    /// ICH_AP1R0_EL2 (GICv3 §12.5.5 / ARM ARM D13.8.46).
+    ap1r0: u64 = 0,
+    /// ICH_MISR_EL2 snapshot written by `hvc_vgic_save_exit` (ARM ARM
+    /// D13.8.47). Only consumed on exit — ignored by the entry stub.
+    misr: u64 = 0,
+};
+
+comptime {
+    std.debug.assert(@offsetOf(VcpuHwShadow, "lrs") == 0x00);
+    std.debug.assert(@offsetOf(VcpuHwShadow, "hcr") == 0x80);
+    std.debug.assert(@offsetOf(VcpuHwShadow, "vmcr") == 0x88);
+    std.debug.assert(@offsetOf(VcpuHwShadow, "ap0r0") == 0x90);
+    std.debug.assert(@offsetOf(VcpuHwShadow, "ap1r0") == 0x98);
+    std.debug.assert(@offsetOf(VcpuHwShadow, "misr") == 0xA0);
+    std.debug.assert(MAX_LRS == 16);
+}
+
 // ===========================================================================
 // Host capability detection
 // ===========================================================================
@@ -464,22 +499,19 @@ var list_regs_detected: bool = false;
 /// Detect how many list registers the host implements by reading
 /// ICH_VTR_EL2.ListRegs (bits[4:0], the encoded count is ListRegs-1).
 ///
-/// GICv3 §12.5.30 / ARM ARM D13.8.50: the register is accessible only
-/// at EL2 or higher (S3_4_C12_C11_1). Zag's world-switch dispatcher
-/// runs the guest-entry path at EL2 and the rest of the kernel's vGIC
-/// sysreg accessors (writeIchHcr, writeLr<n>, etc.) are also issued
-/// from that same EL2 window — so this probe is issued lazily on the
-/// first `init` call, which happens before any vCPU has entered a
-/// guest. If the probe traps (no EL2 or pre-init state), the caller
-/// falls back to the architectural minimum of 4 list registers
-/// (GICv3 §11.2.5 "List registers") which is also what the Pi 5
-/// Cortex-A76 and QEMU virt implement.
+/// GICv3 §12.5.30 / ARM ARM D13.8.50: ICH_VTR_EL2 is EL2-only, so an
+/// EL1 `mrs` traps. The kernel runs at EL1 and this function is
+/// called from `vgic.init` on `vmCreate`; we therefore forward the
+/// probe through `hvc_vgic_detect_lrs` which reads the sysreg at EL2
+/// and returns `(ICH_VTR_EL2.ListRegs + 1)` in x0. If the stub ever
+/// returns 0 or a count larger than MAX_LRS we fall back to the
+/// architectural minimum of 4 list registers (GICv3 §11.2.5) which
+/// is also what the Pi 5 Cortex-A76 and QEMU virt implement.
 fn detectListRegs() void {
     if (list_regs_detected) return;
     list_regs_detected = true;
-    const vtr: u64 = readIchVtrEl2();
-    const encoded: u8 = @intCast(vtr & 0x1F);
-    const count: u8 = encoded + 1;
+    const count_u64: u64 = vm_hw.hypCall(.vgic_detect_lrs, 0);
+    const count: u8 = @intCast(count_u64 & 0xFF);
     if (count == 0 or count > MAX_LRS) {
         // Sanity clamp: a zero/oversized read means the sysreg
         // was unavailable or returned garbage; fall back to the
@@ -488,15 +520,6 @@ fn detectListRegs() void {
         return;
     }
     num_lrs = count;
-}
-
-inline fn readIchVtrEl2() u64 {
-    var v: u64 = 0;
-    // S3_4_C12_C11_1 — ICH_VTR_EL2. GICv3 §12.5.30.
-    asm volatile ("mrs %[v], S3_4_C12_C11_1"
-        : [v] "=r" (v),
-    );
-    return v;
 }
 
 /// Public accessor for `num_lrs`, exposed so vcpu / test code can
@@ -739,17 +762,21 @@ pub fn prepareEntry(state: *VcpuState) void {
     defer state.lock.unlockIrqRestore(flags);
 
     refillLrsLocked(state, state.dist);
-    writeLrs(state);
-    writeIchAp0r0(state.ap0r0);
-    writeIchAp1r0(state.ap1r0);
-    writeIchVmcr(state.vmcr);
-    // Load ICH_HCR_EL2 last with EN=1 so the virtual CPU interface
-    // begins delivering interrupts only after LRs / AP / VMCR are
-    // consistent. GICv3 §11.4 "Maintenance interrupts" notes that
-    // enabling the interface before LRs are populated can cause a
-    // spurious underflow MI. `state.hcr` always carries EN per the
-    // VcpuState default.
-    writeIchHcr(state.hcr | ICH_HCR_EN);
+
+    // Gather the EL2-sysreg-bound state into a pinned-layout shadow
+    // and hand it to the `hvc_vgic_prepare_entry` stub. All ICH_*_EL2
+    // registers are EL2-only (ARM ARM D13.8) so the EL1 kernel cannot
+    // write them directly. GICv3 §11.4 "Maintenance interrupts" notes
+    // that enabling the interface before LRs are populated can cause
+    // a spurious underflow MI, so the stub writes LRs / AP / VMCR
+    // first and enables the CPU interface (ICH_HCR_EL2.EN) last.
+    var shadow: VcpuHwShadow = .{};
+    shadow.lrs = state.lrs;
+    shadow.hcr = state.hcr | ICH_HCR_EN;
+    shadow.vmcr = state.vmcr;
+    shadow.ap0r0 = state.ap0r0;
+    shadow.ap1r0 = state.ap1r0;
+    _ = vm_hw.hypCall(.vgic_prepare_entry, @intFromPtr(&shadow));
 }
 
 /// Called by the vCPU run loop immediately after `vm_hw.vmResume`
@@ -766,9 +793,17 @@ pub fn saveExit(state: *VcpuState) void {
     const flags = state.lock.lockIrqSave();
     defer state.lock.unlockIrqRestore(flags);
 
-    readLrs(state);
-    state.ap0r0 = readIchAp0r0();
-    state.ap1r0 = readIchAp1r0();
+    // Snapshot ICH_LR*_EL2 / ICH_AP{0,1}R0_EL2 at EL2 via the
+    // `hvc_vgic_save_exit` stub, which also disables the virtual CPU
+    // interface (ICH_HCR_EL2 ← 0) for the host-running window so a
+    // maintenance IRQ cannot fire into the host (GICv3 §12.5.7 "En").
+    // EL1 cannot read these sysregs directly (ARM ARM D13.8).
+    var shadow: VcpuHwShadow = .{};
+    shadow.lrs = state.lrs;
+    _ = vm_hw.hypCall(.vgic_save_exit, @intFromPtr(&shadow));
+    state.lrs = shadow.lrs;
+    state.ap0r0 = shadow.ap0r0;
+    state.ap1r0 = shadow.ap1r0;
 
     // Walk the LR shadow looking for entries that have transitioned out
     // of active or pending state. The hardware updates the state field
@@ -807,7 +842,9 @@ pub fn saveExit(state: *VcpuState) void {
 
     // If MISR.U is set the host is telling us LRs are nearly empty;
     // schedule a refill on the next prepareEntry. GICv3 §12.5.18.
-    const misr = readIchMisr();
+    // ICH_MISR_EL2 is EL2-only (ARM ARM D13.8.47) so we read the
+    // snapshot the `hvc_vgic_save_exit` stub stashed in the shadow.
+    const misr = shadow.misr;
     if ((misr & 0b1) != 0) {
         // EOI maintenance — already handled by walking LRs above.
     }
@@ -819,10 +856,8 @@ pub fn saveExit(state: *VcpuState) void {
     // everything. Avoids a tight maintenance IRQ storm.
     state.hcr &= ~ICH_HCR_NPIE;
 
-    // Disable the virtual CPU interface for the host-running window.
-    // While EN=0 the List Registers are not actively consulted and
-    // our shadow remains authoritative. GICv3 §12.5.7 ICH_HCR_EL2.En.
-    writeIchHcr(0);
+    // Note: ICH_HCR_EL2 ← 0 is issued inside `hvc_vgic_save_exit`
+    // after the LR/AP snapshot. GICv3 §12.5.7 ICH_HCR_EL2.En.
 }
 
 fn clearActiveState(state: *VcpuState, intid: u32) void {
@@ -1188,134 +1223,13 @@ fn writeSgiPpiPriority(state: *VcpuState, byte_offset: u64, value: u32) void {
 // Sysreg accessors for the virtual CPU interface
 // ===========================================================================
 //
-// Each ICH_*_EL2 system register has a fixed (op0, op1, CRn, CRm, op2)
-// encoding from ARM ARM D13.8. We use the S<op0>_<op1>_C<CRn>_C<CRm>_<op2>
-// generic syntax so this builds with any LLVM that knows GICv3.
-
-inline fn writeIchHcr(value: u64) void {
-    asm volatile ("msr S3_4_C12_C11_0, %[v]" // ICH_HCR_EL2
-        :
-        : [v] "r" (value),
-    );
-}
-
-inline fn writeIchVmcr(value: u64) void {
-    asm volatile ("msr S3_4_C12_C11_7, %[v]" // ICH_VMCR_EL2
-        :
-        : [v] "r" (value),
-    );
-}
-
-/// ICH_AP0R0_EL2 — Group 0 Active Priorities Register 0.
-/// GICv3 §12.5.2 / ARM ARM D13.8.42. Encoding S3_4_C12_C8_0.
-inline fn writeIchAp0r0(value: u64) void {
-    asm volatile ("msr S3_4_C12_C8_0, %[v]"
-        :
-        : [v] "r" (value),
-    );
-}
-
-inline fn readIchAp0r0() u64 {
-    var v: u64 = undefined;
-    asm volatile ("mrs %[v], S3_4_C12_C8_0"
-        : [v] "=r" (v),
-    );
-    return v;
-}
-
-/// ICH_AP1R0_EL2 — Group 1 Active Priorities Register 0.
-/// GICv3 §12.5.5 / ARM ARM D13.8.46. Encoding S3_4_C12_C9_0.
-inline fn writeIchAp1r0(value: u64) void {
-    asm volatile ("msr S3_4_C12_C9_0, %[v]"
-        :
-        : [v] "r" (value),
-    );
-}
-
-inline fn readIchAp1r0() u64 {
-    var v: u64 = undefined;
-    asm volatile ("mrs %[v], S3_4_C12_C9_0"
-        : [v] "=r" (v),
-    );
-    return v;
-}
-
-inline fn readIchMisr() u64 {
-    var v: u64 = undefined;
-    asm volatile ("mrs %[v], S3_4_C12_C11_2" // ICH_MISR_EL2
-        : [v] "=r" (v),
-    );
-    return v;
-}
-
-/// Write the LR shadow into ICH_LR<0..num_lrs-1>_EL2. Each register has
-/// its own opcode encoding (ARM ARM D13.8.51, Table D13-65). We emit a
-/// straight-line `switch` over slot index because the encodings are not
-/// expressible as a base + offset and the assembler needs the full
-/// encoding literally.
-fn writeLrs(state: *const VcpuState) void {
-    var i: u8 = 0;
-    while (i < num_lrs) : (i += 1) {
-        writeLr(i, state.lrs[i]);
-    }
-}
-
-fn readLrs(state: *VcpuState) void {
-    var i: u8 = 0;
-    while (i < num_lrs) : (i += 1) {
-        state.lrs[i] = readLr(i);
-    }
-}
-
-/// ARM ARM D13.8.51: ICH_LR<n>_EL2 has encoding
-///   op0=3 op1=4 CRn=12 CRm=12+(n>>3) op2=n&7
-/// for n in 0..15. We dispatch on `n` because inline asm cannot
-/// parameterise CRm/op2 at runtime.
-fn writeLr(slot: u8, value: u64) void {
-    switch (slot) {
-        0 => asm volatile ("msr S3_4_C12_C12_0, %[v]" : : [v] "r" (value)),
-        1 => asm volatile ("msr S3_4_C12_C12_1, %[v]" : : [v] "r" (value)),
-        2 => asm volatile ("msr S3_4_C12_C12_2, %[v]" : : [v] "r" (value)),
-        3 => asm volatile ("msr S3_4_C12_C12_3, %[v]" : : [v] "r" (value)),
-        4 => asm volatile ("msr S3_4_C12_C12_4, %[v]" : : [v] "r" (value)),
-        5 => asm volatile ("msr S3_4_C12_C12_5, %[v]" : : [v] "r" (value)),
-        6 => asm volatile ("msr S3_4_C12_C12_6, %[v]" : : [v] "r" (value)),
-        7 => asm volatile ("msr S3_4_C12_C12_7, %[v]" : : [v] "r" (value)),
-        8 => asm volatile ("msr S3_4_C12_C13_0, %[v]" : : [v] "r" (value)),
-        9 => asm volatile ("msr S3_4_C12_C13_1, %[v]" : : [v] "r" (value)),
-        10 => asm volatile ("msr S3_4_C12_C13_2, %[v]" : : [v] "r" (value)),
-        11 => asm volatile ("msr S3_4_C12_C13_3, %[v]" : : [v] "r" (value)),
-        12 => asm volatile ("msr S3_4_C12_C13_4, %[v]" : : [v] "r" (value)),
-        13 => asm volatile ("msr S3_4_C12_C13_5, %[v]" : : [v] "r" (value)),
-        14 => asm volatile ("msr S3_4_C12_C13_6, %[v]" : : [v] "r" (value)),
-        15 => asm volatile ("msr S3_4_C12_C13_7, %[v]" : : [v] "r" (value)),
-        else => {},
-    }
-}
-
-fn readLr(slot: u8) u64 {
-    var v: u64 = 0;
-    switch (slot) {
-        0 => asm volatile ("mrs %[v], S3_4_C12_C12_0" : [v] "=r" (v)),
-        1 => asm volatile ("mrs %[v], S3_4_C12_C12_1" : [v] "=r" (v)),
-        2 => asm volatile ("mrs %[v], S3_4_C12_C12_2" : [v] "=r" (v)),
-        3 => asm volatile ("mrs %[v], S3_4_C12_C12_3" : [v] "=r" (v)),
-        4 => asm volatile ("mrs %[v], S3_4_C12_C12_4" : [v] "=r" (v)),
-        5 => asm volatile ("mrs %[v], S3_4_C12_C12_5" : [v] "=r" (v)),
-        6 => asm volatile ("mrs %[v], S3_4_C12_C12_6" : [v] "=r" (v)),
-        7 => asm volatile ("mrs %[v], S3_4_C12_C12_7" : [v] "=r" (v)),
-        8 => asm volatile ("mrs %[v], S3_4_C12_C13_0" : [v] "=r" (v)),
-        9 => asm volatile ("mrs %[v], S3_4_C12_C13_1" : [v] "=r" (v)),
-        10 => asm volatile ("mrs %[v], S3_4_C12_C13_2" : [v] "=r" (v)),
-        11 => asm volatile ("mrs %[v], S3_4_C12_C13_3" : [v] "=r" (v)),
-        12 => asm volatile ("mrs %[v], S3_4_C12_C13_4" : [v] "=r" (v)),
-        13 => asm volatile ("mrs %[v], S3_4_C12_C13_5" : [v] "=r" (v)),
-        14 => asm volatile ("mrs %[v], S3_4_C12_C13_6" : [v] "=r" (v)),
-        15 => asm volatile ("mrs %[v], S3_4_C12_C13_7" : [v] "=r" (v)),
-        else => {},
-    }
-    return v;
-}
+// Direct EL1 `msr/mrs` on ICH_*_EL2 would trap as an undefined
+// instruction (ARM ARM D13.8). The kernel therefore reaches the
+// virtual CPU interface sysregs via the `hvc_vgic_{detect_lrs,
+// prepare_entry,save_exit}` stubs in `arch/aarch64/vm.zig` which run
+// at EL2 and index `VcpuHwShadow` by the pinned offsets asserted
+// above. See `prepareEntry` / `saveExit` / `detectListRegs` for the
+// call sites.
 
 // ===========================================================================
 // Cross-arch / cross-host build guard
