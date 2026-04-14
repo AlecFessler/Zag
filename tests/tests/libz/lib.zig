@@ -8,3 +8,4 @@ pub const shm_protocol = @import("shm_protocol.zig");
 pub const sync = @import("sync.zig");
 pub const syscall = @import("syscall.zig");
 pub const testing = @import("test.zig");
+pub const vm_guest = @import("vm_guest.zig");
