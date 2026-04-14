@@ -17,6 +17,12 @@ pub fn init(
     allocator: std.mem.Allocator,
 ) void {
     kaslr_slide = slide;
+    // Direct-kernel boot doesn't load the kernel ELF into RAM as a
+    // separately addressable blob (it's baked into the loaded image
+    // itself). Skip parsing when the bootloader passes a zero-length
+    // blob so debug_info stays uninitialised instead of walking a
+    // bogus physmap pointer.
+    if (elf_len == 0) return;
     const parsed_elf = allocator.create(ParsedElf) catch return;
     const elf_ptr_phys = PAddr.fromInt(@intFromPtr(elf_phys_ptr));
     const elf_ptr_virt = VAddr.fromPAddr(elf_ptr_phys, null);

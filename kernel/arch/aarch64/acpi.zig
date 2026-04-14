@@ -411,33 +411,42 @@ pub fn decodeMadt(e: Madt.Entry) ?AnyMadt {
 /// - SPCR: PL011 UART base address for serial output.
 /// - FADT ("FACP"): ARM Boot Architecture Flags → PSCI conduit (SMC vs HVC).
 pub fn parseAcpi(xsdp_phys: PAddr) !void {
-    const xsdp_virt = VAddr.fromPAddr(xsdp_phys, null);
-    const xsdp = Xsdp.fromVAddr(xsdp_virt);
-    try xsdp.validate();
-
-    const xsdt_phys = PAddr.fromInt(xsdp.xsdt_paddr);
-    const xsdt_virt = VAddr.fromPAddr(xsdt_phys, null);
-    const xsdt = Xsdt.fromVAddr(xsdt_virt);
-    try xsdt.validate();
-
+    // Direct-kernel boot has no ACPI at all — QEMU `virt -kernel` hands
+    // us a DTB in x0 which we currently ignore. Skip the XSDP/XSDT walk
+    // entirely when the bootloader passes a zero XSDP and fall through
+    // to the PL011/RTC fallback block so the serial upper-half and the
+    // wall-clock still get wired up.
     var saw_spcr = false;
-    var xsdt_iter = xsdt.iter();
-    while (xsdt_iter.next()) |sdt_paddr| {
-        const sdt_phys = PAddr.fromInt(sdt_paddr);
-        const sdt_virt = VAddr.fromPAddr(sdt_phys, null);
-        const sdt = Sdt.fromVAddr(sdt_virt);
+    if (xsdp_phys.addr == 0) {
+        saw_spcr = false;
+    } else {
+        const xsdp_virt = VAddr.fromPAddr(xsdp_phys, null);
+        const xsdp = Xsdp.fromVAddr(xsdp_virt);
+        try xsdp.validate();
 
-        if (std.mem.eql(u8, @ptrCast(&sdt.signature), "APIC")) {
-            try parseMadt(sdt_virt);
-        }
+        const xsdt_phys = PAddr.fromInt(xsdp.xsdt_paddr);
+        const xsdt_virt = VAddr.fromPAddr(xsdt_phys, null);
+        const xsdt = Xsdt.fromVAddr(xsdt_virt);
+        try xsdt.validate();
 
-        if (std.mem.eql(u8, @ptrCast(&sdt.signature), "SPCR")) {
-            parseSpcr(sdt_virt);
-            saw_spcr = true;
-        }
+        var xsdt_iter = xsdt.iter();
+        while (xsdt_iter.next()) |sdt_paddr| {
+            const sdt_phys = PAddr.fromInt(sdt_paddr);
+            const sdt_virt = VAddr.fromPAddr(sdt_phys, null);
+            const sdt = Sdt.fromVAddr(sdt_virt);
 
-        if (std.mem.eql(u8, @ptrCast(&sdt.signature), "FACP")) {
-            parseFadt(sdt_virt);
+            if (std.mem.eql(u8, @ptrCast(&sdt.signature), "APIC")) {
+                try parseMadt(sdt_virt);
+            }
+
+            if (std.mem.eql(u8, @ptrCast(&sdt.signature), "SPCR")) {
+                parseSpcr(sdt_virt);
+                saw_spcr = true;
+            }
+
+            if (std.mem.eql(u8, @ptrCast(&sdt.signature), "FACP")) {
+                parseFadt(sdt_virt);
+            }
         }
     }
 

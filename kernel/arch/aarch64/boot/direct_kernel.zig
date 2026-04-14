@@ -45,20 +45,41 @@ const uefi = std.os.uefi;
 const MemoryDescriptor = uefi.tables.MemoryDescriptor;
 const MemoryMapKey = uefi.tables.MemoryMapKey;
 
-/// Synthesised memory map. Two descriptors: reserved (below
-/// 0x41200000, covers boot stub + kernel image) and free (above, up
-/// to 0x80000000).
+/// Synthesised memory map. Two descriptors:
+///   [0] acpi_reclaim — boot stub + .data.boot page tables + kernel
+///       image, 0x40000000..0x41200000. Marked `acpi` rather than
+///       `reserved` so `memory.init`'s physmap loop still covers the
+///       range (it skips only !free && !acpi entries) while the
+///       buddy/bump allocators leave it alone. Critical for direct-
+///       kernel on several fronts:
+///         - The TTBR1 root and intermediate tables physically live
+///           in .data.boot; physmap access lets `mapPage` walk them
+///           when kernel demand-page faults on slab-init writes.
+///         - The `root_service.elf` blob is `@embedFile`'d into the
+///           kernel's .rodata, and kMain dereferences its pointer as
+///           a physmap VA, so the kernel image's PA range has to be
+///           physmap-covered too.
+///   [1] conventional — everything above, 0x41200000..0x80000000.
+///       Used by the bump/buddy allocators.
 var mmap_descs: [2]MemoryDescriptor = undefined;
 var synth_boot_info: BootInfo = undefined;
 
-// Hardcoded QEMU virt -m 1G RAM layout. Kernel image LMA starts at
-// 0x40200000 (2 MiB-aligned per the direct-kernel linker script) and
-// we give it 16 MiB of block mappings in TTBR1, so reserve up to
-// 0x41200000.
+// Hardcoded QEMU virt -m 1G RAM layout.
 const RAM_START: u64 = 0x4000_0000;
-const RAM_END: u64 = 0x8000_0000;
 const KERNEL_IMAGE_END: u64 = 0x4120_0000;
+const RAM_END: u64 = 0x8000_0000;
 const PAGE_SIZE: u64 = 4096;
+
+// Kernel image VA base (matches linker-aarch64-direct.ld
+// KERNEL_VADDR_BASE) and LMA base (the 2 MiB-aligned boundary
+// `_boot_end_lma` resolves to with a 0x180000-byte boot stub +
+// 2 MiB alignment). Keep these in sync with the linker script.
+const KERNEL_VMA_BASE: u64 = 0xFFFF_0000_0000_0000;
+const KERNEL_LMA_BASE: u64 = 0x4020_0000;
+
+fn kernelVaToPa(va: u64) u64 {
+    return va - KERNEL_VMA_BASE + KERNEL_LMA_BASE;
+}
 
 extern fn kEntry(boot_info: *BootInfo) callconv(.{ .aarch64_aapcs = .{} }) noreturn;
 
@@ -68,19 +89,15 @@ extern fn kEntry(boot_info: *BootInfo) callconv(.{ .aarch64_aapcs = .{} }) noret
 pub export fn directKernelEntry(dtb_phys: u64) callconv(.{ .aarch64_aapcs = .{} }) noreturn {
     _ = dtb_phys;
 
-    // Reserved span: RAM_START .. KERNEL_IMAGE_END. Contains the boot
-    // stub, page tables, stack, and kernel .text/.rodata/.data/.bss.
-    // Marked as reserved so memory.init's bump allocator won't clobber
-    // it.
+    // [0] acpi_reclaim — boot stub + .data.boot + kernel image.
     mmap_descs[0] = .{
-        .type = .reserved_memory_type,
+        .type = .acpi_reclaim_memory,
         .physical_start = RAM_START,
         .virtual_start = 0,
         .number_of_pages = (KERNEL_IMAGE_END - RAM_START) / PAGE_SIZE,
         .attribute = std.mem.zeroes(uefi.tables.MemoryDescriptorAttribute),
     };
-    // Free span: KERNEL_IMAGE_END .. RAM_END. This is where the bump
-    // allocator runs and the buddy allocator ultimately lives.
+    // [1] conventional — bump/buddy arena.
     mmap_descs[1] = .{
         .type = .conventional_memory,
         .physical_start = KERNEL_IMAGE_END,
@@ -98,7 +115,12 @@ pub export fn directKernelEntry(dtb_phys: u64) callconv(.{ .aarch64_aapcs = .{} 
             .len = 0,
         },
         .root_service = .{
-            .ptr = @constCast(@as([*]const u8, embedded_bins.root_service.ptr)),
+            // kMain treats `root_service.ptr` as a *physical* address
+            // (`PAddr.fromInt(@intFromPtr(ptr))`) and then converts it
+            // to a physmap VA for the read. The embedded_bins blob is
+            // linked into kernel .rodata at a high VA, so hand kMain
+            // the corresponding PA instead of the VA.
+            .ptr = @ptrFromInt(kernelVaToPa(@intFromPtr(embedded_bins.root_service.ptr))),
             .len = embedded_bins.root_service.len,
         },
         .stack_top = VAddr.fromInt(0),
