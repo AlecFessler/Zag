@@ -17,13 +17,26 @@ TIMEOUT=120
 # Default to a single QEMU instance to keep agent runs from blowing up RAM.
 # Override interactively with `PARALLEL=16 bash run_tests.sh` for fast local runs.
 PARALLEL="${PARALLEL:-1}"
-# Target architecture — "x64" (default) or "arm" (aarch64 via qemu-system-aarch64 + TCG)
+# Target architecture:
+#   x64        — x86_64 via OVMF UEFI + KVM (default)
+#   arm        — aarch64 via AAVMF UEFI + TCG (no EL2; VM tests SKIP)
+#   arm-direct — aarch64 via direct-kernel boot (`-kernel kernel.elf`)
+#                with `-M virt,virtualization=on`, providing real EL2 so
+#                VM syscall tests can actually exercise the world switch.
 ARCH="${ARCH:-x64}"
 
+DIRECT_KERNEL=0
+KERNEL_EXTRA_FLAGS=""
 if [ "$ARCH" = "arm" ]; then
     QEMU_CMD="qemu-system-aarch64 -M virt,gic-version=3 -m 1G -bios /usr/share/AAVMF/AAVMF_CODE.fd -serial stdio -display none -no-reboot -machine accel=tcg -cpu cortex-a72 -smp cores=4"
     BUILD_ARCH_FLAG="-Darch=arm"
     LOADER="BOOTAA64.EFI"
+elif [ "$ARCH" = "arm-direct" ]; then
+    QEMU_CMD="qemu-system-aarch64 -M virt,virtualization=on,gic-version=3 -m 1G -serial stdio -display none -no-reboot -machine accel=tcg -cpu cortex-a72 -smp cores=4"
+    BUILD_ARCH_FLAG="-Darch=arm"
+    KERNEL_EXTRA_FLAGS="-Ddirect_kernel=true"
+    LOADER=""
+    DIRECT_KERNEL=1
 else
     QEMU_CMD="qemu-system-x86_64 -m 2G -bios /usr/share/ovmf/x64/OVMF.4m.fd -serial stdio -display none -no-reboot -enable-kvm -cpu host,+invtsc -machine q35 -device intel-iommu,intremap=off -net none -smp cores=4"
     BUILD_ARCH_FLAG=""
@@ -59,7 +72,7 @@ cp "$first_elf" "$BIN_DIR/root_service.elf"
 echo "Building kernel ($ARCH)..."
 cd "$ZAG_ROOT"
 if [ -n "$BUILD_ARCH_FLAG" ]; then
-    zig build $BUILD_ARCH_FLAG -Dprofile=test 2>/dev/null
+    zig build $BUILD_ARCH_FLAG $KERNEL_EXTRA_FLAGS -Dprofile=test 2>/dev/null
 else
     zig build -Dprofile=test 2>/dev/null
 fi
@@ -69,17 +82,34 @@ run_one_test() {
     local elf="$1"
     local name=$(basename "$elf" .elf)
     local workdir=$(mktemp -d)
-
-    # Set up FAT image directory
-    mkdir -p "$workdir/efi/boot"
-    ln -s "$IMG_DIR/efi/boot/$LOADER" "$workdir/efi/boot/"
-    ln -s "$IMG_DIR/kernel.elf" "$workdir/"
-    cp "$IMG_DIR/NvVars" "$workdir/" 2>/dev/null || true
-    cp "$elf" "$workdir/root_service.elf"
-
-    # Run QEMU, capture serial output
     local output
-    output=$(timeout "$TIMEOUT" $QEMU_CMD -drive "file=fat:rw:$workdir,format=raw" 2>/dev/null || true)
+
+    if [ "$DIRECT_KERNEL" = "1" ]; then
+        # Direct-kernel mode: kernel image is reused across tests; the
+        # per-test root_service.elf is injected into guest RAM at PA
+        # 0x44000000 via QEMU `-device loader`, with an 8-byte LE
+        # length header that direct_kernel.zig reads to bound the slice.
+        local blob="$workdir/blob.bin"
+        python3 -c "
+import struct
+elf=open('$elf','rb').read()
+open('$blob','wb').write(struct.pack('<Q', len(elf)) + elf)
+"
+        output=$(timeout "$TIMEOUT" $QEMU_CMD \
+            -kernel "$IMG_DIR/kernel.elf" \
+            -device "loader,file=$blob,addr=0x44000000" \
+            2>/dev/null || true)
+    else
+        # UEFI mode: per-test root_service.elf is swapped via the FAT
+        # boot drive; the kernel reads it via the bootloader.
+        mkdir -p "$workdir/efi/boot"
+        ln -s "$IMG_DIR/efi/boot/$LOADER" "$workdir/efi/boot/"
+        ln -s "$IMG_DIR/kernel.elf" "$workdir/"
+        cp "$IMG_DIR/NvVars" "$workdir/" 2>/dev/null || true
+        cp "$elf" "$workdir/root_service.elf"
+
+        output=$(timeout "$TIMEOUT" $QEMU_CMD -drive "file=fat:rw:$workdir,format=raw" 2>/dev/null || true)
+    fi
 
     # Extract result line
     local result
@@ -97,7 +127,7 @@ run_one_test() {
 }
 
 export -f run_one_test
-export IMG_DIR TIMEOUT QEMU_CMD RESULTS_DIR LOADER
+export IMG_DIR TIMEOUT QEMU_CMD RESULTS_DIR LOADER DIRECT_KERNEL
 
 # Collect all test ELFs, sorted
 mapfile -t test_elfs < <(find "$BIN_DIR" -name 's*.elf' | sort)
