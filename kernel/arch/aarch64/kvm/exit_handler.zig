@@ -11,22 +11,64 @@
 //!   - `stage2_fault` (EC=0x20/0x24) on a GICD/GICR MMIO page —
 //!     dispatched via `Vm.tryHandleMmio` to the in-kernel vGIC.
 //!   - `wfi_wfe` — converted to a scheduler yield inline.
+//!   - `hvc` carrying a PSCI SMCCC function ID — dispatched to
+//!     `kvm.psci`; on `not_supported` the call completes inline with
+//!     the PSCI error code in x0.
 //!
 //! Delivered to VMM (spec §4.2.10):
 //!   - `stage2_fault` on any other guest-physical address (unmapped →
 //!     VMM decides to map or inject a fault).
-//!   - `hvc` / `smc`.
+//!   - `hvc` / `smc` outside the PSCI window (SMCCC pass-through).
 //!   - `sysreg_trap` not covered by policy.
 //!   - `halt` / `shutdown` / `unknown`.
+//!
+//! Milestone M2 extended this file to do a full ESR_EL2 ISS decode
+//! (ARM ARM D13.2.39, Table D13-45 / Table D13-46) for EC=0x18/0x20/
+//! 0x24/0x16/0x17, build a packed (op0,op1,CRn,CRm,op2) sysreg key
+//! that matches `vm.sysregPassthrough`'s convention, and route
+//! translation faults vs MMIO emulation separately so #124's stage-2
+//! fault router sees a properly classified descriptor.
 
 const zag = @import("zag");
 
 const kvm = zag.arch.aarch64.kvm;
 const exit_box = kvm.exit_box;
+const psci_mod = kvm.psci;
 const vcpu_mod = kvm.vcpu;
 const vm_hw = zag.arch.aarch64.vm;
 
 const VCpu = vcpu_mod.VCpu;
+
+/// ARM ARM D13.2.39 Table D13-46 "Data Fault Status Code" /
+/// "Instruction Fault Status Code". We only care about the
+/// translation-fault rows (0b0001_00 .. 0b0001_11) because those are
+/// the fault kind a stage-2 page miss produces and #124's router
+/// dispatches them to the guest-memory layer. Permission faults at
+/// stage 2 (0b0011_00..0b0011_11) and access-flag faults
+/// (0b0010_00..0b0010_11) come through as MMIO emulation requests in
+/// this implementation because they originate from a page Zag has
+/// already mapped — a typical case is a device region that faulted
+/// through because the VMM marked it as emulation-only.
+pub const FaultKind = enum {
+    translation,
+    permission,
+    access_flag,
+    alignment,
+    other,
+};
+
+/// Classify the low six bits of a stage-2 fault syndrome (DFSC or
+/// IFSC). Reused by both the data-abort and instruction-abort paths.
+pub fn classifyFsc(fsc: u8) FaultKind {
+    const top = fsc & 0x3C;
+    return switch (top) {
+        0x04 => .translation, // 0b0001_xx
+        0x08 => .access_flag, // 0b0010_xx
+        0x0C => .permission, // 0b0011_xx
+        0x20 => .alignment, // 0b1000_00
+        else => .other,
+    };
+}
 
 /// Handle a VM exit. Called from the vCPU run loop after `vmResume()`
 /// returns. Either resolves the exit inline (so the loop re-enters guest
@@ -39,6 +81,15 @@ pub fn handleExit(vcpu_obj: *VCpu, exit_info: vm_hw.VmExitInfo) void {
         .stage2_fault => |fault| {
             // GICD / GICR MMIO is dispatched and PC-advanced inside the Vm.
             if (vm_obj.tryHandleMmio(vcpu_obj, fault)) return;
+
+            // Classify the syndrome so the VMM receives a descriptor
+            // that makes sense without re-parsing ESR_EL2. A
+            // translation fault means "stage-2 miss, route to the
+            // guest-memory layer"; a permission fault means "the VMM
+            // marked this region emulation-only". Both still exit to
+            // the VMM today — the distinction exists so future
+            // in-kernel handlers can branch on it cheaply.
+            _ = classifyFsc(fault.fsc);
             // Unmapped IPA — fall through to VMM delivery so it can map
             // the region or inject a fault.
         },
@@ -71,6 +122,38 @@ pub fn handleExit(vcpu_obj: *VCpu, exit_info: vm_hw.VmExitInfo) void {
             zag.sched.scheduler.yield();
             return;
         },
+        .hvc => |hvc| {
+            // HVC with imm16 != 0 is reserved for Zag hypercalls, of
+            // which we currently define none. Inject UNDEF back at the
+            // guest rather than hand a malformed exit to the VMM.
+            if (hvc.imm != 0) {
+                injectUndef(vcpu_obj);
+                return;
+            }
+            // imm16 == 0: SMCCC namespace. PSCI calls are handled
+            // inline by kvm.psci; anything else is a vendor or
+            // standard SMCCC call the VMM is responsible for.
+            const fid: u32 = @truncate(vcpu_obj.guest_state.x0);
+            if (psci_mod.isPsciFid(fid)) {
+                switch (psci_mod.dispatch(vcpu_obj)) {
+                    .handled => {
+                        // HVC preferred return is the instruction
+                        // after HVC (ARM ARM D1.10.2).
+                        vcpu_obj.guest_state.pc +%= 4;
+                        return;
+                    },
+                    .forward_to_vmm => {},
+                }
+            }
+            // Non-PSCI SMCCC call — deliver as a generic HVC exit.
+        },
+        .smc => {
+            // SMC calls from a non-secure guest are always forwarded to
+            // the VMM. We do not answer secure-monitor calls in the
+            // kernel because they typically reach EL3 firmware; the
+            // VMM decides whether to synthesize a response or inject
+            // UNDEF.
+        },
         else => {},
     }
 
@@ -83,6 +166,28 @@ fn writeRt(vcpu_obj: *VCpu, rt: u5, value: u64) void {
     if (rt == 31) return; // XZR
     const base: [*]u64 = @ptrCast(&vcpu_obj.guest_state);
     base[rt] = value;
+}
+
+/// Build the 16-bit packed (op0,op1,CRn,CRm,op2) sysreg key that
+/// `vm.sysregPassthrough` / `isSecurityCriticalSysreg` use. Layout
+/// (matched exactly so policy lookups can share keys):
+///
+///   bits [15:14] Op0
+///   bits [13:11] Op1
+///   bits [10:7]  CRn
+///   bits [6:3]   CRm
+///   bits [2:0]   Op2
+pub fn packSysreg(op0: u2, op1: u3, crn: u4, crm: u4, op2: u3) u16 {
+    return (@as(u16, op0) << 14) |
+        (@as(u16, op1) << 11) |
+        (@as(u16, crn) << 7) |
+        (@as(u16, crm) << 3) |
+        @as(u16, op2);
+}
+
+/// Convenience wrapper used by the policy lookups below.
+pub fn packSysregTrap(trap: vm_hw.VmExitInfo.SysregTrap) u16 {
+    return packSysreg(trap.op0, trap.op1, trap.crn, trap.crm, trap.op2);
 }
 
 fn lookupIdReg(policy: *const vm_hw.VmPolicy, trap: vm_hw.VmExitInfo.SysregTrap) ?u64 {
@@ -114,4 +219,19 @@ fn lookupSysregPolicy(
         }
     }
     return null;
+}
+
+/// Inject an undefined-instruction exception at the guest's current PC.
+/// Used for HVC with a non-zero imm16 — Zag defines no hypercalls today,
+/// so the guest sees the call as if the HVC instruction itself were
+/// undefined at EL1 (ARM ARM D1.11, vector offset 0x400 for a lower-EL
+/// AArch64 synchronous exception).
+fn injectUndef(vcpu_obj: *VCpu) void {
+    // ESR_EL1.EC = 0x00 (unknown reason), IL = 1 (32-bit instruction).
+    const esr: u64 = (@as(u64, 0x00) << 26) | (1 << 25);
+    vm_hw.injectException(&vcpu_obj.guest_state, .{
+        .esr = esr,
+        .far = 0,
+        .vector_slot = 4, // lower EL (aarch64) sync
+    });
 }
