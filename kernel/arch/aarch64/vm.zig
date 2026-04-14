@@ -743,34 +743,25 @@ pub fn decodeEsrEl2(esr: u64, far: u64, hpfar: u64) VmExitInfo {
     };
 }
 
-/// Scratch page used to hold both the `WorldSwitchCtx` and `HostSave`
-/// for a single vmResume call. Allocated lazily from the PMM on first
-/// use so its backing memory lives in physmap and `PAddr.fromVAddr`
-/// is a valid VA → PA translation. Real KVM will own these per-vCPU.
-var smoke_scratch_page: ?*paging.PageMem(.page4k) = null;
-
-fn smokeScratchInit() !*paging.PageMem(.page4k) {
-    if (smoke_scratch_page) |p| return p;
-    const alloc = pmm.global_pmm.?.allocator();
-    const page = try alloc.create(paging.PageMem(.page4k));
-    @memset(std.mem.asBytes(page), 0);
-    smoke_scratch_page = page;
-    return page;
-}
+/// Per-vCPU scratch the EL2 hyp stub reads/writes through PAs. Owned by
+/// the VCpu object (see `kernel/arch/aarch64/kvm/vcpu.zig`) so concurrent
+/// vCPUs don't share storage. Both fields must live in physmap-backed
+/// memory so `PAddr.fromVAddr(..., null)` is a valid VA→PA translation.
+pub const ArchScratch = extern struct {
+    ctx: WorldSwitchCtx = .{},
+    host_save: HostSave = .{},
+};
 
 pub fn vmResume(
     guest_state: *GuestState,
     vm_structures: PAddr,
     guest_fxsave: *align(16) FxsaveArea,
+    arch_scratch: *ArchScratch,
 ) VmExitInfo {
-    _ = guest_fxsave; // FPSIMD save/restore TODO (smoke test is GPR-only).
+    _ = guest_fxsave; // FPSIMD save/restore TODO.
 
-    const scratch = smokeScratchInit() catch return .{ .unknown = 0xDEAD_0001 };
-    const scratch_bytes = std.mem.asBytes(scratch);
-
-    // First half of the page → WorldSwitchCtx; second half → HostSave.
-    const ctx: *WorldSwitchCtx = @ptrCast(@alignCast(&scratch_bytes[0]));
-    const host_save: *HostSave = @ptrCast(@alignCast(&scratch_bytes[@sizeOf(WorldSwitchCtx)]));
+    const ctx = &arch_scratch.ctx;
+    const host_save = &arch_scratch.host_save;
     ctx.* = .{};
     host_save.* = .{};
 
@@ -781,7 +772,7 @@ pub fn vmResume(
     ctx.guest_state_pa = gs_pa.addr;
     ctx.host_save_pa = hs_pa.addr;
     ctx.stage2_root_pa = vm_structures.addr;
-    ctx.vttbr_el2 = vm_structures.addr; // VMID = 0 for the smoke test.
+    ctx.vttbr_el2 = vm_structures.addr; // VMID = 0 (TODO: real VMID alloc).
     ctx.vtcr_el2 = vtcrEl2Value();
     ctx.hcr_el2 = HCR_EL2_VM | HCR_EL2_RW | HCR_EL2_IMO | HCR_EL2_FMO | HCR_EL2_AMO;
 

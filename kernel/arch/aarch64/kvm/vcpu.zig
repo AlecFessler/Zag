@@ -72,6 +72,11 @@ pub const VCpu = struct {
     /// Guest FPSIMD state (V0..V31, FPCR, FPSR). Saved/restored by `vmResume`
     /// across each guest entry. ARM ARM B1.2.2.
     guest_fxsave: vm_hw.FxsaveArea align(16) = vm_hw.fxsaveInit(),
+    /// Per-vCPU scratch the EL2 hyp stub uses for the world-switch
+    /// marshalling block (WorldSwitchCtx + HostSave). Lives inline in
+    /// the VCpu so its PA is reachable by `PAddr.fromVAddr` while the
+    /// stub runs with EL2 MMU off. See `arch.aarch64.vm.ArchScratch`.
+    arch_scratch: vm_hw.ArchScratch align(16) = .{},
     /// Per-vCPU vGIC state: redistributor SGI/PPI bookkeeping plus the
     /// list-register shadow consumed by `vgic.prepareEntry` /
     /// `vgic.saveExit`. Initialized by `vcpu.create` via `vgic.initVcpu`
@@ -190,7 +195,7 @@ fn vcpuEntryPoint() void {
 
         // Enter guest mode.
         const vm_structures = vm_obj.arch_structures;
-        const exit_info = vm_hw.vmResume(&vcpu_obj.guest_state, vm_structures, &vcpu_obj.guest_fxsave);
+        const exit_info = vm_hw.vmResume(&vcpu_obj.guest_state, vm_structures, &vcpu_obj.guest_fxsave, &vcpu_obj.arch_scratch);
 
         vcpu_obj.last_exit_info = exit_info;
         kvm.exit_handler.handleExit(vcpu_obj, exit_info);

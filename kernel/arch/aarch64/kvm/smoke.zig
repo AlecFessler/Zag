@@ -105,8 +105,15 @@ pub fn runVcpuNopSmoke() void {
     @memset(std.mem.asBytes(fx_page), 0);
     const fxsave: *align(16) vm_hw.FxsaveArea = @ptrCast(@alignCast(fx_page));
 
+    const scratch_page = alloc.create(paging.PageMem(.page4k)) catch {
+        puts(":FAIL:alloc-sc]\r\n");
+        return;
+    };
+    @memset(std.mem.asBytes(scratch_page), 0);
+    const arch_scratch: *vm_hw.ArchScratch = @ptrCast(@alignCast(scratch_page));
+
     puts(",run");
-    const exit_info = vm_hw.vmResume(guest_state, stage2_root, fxsave);
+    const exit_info = vm_hw.vmResume(guest_state, stage2_root, fxsave, arch_scratch);
     puts(",back");
 
     // Print the raw ESR and exit pc for diagnostics.
