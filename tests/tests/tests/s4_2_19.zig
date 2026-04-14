@@ -7,6 +7,7 @@ const t = lib.testing;
 var policy: [4096]u8 align(4096) = .{0} ** 4096;
 
 pub fn main(_: u64) void {
+    t.skipNoAarch64Vm("§4.2.19");
     // Request 64 vCPUs — likely exceeds remaining perm table capacity
     // for the root service which already has many entries.
     // On hardware without virt, E_NODEV is returned first. Accept both.

@@ -394,7 +394,18 @@ pub const Process = struct {
         @memset(msg[17..24], 0);
         @as(*align(1) u64, @ptrCast(&msg[24])).* = faulted.fault_addr;
         @as(*align(1) u64, @ptrCast(&msg[32])).* = faulted.fault_rip;
-        const snap = arch.serializeFaultRegs(faulted.ctx);
+        // Serialize the user-mode register frame from the fault's own
+        // user context (which sysFaultReply also writes to for
+        // FAULT_RESUME_MODIFIED). `faulted.ctx` is only guaranteed to
+        // reflect user state on architectures where the exception frame
+        // is written at a fixed per-thread kernel-stack slot; on aarch64
+        // `yield()` nests another exception frame below the fault frame,
+        // so `faulted.ctx` ends up pointing at the nested SGI frame
+        // rather than the user fault frame. Using `fault_user_ctx`
+        // directly — the same frame that `applyModifiedRegs` targets on
+        // resume — keeps the delivered snapshot consistent across arches.
+        const regs_src: *const arch.ArchCpuContext = faulted.fault_user_ctx orelse faulted.ctx;
+        const snap = arch.serializeFaultRegs(regs_src);
         @as(*align(1) u64, @ptrCast(&msg[40])).* = snap.flags;
         @as(*align(1) u64, @ptrCast(&msg[48])).* = snap.sp;
         const gprs = snap.gprs;
@@ -1650,6 +1661,17 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
         try applyRelocations(proc, aslr_base, elf_binary, rela.offset, rela.size);
     }
 
+    // Synchronize the instruction cache after writing the ELF text via the
+    // physmap (D-cache) view. On x86 this is a no-op because the I-cache
+    // snoops D-cache writes. On aarch64 the I/D caches are split and the
+    // first instruction fetch from a freshly loaded page returns stale
+    // bytes (typically zero) until the I-cache is invalidated and the
+    // D-cache lines containing the new code are cleaned to the point of
+    // unification. Without this, every newly created process raises an
+    // instruction-abort exception at its entry point on a real CPU
+    // (TCG masks the bug by re-translating from memory each time).
+    arch.syncInstructionCache();
+
     const final_end = if (has_bss and bss_end > page_end) bss_end else page_end;
     proc.vmm.bump(VAddr.fromInt(final_end));
 
@@ -1680,6 +1702,10 @@ fn writeToUserPages(addr_space_root: PAddr, start_va: u64, data: []const u8) voi
         const chunk_len = @min(data.len - offset, paging.PAGE4K - page_offset);
         const dst: [*]u8 = @ptrFromInt(physmap_addr);
         @memcpy(dst[0..chunk_len], data[offset..][0..chunk_len]);
+        // Clean the just-written physmap range to the Point of Unification
+        // so that a later `ic ivau`/`ic ialluis` makes the new code visible
+        // to instruction fetch on aarch64. No-op on x86-64.
+        arch.cleanDcacheToPou(physmap_addr, chunk_len);
         offset += chunk_len;
     }
 }

@@ -1,9 +1,14 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const futex = zag.proc.futex;
 const kprof = zag.kprof.trace_id;
+const kprof_dump = zag.kprof.dump;
+const kprof_log = zag.kprof.log;
+const kprof_mode = zag.kprof.mode;
+const kprof_sample = zag.kprof.sample;
 const memory_init = zag.memory.init;
 const process_mod = zag.proc.process;
 const thread_mod = zag.sched.thread;
@@ -145,6 +150,26 @@ fn armSchedTimer(state: *PerCoreState, delta_ns: u64) void {
     state.timer.armInterruptTimer(delta_ns);
 }
 
+/// Per-tick gate for `futex.expireTimedWaiters`. The scan is rotated across
+/// cores so a single tick interval only runs it on one core, but the rotation
+/// counter advances on every tick regardless of which core matched. That way,
+/// if some cores are not currently delivering preemption ticks (e.g. aarch64
+/// AP bring-up where secondary cores reach the trampoline but stall before
+/// arming their virtual timer), the still-ticking cores eventually cycle
+/// through every value of `expire_core` and timed futex waiters are still
+/// woken. The previous version stored `(core_id + 1) % cores` only when
+/// `cur == core_id`, which deadlocked the rotation on a non-ticking core.
+fn maybeExpireTimedWaiters(core_id: u64) void {
+    const cores = arch.coreCount();
+    while (true) {
+        const cur = expire_core.load(.monotonic);
+        const next = (cur + 1) % cores;
+        if (expire_core.cmpxchgWeak(cur, next, .monotonic, .monotonic)) |_| continue;
+        if (cur == core_id) futex.expireTimedWaiters();
+        return;
+    }
+}
+
 pub fn currentThread() ?*Thread {
     return core_states[arch.coreID()].running_thread;
 }
@@ -271,6 +296,11 @@ fn tryStealWork(my_core_id: u64) ?*Thread {
 
 pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     kprof.point(.sched_timer_tick, 0);
+    if (comptime kprof_mode.any_enabled) {
+        if (@atomicLoad(u32, &kprof_log.terminate_requested, .acquire) != 0) {
+            kprof_dump.end(.log_full);
+        }
+    }
     const core_id = arch.coreID();
     const state = &core_states[core_id];
 
@@ -312,10 +342,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
         } else {
             const pinned_core = @ctz(preempted.core_affinity orelse 0);
             if (pinned_core == core_id) {
-                if (core_id == expire_core.load(.monotonic)) {
-                    futex.expireTimedWaiters();
-                    expire_core.store((core_id + 1) % arch.coreCount(), .monotonic);
-                }
+                maybeExpireTimedWaiters(core_id);
                 armSchedTimer(state, SCHED_TIMESLICE_NS);
                 return;
             }
@@ -338,10 +365,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
             next_thread.on_cpu.store(true, .release);
             state.running_thread = next_thread;
             state.rq_lock.unlock();
-            if (core_id == expire_core.load(.monotonic)) {
-                futex.expireTimedWaiters();
-                expire_core.store((core_id + 1) % arch.coreCount(), .monotonic);
-            }
+            maybeExpireTimedWaiters(core_id);
             armSchedTimer(state, SCHED_TIMESLICE_NS);
             if (next_thread == preempted) return;
             switchToWithPmu(preempted, next_thread);
@@ -386,10 +410,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
             }
 
             state.rq_lock.unlock();
-            if (core_id == expire_core.load(.monotonic)) {
-                futex.expireTimedWaiters();
-                expire_core.store((core_id + 1) % arch.coreCount(), .monotonic);
-            }
+            maybeExpireTimedWaiters(core_id);
             armSchedTimer(state, SCHED_TIMESLICE_NS);
             if (pinned == preempted) return;
             switchToWithPmu(preempted, pinned);
@@ -399,10 +420,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
         // If current thread IS the pinned thread: never preempt
         if (pinned == preempted) {
             state.rq_lock.unlock();
-            if (core_id == expire_core.load(.monotonic)) {
-                futex.expireTimedWaiters();
-                expire_core.store((core_id + 1) % arch.coreCount(), .monotonic);
-            }
+            maybeExpireTimedWaiters(core_id);
             armSchedTimer(state, SCHED_TIMESLICE_NS);
             return;
         }
@@ -450,10 +468,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     }
 
     state.rq_lock.unlock();
-    if (core_id == expire_core.load(.monotonic)) {
-        futex.expireTimedWaiters();
-        expire_core.store((core_id + 1) % arch.coreCount(), .monotonic);
-    }
+    maybeExpireTimedWaiters(core_id);
     armSchedTimer(state, SCHED_TIMESLICE_NS);
     if (next_thread == preempted) return;
     switchToWithPmu(preempted, next_thread);
@@ -792,6 +807,18 @@ pub fn globalInit() !void {
     initialized = true;
 }
 
+/// Idle loop entry for per-core idle threads. Runs at kernel privilege and
+/// blocks on `halt` until the next interrupt (timer/IPI). aarch64 needs a
+/// real entry and kernel stack because its `switchTo` path uses
+/// `thread.kernel_stack` to seed SP_EL1 and `thread.ctx` to ERET into the
+/// idle body. On x86_64 the existing path never ERETs into the idle thread
+/// (IRQs run on top of whatever context was already executing and TSS.rsp0
+/// is reprogrammed only on EL0→EL1 transitions), so leaving the idle fields
+/// undefined there remains a no-op.
+fn idleLoop() void {
+    while (true) arch.halt();
+}
+
 pub fn perCoreInit() void {
     const core_id = arch.coreID();
     const state = &core_states[core_id];
@@ -808,11 +835,21 @@ pub fn perCoreInit() void {
         .on_cpu = std.atomic.Value(bool).init(true),
         .priority = .idle,
     };
+    if (@import("builtin").cpu.arch == .aarch64) {
+        // aarch64 requires a concrete kernel stack and entry context for
+        // the idle thread because every thread switch reseats SP_EL1 from
+        // `thread.kernel_stack.top` and ERETs into `thread.ctx`.
+        idle_thread.kernel_stack = thread_mod.createKernelStack() catch @panic("failed to allocate idle kernel stack");
+        const idle_kstack_top = address.alignStack(idle_thread.kernel_stack.top);
+        idle_thread.ctx = arch.prepareThreadContext(idle_kstack_top, null, &idleLoop, 0);
+    }
     state.idle_thread = idle_thread;
     state.running_thread = idle_thread;
 
     arch.vmPerCoreInit();
     arch.pmuPerCoreInit();
+    kprof_sample.perCoreInit();
+    kprof.perCoreInit();
     arch.sysInfoPerCoreInit();
     state.timer = arch.getPreemptionTimer();
 

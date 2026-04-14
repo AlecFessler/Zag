@@ -18,6 +18,7 @@ fn findVcpuHandle(view: [*]const perm_view.UserViewEntry, skip_handle: u64) u64 
 }
 
 pub fn main(pv: u64) void {
+    t.skipNoAarch64Vm("§4.2.38");
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
     const self_handle: u64 = @bitCast(syscall.thread_self());

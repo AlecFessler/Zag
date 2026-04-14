@@ -50,7 +50,6 @@ const PSCI_INVALID_ADDRESS: i64 = -9;
 
 const E_OK: i64 = 0;
 const E_NODEV: i64 = -13;
-const E_NOSYS: i64 = -14;
 
 // --- PSCI function IDs (DEN0022D, Section 5) ---
 // SMC32 variants use 0x8400_xxxx prefix, SMC64 variants use 0xC400_xxxx.
@@ -232,7 +231,7 @@ fn hvcCall(function_id: u32, arg1: u64, arg2: u64, arg3: u64) i64 {
 fn mapPsciError(psci_ret: i64) i64 {
     return switch (psci_ret) {
         PSCI_SUCCESS => E_OK,
-        PSCI_NOT_SUPPORTED => E_NOSYS,
+        PSCI_NOT_SUPPORTED => E_NODEV,
         PSCI_INVALID_PARAMETERS => E_NODEV,
         PSCI_DENIED => E_NODEV,
         PSCI_ALREADY_ON => E_OK,

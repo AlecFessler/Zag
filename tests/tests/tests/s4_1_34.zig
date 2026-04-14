@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const children = @import("embedded_children");
 const lib = @import("lib");
 
@@ -67,11 +68,21 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
 
-    // Patch the faulting 2-byte instruction (+ 1 extra byte) to 3 NOPs.
-    // The text segment is mapped RO in the child; fault_write_mem must
-    // bypass that.
-    const nop_bytes = [3]u8{ 0x90, 0x90, 0x90 };
-    const wrc = syscall.fault_write_mem(proc_handle, original_rip, @intFromPtr(&nop_bytes), 3);
+    // Patch the faulting instruction with NOPs. The text segment is
+    // mapped RO in the child; fault_write_mem must bypass that.
+    //
+    // Architecture-specific encoding:
+    //   x86_64:  the null-deref `movb (%rax), %al` is 2 bytes; we patch
+    //            3 bytes (overwriting it plus the next byte) with x86 NOPs.
+    //   aarch64: the null-deref is one 4-byte aligned load instruction;
+    //            we patch the full 4-byte word with one aarch64 NOP
+    //            (`d503201f`, little-endian on disk).
+    const nop_bytes: []const u8 = switch (builtin.cpu.arch) {
+        .x86_64 => &[_]u8{ 0x90, 0x90, 0x90 },
+        .aarch64 => &[_]u8{ 0x1f, 0x20, 0x03, 0xd5 },
+        else => unreachable,
+    };
+    const wrc = syscall.fault_write_mem(proc_handle, original_rip, @intFromPtr(nop_bytes.ptr), nop_bytes.len);
     if (wrc != 0) {
         t.failWithVal("§4.1.34 fault_write_mem", 0, wrc);
         _ = syscall.fault_reply_simple(@bitCast(token1), syscall.FAULT_KILL);

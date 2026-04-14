@@ -11,9 +11,11 @@
 //! the NMI sampling handler may reenter on the same CPU. Atomic RMW
 //! makes the NMI-vs-main race correct without any additional lock.
 //!
-//! The backing storage is allocated once from the kernel heap at
-//! `init()` and pre-faulted so no page faults can occur during
-//! profiling (NMI context cannot fault).
+//! The backing storage lives in the kernel image as `.bss` when any
+//! profiling mode is compiled in, so pages are physically backed at
+//! load time (bootloader zeroes BSS) — no heap dep, no pre-fault pass,
+//! no page faults possible during emit. Under `-Dkernel_profile=none`
+//! the backing collapses to a zero-length array and costs nothing.
 
 const mode = @import("mode.zig");
 const record_mod = @import("record.zig");
@@ -21,18 +23,21 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
-const heap = zag.memory.init;
-const paging = zag.memory.paging;
 
 const Record = record_mod.Record;
 
 /// Hard upper bound on CPUs the profiling log array supports.
-/// Zag targets small systems; 32 is well above current coreCount().
-pub const MAX_CPUS: usize = 32;
+/// Kept tight because every bump costs `LOG_SIZE_BYTES` of BSS.
+pub const MAX_CPUS: usize = 4;
 
 /// Bytes per per-CPU log.
-pub const LOG_SIZE_BYTES: usize = 32 * 1024 * 1024;
+pub const LOG_SIZE_BYTES: usize = 4 * 1024 * 1024;
 pub const RECORDS_PER_LOG: usize = LOG_SIZE_BYTES / @sizeOf(Record);
+
+/// Inline BSS backing for every per-CPU log. Zero bytes when profiling
+/// is compiled out; `MAX_CPUS * LOG_SIZE_BYTES` bytes otherwise.
+const BACKING_BYTES: usize = if (mode.any_enabled) MAX_CPUS * LOG_SIZE_BYTES else 0;
+var inline_backing: [BACKING_BYTES]u8 align(4096) = undefined;
 
 pub const CpuLog = extern struct {
     base: u64 align(64),   // virtual base of this CPU's log buffer
@@ -58,9 +63,26 @@ pub var active: bool = false;
 /// True once `end()` has begun. Prevents re-entering the dump path.
 pub var ending: bool = false;
 
-/// Allocate and pre-fault per-CPU log buffers. Must run after
-/// `zag.memory.init.initHeap()` so the kernel heap is live. No-op when
-/// profiling is compiled out.
+/// Global "some CPU filled its log" flag. Set by `emit()` on first overflow
+/// on any CPU; polled from the scheduler timer tick so the next core to tick
+/// kicks off the IPI-coordinated dump in `dump.end(.log_full)`.
+pub var terminate_requested: u32 = 0;
+
+/// Non-dumping cores increment this while parked in the dump IPI handler.
+/// The dumping core spins until it reaches `n_cpus - 1` before emitting
+/// records, guaranteeing no in-flight `emit()` can race with the dump.
+pub var parked_cores: u32 = 0;
+
+/// Monotonically incremented by the dumping core after each completed
+/// rolling dump. Non-dumping cores snapshot this on entry to
+/// `parkForDump()` and spin until it changes, so every dump cycle has
+/// a distinct "all clear" signal that can't be lost if a parked core
+/// happens to read the counter before the dumper bumps it.
+pub var epoch: u64 = 0;
+
+/// Point every per-CPU CpuLog at its slice of the inline BSS backing.
+/// No allocation, no pre-fault — BSS pages are physically backed by
+/// the kernel image loader. No-op when profiling is compiled out.
 pub fn init() !void {
     if (!mode.any_enabled) return;
 
@@ -68,20 +90,9 @@ pub fn init() !void {
     if (cores > MAX_CPUS) @panic("kprof: coreCount exceeds MAX_CPUS");
     n_cpus = @intCast(cores);
 
-    const allocator = heap.heap_allocator;
     for (0..n_cpus) |i| {
-        const buf = try allocator.alignedAlloc(u8, std.mem.Alignment.fromByteUnits(4096), LOG_SIZE_BYTES);
-
-        // Pre-fault every page so NMI context never triggers a page
-        // fault against an uncommitted heap page.
-        var off: usize = 0;
-        while (off < LOG_SIZE_BYTES) {
-            buf[off] = 0;
-            off += paging.PAGE4K;
-        }
-
         cpu_logs[i] = .{
-            .base = @intFromPtr(buf.ptr),
+            .base = @intFromPtr(&inline_backing[i * LOG_SIZE_BYTES]),
             .head = 0,
             .limit = LOG_SIZE_BYTES,
             .overflowed = 0,
@@ -114,6 +125,7 @@ pub inline fn emit(rec: Record) void {
     const off = @atomicRmw(u64, &log.head, .Add, @sizeOf(Record), .monotonic);
     if (off + @sizeOf(Record) > log.limit) {
         @atomicStore(u64, &log.overflowed, 1, .release);
+        @atomicStore(u32, &terminate_requested, 1, .release);
         return;
     }
     const slot: *Record = @ptrFromInt(log.base + off);

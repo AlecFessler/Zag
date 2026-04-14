@@ -10,6 +10,7 @@ const LAPIC_BASE: u64 = 0xFEE00000;
 const IOAPIC_BASE: u64 = 0xFEC00000;
 
 pub fn main(_: u64) void {
+    t.skipNoAarch64Vm("§4.2.31");
     const cr = syscall.vm_create(1, @intFromPtr(&policy));
     if (cr == syscall.E_NODEV) {
         t.pass("§4.2.31");

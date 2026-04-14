@@ -105,32 +105,63 @@ pub const names = [_]struct { id: TraceId, name: []const u8 }{
     .{ .id = .vm_exit, .name = "vm_exit" },
 };
 
+/// Program the local core's free-running trace counters (cycles,
+/// cache misses, branch misses). Called from `sched.perCoreInit`
+/// after `pmuPerCoreInit` when compiled under `-Dkernel_profile=trace`.
+/// No-op in any other mode.
+pub fn perCoreInit() void {
+    if (comptime !mode.trace_enabled) return;
+    arch.kprofTraceCountersPerCoreInit();
+}
+
 /// Emit an enter record for a scoped tracepoint. Paired with `exit`.
 /// Compiles to nothing unless `-Dkernel_profile=trace`.
+///
+/// Must short-circuit on `log.active` BEFORE calling `arch.coreID()`.
+/// Tracepoints fire throughout boot (e.g. in the page-fault handler
+/// for lazily-mapped slab pages), but `coreID()` depends on
+/// `apic.lapics` which is only populated by ACPI parsing partway
+/// through `kMain`. Constructing the record first would evaluate
+/// `coreID()` unconditionally and panic on `lapics.?` in the early
+/// window.
 pub inline fn enter(comptime id: TraceId) void {
     if (!mode.trace_enabled) return;
+    if (!@atomicLoad(bool, &log.active, .acquire)) return;
+    var counters: [3]u64 = undefined;
+    arch.kprofTraceCountersRead(&counters);
     log.emit(.{
         .tsc = arch.rdtscp(),
         .kind = @intFromEnum(record.Kind.trace_enter),
         .cpu = @truncate(arch.coreID()),
         ._pad = 0,
         .id = @intFromEnum(id),
-        .rip = 0,
+        .ip = @returnAddress(),
         .arg = 0,
+        .cycles = counters[0],
+        .cache_misses = counters[1],
+        .branch_misses = counters[2],
+        ._pad2 = 0,
     });
 }
 
 /// Emit an exit record for a scoped tracepoint. Paired with `enter`.
 pub inline fn exit(comptime id: TraceId) void {
     if (!mode.trace_enabled) return;
+    if (!@atomicLoad(bool, &log.active, .acquire)) return;
+    var counters: [3]u64 = undefined;
+    arch.kprofTraceCountersRead(&counters);
     log.emit(.{
         .tsc = arch.rdtscp(),
         .kind = @intFromEnum(record.Kind.trace_exit),
         .cpu = @truncate(arch.coreID()),
         ._pad = 0,
         .id = @intFromEnum(id),
-        .rip = 0,
+        .ip = @returnAddress(),
         .arg = 0,
+        .cycles = counters[0],
+        .cache_misses = counters[1],
+        .branch_misses = counters[2],
+        ._pad2 = 0,
     });
 }
 
@@ -139,13 +170,20 @@ pub inline fn exit(comptime id: TraceId) void {
 /// (e.g. a page fault address, a thread id, a vm-exit reason).
 pub inline fn point(comptime id: TraceId, arg: u64) void {
     if (!mode.trace_enabled) return;
+    if (!@atomicLoad(bool, &log.active, .acquire)) return;
+    var counters: [3]u64 = undefined;
+    arch.kprofTraceCountersRead(&counters);
     log.emit(.{
         .tsc = arch.rdtscp(),
         .kind = @intFromEnum(record.Kind.trace_point),
         .cpu = @truncate(arch.coreID()),
         ._pad = 0,
         .id = @intFromEnum(id),
-        .rip = 0,
+        .ip = @returnAddress(),
         .arg = arg,
+        .cycles = counters[0],
+        .cache_misses = counters[1],
+        .branch_misses = counters[2],
+        ._pad2 = 0,
     });
 }

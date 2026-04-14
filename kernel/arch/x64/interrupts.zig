@@ -30,6 +30,7 @@ pub const PageFaultContext = struct {
 
 pub const IntVecs = enum(u8) {
     pmu = 0xFB,
+    kprof_dump = 0xFC,
     tlb_shootdown = 0xFD,
     sched = 0xFE,
     spurious = 0xFF,

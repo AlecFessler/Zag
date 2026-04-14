@@ -53,6 +53,8 @@ const syscall_dispatch = zag.syscall.dispatch;
 const ArchCpuContext = zag.arch.aarch64.interrupts.ArchCpuContext;
 const FaultReason = zag.perms.permissions.FaultReason;
 const PageFaultContext = zag.arch.aarch64.interrupts.PageFaultContext;
+const VAddr = zag.memory.address.VAddr;
+const VmNode = zag.memory.vmm.VmNode;
 
 /// ARM ARM D13.2.37 -- ESR_EL1 Exception Class field, bits [31:26].
 /// Identifies the reason for the exception that was taken to EL1.
@@ -380,14 +382,56 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     switch (ec) {
         .svc_aarch64 => {
             const result = syscall_dispatch.dispatch(ctx);
-            ctx.regs.x0 = @bitCast(result.ret);
+            // IPC recv handlers may have already populated x0 with reply
+            // word 0 via copyIpcPayload; on aarch64 that register doubles
+            // as the syscall return, so we must not overwrite it here.
+            if (!result.skip_ret_write) {
+                ctx.regs.x0 = @bitCast(result.ret);
+                // x6 doubles as the IPC metadata register. On an error
+                // return from ipc_call/ipc_send the kernel never wrote a
+                // fresh meta, so x6 still holds the caller's *input*
+                // meta — which on aarch64 makes an errno in x0
+                // indistinguishable from a zero-word successful reply
+                // (both leave "x0 has a valid integer" plus "nonzero
+                // meta"). Zero x6 on the error path so userspace can
+                // unambiguously tell errno from reply payload. Never
+                // touch it on the success path: successful IPC handlers
+                // either set skip_ret_write (word_count>=1) or return
+                // E_OK after already writing fresh meta via
+                // setIpcMetadata (word_count==0).
+                if (result.ret < 0) ctx.regs.x6 = 0;
+            }
             ctx.regs.x1 = result.ret2;
         },
 
         .data_abort_lower_el => {
             const is_write = isWriteFault(esr);
+            const far = readFarEl1();
+
+            // Intercept virtual_bar faults before the generic fault path.
+            // Virtual BAR regions intentionally have no PTEs installed; on
+            // aarch64 we synthesize a zero read / drop the write, advance
+            // ELR_EL1, and return to userspace. This mirrors the x86 port
+            // I/O emulation path but without a real PIO bus.
+            //
+            // Gate the lookup on a user fault that is NOT a present-page
+            // permission fault. Data abort ISS[5:0] DFSC field (ARM ARM
+            // D13.2.37, Table D13-33): 0b0001xx = translation fault
+            // (bottom bits encode level), which is exactly what a virtual
+            // BAR mapping produces because it has no PTE installed. Any
+            // other DFSC (permission / access flag / alignment / sync
+            // external abort) cannot come from a vbar node, so skip the
+            // lookup entirely to keep the hot path lean.
+            if (scheduler.currentThread()) |thread| {
+                const node = thread.process.vmm.findNode(VAddr.fromInt(far));
+                if (node != null and node.?.kind == .virtual_bar) {
+                    emulateVirtualBar(ctx, node.?, far, thread.process);
+                    return;
+                }
+            }
+
             const pf_ctx = PageFaultContext{
-                .faulting_address = readFarEl1(),
+                .faulting_address = far,
                 .is_kernel_privilege = false,
                 .is_write = is_write,
                 .is_exec = false,
@@ -424,6 +468,17 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
         .software_step_lower_el, .watchpoint_lower_el => {
             // Single-step / watchpoint from userspace: resume silently.
             return;
+        },
+
+        .unknown => {
+            // ARM ARM D13.2.37: EC=0x00 is taken for truly unallocated
+            // instruction encodings, which includes `udf` (permanently-
+            // undefined) and other UNDEFINED encodings that ARM treats
+            // as an undefined-instruction exception. This is the direct
+            // aarch64 analogue of x86 #UD (invalid opcode), so report it
+            // as `illegal_instruction` to match the cross-arch fault
+            // taxonomy in perms/permissions.zig.
+            faultOrKillUser(ctx, .illegal_instruction, ctx.elr_el1);
         },
 
         else => {
@@ -584,4 +639,134 @@ fn faultOrKillUser(ctx: *ArchCpuContext, reason: FaultReason, fault_addr: u64) v
     thread.process.kill(reason);
     arch.enableInterrupts();
     while (true) arch.halt();
+}
+
+/// Emulate a userspace access to a virtual BAR mapping on aarch64.
+///
+/// Virtual BAR VM nodes (kernel/memory/vmm.zig, `memVirtualBarMap`) stand
+/// in for the x86 PIO BAR that backs the AHCI/SMBus placeholder devices
+/// the test rig uses. On x86 each access faults in with the decoder path
+/// in kernel/arch/x64/exceptions.zig (`emulateVirtualBar`); on aarch64
+/// there is no PIO bus, so we simply satisfy reads with zero, discard
+/// writes, bounds-check against port_count, and advance ELR_EL1 past the
+/// 4-byte A64 load/store. Non-decodable instructions kill with
+/// protection_fault (the aarch64 analogue of the x86 "non-MOV" case).
+///
+/// ARM ARM C4.1.66 — "Load/store register (unsigned immediate)" encoding
+/// (the shape Zig emits for `*volatile u8` reads/writes):
+///   size[31:30] | 111 | V[26] | 01 | opc[23:22] | imm12[21:10] | Rn | Rt
+/// V=0 selects integer (not SIMD/FP). opc[0]=0 means store, opc[0]=1
+/// means load. size={00,01,10,11} gives {1,2,4,8} byte access widths.
+fn emulateVirtualBar(
+    ctx: *ArchCpuContext,
+    node: *const VmNode,
+    far: u64,
+    proc: anytype,
+) void {
+    const device = node.kind.virtual_bar;
+
+    const decoded = decodeA64LoadStore(ctx, proc) orelse {
+        proc.kill(.protection_fault);
+        arch.enableInterrupts();
+        while (true) arch.halt();
+    };
+
+    const port_offset = far - node.start.addr;
+    if (port_offset + decoded.access_size > device.access.port_io.port_count) {
+        const reason: FaultReason = if (decoded.is_write) .invalid_write else .invalid_read;
+        proc.kill(reason);
+        arch.enableInterrupts();
+        while (true) arch.halt();
+    }
+
+    // aarch64 has no real PIO bus backing the placeholder device: reads
+    // return 0, writes are discarded. The test rig only exercises
+    // trap-emulate-advance semantics, not register-level fidelity.
+    if (!decoded.is_write) {
+        writeContextGpr(ctx, decoded.rt, 0);
+    }
+
+    // A64 instructions are always 4 bytes (ARM ARM B1.2); advance past
+    // the faulting load/store so it is not replayed on ERET.
+    ctx.elr_el1 += 4;
+}
+
+const DecodedLoadStore = struct {
+    rt: u8,
+    access_size: u64,
+    is_write: bool,
+};
+
+/// Fetch and decode the faulting A64 instruction via the process's page
+/// tables. Only the "Load/store register (unsigned immediate)" integer
+/// family is recognised — that is what Zig emits for `*volatile uN`
+/// accesses at constant offsets. Returns null on a SIMD/FP access, an
+/// unrecognised encoding, or an untranslatable RIP.
+fn decodeA64LoadStore(ctx: *const ArchCpuContext, proc: anytype) ?DecodedLoadStore {
+    const rip = ctx.elr_el1;
+    const rip_page = VAddr.fromInt(rip & ~@as(u64, 0xFFF));
+    const phys = arch.resolveVaddr(proc.addr_space_root, rip_page) orelse return null;
+    const physmap = VAddr.fromPAddr(phys, null).addr + (rip & 0xFFF);
+    const insn: u32 = @as(*const u32, @ptrFromInt(physmap)).*;
+
+    // Unsigned-immediate LDR/STR family: bits [29:27]=0b111, bits [25:24]=01.
+    // Bit 26 (V) = 1 selects SIMD/FP; reject.
+    if (((insn >> 27) & 0b111) != 0b111) return null;
+    if (((insn >> 24) & 0b11) != 0b01) return null;
+    if (((insn >> 26) & 0x1) != 0) return null;
+
+    const size: u32 = (insn >> 30) & 0b11;
+    const opc: u32 = (insn >> 22) & 0b11;
+    const rt: u8 = @truncate(insn & 0x1F);
+
+    // opc[0]=0 → store, opc[0]=1 → load (C6.2.123 / C6.2.218). sign-
+    // extending loads (opc=10/11 with size<11) are treated uniformly.
+    const is_write = (opc & 0x1) == 0;
+
+    const access_size: u64 = @as(u64, 1) << @intCast(size);
+
+    return .{
+        .rt = rt,
+        .access_size = access_size,
+        .is_write = is_write,
+    };
+}
+
+/// Write a 64-bit value to a GPR in ArchCpuContext by A64 register index.
+/// Index 31 is the zero register (WZR/XZR) — writes discarded.
+fn writeContextGpr(ctx: *ArchCpuContext, reg: u8, value: u64) void {
+    switch (reg) {
+        0 => ctx.regs.x0 = value,
+        1 => ctx.regs.x1 = value,
+        2 => ctx.regs.x2 = value,
+        3 => ctx.regs.x3 = value,
+        4 => ctx.regs.x4 = value,
+        5 => ctx.regs.x5 = value,
+        6 => ctx.regs.x6 = value,
+        7 => ctx.regs.x7 = value,
+        8 => ctx.regs.x8 = value,
+        9 => ctx.regs.x9 = value,
+        10 => ctx.regs.x10 = value,
+        11 => ctx.regs.x11 = value,
+        12 => ctx.regs.x12 = value,
+        13 => ctx.regs.x13 = value,
+        14 => ctx.regs.x14 = value,
+        15 => ctx.regs.x15 = value,
+        16 => ctx.regs.x16 = value,
+        17 => ctx.regs.x17 = value,
+        18 => ctx.regs.x18 = value,
+        19 => ctx.regs.x19 = value,
+        20 => ctx.regs.x20 = value,
+        21 => ctx.regs.x21 = value,
+        22 => ctx.regs.x22 = value,
+        23 => ctx.regs.x23 = value,
+        24 => ctx.regs.x24 = value,
+        25 => ctx.regs.x25 = value,
+        26 => ctx.regs.x26 = value,
+        27 => ctx.regs.x27 = value,
+        28 => ctx.regs.x28 = value,
+        29 => ctx.regs.x29 = value,
+        30 => ctx.regs.x30 = value,
+        else => {}, // 31 = XZR / WZR
+    }
 }

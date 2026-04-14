@@ -5,6 +5,7 @@ const syscall = lib.syscall;
 const t = lib.testing;
 
 pub fn main(_: u64) void {
+    t.skipNoAarch64Vm("§4.2.16");
     // vcpu_count=65 exceeds MAX_VCPUS. Checked after hardware support, so
     // E_NODEV may be returned first on hosts without virt. Accept both.
     const result = syscall.vm_create(65, 0);

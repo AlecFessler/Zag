@@ -7,6 +7,7 @@ const t = lib.testing;
 var policy: [4096]u8 align(4096) = .{0} ** 4096;
 
 pub fn main(_: u64) void {
+    t.skipNoAarch64Vm("§4.2.17");
     // First vm_create — should succeed or E_NODEV if no hardware virt.
     const r1 = syscall.vm_create(1, @intFromPtr(&policy));
     if (r1 == syscall.E_NODEV) {

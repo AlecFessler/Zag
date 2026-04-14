@@ -306,6 +306,41 @@ pub fn syncInstructionCache() void {
     }
 }
 
+/// Clean the data cache over the given byte range to the Point of
+/// Unification. On x86-64 this is a no-op (coherent caches). On aarch64
+/// this is required after writing freshly loaded ELF code through the
+/// physmap (D-cache) view: until the lines are pushed past the unified
+/// PoU, a subsequent `ic ivau`/`ic ialluis` cannot make the new
+/// instruction bytes visible to instruction fetch, and the user's
+/// entry point fetches stale (typically zero) bytes — manifesting as
+/// repeating instruction-abort exceptions on every ERET.
+///
+/// ARM ARM B2.4.6 / D5.10.2: data-to-instruction cache coherency.
+pub fn cleanDcacheToPou(start: u64, len: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => {
+            if (len == 0) return;
+            // Conservative 64-byte cache line for Cortex-A72/A76. The
+            // exact line size is in CTR_EL0.DminLine; using 64 bytes
+            // simply over-cleans on cores with smaller lines, which is
+            // safe.
+            const line: u64 = 64;
+            const end = start + len;
+            var addr = start & ~(line - 1);
+            while (addr < end) : (addr += line) {
+                asm volatile ("dc cvau, %[a]"
+                    :
+                    : [a] "r" (addr),
+                    : .{ .memory = true }
+                );
+            }
+            asm volatile ("dsb ish" ::: .{ .memory = true });
+        },
+        else => unreachable,
+    }
+}
+
 /// Clean + invalidate the data cache over the given byte range to the
 /// point of coherency. On x86-64 this is a no-op (coherent D-cache). On
 /// aarch64 this is required when memory is reconfigured from Normal
@@ -458,6 +493,54 @@ pub fn halt() noreturn {
     }
 }
 
+/// Spin-loop hint. Reduces power and inter-core memory traffic while
+/// busy-waiting on an atomic.
+pub inline fn cpuRelax() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("pause" ::: .{ .memory = true }),
+        .aarch64 => asm volatile ("yield" ::: .{ .memory = true }),
+        else => unreachable,
+    }
+}
+
+/// Kprof-dump IPI vector. Chosen in the same reserved high-vector band
+/// as the scheduler / TLB-shootdown / spurious vectors so it stays out
+/// of the device IRQ range.
+const kprof_dump_ipi_vector: u8 = switch (builtin.cpu.arch) {
+    .x86_64 => @intFromEnum(x64.interrupts.IntVecs.kprof_dump),
+    // ARM GIC SGI 1 — SGI 0 is claimed by the scheduler IPI.
+    .aarch64 => 1,
+    else => unreachable,
+};
+
+/// Send a kprof-dump IPI to every core except the caller. Invoked by the
+/// dumping core inside `kprof.dump.end()` to quiesce every other CPU
+/// before serial-dumping the per-CPU logs.
+pub fn broadcastKprofIpi() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            const self_id = x64.apic.coreID();
+            const lapics = x64.apic.lapics orelse return;
+            for (lapics, 0..) |la, i| {
+                if (i == self_id) continue;
+                x64.apic.sendIpi(@intCast(la.apic_id), kprof_dump_ipi_vector);
+            }
+        },
+        .aarch64 => {
+            const self_id = aarch64.gic.coreID();
+            const n = aarch64.gic.coreCount();
+            var i: u64 = 0;
+            while (i < n) {
+                if (i != self_id) {
+                    aarch64.gic.sendIpiToCore(i, kprof_dump_ipi_vector);
+                }
+                i += 1;
+            }
+        },
+        else => unreachable,
+    }
+}
+
 pub fn mapPage(
     addr_space_root: PAddr,
     phys: PAddr,
@@ -574,10 +657,17 @@ pub inline fn earlyDebugChar(c: u8) void {
             );
         },
         .aarch64 => {
-            // PL011 at physical 0x09000000 via TTBR0 identity mapping
-            // (UEFI firmware) or via mapEarlyDebugDevices() which
-            // identity-maps it into our kernel page table too.
-            const uart: *volatile u32 = @ptrFromInt(0x09000000);
+            // Prefer the kernel-VA (physmap, TTBR1) UART base set by
+            // serial.init()/parseSpcr — TTBR1 mappings are visible to
+            // every process address space, so this works even after the
+            // kernel has switched to a user process's TTBR0 (which does
+            // not contain the early UEFI identity mapping for the
+            // PL011 page at physical 0x09000000). Fall back to the raw
+            // PA only during the very early-boot window before
+            // serial.init() runs, where UEFI's TTBR0 identity mapping
+            // is still active.
+            const base = aarch64.serial.getBase() orelse 0x09000000;
+            const uart: *volatile u32 = @ptrFromInt(base);
             uart.* = c;
         },
         else => unreachable,
@@ -1122,6 +1212,87 @@ pub fn pmuPerCoreInit() void {
     }
 }
 
+/// Program one PMC on the local core for cycle-overflow sampling and
+/// set the LAPIC LVT PerfMon entry to NMI delivery. Called under
+/// `-Dkernel_profile=sample` once per core after `pmuPerCoreInit`.
+pub fn kprofSamplePerCoreInit(period_cycles: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.pmu.kprofSamplePerCoreInit(period_cycles),
+        // aarch64 backend for kprof sampling isn't wired yet; safe
+        // no-op so the generic kprof code compiles on ARM.
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
+/// Called from the NMI handler. Returns true if PMC 0 overflowed and
+/// was rearmed with a fresh `period_cycles` preload — i.e. this NMI
+/// belongs to kprof. Returns false for any non-sampling NMI.
+pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return x64.pmu.kprofSampleCheckAndRearm(period_cycles),
+        .aarch64 => return false,
+        else => unreachable,
+    }
+}
+
+/// Program PMCs 0/1/2 on the local core for free-running
+/// cycles / cache-miss / branch-mispredict counting. Called under
+/// `-Dkernel_profile=trace` from `sched.perCoreInit` after
+/// `pmuPerCoreInit`. Counters run unattended forever; the trace
+/// helpers in `kprof.trace_id` snapshot them into each emitted
+/// record so the post-processor can compute per-scope deltas.
+pub fn kprofTraceCountersPerCoreInit() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.pmu.kprofTraceCountersPerCoreInit(),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}
+
+/// Read the three free-running trace counters into `out` in the
+/// order (cycles, cache_misses, branch_misses). NMI-safe: pure
+/// RDMSR reads, no allocation, no locks. On aarch64 (stub) fills
+/// with zeros.
+pub inline fn kprofTraceCountersRead(out: *[3]u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.pmu.kprofTraceCountersRead(out),
+        .aarch64 => {
+            out[0] = 0;
+            out[1] = 0;
+            out[2] = 0;
+        },
+        else => unreachable,
+    }
+}
+
+/// NMI-safe read of a `u64` at a supposed kernel virtual address.
+///
+/// Returns `null` if the address is obviously not a valid kernel
+/// pointer (zero, not 8-byte aligned, or not in the upper / kernel
+/// half of the virtual address space). Used by the kprof sample-mode
+/// frame-pointer unwinder, which must never fault: every pointer
+/// dereferenced on the interrupted stack is passed through this
+/// helper first.
+///
+/// A caller is still responsible for being reasonable about the
+/// address — this helper assumes the kernel half of virtual memory
+/// is fully mapped on the current core (which is true for Zag: kernel
+/// code + stacks + physmap are all pre-mapped by boot and never torn
+/// down). It does not probe the page tables.
+pub fn readKernelU64Safe(addr: u64) ?u64 {
+    if (addr == 0) return null;
+    if ((addr & 0x7) != 0) return null;
+    // Kernel half starts at `addr_space.kernel.start` on both
+    // supported architectures (see the canonical layout above).
+    if (addr < addr_space.kernel.start) return null;
+    // Last 8 bytes must be in-range — reject a pointer that straddles
+    // the top of canonical space (defensive; never hit in practice).
+    if (addr > std.math.maxInt(u64) - 8) return null;
+    const ptr: *const u64 = @ptrFromInt(addr);
+    return ptr.*;
+}
+
 pub fn pmuGetInfo() PmuInfo {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.pmu.pmuGetInfo(),
@@ -1206,7 +1377,7 @@ pub fn pmuClearState(state: *PmuState) void {
 pub fn readRtc() u64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.rtc.readRtc(),
-        .aarch64 => 0,
+        .aarch64 => aarch64.rtc.readRtc(),
         else => unreachable,
     };
 }
@@ -1365,80 +1536,88 @@ const ArchCpuContextLocal = ArchCpuContext;
 const SyscallResult = zag.syscall.dispatch.SyscallResult;
 const Process = zag.proc.process.Process;
 
+// AArch64 KVM stubs: `vm_create` returns E_NODEV (-13) per spec §4.2.18 since
+// hardware virtualization (stage-2 / HCR_EL2) is not yet implemented. All
+// downstream VM syscalls still honor spec §4.2.1 — "All VM syscalls with an
+// invalid handle return E_BADHANDLE". Because `proc.vm` is always null on
+// aarch64 (vm_create cannot succeed), every handle-accepting syscall treats
+// the handle as invalid and returns E_BADHANDLE (-3) for handle-based ops or
+// E_INVAL (-1) for vCPU ops (matching the x86 code paths which return E_INVAL
+// when the owning process has no VM).
 pub fn kvmVmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vm.vmCreate(proc, vcpu_count, policy_ptr),
-        else => -14, // E_NOSYS
+        else => -13, // E_NODEV
     };
 }
 
 pub fn kvmGuestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vm.guestMap(proc, vm_handle, host_vaddr, guest_addr, size, rights),
-        else => -14,
+        else => -3, // E_BADHANDLE — no VM exists on this arch
     };
 }
 
 pub fn kvmVmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContextLocal, vm_handle: u64, buf_ptr: u64, blocking: bool) SyscallResult {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.exit_box.vmRecv(proc, thread, ctx, vm_handle, buf_ptr, blocking),
-        else => .{ .ret = -14 },
+        else => .{ .ret = -3 }, // E_BADHANDLE
     };
 }
 
 pub fn kvmVmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.exit_box.vmReply(proc, vm_handle, exit_token, action_ptr),
-        else => -14,
+        else => -3, // E_BADHANDLE
     };
 }
 
 pub fn kvmVcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.vcpuSetState(proc, thread_handle, state_ptr),
-        else => -14,
+        else => -1, // E_INVAL — proc has no VM
     };
 }
 
 pub fn kvmVcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.vcpuGetState(proc, thread_handle, state_ptr),
-        else => -14,
+        else => -1, // E_INVAL
     };
 }
 
 pub fn kvmVcpuRun(proc: *Process, thread_handle: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.vcpuRun(proc, thread_handle),
-        else => -14,
+        else => -1, // E_INVAL
     };
 }
 
 pub fn kvmVcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.vcpuInterrupt(proc, thread_handle, interrupt_ptr),
-        else => -14,
+        else => -1, // E_INVAL
     };
 }
 
 pub fn kvmMsrPassthrough(proc: *Process, vm_handle: u64, msr_num: u32, allow_read: bool, allow_write: bool) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vm.msrPassthrough(proc, vm_handle, msr_num, allow_read, allow_write),
-        else => -14,
+        else => -3, // E_BADHANDLE
     };
 }
 
 pub fn kvmIoapicAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vm.ioapicAssertIrq(proc, vm_handle, irq_num),
-        else => -14,
+        else => -3, // E_BADHANDLE
     };
 }
 
 pub fn kvmIoapicDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vm.ioapicDeassertIrq(proc, vm_handle, irq_num),
-        else => -14,
+        else => -3, // E_BADHANDLE
     };
 }
 

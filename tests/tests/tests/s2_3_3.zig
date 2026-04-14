@@ -1,3 +1,12 @@
+// TODO aarch64: NOOUT on Pi 5 KVM. Child `child_invalid_write` takes a write
+// fault on an RO-reverted page but is never reaped — kernel loops emitting
+// "K: PAGEFAULT pid=2 addr=0xf80 w=false x=false" (from the is_kernel_privilege
+// && is_user_va branch of handlePageFault). Root cause likely sits in the
+// aarch64 data_abort_same_el path: either the exception is being taken at
+// the wrong vector (same-EL vs lower-EL) or proc.kill isn't actually
+// stopping the faulting thread from being rescheduled on SMP, so we re-take
+// the same fault on every core. Need to audit handleSyncCurrentEl vs
+// handleSyncLowerEl dispatch and the SMP kill path.
 const children = @import("embedded_children");
 const lib = @import("lib");
 

@@ -130,7 +130,14 @@ pub fn prepareThreadContext(
     arg: u64,
 ) *ArchCpuContext {
     @setRuntimeSafety(false);
-    const ctx_addr: u64 = kstack_top.addr - @sizeOf(ArchCpuContext);
+    // Match the trampoline's stack frame layout: vector-stub 16-byte push
+    // followed by the 272-byte ArchCpuContext save = 288 bytes total. On
+    // context restore, switchTo() advances SP_EL1 to (ctx + 288) so the
+    // frame is fully popped; by aligning the initial ctx at (top - 288)
+    // we match the offset a resumed thread would see. The 16 high bytes
+    // of the frame are unused (they would hold the vector stub's saved
+    // x0/x30 on a real exception path).
+    const ctx_addr: u64 = kstack_top.addr - 288;
     const ctx: *ArchCpuContext = @ptrFromInt(ctx_addr);
 
     // Zero the entire context for a clean initial state.
@@ -148,8 +155,21 @@ pub fn prepareThreadContext(
         ctx.spsr_el1 = 0x0;
         ctx.sp_el0 = ustack.addr;
     } else {
-        // Kernel thread: EL1h (M[3:0] = 0x4), DAIF masked (bits [9:6]).
-        ctx.spsr_el1 = 0x3C4;
+        // Kernel thread: EL1h (M[3:0] = 0x4), DAIF unmasked (bits [9:6] = 0).
+        //
+        // The only aarch64 kernel thread constructed via this path is the
+        // per-core idle loop (`scheduler.idleLoop`), which runs
+        // `while (true) wfi`. WFI stalls the core until an interrupt is
+        // pending *and* that interrupt can actually be delivered — if
+        // DAIF.I (IRQ mask) is set at ERET, the GIC signals the SGI/PPI
+        // but exception entry is blocked, so the idle core wakes up,
+        // masks pending, loops back into WFI, and effectively ignores
+        // every IPI. A pinned thread migrating to a formerly-idle core
+        // (e.g. §2.1.25 `set_priority(PINNED)` with affinity=0x2) would
+        // then never be dispatched, because `enqueueOnCore`'s wake IPI
+        // can't preempt the idle thread. Clearing DAIF here lets the
+        // wake IPI fire on the first WFI exit.
+        ctx.spsr_el1 = 0x4;
         ctx.sp_el0 = 0;
     }
 
@@ -174,11 +194,30 @@ pub fn switchTo(thread: *Thread) noreturn {
         arch.swapAddrSpace(new_root);
     }
 
+    // Restore SP_EL1 so the incoming thread's in-progress kernel frames
+    // (if it was preempted inside EL1) are reachable, and fresh threads
+    // start with their kernel stack empty. `thread.ctx` always points at
+    // the saved ArchCpuContext; adding 288 bytes pops the full trampoline
+    // frame (16-byte vector-stub push + 272-byte context). Prior to this
+    // fix, SP_EL1 was left pointing at whatever stack switchTo() happened
+    // to be running on, which was the *outgoing* thread's kernel stack —
+    // subsequent exception entries from EL0 then trampled unrelated
+    // frames. (x64 handles the EL0-entry case via TSS.rsp0 and never
+    // needs this because interrupted kernel code just continues on its
+    // own rsp through the standard epilogue.)
+    const new_sp = @intFromPtr(thread.ctx) + 288;
+
     // ctx points to the saved ArchCpuContext (regs x0-x30, sp_el0, elr_el1, spsr_el1).
     // Register file layout: x0 at offset 0, x1 at offset 8, ..., x30 at offset 240,
     // sp_el0 at offset 248, elr_el1 at offset 256, spsr_el1 at offset 264.
     asm volatile (
-    // Load context base address into x0.
+    // Swap SP_EL1 up front using the input register. After this point we
+    // touch no stack memory until ERET, so the value of the old sp is
+    // irrelevant. Doing the swap before touching x0 guarantees the
+    // %[new_sp] input register hasn't been clobbered yet.
+        \\mov sp, %[new_sp]
+        \\
+        // Load context base address into x0.
         \\mov x0, %[ctx]
         \\
         // Restore SP_EL0 (offset 248 = 31*8).
@@ -218,6 +257,7 @@ pub fn switchTo(thread: *Thread) noreturn {
         \\eret
         :
         : [ctx] "r" (@intFromPtr(thread.ctx)),
+          [new_sp] "r" (new_sp),
     );
     unreachable;
 }

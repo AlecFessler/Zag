@@ -332,6 +332,37 @@ fn clearAllOverflowStatus(num_counters: u8) void {
     cpu.wrmsr(IA32_PERF_GLOBAL_OVF_CTRL, mask);
 }
 
+/// kprof sample-mode per-core init. Intel backend isn't wired for
+/// sample-mode NMI yet — the kprof.sample.md plan reserves this for
+/// a follow-up once the AMD path proves the shape. No-op for now so
+/// `-Dkernel_profile=sample` still compiles under Intel.
+pub fn kprofSamplePerCoreInit(period_cycles: u64) void {
+    _ = period_cycles;
+}
+
+/// Mirror of the AMD hook. Returns false because Intel sample-mode
+/// wiring isn't done yet; the NMI handler will fall through to its
+/// existing (panic) policy, which is the right thing under Intel
+/// until this is implemented.
+pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
+    _ = period_cycles;
+    return false;
+}
+
+/// Intel trace-counter stub. Parallel to `kprofSamplePerCoreInit`'s
+/// stub — wire up IA32_PERFEVTSELx programming here when an Intel
+/// test rig exists.
+pub fn kprofTraceCountersPerCoreInit() void {}
+
+/// Intel trace-counter read stub. Zeros the output so trace records
+/// built on Intel at least produce well-defined numbers instead of
+/// garbage until the real backend lands.
+pub inline fn kprofTraceCountersRead(out: *[3]u64) void {
+    out[0] = 0;
+    out[1] = 0;
+    out[2] = 0;
+}
+
 fn pmiHandler(ctx: *cpu.Context) void {
     // The PMI vector is registered as `.external`, so `dispatchInterrupt`
     // already issues `apic.endOfInterrupt()` after this handler returns.

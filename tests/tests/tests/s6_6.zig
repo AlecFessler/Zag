@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const children = @import("embedded_children");
 const lib = @import("lib");
 
@@ -6,7 +7,16 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
-/// §6.6 — Divide-by-zero kills with `arithmetic_fault`.
+/// §6.6 — Divide-by-zero kills the child via a synchronous CPU fault.
+///
+/// On x86 `div`-by-zero raises #DE, which the kernel maps to
+/// `arithmetic_fault`. On aarch64 integer division by zero is defined to
+/// return 0 (ARM ARM C3.4.8 UDIV/SDIV), so it never traps — the child
+/// instead executes `udf #0` (permanently-undefined instruction), which
+/// the kernel reports as `illegal_instruction`. Either reason satisfies
+/// the spec-level assertion that the child dies synchronously from a CPU
+/// fault rather than exiting normally; we accept the arch-appropriate
+/// mapping.
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
     const child_rights = perms.ProcessRights{};
@@ -23,7 +33,13 @@ pub fn main(pv: u64) void {
         if (view[slot].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS) break;
         syscall.thread_yield();
     }
-    if (view[slot].processCrashReason() == .arithmetic_fault) {
+    const reason = view[slot].processCrashReason();
+    const ok = switch (builtin.cpu.arch) {
+        .x86_64 => reason == .arithmetic_fault,
+        .aarch64 => reason == .illegal_instruction,
+        else => false,
+    };
+    if (ok) {
         t.pass("§6.6");
     } else {
         t.fail("§6.6");

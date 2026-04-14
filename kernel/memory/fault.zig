@@ -66,7 +66,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
 
     if (is_kernel_privilege and is_user_va) {
         const thread = scheduler.currentThread() orelse @panic("kernel page fault on user VA with no current thread");
-        arch.print("K: PAGEFAULT pid={d} addr=0x{x} w={} x={}\n", .{ thread.process.pid, fault.faulting_address, is_write, is_exec });
+        arch.print("K: PAGEFAULT pid={d} addr=0x{x} w={} x={} rip=0x{x}\n", .{ thread.process.pid, fault.faulting_address, is_write, is_exec, fault.rip });
         thread.process.kill(accessReason(is_write, is_exec));
         arch.enableInterrupts();
         while (true) arch.halt();

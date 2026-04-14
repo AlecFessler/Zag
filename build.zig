@@ -91,6 +91,7 @@ pub fn build(b: *std.Build) void {
     {
         @panic("-Dkernel_profile must be one of: none, trace, sample");
     }
+    const kprof_enabled = !std.mem.eql(u8, kernel_profile, "none");
 
     const arch: std.Target.Cpu.Arch = blk: {
         break :blk if (std.mem.eql(u8, target_arch, "x64"))
@@ -100,7 +101,22 @@ pub fn build(b: *std.Build) void {
         else
             @panic("Unsupported target architecture");
     };
-    const optimize = b.standardOptimizeOption(.{});
+    // When kprof is compiled in, prefer ReleaseFast so the measured
+    // kernel matches production code generation, and retain debug info
+    // on the kernel.elf so parse_kprof.py can symbolize trace/sample
+    // IPs directly against the built binary. Plain Debug remains the
+    // default when kprof is disabled so normal builds aren't bloated.
+    // We register `-Doptimize` directly (not via standardOptimizeOption)
+    // because standardOptimizeOption hides -Doptimize whenever
+    // preferred_optimize_mode is set, and we still want users to be
+    // able to override the kprof default explicitly.
+    const user_optimize = b.option(
+        std.builtin.OptimizeMode,
+        "optimize",
+        "Prioritize performance, safety, or binary size",
+    );
+    const optimize: std.builtin.OptimizeMode = user_optimize orelse
+        (if (kprof_enabled) .ReleaseFast else .Debug);
     const cpu_model: std.Target.Query.CpuModel = if (arch == .aarch64)
         .{ .explicit = &std.Target.aarch64.cpu.cortex_a72 }
     else
@@ -206,6 +222,11 @@ pub fn build(b: *std.Build) void {
             }),
             .optimize = optimize,
             .code_model = if (arch == .x86_64) .kernel else .small,
+            // Keep debug info in the kernel ELF under kprof so that
+            // parse_kprof.py (task #12) can resolve trace/sample IPs
+            // to source locations without a separate symbol bundle.
+            // null leaves Zig's default behavior for non-kprof builds.
+            .strip = if (kprof_enabled) false else null,
         }),
         .linkage = .static,
     });
@@ -244,9 +265,9 @@ pub fn build(b: *std.Build) void {
     // ── QEMU ────────────────────────────────────────────────────────────
     const qemu_cmdline = if (arch == .aarch64) blk: {
         const accel = if (kvm)
-            "-enable-kvm -cpu host"
+            "-enable-kvm -cpu host,pmu=on"
         else
-            "-machine accel=tcg -cpu cortex-a72 -d int,cpu_reset -no-shutdown -D qemu.log";
+            "-machine accel=tcg -cpu cortex-a72,pmu=on -d int,cpu_reset -no-shutdown -D qemu.log";
         break :blk b.fmt(
             \\exec qemu-system-aarch64 \
             \\ -M virt,gic-version=3 \

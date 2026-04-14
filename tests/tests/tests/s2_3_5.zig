@@ -1,8 +1,20 @@
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
+
+/// Arch-specific `ret` encoding. The test writes this byte pattern into a
+/// demand-paged private page and invokes it via a function pointer to
+/// confirm execute rights reverted post-unmap. On x86 `0xC3` is a 1-byte
+/// near RET that pops RIP from the stack. On aarch64 `0xD65F03C0` is a
+/// 4-byte `ret` instruction that branches to x30 (LR).
+const RET_BYTES: []const u8 = switch (builtin.cpu.arch) {
+    .x86_64 => &[_]u8{0xC3},
+    .aarch64 => &[_]u8{ 0xC0, 0x03, 0x5F, 0xD6 }, // little-endian 0xD65F03C0
+    else => @compileError("unsupported arch"),
+};
 
 /// §2.3.5 — After `mem_unmap`, unmapped private nodes revert to demand-paged state with max RWX rights.
 ///
@@ -39,10 +51,12 @@ pub fn main(perm_view: u64) void {
         t.fail("§2.3.5");
         syscall.shutdown();
     }
-    // Execute right: write a single RET (0xC3) and invoke via fn pointer.
-    // If execute rights failed to revert, this faults with invalid_execute.
-    const code_ptr: *volatile u8 = @ptrFromInt(vm.val2);
-    code_ptr.* = 0xC3;
+    // Execute right: write an arch-appropriate `ret` encoding and invoke
+    // via fn pointer. If execute rights failed to revert, this faults with
+    // invalid_execute. Page start is 4K-aligned, so the aarch64 4-byte
+    // instruction is also 4-byte aligned as aarch64 requires.
+    const dest: [*]volatile u8 = @ptrFromInt(vm.val2);
+    for (RET_BYTES, 0..) |byte, i| dest[i] = byte;
     const func: *const fn () void = @ptrFromInt(vm.val2);
     func();
     t.pass("§2.3.5");

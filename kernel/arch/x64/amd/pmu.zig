@@ -325,6 +325,112 @@ fn preloadValue(cfg: PmuCounterConfig) u64 {
     return span - clamped;
 }
 
+/// PMC index reserved for kprof sample-mode. Userspace PMU sessions
+/// still start at counter 0, so sample mode and userspace PMU can't
+/// run concurrently — sample mode is a kernel debug build, not a
+/// production feature.
+const KPROF_SAMPLE_PMC: u8 = 0;
+
+/// Program `KPROF_SAMPLE_PMC` for cycle-overflow sampling and flip the
+/// LAPIC LVT PerfMon entry to NMI delivery so the PMI fires even when
+/// interrupts are masked. Called once per core under `-Dkernel_profile=sample`.
+///
+/// AMD APM Vol 2, Appendix A: event 0x76 = "CPU Clocks not Halted".
+/// AMD APM Vol 2 §16.4 + Intel SDM Vol 3A §12.5.1: LVT delivery-mode
+/// field is bits [10:8] — value 0b100 selects NMI delivery.
+pub fn kprofSamplePerCoreInit(period_cycles: u64) void {
+    const span: u64 = @as(u64, 1) << AMD_COUNTER_BITS;
+    const clamped = if (period_cycles == 0 or period_cycles >= span) span - 1 else period_cycles;
+    const preload = span - clamped;
+
+    // Disable PMC 0 before reprogramming so no stale PMI slips through.
+    cpu.wrmsr(perfevtselMsr(KPROF_SAMPLE_PMC), 0);
+    cpu.wrmsr(perfctrMsr(KPROF_SAMPLE_PMC), preload);
+
+    // Event 0x76 (CPU clocks not halted), count in both rings, enable
+    // the overflow interrupt bit.
+    const PERFEVTSEL_OS: u64 = 1 << 17;
+    const word: u64 =
+        @as(u64, 0x76) |
+        PERFEVTSEL_USR |
+        PERFEVTSEL_OS |
+        PERFEVTSEL_INT |
+        PERFEVTSEL_EN;
+    cpu.wrmsr(perfevtselMsr(KPROF_SAMPLE_PMC), word);
+
+    // LVT PerfMon: vector + delivery_mode=NMI (bits [10:8] = 0b100 = 0x400).
+    const NMI_DELIVERY: u32 = 0b100 << 8;
+    const lvt: u32 = @as(u32, PMI_VECTOR) | NMI_DELIVERY;
+    if (apic.x2_apic) {
+        cpu.wrmsr(
+            @intFromEnum(apic.X2ApicMsr.local_vector_table_performance_monitor_register),
+            @as(u64, lvt),
+        );
+    } else {
+        apic.writeReg(.lvt_perf_monitoring_counters_reg, lvt);
+    }
+}
+
+/// Program PMCs 0/1/2 for free-running cycles / L1 DC refill /
+/// branch-mispredict counting. No overflow interrupt — the trace
+/// helpers just RDMSR these at each tracepoint. Runs exclusively
+/// under `-Dkernel_profile=trace`; sample mode uses the overflow
+/// path in `kprofSamplePerCoreInit` instead.
+///
+/// Event codes + unit masks: AMD APM Vol 2 Appendix A "Core
+/// Performance Event Reference" (Zen family).
+///   PMC0: event 0x76 umask 0x00 = CPU Clocks not Halted
+///   PMC1: event 0x43 umask 0xFF = Data Cache Refills from L2/System
+///         (all refill sources). An umask of 0 counts nothing, which
+///         is why the first attempt showed cmiss=0 everywhere.
+///   PMC2: event 0xC3 umask 0x00 = Retired Branch Mispredicts
+pub fn kprofTraceCountersPerCoreInit() void {
+    const cfg = [_]struct { pmc: u8, event: u8, umask: u8 }{
+        .{ .pmc = 0, .event = 0x76, .umask = 0x00 },
+        .{ .pmc = 1, .event = 0x43, .umask = 0xFF },
+        .{ .pmc = 2, .event = 0xC3, .umask = 0x00 },
+    };
+    const PERFEVTSEL_OS: u64 = 1 << 17;
+    var i: usize = 0;
+    while (i < cfg.len) {
+        const c = cfg[i];
+        cpu.wrmsr(perfevtselMsr(c.pmc), 0);
+        cpu.wrmsr(perfctrMsr(c.pmc), 0);
+        const word: u64 =
+            @as(u64, c.event) |
+            (@as(u64, c.umask) << 8) |
+            PERFEVTSEL_USR |
+            PERFEVTSEL_OS |
+            PERFEVTSEL_EN;
+        cpu.wrmsr(perfevtselMsr(c.pmc), word);
+        i += 1;
+    }
+}
+
+/// Snapshot the three trace counters. Masked to AMD's 48-bit
+/// counter width so the raw MSR value doesn't carry high-bit noise.
+pub inline fn kprofTraceCountersRead(out: *[3]u64) void {
+    out[0] = cpu.rdmsr(perfctrMsr(0)) & COUNTER_MASK;
+    out[1] = cpu.rdmsr(perfctrMsr(1)) & COUNTER_MASK;
+    out[2] = cpu.rdmsr(perfctrMsr(2)) & COUNTER_MASK;
+}
+
+/// Called from the NMI handler. Reads PMC 0 — if it's below the
+/// preload value, the counter wrapped past 2^48 and fired an NMI that
+/// belongs to kprof; in that case we rearm with a fresh preload and
+/// return true. Otherwise the NMI is for someone else.
+pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
+    const span: u64 = @as(u64, 1) << AMD_COUNTER_BITS;
+    const clamped = if (period_cycles == 0 or period_cycles >= span) span - 1 else period_cycles;
+    const preload = span - clamped;
+
+    const val = cpu.rdmsr(perfctrMsr(KPROF_SAMPLE_PMC)) & COUNTER_MASK;
+    if (val >= preload) return false;
+
+    cpu.wrmsr(perfctrMsr(KPROF_SAMPLE_PMC), preload);
+    return true;
+}
+
 fn pmiHandler(ctx: *cpu.Context) void {
     // Registered as `.external`; `dispatchInterrupt` EOIs after we return.
     const thread = sched.currentThread() orelse return;

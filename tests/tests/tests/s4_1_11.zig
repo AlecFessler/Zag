@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const children = @import("embedded_children");
 const lib = @import("lib");
 
@@ -5,6 +6,27 @@ const perm_view = lib.perm_view;
 const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
+
+// Size of the null-deref instruction: x86 movb is 2 bytes, aarch64 ldrb is 4.
+const null_deref_insn_size: u64 = switch (builtin.cpu.arch) {
+    .x86_64 => 2,
+    .aarch64 => 4,
+    else => @compileError("unsupported arch"),
+};
+
+/// Wait up to `budget` yield iterations for the counter at `ptr` to strictly
+/// advance from its current value. Returns true if it advanced, false if the
+/// budget was exhausted.
+fn waitForCounterAdvance(ptr: *volatile u64, budget: u32) bool {
+    const start = ptr.*;
+    var i: u32 = 0;
+    while (i < budget) {
+        syscall.thread_yield();
+        if (ptr.* > start) return true;
+        i += 1;
+    }
+    return false;
+}
 
 /// §4.1.11 — Before applying stop-all on an external fault, the kernel checks the faulting thread's `exclude_oneshot` and `exclude_permanent` flags on the thread's perm entry in the handler's permissions table.
 ///
@@ -107,26 +129,23 @@ pub fn main(pv: u64) void {
     }
 
     sig_ptr.* = 1;
-    var fault_buf1: [256]u8 align(8) = undefined;
+    var fault_buf1: [syscall.fault_msg_size]u8 align(8) = undefined;
     const token1 = syscall.fault_recv(@intFromPtr(&fault_buf1), 1);
     if (token1 < 0) {
         t.failWithVal("§4.1.11 phase1 fault_recv", 0, token1);
         syscall.shutdown();
     }
     // Worker must keep advancing — stop-all was skipped.
-    const snap1a = counter_ptr.*;
-    for (0..100) |_| syscall.thread_yield();
-    const snap1b = counter_ptr.*;
-    if (snap1b <= snap1a) {
+    if (!waitForCounterAdvance(counter_ptr, 10000)) {
         t.fail("§4.1.11 phase1 worker frozen");
         syscall.shutdown();
     }
-    // Resume past the 2-byte movb null-deref.
+    // Resume past the null-deref instruction.
     const fm1: *const syscall.FaultMessage = @ptrCast(@alignCast(&fault_buf1));
-    var modregs1: [144]u8 align(8) = undefined;
-    @memcpy(modregs1[0..144], fault_buf1[32 .. 32 + 144]);
+    var modregs1: [syscall.fault_regs_size]u8 align(8) = undefined;
+    @memcpy(modregs1[0..syscall.fault_regs_size], fault_buf1[32 .. 32 + syscall.fault_regs_size]);
     const rip_slot1: *align(8) u64 = @ptrCast(&modregs1[0]);
-    rip_slot1.* = fm1.rip + 2;
+    rip_slot1.* = fm1.rip + null_deref_insn_size;
     const rr1 = syscall.fault_reply_action(@bitCast(token1), syscall.FAULT_RESUME_MODIFIED, @intFromPtr(&modregs1));
     if (rr1 != 0) {
         t.failWithVal("§4.1.11 phase1 fault_reply", 0, rr1);
@@ -148,25 +167,22 @@ pub fn main(pv: u64) void {
     }
 
     sig_ptr.* = 1;
-    var fault_buf2: [256]u8 align(8) = undefined;
+    var fault_buf2: [syscall.fault_msg_size]u8 align(8) = undefined;
     const token2 = syscall.fault_recv(@intFromPtr(&fault_buf2), 1);
     if (token2 < 0) {
         t.failWithVal("§4.1.11 phase2 fault_recv", 0, token2);
         syscall.shutdown();
     }
     // Worker must keep advancing — stop-all was skipped.
-    const snap2a = counter_ptr.*;
-    for (0..100) |_| syscall.thread_yield();
-    const snap2b = counter_ptr.*;
-    if (snap2b <= snap2a) {
+    if (!waitForCounterAdvance(counter_ptr, 10000)) {
         t.fail("§4.1.11 phase2 worker frozen");
         syscall.shutdown();
     }
     const fm2: *const syscall.FaultMessage = @ptrCast(@alignCast(&fault_buf2));
-    var modregs2: [144]u8 align(8) = undefined;
-    @memcpy(modregs2[0..144], fault_buf2[32 .. 32 + 144]);
+    var modregs2: [syscall.fault_regs_size]u8 align(8) = undefined;
+    @memcpy(modregs2[0..syscall.fault_regs_size], fault_buf2[32 .. 32 + syscall.fault_regs_size]);
     const rip_slot2: *align(8) u64 = @ptrCast(&modregs2[0]);
-    rip_slot2.* = fm2.rip + 2;
+    rip_slot2.* = fm2.rip + null_deref_insn_size;
     const rr2 = syscall.fault_reply_action(@bitCast(token2), syscall.FAULT_RESUME_MODIFIED, @intFromPtr(&modregs2));
     if (rr2 != 0) {
         t.failWithVal("§4.1.11 phase2 fault_reply", 0, rr2);
@@ -178,15 +194,24 @@ pub fn main(pv: u64) void {
     // kernel consumed the oneshot during phase 2.
     // ================================================================
     sig_ptr.* = 1;
-    var fault_buf3: [256]u8 align(8) = undefined;
+    var fault_buf3: [syscall.fault_msg_size]u8 align(8) = undefined;
     const token3 = syscall.fault_recv(@intFromPtr(&fault_buf3), 1);
     if (token3 < 0) {
         t.failWithVal("§4.1.11 phase3 fault_recv", 0, token3);
         syscall.shutdown();
     }
-    // Worker must be FROZEN — stop-all was applied.
+    // Worker must be FROZEN — stop-all was applied. The suspend IPI is
+    // dispatched asynchronously from sysFaultBlock and has a small
+    // propagation window during which the worker may execute a handful
+    // more increments before its remote core takes the IPI. Wait for
+    // the IPI to propagate, then verify the counter is stable over a
+    // second window: phases 1 & 2 advance the counter by millions per
+    // yield window (uninhibited worker), so a stop-all applied window
+    // is unambiguously distinguishable from a running window even with
+    // a small initial transient slack.
+    for (0..500) |_| syscall.thread_yield();
     const snap3a = counter_ptr.*;
-    for (0..100) |_| syscall.thread_yield();
+    for (0..500) |_| syscall.thread_yield();
     const snap3b = counter_ptr.*;
     if (snap3b != snap3a) {
         t.fail("§4.1.11 phase3 worker not suspended (oneshot not consumed)");

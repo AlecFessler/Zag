@@ -22,6 +22,11 @@ const E_INVAL = errors.E_INVAL;
 pub const SyscallResult = struct {
     ret: i64,
     ret2: u64 = 0,
+    /// On aarch64 x0 is both the syscall return register and IPC reply
+    /// word 0. IPC recv handlers that have already written word 0 into x0
+    /// via copyIpcPayload set this flag so the arch-level exception
+    /// dispatcher does not clobber x0 with `ret` on the way out.
+    skip_ret_write: bool = false,
 };
 
 pub const SyscallNum = enum(u64) {

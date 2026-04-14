@@ -5,6 +5,7 @@ const syscall = lib.syscall;
 const t = lib.testing;
 
 pub fn main(_: u64) void {
+    t.skipNoAarch64Vm("§4.2.15");
     // vcpu_count=0 is checked after hardware support check, so E_NODEV
     // may be returned first on hosts without virt. Accept both.
     const result = syscall.vm_create(0, 0);

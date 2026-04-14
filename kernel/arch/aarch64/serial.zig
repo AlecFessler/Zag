@@ -48,16 +48,31 @@ pub fn setBase(addr: u64) void {
     base_addr = addr;
 }
 
-/// Initialize the PL011 UART for transmit.
-/// If ACPI SPCR didn't set the base address, fall back to the QEMU
-/// virt PL011 at physmap + 0x09000000. UEFI firmware configures baud
-/// rate, line control, and enables the UART before handoff.
-pub fn init() void {
-    if (base_addr == null) {
-        const physmap_start = zag.arch.dispatch.addr_space.physmap.start;
-        base_addr = physmap_start + 0x09000000;
-    }
+/// Return the current PL011 MMIO base virtual address, or null if
+/// `init`/`setBase` have not run yet. Used by `arch.earlyDebugChar`
+/// to route low-level debug writes through the kernel-VA mapping
+/// (which is global across all process page tables) instead of the
+/// raw physical address (which is only mapped while UEFI's TTBR0
+/// identity map is still in place — i.e., before the first user
+/// process is scheduled).
+pub fn getBase() ?u64 {
+    return base_addr;
 }
+
+/// Initialize the PL011 UART for transmit.
+///
+/// Intentionally a no-op for now: the PL011 MMIO page is not yet mapped
+/// into the kernel's TTBR1 physmap range at this point in boot
+/// (memory.init() has not run), so installing a physmap-based base
+/// address here would cause the very next print to translation-fault
+/// before parseAcpi() can install the real mapping. Leaving
+/// `base_addr` null keeps `arch.earlyDebugChar` on the raw PA fallback
+/// (which is reachable via UEFI's TTBR0 identity map at this stage),
+/// and `parseSpcr`/`parseAcpi` will call `setBase` once the physmap
+/// VA for the PL011 page is actually mapped. UEFI firmware configures
+/// baud rate, line control, and enables the UART before handoff so
+/// the raw-PA writes are sufficient until then.
+pub fn init() void {}
 
 /// Format and transmit a string over the PL011 UART.
 /// Silently returns if the base address has not yet been set (early boot

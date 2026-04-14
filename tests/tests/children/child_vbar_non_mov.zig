@@ -29,18 +29,27 @@ pub fn main(perm_view_addr: u64) void {
 
     const bar_base: u64 = vm.val2;
 
-    // Execute a non-MOV instruction on the virtual BAR address. The kernel
-    // should detect this is not a MOV and kill with protection_fault. The
-    // specific instruction is x86-only; on aarch64 the virtual-BAR
-    // MMIO-through-decoder path is x86-specific, so we stub with an
-    // illegal instruction to satisfy the no-return contract of the test.
-    // aarch64: test is x86-specific, stubbed.
+    // Execute a non-MOV access on the virtual BAR address. The kernel
+    // should detect this is not a simple load/store it can emulate and
+    // kill the process with protection_fault.
+    //
+    // x86: `incb (%rax)` is a read-modify-write on memory; the vBAR
+    // decoder rejects anything that isn't a simple MOV.
+    //
+    // aarch64: `ldxr` (load-exclusive) is the canonical non-simple
+    // load — it is not a plain `ldr` and the aarch64 vBAR path does
+    // not decode/emulate exclusive accesses. The load translation
+    // faults (no PTE backs a virtual_bar node), and the generic
+    // handler kills with protection_fault.
     switch (@import("builtin").cpu.arch) {
         .x86_64 => asm volatile ("incb (%%rax)"
             :
             : [addr] "{rax}" (bar_base),
             : .{ .memory = true }),
-        .aarch64 => lib.fault.illegalInstruction(),
+        .aarch64 => asm volatile ("ldxr w1, [%[addr]]"
+            :
+            : [addr] "r" (bar_base),
+            : .{ .memory = true }),
         else => unreachable,
     }
 }

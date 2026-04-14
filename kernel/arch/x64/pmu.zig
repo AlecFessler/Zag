@@ -12,6 +12,7 @@
 const zag = @import("zag");
 
 const amd_pmu = zag.arch.x64.amd.pmu;
+const arch = zag.arch.dispatch;
 const cpu = zag.arch.x64.cpu;
 const intel_pmu = zag.arch.x64.intel.pmu;
 const pmu_sched = zag.syscall.pmu;
@@ -162,5 +163,51 @@ pub fn pmuClearState(state: *PmuState) void {
         .intel => intel_pmu.clearState(state),
         .amd => amd_pmu.clearState(state),
         .none => {},
+    }
+}
+
+/// kprof sample-mode per-core init. Programs one PMC for cycle
+/// overflow every `period_cycles` cycles and routes the LVT PerfMon
+/// entry to NMI delivery. No-op when no backend is active.
+pub fn kprofSamplePerCoreInit(period_cycles: u64) void {
+    switch (active_backend) {
+        .intel => intel_pmu.kprofSamplePerCoreInit(period_cycles),
+        .amd => amd_pmu.kprofSamplePerCoreInit(period_cycles),
+        .none => {},
+    }
+}
+
+/// kprof sample-mode NMI check. Returns true if the dedicated
+/// sampling PMC overflowed and was rearmed with a fresh
+/// `period_cycles` preload.
+pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
+    return switch (active_backend) {
+        .intel => intel_pmu.kprofSampleCheckAndRearm(period_cycles),
+        .amd => amd_pmu.kprofSampleCheckAndRearm(period_cycles),
+        .none => false,
+    };
+}
+
+/// kprof trace-mode per-core init. Programs three PMCs for
+/// free-running cycles / L1 DC refill / branch-mispredict counting.
+pub fn kprofTraceCountersPerCoreInit() void {
+    switch (active_backend) {
+        .intel => intel_pmu.kprofTraceCountersPerCoreInit(),
+        .amd => amd_pmu.kprofTraceCountersPerCoreInit(),
+        .none => {},
+    }
+}
+
+/// kprof trace-mode counter snapshot. Reads the three trace PMCs
+/// into `out` in (cycles, cache_misses, branch_misses) order.
+pub inline fn kprofTraceCountersRead(out: *[3]u64) void {
+    switch (active_backend) {
+        .intel => intel_pmu.kprofTraceCountersRead(out),
+        .amd => amd_pmu.kprofTraceCountersRead(out),
+        .none => {
+            out[0] = 0;
+            out[1] = 0;
+            out[2] = 0;
+        },
     }
 }

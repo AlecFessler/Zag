@@ -47,11 +47,20 @@ pub fn main(_: u64) void {
     // Prime the hold flag so the recorder will spin after it reads the msg.
     @atomicStore(u64, @as(*u64, @ptrCast(@volatileCast(&buf[7]))), 1, .release);
 
-    // Give child time to enter its recv.
+    // Give child time to enter its recv. On SMP systems the recorder may
+    // not have re-entered ipc_recv after replying to the setup call yet, so
+    // retry the send while it returns E_AGAIN ("no receiver waiting").
     for (0..100) |_| syscall.thread_yield();
 
-    // Fire-and-forget send.
-    const rc = syscall.ipc_send(ch, &.{0x4242_4242});
+    // Fire-and-forget send (with bounded E_AGAIN retry to handle SMP races).
+    var rc: i64 = 0;
+    var send_tries: u32 = 0;
+    while (send_tries < 10000) {
+        rc = syscall.ipc_send(ch, &.{0x4242_4242});
+        if (rc != -9) break;
+        syscall.thread_yield();
+        send_tries += 1;
+    }
     if (rc != 0) {
         @atomicStore(u64, @as(*u64, @ptrCast(@volatileCast(&buf[7]))), 0, .release);
         _ = syscall.futex_wake(@as(*u64, @ptrCast(@volatileCast(&buf[7]))), 1);
