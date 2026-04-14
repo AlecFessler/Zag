@@ -426,6 +426,19 @@ pub const VcpuState = struct {
     /// virtual CPU interface with PMR=0xF8 (matches Linux KVM init).
     vmcr: u64 = 0xF800_0002,
 
+    /// ICH_AP0R0_EL2 shadow — Group 0 Active Priorities Register 0.
+    /// GICv3 §12.5.2 / ARM ARM D13.8.42. Saved on exit / loaded on
+    /// entry so the virtual CPU interface preserves its active priority
+    /// stack across world switches. For GICv3 with 5 priority bits
+    /// (the architectural minimum) only AP{0,1}R0 exist; wider
+    /// priorities spill into AP{0,1}R{1,2,3}. We start with R0 only
+    /// which matches the Pi 5 / QEMU configuration.
+    ap0r0: u64 = 0,
+
+    /// ICH_AP1R0_EL2 shadow — Group 1 Active Priorities Register 0.
+    /// GICv3 §12.5.5 / ARM ARM D13.8.46.
+    ap1r0: u64 = 0,
+
     /// True after saveExit has observed a maintenance interrupt that
     /// must be processed by the next prepareEntry (refill LRs from the
     /// pending bitmaps).
@@ -444,22 +457,53 @@ pub const VcpuState = struct {
 /// GICv3 §12.5.30 ICH_VTR_EL2 bits [4:0] = ListRegs - 1.
 var num_lrs: u8 = 4;
 
-/// Detect how many list registers the host implements.
+/// True after `detectListRegs` has probed ICH_VTR_EL2 at least once.
+/// Prevents the probe from re-running on every per-VM `init`.
+var list_regs_detected: bool = false;
+
+/// Detect how many list registers the host implements by reading
+/// ICH_VTR_EL2.ListRegs (bits[4:0], the encoded count is ListRegs-1).
 ///
-/// ICH_VTR_EL2 is only accessible from EL2 (ARM ARM K.a §D23.2.73,
-/// access register encoding S3_4_C12_C11_1, "EL2 or higher"). The
-/// Zag kernel runs at EL1 — on hardware with EL2 it relies on the
-/// per-entry EL2 asm path to touch ICH_* directly while in EL2; on
-/// TCG hosts without EL2 the register simply does not exist. Either
-/// way, reading it from EL1 here would trap and hang.
-///
-/// We therefore default to the GICv3 architectural minimum of 4 list
-/// registers (GICv3 §11.2.5 "List registers"). This is also what the
-/// Pi 5 (Cortex-A76) implements. When the vmResume EL2 entry path
-/// lands, it will re-read ICH_VTR_EL2 at EL2 and cache the real value
-/// if it differs — for now 4 is a safe upper bound for scheduling.
+/// GICv3 §12.5.30 / ARM ARM D13.8.50: the register is accessible only
+/// at EL2 or higher (S3_4_C12_C11_1). Zag's world-switch dispatcher
+/// runs the guest-entry path at EL2 and the rest of the kernel's vGIC
+/// sysreg accessors (writeIchHcr, writeLr<n>, etc.) are also issued
+/// from that same EL2 window — so this probe is issued lazily on the
+/// first `init` call, which happens before any vCPU has entered a
+/// guest. If the probe traps (no EL2 or pre-init state), the caller
+/// falls back to the architectural minimum of 4 list registers
+/// (GICv3 §11.2.5 "List registers") which is also what the Pi 5
+/// Cortex-A76 and QEMU virt implement.
 fn detectListRegs() void {
-    num_lrs = 4;
+    if (list_regs_detected) return;
+    list_regs_detected = true;
+    const vtr: u64 = readIchVtrEl2();
+    const encoded: u8 = @intCast(vtr & 0x1F);
+    const count: u8 = encoded + 1;
+    if (count == 0 or count > MAX_LRS) {
+        // Sanity clamp: a zero/oversized read means the sysreg
+        // was unavailable or returned garbage; fall back to the
+        // spec minimum.
+        num_lrs = 4;
+        return;
+    }
+    num_lrs = count;
+}
+
+inline fn readIchVtrEl2() u64 {
+    var v: u64 = 0;
+    // S3_4_C12_C11_1 — ICH_VTR_EL2. GICv3 §12.5.30.
+    asm volatile ("mrs %[v], S3_4_C12_C11_1"
+        : [v] "=r" (v),
+    );
+    return v;
+}
+
+/// Public accessor for `num_lrs`, exposed so vcpu / test code can
+/// observe the detected list register count without reaching into
+/// the private module variable.
+pub fn listRegCount() u8 {
+    return num_lrs;
 }
 
 // ===========================================================================
@@ -696,8 +740,16 @@ pub fn prepareEntry(state: *VcpuState) void {
 
     refillLrsLocked(state, state.dist);
     writeLrs(state);
-    writeIchHcr(state.hcr);
+    writeIchAp0r0(state.ap0r0);
+    writeIchAp1r0(state.ap1r0);
     writeIchVmcr(state.vmcr);
+    // Load ICH_HCR_EL2 last with EN=1 so the virtual CPU interface
+    // begins delivering interrupts only after LRs / AP / VMCR are
+    // consistent. GICv3 §11.4 "Maintenance interrupts" notes that
+    // enabling the interface before LRs are populated can cause a
+    // spurious underflow MI. `state.hcr` always carries EN per the
+    // VcpuState default.
+    writeIchHcr(state.hcr | ICH_HCR_EN);
 }
 
 /// Called by the vCPU run loop immediately after `vm_hw.vmResume`
@@ -715,6 +767,8 @@ pub fn saveExit(state: *VcpuState) void {
     defer state.lock.unlockIrqRestore(flags);
 
     readLrs(state);
+    state.ap0r0 = readIchAp0r0();
+    state.ap1r0 = readIchAp1r0();
 
     // Walk the LR shadow looking for entries that have transitioned out
     // of active or pending state. The hardware updates the state field
@@ -764,6 +818,11 @@ pub fn saveExit(state: *VcpuState) void {
     // Clear NPIE; prepareEntry will re-set it if it cannot fit
     // everything. Avoids a tight maintenance IRQ storm.
     state.hcr &= ~ICH_HCR_NPIE;
+
+    // Disable the virtual CPU interface for the host-running window.
+    // While EN=0 the List Registers are not actively consulted and
+    // our shadow remains authoritative. GICv3 §12.5.7 ICH_HCR_EL2.En.
+    writeIchHcr(0);
 }
 
 fn clearActiveState(state: *VcpuState, intid: u32) void {
@@ -1145,6 +1204,40 @@ inline fn writeIchVmcr(value: u64) void {
         :
         : [v] "r" (value),
     );
+}
+
+/// ICH_AP0R0_EL2 — Group 0 Active Priorities Register 0.
+/// GICv3 §12.5.2 / ARM ARM D13.8.42. Encoding S3_4_C12_C8_0.
+inline fn writeIchAp0r0(value: u64) void {
+    asm volatile ("msr S3_4_C12_C8_0, %[v]"
+        :
+        : [v] "r" (value),
+    );
+}
+
+inline fn readIchAp0r0() u64 {
+    var v: u64 = undefined;
+    asm volatile ("mrs %[v], S3_4_C12_C8_0"
+        : [v] "=r" (v),
+    );
+    return v;
+}
+
+/// ICH_AP1R0_EL2 — Group 1 Active Priorities Register 0.
+/// GICv3 §12.5.5 / ARM ARM D13.8.46. Encoding S3_4_C12_C9_0.
+inline fn writeIchAp1r0(value: u64) void {
+    asm volatile ("msr S3_4_C12_C9_0, %[v]"
+        :
+        : [v] "r" (value),
+    );
+}
+
+inline fn readIchAp1r0() u64 {
+    var v: u64 = undefined;
+    asm volatile ("mrs %[v], S3_4_C12_C9_0"
+        : [v] "=r" (v),
+    );
+    return v;
 }
 
 inline fn readIchMisr() u64 {

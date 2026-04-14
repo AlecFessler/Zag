@@ -48,6 +48,7 @@ const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 const VgicVcpuState = kvm.vgic.VcpuState;
 const Vm = kvm.vm.Vm;
+const VtimerState = kvm.vtimer.VtimerState;
 
 pub const VCpuAllocator = SlabAllocator(VCpu, false, 0, 64, true);
 pub var allocator: std.mem.Allocator = undefined;
@@ -84,6 +85,11 @@ pub const VCpu = struct {
     /// after the VCpu allocation and before the vcpu thread is started.
     /// See `kernel/arch/aarch64/kvm/vgic.zig`.
     vgic_state: VgicVcpuState = .{},
+    /// Per-vCPU virtual timer save area (CNTVOFF_EL2 / CNTV_CTL_EL0 /
+    /// CNTV_CVAL_EL0 / CNTKCTL_EL1). Loaded into the hardware just
+    /// before world-switch entry and snapshotted back out on exit.
+    /// See `kernel/arch/aarch64/kvm/vtimer.zig`.
+    vtimer_state: VtimerState = .{},
     lock: SpinLock = .{},
 
     pub inline fn loadState(self: *const VCpu) VCpuState {
@@ -191,15 +197,25 @@ fn vcpuEntryPoint() void {
             continue;
         }
 
-        // TODO(vgic): tickInterruptControllers + deliverPendingInterrupts
-        // hook will go here once the vGIC integration commits land.
-
         // Enter guest mode. Revalidate the stage-2 VMID first: if a
         // rollover happened since the last run the cached `vm_obj.vmid`
         // is meaningless and `refresh` will hand out a fresh one under
         // the allocator lock before we build VTTBR_EL2.
         const vm_structures = vm_obj.arch_structures;
         vmid_mod.refresh(vm_obj);
+
+        // M5.1 (#127): program the virtual CPU interface from the
+        // per-vCPU shadow (list registers, AP0R/AP1R, ICH_HCR.EN,
+        // ICH_VMCR) so any pending virtual interrupts staged by
+        // `vgic.injectInterrupt` / `vgic.assertSpi` are delivered
+        // once the guest resumes. GICv3 §11 "Virtualization".
+        kvm.vgic.prepareEntry(&vcpu_obj.vgic_state);
+
+        // M5.2 (#128): load the per-vCPU virtual timer state.
+        // CNTVOFF_EL2 / CNTV_CTL_EL0 / CNTV_CVAL_EL0 / CNTKCTL_EL1.
+        // ARM ARM D13.11.
+        kvm.vtimer.loadGuest(&vcpu_obj.vtimer_state);
+
         const exit_info = vm_hw.vmResume(
             &vcpu_obj.guest_state,
             vm_structures,
@@ -209,6 +225,16 @@ fn vcpuEntryPoint() void {
             vm_obj.hcr_el2_override_set,
             vm_obj.hcr_el2_override_clear,
         );
+
+        // M5.2 save path: snapshot the virtual timer before any host
+        // code runs so a spurious CNTV expiry does not assert into
+        // the host IRQ line. Masks the timer on the way out.
+        kvm.vtimer.saveGuest(&vcpu_obj.vtimer_state);
+
+        // M5.1 save path: fold list registers + AP state back into
+        // the vCPU shadow, classify active→inactive transitions into
+        // the distributor bookkeeping, then clear ICH_HCR_EL2.EN.
+        kvm.vgic.saveExit(&vcpu_obj.vgic_state);
 
         vcpu_obj.last_exit_info = exit_info;
         kvm.exit_handler.handleExit(vcpu_obj, exit_info);
