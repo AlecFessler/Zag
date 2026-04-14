@@ -37,3 +37,4 @@ pub const regs = @import("regs.zig");
 pub const vcpu = @import("vcpu.zig");
 pub const vgic = @import("vgic.zig");
 pub const vm = @import("vm.zig");
+pub const vmid = @import("vmid.zig");

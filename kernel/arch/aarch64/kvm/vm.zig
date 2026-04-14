@@ -33,6 +33,7 @@ const sched = zag.sched.scheduler;
 const vcpu_mod = kvm.vcpu;
 const vgic_mod = kvm.vgic;
 const vm_hw = zag.arch.aarch64.vm;
+const vmid_mod = kvm.vmid;
 
 const GuestMemory = guest_memory.GuestMemory;
 const KernelObject = zag.perms.permissions.KernelObject;
@@ -78,6 +79,13 @@ pub const Vm = struct {
     /// `vgic.GICR_BASE + i*GICR_STRIDE..+GICR_STRIDE`.
     /// See `kernel/arch/aarch64/kvm/vgic.zig`.
     vgic: Vgic = .{},
+    /// Stage-2 VMID (8 bits, baseline ARMv8.0) and the allocator generation
+    /// at which it was handed out. Managed exclusively by
+    /// `kernel/arch/aarch64/kvm/vmid.zig`; the world-switch entry path calls
+    /// `vmid.refresh(self)` to revalidate the pair before programming
+    /// `VTTBR_EL2.VMID`. See ARM ARM D5.10 "VMID and TLB maintenance".
+    vmid: u8 = 0,
+    vmid_generation: u64 = 0,
 
     /// Destroy this VM: kill all vCPU threads, free guest memory and
     /// arch structures, clear the owner's vm pointer.
@@ -94,6 +102,12 @@ pub const Vm = struct {
         if (self.arch_structures.addr != 0) {
             vm_hw.vmFreeStructures(self.arch_structures);
         }
+
+        // Drop the VMID. The allocator does not return the id to a free
+        // list (see vmid.zig) — a rollover is the reclamation mechanism —
+        // but we still clear the fields so any stray use after destroy
+        // goes through the slow path and takes a fresh id.
+        vmid_mod.release(self);
 
         self.owner.vm = null;
 
@@ -232,6 +246,12 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
         .vm_id = @atomicRmw(u64, &vm_id_counter, .Add, 1, .monotonic),
         .arch_structures = arch_structures,
     };
+
+    // Hand out a stage-2 VMID. The allocator is idempotent under rollover —
+    // every world-switch entry re-validates via `vmid.refresh` — but we
+    // still seed the pair eagerly so the first `refresh` is a cheap
+    // generation compare rather than a full allocation.
+    vmid_mod.allocate(vm_obj);
 
     // Initialize the in-kernel vGIC distributor for this VM. The vGIC
     // module owns its own state machine; we just hand it a pointer.
