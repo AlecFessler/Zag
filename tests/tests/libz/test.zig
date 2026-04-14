@@ -153,6 +153,17 @@ pub fn skip(name: []const u8, reason: []const u8) void {
 /// (typically `vm_create(1, &policy)`) and funnelling its return code
 /// through this helper before asserting behaviour that depends on a live
 /// VM object.
+/// Compatibility shim used by older §4.2 tests that predate the
+/// unified `skipIfNoVm` probe. Now a no-op: the real decision is made
+/// by `skipIfNoVm(cr)` after the first VM syscall returns, which works
+/// on both x86_64 (EPT always available under KVM) and aarch64 (EL2
+/// available under `-M virt,virtualization=on`, reported via
+/// `vmSupported()` → E_NODEV otherwise). Kept so existing test
+/// sources still compile without per-file edits.
+pub fn skipNoAarch64Vm(name: []const u8) void {
+    _ = name;
+}
+
 pub fn skipIfNoVm(name: []const u8, rc: i64) void {
     if (rc == syscall.E_NODEV or rc == syscall.E_NORES) {
         skip(name, "VM unavailable (E_NODEV/E_NORES)");

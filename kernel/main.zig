@@ -75,6 +75,16 @@ fn kMain(boot_info: *BootInfo) !void {
     try arch.parseFirmwareTables(boot_info.xsdp_phys);
     arch.earlyDebugChar('J');
     arch.vmInit();
+    // On aarch64, propagate the UEFI bootloader's "I arrived at EL2"
+    // flag into the arch-layer hyp stub gate. The bootloader is the
+    // only code path that can observe CurrentEL under UEFI (firmware
+    // drops privilege as it likes once we're past ExitBootServices)
+    // and was the one that installed the minimal hyp vector table at
+    // VBAR_EL2 before its ERET-to-EL1, so it already ensured the
+    // invariant vmSupported() checks. See bootloader/aarch64_el2_drop.zig.
+    if (@import("builtin").cpu.arch == .aarch64 and boot_info.arrived_at_el2 != 0) {
+        zag.arch.aarch64.vm.hyp_stub_installed = true;
+    }
     arch.earlyDebugChar('K');
     arch.pmuInit();
     arch.earlyDebugChar('L');
@@ -98,7 +108,19 @@ fn kMain(boot_info: *BootInfo) !void {
     arch.earlyDebugChar('S');
     sched.perCoreInit();
     arch.earlyDebugChar('U');
-    if (@import("builtin").cpu.arch == .aarch64) {
+    // aarch64 world-switch smoke test. Only runnable under the
+    // direct-kernel boot path today, because that is the one mode
+    // where the kernel owns VBAR_EL2 (installed from boot/start.S
+    // before the EL2→EL1 ERET). The UEFI-at-EL2 path leaves VBAR_EL2
+    // pointing at the bootloader's minimal hyp stub (see
+    // `bootloader/aarch64_el2_drop.zig`), which only knows how to
+    // bare-eret a lower-EL sync exception — so `hvc #1` for VCPU_RUN
+    // would return to the caller without performing a world switch
+    // and the smoke test would hang in `vmResume` waiting for an
+    // exit reason that never gets written. Gate on direct_kernel
+    // until the UEFI path also installs a full kernel hyp dispatcher
+    // at VBAR_EL2 (tracked separately).
+    if (@import("builtin").cpu.arch == .aarch64 and zag.build_options.direct_kernel) {
         @import("arch/aarch64/kvm/smoke.zig").runVcpuNopSmoke();
     }
     try kprof_log.init();

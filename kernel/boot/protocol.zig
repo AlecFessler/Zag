@@ -46,6 +46,15 @@ pub const BootInfo = extern struct {
     kaslr_slide: u64,
     mmap: MMap,
     framebuffer: Framebuffer,
+    /// Set to 1 by the aarch64 UEFI bootloader when AAVMF handed off at
+    /// EL2 (i.e. QEMU was run with `-M virt,virtualization=on`) and the
+    /// bootloader successfully installed an EL2 hyp stub before ERETing
+    /// to EL1. Read by the aarch64 kernel entry path to set
+    /// `vm.hyp_stub_installed`, unlocking `vmSupported()`. 0 otherwise
+    /// (x86 boots, aarch64 UEFI without virtualization=on, direct-kernel
+    /// boot which uses its own hyp stub install path).
+    arrived_at_el2: u8 = 0,
+    _pad_ael2: [7]u8 = .{ 0, 0, 0, 0, 0, 0, 0 },
 };
 
 pub const MMap = extern struct {

@@ -1,3 +1,5 @@
+const builtin = @import("builtin");
+const el2_drop = @import("aarch64_el2_drop.zig");
 const fs_mod = @import("fs.zig");
 const page_allocator = @import("page_allocator.zig");
 const std = @import("std");
@@ -137,6 +139,30 @@ const dbg = struct {
 };
 
 pub fn main() uefi.Status {
+    // On aarch64 + `-M virt,virtualization=on`, AAVMF hands off to us
+    // at EL2. The Zag bootloader (and kernel) are written against EL1
+    // semantics — in particular `arch.setKernelAddrSpace` writes
+    // TTBR1_EL1, which is inert while the CPU uses the EL2 translation
+    // regime. Drop to EL1 NOW so every subsequent TTBR/TCR/SCTLR/MAIR
+    // write lands on the active regime, matching the plain `-M virt`
+    // path where UEFI was at EL1 to begin with. We must do this before
+    // the first `setKernelAddrSpace` call on line ~190, but firmware
+    // boot services keep working at EL1 because they are plain C code
+    // operating on identity-mapped memory. `dropToEl1` mirrors TTBR0/
+    // TCR/MAIR/SCTLR/VBAR from EL2 into EL1 so the MMU state the
+    // firmware set up stays exactly in force after the ERET.
+    //
+    // `arrived_at_el2` is cached here so the BootInfo flag that tells
+    // the kernel to set `vm.hyp_stub_installed = true` can be filled
+    // in later without re-reading CurrentEL (which would always be 1
+    // after the drop).
+    const arrived_at_el2: bool = blk: {
+        if (builtin.cpu.arch != .aarch64) break :blk false;
+        if (el2_drop.currentEl() != 2) break :blk false;
+        el2_drop.dropToEl1();
+        break :blk true;
+    };
+
     const boot_services: *uefi.tables.BootServices = uefi.system_table.boot_services orelse return .aborted;
     uefi.system_table.con_out.?.clearScreen() catch return .aborted;
     puts(dbg.boot_start);
@@ -394,6 +420,7 @@ pub fn main() uefi.Status {
     boot_info.stack_top = aligned_stack_top_virt;
     boot_info.framebuffer = framebuffer;
     boot_info.kaslr_slide = kaslr_slide;
+    boot_info.arrived_at_el2 = if (arrived_at_el2) 1 else 0;
 
     // Clean boot_info (and the surrounding stack page that holds it)
     // to the Point of Coherency. After the handoff the kernel reads

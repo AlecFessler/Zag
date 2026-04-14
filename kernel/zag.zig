@@ -1,5 +1,6 @@
 pub const arch = @import("arch/arch.zig");
 pub const boot = @import("boot/boot.zig");
+pub const build_options = @import("build_options");
 pub const devices = @import("devices/devices.zig");
 pub const kprof = @import("kprof");
 pub const memory = @import("memory/memory.zig");

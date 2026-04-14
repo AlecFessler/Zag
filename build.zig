@@ -137,7 +137,9 @@ pub fn build(b: *std.Build) void {
 
     const build_opts = b.addOptions();
     build_opts.addOption([]const u8, "kernel_profile", kernel_profile);
-    zag_mod.addImport("build_options", build_opts.createModule());
+    build_opts.addOption(bool, "direct_kernel", direct_kernel);
+    const build_opts_mod = build_opts.createModule();
+    zag_mod.addImport("build_options", build_opts_mod);
 
     const kprof_mod = b.createModule(.{
         .root_source_file = b.path("kernel/kprof/kprof.zig"),
@@ -151,7 +153,7 @@ pub fn build(b: *std.Build) void {
     kprof_mod.omit_frame_pointer = false;
     kprof_mod.red_zone = false;
     kprof_mod.addImport("zag", zag_mod);
-    kprof_mod.addImport("build_options", build_opts.createModule());
+    kprof_mod.addImport("build_options", build_opts_mod);
     zag_mod.addImport("kprof", kprof_mod);
 
     // ── SMP trampoline (x86-only; aarch64 uses PSCI CPU_ON) ────────────

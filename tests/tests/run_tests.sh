@@ -28,7 +28,7 @@ ARCH="${ARCH:-x64}"
 DIRECT_KERNEL=0
 KERNEL_EXTRA_FLAGS=""
 if [ "$ARCH" = "arm" ]; then
-    QEMU_CMD="qemu-system-aarch64 -M virt,gic-version=3 -m 1G -bios /usr/share/AAVMF/AAVMF_CODE.fd -serial stdio -display none -no-reboot -machine accel=tcg -cpu cortex-a72 -smp cores=4"
+    QEMU_CMD="qemu-system-aarch64 -M virt,virtualization=on,gic-version=3 -m 1G -bios /usr/share/AAVMF/AAVMF_CODE.fd -serial stdio -display none -no-reboot -machine accel=tcg -cpu cortex-a72 -smp cores=4"
     BUILD_ARCH_FLAG="-Darch=arm"
     LOADER="BOOTAA64.EFI"
 elif [ "$ARCH" = "arm-direct" ]; then
