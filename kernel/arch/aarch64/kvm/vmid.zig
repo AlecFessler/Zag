@@ -119,5 +119,5 @@ fn flushStage2Tlb() void {
         \\tlbi vmalls12e1is
         \\dsb ish
         \\isb
-        ::: "memory");
+        ::: .{ .memory = true });
 }

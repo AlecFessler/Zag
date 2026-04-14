@@ -752,18 +752,118 @@ comptime {
     std.debug.assert(@offsetOf(HostSave, "far_el1") == 0xE8);
 }
 
-// HCR_EL2 bits (ARM ARM D13.2.46).
-pub const HCR_EL2_VM: u64 = 1 << 0; // stage-2 enable
-pub const HCR_EL2_FMO: u64 = 1 << 3; // route vFIQ
-pub const HCR_EL2_IMO: u64 = 1 << 4; // route vIRQ
-pub const HCR_EL2_AMO: u64 = 1 << 5; // route vSError
-pub const HCR_EL2_RW: u64 = 1 << 31; // EL1 is AArch64
+// HCR_EL2 bits (ARM ARM D13.2.46, "HCR_EL2, Hypervisor Configuration Register").
+// Only the bits this file actually touches are named; the rest stay 0 unless
+// a future change explicitly opts them in.
+pub const HCR_EL2_VM: u64 = 1 << 0; // stage-2 translation enable
+pub const HCR_EL2_SWIO: u64 = 1 << 1; // set/way IO is set-to-one (RES1 on modern impls)
+pub const HCR_EL2_FMO: u64 = 1 << 3; // route physical FIQ to EL2 / enable vFIQ
+pub const HCR_EL2_IMO: u64 = 1 << 4; // route physical IRQ to EL2 / enable vIRQ
+pub const HCR_EL2_AMO: u64 = 1 << 5; // route physical SError to EL2 / enable vSError
+pub const HCR_EL2_VF: u64 = 1 << 6; // virtual FIQ pending (set by vgic inject)
+pub const HCR_EL2_VI: u64 = 1 << 7; // virtual IRQ pending (set by vgic inject)
+pub const HCR_EL2_TWI: u64 = 1 << 13; // trap WFI from EL1/EL0 to EL2
+pub const HCR_EL2_TWE: u64 = 1 << 14; // trap WFE from EL1/EL0 to EL2
+pub const HCR_EL2_TID0: u64 = 1 << 15; // trap ID group 0 reads (AArch32 feature ids)
+pub const HCR_EL2_TID1: u64 = 1 << 16; // trap ID group 1 reads
+pub const HCR_EL2_TID2: u64 = 1 << 17; // trap ID group 2 reads (CTR/DCZID/CCSIDR...)
+pub const HCR_EL2_TID3: u64 = 1 << 18; // trap ID group 3 reads (ID_AA64*_EL1)
+pub const HCR_EL2_TSC: u64 = 1 << 19; // trap SMC from EL1 to EL2
+pub const HCR_EL2_TIDCP: u64 = 1 << 20; // trap impl-defined sysregs at EL1
+pub const HCR_EL2_TACR: u64 = 1 << 21; // trap ACTLR_EL1 access
+pub const HCR_EL2_TTLB: u64 = 1 << 25; // trap TLB maintenance (NOT set — too slow)
+pub const HCR_EL2_TVM: u64 = 1 << 26; // trap VM sysregs writes (NOT set — too slow)
+pub const HCR_EL2_TGE: u64 = 1 << 27; // "host EL2" — MUST stay 0 for an EL1 guest
+pub const HCR_EL2_TRVM: u64 = 1 << 30; // trap VM sysregs reads (NOT set — too slow)
+pub const HCR_EL2_RW: u64 = 1 << 31; // EL1 execution state = AArch64 (not AArch32)
 
-/// VTCR_EL2 value for our stage-2 config: 4K granule, T0SZ=34 (1 GiB
-/// IPA), SL0=00 (start at level 2), shareability/cacheability
-/// inner-shareable WB, PS=40-bit output. ARM ARM D13.2.150.
+/// Default HCR_EL2 mask for a freshly constructed AArch64 Linux guest.
+///
+/// Rationale per bit (ARM ARM D13.2.46):
+///   VM    : stage-2 translation on — without this, guest PAs pass straight
+///           through to host PA and the whole IPA abstraction collapses.
+///   SWIO  : set/way IO treated as inner-shareable. Linux issues set/way
+///           maintenance during early boot; letting those escape to the
+///           host would evict host lines. RES1 on ARMv8.0+.
+///   FMO/IMO/AMO : physical FIQ/IRQ/SError route to EL2 and the matching
+///           virtual {F,I,SE} delivery is enabled. Required for any vGIC
+///           or vSError injection to be visible to the guest.
+///   TWI   : trap WFI so guest halts exit cleanly into the run loop.
+///   TWE   : trap WFE — optional, but keeps spinlock-loop stalls observable
+///           to the VMM instead of burning guest TIME.
+///   TID0/1/2/3 : trap ID register reads. Needed so the VmPolicy ID register
+///           response table (see `VmPolicy.id_reg_responses`) can virtualize
+///           ID_AA64*_EL1 per-VM rather than leaking the raw host features.
+///   TSC   : trap SMC so guest SMC calls exit to the hyp and are decoded by
+///           the SMCCC shim, not silently forwarded to EL3.
+///   TIDCP : trap implementation-defined sysregs at EL1. Belt-and-braces
+///           against CPU-errata knobs the guest has no business poking.
+///   TACR  : trap ACTLR_EL1 (implementation-defined auxiliary control).
+///   RW    : lower EL (EL1/EL0) runs in AArch64. We do not support AArch32
+///           guests in this port.
+///
+/// Bits deliberately left zero:
+///   TGE   : if TGE=1, EL1 exceptions get forwarded to EL2 as "host EL2"
+///           routing, which breaks every EL1 guest. Linux guests MUST see
+///           TGE=0.
+///   TVM/TRVM : trapping the VM sysreg family (SCTLR/TTBR*/TCR/MAIR/...) on
+///           every guest access is a performance catastrophe — Linux
+///           programs SCTLR_EL1 dozens of times during early boot. We let
+///           the guest manage its own stage-1 state and rely on stage-2
+///           containment.
+///   TTLB  : trapping TLB maintenance is likewise too expensive; stage-2
+///           VMID tagging already isolates guest TLB entries from the
+///           host (ARM ARM D5.10.1).
+///   VI/VF : cleared at entry time. `vgic.prepareEntry` OR's them in when
+///           a virtual interrupt is pending; clearing them here gives the
+///           vgic a known starting point each run.
+///   TLOR  : not set — LORegions are not emulated.
+///   HA/HD : not set in VTCR_EL2 either; hw access/dirty flag updates are
+///           a later-wave optimisation.
+pub const HCR_EL2_LINUX_GUEST: u64 = HCR_EL2_VM |
+    HCR_EL2_SWIO |
+    HCR_EL2_FMO |
+    HCR_EL2_IMO |
+    HCR_EL2_AMO |
+    HCR_EL2_TWI |
+    HCR_EL2_TWE |
+    HCR_EL2_TID0 |
+    HCR_EL2_TID1 |
+    HCR_EL2_TID2 |
+    HCR_EL2_TID3 |
+    HCR_EL2_TSC |
+    HCR_EL2_TIDCP |
+    HCR_EL2_TACR |
+    HCR_EL2_RW;
+
+/// VTCR_EL2 value for our stage-2 config (ARM ARM D13.2.150).
+///
+/// Field map:
+///   T0SZ[5:0]   : input address size = 64 - T0SZ. We use STAGE2_T0SZ=34
+///                 → 30-bit (1 GiB) IPA. The stage-2 walker in this file
+///                 is hardcoded to a 2-level walk (level 2 root → level 3
+///                 leaf) that matches exactly this (T0SZ,SL0) pair; see
+///                 the block comment above `stage2L2Idx`. A future wave
+///                 will widen this to a 4-level walker and derive T0SZ
+///                 from ID_AA64MMFR0_EL1.PARange at init time.
+///   SL0[7:6]    : starting level. With 4K granule + T0SZ in [25..33] a
+///                 value of 0 starts the walk at level 2 (1 GiB region,
+///                 level-2 root, level-3 leaves). ARM ARM D8-2540 Table.
+///   IRGN0[9:8]  : inner cacheability of stage-2 table walks = 0b01
+///                 (Normal memory, Inner Write-Back Write-Allocate
+///                 Cacheable).
+///   ORGN0[11:10]: outer cacheability, same encoding.
+///   SH0[13:12]  : shareability = 0b11 (Inner Shareable). Mandatory for
+///                 SMP-coherent stage-2 walks.
+///   TG0[15:14]  : granule size = 0b00 (4 KiB) — matches the descriptor
+///                 layout used by `mapGuestPage`.
+///   PS[18:16]   : physical address size for the stage-2 output.
+///                 0b010 = 40 bits, the baseline assumed by the port.
+///   HA/HD       : left 0. Hardware access/dirty flag update is a later
+///                 optimisation that also needs stage-2 descriptor format
+///                 changes to land first.
 pub fn vtcrEl2Value() u64 {
-    const t0sz: u64 = STAGE2_T0SZ; // 34
+    const t0sz: u64 = STAGE2_T0SZ; // 34 → 1 GiB IPA (matches 2-level walker)
     const sl0: u64 = 0; // start at level 2 (w/ 4K, T0SZ=34)
     const irgn0: u64 = 0b01; // Normal WB WA cacheable
     const orgn0: u64 = 0b01;
@@ -840,6 +940,7 @@ pub fn vmResume(
     vm_structures: PAddr,
     guest_fxsave: *align(16) FxsaveArea,
     arch_scratch: *ArchScratch,
+    vmid_value: u8,
 ) VmExitInfo {
     _ = guest_fxsave; // FPSIMD save/restore TODO.
 
@@ -855,9 +956,17 @@ pub fn vmResume(
     ctx.guest_state_pa = gs_pa.addr;
     ctx.host_save_pa = hs_pa.addr;
     ctx.stage2_root_pa = vm_structures.addr;
-    ctx.vttbr_el2 = vm_structures.addr; // VMID = 0 (TODO: real VMID alloc).
+    // VTTBR_EL2 layout (ARM ARM D13.2.151):
+    //   [63:48] VMID  — stage-2 TLB tag, managed by kvm/vmid.zig
+    //   [47:1]  BADDR — stage-2 root PA (bits [47:x], with `x` dictated
+    //                   by VTCR_EL2.T0SZ+SL0). For T0SZ=34 SL0=0 the
+    //                   root is a single 4 KiB table, so bits [11:1] of
+    //                   BADDR are RES0 and our page-aligned PA fits
+    //                   directly.
+    //   [0]     CnP   — 0; we don't claim common-not-private.
+    ctx.vttbr_el2 = (@as(u64, vmid_value) << 48) | vm_structures.addr;
     ctx.vtcr_el2 = vtcrEl2Value();
-    ctx.hcr_el2 = HCR_EL2_VM | HCR_EL2_RW | HCR_EL2_IMO | HCR_EL2_FMO | HCR_EL2_AMO;
+    ctx.hcr_el2 = HCR_EL2_LINUX_GUEST;
 
     _ = hypCall(.vcpu_run, ctx_pa.addr);
 

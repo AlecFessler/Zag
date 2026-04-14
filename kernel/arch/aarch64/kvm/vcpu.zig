@@ -38,6 +38,7 @@ const stack_mod = zag.memory.stack;
 const thread_mod = zag.sched.thread;
 const vm_hw = zag.arch.aarch64.vm;
 const vm_mod = kvm.vm;
+const vmid_mod = kvm.vmid;
 
 const PAddr = zag.memory.address.PAddr;
 const Process = zag.proc.process.Process;
@@ -193,9 +194,19 @@ fn vcpuEntryPoint() void {
         // TODO(vgic): tickInterruptControllers + deliverPendingInterrupts
         // hook will go here once the vGIC integration commits land.
 
-        // Enter guest mode.
+        // Enter guest mode. Revalidate the stage-2 VMID first: if a
+        // rollover happened since the last run the cached `vm_obj.vmid`
+        // is meaningless and `refresh` will hand out a fresh one under
+        // the allocator lock before we build VTTBR_EL2.
         const vm_structures = vm_obj.arch_structures;
-        const exit_info = vm_hw.vmResume(&vcpu_obj.guest_state, vm_structures, &vcpu_obj.guest_fxsave, &vcpu_obj.arch_scratch);
+        vmid_mod.refresh(vm_obj);
+        const exit_info = vm_hw.vmResume(
+            &vcpu_obj.guest_state,
+            vm_structures,
+            &vcpu_obj.guest_fxsave,
+            &vcpu_obj.arch_scratch,
+            vm_obj.vmid,
+        );
 
         vcpu_obj.last_exit_info = exit_info;
         kvm.exit_handler.handleExit(vcpu_obj, exit_info);
