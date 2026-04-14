@@ -22,7 +22,7 @@ pub fn main(_: u64) void {
     var reply: syscall.IpcMessage = .{};
     _ = syscall.ipc_call(child_handle, &.{}, &reply);
 
-    var fault_buf: [256]u8 align(8) = undefined;
+    var fault_buf: [syscall.fault_msg_size]u8 align(8) = undefined;
     const token = syscall.fault_recv(@intFromPtr(&fault_buf), 1);
     if (token < 0) {
         t.failWithVal("§4.1.12 fault_recv", 0, token);

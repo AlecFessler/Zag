@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const children = @import("embedded_children");
 const lib = @import("lib");
 
@@ -23,7 +24,17 @@ pub fn main(pv: u64) void {
         if (view[slot].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS) break;
         syscall.thread_yield();
     }
-    if (view[slot].processCrashReason() == .protection_fault) {
+    // aarch64 delivers MRS of an EL1-only system register from EL0 via
+    // the same EC=0x00 ("unknown") class as UDF, so it lands as
+    // illegal_instruction rather than protection_fault. Both are
+    // observable "kernel killed the process for executing something it
+    // shouldn't have" — the spec reason name differs by arch.
+    const expected: perm_view.CrashReason = switch (builtin.cpu.arch) {
+        .x86_64 => .protection_fault,
+        .aarch64 => .illegal_instruction,
+        else => unreachable,
+    };
+    if (view[slot].processCrashReason() == expected) {
         t.pass("§6.9");
     } else {
         t.fail("§6.9");

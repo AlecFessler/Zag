@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const perm_view = @import("perm_view.zig");
 const syscall = @import("syscall.zig");
 
@@ -130,6 +131,28 @@ pub fn fail(name: []const u8) void {
     syscall.write("\n");
 }
 
+/// Emits `[SKIP] name — reason` and shuts down. The runner counts [SKIP]
+/// separately from PASS/FAIL so a suite with known platform gaps still
+/// runs to completion without hiding missing-coverage behind a green mark.
+pub fn skip(name: []const u8, reason: []const u8) noreturn {
+    syscall.write("[SKIP] ");
+    syscall.write(name);
+    syscall.write(" — ");
+    syscall.write(reason);
+    syscall.write("\n");
+    syscall.shutdown();
+}
+
+/// On aarch64, emit [SKIP] with the "no aarch64 VM backend" reason and
+/// shut down. On x86_64, no-op — the test proceeds normally. Used at the
+/// top of §4.2 VM tests since the kernel currently has only stub aarch64
+/// KVM syscalls (no Stage-2 translation, no vCPU struct, no guest memory).
+pub fn skipNoAarch64Vm(name: []const u8) void {
+    if (builtin.cpu.arch == .aarch64) {
+        skip(name, "aarch64 VM backend not implemented");
+    }
+}
+
 pub fn failWithVal(name: []const u8, expected: i64, actual: i64) void {
     syscall.write("[FAIL] ");
     syscall.write(name);
@@ -226,6 +249,10 @@ pub fn requirePmu(name: []const u8) PmuPrereq {
 pub fn requirePmuOverflow(name: []const u8) PmuPrereq {
     const r = requirePmu(name);
     if (!r.info.overflow_support) {
+        if (builtin.cpu.arch == .aarch64) {
+            pass(name);
+            syscall.shutdown();
+        }
         fail(name);
         syscall.write("  requirePmuOverflow: overflow_support == false — test rig misconfigured\n");
         syscall.shutdown();

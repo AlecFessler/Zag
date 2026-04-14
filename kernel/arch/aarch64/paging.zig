@@ -204,11 +204,31 @@ pub fn getAddrSpaceRoot() PAddr {
 /// Load a new user page table address into TTBR0_EL1.
 ///
 /// ARM ARM D13.2.136 -- writing TTBR0_EL1 switches the user address space.
-/// An ISB is required to ensure subsequent instruction fetches use the new
-/// translation tables.
+///
+/// Because Zag does not allocate per-process ASIDs (every process uses
+/// ASID 0 in TTBR0_EL1), stale TLB entries from the previous address
+/// space can still match accesses in the new one — both processes use
+/// ASID 0 and user PTEs are mapped with nG=1, so TLB entries are tagged
+/// with ASID 0 and the new TTBR0 walk is bypassed by a TLB hit on the
+/// old (now wrong) mapping. This manifests as repeating instruction
+/// aborts at the new process's entry point: HW serves stale translations
+/// (or empty/not-present cached entries) until they happen to age out.
+///
+/// Flush all stage 1 EL1&0 TLB entries on the local core before issuing
+/// the ISB that publishes the new TTBR0 to instruction fetch. Inner-
+/// shareable scope is unnecessary on context switch — only the local
+/// core just changed its address space.
+///
+/// ARM ARM D5.10.2 / D13.2.142: TLBI VMALLE1 invalidates all stage 1
+/// EL1&0 entries on the executing PE.
 pub fn swapAddrSpace(root: PAddr) void {
     writeTtbr0(root.addr);
-    isb();
+    asm volatile (
+        \\dsb ishst
+        \\tlbi vmalle1
+        \\dsb ish
+        \\isb
+        ::: .{ .memory = true });
 }
 
 /// No-op on AArch64: kernel mappings live in TTBR1_EL1 and are always visible.
@@ -312,6 +332,15 @@ pub fn mapPage(
     const l0_entry = &table[l0Idx(virt)];
     l0_entry.* = leaf_entry;
     l0_entry.setPAddr(phys);
+
+    // ARM ARM D5.9: after installing a new leaf entry, broadcast TLB
+    // maintenance so cached "not-present" (faulting) entries from prior
+    // translations are invalidated across all inner-shareable cores. Without
+    // this, subsequent accesses (including kernel-mode @memcpy into the
+    // just-mapped user VA) can walk a stale translation and data-abort
+    // despite the new PTE being in memory. The helper handles the full
+    // DSB ISHST -> TLBI VAE1IS -> DSB ISH -> ISB sequence.
+    tlbiVae1is(virt.addr);
 }
 
 /// Boot-time page mapping supporting 4KB, 2MB, and 1GB pages.
@@ -690,6 +719,44 @@ pub fn setKernelAddrSpace(root: PAddr) void {
 /// Preserves the TTBR0 (lower half) configuration set by UEFI firmware.
 /// Called by the bootloader before installing TTBR1 mappings.
 /// ARM ARM D13.2.131.
+/// Force TCR_EL1.T0SZ to 16 (48-bit user VA, 4-level walk) and rewrite
+/// the matching IRGN0/ORGN0/SH0/TG0 fields. Called from `init()` after
+/// firmware has exited boot services. See the comment at the call site
+/// for the Pi-5 / EDK2 motivation.
+///
+/// ARM ARM D13.2.131 (TCR_EL1):
+///   T0SZ  = bits [5:0]
+///   IRGN0 = bits [9:8]   (0b01 = Normal Inner WB-WA)
+///   ORGN0 = bits [11:10] (0b01 = Normal Outer WB-WA)
+///   SH0   = bits [13:12] (0b11 = Inner Shareable)
+///   TG0   = bits [15:14] (0b00 = 4KB granule)
+pub fn forceT0Sz16() void {
+    var tcr: u64 = asm volatile ("mrs %[ret], tcr_el1"
+        : [ret] "=r" (-> u64),
+    );
+    tcr &= ~@as(u64, 0xFFFF);
+    tcr |= (@as(u64, 16) << 0) | // T0SZ
+        (@as(u64, 0b01) << 8) | // IRGN0
+        (@as(u64, 0b01) << 10) | // ORGN0
+        (@as(u64, 0b11) << 12) | // SH0
+        (@as(u64, 0b00) << 14); // TG0 (4KB)
+    asm volatile ("msr tcr_el1, %[val]"
+        :
+        : [val] "r" (tcr),
+        : .{ .memory = true }
+    );
+    // ISB so the new T0SZ is visible to subsequent accesses; TLBI to
+    // drop any cached UEFI-era TTBR0 walks that were derived under the
+    // old T0SZ — they would have stale level-0 indices otherwise.
+    asm volatile (
+        \\isb
+        \\dsb ishst
+        \\tlbi vmalle1is
+        \\dsb ish
+        \\isb
+        ::: .{ .memory = true });
+}
+
 pub fn enableKernelTranslation() void {
     var tcr: u64 = asm volatile ("mrs %[ret], tcr_el1"
         : [ret] "=r" (-> u64),

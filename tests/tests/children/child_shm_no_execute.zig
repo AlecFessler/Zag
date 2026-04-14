@@ -1,12 +1,21 @@
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const perms = lib.perms;
 const pv = lib.perm_view;
 const syscall = lib.syscall;
 
-/// Receives a read+write (no execute) SHM via cap transfer. Writes a RET
-/// byte into the mapping and jumps to it, triggering invalid_execute on
-/// the SHM region.
+/// Arch-specific `ret` encoding. x86: `0xC3` (1 byte near RET).
+/// aarch64: `0xD65F03C0` (4 bytes, little-endian) — `ret` to x30.
+const RET_BYTES: []const u8 = switch (builtin.cpu.arch) {
+    .x86_64 => &[_]u8{0xC3},
+    .aarch64 => &[_]u8{ 0xC0, 0x03, 0x5F, 0xD6 },
+    else => @compileError("unsupported arch"),
+};
+
+/// Receives a read+write (no execute) SHM via cap transfer. Writes an
+/// arch-appropriate `ret` encoding into the mapping and jumps to it,
+/// triggering invalid_execute on the SHM region.
 pub fn main(perm_view_addr: u64) void {
     var msg: syscall.IpcMessage = .{};
     if (syscall.ipc_recv(true, &msg) != 0) return;
@@ -33,8 +42,8 @@ pub fn main(perm_view_addr: u64) void {
     if (vm_result.val < 0) return;
     if (syscall.mem_shm_map(shm_handle, @intCast(vm_result.val), 0) != 0) return;
 
-    const ptr: *volatile u8 = @ptrFromInt(vm_result.val2);
-    ptr.* = 0xC3; // RET
+    const dest: [*]volatile u8 = @ptrFromInt(vm_result.val2);
+    for (RET_BYTES, 0..) |byte, i| dest[i] = byte;
     const func: *const fn () void = @ptrFromInt(vm_result.val2);
     func();
 }

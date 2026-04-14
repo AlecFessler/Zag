@@ -8,6 +8,7 @@ const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
 const kprof = zag.kprof.trace_id;
+const kprof_sample = zag.kprof.sample;
 const mmio_decode = zag.arch.x64.mmio_decode;
 const scheduler = zag.sched.scheduler;
 
@@ -181,7 +182,10 @@ fn exceptionHandler(ctx: *cpu.Context) void {
     switch (exception) {
         .double_fault => @panic("Double fault"),
         .machine_check => @panic("Machine check exception"),
-        .non_maskable_interrupt => @panic("NMI"),
+        .non_maskable_interrupt => {
+            if (kprof_sample.onNmi(ctx.rip, ctx.regs.rbp)) return;
+            @panic("NMI");
+        },
         .general_protection_fault => {
             arch.print("GPF at rip=0x{x} err=0x{x}\n", .{ ctx.rip, ctx.err_code });
             @panic("General protection fault");

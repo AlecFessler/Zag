@@ -7,6 +7,7 @@ const t = lib.testing;
 var buf: [4096]u8 align(8) = .{0} ** 4096;
 
 pub fn main(_: u64) void {
+    t.skipNoAarch64Vm("§4.2.1");
     // Process has no VM. Use a bogus handle. All VM handle syscalls should return E_BADCAP.
     var all_pass = true;
     const bad_handle: u64 = 0xDEAD;

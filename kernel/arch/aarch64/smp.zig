@@ -538,6 +538,22 @@ fn secondaryEntry() callconv(.naked) noreturn {
         \\mov w11, #0x63             // 'c' — sysregs primed
         \\str w11, [x10]
         \\
+        // Enable Advanced SIMD / FP at EL0 + EL1 (CPACR_EL1.FPEN = 0b11).
+        // PSCI CPU_ON hands the secondary off with CPACR_EL1 at its reset
+        // value (on real ARM hardware, this traps all FP/SIMD). LLVM emits
+        // q-register loads for ordinary 16-byte struct copies inside Zig
+        // code (e.g. reading an `?u64` global), so the first Zig call
+        // after `br x7` would otherwise hit a silent EL1→EL1 trap the
+        // kernel has no handler for. Setting FPEN here — while we are
+        // still in the MMU-off asm trampoline — ensures every kernel-VA
+        // instruction on the secondary can use FP/SIMD freely, matching
+        // the BSP (which inherits FPEN from UEFI firmware).
+        // ARM ARM D13.2.30 — CPACR_EL1, bits [21:20].
+        \\mrs x12, cpacr_el1
+        \\orr x12, x12, #(3 << 20)
+        \\msr cpacr_el1, x12
+        \\isb
+        \\
         // Enable MMU. SCTLR_EL1 from the BSP already has M|C|I set.
         // The identity mapping in TTBR0 ensures the next instruction
         // fetch succeeds at the same PA after translation is enabled.

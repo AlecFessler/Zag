@@ -5,6 +5,7 @@ const syscall = lib.syscall;
 const t = lib.testing;
 
 pub fn main(_: u64) void {
+    t.skipNoAarch64Vm("§4.2.20");
     // Pass policy_ptr=0 (null), which is not readable — should return E_BADADDR.
     // vcpu_count=1 is valid, so the only error should be from policy_ptr.
     const result = syscall.vm_create(1, 0);

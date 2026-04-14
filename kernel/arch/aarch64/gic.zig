@@ -508,8 +508,17 @@ pub fn initDistributor() void {
             n += 1;
         }
 
-        // Enable distributor with Group 1 (no ARE on GICv2).
-        // IHI 0048B, Section 4.3.2: EnableGrp1 (bit 1), EnableGrp0 (bit 0).
+        // Enable distributor for Group 1 NS interrupts.
+        //
+        // IHI 0048B, Section 4.3.2, Table 4-21 (GICD_CTLR, Non-secure view):
+        // when accessed from Non-secure state — which is the only view
+        // exposed by KVM's in-kernel GICv2 emulation and by TCG GICv2
+        // without the security extensions — bit 0 alone is the Group 1
+        // enable, and the Secure-view bits 0 (EnableGrp0) / 1
+        // (EnableGrp1NS) are not visible. We write both bit 0 (NS view
+        // enable) and bit 1 (Secure-view EnableGrp1NS) so the same
+        // value works regardless of which view the implementation
+        // exposes. Linux's gic.c uses GICD_ENABLE = 0x1.
         gicdWrite(.ctlr, gicd_ctlr_enable_grp1_ns | gicd_ctlr_enable_grp0);
     }
 }
@@ -653,13 +662,24 @@ pub fn initCpuInterface() void {
         // IHI 0048B, Section 4.4.3: GICC_BPR.
         giccWrite(.bpr, 0);
 
-        // Enable the CPU interface for Group 1 non-secure. All SGIs/PPIs
-        // and SPIs are assigned to Group 1 in the distributor path, so we
-        // set EnableGrp1 (bit 1). Setting only EnableGrp0 (bit 0) as a
-        // naive "enable" would silently drop every Group 1 interrupt.
-        // IHI 0048B, Section 4.4.1: GICC_CTLR, bit 0 = EnableGrp0,
-        //   bit 1 = EnableGrp1.
-        giccWrite(.ctlr, 0x2);
+        // Enable the CPU interface for Group 1 non-secure.
+        //
+        // IHI 0048B, Section 4.4.1, Table 4-46 (GICC_CTLR, Non-secure view):
+        // when accessed from Non-secure state, the bit positions are
+        // remapped — bit 0 becomes EnableGrp1 (the "enable" bit for the
+        // OS), bit 5 = FIQBypDisGrp1, bit 6 = IRQBypDisGrp1, bit 9 =
+        // EOImodeNS. The Secure-view layout (bit 0 = EnableGrp0,
+        // bit 1 = EnableGrp1NS) is NOT visible from a Non-secure OS.
+        //
+        // KVM's in-kernel GICv2 emulation (and TCG GICv2 without the
+        // security extensions) only exposes the Non-secure view, so a
+        // write of 0x2 lands on a reserved bit and leaves the CPU
+        // interface disabled — no Group 1 interrupt is ever forwarded
+        // to the core. Writing 0x1 is what Linux's gic.c does
+        // (GICC_ENABLE = 0x1). We additionally set bit 1 so that on a
+        // GICv2 implementation that does expose the Secure view this
+        // also enables Group 1 NS, matching the previous behaviour.
+        giccWrite(.ctlr, 0x3);
     }
 }
 

@@ -8,6 +8,7 @@ var policy: [4096]u8 align(4096) = .{0} ** 4096;
 var buf: [4096]u8 align(8) = .{0} ** 4096;
 
 pub fn main(_: u64) void {
+    t.skipNoAarch64Vm("§4.2.34");
     const cr = syscall.vm_create(1, @intFromPtr(&policy));
     if (cr == syscall.E_NODEV) {
         t.pass("§4.2.34");

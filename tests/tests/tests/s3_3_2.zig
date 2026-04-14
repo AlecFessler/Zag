@@ -31,10 +31,19 @@ pub fn main(_: u64) void {
     var reply: syscall.IpcMessage = .{};
     _ = syscall.ipc_call_cap(ch, &.{ shm, shm_rights.bits() }, &reply);
 
-    // Let child enter recv.
+    // Let child enter recv. On SMP, the recorder may not have re-entered
+    // ipc_recv yet after replying to the setup call, so retry while
+    // ipc_send returns E_AGAIN ("no receiver waiting").
     for (0..50) |_| syscall.thread_yield();
 
-    const send_rc = syscall.ipc_send(ch, &.{0x42});
+    var send_rc: i64 = 0;
+    var send_tries: u32 = 0;
+    while (send_tries < 10000) {
+        send_rc = syscall.ipc_send(ch, &.{0x42});
+        if (send_rc != -9) break;
+        syscall.thread_yield();
+        send_tries += 1;
+    }
     if (send_rc != 0) {
         t.failWithVal("§3.3.2 send", 0, send_rc);
         syscall.shutdown();

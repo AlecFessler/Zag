@@ -95,11 +95,12 @@ pub fn main(pv: u64) void {
     var attempts: u32 = 0;
     var saw_token = false;
     var saw_restart = false;
-    while (attempts < 500_000) : (attempts += 1) {
+    while (attempts < 2_000_000) {
         if (!saw_token and token_slot.* != 0) saw_token = true;
         if (!saw_restart and view[slot].processRestartCount() >= 1) saw_restart = true;
         if (saw_token and saw_restart) break;
         syscall.thread_yield();
+        attempts += 1;
     }
 
     if (!saw_token) {

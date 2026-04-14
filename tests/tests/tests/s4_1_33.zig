@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const children = @import("embedded_children");
 const lib = @import("lib");
 
@@ -47,20 +48,37 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
 
-    // Read 2 bytes from the faulting RIP. The null-deref is a volatile byte
-    // load: `movb (reg), %al` which encodes as 0x8a followed by a ModRM byte.
-    // The ModRM byte depends on register allocation (0x00 for %rax, 0x02 for
-    // %rdx, etc.), so we only check the opcode. A stub returning E_OK with
-    // zeros would get 0x00 in buf[0] and fail this check.
-    var buf: [2]u8 = .{ 0xff, 0xff };
-    const rc = syscall.fault_read_mem(proc_handle, fault_msg.rip, @intFromPtr(&buf), 2);
+    // Read bytes from the faulting PC and verify they encode the expected
+    // null-deref load instruction. A stub returning E_OK with zeros would
+    // fail this check.
+    //
+    // x86_64: `movb (reg), %al` encodes as opcode 0x8a followed by a ModRM
+    // byte (which depends on register allocation), so we only check the
+    // opcode byte.
+    //
+    // aarch64: `ldrb wT, [xN]` encodes as 32-bit instruction
+    // 0x39400000 | (xN<<5) | wT. In little-endian memory the top byte
+    // (offset 3) is 0x39 and offset 2 is 0x40 — these are register-
+    // independent and distinguish a real ldrb from a zero stub.
+    const read_len: u64 = switch (builtin.cpu.arch) {
+        .x86_64 => 2,
+        .aarch64 => 4,
+        else => @compileError("unsupported arch"),
+    };
+    var buf: [4]u8 = .{ 0xff, 0xff, 0xff, 0xff };
+    const rc = syscall.fault_read_mem(proc_handle, fault_msg.rip, @intFromPtr(&buf), read_len);
     if (rc != 0) {
         t.failWithVal("§4.1.33 fault_read_mem rc", 0, rc);
         _ = syscall.fault_reply_simple(@bitCast(recv_ret), syscall.FAULT_KILL);
         syscall.shutdown();
     }
 
-    if (buf[0] == 0x8a) {
+    const ok = switch (builtin.cpu.arch) {
+        .x86_64 => buf[0] == 0x8a,
+        .aarch64 => buf[3] == 0x39 and buf[2] == 0x40,
+        else => false,
+    };
+    if (ok) {
         t.pass("§4.1.33");
     } else {
         t.fail("§4.1.33 wrong bytes read");

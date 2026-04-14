@@ -22,10 +22,10 @@ fn faulterA() void {
 }
 
 fn faulterB() void {
-    // Short yield so the main thread has a moment to fault_recv the first
+    // Short delay so the main thread has a moment to fault_recv the first
     // worker's fault before this one enters .faulted.
-    var i: u32 = 0;
-    while (i < 1000) : (i += 1) syscall.thread_yield();
+    var dummy: u64 = 0;
+    _ = syscall.futex_wait(&dummy, 0, 2_000_000); // 2 ms
     lib.fault.nullDeref();
     while (true) lib.fault.cpuPause();
 }
@@ -77,7 +77,7 @@ pub fn main(pv: u64) void {
 
     _ = syscall.ipc_reply(&.{});
 
-    var buf: [256]u8 align(8) = undefined;
+    var buf: [syscall.fault_msg_size]u8 align(8) = undefined;
     const tok = syscall.fault_recv(@intFromPtr(&buf), 1);
     if (tok > 0) {
         const slot: *volatile u64 = @ptrFromInt(shm_va + 0);
@@ -86,9 +86,12 @@ pub fn main(pv: u64) void {
 
     // Give workerB time to also enter .faulted so the kill below puts
     // the process into the "all threads faulted" state, triggering
-    // §2.12.9.
-    var i: u32 = 0;
-    while (i < 5000) : (i += 1) syscall.thread_yield();
+    // §2.12.9. Use futex_wait with a short timeout rather than a
+    // yield loop: on aarch64 KVM a tight yield loop can race the
+    // self-IPI re-dispatch and never make progress, and we just need
+    // a small real-time delay here.
+    var dummy: u64 = 0;
+    _ = syscall.futex_wait(&dummy, 0, 10_000_000); // 10 ms
 
     // Main null-derefs. Three threads now in .faulted — §2.12.9 fires.
     lib.fault.nullDeref();

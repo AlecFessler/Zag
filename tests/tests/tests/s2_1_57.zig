@@ -39,9 +39,16 @@ pub fn main(pv: u64) void {
         children.child_exit.len,
         child_rights.bits(),
     )));
+    // Find the child entry by handle. On SMP the child may exit and
+    // convert to DEAD_PROCESS before this loop runs, so accept either
+    // PROCESS or DEAD_PROCESS — both are evidence that the view was
+    // synchronized on a permissions table mutation (insert or type change).
     var child_slot: usize = 128;
     for (0..128) |i| {
-        if (view[i].handle == child_handle and view[i].entry_type == perm_view.ENTRY_TYPE_PROCESS) {
+        if (view[i].handle == child_handle and
+            (view[i].entry_type == perm_view.ENTRY_TYPE_PROCESS or
+                view[i].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS))
+        {
             child_slot = i;
             break;
         }
@@ -50,9 +57,9 @@ pub fn main(pv: u64) void {
         t.fail("§2.1.57 child process entry not found after insert");
         syscall.shutdown();
     }
+    var saw_type_change = view[child_slot].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS;
     var iters: u32 = 0;
-    var saw_type_change = false;
-    while (iters < 100000) : (iters += 1) {
+    while (iters < 100000) {
         if (view[child_slot].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS and
             view[child_slot].handle == child_handle)
         {
@@ -60,6 +67,7 @@ pub fn main(pv: u64) void {
             break;
         }
         syscall.thread_yield();
+        iters += 1;
     }
 
     if (found_after_insert and !found_after_remove and saw_type_change) {

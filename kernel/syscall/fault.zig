@@ -47,7 +47,11 @@ fn buildFaultMessage(process_handle: u64, thread_handle: u64, faulted: *Thread) 
     buf[16] = @intFromEnum(faulted.fault_reason);
     @memset(buf[17..24], 0);
     @as(*align(1) u64, @ptrCast(&buf[24])).* = faulted.fault_addr;
-    const snap = arch.serializeFaultRegs(faulted.ctx);
+    // Serialize from the user fault frame (the same frame a subsequent
+    // FAULT_RESUME_MODIFIED will write through) rather than `faulted.ctx`,
+    // which on aarch64 points at the nested SGI frame from `yield()`.
+    const regs_src = faulted.fault_user_ctx orelse faulted.ctx;
+    const snap = arch.serializeFaultRegs(regs_src);
     @as(*align(1) u64, @ptrCast(&buf[32])).* = snap.ip;
     @as(*align(1) u64, @ptrCast(&buf[40])).* = snap.flags;
     @as(*align(1) u64, @ptrCast(&buf[48])).* = snap.sp;
@@ -470,6 +474,14 @@ pub fn sysFaultWriteMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i6
     // Pre-fault both sides: demand-page the target page (even uncommitted
     // pages within a reservation) and the caller's source buffer so
     // ring-0 @memcpy never takes a user fault.
+    //
+    // The fault handler may be patching the target's instruction stream
+    // (debugger / spec §4.1.34 instruction patching). On aarch64 the I-D
+    // caches are not coherent: after the data-side @memcpy lands in the
+    // physmap view we must clean the just-written lines to the Point of
+    // Unification AND invalidate the instruction cache, otherwise the
+    // target re-faults at the same RIP fetching stale bytes. On x86-64
+    // both helpers are no-ops (coherent I-cache).
     var remaining = len;
     var dst_addr = vaddr;
     var src_addr = buf_ptr;
@@ -487,10 +499,16 @@ pub fn sysFaultWriteMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i6
         arch.userAccessBegin();
         @memcpy(dst[0..chunk], src[0..chunk]);
         arch.userAccessEnd();
+        // Push the just-written cache lines to PoU so a subsequent
+        // I-cache invalidate makes them visible to instruction fetch.
+        arch.cleanDcacheToPou(physmap_addr, chunk);
         remaining -= chunk;
         dst_addr += chunk;
         src_addr += chunk;
     }
+    // Broadcast I-cache invalidate so the target core re-fetches the
+    // patched bytes on the next fault-resume. ARM ARM B2.4.6.
+    arch.syncInstructionCache();
 
     return E_OK;
 }

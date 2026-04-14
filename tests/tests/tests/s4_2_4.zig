@@ -72,6 +72,7 @@ fn setupRealModeState(state: [*]u8) void {
 }
 
 pub fn main(pv: u64) void {
+    t.skipNoAarch64Vm("§4.2.4");
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
     // Count thread entries before vm_create.

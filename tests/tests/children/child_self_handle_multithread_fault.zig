@@ -26,7 +26,7 @@ pub fn main(_: u64) void {
         return;
     }
 
-    var fault_buf: [256]u8 align(8) = undefined;
+    var fault_buf: [syscall.fault_msg_size]u8 align(8) = undefined;
     const token = syscall.fault_recv(@intFromPtr(&fault_buf), 1);
 
     var msg: syscall.IpcMessage = .{};

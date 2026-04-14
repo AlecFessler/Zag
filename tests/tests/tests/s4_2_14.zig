@@ -7,6 +7,7 @@ const t = lib.testing;
 var policy: [4096]u8 align(4096) = .{0} ** 4096;
 
 pub fn main(_: u64) void {
+    t.skipNoAarch64Vm("§4.2.14");
     const result = syscall.vm_create(1, @intFromPtr(&policy));
     if (result == syscall.E_NODEV) {
         // Hardware virt not available — pass (cannot test success path).

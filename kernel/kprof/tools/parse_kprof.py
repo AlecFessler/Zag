@@ -43,8 +43,14 @@ class Record:
     tsc: int
     kind: int
     id: int
-    rip: int
+    ip: int
     arg: int
+    # Free-running PMU counter snapshots. Present on every record in
+    # trace-mode dumps (`-Dkernel_profile=trace`); absent on sample
+    # dumps, where the fields default to 0 and aren't meaningful.
+    cycles: int = 0
+    cache_misses: int = 0
+    branch_misses: int = 0
 
     def to_json(self) -> dict:
         return {
@@ -53,8 +59,11 @@ class Record:
             "kind": self.kind,
             "kind_name": KIND_NAMES.get(self.kind, "unknown"),
             "id": self.id,
-            "rip": f"0x{self.rip:x}",
+            "ip": f"0x{self.ip:x}",
             "arg": f"0x{self.arg:x}",
+            "cycles": self.cycles,
+            "cache_misses": self.cache_misses,
+            "branch_misses": self.branch_misses,
         }
 
 
@@ -153,8 +162,11 @@ def parse_session(stream: Iterable[str]) -> Session | None:
                     tsc=parse_int(kv["tsc"]),
                     kind=int(kv["kind"]),
                     id=int(kv["id"]),
-                    rip=parse_int(kv["rip"]),
+                    ip=parse_int(kv["ip"]),
                     arg=parse_int(kv["arg"]),
+                    cycles=parse_int(kv.get("cyc", "0")),
+                    cache_misses=parse_int(kv.get("cmiss", "0")),
+                    branch_misses=parse_int(kv.get("bmiss", "0")),
                 )
                 session.records.append(rec)
             elif verb == "done":
@@ -179,59 +191,93 @@ def percentile(sorted_vals: list[int], pct: float) -> int:
 
 
 @dataclass
-class ScopeStats:
-    name: str
+class MetricStats:
     count: int
     total: int
     min_v: int
     median: int
-    p50: int
     p95: int
     p99: int
     max_v: int
 
 
+@dataclass
+class ScopeStats:
+    name: str
+    tsc: MetricStats
+    cycles: MetricStats
+    cache_misses: MetricStats
+    branch_misses: MetricStats
+
+
+def _metric_from(deltas: list[int]) -> MetricStats:
+    sorted_d = sorted(deltas)
+    return MetricStats(
+        count=len(sorted_d),
+        total=sum(sorted_d),
+        min_v=sorted_d[0] if sorted_d else 0,
+        median=int(statistics.median(sorted_d)) if sorted_d else 0,
+        p95=percentile(sorted_d, 95),
+        p99=percentile(sorted_d, 99),
+        max_v=sorted_d[-1] if sorted_d else 0,
+    )
+
+
 def compute_scope_stats(session: Session) -> tuple[list[ScopeStats], int, int]:
-    """Pair enters/exits per (cpu, id) in order. Returns (stats, orphan_enters, orphan_exits)."""
-    pending: dict[tuple[int, int], list[int]] = defaultdict(list)
-    deltas_by_id: dict[int, list[int]] = defaultdict(list)
+    """Pair enters/exits per (cpu, id) in order. Returns
+    (stats, orphan_enters, orphan_exits).
+
+    For each paired scope we compute deltas across four metrics
+    simultaneously so the dump can be explored with one tool:
+
+      * tsc          — wall cycles via RDTSC
+      * cycles       — PMC-counted cycles-not-halted
+      * cache_misses — L1 DC refill count (Zen's cache-miss analog)
+      * branch_misses — retired branch mispredict count
+
+    Under sample mode the three PMC fields are zero and their deltas
+    are trivially zero, which is harmless.
+    """
+    pending: dict[tuple[int, int], list[Record]] = defaultdict(list)
+    tsc_deltas: dict[int, list[int]] = defaultdict(list)
+    cyc_deltas: dict[int, list[int]] = defaultdict(list)
+    cmiss_deltas: dict[int, list[int]] = defaultdict(list)
+    bmiss_deltas: dict[int, list[int]] = defaultdict(list)
     orphan_exits = 0
 
     for rec in session.records:
         key = (rec.cpu, rec.id)
         if rec.kind == KIND_TRACE_ENTER:
-            pending[key].append(rec.tsc)
+            pending[key].append(rec)
         elif rec.kind == KIND_TRACE_EXIT:
             stack = pending.get(key)
             if not stack:
                 orphan_exits += 1
                 continue
-            enter_tsc = stack.pop()
-            delta = rec.tsc - enter_tsc
-            if delta < 0:
-                warn(f"negative delta on id={rec.id} cpu={rec.cpu}, skipping")
+            enter = stack.pop()
+            dtsc = rec.tsc - enter.tsc
+            if dtsc < 0:
+                warn(f"negative tsc delta on id={rec.id} cpu={rec.cpu}, skipping")
                 continue
-            deltas_by_id[rec.id].append(delta)
+            tsc_deltas[rec.id].append(dtsc)
+            cyc_deltas[rec.id].append(max(0, rec.cycles - enter.cycles))
+            cmiss_deltas[rec.id].append(max(0, rec.cache_misses - enter.cache_misses))
+            bmiss_deltas[rec.id].append(max(0, rec.branch_misses - enter.branch_misses))
 
     orphan_enters = sum(len(v) for v in pending.values())
 
     out: list[ScopeStats] = []
-    for tid, deltas in deltas_by_id.items():
-        deltas.sort()
+    for tid, deltas in tsc_deltas.items():
         out.append(
             ScopeStats(
                 name=session.names.get(tid, f"id_{tid}"),
-                count=len(deltas),
-                total=sum(deltas),
-                min_v=deltas[0],
-                median=int(statistics.median(deltas)),
-                p50=percentile(deltas, 50),
-                p95=percentile(deltas, 95),
-                p99=percentile(deltas, 99),
-                max_v=deltas[-1],
+                tsc=_metric_from(deltas),
+                cycles=_metric_from(cyc_deltas[tid]),
+                cache_misses=_metric_from(cmiss_deltas[tid]),
+                branch_misses=_metric_from(bmiss_deltas[tid]),
             )
         )
-    out.sort(key=lambda s: s.total, reverse=True)
+    out.sort(key=lambda s: s.tsc.total, reverse=True)
     return out, orphan_enters, orphan_exits
 
 
@@ -241,24 +287,48 @@ def report_trace(session: Session) -> None:
     if not stats:
         print("(no paired scopes)")
     else:
-        header = f"{'name':<32} {'count':>8} {'min':>10} {'median':>10} {'p95':>12} {'p99':>12} {'max':>12} {'total':>14}"
-        print(header)
-        print("-" * len(header))
-        for s in stats:
-            print(
-                f"{s.name:<32} {s.count:>8d} {s.min_v:>10d} {s.median:>10d} "
-                f"{s.p95:>12d} {s.p99:>12d} {s.max_v:>12d} {s.total:>14d}"
-            )
+        # Two tables: one for wall-time (tsc) and one per PMC metric
+        # so columns stay narrow enough to read in a terminal.
+        _render_metric_table("tsc", stats, lambda s: s.tsc)
+        print()
+        _render_metric_table("cycles (PMC)", stats, lambda s: s.cycles)
+        print()
+        _render_metric_table("cache_misses (PMC)", stats, lambda s: s.cache_misses)
+        print()
+        _render_metric_table("branch_misses (PMC)", stats, lambda s: s.branch_misses)
         print()
         for s in stats:
             print(
-                f"[KPROF-SUMMARY] scope={s.name} count={s.count} min={s.min_v} "
-                f"median={s.median} p95={s.p95} p99={s.p99} max={s.max_v} total={s.total}"
+                f"[KPROF-SUMMARY] scope={s.name} count={s.tsc.count} "
+                f"tsc_med={s.tsc.median} tsc_total={s.tsc.total} "
+                f"cyc_med={s.cycles.median} cyc_total={s.cycles.total} "
+                f"cmiss_med={s.cache_misses.median} cmiss_total={s.cache_misses.total} "
+                f"bmiss_med={s.branch_misses.median} bmiss_total={s.branch_misses.total}"
             )
     if orphan_enters or orphan_exits:
         print()
         print(f"orphans: enters={orphan_enters} exits={orphan_exits}")
 
+    report_trace_points(session)
+
+
+def _render_metric_table(title: str, stats: list[ScopeStats], pick) -> None:
+    print(f"--- {title} ---")
+    header = (
+        f"{'name':<32} {'count':>8} {'min':>12} {'median':>12} "
+        f"{'p95':>14} {'p99':>14} {'max':>14} {'total':>16}"
+    )
+    print(header)
+    print("-" * len(header))
+    for s in stats:
+        m = pick(s)
+        print(
+            f"{s.name:<32} {m.count:>8d} {m.min_v:>12d} {m.median:>12d} "
+            f"{m.p95:>14d} {m.p99:>14d} {m.max_v:>14d} {m.total:>16d}"
+        )
+
+
+def report_trace_points(session: Session) -> None:
     # Trace points (kind=3).
     points: dict[int, list[int]] = defaultdict(list)
     for rec in session.records:
@@ -286,22 +356,22 @@ def report_sample(session: Session) -> None:
         return
 
     per_cpu: Counter[int] = Counter()
-    rip_hist: Counter[int] = Counter()
+    ip_hist: Counter[int] = Counter()
     for r in samples:
         per_cpu[r.cpu] += 1
-        rip_hist[r.rip] += 1
+        ip_hist[r.ip] += 1
 
     total = len(samples)
     print(f"total samples: {total}")
     for cpu in sorted(per_cpu):
         print(f"  cpu{cpu}: {per_cpu[cpu]}")
     print()
-    print(f"{'rip':<20} {'count':>10} {'pct':>8}")
+    print(f"{'ip':<20} {'count':>10} {'pct':>8}")
     print("-" * 40)
-    for rip, cnt in rip_hist.most_common(20):
+    for ip, cnt in ip_hist.most_common(20):
         pct = (cnt / total) * 100.0
-        print(f"0x{rip:016x}  {cnt:>10d} {pct:>7.2f}%")
-        print(f"[KPROF-SUMMARY] sample rip=0x{rip:x} count={cnt} pct={pct:.2f}")
+        print(f"0x{ip:016x}  {cnt:>10d} {pct:>7.2f}%")
+        print(f"[KPROF-SUMMARY] sample ip=0x{ip:x} count={cnt} pct={pct:.2f}")
 
 
 def report_raw(session: Session) -> None:

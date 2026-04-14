@@ -269,6 +269,16 @@ fn mapKernelStack(stack: Stack) !void {
     }
 }
 
+/// Allocate a kernel stack for a thread without a user stack (e.g. the
+/// per-core idle thread on aarch64, which needs a real SP_EL1 to handle
+/// interrupts taken while halting at EL1).
+pub fn createKernelStack() !Stack {
+    const stack = try stack_mod.createKernel();
+    errdefer stack_mod.destroyKernel(stack, memory_init.kernel_addr_space_root);
+    try mapKernelStack(stack);
+    return stack;
+}
+
 fn unmapKernelStack(stack: Stack) void {
     const pmm_iface = pmm.global_pmm.?.allocator();
     var page_addr = stack.base.addr;

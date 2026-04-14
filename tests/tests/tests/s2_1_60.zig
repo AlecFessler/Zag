@@ -37,9 +37,15 @@ pub fn main(pv: u64) void {
         .kill = true,
         .grant = true,
     });
+    // On SMP the child may exit and convert to DEAD_PROCESS before this loop
+    // runs. The rights encoding is identical in both states (§2.1.60 is about
+    // the rights field, not the type field), so accept either.
     var child_slot_ok = false;
     for (0..128) |i| {
-        if (view[i].handle == child_handle and view[i].entry_type == perm_view.ENTRY_TYPE_PROCESS) {
+        if (view[i].handle == child_handle and
+            (view[i].entry_type == perm_view.ENTRY_TYPE_PROCESS or
+                view[i].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS))
+        {
             child_slot_ok = view[i].rights == full_handle_rights;
             break;
         }

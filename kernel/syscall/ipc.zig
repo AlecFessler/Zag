@@ -380,10 +380,15 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
     const saved_return = arch.getSyscallReturn(receiver.ctx);
     const saved_meta = arch.getIpcMetadata(receiver.ctx);
     const saved_payload = arch.saveIpcPayload(receiver.ctx);
+    // On aarch64, x0 serves as both the syscall return register and the
+    // first IPC payload word. setSyscallReturn must precede copyIpcPayload
+    // so that when word_count >= 1, copyIpcPayload's write of x0 wins and
+    // carries the true reply word 0. On x86_64 rax and rdi are independent,
+    // so the order is immaterial there.
+    arch.setSyscallReturn(receiver.ctx, @bitCast(E_OK));
     arch.copyIpcPayload(receiver.ctx, ctx, meta.word_count);
     // Set recv metadata: bit 0 = 0 (from send), bits [3:1] = word_count
     arch.setIpcMetadata(receiver.ctx, @as(u64, meta.word_count) << 1);
-    arch.setSyscallReturn(receiver.ctx, @bitCast(E_OK));
 
     // Handle capability transfer
     if (meta.cap_transfer) {
@@ -437,9 +442,11 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
         const saved_return = arch.getSyscallReturn(receiver.ctx);
         const saved_meta = arch.getIpcMetadata(receiver.ctx);
         const saved_payload = arch.saveIpcPayload(receiver.ctx);
+        // Order: setSyscallReturn before copyIpcPayload (see comment on the
+        // sysIpcSend path above — x0 is shared on aarch64).
+        arch.setSyscallReturn(receiver.ctx, @bitCast(E_OK));
         arch.copyIpcPayload(receiver.ctx, ctx, meta.word_count);
         arch.setIpcMetadata(receiver.ctx, (@as(u64, meta.word_count) << 1) | 1); // bit 0 = 1 (from call)
-        arch.setSyscallReturn(receiver.ctx, @bitCast(E_OK));
 
         if (meta.cap_transfer) {
             const cap = getCapPayload(ctx, meta.word_count);
@@ -544,6 +551,13 @@ pub fn sysIpcRecv(ctx: *ArchCpuContext) SyscallResult {
     proc.msg_box.beginPendingReplyLocked(waiter);
     proc.msg_box.lock.unlock();
 
+    // aarch64: copyIpcPayload already wrote the true reply word 0 into x0
+    // when word_count >= 1. Tell the arch dispatcher not to overwrite it
+    // with the E_OK return. On x86_64 ret goes into rax (separate from
+    // rdi/reply word 0), so the flag is a harmless no-op there.
+    if (waiter_meta.word_count >= 1) {
+        return .{ .ret = E_OK, .skip_ret_write = true };
+    }
     return .{ .ret = E_OK };
 }
 
@@ -587,8 +601,11 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
         if (reply_cap_err != E_OK) {
             arch.setSyscallReturn(pc.ctx, @bitCast(reply_cap_err));
         } else {
-            arch.copyIpcPayload(pc.ctx, ctx, reply_word_count);
+            // Order: setSyscallReturn before copyIpcPayload on aarch64 (x0
+            // is shared between return value and reply word 0). See
+            // sysIpcSend's matching comment for rationale.
             arch.setSyscallReturn(pc.ctx, @bitCast(E_OK));
+            arch.copyIpcPayload(pc.ctx, ctx, reply_word_count);
             arch.setIpcMetadata(pc.ctx, (@as(u64, reply_word_count) << 1) | 1);
         }
 
@@ -614,14 +631,23 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
                 }
             }
 
+            // Order: setSyscallReturn before copyIpcPayload on aarch64 (x0
+            // is shared between return value and reply word 0). See
+            // sysIpcSend's matching comment for rationale.
+            arch.setSyscallReturn(ctx, @bitCast(E_OK));
             arch.copyIpcPayload(ctx, waiter.ctx, waiter_meta.word_count);
             arch.setIpcMetadata(ctx, (@as(u64, waiter_meta.word_count) << 1) | 1);
-            arch.setSyscallReturn(ctx, @bitCast(E_OK));
 
             proc.msg_box.beginPendingReplyLocked(waiter);
             proc.msg_box.lock.unlock();
 
             if (caller_thread) |ct| wakeThread(ct);
+            // aarch64: preserve the reply word 0 we just wrote to x0 when
+            // no error is being returned. See sysIpcRecv for the same
+            // pattern.
+            if (reply_cap_err == E_OK and waiter_meta.word_count >= 1) {
+                return .{ .ret = E_OK, .skip_ret_write = true };
+            }
             return .{ .ret = if (reply_cap_err != E_OK) reply_cap_err else E_OK };
         } else if (recv_blocking) {
             proc.msg_box.beginReceivingLocked(thread);

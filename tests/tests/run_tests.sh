@@ -21,7 +21,7 @@ PARALLEL="${PARALLEL:-1}"
 ARCH="${ARCH:-x64}"
 
 if [ "$ARCH" = "arm" ]; then
-    QEMU_CMD="qemu-system-aarch64 -M virt,gic-version=3 -m 1G -bios /usr/share/AAVMF/AAVMF_CODE.fd -serial stdio -display none -no-reboot -machine accel=tcg -cpu cortex-a72 -smp cores=4"
+    QEMU_CMD="qemu-system-aarch64 -M virt,gic-version=3 -m 1G -bios /usr/share/AAVMF/AAVMF_CODE.fd -serial stdio -display none -no-reboot -machine accel=tcg -cpu cortex-a72,pmu=on -smp cores=4"
     BUILD_ARCH_FLAG="-Darch=arm"
     LOADER="BOOTAA64.EFI"
 else
@@ -83,7 +83,7 @@ run_one_test() {
 
     # Extract result line
     local result
-    result=$(echo "$output" | grep -m1 '\[PASS\]\|\[FAIL\]' || true)
+    result=$(echo "$output" | grep -m1 '\[PASS\]\|\[FAIL\]\|\[SKIP\]' || true)
     # Strip ANSI escape codes
     result=$(echo "$result" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
 
@@ -112,12 +112,15 @@ printf '%s\n' "${test_elfs[@]}" | xargs -P "$PARALLEL" -I{} bash -c 'run_one_tes
 # Aggregate results
 pass=0
 fail=0
+skip=0
 failures=""
 
 for f in $(ls "$RESULTS_DIR"/ | sort); do
     result=$(cat "$RESULTS_DIR/$f")
     if echo "$result" | grep -q '\[PASS\]'; then
         pass=$((pass + 1))
+    elif echo "$result" | grep -q '\[SKIP\]'; then
+        skip=$((skip + 1))
     else
         fail=$((fail + 1))
         failures="$failures\n  $result"
@@ -127,7 +130,7 @@ done
 rm -rf "$RESULTS_DIR"
 
 echo "================================"
-echo "Total: $pass pass, $fail fail out of $((pass + fail))"
+echo "Total: $pass pass, $fail fail, $skip skip out of $((pass + fail + skip))"
 if [ "$fail" -eq 0 ]; then
     echo "All tests passed!"
 else

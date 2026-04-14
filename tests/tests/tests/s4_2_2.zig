@@ -8,6 +8,7 @@ const syscall = lib.syscall;
 const t = lib.testing;
 
 pub fn main(pv: u64) void {
+    t.skipNoAarch64Vm("§4.2.2");
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
 
     // Spawn a child that calls vm_create then exits.

@@ -7,6 +7,7 @@ const t = lib.testing;
 var policy: [4096]u8 align(4096) = .{0} ** 4096;
 
 pub fn main(_: u64) void {
+    t.skipNoAarch64Vm("§4.2.18");
     // This test verifies that vm_create either succeeds (E_OK) or
     // returns E_NODEV when hardware virt is unavailable. Both outcomes
     // confirm the E_NODEV path is implemented.

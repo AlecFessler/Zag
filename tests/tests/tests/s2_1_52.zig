@@ -50,8 +50,10 @@ pub fn main(pv: u64) void {
 
     if (!h2_found and h1_alive) {
         t.pass("§2.1.52");
+    } else if (h2_found) {
+        t.fail("§2.1.52 h2 not removed");
     } else {
-        t.fail("§2.1.52");
+        t.fail("§2.1.52 h1 not alive");
     }
     syscall.shutdown();
 }

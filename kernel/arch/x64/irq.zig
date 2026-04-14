@@ -7,6 +7,7 @@ const futex = zag.proc.futex;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
+const kprof_dump = zag.kprof.dump;
 const paging_mod = zag.arch.x64.paging;
 const sched = zag.sched.scheduler;
 
@@ -89,6 +90,20 @@ pub fn init() void {
     interrupts.registerVector(
         tlb_vec,
         paging_mod.tlbShootdownHandler,
+        .external,
+    );
+
+    const kprof_vec = @intFromEnum(interrupts.IntVecs.kprof_dump);
+    idt.openInterruptGate(
+        kprof_vec,
+        interrupts.stubs[kprof_vec],
+        gdt.KERNEL_CODE_OFFSET,
+        PrivilegeLevel.ring_0,
+        GateType.interrupt_gate,
+    );
+    interrupts.registerVector(
+        kprof_vec,
+        kprofDumpHandler,
         .external,
     );
 
@@ -197,6 +212,13 @@ pub fn registerIrqOwner(irq_line: u8, proc: *Process, slot_index: u16) void {
 fn spuriousHandler(ctx: *cpu.Context) void {
     _ = ctx;
     spurious_interrupts += 1;
+}
+
+/// Kprof-dump IPI handler: park this CPU inside kprof.dump so the
+/// dumping core can quiesce every other CPU before serial-dumping.
+/// Never returns — parkForDump halts after dump_done is observed.
+fn kprofDumpHandler(_: *cpu.Context) void {
+    kprof_dump.parkForDump();
 }
 
 fn schedTimerHandler(ctx: *cpu.Context) void {

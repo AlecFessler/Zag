@@ -438,8 +438,11 @@ fn ipc_call_ex(target_handle: u64, words: []const u64, cap_transfer: bool, reply
           [w3] "{r8}" (w[3]),
           [w4] "{r9}" (w[4]),
         : .{ .rcx = true, .r11 = true, .memory = true }) else blk: {
-        // aarch64: x0 is both syscall return and reply word 0 — capture once,
-        // mirror into r_rdi after the asm.
+        // aarch64: x0 is both syscall return and reply word 0. The kernel
+        // sets meta bit 0 (from_call) when a reply is being delivered
+        // successfully — in that case x0 holds reply word 0 and the
+        // syscall return is implicitly 0. When from_call is clear, x0
+        // holds the error code and reply words are not valid.
         const r = asm volatile ("svc #0"
             : [ret] "={x0}" (-> i64),
               [o1] "={x1}" (r_rsi),
@@ -456,13 +459,28 @@ fn ipc_call_ex(target_handle: u64, words: []const u64, cap_transfer: bool, reply
               [w3] "{x3}" (w[3]),
               [w4] "{x4}" (w[4]),
             : .{ .memory = true });
-        r_rdi = @bitCast(r);
-        break :blk r;
+        const from_call_bit = (r_r14 & 1) != 0;
+        if (from_call_bit) {
+            r_rdi = @bitCast(r);
+            break :blk @as(i64, 0);
+        } else {
+            r_rdi = 0;
+            break :blk r;
+        }
     };
 
     reply.words = .{ r_rdi, r_rsi, r_rdx, r_r8, r_r9 };
     reply.word_count = @truncate((r_r14 >> 1) & 0x7);
     reply.from_call = (r_r14 & 1) != 0;
+    // aarch64: x0 is shared between syscall return and reply word 0. When
+    // a successful reply comes back, the kernel leaves reply word 0 in x0
+    // and signals success by keeping bit 0 of x6 set ("from call reply").
+    // On the error path the kernel clears x6 to 0, so the errno in x0 is
+    // unambiguous. Reinterpret the two cases here.
+    if (builtin.cpu.arch == .aarch64) {
+        if (reply.from_call) return 0;
+        return ret;
+    }
     return ret;
 }
 
@@ -497,8 +515,17 @@ pub fn ipc_recv(blocking: bool, msg: *IpcMessage) i64 {
             : [num] "{x8}" (@intFromEnum(SyscallNum.ipc_recv)),
               [m] "{x6}" (meta),
             : .{ .memory = true });
-        r_rdi = @bitCast(r);
-        break :blk r;
+        // aarch64 x0 collision: if word_count >= 1 in returned meta,
+        // x0 holds reply word 0 (kernel used skip_ret_write). Otherwise
+        // x0 holds the syscall return.
+        const ret_word_count: u64 = (r_r14 >> 1) & 0x7;
+        if (ret_word_count >= 1) {
+            r_rdi = @bitCast(r);
+            break :blk @as(i64, 0);
+        } else {
+            r_rdi = 0;
+            break :blk r;
+        }
     };
 
     msg.words = .{ r_rdi, r_rsi, r_rdx, r_r8, r_r9 };
@@ -559,8 +586,16 @@ pub fn ipc_reply_recv(words: []const u64, blocking: bool, msg: *IpcMessage) i64 
               [w3] "{x3}" (w[3]),
               [w4] "{x4}" (w[4]),
             : .{ .memory = true });
-        r_rdi = @bitCast(r);
-        break :blk r;
+        // aarch64 x0 collision: if atomic reply+recv delivers a message
+        // with word_count >= 1, x0 holds that message's word 0.
+        const ret_word_count: u64 = (r_r14 >> 1) & 0x7;
+        if (ret_word_count >= 1) {
+            r_rdi = @bitCast(r);
+            break :blk @as(i64, 0);
+        } else {
+            r_rdi = 0;
+            break :blk r;
+        }
     };
 
     msg.words = .{ r_rdi, r_rsi, r_rdx, r_r8, r_r9 };
@@ -592,11 +627,17 @@ pub fn fault_recv(buf_ptr: u64, blocking: u64) i64 {
 }
 
 pub fn fault_reply_action(token: u64, action: u64, modified_regs_ptr: u64) i64 {
-    return syscall3(.fault_reply, token, action, modified_regs_ptr);
+    // Explicit zero-flags reply: the kernel's sysFaultReply reads exclude
+    // flags from the IPC metadata register (r14 on x86, x6 on aarch64).
+    // Using the plain `syscall3` path leaves that register uninitialized,
+    // and stray bits can re-arm FAULT_EXCLUDE_NEXT/PERMANENT across the
+    // reply. Route through `fault_reply_flags` with `flags = 0` so the
+    // metadata register is explicitly clobbered to zero.
+    return fault_reply_flags(token, action, modified_regs_ptr, 0);
 }
 
 pub fn fault_reply_simple(token: u64, action: u64) i64 {
-    return syscall3(.fault_reply, token, action, 0);
+    return fault_reply_flags(token, action, 0, 0);
 }
 
 /// Invoke `fault_reply` with explicit `flags` in r14 (e.g. FAULT_EXCLUDE_NEXT,
@@ -881,15 +922,32 @@ pub const FAULT_MODE_STOP_ALL: u64 = 0;
 pub const FAULT_MODE_EXCLUDE_NEXT: u64 = 1;
 pub const FAULT_MODE_EXCLUDE_PERMANENT: u64 = 2;
 
+/// Number of GPRs serialized in a FaultMessage's saved-regs area. Must
+/// match `kernel/arch/dispatch.zig`'s `fault_gpr_count`.
+pub const fault_gpr_count: usize = switch (builtin.cpu.arch) {
+    .x86_64 => 15,
+    .aarch64 => 31,
+    else => @compileError("unsupported arch"),
+};
+
+/// Size of the saved-regs area inside a FaultMessage: ip + flags + sp +
+/// `fault_gpr_count` GPRs. Must match kernel `fault_regs_size`.
+pub const fault_regs_size: usize = (3 + fault_gpr_count) * @sizeOf(u64);
+
+/// Total size of a FaultMessage written by the kernel into a fault_recv
+/// buffer: 32-byte header + saved-regs area. Must match kernel
+/// `fault_msg_size`.
+pub const fault_msg_size: usize = 32 + fault_regs_size;
+
 pub const FaultMessage = extern struct {
     process_handle: u64,
     thread_handle: u64,
     fault_reason: u8,
     _pad: [7]u8,
     fault_addr: u64,
-    // SavedRegs area: kernel writes rip first.
+    // SavedRegs area: kernel writes ip (rip on x86, elr_el1 on aarch64) first.
     rip: u64,
-    _regs_rest: [136]u8,
+    _regs_rest: [fault_regs_size - @sizeOf(u64)]u8,
 };
 
 fn ipc_reply_ex(words: []const u64, atomic_recv: bool, recv_blocking: bool, cap_transfer: bool) i64 {

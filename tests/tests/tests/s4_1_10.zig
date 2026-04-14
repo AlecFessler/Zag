@@ -60,18 +60,22 @@ pub fn main(pv: u64) void {
     _ = syscall.ipc_call_cap(child_handle, &.{ shm_handle, shm_cap_rights }, &reply);
 
     // Block until the fault arrives.
-    var fault_buf: [256]u8 align(8) = undefined;
+    var fault_buf: [syscall.fault_msg_size]u8 align(8) = undefined;
     const token = syscall.fault_recv(@intFromPtr(&fault_buf), 1);
     if (token < 0) {
         t.failWithVal("§4.1.10 fault_recv", 0, token);
         syscall.shutdown();
     }
 
-    // At this point the worker should be suspended by stop-all. Snapshot
-    // the counter, yield many times, snapshot again: the counter must be
-    // frozen.
+    // At this point the worker should be suspended by stop-all. The
+    // suspend IPI is dispatched asynchronously and has a short window
+    // before it actually deschedules the worker on its remote core
+    // (notably on aarch64 KVM), so yield enough for the IPI to land
+    // before snapshotting, then verify the counter is frozen across a
+    // second yield window.
+    for (0..500) |_| syscall.thread_yield();
     const snap1 = counter_ptr.*;
-    for (0..100) |_| syscall.thread_yield();
+    for (0..500) |_| syscall.thread_yield();
     const snap2 = counter_ptr.*;
 
     if (snap1 != snap2) {
