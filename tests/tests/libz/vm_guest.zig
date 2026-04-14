@@ -65,6 +65,43 @@ pub const guest_state_pc_offset: usize = switch (builtin.cpu.arch) {
     else => @compileError("unsupported arch for vm_guest"),
 };
 
+/// Encoded byte length of `halt_code` — also the amount the guest PC
+/// advances past the halting instruction on a successful resume.
+///   x86-64:  1 (HLT is a single-byte opcode).
+///   aarch64: 4 (HVC is a 32-bit fixed-width instruction).
+pub const halt_insn_size: u64 = switch (builtin.cpu.arch) {
+    .x86_64 => 1,
+    .aarch64 => 4,
+    else => @compileError("unsupported arch for vm_guest"),
+};
+
+/// Number of bytes the kernel reads/writes for a `GuestState`. Required
+/// for tests that forward a full guest-state snapshot through a
+/// `resume_guest` reply action. Must match
+/// `@sizeOf(kernel.arch.*.vm.GuestState)` exactly.
+///   x86-64:  440 (16 GPRs + RIP + RFLAGS + 4 CRs + 8 segs + 2 desc tabs
+///                 + 12 MSRs + pending_eventinj).
+///   aarch64: 472 (31 GPRs + SP0/SP1/PC/PSTATE + EL1 sysregs + timer
+///                 sysregs + pending_v* flags). Tests `@compileError` on
+///                 any drift via a struct-size assertion inside the
+///                 corresponding test if needed — for now this is
+///                 cross-checked by the test runner at build time.
+pub const guest_state_size: usize = switch (builtin.cpu.arch) {
+    .x86_64 => 440,
+    .aarch64 => 472,
+    else => @compileError("unsupported arch for vm_guest"),
+};
+
+/// Read the instruction pointer out of a guest-state byte buffer.
+pub fn readPc(state: [*]const u8) u64 {
+    return @as(*align(1) const u64, @ptrCast(state + guest_state_pc_offset)).*;
+}
+
+/// Write a new instruction pointer into a guest-state byte buffer.
+pub fn writePc(state: [*]u8, new_pc: u64) void {
+    @as(*align(1) u64, @ptrCast(state + guest_state_pc_offset)).* = new_pc;
+}
+
 /// Initialize a guest-state buffer so the vCPU, when run, begins executing
 /// `halt_code` at guest physical / virtual address 0.
 ///

@@ -1,68 +1,16 @@
 /// §4.2.11 — `vm_vcpu_interrupt` injects a virtual interrupt into a vCPU.
+const builtin = @import("builtin");
 const lib = @import("lib");
 
 const perm_view = lib.perm_view;
 const syscall = lib.syscall;
 const t = lib.testing;
+const vm_guest = lib.vm_guest;
 
 var policy: [4096]u8 align(4096) = .{0} ** 4096;
 var buf: [4096]u8 align(8) = .{0} ** 4096;
 var guest_state: [4096]u8 align(8) = .{0} ** 4096;
 var interrupt_data: [64]u8 align(8) = .{0} ** 64;
-
-/// Guest code: HLT (0xF4) — triggers VM exit.
-const guest_code = [_]u8{0xF4};
-
-const SEG_BASE = 0;
-const SEG_LIMIT = 8;
-const SEG_SELECTOR = 12;
-const SEG_AR = 14;
-
-const OFF_RSP = 7 * 8;
-const OFF_RIP = 16 * 8;
-const OFF_RFLAGS = 17 * 8;
-const OFF_CR0 = 18 * 8;
-const OFF_CS = 22 * 8;
-const OFF_DS = OFF_CS + 16;
-const OFF_ES = OFF_DS + 16;
-const OFF_SS = OFF_CS + 5 * 16;
-
-fn writeU64(base: [*]u8, offset: usize, val: u64) void {
-    @as(*align(1) u64, @ptrCast(base + offset)).* = val;
-}
-
-fn writeU32(base: [*]u8, offset: usize, val: u32) void {
-    @as(*align(1) u32, @ptrCast(base + offset)).* = val;
-}
-
-fn writeU16(base: [*]u8, offset: usize, val: u16) void {
-    @as(*align(1) u16, @ptrCast(base + offset)).* = val;
-}
-
-fn setupCodeSeg(base: [*]u8, off: usize) void {
-    writeU64(base, off + SEG_BASE, 0);
-    writeU32(base, off + SEG_LIMIT, 0xFFFF);
-    writeU16(base, off + SEG_SELECTOR, 0);
-    writeU16(base, off + SEG_AR, 0x009B);
-}
-
-fn setupDataSeg(base: [*]u8, off: usize) void {
-    writeU64(base, off + SEG_BASE, 0);
-    writeU32(base, off + SEG_LIMIT, 0xFFFF);
-    writeU16(base, off + SEG_SELECTOR, 0);
-    writeU16(base, off + SEG_AR, 0x0093);
-}
-
-fn setupRealModeState(state: [*]u8) void {
-    writeU64(state, OFF_RIP, 0x0);
-    writeU64(state, OFF_RFLAGS, 0x2);
-    writeU64(state, OFF_CR0, 0);
-    writeU64(state, OFF_RSP, 0x0FF0);
-    setupCodeSeg(state, OFF_CS);
-    setupDataSeg(state, OFF_DS);
-    setupDataSeg(state, OFF_ES);
-    setupDataSeg(state, OFF_SS);
-}
 
 fn findVcpuHandle(view: [*]const perm_view.UserViewEntry, skip_handle: u64) u64 {
     for (0..128) |i| {
@@ -73,35 +21,40 @@ fn findVcpuHandle(view: [*]const perm_view.UserViewEntry, skip_handle: u64) u64 
     return 0;
 }
 
-pub fn main(pv: u64) void {
-    t.skipNoAarch64Vm("§4.2.11");
-    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
+/// Fill `interrupt_data` with a valid arch-specific GuestInterrupt struct.
+/// The test only asserts the syscall returns E_OK — end-to-end delivery
+/// verification requires a guest IDT/vector table, which is orthogonal
+/// to the assertion under test.
+fn initTestInterrupt(out: []u8) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            // x86 GuestInterrupt: vector, interrupt_type, error_code_valid, ...
+            out[0] = 0x20; // vector
+            out[1] = 0; // type = external
+            out[2] = 0; // error_code_valid = false
+        },
+        .aarch64 => {
+            // aarch64 GuestInterrupt: intid(u32), priority(u8), kind(u8), _pad.
+            // INTID 32 = first SPI (valid userspace-assertable line).
+            out[0] = 32;
+            out[1] = 0;
+            out[2] = 0;
+            out[3] = 0;
+            out[4] = 0; // priority = highest
+            out[5] = 0; // kind = vIRQ
+        },
+        else => @compileError("unsupported arch"),
+    }
+}
 
+pub fn main(pv: u64) void {
+    const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
     const self_handle: u64 = @bitCast(syscall.thread_self());
 
     const cr = syscall.vm_create(1, @intFromPtr(&policy));
     t.skipIfNoVm("§4.2.11", cr);
     if (cr < 0) {
         t.failWithVal("§4.2.11 create", syscall.E_OK, cr);
-        syscall.shutdown();
-    }
-
-    // Reserve host buffer and write HLT guest code.
-    const res = syscall.mem_reserve(0, syscall.PAGE4K, 0x3);
-    if (res.val < 0) {
-        t.failWithVal("§4.2.11 reserve", 0, res.val);
-        _ = syscall.revoke_vm(@bitCast(cr));
-        syscall.shutdown();
-    }
-    const host_ptr: [*]u8 = @ptrFromInt(res.val2);
-    for (guest_code, 0..) |byte, i| {
-        host_ptr[i] = byte;
-    }
-
-    const mr = syscall.vm_guest_map(@bitCast(cr), res.val2, 0x0, syscall.PAGE4K, 0x7);
-    if (mr != syscall.E_OK) {
-        t.failWithVal("§4.2.11 vm_guest_map", syscall.E_OK, mr);
-        _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
@@ -112,16 +65,14 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
 
-    // Set up real-mode guest state.
-    setupRealModeState(&guest_state);
-    const sr = syscall.vm_vcpu_set_state(vcpu_handle, @intFromPtr(&guest_state));
-    if (sr != syscall.E_OK) {
-        t.failWithVal("§4.2.11 set_state", syscall.E_OK, sr);
+    const prep = vm_guest.prepHaltGuest(@bitCast(cr), vcpu_handle, &guest_state);
+    if (prep != syscall.E_OK) {
+        t.failWithVal("§4.2.11 prep", syscall.E_OK, prep);
         _ = syscall.revoke_vm(@bitCast(cr));
         syscall.shutdown();
     }
 
-    // Run vCPU — guest executes HLT, exit delivered to VMM.
+    // Run vCPU — guest executes halt_code, exit delivered to VMM.
     _ = syscall.vm_vcpu_run(vcpu_handle);
 
     const exit_token = syscall.vm_recv(@bitCast(cr), @intFromPtr(&buf), 1);
@@ -131,19 +82,10 @@ pub fn main(pv: u64) void {
         syscall.shutdown();
     }
 
-    // Inject a virtual interrupt (vector 0x20, type=0 external) into the vCPU.
-    // GuestInterrupt: vector(u8), interrupt_type(u8), error_code_valid(bool=u8),
-    //                 _pad(5 bytes), error_code(u32), _pad2(4 bytes)
-    interrupt_data[0] = 0x20; // vector
-    interrupt_data[1] = 0; // type = external
-    interrupt_data[2] = 0; // error_code_valid = false
-
-    // Inject the interrupt while the vCPU is stopped (after HLT exit).
-    // Ideally we would verify the interrupt is actually delivered by having
-    // a guest with an IDT that handles vector 0x20 and signals back (e.g.,
-    // writing to an I/O port). However, setting up an IDT in real mode is
-    // complex and orthogonal to this test. We verify the syscall succeeds
-    // (E_OK), which confirms the kernel accepted the injection request.
+    // Inject a virtual interrupt. We only verify the syscall returns E_OK,
+    // which confirms the kernel accepted the injection request. Setting up
+    // a guest IDT / vector table to verify actual delivery is orthogonal.
+    initTestInterrupt(&interrupt_data);
     const result = syscall.vm_vcpu_interrupt(vcpu_handle, @intFromPtr(&interrupt_data));
     t.expectEqual("§4.2.11", syscall.E_OK, result);
 
