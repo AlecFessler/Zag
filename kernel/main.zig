@@ -14,6 +14,19 @@ const BootInfo = zag.boot.protocol.BootInfo;
 const PAddr = zag.memory.address.PAddr;
 const VAddr = zag.memory.address.VAddr;
 
+comptime {
+    // aarch64 `-Ddirect_kernel=true` builds: force-reference the Zig
+    // entry helper that start.S branches to. Without this, Zig's lazy
+    // compilation skips the module and `ld.lld` fails with "undefined
+    // symbol: directKernelEntry". Gated to aarch64 so x86 builds don't
+    // try to compile it. We can't gate on `direct_kernel` itself (no
+    // build option plumbed to Zig here), but the UEFI aarch64 path
+    // just keeps an unused ~500-byte function around, which is fine.
+    if (@import("builtin").cpu.arch == .aarch64) {
+        _ = &@import("arch/aarch64/boot/direct_kernel.zig").directKernelEntry;
+    }
+}
+
 pub fn panic(
     msg: []const u8,
     error_return_trace: ?*std.builtin.StackTrace,

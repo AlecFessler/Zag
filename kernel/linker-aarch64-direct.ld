@@ -53,10 +53,19 @@ SECTIONS {
         *(.data.boot*)
     } :boot
 
+    /* Pad the boot segment out to the next 2 MiB boundary so the kernel
+     * section's LMA is 2 MiB aligned. That lets the Phase 3 TTBR1 map
+     * use a single 2 MiB block descriptor for the high-VA kernel image
+     * without needing 4K page entries. The padding costs ~2 MiB of
+     * direct-kernel ELF size but keeps the boot stub's page-table code
+     * dead simple. */
+    . = ALIGN(2M);
     _boot_end_lma = .;
 
     /* Kernel image: linked at high VA, LMA continues right after the
-     * boot stub so QEMU loads everything in one contiguous blob. */
+     * padded boot stub so QEMU loads everything in one contiguous blob
+     * and the kernel VMA 0xFFFF000000000000 maps cleanly to the 2 MiB-
+     * aligned LMA via block descriptors. */
     . = KERNEL_VADDR_BASE;
 
     .text ALIGN(4K) : AT(_boot_end_lma) {

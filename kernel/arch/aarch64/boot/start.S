@@ -1,201 +1,146 @@
 // aarch64 direct-kernel boot entry.
 //
-// This file is ONLY linked into the kernel when `-Ddirect_kernel=true`
-// is passed to `zig build`. In that mode the kernel ELF is loaded by
-// QEMU's `-kernel` machinery (`qemu-system-aarch64 -M virt \
-// -machine virtualization=on -kernel kernel.elf`) and enters at
-// `_start` with:
+// Linked into the kernel only when `-Ddirect_kernel=true`. In that mode
+// QEMU (`-M virt,virtualization=on -kernel`) loads the ELF directly and
+// jumps here at EL2 with x0 = DTB phys, MMU off. The regular UEFI path
+// (`kEntry` symbol) still works for builds that omit this file.
 //
-//     x0 = physical address of the device tree blob (DTB)
-//     PC = ELF entry point (`_start`)
-//     EL = EL2 when `virtualization=on`, EL1 otherwise
-//     MMU off, caches off, SP undefined
+// Boot phases:
 //
-// The default UEFI build path (`kernel.entry = "kEntry"`) is untouched
-// by this file and keeps working — the AAVMF bootloader still calls
-// straight into `kEntry` at EL1 with x0=BootInfo*.
+//   Phase 1 (history): minimal print-and-halt from EL2.
 //
-// Why a separate entry: the EL2 sysregs the aarch64 KVM object layer
-// needs (HCR_EL2, VTTBR_EL2, VTCR_EL2, VBAR_EL2, ICH_*, TLBI IPAS2E1IS)
-// are completely inaccessible from the EL1-only UEFI boot path. The
-// Debian/Ubuntu AAVMF_CODE.fd on this host can't be booted with
-// `virtualization=on` (it crashes inside its own firmware), so the
-// only way to reach EL2 in TCG is to bypass AAVMF via `-kernel`.
+//   Phase 2 (history): programmed MMU + 16 MiB identity map, dropped to
+//                      EL1 through ERET, proved translation works,
+//                      halted at a landing pad.
 //
-// Boot phases, developed incrementally:
+//   Phase 3 (this file): full TTBR0 identity (1 GiB block) + TTBR1 high-
+//                        VA kernel image map (8 × 2 MiB blocks), then
+//                        branch to Zig helper `directKernelEntry` at the
+//                        kernel's high VA, which synthesises BootInfo
+//                        and tail-calls `kEntry`. From there the kernel
+//                        boots the same way it does under UEFI.
 //
-//   Phase 1 — minimal. Print "E2\n" from EL2 and halt. Proves the
-//             split-layout ELF loads and runs. (commit 9345a85)
+// Memory layout (direct-kernel, -m 1G, virt):
 //
-//   Phase 2 — this file. Configure HCR_EL2/CPTR_EL2, set up MAIR_EL1 /
-//             TCR_EL1 / TTBR0_EL1 with an identity 16 MiB map starting
-//             at 0x40000000, enable SCTLR_EL1.M|C|I, ERET to EL1t with
-//             MMU on. Land at `phase2_el1_landing` (low-VA identity
-//             mapped), print "2M E1\n", halt. Proves the full EL2 →
-//             EL1 drop works under translation.
+//   PA 0x09000000            PL011 UART (Device-nGnRnE)
+//   PA 0x40000000..0x80000000  1 GiB of RAM
+//   PA 0x40080000..0x40200000  boot PT_LOAD (stub + page tables + stack)
+//   PA 0x40200000..            kernel PT_LOAD (text/rodata/data/bss)
+//   VA 0xFFFF000000000000..    kernel image (TTBR1, 8 × 2 MiB blocks)
 //
-//   Phase 3 — parse the DTB in x19 into a synthesized BootInfo (memory
-//             map from /memory nodes, root_service from @embedFile),
-//             install TTBR1 high-VA mapping so kernel VAs work, jump
-//             to `kEntry` with the BootInfo pointer.
+// Page tables built here (all 4 KiB, in .data.boot):
 //
-//   Phase 4 — install an EL2 hyp-stub vector (VBAR_EL2), leave space
-//             for the vmResume trampoline. kEntry runs normally at
-//             EL1; VM entry/exit uses HVC.
+//   TTBR0 (low-VA identity):
+//     __ttbr0_l0[0] → __ttbr0_l1
+//     __ttbr0_l1[0] → __ttbr0_l2_dev   (0x00000000..0x40000000, for PL011)
+//     __ttbr0_l1[1] = 1 GiB block → PA 0x40000000 (all of RAM)
+//     __ttbr0_l2_dev[72] = 2 MiB device block for PL011 at 0x09000000
 //
-// Markers emitted on the PL011 UART (0x09000000) so that any crash mid-
-// sequence can be localised just from the serial tail:
+//   TTBR1 (high-VA kernel image):
+//     __ttbr1_l0[0]  → __ttbr1_l1
+//     __ttbr1_l1[0]  → __ttbr1_l2
+//     __ttbr1_l2[0..7] = 2 MiB Normal-WB blocks → PA 0x40200000..0x41200000
 //
-//     "2"   — EL2 entry reached, stack up
-//     "M"   — MMU enabled at EL1 sysreg level, about to ERET
-//     "E1"  — EL1 landing pad executed (post-ERET, translation live)
+// Markers on the PL011 UART (single-char each; a healthy boot prints
+// "3M K T M m ..." — the lowercase letters come from kMain's own early
+// debug chars once control reaches high-VA kernel code):
 //
-// Each marker is emitted exactly once, in order, so the final serial
-// output for a healthy phase 2 boot is:
-//
-//     2M E1
-//
-// Register conventions inside this file:
-//     x19 — saved DTB phys addr (x0 at entry). Preserved across calls.
-//     x9..x18 — scratch. Do not rely on their value across any `bl`.
+//   '3' — EL2 entry reached in Phase 3 (stack valid)
+//   'M' — EL1 MMU sysregs programmed, about to ERET
 //
 // References:
-//   ARM ARM D13.2.25   CurrentEL
-//   ARM ARM D13.2.46   HCR_EL2
-//   ARM ARM D13.2.30   CPTR_EL2
-//   ARM ARM D13.2.97   MAIR_EL1
-//   ARM ARM D13.2.131  TCR_EL1
-//   ARM ARM D13.2.132  TTBR0_EL1 / TTBR1_EL1
-//   ARM ARM D13.2.118  SCTLR_EL1
-//   ARM ARM D1.11      Exception entry/return (ERET semantics)
-//   ARM ARM D5.3.3     VMSAv8-64 stage-1 block/table descriptors
-//   QEMU docs/system/arm/virt.rst  — direct-kernel boot ABI
-
-// =====================================================================
-// .text.boot — entry code. Must stay in the low-PA boot segment so we
-// can execute it with the MMU off. Keep all subroutines called before
-// phase2_el1_landing in this section; once we're past ERET, we can
-// start using high-VA code.
-// =====================================================================
+//   ARM ARM D5.3.3   VMSAv8-64 block/table descriptor encoding
+//   ARM ARM D13.2.*  HCR_EL2 / CPTR_EL2 / MAIR_EL1 / TCR_EL1 / SCTLR_EL1
+//   QEMU docs/system/arm/virt.rst — direct-kernel boot ABI
 
     .section .text.boot,"ax",%progbits
     .global _start
 _start:
-    // Detect how we were entered.
-    //
-    // UEFI path: AAVMF drops to EL1 long before us, and the Zag
-    // bootloader calls the ELF entry symbol with x0 = BootInfo*.
-    // Detect this by reading CurrentEL and tail-calling `kEntry` so
-    // that this file can be linked into UEFI builds too without
-    // breaking them. (In practice `-Ddirect_kernel=true` is the only
-    // build that includes this file, so the EL1 branch is dormant.)
-    //
-    // Direct-kernel path: QEMU enters us at EL2 with x0 = DTB phys.
-    // Fall through to the real init sequence below.
+    // UEFI-path detector: if we were entered at EL1 (i.e. a UEFI-loaded
+    // build that happens to have this file linked in), tail-call kEntry
+    // so nothing about the UEFI flow changes. Direct-kernel enters at
+    // EL2 and falls through.
     mrs     x9, CurrentEL
     lsr     x9, x9, #2
     cmp     x9, #1
     b.eq    el1_uefi_entry
-    // fall through to EL2 direct-kernel entry
 
-    // Save DTB phys addr. It's the one thing from QEMU we must keep
-    // across every helper call until we hand it to kEntry in Phase 3.
+    // Direct-kernel EL2 entry. Save DTB; bring up bootstrap stack.
     mov     x19, x0
-
-    // Bring up the bootstrap stack. __boot_stack_top lives in
-    // .data.boot, identity-loaded by QEMU at a known low PA, so an
-    // adrp+:lo12: reference works with the MMU still off.
     adrp    x9, __boot_stack_top
     add     x9, x9, :lo12:__boot_stack_top
     mov     sp, x9
 
-    // Marker '2' — reached EL2 entry, stack valid, about to touch
-    // sysregs. If serial stops here the problem is in sysreg access
-    // or the HCR_EL2 / CPTR_EL2 sequence.
-    mov     w0, #'2'
+    mov     w0, #'3'
     bl      uart_putc
 
-    // HCR_EL2.RW = 1: EL1 executes in AArch64. This bit is IMP-DEF at
-    // reset on some parts, so set it explicitly before doing anything
-    // that depends on EL1 state. All other HCR_EL2 bits are zero for
-    // now — VM=0 (stage-2 off), TGE=0 (no host OS semantics), no
-    // traps. The KVM vmResume path will flip the relevant bits per
-    // guest entry, not here.
+    // HCR_EL2.RW = 1: EL1 executes AArch64. Everything else left at
+    // reset-default zero; KVM vmResume will flip per-guest bits later.
     mov     x9, #1
     lsl     x9, x9, #31
     msr     hcr_el2, x9
     isb
 
-    // CPTR_EL2: allow FP/SIMD access from lower ELs without trapping
-    // to EL2. The 0x33FF value matches the architecturally required
-    // bits plus TFP=0 / TCPAC=0 — the same pattern Linux arm64 uses
-    // when coming up at EL2 before dropping to EL1.
+    // CPTR_EL2: don't trap FP/SIMD to EL2. Matches Linux arm64 head.S.
     mov     x9, #0x33FF
     msr     cptr_el2, x9
     isb
 
-    // MAIR_EL1:
-    //   index 0 = 0xFF — Normal, Inner WB RA+WA, Outer WB RA+WA (for RAM)
-    //   index 1 = 0x00 — Device-nGnRnE (for PL011 UART MMIO)
-    //   all other indices are 0 (device-nGnRnE) which is fine unused.
+    // CPACR_EL1.FPEN = 11: don't trap EL0/EL1 FP/SIMD to EL1. Without
+    // this, the first FP/SIMD instruction emitted by the Zig compiler
+    // inside `directKernelEntry` (struct copy, register spill, etc.)
+    // raises a synchronous EC=0x07 trap and we never reach kEntry.
+    mov     x9, #(0b11 << 20)
+    msr     cpacr_el1, x9
+    isb
+
+    // MAIR_EL1: index 0 = Normal WB, index 1 = Device-nGnRnE, all others 0.
     ldr     x9, =0x00000000000000FF
     msr     mair_el1, x9
 
-    // TCR_EL1:
-    //   T0SZ=16, TG0=4K, SH0=IS, IRGN0=WB, ORGN0=WB  (TTBR0 walk config)
-    //   T1SZ=16, TG1=4K, SH1=IS, IRGN1=WB, ORGN1=WB  (TTBR1 walk config)
-    //   IPS=40-bit
-    // TTBR1 is set to the same L0 as TTBR0 below; with no entries it
-    // will fault any high-VA access, which is what we want for Phase 2.
+    // TCR_EL1: 4K granule, T0SZ=T1SZ=16, IS shareable, WB walks, IPS=40.
     ldr     x9, =0x00000002B5103510
     msr     tcr_el1, x9
 
-    // Zero the three page-table pages reserved in .data.boot, then
-    // write the descriptors for a 16 MiB identity map at 0x40000000.
-    // That range covers the entire direct-kernel ELF image (boot
-    // stub + kernel text/rodata/data, both at ≤ a few MB from that
-    // base) with plenty of headroom.
     bl      zero_boot_pagetables
     bl      build_ttbr0_identity
+    bl      build_ttbr1_kernel
 
-    // Point both TTBRs at the boot L0 table. TTBR1 walks will miss
-    // because no high-VA entries are populated — that's OK for phase
-    // 2, we won't execute at a high VA yet. Phase 3 extends the L0
-    // to cover the kernel's 0xFFFF000000000000 range.
+    // TTBR0 = low-VA identity root; TTBR1 = high-VA kernel image root.
     adrp    x9, __ttbr0_l0
     add     x9, x9, :lo12:__ttbr0_l0
     msr     ttbr0_el1, x9
+    adrp    x9, __ttbr1_l0
+    add     x9, x9, :lo12:__ttbr1_l0
     msr     ttbr1_el1, x9
 
-    // Ensure page-table stores are visible to the page-table walker
-    // before enabling translation. `dsb ishst` gates stores; `isb`
-    // prevents the subsequent SCTLR_EL1 write from reordering past.
     dsb     ishst
     isb
 
-    // Enable EL1 MMU + data/instr caches. Preserve the RES1 bits
-    // already set in SCTLR_EL1 by the CPU reset state.
+    // Install a diagnostic VBAR_EL1 so any EL1 fault lands in our
+    // print-and-halt stub instead of looping in page-faulted vectors.
+    adrp    x9, __diag_vectors
+    add     x9, x9, :lo12:__diag_vectors
+    msr     vbar_el1, x9
+    isb
+
+    // Enable EL1 MMU + D-cache + I-cache. SCTLR_EL1 RES1 bits preserved.
     mrs     x9, sctlr_el1
-    orr     x9, x9, #(1 << 0)   // M — MMU enable at EL1
-    orr     x9, x9, #(1 << 2)   // C — data cache enable at EL1
-    orr     x9, x9, #(1 << 12)  // I — instruction cache enable at EL1
+    orr     x9, x9, #(1 << 0)
+    orr     x9, x9, #(1 << 2)
+    orr     x9, x9, #(1 << 12)
     msr     sctlr_el1, x9
     dsb     ish
     isb
 
-    // Marker 'M' — SCTLR_EL1 programmed; about to ERET down into EL1
-    // with the identity map active. Note this still prints with EL2
-    // SCTLR_EL2.M=0, so the MMU being "on" here refers only to the
-    // EL1 state we're setting up for after ERET.
     mov     w0, #'M'
     bl      uart_putc
 
-    // Prepare ERET: land at phase2_el1_landing (low-VA, TTBR0 walks).
-    // SPSR_EL2 = 0x3C5 ⇒ M[3:0]=0101 (EL1h, stack=SP_EL1), DAIF all
-    // masked. x0 carries the DTB pointer for the landing pad's use
-    // (Phase 3 will consume it).
-    adrp    x9, phase2_el1_landing
-    add     x9, x9, :lo12:phase2_el1_landing
+    // ERET into the low-VA landing pad. From there we'll branch to the
+    // high-VA Zig entry point, which lives in .text of the kernel image
+    // and is reachable because TTBR1 now covers it.
+    adrp    x9, phase3_el1_trampoline
+    add     x9, x9, :lo12:phase3_el1_trampoline
     msr     elr_el2, x9
     mov     x9, #0x3C5
     msr     spsr_el2, x9
@@ -210,114 +155,163 @@ el1_uefi_entry:
     br      x9
 
 // -----------------------------------------------------------------
-// Phase-2 EL1 landing.
-//
-// Still in the low-PA identity region (TTBR0 walk active, TTBR1
-// empty). Job: prove translation works end-to-end by emitting a
-// marker and halting. Phase 3 will replace this stub with a real
-// hand-off into the high-VA kEntry.
+// Phase-3 EL1 trampoline. Still in the low-PA identity region; hops
+// to the high-VA Zig entry. SP is reloaded because exception return
+// switches to SP_EL1 which wasn't initialised at the EL2 side.
 // -----------------------------------------------------------------
-phase2_el1_landing:
-    // SP was set on the EL2 side but hardware swaps to SP_EL1 on
-    // exception entry. Reload it so the helper calls have a stack.
+phase3_el1_trampoline:
     adrp    x9, __boot_stack_top
     add     x9, x9, :lo12:__boot_stack_top
     mov     sp, x9
-
-    mov     w0, #' '
-    bl      uart_putc
+    // Marker 'E' — post-ERET, low-VA code running with MMU on.
+    mov     x19, x0            // preserve DTB while we clobber x0 for putc
     mov     w0, #'E'
     bl      uart_putc
-    mov     w0, #'1'
+    // Marker 'H' — about to branch to high-VA Zig entry.
+    mov     w0, #'H'
     bl      uart_putc
-    mov     w0, #'\n'
-    bl      uart_putc
-1:  wfe
-    b       1b
+    mov     x0, x19
+    // Hand off to Zig via the C ABI. The symbol resolves through the
+    // literal pool at link time; its value is a high VA that requires
+    // TTBR1 + kernel block descriptors to be live.
+    ldr     x9, =directKernelEntry
+    br      x9
 
 // -----------------------------------------------------------------
-// Helpers. All run with the MMU off (EL2 side) and therefore must be
-// position-stable at their LMA — keep them in .text.boot.
+// Helpers (run MMU-off at EL2, must stay in .text.boot).
 // -----------------------------------------------------------------
 
-// w0 = byte to send. Writes PL011 DR at 0x09000000. The QEMU PL011
-// model accepts raw byte writes to DR without any FCR/LCR/CR setup
-// at reset, so a single store suffices.
+// w0 = byte. PL011 DR is raw-writable after reset in QEMU virt.
 uart_putc:
     ldr     x1, =0x09000000
     strb    w0, [x1]
     ret
 
-// Zero all four boot page tables (L0 + L1 + L2_ram + L2_dev = 16 KiB).
+// Print a 16-nibble hex value in x0. Clobbers x0..x3.
+uart_puthex:
+    mov     x3, x0
+    mov     x2, #16
+1:  lsr     x0, x3, #60             // top nibble
+    and     x0, x0, #0xF
+    cmp     x0, #10
+    b.lt    2f
+    add     x0, x0, #('A' - 10)
+    b       3f
+2:  add     x0, x0, #'0'
+3:  ldr     x1, =0x09000000
+    strb    w0, [x1]
+    lsl     x3, x3, #4
+    subs    x2, x2, #1
+    b.ne    1b
+    ret
+
+// Diagnostic EL1 vector table. Only the sync-from-same-EL-SP_ELx
+// handler (+0x200) is populated; everything else halts silently.
+// Prints 'F', ESR_EL1, ':', FAR_EL1, newline, then WFEs forever. A
+// page fault mid-transition now shows up as a single line in the
+// serial tail instead of an infinite exception loop.
+    .balign 2048
+__diag_vectors:
+    .org __diag_vectors + 0x000
+    b       diag_halt                   // sync EL1t
+    .org __diag_vectors + 0x080
+    b       diag_halt                   // irq EL1t
+    .org __diag_vectors + 0x100
+    b       diag_halt                   // fiq EL1t
+    .org __diag_vectors + 0x180
+    b       diag_halt                   // serror EL1t
+    .org __diag_vectors + 0x200
+    b       diag_fault                  // sync EL1h
+    .org __diag_vectors + 0x280
+    b       diag_halt                   // irq EL1h
+    .org __diag_vectors + 0x300
+    b       diag_halt                   // fiq EL1h
+    .org __diag_vectors + 0x380
+    b       diag_halt                   // serror EL1h
+    .org __diag_vectors + 0x400
+    b       diag_halt                   // sync lower EL aarch64
+    .org __diag_vectors + 0x480
+    b       diag_halt
+    .org __diag_vectors + 0x500
+    b       diag_halt
+    .org __diag_vectors + 0x580
+    b       diag_halt
+    .org __diag_vectors + 0x600
+    b       diag_halt
+    .org __diag_vectors + 0x680
+    b       diag_halt
+    .org __diag_vectors + 0x700
+    b       diag_halt
+    .org __diag_vectors + 0x780
+    b       diag_halt
+
+diag_fault:
+    mov     w0, #'F'
+    bl      uart_putc
+    mrs     x0, esr_el1
+    bl      uart_puthex
+    mov     w0, #':'
+    bl      uart_putc
+    mrs     x0, far_el1
+    bl      uart_puthex
+    mov     w0, #'\n'
+    bl      uart_putc
+diag_halt:
+1:  wfe
+    b       1b
+
+// Zero all six boot page tables (5 × 4 KiB for TTBR0+TTBR1 plus the
+// device L2 table = 6 × 4 KiB = 24 KiB). Keeping them in a contiguous
+// run in .data.boot lets this be a single linear sweep.
 zero_boot_pagetables:
-    adrp    x0, __ttbr0_l0
-    add     x0, x0, :lo12:__ttbr0_l0
-    mov     x1, #(4 * 4096)
+    adrp    x0, __boot_pagetables_start
+    add     x0, x0, :lo12:__boot_pagetables_start
+    mov     x1, #(6 * 4096)
 1:  str     xzr, [x0], #8
     subs    x1, x1, #8
     b.ne    1b
     ret
 
-// Build the TTBR0 identity map. Two level-2 tables so that a single
-// L1 covers both the device range (L1[0], contains PL011 at
-// 0x09000000) and the kernel RAM range (L1[1], PA 0x40000000+):
-//
-//   L2_ram[0..7] — 2 MiB Normal-WB blocks, PA 0x40000000 .. 0x41000000
-//   L2_dev[72]   — 2 MiB Device-nGnRnE block, PA 0x09000000 .. 0x09200000
-//                  (index = 0x09000000 >> 21 = 72 in the L1[0] 1 GiB slot)
-//   L1[0] → L2_dev   (VA 0x00000000..0x40000000)
-//   L1[1] → L2_ram   (VA 0x40000000..0x80000000)
+// Build TTBR0 identity map:
 //   L0[0] → L1
+//   L1[0] → L2_dev       (VA 0x00000000..0x40000000, for PL011)
+//   L1[1] = 1 GiB block  (VA 0x40000000..0x80000000 → PA 0x40000000)
+//   L2_dev[72] = 2 MiB device block for PL011 @ 0x09000000
 //
-// Block descriptor encoding (ARM ARM D5.3.3):
-//   [0]    = 1                valid
-//   [1]    = 0                block (at level 2)
-//   [4:2]  = AttrIndx         0 = Normal WB, 1 = Device-nGnRnE
-//   [7:6]  = 00               AP — RW at EL1, no EL0 access
-//   [9:8]  = 11               SH — inner shareable
-//   [10]   = 1                AF — access flag
-//   [47:21]= PA>>21           2 MiB-aligned physical block address
+// Block encoding (ARM ARM D5.3.3):
+//   Normal WB   low bits = 0x701 (at L1: block=bit1=0 → 0x701 with [1:0]=01)
+//   Device      low bits = 0x705
+//   Table desc  low bits = 0x003
 //
-//   → Normal WB block low bits = 0x701
-//   → Device   block low bits = 0x705  (AttrIdx=1 means bit 2 = 1)
+// At L1 the "block" descriptor has [1:0]=01, giving 0x...701 when
+// combined with the AttrIdx/AP/SH/AF bits. Same shape as the 2 MiB
+// block at L2 — the block/table distinction is purely bit[1].
 build_ttbr0_identity:
-    // L2_ram: 8 block descriptors mapping 16 MiB at 0x40000000.
-    adrp    x0, __ttbr0_l2_ram
-    add     x0, x0, :lo12:__ttbr0_l2_ram
-    ldr     x1, =0x0000000040000000
-    mov     x2, #0x701
-    mov     x3, #8
-1:  orr     x4, x1, x2
-    str     x4, [x0], #8
-    add     x1, x1, #0x200000       // +2 MiB
-    subs    x3, x3, #1
-    b.ne    1b
-
-    // L2_dev[72] = device block for 0x09000000 .. 0x09200000. This
-    // covers the PL011 UART (0x09000000) and the RTC (0x09010000),
-    // which is enough for Phase 2 debug output. Index 72 = 0x48.
+    // L2_dev[72]: PL011 device block.
     adrp    x0, __ttbr0_l2_dev
     add     x0, x0, :lo12:__ttbr0_l2_dev
     ldr     x1, =0x0000000009000000
-    mov     x2, #0x705              // Device-nGnRnE block
+    mov     x2, #0x705
     orr     x4, x1, x2
     str     x4, [x0, #(72 * 8)]
 
-    // L1[0] → L2_dev (VA range [0, 1 GiB))
+    // L1[0] → L2_dev (table descriptor).
     adrp    x0, __ttbr0_l1
     add     x0, x0, :lo12:__ttbr0_l1
     adrp    x1, __ttbr0_l2_dev
     add     x1, x1, :lo12:__ttbr0_l2_dev
-    orr     x1, x1, #0x3            // table descriptor: valid | table
+    orr     x1, x1, #0x3
     str     x1, [x0, #0]
 
-    // L1[1] → L2_ram (VA range [1 GiB, 2 GiB))
-    adrp    x1, __ttbr0_l2_ram
-    add     x1, x1, :lo12:__ttbr0_l2_ram
-    orr     x1, x1, #0x3
+    // L1[1]: 1 GiB Normal-WB block mapping PA 0x40000000..0x80000000.
+    // One block replaces the old L2_ram table; bump_allocator regions
+    // beyond 16 MiB still resolve under the identity map this way.
+    ldr     x1, =0x0000000040000000
+    mov     x2, #0x701
+    orr     x1, x1, x2
     str     x1, [x0, #8]
 
-    // L0[0] → L1
+    // L0[0] → L1.
     adrp    x0, __ttbr0_l0
     add     x0, x0, :lo12:__ttbr0_l0
     adrp    x1, __ttbr0_l1
@@ -325,7 +319,53 @@ build_ttbr0_identity:
     orr     x1, x1, #0x3
     str     x1, [x0]
 
-    dsb     ishst                   // tables visible to the walker
+    dsb     ishst
+    ret
+
+// Build TTBR1 high-VA kernel image map:
+//   L0[0] → L1
+//   L1[0] → L2
+//   L2[0..7] = 2 MiB Normal-WB blocks → PA 0x40200000..0x41200000
+//
+// This covers kernel .text + .rodata + .data + .bss up to 16 MiB. If
+// the kernel image ever grows past that, bump the loop count here and
+// in the linker pad. Our test builds are ~5 MiB currently, so 16 MiB
+// is comfortable headroom.
+//
+// After memory.init() builds its physmap, TTBR1 gets populated with
+// additional entries by mapPageBoot — those live at L0[511] (physmap
+// VA 0xFFFF_FF80_0000_0000), which is a different L0 slot from this
+// kernel_code mapping, so there's no conflict.
+build_ttbr1_kernel:
+    // L2[0..7]: eight 2 MiB blocks covering 16 MiB of kernel image.
+    adrp    x0, __ttbr1_l2
+    add     x0, x0, :lo12:__ttbr1_l2
+    ldr     x1, =0x0000000040200000
+    mov     x2, #0x701
+    mov     x3, #8
+1:  orr     x4, x1, x2
+    str     x4, [x0], #8
+    add     x1, x1, #0x200000
+    subs    x3, x3, #1
+    b.ne    1b
+
+    // L1[0] → L2.
+    adrp    x0, __ttbr1_l1
+    add     x0, x0, :lo12:__ttbr1_l1
+    adrp    x1, __ttbr1_l2
+    add     x1, x1, :lo12:__ttbr1_l2
+    orr     x1, x1, #0x3
+    str     x1, [x0, #0]
+
+    // L0[0] → L1.
+    adrp    x0, __ttbr1_l0
+    add     x0, x0, :lo12:__ttbr1_l0
+    adrp    x1, __ttbr1_l1
+    add     x1, x1, :lo12:__ttbr1_l1
+    orr     x1, x1, #0x3
+    str     x1, [x0]
+
+    dsb     ishst
     ret
 
 // =====================================================================
@@ -338,20 +378,30 @@ build_ttbr0_identity:
     .balign 16
     .global __boot_stack_bottom
 __boot_stack_bottom:
-    .space 4096
+    .space 0x6000                   // 24 KiB stack (matches boot.protocol.STACK_SIZE)
     .global __boot_stack_top
 __boot_stack_top:
 
     .balign 4096
+    .global __boot_pagetables_start
+__boot_pagetables_start:
     .global __ttbr0_l0
 __ttbr0_l0:
     .space 4096
     .global __ttbr0_l1
 __ttbr0_l1:
     .space 4096
-    .global __ttbr0_l2_ram
-__ttbr0_l2_ram:
-    .space 4096
     .global __ttbr0_l2_dev
 __ttbr0_l2_dev:
     .space 4096
+    .global __ttbr1_l0
+__ttbr1_l0:
+    .space 4096
+    .global __ttbr1_l1
+__ttbr1_l1:
+    .space 4096
+    .global __ttbr1_l2
+__ttbr1_l2:
+    .space 4096
+    .global __boot_pagetables_end
+__boot_pagetables_end:
