@@ -124,6 +124,17 @@ _start:
     msr     vbar_el1, x9
     isb
 
+    // Install the EL2 hyp stub vector table so HVC from EL1 reaches a
+    // real handler. Runs with SCTLR_EL2.M=0 (EL2 MMU off), so the
+    // vector PAs come from adrp against the kernel LMA in .text.boot.
+    // Until the world-switch path lands, the HVC handler is a trivial
+    // ERET back to EL1 so we can smoke-test that the hyp stub round-
+    // trips without touching guest state.
+    adrp    x9, __hyp_vectors
+    add     x9, x9, :lo12:__hyp_vectors
+    msr     vbar_el2, x9
+    isb
+
     // Enable EL1 MMU + D-cache + I-cache. SCTLR_EL1 RES1 bits preserved.
     mrs     x9, sctlr_el1
     orr     x9, x9, #(1 << 0)
@@ -257,6 +268,67 @@ diag_fault:
     mov     w0, #'\n'
     bl      uart_putc
 diag_halt:
+1:  wfe
+    b       1b
+
+// -----------------------------------------------------------------
+// EL2 hyp stub vectors. Runs with EL2 MMU off (SCTLR_EL2.M=0), so
+// all code must be PA-addressable (.text.boot at its LMA in low RAM).
+//
+// Entry at +0x400 (sync from lower EL, AArch64) handles HVC from EL1.
+// For the first increment this just ERETs back: HVC trap has already
+// updated ELR_EL2 to the instruction after the HVC and SPSR_EL2 to
+// the caller PSTATE, so a bare ERET returns control to EL1 at the
+// next instruction. This lets the EL1 kernel smoke-test that the
+// hyp stub is installed and the round-trip works without touching
+// guest state.
+//
+// All other vectors halt: nothing else should ever trap to EL2 with
+// our current HCR_EL2 (only RW=1 is set, no traps enabled). If one
+// does, halt so we notice rather than silently ERETing.
+    .balign 2048
+__hyp_vectors:
+    .org __hyp_vectors + 0x000
+    b       hyp_halt                    // sync EL2t
+    .org __hyp_vectors + 0x080
+    b       hyp_halt                    // irq EL2t
+    .org __hyp_vectors + 0x100
+    b       hyp_halt                    // fiq EL2t
+    .org __hyp_vectors + 0x180
+    b       hyp_halt                    // serror EL2t
+    .org __hyp_vectors + 0x200
+    b       hyp_halt                    // sync EL2h
+    .org __hyp_vectors + 0x280
+    b       hyp_halt                    // irq EL2h
+    .org __hyp_vectors + 0x300
+    b       hyp_halt                    // fiq EL2h
+    .org __hyp_vectors + 0x380
+    b       hyp_halt                    // serror EL2h
+    .org __hyp_vectors + 0x400
+    b       hyp_sync_lower_a64          // sync lower EL A64 (HVC)
+    .org __hyp_vectors + 0x480
+    b       hyp_halt                    // irq lower EL A64
+    .org __hyp_vectors + 0x500
+    b       hyp_halt                    // fiq lower EL A64
+    .org __hyp_vectors + 0x580
+    b       hyp_halt                    // serror lower EL A64
+    .org __hyp_vectors + 0x600
+    b       hyp_halt
+    .org __hyp_vectors + 0x680
+    b       hyp_halt
+    .org __hyp_vectors + 0x700
+    b       hyp_halt
+    .org __hyp_vectors + 0x780
+    b       hyp_halt
+
+hyp_sync_lower_a64:
+    // ESR_EL2.EC == 0b010110 (HVC) is the only case we care about for
+    // now. Unconditionally ERET so the kernel smoke test can confirm
+    // the round-trip works. Later versions will decode ESR_EL2 here
+    // and dispatch by hypercall id in x0.
+    eret
+
+hyp_halt:
 1:  wfe
     b       1b
 
