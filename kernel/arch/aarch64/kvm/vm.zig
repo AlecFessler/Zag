@@ -86,6 +86,21 @@ pub const Vm = struct {
     /// `VTTBR_EL2.VMID`. See ARM ARM D5.10 "VMID and TLB maintenance".
     vmid: u8 = 0,
     vmid_generation: u64 = 0,
+    /// HCR_EL2 trap overrides driven by `sysregPassthrough`. The effective
+    /// HCR_EL2 programmed on each `vmResume` is
+    ///
+    ///     (HCR_EL2_LINUX_GUEST | hcr_el2_override_set) & ~hcr_el2_override_clear
+    ///
+    /// Default (0, 0) keeps every trap bit in `HCR_EL2_LINUX_GUEST` forced
+    /// on — the baseline denies passthrough of ACTLR_EL1, impl-def sysregs,
+    /// and the TVM/TRVM sysreg family. A `sysregPassthrough` call that
+    /// ALLOWS one of those classes drops the matching HCR bit into
+    /// `hcr_el2_override_clear`. Writes are serialized under `lock` by the
+    /// syscall entry in this file; the world-switch reader (`vmResume`) is
+    /// the owning vCPU thread, which is the same thread that issued the
+    /// syscall — so a plain load is sufficient.
+    hcr_el2_override_set: u64 = 0,
+    hcr_el2_override_clear: u64 = 0,
 
     /// Destroy this VM: kill all vCPU threads, free guest memory and
     /// arch structures, clear the owner's vm pointer.
@@ -392,7 +407,7 @@ fn rollbackGuestMap(vm_obj: *Vm, guest_addr: u64, mapped_size: u64) void {
 }
 
 /// `vm_sysreg_passthrough` — on ARM the `sysreg_id` parameter is a packed
-/// (op0,op1,crn,crm,op2) sysreg encoding (see `vm_hw.sysregPassthrough`
+/// (op0,op1,crn,crm,op2) sysreg encoding (see `vm_hw.sysregPassthroughOverride`
 /// header). The kernel refuses security-critical sysregs that would
 /// allow the guest to escape EL1 confinement.
 pub fn sysregPassthrough(proc: *Process, vm_handle: u64, sysreg_id: u32, allow_read: bool, allow_write: bool) i64 {
@@ -406,7 +421,13 @@ pub fn sysregPassthrough(proc: *Process, vm_handle: u64, sysreg_id: u32, allow_r
     vm_obj.lock.lock();
     defer vm_obj.lock.unlock();
 
-    arch.vmSysregPassthrough(vm_obj.arch_structures, sysreg_id, allow_read, allow_write);
+    vm_hw.sysregPassthroughOverride(
+        sysreg_id,
+        allow_read,
+        allow_write,
+        &vm_obj.hcr_el2_override_set,
+        &vm_obj.hcr_el2_override_clear,
+    );
     return 0; // E_OK
 }
 
@@ -501,7 +522,7 @@ fn writeGuestGpr(gs: *vm_hw.GuestState, n: u8, value: u64) void {
 /// let the guest reach EL2 / EL3 state, plus the ID registers we depend on
 /// for VmPolicy decisions.
 ///
-/// The encoding scheme matches the doc comment on `vm_hw.sysregPassthrough`:
+/// The encoding scheme matches the doc comment on `vm_hw.sysregPassthroughOverride`:
 ///   bits [15:14] Op0
 ///   bits [13:11] Op1
 ///   bits [10:7]  CRn

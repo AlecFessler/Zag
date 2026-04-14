@@ -926,24 +926,49 @@ pub fn decodeEsrEl2(esr: u64, far: u64, hpfar: u64) VmExitInfo {
     };
 }
 
+/// Host FPSIMD save slot used by the eager save/restore path in `vmResume`.
+///
+/// Layout matches `FxsaveArea` so the same save/load asm sequences work for
+/// both host and guest state:
+///
+///   [0x000 .. 0x200)  V0..V31  — 32 × 128-bit SIMD regs, byte offset = idx*16
+///   [0x200 .. 0x208)  FPCR     — FP control (D13.2.48)
+///   [0x208 .. 0x210)  FPSR     — FP status  (D13.2.52)
+///
+/// ARM ARM B1.2.2 defines the V-register file; the kernel's host threads
+/// can use FPSIMD (CPACR_EL1.FPEN was set at boot — see init.zig and
+/// smp.zig) so the live host FP register file on entry to `vmResume` is
+/// meaningful and must be preserved across the guest run.
+pub const HostFpState = extern struct {
+    v: [32][16]u8 align(16) = @splat(@splat(0)),
+    fpcr: u64 = 0,
+    fpsr: u64 = 0,
+};
+
 /// Per-vCPU scratch the EL2 hyp stub reads/writes through PAs. Owned by
 /// the VCpu object (see `kernel/arch/aarch64/kvm/vcpu.zig`) so concurrent
-/// vCPUs don't share storage. Both fields must live in physmap-backed
+/// vCPUs don't share storage. All fields must live in physmap-backed
 /// memory so `PAddr.fromVAddr(..., null)` is a valid VA→PA translation.
+///
+/// `host_fp` is a scratch slot used by the eager FPSIMD save/restore
+/// wrapper around `hypCall(.vcpu_run, ...)` — it only needs to live as long
+/// as a single vmResume call, but storing it per-vCPU keeps `vmResume`
+/// reentrancy-safe without per-cpu TLS plumbing.
 pub const ArchScratch = extern struct {
     ctx: WorldSwitchCtx = .{},
     host_save: HostSave = .{},
+    host_fp: HostFpState align(16) = .{},
 };
 
 pub fn vmResume(
     guest_state: *GuestState,
     vm_structures: PAddr,
     guest_fxsave: *align(16) FxsaveArea,
-    arch_scratch: *ArchScratch,
+    arch_scratch: *align(16) ArchScratch,
     vmid_value: u8,
+    hcr_override_set: u64,
+    hcr_override_clear: u64,
 ) VmExitInfo {
-    _ = guest_fxsave; // FPSIMD save/restore TODO.
-
     const ctx = &arch_scratch.ctx;
     const host_save = &arch_scratch.host_save;
     ctx.* = .{};
@@ -966,9 +991,145 @@ pub fn vmResume(
     //   [0]     CnP   — 0; we don't claim common-not-private.
     ctx.vttbr_el2 = (@as(u64, vmid_value) << 48) | vm_structures.addr;
     ctx.vtcr_el2 = vtcrEl2Value();
-    ctx.hcr_el2 = HCR_EL2_LINUX_GUEST;
+    // HCR_EL2 is the union of the per-VM override-set bits with the Linux
+    // baseline, minus any override-clear bits. `sysregPassthrough` feeds
+    // this: by default we deny (trap) everything the baseline traps, and
+    // only dropping a bit into `hcr_override_clear` opens that trap up for
+    // the VM. `hcr_override_set` is reserved for future traps that are not
+    // in the baseline.
+    ctx.hcr_el2 = (HCR_EL2_LINUX_GUEST | hcr_override_set) & ~hcr_override_clear;
 
-    _ = hypCall(.vcpu_run, ctx_pa.addr);
+    // ---- Eager FPSIMD save/restore around the world switch ----
+    //
+    // Must stay fused to the hvc so no host Zig code runs between
+    // "save host FP" and the guest entry, and similarly nothing between
+    // guest exit and "restore host FP". If anything touches V-regs in
+    // between we would either clobber host FP state or leak guest FP
+    // state into the host.
+    //
+    // Layout assumptions (asserted at comptime above for ArchScratch and
+    // at the FxsaveArea type def):
+    //   HostFpState :  V0..V31 @ 0x000, FPCR @ 0x200, FPSR @ 0x208
+    //   FxsaveArea  :  V0..V31 @ 0x000, FPCR @ 0x200, FPSR @ 0x208
+    //
+    // ARM ARM B1.2.2 (V-reg file), D13.2.48 (FPCR), D13.2.52 (FPSR).
+    const host_fp_ptr: [*]u8 = @ptrCast(&arch_scratch.host_fp);
+    const guest_fp_ptr: [*]u8 = @ptrCast(guest_fxsave);
+    asm volatile (
+        \\  // Save host V0..V31 to [host_fp + 0x000..0x200]
+        \\  stp     q0, q1,   [%[hfp], #0x000]
+        \\  stp     q2, q3,   [%[hfp], #0x020]
+        \\  stp     q4, q5,   [%[hfp], #0x040]
+        \\  stp     q6, q7,   [%[hfp], #0x060]
+        \\  stp     q8, q9,   [%[hfp], #0x080]
+        \\  stp     q10, q11, [%[hfp], #0x0A0]
+        \\  stp     q12, q13, [%[hfp], #0x0C0]
+        \\  stp     q14, q15, [%[hfp], #0x0E0]
+        \\  stp     q16, q17, [%[hfp], #0x100]
+        \\  stp     q18, q19, [%[hfp], #0x120]
+        \\  stp     q20, q21, [%[hfp], #0x140]
+        \\  stp     q22, q23, [%[hfp], #0x160]
+        \\  stp     q24, q25, [%[hfp], #0x180]
+        \\  stp     q26, q27, [%[hfp], #0x1A0]
+        \\  stp     q28, q29, [%[hfp], #0x1C0]
+        \\  stp     q30, q31, [%[hfp], #0x1E0]
+        \\  mrs     x2, fpcr
+        \\  str     x2, [%[hfp], #0x200]
+        \\  mrs     x2, fpsr
+        \\  str     x2, [%[hfp], #0x208]
+        \\
+        \\  // Load guest V0..V31 from [gfp + 0x000..0x200]
+        \\  ldr     x2, [%[gfp], #0x200]
+        \\  msr     fpcr, x2
+        \\  ldr     x2, [%[gfp], #0x208]
+        \\  msr     fpsr, x2
+        \\  ldp     q0, q1,   [%[gfp], #0x000]
+        \\  ldp     q2, q3,   [%[gfp], #0x020]
+        \\  ldp     q4, q5,   [%[gfp], #0x040]
+        \\  ldp     q6, q7,   [%[gfp], #0x060]
+        \\  ldp     q8, q9,   [%[gfp], #0x080]
+        \\  ldp     q10, q11, [%[gfp], #0x0A0]
+        \\  ldp     q12, q13, [%[gfp], #0x0C0]
+        \\  ldp     q14, q15, [%[gfp], #0x0E0]
+        \\  ldp     q16, q17, [%[gfp], #0x100]
+        \\  ldp     q18, q19, [%[gfp], #0x120]
+        \\  ldp     q20, q21, [%[gfp], #0x140]
+        \\  ldp     q22, q23, [%[gfp], #0x160]
+        \\  ldp     q24, q25, [%[gfp], #0x180]
+        \\  ldp     q26, q27, [%[gfp], #0x1A0]
+        \\  ldp     q28, q29, [%[gfp], #0x1C0]
+        \\  ldp     q30, q31, [%[gfp], #0x1E0]
+        \\
+        \\  // World switch: x0 = vcpu_run id (1), x1 = ctx PA.
+        \\  // The hyp stub preserves %[hfp] / %[gfp] (both map to
+        \\  // callee-saved x19..x28 via the Zig asm constraint) across
+        \\  // the round trip because the EL2 exit path reloads host
+        \\  // x19..x30 from host_save before returning.
+        \\  mov     x0, #1
+        \\  mov     x1, %[ctxpa]
+        \\  hvc     #0
+        \\
+        \\  // Save guest V0..V31 back into [gfp]
+        \\  stp     q0, q1,   [%[gfp], #0x000]
+        \\  stp     q2, q3,   [%[gfp], #0x020]
+        \\  stp     q4, q5,   [%[gfp], #0x040]
+        \\  stp     q6, q7,   [%[gfp], #0x060]
+        \\  stp     q8, q9,   [%[gfp], #0x080]
+        \\  stp     q10, q11, [%[gfp], #0x0A0]
+        \\  stp     q12, q13, [%[gfp], #0x0C0]
+        \\  stp     q14, q15, [%[gfp], #0x0E0]
+        \\  stp     q16, q17, [%[gfp], #0x100]
+        \\  stp     q18, q19, [%[gfp], #0x120]
+        \\  stp     q20, q21, [%[gfp], #0x140]
+        \\  stp     q22, q23, [%[gfp], #0x160]
+        \\  stp     q24, q25, [%[gfp], #0x180]
+        \\  stp     q26, q27, [%[gfp], #0x1A0]
+        \\  stp     q28, q29, [%[gfp], #0x1C0]
+        \\  stp     q30, q31, [%[gfp], #0x1E0]
+        \\  mrs     x2, fpcr
+        \\  str     x2, [%[gfp], #0x200]
+        \\  mrs     x2, fpsr
+        \\  str     x2, [%[gfp], #0x208]
+        \\
+        \\  // Restore host V0..V31 + FPCR/FPSR from [hfp]
+        \\  ldr     x2, [%[hfp], #0x200]
+        \\  msr     fpcr, x2
+        \\  ldr     x2, [%[hfp], #0x208]
+        \\  msr     fpsr, x2
+        \\  ldp     q0, q1,   [%[hfp], #0x000]
+        \\  ldp     q2, q3,   [%[hfp], #0x020]
+        \\  ldp     q4, q5,   [%[hfp], #0x040]
+        \\  ldp     q6, q7,   [%[hfp], #0x060]
+        \\  ldp     q8, q9,   [%[hfp], #0x080]
+        \\  ldp     q10, q11, [%[hfp], #0x0A0]
+        \\  ldp     q12, q13, [%[hfp], #0x0C0]
+        \\  ldp     q14, q15, [%[hfp], #0x0E0]
+        \\  ldp     q16, q17, [%[hfp], #0x100]
+        \\  ldp     q18, q19, [%[hfp], #0x120]
+        \\  ldp     q20, q21, [%[hfp], #0x140]
+        \\  ldp     q22, q23, [%[hfp], #0x160]
+        \\  ldp     q24, q25, [%[hfp], #0x180]
+        \\  ldp     q26, q27, [%[hfp], #0x1A0]
+        \\  ldp     q28, q29, [%[hfp], #0x1C0]
+        \\  ldp     q30, q31, [%[hfp], #0x1E0]
+        :
+        : [hfp] "r" (host_fp_ptr),
+          [gfp] "r" (guest_fp_ptr),
+          [ctxpa] "r" (ctx_pa.addr),
+        : .{
+            .memory = true,
+            .x0 = true,
+            .x1 = true,
+            .x2 = true,
+            .v0 = true,  .v1 = true,  .v2 = true,  .v3 = true,
+            .v4 = true,  .v5 = true,  .v6 = true,  .v7 = true,
+            .v8 = true,  .v9 = true,  .v10 = true, .v11 = true,
+            .v12 = true, .v13 = true, .v14 = true, .v15 = true,
+            .v16 = true, .v17 = true, .v18 = true, .v19 = true,
+            .v20 = true, .v21 = true, .v22 = true, .v23 = true,
+            .v24 = true, .v25 = true, .v26 = true, .v27 = true,
+            .v28 = true, .v29 = true, .v30 = true, .v31 = true,
+        });
 
     return decodeEsrEl2(ctx.exit_esr, ctx.exit_far, ctx.exit_hpfar);
 }
@@ -1788,22 +1949,164 @@ pub fn injectException(guest_state: *GuestState, exception: GuestException) void
 // Sysreg passthrough
 // ===========================================================================
 
-/// Enable/disable trap-free access to a system register for the guest.
+/// Decoded (op0,op1,crn,crm,op2) sysreg key used by
+/// `sysregPassthroughOverride`. The packed `sysreg_id` layout comes from
+/// the `vm_sysreg_passthrough` syscall and matches
+/// `kvm.vm.isSecurityCriticalSysreg`:
 ///
-/// The x86 MSR bitmap does not exist on ARM; instead each class of register
-/// has its own trap bit in HCR_EL2/CPTR_EL2/MDCR_EL2/CNTHCTL_EL2. This
-/// function decodes `sysreg_id` as a packed (op0,op1,crn,crm,op2) key and
-/// flips the relevant trap bit in the VM control block.
-///
-/// Encoding used by userspace:
 ///   bits [15:14] Op0
 ///   bits [13:11] Op1
 ///   bits [10:7]  CRn
 ///   bits [6:3]   CRm
 ///   bits [2:0]   Op2
-pub fn sysregPassthrough(vm_structures: PAddr, sysreg_id: u32, allow_read: bool, allow_write: bool) void {
-    _ = vm_structures;
-    _ = sysreg_id;
-    _ = allow_read;
-    _ = allow_write;
+pub const SysregKey = packed struct {
+    op0: u8,
+    op1: u8,
+    crn: u8,
+    crm: u8,
+    op2: u8,
+
+    pub fn decode(encoded: u32) SysregKey {
+        return .{
+            .op0 = @intCast((encoded >> 14) & 0x3),
+            .op1 = @intCast((encoded >> 11) & 0x7),
+            .crn = @intCast((encoded >> 7) & 0xF),
+            .crm = @intCast((encoded >> 3) & 0xF),
+            .op2 = @intCast(encoded & 0x7),
+        };
+    }
+};
+
+/// HCR_EL2 trap group a particular sysreg belongs to. Only the groups that
+/// `HCR_EL2_LINUX_GUEST` forces on are meaningful here — allowing
+/// passthrough of a sysreg outside one of these groups is a no-op because
+/// the baseline already lets it through. See `HCR_EL2_LINUX_GUEST` above
+/// for the full rationale table.
+const HcrTrapGroup = enum {
+    /// No HCR bit governs this sysreg — passthrough request is vacuous.
+    none,
+    /// ACTLR_EL1 (impl-defined auxiliary control) — HCR_EL2.TACR.
+    /// ARM ARM D13.2.46 TACR; sysreg encoding op0=3 op1=0 crn=1 crm=0 op2=1.
+    tacr,
+    /// Impl-defined EL1 sysregs — HCR_EL2.TIDCP.
+    /// ARM ARM D13.2.46 TIDCP covers CRn ∈ {9, 10, 11, 15} with the
+    /// implementation-defined flag. We match CRn in {11, 15} (the two most
+    /// commonly used by platform-specific errata knobs on the CPUs this
+    /// port targets — Cortex-A76 uses CRn=11 for CPUACTLR, CRn=15 for
+    /// CPUECTLR/L2CTLR).
+    tidcp,
+    /// Stage-1 "VM" sysreg family — HCR_EL2.TVM (writes) / HCR_EL2.TRVM
+    /// (reads). ARM ARM D13.2.46 TVM enumerates:
+    ///   SCTLR_EL1, TTBR0_EL1, TTBR1_EL1, TCR_EL1, ESR_EL1, FAR_EL1,
+    ///   AFSR0_EL1, AFSR1_EL1, MAIR_EL1, AMAIR_EL1, CONTEXTIDR_EL1.
+    tvm,
+};
+
+/// Classify a sysreg key into the HCR_EL2 trap group that governs its
+/// EL1 access, or `.none` if no bit in `HCR_EL2_LINUX_GUEST` covers it.
+///
+/// Sysreg encodings cross-referenced against ARM ARM C5.3 "System register
+/// encoding". All entries are op0=3, op1=0 (the EL1-accessible half).
+fn classifySysreg(key: SysregKey) HcrTrapGroup {
+    if (key.op0 != 3 or key.op1 != 0) return .none;
+
+    // ACTLR_EL1 — op0=3 op1=0 CRn=1 CRm=0 op2=1 (ARM ARM D13.2.9).
+    if (key.crn == 1 and key.crm == 0 and key.op2 == 1) return .tacr;
+
+    // TVM-governed stage-1 VM sysregs. Each entry is (CRn, CRm, op2).
+    //   SCTLR_EL1       (1, 0, 0)    D13.2.119
+    //   TTBR0_EL1       (2, 0, 0)    D13.2.137
+    //   TTBR1_EL1       (2, 0, 1)    D13.2.139
+    //   TCR_EL1         (2, 0, 2)    D13.2.131
+    //   AFSR0_EL1       (5, 1, 0)    D13.2.23
+    //   AFSR1_EL1       (5, 1, 1)    D13.2.24
+    //   ESR_EL1         (5, 2, 0)    D13.2.39
+    //   FAR_EL1         (6, 0, 0)    D13.2.41
+    //   MAIR_EL1        (10, 2, 0)   D13.2.93
+    //   AMAIR_EL1       (10, 3, 0)   D13.2.25
+    //   CONTEXTIDR_EL1  (13, 0, 1)   D13.2.31
+    switch (key.crn) {
+        1 => if (key.crm == 0 and key.op2 == 0) return .tvm,
+        2 => if (key.crm == 0 and key.op2 <= 2) return .tvm,
+        5 => {
+            if (key.crm == 1 and key.op2 <= 1) return .tvm;
+            if (key.crm == 2 and key.op2 == 0) return .tvm;
+        },
+        6 => if (key.crm == 0 and key.op2 == 0) return .tvm,
+        10 => {
+            if (key.crm == 2 and key.op2 == 0) return .tvm;
+            if (key.crm == 3 and key.op2 == 0) return .tvm;
+        },
+        13 => if (key.crm == 0 and key.op2 == 1) return .tvm,
+        else => {},
+    }
+
+    // Impl-defined groups governed by TIDCP.
+    if (key.crn == 11 or key.crn == 15) return .tidcp;
+
+    return .none;
+}
+
+/// Update a VM's HCR_EL2 override-set/override-clear pair based on a
+/// passthrough request. Baseline `HCR_EL2_LINUX_GUEST` has every relevant
+/// trap bit *set* (deny-by-default), so "allow passthrough" means dropping
+/// the matching bit into `override_clear`; "deny passthrough" removes it
+/// from `override_clear` (returning to the baseline's trap-on state).
+///
+/// The TVM/TRVM group is split read/write: `allow_write` gates TVM and
+/// `allow_read` gates TRVM. For TACR and TIDCP the baseline does not
+/// distinguish direction, so either flag being set opens the group.
+///
+/// Sysregs that do not map to a HCR_EL2 bit managed by the baseline are
+/// silently ignored — `isSecurityCriticalSysreg` in the kvm layer already
+/// rejected the dangerous encodings before we got here.
+pub fn sysregPassthroughOverride(
+    sysreg_id: u32,
+    allow_read: bool,
+    allow_write: bool,
+    override_set: *u64,
+    override_clear: *u64,
+) void {
+    _ = override_set; // reserved for future traps not in the baseline
+    const key = SysregKey.decode(sysreg_id);
+    const group = classifySysreg(key);
+    const any = allow_read or allow_write;
+    switch (group) {
+        .none => {},
+        .tacr => {
+            if (any) {
+                override_clear.* |= HCR_EL2_TACR;
+            } else {
+                override_clear.* &= ~HCR_EL2_TACR;
+            }
+        },
+        .tidcp => {
+            if (any) {
+                override_clear.* |= HCR_EL2_TIDCP;
+            } else {
+                override_clear.* &= ~HCR_EL2_TIDCP;
+            }
+        },
+        .tvm => {
+            // TVM is *write*-side, TRVM is *read*-side. Only drop a bit
+            // once every sysreg in the group has been opened — but the
+            // current API is per-sysreg. For now treat any allow_write in
+            // the group as "clear TVM" and any allow_read as "clear
+            // TRVM". This is correct for the common case (VMM opens the
+            // whole family at once to let the guest own its stage-1
+            // state) and coarser than necessary otherwise. TODO: track a
+            // per-sysreg allow mask and only clear TVM/TRVM when every
+            // member of the group is allowed.
+            if (allow_write) {
+                override_clear.* |= HCR_EL2_TVM;
+            } else {
+                override_clear.* &= ~HCR_EL2_TVM;
+            }
+            if (allow_read) {
+                override_clear.* |= HCR_EL2_TRVM;
+            } else {
+                override_clear.* &= ~HCR_EL2_TRVM;
+            }
+        },
+    }
 }
