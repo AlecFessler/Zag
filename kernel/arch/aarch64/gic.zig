@@ -434,16 +434,25 @@ pub fn initDistributor() void {
     if (gicd_base == 0) return;
 
     // Detect GIC version from GICD_PIDR2.ArchRev [7:4].
-    // GICv2 exposes PIDR2 at offset 0x0FE8 (IHI 0048B, Section 4.3.17).
-    // GICv3/v4 relocates PIDR2 to offset 0xFFE8 (IHI 0069H, Section 12.8);
-    // offset 0x0FE8 on a GICv3 is reserved and typically reads back as 0.
-    // Prefer the GICv3 location; fall back to v2 if the v3 slot reads
-    // back an unsupported ArchRev.
-    const pidr2_v3_val = gicdRead(.pidr2_v3);
+    //
+    // GICv2 exposes PIDR2 at offset 0x0FE8 (IHI 0048B, Section 4.3.17)
+    // and its GICD MMIO window is only 4 KiB wide — offsets >= 0x1000
+    // are unassigned memory. Reading GICv3's PIDR2_v3 slot (0xFFE8)
+    // on a GICv2 implementation raises a synchronous external abort
+    // (QEMU TCG `-M virt` with the default GICv2) or hangs.
+    //
+    // Probe GICv2 first. If ArchRev[7:4] == 2 we know we are on
+    // GICv2 and MUST NOT touch offset 0xFFE8. Only fall through to
+    // the GICv3 probe when the v2 slot shows something else (typical
+    // on a genuine GICv3: 0xFE8 reads back zero because it's reserved).
     const pidr2_v2_val = gicdRead(.pidr2);
-    const arch_rev_v3 = (pidr2_v3_val >> 4) & 0xF;
     const arch_rev_v2 = (pidr2_v2_val >> 4) & 0xF;
-    const arch_rev = if (arch_rev_v3 >= 3) arch_rev_v3 else arch_rev_v2;
+    var arch_rev: u32 = arch_rev_v2;
+    if (arch_rev_v2 != 2) {
+        const pidr2_v3_val = gicdRead(.pidr2_v3);
+        const arch_rev_v3 = (pidr2_v3_val >> 4) & 0xF;
+        if (arch_rev_v3 >= 3) arch_rev = arch_rev_v3;
+    }
     gicv3 = (arch_rev >= 3);
 
     // Disable the distributor while reconfiguring.
