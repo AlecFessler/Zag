@@ -25,19 +25,27 @@ const KERNEL_PERMS = MemoryPerms{
 };
 
 fn demandPageKernel(faulting_virt: VAddr) void {
+    arch.earlyDebugChar('p');
     const page_base = VAddr.fromInt(std.mem.alignBackward(u64, faulting_virt.addr, paging.PAGE4K));
     const kroot = memory_init.kernel_addr_space_root;
 
-    if (arch.resolveVaddr(kroot, page_base) != null) return;
+    if (arch.resolveVaddr(kroot, page_base) != null) {
+        arch.earlyDebugChar('q');
+        return;
+    }
 
+    arch.earlyDebugChar('r');
     const pmm_iface = pmm.global_pmm.?.allocator();
     const page = pmm_iface.create(paging.PageMem(.page4k)) catch
         @panic("OOM in kernel demand page fault");
+    arch.earlyDebugChar('s');
     @memset(std.mem.asBytes(page), 0);
+    arch.earlyDebugChar('t');
 
     const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
     arch.mapPage(kroot, phys, page_base, KERNEL_PERMS) catch
         @panic("mapPage failed in kernel demand page fault");
+    arch.earlyDebugChar('u');
 }
 
 fn accessReason(is_write: bool, is_exec: bool) FaultReason {

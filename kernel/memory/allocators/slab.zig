@@ -54,11 +54,14 @@ pub fn SlabAllocator(
             };
 
             if (!stack_bootstrap) {
+                zag.arch.dispatch.earlyDebugChar('A');
                 const slice = try self.backing_allocator.alloc(T, allocation_chunk_size);
+                zag.arch.dispatch.earlyDebugChar('B');
                 errdefer self.backing_allocator.free(slice);
                 for (slice) |*slab| {
                     self.freelist.push(slab);
                 }
+                zag.arch.dispatch.earlyDebugChar('C');
 
                 const alloc_header = try self.backing_allocator.create(AllocHeader);
                 alloc_header.* = .{
