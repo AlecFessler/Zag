@@ -300,6 +300,9 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
         // Per-vCPU vGIC state (PPIs + SGIs) needs initializing once the
         // VCpu allocation exists.
         vgic_mod.initVcpu(&vcpu_obj.vgic_state, &vm_obj.vgic, i);
+        // Per-vCPU virtual timer save area — zero baseline, CNTVOFF
+        // snapshot is taken on first entry by `vtimer.loadGuest`.
+        kvm.vtimer.initVcpu(&vcpu_obj.vtimer_state);
 
         const handle_id = proc.insertThreadHandle(vcpu_obj.thread, ThreadHandleRights.full) catch {
             var k: u32 = 0;

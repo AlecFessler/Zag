@@ -586,6 +586,37 @@ pub const HypCallId = enum(u64) {
     /// (ARM ARM D7.7); the EL1 kernel therefore cannot issue it
     /// directly. Returns 0.
     tlbi_ipa = 2,
+    /// No argument. Returns `(ICH_VTR_EL2 & 0x1F) + 1` in x0 — the
+    /// number of vGIC list registers implemented on this PE. ICH_VTR_EL2
+    /// is EL2-only (GICv3 §12.5.30 / ARM ARM D13.8.50) so the EL1
+    /// kernel must probe it via an hvc stub. Dispatches to
+    /// `hvc_vgic_detect_lrs`.
+    vgic_detect_lrs = 3,
+    /// `arg` = physical/EL1-VA pointer to a `vgic.VcpuHwShadow`. The
+    /// stub writes ICH_LR0..15_EL2, ICH_AP0R0_EL2, ICH_AP1R0_EL2,
+    /// ICH_VMCR_EL2, and ICH_HCR_EL2 (with EN forced on) from the
+    /// shadow. Returns 0. Dispatches to `hvc_vgic_prepare_entry`.
+    /// All ICH_*_EL2 registers are EL2-only (ARM ARM D13.8) so this
+    /// path replaces the direct msr issued from EL1 code.
+    vgic_prepare_entry = 4,
+    /// `arg` = pointer to a `vgic.VcpuHwShadow`. The stub reads
+    /// ICH_LR0..15_EL2, ICH_AP0R0_EL2, ICH_AP1R0_EL2 back into the
+    /// shadow and then clears ICH_HCR_EL2 (disabling the virtual CPU
+    /// interface for the host-running window). Returns 0. Dispatches
+    /// to `hvc_vgic_save_exit`.
+    vgic_save_exit = 5,
+    /// `arg` = pointer to a `vtimer.VtimerState`. If `primed == 0` the
+    /// stub seeds `cntvoff_el2` from CNTPCT_EL0 and sets `primed = 1`
+    /// before programming. Then writes CNTVOFF_EL2 (EL2-only, ARM ARM
+    /// D13.11.9), CNTKCTL_EL1, CNTV_CVAL_EL0, and finally CNTV_CTL_EL0.
+    /// Returns 0. Dispatches to `hvc_vtimer_load_guest`.
+    vtimer_load_guest = 6,
+    /// `arg` = pointer to a `vtimer.VtimerState`. Reads CNTV_CTL_EL0,
+    /// CNTV_CVAL_EL0, and CNTKCTL_EL1 back into the shadow, then writes
+    /// CNTV_CTL_EL0 = 0x2 (IMASK=1, ENABLE=0) to mask any post-exit
+    /// host-side virtual timer expiry (ARM ARM D13.11.17). Returns 0.
+    /// Dispatches to `hvc_vtimer_save_guest`.
+    vtimer_save_guest = 7,
 };
 
 /// Issue `hvc #0` with (id, arg) and return the 64-bit result in x0.
@@ -1251,6 +1282,16 @@ export fn hyp_sync_lower_a64() callconv(.naked) noreturn {
         \\  b.eq    hvc_vcpu_run
         \\  cmp     x0, #2
         \\  b.eq    hvc_tlbi_ipa
+        \\  cmp     x0, #3
+        \\  b.eq    hvc_vgic_detect_lrs
+        \\  cmp     x0, #4
+        \\  b.eq    hvc_vgic_prepare_entry
+        \\  cmp     x0, #5
+        \\  b.eq    hvc_vgic_save_exit
+        \\  cmp     x0, #6
+        \\  b.eq    hvc_vtimer_load_guest
+        \\  cmp     x0, #7
+        \\  b.eq    hvc_vtimer_save_guest
         \\  // Unknown id — return -1.
         \\  mov     x0, #-1
         \\  eret
@@ -1304,6 +1345,232 @@ export fn hvc_noop() callconv(.naked) noreturn {
     asm volatile (
         \\  // Return arg^1 so the caller can verify the round-trip changed x0.
         \\  eor     x0, x1, #1
+        \\  eret
+    );
+}
+
+// ===========================================================================
+// M5 vGIC / vtimer EL2 sysreg stubs
+// ===========================================================================
+//
+// ICH_*_EL2 (GICv3 §12.5, ARM ARM D13.8) and CNTVOFF_EL2 (ARM ARM D13.11.9)
+// are EL2-only and trap to an undefined-instruction exception if issued from
+// EL1. The EL1 kernel therefore shuttles the vGIC list-register / priority /
+// control state and the virtual-timer offset through the stubs below using
+// pinned-layout shadow structs (`vgic.VcpuHwShadow`, `vtimer.VtimerState`).
+//
+// Struct offsets below are enforced by `comptime` asserts in those modules;
+// changing a field order there will break compilation rather than silently
+// corrupt EL2 state.
+
+// hvc_vgic_detect_lrs — return the implemented list-register count.
+//
+// Reads ICH_VTR_EL2.ListRegs (bits[4:0]), adds 1, returns in x0.
+// ICH_VTR_EL2 has encoding S3_4_C12_C11_1 (ARM ARM D13.8.50).
+export fn hvc_vgic_detect_lrs() callconv(.naked) noreturn {
+    asm volatile (
+        \\  mrs     x0, S3_4_C12_C11_1      // ICH_VTR_EL2
+        \\  and     x0, x0, #0x1F
+        \\  add     x0, x0, #1
+        \\  eret
+    );
+}
+
+// hvc_vgic_prepare_entry — flush VcpuHwShadow → ICH_*_EL2 registers.
+//
+// On entry:
+//   x0 = HypCallId.vgic_prepare_entry (4) — discarded.
+//   x1 = pointer to vgic.VcpuHwShadow.
+//
+// Shadow layout (vgic.VcpuHwShadow, enforced by comptime asserts):
+//   0x00..0x78  lrs[0..15]   (16 × u64)
+//   0x80        hcr          (ICH_HCR_EL2, caller sets EN=1)
+//   0x88        vmcr         (ICH_VMCR_EL2)
+//   0x90        ap0r0        (ICH_AP0R0_EL2)
+//   0x98        ap1r0        (ICH_AP1R0_EL2)
+//
+// Writes all 16 LRs unconditionally; slots beyond num_lrs are zero in
+// the shadow which the spec treats as "no pending vintid" (GICv3 §11.2.5,
+// LR.State field = 0b00 Invalid).
+//
+// Sysreg encodings (ARM ARM D13.8.51 / Table D13-65):
+//   ICH_LR0..7_EL2  = S3_4_C12_C12_{0..7}
+//   ICH_LR8..15_EL2 = S3_4_C12_C13_{0..7}
+//   ICH_AP0R0_EL2   = S3_4_C12_C8_0  (D13.8.42)
+//   ICH_AP1R0_EL2   = S3_4_C12_C9_0  (D13.8.46)
+//   ICH_VMCR_EL2    = S3_4_C12_C11_7 (D13.8.49)
+//   ICH_HCR_EL2     = S3_4_C12_C11_0 (D13.8.45)
+export fn hvc_vgic_prepare_entry() callconv(.naked) noreturn {
+    asm volatile (
+        \\  ldr     x2, [x1, #0x00]
+        \\  msr     S3_4_C12_C12_0, x2
+        \\  ldr     x2, [x1, #0x08]
+        \\  msr     S3_4_C12_C12_1, x2
+        \\  ldr     x2, [x1, #0x10]
+        \\  msr     S3_4_C12_C12_2, x2
+        \\  ldr     x2, [x1, #0x18]
+        \\  msr     S3_4_C12_C12_3, x2
+        \\  ldr     x2, [x1, #0x20]
+        \\  msr     S3_4_C12_C12_4, x2
+        \\  ldr     x2, [x1, #0x28]
+        \\  msr     S3_4_C12_C12_5, x2
+        \\  ldr     x2, [x1, #0x30]
+        \\  msr     S3_4_C12_C12_6, x2
+        \\  ldr     x2, [x1, #0x38]
+        \\  msr     S3_4_C12_C12_7, x2
+        \\  ldr     x2, [x1, #0x40]
+        \\  msr     S3_4_C12_C13_0, x2
+        \\  ldr     x2, [x1, #0x48]
+        \\  msr     S3_4_C12_C13_1, x2
+        \\  ldr     x2, [x1, #0x50]
+        \\  msr     S3_4_C12_C13_2, x2
+        \\  ldr     x2, [x1, #0x58]
+        \\  msr     S3_4_C12_C13_3, x2
+        \\  ldr     x2, [x1, #0x60]
+        \\  msr     S3_4_C12_C13_4, x2
+        \\  ldr     x2, [x1, #0x68]
+        \\  msr     S3_4_C12_C13_5, x2
+        \\  ldr     x2, [x1, #0x70]
+        \\  msr     S3_4_C12_C13_6, x2
+        \\  ldr     x2, [x1, #0x78]
+        \\  msr     S3_4_C12_C13_7, x2
+        \\
+        \\  ldr     x2, [x1, #0x90]         // ap0r0
+        \\  msr     S3_4_C12_C8_0, x2
+        \\  ldr     x2, [x1, #0x98]         // ap1r0
+        \\  msr     S3_4_C12_C9_0, x2
+        \\  ldr     x2, [x1, #0x88]         // vmcr
+        \\  msr     S3_4_C12_C11_7, x2
+        \\  // Enable last so LRs/AP/VMCR are coherent before delivery.
+        \\  ldr     x2, [x1, #0x80]         // hcr (EN forced on by caller)
+        \\  msr     S3_4_C12_C11_0, x2
+        \\  mov     x0, #0
+        \\  eret
+    );
+}
+
+// hvc_vgic_save_exit — snapshot ICH_*_EL2 → VcpuHwShadow on exit.
+//
+// On entry:
+//   x0 = HypCallId.vgic_save_exit (5) — discarded.
+//   x1 = pointer to vgic.VcpuHwShadow.
+//
+// Reads all 16 LRs, AP0R0, AP1R0 into the shadow. Then disables the
+// virtual CPU interface by writing ICH_HCR_EL2 = 0 so a maintenance
+// IRQ cannot fire into the host running window (GICv3 §12.5.7 "En").
+export fn hvc_vgic_save_exit() callconv(.naked) noreturn {
+    asm volatile (
+        \\  mrs     x2, S3_4_C12_C12_0
+        \\  str     x2, [x1, #0x00]
+        \\  mrs     x2, S3_4_C12_C12_1
+        \\  str     x2, [x1, #0x08]
+        \\  mrs     x2, S3_4_C12_C12_2
+        \\  str     x2, [x1, #0x10]
+        \\  mrs     x2, S3_4_C12_C12_3
+        \\  str     x2, [x1, #0x18]
+        \\  mrs     x2, S3_4_C12_C12_4
+        \\  str     x2, [x1, #0x20]
+        \\  mrs     x2, S3_4_C12_C12_5
+        \\  str     x2, [x1, #0x28]
+        \\  mrs     x2, S3_4_C12_C12_6
+        \\  str     x2, [x1, #0x30]
+        \\  mrs     x2, S3_4_C12_C12_7
+        \\  str     x2, [x1, #0x38]
+        \\  mrs     x2, S3_4_C12_C13_0
+        \\  str     x2, [x1, #0x40]
+        \\  mrs     x2, S3_4_C12_C13_1
+        \\  str     x2, [x1, #0x48]
+        \\  mrs     x2, S3_4_C12_C13_2
+        \\  str     x2, [x1, #0x50]
+        \\  mrs     x2, S3_4_C12_C13_3
+        \\  str     x2, [x1, #0x58]
+        \\  mrs     x2, S3_4_C12_C13_4
+        \\  str     x2, [x1, #0x60]
+        \\  mrs     x2, S3_4_C12_C13_5
+        \\  str     x2, [x1, #0x68]
+        \\  mrs     x2, S3_4_C12_C13_6
+        \\  str     x2, [x1, #0x70]
+        \\  mrs     x2, S3_4_C12_C13_7
+        \\  str     x2, [x1, #0x78]
+        \\
+        \\  mrs     x2, S3_4_C12_C8_0       // ap0r0
+        \\  str     x2, [x1, #0x90]
+        \\  mrs     x2, S3_4_C12_C9_0       // ap1r0
+        \\  str     x2, [x1, #0x98]
+        \\  mrs     x2, S3_4_C12_C11_2      // ICH_MISR_EL2
+        \\  str     x2, [x1, #0xA0]
+        \\
+        \\  // Disable the virtual CPU interface for the host window.
+        \\  msr     S3_4_C12_C11_0, xzr     // ICH_HCR_EL2 = 0
+        \\  mov     x0, #0
+        \\  eret
+    );
+}
+
+// hvc_vtimer_load_guest — program per-vCPU virtual timer from shadow.
+//
+// On entry:
+//   x0 = HypCallId.vtimer_load_guest (6) — discarded.
+//   x1 = pointer to vtimer.VtimerState.
+//
+// Shadow layout (vtimer.VtimerState, enforced by comptime asserts):
+//   0x00 cntvoff_el2
+//   0x08 cntv_ctl_el0
+//   0x10 cntv_cval_el0
+//   0x18 cntkctl_el1
+//   0x20 primed (u64; 0 = needs seeding from CNTPCT_EL0)
+//
+// First-entry path: if primed == 0, snapshot CNTPCT_EL0 (ARM ARM
+// D13.11.15) into cntvoff_el2 so CNTVCT_EL0 = 0 at guest boot
+// (D13.11.9 CNTVCT_EL0 = CNTPCT_EL0 - CNTVOFF_EL2), and set primed=1.
+// Then program CNTVOFF_EL2, CNTKCTL_EL1, CNTV_CVAL_EL0, CNTV_CTL_EL0
+// in that order (D13.11.17 ISTATUS is re-evaluated on every read, so
+// writing CTL last ensures IMASK/ENABLE see the fresh CVAL).
+export fn hvc_vtimer_load_guest() callconv(.naked) noreturn {
+    asm volatile (
+        \\  ldr     x3, [x1, #0x20]         // primed
+        \\  cbnz    x3, 1f
+        \\  mrs     x2, cntpct_el0
+        \\  str     x2, [x1, #0x00]         // cntvoff_el2 = CNTPCT
+        \\  mov     x3, #1
+        \\  str     x3, [x1, #0x20]         // primed = 1
+        \\1:
+        \\  ldr     x2, [x1, #0x00]
+        \\  msr     cntvoff_el2, x2
+        \\  ldr     x2, [x1, #0x18]
+        \\  msr     cntkctl_el1, x2
+        \\  ldr     x2, [x1, #0x10]
+        \\  msr     cntv_cval_el0, x2
+        \\  ldr     x2, [x1, #0x08]
+        \\  msr     cntv_ctl_el0, x2
+        \\  mov     x0, #0
+        \\  eret
+    );
+}
+
+// hvc_vtimer_save_guest — snapshot virtual timer sysregs into shadow.
+//
+// On entry:
+//   x0 = HypCallId.vtimer_save_guest (7) — discarded.
+//   x1 = pointer to vtimer.VtimerState.
+//
+// Reads CNTV_CTL_EL0, CNTV_CVAL_EL0, CNTKCTL_EL1 into the shadow (the
+// guest's EL1 may have written CNTKCTL, D13.11.26). CNTVOFF_EL2 is
+// EL2-only so the host's shadow remains authoritative and is not read
+// back. Finally writes CNTV_CTL_EL0 = 0x2 (IMASK=1, ENABLE=0) so a
+// post-exit virtual-timer match cannot fire into the host context
+// (D13.11.17; mirrors Linux arch_timer.c timer_save_state).
+export fn hvc_vtimer_save_guest() callconv(.naked) noreturn {
+    asm volatile (
+        \\  mrs     x2, cntv_ctl_el0
+        \\  str     x2, [x1, #0x08]
+        \\  mrs     x2, cntv_cval_el0
+        \\  str     x2, [x1, #0x10]
+        \\  mrs     x2, cntkctl_el1
+        \\  str     x2, [x1, #0x18]
+        \\  mov     x2, #0x2
+        \\  msr     cntv_ctl_el0, x2
+        \\  mov     x0, #0
         \\  eret
     );
 }
