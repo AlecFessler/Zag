@@ -58,6 +58,9 @@
 //!   without setting up a fresh identity map of its own code.
 
 const std = @import("std");
+const zag = @import("zag");
+
+const hyp_consts = zag.arch.aarch64.hyp_consts;
 
 /// Small EL2 stack for the minimal hyp vector table. Must be 16-byte
 /// aligned per AAPCS64. Lives in the bootloader's .bss so it is valid
@@ -75,12 +78,13 @@ var hyp_stack: [0x2000]u8 align(16) = undefined;
 // before the kernel installs its own __hyp_vectors) are observable as a
 // hang rather than an undefined jump.
 //
-// For the "sync lower A64" vector we ERET unconditionally: the HVC trap
-// already advanced ELR_EL2 past the HVC, so a bare ERET resumes EL1 at
-// the next instruction. The kernel's real hyp stub (start.S) replaces
-// this once vmInit runs, so this table only needs to survive the brief
-// window between the bootloader's ERET-to-EL1 and the kernel's own
-// VBAR_EL2 install.
+// The "sync lower A64" vector decodes ESR_EL2.ISS[15:0] (the HVC
+// immediate; ARM ARM D13.2.36). On the well-known selector
+// `HVC_IMM_INSTALL_VBAR_EL2` (0xE112) it writes X0 into VBAR_EL2 and
+// ERETs, letting the EL1 kernel hand off to its own EL2 vector table
+// without needing raw VBAR_EL2 access from EL1. Every other imm16 falls
+// through to a bare ERET — the HVC trap already advanced ELR_EL2 past
+// the HVC, so this resumes EL1 at the next instruction.
 //
 // `.naked` + `export` gets us a proper symbol we can take `&` of; the
 // 2-KiB alignment required by VBAR_EL2 is enforced by placing the
@@ -88,6 +92,7 @@ var hyp_stack: [0x2000]u8 align(16) = undefined;
 // ===========================================================================
 
 export fn bootloader_hyp_vectors() align(2048) callconv(.naked) void {
+    comptime std.debug.assert(hyp_consts.HVC_IMM_INSTALL_VBAR_EL2 == 0xE112);
     asm volatile (
     // +0x000 — sync EL2t
         \\        b       .
@@ -113,7 +118,23 @@ export fn bootloader_hyp_vectors() align(2048) callconv(.naked) void {
         // +0x380 — serror EL2h
         \\        b       .
         \\        .balign 0x80
-        // +0x400 — sync lower EL A64: bare eret (handles HVC-to-noop).
+        // +0x400 — sync lower EL A64.
+        //
+        // Decode ESR_EL2.ISS[15:0] (HVC imm16, ARM ARM D13.2.36).
+        // On HVC_IMM_INSTALL_VBAR_EL2 (0xE112): write X0 into VBAR_EL2.
+        // Any other imm16 falls through to a bare ERET (HVC already
+        // advanced ELR_EL2 past the instruction).
+        \\        stp     x9,  x10, [sp, #-16]!
+        \\        mrs     x9,  esr_el2
+        \\        mov     x10, #0xFFFF
+        \\        and     x9,  x9,  x10
+        \\        mov     x10, #0xE112
+        \\        cmp     x9,  x10
+        \\        b.ne    1f
+        \\        msr     vbar_el2, x0
+        \\        isb
+        \\1:
+        \\        ldp     x9,  x10, [sp], #16
         \\        eret
         \\        .balign 0x80
         // +0x480 — irq lower A64

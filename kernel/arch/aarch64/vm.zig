@@ -40,6 +40,9 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const aarch64_paging = zag.arch.aarch64.paging;
+const hyp_consts = zag.arch.aarch64.hyp_consts;
+const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 
@@ -418,6 +421,16 @@ var vm_supported: bool = false;
 /// path) and `directKernelEntry` in `boot/direct_kernel.zig`.
 pub var hyp_stub_installed: bool = false;
 
+/// Set to true once `installHypVectors()` has run on any core. Guards
+/// secondary cores from re-issuing the install HVC: on APs we do not
+/// currently control EL2 (they come up via PSCI CPU_ON without the
+/// bootloader's EL2 drop sequence), so a second HVC could trap into an
+/// unknown EL2 handler. Tracked as a global because all cores share the
+/// same VMM toolchain state; until a dedicated per-core EL2 bringup path
+/// exists, VM runs are pinned to the BSP.
+/// TODO(smp): install vectors on every core once AP EL2 bringup lands.
+var hyp_vectors_installed: bool = false;
+
 /// Read ID_AA64PFR0_EL1 (ARM ARM K.a §D23.2.79, p7932).
 ///
 /// Field map (bits → field):
@@ -458,6 +471,48 @@ pub fn vmInit() void {
     // TODO(impl): init VMID allocator
 }
 
+/// Install the kernel's EL2 vector table at VBAR_EL2 via an HVC to the
+/// bootloader's minimal EL2 stub.
+///
+/// The bootloader leaves a tiny stub table at VBAR_EL2 whose sync-lower
+/// A64 handler (bootloader/aarch64_el2_drop.zig) decodes the HVC imm16
+/// and, on HVC_IMM_INSTALL_VBAR_EL2, writes X0 into VBAR_EL2. That lets
+/// us hand EL2 a full vector table that branches into
+/// `hyp_sync_lower_a64` without needing EL2 register access from EL1.
+///
+/// VBAR_EL2 holds a PHYSICAL address; the naked `__hyp_vectors` symbol
+/// is linked at a kernel high-half VA, so we walk the kernel page tables
+/// to resolve its PA first. The table is 2 KiB aligned (ARM ARM D1.10.2
+/// — VBAR_ELx bits [10:0] are RES0).
+pub fn installHypVectors() void {
+    // Requires both a CPU that implements EL2 and a live EL2 stub sitting
+    // at VBAR_EL2 willing to honour our install HVC. On the UEFI path the
+    // bootloader installs that stub in aarch64_el2_drop.zig; if we booted
+    // at EL1 with no stub, there is no one to service the HVC and issuing
+    // it would trap to EL1 as an undefined instruction.
+    if (!vm_supported or !hyp_stub_installed) return;
+    if (hyp_vectors_installed) return;
+
+    const vec_va: u64 = @intFromPtr(&__hyp_vectors);
+    const page_paddr = aarch64_paging.resolveVaddr(
+        memory_init.kernel_addr_space_root,
+        VAddr.fromInt(vec_va),
+    ) orelse return;
+    const vec_pa = page_paddr.addr | (vec_va & 0xFFF);
+    std.debug.assert(vec_pa & 0x7FF == 0);
+
+    const hvc_insn = comptime std.fmt.comptimePrint(
+        "hvc #{d}",
+        .{hyp_consts.HVC_IMM_INSTALL_VBAR_EL2},
+    );
+    asm volatile (hvc_insn
+        :
+        : [vbar] "{x0}" (vec_pa),
+        : .{ .memory = true });
+
+    hyp_vectors_installed = true;
+}
+
 /// Per-core VM initialization. Called from `sched.perCoreInit()` on every
 /// CPU after global init. On ARM the per-core setup is small: ensure EL2
 /// vectors are installed and that per-core trap configuration (HCR_EL2
@@ -466,7 +521,10 @@ pub fn vmInit() void {
 /// a hypervisor that does not switch between host and guest VMIDs outside
 /// of a vCPU run.
 pub fn vmPerCoreInit() void {
-    // TODO: install EL2 vectors via VBAR_EL2 if not already installed by boot
+    // VBAR_EL2 is per-core on ARM; every CPU brought online must install
+    // the kernel's own EL2 vector table via the bootloader HVC stub before
+    // any HVC from this core can reach the kernel's world-switch handlers.
+    installHypVectors();
     // TODO: set HCR_EL2 defaults for "host running at EL1" state
 }
 
@@ -797,14 +855,13 @@ pub fn vmResume(
 // but with one architectural twist: ARMv8 EL1↔EL2 transitions are mediated
 // by the EL2 vector table, not by a single instruction. The UEFI bootloader
 // installs a minimal EL2 hyp stub at VBAR_EL2 (see
-// `bootloader/aarch64_el2_drop.zig`) whose only handler is a bare `eret` on
-// HVC. The kernel's full world-switch dispatcher below is therefore
-// currently **dormant** — the symbols are defined and the code is linked in,
-// but nothing writes VBAR_EL2 with a table that branches to them. Task #113
-// tracks wiring this in: kernel issues an HVC to the bootloader stub, passing
-// the PA of its own vector table, which the stub installs via `msr vbar_el2`.
+// `bootloader/aarch64_el2_drop.zig`). Its sync-lower A64 slot decodes the
+// HVC imm16 and, on `HVC_IMM_INSTALL_VBAR_EL2`, writes X0 into VBAR_EL2.
+// `installHypVectors()` uses that hand-off to swap the stub for the
+// `__hyp_vectors` table defined below, at which point HVCs land in
+// `hyp_sync_lower_a64` and the full world-switch dispatcher is live.
 //
-// Symbols defined here (to be referenced from a future `__hyp_vectors` table):
+// Symbols defined here (referenced from `__hyp_vectors`):
 //   hyp_sync_lower_a64   — dispatcher: tpidr_el2 != 0 → guest exit;
 //                          else decode ESR_EL2.EC == HVC and dispatch x0.
 //   hvc_noop             — id=0 round-trip smoke test (returns x1 ^ 1).
@@ -816,6 +873,69 @@ pub fn vmResume(
 //   - PAs only — no high-VA dereferences.
 //   - SP_EL2 is expected to be set up by whoever installs the vector table.
 //   - tpidr_el2 doubles as "currently active WorldSwitchCtx PA" marker.
+
+/// Kernel EL2 vector table. 16 slots × 0x80 bytes each, 2 KiB aligned.
+///
+/// ARM ARM D1.10.2 vector layout (offset → vector):
+///   0x000 sync  EL2t     0x080 irq  EL2t     0x100 fiq  EL2t     0x180 serror EL2t
+///   0x200 sync  EL2h     0x280 irq  EL2h     0x300 fiq  EL2h     0x380 serror EL2h
+///   0x400 sync  lowerA64 0x480 irq  lowerA64 0x500 fiq  lowerA64 0x580 serror lowerA64
+///   0x600 sync  lowerA32 0x680 irq  lowerA32 0x700 fiq  lowerA32 0x780 serror lowerA32
+///
+/// Only the "sync lower A64" slot is wired up: it branches into
+/// `hyp_sync_lower_a64`, which decodes HVC-vs-guest-exit via tpidr_el2.
+/// Every other slot is a tight `b .` loop — the kernel never raises
+/// async exceptions to EL2 and the direct-kernel path does not support
+/// AArch32 guests, so any entry there is a bug we want to observe as a
+/// hang rather than a silent wild branch.
+export fn __hyp_vectors() align(2048) callconv(.naked) noreturn {
+    asm volatile (
+    // +0x000 sync EL2t
+        \\        b       .
+        \\        .balign 0x80
+        // +0x080 irq EL2t
+        \\        b       .
+        \\        .balign 0x80
+        // +0x100 fiq EL2t
+        \\        b       .
+        \\        .balign 0x80
+        // +0x180 serror EL2t
+        \\        b       .
+        \\        .balign 0x80
+        // +0x200 sync EL2h
+        \\        b       .
+        \\        .balign 0x80
+        // +0x280 irq EL2h
+        \\        b       .
+        \\        .balign 0x80
+        // +0x300 fiq EL2h
+        \\        b       .
+        \\        .balign 0x80
+        // +0x380 serror EL2h
+        \\        b       .
+        \\        .balign 0x80
+        // +0x400 sync lower A64 — host hvc or guest exit
+        \\        b       hyp_sync_lower_a64
+        \\        .balign 0x80
+        // +0x480 irq lower A64
+        \\        b       .
+        \\        .balign 0x80
+        // +0x500 fiq lower A64
+        \\        b       .
+        \\        .balign 0x80
+        // +0x580 serror lower A64
+        \\        b       .
+        \\        .balign 0x80
+        // +0x600..+0x780 lower AArch32 (unused)
+        \\        b       .
+        \\        .balign 0x80
+        \\        b       .
+        \\        .balign 0x80
+        \\        b       .
+        \\        .balign 0x80
+        \\        b       .
+    );
+}
 
 export fn hyp_sync_lower_a64() callconv(.naked) noreturn {
     asm volatile (
