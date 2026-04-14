@@ -18,14 +18,14 @@ const profiles = struct {
         .iommu = "intel",
     };
     const test_ = Profile{
-        .root_service = "ktests/tests/bin/root_service.elf",
+        .root_service = "tests/tests/bin/root_service.elf",
         .net = "none",
         .kvm = true,
         .use_llvm = true,
         .iommu = "intel",
     };
     const bench = Profile{
-        .root_service = "ktests/tests/bin/bench.elf",
+        .root_service = "tests/tests/bin/bench.elf",
         .net = "none",
         .kvm = true,
         .use_llvm = true,
@@ -69,7 +69,7 @@ pub fn build(b: *std.Build) void {
         if (profile) |p| p.use_llvm else false;
     const target_arch = b.option([]const u8, "arch", "Target architecture (x64 or arm)") orelse "x64";
     const root_service_path = b.option([]const u8, "root-service", "Path to root service ELF") orelse
-        if (profile) |p| p.root_service else "ktests/tests/bin/root_service.elf";
+        if (profile) |p| p.root_service else "tests/tests/bin/root_service.elf";
     const iommu_type = b.option([]const u8, "iommu", "IOMMU type: intel or amd (default: intel)") orelse
         if (profile) |p| p.iommu else "intel";
     const display_type = b.option([]const u8, "display", "QEMU display: none, gtk, sdl (default: none)") orelse
@@ -115,7 +115,7 @@ pub fn build(b: *std.Build) void {
     zag_mod.addImport("build_options", build_opts.createModule());
 
     const kprof_mod = b.createModule(.{
-        .root_source_file = b.path("ktests/kprof/kprof.zig"),
+        .root_source_file = b.path("kernel/kprof/kprof.zig"),
         .target = b.resolveTargetQuery(.{
             .cpu_arch = arch,
             .os_tag = .freestanding,
