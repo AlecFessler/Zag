@@ -102,6 +102,211 @@ pub fn writePc(state: [*]u8, new_pc: u64) void {
     @as(*align(1) u64, @ptrCast(state + guest_state_pc_offset)).* = new_pc;
 }
 
+/// Byte offset of general-purpose register 0 (x86 RAX / aarch64 X0)
+/// inside the arch-specific GuestState extern struct.
+pub const guest_state_gpr0_offset: usize = 0;
+
+/// Read GPR 0 out of a guest-state byte buffer.
+pub fn readGpr0(state: [*]const u8) u64 {
+    return @as(*align(1) const u64, @ptrCast(state + guest_state_gpr0_offset)).*;
+}
+
+/// Write GPR 0 into a guest-state byte buffer.
+pub fn writeGpr0(state: [*]u8, val: u64) void {
+    @as(*align(1) u64, @ptrCast(state + guest_state_gpr0_offset)).* = val;
+}
+
+// ===========================================================================
+// Pre-encoded guest code snippets used by the §4.2 TDD tests.
+//
+// Each snippet is a comptime-dispatched byte slice that, when placed at
+// guest PC=0 and run via prepGuest-style helpers, produces the specific
+// exit shape the test under verification needs. The x86-64 versions use
+// real-mode opcodes compatible with the unrestricted-guest / real-mode
+// guest state from initHaltGuestState; the aarch64 versions use 4-byte
+// A64 instructions that target the EL1 state from the same init.
+//
+// Common encodings:
+//   x86-64:
+//     A0 XX YY       MOV AL, [0xYYXX]        (real-mode segmented load)
+//     B8 ii ii ii ii MOV EAX, imm32
+//     31 C0          XOR EAX, EAX
+//     0F A2          CPUID
+//     B0 FF          MOV AL, 0xFF
+//     E6 PP          OUT PP, AL              (port-I/O write)
+//     F4             HLT
+//
+//   aarch64:
+//     D2 8a aa a0   MOVZ X0, #imm16          (imm encoded in bits[20:5])
+//     F9 40 00 01   LDR X1, [X0]             (unsigned-offset load)
+//     D5 38 04 00   MRS X0, ID_AA64PFR0_EL1  (op0=3,op1=0,CRn=0,CRm=4,op2=0)
+//     D4 00 00 02   HVC #0                   (always traps to EL2)
+// ===========================================================================
+
+/// Faulting address used by `fault_load_halt_code` and `map_req_halt_code`.
+/// Deliberately a low real-mode-addressable constant on x86 and a low A64
+/// MOVZ immediate on aarch64.
+pub const fault_addr: u64 = 0x2000;
+pub const map_req_addr: u64 = 0x1000;
+
+/// Load from `fault_addr` then halt — on both arches this produces a
+/// stage-2 fault (x86 EPT violation / aarch64 data abort IPA) because
+/// `fault_addr` is deliberately left unmapped by the test. Used by
+/// s4_2_8 (unmapped-delivered-to-VMM) and s4_2_10 (generic VMM exit).
+pub const fault_load_halt_code: []const u8 = switch (builtin.cpu.arch) {
+    // MOV AL, [0x2000]; HLT
+    .x86_64 => &.{ 0xA0, 0x00, 0x20, 0xF4 },
+    // MOVZ X0, #0x2000; LDR X1, [X0]; HVC #0
+    .aarch64 => &.{
+        0x00, 0x00, 0x84, 0xD2, // movz x0, #0x2000
+        0x01, 0x00, 0x40, 0xF9, // ldr  x1, [x0]
+        0x02, 0x00, 0x00, 0xD4, // hvc  #0
+    },
+    else => @compileError("unsupported arch for vm_guest"),
+};
+
+/// Load from `map_req_addr` then halt — used by s4_2_7 to trigger a
+/// stage-2 fault the VMM responds to with a `map_memory` reply. After
+/// the reply the kernel resumes the guest, the load re-executes
+/// successfully, and the guest falls through to the halt instruction.
+pub const map_req_halt_code: []const u8 = switch (builtin.cpu.arch) {
+    // MOV AL, [0x1000]; HLT
+    .x86_64 => &.{ 0xA0, 0x00, 0x10, 0xF4 },
+    // MOVZ X0, #0x1000; LDR X1, [X0]; HVC #0
+    .aarch64 => &.{
+        0x00, 0x00, 0x82, 0xD2, // movz x0, #0x1000
+        0x01, 0x00, 0x40, 0xF9, // ldr  x1, [x0]
+        0x02, 0x00, 0x00, 0xD4, // hvc  #0
+    },
+    else => @compileError("unsupported arch for vm_guest"),
+};
+
+/// Issue a policy-covered feature query then halt. Used by s4_2_9 to
+/// verify the kernel handles the query inline and resumes the guest
+/// without exiting to the VMM.
+///   x86-64:  XOR EAX,EAX; CPUID; HLT — covered by CpuidPolicy[leaf=0]
+///   aarch64: MRS X0, ID_AA64PFR0_EL1; HVC — covered by
+///            IdRegResponse{op0=3,op1=0,crn=0,crm=4,op2=0}
+pub const feature_query_halt_code: []const u8 = switch (builtin.cpu.arch) {
+    .x86_64 => &.{ 0x31, 0xC0, 0x0F, 0xA2, 0xF4 },
+    .aarch64 => &.{
+        0x00, 0x04, 0x38, 0xD5, // mrs x0, id_aa64pfr0_el1
+        0x02, 0x00, 0x00, 0xD4, // hvc #0
+    },
+    else => @compileError("unsupported arch for vm_guest"),
+};
+
+/// Byte offset of the halt instruction inside `feature_query_halt_code`.
+/// If the feature query was handled inline the exit PC must be ≥ this
+/// offset, proving the guest advanced past the query without an exit.
+pub const feature_query_halt_pc_offset: u64 = switch (builtin.cpu.arch) {
+    .x86_64 => 4, // XOR (2) + CPUID (2)
+    .aarch64 => 4, // MRS (4)
+    else => @compileError("unsupported arch for vm_guest"),
+};
+
+/// Load `mov_imm_value` into GPR0 then halt. Used by s4_2_13 to verify
+/// that `VmExitMessage.guest_state` reflects GPR edits made before the
+/// halt instruction executed.
+///   x86-64:  MOV EAX, 0x42 (5 bytes) ; HLT (1 byte)
+///   aarch64: MOVZ X0, #0x42 (4 bytes) ; HVC #0 (4 bytes)
+pub const mov_imm_halt_code: []const u8 = switch (builtin.cpu.arch) {
+    .x86_64 => &.{ 0xB8, 0x42, 0x00, 0x00, 0x00, 0xF4 },
+    .aarch64 => &.{
+        0x40, 0x08, 0x80, 0xD2, // movz x0, #0x42
+        0x02, 0x00, 0x00, 0xD4, // hvc  #0
+    },
+    else => @compileError("unsupported arch for vm_guest"),
+};
+
+/// Expected GPR0 value after executing `mov_imm_halt_code`.
+pub const mov_imm_value: u64 = 0x42;
+
+/// Byte offset of the halt instruction inside `mov_imm_halt_code`.
+pub const mov_imm_halt_pc_offset: u64 = switch (builtin.cpu.arch) {
+    .x86_64 => 5,
+    .aarch64 => 4,
+    else => @compileError("unsupported arch for vm_guest"),
+};
+
+/// Initialize a page-sized policy buffer with a single inline-handled
+/// feature-query entry that matches `feature_query_halt_code`. Used by
+/// s4_2_9 so the same test can exercise both the x86 CpuidPolicy path
+/// and the aarch64 IdRegResponse path without leaking either layout
+/// into the test source.
+///
+/// x86 VmPolicy layout (extern struct):
+///   [0..768)   cpuid_responses: [32]CpuidPolicy (24 bytes each)
+///   [768..772) num_cpuid_responses: u32
+///
+/// aarch64 VmPolicy layout (extern struct):
+///   [0..1024)    id_reg_responses: [64]IdRegResponse (16 bytes each)
+///   [1024..1028) num_id_reg_responses: u32
+pub fn initFeatureQueryPolicy(out: *[4096]u8) void {
+    @memset(out, 0);
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            // CpuidPolicy[0] at offset 0: leaf=0, subleaf=0, eax=1.
+            //   leaf   (u32 LE) @ 0   — already 0
+            //   subleaf(u32 LE) @ 4   — already 0
+            //   eax    (u32 LE) @ 8   — set to 1
+            out[8] = 1;
+            // num_cpuid_responses (u32 LE) @ 768
+            out[768] = 1;
+        },
+        .aarch64 => {
+            // IdRegResponse[0] at offset 0:
+            //   op0(u8) @ 0 = 3
+            //   op1(u8) @ 1 = 0
+            //   crn(u8) @ 2 = 0
+            //   crm(u8) @ 3 = 4
+            //   op2(u8) @ 4 = 0
+            //   _pad[3] @ 5..7
+            //   value(u64) @ 8 = 0 (the kernel will still return 0 for
+            //                       an unspecified value; we don't care
+            //                       about the read value in this test,
+            //                       only that the read was handled inline)
+            out[0] = 3;
+            out[1] = 0;
+            out[2] = 0;
+            out[3] = 4;
+            out[4] = 0;
+            // num_id_reg_responses (u32 LE) @ 1024
+            out[1024] = 1;
+        },
+        else => @compileError("unsupported arch for vm_guest"),
+    }
+}
+
+/// Generic "write `code` bytes into a freshly-reserved host page, map
+/// that page at guest PA 0, initialize halt guest state, and install it
+/// on the vCPU" — the non-halt variants of the tests use this instead
+/// of `prepHaltGuest` when they need a different opcode sequence at
+/// guest PA 0. Returns E_OK on success or the first non-E_OK syscall
+/// result.
+pub fn prepCustomGuest(
+    vm_handle: u64,
+    vcpu_handle: u64,
+    guest_state_buf: [*]u8,
+    code: []const u8,
+) i64 {
+    const res = syscall.mem_reserve(0, syscall.PAGE4K, 0x3);
+    if (res.val < 0) return res.val;
+    const host_va: u64 = res.val2;
+    const host_ptr: [*]u8 = @ptrFromInt(host_va);
+
+    for (code, 0..) |byte, i| {
+        host_ptr[i] = byte;
+    }
+
+    const mr = syscall.vm_guest_map(vm_handle, host_va, 0x0, syscall.PAGE4K, 0x7);
+    if (mr != syscall.E_OK) return mr;
+
+    initHaltGuestState(guest_state_buf);
+    const sr = syscall.vm_vcpu_set_state(vcpu_handle, @intFromPtr(guest_state_buf));
+    return sr;
+}
+
 /// Initialize a guest-state buffer so the vCPU, when run, begins executing
 /// `halt_code` at guest physical / virtual address 0.
 ///
