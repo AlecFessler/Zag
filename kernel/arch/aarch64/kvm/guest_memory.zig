@@ -54,9 +54,12 @@ pub const GuestMemory = struct {
     /// core off) before touching guest memory. Without it, a remote
     /// core could still hold a stage-2 TLB entry tagged with this VM's
     /// VMID while `unmapGuestPage` clears the descriptor out from under
-    /// it. The v1 `unmapGuestPage` is already a TLBI no-op (see
-    /// `vm.stage2InvalidateIpa`); the full EL2 entry path will grow
-    /// proper `TLBI VMALLS12E1IS` on the rollover side.
+    /// it. M4 #126 landed real per-IPA invalidation
+    /// (`TLBI IPAS2E1IS` via `vm.invalidateStage2Ipa`), so each
+    /// `unmapGuestPage` here broadcasts an IS-domain flush before
+    /// returning — but the "stop every vCPU first" invariant still
+    /// stands because a running guest could re-fault and re-fill
+    /// the TLB between clears.
     pub fn deinit(self: *GuestMemory, arch_structures: PAddr) void {
         for (self.regions[0..self.num_regions]) |*region| {
             if (!region.active) continue;

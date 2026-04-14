@@ -79,19 +79,59 @@ pub fn handleExit(vcpu_obj: *VCpu, exit_info: vm_hw.VmExitInfo) void {
 
     switch (exit_info) {
         .stage2_fault => |fault| {
-            // GICD / GICR MMIO is dispatched and PC-advanced inside the Vm.
+            // GICD / GICR MMIO fast-path: dispatched and PC-advanced
+            // inside the Vm before any classification. GICv3 §12 register
+            // access is strictly emulation-only regardless of the
+            // underlying fault kind, so the vGIC handler runs first.
             if (vm_obj.tryHandleMmio(vcpu_obj, fault)) return;
 
-            // Classify the syndrome so the VMM receives a descriptor
-            // that makes sense without re-parsing ESR_EL2. A
-            // translation fault means "stage-2 miss, route to the
-            // guest-memory layer"; a permission fault means "the VMM
-            // marked this region emulation-only". Both still exit to
-            // the VMM today — the distinction exists so future
-            // in-kernel handlers can branch on it cheaply.
-            _ = classifyFsc(fault.fsc);
-            // Unmapped IPA — fall through to VMM delivery so it can map
-            // the region or inject a fault.
+            // M4 #124: classify the stage-2 fault and route.
+            //
+            // DFSC/IFSC (ARM ARM D13.2.39 Table D13-46) → exit kind:
+            //
+            //   0b000100..0b000111 (translation L0..L3)   → map_request
+            //     Stage-2 miss: no descriptor was installed for this
+            //     IPA. The VMM needs to decide whether to back it with
+            //     a `map_memory` reply (RAM or passthrough MMIO) or
+            //     inject a fault.
+            //
+            //   0b001000..0b001011 (access-flag L0..L3)   → mmio_emulation
+            //   0b001100..0b001111 (permission L0..L3)    → mmio_emulation
+            //     A descriptor exists, but the guest access either
+            //     failed S2AP / AF, or tripped an attribute mismatch.
+            //     In Zag's model this means the VMM deliberately left
+            //     the page Device-nGnRnE / read-only / etc. so it
+            //     could intercept accesses and decode them — classic
+            //     MMIO emulation. `fault.srt`/`fault.access_size`/
+            //     `fault.is_write` already contain the ISS-decoded
+            //     operand so no re-parse is needed.
+            //
+            //   anything else (alignment, external, TLB conflict, …)
+            //     → forwarded as-is for the VMM to inspect
+            //
+            // All three cases still exit to the VMM because v1 has no
+            // in-kernel demand-pager and no in-kernel MMIO emulator
+            // beyond the vGIC fast-path above. The classification is
+            // informational today and lets future in-kernel handlers
+            // branch on `FaultKind` cheaply without re-decoding ESR.
+            // We keep the raw `fault.fsc` on the exit descriptor so
+            // the VMM can (and the spec §4.2.10 requires it to) make
+            // the same determination without re-reading ESR_EL2.
+            switch (classifyFsc(fault.fsc)) {
+                .translation => {
+                    // map_request — fall through to VMM delivery.
+                },
+                .permission, .access_flag => {
+                    // mmio_emulation — fall through to VMM delivery.
+                    // The ISS fields (srt/access_size/is_write/reg64/
+                    // sign_extend/acqrel) are already populated by the
+                    // M2 decoder and travel with the exit message.
+                },
+                .alignment, .other => {
+                    // Unusual fault: still forwarded so the VMM sees
+                    // the raw syndrome and decides policy.
+                },
+            }
         },
         .sysreg_trap => |trap| {
             // ID register lookup — analogous to x86 CPUID inline handling.

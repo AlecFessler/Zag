@@ -579,6 +579,13 @@ pub const HypCallId = enum(u64) {
     /// return when the guest exits with the exit info stored in the
     /// WorldSwitchCtx. Returns 0 on success, non-zero on entry failure.
     vcpu_run = 1,
+    /// `arg` = guest IPA of a stage-2 entry that was just mutated.
+    /// Dispatches to `hvc_tlbi_ipa` which issues
+    /// `tlbi ipas2e1is, arg>>12; dsb ish; tlbi vmalle1is; dsb ish; isb`
+    /// at EL2. Required because `TLBI IPAS2E1IS` is EL2-only
+    /// (ARM ARM D7.7); the EL1 kernel therefore cannot issue it
+    /// directly. Returns 0.
+    tlbi_ipa = 2,
 };
 
 /// Issue `hvc #0` with (id, arg) and return the 64-bit result in x0.
@@ -1081,8 +1088,53 @@ export fn hyp_sync_lower_a64() callconv(.naked) noreturn {
         \\  b.eq    hvc_noop
         \\  cmp     x0, #1
         \\  b.eq    hvc_vcpu_run
+        \\  cmp     x0, #2
+        \\  b.eq    hvc_tlbi_ipa
         \\  // Unknown id — return -1.
         \\  mov     x0, #-1
+        \\  eret
+    );
+}
+
+// hvc_tlbi_ipa — M4 stage-2 IPA invalidation from the EL1 kernel.
+//
+// On entry:
+//   x0 = HypCallId.tlbi_ipa (2) — discarded.
+//   x1 = guest IPA (byte address) of the stage-2 leaf that was mutated.
+//
+// `TLBI IPAS2E1IS` takes a 36-bit IPA page number in bits [35:0] of its
+// register operand (ARM ARM K.a D7.7.7 "TLBI IPAS2E1IS, Xt"). We shift
+// the byte IPA right by 12 to get that page number. The sequence is:
+//
+//   dsb ishst        — order prior stage-2 table stores before the TLBI
+//   tlbi ipas2e1is   — invalidate the specific IPA across the IS domain
+//                      (all EL0/EL1 entries that used stage-2 for this
+//                      IPA under the current VMID)
+//   dsb ish          — wait for the TLBI broadcast to complete everywhere
+//   tlbi vmalle1is   — nuke stage-1 walk caches that may have consumed
+//                      the stale stage-2 descriptor on any IS core
+//                      (cheap; strictly required only for combined
+//                      stage-1+stage-2 walks, ARM ARM D5.10.2)
+//   dsb ish          — wait for the stage-1 TLBI to settle
+//   isb              — context synchronization so the kernel sees the
+//                      post-invalidate state on return
+//
+// The VMID programmed in VTTBR_EL2 selects which VM the IPA belongs to;
+// the caller (EL1 kernel) must have already written VTTBR_EL2 for the
+// target VM via the world-switch entry path — or be invalidating a VM
+// whose VMID is otherwise already loaded, which is the common case
+// because `mapGuestPage`/`unmapGuestPage` are driven from VMM syscalls
+// on the owning process's core while VTTBR_EL2 holds that VM's VMID.
+export fn hvc_tlbi_ipa() callconv(.naked) noreturn {
+    asm volatile (
+        \\  lsr     x1, x1, #12
+        \\  dsb     ishst
+        \\  tlbi    ipas2e1is, x1
+        \\  dsb     ish
+        \\  tlbi    vmalle1is
+        \\  dsb     ish
+        \\  isb
+        \\  mov     x0, #0
         \\  eret
     );
 }
@@ -1476,6 +1528,59 @@ export fn hyp_halt() callconv(.naked) noreturn {
 //   - ARM ARM K.a D5.5.5 "Stage 2 memory region attributes" (MemAttr)
 //   - 102142 §4 "Stage 2 translation"
 
+/// Stage-2 leaf memory type. Selects `MemAttr[3:0]` on the Stage2Entry
+/// per ARM ARM K.a D5.5.5 Table D5-37 "Stage 2 MemAttr[3:0]":
+///
+///   0b1111 — Normal, Inner+Outer Write-Back, Write-Allocate, non-transient
+///   0b0000 — Device-nGnRnE (strongly-ordered MMIO, no gathering, no
+///            reordering, no early ack)
+///
+/// Used by `mapGuestPage` to let the caller request a device mapping
+/// for stage-2 MMIO windows the VMM intends to emulate — guest writes
+/// to a Device-nGnRnE page are guaranteed to fault to the hypervisor
+/// in program order, which is the ARM equivalent of x86 EPT's "UC"
+/// type for an MMIO page.
+pub const Stage2MemAttr = enum(u4) {
+    normal_wb = 0b1111,
+    device_nGnRnE = 0b0000,
+};
+
+/// Well-known guest-physical MMIO windows for the "virt" machine layout
+/// Zag's VMM currently exposes to guests. Used by `stage2MemAttrForIpa`
+/// to pick Device-nGnRnE for pages the VMM is going to emulate. This is
+/// intentionally a closed enumeration — any VMM-specific device memory
+/// the user wires up through `vm_guest_map` still lands as Normal WB
+/// unless the map reply grows an explicit `memattr` flag (TODO #125).
+///
+/// References:
+///   - ARM DDI 0183G     PL011 UART (base 0x09000000 on virt)
+///   - virtio-mmio spec  §4.2.2 (0x0a000000..0x0a000e00 on virt)
+///   - GICv3 §12         GICD / GICR bases live in `kvm.vgic` and are
+///                       already matched by `Vm.tryHandleMmio` before
+///                       the stage-2 mapping path is ever reached.
+pub const PL011_MMIO_BASE: u64 = 0x09000000;
+pub const PL011_MMIO_SIZE: u64 = 0x1000;
+pub const VIRTIO_MMIO_BASE: u64 = 0x0a000000;
+pub const VIRTIO_MMIO_SIZE: u64 = 0x0e00;
+
+/// Pick the stage-2 memory type for `guest_phys` by IPA window match.
+/// Anything outside a known device window is treated as Normal WB.
+///
+/// TODO(#125): extend `VmReplyAction.map_memory` with an explicit
+/// `memattr` field so the VMM can mark arbitrary pages as device
+/// without needing kernel awareness of their IPA. Until then, this
+/// closed table covers the set of devices every v1 guest actually
+/// touches (vGIC is handled inline before we get here).
+pub fn stage2MemAttrForIpa(guest_phys: u64) Stage2MemAttr {
+    if (guest_phys >= PL011_MMIO_BASE and guest_phys < PL011_MMIO_BASE + PL011_MMIO_SIZE) {
+        return .device_nGnRnE;
+    }
+    if (guest_phys >= VIRTIO_MMIO_BASE and guest_phys < VIRTIO_MMIO_BASE + VIRTIO_MMIO_SIZE) {
+        return .device_nGnRnE;
+    }
+    return .normal_wb;
+}
+
 /// 1 GiB IPA → T0SZ = 64 - 30 = 34. Exposed so the VmControlBlock
 /// setup (VTCR_EL2) can cite a single source of truth.
 pub const STAGE2_T0SZ: u6 = 34;
@@ -1602,13 +1707,25 @@ pub fn vmFreeStructures(p: PAddr) void {
 }
 
 /// Install a 4 KiB stage-2 mapping `guest_phys → host_phys` with the
-/// supplied rights (bit 0 = read, bit 1 = write, bit 2 = exec).
+/// supplied rights (bit 0 = read, bit 1 = write, bit 2 = exec) and
+/// memory type (`memattr`). `memattr = .normal_wb` is the default for
+/// guest RAM; `memattr = .device_nGnRnE` is used for MMIO windows the
+/// VMM either emulates directly or passes through to real device
+/// memory. See ARM ARM K.a D5.5.5 Table D5-37 for the full list of
+/// legal stage-2 MemAttr encodings.
 ///
 /// Walks the level-2 root, allocates a level-3 page if the L2 slot is
-/// empty, then writes the leaf descriptor. Issues a single
-/// `TLBI IPAS2LE1IS, <ipa>>>12` + `DSB ISH` afterwards so stale
-/// speculative walks cannot hit the new descriptor with an old value.
-pub fn mapGuestPage(vm_structures: PAddr, guest_phys: u64, host_phys: PAddr, rights: u8) !void {
+/// empty, then writes the leaf descriptor. Issues a per-IPA
+/// `TLBI IPAS2E1IS, ipa>>12; DSB ISH` afterwards via
+/// `stage2InvalidateIpa` so stale speculative stage-2 walks cannot hit
+/// the new descriptor with an old value.
+pub fn mapGuestPage(
+    vm_structures: PAddr,
+    guest_phys: u64,
+    host_phys: PAddr,
+    rights: u8,
+    memattr: Stage2MemAttr,
+) !void {
     if (guest_phys >= (1 << 30)) return error.IpaOutOfRange;
     std.debug.assert(std.mem.isAligned(guest_phys, paging.PAGE4K));
     std.debug.assert(std.mem.isAligned(host_phys.addr, paging.PAGE4K));
@@ -1647,9 +1764,10 @@ pub fn mapGuestPage(vm_structures: PAddr, guest_phys: u64, host_phys: PAddr, rig
     // x86 EPT would do.
     const s2ap: u2 = if (can_write) 0b11 else if (can_read) 0b01 else 0b00;
 
-    // MemAttr for Normal Write-Back Inner/Outer cacheable memory. ARM ARM
-    // D5.5.5 Table D5-37: 0b1111 = Normal Inner WB, Outer WB, non-transient.
-    const mem_attr: u4 = 0b1111;
+    // MemAttr per caller selection. ARM ARM D5.5.5 Table D5-37:
+    //   0b1111 = Normal Inner WB, Outer WB, non-transient (guest RAM)
+    //   0b0000 = Device-nGnRnE (MMIO, strongly-ordered, no gathering)
+    const mem_attr: u4 = @intFromEnum(memattr);
 
     l3[l3_idx] = .{
         .valid = true,
@@ -1683,35 +1801,35 @@ pub fn unmapGuestPage(vm_structures: PAddr, guest_phys: u64) void {
     stage2InvalidateIpa(guest_phys);
 }
 
-/// Invalidate any cached stage-2 translation for `guest_phys` in the
-/// current VM's VMID.
+/// Invalidate any cached stage-2 translation for `guest_phys` (byte
+/// address, page-aligned) in the current VM's VMID.
 ///
 /// `TLBI IPAS2E1IS, <ipa>>>12` is the architectural instruction for
 /// stage-2 invalidation (ARM ARM K.a D7.7 "TLB maintenance
 /// instructions"), but it is EL2-only: executing it from EL1 is
-/// UNDEFINED and would trap. The Zag kernel runs at EL1, so we cannot
-/// issue TLBIs directly here.
+/// UNDEFINED and would trap. The Zag kernel runs at EL1, so we route
+/// through the `hvc_tlbi_ipa` hyp stub (HypCallId.tlbi_ipa) which
+/// executes the full
+///     dsb ishst ; tlbi ipas2e1is ; dsb ish ; tlbi vmalle1is ; dsb ish ; isb
+/// sequence at EL2 against the currently-loaded VTTBR_EL2. Called
+/// from every stage-2 mutation site (`mapGuestPage`, `unmapGuestPage`,
+/// and any future attribute-change path) so speculative walks can
+/// never observe a stale descriptor once this function returns.
 ///
-/// For v1 this is a deliberate no-op. Correctness is preserved because:
+/// Range invalidations (block descriptors, VMID rollover) should keep
+/// using `vmalls12e1is` — see the world-switch entry path in
+/// `hvc_vcpu_run`, which already issues that for VMID rollover.
 ///
-///   1. Fresh stage-2 descriptors written by `mapGuestPage` are only
-///      visible to the guest after the next `ERET` back into EL1N, at
-///      which point the hardware re-walks unless there is a cached
-///      entry — and because no vCPU has yet entered the guest after
-///      this descriptor was written, there is no cached entry to
-///      invalidate.
-///   2. `unmapGuestPage` has a potential stale-entry window, but the
-///      only in-tree caller is VM teardown, and `vmFreeStructures`
-///      tears down the entire VMID — so the TLB eviction happens on
-///      the next VMID rollover.
-///
-/// The EL2 entry path (Task #6: `vmResume`) will grow a proper
-/// invalidation point that batches IPA invalidations into the
-/// post-context-switch sequence, matching the Linux `__tlb_switch_to_*`
-/// dance. Until that lands, the invalidate-on-write guarantee we need
-/// for live guests simply does not apply because no guest ever runs.
+/// Callers must pass a page-aligned byte IPA; `hvc_tlbi_ipa` shifts
+/// right by 12 internally before issuing the TLBI, per the register
+/// format in ARM ARM D7.7.7.
+pub fn invalidateStage2Ipa(guest_phys: u64) void {
+    std.debug.assert(std.mem.isAligned(guest_phys, paging.PAGE4K));
+    _ = hypCall(.tlbi_ipa, guest_phys);
+}
+
 fn stage2InvalidateIpa(guest_phys: u64) void {
-    _ = guest_phys;
+    invalidateStage2Ipa(guest_phys);
 }
 
 // ===========================================================================
