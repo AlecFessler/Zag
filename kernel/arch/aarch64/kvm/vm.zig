@@ -363,7 +363,15 @@ pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64
             rollbackGuestMap(vm_obj, guest_addr, offset);
             return E_BADADDR;
         };
-        vm_hw.mapGuestPage(vm_obj.arch_structures, guest_addr + offset, host_phys, @truncate(rights)) catch {
+        // M4 #125: pick stage-2 MemAttr from the target IPA. Pages
+        // that fall inside a known emulated MMIO window (PL011,
+        // virtio-mmio) get Device-nGnRnE so guest accesses land on
+        // strongly-ordered memory and fault synchronously; everything
+        // else (guest RAM) stays Normal WB. vGIC windows never reach
+        // this code — `guestMap` rejects them above and
+        // `Vm.tryHandleMmio` consumes the resulting stage-2 fault.
+        const memattr = vm_hw.stage2MemAttrForIpa(guest_addr + offset);
+        vm_hw.mapGuestPage(vm_obj.arch_structures, guest_addr + offset, host_phys, @truncate(rights), memattr) catch {
             rollbackGuestMap(vm_obj, guest_addr, offset);
             return E_NOMEM;
         };
