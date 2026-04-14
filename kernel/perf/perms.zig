@@ -1,1 +1,0 @@
-../tests/libz/perms.zig

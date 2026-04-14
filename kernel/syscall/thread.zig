@@ -298,10 +298,7 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
 
     const was_running = target.state == .running;
     const is_self = target == cur;
-    // Use atomic store so concurrent wakeThread's cmpxchg on
-    // thread.state observes .exited and skips the wake.
-    const state_ptr: *align(1) u8 = @ptrCast(&target.state);
-    @atomicStore(u8, state_ptr, @intFromEnum(State.exited), .release);
+    target.state = .exited;
     // Clear bitmask bits
     target_proc.faulted_thread_slots &= ~(@as(u64, 1) << @intCast(target.slot_index));
     target_proc.suspended_thread_slots &= ~(@as(u64, 1) << @intCast(target.slot_index));

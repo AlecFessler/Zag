@@ -8,9 +8,9 @@ iso/boot/kernel.elf
 **/venv/
 .claude/worktrees/
 *.elf
-!kernel/redteam/*.elf
-kernel/perf/perf_results/
-kernel/tests/perf_results/
+!ktests/redteam/*.elf
+ktests/perf/perf_results/
+ktests/tests/perf_results/
 __pycache__/
 *.pyc
 qemu.log

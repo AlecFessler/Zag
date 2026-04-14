@@ -34,7 +34,6 @@ pub const BumpAllocator = struct {
         ret_addr: u64,
     ) ?[*]u8 {
         _ = ret_addr;
-        @import("zag").arch.dispatch.earlyDebugChar('a');
         const self: *BumpAllocator = @ptrCast(@alignCast(ptr));
 
         const aligned = std.mem.alignForward(
@@ -43,14 +42,12 @@ pub const BumpAllocator = struct {
             alignment.toByteUnits(),
         );
         const next_free = aligned + len;
-        @import("zag").arch.dispatch.earlyDebugChar('b');
 
         if (next_free > self.end_addr) {
             return null;
         }
 
         self.free_addr = next_free;
-        @import("zag").arch.dispatch.earlyDebugChar('c');
         return @ptrFromInt(aligned);
     }
 

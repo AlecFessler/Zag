@@ -73,6 +73,17 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
         },
         .process => |proc_ptr| {
             if (handle_val == 0) {
+                // Red-team Finding (5c80fe4): self-cap-transfer is a
+                // no-op semantically and composes with the slot-0 rights
+                // pun in validateIpcSendRights to yield a handle-table
+                // corruption primitive. When target_proc == sender_proc
+                // the fault_handler branch walks sender_proc.threads[]
+                // and inserts duplicate thread handles into the sender's
+                // own perm table. Reject outright.
+                if (target_proc == sender_proc) {
+                    sender_proc.perm_lock.unlock();
+                    return E_INVAL;
+                }
                 // Sending HANDLE_SELF: gives recipient a process handle to the sender.
                 // §4.1.2 restricts the `fault_handler` ProcessHandleRights bit to
                 // "at most one external process per target" — and §4.1.3 describes
@@ -300,6 +311,14 @@ fn getCapPayload(ctx: *const ArchCpuContext, word_count: u3) struct { handle: u6
 }
 
 fn validateIpcSendRights(entry: PermissionEntry, meta: IpcMetadata, sender_proc: *Process, src_ctx: *const ArchCpuContext) i64 {
+    // Red-team Finding (5c80fe4): block cap_transfer self-sends as a
+    // second line of defense after the target_proc == sender_proc check
+    // in transferCapability. The slot-0 entry stores ProcessRights, not
+    // ProcessHandleRights, and reinterpreting the layout lets
+    // ProcessRights.spawn_thread (bit 0) masquerade as send_words,
+    // passing this gate without holding any send_* right.
+    const self_send = entry.object == .process and entry.object.process == sender_proc;
+    if (self_send and meta.cap_transfer) return E_INVAL;
     const rights = entry.processHandleRights();
     if (!rights.send_words) return E_PERM;
     if (meta.cap_transfer) {
@@ -318,17 +337,7 @@ fn validateIpcSendRights(entry: PermissionEntry, meta: IpcMetadata, sender_proc:
 
 fn wakeThread(thread: *Thread) void {
     while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
-
-    // Atomically transition .blocked → .ready. If the thread has already
-    // been marked .exited by a concurrent sysThreadKill, the cmpxchg
-    // fails and we silently skip the wake — the killing core owns the
-    // thread from that point and will call deinit(). Without this guard
-    // we would enqueue a thread that is about to be freed, causing a
-    // use-after-free when the scheduler dequeues it.
-    const state_ptr: *align(1) u8 = @ptrCast(&thread.state);
-    const old = @cmpxchgStrong(u8, state_ptr, @intFromEnum(State.blocked), @intFromEnum(State.ready), .acq_rel, .monotonic);
-    if (old != null) return;
-
+    thread.state = .ready;
     const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
     sched.enqueueOnCore(target_core, thread);
 }
@@ -640,23 +649,12 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
         if (caller_thread == null) return .{ .ret = reply_cap_err };
 
         const ct = caller_thread.?;
-
-        // Guard against concurrent sysThreadKill: if the caller thread
-        // was already marked .exited, skip the wake entirely — the
-        // killing core owns cleanup. Fall through to return normally.
-        const ct_state_ptr: *align(1) u8 = @ptrCast(&ct.state);
-        const ct_old = @cmpxchgStrong(u8, ct_state_ptr, @intFromEnum(State.blocked), @intFromEnum(State.ready), .acq_rel, .monotonic);
-        if (ct_old != null) return .{ .ret = reply_cap_err };
-
-        // Caller successfully transitioned to .ready — try direct switch.
         thread.state = .ready;
         arch.setSyscallReturn(ctx, @bitCast(reply_cap_err));
         const result = sched.switchToThread(thread, ct, ctx, true);
         if (result != 0) {
             thread.state = .running;
-            // Already .ready from cmpxchg above, just enqueue.
-            const target_core = if (ct.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
-            sched.enqueueOnCore(target_core, ct);
+            wakeThread(ct);
             return .{ .ret = reply_cap_err };
         }
         unreachable;

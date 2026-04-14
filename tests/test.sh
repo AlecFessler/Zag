@@ -115,7 +115,7 @@ clean_nvvars() {
 run_kernel_tests() {
     echo "=== Kernel Tests ==="
     clean_nvvars
-    PARALLEL="${PARALLEL:-8}" bash "$SCRIPT_DIR/kernel/tests/run_tests.sh"
+    PARALLEL="${PARALLEL:-8}" bash "$SCRIPT_DIR/ktests/tests/run_tests.sh"
 }
 
 run_linux_boot_test() {
@@ -190,7 +190,7 @@ run_router_tests() {
 run_perf_tests() {
     echo "=== Performance Tests ==="
     clean_nvvars
-    bash "$SCRIPT_DIR/kernel/perf/run_perf.sh"
+    bash "$SCRIPT_DIR/ktests/perf/run_perf.sh"
 }
 
 run_kernel_fuzzers() {

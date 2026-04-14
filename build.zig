@@ -18,14 +18,14 @@ const profiles = struct {
         .iommu = "intel",
     };
     const test_ = Profile{
-        .root_service = "kernel/tests/bin/root_service.elf",
+        .root_service = "ktests/tests/bin/root_service.elf",
         .net = "none",
         .kvm = true,
         .use_llvm = true,
         .iommu = "intel",
     };
     const bench = Profile{
-        .root_service = "kernel/tests/bin/bench.elf",
+        .root_service = "ktests/tests/bin/bench.elf",
         .net = "none",
         .kvm = true,
         .use_llvm = true,
@@ -69,7 +69,7 @@ pub fn build(b: *std.Build) void {
         if (profile) |p| p.use_llvm else false;
     const target_arch = b.option([]const u8, "arch", "Target architecture (x64 or arm)") orelse "x64";
     const root_service_path = b.option([]const u8, "root-service", "Path to root service ELF") orelse
-        if (profile) |p| p.root_service else "kernel/tests/bin/root_service.elf";
+        if (profile) |p| p.root_service else "ktests/tests/bin/root_service.elf";
     const iommu_type = b.option([]const u8, "iommu", "IOMMU type: intel or amd (default: intel)") orelse
         if (profile) |p| p.iommu else "intel";
     const display_type = b.option([]const u8, "display", "QEMU display: none, gtk, sdl (default: none)") orelse
@@ -113,6 +113,21 @@ pub fn build(b: *std.Build) void {
     const build_opts = b.addOptions();
     build_opts.addOption([]const u8, "kernel_profile", kernel_profile);
     zag_mod.addImport("build_options", build_opts.createModule());
+
+    const kprof_mod = b.createModule(.{
+        .root_source_file = b.path("ktests/kprof/kprof.zig"),
+        .target = b.resolveTargetQuery(.{
+            .cpu_arch = arch,
+            .os_tag = .freestanding,
+            .cpu_model = cpu_model,
+        }),
+        .optimize = optimize,
+    });
+    kprof_mod.omit_frame_pointer = false;
+    kprof_mod.red_zone = false;
+    kprof_mod.addImport("zag", zag_mod);
+    kprof_mod.addImport("build_options", build_opts.createModule());
+    zag_mod.addImport("kprof", kprof_mod);
 
     // ── SMP trampoline (x86-only; aarch64 uses PSCI CPU_ON) ────────────
     const embedded_wf = b.addWriteFiles();
@@ -194,7 +209,7 @@ pub fn build(b: *std.Build) void {
     kernel.root_module.omit_frame_pointer = false;
     kernel.root_module.red_zone = false;
     kernel.root_module.addImport("zag", zag_mod);
-    kernel.setLinkerScript(b.path(if (arch == .x86_64) "kernel/linker.ld" else "kernel/linker-aarch64.ld"));
+    kernel.setLinkerScript(b.path(if (arch == .x86_64) "kernel/linker-x86.ld" else "kernel/linker-aarch64.ld"));
     // Preserve relocation info so the bootloader can apply a random KASLR
     // slide to kernel text/rodata/data at load time. Without --emit-relocs
     // the .rela.* sections are stripped and absolute references bake in

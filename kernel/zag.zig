@@ -1,7 +1,7 @@
 pub const arch = @import("arch/arch.zig");
 pub const boot = @import("boot/boot.zig");
 pub const devices = @import("devices/devices.zig");
-pub const kprof = @import("kprof/kprof.zig");
+pub const kprof = @import("kprof");
 pub const memory = @import("memory/memory.zig");
 pub const panic = @import("panic.zig");
 pub const perms = @import("perms/perms.zig");
