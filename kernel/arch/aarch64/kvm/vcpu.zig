@@ -206,6 +206,8 @@ fn vcpuEntryPoint() void {
             &vcpu_obj.guest_fxsave,
             &vcpu_obj.arch_scratch,
             vm_obj.vmid,
+            vm_obj.hcr_el2_override_set,
+            vm_obj.hcr_el2_override_clear,
         );
 
         vcpu_obj.last_exit_info = exit_info;
