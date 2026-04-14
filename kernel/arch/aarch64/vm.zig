@@ -795,14 +795,16 @@ pub fn vmResume(
 //
 // These mirror the x64 inline-asm vmResume structure (see x64/intel/vmx.zig)
 // but with one architectural twist: ARMv8 EL1↔EL2 transitions are mediated
-// by the EL2 vector table, not by a single instruction. The vector table
-// itself still lives in start.S because each entry must be at a fixed
-// `.org`-aligned offset, but every handler the table dispatches to is
-// expressed below as a Zig naked function with `linksection(".text.boot")`
-// so it lands at low PA where EL2 (running with SCTLR_EL2.M=0, MMU off)
-// can reach it via direct branch.
+// by the EL2 vector table, not by a single instruction. The UEFI bootloader
+// installs a minimal EL2 hyp stub at VBAR_EL2 (see
+// `bootloader/aarch64_el2_drop.zig`) whose only handler is a bare `eret` on
+// HVC. The kernel's full world-switch dispatcher below is therefore
+// currently **dormant** — the symbols are defined and the code is linked in,
+// but nothing writes VBAR_EL2 with a table that branches to them. Task #113
+// tracks wiring this in: kernel issues an HVC to the bootloader stub, passing
+// the PA of its own vector table, which the stub installs via `msr vbar_el2`.
 //
-// Symbols defined here (referenced from `__hyp_vectors` in start.S):
+// Symbols defined here (to be referenced from a future `__hyp_vectors` table):
 //   hyp_sync_lower_a64   — dispatcher: tpidr_el2 != 0 → guest exit;
 //                          else decode ESR_EL2.EC == HVC and dispatch x0.
 //   hvc_noop             — id=0 round-trip smoke test (returns x1 ^ 1).
@@ -812,10 +814,10 @@ pub fn vmResume(
 //
 // All four handlers run with EL2 MMU off, so:
 //   - PAs only — no high-VA dereferences.
-//   - SP_EL2 is the active SP (set in start.S to __hyp_stack_top).
+//   - SP_EL2 is expected to be set up by whoever installs the vector table.
 //   - tpidr_el2 doubles as "currently active WorldSwitchCtx PA" marker.
 
-export fn hyp_sync_lower_a64() linksection(".text.boot") callconv(.naked) noreturn {
+export fn hyp_sync_lower_a64() callconv(.naked) noreturn {
     asm volatile (
         \\  // If tpidr_el2 != 0 we were running a guest; this is a VM exit.
         \\  mrs     x18, tpidr_el2
@@ -839,7 +841,7 @@ export fn hyp_sync_lower_a64() linksection(".text.boot") callconv(.naked) noretu
     );
 }
 
-export fn hvc_noop() linksection(".text.boot") callconv(.naked) noreturn {
+export fn hvc_noop() callconv(.naked) noreturn {
     asm volatile (
         \\  // Return arg^1 so the caller can verify the round-trip changed x0.
         \\  eor     x0, x1, #1
@@ -857,7 +859,7 @@ export fn hvc_noop() linksection(".text.boot") callconv(.naked) noreturn {
 // per-VM EL2 state (HCR/VTCR/VTTBR/CNTVOFF), loads guest EL1 sysregs and
 // GPRs from ctx.guest_state, sets tpidr_el2 = ctx_pa as the "guest active"
 // marker, and ERETs to the guest at guest.pc / guest.pstate.
-export fn hvc_vcpu_run() linksection(".text.boot") callconv(.naked) noreturn {
+export fn hvc_vcpu_run() callconv(.naked) noreturn {
     asm volatile (
         \\  // x1 = ctx PA. Preserve it in x18 across sysreg work.
         \\  mov     x18, x1
@@ -1013,7 +1015,7 @@ export fn hvc_vcpu_run() linksection(".text.boot") callconv(.naked) noreturn {
 // ctx.exit_{esr,far,hpfar}, restores host EL1 sysregs and callee-saved
 // GPRs, clears tpidr_el2, restores host ELR_EL2/SPSR_EL2 stashed at entry,
 // and ERETs back to the host (instruction after `hvc #0` in hypCall).
-export fn guest_exit_entry() linksection(".text.boot") callconv(.naked) noreturn {
+export fn guest_exit_entry() callconv(.naked) noreturn {
     asm volatile (
         \\  // Reclaim ctx pointer from tpidr_el2 without clobbering x0..x17.
         \\  // Use SP_EL2 as a two-slot scratch to free up x17/x18.
@@ -1170,7 +1172,7 @@ export fn guest_exit_entry() linksection(".text.boot") callconv(.naked) noreturn
     );
 }
 
-export fn hyp_halt() linksection(".text.boot") callconv(.naked) noreturn {
+export fn hyp_halt() callconv(.naked) noreturn {
     asm volatile (
         \\1:wfe
         \\  b       1b

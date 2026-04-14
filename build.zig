@@ -84,7 +84,6 @@ pub fn build(b: *std.Build) void {
         if (profile) |p| p.display else "none";
     const net_type = b.option([]const u8, "net", "Network: tap, user, or none (default: user)") orelse
         if (profile) |p| p.net else "user";
-    const direct_kernel = b.option(bool, "direct_kernel", "aarch64 only: build kernel for QEMU -kernel direct-boot (EL2 via virtualization=on). Replaces UEFI bootloader entry path.") orelse false;
     const kernel_profile = b.option([]const u8, "kernel_profile", "Kernel profiling mode: none, trace, or sample (default: none)") orelse "none";
     if (!std.mem.eql(u8, kernel_profile, "none") and
         !std.mem.eql(u8, kernel_profile, "trace") and
@@ -137,7 +136,6 @@ pub fn build(b: *std.Build) void {
 
     const build_opts = b.addOptions();
     build_opts.addOption([]const u8, "kernel_profile", kernel_profile);
-    build_opts.addOption(bool, "direct_kernel", direct_kernel);
     const build_opts_mod = build_opts.createModule();
     zag_mod.addImport("build_options", build_opts_mod);
 
@@ -166,11 +164,6 @@ pub fn build(b: *std.Build) void {
         const trampoline_output = nasm_step.addOutputFileArg("trampoline.bin");
         _ = embedded_wf.addCopyFile(trampoline_output, "trampoline.bin");
     }
-    // Direct-kernel aarch64 loads root_service from a fixed PA at boot
-    // (QEMU `-device loader,file=...,addr=0x44000000`) instead of
-    // embedding it in the kernel image. This lets the test runner reuse
-    // a single kernel.elf across all per-test root_service.elf swaps.
-    // See `kernel/arch/aarch64/boot/direct_kernel.zig`.
     const embedded_bins_mod = b.createModule(.{
         .root_source_file = embedded_wf.add("embedded_bins.zig",
             if (arch == .x86_64)
@@ -244,29 +237,20 @@ pub fn build(b: *std.Build) void {
         kernel.use_llvm = true;
         kernel.use_lld = true;
     }
-    const use_direct_kernel = direct_kernel and arch == .aarch64;
-    kernel.entry = .{ .symbol_name = if (use_direct_kernel) "_start" else "kEntry" };
+    kernel.entry = .{ .symbol_name = "kEntry" };
     kernel.root_module.omit_frame_pointer = false;
     kernel.root_module.red_zone = false;
     kernel.root_module.addImport("zag", zag_mod);
     const linker_script = if (arch == .x86_64)
         "kernel/linker-x86.ld"
-    else if (use_direct_kernel)
-        "kernel/linker-aarch64-direct.ld"
     else
         "kernel/linker-aarch64.ld";
     kernel.setLinkerScript(b.path(linker_script));
-    if (use_direct_kernel) {
-        // Boot stub (low-PA entry, EL detection, UEFI tail-call or EL2
-        // direct-boot setup). Only linked when -Ddirect_kernel=true.
-        kernel.addAssemblyFile(b.path("kernel/arch/aarch64/boot/start.S"));
-    }
     // Preserve relocation info so the bootloader can apply a random KASLR
     // slide to kernel text/rodata/data at load time. Without --emit-relocs
     // the .rela.* sections are stripped and absolute references bake in
-    // the link-time base address. Direct-kernel builds skip KASLR and so
-    // don't need emit-relocs — see linker-aarch64-direct.ld.
-    kernel.link_emit_relocs = !use_direct_kernel;
+    // the link-time base address.
+    kernel.link_emit_relocs = true;
     b.installArtifact(kernel);
     const install_kernel = b.addInstallFile(
         kernel.getEmittedBin(),
