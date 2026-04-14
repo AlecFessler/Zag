@@ -148,9 +148,21 @@ pub fn prepareThreadContext(
         ctx.spsr_el1 = 0x0;
         ctx.sp_el0 = ustack.addr;
     } else {
-        // Kernel thread: EL1h (M[3:0] = 0x4), DAIF masked (bits [9:6]).
+        // Kernel thread: EL1t (M[3:0] = 0x4), DAIF masked (bits [9:6]).
+        //
+        // EL1t means "EL1 using SP_EL0 as the stack pointer" (ARM ARM
+        // C5.2.18). Unlike EL1h (which uses SP_EL1 and would require
+        // mid-switch SP_EL1 clobbering), EL1t lets the existing context
+        // restore path use the same SP_EL0 slot for both user and
+        // kernel threads. The kernel's own exception handlers still run
+        // on SP_EL1 via the SPSel=1 in exception entry, so the kernel
+        // thread's stack is separate from the exception-handler stack.
+        //
+        // Must use kstack_top as SP_EL0 for kernel threads — leaving it
+        // zero produces a guaranteed SP-near-zero fault on the very
+        // first stack-touching instruction.
         ctx.spsr_el1 = 0x3C4;
-        ctx.sp_el0 = 0;
+        ctx.sp_el0 = kstack_top.addr;
     }
 
     return ctx;

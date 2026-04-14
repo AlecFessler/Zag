@@ -1,0 +1,403 @@
+//! Aarch64 VCpu object — scaffolding.
+//!
+//! Mirrors `kernel/arch/x64/kvm/vcpu.zig`. The VCpu represents a virtual
+//! CPU: a kernel thread that runs the guest via `vm_hw.vmResume` in a
+//! loop, interleaving inline exit handling and delivery to the VMM via
+//! the VmExitBox.
+//!
+//! x64 → aarch64 notable differences:
+//!   - Entry point. On x64 the vcpu thread executes `vcpu_entry` which
+//!     loads VMCS + calls `vmx.vmResume`. On aarch64 the entry point is
+//!     the same shape but uses EL2 sysregs instead of VMCS loads.
+//!
+//!   - Interrupt delivery. On x64 the vcpu's `guest_state.pending_eventinj`
+//!     holds a VMCB EVENTINJ token. On aarch64 the vGIC owns pending
+//!     virtual interrupts; we just flip a flag in GuestState and
+//!     `vgic.prepareEntry` programs list registers on the next entry.
+//!
+//!   - Sysreg trap inline handling. On x64, CR accesses / CPUID are
+//!     handled inline by `tryHandleInlineExit`. The aarch64 analogue
+//!     handles sysreg traps (MSR/MRS) and ID register reads by looking
+//!     them up in `vm.policy` and calling a shared helper that walks
+//!     the IdRegResponse / SysregPolicy tables.
+//!
+//! TODO(impl): port x64/kvm/vcpu.zig line-for-line, substituting the
+//! three differences above.
+
+const std = @import("std");
+const zag = @import("zag");
+
+const arch = zag.arch.dispatch;
+const interrupts = zag.arch.aarch64.interrupts;
+const kvm = zag.arch.aarch64.kvm;
+const memory_init = zag.memory.init;
+const paging = zag.memory.paging;
+const pmm = zag.memory.pmm;
+const sched = zag.sched.scheduler;
+const stack_mod = zag.memory.stack;
+const thread_mod = zag.sched.thread;
+const vm_hw = zag.arch.aarch64.vm;
+const vm_mod = kvm.vm;
+
+const PAddr = zag.memory.address.PAddr;
+const Process = zag.proc.process.Process;
+const SlabAllocator = zag.memory.allocators.slab.SlabAllocator;
+const SpinLock = zag.utils.sync.SpinLock;
+const Thread = zag.sched.thread.Thread;
+const VAddr = zag.memory.address.VAddr;
+const VgicVcpuState = kvm.vgic.VcpuState;
+const Vm = kvm.vm.Vm;
+
+pub const VCpuAllocator = SlabAllocator(VCpu, false, 0, 64, true);
+pub var allocator: std.mem.Allocator = undefined;
+
+/// State of a vCPU. Accessed from multiple threads (the vCPU's own thread,
+/// `kickRunningVcpus`, the exit handler, and `vm_reply`); all reads/writes
+/// must use atomic load/store via `loadState`/`storeState` helpers.
+pub const VCpuState = enum(u8) {
+    idle,
+    running,
+    exited,
+    waiting_reply,
+};
+
+pub const VCpu = struct {
+    thread: *Thread,
+    vm: *Vm,
+    guest_state: vm_hw.GuestState = .{},
+    /// Atomic state. Use `loadState`/`storeState`. Direct writes are only
+    /// allowed inside regions already holding `vm.lock`.
+    state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(VCpuState.idle)),
+    last_exit_info: vm_hw.VmExitInfo = .{ .unknown = 0 },
+    /// Guest FPSIMD state (V0..V31, FPCR, FPSR). Saved/restored by `vmResume`
+    /// across each guest entry. ARM ARM B1.2.2.
+    guest_fxsave: vm_hw.FxsaveArea align(16) = vm_hw.fxsaveInit(),
+    /// Per-vCPU vGIC state: redistributor SGI/PPI bookkeeping plus the
+    /// list-register shadow consumed by `vgic.prepareEntry` /
+    /// `vgic.saveExit`. Initialized by `vcpu.create` via `vgic.initVcpu`
+    /// after the VCpu allocation and before the vcpu thread is started.
+    /// See `kernel/arch/aarch64/kvm/vgic.zig`.
+    vgic_state: VgicVcpuState = .{},
+    lock: SpinLock = .{},
+
+    pub inline fn loadState(self: *const VCpu) VCpuState {
+        return @enumFromInt(self.state.load(.acquire));
+    }
+
+    pub inline fn storeState(self: *VCpu, new_state: VCpuState) void {
+        self.state.store(@intFromEnum(new_state), .release);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Object lifetime
+// ---------------------------------------------------------------------------
+
+/// Create a vCPU: allocate the struct, create a kernel thread running
+/// `vcpuEntryPoint`, link them.
+pub fn create(vm_obj: *Vm) !*VCpu {
+    const vcpu_obj = try allocator.create(VCpu);
+    errdefer allocator.destroy(vcpu_obj);
+
+    const proc = vm_obj.owner;
+
+    const thread = try thread_mod.allocator.create(Thread);
+    errdefer thread_mod.allocator.destroy(thread);
+
+    thread.* = .{
+        .tid = @atomicRmw(u64, &thread_mod.tid_counter, .Add, 1, .monotonic),
+        .ctx = undefined,
+        .kernel_stack = undefined,
+        .user_stack = null,
+        .process = proc,
+        .state = .blocked, // starts blocked until vm_vcpu_run
+    };
+
+    thread.kernel_stack = try stack_mod.createKernel();
+    errdefer stack_mod.destroyKernel(thread.kernel_stack, memory_init.kernel_addr_space_root);
+
+    try mapKernelStack(thread.kernel_stack);
+
+    // Set up the thread context with the vCPU entry point.
+    const kstack_top = zag.memory.address.alignStack(thread.kernel_stack.top);
+    thread.ctx = interrupts.prepareThreadContext(kstack_top, null, &vcpuEntryPoint, @intFromPtr(vcpu_obj));
+
+    // Add thread to process thread list.
+    proc.lock.lock();
+    if (proc.num_threads >= Process.MAX_THREADS) {
+        proc.lock.unlock();
+        return error.MaxThreads;
+    }
+    thread.slot_index = @intCast(proc.num_threads);
+    proc.threads[proc.num_threads] = thread;
+    proc.num_threads += 1;
+    proc.lock.unlock();
+
+    vcpu_obj.* = .{
+        .thread = thread,
+        .vm = vm_obj,
+    };
+
+    return vcpu_obj;
+}
+
+/// Destroy a vCPU: kill its thread and free the struct.
+pub fn destroy(vcpu_obj: *VCpu) void {
+    const thread = vcpu_obj.thread;
+
+    thread.state = .exited;
+
+    if (sched.coreRunning(thread)) |core_id| {
+        arch.triggerSchedulerInterrupt(core_id);
+    }
+
+    sched.removeFromAnyRunQueue(thread);
+
+    allocator.destroy(vcpu_obj);
+}
+
+/// Find the VCpu that owns a given thread within a VM.
+pub fn vcpuFromThread(vm_obj: *Vm, thread: *Thread) ?*VCpu {
+    for (vm_obj.vcpus[0..vm_obj.num_vcpus]) |v| {
+        if (v.thread == thread) return v;
+    }
+    return null;
+}
+
+// ---------------------------------------------------------------------------
+// vCPU run loop — the entry point for the vCPU's kernel thread.
+// ---------------------------------------------------------------------------
+
+/// The kernel-managed vCPU thread entry point. Looks up the VCpu via the
+/// current thread, then enters the guest in a loop until the vCPU is
+/// killed or transitions out of `.running`.
+fn vcpuEntryPoint() void {
+    const thread = sched.currentThread().?;
+    const vm_obj = thread.process.vm.?;
+    const vcpu_obj = vcpuFromThread(vm_obj, thread).?;
+
+    while (true) {
+        if (vcpu_obj.loadState() != .running) {
+            // Block until the VMM resumes us via vm_reply.
+            thread.state = .blocked;
+            arch.enableInterrupts();
+            sched.yield();
+            continue;
+        }
+
+        // TODO(vgic): tickInterruptControllers + deliverPendingInterrupts
+        // hook will go here once the vGIC integration commits land.
+
+        // Enter guest mode.
+        const vm_structures = vm_obj.arch_structures;
+        const exit_info = vm_hw.vmResume(&vcpu_obj.guest_state, vm_structures, &vcpu_obj.guest_fxsave);
+
+        vcpu_obj.last_exit_info = exit_info;
+        kvm.exit_handler.handleExit(vcpu_obj, exit_info);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Syscall entry points
+// ---------------------------------------------------------------------------
+
+/// `vm_vcpu_run` — transition vcpu.state idle → running and re-enqueue
+/// the thread on the scheduler.
+pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
+    const E_INVAL: i64 = -1;
+    const E_BADCAP: i64 = -3;
+    const E_BUSY: i64 = -11;
+
+    const vm_obj = proc.vm orelse return E_INVAL;
+    const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
+    if (entry.object != .thread) return E_BADCAP;
+
+    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse return E_BADCAP;
+
+    if (vcpu_obj.loadState() != .idle) return E_BUSY;
+
+    vcpu_obj.storeState(.running);
+    const thread = vcpu_obj.thread;
+    thread.state = .ready;
+    const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+    sched.enqueueOnCore(target_core, thread);
+
+    return 0; // E_OK
+}
+
+pub fn vcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
+    const E_INVAL: i64 = -1;
+    const E_BADCAP: i64 = -3;
+    const E_BADADDR: i64 = -7;
+    const E_BUSY: i64 = -11;
+
+    const vm_obj = proc.vm orelse return E_INVAL;
+    const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
+    if (entry.object != .thread) return E_BADCAP;
+
+    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse return E_BADCAP;
+
+    if (vcpu_obj.loadState() != .idle) return E_BUSY;
+
+    if (state_ptr == 0) return E_BADADDR;
+    if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
+
+    var buf: [@sizeOf(vm_hw.GuestState)]u8 = undefined;
+    if (!readUserStruct(proc, state_ptr, &buf)) return E_BADADDR;
+    vcpu_obj.guest_state = std.mem.bytesAsValue(vm_hw.GuestState, &buf).*;
+    return 0; // E_OK
+}
+
+pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
+    const E_INVAL: i64 = -1;
+    const E_BADCAP: i64 = -3;
+    const E_BADADDR: i64 = -7;
+
+    const vm_obj = proc.vm orelse return E_INVAL;
+    const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
+    if (entry.object != .thread) return E_BADCAP;
+
+    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse return E_BADCAP;
+
+    if (state_ptr == 0) return E_BADADDR;
+    if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
+
+    const state_snapshot = vcpu_obj.loadState();
+
+    // If running, IPI to suspend so we get a stable snapshot.
+    if (state_snapshot == .running) {
+        const thread = vcpu_obj.thread;
+        if (sched.coreRunning(thread)) |core_id| {
+            arch.triggerSchedulerInterrupt(core_id);
+            while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+        }
+    }
+
+    const src_bytes = std.mem.asBytes(&vcpu_obj.guest_state);
+    if (!writeUserStruct(proc, state_ptr, src_bytes)) return E_BADADDR;
+
+    if (state_snapshot == .running) {
+        const thread = vcpu_obj.thread;
+        thread.state = .ready;
+        const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+        sched.enqueueOnCore(target_core, thread);
+    }
+
+    return 0; // E_OK
+}
+
+/// `vm_vcpu_interrupt` — inject a virtual interrupt into a vCPU.
+///
+/// On x86 the equivalent function rejects vector < 32 (architectural
+/// exceptions). On ARM no such restriction applies: INTIDs 0..15 are SGIs,
+/// 16..31 PPIs, 32..1019 SPIs — all are valid injection targets and the
+/// vGIC owns the routing decision (GICv3 §2.2.1).
+pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64 {
+    const E_INVAL: i64 = -1;
+    const E_BADCAP: i64 = -3;
+    const E_BADADDR: i64 = -7;
+
+    const vm_obj = proc.vm orelse return E_INVAL;
+    const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
+    if (entry.object != .thread) return E_BADCAP;
+
+    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse return E_BADCAP;
+
+    if (interrupt_ptr == 0) return E_BADADDR;
+    if (!zag.memory.address.AddrSpacePartition.user.contains(interrupt_ptr)) return E_BADADDR;
+
+    var int_buf: [@sizeOf(vm_hw.GuestInterrupt)]u8 = undefined;
+    if (!readUserStruct(proc, interrupt_ptr, &int_buf)) return E_BADADDR;
+    const interrupt = std.mem.bytesAsValue(vm_hw.GuestInterrupt, &int_buf).*;
+
+    if (vcpu_obj.loadState() == .running) {
+        const thread = vcpu_obj.thread;
+        if (sched.coreRunning(thread)) |core_id| {
+            arch.triggerSchedulerInterrupt(core_id);
+            while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+        }
+        arch.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
+        thread.state = .ready;
+        const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+        sched.enqueueOnCore(target_core, thread);
+    } else {
+        arch.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
+    }
+
+    return 0; // E_OK
+}
+
+// ---------------------------------------------------------------------------
+// Internal helpers (ported from x64/kvm/vcpu.zig)
+// ---------------------------------------------------------------------------
+
+fn checkUserRange(user_va: u64, len: usize) bool {
+    const end = std.math.add(u64, user_va, len) catch return false;
+    if (!zag.memory.address.AddrSpacePartition.user.contains(user_va)) return false;
+    if (end != user_va and !zag.memory.address.AddrSpacePartition.user.contains(end - 1)) return false;
+    return true;
+}
+
+fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
+    if (!checkUserRange(user_va, buf.len)) return false;
+    var remaining: usize = buf.len;
+    var dst_off: usize = 0;
+    var src_va: u64 = user_va;
+    while (remaining > 0) {
+        const page_off = src_va & 0xFFF;
+        const chunk = @min(remaining, paging.PAGE4K - page_off);
+        proc.vmm.demandPage(VAddr.fromInt(src_va), false, false) catch return false;
+        const page_paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
+        const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
+        const src: [*]const u8 = @ptrFromInt(physmap_addr);
+        @memcpy(buf[dst_off..][0..chunk], src[0..chunk]);
+        dst_off += chunk;
+        src_va += chunk;
+        remaining -= chunk;
+    }
+    return true;
+}
+
+fn writeUserStruct(proc: *Process, user_va: u64, data: []const u8) bool {
+    if (!checkUserRange(user_va, data.len)) return false;
+    var remaining: usize = data.len;
+    var src_off: usize = 0;
+    var dst_va: u64 = user_va;
+    while (remaining > 0) {
+        const page_off = dst_va & 0xFFF;
+        const chunk = @min(remaining, paging.PAGE4K - page_off);
+        proc.vmm.demandPage(VAddr.fromInt(dst_va), true, false) catch return false;
+        const page_paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return false;
+        const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
+        const dst: [*]u8 = @ptrFromInt(physmap_addr);
+        @memcpy(dst[0..chunk], data[src_off..][0..chunk]);
+        src_off += chunk;
+        dst_va += chunk;
+        remaining -= chunk;
+    }
+    return true;
+}
+
+fn mapKernelStack(stack: zag.memory.stack.Stack) !void {
+    const pmm_iface = pmm.global_pmm.?.allocator();
+    var page_addr = stack.base.addr;
+    while (page_addr < stack.top.addr) {
+        const kpage = try pmm_iface.create(paging.PageMem(.page4k));
+        @memset(std.mem.asBytes(kpage), 0);
+        const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
+        try arch.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), .{
+            .write_perm = .write,
+            .execute_perm = .no_execute,
+            .cache_perm = .write_back,
+            .global_perm = .global,
+            .privilege_perm = .kernel,
+        });
+        page_addr += paging.PAGE4K;
+    }
+}
+
+// vm_mod is referenced by exit_box → vcpu cycle in the future; suppress
+// unused warning until that integration lands.
+comptime {
+    _ = vm_mod;
+}

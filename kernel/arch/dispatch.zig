@@ -924,29 +924,19 @@ pub fn enableDmaRemapping() void {
 
 pub const Vm = switch (builtin.cpu.arch) {
     .x86_64 => x64.kvm.vm.Vm,
-    .aarch64 => struct {
-        pub fn destroy(_: *@This()) void {}
-    },
+    .aarch64 => aarch64.kvm.vm.Vm,
     else => @compileError("unsupported arch for VM"),
 };
 
 pub const VmAllocator = switch (builtin.cpu.arch) {
     .x86_64 => x64.kvm.vm.VmAllocator,
-    .aarch64 => struct {
-        backing: std.mem.Allocator = undefined,
-        pub fn init(alloc: std.mem.Allocator) !@This() { return .{ .backing = alloc }; }
-        pub fn allocator(self: @This()) std.mem.Allocator { return self.backing; }
-    },
+    .aarch64 => aarch64.kvm.vm.VmAllocator,
     else => @compileError("unsupported arch for VM"),
 };
 
 pub const VCpuAllocator = switch (builtin.cpu.arch) {
     .x86_64 => x64.kvm.vcpu.VCpuAllocator,
-    .aarch64 => struct {
-        backing: std.mem.Allocator = undefined,
-        pub fn init(alloc: std.mem.Allocator) !@This() { return .{ .backing = alloc }; }
-        pub fn allocator(self: @This()) std.mem.Allocator { return self.backing; }
-    },
+    .aarch64 => aarch64.kvm.vcpu.VCpuAllocator,
     else => @compileError("unsupported arch for VM"),
 };
 
@@ -1021,7 +1011,7 @@ pub fn vmSupported() bool {
 pub fn vmResume(guest_state: *GuestState, vm_structures: PAddr, guest_fxsave: *align(16) FxsaveArea) VmExitInfo {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.vm.vmResume(guest_state, vm_structures, guest_fxsave),
-        .aarch64 => @panic("unimplemented"),
+        .aarch64 => aarch64.vm.vmResume(guest_state, vm_structures, guest_fxsave),
         else => unreachable,
     };
 }
@@ -1029,7 +1019,7 @@ pub fn vmResume(guest_state: *GuestState, vm_structures: PAddr, guest_fxsave: *a
 pub fn vmAllocStructures() ?PAddr {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.vm.vmAllocStructures(),
-        .aarch64 => null,
+        .aarch64 => aarch64.vm.vmAllocStructures(),
         else => unreachable,
     };
 }
@@ -1037,7 +1027,7 @@ pub fn vmAllocStructures() ?PAddr {
 pub fn vmFreeStructures(paddr: PAddr) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.vm.vmFreeStructures(paddr),
-        .aarch64 => {},
+        .aarch64 => aarch64.vm.vmFreeStructures(paddr),
         else => unreachable,
     }
 }
@@ -1045,7 +1035,7 @@ pub fn vmFreeStructures(paddr: PAddr) void {
 pub fn mapGuestPage(vm_structures: PAddr, guest_phys: u64, host_phys: PAddr, rights: u8) !void {
     switch (builtin.cpu.arch) {
         .x86_64 => try x64.vm.mapGuestPage(vm_structures, guest_phys, host_phys, rights),
-        .aarch64 => @panic("unimplemented"),
+        .aarch64 => try aarch64.vm.mapGuestPage(vm_structures, guest_phys, host_phys, rights),
         else => unreachable,
     }
 }
@@ -1053,7 +1043,7 @@ pub fn mapGuestPage(vm_structures: PAddr, guest_phys: u64, host_phys: PAddr, rig
 pub fn unmapGuestPage(vm_structures: PAddr, guest_phys: u64) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.vm.unmapGuestPage(vm_structures, guest_phys),
-        .aarch64 => {},
+        .aarch64 => aarch64.vm.unmapGuestPage(vm_structures, guest_phys),
         else => unreachable,
     }
 }
@@ -1061,7 +1051,7 @@ pub fn unmapGuestPage(vm_structures: PAddr, guest_phys: u64) void {
 pub fn vmInjectInterrupt(guest_state: *GuestState, interrupt: GuestInterrupt) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.vm.injectInterrupt(guest_state, interrupt),
-        .aarch64 => {},
+        .aarch64 => aarch64.vm.injectInterrupt(guest_state, interrupt),
         else => unreachable,
     }
 }
@@ -1069,7 +1059,7 @@ pub fn vmInjectInterrupt(guest_state: *GuestState, interrupt: GuestInterrupt) vo
 pub fn vmInjectException(guest_state: *GuestState, exception: GuestException) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.vm.injectException(guest_state, exception),
-        .aarch64 => {},
+        .aarch64 => aarch64.vm.injectException(guest_state, exception),
         else => unreachable,
     }
 }
@@ -1084,7 +1074,7 @@ pub fn vmInjectException(guest_state: *GuestState, exception: GuestException) vo
 pub fn vmMsrPassthrough(vm_structures: PAddr, msr_num: u32, allow_read: bool, allow_write: bool) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.vm.msrPassthrough(vm_structures, msr_num, allow_read, allow_write),
-        .aarch64 => {},
+        .aarch64 => aarch64.vm.msrPassthrough(vm_structures, msr_num, allow_read, allow_write),
         else => unreachable,
     }
 }
@@ -1368,6 +1358,7 @@ const Process = zag.proc.process.Process;
 pub fn kvmVmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vm.vmCreate(proc, vcpu_count, policy_ptr),
+        .aarch64 => aarch64.kvm.vm.vmCreate(proc, vcpu_count, policy_ptr),
         else => -14, // E_NOSYS
     };
 }
@@ -1375,6 +1366,7 @@ pub fn kvmVmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
 pub fn kvmGuestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vm.guestMap(proc, vm_handle, host_vaddr, guest_addr, size, rights),
+        .aarch64 => aarch64.kvm.vm.guestMap(proc, vm_handle, host_vaddr, guest_addr, size, rights),
         else => -14,
     };
 }
@@ -1382,6 +1374,7 @@ pub fn kvmGuestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: 
 pub fn kvmVmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContextLocal, vm_handle: u64, buf_ptr: u64, blocking: bool) SyscallResult {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.exit_box.vmRecv(proc, thread, ctx, vm_handle, buf_ptr, blocking),
+        .aarch64 => .{ .ret = aarch64.kvm.exit_box.vmRecv(proc, thread, ctx, vm_handle, buf_ptr, blocking) },
         else => .{ .ret = -14 },
     };
 }
@@ -1389,6 +1382,7 @@ pub fn kvmVmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContextLocal, vm_
 pub fn kvmVmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.exit_box.vmReply(proc, vm_handle, exit_token, action_ptr),
+        .aarch64 => aarch64.kvm.exit_box.vmReply(proc, vm_handle, exit_token, action_ptr),
         else => -14,
     };
 }
@@ -1396,6 +1390,7 @@ pub fn kvmVmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u
 pub fn kvmVcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.vcpuSetState(proc, thread_handle, state_ptr),
+        .aarch64 => aarch64.kvm.vcpu.vcpuSetState(proc, thread_handle, state_ptr),
         else => -14,
     };
 }
@@ -1403,6 +1398,7 @@ pub fn kvmVcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
 pub fn kvmVcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.vcpuGetState(proc, thread_handle, state_ptr),
+        .aarch64 => aarch64.kvm.vcpu.vcpuGetState(proc, thread_handle, state_ptr),
         else => -14,
     };
 }
@@ -1410,6 +1406,7 @@ pub fn kvmVcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
 pub fn kvmVcpuRun(proc: *Process, thread_handle: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.vcpuRun(proc, thread_handle),
+        .aarch64 => aarch64.kvm.vcpu.vcpuRun(proc, thread_handle),
         else => -14,
     };
 }
@@ -1417,6 +1414,7 @@ pub fn kvmVcpuRun(proc: *Process, thread_handle: u64) i64 {
 pub fn kvmVcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.vcpuInterrupt(proc, thread_handle, interrupt_ptr),
+        .aarch64 => aarch64.kvm.vcpu.vcpuInterrupt(proc, thread_handle, interrupt_ptr),
         else => -14,
     };
 }
@@ -1424,6 +1422,7 @@ pub fn kvmVcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) 
 pub fn kvmMsrPassthrough(proc: *Process, vm_handle: u64, msr_num: u32, allow_read: bool, allow_write: bool) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vm.msrPassthrough(proc, vm_handle, msr_num, allow_read, allow_write),
+        .aarch64 => aarch64.kvm.vm.msrPassthrough(proc, vm_handle, msr_num, allow_read, allow_write),
         else => -14,
     };
 }
@@ -1431,6 +1430,7 @@ pub fn kvmMsrPassthrough(proc: *Process, vm_handle: u64, msr_num: u32, allow_rea
 pub fn kvmIoapicAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vm.ioapicAssertIrq(proc, vm_handle, irq_num),
+        .aarch64 => aarch64.kvm.vm.ioapicAssertIrq(proc, vm_handle, irq_num),
         else => -14,
     };
 }
@@ -1438,13 +1438,23 @@ pub fn kvmIoapicAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
 pub fn kvmIoapicDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vm.ioapicDeassertIrq(proc, vm_handle, irq_num),
+        .aarch64 => aarch64.kvm.vm.ioapicDeassertIrq(proc, vm_handle, irq_num),
         else => -14,
     };
 }
 
-pub fn kvmVcpuFromThread(vm_obj: *Vm, thread: *Thread) ?*x64.kvm.vcpu.VCpu {
+/// Per-arch concrete VCpu type (used by the syscall layer to type-check
+/// the result of kvmVcpuFromThread without going through dispatch.Vm).
+pub const VCpu = switch (builtin.cpu.arch) {
+    .x86_64 => x64.kvm.vcpu.VCpu,
+    .aarch64 => aarch64.kvm.vcpu.VCpu,
+    else => @compileError("unsupported arch for VM"),
+};
+
+pub fn kvmVcpuFromThread(vm_obj: *Vm, thread: *Thread) ?*VCpu {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.vcpuFromThread(vm_obj, thread),
+        .aarch64 => aarch64.kvm.vcpu.vcpuFromThread(vm_obj, thread),
         else => null,
     };
 }
@@ -1452,6 +1462,7 @@ pub fn kvmVcpuFromThread(vm_obj: *Vm, thread: *Thread) ?*x64.kvm.vcpu.VCpu {
 pub fn kvmSetVmAllocator(alloc: std.mem.Allocator) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vm.allocator = alloc,
+        .aarch64 => aarch64.kvm.vm.allocator = alloc,
         else => {},
     }
 }
@@ -1459,6 +1470,7 @@ pub fn kvmSetVmAllocator(alloc: std.mem.Allocator) void {
 pub fn kvmSetVcpuAllocator(alloc: std.mem.Allocator) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.allocator = alloc,
+        .aarch64 => aarch64.kvm.vcpu.allocator = alloc,
         else => {},
     }
 }

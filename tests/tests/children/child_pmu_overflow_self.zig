@@ -38,6 +38,10 @@ pub fn main(_: u64) void {
     }
 
     while (true) {
-        asm volatile ("pause" ::: .{ .memory = true });
+        if (@import("builtin").cpu.arch == .x86_64) {
+            asm volatile ("pause" ::: .{ .memory = true });
+        } else {
+            asm volatile ("yield" ::: .{ .memory = true });
+        }
     }
 }

@@ -7,6 +7,7 @@ pub const init = @import("init.zig");
 pub const interrupts = @import("interrupts.zig");
 pub const iommu = @import("iommu.zig");
 pub const irq = @import("irq.zig");
+pub const kvm = @import("kvm/kvm.zig");
 pub const paging = @import("paging.zig");
 pub const pmu = @import("pmu.zig");
 pub const power = @import("power.zig");

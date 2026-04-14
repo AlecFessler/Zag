@@ -110,18 +110,26 @@ fn isWriteFault(esr: u64) bool {
 ///
 /// ARM ARM D1.10.2, Table D1-7.
 fn exceptionVectorTable() align(2048) callconv(.naked) void {
-    // 0x000: Current EL SP0, Synchronous -- should not happen.
+    // 0x000: Current EL SP0, Synchronous.
+    //
+    // This vector fires when an exception is taken at EL1 while
+    // SPSel=0, i.e. the executing context was EL1t (kernel code
+    // running on SP_EL0 rather than SP_EL1). Kernel threads created
+    // by `vcpu.create` run at EL1t so their per-thread stack can be
+    // restored via the normal SP_EL0 slot in ArchCpuContext — which
+    // means their exceptions land here rather than at 0x200. Route
+    // this to the same synchronous handler as Current EL SPx.
     asm volatile (
         \\stp x0, x30, [sp, #-16]!
-        \\adrp x0, %[unexpected]
-        \\add x0, x0, :lo12:%[unexpected]
+        \\adrp x0, %[sync_current]
+        \\add x0, x0, :lo12:%[sync_current]
         \\b %[trampoline]
 
-        // 0x080: Current EL SP0, IRQ
+        // 0x080: Current EL SP0, IRQ — kernel-thread IRQ delivery.
         \\.balign 0x80
         \\stp x0, x30, [sp, #-16]!
-        \\adrp x0, %[unexpected]
-        \\add x0, x0, :lo12:%[unexpected]
+        \\adrp x0, %[irq_current]
+        \\add x0, x0, :lo12:%[irq_current]
         \\b %[trampoline]
 
         // 0x100: Current EL SP0, FIQ

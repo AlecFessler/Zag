@@ -55,6 +55,10 @@ pub fn main(_: u64) void {
     // `illegal_instruction` trailer. If PMU delivery is truly broken,
     // the per-assertion QEMU timeout in `run_tests.sh` is our backstop.
     while (true) {
-        asm volatile ("pause" ::: .{ .memory = true });
+        if (@import("builtin").cpu.arch == .x86_64) {
+            asm volatile ("pause" ::: .{ .memory = true });
+        } else {
+            asm volatile ("yield" ::: .{ .memory = true });
+        }
     }
 }
