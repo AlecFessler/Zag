@@ -410,6 +410,14 @@ pub const VmPolicy = extern struct {
 /// implemented and usable. Queried by `vmSupported()` and by vm_create.
 var vm_supported: bool = false;
 
+/// Set to true by the direct-kernel boot path after VBAR_EL2 has been
+/// loaded with `__hyp_vectors`. UEFI boot enters at EL1 and never gets
+/// the chance to install a hyp stub, so this stays false there — making
+/// `vmSupported()` honest about whether EL2 is actually reachable from
+/// EL1 via HVC. See `kernel/arch/aarch64/boot/start.S` (direct-kernel
+/// path) and `directKernelEntry` in `boot/direct_kernel.zig`.
+pub var hyp_stub_installed: bool = false;
+
 /// Read ID_AA64PFR0_EL1 (ARM ARM K.a §D23.2.79, p7932).
 ///
 /// Field map (bits → field):
@@ -462,21 +470,21 @@ pub fn vmPerCoreInit() void {
     // TODO: set HCR_EL2 defaults for "host running at EL1" state
 }
 
-/// Returns true if hardware virtualization is available on this CPU.
+/// Returns true if hardware virtualization is available AND reachable
+/// from this kernel build. Two conditions must hold:
 ///
-/// NOTE: On any environment that does not expose EL2 to EL1 (TCG without
-/// `-machine virtualization=on`, Linux KVM without nested virt, etc.)
-/// this returns false and every vm_* syscall short-circuits with
-/// `E_NODEV`. That is the same safety-net x86 relies on when SVM/VMX
-/// is unavailable: the VMM-side code stays identical across hardware,
-/// and the syscall layer is exercised only where there is actually
-/// somewhere to enter a guest. The s4_2 test suite accepts E_NODEV as
-/// "no hardware, pass trivially", so running these on bare TCG gives a
-/// uniformly green report without telling you whether the real impl
-/// works. Toggle to `return true;` temporarily to force the validation
-/// and stage-2 paths to run under TCG.
+///   1. `ID_AA64PFR0_EL1.EL2 != 0` — the CPU implements EL2.
+///   2. `hyp_stub_installed` — the boot path actually loaded VBAR_EL2
+///      with our hyp vector table. This requires entering at EL2 (the
+///      direct-kernel boot path under `-M virt,virtualization=on`); the
+///      UEFI path enters at EL1 with no way to write VBAR_EL2, so even
+///      a CPU that advertises EL2 in its ID register is unreachable.
+///
+/// On any environment failing either condition, vm_* syscalls
+/// short-circuit with `E_NODEV` and the s4_2 test suite reports SKIP
+/// (see `tests/tests/libz/test.zig :: skipIfNoVm`).
 pub fn vmSupported() bool {
-    return vm_supported;
+    return vm_supported and hyp_stub_installed;
 }
 
 // ===========================================================================

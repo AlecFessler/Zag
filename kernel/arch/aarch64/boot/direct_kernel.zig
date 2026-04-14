@@ -129,6 +129,12 @@ extern fn kEntry(boot_info: *BootInfo) callconv(.{ .aarch64_aapcs = .{} }) noret
 pub export fn directKernelEntry(dtb_phys: u64) callconv(.{ .aarch64_aapcs = .{} }) noreturn {
     _ = dtb_phys;
 
+    // start.S installed VBAR_EL2 with __hyp_vectors before the EL2→EL1
+    // ERET that landed us here. Record that fact so vmSupported() can
+    // distinguish "EL2 advertised in ID reg" from "EL2 actually reachable
+    // via HVC from this kernel".
+    zag.arch.aarch64.vm.hyp_stub_installed = true;
+
     // [0] acpi_reclaim — boot stub + .data.boot + kernel image.
     mmap_descs[0] = .{
         .type = .acpi_reclaim_memory,
