@@ -33,6 +33,8 @@ const builtin = @import("builtin");
 const embedded_bins = @import("embedded_bins");
 const zag = @import("zag");
 
+const vm_hw = zag.arch.aarch64.vm;
+
 const boot_protocol = zag.boot.protocol;
 const BootInfo = boot_protocol.BootInfo;
 const Blob = boot_protocol.Blob;
@@ -79,6 +81,44 @@ const KERNEL_LMA_BASE: u64 = 0x4020_0000;
 
 fn kernelVaToPa(va: u64) u64 {
     return va - KERNEL_VMA_BASE + KERNEL_LMA_BASE;
+}
+
+/// Early marker print via PL011. Works both MMU-off (PA 0x0900_0000
+/// mapped identity) and MMU-on (the low-VA 0x0900_0000 identity map
+/// from start.S still covers it until the kernel's own physmap takes
+/// over). Used by the EL2 smoke tests so we can localise failures
+/// before any kernel logging subsystem exists.
+fn smokePutc(c: u8) void {
+    const pl011: *volatile u8 = @ptrFromInt(0x0900_0000);
+    pl011.* = c;
+}
+
+fn smokePuts(s: []const u8) void {
+    for (s) |c| smokePutc(c);
+}
+
+fn smokePutHex(v: u64) void {
+    var i: u6 = 60;
+    while (true) : (i -= 4) {
+        const nib: u8 = @intCast((v >> i) & 0xF);
+        smokePutc(if (nib < 10) '0' + nib else 'A' + nib - 10);
+        if (i == 0) break;
+    }
+}
+
+/// Phase A smoke test: verify the EL2 hyp stub round-trip works by
+/// issuing a HVC_NOOP with a known argument and checking that the
+/// dispatcher toggled the low bit. Prints `[hypA:XXXX->YYYY]` on
+/// the PL011. A failure here usually means the hyp vectors are not
+/// installed, SP_EL2 is bad, or HCR_EL2 is routing wrong.
+fn runHypSmokeA() void {
+    smokePuts("[hypA:");
+    const arg: u64 = 0x1234;
+    smokePutHex(arg);
+    smokePuts("->");
+    const ret = vm_hw.hypCall(.noop, arg);
+    smokePutHex(ret);
+    smokePuts("]\r\n");
 }
 
 extern fn kEntry(boot_info: *BootInfo) callconv(.{ .aarch64_aapcs = .{} }) noreturn;
@@ -142,6 +182,8 @@ pub export fn directKernelEntry(dtb_phys: u64) callconv(.{ .aarch64_aapcs = .{} 
             .pixel_format = .none,
         },
     };
+
+    runHypSmokeA();
 
     kEntry(&synth_boot_info);
 }

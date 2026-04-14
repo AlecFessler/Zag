@@ -480,6 +480,48 @@ pub fn vmSupported() bool {
 }
 
 // ===========================================================================
+// Hyp-call ABI (host → EL2 dispatcher)
+// ===========================================================================
+//
+// The direct-kernel EL2 hyp stub in boot/start.S exposes a tiny hypercall
+// interface to the EL1 kernel via `hvc #0`:
+//
+//   x0 = hypercall id (see `HypCallId`)
+//   x1 = argument (id-specific: a raw value or a physical-address pointer)
+//
+// The stub writes the result into x0 and ERETs to the instruction after
+// the HVC (ARM ARM D1.10.2 — HVC preferred exception return address is
+// the instruction following HVC).
+//
+// Non-VHE hyp only: the kernel itself runs at EL1, EL2 is used purely as
+// a thin dispatcher reached via HVC. There is no "host at EL2" mode.
+
+pub const HypCallId = enum(u64) {
+    /// Return `arg ^ 1`. Round-trip smoke test; no side effects.
+    noop = 0,
+    /// `arg` = physical address of a WorldSwitchCtx. Enter the guest;
+    /// return when the guest exits with the exit info stored in the
+    /// WorldSwitchCtx. Returns 0 on success, non-zero on entry failure.
+    vcpu_run = 1,
+};
+
+/// Issue `hvc #0` with (id, arg) and return the 64-bit result in x0.
+///
+/// Marked `inline` because the `hvc` instruction is only legal in kernel
+/// code paths that know EL2 is present — we want the callsite to be a
+/// bare hvc, not a call through a function pointer.
+pub inline fn hypCall(id: HypCallId, arg: u64) u64 {
+    var ret: u64 = undefined;
+    asm volatile (
+        \\hvc #0
+        : [ret] "={x0}" (ret),
+        : [id] "{x0}" (@intFromEnum(id)),
+          [arg] "{x1}" (arg),
+        : .{ .memory = true });
+    return ret;
+}
+
+// ===========================================================================
 // Guest entry / exit
 // ===========================================================================
 

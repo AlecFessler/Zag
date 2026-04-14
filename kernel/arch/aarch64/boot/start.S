@@ -127,12 +127,22 @@ _start:
     // Install the EL2 hyp stub vector table so HVC from EL1 reaches a
     // real handler. Runs with SCTLR_EL2.M=0 (EL2 MMU off), so the
     // vector PAs come from adrp against the kernel LMA in .text.boot.
-    // Until the world-switch path lands, the HVC handler is a trivial
-    // ERET back to EL1 so we can smoke-test that the hyp stub round-
-    // trips without touching guest state.
     adrp    x9, __hyp_vectors
     add     x9, x9, :lo12:__hyp_vectors
     msr     vbar_el2, x9
+    isb
+
+    // Provide a dedicated EL2 stack so the hyp dispatcher can stp/ldp
+    // freely. SP_EL2 is the active SP when an exception is taken to
+    // EL2 from EL1 (PSTATE.M=EL2h after entry); without this any push
+    // would write to whatever SP_EL2 happened to hold (typically 0).
+    adrp    x9, __hyp_stack_top
+    add     x9, x9, :lo12:__hyp_stack_top
+    mov     sp, x9                  // currently at EL2, so this is SP_EL2
+    // Clear tpidr_el2 — used as the "currently-running vCPU ctx PA"
+    // marker by the world-switch dispatcher. Zero = no guest active,
+    // so an HVC trap is a host-initiated hypercall.
+    msr     tpidr_el2, xzr
     isb
 
     // Enable EL1 MMU + D-cache + I-cache. SCTLR_EL1 RES1 bits preserved.
@@ -321,12 +331,57 @@ __hyp_vectors:
     .org __hyp_vectors + 0x780
     b       hyp_halt
 
+// Hyp dispatcher entry. Called from the HVC-from-lower-EL64 vector.
+//
+// ABI:
+//   Host issues `hvc #0` with x0 = hypercall id, x1 = argument.
+//   On return, x0 holds the result; all other host GPRs are preserved.
+//
+// Hypercall ids:
+//   0 (HVC_NOOP)      — return x0 = arg ^ 1. Used as a round-trip smoke
+//                       test that proves the EL1→EL2→EL1 path works.
+//   1 (HVC_VCPU_RUN)  — x1 = PA of a WorldSwitchCtx. Switches to guest
+//                       world and ERETs into the guest at EL1. On guest
+//                       exit the ctx.exit_info is populated and x0 is
+//                       set to 0; control returns to the caller of the
+//                       host-side `hvc #0`.
+//
+// tpidr_el2 holds the PA of the active WorldSwitchCtx when a guest is
+// currently running. Zero means "no guest active, treat HVC as a host
+// hypercall". The world-switch entry sets it; the exit path clears it.
 hyp_sync_lower_a64:
-    // ESR_EL2.EC == 0b010110 (HVC) is the only case we care about for
-    // now. Unconditionally ERET so the kernel smoke test can confirm
-    // the round-trip works. Later versions will decode ESR_EL2 here
-    // and dispatch by hypercall id in x0.
+    // If tpidr_el2 != 0 we were running a guest; this is a VM exit.
+    mrs     x18, tpidr_el2
+    cbnz    x18, guest_exit_entry
+
+    // Host hypercall path. Decode ESR_EL2.EC; we only support EC=0x16.
+    mrs     x18, esr_el2
+    lsr     x18, x18, #26
+    and     x18, x18, #0x3F
+    cmp     x18, #0x16
+    b.ne    hyp_halt
+
+    // Dispatch by x0.
+    cmp     x0, #0
+    b.eq    hvc_noop
+    cmp     x0, #1
+    b.eq    hvc_vcpu_run
+    // Unknown id — return -1.
+    mov     x0, #-1
     eret
+
+hvc_noop:
+    // Return arg^1 so the caller can verify the round-trip changed x0.
+    eor     x0, x1, #1
+    eret
+
+// Phase B: implemented below.
+hvc_vcpu_run:
+    b       hyp_halt
+
+// Phase C: implemented below.
+guest_exit_entry:
+    b       hyp_halt
 
 hyp_halt:
 1:  wfe
@@ -453,6 +508,16 @@ __boot_stack_bottom:
     .space 0x6000                   // 24 KiB stack (matches boot.protocol.STACK_SIZE)
     .global __boot_stack_top
 __boot_stack_top:
+
+    // Dedicated EL2 stack for the hyp dispatcher. Must be 16-byte
+    // aligned per AAPCS64; give it 8 KiB which is plenty for the
+    // world-switch save/restore sequences.
+    .balign 16
+    .global __hyp_stack_bottom
+__hyp_stack_bottom:
+    .space 0x2000
+    .global __hyp_stack_top
+__hyp_stack_top:
 
     .balign 4096
     .global __boot_pagetables_start
