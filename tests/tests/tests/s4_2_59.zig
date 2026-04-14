@@ -22,10 +22,7 @@ const blocklist = [_]u64{
 
 pub fn main(_: u64) void {
     const cr = syscall.vm_create(1, @intFromPtr(&policy));
-    if (cr == syscall.E_NODEV) {
-        t.pass("§4.2.59");
-        syscall.shutdown();
-    }
+    t.skipIfNoVm("§4.2.59", cr);
     if (cr < 0) {
         t.failWithVal("§4.2.59 create", syscall.E_OK, cr);
         syscall.shutdown();

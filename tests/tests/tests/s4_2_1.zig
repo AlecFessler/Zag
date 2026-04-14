@@ -6,7 +6,19 @@ const t = lib.testing;
 
 var buf: [4096]u8 align(8) = .{0} ** 4096;
 
+var probe_policy: [4096]u8 align(4096) = .{0} ** 4096;
+
 pub fn main(_: u64) void {
+    // Probe the VM layer: on hosts with no HW virt the VM syscalls short-
+    // circuit with E_NODEV/E_NORES before validating handle arguments, which
+    // would cause every E_BADHANDLE assertion below to observe the wrong
+    // error code. Skip in that case.
+    const probe = syscall.vm_create(1, @intFromPtr(&probe_policy));
+    t.skipIfNoVm("§4.2.1", probe);
+    if (probe > 0) {
+        _ = syscall.revoke_vm(@bitCast(probe));
+    }
+
     // Process has no VM. Use a bogus handle. All VM handle syscalls should return E_BADCAP.
     var all_pass = true;
     const bad_handle: u64 = 0xDEAD;

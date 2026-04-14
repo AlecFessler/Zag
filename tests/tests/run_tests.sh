@@ -83,7 +83,7 @@ run_one_test() {
 
     # Extract result line
     local result
-    result=$(echo "$output" | grep -m1 '\[PASS\]\|\[FAIL\]' || true)
+    result=$(echo "$output" | grep -m1 '\[PASS\]\|\[FAIL\]\|\[SKIP\]' || true)
     # Strip ANSI escape codes
     result=$(echo "$result" | sed 's/\x1b\[[0-9;]*[a-zA-Z]//g')
 
@@ -112,12 +112,17 @@ printf '%s\n' "${test_elfs[@]}" | xargs -P "$PARALLEL" -I{} bash -c 'run_one_tes
 # Aggregate results
 pass=0
 fail=0
+skip=0
 failures=""
+skips=""
 
 for f in $(ls "$RESULTS_DIR"/ | sort); do
     result=$(cat "$RESULTS_DIR/$f")
     if echo "$result" | grep -q '\[PASS\]'; then
         pass=$((pass + 1))
+    elif echo "$result" | grep -q '\[SKIP\]'; then
+        skip=$((skip + 1))
+        skips="$skips\n  $result"
     else
         fail=$((fail + 1))
         failures="$failures\n  $result"
@@ -127,7 +132,10 @@ done
 rm -rf "$RESULTS_DIR"
 
 echo "================================"
-echo "Total: $pass pass, $fail fail out of $((pass + fail))"
+echo "Total: $pass pass, $skip skip, $fail fail out of $((pass + skip + fail))"
+if [ "$skip" -gt 0 ]; then
+    echo -e "Skipped:$skips"
+fi
 if [ "$fail" -eq 0 ]; then
     echo "All tests passed!"
 else

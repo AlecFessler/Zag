@@ -130,6 +130,36 @@ pub fn fail(name: []const u8) void {
     syscall.write("\n");
 }
 
+/// Emit a SKIP result for the current test. Tests that cannot exercise their
+/// target behavior at runtime (e.g. a VM syscall on a host without hardware
+/// virtualization) must call this instead of `pass`, so a green run isn't
+/// confused with an untested path. The test runner counts SKIPs separately
+/// from PASS/FAIL.
+pub fn skip(name: []const u8, reason: []const u8) void {
+    syscall.write("[SKIP] ");
+    syscall.write(name);
+    syscall.write(" (");
+    syscall.write(reason);
+    syscall.write(")\n");
+}
+
+/// If `rc` indicates the VM syscall layer is unavailable on this host
+/// (currently `E_NODEV` — no hardware virtualization — or `E_NORES` —
+/// architecture has no VM backend wired up, e.g. aarch64 TCG), emit a
+/// `[SKIP]` line tagged with `name` and shut down the test process.
+///
+/// Returns without side effects otherwise, letting the caller proceed with
+/// the positive-path assertions. Tests probe by issuing a cheap VM syscall
+/// (typically `vm_create(1, &policy)`) and funnelling its return code
+/// through this helper before asserting behaviour that depends on a live
+/// VM object.
+pub fn skipIfNoVm(name: []const u8, rc: i64) void {
+    if (rc == syscall.E_NODEV or rc == syscall.E_NORES) {
+        skip(name, "VM unavailable (E_NODEV/E_NORES)");
+        syscall.shutdown();
+    }
+}
+
 pub fn failWithVal(name: []const u8, expected: i64, actual: i64) void {
     syscall.write("[FAIL] ");
     syscall.write(name);

@@ -7,8 +7,19 @@ const perms = lib.perms;
 const syscall = lib.syscall;
 const t = lib.testing;
 
+var probe_policy: [4096]u8 align(4096) = .{0} ** 4096;
+
 pub fn main(pv: u64) void {
     const view: [*]const perm_view.UserViewEntry = @ptrFromInt(pv);
+
+    // Probe the VM layer: if the host has no HW virt, the child's vm_create
+    // will short-circuit and no VM is ever created — there's nothing to
+    // observe about VM teardown on process exit. Skip in that case.
+    const probe = syscall.vm_create(1, @intFromPtr(&probe_policy));
+    t.skipIfNoVm("§4.2.2", probe);
+    if (probe > 0) {
+        _ = syscall.revoke_vm(@bitCast(probe));
+    }
 
     // Spawn a child that calls vm_create then exits.
     // The kernel should clean up the VM during process teardown.

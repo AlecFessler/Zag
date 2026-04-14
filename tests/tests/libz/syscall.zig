@@ -649,6 +649,7 @@ pub const E_AGAIN: i64 = -9;
 pub const E_NOENT: i64 = -10;
 pub const E_BUSY: i64 = -11;
 pub const E_NODEV: i64 = -13;
+pub const E_NORES: i64 = -14;
 
 pub fn vm_create(vcpu_count: u64, policy_ptr: u64) i64 {
     return syscall2(.vm_create, vcpu_count, policy_ptr);
