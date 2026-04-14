@@ -155,7 +155,6 @@ pub fn build(b: *std.Build) void {
     zag_mod.addImport("kprof", kprof_mod);
 
     // ── SMP trampoline (x86-only; aarch64 uses PSCI CPU_ON) ────────────
-    const direct_kernel_for_arch = direct_kernel and arch == .aarch64;
     const embedded_wf = b.addWriteFiles();
     if (arch == .x86_64) {
         const nasm_step = b.addSystemCommand(&.{
@@ -165,21 +164,16 @@ pub fn build(b: *std.Build) void {
         const trampoline_output = nasm_step.addOutputFileArg("trampoline.bin");
         _ = embedded_wf.addCopyFile(trampoline_output, "trampoline.bin");
     }
-    // Direct-kernel aarch64: no FAT partition, so the root service ELF
-    // must be baked into the kernel image via @embedFile. Copy it into
-    // the write-files sandbox and let embedded_bins.zig reference it.
-    if (direct_kernel_for_arch) {
-        _ = embedded_wf.addCopyFile(b.path(root_service_path), "root_service.elf");
-    }
+    // Direct-kernel aarch64 loads root_service from a fixed PA at boot
+    // (QEMU `-device loader,file=...,addr=0x44000000`) instead of
+    // embedding it in the kernel image. This lets the test runner reuse
+    // a single kernel.elf across all per-test root_service.elf swaps.
+    // See `kernel/arch/aarch64/boot/direct_kernel.zig`.
     const embedded_bins_mod = b.createModule(.{
         .root_source_file = embedded_wf.add("embedded_bins.zig",
             if (arch == .x86_64)
                 \\pub const trampoline = @embedFile("trampoline.bin");
                 \\pub const root_service: []const u8 = &.{};
-                \\
-            else if (direct_kernel_for_arch)
-                \\pub const trampoline: []const u8 = &.{};
-                \\pub const root_service = @embedFile("root_service.elf");
                 \\
             else
                 \\pub const trampoline: []const u8 = &.{};
@@ -264,12 +258,6 @@ pub fn build(b: *std.Build) void {
         // Boot stub (low-PA entry, EL detection, UEFI tail-call or EL2
         // direct-boot setup). Only linked when -Ddirect_kernel=true.
         kernel.addAssemblyFile(b.path("kernel/arch/aarch64/boot/start.S"));
-        // The Zig direct-kernel entry (called from start.S) lives in
-        // the kernel root module, so it needs direct access to the
-        // `embedded_bins` module for the @embedFile'd root service.
-        // zag already pulls embedded_bins in, but the root module has
-        // a separate import namespace.
-        kernel.root_module.addImport("embedded_bins", embedded_bins_mod);
     }
     // Preserve relocation info so the bootloader can apply a random KASLR
     // slide to kernel text/rodata/data at load time. Without --emit-relocs

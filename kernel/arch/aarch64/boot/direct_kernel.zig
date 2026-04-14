@@ -30,7 +30,6 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const embedded_bins = @import("embedded_bins");
 const zag = @import("zag");
 
 const vm_hw = zag.arch.aarch64.vm;
@@ -47,41 +46,35 @@ const uefi = std.os.uefi;
 const MemoryDescriptor = uefi.tables.MemoryDescriptor;
 const MemoryMapKey = uefi.tables.MemoryMapKey;
 
-/// Synthesised memory map. Two descriptors:
-///   [0] acpi_reclaim — boot stub + .data.boot page tables + kernel
-///       image, 0x40000000..0x41200000. Marked `acpi` rather than
-///       `reserved` so `memory.init`'s physmap loop still covers the
-///       range (it skips only !free && !acpi entries) while the
-///       buddy/bump allocators leave it alone. Critical for direct-
-///       kernel on several fronts:
-///         - The TTBR1 root and intermediate tables physically live
-///           in .data.boot; physmap access lets `mapPage` walk them
-///           when kernel demand-page faults on slab-init writes.
-///         - The `root_service.elf` blob is `@embedFile`'d into the
-///           kernel's .rodata, and kMain dereferences its pointer as
-///           a physmap VA, so the kernel image's PA range has to be
-///           physmap-covered too.
-///   [1] conventional — everything above, 0x41200000..0x80000000.
-///       Used by the bump/buddy allocators.
-var mmap_descs: [2]MemoryDescriptor = undefined;
+/// Synthesised memory map. Four descriptors carve out three regions:
+///   [0] acpi_reclaim — 0x40000000..0x41200000 — boot stub + .data.boot
+///       page tables + kernel image. Marked `acpi` (not `reserved`) so
+///       `memory.init`'s physmap loop covers the range (it skips only
+///       !free && !acpi entries) while the buddy/bump allocators leave
+///       it alone. The TTBR1 root and intermediate tables live here.
+///   [1] conventional — 0x41200000..0x44000000 — bump/buddy arena (low).
+///   [2] acpi_reclaim — 0x44000000..0x45000000 — root_service.elf blob
+///       loader window (16 MiB). The aarch64 test runner injects the
+///       per-test ELF here via QEMU `-device loader,addr=0x44000000`.
+///       Layout: u64 little-endian length, then ELF bytes. Marked acpi
+///       so kMain can read it via physmap VA but the allocators don't
+///       trample it.
+///   [3] conventional — 0x45000000..0x80000000 — bump/buddy arena (high).
+var mmap_descs: [4]MemoryDescriptor = undefined;
 var synth_boot_info: BootInfo = undefined;
 
 // Hardcoded QEMU virt -m 1G RAM layout.
 const RAM_START: u64 = 0x4000_0000;
 const KERNEL_IMAGE_END: u64 = 0x4120_0000;
+const BLOB_REGION_START: u64 = 0x4400_0000;
+const BLOB_REGION_END: u64 = 0x4500_0000;
 const RAM_END: u64 = 0x8000_0000;
 const PAGE_SIZE: u64 = 4096;
 
-// Kernel image VA base (matches linker-aarch64-direct.ld
-// KERNEL_VADDR_BASE) and LMA base (the 2 MiB-aligned boundary
-// `_boot_end_lma` resolves to with a 0x180000-byte boot stub +
-// 2 MiB alignment). Keep these in sync with the linker script.
-const KERNEL_VMA_BASE: u64 = 0xFFFF_0000_0000_0000;
-const KERNEL_LMA_BASE: u64 = 0x4020_0000;
-
-fn kernelVaToPa(va: u64) u64 {
-    return va - KERNEL_VMA_BASE + KERNEL_LMA_BASE;
-}
+// Layout of the blob loaded at BLOB_REGION_START:
+//   offset 0x00: u64 little-endian ELF length
+//   offset 0x08: <length> bytes of root_service.elf
+const BLOB_ELF_OFFSET: u64 = 8;
 
 /// Early marker print via PL011. Works both MMU-off (PA 0x0900_0000
 /// mapped identity) and MMU-on (the low-VA 0x0900_0000 identity map
@@ -135,6 +128,14 @@ pub export fn directKernelEntry(dtb_phys: u64) callconv(.{ .aarch64_aapcs = .{} 
     // via HVC from this kernel".
     zag.arch.aarch64.vm.hyp_stub_installed = true;
 
+    // Read the QEMU-loader-injected blob length. The low-VA identity map
+    // installed by start.S (TTBR0 L1[1] = 1 GiB block at 0x40000000) makes
+    // PA 0x44000000 directly addressable as VA 0x44000000 from EL1, so a
+    // raw u64 load works without any physmap setup.
+    const blob_len_ptr: *const volatile u64 = @ptrFromInt(BLOB_REGION_START);
+    const rs_len = blob_len_ptr.*;
+    const rs_ptr_pa = BLOB_REGION_START + BLOB_ELF_OFFSET;
+
     // [0] acpi_reclaim — boot stub + .data.boot + kernel image.
     mmap_descs[0] = .{
         .type = .acpi_reclaim_memory,
@@ -143,12 +144,28 @@ pub export fn directKernelEntry(dtb_phys: u64) callconv(.{ .aarch64_aapcs = .{} 
         .number_of_pages = (KERNEL_IMAGE_END - RAM_START) / PAGE_SIZE,
         .attribute = std.mem.zeroes(uefi.tables.MemoryDescriptorAttribute),
     };
-    // [1] conventional — bump/buddy arena.
+    // [1] conventional — bump/buddy arena (low half).
     mmap_descs[1] = .{
         .type = .conventional_memory,
         .physical_start = KERNEL_IMAGE_END,
         .virtual_start = 0,
-        .number_of_pages = (RAM_END - KERNEL_IMAGE_END) / PAGE_SIZE,
+        .number_of_pages = (BLOB_REGION_START - KERNEL_IMAGE_END) / PAGE_SIZE,
+        .attribute = std.mem.zeroes(uefi.tables.MemoryDescriptorAttribute),
+    };
+    // [2] acpi_reclaim — root_service blob loader window.
+    mmap_descs[2] = .{
+        .type = .acpi_reclaim_memory,
+        .physical_start = BLOB_REGION_START,
+        .virtual_start = 0,
+        .number_of_pages = (BLOB_REGION_END - BLOB_REGION_START) / PAGE_SIZE,
+        .attribute = std.mem.zeroes(uefi.tables.MemoryDescriptorAttribute),
+    };
+    // [3] conventional — bump/buddy arena (high half).
+    mmap_descs[3] = .{
+        .type = .conventional_memory,
+        .physical_start = BLOB_REGION_END,
+        .virtual_start = 0,
+        .number_of_pages = (RAM_END - BLOB_REGION_END) / PAGE_SIZE,
         .attribute = std.mem.zeroes(uefi.tables.MemoryDescriptorAttribute),
     };
 
@@ -161,13 +178,13 @@ pub export fn directKernelEntry(dtb_phys: u64) callconv(.{ .aarch64_aapcs = .{} 
             .len = 0,
         },
         .root_service = .{
-            // kMain treats `root_service.ptr` as a *physical* address
+            // kMain treats root_service.ptr as a *physical* address
             // (`PAddr.fromInt(@intFromPtr(ptr))`) and then converts it
-            // to a physmap VA for the read. The embedded_bins blob is
-            // linked into kernel .rodata at a high VA, so hand kMain
-            // the corresponding PA instead of the VA.
-            .ptr = @ptrFromInt(kernelVaToPa(@intFromPtr(embedded_bins.root_service.ptr))),
-            .len = embedded_bins.root_service.len,
+            // to a physmap VA for the read. The blob already lives at a
+            // physical address (loaded by QEMU `-device loader,addr=...`),
+            // so hand kMain that PA directly.
+            .ptr = @ptrFromInt(rs_ptr_pa),
+            .len = rs_len,
         },
         .stack_top = VAddr.fromInt(0),
         .xsdp_phys = PAddr.fromInt(0),
