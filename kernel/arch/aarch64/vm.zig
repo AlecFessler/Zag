@@ -267,7 +267,7 @@ pub const VmExitInfo = union(enum) {
         guest_virt: u64,
         /// True if the fault was on an instruction fetch (EC=0x20).
         is_instruction: bool,
-        /// Write not-read flag (ESR_EL2.ISS.WnR).
+        /// Write not-read flag (ESR_EL2.ISS.WnR, data abort only).
         is_write: bool,
         /// Size of the access encoded in ISS.SAS (0=byte, 1=halfword,
         /// 2=word, 3=doubleword). Only meaningful when ISS.ISV=1.
@@ -278,6 +278,16 @@ pub const VmExitInfo = union(enum) {
         /// 1 if the above fields are valid (ISS.ISV). When 0, the VMM
         /// must do its own instruction decode at `guest_virt`.
         iss_valid: bool,
+        /// Sign-extended load (ISS.SSE, data abort only).
+        sign_extend: bool,
+        /// 64-bit register access (ISS.SF, data abort only).
+        reg64: bool,
+        /// Acquire/release semantics (ISS.AR, data abort only).
+        acqrel: bool,
+        /// Data/Instruction Fault Status Code (ISS.DFSC for EC=0x24 or
+        /// ISS.IFSC for EC=0x20). Low 6 bits. See ARM ARM D13.2.39
+        /// Table D13-46.
+        fsc: u8,
     };
 
     pub const HvcExit = struct {
@@ -696,12 +706,12 @@ pub const HCR_EL2_RW: u64 = 1 << 31; // EL1 is AArch64
 /// inner-shareable WB, PS=40-bit output. ARM ARM D13.2.150.
 pub fn vtcrEl2Value() u64 {
     const t0sz: u64 = STAGE2_T0SZ; // 34
-    const sl0: u64 = 0;             // start at level 2 (w/ 4K, T0SZ=34)
-    const irgn0: u64 = 0b01;        // Normal WB WA cacheable
+    const sl0: u64 = 0; // start at level 2 (w/ 4K, T0SZ=34)
+    const irgn0: u64 = 0b01; // Normal WB WA cacheable
     const orgn0: u64 = 0b01;
-    const sh0: u64 = 0b11;          // Inner shareable
-    const tg0: u64 = 0b00;          // 4 KiB granule
-    const ps: u64 = 0b010;          // 40-bit PA
+    const sh0: u64 = 0b11; // Inner shareable
+    const tg0: u64 = 0b00; // 4 KiB granule
+    const ps: u64 = 0b010; // 40-bit PA
     return t0sz |
         (sl0 << 6) |
         (irgn0 << 8) |
@@ -734,6 +744,9 @@ pub fn decodeEsrEl2(esr: u64, far: u64, hpfar: u64) VmExitInfo {
             .is_read = (iss & 1) != 0,
         } },
         0x20, 0x24 => blk: {
+            // ARM ARM D13.2.39 ESR_EL2 ISS for Data Abort / Instruction
+            // Abort from a lower Exception level. HPFAR_EL2 bits [39:4]
+            // hold IPA bits [47:12]; FAR_EL2 supplies the low 12 bits.
             const guest_phys = ((hpfar & 0x0FFF_FFFF_FFF0) << 8) | (far & 0xFFF);
             const iss_valid = (iss & (1 << 24)) != 0;
             break :blk .{ .stage2_fault = .{
@@ -744,6 +757,10 @@ pub fn decodeEsrEl2(esr: u64, far: u64, hpfar: u64) VmExitInfo {
                 .access_size = @intCast((iss >> 22) & 0x3),
                 .srt = @intCast((iss >> 16) & 0x1F),
                 .iss_valid = iss_valid,
+                .sign_extend = (iss & (1 << 21)) != 0,
+                .reg64 = (iss & (1 << 15)) != 0,
+                .acqrel = (iss & (1 << 14)) != 0,
+                .fsc = @intCast(iss & 0x3F),
             } };
         },
         0x00 => .{ .unknown_ec = 0 },
