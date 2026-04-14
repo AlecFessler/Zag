@@ -84,6 +84,7 @@ pub fn build(b: *std.Build) void {
         if (profile) |p| p.display else "none";
     const net_type = b.option([]const u8, "net", "Network: tap, user, or none (default: user)") orelse
         if (profile) |p| p.net else "user";
+    const direct_kernel = b.option(bool, "direct_kernel", "aarch64 only: build kernel for QEMU -kernel direct-boot (EL2 via virtualization=on). Replaces UEFI bootloader entry path.") orelse false;
     const kernel_profile = b.option([]const u8, "kernel_profile", "Kernel profiling mode: none, trace, or sample (default: none)") orelse "none";
     if (!std.mem.eql(u8, kernel_profile, "none") and
         !std.mem.eql(u8, kernel_profile, "trace") and
@@ -234,16 +235,29 @@ pub fn build(b: *std.Build) void {
         kernel.use_llvm = true;
         kernel.use_lld = true;
     }
-    kernel.entry = .{ .symbol_name = "kEntry" };
+    const use_direct_kernel = direct_kernel and arch == .aarch64;
+    kernel.entry = .{ .symbol_name = if (use_direct_kernel) "_start" else "kEntry" };
     kernel.root_module.omit_frame_pointer = false;
     kernel.root_module.red_zone = false;
     kernel.root_module.addImport("zag", zag_mod);
-    kernel.setLinkerScript(b.path(if (arch == .x86_64) "kernel/linker-x86.ld" else "kernel/linker-aarch64.ld"));
+    const linker_script = if (arch == .x86_64)
+        "kernel/linker-x86.ld"
+    else if (use_direct_kernel)
+        "kernel/linker-aarch64-direct.ld"
+    else
+        "kernel/linker-aarch64.ld";
+    kernel.setLinkerScript(b.path(linker_script));
+    if (use_direct_kernel) {
+        // Boot stub (low-PA entry, EL detection, UEFI tail-call or EL2
+        // direct-boot setup). Only linked when -Ddirect_kernel=true.
+        kernel.addAssemblyFile(b.path("kernel/arch/aarch64/boot/start.S"));
+    }
     // Preserve relocation info so the bootloader can apply a random KASLR
     // slide to kernel text/rodata/data at load time. Without --emit-relocs
     // the .rela.* sections are stripped and absolute references bake in
-    // the link-time base address.
-    kernel.link_emit_relocs = true;
+    // the link-time base address. Direct-kernel builds skip KASLR and so
+    // don't need emit-relocs — see linker-aarch64-direct.ld.
+    kernel.link_emit_relocs = !use_direct_kernel;
     b.installArtifact(kernel);
     const install_kernel = b.addInstallFile(
         kernel.getEmittedBin(),
