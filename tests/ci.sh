@@ -76,6 +76,27 @@ stage_result() {
     esac
 }
 
+# ─── stage 0: zig fmt --check ─────────────────────────────────────────
+stage_start S0 "zig fmt --check on all .zig sources"
+(
+    # `zig fmt --check <path>` walks directories recursively, so we
+    # point it at the top-level source roots and let it find every
+    # .zig file. Skip .zig-cache (build artifacts, auto-generated).
+    targets=(bootloader hyprvOS kernel routerOS tests)
+    existing=()
+    for t in "${targets[@]}"; do
+        [ -d "$ZAG_ROOT/$t" ] && existing+=("$ZAG_ROOT/$t")
+    done
+    [ -f "$ZAG_ROOT/build.zig" ] && existing+=("$ZAG_ROOT/build.zig")
+    zig fmt --check "${existing[@]}"
+) > "$RUN_DIR/s0_zig_fmt.log" 2>&1
+if [ -s "$RUN_DIR/s0_zig_fmt.log" ]; then
+    bad="$(wc -l < "$RUN_DIR/s0_zig_fmt.log")"
+    stage_result S0 FAIL "$bad files would be reformatted — see s0_zig_fmt.log (run \`zig fmt\` to fix)"
+else
+    stage_result S0 PASS
+fi
+
 # ─── stage 1: x86 kernel tests ────────────────────────────────────────
 stage_start S1 "x86 kernel tests (KVM, 590)"
 (
