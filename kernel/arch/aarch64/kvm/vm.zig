@@ -504,11 +504,8 @@ pub fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
         const page_off = src_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(src_va), false, false) catch return false;
-        // aarch64 resolveVaddr returns the full PA (page_off already
-        // OR'd in) unlike x64 which returns the page-base PA, so do
-        // NOT add page_off a second time.
         const src_pa = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
-        const physmap_addr = VAddr.fromPAddr(src_pa, null).addr;
+        const physmap_addr = VAddr.fromPAddr(src_pa, null).addr + page_off;
         const src: [*]const u8 = @ptrFromInt(physmap_addr);
         @memcpy(buf[dst_off..][0..chunk], src[0..chunk]);
         dst_off += chunk;

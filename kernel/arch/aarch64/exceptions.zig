@@ -47,6 +47,7 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const gic = zag.arch.aarch64.gic;
+const pmu = zag.arch.aarch64.pmu;
 const scheduler = zag.sched.scheduler;
 const syscall_dispatch = zag.syscall.dispatch;
 
@@ -504,9 +505,11 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
 fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     const intid = gic.acknowledgeInterrupt();
 
-    // INTID 1023 = spurious interrupt (IHI 0069H, Section 12.11.1).
+    // INTIDs 1020-1023 are all spurious / reserved (IHI 0069H §2.2.1,
+    // IHI 0048B §2.2.1). `isSpurious` covers GICv3 (1023), the GICv2
+    // non-aliased IAR (1023) and the GICv2 aliased AIAR (1022) cases.
     // No EOI needed for spurious interrupts.
-    if (intid == 1023) return;
+    if (gic.isSpurious(intid)) return;
 
     // EOI must be issued BEFORE dispatchIrq because the timer / scheduler
     // IPI paths can call `scheduler.switchTo`, which is `noreturn` and
@@ -567,7 +570,7 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
 fn handleIrqCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
     const intid = gic.acknowledgeInterrupt();
 
-    if (intid == 1023) return;
+    if (gic.isSpurious(intid)) return;
 
     // EOI before dispatch — see handleIrqLowerEl for rationale.
     gic.endOfInterrupt(intid);
@@ -601,23 +604,110 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.
         // it through the same path as the timer tick so the scheduler picks
         // a new runnable thread on this core.
         0 => {
+            // Pi 5 KVM vGICv2 workaround: broadcast a scheduler tick
+            // to all secondary cores whenever the BSP runs through
+            // its scheduler (via yield self-IPI, cross-core wake,
+            // etc). The PPI 30 (CNTP) handler does the same — we
+            // hook both paths because empirically the BSP's dominant
+            // tick source on Pi KVM is the self-yield SGI 0, not the
+            // CNTP PPI, so gating purely off PPI 30 would leave
+            // secondaries silent. `maybeBroadcastSchedTick` is
+            // rate-limited to at most one broadcast per scheduler
+            // timeslice (2 ms), so the fan-out stays bounded. See
+            // gic.zig for full diagnosis and spec references.
+            if (gic.coreID() == 0) {
+                gic.maybeBroadcastSchedTick();
+            }
             const sched_ctx = scheduler.SchedInterruptContext{
                 .privilege = privilege,
                 .thread_ctx = ctx,
             };
             scheduler.schedTimerHandler(sched_ctx);
         },
-        27 => {
-            // Mask the virtual timer while we run the scheduler tick.
-            // schedTimerHandler will re-arm via `armInterruptTimer`
-            // which writes ENABLE=1, IMASK=0 and thereby unmasks again.
-            // Without masking first, ISTATUS stays asserted and the
-            // GIC would immediately re-deliver the PPI after EOI.
-            // ARM ARM D13.8.20: CNTV_CTL_EL0 IMASK (bit 1).
-            asm volatile ("msr cntv_ctl_el0, %[val]"
-                :
-                : [val] "r" (@as(u64, 0x3)), // ENABLE=1, IMASK=1
+        gic.SGI_BCAST_TICK => {
+            // BSP-driven broadcast scheduler tick (Pi 5 KVM vGICv2
+            // workaround). The BSP's CNTP PPI 30 handler fans out an
+            // SGI on INTID `SGI_BCAST_TICK` to every other core on
+            // every tick, because Pi 5 KVM silently drops per-core
+            // CNTV/CNTP PPI injections to secondaries once they run
+            // EL0. The receiving core treats it as an ordinary
+            // scheduler tick. See gic.zig `broadcastSchedTick` for
+            // the full diagnosis and spec citations.
+            const sched_ctx = scheduler.SchedInterruptContext{
+                .privilege = privilege,
+                .thread_ctx = ctx,
+            };
+            scheduler.schedTimerHandler(sched_ctx);
+        },
+        23 => {
+            // PMU overflow PPI. ARM ARM DDI 0487 K.a §D13.3.1 documents
+            // INTID 23 as the GICv3-recommended, level-sensitive PPI
+            // raised when PMOVSSET_EL0 has any bit set whose matching
+            // PMINTENSET_EL1 bit is also set. The handler snapshots the
+            // counter values, masks PMINTENSET / clears PMOVSCLR to
+            // drop the line before ERET, and delivers a pmu_overflow
+            // fault to the thread's process fault handler.
+            pmu.pmiHandler(ctx);
+        },
+        27, 30 => {
+            // EL1 timer preemption tick. Mask the firing line while we
+            // run the scheduler tick; schedTimerHandler re-arms via
+            // `armInterruptTimer`, which writes ENABLE=1, IMASK=0 and
+            // thereby unmasks the timer again. Without masking first,
+            // ISTATUS stays asserted and the GIC would immediately
+            // re-deliver the PPI after EOI.
+            //
+            // We accept INTID 30 (CNTP) as the primary preemption
+            // source and INTID 27 (CNTV) as the fallback. The scheduler
+            // programs CNTP via kernel/arch/aarch64/timers.zig, but
+            // some KVM hosts (notably Pi 5 KVM vGICv2 without FEAT_ECV)
+            // trap guest CNTP programming and re-route the deadline
+            // through the virtual timer line, delivering PPI 27 to the
+            // guest instead of PPI 30 — the guest is unaware of the
+            // substitution, so both INTIDs must land on the same
+            // scheduler path. Masking the CORRECT control register is
+            // determined by ISTATUS: whichever of CNTP/CNTV is firing
+            // has ISTATUS=1; we mask only that one so we don't disturb
+            // a timer we didn't program.
+            //
+            // ARM ARM D13.8.11: CNTP_CTL_EL0 — IMASK (bit 1), ISTATUS (bit 2).
+            // ARM ARM D13.8.20: CNTV_CTL_EL0 — same layout.
+            // GIC IHI 0069H §2.2 / §8.10: INTID 27 = EL1 virtual timer,
+            // INTID 30 = EL1 physical timer.
+            var cntp_ctl: u64 = undefined;
+            var cntv_ctl: u64 = undefined;
+            asm volatile ("mrs %[v], cntp_ctl_el0"
+                : [v] "=r" (cntp_ctl),
             );
+            asm volatile ("mrs %[v], cntv_ctl_el0"
+                : [v] "=r" (cntv_ctl),
+            );
+            if ((cntp_ctl & 0x4) != 0) {
+                asm volatile ("msr cntp_ctl_el0, %[val]"
+                    :
+                    : [val] "r" (@as(u64, 0x3)), // ENABLE=1, IMASK=1
+                );
+            }
+            if ((cntv_ctl & 0x4) != 0) {
+                asm volatile ("msr cntv_ctl_el0, %[val]"
+                    :
+                    : [val] "r" (@as(u64, 0x3)), // ENABLE=1, IMASK=1
+                );
+            }
+            // Pi 5 KVM vGICv2 workaround: fan the BSP's CNTP tick out
+            // to every secondary core over a dedicated SGI so they
+            // preempt even when their own per-core PPI injection is
+            // being silently dropped by the in-kernel vGICv2. Gated
+            // to the BSP (core 0) so this is a single broadcast per
+            // tick, not an N² fan-out. Harmless on TCG GICv3 and
+            // bare-metal where secondaries already see their PPI —
+            // the extra tick just runs the normal scheduler handler.
+            // See gic.zig `broadcastSchedTick` for spec citations.
+            // Rate-limited variant because the SGI 0 handler also
+            // calls it on every BSP yield self-IPI.
+            if (gic.coreID() == 0) {
+                gic.maybeBroadcastSchedTick();
+            }
             const sched_ctx = scheduler.SchedInterruptContext{
                 .privilege = privilege,
                 .thread_ctx = ctx,

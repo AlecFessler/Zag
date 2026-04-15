@@ -41,6 +41,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const aarch64_paging = zag.arch.aarch64.paging;
+const gic = zag.arch.aarch64.gic;
 const hyp_consts = zag.arch.aarch64.hyp_consts;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
@@ -545,7 +546,17 @@ pub fn installHypVectors() void {
     // UEFI path that stub is always live; on a non-UEFI / EL1-entry
     // path `hyp_stub_installed` remains false and we short-circuit.
     if (!vm_supported or !hyp_stub_installed) return;
-    if (hyp_vectors_installed) return;
+    // VBAR_EL2 is per-core and the bootloader's EL2 stub was only
+    // installed on the BSP before it ERETed to EL1. On secondaries
+    // (brought up via PSCI CPU_ON), VBAR_EL2 holds whatever firmware
+    // left there, so issuing the install HVC from an AP would trap into
+    // an unknown/unmapped handler and hang the core. Until a dedicated
+    // per-core EL2 bringup path lands, only the BSP runs the install
+    // HVC; VM runs are pinned to the BSP. ARM ARM D13.2.143 —
+    // VBAR_EL2 is per-PE state.
+    // TODO(smp): install vectors on every core once AP EL2 bringup lands.
+    if (gic.coreID() != 0) return;
+    if (@atomicLoad(bool, &hyp_vectors_installed, .acquire)) return;
 
     const vec_va: u64 = @intFromPtr(&__hyp_vectors);
     const page_paddr = aarch64_paging.resolveVaddr(
@@ -564,7 +575,7 @@ pub fn installHypVectors() void {
         : [vbar] "{x0}" (vec_pa),
         : .{ .memory = true, .x9 = true, .x10 = true });
 
-    hyp_vectors_installed = true;
+    @atomicStore(bool, &hyp_vectors_installed, true, .release);
 }
 
 /// Per-core VM initialization. Called from `sched.perCoreInit()` on every

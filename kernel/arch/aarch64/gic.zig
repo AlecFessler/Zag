@@ -198,13 +198,42 @@ const max_redist: usize = 256;
 
 /// Spurious interrupt ID returned by IAR when no pending interrupt.
 /// IHI 0069H, Section 12.11.1 / IHI 0048B, Section 4.4.4.
+///
+/// Note: GICC_AIAR (the aliased Group 1 IAR, GICv2 with Security
+/// Extensions) returns 1022 instead of 1023 when no Group 1 interrupt
+/// is pending (IHI 0048B §4.4.11). `isSpurious` handles both values;
+/// callers should use that helper rather than a bare equality check.
 pub const spurious_intid: u32 = 1023;
+
+/// True for either spurious interrupt encoding (1022 or 1023). The GIC
+/// spec reserves the top 8 INTIDs (1020-1023) as spurious / non-
+/// maskable hand-offs (IHI 0048B §2.2.1, IHI 0069H §2.2.1), so we
+/// treat any INTID in that range as spurious — nothing valid for the
+/// kernel ever lands there.
+pub inline fn isSpurious(intid: u32) bool {
+    return intid >= 1020;
+}
 
 // ── State ───────────────────────────────────────────────────────
 
 /// GICv3 detected flag. When false, the driver uses GICv2 MMIO paths.
 /// Set during initDistributor() by reading GICD_PIDR2.ArchRev.
 pub var gicv3: bool = false;
+
+/// On GICv2, whether non-secure writes to GICD_IGROUPR0 and the banked
+/// GICR equivalents are honoured by the implementation. When `true`, all
+/// SGIs/PPIs have been moved to Group 1 NS and the driver uses the
+/// aliased IAR/EOIR (GICC_AIAR / GICC_AEOIR) for acknowledgement. When
+/// `false`, the implementation left every INTID in Group 0 — we can
+/// neither write IGROUPR0 from NS nor ack via the alias (would return
+/// spurious 1022), so the driver falls back to the non-aliased
+/// IAR/EOIR pair (GICC_IAR / GICC_EOIR).
+///
+/// IHI 0048B, Section 4.3.10 (GICD_IGROUPR): describes the Secure-only
+/// write access on implementations with Security Extensions.
+/// IHI 0048B, Section 4.4.4 / 4.4.11: GICC_IAR vs GICC_AIAR spurious
+/// returns depending on which Group the pending interrupt is in.
+var gicv2_group1_ack: bool = false;
 
 /// GICD base virtual address. Set by acpi.zig via setDistributorBase().
 var gicd_base: u64 = 0;
@@ -517,17 +546,34 @@ pub fn initDistributor() void {
             n += 1;
         }
 
-        // Enable distributor for Group 1 NS interrupts.
+        // Probe whether Non-secure writes to GICD_IGROUPR0 (the banked
+        // per-CPU INTIDs 0-31) take effect. IHI 0048B §4.3.10 says that
+        // on an implementation with Security Extensions, Non-secure
+        // accesses to GICD_IGROUPR0 "have no effect" and the register
+        // reads back as zero — so every INTID remains in Group 0, and
+        // Group 0 interrupts are unreachable from the Non-secure OS.
+        // When the implementation exposes a writable IGROUPR0 (GICv2
+        // without Security Extensions, or Secure-view access), we can
+        // move every SGI/PPI to Group 1 NS and acknowledge via the
+        // aliased IAR/EOIR pair. Otherwise the driver must leave the
+        // group assignment alone and ack via the non-aliased pair.
         //
-        // IHI 0048B, Section 4.3.2, Table 4-21 (GICD_CTLR, Non-secure view):
-        // when accessed from Non-secure state — which is the only view
-        // exposed by KVM's in-kernel GICv2 emulation and by TCG GICv2
-        // without the security extensions — bit 0 alone is the Group 1
-        // enable, and the Secure-view bits 0 (EnableGrp0) / 1
-        // (EnableGrp1NS) are not visible. We write both bit 0 (NS view
-        // enable) and bit 1 (Secure-view EnableGrp1NS) so the same
-        // value works regardless of which view the implementation
-        // exposes. Linux's gic.c uses GICD_ENABLE = 0x1.
+        // The probe writes all 1s, reads back, and captures whether the
+        // write was observed. The value is latched into
+        // `gicv2_group1_ack` and re-applied below; secondary cores
+        // re-use the same decision via `initRedistributor` path.
+        gicdWriteOffset(.igroupr0, 0, 0xFFFFFFFF);
+        const igroupr0_after = gicdReadOffset(.igroupr0, 0);
+        gicv2_group1_ack = igroupr0_after != 0;
+
+        // Enable distributor for whichever Group the implementation lets
+        // the Non-secure OS drive. IHI 0048B, Section 4.3.2, Table 4-21
+        // (GICD_CTLR, Non-secure view): bit 0 is the single Group 1
+        // enable when only the NS view is visible. Under the Secure
+        // view bit 0 is EnableGrp0 and bit 1 is EnableGrp1NS; writing
+        // both keeps a Group 0 configuration usable when IGROUPR0
+        // writes are ignored and Group 1 usable when they are honoured.
+        // Linux's gic.c uses GICD_ENABLE = 0x1 for the same purpose.
         gicdWrite(.ctlr, gicd_ctlr_enable_grp1_ns | gicd_ctlr_enable_grp0);
     }
 }
@@ -572,18 +618,27 @@ pub fn initRedistributor(core_idx: usize) void {
         // Assign all SGIs/PPIs to Group 1 Non-secure. After reset
         // GICR_IGROUPR0 is UNKNOWN and some implementations leave every
         // INTID in Group 0. We only enable ICC_IGRPEN1_EL1 on the CPU
-        // interface, so any PPI left in Group 0 (notably CNTV PPI 27)
-        // would be silently dropped. IHI 0069H, Section 9.5.2.
+        // interface, so any PPI left in Group 0 (notably the scheduler
+        // preemption PPI 30) would be silently dropped. IHI 0069H,
+        // Section 9.5.2.
         gicrSgiWrite(core_idx, .igroupr0, 0xFFFFFFFF);
 
         // Enable SGIs (INTID 0-15) and the generic timer PPIs
         // (27 = CNTV, 29 = CNTHP, 30 = CNTP) via GICR_ISENABLER0.
         // IHI 0069H, Section 9.5.6: GICR_ISENABLER0 — bit n enables INTID n.
-        // The scheduler uses the virtual timer (CNTV, PPI 27) because it
-        // is always accessible from EL1 without EL2 having to enable
-        // CNTHCTL_EL2.EL1PCEN. The physical timer PPI (30) is kept
-        // enabled as well for generic timer support.
-        gicrSgiWrite(core_idx, .isenabler0, 0x0000FFFF | (1 << 27) | (1 << 29) | (1 << 30));
+        // The scheduler uses the EL1 physical timer (CNTP, PPI 30) for
+        // preemption; see kernel/arch/aarch64/timers.zig for why CNTV
+        // (PPI 27) is unsafe under Pi 5 KVM vGICv2. CNTV is kept enabled
+        // in the GIC anyway for guest-support paths.
+        //
+        // PPI 23 is the PMU overflow request line. ARM ARM DDI 0487 K.a
+        // §D13.3.1 "Generating overflow interrupt requests" says the
+        // PMU connects to the GIC as a PPI with ID 23 (GICv3-recommended)
+        // and is level-sensitive. QEMU `virt` and Cortex-A72/A76 both
+        // honour this recommendation. The default GICR_ICFGR1 reset value
+        // leaves PPIs as level-sensitive (2-bit field = 0b00), which is
+        // exactly what PMU overflow needs, so no ICFGR write is required.
+        gicrSgiWrite(core_idx, .isenabler0, 0x0000FFFF | (1 << 23) | (1 << 27) | (1 << 29) | (1 << 30));
 
         // Set all SGI/PPI priorities to 0x80. On GICv3 ICC_PMR_EL1 is
         // 0xFF and interrupts with priority >= PMR are masked (IHI 0069H,
@@ -608,14 +663,18 @@ pub fn initRedistributor(core_idx: usize) void {
         // GICD_IGROUPR0. After reset this register is UNKNOWN (KVM
         // GICv2 emulation + AAVMF leaves every INTID in Group 0). The
         // CPU interface is enabled for Group 1, so any PPI left in
-        // Group 0 — notably the CNTV preemption timer PPI 27 — would
+        // Group 0 — notably the CNTP preemption timer PPI 30 — would
         // be silently dropped. IHI 0048B, Section 4.3.10.
         gicdWriteOffset(.igroupr0, 0, 0xFFFFFFFF);
 
-        // Enable SGIs (INTID 0-15) and timer PPIs (27, 29, 30) via the
-        // banked GICD_ISENABLER0.
+        // Enable SGIs (INTID 0-15), timer PPIs (27, 29, 30), and the PMU
+        // overflow PPI (23) via the banked GICD_ISENABLER0. ARM ARM DDI
+        // 0487 K.a §D13.3.1 documents PMU overflow as level-sensitive
+        // PPI 23 on GICv3-compatible implementations; GICv2's banked
+        // GICD_ICFGR1 reset defaults also leave PPIs level-sensitive, so
+        // the trigger config does not need to be rewritten here.
         // IHI 0048B, Section 4.3.5.
-        gicdWriteOffset(.isenabler0, 0, 0x0000FFFF | (1 << 27) | (1 << 29) | (1 << 30));
+        gicdWriteOffset(.isenabler0, 0, 0x0000FFFF | (1 << 23) | (1 << 27) | (1 << 29) | (1 << 30));
 
         // Set all SGI/PPI priorities to 0x80 (see GICv3 note above).
         // IHI 0048B, Section 4.3.11: GICD_IPRIORITYR0-7 (banked per-CPU).
@@ -729,25 +788,86 @@ pub fn coreID() u64 {
     return mpidr & 0xFF; // Aff0.
 }
 
+/// Last GICv2 IAR value read on this core, saved for EOI. On GICv2, EOI
+/// for an SGI must include the CPUID of the originating CPU (bits
+/// [12:10] of the IAR value) alongside the INTID — IHI 0048B §4.4.5
+/// "GICC_EOIR" / §4.4.12 "GICC_AEOIR": "Software must write to
+/// GICC_EOIR with the same value that was read from GICC_IAR... if
+/// the interrupt was an SGI, software must include the CPUID of the
+/// requesting CPU." Masking the CPUID away — as earlier revisions did
+/// — meant the GIC never clears the per-source pending state for SGIs
+/// from CPUs other than 0, and the first cross-core self-IPI
+/// (`yield()` → SGI 0 from CPU 0 to CPU 0) produced a correctly-cleared
+/// IRQ but the first scheduler IPI from CPU 1 to CPU 0 pended forever,
+/// re-raising on every ERET in a tight storm.
+///
+/// Writing the full IAR value back is always safe: on SPI/PPI the
+/// CPUID field is RES0 and the EOI still matches on INTID.
+///
+/// Per-core variable because several cores may be handling interrupts
+/// concurrently and each must EOI its own IAR. The BSP seeds the slot
+/// on early boot; `initSecondaryCoreGic` zeros it for each AP.
+var gicv2_last_iar: [max_redist]u32 = [_]u32{0} ** max_redist;
+
 /// Acknowledge the highest priority pending interrupt.
 ///
 /// On GICv3: reads ICC_IAR1_EL1 (IHI 0069H, Section 12.11.1).
-/// On GICv2: reads GICC_AIAR. The driver assigns every INTID to Group 1
-/// non-secure, so GICC_IAR (Group 0 ack) would return the spurious
-/// INTID 1022 whenever a Group 1 interrupt is pending.
-/// IHI 0048B, Section 4.4.11 (aliased IAR).
+///
+/// On GICv2: reads GICC_IAR or GICC_AIAR depending on which Group the
+/// distributor routes SGIs/PPIs to. IHI 0048B §4.3.10 documents that
+/// Non-secure writes to GICD_IGROUPR0 "have no effect" on a GICv2 with
+/// Security Extensions accessed from NS state — every SGI/PPI stays in
+/// Group 0, which a Non-secure OS can neither enable nor acknowledge
+/// via the aliased registers. On such an implementation, reading
+/// GICC_AIAR returns the spurious INTID 1022 (IHI 0048B §4.4.11) on
+/// every tick, the un-acked Group 0 interrupt stays pending, and the
+/// CPU spins in an IRQ storm. `initDistributor` probes IGROUPR0 and
+/// latches the decision in `gicv2_group1_ack`: true → implementation
+/// honoured the write, use aliased (Group 1) ack/eoi path; false →
+/// fall back to the non-aliased (Group 0) pair, which is the ack path
+/// the GICv2 reset state leaves the OS with.
+///
+/// The full raw IAR value (including CPUID bits [12:10] for SGIs) is
+/// latched in `gicv2_last_iar[coreID]` so `endOfInterrupt` can write
+/// the matching full-width EOI value; see `gicv2_last_iar` for the
+/// SGI CPUID-routing requirement.
+///
+/// IHI 0048B, Section 4.4.4: GICC_IAR — INTID in bits [9:0], CPUID in
+/// bits [12:10] for SGIs.
+/// IHI 0048B, Section 4.4.11: GICC_AIAR — same layout, 1022 on
+/// no Group 1 pending.
 ///
 /// Returns the INTID, or `spurious_intid` (1023) if no interrupt is pending.
 pub fn acknowledgeInterrupt() u32 {
     if (gicv3) return readIccIar1();
-    return giccRead(.aiar) & 0x3FF; // IHI 0048B: INTID in bits [9:0].
+    const raw = if (gicv2_group1_ack) giccRead(.aiar) else giccRead(.iar);
+    const core_idx: usize = @intCast(coreID() & 0xFF);
+    if (core_idx < max_redist) gicv2_last_iar[core_idx] = raw;
+    return raw & 0x3FF; // IHI 0048B: INTID in bits [9:0].
 }
 
 /// Signal end of interrupt processing for the given INTID.
 ///
 /// On GICv3: writes ICC_EOIR1_EL1 (IHI 0069H, Section 12.11.1).
-/// On GICv2: writes GICC_AEOIR (IHI 0048B, Section 4.4.12), the Group 1
-/// pair to GICC_AIAR.
+///
+/// On GICv2: writes GICC_AEOIR when the driver ack'd via GICC_AIAR
+/// (Group 1 alias) or GICC_EOIR when the ack came from GICC_IAR
+/// (non-aliased). Using the wrong EOI against an INTID that was not
+/// acknowledged via the matching IAR is a no-op per IHI 0048B §4.4.12
+/// / §4.4.5, which leaves the interrupt active-and-pending and masks
+/// every subsequent delivery at the CPU interface — the failure mode
+/// that caused the scheduler tick to hang after the very first IRQ on
+/// Pi-5 KVM GICv2.
+///
+/// The write uses the full raw value latched by `acknowledgeInterrupt`
+/// so the SGI CPUID bits [12:10] survive the round-trip (IHI 0048B
+/// §4.4.5). When the latched value's INTID does not match the caller-
+/// supplied INTID (e.g. the caller bailed before calling
+/// `acknowledgeInterrupt`), fall back to writing the bare INTID; this
+/// matches the previous behaviour on non-SGI paths where CPUID is RES0.
+///
+/// IHI 0048B, Section 4.4.5: GICC_EOIR.
+/// IHI 0048B, Section 4.4.12: GICC_AEOIR.
 ///
 /// Must be called after the interrupt handler completes. For level-triggered
 /// SPIs, the peripheral must deassert the interrupt line before EOI to
@@ -755,8 +875,15 @@ pub fn acknowledgeInterrupt() u32 {
 pub fn endOfInterrupt(intid: u32) void {
     if (gicv3) {
         writeIccEoir1(intid);
+        return;
+    }
+    const core_idx: usize = @intCast(coreID() & 0xFF);
+    const latched: u32 = if (core_idx < max_redist) gicv2_last_iar[core_idx] else 0;
+    const eoi_val: u32 = if ((latched & 0x3FF) == intid) latched else intid;
+    if (gicv2_group1_ack) {
+        giccWrite(.aeoir, eoi_val);
     } else {
-        giccWrite(.aeoir, intid);
+        giccWrite(.eoir, eoi_val);
     }
 }
 
@@ -779,6 +906,68 @@ pub fn endOfInterrupt(intid: u32) void {
 ///
 /// For a flat topology (single cluster, Aff1=Aff2=Aff3=0), only the
 /// TargetList and INTID fields matter.
+///
+/// Pi 5 KVM GICv2 history note (s2_1_25 / s2_2_16 / s2_2_33): when the
+/// scheduler preemption tick was sourced from the EL1 virtual timer
+/// (CNTV, PPI 27), per-core schedTimerHandler counters showed that
+/// secondary cores under Pi 5 KVM with the in-kernel vGICv2 stopped
+/// receiving the CNTV event as soon as they dispatched a user (EL0)
+/// thread. Sample at 10 s of wall clock running §2.2.16:
+///
+///   tk5000: c0=5001 c1=2(sw1,eq1) c2=7 c3=0
+///
+/// Core 0 ticked at ~500 Hz from main's self-yield SGIs, but cores
+/// 1-3 effectively never ticked. Cross-core SGIs were delivered
+/// correctly in the same run (§2.2.34 passed), isolating the miss to
+/// the KVM↔guest CNTV injection path on Pi-class hardware. TCG GICv2
+/// / TCG GICv3 / x86 KVM were all unaffected by the same bug.
+///
+/// Resolved by switching the scheduler preemption timer from CNTV
+/// (PPI 27) to CNTP (PPI 30) — see kernel/arch/aarch64/timers.zig
+/// and the INTID 30 case in exceptions.zig dispatchIrq. CNTP is
+/// routed by the vGICv2 through a path that does not hit the CNTV
+/// injection bug, and is available on every host/firmware combo we
+/// target. Do not revert the preemption source to CNTV without first
+/// validating on Pi 5 KVM.
+///
+/// Tried-and-not-working workarounds (retained here so the next pass
+/// does not re-investigate from scratch):
+///   * Unconditional BSP→all-secondaries SGI broadcast on every BSP
+///     tick — didn't help the timer-stalled cores AND broke §3_3_7
+///     / §2.2.34 by storming the IPC reply path.
+///   * Same broadcast gated on `remote.rq.head != null` — same result.
+///
+/// Further discovery (2026-04-15, §2.1.25 / §2.2.16 investigation):
+/// the Pi 5 KVM vGICv2 drop is broader than just CNTP/CNTV PPIs —
+/// empirically, when a secondary vCPU is executing at EL0 (running a
+/// user thread), ALL interrupt injections to that vCPU are silently
+/// dropped, including SGIs from the BSP (the `broadcastSchedTick`
+/// SGI_BCAST_TICK fan-out AND the cross-core `sendIpiToCore` SGI 0
+/// scheduler IPI). Trace evidence from s2_2_16 on 4-core Pi KVM:
+///
+///   [BC c1]           (1x, while core 1 was still running idle)
+///   [SGI0 c1]         (1x, dispatches worker to core 1)
+///   [BC c2]...        (hundreds, cores 2 & 3 continue to tick)
+///   (no more c1 interrupts of any kind)
+///
+/// Once core 1 ERETs into the worker's EL0 spin loop (pure atomic
+/// increment with no syscalls), neither the BSP broadcast SGI 7 nor
+/// any newly-fired core 1 CNTP PPI 30 reach the core — it stays in
+/// EL0 indefinitely, so no cross-core wake or preemption tick can
+/// migrate the worker or deliver a timeslice. Cores 2 & 3, which
+/// stayed in EL1 on the idle thread's `wfi`, continued to receive
+/// broadcasts normally. §2.2.33 still passes because its helper
+/// thread performs `thread_yield` syscalls that voluntarily re-enter
+/// EL1 and let queued interrupts drain; §2.2.16 and §2.1.25 fail
+/// because their workers / restartable children spin purely at EL0
+/// after they migrate to a secondary.
+///
+/// There is no guest-side workaround for this limitation — the IRQ
+/// delivery path is inside KVM/vGICv2 on the host. Tests that require
+/// preemptive cross-core scheduling of an EL0-only workload (no
+/// syscalls, no faults) do not pass on Pi 5 KVM vGICv2 today. They
+/// pass on TCG GICv3, x86 KVM, and are expected to pass on Pi 5
+/// bare-metal GICv3 once that bring-up lands.
 pub fn sendIpiToCore(core_id: u64, vector: u8) void {
     // SGI INTID must be 0-15.
     const sgi_id: u64 = vector & 0xF;
@@ -801,6 +990,116 @@ pub fn sendIpiToCore(core_id: u64, vector: u8) void {
         const target_mask: u32 = @as(u32, 1) << @intCast(core_id & 0x7);
         const sgir_val: u32 = @as(u32, @intCast(sgi_id)) | (target_mask << 16);
         gicdWrite(.sgir, sgir_val);
+    }
+}
+
+/// Dedicated SGI INTID reserved for the BSP-driven scheduler-tick
+/// broadcast (Pi 5 KVM vGICv2 workaround — see `broadcastSchedTick`
+/// below). Must not collide with SGI 0 (the scheduler IPI / yield /
+/// cross-core wake vector) because that path has IPC / futex
+/// semantics the tick must not disturb. SGI 7 is otherwise unused by
+/// the kernel.
+pub const SGI_BCAST_TICK: u8 = 7;
+
+/// Next CNTPCT tick at/after which `maybeBroadcastSchedTick` is
+/// allowed to fire. Updated with relaxed atomics by whichever BSP
+/// interrupt handler wins the compare-exchange; losers skip the
+/// broadcast. Zero-initialised — the first caller always fires.
+var next_bcast_tick: u64 = 0;
+
+/// Minimum interval between broadcasts, in CNTFRQ ticks. Scaled at
+/// run time in `maybeBroadcastSchedTick` from the counter frequency
+/// so the guaranteed preemption cadence matches the 2 ms scheduler
+/// timeslice regardless of host CNTFRQ.
+const BCAST_INTERVAL_NS: u64 = 2_000_000;
+
+/// Broadcast a scheduler tick SGI to every core except the caller.
+///
+/// Pi 5 KVM's in-kernel vGICv2 silently drops per-core PPI timer
+/// injections (both CNTV PPI 27 and CNTP PPI 30) to secondary vCPUs
+/// as soon as they dispatch an EL0 thread — see the extended note on
+/// `sendIpiToCore` above and the one in `kernel/arch/aarch64/timers.zig`.
+/// Switching from CNTV to CNTP fixed BSP ticking but secondaries still
+/// never see the timer PPI on Pi KVM. Cross-core SGIs ARE reliably
+/// delivered, so this routine rides the BSP's working CNTP tick out to
+/// every other core via a dedicated SGI INTID (`SGI_BCAST_TICK`). The
+/// dispatcher for that INTID (exceptions.zig) simply runs
+/// `schedTimerHandler` on the receiving core, giving each secondary a
+/// preemption tick at the BSP's cadence (~500 Hz / 2 ms timeslice).
+///
+/// Dedicated INTID is critical: prior attempts broadcast SGI 0 (the
+/// scheduler IPI / yield / cross-core wake vector) on every BSP tick
+/// and stormed the IPC reply path, regressing §3.3.7 / §2.2.34. A
+/// distinct SGI with a tick-only handler keeps the IPC SGI path
+/// untouched.
+///
+/// GICv3: write ICC_SGI1R_EL1 with IRM=1 ("interrupts routed to all
+/// PEs in the system, excluding the PE that requested the
+/// interrupt"). IHI 0069H §12.11.8.
+///
+/// GICv2: write GICD_SGIR with TargetListFilter=0b01 ("forward the
+/// interrupt to all CPU interfaces except that of the processor that
+/// requested the interrupt"). IHI 0048B §4.3.15.
+pub fn broadcastSchedTick() void {
+    const sgi_id: u64 = SGI_BCAST_TICK & 0xF;
+    if (gicv3) {
+        // IRM bit 40 = 1: all-except-self.
+        const irm_bit: u64 = @as(u64, 1) << 40;
+        const sgi_val: u64 = (sgi_id << 24) | irm_bit;
+        writeIccSgi1r(sgi_val);
+    } else {
+        // TargetListFilter = 0b01 in bits [25:24]: all-except-self.
+        const tlf: u32 = 0b01 << 24;
+        const sgir_val: u32 = @as(u32, @intCast(sgi_id)) | tlf;
+        gicdWrite(.sgir, sgir_val);
+    }
+}
+
+/// Rate-limited `broadcastSchedTick`. Only fires if at least
+/// `BCAST_INTERVAL_NS` (≈2 ms, matching `SCHED_TIMESLICE_NS`) has
+/// elapsed since the last broadcast. Uses CNTPCT_EL0 directly (ARM
+/// ARM D13.11.15) rather than the monotonic clock abstraction so it
+/// is safe to call from early-boot / IRQ contexts before the arch
+/// timer vtable is live, and to keep the check branchless and
+/// lock-free.
+///
+/// The rate limiter is a single global `next_bcast_tick` advanced via
+/// compare-exchange: callers read CNTPCT, attempt to CAS
+/// `next_bcast_tick` from its current value to `cntpct + interval`,
+/// and only issue the SGI if the CAS wins. Concurrent callers on
+/// different cores therefore produce at most one broadcast per
+/// interval. Relaxed memory ordering is fine because the SGI itself
+/// carries no payload and the receiving core re-reads per-core state
+/// under its own locks in `schedTimerHandler`.
+pub fn maybeBroadcastSchedTick() void {
+    // Gate the broadcast to GICv2 only. The workaround targets Pi 5
+    // KVM vGICv2's per-core PPI injection drop, which is specific to
+    // that stack — TCG GICv3 and bare-metal GICv3 deliver CNTP PPI 30
+    // reliably to every core, so the extra SGI just perturbs timing
+    // without fixing anything (observed as an s2_2_34 regression on
+    // TCG GICv3: the 2 ms-rate SGI 7 raised helper iteration counts
+    // above the 10k ceiling even though preempt-on-wake still worked
+    // correctly via SGI 0). Restricting to GICv2 keeps the intent of
+    // the workaround surgical.
+    if (gicv3) return;
+    var cntfrq: u64 = undefined;
+    asm volatile ("mrs %[v], cntfrq_el0"
+        : [v] "=r" (cntfrq),
+    );
+    if (cntfrq == 0) return;
+    var cntpct: u64 = undefined;
+    asm volatile ("mrs %[v], cntpct_el0"
+        : [v] "=r" (cntpct),
+    );
+    const interval_ticks: u64 = (BCAST_INTERVAL_NS * cntfrq) / 1_000_000_000;
+    while (true) {
+        const current = @atomicLoad(u64, &next_bcast_tick, .monotonic);
+        if (cntpct < current) return;
+        const new_val = cntpct +| interval_ticks;
+        if (@cmpxchgWeak(u64, &next_bcast_tick, current, new_val, .monotonic, .monotonic) == null) {
+            broadcastSchedTick();
+            return;
+        }
     }
 }
 

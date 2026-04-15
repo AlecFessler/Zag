@@ -341,15 +341,53 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
             _ = unpinExclusive(preempted);
         } else {
             const pinned_core = @ctz(preempted.core_affinity orelse 0);
-            if (pinned_core == core_id) {
+            // §2.2.33: a pinned thread that has blocked (futex/IPC recv) or
+            // faulted/suspended temporarily releases its pinned core so other
+            // threads can run there. Only the still-runnable (.running /
+            // .ready) pinned thread keeps the non-preemption fast path. When
+            // the thread later wakes, the wake path re-enqueues it on its
+            // pinned core via `enqueueOnCore`, which sends an IPI; the
+            // scheduler handler on that core then sees `state.pinned_thread`
+            // with state == .ready and preempts back to it (§2.2.34).
+            const runnable = preempted.state == .running or preempted.state == .ready;
+            if (pinned_core == core_id and runnable) {
                 maybeExpireTimedWaiters(core_id);
                 armSchedTimer(state, SCHED_TIMESLICE_NS);
                 return;
             }
+            if (pinned_core == core_id) {
+                // Pinned thread non-runnable on its own pinned core —
+                // release the core so other threads can run here. Do NOT
+                // re-enqueue `preempted`; the wake/unblock path puts it
+                // back when its state flips to .ready.
+                preempted.ctx = ctx.thread_ctx;
+                preempted.on_cpu.store(false, .release);
+
+                state.rq_lock.lock();
+                var next = state.rq.dequeue();
+                if (next == null) {
+                    state.rq_lock.unlock();
+                    next = tryStealWork(core_id);
+                    state.rq_lock.lock();
+                }
+                if (next == null) {
+                    next = state.idle_thread;
+                }
+                const next_thread = next.?;
+                next_thread.state = .running;
+                next_thread.on_cpu.store(true, .release);
+                state.running_thread = next_thread;
+                state.rq_lock.unlock();
+                maybeExpireTimedWaiters(core_id);
+                armSchedTimer(state, SCHED_TIMESLICE_NS);
+                if (next_thread == preempted) return;
+                switchToWithPmu(preempted, next_thread);
+                return;
+            }
             preempted.ctx = ctx.thread_ctx;
             preempted.on_cpu.store(false, .release);
-            preempted.state = .ready;
-            enqueueOnCore(pinned_core, preempted);
+            if (preempted.state == .running) preempted.state = .ready;
+            if (preempted.state == .ready) enqueueOnCore(pinned_core, preempted);
             state.rq_lock.lock();
             var next = state.rq.dequeue();
             if (next == null) {

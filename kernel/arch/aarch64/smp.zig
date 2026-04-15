@@ -279,49 +279,26 @@ fn createIdentityMapping(trampoline_pa: u64) !u64 {
 /// its MMU before accessing kernel VA code.
 ///
 pub fn smpInit() !void {
-    arch.earlyDebugChar('S');
-    arch.earlyDebugChar('m');
-    arch.earlyDebugChar('p');
     try smpInitFull();
 }
 
 fn smpInitFull() !void {
     const core_count = gic.coreCount();
-    arch.earlyDebugChar('c');
-    arch.earlyDebugChar('=');
-    arch.earlyDebugChar('0' + @as(u8, @intCast(core_count & 0xF)));
-
-    arch.earlyDebugChar('a');
     const pmm_iface = pmm.global_pmm.?.allocator();
-    arch.earlyDebugChar('b');
 
     // Resolve the trampoline's physical address. secondaryEntry is linked at
     // a kernel VA (TTBR1 range) — walk the kernel page tables to find the PA
     // that PSCI needs for the entry_point argument.
     const entry_vaddr = @intFromPtr(&secondaryEntry);
-    arch.earlyDebugChar('c');
-    arch.earlyDebugHex(entry_vaddr);
     const entry_page_paddr = arch.resolveVaddr(
         memory_init.kernel_addr_space_root,
         VAddr.fromInt(entry_vaddr),
-    ) orelse {
-        arch.earlyDebugChar('!');
-        arch.earlyDebugChar('R');
-        return;
-    };
+    ) orelse return;
     const entry_paddr = entry_page_paddr.addr | (entry_vaddr & 0xFFF);
-    arch.earlyDebugChar('d');
-    arch.earlyDebugHex(entry_paddr);
 
     // Create a minimal identity mapping so the trampoline can still execute
     // after enabling the MMU (TTBR0 maps the trampoline PA as VA == PA).
-    const idmap_ttbr0 = createIdentityMapping(entry_paddr) catch {
-        arch.earlyDebugChar('!');
-        arch.earlyDebugChar('I');
-        return;
-    };
-    arch.earlyDebugChar('e');
-    arch.earlyDebugHex(idmap_ttbr0);
+    const idmap_ttbr0 = createIdentityMapping(entry_paddr) catch return;
 
     // Resolve the PA of the static boot params struct by walking the
     // kernel page tables. This avoids relying on physmap VA→PA arithmetic
@@ -330,25 +307,32 @@ fn smpInitFull() !void {
     const params_page_paddr = arch.resolveVaddr(
         memory_init.kernel_addr_space_root,
         VAddr.fromInt(params_vaddr),
-    ) orelse {
-        arch.earlyDebugChar('!');
-        arch.earlyDebugChar('P');
-        return;
-    };
+    ) orelse return;
     boot_params_pa = params_page_paddr.addr | (params_vaddr & 0xFFF);
-    arch.earlyDebugChar('f');
-    arch.earlyDebugHex(boot_params_pa);
 
     // Capture BSP system register state for secondaries.
+    //
+    // The TTBR1 page-table hierarchy lives in kernel memory and has been
+    // touched by the BSP under its live MMU with TCR walker attrs
+    // IRGN1/ORGN1 = Normal WB cacheable. Those dirty lines sit in the
+    // BSP's caches and are *not* guaranteed to be visible to a freshly
+    // powered secondary whose HW table walker does a cached fetch —
+    // especially on TCG, which models inner-shareable snoop only
+    // loosely. Force the secondary's walker to bypass caches entirely
+    // by clearing IRGN1/ORGN1/IRGN0/ORGN0 and SH0/SH1 so the tables are
+    // read directly from the PoC. The TCR the BSP keeps running under
+    // is unchanged. ARM ARM D13.2.131 — TCR_EL1.{IRGN,ORGN,SH}.
     boot_params_storage.ttbr0 = idmap_ttbr0;
     boot_params_storage.ttbr1 = aarch64_paging.readTtbr1();
-    boot_params_storage.tcr = readTcr();
+    var tcr_for_ap: u64 = readTcr();
+    // IRGN0/ORGN0/SH0 at bits [13:8], IRGN1/ORGN1/SH1 at bits [29:24].
+    tcr_for_ap &= ~@as(u64, (0x3F << 8) | (0x3F << 24));
+    // Leave SH=0 (non-shareable), IRGN/ORGN=0b00 (Normal NC).
+    boot_params_storage.tcr = tcr_for_ap;
     boot_params_storage.mair = readMair();
     boot_params_storage.sctlr = readSctlr();
     boot_params_storage.entry = @intFromPtr(&secondarySetup);
     boot_params_storage.vbar = readVbar();
-    arch.earlyDebugChar('g');
-    arch.earlyDebugHex(boot_params_storage.entry);
 
     // Flush the params to main memory so the secondary can read them
     // with MMU off. DC CVAC cleans the cache line to the Point of Coherency.
@@ -369,24 +353,18 @@ fn smpInitFull() !void {
 
     var core_idx: usize = 1;
     while (core_idx < core_count) {
-        arch.earlyDebugChar('L');
-        arch.earlyDebugChar('0' + @as(u8, @intCast(core_idx & 0xF)));
         const target_mpidr = getMpidr(core_idx);
-        arch.earlyDebugChar('M');
 
         // Allocate a kernel stack for this secondary core.
         const ap_stack = stack_mod.createKernel() catch {
-            arch.earlyDebugChar('!');
             core_idx += 1;
             continue;
         };
-        arch.earlyDebugChar('N');
 
         // Map physical pages for the stack.
         var page_addr = ap_stack.base.addr;
         var map_ok = true;
         while (page_addr < ap_stack.top.addr) {
-            arch.earlyDebugChar('.');
             const kpage = pmm_iface.create(paging.PageMem(.page4k)) catch {
                 map_ok = false;
                 break;
@@ -431,16 +409,7 @@ fn smpInitFull() !void {
         // DEN0022D, Section 5.1.4: CPU_ON — context_id (x3) is passed to the
         // target core in x0. We pass the PA of the boot params struct.
         const expected = cores_online.load(.acquire);
-        arch.earlyDebugChar('[');
-        arch.earlyDebugChar('0' + @as(u8, @intCast(core_idx & 0xF)));
-        arch.earlyDebugChar('m');
-        arch.earlyDebugHex(target_mpidr);
-        arch.earlyDebugChar('e');
-        arch.earlyDebugHex(entry_paddr);
         const ret = power.cpuOn(target_mpidr, entry_paddr, boot_params_pa);
-        arch.earlyDebugChar('r');
-        arch.earlyDebugHex(@as(u64, @bitCast(ret)));
-        arch.earlyDebugChar(']');
 
         if (ret != 0) {
             // CPU_ON failed — clean up the stack.
@@ -459,8 +428,6 @@ fn smpInitFull() !void {
         const max_spins: u64 = 500_000;
         while (cores_online.load(.acquire) == expected) {
             if (spin_count >= max_spins) {
-                arch.earlyDebugChar('!');
-                arch.earlyDebugChar('T');
                 stack_mod.destroyKernel(ap_stack, memory_init.kernel_addr_space_root);
                 break;
             }
@@ -478,28 +445,73 @@ fn smpInitFull() !void {
 /// physical address of SecondaryBootParams (passed as context_id).
 ///
 /// DEN0022D, Section 5.1.4: The target core begins execution at the entry
-/// point address with context_id in x0, in AArch64 EL1 with MMU off.
+/// point address with context_id in x0, in AArch64 at the caller's EL
+/// with MMU off. On QEMU `-M virt,virtualization=on`, CPU_ON ignores the
+/// caller EL and delivers the secondary at EL2 even when the BSP called
+/// from EL1; the trampoline detects EL2 at entry and drops to EL1h via
+/// ERET before programming any EL1 sysreg.
 ///
 /// The trampoline:
-/// 1. Loads all boot params from the struct at PA in x0.
-/// 2. Configures MAIR, TCR, TTBR0 (identity mapping), TTBR1 (kernel).
-/// 3. Enables the MMU via SCTLR_EL1.
-/// 4. Installs VBAR_EL1, sets SP, and branches to secondarySetup at kernel VA.
+/// 1. Drops to EL1h if still at EL2.
+/// 2. Loads all boot params from the struct at PA in x0.
+/// 3. Configures MAIR, TCR, TTBR0 (identity mapping), TTBR1 (kernel),
+///    VBAR, TLB, CPACR, I-cache.
+/// 4. Enables the MMU via SCTLR_EL1.
+/// 5. Sets SP and branches to secondarySetup at its kernel VA.
 fn secondaryEntry() callconv(.naked) noreturn {
     asm volatile (
-    // x0 = PA of SecondaryBootParams (from PSCI context_id)
+    // x0 = PA of SecondaryBootParams (from PSCI context_id).
     // MMU is off — all memory access uses physical addresses and is
     // treated as Normal Non-Cacheable (ARM ARM D5.2.9).
     //
-    // Debug: PL011 UART at PA 0x09000000 (QEMU virt machine).
-        \\mov x10, #0x09000000
-        \\mov w11, #0x61             // 'a' — trampoline entered
-        \\str w11, [x10]
-        \\
-        // Mask DAIF: SError, IRQ, FIQ, Debug. We do not want any
-        // spurious interrupt delivered while the MMU is off and
-        // VBAR still points where firmware left it.
+    // Mask DAIF (SError, IRQ, FIQ, Debug). We do not want any
+    // interrupt delivered while the MMU is off and VBAR still
+    // points where firmware left it.
         \\msr daifset, #0xF
+        \\
+        // PSCI CPU_ON is *supposed* to bring the target CPU up at
+        // the same EL as the caller (DEN0022D §5.1.4), but on QEMU's
+        // `-M virt,virtualization=on` the PSCI firmware brings
+        // secondaries online at EL2 regardless of caller EL — the
+        // BSP transitioned EL2→EL1 inside the bootloader before
+        // calling CPU_ON, so each secondary now lands at EL2 while
+        // our sysreg programming below (SCTLR_EL1, TTBR*_EL1,
+        // TCR_EL1, …) configures stage-1 translation for EL1&0. If
+        // we stay at EL2 the EL1 MMU is never consulted, and the BR
+        // to a TTBR1 kernel VA data-aborts at EL2 into VBAR_EL2=0
+        // with no vector installed (and no output). Detect EL2 at
+        // entry and ERET down to EL1h before touching any EL1
+        // sysreg. ARM ARM D1.9 — SPSR_EL2 / ELR_EL2; D13.2.48 —
+        // HCR_EL2.RW; D13.2.27 — CNTHCTL_EL2; D13.2.33 — CPTR_EL2.
+        \\mrs x12, CurrentEL
+        \\lsr x12, x12, #2
+        \\cmp x12, #2
+        \\b.ne 1f
+        \\
+        // HCR_EL2.RW=1 so EL1 runs AArch64.
+        \\mov x12, #(1 << 31)
+        \\msr hcr_el2, x12
+        \\
+        // Let EL1 access the physical counter/timer without trapping.
+        \\mrs x12, cnthctl_el2
+        \\orr x12, x12, #(3 << 0)
+        \\msr cnthctl_el2, x12
+        \\msr cntvoff_el2, xzr
+        \\
+        // Don't trap FP/SIMD to EL2.
+        \\mov x12, #0x33ff
+        \\msr cptr_el2, x12
+        \\msr hstr_el2, xzr
+        \\
+        // ELR_EL2 = label 1f (next instruction after the ERET).
+        // SPSR_EL2 = EL1h with DAIF masked (0x3c5).
+        \\adr x12, 1f
+        \\msr elr_el2, x12
+        \\mov x12, #0x3c5
+        \\msr spsr_el2, x12
+        \\isb
+        \\eret
+        \\1:
         \\
     // Load all params into registers before touching system registers.
     // SecondaryBootParams layout: ttbr0(0), ttbr1(8), tcr(16), mair(24),
@@ -509,8 +521,6 @@ fn secondaryEntry() callconv(.naked) noreturn {
         \\ldp x5, x6, [x0, #32]
         \\ldp x7, x8, [x0, #48]
         \\ldr x9, [x0, #64]
-        \\mov w11, #0x62             // 'b' — params loaded
-        \\str w11, [x10]
         \\
         // Configure memory attributes (ARM ARM D13.2.97).
         \\msr mair_el1, x4
@@ -524,8 +534,9 @@ fn secondaryEntry() callconv(.naked) noreturn {
         \\msr ttbr0_el1, x1
         \\msr ttbr1_el1, x2
         \\
-        // Install exception vectors before enabling the MMU so any
-        // fault during the MMU-enable window lands somewhere sane.
+        // Install the kernel's EL1 exception vector so any fault
+        // after MMU enable is reported via the normal kernel vector
+        // table. ARM ARM D13.2.143 — VBAR_EL1.
         \\msr vbar_el1, x9
         \\isb
         \\
@@ -535,40 +546,35 @@ fn secondaryEntry() callconv(.naked) noreturn {
         \\dsb nsh
         \\isb
         \\
-        \\mov w11, #0x63             // 'c' — sysregs primed
-        \\str w11, [x10]
-        \\
         // Enable Advanced SIMD / FP at EL0 + EL1 (CPACR_EL1.FPEN = 0b11).
         // PSCI CPU_ON hands the secondary off with CPACR_EL1 at its reset
-        // value (on real ARM hardware, this traps all FP/SIMD). LLVM emits
-        // q-register loads for ordinary 16-byte struct copies inside Zig
-        // code (e.g. reading an `?u64` global), so the first Zig call
-        // after `br x7` would otherwise hit a silent EL1→EL1 trap the
-        // kernel has no handler for. Setting FPEN here — while we are
-        // still in the MMU-off asm trampoline — ensures every kernel-VA
-        // instruction on the secondary can use FP/SIMD freely, matching
-        // the BSP (which inherits FPEN from UEFI firmware).
+        // value (on real hardware this traps all FP/SIMD). LLVM emits
+        // q-register accesses for ordinary 16-byte struct copies inside
+        // Zig code, so FPEN must be on before any kernel-VA Zig call.
         // ARM ARM D13.2.30 — CPACR_EL1, bits [21:20].
         \\mrs x12, cpacr_el1
         \\orr x12, x12, #(3 << 20)
         \\msr cpacr_el1, x12
         \\isb
         \\
+        // Invalidate local I-cache so any stale lines from PSCI reset
+        // do not shadow the freshly-programmed page tables once the
+        // MMU turns on. ARM ARM D8.11.1 — IC IALLU affects only the
+        // local PE.
+        \\ic iallu
+        \\dsb ish
+        \\isb
+        \\
         // Enable MMU. SCTLR_EL1 from the BSP already has M|C|I set.
-        // The identity mapping in TTBR0 ensures the next instruction
-        // fetch succeeds at the same PA after translation is enabled.
         \\msr sctlr_el1, x5
         \\isb
-        \\mov w11, #0x66             // 'f' — MMU enabled
-        \\str w11, [x10]
         \\
         // MMU is on. PC is still at the trampoline's PA, which is
-        // identity-mapped via TTBR0. Set the kernel stack and jump
-        // to the kernel VA entry.
+        // identity-mapped via TTBR0. Set the kernel stack, place the
+        // core index in x0 for the C-ABI call, and branch to
+        // secondarySetup at its kernel VA (resolved via TTBR1).
         \\mov sp, x6
         \\mov x0, x8
-        \\mov w11, #0x67             // 'g' — about to jump to VA
-        \\str w11, [x10]
         \\br x7
     );
 }
@@ -581,11 +587,9 @@ fn secondarySetup(core_idx: u64) callconv(.c) noreturn {
 
     // Signal to the BSP that this core is online.
     _ = cores_online.fetchAdd(1, .release);
-    arch.earlyDebugChar('^');
 
     // Initialize per-core scheduler state (idle thread, running thread).
     sched.perCoreInit();
-    arch.earlyDebugChar('&');
 
     // Enter the idle loop.
     cpu.halt();
