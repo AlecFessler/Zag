@@ -165,9 +165,6 @@ fn exceptionHandler(ctx: *cpu.Context) void {
         if (exceptionFaultReason(vector)) |reason| {
             const thread = scheduler.currentThread() orelse
                 @panic("user exception with no current thread");
-            arch.print("K: EXCEPTION pid={d} vec={d} err=0x{x}\n", .{
-                thread.process.pid, vector, ctx.err_code,
-            });
             if (thread.process.faultBlock(thread, reason, ctx.rip, ctx.rip, ctx)) {
                 arch.enableInterrupts();
                 scheduler.yield();

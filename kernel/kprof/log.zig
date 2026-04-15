@@ -31,7 +31,7 @@ const Record = record_mod.Record;
 pub const MAX_CPUS: usize = 4;
 
 /// Bytes per per-CPU log.
-pub const LOG_SIZE_BYTES: usize = 4 * 1024 * 1024;
+pub const LOG_SIZE_BYTES: usize = 256 * 1024;
 pub const RECORDS_PER_LOG: usize = LOG_SIZE_BYTES / @sizeOf(Record);
 
 /// Inline BSS backing for every per-CPU log. Zero bytes when profiling

@@ -419,6 +419,14 @@ pub inline fn kprofTraceCountersRead(out: *[3]u64) void {
 /// preload value, the counter wrapped past 2^48 and fired an NMI that
 /// belongs to kprof; in that case we rearm with a fresh preload and
 /// return true. Otherwise the NMI is for someone else.
+///
+/// The LAPIC auto-sets the LVT PerfMon mask bit (bit 16) when it
+/// delivers a PerfMon interrupt (Intel SDM Vol 3 §10.5.1 — AMD LAPIC
+/// is Intel-compatible). If the handler only writes the counter MSR
+/// and never touches the LVT entry, exactly one NMI fires per core
+/// and subsequent overflows are silently masked. We re-write the LVT
+/// entry here on every rearm to clear the mask and keep the overflow
+/// interrupt live.
 pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
     const span: u64 = @as(u64, 1) << AMD_COUNTER_BITS;
     const clamped = if (period_cycles == 0 or period_cycles >= span) span - 1 else period_cycles;
@@ -428,6 +436,19 @@ pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
     if (val >= preload) return false;
 
     cpu.wrmsr(perfctrMsr(KPROF_SAMPLE_PMC), preload);
+
+    // Clear the auto-set LVT PerfMon mask bit by re-writing the LVT
+    // entry with NMI delivery and no mask.
+    const NMI_DELIVERY: u32 = 0b100 << 8;
+    const lvt: u32 = @as(u32, PMI_VECTOR) | NMI_DELIVERY;
+    if (apic.x2_apic) {
+        cpu.wrmsr(
+            @intFromEnum(apic.X2ApicMsr.local_vector_table_performance_monitor_register),
+            @as(u64, lvt),
+        );
+    } else {
+        apic.writeReg(.lvt_perf_monitoring_counters_reg, lvt);
+    }
     return true;
 }
 
