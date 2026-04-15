@@ -21,7 +21,7 @@ pub fn main(pv: u64) void {
     for (0..128) |i| {
         if (view[i].handle == handle and
             (view[i].entry_type == perm_view.ENTRY_TYPE_PROCESS or
-             view[i].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS))
+                view[i].entry_type == perm_view.ENTRY_TYPE_DEAD_PROCESS))
         {
             found = true;
             break;

@@ -1,7 +1,6 @@
 /// hyprvOS — Minimal VMM for booting Linux on Zag.
 /// Creates a VM with 1 vCPU, loads bzImage + initramfs from NVMe,
 /// and handles VM exits to boot a Linux guest.
-
 const lib = @import("lib");
 
 const acpi = @import("acpi.zig");
@@ -32,21 +31,52 @@ pub const SegmentReg = extern struct {
 };
 
 pub const GuestState = extern struct {
-    rax: u64 = 0, rbx: u64 = 0, rcx: u64 = 0, rdx: u64 = 0,
-    rsi: u64 = 0, rdi: u64 = 0, rbp: u64 = 0, rsp: u64 = 0,
-    r8: u64 = 0, r9: u64 = 0, r10: u64 = 0, r11: u64 = 0,
-    r12: u64 = 0, r13: u64 = 0, r14: u64 = 0, r15: u64 = 0,
-    rip: u64 = 0, rflags: u64 = 0x2,
-    cr0: u64 = 0, cr2: u64 = 0, cr3: u64 = 0, cr4: u64 = 0,
-    cs: SegmentReg = .{}, ds: SegmentReg = .{}, es: SegmentReg = .{},
-    fs: SegmentReg = .{}, gs: SegmentReg = .{}, ss: SegmentReg = .{},
-    tr: SegmentReg = .{}, ldtr: SegmentReg = .{},
-    gdtr_base: u64 = 0, gdtr_limit: u32 = 0,
-    idtr_base: u64 = 0, idtr_limit: u32 = 0,
-    efer: u64 = 0, star: u64 = 0, lstar: u64 = 0, cstar: u64 = 0,
-    sfmask: u64 = 0, kernel_gs_base: u64 = 0,
-    sysenter_cs: u64 = 0, sysenter_esp: u64 = 0, sysenter_eip: u64 = 0,
-    pat: u64 = 0x0007040600070406, dr6: u64 = 0xFFFF0FF0, dr7: u64 = 0x400,
+    rax: u64 = 0,
+    rbx: u64 = 0,
+    rcx: u64 = 0,
+    rdx: u64 = 0,
+    rsi: u64 = 0,
+    rdi: u64 = 0,
+    rbp: u64 = 0,
+    rsp: u64 = 0,
+    r8: u64 = 0,
+    r9: u64 = 0,
+    r10: u64 = 0,
+    r11: u64 = 0,
+    r12: u64 = 0,
+    r13: u64 = 0,
+    r14: u64 = 0,
+    r15: u64 = 0,
+    rip: u64 = 0,
+    rflags: u64 = 0x2,
+    cr0: u64 = 0,
+    cr2: u64 = 0,
+    cr3: u64 = 0,
+    cr4: u64 = 0,
+    cs: SegmentReg = .{},
+    ds: SegmentReg = .{},
+    es: SegmentReg = .{},
+    fs: SegmentReg = .{},
+    gs: SegmentReg = .{},
+    ss: SegmentReg = .{},
+    tr: SegmentReg = .{},
+    ldtr: SegmentReg = .{},
+    gdtr_base: u64 = 0,
+    gdtr_limit: u32 = 0,
+    idtr_base: u64 = 0,
+    idtr_limit: u32 = 0,
+    efer: u64 = 0,
+    star: u64 = 0,
+    lstar: u64 = 0,
+    cstar: u64 = 0,
+    sfmask: u64 = 0,
+    kernel_gs_base: u64 = 0,
+    sysenter_cs: u64 = 0,
+    sysenter_esp: u64 = 0,
+    sysenter_eip: u64 = 0,
+    pat: u64 = 0x0007040600070406,
+    dr6: u64 = 0xFFFF0FF0,
+    dr7: u64 = 0x400,
     pending_eventinj: u64 = 0,
 };
 
@@ -75,12 +105,12 @@ const REPLY_KILL: u64 = 4;
 
 // Tiny test guest: CPUID → serial "Hi\n" → HLT
 const tiny_guest = [_]u8{
-    0x0F, 0xA2,             // CPUID
-    0xBA, 0xF8, 0x03,       // MOV DX, 0x3F8
-    0xB0, 0x48, 0xEE,       // MOV AL, 'H'; OUT DX, AL
-    0xB0, 0x69, 0xEE,       // MOV AL, 'i'; OUT DX, AL
-    0xB0, 0x0A, 0xEE,       // MOV AL, '\n'; OUT DX, AL
-    0xF4,                   // HLT
+    0x0F, 0xA2, // CPUID
+    0xBA, 0xF8, 0x03, // MOV DX, 0x3F8
+    0xB0, 0x48, 0xEE, // MOV AL, 'H'; OUT DX, AL
+    0xB0, 0x69, 0xEE, // MOV AL, 'i'; OUT DX, AL
+    0xB0, 0x0A, 0xEE, // MOV AL, '\n'; OUT DX, AL
+    0xF4, // HLT
 };
 
 // Global buffers (must not be on stack — Debug mode stack probes overflow 32KB)
@@ -106,12 +136,21 @@ pub fn main(pv: u64) void {
 
     // Create VM with empty policy
     const cr = syscall.vm_create(1, @intFromPtr(&policy_buf));
-    if (cr == syscall.E_NODEV) { log.print("No virt support\n"); syscall.shutdown(); }
-    if (cr < 0) { log.print("vm_create failed\n"); syscall.shutdown(); }
+    if (cr == syscall.E_NODEV) {
+        log.print("No virt support\n");
+        syscall.shutdown();
+    }
+    if (cr < 0) {
+        log.print("vm_create failed\n");
+        syscall.shutdown();
+    }
     vm_handle = @bitCast(cr);
 
     const vcpu = findVcpuHandle(pv);
-    if (vcpu == 0) { log.print("No vCPU\n"); syscall.shutdown(); }
+    if (vcpu == 0) {
+        log.print("No vCPU\n");
+        syscall.shutdown();
+    }
 
     // Init host serial for RX bridging
     serial.init(pv);
@@ -397,7 +436,6 @@ noinline fn exitLoop(_: u64) void {
 
         const kill = handleTag(tag, gs);
 
-
         if (kill) {
             @as(*align(1) u64, @ptrCast(&reply_buf)).* = REPLY_KILL;
             _ = syscall.vm_reply_action(vm_handle, @bitCast(tok), @intFromPtr(&reply_buf));
@@ -441,9 +479,7 @@ noinline fn handleTag(tag: u8, gs: *GuestState) bool {
             io.handleOut(port, size, value, gs);
         } else {
             const v = io.handleIn(port, size, gs);
-            if (size == 1) gs.rax = (gs.rax & ~@as(u64, 0xFF)) | @as(u64, v & 0xFF)
-            else if (size == 2) gs.rax = (gs.rax & ~@as(u64, 0xFFFF)) | @as(u64, v & 0xFFFF)
-            else gs.rax = v;
+            if (size == 1) gs.rax = (gs.rax & ~@as(u64, 0xFF)) | @as(u64, v & 0xFF) else if (size == 2) gs.rax = (gs.rax & ~@as(u64, 0xFFFF)) | @as(u64, v & 0xFFFF) else gs.rax = v;
         }
         // Advance RIP using next_rip from SVM EXITINFO2
         // AMD APM Vol 2, Section 15.10.2: EXITINFO2 = next sequential RIP for IOIO exits
@@ -476,7 +512,11 @@ noinline fn handleTag(tag: u8, gs: *GuestState) bool {
             }
         } else {
             const v = switch (cr_num) {
-                0 => gs.cr0, 2 => gs.cr2, 3 => gs.cr3, 4 => gs.cr4, else => 0,
+                0 => gs.cr0,
+                2 => gs.cr2,
+                3 => gs.cr3,
+                4 => gs.cr4,
+                else => 0,
             };
             writeGpr(gs, gpr, v);
         }
@@ -565,10 +605,22 @@ fn findVcpuHandle(pv: u64) u64 {
 
 fn writeGpr(s: *GuestState, gpr: u4, val: u64) void {
     switch (gpr) {
-        0 => s.rax = val, 1 => s.rcx = val, 2 => s.rdx = val, 3 => s.rbx = val,
-        4 => s.rsp = val, 5 => s.rbp = val, 6 => s.rsi = val, 7 => s.rdi = val,
-        8 => s.r8 = val, 9 => s.r9 = val, 10 => s.r10 = val, 11 => s.r11 = val,
-        12 => s.r12 = val, 13 => s.r13 = val, 14 => s.r14 = val, 15 => s.r15 = val,
+        0 => s.rax = val,
+        1 => s.rcx = val,
+        2 => s.rdx = val,
+        3 => s.rbx = val,
+        4 => s.rsp = val,
+        5 => s.rbp = val,
+        6 => s.rsi = val,
+        7 => s.rdi = val,
+        8 => s.r8 = val,
+        9 => s.r9 = val,
+        10 => s.r10 = val,
+        11 => s.r11 = val,
+        12 => s.r12 = val,
+        13 => s.r13 = val,
+        14 => s.r14 = val,
+        15 => s.r15 = val,
     }
 }
 
@@ -582,11 +634,11 @@ fn writeU64(buf: []u8, off: usize, val: u64) void {
     @as(*align(1) u64, @ptrCast(buf.ptr + off)).* = val;
 }
 fn rdU16(buf: []const u8, off: usize) u16 {
-    return @as(*const align(1) u16, @ptrCast(buf.ptr + off)).*;
+    return @as(*align(1) const u16, @ptrCast(buf.ptr + off)).*;
 }
 fn rdU32(buf: []const u8, off: usize) u32 {
-    return @as(*const align(1) u32, @ptrCast(buf.ptr + off)).*;
+    return @as(*align(1) const u32, @ptrCast(buf.ptr + off)).*;
 }
 fn rdU64(buf: []const u8, off: usize) u64 {
-    return @as(*const align(1) u64, @ptrCast(buf.ptr + off)).*;
+    return @as(*align(1) const u64, @ptrCast(buf.ptr + off)).*;
 }

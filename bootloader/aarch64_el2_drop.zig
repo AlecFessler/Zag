@@ -205,8 +205,7 @@ pub fn allocateHypVectorStub(bs: *uefi.tables.BootServices) !u64 {
         :
         : [base] "r" (@intFromPtr(page_ptr)),
           [end] "r" (@intFromPtr(page_ptr) + 0x1000),
-        : .{ .memory = true, .x0 = true, .x1 = true }
-    );
+        : .{ .memory = true, .x0 = true, .x1 = true });
 
     return @intFromPtr(page_ptr);
 }
@@ -424,6 +423,5 @@ pub fn dropToEl1(hyp_vbar: u64) void {
         :
         : [hyp_vbar] "r" (hyp_vbar),
           [hyp_sp_top] "r" (hyp_sp_top),
-        : .{ .memory = true, .x9 = true, .x10 = true, .x11 = true }
-    );
+        : .{ .memory = true, .x9 = true, .x10 = true, .x11 = true });
 }

@@ -361,4 +361,3 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
 
     return E_OK;
 }
-

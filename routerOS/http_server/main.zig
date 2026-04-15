@@ -514,8 +514,6 @@ fn sendSoapFault(code: []const u8, desc: []const u8) void {
     sendHttpResponse("500 Internal Server Error", "text/xml; charset=\"utf-8\"", buf[0..p]);
 }
 
-
-
 fn containsStr(haystack: []const u8, needle: []const u8) bool {
     if (haystack.len < needle.len) return false;
     var i: usize = 0;

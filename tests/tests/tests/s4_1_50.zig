@@ -46,9 +46,7 @@ pub fn main(pv: u64) void {
                 syscall.shutdown();
             }
             if (reason != perm_view.CrashReason.pmu_overflow) {
-                t.failWithVal("§4.1.50 wrong crash reason",
-                    @intFromEnum(perm_view.CrashReason.pmu_overflow),
-                    @intFromEnum(reason));
+                t.failWithVal("§4.1.50 wrong crash reason", @intFromEnum(perm_view.CrashReason.pmu_overflow), @intFromEnum(reason));
                 syscall.shutdown();
             }
             t.pass("§4.1.50");

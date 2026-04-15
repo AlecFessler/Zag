@@ -8,7 +8,6 @@
 ///     [32..40] initramfs_size (bytes)
 ///   Sector 1+: bzImage data
 ///   After bzImage: initramfs data
-
 const lib = @import("lib");
 
 const log = @import("log.zig");
@@ -120,5 +119,5 @@ pub fn loadToGuest(disk_offset: u64, size: u64, guest_phys: u64) bool {
 }
 
 fn readU64(buf: [*]const u8, offset: usize) u64 {
-    return @as(*const align(1) u64, @ptrCast(buf + offset)).*;
+    return @as(*align(1) const u64, @ptrCast(buf + offset)).*;
 }

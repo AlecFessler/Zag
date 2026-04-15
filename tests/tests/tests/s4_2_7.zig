@@ -71,7 +71,7 @@ pub fn main(pv: u64) void {
     }
 
     // Build a map_memory reply action: tag=3 + struct fields.
-    const action_words: [*]u64 = @alignCast(@ptrCast(&reply_action));
+    const action_words: [*]u64 = @ptrCast(@alignCast(&reply_action));
     action_words[0] = 3; // map_memory variant
     action_words[1] = data_res.val2; // host_vaddr
     action_words[2] = vm_guest.map_req_addr; // guest_addr

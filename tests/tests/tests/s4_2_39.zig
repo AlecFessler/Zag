@@ -55,7 +55,7 @@ pub fn main(pv: u64) void {
     }
 
     // Reply with invalid action type (0xFF).
-    const action_words: [*]u64 = @alignCast(@ptrCast(&reply_action));
+    const action_words: [*]u64 = @ptrCast(@alignCast(&reply_action));
     action_words[0] = 0xFF; // invalid action type
 
     const result = syscall.vm_reply_action(@bitCast(cr), @bitCast(exit_token), @intFromPtr(&reply_action));

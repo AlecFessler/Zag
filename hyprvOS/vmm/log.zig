@@ -1,6 +1,5 @@
 /// Debug logging helpers for hyprvOS VMM.
 /// All output goes to Zag's serial console via the write syscall.
-
 const lib = @import("lib");
 
 const syscall = lib.syscall;

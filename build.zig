@@ -53,7 +53,6 @@ const profiles = struct {
         .use_llvm = true,
         .iommu = "intel",
     };
-
 };
 
 fn getProfile(name: []const u8) ?Profile {
@@ -165,15 +164,14 @@ pub fn build(b: *std.Build) void {
         _ = embedded_wf.addCopyFile(trampoline_output, "trampoline.bin");
     }
     const embedded_bins_mod = b.createModule(.{
-        .root_source_file = embedded_wf.add("embedded_bins.zig",
-            if (arch == .x86_64)
-                \\pub const trampoline = @embedFile("trampoline.bin");
-                \\pub const root_service: []const u8 = &.{};
-                \\
-            else
-                \\pub const trampoline: []const u8 = &.{};
-                \\pub const root_service: []const u8 = &.{};
-                \\
+        .root_source_file = embedded_wf.add("embedded_bins.zig", if (arch == .x86_64)
+            \\pub const trampoline = @embedFile("trampoline.bin");
+            \\pub const root_service: []const u8 = &.{};
+            \\
+        else
+            \\pub const trampoline: []const u8 = &.{};
+            \\pub const root_service: []const u8 = &.{};
+            \\
         ),
         .target = b.resolveTargetQuery(.{
             .cpu_arch = arch,
@@ -304,22 +302,19 @@ pub fn build(b: *std.Build) void {
         const qemu_iommu_args: []const u8 = if (std.mem.eql(u8, iommu_type, "intel"))
             "-device intel-iommu,intremap=off"
         else
-            "-device amd-iommu"
-        ;
+            "-device amd-iommu";
         const qemu_usb_args: []const u8 = if (profile_name != null and std.mem.eql(u8, profile_name.?, "desktop"))
             \\-device qemu-xhci,id=xhci \
             \\-device usb-kbd,bus=xhci.0 \
             \\-device usb-mouse,bus=xhci.0
         else
-            ""
-        ;
+            "";
         const qemu_nvme_args: []const u8 = if (profile_name != null and
             (std.mem.eql(u8, profile_name.?, "desktop") or std.mem.eql(u8, profile_name.?, "hyprvos")))
             \\-drive file=nvme.img,format=raw,if=none,id=nvme0 \
             \\-device nvme,drive=nvme0,serial=zagdisk0
         else
-            ""
-        ;
+            "";
         const qemu_net_args: []const u8 = if (std.mem.eql(u8, net_type, "tap"))
             \\-netdev tap,id=net0,ifname=tap0,script=no,downscript=no,vhost=off \
             \\-device e1000e,netdev=net0,mac=52:54:00:12:34:56 \

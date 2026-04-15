@@ -332,8 +332,7 @@ pub fn cleanDcacheToPou(start: u64, len: u64) void {
                 asm volatile ("dc cvau, %[a]"
                     :
                     : [a] "r" (addr),
-                    : .{ .memory = true }
-                );
+                    : .{ .memory = true });
             }
             asm volatile ("dsb ish" ::: .{ .memory = true });
         },
@@ -366,8 +365,7 @@ pub fn cleanInvalidateDcacheRange(start: u64, len: u64) void {
                 asm volatile ("dc civac, %[a]"
                     :
                     : [a] "r" (addr),
-                    : .{ .memory = true }
-                );
+                    : .{ .memory = true });
             }
             asm volatile (
                 \\dsb sy
@@ -425,8 +423,7 @@ pub inline fn switchStackAndCall(stack_top: VAddr, arg: u64, entry: u64) noretur
                 : [sp] "r" (stack_top.addr),
                   [arg] "r" (arg),
                   [entry] "r" (entry),
-                : .{ .rsp = true, .rbp = true, .rdi = true }
-            );
+                : .{ .rsp = true, .rbp = true, .rdi = true });
         },
         .aarch64 => {
             // Follow Linux arm64's rule: MAIR_EL1 is only ever written
@@ -453,8 +450,7 @@ pub inline fn switchStackAndCall(stack_top: VAddr, arg: u64, entry: u64) noretur
                 : [sp] "r" (stack_top.addr),
                   [arg] "r" (arg),
                   [entry] "r" (entry),
-                : .{ .x0 = true, .memory = true }
-            );
+                : .{ .x0 = true, .memory = true });
         },
         else => unreachable,
     }
@@ -1170,9 +1166,6 @@ pub fn vmSysregPassthrough(vm_structures: PAddr, sysreg_id: u32, allow_read: boo
         else => unreachable,
     }
 }
-
-
-
 
 // --- PMU (performance monitoring unit) dispatch (systems.md §arch-interface, §pmu) ---
 

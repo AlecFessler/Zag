@@ -698,8 +698,7 @@ fn writeTtbr0(val: u64) void {
     asm volatile ("msr ttbr0_el1, %[val]"
         :
         : [val] "r" (val),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
 }
 
 /// Read TTBR1_EL1 (Translation Table Base Register 1 -- kernel space).
@@ -716,8 +715,7 @@ pub fn writeTtbr1(val: u64) void {
     asm volatile ("msr ttbr1_el1, %[val]"
         :
         : [val] "r" (val),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
 }
 
 /// Return the physical address of the kernel page table from TTBR1_EL1.
@@ -775,8 +773,7 @@ pub fn forceT0Sz16() void {
     asm volatile ("msr tcr_el1, %[val]"
         :
         : [val] "r" (tcr),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
     // ISB so the new T0SZ is visible to subsequent accesses; TLBI to
     // drop any cached UEFI-era TTBR0 walks that were derived under the
     // old T0SZ — they would have stale level-0 indices otherwise.
@@ -804,8 +801,7 @@ pub fn enableKernelTranslation() void {
     asm volatile ("msr tcr_el1, %[val]"
         :
         : [val] "r" (tcr),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
     // ISB ensures the new TCR takes effect for subsequent TTBR1 writes.
     // No TLBI needed — TTBR1 had no valid entries before this.
     asm volatile ("isb" ::: .{ .memory = true });
@@ -822,8 +818,7 @@ pub fn setMair() void {
     asm volatile ("msr mair_el1, %[val]"
         :
         : [val] "r" (mair),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
     asm volatile (
         \\isb
         \\tlbi vmalle1
@@ -865,8 +860,7 @@ fn tlbiVae1is(vaddr: u64) void {
     asm volatile ("tlbi vae1is, %[addr]"
         :
         : [addr] "r" (page_addr),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
     dsbIsh();
     isb();
 }

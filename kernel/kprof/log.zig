@@ -40,10 +40,10 @@ const BACKING_BYTES: usize = if (mode.any_enabled) MAX_CPUS * LOG_SIZE_BYTES els
 var inline_backing: [BACKING_BYTES]u8 align(4096) = undefined;
 
 pub const CpuLog = extern struct {
-    base: u64 align(64),   // virtual base of this CPU's log buffer
-    head: u64,             // byte offset; atomic RMW bumped
-    limit: u64,            // byte size of the mapped buffer
-    overflowed: u64,       // non-zero once head reached limit
+    base: u64 align(64), // virtual base of this CPU's log buffer
+    head: u64, // byte offset; atomic RMW bumped
+    limit: u64, // byte size of the mapped buffer
+    overflowed: u64, // non-zero once head reached limit
 };
 
 pub var cpu_logs: [MAX_CPUS]CpuLog align(64) = [_]CpuLog{.{

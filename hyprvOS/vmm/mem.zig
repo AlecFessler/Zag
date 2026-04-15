@@ -1,7 +1,6 @@
 /// Guest physical memory management.
 /// Allocates host virtual pages via mem_reserve and maps them into the
 /// guest physical address space via vm_guest_map.
-
 const lib = @import("lib");
 
 const log = @import("log.zig");

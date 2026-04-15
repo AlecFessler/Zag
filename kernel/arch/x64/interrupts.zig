@@ -141,7 +141,7 @@ pub export fn syscallEntry() callconv(.naked) void {
     //   [RSP+160] rsp            │
     //   [RSP+168] ss            ─┘
     asm volatile (
-        // ── Stack switch via SWAPGS (Intel SDM Vol 3A §5.8.8) ────────
+    // ── Stack switch via SWAPGS (Intel SDM Vol 3A §5.8.8) ────────
         \\swapgs                       // GS.base → per-CPU SyscallScratch
         \\movq %%rsp, %%gs:8          // scratch.user_rsp = user RSP
         \\movq %%gs:0, %%rsp          // RSP = kernel stack top
@@ -375,7 +375,7 @@ export fn interruptStubPrologue() callconv(.naked) void {
 
 export fn interruptStubEpilogue() callconv(.naked) void {
     asm volatile (
-        // Restore SSE/x87 state
+    // Restore SSE/x87 state
         \\fxrstor (%rsp)
         \\addq $512, %rsp
         \\
@@ -407,7 +407,7 @@ pub fn serializeFaultRegs(ctx: *const ArchCpuContext) arch.FaultRegSnapshot {
         .flags = ctx.rflags,
         .sp = ctx.rsp,
         .gprs = .{
-            r.r15, r.r14, r.r13, r.r12, r.r11, r.r10, r.r9, r.r8,
+            r.r15, r.r14, r.r13, r.r12, r.r11, r.r10, r.r9,  r.r8,
             r.rdi, r.rsi, r.rbp, r.rbx, r.rdx, r.rcx, r.rax,
         },
     };
@@ -439,7 +439,7 @@ pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: arch.FaultRegSnapshot) voi
     ctx.rsp = snapshot.sp;
     const r = &ctx.regs;
     inline for (.{
-        "r15", "r14", "r13", "r12", "r11", "r10", "r9", "r8",
+        "r15", "r14", "r13", "r12", "r11", "r10", "r9",  "r8",
         "rdi", "rsi", "rbp", "rbx", "rdx", "rcx", "rax",
     }, 0..) |field, i| {
         @field(r, field) = snapshot.gprs[i];

@@ -36,9 +36,9 @@ const blocklist: []const u64 = switch (builtin.cpu.arch) {
         (3 << 14) | (4 << 11) | (2 << 7) | (0 << 3) | 0, // TTBR0_EL2
         (3 << 14) | (4 << 11) | (2 << 7) | (1 << 3) | 0, // VTTBR_EL2
         (3 << 14) | (4 << 11) | (12 << 7) | (0 << 3) | 0, // VBAR_EL2
-        // EL3 register (op1 = 6).
+            // EL3 register (op1 = 6).
         (3 << 14) | (6 << 11) | (1 << 7) | (0 << 3) | 0, // SCTLR_EL3
-        // AArch64 ID registers (op0=3, op1=0, CRn=0, CRm in {0..7}).
+            // AArch64 ID registers (op0=3, op1=0, CRn=0, CRm in {0..7}).
         (3 << 14) | (0 << 11) | (0 << 7) | (0 << 3) | 0, // MIDR_EL1
         (3 << 14) | (0 << 11) | (0 << 7) | (4 << 3) | 0, // ID_AA64PFR0_EL1
         (3 << 14) | (0 << 11) | (0 << 7) | (7 << 3) | 0, // ID_AA64MMFR0_EL1

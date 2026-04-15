@@ -1,7 +1,6 @@
 /// Linux boot protocol constants and command-line setup.
 /// boot_params (zero page) is built inline in main.zig from the bzImage
 /// header read out of guest memory after the kernel is loaded from disk.
-
 const mem = @import("mem.zig");
 
 // Guest physical memory layout

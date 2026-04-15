@@ -248,8 +248,7 @@ fn createIdentityMapping(trampoline_pa: u64) !u64 {
         asm volatile ("dc cvac, %[va]"
             :
             : [va] "r" (clean_va),
-            : .{ .memory = true }
-        );
+            : .{ .memory = true });
         clean_va += 64;
     }
     clean_va = l1_va;
@@ -257,8 +256,7 @@ fn createIdentityMapping(trampoline_pa: u64) !u64 {
         asm volatile ("dc cvac, %[va]"
             :
             : [va] "r" (clean_va),
-            : .{ .memory = true }
-        );
+            : .{ .memory = true });
         clean_va += 64;
     }
     asm volatile ("dsb ish" ::: .{ .memory = true });
@@ -341,8 +339,7 @@ fn smpInitFull() !void {
         asm volatile ("dc cvac, %[va]"
             :
             : [va] "r" (clean_addr),
-            : .{ .memory = true }
-        );
+            : .{ .memory = true });
         clean_addr += 64;
     }
     asm volatile ("dsb ish" ::: .{ .memory = true });
@@ -399,8 +396,7 @@ fn smpInitFull() !void {
                 asm volatile ("dc cvac, %[va]"
                     :
                     : [va] "r" (ca),
-                    : .{ .memory = true }
-                );
+                    : .{ .memory = true });
                 ca += 64;
             }
         }
@@ -513,9 +509,9 @@ fn secondaryEntry() callconv(.naked) noreturn {
         \\eret
         \\1:
         \\
-    // Load all params into registers before touching system registers.
-    // SecondaryBootParams layout: ttbr0(0), ttbr1(8), tcr(16), mair(24),
-    // sctlr(32), sp(40), entry(48), core_idx(56), vbar(64).
+        // Load all params into registers before touching system registers.
+        // SecondaryBootParams layout: ttbr0(0), ttbr1(8), tcr(16), mair(24),
+        // sctlr(32), sp(40), entry(48), core_idx(56), vbar(64).
         \\ldp x1, x2, [x0, #0]
         \\ldp x3, x4, [x0, #16]
         \\ldp x5, x6, [x0, #32]

@@ -1,7 +1,6 @@
 /// MSR read/write emulation for Linux guest boot.
 /// Handles architectural MSRs that Linux reads/writes during early boot.
 /// MSRs in GuestState are read/written directly; others use shadow storage.
-
 const log = @import("log.zig");
 
 const GuestState = @import("main.zig").GuestState;

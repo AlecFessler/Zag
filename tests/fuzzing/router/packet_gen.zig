@@ -836,28 +836,39 @@ fn generateTcpSynWithOptions(random: std.Random) GeneratedPacket {
     const opt_choice = random.intRangeLessThan(u8, 0, 10);
     switch (opt_choice) {
         0 => { // MSS=1460 (should NOT be clamped)
-            pkt.buf[54] = 2; pkt.buf[55] = 4;
-            pkt.buf[56] = 0x05; pkt.buf[57] = 0xB4; // 1460
+            pkt.buf[54] = 2;
+            pkt.buf[55] = 4;
+            pkt.buf[56] = 0x05;
+            pkt.buf[57] = 0xB4; // 1460
         },
         1 => { // MSS=9000 (should be clamped to 1460)
-            pkt.buf[54] = 2; pkt.buf[55] = 4;
-            pkt.buf[56] = 0x23; pkt.buf[57] = 0x28; // 9000
+            pkt.buf[54] = 2;
+            pkt.buf[55] = 4;
+            pkt.buf[56] = 0x23;
+            pkt.buf[57] = 0x28; // 9000
         },
         2 => { // MSS=1461 (edge case)
-            pkt.buf[54] = 2; pkt.buf[55] = 4;
-            pkt.buf[56] = 0x05; pkt.buf[57] = 0xB5; // 1461
+            pkt.buf[54] = 2;
+            pkt.buf[55] = 4;
+            pkt.buf[56] = 0x05;
+            pkt.buf[57] = 0xB5; // 1461
         },
         3 => { // MSS=0
-            pkt.buf[54] = 2; pkt.buf[55] = 4;
-            pkt.buf[56] = 0x00; pkt.buf[57] = 0x00;
+            pkt.buf[54] = 2;
+            pkt.buf[55] = 4;
+            pkt.buf[56] = 0x00;
+            pkt.buf[57] = 0x00;
         },
         4 => { // MSS=65535
-            pkt.buf[54] = 2; pkt.buf[55] = 4;
-            pkt.buf[56] = 0xFF; pkt.buf[57] = 0xFF;
+            pkt.buf[54] = 2;
+            pkt.buf[55] = 4;
+            pkt.buf[56] = 0xFF;
+            pkt.buf[57] = 0xFF;
         },
         5 => { // NOP + MSS=8000 (NOP padding)
             pkt.buf[54] = 1; // NOP
-            pkt.buf[55] = 2; pkt.buf[56] = 4;
+            pkt.buf[55] = 2;
+            pkt.buf[56] = 4;
             pkt.buf[57] = 0x1F; // 8000 = 0x1F40, but only 1 byte left
             // This is malformed (MSS split across option boundary)
         },
@@ -865,15 +876,20 @@ fn generateTcpSynWithOptions(random: std.Random) GeneratedPacket {
             pkt.buf[54] = 0; // end-of-options
         },
         7 => { // Kind=2 len=3 (wrong length)
-            pkt.buf[54] = 2; pkt.buf[55] = 3;
-            pkt.buf[56] = 0x05; pkt.buf[57] = 0xB4;
+            pkt.buf[54] = 2;
+            pkt.buf[55] = 3;
+            pkt.buf[56] = 0x05;
+            pkt.buf[57] = 0xB4;
         },
         8 => { // Kind=2 len=0 (should break loop)
-            pkt.buf[54] = 2; pkt.buf[55] = 0;
+            pkt.buf[54] = 2;
+            pkt.buf[55] = 0;
         },
         9 => { // Kind=2 len=4 with MSS=1500
-            pkt.buf[54] = 2; pkt.buf[55] = 4;
-            pkt.buf[56] = 0x05; pkt.buf[57] = 0xDC; // 1500
+            pkt.buf[54] = 2;
+            pkt.buf[55] = 4;
+            pkt.buf[56] = 0x05;
+            pkt.buf[57] = 0xDC; // 1500
         },
         else => {},
     }

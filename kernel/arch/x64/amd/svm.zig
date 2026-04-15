@@ -481,13 +481,11 @@ pub fn vmResume(guest_state: *GuestState, vmcb_phys: PAddr, guest_fxsave: *align
     asm volatile ("fxsave (%[addr])"
         :
         : [addr] "r" (&host_fxsave),
-        : .{.memory = true}
-    );
+        : .{ .memory = true });
     asm volatile ("fxrstor (%[addr])"
         :
         : [addr] "r" (guest_fxsave),
-        : .{.memory = true}
-    );
+        : .{ .memory = true });
 
     // Look up per-core host VMCB physical address for VMSAVE/VMLOAD.
     const host_pa = host_vmcb_pa[apic.coreID()];
@@ -519,7 +517,7 @@ pub fn vmResume(guest_state: *GuestState, vmcb_phys: PAddr, guest_fxsave: *align
     const gs_ptr = @intFromPtr(guest_state);
 
     asm volatile (
-        // Save host callee-saved registers (VMRUN clobbers them per AMD spec)
+    // Save host callee-saved registers (VMRUN clobbers them per AMD spec)
         \\pushq %%rbx
         \\pushq %%r12
         \\pushq %%r13
@@ -628,20 +626,17 @@ pub fn vmResume(guest_state: *GuestState, vmcb_phys: PAddr, guest_fxsave: *align
           // aborts with "inline assembly requires more registers than
           // available". See the matching comment on the VMX VMLAUNCH/
           // VMRESUME asm in `intel/vmx.zig`.
-        : .{ .memory = true, .rax = true, .rcx = true, .rdx = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true }
-    );
+        : .{ .memory = true, .rax = true, .rcx = true, .rdx = true, .rsi = true, .rdi = true, .r8 = true, .r9 = true, .r10 = true, .r11 = true });
 
     // Save guest FPU/SSE state and restore host FPU/SSE state.
     asm volatile ("fxsave (%[addr])"
         :
         : [addr] "r" (guest_fxsave),
-        : .{.memory = true}
-    );
+        : .{ .memory = true });
     asm volatile ("fxrstor (%[addr])"
         :
         : [addr] "r" (&host_fxsave),
-        : .{.memory = true}
-    );
+        : .{ .memory = true });
 
     // RAX is saved/restored by VMRUN/#VMEXIT in the VMCB state save area
     // (AMD APM Vol 2, Section 15.5.1 and 15.6), but we also save it from
@@ -1003,13 +998,15 @@ fn decodeExitReason(vmcb: [*]const u8, guest_state: *const GuestState) VmExitInf
         var size: u8 = 1;
         if ((exitinfo1 & (1 << 5)) != 0) size = 2; // SZ16
         if ((exitinfo1 & (1 << 6)) != 0) size = 4; // SZ32
-        return .{ .io = .{
-            .port = port,
-            .size = size,
-            .is_write = is_write,
-            .value = @truncate(guest_state.rax),
-            .next_rip = exitinfo2, // AMD APM Vol 2, Section 15.10.2: EXITINFO2 = next sequential RIP
-        } };
+        return .{
+            .io = .{
+                .port = port,
+                .size = size,
+                .is_write = is_write,
+                .value = @truncate(guest_state.rax),
+                .next_rip = exitinfo2, // AMD APM Vol 2, Section 15.10.2: EXITINFO2 = next sequential RIP
+            },
+        };
     }
 
     if (exitcode == VMEXIT_HLT) {

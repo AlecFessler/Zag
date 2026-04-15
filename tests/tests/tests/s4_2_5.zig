@@ -56,7 +56,7 @@ pub fn main(pv: u64) void {
 
     // VmExitMessage.thread_handle is at offset 0 of the buffer and must
     // identify the vCPU that exited.
-    const msg_handle = @as(*const u64, @alignCast(@ptrCast(&buf[0]))).*;
+    const msg_handle = @as(*const u64, @ptrCast(@alignCast(&buf[0]))).*;
     if (msg_handle != vcpu_handle) {
         if (msg_handle == 0) {
             t.fail("§4.2.5 buffer not written");

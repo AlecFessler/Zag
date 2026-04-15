@@ -3,7 +3,6 @@
 ///   TX: guest OUT 0x3F8 → host serial write
 ///   RX: host serial read → guest IN 0x3F8
 /// Presents as a 16550-compatible UART.
-
 const lib = @import("lib");
 
 const log = @import("log.zig");

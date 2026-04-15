@@ -33,8 +33,7 @@ pub fn installEarlyVbar() void {
         \\isb
         :
         : [addr] "r" (addr),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
 }
 
 /// Map the PL011 UART MMIO page into the kernel's TTBR1 physmap range

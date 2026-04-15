@@ -336,7 +336,6 @@ fn dnsRoundtrip(random: std.Random, step: u64, seed: u64) void {
     for (&state.dns_relays) |*r| {
         if (r.valid and r.relay_id == relay_id) break;
     }
-
 }
 
 /// Full TCP HTTP session: SYN → SYN-ACK → ACK → HTTP request → FIN
@@ -403,10 +402,14 @@ fn arpLearningVerification(random: std.Random, step: u64, seed: u64) void {
     var pkt = packet_gen.GeneratedPacket{ .kind = .arp_reply, .interface = .lan };
     @memset(&pkt.buf, 0);
     packet_gen.writeEthernet(&pkt.buf, harness.LAN_MAC, test_mac, 0x0806);
-    pkt.buf[14] = 0x00; pkt.buf[15] = 0x01; // hw type
-    pkt.buf[16] = 0x08; pkt.buf[17] = 0x00; // proto type
-    pkt.buf[18] = 6; pkt.buf[19] = 4;
-    pkt.buf[20] = 0x00; pkt.buf[21] = 0x02; // reply
+    pkt.buf[14] = 0x00;
+    pkt.buf[15] = 0x01; // hw type
+    pkt.buf[16] = 0x08;
+    pkt.buf[17] = 0x00; // proto type
+    pkt.buf[18] = 6;
+    pkt.buf[19] = 4;
+    pkt.buf[20] = 0x00;
+    pkt.buf[21] = 0x02; // reply
     @memcpy(pkt.buf[22..28], &test_mac); // sender MAC
     @memcpy(pkt.buf[28..32], &test_ip); // sender IP
     @memcpy(pkt.buf[32..38], &harness.LAN_MAC);
@@ -674,5 +677,4 @@ fn pcpMappingLifecycle(random: std.Random, step: u64, seed: u64) void {
     harness.advanceClock(7201_000_000_000);
     state.periodicMaintenance();
     checkInvariants(step, seed, "pcp_lifecycle:expire");
-
 }

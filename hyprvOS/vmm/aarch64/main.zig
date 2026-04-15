@@ -93,14 +93,37 @@ const GICR_SIZE: u64 = 0x00020000; // one vCPU stride
 
 pub const GuestState = extern struct {
     // GPRs X0..X30 (31 × 8 = 248 bytes)
-    x0: u64 = 0, x1: u64 = 0, x2: u64 = 0, x3: u64 = 0,
-    x4: u64 = 0, x5: u64 = 0, x6: u64 = 0, x7: u64 = 0,
-    x8: u64 = 0, x9: u64 = 0, x10: u64 = 0, x11: u64 = 0,
-    x12: u64 = 0, x13: u64 = 0, x14: u64 = 0, x15: u64 = 0,
-    x16: u64 = 0, x17: u64 = 0, x18: u64 = 0, x19: u64 = 0,
-    x20: u64 = 0, x21: u64 = 0, x22: u64 = 0, x23: u64 = 0,
-    x24: u64 = 0, x25: u64 = 0, x26: u64 = 0, x27: u64 = 0,
-    x28: u64 = 0, x29: u64 = 0, x30: u64 = 0,
+    x0: u64 = 0,
+    x1: u64 = 0,
+    x2: u64 = 0,
+    x3: u64 = 0,
+    x4: u64 = 0,
+    x5: u64 = 0,
+    x6: u64 = 0,
+    x7: u64 = 0,
+    x8: u64 = 0,
+    x9: u64 = 0,
+    x10: u64 = 0,
+    x11: u64 = 0,
+    x12: u64 = 0,
+    x13: u64 = 0,
+    x14: u64 = 0,
+    x15: u64 = 0,
+    x16: u64 = 0,
+    x17: u64 = 0,
+    x18: u64 = 0,
+    x19: u64 = 0,
+    x20: u64 = 0,
+    x21: u64 = 0,
+    x22: u64 = 0,
+    x23: u64 = 0,
+    x24: u64 = 0,
+    x25: u64 = 0,
+    x26: u64 = 0,
+    x27: u64 = 0,
+    x28: u64 = 0,
+    x29: u64 = 0,
+    x30: u64 = 0,
 
     sp_el0: u64 = 0,
     sp_el1: u64 = 0,
@@ -422,9 +445,17 @@ fn exitLoop() void {
                 const crm: u32 = (iss >> 1) & 0xF;
                 const rd: u32 = iss & 0x1;
                 log.print(" S");
-                log.dec(op0); log.print("_"); log.dec(op1); log.print("_c");
-                log.dec(crn); log.print("_c"); log.dec(crm); log.print("_");
-                log.dec(op2); log.print(" Rt="); log.dec(rt);
+                log.dec(op0);
+                log.print("_");
+                log.dec(op1);
+                log.print("_c");
+                log.dec(crn);
+                log.print("_c");
+                log.dec(crm);
+                log.print("_");
+                log.dec(op2);
+                log.print(" Rt=");
+                log.dec(rt);
                 log.print(if (rd != 0) " R" else " W");
             }
             log.print("\n");
@@ -526,26 +557,26 @@ fn emulateSysregRead(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) u64 {
         switch (crm) {
             4 => switch (op2) {
                 0 => return 0x0000000000000011, // ID_AA64PFR0: EL0/EL1 AArch64
-                1 => return 0,                   // ID_AA64PFR1
+                1 => return 0, // ID_AA64PFR1
                 else => {},
             },
             5 => switch (op2) {
                 0 => return 0x0000000010305106, // ID_AA64DFR0: v8.2 debug, 6 BPs, 4 WPs
-                1 => return 0,                   // ID_AA64DFR1
-                4 => return 0,                   // ID_AA64AFR0
-                5 => return 0,                   // ID_AA64AFR1
+                1 => return 0, // ID_AA64DFR1
+                4 => return 0, // ID_AA64AFR0
+                5 => return 0, // ID_AA64AFR1
                 else => {},
             },
             6 => switch (op2) {
                 0 => return 0x0000000000011120, // ID_AA64ISAR0
-                1 => return 0,                   // ID_AA64ISAR1
+                1 => return 0, // ID_AA64ISAR1
                 else => {},
             },
             7 => switch (op2) {
                 0 => return 0x0000000000001122, // ID_AA64MMFR0: 40-bit PA, 16-bit ASID
-                1 => return 0,                   // ID_AA64MMFR1
-                2 => return 0,                   // ID_AA64MMFR2
-                3 => return 0,                   // ID_AA64MMFR3
+                1 => return 0, // ID_AA64MMFR1
+                2 => return 0, // ID_AA64MMFR2
+                3 => return 0, // ID_AA64MMFR3
                 else => {},
             },
             else => {},
@@ -571,11 +602,11 @@ fn handleHvc(gs: *GuestState) bool {
 // ---------------------------------------------------------------------------
 
 fn readU64LE(buf: []const u8, off: usize) u64 {
-    return @as(*const align(1) u64, @ptrCast(buf.ptr + off)).*;
+    return @as(*align(1) const u64, @ptrCast(buf.ptr + off)).*;
 }
 
 fn readU32LE(buf: []const u8, off: usize) u32 {
-    return @as(*const align(1) u32, @ptrCast(buf.ptr + off)).*;
+    return @as(*align(1) const u32, @ptrCast(buf.ptr + off)).*;
 }
 
 fn readU8(buf: []const u8, off: usize) u8 {
@@ -638,16 +669,26 @@ fn handleStage2Fault(gs: *GuestState) bool {
     }
     log.hex64(guest_phys);
     log.print("\n");
-    log.print("  pc=0x"); log.hex64(gs.pc);
-    log.print(" elr1=0x"); log.hex64(gs.elr_el1);
-    log.print(" far1=0x"); log.hex64(gs.far_el1);
-    log.print(" esr1=0x"); log.hex64(gs.esr_el1);
-    log.print("\n  sctlr=0x"); log.hex64(gs.sctlr_el1);
-    log.print(" tcr=0x"); log.hex64(gs.tcr_el1);
-    log.print(" ttbr0=0x"); log.hex64(gs.ttbr0_el1);
-    log.print(" ttbr1=0x"); log.hex64(gs.ttbr1_el1);
-    log.print("\n  vbar=0x"); log.hex64(gs.vbar_el1);
-    log.print(" mair=0x"); log.hex64(gs.mair_el1);
+    log.print("  pc=0x");
+    log.hex64(gs.pc);
+    log.print(" elr1=0x");
+    log.hex64(gs.elr_el1);
+    log.print(" far1=0x");
+    log.hex64(gs.far_el1);
+    log.print(" esr1=0x");
+    log.hex64(gs.esr_el1);
+    log.print("\n  sctlr=0x");
+    log.hex64(gs.sctlr_el1);
+    log.print(" tcr=0x");
+    log.hex64(gs.tcr_el1);
+    log.print(" ttbr0=0x");
+    log.hex64(gs.ttbr0_el1);
+    log.print(" ttbr1=0x");
+    log.hex64(gs.ttbr1_el1);
+    log.print("\n  vbar=0x");
+    log.hex64(gs.vbar_el1);
+    log.print(" mair=0x");
+    log.hex64(gs.mair_el1);
     log.print("\n");
     return true;
 }

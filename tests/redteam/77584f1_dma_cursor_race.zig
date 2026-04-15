@@ -121,7 +121,6 @@ pub fn main(pv: u64) void {
     const dev = t.requireMmioDevice(view, "POC-77584f1");
     g_dev_handle = dev.handle;
 
-
     // Two SHMs reused across trials, one per thread. 1 page each
     // keeps the per-trial PTE work small.
     const main_shm_h = syscall.shm_create_with_rights(SHM_BYTES, SHM_RIGHTS);

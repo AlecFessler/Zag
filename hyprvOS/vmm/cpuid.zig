@@ -1,7 +1,6 @@
 /// CPUID emulation for Linux guest boot.
 /// Returns minimal but valid responses for all leaves Linux queries during
 /// early boot. Presents as AuthenticAMD with long mode, NX, SSE2, etc.
-
 const log = @import("log.zig");
 
 const GuestState = @import("main.zig").GuestState;

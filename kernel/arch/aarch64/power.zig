@@ -210,8 +210,7 @@ fn smcCall(function_id: u32, arg1: u64, arg2: u64, arg3: u64) i64 {
           [a1] "{x1}" (arg1),
           [a2] "{x2}" (arg2),
           [a3] "{x3}" (arg3),
-        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .memory = true }
-    );
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .memory = true });
 }
 
 /// Issue an HVC #0 instruction with the given arguments.
@@ -223,8 +222,7 @@ fn hvcCall(function_id: u32, arg1: u64, arg2: u64, arg3: u64) i64 {
           [a1] "{x1}" (arg1),
           [a2] "{x2}" (arg2),
           [a3] "{x3}" (arg3),
-        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .memory = true }
-    );
+        : .{ .x1 = true, .x2 = true, .x3 = true, .x4 = true, .x5 = true, .x6 = true, .x7 = true, .x8 = true, .x9 = true, .x10 = true, .x11 = true, .x12 = true, .x13 = true, .x14 = true, .x15 = true, .x16 = true, .x17 = true, .memory = true });
 }
 
 /// Map PSCI error codes to kernel error codes.

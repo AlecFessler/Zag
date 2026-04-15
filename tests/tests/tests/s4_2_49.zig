@@ -38,7 +38,7 @@ fn writeU64(base: [*]u8, offset: usize, val: u64) void {
 }
 
 fn readU64(base: [*]const u8, offset: usize) u64 {
-    return @as(*const align(1) u64, @ptrCast(base + offset)).*;
+    return @as(*align(1) const u64, @ptrCast(base + offset)).*;
 }
 
 fn writeU32(base: [*]u8, offset: usize, val: u32) void {

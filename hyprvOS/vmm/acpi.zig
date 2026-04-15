@@ -5,7 +5,6 @@
 /// References:
 ///   ACPI Specification 6.4, sections 5.2 (RSDP), 5.2.6 (XSDT),
 ///   5.2.12 (MADT), 5.2.9 (FADT), 5.2.11 (DSDT)
-
 const log = @import("log.zig");
 const mem = @import("mem.zig");
 
@@ -115,12 +114,12 @@ const dsdt_aml = [_]u8{
     // PkgLength encoding: single byte, value includes PkgLength byte + all contents.
     0x10, // ScopeOp
     0x12, // PkgLength = 18 (1 + "_SB_"(4) + ProcessorOp(2+11=13))
-    '_',  'S',  'B',  '_', // NameString "\_SB"
+    '_', 'S', 'B', '_', // NameString "\_SB"
 
     // Processor(\_SB.CPU0, 0, 0x00000000, 0)
     0x5B, 0x83, // ProcessorOp (extended opcode)
     0x0B, // PkgLength = 11 (1 + "CPU0"(4) + ProcID(1) + PblkAddr(4) + PblkLen(1))
-    'C',  'P',  'U',  '0', // NameString
+    'C', 'P', 'U', '0', // NameString
     0x00, // ProcID = 0
     0x00, 0x00, 0x00, 0x00, // PblkAddr = 0
     0x00, // PblkLen = 0
@@ -128,7 +127,7 @@ const dsdt_aml = [_]u8{
     // Name(\_S5, Package(){ 5, 0, 0, 0 }) — at root scope
     // Tells Linux SLP_TYPa=5 for S5 (shutdown via ACPI)
     0x08, // NameOp
-    '_',  'S',  '5',  '_', // NameString "\_S5"
+    '_', 'S', '5', '_', // NameString "\_S5"
     0x12, // PackageOp
     0x07, // PkgLength = 7 (1 + NumElements(1) + ByteConst(2) + 3*ZeroOp(3))
     0x04, // NumElements = 4
@@ -164,11 +163,11 @@ const INT_SRC_OVERRIDE_LEN: u32 = 10;
 const LOCAL_APIC_NMI_LEN: u32 = 6;
 
 const MADT_TOTAL_LEN: u32 = 44 // header(36) + local APIC addr(4) + flags(4)
-+ LOCAL_APIC_ENTRY_LEN // CPU0 local APIC
-+ IO_APIC_ENTRY_LEN // I/O APIC
-+ INT_SRC_OVERRIDE_LEN // IRQ0 -> GSI2 (timer)
-+ INT_SRC_OVERRIDE_LEN // IRQ9 -> GSI9 (ACPI SCI)
-+ LOCAL_APIC_NMI_LEN; // LINT1 NMI
+    + LOCAL_APIC_ENTRY_LEN // CPU0 local APIC
+    + IO_APIC_ENTRY_LEN // I/O APIC
+    + INT_SRC_OVERRIDE_LEN // IRQ0 -> GSI2 (timer)
+    + INT_SRC_OVERRIDE_LEN // IRQ9 -> GSI9 (ACPI SCI)
+    + LOCAL_APIC_NMI_LEN; // LINT1 NMI
 
 noinline fn buildMadt() void {
     const base = MADT_OFFSET;

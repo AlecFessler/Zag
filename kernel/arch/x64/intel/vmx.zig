@@ -428,8 +428,7 @@ pub fn perCoreInit() void {
         \\vmxon (%[addr])
         :
         : [addr] "r" (&phys.addr),
-        : .{ .memory = true, .cc = true }
-    );
+        : .{ .memory = true, .cc = true });
 }
 
 // ---------------------------------------------------------------------------
@@ -471,7 +470,6 @@ pub fn perCoreInit() void {
 /// Since mapEptPage receives arch_structures (= VMCS PAddr), we need to
 /// VMPTRLD the VMCS, read the EPTP field, extract the EPT root PAddr.
 /// This is clean and avoids side tables.
-
 /// Allocate and initialize a VMCS and EPT root for a new VM (SDM Vol 3C,
 /// Section 25.2 "Format of the VMCS Region", Table 25-1; Section 25.11.3
 /// for VMCLEAR/VMPTRLD lifecycle). The VMCS revision ID is written into
@@ -501,16 +499,14 @@ pub fn allocVmStructures() ?PAddr {
         \\vmclear (%[addr])
         :
         : [addr] "r" (&vmcs_phys.addr),
-        : .{ .memory = true, .cc = true }
-    );
+        : .{ .memory = true, .cc = true });
 
     // VMPTRLD to make it current
     asm volatile (
         \\vmptrld (%[addr])
         :
         : [addr] "r" (&vmcs_phys.addr),
-        : .{ .memory = true, .cc = true }
-    );
+        : .{ .memory = true, .cc = true });
 
     // Initialize all VMCS fields
     initVmcs(ept_phys);
@@ -525,8 +521,7 @@ pub fn freeVmStructures(paddr: PAddr) void {
         \\vmclear (%[addr])
         :
         : [addr] "r" (&paddr.addr),
-        : .{ .memory = true, .cc = true }
-    );
+        : .{ .memory = true, .cc = true });
 
     // Read back the EPT root from the VMCS before freeing
     // (We'd need to VMPTRLD first, but the VMCS is being freed so
@@ -579,8 +574,7 @@ fn initVmcs(ept_root_phys: PAddr) void {
     asm volatile ("sgdt (%[buf])"
         :
         : [buf] "r" (&gdtr_buf),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
     const gdtr_base = std.mem.readInt(u64, gdtr_buf[2..10], .little);
     vmcsWrite(HOST_GDTR_BASE, gdtr_base);
 
@@ -588,8 +582,7 @@ fn initVmcs(ept_root_phys: PAddr) void {
     asm volatile ("sidt (%[buf])"
         :
         : [buf] "r" (&idtr_buf),
-        : .{ .memory = true }
-    );
+        : .{ .memory = true });
     const idtr_base = std.mem.readInt(u64, idtr_buf[2..10], .little);
     vmcsWrite(HOST_IDTR_BASE, idtr_base);
 
@@ -849,8 +842,7 @@ pub fn vmResume(guest_state: *GuestState, vmcs_paddr: PAddr) VmExitInfo {
         \\vmptrld (%[addr])
         :
         : [addr] "r" (&vmcs_paddr.addr),
-        : .{ .memory = true, .cc = true }
-    );
+        : .{ .memory = true, .cc = true });
 
     // Write guest architectural state into VMCS fields
     writeGuestState(guest_state);
@@ -873,7 +865,7 @@ pub fn vmResume(guest_state: *GuestState, vmcs_paddr: PAddr) VmExitInfo {
     const gs_ptr = @intFromPtr(guest_state);
 
     asm volatile (
-        // Save host callee-saved registers
+    // Save host callee-saved registers
         \\pushq %%rbx
         \\pushq %%rbp
         \\pushq %%r12
@@ -974,21 +966,27 @@ pub fn vmResume(guest_state: *GuestState, vmcs_paddr: PAddr) VmExitInfo {
         :
         : [gs] "r" (gs_ptr),
         : .{
-            // rbx, rbp, r12-r15 are NOT clobber-listed: the asm manually
-            // pushes/pops them on entry/exit. Listing a manually-saved
-            // callee-saved register as a clobber forces LLVM to allocate
-            // a scratch register for it — and with `omit_frame_pointer =
-            // false` plus the guest-GPR constraints below, there simply
-            // aren't enough free GPRs in ReleaseSafe/Fast, so LLVM aborts
-            // with "inline assembly requires more registers than
-            // available". See the matching comment on the SVM VMRUN asm
-            // in `amd/svm.zig`.
-            .rax = true, .rcx = true, .rdx = true,
-            .rsi = true, .rdi = true,
-            .r8 = true, .r9 = true, .r10 = true, .r11 = true,
-            .memory = true, .cc = true,
-        }
-    );
+          // rbx, rbp, r12-r15 are NOT clobber-listed: the asm manually
+          // pushes/pops them on entry/exit. Listing a manually-saved
+          // callee-saved register as a clobber forces LLVM to allocate
+          // a scratch register for it — and with `omit_frame_pointer =
+          // false` plus the guest-GPR constraints below, there simply
+          // aren't enough free GPRs in ReleaseSafe/Fast, so LLVM aborts
+          // with "inline assembly requires more registers than
+          // available". See the matching comment on the SVM VMRUN asm
+          // in `amd/svm.zig`.
+          .rax = true,
+          .rcx = true,
+          .rdx = true,
+          .rsi = true,
+          .rdi = true,
+          .r8 = true,
+          .r9 = true,
+          .r10 = true,
+          .r11 = true,
+          .memory = true,
+          .cc = true,
+        });
 
     // Read guest architectural state back from VMCS into GuestState
     readGuestState(guest_state);
@@ -1125,8 +1123,7 @@ pub fn mapEptPage(ept_root: PAddr, guest_phys: u64, host_phys: PAddr, rights: u8
         \\vmptrld (%[addr])
         :
         : [addr] "r" (&ept_root.addr),
-        : .{ .memory = true, .cc = true }
-    );
+        : .{ .memory = true, .cc = true });
 
     const eptp = vmcsRead(EPT_POINTER);
     const pml4_phys = PAddr.fromInt(eptp & EPT_ADDR_MASK);
@@ -1223,8 +1220,7 @@ pub fn unmapEptPage(ept_root: PAddr, guest_phys: u64) void {
         \\vmptrld (%[addr])
         :
         : [addr] "r" (&ept_root.addr),
-        : .{ .memory = true, .cc = true }
-    );
+        : .{ .memory = true, .cc = true });
 
     const eptp = vmcsRead(EPT_POINTER);
     const pml4_phys = PAddr.fromInt(eptp & EPT_ADDR_MASK);
@@ -1260,8 +1256,7 @@ pub fn unmapEptPage(ept_root: PAddr, guest_phys: u64) void {
         :
         : [desc] "r" (&descriptor),
           [type] "r" (@as(u64, 1)),
-        : .{ .memory = true, .cc = true }
-    );
+        : .{ .memory = true, .cc = true });
 }
 
 // ---------------------------------------------------------------------------

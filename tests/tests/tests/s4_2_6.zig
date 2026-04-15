@@ -54,7 +54,7 @@ pub fn main(pv: u64) void {
     }
 
     // VmExitMessage.thread_handle is at offset 0 of the buffer.
-    const msg_handle = @as(*const u64, @alignCast(@ptrCast(&buf[0]))).*;
+    const msg_handle = @as(*const u64, @ptrCast(@alignCast(&buf[0]))).*;
     const token_u64: u64 = @bitCast(exit_token);
 
     if (token_u64 == msg_handle) {

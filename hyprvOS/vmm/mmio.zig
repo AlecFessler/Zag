@@ -10,7 +10,6 @@
 ///   0x8A MOV r8, r/m8      (MMIO read byte)
 ///
 /// Guest virtual → physical translation via 4-level page table walk.
-
 const log = @import("log.zig");
 const mem = @import("mem.zig");
 
@@ -61,7 +60,7 @@ fn guestVirtToPhys(cr3: u64, vaddr: u64) ?u64 {
 fn readGuestU64(phys: u64) ?u64 {
     if (phys + 8 > 128 * 1024 * 1024) return null;
     const slice = mem.readGuestSlice(phys, 8);
-    return @as(*const align(1) u64, @ptrCast(slice.ptr)).*;
+    return @as(*align(1) const u64, @ptrCast(slice.ptr)).*;
 }
 
 // --- Instruction fetch ---

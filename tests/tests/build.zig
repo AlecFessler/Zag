@@ -394,7 +394,6 @@ pub fn build(b: *std.Build) void {
         \\pub const child_fill_table_recv = @embedFile("child_fill_table_recv.elf");
         \\pub const child_try_mmio_map = @embedFile("child_try_mmio_map.elf");
         \\pub const child_try_dma_map = @embedFile("child_try_dma_map.elf");
-
         \\pub const child_call_parent_with_device = @embedFile("child_call_parent_with_device.elf");
         \\pub const child_call_parent_with_self = @embedFile("child_call_parent_with_self.elf");
         \\pub const child_check_bss = @embedFile("child_check_bss.elf");

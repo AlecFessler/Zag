@@ -40,9 +40,15 @@ fn waiterFn(my_turn: u64, id: u64, priority: u64) void {
 // id=1 idle, id=2 normal, id=3 high
 // Entered in order: idle first, then normal, then high.
 // Expected wake order: high(3), normal(2), idle(1).
-fn waiter_idle() void { waiterFn(0, 1, syscall.PRIORITY_IDLE); }
-fn waiter_normal() void { waiterFn(2, 2, syscall.PRIORITY_NORMAL); }
-fn waiter_high() void { waiterFn(4, 3, syscall.PRIORITY_HIGH); }
+fn waiter_idle() void {
+    waiterFn(0, 1, syscall.PRIORITY_IDLE);
+}
+fn waiter_normal() void {
+    waiterFn(2, 2, syscall.PRIORITY_NORMAL);
+}
+fn waiter_high() void {
+    waiterFn(4, 3, syscall.PRIORITY_HIGH);
+}
 
 /// §3.2.7 — Futex waiters are woken in priority order (highest priority first), with FIFO ordering among waiters of the same priority level.
 pub fn main(_: u64) void {

@@ -342,4 +342,3 @@ pub fn computeIcmpv6Checksum(src_ip6: [16]u8, dst_ip6: [16]u8, icmpv6_data: []co
     while (sum >> 16 != 0) sum = (sum & 0xFFFF) + (sum >> 16);
     return @truncate(~sum);
 }
-

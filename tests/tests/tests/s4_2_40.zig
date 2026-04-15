@@ -105,7 +105,7 @@ pub fn main(pv: u64) void {
     // Build resume_guest reply action: tag=0 (resume_guest) + GuestState payload.
     // Zig non-extern union(enum) layout: tag at byte 0, payload at byte 8
     // (aligned up to GuestState's u64 alignment).
-    const action_words: [*]u64 = @alignCast(@ptrCast(&reply_action));
+    const action_words: [*]u64 = @ptrCast(@alignCast(&reply_action));
     action_words[0] = 0; // resume_guest tag
 
     const action_payload: [*]u8 = @ptrCast(&reply_action[8]);
@@ -145,7 +145,7 @@ pub fn main(pv: u64) void {
     }
 
     // Clean up with kill reply for exit2.
-    const kill_words: [*]u64 = @alignCast(@ptrCast(&kill_action));
+    const kill_words: [*]u64 = @ptrCast(@alignCast(&kill_action));
     kill_words[0] = 4; // kill variant
     _ = syscall.vm_reply_action(@bitCast(cr), @bitCast(exit2), @intFromPtr(&kill_action));
 

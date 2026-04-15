@@ -120,7 +120,6 @@ fn puts(msg: [*:0]const u16) void {
     }
 }
 
-
 const dbg = struct {
     const boot_start = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] boot start\r\n");
     const page_tables = std.unicode.utf8ToUtf16LeStringLiteral("[ZAG] page tables\r\n");

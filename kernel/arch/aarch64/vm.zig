@@ -687,16 +687,29 @@ pub inline fn hypCall(id: HypCallId, arg: u64) u64 {
         : [id] "{x0}" (@intFromEnum(id)),
           [arg] "{x1}" (arg),
         : .{
-            // Hyp stubs use x2, x3 as temporaries (see hvc_tlbi_ipa,
-            // hvc_vgic_prepare_entry, etc.) so mark every AArch64
-            // caller-saved GPR as clobbered. Only x19..x30 are
-            // preserved across the EL1↔EL2 hand-off.
-            .memory = true,
-            .x1 = true,  .x2 = true,  .x3 = true,
-            .x4 = true,  .x5 = true,  .x6 = true,  .x7 = true,
-            .x8 = true,  .x9 = true,  .x10 = true, .x11 = true,
-            .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-            .x16 = true, .x17 = true, .x18 = true,
+          // Hyp stubs use x2, x3 as temporaries (see hvc_tlbi_ipa,
+          // hvc_vgic_prepare_entry, etc.) so mark every AArch64
+          // caller-saved GPR as clobbered. Only x19..x30 are
+          // preserved across the EL1↔EL2 hand-off.
+          .memory = true,
+          .x1 = true,
+          .x2 = true,
+          .x3 = true,
+          .x4 = true,
+          .x5 = true,
+          .x6 = true,
+          .x7 = true,
+          .x8 = true,
+          .x9 = true,
+          .x10 = true,
+          .x11 = true,
+          .x12 = true,
+          .x13 = true,
+          .x14 = true,
+          .x15 = true,
+          .x16 = true,
+          .x17 = true,
+          .x18 = true,
         });
     return ret;
 }
@@ -1249,27 +1262,65 @@ pub fn vmResume(
           [gfp] "r" (guest_fp_ptr),
           [ctxpa] "r" (ctx_pa.addr),
         : .{
-            // The hvc round-trip lands in hvc_vcpu_run / guest_exit_entry
-            // which freely clobber all caller-saved AArch64 GPRs
-            // (x0..x17) as temporaries. x19..x30 are restored by the
-            // guest_exit_entry epilogue from host_save. Mark the full
-            // caller-saved set here so the compiler does not assume any
-            // of them survive the asm block.
-            .memory = true,
-            .x0 = true,  .x1 = true,  .x2 = true,  .x3 = true,
-            .x4 = true,  .x5 = true,  .x6 = true,  .x7 = true,
-            .x8 = true,  .x9 = true,  .x10 = true, .x11 = true,
-            .x12 = true, .x13 = true, .x14 = true, .x15 = true,
-            .x16 = true, .x17 = true, .x18 = true,
-            // Full V register clobber matches the save/restore bracket.
-            .v0 = true,  .v1 = true,  .v2 = true,  .v3 = true,
-            .v4 = true,  .v5 = true,  .v6 = true,  .v7 = true,
-            .v8 = true,  .v9 = true,  .v10 = true, .v11 = true,
-            .v12 = true, .v13 = true, .v14 = true, .v15 = true,
-            .v16 = true, .v17 = true, .v18 = true, .v19 = true,
-            .v20 = true, .v21 = true, .v22 = true, .v23 = true,
-            .v24 = true, .v25 = true, .v26 = true, .v27 = true,
-            .v28 = true, .v29 = true, .v30 = true, .v31 = true,
+          // The hvc round-trip lands in hvc_vcpu_run / guest_exit_entry
+          // which freely clobber all caller-saved AArch64 GPRs
+          // (x0..x17) as temporaries. x19..x30 are restored by the
+          // guest_exit_entry epilogue from host_save. Mark the full
+          // caller-saved set here so the compiler does not assume any
+          // of them survive the asm block.
+          .memory = true,
+          .x0 = true,
+          .x1 = true,
+          .x2 = true,
+          .x3 = true,
+          .x4 = true,
+          .x5 = true,
+          .x6 = true,
+          .x7 = true,
+          .x8 = true,
+          .x9 = true,
+          .x10 = true,
+          .x11 = true,
+          .x12 = true,
+          .x13 = true,
+          .x14 = true,
+          .x15 = true,
+          .x16 = true,
+          .x17 = true,
+          .x18 = true,
+          // Full V register clobber matches the save/restore bracket.
+          .v0 = true,
+          .v1 = true,
+          .v2 = true,
+          .v3 = true,
+          .v4 = true,
+          .v5 = true,
+          .v6 = true,
+          .v7 = true,
+          .v8 = true,
+          .v9 = true,
+          .v10 = true,
+          .v11 = true,
+          .v12 = true,
+          .v13 = true,
+          .v14 = true,
+          .v15 = true,
+          .v16 = true,
+          .v17 = true,
+          .v18 = true,
+          .v19 = true,
+          .v20 = true,
+          .v21 = true,
+          .v22 = true,
+          .v23 = true,
+          .v24 = true,
+          .v25 = true,
+          .v26 = true,
+          .v27 = true,
+          .v28 = true,
+          .v29 = true,
+          .v30 = true,
+          .v31 = true,
         });
 
     return decodeEsrEl2(ctx.exit_esr, ctx.exit_far, ctx.exit_hpfar);

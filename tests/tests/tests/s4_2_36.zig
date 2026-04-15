@@ -55,7 +55,7 @@ pub fn main(pv: u64) void {
     }
 
     // Reply with kill action (action_type=4).
-    const action_words: [*]u64 = @alignCast(@ptrCast(&reply_action));
+    const action_words: [*]u64 = @ptrCast(@alignCast(&reply_action));
     action_words[0] = 4; // kill variant
 
     const result = syscall.vm_reply_action(@bitCast(cr), @bitCast(exit_token), @intFromPtr(&reply_action));

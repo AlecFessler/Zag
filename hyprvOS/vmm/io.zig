@@ -1,7 +1,6 @@
 /// I/O port emulation for non-serial devices.
 /// Stubs for PIC, PIT, PS/2, CMOS, PCI, VGA, etc.
 /// These are needed because Linux probes many legacy devices during boot.
-
 const lib = @import("lib");
 
 const log = @import("log.zig");
@@ -244,8 +243,6 @@ pub noinline fn pitCheckIrq() void {
     }
 }
 
-
-
 pub fn handleOut(port: u16, size: u8, value: u32, state: *GuestState) void {
     _ = state;
     _ = size;
@@ -266,23 +263,43 @@ pub fn handleOut(port: u16, size: u8, value: u32, state: *GuestState) void {
         PIC1_DATA => {
             const v: u8 = @truncate(value);
             switch (pic1_phase) {
-                .icw2 => { pic1_vector_base = v; pic1_phase = .icw3; },
-                .icw3 => { pic1_phase = .icw4; },
-                .icw4 => { pic1_phase = .ready; },
-                .ready => { pic1_mask = v; }, // OCW1: interrupt mask
+                .icw2 => {
+                    pic1_vector_base = v;
+                    pic1_phase = .icw3;
+                },
+                .icw3 => {
+                    pic1_phase = .icw4;
+                },
+                .icw4 => {
+                    pic1_phase = .ready;
+                },
+                .ready => {
+                    pic1_mask = v;
+                }, // OCW1: interrupt mask
             }
         },
         PIC2_CMD => {
             const v: u8 = @truncate(value);
-            if (v & 0x10 != 0) { pic2_phase = .icw2; }
+            if (v & 0x10 != 0) {
+                pic2_phase = .icw2;
+            }
         },
         PIC2_DATA => {
             const v: u8 = @truncate(value);
             switch (pic2_phase) {
-                .icw2 => { pic2_vector_base = v; pic2_phase = .icw3; },
-                .icw3 => { pic2_phase = .icw4; },
-                .icw4 => { pic2_phase = .ready; },
-                .ready => { pic2_mask = v; },
+                .icw2 => {
+                    pic2_vector_base = v;
+                    pic2_phase = .icw3;
+                },
+                .icw3 => {
+                    pic2_phase = .icw4;
+                },
+                .icw4 => {
+                    pic2_phase = .ready;
+                },
+                .ready => {
+                    pic2_mask = v;
+                },
             }
         },
         PIT_CMD => handlePitCommand(@truncate(value)),

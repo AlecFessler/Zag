@@ -32,8 +32,7 @@ pub fn main(_: u64) void {
 
     const fm: *const syscall.FaultMessage = @ptrCast(@alignCast(&fault_buf));
     if (fm.fault_reason != syscall.FAULT_REASON_PMU_OVERFLOW) {
-        t.failWithVal("§4.1.48 fault_reason",
-            syscall.FAULT_REASON_PMU_OVERFLOW, @intCast(fm.fault_reason));
+        t.failWithVal("§4.1.48 fault_reason", syscall.FAULT_REASON_PMU_OVERFLOW, @intCast(fm.fault_reason));
         _ = syscall.fault_reply_simple(@bitCast(token), syscall.FAULT_KILL);
         syscall.shutdown();
     }

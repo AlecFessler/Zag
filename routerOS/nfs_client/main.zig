@@ -102,7 +102,6 @@ const LOG_ROTATE_SIZE: u64 = 256 * 1024; // 256 KB
 var retry_buf: [2048]u8 = undefined;
 var retry_len: usize = 0;
 
-
 // ── Known SHM tracking ──────────────────────────────────────────────
 var known_shm_handles: [32]u64 = .{0} ** 32;
 var known_shm_count: u8 = 0;

@@ -143,8 +143,7 @@ pub fn rndr() ?u64 {
             : [val] "=r" (val),
               [nzcv] "=r" (nzcv),
             :
-            : .{ .nzcv = true }
-        );
+            : .{ .nzcv = true });
         // NZCV bit 30 is Z. If Z == 1 the TRNG was exhausted this cycle
         // — fall through to the software PRNG rather than returning
         // E_AGAIN, so userspace `getrandom` still makes forward progress

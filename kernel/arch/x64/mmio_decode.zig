@@ -75,7 +75,7 @@ fn guestVirtToPhys(vm: *const Vm, cr3: u64, vaddr: u64) ?u64 {
 /// userAccessBegin/userAccessEnd to satisfy SMAP at CPL 0.
 fn readGuestPhysU64(vm: *const Vm, phys: u64) ?u64 {
     const ptr = vm.guestPhysToHost(phys, 8) orelse return null;
-    const u64_ptr: *const align(1) u64 = @ptrCast(ptr);
+    const u64_ptr: *align(1) const u64 = @ptrCast(ptr);
     arch.userAccessBegin();
     defer arch.userAccessEnd();
     return u64_ptr.*;
