@@ -177,9 +177,15 @@ pub fn handleExit(vcpu_obj: *VCpu, exit_info: vm_hw.VmExitInfo) void {
             if (psci_mod.isPsciFid(fid)) {
                 switch (psci_mod.dispatch(vcpu_obj)) {
                     .handled => {
-                        // HVC preferred return is the instruction
-                        // after HVC (ARM ARM D1.10.2).
-                        vcpu_obj.guest_state.pc +%= 4;
+                        // gs.pc was snapshotted from ELR_EL2, which the
+                        // hardware sets to (HVC + 4) — the instruction
+                        // after the HVC. So gs.pc already points at the
+                        // correct resume PC; do NOT add another 4 or we
+                        // skip a real instruction. (The VMM-delivered
+                        // path below rolls PC back by 4 because the VMM
+                        // contract is "exit PC names the trapping HVC,
+                        // VMM advances on resume" — that's a separate
+                        // rule and does not apply when we resolve inline.)
                         return;
                     },
                     .forward_to_vmm => {},

@@ -60,11 +60,18 @@ const syscall = lib.syscall;
 // ---------------------------------------------------------------------------
 
 const GUEST_RAM_BASE: u64 = 0x20000000;
-const GUEST_RAM_SIZE: u64 = 64 * 1024 * 1024;
+const GUEST_RAM_SIZE: u64 = 256 * 1024 * 1024;
 const GUEST_RAM_END: u64 = GUEST_RAM_BASE + GUEST_RAM_SIZE;
 
-const LINUX_TEXT_OFFSET: u64 = 0x80000;
-const LINUX_LOAD_ADDR: u64 = GUEST_RAM_BASE + LINUX_TEXT_OFFSET;
+// Per Documentation/arm64/booting.rst: the loader places the Image at
+// (2 MiB-aligned base) + image.text_offset. Modern Linux (post-4.10) sets
+// text_offset = 0 in the Image header — the previous TEXT_OFFSET = 0x80000
+// is legacy. Using the wrong offset shifts every kernel-VA mapping down by
+// that delta and the very first post-MMU branch (br x8 to __primary_switched)
+// reads from the wrong PA, manifesting as a stage-1 instr fault on the
+// kernel half of the address space.
+const LINUX_LOAD_BASE: u64 = GUEST_RAM_BASE; // 2 MiB-aligned RAM base
+var linux_load_addr: u64 = 0; // resolved from Image header in loadGuestImages
 
 // FDT + initramfs live inside the mapped RAM bank so vm_guest_map wires
 // them into stage-2 along with the rest of RAM. Placed 32 MiB above the
@@ -292,20 +299,38 @@ fn loadGuestImages() void {
         log.print("bad arm64 Image header\n");
         syscall.shutdown();
     };
-    _ = hdr; // text_offset is fixed to LINUX_TEXT_OFFSET in our layout.
 
-    if (assets.image.len > GUEST_RAM_SIZE - LINUX_TEXT_OFFSET) {
-        log.print("Image too large for guest RAM\n");
+    // Linux arm64 booting.rst: image_size is the total in-memory footprint
+    // (head + text + data + BSS). The loader must provide image_size bytes
+    // of contiguous memory at the load address, and the BSS tail past the
+    // on-disk file bytes must be ZERO — reserved_pg_dir, init_pg_dir,
+    // swapper_pg_dir, init_task stack, idmap tables and many other early
+    // boot structures live in that BSS and rely on post-loader zeroing.
+    // Leaving garbage there corrupts the early page-table walk and
+    // produces silent stage-1 faults during __primary_switched.
+    linux_load_addr = LINUX_LOAD_BASE + hdr.text_offset;
+    if (hdr.image_size > GUEST_RAM_SIZE - hdr.text_offset) {
+        log.print("image_size too large for guest RAM\n");
+        syscall.shutdown();
+    }
+    if (assets.image.len > hdr.image_size) {
+        log.print("on-disk Image larger than image_size — bad header\n");
         syscall.shutdown();
     }
 
-    const kdst = guestToHost(LINUX_LOAD_ADDR);
+    const kdst = guestToHost(linux_load_addr);
     var ki: usize = 0;
     while (ki < assets.image.len) : (ki += 1) kdst[ki] = assets.image[ki];
+    // Zero the BSS tail [file_size .. image_size). Critical — see above.
+    while (ki < hdr.image_size) : (ki += 1) kdst[ki] = 0;
     log.print("Image loaded: ");
     log.dec(assets.image.len);
-    log.print(" bytes @0x");
-    log.hex64(LINUX_LOAD_ADDR);
+    log.print(" bytes (+");
+    log.dec(hdr.image_size - assets.image.len);
+    log.print(" BSS) @0x");
+    log.hex64(linux_load_addr);
+    log.print(" text_offset=0x");
+    log.hex64(hdr.text_offset);
     log.print("\n");
 
     const idst = guestToHost(INITRAMFS_LOAD_ADDR);
@@ -321,7 +346,7 @@ fn loadGuestImages() void {
         .ram_size = GUEST_RAM_SIZE,
         .initrd_start = initrd.start,
         .initrd_end = initrd.end,
-        .bootargs = "console=ttyAMA0 earlycon=pl011,0x09000000 panic=-1",
+        .bootargs = "console=ttyAMA0 earlycon=pl011,mmio32,0x09000000 maxcpus=1 nokaslr lpj=5000000 keep_bootcon ignore_loglevel panic=-1",
         .gicd_base = GICD_BASE,
         .gicd_size = GICD_SIZE,
         .gicr_base = GICR_BASE,
@@ -347,7 +372,7 @@ fn loadGuestImages() void {
 /// Initialize the vCPU to the arm64 boot protocol entry state.
 fn setupVcpuState() void {
     guest_state = .{};
-    guest_state.pc = LINUX_LOAD_ADDR;
+    guest_state.pc = linux_load_addr;
     guest_state.x0 = FDT_LOAD_ADDR;
     guest_state.x1 = 0;
     guest_state.x2 = 0;
@@ -612,6 +637,17 @@ fn handleStage2Fault(gs: *GuestState) bool {
         log.print("data fault @0x");
     }
     log.hex64(guest_phys);
+    log.print("\n");
+    log.print("  pc=0x"); log.hex64(gs.pc);
+    log.print(" elr1=0x"); log.hex64(gs.elr_el1);
+    log.print(" far1=0x"); log.hex64(gs.far_el1);
+    log.print(" esr1=0x"); log.hex64(gs.esr_el1);
+    log.print("\n  sctlr=0x"); log.hex64(gs.sctlr_el1);
+    log.print(" tcr=0x"); log.hex64(gs.tcr_el1);
+    log.print(" ttbr0=0x"); log.hex64(gs.ttbr0_el1);
+    log.print(" ttbr1=0x"); log.hex64(gs.ttbr1_el1);
+    log.print("\n  vbar=0x"); log.hex64(gs.vbar_el1);
+    log.print(" mair=0x"); log.hex64(gs.mair_el1);
     log.print("\n");
     return true;
 }

@@ -872,6 +872,7 @@ pub const HCR_EL2_IMO: u64 = 1 << 4; // route physical IRQ to EL2 / enable vIRQ
 pub const HCR_EL2_AMO: u64 = 1 << 5; // route physical SError to EL2 / enable vSError
 pub const HCR_EL2_VF: u64 = 1 << 6; // virtual FIQ pending (set by vgic inject)
 pub const HCR_EL2_VI: u64 = 1 << 7; // virtual IRQ pending (set by vgic inject)
+pub const HCR_EL2_DC: u64 = 1 << 12; // default cacheability: treat stage-1-off as Normal WB cacheable
 pub const HCR_EL2_TWI: u64 = 1 << 13; // trap WFI from EL1/EL0 to EL2
 pub const HCR_EL2_TWE: u64 = 1 << 14; // trap WFE from EL1/EL0 to EL2
 pub const HCR_EL2_TID0: u64 = 1 << 15; // trap ID group 0 reads (AArch32 feature ids)
@@ -930,6 +931,15 @@ pub const HCR_EL2_RW: u64 = 1 << 31; // EL1 execution state = AArch64 (not AArch
 ///   TLOR  : not set — LORegions are not emulated.
 ///   HA/HD : not set in VTCR_EL2 either; hw access/dirty flag updates are
 ///           a later-wave optimisation.
+// NB: HCR_EL2.DC is intentionally NOT set. Per ARM ARM D13.2.46, DC=1
+// forces stage-1 EL1 translation to behave as if SCTLR_EL1.M=0 even when
+// the guest has actually enabled its MMU. QEMU's TCG implements this
+// faithfully (target/arm/ptw.c regime_translation_disabled() returns
+// true whenever HCR_EL2.DC is set), which means the very first kernel-VA
+// fetch after Linux's __enable_mmu fails an Address Size check at level 0
+// and the guest spirals into an unmapped exception vector. The loader
+// (us) is responsible for cleaning the loaded image to PoC instead — see
+// loadGuestImages() in hyprvOS/vmm/aarch64/main.zig.
 pub const HCR_EL2_LINUX_GUEST: u64 = HCR_EL2_VM |
     HCR_EL2_SWIO |
     HCR_EL2_FMO |

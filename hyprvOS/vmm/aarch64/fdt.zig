@@ -226,7 +226,15 @@ pub const Builder = struct {
         try self.writeU32BE(4, @intCast(total_size));
         try self.writeU32BE(8, @intCast(self.struct_start));
         try self.writeU32BE(12, @intCast(strings_relocate_to));
-        try self.writeU32BE(16, 48); // off_mem_rsvmap (sits right after the 40-byte header, 8-byte aligned)
+        // off_mem_rsvmap points to the start of the memory reservation
+        // block, which must end with a 16-byte (addr=0, size=0) terminator.
+        // We reserve exactly 16 bytes after the 40-byte header for the
+        // terminator (struct_start = 40 + 16 = 56), so the reserve block
+        // begins at offset 40 — NOT 48. Setting off_mem_rsvmap = 48 leaves
+        // only 8 bytes for the terminator and lets the size-half overlap
+        // FDT_BEGIN_NODE (0x00000001 BE), which Linux reads as size =
+        // 0x100000000 → it never sees a terminator and walks past the FDT.
+        try self.writeU32BE(16, 40);
         try self.writeU32BE(20, FDT_VERSION);
         try self.writeU32BE(24, FDT_LAST_COMP_VERSION);
         try self.writeU32BE(28, 0); // boot_cpuid_phys
@@ -346,6 +354,19 @@ pub fn build(out: []u8, cfg: Config) BuildError!usize {
     });
     try b.endNode();
 
+    // /apb-pclk — fixed-rate clock for the PL011. The Linux pl011 driver
+    // requires both `clocks` AND `clock-names` to be present and resolvable
+    // before it will probe; without it we get "Warning: unable to open an
+    // initial console" from init. A single fixed-clock advertised under
+    // both phandles works for the simple driver path.
+    try b.beginNode("apb-pclk");
+    try b.propString("compatible", "fixed-clock");
+    try b.propU32("#clock-cells", 0);
+    try b.propU32("clock-frequency", 24_000_000);
+    try b.propString("clock-output-names", "clk24mhz");
+    try b.propU32("phandle", 2);
+    try b.endNode();
+
     // /pl011@9000000 — emulated UART. interrupts = <0 1 4> (SPI 1, level
     // high). Matches the IRQ the VMM asserts from pl011.zig on TX.
     try b.beginNode("pl011@9000000");
@@ -358,6 +379,7 @@ pub fn build(out: []u8, cfg: Config) BuildError!usize {
     });
     try b.propCells("interrupts", &.{ 0, 1, 4 });
     try b.propU32("interrupt-parent", 1);
+    try b.propCells("clocks", &.{ 2, 2 });
     try b.propStringList("clock-names", &.{ "uartclk", "apb_pclk" });
     try b.endNode();
 
