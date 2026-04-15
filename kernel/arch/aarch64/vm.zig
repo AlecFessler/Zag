@@ -634,8 +634,36 @@ pub inline fn hypCall(id: HypCallId, arg: u64) u64 {
         : [ret] "={x0}" (ret),
         : [id] "{x0}" (@intFromEnum(id)),
           [arg] "{x1}" (arg),
-        : .{ .memory = true });
+        : .{
+            // Hyp stubs use x2, x3 as temporaries (see hvc_tlbi_ipa,
+            // hvc_vgic_prepare_entry, etc.) so mark every AArch64
+            // caller-saved GPR as clobbered. Only x19..x30 are
+            // preserved across the EL1↔EL2 hand-off.
+            .memory = true,
+            .x1 = true,  .x2 = true,  .x3 = true,
+            .x4 = true,  .x5 = true,  .x6 = true,  .x7 = true,
+            .x8 = true,  .x9 = true,  .x10 = true, .x11 = true,
+            .x12 = true, .x13 = true, .x14 = true, .x15 = true,
+            .x16 = true, .x17 = true, .x18 = true,
+        });
     return ret;
+}
+
+/// Walk the kernel page tables to resolve a kernel VA to its PA. Used by
+/// the vm world-switch code and by hyp-call wrappers because EL2 runs
+/// with SCTLR_EL2.M=0 and any pointer handed to a hyp stub is
+/// dereferenced as a raw PA. `PAddr.fromVAddr(VAddr, null)` only works
+/// for physmap addresses; slab-allocated kernel objects (VCpu, arch
+/// scratch buffers, guest-state mirrors) live in the kernel heap
+/// partition and need a proper walk. ARM ARM D5.2 table walk.
+pub fn resolveKernelVaToPa(vaddr: u64) u64 {
+    const base = vaddr & ~@as(u64, 0xFFF);
+    const offset = vaddr & 0xFFF;
+    const page_pa = aarch64_paging.resolveVaddr(
+        memory_init.kernel_addr_space_root,
+        VAddr.fromInt(base),
+    ) orelse @panic("resolveKernelVaToPa: unmapped kernel VA");
+    return page_pa.addr | offset;
 }
 
 // ===========================================================================
@@ -1015,9 +1043,17 @@ pub fn vmResume(
     ctx.* = .{};
     host_save.* = .{};
 
-    const gs_pa = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(guest_state)), null);
-    const hs_pa = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(host_save)), null);
-    const ctx_pa = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(ctx)), null);
+    // EL2 runs with SCTLR_EL2.M=0 so the hyp stubs dereference these
+    // pointers as raw PAs. The VCpu (and its embedded guest_state /
+    // arch_scratch) lives in the slab-allocated kernel heap, not the
+    // physmap range, so we must page-walk rather than doing the direct
+    // subtraction in `PAddr.fromVAddr`.
+    const gs_pa_addr = resolveKernelVaToPa(@intFromPtr(guest_state));
+    const hs_pa_addr = resolveKernelVaToPa(@intFromPtr(host_save));
+    const ctx_pa_addr = resolveKernelVaToPa(@intFromPtr(ctx));
+    const gs_pa = PAddr.fromInt(gs_pa_addr);
+    const hs_pa = PAddr.fromInt(hs_pa_addr);
+    const ctx_pa = PAddr.fromInt(ctx_pa_addr);
 
     ctx.guest_state_pa = gs_pa.addr;
     ctx.host_save_pa = hs_pa.addr;
@@ -1158,10 +1194,19 @@ pub fn vmResume(
           [gfp] "r" (guest_fp_ptr),
           [ctxpa] "r" (ctx_pa.addr),
         : .{
+            // The hvc round-trip lands in hvc_vcpu_run / guest_exit_entry
+            // which freely clobber all caller-saved AArch64 GPRs
+            // (x0..x17) as temporaries. x19..x30 are restored by the
+            // guest_exit_entry epilogue from host_save. Mark the full
+            // caller-saved set here so the compiler does not assume any
+            // of them survive the asm block.
             .memory = true,
-            .x0 = true,
-            .x1 = true,
-            .x2 = true,
+            .x0 = true,  .x1 = true,  .x2 = true,  .x3 = true,
+            .x4 = true,  .x5 = true,  .x6 = true,  .x7 = true,
+            .x8 = true,  .x9 = true,  .x10 = true, .x11 = true,
+            .x12 = true, .x13 = true, .x14 = true, .x15 = true,
+            .x16 = true, .x17 = true, .x18 = true,
+            // Full V register clobber matches the save/restore bracket.
             .v0 = true,  .v1 = true,  .v2 = true,  .v3 = true,
             .v4 = true,  .v5 = true,  .v6 = true,  .v7 = true,
             .v8 = true,  .v9 = true,  .v10 = true, .v11 = true,
@@ -1404,40 +1449,76 @@ export fn hvc_vgic_detect_lrs() linksection(".hyp_text") callconv(.naked) noretu
 //   ICH_VMCR_EL2    = S3_4_C12_C11_7 (D13.8.49)
 //   ICH_HCR_EL2     = S3_4_C12_C11_0 (D13.8.45)
 export fn hvc_vgic_prepare_entry() linksection(".hyp_text") callconv(.naked) noreturn {
+    // num_lrs (x3) is read from shadow offset 0xA8; we guard each LR
+    // write with `cmp x3, #n; b.ls 9f` so hosts that implement fewer
+    // than 16 LRs (e.g. cortex-a72 TCG with 4) don't trigger UNDEFINED
+    // on the high-numbered ICH_LR<n>_EL2 sysregs. GICv3 §12.5.30
+    // ICH_VTR_EL2.ListRegs + 1 = implemented LRs.
     asm volatile (
+        \\  ldr     x3, [x1, #0xA8]         // num_lrs
         \\  ldr     x2, [x1, #0x00]
         \\  msr     S3_4_C12_C12_0, x2
+        \\  cmp     x3, #1
+        \\  b.ls    9f
         \\  ldr     x2, [x1, #0x08]
         \\  msr     S3_4_C12_C12_1, x2
+        \\  cmp     x3, #2
+        \\  b.ls    9f
         \\  ldr     x2, [x1, #0x10]
         \\  msr     S3_4_C12_C12_2, x2
+        \\  cmp     x3, #3
+        \\  b.ls    9f
         \\  ldr     x2, [x1, #0x18]
         \\  msr     S3_4_C12_C12_3, x2
+        \\  cmp     x3, #4
+        \\  b.ls    9f
         \\  ldr     x2, [x1, #0x20]
         \\  msr     S3_4_C12_C12_4, x2
+        \\  cmp     x3, #5
+        \\  b.ls    9f
         \\  ldr     x2, [x1, #0x28]
         \\  msr     S3_4_C12_C12_5, x2
+        \\  cmp     x3, #6
+        \\  b.ls    9f
         \\  ldr     x2, [x1, #0x30]
         \\  msr     S3_4_C12_C12_6, x2
+        \\  cmp     x3, #7
+        \\  b.ls    9f
         \\  ldr     x2, [x1, #0x38]
         \\  msr     S3_4_C12_C12_7, x2
+        \\  cmp     x3, #8
+        \\  b.ls    9f
         \\  ldr     x2, [x1, #0x40]
         \\  msr     S3_4_C12_C13_0, x2
+        \\  cmp     x3, #9
+        \\  b.ls    9f
         \\  ldr     x2, [x1, #0x48]
         \\  msr     S3_4_C12_C13_1, x2
+        \\  cmp     x3, #10
+        \\  b.ls    9f
         \\  ldr     x2, [x1, #0x50]
         \\  msr     S3_4_C12_C13_2, x2
+        \\  cmp     x3, #11
+        \\  b.ls    9f
         \\  ldr     x2, [x1, #0x58]
         \\  msr     S3_4_C12_C13_3, x2
+        \\  cmp     x3, #12
+        \\  b.ls    9f
         \\  ldr     x2, [x1, #0x60]
         \\  msr     S3_4_C12_C13_4, x2
+        \\  cmp     x3, #13
+        \\  b.ls    9f
         \\  ldr     x2, [x1, #0x68]
         \\  msr     S3_4_C12_C13_5, x2
+        \\  cmp     x3, #14
+        \\  b.ls    9f
         \\  ldr     x2, [x1, #0x70]
         \\  msr     S3_4_C12_C13_6, x2
+        \\  cmp     x3, #15
+        \\  b.ls    9f
         \\  ldr     x2, [x1, #0x78]
         \\  msr     S3_4_C12_C13_7, x2
-        \\
+        \\9:
         \\  ldr     x2, [x1, #0x90]         // ap0r0
         \\  msr     S3_4_C12_C8_0, x2
         \\  ldr     x2, [x1, #0x98]         // ap1r0
@@ -1462,40 +1543,73 @@ export fn hvc_vgic_prepare_entry() linksection(".hyp_text") callconv(.naked) nor
 // virtual CPU interface by writing ICH_HCR_EL2 = 0 so a maintenance
 // IRQ cannot fire into the host running window (GICv3 §12.5.7 "En").
 export fn hvc_vgic_save_exit() linksection(".hyp_text") callconv(.naked) noreturn {
+    // Mirror of hvc_vgic_prepare_entry — only read the implemented
+    // LR slots. See that function for the rationale.
     asm volatile (
+        \\  ldr     x3, [x1, #0xA8]         // num_lrs
         \\  mrs     x2, S3_4_C12_C12_0
         \\  str     x2, [x1, #0x00]
+        \\  cmp     x3, #1
+        \\  b.ls    9f
         \\  mrs     x2, S3_4_C12_C12_1
         \\  str     x2, [x1, #0x08]
+        \\  cmp     x3, #2
+        \\  b.ls    9f
         \\  mrs     x2, S3_4_C12_C12_2
         \\  str     x2, [x1, #0x10]
+        \\  cmp     x3, #3
+        \\  b.ls    9f
         \\  mrs     x2, S3_4_C12_C12_3
         \\  str     x2, [x1, #0x18]
+        \\  cmp     x3, #4
+        \\  b.ls    9f
         \\  mrs     x2, S3_4_C12_C12_4
         \\  str     x2, [x1, #0x20]
+        \\  cmp     x3, #5
+        \\  b.ls    9f
         \\  mrs     x2, S3_4_C12_C12_5
         \\  str     x2, [x1, #0x28]
+        \\  cmp     x3, #6
+        \\  b.ls    9f
         \\  mrs     x2, S3_4_C12_C12_6
         \\  str     x2, [x1, #0x30]
+        \\  cmp     x3, #7
+        \\  b.ls    9f
         \\  mrs     x2, S3_4_C12_C12_7
         \\  str     x2, [x1, #0x38]
+        \\  cmp     x3, #8
+        \\  b.ls    9f
         \\  mrs     x2, S3_4_C12_C13_0
         \\  str     x2, [x1, #0x40]
+        \\  cmp     x3, #9
+        \\  b.ls    9f
         \\  mrs     x2, S3_4_C12_C13_1
         \\  str     x2, [x1, #0x48]
+        \\  cmp     x3, #10
+        \\  b.ls    9f
         \\  mrs     x2, S3_4_C12_C13_2
         \\  str     x2, [x1, #0x50]
+        \\  cmp     x3, #11
+        \\  b.ls    9f
         \\  mrs     x2, S3_4_C12_C13_3
         \\  str     x2, [x1, #0x58]
+        \\  cmp     x3, #12
+        \\  b.ls    9f
         \\  mrs     x2, S3_4_C12_C13_4
         \\  str     x2, [x1, #0x60]
+        \\  cmp     x3, #13
+        \\  b.ls    9f
         \\  mrs     x2, S3_4_C12_C13_5
         \\  str     x2, [x1, #0x68]
+        \\  cmp     x3, #14
+        \\  b.ls    9f
         \\  mrs     x2, S3_4_C12_C13_6
         \\  str     x2, [x1, #0x70]
+        \\  cmp     x3, #15
+        \\  b.ls    9f
         \\  mrs     x2, S3_4_C12_C13_7
         \\  str     x2, [x1, #0x78]
-        \\
+        \\9:
         \\  mrs     x2, S3_4_C12_C8_0       // ap0r0
         \\  str     x2, [x1, #0x90]
         \\  mrs     x2, S3_4_C12_C9_0       // ap1r0
