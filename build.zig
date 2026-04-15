@@ -283,7 +283,7 @@ pub fn build(b: *std.Build) void {
     } else blk: {
         const qemu_accel_args: []const u8 = if (kvm)
             \\-enable-kvm \
-            \\-cpu host,+invtsc,+pmu,+perfctr-core
+            \\-cpu host,+invtsc
         else
             \\-machine accel=tcg \
             \\-cpu qemu64,+invtsc \
