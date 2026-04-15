@@ -17,16 +17,13 @@
 //!   CNTV_TVAL_EL0:  virtual timer countdown value
 //!
 //! Which timer to use:
-//! - Preemption: EL1 physical timer (CNTP_*, INTID 30). Works both
-//!   bare-metal and under KVM. Pi 5 KVM vGICv2 drops CNTV injections
-//!   to secondary vCPUs once they run EL0, so CNTV (INTID 27) is
-//!   unsafe as a per-core preemption source (see writeCntpTval docs).
-//! - Timestamp reads: CNTVCT_EL0 (virtual counter) — still always
-//!   safe to read; its behaviour is independent of the CNTV interrupt.
+//! - Non-virtualized kernel: physical timer (CNTP_*) for preemption.
+//! - Under a hypervisor: virtual timer (CNTV_*) — host controls physical.
+//! - Timestamp reads: CNTVCT_EL0 (virtual counter) is always safe to use.
 //!
-//! Timer interrupt: PPI 30 (physical). The GIC must be configured to
-//! route this to the exception handler. When the timer fires, the
-//! handler calls the scheduler's preemption logic.
+//! Timer interrupt: PPI 30 (physical) or PPI 27 (virtual). The GIC must
+//! be configured to route these to the exception handler. When the timer
+//! fires, the handler calls the scheduler's preemption logic.
 //!
 //! Tick → nanosecond conversion:
 //!   ns = ticks * 1_000_000_000 / CNTFRQ_EL0
@@ -63,40 +60,28 @@ inline fn readCntfrq() u64 {
     return freq;
 }
 
-/// Write CNTP_TVAL_EL0 — physical timer 32-bit downcounter.
+/// Write CNTV_TVAL_EL0 — virtual timer 32-bit downcounter.
 ///
-/// We use the EL1 physical timer (PPI 30) for scheduler preemption
-/// rather than the virtual timer (PPI 27). Both are architecturally
-/// usable from EL1 once CNTHCTL_EL2.{EL1PCEN,EL1PCTEN} are set (done
-/// by the bootloader EL2→EL1 drop and by the secondary-CPU EL2→EL1
-/// drop in smp.zig) and match our platform profile: AAVMF firmware
-/// sets these bits on EL2 exit, and KVM makes CNTP directly usable
-/// by guest EL1 with CNTVOFF_EL2 transparent to the guest.
+/// We use the virtual timer (PPI 27) rather than the physical timer
+/// (PPI 30) because the virtual timer is always accessible from EL1
+/// and does not require EL2-level configuration of CNTHCTL_EL2 to
+/// route the interrupt. On QEMU virt with UEFI AAVMF, the physical
+/// timer interrupt is delivered to EL2 and not forwarded to EL1 unless
+/// the firmware has explicitly enabled EL1PCEN, which it does not
+/// reliably do across AAVMF versions.
 ///
-/// Empirically, Pi 5 KVM's in-kernel vGICv2 drops CNTV PPI 27
-/// injections to secondary vCPUs once they dispatch an EL0 thread:
-/// PMCCNTR/INTID 27 IRQ counters advance on core 0 (whose yield-SGI
-/// path keeps ticking) but stay at single-digit totals on cores 1-3
-/// for the whole test window. The EL1 physical timer (INTID 30) is
-/// routed by the same vGICv2 bypassing the CNTV path and is reliably
-/// delivered to every vCPU. Switching preemption to CNTP also removes
-/// the last dependency on vGICv2 CNTV injection, which is the quirk
-/// documented in kernel/arch/aarch64/gic.zig:906-944. TCG GICv3 and
-/// TCG GICv2 both route INTID 30 correctly, so this is a strict
-/// reliability improvement, not a Pi-only workaround.
-///
-/// ARM ARM D13.8.12: CNTP_TVAL_EL0. Writing TVAL sets CVAL = CNTPCT + TVAL.
-inline fn writeCntpTval(val: u32) void {
-    asm volatile ("msr cntp_tval_el0, %[val]"
+/// ARM ARM D13.8.21: CNTV_TVAL_EL0. Writing TVAL sets CVAL = CNTVCT + TVAL.
+inline fn writeCntvTval(val: u32) void {
+    asm volatile ("msr cntv_tval_el0, %[val]"
         :
         : [val] "r" (@as(u64, val)),
     );
 }
 
-/// Write CNTP_CTL_EL0 — physical timer control register.
-/// ARM ARM D13.8.11: CNTP_CTL_EL0. Bit 0 ENABLE, bit 1 IMASK, bit 2 ISTATUS.
-inline fn writeCntpCtl(val: u64) void {
-    asm volatile ("msr cntp_ctl_el0, %[val]"
+/// Write CNTV_CTL_EL0 — virtual timer control register.
+/// ARM ARM D13.8.20: CNTV_CTL_EL0. Same bit layout as CNTP_CTL_EL0.
+inline fn writeCntvCtl(val: u64) void {
+    asm volatile ("msr cntv_ctl_el0, %[val]"
         :
         : [val] "r" (val),
     );
@@ -107,16 +92,15 @@ inline fn ensureFreqCached() void {
     cached_freq_hz = readCntfrq();
 }
 
-/// Physical timer for preemption — arms a deadline interrupt via CNTP_TVAL_EL0.
+/// Virtual timer for preemption — arms a deadline interrupt via CNTV_TVAL_EL0.
 ///
-/// We use the EL1 physical timer (INTID 30) instead of the virtual
-/// timer (INTID 27) because Pi 5 KVM's vGICv2 drops CNTV injections
-/// to secondary vCPUs once they run an EL0 thread (see writeCntpTval
-/// and gic.zig:906-944 for the diagnosis). CNTP is universally
-/// available at EL1 on every platform we target: the bootloader
-/// EL2→EL1 drop and smp.zig's secondary EL2→EL1 drop both set
-/// CNTHCTL_EL2.{EL1PCEN,EL1PCTEN} = 1 before handing off, and under
-/// KVM the host leaves CNTP directly accessible to the guest kernel.
+/// We use the virtual timer (INTID 27) instead of the physical timer
+/// (INTID 30) because the virtual timer is always accessible from EL1
+/// without EL2 firmware having to set CNTHCTL_EL2.EL1PCEN. Some QEMU
+/// AAVMF images drop to EL1 without enabling EL1 access to the physical
+/// timer, and every PPI 30 interrupt is silently discarded. The virtual
+/// timer has no such gating and is the conventional choice for guest
+/// kernels on GICv3 (see Linux arm64 arch_timer_kvm_info).
 ///
 /// ARM ARM D11.2.4: Timer conditions and timer interrupts.
 const PreemptionTimer = struct {
@@ -140,19 +124,19 @@ const PreemptionTimer = struct {
     ///
     /// The `Timer` vtable contract (shared with x64 LAPIC/HPET) treats
     /// `timer_val_ns` as a RELATIVE delta, not an absolute deadline. The
-    /// ARM generic timer provides CNTP_TVAL_EL0 which internally computes
-    /// CVAL = CNTPCT + TVAL, so we clamp the delta to 32 bits and let
+    /// ARM generic timer provides CNTV_TVAL_EL0 which internally computes
+    /// CVAL = CNTVCT + TVAL, so we clamp the delta to 32 bits and let
     /// hardware do the offset math.
     ///
-    /// ARM ARM D13.8.12: CNTP_TVAL_EL0.
-    /// ARM ARM D13.8.11: CNTP_CTL_EL0 — ENABLE=1, IMASK=0.
+    /// ARM ARM D13.8.21: CNTV_TVAL_EL0.
+    /// ARM ARM D13.8.20: CNTV_CTL_EL0 — ENABLE=1, IMASK=0.
     fn armInterruptTimer(_: *anyopaque, delta_ns: u64) void {
         var delta_ticks = timer_mod.ticksFromNanosCeil(cached_freq_hz, delta_ns);
         if (delta_ticks == 0) delta_ticks = 1;
         if (delta_ticks > 0x7FFF_FFFF) delta_ticks = 0x7FFF_FFFF;
-        writeCntpTval(@intCast(delta_ticks));
+        writeCntvTval(@intCast(delta_ticks));
         // ENABLE=1 (bit 0), IMASK=0 (bit 1 clear)
-        writeCntpCtl(0x1);
+        writeCntvCtl(0x1);
     }
 };
 
