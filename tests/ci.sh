@@ -108,7 +108,17 @@ stage_start x64_kernel "x86 kernel tests (KVM, 590)"
 # s4_1_107 / s6_11 noise-sensitive tests. Re-run each failing test
 # serially once with a fresh QEMU boot before declaring x64_kernel a failure.
 # Any test that fails BOTH runs is a real regression.
-x64_kernel_fails="$(grep -aE '^\s*\[FAIL\] s[0-9]+_[0-9]+_[0-9]+' "$RUN_DIR/x64_kernel.log" | sed 's/.*\[FAIL\] //; s/ .*//' | sort -u)"
+x64_kernel_fails="$({
+    # run_tests.sh's Failures: section shows two shapes per failing test:
+    #   [FAIL] s<n>_<n>_<n> (no output)      — NOOUT / timeout
+    #   [FAIL] §<n>.<n>.<n> <text>           — assertion failed, test ran
+    # Grab both and normalise §x.y.z → sx_y_z so the retry loop can find
+    # the matching ELF.
+    grep -aE '\[FAIL\] s[0-9]+_[0-9]+_[0-9]+' "$RUN_DIR/x64_kernel.log" \
+        | sed -E 's/.*\[FAIL\] (s[0-9]+_[0-9]+_[0-9]+).*/\1/'
+    grep -aE '\[FAIL\] §[0-9]+\.[0-9]+\.[0-9]+' "$RUN_DIR/x64_kernel.log" \
+        | sed -E 's/.*\[FAIL\] §([0-9]+)\.([0-9]+)\.([0-9]+).*/s\1_\2_\3/'
+} | sort -u)"
 if [ -n "$x64_kernel_fails" ]; then
     echo "== retrying ${x64_kernel_fails} serially ==" >> "$RUN_DIR/x64_kernel.log"
     real_fails=0
@@ -227,7 +237,12 @@ else
     # One-shot retry like x64_kernel: re-run any failing test serially with a
     # fresh QEMU boot. Flakes under parallel-TCG recover; real regressions
     # stay real.
-    arm_kernel_tcg_fails="$(grep -aE '^\s*\[FAIL\] s[0-9]+_[0-9]+_[0-9]+' "$RUN_DIR/arm_kernel_tcg.log" | sed 's/.*\[FAIL\] //; s/ .*//' | sort -u)"
+    arm_kernel_tcg_fails="$({
+        grep -aE '\[FAIL\] s[0-9]+_[0-9]+_[0-9]+' "$RUN_DIR/arm_kernel_tcg.log" \
+            | sed -E 's/.*\[FAIL\] (s[0-9]+_[0-9]+_[0-9]+).*/\1/'
+        grep -aE '\[FAIL\] §[0-9]+\.[0-9]+\.[0-9]+' "$RUN_DIR/arm_kernel_tcg.log" \
+            | sed -E 's/.*\[FAIL\] §([0-9]+)\.([0-9]+)\.([0-9]+).*/s\1_\2_\3/'
+    } | sort -u)"
     if [ -n "$arm_kernel_tcg_fails" ]; then
         echo "== retrying ${arm_kernel_tcg_fails} serially ==" >> "$RUN_DIR/arm_kernel_tcg.log"
         real_fails=0; flakes=0
