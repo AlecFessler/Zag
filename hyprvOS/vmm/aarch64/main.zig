@@ -4,15 +4,16 @@
 //! vCPU ARM guest, loads a Linux arm64 Image + FDT + (optional) initramfs
 //! into guest RAM, and runs the vm_recv / vm_reply_action exit loop.
 //!
-//! Guest physical memory layout (QEMU `virt` model compatible):
+//! Guest physical memory layout (within the kernel's 1 GiB stage-2 IPA
+//! window; see kernel/arch/aarch64/vm.zig IpaOutOfRange check):
 //!   0x0800_0000  GICv3 distributor              (matches kernel vgic.zig)
 //!   0x080A_0000  GICv3 redistributor(s)
 //!   0x0900_0000  PL011 UART                     (see pl011.zig)
-//!   0x4000_0000  RAM base
-//!   0x4008_0000  Linux Image load (RAM + TEXT_OFFSET 0x80000)
-//!   0x4800_0000  FDT
-//!   0x4810_0000  Initramfs start (when loaded)
-//!   0x4800_0000 + 128 MiB  RAM end
+//!   0x2000_0000  RAM base                       (512 MiB IPA)
+//!   0x2008_0000  Linux Image load (RAM + TEXT_OFFSET 0x80000)
+//!   0x2200_0000  FDT                            (RAM + 32 MiB)
+//!   0x2210_0000  Initramfs start (RAM + 33 MiB)
+//!   0x2400_0000  RAM end                        (RAM + 64 MiB)
 //!
 //! vCPU entry state (arm64 boot protocol, arch/arm64/Documentation/booting.rst):
 //!   PC     = 0x4008_0000 (first instruction of Image)
@@ -43,6 +44,7 @@
 
 const lib = @import("lib");
 
+const assets = @import("assets");
 const fdt = @import("fdt.zig");
 const initramfs = @import("initramfs.zig");
 const linux_image = @import("linux_image.zig");
@@ -57,16 +59,20 @@ const syscall = lib.syscall;
 // Guest physical memory layout
 // ---------------------------------------------------------------------------
 
-const GUEST_RAM_BASE: u64 = 0x40000000;
-const GUEST_RAM_SIZE: u64 = 128 * 1024 * 1024;
+const GUEST_RAM_BASE: u64 = 0x20000000;
+const GUEST_RAM_SIZE: u64 = 64 * 1024 * 1024;
 const GUEST_RAM_END: u64 = GUEST_RAM_BASE + GUEST_RAM_SIZE;
 
 const LINUX_TEXT_OFFSET: u64 = 0x80000;
 const LINUX_LOAD_ADDR: u64 = GUEST_RAM_BASE + LINUX_TEXT_OFFSET;
 
-const FDT_LOAD_ADDR: u64 = 0x48000000;
+// FDT + initramfs live inside the mapped RAM bank so vm_guest_map wires
+// them into stage-2 along with the rest of RAM. Placed 32 MiB above the
+// RAM base, well past any reasonable Linux Image + BSS footprint for a
+// tinyconfig kernel (image_size typically < 8 MiB).
+const FDT_LOAD_ADDR: u64 = GUEST_RAM_BASE + 0x02000000;
 const FDT_MAX_SIZE: u64 = 0x10000; // 64 KiB headroom
-const INITRAMFS_LOAD_ADDR: u64 = 0x48100000;
+const INITRAMFS_LOAD_ADDR: u64 = GUEST_RAM_BASE + 0x02100000;
 
 const GICD_BASE: u64 = 0x08000000;
 const GICD_SIZE: u64 = 0x00010000;
@@ -248,7 +254,13 @@ fn setupGuestRam() void {
 
     const m = syscall.vm_guest_map(vm_handle, host_va, GUEST_RAM_BASE, GUEST_RAM_SIZE, RW_X);
     if (m != syscall.E_OK) {
-        log.print("vm_guest_map ram failed\n");
+        log.print("vm_guest_map ram failed err=");
+        log.dec(@bitCast(-m));
+        log.print(" host_va=0x");
+        log.hex64(host_va);
+        log.print(" size=");
+        log.dec(GUEST_RAM_SIZE);
+        log.print("\n");
         syscall.shutdown();
     }
     guest_ram_host_va = host_va;
@@ -273,19 +285,36 @@ fn guestToHost(guest_pa: u64) [*]u8 {
 // Guest image placement
 // ---------------------------------------------------------------------------
 
-/// Load the Linux Image header (stub), build the FDT, and stage the
-/// initramfs. The actual Image bytes are TODO: no asset is embedded yet.
+/// Parse the arm64 Image header, copy the kernel and initramfs into
+/// guest RAM, and build the FDT that /chosen will point the kernel at.
 fn loadGuestImages() void {
-    // TODO(m7.2/m7.6): copy real Image + initramfs bytes into guest
-    // physical memory. For now we leave the RAM bank empty; running the
-    // vCPU will fault immediately, which is acceptable as a skeleton
-    // checkpoint.
-    log.print("loadGuestImages: Image+initramfs assets NOT embedded (TODO)\n");
+    const hdr = linux_image.parse(assets.image) catch {
+        log.print("bad arm64 Image header\n");
+        syscall.shutdown();
+    };
+    _ = hdr; // text_offset is fixed to LINUX_TEXT_OFFSET in our layout.
 
-    // Even without an asset we synthesize the FDT so the rest of the
-    // pipeline (X0=FDT, /chosen bootargs, PL011 node) can be exercised
-    // as soon as an Image blob is wired in.
-    const initrd = initramfs.load(INITRAMFS_LOAD_ADDR);
+    if (assets.image.len > GUEST_RAM_SIZE - LINUX_TEXT_OFFSET) {
+        log.print("Image too large for guest RAM\n");
+        syscall.shutdown();
+    }
+
+    const kdst = guestToHost(LINUX_LOAD_ADDR);
+    var ki: usize = 0;
+    while (ki < assets.image.len) : (ki += 1) kdst[ki] = assets.image[ki];
+    log.print("Image loaded: ");
+    log.dec(assets.image.len);
+    log.print(" bytes @0x");
+    log.hex64(LINUX_LOAD_ADDR);
+    log.print("\n");
+
+    const idst = guestToHost(INITRAMFS_LOAD_ADDR);
+    const initrd = initramfs.load(idst, INITRAMFS_LOAD_ADDR);
+    log.print("initramfs loaded: ");
+    log.dec(initrd.end - initrd.start);
+    log.print(" bytes @0x");
+    log.hex64(initrd.start);
+    log.print("\n");
 
     const cfg = fdt.Config{
         .ram_base = GUEST_RAM_BASE,
@@ -333,18 +362,48 @@ fn setupVcpuState() void {
 // Exit loop
 // ---------------------------------------------------------------------------
 
+var exit_count: u64 = 0;
+
 fn exitLoop() void {
     while (!terminate) {
         const tok = syscall.vm_recv(vm_handle, @intFromPtr(&exit_buf), 1);
         if (tok < 0) {
             log.print("vm_recv err ");
             log.dec(@bitCast(-tok));
-            log.print("\n");
+            log.print(" after ");
+            log.dec(exit_count);
+            log.print(" exits\n");
             return;
         }
 
         const tag = exit_buf[OFF_EXIT_TAG];
         const gs: *GuestState = @ptrCast(@alignCast(&exit_buf[OFF_GUEST_STATE]));
+
+        exit_count += 1;
+        if (exit_count <= 200 or (exit_count & 0x3FF) == 0) {
+            log.print("exit#");
+            log.dec(exit_count);
+            log.print(" tag=");
+            log.dec(tag);
+            log.print(" pc=0x");
+            log.hex64(gs.pc);
+            if (tag == EXIT_TAG_SYSREG) {
+                const iss = readU32LE(&exit_buf, OFF_EXIT_PAYLOAD);
+                const op0: u32 = (iss >> 20) & 0x3;
+                const op2: u32 = (iss >> 17) & 0x7;
+                const op1: u32 = (iss >> 14) & 0x7;
+                const crn: u32 = (iss >> 10) & 0xF;
+                const rt: u32 = (iss >> 5) & 0x1F;
+                const crm: u32 = (iss >> 1) & 0xF;
+                const rd: u32 = iss & 0x1;
+                log.print(" S");
+                log.dec(op0); log.print("_"); log.dec(op1); log.print("_c");
+                log.dec(crn); log.print("_c"); log.dec(crm); log.print("_");
+                log.dec(op2); log.print(" Rt="); log.dec(rt);
+                log.print(if (rd != 0) " R" else " W");
+            }
+            log.print("\n");
+        }
 
         const kill = handleExit(tag, gs);
         if (kill or terminate) {
@@ -371,12 +430,7 @@ fn handleExit(tag: u8, gs: *GuestState) bool {
         EXIT_TAG_HVC => return handleHvc(gs),
         EXIT_TAG_SMC => return handleHvc(gs), // same SMCCC encoding, just a different conduit
         EXIT_TAG_STAGE2 => return handleStage2Fault(gs),
-        EXIT_TAG_SYSREG => {
-            // Policy-by-default: permit reads to return zero, drop writes.
-            // The kernel already forwards unhandled traps here.
-            advancePc(gs);
-            return false;
-        },
+        EXIT_TAG_SYSREG => return handleSysreg(gs),
         EXIT_TAG_WFI_WFE => {
             // Guest idle — advance past the WFI and let it retry.
             advancePc(gs);
@@ -408,6 +462,73 @@ fn advancePc(gs: *GuestState) void {
     gs.pc +%= 4;
 }
 
+/// Permissive sysreg policy: MRS → write 0 to Rt; MSR → drop.
+/// ISS layout for EC=0x18 (ARM ARM D13.2.39): bit 0 = direction (1 = read),
+/// bits 9..5 = Rt. We only need those to advance the guest past reads
+/// without leaving uninitialized garbage in the destination register —
+/// any other handling is the kernel's job via sysregPassthrough.
+fn handleSysreg(gs: *GuestState) bool {
+    const iss = readU32LE(&exit_buf, OFF_EXIT_PAYLOAD + 0);
+    const is_read = (iss & 0x1) != 0;
+    const rt: u8 = @truncate((iss >> 5) & 0x1F);
+    const op0: u32 = (iss >> 20) & 0x3;
+    const op2: u32 = (iss >> 17) & 0x7;
+    const op1: u32 = (iss >> 14) & 0x7;
+    const crn: u32 = (iss >> 10) & 0xF;
+    const crm: u32 = (iss >> 1) & 0xF;
+    if (is_read) writeGpr(gs, rt, emulateSysregRead(op0, op1, crn, crm, op2), 3);
+    advancePc(gs);
+    return false;
+}
+
+/// Emulated sysreg reads for the common HCR_EL2.TID3-trapped ID feature
+/// registers plus CTR_EL0 (TID2). Values are chosen to advertise a minimal
+/// but plausible ARMv8.0 cortex-a72 core so Linux's feature probes don't
+/// loop on zero-valued fields (CTR cache line size, PARange, etc).
+fn emulateSysregRead(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) u64 {
+    // CTR_EL0 — 64-byte L1 D/I lines, 64-byte CWG, 16-word ERG.
+    if (op0 == 3 and op1 == 3 and crn == 0 and crm == 0 and op2 == 1) return 0x8444C004;
+    // DCZID_EL0 — DZP=1 (DC ZVA prohibited), BS irrelevant.
+    if (op0 == 3 and op1 == 3 and crn == 0 and crm == 0 and op2 == 7) return 0x10;
+    // MIDR_EL1 — cortex-a72 r0p0 (Arm, architecture v8).
+    if (op0 == 3 and op1 == 0 and crn == 0 and crm == 0 and op2 == 0) return 0x410FD080;
+    // MPIDR_EL1 — single-core: U=1 (uniprocessor), Aff0=0.
+    if (op0 == 3 and op1 == 0 and crn == 0 and crm == 0 and op2 == 5) return 0x80000000;
+    // REVIDR_EL1 — no revision info.
+    if (op0 == 3 and op1 == 0 and crn == 0 and crm == 0 and op2 == 6) return 0;
+    // ID_AA64 feature regs (CRn=0, CRm=4..7).
+    if (op0 == 3 and op1 == 0 and crn == 0) {
+        switch (crm) {
+            4 => switch (op2) {
+                0 => return 0x0000000000000011, // ID_AA64PFR0: EL0/EL1 AArch64
+                1 => return 0,                   // ID_AA64PFR1
+                else => {},
+            },
+            5 => switch (op2) {
+                0 => return 0x0000000010305106, // ID_AA64DFR0: v8.2 debug, 6 BPs, 4 WPs
+                1 => return 0,                   // ID_AA64DFR1
+                4 => return 0,                   // ID_AA64AFR0
+                5 => return 0,                   // ID_AA64AFR1
+                else => {},
+            },
+            6 => switch (op2) {
+                0 => return 0x0000000000011120, // ID_AA64ISAR0
+                1 => return 0,                   // ID_AA64ISAR1
+                else => {},
+            },
+            7 => switch (op2) {
+                0 => return 0x0000000000001122, // ID_AA64MMFR0: 40-bit PA, 16-bit ASID
+                1 => return 0,                   // ID_AA64MMFR1
+                2 => return 0,                   // ID_AA64MMFR2
+                3 => return 0,                   // ID_AA64MMFR3
+                else => {},
+            },
+            else => {},
+        }
+    }
+    return 0;
+}
+
 // ---------------------------------------------------------------------------
 // HVC / PSCI handling
 // ---------------------------------------------------------------------------
@@ -426,6 +547,10 @@ fn handleHvc(gs: *GuestState) bool {
 
 fn readU64LE(buf: []const u8, off: usize) u64 {
     return @as(*const align(1) u64, @ptrCast(buf.ptr + off)).*;
+}
+
+fn readU32LE(buf: []const u8, off: usize) u32 {
+    return @as(*const align(1) u32, @ptrCast(buf.ptr + off)).*;
 }
 
 fn readU8(buf: []const u8, off: usize) u8 {

@@ -33,18 +33,16 @@ pub fn build(b: *std.Build) void {
     });
     app_mod.addImport("lib", lib_mod);
 
-    // Embedded assets for QEMU fallback (NVMe may not work in emulation).
-    // Only the x64 path consumes this today; the aarch64 path does not yet
-    // embed a Linux arm64 Image + initramfs (see vmm/aarch64/initramfs.zig).
-    if (!is_arm) {
-        const assets_mod = b.createModule(.{
-            .root_source_file = b.path("assets/assets.zig"),
-            .target = target,
-            .optimize = .Debug,
-            .pic = true,
-        });
-        app_mod.addImport("assets", assets_mod);
-    }
+    // Embedded guest assets for QEMU fallback (NVMe may not work in
+    // emulation). assets/assets.zig dispatches on target arch: bzImage +
+    // initramfs.cpio.gz for x64, raw arm64 Image + rootfs.cpio.gz for arm.
+    const assets_mod = b.createModule(.{
+        .root_source_file = b.path("assets/assets.zig"),
+        .target = target,
+        .optimize = .Debug,
+        .pic = true,
+    });
+    app_mod.addImport("assets", assets_mod);
 
     const start_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = "libz/start.zig" },

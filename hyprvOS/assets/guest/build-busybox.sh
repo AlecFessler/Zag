@@ -41,10 +41,37 @@ fi
 cd "busybox-${BUSYBOX_VERSION}"
 
 # Start from defconfig, then apply our delta (static linking, drop
-# inapplicable applets). Keep it minimal.
+# inapplicable applets). Busybox does not ship kernel's merge_config.sh,
+# so we splice in the overrides by hand: strip any matching symbol from
+# .config and append the fragment, then let `make oldconfig` reconcile.
+# `make defconfig` in busybox prints every symbol with "(NEW) <default>"
+# but does not actually prompt — it's just verbose logging of chosen
+# defaults. Do NOT pipe `yes ""` into it: with `set -o pipefail`, yes
+# takes SIGPIPE when make exits, returning 141, which fails the script.
 make defconfig
-./scripts/kconfig/merge_config.sh -m .config "${BB_CONFIG}"
-make oldconfig </dev/null
+while IFS= read -r line; do
+    case "${line}" in
+        "")
+            continue
+            ;;
+        "# "*" is not set")
+            sym="${line#\# }"; sym="${sym% is not set}"
+            ;;
+        \#*)
+            continue  # descriptive comment line — not a kconfig directive
+            ;;
+        *=*)
+            sym="${line%%=*}"
+            ;;
+        *)
+            continue
+            ;;
+    esac
+    sed -i -e "/^${sym}=/d" -e "/^# ${sym} is not set\$/d" .config
+    echo "${line}" >> .config
+done < "${BB_CONFIG}"
+# Same pipefail caveat as above; feed an empty stdin instead of `yes`.
+make oldconfig </dev/null >/dev/null
 
 make -j"$(nproc)"
 make install  # populates ./_install with the applet tree
