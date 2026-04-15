@@ -320,8 +320,10 @@ fn writeExitMessageToUser(proc: *Process, buf_ptr: u64, handle_id: u64, vcpu_obj
     while (remaining > 0) {
         const page_off = dst_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
-        const page_paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return;
-        const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
+        // See readUserBytes — aarch64 resolveVaddr returns the full PA
+        // including the 12-bit page offset; do NOT add page_off again.
+        const dst_pa = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return;
+        const physmap_addr = VAddr.fromPAddr(dst_pa, null).addr;
         const dst: [*]u8 = @ptrFromInt(physmap_addr);
         @memcpy(dst[0..chunk], msg_bytes[src_off..][0..chunk]);
         src_off += chunk;
@@ -342,8 +344,12 @@ fn readUserBytes(proc: *Process, user_va: u64, buf: []u8) bool {
         const page_off = src_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(src_va), false, false) catch return false;
-        const page_paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
-        const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
+        // aarch64 resolveVaddr returns the FULL PA including the 12-bit
+        // offset within the page (paging.zig line 638), unlike the x64
+        // equivalent which returns the page-base PA. Feed it straight
+        // into VAddr.fromPAddr; do NOT add page_off again.
+        const src_pa = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
+        const physmap_addr = VAddr.fromPAddr(src_pa, null).addr;
         const src: [*]const u8 = @ptrFromInt(physmap_addr);
         @memcpy(buf[dst_off..][0..chunk], src[0..chunk]);
         dst_off += chunk;

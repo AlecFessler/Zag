@@ -432,17 +432,24 @@ fn readU8(buf: []const u8, off: usize) u8 {
     return buf[off];
 }
 
-/// Stage2Fault payload layout (see arch/aarch64/vm.zig VmExitInfo.Stage2Fault).
-/// All at OFF_EXIT_PAYLOAD..+24.
+/// Stage2Fault payload layout (see arch/aarch64/vm.zig VmExitInfo.Stage2Fault):
+///   +0  guest_phys    u64
+///   +8  guest_virt    u64
+///   +16 access_size   u8
+///   +17 srt           u8
+///   +18 fsc           u8
+///   +19 flags         u8 (bit0=instr, bit1=write, bit2=iss_valid, ...)
+///   +20 _pad[4]
 fn handleStage2Fault(gs: *GuestState) bool {
     const guest_phys = readU64LE(&exit_buf, OFF_EXIT_PAYLOAD + 0);
     const guest_virt = readU64LE(&exit_buf, OFF_EXIT_PAYLOAD + 8);
     _ = guest_virt;
-    const is_instruction = readU8(&exit_buf, OFF_EXIT_PAYLOAD + 16) != 0;
-    const is_write = readU8(&exit_buf, OFF_EXIT_PAYLOAD + 17) != 0;
-    const access_size = readU8(&exit_buf, OFF_EXIT_PAYLOAD + 18);
-    const srt = readU8(&exit_buf, OFF_EXIT_PAYLOAD + 19);
-    const iss_valid = readU8(&exit_buf, OFF_EXIT_PAYLOAD + 20) != 0;
+    const access_size = readU8(&exit_buf, OFF_EXIT_PAYLOAD + 16);
+    const srt = readU8(&exit_buf, OFF_EXIT_PAYLOAD + 17);
+    const flags = readU8(&exit_buf, OFF_EXIT_PAYLOAD + 19);
+    const is_instruction = (flags & 0x01) != 0;
+    const is_write = (flags & 0x02) != 0;
+    const iss_valid = (flags & 0x04) != 0;
 
     // PL011 MMIO.
     if (pl011.contains(guest_phys)) {
