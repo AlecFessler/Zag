@@ -411,7 +411,7 @@ def report_summary(session: Session) -> None:
 
 def usage() -> None:
     print(
-        "usage: parse_kprof.py <path|-> [--trace|--sample|--raw]",
+        "usage: parse_kprof.py <path|-> [--trace|--sample|--raw|--json]",
         file=sys.stderr,
     )
 
