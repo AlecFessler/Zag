@@ -58,103 +58,157 @@
 //!   without setting up a fresh identity map of its own code.
 
 const std = @import("std");
-const zag = @import("zag");
 
-const hyp_consts = zag.arch.aarch64.hyp_consts;
+const uefi = std.os.uefi;
 
-/// Small EL2 stack for the minimal hyp vector table. Must be 16-byte
-/// aligned per AAPCS64. Lives in the bootloader's .bss so it is valid
-/// after exitBootServices (loader_data stays mapped until we actually
-/// overwrite it).
+/// Dedicated SP_EL2 stack, 16-byte aligned per AAPCS64. Sits in the
+/// bootloader's .bss. Lives long enough for `dropToEl1` to ERET — the
+/// kernel's own `__hyp_vectors` never references this stack because the
+/// kernel installs a fresh SP_EL2 of its own on world-switch entry.
 var hyp_stack: [0x2000]u8 align(16) = undefined;
 
 // ===========================================================================
-// Minimal EL2 hyp stub vector table (bootloader-local).
+// Bootloader EL2 hyp stub — runtime-allocated.
 //
-// Only the "sync from lower EL, AArch64" vector at offset 0x400 is used;
-// every other vector halts in a tight loop. Nothing in the bootloader or
-// the very early kernel path intentionally issues exceptions to EL2 —
-// this table exists so that stray traps (e.g. HVC from buggy EL1 code
-// before the kernel installs its own __hyp_vectors) are observable as a
-// hang rather than an undefined jump.
+// The stub exposes a tiny HVC dispatcher that the EL1 kernel uses to
+// install its own `__hyp_vectors` at VBAR_EL2. Only the sync-lower-A64
+// vector (offset 0x400) does real work — on HVC imm16 ==
+// `HVC_IMM_INSTALL_VBAR_EL2` (0xE112) it writes x0 into VBAR_EL2 and
+// ERETs; on any other imm it falls through to a bare ERET so EL1 resumes
+// at the instruction after the HVC.
 //
-// The "sync lower A64" vector decodes ESR_EL2.ISS[15:0] (the HVC
-// immediate; ARM ARM D13.2.36). On the well-known selector
-// `HVC_IMM_INSTALL_VBAR_EL2` (0xE112) it writes X0 into VBAR_EL2 and
-// ERETs, letting the EL1 kernel hand off to its own EL2 vector table
-// without needing raw VBAR_EL2 access from EL1. Every other imm16 falls
-// through to a bare ERET — the HVC trap already advanced ELR_EL2 past
-// the HVC, so this resumes EL1 at the next instruction.
+// We allocate the stub in a fresh RuntimeServicesCode page at runtime
+// rather than embedding it in the bootloader PE's `.text` section.
+// Empirically, AAVMF's EL2 MMU drops execute permission on bootloader
+// LoaderCode pages once ExitBootServices runs, which turned the earlier
+// static `bootloader_hyp_vectors` export into an IFSC=0xF prefetch abort
+// loop as soon as the kernel's first HVC landed on the stub. A
+// RuntimeServicesCode page is preserved and remains executable across
+// ExitBootServices, matching how runtime drivers keep running at EL2
+// after firmware hands off.
 //
-// `.naked` + `export` gets us a proper symbol we can take `&` of; the
-// 2-KiB alignment required by VBAR_EL2 is enforced by placing the
-// function in its own section with an explicit alignment below.
+// Every vector entry is a `b .` stall except sync-lower-A64; stray traps
+// simply hang the core in a tight loop that the test runner catches as
+// a timeout rather than running off into random memory.
 // ===========================================================================
 
-export fn bootloader_hyp_vectors() align(2048) callconv(.naked) void {
-    comptime std.debug.assert(hyp_consts.HVC_IMM_INSTALL_VBAR_EL2 == 0xE112);
+/// The stub is 0x800 bytes (a full ARM exception vector table). We
+/// allocate a single 4 KiB RuntimeServicesCode page for it. The vector
+/// table must be 2 KiB-aligned (ARM ARM D13.2.148 VBAR_EL2); a fresh
+/// page from AllocatePages is 4 KiB-aligned so the start of the page
+/// is automatically a legal VBAR_EL2 value.
+const HYP_VECTORS_SIZE: usize = 0x800;
+
+/// Precomputed machine code for the hyp vector stub. Each vector slot
+/// is 0x80 bytes; only the sync-lower-A64 slot at offset 0x400 contains
+/// a real handler, every other slot is a single `b .` branch followed
+/// by padding. Generating the bytes once at comptime lets us memcpy
+/// them into any runtime-allocated code page without relying on
+/// section-relative linker placement of an inline-asm symbol.
+///
+/// The sync-lower-A64 handler at offset 0x400 decodes ESR_EL2.ISS[15:0]
+/// (the HVC imm16) and, on `HVC_IMM_INSTALL_VBAR_EL2`, writes x0 into
+/// VBAR_EL2. Any other imm falls through to a bare ERET. Assembled
+/// bytes verified against `zig build-obj -target aarch64-freestanding`:
+///
+///   mrs  x9, esr_el2              0xD53C5209
+///   mov  x10, #0xFFFF             0xD29FFFEA  (MOVZ)
+///   and  x9, x9, x10              0x8A0A0129
+///   mov  x10, #0xE112             0xD29C224A  (MOVZ)
+///   cmp  x9, x10                  0xEB0A013F
+///   b.ne +12 (-> eret)            0x54000061
+///   msr  vbar_el2, x0             0xD51CC000
+///   isb                           0xD5033FDF
+///   eret                          0xD69F03E0
+///
+/// We deliberately avoid touching SP_EL2 in this handler — hyp_stack
+/// lives in the bootloader .bss and its EL2 access attributes post-
+/// ExitBootServices are unreliable (same reason we moved the vector
+/// page out of the PE `.text`). Clobbering x9/x10 is fine because
+/// `kernel/arch/aarch64/vm.zig :: installHypVectors` marks them
+/// clobbered in its inline asm around the HVC instruction.
+const hyp_vectors_bytes: [HYP_VECTORS_SIZE]u8 = blk: {
+    @setEvalBranchQuota(100000);
+    var out: [HYP_VECTORS_SIZE]u8 = [_]u8{0} ** HYP_VECTORS_SIZE;
+
+    // `b .` — an A64 unconditional branch to self. Opcode 0x14000000.
+    const b_dot: u32 = 0x14000000;
+
+    // Vector slots 0x000..0x3FF (8 slots) and 0x480..0x7FF (7 slots)
+    // all contain a single `b .` at their base. Only the slot at
+    // 0x400 (sync lower A64) holds the actual HVC dispatcher below.
+    const stall_offsets = [_]usize{
+        0x000, 0x080, 0x100, 0x180, 0x200, 0x280, 0x300, 0x380,
+        0x480, 0x500, 0x580, 0x600, 0x680, 0x700, 0x780,
+    };
+    for (stall_offsets) |off| {
+        std.mem.writeInt(u32, out[off..][0..4], b_dot, .little);
+    }
+
+    const handler: [9]u32 = .{
+        0xD53C5209, // mrs  x9, esr_el2
+        0xD29FFFEA, // mov  x10, #0xFFFF  (movz)
+        0x8A0A0129, // and  x9, x9, x10
+        0xD29C224A, // mov  x10, #0xE112  (movz)
+        0xEB0A013F, // cmp  x9, x10
+        0x54000061, // b.ne +12 -> eret
+        0xD51CC000, // msr  vbar_el2, x0
+        0xD5033FDF, // isb
+        0xD69F03E0, // eret
+    };
+    const base = 0x400;
+    for (handler, 0..) |insn, i| {
+        std.mem.writeInt(u32, out[base + i * 4 ..][0..4], insn, .little);
+    }
+
+    break :blk out;
+};
+
+/// Allocate a fresh RuntimeServicesCode page, copy the hyp vector stub
+/// into its base, clean+invalidate the D-cache over it (Point of
+/// Coherency) so the CPU can fetch the freshly written instructions at
+/// EL2, and return the physical address to pass as VBAR_EL2. Must be
+/// called before `dropToEl1` and before ExitBootServices.
+pub fn allocateHypVectorStub(bs: *uefi.tables.BootServices) !u64 {
+    const pages = try bs.allocatePages(.any, .runtime_services_code, 1);
+    const page_ptr: [*]u8 = @ptrCast(pages);
+    const dst = page_ptr[0..HYP_VECTORS_SIZE];
+    @memcpy(dst, &hyp_vectors_bytes);
+    // Zero the tail of the page (0x800..0x1000) so any stray exception
+    // that somehow lands past the vector table decodes as an undefined
+    // instruction rather than a stale value from whatever previously
+    // occupied the page.
+    @memset(page_ptr[HYP_VECTORS_SIZE..0x1000], 0);
+
+    // Clean+invalidate the D-cache over the stub page so the CPU's
+    // I-cache fill after VBAR_EL2 is updated sees the freshly written
+    // instruction bytes from RAM, not stale D-cache lines. Pair this
+    // with an instruction-cache invalidate below. Linux arm64 does the
+    // same in `arch/arm64/kernel/head.S :: __inval_cache_range`.
     asm volatile (
-    // +0x000 — sync EL2t
-        \\        b       .
-        \\        .balign 0x80
-        // +0x080 — irq EL2t
-        \\        b       .
-        \\        .balign 0x80
-        // +0x100 — fiq EL2t
-        \\        b       .
-        \\        .balign 0x80
-        // +0x180 — serror EL2t
-        \\        b       .
-        \\        .balign 0x80
-        // +0x200 — sync EL2h
-        \\        b       .
-        \\        .balign 0x80
-        // +0x280 — irq EL2h
-        \\        b       .
-        \\        .balign 0x80
-        // +0x300 — fiq EL2h
-        \\        b       .
-        \\        .balign 0x80
-        // +0x380 — serror EL2h
-        \\        b       .
-        \\        .balign 0x80
-        // +0x400 — sync lower EL A64.
-        //
-        // Decode ESR_EL2.ISS[15:0] (HVC imm16, ARM ARM D13.2.36).
-        // On HVC_IMM_INSTALL_VBAR_EL2 (0xE112): write X0 into VBAR_EL2.
-        // Any other imm16 falls through to a bare ERET (HVC already
-        // advanced ELR_EL2 past the instruction).
-        \\        stp     x9,  x10, [sp, #-16]!
-        \\        mrs     x9,  esr_el2
-        \\        mov     x10, #0xFFFF
-        \\        and     x9,  x9,  x10
-        \\        mov     x10, #0xE112
-        \\        cmp     x9,  x10
-        \\        b.ne    1f
-        \\        msr     vbar_el2, x0
-        \\        isb
+        \\mov x0, %[base]
+        \\mov x1, %[end]
         \\1:
-        \\        ldp     x9,  x10, [sp], #16
-        \\        eret
-        \\        .balign 0x80
-        // +0x480 — irq lower A64
-        \\        b       .
-        \\        .balign 0x80
-        // +0x500 — fiq lower A64
-        \\        b       .
-        \\        .balign 0x80
-        // +0x580 — serror lower A64
-        \\        b       .
-        \\        .balign 0x80
-        // +0x600..+0x780 — lower AArch32 (unused on a 64-bit-only kernel)
-        \\        b       .
-        \\        .balign 0x80
-        \\        b       .
-        \\        .balign 0x80
-        \\        b       .
-        \\        .balign 0x80
-        \\        b       .
+        \\dc  cvau, x0
+        \\add x0, x0, #64
+        \\cmp x0, x1
+        \\b.lt 1b
+        \\dsb ish
+        \\mov x0, %[base]
+        \\2:
+        \\ic  ivau, x0
+        \\add x0, x0, #64
+        \\cmp x0, x1
+        \\b.lt 2b
+        \\dsb ish
+        \\isb
+        :
+        : [base] "r" (@intFromPtr(page_ptr)),
+          [end] "r" (@intFromPtr(page_ptr) + 0x1000),
+        : .{ .memory = true, .x0 = true, .x1 = true }
     );
+
+    return @intFromPtr(page_ptr);
 }
 
 /// Read CurrentEL.EL (bits [3:2]). 0=EL0, 1=EL1, 2=EL2, 3=EL3.
@@ -180,10 +234,14 @@ pub fn currentEl() u8 {
 /// x0..x9 clobbered by the drop sequence itself are preserved by
 /// saving them to the stack around the call because we compile with
 /// `callconv(.c)`.
-pub fn dropToEl1() void {
-    // Pre-resolve the bootloader hyp vector table address and stack
-    // top in pure Zig so the asm below doesn't have to relocate them.
-    const hyp_vbar: u64 = @intFromPtr(&bootloader_hyp_vectors);
+pub fn dropToEl1(hyp_vbar: u64) void {
+    // Pre-resolve the dedicated EL2 stack top in pure Zig so the asm
+    // below doesn't have to relocate it. `hyp_vbar` is the PA of the
+    // kernel's already-loaded `__hyp_vectors` table (must be 2 KiB
+    // aligned per ARM ARM D13.2.148). The bootloader resolves it via
+    // the kernel ELF's symbol table during section mapping, and this
+    // routine is the sole writer of VBAR_EL2 on the boot path.
+    std.debug.assert(hyp_vbar & 0x7FF == 0);
     const hyp_sp_top: u64 = @intFromPtr(&hyp_stack) + hyp_stack.len;
 
     asm volatile (
@@ -302,10 +360,40 @@ pub fn dropToEl1() void {
         \\        msr     cpacr_el1, x9
         \\
         // -------------------------------------------------------------
-        // 3. Install the bootloader's minimal hyp vector table and
-        //    dedicated SP_EL2; clear TPIDR_EL2 (world-switch "no
-        //    active vCPU" marker).
-        // -------------------------------------------------------------
+        // 3. Disable the EL2 MMU before handing off. AAVMF's firmware
+        //    EL2 page tables cover firmware memory only, so any EL2
+        //    instruction fetch into kernel-allocated pages (our own
+        //    HVC stub, and the kernel's `__hyp_vectors` table once it
+        //    is installed later) translates to an IFSC=0xF permission
+        //    fault — the pages exist in the EL2 walk but they land on
+        //    stale / unexecutable attributes. Turning SCTLR_EL2.M off
+        //    makes EL2 instruction/data accesses use PAs directly and
+        //    become Normal Write-Back cacheable, Outer Shareable
+        //    (ARM ARM D5.2.7 "When the stage of translation is
+        //    disabled"), which is exactly what the kernel's EL2-only
+        //    world-switch path needs.
+        //
+        //    We pair this with:
+        //      - DSB SY + ISB so the MMU disable takes effect before
+        //        the next instruction fetch.
+        //      - `ic iallu` then `tlbi alle2` to drop any stale
+        //        cached translations the previous MMU-on regime
+        //        might have left behind.
+        //      - A second DSB SY + ISB to wait for the IC/TLBI to
+        //        complete system-wide.
+        //
+        //    Then install VBAR_EL2 and clear TPIDR_EL2 as before.
+        \\        mrs     x9,  sctlr_el2
+        \\        mov     x10, #0x1005                // bits 0 (M), 2 (C), 12 (I)
+        \\        bic     x9,  x9,  x10
+        \\        msr     sctlr_el2, x9
+        \\        dsb     sy
+        \\        isb
+        \\        ic      iallu
+        \\        tlbi    alle2
+        \\        dsb     sy
+        \\        isb
+        \\
         \\        msr     vbar_el2, %[hyp_vbar]
         \\        msr     tpidr_el2, xzr
         \\        isb
