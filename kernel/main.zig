@@ -54,10 +54,8 @@ fn kMain(boot_info: *BootInfo) !void {
         arch.earlyDebugChar('|');
     }
     try memory.init(boot_info.mmap);
-    arch.earlyDebugChar('h');
-    try memory.initHeap();
     arch.earlyDebugChar('H');
-    debug_info.init(boot_info.elf_blob.ptr, boot_info.elf_blob.len, boot_info.kaslr_slide, memory.heap_allocator);
+    debug_info.init(boot_info.elf_blob.ptr, boot_info.elf_blob.len, boot_info.kaslr_slide);
     arch.earlyDebugChar('I');
     try arch.parseFirmwareTables(boot_info.xsdp_phys);
     arch.earlyDebugChar('J');

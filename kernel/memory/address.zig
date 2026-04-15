@@ -32,13 +32,9 @@ pub const KernelVA = struct {
             .start = kernel_stacks.end,
             .end = kernel_stacks.end + SLAB_RESERVATION,
         };
-        pub const vm_tree_slab: Range = .{
+        pub const shm_slab: Range = .{
             .start = vm_node_slab.end,
             .end = vm_node_slab.end + SLAB_RESERVATION,
-        };
-        pub const shm_slab: Range = .{
-            .start = vm_tree_slab.end,
-            .end = vm_tree_slab.end + SLAB_RESERVATION,
         };
         pub const device_region_slab: Range = .{
             .start = shm_slab.end,
@@ -64,18 +60,10 @@ pub const KernelVA = struct {
             .start = kvm_vcpu_slab.end,
             .end = kvm_vcpu_slab.end + SLAB_RESERVATION,
         };
-        pub const heap_tree: Range = .{
-            .start = pmu_state_slab.end,
-            .end = pmu_state_slab.end + PAGE1G,
-        };
-        pub const heap: Range = .{
-            .start = heap_tree.end,
-            .end = heap_tree.end + 256 * PAGE1G,
-        };
 
         pub const range: Range = .{
             .start = vm_node_slab.start,
-            .end = heap.end,
+            .end = pmu_state_slab.end,
         };
     };
 };

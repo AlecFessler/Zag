@@ -5,11 +5,12 @@ const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const errors = zag.syscall.errors;
 const kprof = zag.kprof.trace_id;
-const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
+const pmm = zag.memory.pmm;
 const process_mod = zag.proc.process;
 const sched = zag.sched.scheduler;
 
+const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Priority = zag.sched.thread.Priority;
 const Process = zag.proc.process.Process;
@@ -74,9 +75,39 @@ pub fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_a
     // Pre-fault every source page first: raw @memcpy from user VA in ring 0
     // would take a page fault on any uncommitted demand-paged page, and
     // interrupts.zig's ring-0-on-user-VA path kills the calling process.
-    const kernel_alloc = memory_init.heap_allocator;
-    const elf_copy = kernel_alloc.alloc(u8, elf_len) catch return E_NOMEM;
-    defer kernel_alloc.free(elf_copy);
+    //
+    // Backing comes straight from the buddy allocator as a single
+    // contiguous range sized to the next power-of-two that covers
+    // `elf_len` — we access it through the kernel physmap, memcpy from
+    // user, and `rawFree` it at the same order when the syscall returns.
+    // No kernel heap involvement.
+    const elf_num_pages_u64 = std.mem.alignForward(u64, elf_len, paging.PAGE4K) / paging.PAGE4K;
+    if (elf_num_pages_u64 == 0 or elf_num_pages_u64 > std.math.maxInt(u32)) return E_NOMEM;
+    const elf_rounded_pages = std.math.ceilPowerOfTwo(u32, @intCast(elf_num_pages_u64)) catch return E_NOMEM;
+    const elf_alloc_size = @as(u64, elf_rounded_pages) * paging.PAGE4K;
+
+    var pmm_global = &pmm.global_pmm.?;
+    const elf_irq = pmm_global.lock.lockIrqSave();
+    const elf_block = pmm_global.backing_allocator.rawAlloc(
+        elf_alloc_size,
+        std.mem.Alignment.fromByteUnits(paging.PAGE4K),
+        @returnAddress(),
+    ) orelse {
+        pmm_global.lock.unlockIrqRestore(elf_irq);
+        return E_NOMEM;
+    };
+    pmm_global.lock.unlockIrqRestore(elf_irq);
+    defer {
+        const d_irq = pmm_global.lock.lockIrqSave();
+        pmm_global.backing_allocator.rawFree(
+            elf_block[0..elf_alloc_size],
+            std.mem.Alignment.fromByteUnits(paging.PAGE4K),
+            @returnAddress(),
+        );
+        pmm_global.lock.unlockIrqRestore(d_irq);
+    }
+    const elf_copy: []u8 = elf_block[0..elf_len];
+
     {
         var page_va = std.mem.alignBackward(u64, elf_ptr, paging.PAGE4K);
         while (page_va < elf_end) {

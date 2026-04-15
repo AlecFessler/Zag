@@ -36,7 +36,7 @@ const Record = record.Record;
 /// workload (e.g. tests/prof yield) produces enough samples to fill a
 /// per-CPU log, but large enough that sampling overhead is a small
 /// fraction of the kernel's cycle budget.
-pub const SAMPLE_PERIOD_CYCLES: u64 = 100_000;
+pub const SAMPLE_PERIOD_CYCLES: u64 = 10_000;
 
 /// Maximum number of caller frames walked per sample. The kernel's
 /// call stack is bounded (scheduler tick + syscall dispatch + driver

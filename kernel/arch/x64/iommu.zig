@@ -63,15 +63,17 @@ pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
     defer device.detail.pci.dma_lock.unlock();
 
     const base_dma = device.detail.pci.dma_cursor;
-    for (shm.pages, 0..) |phys, i| {
+    var i: usize = 0;
+    while (i < shm.num_pages) : (i += 1) {
         const dma_addr = base_dma + @as(u64, i) * 0x1000;
+        const phys = shm.pageAddr(i);
         switch (active_type) {
             .intel_vtd => try vtd.mapDmaPage(device, dma_addr, phys),
             .amd_vi => try vi.mapDmaPage(device, dma_addr, phys),
             .none => unreachable,
         }
     }
-    device.detail.pci.dma_cursor = base_dma + @as(u64, shm.pages.len) * 0x1000;
+    device.detail.pci.dma_cursor = base_dma + @as(u64, shm.num_pages) * 0x1000;
     switch (active_type) {
         .amd_vi => vi.flushDevice(device),
         .intel_vtd => vtd.invalidateIotlb(),

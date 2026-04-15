@@ -55,7 +55,7 @@ pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
     defer device.detail.pci.dma_lock.unlock();
 
     const base_dma = device.detail.pci.dma_cursor;
-    device.detail.pci.dma_cursor = base_dma + @as(u64, shm.pages.len) * 0x1000;
+    device.detail.pci.dma_cursor = base_dma + @as(u64, shm.num_pages) * 0x1000;
     return base_dma;
 }
 

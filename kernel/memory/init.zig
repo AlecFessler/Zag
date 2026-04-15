@@ -14,8 +14,6 @@ const vmm_mod = zag.memory.vmm;
 
 const BuddyAllocator = zag.memory.allocators.buddy.BuddyAllocator;
 const BumpAllocator = zag.memory.allocators.bump.BumpAllocator;
-const HeapAllocator = zag.memory.allocators.heap.HeapAllocator;
-const HeapTreeAllocator = zag.memory.allocators.heap.TreeAllocator;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const MMap = zag.boot.protocol.MMap;
 const MMapEntry = zag.boot.protocol.MMapEntry;
@@ -30,7 +28,6 @@ var bump_allocator: BumpAllocator = undefined;
 var buddy_allocator: BuddyAllocator = undefined;
 
 var vm_node_slab_bump: BumpAllocator = undefined;
-var vm_tree_slab_bump: BumpAllocator = undefined;
 var shm_slab_bump: BumpAllocator = undefined;
 var device_region_slab_bump: BumpAllocator = undefined;
 
@@ -39,12 +36,6 @@ pub var thread_slab_backing: BumpAllocator = undefined;
 pub var kvm_vm_slab_backing: BumpAllocator = undefined;
 pub var kvm_vcpu_slab_backing: BumpAllocator = undefined;
 pub var pmu_state_slab_backing: BumpAllocator = undefined;
-
-var heap_tree_bump: BumpAllocator = undefined;
-var heap_tree_allocator: HeapTreeAllocator = undefined;
-var heap_allocator_instance: HeapAllocator = undefined;
-
-pub var heap_allocator: std.mem.Allocator = undefined;
 
 pub fn init(firmware_mmap: MMap) !void {
     arch.earlyDebugChar('a');
@@ -193,7 +184,6 @@ pub fn init(firmware_mmap: MMap) !void {
     arch.earlyDebugChar('g');
 
     vm_node_slab_bump = BumpAllocator.init(KA.vm_node_slab.start, KA.vm_node_slab.end);
-    vm_tree_slab_bump = BumpAllocator.init(KA.vm_tree_slab.start, KA.vm_tree_slab.end);
     shm_slab_bump = BumpAllocator.init(KA.shm_slab.start, KA.shm_slab.end);
     device_region_slab_bump = BumpAllocator.init(KA.device_region_slab.start, KA.device_region_slab.end);
     proc_slab_backing = BumpAllocator.init(KA.proc_slab.start, KA.proc_slab.end);
@@ -203,7 +193,7 @@ pub fn init(firmware_mmap: MMap) !void {
     pmu_state_slab_backing = BumpAllocator.init(KA.pmu_state_slab.start, KA.pmu_state_slab.end);
     arch.earlyDebugChar('i');
 
-    try vmm_mod.initSlabs(vm_node_slab_bump.allocator(), vm_tree_slab_bump.allocator());
+    try vmm_mod.initSlabs(vm_node_slab_bump.allocator());
     arch.earlyDebugChar('j');
     try device_region_mod.initSlab(device_region_slab_bump.allocator());
 
@@ -211,18 +201,4 @@ pub fn init(firmware_mmap: MMap) !void {
     shared.allocator = shared.slab_allocator_instance.allocator();
 
     try pmu_mod.initSlab(pmu_state_slab_backing.allocator());
-}
-
-pub fn initHeap() !void {
-    heap_tree_bump = BumpAllocator.init(KA.heap_tree.start, KA.heap_tree.end);
-    heap_tree_allocator = try HeapTreeAllocator.init(heap_tree_bump.allocator());
-
-    heap_allocator_instance = HeapAllocator.init(
-        KA.heap.start,
-        KA.heap.end,
-        &heap_tree_allocator,
-    );
-    heap_allocator = heap_allocator_instance.allocator();
-
-    shared.pages_allocator = heap_allocator;
 }

@@ -162,8 +162,8 @@ pub fn sysMemDmaMap(device_handle: u64, shm_handle: u64) i64 {
         return E_NOMEM;
     };
     arch.enableDmaRemapping();
-    proc.addDmaMapping(device, shm, dma_base, shm.pages.len) catch {
-        arch.unmapDmaPages(device, dma_base, shm.pages.len);
+    proc.addDmaMapping(device, shm, dma_base, shm.num_pages) catch {
+        arch.unmapDmaPages(device, dma_base, shm.num_pages);
         shm.decRef();
         return E_NORES;
     };

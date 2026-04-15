@@ -9,7 +9,6 @@ const kprof = zag.kprof.trace_id;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
-const restart_context_mod = zag.proc.restart_context;
 const sched = zag.sched.scheduler;
 const thread_mod = zag.sched.thread;
 
@@ -54,7 +53,7 @@ pub const Process = struct {
     pid: u64,
     parent: ?*Process,
     alive: bool,
-    restart_context: ?*RestartContext,
+    restart_context: ?RestartContext,
     addr_space_root: PAddr,
     vmm: VirtualMemoryManager,
     threads: [MAX_THREADS]*Thread,
@@ -841,8 +840,8 @@ pub const Process = struct {
 
     pub fn disableRestart(self: *Process) void {
         self.lock.lock();
-        if (self.restart_context) |rc| {
-            restart_context_mod.destroy(rc);
+        if (self.restart_context) |*rc| {
+            rc.deinit();
             self.restart_context = null;
         }
         self.lock.unlock();
@@ -1009,18 +1008,18 @@ pub const Process = struct {
 
         self.updateParentView();
 
-        if (rc.data_segment.ghost.len > 0) {
+        if (rc.data_size > 0) {
             writeToUserPages(
                 self.addr_space_root,
-                rc.data_segment.vaddr.addr,
-                rc.data_segment.ghost,
+                rc.data_vaddr.addr,
+                rc.ghostSlice(),
             );
 
             // Zero partial-page BSS: the bytes between the end of initialized data
             // and the next page boundary are BSS that lives on the same page as the
             // data segment tail. The .decommit node only covers full BSS pages;
             // this partial page is in the .preserve node and must be zeroed explicitly.
-            const data_end = rc.data_segment.vaddr.addr + rc.data_segment.ghost.len;
+            const data_end = rc.data_vaddr.addr + rc.data_size;
             const next_page = std.mem.alignForward(u64, data_end, paging.PAGE4K);
             const tail_len = next_page - data_end;
             if (tail_len > 0 and tail_len < paging.PAGE4K) {
@@ -1217,7 +1216,7 @@ pub const Process = struct {
             }
         }
 
-        if (self.restart_context) |rc| restart_context_mod.destroy(rc);
+        if (self.restart_context) |*rc| rc.deinit();
 
         self.cleanup_complete = true;
         // Only free if no external handles remain
@@ -1391,13 +1390,13 @@ pub const Process = struct {
         proc.initPermTable(initial_rights);
 
         if (initial_rights.restart) {
-            proc.restart_context = try restart_context_mod.create(
+            proc.restart_context = try RestartContext.init(
                 elf_result.entry,
                 elf_result.data_vaddr,
                 elf_result.data_content,
             );
         }
-        errdefer if (!skip_cleanup) if (proc.restart_context) |rc| restart_context_mod.destroy(rc);
+        errdefer if (!skip_cleanup) if (proc.restart_context) |*rc| rc.deinit();
 
         const initial_thread = try thread_mod.Thread.create(proc, elf_result.entry, proc.perm_view_vaddr.addr, DEFAULT_STACK_PAGES);
 

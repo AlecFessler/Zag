@@ -72,7 +72,7 @@ kernel/
     address.zig          -- VA/PA types, address space layout constants
     fault.zig            -- page fault handler (demand paging)
     pmm.zig              -- physical memory manager with per-core page caches
-    vmm.zig              -- virtual memory manager (red-black tree)
+    vmm.zig              -- virtual memory manager (sorted inline array, cap MAX_RESERVATIONS)
     stack.zig            -- kernel and user stack management
     shared.zig           -- shared memory objects
     device_region.zig    -- device region objects
@@ -589,8 +589,7 @@ Parameters:
 In debug mode, tracks net allocations and asserts zero on `deinit`.
 
 **Slab instances** (each backed by a dedicated 16 MiB bump allocator region):
-- `VmNodeSlab`: `SlabAllocator(VmNode, false, 0, 64, true)` -- VMM tree data nodes.
-- `VmTreeSlab`: `SlabAllocator(VmTree.Node, false, 0, 64, true)` -- red-black tree nodes.
+- `VmNodeSlab`: `SlabAllocator(VmNode, false, 0, 64, true)` -- backing for the `*VmNode` pointers held in each process's inline reservation array.
 - `SharedMemoryAllocator`: `SlabAllocator(SharedMemory, false, 0, 64, true)` -- SHM objects.
 - `DeviceRegionSlab`: `SlabAllocator(DeviceRegion, false, 0, 32, true)` -- device region objects.
 - `ProcessAllocator`: `SlabAllocator(Process, false, 0, 64, true)` -- process structs.
@@ -654,8 +653,7 @@ Size: 32 GiB. Maps all physical memory (free and ACPI regions) using the largest
 [0xFFFF_8000_0000_0000, 0xFFFF_8400_0000_0000)  -- Kernel address space
   [0xFFFF_8000_0000_0000, +KERNEL_STACKS_RES)      -- Kernel stacks (slot-based)
   [+kernel_stacks.end, +16 MiB)                    -- VmNode slab
-  [+vm_node_slab.end, +16 MiB)                     -- VmTree node slab
-  [+vm_tree_slab.end, +16 MiB)                     -- SharedMemory slab
+  [+vm_node_slab.end, +16 MiB)                     -- SharedMemory slab
   [+shm_slab.end, +16 MiB)                         -- DeviceRegion slab
   [+device_region_slab.end, +16 MiB)               -- Process slab
   [+proc_slab.end, +16 MiB)                        -- Thread slab
@@ -686,8 +684,8 @@ Comptime assertions verify that no kernel VA regions overlap.
 7. Initialize buddy allocator spanning from smallest physical address to end of largest-address free region. Metadata allocated from bump allocator.
 8. Feed all free memory map regions into buddy allocator (excluding bump allocator's consumed range and low memory below 1 MiB).
 9. Initialize global PMM with buddy allocator as backing.
-10. Initialize slab bump allocators for each kernel object type (VmNode, VmTree, SHM, DeviceRegion, Process, Thread, Vm, VCpu, PmuState) -- each gets a 16 MiB VA region. Process/Thread/Vm/VCpu slab bumps are exported as `pub var` so the scheduler and KVM modules can construct their slab instances later in `sched.globalInit()`.
-11. Initialize slabs that `memory.init` itself owns: VmNode and VmTree slabs (`vmm.initSlabs`), DeviceRegion slab (`device_region.initSlab`), SharedMemory slab, and the PMU state slab (`pmu.initSlab`). Process, Thread, Vm, and VCpu slabs are constructed later by their owning subsystems.
+10. Initialize slab bump allocators for each kernel object type (VmNode, SHM, DeviceRegion, Process, Thread, Vm, VCpu, PmuState) -- each gets a 16 MiB VA region. Process/Thread/Vm/VCpu slab bumps are exported as `pub var` so the scheduler and KVM modules can construct their slab instances later in `sched.globalInit()`.
+11. Initialize slabs that `memory.init` itself owns: the VmNode slab (`vmm.initSlabs`), DeviceRegion slab (`device_region.initSlab`), SharedMemory slab, and the PMU state slab (`pmu.initSlab`). Process, Thread, Vm, and VCpu slabs are constructed later by their owning subsystems.
 
 `memory.initHeap()`:
 1. Initialize heap tree bump allocator (1 GiB region).
@@ -1189,11 +1187,11 @@ x64.SavedRegs (extern struct) {
 
 ## 3. VMM Internals
 
-### Red-Black Tree
+### Sorted Inline Array
 
-The VMM uses a `RedBlackTree(*VmNode, vmNodeCmp, true)` where `vmNodeCmp` orders by `start.addr`. The third parameter (`true`) enables duplicate handling. Tree nodes are allocated from `VmTreeSlab = SlabAllocator(VmTree.Node, false, 0, 64, true)`. VM data nodes are allocated from `VmNodeSlab = SlabAllocator(VmNode, false, 0, 64, true)`.
+Each process's VMM holds its reservations in an inline `[MAX_RESERVATIONS]*VmNode` array (cap `256`) sorted by `start.addr`. Lookups use `std.sort.lowerBound` -- O(log N) with cache-friendly contiguous memory. Insert and remove are `@memmove` of the tail (O(N), but N ≤ 256 and the compiler vectorizes the shift). The array holds pointers to slab-allocated `VmNode`s, so structural mutations never move the node bodies themselves -- only the pointer slots.
 
-Both slabs are initialized at boot from dedicated bump allocator regions (16 MiB each).
+`VmNode` bodies come from `VmNodeSlab = SlabAllocator(VmNode, false, 0, 64, true)`, initialized at boot from a dedicated 16 MiB bump region.
 
 ### VmNode Struct
 
@@ -1217,18 +1215,12 @@ VmNode {
 
 `virtual_bar` nodes get `restart_policy = .free` — cleared on restart, device handle persists.
 
-### Sentinel Nodes
-
-`mkSentinel(vaddr)` creates a zero-size VmNode used as a search key for tree lookups:
-```
-{ start: vaddr, size: 0, kind: .private, rights: {}, handle: HANDLE_NONE, restart_policy: .free }
-```
-
 ### VirtualMemoryManager Struct
 
 ```
 VirtualMemoryManager {
-    tree: VmTree
+    nodes: [MAX_RESERVATIONS]*VmNode
+    count: u32
     range_start: VAddr
     range_end: VAddr
     addr_space_root: PAddr
@@ -1236,10 +1228,12 @@ VirtualMemoryManager {
 }
 ```
 
+`nodes[0..count]` is always kept sorted by `node.start.addr`. The active slice helper `self.slice()` hides the two-field dance from internal callers. `MAX_RESERVATIONS = 256`: enough headroom for every realistic userspace process (microkernel userspace is statically linked Zig, so reservations stay bounded), small enough that the per-process VMM struct is ~2 KiB.
+
 ### Two-Layer Model
 
 - **Permissions table**: holds each reservation's capability (max rights, original range). This is the authority layer.
-- **VMM tree**: holds operational state (current rights per sub-region, node type, backing objects). This is the mapping layer.
+- **VMM array**: holds operational state (current rights per sub-region, node type, backing objects). This is the mapping layer.
 - **Page tables**: sole source of truth for which physical pages are actually mapped.
 
 ### Merge Rules
@@ -1259,7 +1253,7 @@ The VMM cursor (`range_start` field, advanced during allocation) advances monoto
 
 ### splitNode
 
-Splits a VmNode at a page-aligned offset into two new nodes. Both halves inherit: `kind`, `rights`, `handle`, `restart_policy`. The original node is removed from the tree and replaced with two new nodes. Used by `mem_perms`, `mem_unmap`, `mem_shm_map`, `mem_mmio_map` to operate on sub-ranges of reservations.
+Splits a VmNode at a page-aligned offset into two nodes. The left half shrinks in place (array position unchanged); the right half is allocated fresh and inserted into the sorted array at the next index. Both halves inherit `kind`, `rights`, `handle`, `restart_policy`. Used by `mem_perms`, `mem_unmap`, `mem_shm_map`, `mem_mmio_map` to operate on sub-ranges of reservations.
 
 ### mem_unmap
 
@@ -1661,27 +1655,30 @@ Exited threads cannot be freed inside the scheduler timer handler (they are runn
 
 ```
 SharedMemory {
-    pages: []PAddr          -- slice of physical page addresses
+    base_paddr: PAddr       -- physical base of the contiguous backing block
+    num_pages: u32          -- user-visible page count (≤ 2^alloc_order)
+    alloc_order: u4         -- buddy order of the backing allocation
     refcount: atomic(u32)   -- atomic reference count
-    alloc_order: u4         -- buddy order of the contiguous allocation that backs `pages`,
-                            -- or 0 if the pages were allocated one at a time
 }
 ```
 
-`MAX_PAGES = 4096` (16 MiB maximum SHM size at 4K pages).
+`MAX_PAGES = 1024` (4 MiB maximum SHM size at 4 KiB pages, bounded by the buddy's max order).
+
+### Contiguity Invariant
+
+Every SHM is backed by a single contiguous physical allocation of `2^alloc_order` pages from the buddy allocator. The user-visible extent is the first `num_pages` pages; any trailing pages up to the rounded buddy block are internal padding that callers never observe. Physical address of the i-th page is `base_paddr + i * 4096`, computed on demand via `shm.pageAddr(i)` -- no lookup table. This makes SHM directly DMA-usable: IOMMU and device descriptors take one contiguous IOVA rather than a scatter list.
 
 ### Allocation
 
-SharedMemory objects are allocated from `SlabAllocator(SharedMemory, false, 0, 64, true)`, backed by a bump allocator over the SHM slab VA region (16 MiB). The `pages` slice is allocated from a separate pages allocator.
+SharedMemory objects are allocated from `SlabAllocator(SharedMemory, false, 0, 64, true)`, backed by a bump allocator over the SHM slab VA region (16 MiB).
 
 ### create(num_bytes) -> *SharedMemory
 
-1. Validate size > 0 and page count <= MAX_PAGES.
-2. Allocate SharedMemory struct from slab.
-3. Allocate `pages` slice from pages allocator.
-4. **Try contiguous buddy allocation first.** Compute the smallest buddy order `o` such that `(1 << o) >= num_pages`, capped at `MAX_BUDDY_ORDER = 10` (1024 pages = 4 MiB). Ask the buddy allocator for one `2^o`-page block. If it succeeds, fan the block out into `pages` (one PAddr per 4 KiB page), zero each page, and stamp `alloc_order = o`. This is the fast path because it gives the caller physically contiguous memory, which both reduces TLB pressure and lets DMA-capable devices use the same backing without scatter/gather.
-5. **Fall back to per-page allocation.** If the contiguous attempt fails (fragmentation), allocate each page individually from the PMM, zero it, store its PAddr, and stamp `alloc_order = 0`. The caller cannot tell the difference at the SHM API level — only `destroy` cares.
-6. Set `refcount = 1`.
+1. Validate size > 0 and page count ≤ MAX_PAGES.
+2. Round `num_pages` up to the next power of two (`rounded_pages`) and compute `alloc_order = log2(rounded_pages)`.
+3. Allocate one `rounded_pages * PAGE4K` contiguous block from the PMM's buddy allocator. Zero it.
+4. Allocate a SharedMemory slab entry, store `{ base_paddr, num_pages, alloc_order, refcount = 1 }`.
+5. On buddy failure, return `error.OutOfMemory` -- no fallback. Callers that need more than 4 MiB of SHM attach multiple regions side-by-side.
 
 ### incRef
 
@@ -1693,9 +1690,8 @@ SharedMemory objects are allocated from `SlabAllocator(SharedMemory, false, 0, 6
 
 ### destroy
 
-1. If `alloc_order > 0`: free the single contiguous block back to the buddy allocator at the recorded order. Otherwise: free each page individually back to PMM.
-2. Free the `pages` slice.
-3. Free the SharedMemory struct back to slab.
+1. Free the contiguous block back to the buddy allocator at the recorded order.
+2. Free the SharedMemory struct back to slab.
 
 ---
 

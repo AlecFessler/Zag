@@ -253,7 +253,7 @@ run_perf_tests() {
 
 run_kernel_fuzzers() {
     local fuzz_args=("--" "-s" "$SEED" "-i" "$ITERATIONS")
-    local fuzzers=(buddy_allocator heap_allocator vmm red_black_tree)
+    local fuzzers=(buddy_allocator vmm)
 
     for fuzzer in "${fuzzers[@]}"; do
         echo "=== Fuzzing: $fuzzer ==="
