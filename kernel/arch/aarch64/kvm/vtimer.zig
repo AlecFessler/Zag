@@ -39,6 +39,19 @@ const zag = @import("zag");
 
 const vm_hw = zag.arch.aarch64.vm;
 
+fn kernelVaToPa(vaddr: u64) u64 {
+    const VAddr = zag.memory.address.VAddr;
+    const paging = zag.arch.aarch64.paging;
+    const memory_init = zag.memory.init;
+    const base = vaddr & ~@as(u64, 0xFFF);
+    const offset = vaddr & 0xFFF;
+    const page_pa = paging.resolveVaddr(
+        memory_init.kernel_addr_space_root,
+        VAddr.fromInt(base),
+    ) orelse @panic("vtimer kernelVaToPa: unmapped state VA");
+    return page_pa.addr | offset;
+}
+
 /// Virtual timer PPI per ARM ARM D11.1.4 / GICv3 §2.2.3.
 pub const VTIMER_PPI_INTID: u32 = 27;
 
@@ -109,7 +122,10 @@ pub fn initVcpu(state: *VtimerState) void {
 ///
 /// Reference: Linux arch/arm64/kvm/arch_timer.c kvm_timer_vcpu_load.
 pub fn loadGuest(state: *VtimerState) void {
-    _ = vm_hw.hypCall(.vtimer_load_guest, @intFromPtr(state));
+    // EL2 has no stage-1 translation — the stub dereferences a PA.
+    // `state` lives inside the slab-allocated VCpu (kernel heap), so
+    // walk the kernel page tables to get its PA.
+    _ = vm_hw.hypCall(.vtimer_load_guest, kernelVaToPa(@intFromPtr(state)));
 }
 
 /// Save the hardware virtual timer sysregs back into the per-vCPU
@@ -124,7 +140,7 @@ pub fn loadGuest(state: *VtimerState) void {
 ///
 /// Reference: Linux arch_timer.c kvm_timer_vcpu_put.
 pub fn saveGuest(state: *VtimerState) void {
-    _ = vm_hw.hypCall(.vtimer_save_guest, @intFromPtr(state));
+    _ = vm_hw.hypCall(.vtimer_save_guest, kernelVaToPa(@intFromPtr(state)));
 
     // TODO(m5-follow-up): when CNTV_CTL_EL0.ISTATUS is set at exit
     // (timer has fired while guest was running) we should re-inject

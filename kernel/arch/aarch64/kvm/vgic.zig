@@ -60,6 +60,24 @@ const vm_hw = zag.arch.aarch64.vm;
 
 const SpinLock = zag.utils.sync.SpinLock;
 
+/// Walk the kernel page tables to resolve a kernel VA (from any of the
+/// kernel_code / kernel_heap / physmap partitions) into its physical
+/// address. Used to hand per-vCPU shadow buffers to the EL2 hyp stubs,
+/// which run with SCTLR_EL2.M=0 and therefore dereference their input
+/// pointer as a raw PA. ARM ARM D5.2 table walk.
+fn shadowKernelPA(vaddr: u64) u64 {
+    const VAddr = zag.memory.address.VAddr;
+    const paging = zag.arch.aarch64.paging;
+    const memory_init = zag.memory.init;
+    const base = vaddr & ~@as(u64, 0xFFF);
+    const offset = vaddr & 0xFFF;
+    const page_pa = paging.resolveVaddr(
+        memory_init.kernel_addr_space_root,
+        VAddr.fromInt(base),
+    ) orelse @panic("shadowKernelPA: unmapped shadow VA");
+    return page_pa.addr | offset;
+}
+
 // ===========================================================================
 // Compile-time configuration
 // ===========================================================================
@@ -443,6 +461,14 @@ pub const VcpuState = struct {
     /// must be processed by the next prepareEntry (refill LRs from the
     /// pending bitmaps).
     needs_refill: bool = false,
+
+    /// EL2 sysreg shadow buffer handed to the hyp stubs. Lives in the
+    /// vcpu struct (slab-allocated, physmap-resident) so its VA→PA can
+    /// be cheaply resolved via `PAddr.fromVAddr`. EL2 runs with
+    /// SCTLR_EL2.M=0, so the stubs dereference this buffer as a PA —
+    /// a stack-local VA would fault the first time the stub does
+    /// `ldr x2, [x1, ...]`.
+    hw_shadow: VcpuHwShadow align(16) = .{},
 };
 
 /// EL2 sysreg shadow handed to the `hvc_vgic_prepare_entry` /
@@ -468,6 +494,13 @@ pub const VcpuHwShadow = extern struct {
     /// ICH_MISR_EL2 snapshot written by `hvc_vgic_save_exit` (ARM ARM
     /// D13.8.47). Only consumed on exit — ignored by the entry stub.
     misr: u64 = 0,
+    /// Number of implemented list registers on this host (1..16). Read
+    /// by `hvc_vgic_prepare_entry` / `hvc_vgic_save_exit` to decide how
+    /// many ICH_LR<n>_EL2 slots to touch — writing or reading an
+    /// unimplemented LR sysreg is UNDEFINED on GICv3 hosts that report
+    /// ICH_VTR_EL2.ListRegs < 15 (e.g. cortex-a72 TCG with 4 LRs).
+    /// Caller (prepareEntry/saveExit) must populate this before the hvc.
+    num_lrs: u64 = 16,
 };
 
 comptime {
@@ -477,6 +510,7 @@ comptime {
     std.debug.assert(@offsetOf(VcpuHwShadow, "ap0r0") == 0x90);
     std.debug.assert(@offsetOf(VcpuHwShadow, "ap1r0") == 0x98);
     std.debug.assert(@offsetOf(VcpuHwShadow, "misr") == 0xA0);
+    std.debug.assert(@offsetOf(VcpuHwShadow, "num_lrs") == 0xA8);
     std.debug.assert(MAX_LRS == 16);
 }
 
@@ -770,13 +804,20 @@ pub fn prepareEntry(state: *VcpuState) void {
     // that enabling the interface before LRs are populated can cause
     // a spurious underflow MI, so the stub writes LRs / AP / VMCR
     // first and enables the CPU interface (ICH_HCR_EL2.EN) last.
-    var shadow: VcpuHwShadow = .{};
+    const shadow = &state.hw_shadow;
+    shadow.* = .{};
     shadow.lrs = state.lrs;
     shadow.hcr = state.hcr | ICH_HCR_EN;
     shadow.vmcr = state.vmcr;
     shadow.ap0r0 = state.ap0r0;
     shadow.ap1r0 = state.ap1r0;
-    _ = vm_hw.hypCall(.vgic_prepare_entry, @intFromPtr(&shadow));
+    shadow.num_lrs = num_lrs;
+    // EL2 runs with SCTLR_EL2.M=0 (no stage-1), so the stub dereferences
+    // the shadow pointer as a PA. The slab-allocated VCpu lives in the
+    // kernel heap partition (not physmap) so we must page-walk to turn
+    // the kernel VA into a PA.
+    const shadow_pa = shadowKernelPA(@intFromPtr(shadow));
+    _ = vm_hw.hypCall(.vgic_prepare_entry, shadow_pa);
 }
 
 /// Called by the vCPU run loop immediately after `vm_hw.vmResume`
@@ -798,9 +839,12 @@ pub fn saveExit(state: *VcpuState) void {
     // interface (ICH_HCR_EL2 ← 0) for the host-running window so a
     // maintenance IRQ cannot fire into the host (GICv3 §12.5.7 "En").
     // EL1 cannot read these sysregs directly (ARM ARM D13.8).
-    var shadow: VcpuHwShadow = .{};
+    const shadow = &state.hw_shadow;
     shadow.lrs = state.lrs;
-    _ = vm_hw.hypCall(.vgic_save_exit, @intFromPtr(&shadow));
+    shadow.num_lrs = num_lrs;
+    // See prepareEntry — EL2 has no stage-1, the stub dereferences a PA.
+    const shadow_pa = shadowKernelPA(@intFromPtr(shadow));
+    _ = vm_hw.hypCall(.vgic_save_exit, shadow_pa);
     state.lrs = shadow.lrs;
     state.ap0r0 = shadow.ap0r0;
     state.ap1r0 = shadow.ap1r0;
