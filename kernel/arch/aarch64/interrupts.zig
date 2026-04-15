@@ -155,22 +155,41 @@ pub fn prepareThreadContext(
         ctx.spsr_el1 = 0x0;
         ctx.sp_el0 = ustack.addr;
     } else {
-        // Kernel thread: EL1h (M[3:0] = 0x4), DAIF unmasked (bits [9:6] = 0).
+        // Kernel thread: EL1h (M[3:0] = 0x5), DAIF unmasked.
         //
-        // The only aarch64 kernel thread constructed via this path is the
-        // per-core idle loop (`scheduler.idleLoop`), which runs
-        // `while (true) wfi`. WFI stalls the core until an interrupt is
-        // pending *and* that interrupt can actually be delivered — if
-        // DAIF.I (IRQ mask) is set at ERET, the GIC signals the SGI/PPI
-        // but exception entry is blocked, so the idle core wakes up,
-        // masks pending, loops back into WFI, and effectively ignores
-        // every IPI. A pinned thread migrating to a formerly-idle core
-        // (e.g. §2.1.25 `set_priority(PINNED)` with affinity=0x2) would
-        // then never be dispatched, because `enqueueOnCore`'s wake IPI
-        // can't preempt the idle thread. Clearing DAIF here lets the
-        // wake IPI fire on the first WFI exit.
-        ctx.spsr_el1 = 0x4;
-        ctx.sp_el0 = 0;
+        // EL1h (ARM ARM C5.2.18, value 0b0101) means "EL1 using SP_EL1
+        // as the stack pointer". This is the correct mode for kernel
+        // threads because a same-EL IRQ taken while a kernel thread is
+        // running does NOT change SP — the trampoline pushes its save
+        // frame onto the very same SP the interrupted code was using,
+        // naturally below the active call-chain frames. The earlier
+        // EL1t choice placed kernel-thread C frames on SP_EL0 while
+        // the same-EL IRQ trampoline still ran on SP_EL1; switchTo
+        // reseeded SP_EL1 = kstack_top on every entry, so a timer IRQ
+        // taken during e.g. `sched.yield()` → GIC SGI send would write
+        // the 288-byte save frame at [kstack_top-288, kstack_top) —
+        // right on top of the thread's live sendIpiToCore / yield /
+        // vcpuEntryPoint frames on SP_EL0, which also started at
+        // kstack_top. On resume the corrupted saved-LR slots caused
+        // the function-epilogue `ret` chain to jump to garbage
+        // addresses (observed: ELR=0x7 PC-alignment fault; ELR deep
+        // inside exceptionTrampoline). Switching the kernel thread to
+        // EL1h eliminates the dual-stack aliasing — see the analogous
+        // x86_64 behavior where interrupted kernel code keeps its RSP
+        // and the IRQ handler pushes below it without a TSS.rsp0
+        // reload.
+        //
+        // SP_EL0 is unused by the thread (EL1h never reads it) but we
+        // still seed it to kstack_top so that serializeFaultRegs and
+        // debug dumps report a sensible value.
+        //
+        // DAIF is unmasked so the idle core can receive IPIs: WFI
+        // stalls until an interrupt is pending *and* deliverable, so a
+        // masked DAIF.I causes the core to wake, mask pending, WFI
+        // again, and effectively ignore every IPI — breaking pinned-
+        // thread migration to a formerly-idle core.
+        ctx.spsr_el1 = 0x5;
+        ctx.sp_el0 = kstack_top.addr;
     }
 
     return ctx;

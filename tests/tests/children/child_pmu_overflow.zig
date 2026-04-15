@@ -58,7 +58,7 @@ pub fn main(_: u64) void {
         switch (@import("builtin").cpu.arch) {
             .x86_64 => asm volatile ("pause" ::: .{ .memory = true }),
             .aarch64 => asm volatile ("yield" ::: .{ .memory = true }),
-            else => {},
+            else => @compileError("unsupported arch"),
         }
     }
 }

@@ -385,29 +385,32 @@ fn rollbackGuestMap(vm_obj: *Vm, guest_addr: u64, mapped_size: u64) void {
     }
 }
 
-/// Syscall implementation: allow/deny MSR passthrough for the calling process's VM.
-/// Modifies MSRPM bits in the VMCB. Refuses security-critical MSRs.
-pub fn msrPassthrough(proc: *Process, vm_handle: u64, msr_num: u32, allow_read: bool, allow_write: bool) i64 {
+/// Syscall implementation: allow/deny system-register passthrough for the
+/// calling process's VM. On x86 a "sysreg" is an MSR — `sysreg_id` is the
+/// 32-bit MSR address. Modifies MSRPM bits in the VMCB. Refuses
+/// security-critical MSRs.
+pub fn sysregPassthrough(proc: *Process, vm_handle: u64, sysreg_id: u32, allow_read: bool, allow_write: bool) i64 {
     const E_BADCAP: i64 = -3;
     const E_PERM: i64 = -2;
 
     const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
 
     // Refuse security-critical MSRs that must always be intercepted.
-    if (isSecurityCriticalMsr(msr_num)) return E_PERM;
+    if (isSecurityCriticalSysreg(sysreg_id)) return E_PERM;
 
-    // Serialize the MSRPM bitwise RMW inside arch.vmMsrPassthrough --
+    // Serialize the MSRPM bitwise RMW inside arch.vmSysregPassthrough --
     // multiple threads in the same process could otherwise race.
     vm_obj.lock.lock();
     defer vm_obj.lock.unlock();
 
     // Access the MSRPM via the VMCB.
-    arch.vmMsrPassthrough(vm_obj.arch_structures, msr_num, allow_read, allow_write);
+    arch.vmSysregPassthrough(vm_obj.arch_structures, sysreg_id, allow_read, allow_write);
     return 0; // E_OK
 }
 
-/// Syscall implementation: assert an IRQ line on the in-kernel IOAPIC.
-pub fn ioapicAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
+/// Syscall implementation: assert an IRQ line on the in-kernel interrupt
+/// controller (x86: IOAPIC).
+pub fn intcAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
     const E_INVAL: i64 = -1;
     const E_BADCAP: i64 = -3;
 
@@ -418,8 +421,9 @@ pub fn ioapicAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
     return 0; // E_OK
 }
 
-/// Syscall implementation: de-assert an IRQ line on the in-kernel IOAPIC.
-pub fn ioapicDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
+/// Syscall implementation: de-assert an IRQ line on the in-kernel interrupt
+/// controller (x86: IOAPIC).
+pub fn intcDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
     const E_INVAL: i64 = -1;
     const E_BADCAP: i64 = -3;
 
@@ -491,7 +495,7 @@ fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
 /// throughput without buying any ring-0 protection. KERNEL_GS_BASE
 /// is different: it survives SWAPGS and the host depends on it for
 /// per-CPU data, which is why that one stays intercepted.
-fn isSecurityCriticalMsr(msr: u32) bool {
+fn isSecurityCriticalSysreg(msr: u32) bool {
     return switch (msr) {
         0xC0000080, // EFER
         0xC0000081, // STAR

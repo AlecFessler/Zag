@@ -55,18 +55,18 @@ pub fn sysVmVcpuInterrupt(thread_handle: u64, interrupt_ptr: u64) i64 {
     return arch.kvmVcpuInterrupt(proc, thread_handle, interrupt_ptr);
 }
 
-pub fn sysVmMsrPassthrough(vm_handle: u64, msr_num: u64, allow_read: u64, allow_write: u64) i64 {
+pub fn sysVmSysregPassthrough(vm_handle: u64, sysreg_id: u64, allow_read: u64, allow_write: u64) i64 {
     const proc = sched.currentProc();
-    if (msr_num > std.math.maxInt(u32)) return E_INVAL;
-    return arch.kvmMsrPassthrough(proc, vm_handle, @truncate(msr_num), allow_read != 0, allow_write != 0);
+    if (sysreg_id > std.math.maxInt(u32)) return E_INVAL;
+    return arch.kvmSysregPassthrough(proc, vm_handle, @truncate(sysreg_id), allow_read != 0, allow_write != 0);
 }
 
-pub fn sysVmIoapicAssertIrq(vm_handle: u64, irq_num: u64) i64 {
+pub fn sysVmIntcAssertIrq(vm_handle: u64, irq_num: u64) i64 {
     const proc = sched.currentProc();
-    return arch.kvmIoapicAssertIrq(proc, vm_handle, irq_num);
+    return arch.kvmIntcAssertIrq(proc, vm_handle, irq_num);
 }
 
-pub fn sysVmIoapicDeassertIrq(vm_handle: u64, irq_num: u64) i64 {
+pub fn sysVmIntcDeassertIrq(vm_handle: u64, irq_num: u64) i64 {
     const proc = sched.currentProc();
-    return arch.kvmIoapicDeassertIrq(proc, vm_handle, irq_num);
+    return arch.kvmIntcDeassertIrq(proc, vm_handle, irq_num);
 }

@@ -55,9 +55,9 @@ pub const SyscallNum = enum(u64) {
     vm_vcpu_get_state,
     vm_vcpu_run,
     vm_vcpu_interrupt,
-    vm_msr_passthrough,
-    vm_ioapic_assert_irq,
-    vm_ioapic_deassert_irq,
+    vm_sysreg_passthrough,
+    vm_intc_assert_irq,
+    vm_intc_deassert_irq,
     pmu_info,
     pmu_start,
     pmu_read,
@@ -690,6 +690,7 @@ pub const E_AGAIN: i64 = -9;
 pub const E_NOENT: i64 = -10;
 pub const E_BUSY: i64 = -11;
 pub const E_NODEV: i64 = -13;
+pub const E_NORES: i64 = -14;
 
 pub fn vm_create(vcpu_count: u64, policy_ptr: u64) i64 {
     return syscall2(.vm_create, vcpu_count, policy_ptr);
@@ -728,16 +729,16 @@ pub fn vm_vcpu_interrupt(thread_handle: u64, interrupt_ptr: u64) i64 {
     return syscall2(.vm_vcpu_interrupt, thread_handle, interrupt_ptr);
 }
 
-pub fn vm_msr_passthrough(vm_handle_arg: u64, msr_num: u64, allow_read: u64, allow_write: u64) i64 {
-    return syscall4(.vm_msr_passthrough, vm_handle_arg, msr_num, allow_read, allow_write);
+pub fn vm_sysreg_passthrough(vm_handle_arg: u64, sysreg_id: u64, allow_read: u64, allow_write: u64) i64 {
+    return syscall4(.vm_sysreg_passthrough, vm_handle_arg, sysreg_id, allow_read, allow_write);
 }
 
-pub fn vm_ioapic_assert_irq(vm_handle_arg: u64, irq_num: u64) i64 {
-    return syscall2(.vm_ioapic_assert_irq, vm_handle_arg, irq_num);
+pub fn vm_intc_assert_irq(vm_handle_arg: u64, irq_num: u64) i64 {
+    return syscall2(.vm_intc_assert_irq, vm_handle_arg, irq_num);
 }
 
-pub fn vm_ioapic_deassert_irq(vm_handle_arg: u64, irq_num: u64) i64 {
-    return syscall2(.vm_ioapic_deassert_irq, vm_handle_arg, irq_num);
+pub fn vm_intc_deassert_irq(vm_handle_arg: u64, irq_num: u64) i64 {
+    return syscall2(.vm_intc_deassert_irq, vm_handle_arg, irq_num);
 }
 
 pub fn revoke_vm(vm_handle_arg: u64) i64 {

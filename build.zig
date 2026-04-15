@@ -136,7 +136,8 @@ pub fn build(b: *std.Build) void {
 
     const build_opts = b.addOptions();
     build_opts.addOption([]const u8, "kernel_profile", kernel_profile);
-    zag_mod.addImport("build_options", build_opts.createModule());
+    const build_opts_mod = build_opts.createModule();
+    zag_mod.addImport("build_options", build_opts_mod);
 
     const kprof_mod = b.createModule(.{
         .root_source_file = b.path("kernel/kprof/kprof.zig"),
@@ -150,7 +151,7 @@ pub fn build(b: *std.Build) void {
     kprof_mod.omit_frame_pointer = false;
     kprof_mod.red_zone = false;
     kprof_mod.addImport("zag", zag_mod);
-    kprof_mod.addImport("build_options", build_opts.createModule());
+    kprof_mod.addImport("build_options", build_opts_mod);
     zag_mod.addImport("kprof", kprof_mod);
 
     // ── SMP trampoline (x86-only; aarch64 uses PSCI CPU_ON) ────────────
@@ -167,9 +168,11 @@ pub fn build(b: *std.Build) void {
         .root_source_file = embedded_wf.add("embedded_bins.zig",
             if (arch == .x86_64)
                 \\pub const trampoline = @embedFile("trampoline.bin");
+                \\pub const root_service: []const u8 = &.{};
                 \\
             else
                 \\pub const trampoline: []const u8 = &.{};
+                \\pub const root_service: []const u8 = &.{};
                 \\
         ),
         .target = b.resolveTargetQuery(.{
@@ -238,7 +241,11 @@ pub fn build(b: *std.Build) void {
     kernel.root_module.omit_frame_pointer = false;
     kernel.root_module.red_zone = false;
     kernel.root_module.addImport("zag", zag_mod);
-    kernel.setLinkerScript(b.path(if (arch == .x86_64) "kernel/linker-x86.ld" else "kernel/linker-aarch64.ld"));
+    const linker_script = if (arch == .x86_64)
+        "kernel/linker-x86.ld"
+    else
+        "kernel/linker-aarch64.ld";
+    kernel.setLinkerScript(b.path(linker_script));
     // Preserve relocation info so the bootloader can apply a random KASLR
     // slide to kernel text/rodata/data at load time. Without --emit-relocs
     // the .rela.* sections are stripped and absolute references bake in

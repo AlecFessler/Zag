@@ -1,3 +1,13 @@
+//! Cross-arch syscall wrappers for hyprvOS.
+//!
+//! Supports both x86_64 (`syscall` instruction, SysV AMD64 register layout)
+//! and aarch64 (`svc #0`, x8=syscall number, x0..x4=args, x0=ret, x1=ret2).
+//! The AArch64 ABI matches `kernel/arch/aarch64/exceptions.zig` which writes
+//! the primary return in x0 and the secondary return (e.g. `mem_reserve`'s
+//! allocated VA) in x1.
+
+const builtin = @import("builtin");
+
 pub const PAGE4K: u64 = 4096;
 
 pub const SyscallResult2 = struct {
@@ -67,82 +77,150 @@ pub const SyscallNum = enum(u64) {
     vm_vcpu_get_state, // 43
     vm_vcpu_run, // 44
     vm_vcpu_interrupt, // 45
-    vm_msr_passthrough, // 46
-    vm_ioapic_assert_irq, // 47
-    vm_ioapic_deassert_irq, // 48
+    vm_sysreg_passthrough, // 46
+    vm_intc_assert_irq, // 47
+    vm_intc_deassert_irq, // 48
 };
 
 // Raw syscall wrappers
 fn syscall0(num: SyscallNum) i64 {
-    return asm volatile ("syscall"
-        : [ret] "={rax}" (-> i64),
-        : [num] "{rax}" (@intFromEnum(num)),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
+    return switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("syscall"
+            : [ret] "={rax}" (-> i64),
+            : [num] "{rax}" (@intFromEnum(num)),
+            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+            : [num] "{x8}" (@intFromEnum(num)),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
 }
 
 fn syscall1(num: SyscallNum, a0: u64) i64 {
-    return asm volatile ("syscall"
-        : [ret] "={rax}" (-> i64),
-        : [num] "{rax}" (@intFromEnum(num)),
-          [a0] "{rdi}" (a0),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
+    return switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("syscall"
+            : [ret] "={rax}" (-> i64),
+            : [num] "{rax}" (@intFromEnum(num)),
+              [a0] "{rdi}" (a0),
+            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+            : [num] "{x8}" (@intFromEnum(num)),
+              [a0] "{x0}" (a0),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
 }
 
 fn syscall2(num: SyscallNum, a0: u64, a1: u64) i64 {
-    return asm volatile ("syscall"
-        : [ret] "={rax}" (-> i64),
-        : [num] "{rax}" (@intFromEnum(num)),
-          [a0] "{rdi}" (a0),
-          [a1] "{rsi}" (a1),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
+    return switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("syscall"
+            : [ret] "={rax}" (-> i64),
+            : [num] "{rax}" (@intFromEnum(num)),
+              [a0] "{rdi}" (a0),
+              [a1] "{rsi}" (a1),
+            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+            : [num] "{x8}" (@intFromEnum(num)),
+              [a0] "{x0}" (a0),
+              [a1] "{x1}" (a1),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
 }
 
 fn syscall3(num: SyscallNum, a0: u64, a1: u64, a2: u64) i64 {
-    return asm volatile (
-        \\syscall
-        : [ret] "={rax}" (-> i64),
-        : [num] "{rax}" (@intFromEnum(num)),
-          [a0] "{rdi}" (a0),
-          [a1] "{rsi}" (a1),
-          [a2] "{rdx}" (a2),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
+    return switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile (
+            \\syscall
+            : [ret] "={rax}" (-> i64),
+            : [num] "{rax}" (@intFromEnum(num)),
+              [a0] "{rdi}" (a0),
+              [a1] "{rsi}" (a1),
+              [a2] "{rdx}" (a2),
+            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+            : [num] "{x8}" (@intFromEnum(num)),
+              [a0] "{x0}" (a0),
+              [a1] "{x1}" (a1),
+              [a2] "{x2}" (a2),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
 }
 
 fn syscall4(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64) i64 {
-    return asm volatile (
-        \\syscall
-        : [ret] "={rax}" (-> i64),
-        : [num] "{rax}" (@intFromEnum(num)),
-          [a0] "{rdi}" (a0),
-          [a1] "{rsi}" (a1),
-          [a2] "{rdx}" (a2),
-          [a3] "{r10}" (a3),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
+    return switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile (
+            \\syscall
+            : [ret] "={rax}" (-> i64),
+            : [num] "{rax}" (@intFromEnum(num)),
+              [a0] "{rdi}" (a0),
+              [a1] "{rsi}" (a1),
+              [a2] "{rdx}" (a2),
+              [a3] "{r10}" (a3),
+            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+            : [num] "{x8}" (@intFromEnum(num)),
+              [a0] "{x0}" (a0),
+              [a1] "{x1}" (a1),
+              [a2] "{x2}" (a2),
+              [a3] "{x3}" (a3),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
 }
 
 fn syscall5(num: SyscallNum, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) i64 {
-    return asm volatile (
-        \\syscall
-        : [ret] "={rax}" (-> i64),
-        : [num] "{rax}" (@intFromEnum(num)),
-          [a0] "{rdi}" (a0),
-          [a1] "{rsi}" (a1),
-          [a2] "{rdx}" (a2),
-          [a3] "{r10}" (a3),
-          [a4] "{r8}" (a4),
-        : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true });
+    return switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile (
+            \\syscall
+            : [ret] "={rax}" (-> i64),
+            : [num] "{rax}" (@intFromEnum(num)),
+              [a0] "{rdi}" (a0),
+              [a1] "{rsi}" (a1),
+              [a2] "{rdx}" (a2),
+              [a3] "{r10}" (a3),
+              [a4] "{r8}" (a4),
+            : .{ .rcx = true, .r11 = true, .rdx = true, .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+            : [num] "{x8}" (@intFromEnum(num)),
+              [a0] "{x0}" (a0),
+              [a1] "{x1}" (a1),
+              [a2] "{x2}" (a2),
+              [a3] "{x3}" (a3),
+              [a4] "{x4}" (a4),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
 }
 
 fn syscall3_2(num: SyscallNum, a0: u64, a1: u64, a2: u64) SyscallResult2 {
     var val2: u64 = undefined;
-    const val = asm volatile ("syscall"
-        : [ret] "={rax}" (-> i64),
-          [out2] "={rdx}" (val2),
-        : [num] "{rax}" (@intFromEnum(num)),
-          [a0] "{rdi}" (a0),
-          [a1] "{rsi}" (a1),
-          [a2] "{rdx}" (a2),
-        : .{ .rcx = true, .r11 = true, .memory = true });
+    const val = switch (builtin.cpu.arch) {
+        .x86_64 => asm volatile ("syscall"
+            : [ret] "={rax}" (-> i64),
+              [out2] "={rdx}" (val2),
+            : [num] "{rax}" (@intFromEnum(num)),
+              [a0] "{rdi}" (a0),
+              [a1] "{rsi}" (a1),
+              [a2] "{rdx}" (a2),
+            : .{ .rcx = true, .r11 = true, .memory = true }),
+        .aarch64 => asm volatile ("svc #0"
+            : [ret] "={x0}" (-> i64),
+              [out2] "={x1}" (val2),
+            : [num] "{x8}" (@intFromEnum(num)),
+              [a0] "{x0}" (a0),
+              [a1] "{x1}" (a1),
+              [a2] "{x2}" (a2),
+            : .{ .memory = true }),
+        else => unreachable,
+    };
     return .{ .val = val, .val2 = val2 };
 }
 
@@ -238,10 +316,10 @@ pub fn vm_vcpu_interrupt(thread_handle: u64, interrupt_ptr: u64) i64 {
     return syscall2(.vm_vcpu_interrupt, thread_handle, interrupt_ptr);
 }
 
-pub fn vm_ioapic_assert_irq(vm_handle: u64, irq_num: u64) i64 {
-    return syscall2(.vm_ioapic_assert_irq, vm_handle, irq_num);
+pub fn vm_intc_assert_irq(vm_handle: u64, irq_num: u64) i64 {
+    return syscall2(.vm_intc_assert_irq, vm_handle, irq_num);
 }
 
-pub fn vm_ioapic_deassert_irq(vm_handle: u64, irq_num: u64) i64 {
-    return syscall2(.vm_ioapic_deassert_irq, vm_handle, irq_num);
+pub fn vm_intc_deassert_irq(vm_handle: u64, irq_num: u64) i64 {
+    return syscall2(.vm_intc_deassert_irq, vm_handle, irq_num);
 }

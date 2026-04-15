@@ -599,18 +599,43 @@ pub fn resolveVaddr(
     const root_virt = VAddr.fromPAddr(addr_space_root, null);
     var table: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
 
-    const walk_indices = [_]u9{ l3Idx(virt), l2Idx(virt), l1Idx(virt) };
-    for (walk_indices) |idx| {
-        const entry = &table[idx];
-        if (!entry.valid) return null;
-        if (!entry.is_table) return null; // block descriptor
-        const next_virt = VAddr.fromPAddr(entry.getPAddr(), null);
-        table = @ptrFromInt(next_virt.addr);
+    // Walk root → L1 → L2, terminating early when we hit a block
+    // descriptor. Block sizes: 1 GiB at ARM L1 (naming `l2Idx` here),
+    // 2 MiB at ARM L2 (`l1Idx` here). The direct-kernel boot stub
+    // maps the kernel image with 2 MiB blocks at L2, so smpInit's
+    // `resolveVaddr(&secondaryEntry)` needs to honour them — without
+    // this early-out it used to return null and SMP bring-up bailed
+    // with "!R".
+    const root_entry = &table[l3Idx(virt)];
+    if (!root_entry.valid) return null;
+    if (!root_entry.is_table) {
+        // 512 GiB block at root — architecturally invalid for 4KB
+        // granule, but handle defensively.
+        return null;
     }
+    table = @ptrFromInt(VAddr.fromPAddr(root_entry.getPAddr(), null).addr);
 
-    const l0_entry = &table[l0Idx(virt)];
-    if (!l0_entry.valid) return null;
-    return l0_entry.getPAddr();
+    const l1_entry = &table[l2Idx(virt)];
+    if (!l1_entry.valid) return null;
+    if (!l1_entry.is_table) {
+        // 1 GiB block: PA = entry_pa_base | (virt[29:0]).
+        const base = l1_entry.getPAddr().addr & ~@as(u64, (1 << 30) - 1);
+        return PAddr.fromInt(base | (virt.addr & ((1 << 30) - 1)));
+    }
+    table = @ptrFromInt(VAddr.fromPAddr(l1_entry.getPAddr(), null).addr);
+
+    const l2_entry = &table[l1Idx(virt)];
+    if (!l2_entry.valid) return null;
+    if (!l2_entry.is_table) {
+        // 2 MiB block: PA = entry_pa_base | (virt[20:0]).
+        const base = l2_entry.getPAddr().addr & ~@as(u64, (1 << 21) - 1);
+        return PAddr.fromInt(base | (virt.addr & ((1 << 21) - 1)));
+    }
+    table = @ptrFromInt(VAddr.fromPAddr(l2_entry.getPAddr(), null).addr);
+
+    const leaf = &table[l0Idx(virt)];
+    if (!leaf.valid) return null;
+    return PAddr.fromInt(leaf.getPAddr().addr | (virt.addr & 0xFFF));
 }
 
 /// Map MemoryPerms to ARM AP[2:1] bits.

@@ -1014,29 +1014,19 @@ pub fn enableDmaRemapping() void {
 
 pub const Vm = switch (builtin.cpu.arch) {
     .x86_64 => x64.kvm.vm.Vm,
-    .aarch64 => struct {
-        pub fn destroy(_: *@This()) void {}
-    },
+    .aarch64 => aarch64.kvm.vm.Vm,
     else => @compileError("unsupported arch for VM"),
 };
 
 pub const VmAllocator = switch (builtin.cpu.arch) {
     .x86_64 => x64.kvm.vm.VmAllocator,
-    .aarch64 => struct {
-        backing: std.mem.Allocator = undefined,
-        pub fn init(alloc: std.mem.Allocator) !@This() { return .{ .backing = alloc }; }
-        pub fn allocator(self: @This()) std.mem.Allocator { return self.backing; }
-    },
+    .aarch64 => aarch64.kvm.vm.VmAllocator,
     else => @compileError("unsupported arch for VM"),
 };
 
 pub const VCpuAllocator = switch (builtin.cpu.arch) {
     .x86_64 => x64.kvm.vcpu.VCpuAllocator,
-    .aarch64 => struct {
-        backing: std.mem.Allocator = undefined,
-        pub fn init(alloc: std.mem.Allocator) !@This() { return .{ .backing = alloc }; }
-        pub fn allocator(self: @This()) std.mem.Allocator { return self.backing; }
-    },
+    .aarch64 => aarch64.kvm.vcpu.VCpuAllocator,
     else => @compileError("unsupported arch for VM"),
 };
 
@@ -1164,16 +1154,18 @@ pub fn vmInjectException(guest_state: *GuestState, exception: GuestException) vo
     }
 }
 
-/// Modify MSR passthrough bits in the VM's MSR permission map.
+/// Modify system-register passthrough bits in the VM's per-sysreg trap map.
 /// On AMD SVM: AMD APM Vol 2, §15.10 "MSR Intercepts" — the MSRPM is an 8-KB
 /// bitmap; two bits per MSR (bit 0 = read intercept, bit 1 = write intercept);
 /// 0 = passthrough, 1 = intercept. MSRs 0x0000–0x1FFF at byte offset 0x000;
 /// MSRs 0xC0000000–0xC0001FFF at byte offset 0x800.
 /// On Intel VMX: Intel SDM Vol 3C, §24.6.9 "MSR-Bitmap Address" — a 4-KB
 /// bitmap with four 1-KB regions for RDMSR/WRMSR on low/high MSR ranges.
-pub fn vmMsrPassthrough(vm_structures: PAddr, msr_num: u32, allow_read: bool, allow_write: bool) void {
+/// On ARMv8: HCR_EL2/CPTR_EL2/MDCR_EL2/CNTHCTL_EL2 trap bits per register class
+/// (ARM ARM D13) — `sysreg_id` is a packed (op0,op1,CRn,CRm,op2) encoding.
+pub fn vmSysregPassthrough(vm_structures: PAddr, sysreg_id: u32, allow_read: bool, allow_write: bool) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.vm.msrPassthrough(vm_structures, msr_num, allow_read, allow_write),
+        .x86_64 => x64.vm.sysregPassthrough(vm_structures, sysreg_id, allow_read, allow_write),
         .aarch64 => {},
         else => unreachable,
     }
@@ -1529,101 +1521,114 @@ pub fn getCoreState(core_id: u64) u8 {
 
 // --- KVM syscall dispatch ---
 // These dispatch the syscall-facing KVM operations through the arch boundary.
-// The KVM implementation lives in arch/x64/kvm/ and is inherently x86-specific;
-// only this thin syscall interface is abstracted.
+// x86 backend lives in arch/x64/kvm/, aarch64 backend in arch/aarch64/kvm/.
+// The syscall layer calls through this abstraction and never references the
+// per-arch modules directly.
 
 const ArchCpuContextLocal = ArchCpuContext;
 const SyscallResult = zag.syscall.dispatch.SyscallResult;
 const Process = zag.proc.process.Process;
 
-// AArch64 KVM stubs: `vm_create` returns E_NODEV (-13) per spec §4.2.18 since
-// hardware virtualization (stage-2 / HCR_EL2) is not yet implemented. All
-// downstream VM syscalls still honor spec §4.2.1 — "All VM syscalls with an
-// invalid handle return E_BADHANDLE". Because `proc.vm` is always null on
-// aarch64 (vm_create cannot succeed), every handle-accepting syscall treats
-// the handle as invalid and returns E_BADHANDLE (-3) for handle-based ops or
-// E_INVAL (-1) for vCPU ops (matching the x86 code paths which return E_INVAL
-// when the owning process has no VM).
 pub fn kvmVmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vm.vmCreate(proc, vcpu_count, policy_ptr),
-        else => -13, // E_NODEV
+        .aarch64 => aarch64.kvm.vm.vmCreate(proc, vcpu_count, policy_ptr),
+        else => -14, // E_NOSYS
     };
 }
 
 pub fn kvmGuestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64, size: u64, rights: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vm.guestMap(proc, vm_handle, host_vaddr, guest_addr, size, rights),
-        else => -3, // E_BADHANDLE — no VM exists on this arch
+        .aarch64 => aarch64.kvm.vm.guestMap(proc, vm_handle, host_vaddr, guest_addr, size, rights),
+        else => -14,
     };
 }
 
 pub fn kvmVmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContextLocal, vm_handle: u64, buf_ptr: u64, blocking: bool) SyscallResult {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.exit_box.vmRecv(proc, thread, ctx, vm_handle, buf_ptr, blocking),
-        else => .{ .ret = -3 }, // E_BADHANDLE
+        .aarch64 => .{ .ret = aarch64.kvm.exit_box.vmRecv(proc, thread, ctx, vm_handle, buf_ptr, blocking) },
+        else => .{ .ret = -14 },
     };
 }
 
 pub fn kvmVmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.exit_box.vmReply(proc, vm_handle, exit_token, action_ptr),
-        else => -3, // E_BADHANDLE
+        .aarch64 => aarch64.kvm.exit_box.vmReply(proc, vm_handle, exit_token, action_ptr),
+        else => -14,
     };
 }
 
 pub fn kvmVcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.vcpuSetState(proc, thread_handle, state_ptr),
-        else => -1, // E_INVAL — proc has no VM
+        .aarch64 => aarch64.kvm.vcpu.vcpuSetState(proc, thread_handle, state_ptr),
+        else => -14,
     };
 }
 
 pub fn kvmVcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.vcpuGetState(proc, thread_handle, state_ptr),
-        else => -1, // E_INVAL
+        .aarch64 => aarch64.kvm.vcpu.vcpuGetState(proc, thread_handle, state_ptr),
+        else => -14,
     };
 }
 
 pub fn kvmVcpuRun(proc: *Process, thread_handle: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.vcpuRun(proc, thread_handle),
-        else => -1, // E_INVAL
+        .aarch64 => aarch64.kvm.vcpu.vcpuRun(proc, thread_handle),
+        else => -14,
     };
 }
 
 pub fn kvmVcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.vcpuInterrupt(proc, thread_handle, interrupt_ptr),
-        else => -1, // E_INVAL
+        .aarch64 => aarch64.kvm.vcpu.vcpuInterrupt(proc, thread_handle, interrupt_ptr),
+        else => -14,
     };
 }
 
-pub fn kvmMsrPassthrough(proc: *Process, vm_handle: u64, msr_num: u32, allow_read: bool, allow_write: bool) i64 {
+pub fn kvmSysregPassthrough(proc: *Process, vm_handle: u64, sysreg_id: u32, allow_read: bool, allow_write: bool) i64 {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.msrPassthrough(proc, vm_handle, msr_num, allow_read, allow_write),
-        else => -3, // E_BADHANDLE
+        .x86_64 => x64.kvm.vm.sysregPassthrough(proc, vm_handle, sysreg_id, allow_read, allow_write),
+        .aarch64 => aarch64.kvm.vm.sysregPassthrough(proc, vm_handle, sysreg_id, allow_read, allow_write),
+        else => -14,
     };
 }
 
-pub fn kvmIoapicAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
+pub fn kvmIntcAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.ioapicAssertIrq(proc, vm_handle, irq_num),
-        else => -3, // E_BADHANDLE
+        .x86_64 => x64.kvm.vm.intcAssertIrq(proc, vm_handle, irq_num),
+        .aarch64 => aarch64.kvm.vm.intcAssertIrq(proc, vm_handle, irq_num),
+        else => -14,
     };
 }
 
-pub fn kvmIoapicDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
+pub fn kvmIntcDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
     return switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.ioapicDeassertIrq(proc, vm_handle, irq_num),
-        else => -3, // E_BADHANDLE
+        .x86_64 => x64.kvm.vm.intcDeassertIrq(proc, vm_handle, irq_num),
+        .aarch64 => aarch64.kvm.vm.intcDeassertIrq(proc, vm_handle, irq_num),
+        else => -14,
     };
 }
 
-pub fn kvmVcpuFromThread(vm_obj: *Vm, thread: *Thread) ?*x64.kvm.vcpu.VCpu {
+/// Per-arch concrete VCpu type (used by the syscall layer to type-check
+/// the result of kvmVcpuFromThread without going through dispatch.Vm).
+pub const VCpu = switch (builtin.cpu.arch) {
+    .x86_64 => x64.kvm.vcpu.VCpu,
+    .aarch64 => aarch64.kvm.vcpu.VCpu,
+    else => @compileError("unsupported arch for VM"),
+};
+
+pub fn kvmVcpuFromThread(vm_obj: *Vm, thread: *Thread) ?*VCpu {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.vcpuFromThread(vm_obj, thread),
+        .aarch64 => aarch64.kvm.vcpu.vcpuFromThread(vm_obj, thread),
         else => null,
     };
 }
@@ -1631,6 +1636,7 @@ pub fn kvmVcpuFromThread(vm_obj: *Vm, thread: *Thread) ?*x64.kvm.vcpu.VCpu {
 pub fn kvmSetVmAllocator(alloc: std.mem.Allocator) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vm.allocator = alloc,
+        .aarch64 => aarch64.kvm.vm.allocator = alloc,
         else => {},
     }
 }
@@ -1638,6 +1644,7 @@ pub fn kvmSetVmAllocator(alloc: std.mem.Allocator) void {
 pub fn kvmSetVcpuAllocator(alloc: std.mem.Allocator) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vcpu.allocator = alloc,
+        .aarch64 => aarch64.kvm.vcpu.allocator = alloc,
         else => {},
     }
 }

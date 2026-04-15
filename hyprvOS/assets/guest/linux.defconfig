@@ -1,0 +1,44 @@
+# Delta config layered on top of `make tinyconfig` for arm64.
+# Goal: smallest Linux Image that boots under hyprvOS with a PL011 UART
+# and an embedded initramfs. No networking, no USB, no block devices.
+#
+# Apply via: scripts/kconfig/merge_config.sh -m .config linux.defconfig
+
+CONFIG_64BIT=y
+CONFIG_ARM64=y
+
+# Virt-class machine support (covers hyprvOS's guest layout + qemu-virt).
+CONFIG_ARCH_VIRT=y
+
+# Boot protocol: allow passing a command line and use one by default so
+# early-printk/console= work without a bootloader cmdline.
+CONFIG_CMDLINE="console=ttyAMA0 earlycon=pl011,0x9000000"
+CONFIG_CMDLINE_FORCE=y
+
+# TTY + PL011 UART (both early and runtime driver).
+CONFIG_TTY=y
+CONFIG_SERIAL_AMBA_PL011=y
+CONFIG_SERIAL_AMBA_PL011_CONSOLE=y
+CONFIG_SERIAL_EARLYCON=y
+
+# printk so we can see the banner at all.
+CONFIG_PRINTK=y
+
+# Initramfs support — kernel embeds / extracts rootfs.cpio.gz.
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_GZIP=y
+
+# Minimal filesystem set needed to actually run /init.
+CONFIG_PROC_FS=y
+CONFIG_SYSFS=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_TMPFS=y
+
+# Userspace binary formats.
+CONFIG_BINFMT_ELF=y
+CONFIG_BINFMT_SCRIPT=y
+
+# Multi-core is not required for the smoke test; leave SMP off to keep
+# the image tiny. Re-enable if/when the guest needs it.
+# CONFIG_SMP is not set

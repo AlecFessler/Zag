@@ -1,7 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
 # Defaults
 TARGET="all"
@@ -18,7 +18,8 @@ Usage: ./test.sh [target] [options]
 Targets:
   kernel          Run kernel integration tests (QEMU, 473 tests)
   router          Run router integration tests (pytest)
-  linux           Boot Linux guest in hyprvOS, verify shell prompt
+  linux           Boot Linux guest in hyprvOS (x86_64), verify shell prompt
+  linux-arm       Boot Linux guest in hyprvOS (aarch64 TCG), verify 'hello from guest'
   pre-commit      Run kernel + linux + router (gate before commit)
   perf            Run kernel performance benchmarks (sequential)
   kernel-fuzz     Run all kernel fuzzers (buddy, heap, vmm, rbt)
@@ -162,6 +163,63 @@ run_linux_boot_test() {
     fi
 }
 
+run_linux_boot_arm_test() {
+    echo "=== Linux VM Boot Test (aarch64) ==="
+    clean_nvvars
+
+    (cd "$SCRIPT_DIR/hyprvOS" && zig build -Darch=arm) \
+        || { echo "hyprvOS-arm build failed"; return 1; }
+    (cd "$SCRIPT_DIR" && zig build -Darch=arm -Dprofile=hyprvos -Dkvm=false \
+        -Doptimize=ReleaseSafe -Droot-service=hyprvOS/bin/hyprvOS-arm.elf) \
+        || { echo "kernel arm build failed"; return 1; }
+
+    local workdir qemu_log
+    workdir=$(mktemp -d)
+    qemu_log=$(mktemp)
+    mkdir -p "$workdir/efi/boot"
+    ln -s "$SCRIPT_DIR/zig-out/img/efi/boot/BOOTAA64.EFI" "$workdir/efi/boot/"
+    ln -s "$SCRIPT_DIR/zig-out/img/kernel.elf" "$workdir/"
+    cp "$SCRIPT_DIR/zig-out/img/NvVars" "$workdir/" 2>/dev/null || true
+    cp "$SCRIPT_DIR/hyprvOS/bin/hyprvOS-arm.elf" "$workdir/root_service.elf"
+
+    timeout 300 qemu-system-aarch64 \
+        -M virt,virtualization=on,gic-version=3 -m 2G \
+        -bios /usr/share/AAVMF/AAVMF_CODE.fd \
+        -serial stdio -display none -no-reboot \
+        -machine accel=tcg -cpu cortex-a72 -smp cores=4 \
+        -drive "file=fat:rw:$workdir,format=raw" \
+        > "$qemu_log" 2>&1 &
+    local qemu_pid=$!
+
+    local found=0
+    for _ in $(seq 1 300); do
+        if grep -q "hello from guest" "$qemu_log" 2>/dev/null; then
+            found=1
+            break
+        fi
+        if ! kill -0 $qemu_pid 2>/dev/null; then break; fi
+        sleep 1
+    done
+
+    kill -TERM $qemu_pid 2>/dev/null || true
+    pkill -f "qemu-system-aarch64.*root_service.elf" 2>/dev/null || true
+    wait $qemu_pid 2>/dev/null || true
+    rm -rf "$workdir"
+
+    if [[ $found -eq 1 ]]; then
+        echo "[PASS] Linux booted to busybox init (aarch64)"
+        rm -f "$qemu_log"
+        return 0
+    else
+        echo "[FAIL] Linux did not reach 'hello from guest' within 300s"
+        echo "--- last 50 lines of QEMU output ---"
+        tail -50 "$qemu_log"
+        echo "--- end ---"
+        rm -f "$qemu_log"
+        return 1
+    fi
+}
+
 run_router_tests() {
     ensure_network
     ensure_venv
@@ -219,6 +277,9 @@ case "$TARGET" in
         ;;
     linux)
         run_linux_boot_test
+        ;;
+    linux-arm)
+        run_linux_boot_arm_test
         ;;
     perf)
         run_perf_tests

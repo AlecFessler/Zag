@@ -1,4 +1,3 @@
-const builtin = @import("builtin");
 const perm_view = @import("perm_view.zig");
 const syscall = @import("syscall.zig");
 
@@ -131,25 +130,44 @@ pub fn fail(name: []const u8) void {
     syscall.write("\n");
 }
 
-/// Emits `[SKIP] name — reason` and shuts down. The runner counts [SKIP]
-/// separately from PASS/FAIL so a suite with known platform gaps still
-/// runs to completion without hiding missing-coverage behind a green mark.
-pub fn skip(name: []const u8, reason: []const u8) noreturn {
+/// Emit a SKIP result for the current test. Tests that cannot exercise their
+/// target behavior at runtime (e.g. a VM syscall on a host without hardware
+/// virtualization) must call this instead of `pass`, so a green run isn't
+/// confused with an untested path. The test runner counts SKIPs separately
+/// from PASS/FAIL.
+pub fn skip(name: []const u8, reason: []const u8) void {
     syscall.write("[SKIP] ");
     syscall.write(name);
-    syscall.write(" — ");
+    syscall.write(" (");
     syscall.write(reason);
-    syscall.write("\n");
-    syscall.shutdown();
+    syscall.write(")\n");
 }
 
-/// On aarch64, emit [SKIP] with the "no aarch64 VM backend" reason and
-/// shut down. On x86_64, no-op — the test proceeds normally. Used at the
-/// top of §4.2 VM tests since the kernel currently has only stub aarch64
-/// KVM syscalls (no Stage-2 translation, no vCPU struct, no guest memory).
+/// If `rc` indicates the VM syscall layer is unavailable on this host
+/// (currently `E_NODEV` — no hardware virtualization — or `E_NORES` —
+/// architecture has no VM backend wired up, e.g. aarch64 TCG), emit a
+/// `[SKIP]` line tagged with `name` and shut down the test process.
+///
+/// Returns without side effects otherwise, letting the caller proceed with
+/// the positive-path assertions. Tests probe by issuing a cheap VM syscall
+/// (typically `vm_create(1, &policy)`) and funnelling its return code
+/// through this helper before asserting behaviour that depends on a live
+/// VM object.
+/// Compatibility shim used by older §4.2 tests that predate the
+/// unified `skipIfNoVm` probe. Now a no-op: the real decision is made
+/// by `skipIfNoVm(cr)` after the first VM syscall returns, which works
+/// on both x86_64 (EPT always available under KVM) and aarch64 (EL2
+/// available under `-M virt,virtualization=on`, reported via
+/// `vmSupported()` → E_NODEV otherwise). Kept so existing test
+/// sources still compile without per-file edits.
 pub fn skipNoAarch64Vm(name: []const u8) void {
-    if (builtin.cpu.arch == .aarch64) {
-        skip(name, "aarch64 VM backend not implemented");
+    _ = name;
+}
+
+pub fn skipIfNoVm(name: []const u8, rc: i64) void {
+    if (rc == syscall.E_NODEV or rc == syscall.E_NORES) {
+        skip(name, "VM unavailable (E_NODEV/E_NORES)");
+        syscall.shutdown();
     }
 }
 
@@ -249,10 +267,6 @@ pub fn requirePmu(name: []const u8) PmuPrereq {
 pub fn requirePmuOverflow(name: []const u8) PmuPrereq {
     const r = requirePmu(name);
     if (!r.info.overflow_support) {
-        if (builtin.cpu.arch == .aarch64) {
-            pass(name);
-            syscall.shutdown();
-        }
         fail(name);
         syscall.write("  requirePmuOverflow: overflow_support == false — test rig misconfigured\n");
         syscall.shutdown();

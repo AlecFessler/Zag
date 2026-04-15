@@ -62,6 +62,16 @@ fn kMain(boot_info: *BootInfo) !void {
     try arch.parseFirmwareTables(boot_info.xsdp_phys);
     arch.earlyDebugChar('J');
     arch.vmInit();
+    // On aarch64, propagate the UEFI bootloader's "I arrived at EL2"
+    // flag into the arch-layer hyp stub gate. The bootloader is the
+    // only code path that can observe CurrentEL under UEFI (firmware
+    // drops privilege as it likes once we're past ExitBootServices)
+    // and was the one that installed the minimal hyp vector table at
+    // VBAR_EL2 before its ERET-to-EL1, so it already ensured the
+    // invariant vmSupported() checks. See bootloader/aarch64_el2_drop.zig.
+    if (@import("builtin").cpu.arch == .aarch64 and boot_info.arrived_at_el2 != 0) {
+        zag.arch.aarch64.vm.hyp_stub_installed = true;
+    }
     arch.earlyDebugChar('K');
     arch.pmuInit();
     arch.earlyDebugChar('L');
