@@ -52,12 +52,18 @@ const pmm = zag.memory.pmm;
 const power = zag.arch.aarch64.power;
 const sched = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
+const vm = zag.arch.aarch64.vm;
 
 // Type aliases — alphabetical
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageEntry = aarch64_paging.PageEntry;
 const VAddr = zag.memory.address.VAddr;
+
+/// Kernel EL2 vector table; defined in kernel/arch/aarch64/vm.zig.
+/// Referenced here to resolve its PA for per-core VBAR_EL2 install on
+/// secondary cores; see `SecondaryBootParams.hyp_vbar`.
+extern fn __hyp_vectors() void;
 
 /// Maximum number of cores supported.
 const MAX_CORES: usize = 256;
@@ -99,6 +105,16 @@ const SecondaryBootParams = extern struct {
     entry: u64, // offset 48: secondarySetup function pointer (kernel VA)
     core_idx: u64, // offset 56: Logical core index
     vbar: u64, // offset 64: VBAR_EL1 value (exception vector table)
+    /// offset 72: PA of the kernel's `__hyp_vectors` table. On QEMU
+    /// `-M virt,virtualization=on`, PSCI CPU_ON delivers the secondary
+    /// at EL2 with VBAR_EL2 unset — the very first exception (e.g. the
+    /// instruction-fetch abort that follows `br x7` into a high VA when
+    /// the EL2 MMU stayed off) then vectors to VBAR_EL2+0x200 = 0x200,
+    /// which is unmapped, yielding an UNDEF loop visible in the
+    /// `qemu -d int` trace. The trampoline installs this table directly
+    /// before the EL2→EL1 drop so secondaries have the same per-core
+    /// EL2 vector setup the primary gets via the bootloader hyp stub.
+    hyp_vbar: u64,
 };
 
 /// Boot params — static global, PA resolved via page table walk.
@@ -347,6 +363,23 @@ fn smpInitFull() !void {
     boot_params_storage.sctlr = readSctlr();
     boot_params_storage.entry = @intFromPtr(&secondarySetup);
     boot_params_storage.vbar = readVbar();
+
+    // Resolve the PA of `__hyp_vectors` so the trampoline can install
+    // VBAR_EL2 before dropping to EL1. Only meaningful when the boot
+    // path brought the primary up at EL2 (hyp_stub_installed); on an
+    // EL1-only UEFI boot, PSCI brings secondaries up at EL1 and no EL2
+    // drop is needed, but we still compute a safe value so the asm can
+    // unconditionally write VBAR_EL2 when it sees EL2.
+    if (vm.hyp_stub_installed) {
+        const hyp_vec_va: u64 = @intFromPtr(&__hyp_vectors);
+        if (arch.resolveVaddr(memory_init.kernel_addr_space_root, VAddr.fromInt(hyp_vec_va))) |hyp_page| {
+            boot_params_storage.hyp_vbar = hyp_page.addr | (hyp_vec_va & 0xFFF);
+        } else {
+            boot_params_storage.hyp_vbar = 0;
+        }
+    } else {
+        boot_params_storage.hyp_vbar = 0;
+    }
     arch.earlyDebugChar('g');
     arch.earlyDebugHex(boot_params_storage.entry);
 
@@ -491,6 +524,66 @@ fn secondaryEntry() callconv(.naked) noreturn {
     // MMU is off — all memory access uses physical addresses and is
     // treated as Normal Non-Cacheable (ARM ARM D5.2.9).
     //
+    // On QEMU `-M virt,virtualization=on`, PSCI CPU_ON wakes the
+    // secondary at EL2 with VBAR_EL2 / SCTLR_EL2 at their reset
+    // values (both effectively zero / MMU-off). If we stayed at EL2
+    // the existing trampoline — which programs EL1 sysregs and does
+    // `br x7` to a kernel high VA — would hit an instruction-fetch
+    // abort that vectors to VBAR_EL2+0x200 = 0x200 (unmapped),
+    // producing the UNDEF loop visible under `qemu -d int`. Detect
+    // EL2 entry and drop to EL1h before the EL1 programming sequence.
+    //
+    // ARM ARM D13.2.28 CurrentEL — bits [3:2] encode EL.
+        \\mrs x15, CurrentEL
+        \\ubfx x15, x15, #2, #2
+        \\cmp x15, #2
+        \\b.ne 10f
+        \\
+        // EL2 entry path.
+        //
+        //   1. Install the kernel's __hyp_vectors at VBAR_EL2 so stray
+        //      EL2 traps during the drop window and any future HVC
+        //      from this core land on a real handler rather than PA 0.
+        //      The PA was pre-resolved by `smpInitFull`.
+        \\ldr x15, [x0, #72]
+        \\msr vbar_el2, x15
+        \\
+        //   2. HCR_EL2.RW = 1 so EL1 executes AArch64. Every other
+        //      bit stays at reset (the kernel reconfigures HCR_EL2
+        //      per-guest via world-switch setup); matches the primary
+        //      drop in bootloader/aarch64_el2_drop.zig.
+        \\mov x15, #1
+        \\lsl x15, x15, #31
+        \\msr hcr_el2, x15
+        \\
+        //   3. CPTR_EL2 = reset pattern 0x33FF so FP/SIMD isn't trapped
+        //      to EL2. Without this the first Zig instruction that
+        //      touches a Q register raises EC=0x07 from EL1 to EL2.
+        \\mov x15, #0x33FF
+        \\msr cptr_el2, x15
+        \\
+        //   4. HSTR_EL2 / MDCR_EL2 cleared. These alias traps on EL1
+        //      CP15/debug access; leaving them at reset defaults is
+        //      correct for a host-at-EL1 kernel.
+        \\msr hstr_el2, xzr
+        \\
+        //   5. SPSR_EL2 = EL1h (M=0b0101) + DAIF masked. ELR_EL2
+        //      points at the shared post-drop label so the remaining
+        //      EL1 programming sequence runs unchanged. SP_EL1 is
+        //      set below (the secondary has no live stack yet, but
+        //      the trampoline installs `x6` as sp after MMU enable).
+        \\mov x15, #0x3C5
+        \\msr spsr_el2, x15
+        \\adr x15, 10f
+        \\msr elr_el2, x15
+        \\msr sp_el1, xzr
+        \\
+        \\isb
+        \\eret
+        \\
+        // 10: EL1 entry (reached either by falling through on an
+        //     EL1-only boot, or via the ERET above on an EL2 boot).
+        \\10:
     // Debug: PL011 UART at PA 0x09000000 (QEMU virt machine).
         \\mov x10, #0x09000000
         \\mov w11, #0x61             // 'a' — trampoline entered

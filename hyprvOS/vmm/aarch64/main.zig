@@ -60,7 +60,7 @@ const syscall = lib.syscall;
 // ---------------------------------------------------------------------------
 
 const GUEST_RAM_BASE: u64 = 0x20000000;
-const GUEST_RAM_SIZE: u64 = 64 * 1024 * 1024;
+const GUEST_RAM_SIZE: u64 = 256 * 1024 * 1024;
 const GUEST_RAM_END: u64 = GUEST_RAM_BASE + GUEST_RAM_SIZE;
 
 const LINUX_TEXT_OFFSET: u64 = 0x80000;
@@ -292,19 +292,34 @@ fn loadGuestImages() void {
         log.print("bad arm64 Image header\n");
         syscall.shutdown();
     };
-    _ = hdr; // text_offset is fixed to LINUX_TEXT_OFFSET in our layout.
 
-    if (assets.image.len > GUEST_RAM_SIZE - LINUX_TEXT_OFFSET) {
-        log.print("Image too large for guest RAM\n");
+    // Linux arm64 booting.rst: image_size is the total in-memory footprint
+    // (head + text + data + BSS). The loader must provide image_size bytes
+    // of contiguous memory at the load address, and the BSS tail past the
+    // on-disk file bytes must be ZERO — reserved_pg_dir, init_pg_dir,
+    // swapper_pg_dir, init_task stack, idmap tables and many other early
+    // boot structures live in that BSS and rely on post-loader zeroing.
+    // Leaving garbage there corrupts the early page-table walk and
+    // produces silent stage-1 faults during __primary_switched.
+    if (hdr.image_size > GUEST_RAM_SIZE - LINUX_TEXT_OFFSET) {
+        log.print("image_size too large for guest RAM\n");
+        syscall.shutdown();
+    }
+    if (assets.image.len > hdr.image_size) {
+        log.print("on-disk Image larger than image_size — bad header\n");
         syscall.shutdown();
     }
 
     const kdst = guestToHost(LINUX_LOAD_ADDR);
     var ki: usize = 0;
     while (ki < assets.image.len) : (ki += 1) kdst[ki] = assets.image[ki];
+    // Zero the BSS tail [file_size .. image_size). Critical — see above.
+    while (ki < hdr.image_size) : (ki += 1) kdst[ki] = 0;
     log.print("Image loaded: ");
     log.dec(assets.image.len);
-    log.print(" bytes @0x");
+    log.print(" bytes (+");
+    log.dec(hdr.image_size - assets.image.len);
+    log.print(" BSS) @0x");
     log.hex64(LINUX_LOAD_ADDR);
     log.print("\n");
 
@@ -321,7 +336,7 @@ fn loadGuestImages() void {
         .ram_size = GUEST_RAM_SIZE,
         .initrd_start = initrd.start,
         .initrd_end = initrd.end,
-        .bootargs = "console=ttyAMA0 earlycon=pl011,0x09000000 panic=-1",
+        .bootargs = "console=ttyAMA0 earlycon=pl011,mmio32,0x09000000 maxcpus=1 nokaslr lpj=5000000 keep_bootcon ignore_loglevel panic=-1",
         .gicd_base = GICD_BASE,
         .gicd_size = GICD_SIZE,
         .gicr_base = GICR_BASE,
