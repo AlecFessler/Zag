@@ -186,6 +186,17 @@ pub fn handleExit(vcpu_obj: *VCpu, exit_info: vm_hw.VmExitInfo) void {
                 }
             }
             // Non-PSCI SMCCC call — deliver as a generic HVC exit.
+            //
+            // ARM hardware advances ELR_EL2 past the HVC instruction
+            // before trapping (D1.10.2), so the guest_state.pc the exit
+            // path snapshotted points to PC+4. The VMM contract used by
+            // the §4.2 tests (and matching AMD SVM HLT semantics on x86)
+            // is that the exit PC names the trapping instruction itself
+            // and the VMM advances PC explicitly on resume. Roll PC back
+            // to the HVC so a `resume_guest` reply that does not touch
+            // PC re-executes the HVC, and one that adds halt_insn_size
+            // lands on the next instruction.
+            vcpu_obj.guest_state.pc -%= 4;
         },
         .smc => {
             // SMC calls from a non-secure guest are always forwarded to
