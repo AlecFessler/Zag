@@ -200,6 +200,17 @@ class MetricStats:
     p99: int
     max_v: int
 
+    def to_json(self) -> dict:
+        return {
+            "count":  self.count,
+            "total":  self.total,
+            "min":    self.min_v,
+            "median": self.median,
+            "p95":    self.p95,
+            "p99":    self.p99,
+            "max":    self.max_v,
+        }
+
 
 @dataclass
 class ScopeStats:
@@ -405,6 +416,35 @@ def usage() -> None:
     )
 
 
+def report_json(session: Session) -> None:
+    """Machine-readable scope summary for CI drift-detection pipelines.
+    Emits a single JSON document with session metadata + per-scope
+    stats (tsc / cycles / cache_misses / branch_misses medians and
+    totals). Mirrors the data shown by `--trace` / `[KPROF-SUMMARY]`
+    lines, in a form trivial to diff across runs."""
+    stats, orphan_enters, orphan_exits = compute_scope_stats(session)
+    doc = {
+        "mode":    session.mode,
+        "cpus":    session.cpus,
+        "reason":  session.reason,
+        "records": len(session.records),
+        "orphan_enters": orphan_enters,
+        "orphan_exits":  orphan_exits,
+        "scopes": [
+            {
+                "name":  s.name,
+                "count": s.tsc.count,
+                "tsc":   s.tsc.to_json(),
+                "cycles": s.cycles.to_json(),
+                "cache_misses":  s.cache_misses.to_json(),
+                "branch_misses": s.branch_misses.to_json(),
+            }
+            for s in stats
+        ],
+    }
+    print(json.dumps(doc, indent=2))
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         usage()
@@ -414,7 +454,7 @@ def main(argv: list[str]) -> int:
     mode_flag = ""
     if len(argv) >= 3:
         mode_flag = argv[2]
-        if mode_flag not in ("--trace", "--sample", "--raw"):
+        if mode_flag not in ("--trace", "--sample", "--raw", "--json"):
             usage()
             return 2
 
@@ -442,6 +482,8 @@ def main(argv: list[str]) -> int:
         report_trace(session)
     elif mode_flag == "--sample":
         report_sample(session)
+    elif mode_flag == "--json":
+        report_json(session)
     else:
         report_summary(session)
 
