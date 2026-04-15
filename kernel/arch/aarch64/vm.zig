@@ -496,10 +496,13 @@ pub fn vmInit() void {
 /// — VBAR_ELx bits [10:0] are RES0).
 pub fn installHypVectors() void {
     // Requires both a CPU that implements EL2 and a live EL2 stub sitting
-    // at VBAR_EL2 willing to honour our install HVC. On the UEFI path the
-    // bootloader installs that stub in aarch64_el2_drop.zig; if we booted
-    // at EL1 with no stub, there is no one to service the HVC and issuing
-    // it would trap to EL1 as an undefined instruction.
+    // at VBAR_EL2 willing to honour our install HVC. The bootloader
+    // (bootloader/aarch64_el2_drop.zig) writes VBAR_EL2 to a
+    // runtime-allocated stub in RuntimeServicesCode memory before
+    // ERETing to EL1; that stub recognises the HVC immediate
+    // `HVC_IMM_INSTALL_VBAR_EL2` and rewrites VBAR_EL2 with x0. On the
+    // UEFI path that stub is always live; on a non-UEFI / EL1-entry
+    // path `hyp_stub_installed` remains false and we short-circuit.
     if (!vm_supported or !hyp_stub_installed) return;
     if (hyp_vectors_installed) return;
 
@@ -518,7 +521,7 @@ pub fn installHypVectors() void {
     asm volatile (hvc_insn
         :
         : [vbar] "{x0}" (vec_pa),
-        : .{ .memory = true });
+        : .{ .memory = true, .x9 = true, .x10 = true });
 
     hyp_vectors_installed = true;
 }
@@ -1213,7 +1216,7 @@ pub fn vmResume(
 /// async exceptions to EL2 and the direct-kernel path does not support
 /// AArch32 guests, so any entry there is a bug we want to observe as a
 /// hang rather than a silent wild branch.
-export fn __hyp_vectors() align(2048) callconv(.naked) noreturn {
+export fn __hyp_vectors() align(2048) linksection(".hyp_vectors") callconv(.naked) noreturn {
     asm volatile (
     // +0x000 sync EL2t
         \\        b       .
@@ -1262,7 +1265,7 @@ export fn __hyp_vectors() align(2048) callconv(.naked) noreturn {
     );
 }
 
-export fn hyp_sync_lower_a64() callconv(.naked) noreturn {
+export fn hyp_sync_lower_a64() linksection(".hyp_text") callconv(.naked) noreturn {
     asm volatile (
         \\  // If tpidr_el2 != 0 we were running a guest; this is a VM exit.
         \\  mrs     x18, tpidr_el2
@@ -1327,7 +1330,7 @@ export fn hyp_sync_lower_a64() callconv(.naked) noreturn {
 // whose VMID is otherwise already loaded, which is the common case
 // because `mapGuestPage`/`unmapGuestPage` are driven from VMM syscalls
 // on the owning process's core while VTTBR_EL2 holds that VM's VMID.
-export fn hvc_tlbi_ipa() callconv(.naked) noreturn {
+export fn hvc_tlbi_ipa() linksection(".hyp_text") callconv(.naked) noreturn {
     asm volatile (
         \\  lsr     x1, x1, #12
         \\  dsb     ishst
@@ -1341,7 +1344,7 @@ export fn hvc_tlbi_ipa() callconv(.naked) noreturn {
     );
 }
 
-export fn hvc_noop() callconv(.naked) noreturn {
+export fn hvc_noop() linksection(".hyp_text") callconv(.naked) noreturn {
     asm volatile (
         \\  // Return arg^1 so the caller can verify the round-trip changed x0.
         \\  eor     x0, x1, #1
@@ -1367,7 +1370,7 @@ export fn hvc_noop() callconv(.naked) noreturn {
 //
 // Reads ICH_VTR_EL2.ListRegs (bits[4:0]), adds 1, returns in x0.
 // ICH_VTR_EL2 has encoding S3_4_C12_C11_1 (ARM ARM D13.8.50).
-export fn hvc_vgic_detect_lrs() callconv(.naked) noreturn {
+export fn hvc_vgic_detect_lrs() linksection(".hyp_text") callconv(.naked) noreturn {
     asm volatile (
         \\  mrs     x0, S3_4_C12_C11_1      // ICH_VTR_EL2
         \\  and     x0, x0, #0x1F
@@ -1400,7 +1403,7 @@ export fn hvc_vgic_detect_lrs() callconv(.naked) noreturn {
 //   ICH_AP1R0_EL2   = S3_4_C12_C9_0  (D13.8.46)
 //   ICH_VMCR_EL2    = S3_4_C12_C11_7 (D13.8.49)
 //   ICH_HCR_EL2     = S3_4_C12_C11_0 (D13.8.45)
-export fn hvc_vgic_prepare_entry() callconv(.naked) noreturn {
+export fn hvc_vgic_prepare_entry() linksection(".hyp_text") callconv(.naked) noreturn {
     asm volatile (
         \\  ldr     x2, [x1, #0x00]
         \\  msr     S3_4_C12_C12_0, x2
@@ -1458,7 +1461,7 @@ export fn hvc_vgic_prepare_entry() callconv(.naked) noreturn {
 // Reads all 16 LRs, AP0R0, AP1R0 into the shadow. Then disables the
 // virtual CPU interface by writing ICH_HCR_EL2 = 0 so a maintenance
 // IRQ cannot fire into the host running window (GICv3 §12.5.7 "En").
-export fn hvc_vgic_save_exit() callconv(.naked) noreturn {
+export fn hvc_vgic_save_exit() linksection(".hyp_text") callconv(.naked) noreturn {
     asm volatile (
         \\  mrs     x2, S3_4_C12_C12_0
         \\  str     x2, [x1, #0x00]
@@ -1526,7 +1529,7 @@ export fn hvc_vgic_save_exit() callconv(.naked) noreturn {
 // Then program CNTVOFF_EL2, CNTKCTL_EL1, CNTV_CVAL_EL0, CNTV_CTL_EL0
 // in that order (D13.11.17 ISTATUS is re-evaluated on every read, so
 // writing CTL last ensures IMASK/ENABLE see the fresh CVAL).
-export fn hvc_vtimer_load_guest() callconv(.naked) noreturn {
+export fn hvc_vtimer_load_guest() linksection(".hyp_text") callconv(.naked) noreturn {
     asm volatile (
         \\  ldr     x3, [x1, #0x20]         // primed
         \\  cbnz    x3, 1f
@@ -1560,7 +1563,7 @@ export fn hvc_vtimer_load_guest() callconv(.naked) noreturn {
 // back. Finally writes CNTV_CTL_EL0 = 0x2 (IMASK=1, ENABLE=0) so a
 // post-exit virtual-timer match cannot fire into the host context
 // (D13.11.17; mirrors Linux arch_timer.c timer_save_state).
-export fn hvc_vtimer_save_guest() callconv(.naked) noreturn {
+export fn hvc_vtimer_save_guest() linksection(".hyp_text") callconv(.naked) noreturn {
     asm volatile (
         \\  mrs     x2, cntv_ctl_el0
         \\  str     x2, [x1, #0x08]
@@ -1585,7 +1588,7 @@ export fn hvc_vtimer_save_guest() callconv(.naked) noreturn {
 // per-VM EL2 state (HCR/VTCR/VTTBR/CNTVOFF), loads guest EL1 sysregs and
 // GPRs from ctx.guest_state, sets tpidr_el2 = ctx_pa as the "guest active"
 // marker, and ERETs to the guest at guest.pc / guest.pstate.
-export fn hvc_vcpu_run() callconv(.naked) noreturn {
+export fn hvc_vcpu_run() linksection(".hyp_text") callconv(.naked) noreturn {
     asm volatile (
         \\  // x1 = ctx PA. Preserve it in x18 across sysreg work.
         \\  mov     x18, x1
@@ -1741,7 +1744,7 @@ export fn hvc_vcpu_run() callconv(.naked) noreturn {
 // ctx.exit_{esr,far,hpfar}, restores host EL1 sysregs and callee-saved
 // GPRs, clears tpidr_el2, restores host ELR_EL2/SPSR_EL2 stashed at entry,
 // and ERETs back to the host (instruction after `hvc #0` in hypCall).
-export fn guest_exit_entry() callconv(.naked) noreturn {
+export fn guest_exit_entry() linksection(".hyp_text") callconv(.naked) noreturn {
     asm volatile (
         \\  // Reclaim ctx pointer from tpidr_el2 without clobbering x0..x17.
         \\  // Use SP_EL2 as a two-slot scratch to free up x17/x18.
@@ -1898,7 +1901,7 @@ export fn guest_exit_entry() callconv(.naked) noreturn {
     );
 }
 
-export fn hyp_halt() callconv(.naked) noreturn {
+export fn hyp_halt() linksection(".hyp_text") callconv(.naked) noreturn {
     asm volatile (
         \\1:wfe
         \\  b       1b

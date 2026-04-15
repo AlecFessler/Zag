@@ -140,35 +140,44 @@ const dbg = struct {
 
 pub fn main() uefi.Status {
     // On aarch64 + `-M virt,virtualization=on`, AAVMF hands off to us
-    // at EL2. The Zag bootloader (and kernel) are written against EL1
-    // semantics — in particular `arch.setKernelAddrSpace` writes
-    // TTBR1_EL1, which is inert while the CPU uses the EL2 translation
-    // regime. Drop to EL1 NOW so every subsequent TTBR/TCR/SCTLR/MAIR
-    // write lands on the active regime, matching the plain `-M virt`
-    // path where UEFI was at EL1 to begin with. We must do this before
-    // the first `setKernelAddrSpace` call on line ~190, but firmware
-    // boot services keep working at EL1 because they are plain C code
-    // operating on identity-mapped memory. `dropToEl1` mirrors TTBR0/
-    // TCR/MAIR/SCTLR/VBAR from EL2 into EL1 so the MMU state the
-    // firmware set up stays exactly in force after the ERET.
+    // at EL2. The bootloader (and kernel) are written against EL1
+    // semantics. Drop to EL1 NOW so every subsequent TTBR/TCR/SCTLR
+    // write lands on the active regime. `dropToEl1` mirrors the EL2
+    // MMU state into the corresponding EL1 sysregs and ERETs back to
+    // the same C frame via SP_EL1 so the drop is transparent.
     //
-    // `arrived_at_el2` is cached here so the BootInfo flag that tells
-    // the kernel to set `vm.hyp_stub_installed = true` can be filled
-    // in later without re-reading CurrentEL (which would always be 1
-    // after the drop).
+    // At this point we do NOT yet know the kernel's __hyp_vectors PA
+    // (the ELF isn't loaded yet). `dropToEl1` therefore writes VBAR_EL2
+    // to a temporary bootloader-owned stub — but that stub is allocated
+    // in a fresh RuntimeServicesCode page (not linked into the
+    // bootloader PE's .text) so its EL2 execute permission survives
+    // ExitBootServices. The kernel later overwrites VBAR_EL2 via an
+    // HVC that the stub honours; see aarch64_el2_drop.zig for the
+    // vector layout and HVC imm dispatch.
+    const boot_services: *uefi.tables.BootServices = uefi.system_table.boot_services orelse return .aborted;
+
     const arrived_at_el2: bool = blk: {
         if (builtin.cpu.arch != .aarch64) break :blk false;
         if (el2_drop.currentEl() != 2) break :blk false;
-        el2_drop.dropToEl1();
+        const stub_pa = el2_drop.allocateHypVectorStub(boot_services) catch return .aborted;
+        el2_drop.dropToEl1(stub_pa);
         break :blk true;
     };
-
-    const boot_services: *uefi.tables.BootServices = uefi.system_table.boot_services orelse return .aborted;
     uefi.system_table.con_out.?.clearScreen() catch return .aborted;
     puts(dbg.boot_start);
 
     var page_alloc = PageAllocator.init(boot_services, .acpi_reclaim_memory);
     const page_alloc_iface = page_alloc.allocator();
+
+    // Separate allocator for pages that must stay executable at EL2
+    // after ExitBootServices. On aarch64 + AAVMF the firmware's EL2
+    // page tables mark generic reclaim/loader-data pages as NX; kernel
+    // `.text` pages we copy into those fault as IFSC=0xF permission
+    // faults the moment an HVC from EL1 tries to fetch from them
+    // (most notably `__hyp_vectors`). `runtime_services_code` memory
+    // is preserved and remains executable at EL2 across the drop.
+    var code_page_alloc = PageAllocator.init(boot_services, .runtime_services_code);
+    const code_page_alloc_iface = code_page_alloc.allocator();
 
     puts(dbg.page_tables);
 
@@ -303,7 +312,14 @@ pub fn main() uefi.Status {
         var current_vaddr = start_vaddr;
         var file_offset = section.offset;
         while (current_vaddr < end_vaddr) {
-            const page = page_alloc_iface.alignedAlloc(
+            // Use RuntimeServicesCode memory for executable sections
+            // so AAVMF's EL2 page tables keep them executable across
+            // ExitBootServices. See the comment near `code_page_alloc`.
+            const section_alloc = if (section_idx == .text)
+                code_page_alloc_iface
+            else
+                page_alloc_iface;
+            const page = section_alloc.alignedAlloc(
                 u8,
                 paging.pageAlign(.page4k),
                 paging.PAGE4K,
@@ -478,6 +494,7 @@ pub fn main() uefi.Status {
     // Final TLB flush after exitBootServices ensures all TTBR1 page table
     // entries are visible to the hardware walker before jumping to the kernel.
     arch.setKernelAddrSpace(kernel_table_root_phys);
+
     // Switch SP to kernel stack before calling kEntry. After exitBootServices,
     // the UEFI stack (loader_data) may be reclaimed — writing to it would
     // fault on KVM where memory is real hardware.
