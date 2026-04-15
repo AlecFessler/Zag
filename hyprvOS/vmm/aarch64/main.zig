@@ -63,8 +63,15 @@ const GUEST_RAM_BASE: u64 = 0x20000000;
 const GUEST_RAM_SIZE: u64 = 256 * 1024 * 1024;
 const GUEST_RAM_END: u64 = GUEST_RAM_BASE + GUEST_RAM_SIZE;
 
-const LINUX_TEXT_OFFSET: u64 = 0x80000;
-const LINUX_LOAD_ADDR: u64 = GUEST_RAM_BASE + LINUX_TEXT_OFFSET;
+// Per Documentation/arm64/booting.rst: the loader places the Image at
+// (2 MiB-aligned base) + image.text_offset. Modern Linux (post-4.10) sets
+// text_offset = 0 in the Image header — the previous TEXT_OFFSET = 0x80000
+// is legacy. Using the wrong offset shifts every kernel-VA mapping down by
+// that delta and the very first post-MMU branch (br x8 to __primary_switched)
+// reads from the wrong PA, manifesting as a stage-1 instr fault on the
+// kernel half of the address space.
+const LINUX_LOAD_BASE: u64 = GUEST_RAM_BASE; // 2 MiB-aligned RAM base
+var linux_load_addr: u64 = 0; // resolved from Image header in loadGuestImages
 
 // FDT + initramfs live inside the mapped RAM bank so vm_guest_map wires
 // them into stage-2 along with the rest of RAM. Placed 32 MiB above the
@@ -301,7 +308,8 @@ fn loadGuestImages() void {
     // boot structures live in that BSS and rely on post-loader zeroing.
     // Leaving garbage there corrupts the early page-table walk and
     // produces silent stage-1 faults during __primary_switched.
-    if (hdr.image_size > GUEST_RAM_SIZE - LINUX_TEXT_OFFSET) {
+    linux_load_addr = LINUX_LOAD_BASE + hdr.text_offset;
+    if (hdr.image_size > GUEST_RAM_SIZE - hdr.text_offset) {
         log.print("image_size too large for guest RAM\n");
         syscall.shutdown();
     }
@@ -310,7 +318,7 @@ fn loadGuestImages() void {
         syscall.shutdown();
     }
 
-    const kdst = guestToHost(LINUX_LOAD_ADDR);
+    const kdst = guestToHost(linux_load_addr);
     var ki: usize = 0;
     while (ki < assets.image.len) : (ki += 1) kdst[ki] = assets.image[ki];
     // Zero the BSS tail [file_size .. image_size). Critical — see above.
@@ -320,7 +328,9 @@ fn loadGuestImages() void {
     log.print(" bytes (+");
     log.dec(hdr.image_size - assets.image.len);
     log.print(" BSS) @0x");
-    log.hex64(LINUX_LOAD_ADDR);
+    log.hex64(linux_load_addr);
+    log.print(" text_offset=0x");
+    log.hex64(hdr.text_offset);
     log.print("\n");
 
     const idst = guestToHost(INITRAMFS_LOAD_ADDR);
@@ -362,7 +372,7 @@ fn loadGuestImages() void {
 /// Initialize the vCPU to the arm64 boot protocol entry state.
 fn setupVcpuState() void {
     guest_state = .{};
-    guest_state.pc = LINUX_LOAD_ADDR;
+    guest_state.pc = linux_load_addr;
     guest_state.x0 = FDT_LOAD_ADDR;
     guest_state.x1 = 0;
     guest_state.x2 = 0;
@@ -627,6 +637,17 @@ fn handleStage2Fault(gs: *GuestState) bool {
         log.print("data fault @0x");
     }
     log.hex64(guest_phys);
+    log.print("\n");
+    log.print("  pc=0x"); log.hex64(gs.pc);
+    log.print(" elr1=0x"); log.hex64(gs.elr_el1);
+    log.print(" far1=0x"); log.hex64(gs.far_el1);
+    log.print(" esr1=0x"); log.hex64(gs.esr_el1);
+    log.print("\n  sctlr=0x"); log.hex64(gs.sctlr_el1);
+    log.print(" tcr=0x"); log.hex64(gs.tcr_el1);
+    log.print(" ttbr0=0x"); log.hex64(gs.ttbr0_el1);
+    log.print(" ttbr1=0x"); log.hex64(gs.ttbr1_el1);
+    log.print("\n  vbar=0x"); log.hex64(gs.vbar_el1);
+    log.print(" mair=0x"); log.hex64(gs.mair_el1);
     log.print("\n");
     return true;
 }
