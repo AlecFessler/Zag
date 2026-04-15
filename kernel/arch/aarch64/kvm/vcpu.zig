@@ -391,10 +391,8 @@ fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
         const page_off = src_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(src_va), false, false) catch return false;
-        // aarch64 resolveVaddr returns the full PA (page_off already
-        // OR'd in); do not add page_off again.
         const src_pa = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
-        const physmap_addr = VAddr.fromPAddr(src_pa, null).addr;
+        const physmap_addr = VAddr.fromPAddr(src_pa, null).addr + page_off;
         const src: [*]const u8 = @ptrFromInt(physmap_addr);
         @memcpy(buf[dst_off..][0..chunk], src[0..chunk]);
         dst_off += chunk;
@@ -413,10 +411,8 @@ fn writeUserStruct(proc: *Process, user_va: u64, data: []const u8) bool {
         const page_off = dst_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(dst_va), true, false) catch return false;
-        // See readUserStruct — aarch64 resolveVaddr already encodes
-        // page_off.
         const dst_pa = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return false;
-        const physmap_addr = VAddr.fromPAddr(dst_pa, null).addr;
+        const physmap_addr = VAddr.fromPAddr(dst_pa, null).addr + page_off;
         const dst: [*]u8 = @ptrFromInt(physmap_addr);
         @memcpy(dst[0..chunk], data[src_off..][0..chunk]);
         src_off += chunk;

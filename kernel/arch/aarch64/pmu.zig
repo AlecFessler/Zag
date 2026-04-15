@@ -31,7 +31,9 @@
 const zag = @import("zag");
 
 const pmu_sched = zag.syscall.pmu;
+const sched = zag.sched.scheduler;
 
+const ArchCpuContext = zag.arch.aarch64.interrupts.ArchCpuContext;
 const PmuCounterConfig = pmu_sched.PmuCounterConfig;
 const PmuEvent = pmu_sched.PmuEvent;
 const PmuInfo = pmu_sched.PmuInfo;
@@ -164,6 +166,21 @@ inline fn writePMINTENCLR(mask: u64) void {
     );
 }
 
+inline fn writePMINTENSET(mask: u64) void {
+    asm volatile ("msr pmintenset_el1, %[v]"
+        :
+        : [v] "r" (mask),
+    );
+}
+
+inline fn readPMOVSCLR() u64 {
+    var v: u64 = undefined;
+    asm volatile ("mrs %[v], pmovsclr_el0"
+        : [v] "=r" (v),
+    );
+    return v;
+}
+
 inline fn writePMCNTENSET(mask: u64) void {
     asm volatile ("msr pmcntenset_el0, %[v]"
         :
@@ -275,12 +292,14 @@ pub fn pmuInit() void {
 
     cached_info = .{
         .num_counters = counters,
-        // PMI delivery is not wired through the GIC yet — overflow-based
-        // sampling (spec §6.11) requires routing the per-CPU PPI for the
-        // PMU through `arch/aarch64/gic.zig` first. Until that lands,
-        // advertise "no overflow support" so the generic syscall layer
-        // rejects any `pmu_start` call with `has_threshold == true`.
-        .overflow_support = false,
+        // Overflow-driven sampling is supported. Per ARM ARM DDI 0487 K.a
+        // §D13.3.1 "Generating overflow interrupt requests", the PMU
+        // connects to the GIC as a level-sensitive PPI with ID 23 on
+        // GICv3-compatible implementations (QEMU `virt`, Cortex-A72/A76
+        // all honour this recommendation). The GIC driver enables and
+        // configures PPI 23 per-core in `initRedistributor`, and
+        // `exceptions.dispatchIrq` routes INTID 23 to `pmiHandler` below.
+        .overflow_support = true,
         .supported_events = mask,
     };
 }
@@ -326,6 +345,12 @@ pub fn pmuStop(state: *PmuState) void {
     }
     const all_mask: u64 = counterMask(cached_info.num_counters);
     writePMCNTENCLR(all_mask);
+    // Mask the PMU overflow PPI for every counter we may have armed.
+    // D13.3.21 PMINTENCLR_EL1: bit n = 1 disables the overflow-interrupt
+    // contribution of PMEVCNTR<n>. Required for level-sensitive PPI 23
+    // so a residual overflow bit can't re-assert the line on the next
+    // thread before it gets a chance to reprogram the PMU.
+    writePMINTENCLR(all_mask);
     clearAllOverflowStatus(state.num_counters);
     state.num_counters = 0;
 }
@@ -360,6 +385,11 @@ pub fn pmuSave(state: *PmuState) void {
 
     const enabled_mask: u64 = counterMask(state.num_counters);
     writePMCNTENCLR(enabled_mask);
+    // Mask the PMU PPI so a pending overflow that fires after the
+    // context switch is not delivered against the incoming thread's
+    // PMU state. pmuRestore re-arms PMINTENSET for the counters that
+    // the restored thread had configured with has_threshold = true.
+    writePMINTENCLR(enabled_mask);
 
     var i: u8 = 0;
     while (i < state.num_counters) {
@@ -374,6 +404,7 @@ pub fn pmuRestore(state: *PmuState) void {
     if (cached_info.num_counters == 0) return;
 
     var enable_mask: u64 = 0;
+    var intr_mask: u64 = 0;
     var i: u8 = 0;
     while (i < state.num_counters) {
         const cfg = state.configs[i];
@@ -386,9 +417,14 @@ pub fn pmuRestore(state: *PmuState) void {
         writePMXEVCNTR(state.values[i]);
         const sh: u6 = @intCast(i);
         enable_mask |= @as(u64, 1) << sh;
+        if (cfg.has_threshold) intr_mask |= @as(u64, 1) << sh;
         i += 1;
     }
     if (enable_mask != 0) writePMCNTENSET(enable_mask);
+    // D13.3.21 PMINTENSET_EL1: re-arm the PMU overflow PPI only on
+    // counters the restored thread asked to sample (has_threshold). The
+    // matching mask was cleared in pmuSave so this is a pure re-arm.
+    if (intr_mask != 0) writePMINTENSET(intr_mask);
 }
 
 pub fn pmuRead(state: *PmuState, sample: *PmuSample) void {
@@ -432,12 +468,16 @@ fn programCounters(state: *PmuState, configs: []const PmuCounterConfig) void {
         return;
     }
 
-    // Disable all slots we are about to touch before reprogramming.
+    // Disable all slots we are about to touch before reprogramming, and
+    // mask any pending overflow interrupts on them to avoid a stale PMI
+    // firing against the new configuration (D13.3.21 PMINTENCLR_EL1).
     const touch_mask = counterMask(n);
     writePMCNTENCLR(touch_mask);
+    writePMINTENCLR(touch_mask);
 
     state.num_counters = n;
     var enable_mask: u64 = 0;
+    var intr_mask: u64 = 0;
     var i: u8 = 0;
     while (i < n) {
         state.configs[i] = configs[i];
@@ -453,6 +493,10 @@ fn programCounters(state: *PmuState, configs: []const PmuCounterConfig) void {
         state.values[i] = preload;
         const sh: u6 = @intCast(i);
         enable_mask |= @as(u64, 1) << sh;
+        // Only arm the PMU overflow interrupt for counters that request
+        // threshold-based sampling. Free-running counters stay off the
+        // PMI so their wrap-arounds don't generate fault messages.
+        if (configs[i].has_threshold) intr_mask |= @as(u64, 1) << sh;
         i += 1;
     }
     while (i < state.values.len) {
@@ -461,6 +505,7 @@ fn programCounters(state: *PmuState, configs: []const PmuCounterConfig) void {
     }
 
     if (enable_mask != 0) writePMCNTENSET(enable_mask);
+    if (intr_mask != 0) writePMINTENSET(intr_mask);
 }
 
 /// Build a PMEVTYPER<n>_EL0 value for `evnum` with EL0-only counting.
@@ -494,4 +539,89 @@ fn clearAllOverflowStatus(num_counters: u8) void {
     if (cached_info.num_counters == 0) return;
     const mask: u64 = counterMask(num_counters);
     writePMOVSCLR(mask);
+}
+
+/// PMU overflow PPI (INTID 23) handler. Invoked from
+/// `kernel/arch/aarch64/exceptions.zig dispatchIrq`.
+///
+/// Mirrors the Intel/AMD PMI contract: snapshot the overflow status and
+/// live counter values, mask the source (so the level-sensitive PPI 23
+/// line deasserts before we ERET back to userspace), deliver a
+/// `.pmu_overflow` fault to the process's fault handler, and yield.
+///
+/// Spec references:
+///   * ARM ARM DDI 0487 K.a §D13.3  Behavior on overflow
+///   * ARM ARM DDI 0487 K.a §D13.3.1 Generating overflow interrupt requests
+///     — PMU overflow connects as GICv3 PPI 23, level-sensitive.
+///   * ARM ARM DDI 0487 K.a §D13.3.17 PMOVSCLR_EL0 — clearing a bit
+///     deasserts that counter's contribution to the PMU overflow request.
+///   * ARM ARM DDI 0487 K.a §D13.3.21 PMINTENCLR_EL1 — masking removes
+///     the counter's contribution to PMUIRQ without losing PMOVSSET state.
+pub fn pmiHandler(ctx: *ArchCpuContext) void {
+    const thread = sched.currentThread() orelse {
+        // No thread context (can happen during early boot transitions).
+        // Just scrub any pending overflow bits so the PPI deasserts.
+        writePMINTENCLR(~@as(u64, 0));
+        writePMOVSCLR(~@as(u64, 0));
+        return;
+    };
+    const state_ptr = thread.pmu_state orelse {
+        // No PMU state on this thread — another thread's overflow that
+        // was latched before the context switch. Mask and clear so the
+        // level-sensitive PPI line drops, then return.
+        writePMINTENCLR(~@as(u64, 0));
+        writePMOVSCLR(~@as(u64, 0));
+        return;
+    };
+
+    // Stale-PMI filter: require at least one overflow bit that maps to
+    // a counter owned by the current thread. Matches the Intel PMI
+    // filter in `arch/x64/intel/pmu.zig`.
+    if (state_ptr.num_counters == 0) {
+        writePMINTENCLR(~@as(u64, 0));
+        writePMOVSCLR(~@as(u64, 0));
+        return;
+    }
+    const nbits: u6 = @intCast(state_ptr.num_counters);
+    const owned_mask: u64 = (@as(u64, 1) << nbits) - 1;
+    const status = readPMOVSCLR();
+    if ((status & owned_mask) == 0) {
+        // Overflow bit belongs to a different thread or a slot we no
+        // longer own; just clear every bit to drop the PPI and return.
+        writePMOVSCLR(status);
+        return;
+    }
+
+    // Snapshot every counter's live value so the faulted thread's
+    // userspace fault handler can observe the sample.
+    var i: u8 = 0;
+    while (i < state_ptr.num_counters) {
+        writePMSELR(i);
+        state_ptr.values[i] = readPMXEVCNTR();
+        i += 1;
+    }
+
+    // Mask PMU overflow contributions for every owned counter, and
+    // clear PMOVSCLR so the level-sensitive PPI 23 line deasserts
+    // before we ERET. PMINTENSET is re-armed on the next pmuRestore
+    // (or pmuStart) for counters that still have has_threshold = true.
+    writePMINTENCLR(owned_mask);
+    writePMOVSCLR(status);
+
+    const rip_at_pmi = ctx.elr_el1;
+    const delivered = thread.process.faultBlock(
+        thread,
+        .pmu_overflow,
+        rip_at_pmi,
+        rip_at_pmi,
+        ctx,
+    );
+
+    if (!delivered) {
+        thread.process.kill(.pmu_overflow);
+    }
+
+    // Hand off to the scheduler so the fault handler (or a new thread,
+    // if this process was killed) can run. schedYield is noreturn.
+    sched.yield();
 }

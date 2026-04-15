@@ -587,8 +587,13 @@ pub fn updatePagePerms(
     tlbiVae1is(virt.addr);
 }
 
-/// Walk the 4-level translation table and return the physical address mapped
-/// at the given virtual address, or null if not mapped.
+/// Walk the 4-level translation table and return the page-base physical
+/// address (4 KiB aligned) of the mapping for `virt`, or null if not mapped.
+///
+/// Contract matches `x64.paging.resolveVaddr`: the returned PAddr is page-
+/// aligned. Callers that need the full PA must add `virt.addr & 0xFFF`
+/// themselves. This keeps generic kernel code (syscall handlers, fault
+/// dispatch, etc.) portable across architectures.
 ///
 /// ARM ARM D5.2 -- performs a software page-table walk through all 4 levels
 /// of the VMSAv8-64 translation regime with 4KB granule.
@@ -618,24 +623,26 @@ pub fn resolveVaddr(
     const l1_entry = &table[l2Idx(virt)];
     if (!l1_entry.valid) return null;
     if (!l1_entry.is_table) {
-        // 1 GiB block: PA = entry_pa_base | (virt[29:0]).
+        // 1 GiB block: page-base = entry_pa_base | (virt[29:12]).
         const base = l1_entry.getPAddr().addr & ~@as(u64, (1 << 30) - 1);
-        return PAddr.fromInt(base | (virt.addr & ((1 << 30) - 1)));
+        const within = virt.addr & ((1 << 30) - 1) & ~@as(u64, 0xFFF);
+        return PAddr.fromInt(base | within);
     }
     table = @ptrFromInt(VAddr.fromPAddr(l1_entry.getPAddr(), null).addr);
 
     const l2_entry = &table[l1Idx(virt)];
     if (!l2_entry.valid) return null;
     if (!l2_entry.is_table) {
-        // 2 MiB block: PA = entry_pa_base | (virt[20:0]).
+        // 2 MiB block: page-base = entry_pa_base | (virt[20:12]).
         const base = l2_entry.getPAddr().addr & ~@as(u64, (1 << 21) - 1);
-        return PAddr.fromInt(base | (virt.addr & ((1 << 21) - 1)));
+        const within = virt.addr & ((1 << 21) - 1) & ~@as(u64, 0xFFF);
+        return PAddr.fromInt(base | within);
     }
     table = @ptrFromInt(VAddr.fromPAddr(l2_entry.getPAddr(), null).addr);
 
     const leaf = &table[l0Idx(virt)];
     if (!leaf.valid) return null;
-    return PAddr.fromInt(leaf.getPAddr().addr | (virt.addr & 0xFFF));
+    return leaf.getPAddr();
 }
 
 /// Map MemoryPerms to ARM AP[2:1] bits.
