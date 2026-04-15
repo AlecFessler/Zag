@@ -630,9 +630,13 @@ done
 log
 log "logs: $RUN_DIR"
 
-# Rotate the latest symlink only on success (so a failing run doesn't
-# become the "previous" baseline for the next perf diff).
-if [ "$hard_fail" -eq 0 ]; then
+# Rotate the latest symlink unconditionally. We used to gate this on
+# "no hard fails", but that meant chronic known-fails in unrelated
+# stages (Pi vGICv2, kprof-on-arm) permanently blocked the perf
+# baseline from ever rotating — the feature it's supposed to enable
+# just never worked. Rotate always: perf diff tracks drift across
+# runs regardless of whether e.g. arm_kernel had a red status.
+if true; then
     if [ -L "$LATEST_LINK" ] && [ -e "$LATEST_LINK" ]; then
         rm -f "$PREVIOUS_LINK"
         mv -T "$LATEST_LINK" "$PREVIOUS_LINK" 2>/dev/null || true
