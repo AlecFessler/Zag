@@ -181,10 +181,10 @@ pub const Vm = struct {
     ) bool {
         // Without a valid syndrome we cannot decode the access. Forward
         // to VMM in that case so it can do an instruction decode.
-        if (!fault.iss_valid) return false;
+        if (!fault.issValid()) return false;
 
         const size: u8 = @as(u8, 1) << @intCast(fault.access_size);
-        if (fault.is_write) {
+        if (fault.isWrite()) {
             const value = readGuestGpr(&vcpu_obj.guest_state, fault.srt);
             switch (target) {
                 .gicd => vgic_mod.mmioWrite(&self.vgic, &vcpu_obj.vgic_state, offset, size, value),
@@ -504,8 +504,11 @@ pub fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
         const page_off = src_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(src_va), false, false) catch return false;
-        const page_paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
-        const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
+        // aarch64 resolveVaddr returns the full PA (page_off already
+        // OR'd in) unlike x64 which returns the page-base PA, so do
+        // NOT add page_off a second time.
+        const src_pa = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
+        const physmap_addr = VAddr.fromPAddr(src_pa, null).addr;
         const src: [*]const u8 = @ptrFromInt(physmap_addr);
         @memcpy(buf[dst_off..][0..chunk], src[0..chunk]);
         dst_off += chunk;

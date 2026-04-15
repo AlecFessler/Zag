@@ -261,36 +261,63 @@ pub const VmExitInfo = union(enum) {
     /// Anything else; `raw` is the full ESR_EL2.
     unknown: u64,
 
-    pub const Stage2Fault = struct {
+    /// Stage-2 fault payload. Must fit in 24 bytes so that the enclosing
+    /// `VmExitInfo` union lays out as 24-byte payload + 1-byte tag (total
+    /// 32 bytes after alignment) — the layout the spec §4.2.5 tests and
+    /// the hyprvOS VMM rely on. See `hyprvOS/vmm/aarch64/main.zig`.
+    pub const Stage2Fault = extern struct {
         /// Guest physical address of the faulting access, derived from
         /// HPFAR_EL2[39:4] << 8 | (FAR_EL2 & 0xFFF).
         guest_phys: u64,
         /// Guest virtual address from FAR_EL2 (may be UNKNOWN for some
         /// fault classes; see ARM ARM D13.2.55).
         guest_virt: u64,
-        /// True if the fault was on an instruction fetch (EC=0x20).
-        is_instruction: bool,
-        /// Write not-read flag (ESR_EL2.ISS.WnR, data abort only).
-        is_write: bool,
         /// Size of the access encoded in ISS.SAS (0=byte, 1=halfword,
         /// 2=word, 3=doubleword). Only meaningful when ISS.ISV=1.
         access_size: u8,
         /// Destination register index (ISS.SRT) for loads. Valid only
         /// when ISS.ISV=1.
         srt: u8,
-        /// 1 if the above fields are valid (ISS.ISV). When 0, the VMM
-        /// must do its own instruction decode at `guest_virt`.
-        iss_valid: bool,
-        /// Sign-extended load (ISS.SSE, data abort only).
-        sign_extend: bool,
-        /// 64-bit register access (ISS.SF, data abort only).
-        reg64: bool,
-        /// Acquire/release semantics (ISS.AR, data abort only).
-        acqrel: bool,
         /// Data/Instruction Fault Status Code (ISS.DFSC for EC=0x24 or
         /// ISS.IFSC for EC=0x20). Low 6 bits. See ARM ARM D13.2.39
         /// Table D13-46.
         fsc: u8,
+        /// Bitfield packing boolean flags so the whole struct fits in
+        /// 24 bytes:
+        ///   bit 0: is_instruction (EC=0x20 instruction abort)
+        ///   bit 1: is_write (ISS.WnR, data abort only)
+        ///   bit 2: iss_valid (ISS.ISV)
+        ///   bit 3: sign_extend (ISS.SSE)
+        ///   bit 4: reg64 (ISS.SF)
+        ///   bit 5: acqrel (ISS.AR)
+        flags: u8,
+        _pad: [4]u8 = .{0} ** 4,
+
+        pub const FLAG_IS_INSTRUCTION: u8 = 1 << 0;
+        pub const FLAG_IS_WRITE: u8 = 1 << 1;
+        pub const FLAG_ISS_VALID: u8 = 1 << 2;
+        pub const FLAG_SIGN_EXTEND: u8 = 1 << 3;
+        pub const FLAG_REG64: u8 = 1 << 4;
+        pub const FLAG_ACQREL: u8 = 1 << 5;
+
+        pub fn isInstruction(self: Stage2Fault) bool {
+            return (self.flags & FLAG_IS_INSTRUCTION) != 0;
+        }
+        pub fn isWrite(self: Stage2Fault) bool {
+            return (self.flags & FLAG_IS_WRITE) != 0;
+        }
+        pub fn issValid(self: Stage2Fault) bool {
+            return (self.flags & FLAG_ISS_VALID) != 0;
+        }
+        pub fn signExtend(self: Stage2Fault) bool {
+            return (self.flags & FLAG_SIGN_EXTEND) != 0;
+        }
+        pub fn reg64(self: Stage2Fault) bool {
+            return (self.flags & FLAG_REG64) != 0;
+        }
+        pub fn acqrel(self: Stage2Fault) bool {
+            return (self.flags & FLAG_ACQREL) != 0;
+        }
     };
 
     pub const HvcExit = struct {
@@ -321,6 +348,20 @@ pub const VmExitInfo = union(enum) {
         is_wfe: bool,
     };
 };
+
+comptime {
+    // Spec §4.2.5 tests and hyprvOS rely on VmExitInfo laying out as a
+    // 24-byte payload + tag byte (total 32 after alignment), matching the
+    // x86_64 VmExitInfo. If any variant grows past 24 bytes, Zig bumps the
+    // union payload size and the tag offset drifts — breaking the binary
+    // contract. Keep the payload exactly 24 bytes.
+    if (@sizeOf(VmExitInfo.Stage2Fault) != 24) {
+        @compileError("Stage2Fault must be 24 bytes — spec §4.2.5 layout contract");
+    }
+    if (@sizeOf(VmExitInfo) != 32) {
+        @compileError("VmExitInfo must be 32 bytes — spec §4.2.5 layout contract");
+    }
+}
 
 // ===========================================================================
 // Interrupt / exception injection types
@@ -976,18 +1017,21 @@ pub fn decodeEsrEl2(esr: u64, far: u64, hpfar: u64) VmExitInfo {
             // hold IPA bits [47:12]; FAR_EL2 supplies the low 12 bits.
             const guest_phys = ((hpfar & 0x0FFF_FFFF_FFF0) << 8) | (far & 0xFFF);
             const iss_valid = (iss & (1 << 24)) != 0;
+            const S2F = VmExitInfo.Stage2Fault;
+            var flags: u8 = 0;
+            if (ec == 0x20) flags |= S2F.FLAG_IS_INSTRUCTION;
+            if ((iss & (1 << 6)) != 0) flags |= S2F.FLAG_IS_WRITE;
+            if (iss_valid) flags |= S2F.FLAG_ISS_VALID;
+            if ((iss & (1 << 21)) != 0) flags |= S2F.FLAG_SIGN_EXTEND;
+            if ((iss & (1 << 15)) != 0) flags |= S2F.FLAG_REG64;
+            if ((iss & (1 << 14)) != 0) flags |= S2F.FLAG_ACQREL;
             break :blk .{ .stage2_fault = .{
                 .guest_phys = guest_phys,
                 .guest_virt = far,
-                .is_instruction = ec == 0x20,
-                .is_write = (iss & (1 << 6)) != 0,
                 .access_size = @intCast((iss >> 22) & 0x3),
                 .srt = @intCast((iss >> 16) & 0x1F),
-                .iss_valid = iss_valid,
-                .sign_extend = (iss & (1 << 21)) != 0,
-                .reg64 = (iss & (1 << 15)) != 0,
-                .acqrel = (iss & (1 << 14)) != 0,
                 .fsc = @intCast(iss & 0x3F),
+                .flags = flags,
             } };
         },
         0x00 => .{ .unknown_ec = 0 },
