@@ -157,6 +157,7 @@ fn coreInit() callconv(.c) noreturn {
     interrupts.initSyscallScratch(core_id);
     cpu.initPat();
     cpu.enableSmapSmep();
+    cpu.enablePcid();
     cpu.enableSpeculationBarriers();
     _ = cores_online.fetchAdd(1, .release);
     sched.perCoreInit();

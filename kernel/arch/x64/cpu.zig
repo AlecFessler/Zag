@@ -588,6 +588,44 @@ pub fn enableSmapSmep() void {
     );
 }
 
+/// Set when the local CPU supports CR4.PCIDE. Read by `swapAddrSpace`
+/// to decide whether to write the PCID/no-flush hint into CR3 or fall
+/// back to the legacy "flush on every CR3 write" path. Whole-system flag
+/// — secondary cores either match the BSP's PCID capability or boot
+/// fails. Some AMD parts (e.g. Ryzen 7950X3D) advertise INVPCID but not
+/// PCID, so the runtime check is required.
+pub var pcid_enabled: bool = false;
+
+/// Enable global pages (CR4.PGE) and, when the CPU supports it,
+/// process-context identifiers (CR4.PCIDE). PGE pins kernel-half TLB
+/// entries across CR3 writes; PCIDE lets us tag the user half with a
+/// per-process id so address-space switches no longer flush the user
+/// TLB. Setting CR4.PCIDE on a CPU that does not support it (CPUID.1
+/// ECX bit 17 = 0) raises #GP, so we CPUID-check first.
+///
+/// CR4.PCIDE may only transition 0→1 while CR3.PCID==0 — true at boot
+/// since the bootloader leaves CR3 with all 12 low bits clear. Once
+/// enabled, CR3 writes interpret bits[11:0] as PCID and bit 63 as the
+/// "preserve TLB" hint (Intel SDM Vol 3A §4.10.4.1).
+pub fn enablePcid() void {
+    var cr4 = asm ("mov %%cr4, %[cr4]"
+        : [cr4] "=r" (-> u64),
+    );
+    cr4 |= (1 << 7); // PGE — always safe to set in long mode.
+
+    const feat = cpuidRaw(0x1, 0);
+    const pcid_bit: u32 = 1 << 17;
+    if ((feat.ecx & pcid_bit) != 0) {
+        cr4 |= (1 << 17); // PCIDE
+        pcid_enabled = true;
+    }
+
+    asm volatile ("mov %[cr4], %%cr4"
+        :
+        : [cr4] "r" (cr4),
+    );
+}
+
 /// Set RFLAGS.AC so the current core may read/write user pages under SMAP.
 /// Must be paired with `clac()`; keep the window as short as possible.
 pub inline fn stac() void {

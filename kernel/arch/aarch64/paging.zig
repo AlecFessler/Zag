@@ -201,34 +201,43 @@ pub fn getAddrSpaceRoot() PAddr {
     return PAddr.fromInt(ttbr0 & mask);
 }
 
-/// Load a new user page table address into TTBR0_EL1.
+/// Load a new user page table address into TTBR0_EL1, tagged with the
+/// process's ASID.
 ///
-/// ARM ARM D13.2.136 -- writing TTBR0_EL1 switches the user address space.
+/// ARM ARM D13.2.136 -- TTBR0_EL1 layout when TCR_EL1.AS=1:
+///   bits [47:1]  = BADDR (page-table base)
+///   bits [63:48] = ASID
 ///
-/// Because Zag does not allocate per-process ASIDs (every process uses
-/// ASID 0 in TTBR0_EL1), stale TLB entries from the previous address
-/// space can still match accesses in the new one — both processes use
-/// ASID 0 and user PTEs are mapped with nG=1, so TLB entries are tagged
-/// with ASID 0 and the new TTBR0 walk is bypassed by a TLB hit on the
-/// old (now wrong) mapping. This manifests as repeating instruction
-/// aborts at the new process's entry point: HW serves stale translations
-/// (or empty/not-present cached entries) until they happen to age out.
+/// User PTEs are mapped with nG=1, so each TLB entry is tagged with the
+/// ASID active when it was loaded. With per-process ASIDs, stale entries
+/// from a different ASID simply miss on lookup and never alias the new
+/// process — no flush needed on context switch. ARM ARM D5.10.2.
 ///
-/// Flush all stage 1 EL1&0 TLB entries on the local core before issuing
-/// the ISB that publishes the new TTBR0 to instruction fetch. Inner-
-/// shareable scope is unnecessary on context switch — only the local
-/// core just changed its address space.
+/// ISB publishes the new TTBR0 to instruction fetch.
+pub fn swapAddrSpace(root: PAddr, id: u16) void {
+    const ttbr0 = (@as(u64, id) << 48) | (root.addr & 0x0000_FFFF_FFFF_FFFE);
+    writeTtbr0(ttbr0);
+    asm volatile ("isb" ::: .{ .memory = true });
+}
+
+/// Invalidate every TLB entry tagged with the given ASID across the inner
+/// shareable domain. Must be called before an ASID is returned to the
+/// allocator — otherwise the next process to be assigned this id would
+/// see stale mappings from the previous owner.
 ///
-/// ARM ARM D5.10.2 / D13.2.142: TLBI VMALLE1 invalidates all stage 1
-/// EL1&0 entries on the executing PE.
-pub fn swapAddrSpace(root: PAddr) void {
-    writeTtbr0(root.addr);
+/// ARM ARM D5.10.2 / D13.2.142: TLBI ASIDE1IS invalidates all stage 1
+/// EL1&0 entries tagged with the supplied ASID. Broadcast across the
+/// inner shareable domain handles SMP automatically — no IPI needed.
+pub fn invalidateAddrSpaceTlb(id: u16) void {
+    const operand: u64 = @as(u64, id) << 48;
     asm volatile (
         \\dsb ishst
-        \\tlbi vmalle1
+        \\tlbi aside1is, %[op]
         \\dsb ish
         \\isb
-        ::: .{ .memory = true });
+        :
+        : [op] "r" (operand),
+        : .{ .memory = true });
 }
 
 /// No-op on AArch64: kernel mappings live in TTBR1_EL1 and are always visible.
@@ -790,14 +799,19 @@ pub fn enableKernelTranslation() void {
     var tcr: u64 = asm volatile ("mrs %[ret], tcr_el1"
         : [ret] "=r" (-> u64),
     );
-    // Clear TTBR1 config bits [31:16], preserve TTBR0 bits [15:0] + upper bits
+    // Clear TTBR1 config bits [31:16] and AS (bit 36). Preserve TTBR0 bits
+    // [15:0] + other upper bits.
     tcr &= ~@as(u64, 0xFFFF_0000);
+    tcr &= ~(@as(u64, 1) << 36);
     // T1SZ=16, EPD1=0, IRGN1=WB-WA, ORGN1=WB-WA, SH1=ISH, TG1=4KB
     tcr |= (16 << 16) | // T1SZ
         (0b01 << 24) | // IRGN1
         (0b01 << 26) | // ORGN1
         (0b11 << 28) | // SH1
         (@as(u64, 0b10) << 30); // TG1
+    // AS=1 selects the 16-bit ASID space; combined with A1=0 (default)
+    // TTBR0_EL1 holds the active ASID in bits [63:48]. ARM ARM D13.2.131.
+    tcr |= (@as(u64, 1) << 36);
     asm volatile ("msr tcr_el1, %[val]"
         :
         : [val] "r" (tcr),

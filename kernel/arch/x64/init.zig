@@ -22,5 +22,6 @@ pub fn init() void {
     cpu.initPat();
     cpu.enableAlignmentCheck();
     cpu.enableSmapSmep();
+    cpu.enablePcid();
     cpu.enableSpeculationBarriers();
 }

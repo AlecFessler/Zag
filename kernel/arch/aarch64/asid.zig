@@ -4,10 +4,12 @@
 //! TLB invalidate. The current kernel TTBR uses ASID 0, so id 0 is reserved
 //! as the boot/kernel sentinel and is never handed out.
 //!
-//! Defaults to the 8-bit ASID space (TCR_EL1.AS = 0 -> 256 ids). The allocator
-//! is a bitmap of 4 u64 words covering ids [0, 256). Bit value 1 means the
-//! id is allocated, 0 means free. An internal `hint` word index points at
-//! the next-likely-free word to keep the common-case search O(1).
+//! Uses the 16-bit ASID space (TCR_EL1.AS = 1 -> 65536 ids). The allocator
+//! is a bitmap of 1024 u64 words covering ids [0, 65536). Bit value 1 means
+//! the id is allocated, 0 means free. An internal `hint` word index points at
+//! the next-likely-free word to keep the common-case search O(1). 16-bit
+//! ASIDs give effectively-infinite headroom for Zag's process counts, so
+//! the allocator never needs to roll over or fall back to a TLB flush.
 //!
 //! References:
 //! - ARM ARM D5.10 -- TLB tagging with ASID
@@ -18,8 +20,8 @@ const zag = @import("zag");
 
 const SpinLock = zag.utils.sync.SpinLock;
 
-const asid_bits: u6 = 8;
-const num_ids: u16 = 1 << asid_bits;
+const asid_bits: u6 = 16;
+const num_ids: u32 = 1 << asid_bits;
 const words: usize = num_ids / 64;
 
 var bitmap: [words]u64 = blk: {

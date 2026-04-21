@@ -607,10 +607,10 @@ pub fn resolveVaddr(
     }
 }
 
-pub fn swapAddrSpace(root: PAddr) void {
+pub fn swapAddrSpace(root: PAddr, id: u16) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.paging.swapAddrSpace(root),
-        .aarch64 => aarch64.paging.swapAddrSpace(root),
+        .x86_64 => x64.paging.swapAddrSpace(root, id),
+        .aarch64 => aarch64.paging.swapAddrSpace(root, id),
         else => unreachable,
     }
 }
@@ -626,11 +626,19 @@ pub fn allocAddrSpaceId() ?u16 {
 }
 
 /// Release an address-space identifier previously returned by
-/// `allocAddrSpaceId`. Releasing id 0 is a programming error.
+/// `allocAddrSpaceId`. Invalidates every TLB entry tagged with `id` first
+/// so a future re-allocation of this id does not inherit stale mappings
+/// from the previous owner. Releasing id 0 is a programming error.
 pub fn freeAddrSpaceId(id: u16) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.pcid.free(id),
-        .aarch64 => aarch64.asid.free(id),
+        .x86_64 => {
+            x64.paging.invalidateAddrSpaceTlb(id);
+            x64.pcid.free(id);
+        },
+        .aarch64 => {
+            aarch64.paging.invalidateAddrSpaceTlb(id);
+            aarch64.asid.free(id);
+        },
         else => unreachable,
     }
 }
@@ -748,12 +756,13 @@ pub fn getKernelAddrSpaceRoot() PAddr {
     };
 }
 
-/// Set the kernel page table root.
-/// On x86-64 this is swapAddrSpace (same CR3). On aarch64 this writes
-/// TTBR1_EL1 (upper/kernel VA range).
+/// Set the kernel page table root. Bootloader-only — runs before
+/// CR4.PCIDE is enabled, so on x86-64 the CR3 source operand cannot
+/// carry the PCID/no-flush bits that runtime swapAddrSpace uses.
+/// On aarch64 this writes TTBR1_EL1 (upper/kernel VA range).
 pub fn setKernelAddrSpace(root: PAddr) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.paging.swapAddrSpace(root),
+        .x86_64 => x64.paging.setKernelAddrSpace(root),
         .aarch64 => aarch64.paging.setKernelAddrSpace(root),
         else => unreachable,
     }

@@ -282,7 +282,7 @@ pub fn switchTo(thread: *Thread) void {
 
     const new_root = thread.process.addr_space_root;
     if (new_root.addr != arch.getAddrSpaceRoot().addr) {
-        arch.swapAddrSpace(new_root);
+        arch.swapAddrSpace(new_root, thread.process.addr_space_id);
         std.debug.assert(arch.getAddrSpaceRoot().addr == new_root.addr);
     }
 

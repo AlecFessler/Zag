@@ -210,7 +210,7 @@ pub fn prepareThreadContext(
 pub fn switchTo(thread: *Thread) noreturn {
     const new_root = thread.process.addr_space_root;
     if (new_root.addr != arch.getAddrSpaceRoot().addr) {
-        arch.swapAddrSpace(new_root);
+        arch.swapAddrSpace(new_root, thread.process.addr_space_id);
     }
 
     // Restore SP_EL1 so the incoming thread's in-progress kernel frames

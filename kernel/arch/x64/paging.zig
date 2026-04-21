@@ -161,12 +161,53 @@ pub fn getAddrSpaceRoot() PAddr {
     return PAddr.fromInt(cr3 & ~mask);
 }
 
+/// Boot-time CR3 write used by the bootloader to install the kernel
+/// page-table root before CR4.PCIDE has been enabled. With PCIDE=0 the
+/// CR3 source operand's PCID/no-flush bits are reserved and must be
+/// clear — `swapAddrSpace` cannot be used here. Always flushes the TLB.
+pub fn setKernelAddrSpace(root: PAddr) void {
+    cpu.writeCr3(root.addr);
+}
+
 /// Load a new PML4 table address into CR3, switching the active address space.
 ///
-/// Intel SDM Vol 3A, Table 5-12; Section 5.10.4.1 -- MOV to CR3 also
-/// invalidates all non-global TLB entries for the current PCID.
-pub fn swapAddrSpace(root: PAddr) void {
-    cpu.writeCr3(root.addr);
+/// With CR4.PCIDE=1, CR3 carries the per-process PCID in bits[11:0] and a
+/// "preserve TLB" hint in bit 63. Setting bit 63 tells the CPU not to
+/// invalidate TLB entries on this CR3 write — entries from other PCIDs
+/// stay cached and are simply ignored on lookup mismatch (Intel SDM Vol 3A
+/// §4.10.4.1). Combined with CR4.PGE for global kernel pages, an
+/// address-space switch costs effectively zero TLB work.
+pub fn swapAddrSpace(root: PAddr, id: u16) void {
+    if (!cpu.pcid_enabled) {
+        cpu.writeCr3(root.addr);
+        return;
+    }
+    const pcid: u64 = @as(u64, id) & 0xFFF;
+    const no_flush: u64 = @as(u64, 1) << 63;
+    cpu.writeCr3((root.addr & ~@as(u64, 0xFFF)) | pcid | no_flush);
+}
+
+/// Invalidate every TLB entry tagged with the given PCID on the local core.
+/// Must be called before a PCID is returned to the allocator — otherwise
+/// the next process to be assigned this id would see stale mappings from
+/// the previous owner.
+///
+/// Uses INVPCID type 1 (single PCID, all addresses). Intel SDM Vol 2A —
+/// INVPCID; Vol 3A §4.10.4.1.
+///
+/// TODO: SMP shootdown. Other cores may still hold TLB entries for `id`
+/// from prior runs of the dying process. Until the existing per-page IPI
+/// shootdown is extended with a per-PCID variant, recycling a freed PCID
+/// onto a different core can read a stale mapping. The current
+/// single-core / pinned-process workloads are correct.
+pub fn invalidateAddrSpaceTlb(id: u16) void {
+    if (!cpu.pcid_enabled) return;
+    const desc: [2]u64 align(16) = .{ @as(u64, id) & 0xFFF, 0 };
+    asm volatile ("invpcid (%[desc]), %[type]"
+        :
+        : [desc] "r" (&desc),
+          [type] "r" (@as(u64, 1)),
+        : .{ .memory = true });
 }
 
 /// Copy the upper-half (kernel) PML4 entries from the current address space
