@@ -615,6 +615,26 @@ pub fn swapAddrSpace(root: PAddr) void {
     }
 }
 
+/// Allocate a per-process address-space identifier for TLB tagging
+/// (PCID on x86-64, ASID on aarch64). Returns null on exhaustion.
+pub fn allocAddrSpaceId() ?u16 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.pcid.allocate(),
+        .aarch64 => aarch64.asid.allocate(),
+        else => unreachable,
+    };
+}
+
+/// Release an address-space identifier previously returned by
+/// `allocAddrSpaceId`. Releasing id 0 is a programming error.
+pub fn freeAddrSpaceId(id: u16) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.pcid.free(id),
+        .aarch64 => aarch64.asid.free(id),
+        else => unreachable,
+    }
+}
+
 /// Read the Memory Attribute Indirection Register.
 /// On aarch64: MAIR_EL1. On x86-64: returns 0 (not applicable).
 pub fn readMair() u64 {

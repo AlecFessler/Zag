@@ -55,6 +55,7 @@ pub const Process = struct {
     alive: bool,
     restart_context: ?RestartContext,
     addr_space_root: PAddr,
+    addr_space_id: u16,
     vmm: VirtualMemoryManager,
     threads: [MAX_THREADS]*Thread,
     num_threads: u64,
@@ -1204,6 +1205,10 @@ pub const Process = struct {
         self.perm_table[0] = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
 
         arch.freeUserAddrSpace(self.addr_space_root);
+        if (self.addr_space_id != 0) {
+            arch.freeAddrSpaceId(self.addr_space_id);
+            self.addr_space_id = 0;
+        }
     }
 
     fn cleanupPhase2(self: *Process) void {
@@ -1321,6 +1326,7 @@ pub const Process = struct {
             .alive = true,
             .restart_context = null,
             .addr_space_root = undefined,
+            .addr_space_id = 0,
             .vmm = undefined,
             .threads = undefined,
             .num_threads = 0,
@@ -1349,6 +1355,9 @@ pub const Process = struct {
         const pml4_vaddr = VAddr.fromInt(@intFromPtr(pml4_page));
         proc.addr_space_root = PAddr.fromVAddr(pml4_vaddr, null);
         arch.copyKernelMappings(pml4_vaddr);
+
+        proc.addr_space_id = arch.allocAddrSpaceId() orelse return error.NoAddrSpaceId;
+        errdefer if (!skip_cleanup) arch.freeAddrSpaceId(proc.addr_space_id);
 
         const aslr_base = generateAslrBase();
 
@@ -1438,6 +1447,7 @@ pub const Process = struct {
             .alive = true,
             .restart_context = null,
             .addr_space_root = memory_init.kernel_addr_space_root,
+            .addr_space_id = 0,
             .vmm = VirtualMemoryManager.init(
                 VAddr.fromInt(address.AddrSpacePartition.user.start),
                 VAddr.fromInt(address.AddrSpacePartition.user.end),
