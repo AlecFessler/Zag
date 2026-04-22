@@ -369,6 +369,22 @@ pub fn sendIpiToCore(core_id: u64, vector: u8) void {
     }
 }
 
+/// Send the scheduler-rearm IPI to `core_id`. Encapsulates the
+/// `IntVecs.sched` vector choice so callers don't have to know which
+/// vector the scheduler listens on.
+pub fn sendSchedulerIpi(core_id: u64) void {
+    sendIpiToCore(core_id, @intFromEnum(interrupts.IntVecs.sched));
+}
+
+/// Fast-path self-scheduler-interrupt for the local core. Used by
+/// `yield()` to skip the APIC self-IPI path, which on x2APIC issues a
+/// WRMSR that typically causes a KVM vm-exit (~5K cycles round trip).
+/// Executes `int 0xFE` — a software interrupt directly dispatched
+/// through the IDT in guest mode without a vm-exit.
+pub inline fn sendSchedulerIpiSelf() void {
+    asm volatile ("int $0xFE" ::: .{ .memory = true });
+}
+
 /// Send a self-IPI. In x2APIC mode uses the dedicated Self IPI Register (MSR 83FH).
 /// In xAPIC mode uses the ICR with shorthand destination "self" (bits [19:18] = 01b).
 /// Intel SDM Vol 3A, Section 13.12.11 "SELF IPI Register", Figure 13-30.

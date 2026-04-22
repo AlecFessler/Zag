@@ -31,31 +31,23 @@ pub fn smpInit() !void {
     }
 }
 
-const sched_ipi_vector: u8 = switch (builtin.cpu.arch) {
-    .x86_64 => @intFromEnum(x64.interrupts.IntVecs.sched),
-    // ARM GIC SGI 0 — Software Generated Interrupts use IDs 0-15.
-    .aarch64 => 0,
-    else => unreachable,
-};
-
 pub fn triggerSchedulerInterrupt(core_id: u64) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.apic.sendIpiToCore(core_id, sched_ipi_vector),
-        .aarch64 => aarch64.gic.sendIpiToCore(core_id, sched_ipi_vector),
+        .x86_64 => x64.apic.sendSchedulerIpi(core_id),
+        .aarch64 => aarch64.gic.sendSchedulerIpi(core_id),
         else => unreachable,
     }
 }
 
-/// Fast-path self-scheduler-interrupt for the local core. Used by `yield()`
-/// to skip the APIC self-IPI path, which on x2APIC issues a WRMSR that
-/// typically causes a KVM vm-exit (~5K cycles round trip). On x86-64 we
-/// instead execute `int 0xFE` — a software interrupt directly dispatched
-/// through the IDT in guest mode without a vm-exit. On aarch64 there is no
-/// analogous cheap path, so we fall back to the GIC SGI sender.
+/// Fast-path self-scheduler-interrupt for the local core. On x86-64 the
+/// helper executes `int 0xFE` directly — a software interrupt dispatched
+/// through the IDT without a vm-exit, unlike the APIC self-IPI which
+/// requires a WRMSR. On aarch64 there is no analogous cheap path, so the
+/// helper just sends an SGI to the local core.
 pub inline fn triggerSchedulerInterruptSelf() void {
     switch (builtin.cpu.arch) {
-        .x86_64 => asm volatile ("int $0xFE" ::: .{ .memory = true }),
-        .aarch64 => aarch64.gic.sendIpiToCore(coreID(), sched_ipi_vector),
+        .x86_64 => x64.apic.sendSchedulerIpiSelf(),
+        .aarch64 => aarch64.gic.sendSchedulerIpiSelf(),
         else => unreachable,
     }
 }
