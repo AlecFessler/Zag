@@ -134,33 +134,6 @@ pub const PageFaultContext = struct {
     user_ctx: ?*ArchCpuContext = null,
 };
 
-/// Per-CPU mailbox for the lazy-FPU cross-core flush IPI (SGI 2).
-/// Mirrors the x64 layout in `arch/x64/interrupts.zig` — one slot per
-/// *target* core, requester writes the thread, sends the SGI, spins
-/// on `done`. Receiver reads the thread, FXSAVEs from its own regs,
-/// acks. See `cpu.fpuFlushIpi`.
-pub const FpuFlushMailbox = struct {
-    requested_thread: ?*anyopaque align(64) = null,
-    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
-
-    pub fn requestThread(self: *FpuFlushMailbox, thread: anytype) void {
-        @atomicStore(?*anyopaque, &self.requested_thread, @ptrCast(thread), .release);
-        self.done.store(false, .release);
-    }
-
-    pub fn waitDone(self: *FpuFlushMailbox) void {
-        while (!self.done.load(.acquire)) {
-            std.atomic.spinLoopHint();
-        }
-    }
-
-    pub fn ackDone(self: *FpuFlushMailbox) void {
-        self.done.store(true, .release);
-    }
-};
-
-pub var fpu_flush_mailbox: [64]FpuFlushMailbox align(64) = [_]FpuFlushMailbox{.{}} ** 64;
-
 /// Allocate and initialize an ArchCpuContext at the top of a kernel stack.
 ///
 /// The context is placed at (kstack_top - sizeof(ArchCpuContext)), matching

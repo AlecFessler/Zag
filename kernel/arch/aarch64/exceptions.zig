@@ -45,7 +45,6 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const aarch64_interrupts = zag.arch.aarch64.interrupts;
 const aarch64_paging = zag.arch.aarch64.paging;
 const cpu = zag.arch.aarch64.cpu;
 const fpu = zag.sched.fpu;
@@ -653,7 +652,7 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.
         // ack so the requester unblocks. See `cpu.fpuFlushIpi`.
         2 => {
             const core_idx: u8 = @truncate(gic.coreID());
-            const slot = &aarch64_interrupts.fpu_flush_mailbox[core_idx];
+            const slot = &cpu.fpu_flush_mailbox[core_idx];
             if (@atomicLoad(?*anyopaque, &slot.requested_thread, .acquire)) |opq| {
                 const thread: *Thread = @ptrCast(@alignCast(opq));
                 fpu.flushIpiHandler(thread);

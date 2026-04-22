@@ -25,7 +25,6 @@ const builtin = @import("builtin");
 const zag = @import("zag");
 
 const gic = zag.arch.aarch64.gic;
-const interrupts = zag.arch.aarch64.interrupts;
 
 const VAddr = zag.memory.address.VAddr;
 
@@ -283,10 +282,37 @@ pub fn fpuArmTrap() void {
     asm volatile ("isb" ::: .{ .memory = true });
 }
 
+/// Per-core mailbox for the lazy-FPU cross-core flush IPI (SGI 2).
+/// Mirrors the x64 layout in `arch/x64/interrupts.zig`'s mailbox — one
+/// slot per *target* core. Requester writes the thread, sends the SGI,
+/// spins on `done`. Receiver reads the thread, saves its FP regs, acks.
+/// See the SGI-2 arm of `exceptions.dispatchIrq` for the receiver.
+pub const FpuFlushMailbox = struct {
+    requested_thread: ?*anyopaque align(64) = null,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+
+    pub fn requestThread(self: *FpuFlushMailbox, thread: anytype) void {
+        @atomicStore(?*anyopaque, &self.requested_thread, @ptrCast(thread), .release);
+        self.done.store(false, .release);
+    }
+
+    pub fn waitDone(self: *FpuFlushMailbox) void {
+        while (!self.done.load(.acquire)) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    pub fn ackDone(self: *FpuFlushMailbox) void {
+        self.done.store(true, .release);
+    }
+};
+
+pub var fpu_flush_mailbox: [64]FpuFlushMailbox align(64) = [_]FpuFlushMailbox{.{}} ** 64;
+
 /// Flush a thread's FP regs from a remote core via SGI 2.
 /// See `kernel/arch/aarch64/exceptions.zig` for the receiver.
 pub fn fpuFlushIpi(target_core: u8, thread: anytype) void {
-    interrupts.fpu_flush_mailbox[target_core].requestThread(thread);
+    fpu_flush_mailbox[target_core].requestThread(thread);
     gic.sendIpiToCore(target_core, 2);
-    interrupts.fpu_flush_mailbox[target_core].waitDone();
+    fpu_flush_mailbox[target_core].waitDone();
 }
