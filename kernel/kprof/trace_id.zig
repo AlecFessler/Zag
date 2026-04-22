@@ -111,13 +111,13 @@ pub const names = [_]struct { id: TraceId, name: []const u8 }{
 /// No-op in any other mode.
 pub fn perCoreInit() void {
     if (comptime !mode.trace_enabled) return;
-    arch.kprofTraceCountersPerCoreInit();
+    arch.pmu.kprofTraceCountersPerCoreInit();
 }
 
 /// Emit an enter record for a scoped tracepoint. Paired with `exit`.
 /// Compiles to nothing unless `-Dkernel_profile=trace`.
 ///
-/// Must short-circuit on `log.active` BEFORE calling `arch.coreID()`.
+/// Must short-circuit on `log.active` BEFORE calling `arch.smp.coreID()`.
 /// Tracepoints fire throughout boot (e.g. in the page-fault handler
 /// for lazily-mapped slab pages), but `coreID()` depends on
 /// `apic.lapics` which is only populated by ACPI parsing partway
@@ -128,11 +128,11 @@ pub inline fn enter(comptime id: TraceId) void {
     if (!mode.trace_enabled) return;
     if (!@atomicLoad(bool, &log.active, .acquire)) return;
     var counters: [3]u64 = undefined;
-    arch.kprofTraceCountersRead(&counters);
+    arch.pmu.kprofTraceCountersRead(&counters);
     log.emit(.{
-        .tsc = arch.rdtscp(),
+        .tsc = arch.time.rdtscp(),
         .kind = @intFromEnum(record.Kind.trace_enter),
-        .cpu = @truncate(arch.coreID()),
+        .cpu = @truncate(arch.smp.coreID()),
         ._pad = 0,
         .id = @intFromEnum(id),
         .ip = @returnAddress(),
@@ -149,11 +149,11 @@ pub inline fn exit(comptime id: TraceId) void {
     if (!mode.trace_enabled) return;
     if (!@atomicLoad(bool, &log.active, .acquire)) return;
     var counters: [3]u64 = undefined;
-    arch.kprofTraceCountersRead(&counters);
+    arch.pmu.kprofTraceCountersRead(&counters);
     log.emit(.{
-        .tsc = arch.rdtscp(),
+        .tsc = arch.time.rdtscp(),
         .kind = @intFromEnum(record.Kind.trace_exit),
-        .cpu = @truncate(arch.coreID()),
+        .cpu = @truncate(arch.smp.coreID()),
         ._pad = 0,
         .id = @intFromEnum(id),
         .ip = @returnAddress(),
@@ -172,11 +172,11 @@ pub inline fn point(comptime id: TraceId, arg: u64) void {
     if (!mode.trace_enabled) return;
     if (!@atomicLoad(bool, &log.active, .acquire)) return;
     var counters: [3]u64 = undefined;
-    arch.kprofTraceCountersRead(&counters);
+    arch.pmu.kprofTraceCountersRead(&counters);
     log.emit(.{
-        .tsc = arch.rdtscp(),
+        .tsc = arch.time.rdtscp(),
         .kind = @intFromEnum(record.Kind.trace_point),
-        .cpu = @truncate(arch.coreID()),
+        .cpu = @truncate(arch.smp.coreID()),
         ._pad = 0,
         .id = @intFromEnum(id),
         .ip = @returnAddress(),

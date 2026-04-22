@@ -26,7 +26,7 @@ pub fn init(root_service_elf: []const u8) !void {
     }, null, ThreadHandleRights.full, .pinned);
 
     grantDevices(root_proc);
-    sched.enqueueOnCore(arch.coreID(), root_proc.threads[0]);
+    sched.enqueueOnCore(arch.smp.coreID(), root_proc.threads[0]);
 }
 
 fn grantDevices(root_proc: *Process) void {

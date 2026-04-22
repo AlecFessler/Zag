@@ -13,13 +13,13 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) n
         if (debug_info.global_ptr) |dbg_info| {
             const sym_name = dbg_info.getSymbolName(ra - debug_info.kaslr_slide);
             if (sym_name) |sym| {
-                arch.print("KERNEL PANIC: {s} @ {s}\n", .{ msg, sym });
+                arch.boot.print("KERNEL PANIC: {s} @ {s}\n", .{ msg, sym });
             }
         } else {
-            arch.print("KERNEL PANIC: {s}\n", .{msg});
+            arch.boot.print("KERNEL PANIC: {s}\n", .{msg});
         }
     } else {
-        arch.print("KERNEL PANIC: {s}\n", .{msg});
+        arch.boot.print("KERNEL PANIC: {s}\n", .{msg});
     }
 
     const first = @returnAddress();
@@ -33,14 +33,14 @@ pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) n
         if (debug_info.global_ptr) |dbg_info| {
             const sym_name = dbg_info.getSymbolName(pc - debug_info.kaslr_slide);
             if (sym_name) |sym| {
-                arch.print("{s}\n", .{sym});
+                arch.boot.print("{s}\n", .{sym});
             }
         } else {
-            arch.print("PC: 0x{X} (no symbol)\n", .{pc});
+            arch.boot.print("PC: 0x{X} (no symbol)\n", .{pc});
         }
         if (pc == 0) break;
         last_pc = pc;
     }
 
-    arch.halt();
+    arch.cpu.halt();
 }

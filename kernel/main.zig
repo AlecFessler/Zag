@@ -22,11 +22,11 @@ pub fn panic(
     zag.panic.panic(msg, error_return_trace, ret_addr);
 }
 
-export fn kEntry(boot_info: *BootInfo) callconv(arch.cc()) noreturn {
-    arch.kEntry(boot_info, &kTrampoline);
+export fn kEntry(boot_info: *BootInfo) callconv(arch.cpu.cc()) noreturn {
+    arch.cpu.kEntry(boot_info, &kTrampoline);
 }
 
-export fn kTrampoline(boot_info: *BootInfo) callconv(arch.cc()) noreturn {
+export fn kTrampoline(boot_info: *BootInfo) callconv(arch.cpu.cc()) noreturn {
     kMain(boot_info) catch {
         @panic("Exiting...");
     };
@@ -34,11 +34,11 @@ export fn kTrampoline(boot_info: *BootInfo) callconv(arch.cc()) noreturn {
 }
 
 fn kMain(boot_info: *BootInfo) !void {
-    arch.init();
+    arch.boot.init();
     try memory.init(boot_info.mmap);
     debug_info.init(boot_info.elf_blob.ptr, boot_info.elf_blob.len, boot_info.kaslr_slide);
-    try arch.parseFirmwareTables(boot_info.xsdp_phys);
-    arch.vmInit();
+    try arch.boot.parseFirmwareTables(boot_info.xsdp_phys);
+    arch.vm.vmInit();
     // On aarch64, propagate the UEFI bootloader's "I arrived at EL2"
     // flag into the arch-layer hyp stub gate. The bootloader is the
     // only code path that can observe CurrentEL under UEFI (firmware
@@ -63,11 +63,11 @@ fn kMain(boot_info: *BootInfo) !void {
         // vectors and fail silently.
         zag.arch.aarch64.vm.installHypVectors();
     }
-    arch.pmuInit();
-    arch.sysInfoInit();
+    arch.pmu.pmuInit();
+    arch.sysinfo.sysInfoInit();
     // Wall clock offset init: read RTC once at boot (systems.md §wall-clock).
-    const rtc_nanos = arch.readRtc();
-    const monotonic_now = arch.getMonotonicClock().now();
+    const rtc_nanos = arch.time.readRtc();
+    const monotonic_now = arch.time.getMonotonicClock().now();
     syscall.clock.wall_offset = @as(i64, @bitCast(rtc_nanos)) -% @as(i64, @bitCast(monotonic_now));
     device_registry.registerDisplayDevice(boot_info.framebuffer);
     try sched.globalInit();
@@ -75,9 +75,9 @@ fn kMain(boot_info: *BootInfo) !void {
     const rs_virt = VAddr.fromPAddr(rs_phys, null);
     const rs_ptr: [*]const u8 = @ptrFromInt(rs_virt.addr);
     try userspace_init.init(rs_ptr[0..boot_info.root_service.len]);
-    try arch.smpInit();
+    try arch.smp.smpInit();
     sched.perCoreInit();
     try kprof_log.init();
     kprof_log.start();
-    arch.halt();
+    arch.cpu.halt();
 }

@@ -99,9 +99,9 @@ pub fn sysIrqAck(device_handle: u64) i64 {
 
     // Look up the device's IRQ line, clear the pending bit, and unmask.
     const device = entry.object.device_region;
-    const irq_line = arch.findIrqForDevice(device) orelse return E_INVAL;
-    arch.clearIrqPendingBit(irq_line);
-    arch.unmaskIrq(irq_line);
+    const irq_line = arch.interrupts.findIrqForDevice(device) orelse return E_INVAL;
+    arch.interrupts.clearIrqPendingBit(irq_line);
+    arch.interrupts.unmaskIrq(irq_line);
     return E_OK;
 }
 
@@ -110,7 +110,7 @@ pub fn sysMemDmaMap(device_handle: u64, shm_handle: u64) i64 {
 
     // Both handle lookups and the shm refcount bump must happen under
     // perm_lock so a concurrent revoke_perm on the SHM handle cannot
-    // decRef the SharedMemory between the lookup and arch.mapDmaPages.
+    // decRef the SharedMemory between the lookup and arch.iommu.mapDmaPages.
     // Without this, the captured `*SharedMemory` becomes a UAF the
     // moment the racing revoke drops the last reference — mapDmaPages
     // then iterates a freed `shm.pages` slice. See exploits/dma_map_uaf.
@@ -152,18 +152,18 @@ pub fn sysMemDmaMap(device_handle: u64, shm_handle: u64) i64 {
     shm.incRef();
     proc.perm_lock.unlock();
 
-    if (!arch.isDmaRemapAvailable()) {
+    if (!arch.iommu.isDmaRemapAvailable()) {
         shm.decRef();
         return E_NOMEM;
     }
 
-    const dma_base = arch.mapDmaPages(device, shm) catch {
+    const dma_base = arch.iommu.mapDmaPages(device, shm) catch {
         shm.decRef();
         return E_NOMEM;
     };
-    arch.enableDmaRemapping();
+    arch.iommu.enableDmaRemapping();
     proc.addDmaMapping(device, shm, dma_base, shm.num_pages) catch {
-        arch.unmapDmaPages(device, dma_base, shm.num_pages);
+        arch.iommu.unmapDmaPages(device, dma_base, shm.num_pages);
         shm.decRef();
         return E_NORES;
     };
@@ -204,13 +204,13 @@ pub fn sysMemDmaUnmap(device_handle: u64, shm_handle: u64) i64 {
     proc.perm_lock.unlock();
     defer shm.decRef();
 
-    if (!arch.isDmaRemapAvailable()) {
+    if (!arch.iommu.isDmaRemapAvailable()) {
         // No IOMMU: no page table entries to clean up, just remove tracking
         _ = proc.removeDmaMapping(device, shm);
         return E_OK;
     }
 
     const mapping = proc.removeDmaMapping(device, shm) orelse return E_NOENT;
-    arch.unmapDmaPages(device, mapping.dma_base, mapping.num_pages);
+    arch.iommu.unmapDmaPages(device, mapping.dma_base, mapping.num_pages);
     return E_OK;
 }

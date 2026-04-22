@@ -43,7 +43,7 @@ pub fn sysFutexWaitVal(addrs_ptr: u64, expected_ptr: u64, count: u64, timeout_ns
 
         // Read the user address value.
         proc.vmm.demandPage(VAddr.fromInt(addr_va), false, false) catch return E_BADADDR;
-        const addr_page = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(addr_va)) orelse return E_BADADDR;
+        const addr_page = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(addr_va)) orelse return E_BADADDR;
         const addr_physmap = VAddr.fromPAddr(addr_page, null).addr + (addr_va & 0xFFF);
         const user_addr = @as(*const u64, @ptrFromInt(addr_physmap)).*;
 
@@ -52,13 +52,13 @@ pub fn sysFutexWaitVal(addrs_ptr: u64, expected_ptr: u64, count: u64, timeout_ns
 
         // Read the expected value.
         proc.vmm.demandPage(VAddr.fromInt(exp_va), false, false) catch return E_BADADDR;
-        const exp_page = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(exp_va)) orelse return E_BADADDR;
+        const exp_page = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(exp_va)) orelse return E_BADADDR;
         const exp_physmap = VAddr.fromPAddr(exp_page, null).addr + (exp_va & 0xFFF);
         expected[i] = @as(*const u64, @ptrFromInt(exp_physmap)).*;
 
         // Resolve the target futex address to physical.
         proc.vmm.demandPage(VAddr.fromInt(user_addr), false, false) catch return E_BADADDR;
-        const page_paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(user_addr)) orelse return E_BADADDR;
+        const page_paddr = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(user_addr)) orelse return E_BADADDR;
         paddrs[i] = PAddr.fromInt(page_paddr.addr + (user_addr & 0xFFF));
     }
 
@@ -89,7 +89,7 @@ pub fn sysFutexWaitChange(addrs_ptr: u64, count: u64, timeout_ns: u64) i64 {
 
         // Read the user address value.
         proc.vmm.demandPage(VAddr.fromInt(addr_va), false, false) catch return E_BADADDR;
-        const addr_page = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(addr_va)) orelse return E_BADADDR;
+        const addr_page = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(addr_va)) orelse return E_BADADDR;
         const addr_physmap = VAddr.fromPAddr(addr_page, null).addr + (addr_va & 0xFFF);
         const user_addr = @as(*const u64, @ptrFromInt(addr_physmap)).*;
 
@@ -98,7 +98,7 @@ pub fn sysFutexWaitChange(addrs_ptr: u64, count: u64, timeout_ns: u64) i64 {
 
         // Resolve the target futex address to physical.
         proc.vmm.demandPage(VAddr.fromInt(user_addr), false, false) catch return E_BADADDR;
-        const page_paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(user_addr)) orelse return E_BADADDR;
+        const page_paddr = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(user_addr)) orelse return E_BADADDR;
         paddrs[i] = PAddr.fromInt(page_paddr.addr + (user_addr & 0xFFF));
     }
 
@@ -115,7 +115,7 @@ pub fn sysFutexWake(addr: u64, count: u64) i64 {
 
     const proc = sched.currentProc();
     const vaddr = VAddr.fromInt(addr);
-    const page_paddr = arch.resolveVaddr(proc.addr_space_root, vaddr) orelse return E_BADADDR;
+    const page_paddr = arch.paging.resolveVaddr(proc.addr_space_root, vaddr) orelse return E_BADADDR;
     const paddr = PAddr.fromInt(page_paddr.addr + (addr & 0xFFF));
 
     return @intCast(futex.wake(paddr, @truncate(count)));

@@ -37,7 +37,7 @@ pub const NotificationBox = struct {
             const target_core = if (thread.core_affinity) |mask|
                 @as(u64, @ctz(mask))
             else
-                arch.coreID();
+                arch.smp.coreID();
             sched.enqueueOnCore(target_core, thread);
         }
         self.lock.unlock();
@@ -69,7 +69,7 @@ pub const NotificationBox = struct {
 
         // Set up timeout if finite.
         if (timeout_ns != std.math.maxInt(u64)) {
-            const now_ns = arch.getMonotonicClock().now();
+            const now_ns = arch.time.getMonotonicClock().now();
             thread.futex_deadline_ns = now_ns + timeout_ns;
             thread.notification_waiter = true;
             // Use the futex timed-waiter infrastructure.
@@ -86,7 +86,7 @@ pub const NotificationBox = struct {
         self.lock.unlockIrqRestore(irq);
 
         // Yield to scheduler.
-        arch.enableInterrupts();
+        arch.interrupts.enableInterrupts();
         sched.yield();
 
         // On wake: check if we were woken by cleanup (E_NOENT sentinel),
@@ -132,7 +132,7 @@ pub const NotificationBox = struct {
             const target_core = if (thread.core_affinity) |mask|
                 @as(u64, @ctz(mask))
             else
-                arch.coreID();
+                arch.smp.coreID();
             sched.enqueueOnCore(target_core, thread);
         }
         @atomicStore(u64, &self.word, 0, .monotonic);

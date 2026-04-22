@@ -55,11 +55,11 @@ pub fn end(reason: EndReason) void {
 
     @atomicStore(bool, &log_mod.active, false, .release);
 
-    arch.broadcastKprofIpi();
+    arch.smp.broadcastKprofIpi();
 
     const expected: u32 = @intCast(log_mod.n_cpus -| 1);
     while (@atomicLoad(u32, &log_mod.parked_cores, .acquire) < expected) {
-        arch.cpuRelax();
+        arch.cpu.cpuRelax();
     }
 
     dumpHeader(reason);
@@ -102,7 +102,7 @@ pub fn parkForDump() void {
     const my_epoch = @atomicLoad(u64, &log_mod.epoch, .acquire);
     _ = @atomicRmw(u32, &log_mod.parked_cores, .Add, 1, .acq_rel);
     while (@atomicLoad(u64, &log_mod.epoch, .acquire) == my_epoch) {
-        arch.cpuRelax();
+        arch.cpu.cpuRelax();
     }
 }
 
@@ -116,7 +116,7 @@ fn dumpHeader(reason: EndReason) void {
         .root_exit => "root_exit",
         .log_full => "log_full",
     };
-    arch.print("[KPROF] begin cpus={d} mode={s} reason={s}\n", .{
+    arch.boot.print("[KPROF] begin cpus={d} mode={s} reason={s}\n", .{
         log_mod.n_cpus,
         @tagName(mode.active),
         reason_str,
@@ -125,7 +125,7 @@ fn dumpHeader(reason: EndReason) void {
 
 fn dumpNameTable() void {
     for (trace_id_mod.names) |entry| {
-        arch.print("[KPROF] name id={d} name={s}\n", .{
+        arch.boot.print("[KPROF] name id={d} name={s}\n", .{
             @intFromEnum(entry.id),
             entry.name,
         });
@@ -147,7 +147,7 @@ fn dumpOneLog(cpu: usize) void {
     const bytes_used = @min(head, log.limit);
     const n_records = bytes_used / @sizeOf(Record);
 
-    arch.print("[KPROF] cpu_begin cpu={d} records={d} overflowed={d}\n", .{
+    arch.boot.print("[KPROF] cpu_begin cpu={d} records={d} overflowed={d}\n", .{
         cpu,
         n_records,
         overflowed,
@@ -158,7 +158,7 @@ fn dumpOneLog(cpu: usize) void {
         const slot: *const Record = @ptrFromInt(log.base + idx * @sizeOf(Record));
         const sym = resolveSym(slot.ip);
         if (comptime mode.trace_enabled) {
-            arch.print(
+            arch.boot.print(
                 "[KPROF] rec cpu={d} tsc={d} kind={d} id={d} ip=0x{x} arg=0x{x} cyc={d} cmiss={d} bmiss={d} sym={s}\n",
                 .{
                     slot.cpu,
@@ -174,7 +174,7 @@ fn dumpOneLog(cpu: usize) void {
                 },
             );
         } else {
-            arch.print(
+            arch.boot.print(
                 "[KPROF] rec cpu={d} tsc={d} kind={d} id={d} ip=0x{x} arg=0x{x} sym={s}\n",
                 .{
                     slot.cpu,
@@ -190,11 +190,11 @@ fn dumpOneLog(cpu: usize) void {
         idx += 1;
     }
 
-    arch.print("[KPROF] cpu_end cpu={d}\n", .{cpu});
+    arch.boot.print("[KPROF] cpu_end cpu={d}\n", .{cpu});
 }
 
 fn dumpFooter() void {
-    arch.print("[KPROF] done\n", .{});
+    arch.boot.print("[KPROF] done\n", .{});
 }
 
 /// Resolve a post-KASLR runtime address to a function name using the

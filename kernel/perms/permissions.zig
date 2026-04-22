@@ -6,7 +6,7 @@ const Process = zag.proc.process.Process;
 const SharedMemory = zag.memory.shared.SharedMemory;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
-const Vm = zag.arch.dispatch.Vm;
+const Vm = zag.arch.dispatch.vm.Vm;
 
 pub const FaultReason = enum(u5) {
     none = 0,

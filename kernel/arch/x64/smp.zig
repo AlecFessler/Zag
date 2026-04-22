@@ -55,7 +55,7 @@ pub fn smpInit() !void {
     const trampoline_phys = PAddr.fromInt(TRAMPOLINE_PHYS);
     const trampoline_virt = VAddr.fromInt(TRAMPOLINE_PHYS);
 
-    try arch.mapPage(
+    try arch.paging.mapPage(
         memory_init.kernel_addr_space_root,
         trampoline_phys,
         trampoline_virt,
@@ -72,7 +72,7 @@ pub fn smpInit() !void {
     @memcpy(dest[0..trampoline_code.len], trampoline_code);
 
     const params: *TrampolineParams = @ptrFromInt(trampoline_virt.addr + params_offset);
-    params.cr3 = arch.getAddrSpaceRoot().addr;
+    params.cr3 = arch.paging.getAddrSpaceRoot().addr;
     params.entry_point = @intFromPtr(&coreInit);
 
     const bsp_id = apic.rawApicId();
@@ -97,7 +97,7 @@ pub fn smpInit() !void {
             };
             @memset(std.mem.asBytes(kpage), 0);
             const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
-            arch.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS) catch {
+            arch.paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS) catch {
                 pmm_iface.destroy(kpage);
                 map_ok = false;
                 break;
@@ -161,5 +161,5 @@ fn coreInit() callconv(.c) noreturn {
     cpu.enableSpeculationBarriers();
     _ = cores_online.fetchAdd(1, .release);
     sched.perCoreInit();
-    arch.halt();
+    arch.cpu.halt();
 }

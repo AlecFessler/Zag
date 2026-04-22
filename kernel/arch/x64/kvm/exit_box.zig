@@ -9,7 +9,7 @@ const kvm = zag.arch.x64.kvm;
 const vcpu_mod = kvm.vcpu;
 const vm_mod = kvm.vm;
 
-const ArchCpuContext = zag.arch.dispatch.ArchCpuContext;
+const ArchCpuContext = zag.arch.dispatch.cpu.ArchCpuContext;
 const KernelObject = zag.perms.permissions.KernelObject;
 const PAddr = zag.memory.address.PAddr;
 const ThreadPriorityQueue = zag.sched.thread.ThreadPriorityQueue;
@@ -145,15 +145,15 @@ fn deliverExit(vm_obj: *Vm, vcpu_obj: *VCpu, receiver: *Thread) void {
     while (receiver.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
 
     // Write exit info into receiver's saved buf_ptr (syscall arg1).
-    const saved_args = arch.getSyscallArgs(receiver.ctx);
+    const saved_args = arch.syscall.getSyscallArgs(receiver.ctx);
     writeExitMessageToUser(owner, saved_args.arg1, handle_id, vcpu_obj);
 
     // Set return value
-    arch.setSyscallReturn(receiver.ctx, handle_id);
+    arch.syscall.setSyscallReturn(receiver.ctx, handle_id);
 
     // Wake the receiver
     receiver.state = .ready;
-    const target_core = if (receiver.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+    const target_core = if (receiver.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
     sched.enqueueOnCore(target_core, receiver);
 }
 
@@ -292,14 +292,14 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
             // an attacker VMM could write an illegal vector directly into
             // VM_ENTRY_INTR_INFO and corrupt guest exception handling.
             if (interrupt.vector < 32) return E_INVAL;
-            arch.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
+            arch.vm.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
             vcpu_obj.storeState(.running);
             resumeVcpuThread(thread);
         },
         2 => {
             // inject_exception: payload is GuestException at offset 8
             const exception = std.mem.bytesAsValue(vm_hw.GuestException, action_buf[8..][0..@sizeOf(vm_hw.GuestException)]).*;
-            arch.vmInjectException(&vcpu_obj.guest_state, exception);
+            arch.vm.vmInjectException(&vcpu_obj.guest_state, exception);
             vcpu_obj.storeState(.running);
             resumeVcpuThread(thread);
         },
@@ -368,7 +368,7 @@ fn writeExitMessageToUser(proc: *Process, buf_ptr: u64, handle_id: u64, vcpu_obj
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         // The receiver already faulted in its buffer pages in vm_recv before
         // blocking, so skip demandPage here — the pages are already present.
-        const page_paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return;
+        const page_paddr = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return;
         const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
         const dst: [*]u8 = @ptrFromInt(physmap_addr);
         @memcpy(dst[0..chunk], msg_bytes[src_off..][0..chunk]);
@@ -395,7 +395,7 @@ fn readUserBytes(proc: *Process, user_va: u64, buf: []u8) bool {
         const page_off = src_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(src_va), false, false) catch return false;
-        const page_paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
+        const page_paddr = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
         const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
         const src: [*]const u8 = @ptrFromInt(physmap_addr);
         @memcpy(buf[dst_off..][0..chunk], src[0..chunk]);
@@ -416,7 +416,7 @@ fn vcpuIndex(vm_obj: *Vm, vcpu_obj: *VCpu) ?u32 {
 fn resumeVcpuThread(thread: *Thread) void {
     while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
     thread.state = .ready;
-    const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+    const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
     sched.enqueueOnCore(target_core, thread);
 }
 

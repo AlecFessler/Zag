@@ -16,8 +16,8 @@ const E_INVAL = errors.E_INVAL;
 const E_OK = errors.E_OK;
 const E_PERM = errors.E_PERM;
 
-const CpuPowerAction = zag.arch.dispatch.CpuPowerAction;
-const PowerAction = zag.arch.dispatch.PowerAction;
+const CpuPowerAction = zag.arch.dispatch.power.CpuPowerAction;
+const PowerAction = zag.arch.dispatch.power.PowerAction;
 const SyscallResult = zag.syscall.dispatch.SyscallResult;
 
 pub fn sysWrite(ptr: u64, len: u64) SyscallResult {
@@ -29,10 +29,10 @@ pub fn sysWrite(ptr: u64, len: u64) SyscallResult {
     // SMAP: print reads the user buffer while formatting, so the AC=1
     // window must span the entire print call rather than just the slice
     // construction.
-    arch.userAccessBegin();
+    arch.interrupts.userAccessBegin();
     const msg: []const u8 = @as([*]const u8, @ptrFromInt(ptr))[0..len];
-    arch.print("{s}", .{msg});
-    arch.userAccessEnd();
+    arch.boot.print("{s}", .{msg});
+    arch.interrupts.userAccessEnd();
     return .{ .ret = @intCast(len) };
 }
 
@@ -49,7 +49,7 @@ pub fn sysGetrandom(buf_ptr: u64, len: u64) i64 {
     var dst_va: u64 = buf_ptr;
 
     while (remaining > 0) {
-        const rand_val = arch.getRandom() orelse {
+        const rand_val = arch.power.getRandom() orelse {
             // If we haven't written anything yet, return E_AGAIN.
             if (remaining == len) return E_AGAIN;
             // Otherwise return E_AGAIN (partial fill not supported).
@@ -62,7 +62,7 @@ pub fn sysGetrandom(buf_ptr: u64, len: u64) i64 {
 
         // Demand-page the destination.
         proc.vmm.demandPage(VAddr.fromInt(dst_va), true, false) catch return E_BADADDR;
-        const page_paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return E_BADADDR;
+        const page_paddr = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return E_BADADDR;
         const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
 
         const bytes: [8]u8 = @bitCast(rand_val);
@@ -88,7 +88,7 @@ pub fn sysSysPower(action_raw: u64) i64 {
     if (action == .shutdown or action == .reboot) {
         kprof_dump.end(.root_exit);
     }
-    return arch.powerAction(action);
+    return arch.power.powerAction(action);
 }
 
 pub fn sysSysCpuPower(action_raw: u64, value: u64) i64 {
@@ -97,5 +97,5 @@ pub fn sysSysCpuPower(action_raw: u64, value: u64) i64 {
     if (!self_entry.processRights().power) return E_PERM;
 
     const action = std.meta.intToEnum(CpuPowerAction, @as(u8, @truncate(action_raw))) catch return E_INVAL;
-    return arch.cpuPowerAction(action, value);
+    return arch.power.cpuPowerAction(action, value);
 }

@@ -15,7 +15,7 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 
-const GuestState = zag.arch.dispatch.GuestState;
+const GuestState = zag.arch.dispatch.vm.GuestState;
 const Vm = zag.arch.x64.kvm.vm.Vm;
 
 /// Result of decoding an MMIO instruction.
@@ -76,8 +76,8 @@ fn guestVirtToPhys(vm: *const Vm, cr3: u64, vaddr: u64) ?u64 {
 fn readGuestPhysU64(vm: *const Vm, phys: u64) ?u64 {
     const ptr = vm.guestPhysToHost(phys, 8) orelse return null;
     const u64_ptr: *align(1) const u64 = @ptrCast(ptr);
-    arch.userAccessBegin();
-    defer arch.userAccessEnd();
+    arch.interrupts.userAccessBegin();
+    defer arch.interrupts.userAccessEnd();
     return u64_ptr.*;
 }
 
@@ -96,18 +96,18 @@ fn fetchInsn(vm: *const Vm, cr0: u64, cr3: u64, rip: u64, buf: *[15]u8) ?u8 {
     // VMM's mapping of guest RAM), so the @memcpy reads must run with
     // SMAP disarmed. Keep the window scoped to the copy itself.
     const slice = vm.readGuestPhysSlice(phys, first) orelse return null;
-    arch.userAccessBegin();
+    arch.interrupts.userAccessBegin();
     @memcpy(buf[0..first], slice);
-    arch.userAccessEnd();
+    arch.interrupts.userAccessEnd();
 
     if (first < 15) {
         const next_vaddr = (rip & ~@as(u64, 0xFFF)) + 4096;
         const next_phys = if (cr0 & (1 << 31) == 0) next_vaddr else (guestVirtToPhys(vm, cr3, next_vaddr) orelse return first);
         const remaining: u8 = 15 - first;
         if (vm.readGuestPhysSlice(next_phys, remaining)) |next_slice| {
-            arch.userAccessBegin();
+            arch.interrupts.userAccessBegin();
             @memcpy(buf[first..15], next_slice);
-            arch.userAccessEnd();
+            arch.interrupts.userAccessEnd();
             return 15;
         }
         return first;

@@ -8,7 +8,7 @@ const sched = zag.sched.scheduler;
 
 const isSubset = zag.perms.permissions.isSubset;
 
-const ArchCpuContext = zag.arch.dispatch.ArchCpuContext;
+const ArchCpuContext = zag.arch.dispatch.cpu.ArchCpuContext;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Process = zag.proc.process.Process;
 const ProcessHandleRights = zag.perms.permissions.ProcessHandleRights;
@@ -302,7 +302,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
 
 /// Get payload registers for cap transfer (last 2 of N words)
 fn getCapPayload(ctx: *const ArchCpuContext, word_count: u3) struct { handle: u64, rights: u64 } {
-    const payload_regs = arch.getIpcPayloadWords(ctx);
+    const payload_regs = arch.syscall.getIpcPayloadWords(ctx);
     if (word_count < 2) return .{ .handle = 0, .rights = 0 };
     return .{
         .handle = payload_regs[word_count - 2],
@@ -338,7 +338,7 @@ fn validateIpcSendRights(entry: PermissionEntry, meta: IpcMetadata, sender_proc:
 fn wakeThread(thread: *Thread) void {
     while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
     thread.state = .ready;
-    const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+    const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
     sched.enqueueOnCore(target_core, thread);
 }
 
@@ -347,8 +347,8 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
     defer kprof.exit(.sys_ipc_send);
     const thread = sched.currentThread().?;
     const proc = thread.process;
-    const target_handle = arch.getIpcHandle(ctx);
-    const meta = parseIpcMetadata(arch.getIpcMetadata(ctx));
+    const target_handle = arch.syscall.getIpcHandle(ctx);
+    const meta = parseIpcMetadata(arch.syscall.getIpcMetadata(ctx));
 
     // Look up target process
     const target_entry = proc.getPermByHandle(target_handle) orelse return .{ .ret = E_BADCAP };
@@ -377,18 +377,18 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
     const receiver = target_proc.msg_box.takeReceiverLocked();
     // Snapshot receiver regs that we're about to overwrite, so we can
     // restore them if cap transfer fails and the receiver re-blocks.
-    const saved_return = arch.getSyscallReturn(receiver.ctx);
-    const saved_meta = arch.getIpcMetadata(receiver.ctx);
-    const saved_payload = arch.saveIpcPayload(receiver.ctx);
+    const saved_return = arch.syscall.getSyscallReturn(receiver.ctx);
+    const saved_meta = arch.syscall.getIpcMetadata(receiver.ctx);
+    const saved_payload = arch.syscall.saveIpcPayload(receiver.ctx);
     // On aarch64, x0 serves as both the syscall return register and the
     // first IPC payload word. setSyscallReturn must precede copyIpcPayload
     // so that when word_count >= 1, copyIpcPayload's write of x0 wins and
     // carries the true reply word 0. On x86_64 rax and rdi are independent,
     // so the order is immaterial there.
-    arch.setSyscallReturn(receiver.ctx, @bitCast(E_OK));
-    arch.copyIpcPayload(receiver.ctx, ctx, meta.word_count);
+    arch.syscall.setSyscallReturn(receiver.ctx, @bitCast(E_OK));
+    arch.syscall.copyIpcPayload(receiver.ctx, ctx, meta.word_count);
     // Set recv metadata: bit 0 = 0 (from send), bits [3:1] = word_count
-    arch.setIpcMetadata(receiver.ctx, @as(u64, meta.word_count) << 1);
+    arch.syscall.setIpcMetadata(receiver.ctx, @as(u64, meta.word_count) << 1);
 
     // Handle capability transfer
     if (meta.cap_transfer) {
@@ -396,9 +396,9 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
         const cap_result = transferCapability(proc, target_proc, cap.handle, cap.rights);
         if (cap_result != E_OK) {
             // Roll back: restore receiver ctx and re-block.
-            arch.setSyscallReturn(receiver.ctx, saved_return);
-            arch.setIpcMetadata(receiver.ctx, saved_meta);
-            arch.restoreIpcPayload(receiver.ctx, saved_payload);
+            arch.syscall.setSyscallReturn(receiver.ctx, saved_return);
+            arch.syscall.setIpcMetadata(receiver.ctx, saved_meta);
+            arch.syscall.restoreIpcPayload(receiver.ctx, saved_payload);
             target_proc.msg_box.beginReceivingLocked(receiver);
             target_proc.msg_box.lock.unlock();
             return .{ .ret = cap_result };
@@ -418,8 +418,8 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
     defer kprof.exit(.sys_ipc_call);
     const thread = sched.currentThread().?;
     const proc = thread.process;
-    const target_handle = arch.getIpcHandle(ctx);
-    const meta = parseIpcMetadata(arch.getIpcMetadata(ctx));
+    const target_handle = arch.syscall.getIpcHandle(ctx);
+    const meta = parseIpcMetadata(arch.syscall.getIpcMetadata(ctx));
 
     const target_entry = proc.getPermByHandle(target_handle) orelse return .{ .ret = E_BADCAP };
     if (target_entry.object != .process) return .{ .ret = E_BADCAP };
@@ -439,23 +439,23 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
     if (target_proc.msg_box.isReceiving()) {
         // Receiver is waiting — deliver and queue caller for reply.
         const receiver = target_proc.msg_box.takeReceiverLocked();
-        const saved_return = arch.getSyscallReturn(receiver.ctx);
-        const saved_meta = arch.getIpcMetadata(receiver.ctx);
-        const saved_payload = arch.saveIpcPayload(receiver.ctx);
+        const saved_return = arch.syscall.getSyscallReturn(receiver.ctx);
+        const saved_meta = arch.syscall.getIpcMetadata(receiver.ctx);
+        const saved_payload = arch.syscall.saveIpcPayload(receiver.ctx);
         // Order: setSyscallReturn before copyIpcPayload (see comment on the
         // sysIpcSend path above — x0 is shared on aarch64).
-        arch.setSyscallReturn(receiver.ctx, @bitCast(E_OK));
-        arch.copyIpcPayload(receiver.ctx, ctx, meta.word_count);
-        arch.setIpcMetadata(receiver.ctx, (@as(u64, meta.word_count) << 1) | 1); // bit 0 = 1 (from call)
+        arch.syscall.setSyscallReturn(receiver.ctx, @bitCast(E_OK));
+        arch.syscall.copyIpcPayload(receiver.ctx, ctx, meta.word_count);
+        arch.syscall.setIpcMetadata(receiver.ctx, (@as(u64, meta.word_count) << 1) | 1); // bit 0 = 1 (from call)
 
         if (meta.cap_transfer) {
             const cap = getCapPayload(ctx, meta.word_count);
             const cap_result = transferCapability(proc, target_proc, cap.handle, cap.rights);
             if (cap_result != E_OK) {
                 // Roll back: restore receiver ctx and re-block.
-                arch.setSyscallReturn(receiver.ctx, saved_return);
-                arch.setIpcMetadata(receiver.ctx, saved_meta);
-                arch.restoreIpcPayload(receiver.ctx, saved_payload);
+                arch.syscall.setSyscallReturn(receiver.ctx, saved_return);
+                arch.syscall.setIpcMetadata(receiver.ctx, saved_meta);
+                arch.syscall.restoreIpcPayload(receiver.ctx, saved_payload);
                 target_proc.msg_box.beginReceivingLocked(receiver);
                 target_proc.msg_box.lock.unlock();
                 return .{ .ret = cap_result };
@@ -496,7 +496,7 @@ pub fn sysIpcRecv(ctx: *ArchCpuContext) SyscallResult {
     defer kprof.exit(.sys_ipc_recv);
     const thread = sched.currentThread().?;
     const proc = thread.process;
-    const blocking = (arch.getIpcMetadata(ctx) & 0x2) != 0;
+    const blocking = (arch.syscall.getIpcMetadata(ctx) & 0x2) != 0;
 
     proc.msg_box.lock.lock();
 
@@ -530,11 +530,11 @@ pub fn sysIpcRecv(ctx: *ArchCpuContext) SyscallResult {
     };
 
     // Copy payload from waiter's saved context.
-    const waiter_meta = parseIpcMetadata(arch.getIpcMetadata(waiter.ctx));
-    arch.copyIpcPayload(ctx, waiter.ctx, waiter_meta.word_count);
+    const waiter_meta = parseIpcMetadata(arch.syscall.getIpcMetadata(waiter.ctx));
+    arch.syscall.copyIpcPayload(ctx, waiter.ctx, waiter_meta.word_count);
 
     // Set recv metadata: bit 0 = 1 (always from call — send doesn't queue).
-    arch.setIpcMetadata(ctx, (@as(u64, waiter_meta.word_count) << 1) | 1);
+    arch.syscall.setIpcMetadata(ctx, (@as(u64, waiter_meta.word_count) << 1) | 1);
 
     // Handle capability transfer.
     if (waiter_meta.cap_transfer) {
@@ -566,7 +566,7 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
     defer kprof.exit(.sys_ipc_reply);
     const thread = sched.currentThread().?;
     const proc = thread.process;
-    const reply_meta = arch.getIpcMetadata(ctx);
+    const reply_meta = arch.syscall.getIpcMetadata(ctx);
     const atomic_recv = (reply_meta & 0x1) != 0;
     const recv_blocking = (reply_meta & 0x2) != 0;
     const reply_word_count: u3 = @truncate((reply_meta >> 2) & 0x7);
@@ -599,14 +599,14 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
             reply_cap_err = transferCapability(proc, pc.process, cap.handle, cap.rights);
         }
         if (reply_cap_err != E_OK) {
-            arch.setSyscallReturn(pc.ctx, @bitCast(reply_cap_err));
+            arch.syscall.setSyscallReturn(pc.ctx, @bitCast(reply_cap_err));
         } else {
             // Order: setSyscallReturn before copyIpcPayload on aarch64 (x0
             // is shared between return value and reply word 0). See
             // sysIpcSend's matching comment for rationale.
-            arch.setSyscallReturn(pc.ctx, @bitCast(E_OK));
-            arch.copyIpcPayload(pc.ctx, ctx, reply_word_count);
-            arch.setIpcMetadata(pc.ctx, (@as(u64, reply_word_count) << 1) | 1);
+            arch.syscall.setSyscallReturn(pc.ctx, @bitCast(E_OK));
+            arch.syscall.copyIpcPayload(pc.ctx, ctx, reply_word_count);
+            arch.syscall.setIpcMetadata(pc.ctx, (@as(u64, reply_word_count) << 1) | 1);
         }
 
         pc.ipc_server = null;
@@ -615,7 +615,7 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
     if (atomic_recv) {
         // Reply + recv atomically.
         if (proc.msg_box.dequeueLocked()) |waiter| {
-            const waiter_meta = parseIpcMetadata(arch.getIpcMetadata(waiter.ctx));
+            const waiter_meta = parseIpcMetadata(arch.syscall.getIpcMetadata(waiter.ctx));
 
             // Capability transfer runs before we deliver to the receiver:
             // on failure, put the waiter back at the head of the queue
@@ -634,9 +634,9 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
             // Order: setSyscallReturn before copyIpcPayload on aarch64 (x0
             // is shared between return value and reply word 0). See
             // sysIpcSend's matching comment for rationale.
-            arch.setSyscallReturn(ctx, @bitCast(E_OK));
-            arch.copyIpcPayload(ctx, waiter.ctx, waiter_meta.word_count);
-            arch.setIpcMetadata(ctx, (@as(u64, waiter_meta.word_count) << 1) | 1);
+            arch.syscall.setSyscallReturn(ctx, @bitCast(E_OK));
+            arch.syscall.copyIpcPayload(ctx, waiter.ctx, waiter_meta.word_count);
+            arch.syscall.setIpcMetadata(ctx, (@as(u64, waiter_meta.word_count) << 1) | 1);
 
             proc.msg_box.beginPendingReplyLocked(waiter);
             proc.msg_box.lock.unlock();
@@ -657,7 +657,7 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
             // for now and block self via switchToNextReady.
             if (caller_thread) |ct| wakeThread(ct);
             thread.state = .blocked;
-            arch.setSyscallReturn(ctx, @bitCast(reply_cap_err));
+            arch.syscall.setSyscallReturn(ctx, @bitCast(reply_cap_err));
             thread.ctx = ctx;
             thread.on_cpu.store(false, .release);
             sched.switchToNextReady();
@@ -666,7 +666,7 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
             proc.msg_box.lock.unlock();
             if (caller_thread) |ct| wakeThread(ct);
             const recv_err = if (reply_cap_err != E_OK) reply_cap_err else E_AGAIN;
-            arch.setSyscallReturn(ctx, @bitCast(recv_err));
+            arch.syscall.setSyscallReturn(ctx, @bitCast(recv_err));
             return .{ .ret = recv_err };
         }
     } else {
@@ -676,7 +676,7 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
 
         const ct = caller_thread.?;
         thread.state = .ready;
-        arch.setSyscallReturn(ctx, @bitCast(reply_cap_err));
+        arch.syscall.setSyscallReturn(ctx, @bitCast(reply_cap_err));
         const result = sched.switchToThread(thread, ct, ctx, true);
         if (result != 0) {
             thread.state = .running;

@@ -8,7 +8,7 @@ const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const stack_mod = zag.memory.stack;
 
-const ArchCpuContext = arch.ArchCpuContext;
+const ArchCpuContext = arch.cpu.ArchCpuContext;
 const FaultReason = zag.perms.permissions.FaultReason;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = address.PAddr;
@@ -95,7 +95,7 @@ pub const Thread = struct {
     /// Arch-specific PMU state (spec §2.14). `null` for threads that have
     /// never called `pmu_start`; allocated lazily on first start and freed
     /// on explicit `pmu_stop` or implicit release in `Thread.deinit`.
-    pmu_state: ?*arch.PmuState = null,
+    pmu_state: ?*arch.pmu.PmuState = null,
     /// Lazy-FPU save buffer. The kernel never touches FP/SIMD itself
     /// (built with `-mno-sse`/`-mno-neon`), so userspace FPU state survives
     /// across syscalls untouched in registers. Eviction happens only when
@@ -146,7 +146,7 @@ pub const Thread = struct {
         // core. Just zero and free the state struct — real hardware
         // teardown happened at the latest pmuSave on context switch away.
         if (self.pmu_state) |state| {
-            arch.pmuClearState(state);
+            arch.pmu.pmuClearState(state);
             zag.syscall.pmu.allocator.destroy(state);
             self.pmu_state = null;
         }
@@ -176,7 +176,7 @@ pub const Thread = struct {
                 proc.lock.lock();
                 const remaining = proc.threads[0..proc.num_threads];
                 for (remaining) |t| {
-                    if (arch.kvmVcpuFromThread(vm_obj, t) == null) {
+                    if (arch.kvm.kvmVcpuFromThread(vm_obj, t) == null) {
                         all_vcpu = false;
                         break;
                     }
@@ -233,7 +233,7 @@ pub const Thread = struct {
             .user_stack = null,
             .process = proc,
         };
-        arch.fpuStateInit(&thread.fpu_state);
+        arch.fpu.fpuStateInit(&thread.fpu_state);
 
         thread.kernel_stack = try stack_mod.createKernel();
         errdefer stack_mod.destroyKernel(thread.kernel_stack, memory_init.kernel_addr_space_root);
@@ -248,7 +248,7 @@ pub const Thread = struct {
         const kstack_top = address.alignStack(thread.kernel_stack.top);
         const ustack_top = address.alignStack(ustack.top);
         const entry_fn: *const fn () void = @ptrFromInt(entry.addr);
-        thread.ctx = arch.prepareThreadContext(kstack_top, ustack_top, entry_fn, arg);
+        thread.ctx = arch.cpu.prepareThreadContext(kstack_top, ustack_top, entry_fn, arg);
 
         proc.lock.lock();
         defer proc.lock.unlock();
@@ -270,7 +270,7 @@ fn mapKernelStack(stack: Stack) !void {
         var undo = stack.base.addr;
         var i: usize = 0;
         while (i < mapped) {
-            if (arch.unmapPage(memory_init.kernel_addr_space_root, VAddr.fromInt(undo))) |paddr| {
+            if (arch.paging.unmapPage(memory_init.kernel_addr_space_root, VAddr.fromInt(undo))) |paddr| {
                 const pg: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
                 pmm_iface.destroy(pg);
             }
@@ -282,7 +282,7 @@ fn mapKernelStack(stack: Stack) !void {
         const kpage = try pmm_iface.create(paging.PageMem(.page4k));
         @memset(std.mem.asBytes(kpage), 0);
         const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
-        try arch.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS);
+        try arch.paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS);
         mapped += 1;
         page_addr += paging.PAGE4K;
     }
@@ -302,7 +302,7 @@ fn unmapKernelStack(stack: Stack) void {
     const pmm_iface = pmm.global_pmm.?.allocator();
     var page_addr = stack.base.addr;
     while (page_addr < stack.top.addr) {
-        if (arch.unmapPage(memory_init.kernel_addr_space_root, VAddr.fromInt(page_addr))) |paddr| {
+        if (arch.paging.unmapPage(memory_init.kernel_addr_space_root, VAddr.fromInt(page_addr))) |paddr| {
             const pg: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
             pmm_iface.destroy(pg);
         }

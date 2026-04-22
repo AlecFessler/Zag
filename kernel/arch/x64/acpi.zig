@@ -395,7 +395,7 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
                 .privilege_perm = .kernel,
             };
 
-            try arch.mapPage(
+            try arch.paging.mapPage(
                 memory_init.kernel_addr_space_root,
                 lapic_phys,
                 lapic_virt,
@@ -420,7 +420,7 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
                 .privilege_perm = .kernel,
             };
 
-            try arch.mapPage(
+            try arch.paging.mapPage(
                 memory_init.kernel_addr_space_root,
                 hpet_phys,
                 hpet_virt,
@@ -486,7 +486,7 @@ fn parseMcfg(mcfg_vaddr: VAddr, length: u32) !void {
         while (offset < ecam_size) {
             const page_phys = PAddr.fromInt(base_address + offset);
             const page_virt = VAddr.fromPAddr(page_phys, null);
-            arch.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS) catch {
+            arch.paging.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS) catch {
                 offset += paging.PAGE4K;
                 continue;
             };

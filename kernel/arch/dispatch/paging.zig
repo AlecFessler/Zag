@@ -1,0 +1,296 @@
+const builtin = @import("builtin");
+const std = @import("std");
+const zag = @import("zag");
+
+const aarch64 = zag.arch.aarch64;
+const x64 = zag.arch.x64;
+
+const MemoryPerms = zag.perms.memory.MemoryPerms;
+const PAddr = zag.memory.address.PAddr;
+const PageSize = zag.memory.paging.PageSize;
+const Range = zag.utils.range.Range;
+const VAddr = zag.memory.address.VAddr;
+
+// ── Address Space Layout ────────────────────────────────────────────────
+// Architecture-specific virtual address space boundaries. These define
+// the user/kernel split, physmap location, and kernel code range.
+
+pub const addr_space = switch (builtin.cpu.arch) {
+    .x86_64 => struct {
+        pub const user: Range = .{
+            .start = 0x0000_0000_0000_0000,
+            .end = 0xFFFF_8000_0000_0000,
+        };
+        pub const kernel: Range = .{
+            .start = 0xFFFF_8000_0000_0000,
+            .end = 0xFFFF_8400_0000_0000,
+        };
+        pub const physmap: Range = .{
+            .start = 0xFFFF_FF80_0000_0000,
+            .end = 0xFFFF_FF88_0000_0000,
+        };
+        pub const kernel_code: Range = .{
+            .start = 0xFFFF_FFFF_8000_0000,
+            .end = 0xFFFF_FFFF_C000_0000,
+        };
+    },
+    .aarch64 => struct {
+        pub const user: Range = .{
+            .start = 0x0000_0000_0000_0000,
+            .end = 0x0001_0000_0000_0000,
+        };
+        // Kernel heap/data (above kernel_code).
+        pub const kernel: Range = .{
+            .start = 0xFFFF_0000_4000_0000,
+            .end = 0xFFFF_0400_0000_0000,
+        };
+        pub const physmap: Range = .{
+            .start = 0xFFFF_FF80_0000_0000,
+            .end = 0xFFFF_FF88_0000_0000,
+        };
+        // Kernel text/rodata (bottom of TTBR1 range).
+        pub const kernel_code: Range = .{
+            .start = 0xFFFF_0000_0000_0000,
+            .end = 0xFFFF_0000_4000_0000,
+        };
+    },
+    else => unreachable,
+};
+
+/// ASLR range for userspace allocations (subset of addr_space.user).
+pub const user_aslr: Range = switch (builtin.cpu.arch) {
+    .x86_64 => .{
+        .start = 0x0000_0000_0000_1000,
+        .end = 0x0000_1000_0000_0000,
+    },
+    .aarch64 => .{
+        .start = 0x0000_0000_0000_1000,
+        .end = 0x0000_1000_0000_0000,
+    },
+    else => unreachable,
+};
+
+pub fn mapPage(
+    addr_space_root: PAddr,
+    phys: PAddr,
+    virt: VAddr,
+    perms: MemoryPerms,
+) !void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => try x64.paging.mapPage(addr_space_root, phys, virt, perms),
+        .aarch64 => try aarch64.paging.mapPage(addr_space_root, phys, virt, perms),
+        else => unreachable,
+    }
+}
+
+pub fn mapPageBoot(
+    addr_space_root: VAddr,
+    phys: PAddr,
+    virt: VAddr,
+    size: PageSize,
+    perms: MemoryPerms,
+    allocator: std.mem.Allocator,
+) !void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => try x64.paging.mapPageBoot(addr_space_root, phys, virt, size, perms, allocator),
+        .aarch64 => try aarch64.paging.mapPageBoot(addr_space_root, phys, virt, size, perms, allocator),
+        else => unreachable,
+    }
+}
+
+pub fn unmapPage(
+    addr_space_root: PAddr,
+    virt: VAddr,
+) ?PAddr {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return x64.paging.unmapPage(addr_space_root, virt),
+        .aarch64 => return aarch64.paging.unmapPage(addr_space_root, virt),
+        else => unreachable,
+    }
+}
+
+pub fn updatePagePerms(
+    addr_space_root: PAddr,
+    virt: VAddr,
+    new_perms: MemoryPerms,
+) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.updatePagePerms(addr_space_root, virt, new_perms),
+        .aarch64 => aarch64.paging.updatePagePerms(addr_space_root, virt, new_perms),
+        else => unreachable,
+    }
+}
+
+pub fn resolveVaddr(
+    addr_space_root: PAddr,
+    virt: VAddr,
+) ?PAddr {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return x64.paging.resolveVaddr(addr_space_root, virt),
+        .aarch64 => return aarch64.paging.resolveVaddr(addr_space_root, virt),
+        else => unreachable,
+    }
+}
+
+pub fn swapAddrSpace(root: PAddr, id: u16) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.swapAddrSpace(root, id),
+        .aarch64 => aarch64.paging.swapAddrSpace(root, id),
+        else => unreachable,
+    }
+}
+
+/// Allocate a per-process address-space identifier for TLB tagging
+/// (PCID on x86-64, ASID on aarch64). Returns null on exhaustion.
+pub fn allocAddrSpaceId() ?u16 {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.pcid.allocate(),
+        .aarch64 => aarch64.asid.allocate(),
+        else => unreachable,
+    };
+}
+
+/// Release an address-space identifier previously returned by
+/// `allocAddrSpaceId`. Invalidates every TLB entry tagged with `id` first
+/// so a future re-allocation of this id does not inherit stale mappings
+/// from the previous owner. Releasing id 0 is a programming error.
+pub fn freeAddrSpaceId(id: u16) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {
+            x64.paging.invalidateAddrSpaceTlb(id);
+            x64.pcid.free(id);
+        },
+        .aarch64 => {
+            aarch64.paging.invalidateAddrSpaceTlb(id);
+            aarch64.asid.free(id);
+        },
+        else => unreachable,
+    }
+}
+
+pub fn getAddrSpaceRoot() PAddr {
+    switch (builtin.cpu.arch) {
+        .x86_64 => return x64.paging.getAddrSpaceRoot(),
+        .aarch64 => return aarch64.paging.getAddrSpaceRoot(),
+        else => unreachable,
+    }
+}
+
+/// Whether the kernel page table root is the same as the user table.
+/// On x86-64 (single CR3) the bootloader must copy the UEFI identity map
+/// into the new kernel table. On aarch64 (split TTBR0/TTBR1) the kernel
+/// table is independent and should start clean.
+pub const kernel_shares_user_table: bool = switch (builtin.cpu.arch) {
+    .x86_64 => true,
+    .aarch64 => false,
+    else => unreachable,
+};
+
+/// Return the physical address of the kernel page table root.
+/// On x86-64 this is the same as getAddrSpaceRoot() since CR3 covers both
+/// halves. On aarch64 this reads TTBR1_EL1 (upper/kernel VA range).
+pub fn getKernelAddrSpaceRoot() PAddr {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.getAddrSpaceRoot(),
+        .aarch64 => aarch64.paging.getKernelAddrSpaceRoot(),
+        else => unreachable,
+    };
+}
+
+/// Set the kernel page table root. Bootloader-only — runs before
+/// CR4.PCIDE is enabled, so on x86-64 the CR3 source operand cannot
+/// carry the PCID/no-flush bits that runtime swapAddrSpace uses.
+/// On aarch64 this writes TTBR1_EL1 (upper/kernel VA range).
+pub fn setKernelAddrSpace(root: PAddr) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.setKernelAddrSpace(root),
+        .aarch64 => aarch64.paging.setKernelAddrSpace(root),
+        else => unreachable,
+    }
+}
+
+pub fn freeUserAddrSpace(addr_space_root: PAddr) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.freeUserAddrSpace(addr_space_root),
+        .aarch64 => aarch64.paging.freeUserAddrSpace(addr_space_root),
+        else => unreachable,
+    }
+}
+
+pub fn copyKernelMappings(root: VAddr) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.copyKernelMappings(root),
+        .aarch64 => aarch64.paging.copyKernelMappings(root),
+        else => unreachable,
+    }
+}
+
+pub fn dropIdentityMapping() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.paging.dropIdentityMapping(),
+        .aarch64 => aarch64.paging.dropIdentityMapping(),
+        else => unreachable,
+    }
+}
+
+/// Align a stack pointer for the target architecture's calling convention.
+/// x86-64: 16-byte aligned minus 8 (simulates the return address push by `call`).
+/// aarch64: 16-byte aligned (SP must be 16-byte aligned at all times).
+pub fn alignStack(stack_top: VAddr) VAddr {
+    const aligned = std.mem.alignBackward(u64, stack_top.addr, 16);
+    const adjusted = switch (builtin.cpu.arch) {
+        .x86_64 => aligned - 8,
+        .aarch64 => aligned,
+        else => unreachable,
+    };
+    return VAddr.fromInt(adjusted);
+}
+
+/// Classification of ELF relocation types for KASLR slide application.
+pub const RelocAction = enum { skip, abs64, abs32, unsupported };
+
+/// Classify a relocation type for KASLR processing.
+pub fn classifyRelocation(rtype: u32) RelocAction {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => {
+            if (rtype == @intFromEnum(std.elf.R_X86_64.PC32) or
+                rtype == @intFromEnum(std.elf.R_X86_64.PLT32) or
+                rtype == @intFromEnum(std.elf.R_X86_64.NONE)) return .skip;
+            if (rtype == @intFromEnum(std.elf.R_X86_64.@"64")) return .abs64;
+            if (rtype == @intFromEnum(std.elf.R_X86_64.@"32S")) return .abs32;
+            return .unsupported;
+        },
+        .aarch64 => {
+            const R = std.elf.R_AARCH64;
+            // PC-relative: no adjustment needed (both sides move by slide).
+            // LO12: low 12 bits unchanged with page-aligned slide.
+            if (rtype == @intFromEnum(R.NONE) or
+                rtype == @intFromEnum(R.PREL32) or
+                rtype == @intFromEnum(R.PREL64) or
+                rtype == @intFromEnum(R.ADR_PREL_PG_HI21) or
+                rtype == @intFromEnum(R.ADR_PREL_PG_HI21_NC) or
+                rtype == @intFromEnum(R.ADR_PREL_LO21) or
+                rtype == @intFromEnum(R.ADD_ABS_LO12_NC) or
+                rtype == @intFromEnum(R.CALL26) or
+                rtype == @intFromEnum(R.JUMP26) or
+                rtype == @intFromEnum(R.LDST8_ABS_LO12_NC) or
+                rtype == @intFromEnum(R.LDST16_ABS_LO12_NC) or
+                rtype == @intFromEnum(R.LDST32_ABS_LO12_NC) or
+                rtype == @intFromEnum(R.LDST64_ABS_LO12_NC) or
+                rtype == @intFromEnum(R.LDST128_ABS_LO12_NC)) return .skip;
+            if (rtype == @intFromEnum(R.ABS64) or
+                rtype == @intFromEnum(R.RELATIVE)) return .abs64;
+            if (rtype == @intFromEnum(R.ABS32)) return .abs32;
+            return .unsupported;
+        },
+        else => unreachable,
+    };
+}
+
+pub fn isRelativeRelocation(rela_type: u32) bool {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => rela_type == @intFromEnum(std.elf.R_X86_64.RELATIVE),
+        .aarch64 => rela_type == @intFromEnum(std.elf.R_AARCH64.RELATIVE),
+        else => unreachable,
+    };
+}

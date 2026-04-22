@@ -12,7 +12,7 @@ const pmm = zag.memory.pmm;
 const sched = zag.sched.scheduler;
 const thread_mod = zag.sched.thread;
 
-const ArchCpuContext = zag.arch.dispatch.ArchCpuContext;
+const ArchCpuContext = zag.arch.dispatch.cpu.ArchCpuContext;
 const CrashReason = FaultReason;
 const DeadProcessInfo = zag.perms.permissions.DeadProcessInfo;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
@@ -96,7 +96,7 @@ pub const Process = struct {
     // decide whether restoring the bit is semantically valid — we never
     // want to synthesize a right the sender didn't have to begin with.
     had_self_fault_handler: bool = true,
-    vm: ?*arch.Vm = null,
+    vm: ?*arch.vm.Vm = null,
 
     pub const MAX_THREADS = 64;
     pub const MAX_CHILDREN = 64;
@@ -303,7 +303,7 @@ pub const Process = struct {
         target.lock.unlock();
 
         for (resume_buf[0..resume_n]) |t| {
-            const target_core = if (t.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+            const target_core = if (t.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
             sched.enqueueOnCore(target_core, t);
         }
 
@@ -387,7 +387,7 @@ pub const Process = struct {
         faulted: *Thread,
     ) void {
         // Layout matches libz.FaultMessage. Size is arch-dependent.
-        var msg: [arch.fault_msg_size]u8 = undefined;
+        var msg: [arch.cpu.fault_msg_size]u8 = undefined;
         @as(*align(1) u64, @ptrCast(&msg[0])).* = process_handle;
         @as(*align(1) u64, @ptrCast(&msg[8])).* = thread_handle;
         msg[16] = @intFromEnum(faulted.fault_reason);
@@ -404,8 +404,8 @@ pub const Process = struct {
         // rather than the user fault frame. Using `fault_user_ctx`
         // directly — the same frame that `applyModifiedRegs` targets on
         // resume — keeps the delivered snapshot consistent across arches.
-        const regs_src: *const arch.ArchCpuContext = faulted.fault_user_ctx orelse faulted.ctx;
-        const snap = arch.serializeFaultRegs(regs_src);
+        const regs_src: *const arch.cpu.ArchCpuContext = faulted.fault_user_ctx orelse faulted.ctx;
+        const snap = arch.cpu.serializeFaultRegs(regs_src);
         @as(*align(1) u64, @ptrCast(&msg[40])).* = snap.flags;
         @as(*align(1) u64, @ptrCast(&msg[48])).* = snap.sp;
         const gprs = snap.gprs;
@@ -416,13 +416,13 @@ pub const Process = struct {
         }
 
         // Walk the receiver's page table and copy the message via physmap.
-        var remaining: usize = arch.fault_msg_size;
+        var remaining: usize = arch.cpu.fault_msg_size;
         var src_off: usize = 0;
         var dst_va: u64 = buf_ptr;
         while (remaining > 0) {
             const page_off = dst_va & 0xFFF;
             const chunk = @min(remaining, paging.PAGE4K - page_off);
-            const page_paddr = arch.resolveVaddr(receiver_proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return;
+            const page_paddr = arch.paging.resolveVaddr(receiver_proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return;
             const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
             const dst: [*]u8 = @ptrFromInt(physmap_addr);
             @memcpy(dst[0..chunk], msg[src_off..][0..chunk]);
@@ -462,12 +462,12 @@ pub const Process = struct {
     fn deliverFaultToWaiter(handler: *Process, receiver: *Thread, faulted: *Thread) void {
         // The receiver was blocked inside sysFaultRecv. The buf_ptr arg
         // is the first syscall argument (preserved from syscall entry).
-        const buf_ptr = arch.getSyscallArgs(receiver.ctx).arg0;
+        const buf_ptr = arch.syscall.getSyscallArgs(receiver.ctx).arg0;
         const handles = lookupHandlesForFault(handler, faulted);
         writeFaultMessageInto(receiver.process, buf_ptr, handles.proc_h, handles.thread_h, faulted);
         // Set the syscall return value: fault_recv returns the thread
         // handle (= the fault token) on success.
-        arch.setSyscallReturn(receiver.ctx, handles.thread_h);
+        arch.syscall.setSyscallReturn(receiver.ctx, handles.thread_h);
         wakeReceiver(receiver);
     }
 
@@ -477,7 +477,7 @@ pub const Process = struct {
     fn wakeReceiver(t: *Thread) void {
         while (t.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
         t.state = .ready;
-        const target_core = if (t.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+        const target_core = if (t.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
         sched.enqueueOnCore(target_core, t);
     }
 
@@ -616,7 +616,7 @@ pub const Process = struct {
             const sib = maybe_sib orelse continue;
             sched.removeFromAnyRunQueue(sib);
             if (sched.coreRunning(sib)) |core_id| {
-                arch.triggerSchedulerInterrupt(core_id);
+                arch.smp.triggerSchedulerInterrupt(core_id);
             }
         }
 
@@ -1026,7 +1026,7 @@ pub const Process = struct {
             if (tail_len > 0 and tail_len < paging.PAGE4K) {
                 const page_base = std.mem.alignBackward(u64, data_end, paging.PAGE4K);
                 const page_offset = data_end - page_base;
-                if (arch.resolveVaddr(self.addr_space_root, VAddr.fromInt(page_base))) |paddr| {
+                if (arch.paging.resolveVaddr(self.addr_space_root, VAddr.fromInt(page_base))) |paddr| {
                     const physmap_addr = VAddr.fromPAddr(paddr, null).addr + page_offset;
                     const dst: [*]u8 = @ptrFromInt(physmap_addr);
                     @memset(dst[0..tail_len], 0);
@@ -1052,7 +1052,7 @@ pub const Process = struct {
             }
         }
 
-        sched.enqueueOnCore(arch.coreID(), thread);
+        sched.enqueueOnCore(arch.smp.coreID(), thread);
     }
 
     fn updateParentView(self: *Process) void {
@@ -1081,10 +1081,10 @@ pub const Process = struct {
         // Drain all queued waiters with E_NOENT.
         while (self.msg_box.dequeueLocked()) |w| {
             w.ipc_server = null;
-            arch.setSyscallReturn(w.ctx, @bitCast(@as(i64, -10)));
+            arch.syscall.setSyscallReturn(w.ctx, @bitCast(@as(i64, -10)));
             while (w.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
             w.state = .ready;
-            const target_core = if (w.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+            const target_core = if (w.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
             sched.enqueueOnCore(target_core, w);
         }
 
@@ -1092,10 +1092,10 @@ pub const Process = struct {
         if (self.msg_box.isPendingReply()) {
             if (self.msg_box.endPendingReplyLocked()) |pc| {
                 pc.ipc_server = null;
-                arch.setSyscallReturn(pc.ctx, @bitCast(@as(i64, -10)));
+                arch.syscall.setSyscallReturn(pc.ctx, @bitCast(@as(i64, -10)));
                 while (pc.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
                 pc.state = .ready;
-                const target_core = if (pc.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+                const target_core = if (pc.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
                 sched.enqueueOnCore(target_core, pc);
             }
         }
@@ -1204,9 +1204,9 @@ pub const Process = struct {
         // Clear slot 0 without touching refcount.
         self.perm_table[0] = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
 
-        arch.freeUserAddrSpace(self.addr_space_root);
+        arch.paging.freeUserAddrSpace(self.addr_space_root);
         if (self.addr_space_id != 0) {
-            arch.freeAddrSpaceId(self.addr_space_id);
+            arch.paging.freeAddrSpaceId(self.addr_space_id);
             self.addr_space_id = 0;
         }
     }
@@ -1287,7 +1287,7 @@ pub const Process = struct {
     pub fn cleanupDmaMappings(self: *Process) void {
         for (self.dma_mappings[0..self.num_dma_mappings]) |*m| {
             if (m.active) {
-                arch.unmapDmaPages(m.device, m.dma_base, m.num_pages);
+                arch.iommu.unmapDmaPages(m.device, m.dma_base, m.num_pages);
                 m.active = false;
             }
         }
@@ -1354,10 +1354,10 @@ pub const Process = struct {
 
         const pml4_vaddr = VAddr.fromInt(@intFromPtr(pml4_page));
         proc.addr_space_root = PAddr.fromVAddr(pml4_vaddr, null);
-        arch.copyKernelMappings(pml4_vaddr);
+        arch.paging.copyKernelMappings(pml4_vaddr);
 
-        proc.addr_space_id = arch.allocAddrSpaceId() orelse return error.NoAddrSpaceId;
-        errdefer if (!skip_cleanup) arch.freeAddrSpaceId(proc.addr_space_id);
+        proc.addr_space_id = arch.paging.allocAddrSpaceId() orelse return error.NoAddrSpaceId;
+        errdefer if (!skip_cleanup) arch.paging.freeAddrSpaceId(proc.addr_space_id);
 
         const aslr_base = generateAslrBase();
 
@@ -1370,7 +1370,7 @@ pub const Process = struct {
         // mapped without a vmm node (e.g. view_page before insertKernelNode)
         // are freed by freeUserAddrSpace below, which also frees the pml4.
         errdefer if (!skip_cleanup) proc.vmm.deinit();
-        errdefer if (!skip_cleanup) arch.freeUserAddrSpace(proc.addr_space_root);
+        errdefer if (!skip_cleanup) arch.paging.freeUserAddrSpace(proc.addr_space_root);
 
         const elf_result = try loadElf(proc, elf_binary, aslr_base);
 
@@ -1388,7 +1388,7 @@ pub const Process = struct {
             .global_perm = .not_global,
             .privilege_perm = .user,
         };
-        try arch.mapPage(proc.addr_space_root, view_phys, view_vaddr, view_perms);
+        try arch.paging.mapPage(proc.addr_space_root, view_phys, view_vaddr, view_perms);
         // Once mapped, freeUserAddrSpace will reclaim view_page on error.
         view_page_mapped = true;
         try proc.vmm.insertKernelNode(view_vaddr, paging.PAGE4K, .{ .read = true }, .preserve);
@@ -1497,7 +1497,7 @@ fn generateAslrBase() u64 {
     const aslr_end = address.UserVA.aslr.end;
     const aslr_range = aslr_end - aslr_start;
     const aslr_pages = aslr_range / paging.PAGE4K;
-    const entropy = arch.readTimestamp();
+    const entropy = arch.time.readTimestamp();
     const offset_pages = entropy % (aslr_pages / 2);
     return aslr_start + offset_pages * paging.PAGE4K;
 }
@@ -1633,7 +1633,7 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
         const page = try pmm_iface.create(paging.PageMem(.page4k));
         @memset(std.mem.asBytes(page), 0);
         const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
-        try arch.mapPage(proc.addr_space_root, phys, VAddr.fromInt(page_va), load_perms);
+        try arch.paging.mapPage(proc.addr_space_root, phys, VAddr.fromInt(page_va), load_perms);
         page_va += paging.PAGE4K;
     }
 
@@ -1679,7 +1679,7 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
     // unification. Without this, every newly created process raises an
     // instruction-abort exception at its entry point on a real CPU
     // (TCG masks the bug by re-translating from memory each time).
-    arch.syncInstructionCache();
+    arch.boot.syncInstructionCache();
 
     const final_end = if (has_bss and bss_end > page_end) bss_end else page_end;
     proc.vmm.bump(VAddr.fromInt(final_end));
@@ -1706,7 +1706,7 @@ fn writeToUserPages(addr_space_root: PAddr, start_va: u64, data: []const u8) voi
         const va = start_va + offset;
         const page_base = std.mem.alignBackward(u64, va, paging.PAGE4K);
         const page_offset = va - page_base;
-        const paddr = arch.resolveVaddr(addr_space_root, VAddr.fromInt(page_base)) orelse return;
+        const paddr = arch.paging.resolveVaddr(addr_space_root, VAddr.fromInt(page_base)) orelse return;
         const physmap_addr = VAddr.fromPAddr(paddr, null).addr + page_offset;
         const chunk_len = @min(data.len - offset, paging.PAGE4K - page_offset);
         const dst: [*]u8 = @ptrFromInt(physmap_addr);
@@ -1714,7 +1714,7 @@ fn writeToUserPages(addr_space_root: PAddr, start_va: u64, data: []const u8) voi
         // Clean the just-written physmap range to the Point of Unification
         // so that a later `ic ivau`/`ic ialluis` makes the new code visible
         // to instruction fetch on aarch64. No-op on x86-64.
-        arch.cleanDcacheToPou(physmap_addr, chunk_len);
+        arch.boot.cleanDcacheToPou(physmap_addr, chunk_len);
         offset += chunk_len;
     }
 }
@@ -1768,7 +1768,7 @@ fn applyRelocations(proc: *Process, aslr_base: u64, elf_binary: []const u8, rela
         const rela = std.mem.bytesAsValue(elf.Elf64_Rela, elf_binary[off..][0..entry_size]);
 
         const rela_type = @as(u32, @truncate(rela.r_info));
-        if (!arch.isRelativeRelocation(rela_type)) {
+        if (!arch.paging.isRelativeRelocation(rela_type)) {
             r += 1;
             continue;
         }
@@ -1789,7 +1789,7 @@ fn applyRelocations(proc: *Process, aslr_base: u64, elf_binary: []const u8, rela
 
         const value: u64 = @bitCast(@as(i64, rela.r_addend) +% @as(i64, @bitCast(aslr_base)));
 
-        const paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(page_base)) orelse return error.InvalidElf;
+        const paddr = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(page_base)) orelse return error.InvalidElf;
         const physmap_addr = VAddr.fromPAddr(paddr, null).addr + (target_vaddr - page_base);
         const ptr: *u64 = @ptrFromInt(physmap_addr);
         ptr.* = value;

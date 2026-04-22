@@ -86,7 +86,7 @@ pub var epoch: u64 = 0;
 pub fn init() !void {
     if (!mode.any_enabled) return;
 
-    const cores = arch.coreCount();
+    const cores = arch.smp.coreCount();
     if (cores > MAX_CPUS) @panic("kprof: coreCount exceeds MAX_CPUS");
     n_cpus = @intCast(cores);
 

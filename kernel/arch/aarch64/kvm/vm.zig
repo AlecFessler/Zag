@@ -362,7 +362,7 @@ pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64
             rollbackGuestMap(vm_obj, guest_addr, offset);
             return E_BADADDR;
         };
-        const host_phys = arch.resolveVaddr(proc.addr_space_root, vaddr) orelse {
+        const host_phys = arch.paging.resolveVaddr(proc.addr_space_root, vaddr) orelse {
             rollbackGuestMap(vm_obj, guest_addr, offset);
             return E_BADADDR;
         };
@@ -411,13 +411,13 @@ pub fn sysregPassthrough(proc: *Process, vm_handle: u64, sysreg_id: u32, allow_r
 
     if (isSecurityCriticalSysreg(sysreg_id)) return E_PERM;
 
-    // Serialize the HCR override RMW inside `arch.vmSysregPassthrough` —
+    // Serialize the HCR override RMW inside `arch.vm.vmSysregPassthrough` —
     // multiple threads in the same process could otherwise race on the
     // VM's control block.
     vm_obj.lock.lock();
     defer vm_obj.lock.unlock();
 
-    arch.vmSysregPassthrough(vm_obj.arch_structures, sysreg_id, allow_read, allow_write);
+    arch.vm.vmSysregPassthrough(vm_obj.arch_structures, sysreg_id, allow_read, allow_write);
     return 0; // E_OK
 }
 
@@ -455,7 +455,7 @@ fn kickRunningVcpus(vm_obj: *Vm) void {
     for (vm_obj.vcpus[0..vm_obj.num_vcpus]) |vcpu_obj| {
         if (vcpu_obj.loadState() == .running) {
             if (sched.coreRunning(vcpu_obj.thread)) |core_id| {
-                arch.triggerSchedulerInterrupt(core_id);
+                arch.smp.triggerSchedulerInterrupt(core_id);
             }
         }
     }
@@ -483,7 +483,7 @@ pub fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
         const page_off = src_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(src_va), false, false) catch return false;
-        const src_pa = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
+        const src_pa = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
         const physmap_addr = VAddr.fromPAddr(src_pa, null).addr + page_off;
         const src: [*]const u8 = @ptrFromInt(physmap_addr);
         @memcpy(buf[dst_off..][0..chunk], src[0..chunk]);

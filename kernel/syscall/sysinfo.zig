@@ -2,8 +2,8 @@
 //!
 //! Defines the observable `SysInfo` / `CoreInfo` types and implements
 //! `sysSysInfo`. All architecture-specific reads (current frequency,
-//! temperature, C-state) are delegated to `arch.getCoreFreq` /
-//! `arch.getCoreTemp` / `arch.getCoreState`; this file contains zero
+//! temperature, C-state) are delegated to `arch.sysinfo.getCoreFreq` /
+//! `arch.sysinfo.getCoreTemp` / `arch.sysinfo.getCoreState`; this file contains zero
 //! x86-specific state or MSR references.
 //!
 //! Public contract is in spec §2.15 (observable types and accounting
@@ -106,7 +106,7 @@ comptime {
 pub fn sysSysInfo(proc: *Process, info_ptr: u64, cores_ptr: u64) i64 {
     // §4.55.3: `info_ptr` must point to a writable region of
     // `sizeof(SysInfo)` bytes.
-    const core_count = arch.coreCount();
+    const core_count = arch.smp.coreCount();
     const info: SysInfo = .{
         .core_count = core_count,
         .mem_total = pmm.totalPageCount(),
@@ -161,9 +161,9 @@ pub fn sysSysInfo(proc: *Process, info_ptr: u64, cores_ptr: u64) i64 {
         entries[i] = .{
             .idle_ns = acct.idle_ns,
             .busy_ns = acct.busy_ns,
-            .freq_hz = arch.getCoreFreq(i),
-            .temp_mc = arch.getCoreTemp(i),
-            .c_state = arch.getCoreState(i),
+            .freq_hz = arch.sysinfo.getCoreFreq(i),
+            .temp_mc = arch.sysinfo.getCoreTemp(i),
+            .c_state = arch.sysinfo.getCoreState(i),
         };
         i += 1;
     }
@@ -227,7 +227,7 @@ fn probeUserWritable(proc: *Process, user_va: u64, len: u64) bool {
         const page_off = dst_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(dst_va), true, false) catch return false;
-        _ = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return false;
+        _ = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return false;
         dst_va += chunk;
         remaining -= chunk;
     }
@@ -250,7 +250,7 @@ fn writeUser(proc: *Process, user_va: u64, data: []const u8) bool {
         const page_off = dst_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(dst_va), true, false) catch return false;
-        const page_paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return false;
+        const page_paddr = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return false;
         const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
         const dst: [*]u8 = @ptrFromInt(physmap_addr);
         @memcpy(dst[0..chunk], data[src_off..][0..chunk]);

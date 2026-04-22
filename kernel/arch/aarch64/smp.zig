@@ -288,7 +288,7 @@ fn smpInitFull() !void {
     // a kernel VA (TTBR1 range) — walk the kernel page tables to find the PA
     // that PSCI needs for the entry_point argument.
     const entry_vaddr = @intFromPtr(&secondaryEntry);
-    const entry_page_paddr = arch.resolveVaddr(
+    const entry_page_paddr = arch.paging.resolveVaddr(
         memory_init.kernel_addr_space_root,
         VAddr.fromInt(entry_vaddr),
     ) orelse return;
@@ -302,7 +302,7 @@ fn smpInitFull() !void {
     // kernel page tables. This avoids relying on physmap VA→PA arithmetic
     // which may produce a PA the secondary can't read with MMU off.
     const params_vaddr = @intFromPtr(&boot_params_storage);
-    const params_page_paddr = arch.resolveVaddr(
+    const params_page_paddr = arch.paging.resolveVaddr(
         memory_init.kernel_addr_space_root,
         VAddr.fromInt(params_vaddr),
     ) orelse return;
@@ -368,7 +368,7 @@ fn smpInitFull() !void {
             };
             @memset(std.mem.asBytes(kpage), 0);
             const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
-            arch.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS) catch {
+            arch.paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS) catch {
                 pmm_iface.destroy(kpage);
                 map_ok = false;
                 break;
@@ -384,7 +384,7 @@ fn smpInitFull() !void {
 
         // Fill in per-core boot params. AArch64 requires 16-byte stack
         // alignment (AAPCS64, Section 6.2.2).
-        boot_params_storage.sp = arch.alignStack(ap_stack.top).addr;
+        boot_params_storage.sp = arch.paging.alignStack(ap_stack.top).addr;
         boot_params_storage.core_idx = core_idx;
 
         // Flush the updated params to main memory so the secondary can

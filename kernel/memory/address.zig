@@ -15,10 +15,10 @@ pub const KERNEL_STACK_SLOT_SIZE: u64 = (KERNEL_STACK_PAGES + 1) * PAGE4K;
 const KERNEL_STACKS_RESERVATION: u64 = std.mem.alignForward(u64, MAX_KERNEL_STACKS * KERNEL_STACK_SLOT_SIZE, PAGE1G);
 const SLAB_RESERVATION: u64 = 16 * 1024 * 1024;
 
-pub const AddrSpacePartition = arch.addr_space;
+pub const AddrSpacePartition = arch.paging.addr_space;
 
 pub const UserVA = struct {
-    pub const aslr: Range = arch.user_aslr;
+    pub const aslr: Range = arch.paging.user_aslr;
 };
 
 pub const KernelVA = struct {
@@ -158,4 +158,4 @@ pub const VAddr = extern struct {
     }
 };
 
-pub const alignStack = arch.alignStack;
+pub const alignStack = arch.paging.alignStack;

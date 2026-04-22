@@ -22,7 +22,7 @@ const vcpu_mod = kvm.vcpu;
 const vm_hw = zag.arch.aarch64.vm;
 const vm_mod = kvm.vm;
 
-const ArchCpuContext = zag.arch.dispatch.ArchCpuContext;
+const ArchCpuContext = zag.arch.dispatch.cpu.ArchCpuContext;
 const KernelObject = zag.perms.permissions.KernelObject;
 const PAddr = zag.memory.address.PAddr;
 const Process = zag.proc.process.Process;
@@ -139,13 +139,13 @@ fn deliverExit(vm_obj: *Vm, vcpu_obj: *VCpu, receiver: *Thread) void {
 
     while (receiver.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
 
-    const saved_args = arch.getSyscallArgs(receiver.ctx);
+    const saved_args = arch.syscall.getSyscallArgs(receiver.ctx);
     writeExitMessageToUser(owner, saved_args.arg1, handle_id, vcpu_obj);
 
-    arch.setSyscallReturn(receiver.ctx, handle_id);
+    arch.syscall.setSyscallReturn(receiver.ctx, handle_id);
 
     receiver.state = .ready;
-    const target_core = if (receiver.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+    const target_core = if (receiver.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
     sched.enqueueOnCore(target_core, receiver);
 }
 
@@ -256,13 +256,13 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
             const interrupt = std.mem.bytesAsValue(vm_hw.GuestInterrupt, action_buf[8..][0..@sizeOf(vm_hw.GuestInterrupt)]).*;
             // No vector-rejection check: GICv3 §2.2.1 makes every INTID
             // (0..1019) a legitimate injection target.
-            arch.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
+            arch.vm.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
             vcpu_obj.storeState(.running);
             resumeVcpuThread(thread);
         },
         2 => {
             const exception = std.mem.bytesAsValue(vm_hw.GuestException, action_buf[8..][0..@sizeOf(vm_hw.GuestException)]).*;
-            arch.vmInjectException(&vcpu_obj.guest_state, exception);
+            arch.vm.vmInjectException(&vcpu_obj.guest_state, exception);
             vcpu_obj.storeState(.running);
             resumeVcpuThread(thread);
         },
@@ -320,7 +320,7 @@ fn writeExitMessageToUser(proc: *Process, buf_ptr: u64, handle_id: u64, vcpu_obj
     while (remaining > 0) {
         const page_off = dst_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
-        const dst_pa = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return;
+        const dst_pa = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return;
         const physmap_addr = VAddr.fromPAddr(dst_pa, null).addr + page_off;
         const dst: [*]u8 = @ptrFromInt(physmap_addr);
         @memcpy(dst[0..chunk], msg_bytes[src_off..][0..chunk]);
@@ -342,7 +342,7 @@ fn readUserBytes(proc: *Process, user_va: u64, buf: []u8) bool {
         const page_off = src_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(src_va), false, false) catch return false;
-        const src_pa = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
+        const src_pa = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
         const physmap_addr = VAddr.fromPAddr(src_pa, null).addr + page_off;
         const src: [*]const u8 = @ptrFromInt(physmap_addr);
         @memcpy(buf[dst_off..][0..chunk], src[0..chunk]);
@@ -363,7 +363,7 @@ fn vcpuIndex(vm_obj: *Vm, vcpu_obj: *VCpu) ?u32 {
 fn resumeVcpuThread(thread: *Thread) void {
     while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
     thread.state = .ready;
-    const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+    const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
     sched.enqueueOnCore(target_core, thread);
 }
 

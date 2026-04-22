@@ -116,9 +116,9 @@ pub fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_a
         }
     }
     const user_bytes: [*]const u8 = @ptrFromInt(elf_ptr);
-    arch.userAccessBegin();
+    arch.interrupts.userAccessBegin();
     @memcpy(elf_copy, user_bytes[0..elf_len]);
-    arch.userAccessEnd();
+    arch.interrupts.userAccessEnd();
 
     const child = Process.create(elf_copy, child_perms, proc, thr_rights, child_max_priority) catch |e| return switch (e) {
         error.InvalidElf => E_INVAL,
@@ -147,7 +147,7 @@ pub fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_a
         return E_MAXCAP;
     };
 
-    sched.enqueueOnCore(arch.coreID(), child.threads[0]);
+    sched.enqueueOnCore(arch.smp.coreID(), child.threads[0]);
     return @intCast(handle_id);
 }
 

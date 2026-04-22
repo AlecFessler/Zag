@@ -13,7 +13,7 @@
 //! carrying the interrupted RIP, then walks the kernel frame-pointer
 //! chain to emit up to `MAX_FRAMES` `sample_frame` records carrying
 //! the saved return address at each level with a 1-based depth in
-//! `arg`. All unwind reads go through `arch.readKernelU64Safe`, so
+//! `arg`. All unwind reads go through `arch.pmu.readKernelU64Safe`, so
 //! the handler never faults: a malformed / non-canonical / unaligned
 //! frame pointer simply terminates the walk early.
 //!
@@ -46,11 +46,11 @@ pub const MAX_FRAMES: usize = 32;
 
 /// Program PMC 0 on this core for cycle-overflow sampling and set the
 /// LAPIC LVT PerfMon entry to NMI delivery. Called from
-/// `sched.perCoreInit` after `arch.pmuPerCoreInit` so the per-thread
+/// `sched.perCoreInit` after `arch.pmu.pmuPerCoreInit` so the per-thread
 /// user PMU plumbing has finished laying claim to the LVT entry.
 pub fn perCoreInit() void {
     if (comptime !mode.sample_enabled) return;
-    arch.kprofSamplePerCoreInit(SAMPLE_PERIOD_CYCLES);
+    arch.pmu.kprofSamplePerCoreInit(SAMPLE_PERIOD_CYCLES);
 }
 
 /// Called from the NMI exception handler. Returns true if this NMI
@@ -67,9 +67,9 @@ pub fn perCoreInit() void {
 /// by emitting no frame records.
 pub fn onNmi(ip: u64, fp: u64) bool {
     if (comptime !mode.sample_enabled) return false;
-    if (!arch.kprofSampleCheckAndRearm(SAMPLE_PERIOD_CYCLES)) return false;
+    if (!arch.pmu.kprofSampleCheckAndRearm(SAMPLE_PERIOD_CYCLES)) return false;
 
-    const cpu: u8 = @truncate(arch.coreID());
+    const cpu: u8 = @truncate(arch.smp.coreID());
 
     // Leaf sample: interrupted RIP. Record is the short (32 B)
     // variant under sample mode — the counter fields only exist
@@ -77,7 +77,7 @@ pub fn onNmi(ip: u64, fp: u64) bool {
     // `sample_enabled`, so the struct literal below matches the
     // Record layout exactly for this build.
     log.emit(.{
-        .tsc = arch.rdtscp(),
+        .tsc = arch.time.rdtscp(),
         .kind = @intFromEnum(Kind.sample),
         .cpu = cpu,
         ._pad = 0,
@@ -92,7 +92,7 @@ pub fn onNmi(ip: u64, fp: u64) bool {
     //   *(fp + 0) = previous saved frame pointer
     //   *(fp + 8) = return address into the caller
     //
-    // Every dereference goes through `arch.readKernelU64Safe`, which
+    // Every dereference goes through `arch.pmu.readKernelU64Safe`, which
     // rejects null, unaligned, and non-kernel-half addresses. That is
     // sufficient defense — Zag maps the entire kernel half on boot
     // and never unmaps it at runtime, so any address passing those
@@ -101,12 +101,12 @@ pub fn onNmi(ip: u64, fp: u64) bool {
     var prev_fp: u64 = 0;
     var depth: u64 = 1;
     while (depth <= MAX_FRAMES) {
-        const next_fp = arch.readKernelU64Safe(cur_fp) orelse break;
-        const ra = arch.readKernelU64Safe(cur_fp + 8) orelse break;
+        const next_fp = arch.pmu.readKernelU64Safe(cur_fp) orelse break;
+        const ra = arch.pmu.readKernelU64Safe(cur_fp + 8) orelse break;
         if (ra == 0) break;
 
         log.emit(.{
-            .tsc = arch.rdtscp(),
+            .tsc = arch.time.rdtscp(),
             .kind = @intFromEnum(Kind.sample_frame),
             .cpu = cpu,
             ._pad = 0,

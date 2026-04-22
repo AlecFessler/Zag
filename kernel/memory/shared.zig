@@ -65,7 +65,7 @@ pub const SharedMemory = struct {
         const alloc_size = @as(u64, rounded_pages) * paging.PAGE4K;
 
         const shm = allocator.create(SharedMemory) catch {
-            arch.print("K: SHM slab alloc fail\n", .{});
+            arch.boot.print("K: SHM slab alloc fail\n", .{});
             return error.OutOfMemory;
         };
         errdefer allocator.destroy(shm);
@@ -78,7 +78,7 @@ pub const SharedMemory = struct {
             @returnAddress(),
         ) orelse {
             global.lock.unlockIrqRestore(irq);
-            arch.print("K: SHM buddy alloc fail pages={d}\n", .{rounded_pages});
+            arch.boot.print("K: SHM buddy alloc fail pages={d}\n", .{rounded_pages});
             return error.OutOfMemory;
         };
         global.lock.unlockIrqRestore(irq);

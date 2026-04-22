@@ -239,8 +239,8 @@ pub fn prepareThreadContext(
 /// pointer), then executes ERET.
 pub fn switchTo(thread: *Thread) noreturn {
     const new_root = thread.process.addr_space_root;
-    if (new_root.addr != arch.getAddrSpaceRoot().addr) {
-        arch.swapAddrSpace(new_root, thread.process.addr_space_id);
+    if (new_root.addr != arch.paging.getAddrSpaceRoot().addr) {
+        arch.paging.swapAddrSpace(new_root, thread.process.addr_space_id);
     }
 
     // Lazy FPU: CPACR_EL1.FPEN should trap iff `thread` isn't the
@@ -257,7 +257,7 @@ pub fn switchTo(thread: *Thread) noreturn {
     // open, so no migration flush is needed either.
     if (comptime fpu.lazy_enabled) {
         fpu.migrateFlush(thread);
-        const cid: u8 = @truncate(arch.coreID());
+        const cid: u8 = @truncate(arch.smp.coreID());
         const desired_armed = (scheduler.last_fpu_owner[cid] != thread);
         if (desired_armed != scheduler.fpu_trap_armed[cid]) {
             if (desired_armed) cpu.fpuArmTrap() else cpu.fpuClearTrap();
@@ -336,7 +336,7 @@ pub fn switchTo(thread: *Thread) noreturn {
 /// Convert an ArchCpuContext into the arch-neutral FaultRegSnapshot.
 /// ARM ARM D13.2.36: ELR_EL1 is the faulting instruction pointer.
 /// ARM ARM D13.2.127: SPSR_EL1 is the saved processor state (flags equivalent).
-pub fn serializeFaultRegs(ctx: *const ArchCpuContext) arch.FaultRegSnapshot {
+pub fn serializeFaultRegs(ctx: *const ArchCpuContext) arch.cpu.FaultRegSnapshot {
     const r = &ctx.regs;
     return .{
         .ip = ctx.elr_el1,
@@ -353,7 +353,7 @@ pub fn serializeFaultRegs(ctx: *const ArchCpuContext) arch.FaultRegSnapshot {
 
 /// Apply a modified register snapshot back to a faulted thread's context.
 /// Reverse of serializeFaultRegs.
-pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: arch.FaultRegSnapshot) void {
+pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: arch.cpu.FaultRegSnapshot) void {
     ctx.elr_el1 = snapshot.ip;
     ctx.spsr_el1 = snapshot.flags;
     ctx.sp_el0 = snapshot.sp;

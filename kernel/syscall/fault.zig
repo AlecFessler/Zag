@@ -10,7 +10,7 @@ const paging = zag.memory.paging;
 const process_mod = zag.proc.process;
 const sched = zag.sched.scheduler;
 
-const ArchCpuContext = zag.arch.dispatch.ArchCpuContext;
+const ArchCpuContext = zag.arch.dispatch.cpu.ArchCpuContext;
 const Process = zag.proc.process.Process;
 const SyscallResult = zag.syscall.dispatch.SyscallResult;
 const Thread = zag.sched.thread.Thread;
@@ -25,7 +25,7 @@ const E_NOENT = errors.E_NOENT;
 const E_OK = errors.E_OK;
 const E_PERM = errors.E_PERM;
 
-/// FaultMessage userspace layout (arch.fault_msg_size bytes). Stable wire
+/// FaultMessage userspace layout (arch.cpu.fault_msg_size bytes). Stable wire
 /// format shared with libz.FaultMessage:
 ///   0   process_handle: u64    handle ID of source process in handler's table
 ///   8   thread_handle:  u64    handle ID of faulting thread in handler's table
@@ -36,8 +36,8 @@ const E_PERM = errors.E_PERM;
 ///   40  flags:          u64    flags register (RFLAGS / SPSR_EL1)
 ///   48  sp:             u64    stack pointer
 ///   56  gprs:           N×u64  GPR snapshot (15 on x86-64, 31 on aarch64)
-const fault_msg_size = arch.fault_msg_size;
-const fault_regs_size = arch.fault_regs_size;
+const fault_msg_size = arch.cpu.fault_msg_size;
+const fault_regs_size = arch.cpu.fault_regs_size;
 
 /// Build a FaultMessage in a temporary kernel buffer.
 fn buildFaultMessage(process_handle: u64, thread_handle: u64, faulted: *Thread) [fault_msg_size]u8 {
@@ -51,7 +51,7 @@ fn buildFaultMessage(process_handle: u64, thread_handle: u64, faulted: *Thread) 
     // FAULT_RESUME_MODIFIED will write through) rather than `faulted.ctx`,
     // which on aarch64 points at the nested SGI frame from `yield()`.
     const regs_src = faulted.fault_user_ctx orelse faulted.ctx;
-    const snap = arch.serializeFaultRegs(regs_src);
+    const snap = arch.cpu.serializeFaultRegs(regs_src);
     @as(*align(1) u64, @ptrCast(&buf[32])).* = snap.ip;
     @as(*align(1) u64, @ptrCast(&buf[40])).* = snap.flags;
     @as(*align(1) u64, @ptrCast(&buf[48])).* = snap.sp;
@@ -83,7 +83,7 @@ fn writeFaultMessage(proc: *Process, buf_ptr: u64, process_handle: u64, thread_h
         // shared/MMIO node, which we simply skip (matching the pre-fix
         // behavior of silently writing into wrong memory).
         proc.vmm.demandPage(VAddr.fromInt(dst_va), true, false) catch {};
-        if (arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va))) |page_paddr| {
+        if (arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va))) |page_paddr| {
             const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
             const dst: [*]u8 = @ptrFromInt(physmap_addr);
             @memcpy(dst[0..chunk], msg[src_off..][0..chunk]);
@@ -204,8 +204,8 @@ pub fn sysFaultRecv(ctx: *ArchCpuContext, buf_ptr: u64, blocking: u64) SyscallRe
 fn applyModifiedRegs(dst: *Thread, src_ptr: u64) void {
     const target = dst.fault_user_ctx orelse return;
     const buf: [*]const u8 = @ptrFromInt(src_ptr);
-    arch.userAccessBegin();
-    var snapshot: arch.FaultRegSnapshot = undefined;
+    arch.interrupts.userAccessBegin();
+    var snapshot: arch.cpu.FaultRegSnapshot = undefined;
     snapshot.ip = @as(*align(1) const u64, @ptrCast(buf + 0)).*;
     snapshot.flags = @as(*align(1) const u64, @ptrCast(buf + 8)).*;
     snapshot.sp = @as(*align(1) const u64, @ptrCast(buf + 16)).*;
@@ -214,8 +214,8 @@ fn applyModifiedRegs(dst: *Thread, src_ptr: u64) void {
         gpr.* = @as(*align(1) const u64, @ptrCast(buf + off)).*;
         off += 8;
     }
-    arch.userAccessEnd();
-    arch.applyFaultRegs(target, snapshot);
+    arch.interrupts.userAccessEnd();
+    arch.cpu.applyFaultRegs(target, snapshot);
 }
 
 const fault_kill: u64 = 0;
@@ -230,7 +230,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
     if (action > fault_resume_modified) return E_INVAL;
 
     const proc = sched.currentProc();
-    const flags = arch.getIpcMetadata(ctx);
+    const flags = arch.syscall.getIpcMetadata(ctx);
 
     // §2.12.22: both exclude bits set is invalid.
     if ((flags & fault_exclude_next) != 0 and (flags & fault_exclude_permanent) != 0) {
@@ -335,7 +335,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
         while (i < src.num_threads) {
             const t = src.threads[i];
             if ((sib_mask & (@as(u64, 1) << @intCast(t.slot_index))) != 0) {
-                const target_core = if (t.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+                const target_core = if (t.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
                 sched.enqueueOnCore(target_core, t);
             }
             i += 1;
@@ -391,7 +391,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
             src.faulted_thread_slots &= ~faulted_bit;
             src.lock.unlock();
 
-            const target_core = if (pending.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.coreID();
+            const target_core = if (pending.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
             sched.enqueueOnCore(target_core, pending);
         },
         else => unreachable,
@@ -433,8 +433,8 @@ pub fn sysFaultReadMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64
         const chunk = @min(remaining, paging.PAGE4K - page_offset);
         target.vmm.demandPage(VAddr.fromInt(src_addr), false, false) catch {};
         proc.vmm.demandPage(VAddr.fromInt(dst_addr), true, false) catch {};
-        const src_paddr = arch.resolveVaddr(target.addr_space_root, VAddr.fromInt(src_addr)) orelse return E_BADADDR;
-        const dst_paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_addr)) orelse return E_BADADDR;
+        const src_paddr = arch.paging.resolveVaddr(target.addr_space_root, VAddr.fromInt(src_addr)) orelse return E_BADADDR;
+        const dst_paddr = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_addr)) orelse return E_BADADDR;
         const src_phys = VAddr.fromPAddr(src_paddr, null).addr + page_offset;
         const dst_page_off = dst_addr & 0xFFF;
         const dst_phys = VAddr.fromPAddr(dst_paddr, null).addr + dst_page_off;
@@ -490,25 +490,25 @@ pub fn sysFaultWriteMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i6
         const chunk = @min(remaining, paging.PAGE4K - page_offset);
         target.vmm.demandPage(VAddr.fromInt(dst_addr), true, false) catch {};
         proc.vmm.demandPage(VAddr.fromInt(src_addr), false, false) catch {};
-        const page_paddr = arch.resolveVaddr(target.addr_space_root, VAddr.fromInt(dst_addr)) orelse return E_BADADDR;
+        const page_paddr = arch.paging.resolveVaddr(target.addr_space_root, VAddr.fromInt(dst_addr)) orelse return E_BADADDR;
         const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_offset;
         const src: [*]const u8 = @ptrFromInt(src_addr);
         const dst: [*]u8 = @ptrFromInt(physmap_addr);
         // `dst` is a kernel physmap address; only `src` is a raw user VA,
         // so the SMAP window only needs to cover the read side of the copy.
-        arch.userAccessBegin();
+        arch.interrupts.userAccessBegin();
         @memcpy(dst[0..chunk], src[0..chunk]);
-        arch.userAccessEnd();
+        arch.interrupts.userAccessEnd();
         // Push the just-written cache lines to PoU so a subsequent
         // I-cache invalidate makes them visible to instruction fetch.
-        arch.cleanDcacheToPou(physmap_addr, chunk);
+        arch.boot.cleanDcacheToPou(physmap_addr, chunk);
         remaining -= chunk;
         dst_addr += chunk;
         src_addr += chunk;
     }
     // Broadcast I-cache invalidate so the target core re-fetches the
     // patched bytes on the next fault-resume. ARM ARM B2.4.6.
-    arch.syncInstructionCache();
+    arch.boot.syncInstructionCache();
 
     return E_OK;
 }

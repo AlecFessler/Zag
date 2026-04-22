@@ -63,7 +63,7 @@ fn detectVendor() Vendor {
 
 /// BSP PMU bring-up. Detects vendor, delegates to the appropriate backend
 /// for CPUID probing and PMI vector wiring. Called from `kMain` between
-/// `arch.vmInit()` and `sched.globalInit()`.
+/// `arch.vm.vmInit()` and `sched.globalInit()`.
 pub fn pmuInit() void {
     switch (detectVendor()) {
         .intel => {

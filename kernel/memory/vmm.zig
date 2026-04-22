@@ -367,7 +367,7 @@ pub const VirtualMemoryManager = struct {
         @memset(std.mem.asBytes(top_page), 0);
         const top_phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(top_page)), null);
         const stack_perms = rightsToMemPerms(.{ .read = true, .write = true }, .user);
-        arch.mapPage(self.addr_space_root, top_phys, top_page_va, stack_perms) catch {
+        arch.paging.mapPage(self.addr_space_root, top_phys, top_page_va, stack_perms) catch {
             pmm_iface.destroy(top_page);
             return error.OutOfMemory;
         };
@@ -424,7 +424,7 @@ pub const VirtualMemoryManager = struct {
         // pre-fault loop that handles both demand-paged private sources and
         // SHM-backed ELF sources).
         const page_base = VAddr.fromInt(std.mem.alignBackward(u64, fault_vaddr.addr, paging.PAGE4K));
-        if (arch.resolveVaddr(self.addr_space_root, page_base) != null) return;
+        if (arch.paging.resolveVaddr(self.addr_space_root, page_base) != null) return;
 
         if (node.kind != .private) return error.NotDemandPageable;
 
@@ -435,7 +435,7 @@ pub const VirtualMemoryManager = struct {
         const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
         const perms = rightsToMemPerms(node.rights, .user);
 
-        arch.mapPage(self.addr_space_root, phys, page_base, perms) catch {
+        arch.paging.mapPage(self.addr_space_root, phys, page_base, perms) catch {
             pmm_iface.destroy(page);
             return error.OutOfMemory;
         };
@@ -540,10 +540,10 @@ pub const VirtualMemoryManager = struct {
             var i: usize = 0;
             while (i < shm.num_pages) : (i += 1) {
                 const page_virt = VAddr.fromInt(range_start.addr + @as(u64, i) * paging.PAGE4K);
-                arch.mapPage(self.addr_space_root, shm.pageAddr(i), page_virt, perms) catch {
+                arch.paging.mapPage(self.addr_space_root, shm.pageAddr(i), page_virt, perms) catch {
                     var j: usize = 0;
                     while (j < i) {
-                        _ = arch.unmapPage(self.addr_space_root, VAddr.fromInt(range_start.addr + @as(u64, j) * paging.PAGE4K));
+                        _ = arch.paging.unmapPage(self.addr_space_root, VAddr.fromInt(range_start.addr + @as(u64, j) * paging.PAGE4K));
                         j += 1;
                     }
                     self.removeNodeLocked(map_node);
@@ -713,10 +713,10 @@ pub const VirtualMemoryManager = struct {
             while (mapped < range_size) {
                 const page_phys = PAddr.fromInt(device.access.mmio.phys_base.addr + mapped);
                 const page_virt = VAddr.fromInt(range_start.addr + mapped);
-                arch.mapPage(self.addr_space_root, page_phys, page_virt, perms) catch {
+                arch.paging.mapPage(self.addr_space_root, page_phys, page_virt, perms) catch {
                     var undo: u64 = 0;
                     while (undo < mapped) {
-                        _ = arch.unmapPage(self.addr_space_root, VAddr.fromInt(range_start.addr + undo));
+                        _ = arch.paging.unmapPage(self.addr_space_root, VAddr.fromInt(range_start.addr + undo));
                         undo += paging.PAGE4K;
                     }
                     self.removeNodeLocked(map_node);
@@ -991,7 +991,7 @@ pub const VirtualMemoryManager = struct {
         const hi = lowerBoundIdx(s, range_end_addr);
         var i: usize = lo;
         while (i < hi) : (i += 1) {
-            if (arch.resolveVaddr(self.addr_space_root, s[i].start) != null) return true;
+            if (arch.paging.resolveVaddr(self.addr_space_root, s[i].start) != null) return true;
         }
         return false;
     }
@@ -1021,7 +1021,7 @@ fn unmapNodePages(node: *VmNode, addr_space_root: PAddr, free_phys: bool) void {
     const pmm_iface = pmm.global_pmm.?.allocator();
     var page_addr = node.start.addr;
     while (page_addr < node.end()) {
-        if (arch.unmapPage(addr_space_root, VAddr.fromInt(page_addr))) |paddr| {
+        if (arch.paging.unmapPage(addr_space_root, VAddr.fromInt(page_addr))) |paddr| {
             if (free_phys and node.kind == .private) {
                 const page: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
                 pmm_iface.destroy(page);
@@ -1043,7 +1043,7 @@ fn updateCommittedPages(
         const pmm_iface = pmm.global_pmm.?.allocator();
         var page_addr = node.start.addr;
         while (page_addr < node.end()) {
-            if (arch.unmapPage(addr_space_root, VAddr.fromInt(page_addr))) |paddr| {
+            if (arch.paging.unmapPage(addr_space_root, VAddr.fromInt(page_addr))) |paddr| {
                 if (node.kind == .private) {
                     const page: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
                     pmm_iface.destroy(page);
@@ -1058,8 +1058,8 @@ fn updateCommittedPages(
     var page_addr = node.start.addr;
     while (page_addr < node.end()) {
         const vaddr = VAddr.fromInt(page_addr);
-        if (arch.resolveVaddr(addr_space_root, vaddr) != null) {
-            arch.updatePagePerms(addr_space_root, vaddr, perms);
+        if (arch.paging.resolveVaddr(addr_space_root, vaddr) != null) {
+            arch.paging.updatePagePerms(addr_space_root, vaddr, perms);
         }
         page_addr += paging.PAGE4K;
     }

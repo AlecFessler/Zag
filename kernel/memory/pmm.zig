@@ -69,11 +69,11 @@ pub const PhysicalMemoryManager = struct {
         const self: *PhysicalMemoryManager = @ptrCast(@alignCast(ptr));
 
         if (len == paging.PAGE4K and sched.initialized) {
-            const irq = arch.saveAndDisableInterrupts();
-            const cache = &page_caches[arch.coreID()];
+            const irq = arch.interrupts.saveAndDisableInterrupts();
+            const cache = &page_caches[arch.smp.coreID()];
 
             if (cache.pop()) |page| {
-                arch.restoreInterrupts(irq);
+                arch.interrupts.restoreInterrupts(irq);
                 return page;
             }
 
@@ -86,7 +86,7 @@ pub const PhysicalMemoryManager = struct {
             ) orelse {
                 const single = self.backing_allocator.rawAlloc(len, alignment, ret_addr);
                 self.lock.unlock();
-                arch.restoreInterrupts(irq);
+                arch.interrupts.restoreInterrupts(irq);
                 return single;
             };
 
@@ -99,7 +99,7 @@ pub const PhysicalMemoryManager = struct {
             }
 
             const result = cache.pop().?;
-            arch.restoreInterrupts(irq);
+            arch.interrupts.restoreInterrupts(irq);
             return result;
         }
 
@@ -117,14 +117,14 @@ pub const PhysicalMemoryManager = struct {
         const self: *PhysicalMemoryManager = @ptrCast(@alignCast(ptr));
 
         // only touch per core cache if the scheduler has been fully initialized (ie, system is fully booted)
-        // otherwise arch.coreID() will access an array that is undefined
+        // otherwise arch.smp.coreID() will access an array that is undefined
         if (buf.len == paging.PAGE4K and sched.initialized) {
-            const irq = arch.saveAndDisableInterrupts();
-            const cache = &page_caches[arch.coreID()];
+            const irq = arch.interrupts.saveAndDisableInterrupts();
+            const cache = &page_caches[arch.smp.coreID()];
 
             if (cache.count < CACHE_MAX_PAGES) {
                 cache.push(buf.ptr);
-                arch.restoreInterrupts(irq);
+                arch.interrupts.restoreInterrupts(irq);
                 return;
             }
 
@@ -142,7 +142,7 @@ pub const PhysicalMemoryManager = struct {
             self.lock.unlock();
 
             cache.push(buf.ptr);
-            arch.restoreInterrupts(irq);
+            arch.interrupts.restoreInterrupts(irq);
             return;
         }
 

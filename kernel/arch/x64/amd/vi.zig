@@ -276,7 +276,7 @@ pub fn init(reg_base_phys: PAddr) !void {
     while (i < num_mmio_pages) {
         const page_phys = PAddr.fromInt(reg_base_phys.addr + @as(u64, i) * paging.PAGE4K);
         const page_virt = VAddr.fromPAddr(page_phys, null);
-        arch.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS) catch {
+        arch.paging.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS) catch {
             i += 1;
             continue;
         };

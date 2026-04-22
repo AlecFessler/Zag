@@ -15,7 +15,7 @@ const system = zag.syscall.system;
 const thread = zag.syscall.thread;
 const vm = zag.syscall.vm;
 
-const ArchCpuContext = zag.arch.dispatch.ArchCpuContext;
+const ArchCpuContext = zag.arch.dispatch.cpu.ArchCpuContext;
 
 const E_INVAL = errors.E_INVAL;
 
@@ -100,7 +100,7 @@ pub const SyscallNum = enum(u64) {
 pub fn dispatch(ctx: *ArchCpuContext) SyscallResult {
     kprof.enter(.syscall_dispatch);
     defer kprof.exit(.syscall_dispatch);
-    const args = zag.arch.dispatch.getSyscallArgs(ctx);
+    const args = zag.arch.dispatch.syscall.getSyscallArgs(ctx);
     const arg0 = args.arg0;
     const arg1 = args.arg1;
     const arg2 = args.arg2;

@@ -98,9 +98,9 @@ pub const PmuSample = extern struct {
 // ── PmuStateAllocator (slab) ────────────────────────────────────────────
 
 /// Lazily-allocated per-thread PMU state. Chunk size matches the other
-/// per-thread slabs (64). `arch.PmuState` is the arch-dispatched type
+/// per-thread slabs (64). `arch.pmu.PmuState` is the arch-dispatched type
 /// (empty stub on aarch64, ~200 B on x64).
-pub const PmuStateAllocator = slab_alloc.SlabAllocator(arch.PmuState, false, 0, 64, true);
+pub const PmuStateAllocator = slab_alloc.SlabAllocator(arch.pmu.PmuState, false, 0, 64, true);
 
 pub var allocator: std.mem.Allocator = undefined;
 var slab_instance: PmuStateAllocator = undefined;
@@ -114,7 +114,7 @@ pub fn initSlab(backing_allocator: std.mem.Allocator) !void {
 
 /// §4.50 pmu_info(info_ptr). No rights checks (§4.50.2).
 pub fn sysPmuInfo(proc: *Process, info_ptr: u64) i64 {
-    const info = arch.pmuGetInfo();
+    const info = arch.pmu.pmuGetInfo();
     var buf: [@sizeOf(PmuInfo)]u8 = undefined;
     @memcpy(&buf, std.mem.asBytes(&info));
     if (!writeUser(proc, info_ptr, &buf)) return E_BADADDR;
@@ -128,7 +128,7 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     const target_thread = lookupThread(proc, thread_handle) orelse return E_BADCAP;
     defer target_thread.releaseRef();
 
-    var configs: [arch.pmu_max_counters]PmuCounterConfig = undefined;
+    var configs: [arch.pmu.pmu_max_counters]PmuCounterConfig = undefined;
     const slice = readConfigs(proc, configs_ptr, count, &configs) catch |err| return configErrToCode(err);
 
     const target_proc = target_thread.process;
@@ -153,16 +153,16 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
 
     // Allocate PMU state lazily on first start (§2.14.8).
     if (target_thread.pmu_state == null) {
-        const new_state = allocator.create(arch.PmuState) catch return E_NOMEM;
+        const new_state = allocator.create(arch.pmu.PmuState) catch return E_NOMEM;
         new_state.* = .{};
         target_thread.pmu_state = new_state;
     }
     const state = target_thread.pmu_state.?;
 
     if (is_self) {
-        arch.pmuStart(state, slice) catch return E_INVAL;
+        arch.pmu.pmuStart(state, slice) catch return E_INVAL;
     } else {
-        arch.pmuConfigureState(state, slice);
+        arch.pmu.pmuConfigureState(state, slice);
     }
     return E_OK;
 }
@@ -187,8 +187,8 @@ pub fn sysPmuRead(proc: *Process, thread_handle: u64, sample_ptr: u64) i64 {
     const state = target_thread.pmu_state orelse return E_INVAL; // §4.52.6
 
     var sample: PmuSample = .{};
-    arch.pmuRead(state, &sample);
-    sample.timestamp = arch.getMonotonicClock().now();
+    arch.pmu.pmuRead(state, &sample);
+    sample.timestamp = arch.time.getMonotonicClock().now();
 
     var buf: [@sizeOf(PmuSample)]u8 = undefined;
     @memcpy(&buf, std.mem.asBytes(&sample));
@@ -203,7 +203,7 @@ pub fn sysPmuReset(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     const target_thread = lookupThread(proc, thread_handle) orelse return E_BADCAP;
     defer target_thread.releaseRef();
 
-    var configs: [arch.pmu_max_counters]PmuCounterConfig = undefined;
+    var configs: [arch.pmu.pmu_max_counters]PmuCounterConfig = undefined;
     const slice = readConfigs(proc, configs_ptr, count, &configs) catch |err| return configErrToCode(err);
 
     const target_proc = target_thread.process;
@@ -221,9 +221,9 @@ pub fn sysPmuReset(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     // fault box and we're the profiler. Branch so the hardware-programming
     // path only runs when the target really is on this core.
     if (target_thread == scheduler.currentThread()) {
-        arch.pmuReset(state, slice) catch return E_INVAL;
+        arch.pmu.pmuReset(state, slice) catch return E_INVAL;
     } else {
-        arch.pmuConfigureState(state, slice);
+        arch.pmu.pmuConfigureState(state, slice);
     }
     return E_OK;
 }
@@ -259,9 +259,9 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
     const state = target_thread.pmu_state orelse return E_INVAL; // §4.54.5
 
     if (is_self) {
-        arch.pmuStop(state);
+        arch.pmu.pmuStop(state);
     } else {
-        arch.pmuClearState(state);
+        arch.pmu.pmuClearState(state);
     }
     target_thread.pmu_state = null;
     allocator.destroy(state);
@@ -333,7 +333,7 @@ fn readConfigs(
     // `num_counters <= MAX_COUNTERS`), so §4.51.6 E_INVAL applies.
     if (count > out_buf.len) return ConfigReadError.Invalid; // §4.51.6
 
-    const info = arch.pmuGetInfo();
+    const info = arch.pmu.pmuGetInfo();
     if (count > info.num_counters) return ConfigReadError.Invalid; // §4.51.6
 
     // §4.51.7 / §4.51.8: per-entry validation.
@@ -378,7 +378,7 @@ fn readUser(proc: *Process, user_va: u64, buf: []u8) bool {
         const page_off = src_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(src_va), false, false) catch return false;
-        const page_paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
+        const page_paddr = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
         const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
         const src: [*]const u8 = @ptrFromInt(physmap_addr);
         @memcpy(buf[dst_off..][0..chunk], src[0..chunk]);
@@ -403,7 +403,7 @@ fn writeUser(proc: *Process, user_va: u64, data: []const u8) bool {
         const page_off = dst_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(dst_va), true, false) catch return false;
-        const page_paddr = arch.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return false;
+        const page_paddr = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return false;
         const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
         const dst: [*]u8 = @ptrFromInt(physmap_addr);
         @memcpy(dst[0..chunk], data[src_off..][0..chunk]);

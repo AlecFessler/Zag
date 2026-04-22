@@ -60,7 +60,7 @@ fn mapDeviceRange(phys_start: u64, length: u64) !u64 {
     const end_aligned = std.mem.alignForward(u64, phys_start + length, page);
     var pa: u64 = start_aligned;
     while (pa < end_aligned) {
-        try arch.mapPage(
+        try arch.paging.mapPage(
             memory_init.kernel_addr_space_root,
             PAddr.fromInt(pa),
             VAddr.fromPAddr(PAddr.fromInt(pa), null),
@@ -465,7 +465,7 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
     // QEMU `virt` exposes a PL031 RTC at PA 0x09010000 but does not
     // advertise it through any ACPI table we currently parse. Map the
     // MMIO page as Device memory and install its physmap VA so
-    // `arch.readRtc()` returns a real wall-clock value. Physical
+    // `arch.time.readRtc()` returns a real wall-clock value. Physical
     // ARM platforms typically describe the RTC via the device tree or
     // SSDT; this hardcoded fallback targets the QEMU virt layout used
     // by the kernel test suite.
@@ -741,7 +741,7 @@ fn parseMadt(madt_virt: VAddr) !void {
 /// (the physmap only covers RAM reported as free/ACPI in the UEFI memory map),
 /// so we must explicitly map it as Device memory into the kernel address
 /// space root before handing its physmap VA to the serial driver. Without
-/// this, the first `arch.print` from a syscall (e.g. sysWrite) translation
+/// this, the first `arch.boot.print` from a syscall (e.g. sysWrite) translation
 /// faults on the upper-half VA and the kernel hangs in a nested exception
 /// loop.
 fn parseSpcr(spcr_virt: VAddr) void {

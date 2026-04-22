@@ -21,7 +21,7 @@ const PageAllocator = page_allocator.PageAllocator;
 const ParsedElf = zag.utils.elf.ParsedElf;
 const VAddr = zag.memory.address.VAddr;
 
-const KEntryType = fn (*BootInfo) callconv(zag.arch.dispatch.cc()) noreturn;
+const KEntryType = fn (*BootInfo) callconv(zag.arch.dispatch.cpu.cc()) noreturn;
 
 fn computeKaslrSlide(parsed_elf: *const ParsedElf) u64 {
     const link_base = address.AddrSpacePartition.kernel_code.start;
@@ -39,7 +39,7 @@ fn computeKaslrSlide(parsed_elf: *const ParsedElf) u64 {
     const slide_pages = max_slide / paging.PAGE4K;
 
     _ = slide_pages;
-    _ = arch.readTimestamp();
+    _ = arch.time.readTimestamp();
     return 0;
 }
 
@@ -95,7 +95,7 @@ fn applyKaslrRelocations(file_bytes: []u8, slide: u64) !void {
             if (rela.r_offset < target_base_addr) return error.InvalidElf;
             const file_off = target_base_file_offset + (rela.r_offset - target_base_addr);
 
-            switch (arch.classifyRelocation(rtype)) {
+            switch (arch.paging.classifyRelocation(rtype)) {
                 .skip => continue,
                 .abs64 => {
                     if (file_off + 8 > file_bytes.len) return error.InvalidElf;
@@ -194,8 +194,8 @@ pub fn main() uefi.Status {
         // On x86-64 (shared CR3): copy UEFI's identity-mapped table so the
         // bootloader keeps running from the same mappings.
         // On aarch64 (split TTBR0/TTBR1): start with a clean kernel table.
-        if (arch.kernel_shares_user_table) {
-            const current = arch.getKernelAddrSpaceRoot();
+        if (arch.paging.kernel_shares_user_table) {
+            const current = arch.paging.getKernelAddrSpaceRoot();
             const src = current.getPtr([*]u8);
             @memcpy(fresh, src[0..paging.PAGE4K]);
         } else {
@@ -203,7 +203,7 @@ pub fn main() uefi.Status {
         }
 
         const phys = PAddr.fromInt(@intFromPtr(fresh.ptr));
-        arch.setKernelAddrSpace(phys);
+        arch.paging.setKernelAddrSpace(phys);
         break :blk phys;
     };
 
@@ -219,7 +219,7 @@ pub fn main() uefi.Status {
         .global_perm = .global,
         .privilege_perm = .kernel,
     };
-    arch.mapPageBoot(
+    arch.paging.mapPageBoot(
         new_addr_space_root_virt,
         kernel_table_root_phys,
         new_addr_space_root_virt_physmapped,
@@ -324,7 +324,7 @@ pub fn main() uefi.Status {
             // goes to RAM). Linux arm64 does the same in head.S as
             // `dcache_clean_poc` over the loaded image. Pair this with
             // `syncInstructionCache` after the loop.
-            arch.cleanInvalidateDcacheRange(
+            arch.boot.cleanInvalidateDcacheRange(
                 @intFromPtr(page.ptr),
                 paging.PAGE4K,
             );
@@ -332,7 +332,7 @@ pub fn main() uefi.Status {
             const page_phys = PAddr.fromInt(@intFromPtr(page.ptr));
             const page_virt = VAddr.fromInt(current_vaddr);
 
-            arch.mapPageBoot(
+            arch.paging.mapPageBoot(
                 new_addr_space_root_virt,
                 page_phys,
                 page_virt,
@@ -349,7 +349,7 @@ pub fn main() uefi.Status {
     // code. On architectures with split I/D caches this is required
     // before branching into any newly written instructions — without
     // it the first fetch can decode stale cache bytes as garbage.
-    arch.syncInstructionCache();
+    arch.boot.syncInstructionCache();
 
     puts(dbg.sections_done);
     const xsdp_addr = boot_protocol.findXSDP() catch return .aborted;
@@ -396,7 +396,7 @@ pub fn main() uefi.Status {
             .privilege_perm = .kernel,
         };
 
-        arch.mapPageBoot(
+        arch.paging.mapPageBoot(
             new_addr_space_root_virt,
             current_page_phys,
             current_page_virt,
@@ -430,7 +430,7 @@ pub fn main() uefi.Status {
     // firmware activity that mapped the same page as Write-Back —
     // otherwise shadows the writes we just performed. Linux does the
     // same with `dcache_clean_poc` over the boot arguments in head.S.
-    arch.cleanInvalidateDcacheRange(
+    arch.boot.cleanInvalidateDcacheRange(
         @intFromPtr(boot_info),
         @sizeOf(BootInfo),
     );
@@ -449,19 +449,19 @@ pub fn main() uefi.Status {
     };
 
     // Clean boot_info again after the mmap field has been populated.
-    arch.cleanInvalidateDcacheRange(
+    arch.boot.cleanInvalidateDcacheRange(
         @intFromPtr(boot_info),
         @sizeOf(BootInfo),
     );
 
     // Final TLB flush after exitBootServices ensures all TTBR1 page table
     // entries are visible to the hardware walker before jumping to the kernel.
-    arch.setKernelAddrSpace(kernel_table_root_phys);
+    arch.paging.setKernelAddrSpace(kernel_table_root_phys);
 
     // Switch SP to kernel stack before calling kEntry. After exitBootServices,
     // the UEFI stack (loader_data) may be reclaimed — writing to it would
     // fault on KVM where memory is real hardware.
-    arch.switchStackAndCall(
+    arch.cpu.switchStackAndCall(
         aligned_stack_top_virt,
         @intFromPtr(boot_info),
         parsed_elf.entry.addr + kaslr_slide,

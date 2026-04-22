@@ -13,7 +13,7 @@ const stack_mod = zag.memory.stack;
 const FaultReason = zag.perms.permissions.FaultReason;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
-const PageFaultContext = zag.arch.dispatch.PageFaultContext;
+const PageFaultContext = zag.arch.dispatch.cpu.PageFaultContext;
 const VAddr = zag.memory.address.VAddr;
 
 const KERNEL_PERMS = MemoryPerms{
@@ -28,7 +28,7 @@ fn demandPageKernel(faulting_virt: VAddr) void {
     const page_base = VAddr.fromInt(std.mem.alignBackward(u64, faulting_virt.addr, paging.PAGE4K));
     const kroot = memory_init.kernel_addr_space_root;
 
-    if (arch.resolveVaddr(kroot, page_base) != null) return;
+    if (arch.paging.resolveVaddr(kroot, page_base) != null) return;
 
     const pmm_iface = pmm.global_pmm.?.allocator();
     const page = pmm_iface.create(paging.PageMem(.page4k)) catch
@@ -36,7 +36,7 @@ fn demandPageKernel(faulting_virt: VAddr) void {
     @memset(std.mem.asBytes(page), 0);
 
     const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
-    arch.mapPage(kroot, phys, page_base, KERNEL_PERMS) catch
+    arch.paging.mapPage(kroot, phys, page_base, KERNEL_PERMS) catch
         @panic("mapPage failed in kernel demand page fault");
 }
 
@@ -66,10 +66,10 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
 
     if (is_kernel_privilege and is_user_va) {
         const thread = scheduler.currentThread() orelse @panic("kernel page fault on user VA with no current thread");
-        arch.print("K: PAGEFAULT pid={d} addr=0x{x} w={} x={} rip=0x{x}\n", .{ thread.process.pid, fault.faulting_address, is_write, is_exec, fault.rip });
+        arch.boot.print("K: PAGEFAULT pid={d} addr=0x{x} w={} x={} rip=0x{x}\n", .{ thread.process.pid, fault.faulting_address, is_write, is_exec, fault.rip });
         thread.process.kill(accessReason(is_write, is_exec));
-        arch.enableInterrupts();
-        while (true) arch.halt();
+        arch.interrupts.enableInterrupts();
+        while (true) arch.cpu.halt();
     }
 
     if (is_kernel_privilege) {
@@ -88,7 +88,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
             return;
         }
 
-        arch.print("KERNEL PAGE FAULT at 0x{x} (write={} exec={})\n", .{ faulting_virt.addr, is_write, is_exec });
+        arch.boot.print("KERNEL PAGE FAULT at 0x{x} (write={} exec={})\n", .{ faulting_virt.addr, is_write, is_exec });
         @panic("unexpected kernel page fault");
     }
 
@@ -96,41 +96,41 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     const proc = thread.process;
 
     const node = proc.vmm.findNode(faulting_virt) orelse {
-        arch.print("K: USER_PF pid={d} addr=0x{x} w={} x={}\n", .{ proc.pid, faulting_virt.addr, is_write, is_exec });
+        arch.boot.print("K: USER_PF pid={d} addr=0x{x} w={} x={}\n", .{ proc.pid, faulting_virt.addr, is_write, is_exec });
         if (proc.faultBlock(thread, .unmapped_access, faulting_virt.addr, fault.rip, fault.user_ctx)) {
-            arch.enableInterrupts();
+            arch.interrupts.enableInterrupts();
             scheduler.yield();
             return;
         }
         proc.kill(.unmapped_access);
-        arch.enableInterrupts();
-        while (true) arch.halt();
+        arch.interrupts.enableInterrupts();
+        while (true) arch.cpu.halt();
     };
 
     switch (node.kind) {
         .shared_memory, .mmio => {
             const r = accessReason(is_write, is_exec);
             if (proc.faultBlock(thread, r, faulting_virt.addr, fault.rip, fault.user_ctx)) {
-                arch.enableInterrupts();
+                arch.interrupts.enableInterrupts();
                 scheduler.yield();
                 return;
             }
             proc.kill(r);
-            arch.enableInterrupts();
-            while (true) arch.halt();
+            arch.interrupts.enableInterrupts();
+            while (true) arch.cpu.halt();
         },
         .virtual_bar => {
             // Virtual BAR faults should be intercepted by the arch-specific
             // page fault handler. Reaching here means something unexpected
             // happened (e.g., present-page protection fault).
             if (proc.faultBlock(thread, .protection_fault, faulting_virt.addr, fault.rip, fault.user_ctx)) {
-                arch.enableInterrupts();
+                arch.interrupts.enableInterrupts();
                 scheduler.yield();
                 return;
             }
             proc.kill(.protection_fault);
-            arch.enableInterrupts();
-            while (true) arch.halt();
+            arch.interrupts.enableInterrupts();
+            while (true) arch.cpu.halt();
         },
         .private => {
             const rights_ok = blk: {
@@ -145,16 +145,16 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
                 else
                     accessReason(is_write, is_exec);
                 if (proc.faultBlock(thread, r2, faulting_virt.addr, fault.rip, fault.user_ctx)) {
-                    arch.enableInterrupts();
+                    arch.interrupts.enableInterrupts();
                     scheduler.yield();
                     return;
                 }
                 proc.kill(r2);
-                arch.enableInterrupts();
-                while (true) arch.halt();
+                arch.interrupts.enableInterrupts();
+                while (true) arch.cpu.halt();
             }
 
-            // Note: we do NOT pre-check arch.resolveVaddr here. A concurrent
+            // Note: we do NOT pre-check arch.paging.resolveVaddr here. A concurrent
             // syscall pre-fault on another CPU (readUserBytes, vmRecv, futex,
             // sysinfo, pmu, proc_create, vCPU run) can install the PTE
             // between the hardware raising #PF and us reaching this point.
@@ -163,13 +163,13 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
             // faulting instruction simply retries.
             proc.vmm.demandPage(faulting_virt, is_write, is_exec) catch {
                 if (proc.faultBlock(thread, .out_of_memory, faulting_virt.addr, fault.rip, fault.user_ctx)) {
-                    arch.enableInterrupts();
+                    arch.interrupts.enableInterrupts();
                     scheduler.yield();
                     return;
                 }
                 proc.kill(.out_of_memory);
-                arch.enableInterrupts();
-                while (true) arch.halt();
+                arch.interrupts.enableInterrupts();
+                while (true) arch.cpu.halt();
             };
         },
     }

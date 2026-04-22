@@ -108,7 +108,7 @@ pub fn wait(paddr: PAddr, expected: u64, timeout_ns: u64, thread: *Thread) i64 {
     const max_timeout: u64 = @bitCast(@as(i64, -1));
     thread.futex_paddr = paddr;
     if (timeout_ns != max_timeout) {
-        const now_ns = arch.getMonotonicClock().now();
+        const now_ns = arch.time.getMonotonicClock().now();
         thread.futex_deadline_ns = now_ns +| timeout_ns;
     } else {
         thread.futex_deadline_ns = 0;
@@ -132,7 +132,7 @@ pub fn wait(paddr: PAddr, expected: u64, timeout_ns: u64, thread: *Thread) i64 {
 
     bucket.lock.unlockIrqRestore(irq);
 
-    arch.enableInterrupts();
+    arch.interrupts.enableInterrupts();
     sched.yield();
 
     const was_timeout: bool = thread.futex_deadline_ns == @as(u64, @bitCast(E_TIMEOUT));
@@ -187,7 +187,7 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
         const target_core = if (thread.core_affinity) |mask|
             @as(u64, @ctz(mask))
         else
-            arch.coreID();
+            arch.smp.coreID();
         sched.enqueueOnCore(target_core, thread);
         woken += 1;
     }
@@ -247,7 +247,7 @@ pub fn waitVal(addrs: []const PAddr, expected: []const u64, count: usize, timeou
     // Set up timeout.
     const max_timeout: u64 = @bitCast(@as(i64, -1));
     if (timeout_ns != max_timeout) {
-        const now_ns = arch.getMonotonicClock().now();
+        const now_ns = arch.time.getMonotonicClock().now();
         thread.futex_deadline_ns = now_ns +| timeout_ns;
     } else {
         thread.futex_deadline_ns = 0;
@@ -284,7 +284,7 @@ pub fn waitVal(addrs: []const PAddr, expected: []const u64, count: usize, timeou
 
     releaseBucketLocks(&lock_state);
 
-    arch.enableInterrupts();
+    arch.interrupts.enableInterrupts();
     sched.yield();
 
     const was_timeout: bool = thread.futex_deadline_ns == @as(u64, @bitCast(E_TIMEOUT));
@@ -321,7 +321,7 @@ pub fn waitChange(addrs: []const PAddr, count: usize, timeout_ns: u64, thread: *
     // Set up timeout.
     const max_timeout: u64 = @bitCast(@as(i64, -1));
     if (timeout_ns != max_timeout) {
-        const now_ns = arch.getMonotonicClock().now();
+        const now_ns = arch.time.getMonotonicClock().now();
         thread.futex_deadline_ns = now_ns +| timeout_ns;
     } else {
         thread.futex_deadline_ns = 0;
@@ -357,7 +357,7 @@ pub fn waitChange(addrs: []const PAddr, count: usize, timeout_ns: u64, thread: *
 
     releaseBucketLocks(&lock_state);
 
-    arch.enableInterrupts();
+    arch.interrupts.enableInterrupts();
     sched.yield();
 
     const was_timeout: bool = thread.futex_deadline_ns == @as(u64, @bitCast(E_TIMEOUT));
@@ -419,7 +419,7 @@ fn releaseBucketLocks(lock_state: *const BucketLockState) void {
 }
 
 pub fn expireTimedWaiters() void {
-    const now_ns = arch.getMonotonicClock().now();
+    const now_ns = arch.time.getMonotonicClock().now();
 
     const irq = timed_lock.lockIrqSave();
 
@@ -451,7 +451,7 @@ pub fn expireTimedWaiters() void {
             const target = if (thread.core_affinity) |mask|
                 @as(u64, @ctz(mask))
             else
-                arch.coreID();
+                arch.smp.coreID();
             sched.enqueueOnCore(target, thread);
         }
         slot.* = null;

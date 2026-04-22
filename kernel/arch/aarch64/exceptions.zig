@@ -574,7 +574,7 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
         },
 
         else => {
-            arch.print("KERNEL EXCEPTION: EC=0x{x} ESR=0x{x} ELR=0x{x} FAR=0x{x}\n", .{
+            arch.boot.print("KERNEL EXCEPTION: EC=0x{x} ESR=0x{x} ELR=0x{x} FAR=0x{x}\n", .{
                 @intFromEnum(ec), esr, ctx.elr_el1, readFarEl1(),
             });
             @panic("Unhandled kernel synchronous exception");
@@ -597,7 +597,7 @@ fn handleIrqCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
 /// Panic handler for unexpected/unimplemented vector entries.
 fn handleUnexpected(ctx: *ArchCpuContext) callconv(.c) void {
     const esr = readEsrEl1();
-    arch.print("UNEXPECTED EXCEPTION: ESR=0x{x} ELR=0x{x} FAR=0x{x}\n", .{
+    arch.boot.print("UNEXPECTED EXCEPTION: ESR=0x{x} ELR=0x{x} FAR=0x{x}\n", .{
         esr, ctx.elr_el1, readFarEl1(),
     });
     @panic("Unexpected exception vector taken");
@@ -650,7 +650,7 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.
         // regs into the thread's `fpu_state` if we still own them, then
         // ack so the requester unblocks. See `cpu.fpuFlushIpi`.
         2 => {
-            const core_idx: u8 = @truncate(arch.coreID());
+            const core_idx: u8 = @truncate(arch.smp.coreID());
             const slot = &aarch64_interrupts.fpu_flush_mailbox[core_idx];
             if (@atomicLoad(?*anyopaque, &slot.requested_thread, .acquire)) |opq| {
                 const thread: *Thread = @ptrCast(@alignCast(opq));
@@ -749,7 +749,7 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.
             scheduler.schedTimerHandler(sched_ctx);
         },
         else => {
-            arch.print("K: IRQ intid={d} (unhandled)\n", .{intid});
+            arch.boot.print("K: IRQ intid={d} (unhandled)\n", .{intid});
         },
     }
 }
@@ -760,17 +760,17 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.
 fn faultOrKillUser(ctx: *ArchCpuContext, reason: FaultReason, fault_addr: u64) void {
     const thread = scheduler.currentThread() orelse
         @panic("user exception with no current thread");
-    arch.print("K: EXCEPTION pid={d} EC reason={d} addr=0x{x}\n", .{
+    arch.boot.print("K: EXCEPTION pid={d} EC reason={d} addr=0x{x}\n", .{
         thread.process.pid, @intFromEnum(reason), fault_addr,
     });
     if (thread.process.faultBlock(thread, reason, fault_addr, ctx.elr_el1, ctx)) {
-        arch.enableInterrupts();
+        arch.interrupts.enableInterrupts();
         scheduler.yield();
         return;
     }
     thread.process.kill(reason);
-    arch.enableInterrupts();
-    while (true) arch.halt();
+    arch.interrupts.enableInterrupts();
+    while (true) arch.cpu.halt();
 }
 
 /// Emulate a userspace access to a virtual BAR mapping on aarch64.
@@ -799,16 +799,16 @@ fn emulateVirtualBar(
 
     const decoded = decodeA64LoadStore(ctx, proc) orelse {
         proc.kill(.protection_fault);
-        arch.enableInterrupts();
-        while (true) arch.halt();
+        arch.interrupts.enableInterrupts();
+        while (true) arch.cpu.halt();
     };
 
     const port_offset = far - node.start.addr;
     if (port_offset + decoded.access_size > device.access.port_io.port_count) {
         const reason: FaultReason = if (decoded.is_write) .invalid_write else .invalid_read;
         proc.kill(reason);
-        arch.enableInterrupts();
-        while (true) arch.halt();
+        arch.interrupts.enableInterrupts();
+        while (true) arch.cpu.halt();
     }
 
     // aarch64 has no real PIO bus backing the placeholder device: reads
@@ -837,7 +837,7 @@ const DecodedLoadStore = struct {
 fn decodeA64LoadStore(ctx: *const ArchCpuContext, proc: anytype) ?DecodedLoadStore {
     const rip = ctx.elr_el1;
     const rip_page = VAddr.fromInt(rip & ~@as(u64, 0xFFF));
-    const phys = arch.resolveVaddr(proc.addr_space_root, rip_page) orelse return null;
+    const phys = arch.paging.resolveVaddr(proc.addr_space_root, rip_page) orelse return null;
     const physmap = VAddr.fromPAddr(phys, null).addr + (rip & 0xFFF);
     const insn: u32 = @as(*const u32, @ptrFromInt(physmap)).*;
 

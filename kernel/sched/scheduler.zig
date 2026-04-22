@@ -14,7 +14,7 @@ const memory_init = zag.memory.init;
 const process_mod = zag.proc.process;
 const thread_mod = zag.sched.thread;
 
-const ArchCpuContext = arch.ArchCpuContext;
+const ArchCpuContext = arch.cpu.ArchCpuContext;
 const ThreadPriorityQueue = thread_mod.ThreadPriorityQueue;
 const Process = process_mod.Process;
 const ProcessAllocator = process_mod.ProcessAllocator;
@@ -22,8 +22,8 @@ const SpinLock = zag.utils.sync.SpinLock;
 const Thread = thread_mod.Thread;
 const ThreadAllocator = thread_mod.ThreadAllocator;
 const Timer = zag.arch.timer.Timer;
-const VCpuAllocator = arch.VCpuAllocator;
-const VmAllocator = arch.VmAllocator;
+const VCpuAllocator = arch.vm.VCpuAllocator;
+const VmAllocator = arch.vm.VmAllocator;
 
 var proc_alloc_instance: ProcessAllocator = undefined;
 var thread_alloc_instance: ThreadAllocator = undefined;
@@ -61,7 +61,7 @@ const RunQueue = struct {
 /// dispatched anywhere. Used by thread_suspend so the kernel can IPI the
 /// right core regardless of whether the thread has explicit affinity.
 pub fn coreRunning(thread: *Thread) ?u64 {
-    const count = arch.coreCount();
+    const count = arch.smp.coreCount();
     var i: u64 = 0;
     while (i < count) {
         if (@atomicLoad(?*Thread, &core_states[i].running_thread, .acquire) == thread) return i;
@@ -70,11 +70,11 @@ pub fn coreRunning(thread: *Thread) ?u64 {
     return null;
 }
 
-/// PMU save/restore hook around `arch.switchTo`. Centralizes the
+/// PMU save/restore hook around `arch.cpu.switchTo`. Centralizes the
 /// null-guarded calls described in systems.md §run-queue "PMU Save/Restore Hooks"
 /// so every `switchTo` site in this file goes through the same pair.
 ///
-/// `arch.switchTo` does not return to this frame — on x64 it mov's RSP to
+/// `arch.cpu.switchTo` does not return to this frame — on x64 it mov's RSP to
 /// the incoming thread's interrupt frame and jmp's to `interruptStubEpilogue`,
 /// which iret's into the incoming thread's userspace. Any code placed after
 /// `switchTo` is therefore dead on the incoming side and would only run the
@@ -91,27 +91,27 @@ pub fn coreRunning(thread: *Thread) ?u64 {
 inline fn switchToWithPmu(outgoing: *Thread, next: *Thread) void {
     kprof.enter(.sched_switch_pmu);
     defer kprof.exit(.sched_switch_pmu);
-    if (outgoing.pmu_state) |st| arch.pmuSave(st);
-    if (next.pmu_state) |st| arch.pmuRestore(st);
+    if (outgoing.pmu_state) |st| arch.pmu.pmuSave(st);
+    if (next.pmu_state) |st| arch.pmu.pmuRestore(st);
     // Eager-FPU baseline (-Dlazy_fpu=false): unconditionally save the
     // outgoing thread's FP/SIMD regs and reload the incoming thread's,
-    // skipping the trap-driven lazy machinery in arch.switchTo. The
+    // skipping the trap-driven lazy machinery in arch.cpu.switchTo. The
     // same-thread guard avoids a wasted save+restore pair when the
     // scheduler picks the thread it just preempted.
     if (comptime !fpu.lazy_enabled) {
         if (outgoing != next) {
-            arch.fpuSave(&outgoing.fpu_state);
-            arch.fpuRestore(&next.fpu_state);
+            arch.fpu.fpuSave(&outgoing.fpu_state);
+            arch.fpu.fpuRestore(&next.fpu_state);
         }
     }
-    arch.switchTo(next);
+    arch.cpu.switchTo(next);
 }
 
 /// Remove `thread` from any core's run queue. Used when a remote thread is
 /// killed while .ready (so we can deinit it without leaving a dangling pointer).
 pub fn removeFromAnyRunQueue(thread: *Thread) void {
     kprof.point(.sched_remove_run_queue, 0);
-    const count = arch.coreCount();
+    const count = arch.smp.coreCount();
     var i: u64 = 0;
     while (i < count) {
         const state = &core_states[i];
@@ -190,7 +190,7 @@ fn armSchedTimer(state: *PerCoreState, delta_ns: u64) void {
 /// woken. The previous version stored `(core_id + 1) % cores` only when
 /// `cur == core_id`, which deadlocked the rotation on a non-ticking core.
 fn maybeExpireTimedWaiters(core_id: u64) void {
-    const cores = arch.coreCount();
+    const cores = arch.smp.coreCount();
     while (true) {
         const cur = expire_core.load(.monotonic);
         const next = (cur + 1) % cores;
@@ -201,7 +201,7 @@ fn maybeExpireTimedWaiters(core_id: u64) void {
 }
 
 pub fn currentThread() ?*Thread {
-    return core_states[arch.coreID()].running_thread;
+    return core_states[arch.smp.coreID()].running_thread;
 }
 
 pub fn currentProc() *Process {
@@ -275,7 +275,7 @@ fn peekHighestStealable(pq: *const ThreadPriorityQueue, core_id: u6) ?*Thread {
 fn tryStealWork(my_core_id: u64) ?*Thread {
     kprof.enter(.sched_try_steal);
     defer kprof.exit(.sched_try_steal);
-    const count = arch.coreCount();
+    const count = arch.smp.coreCount();
     const pinned = pinned_cores.load(.acquire);
 
     // Retry loop in case peek succeeds but removal fails (race with another stealer)
@@ -331,7 +331,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
             kprof_dump.end(.log_full);
         }
     }
-    const core_id = arch.coreID();
+    const core_id = arch.smp.coreID();
     const state = &core_states[core_id];
 
     const preempted = state.running_thread.?;
@@ -349,7 +349,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     // which is far below any reasonable polling cadence. `last_tick_ns`
     // was seeded in `perCoreInit` before the first preemption timer was
     // armed, so the first delta is well-defined.
-    const mono = arch.getMonotonicClock();
+    const mono = arch.time.getMonotonicClock();
     const now = mono.now();
     const delta: u64 = now -| state.last_tick_ns;
     const was_idle = (state.idle_thread != null and preempted == state.idle_thread.?);
@@ -364,7 +364,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     // C-state) on this core so that `sys_info` reads from any core see a
     // value at most one tick stale. Must run on the owning core because
     // the underlying `rdmsr` instructions are core-local (§21).
-    arch.sampleCoreHwState();
+    arch.sysinfo.sampleCoreHwState();
 
     if (preempted.pinned_exclusive) {
         if (preempted.state == .exited) {
@@ -544,7 +544,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
 
 pub fn yield() void {
     kprof.point(.sched_yield, 0);
-    arch.triggerSchedulerInterruptSelf();
+    arch.smp.triggerSchedulerInterruptSelf();
 }
 
 /// Pin the calling thread exclusively to a single core. The thread becomes
@@ -587,7 +587,7 @@ pub fn pinExclusive(thread: *Thread) i64 {
 
 /// Move all threads from a pinned core's run queue to other available cores.
 fn migrateThreadsOff(state: *PerCoreState, pinned_core: u64) void {
-    const count = arch.coreCount();
+    const count = arch.smp.coreCount();
     const irq = state.rq_lock.lockIrqSave();
     defer state.rq_lock.unlockIrqRestore(irq);
 
@@ -624,7 +624,7 @@ fn migrateThreadsOff(state: *PerCoreState, pinned_core: u64) void {
 /// Migrate a thread to an eligible non-pinned core. Used when a pinned thread
 /// preempts the current thread and needs to move it elsewhere.
 fn migrateToEligibleCore(thread: *Thread, exclude_core: u64) void {
-    const count = arch.coreCount();
+    const count = arch.smp.coreCount();
     const pinned = pinned_cores.load(.acquire);
     var target: u64 = 0;
     while (target < count) {
@@ -693,7 +693,7 @@ pub fn enqueueOnCore(core_index: u64, thread: *Thread) void {
         const pinned = pinned_cores.load(.acquire);
         if (pinned & (@as(u64, 1) << @intCast(target)) != 0) {
             // Find an unpinned core
-            const count = arch.coreCount();
+            const count = arch.smp.coreCount();
             var i: u64 = 0;
             while (i < count) {
                 if (pinned & (@as(u64, 1) << @intCast(i)) != 0) {
@@ -722,7 +722,7 @@ pub fn enqueueOnCore(core_index: u64, thread: *Thread) void {
     const running = @atomicLoad(?*Thread, &state.running_thread, .acquire);
     if (running) |r| {
         if (@intFromEnum(thread.priority) > @intFromEnum(r.priority)) {
-            arch.triggerSchedulerInterrupt(target);
+            arch.smp.triggerSchedulerInterrupt(target);
         }
     }
 }
@@ -735,7 +735,7 @@ fn pickCoreForThread(thread: *Thread, current_core: u64) ?u64 {
     if (mask & current_bit != 0 and core_states[current_core].pinned_thread == null) {
         return current_core;
     }
-    const count = arch.coreCount();
+    const count = arch.smp.coreCount();
     var i: u64 = 0;
     while (i < count) {
         const bit = @as(u64, 1) << @intCast(i);
@@ -754,7 +754,7 @@ fn pickCoreForThread(thread: *Thread, current_core: u64) ?u64 {
 pub fn switchToNextReady() noreturn {
     kprof.enter(.sched_switch);
     defer kprof.exit(.sched_switch);
-    const core_id = arch.coreID();
+    const core_id = arch.smp.coreID();
     const state = &core_states[core_id];
     // Outgoing is whoever was running on this core before the caller
     // flipped its state to .blocked. We read it *before* overwriting
@@ -787,7 +787,7 @@ pub fn switchToNextReady() noreturn {
     if (outgoing) |out| {
         switchToWithPmu(out, next_thread);
     } else {
-        arch.switchTo(next_thread);
+        arch.cpu.switchTo(next_thread);
     }
     unreachable;
 }
@@ -806,7 +806,7 @@ pub fn switchToThread(current: *Thread, target: *Thread, ctx: *ArchCpuContext, e
     current.ctx = ctx;
     current.on_cpu.store(false, .release);
 
-    const current_core = arch.coreID();
+    const current_core = arch.smp.coreID();
     const target_core = pickCoreForThread(target, current_core) orelse {
         // Undo — caller must handle this error
         current.on_cpu.store(true, .release);
@@ -829,7 +829,7 @@ pub fn switchToThread(current: *Thread, target: *Thread, ctx: *ArchCpuContext, e
     } else {
         target.state = .ready;
         enqueueOnCore(target_core, target);
-        arch.triggerSchedulerInterrupt(target_core);
+        arch.smp.triggerSchedulerInterrupt(target_core);
         // Run next ready thread locally
         state.rq_lock.lock();
         var next = state.rq.dequeue();
@@ -865,10 +865,10 @@ pub fn globalInit() !void {
     thread_mod.allocator = thread_alloc_instance.allocator();
 
     vm_alloc_instance = try VmAllocator.init(memory_init.kvm_vm_slab_backing.allocator());
-    arch.kvmSetVmAllocator(vm_alloc_instance.allocator());
+    arch.kvm.kvmSetVmAllocator(vm_alloc_instance.allocator());
 
     vcpu_alloc_instance = try VCpuAllocator.init(memory_init.kvm_vcpu_slab_backing.allocator());
-    arch.kvmSetVcpuAllocator(vcpu_alloc_instance.allocator());
+    arch.kvm.kvmSetVcpuAllocator(vcpu_alloc_instance.allocator());
 
     idle_process = try Process.createIdle();
 
@@ -884,11 +884,11 @@ pub fn globalInit() !void {
 /// is reprogrammed only on EL0→EL1 transitions), so leaving the idle fields
 /// undefined there remains a no-op.
 fn idleLoop() void {
-    while (true) arch.halt();
+    while (true) arch.cpu.halt();
 }
 
 pub fn perCoreInit() void {
-    const core_id = arch.coreID();
+    const core_id = arch.smp.coreID();
     const state = &core_states[core_id];
 
     // Create a real idle thread for this core
@@ -909,24 +909,24 @@ pub fn perCoreInit() void {
         // `thread.kernel_stack.top` and ERETs into `thread.ctx`.
         idle_thread.kernel_stack = thread_mod.createKernelStack() catch @panic("failed to allocate idle kernel stack");
         const idle_kstack_top = address.alignStack(idle_thread.kernel_stack.top);
-        idle_thread.ctx = arch.prepareThreadContext(idle_kstack_top, null, &idleLoop, 0);
+        idle_thread.ctx = arch.cpu.prepareThreadContext(idle_kstack_top, null, &idleLoop, 0);
     }
     state.idle_thread = idle_thread;
     state.running_thread = idle_thread;
 
-    arch.vmPerCoreInit();
-    arch.pmuPerCoreInit();
+    arch.vm.vmPerCoreInit();
+    arch.pmu.pmuPerCoreInit();
     kprof_sample.perCoreInit();
     kprof.perCoreInit();
-    arch.sysInfoPerCoreInit();
-    state.timer = arch.getPreemptionTimer();
+    arch.sysinfo.sysInfoPerCoreInit();
+    state.timer = arch.time.getPreemptionTimer();
 
     // Seed `last_tick_ns` from the monotonic clock before the preemption
     // timer is armed (§6 Idle/Busy Accounting Hook). Until this point
     // `idle_ns` and `busy_ns` are zero; the first tick's delta lands
     // cleanly on a well-defined prior timestamp.
-    state.last_tick_ns = arch.getMonotonicClock().now();
+    state.last_tick_ns = arch.time.getMonotonicClock().now();
 
-    arch.enableInterrupts();
+    arch.interrupts.enableInterrupts();
     armSchedTimer(state, SCHED_TIMESLICE_NS);
 }

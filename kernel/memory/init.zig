@@ -61,7 +61,7 @@ pub fn init(firmware_mmap: MMap) !void {
     bump_allocator = BumpAllocator.init(bump_alloc_start_phys.addr, bump_alloc_end_phys.addr);
     const bump_alloc_iface: std.mem.Allocator = bump_allocator.allocator();
 
-    const addr_space_root_phys = arch.getKernelAddrSpaceRoot();
+    const addr_space_root_phys = arch.paging.getKernelAddrSpaceRoot();
     kernel_addr_space_root = addr_space_root_phys;
     const addr_space_root_id_virt = VAddr.fromPAddr(addr_space_root_phys, 0);
 
@@ -90,7 +90,7 @@ pub fn init(firmware_mmap: MMap) !void {
                 .privilege_perm = .kernel,
             };
 
-            try arch.mapPageBoot(
+            try arch.paging.mapPageBoot(
                 addr_space_root_id_virt,
                 current_phys,
                 physmap_virt,
@@ -112,7 +112,7 @@ pub fn init(firmware_mmap: MMap) !void {
     bump_allocator.free_addr = bump_alloc_free_virt.addr;
     bump_allocator.end_addr = bump_alloc_end_virt.addr;
 
-    arch.dropIdentityMapping();
+    arch.paging.dropIdentityMapping();
     const buddy_alloc_start_virt = VAddr.fromPAddr(
         PAddr.fromInt(std.mem.alignForward(u64, smallest_addr_region.start_paddr, paging.PAGE4K)),
         null,

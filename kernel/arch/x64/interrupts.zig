@@ -304,9 +304,9 @@ pub fn switchTo(thread: *Thread) void {
     updateScratchKernelRsp(core_id, kstack);
 
     const new_root = thread.process.addr_space_root;
-    if (new_root.addr != arch.getAddrSpaceRoot().addr) {
-        arch.swapAddrSpace(new_root, thread.process.addr_space_id);
-        std.debug.assert(arch.getAddrSpaceRoot().addr == new_root.addr);
+    if (new_root.addr != arch.paging.getAddrSpaceRoot().addr) {
+        arch.paging.swapAddrSpace(new_root, thread.process.addr_space_id);
+        std.debug.assert(arch.paging.getAddrSpaceRoot().addr == new_root.addr);
     }
 
     // Lazy FPU: TS should be clear iff `thread` is the current owner
@@ -438,7 +438,7 @@ export fn interruptStubEpilogue() callconv(.naked) void {
     );
 }
 
-pub fn serializeFaultRegs(ctx: *const ArchCpuContext) arch.FaultRegSnapshot {
+pub fn serializeFaultRegs(ctx: *const ArchCpuContext) arch.cpu.FaultRegSnapshot {
     const r = &ctx.regs;
     return .{
         .ip = ctx.rip,
@@ -471,7 +471,7 @@ pub fn restoreIpcPayload(ctx: *ArchCpuContext, words: [5]u64) void {
     ctx.regs.r9 = words[4];
 }
 
-pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: arch.FaultRegSnapshot) void {
+pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: arch.cpu.FaultRegSnapshot) void {
     ctx.rip = snapshot.ip;
     ctx.rflags = snapshot.flags;
     ctx.rsp = snapshot.sp;
