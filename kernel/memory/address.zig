@@ -158,4 +158,4 @@ pub const VAddr = extern struct {
     }
 };
 
-pub const alignStack = arch.paging.alignStack;
+pub const alignStack = arch.cpu.alignStack;

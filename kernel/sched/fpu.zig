@@ -99,5 +99,5 @@ pub fn migrateFlush(thread: *Thread) void {
     // load above and the IPI delivery; the IPI handler tolerates that
     // (no-op when last_fpu_owner mismatches). We still always clear
     // last_fpu_core so subsequent migration checks short-circuit.
-    arch.smp.fpuFlushIpi(src, thread);
+    arch.fpu.fpuFlushIpi(src, thread);
 }

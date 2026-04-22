@@ -5,6 +5,8 @@ const zag = @import("zag");
 const aarch64 = zag.arch.aarch64;
 const x64 = zag.arch.x64;
 
+const Thread = zag.sched.thread.Thread;
+
 // --- Lazy FPU dispatch ---
 //
 // User-mode FP/SIMD state is owned by exactly one thread per core at a
@@ -64,6 +66,19 @@ pub fn fpuArmTrap() void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.cpu.fpuArmTrap(),
         .aarch64 => aarch64.cpu.fpuArmTrap(),
+        else => unreachable,
+    }
+}
+
+/// Synchronously flush `thread`'s FP state from the source core's
+/// registers into `thread.fpu_state`. Called by the destination core
+/// when work-stealing has migrated `thread` and a subsequent
+/// `fpuRestore` would otherwise read stale buffer contents. Sends an
+/// IPI and spins until the source core acknowledges.
+pub fn fpuFlushIpi(target_core: u8, thread: *Thread) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.fpuFlushIpi(target_core, thread),
+        .aarch64 => aarch64.cpu.fpuFlushIpi(target_core, thread),
         else => unreachable,
     }
 }

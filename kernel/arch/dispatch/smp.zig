@@ -98,15 +98,3 @@ pub fn broadcastKprofIpi() void {
     }
 }
 
-/// Synchronously flush `thread`'s FP state from the source core's
-/// registers into `thread.fpu_state`. Called by the destination core
-/// when work-stealing has migrated `thread` and a subsequent
-/// `fpuRestore` would otherwise read stale buffer contents. Sends an
-/// IPI and spins until the source core acknowledges.
-pub fn fpuFlushIpi(target_core: u8, thread: *Thread) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.cpu.fpuFlushIpi(target_core, thread),
-        .aarch64 => aarch64.cpu.fpuFlushIpi(target_core, thread),
-        else => unreachable,
-    }
-}

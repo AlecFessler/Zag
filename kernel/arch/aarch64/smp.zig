@@ -384,7 +384,7 @@ fn smpInitFull() !void {
 
         // Fill in per-core boot params. AArch64 requires 16-byte stack
         // alignment (AAPCS64, Section 6.2.2).
-        boot_params_storage.sp = arch.paging.alignStack(ap_stack.top).addr;
+        boot_params_storage.sp = arch.cpu.alignStack(ap_stack.top).addr;
         boot_params_storage.core_idx = core_idx;
 
         // Flush the updated params to main memory so the secondary can

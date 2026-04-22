@@ -233,19 +233,6 @@ pub fn dropIdentityMapping() void {
     }
 }
 
-/// Align a stack pointer for the target architecture's calling convention.
-/// x86-64: 16-byte aligned minus 8 (simulates the return address push by `call`).
-/// aarch64: 16-byte aligned (SP must be 16-byte aligned at all times).
-pub fn alignStack(stack_top: VAddr) VAddr {
-    const aligned = std.mem.alignBackward(u64, stack_top.addr, 16);
-    const adjusted = switch (builtin.cpu.arch) {
-        .x86_64 => aligned - 8,
-        .aarch64 => aligned,
-        else => unreachable,
-    };
-    return VAddr.fromInt(adjusted);
-}
-
 /// Classification of ELF relocation types for KASLR slide application.
 pub const RelocAction = enum { skip, abs64, abs32, unsupported };
 
