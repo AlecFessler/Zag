@@ -1,4 +1,8 @@
 const std = @import("std");
+const zag = @import("zag");
+
+const apic = zag.arch.x64.apic;
+const interrupts = zag.arch.x64.interrupts;
 
 pub const CpuidFeatureEcx = enum(u32) {
     sse3 = 1 << 0, // Supplemental SSE3
@@ -106,9 +110,85 @@ pub const Context = packed struct {
     ss: u64,
 };
 
-/// Size of FXSAVE area allocated below Context on kernel stack.
-/// FXSAVE/FXRSTOR is handled in assembly prologue/epilogue.
+/// Size of the per-thread FXSAVE save buffer used by the lazy-FPU
+/// machinery (`sched.fpu`). 512 bytes is the FXSAVE format; we
+/// allocate 576 in `Thread.fpu_state` to leave headroom matching the
+/// aarch64 layout, but the FXSAVE/FXRSTOR instructions only touch the
+/// first 512 bytes.
 pub const fxsave_size: u64 = 512;
+
+/// FXSAVE the local core's FP/SIMD state into the thread's lazy-FPU
+/// buffer. `area` must be 16-byte aligned (Thread.fpu_state is 64-byte
+/// aligned, so this is satisfied by construction).
+/// Intel SDM Vol 2A "FXSAVE — Save x87 FPU, MMX, XMM, and MXCSR State".
+pub inline fn fpuSave(area: *[576]u8) void {
+    asm volatile (
+        \\fxsave (%[a])
+        :
+        : [a] "r" (area),
+        : .{ .memory = true });
+}
+
+/// FXRSTOR the local core's FP/SIMD state from the thread's lazy-FPU
+/// buffer. Reverse of `fpuSave`. The buffer must contain a previously
+/// saved FXSAVE image, or the canonical init image written by
+/// `fpuStateInit` for never-before-run threads.
+/// Intel SDM Vol 2A "FXRSTOR — Restore x87 FPU, MMX, XMM, and MXCSR State".
+pub inline fn fpuRestore(area: *[576]u8) void {
+    asm volatile (
+        \\fxrstor (%[a])
+        :
+        : [a] "r" (area),
+        : .{ .memory = true });
+}
+
+/// Initialise an FPU buffer to the architectural reset state.
+/// FCW = 0x037F (mask all FPU exceptions), MXCSR = 0x1F80 (mask all
+/// SSE exceptions, round-to-nearest, FZ/DAZ off). Everything else
+/// zero. Called by Thread create so the first FXRSTOR on a brand-new
+/// thread loads sensible defaults rather than whatever bit pattern
+/// happened to be in the slab page.
+pub fn fpuStateInit(area: *[576]u8) void {
+    @memset(area, 0);
+    @as(*align(1) u16, @ptrCast(area[0..2])).* = 0x037F; // FCW
+    @as(*align(1) u32, @ptrCast(area[24..28])).* = 0x1F80; // MXCSR
+}
+
+/// Clear CR0.TS (bit 3). The next user-mode FP/SSE instruction will
+/// no longer raise #NM. Called at the end of the lazy-FPU trap handler
+/// after the thread's state has been restored.
+/// Intel SDM Vol 2A "CLTS — Clear Task-Switched Flag in CR0".
+pub inline fn fpuClearTrap() void {
+    asm volatile ("clts" ::: .{ .memory = true });
+}
+
+/// Set CR0.TS (bit 3). The next user-mode FP/SSE instruction will
+/// raise #NM, dispatching to the lazy-FPU trap handler. Called from
+/// `switchTo` on every context switch so the new thread traps on its
+/// first FP touch (unless it was already the previous owner on this
+/// core, in which case the handler short-circuits).
+/// Intel SDM Vol 3A §2.5 "Control Registers", CR0.TS.
+pub inline fn fpuArmTrap() void {
+    var cr0: u64 = undefined;
+    asm volatile ("mov %%cr0, %[v]"
+        : [v] "=r" (cr0),
+    );
+    cr0 |= 0x8;
+    asm volatile ("mov %[v], %%cr0"
+        :
+        : [v] "r" (cr0),
+    );
+}
+
+/// Send the FPU-flush IPI to `target_core`, encoding `thread` as the
+/// target via a per-CPU mailbox. Spins on the mailbox's done flag
+/// until the receiver finishes saving `thread`'s state.
+/// See `interrupts.fpuFlushIpiVector` for the receiver side.
+pub fn fpuFlushIpi(target_core: u8, thread: anytype) void {
+    interrupts.fpu_flush_mailbox[target_core].requestThread(thread);
+    apic.sendIpiToCore(target_core, @intFromEnum(interrupts.IntVecs.fpu_flush));
+    interrupts.fpu_flush_mailbox[target_core].waitDone();
+}
 
 pub const Registers = packed struct {
     r15: u64,

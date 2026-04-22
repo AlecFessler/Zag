@@ -40,7 +40,7 @@ fn buildChild(
 
 pub fn build(b: *std.Build) void {
     const target_arch_str = b.option([]const u8, "arch", "Target architecture (x64 or arm)") orelse "x64";
-    const workload = b.option([]const u8, "workload", "kprof workload: yield, ipc, fault, spawn, shm_cycle, debugger, composed (default: yield)") orelse "yield";
+    const workload = b.option([]const u8, "workload", "kprof workload: yield, ipc, fault, spawn, shm_cycle, debugger, composed, fpu_mix (default: yield)") orelse "yield";
 
     const workload_src = blk: {
         if (std.mem.eql(u8, workload, "yield")) break :blk "src/yield.zig";
@@ -50,7 +50,8 @@ pub fn build(b: *std.Build) void {
         if (std.mem.eql(u8, workload, "shm_cycle")) break :blk "src/shm_cycle.zig";
         if (std.mem.eql(u8, workload, "debugger")) break :blk "src/debugger.zig";
         if (std.mem.eql(u8, workload, "composed")) break :blk "src/composed.zig";
-        @panic("-Dworkload must be one of: yield, ipc, fault, spawn, shm_cycle, debugger, composed");
+        if (std.mem.eql(u8, workload, "fpu_mix")) break :blk "src/fpu_mix.zig";
+        @panic("-Dworkload must be one of: yield, ipc, fault, spawn, shm_cycle, debugger, composed, fpu_mix");
     };
 
     const cpu_arch: std.Target.Cpu.Arch = blk: {

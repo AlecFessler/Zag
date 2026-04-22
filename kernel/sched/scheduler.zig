@@ -3,6 +3,7 @@ const zag = @import("zag");
 
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
+const fpu = zag.sched.fpu;
 const futex = zag.proc.futex;
 const kprof = zag.kprof.trace_id;
 const kprof_dump = zag.kprof.dump;
@@ -92,6 +93,17 @@ inline fn switchToWithPmu(outgoing: *Thread, next: *Thread) void {
     defer kprof.exit(.sched_switch_pmu);
     if (outgoing.pmu_state) |st| arch.pmuSave(st);
     if (next.pmu_state) |st| arch.pmuRestore(st);
+    // Eager-FPU baseline (-Dlazy_fpu=false): unconditionally save the
+    // outgoing thread's FP/SIMD regs and reload the incoming thread's,
+    // skipping the trap-driven lazy machinery in arch.switchTo. The
+    // same-thread guard avoids a wasted save+restore pair when the
+    // scheduler picks the thread it just preempted.
+    if (comptime !fpu.lazy_enabled) {
+        if (outgoing != next) {
+            arch.fpuSave(&outgoing.fpu_state);
+            arch.fpuRestore(&next.fpu_state);
+        }
+    }
     arch.switchTo(next);
 }
 
@@ -135,6 +147,24 @@ const PerCoreState = struct {
     /// to `idle_ns` / `busy_ns`.
     last_tick_ns: u64 = 0,
 };
+
+/// Lazy-FPU per-core owner table: `last_fpu_owner[core]` is the thread
+/// whose FP/SIMD register state currently lives in that core's CPU
+/// registers, or null if no thread has dirtied the FPU on that core
+/// since boot / since being evicted by a migration flush.
+///
+/// Only the FPU trap handler (`fpu.handleTrap`) and the cross-core
+/// flush IPI handler (`fpu.flushIpiHandler`) write this array. The
+/// scheduler reads it via `fpu.migrateFlush` when a thread is about to
+/// run on a core different from `thread.last_fpu_core`.
+pub var last_fpu_owner: [MAX_CORES]?*Thread align(CACHE_LINE_SIZE) = [_]?*Thread{null} ** MAX_CORES;
+
+/// Per-core shadow of CR0.TS (x64) / CPACR_EL1.FPEN-traps-EL0 (aarch64)
+/// — true when the FP-disable trap is currently armed on that core.
+/// Tracked in a normal variable so `switchTo` can avoid the expensive
+/// MOV-to-CR0 (which vmexits under KVM at ~1k+ cycles per write) when
+/// the desired state already matches the current state.
+pub var fpu_trap_armed: [MAX_CORES]bool align(CACHE_LINE_SIZE) = [_]bool{false} ** MAX_CORES;
 
 var core_states: [MAX_CORES]PerCoreState align(CACHE_LINE_SIZE) = [_]PerCoreState{.{}} ** MAX_CORES;
 var expire_core: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);

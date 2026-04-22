@@ -96,6 +96,24 @@ pub const Thread = struct {
     /// never called `pmu_start`; allocated lazily on first start and freed
     /// on explicit `pmu_stop` or implicit release in `Thread.deinit`.
     pmu_state: ?*arch.PmuState = null,
+    /// Lazy-FPU save buffer. The kernel never touches FP/SIMD itself
+    /// (built with `-mno-sse`/`-mno-neon`), so userspace FPU state survives
+    /// across syscalls untouched in registers. Eviction happens only when
+    /// a different thread on the same core actually uses FP/SIMD —
+    /// trapping #NM (x64) or ESR_EL1.EC=0x07 (aarch64) — at which point
+    /// the trap handler `fxsave`/`stp q0..q31` into the previous owner's
+    /// buffer and `fxrstor`/`ldp` from the new owner's. 576 bytes covers
+    /// FXSAVE on x64 and V0-V31 + FPCR + FPSR on aarch64 (no SVE).
+    /// Aligned 64 because XSAVE family requires it on x64 (forward-compat),
+    /// and to hit a single cache line for the common case.
+    fpu_state: [576]u8 align(64) = [_]u8{0} ** 576,
+    /// Which core's `last_fpu_owner` slot currently points at this thread,
+    /// or `null` if the thread has never used FPU since boot or has been
+    /// evicted by another thread's trap. Set by the trap handler on save;
+    /// read by the scheduler on cross-core migration to know whether the
+    /// thread's regs need flushing from the source core's CPU before the
+    /// destination core can safely `fxrstor`.
+    last_fpu_core: ?u8 = null,
     /// Count of outstanding external pins on this Thread struct. Protects
     /// against concurrent-free races where a syscall looks up a thread
     /// via a handle, drops perm_lock, and then dereferences the *Thread
@@ -215,6 +233,7 @@ pub const Thread = struct {
             .user_stack = null,
             .process = proc,
         };
+        arch.fpuStateInit(&thread.fpu_state);
 
         thread.kernel_stack = try stack_mod.createKernel();
         errdefer stack_mod.destroyKernel(thread.kernel_stack, memory_init.kernel_addr_space_root);

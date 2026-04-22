@@ -18,6 +18,7 @@
 const zag = @import("zag");
 
 const exceptions = zag.arch.aarch64.exceptions;
+const fpu = zag.sched.fpu;
 const gic = zag.arch.aarch64.gic;
 const paging = zag.arch.aarch64.paging;
 const serial = zag.arch.aarch64.serial;
@@ -55,17 +56,18 @@ pub fn init() void {
     // until the first user process is scheduled, at which point a fresh
     // 4-level table is written to TTBR0.
     paging.forceT0Sz16();
-    // Enable Advanced SIMD / FP access at EL0 and EL1 (CPACR_EL1.FPEN = 0b11).
-    // Firmware on QEMU virt happens to leave FPEN enabled already, but PSCI
-    // CPU_ON on real hardware (Pi 5) brings secondaries up with CPACR_EL1 at
-    // its reset value, which traps any FP/SIMD instruction. LLVM emits q-reg
-    // loads for 16-byte struct copies (e.g. reading an `?u64` global via
-    // `serial.getBase`), so without FPEN the very first secondary call into
-    // any kernel Zig code hits a silent EL1→EL1 sync trap the kernel has no
-    // handler for. Setting FPEN here covers the BSP; `secondarySetup` does
-    // the same for each AP before it touches Zig code.
-    // ARM ARM D13.2.30: CPACR_EL1.FPEN, bits [21:20].
-    enableFpAccess();
+    // Lazy FPU: the kernel itself is built without FP/SIMD (see
+    // -Dcpu_features_sub in build.zig drops neon + fp_armv8) so it
+    // never emits Q-register loads, and there's no need to leave
+    // CPACR_EL1.FPEN globally open. Set it to 0b01 (trap EL0 only,
+    // EL1 unrestricted) — switchTo flips between 0b01 and 0b11 from
+    // here on as it tracks per-core FPU ownership. ARM ARM D13.2.30.
+    //
+    // Eager baseline (-Dlazy_fpu=false): leave FPEN at its firmware
+    // default (FPEN=0b11, no trap) so the eager save/restore in
+    // scheduler.switchToWithPmu owns the FPU lifecycle and the trap
+    // handler never fires.
+    if (comptime fpu.lazy_enabled) armFpTrapEl0();
     // Enable SP alignment checking at EL0 (SCTLR_EL1.SA0, bit 4). Without
     // this, EL0 SP-relative loads with a misaligned SP silently succeed
     // and the §6.8 alignment_fault behaviour cannot be exercised.
@@ -81,23 +83,24 @@ pub fn init() void {
 /// Secondary core initialization. Called on each AP after SMP boot brings
 /// the core online. Sets up the per-core GIC redistributor and CPU interface.
 pub fn perCoreInit(core_idx: usize) void {
-    enableFpAccess();
+    if (comptime fpu.lazy_enabled) armFpTrapEl0();
     enableSpAlignmentChecks();
     gic.initSecondaryCoreGic(core_idx);
 }
 
-/// Set CPACR_EL1.FPEN (bits [21:20] = 0b11) so Advanced SIMD / FP
-/// instructions do not trap at EL0 or EL1. Required on every core — PSCI
-/// CPU_ON brings the core up with CPACR_EL1 at its reset value, which may
-/// trap SIMD. LLVM emits q-register accesses for 16-byte struct copies
-/// inside regular Zig code, so FPEN must be on before any Zig code runs.
-/// ARM ARM D13.2.30 — CPACR_EL1.
-fn enableFpAccess() void {
+/// Set CPACR_EL1.FPEN bits [21:20] = 0b01 — trap any FP/SIMD access
+/// from EL0, allow at EL1 (the kernel is built without FP/SIMD so EL1
+/// access never actually fires). Required on every core because PSCI
+/// CPU_ON brings the core up with FPEN at its implementation-defined
+/// reset value. switchTo manages FPEN from here on.
+/// ARM ARM D13.2.30.
+fn armFpTrapEl0() void {
     var cpacr: u64 = undefined;
     asm volatile ("mrs %[v], cpacr_el1"
         : [v] "=r" (cpacr),
     );
-    cpacr |= (@as(u64, 0b11) << 20);
+    cpacr &= ~(@as(u64, 0b11) << 20);
+    cpacr |= (@as(u64, 0b01) << 20);
     asm volatile ("msr cpacr_el1, %[v]"
         :
         : [v] "r" (cpacr),

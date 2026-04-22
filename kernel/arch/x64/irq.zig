@@ -1,8 +1,10 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const arch = zag.arch.dispatch;
 const cpu = zag.arch.x64.cpu;
 const exceptions = zag.arch.x64.exceptions;
+const fpu = zag.sched.fpu;
 const futex = zag.proc.futex;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
@@ -18,6 +20,7 @@ const Process = zag.proc.process.Process;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 const SchedInterruptContext = zag.sched.scheduler.SchedInterruptContext;
 const SpinLock = zag.utils.sync.SpinLock;
+const Thread = zag.sched.thread.Thread;
 const UserViewEntry = zag.perms.permissions.UserViewEntry;
 const VAddr = zag.memory.address.VAddr;
 
@@ -104,6 +107,25 @@ pub fn init() void {
     interrupts.registerVector(
         kprof_vec,
         kprofDumpHandler,
+        .external,
+    );
+
+    // Lazy-FPU cross-core flush IPI vector. Sent by `cpu.fpuFlushIpi`
+    // when the scheduler migrates a thread whose FP regs still live on
+    // a remote core's hardware. Receiver runs `fpuFlushIpiHandler` to
+    // FXSAVE the requested thread's state from this core's regs into
+    // the thread's `fpu_state` buffer, then acks the mailbox.
+    const fpu_flush_vec = @intFromEnum(interrupts.IntVecs.fpu_flush);
+    idt.openInterruptGate(
+        fpu_flush_vec,
+        interrupts.stubs[fpu_flush_vec],
+        gdt.KERNEL_CODE_OFFSET,
+        PrivilegeLevel.ring_0,
+        GateType.interrupt_gate,
+    );
+    interrupts.registerVector(
+        fpu_flush_vec,
+        fpuFlushIpiHandler,
         .external,
     );
 
@@ -219,6 +241,22 @@ fn spuriousHandler(ctx: *cpu.Context) void {
 /// Never returns — parkForDump halts after dump_done is observed.
 fn kprofDumpHandler(_: *cpu.Context) void {
     kprof_dump.parkForDump();
+}
+
+/// IPI handler for the lazy-FPU cross-core flush. Reads the requested
+/// thread from this core's mailbox, calls into the generic FPU module
+/// (which checks if this core is still the owner and FXSAVEs if so),
+/// then acks the mailbox so the requester unblocks.
+fn fpuFlushIpiHandler(_: *cpu.Context) void {
+    const core_id: u8 = @truncate(arch.coreID());
+    const slot = &interrupts.fpu_flush_mailbox[core_id];
+    const opaque_ptr = @atomicLoad(?*anyopaque, &slot.requested_thread, .acquire) orelse {
+        slot.ackDone();
+        return;
+    };
+    const thread: *Thread = @ptrCast(@alignCast(opaque_ptr));
+    fpu.flushIpiHandler(thread);
+    slot.ackDone();
 }
 
 fn schedTimerHandler(ctx: *cpu.Context) void {

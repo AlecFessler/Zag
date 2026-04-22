@@ -4,6 +4,7 @@ const zag = @import("zag");
 const address = zag.memory.address;
 const arch = zag.arch.dispatch;
 const cpu = zag.arch.x64.cpu;
+const fpu = zag.sched.fpu;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const interrupts = zag.arch.x64.interrupts;
@@ -139,7 +140,10 @@ fn exceptionFaultReason(vector: u5) ?FaultReason {
     return switch (@as(Exception, @enumFromInt(vector))) {
         .divide_by_zero, .overflow, .bound_range_exceeded => .arithmetic_fault,
         .x87_floating_point, .simd_floating_point => .arithmetic_fault,
-        .invalid_opcode, .device_not_available => .illegal_instruction,
+        .invalid_opcode => .illegal_instruction,
+        // device_not_available is handled out-of-band (lazy FPU trap)
+        // before we reach exceptionFaultReason — see exceptionHandler.
+        .device_not_available => null,
         .alignment_check => .alignment_fault,
         .general_protection_fault, .stack_segment_fault => .protection_fault,
         .invalid_task_state_segment, .segment_not_present => .protection_fault,
@@ -157,6 +161,17 @@ fn exceptionHandler(ctx: *cpu.Context) void {
     const exception: Exception = @enumFromInt(vector);
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
     const from_user = (ctx.cs & ring_3) == ring_3;
+
+    // Lazy-FPU trap. CR0.TS was set by switchTo when this thread last
+    // got dispatched (because it wasn't the last FPU owner on this
+    // core). Userspace's first FP/SSE instruction trapped #NM here —
+    // swap state and return so the instruction re-executes.
+    if (exception == .device_not_available) {
+        const thread = scheduler.currentThread() orelse
+            @panic("#NM with no current thread");
+        fpu.handleTrap(thread);
+        return;
+    }
 
     if (from_user) {
         // Debug/single-step from userspace: just resume.

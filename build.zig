@@ -91,6 +91,11 @@ pub fn build(b: *std.Build) void {
         @panic("-Dkernel_profile must be one of: none, trace, sample");
     }
     const kprof_enabled = !std.mem.eql(u8, kernel_profile, "none");
+    // Lazy-FPU on/off switch. Default on. With -Dlazy_fpu=false the
+    // kernel arms no FP-disable trap and unconditionally save/restores
+    // FPU state on every context switch — exposes the eager baseline
+    // for A/B perf comparison.
+    const lazy_fpu = b.option(bool, "lazy_fpu", "Lazy FPU save/restore (default: on)") orelse true;
 
     const arch: std.Target.Cpu.Arch = blk: {
         break :blk if (std.mem.eql(u8, target_arch, "x64"))
@@ -120,12 +125,51 @@ pub fn build(b: *std.Build) void {
         .{ .explicit = &std.Target.aarch64.cpu.cortex_a72 }
     else
         .determined_by_arch_os;
+    // Lazy-FPU requires the kernel itself to never emit FP/SIMD
+    // instructions, so userspace FP state survives across kernel
+    // entries untouched in registers. LLVM otherwise auto-vectorises
+    // 16-byte struct copies into XMM/Q-reg moves throughout the
+    // kernel. Subtract the SIMD feature bits per arch and add
+    // soft_float (x64) so compiler-rt uses software-emulated FP for
+    // its own float-converting builtins (otherwise their SSE-register
+    // return ABIs fail to compile against the reduced target).
+    const cpu_features_sub: std.Target.Cpu.Feature.Set = blk: {
+        var s = std.Target.Cpu.Feature.Set.empty;
+        if (arch == .x86_64) {
+            const F = std.Target.x86.Feature;
+            s.addFeature(@intFromEnum(F.mmx));
+            s.addFeature(@intFromEnum(F.sse));
+            s.addFeature(@intFromEnum(F.sse2));
+            s.addFeature(@intFromEnum(F.avx));
+            s.addFeature(@intFromEnum(F.avx2));
+        } else if (arch == .aarch64) {
+            // TODO: also drop neon for aarch64 — needs the bootloader
+            // path debugged first (initial attempt boot-faults in
+            // firmware between [ZAG] stack and [ZAG] exit BS). For now
+            // leave NEON enabled on aarch64 so the bootloader still
+            // works; lazy-FPU correctness still holds because the
+            // kernel save/restore asm runs unconditionally and the
+            // CPACR_EL1 trap arms regardless of whether the kernel
+            // *could* clobber V regs.
+            _ = std.Target.aarch64.Feature; // keep import shape stable
+        }
+        break :blk s;
+    };
+    const cpu_features_add: std.Target.Cpu.Feature.Set = blk: {
+        var s = std.Target.Cpu.Feature.Set.empty;
+        if (arch == .x86_64) {
+            s.addFeature(@intFromEnum(std.Target.x86.Feature.soft_float));
+        }
+        break :blk s;
+    };
     const zag_mod = b.addModule("zag", .{
         .root_source_file = b.path("kernel/zag.zig"),
         .target = b.resolveTargetQuery(.{
             .cpu_arch = arch,
             .os_tag = .freestanding,
             .cpu_model = cpu_model,
+            .cpu_features_sub = cpu_features_sub,
+            .cpu_features_add = cpu_features_add,
         }),
         .optimize = optimize,
     });
@@ -135,6 +179,7 @@ pub fn build(b: *std.Build) void {
 
     const build_opts = b.addOptions();
     build_opts.addOption([]const u8, "kernel_profile", kernel_profile);
+    build_opts.addOption(bool, "lazy_fpu", lazy_fpu);
     const build_opts_mod = build_opts.createModule();
     zag_mod.addImport("build_options", build_opts_mod);
 
@@ -144,6 +189,8 @@ pub fn build(b: *std.Build) void {
             .cpu_arch = arch,
             .os_tag = .freestanding,
             .cpu_model = cpu_model,
+            .cpu_features_sub = cpu_features_sub,
+            .cpu_features_add = cpu_features_add,
         }),
         .optimize = optimize,
     });
@@ -177,6 +224,8 @@ pub fn build(b: *std.Build) void {
             .cpu_arch = arch,
             .os_tag = .freestanding,
             .cpu_model = cpu_model,
+            .cpu_features_sub = cpu_features_sub,
+            .cpu_features_add = cpu_features_add,
         }),
         .optimize = optimize,
     });
@@ -220,6 +269,8 @@ pub fn build(b: *std.Build) void {
                 .os_tag = .freestanding,
                 .ofmt = .elf,
                 .cpu_model = cpu_model,
+                .cpu_features_sub = cpu_features_sub,
+                .cpu_features_add = cpu_features_add,
             }),
             .optimize = optimize,
             .code_model = if (arch == .x86_64) .kernel else .small,

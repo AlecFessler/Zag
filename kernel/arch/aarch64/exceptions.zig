@@ -45,7 +45,9 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const aarch64_interrupts = zag.arch.aarch64.interrupts;
 const arch = zag.arch.dispatch;
+const fpu = zag.sched.fpu;
 const gic = zag.arch.aarch64.gic;
 const kprof_dump = zag.kprof.dump;
 const pmu = zag.arch.aarch64.pmu;
@@ -55,6 +57,7 @@ const syscall_dispatch = zag.syscall.dispatch;
 const ArchCpuContext = zag.arch.aarch64.interrupts.ArchCpuContext;
 const FaultReason = zag.perms.permissions.FaultReason;
 const PageFaultContext = zag.arch.aarch64.interrupts.PageFaultContext;
+const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 const VmNode = zag.memory.vmm.VmNode;
 
@@ -63,6 +66,7 @@ const VmNode = zag.memory.vmm.VmNode;
 const ExceptionClass = enum(u6) {
     unknown = 0x00,
     wf_trapped = 0x01,
+    sve_simd_fp_access = 0x07, // ARM ARM D13.2.37 — Access to FP/Advanced SIMD/SVE
     svc_aarch64 = 0x15,
     instruction_abort_lower_el = 0x20,
     instruction_abort_same_el = 0x21,
@@ -390,6 +394,18 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     const ec = extractEc(esr);
 
     switch (ec) {
+        // Lazy-FPU trap. CPACR_EL1.FPEN was clamped to 0b01 (trap EL0)
+        // by switchTo when this thread last got dispatched (because it
+        // wasn't the last FPU owner on this core). Userspace's first
+        // FP/SIMD instruction trapped here — swap state and return so
+        // the instruction re-executes.
+        .sve_simd_fp_access => {
+            const thread = scheduler.currentThread() orelse
+                @panic("FP/SIMD trap with no current thread");
+            fpu.handleTrap(thread);
+            return;
+        },
+
         .svc_aarch64 => {
             const result = syscall_dispatch.dispatch(ctx);
             // IPC recv handlers may have already populated x0 with reply
@@ -628,6 +644,19 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.
         // SGI 1 — kprof-dump IPI. Park until the dumper bumps the epoch.
         1 => {
             kprof_dump.parkForDump();
+        },
+        // SGI 2 — lazy-FPU cross-core flush. The requesting core wrote
+        // the target thread into this core's mailbox; we save the FPU
+        // regs into the thread's `fpu_state` if we still own them, then
+        // ack so the requester unblocks. See `cpu.fpuFlushIpi`.
+        2 => {
+            const core_idx: u8 = @truncate(arch.coreID());
+            const slot = &aarch64_interrupts.fpu_flush_mailbox[core_idx];
+            if (@atomicLoad(?*anyopaque, &slot.requested_thread, .acquire)) |opq| {
+                const thread: *Thread = @ptrCast(@alignCast(opq));
+                fpu.flushIpiHandler(thread);
+            }
+            slot.ackDone();
         },
         gic.SGI_BCAST_TICK => {
             // BSP-driven broadcast scheduler tick (Pi 5 KVM vGICv2

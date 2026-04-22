@@ -55,8 +55,11 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
+const cpu = zag.arch.aarch64.cpu;
+const fpu = zag.sched.fpu;
 const gic = zag.arch.aarch64.gic;
 const paging = zag.arch.aarch64.paging;
+const scheduler = zag.sched.scheduler;
 
 const PAddr = zag.memory.address.PAddr;
 const Thread = zag.sched.thread.Thread;
@@ -111,6 +114,33 @@ pub const PageFaultContext = struct {
     rip: u64 = 0,
     user_ctx: ?*ArchCpuContext = null,
 };
+
+/// Per-CPU mailbox for the lazy-FPU cross-core flush IPI (SGI 2).
+/// Mirrors the x64 layout in `arch/x64/interrupts.zig` — one slot per
+/// *target* core, requester writes the thread, sends the SGI, spins
+/// on `done`. Receiver reads the thread, FXSAVEs from its own regs,
+/// acks. See `cpu.fpuFlushIpi`.
+pub const FpuFlushMailbox = struct {
+    requested_thread: ?*anyopaque align(64) = null,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+
+    pub fn requestThread(self: *FpuFlushMailbox, thread: anytype) void {
+        @atomicStore(?*anyopaque, &self.requested_thread, @ptrCast(thread), .release);
+        self.done.store(false, .release);
+    }
+
+    pub fn waitDone(self: *FpuFlushMailbox) void {
+        while (!self.done.load(.acquire)) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    pub fn ackDone(self: *FpuFlushMailbox) void {
+        self.done.store(true, .release);
+    }
+};
+
+pub var fpu_flush_mailbox: [64]FpuFlushMailbox align(64) = [_]FpuFlushMailbox{.{}} ** 64;
 
 /// Allocate and initialize an ArchCpuContext at the top of a kernel stack.
 ///
@@ -211,6 +241,28 @@ pub fn switchTo(thread: *Thread) noreturn {
     const new_root = thread.process.addr_space_root;
     if (new_root.addr != arch.getAddrSpaceRoot().addr) {
         arch.swapAddrSpace(new_root, thread.process.addr_space_id);
+    }
+
+    // Lazy FPU: CPACR_EL1.FPEN should trap iff `thread` isn't the
+    // current FPU owner on this core. Track the desired state in a
+    // shadow var and only touch CPACR when it changes — MSRs to
+    // CPACR_EL1 ISB-fence and may trap to EL2 under some hypervisors,
+    // so skipping no-op writes matters.
+    //
+    // Cross-core migration: if the thread's FP regs live on another
+    // core, IPI it to flush before we can safely fxrstor here.
+    //
+    // Skipped under -Dlazy_fpu=false (eager baseline): the FPU regs
+    // were already swapped in scheduler.switchToWithPmu and FPEN stays
+    // open, so no migration flush is needed either.
+    if (comptime fpu.lazy_enabled) {
+        fpu.migrateFlush(thread);
+        const cid: u8 = @truncate(arch.coreID());
+        const desired_armed = (scheduler.last_fpu_owner[cid] != thread);
+        if (desired_armed != scheduler.fpu_trap_armed[cid]) {
+            if (desired_armed) cpu.fpuArmTrap() else cpu.fpuClearTrap();
+            scheduler.fpu_trap_armed[cid] = desired_armed;
+        }
     }
 
     // Restore SP_EL1 so the incoming thread's in-progress kernel frames

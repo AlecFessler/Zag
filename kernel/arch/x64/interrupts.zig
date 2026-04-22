@@ -4,8 +4,10 @@ const zag = @import("zag");
 const apic = zag.arch.x64.apic;
 const arch = zag.arch.dispatch;
 const cpu = zag.arch.x64.cpu;
+const fpu = zag.sched.fpu;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
+const scheduler = zag.sched.scheduler;
 
 const InterruptHandler = idt.interruptHandler;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
@@ -34,7 +36,37 @@ pub const IntVecs = enum(u8) {
     tlb_shootdown = 0xFD,
     sched = 0xFE,
     spurious = 0xFF,
+    fpu_flush = 0xFA,
 };
+
+/// Per-CPU mailbox for the FPU-flush IPI. The requesting core writes
+/// `requested_thread`, sends the IPI, then spins on `done`. The
+/// receiver reads `requested_thread`, performs the FXSAVE, sets `done`.
+/// One mailbox per *target* core; concurrent flushes targeting the
+/// same core would serialize at the IPI vector level (the receiver
+/// services one IPI at a time), but in practice a thread only owns FPU
+/// on one core so a second flush of the same thread is a no-op.
+pub const FpuFlushMailbox = struct {
+    requested_thread: ?*anyopaque align(64) = null,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+
+    pub fn requestThread(self: *FpuFlushMailbox, thread: anytype) void {
+        @atomicStore(?*anyopaque, &self.requested_thread, @ptrCast(thread), .release);
+        self.done.store(false, .release);
+    }
+
+    pub fn waitDone(self: *FpuFlushMailbox) void {
+        while (!self.done.load(.acquire)) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    pub fn ackDone(self: *FpuFlushMailbox) void {
+        self.done.store(true, .release);
+    }
+};
+
+pub var fpu_flush_mailbox: [64]FpuFlushMailbox align(64) = [_]FpuFlushMailbox{.{}} ** 64;
 
 pub const VectorKind = enum {
     exception,
@@ -185,17 +217,17 @@ pub export fn syscallEntry() callconv(.naked) void {
         \\movq %%r14, 8(%%rsp)        // ctx.regs.r14
         \\movq %%r15, 0(%%rsp)        // ctx.regs.r15
 
-        // ── FXSAVE (Intel SDM Vol 1 §10.5) ──────────────────────────
-        \\subq $512, %%rsp
-        \\fxsave (%%rsp)
-
         // ── Dispatch ─────────────────────────────────────────────────
-        \\lea 512(%%rsp), %%rdi       // RDI = &Context
+        // Lazy FPU: no FXSAVE here. The user's FP/SIMD register file is
+        // left in place across the syscall. The kernel is built without
+        // SSE (see -mno-sse2/-mno-avx in build.zig), so it cannot
+        // clobber XMM/YMM state. The thread is still the FPU owner on
+        // this core (last_fpu_owner[core] == thread), so on iretq the
+        // user can keep using FP without any trap.
+        \\movq %%rsp, %%rdi            // RDI = &Context
         \\call syscallDispatch
 
-        // ── Restore FPU + GPRs ───────────────────────────────────────
-        \\fxrstor (%%rsp)
-        \\addq $512, %%rsp
+        // ── Restore GPRs ─────────────────────────────────────────────
         \\movq 0(%%rsp), %%r15
         \\movq 8(%%rsp), %%r14
         \\movq 16(%%rsp), %%r13
@@ -230,29 +262,21 @@ pub fn prepareThreadContext(
     arg: u64,
 ) *ArchCpuContext {
     @setRuntimeSafety(false);
-    // Match the real interrupt entry layout. TSS.RSP0 = kernel_stack.top (page-aligned).
-    // CPU pushes 5 words (40 bytes), stub pushes 2 words (16 bytes),
-    // prologue pushes 15 GP regs (120 bytes) = 176 total. Then FXSAVE area below.
-    // kstack_top from caller is alignStack(top) = top-8, but we need the raw top
-    // (same as TSS.RSP0) so FXSAVE lands at a 16-byte aligned address.
-    // Undo the -8 from alignStack:
+    // Match the real interrupt entry layout. TSS.RSP0 = kernel_stack.top
+    // (page-aligned). CPU pushes 5 words (40 bytes), stub pushes 2 words
+    // (16 bytes), prologue pushes 15 GP regs (120 bytes) = 176 total.
+    // Under lazy FPU there is no FXSAVE area below Context — the per-
+    // thread `fpu_state` buffer lives in the Thread struct, not on the
+    // kernel stack.
+    // kstack_top from caller is alignStack(top) = top-8, undo the -8:
     const raw_top: u64 = (kstack_top.addr + 8 + 15) & ~@as(u64, 15);
     const ctx_addr: u64 = raw_top - @sizeOf(cpu.Context);
-    const fxsave_addr: u64 = ctx_addr - cpu.fxsave_size;
     var ctx: *cpu.Context = @ptrFromInt(ctx_addr);
 
     const ring_3 = @intFromEnum(PrivilegeLevel.ring_3);
 
-    // Zero the entire region (FXSAVE area + Context) to avoid movaps
-    // alignment issues and to give a clean initial SSE state.
-    const full_bytes: [*]u8 = @ptrFromInt(fxsave_addr);
-    @memset(full_bytes[0 .. cpu.fxsave_size + @sizeOf(cpu.Context)], 0);
+    @memset(std.mem.asBytes(ctx), 0);
 
-    // Set FXSAVE defaults: FCW=0x037F (mask all FPU exceptions),
-    // MXCSR=0x1F80 (mask all SSE exceptions, round-to-nearest)
-    const fxsave: [*]u8 = @ptrFromInt(fxsave_addr);
-    @as(*align(1) u16, @ptrCast(fxsave[0..2])).* = 0x037F; // FCW
-    @as(*align(1) u32, @ptrCast(fxsave[24..28])).* = 0x1F80; // MXCSR
     ctx.regs.rdi = arg;
     ctx.rip = @intFromPtr(entry);
     ctx.rflags = 0x202;
@@ -264,10 +288,9 @@ pub fn prepareThreadContext(
     } else {
         ctx.cs = gdt.KERNEL_CODE_OFFSET;
         ctx.ss = gdt.KERNEL_DATA_OFFSET;
-        // Subtract 8 to simulate a CALL instruction's return-address push,
-        // so the entry function sees RSP ≡ 8 (mod 16) per the SysV ABI.
-        // The slot at ctx_addr-8 falls in the (already-restored) FXSAVE area
-        // and is zero, which is fine — kernel entry points never return.
+        // Subtract 8 to simulate a CALL instruction's return-address
+        // push so the entry function sees RSP ≡ 8 (mod 16) per the
+        // SysV ABI. Kernel entry points never return.
         ctx.rsp = ctx_addr - 8;
     }
 
@@ -286,12 +309,31 @@ pub fn switchTo(thread: *Thread) void {
         std.debug.assert(arch.getAddrSpaceRoot().addr == new_root.addr);
     }
 
+    // Lazy FPU: TS should be clear iff `thread` is the current owner
+    // on this core, set otherwise. Track the desired state and only
+    // touch CR0 when it changes — MOV-to-CR0 vmexits under KVM at
+    // ~1k+ cycles per write, so skipping no-op writes is critical.
+    //
+    // Cross-core migration: if the thread's FP state lives in a
+    // different core's regs, flush it out via IPI first so the trap
+    // handler restores from the right buffer contents.
+    //
+    // Skipped under -Dlazy_fpu=false (eager baseline): the FPU regs
+    // were already swapped in scheduler.switchToWithPmu and CR0.TS is
+    // never armed, so no migration flush is needed either.
+    if (comptime fpu.lazy_enabled) {
+        fpu.migrateFlush(thread);
+        const cid: u8 = @truncate(core_id);
+        const desired_armed = (scheduler.last_fpu_owner[cid] != thread);
+        if (desired_armed != scheduler.fpu_trap_armed[cid]) {
+            if (desired_armed) cpu.fpuArmTrap() else cpu.fpuClearTrap();
+            scheduler.fpu_trap_armed[cid] = desired_armed;
+        }
+    }
+
     apic.endOfInterrupt();
-    // ctx points to Context (GP regs). FXSAVE area is 512 bytes below.
-    // Epilogue expects RSP at FXSAVE area.
     asm volatile (
         \\movq %[new_stack], %%rsp
-        \\subq $512, %%rsp
         \\jmp interruptStubEpilogue
         :
         : [new_stack] "r" (@intFromPtr(thread.ctx)),
@@ -361,12 +403,12 @@ export fn interruptStubPrologue() callconv(.naked) void {
         \\pushq %r14
         \\pushq %r15
         \\
-        // Save SSE/x87 state (512 bytes below GP regs)
-        \\subq $512, %rsp
-        \\fxsave (%rsp)
-        \\
-        // Pass Context address (GP regs, 512 bytes above FXSAVE) to handler
-        \\lea 512(%rsp), %rdi
+        // Lazy FPU: no FXSAVE here. Kernel is built without SSE so it
+        // cannot dirty the FP/SIMD register file across the handler.
+        // The previous owner of the FPU on this core (which may be the
+        // userspace thread we just interrupted, or some other thread
+        // whose state has been parked here) keeps its regs in place.
+        \\movq %rsp, %rdi
         \\call dispatchInterrupt
         \\
         \\jmp interruptStubEpilogue
@@ -375,10 +417,6 @@ export fn interruptStubPrologue() callconv(.naked) void {
 
 export fn interruptStubEpilogue() callconv(.naked) void {
     asm volatile (
-    // Restore SSE/x87 state
-        \\fxrstor (%rsp)
-        \\addq $512, %rsp
-        \\
         \\popq %r15
         \\popq %r14
         \\popq %r13
