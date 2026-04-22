@@ -47,6 +47,7 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const gic = zag.arch.aarch64.gic;
+const kprof_dump = zag.kprof.dump;
 const pmu = zag.arch.aarch64.pmu;
 const scheduler = zag.sched.scheduler;
 const syscall_dispatch = zag.syscall.dispatch;
@@ -623,6 +624,10 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.
                 .thread_ctx = ctx,
             };
             scheduler.schedTimerHandler(sched_ctx);
+        },
+        // SGI 1 — kprof-dump IPI. Park until the dumper bumps the epoch.
+        1 => {
+            kprof_dump.parkForDump();
         },
         gic.SGI_BCAST_TICK => {
             // BSP-driven broadcast scheduler tick (Pi 5 KVM vGICv2

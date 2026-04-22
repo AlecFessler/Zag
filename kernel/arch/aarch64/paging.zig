@@ -816,9 +816,16 @@ pub fn enableKernelTranslation() void {
         :
         : [val] "r" (tcr),
         : .{ .memory = true });
-    // ISB ensures the new TCR takes effect for subsequent TTBR1 writes.
-    // No TLBI needed — TTBR1 had no valid entries before this.
-    asm volatile ("isb" ::: .{ .memory = true });
+    // ISB publishes the new TCR. Flush any TLB entries cached under the
+    // previous AS=0 interpretation — their ASID tags are reinterpreted
+    // under AS=1 and would alias incorrectly otherwise.
+    asm volatile (
+        \\isb
+        \\dsb ishst
+        \\tlbi vmalle1is
+        \\dsb ish
+        \\isb
+        ::: .{ .memory = true });
 }
 
 /// Set MAIR_EL1 to our expected attribute configuration and flush TLB.
