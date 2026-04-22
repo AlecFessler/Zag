@@ -6,8 +6,8 @@
 #   2. aarch64 kernel test suite  (KVM on the Pi 5 @ 192.168.86.106 via SSH)
 #   3. hyprvOS Linux boot          (x86-64, KVM on this PC)
 #   4. hyprvOS Linux boot          (aarch64, KVM on Pi via SSH)
-#   5. redteam regression runner   (COMMENTED OUT, runner does not exist yet)
-#   6. kernel perf regression test (COMMENTED OUT, harness does not exist yet)
+#   5. red-team regression PoCs   (tests/redteam/run_all.sh)
+#   6. kernel perf regression gate (tests/prof/run_perf.sh, kprof trace)
 #
 # Usage:
 #   ./tests/precommit.sh
@@ -235,39 +235,37 @@ stage_hyprvos_aarch64_linux_boot() {
     fi
 }
 
-# ── Regression PoC runner (tests/redteam/) ────────────────────────────
-# Commented out: tests/redteam/run.sh builds and runs ONE PoC at a time via
-# -Dsrc=<file>. A batch runner that iterates every tracked PoC and asserts
-# the expected outcome (panic caught / syscall rejected / etc.) is planned
-# but does not exist yet. Enable once it lands.
-#
-# stage_redteam_regressions() {
-#     echo ""
-#     echo "=================================================="
-#     echo "[5] Red-team regression PoCs"
-#     echo "=================================================="
-#     if ! bash "$SCRIPT_DIR/redteam/run_all.sh"; then
-#         FAILURES+=("red-team regressions")
-#         return 1
-#     fi
-# }
+stage_redteam_regressions() {
+    echo ""
+    echo "=================================================="
+    echo "[5] Red-team regression PoCs"
+    echo "=================================================="
+    # tests/redteam/run_all.sh iterates every PoC that emits a
+    # `POC-<id>: PATCHED` marker, reusing the per-PoC run.sh pipeline.
+    # SKIPPED outcomes (e.g. no VMX) are allowed; VULNERABLE or a
+    # missing marker (kernel panic before AFTER) fails the gate.
+    if ! bash "$SCRIPT_DIR/redteam/run_all.sh"; then
+        FAILURES+=("red-team regressions")
+        return 1
+    fi
+}
 
-# ── Kernel perf regression test ──────────────────────────────────────
-# Commented out: the perf harness (baseline snapshotting, compare-to-last,
-# delta reporting) is not yet implemented. Once it exists, this stage should
-# run the benchmarks, diff against the committed baseline, and fail only on
-# regressions above a configured threshold while still reporting wins.
-#
-# stage_kernel_perf() {
-#     echo ""
-#     echo "=================================================="
-#     echo "[6] Kernel performance regression test"
-#     echo "=================================================="
-#     if ! bash "$SCRIPT_DIR/prof/run_perf.sh" --compare-baseline; then
-#         FAILURES+=("kernel perf regression")
-#         return 1
-#     fi
-# }
+stage_kernel_perf() {
+    echo ""
+    echo "=================================================="
+    echo "[6] Kernel perf regression (kprof trace)"
+    echo "=================================================="
+    # tests/prof/run_perf.sh boots each workload with
+    # `-Dkernel_profile=trace` and compares scope medians against
+    # tests/prof/baselines/<workload>.json. Sampling doesn't fit this
+    # job — we're gating known scheduler/IPC/fault scopes, not
+    # hunting unknown hot paths. Enter/exit pairs with PMU deltas
+    # give a direct per-scope answer.
+    if ! bash "$SCRIPT_DIR/prof/run_perf.sh" --compare-baseline; then
+        FAILURES+=("kernel perf regression")
+        return 1
+    fi
+}
 
 # ── Dispatch ──────────────────────────────────────────────────────────
 
@@ -277,8 +275,8 @@ stage_x86_kernel_tests          || true
 stage_aarch64_kernel_tests_pi   || true
 stage_hyprvos_x86_linux_boot    || true
 stage_hyprvos_aarch64_linux_boot || true
-# stage_redteam_regressions     || true
-# stage_kernel_perf             || true
+stage_redteam_regressions       || true
+stage_kernel_perf               || true
 
 echo ""
 echo "=================================================="

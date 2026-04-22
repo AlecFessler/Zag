@@ -11,6 +11,7 @@ iso/boot/kernel.elf
 !ktests/redteam/*.elf
 ktests/perf/perf_results/
 ktests/tests/perf_results/
+tests/prof/current/
 __pycache__/
 *.pyc
 qemu.log
