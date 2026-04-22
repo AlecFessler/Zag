@@ -31,6 +31,7 @@ const guest_memory = kvm.guest_memory;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const sched = zag.sched.scheduler;
+const stage2 = zag.arch.aarch64.stage2;
 const vcpu_mod = kvm.vcpu;
 const vgic_mod = kvm.vgic;
 const vm_hw = zag.arch.aarch64.vm;
@@ -101,7 +102,7 @@ pub const Vm = struct {
         self.guest_mem.deinit(self.arch_structures);
 
         if (self.arch_structures.addr != 0) {
-            vm_hw.vmFreeStructures(self.arch_structures);
+            stage2.vmFreeStructures(self.arch_structures);
         }
 
         // Drop the VMID. The allocator does not return the id to a free
@@ -236,7 +237,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
 
     const vm_obj = allocator.create(Vm) catch return E_NOMEM;
 
-    const arch_structures = vm_hw.vmAllocStructures() orelse {
+    const arch_structures = stage2.vmAllocStructures() orelse {
         allocator.destroy(vm_obj);
         return E_NOMEM;
     };
@@ -275,7 +276,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
                 vcpu_mod.destroy(vm_obj.vcpus[j]);
                 j += 1;
             }
-            vm_hw.vmFreeStructures(arch_structures);
+            stage2.vmFreeStructures(arch_structures);
             allocator.destroy(vm_obj);
             return E_NOMEM;
         };
@@ -301,7 +302,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
                 vcpu_mod.destroy(vm_obj.vcpus[j]);
                 j += 1;
             }
-            vm_hw.vmFreeStructures(arch_structures);
+            stage2.vmFreeStructures(arch_structures);
             allocator.destroy(vm_obj);
             return E_MAXCAP;
         };
@@ -367,12 +368,12 @@ pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64
             rollbackGuestMap(vm_obj, guest_addr, offset);
             return E_BADADDR;
         };
-        // M4 #125: `vm_hw.mapGuestPage` picks stage-2 MemAttr from the
+        // M4 #125: `stage2.mapGuestPage` picks stage-2 MemAttr from the
         // target IPA internally (PL011, virtio-mmio → Device-nGnRnE;
         // everything else → Normal WB). vGIC windows never reach this
         // code — `guestMap` rejects them above and `Vm.tryHandleMmio`
         // consumes the resulting stage-2 fault.
-        vm_hw.mapGuestPage(vm_obj.arch_structures, guest_addr + offset, host_phys, @truncate(rights)) catch {
+        stage2.mapGuestPage(vm_obj.arch_structures, guest_addr + offset, host_phys, @truncate(rights)) catch {
             rollbackGuestMap(vm_obj, guest_addr, offset);
             return E_NOMEM;
         };
@@ -395,13 +396,13 @@ pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64
 fn rollbackGuestMap(vm_obj: *Vm, guest_addr: u64, mapped_size: u64) void {
     var off: u64 = 0;
     while (off < mapped_size) {
-        vm_hw.unmapGuestPage(vm_obj.arch_structures, guest_addr + off);
+        stage2.unmapGuestPage(vm_obj.arch_structures, guest_addr + off);
         off += 0x1000;
     }
 }
 
 /// `vm_sysreg_passthrough` — on ARM the `sysreg_id` parameter is a packed
-/// (op0,op1,crn,crm,op2) sysreg encoding (see `vm_hw.sysregPassthrough`
+/// (op0,op1,crn,crm,op2) sysreg encoding (see `stage2.sysregPassthrough`
 /// header). The kernel refuses security-critical sysregs that would
 /// allow the guest to escape EL1 confinement.
 pub fn sysregPassthrough(proc: *Process, vm_handle: u64, sysreg_id: u32, allow_read: bool, allow_write: bool) i64 {
@@ -417,7 +418,7 @@ pub fn sysregPassthrough(proc: *Process, vm_handle: u64, sysreg_id: u32, allow_r
     vm_obj.lock.lock();
     defer vm_obj.lock.unlock();
 
-    vm_hw.sysregPassthrough(vm_obj.arch_structures, sysreg_id, allow_read, allow_write);
+    stage2.sysregPassthrough(vm_obj.arch_structures, sysreg_id, allow_read, allow_write);
     return 0; // E_OK
 }
 
@@ -512,7 +513,7 @@ fn writeGuestGpr(gs: *vm_hw.GuestState, n: u8, value: u64) void {
 /// let the guest reach EL2 / EL3 state, plus the ID registers we depend on
 /// for VmPolicy decisions.
 ///
-/// The encoding scheme matches the doc comment on `vm_hw.sysregPassthrough`:
+/// The encoding scheme matches the doc comment on `stage2.sysregPassthrough`:
 ///   bits [15:14] Op0
 ///   bits [13:11] Op1
 ///   bits [10:7]  CRn

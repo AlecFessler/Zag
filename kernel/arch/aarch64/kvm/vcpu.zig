@@ -1,7 +1,7 @@
 //! Aarch64 VCpu object — scaffolding.
 //!
 //! Mirrors `kernel/arch/x64/kvm/vcpu.zig`. The VCpu represents a virtual
-//! CPU: a kernel thread that runs the guest via `vm_hw.vmResume` in a
+//! CPU: a kernel thread that runs the guest via `vm_hyp.vmResume` in a
 //! loop, interleaving inline exit handling and delivery to the VMM via
 //! the VmExitBox.
 //!
@@ -37,8 +37,10 @@ const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const sched = zag.sched.scheduler;
 const stack_mod = zag.memory.stack;
+const stage2 = zag.arch.aarch64.stage2;
 const thread_mod = zag.sched.thread;
 const vm_hw = zag.arch.aarch64.vm;
+const vm_hyp = zag.arch.aarch64.hyp;
 const vm_mod = kvm.vm;
 const vmid_mod = kvm.vmid;
 
@@ -79,8 +81,8 @@ pub const VCpu = struct {
     /// Per-vCPU scratch the EL2 hyp stub uses for the world-switch
     /// marshalling block (WorldSwitchCtx + HostSave). Lives inline in
     /// the VCpu so its PA is reachable by `PAddr.fromVAddr` while the
-    /// stub runs with EL2 MMU off. See `arch.aarch64.vm.ArchScratch`.
-    arch_scratch: vm_hw.ArchScratch align(16) = .{},
+    /// stub runs with EL2 MMU off. See `arch.aarch64.hyp.ArchScratch`.
+    arch_scratch: vm_hyp.ArchScratch align(16) = .{},
     /// Per-vCPU vGIC state: redistributor SGI/PPI bookkeeping plus the
     /// list-register shadow consumed by `vgic.prepareEntry` /
     /// `vgic.saveExit`. Initialized by `vcpu.create` via `vgic.initVcpu`
@@ -230,10 +232,10 @@ fn vcpuEntryPoint() void {
         const vm_structures = vm_obj.arch_structures;
         vmid_mod.refresh(vm_obj);
         // Stage the refreshed VMID into the per-VM control block so
-        // `vm_hw.vmResume` can build VTTBR_EL2.VMID from `vm_structures`
+        // `vm_hyp.vmResume` can build VTTBR_EL2.VMID from `vm_structures`
         // alone (matches the x86 pattern where the per-VM ASID/VPID
         // is already inside the VMCB/VMCS that vm_structures points at).
-        vm_hw.controlBlock(vm_structures).vmid = vm_obj.vmid;
+        stage2.controlBlock(vm_structures).vmid = vm_obj.vmid;
 
         // M5.1 (#127): program the virtual CPU interface from the
         // per-vCPU shadow (list registers, AP0R/AP1R, ICH_HCR.EN,
@@ -247,7 +249,7 @@ fn vcpuEntryPoint() void {
         // ARM ARM D13.11.
         kvm.vtimer.loadGuest(&vcpu_obj.vtimer_state);
 
-        const exit_info = vm_hw.vmResume(
+        const exit_info = vm_hyp.vmResume(
             &vcpu_obj.guest_state,
             vm_structures,
             &vcpu_obj.guest_fxsave,

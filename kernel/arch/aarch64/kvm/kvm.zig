@@ -12,7 +12,7 @@
 //!
 //!   vcpu.zig          VCpu object + vm_vcpu_{run,set_state,get_state,interrupt}
 //!                     syscall implementations, plus the per-vCPU run loop
-//!                     that drives `vm.vmResume`.
+//!                     that drives `hyp.vmResume`.
 //!
 //!   exit_box.zig      Portable VmExitBox + vm_recv / vm_reply.
 //!
@@ -21,7 +21,7 @@
 //!
 //!   guest_memory.zig  Guest-physical tracking helpers; walks host vaddr
 //!                     ranges and installs stage-2 mappings via
-//!                     `vm.mapGuestPage`.
+//!                     `stage2.mapGuestPage`.
 //!
 //!   vgic.zig          In-kernel vGIC (GICv3 virtual CPU interface + GICD/GICR
 //!                     MMIO emulation). Replaces x64/kvm/lapic.zig +

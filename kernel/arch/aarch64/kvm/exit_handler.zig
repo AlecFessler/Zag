@@ -1,7 +1,7 @@
 //! Aarch64 VM exit dispatch.
 //!
 //! Mirrors `kernel/arch/x64/kvm/exit_handler.zig`. Called by the vCPU
-//! run loop after every `vm_hw.vmResume` to decide whether an exit is
+//! run loop after every `vm_hyp.vmResume` to decide whether an exit is
 //! handled inline by the kernel or delivered to the VMM via the
 //! VmExitBox.
 //!
@@ -25,7 +25,7 @@
 //! Milestone M2 extended this file to do a full ESR_EL2 ISS decode
 //! (ARM ARM D13.2.39, Table D13-45 / Table D13-46) for EC=0x18/0x20/
 //! 0x24/0x16/0x17, build a packed (op0,op1,CRn,CRm,op2) sysreg key
-//! that matches `vm.sysregPassthrough`'s convention, and route
+//! that matches `stage2.sysregPassthrough`'s convention, and route
 //! translation faults vs MMIO emulation separately so #124's stage-2
 //! fault router sees a properly classified descriptor.
 
@@ -226,7 +226,7 @@ fn writeRt(vcpu_obj: *VCpu, rt: u5, value: u64) void {
 }
 
 /// Build the 16-bit packed (op0,op1,CRn,CRm,op2) sysreg key that
-/// `vm.sysregPassthrough` / `isSecurityCriticalSysreg` use. Layout
+/// `stage2.sysregPassthrough` / `isSecurityCriticalSysreg` use. Layout
 /// (matched exactly so policy lookups can share keys):
 ///
 ///   bits [15:14] Op0

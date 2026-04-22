@@ -1,19 +1,19 @@
 //! Aarch64 guest memory region tracking.
 //!
 //! Portable port of `kernel/arch/x64/kvm/guest_memory.zig`. Nothing here
-//! is arch-specific except the `vm_hw` import — the x64 and aarch64
+//! is arch-specific except the `stage2` import — the x64 and aarch64
 //! copies could be unified in a future pass. For now they stay parallel
 //! to match the directory layout and avoid cross-arch churn.
 //!
 //! Purpose: keep a small array of `(guest_phys, size, rights)` tuples
 //! for every region the VMM has installed via `vm_guest_map`, so that
-//! `Vm.destroy` can walk them and call `vm_hw.unmapGuestPage` per page
+//! `Vm.destroy` can walk them and call `stage2.unmapGuestPage` per page
 //! on teardown.
 
 const zag = @import("zag");
 
 const paging = zag.memory.paging;
-const vm_hw = zag.arch.aarch64.vm;
+const stage2 = zag.arch.aarch64.stage2;
 
 const PAddr = zag.memory.address.PAddr;
 
@@ -55,7 +55,7 @@ pub const GuestMemory = struct {
     /// core could still hold a stage-2 TLB entry tagged with this VM's
     /// VMID while `unmapGuestPage` clears the descriptor out from under
     /// it. M4 #126 landed real per-IPA invalidation
-    /// (`TLBI IPAS2E1IS` via `vm.invalidateStage2Ipa`), so each
+    /// (`TLBI IPAS2E1IS` via `stage2.invalidateStage2Ipa`), so each
     /// `unmapGuestPage` here broadcasts an IS-domain flush before
     /// returning — but the "stop every vCPU first" invariant still
     /// stands because a running guest could re-fault and re-fill
@@ -65,7 +65,7 @@ pub const GuestMemory = struct {
             if (!region.active) continue;
             var offset: u64 = 0;
             while (offset < region.size) : (offset += paging.PAGE4K) {
-                vm_hw.unmapGuestPage(arch_structures, region.guest_phys_start + offset);
+                stage2.unmapGuestPage(arch_structures, region.guest_phys_start + offset);
             }
             region.active = false;
         }

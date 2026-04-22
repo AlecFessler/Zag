@@ -49,7 +49,13 @@ pub fn vmInit() void {
 pub fn vmPerCoreInit() void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.vm.vmPerCoreInit(),
-        .aarch64 => aarch64.vm.vmPerCoreInit(),
+        .aarch64 => {
+            aarch64.vm.vmPerCoreInit();
+            // EL2 vector-table install is a per-core concern but lives in
+            // the hyp.zig half of the aarch64 VM split; keep the call-out
+            // here so vm.zig does not need a back-reference into hyp.
+            aarch64.hyp.installHypVectors();
+        },
         else => unreachable,
     }
 }
@@ -64,7 +70,7 @@ pub fn bspBootHandoff(arrived_at_el2: bool) void {
         .x86_64 => {},
         .aarch64 => if (arrived_at_el2) {
             aarch64.vm.hyp_stub_installed = true;
-            aarch64.vm.installHypVectors();
+            aarch64.hyp.installHypVectors();
         },
         else => unreachable,
     }

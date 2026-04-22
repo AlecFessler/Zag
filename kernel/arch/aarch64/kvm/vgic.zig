@@ -785,7 +785,7 @@ fn refillLrsLocked(state: *VcpuState, dist: *Vgic) void {
 // Entry / exit hooks
 // ===========================================================================
 
-/// Called by the vCPU run loop just before `vm_hw.vmResume`. Refills
+/// Called by the vCPU run loop just before `vm_hyp.vmResume`. Refills
 /// the LR shadow from the distributor / redistributor pending bitmaps,
 /// then writes the shadow into ICH_LR<n>_EL2 and ICH_HCR_EL2.
 ///
@@ -820,7 +820,7 @@ pub fn prepareEntry(state: *VcpuState) void {
     _ = vm_hw.hypCall(.vgic_prepare_entry, shadow_pa);
 }
 
-/// Called by the vCPU run loop immediately after `vm_hw.vmResume`
+/// Called by the vCPU run loop immediately after `vm_hyp.vmResume`
 /// returns. Snapshots ICH_LR<n>_EL2 back into the shadow state and
 /// records active→inactive transitions (the guest acked an SPI) by
 /// clearing the corresponding spi_active bit.
