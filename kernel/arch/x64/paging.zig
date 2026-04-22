@@ -187,29 +187,6 @@ pub fn swapAddrSpace(root: PAddr, id: u16) void {
     cpu.writeCr3((root.addr & ~@as(u64, 0xFFF)) | pcid | no_flush);
 }
 
-/// Invalidate every TLB entry tagged with the given PCID on the local core.
-/// Must be called before a PCID is returned to the allocator — otherwise
-/// the next process to be assigned this id would see stale mappings from
-/// the previous owner.
-///
-/// Uses INVPCID type 1 (single PCID, all addresses). Intel SDM Vol 2A —
-/// INVPCID; Vol 3A §5.10.4.1.
-///
-/// TODO: SMP shootdown. Other cores may still hold TLB entries for `id`
-/// from prior runs of the dying process. Until the existing per-page IPI
-/// shootdown is extended with a per-PCID variant, recycling a freed PCID
-/// onto a different core can read a stale mapping. The current
-/// single-core / pinned-process workloads are correct.
-pub fn invalidateAddrSpaceTlb(id: u16) void {
-    if (!cpu.pcid_enabled) return;
-    const desc: [2]u64 align(16) = .{ @as(u64, id) & 0xFFF, 0 };
-    asm volatile ("invpcid (%[desc]), %[type]"
-        :
-        : [desc] "r" (&desc),
-          [type] "r" (@as(u64, 1)),
-        : .{ .memory = true });
-}
-
 /// Copy the upper-half (kernel) PML4 entries from the current address space
 /// into a new PML4 table. Entries 256..511 cover the kernel's virtual
 /// address range (bits 47:39 >= 256, i.e. canonical high-half addresses).

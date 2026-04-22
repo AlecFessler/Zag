@@ -11,6 +11,12 @@
 //! ASIDs give effectively-infinite headroom for Zag's process counts, so
 //! the allocator never needs to roll over or fall back to a TLB flush.
 //!
+//! The allocator owns the full lifecycle: `free(id)` is the only release
+//! path, and it invalidates every TLB entry tagged with `id` across the
+//! inner shareable domain before returning the slot to the bitmap. A
+//! future re-allocation of the same id therefore cannot inherit stale
+//! mappings from the previous owner.
+//!
 //! References:
 //! - ARM ARM D5.10 -- TLB tagging with ASID
 //! - ARM ARM D13.2.131 -- TCR_EL1.AS (ASID size select)
@@ -56,6 +62,8 @@ pub fn free(id: u16) void {
     std.debug.assert(id != 0);
     std.debug.assert(id < num_ids);
 
+    invalidateTlb(id);
+
     const irq_state = lock.lockIrqSave();
     defer lock.unlockIrqRestore(irq_state);
 
@@ -65,4 +73,23 @@ pub fn free(id: u16) void {
     std.debug.assert((bitmap[w] & mask) != 0);
     bitmap[w] &= ~mask;
     if (w < hint) hint = w;
+}
+
+/// Invalidate every TLB entry tagged with `id` across the inner shareable
+/// domain. Called by `free` before the id returns to the bitmap so a
+/// future owner of the same id does not inherit stale mappings.
+///
+/// ARM ARM D5.10.2 / D13.2.142: TLBI ASIDE1IS invalidates all stage 1
+/// EL1&0 entries tagged with the supplied ASID. Broadcast across the
+/// inner shareable domain handles SMP automatically — no IPI needed.
+fn invalidateTlb(id: u16) void {
+    const operand: u64 = @as(u64, id) << 48;
+    asm volatile (
+        \\dsb ishst
+        \\tlbi aside1is, %[op]
+        \\dsb ish
+        \\isb
+        :
+        : [op] "r" (operand),
+        : .{ .memory = true });
 }

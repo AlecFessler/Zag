@@ -220,26 +220,6 @@ pub fn swapAddrSpace(root: PAddr, id: u16) void {
     asm volatile ("isb" ::: .{ .memory = true });
 }
 
-/// Invalidate every TLB entry tagged with the given ASID across the inner
-/// shareable domain. Must be called before an ASID is returned to the
-/// allocator — otherwise the next process to be assigned this id would
-/// see stale mappings from the previous owner.
-///
-/// ARM ARM D5.10.2 / D13.2.142: TLBI ASIDE1IS invalidates all stage 1
-/// EL1&0 entries tagged with the supplied ASID. Broadcast across the
-/// inner shareable domain handles SMP automatically — no IPI needed.
-pub fn invalidateAddrSpaceTlb(id: u16) void {
-    const operand: u64 = @as(u64, id) << 48;
-    asm volatile (
-        \\dsb ishst
-        \\tlbi aside1is, %[op]
-        \\dsb ish
-        \\isb
-        :
-        : [op] "r" (operand),
-        : .{ .memory = true });
-}
-
 /// No-op on AArch64: kernel mappings live in TTBR1_EL1 and are always visible.
 ///
 /// ARM ARM D5.2 -- the split TTBR0/TTBR1 scheme means kernel virtual addresses

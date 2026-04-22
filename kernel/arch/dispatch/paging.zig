@@ -143,19 +143,14 @@ pub fn allocAddrSpaceId() ?u16 {
 }
 
 /// Release an address-space identifier previously returned by
-/// `allocAddrSpaceId`. Invalidates every TLB entry tagged with `id` first
-/// so a future re-allocation of this id does not inherit stale mappings
-/// from the previous owner. Releasing id 0 is a programming error.
+/// `allocAddrSpaceId`. The allocator invalidates every TLB entry tagged
+/// with `id` before returning the slot so a future re-allocation does not
+/// inherit stale mappings from the previous owner. Releasing id 0 is a
+/// programming error.
 pub fn freeAddrSpaceId(id: u16) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => {
-            x64.paging.invalidateAddrSpaceTlb(id);
-            x64.pcid.free(id);
-        },
-        .aarch64 => {
-            aarch64.paging.invalidateAddrSpaceTlb(id);
-            aarch64.asid.free(id);
-        },
+        .x86_64 => x64.pcid.free(id),
+        .aarch64 => aarch64.asid.free(id),
         else => unreachable,
     }
 }

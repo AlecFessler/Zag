@@ -1,6 +1,8 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const cpu = zag.arch.x64.cpu;
+
 const SpinLock = zag.utils.sync.SpinLock;
 
 /// Bitmap-based PCID (Process Context Identifier) allocator.
@@ -12,6 +14,12 @@ const SpinLock = zag.utils.sync.SpinLock;
 /// Bit convention: 1 = allocated, 0 = free.
 /// Id 0 is reserved as the boot/kernel sentinel (the value CR3 uses when
 /// CR4.PCIDE=0) and is never handed out.
+///
+/// The allocator owns the full lifecycle: `free(id)` is the only release
+/// path, and it invalidates every TLB entry tagged with `id` on the local
+/// core before returning the slot to the bitmap. A future re-allocation
+/// of the same id therefore cannot inherit stale mappings from the
+/// previous owner.
 
 const pcid_bits: u16 = 12;
 const pcid_count: u16 = 1 << pcid_bits;
@@ -50,6 +58,8 @@ pub fn free(id: u16) void {
     std.debug.assert(id != 0);
     std.debug.assert(id < pcid_count);
 
+    invalidateTlb(id);
+
     const irq_state = lock.lockIrqSave();
     defer lock.unlockIrqRestore(irq_state);
 
@@ -59,4 +69,26 @@ pub fn free(id: u16) void {
     std.debug.assert((bitmap[w] & mask) != 0);
     bitmap[w] &= ~mask;
     if (w < hint) hint = w;
+}
+
+/// Invalidate every TLB entry tagged with `id` on the local core. Called
+/// by `free` before the id returns to the bitmap so a future owner of the
+/// same id does not inherit stale mappings.
+///
+/// Uses INVPCID type 1 (single PCID, all addresses). Intel SDM Vol 2A —
+/// INVPCID; Vol 3A §5.10.4.1.
+///
+/// TODO: SMP shootdown. Other cores may still hold TLB entries for `id`
+/// from prior runs of the dying process. Until the existing per-page IPI
+/// shootdown is extended with a per-PCID variant, recycling a freed PCID
+/// onto a different core can read a stale mapping. The current
+/// single-core / pinned-process workloads are correct.
+fn invalidateTlb(id: u16) void {
+    if (!cpu.pcid_enabled) return;
+    const desc: [2]u64 align(16) = .{ @as(u64, id) & 0xFFF, 0 };
+    asm volatile ("invpcid (%[desc]), %[type]"
+        :
+        : [desc] "r" (&desc),
+          [type] "r" (@as(u64, 1)),
+        : .{ .memory = true });
 }
