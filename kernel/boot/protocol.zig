@@ -78,25 +78,10 @@ pub fn collapseMMap(
     map: *const MMap,
     mmap_entries: *[MAX_MMAP_ENTRIES]MMapEntry,
 ) []MMapEntry {
-    const dispatch = @import("zag").arch.dispatch;
-    dispatch.earlyDebugChar('[');
-    // Print num_descriptors as 4 hex chars so we can see the actual value.
-    const n = map.num_descriptors;
-    var shift: u6 = 12;
-    while (true) {
-        const nibble: u8 = @intCast((n >> shift) & 0xF);
-        const ch: u8 = if (nibble < 10) '0' + nibble else 'A' + (nibble - 10);
-        dispatch.earlyDebugChar(ch);
-        if (shift == 0) break;
-        shift -= 4;
-    }
-    dispatch.earlyDebugChar(' ');
     std.debug.assert(map.num_descriptors <= MAX_MMAP_ENTRIES);
-    dispatch.earlyDebugChar('(');
 
     var idx: u64 = 0;
     for (0..map.num_descriptors) |i| {
-        dispatch.earlyDebugChar('.');
         const descriptor: *uefi.tables.MemoryDescriptor = @ptrFromInt(i * map.descriptor_size + @intFromPtr(map.mmap));
 
         const t: MMapEntryType = switch (descriptor.type) {
@@ -132,7 +117,6 @@ pub fn collapseMMap(
         }
     }
 
-    dispatch.earlyDebugChar(']');
     return mmap_entries[0..idx];
 }
 

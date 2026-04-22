@@ -736,14 +736,47 @@ pub fn getKernelAddrSpaceRoot() PAddr {
     return PAddr.fromInt(ttbr1 & mask);
 }
 
-/// Load a new kernel page table address into TTBR1_EL1 and flush stale
-/// TLB entries for the kernel VA range.
+/// Configure TCR_EL1's TTBR1 half and load a new kernel page table address
+/// into TTBR1_EL1. Also caches firmware MAIR indices for attr_indx use.
 ///
-/// ARM ARM D13.2.136 -- writing TTBR1_EL1 switches the kernel address space.
-/// ARM ARM D5.9 -- TLBI VMALLE1 invalidates all EL1&0 TLB entries to
-/// ensure no stale translations from a previous TTBR1 configuration
-/// (e.g., UEFI firmware) remain cached.
+/// Sets T1SZ=16, IRGN1/ORGN1=WB-WA, SH1=ISH, TG1=4KB, AS=1 (16-bit ASID
+/// tag lives in TTBR0 bits [63:48]). Preserves TTBR0 bits [15:0].
+/// All register writes are idempotent — safe to call repeatedly.
+///
+/// ARM ARM D13.2.131 (TCR_EL1), D13.2.136 (TTBR1_EL1), D5.9 (TLBI VMALLE1).
 pub fn setKernelAddrSpace(root: PAddr) void {
+    initMairIndices();
+
+    var tcr: u64 = asm volatile ("mrs %[ret], tcr_el1"
+        : [ret] "=r" (-> u64),
+    );
+    // Clear TTBR1 config bits [31:16] and AS (bit 36). Preserve TTBR0 bits
+    // [15:0] and any other upper bits.
+    tcr &= ~@as(u64, 0xFFFF_0000);
+    tcr &= ~(@as(u64, 1) << 36);
+    tcr |= (16 << 16) | // T1SZ
+        (0b01 << 24) | // IRGN1
+        (0b01 << 26) | // ORGN1
+        (0b11 << 28) | // SH1
+        (@as(u64, 0b10) << 30); // TG1 (4KB)
+    // AS=1 selects the 16-bit ASID space; A1=0 (default) means TTBR0_EL1
+    // holds the active ASID in bits [63:48]. ARM ARM D13.2.131.
+    tcr |= (@as(u64, 1) << 36);
+    asm volatile ("msr tcr_el1, %[val]"
+        :
+        : [val] "r" (tcr),
+        : .{ .memory = true });
+    // ISB publishes the new TCR. Flush any TLB entries cached under the
+    // previous AS=0 interpretation — their ASID tags are reinterpreted
+    // under AS=1 and would alias incorrectly otherwise.
+    asm volatile (
+        \\isb
+        \\dsb ishst
+        \\tlbi vmalle1is
+        \\dsb ish
+        \\isb
+        ::: .{ .memory = true });
+
     writeTtbr1(root.addr);
     asm volatile (
         \\isb
@@ -754,10 +787,6 @@ pub fn setKernelAddrSpace(root: PAddr) void {
         ::: .{ .memory = true });
 }
 
-/// Configure TCR_EL1 to enable TTBR1 walks with 48-bit VA and 4KB granule.
-/// Preserves the TTBR0 (lower half) configuration set by UEFI firmware.
-/// Called by the bootloader before installing TTBR1 mappings.
-/// ARM ARM D13.2.131.
 /// Force TCR_EL1.T0SZ to 16 (48-bit user VA, 4-level walk) and rewrite
 /// the matching IRGN0/ORGN0/SH0/TG0 fields. Called from `init()` after
 /// firmware has exited boot services. See the comment at the call site
@@ -790,59 +819,6 @@ pub fn forceT0Sz16() void {
         \\isb
         \\dsb ishst
         \\tlbi vmalle1is
-        \\dsb ish
-        \\isb
-        ::: .{ .memory = true });
-}
-
-pub fn enableKernelTranslation() void {
-    var tcr: u64 = asm volatile ("mrs %[ret], tcr_el1"
-        : [ret] "=r" (-> u64),
-    );
-    // Clear TTBR1 config bits [31:16] and AS (bit 36). Preserve TTBR0 bits
-    // [15:0] + other upper bits.
-    tcr &= ~@as(u64, 0xFFFF_0000);
-    tcr &= ~(@as(u64, 1) << 36);
-    // T1SZ=16, EPD1=0, IRGN1=WB-WA, ORGN1=WB-WA, SH1=ISH, TG1=4KB
-    tcr |= (16 << 16) | // T1SZ
-        (0b01 << 24) | // IRGN1
-        (0b01 << 26) | // ORGN1
-        (0b11 << 28) | // SH1
-        (@as(u64, 0b10) << 30); // TG1
-    // AS=1 selects the 16-bit ASID space; combined with A1=0 (default)
-    // TTBR0_EL1 holds the active ASID in bits [63:48]. ARM ARM D13.2.131.
-    tcr |= (@as(u64, 1) << 36);
-    asm volatile ("msr tcr_el1, %[val]"
-        :
-        : [val] "r" (tcr),
-        : .{ .memory = true });
-    // ISB publishes the new TCR. Flush any TLB entries cached under the
-    // previous AS=0 interpretation — their ASID tags are reinterpreted
-    // under AS=1 and would alias incorrectly otherwise.
-    asm volatile (
-        \\isb
-        \\dsb ishst
-        \\tlbi vmalle1is
-        \\dsb ish
-        \\isb
-        ::: .{ .memory = true });
-}
-
-/// Set MAIR_EL1 to our expected attribute configuration and flush TLB.
-/// Called from arch.init() after the kernel is running on its own stack.
-///
-/// MAIR_EL1 attribute indices (ARM ARM D13.2.97):
-///   Index 0 = Device-nGnRnE (0x00)
-///   Index 1 = Normal Write-Back cacheable (0xFF)
-pub fn setMair() void {
-    const mair: u64 = 0x00000000_0000FF00;
-    asm volatile ("msr mair_el1, %[val]"
-        :
-        : [val] "r" (mair),
-        : .{ .memory = true });
-    asm volatile (
-        \\isb
-        \\tlbi vmalle1
         \\dsb ish
         \\isb
         ::: .{ .memory = true });

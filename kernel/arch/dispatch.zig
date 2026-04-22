@@ -276,19 +276,6 @@ pub fn alignStack(stack_top: VAddr) VAddr {
     return VAddr.fromInt(adjusted);
 }
 
-/// Install an early fault handler for boot-time exception capture.
-/// Used by the bootloader to catch faults during the exitBootServices →
-/// kernel handoff window. On x86-64 this is a no-op (UEFI's exception
-/// handler is adequate); on aarch64 it installs a minimal VBAR_EL1 that
-/// dumps ESR_EL1, FAR_EL1, ELR_EL1 to the PL011 UART and halts.
-pub fn installEarlyFaultHandler() void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => {},
-        .aarch64 => aarch64.early_fault.installEarlyVbar(),
-        else => unreachable,
-    }
-}
-
 /// Synchronize the instruction cache with the data cache after writing
 /// new executable code to memory. On x86-64 this is a no-op (coherent
 /// I-cache). On aarch64 the I/D caches are separate and loader code must
@@ -372,22 +359,6 @@ pub fn cleanInvalidateDcacheRange(start: u64, len: u64) void {
                 \\isb
                 ::: .{ .memory = true });
         },
-        else => unreachable,
-    }
-}
-
-/// Map any device MMIO the early fault handler needs to reach into the
-/// kernel page tables. On x86-64 this is a no-op (IO is via port
-/// instructions, no translation needed). On aarch64 this identity-maps
-/// the PL011 UART so the early fault handler can dump registers even
-/// after UEFI's TTBR0 identity mapping has been flushed or dropped.
-pub fn mapEarlyDebugDevices(
-    addr_space_root: VAddr,
-    allocator: std.mem.Allocator,
-) !void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => {},
-        .aarch64 => try aarch64.early_fault.mapUart(addr_space_root, allocator),
         else => unreachable,
     }
 }
@@ -638,62 +609,6 @@ pub fn freeAddrSpaceId(id: u16) void {
         .aarch64 => {
             aarch64.paging.invalidateAddrSpaceTlb(id);
             aarch64.asid.free(id);
-        },
-        else => unreachable,
-    }
-}
-
-/// Write a single character to the platform's early debug output.
-/// On x86-64: serial port 0x3F8. On aarch64: PL011 at physmap + 0x09000000.
-/// Used before the serial driver is initialized. The physmap VA is used
-/// because the identity mapping may have been dropped.
-pub inline fn earlyDebugChar(c: u8) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => {
-            asm volatile ("outb %[val], %[port]"
-                :
-                : [val] "{al}" (c),
-                  [port] "N{dx}" (@as(u16, 0x3F8)),
-            );
-        },
-        .aarch64 => {
-            // Prefer the kernel-VA (physmap, TTBR1) UART base set by
-            // serial.init()/parseSpcr — TTBR1 mappings are visible to
-            // every process address space, so this works even after the
-            // kernel has switched to a user process's TTBR0 (which does
-            // not contain the early UEFI identity mapping for the
-            // PL011 page at physical 0x09000000). Fall back to the raw
-            // PA only during the very early-boot window before
-            // serial.init() runs, where UEFI's TTBR0 identity mapping
-            // is still active.
-            const base = aarch64.serial.getBase() orelse 0x09000000;
-            const uart: *volatile u32 = @ptrFromInt(base);
-            uart.* = c;
-        },
-        else => unreachable,
-    }
-}
-
-pub fn earlyDebugHex(v: u64) void {
-    var shift: u6 = 60;
-    while (true) {
-        const nibble: u8 = @intCast((v >> shift) & 0xF);
-        const ch: u8 = if (nibble < 10) '0' + nibble else 'A' + (nibble - 10);
-        earlyDebugChar(ch);
-        if (shift == 0) break;
-        shift -= 4;
-    }
-}
-
-/// Enable kernel-space translation. On aarch64 this configures TCR_EL1 to
-/// enable TTBR1 walks with 48-bit VA and 4KB granule. On x86-64 this is a
-/// no-op since CR3 already covers the full address space.
-pub fn enableKernelTranslation() void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => {},
-        .aarch64 => {
-            aarch64.paging.initMairIndices();
-            aarch64.paging.enableKernelTranslation();
         },
         else => unreachable,
     }

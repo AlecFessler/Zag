@@ -26,19 +26,14 @@ const serial = zag.arch.aarch64.serial;
 /// BSP early-boot initialization. Called once from dispatch.init() before
 /// the scheduler runs.
 pub fn init() void {
-    const dispatch = zag.arch.dispatch;
-    dispatch.earlyDebugChar('1');
     // Resolve MAIR attribute indices against whatever layout the
     // firmware/bootloader left in MAIR_EL1. We cannot safely rewrite
     // MAIR_EL1 under a live MMU (Linux arm64 head.S / proc.S only
     // writes MAIR with the MMU disabled), so we adopt the firmware
     // indices and use them for page-table attr_indx fields.
     paging.initMairIndices();
-    dispatch.earlyDebugChar('2');
     exceptions.install();
-    dispatch.earlyDebugChar('3');
     serial.init();
-    dispatch.earlyDebugChar('4');
     // Force TCR_EL1.T0SZ=16 (48-bit user VA, 4-level walk) NOW, after
     // exitBootServices. UEFI on QEMU virt happens to pick T0SZ=16
     // already, but EDK2/AAVMF on real ARM hardware (Cortex-A76 Pi 5)
@@ -73,11 +68,9 @@ pub fn init() void {
     // and the §6.8 alignment_fault behaviour cannot be exercised.
     // ARM ARM D13.2.118.
     enableSpAlignmentChecks();
-    dispatch.earlyDebugChar('5');
     // NOTE: GIC init is deferred to acpi.parseAcpi() — the distributor
     // and redistributor base addresses come from MADT, which has not
     // been parsed yet at this point.
-    dispatch.earlyDebugChar('6');
 }
 
 /// Secondary core initialization. Called on each AP after SMP boot brings

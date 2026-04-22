@@ -1,7 +1,6 @@
 pub const acpi = @import("acpi.zig");
 pub const asid = @import("asid.zig");
 pub const cpu = @import("cpu.zig");
-pub const early_fault = @import("early_fault.zig");
 pub const exceptions = @import("exceptions.zig");
 pub const gic = @import("gic.zig");
 pub const hyp_consts = @import("hyp_consts.zig");

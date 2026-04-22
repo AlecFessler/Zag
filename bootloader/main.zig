@@ -180,16 +180,10 @@ pub fn main() uefi.Status {
 
     puts(dbg.page_tables);
 
-    // Set up the kernel page table root. enableKernelTranslation() is a no-op
-    // on x86-64 (CR3 covers both halves) and configures TCR_EL1 TTBR1 on
-    // aarch64. getKernelAddrSpaceRoot() returns CR3 on x86 / TTBR1 on aarch64.
-    arch.enableKernelTranslation();
-
     // Copy or allocate the kernel page table root. On x86-64, the UEFI
     // identity-mapped CR3 covers both halves so we copy it and keep using it.
-    // On aarch64 TTBR1 may be uninitialized, but getKernelAddrSpaceRoot still
-    // returns whatever is there — allocate a fresh table regardless, set it as
-    // the kernel root, then use it for all kernel-range mappings.
+    // On aarch64 (split TTBR0/TTBR1) TTBR1 may be uninitialized — allocate a
+    // fresh table, then setKernelAddrSpace programs TCR_EL1 + writes TTBR1.
     const kernel_table_root_phys: PAddr = blk: {
         const fresh = page_alloc_iface.alignedAlloc(
             u8,
@@ -231,14 +225,6 @@ pub fn main() uefi.Status {
         new_addr_space_root_virt_physmapped,
         .page4k,
         addr_space_root_perms,
-        page_alloc_iface,
-    ) catch return .aborted;
-
-    // Map any device MMIO the early fault handler needs to reach so
-    // its diagnostic output path survives after exitBootServices and
-    // the firmware's original mappings are gone.
-    arch.mapEarlyDebugDevices(
-        new_addr_space_root_virt,
         page_alloc_iface,
     ) catch return .aborted;
 
@@ -467,28 +453,6 @@ pub fn main() uefi.Status {
         @intFromPtr(boot_info),
         @sizeOf(BootInfo),
     );
-
-    // DEBUG: print what the bootloader sees AFTER the clean, right
-    // before handoff. If this shows the correct num_descriptors but
-    // the kernel reads 0xAA, the bug is in the handoff transition.
-    {
-        const n = boot_info.mmap.num_descriptors;
-        var shift: u6 = 12;
-        while (true) {
-            const nibble: u8 = @intCast((n >> shift) & 0xF);
-            const ch: u8 = if (nibble < 10) '0' + nibble else 'A' + (nibble - 10);
-            arch.earlyDebugChar(ch);
-            if (shift == 0) break;
-            shift -= 4;
-        }
-        arch.earlyDebugChar('>');
-    }
-
-    // Install our early fault handler only after exitBootServices.
-    // Replacing firmware exception vectors while boot services are
-    // still live can hijack the firmware's own internal exception
-    // paths and turn recoverable events into halts.
-    arch.installEarlyFaultHandler();
 
     // Final TLB flush after exitBootServices ensures all TTBR1 page table
     // entries are visible to the hardware walker before jumping to the kernel.
