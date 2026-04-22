@@ -86,21 +86,6 @@ pub const Vm = struct {
     /// `VTTBR_EL2.VMID`. See ARM ARM D5.10 "VMID and TLB maintenance".
     vmid: u8 = 0,
     vmid_generation: u64 = 0,
-    /// HCR_EL2 trap overrides driven by `sysregPassthrough`. The effective
-    /// HCR_EL2 programmed on each `vmResume` is
-    ///
-    ///     (HCR_EL2_LINUX_GUEST | hcr_el2_override_set) & ~hcr_el2_override_clear
-    ///
-    /// Default (0, 0) keeps every trap bit in `HCR_EL2_LINUX_GUEST` forced
-    /// on — the baseline denies passthrough of ACTLR_EL1, impl-def sysregs,
-    /// and the TVM/TRVM sysreg family. A `sysregPassthrough` call that
-    /// ALLOWS one of those classes drops the matching HCR bit into
-    /// `hcr_el2_override_clear`. Writes are serialized under `lock` by the
-    /// syscall entry in this file; the world-switch reader (`vmResume`) is
-    /// the owning vCPU thread, which is the same thread that issued the
-    /// syscall — so a plain load is sufficient.
-    hcr_el2_override_set: u64 = 0,
-    hcr_el2_override_clear: u64 = 0,
 
     /// Destroy this VM: kill all vCPU threads, free guest memory and
     /// arch structures, clear the owner's vm pointer.
@@ -381,15 +366,12 @@ pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64
             rollbackGuestMap(vm_obj, guest_addr, offset);
             return E_BADADDR;
         };
-        // M4 #125: pick stage-2 MemAttr from the target IPA. Pages
-        // that fall inside a known emulated MMIO window (PL011,
-        // virtio-mmio) get Device-nGnRnE so guest accesses land on
-        // strongly-ordered memory and fault synchronously; everything
-        // else (guest RAM) stays Normal WB. vGIC windows never reach
-        // this code — `guestMap` rejects them above and
-        // `Vm.tryHandleMmio` consumes the resulting stage-2 fault.
-        const memattr = vm_hw.stage2MemAttrForIpa(guest_addr + offset);
-        vm_hw.mapGuestPage(vm_obj.arch_structures, guest_addr + offset, host_phys, @truncate(rights), memattr) catch {
+        // M4 #125: `vm_hw.mapGuestPage` picks stage-2 MemAttr from the
+        // target IPA internally (PL011, virtio-mmio → Device-nGnRnE;
+        // everything else → Normal WB). vGIC windows never reach this
+        // code — `guestMap` rejects them above and `Vm.tryHandleMmio`
+        // consumes the resulting stage-2 fault.
+        vm_hw.mapGuestPage(vm_obj.arch_structures, guest_addr + offset, host_phys, @truncate(rights)) catch {
             rollbackGuestMap(vm_obj, guest_addr, offset);
             return E_NOMEM;
         };
@@ -418,7 +400,7 @@ fn rollbackGuestMap(vm_obj: *Vm, guest_addr: u64, mapped_size: u64) void {
 }
 
 /// `vm_sysreg_passthrough` — on ARM the `sysreg_id` parameter is a packed
-/// (op0,op1,crn,crm,op2) sysreg encoding (see `vm_hw.sysregPassthroughOverride`
+/// (op0,op1,crn,crm,op2) sysreg encoding (see `vm_hw.sysregPassthrough`
 /// header). The kernel refuses security-critical sysregs that would
 /// allow the guest to escape EL1 confinement.
 pub fn sysregPassthrough(proc: *Process, vm_handle: u64, sysreg_id: u32, allow_read: bool, allow_write: bool) i64 {
@@ -429,16 +411,13 @@ pub fn sysregPassthrough(proc: *Process, vm_handle: u64, sysreg_id: u32, allow_r
 
     if (isSecurityCriticalSysreg(sysreg_id)) return E_PERM;
 
+    // Serialize the HCR override RMW inside `arch.vmSysregPassthrough` —
+    // multiple threads in the same process could otherwise race on the
+    // VM's control block.
     vm_obj.lock.lock();
     defer vm_obj.lock.unlock();
 
-    vm_hw.sysregPassthroughOverride(
-        sysreg_id,
-        allow_read,
-        allow_write,
-        &vm_obj.hcr_el2_override_set,
-        &vm_obj.hcr_el2_override_clear,
-    );
+    arch.vmSysregPassthrough(vm_obj.arch_structures, sysreg_id, allow_read, allow_write);
     return 0; // E_OK
 }
 
@@ -533,7 +512,7 @@ fn writeGuestGpr(gs: *vm_hw.GuestState, n: u8, value: u64) void {
 /// let the guest reach EL2 / EL3 state, plus the ID registers we depend on
 /// for VmPolicy decisions.
 ///
-/// The encoding scheme matches the doc comment on `vm_hw.sysregPassthroughOverride`:
+/// The encoding scheme matches the doc comment on `vm_hw.sysregPassthrough`:
 ///   bits [15:14] Op0
 ///   bits [13:11] Op1
 ///   bits [10:7]  CRn

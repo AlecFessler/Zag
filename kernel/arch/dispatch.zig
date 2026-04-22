@@ -972,18 +972,19 @@ pub fn vmSupported() bool {
     };
 }
 
-pub fn vmResume(guest_state: *GuestState, vm_structures: PAddr, guest_fxsave: *align(16) FxsaveArea) VmExitInfo {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => x64.vm.vmResume(guest_state, vm_structures, guest_fxsave),
-        .aarch64 => @panic("unimplemented"),
-        else => unreachable,
-    };
-}
+// Note: there is no `arch.vmResume` at the dispatch layer. Guest entry
+// is inherently per-arch — x86 needs only (guest_state, vm_structures,
+// guest_fxsave), while aarch64 additionally threads a per-vCPU
+// `arch_scratch` through (for the EL2 world-switch marshalling block).
+// Both architectures' KVM vcpu loops call their own `vm_hw.vmResume`
+// directly. A dispatch fn here would either have to carry the extra
+// arg on both sides (dead weight for x86) or silently ignore it
+// (back-door divergence), so it is intentionally absent.
 
 pub fn vmAllocStructures() ?PAddr {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.vm.vmAllocStructures(),
-        .aarch64 => null,
+        .aarch64 => aarch64.vm.vmAllocStructures(),
         else => unreachable,
     };
 }
@@ -991,7 +992,7 @@ pub fn vmAllocStructures() ?PAddr {
 pub fn vmFreeStructures(paddr: PAddr) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.vm.vmFreeStructures(paddr),
-        .aarch64 => {},
+        .aarch64 => aarch64.vm.vmFreeStructures(paddr),
         else => unreachable,
     }
 }
@@ -999,7 +1000,7 @@ pub fn vmFreeStructures(paddr: PAddr) void {
 pub fn mapGuestPage(vm_structures: PAddr, guest_phys: u64, host_phys: PAddr, rights: u8) !void {
     switch (builtin.cpu.arch) {
         .x86_64 => try x64.vm.mapGuestPage(vm_structures, guest_phys, host_phys, rights),
-        .aarch64 => @panic("unimplemented"),
+        .aarch64 => try aarch64.vm.mapGuestPage(vm_structures, guest_phys, host_phys, rights),
         else => unreachable,
     }
 }
@@ -1007,7 +1008,7 @@ pub fn mapGuestPage(vm_structures: PAddr, guest_phys: u64, host_phys: PAddr, rig
 pub fn unmapGuestPage(vm_structures: PAddr, guest_phys: u64) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.vm.unmapGuestPage(vm_structures, guest_phys),
-        .aarch64 => {},
+        .aarch64 => aarch64.vm.unmapGuestPage(vm_structures, guest_phys),
         else => unreachable,
     }
 }
@@ -1015,7 +1016,12 @@ pub fn unmapGuestPage(vm_structures: PAddr, guest_phys: u64) void {
 pub fn vmInjectInterrupt(guest_state: *GuestState, interrupt: GuestInterrupt) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.vm.injectInterrupt(guest_state, interrupt),
-        .aarch64 => {},
+        // aarch64 primitive lives in the KVM object layer, not
+        // `arch/aarch64/vm.zig`, because the real injection updates
+        // the per-vCPU vGIC shadow — which the hardware VM primitive
+        // file cannot reach without a circular module import. See
+        // `kvm.vcpu.injectInterrupt` for the `@fieldParentPtr` bridge.
+        .aarch64 => aarch64.kvm.vcpu.injectInterrupt(guest_state, interrupt),
         else => unreachable,
     }
 }
@@ -1023,7 +1029,7 @@ pub fn vmInjectInterrupt(guest_state: *GuestState, interrupt: GuestInterrupt) vo
 pub fn vmInjectException(guest_state: *GuestState, exception: GuestException) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.vm.injectException(guest_state, exception),
-        .aarch64 => {},
+        .aarch64 => aarch64.vm.injectException(guest_state, exception),
         else => unreachable,
     }
 }
@@ -1037,10 +1043,13 @@ pub fn vmInjectException(guest_state: *GuestState, exception: GuestException) vo
 /// bitmap with four 1-KB regions for RDMSR/WRMSR on low/high MSR ranges.
 /// On ARMv8: HCR_EL2/CPTR_EL2/MDCR_EL2/CNTHCTL_EL2 trap bits per register class
 /// (ARM ARM D13) — `sysreg_id` is a packed (op0,op1,CRn,CRm,op2) encoding.
+/// The aarch64 primitive reads/writes the HCR override pair from the
+/// `VmControlBlock` page at `vm_structures + PAGE4K`, so the dispatch
+/// signature matches x86's 1:1.
 pub fn vmSysregPassthrough(vm_structures: PAddr, sysreg_id: u32, allow_read: bool, allow_write: bool) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.vm.sysregPassthrough(vm_structures, sysreg_id, allow_read, allow_write),
-        .aarch64 => {},
+        .aarch64 => aarch64.vm.sysregPassthrough(vm_structures, sysreg_id, allow_read, allow_write),
         else => unreachable,
     }
 }

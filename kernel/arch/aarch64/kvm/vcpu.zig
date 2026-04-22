@@ -176,6 +176,32 @@ pub fn vcpuFromThread(vm_obj: *Vm, thread: *Thread) ?*VCpu {
     return null;
 }
 
+/// Route an interrupt injection addressed by GuestState pointer into the
+/// in-kernel vGIC. This is the aarch64 backend for `arch.vmInjectInterrupt`
+/// — the dispatch signature takes `*GuestState` for 1:1 parity with the
+/// x86 side (which mutates `guest_state.pending_eventinj` directly). On
+/// aarch64 the real injection state lives on the per-vCPU vGIC shadow
+/// (list registers + SGI/PPI pending bits), so we recover the containing
+/// VCpu via `@fieldParentPtr("guest_state", ...)` — every call site
+/// already passes `&vcpu_obj.guest_state`, see
+/// `kvm.vcpu.vcpuInterrupt` and `kvm.exit_box.vmReply`.
+///
+/// `aarch64/vm.zig` cannot `@import("zag").arch.aarch64.kvm.vgic`
+/// directly without a circular module dependency (kvm imports vm), so
+/// this bridge lives in the KVM object layer where both the VCpu type
+/// and the vGIC module are in scope.
+///
+/// Reference: GICv3 §11.2 "List registers", `vgic.injectInterrupt`.
+pub fn injectInterrupt(guest_state: *vm_hw.GuestState, interrupt: vm_hw.GuestInterrupt) void {
+    // `@fieldParentPtr` yields a `*align(@alignOf(GuestState)) VCpu`;
+    // `VCpu` has a stricter alignment than `GuestState` so the cast
+    // back to the natural-alignment pointer is sound — every caller
+    // passes `&vcpu.guest_state` from a `VCpu` allocated by the VCpu
+    // slab allocator, which preserves `VCpu`'s 16-byte alignment.
+    const vcpu: *VCpu = @alignCast(@fieldParentPtr("guest_state", guest_state));
+    kvm.vgic.injectInterrupt(&vcpu.vgic_state, interrupt);
+}
+
 // ---------------------------------------------------------------------------
 // vCPU run loop — the entry point for the vCPU's kernel thread.
 // ---------------------------------------------------------------------------
@@ -203,6 +229,11 @@ fn vcpuEntryPoint() void {
         // the allocator lock before we build VTTBR_EL2.
         const vm_structures = vm_obj.arch_structures;
         vmid_mod.refresh(vm_obj);
+        // Stage the refreshed VMID into the per-VM control block so
+        // `vm_hw.vmResume` can build VTTBR_EL2.VMID from `vm_structures`
+        // alone (matches the x86 pattern where the per-VM ASID/VPID
+        // is already inside the VMCB/VMCS that vm_structures points at).
+        vm_hw.controlBlock(vm_structures).vmid = vm_obj.vmid;
 
         // M5.1 (#127): program the virtual CPU interface from the
         // per-vCPU shadow (list registers, AP0R/AP1R, ICH_HCR.EN,
@@ -221,9 +252,6 @@ fn vcpuEntryPoint() void {
             vm_structures,
             &vcpu_obj.guest_fxsave,
             &vcpu_obj.arch_scratch,
-            vm_obj.vmid,
-            vm_obj.hcr_el2_override_set,
-            vm_obj.hcr_el2_override_clear,
         );
 
         // M5.2 save path: snapshot the virtual timer before any host

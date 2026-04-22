@@ -170,22 +170,6 @@ pub const GuestState = extern struct {
     /// CNTVOFF_EL2 — virtual timer offset (per VM, not per vCPU).
     /// Tracked here for convenience; loaded during entry (D11.2.7).
     cntvoff_el2: u64 = 0,
-
-    // ----- Pending virtual-interrupt bits consumed by vmResume -----
-    //
-    // On x86 the guest event injection token lives in the VMCS/VMCB; on
-    // ARM the equivalent is the ICH_LR<n>_EL2 list registers. We stage
-    // the desired injection here in GuestState and `vgic.prepareEntry`
-    // translates it to LR writes right before ERET.
-    //
-    // These fields are flags, not vectors: the vector lookup happens via
-    // the vGIC when it actually fills an LR. They exist so an exit
-    // handler that just decided to inject something does not have to reach
-    // into the vGIC before vmResume runs.
-    pending_virq: u8 = 0,
-    pending_vfiq: u8 = 0,
-    pending_vserror: u8 = 0,
-    _pad0: [5]u8 = .{0} ** 5,
 };
 
 /// FPSIMD/SVE save area. We use plain FPSIMD (V0..V31 + FPCR + FPSR) for
@@ -1102,14 +1086,18 @@ pub fn vmResume(
     vm_structures: PAddr,
     guest_fxsave: *align(16) FxsaveArea,
     arch_scratch: *align(16) ArchScratch,
-    vmid_value: u8,
-    hcr_override_set: u64,
-    hcr_override_clear: u64,
 ) VmExitInfo {
     const ctx = &arch_scratch.ctx;
     const host_save = &arch_scratch.host_save;
     ctx.* = .{};
     host_save.* = .{};
+
+    // Per-VM state (vmid + HCR_EL2 overrides) live in the control
+    // block page immediately following the stage-2 root. Pulling
+    // them from `vm_structures` here keeps vmResume's interface down
+    // to the same four arguments x86's does (guest_state,
+    // vm_structures, guest_fxsave) plus the per-vCPU arch_scratch.
+    const cb = controlBlock(vm_structures);
 
     // EL2 runs with SCTLR_EL2.M=0 so the hyp stubs dereference these
     // pointers as raw PAs. The VCpu (and its embedded guest_state /
@@ -1134,7 +1122,7 @@ pub fn vmResume(
     //                   BADDR are RES0 and our page-aligned PA fits
     //                   directly.
     //   [0]     CnP   — 0; we don't claim common-not-private.
-    ctx.vttbr_el2 = (@as(u64, vmid_value) << 48) | vm_structures.addr;
+    ctx.vttbr_el2 = (@as(u64, cb.vmid) << 48) | vm_structures.addr;
     ctx.vtcr_el2 = vtcrEl2Value();
     // HCR_EL2 is the union of the per-VM override-set bits with the Linux
     // baseline, minus any override-clear bits. `sysregPassthrough` feeds
@@ -1142,7 +1130,7 @@ pub fn vmResume(
     // only dropping a bit into `hcr_override_clear` opens that trap up for
     // the VM. `hcr_override_set` is reserved for future traps that are not
     // in the baseline.
-    ctx.hcr_el2 = (HCR_EL2_LINUX_GUEST | hcr_override_set) & ~hcr_override_clear;
+    ctx.hcr_el2 = (HCR_EL2_LINUX_GUEST | cb.hcr_override_set) & ~cb.hcr_override_clear;
 
     // ---- Eager FPSIMD save/restore around the world switch ----
     //
@@ -2320,23 +2308,75 @@ fn freeTablePage(p: PAddr) void {
     alloc.destroy(page);
 }
 
-/// Allocate the per-VM arch block. For this v1 implementation the "arch
-/// structures" are exactly the stage-2 L2 root page — a single 4 KiB
-/// table with 512 level-2 entries, each covering 2 MiB = 1 GiB total IPA.
-/// `vm_structures` values returned from here are the physical address of
-/// that root and can be loaded directly into `VTTBR_EL2.BADDR`.
+/// Per-VM control block allocated alongside the stage-2 root. Holds
+/// per-VM state the world-switch entry path and `sysregPassthrough`
+/// need to read/write via a plain `PAddr` handle, matching the x86
+/// shape where `sysregPassthrough` operates on the VMCB at
+/// `vm_structures`. The block lives at `vm_structures + PAGE4K` within
+/// the order-1 allocation returned by `vmAllocStructures`.
 ///
-/// Not yet tracked:
-///   - A separate VmControlBlock holding cached HCR_EL2 / VTCR_EL2 /
-///     CNTVOFF_EL2 values. Those live in the Vm object for now and are
-///     baked into `vmResume` once it lands. A future refactor will
-///     break them out into a per-VM page alongside the stage-2 root.
+/// Fields are exposed publicly so `vmid.refresh` / `sysregPassthrough`
+/// in the KVM object layer can update them without going through a
+/// setter helper for every field.
+///
+/// References:
+///   - ARM ARM D13.2.46  HCR_EL2 (see `HCR_EL2_LINUX_GUEST`)
+///   - ARM ARM D13.2.151 VTTBR_EL2 VMID field
+pub const VmControlBlock = extern struct {
+    /// Bits to force ON in HCR_EL2 on top of `HCR_EL2_LINUX_GUEST`.
+    /// Reserved for future traps not in the baseline.
+    hcr_override_set: u64 = 0,
+    /// Bits to clear in HCR_EL2 relative to `HCR_EL2_LINUX_GUEST`. A
+    /// `sysregPassthrough` call that allows one of the baseline's
+    /// trap groups drops the matching bit here so the world-switch
+    /// programs HCR_EL2 without it.
+    hcr_override_clear: u64 = 0,
+    /// Stage-2 VMID to program into `VTTBR_EL2.VMID[63:48]` on the
+    /// next guest entry. Updated by `kvm.vmid.refresh` from the Vm
+    /// object's cached generation. Zero means "not yet assigned" —
+    /// `vmResume` will fall back to the Vm's cached value in that
+    /// case; normal flows call `vmid.refresh` before every entry so
+    /// the field is current.
+    vmid: u8 = 0,
+    _pad: [paging.PAGE4K - 17]u8 = .{0} ** (paging.PAGE4K - 17),
+};
+
+comptime {
+    std.debug.assert(@sizeOf(VmControlBlock) == paging.PAGE4K);
+    std.debug.assert(@offsetOf(VmControlBlock, "hcr_override_set") == 0);
+    std.debug.assert(@offsetOf(VmControlBlock, "hcr_override_clear") == 8);
+    std.debug.assert(@offsetOf(VmControlBlock, "vmid") == 16);
+}
+
+/// Allocate the per-VM arch block. Returns the physical address of a
+/// contiguous 8 KiB (order-1) allocation whose:
+///
+///   - first page is the stage-2 L2 root — 512 level-2 entries, each
+///     covering 2 MiB = 1 GiB total IPA — loaded directly into
+///     `VTTBR_EL2.BADDR`.
+///   - second page is a `VmControlBlock` holding HCR_EL2 override
+///     bits and the cached VMID. `sysregPassthrough(vm_structures,
+///     ...)` writes into this page; the world-switch entry reads it
+///     via `controlBlock(vm_structures)`.
+///
+/// The caller treats the returned PAddr as an opaque handle; its
+/// numeric value is also the stage-2 root PA, which keeps
+/// `mapGuestPage` / `unmapGuestPage` / `invalidateStage2Ipa` unchanged.
 pub fn vmAllocStructures() ?PAddr {
-    return allocTablePage();
+    const alloc = pmm.global_pmm.?.allocator();
+    const bytes = alloc.rawAlloc(
+        2 * paging.PAGE4K,
+        std.mem.Alignment.fromByteUnits(paging.PAGE4K),
+        @returnAddress(),
+    ) orelse return null;
+    @memset(bytes[0 .. 2 * paging.PAGE4K], 0);
+    const va = VAddr.fromInt(@intFromPtr(bytes));
+    return PAddr.fromVAddr(va, null);
 }
 
 /// Tear down the per-VM arch block. Walks the stage-2 root, frees every
-/// allocated level-3 table page, then frees the root.
+/// allocated level-3 table page, then frees the 2-page root+control
+/// block allocation.
 ///
 /// TLB invalidation for the departing VMID is the caller's job (done
 /// inside `Vm.destroy` once VMID management is real). Stage-2 leaks
@@ -2354,16 +2394,35 @@ pub fn vmFreeStructures(p: PAddr) void {
         freeTablePage(entry.getPAddr());
         entry.* = .{};
     }
-    freeTablePage(p);
+    const alloc = pmm.global_pmm.?.allocator();
+    const va = VAddr.fromPAddr(p, null);
+    const base: [*]u8 = @ptrFromInt(va.addr);
+    alloc.rawFree(
+        base[0 .. 2 * paging.PAGE4K],
+        std.mem.Alignment.fromByteUnits(paging.PAGE4K),
+        @returnAddress(),
+    );
+}
+
+/// Return a mutable pointer to the `VmControlBlock` embedded in the
+/// 8 KiB arch structures allocation at `vm_structures + PAGE4K`.
+pub fn controlBlock(vm_structures: PAddr) *VmControlBlock {
+    const cb_pa = PAddr.fromInt(vm_structures.addr + paging.PAGE4K);
+    return @ptrFromInt(VAddr.fromPAddr(cb_pa, null).addr);
 }
 
 /// Install a 4 KiB stage-2 mapping `guest_phys → host_phys` with the
-/// supplied rights (bit 0 = read, bit 1 = write, bit 2 = exec) and
-/// memory type (`memattr`). `memattr = .normal_wb` is the default for
-/// guest RAM; `memattr = .device_nGnRnE` is used for MMIO windows the
-/// VMM either emulates directly or passes through to real device
-/// memory. See ARM ARM K.a D5.5.5 Table D5-37 for the full list of
-/// legal stage-2 MemAttr encodings.
+/// supplied rights (bit 0 = read, bit 1 = write, bit 2 = exec). The
+/// stage-2 memory type is chosen from the IPA via
+/// `stage2MemAttrForIpa`: known emulated-MMIO windows (PL011,
+/// virtio-mmio) map as Device-nGnRnE so guest writes fault
+/// synchronously; everything else maps as Normal WB for guest RAM.
+/// See ARM ARM K.a D5.5.5 Table D5-37 for the legal MemAttr encodings.
+///
+/// This is the dispatch-level signature that matches
+/// `x64.vm.mapGuestPage` 1:1; IPA-dependent memattr selection is an
+/// aarch64 internal and is not surfaced to the portable dispatch
+/// layer.
 ///
 /// Walks the level-2 root, allocates a level-3 page if the L2 slot is
 /// empty, then writes the leaf descriptor. Issues a per-IPA
@@ -2375,11 +2434,12 @@ pub fn mapGuestPage(
     guest_phys: u64,
     host_phys: PAddr,
     rights: u8,
-    memattr: Stage2MemAttr,
 ) !void {
     if (guest_phys >= (1 << 30)) return error.IpaOutOfRange;
     std.debug.assert(std.mem.isAligned(guest_phys, paging.PAGE4K));
     std.debug.assert(std.mem.isAligned(host_phys.addr, paging.PAGE4K));
+
+    const memattr = stage2MemAttrForIpa(guest_phys);
 
     const root_va = VAddr.fromPAddr(vm_structures, null).addr;
     const root: *[STAGE2_ENTRIES_PER_TABLE]Stage2Entry = @ptrFromInt(root_va);
@@ -2487,23 +2547,6 @@ fn stage2InvalidateIpa(guest_phys: u64) void {
 // Interrupt / exception injection
 // ===========================================================================
 
-/// Inject a virtual interrupt into the guest vCPU.
-///
-/// Sets the corresponding `pending_v*` flag in GuestState so the next
-/// `vmResume` knows something needs to be delivered. The real vGIC LR
-/// programming happens in `vgic.prepareEntry` on the entry path.
-/// `kvm.vcpu.vcpuInterrupt` calls this as a fallback for the non-vGIC
-/// path (legacy HCR_EL2.VI/.VF/.VSE bit injection); production flows
-/// route straight to `vgic.injectInterrupt` instead.
-pub fn injectInterrupt(guest_state: *GuestState, interrupt: GuestInterrupt) void {
-    switch (interrupt.kind) {
-        0 => guest_state.pending_virq = 1,
-        1 => guest_state.pending_vfiq = 1,
-        2 => guest_state.pending_vserror = 1,
-        else => {},
-    }
-}
-
 /// Inject a synchronous exception into the guest at EL1.
 ///
 /// Per ARM ARM K.a D1.11 "Exception entry":
@@ -2558,7 +2601,7 @@ pub fn injectException(guest_state: *GuestState, exception: GuestException) void
 // ===========================================================================
 
 /// Decoded (op0,op1,crn,crm,op2) sysreg key used by
-/// `sysregPassthroughOverride`. The packed `sysreg_id` layout comes from
+/// `sysregPassthrough`. The packed `sysreg_id` layout comes from
 /// the `vm_sysreg_passthrough` syscall and matches
 /// `kvm.vm.isSecurityCriticalSysreg`:
 ///
@@ -2668,14 +2711,20 @@ fn classifySysreg(key: SysregKey) HcrTrapGroup {
 /// Sysregs that do not map to a HCR_EL2 bit managed by the baseline are
 /// silently ignored — `isSecurityCriticalSysreg` in the kvm layer already
 /// rejected the dangerous encodings before we got here.
-pub fn sysregPassthroughOverride(
+///
+/// Dispatch-level signature — matches `x64.vm.sysregPassthrough(vm_structures,
+/// sysreg_id, allow_read, allow_write)` 1:1. The HCR override pair lives in
+/// the per-VM control block at `vm_structures + PAGE4K`, so a `PAddr` handle
+/// is sufficient and no caller-owned pointer pair is threaded through.
+pub fn sysregPassthrough(
+    vm_structures: PAddr,
     sysreg_id: u32,
     allow_read: bool,
     allow_write: bool,
-    override_set: *u64,
-    override_clear: *u64,
 ) void {
-    _ = override_set; // reserved for future traps not in the baseline
+    const cb = controlBlock(vm_structures);
+    const override_clear = &cb.hcr_override_clear;
+    // `hcr_override_set` is reserved for future traps not in the baseline.
     const key = SysregKey.decode(sysreg_id);
     const group = classifySysreg(key);
     const any = allow_read or allow_write;
