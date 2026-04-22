@@ -1,3 +1,4 @@
+const std = @import("std");
 const zag = @import("zag");
 
 const vi = zag.arch.x64.amd.vi;
@@ -16,11 +17,17 @@ const IommuType = enum {
 var active_type: IommuType = .none;
 
 pub fn initIntel(reg_base: PAddr) !void {
+    // Invariant: at most one IOMMU flavor per platform; ACPI calls this
+    // serially during boot, so no lock is required.
+    std.debug.assert(active_type == .none);
     try vtd.init(reg_base);
     active_type = .intel_vtd;
 }
 
 pub fn initAmd(reg_base: PAddr) !void {
+    // Invariant: at most one IOMMU flavor per platform; ACPI calls this
+    // serially during boot, so no lock is required.
+    std.debug.assert(active_type == .none);
     try vi.init(reg_base);
     active_type = .amd_vi;
 }
