@@ -74,16 +74,16 @@ pub fn sysThreadExit() noreturn {
     defer kprof.exit(.sys_thread_exit);
     const thread = sched.currentThread().?;
     thread.state = .exited;
-    arch.interrupts.enableInterrupts();
+    arch.cpu.enableInterrupts();
     sched.yield();
     while (true) {
-        arch.interrupts.enableInterrupts();
+        arch.cpu.enableInterrupts();
         arch.cpu.halt();
     }
 }
 
 pub fn sysThreadYield() i64 {
-    arch.interrupts.enableInterrupts();
+    arch.cpu.enableInterrupts();
     sched.yield();
     return E_OK;
 }
@@ -222,7 +222,7 @@ pub fn sysThreadSuspend(thread_handle: u64) i64 {
                 // — dual dispatch. §2.4.9 requires the transition to be
                 // effective immediately.
                 target_proc.lock.unlock();
-                arch.interrupts.enableInterrupts();
+                arch.cpu.enableInterrupts();
                 sched.yield();
                 // On the next time we are resumed, we return into the
                 // syscall epilogue with rax = E_OK.
@@ -306,7 +306,7 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
 
     // Self-kill: fall through to scheduler-zombie cleanup path.
     if (is_self) {
-        arch.interrupts.enableInterrupts();
+        arch.cpu.enableInterrupts();
         sched.yield();
         while (true) arch.cpu.halt();
     }

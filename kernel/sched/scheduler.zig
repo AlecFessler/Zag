@@ -927,6 +927,6 @@ pub fn perCoreInit() void {
     // cleanly on a well-defined prior timestamp.
     state.last_tick_ns = arch.time.getMonotonicClock().now();
 
-    arch.interrupts.enableInterrupts();
+    arch.cpu.enableInterrupts();
     armSchedTimer(state, SCHED_TIMESLICE_NS);
 }

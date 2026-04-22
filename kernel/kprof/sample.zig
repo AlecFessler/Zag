@@ -77,7 +77,7 @@ pub fn onNmi(ip: u64, fp: u64) bool {
     // `sample_enabled`, so the struct literal below matches the
     // Record layout exactly for this build.
     log.emit(.{
-        .tsc = arch.time.rdtscp(),
+        .tsc = arch.time.readTimestamp(false),
         .kind = @intFromEnum(Kind.sample),
         .cpu = cpu,
         ._pad = 0,
@@ -106,7 +106,7 @@ pub fn onNmi(ip: u64, fp: u64) bool {
         if (ra == 0) break;
 
         log.emit(.{
-            .tsc = arch.time.rdtscp(),
+            .tsc = arch.time.readTimestamp(false),
             .kind = @intFromEnum(Kind.sample_frame),
             .cpu = cpu,
             ._pad = 0,

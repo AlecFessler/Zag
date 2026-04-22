@@ -1497,7 +1497,7 @@ fn generateAslrBase() u64 {
     const aslr_end = address.UserVA.aslr.end;
     const aslr_range = aslr_end - aslr_start;
     const aslr_pages = aslr_range / paging.PAGE4K;
-    const entropy = arch.time.readTimestamp();
+    const entropy = arch.time.readTimestamp(true);
     const offset_pages = entropy % (aslr_pages / 2);
     return aslr_start + offset_pages * paging.PAGE4K;
 }

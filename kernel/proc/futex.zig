@@ -132,7 +132,7 @@ pub fn wait(paddr: PAddr, expected: u64, timeout_ns: u64, thread: *Thread) i64 {
 
     bucket.lock.unlockIrqRestore(irq);
 
-    arch.interrupts.enableInterrupts();
+    arch.cpu.enableInterrupts();
     sched.yield();
 
     const was_timeout: bool = thread.futex_deadline_ns == @as(u64, @bitCast(E_TIMEOUT));
@@ -284,7 +284,7 @@ pub fn waitVal(addrs: []const PAddr, expected: []const u64, count: usize, timeou
 
     releaseBucketLocks(&lock_state);
 
-    arch.interrupts.enableInterrupts();
+    arch.cpu.enableInterrupts();
     sched.yield();
 
     const was_timeout: bool = thread.futex_deadline_ns == @as(u64, @bitCast(E_TIMEOUT));
@@ -357,7 +357,7 @@ pub fn waitChange(addrs: []const PAddr, count: usize, timeout_ns: u64, thread: *
 
     releaseBucketLocks(&lock_state);
 
-    arch.interrupts.enableInterrupts();
+    arch.cpu.enableInterrupts();
     sched.yield();
 
     const was_timeout: bool = thread.futex_deadline_ns == @as(u64, @bitCast(E_TIMEOUT));

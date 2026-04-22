@@ -18,13 +18,13 @@ pub const SpinLock = struct {
     }
 
     pub fn lockIrqSave(self: *SpinLock) u64 {
-        const state = arch.interrupts.saveAndDisableInterrupts();
+        const state = arch.cpu.saveAndDisableInterrupts();
         self.lock();
         return state;
     }
 
     pub fn unlockIrqRestore(self: *SpinLock, state: u64) void {
         self.unlock();
-        arch.interrupts.restoreInterrupts(state);
+        arch.cpu.restoreInterrupts(state);
     }
 };

@@ -68,7 +68,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         const thread = scheduler.currentThread() orelse @panic("kernel page fault on user VA with no current thread");
         arch.boot.print("K: PAGEFAULT pid={d} addr=0x{x} w={} x={} rip=0x{x}\n", .{ thread.process.pid, fault.faulting_address, is_write, is_exec, fault.rip });
         thread.process.kill(accessReason(is_write, is_exec));
-        arch.interrupts.enableInterrupts();
+        arch.cpu.enableInterrupts();
         while (true) arch.cpu.halt();
     }
 
@@ -98,12 +98,12 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     const node = proc.vmm.findNode(faulting_virt) orelse {
         arch.boot.print("K: USER_PF pid={d} addr=0x{x} w={} x={}\n", .{ proc.pid, faulting_virt.addr, is_write, is_exec });
         if (proc.faultBlock(thread, .unmapped_access, faulting_virt.addr, fault.rip, fault.user_ctx)) {
-            arch.interrupts.enableInterrupts();
+            arch.cpu.enableInterrupts();
             scheduler.yield();
             return;
         }
         proc.kill(.unmapped_access);
-        arch.interrupts.enableInterrupts();
+        arch.cpu.enableInterrupts();
         while (true) arch.cpu.halt();
     };
 
@@ -111,12 +111,12 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         .shared_memory, .mmio => {
             const r = accessReason(is_write, is_exec);
             if (proc.faultBlock(thread, r, faulting_virt.addr, fault.rip, fault.user_ctx)) {
-                arch.interrupts.enableInterrupts();
+                arch.cpu.enableInterrupts();
                 scheduler.yield();
                 return;
             }
             proc.kill(r);
-            arch.interrupts.enableInterrupts();
+            arch.cpu.enableInterrupts();
             while (true) arch.cpu.halt();
         },
         .virtual_bar => {
@@ -124,12 +124,12 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
             // page fault handler. Reaching here means something unexpected
             // happened (e.g., present-page protection fault).
             if (proc.faultBlock(thread, .protection_fault, faulting_virt.addr, fault.rip, fault.user_ctx)) {
-                arch.interrupts.enableInterrupts();
+                arch.cpu.enableInterrupts();
                 scheduler.yield();
                 return;
             }
             proc.kill(.protection_fault);
-            arch.interrupts.enableInterrupts();
+            arch.cpu.enableInterrupts();
             while (true) arch.cpu.halt();
         },
         .private => {
@@ -145,12 +145,12 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
                 else
                     accessReason(is_write, is_exec);
                 if (proc.faultBlock(thread, r2, faulting_virt.addr, fault.rip, fault.user_ctx)) {
-                    arch.interrupts.enableInterrupts();
+                    arch.cpu.enableInterrupts();
                     scheduler.yield();
                     return;
                 }
                 proc.kill(r2);
-                arch.interrupts.enableInterrupts();
+                arch.cpu.enableInterrupts();
                 while (true) arch.cpu.halt();
             }
 
@@ -163,12 +163,12 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
             // faulting instruction simply retries.
             proc.vmm.demandPage(faulting_virt, is_write, is_exec) catch {
                 if (proc.faultBlock(thread, .out_of_memory, faulting_virt.addr, fault.rip, fault.user_ctx)) {
-                    arch.interrupts.enableInterrupts();
+                    arch.cpu.enableInterrupts();
                     scheduler.yield();
                     return;
                 }
                 proc.kill(.out_of_memory);
-                arch.interrupts.enableInterrupts();
+                arch.cpu.enableInterrupts();
                 while (true) arch.cpu.halt();
             };
         },

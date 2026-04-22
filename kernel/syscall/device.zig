@@ -99,9 +99,9 @@ pub fn sysIrqAck(device_handle: u64) i64 {
 
     // Look up the device's IRQ line, clear the pending bit, and unmask.
     const device = entry.object.device_region;
-    const irq_line = arch.interrupts.findIrqForDevice(device) orelse return E_INVAL;
-    arch.interrupts.clearIrqPendingBit(irq_line);
-    arch.interrupts.unmaskIrq(irq_line);
+    const irq_line = arch.cpu.findIrqForDevice(device) orelse return E_INVAL;
+    arch.cpu.clearIrqPendingBit(irq_line);
+    arch.cpu.unmaskIrq(irq_line);
     return E_OK;
 }
 

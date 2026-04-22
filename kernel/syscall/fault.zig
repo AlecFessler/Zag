@@ -204,7 +204,7 @@ pub fn sysFaultRecv(ctx: *ArchCpuContext, buf_ptr: u64, blocking: u64) SyscallRe
 fn applyModifiedRegs(dst: *Thread, src_ptr: u64) void {
     const target = dst.fault_user_ctx orelse return;
     const buf: [*]const u8 = @ptrFromInt(src_ptr);
-    arch.interrupts.userAccessBegin();
+    arch.cpu.userAccessBegin();
     var snapshot: arch.cpu.FaultRegSnapshot = undefined;
     snapshot.ip = @as(*align(1) const u64, @ptrCast(buf + 0)).*;
     snapshot.flags = @as(*align(1) const u64, @ptrCast(buf + 8)).*;
@@ -214,7 +214,7 @@ fn applyModifiedRegs(dst: *Thread, src_ptr: u64) void {
         gpr.* = @as(*align(1) const u64, @ptrCast(buf + off)).*;
         off += 8;
     }
-    arch.interrupts.userAccessEnd();
+    arch.cpu.userAccessEnd();
     arch.cpu.applyFaultRegs(target, snapshot);
 }
 
@@ -496,9 +496,9 @@ pub fn sysFaultWriteMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i6
         const dst: [*]u8 = @ptrFromInt(physmap_addr);
         // `dst` is a kernel physmap address; only `src` is a raw user VA,
         // so the SMAP window only needs to cover the read side of the copy.
-        arch.interrupts.userAccessBegin();
+        arch.cpu.userAccessBegin();
         @memcpy(dst[0..chunk], src[0..chunk]);
-        arch.interrupts.userAccessEnd();
+        arch.cpu.userAccessEnd();
         // Push the just-written cache lines to PoU so a subsequent
         // I-cache invalidate makes them visible to instruction fetch.
         arch.cpu.cleanDcacheToPou(physmap_addr, chunk);

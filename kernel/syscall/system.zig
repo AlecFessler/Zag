@@ -29,10 +29,10 @@ pub fn sysWrite(ptr: u64, len: u64) SyscallResult {
     // SMAP: print reads the user buffer while formatting, so the AC=1
     // window must span the entire print call rather than just the slice
     // construction.
-    arch.interrupts.userAccessBegin();
+    arch.cpu.userAccessBegin();
     const msg: []const u8 = @as([*]const u8, @ptrFromInt(ptr))[0..len];
     arch.boot.print("{s}", .{msg});
-    arch.interrupts.userAccessEnd();
+    arch.cpu.userAccessEnd();
     return .{ .ret = @intCast(len) };
 }
 

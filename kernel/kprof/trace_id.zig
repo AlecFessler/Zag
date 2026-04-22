@@ -130,7 +130,7 @@ pub inline fn enter(comptime id: TraceId) void {
     var counters: [3]u64 = undefined;
     arch.pmu.kprofTraceCountersRead(&counters);
     log.emit(.{
-        .tsc = arch.time.rdtscp(),
+        .tsc = arch.time.readTimestamp(false),
         .kind = @intFromEnum(record.Kind.trace_enter),
         .cpu = @truncate(arch.smp.coreID()),
         ._pad = 0,
@@ -151,7 +151,7 @@ pub inline fn exit(comptime id: TraceId) void {
     var counters: [3]u64 = undefined;
     arch.pmu.kprofTraceCountersRead(&counters);
     log.emit(.{
-        .tsc = arch.time.rdtscp(),
+        .tsc = arch.time.readTimestamp(false),
         .kind = @intFromEnum(record.Kind.trace_exit),
         .cpu = @truncate(arch.smp.coreID()),
         ._pad = 0,
@@ -174,7 +174,7 @@ pub inline fn point(comptime id: TraceId, arg: u64) void {
     var counters: [3]u64 = undefined;
     arch.pmu.kprofTraceCountersRead(&counters);
     log.emit(.{
-        .tsc = arch.time.rdtscp(),
+        .tsc = arch.time.readTimestamp(false),
         .kind = @intFromEnum(record.Kind.trace_point),
         .cpu = @truncate(arch.smp.coreID()),
         ._pad = 0,

@@ -86,7 +86,7 @@ pub const NotificationBox = struct {
         self.lock.unlockIrqRestore(irq);
 
         // Yield to scheduler.
-        arch.interrupts.enableInterrupts();
+        arch.cpu.enableInterrupts();
         sched.yield();
 
         // On wake: check if we were woken by cleanup (E_NOENT sentinel),

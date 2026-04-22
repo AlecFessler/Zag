@@ -39,7 +39,7 @@ fn computeKaslrSlide(parsed_elf: *const ParsedElf) u64 {
     const slide_pages = max_slide / paging.PAGE4K;
 
     _ = slide_pages;
-    _ = arch.time.readTimestamp();
+    _ = arch.time.readTimestamp(true);
     return 0;
 }
 

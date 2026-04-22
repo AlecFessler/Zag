@@ -69,11 +69,11 @@ pub const PhysicalMemoryManager = struct {
         const self: *PhysicalMemoryManager = @ptrCast(@alignCast(ptr));
 
         if (len == paging.PAGE4K and sched.initialized) {
-            const irq = arch.interrupts.saveAndDisableInterrupts();
+            const irq = arch.cpu.saveAndDisableInterrupts();
             const cache = &page_caches[arch.smp.coreID()];
 
             if (cache.pop()) |page| {
-                arch.interrupts.restoreInterrupts(irq);
+                arch.cpu.restoreInterrupts(irq);
                 return page;
             }
 
@@ -86,7 +86,7 @@ pub const PhysicalMemoryManager = struct {
             ) orelse {
                 const single = self.backing_allocator.rawAlloc(len, alignment, ret_addr);
                 self.lock.unlock();
-                arch.interrupts.restoreInterrupts(irq);
+                arch.cpu.restoreInterrupts(irq);
                 return single;
             };
 
@@ -99,7 +99,7 @@ pub const PhysicalMemoryManager = struct {
             }
 
             const result = cache.pop().?;
-            arch.interrupts.restoreInterrupts(irq);
+            arch.cpu.restoreInterrupts(irq);
             return result;
         }
 
@@ -119,12 +119,12 @@ pub const PhysicalMemoryManager = struct {
         // only touch per core cache if the scheduler has been fully initialized (ie, system is fully booted)
         // otherwise arch.smp.coreID() will access an array that is undefined
         if (buf.len == paging.PAGE4K and sched.initialized) {
-            const irq = arch.interrupts.saveAndDisableInterrupts();
+            const irq = arch.cpu.saveAndDisableInterrupts();
             const cache = &page_caches[arch.smp.coreID()];
 
             if (cache.count < CACHE_MAX_PAGES) {
                 cache.push(buf.ptr);
-                arch.interrupts.restoreInterrupts(irq);
+                arch.cpu.restoreInterrupts(irq);
                 return;
             }
 
@@ -142,7 +142,7 @@ pub const PhysicalMemoryManager = struct {
             self.lock.unlock();
 
             cache.push(buf.ptr);
-            arch.interrupts.restoreInterrupts(irq);
+            arch.cpu.restoreInterrupts(irq);
             return;
         }
 
