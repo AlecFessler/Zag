@@ -2,7 +2,6 @@ const std = @import("std");
 const zag = @import("zag");
 
 const address = zag.memory.address;
-const arch = zag.arch.dispatch;
 const cpu = zag.arch.x64.cpu;
 const fpu = zag.sched.fpu;
 const gdt = zag.arch.x64.gdt;
@@ -11,11 +10,13 @@ const interrupts = zag.arch.x64.interrupts;
 const kprof = zag.kprof.trace_id;
 const kprof_sample = zag.kprof.sample;
 const mmio_decode = zag.arch.x64.mmio_decode;
+const paging_mod = zag.arch.x64.paging;
 const scheduler = zag.sched.scheduler;
+const serial = zag.arch.x64.serial;
 
 const FaultReason = zag.perms.permissions.FaultReason;
 const GateType = zag.arch.x64.idt.GateType;
-const PageFaultContext = zag.arch.dispatch.cpu.PageFaultContext;
+const PageFaultContext = zag.arch.x64.interrupts.PageFaultContext;
 const PAddr = zag.memory.address.PAddr;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 const VAddr = zag.memory.address.VAddr;
@@ -181,13 +182,13 @@ fn exceptionHandler(ctx: *cpu.Context) void {
             const thread = scheduler.currentThread() orelse
                 @panic("user exception with no current thread");
             if (thread.process.faultBlock(thread, reason, ctx.rip, ctx.rip, ctx)) {
-                arch.interrupts.enableInterrupts();
+                cpu.enableInterrupts();
                 scheduler.yield();
                 return;
             }
             thread.process.kill(reason);
-            arch.interrupts.enableInterrupts();
-            while (true) arch.cpu.halt();
+            cpu.enableInterrupts();
+            while (true) cpu.halt();
         }
     }
 
@@ -199,12 +200,12 @@ fn exceptionHandler(ctx: *cpu.Context) void {
             @panic("NMI");
         },
         .general_protection_fault => {
-            arch.boot.print("GPF at rip=0x{x} err=0x{x}\n", .{ ctx.rip, ctx.err_code });
+            serial.print("GPF at rip=0x{x} err=0x{x}\n", .{ ctx.rip, ctx.err_code });
             @panic("General protection fault");
         },
         .page_fault => unreachable,
         else => {
-            arch.boot.print("Exception {d} at rip=0x{x} err=0x{x}\n", .{
+            serial.print("Exception {d} at rip=0x{x} err=0x{x}\n", .{
                 vector, ctx.rip, ctx.err_code,
             });
             @panic("Unhandled kernel exception");
@@ -264,10 +265,10 @@ fn emulateVirtualBar(ctx: *cpu.Context, node: *const VmNode, faulting_addr: u64,
     const max_bytes: u8 = @intCast(@min(15, 4096 - page_off));
 
     const rip_page = VAddr.fromInt(rip & ~@as(u64, 0xFFF));
-    const phys = arch.paging.resolveVaddr(proc.addr_space_root, rip_page) orelse {
+    const phys = paging_mod.resolveVaddr(proc.addr_space_root, rip_page) orelse {
         proc.kill(.protection_fault);
-        arch.interrupts.enableInterrupts();
-        while (true) arch.cpu.halt();
+        cpu.enableInterrupts();
+        while (true) cpu.halt();
     };
 
     const physmap_base = VAddr.fromPAddr(phys, null).addr + page_off;
@@ -278,8 +279,8 @@ fn emulateVirtualBar(ctx: *cpu.Context, node: *const VmNode, faulting_addr: u64,
     // Decode the instruction
     const op = mmio_decode.decodeBytes(buf[0..max_bytes]) catch {
         proc.kill(.protection_fault);
-        arch.interrupts.enableInterrupts();
-        while (true) arch.cpu.halt();
+        cpu.enableInterrupts();
+        while (true) cpu.halt();
     };
 
     // Compute the port offset and validate bounds
@@ -287,8 +288,8 @@ fn emulateVirtualBar(ctx: *cpu.Context, node: *const VmNode, faulting_addr: u64,
     if (port_offset + op.size > device.access.port_io.port_count) {
         const reason: FaultReason = if (op.is_write) .invalid_write else .invalid_read;
         proc.kill(reason);
-        arch.interrupts.enableInterrupts();
-        while (true) arch.cpu.halt();
+        cpu.enableInterrupts();
+        while (true) cpu.halt();
     }
 
     const port: u16 = device.access.port_io.base_port + @as(u16, @truncate(port_offset));
@@ -305,8 +306,8 @@ fn emulateVirtualBar(ctx: *cpu.Context, node: *const VmNode, faulting_addr: u64,
             4 => cpu.outd(value, port),
             else => {
                 proc.kill(.protection_fault);
-                arch.interrupts.enableInterrupts();
-                while (true) arch.cpu.halt();
+                cpu.enableInterrupts();
+                while (true) cpu.halt();
             },
         }
     } else {
@@ -316,8 +317,8 @@ fn emulateVirtualBar(ctx: *cpu.Context, node: *const VmNode, faulting_addr: u64,
             4 => cpu.ind(port),
             else => {
                 proc.kill(.protection_fault);
-                arch.interrupts.enableInterrupts();
-                while (true) arch.cpu.halt();
+                cpu.enableInterrupts();
+                while (true) cpu.halt();
             },
         };
         writeContextGpr(ctx, op.reg, op.size, result);

@@ -22,7 +22,7 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const arch = zag.arch.dispatch;
+const aarch64_paging = zag.arch.aarch64.paging;
 const device_registry = zag.devices.registry;
 const gic = zag.arch.aarch64.gic;
 const memory_init = zag.memory.init;
@@ -60,7 +60,7 @@ fn mapDeviceRange(phys_start: u64, length: u64) !u64 {
     const end_aligned = std.mem.alignForward(u64, phys_start + length, page);
     var pa: u64 = start_aligned;
     while (pa < end_aligned) {
-        try arch.paging.mapPage(
+        try aarch64_paging.mapPage(
             memory_init.kernel_addr_space_root,
             PAddr.fromInt(pa),
             VAddr.fromPAddr(PAddr.fromInt(pa), null),

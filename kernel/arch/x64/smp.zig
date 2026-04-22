@@ -4,7 +4,7 @@ const zag = @import("zag");
 const trampoline_code = @import("embedded_bins").trampoline;
 
 const apic = zag.arch.x64.apic;
-const arch = zag.arch.dispatch;
+const arch_paging = zag.arch.x64.paging;
 const cpu = zag.arch.x64.cpu;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
@@ -55,7 +55,7 @@ pub fn smpInit() !void {
     const trampoline_phys = PAddr.fromInt(TRAMPOLINE_PHYS);
     const trampoline_virt = VAddr.fromInt(TRAMPOLINE_PHYS);
 
-    try arch.paging.mapPage(
+    try arch_paging.mapPage(
         memory_init.kernel_addr_space_root,
         trampoline_phys,
         trampoline_virt,
@@ -97,7 +97,7 @@ pub fn smpInit() !void {
             };
             @memset(std.mem.asBytes(kpage), 0);
             const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
-            arch.paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS) catch {
+            arch_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS) catch {
                 pmm_iface.destroy(kpage);
                 map_ok = false;
                 break;
@@ -161,5 +161,5 @@ fn coreInit() callconv(.c) noreturn {
     cpu.enableSpeculationBarriers();
     _ = cores_online.fetchAdd(1, .release);
     sched.perCoreInit();
-    arch.cpu.halt();
+    cpu.halt();
 }

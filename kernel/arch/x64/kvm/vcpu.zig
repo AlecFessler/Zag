@@ -1,7 +1,9 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const arch = zag.arch.dispatch;
+const apic = zag.arch.x64.apic;
+const arch_paging = zag.arch.x64.paging;
+const cpu = zag.arch.x64.cpu;
 const kvm = zag.arch.x64.kvm;
 const interrupts = zag.arch.x64.interrupts;
 const vm_hw = zag.arch.x64.vm;
@@ -117,7 +119,7 @@ pub fn destroy(vcpu_obj: *VCpu) void {
 
     // If on a CPU, IPI to force off
     if (sched.coreRunning(thread)) |core_id| {
-        arch.smp.triggerSchedulerInterrupt(core_id);
+        apic.sendSchedulerIpi(core_id);
     }
 
     // Remove from run queues
@@ -143,7 +145,7 @@ pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
     vcpu_obj.storeState(.running);
     const thread = vcpu_obj.thread;
     thread.state = .ready;
-    const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
+    const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
     sched.enqueueOnCore(target_core, thread);
 
     return 0; // E_OK
@@ -196,7 +198,7 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     if (state_snapshot == .running) {
         const thread = vcpu_obj.thread;
         if (sched.coreRunning(thread)) |core_id| {
-            arch.smp.triggerSchedulerInterrupt(core_id);
+            apic.sendSchedulerIpi(core_id);
             // Spin until the thread is off CPU
             while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
         }
@@ -210,7 +212,7 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     if (state_snapshot == .running) {
         const thread = vcpu_obj.thread;
         thread.state = .ready;
-        const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
+        const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
         sched.enqueueOnCore(target_core, thread);
     }
 
@@ -249,7 +251,7 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
         const thread = vcpu_obj.thread;
         // IPI to suspend
         if (sched.coreRunning(thread)) |core_id| {
-            arch.smp.triggerSchedulerInterrupt(core_id);
+            apic.sendSchedulerIpi(core_id);
             while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
         }
         // If the vCPU entry loop (or a prior injection) already queued a
@@ -261,7 +263,7 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
             vm_hw.injectInterrupt(&vcpu_obj.guest_state, interrupt);
         }
         thread.state = .ready;
-        const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
+        const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
         sched.enqueueOnCore(target_core, thread);
     } else {
         // Not running — write pending interrupt into arch state
@@ -291,21 +293,21 @@ fn vcpuEntryPoint() void {
     const vm_obj = thread.process.vm.?;
     const vcpu_obj = vcpuFromThread(vm_obj, thread).?;
 
-    var last_tsc: u64 = arch.time.readTimestamp();
+    var last_tsc: u64 = cpu.rdtscLFenced();
 
     while (true) {
         if (vcpu_obj.loadState() != .running) {
             // Block until the VMM resumes us via vm_reply.
             thread.state = .blocked;
-            arch.interrupts.enableInterrupts();
+            cpu.enableInterrupts();
             sched.yield();
-            last_tsc = arch.time.readTimestamp();
+            last_tsc = cpu.rdtscLFenced();
             continue;
         }
 
         // Tick interrupt-controller timers with elapsed nanoseconds before
         // each VMRUN. TSC ticks at ~1 GHz on most hardware; treat 1 tick = 1 ns.
-        const now_tsc = arch.time.readTimestamp();
+        const now_tsc = cpu.rdtscLFenced();
         const elapsed_ns = now_tsc -% last_tsc;
         last_tsc = now_tsc;
         vm_obj.tickInterruptControllers(elapsed_ns);
@@ -346,7 +348,7 @@ fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
         const page_off = src_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(src_va), false, false) catch return false;
-        const page_paddr = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
+        const page_paddr = arch_paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
         const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
         const src: [*]const u8 = @ptrFromInt(physmap_addr);
         @memcpy(buf[dst_off..][0..chunk], src[0..chunk]);
@@ -368,7 +370,7 @@ fn writeUserStruct(proc: *Process, user_va: u64, data: []const u8) bool {
         const page_off = dst_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(dst_va), true, false) catch return false;
-        const page_paddr = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return false;
+        const page_paddr = arch_paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return false;
         const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
         const dst: [*]u8 = @ptrFromInt(physmap_addr);
         @memcpy(dst[0..chunk], data[src_off..][0..chunk]);
@@ -386,7 +388,7 @@ fn mapKernelStack(stack: zag.memory.stack.Stack) !void {
         const kpage = try pmm_iface.create(paging.PageMem(.page4k));
         @memset(std.mem.asBytes(kpage), 0);
         const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
-        try arch.paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), .{
+        try arch_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), .{
             .write_perm = .write,
             .execute_perm = .no_execute,
             .cache_perm = .write_back,

@@ -10,7 +10,7 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const arch = zag.arch.dispatch;
+const arch_paging = zag.arch.x64.paging;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
@@ -212,7 +212,7 @@ fn issueGlobalCommand(cmd_bit: u32, status_bit: u32) void {
 pub fn init(reg_base_phys: PAddr) !void {
     const reg_base_virt = VAddr.fromPAddr(reg_base_phys, null);
 
-    try arch.paging.mapPage(memory_init.kernel_addr_space_root, reg_base_phys, reg_base_virt, MMIO_PERMS);
+    try arch_paging.mapPage(memory_init.kernel_addr_space_root, reg_base_phys, reg_base_virt, MMIO_PERMS);
     iommu_base = reg_base_virt.addr;
 
     // ECAP.IRO (Section 11.4.3): bits 17:8 give the IOTLB register offset

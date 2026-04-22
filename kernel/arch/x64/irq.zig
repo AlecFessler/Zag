@@ -1,7 +1,7 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const arch = zag.arch.dispatch;
+const apic = zag.arch.x64.apic;
 const cpu = zag.arch.x64.cpu;
 const exceptions = zag.arch.x64.exceptions;
 const fpu = zag.sched.fpu;
@@ -248,7 +248,7 @@ fn kprofDumpHandler(_: *cpu.Context) void {
 /// (which checks if this core is still the owner and FXSAVEs if so),
 /// then acks the mailbox so the requester unblocks.
 fn fpuFlushIpiHandler(_: *cpu.Context) void {
-    const core_id: u8 = @truncate(arch.smp.coreID());
+    const core_id: u8 = @truncate(apic.coreID());
     const slot = &interrupts.fpu_flush_mailbox[core_id];
     const opaque_ptr = @atomicLoad(?*anyopaque, &slot.requested_thread, .acquire) orelse {
         slot.ackDone();

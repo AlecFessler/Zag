@@ -1,7 +1,9 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const arch = zag.arch.dispatch;
+const apic = zag.arch.x64.apic;
+const arch_paging = zag.arch.x64.paging;
+const interrupts = zag.arch.x64.interrupts;
 const vm_hw = zag.arch.x64.vm;
 const paging = zag.memory.paging;
 const sched = zag.sched.scheduler;
@@ -9,7 +11,7 @@ const kvm = zag.arch.x64.kvm;
 const vcpu_mod = kvm.vcpu;
 const vm_mod = kvm.vm;
 
-const ArchCpuContext = zag.arch.dispatch.cpu.ArchCpuContext;
+const ArchCpuContext = zag.arch.x64.interrupts.ArchCpuContext;
 const KernelObject = zag.perms.permissions.KernelObject;
 const PAddr = zag.memory.address.PAddr;
 const ThreadPriorityQueue = zag.sched.thread.ThreadPriorityQueue;
@@ -145,15 +147,15 @@ fn deliverExit(vm_obj: *Vm, vcpu_obj: *VCpu, receiver: *Thread) void {
     while (receiver.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
 
     // Write exit info into receiver's saved buf_ptr (syscall arg1).
-    const saved_args = arch.syscall.getSyscallArgs(receiver.ctx);
+    const saved_args = interrupts.getSyscallArgs(receiver.ctx);
     writeExitMessageToUser(owner, saved_args.arg1, handle_id, vcpu_obj);
 
     // Set return value
-    arch.syscall.setSyscallReturn(receiver.ctx, handle_id);
+    interrupts.setSyscallReturn(receiver.ctx, handle_id);
 
     // Wake the receiver
     receiver.state = .ready;
-    const target_core = if (receiver.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
+    const target_core = if (receiver.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
     sched.enqueueOnCore(target_core, receiver);
 }
 
@@ -368,7 +370,7 @@ fn writeExitMessageToUser(proc: *Process, buf_ptr: u64, handle_id: u64, vcpu_obj
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         // The receiver already faulted in its buffer pages in vm_recv before
         // blocking, so skip demandPage here — the pages are already present.
-        const page_paddr = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return;
+        const page_paddr = arch_paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return;
         const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
         const dst: [*]u8 = @ptrFromInt(physmap_addr);
         @memcpy(dst[0..chunk], msg_bytes[src_off..][0..chunk]);
@@ -395,7 +397,7 @@ fn readUserBytes(proc: *Process, user_va: u64, buf: []u8) bool {
         const page_off = src_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(src_va), false, false) catch return false;
-        const page_paddr = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
+        const page_paddr = arch_paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
         const physmap_addr = VAddr.fromPAddr(page_paddr, null).addr + page_off;
         const src: [*]const u8 = @ptrFromInt(physmap_addr);
         @memcpy(buf[dst_off..][0..chunk], src[0..chunk]);
@@ -416,7 +418,7 @@ fn vcpuIndex(vm_obj: *Vm, vcpu_obj: *VCpu) ?u32 {
 fn resumeVcpuThread(thread: *Thread) void {
     while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
     thread.state = .ready;
-    const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
+    const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
     sched.enqueueOnCore(target_core, thread);
 }
 

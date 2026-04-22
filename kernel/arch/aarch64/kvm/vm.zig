@@ -24,7 +24,8 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const arch = zag.arch.dispatch;
+const aarch64_paging = zag.arch.aarch64.paging;
+const gic = zag.arch.aarch64.gic;
 const kvm = zag.arch.aarch64.kvm;
 const guest_memory = kvm.guest_memory;
 const memory_init = zag.memory.init;
@@ -362,7 +363,7 @@ pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64
             rollbackGuestMap(vm_obj, guest_addr, offset);
             return E_BADADDR;
         };
-        const host_phys = arch.paging.resolveVaddr(proc.addr_space_root, vaddr) orelse {
+        const host_phys = aarch64_paging.resolveVaddr(proc.addr_space_root, vaddr) orelse {
             rollbackGuestMap(vm_obj, guest_addr, offset);
             return E_BADADDR;
         };
@@ -454,7 +455,7 @@ fn kickRunningVcpus(vm_obj: *Vm) void {
     for (vm_obj.vcpus[0..vm_obj.num_vcpus]) |vcpu_obj| {
         if (vcpu_obj.loadState() == .running) {
             if (sched.coreRunning(vcpu_obj.thread)) |core_id| {
-                arch.smp.triggerSchedulerInterrupt(core_id);
+                gic.sendSchedulerIpi(core_id);
             }
         }
     }
@@ -482,7 +483,7 @@ pub fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
         const page_off = src_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(src_va), false, false) catch return false;
-        const src_pa = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
+        const src_pa = aarch64_paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
         const physmap_addr = VAddr.fromPAddr(src_pa, null).addr + page_off;
         const src: [*]const u8 = @ptrFromInt(physmap_addr);
         @memcpy(buf[dst_off..][0..chunk], src[0..chunk]);

@@ -1,7 +1,6 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const arch = zag.arch.dispatch;
 const cpu = zag.arch.x64.cpu;
 const interrupts = zag.arch.x64.interrupts;
 const paging = zag.arch.x64.paging;

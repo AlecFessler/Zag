@@ -12,7 +12,6 @@
 const zag = @import("zag");
 
 const amd_pmu = zag.arch.x64.amd.pmu;
-const arch = zag.arch.dispatch;
 const cpu = zag.arch.x64.cpu;
 const intel_pmu = zag.arch.x64.intel.pmu;
 const pmu_sched = zag.syscall.pmu;

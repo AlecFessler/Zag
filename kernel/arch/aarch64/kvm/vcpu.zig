@@ -27,7 +27,9 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const arch = zag.arch.dispatch;
+const aarch64_paging = zag.arch.aarch64.paging;
+const cpu = zag.arch.aarch64.cpu;
+const gic = zag.arch.aarch64.gic;
 const interrupts = zag.arch.aarch64.interrupts;
 const kvm = zag.arch.aarch64.kvm;
 const memory_init = zag.memory.init;
@@ -160,7 +162,7 @@ pub fn destroy(vcpu_obj: *VCpu) void {
     thread.state = .exited;
 
     if (sched.coreRunning(thread)) |core_id| {
-        arch.smp.triggerSchedulerInterrupt(core_id);
+        gic.sendSchedulerIpi(core_id);
     }
 
     sched.removeFromAnyRunQueue(thread);
@@ -216,7 +218,7 @@ fn vcpuEntryPoint() void {
         if (vcpu_obj.loadState() != .running) {
             // Block until the VMM resumes us via vm_reply.
             thread.state = .blocked;
-            arch.interrupts.enableInterrupts();
+            cpu.enableInterrupts();
             sched.yield();
             continue;
         }
@@ -289,7 +291,7 @@ pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
     vcpu_obj.storeState(.running);
     const thread = vcpu_obj.thread;
     thread.state = .ready;
-    const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
+    const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
     sched.enqueueOnCore(target_core, thread);
 
     return 0; // E_OK
@@ -338,7 +340,7 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     if (state_snapshot == .running) {
         const thread = vcpu_obj.thread;
         if (sched.coreRunning(thread)) |core_id| {
-            arch.smp.triggerSchedulerInterrupt(core_id);
+            gic.sendSchedulerIpi(core_id);
             while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
         }
     }
@@ -349,7 +351,7 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     if (state_snapshot == .running) {
         const thread = vcpu_obj.thread;
         thread.state = .ready;
-        const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
+        const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
         sched.enqueueOnCore(target_core, thread);
     }
 
@@ -383,12 +385,12 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     if (vcpu_obj.loadState() == .running) {
         const thread = vcpu_obj.thread;
         if (sched.coreRunning(thread)) |core_id| {
-            arch.smp.triggerSchedulerInterrupt(core_id);
+            gic.sendSchedulerIpi(core_id);
             while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
         }
         injectInterrupt(&vcpu_obj.guest_state, interrupt);
         thread.state = .ready;
-        const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
+        const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
         sched.enqueueOnCore(target_core, thread);
     } else {
         injectInterrupt(&vcpu_obj.guest_state, interrupt);
@@ -417,7 +419,7 @@ fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
         const page_off = src_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(src_va), false, false) catch return false;
-        const src_pa = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
+        const src_pa = aarch64_paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(src_va)) orelse return false;
         const physmap_addr = VAddr.fromPAddr(src_pa, null).addr + page_off;
         const src: [*]const u8 = @ptrFromInt(physmap_addr);
         @memcpy(buf[dst_off..][0..chunk], src[0..chunk]);
@@ -437,7 +439,7 @@ fn writeUserStruct(proc: *Process, user_va: u64, data: []const u8) bool {
         const page_off = dst_va & 0xFFF;
         const chunk = @min(remaining, paging.PAGE4K - page_off);
         proc.vmm.demandPage(VAddr.fromInt(dst_va), true, false) catch return false;
-        const dst_pa = arch.paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return false;
+        const dst_pa = aarch64_paging.resolveVaddr(proc.addr_space_root, VAddr.fromInt(dst_va)) orelse return false;
         const physmap_addr = VAddr.fromPAddr(dst_pa, null).addr + page_off;
         const dst: [*]u8 = @ptrFromInt(physmap_addr);
         @memcpy(dst[0..chunk], data[src_off..][0..chunk]);
@@ -455,7 +457,7 @@ fn mapKernelStack(stack: zag.memory.stack.Stack) !void {
         const kpage = try pmm_iface.create(paging.PageMem(.page4k));
         @memset(std.mem.asBytes(kpage), 0);
         const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
-        try arch.paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), .{
+        try aarch64_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), .{
             .write_perm = .write,
             .execute_perm = .no_execute,
             .cache_perm = .write_back,

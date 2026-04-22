@@ -2,7 +2,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const apic = zag.arch.x64.apic;
-const arch = zag.arch.dispatch;
+const arch_paging = zag.arch.x64.paging;
 const cpu = zag.arch.x64.cpu;
 const device_registry = zag.devices.registry;
 const iommu = zag.arch.x64.iommu;
@@ -395,7 +395,7 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
                 .privilege_perm = .kernel,
             };
 
-            try arch.paging.mapPage(
+            try arch_paging.mapPage(
                 memory_init.kernel_addr_space_root,
                 lapic_phys,
                 lapic_virt,
@@ -420,7 +420,7 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
                 .privilege_perm = .kernel,
             };
 
-            try arch.paging.mapPage(
+            try arch_paging.mapPage(
                 memory_init.kernel_addr_space_root,
                 hpet_phys,
                 hpet_virt,
@@ -486,7 +486,7 @@ fn parseMcfg(mcfg_vaddr: VAddr, length: u32) !void {
         while (offset < ecam_size) {
             const page_phys = PAddr.fromInt(base_address + offset);
             const page_virt = VAddr.fromPAddr(page_phys, null);
-            arch.paging.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS) catch {
+            arch_paging.mapPage(memory_init.kernel_addr_space_root, page_phys, page_virt, MMIO_PERMS) catch {
                 offset += paging.PAGE4K;
                 continue;
             };
