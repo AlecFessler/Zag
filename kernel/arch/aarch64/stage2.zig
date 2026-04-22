@@ -271,12 +271,6 @@ pub const VmControlBlock = extern struct {
             self.hcr_override_clear &= ~mask;
         }
     }
-
-    /// Stage the VMID the next guest entry will program into
-    /// `VTTBR_EL2.VMID`. Called by `kvm.vmid.refresh` after rollover.
-    pub fn setVmid(self: *VmControlBlock, id: u8) void {
-        self.vmid = id;
-    }
 };
 
 comptime {

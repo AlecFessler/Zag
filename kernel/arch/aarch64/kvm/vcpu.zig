@@ -235,7 +235,7 @@ fn vcpuEntryPoint() void {
         // `vm_hyp.vmResume` can build VTTBR_EL2.VMID from `vm_structures`
         // alone (matches the x86 pattern where the per-VM ASID/VPID
         // is already inside the VMCB/VMCS that vm_structures points at).
-        stage2.controlBlock(vm_structures).setVmid(vm_obj.vmid);
+        stage2.controlBlock(vm_structures).vmid = vm_obj.vmid;
 
         // M5.1 (#127): program the virtual CPU interface from the
         // per-vCPU shadow (list registers, AP0R/AP1R, ICH_HCR.EN,
