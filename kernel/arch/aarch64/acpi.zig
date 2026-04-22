@@ -417,6 +417,7 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
     // to the PL011/RTC fallback block so the serial upper-half and the
     // wall-clock still get wired up.
     var saw_spcr = false;
+    var gic_discovery: gic.GicDiscovery = .{};
     if (xsdp_phys.addr == 0) {
         saw_spcr = false;
     } else {
@@ -436,7 +437,7 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
             const sdt = Sdt.fromVAddr(sdt_virt);
 
             if (std.mem.eql(u8, @ptrCast(&sdt.signature), "APIC")) {
-                try parseMadt(sdt_virt);
+                gic_discovery = try parseMadt(sdt_virt);
             }
 
             if (std.mem.eql(u8, @ptrCast(&sdt.signature), "SPCR")) {
@@ -584,10 +585,14 @@ pub fn parseAcpi(xsdp_phys: PAddr) !void {
         .pixel_format = PixelFormat.bgr8,
     });
 
-    // GIC init must happen after MADT parsing so that gicd_base /
-    // gicr_bases / core_count are populated. init.zig runs before ACPI
-    // parsing, so it cannot do this itself.
-    gic.init();
+    // GIC init must happen after MADT parsing so that the distributor,
+    // CPU-interface, and redistributor bases are known. init.zig runs
+    // before ACPI parsing, so it cannot do this itself. The discovery
+    // state is an explicit argument rather than module globals — if the
+    // MADT pass is skipped (e.g. direct-kernel boot with XSDP == 0), the
+    // default-initialized `gic_discovery` simply leaves the driver with
+    // zeroed state and the internal guards bail out safely.
+    gic.init(gic_discovery);
 }
 
 // FADT (ACPI 6.5, Section 5.2.9, Table 5-34) — ARM Boot Architecture Flags.
@@ -637,10 +642,16 @@ fn parseFadt(fadt_virt: VAddr) void {
 /// - GICD entries (type 0x0C): extract distributor base address.
 /// - GICR entries (type 0x0E): extract redistributor region base addresses.
 ///
+/// Returns a `GicDiscovery` populated with the virtual-address topology
+/// so that `gic.init(discovery)` receives its inputs through an explicit
+/// argument rather than side-channel globals.
+///
 /// ACPI 6.5, Section 5.2.12.
-fn parseMadt(madt_virt: VAddr) !void {
+fn parseMadt(madt_virt: VAddr) !gic.GicDiscovery {
     const madt = Madt.fromVAddr(madt_virt);
     try madt.validate();
+
+    var discovery: gic.GicDiscovery = .{};
 
     // First pass: count enabled cores, store MPIDR values, and capture
     // the GICv2 GICC CPU-interface MMIO base if present. On GICv3 the
@@ -668,17 +679,14 @@ fn parseMadt(madt_virt: VAddr) !void {
 
     if (gicc_mmio_phys != 0) {
         // GICv2 CPU interface is spec'd as an 8KB region (IHI 0048B §5.3).
-        const gicc_va = try mapDeviceRange(gicc_mmio_phys, 8 * 1024);
-        gic.setGiccBase(gicc_va);
+        discovery.gicc_base = try mapDeviceRange(gicc_mmio_phys, 8 * 1024);
     }
 
     // Second pass: extract distributor and redistributor base addresses.
-    // addRedistributor increments gic.core_count internally, so we must
-    // call setCoreCount AFTER this pass — otherwise the redistributor
-    // additions would push core_count past the true MADT GICC count
-    // (one phantom core per redistributor entry).
+    // The redistributor slots populate `discovery.gicr_bases`, leaving
+    // `core_count` (from the GICC pass above) independent so the two
+    // counters can't clobber each other regardless of MADT entry order.
     madt_iter = madt.iter();
-    var redist_idx: u64 = 0;
 
     while (madt_iter.next()) |e| {
         const entry = decodeMadt(e) orelse continue;
@@ -691,7 +699,7 @@ fn parseMadt(madt_virt: VAddr) !void {
                 // explicit mapping here.
                 // IHI 0069H, Section 8.1.
                 const gicd_va = try mapDeviceRange(gicd_entry.physical_base_address, 64 * 1024);
-                gic.setDistributorBase(gicd_va);
+                discovery.gicd_base = gicd_va;
             },
             .gicr => |gicr_entry| {
                 // A GICR discovery range covers one or more redistributors
@@ -717,8 +725,10 @@ fn parseMadt(madt_virt: VAddr) !void {
                 const gicr_va_base = try mapDeviceRange(gicr_entry.discovery_range_base, range_len);
                 var offset: u64 = 0;
                 while (offset + stride <= range_len) {
-                    gic.addRedistributor(gicr_va_base + offset);
-                    redist_idx += 1;
+                    const idx: usize = @intCast(discovery.redist_count);
+                    if (idx >= discovery.gicr_bases.len) break;
+                    discovery.gicr_bases[idx] = gicr_va_base + offset;
+                    discovery.redist_count += 1;
                     offset += stride;
                 }
             },
@@ -726,9 +736,8 @@ fn parseMadt(madt_virt: VAddr) !void {
         }
     }
 
-    if (core_count > 0) {
-        gic.setCoreCount(core_count);
-    }
+    discovery.core_count = core_count;
+    return discovery;
 }
 
 /// Parse SPCR to discover the PL011 UART base address.

@@ -235,25 +235,60 @@ pub var gicv3: bool = false;
 /// returns depending on which Group the pending interrupt is in.
 var gicv2_group1_ack: bool = false;
 
-/// GICD base virtual address. Set by acpi.zig via setDistributorBase().
+/// GICD base virtual address. Populated by `init(discovery)` from
+/// `GicDiscovery.gicd_base`.
 var gicd_base: u64 = 0;
 
-/// GICC base virtual address (GICv2 only). Set via setGiccBase().
+/// GICC base virtual address (GICv2 only). Populated by `init(discovery)`
+/// from `GicDiscovery.gicc_base`; zero when the ACPI MADT did not expose
+/// a GICv2 CPU-interface MMIO window (e.g. GICv3 systems).
 /// IHI 0048B, Section 4.4: CPU Interface register map.
 var gicc_base: u64 = 0;
 
-/// GICR base virtual addresses, one per core. Populated by acpi.zig via addRedistributor().
+/// GICR base virtual addresses, one per core. Populated by `init(discovery)`
+/// from `GicDiscovery.gicr_bases`.
 var gicr_bases: [max_redist]u64 = [_]u64{0} ** max_redist;
 
 /// Number of redistributors populated in `gicr_bases`. Separate from
 /// `core_count` (which tracks enabled CPU cores from MADT GICC entries)
-/// so that setCoreCount + addRedistributor can be called in any order
-/// without the two counters clobbering each other.
+/// so the two counters don't clobber each other. Populated by
+/// `init(discovery)` from `GicDiscovery.redist_count`.
 var redist_count: u64 = 0;
 
-/// Number of cores discovered from MADT. Starts at 0; set via setCoreCount().
-/// Defaults to 1 after init() if no cores were explicitly added (BSP-only fallback).
+/// Number of cores discovered from MADT. Populated by `init(discovery)`
+/// from `GicDiscovery.core_count`; `coreCount()` reports 1 as a BSP-only
+/// fallback when the discovery struct left this zero.
 var core_count: u64 = 0;
+
+/// ACPI-discovered GIC topology passed from the MADT parser to `init()`.
+///
+/// Replaces the earlier implicit contract where `parseMadt` mutated
+/// module-global discovery state (`gicd_base`, `gicc_base`, `gicr_bases`,
+/// `redist_count`, `core_count`) and the caller had to invoke `gic.init()`
+/// afterwards. The handoff is now explicit: the MADT parser builds the
+/// struct, the caller hands it to `init(discovery)`, and reordering the
+/// two steps is a compile-time error rather than a silent boot hang.
+///
+/// Fields mirror the discovery setters they replace:
+///   - gicd_base: GICD MMIO virtual address (distributor).
+///     ACPI 6.5 Table 5-47 (MADT GICD, type 0x0C).
+///   - gicc_base: GICv2 CPU-interface MMIO virtual address; zero on
+///     GICv3 systems where the CPU interface is accessed via ICC_*_EL1
+///     system registers. ACPI 6.5 Table 5-45 (MADT GICC, type 0x0B).
+///   - gicr_bases: per-core GICR frame virtual addresses; only the first
+///     `redist_count` entries are populated. ACPI 6.5 Table 5-49 (MADT
+///     GICR, type 0x0E).
+///   - redist_count: number of populated entries in `gicr_bases`.
+///   - core_count: enabled core count from MADT GICC entries. Zero when
+///     the MADT had no enabled GICC entries; `coreCount()` treats zero
+///     as a BSP-only (1-core) fallback.
+pub const GicDiscovery = struct {
+    gicd_base: u64 = 0,
+    gicc_base: u64 = 0,
+    gicr_bases: [max_redist]u64 = [_]u64{0} ** max_redist,
+    redist_count: u64 = 0,
+    core_count: u64 = 0,
+};
 
 /// Number of SPI lines supported by this GICD, derived from GICD_TYPER.
 var max_spi_intid: u32 = 0;
@@ -402,40 +437,6 @@ fn readMpidr() u64 {
         : [val] "=r" (val),
     );
     return val;
-}
-
-// ── ACPI discovery interface ────────────────────────────────────
-
-/// Set the GICD base virtual address. Called by acpi.zig when parsing the
-/// MADT GIC Distributor structure (ACPI 6.5, Table 5-47, type 0x0C).
-pub fn setDistributorBase(addr: u64) void {
-    gicd_base = addr;
-}
-
-/// Set the GICC base virtual address for GICv2 CPU interface.
-/// Called by acpi.zig when parsing the MADT GICC structure, or by DTB
-/// parsing for the GICv2 CPU interface memory region.
-///
-/// IHI 0048B, Section 4.4: CPU Interface register map.
-pub fn setGiccBase(addr: u64) void {
-    gicc_base = addr;
-}
-
-/// Register a redistributor base virtual address. Called by acpi.zig for each
-/// core discovered from MADT GIC Redistributor structures (ACPI 6.5, type 0x0E)
-/// or by iterating the redistributor discovery region.
-///
-/// Must be called in core index order (core 0, core 1, ...).
-pub fn addRedistributor(addr: u64) void {
-    const idx: usize = @intCast(redist_count);
-    if (idx >= max_redist) return;
-    gicr_bases[idx] = addr;
-    redist_count += 1;
-}
-
-/// Set the core count directly (e.g., from counting MADT GICC structures).
-pub fn setCoreCount(count: u64) void {
-    core_count = count;
 }
 
 // ── Initialization ──────────────────────────────────────────────
@@ -753,9 +754,28 @@ pub fn initCpuInterface() void {
 
 /// Full GIC initialization for the BSP (boot core).
 ///
-/// Initializes the distributor, the BSP's redistributor (index 0), and the
-/// BSP's CPU interface. Secondary cores call initSecondaryCoreGic() instead.
-pub fn init() void {
+/// Installs the ACPI-discovered topology (`d`) into module-local state
+/// and then initializes the distributor, the BSP's redistributor (index
+/// 0), and the BSP's CPU interface. Secondary cores call
+/// initSecondaryCoreGic() instead.
+///
+/// Taking discovery as an explicit argument (rather than reading globals
+/// written earlier by the MADT parser) makes the ordering between MADT
+/// parsing and GIC init a compile-time contract: reordering the two
+/// steps in `acpi.parseAcpi` is a type error rather than a silent boot
+/// hang. See `GicDiscovery` for field semantics.
+pub fn init(d: GicDiscovery) void {
+    gicd_base = d.gicd_base;
+    gicc_base = d.gicc_base;
+    const n: usize = @intCast(@min(d.redist_count, @as(u64, max_redist)));
+    var i: usize = 0;
+    while (i < n) {
+        gicr_bases[i] = d.gicr_bases[i];
+        i += 1;
+    }
+    redist_count = n;
+    core_count = d.core_count;
+
     initDistributor();
     initRedistributor(0);
     initCpuInterface();
