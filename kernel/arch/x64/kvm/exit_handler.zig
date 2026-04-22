@@ -42,11 +42,7 @@ pub fn handleExit(vcpu_obj: *VCpu, exit_info: vm_hw.VmExitInfo) void {
             // Check policy table for pre-configured response
             if (lookupCpuidPolicy(&vm_obj.policy, cpuid_exit.leaf, cpuid_exit.subleaf)) |response| {
                 // Write response into guest state and advance RIP past CPUID (2 bytes)
-                vcpu_obj.guest_state.rax = response.eax;
-                vcpu_obj.guest_state.rbx = response.ebx;
-                vcpu_obj.guest_state.rcx = response.ecx;
-                vcpu_obj.guest_state.rdx = response.edx;
-                vcpu_obj.guest_state.rip += 2;
+                vcpu_obj.respondCpuid(response.eax, response.ebx, response.ecx, response.edx, 2);
                 return;
             }
             // No policy match -- fall through to VMM delivery

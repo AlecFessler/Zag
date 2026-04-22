@@ -139,7 +139,7 @@ pub const Vm = struct {
             const value = self.lapic.mmioRead(offset);
             mmio_decode.writeGpr(&vcpu_obj.guest_state, op.reg, @as(u64, value));
         }
-        vcpu_obj.guest_state.rip += op.len;
+        vcpu_obj.advanceRip(op.len);
         return true;
     }
 
@@ -152,7 +152,7 @@ pub const Vm = struct {
             const value = self.ioapic.mmioRead(offset);
             mmio_decode.writeGpr(&vcpu_obj.guest_state, op.reg, @as(u64, value));
         }
-        vcpu_obj.guest_state.rip += op.len;
+        vcpu_obj.advanceRip(op.len);
         return true;
     }
 

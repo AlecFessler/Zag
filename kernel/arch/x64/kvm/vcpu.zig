@@ -59,6 +59,32 @@ pub const VCpu = struct {
     pub inline fn storeState(self: *VCpu, s: VCpuState) void {
         @atomicStore(VCpuState, &self.state, s, .release);
     }
+
+    /// Advance guest RIP by `bytes`. Wrapping add matches the arithmetic the
+    /// callers used inline and keeps an out-of-band guest RIP (e.g. a guest
+    /// jumping to near the top of the 64-bit address space) from panicking
+    /// a safety-checked kernel build on the post-instruction advance.
+    pub inline fn advanceRip(self: *VCpu, bytes: u8) void {
+        self.guest_state.rip +%= bytes;
+    }
+
+    /// Write the CPUID response registers into guest state and advance RIP
+    /// past the CPUID instruction. All inline CPUID exit paths route through
+    /// here so guest-state writes stay local to VCpu.
+    pub inline fn respondCpuid(
+        self: *VCpu,
+        rax_value: u64,
+        rbx_value: u64,
+        rcx_value: u64,
+        rdx_value: u64,
+        advance: u8,
+    ) void {
+        self.guest_state.rax = rax_value;
+        self.guest_state.rbx = rbx_value;
+        self.guest_state.rcx = rcx_value;
+        self.guest_state.rdx = rdx_value;
+        self.advanceRip(advance);
+    }
 };
 
 /// Create a vCPU: allocate the struct, create a kernel thread, link them.
