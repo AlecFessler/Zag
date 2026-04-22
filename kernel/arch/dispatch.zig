@@ -643,30 +643,6 @@ pub fn freeAddrSpaceId(id: u16) void {
     }
 }
 
-/// Read the Memory Attribute Indirection Register.
-/// On aarch64: MAIR_EL1. On x86-64: returns 0 (not applicable).
-pub fn readMair() u64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => 0,
-        .aarch64 => asm volatile ("mrs %[ret], mair_el1"
-            : [ret] "=r" (-> u64),
-        ),
-        else => unreachable,
-    };
-}
-
-/// Read the Translation Control Register.
-/// On aarch64: TCR_EL1. On x86-64: returns 0.
-pub fn readTcr() u64 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => 0,
-        .aarch64 => asm volatile ("mrs %[ret], tcr_el1"
-            : [ret] "=r" (-> u64),
-        ),
-        else => unreachable,
-    };
-}
-
 /// Write a single character to the platform's early debug output.
 /// On x86-64: serial port 0x3F8. On aarch64: PL011 at physmap + 0x09000000.
 /// Used before the serial driver is initialized. The physmap VA is used
@@ -719,18 +695,6 @@ pub fn enableKernelTranslation() void {
             aarch64.paging.initMairIndices();
             aarch64.paging.enableKernelTranslation();
         },
-        else => unreachable,
-    }
-}
-
-/// Set the memory attribute indirection register to our expected values.
-/// On aarch64 this writes MAIR_EL1 (index 0 = Device, index 1 = Normal WB).
-/// Must be called after UEFI boot services exit, before jumping to the kernel.
-/// On x86-64 this is a no-op (PAT is set up by the kernel).
-pub fn setMemoryAttributes() void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => {},
-        .aarch64 => aarch64.paging.setMair(),
         else => unreachable,
     }
 }
@@ -958,36 +922,6 @@ pub fn readTimestamp() u64 {
         .aarch64 => aarch64.cpu.readCntvct(),
         else => unreachable,
     };
-}
-
-/// Read a value from an x86 I/O port.
-/// Intel SDM Vol 1, §18.2 "I/O Port Addressing" — IN instruction reads 8, 16,
-/// or 32 bits from the port address specified in DX (or an immediate byte).
-pub fn ioportIn(port: u16, width: u8) u32 {
-    return switch (builtin.cpu.arch) {
-        .x86_64 => switch (width) {
-            1 => @as(u32, x64.cpu.inb(port)),
-            2 => @as(u32, x64.cpu.inw(port)),
-            4 => x64.cpu.ind(port),
-            else => unreachable,
-        },
-        else => unreachable,
-    };
-}
-
-/// Write a value to an x86 I/O port.
-/// Intel SDM Vol 1, §18.2 "I/O Port Addressing" — OUT instruction writes 8,
-/// 16, or 32 bits to the port address specified in DX (or an immediate byte).
-pub fn ioportOut(port: u16, width: u8, value: u32) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => switch (width) {
-            1 => x64.cpu.outb(@truncate(value), port),
-            2 => x64.cpu.outw(@truncate(value), port),
-            4 => x64.cpu.outd(value, port),
-            else => unreachable,
-        },
-        else => unreachable,
-    }
 }
 
 pub fn print(
