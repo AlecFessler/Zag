@@ -865,10 +865,10 @@ pub fn globalInit() !void {
     thread_mod.allocator = thread_alloc_instance.allocator();
 
     vm_alloc_instance = try VmAllocator.init(memory_init.kvm_vm_slab_backing.allocator());
-    arch.kvm.kvmSetVmAllocator(vm_alloc_instance.allocator());
+    arch.vm.setVmAllocator(vm_alloc_instance.allocator());
 
     vcpu_alloc_instance = try VCpuAllocator.init(memory_init.kvm_vcpu_slab_backing.allocator());
-    arch.kvm.kvmSetVcpuAllocator(vcpu_alloc_instance.allocator());
+    arch.vm.setVcpuAllocator(vcpu_alloc_instance.allocator());
 
     idle_process = try Process.createIdle();
 

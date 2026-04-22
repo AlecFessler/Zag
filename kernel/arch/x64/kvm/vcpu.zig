@@ -258,7 +258,7 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
         if (vcpu_obj.guest_state.pending_eventinj != 0) {
             vm_obj.injectExternal(interrupt.vector);
         } else {
-            arch.vm.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
+            vm_hw.injectInterrupt(&vcpu_obj.guest_state, interrupt);
         }
         thread.state = .ready;
         const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
@@ -268,7 +268,7 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
         if (vcpu_obj.guest_state.pending_eventinj != 0) {
             vm_obj.injectExternal(interrupt.vector);
         } else {
-            arch.vm.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
+            vm_hw.injectInterrupt(&vcpu_obj.guest_state, interrupt);
         }
     }
 

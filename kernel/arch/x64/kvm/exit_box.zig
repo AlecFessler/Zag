@@ -292,14 +292,14 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
             // an attacker VMM could write an illegal vector directly into
             // VM_ENTRY_INTR_INFO and corrupt guest exception handling.
             if (interrupt.vector < 32) return E_INVAL;
-            arch.vm.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
+            vm_hw.injectInterrupt(&vcpu_obj.guest_state, interrupt);
             vcpu_obj.storeState(.running);
             resumeVcpuThread(thread);
         },
         2 => {
             // inject_exception: payload is GuestException at offset 8
             const exception = std.mem.bytesAsValue(vm_hw.GuestException, action_buf[8..][0..@sizeOf(vm_hw.GuestException)]).*;
-            arch.vm.vmInjectException(&vcpu_obj.guest_state, exception);
+            vm_hw.injectException(&vcpu_obj.guest_state, exception);
             vcpu_obj.storeState(.running);
             resumeVcpuThread(thread);
         },

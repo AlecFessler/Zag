@@ -176,7 +176,7 @@ pub const Thread = struct {
                 proc.lock.lock();
                 const remaining = proc.threads[0..proc.num_threads];
                 for (remaining) |t| {
-                    if (arch.kvm.kvmVcpuFromThread(vm_obj, t) == null) {
+                    if (!arch.vm.threadIsVcpu(vm_obj, t)) {
                         all_vcpu = false;
                         break;
                     }

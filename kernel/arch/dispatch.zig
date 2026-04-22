@@ -3,7 +3,6 @@ pub const cpu = @import("dispatch/cpu.zig");
 pub const fpu = @import("dispatch/fpu.zig");
 pub const interrupts = @import("dispatch/interrupts.zig");
 pub const iommu = @import("dispatch/iommu.zig");
-pub const kvm = @import("dispatch/kvm.zig");
 pub const paging = @import("dispatch/paging.zig");
 pub const pmu = @import("dispatch/pmu.zig");
 pub const power = @import("dispatch/power.zig");

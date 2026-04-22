@@ -256,13 +256,13 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
             const interrupt = std.mem.bytesAsValue(vm_hw.GuestInterrupt, action_buf[8..][0..@sizeOf(vm_hw.GuestInterrupt)]).*;
             // No vector-rejection check: GICv3 §2.2.1 makes every INTID
             // (0..1019) a legitimate injection target.
-            arch.vm.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
+            vcpu_mod.injectInterrupt(&vcpu_obj.guest_state, interrupt);
             vcpu_obj.storeState(.running);
             resumeVcpuThread(thread);
         },
         2 => {
             const exception = std.mem.bytesAsValue(vm_hw.GuestException, action_buf[8..][0..@sizeOf(vm_hw.GuestException)]).*;
-            arch.vm.vmInjectException(&vcpu_obj.guest_state, exception);
+            vm_hw.injectException(&vcpu_obj.guest_state, exception);
             vcpu_obj.storeState(.running);
             resumeVcpuThread(thread);
         },

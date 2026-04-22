@@ -411,13 +411,12 @@ pub fn sysregPassthrough(proc: *Process, vm_handle: u64, sysreg_id: u32, allow_r
 
     if (isSecurityCriticalSysreg(sysreg_id)) return E_PERM;
 
-    // Serialize the HCR override RMW inside `arch.vm.vmSysregPassthrough` —
-    // multiple threads in the same process could otherwise race on the
-    // VM's control block.
+    // Serialize the HCR override RMW — multiple threads in the same
+    // process could otherwise race on the VM's control block.
     vm_obj.lock.lock();
     defer vm_obj.lock.unlock();
 
-    arch.vm.vmSysregPassthrough(vm_obj.arch_structures, sysreg_id, allow_read, allow_write);
+    vm_hw.sysregPassthrough(vm_obj.arch_structures, sysreg_id, allow_read, allow_write);
     return 0; // E_OK
 }
 

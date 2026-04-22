@@ -177,13 +177,11 @@ pub fn vcpuFromThread(vm_obj: *Vm, thread: *Thread) ?*VCpu {
 }
 
 /// Route an interrupt injection addressed by GuestState pointer into the
-/// in-kernel vGIC. This is the aarch64 backend for `arch.vm.vmInjectInterrupt`
-/// — the dispatch signature takes `*GuestState` for 1:1 parity with the
-/// x86 side (which mutates `guest_state.pending_eventinj` directly). On
-/// aarch64 the real injection state lives on the per-vCPU vGIC shadow
-/// (list registers + SGI/PPI pending bits), so we recover the containing
-/// VCpu via `@fieldParentPtr("guest_state", ...)` — every call site
-/// already passes `&vcpu_obj.guest_state`, see
+/// in-kernel vGIC. The caller passes `&vcpu_obj.guest_state`; we recover
+/// the containing VCpu via `@fieldParentPtr("guest_state", ...)` because
+/// the real injection state lives on the per-vCPU vGIC shadow (list
+/// registers + SGI/PPI pending bits), not directly on GuestState.
+/// See
 /// `kvm.vcpu.vcpuInterrupt` and `kvm.exit_box.vmReply`.
 ///
 /// `aarch64/vm.zig` cannot `@import("zag").arch.aarch64.kvm.vgic`
@@ -388,12 +386,12 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
             arch.smp.triggerSchedulerInterrupt(core_id);
             while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
         }
-        arch.vm.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
+        injectInterrupt(&vcpu_obj.guest_state, interrupt);
         thread.state = .ready;
         const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
         sched.enqueueOnCore(target_core, thread);
     } else {
-        arch.vm.vmInjectInterrupt(&vcpu_obj.guest_state, interrupt);
+        injectInterrupt(&vcpu_obj.guest_state, interrupt);
     }
 
     return 0; // E_OK
