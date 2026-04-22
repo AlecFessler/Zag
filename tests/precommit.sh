@@ -214,93 +214,23 @@ stage_hyprvos_x86_linux_boot() {
     fi
 }
 
-stage_hyprvos_pi_linux_boot() {
+stage_hyprvos_aarch64_linux_boot() {
     echo ""
     echo "=================================================="
-    echo "[4/4] hyprvOS Linux boot (aarch64 on Pi)"
+    echo "[4/4] hyprvOS Linux boot (aarch64, local TCG)"
     echo "=================================================="
-
-    echo "Building hyprvOS (aarch64)..."
-    if ! (cd "$ZAG_ROOT/hyprvOS" && zig build -Darch=arm); then
-        FAILURES+=("hyprvOS aarch64 build")
-        return 1
-    fi
-
-    echo "Building kernel (aarch64, hyprvos profile)..."
-    if ! (cd "$ZAG_ROOT" && zig build -Darch=arm -Dprofile=hyprvos -Doptimize=ReleaseSafe); then
-        FAILURES+=("hyprvos aarch64 kernel build")
-        return 1
-    fi
-
-    echo "Syncing hyprvOS aarch64 artifacts to $PI_HOST..."
-    ssh "$PI_HOST" "mkdir -p zag-test/hyprvos/efi/boot" || {
-        FAILURES+=("ssh mkdir hyprvos on Pi")
-        return 1
-    }
-    if ! rsync -a \
-        "$ZAG_ROOT/zig-out/img/kernel.elf" \
-        "$ZAG_ROOT/zig-out/img/root_service.elf" \
-        "$PI_HOST:zag-test/hyprvos/"; then
-        FAILURES+=("rsync hyprvos kernel to Pi")
-        return 1
-    fi
-    if ! rsync -a \
-        "$ZAG_ROOT/zig-out/img/efi/boot/BOOTAA64.EFI" \
-        "$PI_HOST:zag-test/hyprvos/efi/boot/BOOTAA64.EFI"; then
-        FAILURES+=("rsync BOOTAA64.EFI (hyprvos) to Pi")
-        return 1
-    fi
-
-    # Pi 5 KVM requires gic-version=2 (see project_aarch64_port_state).
-    local remote_script
-    remote_script=$(cat <<'REMOTE'
-set -u
-cd "$HOME/zag-test/hyprvos"
-WD=$(mktemp -d)
-trap "rm -rf $WD" EXIT
-mkdir -p "$WD/efi/boot"
-cp efi/boot/BOOTAA64.EFI "$WD/efi/boot/"
-cp kernel.elf "$WD/"
-cp root_service.elf "$WD/"
-LOG=$(mktemp)
-timeout 120 qemu-system-aarch64 \
-    -M virt,gic-version=2,accel=kvm \
-    -cpu host,pmu=on \
-    -m 2G \
-    -bios /usr/share/AAVMF/AAVMF_CODE.fd \
-    -serial stdio \
-    -display none \
-    -no-reboot \
-    -smp 4 \
-    -drive "file=fat:rw:$WD,format=raw" > "$LOG" 2>&1 &
-QPID=$!
-found=0
-for _ in $(seq 1 120); do
-    if grep -q "=== Zag VM Shell ===" "$LOG" 2>/dev/null; then
-        found=1
-        break
-    fi
-    sleep 1
-done
-kill -TERM $QPID 2>/dev/null || true
-pkill -f qemu-system-aarch64 2>/dev/null || true
-wait $QPID 2>/dev/null || true
-if [ $found -eq 1 ]; then
-    echo "[PASS] Linux booted to shell (aarch64 on Pi)"
-    rm -f "$LOG"
-    exit 0
-else
-    echo "[FAIL] Linux did not reach shell within 120s (aarch64 on Pi)"
-    echo "--- last 30 lines of QEMU output ---"
-    tail -30 "$LOG"
-    echo "--- end ---"
-    rm -f "$LOG"
-    exit 1
-fi
-REMOTE
-)
-    if ! ssh "$PI_HOST" "bash -s" <<<"$remote_script"; then
-        FAILURES+=("hyprvOS Linux boot (aarch64 on Pi)")
+    # TCG, not KVM-on-Pi: the Pi 5 does not expose nested virt, and Pi
+    # KVM only supports gic-version=2 while our driver is GICv3. The
+    # aarch64 hyprvOS path puts Zag at EL2, so it has to run under TCG
+    # with `virtualization=on`. The aarch64 kernel test suite still
+    # runs on Pi KVM (stage 2) because those tests don't take the
+    # kernel into EL2.
+    #
+    # Delegate to tests/test.sh linux-arm — it has the canonical QEMU
+    # incantation + build flags (-Dkvm=false, cpu cortex-a72, etc.)
+    # and the "hello from guest" marker. Single source of truth.
+    if ! bash "$SCRIPT_DIR/test.sh" linux-arm; then
+        FAILURES+=("hyprvOS Linux boot (aarch64 TCG)")
         return 1
     fi
 }
@@ -346,7 +276,7 @@ stage_dead_code_report          || true
 stage_x86_kernel_tests          || true
 stage_aarch64_kernel_tests_pi   || true
 stage_hyprvos_x86_linux_boot    || true
-stage_hyprvos_pi_linux_boot     || true
+stage_hyprvos_aarch64_linux_boot || true
 # stage_redteam_regressions     || true
 # stage_kernel_perf             || true
 
