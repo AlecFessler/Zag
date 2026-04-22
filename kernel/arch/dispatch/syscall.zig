@@ -7,41 +7,30 @@ const x64 = zag.arch.x64;
 
 const ArchCpuContext = zag.arch.dispatch.cpu.ArchCpuContext;
 
-pub const SyscallArgs = struct {
-    num: u64,
-    arg0: u64,
-    arg1: u64,
-    arg2: u64,
-    arg3: u64,
-    arg4: u64,
+pub const SyscallArgs = switch (builtin.cpu.arch) {
+    .x86_64 => x64.interrupts.SyscallArgs,
+    .aarch64 => aarch64.interrupts.SyscallArgs,
+    else => unreachable,
+};
+
+pub const IpcPayloadSnapshot = switch (builtin.cpu.arch) {
+    .x86_64 => x64.interrupts.IpcPayloadSnapshot,
+    .aarch64 => aarch64.interrupts.IpcPayloadSnapshot,
+    else => unreachable,
 };
 
 pub fn getSyscallArgs(ctx: *const ArchCpuContext) SyscallArgs {
     return switch (builtin.cpu.arch) {
-        .x86_64 => .{
-            .num = ctx.regs.rax,
-            .arg0 = ctx.regs.rdi,
-            .arg1 = ctx.regs.rsi,
-            .arg2 = ctx.regs.rdx,
-            .arg3 = ctx.regs.r10,
-            .arg4 = ctx.regs.r8,
-        },
-        .aarch64 => .{
-            .num = ctx.regs.x8,
-            .arg0 = ctx.regs.x0,
-            .arg1 = ctx.regs.x1,
-            .arg2 = ctx.regs.x2,
-            .arg3 = ctx.regs.x3,
-            .arg4 = ctx.regs.x4,
-        },
+        .x86_64 => x64.interrupts.getSyscallArgs(ctx),
+        .aarch64 => aarch64.interrupts.getSyscallArgs(ctx),
         else => unreachable,
     };
 }
 
 pub fn getSyscallReturn(ctx: *const ArchCpuContext) u64 {
     return switch (builtin.cpu.arch) {
-        .x86_64 => ctx.regs.rax,
-        .aarch64 => ctx.regs.x0,
+        .x86_64 => x64.interrupts.getSyscallReturn(ctx),
+        .aarch64 => aarch64.interrupts.getSyscallReturn(ctx),
         else => unreachable,
     };
 }
@@ -56,32 +45,32 @@ pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
 
 pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
     return switch (builtin.cpu.arch) {
-        .x86_64 => ctx.regs.r13,
-        .aarch64 => ctx.regs.x5,
+        .x86_64 => x64.interrupts.getIpcHandle(ctx),
+        .aarch64 => aarch64.interrupts.getIpcHandle(ctx),
         else => unreachable,
     };
 }
 
 pub fn getIpcMetadata(ctx: *const ArchCpuContext) u64 {
     return switch (builtin.cpu.arch) {
-        .x86_64 => ctx.regs.r14,
-        .aarch64 => ctx.regs.x6,
+        .x86_64 => x64.interrupts.getIpcMetadata(ctx),
+        .aarch64 => aarch64.interrupts.getIpcMetadata(ctx),
         else => unreachable,
     };
 }
 
 pub fn setIpcMetadata(ctx: *ArchCpuContext, value: u64) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => ctx.regs.r14 = value,
-        .aarch64 => ctx.regs.x6 = value,
+        .x86_64 => x64.interrupts.setIpcMetadata(ctx, value),
+        .aarch64 => aarch64.interrupts.setIpcMetadata(ctx, value),
         else => unreachable,
     }
 }
 
 pub fn getIpcPayloadWords(ctx: *const ArchCpuContext) [5]u64 {
     return switch (builtin.cpu.arch) {
-        .x86_64 => .{ ctx.regs.rdi, ctx.regs.rsi, ctx.regs.rdx, ctx.regs.r8, ctx.regs.r9 },
-        .aarch64 => .{ ctx.regs.x0, ctx.regs.x1, ctx.regs.x2, ctx.regs.x3, ctx.regs.x4 },
+        .x86_64 => x64.interrupts.getIpcPayloadWords(ctx),
+        .aarch64 => aarch64.interrupts.getIpcPayloadWords(ctx),
         else => unreachable,
     };
 }
@@ -94,10 +83,12 @@ pub fn copyIpcPayload(dst: *ArchCpuContext, src: *const ArchCpuContext, word_cou
     };
 }
 
-pub const IpcPayloadSnapshot = struct { words: [5]u64 };
-
 pub fn saveIpcPayload(ctx: *const ArchCpuContext) IpcPayloadSnapshot {
-    return .{ .words = getIpcPayloadWords(ctx) };
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.saveIpcPayload(ctx),
+        .aarch64 => aarch64.interrupts.saveIpcPayload(ctx),
+        else => unreachable,
+    };
 }
 
 pub fn restoreIpcPayload(ctx: *ArchCpuContext, snap: IpcPayloadSnapshot) void {

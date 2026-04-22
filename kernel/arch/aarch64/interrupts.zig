@@ -54,7 +54,6 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const arch = zag.arch.dispatch;
 const cpu = zag.arch.aarch64.cpu;
 const fpu = zag.sched.fpu;
 const gic = zag.arch.aarch64.gic;
@@ -64,6 +63,26 @@ const scheduler = zag.sched.scheduler;
 const PAddr = zag.memory.address.PAddr;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
+
+/// Number of general-purpose registers saved in a fault snapshot.
+/// aarch64: 31 (x0-x30).
+pub const fault_gpr_count: usize = 31;
+
+/// Size of the register portion of a FaultMessage: ip + flags + sp + GPRs.
+pub const fault_regs_size: usize = (3 + fault_gpr_count) * @sizeOf(u64);
+
+/// Total size of a FaultMessage written to userspace (32-byte header + regs).
+pub const fault_msg_size: usize = 32 + fault_regs_size;
+
+/// Architecture-neutral snapshot of a faulted thread's registers.
+/// Used by fault delivery to serialize register state without the
+/// generic kernel referencing arch-specific register names.
+pub const FaultRegSnapshot = struct {
+    ip: u64,
+    flags: u64,
+    sp: u64,
+    gprs: [fault_gpr_count]u64,
+};
 
 pub const Registers = extern struct {
     x0: u64,
@@ -257,7 +276,7 @@ pub fn switchTo(thread: *Thread) noreturn {
     // open, so no migration flush is needed either.
     if (comptime fpu.lazy_enabled) {
         fpu.migrateFlush(thread);
-        const cid: u8 = @truncate(arch.smp.coreID());
+        const cid: u8 = @truncate(gic.coreID());
         const desired_armed = (scheduler.last_fpu_owner[cid] != thread);
         if (desired_armed != scheduler.fpu_trap_armed[cid]) {
             if (desired_armed) cpu.fpuArmTrap() else cpu.fpuClearTrap();
@@ -336,7 +355,7 @@ pub fn switchTo(thread: *Thread) noreturn {
 /// Convert an ArchCpuContext into the arch-neutral FaultRegSnapshot.
 /// ARM ARM D13.2.36: ELR_EL1 is the faulting instruction pointer.
 /// ARM ARM D13.2.127: SPSR_EL1 is the saved processor state (flags equivalent).
-pub fn serializeFaultRegs(ctx: *const ArchCpuContext) arch.cpu.FaultRegSnapshot {
+pub fn serializeFaultRegs(ctx: *const ArchCpuContext) FaultRegSnapshot {
     const r = &ctx.regs;
     return .{
         .ip = ctx.elr_el1,
@@ -353,7 +372,7 @@ pub fn serializeFaultRegs(ctx: *const ArchCpuContext) arch.cpu.FaultRegSnapshot 
 
 /// Apply a modified register snapshot back to a faulted thread's context.
 /// Reverse of serializeFaultRegs.
-pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: arch.cpu.FaultRegSnapshot) void {
+pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: FaultRegSnapshot) void {
     ctx.elr_el1 = snapshot.ip;
     ctx.spsr_el1 = snapshot.flags;
     ctx.sp_el0 = snapshot.sp;
@@ -368,8 +387,48 @@ pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: arch.cpu.FaultRegSnapshot)
     }
 }
 
+pub const SyscallArgs = struct {
+    num: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+};
+
+pub fn getSyscallArgs(ctx: *const ArchCpuContext) SyscallArgs {
+    return .{
+        .num = ctx.regs.x8,
+        .arg0 = ctx.regs.x0,
+        .arg1 = ctx.regs.x1,
+        .arg2 = ctx.regs.x2,
+        .arg3 = ctx.regs.x3,
+        .arg4 = ctx.regs.x4,
+    };
+}
+
+pub fn getSyscallReturn(ctx: *const ArchCpuContext) u64 {
+    return ctx.regs.x0;
+}
+
 pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.x0 = value;
+}
+
+pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
+    return ctx.regs.x5;
+}
+
+pub fn getIpcMetadata(ctx: *const ArchCpuContext) u64 {
+    return ctx.regs.x6;
+}
+
+pub fn setIpcMetadata(ctx: *ArchCpuContext, value: u64) void {
+    ctx.regs.x6 = value;
+}
+
+pub fn getIpcPayloadWords(ctx: *const ArchCpuContext) [5]u64 {
+    return .{ ctx.regs.x0, ctx.regs.x1, ctx.regs.x2, ctx.regs.x3, ctx.regs.x4 };
 }
 
 pub fn copyIpcPayload(dst: *ArchCpuContext, src: *const ArchCpuContext, word_count: u3) void {
@@ -378,6 +437,12 @@ pub fn copyIpcPayload(dst: *ArchCpuContext, src: *const ArchCpuContext, word_cou
     if (word_count >= 3) dst.regs.x2 = src.regs.x2;
     if (word_count >= 4) dst.regs.x3 = src.regs.x3;
     if (word_count >= 5) dst.regs.x4 = src.regs.x4;
+}
+
+pub const IpcPayloadSnapshot = struct { words: [5]u64 };
+
+pub fn saveIpcPayload(ctx: *const ArchCpuContext) IpcPayloadSnapshot {
+    return .{ .words = getIpcPayloadWords(ctx) };
 }
 
 pub fn restoreIpcPayload(ctx: *ArchCpuContext, words: [5]u64) void {

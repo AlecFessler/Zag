@@ -2,7 +2,6 @@ const std = @import("std");
 const zag = @import("zag");
 
 const apic = zag.arch.x64.apic;
-const arch = zag.arch.dispatch;
 const cpu = zag.arch.x64.cpu;
 const fpu = zag.sched.fpu;
 const gdt = zag.arch.x64.gdt;
@@ -16,6 +15,26 @@ const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 
 pub const ArchCpuContext = cpu.Context;
+
+/// Number of general-purpose registers saved in a fault snapshot.
+/// x86-64: 15 (rax-r15 minus rsp).
+pub const fault_gpr_count: usize = 15;
+
+/// Size of the register portion of a FaultMessage: ip + flags + sp + GPRs.
+pub const fault_regs_size: usize = (3 + fault_gpr_count) * @sizeOf(u64);
+
+/// Total size of a FaultMessage written to userspace (32-byte header + regs).
+pub const fault_msg_size: usize = 32 + fault_regs_size;
+
+/// Architecture-neutral snapshot of a faulted thread's registers.
+/// Used by fault delivery to serialize register state without the
+/// generic kernel referencing arch-specific register names.
+pub const FaultRegSnapshot = struct {
+    ip: u64,
+    flags: u64,
+    sp: u64,
+    gprs: [fault_gpr_count]u64,
+};
 
 pub const PageFaultContext = struct {
     faulting_address: u64,
@@ -439,7 +458,7 @@ export fn interruptStubEpilogue() callconv(.naked) void {
     );
 }
 
-pub fn serializeFaultRegs(ctx: *const ArchCpuContext) arch.cpu.FaultRegSnapshot {
+pub fn serializeFaultRegs(ctx: *const ArchCpuContext) FaultRegSnapshot {
     const r = &ctx.regs;
     return .{
         .ip = ctx.rip,
@@ -452,8 +471,48 @@ pub fn serializeFaultRegs(ctx: *const ArchCpuContext) arch.cpu.FaultRegSnapshot 
     };
 }
 
+pub const SyscallArgs = struct {
+    num: u64,
+    arg0: u64,
+    arg1: u64,
+    arg2: u64,
+    arg3: u64,
+    arg4: u64,
+};
+
+pub fn getSyscallArgs(ctx: *const ArchCpuContext) SyscallArgs {
+    return .{
+        .num = ctx.regs.rax,
+        .arg0 = ctx.regs.rdi,
+        .arg1 = ctx.regs.rsi,
+        .arg2 = ctx.regs.rdx,
+        .arg3 = ctx.regs.r10,
+        .arg4 = ctx.regs.r8,
+    };
+}
+
+pub fn getSyscallReturn(ctx: *const ArchCpuContext) u64 {
+    return ctx.regs.rax;
+}
+
 pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
     ctx.regs.rax = value;
+}
+
+pub fn getIpcHandle(ctx: *const ArchCpuContext) u64 {
+    return ctx.regs.r13;
+}
+
+pub fn getIpcMetadata(ctx: *const ArchCpuContext) u64 {
+    return ctx.regs.r14;
+}
+
+pub fn setIpcMetadata(ctx: *ArchCpuContext, value: u64) void {
+    ctx.regs.r14 = value;
+}
+
+pub fn getIpcPayloadWords(ctx: *const ArchCpuContext) [5]u64 {
+    return .{ ctx.regs.rdi, ctx.regs.rsi, ctx.regs.rdx, ctx.regs.r8, ctx.regs.r9 };
 }
 
 pub fn copyIpcPayload(dst: *ArchCpuContext, src: *const ArchCpuContext, word_count: u3) void {
@@ -464,6 +523,12 @@ pub fn copyIpcPayload(dst: *ArchCpuContext, src: *const ArchCpuContext, word_cou
     if (word_count >= 5) dst.regs.r9 = src.regs.r9;
 }
 
+pub const IpcPayloadSnapshot = struct { words: [5]u64 };
+
+pub fn saveIpcPayload(ctx: *const ArchCpuContext) IpcPayloadSnapshot {
+    return .{ .words = getIpcPayloadWords(ctx) };
+}
+
 pub fn restoreIpcPayload(ctx: *ArchCpuContext, words: [5]u64) void {
     ctx.regs.rdi = words[0];
     ctx.regs.rsi = words[1];
@@ -472,7 +537,7 @@ pub fn restoreIpcPayload(ctx: *ArchCpuContext, words: [5]u64) void {
     ctx.regs.r9 = words[4];
 }
 
-pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: arch.cpu.FaultRegSnapshot) void {
+pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: FaultRegSnapshot) void {
     ctx.rip = snapshot.ip;
     ctx.rflags = snapshot.flags;
     ctx.rsp = snapshot.sp;

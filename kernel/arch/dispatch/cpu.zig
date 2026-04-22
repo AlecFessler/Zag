@@ -12,25 +12,32 @@ const VAddr = zag.memory.address.VAddr;
 /// Number of general-purpose registers saved in a fault snapshot.
 /// x86-64: 15 (rax-r15 minus rsp). aarch64: 31 (x0-x30).
 pub const fault_gpr_count: usize = switch (builtin.cpu.arch) {
-    .x86_64 => 15,
-    .aarch64 => 31,
+    .x86_64 => x64.interrupts.fault_gpr_count,
+    .aarch64 => aarch64.interrupts.fault_gpr_count,
     else => unreachable,
 };
 
 /// Size of the register portion of a FaultMessage: ip + flags + sp + GPRs.
-pub const fault_regs_size: usize = (3 + fault_gpr_count) * @sizeOf(u64);
+pub const fault_regs_size: usize = switch (builtin.cpu.arch) {
+    .x86_64 => x64.interrupts.fault_regs_size,
+    .aarch64 => aarch64.interrupts.fault_regs_size,
+    else => unreachable,
+};
 
 /// Total size of a FaultMessage written to userspace (32-byte header + regs).
-pub const fault_msg_size: usize = 32 + fault_regs_size;
+pub const fault_msg_size: usize = switch (builtin.cpu.arch) {
+    .x86_64 => x64.interrupts.fault_msg_size,
+    .aarch64 => aarch64.interrupts.fault_msg_size,
+    else => unreachable,
+};
 
 /// Architecture-neutral snapshot of a faulted thread's registers.
 /// Used by fault delivery to serialize register state without the
 /// generic kernel referencing arch-specific register names.
-pub const FaultRegSnapshot = struct {
-    ip: u64,
-    flags: u64,
-    sp: u64,
-    gprs: [fault_gpr_count]u64,
+pub const FaultRegSnapshot = switch (builtin.cpu.arch) {
+    .x86_64 => x64.interrupts.FaultRegSnapshot,
+    .aarch64 => aarch64.interrupts.FaultRegSnapshot,
+    else => unreachable,
 };
 
 pub const ArchCpuContext = switch (builtin.cpu.arch) {
@@ -172,11 +179,9 @@ pub fn halt() noreturn {
 /// x86-64: 16-byte aligned minus 8 (simulates the return address push by `call`).
 /// aarch64: 16-byte aligned (SP must be 16-byte aligned at all times).
 pub fn alignStack(stack_top: VAddr) VAddr {
-    const aligned = std.mem.alignBackward(u64, stack_top.addr, 16);
-    const adjusted = switch (builtin.cpu.arch) {
-        .x86_64 => aligned - 8,
-        .aarch64 => aligned,
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.alignStack(stack_top),
+        .aarch64 => aarch64.cpu.alignStack(stack_top),
         else => unreachable,
     };
-    return VAddr.fromInt(adjusted);
 }

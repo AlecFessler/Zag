@@ -4,6 +4,8 @@ const zag = @import("zag");
 const apic = zag.arch.x64.apic;
 const interrupts = zag.arch.x64.interrupts;
 
+const VAddr = zag.memory.address.VAddr;
+
 pub const CpuidFeatureEcx = enum(u32) {
     sse3 = 1 << 0, // Supplemental SSE3
     pclmul = 1 << 1, // Carryless multiply
@@ -412,6 +414,12 @@ pub fn halt() noreturn {
     while (true) {
         asm volatile ("hlt");
     }
+}
+
+/// Align a stack pointer for the SysV x86-64 calling convention:
+/// 16-byte aligned minus 8 (simulates the return-address push by `call`).
+pub fn alignStack(stack_top: VAddr) VAddr {
+    return VAddr.fromInt(std.mem.alignBackward(u64, stack_top.addr, 16) - 8);
 }
 
 pub fn qemuShutdown() noreturn {

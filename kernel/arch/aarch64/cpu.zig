@@ -27,6 +27,8 @@ const zag = @import("zag");
 const gic = zag.arch.aarch64.gic;
 const interrupts = zag.arch.aarch64.interrupts;
 
+const VAddr = zag.memory.address.VAddr;
+
 /// True when the target CPU advertises the ARMv8.1 PAN (Privileged
 /// Access Never) feature. Cortex-A72 is ARMv8.0 and lacks PAN; the
 /// `msr pan, #imm` mnemonic is UNDEFINED there and must not execute.
@@ -39,6 +41,12 @@ pub fn halt() noreturn {
     while (true) {
         asm volatile ("wfi");
     }
+}
+
+/// Align a stack pointer for the AAPCS64 calling convention:
+/// SP must be 16-byte aligned at all times.
+pub fn alignStack(stack_top: VAddr) VAddr {
+    return VAddr.fromInt(std.mem.alignBackward(u64, stack_top.addr, 16));
 }
 
 pub fn enableInterrupts() void {
