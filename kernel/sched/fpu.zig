@@ -48,7 +48,7 @@ pub fn handleTrap(current: *Thread) void {
     // when CR0.TS is set (Intel SDM Vol 2A "FXSAVE — Operation"), so
     // calling fpuSave/fpuRestore below with the trap still armed
     // would recursively re-fault and overflow the kernel stack.
-    arch.fpu.fpuClearTrap();
+    arch.cpu.fpuClearTrap();
     sched.fpu_trap_armed[core_id] = false;
 
     const prev = sched.last_fpu_owner[core_id];
@@ -58,11 +58,11 @@ pub fn handleTrap(current: *Thread) void {
             // still valid — no save, no restore, just leave TS clear.
             return;
         }
-        arch.fpu.fpuSave(&p.fpu_state);
+        arch.cpu.fpuSave(&p.fpu_state);
         p.last_fpu_core = null;
     }
 
-    arch.fpu.fpuRestore(&current.fpu_state);
+    arch.cpu.fpuRestore(&current.fpu_state);
     sched.last_fpu_owner[core_id] = current;
     current.last_fpu_core = core_id;
 }
@@ -80,7 +80,7 @@ pub fn handleTrap(current: *Thread) void {
 pub fn flushIpiHandler(thread: *Thread) void {
     const core_id: u8 = @truncate(arch.smp.coreID());
     if (sched.last_fpu_owner[core_id] == thread) {
-        arch.fpu.fpuSave(&thread.fpu_state);
+        arch.cpu.fpuSave(&thread.fpu_state);
         sched.last_fpu_owner[core_id] = null;
     }
     thread.last_fpu_core = null;
@@ -99,5 +99,5 @@ pub fn migrateFlush(thread: *Thread) void {
     // load above and the IPI delivery; the IPI handler tolerates that
     // (no-op when last_fpu_owner mismatches). We still always clear
     // last_fpu_core so subsequent migration checks short-circuit.
-    arch.fpu.fpuFlushIpi(src, thread);
+    arch.cpu.fpuFlushIpi(src, thread);
 }

@@ -16,8 +16,8 @@ const E_INVAL = errors.E_INVAL;
 const E_OK = errors.E_OK;
 const E_PERM = errors.E_PERM;
 
-const CpuPowerAction = zag.arch.dispatch.power.CpuPowerAction;
-const PowerAction = zag.arch.dispatch.power.PowerAction;
+const CpuPowerAction = zag.arch.dispatch.cpu.CpuPowerAction;
+const PowerAction = zag.arch.dispatch.cpu.PowerAction;
 const SyscallResult = zag.syscall.dispatch.SyscallResult;
 
 pub fn sysWrite(ptr: u64, len: u64) SyscallResult {
@@ -49,7 +49,7 @@ pub fn sysGetrandom(buf_ptr: u64, len: u64) i64 {
     var dst_va: u64 = buf_ptr;
 
     while (remaining > 0) {
-        const rand_val = arch.power.getRandom() orelse {
+        const rand_val = arch.cpu.getRandom() orelse {
             // If we haven't written anything yet, return E_AGAIN.
             if (remaining == len) return E_AGAIN;
             // Otherwise return E_AGAIN (partial fill not supported).
@@ -88,7 +88,7 @@ pub fn sysSysPower(action_raw: u64) i64 {
     if (action == .shutdown or action == .reboot) {
         kprof_dump.end(.root_exit);
     }
-    return arch.power.powerAction(action);
+    return arch.cpu.powerAction(action);
 }
 
 pub fn sysSysCpuPower(action_raw: u64, value: u64) i64 {
@@ -97,5 +97,5 @@ pub fn sysSysCpuPower(action_raw: u64, value: u64) i64 {
     if (!self_entry.processRights().power) return E_PERM;
 
     const action = std.meta.intToEnum(CpuPowerAction, @as(u8, @truncate(action_raw))) catch return E_INVAL;
-    return arch.power.cpuPowerAction(action, value);
+    return arch.cpu.cpuPowerAction(action, value);
 }

@@ -233,7 +233,7 @@ pub const Thread = struct {
             .user_stack = null,
             .process = proc,
         };
-        arch.fpu.fpuStateInit(&thread.fpu_state);
+        arch.cpu.fpuStateInit(&thread.fpu_state);
 
         thread.kernel_stack = try stack_mod.createKernel();
         errdefer stack_mod.destroyKernel(thread.kernel_stack, memory_init.kernel_addr_space_root);

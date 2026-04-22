@@ -501,14 +501,14 @@ pub fn sysFaultWriteMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i6
         arch.interrupts.userAccessEnd();
         // Push the just-written cache lines to PoU so a subsequent
         // I-cache invalidate makes them visible to instruction fetch.
-        arch.boot.cleanDcacheToPou(physmap_addr, chunk);
+        arch.cpu.cleanDcacheToPou(physmap_addr, chunk);
         remaining -= chunk;
         dst_addr += chunk;
         src_addr += chunk;
     }
     // Broadcast I-cache invalidate so the target core re-fetches the
     // patched bytes on the next fault-resume. ARM ARM B2.4.6.
-    arch.boot.syncInstructionCache();
+    arch.cpu.syncInstructionCache();
 
     return E_OK;
 }

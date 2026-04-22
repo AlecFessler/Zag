@@ -2,8 +2,8 @@
 //!
 //! Defines the observable `SysInfo` / `CoreInfo` types and implements
 //! `sysSysInfo`. All architecture-specific reads (current frequency,
-//! temperature, C-state) are delegated to `arch.sysinfo.getCoreFreq` /
-//! `arch.sysinfo.getCoreTemp` / `arch.sysinfo.getCoreState`; this file contains zero
+//! temperature, C-state) are delegated to `arch.cpu.getCoreFreq` /
+//! `arch.cpu.getCoreTemp` / `arch.cpu.getCoreState`; this file contains zero
 //! x86-specific state or MSR references.
 //!
 //! Public contract is in spec §2.15 (observable types and accounting
@@ -161,9 +161,9 @@ pub fn sysSysInfo(proc: *Process, info_ptr: u64, cores_ptr: u64) i64 {
         entries[i] = .{
             .idle_ns = acct.idle_ns,
             .busy_ns = acct.busy_ns,
-            .freq_hz = arch.sysinfo.getCoreFreq(i),
-            .temp_mc = arch.sysinfo.getCoreTemp(i),
-            .c_state = arch.sysinfo.getCoreState(i),
+            .freq_hz = arch.cpu.getCoreFreq(i),
+            .temp_mc = arch.cpu.getCoreTemp(i),
+            .c_state = arch.cpu.getCoreState(i),
         };
         i += 1;
     }

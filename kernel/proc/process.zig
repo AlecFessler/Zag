@@ -1679,7 +1679,7 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
     // unification. Without this, every newly created process raises an
     // instruction-abort exception at its entry point on a real CPU
     // (TCG masks the bug by re-translating from memory each time).
-    arch.boot.syncInstructionCache();
+    arch.cpu.syncInstructionCache();
 
     const final_end = if (has_bss and bss_end > page_end) bss_end else page_end;
     proc.vmm.bump(VAddr.fromInt(final_end));
@@ -1714,7 +1714,7 @@ fn writeToUserPages(addr_space_root: PAddr, start_va: u64, data: []const u8) voi
         // Clean the just-written physmap range to the Point of Unification
         // so that a later `ic ivau`/`ic ialluis` makes the new code visible
         // to instruction fetch on aarch64. No-op on x86-64.
-        arch.boot.cleanDcacheToPou(physmap_addr, chunk_len);
+        arch.cpu.cleanDcacheToPou(physmap_addr, chunk_len);
         offset += chunk_len;
     }
 }

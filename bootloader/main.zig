@@ -324,7 +324,7 @@ pub fn main() uefi.Status {
             // goes to RAM). Linux arm64 does the same in head.S as
             // `dcache_clean_poc` over the loaded image. Pair this with
             // `syncInstructionCache` after the loop.
-            arch.boot.cleanInvalidateDcacheRange(
+            arch.cpu.cleanInvalidateDcacheRange(
                 @intFromPtr(page.ptr),
                 paging.PAGE4K,
             );
@@ -349,7 +349,7 @@ pub fn main() uefi.Status {
     // code. On architectures with split I/D caches this is required
     // before branching into any newly written instructions — without
     // it the first fetch can decode stale cache bytes as garbage.
-    arch.boot.syncInstructionCache();
+    arch.cpu.syncInstructionCache();
 
     puts(dbg.sections_done);
     const xsdp_addr = boot_protocol.findXSDP() catch return .aborted;
@@ -430,7 +430,7 @@ pub fn main() uefi.Status {
     // firmware activity that mapped the same page as Write-Back —
     // otherwise shadows the writes we just performed. Linux does the
     // same with `dcache_clean_poc` over the boot arguments in head.S.
-    arch.boot.cleanInvalidateDcacheRange(
+    arch.cpu.cleanInvalidateDcacheRange(
         @intFromPtr(boot_info),
         @sizeOf(BootInfo),
     );
@@ -449,7 +449,7 @@ pub fn main() uefi.Status {
     };
 
     // Clean boot_info again after the mmap field has been populated.
-    arch.boot.cleanInvalidateDcacheRange(
+    arch.cpu.cleanInvalidateDcacheRange(
         @intFromPtr(boot_info),
         @sizeOf(BootInfo),
     );

@@ -100,8 +100,8 @@ inline fn switchToWithPmu(outgoing: *Thread, next: *Thread) void {
     // scheduler picks the thread it just preempted.
     if (comptime !fpu.lazy_enabled) {
         if (outgoing != next) {
-            arch.fpu.fpuSave(&outgoing.fpu_state);
-            arch.fpu.fpuRestore(&next.fpu_state);
+            arch.cpu.fpuSave(&outgoing.fpu_state);
+            arch.cpu.fpuRestore(&next.fpu_state);
         }
     }
     arch.cpu.switchTo(next);
@@ -364,7 +364,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     // C-state) on this core so that `sys_info` reads from any core see a
     // value at most one tick stale. Must run on the owning core because
     // the underlying `rdmsr` instructions are core-local (§21).
-    arch.sysinfo.sampleCoreHwState();
+    arch.cpu.sampleCoreHwState();
 
     if (preempted.pinned_exclusive) {
         if (preempted.state == .exited) {
@@ -918,7 +918,7 @@ pub fn perCoreInit() void {
     arch.pmu.pmuPerCoreInit();
     kprof_sample.perCoreInit();
     kprof.perCoreInit();
-    arch.sysinfo.sysInfoPerCoreInit();
+    arch.cpu.sysInfoPerCoreInit();
     state.timer = arch.time.getPreemptionTimer();
 
     // Seed `last_tick_ns` from the monotonic clock before the preemption

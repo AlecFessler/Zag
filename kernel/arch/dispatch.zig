@@ -1,13 +1,10 @@
 pub const boot = @import("dispatch/boot.zig");
 pub const cpu = @import("dispatch/cpu.zig");
-pub const fpu = @import("dispatch/fpu.zig");
 pub const interrupts = @import("dispatch/interrupts.zig");
 pub const iommu = @import("dispatch/iommu.zig");
 pub const paging = @import("dispatch/paging.zig");
 pub const pmu = @import("dispatch/pmu.zig");
-pub const power = @import("dispatch/power.zig");
 pub const smp = @import("dispatch/smp.zig");
 pub const syscall = @import("dispatch/syscall.zig");
-pub const sysinfo = @import("dispatch/sysinfo.zig");
 pub const time = @import("dispatch/time.zig");
 pub const vm = @import("dispatch/vm.zig");
