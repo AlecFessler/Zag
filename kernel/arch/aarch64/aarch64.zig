@@ -4,7 +4,6 @@ pub const cpu = @import("cpu.zig");
 pub const exceptions = @import("exceptions.zig");
 pub const gic = @import("gic.zig");
 pub const hyp = @import("hyp.zig");
-pub const hyp_consts = @import("hyp_consts.zig");
 pub const init = @import("init.zig");
 pub const interrupts = @import("interrupts.zig");
 pub const iommu = @import("iommu.zig");

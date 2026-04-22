@@ -28,7 +28,6 @@ const zag = @import("zag");
 
 const aarch64_paging = zag.arch.aarch64.paging;
 const gic = zag.arch.aarch64.gic;
-const hyp_consts = zag.arch.aarch64.hyp_consts;
 const memory_init = zag.memory.init;
 const stage2 = zag.arch.aarch64.stage2;
 const vm = zag.arch.aarch64.vm;
@@ -42,6 +41,19 @@ const VmExitInfo = vm.VmExitInfo;
 // ===========================================================================
 // Vector-table install (BSP boot handoff)
 // ===========================================================================
+
+/// HVC immediate the kernel uses to ask the bootloader-installed EL2 stub
+/// to load VBAR_EL2 from X0 and ERET. The value is arbitrary but must not
+/// collide with PSCI/SMCCC-defined immediates (those use HVC #0 with a
+/// function-id register convention; this path encodes the selector in the
+/// instruction's imm16 so the stub can demux without touching guest-facing
+/// argument registers). ARM ARM C5.6.103 (HVC) places the immediate at
+/// ESR_EL2.ISS[15:0] on a sync-lower-EL trap.
+///
+/// `bootloader/aarch64_el2_drop.zig` hardcodes the same value (0xE112)
+/// into its naked-asm stub as the `movz x10, #0xE112` literal; both sides
+/// must agree.
+const HVC_IMM_INSTALL_VBAR_EL2: u16 = 0xE112;
 
 /// Install the kernel's EL2 vector table at VBAR_EL2 via an HVC to the
 /// bootloader's minimal EL2 stub.
@@ -92,7 +104,7 @@ pub fn installHypVectors() void {
 
     const hvc_insn = comptime std.fmt.comptimePrint(
         "hvc #{d}",
-        .{hyp_consts.HVC_IMM_INSTALL_VBAR_EL2},
+        .{HVC_IMM_INSTALL_VBAR_EL2},
     );
     asm volatile (hvc_insn
         :

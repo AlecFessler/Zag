@@ -6,8 +6,8 @@ const cpu = zag.arch.x64.cpu;
 const E_OK: i64 = 0;
 const E_NODEV: i64 = -13;
 
-/// System-wide power actions.
-/// Spec §2.19, §4.61.
+/// System-wide power actions. Observable `sys_power` semantics in
+/// docs/kernel/spec.md §5.4 Power.
 pub const PowerAction = enum(u8) {
     shutdown = 0,
     reboot = 1,
@@ -16,15 +16,16 @@ pub const PowerAction = enum(u8) {
     screen_off = 4,
 };
 
-/// Per-CPU power actions.
-/// Spec §2.19, §4.62.
+/// Per-CPU power actions. Observable `sys_cpu_power` semantics in
+/// docs/kernel/spec.md §5.4 Power.
 pub const CpuPowerAction = enum(u8) {
     set_freq = 0,
     set_idle = 1,
 };
 
 /// Perform a system-wide power action.
-/// Spec §4.61; systems.md §power.
+/// docs/kernel/spec.md §5.4 "Power" (syscall contract);
+/// docs/kernel/systems.md §power (implementation notes).
 pub fn powerAction(action: PowerAction) i64 {
     switch (action) {
         .shutdown => doShutdown(),
@@ -42,7 +43,8 @@ pub fn powerAction(action: PowerAction) i64 {
 }
 
 /// Perform a per-CPU power action.
-/// Spec §4.62; systems.md §power.
+/// docs/kernel/spec.md §5.4 "Power" (syscall contract);
+/// docs/kernel/systems.md §power (implementation notes).
 pub fn cpuPowerAction(action: CpuPowerAction, value: u64) i64 {
     switch (action) {
         .set_freq => {
