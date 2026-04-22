@@ -54,6 +54,22 @@ pub fn vmPerCoreInit() void {
     }
 }
 
+/// BSP post-bootloader handoff. On aarch64, when UEFI's firmware drops
+/// us at EL2 (only observable by the bootloader, which signals via
+/// `boot_info.arrived_at_el2`), arm the hyp-stub gate and install the
+/// kernel's EL2 vector table — must run before secondaries start since
+/// only the BSP inherits the bootloader's EL2 vector stub. No-op on x86.
+pub fn bspBootHandoff(arrived_at_el2: bool) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => {},
+        .aarch64 => if (arrived_at_el2) {
+            aarch64.vm.hyp_stub_installed = true;
+            aarch64.vm.installHypVectors();
+        },
+        else => unreachable,
+    }
+}
+
 pub fn setVmAllocator(alloc: std.mem.Allocator) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.kvm.vm.allocator = alloc,

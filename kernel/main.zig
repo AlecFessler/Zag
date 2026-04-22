@@ -39,30 +39,7 @@ fn kMain(boot_info: *BootInfo) !void {
     debug_info.init(boot_info.elf_blob.ptr, boot_info.elf_blob.len, boot_info.kaslr_slide);
     try arch.boot.parseFirmwareTables(boot_info.xsdp_phys);
     arch.vm.vmInit();
-    // On aarch64, propagate the UEFI bootloader's "I arrived at EL2"
-    // flag into the arch-layer hyp stub gate. The bootloader is the
-    // only code path that can observe CurrentEL under UEFI (firmware
-    // drops privilege as it likes once we're past ExitBootServices)
-    // and was the one that installed the minimal hyp vector table at
-    // VBAR_EL2 before its ERET-to-EL1, so it already ensured the
-    // invariant vmSupported() checks. See bootloader/aarch64_el2_drop.zig.
-    if (@import("builtin").cpu.arch == .aarch64 and boot_info.arrived_at_el2 != 0) {
-        zag.arch.aarch64.vm.hyp_stub_installed = true;
-        // Install the kernel's EL2 vector table on the boot CPU now,
-        // before `smpInit` brings up secondaries. The install path does
-        // an HVC to the bootloader's stub at VBAR_EL2 (which recognizes
-        // `HVC_IMM_INSTALL_VBAR_EL2`) — that stub is only present on the
-        // BSP (UEFI firmware handed it to us). Secondaries come up via
-        // PSCI with no bootloader stub on their EL2, so their own EL2
-        // drop in `smp.secondaryEntry` writes VBAR_EL2 with the PA of
-        // this same table directly. Running this here guarantees the
-        // global `hyp_vectors_installed` is set before secondaries call
-        // `perCoreInit`, which would otherwise either (a) early-return
-        // on the already-true flag and leave the BSP's VBAR_EL2 at the
-        // bootloader stub, or (b) fire the install HVC into the kernel
-        // vectors and fail silently.
-        zag.arch.aarch64.vm.installHypVectors();
-    }
+    arch.vm.bspBootHandoff(boot_info.arrived_at_el2 != 0);
     arch.pmu.pmuInit();
     arch.sysinfo.sysInfoInit();
     // Wall clock offset init: read RTC once at boot (systems.md §wall-clock).
