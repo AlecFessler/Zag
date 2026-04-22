@@ -232,9 +232,11 @@ fn freeTablePage(p: PAddr) void {
 /// `vm_structures`. The block lives at `vm_structures + PAGE4K` within
 /// the order-1 allocation returned by `vmAllocStructures`.
 ///
-/// Fields are exposed publicly so `vmid.refresh` / `sysregPassthrough`
-/// in the KVM object layer can update them without going through a
-/// setter helper for every field.
+/// Mutations go through `setHcrOverride` / `setVmid` so the deny-by-default
+/// invariant (allow=true drops the bit into `hcr_override_clear`,
+/// allow=false restores the baseline's trap-on state) lives with the
+/// struct. Fields stay `pub` so the world-switch entry path can read
+/// them without a getter.
 ///
 /// References:
 ///   - ARM ARM D13.2.46  HCR_EL2 (see `HCR_EL2_LINUX_GUEST`)
@@ -256,6 +258,25 @@ pub const VmControlBlock = extern struct {
     /// the field is current.
     vmid: u8 = 0,
     _pad: [paging.PAGE4K - 17]u8 = .{0} ** (paging.PAGE4K - 17),
+
+    /// Drop (`allow=true`) or reinstate (`allow=false`) the HCR_EL2
+    /// bits named by `mask`, relative to `HCR_EL2_LINUX_GUEST`. The
+    /// world-switch programs `HCR_EL2 = (LINUX_GUEST | hcr_override_set)
+    /// & ~hcr_override_clear`, so clearing a baseline-trap bit opens
+    /// that trap group for the guest.
+    pub fn setHcrOverride(self: *VmControlBlock, mask: u64, allow: bool) void {
+        if (allow) {
+            self.hcr_override_clear |= mask;
+        } else {
+            self.hcr_override_clear &= ~mask;
+        }
+    }
+
+    /// Stage the VMID the next guest entry will program into
+    /// `VTTBR_EL2.VMID`. Called by `kvm.vmid.refresh` after rollover.
+    pub fn setVmid(self: *VmControlBlock, id: u8) void {
+        self.vmid = id;
+    }
 };
 
 comptime {
@@ -573,42 +594,36 @@ fn classifySysreg(key: SysregKey) HcrTrapGroup {
 /// `allow_read` gates TRVM. For TACR and TIDCP the baseline does not
 /// distinguish direction, so either flag being set opens the group.
 ///
-/// Sysregs that do not map to a HCR_EL2 bit managed by the baseline are
-/// silently ignored — `isSecurityCriticalSysreg` in the kvm layer already
-/// rejected the dangerous encodings before we got here.
+/// Rejects sysregs the guest must never own — EL2/EL3 encodings and the ID
+/// registers the VmPolicy depends on — with `error.SecurityCritical` before
+/// touching any state. The check is the function's own invariant so a
+/// forgetful caller can't smuggle a dangerous encoding through.
+///
+/// Sysregs that pass the security check but do not map to a HCR_EL2 bit
+/// managed by the baseline are silently ignored.
 ///
 /// Dispatch-level signature — matches `x64.vm.sysregPassthrough(vm_structures,
 /// sysreg_id, allow_read, allow_write)` 1:1. The HCR override pair lives in
 /// the per-VM control block at `vm_structures + PAGE4K`, so a `PAddr` handle
 /// is sufficient and no caller-owned pointer pair is threaded through.
+pub const SysregPassthroughError = error{SecurityCritical};
+
 pub fn sysregPassthrough(
     vm_structures: PAddr,
     sysreg_id: u32,
     allow_read: bool,
     allow_write: bool,
-) void {
+) SysregPassthroughError!void {
+    if (isSecurityCriticalSysreg(sysreg_id)) return error.SecurityCritical;
+
     const cb = controlBlock(vm_structures);
-    const override_clear = &cb.hcr_override_clear;
-    // `hcr_override_set` is reserved for future traps not in the baseline.
     const key = SysregKey.decode(sysreg_id);
     const group = classifySysreg(key);
     const any = allow_read or allow_write;
     switch (group) {
         .none => {},
-        .tacr => {
-            if (any) {
-                override_clear.* |= vm.HCR_EL2_TACR;
-            } else {
-                override_clear.* &= ~vm.HCR_EL2_TACR;
-            }
-        },
-        .tidcp => {
-            if (any) {
-                override_clear.* |= vm.HCR_EL2_TIDCP;
-            } else {
-                override_clear.* &= ~vm.HCR_EL2_TIDCP;
-            }
-        },
+        .tacr => cb.setHcrOverride(vm.HCR_EL2_TACR, any),
+        .tidcp => cb.setHcrOverride(vm.HCR_EL2_TIDCP, any),
         .tvm => {
             // TVM is *write*-side, TRVM is *read*-side. Only drop a bit
             // once every sysreg in the group has been opened — but the
@@ -619,16 +634,23 @@ pub fn sysregPassthrough(
             // state) and coarser than necessary otherwise. TODO: track a
             // per-sysreg allow mask and only clear TVM/TRVM when every
             // member of the group is allowed.
-            if (allow_write) {
-                override_clear.* |= vm.HCR_EL2_TVM;
-            } else {
-                override_clear.* &= ~vm.HCR_EL2_TVM;
-            }
-            if (allow_read) {
-                override_clear.* |= vm.HCR_EL2_TRVM;
-            } else {
-                override_clear.* &= ~vm.HCR_EL2_TRVM;
-            }
+            cb.setHcrOverride(vm.HCR_EL2_TVM, allow_write);
+            cb.setHcrOverride(vm.HCR_EL2_TRVM, allow_read);
         },
     }
+}
+
+/// Reject sysregs the guest must never own: anything addressing EL2 or EL3
+/// (op1 ∈ {4,5,6,7} per ARM ARM C5.3), plus the ID registers (op0=3,op1=0,
+/// CRn=0,CRm ∈ 0..7) that the VmPolicy decisions depend on. The encoding
+/// layout matches the doc comment above `sysregPassthrough`: bits [15:14]
+/// Op0, [13:11] Op1, [10:7] CRn, [6:3] CRm, [2:0] Op2.
+pub fn isSecurityCriticalSysreg(encoded: u32) bool {
+    const op0: u8 = @intCast((encoded >> 14) & 0x3);
+    const op1: u8 = @intCast((encoded >> 11) & 0x7);
+    if (op1 >= 4) return true;
+    const crn: u8 = @intCast((encoded >> 7) & 0xF);
+    const crm: u8 = @intCast((encoded >> 3) & 0xF);
+    if (op0 == 3 and op1 == 0 and crn == 0 and crm <= 7) return true;
+    return false;
 }

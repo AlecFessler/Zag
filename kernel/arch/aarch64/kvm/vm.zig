@@ -411,14 +411,12 @@ pub fn sysregPassthrough(proc: *Process, vm_handle: u64, sysreg_id: u32, allow_r
 
     const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
 
-    if (isSecurityCriticalSysreg(sysreg_id)) return E_PERM;
-
     // Serialize the HCR override RMW — multiple threads in the same
     // process could otherwise race on the VM's control block.
     vm_obj.lock.lock();
     defer vm_obj.lock.unlock();
 
-    stage2.sysregPassthrough(vm_obj.arch_structures, sysreg_id, allow_read, allow_write);
+    stage2.sysregPassthrough(vm_obj.arch_structures, sysreg_id, allow_read, allow_write) catch return E_PERM;
     return 0; // E_OK
 }
 
@@ -509,26 +507,3 @@ fn writeGuestGpr(gs: *vm_hw.GuestState, n: u8, value: u64) void {
     base[n] = value;
 }
 
-/// Sysreg blocklist for `vm_sysreg_passthrough`. Refuses anything that would
-/// let the guest reach EL2 / EL3 state, plus the ID registers we depend on
-/// for VmPolicy decisions.
-///
-/// The encoding scheme matches the doc comment on `stage2.sysregPassthrough`:
-///   bits [15:14] Op0
-///   bits [13:11] Op1
-///   bits [10:7]  CRn
-///   bits [6:3]   CRm
-///   bits [2:0]   Op2
-fn isSecurityCriticalSysreg(encoded: u32) bool {
-    const op0: u8 = @intCast((encoded >> 14) & 0x3);
-    const op1: u8 = @intCast((encoded >> 11) & 0x7);
-    // Anything with op1 in {4,5,6,7} addresses an EL2 or EL3 register
-    // (ARM ARM C5.3 "System register encoding"). Block them all — a
-    // guest at EL1 should never see those.
-    if (op1 >= 4) return true;
-    // ID registers live at op0=3, op1=0, CRn=0, CRm in {0..7}, op2=*.
-    const crn: u8 = @intCast((encoded >> 7) & 0xF);
-    const crm: u8 = @intCast((encoded >> 3) & 0xF);
-    if (op0 == 3 and op1 == 0 and crn == 0 and crm <= 7) return true;
-    return false;
-}
