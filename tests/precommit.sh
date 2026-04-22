@@ -33,6 +33,48 @@ FAILURES=()
 
 # ── Stage runners ─────────────────────────────────────────────────────
 
+stage_arch_layering_lint() {
+    echo ""
+    echo "=================================================="
+    echo "[0] Arch layering lint (grep)"
+    echo "=================================================="
+    local violations=0
+
+    local up_leak
+    up_leak=$(grep -rn 'zag\.arch\.dispatch' "$ZAG_ROOT/kernel/arch/x64" "$ZAG_ROOT/kernel/arch/aarch64" 2>/dev/null || true)
+    if [[ -n "$up_leak" ]]; then
+        echo "arch-specific code imports zag.arch.dispatch (must not):"
+        echo "$up_leak"
+        violations=$((violations + 1))
+    fi
+
+    local down_leak
+    down_leak=$(grep -rln 'zag\.arch\.\(x64\|aarch64\)\.' "$ZAG_ROOT/kernel" "$ZAG_ROOT/bootloader" 2>/dev/null | grep -v '/kernel/arch/' || true)
+    if [[ -n "$down_leak" ]]; then
+        echo "generic code reaches into zag.arch.x64/aarch64 (must go through dispatch):"
+        echo "$down_leak"
+        violations=$((violations + 1))
+    fi
+
+    if [[ $violations -eq 0 ]]; then
+        echo "[PASS] arch boundaries clean"
+        return 0
+    fi
+    FAILURES+=("arch layering lint")
+    return 1
+}
+
+stage_dead_code_report() {
+    echo ""
+    echo "=================================================="
+    echo "[0b] Dead-code report (advisory)"
+    echo "=================================================="
+    # Advisory only — output is manual-review (checks for @field/asm refs needed).
+    python3 "$ZAG_ROOT/tools/dead_code.py" kernel 2>&1 | tail -20 || true
+    echo "(advisory — see tools/dead_code.py kernel for full listing)"
+    return 0
+}
+
 clean_nvvars() {
     local nv="$ZAG_ROOT/zig-out/img/NvVars"
     if [[ -f "$nv" ]] && [[ "$(stat -c %U "$nv" 2>/dev/null)" == "root" ]]; then
@@ -299,6 +341,8 @@ REMOTE
 
 # ── Dispatch ──────────────────────────────────────────────────────────
 
+stage_arch_layering_lint        || true
+stage_dead_code_report          || true
 stage_x86_kernel_tests          || true
 stage_aarch64_kernel_tests_pi   || true
 stage_hyprvos_x86_linux_boot    || true
