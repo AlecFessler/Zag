@@ -72,7 +72,7 @@ pub fn smpInit() !void {
     @memcpy(dest[0..trampoline_code.len], trampoline_code);
 
     const params: *TrampolineParams = @ptrFromInt(trampoline_virt.addr + params_offset);
-    params.cr3 = arch.paging.getAddrSpaceRoot().addr;
+    params.cr3 = zag.arch.x64.paging.getAddrSpaceRoot().addr;
     params.entry_point = @intFromPtr(&coreInit);
 
     const bsp_id = apic.rawApicId();

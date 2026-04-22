@@ -7,6 +7,7 @@ const cpu = zag.arch.x64.cpu;
 const fpu = zag.sched.fpu;
 const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
+const paging = zag.arch.x64.paging;
 const scheduler = zag.sched.scheduler;
 
 const InterruptHandler = idt.interruptHandler;
@@ -304,9 +305,9 @@ pub fn switchTo(thread: *Thread) void {
     updateScratchKernelRsp(core_id, kstack);
 
     const new_root = thread.process.addr_space_root;
-    if (new_root.addr != arch.paging.getAddrSpaceRoot().addr) {
-        arch.paging.swapAddrSpace(new_root, thread.process.addr_space_id);
-        std.debug.assert(arch.paging.getAddrSpaceRoot().addr == new_root.addr);
+    if (new_root.addr != paging.getAddrSpaceRoot().addr) {
+        paging.swapAddrSpace(new_root, thread.process.addr_space_id);
+        std.debug.assert(paging.getAddrSpaceRoot().addr == new_root.addr);
     }
 
     // Lazy FPU: TS should be clear iff `thread` is the current owner

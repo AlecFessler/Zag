@@ -239,8 +239,8 @@ pub fn prepareThreadContext(
 /// pointer), then executes ERET.
 pub fn switchTo(thread: *Thread) noreturn {
     const new_root = thread.process.addr_space_root;
-    if (new_root.addr != arch.paging.getAddrSpaceRoot().addr) {
-        arch.paging.swapAddrSpace(new_root, thread.process.addr_space_id);
+    if (new_root.addr != paging.getAddrSpaceRoot().addr) {
+        paging.swapAddrSpace(new_root, thread.process.addr_space_id);
     }
 
     // Lazy FPU: CPACR_EL1.FPEN should trap iff `thread` isn't the

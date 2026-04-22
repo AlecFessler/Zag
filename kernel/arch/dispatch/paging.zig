@@ -132,14 +132,6 @@ pub fn resolveVaddr(
     }
 }
 
-pub fn swapAddrSpace(root: PAddr, id: u16) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.paging.swapAddrSpace(root, id),
-        .aarch64 => aarch64.paging.swapAddrSpace(root, id),
-        else => unreachable,
-    }
-}
-
 /// Allocate a per-process address-space identifier for TLB tagging
 /// (PCID on x86-64, ASID on aarch64). Returns null on exhaustion.
 pub fn allocAddrSpaceId() ?u16 {
@@ -164,14 +156,6 @@ pub fn freeAddrSpaceId(id: u16) void {
             aarch64.paging.invalidateAddrSpaceTlb(id);
             aarch64.asid.free(id);
         },
-        else => unreachable,
-    }
-}
-
-pub fn getAddrSpaceRoot() PAddr {
-    switch (builtin.cpu.arch) {
-        .x86_64 => return x64.paging.getAddrSpaceRoot(),
-        .aarch64 => return aarch64.paging.getAddrSpaceRoot(),
         else => unreachable,
     }
 }
