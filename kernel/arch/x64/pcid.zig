@@ -5,7 +5,7 @@ const SpinLock = zag.utils.sync.SpinLock;
 
 /// Bitmap-based PCID (Process Context Identifier) allocator.
 ///
-/// Intel SDM Vol 3A, Section 4.10.1 — Process-Context Identifiers (PCIDs).
+/// Intel SDM Vol 3A, Section 5.10.1 — Process-Context Identifiers (PCIDs).
 /// PCIDs are 12-bit IDs (0..4095) placed in CR3[11:0] (when CR4.PCIDE=1) to
 /// tag TLB entries so address-space switches do not flush the TLB.
 ///

@@ -6,7 +6,14 @@
 /// Section 3.0: Register Description.
 const zag = @import("zag");
 
-const Lapic = zag.arch.x64.kvm.lapic.Lapic;
+/// Host interface supplied by the owning `Vm`. Lets the IOAPIC deliver
+/// a decoded interrupt into the LAPIC without importing `kvm/lapic.zig`
+/// directly — breaks the peer import cycle. See `kvm/vm.zig` for the
+/// trampoline that casts `ctx` back to `*Vm`.
+pub const IoapicHost = struct {
+    ctx: *anyopaque,
+    injectExternal: *const fn (ctx: *anyopaque, vector: u8) void,
+};
 
 // Memory-mapped register offsets (Table 1)
 const IOREGSEL_OFF: u32 = 0x00;
@@ -31,13 +38,14 @@ pub const Ioapic = struct {
     redir_table: [NUM_REDIR_ENTRIES]u64 = .{@as(u64, 1) << 16} ** NUM_REDIR_ENTRIES,
     /// IRQ line state for level-triggered interrupt tracking.
     irq_level: u32 = 0,
-    /// Pointer to the associated LAPIC for interrupt delivery.
-    lapic: *Lapic = undefined,
+    /// Host callback for delivering a decoded interrupt into the LAPIC.
+    /// Wired by `Vm.create`; see `IoapicHost` at the top of this file.
+    host: IoapicHost = undefined,
 
     /// Initialize the IOAPIC to reset state.
-    pub fn init(self: *Ioapic, lapic_ptr: *Lapic) void {
+    pub fn init(self: *Ioapic, host: IoapicHost) void {
         self.* = .{};
-        self.lapic = lapic_ptr;
+        self.host = host;
     }
 
     /// Handle MMIO read at offset from IOAPIC base 0xFEC00000.
@@ -171,11 +179,11 @@ pub const Ioapic = struct {
             0b000, 0b001 => {
                 // Fixed / Lowest Priority -- deliver vector to LAPIC.
                 if (vector < 16) return; // Illegal vector, ignore
-                self.lapic.injectExternal(vector);
+                self.host.injectExternal(self.host.ctx, vector);
             },
             0b111 => {
                 // ExtINT -- deliver as external interrupt
-                self.lapic.injectExternal(vector);
+                self.host.injectExternal(self.host.ctx, vector);
             },
             else => {}, // SMI, NMI, INIT -- stubbed
         }

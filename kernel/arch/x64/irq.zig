@@ -249,7 +249,7 @@ fn kprofDumpHandler(_: *cpu.Context) void {
 /// then acks the mailbox so the requester unblocks.
 fn fpuFlushIpiHandler(_: *cpu.Context) void {
     const core_id: u8 = @truncate(apic.coreID());
-    const slot = &interrupts.fpu_flush_mailbox[core_id];
+    const slot = &cpu.fpu_flush_mailbox[core_id];
     const opaque_ptr = @atomicLoad(?*anyopaque, &slot.requested_thread, .acquire) orelse {
         slot.ackDone();
         return;

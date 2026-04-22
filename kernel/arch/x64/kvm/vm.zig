@@ -227,11 +227,19 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
         .arch_structures = arch_structures,
     };
 
-    // Initialize in-kernel LAPIC and IOAPIC emulation.
-    // IOAPIC needs a pointer to LAPIC for interrupt delivery;
-    // LAPIC needs a pointer to IOAPIC for EOI notification.
-    vm_obj.ioapic.init(&vm_obj.lapic);
-    vm_obj.lapic.init(&vm_obj.ioapic);
+    // Initialize in-kernel LAPIC and IOAPIC emulation. The two devices
+    // notify each other through host-callback structs (`LapicHost` /
+    // `IoapicHost`) routed via the owning Vm rather than holding typed
+    // pointers at each other — that peer coupling was a module-import
+    // cycle (see `lapicNotifyLevelEoi` / `ioapicInjectExternal` below).
+    vm_obj.ioapic.init(.{
+        .ctx = vm_obj,
+        .injectExternal = ioapicInjectExternal,
+    });
+    vm_obj.lapic.init(.{
+        .ctx = vm_obj,
+        .notifyLevelEoi = lapicNotifyLevelEoi,
+    });
 
     // Create vCPUs. Track each inserted perm-table handle so we can roll
     // back on partial failure without leaking dangling thread handles.
@@ -485,7 +493,7 @@ fn readUserStruct(proc: *Process, user_va: u64, buf: []u8) bool {
     return true;
 }
 
-/// AMD APM Vol 2, §15.10; Intel SDM Vol 3C, §24.6.9.
+/// AMD APM Vol 2, §15.10; Intel SDM Vol 3C, §25.6.9.
 /// MSRs that must always be intercepted by the hypervisor.
 ///
 /// FS_BASE (0xC0000100) and GS_BASE (0xC0000101) are intentionally
@@ -511,4 +519,20 @@ fn isSecurityCriticalSysreg(msr: u32) bool {
         => true,
         else => false,
     };
+}
+
+// ── Cross-device routing trampolines ─────────────────────────────────
+// `Lapic` and `Ioapic` used to hold typed pointers at each other, which
+// made `kvm/lapic.zig` and `kvm/ioapic.zig` import each other. These
+// trampolines sit on the Vm side (which already owns both) so the
+// device files stay free of peer imports.
+
+fn lapicNotifyLevelEoi(ctx: *anyopaque, vector: u8) void {
+    const vm_obj: *Vm = @ptrCast(@alignCast(ctx));
+    vm_obj.ioapic.handleEOI(vector);
+}
+
+fn ioapicInjectExternal(ctx: *anyopaque, vector: u8) void {
+    const vm_obj: *Vm = @ptrCast(@alignCast(ctx));
+    vm_obj.lapic.injectExternal(vector);
 }

@@ -175,7 +175,7 @@ pub fn setKernelAddrSpace(root: PAddr) void {
 /// "preserve TLB" hint in bit 63. Setting bit 63 tells the CPU not to
 /// invalidate TLB entries on this CR3 write — entries from other PCIDs
 /// stay cached and are simply ignored on lookup mismatch (Intel SDM Vol 3A
-/// §4.10.4.1). Combined with CR4.PGE for global kernel pages, an
+/// §5.10.4.1). Combined with CR4.PGE for global kernel pages, an
 /// address-space switch costs effectively zero TLB work.
 pub fn swapAddrSpace(root: PAddr, id: u16) void {
     if (!cpu.pcid_enabled) {
@@ -193,7 +193,7 @@ pub fn swapAddrSpace(root: PAddr, id: u16) void {
 /// the previous owner.
 ///
 /// Uses INVPCID type 1 (single PCID, all addresses). Intel SDM Vol 2A —
-/// INVPCID; Vol 3A §4.10.4.1.
+/// INVPCID; Vol 3A §5.10.4.1.
 ///
 /// TODO: SMP shootdown. Other cores may still hold TLB entries for `id`
 /// from prior runs of the dying process. Until the existing per-page IPI

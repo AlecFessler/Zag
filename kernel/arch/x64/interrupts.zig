@@ -59,35 +59,6 @@ pub const IntVecs = enum(u8) {
     fpu_flush = 0xFA,
 };
 
-/// Per-CPU mailbox for the FPU-flush IPI. The requesting core writes
-/// `requested_thread`, sends the IPI, then spins on `done`. The
-/// receiver reads `requested_thread`, performs the FXSAVE, sets `done`.
-/// One mailbox per *target* core; concurrent flushes targeting the
-/// same core would serialize at the IPI vector level (the receiver
-/// services one IPI at a time), but in practice a thread only owns FPU
-/// on one core so a second flush of the same thread is a no-op.
-pub const FpuFlushMailbox = struct {
-    requested_thread: ?*anyopaque align(64) = null,
-    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
-
-    pub fn requestThread(self: *FpuFlushMailbox, thread: anytype) void {
-        @atomicStore(?*anyopaque, &self.requested_thread, @ptrCast(thread), .release);
-        self.done.store(false, .release);
-    }
-
-    pub fn waitDone(self: *FpuFlushMailbox) void {
-        while (!self.done.load(.acquire)) {
-            std.atomic.spinLoopHint();
-        }
-    }
-
-    pub fn ackDone(self: *FpuFlushMailbox) void {
-        self.done.store(true, .release);
-    }
-};
-
-pub var fpu_flush_mailbox: [64]FpuFlushMailbox align(64) = [_]FpuFlushMailbox{.{}} ** 64;
-
 pub const VectorKind = enum {
     exception,
     external,

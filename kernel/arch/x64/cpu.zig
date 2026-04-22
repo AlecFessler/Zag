@@ -182,14 +182,43 @@ pub inline fn fpuArmTrap() void {
     );
 }
 
+/// Per-core mailbox for the FPU-flush IPI. The requesting core writes
+/// `requested_thread`, sends the IPI, then spins on `done`. The
+/// receiver reads `requested_thread`, performs the FXSAVE, sets `done`.
+/// One mailbox per *target* core; concurrent flushes targeting the
+/// same core serialize at the IPI vector level (the receiver services
+/// one IPI at a time). A thread only owns the FPU on one core at a
+/// time, so a second flush of the same thread is a no-op.
+pub const FpuFlushMailbox = struct {
+    requested_thread: ?*anyopaque align(64) = null,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(true),
+
+    pub fn requestThread(self: *FpuFlushMailbox, thread: anytype) void {
+        @atomicStore(?*anyopaque, &self.requested_thread, @ptrCast(thread), .release);
+        self.done.store(false, .release);
+    }
+
+    pub fn waitDone(self: *FpuFlushMailbox) void {
+        while (!self.done.load(.acquire)) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    pub fn ackDone(self: *FpuFlushMailbox) void {
+        self.done.store(true, .release);
+    }
+};
+
+pub var fpu_flush_mailbox: [64]FpuFlushMailbox align(64) = [_]FpuFlushMailbox{.{}} ** 64;
+
 /// Send the FPU-flush IPI to `target_core`, encoding `thread` as the
-/// target via a per-CPU mailbox. Spins on the mailbox's done flag
-/// until the receiver finishes saving `thread`'s state.
-/// See `interrupts.fpuFlushIpiVector` for the receiver side.
+/// target via the per-core mailbox. Spins on the mailbox's done flag
+/// until the receiver finishes saving `thread`'s state. Receiver is
+/// `fpuFlushIpiHandler` registered in `irq.zig`.
 pub fn fpuFlushIpi(target_core: u8, thread: anytype) void {
-    interrupts.fpu_flush_mailbox[target_core].requestThread(thread);
+    fpu_flush_mailbox[target_core].requestThread(thread);
     apic.sendIpiToCore(target_core, @intFromEnum(interrupts.IntVecs.fpu_flush));
-    interrupts.fpu_flush_mailbox[target_core].waitDone();
+    fpu_flush_mailbox[target_core].waitDone();
 }
 
 pub const Registers = packed struct {
@@ -400,7 +429,7 @@ pub fn saveAndDisableInterrupts() u64 {
 /// Intel SDM Vol 2A, "INVLPG — Invalidate TLB Entry" — invalidates any TLB
 /// entries covering the 4-KByte page that contains `vaddr`, including global
 /// entries (regardless of CR4.PGE). Also invalidates paging-structure caches.
-/// Intel SDM Vol 3A, Section 4.10.4.1 "Operations that Invalidate TLBs and
+/// Intel SDM Vol 3A, Section 5.10.4.1 "Operations that Invalidate TLBs and
 /// Paging-Structure Caches".
 pub fn invlpg(vaddr: u64) void {
     asm volatile (
@@ -466,7 +495,7 @@ pub fn readCr3() u64 {
     return value;
 }
 
-/// Intel SDM Vol 3A, Section 4.10.4.1 — MOV to CR3 invalidates all TLB entries
+/// Intel SDM Vol 3A, Section 5.10.4.1 — MOV to CR3 invalidates all TLB entries
 /// except global pages (CR4.PGE=1) and reloads the page-directory base.
 /// Intel SDM Vol 3A, Table 4-12 "Use of CR3 with 4-Level Paging and CR4.PCIDE=0".
 pub fn writeCr3(value: u64) void {
@@ -694,7 +723,7 @@ pub var pcid_enabled: bool = false;
 /// CR4.PCIDE may only transition 0→1 while CR3.PCID==0 — true at boot
 /// since the bootloader leaves CR3 with all 12 low bits clear. Once
 /// enabled, CR3 writes interpret bits[11:0] as PCID and bit 63 as the
-/// "preserve TLB" hint (Intel SDM Vol 3A §4.10.4.1).
+/// "preserve TLB" hint (Intel SDM Vol 3A §5.10.4.1).
 pub fn enablePcid() void {
     var cr4 = asm ("mov %%cr4, %[cr4]"
         : [cr4] "=r" (-> u64),
@@ -742,7 +771,7 @@ pub inline fn clac() void {
 ///   CPUID.(EAX=7,ECX=0):EDX bit 27 = STIBP supported
 ///   IA32_ARCH_CAPABILITIES (MSR 0x10A) bit 2 = IBRS_ALL (eIBRS)
 ///
-/// Intel SDM Vol 3A §4.10.1; AMD APM Vol 2 §3.2.8.
+/// Intel SDM Vol 3A §5.10.1; AMD APM Vol 2 §3.2.8.
 pub fn enableSpeculationBarriers() void {
     const feat = cpuidRaw(0x7, 0);
     const ibrs_bit: u32 = 1 << 26;

@@ -121,6 +121,10 @@ fn fetchInsn(vm: *const Vm, cr0: u64, cr3: u64, rip: u64, buf: *[15]u8) ?u8 {
 /// Returns the decoded operation or an error if the instruction is
 /// unsupported or the buffer is too short.
 ///
+/// Follows the general 64-bit instruction format from Intel SDM Vol 2A
+/// §2.1 "Instruction Format":
+///   [Legacy Prefix][REX Prefix][Opcode][ModR/M][SIB][Displacement][Immediate]
+///
 /// For register-source writes (0x89, 0x88), `is_immediate` is false and
 /// `value` is 0 — the caller must read the source register via `reg`.
 pub fn decodeBytes(buf: []const u8) DecodeError!MmioOp {
@@ -131,7 +135,13 @@ pub fn decodeBytes(buf: []const u8) DecodeError!MmioOp {
     var has_66: bool = false;
     var has_rex_w: bool = false;
 
-    // Parse legacy + REX prefixes
+    // Parse legacy + REX prefixes.
+    // REX: Intel SDM Vol 2A §2.2.1 Table 2-4 (REX.W is bit 3 of the
+    // 0x40..0x4F prefix byte; promotes the operand to 64-bit).
+    // 0x66: operand-size override (SDM Vol 2A §2.1.1) — switches 32-bit
+    // default to 16-bit in this context.
+    // 0x67/0xF0/0xF2/0xF3/segment-overrides: skipped per SDM Vol 2A §2.1.1
+    // "Instruction Prefixes" — they don't affect the MOV opcodes we decode.
     while (i < buf.len) {
         switch (buf[i]) {
             0x40...0x4F => {
@@ -159,24 +169,35 @@ pub fn decodeBytes(buf: []const u8) DecodeError!MmioOp {
     const modrm = buf[i];
     i += 1;
 
+    // ModR/M decomposition — Intel SDM Vol 2A §2.1.5, Table 2-1
+    // (32-bit addressing forms with the ModR/M byte) and Table 2-2
+    // (addressing forms reference for SIB). Bits: mod[7:6] reg[5:3] r/m[2:0].
     const mod_field: u2 = @truncate(modrm >> 6);
-    // REX.R extends ModRM.reg (bit 2 of REX = R)
+    // REX.R extends ModR/M.reg (SDM Vol 2A §2.2.1 Table 2-4). REX is
+    // bit 2 of the REX prefix byte.
     const reg_field: u4 = @as(u4, @truncate((modrm >> 3) & 7)) | (if (rex & 0x04 != 0) @as(u4, 8) else 0);
     const rm_field: u3 = @truncate(modrm & 7);
 
-    // Skip SIB byte if present (mod != 11 and r/m == 100)
+    // SIB byte present when mod != 11 AND r/m == 100 (SDM Vol 2A §2.1.5
+    // Table 2-2 "32-Bit Addressing Forms with the SIB Byte"). Layout:
+    // scale[7:6] index[5:3] base[2:0].
     var has_sib_disp32 = false;
     if (mod_field != 0b11 and rm_field == 0b100) {
         if (i >= buf.len) return DecodeError.IncompleteDecode;
         const sib = buf[i];
         i += 1; // SIB
         const sib_base: u3 = @truncate(sib & 7);
+        // SIB base==101 combined with mod==00 replaces the base
+        // register with an absolute disp32 (SDM Vol 2A §2.1.5,
+        // footnote to Table 2-2).
         if (mod_field == 0b00 and sib_base == 0b101) {
             has_sib_disp32 = true;
         }
     }
 
-    // Skip displacement
+    // Displacement size derived from ModR/M.mod (SDM Vol 2A Table 2-1)
+    // and the SIB corner case. Special case: mod==00 r/m==101 is
+    // RIP-relative disp32 in 64-bit mode (SDM Vol 2A §2.2.1.6).
     if (has_sib_disp32) {
         i += 4; // SIB base=101 + mod=00 -> absolute disp32
     } else if (mod_field == 0b00 and rm_field == 0b101) {

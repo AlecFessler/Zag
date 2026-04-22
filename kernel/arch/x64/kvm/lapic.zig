@@ -5,7 +5,15 @@
 /// Table 13-1: Local APIC Register Address Map.
 const zag = @import("zag");
 
-const Ioapic = zag.arch.x64.kvm.ioapic.Ioapic;
+/// Host interface supplied by the owning `Vm`. Lets the LAPIC notify the
+/// IOAPIC of a level-triggered EOI without importing `kvm/ioapic.zig`
+/// directly — the two controllers are peers and each holding a typed
+/// pointer to the other creates an import cycle. See `kvm/vm.zig` for
+/// the trampoline that casts `ctx` back to `*Vm` and calls through.
+pub const LapicHost = struct {
+    ctx: *anyopaque,
+    notifyLevelEoi: *const fn (ctx: *anyopaque, vector: u8) void,
+};
 
 // Register offsets from APIC base (Table 13-1)
 const REG_ID: u32 = 0x020; // Local APIC ID Register -- R/W
@@ -68,13 +76,14 @@ pub const Lapic = struct {
     isr: [8]u32 = .{0} ** 8,
     tmr: [8]u32 = .{0} ** 8,
     irr: [8]u32 = .{0} ** 8,
-    /// Pointer to the associated IOAPIC for EOI notification.
-    ioapic: *Ioapic = undefined,
+    /// Host callback for EOI-of-level-interrupt notification. Wired by
+    /// `Vm.create`; see `LapicHost` at the top of this file.
+    host: LapicHost = undefined,
 
     /// Initialize all APIC registers to power-up/reset state (Section 13.4.7.1).
-    pub fn init(self: *Lapic, ioapic_ptr: *Ioapic) void {
+    pub fn init(self: *Lapic, host: LapicHost) void {
         self.* = .{};
-        self.ioapic = ioapic_ptr;
+        self.host = host;
     }
 
     /// Handle MMIO read at offset from APIC base 0xFEE00000.
@@ -280,7 +289,7 @@ pub const Lapic = struct {
         clearBit(&self.isr, vec);
         // If this was a level-triggered interrupt (TMR bit set), notify IOAPIC
         if (getBit(&self.tmr, vec)) {
-            self.ioapic.handleEOI(vec);
+            self.host.notifyLevelEoi(self.host.ctx, vec);
         }
     }
 
