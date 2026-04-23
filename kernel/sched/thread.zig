@@ -13,11 +13,11 @@ const FaultReason = zag.perms.permissions.FaultReason;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = address.PAddr;
 const Process = zag.proc.process.Process;
-const SlabAllocator = zag.memory.allocators.slab.SlabAllocator;
+const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
 const Stack = stack_mod.Stack;
 const VAddr = address.VAddr;
 
-pub const ThreadAllocator = SlabAllocator(Thread, false, 0, 64, true);
+pub const ThreadAllocator = SecureSlab(Thread, 256);
 
 pub const Priority = enum(u3) {
     idle = 0,
@@ -131,7 +131,8 @@ pub const Thread = struct {
     pub fn releaseRef(self: *Thread) void {
         const prev = self.handle_refcount.fetchSub(1, .acq_rel);
         if (prev == 1 and @atomicLoad(bool, &self.teardown_done, .acquire)) {
-            allocator.destroy(self);
+            const gen = ThreadAllocator.currentGen(self);
+            slab_instance.destroy(self, gen) catch unreachable;
         }
     }
 
@@ -210,7 +211,8 @@ pub const Thread = struct {
 
         @atomicStore(bool, &self.teardown_done, true, .release);
         if (self.handle_refcount.load(.acquire) == 0) {
-            allocator.destroy(self);
+            const gen = ThreadAllocator.currentGen(self);
+            slab_instance.destroy(self, gen) catch unreachable;
         }
 
         if (is_last) proc.lastThreadExited();
@@ -224,8 +226,9 @@ pub const Thread = struct {
     ) !*Thread {
         if (proc.num_threads >= Process.MAX_THREADS) return error.MaxThreads;
 
-        const thread = try allocator.create(Thread);
-        errdefer allocator.destroy(thread);
+        const alloc_result = try slab_instance.create();
+        const thread = alloc_result.ptr;
+        errdefer slab_instance.destroy(thread, alloc_result.gen) catch unreachable;
 
         thread.* = .{
             .tid = @atomicRmw(u64, &tid_counter, .Add, 1, .monotonic),
@@ -311,5 +314,5 @@ fn unmapKernelStack(stack: Stack) void {
     }
 }
 
-pub var allocator: std.mem.Allocator = undefined;
+pub var slab_instance: ThreadAllocator = undefined;
 pub var tid_counter: u64 = 1;

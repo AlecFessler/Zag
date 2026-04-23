@@ -31,7 +31,6 @@ var vm_node_slab_bump: BumpAllocator = undefined;
 var device_region_slab_bump: BumpAllocator = undefined;
 
 pub var proc_slab_backing: BumpAllocator = undefined;
-pub var thread_slab_backing: BumpAllocator = undefined;
 pub var kvm_vm_slab_backing: BumpAllocator = undefined;
 pub var kvm_vcpu_slab_backing: BumpAllocator = undefined;
 
@@ -170,7 +169,6 @@ pub fn init(firmware_mmap: MMap) !void {
     vm_node_slab_bump = BumpAllocator.init(KA.vm_node_slab.start, KA.vm_node_slab.end);
     device_region_slab_bump = BumpAllocator.init(KA.device_region_slab.start, KA.device_region_slab.end);
     proc_slab_backing = BumpAllocator.init(KA.proc_slab.start, KA.proc_slab.end);
-    thread_slab_backing = BumpAllocator.init(KA.thread_slab.start, KA.thread_slab.end);
     kvm_vm_slab_backing = BumpAllocator.init(KA.kvm_vm_slab.start, KA.kvm_vm_slab.end);
     kvm_vcpu_slab_backing = BumpAllocator.init(KA.kvm_vcpu_slab.start, KA.kvm_vcpu_slab.end);
 

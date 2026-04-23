@@ -28,12 +28,10 @@ pub const SharedMemoryAllocator = secure_slab.SecureSlab(SharedMemory, 256);
 /// The cost is a cap at the buddy's max order: `MAX_PAGES = 1024`
 /// (4 MiB per SHM). Callers that want larger regions must attach
 /// multiple SHMs side-by-side in their VMM.
-pub const SharedMemory = extern struct {
-    _gen_lock: u64,
+pub const SharedMemory = struct {
     base_paddr: PAddr,
     num_pages: u32,
-    alloc_order: u8,
-    _pad: [3]u8 = .{ 0, 0, 0 },
+    alloc_order: u4,
     refcount: std.atomic.Value(u32),
 
     /// Max usable pages per SHM. Bounded by the buddy's max order
@@ -63,7 +61,7 @@ pub const SharedMemory = extern struct {
         if (num_pages == 0 or num_pages > MAX_PAGES) return error.TooManyPages;
 
         const rounded_pages = std.math.ceilPowerOfTwo(u32, num_pages) catch return error.TooManyPages;
-        const order: u8 = @intCast(@ctz(rounded_pages));
+        const order: u4 = @intCast(@ctz(rounded_pages));
         const alloc_size = @as(u64, rounded_pages) * paging.PAGE4K;
 
         const alloc_result = slab_allocator_instance.create() catch {
@@ -89,11 +87,12 @@ pub const SharedMemory = extern struct {
         @memset(blk[0..alloc_size], 0);
         const base_paddr = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(blk)), null);
 
-        shm.base_paddr = base_paddr;
-        shm.num_pages = num_pages;
-        shm.alloc_order = order;
-        shm._pad = .{ 0, 0, 0 };
-        shm.refcount = std.atomic.Value(u32).init(1);
+        shm.* = .{
+            .base_paddr = base_paddr,
+            .num_pages = num_pages,
+            .alloc_order = order,
+            .refcount = std.atomic.Value(u32).init(1),
+        };
         return shm;
     }
 
@@ -118,7 +117,7 @@ pub const SharedMemory = extern struct {
     fn freePages(self: *SharedMemory) void {
         if (self.num_pages == 0) return;
 
-        const block_pages = @as(u32, 1) << @as(u4, @intCast(self.alloc_order));
+        const block_pages = @as(u32, 1) << self.alloc_order;
         const block_size = @as(u64, block_pages) * paging.PAGE4K;
         const base_vaddr = VAddr.fromPAddr(self.base_paddr, null);
         const buf: [*]u8 = @ptrFromInt(base_vaddr.addr);

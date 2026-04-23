@@ -26,7 +26,6 @@ const VCpuAllocator = arch.vm.VCpuAllocator;
 const VmAllocator = arch.vm.VmAllocator;
 
 var proc_alloc_instance: ProcessAllocator = undefined;
-var thread_alloc_instance: ThreadAllocator = undefined;
 var vm_alloc_instance: VmAllocator = undefined;
 var vcpu_alloc_instance: VCpuAllocator = undefined;
 
@@ -861,8 +860,11 @@ pub fn globalInit() !void {
     proc_alloc_instance = try ProcessAllocator.init(memory_init.proc_slab_backing.allocator());
     process_mod.allocator = proc_alloc_instance.allocator();
 
-    thread_alloc_instance = try ThreadAllocator.init(memory_init.thread_slab_backing.allocator());
-    thread_mod.allocator = thread_alloc_instance.allocator();
+    thread_mod.slab_instance = ThreadAllocator.init(
+        address.KernelVA.KernelAllocators.thread_slab,
+        address.KernelVA.KernelAllocators.thread_slab_ptrs,
+        address.KernelVA.KernelAllocators.thread_slab_links,
+    );
 
     vm_alloc_instance = try VmAllocator.init(memory_init.kvm_vm_slab_backing.allocator());
     arch.vm.setVmAllocator(vm_alloc_instance.allocator());
@@ -892,7 +894,8 @@ pub fn perCoreInit() void {
     const state = &core_states[core_id];
 
     // Create a real idle thread for this core
-    const idle_thread = thread_mod.allocator.create(Thread) catch @panic("failed to allocate idle thread");
+    const idle_alloc = thread_mod.slab_instance.create() catch @panic("failed to allocate idle thread");
+    const idle_thread = idle_alloc.ptr;
     idle_thread.* = .{
         .tid = std.math.maxInt(u64) - core_id,
         .ctx = undefined,

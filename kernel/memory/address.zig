@@ -86,10 +86,18 @@ pub const KernelVA = struct {
             .start = pmu_state_slab_ptrs.end,
             .end = pmu_state_slab_ptrs.end + SLAB_RESERVATION,
         };
+        pub const thread_slab_ptrs: Range = .{
+            .start = pmu_state_slab_links.end,
+            .end = pmu_state_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const thread_slab_links: Range = .{
+            .start = thread_slab_ptrs.end,
+            .end = thread_slab_ptrs.end + SLAB_RESERVATION,
+        };
 
         pub const range: Range = .{
             .start = vm_node_slab.start,
-            .end = pmu_state_slab_links.end,
+            .end = thread_slab_links.end,
         };
     };
 };

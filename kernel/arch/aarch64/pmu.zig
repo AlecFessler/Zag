@@ -52,7 +52,6 @@ const default_config: PmuCounterConfig = .{
 /// Per-thread arch PMU state. Layout identical in spirit to the x64
 /// backend's `PmuState`: count + configs + saved values.
 pub const PmuState = extern struct {
-    _gen_lock: u64,
     num_counters: u8 = 0,
     _pad: [7]u8 = .{0} ** 7,
     configs: [MAX_COUNTERS]PmuCounterConfig = .{default_config} ** MAX_COUNTERS,

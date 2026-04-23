@@ -156,7 +156,7 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     if (target_thread.pmu_state == null) {
         const alloc_result = slab_instance.create() catch return E_NOMEM;
         const new_state = alloc_result.ptr;
-        new_state.* = .{ ._gen_lock = new_state._gen_lock };
+        new_state.* = .{};
         target_thread.pmu_state = new_state;
     }
     const state = target_thread.pmu_state.?;

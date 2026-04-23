@@ -95,8 +95,9 @@ pub fn create(vm_obj: *Vm) !*VCpu {
     const proc = vm_obj.owner;
 
     // Allocate a thread from the existing ThreadAllocator
-    const thread = try thread_mod.allocator.create(Thread);
-    errdefer thread_mod.allocator.destroy(thread);
+    const thread_alloc = try thread_mod.slab_instance.create();
+    const thread = thread_alloc.ptr;
+    errdefer thread_mod.slab_instance.destroy(thread, thread_alloc.gen) catch unreachable;
 
     thread.* = .{
         .tid = @atomicRmw(u64, &thread_mod.tid_counter, .Add, 1, .monotonic),

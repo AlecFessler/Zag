@@ -42,10 +42,11 @@ pub const AccessError = error{
 /// so an attacker cannot pin which slot their next free-then-alloc will
 /// reclaim.
 ///
-/// Per-object gen+lock word: every slab-allocated T must be `extern struct`
-/// with `_gen_lock: u64` as its first field. Bit 0 of that word is the
-/// per-object lock bit; bits 1..63 hold the monotonically-increasing
-/// generation counter. Encoding:
+/// Per-object gen+lock word: SecureSlab transparently prefixes every T
+/// with a gen-lock header. Callers receive `*T` and treat it like any
+/// other pointer; the header lives at `ptr - headerOffset(T)`. Bit 0 of
+/// the header word is the per-object lock bit; bits 1..63 hold the
+/// monotonically-increasing generation counter. Encoding:
 ///   word = (gen << 1) | lock_bit
 ///   gen even  → slot is freed
 ///   gen odd   → slot is live
@@ -63,6 +64,10 @@ pub fn SecureSlab(
 
     return struct {
         const Self = @This();
+
+        const header_offset: u64 = std.mem.alignForward(u64, @sizeOf(u64), @alignOf(T));
+        const slot_align: u64 = @max(@alignOf(T), @alignOf(u64));
+        const slot_stride: u64 = std.mem.alignForward(u64, header_offset + @sizeOf(T), slot_align);
 
         data_bump: bump.BumpAllocator,
         ptrs_bump: bump.BumpAllocator,
@@ -98,7 +103,7 @@ pub fn SecureSlab(
             std.debug.assert(!data_range.overlapsWith(links_range));
             std.debug.assert(!ptrs_range.overlapsWith(links_range));
 
-            const max_by_data: u64 = (data_range.end - data_range.start) / @sizeOf(T);
+            const max_by_data: u64 = (data_range.end - data_range.start) / slot_stride;
             const max_by_ptrs: u64 = (ptrs_range.end - ptrs_range.start) / @sizeOf(*T);
             const max_by_links: u64 = (links_range.end - links_range.start) / @sizeOf(LinkPair);
             const max_index_space: u64 = INVALID_INDEX;
@@ -156,7 +161,7 @@ pub fn SecureSlab(
             self.push_cursor = self.walkCursorLocked(self.push_cursor, draw_push);
 
             const slot_ptr = self.ptrAt(popped);
-            const word = genLockWord(slot_ptr);
+            const word = genLockWordOf(T, slot_ptr);
             const prev_word = word.load(.monotonic);
             std.debug.assert(prev_word & 1 == 0); // was not locked
             std.debug.assert((prev_word >> 1) % 2 == 0); // was freed (gen even)
@@ -177,7 +182,7 @@ pub fn SecureSlab(
             ptr: *T,
             expected_gen: u63,
         ) AccessError!void {
-            const word = genLockWord(ptr);
+            const word = genLockWordOf(T, ptr);
             const unlocked: u64 = (@as(u64, expected_gen) << 1) | 0;
             const locked: u64 = (@as(u64, expected_gen) << 1) | 1;
 
@@ -213,7 +218,7 @@ pub fn SecureSlab(
         /// to feed `destroy` without the unsafe "just free and hope no
         /// one's looking" variant.
         pub fn currentGen(ptr: *T) u63 {
-            const word = genLockWord(ptr);
+            const word = genLockWordOf(T, ptr);
             return @intCast(word.load(.monotonic) >> 1);
         }
 
@@ -229,7 +234,7 @@ pub fn SecureSlab(
             comptime body: anytype,
         ) SafeAccessReturn(@TypeOf(body)) {
             _ = self;
-            const word = genLockWord(ptr);
+            const word = genLockWordOf(T, ptr);
             const unlocked: u64 = (@as(u64, expected_gen) << 1) | 0;
             const locked: u64 = (@as(u64, expected_gen) << 1) | 1;
 
@@ -249,11 +254,13 @@ pub fn SecureSlab(
         fn growOne(self: *Self) AllocError!void {
             if (self.count_total >= self.max_slots) return error.SlabFull;
 
-            const slot_ptr = bumpOne(&self.data_bump, T) orelse return error.SlabFull;
+            const slot_base = bumpBytes(&self.data_bump, slot_stride, slot_align) orelse
+                return error.SlabFull;
             // Freshly demand-paged memory is already zero (fault handler
             // zeroes new pages), but be explicit for correctness under
             // second-touch reuse.
-            @memset(std.mem.asBytes(slot_ptr), 0);
+            @memset(slot_base[0..slot_stride], 0);
+            const slot_ptr: *T = @ptrCast(@alignCast(slot_base + header_offset));
 
             const ptr_cell = bumpOne(&self.ptrs_bump, *T) orelse return error.SlabFull;
             ptr_cell.* = slot_ptr;
@@ -387,39 +394,36 @@ fn validateT(comptime T: type) void {
     if (info != .@"struct") {
         @compileError("SecureSlab requires a struct T; got " ++ @typeName(T));
     }
-    if (info.@"struct".layout != .@"extern") {
-        @compileError("SecureSlab requires T to be `extern struct` for stable layout; got " ++ @typeName(T));
-    }
 
-    const fields = info.@"struct".fields;
-    if (fields.len == 0) {
-        @compileError(@typeName(T) ++ " must have `_gen_lock: u64` as its first field");
-    }
-    if (!std.mem.eql(u8, fields[0].name, "_gen_lock")) {
-        @compileError(@typeName(T) ++ ": first field must be `_gen_lock`, got `" ++ fields[0].name ++ "`");
-    }
-    if (fields[0].type != u64) {
-        @compileError(@typeName(T) ++ ": `_gen_lock` must be u64");
-    }
-
-    // Any other top-level SpinLock field means the caller is double-locking.
-    // Fine-grained sub-locks on *sub*-structs are fine; this only fires on
-    // SpinLock sitting directly on T.
-    for (fields[1..]) |f| {
+    // Any top-level SpinLock field means the caller is double-locking —
+    // the transparent gen-lock header replaces the coarse object lock.
+    // Fine-grained sub-locks on sub-structs are fine; this only fires
+    // on SpinLock sitting directly on T.
+    for (info.@"struct".fields) |f| {
         if (f.type == SpinLock) {
             @compileError(@typeName(T) ++ " has top-level SpinLock `" ++ f.name ++
-                "`; remove it (the `_gen_lock` word replaces the coarse object lock)");
+                "`; remove it (the SecureSlab gen-lock replaces the coarse object lock)");
         }
     }
 }
 
-fn genLockWord(ptr: anytype) *std.atomic.Value(u64) {
-    return @ptrCast(@alignCast(ptr));
+fn genLockWordOf(comptime T: type, ptr: *T) *std.atomic.Value(u64) {
+    const header_offset = std.mem.alignForward(u64, @sizeOf(u64), @alignOf(T));
+    const base: [*]u8 = @ptrCast(ptr);
+    return @ptrCast(@alignCast(base - header_offset));
 }
 
 fn bumpOne(ba: *bump.BumpAllocator, comptime R: type) ?*R {
     const aligned = std.mem.alignForward(u64, ba.free_addr, @alignOf(R));
     const next_free = aligned + @sizeOf(R);
+    if (next_free > ba.end_addr) return null;
+    ba.free_addr = next_free;
+    return @ptrFromInt(aligned);
+}
+
+fn bumpBytes(ba: *bump.BumpAllocator, size: u64, alignment: u64) ?[*]u8 {
+    const aligned = std.mem.alignForward(u64, ba.free_addr, alignment);
+    const next_free = aligned + size;
     if (next_free > ba.end_addr) return null;
     ba.free_addr = next_free;
     return @ptrFromInt(aligned);
