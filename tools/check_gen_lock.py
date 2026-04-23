@@ -46,8 +46,8 @@ Usage
   python3 tools/check_gen_lock.py --summary    # one line per entry
   python3 tools/check_gen_lock.py --entry foo  # drill into one handler
 
-Exit status is 0 regardless of findings; this is a sanity-check tool,
-not a CI gate (yet).
+Exit status is nonzero if any err findings are emitted (fat-pointer
+violations or missing bracket coverage). Info findings do not gate.
 """
 
 from __future__ import annotations
@@ -1007,7 +1007,18 @@ def _walk_body(
                     self_alive.add(name)
                     became_self_alive = True
                     break
-            if not became_self_alive and rhs_chain and rhs_chain[0] in self_alive:
+            # Self-alive propagates only on direct aliasing (`var x = y`
+            # where y is self-alive). Field access (`var t = proc.threads[0]`)
+            # yields a different slab object with its own lifetime — the
+            # parent being alive says nothing about the child's gen. Without
+            # this `len(chain) == 1` gate, any access on a field-derived
+            # ident is silently exempted from gen-lock coverage.
+            if (
+                not became_self_alive
+                and rhs_chain
+                and len(rhs_chain) == 1
+                and rhs_chain[0] in self_alive
+            ):
                 self_alive.add(name)
                 became_self_alive = True
             if not became_self_alive and (is_fresh_alloc or is_ptr_of_fresh):
@@ -1211,6 +1222,23 @@ def _walk_body(
             key = (recv_ty, fn_name)
             fninfo = fn_index.get(key)
             if fninfo is None:
+                # Mirror the receiver-style fallback: if we can't see
+                # the callee, record the call as a plain access on the
+                # slab ident. The callee may dereference it; caller must
+                # therefore hold a lock across this call site. Without
+                # this fallback, a syscall that releases its lock and
+                # hands a slab ptr to an opaque helper would record no
+                # access and bracket_check would never fire.
+                accesses.setdefault(first_arg, []).append(Access(
+                    line_no=synth,
+                    col=0,
+                    ident=first_arg,
+                    tail=fn_name,
+                    raw=code.strip(),
+                    slab_type=recv_ty,
+                    src_file=src_file,
+                    src_line=src_line,
+                ))
                 continue
             if key in visited:
                 continue
@@ -1685,6 +1713,12 @@ def main() -> int:
           f"{total_errs} err, {total_infos} info")
     print(f"         {len(slab_types)} slab-backed types discovered")
     print(f"         {total_bare_ptr} bare-pointer fat-pointer violations")
+
+    # Exit nonzero on any err. Info findings are informational and do
+    # not gate. This makes the tool a real CI check once wired into
+    # pre-commit — see tests/test.sh.
+    if total_errs > 0:
+        return 1
 
     if args.depth_stats:
         print()
