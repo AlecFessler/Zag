@@ -752,6 +752,17 @@ def _walk_body(
             if resolved:
                 env[name] = resolved
 
+        # Refcount-pinning detector. The idiomatic pin pair in this
+        # kernel is:
+        #     const x = <acquireFn>(...) orelse return ...;
+        #     defer x.releaseRef();
+        # The `acquireFn` bumps `x.handle_refcount`; the defer drops it at
+        # scope exit. While pinned, `x` cannot be freed — accesses to `x`
+        # are UAF-safe even without gen-lock. Mark the ident as self-alive.
+        m_pin = re.match(r"^\s*defer\s+(\w+)\s*\.\s*releaseRef\s*\(", code)
+        if m_pin:
+            self_alive.add(m_pin.group(1))
+
         # Lock / unlock / defer-unlock ops on slab idents.
         for m_lock in re.finditer(
             r"\b(\w+)\._gen_lock\.(lock|unlock|lockWithGen)\b", code
