@@ -628,6 +628,48 @@ def _atomic_call_spans(line: str) -> list[tuple[int, int]]:
     return spans
 
 
+def _extract_call_arg_idents(
+    code: str, open_paren_pos: int
+) -> list[str | None]:
+    """Given the position of a `(` in `code`, parse the top-level
+    comma-separated args up to the matching `)`. Return a list where
+    each element is the arg's simple identifier (if the whole arg is
+    a bare `\\w+`) or None (complex expression we can't safely rename
+    through). Bracket matching handles nested (), [], {}."""
+    depth = 0
+    i = open_paren_pos
+    args: list[str | None] = []
+    cur = ""
+    while i < len(code):
+        c = code[i]
+        if c in "([{":
+            depth += 1
+            if depth > 1:
+                cur += c
+        elif c in ")]}":
+            depth -= 1
+            if depth == 0:
+                if cur.strip():
+                    args.append(_arg_to_ident(cur))
+                return args
+            cur += c
+        elif c == "," and depth == 1:
+            args.append(_arg_to_ident(cur))
+            cur = ""
+        else:
+            if depth >= 1:
+                cur += c
+        i += 1
+    return args
+
+
+def _arg_to_ident(s: str) -> str | None:
+    s = s.strip()
+    if re.fullmatch(r"[A-Za-z_]\w*", s):
+        return s
+    return None
+
+
 def _join_multiline_decl(body_lines: list[str], rel: int) -> str:
     """If `body_lines[rel]` starts a decl that doesn't close with `;`, peek
     forward until we see the terminator."""
@@ -876,16 +918,28 @@ def _walk_body(
                 continue
             if depth >= MAX_INLINE_DEPTH or key in visited:
                 continue
-            # Substitute first-param name → caller ident throughout the
-            # callee's body. Whole-word replacement.
-            self_name = fninfo.first_param
-            if self_name:
+            # Build a full param→caller-ident substitution map. For method
+            # calls the first "param" is the receiver (substitute with
+            # `ident`), and the remaining callee params map positionally
+            # to the caller's positional args. Args we can't reduce to a
+            # bare identifier are skipped — the callee-local name is left
+            # in place and the ident may be flagged later if it escapes.
+            open_paren = code.find("(", _end)
+            caller_args: list[str | None] = []
+            if open_paren != -1:
+                caller_args = _extract_call_arg_idents(code, open_paren)
+            subs: list[tuple[str, str]] = []
+            if fninfo.first_param:
+                subs.append((fninfo.first_param, ident))
+            for (pname, _ptype), carg in zip(fninfo.other_params, caller_args):
+                if carg is not None and pname:
+                    subs.append((pname, carg))
+            subbed = list(fninfo.body_lines)
+            for pname, cident in subs:
                 subbed = [
-                    re.sub(rf"\b{re.escape(self_name)}\b", ident, ln)
-                    for ln in fninfo.body_lines
+                    re.sub(rf"\b{re.escape(pname)}\b", cident, ln)
+                    for ln in subbed
                 ]
-            else:
-                subbed = list(fninfo.body_lines)
             sub_env = dict(env)
             sub_env[ident] = recv_ty
             sub_self_alive = set(self_alive)
@@ -917,14 +971,31 @@ def _walk_body(
                 continue
             if depth >= MAX_INLINE_DEPTH or key in visited:
                 continue
-            self_name = fninfo.first_param
-            if self_name:
-                subbed = [
-                    re.sub(rf"\b{re.escape(self_name)}\b", first_arg, ln)
-                    for ln in fninfo.body_lines
-                ]
+            # Locate this call in `code` so we can extract the arg list.
+            open_paren = -1
+            for m_oc in re.finditer(
+                rf"\b{re.escape(fn_name)}\s*\(", code
+            ):
+                open_paren = m_oc.end() - 1
+                break
+            caller_args: list[str | None] = []
+            if open_paren != -1:
+                caller_args = _extract_call_arg_idents(code, open_paren)
+            subs: list[tuple[str, str]] = []
+            if fninfo.first_param and caller_args and caller_args[0] == first_arg:
+                subs.append((fninfo.first_param, first_arg))
+                remaining_caller = caller_args[1:]
             else:
-                subbed = list(fninfo.body_lines)
+                remaining_caller = caller_args
+            for (pname, _ptype), carg in zip(fninfo.other_params, remaining_caller):
+                if carg is not None and pname:
+                    subs.append((pname, carg))
+            subbed = list(fninfo.body_lines)
+            for pname, cident in subs:
+                subbed = [
+                    re.sub(rf"\b{re.escape(pname)}\b", cident, ln)
+                    for ln in subbed
+                ]
             sub_env = dict(env)
             sub_env[first_arg] = recv_ty
             sub_self_alive = set(self_alive)
