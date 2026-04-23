@@ -103,6 +103,20 @@ fn allocRegion() !*DeviceRegion {
     return r.ptr;
 }
 
+/// Zero the union storage before writing the active variant. Without
+/// this, a recycled slot keeps the previous occupant's Pci tail bytes
+/// (Pci is larger than Display) leaking through the union. Same story
+/// for the outer DeviceRegion `_pad`.
+fn zeroRegionBytes(dr: *DeviceRegion) void {
+    const base: [*]u8 = @ptrCast(dr);
+    const gen_lock_off: usize = @offsetOf(DeviceRegion, "_gen_lock");
+    const gen_lock_size: usize = @sizeOf(@TypeOf(dr._gen_lock));
+    // Zero everything except the gen-lock word — that was just set by
+    // the allocator and must not be clobbered.
+    @memset(base[0..gen_lock_off], 0);
+    @memset(base[gen_lock_off + gen_lock_size .. @sizeOf(DeviceRegion)], 0);
+}
+
 pub fn createMmio(
     phys_base: PAddr,
     size: u64,
@@ -116,6 +130,7 @@ pub fn createMmio(
     pci_func: u8,
 ) !*DeviceRegion {
     const dr = try allocRegion();
+    zeroRegionBytes(dr);
     dr.access = .{ .mmio = .{ .phys_base = phys_base, .size = size } };
     dr.detail = .{ .pci = .{
         .vendor = pci_vendor,
@@ -146,6 +161,7 @@ pub fn createPortIo(
     pci_func: u8,
 ) !*DeviceRegion {
     const dr = try allocRegion();
+    zeroRegionBytes(dr);
     dr.access = .{ .port_io = .{ .base_port = base_port, .port_count = port_count } };
     dr.detail = .{ .pci = .{
         .vendor = pci_vendor,
@@ -172,6 +188,7 @@ pub fn createDisplay(
     fb_pixel_format: u8,
 ) !*DeviceRegion {
     const dr = try allocRegion();
+    zeroRegionBytes(dr);
     dr.access = .{ .mmio = .{ .phys_base = phys_base, .size = size } };
     dr.detail = .{ .display = .{
         .fb_width = fb_width,

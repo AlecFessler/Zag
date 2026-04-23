@@ -84,6 +84,9 @@ pub const VmNode = extern struct {
         self.rights = rights;
         self.handle = handle;
         self.restart_policy = policy;
+        // Explicit pad reset: a recycled slot would otherwise carry
+        // whatever the previous occupant left in these bytes.
+        self._pad = .{ 0, 0, 0, 0, 0 };
     }
 
     pub fn sharedMemory(self: *const VmNode) ?*SharedMemory {

@@ -132,10 +132,6 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     var configs: [arch.pmu.pmu_max_counters]PmuCounterConfig = undefined;
     const slice = readConfigs(proc, configs_ptr, count, &configs) catch |err| return configErrToCode(err);
 
-    const target_proc = target_thread.process;
-    target_proc._gen_lock.lock();
-    defer target_proc._gen_lock.unlock();
-
     // Self vs. remote programming. Writing MSRs on the caller's core only
     // makes sense if the caller *is* the target — otherwise we'd trash the
     // caller's own PMU state and do nothing to the target's actual core.
@@ -145,27 +141,60 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     // there. Require the target to be observable (.faulted or .suspended);
     // return E_BUSY otherwise (§4.51.11).
     const is_self = target_thread == scheduler.currentThread();
+
+    // Allocate PMU state lazily on first start (§2.14.8). Slab create
+    // is outside target_proc._gen_lock — the allocator has its own
+    // internal lock and the slot isn't visible to any observer yet.
+    var new_state_opt: ?*arch.pmu.PmuState = null;
+    errdefer if (new_state_opt) |s| slab_instance.destroy(s, s._gen_lock.currentGen()) catch {};
+
+    const target_proc = target_thread.process;
+
+    // Tight critical section: target_thread.state check + pmu_state
+    // slot read/write. MSR programming happens below with the gen-lock
+    // released — `state` is a stable *T after the slab allocator
+    // handed it out, refcount-pinned by the thread's handle ref.
+    target_proc._gen_lock.lock();
+
     if (!is_self) {
         switch (target_thread.state) {
             .faulted, .suspended => {},
-            else => return E_BUSY,
+            else => {
+                target_proc._gen_lock.unlock();
+                return E_BUSY;
+            },
         }
     }
 
-    // Allocate PMU state lazily on first start (§2.14.8). Save/restore
-    // `_gen_lock` across the zeroing struct-literal assignment — the
-    // slab allocator just set gen-odd/live, and a `.* = .{}` would
-    // clobber it to zero. No race window: the pointer hasn't been
-    // handed out to anyone yet.
-    if (target_thread.pmu_state == null) {
+    var state_ptr = target_thread.pmu_state;
+    if (state_ptr == null) {
+        target_proc._gen_lock.unlock();
         const alloc_result = slab_instance.create() catch return E_NOMEM;
         const new_state = alloc_result.ptr;
+        new_state_opt = new_state;
+        // Save/restore `_gen_lock` across `.* = .{}` zeroing; the slot
+        // is unpublished until the assignment below, so no race.
         const saved_gen = new_state._gen_lock;
         new_state.* = .{};
         new_state._gen_lock = saved_gen;
-        target_thread.pmu_state = new_state;
+        target_proc._gen_lock.lock();
+        // Re-check under the lock: another core may have allocated a
+        // state for this thread while we were unlocked.
+        if (target_thread.pmu_state) |existing| {
+            state_ptr = existing;
+            // Roll back our speculative allocation.
+            target_proc._gen_lock.unlock();
+            slab_instance.destroy(new_state, new_state._gen_lock.currentGen()) catch {};
+            new_state_opt = null;
+            target_proc._gen_lock.lock();
+        } else {
+            target_thread.pmu_state = new_state;
+            state_ptr = new_state;
+            new_state_opt = null;
+        }
     }
-    const state = target_thread.pmu_state.?;
+    const state = state_ptr.?;
+    target_proc._gen_lock.unlock();
 
     if (is_self) {
         arch.pmu.pmuStart(state, slice) catch return E_INVAL;
@@ -183,16 +212,25 @@ pub fn sysPmuRead(proc: *Process, thread_handle: u64, sample_ptr: u64) i64 {
     defer target_thread.releaseRef();
 
     const target_proc = target_thread.process;
-    target_proc._gen_lock.lock();
-    defer target_proc._gen_lock.unlock();
 
+    // Tight critical section: state check + pmu_state read only. Drop
+    // the gen-lock before `writeUser`, which can page-fault; the fault
+    // handler (`Process.fault`) takes `self._gen_lock` on the caller's
+    // process, and if `proc == target_proc` that would self-deadlock.
+    target_proc._gen_lock.lock();
     // §2.14.11 / §4.52.5: only .faulted or .suspended is legal.
     switch (target_thread.state) {
         .faulted, .suspended => {},
-        else => return E_BUSY,
+        else => {
+            target_proc._gen_lock.unlock();
+            return E_BUSY;
+        },
     }
-
-    const state = target_thread.pmu_state orelse return E_INVAL; // §4.52.6
+    const state = target_thread.pmu_state orelse {
+        target_proc._gen_lock.unlock();
+        return E_INVAL; // §4.52.6
+    };
+    target_proc._gen_lock.unlock();
 
     var sample: PmuSample = .{};
     arch.pmu.pmuRead(state, &sample);
@@ -215,13 +253,19 @@ pub fn sysPmuReset(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     const slice = readConfigs(proc, configs_ptr, count, &configs) catch |err| return configErrToCode(err);
 
     const target_proc = target_thread.process;
+
+    // Tight critical section: state check + pmu_state read. Drop
+    // the gen-lock before hardware programming.
     target_proc._gen_lock.lock();
-    defer target_proc._gen_lock.unlock();
-
-    // §4.53.5: only .faulted is valid.
-    if (target_thread.state != .faulted) return E_INVAL;
-
-    const state = target_thread.pmu_state orelse return E_INVAL; // §4.53.6
+    if (target_thread.state != .faulted) {
+        target_proc._gen_lock.unlock();
+        return E_INVAL;
+    }
+    const state = target_thread.pmu_state orelse {
+        target_proc._gen_lock.unlock();
+        return E_INVAL; // §4.53.6
+    };
+    target_proc._gen_lock.unlock();
 
     // Self vs. remote: a .faulted target can only be `currentThread()`
     // if the thread is handling its own fault (thread-level self-handler,
@@ -244,8 +288,12 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
     defer target_thread.releaseRef();
 
     const target_proc = target_thread.process;
+    const is_self = target_thread == scheduler.currentThread();
+
+    // Tight critical section: state check + pmu_state take. Drop the
+    // gen-lock before hardware programming and before calling the slab
+    // allocator's destroy (which takes the allocator's internal lock).
     target_proc._gen_lock.lock();
-    defer target_proc._gen_lock.unlock();
 
     // Self vs. remote: only touch hardware on the caller's core if the
     // caller IS the target. Otherwise, the target isn't running here —
@@ -256,22 +304,28 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
     // until the next context switch, and `pmuSave` on that core would
     // race our state mutation here. Require the target to be observable
     // (.faulted or .suspended); return E_BUSY otherwise (§4.54.7).
-    const is_self = target_thread == scheduler.currentThread();
     if (!is_self) {
         switch (target_thread.state) {
             .faulted, .suspended => {},
-            else => return E_BUSY,
+            else => {
+                target_proc._gen_lock.unlock();
+                return E_BUSY;
+            },
         }
     }
 
-    const state = target_thread.pmu_state orelse return E_INVAL; // §4.54.5
+    const state = target_thread.pmu_state orelse {
+        target_proc._gen_lock.unlock();
+        return E_INVAL; // §4.54.5
+    };
+    target_thread.pmu_state = null;
+    target_proc._gen_lock.unlock();
 
     if (is_self) {
         arch.pmu.pmuStop(state);
     } else {
         arch.pmu.pmuClearState(state);
     }
-    target_thread.pmu_state = null;
     const gen = PmuStateAllocator.currentGen(state);
     slab_instance.destroy(state, gen) catch unreachable;
     return E_OK;

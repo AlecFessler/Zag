@@ -84,9 +84,12 @@ pub const SharedMemory = extern struct {
 
         // Field-by-field assignment preserves `_gen_lock` (which the
         // slab allocator just set to the freshly-advanced live gen).
+        // Explicit `_pad` reset prevents leaking whatever the previous
+        // occupant left in those bytes on a recycled slot.
         shm.base_paddr = base_paddr;
         shm.num_pages = num_pages;
         shm.alloc_order = order;
+        shm._pad = .{ 0, 0, 0 };
         shm.refcount = std.atomic.Value(u32).init(1);
         return shm;
     }
