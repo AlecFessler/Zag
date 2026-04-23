@@ -185,16 +185,22 @@ pub fn sysThreadSuspend(thread_handle: u64) i64 {
     const target = pinned.thread;
     defer target.releaseRef();
     if (!pinned.entry.threadHandleRights().@"suspend") return E_PERM;
+
+    target._gen_lock.lock();
     const target_proc = target.process;
+    target._gen_lock.unlock();
 
     target_proc._gen_lock.lock();
+    target._gen_lock.lock();
 
     switch (target.state) {
         .faulted, .suspended => {
+            target._gen_lock.unlock();
             target_proc._gen_lock.unlock();
             return E_BUSY;
         },
         .exited => {
+            target._gen_lock.unlock();
             target_proc._gen_lock.unlock();
             return E_BADCAP;
         },
@@ -204,6 +210,7 @@ pub fn sysThreadSuspend(thread_handle: u64) i64 {
         // a debugger can wait for the thread to leave .blocked and try
         // again.
         .blocked => {
+            target._gen_lock.unlock();
             target_proc._gen_lock.unlock();
             return E_BUSY;
         },
@@ -221,6 +228,7 @@ pub fn sysThreadSuspend(thread_handle: u64) i64 {
                 // re-enqueue us while we are still running on this core
                 // — dual dispatch. §2.4.9 requires the transition to be
                 // effective immediately.
+                target._gen_lock.unlock();
                 target_proc._gen_lock.unlock();
                 arch.cpu.enableInterrupts();
                 sched.yield();
@@ -229,6 +237,7 @@ pub fn sysThreadSuspend(thread_handle: u64) i64 {
                 return E_OK;
             }
 
+            target._gen_lock.unlock();
             target_proc._gen_lock.unlock();
 
             // The target may be in a run queue (.ready) or actively
@@ -256,19 +265,26 @@ pub fn sysThreadResume(thread_handle: u64) i64 {
     const target = pinned.thread;
     defer target.releaseRef();
     if (!pinned.entry.threadHandleRights().@"resume") return E_PERM;
+
+    target._gen_lock.lock();
     const target_proc = target.process;
+    target._gen_lock.unlock();
 
     target_proc._gen_lock.lock();
+    target._gen_lock.lock();
     if (target.state != .suspended) {
+        target._gen_lock.unlock();
         target_proc._gen_lock.unlock();
         return E_INVAL;
     }
 
     target.state = .ready;
     target_proc.suspended_thread_slots &= ~(@as(u64, 1) << @intCast(target.slot_index));
+    const affinity = target.core_affinity;
+    target._gen_lock.unlock();
     target_proc._gen_lock.unlock();
 
-    const target_core = if (target.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
+    const target_core = if (affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
     sched.enqueueOnCore(target_core, target);
     return E_OK;
 }
@@ -281,15 +297,21 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
     const target = pinned.thread;
     defer target.releaseRef();
     if (!pinned.entry.threadHandleRights().kill) return E_PERM;
-    const target_proc = target.process;
     const cur = sched.currentThread().?;
 
+    target._gen_lock.lock();
+    const target_proc = target.process;
+    target._gen_lock.unlock();
+
     target_proc._gen_lock.lock();
+    target._gen_lock.lock();
     if (target.state == .faulted) {
+        target._gen_lock.unlock();
         target_proc._gen_lock.unlock();
         return E_BUSY;
     }
     if (target.state == .exited) {
+        target._gen_lock.unlock();
         target_proc._gen_lock.unlock();
         return E_BADCAP;
     }
@@ -300,6 +322,7 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
     // Clear bitmask bits
     target_proc.faulted_thread_slots &= ~(@as(u64, 1) << @intCast(target.slot_index));
     target_proc.suspended_thread_slots &= ~(@as(u64, 1) << @intCast(target.slot_index));
+    target._gen_lock.unlock();
     target_proc._gen_lock.unlock();
 
     // Self-kill: fall through to scheduler-zombie cleanup path.
