@@ -1,0 +1,1190 @@
+#!/usr/bin/env python3
+"""
+Static analyzer for gen-lock coverage / scoping on slab-backed objects.
+
+Design goal
+-----------
+Every access to a slab-backed object from a kernel entry point (syscall
+handler or exception/fault handler) must be bracketed by a gen-lock
+acquire and release on that very object. For tight scoping:
+
+  * the line immediately preceding the FIRST access must be the acquire,
+  * the line immediately following the LAST access must be the release.
+
+`defer <obj>._gen_lock.unlock()` is accepted only when the last access
+is the last statement in the enclosing block (i.e. the release lines up
+with scope exit).
+
+What counts as a "slab-backed type":
+  Any struct whose body declares `_gen_lock: GenLock = .{}`. That is the
+  allocator-enforced stamp — every object that sits in a SecureSlab has
+  exactly one.
+
+What counts as a "kernel entry point":
+  * all `pub fn sys*` in kernel/syscall/*.zig
+  * exception / fault / IRQ trampolines:
+      kernel/arch/x64/exceptions.zig::exceptionHandler, pageFaultHandler
+      kernel/arch/aarch64/exceptions.zig::handle{Sync,Irq}{Lower,Current}El,
+          handleUnexpected, dispatchIrq, faultOrKillUser
+
+Identifier typing (conservative; we only track what we can be sure of):
+  * parameters declared as `*T` / `?*T` / `*const T` where T is slab-backed
+  * assignments from known slab-returning expressions:
+      scheduler.currentThread()[.?]        -> *Thread
+      scheduler.currentProc()              -> *Process
+      sched.currentThread()[.?] / Proc     -> same
+      <slab>.process                       -> *Process     (Thread / VCpu has it)
+      <slab>.pmu_state                     -> ?*PmuState   (Thread)
+      <PermissionEntry or similar>.object.<variant>
+           where variant in {thread, process, dead_process,
+                             shared_memory, device_region, vm}
+      <acquireThreadRef-result>.thread     -> *Thread
+
+Usage
+-----
+  python3 tools/check_gen_lock.py              # full report
+  python3 tools/check_gen_lock.py --summary    # one line per entry
+  python3 tools/check_gen_lock.py --entry foo  # drill into one handler
+
+Exit status is 0 regardless of findings; this is a sanity-check tool,
+not a CI gate (yet).
+"""
+
+from __future__ import annotations
+
+import argparse
+import re
+import sys
+from dataclasses import dataclass, field
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+KERNEL_DIR = REPO_ROOT / "kernel"
+
+# Lock-op method names that are NOT to be treated as generic field
+# access. These are the gen-lock operations themselves.
+LOCK_OPS = {
+    "lock",
+    "unlock",
+    "lockWithGen",
+    "currentGen",
+    "setGenRelease",
+}
+
+# Names of helper expressions whose returned pointer is "self-alive" — the
+# caller IS this object (we're currently executing on it), so no UAF is
+# possible. Gen-lock is not required for accesses on these.
+#
+# This is NOT a safe-method whitelist: it's the entry point into the
+# "validity is pre-established by the scheduler" chain. Everything else —
+# including refcount-pinning helpers like `lookupThread` — gets analyzed
+# by the call-graph tracer in pass 2, not by name matching.
+SELF_ALIVE_HELPERS = {
+    "currentThread",
+    "currentProc",
+}
+
+# Names we treat as "slab of type T" when they appear as the tail of an
+# identifier chain. Keyed by variant name in the KernelObject union.
+UNION_VARIANT_TYPES = {
+    "thread": "Thread",
+    "process": "Process",
+    "dead_process": "Process",
+    "shared_memory": "SharedMemory",
+    "device_region": "DeviceRegion",
+    "vm": "Vm",
+}
+
+# Simple known-slab field map. Filled in by scan_struct_fields() and
+# seeded with a few high-traffic references that the struct-scanner
+# might not pick up (e.g. union variants).
+DEFAULT_FIELD_CHAINS = {
+    ("Thread", "process"): "Process",
+    ("Thread", "pmu_state"): "PmuState",
+    ("VCpu", "process"): "Process",
+    ("VCpu", "vm"): "Vm",
+    ("Vm", "proc"): "Process",
+}
+
+
+@dataclass
+class SlabType:
+    name: str
+    file: Path
+    line: int
+
+
+@dataclass
+class EntryPoint:
+    name: str
+    file: Path
+    line: int
+    body_lines: list[str] = field(default_factory=list)
+    body_first_line: int = 0  # 1-based source line of first body line
+
+
+@dataclass
+class FnInfo:
+    """Metadata for any fn we may inline when tracing call graphs."""
+    file: Path
+    line: int             # 1-based line of header
+    first_param: str      # name of first param (the receiver for methods)
+    other_params: list[tuple[str, str]]  # (name, type_str) for other params
+    body_lines: list[str]
+    body_first_line: int
+    receiver_type: str | None  # type T if first param is `*T` / `*const T` / T
+
+
+@dataclass
+class Access:
+    line_no: int       # synthesized flat line number (see `flatten`)
+    col: int           # 0-based col of the access dot
+    ident: str
+    tail: str          # the field/method accessed
+    raw: str           # the full source line (stripped)
+    slab_type: str = "" # resolved slab-type name of `ident`
+    src_file: Path | None = None  # real source file (None = entry's own body)
+    src_line: int = 0             # real 1-based source line
+
+
+@dataclass
+class LockOp:
+    line_no: int       # synthesized flat line number
+    ident: str
+    op: str            # "lock", "unlock", "lockWithGen", or "defer-unlock"
+    raw: str
+    src_file: Path | None = None
+    src_line: int = 0
+
+
+@dataclass
+class Finding:
+    severity: str      # "err" | "warn" | "info"
+    entry: str
+    message: str
+    line_no: int = 0
+    src_file: Path | None = None
+    src_line: int = 0
+    call_stack: list[str] = field(default_factory=list)  # inlined call chain
+
+
+# ---------------------------------------------------------------------------
+# File walking helpers
+# ---------------------------------------------------------------------------
+
+def iter_zig_files(root: Path):
+    for p in root.rglob("*.zig"):
+        if ".zig-cache" in p.parts:
+            continue
+        yield p
+
+
+def strip_comments(line: str) -> str:
+    """Remove // comments from a line (naive; does not respect strings)."""
+    i = line.find("//")
+    if i == -1:
+        return line
+    return line[:i]
+
+
+# ---------------------------------------------------------------------------
+# Step 1: discover slab-backed types
+# ---------------------------------------------------------------------------
+
+STRUCT_HEAD_RE = re.compile(
+    r"(?:pub\s+)?const\s+(\w+)\s*=\s*(?:extern\s+|packed\s+)?struct\b"
+)
+
+def find_slab_types() -> dict[str, SlabType]:
+    """
+    Scan all kernel .zig files for struct definitions that contain a
+    `_gen_lock:` field. Returns a dict of type name -> SlabType.
+
+    Excludes test-local fixtures inside secure_slab.zig whose only purpose
+    is exercising the allocator itself — they don't appear in real entry
+    paths.
+    """
+    out: dict[str, SlabType] = {}
+    TEST_FIXTURE_TYPES = {"TestT"}
+    for fpath in iter_zig_files(KERNEL_DIR):
+        text = fpath.read_text()
+        # For every `_gen_lock:` occurrence, walk backwards to the most
+        # recent `const <Name> = [extern|packed] struct` definition in
+        # the same file.
+        lines = text.splitlines()
+        for idx, line in enumerate(lines):
+            stripped = strip_comments(line).strip()
+            if not stripped.startswith("_gen_lock:"):
+                continue
+            # Walk backwards to find the enclosing struct header. Track
+            # brace balance so nested structs don't confuse us.
+            depth = 0
+            # The field sits *inside* a struct body, so the enclosing `{`
+            # is at depth 1 looking backwards.
+            for j in range(idx, -1, -1):
+                for ch in reversed(lines[j]):
+                    if ch == '}':
+                        depth += 1
+                    elif ch == '{':
+                        if depth == 0:
+                            # This is the opening brace of the field's
+                            # enclosing struct. Match the header on this
+                            # or earlier lines.
+                            header_scan_start = j
+                            break
+                        depth -= 1
+                else:
+                    continue
+                break
+            else:
+                continue
+            # Scan this line (and any continuation upward) for struct head.
+            header = lines[header_scan_start]
+            for k in range(header_scan_start, max(-1, header_scan_start - 4), -1):
+                if k < 0:
+                    break
+                m = STRUCT_HEAD_RE.search(lines[k])
+                if m:
+                    name = m.group(1)
+                    if name in TEST_FIXTURE_TYPES:
+                        break
+                    if name not in out:
+                        out[name] = SlabType(name=name, file=fpath, line=k + 1)
+                    break
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Step 2: discover kernel entry points
+# ---------------------------------------------------------------------------
+
+FN_HEAD_RE = re.compile(r"^\s*(?:pub\s+)?fn\s+(\w+)\s*\(")
+
+EXCEPTION_ENTRY_NAMES = {
+    # x64
+    "exceptionHandler",
+    "pageFaultHandler",
+    # aarch64
+    "handleSyncLowerEl",
+    "handleIrqLowerEl",
+    "handleSyncCurrentEl",
+    "handleIrqCurrentEl",
+    "handleUnexpected",
+    "dispatchIrq",
+    "faultOrKillUser",
+}
+
+# Thin-dispatch helpers that syscall entries forward to. Analyzed as
+# extra entry points because the real critical section lives here, not
+# in the one-line syscall stub.
+#
+# Each tuple is (file-relative-path, fn-name). The tool walks both x64
+# and aarch64 implementations where they exist.
+ARCH_HELPER_ENTRIES: list[tuple[str, str]] = [
+    # kvm/vm.zig
+    ("kernel/arch/x64/kvm/vm.zig", "vmCreate"),
+    ("kernel/arch/x64/kvm/vm.zig", "guestMap"),
+    ("kernel/arch/x64/kvm/vm.zig", "sysregPassthrough"),
+    ("kernel/arch/x64/kvm/vm.zig", "intcAssertIrq"),
+    ("kernel/arch/x64/kvm/vm.zig", "intcDeassertIrq"),
+    ("kernel/arch/aarch64/kvm/vm.zig", "vmCreate"),
+    ("kernel/arch/aarch64/kvm/vm.zig", "guestMap"),
+    ("kernel/arch/aarch64/kvm/vm.zig", "sysregPassthrough"),
+    ("kernel/arch/aarch64/kvm/vm.zig", "intcAssertIrq"),
+    ("kernel/arch/aarch64/kvm/vm.zig", "intcDeassertIrq"),
+    # kvm/exit_box.zig
+    ("kernel/arch/x64/kvm/exit_box.zig", "vmRecv"),
+    ("kernel/arch/x64/kvm/exit_box.zig", "vmReply"),
+    ("kernel/arch/aarch64/kvm/exit_box.zig", "vmRecv"),
+    ("kernel/arch/aarch64/kvm/exit_box.zig", "vmReply"),
+    # kvm/vcpu.zig
+    ("kernel/arch/x64/kvm/vcpu.zig", "vcpuRun"),
+    ("kernel/arch/x64/kvm/vcpu.zig", "vcpuSetState"),
+    ("kernel/arch/x64/kvm/vcpu.zig", "vcpuGetState"),
+    ("kernel/arch/x64/kvm/vcpu.zig", "vcpuInterrupt"),
+    ("kernel/arch/aarch64/kvm/vcpu.zig", "vcpuRun"),
+    ("kernel/arch/aarch64/kvm/vcpu.zig", "vcpuSetState"),
+    ("kernel/arch/aarch64/kvm/vcpu.zig", "vcpuGetState"),
+    ("kernel/arch/aarch64/kvm/vcpu.zig", "vcpuInterrupt"),
+]
+
+
+def extract_function_body(lines: list[str], header_line_idx: int) -> tuple[list[str], int]:
+    """
+    Given the 0-based index of a `fn foo(...)` line, return the body
+    lines (between the first `{` and its matching `}`) plus the 1-based
+    source line number of the first body line.
+
+    Returns ([], 0) if we can't find a balanced body (e.g. extern decl).
+    """
+    # Find the opening `{` on/after the header.
+    open_line = header_line_idx
+    open_col = -1
+    for i in range(header_line_idx, min(header_line_idx + 20, len(lines))):
+        code = strip_comments(lines[i])
+        idx = code.find("{")
+        if idx != -1:
+            open_line = i
+            open_col = idx
+            break
+    if open_col == -1:
+        return [], 0
+
+    # Walk forward tracking brace depth.
+    depth = 0
+    # Count the opening brace.
+    body_start_line = open_line  # we'll trim the prefix from this line
+    body_start_col = open_col + 1
+    body: list[str] = []
+    first_body_line_no = 0
+    for i in range(open_line, len(lines)):
+        code = strip_comments(lines[i])
+        start = 0
+        if i == open_line:
+            start = body_start_col
+            # everything before body_start_col on this line is header
+        for c_idx in range(start, len(code)):
+            ch = code[c_idx]
+            if ch == '{':
+                depth += 1
+            elif ch == '}':
+                if depth == 0:
+                    # End of body. Append up to this position from line i.
+                    prefix = lines[i][start:c_idx] if i == open_line else lines[i][:c_idx]
+                    if prefix.strip():
+                        body.append(prefix.rstrip())
+                        if first_body_line_no == 0:
+                            first_body_line_no = i + 1
+                    return body, (first_body_line_no or (open_line + 2))
+                depth -= 1
+        # end of line — append the whole line to body
+        if i == open_line:
+            content = lines[i][start:]
+        else:
+            content = lines[i]
+        if content.strip() or body:
+            body.append(content)
+            if first_body_line_no == 0 and content.strip():
+                first_body_line_no = i + 1
+    return body, (first_body_line_no or (open_line + 2))
+
+
+def find_entry_points() -> list[EntryPoint]:
+    entries: list[EntryPoint] = []
+
+    # Syscalls: every `pub fn sys*` under kernel/syscall/.
+    syscall_dir = KERNEL_DIR / "syscall"
+    for fpath in iter_zig_files(syscall_dir):
+        lines = fpath.read_text().splitlines()
+        for i, line in enumerate(lines):
+            m = re.match(r"^pub\s+fn\s+(sys\w+)\s*\(", line)
+            if not m:
+                continue
+            body, body_start = extract_function_body(lines, i)
+            if not body:
+                continue
+            entries.append(EntryPoint(
+                name=m.group(1), file=fpath, line=i + 1,
+                body_lines=body, body_first_line=body_start,
+            ))
+
+    # Exception handlers: exact-name match in arch exceptions files.
+    arch_files = [
+        KERNEL_DIR / "arch" / "x64" / "exceptions.zig",
+        KERNEL_DIR / "arch" / "aarch64" / "exceptions.zig",
+    ]
+    for fpath in arch_files:
+        if not fpath.exists():
+            continue
+        lines = fpath.read_text().splitlines()
+        for i, line in enumerate(lines):
+            m = FN_HEAD_RE.match(line)
+            if not m:
+                continue
+            name = m.group(1)
+            if name not in EXCEPTION_ENTRY_NAMES:
+                continue
+            body, body_start = extract_function_body(lines, i)
+            if not body:
+                continue
+            entries.append(EntryPoint(
+                name=name, file=fpath, line=i + 1,
+                body_lines=body, body_first_line=body_start,
+            ))
+
+    # Thin-dispatch helpers reached from syscalls.
+    for rel_path, fn_name in ARCH_HELPER_ENTRIES:
+        fpath = REPO_ROOT / rel_path
+        if not fpath.exists():
+            continue
+        lines = fpath.read_text().splitlines()
+        for i, line in enumerate(lines):
+            m = FN_HEAD_RE.match(line)
+            if not m or m.group(1) != fn_name:
+                continue
+            body, body_start = extract_function_body(lines, i)
+            if not body:
+                continue
+            entries.append(EntryPoint(
+                name=fn_name, file=fpath, line=i + 1,
+                body_lines=body, body_first_line=body_start,
+            ))
+            break
+
+    return entries
+
+
+# ---------------------------------------------------------------------------
+# Step 3: per-entry slab-identifier tracking + access walk
+# ---------------------------------------------------------------------------
+
+# Matches `const X = expr;` or `var X = expr;` (single-ident declarations).
+DECL_RE = re.compile(
+    r"""^\s*(?:const|var)\s+(\w+)\s*(?::\s*([^=]+?))?\s*=\s*(.+?);\s*$"""
+)
+# Matches `fn foo(name: type, name: type)` — we parse the `()` group.
+PARAMS_RE = re.compile(r"\(([^)]*)\)")
+
+# scheduler / sched prefix + either currentThread or currentProc, optional `.?`
+CURRENT_RE = re.compile(r"\b(?:scheduler|sched)\.(currentThread|currentProc)\s*\(\s*\)\s*(\.\?)?")
+
+# Helpers with well-known slab-pointer return types. Extend as needed.
+SLAB_RETURN_HELPERS: dict[str, str] = {
+    "lookupThread": "Thread",                       # kernel/syscall/pmu.zig
+    # `proc.acquireThreadRef(h)` returns `?struct{ entry, thread: *Thread }`.
+    # We handle that via the `.thread` extraction on the result struct.
+}
+
+# Methods on non-slab host types that return a slab pointer. Looked up
+# on the FINAL method call in a chain, e.g. `thread.process.vmm.findNode(...)`.
+# The host type is ignored — we just match the method name at call time.
+SLAB_RETURN_METHODS: dict[str, str] = {
+    "findNode": "VmNode",
+}
+
+# Names whose result type is NOT a slab pointer, even when the name
+# string looks suggestive.
+COMPARISON_OPS = re.compile(r"==|!=|<=|>=|<(?![-=])|>(?![-=])")
+
+
+def param_types_from_header(header_line: str) -> list[tuple[str, str]]:
+    """Return list of (param_name, param_type_string) from `fn(...)` header."""
+    m = PARAMS_RE.search(header_line)
+    if not m:
+        return []
+    group = m.group(1)
+    out: list[tuple[str, str]] = []
+    # split on commas at depth 0
+    depth = 0
+    buf = ""
+    for ch in group:
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            depth -= 1
+        if ch == "," and depth == 0:
+            if buf.strip():
+                out.append(_split_param(buf))
+            buf = ""
+        else:
+            buf += ch
+    if buf.strip():
+        out.append(_split_param(buf))
+    return out
+
+
+def _split_param(s: str) -> tuple[str, str]:
+    # "name: type"
+    parts = s.split(":", 1)
+    if len(parts) != 2:
+        return (s.strip(), "")
+    return (parts[0].strip(), parts[1].strip())
+
+
+def parse_type_ref(type_str: str) -> str | None:
+    """
+    Extract the trailing type name from a type string like `*Process`,
+    `?*Process`, `*const Thread`, etc. Returns None if the type is not
+    a pointer-like reference.
+    """
+    t = type_str.strip()
+    # Strip optional `?`
+    if t.startswith("?"):
+        t = t[1:].strip()
+    if not t.startswith("*"):
+        return None
+    t = t[1:].strip()
+    if t.startswith("const "):
+        t = t[len("const "):].strip()
+    # Simple trailing identifier
+    m = re.match(r"(\w+)", t)
+    if not m:
+        return None
+    return m.group(1)
+
+
+def _strip_postfix(s: str) -> str:
+    """Remove trailing `orelse ...`, `.?`, `catch ...`, parenthesized casts."""
+    # chop off `orelse ...`
+    for kw in (" orelse ", " catch "):
+        idx = s.find(kw)
+        if idx != -1:
+            s = s[:idx]
+    s = s.strip()
+    # chop trailing `.?`
+    while s.endswith(".?"):
+        s = s[:-2].strip()
+    # chop surrounding parens
+    while s.startswith("(") and s.endswith(")"):
+        s = s[1:-1].strip()
+    return s
+
+
+def _leading_chain(s: str) -> list[str] | None:
+    """
+    If s starts with `A.b.c...` (optionally followed by `.?` tails) and
+    nothing else, return the chain [A, b, c, ...]. Returns None if the
+    expression contains any operators, calls, subscripts, or other
+    tokens after the chain.
+    """
+    m = re.match(r"^(\w+(?:\.\w+)*)\s*$", s.rstrip(";").strip())
+    if not m:
+        return None
+    return m.group(1).split(".")
+
+
+def infer_rhs_type(
+    rhs: str,
+    env: dict[str, str],
+    slab_types: set[str],
+) -> str | None:
+    """
+    Given the right-hand side of a decl, try to produce a slab-type name.
+    Returns None if unknown / not a slab reference.
+
+    We deliberately keep this conservative — a wrong positive here makes
+    the tool flag a non-slab ident and drown real findings in noise.
+    """
+    s = rhs.strip().rstrip(";").strip()
+
+    # Comparison expressions are always bool.
+    if COMPARISON_OPS.search(s):
+        return None
+
+    s = _strip_postfix(s)
+
+    # `scheduler.currentThread().?` / `scheduler.currentProc()` — at end
+    # of the expression with no further trailing chain.
+    m = re.fullmatch(r"(?:scheduler|sched)\.(currentThread|currentProc)\s*\(\s*\)", s)
+    if m:
+        return "Thread" if m.group(1) == "currentThread" else "Process"
+
+    # `<helper>(args)` — exactly a call, nothing trailing.
+    m = re.fullmatch(r"(\w+)\s*\(.*\)", s)
+    if m and m.group(1) in SLAB_RETURN_HELPERS:
+        return SLAB_RETURN_HELPERS[m.group(1)]
+
+    # `<prefix>.<method>(args)` where method is a known slab-returning
+    # method. We accept any chain prefix.
+    m = re.fullmatch(r"[\w.]*?\.(\w+)\s*\(.*\)", s)
+    if m and m.group(1) in SLAB_RETURN_METHODS:
+        return SLAB_RETURN_METHODS[m.group(1)]
+
+    # `<entry>.object.<variant>` — exactly, nothing trailing. This is
+    # the kernel's KernelObject-union extraction idiom.
+    m = re.fullmatch(r"\w+\.object\.(\w+)", s)
+    if m:
+        variant = m.group(1)
+        if variant in UNION_VARIANT_TYPES:
+            return UNION_VARIANT_TYPES[variant]
+
+    # `<ident>.<variant>` where variant is a known union tag name, and
+    # ident is NOT itself a slab ident (so we're reading into a
+    # pinned-struct / KernelObject union / etc). Exactly — nothing else.
+    m = re.fullmatch(r"(\w+)\.(thread|process|vm|shared_memory|device_region|dead_process)", s)
+    if m:
+        head = m.group(1)
+        if env.get(head) not in slab_types:
+            return UNION_VARIANT_TYPES.get(m.group(2))
+
+    # `<slab-ident>.field.field...` — chase DEFAULT_FIELD_CHAINS. Only
+    # if the WHOLE expression is a bare chain (no calls, no subscripts).
+    chain = _leading_chain(s)
+    if chain:
+        head = chain[0]
+        ty = env.get(head)
+        if ty is not None:
+            for fld in chain[1:]:
+                nxt = DEFAULT_FIELD_CHAINS.get((ty, fld))
+                if nxt is None:
+                    ty = None
+                    break
+                ty = nxt
+            if ty in slab_types:
+                return ty
+            # Also: the union variant on a KernelObject-typed field.
+            if chain[-1] in UNION_VARIANT_TYPES and ty is None:
+                return None  # can't resolve without full union typing
+
+    # Bare ident: inherit.
+    m = re.fullmatch(r"(\w+)", s)
+    if m and m.group(1) in env:
+        return env[m.group(1)]
+
+    return None
+
+
+MAX_INLINE_DEPTH = 6
+
+# Method names on `std.atomic.Value(T)` / `std.atomic.Atomic(T)`. If a
+# slab-field access is followed by one of these, the access is the
+# receiver of an atomic op — not a plain load/store — and the atomic is
+# its own synchronization. Structural detection, not a whitelist.
+ATOMIC_METHOD_RE = re.compile(
+    r"^\s*\.\s*(?:"
+    r"load|store|cmpxchg(?:Weak|Strong)|swap|exchange|"
+    r"fetch(?:Add|Sub|Or|And|Xor|Min|Max)|"
+    r"bit(?:Set|Reset|Toggle)|raw"
+    r")\s*\("
+)
+
+# Zig atomic builtins that take `&<addr>` of a field. An access enclosed
+# in one of these calls is an atomic op.
+ATOMIC_BUILTIN_CALL_RE = re.compile(
+    r"@(?:atomicLoad|atomicStore|atomicRmw|cmpxchgWeak|cmpxchgStrong|fence)\s*\("
+)
+
+
+def _atomic_call_spans(line: str) -> list[tuple[int, int]]:
+    """Find [start, end) spans of @atomic...(...) / @cmpxchg...(...) calls.
+    End is one past the matching close paren (best-effort bracket match)."""
+    spans: list[tuple[int, int]] = []
+    for m in ATOMIC_BUILTIN_CALL_RE.finditer(line):
+        depth = 0
+        end = m.end() - 1  # position of the `(`
+        for i in range(end, len(line)):
+            c = line[i]
+            if c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+        spans.append((m.start(), end))
+    return spans
+
+
+def _join_multiline_decl(body_lines: list[str], rel: int) -> str:
+    """If `body_lines[rel]` starts a decl that doesn't close with `;`, peek
+    forward until we see the terminator."""
+    code = strip_comments(body_lines[rel])
+    joined = code
+    if re.match(r"^\s*(?:const|var)\s+\w+", code) and not code.rstrip().endswith(";"):
+        look = rel + 1
+        while look < len(body_lines):
+            joined += " " + strip_comments(body_lines[look]).strip()
+            if joined.rstrip().endswith(";"):
+                break
+            look += 1
+    return joined
+
+
+def _walk_body(
+    body_lines: list[str],
+    body_first_line: int,
+    src_file: Path,
+    env: dict[str, str],
+    self_alive: set[str],
+    slab_types: set[str],
+    fn_index: dict[tuple[str, str], FnInfo],
+    accesses: dict[str, list[Access]],
+    lock_ops: list[LockOp],
+    synth_counter: list[int],
+    visited: frozenset[tuple[str, str]],
+    depth: int,
+    call_stack: list[str],
+) -> None:
+    """Walk one fn body's lines, emitting accesses/lock_ops and recursing
+    into resolvable method calls on slab idents.
+
+    env / self_alive are MUTATED for entry-level bodies (we want decls to
+    persist forward). Callee recursion uses forked copies so changes in
+    inlined method bodies don't leak back to the caller's scope.
+    """
+    for rel, raw_line in enumerate(body_lines):
+        src_line = body_first_line + rel
+        synth_counter[0] += 1
+        synth = synth_counter[0]
+        code = strip_comments(raw_line)
+
+        # Decl → grow env (& self_alive where applicable).
+        joined = _join_multiline_decl(body_lines, rel)
+        m = DECL_RE.match(joined)
+        if m:
+            name = m.group(1)
+            ann = (m.group(2) or "").strip()
+            rhs = m.group(3)
+            resolved = None
+            if ann:
+                ty = parse_type_ref(ann)
+                if ty and ty in slab_types:
+                    resolved = ty
+            if not resolved:
+                ty = infer_rhs_type(rhs, env, slab_types)
+                if ty and ty in slab_types:
+                    resolved = ty
+            if resolved:
+                env[name] = resolved
+                for helper in SELF_ALIVE_HELPERS:
+                    if re.search(rf"\b{helper}\s*\(", rhs):
+                        self_alive.add(name)
+                        break
+                else:
+                    chain = _leading_chain(rhs.strip().rstrip(";").strip())
+                    if chain and chain[0] in self_alive:
+                        self_alive.add(name)
+
+        # Lock / unlock / defer-unlock ops on slab idents.
+        for m_lock in re.finditer(
+            r"\b(\w+)\._gen_lock\.(lock|unlock|lockWithGen)\b", code
+        ):
+            ident, op = m_lock.group(1), m_lock.group(2)
+            if ident not in env:
+                continue
+            is_defer = bool(re.search(
+                rf"\bdefer\s+{re.escape(ident)}\._gen_lock\.", code
+            ))
+            lock_ops.append(LockOp(
+                line_no=synth,
+                ident=ident,
+                op=("defer-unlock" if (is_defer and op == "unlock") else op),
+                raw=code.strip(),
+                src_file=src_file,
+                src_line=src_line,
+            ))
+
+        # Collect every `<ident>.<tail>` on this line, separating METHOD
+        # CALLS (tail immediately followed by `(`) from FIELD ACCESSES.
+        #
+        # For field accesses we record an Access unless the access is the
+        # receiver of an atomic op (`x.field.fetchAdd(...)`, `x.field.load(...)`)
+        # or sits inside a `@atomicLoad/@atomicStore/@atomicRmw/@cmpxchg*/@fence`
+        # call — those are atomic primitives and synchronize themselves.
+        # For method calls we try to inline the callee's body so its
+        # inner accesses/locks roll up into this entry's trace.
+        atomic_call_spans = _atomic_call_spans(code)
+        access_spans: list[tuple[int, int, str, str]] = []
+        call_spans: list[tuple[int, int, str, str]] = []
+        for m_tok in re.finditer(r"\b(\w+)(?:\.\?)?\.(\w+)", code):
+            ident, tail = m_tok.group(1), m_tok.group(2)
+            if ident not in env:
+                continue
+            if tail == "_gen_lock":
+                continue
+            # Is this access inside an atomic-builtin call span?
+            if any(sp[0] <= m_tok.start() < sp[1] for sp in atomic_call_spans):
+                continue
+            after = code[m_tok.end():]
+            # Atomic method op (receiver is the `tail` field of a slab obj)
+            if ATOMIC_METHOD_RE.match(after):
+                continue
+            if re.match(r"\s*\(", after):
+                call_spans.append((m_tok.start(), m_tok.end(), ident, tail))
+            else:
+                access_spans.append((m_tok.start(), m_tok.end(), ident, tail))
+
+        for start, _end, ident, tail in access_spans:
+            accesses.setdefault(ident, []).append(Access(
+                line_no=synth,
+                col=start,
+                ident=ident,
+                tail=tail,
+                raw=code.strip(),
+                slab_type=env.get(ident, ""),
+                src_file=src_file,
+                src_line=src_line,
+            ))
+
+        # Inline method calls we can resolve, depth-limited.
+        for _start, _end, ident, method in call_spans:
+            recv_ty = env.get(ident)
+            if recv_ty is None:
+                continue
+            key = (recv_ty, method)
+            fninfo = fn_index.get(key)
+            if fninfo is None:
+                # If we can't see the callee (imported helper, builtin,
+                # external crate), fall back to treating the call as a
+                # plain access so callers at least see it needs coverage.
+                accesses.setdefault(ident, []).append(Access(
+                    line_no=synth,
+                    col=_start,
+                    ident=ident,
+                    tail=method,
+                    raw=code.strip(),
+                    slab_type=recv_ty,
+                    src_file=src_file,
+                    src_line=src_line,
+                ))
+                continue
+            if depth >= MAX_INLINE_DEPTH or key in visited:
+                continue
+            # Substitute first-param name → caller ident throughout the
+            # callee's body. Whole-word replacement.
+            self_name = fninfo.first_param
+            if self_name:
+                subbed = [
+                    re.sub(rf"\b{re.escape(self_name)}\b", ident, ln)
+                    for ln in fninfo.body_lines
+                ]
+            else:
+                subbed = list(fninfo.body_lines)
+            sub_env = dict(env)
+            sub_env[ident] = recv_ty
+            sub_self_alive = set(self_alive)
+            _walk_body(
+                subbed,
+                fninfo.body_first_line,
+                fninfo.file,
+                sub_env,
+                sub_self_alive,
+                slab_types,
+                fn_index,
+                accesses,
+                lock_ops,
+                synth_counter,
+                visited | {key},
+                depth + 1,
+                call_stack + [f"{recv_ty}.{method}"],
+            )
+
+
+def analyze_entry(
+    entry: EntryPoint,
+    slab_types: set[str],
+    fn_index: dict[tuple[str, str], FnInfo],
+) -> tuple[dict[str, list[Access]], list[LockOp], dict[str, str], set[str], list[Finding]]:
+    """Entry wrapper around `_walk_body`. Seeds env from the fn header and
+    threads an empty inlining stack."""
+    file_lines = entry.file.read_text().splitlines()
+    header = file_lines[entry.line - 1]
+    concat = header
+    idx = entry.line - 1
+    while "{" not in concat and idx + 1 < len(file_lines):
+        idx += 1
+        concat += " " + file_lines[idx]
+    env: dict[str, str] = {}
+    self_alive: set[str] = set()
+    for pname, ptype in param_types_from_header(concat):
+        ty = parse_type_ref(ptype)
+        if ty and ty in slab_types:
+            env[pname] = ty
+
+    accesses: dict[str, list[Access]] = {}
+    lock_ops: list[LockOp] = []
+    findings: list[Finding] = []
+
+    _walk_body(
+        entry.body_lines,
+        entry.body_first_line,
+        entry.file,
+        env,
+        self_alive,
+        slab_types,
+        fn_index,
+        accesses,
+        lock_ops,
+        synth_counter=[0],
+        visited=frozenset(),
+        depth=0,
+        call_stack=[],
+    )
+
+    return accesses, lock_ops, env, self_alive, findings
+
+
+# ---------------------------------------------------------------------------
+# Step 4: rule evaluation
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CheckResult:
+    entry: EntryPoint
+    env: dict[str, str]
+    accesses: dict[str, list[Access]]
+    lock_ops: list[LockOp]
+    findings: list[Finding]
+    self_alive: set[str] = field(default_factory=set)
+
+
+def bracket_check(res: CheckResult) -> None:
+    """
+    For each slab ident with ≥1 access, verify bracketing:
+      1. Some lock/lockWithGen on this ident exists in the function, OR
+         a `defer <ident>._gen_lock.unlock()` appears above the first
+         access (paired with an earlier lock).
+      2. The line immediately preceding the FIRST access is one of:
+         - <ident>._gen_lock.lock()
+         - <ident>._gen_lock.lockWithGen(...)
+         - defer <ident>._gen_lock.unlock()   (accepting the classic
+           2-line pair: lock on line N, defer-unlock on N+1, first
+           access on N+2)
+      3. The line immediately following the LAST access is one of:
+         - <ident>._gen_lock.unlock()
+      3b. OR the last access is already at/near end of a scope and a
+          `defer <ident>._gen_lock.unlock()` covers it.
+    Findings recorded into res.findings.
+    """
+    for ident, accs in res.accesses.items():
+        if not accs:
+            continue
+        # Self-alive idents (derived from scheduler.currentThread() /
+        # currentProc()) don't need gen-lock coverage: the caller IS this
+        # thread/proc, so the slot cannot be freed out from under us.
+        if ident in res.self_alive:
+            continue
+        # Pick the slab type from the first access's recorded binding
+        # (callee-local idents have type context but aren't in res.env).
+        slab_ty = accs[0].slab_type or res.env.get(ident, "?")
+        # Deduplicate per-line (multiple accesses on same line are OK).
+        lines = sorted({a.line_no for a in accs})
+        first = lines[0]
+        last = lines[-1]
+
+        ident_lock_ops = [op for op in res.lock_ops if op.ident == ident]
+        if not ident_lock_ops:
+            res.findings.append(Finding(
+                severity="err",
+                entry=res.entry.name,
+                message=f"{ident} ({slab_ty}): {len(accs)} access(es) on lines {lines} but no gen-lock op on this ident at all",
+                line_no=first,
+            ))
+            continue
+
+        # Check acquire immediately before first access.
+        acq_ok = False
+        for op in ident_lock_ops:
+            if op.op in ("lock", "lockWithGen") and op.line_no == first - 1:
+                acq_ok = True
+                break
+            if op.op == "defer-unlock" and op.line_no == first - 1:
+                # accept if the preceding line is a lock on same ident
+                for op2 in ident_lock_ops:
+                    if op2.op in ("lock", "lockWithGen") and op2.line_no == first - 2:
+                        acq_ok = True
+                        break
+                break
+        if not acq_ok:
+            # Record which lock op is closest BEFORE first access.
+            candidates = [op for op in ident_lock_ops
+                          if op.op in ("lock", "lockWithGen") and op.line_no < first]
+            nearest = max((op.line_no for op in candidates), default=None)
+            gap = (first - nearest) if nearest is not None else None
+            res.findings.append(Finding(
+                severity="err",
+                entry=res.entry.name,
+                message=(
+                    f"{ident} ({slab_ty}): first access at L{first} "
+                    f"not tight-preceded by lock (nearest acquire L{nearest}, gap={gap})"
+                ),
+                line_no=first,
+            ))
+
+        # Check release immediately after last access.
+        rel_ok = False
+        for op in ident_lock_ops:
+            if op.op == "unlock" and op.line_no == last + 1:
+                rel_ok = True
+                break
+        if not rel_ok:
+            # Accept `defer <ident>._gen_lock.unlock()` if there's NO
+            # access after the defer's scope exit — approximated here
+            # as: defer present *before* first access, AND no other
+            # access after last. We've already bounded `last`, so we
+            # just need to see a defer-unlock earlier than last.
+            has_defer = any(
+                op.op == "defer-unlock" and op.line_no <= last
+                for op in ident_lock_ops
+            )
+            if has_defer:
+                # Accept, but note it for review.
+                res.findings.append(Finding(
+                    severity="info",
+                    entry=res.entry.name,
+                    message=(
+                        f"{ident} ({slab_ty}): last access L{last} relies on "
+                        f"defer-unlock (no explicit unlock on L{last + 1})"
+                    ),
+                    line_no=last,
+                ))
+            else:
+                candidates = [op for op in ident_lock_ops
+                              if op.op == "unlock" and op.line_no > last]
+                nearest = min((op.line_no for op in candidates), default=None)
+                gap = (nearest - last) if nearest is not None else None
+                res.findings.append(Finding(
+                    severity="err",
+                    entry=res.entry.name,
+                    message=(
+                        f"{ident} ({slab_ty}): last access at L{last} "
+                        f"not tight-followed by unlock (nearest release L{nearest}, gap={gap})"
+                    ),
+                    line_no=last,
+                ))
+
+
+# ---------------------------------------------------------------------------
+# Reporting
+# ---------------------------------------------------------------------------
+
+def print_entry(res: CheckResult, verbose: bool) -> None:
+    entry = res.entry
+    rel = entry.file.relative_to(REPO_ROOT)
+    print(f"\n=== {entry.name}  [{rel}:{entry.line}]")
+    if not res.env:
+        print("    (no slab-typed idents tracked)")
+        return
+    print(f"    tracked: {', '.join(f'{k}:{v}' for k, v in res.env.items())}")
+    if verbose:
+        for ident, accs in res.accesses.items():
+            lines = sorted({a.line_no for a in accs})
+            tails = sorted({a.tail for a in accs})
+            print(f"      {ident} accesses on L{lines[0]}..L{lines[-1]} "
+                  f"({len(accs)} refs; fields: {', '.join(tails)})")
+        for op in res.lock_ops:
+            print(f"      lock-op L{op.line_no}: {op.ident}.{op.op}")
+    for f in res.findings:
+        tag = {"err": "[ERR ]", "warn": "[WARN]", "info": "[INFO]"}[f.severity]
+        print(f"    {tag} L{f.line_no}: {f.message}")
+
+
+def build_method_index(
+    slab_types: set[str],
+) -> dict[tuple[str, str], FnInfo]:
+    """Scan all kernel .zig files for fn definitions and index them by
+    (receiver_type, fn_name). Receiver is identified as the first parameter
+    whose declared type resolves (via `parse_type_ref`) to a slab-backed
+    type name. Ambiguity — multiple fns of the same (T, name) across arch
+    variants — is handled by first-seen-wins; callers concerned about
+    arch-specific divergence should run the tool twice with each arch's
+    dispatch path in scope.
+    """
+    idx: dict[tuple[str, str], FnInfo] = {}
+    fn_hdr = re.compile(r"^\s*(?:pub\s+)?fn\s+(\w+)\s*\(")
+    for fpath in iter_zig_files(KERNEL_DIR):
+        try:
+            lines = fpath.read_text().splitlines()
+        except Exception:
+            continue
+        for i, line in enumerate(lines):
+            m = fn_hdr.match(line)
+            if not m:
+                continue
+            fname = m.group(1)
+            # Join header across lines to get full param list.
+            concat = line
+            j = i
+            while "{" not in concat and j + 1 < len(lines):
+                j += 1
+                concat += " " + lines[j]
+            params = param_types_from_header(concat)
+            if not params:
+                continue
+            first_pname, first_ptype = params[0]
+            recv = parse_type_ref(first_ptype)
+            if recv not in slab_types:
+                continue
+            body, body_start = extract_function_body(lines, i)
+            if not body:
+                continue
+            key = (recv, fname)
+            if key in idx:
+                continue
+            idx[key] = FnInfo(
+                file=fpath,
+                line=i + 1,
+                first_param=first_pname,
+                other_params=params[1:],
+                body_lines=body,
+                body_first_line=body_start,
+                receiver_type=recv,
+            )
+    return idx
+
+
+def main() -> int:
+    p = argparse.ArgumentParser()
+    p.add_argument("--summary", action="store_true",
+                   help="one line per entry with finding counts")
+    p.add_argument("--entry", default=None,
+                   help="drill into a single entry by name")
+    p.add_argument("--verbose", "-v", action="store_true",
+                   help="print per-ident access/lock summary")
+    p.add_argument("--list-slab-types", action="store_true")
+    p.add_argument("--list-methods", action="store_true",
+                   help="dump discovered (receiver, method) pairs")
+    args = p.parse_args()
+
+    slab_types = find_slab_types()
+    slab_names = set(slab_types.keys())
+    if args.list_slab_types:
+        print("Slab-backed types:")
+        for name, st in sorted(slab_types.items()):
+            rel = st.file.relative_to(REPO_ROOT)
+            print(f"  {name:20s} {rel}:{st.line}")
+        return 0
+
+    fn_index = build_method_index(slab_names)
+    if args.list_methods:
+        print(f"Methods on slab-backed types ({len(fn_index)}):")
+        for (recv, name), info in sorted(fn_index.items()):
+            rel = info.file.relative_to(REPO_ROOT)
+            print(f"  {recv}.{name:30s} {rel}:{info.line}")
+        return 0
+
+    entries = find_entry_points()
+    if args.entry:
+        entries = [e for e in entries if e.name == args.entry]
+        if not entries:
+            print(f"no entry matching {args.entry!r}", file=sys.stderr)
+            return 2
+
+    results: list[CheckResult] = []
+    for entry in entries:
+        accesses, lock_ops, env, self_alive, findings = analyze_entry(
+            entry, slab_names, fn_index
+        )
+        res = CheckResult(entry=entry, env=env, accesses=accesses,
+                          lock_ops=lock_ops, findings=list(findings),
+                          self_alive=self_alive)
+        bracket_check(res)
+        results.append(res)
+
+    results.sort(key=lambda r: (str(r.entry.file), r.entry.line))
+
+    total_errs = 0
+    total_infos = 0
+    total_tracked = 0
+    for res in results:
+        errs = sum(1 for f in res.findings if f.severity == "err")
+        infos = sum(1 for f in res.findings if f.severity == "info")
+        total_errs += errs
+        total_infos += infos
+        total_tracked += len(res.env)
+        if args.summary:
+            if res.env or errs or infos:
+                rel = res.entry.file.relative_to(REPO_ROOT)
+                print(f"{res.entry.name:32s}  tracked={len(res.env):2d}  err={errs:2d}  info={infos:2d}  [{rel}:{res.entry.line}]")
+        else:
+            print_entry(res, args.verbose)
+
+    print()
+    print(f"Summary: {len(results)} entries, {total_tracked} tracked idents, "
+          f"{total_errs} err, {total_infos} info")
+    print(f"         {len(slab_types)} slab-backed types discovered")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
