@@ -167,7 +167,6 @@ pub fn vmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContext, vm_handle: 
     const E_AGAIN: i64 = -9;
 
     const vm_obj = resolveVmHandle(proc, vm_handle) orelse return .{ .ret = E_BADCAP };
-    const box = vm_obj.exitBox();
 
     if (buf_ptr == 0) return .{ .ret = E_BADADDR };
     if (!zag.memory.address.AddrSpacePartition.user.contains(buf_ptr)) return .{ .ret = E_BADADDR };
@@ -189,17 +188,21 @@ pub fn vmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContext, vm_handle: 
         prefault_va += paging.PAGE4K;
     }
 
+    vm_obj._gen_lock.lock();
+    const box = vm_obj.exitBox();
     box.lock.lock();
 
     // Try to dequeue an exited vCPU
     if (box.queue.dequeue()) |exited_thread| {
         box.lock.unlock();
+        vm_obj._gen_lock.unlock();
         const result = deliverExitMessage(proc, vm_obj, exited_thread, buf_ptr);
         return .{ .ret = result };
     }
 
     if (!blocking) {
         box.lock.unlock();
+        vm_obj._gen_lock.unlock();
         return .{ .ret = E_AGAIN };
     }
 
@@ -209,9 +212,12 @@ pub fn vmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContext, vm_handle: 
     box.receiver = thread;
     box.state = .receiving;
     box.lock.unlock();
+    vm_obj._gen_lock.unlock();
 
+    thread._gen_lock.lock();
     thread.state = .blocked;
     thread.ctx = ctx;
+    thread._gen_lock.unlock();
     thread.on_cpu.store(false, .release);
     sched.switchToNextReady();
     unreachable;
