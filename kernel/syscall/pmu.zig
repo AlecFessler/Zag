@@ -133,8 +133,8 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     const slice = readConfigs(proc, configs_ptr, count, &configs) catch |err| return configErrToCode(err);
 
     const target_proc = target_thread.process;
-    target_proc.lock.lock();
-    defer target_proc.lock.unlock();
+    target_proc._gen_lock.lock();
+    defer target_proc._gen_lock.unlock();
 
     // Self vs. remote programming. Writing MSRs on the caller's core only
     // makes sense if the caller *is* the target — otherwise we'd trash the
@@ -177,8 +177,8 @@ pub fn sysPmuRead(proc: *Process, thread_handle: u64, sample_ptr: u64) i64 {
     defer target_thread.releaseRef();
 
     const target_proc = target_thread.process;
-    target_proc.lock.lock();
-    defer target_proc.lock.unlock();
+    target_proc._gen_lock.lock();
+    defer target_proc._gen_lock.unlock();
 
     // §2.14.11 / §4.52.5: only .faulted or .suspended is legal.
     switch (target_thread.state) {
@@ -209,8 +209,8 @@ pub fn sysPmuReset(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     const slice = readConfigs(proc, configs_ptr, count, &configs) catch |err| return configErrToCode(err);
 
     const target_proc = target_thread.process;
-    target_proc.lock.lock();
-    defer target_proc.lock.unlock();
+    target_proc._gen_lock.lock();
+    defer target_proc._gen_lock.unlock();
 
     // §4.53.5: only .faulted is valid.
     if (target_thread.state != .faulted) return E_INVAL;
@@ -238,8 +238,8 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
     defer target_thread.releaseRef();
 
     const target_proc = target_thread.process;
-    target_proc.lock.lock();
-    defer target_proc.lock.unlock();
+    target_proc._gen_lock.lock();
+    defer target_proc._gen_lock.unlock();
 
     // Self vs. remote: only touch hardware on the caller's core if the
     // caller IS the target. Otherwise, the target isn't running here —

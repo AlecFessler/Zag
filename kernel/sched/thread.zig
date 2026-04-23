@@ -177,7 +177,7 @@ pub const Thread = struct {
             if (proc.vm) |vm_obj| {
                 // Check if all remaining threads are vCPU threads.
                 var all_vcpu = true;
-                proc.lock.lock();
+                proc._gen_lock.lock();
                 const remaining = proc.threads[0..proc.num_threads];
                 for (remaining) |t| {
                     if (!arch.vm.threadIsVcpu(vm_obj, t)) {
@@ -185,7 +185,7 @@ pub const Thread = struct {
                         break;
                     }
                 }
-                proc.lock.unlock();
+                proc._gen_lock.unlock();
 
                 if (all_vcpu) {
                     // Destroy the VM — marks all vCPU threads as exited and
@@ -195,14 +195,14 @@ pub const Thread = struct {
                     // Deinit the vCPU threads. Each deinit calls removeThread;
                     // the last one triggers lastThreadExited -> process exit.
                     // Snapshot the list since deinit mutates it.
-                    proc.lock.lock();
+                    proc._gen_lock.lock();
                     var vcpu_threads: [Process.MAX_THREADS]*Thread = undefined;
                     var num_vcpu: u32 = 0;
                     for (proc.threads[0..proc.num_threads]) |t| {
                         vcpu_threads[num_vcpu] = t;
                         num_vcpu += 1;
                     }
-                    proc.lock.unlock();
+                    proc._gen_lock.unlock();
 
                     for (vcpu_threads[0..num_vcpu]) |t| {
                         t.deinit();
@@ -256,8 +256,8 @@ pub const Thread = struct {
         const entry_fn: *const fn () void = @ptrFromInt(entry.addr);
         thread.ctx = arch.cpu.prepareThreadContext(kstack_top, ustack_top, entry_fn, arg);
 
-        proc.lock.lock();
-        defer proc.lock.unlock();
+        proc._gen_lock.lock();
+        defer proc._gen_lock.unlock();
 
         if (proc.num_threads >= Process.MAX_THREADS) return error.MaxThreads;
         thread.slot_index = @intCast(proc.num_threads);

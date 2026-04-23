@@ -116,7 +116,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                 // (which protects fault_handler_proc per process.zig:87),
                 // nested with perm_lock for the slot-0 bit write.
                 if (granted_phr.fault_handler) {
-                    sender_proc.lock.lock();
+                    sender_proc._gen_lock.lock();
                     sender_proc.fault_handler_proc = target_proc;
                     sender_proc.perm_lock.lock();
                     const self_rights = sender_proc.perm_table[0].processRights();
@@ -126,7 +126,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                     sender_proc.perm_table[0].rights = @bitCast(new_rights);
                     sender_proc.syncUserView();
                     sender_proc.perm_lock.unlock();
-                    sender_proc.lock.unlock();
+                    sender_proc._gen_lock.unlock();
 
                     // Link sender into target's fault_handler_targets list
                     // so target's death can revert sender to self-handling.
@@ -136,7 +136,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                     // restore sender's slot-0 fault_handler bit and clear
                     // fault_handler_proc so sender goes back to self-handling.
                     if (!target_proc.linkFaultHandlerTarget(sender_proc)) {
-                        sender_proc.lock.lock();
+                        sender_proc._gen_lock.lock();
                         sender_proc.fault_handler_proc = null;
                         sender_proc.perm_lock.lock();
                         const r = sender_proc.perm_table[0].processRights();
@@ -145,7 +145,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                         sender_proc.perm_table[0].rights = @bitCast(rr);
                         sender_proc.syncUserView();
                         sender_proc.perm_lock.unlock();
-                        sender_proc.lock.unlock();
+                        sender_proc._gen_lock.unlock();
                         return E_INVAL;
                     }
 
@@ -193,7 +193,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                             //    linkFaultHandlerTarget-failure rollback
                             //    above: under sender_proc.lock nested with
                             //    perm_lock.
-                            sender_proc.lock.lock();
+                            sender_proc._gen_lock.lock();
                             sender_proc.fault_handler_proc = null;
                             sender_proc.perm_lock.lock();
                             var rb_rights = sender_proc.perm_table[0].processRights();
@@ -210,7 +210,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                                 sender_proc.syncUserView();
                             }
                             sender_proc.perm_lock.unlock();
-                            sender_proc.lock.unlock();
+                            sender_proc._gen_lock.unlock();
                             return E_MAXCAP;
                         };
                     }
@@ -218,11 +218,11 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                     // Snapshot the sender's thread list under sender_proc.lock,
                     // then release the lock before walking it (insertThreadHandle
                     // takes target_proc.perm_lock and we don't want to nest).
-                    sender_proc.lock.lock();
+                    sender_proc._gen_lock.lock();
                     const num_threads = sender_proc.num_threads;
                     var threads_copy: [Process.MAX_THREADS]*Thread = undefined;
                     @memcpy(threads_copy[0..num_threads], sender_proc.threads[0..num_threads]);
-                    sender_proc.lock.unlock();
+                    sender_proc._gen_lock.unlock();
 
                     for (threads_copy[0..num_threads]) |t| {
                         _ = target_proc.insertThreadHandle(t, ThreadHandleRights.full) catch {};

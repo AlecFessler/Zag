@@ -63,7 +63,6 @@ pub const Process = struct {
     num_threads: u64,
     children: [MAX_CHILDREN]*Process,
     num_children: u64,
-    lock: SpinLock,
     perm_table: [MAX_PERMS]PermissionEntry,
     perm_count: u32,
     perm_lock: SpinLock,
@@ -283,7 +282,7 @@ pub const Process = struct {
         //   can recv them. Their state stays .faulted.
         // - If after re-eval no thread is alive (all .faulted), kill the
         //   process per §2.12.9.
-        target.lock.lock();
+        target._gen_lock.lock();
         var resume_buf: [MAX_THREADS]*Thread = undefined;
         var resume_n: usize = 0;
         var faulted_buf: [MAX_THREADS]*Thread = undefined;
@@ -304,7 +303,7 @@ pub const Process = struct {
         for (target.threads[0..target.num_threads]) |t| {
             if (t.state != .faulted and t.state != .exited) alive += 1;
         }
-        target.lock.unlock();
+        target._gen_lock.unlock();
 
         for (resume_buf[0..resume_n]) |t| {
             const target_core = if (t.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
@@ -343,8 +342,8 @@ pub const Process = struct {
     /// serializes us with kill() which transitions alive→false under the
     /// same lock.
     pub fn linkFaultHandlerTarget(self: *Process, target: *Process) bool {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self._gen_lock.lock();
+        defer self._gen_lock.unlock();
         if (!self.alive) return false;
         // Avoid double-link
         var cur = self.fault_handler_targets_head;
@@ -359,8 +358,8 @@ pub const Process = struct {
 
     /// Unlink a target from this handler's fault_handler_targets list.
     pub fn unlinkFaultHandlerTarget(self: *Process, target: *Process) void {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self._gen_lock.lock();
+        defer self._gen_lock.unlock();
         var prev: ?*Process = null;
         var cur = self.fault_handler_targets_head;
         while (cur) |c| {
@@ -523,7 +522,7 @@ pub const Process = struct {
             // Self-handling: §2.12.7 / §2.12.8 / §2.12.9. No stop-all — sibling
             // threads continue running so they can call fault_recv on our own
             // fault box.
-            self.lock.lock();
+            self._gen_lock.lock();
             // Count threads that are actually runnable and could call
             // fault_recv on our own box. §2.12.9 requires kill/restart if
             // there are no surviving receivers. `.exited` threads are gone,
@@ -547,12 +546,12 @@ pub const Process = struct {
                 // §2.12.7 / §2.12.9: no surviving thread to call fault_recv;
                 // the spec mandates immediate kill/restart with no message
                 // delivered.
-                self.lock.unlock();
+                self._gen_lock.unlock();
                 return false;
             }
             thread.state = .faulted;
             self.faulted_thread_slots |= @as(u64, 1) << @intCast(thread.slot_index);
-            self.lock.unlock();
+            self._gen_lock.unlock();
 
             // If a sibling is blocked on fault_recv, deliver directly into
             // its user buffer (the receiver cannot dequeue itself on
@@ -597,7 +596,7 @@ pub const Process = struct {
         // queues and IPI their cores after releasing proc.lock.
         var stopped: [MAX_THREADS]?*Thread = .{null} ** MAX_THREADS;
         var stopped_count: u32 = 0;
-        self.lock.lock();
+        self._gen_lock.lock();
         if (stop_all) {
             for (self.threads[0..self.num_threads]) |sib| {
                 if (sib == thread) continue;
@@ -611,7 +610,7 @@ pub const Process = struct {
         }
         thread.state = .faulted;
         self.faulted_thread_slots |= @as(u64, 1) << @intCast(thread.slot_index);
-        self.lock.unlock();
+        self._gen_lock.unlock();
 
         // Force-deschedule stopped siblings: remove from run queues
         // (in case they were .ready) and IPI cores where they are
@@ -738,8 +737,8 @@ pub const Process = struct {
     }
 
     pub fn removeChild(self: *Process, child: *Process) void {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self._gen_lock.lock();
+        defer self._gen_lock.unlock();
         for (self.children[0..self.num_children], 0..) |c, i| {
             if (c == child) {
                 self.num_children -= 1;
@@ -752,8 +751,8 @@ pub const Process = struct {
     }
 
     pub fn removeThread(self: *Process, thread: *Thread) bool {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self._gen_lock.lock();
+        defer self._gen_lock.unlock();
         for (self.threads[0..self.num_threads], 0..) |t, i| {
             if (t == thread) {
                 self.num_threads -= 1;
@@ -768,9 +767,9 @@ pub const Process = struct {
     }
 
     pub fn kill(self: *Process, reason: CrashReason) void {
-        self.lock.lock();
+        self._gen_lock.lock();
         if (!self.alive) {
-            self.lock.unlock();
+            self._gen_lock.unlock();
             return;
         }
         self.fault_reason = reason;
@@ -793,7 +792,7 @@ pub const Process = struct {
         }
         self.faulted_thread_slots = 0;
         self.suspended_thread_slots = 0;
-        self.lock.unlock();
+        self._gen_lock.unlock();
 
         // Remove blocked threads from external wait structures and deinit them.
         // Each deinit calls removeThread which decrements num_threads.
@@ -853,12 +852,12 @@ pub const Process = struct {
     }
 
     pub fn disableRestart(self: *Process) void {
-        self.lock.lock();
+        self._gen_lock.lock();
         if (self.restart_context) |*rc| {
             rc.deinit();
             self.restart_context = null;
         }
-        self.lock.unlock();
+        self._gen_lock.unlock();
 
         // §2.3.4: clear the restart bit from slot 0 of our own permission
         // table and publish to the user view so userspace observes that the
@@ -887,9 +886,9 @@ pub const Process = struct {
     }
 
     pub fn exit(self: *Process) void {
-        self.lock.lock();
+        self._gen_lock.lock();
         if (!self.alive) {
-            self.lock.unlock();
+            self._gen_lock.unlock();
             return;
         }
         if (self.fault_reason == .none) {
@@ -899,7 +898,7 @@ pub const Process = struct {
         if (!should_restart) {
             self.alive = false;
         }
-        self.lock.unlock();
+        self._gen_lock.unlock();
 
         if (should_restart) {
             self.performRestart();
@@ -1139,9 +1138,9 @@ pub const Process = struct {
         // §2.12.35: if we are a fault handler for other processes, revert
         // each target to self-handling before tearing down our perm table.
         while (true) {
-            self.lock.lock();
+            self._gen_lock.lock();
             const target = self.fault_handler_targets_head;
-            self.lock.unlock();
+            self._gen_lock.unlock();
             const t = target orelse break;
             // releaseFaultHandler unlinks t from our list, so loop terminates.
             self.releaseFaultHandler(t);
@@ -1335,32 +1334,44 @@ pub const Process = struct {
         var skip_cleanup = false;
         errdefer if (!skip_cleanup) slab_instance.destroy(proc, proc_alloc.gen) catch unreachable;
 
-        proc.* = .{
-            .pid = @atomicRmw(u64, &pid_counter, .Add, 1, .monotonic),
-            .parent = parent,
-            .alive = true,
-            .restart_context = null,
-            .addr_space_root = undefined,
-            .addr_space_id = 0,
-            .vmm = undefined,
-            .threads = undefined,
-            .num_threads = 0,
-            .children = undefined,
-            .num_children = 0,
-            .lock = .{},
-            .perm_table = undefined,
-            .perm_count = 0,
-            .perm_lock = .{},
-            .handle_counter = 1,
-            .perm_view_vaddr = VAddr.fromInt(0),
-            .perm_view_phys = PAddr.fromInt(0),
-            .dma_mappings = undefined,
-            .num_dma_mappings = 0,
-            .fault_reason = .none,
-            .restart_count = 0,
-            .thread_handle_rights = thr_rights,
-            .max_thread_priority = max_priority,
-        };
+        // Field-by-field init preserves `proc._gen_lock`, which the slab
+        // allocator just set to the freshly-advanced live gen. A whole-
+        // struct `proc.* = .{...}` would zero it.
+        proc.pid = @atomicRmw(u64, &pid_counter, .Add, 1, .monotonic);
+        proc.parent = parent;
+        proc.alive = true;
+        proc.restart_context = null;
+        proc.addr_space_root = undefined;
+        proc.addr_space_id = 0;
+        proc.vmm = undefined;
+        proc.threads = undefined;
+        proc.num_threads = 0;
+        proc.children = undefined;
+        proc.num_children = 0;
+        proc.perm_table = undefined;
+        proc.perm_count = 0;
+        proc.perm_lock = .{};
+        proc.handle_counter = 1;
+        proc.perm_view_vaddr = VAddr.fromInt(0);
+        proc.perm_view_phys = PAddr.fromInt(0);
+        proc.dma_mappings = undefined;
+        proc.num_dma_mappings = 0;
+        proc.msg_box = .{};
+        proc.fault_box = .{};
+        proc.fault_reason = .none;
+        proc.restart_count = 0;
+        proc.perm_view_gen = 0;
+        proc.handle_refcount = 0;
+        proc.cleanup_complete = false;
+        proc.fault_handler_proc = null;
+        proc.faulted_thread_slots = 0;
+        proc.suspended_thread_slots = 0;
+        proc.thread_handle_rights = thr_rights;
+        proc.max_thread_priority = max_priority;
+        proc.fault_handler_targets_head = null;
+        proc.fault_handler_targets_next = null;
+        proc.had_self_fault_handler = true;
+        proc.vm = null;
 
         const pmm_mgr = &pmm.global_pmm.?;
 
@@ -1427,8 +1438,8 @@ pub const Process = struct {
         proc.insertThreadHandleAtSlot(1, initial_thread, thr_rights);
 
         if (parent) |p| {
-            p.lock.lock();
-            defer p.lock.unlock();
+            p._gen_lock.lock();
+            defer p._gen_lock.unlock();
             if (p.num_children >= MAX_CHILDREN) {
                 // INVARIANT: `proc` has been allocated and its initial
                 // thread created, but nothing outside this function
@@ -1456,34 +1467,47 @@ pub const Process = struct {
     pub fn createIdle() !*Process {
         const proc_alloc = try slab_instance.create();
         const proc = proc_alloc.ptr;
-        proc.* = .{
-            .pid = @atomicRmw(u64, &pid_counter, .Add, 1, .monotonic),
-            .parent = null,
-            .alive = true,
-            .restart_context = null,
-            .addr_space_root = memory_init.kernel_addr_space_root,
-            .addr_space_id = 0,
-            .vmm = VirtualMemoryManager.init(
-                VAddr.fromInt(address.AddrSpacePartition.user.start),
-                VAddr.fromInt(address.AddrSpacePartition.user.end),
-                memory_init.kernel_addr_space_root,
-            ),
-            .threads = undefined,
-            .num_threads = 0,
-            .children = undefined,
-            .num_children = 0,
-            .lock = .{},
-            .perm_table = undefined,
-            .perm_count = 0,
-            .perm_lock = .{},
-            .handle_counter = 1,
-            .perm_view_vaddr = VAddr.fromInt(0),
-            .perm_view_phys = PAddr.fromInt(0),
-            .dma_mappings = undefined,
-            .num_dma_mappings = 0,
-            .fault_reason = .none,
-            .restart_count = 0,
-        };
+        // Same field-by-field pattern as `create`: a whole-struct
+        // `.* = .{...}` would zero `_gen_lock`.
+        proc.pid = @atomicRmw(u64, &pid_counter, .Add, 1, .monotonic);
+        proc.parent = null;
+        proc.alive = true;
+        proc.restart_context = null;
+        proc.addr_space_root = memory_init.kernel_addr_space_root;
+        proc.addr_space_id = 0;
+        proc.vmm = VirtualMemoryManager.init(
+            VAddr.fromInt(address.AddrSpacePartition.user.start),
+            VAddr.fromInt(address.AddrSpacePartition.user.end),
+            memory_init.kernel_addr_space_root,
+        );
+        proc.threads = undefined;
+        proc.num_threads = 0;
+        proc.children = undefined;
+        proc.num_children = 0;
+        proc.perm_table = undefined;
+        proc.perm_count = 0;
+        proc.perm_lock = .{};
+        proc.handle_counter = 1;
+        proc.perm_view_vaddr = VAddr.fromInt(0);
+        proc.perm_view_phys = PAddr.fromInt(0);
+        proc.dma_mappings = undefined;
+        proc.num_dma_mappings = 0;
+        proc.msg_box = .{};
+        proc.fault_box = .{};
+        proc.fault_reason = .none;
+        proc.restart_count = 0;
+        proc.perm_view_gen = 0;
+        proc.handle_refcount = 0;
+        proc.cleanup_complete = false;
+        proc.fault_handler_proc = null;
+        proc.faulted_thread_slots = 0;
+        proc.suspended_thread_slots = 0;
+        proc.thread_handle_rights = ThreadHandleRights.full;
+        proc.max_thread_priority = .normal;
+        proc.fault_handler_targets_head = null;
+        proc.fault_handler_targets_next = null;
+        proc.had_self_fault_handler = true;
+        proc.vm = null;
         proc.initPermTable(.{});
         return proc;
     }

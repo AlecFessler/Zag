@@ -50,7 +50,6 @@ pub const Vm = struct {
     owner: *Process,
     exit_box: VmExitBox = .{},
     policy: vm_hw.VmPolicy = .{},
-    lock: SpinLock = .{},
     vm_id: u64 = 0,
     arch_structures: PAddr = PAddr.fromInt(0),
     guest_mem: GuestMemory = .{},
@@ -413,8 +412,8 @@ pub fn sysregPassthrough(proc: *Process, vm_handle: u64, sysreg_id: u32, allow_r
 
     // Serialize the MSRPM bitwise RMW -- multiple threads in the same
     // process could otherwise race.
-    vm_obj.lock.lock();
-    defer vm_obj.lock.unlock();
+    vm_obj._gen_lock.lock();
+    defer vm_obj._gen_lock.unlock();
 
     // Access the MSRPM via the VMCB.
     vm_hw.sysregPassthrough(vm_obj.arch_structures, sysreg_id, allow_read, allow_write);

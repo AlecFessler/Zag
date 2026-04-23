@@ -315,7 +315,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
 
     // §2.12.23: on ANY fault_reply, release all .suspended siblings before
     // applying the action on the faulting thread.
-    src.lock.lock();
+    src._gen_lock.lock();
     {
         var i: u64 = 0;
         while (i < src.num_threads) {
@@ -328,7 +328,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
     }
     const sib_mask = src.suspended_thread_slots;
     src.suspended_thread_slots = 0;
-    src.lock.unlock();
+    src._gen_lock.unlock();
 
     {
         var i: u64 = 0;
@@ -347,11 +347,11 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
             // §2.12.24: kill ONLY the faulting thread. If it is the last
             // non-exited thread, Thread.deinit -> lastThreadExited drives
             // process exit/restart per §2.6.
-            src.lock.lock();
+            src._gen_lock.lock();
             pending.state = .exited;
             const faulted_bit = @as(u64, 1) << @intCast(pending.slot_index);
             src.faulted_thread_slots &= ~faulted_bit;
-            src.lock.unlock();
+            src._gen_lock.unlock();
 
             while (pending.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
             sched.removeFromAnyRunQueue(pending);
@@ -385,11 +385,11 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
             // to consume it via iret. Leaving a stale pointer would target
             // a previous frame on the next fault.
             pending.fault_user_ctx = null;
-            src.lock.lock();
+            src._gen_lock.lock();
             pending.state = .ready;
             const faulted_bit = @as(u64, 1) << @intCast(pending.slot_index);
             src.faulted_thread_slots &= ~faulted_bit;
-            src.lock.unlock();
+            src._gen_lock.unlock();
 
             const target_core = if (pending.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
             sched.enqueueOnCore(target_core, pending);

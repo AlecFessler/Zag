@@ -122,15 +122,15 @@ pub fn create(vm_obj: *Vm) !*VCpu {
     thread.ctx = interrupts.prepareThreadContext(kstack_top, null, &vcpuEntryPoint, @intFromPtr(vcpu_obj));
 
     // Add thread to process thread list
-    proc.lock.lock();
+    proc._gen_lock.lock();
     if (proc.num_threads >= Process.MAX_THREADS) {
-        proc.lock.unlock();
+        proc._gen_lock.unlock();
         return error.MaxThreads;
     }
     thread.slot_index = @intCast(proc.num_threads);
     proc.threads[proc.num_threads] = thread;
     proc.num_threads += 1;
-    proc.lock.unlock();
+    proc._gen_lock.unlock();
 
     vcpu_obj.* = .{
         .thread = thread,
