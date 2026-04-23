@@ -366,6 +366,10 @@ pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64
     // owned by the kernel and must always stage-2-fault to the inline
     // handler — see `Vm.tryHandleMmio`.
     if (guest_addr < vgic_mod.GICD_BASE + vgic_mod.GICD_SIZE and guest_end > vgic_mod.GICD_BASE) return E_INVAL;
+
+    vm_obj._gen_lock.lock();
+    defer vm_obj._gen_lock.unlock();
+
     const gicr_end = vgic_mod.GICR_BASE + vgic_mod.GICR_STRIDE * vm_obj.num_vcpus;
     if (guest_addr < gicr_end and guest_end > vgic_mod.GICR_BASE) return E_INVAL;
 
@@ -442,6 +446,8 @@ pub fn intcAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
 
     const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
     if (irq_num >= 24) return E_INVAL;
+    vm_obj._gen_lock.lock();
+    defer vm_obj._gen_lock.unlock();
     vgic_mod.assertSpi(&vm_obj.vgic, @intCast(irq_num + 32));
     kickRunningVcpus(vm_obj);
     return 0; // E_OK
@@ -453,6 +459,8 @@ pub fn intcDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
 
     const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
     if (irq_num >= 24) return E_INVAL;
+    vm_obj._gen_lock.lock();
+    defer vm_obj._gen_lock.unlock();
     vgic_mod.deassertSpi(&vm_obj.vgic, @intCast(irq_num + 32));
     kickRunningVcpus(vm_obj);
     return 0; // E_OK

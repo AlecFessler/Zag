@@ -195,6 +195,9 @@ pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
+    vm_obj._gen_lock.lock();
+    defer vm_obj._gen_lock.unlock();
+
     const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse return E_BADCAP;
 
     if (vcpu_obj.loadState() != .idle) return E_BUSY;
@@ -219,12 +222,15 @@ pub fn vcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
+    if (state_ptr == 0) return E_BADADDR;
+    if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
+
+    vm_obj._gen_lock.lock();
+    defer vm_obj._gen_lock.unlock();
+
     const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse return E_BADCAP;
 
     if (vcpu_obj.loadState() != .idle) return E_BUSY;
-
-    if (state_ptr == 0) return E_BADADDR;
-    if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
 
     // Read guest state from userspace via physmap, handling cross-page boundaries.
     var buf: [@sizeOf(vm_hw.GuestState)]u8 = undefined;
@@ -243,13 +249,19 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
-    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse return E_BADCAP;
-
     if (state_ptr == 0) return E_BADADDR;
     if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
 
-    // Snapshot the state once; avoid racing the vCPU's own writes.
+    // Resolve vcpu + snapshot state under vm_obj._gen_lock. The lock is
+    // released before the IPI/spin loop so we don't stall other cores
+    // touching vm_obj while we wait for the vcpu thread to leave CPU.
+    vm_obj._gen_lock.lock();
+    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse {
+        vm_obj._gen_lock.unlock();
+        return E_BADCAP;
+    };
     const state_snapshot = vcpu_obj.loadState();
+    vm_obj._gen_lock.unlock();
 
     // If running, IPI to suspend and snapshot
     if (state_snapshot == .running) {
@@ -261,9 +273,12 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
         }
     }
 
-    // Write guest state to userspace via physmap, handling cross-page boundaries.
+    // Copy guest_state out under the lock again (point-in-time snapshot).
+    vm_obj._gen_lock.lock();
     const src_bytes = std.mem.asBytes(&vcpu_obj.guest_state);
-    if (!writeUserStruct(proc, state_ptr, src_bytes)) return E_BADADDR;
+    const write_ok = writeUserStruct(proc, state_ptr, src_bytes);
+    vm_obj._gen_lock.unlock();
+    if (!write_ok) return E_BADADDR;
 
     // Resume if it was running
     if (state_snapshot == .running) {
@@ -286,8 +301,6 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
-    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse return E_BADCAP;
-
     if (interrupt_ptr == 0) return E_BADADDR;
     if (!zag.memory.address.AddrSpacePartition.user.contains(interrupt_ptr)) return E_BADADDR;
 
@@ -304,13 +317,24 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     // vector directly to VMCS VM_ENTRY_INTR_INFO.
     if (interrupt.vector < 32) return E_INVAL;
 
-    if (vcpu_obj.loadState() == .running) {
+    // Resolve vcpu + snapshot state under vm_obj._gen_lock. Lock released
+    // before the IPI/spin so we don't stall cross-core work on the VM.
+    vm_obj._gen_lock.lock();
+    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse {
+        vm_obj._gen_lock.unlock();
+        return E_BADCAP;
+    };
+    const state_snapshot = vcpu_obj.loadState();
+    vm_obj._gen_lock.unlock();
+
+    if (state_snapshot == .running) {
         const thread = vcpu_obj.thread;
         // IPI to suspend
         if (sched.coreRunning(thread)) |core_id| {
             apic.sendSchedulerIpi(core_id);
             while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
         }
+        vm_obj._gen_lock.lock();
         // If the vCPU entry loop (or a prior injection) already queued a
         // vector in pending_eventinj, don't clobber it. Route this vector
         // through the LAPIC IRR so the entry loop can pick it up next time.
@@ -319,11 +343,14 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
         } else {
             vm_hw.injectInterrupt(&vcpu_obj.guest_state, interrupt);
         }
+        vm_obj._gen_lock.unlock();
         thread.state = .ready;
         const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
         sched.enqueueOnCore(target_core, thread);
     } else {
         // Not running — write pending interrupt into arch state
+        vm_obj._gen_lock.lock();
+        defer vm_obj._gen_lock.unlock();
         if (vcpu_obj.guest_state.pending_eventinj != 0) {
             vm_obj.injectExternal(interrupt.vector);
         } else {

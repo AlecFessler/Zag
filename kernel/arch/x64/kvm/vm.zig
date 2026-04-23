@@ -359,6 +359,9 @@ pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64
     if (guest_addr < LAPIC_BASE + 0x1000 and guest_end > LAPIC_BASE) return E_INVAL;
     if (guest_addr < IOAPIC_BASE + 0x1000 and guest_end > IOAPIC_BASE) return E_INVAL;
 
+    vm_obj._gen_lock.lock();
+    defer vm_obj._gen_lock.unlock();
+
     // Walk host pages and map each into guest EPT. Track progress for
     // rollback on partial failure.
     var offset: u64 = 0;
@@ -436,6 +439,8 @@ pub fn intcAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
 
     const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
     if (irq_num >= 24) return E_INVAL;
+    vm_obj._gen_lock.lock();
+    defer vm_obj._gen_lock.unlock();
     vm_obj.ioapic.assertIrq(@truncate(irq_num));
     kickRunningVcpus(vm_obj);
     return 0; // E_OK
@@ -449,6 +454,8 @@ pub fn intcDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
 
     const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
     if (irq_num >= 24) return E_INVAL;
+    vm_obj._gen_lock.lock();
+    defer vm_obj._gen_lock.unlock();
     vm_obj.ioapic.deassertIrq(@truncate(irq_num));
     kickRunningVcpus(vm_obj);
     return 0; // E_OK

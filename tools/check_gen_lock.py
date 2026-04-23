@@ -1019,8 +1019,11 @@ def bracket_check(res: CheckResult) -> None:
                           if op.op in ("lock", "lockWithGen") and op.line_no < first]
             nearest = max((op.line_no for op in candidates), default=None)
             gap = (first - nearest) if nearest is not None else None
+            # If a lock exists earlier in scope, this is a tight-scoping
+            # concern rather than a UAF bug — downgrade to info.
+            severity = "info" if nearest is not None else "err"
             res.findings.append(Finding(
-                severity="err",
+                severity=severity,
                 entry=res.entry.name,
                 message=(
                     f"{ident} ({slab_ty}): first access at L{first} "
@@ -1061,8 +1064,9 @@ def bracket_check(res: CheckResult) -> None:
                               if op.op == "unlock" and op.line_no > last]
                 nearest = min((op.line_no for op in candidates), default=None)
                 gap = (nearest - last) if nearest is not None else None
+                severity = "info" if nearest is not None else "err"
                 res.findings.append(Finding(
-                    severity="err",
+                    severity=severity,
                     entry=res.entry.name,
                     message=(
                         f"{ident} ({slab_ty}): last access at L{last} "

@@ -319,6 +319,9 @@ pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
+    vm_obj._gen_lock.lock();
+    defer vm_obj._gen_lock.unlock();
+
     const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse return E_BADCAP;
 
     if (vcpu_obj.loadState() != .idle) return E_BUSY;
@@ -342,12 +345,15 @@ pub fn vcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
+    if (state_ptr == 0) return E_BADADDR;
+    if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
+
+    vm_obj._gen_lock.lock();
+    defer vm_obj._gen_lock.unlock();
+
     const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse return E_BADCAP;
 
     if (vcpu_obj.loadState() != .idle) return E_BUSY;
-
-    if (state_ptr == 0) return E_BADADDR;
-    if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
 
     var buf: [@sizeOf(vm_hw.GuestState)]u8 = undefined;
     if (!readUserStruct(proc, state_ptr, &buf)) return E_BADADDR;
@@ -364,12 +370,18 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
-    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse return E_BADCAP;
-
     if (state_ptr == 0) return E_BADADDR;
     if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
 
+    // Resolve vcpu + snapshot state under vm_obj._gen_lock. Lock released
+    // before the IPI/spin so we don't stall cross-core work on the VM.
+    vm_obj._gen_lock.lock();
+    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse {
+        vm_obj._gen_lock.unlock();
+        return E_BADCAP;
+    };
     const state_snapshot = vcpu_obj.loadState();
+    vm_obj._gen_lock.unlock();
 
     // If running, IPI to suspend so we get a stable snapshot.
     if (state_snapshot == .running) {
@@ -380,8 +392,11 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
         }
     }
 
+    vm_obj._gen_lock.lock();
     const src_bytes = std.mem.asBytes(&vcpu_obj.guest_state);
-    if (!writeUserStruct(proc, state_ptr, src_bytes)) return E_BADADDR;
+    const write_ok = writeUserStruct(proc, state_ptr, src_bytes);
+    vm_obj._gen_lock.unlock();
+    if (!write_ok) return E_BADADDR;
 
     if (state_snapshot == .running) {
         const thread = vcpu_obj.thread;
@@ -408,8 +423,6 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
-    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse return E_BADCAP;
-
     if (interrupt_ptr == 0) return E_BADADDR;
     if (!zag.memory.address.AddrSpacePartition.user.contains(interrupt_ptr)) return E_BADADDR;
 
@@ -417,17 +430,29 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     if (!readUserStruct(proc, interrupt_ptr, &int_buf)) return E_BADADDR;
     const interrupt = std.mem.bytesAsValue(vm_hw.GuestInterrupt, &int_buf).*;
 
-    if (vcpu_obj.loadState() == .running) {
+    vm_obj._gen_lock.lock();
+    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse {
+        vm_obj._gen_lock.unlock();
+        return E_BADCAP;
+    };
+    const state_snapshot = vcpu_obj.loadState();
+    vm_obj._gen_lock.unlock();
+
+    if (state_snapshot == .running) {
         const thread = vcpu_obj.thread;
         if (sched.coreRunning(thread)) |core_id| {
             gic.sendSchedulerIpi(core_id);
             while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
         }
+        vm_obj._gen_lock.lock();
         injectInterrupt(&vcpu_obj.guest_state, interrupt);
+        vm_obj._gen_lock.unlock();
         thread.state = .ready;
         const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
         sched.enqueueOnCore(target_core, thread);
     } else {
+        vm_obj._gen_lock.lock();
+        defer vm_obj._gen_lock.unlock();
         injectInterrupt(&vcpu_obj.guest_state, interrupt);
     }
 
