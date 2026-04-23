@@ -4,12 +4,12 @@ const zag = @import("zag");
 const arch = zag.arch.dispatch;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
+const secure_slab = zag.memory.allocators.secure_slab;
 
 const PAddr = zag.memory.address.PAddr;
-const SlabAllocator = zag.memory.allocators.slab.SlabAllocator;
 const VAddr = zag.memory.address.VAddr;
 
-pub const SharedMemoryAllocator = SlabAllocator(SharedMemory, false, 0, 64, true);
+pub const SharedMemoryAllocator = secure_slab.SecureSlab(SharedMemory, 256);
 
 /// A contiguous-backed shared memory region. Always a single buddy
 /// allocation at `alloc_order`, covering `2^alloc_order` physical pages;
@@ -28,10 +28,12 @@ pub const SharedMemoryAllocator = SlabAllocator(SharedMemory, false, 0, 64, true
 /// The cost is a cap at the buddy's max order: `MAX_PAGES = 1024`
 /// (4 MiB per SHM). Callers that want larger regions must attach
 /// multiple SHMs side-by-side in their VMM.
-pub const SharedMemory = struct {
+pub const SharedMemory = extern struct {
+    _gen_lock: u64,
     base_paddr: PAddr,
     num_pages: u32,
-    alloc_order: u4,
+    alloc_order: u8,
+    _pad: [3]u8 = .{ 0, 0, 0 },
     refcount: std.atomic.Value(u32),
 
     /// Max usable pages per SHM. Bounded by the buddy's max order
@@ -48,6 +50,14 @@ pub const SharedMemory = struct {
         return PAddr.fromInt(self.base_paddr.addr + @as(u64, idx) * paging.PAGE4K);
     }
 
+    /// Returns the current generation of this slot. Callers issuing new
+    /// capability handles should stash this alongside the pointer so a
+    /// later `safeAccess` on the handle can catch stale use after free.
+    pub fn gen(self: *const SharedMemory) u63 {
+        const word: *const std.atomic.Value(u64) = @ptrCast(@alignCast(&self._gen_lock));
+        return @intCast(word.load(.monotonic) >> 1);
+    }
+
     pub fn create(num_bytes: u64) !*SharedMemory {
         if (num_bytes == 0) return error.InvalidSize;
         // Bound num_bytes before narrowing to u32 — a raw @intCast of
@@ -61,14 +71,15 @@ pub const SharedMemory = struct {
         if (num_pages == 0 or num_pages > MAX_PAGES) return error.TooManyPages;
 
         const rounded_pages = std.math.ceilPowerOfTwo(u32, num_pages) catch return error.TooManyPages;
-        const order: u4 = @intCast(@ctz(rounded_pages));
+        const order: u8 = @intCast(@ctz(rounded_pages));
         const alloc_size = @as(u64, rounded_pages) * paging.PAGE4K;
 
-        const shm = allocator.create(SharedMemory) catch {
+        const alloc_result = slab_allocator_instance.create() catch {
             arch.boot.print("K: SHM slab alloc fail\n", .{});
             return error.OutOfMemory;
         };
-        errdefer allocator.destroy(shm);
+        const shm = alloc_result.ptr;
+        errdefer slab_allocator_instance.destroyUnchecked(shm);
 
         var global = &pmm.global_pmm.?;
         const irq = global.lock.lockIrqSave();
@@ -86,12 +97,11 @@ pub const SharedMemory = struct {
         @memset(blk[0..alloc_size], 0);
         const base_paddr = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(blk)), null);
 
-        shm.* = .{
-            .base_paddr = base_paddr,
-            .num_pages = num_pages,
-            .alloc_order = order,
-            .refcount = std.atomic.Value(u32).init(1),
-        };
+        shm.base_paddr = base_paddr;
+        shm.num_pages = num_pages;
+        shm.alloc_order = order;
+        shm._pad = .{ 0, 0, 0 };
+        shm.refcount = std.atomic.Value(u32).init(1);
         return shm;
     }
 
@@ -109,13 +119,13 @@ pub const SharedMemory = struct {
 
     fn destroy(self: *SharedMemory) void {
         self.freePages();
-        allocator.destroy(self);
+        slab_allocator_instance.destroyUnchecked(self);
     }
 
     fn freePages(self: *SharedMemory) void {
         if (self.num_pages == 0) return;
 
-        const block_pages = @as(u32, 1) << self.alloc_order;
+        const block_pages = @as(u32, 1) << @as(u4, @intCast(self.alloc_order));
         const block_size = @as(u64, block_pages) * paging.PAGE4K;
         const base_vaddr = VAddr.fromPAddr(self.base_paddr, null);
         const buf: [*]u8 = @ptrFromInt(base_vaddr.addr);
@@ -132,4 +142,3 @@ pub const SharedMemory = struct {
 };
 
 pub var slab_allocator_instance: SharedMemoryAllocator = undefined;
-pub var allocator: std.mem.Allocator = undefined;

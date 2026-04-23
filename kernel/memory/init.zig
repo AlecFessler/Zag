@@ -28,7 +28,6 @@ var bump_allocator: BumpAllocator = undefined;
 var buddy_allocator: BuddyAllocator = undefined;
 
 var vm_node_slab_bump: BumpAllocator = undefined;
-var shm_slab_bump: BumpAllocator = undefined;
 var device_region_slab_bump: BumpAllocator = undefined;
 
 pub var proc_slab_backing: BumpAllocator = undefined;
@@ -170,7 +169,6 @@ pub fn init(firmware_mmap: MMap) !void {
     pmm.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
 
     vm_node_slab_bump = BumpAllocator.init(KA.vm_node_slab.start, KA.vm_node_slab.end);
-    shm_slab_bump = BumpAllocator.init(KA.shm_slab.start, KA.shm_slab.end);
     device_region_slab_bump = BumpAllocator.init(KA.device_region_slab.start, KA.device_region_slab.end);
     proc_slab_backing = BumpAllocator.init(KA.proc_slab.start, KA.proc_slab.end);
     thread_slab_backing = BumpAllocator.init(KA.thread_slab.start, KA.thread_slab.end);
@@ -181,8 +179,11 @@ pub fn init(firmware_mmap: MMap) !void {
     try vmm_mod.initSlabs(vm_node_slab_bump.allocator());
     try device_region_mod.initSlab(device_region_slab_bump.allocator());
 
-    shared.slab_allocator_instance = try shared.SharedMemoryAllocator.init(shm_slab_bump.allocator());
-    shared.allocator = shared.slab_allocator_instance.allocator();
+    shared.slab_allocator_instance = shared.SharedMemoryAllocator.init(
+        KA.shm_slab,
+        KA.shm_slab_ptrs,
+        KA.shm_slab_links,
+    );
 
     try pmu_mod.initSlab(pmu_state_slab_backing.allocator());
 }

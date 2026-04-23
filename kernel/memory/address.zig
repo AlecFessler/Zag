@@ -61,9 +61,27 @@ pub const KernelVA = struct {
             .end = kvm_vcpu_slab.end + SLAB_RESERVATION,
         };
 
+        // SecureSlab out-of-band metadata regions. Each gen-protected slab
+        // class reserves two sibling regions alongside its data region:
+        //   *_slab_ptrs  — dense array of `*T` (one per slot index)
+        //   *_slab_links — prev/next u32 pairs backing the circular
+        //                  doubly-linked free list
+        // Separation is the security property: an OOB write from a T
+        // instance cannot reach the address table or the freelist
+        // topology from the same primitive.
+
+        pub const shm_slab_ptrs: Range = .{
+            .start = pmu_state_slab.end,
+            .end = pmu_state_slab.end + SLAB_RESERVATION,
+        };
+        pub const shm_slab_links: Range = .{
+            .start = shm_slab_ptrs.end,
+            .end = shm_slab_ptrs.end + SLAB_RESERVATION,
+        };
+
         pub const range: Range = .{
             .start = vm_node_slab.start,
-            .end = pmu_state_slab.end,
+            .end = shm_slab_links.end,
         };
     };
 };
