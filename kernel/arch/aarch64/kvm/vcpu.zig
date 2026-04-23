@@ -347,15 +347,15 @@ pub fn vcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
-    if (state_ptr == 0) return E_BADADDR;
-    if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
-
     vm_obj._gen_lock.lock();
     defer vm_obj._gen_lock.unlock();
 
     const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse return E_BADCAP;
 
     if (vcpu_obj.loadState() != .idle) return E_BUSY;
+
+    if (state_ptr == 0) return E_BADADDR;
+    if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
 
     var buf: [@sizeOf(vm_hw.GuestState)]u8 = undefined;
     if (!readUserStruct(proc, state_ptr, &buf)) return E_BADADDR;
@@ -372,9 +372,6 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
-    if (state_ptr == 0) return E_BADADDR;
-    if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
-
     // Resolve vcpu + snapshot state under vm_obj._gen_lock. Lock released
     // before the IPI/spin so we don't stall cross-core work on the VM.
     vm_obj._gen_lock.lock();
@@ -384,6 +381,9 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     };
     const state_snapshot = vcpu_obj.loadState();
     vm_obj._gen_lock.unlock();
+
+    if (state_ptr == 0) return E_BADADDR;
+    if (!zag.memory.address.AddrSpacePartition.user.contains(state_ptr)) return E_BADADDR;
 
     // If running, IPI to suspend so we get a stable snapshot.
     if (state_snapshot == .running) {
@@ -427,13 +427,6 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
-    if (interrupt_ptr == 0) return E_BADADDR;
-    if (!zag.memory.address.AddrSpacePartition.user.contains(interrupt_ptr)) return E_BADADDR;
-
-    var int_buf: [@sizeOf(vm_hw.GuestInterrupt)]u8 = undefined;
-    if (!readUserStruct(proc, interrupt_ptr, &int_buf)) return E_BADADDR;
-    const interrupt = std.mem.bytesAsValue(vm_hw.GuestInterrupt, &int_buf).*;
-
     vm_obj._gen_lock.lock();
     const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse {
         vm_obj._gen_lock.unlock();
@@ -441,6 +434,13 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     };
     const state_snapshot = vcpu_obj.loadState();
     vm_obj._gen_lock.unlock();
+
+    if (interrupt_ptr == 0) return E_BADADDR;
+    if (!zag.memory.address.AddrSpacePartition.user.contains(interrupt_ptr)) return E_BADADDR;
+
+    var int_buf: [@sizeOf(vm_hw.GuestInterrupt)]u8 = undefined;
+    if (!readUserStruct(proc, interrupt_ptr, &int_buf)) return E_BADADDR;
+    const interrupt = std.mem.bytesAsValue(vm_hw.GuestInterrupt, &int_buf).*;
 
     if (state_snapshot == .running) {
         const thread = vcpu_obj.thread;
