@@ -254,7 +254,7 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
 /// Decodes the faulting instruction, performs the port I/O, writes back
 /// the result (for reads), and advances RIP past the instruction.
 fn emulateVirtualBar(ctx: *cpu.Context, node: *const VmNode, faulting_addr: u64, proc: anytype) void {
-    const device = node.kind.virtual_bar;
+    const device = node.deviceRegion().?;
 
     // Fetch instruction bytes from user RIP via the process page tables.
     const rip = ctx.rip;

@@ -1,9 +1,11 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const secure_slab = zag.memory.allocators.secure_slab;
+
+const GenLock = secure_slab.GenLock;
 const PAddr = zag.memory.address.PAddr;
-const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
-const SpinLock = zag.utils.sync.SpinLock;
+const SecureSlab = secure_slab.SecureSlab;
 
 pub const DeviceType = enum(u8) {
     mmio = 0,
@@ -20,7 +22,26 @@ pub const DeviceClass = enum(u8) {
     unknown = 0xFF,
 };
 
-pub const Pci = struct {
+pub const AccessMmio = extern struct {
+    phys_base: PAddr,
+    size: u64,
+};
+
+pub const AccessPortIo = extern struct {
+    base_port: u16,
+    port_count: u16,
+    _pad: [4]u8 = .{ 0, 0, 0, 0 },
+    // Padded to match AccessMmio's 16-byte footprint so the enclosing
+    // extern union has a deterministic size regardless of the variant.
+    _pad2: [8]u8 = .{ 0, 0, 0, 0, 0, 0, 0, 0 },
+};
+
+pub const Access = extern union {
+    mmio: AccessMmio,
+    port_io: AccessPortIo,
+};
+
+pub const Pci = extern struct {
     vendor: u16,
     device: u16,
     class: u8,
@@ -28,40 +49,38 @@ pub const Pci = struct {
     bus: u8,
     dev: u8,
     func: u8,
+    _pad: [3]u8 = .{ 0, 0, 0 },
     dma_page_table_root: PAddr,
     dma_cursor: u64,
-    /// Serializes `arch.mapDmaPages` / `arch.unmapDmaPages` for this
-    /// device. Without this lock, two threads sharing a device cap with
-    /// the `dma` right can race in the iommu walk, read the same
-    /// `dma_cursor`, install overlapping leaf PTEs, and return the
-    /// same `dma_base` for two different SHMs — a subsequent unmap of
-    /// either mapping then tears down PTEs that still back the other
-    /// and pmm-frees frames that the device is still programmed to
-    /// DMA into (kernel-RAM pivot). See exploits/dma_map_race_iova_alias.
-    dma_lock: SpinLock,
 };
 
-pub const Display = struct {
+pub const Display = extern struct {
     fb_width: u16,
     fb_height: u16,
     fb_stride: u16,
     fb_pixel_format: u8,
+    _pad: [1]u8 = .{0},
 };
 
-pub const DeviceRegion = struct {
+pub const Detail = extern union {
+    pci: Pci,
+    display: Display,
+};
+
+/// DMA-path mutual exclusion for a DeviceRegion comes from the object's
+/// own `_gen_lock` (SecureSlab). Without that, two threads sharing a
+/// device cap with the `dma` right could race in the iommu walk, read
+/// the same `dma_cursor`, install overlapping leaf PTEs, and return the
+/// same `dma_base` for two different SHMs — see
+/// exploits/dma_map_race_iova_alias. The old `Pci.dma_lock` is gone;
+/// callers on `mapDmaPages` / `unmapDmaPages` acquire `dr._gen_lock`.
+pub const DeviceRegion = extern struct {
+    _gen_lock: GenLock = .{},
+    access: Access,
+    detail: Detail,
     device_type: DeviceType,
     device_class: DeviceClass,
-
-    access: union {
-        mmio: struct { phys_base: PAddr, size: u64 },
-        port_io: struct { base_port: u16, port_count: u16 },
-    },
-
-    detail: union {
-        pci: Pci,
-        display: Display,
-        none: void,
-    },
+    _pad: [6]u8 = .{ 0, 0, 0, 0, 0, 0 },
 };
 
 const DeviceRegionSlab = SecureSlab(DeviceRegion, 256);
@@ -97,23 +116,20 @@ pub fn createMmio(
     pci_func: u8,
 ) !*DeviceRegion {
     const dr = try allocRegion();
-    dr.* = .{
-        .device_type = .mmio,
-        .device_class = device_class,
-        .access = .{ .mmio = .{ .phys_base = phys_base, .size = size } },
-        .detail = .{ .pci = .{
-            .vendor = pci_vendor,
-            .device = pci_device,
-            .class = pci_class,
-            .subclass = pci_subclass,
-            .bus = pci_bus,
-            .dev = pci_dev,
-            .func = pci_func,
-            .dma_page_table_root = PAddr.fromInt(0),
-            .dma_cursor = 0x1000,
-            .dma_lock = .{},
-        } },
-    };
+    dr.access = .{ .mmio = .{ .phys_base = phys_base, .size = size } };
+    dr.detail = .{ .pci = .{
+        .vendor = pci_vendor,
+        .device = pci_device,
+        .class = pci_class,
+        .subclass = pci_subclass,
+        .bus = pci_bus,
+        .dev = pci_dev,
+        .func = pci_func,
+        .dma_page_table_root = PAddr.fromInt(0),
+        .dma_cursor = 0x1000,
+    } };
+    dr.device_type = .mmio;
+    dr.device_class = device_class;
     return dr;
 }
 
@@ -130,23 +146,20 @@ pub fn createPortIo(
     pci_func: u8,
 ) !*DeviceRegion {
     const dr = try allocRegion();
-    dr.* = .{
-        .device_type = .port_io,
-        .device_class = device_class,
-        .access = .{ .port_io = .{ .base_port = base_port, .port_count = port_count } },
-        .detail = .{ .pci = .{
-            .vendor = pci_vendor,
-            .device = pci_device,
-            .class = pci_class,
-            .subclass = pci_subclass,
-            .bus = pci_bus,
-            .dev = pci_dev,
-            .func = pci_func,
-            .dma_page_table_root = PAddr.fromInt(0),
-            .dma_cursor = 0,
-            .dma_lock = .{},
-        } },
-    };
+    dr.access = .{ .port_io = .{ .base_port = base_port, .port_count = port_count } };
+    dr.detail = .{ .pci = .{
+        .vendor = pci_vendor,
+        .device = pci_device,
+        .class = pci_class,
+        .subclass = pci_subclass,
+        .bus = pci_bus,
+        .dev = pci_dev,
+        .func = pci_func,
+        .dma_page_table_root = PAddr.fromInt(0),
+        .dma_cursor = 0,
+    } };
+    dr.device_type = .port_io;
+    dr.device_class = device_class;
     return dr;
 }
 
@@ -159,17 +172,15 @@ pub fn createDisplay(
     fb_pixel_format: u8,
 ) !*DeviceRegion {
     const dr = try allocRegion();
-    dr.* = .{
-        .device_type = .mmio,
-        .device_class = .display,
-        .access = .{ .mmio = .{ .phys_base = phys_base, .size = size } },
-        .detail = .{ .display = .{
-            .fb_width = fb_width,
-            .fb_height = fb_height,
-            .fb_stride = fb_stride,
-            .fb_pixel_format = fb_pixel_format,
-        } },
-    };
+    dr.access = .{ .mmio = .{ .phys_base = phys_base, .size = size } };
+    dr.detail = .{ .display = .{
+        .fb_width = fb_width,
+        .fb_height = fb_height,
+        .fb_stride = fb_stride,
+        .fb_pixel_format = fb_pixel_format,
+    } };
+    dr.device_type = .mmio;
+    dr.device_class = .display;
     return dr;
 }
 

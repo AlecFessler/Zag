@@ -12,14 +12,6 @@ const SpinLock = zag.utils.sync.SpinLock;
 const INVALID_INDEX: u32 = std.math.maxInt(u32);
 const DEFAULT_WALK_BOUND: u32 = 256;
 
-/// Out-of-band doubly-linked list entry. Sits in its own vaddr region
-/// separate from the slot pointers so a single OOB write from a T instance
-/// cannot corrupt both the address table and the freelist topology.
-pub const LinkPair = extern struct {
-    prev: u32,
-    next: u32,
-};
-
 pub const AllocError = error{
     SlabFull,
 };
@@ -28,11 +20,89 @@ pub const AccessError = error{
     StaleHandle,
 };
 
+/// Per-object gen+lock word. First field of every slab-backed T. Encodes:
+///   word = (gen << 1) | lock_bit
+///   gen even  → slot is freed
+///   gen odd   → slot is live
+///   lock_bit  → 1 while a critical section is in progress
+///
+/// Replaces the object-level `SpinLock` that slab-backed types used to
+/// carry as a separate field: same mutual-exclusion semantics, plus
+/// structural UAF detection on every acquire (stale expected_gen → the
+/// slot was freed since the handle was issued).
+///
+/// Callers that have a handle and a snapshotted `expected_gen` use
+/// `lockWithGen` to verify + lock in one atomic instruction. Callers
+/// holding a *T from a live internal reference chain use the plain
+/// `lock()` which acquires whatever gen is current.
+pub const GenLock = extern struct {
+    word: std.atomic.Value(u64) align(8) = .{ .raw = 0 },
+
+    /// Plain spin-acquire of the lock bit, regardless of generation.
+    /// Used by internal kernel paths that already have a live *T from a
+    /// pinned reference chain (no handle, no staleness concern).
+    pub fn lock(self: *GenLock) void {
+        while (true) {
+            const cur = self.word.load(.monotonic);
+            if (cur & 1 == 0) {
+                if (self.word.cmpxchgWeak(cur, cur | 1, .acquire, .monotonic) == null) return;
+            }
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    /// Release a lock acquired via `lock` or `lockWithGen`. Clears the
+    /// lock bit without touching the generation counter.
+    pub fn unlock(self: *GenLock) void {
+        const cur = self.word.load(.monotonic);
+        std.debug.assert(cur & 1 == 1);
+        self.word.store(cur & ~@as(u64, 1), .release);
+    }
+
+    /// Spin-CAS-acquire the lock bit while atomically verifying the
+    /// caller's `expected_gen` snapshot matches the slot's current gen.
+    /// Returns `StaleHandle` if the slot has been freed (and possibly
+    /// reallocated) since the handle was issued.
+    pub fn lockWithGen(self: *GenLock, expected_gen: u63) AccessError!void {
+        const unlocked: u64 = (@as(u64, expected_gen) << 1) | 0;
+        const locked: u64 = (@as(u64, expected_gen) << 1) | 1;
+        while (true) {
+            if (self.word.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) return;
+            const cur = self.word.load(.monotonic);
+            if ((cur >> 1) != expected_gen) return error.StaleHandle;
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    /// Read the current generation. Callers issuing a handle snapshot
+    /// this alongside the *T; callers on refcount-zero destroy paths
+    /// read it to hand back to `SecureSlab.destroy`.
+    pub fn currentGen(self: *const GenLock) u63 {
+        return @intCast(self.word.load(.monotonic) >> 1);
+    }
+
+    /// Replace the word with `(new_gen << 1) | 0` — clears the lock bit
+    /// and installs a new gen in one release store. Used by the slab
+    /// allocator on alloc (freed→live) and destroy (live→freed).
+    pub fn setGenRelease(self: *GenLock, new_gen: u63) void {
+        const new_word: u64 = (@as(u64, new_gen) << 1) | 0;
+        self.word.store(new_word, .release);
+    }
+};
+
+/// Out-of-band doubly-linked list entry. Sits in its own vaddr region
+/// separate from the slot pointers so a single OOB write from a T instance
+/// cannot corrupt both the address table and the freelist topology.
+pub const LinkPair = extern struct {
+    prev: u32,
+    next: u32,
+};
+
 /// Secure slab allocator.
 ///
 /// Memory model: three comptime-reserved kernel vaddr regions per class,
 /// each demand-paged via the kernel page-fault handler. Regions:
-///   data  — dense array of T slots
+///   data  — dense array of T slots (T embeds its own GenLock at offset 0)
 ///   ptrs  — parallel array of `*T` (one per slot index)
 ///   links — parallel array of `LinkPair` (prev/next indices into the free list)
 ///
@@ -42,20 +112,10 @@ pub const AccessError = error{
 /// so an attacker cannot pin which slot their next free-then-alloc will
 /// reclaim.
 ///
-/// Per-object gen+lock word: SecureSlab transparently prefixes every T
-/// with a gen-lock header. Callers receive `*T` and treat it like any
-/// other pointer; the header lives at `ptr - headerOffset(T)`. Bit 0 of
-/// the header word is the per-object lock bit; bits 1..63 hold the
-/// monotonically-increasing generation counter. Encoding:
-///   word = (gen << 1) | lock_bit
-///   gen even  → slot is freed
-///   gen odd   → slot is live
-///   lock_bit  → 1 while a safeAccess / destroy is in progress
-///
-/// Capability handles store the expected gen alongside `*T`; on deref,
-/// `safeAccess` performs a CAS that simultaneously verifies the gen and
-/// acquires the object lock, making stale-handle use a clean error rather
-/// than silent corruption.
+/// Per-object gen+lock word: T declares `_gen_lock: GenLock` as its first
+/// field. Capability handles store the expected gen alongside *T; deref
+/// goes through `GenLock.lockWithGen` which CAS-verifies gen + acquires
+/// the lock bit in one instruction.
 pub fn SecureSlab(
     comptime T: type,
     comptime walk_bound: u32,
@@ -65,9 +125,8 @@ pub fn SecureSlab(
     return struct {
         const Self = @This();
 
-        const header_offset: u64 = std.mem.alignForward(u64, @sizeOf(u64), @alignOf(T));
-        const slot_align: u64 = @max(@alignOf(T), @alignOf(u64));
-        const slot_stride: u64 = std.mem.alignForward(u64, header_offset + @sizeOf(T), slot_align);
+        const slot_align: u64 = @alignOf(T);
+        const slot_stride: u64 = std.mem.alignForward(u64, @sizeOf(T), slot_align);
 
         data_bump: bump.BumpAllocator,
         ptrs_bump: bump.BumpAllocator,
@@ -84,6 +143,8 @@ pub fn SecureSlab(
 
         rng_state: u64,
 
+        /// Allocator-internal lock guarding the freelist / cursors /
+        /// bump pointers. Orthogonal to per-slot GenLocks.
         lock: SpinLock = .{},
 
         pub const AllocResult = struct {
@@ -131,10 +192,12 @@ pub fn SecureSlab(
 
         /// Allocate a fresh slot. Returns the object pointer and its new
         /// generation; the caller must stash `gen` in whatever capability
-        /// handle it issues, then pass it back to `safeAccess` / `destroy`.
+        /// handle it issues, then pass it back to `destroy` (or wire it
+        /// into `GenLock.lockWithGen` at every subsequent use).
         ///
-        /// Caller must not touch any `T` fields before receiving both values
-        /// — the gen-lock word is written by this path.
+        /// The caller must initialize all non-`_gen_lock` fields of T
+        /// before any concurrent observer can see the pointer; this path
+        /// writes the gen-lock word (live, unlocked) but nothing else.
         pub fn create(self: *Self) AllocError!AllocResult {
             self.lock.lock();
             defer self.lock.unlock();
@@ -143,7 +206,6 @@ pub fn SecureSlab(
                 try self.growOne();
             }
 
-            // Pop cursor walks, then the slot at the cursor is extracted.
             const draw_pop = self.randStep();
             const draw_push = self.randStep();
             self.pop_cursor = self.walkCursorLocked(self.pop_cursor, draw_pop);
@@ -153,45 +215,28 @@ pub fn SecureSlab(
             const next_after_pop = link.next;
 
             self.unlinkLocked(popped);
-
-            // Keep pop cursor valid after the unlink.
             self.pop_cursor = if (self.count_free == 0) INVALID_INDEX else next_after_pop;
-
-            // Push cursor walk happens on the (now-shrunken) free list.
             self.push_cursor = self.walkCursorLocked(self.push_cursor, draw_push);
 
             const slot_ptr = self.ptrAt(popped);
-            const word = genLockWordOf(T, slot_ptr);
-            const prev_word = word.load(.monotonic);
-            std.debug.assert(prev_word & 1 == 0); // was not locked
-            std.debug.assert((prev_word >> 1) % 2 == 0); // was freed (gen even)
-            const new_gen: u63 = @intCast((prev_word >> 1) + 1);
-            const new_word: u64 = (@as(u64, new_gen) << 1) | 0; // live, unlocked
-            word.store(new_word, .release);
+            const prev_gen = slot_ptr._gen_lock.currentGen();
+            std.debug.assert(prev_gen % 2 == 0); // was freed (gen even)
+            const new_gen: u63 = prev_gen + 1;
+            slot_ptr._gen_lock.setGenRelease(new_gen);
 
             return .{ .ptr = slot_ptr, .gen = new_gen };
         }
 
-        /// Atomically verify the caller's expected gen matches, acquire the
-        /// object lock, bump the gen to the next even (freed) value, and
-        /// link the slot back into the free list. Returns `StaleHandle` if
-        /// the handle's gen no longer matches — that means the object was
-        /// already freed (possibly reallocated) by a concurrent path.
+        /// Atomically verify the caller's expected gen, acquire the lock,
+        /// bump gen to the next even (freed) value, and re-link the slot.
+        /// Returns `StaleHandle` if gen no longer matches — the object
+        /// was already freed (possibly reallocated) by a concurrent path.
         pub fn destroy(
             self: *Self,
             ptr: *T,
             expected_gen: u63,
         ) AccessError!void {
-            const word = genLockWordOf(T, ptr);
-            const unlocked: u64 = (@as(u64, expected_gen) << 1) | 0;
-            const locked: u64 = (@as(u64, expected_gen) << 1) | 1;
-
-            while (true) {
-                if (word.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) break;
-                const cur = word.load(.monotonic);
-                if ((cur >> 1) != expected_gen) return error.StaleHandle;
-                std.atomic.spinLoopHint();
-            }
+            try ptr._gen_lock.lockWithGen(expected_gen);
 
             self.lock.lock();
             defer self.lock.unlock();
@@ -199,8 +244,7 @@ pub fn SecureSlab(
             // Gen-lock currently held. Bump to (expected_gen+1)<<1 | 0 and
             // release in one store: the new gen is even (freed) and the
             // lock bit is clear.
-            const new_word: u64 = (@as(u64, expected_gen + 1) << 1) | 0;
-            word.store(new_word, .release);
+            ptr._gen_lock.setGenRelease(expected_gen + 1);
 
             const idx = self.indexOf(ptr);
 
@@ -212,73 +256,11 @@ pub fn SecureSlab(
             self.pop_cursor = self.walkCursorLocked(self.pop_cursor, draw_pop);
         }
 
-        /// Read the current generation of a slot. Callers issuing new
-        /// capability handles stash this alongside the pointer; callers on
-        /// refcount-zero / exclusive-ownership destruction paths use it
-        /// to feed `destroy` without the unsafe "just free and hope no
-        /// one's looking" variant.
+        /// Read the current generation of a slot. Thin forwarder to the
+        /// per-slot `GenLock.currentGen` for callers who already hold an
+        /// instance-type.
         pub fn currentGen(ptr: *T) u63 {
-            const word = genLockWordOf(T, ptr);
-            return @intCast(word.load(.monotonic) >> 1);
-        }
-
-        /// Spin-CAS acquire the gen-lock on `ptr` while verifying the
-        /// caller's expected_gen matches the slot's current gen. On
-        /// success the caller has exclusive access to the object; every
-        /// field access must happen between `acquire` and the matching
-        /// `release`. On gen mismatch returns StaleHandle — the slot has
-        /// been freed (possibly reallocated) since issuance.
-        ///
-        /// Pair with `defer SecureSlab(T).release(ptr)` on the caller
-        /// side. This is the scope-based counterpart to `safeAccess`:
-        /// same atomic semantics, no body-closure plumbing.
-        pub fn acquire(ptr: *T, expected_gen: u63) error{StaleHandle}!void {
-            const word = genLockWordOf(T, ptr);
-            const unlocked: u64 = (@as(u64, expected_gen) << 1) | 0;
-            const locked: u64 = (@as(u64, expected_gen) << 1) | 1;
-            while (true) {
-                if (word.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) return;
-                const cur = word.load(.monotonic);
-                if ((cur >> 1) != expected_gen) return error.StaleHandle;
-                std.atomic.spinLoopHint();
-            }
-        }
-
-        /// Release a gen-lock acquired via `acquire`. Must pair 1:1 with
-        /// an `acquire` that returned without error. Clears the lock bit
-        /// without touching the generation counter.
-        pub fn release(ptr: *T) void {
-            const word = genLockWordOf(T, ptr);
-            const cur = word.load(.monotonic);
-            std.debug.assert(cur & 1 == 1); // was locked
-            word.store(cur & ~@as(u64, 1), .release);
-        }
-
-        /// The only door to a real `*T`. Spin-CAS-acquires the gen-lock while
-        /// verifying the handle's expected gen, runs `body(ctx, ptr)`, and
-        /// releases the lock. Returns `StaleHandle` if the gen no longer
-        /// matches; propagates any error returned by `body`.
-        pub fn safeAccess(
-            self: *Self,
-            ptr: *T,
-            expected_gen: u63,
-            ctx: anytype,
-            comptime body: anytype,
-        ) SafeAccessReturn(@TypeOf(body)) {
-            _ = self;
-            const word = genLockWordOf(T, ptr);
-            const unlocked: u64 = (@as(u64, expected_gen) << 1) | 0;
-            const locked: u64 = (@as(u64, expected_gen) << 1) | 1;
-
-            while (true) {
-                if (word.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) break;
-                const cur = word.load(.monotonic);
-                if ((cur >> 1) != expected_gen) return error.StaleHandle;
-                std.atomic.spinLoopHint();
-            }
-            defer word.store(unlocked, .release);
-
-            return body(ctx, ptr);
+            return ptr._gen_lock.currentGen();
         }
 
         // ---- internals ----
@@ -289,10 +271,9 @@ pub fn SecureSlab(
             const slot_base = bumpBytes(&self.data_bump, slot_stride, slot_align) orelse
                 return error.SlabFull;
             // Freshly demand-paged memory is already zero (fault handler
-            // zeroes new pages), but be explicit for correctness under
-            // second-touch reuse.
+            // zeroes new pages); be explicit under second-touch reuse.
             @memset(slot_base[0..slot_stride], 0);
-            const slot_ptr: *T = @ptrCast(@alignCast(slot_base + header_offset));
+            const slot_ptr: *T = @ptrCast(@alignCast(slot_base));
 
             const ptr_cell = bumpOne(&self.ptrs_bump, *T) orelse return error.SlabFull;
             ptr_cell.* = slot_ptr;
@@ -343,9 +324,6 @@ pub fn SecureSlab(
         }
 
         fn anyFreeSlotLocked(self: *Self) u32 {
-            // Used only to re-seed a cursor after it was invalidated. The
-            // push_cursor (if valid) is the canonical seed; otherwise fall
-            // back to the pop_cursor; otherwise the list is empty.
             if (self.push_cursor != INVALID_INDEX) return self.push_cursor;
             if (self.pop_cursor != INVALID_INDEX) return self.pop_cursor;
             @panic("anyFreeSlotLocked called on empty list");
@@ -358,8 +336,6 @@ pub fn SecureSlab(
                 self.pop_cursor = idx;
                 self.push_cursor = idx;
             } else {
-                // Insert after push_cursor (or after an arbitrary node if
-                // push_cursor was invalidated).
                 const anchor = if (self.push_cursor == INVALID_INDEX)
                     self.anyFreeSlotLocked()
                 else
@@ -405,10 +381,6 @@ pub fn SecureSlab(
         }
 
         fn indexOf(self: *Self, ptr: *T) u32 {
-            // Walk the ptrs array to find the matching index. This is O(n)
-            // but only on the destroy path; the alternative — reverse-mapping
-            // via `(ptr - data_base) / sizeof(T)` — skips the ptrs-table
-            // indirection that the separation-of-metadata property relies on.
             var i: u32 = 0;
             while (i < self.count_total) {
                 if (self.ptrAt(i) == ptr) return i;
@@ -426,27 +398,18 @@ fn validateT(comptime T: type) void {
     if (info != .@"struct") {
         @compileError("SecureSlab requires a struct T; got " ++ @typeName(T));
     }
-    // Reviewer responsibility: once syscall deref sites are wrapped in
-    // `safeAccessSlabT`, any remaining top-level `SpinLock` on T is a
-    // double-lock smell — the gen-lock bit provides the object-level
-    // exclusion. Before that wrapping lands, the legacy coarse locks
-    // are what's providing that exclusion, so the comptime enforcement
-    // would fire too early.
+    if (!@hasField(T, "_gen_lock")) {
+        @compileError(@typeName(T) ++ " must declare `_gen_lock: GenLock` as its first field");
+    }
+    if (@offsetOf(T, "_gen_lock") != 0) {
+        @compileError(@typeName(T) ++ "._gen_lock must be at offset 0 — make T extern struct");
+    }
 }
 
-fn genLockWordOf(comptime T: type, ptr: *T) *std.atomic.Value(u64) {
-    const header_offset = std.mem.alignForward(u64, @sizeOf(u64), @alignOf(T));
-    const base: [*]u8 = @ptrCast(ptr);
-    return @ptrCast(@alignCast(base - header_offset));
-}
-
-/// Free-function equivalent of `SecureSlab(T).currentGen(ptr)` for
-/// callers that don't have the instance type in scope (e.g. the
-/// capability handle layer reading the gen off several different
-/// slab-allocated T's).
+/// Read the gen of a slab-backed *T via field access. Used at capability
+/// handle issuance time (snapshot) and by lookup paths (compare).
 pub fn genOf(comptime T: type, ptr: *T) u63 {
-    const word = genLockWordOf(T, ptr);
-    return @intCast(word.load(.monotonic) >> 1);
+    return ptr._gen_lock.currentGen();
 }
 
 fn bumpOne(ba: *bump.BumpAllocator, comptime R: type) ?*R {
@@ -465,28 +428,17 @@ fn bumpBytes(ba: *bump.BumpAllocator, size: u64, alignment: u64) ?[*]u8 {
     return @ptrFromInt(aligned);
 }
 
-fn SafeAccessReturn(comptime BodyType: type) type {
-    const body_info = @typeInfo(BodyType).@"fn";
-    const body_ret = body_info.return_type.?;
-    const ret_info = @typeInfo(body_ret);
-    return switch (ret_info) {
-        .error_union => |eu| (eu.error_set || AccessError)!eu.payload,
-        else => AccessError!body_ret,
-    };
-}
-
 // ---- tests ----
 
 const testing = std.testing;
 
 const TestT = extern struct {
-    _gen_lock: u64,
-    value: u64,
-    pad: u64,
+    _gen_lock: GenLock = .{},
+    value: u64 = 0,
+    pad: u64 = 0,
 };
 
 test "validateT accepts well-formed extern struct" {
-    // Just instantiating the type triggers the comptime check.
     _ = SecureSlab(TestT, DEFAULT_WALK_BOUND);
 }
 
@@ -500,4 +452,20 @@ test "randStep stays in [-N, N]" {
         try testing.expect(step >= -16 and step <= 16);
         i += 1;
     }
+}
+
+test "genlock lock/unlock sequencing" {
+    var gl: GenLock = .{};
+    gl.setGenRelease(5); // pretend we just allocated gen=5
+    gl.lock();
+    try testing.expect(gl.word.load(.monotonic) & 1 == 1);
+    gl.unlock();
+    try testing.expect(gl.word.load(.monotonic) & 1 == 0);
+    try testing.expectEqual(@as(u63, 5), gl.currentGen());
+}
+
+test "genlock lockWithGen rejects stale" {
+    var gl: GenLock = .{};
+    gl.setGenRelease(5);
+    try testing.expectError(error.StaleHandle, gl.lockWithGen(4));
 }

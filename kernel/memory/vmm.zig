@@ -8,6 +8,7 @@ const pmm = zag.memory.pmm;
 const secure_slab = zag.memory.allocators.secure_slab;
 
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
+const GenLock = secure_slab.GenLock;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PrivilegePerm = zag.perms.privilege.PrivilegePerm;
@@ -28,27 +29,74 @@ pub const HANDLE_NONE: u64 = std.math.maxInt(u64);
 /// guards around each user stack.
 pub const MAX_RESERVATIONS: usize = 256;
 
-pub const RestartPolicy = enum {
+pub const RestartPolicy = enum(u8) {
     free,
     decommit,
     preserve,
 };
 
-pub const VmNode = struct {
+pub const VmNodeKind = enum(u8) {
+    private = 0,
+    shared_memory = 1,
+    mmio = 2,
+    virtual_bar = 3,
+};
+
+/// Type-erased payload for `VmNode.kind_ptr`:
+///   .private               → kind_ptr == null
+///   .shared_memory         → kind_ptr points at the backing *SharedMemory
+///   .mmio, .virtual_bar    → kind_ptr points at the backing *DeviceRegion
+///
+/// Split from a tagged union so VmNode can be `extern struct` and carry
+/// the slab-allocator gen-lock at offset 0.
+pub const VmNode = extern struct {
+    _gen_lock: GenLock = .{},
     start: VAddr,
     size: u64,
-    kind: union(enum) {
-        private: void,
-        shared_memory: *SharedMemory,
-        mmio: *DeviceRegion,
-        virtual_bar: *DeviceRegion,
-    },
-    rights: VmReservationRights,
     handle: u64,
+    kind_ptr: ?*anyopaque,
+    rights: VmReservationRights,
+    kind: VmNodeKind,
     restart_policy: RestartPolicy,
+    _pad: [5]u8 = .{ 0, 0, 0, 0, 0 },
 
     pub fn end(self: *const VmNode) u64 {
         return self.start.addr + self.size;
+    }
+
+    /// Populate every non-`_gen_lock` field of a freshly allocated node.
+    /// Use this instead of `node.* = .{...}` — a whole-struct assignment
+    /// would clobber the gen-lock word that the allocator just set.
+    pub fn init(
+        self: *VmNode,
+        start: VAddr,
+        size: u64,
+        kind: VmNodeKind,
+        kind_ptr: ?*anyopaque,
+        rights: VmReservationRights,
+        handle: u64,
+        policy: RestartPolicy,
+    ) void {
+        self.start = start;
+        self.size = size;
+        self.kind = kind;
+        self.kind_ptr = kind_ptr;
+        self.rights = rights;
+        self.handle = handle;
+        self.restart_policy = policy;
+    }
+
+    pub fn sharedMemory(self: *const VmNode) ?*SharedMemory {
+        if (self.kind != .shared_memory) return null;
+        return @ptrCast(@alignCast(self.kind_ptr));
+    }
+
+    /// Returns the backing device for `.mmio` or `.virtual_bar`; null
+    /// otherwise. Callers that need to discriminate `.mmio` vs
+    /// `.virtual_bar` should check `kind` explicitly.
+    pub fn deviceRegion(self: *const VmNode) ?*DeviceRegion {
+        if (self.kind != .mmio and self.kind != .virtual_bar) return null;
+        return @ptrCast(@alignCast(self.kind_ptr));
     }
 };
 
@@ -187,14 +235,14 @@ pub const VirtualMemoryManager = struct {
         defer self.lock.unlock();
 
         const node = try allocVmNode();
-        node.* = .{
-            .start = start,
-            .size = size,
-            .kind = .private,
-            .rights = rights,
-            .handle = HANDLE_NONE,
-            .restart_policy = policy,
-        };
+        // Field-by-field assignment preserves `node._gen_lock`.
+        node.start = start;
+        node.size = size;
+        node.kind = .private;
+        node.kind_ptr = null;
+        node.rights = rights;
+        node.handle = HANDLE_NONE;
+        node.restart_policy = policy;
 
         self.insertNodeLocked(node) catch |e| {
             freeVmNode(node);
@@ -283,18 +331,19 @@ pub const VirtualMemoryManager = struct {
         };
 
         const node = try allocVmNode();
-        node.* = .{
-            .start = chosen,
-            .size = size,
-            .kind = .private,
-            .rights = .{
+        node.init(
+            chosen,
+            size,
+            .private,
+            null,
+            .{
                 .read = max_rights.read,
                 .write = max_rights.write,
                 .execute = max_rights.execute,
             },
-            .handle = HANDLE_NONE,
-            .restart_policy = .free,
-        };
+            HANDLE_NONE,
+            .free,
+        );
 
         self.insertNodeLocked(node) catch |e| {
             freeVmNode(node);
@@ -320,6 +369,7 @@ pub const VirtualMemoryManager = struct {
             .start = base_addr,
             .size = paging.PAGE4K,
             .kind = .private,
+            .kind_ptr = null,
             .rights = .{},
             .handle = HANDLE_NONE,
             .restart_policy = .free,
@@ -335,6 +385,7 @@ pub const VirtualMemoryManager = struct {
             .start = VAddr.fromInt(usable_start),
             .size = usable_size,
             .kind = .private,
+            .kind_ptr = null,
             .rights = .{ .read = true, .write = true },
             .handle = HANDLE_NONE,
             .restart_policy = .free,
@@ -352,6 +403,7 @@ pub const VirtualMemoryManager = struct {
             .start = VAddr.fromInt(overflow_start),
             .size = paging.PAGE4K,
             .kind = .private,
+            .kind_ptr = null,
             .rights = .{},
             .handle = HANDLE_NONE,
             .restart_policy = .free,
@@ -518,7 +570,8 @@ pub const VirtualMemoryManager = struct {
         map_node.* = .{
             .start = range_start,
             .size = range_size,
-            .kind = .{ .shared_memory = shm },
+            .kind = .shared_memory,
+            .kind_ptr = shm,
             .rights = .{ .read = rights.read, .write = rights.write, .execute = rights.execute },
             .handle = shm_handle,
             .restart_policy = .free,
@@ -641,6 +694,7 @@ pub const VirtualMemoryManager = struct {
                 .start = old_start,
                 .size = old_size,
                 .kind = .private,
+            .kind_ptr = null,
                 .rights = .{
                     .read = max_rights.read,
                     .write = max_rights.write,
@@ -689,7 +743,8 @@ pub const VirtualMemoryManager = struct {
         map_node.* = .{
             .start = range_start,
             .size = range_size,
-            .kind = .{ .mmio = device },
+            .kind = .mmio,
+            .kind_ptr = device,
             .rights = .{ .read = rights.read, .write = rights.write, .execute = rights.execute },
             .handle = device_handle,
             .restart_policy = .free,
@@ -765,7 +820,8 @@ pub const VirtualMemoryManager = struct {
         map_node.* = .{
             .start = range_start,
             .size = range_size,
-            .kind = .{ .virtual_bar = device },
+            .kind = .virtual_bar,
+            .kind_ptr = device,
             .rights = .{ .read = rights.read, .write = rights.write, .execute = rights.execute },
             .handle = device_handle,
             .restart_policy = .free,
@@ -821,7 +877,7 @@ pub const VirtualMemoryManager = struct {
         while (i < self.count) : (i += 1) {
             const node = self.nodes[i];
             if (node.kind != .shared_memory) continue;
-            if (node.kind.shared_memory != shm) continue;
+            if (node.sharedMemory() != shm) continue;
             unmapNodePages(node, self.addr_space_root, false);
             node.kind = .private;
             node.rights = findContainingRights(reservations, node.start.addr);
@@ -837,8 +893,8 @@ pub const VirtualMemoryManager = struct {
         var i: usize = 0;
         while (i < self.count) : (i += 1) {
             const node = self.nodes[i];
-            const is_mmio = node.kind == .mmio and node.kind.mmio == device;
-            const is_vbar = node.kind == .virtual_bar and node.kind.virtual_bar == device;
+            const is_mmio = node.kind == .mmio and node.deviceRegion() == device;
+            const is_vbar = node.kind == .virtual_bar and node.deviceRegion() == device;
             if (!is_mmio and !is_vbar) continue;
             if (is_mmio) unmapNodePages(node, self.addr_space_root, false);
             node.kind = .private;
@@ -881,14 +937,14 @@ pub const VirtualMemoryManager = struct {
         if (node.start.addr == split_vaddr.addr) return;
 
         const right = try allocVmNode();
-        right.* = .{
-            .start = split_vaddr,
-            .size = node.end() - split_vaddr.addr,
-            .kind = node.kind,
-            .rights = node.rights,
-            .handle = node.handle,
-            .restart_policy = node.restart_policy,
-        };
+        // Field-by-field write preserves `right._gen_lock`.
+        right.start = split_vaddr;
+        right.size = node.end() - split_vaddr.addr;
+        right.kind = node.kind;
+        right.kind_ptr = node.kind_ptr;
+        right.rights = node.rights;
+        right.handle = node.handle;
+        right.restart_policy = node.restart_policy;
         node.size = split_vaddr.addr - node.start.addr;
 
         self.insertNodeLocked(right) catch |e| {
@@ -962,7 +1018,7 @@ pub const VirtualMemoryManager = struct {
         const hi = lowerBoundIdx(s, res_start.addr + res_size);
         var i: usize = lo;
         while (i < hi) : (i += 1) {
-            if (s[i].kind == .shared_memory and s[i].kind.shared_memory == shm) return true;
+            if (s[i].kind == .shared_memory and s[i].sharedMemory() == shm) return true;
         }
         return false;
     }
@@ -973,7 +1029,7 @@ pub const VirtualMemoryManager = struct {
         const hi = lowerBoundIdx(s, res_start.addr + res_size);
         var i: usize = lo;
         while (i < hi) : (i += 1) {
-            if (s[i].kind == .mmio and s[i].kind.mmio == device) return true;
+            if (s[i].kind == .mmio and s[i].deviceRegion() == device) return true;
         }
         return false;
     }
@@ -984,7 +1040,7 @@ pub const VirtualMemoryManager = struct {
         const hi = lowerBoundIdx(s, res_start.addr + res_size);
         var i: usize = lo;
         while (i < hi) : (i += 1) {
-            if (s[i].kind == .virtual_bar and s[i].kind.virtual_bar == device) return true;
+            if (s[i].kind == .virtual_bar and s[i].deviceRegion() == device) return true;
         }
         return false;
     }

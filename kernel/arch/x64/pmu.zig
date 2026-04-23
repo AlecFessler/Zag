@@ -16,6 +16,7 @@ const cpu = zag.arch.x64.cpu;
 const intel_pmu = zag.arch.x64.intel.pmu;
 const pmu_sched = zag.syscall.pmu;
 
+const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const PmuCounterConfig = pmu_sched.PmuCounterConfig;
 const PmuInfo = pmu_sched.PmuInfo;
 const PmuSample = pmu_sched.PmuSample;
@@ -33,6 +34,7 @@ const default_config: PmuCounterConfig = .{
 /// Per-thread arch PMU state. Backend-agnostic: both Intel and AMD need
 /// the same layout (configured counter count, config array, saved values).
 pub const PmuState = extern struct {
+    _gen_lock: GenLock = .{},
     num_counters: u8 = 0,
     _pad: [7]u8 = .{0} ** 7,
     configs: [MAX_COUNTERS]PmuCounterConfig = .{default_config} ** MAX_COUNTERS,

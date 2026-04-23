@@ -796,7 +796,7 @@ fn emulateVirtualBar(
     far: u64,
     proc: anytype,
 ) void {
-    const device = node.kind.virtual_bar;
+    const device = node.deviceRegion().?;
 
     const decoded = decodeA64LoadStore(ctx, proc) orelse {
         proc.kill(.protection_fault);

@@ -34,6 +34,7 @@ const pmu_sched = zag.syscall.pmu;
 const sched = zag.sched.scheduler;
 
 const ArchCpuContext = zag.arch.aarch64.interrupts.ArchCpuContext;
+const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const PmuCounterConfig = pmu_sched.PmuCounterConfig;
 const PmuEvent = pmu_sched.PmuEvent;
 const PmuInfo = pmu_sched.PmuInfo;
@@ -52,6 +53,7 @@ const default_config: PmuCounterConfig = .{
 /// Per-thread arch PMU state. Layout identical in spirit to the x64
 /// backend's `PmuState`: count + configs + saved values.
 pub const PmuState = extern struct {
+    _gen_lock: GenLock = .{},
     num_counters: u8 = 0,
     _pad: [7]u8 = .{0} ** 7,
     configs: [MAX_COUNTERS]PmuCounterConfig = .{default_config} ** MAX_COUNTERS,

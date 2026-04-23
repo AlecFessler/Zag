@@ -173,6 +173,39 @@ pub const KernelObject = union(enum) {
             .vm_reservation, .empty => 0,
         };
     }
+
+    /// Spin-CAS-acquire the gen-lock on the backing slab slot, while
+    /// verifying `expected_gen` (the snapshot taken when the handle was
+    /// issued) matches the current gen. On success the caller holds
+    /// exclusive access to the object and must pair this with a
+    /// `releaseLock` on the same variant. Returns `StaleHandle` if the
+    /// slot has been freed since issuance. No-op for variants that do
+    /// not reference a slab-allocated `*T`.
+    pub fn acquireLock(self: @This(), expected_gen: u32) error{StaleHandle}!void {
+        return switch (self) {
+            .process => |p| secure_slab.acquireOf(Process, p, @intCast(expected_gen)),
+            .dead_process => |p| secure_slab.acquireOf(Process, p, @intCast(expected_gen)),
+            .thread => |t| secure_slab.acquireOf(Thread, t, @intCast(expected_gen)),
+            .shared_memory => |s| secure_slab.acquireOf(SharedMemory, s, @intCast(expected_gen)),
+            .device_region => |d| secure_slab.acquireOf(DeviceRegion, d, @intCast(expected_gen)),
+            .vm => |v| secure_slab.acquireOf(Vm, v, @intCast(expected_gen)),
+            .vm_reservation, .empty => {},
+        };
+    }
+
+    /// Release the gen-lock acquired via `acquireLock`. Must be paired
+    /// with a successful `acquireLock` on the same variant.
+    pub fn releaseLock(self: @This()) void {
+        switch (self) {
+            .process => |p| secure_slab.releaseOf(Process, p),
+            .dead_process => |p| secure_slab.releaseOf(Process, p),
+            .thread => |t| secure_slab.releaseOf(Thread, t),
+            .shared_memory => |s| secure_slab.releaseOf(SharedMemory, s),
+            .device_region => |d| secure_slab.releaseOf(DeviceRegion, d),
+            .vm => |v| secure_slab.releaseOf(Vm, v),
+            .vm_reservation, .empty => {},
+        }
+    }
 };
 
 pub const UserViewEntryType = enum(u8) {
