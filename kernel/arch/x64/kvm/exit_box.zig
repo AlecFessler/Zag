@@ -339,6 +339,9 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
 fn deliverExitMessage(proc: *Process, vm_obj: *Vm, thread: *Thread, buf_ptr: u64) i64 {
     const E_BADADDR: i64 = -7;
 
+    vm_obj._gen_lock.lock();
+    defer vm_obj._gen_lock.unlock();
+
     const vcpu_obj = vcpu_mod.vcpuFromThread(vm_obj, thread) orelse return E_BADADDR;
 
     // Find thread handle in caller's perm table
