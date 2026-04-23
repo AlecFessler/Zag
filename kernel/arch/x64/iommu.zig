@@ -69,6 +69,8 @@ pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
     // exploits/dma_map_race_iova_alias.
     device._gen_lock.lock();
     defer device._gen_lock.unlock();
+    shm._gen_lock.lock();
+    defer shm._gen_lock.unlock();
 
     const base_dma = device.detail.pci.dma_cursor;
     var i: usize = 0;
