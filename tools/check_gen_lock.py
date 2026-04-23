@@ -707,6 +707,37 @@ def _walk_body(
     persist forward). Callee recursion uses forked copies so changes in
     inlined method bodies don't leak back to the caller's scope.
     """
+    # Brace-depth-aware defer tracker. `defer X._gen_lock.unlock()` fires
+    # at the matching `}` of its enclosing block. Record pending defers
+    # and emit synthetic unlock events at the correct synth line so
+    # bracket_check sees the tight scope boundary.
+    #
+    # brace_depth is the depth *entering* the current line. Defers push
+    # at their enclosing depth (= brace_depth after counting `{`s on
+    # their own line). A defer fires when we leave the line whose exit
+    # depth drops below its recorded depth.
+    brace_depth = 0
+    pending_defers: list[tuple[str, int]] = []  # (ident, fire_at_depth)
+
+    def emit_defer_fires(current_synth: int) -> None:
+        # Pop defers whose fire-depth is >= current brace_depth + 1
+        # (i.e., whose enclosing block has just closed). A defer at
+        # fire-depth D fires when brace_depth becomes < D.
+        i = len(pending_defers) - 1
+        while i >= 0:
+            ident_d, depth_d = pending_defers[i]
+            if brace_depth < depth_d:
+                lock_ops.append(LockOp(
+                    line_no=current_synth,
+                    ident=ident_d,
+                    op="unlock",
+                    raw="<defer fires at scope end>",
+                    src_file=src_file,
+                    src_line=0,
+                ))
+                pending_defers.pop(i)
+            i -= 1
+
     for rel, raw_line in enumerate(body_lines):
         src_line = body_first_line + rel
         synth_counter[0] += 1
@@ -797,15 +828,23 @@ def _walk_body(
         # Refcount-pinning detector. The idiomatic pin pair in this
         # kernel is:
         #     const x = <acquireFn>(...) orelse return ...;
-        #     defer x.releaseRef();
-        # The `acquireFn` bumps `x.handle_refcount`; the defer drops it at
-        # scope exit. While pinned, `x` cannot be freed — accesses to `x`
-        # are UAF-safe even without gen-lock. Mark the ident as self-alive.
-        m_pin = re.match(r"^\s*defer\s+(\w+)\s*\.\s*releaseRef\s*\(", code)
+        #     defer x.releaseRef();   (Thread / Process handle refcount)
+        #     defer x.decRef();       (SharedMemory atomic refcount)
+        # The acquire bumps a refcount; the defer drops it at scope exit.
+        # While pinned, `x` cannot be freed — accesses to `x` are UAF-safe
+        # even without gen-lock. Mark the ident as self-alive.
+        m_pin = re.match(
+            r"^\s*defer\s+(\w+)\s*\.\s*(?:releaseRef|decRef)\s*\(", code
+        )
         if m_pin:
             self_alive.add(m_pin.group(1))
 
         # Lock / unlock / defer-unlock ops on slab idents.
+        # Explicit `lock()`, `unlock()`, and `lockWithGen()` are recorded
+        # at this synth line. A `defer <ident>._gen_lock.unlock()` is
+        # recorded as a "defer-unlock" at this line AND queued to fire a
+        # synthetic `unlock` event at the synth line where its enclosing
+        # block closes — see `pending_defers` / `emit_defer_fires`.
         for m_lock in re.finditer(
             r"\b(\w+)\._gen_lock\.(lock|unlock|lockWithGen)\b", code
         ):
@@ -823,6 +862,12 @@ def _walk_body(
                 src_file=src_file,
                 src_line=src_line,
             ))
+            if is_defer and op == "unlock":
+                # brace_depth is the depth entering this line (before any
+                # braces on the line itself). defer fires when the block
+                # containing the defer is left. Assume the defer line
+                # doesn't open/close its own block — it's a bare statement.
+                pending_defers.append((ident, brace_depth))
 
         # Collect every `<ident>.<tail>` on this line, separating METHOD
         # CALLS (tail immediately followed by `(`) from FIELD ACCESSES.
@@ -1014,6 +1059,42 @@ def _walk_body(
                 depth + 1,
                 call_stack + [f"{recv_ty}.{fn_name}"],
             )
+
+        # End-of-line: update brace depth by counting braces on this
+        # line (string-literal aware, best-effort), then fire any
+        # pending defers whose enclosing block just closed.
+        in_str = False
+        esc = False
+        for c in code:
+            if esc:
+                esc = False
+                continue
+            if c == "\\" and in_str:
+                esc = True
+                continue
+            if c == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if c == "{":
+                brace_depth += 1
+            elif c == "}":
+                brace_depth -= 1
+        emit_defer_fires(synth)
+
+    # Fire any remaining defers at end-of-body — normally covered above
+    # but this handles bodies that end without a trailing `}` line.
+    while pending_defers:
+        ident_d, _ = pending_defers.pop()
+        lock_ops.append(LockOp(
+            line_no=synth_counter[0],
+            ident=ident_d,
+            op="unlock",
+            raw="<defer fires at body end>",
+            src_file=src_file,
+            src_line=0,
+        ))
 
 
 def analyze_entry(
