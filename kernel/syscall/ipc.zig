@@ -356,7 +356,10 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
     const target_proc = target_entry.object.process;
 
     // §2.6.30: lazily convert dead process entries on IPC attempt.
-    if (!target_proc.alive) {
+    target_proc._gen_lock.lock();
+    const target_alive = target_proc.alive;
+    target_proc._gen_lock.unlock();
+    if (!target_alive) {
         proc.convertToDeadProcess(target_proc);
         return .{ .ret = E_BADCAP };
     }
