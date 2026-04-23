@@ -408,6 +408,15 @@ fn genLockWordOf(comptime T: type, ptr: *T) *std.atomic.Value(u64) {
     return @ptrCast(@alignCast(base - header_offset));
 }
 
+/// Free-function equivalent of `SecureSlab(T).currentGen(ptr)` for
+/// callers that don't have the instance type in scope (e.g. the
+/// capability handle layer reading the gen off several different
+/// slab-allocated T's).
+pub fn genOf(comptime T: type, ptr: *T) u63 {
+    const word = genLockWordOf(T, ptr);
+    return @intCast(word.load(.monotonic) >> 1);
+}
+
 fn bumpOne(ba: *bump.BumpAllocator, comptime R: type) ?*R {
     const aligned = std.mem.alignForward(u64, ba.free_addr, @alignOf(R));
     const next_free = aligned + @sizeOf(R);

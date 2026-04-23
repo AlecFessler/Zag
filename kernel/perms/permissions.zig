@@ -1,6 +1,8 @@
 const std = @import("std");
 const zag = @import("zag");
 
+const secure_slab = zag.memory.allocators.secure_slab;
+
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const Process = zag.proc.process.Process;
 const SharedMemory = zag.memory.shared.SharedMemory;
@@ -110,6 +112,14 @@ pub const PermissionEntry = struct {
     rights: u16,
     exclude_oneshot: bool = false,
     exclude_permanent: bool = false,
+    /// Snapshot of the backing SecureSlab slot's generation taken when
+    /// this handle was issued. `getPermByHandleLocked` refuses to return
+    /// the entry if the current gen no longer matches — the slot has
+    /// been freed (and possibly reallocated) since issuance, so the
+    /// handle is stale. Sentinel 0 = no gen tracking (used for variants
+    /// that don't reference a slab-allocated object: vm_reservation,
+    /// empty).
+    expected_gen: u32 = 0,
 
     pub fn processRights(self: @This()) ProcessRights {
         return @bitCast(self.rights);
@@ -147,6 +157,22 @@ pub const KernelObject = union(enum) {
     thread: *Thread,
     vm: *Vm,
     empty: void,
+
+    /// Read the current SecureSlab generation for the backing slot of
+    /// the variants that reference a slab-allocated `*T`. Used when
+    /// issuing a capability handle to snapshot the gen, and when
+    /// verifying a handle at lookup.
+    pub fn currentGen(self: @This()) u32 {
+        return switch (self) {
+            .process => |p| @truncate(secure_slab.genOf(Process, p)),
+            .dead_process => |p| @truncate(secure_slab.genOf(Process, p)),
+            .thread => |t| @truncate(secure_slab.genOf(Thread, t)),
+            .shared_memory => |s| @truncate(secure_slab.genOf(SharedMemory, s)),
+            .device_region => |d| @truncate(secure_slab.genOf(DeviceRegion, d)),
+            .vm => |v| @truncate(secure_slab.genOf(Vm, v)),
+            .vm_reservation, .empty => 0,
+        };
+    }
 };
 
 pub const UserViewEntryType = enum(u8) {

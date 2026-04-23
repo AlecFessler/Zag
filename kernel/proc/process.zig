@@ -174,10 +174,12 @@ pub const Process = struct {
         std.debug.assert(self.perm_table[slot].object == .empty);
         const handle_id = self.handle_counter;
         self.handle_counter += 1;
+        const object: KernelObject = .{ .thread = thread };
         self.perm_table[slot] = .{
             .handle = handle_id,
-            .object = .{ .thread = thread },
+            .object = object,
             .rights = @as(u16, @as(u8, @bitCast(rights))),
+            .expected_gen = object.currentGen(),
         };
         self.perm_count += 1;
         _ = thread.handle_refcount.fetchAdd(1, .acq_rel);
@@ -661,9 +663,17 @@ pub const Process = struct {
     }
 
     /// Look up a handle while the caller already holds perm_lock.
+    /// Stale-gen entries are reported as missing: the backing SecureSlab
+    /// slot has been freed (and possibly reallocated) since the handle
+    /// was issued, so the `*T` in the entry no longer refers to the
+    /// object the caller thinks it does.
     pub fn getPermByHandleLocked(self: *const Process, handle_id: u64) ?PermissionEntry {
         for (self.perm_table) |entry| {
-            if (entry.object != .empty and entry.handle == handle_id) return entry;
+            if (entry.object == .empty or entry.handle != handle_id) continue;
+            if (entry.expected_gen != 0 and entry.object.currentGen() != entry.expected_gen) {
+                return null;
+            }
+            return entry;
         }
         return null;
     }
@@ -677,6 +687,7 @@ pub const Process = struct {
                 self.handle_counter += 1;
                 slot.* = entry_in;
                 slot.handle = handle_id;
+                slot.expected_gen = entry_in.object.currentGen();
                 self.perm_count += 1;
                 // Increment refcount on referenced object
                 switch (entry_in.object) {
