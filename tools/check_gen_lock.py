@@ -914,10 +914,16 @@ def analyze_entry(
         concat += " " + file_lines[idx]
     env: dict[str, str] = {}
     self_alive: set[str] = set()
+    is_syscall_entry = entry.name.startswith("sys")
     for pname, ptype in param_types_from_header(concat):
         ty = parse_type_ref(ptype)
         if ty and ty in slab_types:
             env[pname] = ty
+            # Syscall dispatchers invoke `sys*` entries with proc/thread
+            # resolved from the scheduler, so the pointer is self-alive
+            # by construction. Fault handlers have no such contract.
+            if is_syscall_entry and ty in ("Process", "Thread"):
+                self_alive.add(pname)
 
     accesses: dict[str, list[Access]] = {}
     lock_ops: list[LockOp] = []

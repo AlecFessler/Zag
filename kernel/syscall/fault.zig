@@ -421,6 +421,9 @@ pub fn sysFaultReadMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64
     const buf_end = std.math.add(u64, buf_ptr, len) catch return E_BADADDR;
     if (!address.AddrSpacePartition.user.contains(buf_end -| 1)) return E_BADADDR;
 
+    target._gen_lock.lock();
+    defer target._gen_lock.unlock();
+
     // Read from target process's virtual address space via physmap.
     // Pre-fault both sides: demand-page the target page so debuggers can
     // read uncommitted-yet-reserved pages, and demand-page the caller's
@@ -469,6 +472,9 @@ pub fn sysFaultWriteMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i6
     if (!address.AddrSpacePartition.user.contains(buf_ptr)) return E_BADADDR;
     const buf_end = std.math.add(u64, buf_ptr, len) catch return E_BADADDR;
     if (!address.AddrSpacePartition.user.contains(buf_end -| 1)) return E_BADADDR;
+
+    target._gen_lock.lock();
+    defer target._gen_lock.unlock();
 
     // Write to target process's virtual address space via physmap (bypasses page perms).
     // Pre-fault both sides: demand-page the target page (even uncommitted
@@ -526,10 +532,15 @@ pub fn sysFaultSetThreadMode(thread_handle: u64, mode: u64) i64 {
     //   1. External handler: target_proc.fault_handler_proc == proc
     //   2. Self-handling:    target_proc == proc AND proc's slot 0 has
     //                        the fault_handler ProcessRights bit set.
+    target_thread._gen_lock.lock();
     const target_proc = target_thread.process;
+    target_thread._gen_lock.unlock();
+    target_proc._gen_lock.lock();
+    const handler_ok = target_proc.fault_handler_proc == proc;
+    target_proc._gen_lock.unlock();
     const is_self_handler = target_proc == proc and
         proc.perm_table[0].processRights().fault_handler;
-    if (target_proc.fault_handler_proc != proc and !is_self_handler) return E_PERM;
+    if (!handler_ok and !is_self_handler) return E_PERM;
 
     // Update exclude flags on the thread's perm entry in caller's table
     proc.perm_lock.lock();
