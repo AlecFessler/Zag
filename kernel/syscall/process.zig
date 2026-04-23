@@ -53,8 +53,12 @@ pub fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_a
     var check_addr = elf_ptr;
     while (check_addr < elf_end) {
         const node = proc.vmm.findNode(VAddr.fromInt(check_addr)) orelse return E_BADADDR;
-        if (!node.rights.read) return E_BADADDR;
-        check_addr = node.end();
+        node._gen_lock.lock();
+        const readable = node.rights.read;
+        const node_end = node.end();
+        node._gen_lock.unlock();
+        if (!readable) return E_BADADDR;
+        check_addr = node_end;
     }
 
     const self_entry = proc.getPermByHandle(0) orelse return E_PERM;
