@@ -134,10 +134,13 @@ pub fn sysMemDmaMap(device_handle: u64, shm_handle: u64) i64 {
         return E_PERM;
     }
     const device = dev_entry.object.device_region;
+    device._gen_lock.lock();
     if (device.device_type != .mmio) {
+        device._gen_lock.unlock();
         proc.perm_lock.unlock();
         return E_INVAL;
     }
+    device._gen_lock.unlock();
 
     const shm_entry = proc.getPermByHandleLocked(shm_handle) orelse {
         proc.perm_lock.unlock();
@@ -159,13 +162,17 @@ pub fn sysMemDmaMap(device_handle: u64, shm_handle: u64) i64 {
         return E_NOMEM;
     }
 
+    shm._gen_lock.lock();
+    const num_pages = shm.num_pages;
+    shm._gen_lock.unlock();
+
     const dma_base = arch.iommu.mapDmaPages(device, shm) catch {
         shm.decRef();
         return E_NOMEM;
     };
     arch.iommu.enableDmaRemapping();
-    proc.addDmaMapping(device, shm, dma_base, shm.num_pages) catch {
-        arch.iommu.unmapDmaPages(device, dma_base, shm.num_pages);
+    proc.addDmaMapping(device, shm, dma_base, num_pages) catch {
+        arch.iommu.unmapDmaPages(device, dma_base, num_pages);
         shm.decRef();
         return E_NORES;
     };

@@ -174,6 +174,9 @@ pub fn sysMemShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
         .execute = shm_entry.shmRights().execute,
     };
 
+    shm._gen_lock.lock();
+    defer shm._gen_lock.unlock();
+
     const range_end = std.math.add(u64, offset, shm.size()) catch return E_INVAL;
     if (range_end > vm_res.original_size) return E_INVAL;
 
