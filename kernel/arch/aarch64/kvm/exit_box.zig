@@ -216,24 +216,29 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
     const thread = entry.object.thread;
 
     vm_obj._gen_lock.lock();
-    defer vm_obj._gen_lock.unlock();
 
-    const vcpu_obj = vcpu_mod.vcpuFromThread(vm_obj, thread) orelse return E_NOENT;
+    const vcpu_obj = vcpu_mod.vcpuFromThread(vm_obj, thread) orelse {
+        vm_obj._gen_lock.unlock();
+        return E_NOENT;
+    };
 
     const box = vm_obj.exitBox();
     box.lock.lock();
 
     const vcpu_index = vcpuIndex(vm_obj, vcpu_obj) orelse {
         box.lock.unlock();
+        vm_obj._gen_lock.unlock();
         return E_NOENT;
     };
     if (!box.pending[vcpu_index]) {
         box.lock.unlock();
+        vm_obj._gen_lock.unlock();
         return E_NOENT;
     }
 
     box.clearPendingLocked(vcpu_index);
     box.lock.unlock();
+    vm_obj._gen_lock.unlock();
 
     if (action_ptr == 0) return E_BADADDR;
     if (!zag.memory.address.AddrSpacePartition.user.contains(action_ptr)) return E_BADADDR;
@@ -259,25 +264,32 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
 
     switch (raw_tag) {
         0 => {
+            vm_obj._gen_lock.lock();
             vcpu_obj.guest_state = std.mem.bytesAsValue(vm_hw.GuestState, action_buf[8..][0..@sizeOf(vm_hw.GuestState)]).*;
             vcpu_obj.storeState(.running);
+            vm_obj._gen_lock.unlock();
             resumeVcpuThread(thread);
         },
         1 => {
             const interrupt = std.mem.bytesAsValue(vm_hw.GuestInterrupt, action_buf[8..][0..@sizeOf(vm_hw.GuestInterrupt)]).*;
             // No vector-rejection check: GICv3 §2.2.1 makes every INTID
             // (0..1019) a legitimate injection target.
+            vm_obj._gen_lock.lock();
             vcpu_mod.injectInterrupt(&vcpu_obj.guest_state, interrupt);
             vcpu_obj.storeState(.running);
+            vm_obj._gen_lock.unlock();
             resumeVcpuThread(thread);
         },
         2 => {
             const exception = std.mem.bytesAsValue(vm_hw.GuestException, action_buf[8..][0..@sizeOf(vm_hw.GuestException)]).*;
+            vm_obj._gen_lock.lock();
             vm_hw.injectException(&vcpu_obj.guest_state, exception);
             vcpu_obj.storeState(.running);
+            vm_obj._gen_lock.unlock();
             resumeVcpuThread(thread);
         },
         3 => {
+            // guestMap takes vm_obj._gen_lock itself; must not be held.
             const payload = action_buf[8..];
             const host_vaddr = std.mem.readInt(u64, payload[0..8], .little);
             const guest_addr = std.mem.readInt(u64, payload[8..16], .little);
@@ -285,12 +297,18 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
             const rights = payload[24];
             const result = vm_mod.guestMap(proc, vm_handle, host_vaddr, guest_addr, map_size, @as(u64, rights));
             if (result != 0) return result;
+            vm_obj._gen_lock.lock();
             vcpu_obj.storeState(.running);
+            vm_obj._gen_lock.unlock();
             resumeVcpuThread(thread);
         },
         4 => {
+            vm_obj._gen_lock.lock();
             vcpu_obj.storeState(.exited);
+            vm_obj._gen_lock.unlock();
+            thread._gen_lock.lock();
             thread.state = .exited;
+            thread._gen_lock.unlock();
         },
         else => return E_INVAL,
     }

@@ -238,10 +238,12 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
     const thread = entry.object.thread;
 
     vm_obj._gen_lock.lock();
-    defer vm_obj._gen_lock.unlock();
 
     // Find which vCPU this thread belongs to
-    const vcpu_obj = vcpu_mod.vcpuFromThread(vm_obj, thread) orelse return E_NOENT;
+    const vcpu_obj = vcpu_mod.vcpuFromThread(vm_obj, thread) orelse {
+        vm_obj._gen_lock.unlock();
+        return E_NOENT;
+    };
 
     const box = vm_obj.exitBox();
     box.lock.lock();
@@ -249,15 +251,18 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
     // Check this vCPU actually has a pending exit
     const vcpu_index = vcpuIndex(vm_obj, vcpu_obj) orelse {
         box.lock.unlock();
+        vm_obj._gen_lock.unlock();
         return E_NOENT;
     };
     if (!box.pending[vcpu_index]) {
         box.lock.unlock();
+        vm_obj._gen_lock.unlock();
         return E_NOENT;
     }
 
     box.clearPendingLocked(vcpu_index);
     box.lock.unlock();
+    vm_obj._gen_lock.unlock();
 
     // Validate action_ptr after confirming the exit token is valid
     if (action_ptr == 0) return E_BADADDR;
@@ -290,8 +295,10 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
     switch (raw_tag) {
         0 => {
             // resume_guest: payload is GuestState at offset 8
+            vm_obj._gen_lock.lock();
             vcpu_obj.guest_state = std.mem.bytesAsValue(vm_hw.GuestState, action_buf[8..][0..@sizeOf(vm_hw.GuestState)]).*;
             vcpu_obj.storeState(.running);
+            vm_obj._gen_lock.unlock();
             resumeVcpuThread(thread);
         },
         1 => {
@@ -303,21 +310,26 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
             // an attacker VMM could write an illegal vector directly into
             // VM_ENTRY_INTR_INFO and corrupt guest exception handling.
             if (interrupt.vector < 32) return E_INVAL;
+            vm_obj._gen_lock.lock();
             vm_hw.injectInterrupt(&vcpu_obj.guest_state, interrupt);
             vcpu_obj.storeState(.running);
+            vm_obj._gen_lock.unlock();
             resumeVcpuThread(thread);
         },
         2 => {
             // inject_exception: payload is GuestException at offset 8
             const exception = std.mem.bytesAsValue(vm_hw.GuestException, action_buf[8..][0..@sizeOf(vm_hw.GuestException)]).*;
+            vm_obj._gen_lock.lock();
             vm_hw.injectException(&vcpu_obj.guest_state, exception);
             vcpu_obj.storeState(.running);
+            vm_obj._gen_lock.unlock();
             resumeVcpuThread(thread);
         },
         3 => {
             // map_memory: payload is {host_vaddr, guest_addr, size, rights} at offset 8.
             // This is the intentional reply→syscall bridge: vm.guestMap is the public
             // memory-mapping entry point, and the reply path forwards to it directly.
+            // guestMap takes vm_obj._gen_lock itself, so we must NOT hold it here.
             const payload = action_buf[8..];
             const host_vaddr = std.mem.readInt(u64, payload[0..8], .little);
             const guest_addr = std.mem.readInt(u64, payload[8..16], .little);
@@ -325,13 +337,19 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
             const rights = payload[24];
             const result = vm_mod.guestMap(proc, vm_handle, host_vaddr, guest_addr, map_size, @as(u64, rights));
             if (result != 0) return result;
+            vm_obj._gen_lock.lock();
             vcpu_obj.storeState(.running);
+            vm_obj._gen_lock.unlock();
             resumeVcpuThread(thread);
         },
         4 => {
             // kill
+            vm_obj._gen_lock.lock();
             vcpu_obj.storeState(.exited);
+            vm_obj._gen_lock.unlock();
+            thread._gen_lock.lock();
             thread.state = .exited;
+            thread._gen_lock.unlock();
         },
         else => return E_INVAL,
     }
