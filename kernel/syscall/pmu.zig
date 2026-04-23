@@ -176,6 +176,8 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     }
     const state = target_thread.pmu_state.?;
 
+    state._gen_lock.lock();
+    defer state._gen_lock.unlock();
     if (is_self) {
         arch.pmu.pmuStart(state, slice) catch return E_INVAL;
     } else {
@@ -215,7 +217,9 @@ pub fn sysPmuRead(proc: *Process, thread_handle: u64, sample_ptr: u64) i64 {
         }
 
         const state = target_thread.pmu_state orelse return E_INVAL; // §4.52.6
+        state._gen_lock.lock();
         arch.pmu.pmuRead(state, &sample);
+        state._gen_lock.unlock();
     }
     sample.timestamp = arch.time.getMonotonicClock().now();
 
@@ -249,6 +253,8 @@ pub fn sysPmuReset(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
 
     const state = target_thread.pmu_state orelse return E_INVAL; // §4.53.6
 
+    state._gen_lock.lock();
+    defer state._gen_lock.unlock();
     // Self vs. remote: a .faulted target can only be `currentThread()`
     // if the thread is handling its own fault (thread-level self-handler,
     // §2.12.7) — otherwise the faulted thread is sitting in its handler's
@@ -297,11 +303,13 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
 
     const state = target_thread.pmu_state orelse return E_INVAL; // §4.54.5
 
+    state._gen_lock.lock();
     if (is_self) {
         arch.pmu.pmuStop(state);
     } else {
         arch.pmu.pmuClearState(state);
     }
+    state._gen_lock.unlock();
     target_thread.pmu_state = null;
     const gen = state._gen_lock.currentGen();
     slab_instance.destroy(state, gen) catch unreachable;
