@@ -7,6 +7,7 @@ const x64 = zag.arch.x64;
 
 const ArchCpuContext = zag.arch.dispatch.cpu.ArchCpuContext;
 const Process = zag.proc.process.Process;
+const Range = zag.utils.range.Range;
 const SyscallResult = zag.syscall.dispatch.SyscallResult;
 const Thread = zag.sched.thread.Thread;
 
@@ -76,18 +77,18 @@ pub fn bspBootHandoff(arrived_at_el2: bool) void {
     }
 }
 
-pub fn setVmAllocator(alloc: std.mem.Allocator) void {
+pub fn initVmSlab(data_range: Range, ptrs_range: Range, links_range: Range) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vm.allocator = alloc,
-        .aarch64 => aarch64.kvm.vm.allocator = alloc,
+        .x86_64 => x64.kvm.vm.slab_instance = x64.kvm.vm.VmAllocator.init(data_range, ptrs_range, links_range),
+        .aarch64 => aarch64.kvm.vm.slab_instance = aarch64.kvm.vm.VmAllocator.init(data_range, ptrs_range, links_range),
         else => {},
     }
 }
 
-pub fn setVcpuAllocator(alloc: std.mem.Allocator) void {
+pub fn initVcpuSlab(data_range: Range, ptrs_range: Range, links_range: Range) void {
     switch (builtin.cpu.arch) {
-        .x86_64 => x64.kvm.vcpu.allocator = alloc,
-        .aarch64 => aarch64.kvm.vcpu.allocator = alloc,
+        .x86_64 => x64.kvm.vcpu.slab_instance = x64.kvm.vcpu.VCpuAllocator.init(data_range, ptrs_range, links_range),
+        .aarch64 => aarch64.kvm.vcpu.slab_instance = aarch64.kvm.vcpu.VCpuAllocator.init(data_range, ptrs_range, links_range),
         else => {},
     }
 }

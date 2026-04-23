@@ -5,7 +5,7 @@ const arch = zag.arch.dispatch;
 const kprof = zag.kprof.trace_id;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
-const slab_mod = zag.memory.allocators.slab;
+const secure_slab = zag.memory.allocators.secure_slab;
 
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
@@ -52,19 +52,25 @@ pub const VmNode = struct {
     }
 };
 
-const VmNodeSlab = slab_mod.SlabAllocator(VmNode, false, 0, 64, true);
+const VmNodeSlab = secure_slab.SecureSlab(VmNode, 256);
 var vm_node_slab: VmNodeSlab = undefined;
 
-pub fn initSlabs(node_backing: std.mem.Allocator) !void {
-    vm_node_slab = try VmNodeSlab.init(node_backing);
+pub fn initSlabs(
+    data_range: zag.utils.range.Range,
+    ptrs_range: zag.utils.range.Range,
+    links_range: zag.utils.range.Range,
+) void {
+    vm_node_slab = VmNodeSlab.init(data_range, ptrs_range, links_range);
 }
 
 fn allocVmNode() !*VmNode {
-    return vm_node_slab.allocator().create(VmNode);
+    const r = try vm_node_slab.create();
+    return r.ptr;
 }
 
 fn freeVmNode(node: *VmNode) void {
-    vm_node_slab.allocator().destroy(node);
+    const gen = VmNodeSlab.currentGen(node);
+    vm_node_slab.destroy(node, gen) catch unreachable;
 }
 
 fn cmpAddrToNode(ctx_addr: u64, item: *VmNode) std.math.Order {

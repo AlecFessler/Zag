@@ -2,7 +2,7 @@ const std = @import("std");
 const zag = @import("zag");
 
 const PAddr = zag.memory.address.PAddr;
-const SlabAllocator = zag.memory.allocators.slab.SlabAllocator;
+const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
 const SpinLock = zag.utils.sync.SpinLock;
 
 pub const DeviceType = enum(u8) {
@@ -64,14 +64,24 @@ pub const DeviceRegion = struct {
     },
 };
 
-const DeviceRegionSlab = SlabAllocator(DeviceRegion, false, 0, 32, true);
+const DeviceRegionSlab = SecureSlab(DeviceRegion, 256);
 
 var device_region_slab: DeviceRegionSlab = undefined;
 var slab_initialized = false;
 
-pub fn initSlab(backing: std.mem.Allocator) !void {
-    device_region_slab = try DeviceRegionSlab.init(backing);
+pub fn initSlab(
+    data_range: zag.utils.range.Range,
+    ptrs_range: zag.utils.range.Range,
+    links_range: zag.utils.range.Range,
+) void {
+    device_region_slab = DeviceRegionSlab.init(data_range, ptrs_range, links_range);
     slab_initialized = true;
+}
+
+fn allocRegion() !*DeviceRegion {
+    std.debug.assert(slab_initialized);
+    const r = try device_region_slab.create();
+    return r.ptr;
 }
 
 pub fn createMmio(
@@ -86,8 +96,7 @@ pub fn createMmio(
     pci_dev: u8,
     pci_func: u8,
 ) !*DeviceRegion {
-    std.debug.assert(slab_initialized);
-    const dr = try device_region_slab.allocator().create(DeviceRegion);
+    const dr = try allocRegion();
     dr.* = .{
         .device_type = .mmio,
         .device_class = device_class,
@@ -120,8 +129,7 @@ pub fn createPortIo(
     pci_dev: u8,
     pci_func: u8,
 ) !*DeviceRegion {
-    std.debug.assert(slab_initialized);
-    const dr = try device_region_slab.allocator().create(DeviceRegion);
+    const dr = try allocRegion();
     dr.* = .{
         .device_type = .port_io,
         .device_class = device_class,
@@ -150,8 +158,7 @@ pub fn createDisplay(
     fb_stride: u16,
     fb_pixel_format: u8,
 ) !*DeviceRegion {
-    std.debug.assert(slab_initialized);
-    const dr = try device_region_slab.allocator().create(DeviceRegion);
+    const dr = try allocRegion();
     dr.* = .{
         .device_type = .mmio,
         .device_class = .display,
@@ -167,5 +174,6 @@ pub fn createDisplay(
 }
 
 pub fn destroy(dr: *DeviceRegion) void {
-    device_region_slab.allocator().destroy(dr);
+    const gen = DeviceRegionSlab.currentGen(dr);
+    device_region_slab.destroy(dr, gen) catch unreachable;
 }

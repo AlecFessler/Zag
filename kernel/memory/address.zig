@@ -94,15 +94,56 @@ pub const KernelVA = struct {
             .start = thread_slab_ptrs.end,
             .end = thread_slab_ptrs.end + SLAB_RESERVATION,
         };
+        pub const kvm_vm_slab_ptrs: Range = .{
+            .start = thread_slab_links.end,
+            .end = thread_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const kvm_vm_slab_links: Range = .{
+            .start = kvm_vm_slab_ptrs.end,
+            .end = kvm_vm_slab_ptrs.end + SLAB_RESERVATION,
+        };
+        pub const kvm_vcpu_slab_ptrs: Range = .{
+            .start = kvm_vm_slab_links.end,
+            .end = kvm_vm_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const kvm_vcpu_slab_links: Range = .{
+            .start = kvm_vcpu_slab_ptrs.end,
+            .end = kvm_vcpu_slab_ptrs.end + SLAB_RESERVATION,
+        };
+        pub const device_region_slab_ptrs: Range = .{
+            .start = kvm_vcpu_slab_links.end,
+            .end = kvm_vcpu_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const device_region_slab_links: Range = .{
+            .start = device_region_slab_ptrs.end,
+            .end = device_region_slab_ptrs.end + SLAB_RESERVATION,
+        };
+        pub const vm_node_slab_ptrs: Range = .{
+            .start = device_region_slab_links.end,
+            .end = device_region_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const vm_node_slab_links: Range = .{
+            .start = vm_node_slab_ptrs.end,
+            .end = vm_node_slab_ptrs.end + SLAB_RESERVATION,
+        };
+        pub const proc_slab_ptrs: Range = .{
+            .start = vm_node_slab_links.end,
+            .end = vm_node_slab_links.end + SLAB_RESERVATION,
+        };
+        pub const proc_slab_links: Range = .{
+            .start = proc_slab_ptrs.end,
+            .end = proc_slab_ptrs.end + SLAB_RESERVATION,
+        };
 
         pub const range: Range = .{
             .start = vm_node_slab.start,
-            .end = thread_slab_links.end,
+            .end = proc_slab_links.end,
         };
     };
 };
 
 comptime {
+    @setEvalBranchQuota(20000);
     const T = AddrSpacePartition;
     const info = @typeInfo(T).@"struct";
     const decls = info.decls;

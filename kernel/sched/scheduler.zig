@@ -25,9 +25,6 @@ const Timer = zag.arch.timer.Timer;
 const VCpuAllocator = arch.vm.VCpuAllocator;
 const VmAllocator = arch.vm.VmAllocator;
 
-var proc_alloc_instance: ProcessAllocator = undefined;
-var vm_alloc_instance: VmAllocator = undefined;
-var vcpu_alloc_instance: VCpuAllocator = undefined;
 
 pub var idle_process: *Process = undefined;
 pub var initialized: bool = false;
@@ -857,8 +854,11 @@ pub fn switchToThread(current: *Thread, target: *Thread, ctx: *ArchCpuContext, e
 }
 
 pub fn globalInit() !void {
-    proc_alloc_instance = try ProcessAllocator.init(memory_init.proc_slab_backing.allocator());
-    process_mod.allocator = proc_alloc_instance.allocator();
+    process_mod.slab_instance = ProcessAllocator.init(
+        address.KernelVA.KernelAllocators.proc_slab,
+        address.KernelVA.KernelAllocators.proc_slab_ptrs,
+        address.KernelVA.KernelAllocators.proc_slab_links,
+    );
 
     thread_mod.slab_instance = ThreadAllocator.init(
         address.KernelVA.KernelAllocators.thread_slab,
@@ -866,11 +866,16 @@ pub fn globalInit() !void {
         address.KernelVA.KernelAllocators.thread_slab_links,
     );
 
-    vm_alloc_instance = try VmAllocator.init(memory_init.kvm_vm_slab_backing.allocator());
-    arch.vm.setVmAllocator(vm_alloc_instance.allocator());
-
-    vcpu_alloc_instance = try VCpuAllocator.init(memory_init.kvm_vcpu_slab_backing.allocator());
-    arch.vm.setVcpuAllocator(vcpu_alloc_instance.allocator());
+    arch.vm.initVmSlab(
+        address.KernelVA.KernelAllocators.kvm_vm_slab,
+        address.KernelVA.KernelAllocators.kvm_vm_slab_ptrs,
+        address.KernelVA.KernelAllocators.kvm_vm_slab_links,
+    );
+    arch.vm.initVcpuSlab(
+        address.KernelVA.KernelAllocators.kvm_vcpu_slab,
+        address.KernelVA.KernelAllocators.kvm_vcpu_slab_ptrs,
+        address.KernelVA.KernelAllocators.kvm_vcpu_slab_links,
+    );
 
     idle_process = try Process.createIdle();
 

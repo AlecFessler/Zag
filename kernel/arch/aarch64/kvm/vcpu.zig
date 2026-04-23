@@ -46,7 +46,7 @@ const vmid_mod = kvm.vmid;
 
 const PAddr = zag.memory.address.PAddr;
 const Process = zag.proc.process.Process;
-const SlabAllocator = zag.memory.allocators.slab.SlabAllocator;
+const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
 const SpinLock = zag.utils.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
@@ -54,8 +54,8 @@ const VgicVcpuState = kvm.vgic.VcpuState;
 const Vm = kvm.vm.Vm;
 const VtimerState = kvm.vtimer.VtimerState;
 
-pub const VCpuAllocator = SlabAllocator(VCpu, false, 0, 64, true);
-pub var allocator: std.mem.Allocator = undefined;
+pub const VCpuAllocator = SecureSlab(VCpu, 256);
+pub var slab_instance: VCpuAllocator = undefined;
 
 /// State of a vCPU. Accessed from multiple threads (the vCPU's own thread,
 /// `kickRunningVcpus`, the exit handler, and `vm_reply`); all reads/writes
@@ -112,8 +112,9 @@ pub const VCpu = struct {
 /// Create a vCPU: allocate the struct, create a kernel thread running
 /// `vcpuEntryPoint`, link them.
 pub fn create(vm_obj: *Vm) !*VCpu {
-    const vcpu_obj = try allocator.create(VCpu);
-    errdefer allocator.destroy(vcpu_obj);
+    const vcpu_alloc = try slab_instance.create();
+    const vcpu_obj = vcpu_alloc.ptr;
+    errdefer slab_instance.destroy(vcpu_obj, vcpu_alloc.gen) catch unreachable;
 
     const proc = vm_obj.owner;
 
@@ -170,7 +171,8 @@ pub fn destroy(vcpu_obj: *VCpu) void {
 
     sched.removeFromAnyRunQueue(thread);
 
-    allocator.destroy(vcpu_obj);
+    const gen = VCpuAllocator.currentGen(vcpu_obj);
+    slab_instance.destroy(vcpu_obj, gen) catch unreachable;
 }
 
 /// Find the VCpu that owns a given thread within a VM.

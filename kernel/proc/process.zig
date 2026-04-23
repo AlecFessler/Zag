@@ -26,7 +26,7 @@ const Priority = zag.sched.thread.Priority;
 const ProcessRights = zag.perms.permissions.ProcessRights;
 const RestartContext = zag.proc.restart_context.RestartContext;
 const SharedMemory = zag.memory.shared.SharedMemory;
-const SlabAllocator = zag.memory.allocators.slab.SlabAllocator;
+const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
 const SpinLock = zag.utils.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
@@ -47,7 +47,7 @@ pub const DmaMapping = struct {
     active: bool,
 };
 
-pub const ProcessAllocator = SlabAllocator(Process, false, 0, 64, true);
+pub const ProcessAllocator = SecureSlab(Process, 256);
 
 pub const Process = struct {
     pid: u64,
@@ -713,7 +713,7 @@ pub const Process = struct {
                 if (referenced_proc) |p| {
                     const prev = @atomicRmw(u32, &p.handle_refcount, .Sub, 1, .acq_rel);
                     if (prev == 1 and p.cleanup_complete) {
-                        allocator.destroy(p);
+                        { const gen = ProcessAllocator.currentGen(p); slab_instance.destroy(p, gen) catch unreachable; }
                     }
                 }
                 if (referenced_thread) |t| t.releaseRef();
@@ -1188,13 +1188,13 @@ pub const Process = struct {
                 .process => |p| {
                     const prev = @atomicRmw(u32, &p.handle_refcount, .Sub, 1, .acq_rel);
                     if (prev == 1 and p.cleanup_complete) {
-                        allocator.destroy(p);
+                        { const gen = ProcessAllocator.currentGen(p); slab_instance.destroy(p, gen) catch unreachable; }
                     }
                 },
                 .dead_process => |p| {
                     const prev = @atomicRmw(u32, &p.handle_refcount, .Sub, 1, .acq_rel);
                     if (prev == 1 and p.cleanup_complete) {
-                        allocator.destroy(p);
+                        { const gen = ProcessAllocator.currentGen(p); slab_instance.destroy(p, gen) catch unreachable; }
                     }
                 },
                 .vm_reservation, .empty => {},
@@ -1226,7 +1226,8 @@ pub const Process = struct {
         self.cleanup_complete = true;
         // Only free if no external handles remain
         if (@atomicLoad(u32, &self.handle_refcount, .acquire) == 0) {
-            allocator.destroy(self);
+            const gen = ProcessAllocator.currentGen(self);
+            slab_instance.destroy(self, gen) catch unreachable;
         }
     }
 
@@ -1313,12 +1314,13 @@ pub const Process = struct {
     }
 
     pub fn create(elf_binary: []const u8, initial_rights: ProcessRights, parent: ?*Process, thr_rights: ThreadHandleRights, max_priority: Priority) !*Process {
-        const proc = try allocator.create(Process);
+        const proc_alloc = try slab_instance.create();
+        const proc = proc_alloc.ptr;
         // The late-stage TooManyChildren branch below calls proc.kill()
         // which drives its own teardown. In that case the errdefers in
         // this function must be skipped to avoid double-free.
         var skip_cleanup = false;
-        errdefer if (!skip_cleanup) allocator.destroy(proc);
+        errdefer if (!skip_cleanup) slab_instance.destroy(proc, proc_alloc.gen) catch unreachable;
 
         proc.* = .{
             .pid = @atomicRmw(u64, &pid_counter, .Add, 1, .monotonic),
@@ -1440,7 +1442,8 @@ pub const Process = struct {
     }
 
     pub fn createIdle() !*Process {
-        const proc = try allocator.create(Process);
+        const proc_alloc = try slab_instance.create();
+        const proc = proc_alloc.ptr;
         proc.* = .{
             .pid = @atomicRmw(u64, &pid_counter, .Add, 1, .monotonic),
             .parent = null,
@@ -1797,5 +1800,5 @@ fn applyRelocations(proc: *Process, aslr_base: u64, elf_binary: []const u8, rela
     }
 }
 
-pub var allocator: std.mem.Allocator = undefined;
+pub var slab_instance: ProcessAllocator = undefined;
 var pid_counter: u64 = 1;

@@ -22,7 +22,7 @@ const Lapic = lapic_mod.Lapic;
 const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Process = zag.proc.process.Process;
-const SlabAllocator = zag.memory.allocators.slab.SlabAllocator;
+const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
 const SpinLock = zag.utils.sync.SpinLock;
 const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
 const VAddr = zag.memory.address.VAddr;
@@ -36,9 +36,9 @@ const LAPIC_BASE: u64 = 0xFEE00000;
 /// Intel 82093AA datasheet, Section 3.0: default IOAPIC base.
 const IOAPIC_BASE: u64 = 0xFEC00000;
 
-pub const VmAllocator = SlabAllocator(Vm, false, 0, 64, true);
+pub const VmAllocator = SecureSlab(Vm, 256);
 
-pub var allocator: std.mem.Allocator = undefined;
+pub var slab_instance: VmAllocator = undefined;
 
 var vm_id_counter: u64 = 1;
 
@@ -82,7 +82,8 @@ pub const Vm = struct {
         // Clear owner's vm pointer
         self.owner.vm = null;
 
-        allocator.destroy(self);
+        const gen = VmAllocator.currentGen(self);
+        slab_instance.destroy(self, gen) catch unreachable;
     }
 
     /// Returns a pointer to the VM's exit box. Used by `vcpu` and
@@ -212,11 +213,12 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
     if (user_policy.num_cr_policies > vm_hw.VmPolicy.MAX_CR_POLICIES) return E_INVAL;
 
     // Allocate VM struct
-    const vm_obj = allocator.create(Vm) catch return E_NOMEM;
+    const vm_alloc = slab_instance.create() catch return E_NOMEM;
+    const vm_obj = vm_alloc.ptr;
 
     // Allocate arch-specific structures
     const arch_structures = vm_hw.vmAllocStructures() orelse {
-        allocator.destroy(vm_obj);
+        slab_instance.destroy(vm_obj, vm_alloc.gen) catch unreachable;
         return E_NOMEM;
     };
 
@@ -261,7 +263,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
                 j += 1;
             }
             vm_hw.vmFreeStructures(arch_structures);
-            allocator.destroy(vm_obj);
+            slab_instance.destroy(vm_obj, vm_alloc.gen) catch unreachable;
             return E_NOMEM;
         };
 
@@ -283,7 +285,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
                 j += 1;
             }
             vm_hw.vmFreeStructures(arch_structures);
-            allocator.destroy(vm_obj);
+            slab_instance.destroy(vm_obj, vm_alloc.gen) catch unreachable;
             return E_MAXCAP;
         };
         inserted_handles[inserted_count] = handle_id;
