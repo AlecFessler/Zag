@@ -615,7 +615,16 @@ def infer_rhs_type(
     return None
 
 
-MAX_INLINE_DEPTH = 6
+MAX_INLINE_DEPTH = 32
+# Chosen well above the deepest observed call chain (measured at 6 on
+# this kernel). Raising the cap didn't change findings or runtime;
+# recursion bottoms out via `visited` regardless. Keep a cap anyway as
+# a defensive bound against pathological inputs.
+
+# Instrumentation: records every time the depth cap prevents an inline
+# expansion. Keyed by (caller_key, callee_key); values count hits.
+# Populated by _walk_body, dumped by `--depth-stats`.
+DEPTH_CAP_HITS: dict[tuple[str, str], int] = {}
 
 # Method names on `std.atomic.Value(T)` / `std.atomic.Atomic(T)`. If a
 # slab-field access is followed by one of these, the access is the
@@ -1025,7 +1034,13 @@ def _walk_body(
                     src_line=src_line,
                 ))
                 continue
-            if depth >= MAX_INLINE_DEPTH or key in visited:
+            if key in visited:
+                continue
+            if depth >= MAX_INLINE_DEPTH:
+                caller = call_stack[-1] if call_stack else "<root>"
+                DEPTH_CAP_HITS[(caller, f"{recv_ty}.{method}")] = (
+                    DEPTH_CAP_HITS.get((caller, f"{recv_ty}.{method}"), 0) + 1
+                )
                 continue
             # Build a full param→caller-ident substitution map. For method
             # calls the first "param" is the receiver (substitute with
@@ -1078,7 +1093,13 @@ def _walk_body(
             fninfo = fn_index.get(key)
             if fninfo is None:
                 continue
-            if depth >= MAX_INLINE_DEPTH or key in visited:
+            if key in visited:
+                continue
+            if depth >= MAX_INLINE_DEPTH:
+                caller = call_stack[-1] if call_stack else "<root>"
+                DEPTH_CAP_HITS[(caller, f"{recv_ty}.{fn_name}")] = (
+                    DEPTH_CAP_HITS.get((caller, f"{recv_ty}.{fn_name}"), 0) + 1
+                )
                 continue
             # Locate this call in `code` so we can extract the arg list.
             open_paren = -1
@@ -1461,6 +1482,10 @@ def main() -> int:
     p.add_argument("--list-slab-types", action="store_true")
     p.add_argument("--list-methods", action="store_true",
                    help="dump discovered (receiver, method) pairs")
+    p.add_argument("--depth-stats", action="store_true",
+                   help="after analysis, print every (caller, callee) "
+                        "pair where MAX_INLINE_DEPTH blocked an inline "
+                        "expansion (non-empty output = raise the cap)")
     args = p.parse_args()
 
     slab_types = find_slab_types()
@@ -1520,6 +1545,16 @@ def main() -> int:
     print(f"Summary: {len(results)} entries, {total_tracked} tracked idents, "
           f"{total_errs} err, {total_infos} info")
     print(f"         {len(slab_types)} slab-backed types discovered")
+
+    if args.depth_stats:
+        print()
+        total = sum(DEPTH_CAP_HITS.values())
+        print(f"Depth-cap hits (MAX_INLINE_DEPTH={MAX_INLINE_DEPTH}): {total}")
+        if total:
+            for (caller, callee), n in sorted(
+                DEPTH_CAP_HITS.items(), key=lambda kv: -kv[1]
+            ):
+                print(f"  {n:4d}  {caller} -> {callee}")
     return 0
 
 
