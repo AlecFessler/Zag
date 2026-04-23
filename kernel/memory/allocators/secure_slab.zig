@@ -54,9 +54,8 @@ pub const GenLock = extern struct {
     /// Release a lock acquired via `lock` or `lockWithGen`. Clears the
     /// lock bit without touching the generation counter.
     pub fn unlock(self: *GenLock) void {
-        const cur = self.word.load(.monotonic);
-        std.debug.assert(cur & 1 == 1);
-        self.word.store(cur & ~@as(u64, 1), .release);
+        const prev = self.word.fetchAnd(~@as(u64, 1), .release);
+        std.debug.assert(prev & 1 == 1);
     }
 
     /// Spin-CAS-acquire the lock bit while atomically verifying the
@@ -64,6 +63,10 @@ pub const GenLock = extern struct {
     /// Returns `StaleHandle` if the slot has been freed (and possibly
     /// reallocated) since the handle was issued.
     pub fn lockWithGen(self: *GenLock, expected_gen: u63) AccessError!void {
+        // Parity invariant: a live-handle gen is always odd. An even
+        // expected_gen means the caller is holding a reference to a
+        // freed slot — a bug at the issuance site, not a stale handle.
+        std.debug.assert(expected_gen % 2 == 1);
         const unlocked: u64 = (@as(u64, expected_gen) << 1) | 0;
         const locked: u64 = (@as(u64, expected_gen) << 1) | 1;
         while (true) {
@@ -132,6 +135,7 @@ pub fn SecureSlab(
         ptrs_bump: bump.BumpAllocator,
         links_bump: bump.BumpAllocator,
 
+        data_base: u64,
         ptrs_base: u64,
         links_base: u64,
 
@@ -173,12 +177,19 @@ pub fn SecureSlab(
                 @min(max_by_links, max_index_space),
             ));
 
-            const seed: u64 = arch.cpu.getRandom() orelse 0x9E3779B97F4A7C15;
+            // Mix a timestamp into the seed even when RDRAND / RNDR is
+            // available, and use it as sole entropy if hardware RNG is not.
+            // Prevents a deterministic cursor walk in the narrow window
+            // before any hardware RNG has been observed.
+            const ts = arch.time.readTimestamp(false);
+            const hw = arch.cpu.getRandom() orelse 0x9E3779B97F4A7C15;
+            const seed: u64 = hw ^ ts;
 
             return .{
                 .data_bump = bump.BumpAllocator.init(data_range.start, data_range.end),
                 .ptrs_bump = bump.BumpAllocator.init(ptrs_range.start, ptrs_range.end),
                 .links_bump = bump.BumpAllocator.init(links_range.start, links_range.end),
+                .data_base = data_range.start,
                 .ptrs_base = ptrs_range.start,
                 .links_base = links_range.start,
                 .pop_cursor = INVALID_INDEX,
@@ -236,6 +247,10 @@ pub fn SecureSlab(
             ptr: *T,
             expected_gen: u63,
         ) AccessError!void {
+            // Parity invariant: expected_gen must be odd (live slot).
+            // lockWithGen asserts this too; stating it here makes the
+            // destroy-side contract explicit for readers.
+            std.debug.assert(expected_gen % 2 == 1);
             try ptr._gen_lock.lockWithGen(expected_gen);
 
             self.lock.lock();
@@ -323,6 +338,10 @@ pub fn SecureSlab(
         }
 
         fn linkInLocked(self: *Self, idx: u32) void {
+            // Parity invariant: slots on the freelist have even gen.
+            // linkIn is called from growOne (slot fresh at gen=0) and
+            // from destroy (slot just bumped to the next even gen).
+            std.debug.assert(self.ptrAt(idx)._gen_lock.currentGen() % 2 == 0);
             const link = self.linkAt(idx);
             if (self.count_free == 0) {
                 link.* = .{ .prev = idx, .next = idx };
@@ -344,6 +363,10 @@ pub fn SecureSlab(
 
         fn unlinkLocked(self: *Self, idx: u32) void {
             std.debug.assert(self.count_free > 0);
+            // Parity invariant: slots on the freelist have even gen.
+            // unlink is called from create() before the gen is bumped
+            // to odd, so the slot must still be even here.
+            std.debug.assert(self.ptrAt(idx)._gen_lock.currentGen() % 2 == 0);
             const link = self.linkAt(idx);
             const saved_prev = link.prev;
             if (self.count_free == 1) {
@@ -374,12 +397,20 @@ pub fn SecureSlab(
         }
 
         fn indexOf(self: *Self, ptr: *T) u32 {
-            var i: u32 = 0;
-            while (i < self.count_total) {
-                if (self.ptrAt(i) == ptr) return i;
-                i += 1;
-            }
-            @panic("indexOf: pointer not in this slab");
+            // Slots are laid out at `data_base + i * slot_stride` by
+            // growOne; the pointer's offset from data_base divides by
+            // stride to give its index. O(1), no ptrs-array walk.
+            const addr = @intFromPtr(ptr);
+            std.debug.assert(addr >= self.data_base);
+            const offset = addr - self.data_base;
+            std.debug.assert(offset % slot_stride == 0);
+            const idx: u32 = @intCast(offset / slot_stride);
+            std.debug.assert(idx < self.count_total);
+            // Defensive: ptrs-array must still agree. This is a
+            // debug-only cross-check that catches corruption of the
+            // ptrs region independent of the stride math.
+            std.debug.assert(self.ptrAt(idx) == ptr);
+            return idx;
         }
     };
 }
