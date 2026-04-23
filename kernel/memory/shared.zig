@@ -50,14 +50,6 @@ pub const SharedMemory = extern struct {
         return PAddr.fromInt(self.base_paddr.addr + @as(u64, idx) * paging.PAGE4K);
     }
 
-    /// Returns the current generation of this slot. Callers issuing new
-    /// capability handles should stash this alongside the pointer so a
-    /// later `safeAccess` on the handle can catch stale use after free.
-    pub fn gen(self: *const SharedMemory) u63 {
-        const word: *const std.atomic.Value(u64) = @ptrCast(@alignCast(&self._gen_lock));
-        return @intCast(word.load(.monotonic) >> 1);
-    }
-
     pub fn create(num_bytes: u64) !*SharedMemory {
         if (num_bytes == 0) return error.InvalidSize;
         // Bound num_bytes before narrowing to u32 — a raw @intCast of
@@ -79,7 +71,7 @@ pub const SharedMemory = extern struct {
             return error.OutOfMemory;
         };
         const shm = alloc_result.ptr;
-        errdefer slab_allocator_instance.destroyUnchecked(shm);
+        errdefer slab_allocator_instance.destroy(shm, alloc_result.gen) catch unreachable;
 
         var global = &pmm.global_pmm.?;
         const irq = global.lock.lockIrqSave();
@@ -119,7 +111,8 @@ pub const SharedMemory = extern struct {
 
     fn destroy(self: *SharedMemory) void {
         self.freePages();
-        slab_allocator_instance.destroyUnchecked(self);
+        const gen = SharedMemoryAllocator.currentGen(self);
+        slab_allocator_instance.destroy(self, gen) catch unreachable;
     }
 
     fn freePages(self: *SharedMemory) void {

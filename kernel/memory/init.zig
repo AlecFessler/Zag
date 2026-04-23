@@ -34,7 +34,6 @@ pub var proc_slab_backing: BumpAllocator = undefined;
 pub var thread_slab_backing: BumpAllocator = undefined;
 pub var kvm_vm_slab_backing: BumpAllocator = undefined;
 pub var kvm_vcpu_slab_backing: BumpAllocator = undefined;
-pub var pmu_state_slab_backing: BumpAllocator = undefined;
 
 pub fn init(firmware_mmap: MMap) !void {
     var mmap_entries: [boot.protocol.MAX_MMAP_ENTRIES]MMapEntry = undefined;
@@ -174,7 +173,6 @@ pub fn init(firmware_mmap: MMap) !void {
     thread_slab_backing = BumpAllocator.init(KA.thread_slab.start, KA.thread_slab.end);
     kvm_vm_slab_backing = BumpAllocator.init(KA.kvm_vm_slab.start, KA.kvm_vm_slab.end);
     kvm_vcpu_slab_backing = BumpAllocator.init(KA.kvm_vcpu_slab.start, KA.kvm_vcpu_slab.end);
-    pmu_state_slab_backing = BumpAllocator.init(KA.pmu_state_slab.start, KA.pmu_state_slab.end);
 
     try vmm_mod.initSlabs(vm_node_slab_bump.allocator());
     try device_region_mod.initSlab(device_region_slab_bump.allocator());
@@ -185,5 +183,9 @@ pub fn init(firmware_mmap: MMap) !void {
         KA.shm_slab_links,
     );
 
-    try pmu_mod.initSlab(pmu_state_slab_backing.allocator());
+    pmu_mod.initSlab(
+        KA.pmu_state_slab,
+        KA.pmu_state_slab_ptrs,
+        KA.pmu_state_slab_links,
+    );
 }

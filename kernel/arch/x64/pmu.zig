@@ -33,6 +33,7 @@ const default_config: PmuCounterConfig = .{
 /// Per-thread arch PMU state. Backend-agnostic: both Intel and AMD need
 /// the same layout (configured counter count, config array, saved values).
 pub const PmuState = extern struct {
+    _gen_lock: u64,
     num_counters: u8 = 0,
     _pad: [7]u8 = .{0} ** 7,
     configs: [MAX_COUNTERS]PmuCounterConfig = .{default_config} ** MAX_COUNTERS,

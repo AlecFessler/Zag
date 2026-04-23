@@ -207,37 +207,14 @@ pub fn SecureSlab(
             self.pop_cursor = self.walkCursorLocked(self.pop_cursor, draw_pop);
         }
 
-        /// Destroy a slot whose caller has independently established
-        /// exclusive ownership (typically via a refcount transition to
-        /// zero). Skips the gen-lock CAS that `destroy` requires — the
-        /// caller is asserting no other CPU can possibly be in a
-        /// `safeAccess` body on this slot. Bumps gen to the next even
-        /// value and links back into the free list.
-        ///
-        /// If you have a capability handle with an expected_gen, use
-        /// `destroy` instead. Misuse turns UAF-protection into a silent
-        /// corruption window.
-        pub fn destroyUnchecked(self: *Self, ptr: *T) void {
+        /// Read the current generation of a slot. Callers issuing new
+        /// capability handles stash this alongside the pointer; callers on
+        /// refcount-zero / exclusive-ownership destruction paths use it
+        /// to feed `destroy` without the unsafe "just free and hope no
+        /// one's looking" variant.
+        pub fn currentGen(ptr: *T) u63 {
             const word = genLockWord(ptr);
-            const cur = word.load(.monotonic);
-            const cur_gen = cur >> 1;
-            std.debug.assert(cur_gen % 2 == 1); // was live (gen odd)
-            std.debug.assert(cur & 1 == 0); // was unlocked
-
-            self.lock.lock();
-            defer self.lock.unlock();
-
-            const new_word: u64 = (@as(u64, cur_gen + 1) << 1) | 0;
-            word.store(new_word, .release);
-
-            const idx = self.indexOf(ptr);
-
-            const draw_push = self.randStep();
-            const draw_pop = self.randStep();
-
-            self.linkInLocked(idx);
-            self.push_cursor = self.walkCursorLocked(self.push_cursor, draw_push);
-            self.pop_cursor = self.walkCursorLocked(self.pop_cursor, draw_pop);
+            return @intCast(word.load(.monotonic) >> 1);
         }
 
         /// The only door to a real `*T`. Spin-CAS-acquires the gen-lock while

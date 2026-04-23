@@ -21,7 +21,7 @@ const arch = zag.arch.dispatch;
 const errors = zag.syscall.errors;
 const paging = zag.memory.paging;
 const scheduler = zag.sched.scheduler;
-const slab_alloc = zag.memory.allocators.slab;
+const secure_slab = zag.memory.allocators.secure_slab;
 
 const Process = zag.proc.process.Process;
 const Thread = zag.sched.thread.Thread;
@@ -97,17 +97,18 @@ pub const PmuSample = extern struct {
 
 // ── PmuStateAllocator (slab) ────────────────────────────────────────────
 
-/// Lazily-allocated per-thread PMU state. Chunk size matches the other
-/// per-thread slabs (64). `arch.pmu.PmuState` is the arch-dispatched type
-/// (empty stub on aarch64, ~200 B on x64).
-pub const PmuStateAllocator = slab_alloc.SlabAllocator(arch.pmu.PmuState, false, 0, 64, true);
+/// Lazily-allocated per-thread PMU state. `arch.pmu.PmuState` is the
+/// arch-dispatched type (empty stub on aarch64, ~200 B on x64).
+pub const PmuStateAllocator = secure_slab.SecureSlab(arch.pmu.PmuState, 256);
 
-pub var allocator: std.mem.Allocator = undefined;
-var slab_instance: PmuStateAllocator = undefined;
+pub var slab_instance: PmuStateAllocator = undefined;
 
-pub fn initSlab(backing_allocator: std.mem.Allocator) !void {
-    slab_instance = try PmuStateAllocator.init(backing_allocator);
-    allocator = slab_instance.allocator();
+pub fn initSlab(
+    data_range: zag.utils.range.Range,
+    ptrs_range: zag.utils.range.Range,
+    links_range: zag.utils.range.Range,
+) void {
+    slab_instance = PmuStateAllocator.init(data_range, ptrs_range, links_range);
 }
 
 // ── Syscall entry points ────────────────────────────────────────────────
@@ -153,8 +154,9 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
 
     // Allocate PMU state lazily on first start (§2.14.8).
     if (target_thread.pmu_state == null) {
-        const new_state = allocator.create(arch.pmu.PmuState) catch return E_NOMEM;
-        new_state.* = .{};
+        const alloc_result = slab_instance.create() catch return E_NOMEM;
+        const new_state = alloc_result.ptr;
+        new_state.* = .{ ._gen_lock = new_state._gen_lock };
         target_thread.pmu_state = new_state;
     }
     const state = target_thread.pmu_state.?;
@@ -264,7 +266,8 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
         arch.pmu.pmuClearState(state);
     }
     target_thread.pmu_state = null;
-    allocator.destroy(state);
+    const gen = PmuStateAllocator.currentGen(state);
+    slab_instance.destroy(state, gen) catch unreachable;
     return E_OK;
 }
 
