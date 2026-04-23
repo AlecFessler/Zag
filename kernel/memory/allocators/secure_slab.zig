@@ -222,6 +222,38 @@ pub fn SecureSlab(
             return @intCast(word.load(.monotonic) >> 1);
         }
 
+        /// Spin-CAS acquire the gen-lock on `ptr` while verifying the
+        /// caller's expected_gen matches the slot's current gen. On
+        /// success the caller has exclusive access to the object; every
+        /// field access must happen between `acquire` and the matching
+        /// `release`. On gen mismatch returns StaleHandle — the slot has
+        /// been freed (possibly reallocated) since issuance.
+        ///
+        /// Pair with `defer SecureSlab(T).release(ptr)` on the caller
+        /// side. This is the scope-based counterpart to `safeAccess`:
+        /// same atomic semantics, no body-closure plumbing.
+        pub fn acquire(ptr: *T, expected_gen: u63) error{StaleHandle}!void {
+            const word = genLockWordOf(T, ptr);
+            const unlocked: u64 = (@as(u64, expected_gen) << 1) | 0;
+            const locked: u64 = (@as(u64, expected_gen) << 1) | 1;
+            while (true) {
+                if (word.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) return;
+                const cur = word.load(.monotonic);
+                if ((cur >> 1) != expected_gen) return error.StaleHandle;
+                std.atomic.spinLoopHint();
+            }
+        }
+
+        /// Release a gen-lock acquired via `acquire`. Must pair 1:1 with
+        /// an `acquire` that returned without error. Clears the lock bit
+        /// without touching the generation counter.
+        pub fn release(ptr: *T) void {
+            const word = genLockWordOf(T, ptr);
+            const cur = word.load(.monotonic);
+            std.debug.assert(cur & 1 == 1); // was locked
+            word.store(cur & ~@as(u64, 1), .release);
+        }
+
         /// The only door to a real `*T`. Spin-CAS-acquires the gen-lock while
         /// verifying the handle's expected gen, runs `body(ctx, ptr)`, and
         /// releases the lock. Returns `StaleHandle` if the gen no longer
