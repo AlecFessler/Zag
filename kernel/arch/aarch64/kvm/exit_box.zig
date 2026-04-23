@@ -215,6 +215,9 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
     if (entry.object != .thread) return E_NOENT;
     const thread = entry.object.thread;
 
+    vm_obj._gen_lock.lock();
+    defer vm_obj._gen_lock.unlock();
+
     const vcpu_obj = vcpu_mod.vcpuFromThread(vm_obj, thread) orelse return E_NOENT;
 
     const box = vm_obj.exitBox();
