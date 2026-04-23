@@ -1360,10 +1360,9 @@ pub const Process = struct {
             .max_thread_priority = max_priority,
         };
 
-        const pmm_iface = pmm.global_pmm.?.allocator();
+        const pmm_mgr = &pmm.global_pmm.?;
 
-        const pml4_page = try pmm_iface.create(paging.PageMem(.page4k));
-        @memset(std.mem.asBytes(pml4_page), 0);
+        const pml4_page = try pmm_mgr.create(paging.PageMem(.page4k));
 
         const pml4_vaddr = VAddr.fromInt(@intFromPtr(pml4_page));
         proc.addr_space_root = PAddr.fromVAddr(pml4_vaddr, null);
@@ -1388,8 +1387,8 @@ pub const Process = struct {
         const elf_result = try loadElf(proc, elf_binary, aslr_base);
 
         var view_page_mapped = false;
-        const view_page = try pmm_iface.create(paging.PageMem(.page4k));
-        errdefer if (!skip_cleanup and !view_page_mapped) pmm_iface.destroy(view_page);
+        const view_page = try pmm_mgr.create(paging.PageMem(.page4k));
+        errdefer if (!skip_cleanup and !view_page_mapped) pmm_mgr.destroy(view_page);
         @memset(std.mem.asBytes(view_page), 0xFF);
         const view_phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(view_page)), null);
 
@@ -1547,7 +1546,7 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
     const phdr_end = std.math.add(u64, phdr_offset, phdr_total) catch return error.InvalidElf;
     if (phdr_end > elf_binary.len) return error.InvalidElf;
 
-    const pmm_iface = pmm.global_pmm.?.allocator();
+    const pmm_mgr = &pmm.global_pmm.?;
     const rela_info = findRelaSection(elf_binary, ehdr);
 
     var lowest_va: u64 = std.math.maxInt(u64);
@@ -1644,8 +1643,7 @@ fn loadElf(proc: *Process, elf_binary: []const u8, aslr_base: u64) !ElfLoadResul
 
     var page_va = page_start;
     while (page_va < page_end) {
-        const page = try pmm_iface.create(paging.PageMem(.page4k));
-        @memset(std.mem.asBytes(page), 0);
+        const page = try pmm_mgr.create(paging.PageMem(.page4k));
         const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
         try arch.paging.mapPage(proc.addr_space_root, phys, VAddr.fromInt(page_va), load_perms);
         page_va += paging.PAGE4K;

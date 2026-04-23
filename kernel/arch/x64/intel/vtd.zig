@@ -165,9 +165,8 @@ fn writeReg64(offset: u32, value: u64) void {
 /// Used for root tables, context tables, and page table levels — all of which
 /// must be 4KB-aligned and zero-initialized (Section 9.1, 9.3, 9.8).
 fn allocZeroedPage() !struct { phys: PAddr, virt: VAddr } {
-    const pmm_iface = pmm.global_pmm.?.allocator();
-    const page = try pmm_iface.create(paging.PageMem(.page4k));
-    @memset(std.mem.asBytes(page), 0);
+    const pmm_mgr = &pmm.global_pmm.?;
+    const page = try pmm_mgr.create(paging.PageMem(.page4k));
     const virt = VAddr.fromInt(@intFromPtr(page));
     const phys = PAddr.fromVAddr(virt, null);
     return .{ .phys = phys, .virt = virt };

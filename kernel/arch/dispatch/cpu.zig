@@ -485,6 +485,16 @@ pub fn getRandom() ?u64 {
     };
 }
 
+/// Probe CPU feature bits backing `arch.memory.zeroPage`. Called once
+/// from the PMM initialization path before any freed page is zeroed.
+pub fn initZeroPageFeatures() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.initZeroPageFeatures(),
+        .aarch64 => aarch64.cpu.initZeroPageFeatures(),
+        else => unreachable,
+    }
+}
+
 // --- Per-core hardware state (freq / temp / C-state) -------------------
 
 /// One-time bring-up on the bootstrap core. Called from `kMain` after

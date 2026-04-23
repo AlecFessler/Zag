@@ -122,7 +122,11 @@ pub fn init(firmware_mmap: MMap) !void {
         buddy_alloc_end_virt.addr,
         bump_alloc_iface,
     );
-    const buddy_alloc_iface = buddy_allocator.allocator();
+
+    // Feature-detect CLZERO / DC ZVA once before anybody calls
+    // `arch.memory.zeroPage`. The initial-pool pre-zero below and every
+    // subsequent PMM free path rely on the cached flag.
+    arch.cpu.initZeroPageFeatures();
 
     for (mmap) |entry| {
         if (entry.type != .free) continue;
@@ -156,10 +160,24 @@ pub fn init(firmware_mmap: MMap) !void {
             useable_range = entry_range.removeOverlap(low_memory_range);
         }
 
+        // Zero every 4 KiB page before handing it to the buddy. The PMM
+        // free path zeroes on release, so alloc callers can rely on a
+        // zero page without per-site @memset — but the very first
+        // allocations come from this pool, which has never been freed.
+        // Wiping it here extends the zero-on-free invariant backwards
+        // to boot. Uses the same CLZERO/DC ZVA path the free path
+        // uses, so cache traffic is identical.
+        var zpage = std.mem.alignForward(u64, useable_range.start, paging.PAGE4K);
+        const zend = std.mem.alignBackward(u64, useable_range.end, paging.PAGE4K);
+        while (zpage < zend) {
+            arch.memory.zeroPage(@ptrFromInt(zpage));
+            zpage += paging.PAGE4K;
+        }
+
         buddy_allocator.addRegion(useable_range.start, useable_range.end);
     }
 
-    pmm.global_pmm = PhysicalMemoryManager.init(buddy_alloc_iface);
+    pmm.global_pmm = PhysicalMemoryManager.init(&buddy_allocator);
 
 
     vmm_mod.initSlabs(

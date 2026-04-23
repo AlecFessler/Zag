@@ -35,7 +35,7 @@ pub const RestartContext = struct {
         // Round up to page count, then to a buddy-servable power of two.
         // The ghost allocation is contiguous so we can access it through
         // the kernel physmap with a plain `@ptrFromInt` later, and free
-        // it in one `rawFree` at the same order.
+        // it in one `freeBlock` at the same order.
         const num_pages_u64 = std.mem.alignForward(u64, data_content.len, paging.PAGE4K) / paging.PAGE4K;
         if (num_pages_u64 == 0 or num_pages_u64 > std.math.maxInt(u32)) return error.TooManyPages;
         const num_pages: u32 = @intCast(num_pages_u64);
@@ -44,21 +44,12 @@ pub const RestartContext = struct {
         const alloc_size = @as(u64, rounded_pages) * paging.PAGE4K;
 
         var global = &pmm.global_pmm.?;
-        const irq = global.lock.lockIrqSave();
-        const blk = global.backing_allocator.rawAlloc(
-            alloc_size,
-            std.mem.Alignment.fromByteUnits(paging.PAGE4K),
-            @returnAddress(),
-        ) orelse {
-            global.lock.unlockIrqRestore(irq);
-            return error.OutOfMemory;
-        };
-        global.lock.unlockIrqRestore(irq);
+        const blk = global.allocBlock(alloc_size) orelse return error.OutOfMemory;
 
+        // Pages come back zeroed from the PMM (§ zero-on-free), so the
+        // tail between `data_content.len` and `alloc_size` is already
+        // zero — only the prefix needs copying.
         @memcpy(blk[0..data_content.len], data_content);
-        if (alloc_size > data_content.len) {
-            @memset(blk[data_content.len..alloc_size], 0);
-        }
 
         return .{
             .entry_point = entry,
@@ -76,13 +67,7 @@ pub const RestartContext = struct {
         const base_vaddr = VAddr.fromPAddr(self.ghost_base, null);
         const buf: [*]u8 = @ptrFromInt(base_vaddr.addr);
         var global = &pmm.global_pmm.?;
-        const irq = global.lock.lockIrqSave();
-        global.backing_allocator.rawFree(
-            buf[0..block_size],
-            std.mem.Alignment.fromByteUnits(paging.PAGE4K),
-            @returnAddress(),
-        );
-        global.lock.unlockIrqRestore(irq);
+        global.freeBlock(buf[0..block_size]);
         self.data_size = 0;
     }
 

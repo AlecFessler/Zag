@@ -367,14 +367,13 @@ pub const VirtualMemoryManager = struct {
             return e;
         };
 
-        const pmm_iface = pmm.global_pmm.?.allocator();
+        const pmm_mgr = &pmm.global_pmm.?;
         const top_page_va = VAddr.fromInt(overflow_start - paging.PAGE4K);
-        const top_page = pmm_iface.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
-        @memset(std.mem.asBytes(top_page), 0);
+        const top_page = pmm_mgr.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
         const top_phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(top_page)), null);
         const stack_perms = rightsToMemPerms(.{ .read = true, .write = true }, .user);
         arch.paging.mapPage(self.addr_space_root, top_phys, top_page_va, stack_perms) catch {
-            pmm_iface.destroy(top_page);
+            pmm_mgr.destroy(top_page);
             return error.OutOfMemory;
         };
 
@@ -434,15 +433,14 @@ pub const VirtualMemoryManager = struct {
 
         if (node.kind != .private) return error.NotDemandPageable;
 
-        const pmm_iface = pmm.global_pmm.?.allocator();
-        const page = pmm_iface.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
-        @memset(std.mem.asBytes(page), 0);
+        const pmm_mgr = &pmm.global_pmm.?;
+        const page = pmm_mgr.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
 
         const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
         const perms = rightsToMemPerms(node.rights, .user);
 
         arch.paging.mapPage(self.addr_space_root, phys, page_base, perms) catch {
-            pmm_iface.destroy(page);
+            pmm_mgr.destroy(page);
             return error.OutOfMemory;
         };
     }
@@ -1024,13 +1022,13 @@ fn unmapNodePages(node: *VmNode, addr_space_root: PAddr, free_phys: bool) void {
     // virtual_bar nodes have no mapped pages — PTEs are intentionally absent
     if (node.kind == .virtual_bar) return;
 
-    const pmm_iface = pmm.global_pmm.?.allocator();
+    const pmm_mgr = &pmm.global_pmm.?;
     var page_addr = node.start.addr;
     while (page_addr < node.end()) {
         if (arch.paging.unmapPage(addr_space_root, VAddr.fromInt(page_addr))) |paddr| {
             if (free_phys and node.kind == .private) {
                 const page: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
-                pmm_iface.destroy(page);
+                pmm_mgr.destroy(page);
             }
         }
         page_addr += paging.PAGE4K;
@@ -1046,13 +1044,13 @@ fn updateCommittedPages(
     const is_decommit = !rights.read and !rights.write and !rights.execute;
 
     if (is_decommit) {
-        const pmm_iface = pmm.global_pmm.?.allocator();
+        const pmm_mgr = &pmm.global_pmm.?;
         var page_addr = node.start.addr;
         while (page_addr < node.end()) {
             if (arch.paging.unmapPage(addr_space_root, VAddr.fromInt(page_addr))) |paddr| {
                 if (node.kind == .private) {
                     const page: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
-                    pmm_iface.destroy(page);
+                    pmm_mgr.destroy(page);
                 }
             }
             page_addr += paging.PAGE4K;

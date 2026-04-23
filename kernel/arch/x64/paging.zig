@@ -236,7 +236,7 @@ pub fn mapPage(
     std.debug.assert(std.mem.isAligned(phys.addr, paging.PAGE4K));
     std.debug.assert(std.mem.isAligned(virt.addr, paging.PAGE4K));
 
-    const pmm_iface = pmm.global_pmm.?.allocator();
+    const pmm_mgr = &pmm.global_pmm.?;
 
     const user_accessible = perms.privilege_perm == .user;
     const writable = perms.write_perm == .write;
@@ -271,8 +271,7 @@ pub fn mapPage(
     for (walk_indices) |idx| {
         const entry = &table[idx];
         if (!entry.present) {
-            const new_page = try pmm_iface.create(paging.PageMem(.page4k));
-            @memset(&new_page.mem, 0);
+            const new_page = try pmm_mgr.create(paging.PageMem(.page4k));
             const new_virt = VAddr.fromInt(@intFromPtr(new_page));
             const new_phys = PAddr.fromVAddr(new_virt, null);
             entry.* = parent_entry;
@@ -469,7 +468,7 @@ pub fn freeUserAddrSpace(addr_space_root: PAddr) void {
         idx: usize,
     };
 
-    const pmm_iface = pmm.global_pmm.?.allocator();
+    const pmm_mgr = &pmm.global_pmm.?;
     const root_virt = VAddr.fromPAddr(addr_space_root, null);
     const root: *[page_entry_table_size]PageEntry = @ptrFromInt(root_virt.addr);
 
@@ -493,7 +492,7 @@ pub fn freeUserAddrSpace(addr_space_root: PAddr) void {
         // Exhausted this table — pop back up (freeing non-root tables).
         if (cur.idx >= limit) {
             if (level == .l4) break;
-            freeTablePage(cur.table, pmm_iface);
+            freeTablePage(cur.table, pmm_mgr);
             level = @enumFromInt(depth - 1);
             stack[depth - 1].idx += 1;
             continue;
@@ -509,7 +508,7 @@ pub fn freeUserAddrSpace(addr_space_root: PAddr) void {
 
         // Leaf level: free the physical page and advance.
         if (level == .l1) {
-            freePhysPage(entry.getPAddr(), pmm_iface);
+            freePhysPage(entry.getPAddr(), pmm_mgr);
             cur.idx += 1;
             continue;
         }
@@ -522,7 +521,7 @@ pub fn freeUserAddrSpace(addr_space_root: PAddr) void {
         level = @enumFromInt(next_depth);
     }
 
-    freeTablePage(root, pmm_iface);
+    freeTablePage(root, pmm_mgr);
 }
 
 /// Update permission bits on an existing leaf PTE and invalidate the TLB.
@@ -604,13 +603,13 @@ fn entryToTable(entry: *const PageEntry) *[page_entry_table_size]PageEntry {
     return @ptrFromInt(virt.addr);
 }
 
-fn freePhysPage(paddr: PAddr, pmm_iface: std.mem.Allocator) void {
+fn freePhysPage(paddr: PAddr, pmm_mgr: *pmm.PhysicalMemoryManager) void {
     const virt = VAddr.fromPAddr(paddr, null);
     const page: *paging.PageMem(.page4k) = @ptrFromInt(virt.addr);
-    pmm_iface.destroy(page);
+    pmm_mgr.destroy(page);
 }
 
-fn freeTablePage(table: *[page_entry_table_size]PageEntry, pmm_iface: std.mem.Allocator) void {
+fn freeTablePage(table: *[page_entry_table_size]PageEntry, pmm_mgr: *pmm.PhysicalMemoryManager) void {
     const page: *paging.PageMem(.page4k) = @ptrCast(@alignCast(table));
-    pmm_iface.destroy(page);
+    pmm_mgr.destroy(page);
 }

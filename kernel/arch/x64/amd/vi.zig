@@ -229,9 +229,8 @@ var aliases: [MAX_ALIASES]AliasEntry = .{AliasEntry{}} ** MAX_ALIASES;
 var alias_count: u32 = 0;
 
 fn allocZeroedPage() !struct { phys: PAddr, virt: VAddr } {
-    const pmm_iface = pmm.global_pmm.?.allocator();
-    const page = try pmm_iface.create(paging.PageMem(.page4k));
-    @memset(std.mem.asBytes(page), 0);
+    const pmm_mgr = &pmm.global_pmm.?;
+    const page = try pmm_mgr.create(paging.PageMem(.page4k));
     const virt = VAddr.fromInt(@intFromPtr(page));
     const phys = PAddr.fromVAddr(virt, null);
     return .{ .phys = phys, .virt = virt };
@@ -293,13 +292,8 @@ pub fn init(reg_base_phys: PAddr) !void {
     // -----------------------------------------------------------------------
     const dt_pages: u32 = 512;
     const dt_size = @as(u64, dt_pages) * paging.PAGE4K;
-    const pmm_iface = pmm.global_pmm.?.allocator();
-    const dt_mem = pmm_iface.rawAlloc(
-        dt_size,
-        std.mem.Alignment.fromByteUnits(paging.PAGE4K),
-        0,
-    ) orelse return error.OutOfMemory;
-    @memset(dt_mem[0..dt_size], 0);
+    const pmm_mgr = &pmm.global_pmm.?;
+    const dt_mem = pmm_mgr.allocBlock(dt_size) orelse return error.OutOfMemory;
 
     // Initialize all DTEs to block DMA by default.
     //

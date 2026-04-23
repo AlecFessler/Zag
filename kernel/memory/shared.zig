@@ -72,19 +72,11 @@ pub const SharedMemory = struct {
         errdefer slab_allocator_instance.destroy(shm, alloc_result.gen) catch unreachable;
 
         var global = &pmm.global_pmm.?;
-        const irq = global.lock.lockIrqSave();
-        const blk = global.backing_allocator.rawAlloc(
-            alloc_size,
-            std.mem.Alignment.fromByteUnits(paging.PAGE4K),
-            @returnAddress(),
-        ) orelse {
-            global.lock.unlockIrqRestore(irq);
+        const blk = global.allocBlock(alloc_size) orelse {
             arch.boot.print("K: SHM buddy alloc fail pages={d}\n", .{rounded_pages});
             return error.OutOfMemory;
         };
-        global.lock.unlockIrqRestore(irq);
-
-        @memset(blk[0..alloc_size], 0);
+        // Pages come back already zeroed from the PMM (§ zero-on-free).
         const base_paddr = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(blk)), null);
 
         shm.* = .{
@@ -123,13 +115,7 @@ pub const SharedMemory = struct {
         const buf: [*]u8 = @ptrFromInt(base_vaddr.addr);
 
         var global = &pmm.global_pmm.?;
-        const irq = global.lock.lockIrqSave();
-        global.backing_allocator.rawFree(
-            buf[0..block_size],
-            std.mem.Alignment.fromByteUnits(paging.PAGE4K),
-            @returnAddress(),
-        );
-        global.lock.unlockIrqRestore(irq);
+        global.freeBlock(buf[0..block_size]);
     }
 };
 

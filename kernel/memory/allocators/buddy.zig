@@ -122,16 +122,47 @@ pub const BuddyAllocator = struct {
         self.bitmap.deinit();
     }
 
-    pub fn allocator(self: *BuddyAllocator) std.mem.Allocator {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .alloc = alloc,
-                .resize = resize,
-                .remap = remap,
-                .free = free,
-            },
-        };
+    /// Allocate a `len`-byte block whose size is a power-of-two multiple
+    /// of `PAGE_SIZE`. Returns null if no block is available at the
+    /// required order. `len` is asserted to be page-aligned; callers
+    /// compute the block size by rounding up to the next power of two.
+    pub fn allocBlock(self: *BuddyAllocator, len: u64) ?[*]u8 {
+        std.debug.assert(len % PAGE_SIZE == 0);
+        std.debug.assert(len > 0);
+        const num_pages = len / PAGE_SIZE;
+        std.debug.assert((num_pages & (num_pages - 1)) == 0);
+        const order: u4 = @intCast(@ctz(num_pages));
+        std.debug.assert(order < NUM_ORDERS);
+
+        const addr = self.recursiveSplit(order) orelse return null;
+        self.bitmap.setBit(addr, 0);
+
+        // Accounting for pmm.freePageCount (§14, §21). Every successful
+        // alloc removes `num_pages` pages from the free pool.
+        if (self.free_pages >= num_pages) {
+            self.free_pages -= num_pages;
+        } else {
+            self.free_pages = 0;
+        }
+
+        return @ptrFromInt(addr);
+    }
+
+    /// Return a power-of-two block previously returned by `allocBlock`
+    /// (or by `splitAllocation`) to the freelist, coalescing with its
+    /// buddy where possible.
+    pub fn freeBlock(self: *BuddyAllocator, buf: []u8) void {
+        const addr = @intFromPtr(buf.ptr);
+        const result = self.recursiveMerge(addr);
+        self.bitmap.setBit(result.addr, 1);
+        self.freelists[result.order].push(@ptrFromInt(result.addr));
+
+        // Accounting for pmm.freePageCount (§14, §21). `buf.len` covers the
+        // full allocated block regardless of whether `recursiveMerge` then
+        // coalesced with a sibling; the coalesced sibling was already
+        // counted when it was originally freed.
+        const num_pages = buf.len / PAGE_SIZE;
+        self.free_pages += num_pages;
     }
 
     pub fn splitAllocation(
@@ -272,87 +303,6 @@ pub const BuddyAllocator = struct {
         } else {
             self.page_pair_orders[pair_idx].even = order;
         }
-    }
-
-    fn alloc(
-        ptr: *anyopaque,
-        len: u64,
-        alignment: std.mem.Alignment,
-        ret_addr: u64,
-    ) ?[*]u8 {
-        _ = alignment;
-        _ = ret_addr;
-        std.debug.assert(len % PAGE_SIZE == 0);
-        const self: *BuddyAllocator = @ptrCast(@alignCast(ptr));
-
-        const num_pages = len / PAGE_SIZE;
-        const order: u4 = @intCast(@ctz(num_pages));
-        std.debug.assert(order < NUM_ORDERS);
-
-        const addr = self.recursiveSplit(order) orelse return null;
-        self.bitmap.setBit(addr, 0);
-
-        // Accounting for pmm.freePageCount (§14, §21). Every successful
-        // alloc removes `num_pages` pages from the free pool.
-        if (self.free_pages >= num_pages) {
-            self.free_pages -= num_pages;
-        } else {
-            self.free_pages = 0;
-        }
-
-        return @ptrFromInt(addr);
-    }
-
-    fn resize(
-        ptr: *anyopaque,
-        memory: []u8,
-        alignment: std.mem.Alignment,
-        new_len: u64,
-        ret_addr: u64,
-    ) bool {
-        _ = ptr;
-        _ = memory;
-        _ = alignment;
-        _ = new_len;
-        _ = ret_addr;
-        return false;
-    }
-
-    fn remap(
-        ptr: *anyopaque,
-        memory: []u8,
-        alignment: std.mem.Alignment,
-        new_len: u64,
-        ret_addr: u64,
-    ) ?[*]u8 {
-        _ = ptr;
-        _ = memory;
-        _ = alignment;
-        _ = new_len;
-        _ = ret_addr;
-        return null;
-    }
-
-    fn free(
-        ptr: *anyopaque,
-        buf: []u8,
-        alignment: std.mem.Alignment,
-        ret_addr: u64,
-    ) void {
-        _ = alignment;
-        _ = ret_addr;
-        const self: *BuddyAllocator = @ptrCast(@alignCast(ptr));
-        const addr = @intFromPtr(buf.ptr);
-        const result = self.recursiveMerge(addr);
-        self.bitmap.setBit(result.addr, 1);
-        self.freelists[result.order].push(@ptrFromInt(result.addr));
-
-        // Accounting for pmm.freePageCount (§14, §21). `buf.len` covers the
-        // full allocated block regardless of whether `recursiveMerge` then
-        // coalesced with a sibling; the coalesced sibling was already
-        // counted when it was originally freed.
-        const num_pages = buf.len / PAGE_SIZE;
-        self.free_pages += num_pages;
     }
 
     pub const AllocationMap = std.HashMap(
@@ -633,31 +583,30 @@ test "out of bounds buddy handling - fragmentation recovery" {
 
     buddy.addRegion(start_addr, end_addr);
 
-    var allocator = buddy.allocator();
     var allocations = BuddyAllocator.AllocationMap.init(test_allocator);
     defer allocations.deinit();
 
     try std.testing.expect(buddy.validateState(&allocations));
 
-    const order_10_ptr = try allocator.alloc(u8, ORDERS[10]);
-    try allocations.put(@intFromPtr(order_10_ptr.ptr), .{ .size = ORDERS[10], .order = 10 });
+    const order_10_ptr = buddy.allocBlock(ORDERS[10]).?;
+    try allocations.put(@intFromPtr(order_10_ptr), .{ .size = ORDERS[10], .order = 10 });
     try std.testing.expect(buddy.validateState(&allocations));
 
-    const order_4_ptr = try allocator.alloc(u8, ORDERS[4]);
-    const order_4_addr = @intFromPtr(order_4_ptr.ptr);
+    const order_4_ptr = buddy.allocBlock(ORDERS[4]).?;
+    const order_4_addr = @intFromPtr(order_4_ptr);
     try allocations.put(order_4_addr, .{ .size = ORDERS[4], .order = 4 });
     try std.testing.expect(buddy.validateState(&allocations));
 
     try std.testing.expectEqual(@as(u4, 4), buddy.getOrder(order_4_addr));
 
-    allocator.free(order_4_ptr);
+    buddy.freeBlock(order_4_ptr[0..ORDERS[4]]);
     _ = allocations.remove(order_4_addr);
     try std.testing.expect(buddy.validateState(&allocations));
 
     try std.testing.expectEqual(@as(u4, 6), buddy.getOrder(order_4_addr));
 
-    allocator.free(order_10_ptr);
-    _ = allocations.remove(@intFromPtr(order_10_ptr.ptr));
+    buddy.freeBlock(order_10_ptr[0..ORDERS[10]]);
+    _ = allocations.remove(@intFromPtr(order_10_ptr));
     try std.testing.expect(buddy.validateState(&allocations));
 }
 
@@ -763,19 +712,17 @@ test "split allocation handles order changes correctly" {
 
     buddy.addRegion(start_addr, end_addr);
 
-    var allocator = buddy.allocator();
-
     var allocations = BuddyAllocator.AllocationMap.init(test_allocator);
     defer allocations.deinit();
 
     var freelist: FreeListBatch = .{};
 
-    const allocation = try allocator.alloc(u8, ORDERS[10]);
-    try allocations.put(@intFromPtr(allocation.ptr), .{ .size = ORDERS[10], .order = 10 });
+    const allocation = buddy.allocBlock(ORDERS[10]).?;
+    try allocations.put(@intFromPtr(allocation), .{ .size = ORDERS[10], .order = 10 });
     try std.testing.expect(buddy.validateState(&allocations));
 
-    _ = allocations.remove(@intFromPtr(allocation.ptr));
-    var split = buddy.splitAllocation(@intFromPtr(allocation.ptr), 0);
+    _ = allocations.remove(@intFromPtr(allocation));
+    var split = buddy.splitAllocation(@intFromPtr(allocation), 0);
     var count: u64 = 0;
     while (split.pop()) |page| {
         count += 1;
@@ -788,7 +735,7 @@ test "split allocation handles order changes correctly" {
     while (freelist.pop()) |page| {
         _ = allocations.remove(@intFromPtr(page));
         const page_slice: []u8 = @as([*]u8, @ptrCast(page))[0..PAGE_SIZE];
-        allocator.free(page_slice);
+        buddy.freeBlock(page_slice);
         try std.testing.expect(buddy.validateState(&allocations));
     }
 }
@@ -824,19 +771,19 @@ test "split region logic with buddy allocator" {
     var allocations = BuddyAllocator.AllocationMap.init(allocator);
     defer allocations.deinit();
 
-    const order_5_ptr = try buddy.allocator().alloc(u8, ORDERS[5]);
-    try allocations.put(@intFromPtr(order_5_ptr.ptr), .{ .size = ORDERS[5], .order = 5 });
+    const order_5_ptr = buddy.allocBlock(ORDERS[5]).?;
+    try allocations.put(@intFromPtr(order_5_ptr), .{ .size = ORDERS[5], .order = 5 });
     try std.testing.expect(buddy.validateState(&allocations));
 
-    const order_2_ptr = try buddy.allocator().alloc(u8, ORDERS[2]);
-    try allocations.put(@intFromPtr(order_2_ptr.ptr), .{ .size = ORDERS[2], .order = 2 });
+    const order_2_ptr = buddy.allocBlock(ORDERS[2]).?;
+    try allocations.put(@intFromPtr(order_2_ptr), .{ .size = ORDERS[2], .order = 2 });
     try std.testing.expect(buddy.validateState(&allocations));
 
-    try std.testing.expect(@intFromPtr(order_5_ptr.ptr) >= first_alloc);
-    try std.testing.expect(@intFromPtr(order_5_ptr.ptr) + ORDERS[5] <= first_alloc + ORDERS[6]);
+    try std.testing.expect(@intFromPtr(order_5_ptr) >= first_alloc);
+    try std.testing.expect(@intFromPtr(order_5_ptr) + ORDERS[5] <= first_alloc + ORDERS[6]);
 
-    try std.testing.expect(@intFromPtr(order_2_ptr.ptr) >= second_alloc);
-    try std.testing.expect(@intFromPtr(order_2_ptr.ptr) + ORDERS[2] <= second_alloc + ORDERS[4]);
+    try std.testing.expect(@intFromPtr(order_2_ptr) >= second_alloc);
+    try std.testing.expect(@intFromPtr(order_2_ptr) + ORDERS[2] <= second_alloc + ORDERS[4]);
 
     try std.testing.expect(buddy.validateState(&allocations));
 }
