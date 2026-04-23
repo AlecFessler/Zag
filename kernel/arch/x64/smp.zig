@@ -77,7 +77,7 @@ pub fn smpInit() !void {
 
     const bsp_id = apic.rawApicId();
 
-    const pmm_iface = pmm.global_pmm.?.allocator();
+    const pmm_mgr = &pmm.global_pmm.?;
     var hpet = &timers.hpet_timer;
     const hpet_iface = hpet.timer();
 
@@ -91,14 +91,13 @@ pub fn smpInit() !void {
         var page_addr = ap_stack.base.addr;
         var map_ok = true;
         while (page_addr < ap_stack.top.addr) {
-            const kpage = pmm_iface.create(paging.PageMem(.page4k)) catch {
+            const kpage = pmm_mgr.create(paging.PageMem(.page4k)) catch {
                 map_ok = false;
                 break;
             };
-            @memset(std.mem.asBytes(kpage), 0);
             const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
             arch_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS) catch {
-                pmm_iface.destroy(kpage);
+                pmm_mgr.destroy(kpage);
                 map_ok = false;
                 break;
             };

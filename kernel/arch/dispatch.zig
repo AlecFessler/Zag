@@ -1,6 +1,7 @@
 pub const boot = @import("dispatch/boot.zig");
 pub const cpu = @import("dispatch/cpu.zig");
 pub const iommu = @import("dispatch/iommu.zig");
+pub const memory = @import("dispatch/memory.zig");
 pub const paging = @import("dispatch/paging.zig");
 pub const pmu = @import("dispatch/pmu.zig");
 pub const smp = @import("dispatch/smp.zig");

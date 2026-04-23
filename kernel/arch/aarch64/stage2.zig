@@ -208,21 +208,21 @@ inline fn stage2L3Idx(guest_phys: u64) u9 {
     return @truncate(guest_phys >> stage2_leaf_shift);
 }
 
-/// Allocate and zero a 4 KiB page from the global PMM and return its PA.
+/// Allocate a 4 KiB page from the global PMM and return its PA. Pages
+/// come back already zeroed — the PMM zero-on-free invariant covers it.
 fn allocTablePage() ?PAddr {
-    const alloc = pmm.global_pmm.?.allocator();
-    const page = alloc.create(paging.PageMem(.page4k)) catch return null;
-    @memset(std.mem.asBytes(page), 0);
+    const pmm_mgr = &pmm.global_pmm.?;
+    const page = pmm_mgr.create(paging.PageMem(.page4k)) catch return null;
     const va = VAddr.fromInt(@intFromPtr(page));
     return PAddr.fromVAddr(va, null);
 }
 
 /// Free a 4 KiB table page that was previously allocated by `allocTablePage`.
 fn freeTablePage(p: PAddr) void {
-    const alloc = pmm.global_pmm.?.allocator();
+    const pmm_mgr = &pmm.global_pmm.?;
     const va = VAddr.fromPAddr(p, null);
     const page: *paging.PageMem(.page4k) = @ptrFromInt(va.addr);
-    alloc.destroy(page);
+    pmm_mgr.destroy(page);
 }
 
 /// Per-VM control block allocated alongside the stage-2 root. Holds
@@ -295,13 +295,8 @@ comptime {
 /// numeric value is also the stage-2 root PA, which keeps
 /// `mapGuestPage` / `unmapGuestPage` / `invalidateStage2Ipa` unchanged.
 pub fn vmAllocStructures() ?PAddr {
-    const alloc = pmm.global_pmm.?.allocator();
-    const bytes = alloc.rawAlloc(
-        2 * paging.PAGE4K,
-        std.mem.Alignment.fromByteUnits(paging.PAGE4K),
-        @returnAddress(),
-    ) orelse return null;
-    @memset(bytes[0 .. 2 * paging.PAGE4K], 0);
+    const pmm_mgr = &pmm.global_pmm.?;
+    const bytes = pmm_mgr.allocBlock(2 * paging.PAGE4K) orelse return null;
     const va = VAddr.fromInt(@intFromPtr(bytes));
     return PAddr.fromVAddr(va, null);
 }
@@ -326,14 +321,10 @@ pub fn vmFreeStructures(p: PAddr) void {
         freeTablePage(entry.getPAddr());
         entry.* = .{};
     }
-    const alloc = pmm.global_pmm.?.allocator();
+    const pmm_mgr = &pmm.global_pmm.?;
     const va = VAddr.fromPAddr(p, null);
     const base: [*]u8 = @ptrFromInt(va.addr);
-    alloc.rawFree(
-        base[0 .. 2 * paging.PAGE4K],
-        std.mem.Alignment.fromByteUnits(paging.PAGE4K),
-        @returnAddress(),
-    );
+    pmm_mgr.freeBlock(base[0 .. 2 * paging.PAGE4K]);
 }
 
 /// Return a mutable pointer to the `VmControlBlock` embedded in the

@@ -453,11 +453,10 @@ fn writeUserStruct(proc: *Process, user_va: u64, data: []const u8) bool {
 }
 
 fn mapKernelStack(stack: zag.memory.stack.Stack) !void {
-    const pmm_iface = pmm.global_pmm.?.allocator();
+    const pmm_mgr = &pmm.global_pmm.?;
     var page_addr = stack.base.addr;
     while (page_addr < stack.top.addr) {
-        const kpage = try pmm_iface.create(paging.PageMem(.page4k));
-        @memset(std.mem.asBytes(kpage), 0);
+        const kpage = try pmm_mgr.create(paging.PageMem(.page4k));
         const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
         try aarch64_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), .{
             .write_perm = .write,

@@ -174,17 +174,15 @@ fn readVbar() u64 {
 ///
 /// ARM ARM D5.3, Table D5-15: Level 1 block descriptors map 1GB regions.
 fn createIdentityMapping(trampoline_pa: u64) !u64 {
-    const pmm_iface = pmm.global_pmm.?.allocator();
+    const pmm_mgr = &pmm.global_pmm.?;
 
-    // Allocate and zero L0 table (PGD)
-    const l0_page = try pmm_iface.create(paging.PageMem(.page4k));
-    @memset(std.mem.asBytes(l0_page), 0);
+    // Allocate L0 table (PGD) — comes back already zeroed from the PMM.
+    const l0_page = try pmm_mgr.create(paging.PageMem(.page4k));
     const l0_va = @intFromPtr(l0_page);
     const l0_pa = PAddr.fromVAddr(VAddr.fromInt(l0_va), null).addr;
 
-    // Allocate and zero L1 table (PUD)
-    const l1_page = try pmm_iface.create(paging.PageMem(.page4k));
-    @memset(std.mem.asBytes(l1_page), 0);
+    // Allocate L1 table (PUD) — comes back already zeroed from the PMM.
+    const l1_page = try pmm_mgr.create(paging.PageMem(.page4k));
     const l1_va = @intFromPtr(l1_page);
     const l1_pa = PAddr.fromVAddr(VAddr.fromInt(l1_va), null).addr;
 
@@ -281,7 +279,7 @@ pub fn smpInit() !void {
 
 fn smpInitFull() !void {
     const core_count = gic.coreCount();
-    const pmm_iface = pmm.global_pmm.?.allocator();
+    const pmm_mgr = &pmm.global_pmm.?;
 
     // Resolve the trampoline's physical address. secondaryEntry is linked at
     // a kernel VA (TTBR1 range) — walk the kernel page tables to find the PA
@@ -361,14 +359,13 @@ fn smpInitFull() !void {
         var page_addr = ap_stack.base.addr;
         var map_ok = true;
         while (page_addr < ap_stack.top.addr) {
-            const kpage = pmm_iface.create(paging.PageMem(.page4k)) catch {
+            const kpage = pmm_mgr.create(paging.PageMem(.page4k)) catch {
                 map_ok = false;
                 break;
             };
-            @memset(std.mem.asBytes(kpage), 0);
             const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
             aarch64_paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS) catch {
-                pmm_iface.destroy(kpage);
+                pmm_mgr.destroy(kpage);
                 map_ok = false;
                 break;
             };

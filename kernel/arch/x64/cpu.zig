@@ -803,3 +803,58 @@ pub fn rdrand() ?u64 {
     );
     return if (success != 0) value else null;
 }
+
+/// CLZERO cache-line size and feature status. CLZERO is an AMD instruction
+/// that zeroes a single cache line at the linear address in RAX without
+/// first reading it (no read-for-ownership). The line size is fixed in the
+/// microarchitecture and reported via CPUID Fn8000_0008_EBX[0] (feature bit)
+/// and CPUID Fn8000_0008_ECX[23:16] (Zen-family line size field is not
+/// standardized; AMD APM specifies CLZERO operates on a 64-byte line on
+/// all implementations shipped to date, matching the standard cache line).
+///
+/// AMD APM Vol 3, "CLZERO — Cache Line Zero" instruction reference.
+/// AMD APM Vol 3, Table E-3 — CPUID Fn8000_0008_EBX bit 0 = CLZERO.
+const CLZERO_LINE: usize = 64;
+var has_clzero: bool = false;
+
+/// Probe CPUID Fn8000_0008_EBX[0] for CLZERO support and cache the result.
+/// Called once from the PMM initialization path before any zeroPage4K call
+/// can be issued. Safe to call multiple times (idempotent).
+pub fn initZeroPageFeatures() void {
+    // CPUID Fn8000_0000 returns the highest supported extended leaf in EAX.
+    // Anything below 8000_0008h means CLZERO is not advertised.
+    const ext_max_result = cpuidRaw(0x80000000, 0);
+    if (ext_max_result.eax < 0x80000008) {
+        has_clzero = false;
+        return;
+    }
+    const ext8 = cpuidRaw(0x80000008, 0);
+    has_clzero = (ext8.ebx & 0x1) != 0;
+}
+
+/// Zero a 4 KiB page at `ptr` using CLZERO when available, otherwise
+/// fall back to `@memset`. The CLZERO path writes 64 zero bytes per
+/// cache line with no prior read, avoiding the read-for-ownership penalty
+/// that `rep stosb`/`@memset` pays on lines not already in cache.
+///
+/// AMD APM Vol 3, "CLZERO" — "Zeroes the cache line specified by the
+/// logical address in rAX." CLZERO implicitly flushes the line from
+/// all caches in the coherence domain before zeroing, so the zeros
+/// reach main memory on the next writeback.
+pub fn zeroPage4K(ptr: *anyopaque) void {
+    if (has_clzero) {
+        const base: usize = @intFromPtr(ptr);
+        const end: usize = base + 4096;
+        var addr: usize = base;
+        while (addr < end) {
+            asm volatile ("clzero"
+                :
+                : [a] "{rax}" (addr),
+                : .{ .memory = true });
+            addr += CLZERO_LINE;
+        }
+        return;
+    }
+    const bytes: [*]u8 = @ptrCast(ptr);
+    @memset(bytes[0..4096], 0);
+}

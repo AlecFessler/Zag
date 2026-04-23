@@ -116,7 +116,7 @@ clean_nvvars() {
 run_kernel_tests() {
     echo "=== Kernel Tests ==="
     clean_nvvars
-    PARALLEL="${PARALLEL:-8}" bash "$SCRIPT_DIR/tests/run_tests.sh"
+    PARALLEL="${PARALLEL:-8}" bash "$SCRIPT_DIR/tests/tests/run_tests.sh"
 }
 
 run_linux_boot_test() {

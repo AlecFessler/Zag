@@ -316,3 +316,75 @@ pub fn fpuFlushIpi(target_core: u8, thread: anytype) void {
     gic.sendIpiToCore(target_core, 2);
     fpu_flush_mailbox[target_core].waitDone();
 }
+
+/// DC ZVA block size in bytes. Captured at boot from DCZID_EL0.BS. When
+/// `DCZID_EL0.DZP` is set the instruction is disabled at EL1 (or the
+/// implementation chose not to support it) and we must use the `@memset`
+/// fallback path.
+///
+/// ARM ARM D7.2.23 "DC ZVA, Data Cache Zero by Virtual Address":
+///   DC ZVA writes `4 << BS` bytes of zeros starting at a natural block
+///   boundary at or below the provided address. The block size is uniform
+///   across a system; typical Cortex-A implementations report BS=4 → 64B.
+/// ARM ARM D7.2.36 "DCZID_EL0":
+///   Bits [3:0] = BS (log2(words/4) of block size);
+///   Bit  4     = DZP (1 = DC ZVA prohibited).
+var dc_zva_block_size: usize = 0;
+var dc_zva_enabled: bool = false;
+
+/// Read DCZID_EL0 and cache the block size / enable bit. Called once from
+/// the PMM init path on the boot core; safe to call again on APs (all
+/// cores in a valid system report the same BS field).
+pub fn initZeroPageFeatures() void {
+    var dczid: u64 = undefined;
+    asm volatile ("mrs %[v], DCZID_EL0"
+        : [v] "=r" (dczid),
+    );
+    // DZP == 1 means DC ZVA is prohibited — fall back to @memset.
+    if ((dczid & (1 << 4)) != 0) {
+        dc_zva_enabled = false;
+        dc_zva_block_size = 0;
+        return;
+    }
+    const bs: u6 = @truncate(dczid & 0xF);
+    // Block size in bytes = 4 << BS (ARM ARM D7.2.36, DCZID_EL0.BS field).
+    dc_zva_block_size = @as(usize, 4) << bs;
+    dc_zva_enabled = true;
+}
+
+/// Zero a 4 KiB page at `ptr` using DC ZVA when available, otherwise
+/// fall back to `@memset`. DC ZVA zeroes one naturally aligned block
+/// per instruction without a read-for-ownership, which is the critical
+/// property for the PMM-free path where the freshly freed page is
+/// typically not in cache.
+///
+/// ARM ARM D7.2.23 "DC ZVA, Data Cache Zero by Virtual Address":
+///   The instruction operates on the aligned block containing the
+///   supplied VA. Callers must step by the block size reported via
+///   DCZID_EL0.BS for the full region to be covered.
+pub fn zeroPage4K(ptr: *anyopaque) void {
+    if (dc_zva_enabled and dc_zva_block_size > 0 and 4096 % dc_zva_block_size == 0) {
+        const base: usize = @intFromPtr(ptr);
+        const end: usize = base + 4096;
+        // Ensure the starting VA is aligned to the block size. Callers
+        // pass a 4 KiB-aligned pointer and typical block sizes are
+        // 32/64/128 bytes (all divisors of 4096), so this is a no-op
+        // assertion in the common path.
+        std.debug.assert(base % dc_zva_block_size == 0);
+        var addr: usize = base;
+        while (addr < end) {
+            asm volatile ("dc zva, %[a]"
+                :
+                : [a] "r" (addr),
+                : .{ .memory = true });
+            addr += dc_zva_block_size;
+        }
+        // DC ZVA is a cache maintenance op; callers expect the zeros to
+        // be observable by subsequent loads on this core, which requires
+        // a DSB to drain the CMO completion.
+        asm volatile ("dsb ish" ::: .{ .memory = true });
+        return;
+    }
+    const bytes: [*]u8 = @ptrCast(ptr);
+    @memset(bytes[0..4096], 0);
+}

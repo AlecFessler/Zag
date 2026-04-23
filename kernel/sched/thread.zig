@@ -263,7 +263,7 @@ pub const Thread = struct {
 };
 
 fn mapKernelStack(stack: Stack) !void {
-    const pmm_iface = pmm.global_pmm.?.allocator();
+    const pmm_mgr = &pmm.global_pmm.?;
     var page_addr = stack.base.addr;
     var mapped: usize = 0;
     errdefer {
@@ -272,15 +272,14 @@ fn mapKernelStack(stack: Stack) !void {
         while (i < mapped) {
             if (arch.paging.unmapPage(memory_init.kernel_addr_space_root, VAddr.fromInt(undo))) |paddr| {
                 const pg: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
-                pmm_iface.destroy(pg);
+                pmm_mgr.destroy(pg);
             }
             undo += paging.PAGE4K;
             i += 1;
         }
     }
     while (page_addr < stack.top.addr) {
-        const kpage = try pmm_iface.create(paging.PageMem(.page4k));
-        @memset(std.mem.asBytes(kpage), 0);
+        const kpage = try pmm_mgr.create(paging.PageMem(.page4k));
         const kphys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(kpage)), null);
         try arch.paging.mapPage(memory_init.kernel_addr_space_root, kphys, VAddr.fromInt(page_addr), KERNEL_PERMS);
         mapped += 1;
@@ -299,12 +298,12 @@ pub fn createKernelStack() !Stack {
 }
 
 fn unmapKernelStack(stack: Stack) void {
-    const pmm_iface = pmm.global_pmm.?.allocator();
+    const pmm_mgr = &pmm.global_pmm.?;
     var page_addr = stack.base.addr;
     while (page_addr < stack.top.addr) {
         if (arch.paging.unmapPage(memory_init.kernel_addr_space_root, VAddr.fromInt(page_addr))) |paddr| {
             const pg: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(paddr, null).addr);
-            pmm_iface.destroy(pg);
+            pmm_mgr.destroy(pg);
         }
         page_addr += paging.PAGE4K;
     }

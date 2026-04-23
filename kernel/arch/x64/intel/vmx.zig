@@ -341,13 +341,13 @@ fn adjustControls(desired: u32, msr: u32) u32 {
 // ---------------------------------------------------------------------------
 
 fn allocPage() ?*paging.PageMem(.page4k) {
-    const pmm_iface = pmm.global_pmm.?.allocator();
-    return pmm_iface.create(paging.PageMem(.page4k)) catch null;
+    const pmm_mgr = &pmm.global_pmm.?;
+    return pmm_mgr.create(paging.PageMem(.page4k)) catch null;
 }
 
 fn freePage(page: *paging.PageMem(.page4k)) void {
-    const pmm_iface = pmm.global_pmm.?.allocator();
-    pmm_iface.destroy(page);
+    const pmm_mgr = &pmm.global_pmm.?;
+    pmm_mgr.destroy(page);
 }
 
 fn pageToPhys(page: *paging.PageMem(.page4k)) PAddr {
@@ -1132,7 +1132,7 @@ pub fn mapEptPage(ept_root: PAddr, guest_phys: u64, host_phys: PAddr, rights: u8
 }
 
 fn mapEptPageInner(pml4_phys: PAddr, guest_phys: u64, host_phys: PAddr, rights: u8) !void {
-    const pmm_iface = pmm.global_pmm.?.allocator();
+    const pmm_mgr = &pmm.global_pmm.?;
 
     // Build EPT rights bits
     var ept_rights: u64 = 0;
@@ -1154,9 +1154,8 @@ fn mapEptPageInner(pml4_phys: PAddr, guest_phys: u64, host_phys: PAddr, rights: 
     for (indices) |idx| {
         const entry = &table[idx];
         if (entry.* & (EPT_READ | EPT_WRITE | EPT_EXECUTE) == 0) {
-            // No valid entry — allocate a new page table page
-            const new_page = try pmm_iface.create(paging.PageMem(.page4k));
-            @memset(&new_page.mem, 0);
+            // No valid entry — allocate a new page table page (comes back zeroed).
+            const new_page = try pmm_mgr.create(paging.PageMem(.page4k));
             const new_phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(new_page)), null);
             // Intermediate entries need R/W/X set so the walk continues
             entry.* = (new_phys.addr & EPT_ADDR_MASK) | EPT_READ | EPT_WRITE | EPT_EXECUTE;

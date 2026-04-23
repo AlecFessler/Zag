@@ -30,10 +30,9 @@ fn demandPageKernel(faulting_virt: VAddr) void {
 
     if (arch.paging.resolveVaddr(kroot, page_base) != null) return;
 
-    const pmm_iface = pmm.global_pmm.?.allocator();
-    const page = pmm_iface.create(paging.PageMem(.page4k)) catch
+    const pmm_mgr = &pmm.global_pmm.?;
+    const page = pmm_mgr.create(paging.PageMem(.page4k)) catch
         @panic("OOM in kernel demand page fault");
-    @memset(std.mem.asBytes(page), 0);
 
     const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
     arch.paging.mapPage(kroot, phys, page_base, KERNEL_PERMS) catch

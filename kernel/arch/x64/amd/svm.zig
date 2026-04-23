@@ -201,9 +201,8 @@ pub fn perCoreInit() void {
     // Allocate host state-save area (4KB aligned page).
     // AMD APM Vol 2, Section 15.28: VM_HSAVE_PA MSR holds the physical
     // address of the host save area used by VMRUN/#VMEXIT.
-    const pmm_iface = pmm.global_pmm.?.allocator();
-    const hsa_page = pmm_iface.create(paging.PageMem(.page4k)) catch return;
-    @memset(std.mem.asBytes(hsa_page), 0);
+    const pmm_mgr = &pmm.global_pmm.?;
+    const hsa_page = pmm_mgr.create(paging.PageMem(.page4k)) catch return;
     const hsa_phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(hsa_page)), null);
     cpu.wrmsr(VM_HSAVE_PA, hsa_phys.addr);
 
@@ -212,8 +211,7 @@ pub fn perCoreInit() void {
     // which is implementation-specific). This page holds host FS/GS bases,
     // TR/LDTR hidden state, KernelGsBase, STAR, LSTAR, CSTAR, SFMASK,
     // and SYSENTER_CS/ESP/EIP across guest entry/exit.
-    const host_vmcb_page = pmm_iface.create(paging.PageMem(.page4k)) catch return;
-    @memset(std.mem.asBytes(host_vmcb_page), 0);
+    const host_vmcb_page = pmm_mgr.create(paging.PageMem(.page4k)) catch return;
     const core_id = apic.coreID();
     host_vmcb_pa[core_id] = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(host_vmcb_page)), null).addr;
 }
@@ -223,33 +221,27 @@ pub fn perCoreInit() void {
 /// Returns physical address of the VMCB page. The NPT PML4 physical
 /// address is stored at VMCB offset N_CR3 (0x0B0).
 pub fn allocVmStructures() ?PAddr {
-    const pmm_iface = pmm.global_pmm.?.allocator();
+    const pmm_mgr = &pmm.global_pmm.?;
 
-    // Allocate VMCB page
-    const vmcb_page = pmm_iface.create(paging.PageMem(.page4k)) catch return null;
-    @memset(std.mem.asBytes(vmcb_page), 0);
+    // Allocate VMCB page — returns zeroed.
+    const vmcb_page = pmm_mgr.create(paging.PageMem(.page4k)) catch return null;
     const vmcb_vaddr = @intFromPtr(vmcb_page);
     const vmcb_phys = PAddr.fromVAddr(VAddr.fromInt(vmcb_vaddr), null);
 
-    // Allocate NPT PML4 page
-    const npt_page = pmm_iface.create(paging.PageMem(.page4k)) catch {
-        pmm_iface.destroy(vmcb_page);
+    // Allocate NPT PML4 page — returns zeroed.
+    const npt_page = pmm_mgr.create(paging.PageMem(.page4k)) catch {
+        pmm_mgr.destroy(vmcb_page);
         return null;
     };
-    @memset(std.mem.asBytes(npt_page), 0);
     const npt_phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(npt_page)), null);
 
     // Allocate IOPM (3 contiguous pages = 12KB, 4KB-aligned).
     // AMD APM Vol 2, Section 15.10.1: I/O permission map is 12KB.
     // Must be physically contiguous. Allocate 4 pages (order-2) from the
     // buddy allocator to guarantee contiguity, then use the first 3.
-    const iopm_ptr = pmm_iface.rawAlloc(
-        4 * paging.PAGE4K,
-        std.mem.Alignment.fromByteUnits(paging.PAGE4K),
-        @returnAddress(),
-    ) orelse {
-        pmm_iface.destroy(npt_page);
-        pmm_iface.destroy(vmcb_page);
+    const iopm_ptr = pmm_mgr.allocBlock(4 * paging.PAGE4K) orelse {
+        pmm_mgr.destroy(npt_page);
+        pmm_mgr.destroy(vmcb_page);
         return null;
     };
     @memset(iopm_ptr[0 .. 3 * paging.PAGE4K], 0xFF);
@@ -258,14 +250,10 @@ pub fn allocVmStructures() ?PAddr {
     // Allocate MSRPM (2 contiguous pages = 8KB, 4KB-aligned).
     // AMD APM Vol 2, Section 15.10.2: MSR permission map is 8KB.
     // Must be physically contiguous. Allocate 2 pages (order-1).
-    const msrpm_ptr = pmm_iface.rawAlloc(
-        2 * paging.PAGE4K,
-        std.mem.Alignment.fromByteUnits(paging.PAGE4K),
-        @returnAddress(),
-    ) orelse {
-        pmm_iface.rawFree(iopm_ptr[0 .. 4 * paging.PAGE4K], std.mem.Alignment.fromByteUnits(paging.PAGE4K), @returnAddress());
-        pmm_iface.destroy(npt_page);
-        pmm_iface.destroy(vmcb_page);
+    const msrpm_ptr = pmm_mgr.allocBlock(2 * paging.PAGE4K) orelse {
+        pmm_mgr.freeBlock(iopm_ptr[0 .. 4 * paging.PAGE4K]);
+        pmm_mgr.destroy(npt_page);
+        pmm_mgr.destroy(vmcb_page);
         return null;
     };
     @memset(msrpm_ptr[0 .. 2 * paging.PAGE4K], 0xFF);
@@ -361,7 +349,7 @@ pub fn allocVmStructures() ?PAddr {
 
 /// Free VMCB and associated structures.
 pub fn freeVmStructures(vmcb_phys: PAddr) void {
-    const pmm_iface = pmm.global_pmm.?.allocator();
+    const pmm_mgr = &pmm.global_pmm.?;
     const vmcb_vaddr = VAddr.fromPAddr(vmcb_phys, null).addr;
     const vmcb: [*]u8 = @ptrFromInt(vmcb_vaddr);
 
@@ -370,7 +358,7 @@ pub fn freeVmStructures(vmcb_phys: PAddr) void {
     if (iopm_phys_addr != 0) {
         const iopm_vaddr = VAddr.fromPAddr(PAddr.fromInt(iopm_phys_addr), null).addr;
         const iopm_slice: [*]u8 = @ptrFromInt(iopm_vaddr);
-        pmm_iface.rawFree(iopm_slice[0 .. 4 * paging.PAGE4K], std.mem.Alignment.fromByteUnits(paging.PAGE4K), 0);
+        pmm_mgr.freeBlock(iopm_slice[0 .. 4 * paging.PAGE4K]);
     }
 
     // Free MSRPM (2-page contiguous block)
@@ -378,7 +366,7 @@ pub fn freeVmStructures(vmcb_phys: PAddr) void {
     if (msrpm_phys_addr != 0) {
         const msrpm_vaddr = VAddr.fromPAddr(PAddr.fromInt(msrpm_phys_addr), null).addr;
         const msrpm_slice: [*]u8 = @ptrFromInt(msrpm_vaddr);
-        pmm_iface.rawFree(msrpm_slice[0 .. 2 * paging.PAGE4K], std.mem.Alignment.fromByteUnits(paging.PAGE4K), 0);
+        pmm_mgr.freeBlock(msrpm_slice[0 .. 2 * paging.PAGE4K]);
     }
 
     // Free NPT page table tree (intermediate pages) before freeing the PML4.
@@ -389,14 +377,14 @@ pub fn freeVmStructures(vmcb_phys: PAddr) void {
 
     // Free VMCB page
     const vmcb_page: *paging.PageMem(.page4k) = @ptrFromInt(vmcb_vaddr);
-    pmm_iface.destroy(vmcb_page);
+    pmm_mgr.destroy(vmcb_page);
 }
 
 /// Recursively walk the NPT page table tree and free all intermediate pages
 /// (PDPT, PD, PT) plus the PML4 itself. Leaf entries point to guest-backing
 /// host pages which are NOT freed here (they belong to the host process).
 fn freeNptTree(npt_root: PAddr) void {
-    const pmm_iface = pmm.global_pmm.?.allocator();
+    const pmm_mgr = &pmm.global_pmm.?;
     const pml4: *[512]u64 = @ptrFromInt(VAddr.fromPAddr(npt_root, null).addr);
 
     for (pml4) |pml4e| {
@@ -414,22 +402,22 @@ fn freeNptTree(npt_root: PAddr) void {
                 // Free PT page (leaf entries in PT point to host pages, not freed)
                 const pt_phys = PAddr.fromInt(pde & 0x000F_FFFF_FFFF_F000);
                 const pt_page: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(pt_phys, null).addr);
-                pmm_iface.destroy(pt_page);
+                pmm_mgr.destroy(pt_page);
             }
 
             // Free PD page
             const pd_page: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(pd_phys, null).addr);
-            pmm_iface.destroy(pd_page);
+            pmm_mgr.destroy(pd_page);
         }
 
         // Free PDPT page
         const pdpt_page: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(pdpt_phys, null).addr);
-        pmm_iface.destroy(pdpt_page);
+        pmm_mgr.destroy(pdpt_page);
     }
 
     // Free PML4 page
     const pml4_page: *paging.PageMem(.page4k) = @ptrFromInt(VAddr.fromPAddr(npt_root, null).addr);
-    pmm_iface.destroy(pml4_page);
+    pmm_mgr.destroy(pml4_page);
 }
 
 /// Execute guest via VMRUN, handle #VMEXIT.
@@ -658,7 +646,7 @@ pub fn vmResume(guest_state: *GuestState, vmcb_phys: PAddr, guest_fxsave: *align
 /// `vmcb_phys` is the VMCB physical address (same as vm.arch_structures).
 /// The NPT PML4 root is read from the VMCB at N_CR3 (offset 0x0B0).
 pub fn mapNptPage(vmcb_phys: PAddr, guest_phys: u64, host_phys: PAddr, rights: u8) !void {
-    const pmm_iface = pmm.global_pmm.?.allocator();
+    const pmm_mgr = &pmm.global_pmm.?;
 
     // Extract NPT PML4 root from VMCB N_CR3 field.
     const vmcb: [*]const u8 = @ptrFromInt(VAddr.fromPAddr(vmcb_phys, null).addr);
@@ -677,8 +665,7 @@ pub fn mapNptPage(vmcb_phys: PAddr, guest_phys: u64, host_phys: PAddr, rights: u
 
     // Walk/allocate PML4 → PDPT
     if (pml4[pml4_idx] == 0) {
-        const page = pmm_iface.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
-        @memset(std.mem.asBytes(page), 0);
+        const page = pmm_mgr.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
         const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
         pml4[pml4_idx] = phys.addr | 0x7; // present + writable + user
     }
@@ -686,8 +673,7 @@ pub fn mapNptPage(vmcb_phys: PAddr, guest_phys: u64, host_phys: PAddr, rights: u
 
     // Walk/allocate PDPT → PD
     if (pdpt[pdpt_idx] == 0) {
-        const page = pmm_iface.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
-        @memset(std.mem.asBytes(page), 0);
+        const page = pmm_mgr.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
         const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
         pdpt[pdpt_idx] = phys.addr | 0x7;
     }
@@ -695,8 +681,7 @@ pub fn mapNptPage(vmcb_phys: PAddr, guest_phys: u64, host_phys: PAddr, rights: u
 
     // Walk/allocate PD → PT
     if (pd[pd_idx] == 0) {
-        const page = pmm_iface.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
-        @memset(std.mem.asBytes(page), 0);
+        const page = pmm_mgr.create(paging.PageMem(.page4k)) catch return error.OutOfMemory;
         const phys = PAddr.fromVAddr(VAddr.fromInt(@intFromPtr(page)), null);
         pd[pd_idx] = phys.addr | 0x7;
     }

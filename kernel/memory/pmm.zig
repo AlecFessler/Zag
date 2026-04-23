@@ -32,6 +32,12 @@ const PerCorePageCache = struct {
         const node = self.head orelse return null;
         self.head = node.next;
         self.count -= 1;
+        // Push overwrote the first 8 bytes of the page with the intrusive
+        // `next` pointer. Allocation callers expect a fully zeroed page
+        // (§ PMM zero-on-free invariant), so null the one field we
+        // mutated — re-zeroing the whole page would throw away the
+        // cache-line-zero work the free path already paid for.
+        node.next = null;
         return @ptrCast(node);
     }
 };
@@ -39,36 +45,21 @@ const PerCorePageCache = struct {
 var page_caches: [MAX_CORES]PerCorePageCache = [_]PerCorePageCache{.{}} ** MAX_CORES;
 
 pub const PhysicalMemoryManager = struct {
-    backing_allocator: std.mem.Allocator,
+    buddy: *BuddyAllocator,
     lock: SpinLock = .{},
 
-    pub fn init(backing_allocator: std.mem.Allocator) PhysicalMemoryManager {
+    pub fn init(buddy: *BuddyAllocator) PhysicalMemoryManager {
         return .{
-            .backing_allocator = backing_allocator,
+            .buddy = buddy,
         };
     }
 
-    pub fn allocator(self: *PhysicalMemoryManager) std.mem.Allocator {
-        return .{
-            .ptr = self,
-            .vtable = &.{
-                .alloc = alloc,
-                .resize = resize,
-                .remap = remap,
-                .free = free,
-            },
-        };
-    }
-
-    fn alloc(
-        ptr: *anyopaque,
-        len: usize,
-        alignment: std.mem.Alignment,
-        ret_addr: usize,
-    ) ?[*]u8 {
-        const self: *PhysicalMemoryManager = @ptrCast(@alignCast(ptr));
-
-        if (len == paging.PAGE4K and sched.initialized) {
+    /// Allocate a single 4 KiB page. Uses the per-core page cache after
+    /// the scheduler is up (so the common hot path avoids the buddy
+    /// spinlock); falls back to a buddy allocation before that or on
+    /// cache miss. Returns null on OOM.
+    pub fn allocPage(self: *PhysicalMemoryManager) ?[*]u8 {
+        if (sched.initialized) {
             const irq = arch.cpu.saveAndDisableInterrupts();
             const cache = &page_caches[arch.smp.coreID()];
 
@@ -78,20 +69,13 @@ pub const PhysicalMemoryManager = struct {
             }
 
             self.lock.lock();
-
-            const bulk = self.backing_allocator.rawAlloc(
-                paging.PAGE4K * CACHE_REFILL_PAGES,
-                std.mem.Alignment.fromByteUnits(paging.PAGE4K),
-                ret_addr,
-            ) orelse {
-                const single = self.backing_allocator.rawAlloc(len, alignment, ret_addr);
+            const bulk = self.buddy.allocBlock(paging.PAGE4K * CACHE_REFILL_PAGES) orelse {
+                const single = self.buddy.allocBlock(paging.PAGE4K);
                 self.lock.unlock();
                 arch.cpu.restoreInterrupts(irq);
                 return single;
             };
-
-            const buddy: *BuddyAllocator = @ptrCast(@alignCast(self.backing_allocator.ptr));
-            var batch = buddy.splitAllocation(@intFromPtr(bulk), 0);
+            var batch = self.buddy.splitAllocation(@intFromPtr(bulk), 0);
             self.lock.unlock();
 
             while (batch.pop()) |page| {
@@ -105,25 +89,22 @@ pub const PhysicalMemoryManager = struct {
 
         const irq = self.lock.lockIrqSave();
         defer self.lock.unlockIrqRestore(irq);
-        return self.backing_allocator.rawAlloc(len, alignment, ret_addr);
+        return self.buddy.allocBlock(paging.PAGE4K);
     }
 
-    fn free(
-        ptr: *anyopaque,
-        buf: []u8,
-        alignment: std.mem.Alignment,
-        ret_addr: usize,
-    ) void {
-        const self: *PhysicalMemoryManager = @ptrCast(@alignCast(ptr));
+    /// Free a single 4 KiB page previously returned by `allocPage`.
+    /// Zeroes the page before it rejoins the free pool (via the
+    /// per-core cache or the buddy) so every alloc path observes a zero
+    /// page without paying a read-for-ownership on bulk `@memset`.
+    pub fn freePage(self: *PhysicalMemoryManager, page: [*]u8) void {
+        arch.memory.zeroPage(@ptrCast(page));
 
-        // only touch per core cache if the scheduler has been fully initialized (ie, system is fully booted)
-        // otherwise arch.smp.coreID() will access an array that is undefined
-        if (buf.len == paging.PAGE4K and sched.initialized) {
+        if (sched.initialized) {
             const irq = arch.cpu.saveAndDisableInterrupts();
             const cache = &page_caches[arch.smp.coreID()];
 
             if (cache.count < CACHE_MAX_PAGES) {
-                cache.push(buf.ptr);
+                cache.push(page);
                 arch.cpu.restoreInterrupts(irq);
                 return;
             }
@@ -131,54 +112,59 @@ pub const PhysicalMemoryManager = struct {
             self.lock.lock();
             var i: u32 = 0;
             while (i < CACHE_MAX_PAGES / 2) {
-                const page = cache.pop().?;
-                self.backing_allocator.rawFree(
-                    page[0..paging.PAGE4K],
-                    std.mem.Alignment.fromByteUnits(paging.PAGE4K),
-                    ret_addr,
-                );
+                const cached = cache.pop().?;
+                self.buddy.freeBlock(cached[0..paging.PAGE4K]);
                 i += 1;
             }
             self.lock.unlock();
 
-            cache.push(buf.ptr);
+            cache.push(page);
             arch.cpu.restoreInterrupts(irq);
             return;
         }
 
         const irq = self.lock.lockIrqSave();
         defer self.lock.unlockIrqRestore(irq);
-        self.backing_allocator.rawFree(buf, alignment, ret_addr);
+        self.buddy.freeBlock(page[0..paging.PAGE4K]);
     }
 
-    fn resize(
-        ptr: *anyopaque,
-        memory: []u8,
-        alignment: std.mem.Alignment,
-        new_len: usize,
-        ret_addr: usize,
-    ) bool {
-        _ = ptr;
-        _ = memory;
-        _ = alignment;
-        _ = new_len;
-        _ = ret_addr;
-        unreachable;
+    /// Allocate a contiguous physical block sized `len` bytes (must be a
+    /// power-of-two multiple of 4 KiB). Bypasses the per-core cache —
+    /// the cache only holds single pages — and returns directly from
+    /// the buddy allocator.
+    pub fn allocBlock(self: *PhysicalMemoryManager, len: u64) ?[*]u8 {
+        const irq = self.lock.lockIrqSave();
+        defer self.lock.unlockIrqRestore(irq);
+        return self.buddy.allocBlock(len);
     }
 
-    fn remap(
-        ptr: *anyopaque,
-        memory: []u8,
-        alignment: std.mem.Alignment,
-        new_len: usize,
-        ret_addr: usize,
-    ) ?[*]u8 {
-        _ = ptr;
-        _ = memory;
-        _ = alignment;
-        _ = new_len;
-        _ = ret_addr;
-        unreachable;
+    /// Free a contiguous physical block previously returned by
+    /// `allocBlock`. Zeroes every page in the block before the buddy
+    /// takes it back.
+    pub fn freeBlock(self: *PhysicalMemoryManager, buf: []u8) void {
+        std.debug.assert(buf.len % paging.PAGE4K == 0);
+        var offset: u64 = 0;
+        while (offset < buf.len) {
+            arch.memory.zeroPage(@ptrCast(&buf[offset]));
+            offset += paging.PAGE4K;
+        }
+        const irq = self.lock.lockIrqSave();
+        defer self.lock.unlockIrqRestore(irq);
+        self.buddy.freeBlock(buf);
+    }
+
+    /// Typed convenience wrapper for the single-page path. The backing
+    /// page is returned already zeroed (§ PMM zero-on-free invariant).
+    pub fn create(self: *PhysicalMemoryManager, comptime T: type) !*T {
+        comptime std.debug.assert(@sizeOf(T) == paging.PAGE4K);
+        comptime std.debug.assert(@alignOf(T) == paging.PAGE4K);
+        const page = self.allocPage() orelse return error.OutOfMemory;
+        return @ptrCast(@alignCast(page));
+    }
+
+    pub fn destroy(self: *PhysicalMemoryManager, ptr: anytype) void {
+        const bytes: [*]u8 = @ptrCast(ptr);
+        self.freePage(bytes);
     }
 };
 
@@ -203,8 +189,7 @@ pub fn freePageCount() u64 {
     const irq = pmm_ptr.lock.lockIrqSave();
     defer pmm_ptr.lock.unlockIrqRestore(irq);
 
-    const buddy: *BuddyAllocator = @ptrCast(@alignCast(pmm_ptr.backing_allocator.ptr));
-    var total = buddy.free_pages;
+    var total = pmm_ptr.buddy.free_pages;
 
     // Per-core cache pages were allocated from the buddy (via
     // `splitAllocation`) and are observably free to userspace. Each
@@ -225,7 +210,6 @@ pub fn totalPageCount() u64 {
     const pmm_ptr: *PhysicalMemoryManager = &global_pmm.?;
     const irq = pmm_ptr.lock.lockIrqSave();
     defer pmm_ptr.lock.unlockIrqRestore(irq);
-
-    const buddy: *BuddyAllocator = @ptrCast(@alignCast(pmm_ptr.backing_allocator.ptr));
-    return buddy.total_pages;
+    return pmm_ptr.buddy.total_pages;
 }
+
