@@ -148,27 +148,11 @@ pub const Thread = struct {
         // state of whichever thread is currently running on the caller's
         // core. Just zero and free the state struct — real hardware
         // teardown happened at the latest pmuSave on context switch away.
-        //
-        // Serialize with in-flight pmu syscalls on this thread via
-        // `proc._gen_lock`: sysPmuStart/Read/Reset/Stop all touch
-        // `target_thread.pmu_state` + the `*PmuState` fields under the
-        // same lock. Without this, deinit destroying the PmuState slot
-        // would race a concurrent `arch.pmu.pmuRead(state, ...)` and
-        // trigger a UAF / `destroy unreachable`. Take, null, release,
-        // then do the hardware clear + slab destroy outside the lock —
-        // the local `state` pointer can no longer be reached by any
-        // other caller because `pmu_state = null` is published.
-        const maybe_state = blk: {
-            proc._gen_lock.lock();
-            defer proc._gen_lock.unlock();
-            const s = self.pmu_state;
-            self.pmu_state = null;
-            break :blk s;
-        };
-        if (maybe_state) |state| {
+        if (self.pmu_state) |state| {
             arch.pmu.pmuClearState(state);
             const gen = zag.syscall.pmu.PmuStateAllocator.currentGen(state);
             zag.syscall.pmu.slab_instance.destroy(state, gen) catch unreachable;
+            self.pmu_state = null;
         }
 
         // Remove thread handle from own perm table and handler's perm table
