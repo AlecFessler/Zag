@@ -273,7 +273,14 @@ EXCEPTION_ENTRY_NAMES = {
     "handleUnexpected",
     "dispatchIrq",
     "faultOrKillUser",
+    # scheduler tick, hit from the arch IRQ vector on every timer
+    "schedTimerHandler",
 }
+
+# Extra roots outside exceptions.zig that IRQ / timer paths reach.
+EXTRA_ROOT_LOCATIONS: list[tuple[str, str]] = [
+    ("kernel/sched/scheduler.zig", "schedTimerHandler"),
+]
 
 
 
@@ -382,7 +389,28 @@ def find_entry_points() -> list[EntryPoint]:
 
     # Thin-dispatch helpers (arch.vm.guestMap, etc.) are reached via
     # inline expansion of free-function calls in the syscall bodies —
-    # not as separate entries. Removed ARCH_HELPER_ENTRIES.
+    # not as separate entries.
+    #
+    # Extra roots listed in EXTRA_ROOT_LOCATIONS (e.g. schedTimerHandler
+    # in kernel/sched/scheduler.zig) are reached from IRQ / timer paths
+    # but live outside the arch exceptions file, so wire them in.
+    for rel_path, fn_name in EXTRA_ROOT_LOCATIONS:
+        fpath = REPO_ROOT / rel_path
+        if not fpath.exists():
+            continue
+        lines = fpath.read_text().splitlines()
+        for i, line in enumerate(lines):
+            m = FN_HEAD_RE.match(line)
+            if not m or m.group(1) != fn_name:
+                continue
+            body, body_start = extract_function_body(lines, i)
+            if not body:
+                continue
+            entries.append(EntryPoint(
+                name=fn_name, file=fpath, line=i + 1,
+                body_lines=body, body_first_line=body_start,
+            ))
+            break
 
     return entries
 
@@ -743,6 +771,42 @@ def _walk_body(
         synth_counter[0] += 1
         synth = synth_counter[0]
         code = strip_comments(raw_line)
+
+        # For-loop captures: `for (<array>) |x| { ... }` binds `x` to
+        # each element. When `<array>` head is slab-typed and the array
+        # is `[N]*T` / `[]*T` or similar (Process.threads is
+        # `[MAX_THREADS]*Thread`), the capture ident becomes a slab ptr.
+        # Handle `|x|` and `|x, i|` capture lists; only the first
+        # capture gets the element value.
+        m_for = re.match(
+            r"^\s*for\s*\(\s*([A-Za-z_]\w*(?:\[[^\]]*\])?"
+            r"(?:\.[A-Za-z_]\w*(?:\[[^\]]*\])?)*)"
+            r"(?:\s*,[^)]*)?"
+            r"\s*\)\s*\|\s*([A-Za-z_]\w*)",
+            code,
+        )
+        if m_for:
+            array_expr = m_for.group(1)
+            cap = m_for.group(2)
+            # Strip trailing `[...]` slice and chase field chain to
+            # figure out the array's owning struct + field.
+            head = array_expr.split(".", 1)[0]
+            head = head.split("[", 1)[0]
+            if head in env:
+                # Walk the chain of fields beyond the head. If any field
+                # in DEFAULT_FIELD_CHAINS has a `threads`-like array
+                # type, bind `cap` to the element slab type.
+                # Shortcut: Process.threads is the canonical array we
+                # care about; treat any `.threads` or `.children` tail
+                # as *Thread / *Process. Extendable.
+                tail_fields = [
+                    t.split("[", 1)[0]
+                    for t in array_expr.split(".")[1:]
+                ]
+                if tail_fields and tail_fields[-1] == "threads":
+                    env[cap] = "Thread"
+                elif tail_fields and tail_fields[-1] == "children":
+                    env[cap] = "Process"
 
         # Decl → grow env (& self_alive where applicable).
         joined = _join_multiline_decl(body_lines, rel)
