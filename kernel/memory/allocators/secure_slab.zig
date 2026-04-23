@@ -93,6 +93,62 @@ pub const GenLock = extern struct {
     }
 };
 
+/// Fat pointer to a slab-backed object. Pairs the pointer with the
+/// generation captured at issuance; every access goes through `lock` /
+/// `unlock`, which internally calls `GenLock.lockWithGen(self.gen)`.
+///
+/// This is the ONLY sanctioned form for kernel storage of a pointer to
+/// a slab-backed object. Bare `*T` for slab-backed T is banned at the
+/// type-system level (enforced by the static analyzer — see
+/// `tools/check_gen_lock.py`). Wherever such a pointer would be stored
+/// — struct field, array element, function parameter, local variable —
+/// the slot is `SlabRef(T)` instead.
+///
+/// Semantics:
+///  * `init(ptr, gen)` — construct a fat pointer; gen is the snapshot
+///    taken when the reference was minted (perm-table insertion,
+///    fresh-alloc return, etc.).
+///  * `lock()` returns a guarded pointer to T on success, or
+///    `StaleHandle` if the slot has been freed since the ref was
+///    minted. Caller must pair with `unlock()`.
+///  * `unlock()` releases the lock bit. The gen carried by the ref is
+///    untouched — the ref remains valid for subsequent locks until the
+///    slot is actually freed.
+///  * `eql(other)` — identity compare. Fat refs to the same slot with
+///    the same gen are the same reference.
+pub fn SlabRef(comptime T: type) type {
+    comptime validateT(T);
+    return extern struct {
+        const Self = @This();
+
+        ptr: *T,
+        gen: u32,
+        _pad: u32 = 0,
+
+        pub fn init(ptr: *T, gen: u63) Self {
+            std.debug.assert(gen % 2 == 1);
+            return .{ .ptr = ptr, .gen = @intCast(gen) };
+        }
+
+        /// Verify-and-acquire. On success the caller has exclusive
+        /// access to `self.ptr` until `unlock()`. On `StaleHandle` the
+        /// slot was freed since this ref was minted — the caller must
+        /// NOT touch `self.ptr`.
+        pub fn lock(self: Self) AccessError!*T {
+            try self.ptr._gen_lock.lockWithGen(@intCast(self.gen));
+            return self.ptr;
+        }
+
+        pub fn unlock(self: Self) void {
+            self.ptr._gen_lock.unlock();
+        }
+
+        pub fn eql(self: Self, other: Self) bool {
+            return self.ptr == other.ptr and self.gen == other.gen;
+        }
+    };
+}
+
 /// Out-of-band doubly-linked list entry. Sits in its own vaddr region
 /// separate from the slot pointers so a single OOB write from a T instance
 /// cannot corrupt both the address table and the freelist topology.
@@ -151,10 +207,7 @@ pub fn SecureSlab(
         /// bump pointers. Orthogonal to per-slot GenLocks.
         lock: SpinLock = .{},
 
-        pub const AllocResult = struct {
-            ptr: *T,
-            gen: u63,
-        };
+        pub const Ref = SlabRef(T);
 
         pub fn init(
             data_range: Range,
@@ -201,15 +254,15 @@ pub fn SecureSlab(
             };
         }
 
-        /// Allocate a fresh slot. Returns the object pointer and its new
-        /// generation; the caller must stash `gen` in whatever capability
-        /// handle it issues, then pass it back to `destroy` (or wire it
-        /// into `GenLock.lockWithGen` at every subsequent use).
-        ///
-        /// The caller must initialize all non-`_gen_lock` fields of T
-        /// before any concurrent observer can see the pointer; this path
-        /// writes the gen-lock word (live, unlocked) but nothing else.
-        pub fn create(self: *Self) AllocError!AllocResult {
+        /// Allocate a fresh slot. Returns a `SlabRef(T)` — a fat
+        /// pointer pairing the slot pointer with its just-advanced
+        /// generation. The caller must initialize all non-`_gen_lock`
+        /// fields of T via `ref.ptr.field = …` before any concurrent
+        /// observer can see the ref; this path writes the gen-lock
+        /// word (live, unlocked) but nothing else. While no other
+        /// observer holds the ref, field access during init is
+        /// self-alive and does not need lock/unlock bracketing.
+        pub fn create(self: *Self) AllocError!Ref {
             self.lock.lock();
             defer self.lock.unlock();
 
@@ -235,13 +288,19 @@ pub fn SecureSlab(
             const new_gen: u63 = prev_gen + 1;
             slot_ptr._gen_lock.setGenRelease(new_gen);
 
-            return .{ .ptr = slot_ptr, .gen = new_gen };
+            return Ref.init(slot_ptr, new_gen);
         }
 
-        /// Atomically verify the caller's expected gen, acquire the lock,
-        /// bump gen to the next even (freed) value, and re-link the slot.
-        /// Returns `StaleHandle` if gen no longer matches — the object
-        /// was already freed (possibly reallocated) by a concurrent path.
+        /// Atomically verify the caller's carried gen, acquire the
+        /// lock, bump gen to the next even (freed) value, and re-link
+        /// the slot. Returns `StaleHandle` if the gen no longer matches
+        /// — a concurrent destroy already ran (or the ref predates a
+        /// reallocation and is a bug). A racing double-free is rejected
+        /// cleanly rather than panicking.
+        ///
+        /// Prefer `SlabRef(T).destroy(slab)` at call sites that already
+        /// hold a fat pointer; this underlying form exists for sites
+        /// that only know `(*T, gen)` and haven't migrated yet.
         pub fn destroy(
             self: *Self,
             ptr: *T,
@@ -496,5 +555,26 @@ test "genlock lock/unlock sequencing" {
 test "genlock lockWithGen rejects stale" {
     var gl: GenLock = .{};
     gl.setGenRelease(5);
-    try testing.expectError(error.StaleHandle, gl.lockWithGen(4));
+    // Stale gen must still be odd — an even expected_gen would trip
+    // the parity assert, not return StaleHandle (that's a caller bug,
+    // not an ordinary stale-handle miss).
+    try testing.expectError(error.StaleHandle, gl.lockWithGen(3));
+}
+
+test "SlabRef lock / unlock round-trip on live slot" {
+    var t: TestT = .{};
+    t._gen_lock.setGenRelease(3); // pretend live at gen=3
+    const ref = SlabRef(TestT).init(&t, 3);
+    const got = try ref.lock();
+    try testing.expectEqual(&t, got);
+    try testing.expect(t._gen_lock.word.load(.monotonic) & 1 == 1);
+    ref.unlock();
+    try testing.expect(t._gen_lock.word.load(.monotonic) & 1 == 0);
+}
+
+test "SlabRef.lock rejects a stale ref" {
+    var t: TestT = .{};
+    t._gen_lock.setGenRelease(5); // slot has advanced to 5
+    const stale = SlabRef(TestT).init(&t, 3); // caller captured gen=3
+    try testing.expectError(error.StaleHandle, stale.lock());
 }
