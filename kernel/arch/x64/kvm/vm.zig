@@ -223,12 +223,20 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
         return E_NOMEM;
     };
 
-    vm_obj.* = .{
-        .owner = proc,
-        .policy = user_policy.*,
-        .vm_id = @atomicRmw(u64, &vm_id_counter, .Add, 1, .monotonic),
-        .arch_structures = arch_structures,
-    };
+    // Field-by-field init preserves `vm_obj._gen_lock` set by the slab
+    // allocator. A `.* = .{...}` would zero it.
+    vm_obj.vcpus = undefined;
+    vm_obj.num_vcpus = 0;
+    vm_obj.owner = proc;
+    vm_obj.exit_box = .{};
+    vm_obj.policy = user_policy.*;
+    vm_obj.vm_id = @atomicRmw(u64, &vm_id_counter, .Add, 1, .monotonic);
+    vm_obj.arch_structures = arch_structures;
+    vm_obj.guest_mem = .{};
+    vm_obj.guest_ram_host_base = 0;
+    vm_obj.guest_ram_size = 0;
+    vm_obj.lapic = .{};
+    vm_obj.ioapic = .{};
 
     // Initialize in-kernel LAPIC and IOAPIC emulation. The two devices
     // notify each other through host-callback structs (`LapicHost` /

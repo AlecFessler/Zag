@@ -232,13 +232,39 @@ pub const Thread = struct {
         const thread = alloc_result.ptr;
         errdefer slab_instance.destroy(thread, alloc_result.gen) catch unreachable;
 
-        thread.* = .{
-            .tid = @atomicRmw(u64, &tid_counter, .Add, 1, .monotonic),
-            .ctx = undefined,
-            .kernel_stack = undefined,
-            .user_stack = null,
-            .process = proc,
-        };
+        // Field-by-field assignment preserves `thread._gen_lock` (which
+        // the slab allocator just set to the freshly-advanced live gen).
+        // A whole-struct `thread.* = .{...}` would zero the gen-lock,
+        // desyncing it from the allocator's gen and invalidating every
+        // subsequent `lockWithGen` through a handle.
+        thread.tid = @atomicRmw(u64, &tid_counter, .Add, 1, .monotonic);
+        thread.ctx = undefined;
+        thread.kernel_stack = undefined;
+        thread.user_stack = null;
+        thread.process = proc;
+        thread.next = null;
+        thread.priority = .normal;
+        thread.pre_pin_priority = .normal;
+        thread.pre_pin_affinity = null;
+        thread.core_affinity = null;
+        thread.state = .ready;
+        thread.on_cpu = std.atomic.Value(bool).init(false);
+        thread.pinned_exclusive = false;
+        thread.futex_deadline_ns = 0;
+        thread.futex_paddr = PAddr.fromInt(0);
+        thread.futex_wake_index = 0;
+        thread.futex_paddrs = [_]PAddr{PAddr.fromInt(0)} ** 64;
+        thread.futex_bucket_count = 0;
+        thread.ipc_server = null;
+        thread.slot_index = 0;
+        thread.fault_reason = .none;
+        thread.fault_addr = 0;
+        thread.fault_rip = 0;
+        thread.fault_user_ctx = null;
+        thread.pmu_state = null;
+        thread.last_fpu_core = null;
+        thread.handle_refcount = std.atomic.Value(u32).init(0);
+        thread.teardown_done = false;
         arch.cpu.fpuStateInit(&thread.fpu_state);
 
         thread.kernel_stack = try stack_mod.createKernel();

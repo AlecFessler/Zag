@@ -123,14 +123,37 @@ pub fn create(vm_obj: *Vm) !*VCpu {
     const thread = thread_alloc.ptr;
     errdefer thread_mod.slab_instance.destroy(thread, thread_alloc.gen) catch unreachable;
 
-    thread.* = .{
-        .tid = @atomicRmw(u64, &thread_mod.tid_counter, .Add, 1, .monotonic),
-        .ctx = undefined,
-        .kernel_stack = undefined,
-        .user_stack = null,
-        .process = proc,
-        .state = .blocked, // starts blocked until vm_vcpu_run
-    };
+    // Field-by-field init preserves `thread._gen_lock` set by the slab
+    // allocator. A `.* = .{...}` would zero it.
+    thread.tid = @atomicRmw(u64, &thread_mod.tid_counter, .Add, 1, .monotonic);
+    thread.ctx = undefined;
+    thread.kernel_stack = undefined;
+    thread.user_stack = null;
+    thread.process = proc;
+    thread.next = null;
+    thread.priority = .normal;
+    thread.pre_pin_priority = .normal;
+    thread.pre_pin_affinity = null;
+    thread.core_affinity = null;
+    thread.state = .blocked;
+    thread.on_cpu = std.atomic.Value(bool).init(false);
+    thread.pinned_exclusive = false;
+    thread.futex_deadline_ns = 0;
+    thread.futex_paddr = PAddr.fromInt(0);
+    thread.futex_wake_index = 0;
+    thread.futex_paddrs = [_]PAddr{PAddr.fromInt(0)} ** 64;
+    thread.futex_bucket_count = 0;
+    thread.ipc_server = null;
+    thread.slot_index = 0;
+    thread.fault_reason = .none;
+    thread.fault_addr = 0;
+    thread.fault_rip = 0;
+    thread.fault_user_ctx = null;
+    thread.pmu_state = null;
+    thread.fpu_state = [_]u8{0} ** 576;
+    thread.last_fpu_core = null;
+    thread.handle_refcount = std.atomic.Value(u32).init(0);
+    thread.teardown_done = false;
 
     thread.kernel_stack = try stack_mod.createKernel();
     errdefer stack_mod.destroyKernel(thread.kernel_stack, memory_init.kernel_addr_space_root);
@@ -152,10 +175,16 @@ pub fn create(vm_obj: *Vm) !*VCpu {
     proc.num_threads += 1;
     proc._gen_lock.unlock();
 
-    vcpu_obj.* = .{
-        .thread = thread,
-        .vm = vm_obj,
-    };
+    // Field-by-field to preserve `vcpu_obj._gen_lock`.
+    vcpu_obj.thread = thread;
+    vcpu_obj.vm = vm_obj;
+    vcpu_obj.guest_state = .{};
+    vcpu_obj.state = std.atomic.Value(u8).init(@intFromEnum(VCpuState.idle));
+    vcpu_obj.last_exit_info = .{ .unknown = 0 };
+    vcpu_obj.guest_fxsave = vm_hw.fxsaveInit();
+    vcpu_obj.arch_scratch = .{};
+    vcpu_obj.vgic_state = .{};
+    vcpu_obj.vtimer_state = .{};
 
     return vcpu_obj;
 }

@@ -152,11 +152,17 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
         }
     }
 
-    // Allocate PMU state lazily on first start (§2.14.8).
+    // Allocate PMU state lazily on first start (§2.14.8). Save/restore
+    // `_gen_lock` across the zeroing struct-literal assignment — the
+    // slab allocator just set gen-odd/live, and a `.* = .{}` would
+    // clobber it to zero. No race window: the pointer hasn't been
+    // handed out to anyone yet.
     if (target_thread.pmu_state == null) {
         const alloc_result = slab_instance.create() catch return E_NOMEM;
         const new_state = alloc_result.ptr;
+        const saved_gen = new_state._gen_lock;
         new_state.* = .{};
+        new_state._gen_lock = saved_gen;
         target_thread.pmu_state = new_state;
     }
     const state = target_thread.pmu_state.?;

@@ -898,19 +898,39 @@ pub fn perCoreInit() void {
     const core_id = arch.smp.coreID();
     const state = &core_states[core_id];
 
-    // Create a real idle thread for this core
+    // Create a real idle thread for this core. Field-by-field init
+    // preserves `idle_thread._gen_lock` set by the slab allocator.
     const idle_alloc = thread_mod.slab_instance.create() catch @panic("failed to allocate idle thread");
     const idle_thread = idle_alloc.ptr;
-    idle_thread.* = .{
-        .tid = std.math.maxInt(u64) - core_id,
-        .ctx = undefined,
-        .kernel_stack = undefined,
-        .user_stack = null,
-        .process = idle_process,
-        .state = .running,
-        .on_cpu = std.atomic.Value(bool).init(true),
-        .priority = .idle,
-    };
+    idle_thread.tid = std.math.maxInt(u64) - core_id;
+    idle_thread.ctx = undefined;
+    idle_thread.kernel_stack = undefined;
+    idle_thread.user_stack = null;
+    idle_thread.process = idle_process;
+    idle_thread.next = null;
+    idle_thread.priority = .idle;
+    idle_thread.pre_pin_priority = .normal;
+    idle_thread.pre_pin_affinity = null;
+    idle_thread.core_affinity = null;
+    idle_thread.state = .running;
+    idle_thread.on_cpu = std.atomic.Value(bool).init(true);
+    idle_thread.pinned_exclusive = false;
+    idle_thread.futex_deadline_ns = 0;
+    idle_thread.futex_paddr = address.PAddr.fromInt(0);
+    idle_thread.futex_wake_index = 0;
+    idle_thread.futex_paddrs = [_]address.PAddr{address.PAddr.fromInt(0)} ** 64;
+    idle_thread.futex_bucket_count = 0;
+    idle_thread.ipc_server = null;
+    idle_thread.slot_index = 0;
+    idle_thread.fault_reason = .none;
+    idle_thread.fault_addr = 0;
+    idle_thread.fault_rip = 0;
+    idle_thread.fault_user_ctx = null;
+    idle_thread.pmu_state = null;
+    idle_thread.fpu_state = [_]u8{0} ** 576;
+    idle_thread.last_fpu_core = null;
+    idle_thread.handle_refcount = std.atomic.Value(u32).init(0);
+    idle_thread.teardown_done = false;
     if (@import("builtin").cpu.arch == .aarch64) {
         // aarch64 requires a concrete kernel stack and entry context for
         // the idle thread because every thread switch reseats SP_EL1 from

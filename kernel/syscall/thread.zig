@@ -246,8 +246,6 @@ pub fn sysThreadSuspend(thread_handle: u64) i64 {
             return E_OK;
         },
     }
-    target_proc._gen_lock.unlock();
-    return E_OK;
 }
 
 pub fn sysThreadResume(thread_handle: u64) i64 {
