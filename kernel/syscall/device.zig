@@ -35,6 +35,8 @@ pub fn sysMemMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
     if (!vm_res.max_rights.read and !vm_res.max_rights.write) return E_PERM;
 
     const device = device_entry.object.device_region;
+    device._gen_lock.lock();
+    defer device._gen_lock.unlock();
 
     if (device.device_type == .port_io) {
         // Port I/O devices use virtual BAR — write_combining is invalid
