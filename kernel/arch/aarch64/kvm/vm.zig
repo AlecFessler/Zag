@@ -37,6 +37,7 @@ const vgic_mod = kvm.vgic;
 const vm_hw = zag.arch.aarch64.vm;
 const vmid_mod = kvm.vmid;
 
+const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const GuestMemory = guest_memory.GuestMemory;
 const KernelObject = zag.perms.permissions.KernelObject;
 const PAddr = zag.memory.address.PAddr;
@@ -59,6 +60,7 @@ pub var slab_instance: VmAllocator = undefined;
 var vm_id_counter: u64 = 1;
 
 pub const Vm = struct {
+    _gen_lock: GenLock = .{},
     vcpus: [MAX_VCPUS]*VCpu = undefined,
     num_vcpus: u32 = 0,
     owner: *Process,

@@ -10,6 +10,7 @@ const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
 const pmm = zag.memory.pmm;
 const sched = zag.sched.scheduler;
+const secure_slab = zag.memory.allocators.secure_slab;
 const thread_mod = zag.sched.thread;
 
 const ArchCpuContext = zag.arch.dispatch.cpu.ArchCpuContext;
@@ -50,6 +51,7 @@ pub const DmaMapping = struct {
 pub const ProcessAllocator = SecureSlab(Process, 256);
 
 pub const Process = struct {
+    _gen_lock: secure_slab.GenLock = .{},
     pid: u64,
     parent: ?*Process,
     alive: bool,

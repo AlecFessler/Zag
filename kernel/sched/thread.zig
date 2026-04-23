@@ -10,6 +10,7 @@ const stack_mod = zag.memory.stack;
 
 const ArchCpuContext = arch.cpu.ArchCpuContext;
 const FaultReason = zag.perms.permissions.FaultReason;
+const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = address.PAddr;
 const Process = zag.proc.process.Process;
@@ -52,6 +53,7 @@ const KERNEL_PERMS = MemoryPerms{
 };
 
 pub const Thread = struct {
+    _gen_lock: GenLock = .{},
     tid: u64,
     ctx: *ArchCpuContext,
     kernel_stack: Stack,

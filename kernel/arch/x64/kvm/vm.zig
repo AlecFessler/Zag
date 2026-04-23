@@ -15,6 +15,7 @@ const paging = zag.memory.paging;
 const sched = zag.sched.scheduler;
 const vcpu_mod = kvm.vcpu;
 
+const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const GuestMemory = guest_memory.GuestMemory;
 const Ioapic = ioapic_mod.Ioapic;
 const KernelObject = zag.perms.permissions.KernelObject;
@@ -43,6 +44,7 @@ pub var slab_instance: VmAllocator = undefined;
 var vm_id_counter: u64 = 1;
 
 pub const Vm = struct {
+    _gen_lock: GenLock = .{},
     vcpus: [MAX_VCPUS]*VCpu = undefined,
     num_vcpus: u32 = 0,
     owner: *Process,

@@ -44,6 +44,7 @@ const vm_hyp = zag.arch.aarch64.hyp;
 const vm_mod = kvm.vm;
 const vmid_mod = kvm.vmid;
 
+const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const PAddr = zag.memory.address.PAddr;
 const Process = zag.proc.process.Process;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
@@ -68,6 +69,7 @@ pub const VCpuState = enum(u8) {
 };
 
 pub const VCpu = struct {
+    _gen_lock: GenLock = .{},
     thread: *Thread,
     vm: *Vm,
     guest_state: vm_hw.GuestState = .{},

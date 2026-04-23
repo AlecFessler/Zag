@@ -16,6 +16,7 @@ const stack_mod = zag.memory.stack;
 const thread_mod = zag.sched.thread;
 const vm_mod = kvm.vm;
 
+const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const PAddr = zag.memory.address.PAddr;
 const Process = zag.proc.process.Process;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
@@ -40,6 +41,7 @@ pub const VCpuAllocator = SecureSlab(VCpu, 256);
 pub var slab_instance: VCpuAllocator = undefined;
 
 pub const VCpu = struct {
+    _gen_lock: GenLock = .{},
     thread: *Thread,
     vm: *Vm,
     guest_state: vm_hw.GuestState = .{},

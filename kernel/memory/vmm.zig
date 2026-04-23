@@ -365,15 +365,7 @@ pub const VirtualMemoryManager = struct {
         const overflow_start = usable_start + usable_size;
 
         const underflow_node = try allocVmNode();
-        underflow_node.* = .{
-            .start = base_addr,
-            .size = paging.PAGE4K,
-            .kind = .private,
-            .kind_ptr = null,
-            .rights = .{},
-            .handle = HANDLE_NONE,
-            .restart_policy = .free,
-        };
+        underflow_node.init(base_addr, paging.PAGE4K, .private, null, .{}, HANDLE_NONE, .free);
 
         self.insertNodeLocked(underflow_node) catch |e| {
             freeVmNode(underflow_node);
@@ -381,15 +373,15 @@ pub const VirtualMemoryManager = struct {
         };
 
         const stack_node = try allocVmNode();
-        stack_node.* = .{
-            .start = VAddr.fromInt(usable_start),
-            .size = usable_size,
-            .kind = .private,
-            .kind_ptr = null,
-            .rights = .{ .read = true, .write = true },
-            .handle = HANDLE_NONE,
-            .restart_policy = .free,
-        };
+        stack_node.init(
+            VAddr.fromInt(usable_start),
+            usable_size,
+            .private,
+            null,
+            .{ .read = true, .write = true },
+            HANDLE_NONE,
+            .free,
+        );
 
         self.insertNodeLocked(stack_node) catch |e| {
             self.removeNodeLocked(underflow_node);
@@ -399,15 +391,15 @@ pub const VirtualMemoryManager = struct {
         };
 
         const overflow_node = try allocVmNode();
-        overflow_node.* = .{
-            .start = VAddr.fromInt(overflow_start),
-            .size = paging.PAGE4K,
-            .kind = .private,
-            .kind_ptr = null,
-            .rights = .{},
-            .handle = HANDLE_NONE,
-            .restart_policy = .free,
-        };
+        overflow_node.init(
+            VAddr.fromInt(overflow_start),
+            paging.PAGE4K,
+            .private,
+            null,
+            .{},
+            HANDLE_NONE,
+            .free,
+        );
 
         self.insertNodeLocked(overflow_node) catch |e| {
             unmapNodePages(stack_node, self.addr_space_root, true);
@@ -567,15 +559,15 @@ pub const VirtualMemoryManager = struct {
         try self.removeRangeLocked(range_start, range_end_addr);
 
         const map_node = try allocVmNode();
-        map_node.* = .{
-            .start = range_start,
-            .size = range_size,
-            .kind = .shared_memory,
-            .kind_ptr = shm,
-            .rights = .{ .read = rights.read, .write = rights.write, .execute = rights.execute },
-            .handle = shm_handle,
-            .restart_policy = .free,
-        };
+        map_node.init(
+            range_start,
+            range_size,
+            .shared_memory,
+            shm,
+            .{ .read = rights.read, .write = rights.write, .execute = rights.execute },
+            shm_handle,
+            .free,
+        );
 
         self.insertNodeLocked(map_node) catch |e| {
             freeVmNode(map_node);
@@ -690,19 +682,19 @@ pub const VirtualMemoryManager = struct {
             freeVmNode(node);
 
             const replacement = allocVmNode() catch continue;
-            replacement.* = .{
-                .start = old_start,
-                .size = old_size,
-                .kind = .private,
-            .kind_ptr = null,
-                .rights = .{
+            replacement.init(
+                old_start,
+                old_size,
+                .private,
+                null,
+                .{
                     .read = max_rights.read,
                     .write = max_rights.write,
                     .execute = max_rights.execute,
                 },
-                .handle = old_handle,
-                .restart_policy = .free,
-            };
+                old_handle,
+                .free,
+            );
             self.insertNodeLocked(replacement) catch freeVmNode(replacement);
         }
 
@@ -740,15 +732,15 @@ pub const VirtualMemoryManager = struct {
         try self.removeRangeLocked(range_start, range_end_addr);
 
         const map_node = try allocVmNode();
-        map_node.* = .{
-            .start = range_start,
-            .size = range_size,
-            .kind = .mmio,
-            .kind_ptr = device,
-            .rights = .{ .read = rights.read, .write = rights.write, .execute = rights.execute },
-            .handle = device_handle,
-            .restart_policy = .free,
-        };
+        map_node.init(
+            range_start,
+            range_size,
+            .mmio,
+            device,
+            .{ .read = rights.read, .write = rights.write, .execute = rights.execute },
+            device_handle,
+            .free,
+        );
 
         self.insertNodeLocked(map_node) catch |e| {
             freeVmNode(map_node);
@@ -817,15 +809,15 @@ pub const VirtualMemoryManager = struct {
         try self.removeRangeLocked(range_start, range_end_addr);
 
         const map_node = try allocVmNode();
-        map_node.* = .{
-            .start = range_start,
-            .size = range_size,
-            .kind = .virtual_bar,
-            .kind_ptr = device,
-            .rights = .{ .read = rights.read, .write = rights.write, .execute = rights.execute },
-            .handle = device_handle,
-            .restart_policy = .free,
-        };
+        map_node.init(
+            range_start,
+            range_size,
+            .virtual_bar,
+            device,
+            .{ .read = rights.read, .write = rights.write, .execute = rights.execute },
+            device_handle,
+            .free,
+        );
 
         self.insertNodeLocked(map_node) catch |e| {
             freeVmNode(map_node);
