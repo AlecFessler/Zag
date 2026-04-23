@@ -204,8 +204,10 @@ pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
 
     vcpu_obj.storeState(.running);
     const thread = vcpu_obj.thread;
+    thread._gen_lock.lock();
     thread.state = .ready;
     const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
+    thread._gen_lock.unlock();
     sched.enqueueOnCore(target_core, thread);
 
     return 0; // E_OK
@@ -283,8 +285,10 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     // Resume if it was running
     if (state_snapshot == .running) {
         const thread = vcpu_obj.thread;
+        thread._gen_lock.lock();
         thread.state = .ready;
         const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
+        thread._gen_lock.unlock();
         sched.enqueueOnCore(target_core, thread);
     }
 
@@ -344,8 +348,10 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
             vm_hw.injectInterrupt(&vcpu_obj.guest_state, interrupt);
         }
         vm_obj._gen_lock.unlock();
+        thread._gen_lock.lock();
         thread.state = .ready;
         const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
+        thread._gen_lock.unlock();
         sched.enqueueOnCore(target_core, thread);
     } else {
         // Not running — write pending interrupt into arch state
