@@ -202,6 +202,6 @@ pub fn createDisplay(
 }
 
 pub fn destroy(dr: *DeviceRegion) void {
-    const gen = DeviceRegionSlab.currentGen(dr);
+    const gen = dr._gen_lock.currentGen();
     device_region_slab.destroy(dr, gen) catch unreachable;
 }

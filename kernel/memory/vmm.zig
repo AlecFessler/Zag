@@ -120,7 +120,7 @@ fn allocVmNode() !*VmNode {
 }
 
 fn freeVmNode(node: *VmNode) void {
-    const gen = VmNodeSlab.currentGen(node);
+    const gen = node._gen_lock.currentGen();
     vm_node_slab.destroy(node, gen) catch unreachable;
 }
 

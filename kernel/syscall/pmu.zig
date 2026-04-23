@@ -284,7 +284,7 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
         arch.pmu.pmuClearState(state);
     }
     target_thread.pmu_state = null;
-    const gen = PmuStateAllocator.currentGen(state);
+    const gen = state._gen_lock.currentGen();
     slab_instance.destroy(state, gen) catch unreachable;
     return E_OK;
 }

@@ -181,7 +181,7 @@ pub fn destroy(vcpu_obj: *VCpu) void {
     // Remove from run queues
     sched.removeFromAnyRunQueue(thread);
 
-    const gen = VCpuAllocator.currentGen(vcpu_obj);
+    const gen = vcpu_obj._gen_lock.currentGen();
     slab_instance.destroy(vcpu_obj, gen) catch unreachable;
 }
 

@@ -256,13 +256,6 @@ pub fn SecureSlab(
             self.pop_cursor = self.walkCursorLocked(self.pop_cursor, draw_pop);
         }
 
-        /// Read the current generation of a slot. Thin forwarder to the
-        /// per-slot `GenLock.currentGen` for callers who already hold an
-        /// instance-type.
-        pub fn currentGen(ptr: *T) u63 {
-            return ptr._gen_lock.currentGen();
-        }
-
         // ---- internals ----
 
         fn growOne(self: *Self) AllocError!void {
@@ -415,12 +408,6 @@ fn validateT(comptime T: type) void {
     // offset-0 convention should be restored as each slab T is converted
     // to extern struct; until then, comptime enforcement would gate the
     // build on the full refactor.
-}
-
-/// Read the gen of a slab-backed *T via field access. Used at capability
-/// handle issuance time (snapshot) and by lookup paths (compare).
-pub fn genOf(comptime T: type, ptr: *T) u63 {
-    return ptr._gen_lock.currentGen();
 }
 
 fn bumpOne(ba: *bump.BumpAllocator, comptime R: type) ?*R {

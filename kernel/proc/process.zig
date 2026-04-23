@@ -506,6 +506,7 @@ pub const Process = struct {
     /// links into the queue, and the saved register snapshot lives in
     /// `thread.ctx.regs` (already populated by the exception entry stub).
     pub fn faultBlock(self: *Process, thread: *Thread, reason: FaultReason, fault_addr: u64, rip: u64, user_ctx: ?*ArchCpuContext) bool {
+        arch.boot.print("K: faultBlock reason={d} addr=0x{x}\n", .{ @intFromEnum(reason), fault_addr });
         const handler = self.faultHandlerOf() orelse return false;
 
         // Stamp the fault payload onto the thread itself.
@@ -725,7 +726,7 @@ pub const Process = struct {
                 if (referenced_proc) |p| {
                     const prev = @atomicRmw(u32, &p.handle_refcount, .Sub, 1, .acq_rel);
                     if (prev == 1 and p.cleanup_complete) {
-                        { const gen = ProcessAllocator.currentGen(p); slab_instance.destroy(p, gen) catch unreachable; }
+                        { const gen = p._gen_lock.currentGen(); slab_instance.destroy(p, gen) catch unreachable; }
                     }
                 }
                 if (referenced_thread) |t| t.releaseRef();
@@ -935,6 +936,7 @@ pub const Process = struct {
         };
 
         self.restart_count +%= 1;
+        arch.boot.print("K: performRestart pid={d} count={d}\n", .{ self.pid, self.restart_count });
 
         // Preserve IPC wait list across restart. If there's a pending caller
         // (message was delivered but not replied to), re-enqueue it at the
@@ -1200,13 +1202,13 @@ pub const Process = struct {
                 .process => |p| {
                     const prev = @atomicRmw(u32, &p.handle_refcount, .Sub, 1, .acq_rel);
                     if (prev == 1 and p.cleanup_complete) {
-                        { const gen = ProcessAllocator.currentGen(p); slab_instance.destroy(p, gen) catch unreachable; }
+                        { const gen = p._gen_lock.currentGen(); slab_instance.destroy(p, gen) catch unreachable; }
                     }
                 },
                 .dead_process => |p| {
                     const prev = @atomicRmw(u32, &p.handle_refcount, .Sub, 1, .acq_rel);
                     if (prev == 1 and p.cleanup_complete) {
-                        { const gen = ProcessAllocator.currentGen(p); slab_instance.destroy(p, gen) catch unreachable; }
+                        { const gen = p._gen_lock.currentGen(); slab_instance.destroy(p, gen) catch unreachable; }
                     }
                 },
                 .vm_reservation, .empty => {},
@@ -1238,7 +1240,7 @@ pub const Process = struct {
         self.cleanup_complete = true;
         // Only free if no external handles remain
         if (@atomicLoad(u32, &self.handle_refcount, .acquire) == 0) {
-            const gen = ProcessAllocator.currentGen(self);
+            const gen = self._gen_lock.currentGen();
             slab_instance.destroy(self, gen) catch unreachable;
         }
     }

@@ -164,12 +164,12 @@ pub const KernelObject = union(enum) {
     /// verifying a handle at lookup.
     pub fn currentGen(self: @This()) u32 {
         return switch (self) {
-            .process => |p| @truncate(secure_slab.genOf(Process, p)),
-            .dead_process => |p| @truncate(secure_slab.genOf(Process, p)),
-            .thread => |t| @truncate(secure_slab.genOf(Thread, t)),
-            .shared_memory => |s| @truncate(secure_slab.genOf(SharedMemory, s)),
-            .device_region => |d| @truncate(secure_slab.genOf(DeviceRegion, d)),
-            .vm => |v| @truncate(secure_slab.genOf(Vm, v)),
+            .process => |p| @truncate(p._gen_lock.currentGen()),
+            .dead_process => |p| @truncate(p._gen_lock.currentGen()),
+            .thread => |t| @truncate(t._gen_lock.currentGen()),
+            .shared_memory => |s| @truncate(s._gen_lock.currentGen()),
+            .device_region => |d| @truncate(d._gen_lock.currentGen()),
+            .vm => |v| @truncate(v._gen_lock.currentGen()),
             .vm_reservation, .empty => 0,
         };
     }
@@ -183,12 +183,12 @@ pub const KernelObject = union(enum) {
     /// not reference a slab-allocated `*T`.
     pub fn acquireLock(self: @This(), expected_gen: u32) error{StaleHandle}!void {
         return switch (self) {
-            .process => |p| secure_slab.acquireOf(Process, p, @intCast(expected_gen)),
-            .dead_process => |p| secure_slab.acquireOf(Process, p, @intCast(expected_gen)),
-            .thread => |t| secure_slab.acquireOf(Thread, t, @intCast(expected_gen)),
-            .shared_memory => |s| secure_slab.acquireOf(SharedMemory, s, @intCast(expected_gen)),
-            .device_region => |d| secure_slab.acquireOf(DeviceRegion, d, @intCast(expected_gen)),
-            .vm => |v| secure_slab.acquireOf(Vm, v, @intCast(expected_gen)),
+            .process => |p| p._gen_lock.lockWithGen(@intCast(expected_gen)),
+            .dead_process => |p| p._gen_lock.lockWithGen(@intCast(expected_gen)),
+            .thread => |t| t._gen_lock.lockWithGen(@intCast(expected_gen)),
+            .shared_memory => |s| s._gen_lock.lockWithGen(@intCast(expected_gen)),
+            .device_region => |d| d._gen_lock.lockWithGen(@intCast(expected_gen)),
+            .vm => |v| v._gen_lock.lockWithGen(@intCast(expected_gen)),
             .vm_reservation, .empty => {},
         };
     }
@@ -197,12 +197,12 @@ pub const KernelObject = union(enum) {
     /// with a successful `acquireLock` on the same variant.
     pub fn releaseLock(self: @This()) void {
         switch (self) {
-            .process => |p| secure_slab.releaseOf(Process, p),
-            .dead_process => |p| secure_slab.releaseOf(Process, p),
-            .thread => |t| secure_slab.releaseOf(Thread, t),
-            .shared_memory => |s| secure_slab.releaseOf(SharedMemory, s),
-            .device_region => |d| secure_slab.releaseOf(DeviceRegion, d),
-            .vm => |v| secure_slab.releaseOf(Vm, v),
+            .process => |p| p._gen_lock.unlock(),
+            .dead_process => |p| p._gen_lock.unlock(),
+            .thread => |t| t._gen_lock.unlock(),
+            .shared_memory => |s| s._gen_lock.unlock(),
+            .device_region => |d| d._gen_lock.unlock(),
+            .vm => |v| v._gen_lock.unlock(),
             .vm_reservation, .empty => {},
         }
     }

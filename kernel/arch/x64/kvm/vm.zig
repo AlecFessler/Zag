@@ -83,7 +83,7 @@ pub const Vm = struct {
         // Clear owner's vm pointer
         self.owner.vm = null;
 
-        const gen = VmAllocator.currentGen(self);
+        const gen = self._gen_lock.currentGen();
         slab_instance.destroy(self, gen) catch unreachable;
     }
 

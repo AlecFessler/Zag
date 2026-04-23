@@ -133,7 +133,7 @@ pub const Thread = struct {
     pub fn releaseRef(self: *Thread) void {
         const prev = self.handle_refcount.fetchSub(1, .acq_rel);
         if (prev == 1 and @atomicLoad(bool, &self.teardown_done, .acquire)) {
-            const gen = ThreadAllocator.currentGen(self);
+            const gen = self._gen_lock.currentGen();
             slab_instance.destroy(self, gen) catch unreachable;
         }
     }
@@ -150,7 +150,7 @@ pub const Thread = struct {
         // teardown happened at the latest pmuSave on context switch away.
         if (self.pmu_state) |state| {
             arch.pmu.pmuClearState(state);
-            const gen = zag.syscall.pmu.PmuStateAllocator.currentGen(state);
+            const gen = state._gen_lock.currentGen();
             zag.syscall.pmu.slab_instance.destroy(state, gen) catch unreachable;
             self.pmu_state = null;
         }
@@ -213,7 +213,7 @@ pub const Thread = struct {
 
         @atomicStore(bool, &self.teardown_done, true, .release);
         if (self.handle_refcount.load(.acquire) == 0) {
-            const gen = ThreadAllocator.currentGen(self);
+            const gen = self._gen_lock.currentGen();
             slab_instance.destroy(self, gen) catch unreachable;
         }
 

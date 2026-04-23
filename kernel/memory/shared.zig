@@ -108,7 +108,7 @@ pub const SharedMemory = extern struct {
 
     fn destroy(self: *SharedMemory) void {
         self.freePages();
-        const gen = SharedMemoryAllocator.currentGen(self);
+        const gen = self._gen_lock.currentGen();
         slab_allocator_instance.destroy(self, gen) catch unreachable;
     }
 
