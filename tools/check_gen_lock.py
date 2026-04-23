@@ -133,6 +133,7 @@ class FnInfo:
     body_lines: list[str]
     body_first_line: int
     receiver_type: str | None  # type T if first param is `*T` / `*const T` / T
+    return_type: str | None = None  # trailing slab type T if return is `*T`/`?*T`/`!*T`
 
 
 @dataclass
@@ -274,39 +275,6 @@ EXCEPTION_ENTRY_NAMES = {
     "faultOrKillUser",
 }
 
-# Thin-dispatch helpers that syscall entries forward to. Analyzed as
-# extra entry points because the real critical section lives here, not
-# in the one-line syscall stub.
-#
-# Each tuple is (file-relative-path, fn-name). The tool walks both x64
-# and aarch64 implementations where they exist.
-ARCH_HELPER_ENTRIES: list[tuple[str, str]] = [
-    # kvm/vm.zig
-    ("kernel/arch/x64/kvm/vm.zig", "vmCreate"),
-    ("kernel/arch/x64/kvm/vm.zig", "guestMap"),
-    ("kernel/arch/x64/kvm/vm.zig", "sysregPassthrough"),
-    ("kernel/arch/x64/kvm/vm.zig", "intcAssertIrq"),
-    ("kernel/arch/x64/kvm/vm.zig", "intcDeassertIrq"),
-    ("kernel/arch/aarch64/kvm/vm.zig", "vmCreate"),
-    ("kernel/arch/aarch64/kvm/vm.zig", "guestMap"),
-    ("kernel/arch/aarch64/kvm/vm.zig", "sysregPassthrough"),
-    ("kernel/arch/aarch64/kvm/vm.zig", "intcAssertIrq"),
-    ("kernel/arch/aarch64/kvm/vm.zig", "intcDeassertIrq"),
-    # kvm/exit_box.zig
-    ("kernel/arch/x64/kvm/exit_box.zig", "vmRecv"),
-    ("kernel/arch/x64/kvm/exit_box.zig", "vmReply"),
-    ("kernel/arch/aarch64/kvm/exit_box.zig", "vmRecv"),
-    ("kernel/arch/aarch64/kvm/exit_box.zig", "vmReply"),
-    # kvm/vcpu.zig
-    ("kernel/arch/x64/kvm/vcpu.zig", "vcpuRun"),
-    ("kernel/arch/x64/kvm/vcpu.zig", "vcpuSetState"),
-    ("kernel/arch/x64/kvm/vcpu.zig", "vcpuGetState"),
-    ("kernel/arch/x64/kvm/vcpu.zig", "vcpuInterrupt"),
-    ("kernel/arch/aarch64/kvm/vcpu.zig", "vcpuRun"),
-    ("kernel/arch/aarch64/kvm/vcpu.zig", "vcpuSetState"),
-    ("kernel/arch/aarch64/kvm/vcpu.zig", "vcpuGetState"),
-    ("kernel/arch/aarch64/kvm/vcpu.zig", "vcpuInterrupt"),
-]
 
 
 def extract_function_body(lines: list[str], header_line_idx: int) -> tuple[list[str], int]:
@@ -412,24 +380,9 @@ def find_entry_points() -> list[EntryPoint]:
                 body_lines=body, body_first_line=body_start,
             ))
 
-    # Thin-dispatch helpers reached from syscalls.
-    for rel_path, fn_name in ARCH_HELPER_ENTRIES:
-        fpath = REPO_ROOT / rel_path
-        if not fpath.exists():
-            continue
-        lines = fpath.read_text().splitlines()
-        for i, line in enumerate(lines):
-            m = FN_HEAD_RE.match(line)
-            if not m or m.group(1) != fn_name:
-                continue
-            body, body_start = extract_function_body(lines, i)
-            if not body:
-                continue
-            entries.append(EntryPoint(
-                name=fn_name, file=fpath, line=i + 1,
-                body_lines=body, body_first_line=body_start,
-            ))
-            break
+    # Thin-dispatch helpers (arch.vm.guestMap, etc.) are reached via
+    # inline expansion of free-function calls in the syscall bodies —
+    # not as separate entries. Removed ARCH_HELPER_ENTRIES.
 
     return entries
 
@@ -734,6 +687,24 @@ def _walk_body(
                 ty = infer_rhs_type(rhs, env, slab_types)
                 if ty and ty in slab_types:
                     resolved = ty
+            if not resolved:
+                # Try fn-return-type resolution: match a call expression
+                # like `helper(first_arg, ...)` or `mod.path.helper(...)`
+                # and look up (first_arg_type, helper_name) in fn_index.
+                stripped = _strip_postfix(rhs.strip().rstrip(";").strip())
+                m_call = re.match(
+                    r"^([A-Za-z_][\w.]*)\s*\(\s*([A-Za-z_]\w*)",
+                    stripped,
+                )
+                if m_call:
+                    fq = m_call.group(1)
+                    first_arg = m_call.group(2)
+                    arg_ty = env.get(first_arg)
+                    fn_name = fq.split(".")[-1]
+                    if arg_ty is not None:
+                        fninfo = fn_index.get((arg_ty, fn_name))
+                        if fninfo and fninfo.return_type in slab_types:
+                            resolved = fninfo.return_type
             if resolved:
                 env[name] = resolved
                 for helper in SELF_ALIVE_HELPERS:
@@ -793,6 +764,34 @@ def _walk_body(
                 call_spans.append((m_tok.start(), m_tok.end(), ident, tail))
             else:
                 access_spans.append((m_tok.start(), m_tok.end(), ident, tail))
+
+        # Non-method calls that PASS a slab ident as the first argument.
+        # e.g. `arch.vm.guestMap(proc, ...)`, `Thread.create(proc, ...)`,
+        # `helper(proc, ...)`. These aren't receiver-style but the callee
+        # still receives our slab pointer — inline it so its accesses and
+        # lock ops roll up into the caller's trace (and self-alive status
+        # propagates).
+        free_call_spans: list[tuple[str, str]] = []  # (fn_name, first_arg_ident)
+        for m_call in re.finditer(
+            r"(?<![\w.])([A-Za-z_][\w.]*)\s*\(\s*([A-Za-z_]\w*)", code
+        ):
+            fq = m_call.group(1)
+            first_arg = m_call.group(2)
+            if first_arg not in env:
+                continue
+            # Skip obvious builtins / std types / non-slab helpers.
+            if fq.startswith("@") or fq.startswith("std.") or fq == "return":
+                continue
+            # Skip method-call form (already handled above) — that form has
+            # a dot between ident and method and the "chain" starts with a
+            # known local ident. Method form: `ident.method(`.
+            fn_name = fq.split(".")[-1]
+            chain_head = fq.split(".")[0]
+            if chain_head in env and fq.count(".") == 1:
+                # This is `ident.method(` — covered by the receiver-style
+                # call_spans above.
+                continue
+            free_call_spans.append((fn_name, first_arg))
 
         for start, _end, ident, tail in access_spans:
             accesses.setdefault(ident, []).append(Access(
@@ -857,6 +856,45 @@ def _walk_body(
                 visited | {key},
                 depth + 1,
                 call_stack + [f"{recv_ty}.{method}"],
+            )
+
+        # Inline free-function calls that take a slab ident as their
+        # first argument. Key into fn_index by (first_arg_type, fn_name).
+        for fn_name, first_arg in free_call_spans:
+            recv_ty = env.get(first_arg)
+            if recv_ty is None:
+                continue
+            key = (recv_ty, fn_name)
+            fninfo = fn_index.get(key)
+            if fninfo is None:
+                continue
+            if depth >= MAX_INLINE_DEPTH or key in visited:
+                continue
+            self_name = fninfo.first_param
+            if self_name:
+                subbed = [
+                    re.sub(rf"\b{re.escape(self_name)}\b", first_arg, ln)
+                    for ln in fninfo.body_lines
+                ]
+            else:
+                subbed = list(fninfo.body_lines)
+            sub_env = dict(env)
+            sub_env[first_arg] = recv_ty
+            sub_self_alive = set(self_alive)
+            _walk_body(
+                subbed,
+                fninfo.body_first_line,
+                fninfo.file,
+                sub_env,
+                sub_self_alive,
+                slab_types,
+                fn_index,
+                accesses,
+                lock_ops,
+                synth_counter,
+                visited | {key},
+                depth + 1,
+                call_stack + [f"{recv_ty}.{fn_name}"],
             )
 
 
@@ -1065,14 +1103,26 @@ def build_method_index(
     """Scan all kernel .zig files for fn definitions and index them by
     (receiver_type, fn_name). Receiver is identified as the first parameter
     whose declared type resolves (via `parse_type_ref`) to a slab-backed
-    type name. Ambiguity — multiple fns of the same (T, name) across arch
-    variants — is handled by first-seen-wins; callers concerned about
-    arch-specific divergence should run the tool twice with each arch's
-    dispatch path in scope.
+    type name.
+
+    Skips `kernel/arch/dispatch/*` — those fns are trivial comptime-switch
+    trampolines whose bodies contain nothing but arch-specific re-dispatches.
+    By excluding them we force lookups of `arch.vm.foo(proc)` / similar
+    dispatcher calls to miss, and the tool falls back to treating the call
+    as a plain access (reported to the user). When the caller invokes an
+    arch-specific form directly (`x64.kvm.vm.foo(proc)`), the index
+    resolves to the real implementation.
     """
     idx: dict[tuple[str, str], FnInfo] = {}
     fn_hdr = re.compile(r"^\s*(?:pub\s+)?fn\s+(\w+)\s*\(")
+    dispatch_dir = KERNEL_DIR / "arch" / "dispatch"
     for fpath in iter_zig_files(KERNEL_DIR):
+        # Trampolines — skip.
+        try:
+            fpath.relative_to(dispatch_dir)
+            continue
+        except ValueError:
+            pass
         try:
             lines = fpath.read_text().splitlines()
         except Exception:
@@ -1101,6 +1151,19 @@ def build_method_index(
             key = (recv, fname)
             if key in idx:
                 continue
+            # Extract the return type token between the `)` closing the
+            # param list and the `{` opening the body. Handles `*T`, `?*T`,
+            # `!*T`, `error{...}!*T`, etc. by delegating to parse_type_ref.
+            rt: str | None = None
+            m_ret = re.search(r"\)\s*([^{]+?)\s*\{", concat)
+            if m_ret:
+                rt_tok = m_ret.group(1).strip()
+                # Strip Zig error-union prefix: `error{Foo, Bar}!T` or `!T`.
+                rt_tok = re.sub(r"^error\s*\{[^}]*\}\s*!\s*", "", rt_tok)
+                rt_tok = rt_tok.lstrip("!").strip()
+                rt = parse_type_ref(rt_tok)
+                if rt not in slab_types:
+                    rt = None
             idx[key] = FnInfo(
                 file=fpath,
                 line=i + 1,
@@ -1109,6 +1172,7 @@ def build_method_index(
                 body_lines=body,
                 body_first_line=body_start,
                 receiver_type=recv,
+                return_type=rt,
             )
     return idx
 
