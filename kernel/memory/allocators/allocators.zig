@@ -3,4 +3,3 @@ pub const buddy = @import("buddy.zig");
 pub const bump = @import("bump.zig");
 pub const intrusive_freelist = @import("intrusive_freelist.zig");
 pub const secure_slab = @import("secure_slab.zig");
-pub const slab = @import("slab.zig");
