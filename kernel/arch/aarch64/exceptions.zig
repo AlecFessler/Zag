@@ -451,10 +451,14 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // external abort) cannot come from a vbar node, so skip the
             // lookup entirely to keep the hot path lean.
             if (scheduler.currentThread()) |thread| {
-                const node = thread.process.vmm.findNode(VAddr.fromInt(far));
-                if (node != null and node.?.kind == .virtual_bar) {
-                    emulateVirtualBar(ctx, node.?, far, thread.process);
-                    return;
+                if (thread.process.vmm.findNode(VAddr.fromInt(far))) |node| {
+                    node._gen_lock.lock();
+                    const is_virtual_bar = node.kind == .virtual_bar;
+                    node._gen_lock.unlock();
+                    if (is_virtual_bar) {
+                        emulateVirtualBar(ctx, node, far, thread.process);
+                        return;
+                    }
                 }
             }
 
