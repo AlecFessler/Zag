@@ -705,16 +705,52 @@ def _walk_body(
                         fninfo = fn_index.get((arg_ty, fn_name))
                         if fninfo and fninfo.return_type in slab_types:
                             resolved = fninfo.return_type
+            # Liveness tracking. We mark `name` as self-alive in three
+            # cases, independent of whether the type resolved to a slab
+            # (fresh-alloc wrappers — `alloc_result` etc. — are often
+            # non-slab structs whose .ptr is the slab pointer).
+            #
+            # 1. RHS calls a self-alive helper (`scheduler.currentThread()`).
+            # 2. RHS is a chain whose head is already self-alive.
+            # 3. RHS calls `<allocator>.create(...)` or is the `.ptr`
+            #    field of a value whose head is already self-alive —
+            #    a freshly allocated slab slot nobody else references.
+            # Fresh-alloc patterns:
+            #   * `slab_instance.create(...)` / `<foo>Slab.create(...)` —
+            #     direct SecureSlab call
+            #   * `<SlabType>.create(...)` — a constructor-style wrapper
+            #     that returns a new slab pointer (Thread.create,
+            #     SharedMemory.create, Vm.create, …)
+            is_fresh_alloc = bool(re.search(
+                r"\b(?:slab_instance|[A-Za-z_]\w*_slab|[A-Za-z_]\w*Slab|"
+                r"[A-Za-z_]\w*Allocator)\s*\.\s*create\s*\(",
+                rhs,
+            )) or any(
+                re.search(rf"\b{st}\s*\.\s*create\s*\(", rhs)
+                for st in slab_types
+            )
+            rhs_chain = _leading_chain(rhs.strip().rstrip(";").strip())
+            is_ptr_of_fresh = (
+                rhs_chain is not None
+                and len(rhs_chain) >= 2
+                and rhs_chain[-1] == "ptr"
+                and rhs_chain[0] in self_alive
+            )
+            became_self_alive = False
+            for helper in SELF_ALIVE_HELPERS:
+                if re.search(rf"\b{helper}\s*\(", rhs):
+                    self_alive.add(name)
+                    became_self_alive = True
+                    break
+            if not became_self_alive and rhs_chain and rhs_chain[0] in self_alive:
+                self_alive.add(name)
+                became_self_alive = True
+            if not became_self_alive and (is_fresh_alloc or is_ptr_of_fresh):
+                self_alive.add(name)
+                became_self_alive = True
+
             if resolved:
                 env[name] = resolved
-                for helper in SELF_ALIVE_HELPERS:
-                    if re.search(rf"\b{helper}\s*\(", rhs):
-                        self_alive.add(name)
-                        break
-                else:
-                    chain = _leading_chain(rhs.strip().rstrip(";").strip())
-                    if chain and chain[0] in self_alive:
-                        self_alive.add(name)
 
         # Lock / unlock / defer-unlock ops on slab idents.
         for m_lock in re.finditer(
