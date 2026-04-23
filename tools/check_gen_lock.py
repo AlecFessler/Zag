@@ -193,7 +193,8 @@ def strip_comments(line: str) -> str:
 # ---------------------------------------------------------------------------
 
 STRUCT_HEAD_RE = re.compile(
-    r"(?:pub\s+)?const\s+(\w+)\s*=\s*(?:extern\s+|packed\s+)?struct\b"
+    r"(?:pub\s+)?const\s+(\w+)\s*=\s*(?:extern\s+|packed\s+)?"
+    r"(?:struct|union(?:\s*\([^)]*\))?)\b"
 )
 
 def find_slab_types() -> dict[str, SlabType]:
@@ -252,6 +253,124 @@ def find_slab_types() -> dict[str, SlabType]:
                     if name not in out:
                         out[name] = SlabType(name=name, file=fpath, line=k + 1)
                     break
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Step 1b: fat-pointer invariant — bare *T fields for slab-backed T are banned
+# ---------------------------------------------------------------------------
+
+# A Zig struct field line: `    <name>: <type>,` or `    <name>: <type> = <default>,`
+# The field name is a plain identifier; the type spans everything up to `=`
+# or the end-of-line comma (whichever comes first). We capture the whole type
+# substring and pattern-match for bare slab pointers.
+FIELD_LINE_RE = re.compile(
+    r"^\s*(?:pub\s+)?(\w+)\s*:\s*([^,=\n]+?)(?:\s*=[^,\n]*)?(?:,|$)"
+)
+
+# Detects `*T`, `?*T`, `[N]*T`, `[]*T`, `[*]T`, `[*c]T` substrings — the
+# pointer forms we care about. The CAPTURED group is the bare type name
+# following the pointer token(s).
+BARE_PTR_TO_NAME_RE = re.compile(
+    r"(?:\?\s*)?"                                    # optional ?
+    r"(?:\[(?:\d+|[A-Za-z_]\w*|\*c?|)\])?"           # optional [N] / [] / [*] / [*c]
+    r"\s*\*\s*(?:const\s+)?(\w+)\b"                  # * or *const then type name
+)
+
+# Detects SlabRef(T) wrapping so we can whitelist it.
+SLAB_REF_RE = re.compile(r"\bSlabRef\s*\(\s*(\w+)\s*\)")
+
+# Files that legitimately name bare `*T` for slab-backed T:
+#   * secure_slab.zig defines SlabRef itself (ptr: *T IS the fat-pointer's storage)
+#   * allocators.zig re-exports
+# Everything else must use SlabRef.
+BARE_PTR_FIELD_EXEMPT_FILES = {
+    "kernel/memory/allocators/secure_slab.zig",
+    "kernel/memory/allocators/allocators.zig",
+}
+
+
+@dataclass
+class BarePtrFinding:
+    file: Path
+    line: int
+    struct_name: str
+    field_name: str
+    field_type: str
+    slab_type: str
+
+
+def _struct_name_at_line(lines: list[str], field_line_idx: int) -> str | None:
+    """Walk backward from a field line to find the enclosing struct's name.
+    Tracks brace balance so nested struct definitions don't fool us."""
+    depth = 0
+    for j in range(field_line_idx, -1, -1):
+        code = strip_comments(lines[j])
+        for ch in reversed(code):
+            if ch == "}":
+                depth += 1
+            elif ch == "{":
+                if depth == 0:
+                    # This `{` opens the struct body. Struct head is on
+                    # this line or a line or two above.
+                    for k in range(j, max(-1, j - 4), -1):
+                        if k < 0:
+                            break
+                        m = STRUCT_HEAD_RE.search(lines[k])
+                        if m:
+                            return m.group(1)
+                    return None
+                depth -= 1
+    return None
+
+
+def find_bare_slab_pointer_fields(
+    slab_types: dict[str, SlabType],
+) -> list[BarePtrFinding]:
+    """
+    The fat-pointer invariant: every kernel pointer to a slab-backed
+    object must be `SlabRef(T)`, never a bare `*T` / `?*T` / `[N]*T` /
+    `[]*T`. Walks every struct definition in kernel/ and flags violators.
+
+    A caller holding a bare `*T` for slab-backed T cannot do a
+    gen-verified lock at access time (nothing tells it which gen to
+    verify against). That's the UAF window this whole architecture
+    exists to close.
+    """
+    out: list[BarePtrFinding] = []
+    slab_names = set(slab_types.keys())
+    for fpath in iter_zig_files(KERNEL_DIR):
+        rel = str(fpath.relative_to(REPO_ROOT))
+        if rel in BARE_PTR_FIELD_EXEMPT_FILES:
+            continue
+        lines = fpath.read_text().splitlines()
+        for i, raw in enumerate(lines):
+            code = strip_comments(raw)
+            m = FIELD_LINE_RE.match(code)
+            if not m:
+                continue
+            field_name, field_type = m.group(1), m.group(2).strip()
+            # Skip obvious non-fields: `const`, `var`, method syntax.
+            # FIELD_LINE_RE already rejects statements with `;` / `()`.
+            if field_name in {"const", "var", "fn", "pub", "return"}:
+                continue
+            # SlabRef-wrapped is always OK.
+            if SLAB_REF_RE.search(field_type):
+                continue
+            # Look for a bare-pointer hit against a slab-type name.
+            for ptr_match in BARE_PTR_TO_NAME_RE.finditer(field_type):
+                target = ptr_match.group(1)
+                if target in slab_names:
+                    struct_name = _struct_name_at_line(lines, i) or "<unknown>"
+                    out.append(BarePtrFinding(
+                        file=fpath,
+                        line=i + 1,
+                        struct_name=struct_name,
+                        field_name=field_name,
+                        field_type=field_type,
+                        slab_type=target,
+                    ))
+                    break  # one finding per field line
     return out
 
 
@@ -1497,6 +1616,11 @@ def main() -> int:
             print(f"  {name:20s} {rel}:{st.line}")
         return 0
 
+    # Fat-pointer invariant: no bare *T for slab-backed T in struct
+    # fields. This is the structural UAF barrier — a bare pointer can't
+    # carry the gen needed for lockWithGen at access time.
+    bare_ptr_findings = find_bare_slab_pointer_fields(slab_types)
+
     fn_index = build_method_index(slab_names)
     if args.list_methods:
         print(f"Methods on slab-backed types ({len(fn_index)}):")
@@ -1541,10 +1665,26 @@ def main() -> int:
         else:
             print_entry(res, args.verbose)
 
+    # Emit bare-pointer findings. Each is always an err — there is no
+    # "soft" version of this invariant; a bare *T for slab-backed T is
+    # a UAF waiting to happen.
+    if bare_ptr_findings:
+        print()
+        print(f"Fat-pointer invariant violations "
+              f"({len(bare_ptr_findings)} bare *T fields for slab-backed T):")
+        for f in bare_ptr_findings:
+            rel = f.file.relative_to(REPO_ROOT)
+            print(f"  [ERR ] {rel}:{f.line}  "
+                  f"{f.struct_name}.{f.field_name}: {f.field_type}  "
+                  f"→ use SlabRef({f.slab_type})")
+    total_bare_ptr = len(bare_ptr_findings)
+    total_errs += total_bare_ptr
+
     print()
     print(f"Summary: {len(results)} entries, {total_tracked} tracked idents, "
           f"{total_errs} err, {total_infos} info")
     print(f"         {len(slab_types)} slab-backed types discovered")
+    print(f"         {total_bare_ptr} bare-pointer fat-pointer violations")
 
     if args.depth_stats:
         print()
