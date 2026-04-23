@@ -134,8 +134,12 @@ fn faultRecvValidateBuf(proc: *Process, buf_ptr: u64) i64 {
     var check_addr = buf_ptr;
     while (check_addr < buf_end) {
         const node = proc.vmm.findNode(VAddr.fromInt(check_addr)) orelse return E_BADADDR;
-        if (!node.rights.write) return E_BADADDR;
-        check_addr = node.end();
+        node._gen_lock.lock();
+        const writable = node.rights.write;
+        const node_end = node.end();
+        node._gen_lock.unlock();
+        if (!writable) return E_BADADDR;
+        check_addr = node_end;
     }
     return E_OK;
 }
@@ -255,7 +259,10 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
         var page = first_page;
         while (true) {
             const node = proc.vmm.findNode(VAddr.fromInt(page)) orelse return E_BADADDR;
-            if (!node.rights.read) return E_BADADDR;
+            node._gen_lock.lock();
+            const readable = node.rights.read;
+            node._gen_lock.unlock();
+            if (!readable) return E_BADADDR;
             if (page == last_page) break;
             page += paging.PAGE4K;
         }
