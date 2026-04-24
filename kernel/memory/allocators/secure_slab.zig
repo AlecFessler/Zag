@@ -546,25 +546,34 @@ fn validateT(comptime T: type) void {
         );
     }
 
-    // ---- deferred: offset-0 + extern layout ----
-    // The design ideal is `_gen_lock` at offset 0 in every slab-backed
-    // object — first word of the slot, always. Enforcing that at
-    // comptime demands every slab T be `extern struct` (the only
-    // layout kind that guarantees source-order offsets). Today most
-    // kernel slab types are plain `struct` because they embed `?Stack`,
-    // tagged-union perm tables, and similar constructs that aren't
-    // extern-compatible without restructuring. Field-0 discipline
-    // (checked above) is the practical approximation: Zig rarely
-    // reorders the first field when it's already suitably aligned,
-    // and the explicit `_gen_lock` first-field rule makes the
-    // approximation auditable without cascading a rewrite of every
-    // slab T at this time. When the cascade lands (tracked as a
-    // separate task), restore:
+    // ---- layout: T must be `extern struct` with `_gen_lock` at offset 0 ----
+    // This is what the gen-lock design actually requires: a guaranteed
+    // offset for the lock word. Plain `struct` lets Zig reorder fields
+    // for packing — the first-field check above is an approximation,
+    // not a guarantee. Extern is the mechanism that makes it real.
     //
-    //     if (info.@"struct".layout != .@"extern") @compileError(...);
-    //     if (@offsetOf(T, "_gen_lock") != 0)     @compileError(...);
-    //
-    // which will then close the loop.
+    // If this fires on a slab T, convert it to `extern struct`. That
+    // may require replacing `?T` fields (e.g. `?Stack`, `?u64`,
+    // `?RestartContext`) with extern-compatible shapes: for pointer
+    // optionals `?*T` already works, for SlabRef itself ptr: ?*T
+    // subsumes nullability without a separate `?SlabRef(T)`, and for
+    // other optionals use a wrapper struct with explicit presence or a
+    // documented sentinel that does NOT collide with an existing
+    // invariant (no `gen = 0` for "none" — the gen-parity invariant
+    // already uses 0 to mean freed).
+    if (info.@"struct".layout != .@"extern") {
+        @compileError(
+            @typeName(T) ++ " must be `extern struct` — required for" ++
+                " guaranteed `_gen_lock` offset. Plain `struct` lets Zig" ++
+                " reorder fields.",
+        );
+    }
+    if (@offsetOf(T, "_gen_lock") != 0) {
+        @compileError(
+            @typeName(T) ++ "._gen_lock must be at offset 0; got offset " ++
+                std.fmt.comptimePrint("{d}", .{@offsetOf(T, "_gen_lock")}),
+        );
+    }
 }
 
 fn bumpOne(ba: *bump.BumpAllocator, comptime R: type) ?*R {
