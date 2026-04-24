@@ -2549,6 +2549,51 @@ fn walkBody(
                     if (ctx.slab_types.contains(lrty)) resolved = lrty;
                 }
             }
+            // Chained-SlabRef .lock() RHS: `const x = <chain>.<variant>.lock() catch ...`
+            // where <variant> is a known fat-yielding field (UNION_VARIANTS
+            // or FAT_YIELDING_FIELDS). The .lock() returns *T of the
+            // resolved slab type; record that on x so downstream
+            // `x.<lock_field>.lock()` chains classify. Also self-alive
+            // the local — the programmer is responsible for bracketing
+            // the *chain's* lock/unlock, and x aliases that lock's
+            // protected region. (Same semantic as the existing
+            // lock_alias_ref path for plain-ident chains.)
+            var chained_lock_alias = false;
+            if (resolved == null) {
+                const rhs_cs = stripPostfix(dp.rhs);
+                if (mem.endsWith(u8, rhs_cs, ".lock()")) {
+                    const chain = rhs_cs[0 .. rhs_cs.len - ".lock()".len];
+                    // chain must be all idents + dots.
+                    var all_chain = chain.len > 0;
+                    for (chain) |c| if (!isIdentChar(c) and c != '.') {
+                        all_chain = false;
+                        break;
+                    };
+                    if (all_chain) {
+                        const last_seg_start = (mem.lastIndexOfScalar(u8, chain, '.') orelse 0) + 1;
+                        const last_seg = chain[last_seg_start..];
+                        if (lookupUnionVariant(last_seg)) |ty| {
+                            if (ctx.slab_types.contains(ty)) {
+                                resolved = ty;
+                                chained_lock_alias = true;
+                            }
+                        }
+                        if (resolved == null) {
+                            for (FAT_YIELDING_FIELDS) |e| {
+                                if (!mem.eql(u8, e.field, last_seg)) continue;
+                                for (DEFAULT_FIELD_CHAINS) |d| {
+                                    if (mem.eql(u8, d.field, last_seg) and ctx.slab_types.contains(d.ty)) {
+                                        resolved = d.ty;
+                                        chained_lock_alias = true;
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
             if (resolved == null and dp.ann.len > 0) {
                 if (parseTypeRef(dp.ann)) |ty| {
                     if (ctx.slab_types.contains(ty)) resolved = ty;
@@ -2618,7 +2663,7 @@ fn walkBody(
                 try env.map.put(dp.name, rt_i);
                 try env.all_types.put(dp.name, rt_i);
                 if (is_fat) try env.fat.add(dp.name);
-                if (lock_alias_ref != null) try env.self_alive.add(dp.name);
+                if (lock_alias_ref != null or chained_lock_alias) try env.self_alive.add(dp.name);
             } else if (dp.ann.len > 0) {
                 // Non-slab annotation — record bare type in all_types so
                 // plain SpinLock/GenLock field accesses through this local
