@@ -487,26 +487,84 @@ pub fn SecureSlab(
 
 fn validateT(comptime T: type) void {
     const info = @typeInfo(T);
+
+    // ---- shape: T must be a struct ----
     if (info != .@"struct") {
         @compileError("SecureSlab requires a struct T; got " ++ @typeName(T));
     }
+
+    // ---- identity: T must carry a `_gen_lock: GenLock` field ----
     if (!@hasField(T, "_gen_lock")) {
         @compileError(@typeName(T) ++ " must declare a `_gen_lock: GenLock` field");
     }
-    // Offset-0 is the design ideal ("the first word of every slab-backed
-    // object is the lock, stable even when inserted into the freelist").
-    // Enforcing it at comptime would require every slab T — including
-    // Thread/Process and their many sub-structs — to be `extern struct`,
-    // a cascading refactor that touches ?u64 / ?Stack / tagged-union
-    // fields. For now we validate only that `_gen_lock` exists; access
-    // goes through `ptr._gen_lock` (field syntax), so Zig's struct
-    // layout still resolves the gen-lock correctly at any offset. The
-    // UAF-detection invariant holds regardless — the word is part of T's
-    // own storage, so it persists across the free→alloc cycle on the
-    // freelist, and `lockWithGen` CAS-catches stale expected_gen. The
-    // offset-0 convention should be restored as each slab T is converted
-    // to extern struct; until then, comptime enforcement would gate the
-    // build on the full refactor.
+    if (@FieldType(T, "_gen_lock") != GenLock) {
+        @compileError(
+            @typeName(T) ++ "._gen_lock must be `GenLock`, got `" ++
+                @typeName(@FieldType(T, "_gen_lock")) ++ "`",
+        );
+    }
+
+    // ---- first-field discipline: `_gen_lock` is the first-declared field ----
+    // Source-order first field is an offset-0 cue: for extern and packed
+    // structs it IS the offset-0 guarantee; for plain Zig structs Zig is
+    // free to reorder for size/alignment, but the canonical pattern in
+    // this kernel is to list `_gen_lock` first on every slab T, and any
+    // deviation is a bug worth catching at instantiation time (wrong
+    // field was renamed / someone added a field above by accident).
+    if (info.@"struct".fields.len == 0 or
+        !std.mem.eql(u8, info.@"struct".fields[0].name, "_gen_lock"))
+    {
+        @compileError(
+            @typeName(T) ++ " must list `_gen_lock` as the first declared field",
+        );
+    }
+
+    // ---- alignment: T must be at least 8-byte-aligned for the atomic word ----
+    if (@alignOf(T) < @alignOf(GenLock)) {
+        @compileError(
+            @typeName(T) ++ " must be at least " ++
+                std.fmt.comptimePrint("{d}", .{@alignOf(GenLock)}) ++
+                "-byte aligned (GenLock's atomic u64 requires it); got " ++
+                std.fmt.comptimePrint("{d}", .{@alignOf(T)}),
+        );
+    }
+
+    // ---- size / stride stability: @sizeOf divides @alignOf cleanly ----
+    // slot_stride = alignForward(@sizeOf(T), @alignOf(T)) in SecureSlab;
+    // if @sizeOf isn't already a multiple of @alignOf, alignForward pads
+    // and the in-between bytes become reusable scratch across free→alloc
+    // (they're not part of T's storage, so the slab allocator's zeroing
+    // protections don't cover them). Ban this shape — every slab T
+    // should be sized to its own alignment.
+    if (@sizeOf(T) % @alignOf(T) != 0) {
+        @compileError(
+            @typeName(T) ++ " @sizeOf (" ++
+                std.fmt.comptimePrint("{d}", .{@sizeOf(T)}) ++
+                ") must be a multiple of @alignOf (" ++
+                std.fmt.comptimePrint("{d}", .{@alignOf(T)}) ++
+                ") for stable array stride",
+        );
+    }
+
+    // ---- deferred: offset-0 + extern layout ----
+    // The design ideal is `_gen_lock` at offset 0 in every slab-backed
+    // object — first word of the slot, always. Enforcing that at
+    // comptime demands every slab T be `extern struct` (the only
+    // layout kind that guarantees source-order offsets). Today most
+    // kernel slab types are plain `struct` because they embed `?Stack`,
+    // tagged-union perm tables, and similar constructs that aren't
+    // extern-compatible without restructuring. Field-0 discipline
+    // (checked above) is the practical approximation: Zig rarely
+    // reorders the first field when it's already suitably aligned,
+    // and the explicit `_gen_lock` first-field rule makes the
+    // approximation auditable without cascading a rewrite of every
+    // slab T at this time. When the cascade lands (tracked as a
+    // separate task), restore:
+    //
+    //     if (info.@"struct".layout != .@"extern") @compileError(...);
+    //     if (@offsetOf(T, "_gen_lock") != 0)     @compileError(...);
+    //
+    // which will then close the loop.
 }
 
 fn bumpOne(ba: *bump.BumpAllocator, comptime R: type) ?*R {
