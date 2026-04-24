@@ -14,12 +14,12 @@ const VAddr = zag.memory.address.VAddr;
 ///
 /// When `data_size == 0` the context carries only the entry point and
 /// no ghost pages are allocated (`deinit()` is a no-op in that case).
-pub const RestartContext = extern struct {
+pub const RestartContext = struct {
     entry_point: VAddr,
     data_vaddr: VAddr,
     data_size: u64,
     ghost_base: PAddr,
-    ghost_order: u8,
+    ghost_order: u4,
 
     pub fn init(entry: VAddr, data_vaddr: VAddr, data_content: []const u8) !RestartContext {
         if (data_content.len == 0) {
@@ -40,7 +40,7 @@ pub const RestartContext = extern struct {
         if (num_pages_u64 == 0 or num_pages_u64 > std.math.maxInt(u32)) return error.TooManyPages;
         const num_pages: u32 = @intCast(num_pages_u64);
         const rounded_pages = std.math.ceilPowerOfTwo(u32, num_pages) catch return error.TooManyPages;
-        const order: u8 = @intCast(@ctz(rounded_pages));
+        const order: u4 = @intCast(@ctz(rounded_pages));
         const alloc_size = @as(u64, rounded_pages) * paging.PAGE4K;
 
         var global = &pmm.global_pmm.?;
@@ -62,7 +62,7 @@ pub const RestartContext = extern struct {
 
     pub fn deinit(self: *RestartContext) void {
         if (self.data_size == 0) return;
-        const block_pages = @as(u32, 1) << @intCast(self.ghost_order);
+        const block_pages = @as(u32, 1) << self.ghost_order;
         const block_size = @as(u64, block_pages) * paging.PAGE4K;
         const base_vaddr = VAddr.fromPAddr(self.ghost_base, null);
         const buf: [*]u8 = @ptrFromInt(base_vaddr.addr);

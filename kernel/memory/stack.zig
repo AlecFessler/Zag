@@ -23,7 +23,7 @@ var freelist_buf: [FREELIST_CAP]u64 = undefined;
 var freelist_top: usize = 0;
 var freelist_lock: SpinLock = .{};
 
-pub const Stack = extern struct {
+pub const Stack = struct {
     top: VAddr,
     base: VAddr,
     guard: VAddr,

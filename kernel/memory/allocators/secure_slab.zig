@@ -324,6 +324,15 @@ pub fn SecureSlab(
             self.lock.lock();
             defer self.lock.unlock();
 
+            // Defense-in-depth: clear every byte of T *except* `_gen_lock`
+            // before releasing the slot. Stale capability data, keys, or
+            // IPC payloads can't leak across a free→realloc cycle, and the
+            // zero'd representation gives the next allocator the same
+            // "clean-zero" state it'd get from a freshly-grown slot.
+            // Uses `@offsetOf(T, "_gen_lock")` so T is free to place the
+            // lock word wherever Zig's auto-layout prefers.
+            zeroExceptGenLock(ptr);
+
             // Gen-lock currently held. Bump to (expected_gen+1)<<1 | 0 and
             // release in one store: the new gen is even (freed) and the
             // lock bit is clear.
@@ -464,6 +473,19 @@ pub fn SecureSlab(
             return cell.*;
         }
 
+        fn zeroExceptGenLock(ptr: *T) void {
+            const byte_ptr: [*]u8 = @ptrCast(ptr);
+            const gen_off = comptime @offsetOf(T, "_gen_lock");
+            const gen_end = comptime gen_off + @sizeOf(GenLock);
+            const total = comptime @sizeOf(T);
+            if (comptime gen_off > 0) {
+                @memset(byte_ptr[0..gen_off], 0);
+            }
+            if (comptime gen_end < total) {
+                @memset(byte_ptr[gen_end..total], 0);
+            }
+        }
+
         fn indexOf(self: *Self, ptr: *T) u32 {
             // Slots are laid out at `data_base + i * slot_stride` by
             // growOne; the pointer's offset from data_base divides by
@@ -531,34 +553,14 @@ fn validateT(comptime T: type) void {
         );
     }
 
-    // ---- layout: T must be `extern struct` with `_gen_lock` at offset 0 ----
-    // This is what the gen-lock design actually requires: a guaranteed
-    // offset for the lock word. Plain `struct` lets Zig reorder fields
-    // for packing — the first-field check above is an approximation,
-    // not a guarantee. Extern is the mechanism that makes it real.
-    //
-    // If this fires on a slab T, convert it to `extern struct`. That
-    // may require replacing `?T` fields (e.g. `?Stack`, `?u64`,
-    // `?RestartContext`) with extern-compatible shapes: for pointer
-    // optionals `?*T` already works, for SlabRef itself ptr: ?*T
-    // subsumes nullability without a separate `?SlabRef(T)`, and for
-    // other optionals use a wrapper struct with explicit presence or a
-    // documented sentinel that does NOT collide with an existing
-    // invariant (no `gen = 0` for "none" — the gen-parity invariant
-    // already uses 0 to mean freed).
-    if (info.@"struct".layout != .@"extern") {
-        @compileError(
-            @typeName(T) ++ " must be `extern struct` — required for" ++
-                " guaranteed `_gen_lock` offset. Plain `struct` lets Zig" ++
-                " reorder fields.",
-        );
-    }
-    if (@offsetOf(T, "_gen_lock") != 0) {
-        @compileError(
-            @typeName(T) ++ "._gen_lock must be at offset 0; got offset " ++
-                std.fmt.comptimePrint("{d}", .{@offsetOf(T, "_gen_lock")}),
-        );
-    }
+    // ---- layout: `_gen_lock`'s offset is whatever Zig picked ----
+    // `_gen_lock` persists across free→alloc cycles (the whole gen-parity
+    // invariant depends on it), but its *offset within T* is not load-
+    // bearing — `zeroExceptGenLock` below uses `@offsetOf(T, "_gen_lock")`
+    // at comptime to skip it when clearing the slot. This lets T stay a
+    // plain `struct` and keeps Zig free to reorder for packing, avoiding
+    // the extern-cascade churn (tagged unions, nested optionals, …) that
+    // would otherwise ripple through Process/Thread/Vm/VCpu.
 }
 
 fn bumpOne(ba: *bump.BumpAllocator, comptime R: type) ?*R {

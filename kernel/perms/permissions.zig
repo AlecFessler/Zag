@@ -11,7 +11,7 @@ const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 const Vm = zag.arch.dispatch.vm.Vm;
 
-pub const FaultReason = enum(u8) {
+pub const FaultReason = enum(u5) {
     none = 0,
     stack_overflow = 1,
     stack_underflow = 2,
@@ -135,7 +135,7 @@ pub const PermissionEntry = struct {
     }
 };
 
-pub const VmReservationObject = extern struct {
+pub const VmReservationObject = struct {
     max_rights: VmReservationRights,
     original_start: VAddr,
     original_size: u64,
