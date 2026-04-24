@@ -18,6 +18,29 @@ Parses all .zig files (excluding tests/) for definitions:
 
 Then searches the entire repo for references to each definition.
 Reports items with zero references outside their definition line.
+
+Qualified-reference detection for ambiguous method names
+--------------------------------------------------------
+Module-level `pub fn <name>` where <name> is a widely-shared method identifier
+(`destroy`, `init`, `deinit`, `free`, `create`, `new`, `reset`, `start`,
+`stop`, `update`, `clear`, `read`, `write`) is counted with qualified
+patterns only, because the bare-identifier grep yields ~hundreds of false
+positives from `allocator.destroy`, `pmm_iface.destroy`, generic-struct
+methods, etc. The qualified forms are:
+
+  - `<basename>.<name>`       (e.g. `device_region.destroy`)
+  - `<alias>.<name>`          (aliases that assign the module to a new name,
+                               discovered by scanning the repo for
+                               `const <alias> = ... <basename>;` lines and
+                               `const <alias> = @import("<basename>.zig")`)
+  - `<Type>.<name>`           (UFCS / explicit type dispatch, where <Type>
+                               is any pub struct/enum/union declared in the
+                               defining file)
+
+If ALL of those yield zero hits outside the defining line, the function is
+flagged. This intentionally misses the case where a function is called
+exclusively via instance method dispatch (`dr.destroy()`) on a variable
+whose static type we cannot resolve — such cases must be whitelisted below.
 """
 
 import os
@@ -28,6 +51,23 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
+
+# Ambiguous method identifiers — bare-identifier grep is useless for these
+# because they collide with allocator / interface / generic-struct methods
+# across the repo. Module-level `pub fn` with one of these names is only
+# counted live when a qualified reference (module/alias/type . name) exists.
+COMMON_METHOD_NAMES = frozenset({
+    "destroy", "init", "deinit", "free", "create", "new",
+    "reset", "start", "stop", "update", "clear", "read", "write",
+})
+
+# Functions whose names are commonly resolved via reflection, linker, or
+# comptime dispatch that `rg` cannot see. Never flag these, even if qualified
+# references are zero.
+#
+#   panic       — compiled-in panic handler (std looks it up via @hasDecl)
+#   main        — binary entry point referenced by the linker / runtime
+EXEMPT_FUNCTION_NAMES = frozenset({"panic", "main"})
 
 target_name = sys.argv[1] if len(sys.argv) > 1 else "kernel"
 TARGET_DIR = REPO_ROOT / target_name
@@ -48,11 +88,18 @@ SEARCH_DIRS = [str(REPO_ROOT)]
 
 @dataclass
 class Definition:
-    kind: str          # FUNCTION, STRUCT, ENUM, UNION, CONST, VAR, IMPORT, FIELD, VARIANT
-    name: str          # identifier name
-    line: int          # line number in file
-    file: Path         # source file
-    parent: str = ""   # parent struct/enum name for fields/variants
+    kind: str               # FUNCTION, STRUCT, ENUM, UNION, CONST, VAR, IMPORT, FIELD, VARIANT
+    name: str               # identifier name
+    line: int               # line number in file
+    file: Path              # source file
+    parent: str = ""        # parent struct/enum name for fields/variants
+    module_level: bool = False  # true only for FUNCTIONs declared at brace_depth == 0
+
+
+# Cache for module-alias discovery: maps module basename -> set of identifiers
+# that bind the module (basename itself + any `const <alias> = ... <basename>;`
+# found across the repo). Computed lazily on first common-method lookup.
+_alias_cache: dict[str, frozenset[str]] = {}
 
 
 def grep_count(pattern: str, is_field: bool = False) -> int:
@@ -77,18 +124,8 @@ def grep_count(pattern: str, is_field: bool = False) -> int:
         return -1
 
 
-def grep_references(name: str, def_file: Path, def_line: int, is_field: bool = False) -> int:
-    """
-    Count references to `name` across the repo, excluding the definition line.
-
-    For fields/variants, searches for `.name` pattern.
-    For other items, searches for the bare name as a word boundary.
-    """
-    if is_field:
-        pattern = rf"\.{re.escape(name)}\b"
-    else:
-        pattern = rf"\b{re.escape(name)}\b"
-
+def _rg_count(pattern: str) -> int:
+    """Run ripgrep and sum per-file match counts. Returns -1 on error."""
     cmd = [
         "rg", "--count-matches", "--no-filename",
         "--type", "zig",
@@ -107,13 +144,136 @@ def grep_references(name: str, def_file: Path, def_line: int, is_field: bool = F
                 total += int(line.strip())
             except ValueError:
                 pass
+    return total
 
-    # Now count how many times it appears on the definition line itself
-    # (and the line where it's declared in a struct/enum body)
-    # We subtract 1 for the definition itself
+
+def module_aliases(basename: str) -> frozenset[str]:
+    """
+    Discover identifiers that bind the module whose file basename is `basename`.
+
+    Always includes `basename` itself. Scans the repo for:
+        const <alias> = @import("<basename>.zig");
+        const <alias> = @import(".../<basename>.zig");
+        const <alias> = <something>.<basename>;
+        pub const <alias> = ... <basename> ...;
+    and collects the <alias> identifiers.
+
+    Result is cached per-basename.
+    """
+    if basename in _alias_cache:
+        return _alias_cache[basename]
+
+    aliases: set[str] = {basename}
+
+    # `const NAME = ...@import("...basename.zig")...;` at module scope.
+    # The `@import` does not have to be the entire RHS — e.g. nic.zig has
+    # `const driver = if (cond) @import("x550.zig") else @import("e1000.zig");`
+    # which still effectively binds `driver` to the module at comptime.
+    cmd = [
+        "rg", "--no-filename", "--no-line-number", "--multiline",
+        "--type", "zig",
+        rf'(?m)^(?:pub\s+)?const\s+(\w+)\s*=\s*[^;]*?@import\("(?:[^"]*/)?{re.escape(basename)}\.zig"\)',
+        "--replace", "$1",
+        "-o",
+        str(REPO_ROOT),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        for line in result.stdout.splitlines():
+            alias = line.strip()
+            if alias:
+                aliases.add(alias)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    # `const NAME = <path>.basename;` at module scope, terminated by `;`.
+    cmd = [
+        "rg", "--no-filename", "--no-line-number", "--multiline",
+        "--type", "zig",
+        rf'(?m)^(?:pub\s+)?const\s+(\w+)\s*=\s*[\w.]+\.{re.escape(basename)}\s*;',
+        "--replace", "$1",
+        "-o",
+        str(REPO_ROOT),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        for line in result.stdout.splitlines():
+            alias = line.strip()
+            if alias:
+                aliases.add(alias)
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+
+    frozen = frozenset(aliases)
+    _alias_cache[basename] = frozen
+    return frozen
+
+
+def local_type_names(def_file: Path) -> list[str]:
+    """Return pub struct/enum/union names declared at module scope in def_file."""
+    names: list[str] = []
+    try:
+        lines = def_file.read_text().splitlines()
+    except Exception:
+        return names
+
+    brace_depth = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("//"):
+            # Still need to track braces inside block-ish comments? No — `//` is line comment.
+            continue
+        # Track whether this line's declarations are at module scope.
+        at_top = (brace_depth == 0)
+        if at_top:
+            m = re.match(
+                r'(?:pub\s+)?const\s+(\w+)\s*=\s*(?:extern\s+)?(?:packed\s+)?(?:struct|enum|union)\b',
+                stripped,
+            )
+            if m:
+                names.append(m.group(1))
+        brace_depth += line.count("{") - line.count("}")
+    return names
+
+
+def grep_references(
+    name: str,
+    def_file: Path,
+    def_line: int,
+    is_field: bool = False,
+    is_module_fn: bool = False,
+) -> int:
+    """
+    Count references to `name` across the repo, excluding the definition line.
+
+    For fields/variants: `.name`.
+    For module-level `pub fn NAME` where NAME is ambiguous (see
+    COMMON_METHOD_NAMES): the qualified forms only — `<alias>.NAME` for any
+    module alias, plus `<Type>.NAME` for any pub type in the defining file.
+    For all other items: bare word-boundary `\\bname\\b`.
+    """
+    if is_field:
+        total = _rg_count(rf"\.{re.escape(name)}\b")
+        if total > 0:
+            total -= 1
+        return total
+
+    if is_module_fn and name in COMMON_METHOD_NAMES:
+        basename = def_file.stem
+        aliases = module_aliases(basename)
+        type_names = local_type_names(def_file)
+        qualifiers = sorted(set(aliases) | set(type_names), key=len, reverse=True)
+        # Build a single alternation to keep ripgrep invocations low.
+        alt = "|".join(re.escape(q) for q in qualifiers)
+        pattern = rf"\b(?:{alt})\.{re.escape(name)}\b"
+        total = _rg_count(pattern)
+        # The definition line itself only contains `pub fn NAME(` (no qualifier),
+        # so nothing to subtract.
+        return total
+
+    total = _rg_count(rf"\b{re.escape(name)}\b")
     if total > 0:
         total -= 1
-
     return total
 
 
@@ -158,7 +318,12 @@ def parse_file(filepath: Path) -> list[Definition]:
         m = re.match(r'\s*(pub\s+)?fn\s+(\w+)\s*\(', stripped)
         if m:
             fname = m.group(2)
-            defs.append(Definition("FUNCTION", fname, lineno, filepath))
+            # Module-level iff not nested inside any struct/enum/union.
+            # (brace_depth here is pre-open — for a top-level decl it's 0.)
+            is_top = (brace_depth == 0 and not struct_stack)
+            defs.append(Definition(
+                "FUNCTION", fname, lineno, filepath, module_level=is_top,
+            ))
             brace_depth += open_braces
             i += 1
             continue
@@ -262,8 +427,15 @@ def main():
         file_unused = []
 
         for d in defs:
+            if d.kind == "FUNCTION" and d.name in EXEMPT_FUNCTION_NAMES:
+                continue
             is_field = d.kind in ("FIELD", "VARIANT")
-            refs = grep_references(d.name, d.file, d.line, is_field=is_field)
+            is_module_fn = d.kind == "FUNCTION" and d.module_level
+            refs = grep_references(
+                d.name, d.file, d.line,
+                is_field=is_field,
+                is_module_fn=is_module_fn,
+            )
 
             if refs == 0:
                 if d.parent:
