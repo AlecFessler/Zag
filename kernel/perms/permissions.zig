@@ -135,7 +135,7 @@ pub const PermissionEntry = struct {
     }
 };
 
-pub const VmReservationObject = struct {
+pub const VmReservationObject = extern struct {
     max_rights: VmReservationRights,
     original_start: VAddr,
     original_size: u64,
