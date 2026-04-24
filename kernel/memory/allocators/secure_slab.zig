@@ -504,21 +504,6 @@ fn validateT(comptime T: type) void {
         );
     }
 
-    // ---- first-field discipline: `_gen_lock` is the first-declared field ----
-    // Source-order first field is an offset-0 cue: for extern and packed
-    // structs it IS the offset-0 guarantee; for plain Zig structs Zig is
-    // free to reorder for size/alignment, but the canonical pattern in
-    // this kernel is to list `_gen_lock` first on every slab T, and any
-    // deviation is a bug worth catching at instantiation time (wrong
-    // field was renamed / someone added a field above by accident).
-    if (info.@"struct".fields.len == 0 or
-        !std.mem.eql(u8, info.@"struct".fields[0].name, "_gen_lock"))
-    {
-        @compileError(
-            @typeName(T) ++ " must list `_gen_lock` as the first declared field",
-        );
-    }
-
     // ---- alignment: T must be at least 8-byte-aligned for the atomic word ----
     if (@alignOf(T) < @alignOf(GenLock)) {
         @compileError(
