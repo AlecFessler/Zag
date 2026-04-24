@@ -134,7 +134,7 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     const target_thread = target_ref.lock() catch return E_BADCAP;
     defer target_ref.unlock();
     const target_proc_ref = target_thread.process;
-    const target_proc = target_proc_ref.lock() catch return E_BADCAP;
+    _ = target_proc_ref.lock() catch return E_BADCAP;
     defer target_proc_ref.unlock();
 
     // Self vs. remote programming. Writing MSRs on the caller's core only
@@ -199,7 +199,7 @@ pub fn sysPmuRead(proc: *Process, thread_handle: u64, sample_ptr: u64) i64 {
         const target_thread = target_ref.lock() catch return E_BADCAP;
         defer target_ref.unlock();
         const target_proc_ref = target_thread.process;
-        const target_proc = target_proc_ref.lock() catch return E_BADCAP;
+        _ = target_proc_ref.lock() catch return E_BADCAP;
         defer target_proc_ref.unlock();
 
         // §2.14.11 / §4.52.5: only .faulted or .suspended is legal.
@@ -233,7 +233,7 @@ pub fn sysPmuReset(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     const target_thread = target_ref.lock() catch return E_BADCAP;
     defer target_ref.unlock();
     const target_proc_ref = target_thread.process;
-    const target_proc = target_proc_ref.lock() catch return E_BADCAP;
+    _ = target_proc_ref.lock() catch return E_BADCAP;
     defer target_proc_ref.unlock();
 
     // §4.53.5: only .faulted is valid.
@@ -265,7 +265,7 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
     const target_thread = target_ref.lock() catch return E_BADCAP;
     defer target_ref.unlock();
     const target_proc_ref = target_thread.process;
-    const target_proc = target_proc_ref.lock() catch return E_BADCAP;
+    _ = target_proc_ref.lock() catch return E_BADCAP;
     defer target_proc_ref.unlock();
 
     // Self vs. remote: only touch hardware on the caller's core if the

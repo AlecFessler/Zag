@@ -212,12 +212,8 @@ pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
     if (vcpu_obj.loadState() != .idle) return E_BUSY;
 
     vcpu_obj.storeState(.running);
-<<<<<<< HEAD
     const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
     defer vcpu_obj.thread.unlock();
-=======
-    const thread = vcpu_obj.thread;
->>>>>>> 47a0277 (syscall/kvm: tighten SlabRef consumers to ref.lock()/unlock() brackets)
     thread.state = .ready;
     const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
     sched.enqueueOnCore(target_core, thread);
@@ -303,12 +299,8 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
 
     // Resume if it was running
     if (state_snapshot == .running) {
-<<<<<<< HEAD
         const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
         defer vcpu_obj.thread.unlock();
-=======
-        const thread = vcpu_obj.thread;
->>>>>>> 47a0277 (syscall/kvm: tighten SlabRef consumers to ref.lock()/unlock() brackets)
         thread.state = .ready;
         const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
         sched.enqueueOnCore(target_core, thread);

@@ -459,7 +459,7 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
         const receiver = recv_ref.lock() catch {
             // Receiver slot freed while blocked — fall back to enqueue path.
             target_proc.msg_box.enqueueLocked(thread);
-            thread.ipc_server = target_proc;
+            thread.ipc_server = process_mod.slabRefNow(Process, target_proc);
             target_proc.msg_box.lock.unlock();
 
             thread.state = .blocked;

@@ -166,7 +166,7 @@ pub fn sysRevokePerm(handle: u64) i64 {
             // until the caller explicitly `mem_dma_unmap`s the SHM.
             // See exploits/dma_revoke_stale_iommu.
             for (proc.dma_mappings[0..proc.num_dma_mappings]) |*m| {
-                if (m.active and m.shm == shm) return E_BUSY;
+                if (m.active and m.shm.ptr == shm) return E_BUSY;
             }
             // Remove the handle from the permission table BEFORE freeing
             // the SHM.  This prevents a concurrent sysMemShmMap (which holds

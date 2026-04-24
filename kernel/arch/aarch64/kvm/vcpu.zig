@@ -344,12 +344,8 @@ pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
     if (vcpu_obj.loadState() != .idle) return E_BUSY;
 
     vcpu_obj.storeState(.running);
-<<<<<<< HEAD
     const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
     defer vcpu_obj.thread.unlock();
-=======
-    const thread = vcpu_obj.thread;
->>>>>>> 47a0277 (syscall/kvm: tighten SlabRef consumers to ref.lock()/unlock() brackets)
     thread.state = .ready;
     const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
     sched.enqueueOnCore(target_core, thread);
@@ -428,12 +424,8 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     if (!write_ok) return E_BADADDR;
 
     if (state_snapshot == .running) {
-<<<<<<< HEAD
         const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
         defer vcpu_obj.thread.unlock();
-=======
-        const thread = vcpu_obj.thread;
->>>>>>> 47a0277 (syscall/kvm: tighten SlabRef consumers to ref.lock()/unlock() brackets)
         thread.state = .ready;
         const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
         sched.enqueueOnCore(target_core, thread);
@@ -490,15 +482,14 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
         vm_obj._gen_lock.lock();
         injectInterrupt(&vcpu_obj.guest_state, interrupt);
         vm_obj._gen_lock.unlock();
-<<<<<<< HEAD
         // Resume phase.
-        const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
-        defer vcpu_obj.thread.unlock();
-=======
->>>>>>> 47a0277 (syscall/kvm: tighten SlabRef consumers to ref.lock()/unlock() brackets)
-        thread.state = .ready;
-        const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
-        sched.enqueueOnCore(target_core, thread);
+        {
+            const thread_resumed = vcpu_obj.thread.lock() catch return E_BADCAP;
+            defer vcpu_obj.thread.unlock();
+            thread_resumed.state = .ready;
+            const target_core = if (thread_resumed.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
+            sched.enqueueOnCore(target_core, thread_resumed);
+        }
     } else {
         vm_obj._gen_lock.lock();
         defer vm_obj._gen_lock.unlock();
