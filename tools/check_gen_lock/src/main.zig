@@ -1719,6 +1719,7 @@ const Ctx = struct {
     summaries: *SummaryMap,
     lock_fields: *const LockFieldMap,
     module_globals: *const StringStringMap,
+    field_types: *const StructFieldTypeMap,
 
     fn fileTokens(self: *const Ctx, sf: *const SourceFile) []const Tok {
         for (self.files, self.tokens_per_file) |f, toks| {
@@ -2830,18 +2831,65 @@ fn walkBody(
                     pos = at + skip;
                     continue;
                 }
-                // Resolve receiver's type. Two paths:
-                //   (a) recv_chain is a bare ident tracked in env.all_types.
-                //   (b) recv_chain is `<ident>.<field>` where <ident>'s
-                //       owner type has <field> with a known struct type
-                //       (one-level deep only for v2).
+                // Resolve receiver's type. Walk segments left-to-right:
+                //   first segment: env.all_types (locals/params) or
+                //                  module_globals (file-scope vars);
+                //   each subsequent segment: field_types lookup on the
+                //                  current type.
+                // Segments may include `[...]` suffixes which we strip.
                 var recv_type: []const u8 = "";
-                if (mem.indexOfScalar(u8, recv_chain, '.')) |dot| {
-                    // Multi-segment receiver — only handle `<ident>` chain,
-                    // not arbitrary depth. Skip for v2.
-                    _ = dot;
-                } else {
-                    if (env.all_types.get(recv_chain)) |ty| recv_type = ty;
+                {
+                    // Split recv_chain on '.' ignoring content inside `[]`.
+                    const SegParser = struct {
+                        fn next(s: []const u8, start: *usize) ?[]const u8 {
+                            if (start.* >= s.len) return null;
+                            var i: usize = start.*;
+                            var depth: i32 = 0;
+                            while (i < s.len) : (i += 1) {
+                                switch (s[i]) {
+                                    '[' => depth += 1,
+                                    ']' => depth -= 1,
+                                    '.' => if (depth == 0) {
+                                        const seg = s[start.*..i];
+                                        start.* = i + 1;
+                                        return seg;
+                                    },
+                                    else => {},
+                                }
+                            }
+                            const seg = s[start.*..];
+                            start.* = s.len;
+                            return seg;
+                        }
+                        fn stripSubscript(s: []const u8) []const u8 {
+                            if (mem.indexOfScalar(u8, s, '[')) |b| return s[0..b];
+                            return s;
+                        }
+                    };
+                    var scur: usize = 0;
+                    const first_raw = SegParser.next(recv_chain, &scur) orelse "";
+                    const first = SegParser.stripSubscript(first_raw);
+                    if (first.len > 0) {
+                        if (env.all_types.get(first)) |ty| {
+                            recv_type = ty;
+                        } else if (ctx.module_globals.get(first)) |ty| {
+                            recv_type = ty;
+                        }
+                    }
+                    while (recv_type.len > 0) {
+                        const seg_raw = SegParser.next(recv_chain, &scur) orelse break;
+                        const seg = SegParser.stripSubscript(seg_raw);
+                        if (seg.len == 0) {
+                            recv_type = "";
+                            break;
+                        }
+                        if (ctx.field_types.get(.{ .owner = recv_type, .field = seg })) |nt| {
+                            recv_type = nt;
+                        } else {
+                            recv_type = "";
+                            break;
+                        }
+                    }
                 }
                 if (recv_type.len == 0) {
                     pos = at + skip;
@@ -3361,6 +3409,7 @@ fn analyzeEntry(
     summaries: *SummaryMap,
     lock_fields: *const LockFieldMap,
     module_globals: *const StringStringMap,
+    field_types: *const StructFieldTypeMap,
     entry: *const EntryPoint,
     out_env: *SlabEnv,
     out_events: *EventMap,
@@ -3426,6 +3475,7 @@ fn analyzeEntry(
         .summaries = summaries,
         .lock_fields = lock_fields,
         .module_globals = module_globals,
+        .field_types = field_types,
     };
 
     var seq: u32 = 0;
@@ -3663,6 +3713,36 @@ fn typeNameFromFieldType(ft: []const u8) []const u8 {
     var e: usize = 0;
     while (e < t.len and isIdentChar(t[e])) e += 1;
     return t[0..e];
+}
+
+// Generic struct-field-type map: (owner, field) → bare type name. Used
+// by the lock-ordering analyzer to walk multi-segment receiver chains
+// like `a.b.c.lock()` segment-by-segment: start from `a`'s type,
+// look up `b` in that type's fields to get `b`'s type, repeat. Covers
+// every struct field — not just lock-typed ones — so the chain walk
+// can traverse through intermediate non-lock fields.
+const StructFieldTypeMap = std.HashMap(
+    LockFieldKey,
+    []const u8,
+    LockFieldCtx,
+    std.hash_map.default_max_load_percentage,
+);
+
+fn buildStructFieldTypeMap(
+    pool: *Pool,
+    struct_fields: []const StructField,
+    out: *StructFieldTypeMap,
+) !void {
+    for (struct_fields) |f| {
+        const bare = typeNameFromFieldType(f.field_type);
+        if (bare.len == 0) continue;
+        const owner_i = try pool.intern(f.struct_name);
+        const field_i = try pool.intern(f.field_name);
+        const ty_i = try pool.intern(bare);
+        // Last-wins for same (owner, field) — struct fields don't
+        // typically duplicate in practice.
+        try out.put(.{ .owner = owner_i, .field = field_i }, ty_i);
+    }
 }
 
 fn buildLockFieldMap(
@@ -4247,6 +4327,13 @@ pub fn main() !u8 {
     defer lock_fields.deinit();
     try buildLockFieldMap(gpa, &pool, struct_fields.items, &lock_fields);
 
+    // Struct field type map (owner.field → bare type) used for walking
+    // multi-segment receiver chains like `a.b.c.lock()` when resolving
+    // the owner of `c`'s lock field.
+    var field_types = StructFieldTypeMap.init(gpa);
+    defer field_types.deinit();
+    try buildStructFieldTypeMap(&pool, struct_fields.items, &field_types);
+
     // Module-level globals. Every `var/const NAME: TYPE` at file scope
     // contributes a NAME → element type entry; walks resolve locals
     // that reference these globals (e.g. `const state =
@@ -4293,7 +4380,7 @@ pub fn main() !u8 {
     for (entries.items) |*entry| {
         var env = SlabEnv.init(gpa);
         var events = EventMap.init(gpa);
-        try analyzeEntry(gpa, &pool, files.items, tokens.items, &slab_types, &fn_index, &summaries, &lock_fields, &module_globals, entry, &env, &events);
+        try analyzeEntry(gpa, &pool, files.items, tokens.items, &slab_types, &fn_index, &summaries, &lock_fields, &module_globals, &field_types, entry, &env, &events);
         var res = CheckResult{
             .entry = entry,
             .env = env,
@@ -4405,7 +4492,7 @@ pub fn main() !u8 {
             analyzeEntry(
                 gpa, &pool, files.items, tokens.items,
                 &slab_types, &fn_index, &summaries,
-                &lock_fields, &module_globals,
+                &lock_fields, &module_globals, &field_types,
                 &synth, &env, &events,
             ) catch {
                 // Best-effort cleanup on error.
@@ -4531,7 +4618,7 @@ pub fn main() !u8 {
                 }
                 if (dup) continue;
                 try w.print(
-                    "    [WARN] {s} → {s}  at {s}:{d}  in {s}()\n",
+                    "    [ERR ] {s} → {s}  at {s}:{d}  in {s}()\n",
                     .{ p.outer, p.inner, p.file_rel, p.line, p.entry_name },
                 );
                 shown += 1;
@@ -4547,6 +4634,7 @@ pub fn main() !u8 {
             .{},
         );
     }
+    total_errs += @intCast(cycles.items.len);
 
     try w.writeAll("\n");
     try w.print("Summary: {d} entries, {d} tracked idents, {d} err, {d} info\n", .{ results.items.len, total_tracked, total_errs, total_infos });
