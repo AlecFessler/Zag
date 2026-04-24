@@ -662,6 +662,9 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.
             const core_idx: u8 = @truncate(gic.coreID());
             const slot = &cpu.fpu_flush_mailbox[core_idx];
             if (@atomicLoad(?*anyopaque, &slot.requested_thread, .acquire)) |opq| {
+                // self-alive: the requesting core pins the target thread
+                // across the IPI and waits for ack before releasing it;
+                // we cannot observe a freed slot here.
                 const thread: *Thread = @ptrCast(@alignCast(opq));
                 fpu.flushIpiHandler(thread);
             }

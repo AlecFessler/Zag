@@ -106,6 +106,19 @@ DEFAULT_FIELD_CHAINS = {
     ("Vm", "proc"): "Process",
 }
 
+# Fields whose stored value is a `SlabRef(T)` fat pointer (not a bare
+# `*T`). Used by decl inference: `const x = target_thread.process;` binds
+# `x` as a fat ident — so `x.lock()` / `x.unlock()` register as lock ops
+# rather than being treated as arbitrary method calls on a bare pointer.
+FAT_YIELDING_FIELDS = {
+    ("Thread", "process"),
+    ("Thread", "next"),
+    ("Thread", "ipc_server"),
+    ("VCpu", "process"),
+    ("VCpu", "vm"),
+    ("VCpu", "thread"),
+}
+
 
 @dataclass
 class SlabType:
@@ -517,11 +530,20 @@ def find_ptr_bypasses(slab_types: dict[str, SlabType]) -> list[PtrBypassFinding]
         for i, raw in enumerate(lines):
             code = strip_comments(raw)
             # Self-alive comment on this line → skip every .ptr hit on
-            # this line. Same on the previous line → skip this line's
-            # hits. Conservative but easy to reason about.
+            # this line. A `// self-alive` comment anywhere in the
+            # contiguous `//` comment block immediately above the `.ptr`
+            # line also suppresses — multi-line rationale for why the
+            # pointer is kept alive by construction is common.
             if SELF_ALIVE_COMMENT_RE.search(raw):
                 continue
-            if i > 0 and SELF_ALIVE_COMMENT_RE.search(lines[i - 1]):
+            j = i - 1
+            saw_self_alive_above = False
+            while j >= 0 and lines[j].lstrip().startswith("//"):
+                if SELF_ALIVE_COMMENT_RE.search(lines[j]):
+                    saw_self_alive_above = True
+                    break
+                j -= 1
+            if saw_self_alive_above:
                 continue
             for m_chain in PTR_CHAIN_RE.finditer(code):
                 chain = m_chain.group(1)
@@ -726,6 +748,15 @@ SLAB_RETURN_HELPERS: dict[str, str] = {
     "lookupThread": "Thread",                       # kernel/syscall/pmu.zig
     # `proc.acquireThreadRef(h)` returns `?struct{ entry, thread: *Thread }`.
     # We handle that via the `.thread` extraction on the result struct.
+}
+
+# Subset of `SLAB_RETURN_HELPERS` / `SLAB_RETURN_METHODS` whose return
+# value is a `SlabRef(T)` fat pointer (rather than a bare `*T`). A decl
+# whose RHS resolves via these maps binds the new ident as fat, so
+# `<ident>.lock()` registers as a gen-lock op.
+FAT_SLAB_RETURN_NAMES: set[str] = {
+    "lookupThread",
+    "findNode",
 }
 
 # Methods on non-slab host types that return a slab pointer. Looked up
@@ -1134,6 +1165,39 @@ def _walk_body(
             is_fat = bool(re.search(r"\bSlabRef\s*\(", ann)) or bool(
                 re.search(r"\bSlabRef\s*\(", rhs)
             )
+            # Known fat-returning helpers/methods anywhere in rhs.
+            if not is_fat:
+                for fat_fn in FAT_SLAB_RETURN_NAMES:
+                    if re.search(rf"\b{fat_fn}\s*\(", rhs):
+                        is_fat = True
+                        break
+            # RHS is a bare `<ident>.<field>` chain on a slab object
+            # whose `<field>` is known to be stored as `SlabRef(T)`.
+            # Mark the new binding as fat so `<new>.lock()` is recognized.
+            if not is_fat:
+                rhs_plain = _strip_postfix(rhs.strip().rstrip(";").strip())
+                m_chain = re.fullmatch(r"(\w+)\.(\w+)", rhs_plain)
+                if m_chain:
+                    head_ty = env.get(m_chain.group(1))
+                    if head_ty is not None and (head_ty, m_chain.group(2)) in FAT_YIELDING_FIELDS:
+                        is_fat = True
+            # RHS is `<fat_ident>.lock()` — the result is a raw `*T`
+            # pinned alive for the duration of the SlabRef's lock/unlock
+            # bracket. Resolve the slab type AND mark the new ident as
+            # self-alive: accesses on it sit inside the already-verified
+            # bracket on the originating fat ref. This also teaches the
+            # inference that `target_thread.process` is a fat field,
+            # so the cascading `target_proc_ref.lock()` in pmu.zig /
+            # thread.zig syscalls is recognized as a real lock op.
+            lock_alias_ref: str | None = None
+            if not resolved:
+                rhs_plain = _strip_postfix(rhs.strip().rstrip(";").strip())
+                m_lock = re.fullmatch(r"(\w+)\.lock\s*\(\s*\)", rhs_plain)
+                if m_lock and m_lock.group(1) in fat_idents:
+                    head_ty = env.get(m_lock.group(1))
+                    if head_ty in slab_types:
+                        resolved = head_ty
+                        lock_alias_ref = m_lock.group(1)
             if ann:
                 ty = parse_type_ref(ann)
                 if ty and ty in slab_types:
@@ -1219,6 +1283,30 @@ def _walk_body(
                 env[name] = resolved
                 if is_fat:
                     fat_idents.add(name)
+                # `const x = <ref>.lock() catch ...;` produces a raw `*T`
+                # pinned by the outstanding bracket on `<ref>`. Accesses
+                # on `x` up through the matching `<ref>.unlock()` are
+                # covered — mark self-alive.
+                if lock_alias_ref is not None:
+                    self_alive.add(name)
+
+            # Explicit `// self-alive` comment on the decl line (or any
+            # contiguous `//` comment line immediately above the decl)
+            # opts the newly-bound ident out of gen-lock bracket checks.
+            # Used where the decl's *T came from a source the analyzer
+            # can't reason about (cross-core IPI mailbox, atomic load
+            # from per-core scheduler slot, etc.) but the calling
+            # protocol pins the slot live across the access.
+            if not became_self_alive:
+                if SELF_ALIVE_COMMENT_RE.search(raw_line):
+                    self_alive.add(name)
+                else:
+                    k = rel - 1
+                    while k >= 0 and body_lines[k].lstrip().startswith("//"):
+                        if SELF_ALIVE_COMMENT_RE.search(body_lines[k]):
+                            self_alive.add(name)
+                            break
+                        k -= 1
 
         # Refcount-pinning detector. The idiomatic pin pair in this
         # kernel is:
@@ -1263,16 +1351,17 @@ def _walk_body(
             ))
             if is_defer and op == "unlock":
                 pending_defers.append((ident, brace_depth))
-        # SlabRef form: `ident.lock()` / `ident.unlock()`. Gated on
-        # fat_idents so only confirmed SlabRef-typed idents match.
+        # SlabRef form: `ident.lock()` / `ident.unlock()`, also accepts
+        # `ident.?.lock()` / `ident.?.unlock()` for `?SlabRef(T)` fields.
+        # Gated on fat_idents so only confirmed SlabRef-typed idents match.
         for m_lock in re.finditer(
-            r"\b(\w+)\.(lock|unlock)\s*\(", code
+            r"\b(\w+)(?:\.\?)?\.(lock|unlock)\s*\(", code
         ):
             ident, op = m_lock.group(1), m_lock.group(2)
             if ident not in env or ident not in fat_idents:
                 continue
             is_defer = bool(re.search(
-                rf"\bdefer\s+{re.escape(ident)}\.", code
+                rf"\bdefer\s+{re.escape(ident)}(?:\.\?)?\.", code
             ))
             # `try ident.lock()` is the usual form because SlabRef.lock
             # returns `AccessError!*T`. That's a call site detail; the
@@ -1312,6 +1401,13 @@ def _walk_body(
             after = code[m_tok.end():]
             # Atomic method op (receiver is the `tail` field of a slab obj)
             if ATOMIC_METHOD_RE.match(after):
+                continue
+            # SlabRef(T) gen-lock primitives are lock ops, not accesses.
+            # `.lock()` / `.unlock()` on a fat ident is recorded separately
+            # by the lock-op matcher — recording it ALSO as an access makes
+            # it collide with itself in bracket_check (lock on line N gets
+            # accepted only if a prior lock exists on line N-1).
+            if ident in fat_idents and tail in ("lock", "unlock") and re.match(r"\s*\(", after):
                 continue
             if re.match(r"\s*\(", after):
                 call_spans.append((m_tok.start(), m_tok.end(), ident, tail))

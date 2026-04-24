@@ -637,8 +637,8 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
             caller_thread = pc;
             if (reply_cap_transfer) {
                 const cap = getCapPayload(ctx, reply_word_count);
-                // pc.process is SlabRef(Process); .ptr is identity-safe here
-                // because we hold pc's slab lock.
+                // self-alive: pc is locked via cr.lock(); Process outlives
+                // Thread (deinit ordering), so pc.process.ptr is live.
                 reply_cap_err = transferCapability(proc, pc.process.ptr, cap.handle, cap.rights);
             }
             if (reply_cap_err != E_OK) {
