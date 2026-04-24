@@ -44,6 +44,7 @@ const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Process = zag.proc.process.Process;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const slabRefNow = zag.proc.process.slabRefNow;
 const SpinLock = zag.utils.sync.SpinLock;
 const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
@@ -62,9 +63,9 @@ var vm_id_counter: u64 = 1;
 
 pub const Vm = struct {
     _gen_lock: GenLock = .{},
-    vcpus: [MAX_VCPUS]*VCpu = undefined,
+    vcpus: [MAX_VCPUS]SlabRef(VCpu) = undefined,
     num_vcpus: u32 = 0,
-    owner: *Process,
+    owner: SlabRef(Process),
     exit_box: VmExitBox = .{},
     policy: vm_hw.VmPolicy = .{},
     vm_id: u64 = 0,
@@ -94,9 +95,15 @@ pub const Vm = struct {
     /// Destroy this VM: kill all vCPU threads, free guest memory and
     /// arch structures, clear the owner's vm pointer.
     pub fn destroy(self: *Vm) void {
+        // self-alive: the vCPU slots were allocated by this VM at
+        // create time and have not been freed until this loop runs;
+        // no concurrent observer still holds a live ref to them
+        // because the process's perm-table handles are cleared by the
+        // caller (vmCreate rollback / process teardown) before
+        // Vm.destroy runs.
         var i: u32 = 0;
         while (i < self.num_vcpus) {
-            vcpu_mod.destroy(self.vcpus[i]);
+            vcpu_mod.destroy(self.vcpus[i].ptr);
             i += 1;
         }
         self.num_vcpus = 0;
@@ -113,7 +120,14 @@ pub const Vm = struct {
         // goes through the slow path and takes a fresh id.
         vmid_mod.release(self);
 
-        self.owner.vm = null;
+        // Clear owner's vm pointer. The owning Process is the caller of
+        // the syscall that ended up here (vmCreate rollback or teardown
+        // from process exit), so the slot is live — take the gen-lock
+        // rather than reaching through `.ptr`.
+        if (self.owner.lock()) |proc| {
+            proc.vm = null;
+            self.owner.unlock();
+        } else |_| {}
 
         const gen = self._gen_lock.currentGen();
         slab_instance.destroy(self, gen) catch unreachable;
@@ -250,7 +264,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
     // allocator. A `.* = .{...}` would zero it.
     vm_obj.vcpus = undefined;
     vm_obj.num_vcpus = 0;
-    vm_obj.owner = proc;
+    vm_obj.owner = slabRefNow(Process, proc);
     vm_obj.exit_box = .{};
     vm_obj.policy = user_policy.*;
     vm_obj.vm_id = @atomicRmw(u64, &vm_id_counter, .Add, 1, .monotonic);
@@ -284,9 +298,10 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
                 proc.removePerm(inserted_handles[k]) catch {};
                 k += 1;
             }
+            // self-alive: slots were allocated in this loop and not freed.
             var j: u32 = 0;
             while (j < i) {
-                vcpu_mod.destroy(vm_obj.vcpus[j]);
+                vcpu_mod.destroy(vm_obj.vcpus[j].ptr);
                 j += 1;
             }
             stage2.vmFreeStructures(arch_structures);
@@ -294,7 +309,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
             return E_NOMEM;
         };
 
-        vm_obj.vcpus[i] = vcpu_obj;
+        vm_obj.vcpus[i] = SlabRef(VCpu).init(vcpu_obj, vcpu_obj._gen_lock.currentGen());
         vm_obj.num_vcpus = i + 1;
 
         // Per-vCPU vGIC state (PPIs + SGIs) needs initializing once the
@@ -304,15 +319,17 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
         // snapshot is taken on first entry by `vtimer.loadGuest`.
         kvm.vtimer.initVcpu(&vcpu_obj.vtimer_state);
 
-        const handle_id = proc.insertThreadHandle(vcpu_obj.thread, ThreadHandleRights.full) catch {
+        // self-alive: vcpu_obj was just returned by vcpu_mod.create.
+        const handle_id = proc.insertThreadHandle(vcpu_obj.thread.ptr, ThreadHandleRights.full) catch {
             var k: u32 = 0;
             while (k < inserted_count) {
                 proc.removePerm(inserted_handles[k]) catch {};
                 k += 1;
             }
+            // self-alive: slots were allocated in this loop and not freed.
             var j: u32 = 0;
             while (j <= i) {
-                vcpu_mod.destroy(vm_obj.vcpus[j]);
+                vcpu_mod.destroy(vm_obj.vcpus[j].ptr);
                 j += 1;
             }
             stage2.vmFreeStructures(arch_structures);
@@ -472,9 +489,13 @@ pub fn intcDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
 // ---------------------------------------------------------------------------
 
 fn kickRunningVcpus(vm_obj: *Vm) void {
-    for (vm_obj.vcpus[0..vm_obj.num_vcpus]) |vcpu_obj| {
+    for (vm_obj.vcpus[0..vm_obj.num_vcpus]) |vcpu_ref| {
+        const vcpu_obj = vcpu_ref.lock() catch continue;
+        defer vcpu_ref.unlock();
         if (vcpu_obj.loadState() == .running) {
-            if (sched.coreRunning(vcpu_obj.thread)) |core_id| {
+            const thread = vcpu_obj.thread.lock() catch continue;
+            defer vcpu_obj.thread.unlock();
+            if (sched.coreRunning(thread)) |core_id| {
                 gic.sendSchedulerIpi(core_id);
             }
         }

@@ -75,7 +75,12 @@ pub fn classifyFsc(fsc: u8) FaultKind {
 /// mode) or transitions the vCPU to `.exited` and queues it on the
 /// exit box for VMM delivery.
 pub fn handleExit(vcpu_obj: *VCpu, exit_info: vm_hw.VmExitInfo) void {
-    const vm_obj = vcpu_obj.vm;
+    // handleExit runs on the vCPU's own thread (`vcpu_obj.thread`).
+    // While the thread is executing here the Vm it belongs to cannot
+    // be destroyed — Vm.destroy waits for its vCPU threads via
+    // removeFromAnyRunQueue + exited state.
+    // self-alive: owning Vm kept live by the vcpu thread's run loop.
+    const vm_obj = vcpu_obj.vm.ptr;
 
     switch (exit_info) {
         .stage2_fault => |fault| {

@@ -43,8 +43,8 @@ pub var slab_instance: VCpuAllocator = undefined;
 
 pub const VCpu = struct {
     _gen_lock: GenLock = .{},
-    thread: *Thread,
-    vm: *Vm,
+    thread: SlabRef(Thread),
+    vm: SlabRef(Vm),
     guest_state: vm_hw.GuestState = .{},
     /// Atomic state. Use `loadState`/`storeState` -- direct `.state = ...`
     /// writes are still allowed inside regions already holding `vm.lock`,
@@ -96,7 +96,10 @@ pub fn create(vm_obj: *Vm) !*VCpu {
     const vcpu_obj = vcpu_alloc.ptr;
     errdefer slab_instance.destroy(vcpu_obj, vcpu_alloc.gen) catch unreachable;
 
-    const proc = vm_obj.owner;
+    // Caller (vmCreate) holds the owning Process live for the entire
+    // duration of this syscall — the Process is the syscall caller.
+    // self-alive: owning Process is the syscall caller.
+    const proc = vm_obj.owner.ptr;
 
     // Allocate a thread from the existing ThreadAllocator
     const thread_alloc = try thread_mod.slab_instance.create();
@@ -155,8 +158,8 @@ pub fn create(vm_obj: *Vm) !*VCpu {
     proc._gen_lock.unlock();
 
     // Field-by-field to preserve `vcpu_obj._gen_lock`.
-    vcpu_obj.thread = thread;
-    vcpu_obj.vm = vm_obj;
+    vcpu_obj.thread = SlabRef(Thread).init(thread, thread._gen_lock.currentGen());
+    vcpu_obj.vm = SlabRef(Vm).init(vm_obj, vm_obj._gen_lock.currentGen());
     vcpu_obj.guest_state = .{};
     vcpu_obj.state = .idle;
     vcpu_obj.last_exit_info = .{ .unknown = 0 };
@@ -167,7 +170,11 @@ pub fn create(vm_obj: *Vm) !*VCpu {
 
 /// Destroy a vCPU: kill its thread and free the struct.
 pub fn destroy(vcpu_obj: *VCpu) void {
-    const thread = vcpu_obj.thread;
+    // vcpu_obj and its paired Thread are being torn down together here;
+    // the caller (Vm.destroy / vmCreate error unwind) has already
+    // ensured no concurrent observer holds the vCPU.
+    // self-alive: caller guarantees no concurrent observer holds vcpu_obj.
+    const thread = vcpu_obj.thread.ptr;
 
     // Mark thread as exited so scheduler won't run it
     thread.state = .exited;
@@ -202,11 +209,10 @@ pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
     if (vcpu_obj.loadState() != .idle) return E_BUSY;
 
     vcpu_obj.storeState(.running);
-    const thread = vcpu_obj.thread;
-    thread._gen_lock.lock();
+    const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
+    defer vcpu_obj.thread.unlock();
     thread.state = .ready;
     const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
-    thread._gen_lock.unlock();
     sched.enqueueOnCore(target_core, thread);
 
     return 0; // E_OK
@@ -266,7 +272,8 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
 
     // If running, IPI to suspend and snapshot
     if (state_snapshot == .running) {
-        const thread = vcpu_obj.thread;
+        const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
+        defer vcpu_obj.thread.unlock();
         if (sched.coreRunning(thread)) |core_id| {
             apic.sendSchedulerIpi(core_id);
             // Spin until the thread is off CPU
@@ -283,11 +290,10 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
 
     // Resume if it was running
     if (state_snapshot == .running) {
-        const thread = vcpu_obj.thread;
-        thread._gen_lock.lock();
+        const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
+        defer vcpu_obj.thread.unlock();
         thread.state = .ready;
         const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
-        thread._gen_lock.unlock();
         sched.enqueueOnCore(target_core, thread);
     }
 
@@ -331,11 +337,17 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     if (interrupt.vector < 32) return E_INVAL;
 
     if (state_snapshot == .running) {
-        const thread = vcpu_obj.thread;
-        // IPI to suspend
-        if (sched.coreRunning(thread)) |core_id| {
-            apic.sendSchedulerIpi(core_id);
-            while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+        // Suspend phase. Scope the thread's gen-lock tightly so we do
+        // not hold it across `vm_obj._gen_lock` below — the established
+        // lock order is (vm, then thread).
+        {
+            const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
+            defer vcpu_obj.thread.unlock();
+            // IPI to suspend
+            if (sched.coreRunning(thread)) |core_id| {
+                apic.sendSchedulerIpi(core_id);
+                while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+            }
         }
         vm_obj._gen_lock.lock();
         // If the vCPU entry loop (or a prior injection) already queued a
@@ -347,10 +359,11 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
             vm_hw.injectInterrupt(&vcpu_obj.guest_state, interrupt);
         }
         vm_obj._gen_lock.unlock();
-        thread._gen_lock.lock();
+        // Resume phase.
+        const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
+        defer vcpu_obj.thread.unlock();
         thread.state = .ready;
         const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else apic.coreID();
-        thread._gen_lock.unlock();
         sched.enqueueOnCore(target_core, thread);
     } else {
         // Not running — write pending interrupt into arch state
@@ -367,9 +380,14 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
 }
 
 /// Find the VCpu that owns a given thread within a VM.
+/// Callers must hold `vm_obj._gen_lock`, which serializes with Vm
+/// destroy and keeps every live `vm_obj.vcpus[i]` slot alive for the
+/// duration of the lookup. self-alive: the vCPU slots indexed
+/// [0, num_vcpus) were allocated during vmCreate and are only freed
+/// via Vm.destroy, which takes the same lock.
 pub fn vcpuFromThread(vm_obj: *Vm, thread: *Thread) ?*VCpu {
     for (vm_obj.vcpus[0..vm_obj.num_vcpus]) |v| {
-        if (v.thread == thread) return v;
+        if (v.ptr.thread.ptr == thread) return v.ptr;
     }
     return null;
 }

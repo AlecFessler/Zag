@@ -127,17 +127,25 @@ pub fn queueOrDeliver(box: *VmExitBox, vm_obj: *Vm, vcpu_obj: *VCpu) void {
             box.lock.unlock();
         }
     } else {
-        box.enqueueLocked(vcpu_obj.thread);
+        // This is the vcpu's own thread calling into the exit path —
+        // the Thread slot is live by definition.
+        // self-alive: caller IS vcpu_obj.thread.
+        box.enqueueLocked(vcpu_obj.thread.ptr);
         box.lock.unlock();
     }
 }
 
 fn deliverExit(vm_obj: *Vm, vcpu_obj: *VCpu, receiver: *Thread) void {
-    const owner = vm_obj.owner;
-    const handle_id = owner.findThreadHandle(vcpu_obj.thread) orelse return;
+    // Owning Process is kept alive for the life of this VM; Vm.destroy
+    // clears `proc.vm` under the process's gen-lock before tearing the
+    // VM down.
+    // self-alive: owning Process held live by this VM.
+    const owner = vm_obj.owner.ptr;
+    // self-alive: vcpu_obj.thread is the caller's own vcpu thread.
+    const handle_id = owner.findThreadHandle(vcpu_obj.thread.ptr) orelse return;
 
     for (vm_obj.vcpus[0..vm_obj.num_vcpus], 0..) |v, i| {
-        if (v == vcpu_obj) {
+        if (v.ptr == vcpu_obj) {
             const box = vm_obj.exitBox();
             box.lock.lock();
             box.markPendingLocked(@intCast(i));
@@ -396,7 +404,7 @@ fn readUserBytes(proc: *Process, user_va: u64, buf: []u8) bool {
 
 fn vcpuIndex(vm_obj: *Vm, vcpu_obj: *VCpu) ?u32 {
     for (vm_obj.vcpus[0..vm_obj.num_vcpus], 0..) |v, i| {
-        if (v == vcpu_obj) return @intCast(i);
+        if (v.ptr == vcpu_obj) return @intCast(i);
     }
     return null;
 }

@@ -24,7 +24,12 @@ pub fn handleExit(vcpu_obj: *VCpu, exit_info: vm_hw.VmExitInfo) void {
     kprof.enter(.vm_exit);
     defer kprof.exit(.vm_exit);
     kprof.point(.vm_exit, @intFromEnum(std.meta.activeTag(exit_info)));
-    const vm_obj = vcpu_obj.vm;
+    // handleExit runs on the vCPU's own thread, which is
+    // `vcpu_obj.thread`. While the thread is executing here the Vm it
+    // belongs to cannot be destroyed (Vm.destroy waits for its vCPU
+    // threads via removeFromAnyRunQueue + exited state).
+    // self-alive: owning Vm kept live by the vcpu thread's run loop.
+    const vm_obj = vcpu_obj.vm.ptr;
 
     // Try kernel-handled exits first
     switch (exit_info) {

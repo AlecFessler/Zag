@@ -71,8 +71,8 @@ pub const VCpuState = enum(u8) {
 
 pub const VCpu = struct {
     _gen_lock: GenLock = .{},
-    thread: *Thread,
-    vm: *Vm,
+    thread: SlabRef(Thread),
+    vm: SlabRef(Vm),
     guest_state: vm_hw.GuestState = .{},
     /// Atomic state. Use `loadState`/`storeState`. Direct writes are only
     /// allowed inside regions already holding `vm.lock`.
@@ -118,7 +118,10 @@ pub fn create(vm_obj: *Vm) !*VCpu {
     const vcpu_obj = vcpu_alloc.ptr;
     errdefer slab_instance.destroy(vcpu_obj, vcpu_alloc.gen) catch unreachable;
 
-    const proc = vm_obj.owner;
+    // Caller (vmCreate) holds the owning Process live for the entire
+    // duration of this syscall — the Process is the syscall caller.
+    // self-alive: owning Process is the syscall caller.
+    const proc = vm_obj.owner.ptr;
 
     const thread_alloc = try thread_mod.slab_instance.create();
     const thread = thread_alloc.ptr;
@@ -175,8 +178,8 @@ pub fn create(vm_obj: *Vm) !*VCpu {
     proc._gen_lock.unlock();
 
     // Field-by-field to preserve `vcpu_obj._gen_lock`.
-    vcpu_obj.thread = thread;
-    vcpu_obj.vm = vm_obj;
+    vcpu_obj.thread = SlabRef(Thread).init(thread, thread._gen_lock.currentGen());
+    vcpu_obj.vm = SlabRef(Vm).init(vm_obj, vm_obj._gen_lock.currentGen());
     vcpu_obj.guest_state = .{};
     vcpu_obj.state = std.atomic.Value(u8).init(@intFromEnum(VCpuState.idle));
     vcpu_obj.last_exit_info = .{ .unknown = 0 };
@@ -190,7 +193,11 @@ pub fn create(vm_obj: *Vm) !*VCpu {
 
 /// Destroy a vCPU: kill its thread and free the struct.
 pub fn destroy(vcpu_obj: *VCpu) void {
-    const thread = vcpu_obj.thread;
+    // vcpu_obj and its paired Thread are being torn down together here;
+    // the caller (Vm.destroy / vmCreate error unwind) has already
+    // ensured no concurrent observer holds the vCPU.
+    // self-alive: caller guarantees no concurrent observer holds vcpu_obj.
+    const thread = vcpu_obj.thread.ptr;
 
     thread.state = .exited;
 
@@ -205,9 +212,14 @@ pub fn destroy(vcpu_obj: *VCpu) void {
 }
 
 /// Find the VCpu that owns a given thread within a VM.
+/// Callers must hold `vm_obj._gen_lock`, which serializes with Vm
+/// destroy and keeps every live `vm_obj.vcpus[i]` slot alive for the
+/// duration of the lookup. self-alive: the vCPU slots indexed
+/// [0, num_vcpus) were allocated during vmCreate and are only freed
+/// via Vm.destroy, which takes the same lock.
 pub fn vcpuFromThread(vm_obj: *Vm, thread: *Thread) ?*VCpu {
     for (vm_obj.vcpus[0..vm_obj.num_vcpus]) |v| {
-        if (v.thread == thread) return v;
+        if (v.ptr.thread.ptr == thread) return v.ptr;
     }
     return null;
 }
@@ -329,11 +341,10 @@ pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
     if (vcpu_obj.loadState() != .idle) return E_BUSY;
 
     vcpu_obj.storeState(.running);
-    const thread = vcpu_obj.thread;
-    thread._gen_lock.lock();
+    const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
+    defer vcpu_obj.thread.unlock();
     thread.state = .ready;
     const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
-    thread._gen_lock.unlock();
     sched.enqueueOnCore(target_core, thread);
 
     return 0; // E_OK
@@ -389,7 +400,8 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
 
     // If running, IPI to suspend so we get a stable snapshot.
     if (state_snapshot == .running) {
-        const thread = vcpu_obj.thread;
+        const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
+        defer vcpu_obj.thread.unlock();
         if (sched.coreRunning(thread)) |core_id| {
             gic.sendSchedulerIpi(core_id);
             while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
@@ -403,11 +415,10 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     if (!write_ok) return E_BADADDR;
 
     if (state_snapshot == .running) {
-        const thread = vcpu_obj.thread;
-        thread._gen_lock.lock();
+        const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
+        defer vcpu_obj.thread.unlock();
         thread.state = .ready;
         const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
-        thread._gen_lock.unlock();
         sched.enqueueOnCore(target_core, thread);
     }
 
@@ -445,18 +456,25 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     const interrupt = std.mem.bytesAsValue(vm_hw.GuestInterrupt, &int_buf).*;
 
     if (state_snapshot == .running) {
-        const thread = vcpu_obj.thread;
-        if (sched.coreRunning(thread)) |core_id| {
-            gic.sendSchedulerIpi(core_id);
-            while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+        // Suspend phase. Bracket just the scheduler interaction so we
+        // do not hold the thread's gen-lock across `vm_obj._gen_lock`
+        // below — the established lock order is (vm, then thread).
+        {
+            const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
+            defer vcpu_obj.thread.unlock();
+            if (sched.coreRunning(thread)) |core_id| {
+                gic.sendSchedulerIpi(core_id);
+                while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+            }
         }
         vm_obj._gen_lock.lock();
         injectInterrupt(&vcpu_obj.guest_state, interrupt);
         vm_obj._gen_lock.unlock();
-        thread._gen_lock.lock();
+        // Resume phase.
+        const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
+        defer vcpu_obj.thread.unlock();
         thread.state = .ready;
         const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
-        thread._gen_lock.unlock();
         sched.enqueueOnCore(target_core, thread);
     } else {
         vm_obj._gen_lock.lock();
