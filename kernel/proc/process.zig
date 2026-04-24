@@ -243,7 +243,11 @@ pub const Process = struct {
         // Clear all thread-handle slots in self.perm_table that belong to target.
         self.perm_lock.lock();
         for (&self.perm_table) |*slot| {
-            if (slot.object == .thread and slot.object.thread.ptr.process == target) {
+            // self-alive: iterating our own perm_table under perm_lock.
+            // The `.thread` SlabRef pairs a *Thread with its capture gen;
+            // comparing `.ptr.process.ptr` to `target` is a pure address
+            // match and doesn't deref unsafely.
+            if (slot.object == .thread and slot.object.thread.ptr.process.ptr == target) {
                 slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
             }
@@ -271,9 +275,8 @@ pub const Process = struct {
         self.fault_box.lock.lock();
         if (self.fault_box.isPendingReply()) {
             if (self.fault_box.pending_thread) |pt| {
-                // self-alive: pt is a Thread in the fault box; Agent-Thread
-                // owns migration of Thread.process to SlabRef.
-                if (pt.process == target) {
+                // self-alive: pt is a live pointer owned by the fault box.
+                if (pt.process.ptr == target) {
                     _ = self.fault_box.endPendingReplyLocked();
                 }
             }
@@ -464,7 +467,10 @@ pub const Process = struct {
                 .thread => |r| if (r.ptr == faulted) {
                     thread_h = slot.handle;
                 },
-                .process => |r| if (r.ptr == faulted.process) {
+                // self-alive: `faulted` is owned by its caller for the
+                // duration of fault delivery; its `.process` SlabRef
+                // points at the live owning Process.
+                .process => |r| if (r.ptr == faulted.process.ptr) {
                     proc_h = slot.handle;
                 },
                 else => {},
@@ -482,7 +488,9 @@ pub const Process = struct {
         // is the first syscall argument (preserved from syscall entry).
         const buf_ptr = arch.syscall.getSyscallArgs(receiver.ctx).arg0;
         const handles = lookupHandlesForFault(handler, faulted);
-        writeFaultMessageInto(receiver.process, buf_ptr, handles.proc_h, handles.thread_h, faulted);
+        // self-alive: `receiver` is a live blocked thread owned by the
+        // fault box; its owning process is alive while it's blocked.
+        writeFaultMessageInto(receiver.process.ptr, buf_ptr, handles.proc_h, handles.thread_h, faulted);
         // Set the syscall return value: fault_recv returns the thread
         // handle (= the fault token) on success.
         arch.syscall.setSyscallReturn(receiver.ctx, handles.thread_h);
@@ -814,7 +822,12 @@ pub const Process = struct {
             if (thread.futex_paddr.addr != 0) {
                 futex.removeBlockedThread(thread);
             }
-            if (thread.ipc_server) |server| {
+            if (thread.ipc_server) |server_ref| {
+                // self-alive: kill() is tearing down all threads of `self`
+                // and holds no external lock; the server pointer is the
+                // ipc_server we ourselves stored and must outlive the
+                // reply-wait state we're now draining.
+                const server = server_ref.ptr;
                 server.msg_box.lock.lock();
                 if (server.msg_box.isPendingReply() and server.msg_box.pending_thread == thread) {
                     _ = server.msg_box.endPendingReplyLocked();
@@ -983,8 +996,10 @@ pub const Process = struct {
                 handler.perm_lock.lock();
                 for (&handler.perm_table) |*slot| {
                     if (slot.object == .thread) {
+                        // self-alive: walking handler's perm table under
+                        // perm_lock; the thread SlabRef is stable while held.
                         const t = slot.object.thread.ptr;
-                        if (t.process == self) {
+                        if (t.process.ptr == self) {
                             slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                             handler.perm_count -= 1;
                         }
@@ -1000,7 +1015,8 @@ pub const Process = struct {
                 handler.fault_box.lock.lock();
                 if (handler.fault_box.isPendingReply()) {
                     if (handler.fault_box.pending_thread) |pt| {
-                        if (pt.process == self) {
+                        // self-alive: pt owned by the fault box while held.
+                        if (pt.process.ptr == self) {
                             _ = handler.fault_box.endPendingReplyLocked();
                         }
                     }
@@ -1156,7 +1172,11 @@ pub const Process = struct {
 
         // Clean up threads that are blocked waiting for reply from other processes
         for (self.threads[0..self.num_threads]) |thread| {
-            if (thread.ipc_server) |server| {
+            if (thread.ipc_server) |server_ref| {
+                // self-alive: same rationale as the kill() branch — we
+                // ourselves stored this ipc_server, and it outlives the
+                // reply state we're draining.
+                const server = server_ref.ptr;
                 server.msg_box.lock.lock();
                 if (server.msg_box.isPendingReply() and server.msg_box.pending_thread == thread) {
                     _ = server.msg_box.endPendingReplyLocked();
@@ -1203,7 +1223,8 @@ pub const Process = struct {
                 // Drop pending_thread if it points at one of ours.
                 if (handler.fault_box.isPendingReply()) {
                     if (handler.fault_box.pending_thread) |pt| {
-                        if (pt.process == self) {
+                        // self-alive: pt is owned by the fault box.
+                        if (pt.process.ptr == self) {
                             _ = handler.fault_box.endPendingReplyLocked();
                         }
                     }

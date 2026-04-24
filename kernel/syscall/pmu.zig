@@ -132,7 +132,9 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     const slice = readConfigs(proc, configs_ptr, count, &configs) catch |err| return configErrToCode(err);
 
     target_thread._gen_lock.lock();
-    const target_proc = target_thread.process;
+    // self-alive: we hold `target_thread._gen_lock`; its `.process`
+    // SlabRef addresses a live Process slot under that lock.
+    const target_proc = target_thread.process.ptr;
     target_thread._gen_lock.unlock();
 
     target_proc._gen_lock.lock();
@@ -192,7 +194,9 @@ pub fn sysPmuRead(proc: *Process, thread_handle: u64, sample_ptr: u64) i64 {
     const target_thread = lookupThread(proc, thread_handle) orelse return E_BADCAP;
 
     target_thread._gen_lock.lock();
-    const target_proc = target_thread.process;
+    // self-alive: we hold `target_thread._gen_lock`; its `.process`
+    // SlabRef addresses a live Process slot under that lock.
+    const target_proc = target_thread.process.ptr;
     target_thread._gen_lock.unlock();
 
     // Snapshot into a stack-local buffer under the gen-lock, then drop
@@ -237,7 +241,9 @@ pub fn sysPmuReset(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     const slice = readConfigs(proc, configs_ptr, count, &configs) catch |err| return configErrToCode(err);
 
     target_thread._gen_lock.lock();
-    const target_proc = target_thread.process;
+    // self-alive: we hold `target_thread._gen_lock`; its `.process`
+    // SlabRef addresses a live Process slot under that lock.
+    const target_proc = target_thread.process.ptr;
     target_thread._gen_lock.unlock();
 
     target_proc._gen_lock.lock();
@@ -272,7 +278,9 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
     const target_thread = lookupThread(proc, thread_handle) orelse return E_BADCAP;
 
     target_thread._gen_lock.lock();
-    const target_proc = target_thread.process;
+    // self-alive: we hold `target_thread._gen_lock`; its `.process`
+    // SlabRef addresses a live Process slot under that lock.
+    const target_proc = target_thread.process.ptr;
     target_thread._gen_lock.unlock();
 
     target_proc._gen_lock.lock();

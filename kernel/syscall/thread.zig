@@ -197,7 +197,9 @@ pub fn sysThreadSuspend(thread_handle: u64) i64 {
     if (!pinned.entry.threadHandleRights().@"suspend") return E_PERM;
 
     target._gen_lock.lock();
-    const target_proc = target.process;
+    // self-alive: we hold `target._gen_lock`; its `.process` SlabRef
+    // addresses a live Process slot under that lock.
+    const target_proc = target.process.ptr;
     target._gen_lock.unlock();
 
     target_proc._gen_lock.lock();
@@ -276,7 +278,9 @@ pub fn sysThreadResume(thread_handle: u64) i64 {
     if (!pinned.entry.threadHandleRights().@"resume") return E_PERM;
 
     target._gen_lock.lock();
-    const target_proc = target.process;
+    // self-alive: we hold `target._gen_lock`; its `.process` SlabRef
+    // addresses a live Process slot under that lock.
+    const target_proc = target.process.ptr;
     target._gen_lock.unlock();
 
     target_proc._gen_lock.lock();
@@ -308,7 +312,9 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
     const cur = sched.currentThread().?;
 
     target._gen_lock.lock();
-    const target_proc = target.process;
+    // self-alive: we hold `target._gen_lock`; its `.process` SlabRef
+    // addresses a live Process slot under that lock.
+    const target_proc = target.process.ptr;
     target._gen_lock.unlock();
 
     target_proc._gen_lock.lock();
@@ -360,7 +366,10 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
     // holding a dangling *Thread — the same UAF class that scrubFromFaultBox
     // fixes for the fault box. Mirrors Process.kill()'s blocked-thread
     // cleanup loop.
-    if (target.ipc_server) |server| {
+    if (target.ipc_server) |server_ref| {
+        // self-alive: ipc_server was stored on the send/call path and
+        // outlives the reply-wait we are tearing down now.
+        const server = server_ref.ptr;
         server.msg_box.lock.lock();
         if (server.msg_box.isPendingReply() and server.msg_box.pending_thread == target) {
             _ = server.msg_box.endPendingReplyLocked();

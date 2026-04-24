@@ -1,9 +1,10 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const ThreadPriorityQueue = zag.sched.thread.ThreadPriorityQueue;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
+const ThreadPriorityQueue = zag.sched.thread.ThreadPriorityQueue;
 
 /// A unified message box used for both IPC message passing and fault delivery.
 ///
@@ -76,12 +77,15 @@ pub const MessageBox = struct {
             var prev: ?*Thread = null;
             var cur = level.head;
             while (cur) |c| {
-                const next = c.next;
-                if (c.process == proc) {
+                // self-alive: a waiter is kept alive by the queue that
+                // owns it; both `c.next` and `c.process` resolve to
+                // live slots until we unlink.
+                const next_ptr: ?*Thread = if (c.next) |r| r.ptr else null;
+                if (c.process.ptr == proc) {
                     if (prev) |p| {
-                        p.next = next;
+                        p.next = if (next_ptr) |np| SlabRef(Thread).init(np, np._gen_lock.currentGen()) else null;
                     } else {
-                        level.head = next;
+                        level.head = next_ptr;
                     }
                     if (level.tail == c) {
                         level.tail = prev;
@@ -90,7 +94,7 @@ pub const MessageBox = struct {
                 } else {
                     prev = c;
                 }
-                cur = next;
+                cur = next_ptr;
             }
         }
     }

@@ -451,12 +451,14 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // external abort) cannot come from a vbar node, so skip the
             // lookup entirely to keep the hot path lean.
             if (scheduler.currentThread()) |thread| {
-                if (thread.process.vmm.findNode(VAddr.fromInt(far))) |node| {
+                // self-alive: currentThread() is running on this core.
+                const proc = thread.process.ptr;
+                if (proc.vmm.findNode(VAddr.fromInt(far))) |node| {
                     node._gen_lock.lock();
                     const is_virtual_bar = node.kind == .virtual_bar;
                     node._gen_lock.unlock();
                     if (is_virtual_bar) {
-                        emulateVirtualBar(ctx, node, far, thread.process);
+                        emulateVirtualBar(ctx, node, far, proc);
                         return;
                     }
                 }
@@ -766,15 +768,17 @@ fn dispatchIrq(intid: u32, ctx: *ArchCpuContext, privilege: zag.perms.privilege.
 fn faultOrKillUser(ctx: *ArchCpuContext, reason: FaultReason, fault_addr: u64) void {
     const thread = scheduler.currentThread() orelse
         @panic("user exception with no current thread");
+    // self-alive: currentThread() is this core's running thread.
+    const proc = thread.process.ptr;
     serial.print("K: EXCEPTION pid={d} EC reason={d} addr=0x{x}\n", .{
-        thread.process.pid, @intFromEnum(reason), fault_addr,
+        proc.pid, @intFromEnum(reason), fault_addr,
     });
-    if (thread.process.faultBlock(thread, reason, fault_addr, ctx.elr_el1, ctx)) {
+    if (proc.faultBlock(thread, reason, fault_addr, ctx.elr_el1, ctx)) {
         cpu.enableInterrupts();
         scheduler.yield();
         return;
     }
-    thread.process.kill(reason);
+    proc.kill(reason);
     cpu.enableInterrupts();
     while (true) cpu.halt();
 }

@@ -181,12 +181,15 @@ fn exceptionHandler(ctx: *cpu.Context) void {
         if (exceptionFaultReason(vector)) |reason| {
             const thread = scheduler.currentThread() orelse
                 @panic("user exception with no current thread");
-            if (thread.process.faultBlock(thread, reason, ctx.rip, ctx.rip, ctx)) {
+            // self-alive: currentThread() is running on this core; its
+            // owning Process is alive across this exception path.
+            const proc = thread.process.ptr;
+            if (proc.faultBlock(thread, reason, ctx.rip, ctx.rip, ctx)) {
                 cpu.enableInterrupts();
                 scheduler.yield();
                 return;
             }
-            thread.process.kill(reason);
+            proc.kill(reason);
             cpu.enableInterrupts();
             while (true) cpu.halt();
         }
@@ -232,12 +235,15 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
     if (from_user and !pf_err.present) {
         const thread = scheduler.currentThread() orelse
             @panic("user page fault with no current thread");
-        if (thread.process.vmm.findNode(VAddr.fromInt(faulting_addr))) |node| {
+        // self-alive: currentThread() runs on this core; its owning
+        // Process is alive across this PF handler.
+        const proc = thread.process.ptr;
+        if (proc.vmm.findNode(VAddr.fromInt(faulting_addr))) |node| {
             node._gen_lock.lock();
             const is_virtual_bar = node.kind == .virtual_bar;
             node._gen_lock.unlock();
             if (is_virtual_bar) {
-                emulateVirtualBar(ctx, node, faulting_addr, thread.process);
+                emulateVirtualBar(ctx, node, faulting_addr, proc);
                 return;
             }
         }

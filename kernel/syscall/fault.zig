@@ -108,7 +108,9 @@ fn lookupFaultHandles(handler: *Process, faulted: *Thread) struct { proc_h: u64,
             .thread => |r| if (r.ptr == faulted) {
                 thread_h = slot.handle;
             },
-            .process => |r| if (r.ptr == faulted.process) {
+            // self-alive: `faulted` is owned for fault delivery; its
+            // `.process` SlabRef points at the live owning Process.
+            .process => |r| if (r.ptr == faulted.process.ptr) {
                 proc_h = slot.handle;
             },
             else => {},
@@ -148,7 +150,9 @@ pub fn sysFaultRecv(ctx: *ArchCpuContext, buf_ptr: u64, blocking: u64) SyscallRe
     kprof.enter(.sys_fault_recv);
     defer kprof.exit(.sys_fault_recv);
     const thread = sched.currentThread().?;
-    const proc = thread.process;
+    // self-alive: currentThread() is running on this core; its
+    // owning Process is alive for the duration of this syscall.
+    const proc = thread.process.ptr;
 
     if (!faultHandlerCheck(proc)) return .{ .ret = E_PERM };
 
@@ -318,7 +322,10 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
         proc.perm_lock.unlock();
     }
 
-    const src = pending.process;
+    // self-alive: `pending` is the handler's pending fault thread,
+    // still referenced by the fault box until we deinit it; its
+    // owning Process is alive throughout this reply path.
+    const src = pending.process.ptr;
 
     // §2.12.23: on ANY fault_reply, release all .suspended siblings before
     // applying the action on the faulting thread.
@@ -365,7 +372,11 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
             if (pending.futex_paddr.addr != 0) {
                 futex.removeBlockedThread(pending);
             }
-            if (pending.ipc_server) |server| {
+            if (pending.ipc_server) |server_ref| {
+                // self-alive: we stored `ipc_server` ourselves on the
+                // send/call path; it outlives the reply-wait we are
+                // tearing down now.
+                const server = server_ref.ptr;
                 server.msg_box.lock.lock();
                 if (server.msg_box.isPendingReply() and server.msg_box.pending_thread == pending) {
                     _ = server.msg_box.endPendingReplyLocked();
@@ -539,7 +550,9 @@ pub fn sysFaultSetThreadMode(thread_handle: u64, mode: u64) i64 {
     //   2. Self-handling:    target_proc == proc AND proc's slot 0 has
     //                        the fault_handler ProcessRights bit set.
     target_thread._gen_lock.lock();
-    const target_proc = target_thread.process;
+    // self-alive: we hold the thread's gen-lock; its `.process`
+    // SlabRef addresses a live Process slot under that lock.
+    const target_proc = target_thread.process.ptr;
     target_thread._gen_lock.unlock();
     target_proc._gen_lock.lock();
     const handler_ok = if (target_proc.fault_handler_proc) |h_ref|

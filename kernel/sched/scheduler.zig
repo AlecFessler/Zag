@@ -202,7 +202,11 @@ pub fn currentThread() ?*Thread {
 }
 
 pub fn currentProc() *Process {
-    return currentThread().?.process;
+    // self-alive: currentThread() returns a thread dispatched on this
+    // core; its `.process` SlabRef points at a live Process slot (the
+    // owning Process holds the thread alive for the duration of its
+    // execution). A concurrent free would have to unscheduled us first.
+    return currentThread().?.process.ptr;
 }
 
 /// Snapshot the idle/busy nanosecond accounting for `core_id`, zeroing
@@ -261,7 +265,10 @@ fn peekHighestStealable(pq: *const ThreadPriorityQueue, core_id: u6) ?*Thread {
             } else {
                 return c;
             }
-            cur = c.next;
+            // self-alive: this chain walks a per-core run queue we are
+            // inspecting under rq_lock; queued threads cannot be freed
+            // while linked, so the SlabRef will not go stale.
+            cur = if (c.next) |r| r.ptr else null;
         }
     }
     return null;
@@ -911,7 +918,7 @@ pub fn perCoreInit() void {
     idle_thread.ctx = undefined;
     idle_thread.kernel_stack = undefined;
     idle_thread.user_stack = null;
-    idle_thread.process = idle_process;
+    idle_thread.process = SlabRef(Process).init(idle_process, idle_process._gen_lock.currentGen());
     idle_thread.next = null;
     idle_thread.priority = .idle;
     idle_thread.pre_pin_priority = .normal;

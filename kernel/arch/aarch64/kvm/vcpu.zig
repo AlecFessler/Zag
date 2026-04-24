@@ -48,6 +48,7 @@ const GenLock = zag.memory.allocators.secure_slab.GenLock;
 const PAddr = zag.memory.address.PAddr;
 const Process = zag.proc.process.Process;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
@@ -129,7 +130,7 @@ pub fn create(vm_obj: *Vm) !*VCpu {
     thread.ctx = undefined;
     thread.kernel_stack = undefined;
     thread.user_stack = null;
-    thread.process = proc;
+    thread.process = SlabRef(Process).init(proc, proc._gen_lock.currentGen());
     thread.next = null;
     thread.priority = .normal;
     thread.pre_pin_priority = .normal;
@@ -244,7 +245,10 @@ pub fn injectInterrupt(guest_state: *vm_hw.GuestState, interrupt: vm_hw.GuestInt
 /// killed or transitions out of `.running`.
 fn vcpuEntryPoint() void {
     const thread = sched.currentThread().?;
-    const vm_obj = thread.process.vm.?;
+    // self-alive: this is the vCPU's own thread entry — the process
+    // that owns it (and its `vm`) is alive for the whole lifetime of
+    // this function; teardown goes through vm.destroy() + deinit.
+    const vm_obj = thread.process.ptr.vm.?;
     const vcpu_obj = vcpuFromThread(vm_obj, thread).?;
 
     while (true) {

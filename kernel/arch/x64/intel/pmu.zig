@@ -390,7 +390,10 @@ fn pmiHandler(ctx: *cpu.Context) void {
     }
 
     const rip_at_pmi = ctx.rip;
-    const delivered = thread.process.faultBlock(
+    // self-alive: PMI fires on the core where `thread` is running;
+    // its owning Process is alive across this handler.
+    const proc = thread.process.ptr;
+    const delivered = proc.faultBlock(
         thread,
         .pmu_overflow,
         rip_at_pmi,
@@ -399,7 +402,7 @@ fn pmiHandler(ctx: *cpu.Context) void {
     );
 
     if (!delivered) {
-        thread.process.kill(.pmu_overflow);
+        proc.kill(.pmu_overflow);
     }
 
     cpu.enableInterrupts();

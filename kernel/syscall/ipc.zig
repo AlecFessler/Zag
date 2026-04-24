@@ -15,6 +15,7 @@ const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Process = zag.proc.process.Process;
 const ProcessHandleRights = zag.perms.permissions.ProcessHandleRights;
 const SharedMemory = zag.memory.shared.SharedMemory;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const State = zag.sched.thread.State;
 const SyscallResult = zag.syscall.dispatch.SyscallResult;
 const Thread = zag.sched.thread.Thread;
@@ -348,7 +349,9 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
     kprof.enter(.sys_ipc_send);
     defer kprof.exit(.sys_ipc_send);
     const thread = sched.currentThread().?;
-    const proc = thread.process;
+    // self-alive: currentThread() is dispatched on this core; its
+    // owning Process is alive across the syscall.
+    const proc = thread.process.ptr;
     const target_handle = arch.syscall.getIpcHandle(ctx);
     const meta = parseIpcMetadata(arch.syscall.getIpcMetadata(ctx));
 
@@ -422,7 +425,9 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
     kprof.enter(.sys_ipc_call);
     defer kprof.exit(.sys_ipc_call);
     const thread = sched.currentThread().?;
-    const proc = thread.process;
+    // self-alive: currentThread() is dispatched on this core; its
+    // owning Process is alive across the syscall.
+    const proc = thread.process.ptr;
     const target_handle = arch.syscall.getIpcHandle(ctx);
     const meta = parseIpcMetadata(arch.syscall.getIpcMetadata(ctx));
 
@@ -471,7 +476,7 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
         }
 
         target_proc.msg_box.beginPendingReplyLocked(thread);
-        thread.ipc_server = target_proc;
+        thread.ipc_server = SlabRef(Process).init(target_proc, target_proc._gen_lock.currentGen());
         target_proc.msg_box.lock.unlock();
 
         // TODO: this should switchToThread directly to the receiver as a
@@ -486,7 +491,7 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
     } else {
         // No receiver — queue on wait list
         target_proc.msg_box.enqueueLocked(thread);
-        thread.ipc_server = target_proc;
+        thread.ipc_server = SlabRef(Process).init(target_proc, target_proc._gen_lock.currentGen());
         target_proc.msg_box.lock.unlock();
 
         thread.state = .blocked;
@@ -503,7 +508,8 @@ pub fn sysIpcRecv(ctx: *ArchCpuContext) SyscallResult {
     kprof.enter(.sys_ipc_recv);
     defer kprof.exit(.sys_ipc_recv);
     const thread = sched.currentThread().?;
-    const proc = thread.process;
+    // self-alive: currentThread() on this core.
+    const proc = thread.process.ptr;
     const blocking = (arch.syscall.getIpcMetadata(ctx) & 0x2) != 0;
 
     proc.msg_box.lock.lock();
@@ -547,7 +553,10 @@ pub fn sysIpcRecv(ctx: *ArchCpuContext) SyscallResult {
     // Handle capability transfer.
     if (waiter_meta.cap_transfer) {
         const cap = getCapPayload(waiter.ctx, waiter_meta.word_count);
-        const cap_result = transferCapability(waiter.process, proc, cap.handle, cap.rights);
+        // self-alive: `waiter` is the dequeued sender we are now
+        // servicing; its owning Process is still alive while the
+        // thread is in the rendezvous.
+        const cap_result = transferCapability(waiter.process.ptr, proc, cap.handle, cap.rights);
         if (cap_result != E_OK) {
             // Put waiter back at head of the queue.
             proc.msg_box.enqueueFrontLocked(waiter);
@@ -573,7 +582,8 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
     kprof.enter(.sys_ipc_reply);
     defer kprof.exit(.sys_ipc_reply);
     const thread = sched.currentThread().?;
-    const proc = thread.process;
+    // self-alive: currentThread() on this core.
+    const proc = thread.process.ptr;
     const reply_meta = arch.syscall.getIpcMetadata(ctx);
     const atomic_recv = (reply_meta & 0x1) != 0;
     const recv_blocking = (reply_meta & 0x2) != 0;
@@ -604,7 +614,10 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
     if (caller_thread) |pc| {
         if (reply_cap_transfer) {
             const cap = getCapPayload(ctx, reply_word_count);
-            reply_cap_err = transferCapability(proc, pc.process, cap.handle, cap.rights);
+            // self-alive: `pc` is the msg_box's pending caller,
+            // still referenced by the box until we unblock it; its
+            // owning Process is alive across the reply.
+            reply_cap_err = transferCapability(proc, pc.process.ptr, cap.handle, cap.rights);
         }
         if (reply_cap_err != E_OK) {
             arch.syscall.setSyscallReturn(pc.ctx, @bitCast(reply_cap_err));
@@ -630,7 +643,10 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
             // and return E_MAXCAP (§2.11.14) — mirrors sysIpcRecv.
             if (waiter_meta.cap_transfer) {
                 const cap = getCapPayload(waiter.ctx, waiter_meta.word_count);
-                const cap_result = transferCapability(waiter.process, proc, cap.handle, cap.rights);
+                // self-alive: `waiter` is the dequeued sender; its
+                // owning Process is alive while the thread is in
+                // the rendezvous.
+                const cap_result = transferCapability(waiter.process.ptr, proc, cap.handle, cap.rights);
                 if (cap_result != E_OK) {
                     proc.msg_box.enqueueFrontLocked(waiter);
                     proc.msg_box.lock.unlock();

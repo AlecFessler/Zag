@@ -15,6 +15,7 @@ const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = address.PAddr;
 const Process = zag.proc.process.Process;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const Stack = stack_mod.Stack;
 const VAddr = address.VAddr;
 
@@ -58,8 +59,8 @@ pub const Thread = struct {
     ctx: *ArchCpuContext,
     kernel_stack: Stack,
     user_stack: ?Stack,
-    process: *Process,
-    next: ?*Thread = null,
+    process: SlabRef(Process),
+    next: ?SlabRef(Thread) = null,
     priority: Priority = .normal,
     pre_pin_priority: Priority = .normal,
     pre_pin_affinity: ?u64 = null,
@@ -77,7 +78,7 @@ pub const Thread = struct {
     futex_paddrs: [64]PAddr = [_]PAddr{PAddr.fromInt(0)} ** 64,
     /// Number of addresses in the current multi-address futex wait.
     futex_bucket_count: u8 = 0,
-    ipc_server: ?*Process = null,
+    ipc_server: ?SlabRef(Process) = null,
     slot_index: u8 = 0,
     /// Fault metadata, valid iff thread.state == .faulted (or the thread
     /// is queued in some fault box's wait queue / pending_thread slot).
@@ -118,7 +119,10 @@ pub const Thread = struct {
     last_fpu_core: ?u8 = null,
 
     pub fn deinit(self: *Thread) void {
-        const proc = self.process;
+        // self-alive: deinit owns teardown of this thread's links; the
+        // slot was reached via currentThread() / exited_thread slot /
+        // sibling enumeration that already established liveness.
+        const proc = self.process.ptr;
 
         // §2.14.9: automatic pmu_stop on thread exit. Serialize with
         // in-flight pmu syscalls on this thread via `proc._gen_lock`:
@@ -230,7 +234,7 @@ pub const Thread = struct {
         thread.ctx = undefined;
         thread.kernel_stack = undefined;
         thread.user_stack = null;
-        thread.process = proc;
+        thread.process = SlabRef(Process).init(proc, proc._gen_lock.currentGen());
         thread.next = null;
         thread.priority = .normal;
         thread.pre_pin_priority = .normal;

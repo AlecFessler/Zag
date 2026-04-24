@@ -294,9 +294,14 @@ pub fn switchTo(thread: *Thread) void {
     gdt.coreTss(core_id).rsp0 = kstack;
     updateScratchKernelRsp(core_id, kstack);
 
-    const new_root = thread.process.addr_space_root;
+    // self-alive: `thread` was selected by the scheduler for this
+    // core; its owning Process is kept alive by the thread through
+    // the dispatch window, so reading `addr_space_root` / `_id`
+    // directly without a lock is sound.
+    const proc = thread.process.ptr;
+    const new_root = proc.addr_space_root;
     if (new_root.addr != paging.getAddrSpaceRoot().addr) {
-        paging.swapAddrSpace(new_root, thread.process.addr_space_id);
+        paging.swapAddrSpace(new_root, proc.addr_space_id);
         std.debug.assert(paging.getAddrSpaceRoot().addr == new_root.addr);
     }
 

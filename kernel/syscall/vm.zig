@@ -24,7 +24,9 @@ pub fn sysVmGuestMap(vm_handle: u64, host_vaddr: u64, guest_addr: u64, size: u64
 
 pub fn sysVmRecv(ctx: *ArchCpuContext, vm_handle: u64, buf_ptr: u64, blocking: u64) SyscallResult {
     const thread = sched.currentThread().?;
-    const proc = thread.process;
+    // self-alive: currentThread() on this core; owning Process is
+    // alive across the syscall.
+    const proc = thread.process.ptr;
     return arch.vm.vmRecv(proc, thread, ctx, vm_handle, buf_ptr, blocking != 0);
 }
 

@@ -65,8 +65,10 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
 
     if (is_kernel_privilege and is_user_va) {
         const thread = scheduler.currentThread() orelse @panic("kernel page fault on user VA with no current thread");
-        arch.boot.print("K: PAGEFAULT pid={d} addr=0x{x} w={} x={} rip=0x{x}\n", .{ thread.process.pid, fault.faulting_address, is_write, is_exec, fault.rip });
-        thread.process.kill(accessReason(is_write, is_exec));
+        // self-alive: currentThread() on this core.
+        const proc = thread.process.ptr;
+        arch.boot.print("K: PAGEFAULT pid={d} addr=0x{x} w={} x={} rip=0x{x}\n", .{ proc.pid, fault.faulting_address, is_write, is_exec, fault.rip });
+        proc.kill(accessReason(is_write, is_exec));
         arch.cpu.enableInterrupts();
         while (true) arch.cpu.halt();
     }
@@ -92,7 +94,9 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     }
 
     const thread = scheduler.currentThread() orelse @panic("user page fault with no current thread");
-    const proc = thread.process;
+    // self-alive: currentThread() on this core; owning Process
+    // is alive for the full fault-handler scope.
+    const proc = thread.process.ptr;
 
     const node = proc.vmm.findNode(faulting_virt) orelse {
         arch.boot.print("K: USER_PF pid={d} addr=0x{x} w={} x={}\n", .{ proc.pid, faulting_virt.addr, is_write, is_exec });

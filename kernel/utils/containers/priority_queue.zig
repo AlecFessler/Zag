@@ -1,4 +1,7 @@
 const std = @import("std");
+const zag = @import("zag");
+
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 
 pub fn PriorityQueue(
     comptime T: type,
@@ -6,6 +9,52 @@ pub fn PriorityQueue(
     comptime priority_field: []const u8,
     comptime num_levels: comptime_int,
 ) type {
+    // The linked-list `next` field on `T` may be stored as either a
+    // bare `?*T` or a `?SlabRef(T)` (for slab-backed T where all stored
+    // pointers are fat references). The queue itself always operates
+    // on `*T` — items sitting in a run queue / wait queue are live by
+    // construction, since the queue owns them across yields — so we
+    // just need two comptime adapters: one to turn the stored slot
+    // into `?*T`, one to go back.
+    const next_is_slabref = comptime blk: {
+        const SentinelT = @FieldType(T, next_field);
+        break :blk @typeInfo(SentinelT) == .optional and
+            @typeInfo(@typeInfo(SentinelT).optional.child) == .@"struct";
+    };
+
+    const Helpers = struct {
+        inline fn getNext(item: *T) ?*T {
+            if (comptime next_is_slabref) {
+                const maybe = @field(item, next_field);
+                if (maybe) |r| {
+                    // self-alive: the run/wait queue owns its nodes
+                    // until dequeue/remove; the SlabRef cannot go
+                    // stale while the node is linked.
+                    return r.ptr;
+                }
+                return null;
+            } else {
+                return @field(item, next_field);
+            }
+        }
+
+        inline fn setNext(item: *T, next: ?*T) void {
+            if (comptime next_is_slabref) {
+                if (next) |n| {
+                    @field(item, next_field) = SlabRef(T).init(n, n._gen_lock.currentGen());
+                } else {
+                    @field(item, next_field) = null;
+                }
+            } else {
+                @field(item, next_field) = next;
+            }
+        }
+
+        inline fn isNull(item: *T) bool {
+            return @field(item, next_field) == null;
+        }
+    };
+
     return struct {
         const Self = @This();
 
@@ -17,16 +66,16 @@ pub fn PriorityQueue(
         levels: [num_levels]Level = [_]Level{.{}} ** num_levels,
 
         pub fn enqueue(self: *Self, item: *T) void {
-            std.debug.assert(@field(item, next_field) == null);
+            std.debug.assert(Helpers.isNull(item));
             const idx = @intFromEnum(@field(item, priority_field));
             const level = &self.levels[idx];
             if (level.tail) |tail| {
-                @field(tail, next_field) = item;
+                Helpers.setNext(tail, item);
             } else {
                 level.head = item;
             }
             level.tail = item;
-            @field(item, next_field) = null;
+            Helpers.setNext(item, null);
         }
 
         pub fn dequeue(self: *Self) ?*T {
@@ -35,11 +84,11 @@ pub fn PriorityQueue(
                 idx -= 1;
                 const level = &self.levels[idx];
                 const head = level.head orelse continue;
-                level.head = @field(head, next_field);
+                level.head = Helpers.getNext(head);
                 if (level.head == null) {
                     level.tail = null;
                 }
-                @field(head, next_field) = null;
+                Helpers.setNext(head, null);
                 return head;
             }
             return null;
@@ -52,18 +101,18 @@ pub fn PriorityQueue(
                 while (cur) |c| {
                     if (c == target) {
                         if (prev) |p| {
-                            @field(p, next_field) = @field(c, next_field);
+                            Helpers.setNext(p, Helpers.getNext(c));
                         } else {
-                            level.head = @field(c, next_field);
+                            level.head = Helpers.getNext(c);
                         }
                         if (level.tail == c) {
                             level.tail = prev;
                         }
-                        @field(c, next_field) = null;
+                        Helpers.setNext(c, null);
                         return true;
                     }
                     prev = c;
-                    cur = @field(c, next_field);
+                    cur = Helpers.getNext(c);
                 }
             }
             return false;
@@ -73,10 +122,10 @@ pub fn PriorityQueue(
         /// dequeued waiter must be re-queued without losing its place (e.g.
         /// IPC cap-transfer failure rollback).
         pub fn enqueueFront(self: *Self, item: *T) void {
-            std.debug.assert(@field(item, next_field) == null);
+            std.debug.assert(Helpers.isNull(item));
             const idx = @intFromEnum(@field(item, priority_field));
             const level = &self.levels[idx];
-            @field(item, next_field) = level.head;
+            Helpers.setNext(item, level.head);
             level.head = item;
             if (level.tail == null) {
                 level.tail = item;

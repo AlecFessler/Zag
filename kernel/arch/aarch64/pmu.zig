@@ -611,7 +611,10 @@ pub fn pmiHandler(ctx: *ArchCpuContext) void {
     writePMOVSCLR(status);
 
     const rip_at_pmi = ctx.elr_el1;
-    const delivered = thread.process.faultBlock(
+    // self-alive: PMU overflow fires on the core where `thread` is
+    // running; its owning Process is alive across this handler.
+    const proc = thread.process.ptr;
+    const delivered = proc.faultBlock(
         thread,
         .pmu_overflow,
         rip_at_pmi,
@@ -620,7 +623,7 @@ pub fn pmiHandler(ctx: *ArchCpuContext) void {
     );
 
     if (!delivered) {
-        thread.process.kill(.pmu_overflow);
+        proc.kill(.pmu_overflow);
     }
 
     // Hand off to the scheduler so the fault handler (or a new thread,

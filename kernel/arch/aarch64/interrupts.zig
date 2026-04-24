@@ -230,9 +230,12 @@ pub fn prepareThreadContext(
 /// from the context, and finally restores x0 last (since it held the base
 /// pointer), then executes ERET.
 pub fn switchTo(thread: *Thread) noreturn {
-    const new_root = thread.process.addr_space_root;
+    // self-alive: scheduler dispatched `thread` to this core; its
+    // owning Process stays alive through the switch window.
+    const proc = thread.process.ptr;
+    const new_root = proc.addr_space_root;
     if (new_root.addr != paging.getAddrSpaceRoot().addr) {
-        paging.swapAddrSpace(new_root, thread.process.addr_space_id);
+        paging.swapAddrSpace(new_root, proc.addr_space_id);
     }
 
     // Lazy FPU: CPACR_EL1.FPEN should trap iff `thread` isn't the
