@@ -78,7 +78,7 @@ pub const Vm = struct {
         // before Vm.destroy runs.
         var i: u32 = 0;
         while (i < self.num_vcpus) {
-            vcpu_mod.destroy(self.vcpus[i].ptr);
+            vcpu_mod.destroy(self.vcpus[i].ptr, @intCast(self.vcpus[i].gen));
             i += 1;
         }
         self.num_vcpus = 0;
@@ -286,7 +286,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
             // allocated above in this loop and have not been freed.
             var j: u32 = 0;
             while (j < i) {
-                vcpu_mod.destroy(vm_obj.vcpus[j].ptr);
+                vcpu_mod.destroy(vm_obj.vcpus[j].ptr, @intCast(vm_obj.vcpus[j].gen));
                 j += 1;
             }
             vm_hw.vmFreeStructures(arch_structures);
@@ -312,7 +312,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
             // self-alive: slots were allocated in this loop and not freed.
             var j: u32 = 0;
             while (j <= i) {
-                vcpu_mod.destroy(vm_obj.vcpus[j].ptr);
+                vcpu_mod.destroy(vm_obj.vcpus[j].ptr, @intCast(vm_obj.vcpus[j].gen));
                 j += 1;
             }
             vm_hw.vmFreeStructures(arch_structures);

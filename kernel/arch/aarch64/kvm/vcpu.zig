@@ -192,7 +192,10 @@ pub fn create(vm_obj: *Vm) !*VCpu {
 }
 
 /// Destroy a vCPU: kill its thread and free the struct.
-pub fn destroy(vcpu_obj: *VCpu) void {
+/// `carried_gen` is the caller's SlabRef(VCpu) generation, passed
+/// through to the slab destroy so a stale ref panics rather than
+/// freeing a recycled slot.
+pub fn destroy(vcpu_obj: *VCpu, carried_gen: u63) void {
     // vcpu_obj and its paired Thread are being torn down together here;
     // the caller (Vm.destroy / vmCreate error unwind) has already
     // ensured no concurrent observer holds the vCPU.
@@ -207,8 +210,7 @@ pub fn destroy(vcpu_obj: *VCpu) void {
 
     sched.removeFromAnyRunQueue(thread);
 
-    const gen = vcpu_obj._gen_lock.currentGen();
-    slab_instance.destroy(vcpu_obj, gen) catch unreachable;
+    slab_instance.destroy(vcpu_obj, carried_gen) catch unreachable;
 }
 
 /// Find the VCpu that owns a given thread within a VM.
