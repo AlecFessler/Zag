@@ -69,7 +69,7 @@ pub const Process = struct {
     addr_space_root: PAddr,
     addr_space_id: u16,
     vmm: VirtualMemoryManager,
-    threads: [MAX_THREADS]*Thread,
+    threads: [MAX_THREADS]SlabRef(Thread),
     num_threads: u64,
     children: [MAX_CHILDREN]SlabRef(Process),
     num_children: u64,
@@ -296,31 +296,40 @@ pub const Process = struct {
         // - If after re-eval no thread is alive (all .faulted), kill the
         //   process per §2.12.9.
         target._gen_lock.lock();
-        var resume_buf: [MAX_THREADS]*Thread = undefined;
+        var resume_buf: [MAX_THREADS]SlabRef(Thread) = undefined;
         var resume_n: usize = 0;
-        var faulted_buf: [MAX_THREADS]*Thread = undefined;
+        var faulted_buf: [MAX_THREADS]SlabRef(Thread) = undefined;
         var faulted_n: usize = 0;
-        for (target.threads[0..target.num_threads]) |t| {
+        // self-alive: target._gen_lock is held, so removeThread can't run
+        // on any of these siblings; their slab slots stay live for the
+        // whole loop and we can read `.state` through `.ptr`.
+        for (target.threads[0..target.num_threads]) |t_ref| {
+            const t = t_ref.ptr;
             if (t.state == .suspended) {
                 t.state = .ready;
-                resume_buf[resume_n] = t;
+                resume_buf[resume_n] = t_ref;
                 resume_n += 1;
             } else if (t.state == .faulted) {
-                faulted_buf[faulted_n] = t;
+                faulted_buf[faulted_n] = t_ref;
                 faulted_n += 1;
             }
         }
         target.suspended_thread_slots = 0;
         // Count alive threads (not .faulted, not .exited).
+        // self-alive: same target._gen_lock window as the loop above.
         var alive: u64 = 0;
-        for (target.threads[0..target.num_threads]) |t| {
+        for (target.threads[0..target.num_threads]) |t_ref| {
+            const t = t_ref.ptr;
             if (t.state != .faulted and t.state != .exited) alive += 1;
         }
         target._gen_lock.unlock();
 
-        for (resume_buf[0..resume_n]) |t| {
-            const target_core = if (t.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
-            sched.enqueueOnCore(target_core, t);
+        for (resume_buf[0..resume_n]) |t_ref| {
+            if (t_ref.lock()) |t| {
+                defer t_ref.unlock();
+                const target_core = if (t.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
+                sched.enqueueOnCore(target_core, t);
+            } else |_| {}
         }
 
         if (alive == 0 and faulted_n > 0) {
@@ -329,7 +338,9 @@ pub const Process = struct {
         } else {
             // Push the faulted threads onto target's own fault_box.
             target.fault_box.lock.lock();
-            for (faulted_buf[0..faulted_n]) |t| {
+            for (faulted_buf[0..faulted_n]) |t_ref| {
+                const t = t_ref.lock() catch continue;
+                defer t_ref.unlock();
                 if (target.fault_box.isReceiving()) {
                     const r_ref = target.fault_box.takeReceiverLocked();
                     target.fault_box.beginPendingReplyLocked(t);
@@ -566,7 +577,10 @@ pub const Process = struct {
             // itself in `alive` (it hasn't been marked .faulted yet below),
             // so the check is `alive <= 1` (only us = no one else).
             var alive: u64 = 0;
-            for (self.threads[0..self.num_threads]) |t| {
+            // self-alive: self._gen_lock held, threads[] entries can't be
+            // freed (destroy would need proc lock via removeThread).
+            for (self.threads[0..self.num_threads]) |t_ref| {
+                const t = t_ref.ptr;
                 if (t == thread) continue;
                 switch (t.state) {
                     .ready, .running, .blocked => alive += 1,
@@ -637,16 +651,18 @@ pub const Process = struct {
         // (.ready or .running) is moved to .suspended.
         // We collect suspended siblings so we can remove them from run
         // queues and IPI their cores after releasing proc.lock.
-        var stopped: [MAX_THREADS]?*Thread = .{null} ** MAX_THREADS;
+        var stopped: [MAX_THREADS]?SlabRef(Thread) = .{null} ** MAX_THREADS;
         var stopped_count: u32 = 0;
         self._gen_lock.lock();
         if (stop_all) {
-            for (self.threads[0..self.num_threads]) |sib| {
+            // self-alive: self._gen_lock held, siblings can't be freed.
+            for (self.threads[0..self.num_threads]) |sib_ref| {
+                const sib = sib_ref.ptr;
                 if (sib == thread) continue;
                 if (sib.state == .ready or sib.state == .running) {
                     sib.state = .suspended;
                     self.suspended_thread_slots |= @as(u64, 1) << @intCast(sib.slot_index);
-                    stopped[stopped_count] = sib;
+                    stopped[stopped_count] = sib_ref;
                     stopped_count += 1;
                 }
             }
@@ -658,8 +674,10 @@ pub const Process = struct {
         // Force-deschedule stopped siblings: remove from run queues
         // (in case they were .ready) and IPI cores where they are
         // dispatched (in case they were .running or raced to .running).
-        for (stopped[0..stopped_count]) |maybe_sib| {
-            const sib = maybe_sib orelse continue;
+        for (stopped[0..stopped_count]) |maybe_sib_ref| {
+            const sib_ref = maybe_sib_ref orelse continue;
+            const sib = sib_ref.lock() catch continue;
+            defer sib_ref.unlock();
             sched.removeFromAnyRunQueue(sib);
             if (sched.coreRunning(sib)) |core_id| {
                 arch.smp.triggerSchedulerInterrupt(core_id);
@@ -781,12 +799,15 @@ pub const Process = struct {
     pub fn removeThread(self: *Process, thread: *Thread) bool {
         self._gen_lock.lock();
         defer self._gen_lock.unlock();
-        for (self.threads[0..self.num_threads], 0..) |t, i| {
-            if (t == thread) {
+        // self-alive: self._gen_lock held, threads[] entries are stable.
+        // `.ptr == thread` is identity compare — `thread` is the caller's
+        // live `*Thread` (we're in its deinit path).
+        for (self.threads[0..self.num_threads], 0..) |t_ref, i| {
+            if (t_ref.ptr == thread) {
                 self.num_threads -= 1;
                 if (i < self.num_threads) {
                     self.threads[i] = self.threads[self.num_threads];
-                    self.threads[i].slot_index = @intCast(i);
+                    self.threads[i].ptr.slot_index = @intCast(i);
                 }
                 return self.num_threads == 0;
             }
@@ -809,11 +830,13 @@ pub const Process = struct {
         // Collect blocked/faulted/suspended threads before marking all exited.
         // These are off-CPU and need explicit deinit (they won't be picked up
         // by the scheduler-zombie path because they're not currently running).
-        var blocked: [MAX_THREADS]*Thread = undefined;
+        var blocked: [MAX_THREADS]SlabRef(Thread) = undefined;
         var num_blocked: u32 = 0;
-        for (self.threads[0..self.num_threads]) |thread| {
+        // self-alive: self._gen_lock held — threads[] entries stable.
+        for (self.threads[0..self.num_threads]) |t_ref| {
+            const thread = t_ref.ptr;
             if (thread.state == .blocked or thread.state == .faulted or thread.state == .suspended) {
-                blocked[num_blocked] = thread;
+                blocked[num_blocked] = t_ref;
                 num_blocked += 1;
             }
             thread.state = .exited;
@@ -825,7 +848,11 @@ pub const Process = struct {
         // Remove blocked threads from external wait structures and deinit them.
         // Each deinit calls removeThread which decrements num_threads.
         // The last thread's deinit triggers lastThreadExited.
-        for (blocked[0..num_blocked]) |thread| {
+        // self-alive: blocked[] was snapshotted under self._gen_lock, and
+        // the only path that frees these slots is Thread.deinit() which
+        // this loop drives serially. No concurrent reaper can race.
+        for (blocked[0..num_blocked]) |thread_ref| {
+            const thread = thread_ref.ptr;
             // Wait until the thread is fully off-CPU before freeing its
             // kernel stack. .suspended and .faulted threads may still be in
             // the middle of a syscall on their kernel stack.
@@ -1208,7 +1235,10 @@ pub const Process = struct {
         self.msg_box.lock.unlock();
 
         // Clean up threads that are blocked waiting for reply from other processes
-        for (self.threads[0..self.num_threads]) |thread| {
+        // self-alive: cleanupPhase1 runs under process death, no concurrent
+        // thread creation/destruction races us — threads[] entries are stable.
+        for (self.threads[0..self.num_threads]) |t_ref| {
+            const thread = t_ref.ptr;
             if (thread.ipc_server) |server_ref| {
                 // self-alive: same rationale as the kill() branch — we
                 // ourselves stored this ipc_server, and it outlives the

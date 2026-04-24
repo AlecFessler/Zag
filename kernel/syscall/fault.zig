@@ -348,8 +348,9 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
     src._gen_lock.lock();
     {
         var i: u64 = 0;
+        // self-alive: src._gen_lock held — threads[] stable.
         while (i < src.num_threads) {
-            const t = src.threads[i];
+            const t = src.threads[i].ptr;
             if (t.state == .suspended) {
                 t.state = .ready;
             }
@@ -363,11 +364,14 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
     {
         var i: u64 = 0;
         while (i < src.num_threads) {
-            const t = src.threads[i];
-            if ((sib_mask & (@as(u64, 1) << @intCast(t.slot_index))) != 0) {
-                const target_core = if (t.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
-                sched.enqueueOnCore(target_core, t);
-            }
+            const t_ref = src.threads[i];
+            if (t_ref.lock()) |t| {
+                defer t_ref.unlock();
+                if ((sib_mask & (@as(u64, 1) << @intCast(t.slot_index))) != 0) {
+                    const target_core = if (t.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
+                    sched.enqueueOnCore(target_core, t);
+                }
+            } else |_| {}
             i += 1;
         }
     }

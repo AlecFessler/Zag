@@ -223,11 +223,13 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                     // takes target_proc.perm_lock and we don't want to nest).
                     sender_proc._gen_lock.lock();
                     const num_threads = sender_proc.num_threads;
-                    var threads_copy: [Process.MAX_THREADS]*Thread = undefined;
+                    var threads_copy: [Process.MAX_THREADS]SlabRef(Thread) = undefined;
                     @memcpy(threads_copy[0..num_threads], sender_proc.threads[0..num_threads]);
                     sender_proc._gen_lock.unlock();
 
-                    for (threads_copy[0..num_threads]) |t| {
+                    for (threads_copy[0..num_threads]) |t_ref| {
+                        const t = t_ref.lock() catch continue;
+                        defer t_ref.unlock();
                         _ = target_proc.insertThreadHandle(t, ThreadHandleRights.full) catch {};
                     }
 

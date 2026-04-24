@@ -174,9 +174,9 @@ pub const Thread = struct {
                 // Check if all remaining threads are vCPU threads.
                 var all_vcpu = true;
                 proc._gen_lock.lock();
-                const remaining = proc.threads[0..proc.num_threads];
-                for (remaining) |t| {
-                    if (!arch.vm.threadIsVcpu(vm_obj, t)) {
+                // self-alive: proc._gen_lock held — threads[] stable.
+                for (proc.threads[0..proc.num_threads]) |t_ref| {
+                    if (!arch.vm.threadIsVcpu(vm_obj, t_ref.ptr)) {
                         all_vcpu = false;
                         break;
                     }
@@ -192,16 +192,19 @@ pub const Thread = struct {
                     // the last one triggers lastThreadExited -> process exit.
                     // Snapshot the list since deinit mutates it.
                     proc._gen_lock.lock();
-                    var vcpu_threads: [Process.MAX_THREADS]*Thread = undefined;
+                    var vcpu_threads: [Process.MAX_THREADS]SlabRef(Thread) = undefined;
                     var num_vcpu: u32 = 0;
-                    for (proc.threads[0..proc.num_threads]) |t| {
-                        vcpu_threads[num_vcpu] = t;
+                    for (proc.threads[0..proc.num_threads]) |t_ref| {
+                        vcpu_threads[num_vcpu] = t_ref;
                         num_vcpu += 1;
                     }
                     proc._gen_lock.unlock();
 
-                    for (vcpu_threads[0..num_vcpu]) |t| {
-                        t.deinit();
+                    // self-alive: we just snapshotted under proc._gen_lock,
+                    // and deinit is what frees these slots — serial calls
+                    // keep each slot live until its turn.
+                    for (vcpu_threads[0..num_vcpu]) |t_ref| {
+                        t_ref.ptr.deinit();
                     }
                 }
             }
@@ -278,7 +281,7 @@ pub const Thread = struct {
 
         if (proc.num_threads >= Process.MAX_THREADS) return error.MaxThreads;
         thread.slot_index = @intCast(proc.num_threads);
-        proc.threads[proc.num_threads] = thread;
+        proc.threads[proc.num_threads] = SlabRef(Thread).init(thread, thread._gen_lock.currentGen());
         proc.num_threads += 1;
 
         return thread;

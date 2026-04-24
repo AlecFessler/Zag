@@ -136,7 +136,9 @@ pub fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_a
         return E_MAXCAP;
     };
 
-    sched.enqueueOnCore(arch.smp.coreID(), child.threads[0]);
+    // self-alive: child just created, its initial thread is the only one
+    // and it can't be freed before the scheduler picks it up.
+    sched.enqueueOnCore(arch.smp.coreID(), child.threads[0].ptr);
     return @intCast(handle_id);
 }
 

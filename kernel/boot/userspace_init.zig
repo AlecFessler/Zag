@@ -28,7 +28,9 @@ pub fn init(root_service_elf: []const u8) !void {
     }, null, ThreadHandleRights.full, .pinned);
 
     grantDevices(root_proc);
-    sched.enqueueOnCore(arch.smp.coreID(), root_proc.threads[0]);
+    // self-alive: root process just created, threads[0] is its only thread
+    // and no other actor can free it before the scheduler picks it up.
+    sched.enqueueOnCore(arch.smp.coreID(), root_proc.threads[0].ptr);
 }
 
 fn grantDevices(root_proc: *Process) void {

@@ -126,8 +126,8 @@ pub fn queueOrDeliver(box: *VmExitBox, vm_obj: *Vm, vcpu_obj: *VCpu) void {
             // Receiver slot freed; exit will be picked up on the next
             // vm_recv via the pending bit set by deliverExit — but
             // without a receiver we fall back to enqueuing.
-            // self-alive: caller IS vcpu_obj.thread.
             box.lock.lock();
+            // self-alive: caller IS vcpu_obj.thread.
             box.enqueueLocked(vcpu_obj.thread.ptr);
             box.lock.unlock();
         }

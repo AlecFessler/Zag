@@ -153,7 +153,7 @@ pub fn create(vm_obj: *Vm) !*VCpu {
         return error.MaxThreads;
     }
     thread.slot_index = @intCast(proc.num_threads);
-    proc.threads[proc.num_threads] = thread;
+    proc.threads[proc.num_threads] = SlabRef(Thread).init(thread, thread._gen_lock.currentGen());
     proc.num_threads += 1;
     proc._gen_lock.unlock();
 
