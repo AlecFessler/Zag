@@ -100,7 +100,7 @@ pub const GenLock = extern struct {
 /// This is the ONLY sanctioned form for kernel storage of a pointer to
 /// a slab-backed object. Bare `*T` for slab-backed T is banned at the
 /// type-system level (enforced by the static analyzer — see
-/// `tools/check_gen_lock.py`). Wherever such a pointer would be stored
+/// `tools/check_gen_lock/`). Wherever such a pointer would be stored
 /// — struct field, array element, function parameter, local variable —
 /// the slot is `SlabRef(T)` instead.
 ///

@@ -45,7 +45,7 @@ by severity. Every item cites the file/line so it's immediately actionable.
       `PermissionEntry.acquireLock` helper already does.
 
 - [ ] **Static analyzer accepts `lock()` and `lockWithGen()` interchangeably.**
-      `tools/check_gen_lock.py:1083`, `:1475`, `:1479`, `:1522`. This is the
+      `tools/check_gen_lock/`. This is the
       mechanism by which the UAFs above go unreported. Change the bracket
       check: for any ident typed as a slab ref that isn't `self_alive` and
       wasn't obtained through a recognized refcount-pin chain
@@ -55,7 +55,7 @@ by severity. Every item cites the file/line so it's immediately actionable.
 ## Major — analyzer soundness holes
 
 - [ ] **Free-function inlining silently drops on unresolved callees.**
-      `tools/check_gen_lock.py:1262-1266`. Receiver-style calls fall back to
+      `tools/check_gen_lock/`. Receiver-style calls fall back to
       a plain access record (`:1193-1206`); free-style calls just `continue`.
       A syscall that intentionally releases a lock before handing its slab
       ptr to an opaque helper (the `guestMap` pattern from commit d1c260e)
@@ -63,14 +63,14 @@ by severity. Every item cites the file/line so it's immediately actionable.
       is emitted. Make the fallback symmetric with the receiver-style branch.
 
 - [ ] **`self_alive` propagates transitively via chain head.**
-      `tools/check_gen_lock.py:1052-1054`. If `proc` is self-alive and the
+      `tools/check_gen_lock/`. If `proc` is self-alive and the
       body has `var t = proc.threads[0]`, the analyzer tags `t` as self-alive
       too. `t` is a distinct slab object; proc being alive says nothing about
       `t`'s gen. This masks real findings on derived slab idents. Require the
       derived ident to be refcount-pinned or `lockWithGen`-verified before
       treating it as self-alive.
 
-- [ ] **Analyzer exit code is always 0** (`tools/check_gen_lock.py:49-50`).
+- [ ] **Analyzer exit code is always 0** (`tools/check_gen_lock/`).
       Not gated in pre-commit. Wire `return 1 if total_errs > 0` and add a
       stage to `tests/test.sh pre-commit` once the real findings are
       addressed.
