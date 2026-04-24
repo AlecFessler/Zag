@@ -121,7 +121,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                 // nested with perm_lock for the slot-0 bit write.
                 if (granted_phr.fault_handler) {
                     sender_proc._gen_lock.lock();
-                    sender_proc.fault_handler_proc = target_proc;
+                    sender_proc.fault_handler_proc = process_mod.slabRefNow(Process, target_proc);
                     sender_proc.perm_lock.lock();
                     const self_rights = sender_proc.perm_table[0].processRights();
                     sender_proc.had_self_fault_handler = self_rights.fault_handler;
@@ -274,8 +274,11 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
             if (!src_entry.deviceRights().grant) return E_PERM;
             const granted_u16: u16 = @truncate(rights_val);
             if (!isSubset(granted_u16, src_entry.rights)) return E_PERM;
-            // Device transfer is parent->child only
-            if (target_proc.parent != sender_proc) return E_PERM;
+            // Device transfer is parent->child only. Identity-compare
+            // target's parent SlabRef against sender; absence or mismatch
+            // both fail.
+            const parent_matches = if (target_proc.parent) |pref| pref.ptr == sender_proc else false;
+            if (!parent_matches) return E_PERM;
             const target_self = target_proc.getPermByHandle(0) orelse return E_PERM;
             if (!target_self.processRights().device_own) return E_PERM;
             const new_entry = PermissionEntry{

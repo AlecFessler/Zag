@@ -55,10 +55,21 @@ pub fn sysThreadCreate(entry_addr: u64, arg: u64, num_stack_pages_u64: u64) i64 
     // §2.12.5: the handle MUST be inserted; if the handler's table is full,
     // roll back the new thread and return E_MAXCAP so userspace observes
     // the failure instead of silently getting an unmanaged thread.
-    if (proc.fault_handler_proc) |handler| {
-        if (handler.insertThreadHandle(thread, ThreadHandleRights.full)) |_| {
-            // OK
+    if (proc.fault_handler_proc) |handler_ref| {
+        if (handler_ref.lock()) |handler| {
+            // Verify freshness then drop the gen-lock bit; insertThreadHandle
+            // takes handler.perm_lock, and the fault_handler relationship
+            // invariant keeps handler alive for the duration.
+            handler_ref.unlock();
+            if (handler.insertThreadHandle(thread, ThreadHandleRights.full)) |_| {
+                // OK
+            } else |_| {
+                proc.removePerm(handle_id) catch {};
+                thread.deinit();
+                return E_MAXCAP;
+            }
         } else |_| {
+            // Handler slot has been recycled — treat as no handler.
             proc.removePerm(handle_id) catch {};
             thread.deinit();
             return E_MAXCAP;
@@ -370,8 +381,11 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
     _ = target_proc.msg_box.removeLocked(target);
     target_proc.msg_box.lock.unlock();
     process_mod.scrubFromFaultBoxPub(&target_proc.fault_box, target);
-    if (target_proc.fault_handler_proc) |handler| {
-        process_mod.scrubFromFaultBoxPub(&handler.fault_box, target);
+    if (target_proc.fault_handler_proc) |handler_ref| {
+        if (handler_ref.lock()) |handler| {
+            defer handler_ref.unlock();
+            process_mod.scrubFromFaultBoxPub(&handler.fault_box, target);
+        } else |_| {}
     }
     // deinit removes thread handles from perm tables, frees stacks,
     // calls lastThreadExited (which triggers process exit/restart).

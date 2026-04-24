@@ -542,7 +542,10 @@ pub fn sysFaultSetThreadMode(thread_handle: u64, mode: u64) i64 {
     const target_proc = target_thread.process;
     target_thread._gen_lock.unlock();
     target_proc._gen_lock.lock();
-    const handler_ok = target_proc.fault_handler_proc == proc;
+    const handler_ok = if (target_proc.fault_handler_proc) |h_ref|
+        h_ref.ptr == proc
+    else
+        false;
     target_proc._gen_lock.unlock();
     const is_self_handler = target_proc == proc and
         proc.perm_table[0].processRights().fault_handler;

@@ -143,8 +143,14 @@ pub const Thread = struct {
 
         // Remove thread handle from own perm table and handler's perm table
         proc.removeThreadHandle(self);
-        if (proc.fault_handler_proc) |handler| {
-            handler.removeThreadHandle(self);
+        if (proc.fault_handler_proc) |handler_ref| {
+            if (handler_ref.lock()) |handler| {
+                // Verify freshness then drop gen-lock bit; removeThreadHandle
+                // takes handler.perm_lock. The fault_handler relationship
+                // invariant keeps handler alive across the brief window.
+                handler_ref.unlock();
+                handler.removeThreadHandle(self);
+            } else |_| {}
         }
 
         stack_mod.destroyKernel(self.kernel_stack, memory_init.kernel_addr_space_root);

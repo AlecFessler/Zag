@@ -63,7 +63,7 @@ pub const ProcessAllocator = SecureSlab(Process, 256);
 pub const Process = struct {
     _gen_lock: secure_slab.GenLock = .{},
     pid: u64,
-    parent: ?*Process,
+    parent: ?SlabRef(Process),
     alive: bool,
     restart_context: ?RestartContext,
     addr_space_root: PAddr,
@@ -71,7 +71,7 @@ pub const Process = struct {
     vmm: VirtualMemoryManager,
     threads: [MAX_THREADS]*Thread,
     num_threads: u64,
-    children: [MAX_CHILDREN]*Process,
+    children: [MAX_CHILDREN]SlabRef(Process),
     num_children: u64,
     perm_table: [MAX_PERMS]PermissionEntry,
     perm_count: u32,
@@ -97,7 +97,7 @@ pub const Process = struct {
     /// are freed — but the slab slot + its live gen stay intact so the
     /// parent's perm-table entry continues to resolve.
     zombie: bool = false,
-    fault_handler_proc: ?*Process = null,
+    fault_handler_proc: ?SlabRef(Process) = null,
     faulted_thread_slots: u64 = 0,
     suspended_thread_slots: u64 = 0,
     thread_handle_rights: ThreadHandleRights = ThreadHandleRights.full,
@@ -105,9 +105,9 @@ pub const Process = struct {
     // Back-pointer list of processes whose fault_handler_proc == self.
     // Walked on handler death to revert targets to self-handling (§2.12.35).
     // Protected by self.lock.
-    fault_handler_targets_head: ?*Process = null,
+    fault_handler_targets_head: ?SlabRef(Process) = null,
     // Intrusive next-pointer for fault_handler_targets list of OUR handler.
-    fault_handler_targets_next: ?*Process = null,
+    fault_handler_targets_next: ?SlabRef(Process) = null,
     // Whether slot 0's fault_handler bit was set at the moment the
     // relationship was established. releaseFaultHandler uses this to
     // decide whether restoring the bit is semantically valid — we never
@@ -271,6 +271,8 @@ pub const Process = struct {
         self.fault_box.lock.lock();
         if (self.fault_box.isPendingReply()) {
             if (self.fault_box.pending_thread) |pt| {
+                // self-alive: pt is a Thread in the fault box; Agent-Thread
+                // owns migration of Thread.process to SlabRef.
                 if (pt.process == target) {
                     _ = self.fault_box.endPendingReplyLocked();
                 }
@@ -348,14 +350,19 @@ pub const Process = struct {
         self._gen_lock.lock();
         defer self._gen_lock.unlock();
         if (!self.alive) return false;
-        // Avoid double-link
+        // Avoid double-link. List nodes are SlabRef(Process); traversal
+        // compares `.ptr` against `target` — the caller holds `target`
+        // pinned (it's our own sender_proc context), so .ptr is live.
         var cur = self.fault_handler_targets_head;
-        while (cur) |c| {
-            if (c == target) return true;
-            cur = c.fault_handler_targets_next;
+        while (cur) |c_ref| {
+            // self-alive: caller pins `target`; list nodes are siblings
+            // of `target` whose own lifetimes are guarded by their
+            // respective processes holding `self` as fault handler.
+            if (c_ref.ptr == target) return true;
+            cur = c_ref.ptr.fault_handler_targets_next;
         }
         target.fault_handler_targets_next = self.fault_handler_targets_head;
-        self.fault_handler_targets_head = target;
+        self.fault_handler_targets_head = SlabRef(Process).init(target, target._gen_lock.currentGen());
         return true;
     }
 
@@ -363,20 +370,25 @@ pub const Process = struct {
     pub fn unlinkFaultHandlerTarget(self: *Process, target: *Process) void {
         self._gen_lock.lock();
         defer self._gen_lock.unlock();
-        var prev: ?*Process = null;
+        var prev: ?SlabRef(Process) = null;
         var cur = self.fault_handler_targets_head;
-        while (cur) |c| {
-            if (c == target) {
-                if (prev) |p| {
-                    p.fault_handler_targets_next = c.fault_handler_targets_next;
+        while (cur) |c_ref| {
+            // self-alive: caller pins `target`; other nodes are live
+            // while linked (each holds `self` as its fault handler).
+            if (c_ref.ptr == target) {
+                if (prev) |p_ref| {
+                    // self-alive: prev was just validated by the previous
+                    // iteration and hasn't been unlinked since we hold
+                    // self._gen_lock throughout.
+                    p_ref.ptr.fault_handler_targets_next = c_ref.ptr.fault_handler_targets_next;
                 } else {
-                    self.fault_handler_targets_head = c.fault_handler_targets_next;
+                    self.fault_handler_targets_head = c_ref.ptr.fault_handler_targets_next;
                 }
                 target.fault_handler_targets_next = null;
                 return;
             }
-            prev = c;
-            cur = c.fault_handler_targets_next;
+            prev = c_ref;
+            cur = c_ref.ptr.fault_handler_targets_next;
         }
     }
 
@@ -492,9 +504,15 @@ pub const Process = struct {
     /// `systems.md:876`, a process with `fault_handler_proc == null`
     /// self-handles iff it holds the `fault_handler` ProcessRight bit on
     /// slot 0; otherwise it has no handler at all.
-    fn faultHandlerOf(self: *Process) ?*Process {
-        if (self.fault_handler_proc) |h| return h;
-        if (self.perm_table[0].processRights().fault_handler) return self;
+    ///
+    /// External handlers are returned as a `SlabRef(Process)` the caller
+    /// must lock before touching. Self-handling is signaled by a null
+    /// SlabRef and a true `is_self` flag — self is already pinned by
+    /// virtue of being the faulting process, so no additional lock is
+    /// needed.
+    fn faultHandlerOf(self: *Process) ?struct { ref: ?SlabRef(Process), is_self: bool } {
+        if (self.fault_handler_proc) |h| return .{ .ref = h, .is_self = false };
+        if (self.perm_table[0].processRights().fault_handler) return .{ .ref = null, .is_self = true };
         return null;
     }
 
@@ -510,7 +528,7 @@ pub const Process = struct {
     /// `thread.ctx.regs` (already populated by the exception entry stub).
     pub fn faultBlock(self: *Process, thread: *Thread, reason: FaultReason, fault_addr: u64, rip: u64, user_ctx: ?*ArchCpuContext) bool {
         arch.boot.print("K: faultBlock reason={d} addr=0x{x}\n", .{ @intFromEnum(reason), fault_addr });
-        const handler = self.faultHandlerOf() orelse return false;
+        const resolved = self.faultHandlerOf() orelse return false;
 
         // Stamp the fault payload onto the thread itself.
         thread.fault_reason = reason;
@@ -522,7 +540,7 @@ pub const Process = struct {
         // frame that the stub will iret through on resume.
         thread.fault_user_ctx = user_ctx;
 
-        if (handler == self) {
+        if (resolved.is_self) {
             // Self-handling: §2.12.7 / §2.12.8 / §2.12.9. No stop-all — sibling
             // threads continue running so they can call fault_recv on our own
             // fault box.
@@ -576,6 +594,9 @@ pub const Process = struct {
 
         // External handler path (§2.12.10): possibly stop-all + enqueue on
         // handler's box.
+        const handler_ref = resolved.ref.?;
+        const handler = handler_ref.lock() catch return false;
+        defer handler_ref.unlock();
         //
         // §2.12.11: before stop-all, check the faulting thread's
         // exclude_oneshot / exclude_permanent flags on its perm entry in
@@ -719,8 +740,11 @@ pub const Process = struct {
     pub fn removeChild(self: *Process, child: *Process) void {
         self._gen_lock.lock();
         defer self._gen_lock.unlock();
-        for (self.children[0..self.num_children], 0..) |c, i| {
-            if (c == child) {
+        for (self.children[0..self.num_children], 0..) |c_ref, i| {
+            // self-alive: children array entries are live while occupied —
+            // a child's cleanupPhase2 is what drives this call, so `child`
+            // itself is the caller context. We compare `.ptr` for identity.
+            if (c_ref.ptr == child) {
                 self.num_children -= 1;
                 if (i < self.num_children) {
                     self.children[i] = self.children[self.num_children];
@@ -806,8 +830,11 @@ pub const Process = struct {
             // loop, freed pointers would otherwise be visible to a
             // concurrent fault_recv on another core.
             scrubFromFaultBox(&self.fault_box, thread);
-            if (self.fault_handler_proc) |handler| {
-                scrubFromFaultBox(&handler.fault_box, thread);
+            if (self.fault_handler_proc) |handler_ref| {
+                if (handler_ref.lock()) |handler| {
+                    defer handler_ref.unlock();
+                    scrubFromFaultBox(&handler.fault_box, thread);
+                } else |_| {}
             }
             thread.deinit();
         }
@@ -825,7 +852,13 @@ pub const Process = struct {
     pub fn killSubtree(self: *Process) void {
         var i: u64 = 0;
         while (i < self.num_children) {
-            self.children[i].killSubtree();
+            const child_ref = self.children[i];
+            if (child_ref.lock()) |child| {
+                // Release the lock before recursing — killSubtree re-enters
+                // on the child and will take its own _gen_lock.
+                child_ref.unlock();
+                child.killSubtree();
+            } else |_| {}
             i += 1;
         }
         self.kill(.killed);
@@ -851,7 +884,11 @@ pub const Process = struct {
 
         var i: u64 = 0;
         while (i < self.num_children) {
-            self.children[i].disableRestart();
+            const child_ref = self.children[i];
+            if (child_ref.lock()) |child| {
+                child_ref.unlock();
+                child.disableRestart();
+            } else |_| {}
             i += 1;
         }
     }
@@ -899,8 +936,11 @@ pub const Process = struct {
             // Zombie: has children, so cleanupPhase2 is deferred until
             // the last child's cleanupPhase2 cascades back to us. Convert
             // the parent's entry now so the parent can observe the death.
-            if (self.parent) |p| {
-                p.convertToDeadProcess(self);
+            if (self.parent) |parent_ref| {
+                if (parent_ref.lock()) |p| {
+                    defer parent_ref.unlock();
+                    p.convertToDeadProcess(self);
+                } else |_| {}
             }
         }
     }
@@ -937,34 +977,37 @@ pub const Process = struct {
         self.vmm.resetForRestart();
 
         // Clean up thread handles from own perm table and handler's perm table
-        if (self.fault_handler_proc) |handler| {
-            handler.perm_lock.lock();
-            for (&handler.perm_table) |*slot| {
-                if (slot.object == .thread) {
-                    const t = slot.object.thread.ptr;
-                    if (t.process == self) {
-                        slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
-                        handler.perm_count -= 1;
+        if (self.fault_handler_proc) |handler_ref| {
+            if (handler_ref.lock()) |handler| {
+                defer handler_ref.unlock();
+                handler.perm_lock.lock();
+                for (&handler.perm_table) |*slot| {
+                    if (slot.object == .thread) {
+                        const t = slot.object.thread.ptr;
+                        if (t.process == self) {
+                            slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
+                            handler.perm_count -= 1;
+                        }
                     }
                 }
-            }
-            handler.syncUserView();
-            handler.perm_lock.unlock();
+                handler.syncUserView();
+                handler.perm_lock.unlock();
 
-            // §2.6.35: also drain the handler's fault_box of any entries
-            // pointing at our threads. The threads have already been
-            // deinit'd by the kill() path, so the queue holds dangling
-            // pointers — must scrub before the handler can recv again.
-            handler.fault_box.lock.lock();
-            if (handler.fault_box.isPendingReply()) {
-                if (handler.fault_box.pending_thread) |pt| {
-                    if (pt.process == self) {
-                        _ = handler.fault_box.endPendingReplyLocked();
+                // §2.6.35: also drain the handler's fault_box of any entries
+                // pointing at our threads. The threads have already been
+                // deinit'd by the kill() path, so the queue holds dangling
+                // pointers — must scrub before the handler can recv again.
+                handler.fault_box.lock.lock();
+                if (handler.fault_box.isPendingReply()) {
+                    if (handler.fault_box.pending_thread) |pt| {
+                        if (pt.process == self) {
+                            _ = handler.fault_box.endPendingReplyLocked();
+                        }
                     }
                 }
-            }
-            handler.fault_box.drainByProcessLocked(self);
-            handler.fault_box.lock.unlock();
+                handler.fault_box.drainByProcessLocked(self);
+                handler.fault_box.lock.unlock();
+            } else |_| {}
         }
 
         // Drain our own fault_box too — when self-handling, queued faulting
@@ -1037,19 +1080,30 @@ pub const Process = struct {
         // revert the fault_handler relationship so the restarted process handles
         // its own faults. Spec §2.6.35 / §2.12.5 require the thread handle to be
         // inserted; if we can't, self-handling is the safe degradation.
-        if (self.fault_handler_proc) |handler| {
-            if (handler.insertThreadHandle(thread, ThreadHandleRights.full)) |_| {
-                // OK
-            } else |_| {
-                handler.releaseFaultHandler(self);
-            }
+        if (self.fault_handler_proc) |handler_ref| {
+            // Verify handler freshness, then drop the gen-lock bit so the
+            // downstream calls (which themselves take handler locks) don't
+            // deadlock. The fault_handler relationship keeps handler linked
+            // to us via fault_handler_targets — handler's cleanupPhase1
+            // unlinks under self._gen_lock before freeing — so the window
+            // between verify and call is bounded by handler-cleanup order.
+            if (handler_ref.lock()) |handler| {
+                handler_ref.unlock();
+                if (handler.insertThreadHandle(thread, ThreadHandleRights.full)) |_| {
+                    // OK
+                } else |_| {
+                    handler.releaseFaultHandler(self);
+                }
+            } else |_| {}
         }
 
         sched.enqueueOnCore(arch.smp.coreID(), thread);
     }
 
     fn updateParentView(self: *Process) void {
-        const parent = self.parent orelse return;
+        const parent_ref = self.parent orelse return;
+        const parent = parent_ref.lock() catch return;
+        defer parent_ref.unlock();
         parent.perm_lock.lock();
         defer parent.perm_lock.unlock();
         for (parent.perm_table[1..], 1..) |*slot, idx| {
@@ -1120,10 +1174,17 @@ pub const Process = struct {
         // each target to self-handling before tearing down our perm table.
         while (true) {
             self._gen_lock.lock();
-            const target = self.fault_handler_targets_head;
+            const target_ref_opt = self.fault_handler_targets_head;
             self._gen_lock.unlock();
-            const t = target orelse break;
+            const target_ref = target_ref_opt orelse break;
             // releaseFaultHandler unlinks t from our list, so loop terminates.
+            // The target is linked into our list because we're its fault
+            // handler; the list's own invariant keeps the target's slab
+            // slot alive. Use `.ptr` under that linkage invariant.
+            // self-alive: fault_handler_targets list entries are alive
+            // while we haven't released them — target's death unlinks
+            // itself before freeing.
+            const t = target_ref.ptr;
             self.releaseFaultHandler(t);
         }
 
@@ -1131,20 +1192,26 @@ pub const Process = struct {
         // list and drain any of our threads from its fault box. We don't
         // call releaseFaultHandler on the handler because that would touch
         // our own perm table while we're in the middle of cleanup.
-        if (self.fault_handler_proc) |handler| {
-            handler.unlinkFaultHandlerTarget(self);
-            handler.fault_box.lock.lock();
-            // Drop pending_thread if it points at one of ours.
-            if (handler.fault_box.isPendingReply()) {
-                if (handler.fault_box.pending_thread) |pt| {
-                    if (pt.process == self) {
-                        _ = handler.fault_box.endPendingReplyLocked();
+        if (self.fault_handler_proc) |handler_ref| {
+            if (handler_ref.lock()) |handler| {
+                // Drop the gen-lock bit before calling handler methods
+                // that take their own locks (unlinkFaultHandlerTarget
+                // takes handler._gen_lock).
+                handler_ref.unlock();
+                handler.unlinkFaultHandlerTarget(self);
+                handler.fault_box.lock.lock();
+                // Drop pending_thread if it points at one of ours.
+                if (handler.fault_box.isPendingReply()) {
+                    if (handler.fault_box.pending_thread) |pt| {
+                        if (pt.process == self) {
+                            _ = handler.fault_box.endPendingReplyLocked();
+                        }
                     }
                 }
-            }
-            // Drain any of our queued threads from the handler's box.
-            handler.fault_box.drainByProcessLocked(self);
-            handler.fault_box.lock.unlock();
+                // Drain any of our queued threads from the handler's box.
+                handler.fault_box.drainByProcessLocked(self);
+                handler.fault_box.lock.unlock();
+            } else |_| {}
             self.fault_handler_proc = null;
         }
 
@@ -1187,13 +1254,19 @@ pub const Process = struct {
     }
 
     fn cleanupPhase2(self: *Process) void {
-        if (self.parent) |p| {
-            p.removeChild(self);
-            p.convertToDeadProcess(self);
+        if (self.parent) |parent_ref| {
+            if (parent_ref.lock()) |p| {
+                // Drop the gen-lock bit — removeChild / cleanupPhase2 both
+                // take parent._gen_lock themselves. We only used the lock
+                // here to verify parent's slab slot hasn't been recycled.
+                parent_ref.unlock();
+                p.removeChild(self);
+                p.convertToDeadProcess(self);
 
-            if (!p.alive and p.num_children == 0) {
-                p.cleanupPhase2();
-            }
+                if (!p.alive and p.num_children == 0) {
+                    p.cleanupPhase2();
+                }
+            } else |_| {}
         }
 
         if (self.restart_context) |*rc| rc.deinit();
@@ -1277,19 +1350,23 @@ pub const Process = struct {
 
     pub fn returnDeviceHandleUpTree(source: *Process, rights: u16, device: *DeviceRegion) void {
         var ancestor = source.parent;
-        while (ancestor) |anc| {
+        while (ancestor) |anc_ref| {
+            const anc = anc_ref.lock() catch break;
+            const next = anc.parent;
             if (anc.alive) {
                 if (anc.insertPerm(.{
                     .handle = 0,
                     .object = .{ .device_region = slabRefNow(DeviceRegion, device) },
                     .rights = rights,
                 })) |_| {
+                    anc_ref.unlock();
                     return;
                 } else |_| {
                     // Table full — continue walk to next ancestor (§2.1.11).
                 }
             }
-            ancestor = anc.parent;
+            anc_ref.unlock();
+            ancestor = next;
         }
     }
 
@@ -1306,7 +1383,7 @@ pub const Process = struct {
         // allocator just set to the freshly-advanced live gen. A whole-
         // struct `proc.* = .{...}` would zero it.
         proc.pid = @atomicRmw(u64, &pid_counter, .Add, 1, .monotonic);
-        proc.parent = parent;
+        proc.parent = if (parent) |p| slabRefNow(Process, p) else null;
         proc.alive = true;
         proc.restart_context = null;
         proc.addr_space_root = undefined;
@@ -1424,7 +1501,7 @@ pub const Process = struct {
                 proc.kill(.none);
                 return error.TooManyChildren;
             }
-            p.children[p.num_children] = proc;
+            p.children[p.num_children] = slabRefNow(Process, proc);
             p.num_children += 1;
         }
 
