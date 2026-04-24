@@ -2914,6 +2914,11 @@ fn walkBody(
             while (p < code.len) {
                 if (!isIdentStart(code[p])) { p += 1; continue; }
                 if (p > 0 and (isIdentChar(code[p - 1]) or code[p - 1] == '.')) { p += 1; continue; }
+                // Builtin calls `@intCast(...)` etc. — when the scanner
+                // skipped past '@' it lands on the bare builtin name;
+                // reject it here so we don't misread the first parenthesized
+                // expr as a "call on the builtin."
+                if (p > 0 and code[p - 1] == '@') { p += 1; continue; }
                 var e = p;
                 while (e < code.len and (isIdentChar(code[e]) or code[e] == '.')) e += 1;
                 const fq = code[p..e];
@@ -3003,6 +3008,46 @@ fn walkBody(
             // lock/unlock surrounding the real mutation (before destroy)
             // already stand on their own merits.
             if (mem.eql(u8, fc.fn_name, "destroy") and leaderIsSlabModule(fc.leader)) {
+                continue;
+            }
+            // `<slab_module>.destroyLocked(<ident>, <gen>)` is the caller-
+            // holds-gen-lock sink: the allocator releases the lock bit as
+            // part of the gen bump, so there is no (and must be no) trailing
+            // `unlock()`. Skip emitting an access event on the first arg,
+            // and synthesize an unlock event for any fat ident used in the
+            // args (typically `<ref>.gen`) so bracketCheck sees the lock
+            // released right after the last access, rather than flagging a
+            // missing tight-following unlock.
+            if (mem.eql(u8, fc.fn_name, "destroyLocked") and leaderIsSlabModule(fc.leader)) {
+                const args_start = fc.open_p + 1;
+                var rp = args_start;
+                var depth: i32 = 1;
+                while (rp < code.len and depth > 0) : (rp += 1) {
+                    if (code[rp] == '(') depth += 1;
+                    if (code[rp] == ')') depth -= 1;
+                    if (depth == 0) break;
+                }
+                const args_end = rp;
+                if (args_end <= code.len and args_start <= args_end) {
+                    var sp: usize = args_start;
+                    while (sp < args_end) {
+                        if (!isIdentStart(code[sp])) { sp += 1; continue; }
+                        if (sp > 0 and (isIdentChar(code[sp - 1]) or code[sp - 1] == '.')) { sp += 1; continue; }
+                        var se = sp;
+                        while (se < args_end and isIdentChar(code[se])) se += 1;
+                        const aid = code[sp..se];
+                        if (se + 4 <= args_end and code[se] == '.' and
+                            mem.eql(u8, code[se + 1 .. se + 4], "gen") and
+                            (se + 4 == args_end or !isIdentChar(code[se + 4])))
+                        {
+                            if (env.fat.contains(aid)) {
+                                const aid_i = try ctx.pool.intern(aid);
+                                try emitEvent(gpa, ec, aid_i, .unlock, src_line, "", env.map.get(aid) orelse "");
+                            }
+                        }
+                        sp = se;
+                    }
+                }
                 continue;
             }
             const summary_opt = try getOrBuildSummary(ctx, recv_ty, fc.fn_name);
