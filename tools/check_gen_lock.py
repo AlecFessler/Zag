@@ -344,7 +344,34 @@ def find_bare_slab_pointer_fields(
         if rel in BARE_PTR_FIELD_EXEMPT_FILES:
             continue
         lines = fpath.read_text().splitlines()
+        # Precompute paren depth at the START of each line (string-literal
+        # aware). Multi-line fn signatures put `self: *T,` on its own line
+        # inside `(…)`; those must not be read as struct fields.
+        paren_depth_at_line: list[int] = [0] * len(lines)
+        depth = 0
+        in_str = False
+        esc = False
+        for idx, raw in enumerate(lines):
+            paren_depth_at_line[idx] = depth
+            for ch in strip_comments(raw):
+                if esc:
+                    esc = False
+                    continue
+                if ch == "\\" and in_str:
+                    esc = True
+                    continue
+                if ch == '"':
+                    in_str = not in_str
+                    continue
+                if in_str:
+                    continue
+                if ch == "(":
+                    depth += 1
+                elif ch == ")":
+                    depth -= 1
         for i, raw in enumerate(lines):
+            if paren_depth_at_line[i] > 0:
+                continue  # inside a fn signature / call arg list
             code = strip_comments(raw)
             m = FIELD_LINE_RE.match(code)
             if not m:
