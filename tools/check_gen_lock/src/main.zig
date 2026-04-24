@@ -2519,6 +2519,15 @@ fn walkBody(
                 try env.all_types.put(dp.name, rt_i);
                 if (is_fat) try env.fat.add(dp.name);
                 if (lock_alias_ref != null) try env.self_alive.add(dp.name);
+            } else if (dp.ann.len > 0) {
+                // Non-slab annotation — record bare type in all_types so
+                // plain SpinLock/GenLock field accesses through this local
+                // can classify. `*PerCoreState`, `Vmm`, `*const Foo`, etc.
+                const bare = typeNameFromFieldType(dp.ann);
+                if (bare.len > 0) {
+                    const bare_i = try ctx.pool.intern(bare);
+                    try env.all_types.put(dp.name, bare_i);
+                }
             }
 
             if (!became_self_alive) {
