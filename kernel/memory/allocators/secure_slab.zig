@@ -363,9 +363,10 @@ pub fn SecureSlab(
         /// reallocation and is a bug). A racing double-free is rejected
         /// cleanly rather than panicking.
         ///
-        /// Prefer `SlabRef(T).destroy(slab)` at call sites that already
-        /// hold a fat pointer; this underlying form exists for sites
-        /// that only know `(*T, gen)` and haven't migrated yet.
+        /// For call sites that already hold the slot's gen-lock (they
+        /// locked, did work, and are ready to free) prefer
+        /// `destroyLocked(ptr, expected_gen)` — it avoids the awkward
+        /// unlock/destroy-relock dance and cannot fail.
         pub fn destroy(
             self: *Self,
             ptr: *T,
@@ -376,7 +377,27 @@ pub fn SecureSlab(
             // destroy-side contract explicit for readers.
             std.debug.assert(expected_gen % 2 == 1);
             try ptr._gen_lock.lockWithGen(expected_gen);
+            self.destroyLockedInner(ptr, expected_gen);
+        }
 
+        /// Destroy a slot whose gen-lock the caller already holds at
+        /// `expected_gen`. Releases the lock as part of the gen bump
+        /// (same `setGenRelease(expected_gen + 1)` that `destroy` does).
+        /// Cannot fail: gen was verified when the caller took the lock,
+        /// and the lock bit prevents anyone else from mutating the slot.
+        pub fn destroyLocked(self: *Self, ptr: *T, expected_gen: u63) void {
+            std.debug.assert(expected_gen % 2 == 1);
+            // Debug-only: caller must actually hold the lock at expected_gen.
+            if (std.debug.runtime_safety) {
+                const word = ptr._gen_lock.word.load(.monotonic);
+                std.debug.assert(word == ((@as(u64, expected_gen) << 1) | 1));
+            }
+            self.destroyLockedInner(ptr, expected_gen);
+        }
+
+        /// Shared tail of `destroy` / `destroyLocked`. Caller has already
+        /// established the slot's gen-lock is held at `expected_gen`.
+        fn destroyLockedInner(self: *Self, ptr: *T, expected_gen: u63) void {
             self.lock.lock();
             defer self.lock.unlock();
 

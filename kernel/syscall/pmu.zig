@@ -285,15 +285,17 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
 
     const state_ref = target_thread.pmu_state orelse return E_INVAL; // §4.54.5
     const state = state_ref.lock() catch return E_INVAL;
-    const carried_gen: u63 = @intCast(state_ref.gen);
     if (is_self) {
         arch.pmu.pmuStop(state);
     } else {
         arch.pmu.pmuClearState(state);
     }
-    state_ref.unlock();
     target_thread.pmu_state = null;
-    slab_instance.destroy(state, carried_gen) catch unreachable;
+    // destroyLocked consumes the gen-lock held by `state_ref.lock()` —
+    // it bumps gen to the next even value and releases the lock bit in
+    // one store, so no explicit `state_ref.unlock()` is needed (and
+    // would double-release).
+    slab_instance.destroyLocked(state, @intCast(state_ref.gen));
     return E_OK;
 }
 
