@@ -98,7 +98,7 @@ pub const Thread = struct {
     /// Arch-specific PMU state (spec §2.14). `null` for threads that have
     /// never called `pmu_start`; allocated lazily on first start and freed
     /// on explicit `pmu_stop` or implicit release in `Thread.deinit`.
-    pmu_state: ?*arch.pmu.PmuState = null,
+    pmu_state: ?SlabRef(arch.pmu.PmuState) = null,
     /// Lazy-FPU save buffer. The kernel never touches FP/SIMD itself
     /// (built with `-mno-sse`/`-mno-neon`), so userspace FPU state survives
     /// across syscalls untouched in registers. Eviction happens only when
@@ -138,17 +138,19 @@ pub const Thread = struct {
         // `arch.pmu.pmuRead(state, ...)` and trigger a UAF / `destroy
         // unreachable`. Take, null, release, then do the hardware clear
         // + slab destroy outside the lock.
-        const maybe_state = blk: {
+        const maybe_state_ref = blk: {
             proc._gen_lock.lock();
             defer proc._gen_lock.unlock();
             const s = self.pmu_state;
             self.pmu_state = null;
             break :blk s;
         };
-        if (maybe_state) |state| {
-            arch.pmu.pmuClearState(state);
-            const gen = state._gen_lock.currentGen();
-            zag.syscall.pmu.slab_instance.destroy(state, gen) catch unreachable;
+        if (maybe_state_ref) |state_ref| {
+            // self-alive: we just atomically took the ref out of our
+            // own `pmu_state` slot under proc lock; no other observer
+            // can race us to the destroy.
+            arch.pmu.pmuClearState(state_ref.ptr);
+            zag.syscall.pmu.slab_instance.destroy(state_ref.ptr, @intCast(state_ref.gen)) catch unreachable;
         }
 
         // Remove thread handle from own perm table and handler's perm table

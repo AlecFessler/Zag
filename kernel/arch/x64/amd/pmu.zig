@@ -455,7 +455,10 @@ pub fn kprofSampleCheckAndRearm(period_cycles: u64) bool {
 fn pmiHandler(ctx: *cpu.Context) void {
     // Registered as `.external`; `dispatchInterrupt` EOIs after we return.
     const thread = sched.currentThread() orelse return;
-    const state_ptr = thread.pmu_state orelse return;
+    // self-alive: PMI fires on the core running `thread`; pmu_state
+    // can't be freed out from under us during the handler.
+    const state_ref = thread.pmu_state orelse return;
+    const state_ptr = state_ref.ptr;
     if (state_ptr.num_counters == 0) return;
 
     // Stale-PMI filter: any counter whose current value has wrapped back

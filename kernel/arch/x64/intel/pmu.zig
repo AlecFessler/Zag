@@ -373,7 +373,11 @@ fn pmiHandler(ctx: *cpu.Context) void {
     cpu.wrmsr(IA32_PERF_GLOBAL_CTRL, 0);
 
     const thread = sched.currentThread() orelse return;
-    const state_ptr = thread.pmu_state orelse return;
+    // self-alive: PMI fires on the core running `thread`; its pmu_state
+    // slot can't be freed under us because sysPmuStop would need to IPI
+    // this core to clear the MSRs before destroying the slot.
+    const state_ref = thread.pmu_state orelse return;
+    const state_ptr = state_ref.ptr;
 
     // Stale-PMI filter: require at least one overflow bit in the current
     // thread's counter range. Otherwise this is a masked PMI from a prior

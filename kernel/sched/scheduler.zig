@@ -136,8 +136,12 @@ inline fn setIdle(state: *PerCoreState, t: ?*Thread) void {
 inline fn switchToWithPmu(outgoing: *Thread, next: *Thread) void {
     kprof.enter(.sched_switch_pmu);
     defer kprof.exit(.sched_switch_pmu);
-    if (outgoing.pmu_state) |st| arch.pmu.pmuSave(st);
-    if (next.pmu_state) |st| arch.pmu.pmuRestore(st);
+    // self-alive: switchToWithPmu is called from the scheduler context
+    // switch path; neither outgoing nor next can be destroyed here
+    // (their deinit needs proc._gen_lock which the scheduler doesn't
+    // hold, and the scheduler controls preemption on this core).
+    if (outgoing.pmu_state) |st_ref| arch.pmu.pmuSave(st_ref.ptr);
+    if (next.pmu_state) |st_ref| arch.pmu.pmuRestore(st_ref.ptr);
     // Eager-FPU baseline (-Dlazy_fpu=false): unconditionally save the
     // outgoing thread's FP/SIMD regs and reload the incoming thread's,
     // skipping the trap-driven lazy machinery in arch.cpu.switchTo. The

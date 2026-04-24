@@ -168,12 +168,11 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
         const saved_gen = new_state._gen_lock;
         new_state.* = .{};
         new_state._gen_lock = saved_gen;
-        target_thread.pmu_state = new_state;
+        target_thread.pmu_state = alloc_result;
     }
-    const state = target_thread.pmu_state.?;
-
-    state._gen_lock.lock();
-    defer state._gen_lock.unlock();
+    const state_ref = target_thread.pmu_state.?;
+    const state = state_ref.lock() catch return E_INVAL;
+    defer state_ref.unlock();
     if (is_self) {
         arch.pmu.pmuStart(state, slice) catch return E_INVAL;
     } else {
@@ -208,10 +207,10 @@ pub fn sysPmuRead(proc: *Process, thread_handle: u64, sample_ptr: u64) i64 {
             else => return E_BUSY,
         }
 
-        const state = target_thread.pmu_state orelse return E_INVAL; // §4.52.6
-        state._gen_lock.lock();
+        const state_ref = target_thread.pmu_state orelse return E_INVAL; // §4.52.6
+        const state = state_ref.lock() catch return E_INVAL;
         arch.pmu.pmuRead(state, &sample);
-        state._gen_lock.unlock();
+        state_ref.unlock();
     }
     sample.timestamp = arch.time.getMonotonicClock().now();
 
@@ -239,10 +238,9 @@ pub fn sysPmuReset(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     // §4.53.5: only .faulted is valid.
     if (target_thread.state != .faulted) return E_INVAL;
 
-    const state = target_thread.pmu_state orelse return E_INVAL; // §4.53.6
-
-    state._gen_lock.lock();
-    defer state._gen_lock.unlock();
+    const state_ref = target_thread.pmu_state orelse return E_INVAL; // §4.53.6
+    const state = state_ref.lock() catch return E_INVAL;
+    defer state_ref.unlock();
     // Self vs. remote: a .faulted target can only be `currentThread()`
     // if the thread is handling its own fault (thread-level self-handler,
     // §2.12.7) — otherwise the faulted thread is sitting in its handler's
@@ -285,22 +283,16 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
         }
     }
 
-    const state = target_thread.pmu_state orelse return E_INVAL; // §4.54.5
-
-    state._gen_lock.lock();
-    // Snapshot the live gen while the lock is held so destroy() below
-    // targets this specific tenant. Reading `currentGen()` after the
-    // unlock would be racy — anyone else could have destroyed+realloced
-    // the slot between unlock and destroy.
-    const carried_gen: u63 = @intCast(state._gen_lock.currentGen());
+    const state_ref = target_thread.pmu_state orelse return E_INVAL; // §4.54.5
+    const state = state_ref.lock() catch return E_INVAL;
     if (is_self) {
         arch.pmu.pmuStop(state);
     } else {
         arch.pmu.pmuClearState(state);
     }
-    state._gen_lock.unlock();
+    state_ref.unlock();
     target_thread.pmu_state = null;
-    slab_instance.destroy(state, carried_gen) catch unreachable;
+    slab_instance.destroy(state, @intCast(state_ref.gen)) catch unreachable;
     return E_OK;
 }
 

@@ -567,7 +567,9 @@ pub fn pmiHandler(ctx: *ArchCpuContext) void {
         writePMOVSCLR(~@as(u64, 0));
         return;
     };
-    const state_ptr = thread.pmu_state orelse {
+    // self-alive: PMI fires on the core running `thread`; its pmu_state
+    // slot can't be freed under us during this handler.
+    const state_ref = thread.pmu_state orelse {
         // No PMU state on this thread — another thread's overflow that
         // was latched before the context switch. Mask and clear so the
         // level-sensitive PPI line drops, then return.
@@ -575,6 +577,7 @@ pub fn pmiHandler(ctx: *ArchCpuContext) void {
         writePMOVSCLR(~@as(u64, 0));
         return;
     };
+    const state_ptr = state_ref.ptr;
 
     // Stale-PMI filter: require at least one overflow bit that maps to
     // a counter owned by the current thread. Matches the Intel PMI
