@@ -18,6 +18,7 @@ const ArchCpuContext = arch.cpu.ArchCpuContext;
 const ThreadPriorityQueue = thread_mod.ThreadPriorityQueue;
 const Process = process_mod.Process;
 const ProcessAllocator = process_mod.ProcessAllocator;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;
 const Thread = thread_mod.Thread;
 const ThreadAllocator = thread_mod.ThreadAllocator;
@@ -120,7 +121,7 @@ pub fn removeFromAnyRunQueue(thread: *Thread) void {
 }
 
 const ExitedThread = struct {
-    thread: *Thread,
+    thread: SlabRef(Thread),
 };
 
 const PerCoreState = struct {
@@ -448,7 +449,11 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     // and we still had on_cpu set, the wake spin would deadlock against
     // ourselves. Clearing on_cpu first makes the wake's spin a no-op.
     if (state.exited_thread) |exited| {
-        exited.thread.deinit();
+        // The thread was just preempted on this core; its slot is
+        // still live (deinit below is what frees it). `lock()` would
+        // deadlock with `slab_instance.destroy` inside deinit, so use
+        // .ptr directly — this is a self-alive reference at this point.
+        exited.thread.ptr.deinit();
         state.exited_thread = null;
     }
 
@@ -470,7 +475,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
             state.running_thread = pinned;
 
             if (preempted.state == .exited) {
-                state.exited_thread = .{ .thread = preempted };
+                state.exited_thread = .{ .thread = SlabRef(Thread).init(preempted, preempted._gen_lock.currentGen()) };
             }
 
             state.rq_lock.unlock();
@@ -528,7 +533,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     state.running_thread = next_thread;
 
     if (preempted.state == .exited) {
-        state.exited_thread = .{ .thread = preempted };
+        state.exited_thread = .{ .thread = SlabRef(Thread).init(preempted, preempted._gen_lock.currentGen()) };
     }
 
     state.rq_lock.unlock();

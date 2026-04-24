@@ -19,6 +19,7 @@ const PAddr = zag.memory.address.PAddr;
 const Process = zag.proc.process.Process;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 const SchedInterruptContext = zag.sched.scheduler.SchedInterruptContext;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 const UserViewEntry = zag.perms.permissions.UserViewEntry;
@@ -40,7 +41,7 @@ pub var irq_table: [256]?*DeviceRegion = [_]?*DeviceRegion{null} ** 256;
 /// Per-IRQ-line owner info for the IRQ pending bit path.
 /// Set by registerIrqOwner when a process takes ownership of a device IRQ.
 pub const IrqOwner = struct {
-    process: *Process,
+    process: SlabRef(Process),
     slot_index: u16,
 };
 
@@ -185,7 +186,8 @@ fn deviceIrqHandler(ctx: *cpu.Context) void {
 /// then wake any futex waiters on that physical address.
 /// Called from the device IRQ handler (interrupts disabled).
 fn setIrqPendingBitForOwner(owner: IrqOwner) void {
-    const proc = owner.process;
+    const proc = owner.process.lock() catch return;
+    defer owner.process.unlock();
     if (proc.perm_view_phys.addr == 0) return;
 
     // Calculate physical address of field0 in the user view entry.
@@ -207,7 +209,8 @@ fn setIrqPendingBitForOwner(owner: IrqOwner) void {
 /// Called from sysIrqAck after unmasking the IRQ line.
 pub fn clearIrqPendingBit(irq_line: u8) void {
     const owner = irq_owners[irq_line] orelse return;
-    const proc = owner.process;
+    const proc = owner.process.lock() catch return;
+    defer owner.process.unlock();
     if (proc.perm_view_phys.addr == 0) return;
 
     const field0_paddr = PAddr.fromInt(
@@ -224,7 +227,7 @@ pub fn clearIrqPendingBit(irq_line: u8) void {
 /// a device handle with IRQ rights.
 pub fn registerIrqOwner(irq_line: u8, proc: *Process, slot_index: u16) void {
     irq_owners[irq_line] = .{
-        .process = proc,
+        .process = SlabRef(Process).init(proc, proc._gen_lock.currentGen()),
         .slot_index = slot_index,
     };
 }
