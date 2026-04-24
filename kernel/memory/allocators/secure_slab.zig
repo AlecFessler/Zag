@@ -546,25 +546,23 @@ fn validateT(comptime T: type) void {
         );
     }
 
-    // ---- deferred: offset-0 + extern layout ----
-    // The design ideal is `_gen_lock` at offset 0 in every slab-backed
-    // object — first word of the slot, always. Enforcing that at
-    // comptime demands every slab T be `extern struct` (the only
-    // layout kind that guarantees source-order offsets). Today most
-    // kernel slab types are plain `struct` because they embed `?Stack`,
-    // tagged-union perm tables, and similar constructs that aren't
-    // extern-compatible without restructuring. Field-0 discipline
-    // (checked above) is the practical approximation: Zig rarely
-    // reorders the first field when it's already suitably aligned,
-    // and the explicit `_gen_lock` first-field rule makes the
-    // approximation auditable without cascading a rewrite of every
-    // slab T at this time. When the cascade lands (tracked as a
-    // separate task), restore:
+    // ---- not enforced: extern layout + offset-0 ----
+    // Early drafts of this file called offset-0 the "design ideal" —
+    // `_gen_lock` as the literal first word of every slot. In practice
+    // it's cosmetic: every access goes through `ptr._gen_lock.X` field
+    // syntax, Zig resolves the offset correctly at any layout, and the
+    // freelist is out-of-band (LinkPair in its own region, not inline
+    // in the slot). There is no raw-byte cast or pointer arithmetic
+    // that depends on the gen-lock word sitting at offset 0.
     //
-    //     if (info.@"struct".layout != .@"extern") @compileError(...);
-    //     if (@offsetOf(T, "_gen_lock") != 0)     @compileError(...);
-    //
-    // which will then close the loop.
+    // Forcing `extern struct` would demand replacing every `?T` in the
+    // slab types (Process.parent, Thread.user_stack, Thread.*_affinity,
+    // etc.) with a sentinel-encoded non-optional — and the natural
+    // sentinel for `?SlabRef(T)` would be `gen = 0`, which collides
+    // with the gen-parity invariant (gen 0 is a freed-slot value, not
+    // a "none" value). So the offset-0 goal is abandoned, not
+    // deferred. The first-field discipline check above is the audit
+    // rule that remains.
 }
 
 fn bumpOne(ba: *bump.BumpAllocator, comptime R: type) ?*R {
