@@ -1093,22 +1093,24 @@ pub const Process = struct {
         while (self.fault_box.dequeueLocked()) |_| {}
         self.fault_box.lock.unlock();
 
+        // Snapshot thread-entry refs under perm_lock WITHOUT taking each
+        // thread's gen-lock: the `perm_lock → Thread._gen_lock` edge
+        // closes a 3-class cycle with the `Thread._gen_lock →
+        // Process._gen_lock → Process.perm_lock` edges established by
+        // the PMU syscalls / transferCapability. Break the cycle by
+        // deferring per-thread work until after perm_lock is dropped.
+        // The snapshot is bounded by the static `MAX_PERMS` table size
+        // — it cannot grow past the set we iterate here.
+        var thread_snapshot: [MAX_PERMS]SlabRef(Thread) = undefined;
+        var snapshot_len: usize = 0;
         self.perm_lock.lock();
         for (&self.perm_table) |*entry| {
             if (entry.object == .vm_reservation) {
                 entry.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
             } else if (entry.object == .thread) {
-                // Unpin any pinned threads before clearing the entry
-                if (entry.object.thread.lock()) |t| {
-                    if (t.priority == .pinned) {
-                        const core_id = @ctz(t.core_affinity orelse 0);
-                        entry.object.thread.unlock();
-                        sched.unpinByRevoke(core_id);
-                    } else {
-                        entry.object.thread.unlock();
-                    }
-                } else |_| {}
+                thread_snapshot[snapshot_len] = entry.object.thread;
+                snapshot_len += 1;
                 entry.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
             }
@@ -1117,6 +1119,19 @@ pub const Process = struct {
         self.suspended_thread_slots = 0;
         self.syncUserView();
         self.perm_lock.unlock();
+
+        // Process the snapshot after releasing perm_lock. Take each
+        // thread's gen-lock individually to read priority / affinity —
+        // a stale ref (freed since the snapshot) is a benign no-op.
+        for (thread_snapshot[0..snapshot_len]) |thread_ref| {
+            if (thread_ref.lock()) |t| {
+                defer thread_ref.unlock();
+                if (t.priority == .pinned) {
+                    const core_id = @ctz(t.core_affinity orelse 0);
+                    sched.unpinByRevoke(core_id);
+                }
+            } else |_| {}
+        }
 
         self.updateParentView();
 

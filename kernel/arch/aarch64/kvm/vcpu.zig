@@ -346,8 +346,11 @@ pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
     if (vcpu_obj.loadState() != .idle) return E_BUSY;
 
     vcpu_obj.storeState(.running);
-    const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
-    defer vcpu_obj.thread.unlock();
+    // Reuse the gen-lock we already hold on `entry.object.thread`:
+    // `vcpuFromThread` matched by identity, so `vcpu_obj.thread.ptr ==
+    // thread_ptr`. Taking a second gen-lock on the same Thread slot
+    // would self-deadlock on the lock bit.
+    const thread = thread_ptr;
     thread.state = .ready;
     const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
     sched.enqueueOnCore(target_core, thread);
@@ -416,8 +419,9 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
 
     // If running, IPI to suspend so we get a stable snapshot.
     if (state_snapshot == .running) {
-        const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
-        defer vcpu_obj.thread.unlock();
+        // Reuse the already-held gen-lock on `entry.object.thread`;
+        // vcpu_obj.thread aliases the same slot (see `vcpuFromThread`).
+        const thread = thread_ptr;
         if (sched.coreRunning(thread)) |core_id| {
             gic.sendSchedulerIpi(core_id);
             while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
@@ -431,8 +435,8 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     if (!write_ok) return E_BADADDR;
 
     if (state_snapshot == .running) {
-        const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
-        defer vcpu_obj.thread.unlock();
+        // Same aliased Thread slot; reuse the outer gen-lock.
+        const thread = thread_ptr;
         thread.state = .ready;
         const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
         sched.enqueueOnCore(target_core, thread);
@@ -475,28 +479,21 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     const interrupt = std.mem.bytesAsValue(vm_hw.GuestInterrupt, &int_buf).*;
 
     if (state_snapshot == .running) {
-        // Suspend phase. Bracket just the scheduler interaction so we
-        // do not hold the thread's gen-lock across `vm_obj._gen_lock`
-        // below — the established lock order is (vm, then thread).
-        {
-            const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
-            defer vcpu_obj.thread.unlock();
-            if (sched.coreRunning(thread)) |core_id| {
-                gic.sendSchedulerIpi(core_id);
-                while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
-            }
+        // Suspend phase. Reuse the already-held gen-lock on
+        // `entry.object.thread`; `vcpu_obj.thread` aliases the same
+        // Thread slot, so a second lock here would self-deadlock.
+        if (sched.coreRunning(thread_ptr)) |core_id| {
+            gic.sendSchedulerIpi(core_id);
+            while (thread_ptr.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
         }
         vm_obj._gen_lock.lock();
         injectInterrupt(&vcpu_obj.guest_state, interrupt);
         vm_obj._gen_lock.unlock();
-        // Resume phase.
-        {
-            const thread_resumed = vcpu_obj.thread.lock() catch return E_BADCAP;
-            defer vcpu_obj.thread.unlock();
-            thread_resumed.state = .ready;
-            const target_core = if (thread_resumed.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
-            sched.enqueueOnCore(target_core, thread_resumed);
-        }
+        // Resume phase. Same aliased Thread slot; reuse the outer lock.
+        const thread_resumed = thread_ptr;
+        thread_resumed.state = .ready;
+        const target_core = if (thread_resumed.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
+        sched.enqueueOnCore(target_core, thread_resumed);
     } else {
         vm_obj._gen_lock.lock();
         defer vm_obj._gen_lock.unlock();

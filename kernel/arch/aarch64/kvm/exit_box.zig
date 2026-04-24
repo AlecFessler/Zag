@@ -324,9 +324,11 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
             vm_obj._gen_lock.lock();
             vcpu_obj.storeState(.exited);
             vm_obj._gen_lock.unlock();
-            thread._gen_lock.lock();
+            // No inner thread._gen_lock — the outer `entry.object.thread`
+            // lock taken at function entry is still held (defer'd to
+            // function exit), and that's the same Thread slot. Re-locking
+            // would spin on our own already-held lock bit.
             thread.state = .exited;
-            thread._gen_lock.unlock();
         },
         else => return E_INVAL,
     }
