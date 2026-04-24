@@ -375,6 +375,152 @@ def find_bare_slab_pointer_fields(
 
 
 # ---------------------------------------------------------------------------
+# Step 1c: .ptr bypass — naming a slab *T outside a ref.lock() scope
+# ---------------------------------------------------------------------------
+
+# A chain `<prefix>.ptr` where <prefix> evaluates to `SlabRef(T)` for
+# some slab-backed T extracts the raw `*T` without verifying the gen.
+# This defeats the whole fat-pointer invariant. Flag every such chain,
+# with two narrowly-scoped exceptions:
+#
+#   (1) Identity comparison: `ref.ptr == other` / `other == ref.ptr`.
+#       Reading the address is not a deref.
+#
+#   (2) Explicitly self-alive `.ptr` usage immediately preceded by a
+#       `// self-alive` comment on the same or previous line. This is
+#       the documented escape hatch for fresh-alloc init paths,
+#       teardown paths where the caller owns lifetime, etc.
+#
+# SlabRef-valued prefixes we recognize (conservative; the goal is to
+# catch the common bypass forms, not every obscure chain):
+#   * `<ident>.<variant>` where <variant> is a KernelObject tag:
+#       entry.thread, entry.process, entry.shared_memory, …
+#   * `<ident>.object.<variant>`: entry.object.thread, …
+#   * `<ident>.<field>` where the field is a SlabRef-typed struct field
+#     (the analyzer already knows which fields those are via the
+#     fat-pointer pass).
+#   * Lone `<ident>.ptr` where <ident> is itself SlabRef-typed in env.
+#     Per-entry analysis already tracks this; the standalone pass below
+#     is the file-scale catchall for syntactic bypass.
+
+PTR_BYPASS_EXEMPT_FILES = {
+    "kernel/memory/allocators/secure_slab.zig",
+}
+
+# Matches a dotted chain ending in `.ptr`. The chain head is a bare
+# ident; tails are word-dotted. We capture the full prefix (everything
+# before the trailing `.ptr`) and the prefix's head ident.
+PTR_CHAIN_RE = re.compile(
+    r"(?<![\w.])(\w+(?:\.\w+)*)\.ptr\b"
+)
+
+# Recognize a chain whose tail element is a KernelObject variant —
+# those slots were migrated to SlabRef(T), so `.<variant>.ptr` is the
+# canonical bypass shape.
+KERNEL_OBJ_VARIANTS = set(UNION_VARIANT_TYPES.keys())
+
+# Self-alive exemption: an inline `// self-alive:` comment on the
+# same line, or a `// self-alive` comment on the preceding line,
+# marks the `.ptr` as intentional.
+SELF_ALIVE_COMMENT_RE = re.compile(r"//\s*self-alive")
+
+
+@dataclass
+class PtrBypassFinding:
+    file: Path
+    line: int
+    chain: str   # the full `<prefix>.ptr` chain text
+    context: str # the whole stripped code line for the reader
+
+
+def _ptr_chain_is_identity_cmp(code: str, match: re.Match) -> bool:
+    """True if the `.ptr` access is part of `x.ptr == …` / `… == x.ptr`.
+    Purely positional — we scan a few chars on either side for `==` /
+    `!=` with no other operator in between."""
+    start, end = match.span()
+    # Look right for `==`/`!=` at the next non-space position.
+    right = code[end:].lstrip()
+    if right.startswith("==") or right.startswith("!="):
+        return True
+    # Look left for `==`/`!=` at the prior non-space position.
+    left = code[:start].rstrip()
+    if left.endswith("==") or left.endswith("!="):
+        return True
+    return False
+
+
+def find_ptr_bypasses(slab_types: dict[str, SlabType]) -> list[PtrBypassFinding]:
+    """
+    Walk every kernel .zig file and flag `.ptr` accesses whose
+    immediate prefix is a SlabRef-valued expression. See module-level
+    comment above for the recognized prefix forms + exemptions.
+
+    This is purely syntactic: we do not try to resolve the expression's
+    type in full. We rely on the tail naming convention (KernelObject
+    variant names, known SlabRef-field names) which is tight enough to
+    catch Agent 1's shortcut pattern (`pinned.thread.ptr`,
+    `entry.object.thread.ptr`, etc.) without torturing the caller at
+    every legitimate .ptr use in secure_slab.zig or identity compares.
+    """
+    out: list[PtrBypassFinding] = []
+    # Collect known SlabRef-typed field names from all struct defs in
+    # the kernel. If a line contains `foo.<field>.ptr` and <field> is a
+    # SlabRef-typed field name we have on record, treat it as a bypass.
+    slab_field_names: set[str] = set()
+    for fpath in iter_zig_files(KERNEL_DIR):
+        lines = fpath.read_text().splitlines()
+        for raw in lines:
+            code = strip_comments(raw)
+            m = FIELD_LINE_RE.match(code)
+            if not m:
+                continue
+            field_name, field_type = m.group(1), m.group(2).strip()
+            if SLAB_REF_RE.search(field_type):
+                slab_field_names.add(field_name)
+
+    # Variant tail names (KernelObject) are also SlabRef-yielding by
+    # construction after the perms migration. Seed them explicitly.
+    slab_field_names |= KERNEL_OBJ_VARIANTS
+
+    for fpath in iter_zig_files(KERNEL_DIR):
+        rel = str(fpath.relative_to(REPO_ROOT))
+        if rel in PTR_BYPASS_EXEMPT_FILES:
+            continue
+        lines = fpath.read_text().splitlines()
+        for i, raw in enumerate(lines):
+            code = strip_comments(raw)
+            # Self-alive comment on this line → skip every .ptr hit on
+            # this line. Same on the previous line → skip this line's
+            # hits. Conservative but easy to reason about.
+            if SELF_ALIVE_COMMENT_RE.search(raw):
+                continue
+            if i > 0 and SELF_ALIVE_COMMENT_RE.search(lines[i - 1]):
+                continue
+            for m_chain in PTR_CHAIN_RE.finditer(code):
+                chain = m_chain.group(1)
+                if "." not in chain:
+                    # Bare `ident.ptr` — only flag if `ident` is a
+                    # field-ish name likely to be SlabRef-typed.
+                    # Per-entry analysis in bracket_check handles the
+                    # rigorous version; this pass would be noisy if it
+                    # flagged every `something.ptr` (there are legitimate
+                    # raw-pointer `.ptr` fields on intrusive lists etc.).
+                    continue
+                tail = chain.rsplit(".", 1)[-1]
+                if tail not in slab_field_names:
+                    continue
+                if _ptr_chain_is_identity_cmp(code, m_chain):
+                    continue
+                out.append(PtrBypassFinding(
+                    file=fpath,
+                    line=i + 1,
+                    chain=chain + ".ptr",
+                    context=code.strip(),
+                ))
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Step 2: discover kernel entry points
 # ---------------------------------------------------------------------------
 
@@ -1700,6 +1846,12 @@ def main() -> int:
     # carry the gen needed for lockWithGen at access time.
     bare_ptr_findings = find_bare_slab_pointer_fields(slab_types)
 
+    # `.ptr` bypass: naming a slab-backed *T outside a ref.lock() scope.
+    # Fields are fat, but if a caller extracts `ref.ptr` and then uses
+    # the raw pointer with bare `_gen_lock.lock()`, the gen check is
+    # skipped and UAF is back on the table.
+    ptr_bypass_findings = find_ptr_bypasses(slab_types)
+
     fn_index = build_method_index(slab_names)
     if args.list_methods:
         print(f"Methods on slab-backed types ({len(fn_index)}):")
@@ -1759,11 +1911,26 @@ def main() -> int:
     total_bare_ptr = len(bare_ptr_findings)
     total_errs += total_bare_ptr
 
+    # Emit .ptr-bypass findings. These are errors — every such site
+    # skips the gen check, which is the whole point of SlabRef. The
+    # exception mechanism is an inline `// self-alive: <why>` comment
+    # for documented-safe uses (teardown, fresh-alloc init).
+    if ptr_bypass_findings:
+        print()
+        print(f"SlabRef `.ptr` bypass ({len(ptr_bypass_findings)} sites):")
+        for f in ptr_bypass_findings:
+            rel = f.file.relative_to(REPO_ROOT)
+            print(f"  [ERR ] {rel}:{f.line}  {f.chain}  →  use `<ref>.lock()` / `<ref>.unlock()` bracket")
+            print(f"         {f.context[:120]}")
+    total_bypass = len(ptr_bypass_findings)
+    total_errs += total_bypass
+
     print()
     print(f"Summary: {len(results)} entries, {total_tracked} tracked idents, "
           f"{total_errs} err, {total_infos} info")
     print(f"         {len(slab_types)} slab-backed types discovered")
     print(f"         {total_bare_ptr} bare-pointer fat-pointer violations")
+    print(f"         {total_bypass} `.ptr` bypass sites")
 
     # Exit nonzero on any err. Info findings are informational and do
     # not gate. This makes the tool a real CI check once wired into
