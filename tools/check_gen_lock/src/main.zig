@@ -829,6 +829,104 @@ const StructField = struct {
     field_type: []const u8, // borrowed (stripped code slice of the type)
 };
 
+// Module-level `var/const <name>: <type> = ...` declarations. Used by
+// the lock-ordering analyzer to resolve locals like
+// `const state = &core_states[core_id];` — without this, the receiver
+// `state` is untyped and subsequent `state.rq_lock.lockIrqSave()` calls
+// can't classify.
+//
+// Scope for v3: keyed by bare name (not file-qualified). If two files
+// declare same-named globals the map takes last-wins. Internal to
+// each file's walks, this is almost always unique — cross-file access
+// goes through `module.name` which we don't normalize here.
+const ModuleGlobal = struct {
+    name: []const u8, // interned
+    bare_type: []const u8, // interned — e.g. "PerCoreState", "Vmm", "SpinLock"
+    is_array: bool, // true when the declared type is `[N]T`
+};
+
+fn scanModuleGlobals(
+    gpa: Allocator,
+    pool: *Pool,
+    sf: *const SourceFile,
+    toks: []const Tok,
+    out: *StringStringMap,
+) !void {
+    _ = gpa;
+    // Walk tokens at the file's top-level (brace_depth 0, paren_depth 0)
+    // looking for `pub? (var|const) <ident>: <type> ...`. The `: type`
+    // distinguishes typed globals from `const X = 42` style value decls
+    // (no type annotation) where inferring the type needs real
+    // type-checking — out of scope for v3. Missing an un-annotated
+    // global is fine; the lock-ordering analyzer just skips receivers
+    // it can't resolve.
+    var brace_depth: i32 = 0;
+    var paren_depth: i32 = 0;
+    var i: usize = 0;
+    while (i < toks.len) : (i += 1) {
+        const t = toks[i];
+        switch (t.tag) {
+            .l_brace => brace_depth += 1,
+            .r_brace => brace_depth -= 1,
+            .l_paren => paren_depth += 1,
+            .r_paren => paren_depth -= 1,
+            else => {},
+        }
+        if (brace_depth != 0 or paren_depth != 0) continue;
+        if (t.tag != .keyword_var and t.tag != .keyword_const) continue;
+        if (i + 3 >= toks.len) continue;
+        if (toks[i + 1].tag != .identifier) continue;
+        if (toks[i + 2].tag != .colon) continue;
+        const name = tokSlice(sf, toks[i + 1]);
+        // Collect the type expression from after `:` until the next
+        // top-level `=` or `;`.
+        const type_start_idx = i + 3;
+        var j: usize = type_start_idx;
+        var inner_paren: i32 = 0;
+        var inner_bracket: i32 = 0;
+        while (j < toks.len) : (j += 1) {
+            switch (toks[j].tag) {
+                .l_paren => inner_paren += 1,
+                .r_paren => inner_paren -= 1,
+                .l_bracket => inner_bracket += 1,
+                .r_bracket => inner_bracket -= 1,
+                else => {},
+            }
+            if (inner_paren == 0 and inner_bracket == 0) {
+                if (toks[j].tag == .equal or toks[j].tag == .semicolon) break;
+            }
+        }
+        if (j <= type_start_idx) continue;
+        const type_start_byte = toks[type_start_idx].start;
+        const type_end_byte = toks[j].start;
+        const type_text = trimAscii(sf.source[type_start_byte..type_end_byte]);
+        if (type_text.len == 0) continue;
+        // Strip leading `[N]` / `[_]` for array globals — element type
+        // is what matters when callers do `&global[idx]`.
+        var te = type_text;
+        if (te.len > 0 and te[0] == '[') {
+            if (mem.indexOfScalar(u8, te, ']')) |close| {
+                te = trimAscii(te[close + 1 ..]);
+            }
+        }
+        const bare = typeNameFromFieldType(te);
+        if (bare.len == 0) continue;
+        // Skip primitive / stdlib types — they don't own lock fields.
+        if (mem.eql(u8, bare, "bool") or
+            mem.eql(u8, bare, "u8") or mem.eql(u8, bare, "u16") or
+            mem.eql(u8, bare, "u32") or mem.eql(u8, bare, "u64") or
+            mem.eql(u8, bare, "usize") or
+            mem.eql(u8, bare, "i8") or mem.eql(u8, bare, "i16") or
+            mem.eql(u8, bare, "i32") or mem.eql(u8, bare, "i64") or
+            mem.eql(u8, bare, "isize") or
+            mem.startsWith(u8, bare, "std")) continue;
+        const name_i = try pool.intern(name);
+        const bare_i = try pool.intern(bare);
+        try out.put(name_i, bare_i);
+        i = j;
+    }
+}
+
 // Walks a file's tokens finding lines where a struct field appears at
 // brace-depth >= 1 and paren-depth == 0. For each such line, we emit
 // StructField. The field-recognition pattern is identifier + `:` +
@@ -1620,6 +1718,7 @@ const Ctx = struct {
     fn_index: *FnIndex,
     summaries: *SummaryMap,
     lock_fields: *const LockFieldMap,
+    module_globals: *const StringStringMap,
 
     fn fileTokens(self: *const Ctx, sf: *const SourceFile) []const Tok {
         for (self.files, self.tokens_per_file) |f, toks| {
@@ -2528,6 +2627,33 @@ fn walkBody(
                     const bare_i = try ctx.pool.intern(bare);
                     try env.all_types.put(dp.name, bare_i);
                 }
+            } else {
+                // No annotation — try to resolve via module-global lookup
+                // of the RHS. Patterns we handle:
+                //   `&<name>`, `&<name>[...]`, `<name>`, `<name>[...]`
+                // each produces a local of (element) type <name>'s
+                // declared bare type. Covers scheduler-style per-core
+                // state slots and similar module-backed data.
+                const rhs_plain = stripPostfix(dp.rhs);
+                var start: usize = 0;
+                if (rhs_plain.len > 0 and rhs_plain[0] == '&') start = 1;
+                while (start < rhs_plain.len and ascii.isWhitespace(rhs_plain[start])) start += 1;
+                var end: usize = start;
+                while (end < rhs_plain.len and isIdentChar(rhs_plain[end])) end += 1;
+                if (end > start) {
+                    const lead = rhs_plain[start..end];
+                    // Accept if the only trailing content is `[...]` or
+                    // the string ends immediately — anything else (like
+                    // `.field`, `(`, `+`) means the RHS isn't a plain
+                    // global reference.
+                    const after = trimAscii(rhs_plain[end..]);
+                    const plain_ok = after.len == 0 or after[0] == '[';
+                    if (plain_ok) {
+                        if (ctx.module_globals.get(lead)) |mty| {
+                            try env.all_types.put(dp.name, mty);
+                        }
+                    }
+                }
             }
 
             if (!became_self_alive) {
@@ -3234,6 +3360,7 @@ fn analyzeEntry(
     fn_index: *FnIndex,
     summaries: *SummaryMap,
     lock_fields: *const LockFieldMap,
+    module_globals: *const StringStringMap,
     entry: *const EntryPoint,
     out_env: *SlabEnv,
     out_events: *EventMap,
@@ -3298,6 +3425,7 @@ fn analyzeEntry(
         .fn_index = fn_index,
         .summaries = summaries,
         .lock_fields = lock_fields,
+        .module_globals = module_globals,
     };
 
     var seq: u32 = 0;
@@ -4119,6 +4247,30 @@ pub fn main() !u8 {
     defer lock_fields.deinit();
     try buildLockFieldMap(gpa, &pool, struct_fields.items, &lock_fields);
 
+    // Module-level globals. Every `var/const NAME: TYPE` at file scope
+    // contributes a NAME → element type entry; walks resolve locals
+    // that reference these globals (e.g. `const state =
+    // &core_states[i];`) so downstream lock-field accesses through
+    // those locals classify correctly.
+    var module_globals = StringStringMap.init(gpa);
+    defer module_globals.deinit();
+    for (files.items, tokens.items) |sf, t| {
+        try scanModuleGlobals(gpa, &pool, sf, t, &module_globals);
+    }
+    if (args.list_lock_pairs) {
+        try w.print("\nModule globals ({d}):\n", .{module_globals.count()});
+        var mit = module_globals.iterator();
+        while (mit.next()) |kv| {
+            try w.print("  {s} : {s}\n", .{ kv.key_ptr.*, kv.value_ptr.* });
+        }
+        try w.print("\nLock fields ({d}):\n", .{lock_fields.count()});
+        var lit = lock_fields.iterator();
+        while (lit.next()) |kv| {
+            try w.print("  {s}.{s} → {s}\n", .{ kv.key_ptr.owner, kv.key_ptr.field, kv.value_ptr.* });
+        }
+        try w.writeAll("\n");
+    }
+
     var results = ArrayList(CheckResult).empty;
     defer {
         for (results.items) |*r| r.deinit(gpa);
@@ -4141,7 +4293,7 @@ pub fn main() !u8 {
     for (entries.items) |*entry| {
         var env = SlabEnv.init(gpa);
         var events = EventMap.init(gpa);
-        try analyzeEntry(gpa, &pool, files.items, tokens.items, &slab_types, &fn_index, &summaries, &lock_fields, entry, &env, &events);
+        try analyzeEntry(gpa, &pool, files.items, tokens.items, &slab_types, &fn_index, &summaries, &lock_fields, &module_globals, entry, &env, &events);
         var res = CheckResult{
             .entry = entry,
             .env = env,
