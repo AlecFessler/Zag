@@ -603,14 +603,21 @@ def _split_param(s: str) -> tuple[str, str]:
 
 def parse_type_ref(type_str: str) -> str | None:
     """
-    Extract the trailing type name from a type string like `*Process`,
-    `?*Process`, `*const Thread`, etc. Returns None if the type is not
-    a pointer-like reference.
+    Extract the trailing slab-type name from a type string. Accepts:
+      `*Process`, `?*Process`, `*const Thread`       — bare pointers
+      `SlabRef(Process)`, `?SlabRef(Process)`         — fat pointers
+    Returns None if the type is not a pointer-like reference to a
+    nameable type. Callers that care about the distinction between fat
+    and bare should check the original type string for `SlabRef(`.
     """
     t = type_str.strip()
     # Strip optional `?`
     if t.startswith("?"):
         t = t[1:].strip()
+    # SlabRef(T) — extract T.
+    m = re.match(r"SlabRef\s*\(\s*(\w+)\s*\)", t)
+    if m:
+        return m.group(1)
     if not t.startswith("*"):
         return None
     t = t[1:].strip()
@@ -847,6 +854,7 @@ def _walk_body(
     src_file: Path,
     env: dict[str, str],
     self_alive: set[str],
+    fat_idents: set[str],
     slab_types: set[str],
     fn_index: dict[tuple[str, str], FnInfo],
     accesses: dict[str, list[Access]],
@@ -859,9 +867,12 @@ def _walk_body(
     """Walk one fn body's lines, emitting accesses/lock_ops and recursing
     into resolvable method calls on slab idents.
 
-    env / self_alive are MUTATED for entry-level bodies (we want decls to
-    persist forward). Callee recursion uses forked copies so changes in
-    inlined method bodies don't leak back to the caller's scope.
+    env / self_alive / fat_idents are MUTATED for entry-level bodies
+    (we want decls to persist forward). Callee recursion uses forked
+    copies so changes in inlined method bodies don't leak back to the
+    caller's scope. `fat_idents` tags idents whose storage is
+    `SlabRef(T)` — these use `.lock()` / `.unlock()` as lock ops rather
+    than `._gen_lock.lock()` / `._gen_lock.unlock()`.
     """
     # Brace-depth-aware defer tracker. `defer X._gen_lock.unlock()` fires
     # at the matching `}` of its enclosing block. Record pending defers
@@ -944,6 +955,12 @@ def _walk_body(
             ann = (m.group(2) or "").strip()
             rhs = m.group(3)
             resolved = None
+            # Is the declared/inferred type a SlabRef(T)? Track so later
+            # lock-op detection knows whether `.lock()` or `._gen_lock.lock()`
+            # is the expected form.
+            is_fat = bool(re.search(r"\bSlabRef\s*\(", ann)) or bool(
+                re.search(r"\bSlabRef\s*\(", rhs)
+            )
             if ann:
                 ty = parse_type_ref(ann)
                 if ty and ty in slab_types:
@@ -1027,6 +1044,8 @@ def _walk_body(
 
             if resolved:
                 env[name] = resolved
+                if is_fat:
+                    fat_idents.add(name)
 
         # Refcount-pinning detector. The idiomatic pin pair in this
         # kernel is:
@@ -1042,12 +1061,16 @@ def _walk_body(
         if m_pin:
             self_alive.add(m_pin.group(1))
 
-        # Lock / unlock / defer-unlock ops on slab idents.
-        # Explicit `lock()`, `unlock()`, and `lockWithGen()` are recorded
-        # at this synth line. A `defer <ident>._gen_lock.unlock()` is
-        # recorded as a "defer-unlock" at this line AND queued to fire a
-        # synthetic `unlock` event at the synth line where its enclosing
-        # block closes — see `pending_defers` / `emit_defer_fires`.
+        # Lock / unlock / defer-unlock ops on slab idents. Two forms:
+        #   (a) `ident._gen_lock.lock() / unlock() / lockWithGen()` —
+        #       the legacy form on bare *T slab pointers.
+        #   (b) `ident.lock() / unlock()` — the SlabRef(T) form. Only
+        #       counted when `ident in fat_idents`; otherwise a generic
+        #       `.lock()` method call on some unrelated type would be
+        #       misread as a gen-lock op.
+        # A `defer <ident>[._gen_lock].unlock()` fires at the enclosing
+        # block's `}` — synthesized into a pending_defers queue that
+        # emits the unlock at the correct synth line.
         for m_lock in re.finditer(
             r"\b(\w+)\._gen_lock\.(lock|unlock|lockWithGen)\b", code
         ):
@@ -1066,10 +1089,30 @@ def _walk_body(
                 src_line=src_line,
             ))
             if is_defer and op == "unlock":
-                # brace_depth is the depth entering this line (before any
-                # braces on the line itself). defer fires when the block
-                # containing the defer is left. Assume the defer line
-                # doesn't open/close its own block — it's a bare statement.
+                pending_defers.append((ident, brace_depth))
+        # SlabRef form: `ident.lock()` / `ident.unlock()`. Gated on
+        # fat_idents so only confirmed SlabRef-typed idents match.
+        for m_lock in re.finditer(
+            r"\b(\w+)\.(lock|unlock)\s*\(", code
+        ):
+            ident, op = m_lock.group(1), m_lock.group(2)
+            if ident not in env or ident not in fat_idents:
+                continue
+            is_defer = bool(re.search(
+                rf"\bdefer\s+{re.escape(ident)}\.", code
+            ))
+            # `try ident.lock()` is the usual form because SlabRef.lock
+            # returns `AccessError!*T`. That's a call site detail; the
+            # lock-op itself is still just `.lock()` for our purposes.
+            lock_ops.append(LockOp(
+                line_no=synth,
+                ident=ident,
+                op=("defer-unlock" if (is_defer and op == "unlock") else op),
+                raw=code.strip(),
+                src_file=src_file,
+                src_line=src_line,
+            ))
+            if is_defer and op == "unlock":
                 pending_defers.append((ident, brace_depth))
 
         # Collect every `<ident>.<tail>` on this line, separating METHOD
@@ -1197,12 +1240,14 @@ def _walk_body(
             sub_env = dict(env)
             sub_env[ident] = recv_ty
             sub_self_alive = set(self_alive)
+            sub_fat = set(fat_idents)
             _walk_body(
                 subbed,
                 fninfo.body_first_line,
                 fninfo.file,
                 sub_env,
                 sub_self_alive,
+                sub_fat,
                 slab_types,
                 fn_index,
                 accesses,
@@ -1276,12 +1321,14 @@ def _walk_body(
             sub_env = dict(env)
             sub_env[first_arg] = recv_ty
             sub_self_alive = set(self_alive)
+            sub_fat = set(fat_idents)
             _walk_body(
                 subbed,
                 fninfo.body_first_line,
                 fninfo.file,
                 sub_env,
                 sub_self_alive,
+                sub_fat,
                 slab_types,
                 fn_index,
                 accesses,
@@ -1346,10 +1393,13 @@ def analyze_entry(
     env: dict[str, str] = {}
     self_alive: set[str] = set()
     is_syscall_entry = entry.name.startswith("sys")
+    fat_idents: set[str] = set()
     for pname, ptype in param_types_from_header(concat):
         ty = parse_type_ref(ptype)
         if ty and ty in slab_types:
             env[pname] = ty
+            if re.search(r"\bSlabRef\s*\(", ptype):
+                fat_idents.add(pname)
             # Syscall dispatchers invoke `sys*` entries with proc/thread
             # resolved from the scheduler, so the pointer is self-alive
             # by construction. Fault handlers have no such contract.
@@ -1366,6 +1416,7 @@ def analyze_entry(
         entry.file,
         env,
         self_alive,
+        fat_idents,
         slab_types,
         fn_index,
         accesses,
