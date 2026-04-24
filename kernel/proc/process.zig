@@ -1315,7 +1315,7 @@ pub const Process = struct {
         if (self.vm) |vm_ref| {
             // self-alive: self is being torn down; no other observer
             // can race destroy of our own VM.
-            vm_ref.ptr.destroy();
+            vm_ref.ptr.destroy(@intCast(vm_ref.gen));
             self.vm = null;
         }
 

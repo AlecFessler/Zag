@@ -195,7 +195,7 @@ pub const Thread = struct {
                 if (all_vcpu) {
                     // Destroy the VM — marks all vCPU threads as exited and
                     // removes them from run queues.
-                    vm_obj.destroy();
+                    vm_obj.destroy(@intCast(vm_ref.gen));
 
                     // Deinit the vCPU threads. Each deinit calls removeThread;
                     // the last one triggers lastThreadExited -> process exit.

@@ -216,7 +216,7 @@ pub fn sysRevokePerm(handle: u64) i64 {
             proc.removePerm(handle) catch {};
         },
         .vm => |vm_ref| {
-            vm_ref.ptr.destroy();
+            vm_ref.ptr.destroy(@intCast(vm_ref.gen));
             proc.removePerm(handle) catch {};
         },
         .empty => return E_BADCAP,

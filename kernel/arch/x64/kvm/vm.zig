@@ -65,7 +65,11 @@ pub const Vm = struct {
     ioapic: Ioapic = .{},
 
     /// Destroy this VM: kill all vCPU threads, free structures.
-    pub fn destroy(self: *Vm) void {
+    /// `carried_gen` is the generation the caller's SlabRef(Vm) held;
+    /// passing it through (instead of reading `currentGen()` at destroy
+    /// time) ensures a stale caller panics cleanly rather than freeing
+    /// the wrong tenant of a recycled slot.
+    pub fn destroy(self: *Vm, carried_gen: u63) void {
         // Kill all vCPU threads. self-alive: the vCPU slots were
         // allocated by this VM at create time and have not been freed
         // until this loop runs; no concurrent observer still holds a
@@ -97,8 +101,7 @@ pub const Vm = struct {
             self.owner.unlock();
         } else |_| {}
 
-        const gen = self._gen_lock.currentGen();
-        slab_instance.destroy(self, gen) catch unreachable;
+        slab_instance.destroy(self, carried_gen) catch unreachable;
     }
 
     /// Returns a pointer to the VM's exit box. Used by `vcpu` and
@@ -335,7 +338,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
             proc.removePerm(inserted_handles[k]) catch {};
             k += 1;
         }
-        vm_obj.destroy();
+        vm_obj.destroy(vm_alloc.gen);
         return E_MAXCAP;
     };
 
