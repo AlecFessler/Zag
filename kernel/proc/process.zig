@@ -895,7 +895,7 @@ pub const Process = struct {
                     scrubFromFaultBox(&handler.fault_box, thread);
                 } else |_| {}
             }
-            thread.deinit();
+            thread.deinit(@intCast(thread_ref.gen));
         }
 
         // Edge case: process had 0 threads (shouldn't happen normally).

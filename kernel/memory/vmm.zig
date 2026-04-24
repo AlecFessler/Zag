@@ -119,8 +119,11 @@ fn freeVmNode(node_ref: SlabRef(VmNode)) void {
     // self-alive: caller proves liveness by holding vmm.lock; the node
     // was just removed from `self.nodes[]` and no other context can
     // observe it after that point.
-    const node = node_ref.ptr;
-    vm_node_slab.destroy(node, node._gen_lock.currentGen()) catch unreachable;
+    // Use the carried gen (from the caller's SlabRef) rather than
+    // reading `currentGen()` off the slot — the carried value is what
+    // every prior handle to this node has been validated against, so
+    // destroy targets that specific generation of the slot.
+    vm_node_slab.destroy(node_ref.ptr, @intCast(node_ref.gen)) catch unreachable;
 }
 
 fn cmpAddrToNode(ctx_addr: u64, item: SlabRef(VmNode)) std.math.Order {

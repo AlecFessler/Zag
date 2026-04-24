@@ -118,7 +118,13 @@ pub const Thread = struct {
     /// destination core can safely `fxrstor`.
     last_fpu_core: ?u8 = null,
 
-    pub fn deinit(self: *Thread) void {
+    /// Tear down and free this Thread slot. `carried_gen` is the
+    /// generation carried by the caller's `SlabRef(Thread)` — we
+    /// validate it when destroying the slab slot instead of
+    /// reading `currentGen()` at destroy time, so a stale caller
+    /// (whose ref predated a reallocation) panics cleanly rather
+    /// than freeing the wrong tenant of the slot.
+    pub fn deinit(self: *Thread, carried_gen: u63) void {
         // self-alive: deinit owns teardown of this thread's links; the
         // slot was reached via currentThread() / exited_thread slot /
         // sibling enumeration that already established liveness.
@@ -204,14 +210,13 @@ pub const Thread = struct {
                     // and deinit is what frees these slots — serial calls
                     // keep each slot live until its turn.
                     for (vcpu_threads[0..num_vcpu]) |t_ref| {
-                        t_ref.ptr.deinit();
+                        t_ref.ptr.deinit(@intCast(t_ref.gen));
                     }
                 }
             }
         }
 
-        const gen = self._gen_lock.currentGen();
-        slab_instance.destroy(self, gen) catch unreachable;
+        slab_instance.destroy(self, carried_gen) catch unreachable;
 
         if (is_last) proc.lastThreadExited();
     }

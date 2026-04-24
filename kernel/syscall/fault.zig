@@ -418,8 +418,9 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
             process_mod.scrubFromFaultBoxPub(&proc.fault_box, pending);
             // Release pending_ref before deinit: Thread.deinit calls
             // slab_instance.destroy which re-acquires the same gen-lock.
+            const pending_gen: u63 = @intCast(pending_ref.gen);
             pending_ref.unlock();
-            pending.deinit();
+            pending.deinit(pending_gen);
         },
         fault_resume, fault_resume_modified => {
             if (action == fault_resume_modified) {

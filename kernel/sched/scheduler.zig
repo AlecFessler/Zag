@@ -517,7 +517,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
         // live (deinit below is what frees it). `lock()` would deadlock
         // with `slab_instance.destroy` inside deinit.
         // self-alive: preempted-on-this-core guarantees liveness.
-        exited.thread.ptr.deinit();
+        exited.thread.ptr.deinit(@intCast(exited.thread.gen));
         state.exited_thread = null;
     }
 

@@ -44,10 +44,14 @@ pub fn sysThreadCreate(entry_addr: u64, arg: u64, num_stack_pages_u64: u64) i64 
         error.OutOfKernelStacks => E_NORES,
         else => E_NOMEM,
     };
+    // Carry the fresh gen straight out of Thread.create so every
+    // rollback `deinit()` targets the slot we just allocated,
+    // independent of anything that may have happened since.
+    const thread_gen: u63 = @intCast(thread._gen_lock.currentGen());
 
     // Insert thread handle into process perm table
     const handle_id = proc.insertThreadHandle(thread, proc.thread_handle_rights) catch {
-        thread.deinit();
+        thread.deinit(thread_gen);
         return E_MAXCAP;
     };
 
@@ -65,13 +69,13 @@ pub fn sysThreadCreate(entry_addr: u64, arg: u64, num_stack_pages_u64: u64) i64 
                 // OK
             } else |_| {
                 proc.removePerm(handle_id) catch {};
-                thread.deinit();
+                thread.deinit(thread_gen);
                 return E_MAXCAP;
             }
         } else |_| {
             // Handler slot has been recycled — treat as no handler.
             proc.removePerm(handle_id) catch {};
-            thread.deinit();
+            thread.deinit(thread_gen);
             return E_MAXCAP;
         }
     }
@@ -394,7 +398,7 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
     }
     // deinit removes thread handles from perm tables, frees stacks,
     // calls lastThreadExited (which triggers process exit/restart).
-    target.deinit();
+    target.deinit(@intCast(pinned.thread.gen));
 
     return E_OK;
 }
