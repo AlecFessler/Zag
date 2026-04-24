@@ -1588,6 +1588,13 @@ const ParamEvent = struct {
     // false-positive — and the SCC still fires if any other site also
     // establishes the same edge.
     group_id: u32 = 0,
+    // Mirrors Event.lock_class. Required for plain SpinLock / non-
+    // gen-lock classifications to survive summary → fold: the callee
+    // resolves `<recv>.<field>.lock()` to a class like "Vmm.lock" and
+    // stamps that on the lock event; without preserving it through the
+    // summary the caller would fall back to `<slab_type>._gen_lock`
+    // synthesis and mis-classify the edge.
+    lock_class: []const u8 = "",
 };
 
 const Summary = struct {
@@ -2223,6 +2230,7 @@ fn getOrBuildSummary(
                 .order = ev.seq,
                 .tail = tail_i,
                 .group_id = ev.group_id,
+                .lock_class = ev.lock_class,
             });
         }
     }
@@ -2269,7 +2277,7 @@ fn foldSummary(
             .lock_with_gen => .lock_with_gen,
         };
         const slab_ty = env.map.get(arg) orelse "";
-        try emitEventG(ctx.gpa, ec, arg, kind, src_line, pe.tail, slab_ty, pe.group_id);
+        try emitEventGC(ctx.gpa, ec, arg, kind, src_line, pe.tail, slab_ty, pe.group_id, pe.lock_class);
     }
 }
 
@@ -2627,22 +2635,34 @@ fn walkBody(
         // with the slab_type alone and the pair extractor synthesizes
         // `"<Slab>._gen_lock"` from it. Double-emitting would produce
         // ghost pairs.
+        //
+        // Both `.lock(` and `.lockIrqSave(` acquire; `.unlock(` and
+        // `.unlockIrqRestore(` release. The IRQ variants live on
+        // SpinLock and are the usual form in scheduler / IRQ paths.
         {
+            const LockForm = struct {
+                tag: []const u8,
+                is_lock: bool,
+            };
+            const forms = [_]LockForm{
+                .{ .tag = ".lock(", .is_lock = true },
+                .{ .tag = ".lockIrqSave(", .is_lock = true },
+                .{ .tag = ".unlock(", .is_lock = false },
+                .{ .tag = ".unlockIrqRestore(", .is_lock = false },
+            };
             var pos: usize = 0;
             while (pos < code.len) {
-                const lock_p = mem.indexOf(u8, code[pos..], ".lock(");
-                const unlock_p = mem.indexOf(u8, code[pos..], ".unlock(");
                 var hit: ?usize = null;
                 var op_is_lock = false;
                 var skip: usize = 0;
-                if (lock_p != null and (unlock_p == null or lock_p.? < unlock_p.?)) {
-                    hit = pos + lock_p.?;
-                    op_is_lock = true;
-                    skip = ".lock(".len;
-                } else if (unlock_p != null) {
-                    hit = pos + unlock_p.?;
-                    op_is_lock = false;
-                    skip = ".unlock(".len;
+                for (forms) |f| {
+                    const fp = mem.indexOf(u8, code[pos..], f.tag) orelse continue;
+                    const abs = pos + fp;
+                    if (hit == null or abs < hit.?) {
+                        hit = abs;
+                        op_is_lock = f.is_lock;
+                        skip = f.tag.len;
+                    }
                 }
                 if (hit == null) break;
                 const at = hit.?;
