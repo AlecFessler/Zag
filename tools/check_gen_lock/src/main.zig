@@ -136,6 +136,21 @@ const PTR_BYPASS_EXEMPT_FILES = [_][]const u8{
 
 const TEST_FIXTURE_TYPES = [_][]const u8{"TestT"};
 
+// Blessed helpers for ordered same-type lock acquisition. A call like
+// `lockPair(a, b)` internally acquires `a` and `b` in a deterministic
+// address-ordered sequence, so the same-type nesting within that single
+// call is safe-by-construction — equivalent to Linux's
+// mutex_lock_nested / spin_lock_nested "subclass" annotation but
+// expressed as a helper name instead of a magic comment. The lock-order
+// cycle detector skips same-type pairs whose events share an
+// ordered_group id emitted by one of these helpers.
+const ORDERED_PAIR_LOCK_HELPERS = [_][]const u8{
+    "lockPair",
+};
+const ORDERED_PAIR_UNLOCK_HELPERS = [_][]const u8{
+    "unlockPair",
+};
+
 // -----------------------------------------------------------------
 // Small helper types
 // -----------------------------------------------------------------
@@ -557,6 +572,40 @@ const Event = struct {
     seq: u32, // per-entry insertion order
     tail: []const u8 = "", // method / field name for access events
     slab_type: []const u8 = "",
+    // Non-zero when this lock/unlock event was emitted by an ordered-pair
+    // helper call (`lockPair`, `unlockPair`). Two lock events sharing the
+    // same non-zero group_id are treated as a single atomic ordered
+    // acquisition when the cycle detector considers same-type pairs —
+    // their mutual self-loop is suppressed because the helper enforces a
+    // deterministic address-order internally. Cross-type pairs from
+    // ordered groups still contribute normal edges; only the same-type
+    // self-loop between the group's members is elided.
+    group_id: u32 = 0,
+};
+
+// -----------------------------------------------------------------
+// Lock-ordering graph: pairs + cycles.
+// -----------------------------------------------------------------
+//
+// A LockClass is an interned string identifying a lock *type* — e.g.
+// "Process._gen_lock", "Thread._gen_lock". Instances of the same class
+// are interchangeable for graph purposes (two Process objects' gen-locks
+// share a class, same as Linux lockdep's lock_class).
+//
+// A LockPair (outer_class → inner_class) records that some function was
+// observed to hold `outer` when acquiring `inner`. A cycle in the
+// directed graph of pairs indicates a potential deadlock: thread A
+// holding outer→inner and thread B holding inner→outer can deadlock
+// regardless of which specific instances each thread acquires.
+
+const LockPair = struct {
+    outer: []const u8, // interned class
+    inner: []const u8, // interned class
+    file_rel: []const u8, // borrowed
+    line: u32, // call-site line where `inner` was acquired
+    entry_name: []const u8, // borrowed
+    outer_ident: []const u8, // borrowed
+    inner_ident: []const u8, // borrowed
 };
 
 // -----------------------------------------------------------------
@@ -1504,6 +1553,18 @@ const ParamEvent = struct {
     param_idx: usize,
     order: u32, // relative order within the callee body
     tail: []const u8 = "",
+    // Mirrors Event.group_id — preserved through summary/fold so an
+    // ordered-pair helper call inside a helper function still
+    // suppresses the same-type self-loop when its caller replays the
+    // summary. group_id values are unique within one walk (callee's
+    // walk produces them), so folding into a caller where the caller
+    // has its own ordered_group_counter can't collide — we remap by
+    // adding a caller-side offset at fold time. For v1 we just preserve
+    // the callee's value; collisions across callees are rare enough
+    // that they'd appear as an accidental suppression, not a cycle
+    // false-positive — and the SCC still fires if any other site also
+    // establishes the same edge.
+    group_id: u32 = 0,
 };
 
 const Summary = struct {
@@ -1983,6 +2044,19 @@ fn emitEvent(
     tail: []const u8,
     slab_type: []const u8,
 ) !void {
+    return emitEventG(gpa, ec, ident, kind, src_line, tail, slab_type, 0);
+}
+
+fn emitEventG(
+    gpa: Allocator,
+    ec: *EmitCtx,
+    ident: []const u8,
+    kind: EventKind,
+    src_line: u32,
+    tail: []const u8,
+    slab_type: []const u8,
+    group_id: u32,
+) !void {
     if (ec.emit_param_only and !ec.param_set.contains(ident)) return;
     const gop = try ec.events.getOrPut(ident);
     if (!gop.found_existing) gop.value_ptr.* = EventList.empty;
@@ -1993,6 +2067,7 @@ fn emitEvent(
         .seq = ec.seq.*,
         .tail = tail,
         .slab_type = slab_type,
+        .group_id = group_id,
     });
 }
 
@@ -2099,6 +2174,7 @@ fn getOrBuildSummary(
                 .param_idx = pi,
                 .order = ev.seq,
                 .tail = tail_i,
+                .group_id = ev.group_id,
             });
         }
     }
@@ -2145,7 +2221,7 @@ fn foldSummary(
             .lock_with_gen => .lock_with_gen,
         };
         const slab_ty = env.map.get(arg) orelse "";
-        try emitEvent(ctx.gpa, ec, arg, kind, src_line, pe.tail, slab_ty);
+        try emitEventG(ctx.gpa, ec, arg, kind, src_line, pe.tail, slab_ty, pe.group_id);
     }
 }
 
@@ -2186,6 +2262,13 @@ fn walkBody(
     var pending_defers = ArrayList(Pending).empty;
     defer pending_defers.deinit(gpa);
     var brace_depth: i32 = 0;
+
+    // Monotonic group counter for ordered-pair helper calls within this
+    // body walk. Each call to `lockPair(a, b)` gets a unique non-zero
+    // group_id that's stamped into every lock event it emits; the cycle
+    // detector uses matching group_ids to suppress the same-type pair
+    // between the helper's argument locks.
+    var ordered_group_counter: u32 = 0;
 
     for (body_lines, 0..) |line, rel| {
         const src_line: u32 = body_start_line + @as(u32, @intCast(rel));
@@ -2482,6 +2565,77 @@ fn walkBody(
             }
         }
 
+        // Ordered-pair helper scan: `lockPair(a, b, ...)` /
+        // `unlockPair(a, b, ...)`. Each match emits a lock/unlock event
+        // for every fat-ref arg that's tracked in env, all sharing a
+        // fresh group_id so the cycle detector can tell they came from
+        // one atomic ordered acquisition.
+        {
+            const Scan = struct {
+                names: []const []const u8,
+                kind_lock: bool,
+            };
+            const scans = [_]Scan{
+                .{ .names = &ORDERED_PAIR_LOCK_HELPERS, .kind_lock = true },
+                .{ .names = &ORDERED_PAIR_UNLOCK_HELPERS, .kind_lock = false },
+            };
+            for (scans) |scan| {
+                for (scan.names) |helper| {
+                    var sp: usize = 0;
+                    while (sp < code.len) {
+                        const idx_opt = mem.indexOf(u8, code[sp..], helper);
+                        if (idx_opt == null) break;
+                        const idx = sp + idx_opt.?;
+                        // Start-of-ident boundary.
+                        if (idx > 0 and isIdentChar(code[idx - 1])) {
+                            sp = idx + helper.len;
+                            continue;
+                        }
+                        const after = idx + helper.len;
+                        if (after >= code.len or code[after] != '(') {
+                            sp = after;
+                            continue;
+                        }
+                        var caller_args = ArrayList(?[]const u8).empty;
+                        defer caller_args.deinit(gpa);
+                        try parseCallArgs(gpa, ctx.pool, code, after, &caller_args);
+                        ordered_group_counter += 1;
+                        const gid = ordered_group_counter;
+                        const is_defer = scan.kind_lock == false and isOrderedDefer(code, idx);
+                        for (caller_args.items) |ai_opt| {
+                            const ai = ai_opt orelse continue;
+                            if (!env.map.contains(ai)) continue;
+                            if (!env.fat.contains(ai)) continue;
+                            const ident_i = try ctx.pool.intern(ai);
+                            const kind: EventKind = if (scan.kind_lock)
+                                .lock
+                            else if (is_defer)
+                                .defer_unlock
+                            else
+                                .unlock;
+                            try emitEventG(
+                                gpa,
+                                ec,
+                                ident_i,
+                                kind,
+                                src_line,
+                                "",
+                                env.map.get(ident_i) orelse "",
+                                gid,
+                            );
+                            if (is_defer) {
+                                try pending_defers.append(gpa, .{
+                                    .ident = ident_i,
+                                    .fire_at_depth = brace_depth,
+                                });
+                            }
+                        }
+                        sp = after;
+                    }
+                }
+            }
+        }
+
         // Access + call-site scanning.
         const atomic_spans = try atomicCallSpans(gpa, code);
         defer gpa.free(atomic_spans);
@@ -2716,6 +2870,25 @@ fn isDeferFor(code: []const u8, ident: []const u8) bool {
             return true;
         }
         search_pos = abs + 6;
+    }
+    return false;
+}
+
+// Helper: detect `defer ` preceding a specific byte-offset callsite
+// (e.g. for `defer unlockPair(a, b)` — ordered-pair helpers live at
+// top-level, not as a `.method()` call, so the existing isDeferFor*
+// helpers don't match them).
+fn isOrderedDefer(code: []const u8, callsite_idx: usize) bool {
+    var sp: usize = 0;
+    while (sp < callsite_idx) {
+        const p = mem.indexOf(u8, code[sp..callsite_idx], "defer ") orelse break;
+        const abs = sp + p;
+        // There's a `defer ` before us; verify only whitespace between
+        // `defer ` and callsite_idx (ignoring `try ` / `errdefer` noise
+        // is beyond v1's appetite — if needed, callers can nest).
+        const between = trimAscii(code[abs + 6 .. callsite_idx]);
+        if (between.len == 0) return true;
+        sp = abs + 6;
     }
     return false;
 }
@@ -3054,6 +3227,287 @@ fn bracketCheck(gpa: Allocator, res: *CheckResult) !void {
 }
 
 // -----------------------------------------------------------------
+// Lock-ordering analysis.
+// -----------------------------------------------------------------
+//
+// For each CheckResult (one entry-point walk) we already have a per-
+// ident event stream with lock/unlock/defer_unlock events that reflect
+// BOTH direct in-body lock ops and callee-effects folded in via
+// `foldSummary` at call sites. That stream, flattened and sorted by
+// seq (the global insertion counter the walker stamps on every event),
+// replays the function's observable lock-acquire behavior in source
+// order.
+//
+// Simulating a lock stack over the flattened stream yields every
+// ordered (outer → inner) pair the function introduces. Pairs emitted
+// by different entries all flow into a single global directed graph
+// whose nodes are lock CLASSES (interned strings like
+// "Process._gen_lock"). A cycle in this graph = a potential deadlock,
+// regardless of which specific instance each thread holds.
+//
+// Same-type self-edges are suppressed when both events belong to the
+// same non-zero `group_id` — that's our marker for an ordered-pair
+// helper call (`lockPair(a, b)`) which internally address-orders its
+// acquires.
+
+fn lockClassFor(pool: *Pool, slab_type: []const u8) ![]const u8 {
+    var buf: [128]u8 = undefined;
+    const printed = try std.fmt.bufPrint(&buf, "{s}._gen_lock", .{slab_type});
+    return pool.intern(printed);
+}
+
+fn flattenEventsBySeq(
+    gpa: Allocator,
+    events: *const EventMap,
+    out: *ArrayList(FlatEvent),
+) !void {
+    var it = events.iterator();
+    while (it.next()) |kv| {
+        const ident = kv.key_ptr.*;
+        for (kv.value_ptr.items) |ev| {
+            try out.append(gpa, .{ .ident = ident, .ev = ev });
+        }
+    }
+    std.sort.heap(FlatEvent, out.items, {}, lessFlatEvent);
+}
+
+const FlatEvent = struct {
+    ident: []const u8,
+    ev: Event,
+};
+
+fn lessFlatEvent(_: void, a: FlatEvent, b: FlatEvent) bool {
+    return a.ev.seq < b.ev.seq;
+}
+
+const HeldLock = struct {
+    ident: []const u8,
+    class: []const u8,
+    group_id: u32,
+    seq: u32,
+};
+
+fn collectLockPairsFromResult(
+    gpa: Allocator,
+    pool: *Pool,
+    res: *const CheckResult,
+    out: *ArrayList(LockPair),
+) !void {
+    var flat = ArrayList(FlatEvent).empty;
+    defer flat.deinit(gpa);
+    try flattenEventsBySeq(gpa, &res.events, &flat);
+
+    var held = ArrayList(HeldLock).empty;
+    defer held.deinit(gpa);
+
+    for (flat.items) |f| {
+        switch (f.ev.kind) {
+            .lock, .lock_with_gen => {
+                if (f.ev.slab_type.len == 0) continue;
+                const new_class = try lockClassFor(pool, f.ev.slab_type);
+                for (held.items) |h| {
+                    // Ordered-pair suppression: same class + same non-zero
+                    // group = helper-enforced address-ordered acquire, not
+                    // a cycle edge.
+                    const same_class = mem.eql(u8, h.class, new_class);
+                    const same_group = h.group_id != 0 and h.group_id == f.ev.group_id;
+                    if (same_class and same_group) continue;
+                    try out.append(gpa, .{
+                        .outer = h.class,
+                        .inner = new_class,
+                        .file_rel = res.entry.file_rel,
+                        .line = f.ev.src_line,
+                        .entry_name = res.entry.name,
+                        .outer_ident = h.ident,
+                        .inner_ident = f.ident,
+                    });
+                }
+                try held.append(gpa, .{
+                    .ident = f.ident,
+                    .class = new_class,
+                    .group_id = f.ev.group_id,
+                    .seq = f.ev.seq,
+                });
+            },
+            .unlock => {
+                // Only plain `.unlock` actually releases the held slot —
+                // `.defer_unlock` is a marker at the `defer <ident>.unlock()`
+                // source line; the real release is a synthesized `.unlock`
+                // event the walker fires when the pending defer pops at
+                // scope exit. Popping on `.defer_unlock` too would release
+                // the held lock right at the defer line, which is wrong:
+                // callees that take further locks AFTER `defer ref.unlock()`
+                // would appear to be running with `ref` already released,
+                // and the resulting lock-pair graph would miss the real
+                // nested acquires.
+                var i: isize = @as(isize, @intCast(held.items.len)) - 1;
+                while (i >= 0) : (i -= 1) {
+                    if (mem.eql(u8, held.items[@intCast(i)].ident, f.ident)) {
+                        _ = held.orderedRemove(@intCast(i));
+                        break;
+                    }
+                }
+            },
+            .defer_unlock => {},
+            else => {},
+        }
+    }
+}
+
+// -----------------------------------------------------------------
+// Cycle detection via Tarjan's SCC.
+// -----------------------------------------------------------------
+
+const AdjList = ArrayList([]const u8);
+const AdjMap = StringHashMap(AdjList);
+
+fn buildGraph(
+    gpa: Allocator,
+    pairs: []const LockPair,
+    adj: *AdjMap,
+    nodes: *ArrayList([]const u8),
+) !void {
+    var seen_node = StringHashMap(void).init(gpa);
+    defer seen_node.deinit();
+    for (pairs) |p| {
+        if (!seen_node.contains(p.outer)) {
+            try seen_node.put(p.outer, {});
+            try nodes.append(gpa, p.outer);
+        }
+        if (!seen_node.contains(p.inner)) {
+            try seen_node.put(p.inner, {});
+            try nodes.append(gpa, p.inner);
+        }
+        const gop = try adj.getOrPut(p.outer);
+        if (!gop.found_existing) gop.value_ptr.* = AdjList.empty;
+        // Dedup successor entries.
+        var already = false;
+        for (gop.value_ptr.items) |e| {
+            if (mem.eql(u8, e, p.inner)) {
+                already = true;
+                break;
+            }
+        }
+        if (!already) try gop.value_ptr.append(gpa, p.inner);
+    }
+    // Ensure every node appears as a key even if it has no outgoing edges
+    // (Tarjan's iterates keys; isolated nodes are fine).
+    for (nodes.items) |n| {
+        const gop = try adj.getOrPut(n);
+        if (!gop.found_existing) gop.value_ptr.* = AdjList.empty;
+    }
+}
+
+const TarjanCtx = struct {
+    gpa: Allocator,
+    adj: *AdjMap,
+    index_map: StringHashMap(u32),
+    lowlink: StringHashMap(u32),
+    on_stack: StringHashMap(void),
+    stack: ArrayList([]const u8),
+    next_index: u32,
+    sccs: ArrayList([][]const u8),
+};
+
+fn tarjanStrongconnect(t: *TarjanCtx, v: []const u8) WalkError!void {
+    try t.index_map.put(v, t.next_index);
+    try t.lowlink.put(v, t.next_index);
+    t.next_index += 1;
+    try t.stack.append(t.gpa, v);
+    try t.on_stack.put(v, {});
+
+    const edges = t.adj.getPtr(v) orelse unreachable;
+    for (edges.items) |w| {
+        if (!t.index_map.contains(w)) {
+            try tarjanStrongconnect(t, w);
+            const wll = t.lowlink.get(w).?;
+            const vll = t.lowlink.get(v).?;
+            if (wll < vll) try t.lowlink.put(v, wll);
+        } else if (t.on_stack.contains(w)) {
+            const widx = t.index_map.get(w).?;
+            const vll = t.lowlink.get(v).?;
+            if (widx < vll) try t.lowlink.put(v, widx);
+        }
+    }
+
+    const vll = t.lowlink.get(v).?;
+    const vidx = t.index_map.get(v).?;
+    if (vll == vidx) {
+        var scc = ArrayList([]const u8).empty;
+        errdefer scc.deinit(t.gpa);
+        while (true) {
+            const w = t.stack.pop().?;
+            _ = t.on_stack.remove(w);
+            try scc.append(t.gpa, w);
+            if (mem.eql(u8, w, v)) break;
+        }
+        try t.sccs.append(t.gpa, try scc.toOwnedSlice(t.gpa));
+    }
+}
+
+fn findLockCycles(
+    gpa: Allocator,
+    pairs: []const LockPair,
+    out_cycles: *ArrayList([][]const u8),
+) !void {
+    var adj = AdjMap.init(gpa);
+    defer {
+        var it = adj.valueIterator();
+        while (it.next()) |v| v.deinit(gpa);
+        adj.deinit();
+    }
+    var nodes = ArrayList([]const u8).empty;
+    defer nodes.deinit(gpa);
+    try buildGraph(gpa, pairs, &adj, &nodes);
+
+    var t = TarjanCtx{
+        .gpa = gpa,
+        .adj = &adj,
+        .index_map = StringHashMap(u32).init(gpa),
+        .lowlink = StringHashMap(u32).init(gpa),
+        .on_stack = StringHashMap(void).init(gpa),
+        .stack = ArrayList([]const u8).empty,
+        .next_index = 0,
+        .sccs = ArrayList([][]const u8).empty,
+    };
+    defer {
+        t.index_map.deinit();
+        t.lowlink.deinit();
+        t.on_stack.deinit();
+        t.stack.deinit(gpa);
+        // Note: we transfer ownership of SCC slices to out_cycles, so we
+        // don't deinit sccs here — but cycles that didn't make the cut
+        // (size-1 with no self-loop) must be freed.
+    }
+
+    for (nodes.items) |n| {
+        if (!t.index_map.contains(n)) try tarjanStrongconnect(&t, n);
+    }
+
+    // Keep non-trivial SCCs (size > 1) and singletons with a self-loop.
+    for (t.sccs.items) |scc| {
+        var keep = scc.len > 1;
+        if (!keep and scc.len == 1) {
+            const n = scc[0];
+            if (adj.getPtr(n)) |succ| {
+                for (succ.items) |w| {
+                    if (mem.eql(u8, w, n)) {
+                        keep = true;
+                        break;
+                    }
+                }
+            }
+        }
+        if (keep) {
+            try out_cycles.append(gpa, scc);
+        } else {
+            gpa.free(scc);
+        }
+    }
+    t.sccs.deinit(gpa);
+}
+
+// -----------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------
 
@@ -3062,6 +3516,7 @@ const Args = struct {
     verbose: bool = false,
     entry_filter: ?[]const u8 = null,
     list_slab_types: bool = false,
+    list_lock_pairs: bool = false,
     list_methods: bool = false,
     print_help: bool = false,
 };
@@ -3080,6 +3535,8 @@ fn parseArgs(gpa: Allocator) !Args {
             args.list_slab_types = true;
         } else if (mem.eql(u8, a, "--list-methods")) {
             args.list_methods = true;
+        } else if (mem.eql(u8, a, "--list-lock-pairs")) {
+            args.list_lock_pairs = true;
         } else if (mem.eql(u8, a, "--help") or mem.eql(u8, a, "-h")) {
             args.print_help = true;
         } else if (mem.eql(u8, a, "--entry")) {
@@ -3401,11 +3858,100 @@ pub fn main() !u8 {
     }
     total_errs += @intCast(ptr_bypasses.items.len);
 
+    // Lock-ordering analysis.
+    var all_pairs = ArrayList(LockPair).empty;
+    defer all_pairs.deinit(gpa);
+    for (results.items) |*res| {
+        try collectLockPairsFromResult(gpa, &pool, res, &all_pairs);
+    }
+    if (args.list_lock_pairs) {
+        try w.writeAll("\n");
+        try w.print("Lock-ordering pairs ({d}):\n", .{all_pairs.items.len});
+        for (all_pairs.items) |p| {
+            try w.print("  {s} → {s}  at {s}:{d}  in {s}()  [{s} held, {s} acquired]\n", .{
+                p.outer, p.inner, p.file_rel, p.line, p.entry_name,
+                p.outer_ident, p.inner_ident,
+            });
+        }
+    }
+    var cycles = ArrayList([][]const u8).empty;
+    defer {
+        for (cycles.items) |scc| gpa.free(scc);
+        cycles.deinit(gpa);
+    }
+    try findLockCycles(gpa, all_pairs.items, &cycles);
+
+    if (cycles.items.len > 0) {
+        try w.writeAll("\n");
+        try w.print("Lock-ordering cycles ({d}):\n", .{cycles.items.len});
+        for (cycles.items, 0..) |scc, ci| {
+            try w.print("  Cycle {d} ({d} classes):", .{ ci + 1, scc.len });
+            // Node list — keep it compact.
+            for (scc, 0..) |c, i| {
+                if (i > 0) try w.writeAll(" ⇄ ");
+                try w.print(" {s}", .{c});
+            }
+            try w.writeAll("\n");
+            // Representative edges inside this SCC. Dedup by
+            // (outer, inner) so we don't spam identical entries
+            // discovered from multiple entry walks.
+            const EdgeKey = struct {
+                fn matches(a: LockPair, b: LockPair) bool {
+                    return mem.eql(u8, a.outer, b.outer) and
+                        mem.eql(u8, a.inner, b.inner) and
+                        mem.eql(u8, a.file_rel, b.file_rel) and
+                        a.line == b.line;
+                }
+            };
+            var shown: usize = 0;
+            for (all_pairs.items, 0..) |p, pi| {
+                var in_o = false;
+                var in_i = false;
+                for (scc) |c| {
+                    if (mem.eql(u8, c, p.outer)) in_o = true;
+                    if (mem.eql(u8, c, p.inner)) in_i = true;
+                }
+                if (!(in_o and in_i)) continue;
+                // Dedup against earlier items in this SCC's listing.
+                var dup = false;
+                for (all_pairs.items[0..pi]) |q| {
+                    var inq_o = false;
+                    var inq_i = false;
+                    for (scc) |c| {
+                        if (mem.eql(u8, c, q.outer)) inq_o = true;
+                        if (mem.eql(u8, c, q.inner)) inq_i = true;
+                    }
+                    if (!(inq_o and inq_i)) continue;
+                    if (EdgeKey.matches(p, q)) {
+                        dup = true;
+                        break;
+                    }
+                }
+                if (dup) continue;
+                try w.print(
+                    "    [WARN] {s} → {s}  at {s}:{d}  in {s}()\n",
+                    .{ p.outer, p.inner, p.file_rel, p.line, p.entry_name },
+                );
+                shown += 1;
+                if (shown >= 8) {
+                    try w.writeAll("    ... (additional edges suppressed)\n");
+                    break;
+                }
+            }
+        }
+        try w.print(
+            "  Resolution: establish a stable acquire order across all sites, or\n" ++
+            "  wrap same-type nestings in `lockPair(a, b)` for address-ordered acquire.\n",
+            .{},
+        );
+    }
+
     try w.writeAll("\n");
     try w.print("Summary: {d} entries, {d} tracked idents, {d} err, {d} info\n", .{ results.items.len, total_tracked, total_errs, total_infos });
     try w.print("         {d} slab-backed types discovered\n", .{slab_types.inner.count()});
     try w.print("         {d} bare-pointer fat-pointer violations\n", .{bare_ptr.items.len});
     try w.print("         {d} `.ptr` bypass sites\n", .{ptr_bypasses.items.len});
+    try w.print("         {d} lock-ordering pairs, {d} cycles\n", .{ all_pairs.items.len, cycles.items.len });
 
     try w.flush();
     if (total_errs > 0) return 1;
