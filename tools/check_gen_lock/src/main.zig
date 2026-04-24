@@ -4366,6 +4366,66 @@ pub fn main() !u8 {
     for (results.items) |*res| {
         try collectLockPairsFromResult(gpa, &pool, res, &all_pairs);
     }
+
+    // Widened lock-pair coverage: walk every slab-type method in the
+    // fn_index as if it were an entry point, *for pair collection only*.
+    // Bracket-check findings from these walks are discarded — those are
+    // already covered by the summary-fold pipeline from the real
+    // entries. What this adds is lock events on NON-PARAM receivers
+    // (`self.perm_lock`, `proc.vm`, etc.) that summaries can't carry
+    // upward because ParamEvent only tracks effects on params.
+    {
+        var fit = fn_index.iterator();
+        while (fit.next()) |kv| {
+            const fi = kv.value_ptr.*;
+            const fn_name = kv.key_ptr.name;
+
+            // Skip if already a primary entry (exact name + file).
+            var is_primary = false;
+            for (entries.items) |pe| {
+                if (mem.eql(u8, pe.name, fn_name) and
+                    mem.eql(u8, pe.file_rel, fi.file_rel))
+                {
+                    is_primary = true;
+                    break;
+                }
+            }
+            if (is_primary) continue;
+
+            const synth = EntryPoint{
+                .name = fn_name,
+                .file_path = fi.file_path,
+                .file_rel = fi.file_rel,
+                .line = fi.line,
+                .body_start_line = fi.body_start_line,
+                .body_end_line = fi.body_end_line,
+            };
+            var env = SlabEnv.init(gpa);
+            var events = EventMap.init(gpa);
+            analyzeEntry(
+                gpa, &pool, files.items, tokens.items,
+                &slab_types, &fn_index, &summaries,
+                &lock_fields, &module_globals,
+                &synth, &env, &events,
+            ) catch {
+                // Best-effort cleanup on error.
+                var eit = events.valueIterator();
+                while (eit.next()) |al| al.deinit(gpa);
+                events.deinit();
+                env.deinit();
+                continue;
+            };
+            var synth_res = CheckResult{
+                .entry = &synth,
+                .env = env,
+                .events = events,
+                .findings = ArrayList(Finding).empty,
+            };
+            collectLockPairsFromResult(gpa, &pool, &synth_res, &all_pairs) catch {};
+            // CheckResult.deinit frees env, events, and findings.
+            synth_res.deinit(gpa);
+        }
+    }
     if (args.list_lock_pairs) {
         try w.writeAll("\n");
         try w.print("Lock-ordering pairs ({d}):\n", .{all_pairs.items.len});
