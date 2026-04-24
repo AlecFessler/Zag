@@ -1399,8 +1399,14 @@ pub const Process = struct {
                 // Carry the original .process SlabRef's gen over to the
                 // dead_process variant: the slab slot is the same Process
                 // and has not been freed, so the handle stays fresh for
-                // the tombstone lifetime (§2.1.6).
-                slot.object = .{ .dead_process = slot.object.process };
+                // the tombstone lifetime (§2.1.6). Hoist the RHS into a
+                // local to avoid Zig result-location-semantics: writing
+                // the new union tag in place would change slot.object's
+                // active tag to .dead_process before the RHS read of
+                // slot.object.process, tripping the inactive-field
+                // safety check.
+                const old_ref = slot.object.process;
+                slot.object = .{ .dead_process = old_ref };
                 converted = true;
                 if (holder.perm_view_phys.addr != 0) {
                     const field0_pa = PAddr.fromInt(holder.perm_view_phys.addr + idx * @sizeOf(UserViewEntry) + @offsetOf(UserViewEntry, "field0"));
