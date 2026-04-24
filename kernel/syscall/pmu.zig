@@ -285,6 +285,7 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
 
     const state_ref = target_thread.pmu_state orelse return E_INVAL; // §4.54.5
     const state = state_ref.lock() catch return E_INVAL;
+    const carried_gen: u63 = @intCast(state_ref.gen);
     if (is_self) {
         arch.pmu.pmuStop(state);
     } else {
@@ -292,7 +293,7 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
     }
     state_ref.unlock();
     target_thread.pmu_state = null;
-    slab_instance.destroy(state, @intCast(state_ref.gen)) catch unreachable;
+    slab_instance.destroy(state, carried_gen) catch unreachable;
     return E_OK;
 }
 

@@ -4,7 +4,7 @@
 # Stages:
 #   0. arch layering lint          (grep — arch-specific / generic boundaries)
 #   0b. dead-code report            (advisory — manual review)
-#   0c. gen-lock analyzer           (advisory — fat-pointer + bracketing invariants)
+#   0c. gen-lock analyzer           (gating — fat-pointer + bracketing invariants)
 #   1. x86-64 kernel test suite   (KVM on this dev PC)
 #   2. aarch64 kernel test suite  (KVM on the Pi 5 @ 192.168.86.106 via SSH)
 #   3. hyprvOS Linux boot          (x86-64, KVM on this PC)
@@ -83,20 +83,20 @@ stage_gen_lock_analyzer() {
     echo "=================================================="
     echo "[0c] Gen-lock analyzer (fat-pointer invariants)"
     echo "=================================================="
-    # Build the analyzer once (cheap — ReleaseFast is ~50ms to run) and
-    # print its summary. Advisory until task #8 clears the remaining
-    # false positives (analyzer's flow analysis synthesizes inlined-body
-    # line numbers that don't map back cleanly). Switch to gating once
-    # the summary reports 0 errors; treat any *new* category as
-    # immediate regression in the meantime.
+    # Enforces: every kernel pointer to a slab-backed object is
+    # stored / passed / returned as `SlabRef(T)`, and every access
+    # goes through a `lock()`/`unlock()` bracket on that ref
+    # (unless the site is explicitly marked `// self-alive:`).
+    # The analyzer exits non-zero on any finding.
     if ! (cd "$ZAG_ROOT/tools/check_gen_lock" && zig build 2>&1); then
         FAILURES+=("gen-lock analyzer build")
         return 1
     fi
     local analyzer="$ZAG_ROOT/tools/check_gen_lock/zig-out/bin/check_gen_lock"
-    "$analyzer" 2>&1 | tail -8 || true
-    echo "(advisory — see tools/check_gen_lock/ for full trace)"
-    return 0
+    if ! "$analyzer"; then
+        FAILURES+=("gen-lock analyzer findings")
+        return 1
+    fi
 }
 
 clean_nvvars() {

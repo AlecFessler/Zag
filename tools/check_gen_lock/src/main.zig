@@ -86,9 +86,11 @@ const FAT_YIELDING_FIELDS = [_]FatFieldEntry{
     .{ .owner = "Thread", .field = "process" },
     .{ .owner = "Thread", .field = "next" },
     .{ .owner = "Thread", .field = "ipc_server" },
+    .{ .owner = "Thread", .field = "pmu_state" },
     .{ .owner = "VCpu", .field = "process" },
     .{ .owner = "VCpu", .field = "vm" },
     .{ .owner = "VCpu", .field = "thread" },
+    .{ .owner = "Process", .field = "vm" },
 };
 
 const EXCEPTION_ENTRY_NAMES = [_][]const u8{
