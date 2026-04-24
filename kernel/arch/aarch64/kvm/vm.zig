@@ -44,6 +44,7 @@ const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Process = zag.proc.process.Process;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
+const slabRefNow = zag.proc.process.slabRefNow;
 const SpinLock = zag.utils.sync.SpinLock;
 const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
 const VAddr = zag.memory.address.VAddr;
@@ -327,7 +328,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
 
     const vm_handle_id = proc.insertPerm(PermissionEntry{
         .handle = 0,
-        .object = KernelObject{ .vm = vm_obj },
+        .object = KernelObject{ .vm = slabRefNow(Vm, vm_obj) },
         .rights = 0xFFFF,
     }) catch {
         var k: u32 = 0;

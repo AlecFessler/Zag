@@ -126,7 +126,7 @@ pub fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_a
     });
     const child_entry = PermissionEntry{
         .handle = 0,
-        .object = .{ .process = child },
+        .object = .{ .process = process_mod.slabRefNow(Process, child) },
         .rights = parent_rights,
     };
     const handle_id = proc.insertPerm(child_entry) catch {
@@ -151,7 +151,8 @@ pub fn sysRevokePerm(handle: u64) i64 {
             proc.vmm.revokeReservation(vm_res.original_start, vm_res.original_size) catch {};
             proc.removePerm(handle) catch {};
         },
-        .shared_memory => |shm| {
+        .shared_memory => |shm_ref| {
+            const shm = shm_ref.ptr;
             // DMA mappings of this SHM pin the kernel-side `*SharedMemory`
             // via a raw pointer in `proc.dma_mappings` (no counted ref).
             // If we dropped the perm-table ref here while a DMA mapping
@@ -174,7 +175,8 @@ pub fn sysRevokePerm(handle: u64) i64 {
             proc.vmm.revokeShmHandle(shm, res.items());
             shm.decRef();
         },
-        .device_region => |device| {
+        .device_region => |dev_ref| {
+            const device = dev_ref.ptr;
             const res = collectReservations(proc);
             proc.vmm.revokeMmioHandle(device, res.items());
             // Remove our slot first so there is no window where both
@@ -183,7 +185,8 @@ pub fn sysRevokePerm(handle: u64) i64 {
             proc.removePerm(handle) catch {};
             Process.returnDeviceHandleUpTree(proc, entry.rights, device);
         },
-        .process => |child| {
+        .process => |child_ref| {
+            const child = child_ref.ptr;
             // §2.12.6: revoking a handle with the fault_handler bit releases
             // the fault-handler relationship without killing the target.
             if (entry.processHandleRights().fault_handler) {
@@ -197,7 +200,8 @@ pub fn sysRevokePerm(handle: u64) i64 {
         .dead_process => {
             proc.removePerm(handle) catch {};
         },
-        .thread => |t| {
+        .thread => |thread_ref| {
+            const t = thread_ref.ptr;
             // If the thread is pinned, release the core pin before removing
             // the handle. Otherwise PerCoreState.pinned_thread is orphaned
             // and that core is deadlocked for preemptive scheduling.
@@ -207,8 +211,8 @@ pub fn sysRevokePerm(handle: u64) i64 {
             }
             proc.removePerm(handle) catch {};
         },
-        .vm => |vm_obj| {
-            vm_obj.destroy();
+        .vm => |vm_ref| {
+            vm_ref.ptr.destroy();
             proc.removePerm(handle) catch {};
         },
         .empty => return E_BADCAP,

@@ -28,6 +28,7 @@ const ProcessRights = zag.perms.permissions.ProcessRights;
 const RestartContext = zag.proc.restart_context.RestartContext;
 const SharedMemory = zag.memory.shared.SharedMemory;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
@@ -39,6 +40,15 @@ pub const DEFAULT_STACK_PAGES: u32 = 8;
 pub const MAX_PERMS: usize = 128;
 pub const MAX_DMA_MAPPINGS: usize = 16;
 pub const HANDLE_SELF: u64 = 0;
+
+/// Build a `SlabRef(T)` from a live pointer by sampling the slot's
+/// current gen. Callers use this at the moment they mint a handle
+/// (insertPerm, etc.) — the captured gen becomes the staleness baseline
+/// for every later `lock()` on the resulting ref. Must only be called
+/// while the slot is live (gen is odd); the SlabRef constructor asserts.
+pub fn slabRefNow(comptime T: type, ptr: *T) SlabRef(T) {
+    return SlabRef(T).init(ptr, ptr._gen_lock.currentGen());
+}
 
 pub const DmaMapping = struct {
     device: *DeviceRegion,
@@ -114,7 +124,7 @@ pub const Process = struct {
         }
         self.perm_table[0] = .{
             .handle = HANDLE_SELF,
-            .object = .{ .process = self },
+            .object = .{ .process = slabRefNow(Process, self) },
             .rights = @bitCast(self_rights),
         };
         self.perm_count = 1;
@@ -165,7 +175,7 @@ pub const Process = struct {
     pub fn insertThreadHandle(self: *Process, thread: *Thread, rights: ThreadHandleRights) !u64 {
         return self.insertPerm(.{
             .handle = 0,
-            .object = .{ .thread = thread },
+            .object = .{ .thread = slabRefNow(Thread, thread) },
             .rights = @as(u16, @as(u8, @bitCast(rights))),
         });
     }
@@ -181,12 +191,10 @@ pub const Process = struct {
         std.debug.assert(self.perm_table[slot].object == .empty);
         const handle_id = self.handle_counter;
         self.handle_counter += 1;
-        const object: KernelObject = .{ .thread = thread };
         self.perm_table[slot] = .{
             .handle = handle_id,
-            .object = object,
+            .object = .{ .thread = slabRefNow(Thread, thread) },
             .rights = @as(u16, @as(u8, @bitCast(rights))),
-            .expected_gen = object.currentGen(),
         };
         self.perm_count += 1;
         self.syncUserView();
@@ -204,7 +212,7 @@ pub const Process = struct {
         self.perm_lock.lock();
         var drop: u32 = 0;
         for (&self.perm_table) |*slot| {
-            if (slot.object == .thread and slot.object.thread == thread) {
+            if (slot.object == .thread and slot.object.thread.ptr == thread) {
                 slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
                 drop += 1;
@@ -219,7 +227,7 @@ pub const Process = struct {
         self.perm_lock.lock();
         defer self.perm_lock.unlock();
         for (self.perm_table) |slot| {
-            if (slot.object == .thread and slot.object.thread == thread) {
+            if (slot.object == .thread and slot.object.thread.ptr == thread) {
                 return slot.handle;
             }
         }
@@ -235,7 +243,7 @@ pub const Process = struct {
         // Clear all thread-handle slots in self.perm_table that belong to target.
         self.perm_lock.lock();
         for (&self.perm_table) |*slot| {
-            if (slot.object == .thread and slot.object.thread.process == target) {
+            if (slot.object == .thread and slot.object.thread.ptr.process == target) {
                 slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
             }
@@ -441,10 +449,10 @@ pub const Process = struct {
         var thread_h: u64 = 0;
         for (&handler.perm_table) |*slot| {
             switch (slot.object) {
-                .thread => |t| if (t == faulted) {
+                .thread => |r| if (r.ptr == faulted) {
                     thread_h = slot.handle;
                 },
-                .process => |p| if (p == faulted.process) {
+                .process => |r| if (r.ptr == faulted.process) {
                     proc_h = slot.handle;
                 },
                 else => {},
@@ -576,7 +584,7 @@ pub const Process = struct {
         var stop_all = true;
         handler.perm_lock.lock();
         for (&handler.perm_table) |*slot| {
-            if (slot.object == .thread and slot.object.thread == thread) {
+            if (slot.object == .thread and slot.object.thread.ptr == thread) {
                 if (slot.exclude_oneshot or slot.exclude_permanent) {
                     stop_all = false;
                     if (slot.exclude_oneshot) slot.exclude_oneshot = false;
@@ -640,17 +648,19 @@ pub const Process = struct {
     }
 
     /// Look up a handle that references a thread. Returns the permission
-    /// entry snapshot plus the thread pointer; returns null on
-    /// handle-not-found or when the entry is not a thread.
+    /// entry snapshot plus a `SlabRef(Thread)` the caller can lock; null
+    /// on handle-not-found or when the entry is not a thread.
     ///
-    /// *Unpinned*: the returned `*Thread` carries no liveness guarantee
-    /// after this function returns — a concurrent Thread.deinit on
-    /// another core can free the slot at any point. Callers that hold
-    /// the pointer across a yield / blocking call / fn return are
-    /// racing a UAF.
+    /// The returned `SlabRef` carries the gen captured when the handle
+    /// was issued. A concurrent Thread.deinit that frees the slot on
+    /// another core will bump the gen, so the next `thread_ref.lock()`
+    /// on this caller side fails with `StaleHandle` rather than
+    /// silently touching a recycled slot. Callers that deref the
+    /// pointer across a yield / blocking call / fn return should
+    /// acquire the lock via `thread_ref.lock()` for UAF safety.
     pub fn lookupThreadHandle(self: *Process, handle_id: u64) ?struct {
         entry: PermissionEntry,
-        thread: *Thread,
+        thread: SlabRef(Thread),
     } {
         self.perm_lock.lock();
         defer self.perm_lock.unlock();
@@ -667,9 +677,7 @@ pub const Process = struct {
     pub fn getPermByHandleLocked(self: *const Process, handle_id: u64) ?PermissionEntry {
         for (self.perm_table) |entry| {
             if (entry.object == .empty or entry.handle != handle_id) continue;
-            if (entry.expected_gen != 0 and entry.object.currentGen() != entry.expected_gen) {
-                return null;
-            }
+            if (!entry.object.isFresh()) return null;
             return entry;
         }
         return null;
@@ -684,7 +692,6 @@ pub const Process = struct {
                 self.handle_counter += 1;
                 slot.* = entry_in;
                 slot.handle = handle_id;
-                slot.expected_gen = entry_in.object.currentGen();
                 self.perm_count += 1;
                 self.syncUserViewSlot(slot_index);
                 return handle_id;
@@ -934,7 +941,7 @@ pub const Process = struct {
             handler.perm_lock.lock();
             for (&handler.perm_table) |*slot| {
                 if (slot.object == .thread) {
-                    const t = slot.object.thread;
+                    const t = slot.object.thread.ptr;
                     if (t.process == self) {
                         slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                         handler.perm_count -= 1;
@@ -979,7 +986,7 @@ pub const Process = struct {
                 self.perm_count -= 1;
             } else if (entry.object == .thread) {
                 // Unpin any pinned threads before clearing the entry
-                const t = entry.object.thread;
+                const t = entry.object.thread.ptr;
                 if (t.priority == .pinned) {
                     const core_id = @ctz(t.core_affinity orelse 0);
                     sched.unpinByRevoke(core_id);
@@ -1047,7 +1054,7 @@ pub const Process = struct {
         defer parent.perm_lock.unlock();
         for (parent.perm_table[1..], 1..) |*slot, idx| {
             const matches = switch (slot.object) {
-                .process => |p| @intFromPtr(p) == @intFromPtr(self),
+                .process => |r| r.ptr == self,
                 else => false,
             };
             if (matches) {
@@ -1155,11 +1162,12 @@ pub const Process = struct {
         // has no lifetime bookkeeping on this path.
         for (self.perm_table[1..]) |*entry| {
             switch (entry.object) {
-                .shared_memory => |shm| shm.decRef(),
-                .device_region => |device| {
-                    returnDeviceHandleUpTree(self, entry.rights, device);
+                .shared_memory => |r| r.ptr.decRef(),
+                .device_region => |r| {
+                    returnDeviceHandleUpTree(self, entry.rights, r.ptr);
                 },
-                .thread => |t| {
+                .thread => |r| {
+                    const t = r.ptr;
                     if (t.priority == .pinned) {
                         const core_id = @ctz(t.core_affinity orelse 0);
                         sched.unpinByRevoke(core_id);
@@ -1212,11 +1220,15 @@ pub const Process = struct {
         var converted = false;
         for (holder.perm_table[1..], 1..) |*slot, idx| {
             const matches = switch (slot.object) {
-                .process => |p| @intFromPtr(p) == @intFromPtr(child),
+                .process => |r| r.ptr == child,
                 else => false,
             };
             if (matches) {
-                slot.object = .{ .dead_process = child };
+                // Carry the original .process SlabRef's gen over to the
+                // dead_process variant: the slab slot is the same Process
+                // and has not been freed, so the handle stays fresh for
+                // the tombstone lifetime (§2.1.6).
+                slot.object = .{ .dead_process = slot.object.process };
                 converted = true;
                 if (holder.perm_view_phys.addr != 0) {
                     const field0_pa = PAddr.fromInt(holder.perm_view_phys.addr + idx * @sizeOf(UserViewEntry) + @offsetOf(UserViewEntry, "field0"));
@@ -1269,7 +1281,7 @@ pub const Process = struct {
             if (anc.alive) {
                 if (anc.insertPerm(.{
                     .handle = 0,
-                    .object = .{ .device_region = device },
+                    .object = .{ .device_region = slabRefNow(DeviceRegion, device) },
                     .rights = rights,
                 })) |_| {
                     return;

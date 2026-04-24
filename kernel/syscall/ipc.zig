@@ -4,11 +4,13 @@ const zag = @import("zag");
 const arch = zag.arch.dispatch;
 const errors = zag.syscall.errors;
 const kprof = zag.kprof.trace_id;
+const process_mod = zag.proc.process;
 const sched = zag.sched.scheduler;
 
 const isSubset = zag.perms.permissions.isSubset;
 
 const ArchCpuContext = zag.arch.dispatch.cpu.ArchCpuContext;
+const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Process = zag.proc.process.Process;
 const ProcessHandleRights = zag.perms.permissions.ProcessHandleRights;
@@ -46,7 +48,8 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
     };
 
     switch (src_entry.object) {
-        .shared_memory => |shm| {
+        .shared_memory => |shm_ref| {
+            const shm = shm_ref.ptr;
             if (!src_entry.shmRights().grant) {
                 sender_proc.perm_lock.unlock();
                 return E_PERM;
@@ -62,7 +65,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
 
             const new_entry = PermissionEntry{
                 .handle = 0,
-                .object = .{ .shared_memory = shm },
+                .object = .{ .shared_memory = process_mod.slabRefNow(SharedMemory, shm) },
                 .rights = granted_u16,
             };
             _ = target_proc.insertPerm(new_entry) catch {
@@ -71,7 +74,8 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
             };
             return E_OK;
         },
-        .process => |proc_ptr| {
+        .process => |proc_ref| {
+            const proc_ptr = proc_ref.ptr;
             if (handle_val == 0) {
                 // Red-team Finding (5c80fe4): self-cap-transfer is a
                 // no-op semantically and composes with the slot-0 rights
@@ -153,7 +157,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                     target_proc.perm_lock.lock();
                     var found_existing = false;
                     for (&target_proc.perm_table) |*slot| {
-                        if (slot.object == .process and slot.object.process == proc_ptr) {
+                        if (slot.object == .process and slot.object.process.ptr == proc_ptr) {
                             var existing_rights: ProcessHandleRights = @bitCast(slot.rights);
                             existing_rights.fault_handler = true;
                             slot.rights = @bitCast(existing_rights);
@@ -166,7 +170,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                     if (!found_existing) {
                         _ = target_proc.insertPerm(.{
                             .handle = 0,
-                            .object = .{ .process = proc_ptr },
+                            .object = .{ .process = process_mod.slabRefNow(Process, proc_ptr) },
                             .rights = granted_u16,
                         }) catch {
                             // Rollback the partially committed fault_handler
@@ -233,7 +237,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                 // Normal HANDLE_SELF transfer (no fault_handler)
                 const new_entry = PermissionEntry{
                     .handle = 0,
-                    .object = .{ .process = proc_ptr },
+                    .object = .{ .process = process_mod.slabRefNow(Process, proc_ptr) },
                     .rights = granted_u16,
                 };
                 _ = target_proc.insertPerm(new_entry) catch {
@@ -255,7 +259,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
             }
             const new_entry = PermissionEntry{
                 .handle = 0,
-                .object = .{ .process = proc_ptr },
+                .object = .{ .process = process_mod.slabRefNow(Process, proc_ptr) },
                 .rights = granted_u16,
             };
             sender_proc.perm_lock.unlock();
@@ -264,7 +268,8 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
             };
             return E_OK;
         },
-        .device_region => |device| {
+        .device_region => |dev_ref| {
+            const device = dev_ref.ptr;
             sender_proc.perm_lock.unlock();
             if (!src_entry.deviceRights().grant) return E_PERM;
             const granted_u16: u16 = @truncate(rights_val);
@@ -275,7 +280,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
             if (!target_self.processRights().device_own) return E_PERM;
             const new_entry = PermissionEntry{
                 .handle = 0,
-                .object = .{ .device_region = device },
+                .object = .{ .device_region = process_mod.slabRefNow(DeviceRegion, device) },
                 .rights = granted_u16,
             };
             _ = target_proc.insertPerm(new_entry) catch return E_MAXCAP;
@@ -311,7 +316,7 @@ fn validateIpcSendRights(entry: PermissionEntry, meta: IpcMetadata, sender_proc:
     // ProcessHandleRights, and reinterpreting the layout lets
     // ProcessRights.spawn_thread (bit 0) masquerade as send_words,
     // passing this gate without holding any send_* right.
-    const self_send = entry.object == .process and entry.object.process == sender_proc;
+    const self_send = entry.object == .process and entry.object.process.ptr == sender_proc;
     if (self_send and meta.cap_transfer) return E_INVAL;
     const rights = entry.processHandleRights();
     if (!rights.send_words) return E_PERM;
@@ -347,7 +352,7 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
     // Look up target process
     const target_entry = proc.getPermByHandle(target_handle) orelse return .{ .ret = E_BADCAP };
     if (target_entry.object != .process) return .{ .ret = E_BADCAP };
-    const target_proc = target_entry.object.process;
+    const target_proc = target_entry.object.process.ptr;
 
     // §2.6.30: lazily convert dead process entries on IPC attempt.
     target_proc._gen_lock.lock();
@@ -420,7 +425,7 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
 
     const target_entry = proc.getPermByHandle(target_handle) orelse return .{ .ret = E_BADCAP };
     if (target_entry.object != .process) return .{ .ret = E_BADCAP };
-    const target_proc = target_entry.object.process;
+    const target_proc = target_entry.object.process.ptr;
 
     // §2.6.30: lazily convert dead process entries on IPC attempt.
     target_proc._gen_lock.lock();

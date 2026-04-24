@@ -213,7 +213,7 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
 
     const entry = proc.getPermByHandle(exit_token) orelse return E_NOENT;
     if (entry.object != .thread) return E_NOENT;
-    const thread = entry.object.thread;
+    const thread = entry.object.thread.ptr;
 
     vm_obj._gen_lock.lock();
 
@@ -402,7 +402,7 @@ fn resumeVcpuThread(thread: *Thread) void {
 fn resolveVmHandle(proc: *Process, vm_handle: u64) ?*Vm {
     const entry = proc.getPermByHandle(vm_handle) orelse return null;
     return switch (entry.object) {
-        .vm => |v| v,
+        .vm => |r| r.ptr,
         else => null,
     };
 }

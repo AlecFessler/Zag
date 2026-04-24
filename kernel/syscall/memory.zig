@@ -5,6 +5,7 @@ const address = zag.memory.address;
 const errors = zag.syscall.errors;
 const kprof = zag.kprof.trace_id;
 const paging = zag.memory.paging;
+const process_mod = zag.proc.process;
 const sched = zag.sched.scheduler;
 
 const isSubset = zag.perms.permissions.isSubset;
@@ -125,7 +126,7 @@ pub fn sysMemShmCreate(size: u64, rights_bits: u64) i64 {
     const rights: u16 = @truncate(rights_bits);
     const entry = PermissionEntry{
         .handle = 0,
-        .object = .{ .shared_memory = shm },
+        .object = .{ .shared_memory = process_mod.slabRefNow(SharedMemory, shm) },
         .rights = rights,
     };
     const handle_id = proc.insertPerm(entry) catch {
@@ -160,7 +161,7 @@ pub fn sysMemShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
     const vm_res = vm_entry.object.vm_reservation;
     if (!vm_res.max_rights.shareable) return E_PERM;
 
-    const shm = shm_entry.object.shared_memory;
+    const shm = shm_entry.object.shared_memory.ptr;
     const shm_rwx = shm_entry.rights & 0b111;
     const max_rwx: u16 =
         @as(u16, @intFromBool(vm_res.max_rights.read)) |

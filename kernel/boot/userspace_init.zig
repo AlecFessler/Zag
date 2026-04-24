@@ -2,8 +2,10 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const device_registry = zag.devices.registry;
+const process_mod = zag.proc.process;
 const sched = zag.sched.scheduler;
 
+const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const DeviceRegionRights = zag.perms.permissions.DeviceRegionRights;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Process = zag.proc.process.Process;
@@ -41,7 +43,7 @@ fn grantDevices(root_proc: *Process) void {
             .{ .map = true, .grant = true, .dma = true, .irq = true };
         const entry = PermissionEntry{
             .handle = 0,
-            .object = .{ .device_region = dev },
+            .object = .{ .device_region = process_mod.slabRefNow(DeviceRegion, dev) },
             .rights = @as(u16, @as(u8, @bitCast(rights))),
         };
         _ = root_proc.insertPerm(entry) catch {};

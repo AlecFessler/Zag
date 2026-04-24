@@ -6,6 +6,7 @@ const secure_slab = zag.memory.allocators.secure_slab;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const Process = zag.proc.process.Process;
 const SharedMemory = zag.memory.shared.SharedMemory;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 const Vm = zag.arch.dispatch.vm.Vm;
@@ -112,14 +113,6 @@ pub const PermissionEntry = struct {
     rights: u16,
     exclude_oneshot: bool = false,
     exclude_permanent: bool = false,
-    /// Snapshot of the backing SecureSlab slot's generation taken when
-    /// this handle was issued. `getPermByHandleLocked` refuses to return
-    /// the entry if the current gen no longer matches — the slot has
-    /// been freed (and possibly reallocated) since issuance, so the
-    /// handle is stale. Sentinel 0 = no gen tracking (used for variants
-    /// that don't reference a slab-allocated object: vm_reservation,
-    /// empty).
-    expected_gen: u32 = 0,
 
     pub fn processRights(self: @This()) ProcessRights {
         return @bitCast(self.rights);
@@ -149,60 +142,58 @@ pub const VmReservationObject = struct {
 };
 
 pub const KernelObject = union(enum) {
-    process: *Process,
-    dead_process: *Process,
+    process: SlabRef(Process),
+    dead_process: SlabRef(Process),
     vm_reservation: VmReservationObject,
-    shared_memory: *SharedMemory,
-    device_region: *DeviceRegion,
-    thread: *Thread,
-    vm: *Vm,
+    shared_memory: SlabRef(SharedMemory),
+    device_region: SlabRef(DeviceRegion),
+    thread: SlabRef(Thread),
+    vm: SlabRef(Vm),
     empty: void,
 
-    /// Read the current SecureSlab generation for the backing slot of
-    /// the variants that reference a slab-allocated `*T`. Used when
-    /// issuing a capability handle to snapshot the gen, and when
-    /// verifying a handle at lookup.
-    pub fn currentGen(self: @This()) u32 {
+    /// Check whether the slab slot backing this handle is still live
+    /// with the generation captured at issuance. Variants without a
+    /// slab-backed slot (`vm_reservation`, `empty`) are always fresh.
+    pub fn isFresh(self: @This()) bool {
         return switch (self) {
-            .process => |p| @truncate(p._gen_lock.currentGen()),
-            .dead_process => |p| @truncate(p._gen_lock.currentGen()),
-            .thread => |t| @truncate(t._gen_lock.currentGen()),
-            .shared_memory => |s| @truncate(s._gen_lock.currentGen()),
-            .device_region => |d| @truncate(d._gen_lock.currentGen()),
-            .vm => |v| @truncate(v._gen_lock.currentGen()),
-            .vm_reservation, .empty => 0,
+            .process => |r| r.gen == r.ptr._gen_lock.currentGen(),
+            .dead_process => |r| r.gen == r.ptr._gen_lock.currentGen(),
+            .thread => |r| r.gen == r.ptr._gen_lock.currentGen(),
+            .shared_memory => |r| r.gen == r.ptr._gen_lock.currentGen(),
+            .device_region => |r| r.gen == r.ptr._gen_lock.currentGen(),
+            .vm => |r| r.gen == r.ptr._gen_lock.currentGen(),
+            .vm_reservation, .empty => true,
         };
     }
 
-    /// Spin-CAS-acquire the gen-lock on the backing slab slot, while
-    /// verifying `expected_gen` (the snapshot taken when the handle was
-    /// issued) matches the current gen. On success the caller holds
-    /// exclusive access to the object and must pair this with a
-    /// `releaseLock` on the same variant. Returns `StaleHandle` if the
-    /// slot has been freed since issuance. No-op for variants that do
-    /// not reference a slab-allocated `*T`.
-    pub fn acquireLock(self: @This(), expected_gen: u32) error{StaleHandle}!void {
-        return switch (self) {
-            .process => |p| p._gen_lock.lockWithGen(@intCast(expected_gen)),
-            .dead_process => |p| p._gen_lock.lockWithGen(@intCast(expected_gen)),
-            .thread => |t| t._gen_lock.lockWithGen(@intCast(expected_gen)),
-            .shared_memory => |s| s._gen_lock.lockWithGen(@intCast(expected_gen)),
-            .device_region => |d| d._gen_lock.lockWithGen(@intCast(expected_gen)),
-            .vm => |v| v._gen_lock.lockWithGen(@intCast(expected_gen)),
+    /// Spin-CAS-acquire the gen-lock on the backing slab slot, using
+    /// the gen captured inside the variant's SlabRef. On success the
+    /// caller holds exclusive access to the object and must pair this
+    /// with a `releaseLock` on the same variant. Returns `StaleHandle`
+    /// if the slot has been freed since issuance. No-op for variants
+    /// that do not reference a slab-allocated object.
+    pub fn acquireLock(self: @This()) secure_slab.AccessError!void {
+        switch (self) {
+            .process => |r| _ = try r.lock(),
+            .dead_process => |r| _ = try r.lock(),
+            .thread => |r| _ = try r.lock(),
+            .shared_memory => |r| _ = try r.lock(),
+            .device_region => |r| _ = try r.lock(),
+            .vm => |r| _ = try r.lock(),
             .vm_reservation, .empty => {},
-        };
+        }
     }
 
     /// Release the gen-lock acquired via `acquireLock`. Must be paired
     /// with a successful `acquireLock` on the same variant.
     pub fn releaseLock(self: @This()) void {
         switch (self) {
-            .process => |p| p._gen_lock.unlock(),
-            .dead_process => |p| p._gen_lock.unlock(),
-            .thread => |t| t._gen_lock.unlock(),
-            .shared_memory => |s| s._gen_lock.unlock(),
-            .device_region => |d| d._gen_lock.unlock(),
-            .vm => |v| v._gen_lock.unlock(),
+            .process => |r| r.unlock(),
+            .dead_process => |r| r.unlock(),
+            .thread => |r| r.unlock(),
+            .shared_memory => |r| r.unlock(),
+            .device_region => |r| r.unlock(),
+            .vm => |r| r.unlock(),
             .vm_reservation, .empty => {},
         }
     }
@@ -266,19 +257,25 @@ pub const UserViewEntry = extern struct {
 
     pub fn fromKernelEntry(entry: PermissionEntry) UserViewEntry {
         return switch (entry.object) {
-            .process => |p| .{
-                .handle = entry.handle,
-                .entry_type = @intFromEnum(UserViewEntryType.process),
-                .rights = entry.rights,
-                .field0 = processField0(p.fault_reason, p.restart_count),
-                .field1 = 0,
+            .process => |r| blk: {
+                const p = r.ptr;
+                break :blk .{
+                    .handle = entry.handle,
+                    .entry_type = @intFromEnum(UserViewEntryType.process),
+                    .rights = entry.rights,
+                    .field0 = processField0(p.fault_reason, p.restart_count),
+                    .field1 = 0,
+                };
             },
-            .dead_process => |p| .{
-                .handle = entry.handle,
-                .entry_type = @intFromEnum(UserViewEntryType.dead_process),
-                .rights = entry.rights,
-                .field0 = processField0(p.fault_reason, p.restart_count),
-                .field1 = 0,
+            .dead_process => |r| blk: {
+                const p = r.ptr;
+                break :blk .{
+                    .handle = entry.handle,
+                    .entry_type = @intFromEnum(UserViewEntryType.dead_process),
+                    .rights = entry.rights,
+                    .field0 = processField0(p.fault_reason, p.restart_count),
+                    .field1 = 0,
+                };
             },
             .vm_reservation => |vm| .{
                 .handle = entry.handle,
@@ -287,46 +284,49 @@ pub const UserViewEntry = extern struct {
                 .field0 = vm.original_start.addr,
                 .field1 = vm.original_size,
             },
-            .shared_memory => |shm| .{
+            .shared_memory => |r| .{
                 .handle = entry.handle,
                 .entry_type = @intFromEnum(UserViewEntryType.shared_memory),
                 .rights = entry.rights,
-                .field0 = shm.size(),
+                .field0 = r.ptr.size(),
                 .field1 = 0,
             },
-            .device_region => |dr| .{
-                .handle = entry.handle,
-                .entry_type = @intFromEnum(UserViewEntryType.device_region),
-                .rights = entry.rights,
-                .field0 = @as(u64, @intFromEnum(dr.device_type)) |
-                    (@as(u64, @intFromEnum(dr.device_class)) << 8) |
-                    (if (dr.device_type == .mmio)
-                        @as(u64, @truncate(dr.access.mmio.size)) << 32
-                    else
-                        @as(u64, dr.access.port_io.port_count) << 32),
-                .field1 = if (dr.device_class == .display) blk: {
-                    const d = dr.detail.display;
-                    break :blk @as(u64, d.fb_width) |
-                        (@as(u64, d.fb_height) << 16) |
-                        (@as(u64, d.fb_stride) << 32) |
-                        (@as(u64, d.fb_pixel_format) << 48);
-                } else blk: {
-                    const p = dr.detail.pci;
-                    break :blk @as(u64, p.vendor) |
-                        (@as(u64, p.device) << 16) |
-                        (@as(u64, p.class) << 32) |
-                        (@as(u64, p.subclass) << 40) |
-                        (@as(u64, p.bus) << 48) |
-                        (@as(u64, p.dev) << 53) |
-                        (@as(u64, p.func) << 58);
-                },
+            .device_region => |r| blk: {
+                const dr = r.ptr;
+                break :blk .{
+                    .handle = entry.handle,
+                    .entry_type = @intFromEnum(UserViewEntryType.device_region),
+                    .rights = entry.rights,
+                    .field0 = @as(u64, @intFromEnum(dr.device_type)) |
+                        (@as(u64, @intFromEnum(dr.device_class)) << 8) |
+                        (if (dr.device_type == .mmio)
+                            @as(u64, @truncate(dr.access.mmio.size)) << 32
+                        else
+                            @as(u64, dr.access.port_io.port_count) << 32),
+                    .field1 = if (dr.device_class == .display) inner: {
+                        const d = dr.detail.display;
+                        break :inner @as(u64, d.fb_width) |
+                            (@as(u64, d.fb_height) << 16) |
+                            (@as(u64, d.fb_stride) << 32) |
+                            (@as(u64, d.fb_pixel_format) << 48);
+                    } else inner: {
+                        const p = dr.detail.pci;
+                        break :inner @as(u64, p.vendor) |
+                            (@as(u64, p.device) << 16) |
+                            (@as(u64, p.class) << 32) |
+                            (@as(u64, p.subclass) << 40) |
+                            (@as(u64, p.bus) << 48) |
+                            (@as(u64, p.dev) << 53) |
+                            (@as(u64, p.func) << 58);
+                    },
+                };
             },
-            .thread => |t| .{
+            .thread => |r| .{
                 .handle = entry.handle,
                 .entry_type = @intFromEnum(UserViewEntryType.thread),
                 .rights = entry.rights,
-                .field0 = threadField0(t, entry),
-                .field1 = threadField1(t),
+                .field0 = threadField0(r.ptr, entry),
+                .field1 = threadField1(r.ptr),
             },
             .vm => .{
                 .handle = entry.handle,

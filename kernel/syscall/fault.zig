@@ -105,10 +105,10 @@ fn lookupFaultHandles(handler: *Process, faulted: *Thread) struct { proc_h: u64,
     var thread_h: u64 = 0;
     for (&handler.perm_table) |*slot| {
         switch (slot.object) {
-            .thread => |t| if (t == faulted) {
+            .thread => |r| if (r.ptr == faulted) {
                 thread_h = slot.handle;
             },
-            .process => |p| if (p == faulted.process) {
+            .process => |r| if (r.ptr == faulted.process) {
                 proc_h = slot.handle;
             },
             else => {},
@@ -303,7 +303,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
     if ((flags & (fault_exclude_next | fault_exclude_permanent)) != 0) {
         proc.perm_lock.lock();
         for (&proc.perm_table) |*slot| {
-            if (slot.object == .thread and slot.object.thread == pending) {
+            if (slot.object == .thread and slot.object.thread.ptr == pending) {
                 if ((flags & fault_exclude_next) != 0) {
                     slot.exclude_oneshot = true;
                     slot.exclude_permanent = false;
@@ -416,7 +416,7 @@ pub fn sysFaultReadMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64
 
     if (len == 0) return E_INVAL;
 
-    const target = entry.object.process;
+    const target = entry.object.process.ptr;
 
     // Validate target vaddr is within user address space
     if (!address.AddrSpacePartition.user.contains(vaddr)) return E_BADADDR;
@@ -468,7 +468,7 @@ pub fn sysFaultWriteMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i6
 
     if (len == 0) return E_INVAL;
 
-    const target = entry.object.process;
+    const target = entry.object.process.ptr;
 
     // Validate target vaddr is within user address space
     if (!address.AddrSpacePartition.user.contains(vaddr)) return E_BADADDR;
@@ -531,7 +531,7 @@ pub fn sysFaultSetThreadMode(thread_handle: u64, mode: u64) i64 {
 
     const proc = sched.currentProc();
     const pinned = proc.lookupThreadHandle(thread_handle) orelse return E_BADCAP;
-    const target_thread = pinned.thread;
+    const target_thread = pinned.thread.ptr;
 
     // Verify caller holds fault_handler for the thread's owning process.
     // Two valid cases (§2.12.32):
@@ -552,7 +552,7 @@ pub fn sysFaultSetThreadMode(thread_handle: u64, mode: u64) i64 {
     proc.perm_lock.lock();
     defer proc.perm_lock.unlock();
     for (&proc.perm_table) |*slot| {
-        if (slot.object == .thread and slot.object.thread == target_thread) {
+        if (slot.object == .thread and slot.object.thread.ptr == target_thread) {
             switch (mode) {
                 0 => { // stop_all
                     slot.exclude_oneshot = false;

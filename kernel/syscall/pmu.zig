@@ -317,7 +317,7 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
 /// Look up a thread handle and verify the entry is actually a thread.
 fn lookupThread(proc: *Process, thread_handle: u64) ?*Thread {
     const pinned = proc.lookupThreadHandle(thread_handle) orelse return null;
-    return pinned.thread;
+    return pinned.thread.ptr;
 }
 
 /// Dual-gated rights check. Returns null on success, error code on failure.

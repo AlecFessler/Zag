@@ -117,7 +117,16 @@ pub const GenLock = extern struct {
 ///  * `eql(other)` — identity compare. Fat refs to the same slot with
 ///    the same gen are the same reference.
 pub fn SlabRef(comptime T: type) type {
-    comptime validateT(T);
+    // NOTE: `validateT` is intentionally deferred to the method bodies
+    // below (via `ptr._gen_lock` field syntax) rather than called at
+    // the outer `fn SlabRef` scope. Otherwise embedding `SlabRef(T)` in
+    // a struct field of T itself (e.g. `KernelObject.process:
+    // SlabRef(Process)` inside `Process.perm_table`) creates a
+    // self-referential comptime cycle — Zig's `@hasField` requires the
+    // struct to be fully resolved, which cannot happen while T is
+    // still being declared. Field-syntax access inside `lock`/`unlock`
+    // still produces the same `@hasField("_gen_lock")` guarantee, just
+    // at method-call time instead of at type-instantiation time.
     return extern struct {
         const Self = @This();
 

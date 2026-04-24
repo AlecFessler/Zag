@@ -24,6 +24,7 @@ const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Process = zag.proc.process.Process;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
+const slabRefNow = zag.proc.process.slabRefNow;
 const SpinLock = zag.utils.sync.SpinLock;
 const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
 const VAddr = zag.memory.address.VAddr;
@@ -307,7 +308,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
     // Insert VM handle into caller's perm table
     const vm_handle_id = proc.insertPerm(PermissionEntry{
         .handle = 0, // will be assigned by insertPerm
-        .object = KernelObject{ .vm = vm_obj },
+        .object = KernelObject{ .vm = slabRefNow(Vm, vm_obj) },
         .rights = 0xFFFF,
     }) catch {
         // Cleanup on failure: remove all vCPU thread handles, destroy VM
@@ -477,7 +478,7 @@ fn kickRunningVcpus(vm_obj: *Vm) void {
 fn resolveVmHandle(proc: *Process, vm_handle: u64) ?*Vm {
     const entry = proc.getPermByHandle(vm_handle) orelse return null;
     return switch (entry.object) {
-        .vm => |v| v,
+        .vm => |r| r.ptr,
         else => null,
     };
 }

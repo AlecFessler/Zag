@@ -196,7 +196,7 @@ pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
     vm_obj._gen_lock.lock();
     defer vm_obj._gen_lock.unlock();
 
-    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse return E_BADCAP;
+    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread.ptr) orelse return E_BADCAP;
 
     if (vcpu_obj.loadState() != .idle) return E_BUSY;
 
@@ -225,7 +225,7 @@ pub fn vcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     vm_obj._gen_lock.lock();
     defer vm_obj._gen_lock.unlock();
 
-    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse return E_BADCAP;
+    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread.ptr) orelse return E_BADCAP;
 
     if (vcpu_obj.loadState() != .idle) return E_BUSY;
 
@@ -253,7 +253,7 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     // released before the IPI/spin loop so we don't stall other cores
     // touching vm_obj while we wait for the vcpu thread to leave CPU.
     vm_obj._gen_lock.lock();
-    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse {
+    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread.ptr) orelse {
         vm_obj._gen_lock.unlock();
         return E_BADCAP;
     };
@@ -306,7 +306,7 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     // Resolve vcpu + snapshot state under vm_obj._gen_lock. Lock released
     // before the IPI/spin so we don't stall cross-core work on the VM.
     vm_obj._gen_lock.lock();
-    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread) orelse {
+    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread.ptr) orelse {
         vm_obj._gen_lock.unlock();
         return E_BADCAP;
     };

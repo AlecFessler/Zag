@@ -34,7 +34,7 @@ pub fn sysMemMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
     if (!vm_res.max_rights.mmio) return E_PERM;
     if (!vm_res.max_rights.read and !vm_res.max_rights.write) return E_PERM;
 
-    const device = device_entry.object.device_region;
+    const device = device_entry.object.device_region.ptr;
     device._gen_lock.lock();
     defer device._gen_lock.unlock();
 
@@ -100,7 +100,7 @@ pub fn sysIrqAck(device_handle: u64) i64 {
     if (!entry.deviceRights().irq) return E_PERM;
 
     // Look up the device's IRQ line, clear the pending bit, and unmask.
-    const device = entry.object.device_region;
+    const device = entry.object.device_region.ptr;
     const irq_line = arch.cpu.findIrqForDevice(device) orelse return E_INVAL;
     arch.cpu.clearIrqPendingBit(irq_line);
     arch.cpu.unmaskIrq(irq_line);
@@ -133,7 +133,7 @@ pub fn sysMemDmaMap(device_handle: u64, shm_handle: u64) i64 {
         proc.perm_lock.unlock();
         return E_PERM;
     }
-    const device = dev_entry.object.device_region;
+    const device = dev_entry.object.device_region.ptr;
     device._gen_lock.lock();
     if (device.device_type != .mmio) {
         device._gen_lock.unlock();
@@ -150,7 +150,7 @@ pub fn sysMemDmaMap(device_handle: u64, shm_handle: u64) i64 {
         proc.perm_lock.unlock();
         return E_BADCAP;
     }
-    const shm = shm_entry.object.shared_memory;
+    const shm = shm_entry.object.shared_memory.ptr;
 
     // Keep the SHM alive for the duration of this syscall regardless
     // of a concurrent revoke.
@@ -198,7 +198,7 @@ pub fn sysMemDmaUnmap(device_handle: u64, shm_handle: u64) i64 {
         proc.perm_lock.unlock();
         return E_BADCAP;
     }
-    const device = dev_entry.object.device_region;
+    const device = dev_entry.object.device_region.ptr;
 
     const shm_entry = proc.getPermByHandleLocked(shm_handle) orelse {
         proc.perm_lock.unlock();
@@ -208,7 +208,7 @@ pub fn sysMemDmaUnmap(device_handle: u64, shm_handle: u64) i64 {
         proc.perm_lock.unlock();
         return E_BADCAP;
     }
-    const shm = shm_entry.object.shared_memory;
+    const shm = shm_entry.object.shared_memory.ptr;
     shm.incRef();
     proc.perm_lock.unlock();
     defer shm.decRef();

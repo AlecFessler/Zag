@@ -182,7 +182,7 @@ pub fn sysThreadSuspend(thread_handle: u64) i64 {
     defer kprof.exit(.sys_thread_suspend);
     const proc = sched.currentProc();
     const pinned = proc.lookupThreadHandle(thread_handle) orelse return E_BADCAP;
-    const target = pinned.thread;
+    const target = pinned.thread.ptr;
     if (!pinned.entry.threadHandleRights().@"suspend") return E_PERM;
 
     target._gen_lock.lock();
@@ -261,7 +261,7 @@ pub fn sysThreadResume(thread_handle: u64) i64 {
     defer kprof.exit(.sys_thread_resume);
     const proc = sched.currentProc();
     const pinned = proc.lookupThreadHandle(thread_handle) orelse return E_BADCAP;
-    const target = pinned.thread;
+    const target = pinned.thread.ptr;
     if (!pinned.entry.threadHandleRights().@"resume") return E_PERM;
 
     target._gen_lock.lock();
@@ -292,7 +292,7 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
     defer kprof.exit(.sys_thread_kill);
     const proc = sched.currentProc();
     const pinned = proc.lookupThreadHandle(thread_handle) orelse return E_BADCAP;
-    const target = pinned.thread;
+    const target = pinned.thread.ptr;
     if (!pinned.entry.threadHandleRights().kill) return E_PERM;
     const cur = sched.currentThread().?;
 
