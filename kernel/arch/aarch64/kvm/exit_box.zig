@@ -230,7 +230,8 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
 
     const entry = proc.getPermByHandle(exit_token) orelse return E_NOENT;
     if (entry.object != .thread) return E_NOENT;
-    const thread = entry.object.thread.ptr;
+    const thread = entry.object.thread.lock() catch return E_NOENT;
+    defer entry.object.thread.unlock();
 
     vm_obj._gen_lock.lock();
 

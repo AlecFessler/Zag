@@ -448,8 +448,6 @@ pub fn sysFaultReadMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64
 
     if (len == 0) return E_INVAL;
 
-    const target = entry.object.process.ptr;
-
     // Validate target vaddr is within user address space
     if (!address.AddrSpacePartition.user.contains(vaddr)) return E_BADADDR;
     const vaddr_end = std.math.add(u64, vaddr, len) catch return E_BADADDR;
@@ -460,8 +458,8 @@ pub fn sysFaultReadMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64
     const buf_end = std.math.add(u64, buf_ptr, len) catch return E_BADADDR;
     if (!address.AddrSpacePartition.user.contains(buf_end -| 1)) return E_BADADDR;
 
-    target._gen_lock.lock();
-    defer target._gen_lock.unlock();
+    const target = entry.object.process.lock() catch return E_BADCAP;
+    defer entry.object.process.unlock();
 
     // Read from target process's virtual address space via physmap.
     // Pre-fault both sides: demand-page the target page so debuggers can
@@ -500,8 +498,6 @@ pub fn sysFaultWriteMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i6
 
     if (len == 0) return E_INVAL;
 
-    const target = entry.object.process.ptr;
-
     // Validate target vaddr is within user address space
     if (!address.AddrSpacePartition.user.contains(vaddr)) return E_BADADDR;
     const vaddr_end = std.math.add(u64, vaddr, len) catch return E_BADADDR;
@@ -512,8 +508,8 @@ pub fn sysFaultWriteMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i6
     const buf_end = std.math.add(u64, buf_ptr, len) catch return E_BADADDR;
     if (!address.AddrSpacePartition.user.contains(buf_end -| 1)) return E_BADADDR;
 
-    target._gen_lock.lock();
-    defer target._gen_lock.unlock();
+    const target = entry.object.process.lock() catch return E_BADCAP;
+    defer entry.object.process.unlock();
 
     // Write to target process's virtual address space via physmap (bypasses page perms).
     // Pre-fault both sides: demand-page the target page (even uncommitted
@@ -563,24 +559,21 @@ pub fn sysFaultSetThreadMode(thread_handle: u64, mode: u64) i64 {
 
     const proc = sched.currentProc();
     const pinned = proc.lookupThreadHandle(thread_handle) orelse return E_BADCAP;
-    const target_thread = pinned.thread.ptr;
+    const target_thread = pinned.thread.lock() catch return E_BADCAP;
+    defer pinned.thread.unlock();
 
     // Verify caller holds fault_handler for the thread's owning process.
     // Two valid cases (§2.12.32):
     //   1. External handler: target_proc.fault_handler_proc == proc
     //   2. Self-handling:    target_proc == proc AND proc's slot 0 has
     //                        the fault_handler ProcessRights bit set.
-    target_thread._gen_lock.lock();
-    // self-alive: we hold the thread's gen-lock; its `.process`
-    // SlabRef addresses a live Process slot under that lock.
-    const target_proc = target_thread.process.ptr;
-    target_thread._gen_lock.unlock();
-    target_proc._gen_lock.lock();
+    const target_proc_ref = target_thread.process;
+    const target_proc = target_proc_ref.lock() catch return E_BADCAP;
     const handler_ok = if (target_proc.fault_handler_proc) |h_ref|
         h_ref.ptr == proc
     else
         false;
-    target_proc._gen_lock.unlock();
+    target_proc_ref.unlock();
     const is_self_handler = target_proc == proc and
         proc.perm_table[0].processRights().fault_handler;
     if (!handler_ok and !is_self_handler) return E_PERM;

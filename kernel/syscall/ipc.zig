@@ -358,12 +358,11 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
     // Look up target process
     const target_entry = proc.getPermByHandle(target_handle) orelse return .{ .ret = E_BADCAP };
     if (target_entry.object != .process) return .{ .ret = E_BADCAP };
-    const target_proc = target_entry.object.process.ptr;
 
     // §2.6.30: lazily convert dead process entries on IPC attempt.
-    target_proc._gen_lock.lock();
+    const target_proc = target_entry.object.process.lock() catch return .{ .ret = E_BADCAP };
     const target_alive = target_proc.alive;
-    target_proc._gen_lock.unlock();
+    target_entry.object.process.unlock();
     if (!target_alive) {
         proc.convertToDeadProcess(target_proc);
         return .{ .ret = E_BADCAP };
@@ -439,12 +438,11 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
 
     const target_entry = proc.getPermByHandle(target_handle) orelse return .{ .ret = E_BADCAP };
     if (target_entry.object != .process) return .{ .ret = E_BADCAP };
-    const target_proc = target_entry.object.process.ptr;
 
     // §2.6.30: lazily convert dead process entries on IPC attempt.
-    target_proc._gen_lock.lock();
+    const target_proc = target_entry.object.process.lock() catch return .{ .ret = E_BADCAP };
     const target_alive = target_proc.alive;
-    target_proc._gen_lock.unlock();
+    target_entry.object.process.unlock();
     if (!target_alive) {
         proc.convertToDeadProcess(target_proc);
         return .{ .ret = E_BADCAP };

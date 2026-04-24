@@ -34,9 +34,8 @@ pub fn sysMemMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
     if (!vm_res.max_rights.mmio) return E_PERM;
     if (!vm_res.max_rights.read and !vm_res.max_rights.write) return E_PERM;
 
-    const device = device_entry.object.device_region.ptr;
-    device._gen_lock.lock();
-    defer device._gen_lock.unlock();
+    const device = device_entry.object.device_region.lock() catch return E_BADCAP;
+    defer device_entry.object.device_region.unlock();
 
     if (device.device_type == .port_io) {
         // Port I/O devices use virtual BAR — write_combining is invalid
@@ -100,7 +99,8 @@ pub fn sysIrqAck(device_handle: u64) i64 {
     if (!entry.deviceRights().irq) return E_PERM;
 
     // Look up the device's IRQ line, clear the pending bit, and unmask.
-    const device = entry.object.device_region.ptr;
+    const device = entry.object.device_region.lock() catch return E_BADCAP;
+    defer entry.object.device_region.unlock();
     const irq_line = arch.cpu.findIrqForDevice(device) orelse return E_INVAL;
     arch.cpu.clearIrqPendingBit(irq_line);
     arch.cpu.unmaskIrq(irq_line);
@@ -133,14 +133,16 @@ pub fn sysMemDmaMap(device_handle: u64, shm_handle: u64) i64 {
         proc.perm_lock.unlock();
         return E_PERM;
     }
-    const device = dev_entry.object.device_region.ptr;
-    device._gen_lock.lock();
+    const device = dev_entry.object.device_region.lock() catch {
+        proc.perm_lock.unlock();
+        return E_BADCAP;
+    };
     if (device.device_type != .mmio) {
-        device._gen_lock.unlock();
+        dev_entry.object.device_region.unlock();
         proc.perm_lock.unlock();
         return E_INVAL;
     }
-    device._gen_lock.unlock();
+    dev_entry.object.device_region.unlock();
 
     const shm_entry = proc.getPermByHandleLocked(shm_handle) orelse {
         proc.perm_lock.unlock();
@@ -150,11 +152,15 @@ pub fn sysMemDmaMap(device_handle: u64, shm_handle: u64) i64 {
         proc.perm_lock.unlock();
         return E_BADCAP;
     }
-    const shm = shm_entry.object.shared_memory.ptr;
+    const shm = shm_entry.object.shared_memory.lock() catch {
+        proc.perm_lock.unlock();
+        return E_BADCAP;
+    };
 
     // Keep the SHM alive for the duration of this syscall regardless
     // of a concurrent revoke.
     shm.incRef();
+    shm_entry.object.shared_memory.unlock();
     proc.perm_lock.unlock();
 
     if (!arch.iommu.isDmaRemapAvailable()) {
@@ -162,9 +168,7 @@ pub fn sysMemDmaMap(device_handle: u64, shm_handle: u64) i64 {
         return E_NOMEM;
     }
 
-    shm._gen_lock.lock();
     const num_pages = shm.num_pages;
-    shm._gen_lock.unlock();
 
     const dma_base = arch.iommu.mapDmaPages(device, shm) catch {
         shm.decRef();
@@ -198,7 +202,11 @@ pub fn sysMemDmaUnmap(device_handle: u64, shm_handle: u64) i64 {
         proc.perm_lock.unlock();
         return E_BADCAP;
     }
-    const device = dev_entry.object.device_region.ptr;
+    const device = dev_entry.object.device_region.lock() catch {
+        proc.perm_lock.unlock();
+        return E_BADCAP;
+    };
+    dev_entry.object.device_region.unlock();
 
     const shm_entry = proc.getPermByHandleLocked(shm_handle) orelse {
         proc.perm_lock.unlock();
@@ -208,8 +216,12 @@ pub fn sysMemDmaUnmap(device_handle: u64, shm_handle: u64) i64 {
         proc.perm_lock.unlock();
         return E_BADCAP;
     }
-    const shm = shm_entry.object.shared_memory.ptr;
+    const shm = shm_entry.object.shared_memory.lock() catch {
+        proc.perm_lock.unlock();
+        return E_BADCAP;
+    };
     shm.incRef();
+    shm_entry.object.shared_memory.unlock();
     proc.perm_lock.unlock();
     defer shm.decRef();
 

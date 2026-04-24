@@ -333,16 +333,23 @@ pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
+    const thread_ptr = entry.object.thread.lock() catch return E_BADCAP;
+    defer entry.object.thread.unlock();
+
     vm_obj._gen_lock.lock();
     defer vm_obj._gen_lock.unlock();
 
-    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread.ptr) orelse return E_BADCAP;
+    const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse return E_BADCAP;
 
     if (vcpu_obj.loadState() != .idle) return E_BUSY;
 
     vcpu_obj.storeState(.running);
+<<<<<<< HEAD
     const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
     defer vcpu_obj.thread.unlock();
+=======
+    const thread = vcpu_obj.thread;
+>>>>>>> 47a0277 (syscall/kvm: tighten SlabRef consumers to ref.lock()/unlock() brackets)
     thread.state = .ready;
     const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
     sched.enqueueOnCore(target_core, thread);
@@ -360,10 +367,13 @@ pub fn vcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
+    const thread_ptr = entry.object.thread.lock() catch return E_BADCAP;
+    defer entry.object.thread.unlock();
+
     vm_obj._gen_lock.lock();
     defer vm_obj._gen_lock.unlock();
 
-    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread.ptr) orelse return E_BADCAP;
+    const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse return E_BADCAP;
 
     if (vcpu_obj.loadState() != .idle) return E_BUSY;
 
@@ -385,10 +395,13 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
+    const thread_ptr = entry.object.thread.lock() catch return E_BADCAP;
+    defer entry.object.thread.unlock();
+
     // Resolve vcpu + snapshot state under vm_obj._gen_lock. Lock released
     // before the IPI/spin so we don't stall cross-core work on the VM.
     vm_obj._gen_lock.lock();
-    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread.ptr) orelse {
+    const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse {
         vm_obj._gen_lock.unlock();
         return E_BADCAP;
     };
@@ -415,8 +428,12 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     if (!write_ok) return E_BADADDR;
 
     if (state_snapshot == .running) {
+<<<<<<< HEAD
         const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
         defer vcpu_obj.thread.unlock();
+=======
+        const thread = vcpu_obj.thread;
+>>>>>>> 47a0277 (syscall/kvm: tighten SlabRef consumers to ref.lock()/unlock() brackets)
         thread.state = .ready;
         const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
         sched.enqueueOnCore(target_core, thread);
@@ -440,8 +457,11 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
+    const thread_ptr = entry.object.thread.lock() catch return E_BADCAP;
+    defer entry.object.thread.unlock();
+
     vm_obj._gen_lock.lock();
-    const vcpu_obj = vcpuFromThread(vm_obj, entry.object.thread.ptr) orelse {
+    const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse {
         vm_obj._gen_lock.unlock();
         return E_BADCAP;
     };
@@ -470,9 +490,12 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
         vm_obj._gen_lock.lock();
         injectInterrupt(&vcpu_obj.guest_state, interrupt);
         vm_obj._gen_lock.unlock();
+<<<<<<< HEAD
         // Resume phase.
         const thread = vcpu_obj.thread.lock() catch return E_BADCAP;
         defer vcpu_obj.thread.unlock();
+=======
+>>>>>>> 47a0277 (syscall/kvm: tighten SlabRef consumers to ref.lock()/unlock() brackets)
         thread.state = .ready;
         const target_core = if (thread.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
         sched.enqueueOnCore(target_core, thread);

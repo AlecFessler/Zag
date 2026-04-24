@@ -244,9 +244,8 @@ pub const Process = struct {
         self.perm_lock.lock();
         for (&self.perm_table) |*slot| {
             // self-alive: iterating our own perm_table under perm_lock.
-            // The `.thread` SlabRef pairs a *Thread with its capture gen;
-            // comparing `.ptr.process.ptr` to `target` is a pure address
-            // match and doesn't deref unsafely.
+            // Identity compare — both .ptr accesses are analyzer-exempt
+            // address reads, not derefs.
             if (slot.object == .thread and slot.object.thread.ptr.process.ptr == target) {
                 slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
@@ -1027,14 +1026,11 @@ pub const Process = struct {
                 defer handler_ref.unlock();
                 handler.perm_lock.lock();
                 for (&handler.perm_table) |*slot| {
-                    if (slot.object == .thread) {
-                        // self-alive: walking handler's perm table under
-                        // perm_lock; the thread SlabRef is stable while held.
-                        const t = slot.object.thread.ptr;
-                        if (t.process.ptr == self) {
-                            slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
-                            handler.perm_count -= 1;
-                        }
+                    // self-alive: walking handler's perm_table under perm_lock.
+                    // Identity compare — .ptr accesses are analyzer-exempt.
+                    if (slot.object == .thread and slot.object.thread.ptr.process.ptr == self) {
+                        slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
+                        handler.perm_count -= 1;
                     }
                 }
                 handler.syncUserView();
@@ -1083,11 +1079,15 @@ pub const Process = struct {
                 self.perm_count -= 1;
             } else if (entry.object == .thread) {
                 // Unpin any pinned threads before clearing the entry
-                const t = entry.object.thread.ptr;
-                if (t.priority == .pinned) {
-                    const core_id = @ctz(t.core_affinity orelse 0);
-                    sched.unpinByRevoke(core_id);
-                }
+                if (entry.object.thread.lock()) |t| {
+                    if (t.priority == .pinned) {
+                        const core_id = @ctz(t.core_affinity orelse 0);
+                        entry.object.thread.unlock();
+                        sched.unpinByRevoke(core_id);
+                    } else {
+                        entry.object.thread.unlock();
+                    }
+                } else |_| {}
                 entry.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
             }

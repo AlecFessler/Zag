@@ -193,27 +193,23 @@ pub fn sysThreadSuspend(thread_handle: u64) i64 {
     defer kprof.exit(.sys_thread_suspend);
     const proc = sched.currentProc();
     const pinned = proc.lookupThreadHandle(thread_handle) orelse return E_BADCAP;
-    const target = pinned.thread.ptr;
     if (!pinned.entry.threadHandleRights().@"suspend") return E_PERM;
-
-    target._gen_lock.lock();
-    // self-alive: we hold `target._gen_lock`; its `.process` SlabRef
-    // addresses a live Process slot under that lock.
-    const target_proc = target.process.ptr;
-    target._gen_lock.unlock();
-
-    target_proc._gen_lock.lock();
-    target._gen_lock.lock();
+    const target = pinned.thread.lock() catch return E_BADCAP;
+    const target_proc_ref = target.process;
+    const target_proc = target_proc_ref.lock() catch {
+        pinned.thread.unlock();
+        return E_BADCAP;
+    };
 
     switch (target.state) {
         .faulted, .suspended => {
-            target._gen_lock.unlock();
-            target_proc._gen_lock.unlock();
+            target_proc_ref.unlock();
+            pinned.thread.unlock();
             return E_BUSY;
         },
         .exited => {
-            target._gen_lock.unlock();
-            target_proc._gen_lock.unlock();
+            target_proc_ref.unlock();
+            pinned.thread.unlock();
             return E_BADCAP;
         },
         // §2.4: blocked threads (futex / IPC) cannot be suspended in
@@ -222,8 +218,8 @@ pub fn sysThreadSuspend(thread_handle: u64) i64 {
         // a debugger can wait for the thread to leave .blocked and try
         // again.
         .blocked => {
-            target._gen_lock.unlock();
-            target_proc._gen_lock.unlock();
+            target_proc_ref.unlock();
+            pinned.thread.unlock();
             return E_BUSY;
         },
         .running, .ready => {
@@ -240,8 +236,8 @@ pub fn sysThreadSuspend(thread_handle: u64) i64 {
                 // re-enqueue us while we are still running on this core
                 // — dual dispatch. §2.4.9 requires the transition to be
                 // effective immediately.
-                target._gen_lock.unlock();
-                target_proc._gen_lock.unlock();
+                target_proc_ref.unlock();
+                pinned.thread.unlock();
                 arch.cpu.enableInterrupts();
                 sched.yield();
                 // On the next time we are resumed, we return into the
@@ -249,8 +245,8 @@ pub fn sysThreadSuspend(thread_handle: u64) i64 {
                 return E_OK;
             }
 
-            target._gen_lock.unlock();
-            target_proc._gen_lock.unlock();
+            target_proc_ref.unlock();
+            pinned.thread.unlock();
 
             // The target may be in a run queue (.ready) or actively
             // dispatched on a core (.running). Because the scheduler
@@ -274,28 +270,25 @@ pub fn sysThreadResume(thread_handle: u64) i64 {
     defer kprof.exit(.sys_thread_resume);
     const proc = sched.currentProc();
     const pinned = proc.lookupThreadHandle(thread_handle) orelse return E_BADCAP;
-    const target = pinned.thread.ptr;
     if (!pinned.entry.threadHandleRights().@"resume") return E_PERM;
+    const target = pinned.thread.lock() catch return E_BADCAP;
+    const target_proc_ref = target.process;
+    const target_proc = target_proc_ref.lock() catch {
+        pinned.thread.unlock();
+        return E_BADCAP;
+    };
 
-    target._gen_lock.lock();
-    // self-alive: we hold `target._gen_lock`; its `.process` SlabRef
-    // addresses a live Process slot under that lock.
-    const target_proc = target.process.ptr;
-    target._gen_lock.unlock();
-
-    target_proc._gen_lock.lock();
-    target._gen_lock.lock();
     if (target.state != .suspended) {
-        target._gen_lock.unlock();
-        target_proc._gen_lock.unlock();
+        target_proc_ref.unlock();
+        pinned.thread.unlock();
         return E_INVAL;
     }
 
     target.state = .ready;
     target_proc.suspended_thread_slots &= ~(@as(u64, 1) << @intCast(target.slot_index));
     const affinity = target.core_affinity;
-    target._gen_lock.unlock();
-    target_proc._gen_lock.unlock();
+    target_proc_ref.unlock();
+    pinned.thread.unlock();
 
     const target_core = if (affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
     sched.enqueueOnCore(target_core, target);
@@ -307,26 +300,23 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
     defer kprof.exit(.sys_thread_kill);
     const proc = sched.currentProc();
     const pinned = proc.lookupThreadHandle(thread_handle) orelse return E_BADCAP;
-    const target = pinned.thread.ptr;
     if (!pinned.entry.threadHandleRights().kill) return E_PERM;
     const cur = sched.currentThread().?;
+    const target = pinned.thread.lock() catch return E_BADCAP;
+    const target_proc_ref = target.process;
+    const target_proc = target_proc_ref.lock() catch {
+        pinned.thread.unlock();
+        return E_BADCAP;
+    };
 
-    target._gen_lock.lock();
-    // self-alive: we hold `target._gen_lock`; its `.process` SlabRef
-    // addresses a live Process slot under that lock.
-    const target_proc = target.process.ptr;
-    target._gen_lock.unlock();
-
-    target_proc._gen_lock.lock();
-    target._gen_lock.lock();
     if (target.state == .faulted) {
-        target._gen_lock.unlock();
-        target_proc._gen_lock.unlock();
+        target_proc_ref.unlock();
+        pinned.thread.unlock();
         return E_BUSY;
     }
     if (target.state == .exited) {
-        target._gen_lock.unlock();
-        target_proc._gen_lock.unlock();
+        target_proc_ref.unlock();
+        pinned.thread.unlock();
         return E_BADCAP;
     }
 
@@ -336,8 +326,8 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
     // Clear bitmask bits
     target_proc.faulted_thread_slots &= ~(@as(u64, 1) << @intCast(target.slot_index));
     target_proc.suspended_thread_slots &= ~(@as(u64, 1) << @intCast(target.slot_index));
-    target._gen_lock.unlock();
-    target_proc._gen_lock.unlock();
+    target_proc_ref.unlock();
+    pinned.thread.unlock();
 
     // Self-kill: fall through to scheduler-zombie cleanup path.
     if (is_self) {

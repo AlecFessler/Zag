@@ -126,21 +126,16 @@ pub fn sysPmuInfo(proc: *Process, info_ptr: u64) i64 {
 pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: u64) i64 {
     const rights_err = checkRights(proc, thread_handle);
     if (rights_err) |e| return e;
-    const target_thread = lookupThread(proc, thread_handle) orelse return E_BADCAP;
+    const target_ref = lookupThread(proc, thread_handle) orelse return E_BADCAP;
 
     var configs: [arch.pmu.pmu_max_counters]PmuCounterConfig = undefined;
     const slice = readConfigs(proc, configs_ptr, count, &configs) catch |err| return configErrToCode(err);
 
-    target_thread._gen_lock.lock();
-    // self-alive: we hold `target_thread._gen_lock`; its `.process`
-    // SlabRef addresses a live Process slot under that lock.
-    const target_proc = target_thread.process.ptr;
-    target_thread._gen_lock.unlock();
-
-    target_proc._gen_lock.lock();
-    defer target_proc._gen_lock.unlock();
-    target_thread._gen_lock.lock();
-    defer target_thread._gen_lock.unlock();
+    const target_thread = target_ref.lock() catch return E_BADCAP;
+    defer target_ref.unlock();
+    const target_proc_ref = target_thread.process;
+    const target_proc = target_proc_ref.lock() catch return E_BADCAP;
+    defer target_proc_ref.unlock();
 
     // Self vs. remote programming. Writing MSRs on the caller's core only
     // makes sense if the caller *is* the target — otherwise we'd trash the
@@ -191,13 +186,7 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
 pub fn sysPmuRead(proc: *Process, thread_handle: u64, sample_ptr: u64) i64 {
     const rights_err = checkRights(proc, thread_handle);
     if (rights_err) |e| return e;
-    const target_thread = lookupThread(proc, thread_handle) orelse return E_BADCAP;
-
-    target_thread._gen_lock.lock();
-    // self-alive: we hold `target_thread._gen_lock`; its `.process`
-    // SlabRef addresses a live Process slot under that lock.
-    const target_proc = target_thread.process.ptr;
-    target_thread._gen_lock.unlock();
+    const target_ref = lookupThread(proc, thread_handle) orelse return E_BADCAP;
 
     // Snapshot into a stack-local buffer under the gen-lock, then drop
     // the lock before `writeUser` — the user-space copy can page-fault
@@ -207,10 +196,11 @@ pub fn sysPmuRead(proc: *Process, thread_handle: u64, sample_ptr: u64) i64 {
     // write doesn't race the PmuState slot.
     var sample: PmuSample = .{};
     {
-        target_proc._gen_lock.lock();
-        defer target_proc._gen_lock.unlock();
-        target_thread._gen_lock.lock();
-        defer target_thread._gen_lock.unlock();
+        const target_thread = target_ref.lock() catch return E_BADCAP;
+        defer target_ref.unlock();
+        const target_proc_ref = target_thread.process;
+        const target_proc = target_proc_ref.lock() catch return E_BADCAP;
+        defer target_proc_ref.unlock();
 
         // §2.14.11 / §4.52.5: only .faulted or .suspended is legal.
         switch (target_thread.state) {
@@ -235,21 +225,16 @@ pub fn sysPmuRead(proc: *Process, thread_handle: u64, sample_ptr: u64) i64 {
 pub fn sysPmuReset(proc: *Process, thread_handle: u64, configs_ptr: u64, count: u64) i64 {
     const rights_err = checkRights(proc, thread_handle);
     if (rights_err) |e| return e;
-    const target_thread = lookupThread(proc, thread_handle) orelse return E_BADCAP;
+    const target_ref = lookupThread(proc, thread_handle) orelse return E_BADCAP;
 
     var configs: [arch.pmu.pmu_max_counters]PmuCounterConfig = undefined;
     const slice = readConfigs(proc, configs_ptr, count, &configs) catch |err| return configErrToCode(err);
 
-    target_thread._gen_lock.lock();
-    // self-alive: we hold `target_thread._gen_lock`; its `.process`
-    // SlabRef addresses a live Process slot under that lock.
-    const target_proc = target_thread.process.ptr;
-    target_thread._gen_lock.unlock();
-
-    target_proc._gen_lock.lock();
-    defer target_proc._gen_lock.unlock();
-    target_thread._gen_lock.lock();
-    defer target_thread._gen_lock.unlock();
+    const target_thread = target_ref.lock() catch return E_BADCAP;
+    defer target_ref.unlock();
+    const target_proc_ref = target_thread.process;
+    const target_proc = target_proc_ref.lock() catch return E_BADCAP;
+    defer target_proc_ref.unlock();
 
     // §4.53.5: only .faulted is valid.
     if (target_thread.state != .faulted) return E_INVAL;
@@ -275,18 +260,13 @@ pub fn sysPmuReset(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
 pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
     const rights_err = checkRights(proc, thread_handle);
     if (rights_err) |e| return e;
-    const target_thread = lookupThread(proc, thread_handle) orelse return E_BADCAP;
+    const target_ref = lookupThread(proc, thread_handle) orelse return E_BADCAP;
 
-    target_thread._gen_lock.lock();
-    // self-alive: we hold `target_thread._gen_lock`; its `.process`
-    // SlabRef addresses a live Process slot under that lock.
-    const target_proc = target_thread.process.ptr;
-    target_thread._gen_lock.unlock();
-
-    target_proc._gen_lock.lock();
-    defer target_proc._gen_lock.unlock();
-    target_thread._gen_lock.lock();
-    defer target_thread._gen_lock.unlock();
+    const target_thread = target_ref.lock() catch return E_BADCAP;
+    defer target_ref.unlock();
+    const target_proc_ref = target_thread.process;
+    const target_proc = target_proc_ref.lock() catch return E_BADCAP;
+    defer target_proc_ref.unlock();
 
     // Self vs. remote: only touch hardware on the caller's core if the
     // caller IS the target. Otherwise, the target isn't running here —
@@ -323,9 +303,10 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
 // ── Internal helpers ────────────────────────────────────────────────────
 
 /// Look up a thread handle and verify the entry is actually a thread.
-fn lookupThread(proc: *Process, thread_handle: u64) ?*Thread {
+/// Returns a `SlabRef(Thread)` — callers must `lock()/unlock()` to deref.
+fn lookupThread(proc: *Process, thread_handle: u64) ?secure_slab.SlabRef(Thread) {
     const pinned = proc.lookupThreadHandle(thread_handle) orelse return null;
-    return pinned.thread.ptr;
+    return pinned.thread;
 }
 
 /// Dual-gated rights check. Returns null on success, error code on failure.

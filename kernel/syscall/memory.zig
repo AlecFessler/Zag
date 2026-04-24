@@ -161,7 +161,6 @@ pub fn sysMemShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
     const vm_res = vm_entry.object.vm_reservation;
     if (!vm_res.max_rights.shareable) return E_PERM;
 
-    const shm = shm_entry.object.shared_memory.ptr;
     const shm_rwx = shm_entry.rights & 0b111;
     const max_rwx: u16 =
         @as(u16, @intFromBool(vm_res.max_rights.read)) |
@@ -175,8 +174,8 @@ pub fn sysMemShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
         .execute = shm_entry.shmRights().execute,
     };
 
-    shm._gen_lock.lock();
-    defer shm._gen_lock.unlock();
+    const shm = shm_entry.object.shared_memory.lock() catch return E_BADCAP;
+    defer shm_entry.object.shared_memory.unlock();
 
     const range_end = std.math.add(u64, offset, shm.size()) catch return E_INVAL;
     if (range_end > vm_res.original_size) return E_INVAL;

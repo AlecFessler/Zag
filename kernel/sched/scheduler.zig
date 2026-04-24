@@ -456,10 +456,10 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     // and we still had on_cpu set, the wake spin would deadlock against
     // ourselves. Clearing on_cpu first makes the wake's spin a no-op.
     if (state.exited_thread) |exited| {
-        // The thread was just preempted on this core; its slot is
-        // still live (deinit below is what frees it). `lock()` would
-        // deadlock with `slab_instance.destroy` inside deinit, so use
-        // .ptr directly — this is a self-alive reference at this point.
+        // The thread was just preempted on this core; its slot is still
+        // live (deinit below is what frees it). `lock()` would deadlock
+        // with `slab_instance.destroy` inside deinit.
+        // self-alive: preempted-on-this-core guarantees liveness.
         exited.thread.ptr.deinit();
         state.exited_thread = null;
     }
