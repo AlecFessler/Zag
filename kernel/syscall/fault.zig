@@ -279,12 +279,24 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
         return E_INVAL;
     }
 
-    const pending = proc.fault_box.pending_thread orelse {
+    const pending_ref = proc.fault_box.pending_thread orelse {
         // pending_reply with null pending_thread shouldn't happen for fault box.
         _ = proc.fault_box.endPendingReplyLocked();
         proc.fault_box.lock.unlock();
         return E_INVAL;
     };
+
+    const pending = pending_ref.lock() catch {
+        // Pending thread's slot was freed — drop the stale pending_reply.
+        _ = proc.fault_box.endPendingReplyLocked();
+        proc.fault_box.lock.unlock();
+        return E_NOENT;
+    };
+    // NOTE: `pending_ref` gen-lock is released explicitly before the
+    // fault_kill branch calls `pending.deinit()` — deinit's
+    // `slab_instance.destroy` acquires the same gen-lock and would
+    // deadlock if we left it held. The resume paths release it just
+    // before returning to keep the self-alive window bounded.
 
     // Validate the token matches the pending thread's handle in our perm
     // table. If the source thread was killed externally between fault_recv
@@ -293,10 +305,12 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
     const pending_handle = proc.findThreadHandle(pending) orelse {
         _ = proc.fault_box.endPendingReplyLocked();
         proc.fault_box.lock.unlock();
+        pending_ref.unlock();
         return E_NOENT;
     };
     if (pending_handle != fault_token) {
         proc.fault_box.lock.unlock();
+        pending_ref.unlock();
         return E_NOENT;
     }
 
@@ -378,7 +392,10 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
                 // tearing down now.
                 const server = server_ref.ptr;
                 server.msg_box.lock.lock();
-                if (server.msg_box.isPendingReply() and server.msg_box.pending_thread == pending) {
+                if (server.msg_box.isPendingReply() and
+                    server.msg_box.pending_thread != null and
+                    server.msg_box.pending_thread.?.ptr == pending)
+                {
                     _ = server.msg_box.endPendingReplyLocked();
                 } else {
                     _ = server.msg_box.removeLocked(pending);
@@ -393,6 +410,9 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
             // context. Mirror what target.fault_box / msg_box scrubbing
             // does in the intra-process case.
             process_mod.scrubFromFaultBoxPub(&proc.fault_box, pending);
+            // Release pending_ref before deinit: Thread.deinit calls
+            // slab_instance.destroy which re-acquires the same gen-lock.
+            pending_ref.unlock();
             pending.deinit();
         },
         fault_resume, fault_resume_modified => {
@@ -411,6 +431,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
 
             const target_core = if (pending.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
             sched.enqueueOnCore(target_core, pending);
+            pending_ref.unlock();
         },
         else => unreachable,
     }

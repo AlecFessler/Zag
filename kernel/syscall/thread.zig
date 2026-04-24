@@ -371,7 +371,10 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
         // outlives the reply-wait we are tearing down now.
         const server = server_ref.ptr;
         server.msg_box.lock.lock();
-        if (server.msg_box.isPendingReply() and server.msg_box.pending_thread == target) {
+        if (server.msg_box.isPendingReply() and
+            server.msg_box.pending_thread != null and
+            server.msg_box.pending_thread.?.ptr == target)
+        {
             _ = server.msg_box.endPendingReplyLocked();
         } else {
             _ = server.msg_box.removeLocked(target);
@@ -384,7 +387,10 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
     // boxes in case target was queued there for some reason. These are
     // cheap no-ops when the thread isn't actually in the box.
     target_proc.msg_box.lock.lock();
-    if (target_proc.msg_box.isReceiving() and target_proc.msg_box.receiver == target) {
+    if (target_proc.msg_box.isReceiving() and
+        target_proc.msg_box.receiver != null and
+        target_proc.msg_box.receiver.?.ptr == target)
+    {
         _ = target_proc.msg_box.takeReceiverLocked();
     }
     _ = target_proc.msg_box.removeLocked(target);

@@ -14,11 +14,12 @@ const vm_mod = kvm.vm;
 const ArchCpuContext = zag.arch.x64.interrupts.ArchCpuContext;
 const KernelObject = zag.perms.permissions.KernelObject;
 const PAddr = zag.memory.address.PAddr;
-const ThreadPriorityQueue = zag.sched.thread.ThreadPriorityQueue;
 const Process = zag.proc.process.Process;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;
 const SyscallResult = zag.syscall.dispatch.SyscallResult;
 const Thread = zag.sched.thread.Thread;
+const ThreadPriorityQueue = zag.sched.thread.ThreadPriorityQueue;
 const VAddr = zag.memory.address.VAddr;
 const VCpu = vcpu_mod.VCpu;
 const Vm = vm_mod.Vm;
@@ -34,7 +35,7 @@ pub const VmExitBoxState = enum {
 pub const VmExitBox = struct {
     state: VmExitBoxState = .idle,
     queue: ThreadPriorityQueue = .{},
-    receiver: ?*Thread = null,
+    receiver: ?SlabRef(Thread) = null,
     pending: [MAX_VCPUS]bool = .{false} ** MAX_VCPUS,
     lock: SpinLock = .{},
 
@@ -61,9 +62,11 @@ pub const VmExitBox = struct {
     }
 
     /// Take the blocked receiver thread. Caller must hold lock.
-    /// Transitions from receiving to pending_replies.
+    /// Transitions from receiving to pending_replies. Returns a
+    /// `SlabRef(Thread)` — the consumer must `lock()` before using
+    /// the thread pointer.
     /// Internal helper of queueOrDeliver — not for use across modules.
-    fn takeReceiverLocked(self: *VmExitBox) *Thread {
+    fn takeReceiverLocked(self: *VmExitBox) SlabRef(Thread) {
         const r = self.receiver.?;
         self.receiver = null;
         self.state = .pending_replies;
@@ -114,9 +117,19 @@ pub const VmReplyAction = union(enum) {
 pub fn queueOrDeliver(box: *VmExitBox, vm_obj: *Vm, vcpu_obj: *VCpu) void {
     box.lock.lock();
     if (box.isReceiving()) {
-        const receiver = box.takeReceiverLocked();
+        const recv_ref = box.takeReceiverLocked();
         box.lock.unlock();
-        deliverExit(vm_obj, vcpu_obj, receiver);
+        if (recv_ref.lock()) |receiver| {
+            deliverExit(vm_obj, vcpu_obj, receiver);
+            recv_ref.unlock();
+        } else |_| {
+            // Receiver slot freed; exit will be picked up on the next
+            // vm_recv via the pending bit set by deliverExit — but
+            // without a receiver we fall back to enqueuing.
+            box.lock.lock();
+            box.enqueueLocked(vcpu_obj.thread);
+            box.lock.unlock();
+        }
     } else {
         box.enqueueLocked(vcpu_obj.thread);
         box.lock.unlock();
@@ -209,7 +222,7 @@ pub fn vmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContext, vm_handle: 
     // Block: set receiver and switch away. When a vCPU exit is delivered
     // to us, the delivery path writes rax into our saved context and
     // wakes us — we resume from the syscall return frame directly.
-    box.receiver = thread;
+    box.receiver = SlabRef(Thread).init(thread, thread._gen_lock.currentGen());
     box.state = .receiving;
     box.lock.unlock();
     vm_obj._gen_lock.unlock();

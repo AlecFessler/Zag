@@ -274,9 +274,15 @@ pub const Process = struct {
         // semantics below.
         self.fault_box.lock.lock();
         if (self.fault_box.isPendingReply()) {
-            if (self.fault_box.pending_thread) |pt| {
-                // self-alive: pt is a live pointer owned by the fault box.
-                if (pt.process.ptr == target) {
+            if (self.fault_box.pending_thread) |pt_ref| {
+                if (pt_ref.lock()) |pt| {
+                    const belongs = pt.process.ptr == target;
+                    pt_ref.unlock();
+                    if (belongs) {
+                        _ = self.fault_box.endPendingReplyLocked();
+                    }
+                } else |_| {
+                    // Pending thread's slot was freed; drop the stale entry.
                     _ = self.fault_box.endPendingReplyLocked();
                 }
             }
@@ -326,10 +332,15 @@ pub const Process = struct {
             target.fault_box.lock.lock();
             for (faulted_buf[0..faulted_n]) |t| {
                 if (target.fault_box.isReceiving()) {
-                    const r = target.fault_box.takeReceiverLocked();
+                    const r_ref = target.fault_box.takeReceiverLocked();
                     target.fault_box.beginPendingReplyLocked(t);
                     target.fault_box.lock.unlock();
-                    deliverFaultToWaiter(target, r, t);
+                    if (r_ref.lock()) |r| {
+                        deliverFaultToWaiter(target, r, t);
+                        r_ref.unlock();
+                    } else |_| {
+                        // Blocked receiver's slot was freed; drop the fault.
+                    }
                     target.fault_box.lock.lock();
                 } else {
                     target.fault_box.enqueueLocked(t);
@@ -589,10 +600,16 @@ pub const Process = struct {
             // Otherwise enqueue and let the next fault_recv pick it up.
             self.fault_box.lock.lock();
             if (self.fault_box.isReceiving()) {
-                const r = self.fault_box.takeReceiverLocked();
+                const r_ref = self.fault_box.takeReceiverLocked();
                 self.fault_box.beginPendingReplyLocked(thread);
                 self.fault_box.lock.unlock();
-                deliverFaultToWaiter(self, r, thread);
+                if (r_ref.lock()) |r| {
+                    deliverFaultToWaiter(self, r, thread);
+                    r_ref.unlock();
+                } else |_| {
+                    // Receiver slot freed; fault is already in pending_reply,
+                    // will be picked up on the next fault_recv.
+                }
                 return true;
             }
             self.fault_box.enqueueLocked(thread);
@@ -658,10 +675,16 @@ pub const Process = struct {
 
         handler.fault_box.lock.lock();
         if (handler.fault_box.isReceiving()) {
-            const r = handler.fault_box.takeReceiverLocked();
+            const r_ref = handler.fault_box.takeReceiverLocked();
             handler.fault_box.beginPendingReplyLocked(thread);
             handler.fault_box.lock.unlock();
-            deliverFaultToWaiter(handler, r, thread);
+            if (r_ref.lock()) |r| {
+                deliverFaultToWaiter(handler, r, thread);
+                r_ref.unlock();
+            } else |_| {
+                // Receiver slot freed; fault is already in pending_reply,
+                // will be picked up on the next fault_recv.
+            }
         } else {
             handler.fault_box.enqueueLocked(thread);
             handler.fault_box.lock.unlock();
@@ -829,7 +852,10 @@ pub const Process = struct {
                 // reply-wait state we're now draining.
                 const server = server_ref.ptr;
                 server.msg_box.lock.lock();
-                if (server.msg_box.isPendingReply() and server.msg_box.pending_thread == thread) {
+                if (server.msg_box.isPendingReply() and
+                    server.msg_box.pending_thread != null and
+                    server.msg_box.pending_thread.?.ptr == thread)
+                {
                     _ = server.msg_box.endPendingReplyLocked();
                 } else {
                     _ = server.msg_box.removeLocked(thread);
@@ -975,12 +1001,18 @@ pub const Process = struct {
         // head so the restarted process can recv it again. Drop the
         // receiver — that thread is dead with the rest of the process.
         self.msg_box.lock.lock();
-        const restored_caller: ?*Thread = if (self.msg_box.isPendingReply())
+        const restored_caller_ref: ?SlabRef(Thread) = if (self.msg_box.isPendingReply())
             self.msg_box.endPendingReplyLocked()
         else
             null;
-        if (restored_caller) |pc| {
-            self.msg_box.enqueueFrontLocked(pc);
+        if (restored_caller_ref) |cr| {
+            if (cr.lock()) |pc| {
+                self.msg_box.enqueueFrontLocked(pc);
+                cr.unlock();
+            } else |_| {
+                // Caller slot was freed since pending_reply registration;
+                // nothing to re-enqueue.
+            }
         }
         if (self.msg_box.isReceiving()) {
             _ = self.msg_box.takeReceiverLocked();
@@ -1014,9 +1046,15 @@ pub const Process = struct {
                 // pointers — must scrub before the handler can recv again.
                 handler.fault_box.lock.lock();
                 if (handler.fault_box.isPendingReply()) {
-                    if (handler.fault_box.pending_thread) |pt| {
-                        // self-alive: pt owned by the fault box while held.
-                        if (pt.process.ptr == self) {
+                    if (handler.fault_box.pending_thread) |pt_ref| {
+                        if (pt_ref.lock()) |pt| {
+                            const belongs = pt.process.ptr == self;
+                            pt_ref.unlock();
+                            if (belongs) {
+                                _ = handler.fault_box.endPendingReplyLocked();
+                            }
+                        } else |_| {
+                            // Pending thread's slot was freed; drop the stale entry.
                             _ = handler.fault_box.endPendingReplyLocked();
                         }
                     }
@@ -1153,13 +1191,18 @@ pub const Process = struct {
 
         // Unblock the pending caller (delivered but not replied) if any.
         if (self.msg_box.isPendingReply()) {
-            if (self.msg_box.endPendingReplyLocked()) |pc| {
-                pc.ipc_server = null;
-                arch.syscall.setSyscallReturn(pc.ctx, @bitCast(@as(i64, -10)));
-                while (pc.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
-                pc.state = .ready;
-                const target_core = if (pc.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
-                sched.enqueueOnCore(target_core, pc);
+            if (self.msg_box.endPendingReplyLocked()) |pc_ref| {
+                if (pc_ref.lock()) |pc| {
+                    pc.ipc_server = null;
+                    arch.syscall.setSyscallReturn(pc.ctx, @bitCast(@as(i64, -10)));
+                    while (pc.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
+                    pc.state = .ready;
+                    const target_core = if (pc.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
+                    sched.enqueueOnCore(target_core, pc);
+                    pc_ref.unlock();
+                } else |_| {
+                    // Caller slot was freed; nothing to unblock.
+                }
             }
         }
 
@@ -1178,7 +1221,10 @@ pub const Process = struct {
                 // reply state we're draining.
                 const server = server_ref.ptr;
                 server.msg_box.lock.lock();
-                if (server.msg_box.isPendingReply() and server.msg_box.pending_thread == thread) {
+                if (server.msg_box.isPendingReply() and
+                    server.msg_box.pending_thread != null and
+                    server.msg_box.pending_thread.?.ptr == thread)
+                {
                     _ = server.msg_box.endPendingReplyLocked();
                 } else {
                     _ = server.msg_box.removeLocked(thread);
@@ -1222,9 +1268,15 @@ pub const Process = struct {
                 handler.fault_box.lock.lock();
                 // Drop pending_thread if it points at one of ours.
                 if (handler.fault_box.isPendingReply()) {
-                    if (handler.fault_box.pending_thread) |pt| {
-                        // self-alive: pt is owned by the fault box.
-                        if (pt.process.ptr == self) {
+                    if (handler.fault_box.pending_thread) |pt_ref| {
+                        if (pt_ref.lock()) |pt| {
+                            const belongs = pt.process.ptr == self;
+                            pt_ref.unlock();
+                            if (belongs) {
+                                _ = handler.fault_box.endPendingReplyLocked();
+                            }
+                        } else |_| {
+                            // Pending thread's slot was freed; drop the stale entry.
                             _ = handler.fault_box.endPendingReplyLocked();
                         }
                     }
@@ -1583,7 +1635,10 @@ pub const Process = struct {
 fn scrubFromFaultBox(box: *MessageBox, target: *Thread) void {
     box.lock.lock();
     defer box.lock.unlock();
-    if (box.isPendingReply() and box.pending_thread == target) {
+    if (box.isPendingReply() and
+        box.pending_thread != null and
+        box.pending_thread.?.ptr == target)
+    {
         _ = box.endPendingReplyLocked();
     }
     _ = box.removeLocked(target);

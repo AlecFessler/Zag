@@ -382,7 +382,13 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
     }
 
     // Receiver is waiting — deliver directly
-    const receiver = target_proc.msg_box.takeReceiverLocked();
+    const recv_ref = target_proc.msg_box.takeReceiverLocked();
+    const receiver = recv_ref.lock() catch {
+        // Receiver slot got freed while blocked — treat as no receiver.
+        target_proc.msg_box.lock.unlock();
+        return .{ .ret = E_AGAIN };
+    };
+    defer recv_ref.unlock();
     // Snapshot receiver regs that we're about to overwrite, so we can
     // restore them if cap transfer fails and the receiver re-blocks.
     const saved_return = arch.syscall.getSyscallReturn(receiver.ctx);
@@ -451,7 +457,19 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
 
     if (target_proc.msg_box.isReceiving()) {
         // Receiver is waiting — deliver and queue caller for reply.
-        const receiver = target_proc.msg_box.takeReceiverLocked();
+        const recv_ref = target_proc.msg_box.takeReceiverLocked();
+        const receiver = recv_ref.lock() catch {
+            // Receiver slot freed while blocked — fall back to enqueue path.
+            target_proc.msg_box.enqueueLocked(thread);
+            thread.ipc_server = target_proc;
+            target_proc.msg_box.lock.unlock();
+
+            thread.state = .blocked;
+            thread.ctx = ctx;
+            thread.on_cpu.store(false, .release);
+            sched.switchToNextReady();
+            return .{ .ret = E_OK };
+        };
         const saved_return = arch.syscall.getSyscallReturn(receiver.ctx);
         const saved_meta = arch.syscall.getIpcMetadata(receiver.ctx);
         const saved_payload = arch.syscall.saveIpcPayload(receiver.ctx);
@@ -470,6 +488,7 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
                 arch.syscall.setIpcMetadata(receiver.ctx, saved_meta);
                 arch.syscall.restoreIpcPayload(receiver.ctx, saved_payload);
                 target_proc.msg_box.beginReceivingLocked(receiver);
+                recv_ref.unlock();
                 target_proc.msg_box.lock.unlock();
                 return .{ .ret = cap_result };
             }
@@ -483,6 +502,7 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
         // fast-path handoff, but doing so currently hangs. Use wakeThread
         // and block self via switchToNextReady for now.
         wakeThread(receiver);
+        recv_ref.unlock();
 
         thread.state = .blocked;
         thread.ctx = ctx;
@@ -604,33 +624,41 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
         return .{ .ret = E_INVAL };
     }
 
-    const caller_thread: ?*Thread = proc.msg_box.endPendingReplyLocked();
+    const caller_ref: ?SlabRef(Thread) = proc.msg_box.endPendingReplyLocked();
 
     // Capability transfer runs before we commit any payload to the
     // caller: on failure, both caller and replier must observe the
     // error rather than a successful reply (§2.11.14). Preserve the
     // caller's original payload registers — only the return value is overwritten.
+    // If the caller slot has been freed since it was registered as pending,
+    // treat it as though no caller existed (no reply delivered, no wake).
     var reply_cap_err: i64 = E_OK;
-    if (caller_thread) |pc| {
-        if (reply_cap_transfer) {
-            const cap = getCapPayload(ctx, reply_word_count);
-            // self-alive: `pc` is the msg_box's pending caller,
-            // still referenced by the box until we unblock it; its
-            // owning Process is alive across the reply.
-            reply_cap_err = transferCapability(proc, pc.process.ptr, cap.handle, cap.rights);
-        }
-        if (reply_cap_err != E_OK) {
-            arch.syscall.setSyscallReturn(pc.ctx, @bitCast(reply_cap_err));
-        } else {
-            // Order: setSyscallReturn before copyIpcPayload on aarch64 (x0
-            // is shared between return value and reply word 0). See
-            // sysIpcSend's matching comment for rationale.
-            arch.syscall.setSyscallReturn(pc.ctx, @bitCast(E_OK));
-            arch.syscall.copyIpcPayload(pc.ctx, ctx, reply_word_count);
-            arch.syscall.setIpcMetadata(pc.ctx, (@as(u64, reply_word_count) << 1) | 1);
-        }
+    var caller_thread: ?*Thread = null;
+    if (caller_ref) |cr| {
+        if (cr.lock()) |pc| {
+            caller_thread = pc;
+            if (reply_cap_transfer) {
+                const cap = getCapPayload(ctx, reply_word_count);
+                // pc.process is SlabRef(Process); .ptr is identity-safe here
+                // because we hold pc's slab lock.
+                reply_cap_err = transferCapability(proc, pc.process.ptr, cap.handle, cap.rights);
+            }
+            if (reply_cap_err != E_OK) {
+                arch.syscall.setSyscallReturn(pc.ctx, @bitCast(reply_cap_err));
+            } else {
+                // Order: setSyscallReturn before copyIpcPayload on aarch64 (x0
+                // is shared between return value and reply word 0). See
+                // sysIpcSend's matching comment for rationale.
+                arch.syscall.setSyscallReturn(pc.ctx, @bitCast(E_OK));
+                arch.syscall.copyIpcPayload(pc.ctx, ctx, reply_word_count);
+                arch.syscall.setIpcMetadata(pc.ctx, (@as(u64, reply_word_count) << 1) | 1);
+            }
 
-        pc.ipc_server = null;
+            pc.ipc_server = null;
+        } else |_| {
+            // Caller slot was freed — nothing to reply to. Fall through
+            // with caller_thread = null so no wake / switch is attempted.
+        }
     }
 
     if (atomic_recv) {
@@ -650,7 +678,10 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
                 if (cap_result != E_OK) {
                     proc.msg_box.enqueueFrontLocked(waiter);
                     proc.msg_box.lock.unlock();
-                    if (caller_thread) |ct| wakeThread(ct);
+                    if (caller_thread) |ct| {
+                        wakeThread(ct);
+                        caller_ref.?.unlock();
+                    }
                     return .{ .ret = cap_result };
                 }
             }
@@ -665,7 +696,10 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
             proc.msg_box.beginPendingReplyLocked(waiter);
             proc.msg_box.lock.unlock();
 
-            if (caller_thread) |ct| wakeThread(ct);
+            if (caller_thread) |ct| {
+                wakeThread(ct);
+                caller_ref.?.unlock();
+            }
             // aarch64: preserve the reply word 0 we just wrote to x0 when
             // no error is being returned. See sysIpcRecv for the same
             // pattern.
@@ -679,7 +713,10 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
 
             // TODO: same direct-switch hang issue as above; use wakeThread
             // for now and block self via switchToNextReady.
-            if (caller_thread) |ct| wakeThread(ct);
+            if (caller_thread) |ct| {
+                wakeThread(ct);
+                caller_ref.?.unlock();
+            }
             thread.state = .blocked;
             arch.syscall.setSyscallReturn(ctx, @bitCast(reply_cap_err));
             thread.ctx = ctx;
@@ -688,7 +725,10 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
             unreachable;
         } else {
             proc.msg_box.lock.unlock();
-            if (caller_thread) |ct| wakeThread(ct);
+            if (caller_thread) |ct| {
+                wakeThread(ct);
+                caller_ref.?.unlock();
+            }
             const recv_err = if (reply_cap_err != E_OK) reply_cap_err else E_AGAIN;
             arch.syscall.setSyscallReturn(ctx, @bitCast(recv_err));
             return .{ .ret = recv_err };
@@ -701,6 +741,10 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
         const ct = caller_thread.?;
         thread.state = .ready;
         arch.syscall.setSyscallReturn(ctx, @bitCast(reply_cap_err));
+        // Release the caller gen-lock before switchToThread: the successful
+        // path never returns on this stack, and the caller must be free to
+        // destroy itself on exit (Thread.deinit acquires its own gen lock).
+        caller_ref.?.unlock();
         const result = sched.switchToThread(thread, ct, ctx, true);
         if (result != 0) {
             thread.state = .running;

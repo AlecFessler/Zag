@@ -31,12 +31,12 @@ pub const MessageBox = struct {
     state: State = .idle,
     waiters: ThreadPriorityQueue = .{},
     /// Thread blocked on `recv`, valid iff `state == .receiving`.
-    receiver: ?*Thread = null,
+    receiver: ?SlabRef(Thread) = null,
     /// Sender thread that owns the currently-pending message; valid iff
     /// `state == .pending_reply`. For IPC this is the caller of `ipc_call`
     /// (null if the message came from `ipc_send`, which has nothing to
     /// reply to). For faults this is always the faulted thread.
-    pending_thread: ?*Thread = null,
+    pending_thread: ?SlabRef(Thread) = null,
     lock: SpinLock = .{},
 
     pub const State = enum(u8) { idle, receiving, pending_reply };
@@ -107,14 +107,16 @@ pub const MessageBox = struct {
         std.debug.assert(self.waiters.isEmpty());
         std.debug.assert(self.receiver == null);
         self.state = .receiving;
-        self.receiver = thread;
+        self.receiver = SlabRef(Thread).init(thread, thread._gen_lock.currentGen());
     }
 
     /// Transition out of `receiving` back to `idle`. Returns the previously
-    /// blocked receiver. Caller must hold `self.lock` and must have already
-    /// verified `state == .receiving`. Used when a sender takes the
-    /// receiver's place via direct delivery.
-    pub fn takeReceiverLocked(self: *MessageBox) *Thread {
+    /// blocked receiver as a `SlabRef(Thread)` — caller must `lock()` it
+    /// before touching the thread (unless they only need identity compare).
+    /// Caller must hold `self.lock` and must have already verified
+    /// `state == .receiving`. Used when a sender takes the receiver's
+    /// place via direct delivery.
+    pub fn takeReceiverLocked(self: *MessageBox) SlabRef(Thread) {
         std.debug.assert(self.state == .receiving);
         const r = self.receiver.?;
         self.receiver = null;
@@ -128,13 +130,17 @@ pub const MessageBox = struct {
     pub fn beginPendingReplyLocked(self: *MessageBox, sender: ?*Thread) void {
         std.debug.assert(self.state != .pending_reply);
         self.state = .pending_reply;
-        self.pending_thread = sender;
+        self.pending_thread = if (sender) |s|
+            SlabRef(Thread).init(s, s._gen_lock.currentGen())
+        else
+            null;
     }
 
     /// Transition out of `pending_reply` back to `idle`. Returns the
-    /// pending sender thread (if any). Caller must hold `self.lock` and
-    /// must have already verified `state == .pending_reply`.
-    pub fn endPendingReplyLocked(self: *MessageBox) ?*Thread {
+    /// pending sender as a `SlabRef(Thread)` (if any) — caller must
+    /// `lock()` it before touching the thread. Caller must hold
+    /// `self.lock` and must have already verified `state == .pending_reply`.
+    pub fn endPendingReplyLocked(self: *MessageBox) ?SlabRef(Thread) {
         std.debug.assert(self.state == .pending_reply);
         const t = self.pending_thread;
         self.pending_thread = null;
