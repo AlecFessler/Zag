@@ -136,6 +136,16 @@ const PTR_BYPASS_EXEMPT_FILES = [_][]const u8{
 
 const TEST_FIXTURE_TYPES = [_][]const u8{"TestT"};
 
+// Field types recognized as locks. A field `foo: SpinLock` or
+// `foo: GenLock` on any struct is treated as a lock-class field whose
+// class identity is `"<StructName>.<field_name>"`. Additional lock
+// abstractions can be added here; the analyzer treats the class as
+// opaque beyond the struct-field → class mapping.
+const LOCK_TYPE_NAMES = [_][]const u8{
+    "SpinLock",
+    "GenLock",
+};
+
 // Blessed helpers for ordered same-type lock acquisition. A call like
 // `lockPair(a, b)` internally acquires `a` and `b` in a deterministic
 // address-ordered sequence, so the same-type nesting within that single
@@ -581,6 +591,11 @@ const Event = struct {
     // ordered groups still contribute normal edges; only the same-type
     // self-loop between the group's members is elided.
     group_id: u32 = 0,
+    // Pre-resolved lock class (interned). When non-empty, the pair
+    // extractor uses this verbatim instead of synthesizing a class from
+    // slab_type. Populated for plain SpinLock / struct-field locks
+    // where the class is `<OwnerStruct>.<field_name>`.
+    lock_class: []const u8 = "",
 };
 
 // -----------------------------------------------------------------
@@ -1479,18 +1494,26 @@ const SlabEnv = struct {
     map: StringStringMap,
     fat: SliceSet,
     self_alive: SliceSet,
+    // Broader type-of ident registry — covers NON-slab locals too.
+    // Used by the lock-ordering analyzer to resolve `<ident>.<lock_field>.lock()`
+    // into a `<StructType>.<lock_field>` class when the ident isn't
+    // slab-typed but does have a known struct type (method receiver,
+    // non-slab fn param, etc.). Entries are interned.
+    all_types: StringStringMap,
 
     fn init(gpa: Allocator) SlabEnv {
         return .{
             .map = StringStringMap.init(gpa),
             .fat = SliceSet.init(gpa),
             .self_alive = SliceSet.init(gpa),
+            .all_types = StringStringMap.init(gpa),
         };
     }
     fn deinit(self: *SlabEnv) void {
         self.map.deinit();
         self.fat.deinit();
         self.self_alive.deinit();
+        self.all_types.deinit();
     }
 };
 
@@ -1589,6 +1612,7 @@ const Ctx = struct {
     slab_types: *const SlabTypeMap,
     fn_index: *FnIndex,
     summaries: *SummaryMap,
+    lock_fields: *const LockFieldMap,
 
     fn fileTokens(self: *const Ctx, sf: *const SourceFile) []const Tok {
         for (self.files, self.tokens_per_file) |f, toks| {
@@ -2057,6 +2081,20 @@ fn emitEventG(
     slab_type: []const u8,
     group_id: u32,
 ) !void {
+    return emitEventGC(gpa, ec, ident, kind, src_line, tail, slab_type, group_id, "");
+}
+
+fn emitEventGC(
+    gpa: Allocator,
+    ec: *EmitCtx,
+    ident: []const u8,
+    kind: EventKind,
+    src_line: u32,
+    tail: []const u8,
+    slab_type: []const u8,
+    group_id: u32,
+    lock_class: []const u8,
+) !void {
     if (ec.emit_param_only and !ec.param_set.contains(ident)) return;
     const gop = try ec.events.getOrPut(ident);
     if (!gop.found_existing) gop.value_ptr.* = EventList.empty;
@@ -2068,6 +2106,7 @@ fn emitEventG(
         .tail = tail,
         .slab_type = slab_type,
         .group_id = group_id,
+        .lock_class = lock_class,
     });
 }
 
@@ -2129,11 +2168,20 @@ fn getOrBuildSummary(
             const ty_i = try ctx.pool.intern(ty);
             param_types[pi] = ty_i;
             try env.map.put(interned, ty_i);
+            try env.all_types.put(interned, ty_i);
             if (mem.indexOf(u8, pp.type_str, "SlabRef") != null) try env.fat.add(interned);
             try param_set.add(interned);
             continue;
         };
         param_types[pi] = "";
+        // Non-slab param: track bare type name so receiver chains
+        // through this ident can classify plain SpinLock/GenLock
+        // fields (e.g. `self.perm_lock.lock()` with `self: *Process`).
+        const bare = typeNameFromFieldType(pp.type_str);
+        if (bare.len > 0) {
+            const bare_i = try ctx.pool.intern(bare);
+            try env.all_types.put(interned, bare_i);
+        }
     }
 
     var events_map = EventMap.init(ctx.gpa);
@@ -2458,7 +2506,9 @@ fn walkBody(
             }
 
             if (resolved) |rt| {
-                try env.map.put(dp.name, try ctx.pool.intern(rt));
+                const rt_i = try ctx.pool.intern(rt);
+                try env.map.put(dp.name, rt_i);
+                try env.all_types.put(dp.name, rt_i);
                 if (is_fat) try env.fat.add(dp.name);
                 if (lock_alias_ref != null) try env.self_alive.add(dp.name);
             }
@@ -2560,6 +2610,137 @@ fn walkBody(
                     if (is_defer and mem.eql(u8, op_name, "unlock")) {
                         try pending_defers.append(gpa, .{ .ident = ident_i, .fire_at_depth = brace_depth });
                     }
+                }
+                pos = at + skip;
+            }
+        }
+
+        // Generic lock-field scan: `<chain>.lock()` / `.unlock()` on a
+        // plain SpinLock (or any LOCK_TYPE_NAMES member) field. The
+        // receiver's owner type must resolve via env.all_types for the
+        // call to classify — unclassifiable calls are left alone (they
+        // won't contribute to the lock-order graph). Classification
+        // produces a class name like `"Vmm.lock"`, `"Process.perm_lock"`.
+        //
+        // This block explicitly SKIPS any call that's already handled by
+        // the earlier SlabRef / _gen_lock blocks — those emit events
+        // with the slab_type alone and the pair extractor synthesizes
+        // `"<Slab>._gen_lock"` from it. Double-emitting would produce
+        // ghost pairs.
+        {
+            var pos: usize = 0;
+            while (pos < code.len) {
+                const lock_p = mem.indexOf(u8, code[pos..], ".lock(");
+                const unlock_p = mem.indexOf(u8, code[pos..], ".unlock(");
+                var hit: ?usize = null;
+                var op_is_lock = false;
+                var skip: usize = 0;
+                if (lock_p != null and (unlock_p == null or lock_p.? < unlock_p.?)) {
+                    hit = pos + lock_p.?;
+                    op_is_lock = true;
+                    skip = ".lock(".len;
+                } else if (unlock_p != null) {
+                    hit = pos + unlock_p.?;
+                    op_is_lock = false;
+                    skip = ".unlock(".len;
+                }
+                if (hit == null) break;
+                const at = hit.?;
+                // Walk back to extract the receiver chain (`a.b.c`).
+                // Stop at the first non-chain char (whitespace, paren,
+                // comma, operator, etc.).
+                var sidx: usize = at;
+                while (sidx > 0) {
+                    const c = code[sidx - 1];
+                    if (isIdentChar(c) or c == '.') {
+                        sidx -= 1;
+                    } else break;
+                }
+                if (sidx == at) {
+                    pos = at + skip;
+                    continue;
+                }
+                const full_chain = code[sidx..at]; // e.g. "self.lock"
+                // Split into (receiver, lock_field) at the LAST `.`.
+                const last_dot = mem.lastIndexOfScalar(u8, full_chain, '.') orelse {
+                    // Bare `foo.lock()` with no chain — can't classify
+                    // without knowing foo's type. Skip.
+                    pos = at + skip;
+                    continue;
+                };
+                const recv_chain = full_chain[0..last_dot];
+                const field_name = full_chain[last_dot + 1 ..];
+                // _gen_lock is handled by the slab block above; skip.
+                if (mem.eql(u8, field_name, "_gen_lock")) {
+                    pos = at + skip;
+                    continue;
+                }
+                // Resolve receiver's type. Two paths:
+                //   (a) recv_chain is a bare ident tracked in env.all_types.
+                //   (b) recv_chain is `<ident>.<field>` where <ident>'s
+                //       owner type has <field> with a known struct type
+                //       (one-level deep only for v2).
+                var recv_type: []const u8 = "";
+                if (mem.indexOfScalar(u8, recv_chain, '.')) |dot| {
+                    // Multi-segment receiver — only handle `<ident>` chain,
+                    // not arbitrary depth. Skip for v2.
+                    _ = dot;
+                } else {
+                    if (env.all_types.get(recv_chain)) |ty| recv_type = ty;
+                }
+                if (recv_type.len == 0) {
+                    pos = at + skip;
+                    continue;
+                }
+                // Lookup (recv_type, field_name) in LockFieldMap.
+                const class_opt = ctx.lock_fields.get(.{ .owner = recv_type, .field = field_name });
+                if (class_opt == null) {
+                    pos = at + skip;
+                    continue;
+                }
+                // Skip if this ident is already being tracked via the
+                // slab block (its events are emitted above with a
+                // slab_type; the pair extractor will synthesize a class).
+                // In practice, slab-tracked idents use `_gen_lock` (already
+                // filtered) or SlabRef `.lock()` (which resolves on a fat
+                // ident where env.fat.contains). We can't easily detect
+                // overlap from here; rely on the `_gen_lock` skip + the
+                // fact that plain lock-field names (e.g. "rq_lock",
+                // "perm_lock", "lock") won't collide with the SlabRef form
+                // because SlabRef.lock() is a *method* call with an empty
+                // last segment, not a `<x>.lock` field access followed by
+                // `.lock()`.
+                const class = class_opt.?;
+                const recv_ident_i = try ctx.pool.intern(recv_chain);
+                const is_defer_plain = blk: {
+                    // `defer <chain>.lock()` / `defer <chain>.unlock()`:
+                    // detect a `defer ` token appearing before the
+                    // callsite on this line.
+                    if (mem.indexOf(u8, code[0..at], "defer ")) |_| break :blk !op_is_lock;
+                    break :blk false;
+                };
+                const kind: EventKind = if (op_is_lock)
+                    .lock
+                else if (is_defer_plain)
+                    .defer_unlock
+                else
+                    .unlock;
+                try emitEventGC(
+                    gpa,
+                    ec,
+                    recv_ident_i,
+                    kind,
+                    src_line,
+                    "",
+                    recv_type,
+                    0,
+                    class,
+                );
+                if (is_defer_plain) {
+                    try pending_defers.append(gpa, .{
+                        .ident = recv_ident_i,
+                        .fire_at_depth = brace_depth,
+                    });
                 }
                 pos = at + skip;
             }
@@ -2978,6 +3159,7 @@ fn analyzeEntry(
     slab_types: *const SlabTypeMap,
     fn_index: *FnIndex,
     summaries: *SummaryMap,
+    lock_fields: *const LockFieldMap,
     entry: *const EntryPoint,
     out_env: *SlabEnv,
     out_events: *EventMap,
@@ -3009,16 +3191,27 @@ fn analyzeEntry(
     const params = try parseParamList(gpa, sf, toks, hdr.?.l_paren_idx, hdr.?.r_paren_idx);
     defer gpa.free(params);
     for (params) |pp| {
+        const nm = try pool.intern(pp.name);
         if (parseTypeRef(pp.type_str)) |ty| {
             if (slab_types.contains(ty)) {
-                const nm = try pool.intern(pp.name);
                 const ty_i = try pool.intern(ty);
                 try out_env.map.put(nm, ty_i);
+                try out_env.all_types.put(nm, ty_i);
                 if (mem.indexOf(u8, pp.type_str, "SlabRef") != null) try out_env.fat.add(nm);
                 if (is_syscall_entry and (mem.eql(u8, ty, "Process") or mem.eql(u8, ty, "Thread"))) {
                     try out_env.self_alive.add(nm);
                 }
+                continue;
             }
+        }
+        // Non-slab param: still record its bare type name (if any) so
+        // `self.lock.lock()` style calls on non-slab receivers can be
+        // classified via LockFieldMap. parseTypeRef is slab-specific;
+        // fall through to the bare-name extractor for plain types.
+        const bare = typeNameFromFieldType(pp.type_str);
+        if (bare.len > 0) {
+            const bare_i = try pool.intern(bare);
+            try out_env.all_types.put(nm, bare_i);
         }
     }
 
@@ -3030,6 +3223,7 @@ fn analyzeEntry(
         .slab_types = slab_types,
         .fn_index = fn_index,
         .summaries = summaries,
+        .lock_fields = lock_fields,
     };
 
     var seq: u32 = 0;
@@ -3227,6 +3421,76 @@ fn bracketCheck(gpa: Allocator, res: *CheckResult) !void {
 }
 
 // -----------------------------------------------------------------
+// Lock-field registry — maps (struct_name, field_name) → lock class
+// for every field whose declared type is one of LOCK_TYPE_NAMES.
+// -----------------------------------------------------------------
+
+const LockFieldKey = struct { owner: []const u8, field: []const u8 };
+const LockFieldCtx = struct {
+    pub fn hash(_: @This(), k: LockFieldKey) u64 {
+        var h = std.hash.Wyhash.init(0);
+        h.update(k.owner);
+        h.update("|");
+        h.update(k.field);
+        return h.final();
+    }
+    pub fn eql(_: @This(), a: LockFieldKey, b: LockFieldKey) bool {
+        return mem.eql(u8, a.owner, b.owner) and mem.eql(u8, a.field, b.field);
+    }
+};
+// Value is the lock CLASS name (interned): e.g. "Vmm.lock",
+// "Process.perm_lock". Stable across a run.
+const LockFieldMap = std.HashMap(
+    LockFieldKey,
+    []const u8,
+    LockFieldCtx,
+    std.hash_map.default_max_load_percentage,
+);
+
+fn typeNameFromFieldType(ft: []const u8) []const u8 {
+    // Strip trailing `= .{...}`, `,`, surrounding whitespace, pointer
+    // prefixes (`*`, `?`, `*const`) to bottom out at the bare type
+    // name. We only care about matching against LOCK_TYPE_NAMES.
+    var t = trimAscii(ft);
+    if (t.len == 0) return t;
+    if (t[0] == '?') t = trimAscii(t[1..]);
+    if (t.len == 0) return t;
+    if (t[0] == '*') t = trimAscii(t[1..]);
+    if (mem.startsWith(u8, t, "const ")) t = trimAscii(t["const ".len..]);
+    // Take leading identifier.
+    var e: usize = 0;
+    while (e < t.len and isIdentChar(t[e])) e += 1;
+    return t[0..e];
+}
+
+fn buildLockFieldMap(
+    gpa: Allocator,
+    pool: *Pool,
+    struct_fields: []const StructField,
+    out: *LockFieldMap,
+) !void {
+    _ = gpa;
+    for (struct_fields) |f| {
+        const bare = typeNameFromFieldType(f.field_type);
+        if (bare.len == 0) continue;
+        var is_lock = false;
+        for (LOCK_TYPE_NAMES) |lt| {
+            if (mem.eql(u8, bare, lt)) {
+                is_lock = true;
+                break;
+            }
+        }
+        if (!is_lock) continue;
+        const owner_i = try pool.intern(f.struct_name);
+        const field_i = try pool.intern(f.field_name);
+        var class_buf: [160]u8 = undefined;
+        const class_s = try std.fmt.bufPrint(&class_buf, "{s}.{s}", .{ owner_i, field_i });
+        const class_i = try pool.intern(class_s);
+        try out.put(.{ .owner = owner_i, .field = field_i }, class_i);
+    }
+}
+
+// -----------------------------------------------------------------
 // Lock-ordering analysis.
 // -----------------------------------------------------------------
 //
@@ -3303,8 +3567,13 @@ fn collectLockPairsFromResult(
     for (flat.items) |f| {
         switch (f.ev.kind) {
             .lock, .lock_with_gen => {
-                if (f.ev.slab_type.len == 0) continue;
-                const new_class = try lockClassFor(pool, f.ev.slab_type);
+                const new_class = if (f.ev.lock_class.len > 0)
+                    f.ev.lock_class
+                else blk: {
+                    if (f.ev.slab_type.len == 0) break :blk @as([]const u8, "");
+                    break :blk try lockClassFor(pool, f.ev.slab_type);
+                };
+                if (new_class.len == 0) continue;
                 for (held.items) |h| {
                     // Ordered-pair suppression: same class + same non-zero
                     // group = helper-enforced address-ordered acquire, not
@@ -3769,6 +4038,13 @@ pub fn main() !u8 {
     var pool = Pool.init(gpa);
     defer pool.deinit();
 
+    // Build lock-field registry now that pool exists: every struct
+    // field whose declared type is in LOCK_TYPE_NAMES maps to a class
+    // name of the form "<OwnerStruct>.<field>".
+    var lock_fields = LockFieldMap.init(gpa);
+    defer lock_fields.deinit();
+    try buildLockFieldMap(gpa, &pool, struct_fields.items, &lock_fields);
+
     var results = ArrayList(CheckResult).empty;
     defer {
         for (results.items) |*r| r.deinit(gpa);
@@ -3791,7 +4067,7 @@ pub fn main() !u8 {
     for (entries.items) |*entry| {
         var env = SlabEnv.init(gpa);
         var events = EventMap.init(gpa);
-        try analyzeEntry(gpa, &pool, files.items, tokens.items, &slab_types, &fn_index, &summaries, entry, &env, &events);
+        try analyzeEntry(gpa, &pool, files.items, tokens.items, &slab_types, &fn_index, &summaries, &lock_fields, entry, &env, &events);
         var res = CheckResult{
             .entry = entry,
             .env = env,
@@ -3874,6 +4150,46 @@ pub fn main() !u8 {
             });
         }
     }
+
+    // Same-type overlap: two locks of the same class held at once
+    // without going through a blessed ordered-pair helper. This is the
+    // textbook two-instance deadlock — thread A holds instance1 and
+    // waits on instance2; thread B holds instance2 and waits on
+    // instance1. The fix is `lockPair(a, b)` (kernel/utils/sync.zig),
+    // which acquires in stable address order and breaks the cycle.
+    var same_type_overlaps = ArrayList(LockPair).empty;
+    defer same_type_overlaps.deinit(gpa);
+    for (all_pairs.items) |p| {
+        if (!mem.eql(u8, p.outer, p.inner)) continue;
+        // Dedup against earlier same-type overlaps on (file, line, class).
+        var dup = false;
+        for (same_type_overlaps.items) |q| {
+            if (mem.eql(u8, p.file_rel, q.file_rel) and p.line == q.line and
+                mem.eql(u8, p.outer, q.outer))
+            {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) continue;
+        try same_type_overlaps.append(gpa, p);
+    }
+    if (same_type_overlaps.items.len > 0) {
+        try w.writeAll("\n");
+        try w.print("Same-type lock overlap ({d} sites — require lockPair/unlockPair):\n", .{same_type_overlaps.items.len});
+        for (same_type_overlaps.items) |p| {
+            try w.print(
+                "  [ERR ] {s} held while acquiring another {s}  at {s}:{d}  in {s}()\n" ++
+                "          [{s} held, {s} acquired]  → wrap via `zag.utils.sync.lockPair(&a, &b)`\n",
+                .{
+                    p.outer, p.outer, p.file_rel, p.line, p.entry_name,
+                    p.outer_ident, p.inner_ident,
+                },
+            );
+        }
+    }
+    total_errs += @intCast(same_type_overlaps.items.len);
+
     var cycles = ArrayList([][]const u8).empty;
     defer {
         for (cycles.items) |scc| gpa.free(scc);
