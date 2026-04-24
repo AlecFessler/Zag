@@ -738,6 +738,10 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
 
         if (caller_thread == null) return .{ .ret = reply_cap_err };
 
+        // self-alive: `ct` is the IPC caller, currently blocked-waiting-
+        // for-reply. It can't self-deinit from .blocked; a concurrent
+        // sysThreadKill would flip it to .exited which switchToThread
+        // handles cleanly. No gen check needed past the unlock below.
         const ct = caller_thread.?;
         thread.state = .ready;
         arch.syscall.setSyscallReturn(ctx, @bitCast(reply_cap_err));

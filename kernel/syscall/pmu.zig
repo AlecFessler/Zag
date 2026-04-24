@@ -288,6 +288,11 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
     const state = target_thread.pmu_state orelse return E_INVAL; // §4.54.5
 
     state._gen_lock.lock();
+    // Snapshot the live gen while the lock is held so destroy() below
+    // targets this specific tenant. Reading `currentGen()` after the
+    // unlock would be racy — anyone else could have destroyed+realloced
+    // the slot between unlock and destroy.
+    const carried_gen: u63 = @intCast(state._gen_lock.currentGen());
     if (is_self) {
         arch.pmu.pmuStop(state);
     } else {
@@ -295,8 +300,7 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
     }
     state._gen_lock.unlock();
     target_thread.pmu_state = null;
-    const gen = state._gen_lock.currentGen();
-    slab_instance.destroy(state, gen) catch unreachable;
+    slab_instance.destroy(state, carried_gen) catch unreachable;
     return E_OK;
 }
 
