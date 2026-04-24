@@ -58,6 +58,7 @@ const syscall_dispatch = zag.syscall.dispatch;
 const ArchCpuContext = zag.arch.aarch64.interrupts.ArchCpuContext;
 const FaultReason = zag.perms.permissions.FaultReason;
 const PageFaultContext = zag.arch.aarch64.interrupts.PageFaultContext;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 const VmNode = zag.memory.vmm.VmNode;
@@ -451,14 +452,14 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
             // external abort) cannot come from a vbar node, so skip the
             // lookup entirely to keep the hot path lean.
             if (scheduler.currentThread()) |thread| {
-                // self-alive: currentThread() is running on this core.
+                // self-alive: currentThread() runs on this core.
                 const proc = thread.process.ptr;
-                if (proc.vmm.findNode(VAddr.fromInt(far))) |node| {
-                    node._gen_lock.lock();
+                if (proc.vmm.findNode(VAddr.fromInt(far))) |node_ref| {
+                    const node = node_ref.lock() catch return;
                     const is_virtual_bar = node.kind == .virtual_bar;
-                    node._gen_lock.unlock();
+                    node_ref.unlock();
                     if (is_virtual_bar) {
-                        emulateVirtualBar(ctx, node, far, proc);
+                        emulateVirtualBar(ctx, node_ref, far, proc);
                         return;
                     }
                 }
@@ -801,10 +802,12 @@ fn faultOrKillUser(ctx: *ArchCpuContext, reason: FaultReason, fault_addr: u64) v
 /// means load. size={00,01,10,11} gives {1,2,4,8} byte access widths.
 fn emulateVirtualBar(
     ctx: *ArchCpuContext,
-    node: *const VmNode,
+    node_ref: SlabRef(VmNode),
     far: u64,
     proc: anytype,
 ) void {
+    const node = node_ref.lock() catch return;
+    defer node_ref.unlock();
     const device = node.deviceRegion().?;
 
     const decoded = decodeA64LoadStore(ctx, proc) orelse {

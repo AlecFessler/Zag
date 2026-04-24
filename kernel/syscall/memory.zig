@@ -12,6 +12,7 @@ const isSubset = zag.perms.permissions.isSubset;
 
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const SharedMemory = zag.memory.shared.SharedMemory;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const VAddr = zag.memory.address.VAddr;
 const VmReservationRights = zag.perms.permissions.VmReservationRights;
 
@@ -63,7 +64,9 @@ pub fn sysMemReserve(hint: u64, size: u64, max_perms_bits: u64) SyscallResult {
         .rights = @truncate(max_perms_bits),
     };
     const handle_id = proc.insertPerm(entry) catch return .{ .ret = E_MAXCAP };
-    result.node.handle = handle_id;
+    // self-alive: node was just reserved by this thread and has not
+    // been exposed to any other observer that could free it.
+    result.node.ptr.handle = handle_id;
 
     return .{ .ret = @intCast(handle_id), .ret2 = result.vaddr.addr };
 }
@@ -161,6 +164,9 @@ pub fn sysMemShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
     const vm_res = vm_entry.object.vm_reservation;
     if (!vm_res.max_rights.shareable) return E_PERM;
 
+    const shm_ref: SlabRef(SharedMemory) = shm_entry.object.shared_memory;
+    const shm = shm_ref.lock() catch return E_BADCAP;
+    defer shm_ref.unlock();
     const shm_rwx = shm_entry.rights & 0b111;
     const max_rwx: u16 =
         @as(u16, @intFromBool(vm_res.max_rights.read)) |
@@ -174,9 +180,6 @@ pub fn sysMemShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
         .execute = shm_entry.shmRights().execute,
     };
 
-    const shm = shm_entry.object.shared_memory.lock() catch return E_BADCAP;
-    defer shm_entry.object.shared_memory.unlock();
-
     const range_end = std.math.add(u64, offset, shm.size()) catch return E_INVAL;
     if (range_end > vm_res.original_size) return E_INVAL;
 
@@ -186,7 +189,7 @@ pub fn sysMemShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
         vm_res.original_start,
         vm_res.original_size,
         offset,
-        shm,
+        shm_ref,
         shm_map_rights,
     ) catch |e| return switch (e) {
         error.CommittedPages => E_EXIST,

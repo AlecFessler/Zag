@@ -14,7 +14,9 @@ const FaultReason = zag.perms.permissions.FaultReason;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PageFaultContext = zag.arch.dispatch.cpu.PageFaultContext;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const VAddr = zag.memory.address.VAddr;
+const VmNode = zag.memory.vmm.VmNode;
 
 const KERNEL_PERMS = MemoryPerms{
     .write_perm = .write,
@@ -46,8 +48,11 @@ fn accessReason(is_write: bool, is_exec: bool) FaultReason {
 }
 
 fn guardPageReason(proc: anytype, node_start: u64) FaultReason {
-    const above = proc.vmm.findNode(VAddr.fromInt(node_start + paging.PAGE4K));
-    if (above != null and above.?.rights.write) {
+    const above_ref: SlabRef(VmNode) = proc.vmm.findNode(VAddr.fromInt(node_start + paging.PAGE4K)) orelse
+        return .stack_underflow;
+    const above = above_ref.lock() catch return .stack_underflow;
+    defer above_ref.unlock();
+    if (above.rights.write) {
         return .stack_overflow;
     }
     return .stack_underflow;
@@ -98,7 +103,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
     // is alive for the full fault-handler scope.
     const proc = thread.process.ptr;
 
-    const node = proc.vmm.findNode(faulting_virt) orelse {
+    const node_ref: SlabRef(VmNode) = proc.vmm.findNode(faulting_virt) orelse {
         arch.boot.print("K: USER_PF pid={d} addr=0x{x} w={} x={}\n", .{ proc.pid, faulting_virt.addr, is_write, is_exec });
         if (proc.faultBlock(thread, .unmapped_access, faulting_virt.addr, fault.rip, fault.user_ctx)) {
             arch.cpu.enableInterrupts();
@@ -109,6 +114,19 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         arch.cpu.enableInterrupts();
         while (true) arch.cpu.halt();
     };
+    const node = node_ref.lock() catch {
+        // Node was freed out from under us (e.g. concurrent revoke).
+        // Treat like "no mapping".
+        if (proc.faultBlock(thread, .unmapped_access, faulting_virt.addr, fault.rip, fault.user_ctx)) {
+            arch.cpu.enableInterrupts();
+            scheduler.yield();
+            return;
+        }
+        proc.kill(.unmapped_access);
+        arch.cpu.enableInterrupts();
+        while (true) arch.cpu.halt();
+    };
+    defer node_ref.unlock();
 
     switch (node.kind) {
         .shared_memory, .mmio => {

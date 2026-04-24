@@ -6,6 +6,8 @@ const errors = zag.syscall.errors;
 const paging = zag.memory.paging;
 const sched = zag.sched.scheduler;
 
+const DeviceRegion = zag.memory.device_region.DeviceRegion;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const VAddr = zag.memory.address.VAddr;
 const VmReservationRights = zag.perms.permissions.VmReservationRights;
 
@@ -34,8 +36,9 @@ pub fn sysMemMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
     if (!vm_res.max_rights.mmio) return E_PERM;
     if (!vm_res.max_rights.read and !vm_res.max_rights.write) return E_PERM;
 
-    const device = device_entry.object.device_region.lock() catch return E_BADCAP;
-    defer device_entry.object.device_region.unlock();
+    const device_ref: SlabRef(DeviceRegion) = device_entry.object.device_region;
+    const device = device_ref.lock() catch return E_BADCAP;
+    defer device_ref.unlock();
 
     if (device.device_type == .port_io) {
         // Port I/O devices use virtual BAR — write_combining is invalid
@@ -51,7 +54,7 @@ pub fn sysMemMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
             vm_res.original_start,
             vm_res.original_size,
             offset,
-            device,
+            device_ref,
             .{
                 .read = vm_res.max_rights.read,
                 .write = vm_res.max_rights.write,
@@ -77,7 +80,7 @@ pub fn sysMemMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
         vm_res.original_start,
         vm_res.original_size,
         offset,
-        device,
+        device_ref,
         vm_res.max_rights.write_combining,
         .{
             .read = vm_res.max_rights.read,

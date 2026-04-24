@@ -12,9 +12,11 @@ const sched = zag.sched.scheduler;
 
 const ArchCpuContext = zag.arch.dispatch.cpu.ArchCpuContext;
 const Process = zag.proc.process.Process;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SyscallResult = zag.syscall.dispatch.SyscallResult;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
+const VmNode = zag.memory.vmm.VmNode;
 
 const E_AGAIN = errors.E_AGAIN;
 const E_BADADDR = errors.E_BADADDR;
@@ -135,11 +137,11 @@ fn faultRecvValidateBuf(proc: *Process, buf_ptr: u64) i64 {
     if (!address.AddrSpacePartition.user.contains(buf_end -| 1)) return E_BADADDR;
     var check_addr = buf_ptr;
     while (check_addr < buf_end) {
-        const node = proc.vmm.findNode(VAddr.fromInt(check_addr)) orelse return E_BADADDR;
-        node._gen_lock.lock();
+        const node_ref: SlabRef(VmNode) = proc.vmm.findNode(VAddr.fromInt(check_addr)) orelse return E_BADADDR;
+        const node = node_ref.lock() catch return E_BADADDR;
         const writable = node.rights.write;
         const node_end = node.end();
-        node._gen_lock.unlock();
+        node_ref.unlock();
         if (!writable) return E_BADADDR;
         check_addr = node_end;
     }
@@ -262,10 +264,10 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
         const last_page = std.mem.alignBackward(u64, buf_end - 1, paging.PAGE4K);
         var page = first_page;
         while (true) {
-            const node = proc.vmm.findNode(VAddr.fromInt(page)) orelse return E_BADADDR;
-            node._gen_lock.lock();
+            const node_ref: SlabRef(VmNode) = proc.vmm.findNode(VAddr.fromInt(page)) orelse return E_BADADDR;
+            const node = node_ref.lock() catch return E_BADADDR;
             const readable = node.rights.read;
-            node._gen_lock.unlock();
+            node_ref.unlock();
             if (!readable) return E_BADADDR;
             if (page == last_page) break;
             page += paging.PAGE4K;

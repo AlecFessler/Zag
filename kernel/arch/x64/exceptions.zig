@@ -19,6 +19,7 @@ const GateType = zag.arch.x64.idt.GateType;
 const PageFaultContext = zag.arch.x64.interrupts.PageFaultContext;
 const PAddr = zag.memory.address.PAddr;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const VAddr = zag.memory.address.VAddr;
 const VmNode = zag.memory.vmm.VmNode;
 
@@ -238,12 +239,12 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         // self-alive: currentThread() runs on this core; its owning
         // Process is alive across this PF handler.
         const proc = thread.process.ptr;
-        if (proc.vmm.findNode(VAddr.fromInt(faulting_addr))) |node| {
-            node._gen_lock.lock();
+        if (proc.vmm.findNode(VAddr.fromInt(faulting_addr))) |node_ref| {
+            const node = node_ref.lock() catch return;
             const is_virtual_bar = node.kind == .virtual_bar;
-            node._gen_lock.unlock();
+            node_ref.unlock();
             if (is_virtual_bar) {
-                emulateVirtualBar(ctx, node, faulting_addr, proc);
+                emulateVirtualBar(ctx, node_ref, faulting_addr, proc);
                 return;
             }
         }
@@ -263,7 +264,9 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
 /// Emulate a port I/O access through a virtual BAR mapping.
 /// Decodes the faulting instruction, performs the port I/O, writes back
 /// the result (for reads), and advances RIP past the instruction.
-fn emulateVirtualBar(ctx: *cpu.Context, node: *const VmNode, faulting_addr: u64, proc: anytype) void {
+fn emulateVirtualBar(ctx: *cpu.Context, node_ref: SlabRef(VmNode), faulting_addr: u64, proc: anytype) void {
+    const node = node_ref.lock() catch return;
+    defer node_ref.unlock();
     const device = node.deviceRegion().?;
 
     // Fetch instruction bytes from user RIP via the process page tables.

@@ -13,6 +13,7 @@ const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PrivilegePerm = zag.perms.privilege.PrivilegePerm;
 const SharedMemory = zag.memory.shared.SharedMemory;
+const SlabRef = secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;
 const VAddr = zag.memory.address.VAddr;
 const VmReservationRights = zag.perms.permissions.VmReservationRights;
@@ -20,7 +21,7 @@ const VmReservationRights = zag.perms.permissions.VmReservationRights;
 pub const HANDLE_NONE: u64 = std.math.maxInt(u64);
 
 /// Per-process reservation cap. Reservations live in a sorted inline
-/// `[MAX_RESERVATIONS]*VmNode` array inside every process's VMM —
+/// `[MAX_RESERVATIONS]SlabRef(VmNode)` array inside every process's VMM —
 /// lookups are `std.sort.lowerBound` (O(log N) with cache-friendly
 /// contiguous memory), insert/remove are `@memmove` of the tail (O(N)
 /// but N ≤ 256 and the compiler vectorizes the shift). Every reservation
@@ -67,16 +68,7 @@ pub const VmNode = extern struct {
     /// Populate every non-`_gen_lock` field of a freshly allocated node.
     /// Use this instead of `node.* = .{...}` — a whole-struct assignment
     /// would clobber the gen-lock word that the allocator just set.
-    pub fn init(
-        self: *VmNode,
-        start: VAddr,
-        size: u64,
-        kind: VmNodeKind,
-        kind_ptr: ?*anyopaque,
-        rights: VmReservationRights,
-        handle: u64,
-        policy: RestartPolicy,
-    ) void {
+    pub fn init(self: *VmNode, start: VAddr, size: u64, kind: VmNodeKind, kind_ptr: ?*anyopaque, rights: VmReservationRights, handle: u64, policy: RestartPolicy) void {
         self.start = start;
         self.size = size;
         self.kind = kind;
@@ -114,30 +106,39 @@ pub fn initSlabs(
     vm_node_slab = VmNodeSlab.init(data_range, ptrs_range, links_range);
 }
 
-fn allocVmNode() !*VmNode {
-    const r = try vm_node_slab.create();
-    return r.ptr;
+/// Allocate a fresh `VmNode` slot and return a SlabRef. The returned
+/// ref is self-alive (gen sampled at alloc time; the caller is the
+/// sole observer until the ref is stored in `self.nodes[]`), so
+/// internal callers under `vmm.lock` may deref via `.ptr` — the node
+/// cannot be freed concurrently.
+fn allocVmNode() !SlabRef(VmNode) {
+    return try vm_node_slab.create();
 }
 
-fn freeVmNode(node: *VmNode) void {
-    const gen = node._gen_lock.currentGen();
-    vm_node_slab.destroy(node, gen) catch unreachable;
+fn freeVmNode(node_ref: SlabRef(VmNode)) void {
+    // self-alive: caller proves liveness by holding vmm.lock; the node
+    // was just removed from `self.nodes[]` and no other context can
+    // observe it after that point.
+    const node = node_ref.ptr;
+    vm_node_slab.destroy(node, node._gen_lock.currentGen()) catch unreachable;
 }
 
-fn cmpAddrToNode(ctx_addr: u64, item: *VmNode) std.math.Order {
-    return std.math.order(ctx_addr, item.start.addr);
+fn cmpAddrToNode(ctx_addr: u64, item: SlabRef(VmNode)) std.math.Order {
+    // self-alive: sort comparator runs under vmm.lock; every item in
+    // the slice is alive for the duration of the search.
+    return std.math.order(ctx_addr, item.ptr.start.addr);
 }
 
 /// First index `i` into `slice` where `slice[i].start.addr >= addr`.
 /// Matches `std.sort.lowerBound` semantics; returns `slice.len` when
 /// `addr` is greater than every node's start.
-fn lowerBoundIdx(slice: []*VmNode, addr: u64) usize {
-    return std.sort.lowerBound(*VmNode, slice, addr, cmpAddrToNode);
+fn lowerBoundIdx(slice: []SlabRef(VmNode), addr: u64) usize {
+    return std.sort.lowerBound(SlabRef(VmNode), slice, addr, cmpAddrToNode);
 }
 
 pub const ReserveResult = struct {
     vaddr: VAddr,
-    node: *VmNode,
+    node: SlabRef(VmNode),
 };
 
 pub const StackResult = struct {
@@ -147,7 +148,7 @@ pub const StackResult = struct {
 };
 
 pub const VirtualMemoryManager = struct {
-    nodes: [MAX_RESERVATIONS]*VmNode,
+    nodes: [MAX_RESERVATIONS]SlabRef(VmNode),
     count: u32,
     range_start: VAddr,
     range_end: VAddr,
@@ -166,7 +167,7 @@ pub const VirtualMemoryManager = struct {
     }
 
     /// Active slice view over the sorted reservation array.
-    fn slice(self: *VirtualMemoryManager) []*VmNode {
+    fn slice(self: *VirtualMemoryManager) []SlabRef(VmNode) {
         return self.nodes[0..self.count];
     }
 
@@ -175,17 +176,19 @@ pub const VirtualMemoryManager = struct {
     /// (`MAX_RESERVATIONS`) — this is the same error shape the tree
     /// insert used to return, so syscall-level callers continue to map
     /// it to `E_NOMEM` without code change.
-    fn insertNodeLocked(self: *VirtualMemoryManager, node: *VmNode) !void {
+    fn insertNodeLocked(self: *VirtualMemoryManager, node_ref: SlabRef(VmNode)) !void {
         if (self.count >= MAX_RESERVATIONS) return error.OutOfMemory;
-        const idx = lowerBoundIdx(self.slice(), node.start.addr);
-        insertAtIdx(self, idx, node);
+        // self-alive: holding vmm.lock; node_ref was just allocated or
+        // is being re-inserted by an internal helper that owns it.
+        const idx = lowerBoundIdx(self.slice(), node_ref.ptr.start.addr);
+        insertAtIdx(self, idx, node_ref);
     }
 
-    fn insertAtIdx(self: *VirtualMemoryManager, idx: usize, node: *VmNode) void {
+    fn insertAtIdx(self: *VirtualMemoryManager, idx: usize, node_ref: SlabRef(VmNode)) void {
         if (idx < self.count) {
             @memmove(self.nodes[idx + 1 .. self.count + 1], self.nodes[idx..self.count]);
         }
-        self.nodes[idx] = node;
+        self.nodes[idx] = node_ref;
         self.count += 1;
     }
 
@@ -200,20 +203,24 @@ pub const VirtualMemoryManager = struct {
     /// address, verifies pointer identity). Silently no-ops if the node
     /// is not present — preserves the `_ = self.tree.remove(node) catch {}`
     /// "fire and forget" idiom the RB-tree version used in rollback paths.
-    fn removeNodeLocked(self: *VirtualMemoryManager, node: *VmNode) void {
-        const idx = lowerBoundIdx(self.slice(), node.start.addr);
-        if (idx >= self.count or self.nodes[idx] != node) return;
+    fn removeNodeLocked(self: *VirtualMemoryManager, node_ref: SlabRef(VmNode)) void {
+        // self-alive: identity compare against a caller-owned ref; the
+        // array entry (if present) shares the same slab slot and its
+        // gen matches while vmm.lock is held.
+        const idx = lowerBoundIdx(self.slice(), node_ref.ptr.start.addr);
+        if (idx >= self.count or self.nodes[idx].ptr != node_ref.ptr) return;
         self.removeAtIdx(idx);
     }
 
     /// Returns the node whose range covers `vaddr`, or null. Each node
     /// occupies a disjoint half-open interval `[start, end)`, so the
     /// only candidate is the greatest-start-≤-vaddr neighbor.
-    fn findNodeLocked(self: *VirtualMemoryManager, vaddr: VAddr) ?*VmNode {
+    fn findNodeLocked(self: *VirtualMemoryManager, vaddr: VAddr) ?SlabRef(VmNode) {
         const idx = lowerBoundIdx(self.slice(), vaddr.addr +| 1);
         if (idx == 0) return null;
         const candidate = self.nodes[idx - 1];
-        if (vaddr.addr < candidate.end()) return candidate;
+        // self-alive: vmm.lock is held — the node is still in the array.
+        if (vaddr.addr < candidate.ptr.end()) return candidate;
         return null;
     }
 
@@ -237,7 +244,9 @@ pub const VirtualMemoryManager = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        const node = try allocVmNode();
+        const node_ref = try allocVmNode();
+        // self-alive: freshly allocated; no other observer yet.
+        const node = node_ref.ptr;
         // Field-by-field assignment preserves `node._gen_lock`.
         node.start = start;
         node.size = size;
@@ -247,8 +256,8 @@ pub const VirtualMemoryManager = struct {
         node.handle = HANDLE_NONE;
         node.restart_policy = policy;
 
-        self.insertNodeLocked(node) catch |e| {
-            freeVmNode(node);
+        self.insertNodeLocked(node_ref) catch |e| {
+            freeVmNode(node_ref);
             return e;
         };
     }
@@ -259,14 +268,14 @@ pub const VirtualMemoryManager = struct {
 
         var i: usize = 0;
         while (i < self.count) : (i += 1) {
-            const node = self.nodes[i];
-            unmapNodePages(node, self.addr_space_root, true);
-            freeVmNode(node);
+            const node_ref = self.nodes[i];
+            unmapNodePages(node_ref, self.addr_space_root, true);
+            freeVmNode(node_ref);
         }
         self.count = 0;
     }
 
-    pub fn findNode(self: *VirtualMemoryManager, vaddr: VAddr) ?*VmNode {
+    pub fn findNode(self: *VirtualMemoryManager, vaddr: VAddr) ?SlabRef(VmNode) {
         self.lock.lock();
         defer self.lock.unlock();
         return self.findNodeLocked(vaddr);
@@ -280,7 +289,8 @@ pub const VirtualMemoryManager = struct {
         // any gap before `range_start` is off-limits for new reservations.
         var i: usize = lowerBoundIdx(s, self.range_start.addr);
         while (i < s.len) : (i += 1) {
-            const node = s[i];
+            // self-alive: scanning the array under vmm.lock.
+            const node = s[i].ptr;
             if (node.start.addr > prev_end and node.start.addr - prev_end >= size) {
                 return VAddr.fromInt(prev_end);
             }
@@ -316,25 +326,28 @@ pub const VirtualMemoryManager = struct {
                 const upper_idx = lowerBoundIdx(s, hint.addr);
 
                 // lower: greatest-start-strictly-less-than-hint neighbor
+                // self-alive: array walk under vmm.lock.
                 const hint_free = if (upper_idx == 0)
                     true
                 else
-                    hint.addr >= s[upper_idx - 1].end();
+                    hint.addr >= s[upper_idx - 1].ptr.end();
 
                 // upper: first node with start >= hint. If it starts
                 // inside [hint, hint_end), the hinted range is not clear.
+                // self-alive: array walk under vmm.lock.
                 const range_clear = if (upper_idx >= s.len)
                     true
                 else
-                    s[upper_idx].start.addr >= hint_end;
+                    s[upper_idx].ptr.start.addr >= hint_end;
 
                 if (hint_free and range_clear) break :blk hint;
             }
             break :blk try self.findFreeRange(size);
         };
 
-        const node = try allocVmNode();
-        node.init(
+        const node_ref = try allocVmNode();
+        // self-alive: freshly allocated; no other observer until insert.
+        node_ref.ptr.init(
             chosen,
             size,
             .private,
@@ -348,12 +361,12 @@ pub const VirtualMemoryManager = struct {
             .free,
         );
 
-        self.insertNodeLocked(node) catch |e| {
-            freeVmNode(node);
+        self.insertNodeLocked(node_ref) catch |e| {
+            freeVmNode(node_ref);
             return e;
         };
 
-        return .{ .vaddr = chosen, .node = node };
+        return .{ .vaddr = chosen, .node = node_ref };
     }
 
     pub fn reserveStack(self: *VirtualMemoryManager, num_pages: u32) !StackResult {
@@ -367,16 +380,18 @@ pub const VirtualMemoryManager = struct {
         const usable_start = base_addr.addr + paging.PAGE4K;
         const overflow_start = usable_start + usable_size;
 
-        const underflow_node = try allocVmNode();
-        underflow_node.init(base_addr, paging.PAGE4K, .private, null, .{}, HANDLE_NONE, .free);
+        const underflow_ref = try allocVmNode();
+        // self-alive: freshly allocated; no other observer yet.
+        underflow_ref.ptr.init(base_addr, paging.PAGE4K, .private, null, .{}, HANDLE_NONE, .free);
 
-        self.insertNodeLocked(underflow_node) catch |e| {
-            freeVmNode(underflow_node);
+        self.insertNodeLocked(underflow_ref) catch |e| {
+            freeVmNode(underflow_ref);
             return e;
         };
 
-        const stack_node = try allocVmNode();
-        stack_node.init(
+        const stack_ref = try allocVmNode();
+        // self-alive: freshly allocated.
+        stack_ref.ptr.init(
             VAddr.fromInt(usable_start),
             usable_size,
             .private,
@@ -386,15 +401,16 @@ pub const VirtualMemoryManager = struct {
             .free,
         );
 
-        self.insertNodeLocked(stack_node) catch |e| {
-            self.removeNodeLocked(underflow_node);
-            freeVmNode(underflow_node);
-            freeVmNode(stack_node);
+        self.insertNodeLocked(stack_ref) catch |e| {
+            self.removeNodeLocked(underflow_ref);
+            freeVmNode(underflow_ref);
+            freeVmNode(stack_ref);
             return e;
         };
 
-        const overflow_node = try allocVmNode();
-        overflow_node.init(
+        const overflow_ref = try allocVmNode();
+        // self-alive: freshly allocated.
+        overflow_ref.ptr.init(
             VAddr.fromInt(overflow_start),
             paging.PAGE4K,
             .private,
@@ -404,13 +420,13 @@ pub const VirtualMemoryManager = struct {
             .free,
         );
 
-        self.insertNodeLocked(overflow_node) catch |e| {
-            unmapNodePages(stack_node, self.addr_space_root, true);
-            self.removeNodeLocked(stack_node);
-            self.removeNodeLocked(underflow_node);
-            freeVmNode(overflow_node);
-            freeVmNode(stack_node);
-            freeVmNode(underflow_node);
+        self.insertNodeLocked(overflow_ref) catch |e| {
+            unmapNodePages(stack_ref, self.addr_space_root, true);
+            self.removeNodeLocked(stack_ref);
+            self.removeNodeLocked(underflow_ref);
+            freeVmNode(overflow_ref);
+            freeVmNode(stack_ref);
+            freeVmNode(underflow_ref);
             return e;
         };
 
@@ -435,18 +451,18 @@ pub const VirtualMemoryManager = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        if (self.findNodeLocked(stack.guard)) |underflow_node| {
-            self.removeNodeLocked(underflow_node);
-            freeVmNode(underflow_node);
+        if (self.findNodeLocked(stack.guard)) |underflow_ref| {
+            self.removeNodeLocked(underflow_ref);
+            freeVmNode(underflow_ref);
         }
-        if (self.findNodeLocked(stack.base)) |stack_node| {
-            unmapNodePages(stack_node, self.addr_space_root, true);
-            self.removeNodeLocked(stack_node);
-            freeVmNode(stack_node);
+        if (self.findNodeLocked(stack.base)) |stack_ref| {
+            unmapNodePages(stack_ref, self.addr_space_root, true);
+            self.removeNodeLocked(stack_ref);
+            freeVmNode(stack_ref);
         }
-        if (self.findNodeLocked(stack.top)) |overflow_node| {
-            self.removeNodeLocked(overflow_node);
-            freeVmNode(overflow_node);
+        if (self.findNodeLocked(stack.top)) |overflow_ref| {
+            self.removeNodeLocked(overflow_ref);
+            freeVmNode(overflow_ref);
         }
     }
 
@@ -454,7 +470,9 @@ pub const VirtualMemoryManager = struct {
         self.lock.lock();
         defer self.lock.unlock();
 
-        const node = self.findNodeLocked(fault_vaddr) orelse return error.NoMapping;
+        const node_ref = self.findNodeLocked(fault_vaddr) orelse return error.NoMapping;
+        // self-alive: node is in the array under vmm.lock.
+        const node = node_ref.ptr;
 
         // Rights check lives *above* the already-resolved fast path on
         // purpose. Callers pre-fault with (is_write, is_exec) reflecting
@@ -518,15 +536,18 @@ pub const VirtualMemoryManager = struct {
         const hi = lowerBoundIdx(s, range_end_addr);
         var i: usize = lo;
         while (i < hi) : (i += 1) {
-            if (s[i].kind != .private) return error.NonPrivateRange;
+            // self-alive: array walk under vmm.lock.
+            if (s[i].ptr.kind != .private) return error.NonPrivateRange;
         }
 
         i = lo;
         while (i < hi) : (i += 1) {
-            const node = s[i];
+            const node_ref = s[i];
+            // self-alive: array walk under vmm.lock.
+            const node = node_ref.ptr;
             if (node.kind != .private) continue;
             node.rights = new_rights;
-            updateCommittedPages(node, self.addr_space_root, new_rights, .user);
+            updateCommittedPages(node_ref, self.addr_space_root, new_rights, .user);
         }
 
         self.mergeRangeLocked(range_start, VAddr.fromInt(range_end_addr));
@@ -539,11 +560,15 @@ pub const VirtualMemoryManager = struct {
         original_start: VAddr,
         original_size: u64,
         offset: u64,
-        shm: *SharedMemory,
+        shm_ref: SlabRef(SharedMemory),
         rights: VmReservationRights,
     ) !void {
         self.lock.lock();
         defer self.lock.unlock();
+
+        // self-alive: caller holds shm._gen_lock across this call (see
+        // sysMemShmMap); the SHM object cannot be freed beneath us.
+        const shm = shm_ref.ptr;
 
         const range_start = VAddr.fromInt(original_start.addr + offset);
         const range_size = shm.size();
@@ -561,8 +586,9 @@ pub const VirtualMemoryManager = struct {
 
         try self.removeRangeLocked(range_start, range_end_addr);
 
-        const map_node = try allocVmNode();
-        map_node.init(
+        const map_ref = try allocVmNode();
+        // self-alive: freshly allocated.
+        map_ref.ptr.init(
             range_start,
             range_size,
             .shared_memory,
@@ -572,8 +598,8 @@ pub const VirtualMemoryManager = struct {
             .free,
         );
 
-        self.insertNodeLocked(map_node) catch |e| {
-            freeVmNode(map_node);
+        self.insertNodeLocked(map_ref) catch |e| {
+            freeVmNode(map_ref);
             return e;
         };
 
@@ -598,8 +624,8 @@ pub const VirtualMemoryManager = struct {
                         _ = arch.paging.unmapPage(self.addr_space_root, VAddr.fromInt(range_start.addr + @as(u64, j) * paging.PAGE4K));
                         j += 1;
                     }
-                    self.removeNodeLocked(map_node);
-                    freeVmNode(map_node);
+                    self.removeNodeLocked(map_ref);
+                    freeVmNode(map_ref);
                     return error.OutOfMemory;
                 };
             }
@@ -627,11 +653,15 @@ pub const VirtualMemoryManager = struct {
         // contained — partial overlap returns E_INVAL. Check the boundary
         // nodes BEFORE splitting (splitAtLocked would split non-private
         // nodes, corrupting them).
-        if (self.findNodeLocked(range_start)) |node| {
+        if (self.findNodeLocked(range_start)) |node_ref| {
+            // self-alive: under vmm.lock.
+            const node = node_ref.ptr;
             if (node.kind != .private and node.start.addr < range_start.addr)
                 return error.PartialOverlap;
         }
-        if (self.findNodeLocked(VAddr.fromInt(range_end_addr -| 1))) |node| {
+        if (self.findNodeLocked(VAddr.fromInt(range_end_addr -| 1))) |node_ref| {
+            // self-alive: under vmm.lock.
+            const node = node_ref.ptr;
             if (node.kind != .private and node.start.addr + node.size > range_end_addr)
                 return error.PartialOverlap;
         }
@@ -643,7 +673,7 @@ pub const VirtualMemoryManager = struct {
         // UNMAP PASS: drop non-private nodes into `to_replace` so we can
         // swap them for private placeholders after the iteration — we
         // avoid mutating the array while iterating over it.
-        var to_replace: [128]*VmNode = undefined;
+        var to_replace: [128]SlabRef(VmNode) = undefined;
         var replace_count: usize = 0;
 
         {
@@ -652,7 +682,9 @@ pub const VirtualMemoryManager = struct {
             const hi = lowerBoundIdx(s, range_end_addr);
             var i: usize = lo;
             while (i < hi) : (i += 1) {
-                const node = s[i];
+                const node_ref = s[i];
+                // self-alive: iterating the array under vmm.lock.
+                const node = node_ref.ptr;
                 const unmap_rights: VmReservationRights = .{
                     .read = max_rights.read,
                     .write = max_rights.write,
@@ -660,15 +692,15 @@ pub const VirtualMemoryManager = struct {
                 };
                 switch (node.kind) {
                     .private => {
-                        unmapNodePages(node, self.addr_space_root, true);
+                        unmapNodePages(node_ref, self.addr_space_root, true);
                         node.rights = unmap_rights;
                     },
                     .shared_memory, .mmio, .virtual_bar => {
                         if (node.kind != .virtual_bar) {
-                            unmapNodePages(node, self.addr_space_root, false);
+                            unmapNodePages(node_ref, self.addr_space_root, false);
                         }
                         if (replace_count < to_replace.len) {
-                            to_replace[replace_count] = node;
+                            to_replace[replace_count] = node_ref;
                             replace_count += 1;
                         }
                     },
@@ -677,15 +709,19 @@ pub const VirtualMemoryManager = struct {
         }
 
         // Replace non-private nodes with private nodes.
-        for (to_replace[0..replace_count]) |node| {
+        for (to_replace[0..replace_count]) |node_ref| {
+            // self-alive: under vmm.lock; we just picked this node up
+            // from the array in the pass above.
+            const node = node_ref.ptr;
             const old_start = node.start;
             const old_size = node.size;
             const old_handle = node.handle;
-            self.removeNodeLocked(node);
-            freeVmNode(node);
+            self.removeNodeLocked(node_ref);
+            freeVmNode(node_ref);
 
-            const replacement = allocVmNode() catch continue;
-            replacement.init(
+            const replacement_ref = allocVmNode() catch continue;
+            // self-alive: freshly allocated.
+            replacement_ref.ptr.init(
                 old_start,
                 old_size,
                 .private,
@@ -698,7 +734,7 @@ pub const VirtualMemoryManager = struct {
                 old_handle,
                 .free,
             );
-            self.insertNodeLocked(replacement) catch freeVmNode(replacement);
+            self.insertNodeLocked(replacement_ref) catch freeVmNode(replacement_ref);
         }
 
         self.mergeRangeLocked(range_start, VAddr.fromInt(range_end_addr));
@@ -711,12 +747,16 @@ pub const VirtualMemoryManager = struct {
         original_start: VAddr,
         original_size: u64,
         offset: u64,
-        device: *DeviceRegion,
+        device_ref: SlabRef(DeviceRegion),
         write_combining: bool,
         rights: VmReservationRights,
     ) !void {
         self.lock.lock();
         defer self.lock.unlock();
+
+        // self-alive: caller (sysMemMmioMap) holds device._gen_lock across
+        // this call, so the DeviceRegion cannot be freed beneath us.
+        const device = device_ref.ptr;
 
         const range_start = VAddr.fromInt(original_start.addr + offset);
         const range_size = device.access.mmio.size;
@@ -734,8 +774,9 @@ pub const VirtualMemoryManager = struct {
 
         try self.removeRangeLocked(range_start, range_end_addr);
 
-        const map_node = try allocVmNode();
-        map_node.init(
+        const map_ref = try allocVmNode();
+        // self-alive: freshly allocated.
+        map_ref.ptr.init(
             range_start,
             range_size,
             .mmio,
@@ -745,8 +786,8 @@ pub const VirtualMemoryManager = struct {
             .free,
         );
 
-        self.insertNodeLocked(map_node) catch |e| {
-            freeVmNode(map_node);
+        self.insertNodeLocked(map_ref) catch |e| {
+            freeVmNode(map_ref);
             return e;
         };
 
@@ -773,8 +814,8 @@ pub const VirtualMemoryManager = struct {
                         _ = arch.paging.unmapPage(self.addr_space_root, VAddr.fromInt(range_start.addr + undo));
                         undo += paging.PAGE4K;
                     }
-                    self.removeNodeLocked(map_node);
-                    freeVmNode(map_node);
+                    self.removeNodeLocked(map_ref);
+                    freeVmNode(map_ref);
                     return error.OutOfMemory;
                 };
                 mapped += paging.PAGE4K;
@@ -789,11 +830,15 @@ pub const VirtualMemoryManager = struct {
         original_start: VAddr,
         original_size: u64,
         offset: u64,
-        device: *DeviceRegion,
+        device_ref: SlabRef(DeviceRegion),
         rights: VmReservationRights,
     ) !void {
         self.lock.lock();
         defer self.lock.unlock();
+
+        // self-alive: caller (sysMemMmioMap) holds device._gen_lock across
+        // this call.
+        const device = device_ref.ptr;
 
         const range_start = VAddr.fromInt(original_start.addr + offset);
         const range_size = std.mem.alignForward(u64, device.access.port_io.port_count, paging.PAGE4K);
@@ -811,8 +856,9 @@ pub const VirtualMemoryManager = struct {
 
         try self.removeRangeLocked(range_start, range_end_addr);
 
-        const map_node = try allocVmNode();
-        map_node.init(
+        const map_ref = try allocVmNode();
+        // self-alive: freshly allocated.
+        map_ref.ptr.init(
             range_start,
             range_size,
             .virtual_bar,
@@ -822,8 +868,8 @@ pub const VirtualMemoryManager = struct {
             .free,
         );
 
-        self.insertNodeLocked(map_node) catch |e| {
-            freeVmNode(map_node);
+        self.insertNodeLocked(map_ref) catch |e| {
+            freeVmNode(map_ref);
             return e;
         };
 
@@ -850,11 +896,12 @@ pub const VirtualMemoryManager = struct {
         var i: usize = hi;
         while (i > lo) {
             i -= 1;
-            const node = self.nodes[i];
-            const free_phys = node.kind == .private;
-            unmapNodePages(node, self.addr_space_root, free_phys);
+            const node_ref = self.nodes[i];
+            // self-alive: under vmm.lock.
+            const free_phys = node_ref.ptr.kind == .private;
+            unmapNodePages(node_ref, self.addr_space_root, free_phys);
             self.removeAtIdx(i);
-            freeVmNode(node);
+            freeVmNode(node_ref);
         }
     }
 
@@ -870,10 +917,12 @@ pub const VirtualMemoryManager = struct {
 
         var i: usize = 0;
         while (i < self.count) : (i += 1) {
-            const node = self.nodes[i];
+            const node_ref = self.nodes[i];
+            // self-alive: under vmm.lock.
+            const node = node_ref.ptr;
             if (node.kind != .shared_memory) continue;
             if (node.sharedMemory() != shm) continue;
-            unmapNodePages(node, self.addr_space_root, false);
+            unmapNodePages(node_ref, self.addr_space_root, false);
             node.kind = .private;
             node.rights = findContainingRights(reservations, node.start.addr);
             node.handle = HANDLE_NONE;
@@ -887,11 +936,13 @@ pub const VirtualMemoryManager = struct {
 
         var i: usize = 0;
         while (i < self.count) : (i += 1) {
-            const node = self.nodes[i];
+            const node_ref = self.nodes[i];
+            // self-alive: under vmm.lock.
+            const node = node_ref.ptr;
             const is_mmio = node.kind == .mmio and node.deviceRegion() == device;
             const is_vbar = node.kind == .virtual_bar and node.deviceRegion() == device;
             if (!is_mmio and !is_vbar) continue;
-            if (is_mmio) unmapNodePages(node, self.addr_space_root, false);
+            if (is_mmio) unmapNodePages(node_ref, self.addr_space_root, false);
             node.kind = .private;
             node.rights = findContainingRights(reservations, node.start.addr);
             node.handle = HANDLE_NONE;
@@ -909,16 +960,18 @@ pub const VirtualMemoryManager = struct {
         var i: usize = self.count;
         while (i > 0) {
             i -= 1;
-            const node = self.nodes[i];
+            const node_ref = self.nodes[i];
+            // self-alive: under vmm.lock.
+            const node = node_ref.ptr;
             switch (node.restart_policy) {
                 .free => {
                     const free_phys = node.kind == .private;
-                    unmapNodePages(node, self.addr_space_root, free_phys);
+                    unmapNodePages(node_ref, self.addr_space_root, free_phys);
                     self.removeAtIdx(i);
-                    freeVmNode(node);
+                    freeVmNode(node_ref);
                 },
                 .decommit => {
-                    unmapNodePages(node, self.addr_space_root, true);
+                    unmapNodePages(node_ref, self.addr_space_root, true);
                 },
                 .preserve => {},
             }
@@ -928,10 +981,14 @@ pub const VirtualMemoryManager = struct {
     // ── Internal helpers (locked) ──────────────────────────────────────
 
     fn splitAtLocked(self: *VirtualMemoryManager, split_vaddr: VAddr) !void {
-        const node = self.findNodeLocked(split_vaddr) orelse return;
+        const node_ref = self.findNodeLocked(split_vaddr) orelse return;
+        // self-alive: under vmm.lock.
+        const node = node_ref.ptr;
         if (node.start.addr == split_vaddr.addr) return;
 
-        const right = try allocVmNode();
+        const right_ref = try allocVmNode();
+        // self-alive: freshly allocated.
+        const right = right_ref.ptr;
         // Field-by-field write preserves `right._gen_lock`.
         right.start = split_vaddr;
         right.size = node.end() - split_vaddr.addr;
@@ -942,9 +999,9 @@ pub const VirtualMemoryManager = struct {
         right.restart_policy = node.restart_policy;
         node.size = split_vaddr.addr - node.start.addr;
 
-        self.insertNodeLocked(right) catch |e| {
+        self.insertNodeLocked(right_ref) catch |e| {
             node.size = right.end() - node.start.addr;
-            freeVmNode(right);
+            freeVmNode(right_ref);
             return e;
         };
     }
@@ -959,14 +1016,17 @@ pub const VirtualMemoryManager = struct {
         // so removals can't desync our cursor.
         var idx = lowerBoundIdx(self.slice(), range_start.addr);
         while (idx + 1 < self.count) {
-            const node = self.nodes[idx];
+            // self-alive: under vmm.lock.
+            const node = self.nodes[idx].ptr;
             if (node.start.addr >= range_end.addr) break;
-            const next = self.nodes[idx + 1];
+            const next_ref = self.nodes[idx + 1];
+            // self-alive: under vmm.lock.
+            const next = next_ref.ptr;
             if (next.start.addr >= range_end.addr) break;
             if (canMerge(node, next)) {
                 node.size += next.size;
                 self.removeAtIdx(idx + 1);
-                freeVmNode(next);
+                freeVmNode(next_ref);
                 // Stay at `idx` — another successor may now be mergeable too.
                 continue;
             }
@@ -982,13 +1042,16 @@ pub const VirtualMemoryManager = struct {
     fn tryMergeAt(self: *VirtualMemoryManager, vaddr: VAddr) void {
         const idx = lowerBoundIdx(self.slice(), vaddr.addr);
         if (idx == 0 or idx >= self.count) return;
-        const node = self.nodes[idx];
+        const node_ref = self.nodes[idx];
+        // self-alive: under vmm.lock.
+        const node = node_ref.ptr;
         if (node.start.addr != vaddr.addr) return;
-        const prev = self.nodes[idx - 1];
+        // self-alive: under vmm.lock.
+        const prev = self.nodes[idx - 1].ptr;
         if (!canMerge(prev, node)) return;
         prev.size += node.size;
         self.removeAtIdx(idx);
-        freeVmNode(node);
+        freeVmNode(node_ref);
     }
 
     fn removeRangeLocked(self: *VirtualMemoryManager, range_start: VAddr, range_end_addr: u64) !void {
@@ -1001,9 +1064,9 @@ pub const VirtualMemoryManager = struct {
         var i: usize = hi;
         while (i > lo) {
             i -= 1;
-            const node = self.nodes[i];
+            const node_ref = self.nodes[i];
             self.removeAtIdx(i);
-            freeVmNode(node);
+            freeVmNode(node_ref);
         }
     }
 
@@ -1013,7 +1076,9 @@ pub const VirtualMemoryManager = struct {
         const hi = lowerBoundIdx(s, res_start.addr + res_size);
         var i: usize = lo;
         while (i < hi) : (i += 1) {
-            if (s[i].kind == .shared_memory and s[i].sharedMemory() == shm) return true;
+            // self-alive: array walk under vmm.lock.
+            const node = s[i].ptr;
+            if (node.kind == .shared_memory and node.sharedMemory() == shm) return true;
         }
         return false;
     }
@@ -1024,7 +1089,9 @@ pub const VirtualMemoryManager = struct {
         const hi = lowerBoundIdx(s, res_start.addr + res_size);
         var i: usize = lo;
         while (i < hi) : (i += 1) {
-            if (s[i].kind == .mmio and s[i].deviceRegion() == device) return true;
+            // self-alive: array walk under vmm.lock.
+            const node = s[i].ptr;
+            if (node.kind == .mmio and node.deviceRegion() == device) return true;
         }
         return false;
     }
@@ -1035,7 +1102,9 @@ pub const VirtualMemoryManager = struct {
         const hi = lowerBoundIdx(s, res_start.addr + res_size);
         var i: usize = lo;
         while (i < hi) : (i += 1) {
-            if (s[i].kind == .virtual_bar and s[i].deviceRegion() == device) return true;
+            // self-alive: array walk under vmm.lock.
+            const node = s[i].ptr;
+            if (node.kind == .virtual_bar and node.deviceRegion() == device) return true;
         }
         return false;
     }
@@ -1046,7 +1115,8 @@ pub const VirtualMemoryManager = struct {
         const hi = lowerBoundIdx(s, range_end_addr);
         var i: usize = lo;
         while (i < hi) : (i += 1) {
-            if (arch.paging.resolveVaddr(self.addr_space_root, s[i].start) != null) return true;
+            // self-alive: array walk under vmm.lock.
+            if (arch.paging.resolveVaddr(self.addr_space_root, s[i].ptr.start) != null) return true;
         }
         return false;
     }
@@ -1069,7 +1139,11 @@ fn canMerge(a: *VmNode, b: *VmNode) bool {
     return a.end() == b.start.addr;
 }
 
-fn unmapNodePages(node: *VmNode, addr_space_root: PAddr, free_phys: bool) void {
+fn unmapNodePages(node_ref: SlabRef(VmNode), addr_space_root: PAddr, free_phys: bool) void {
+    // self-alive: callers hold vmm.lock; the node is stored in
+    // self.nodes[] or was just removed by the same critical section.
+    const node = node_ref.ptr;
+
     // virtual_bar nodes have no mapped pages — PTEs are intentionally absent
     if (node.kind == .virtual_bar) return;
 
@@ -1087,11 +1161,15 @@ fn unmapNodePages(node: *VmNode, addr_space_root: PAddr, free_phys: bool) void {
 }
 
 fn updateCommittedPages(
-    node: *VmNode,
+    node_ref: SlabRef(VmNode),
     addr_space_root: PAddr,
     rights: VmReservationRights,
     privilege: PrivilegePerm,
 ) void {
+    // self-alive: caller (memPerms) holds vmm.lock; node is live in the
+    // array.
+    const node = node_ref.ptr;
+
     const is_decommit = !rights.read and !rights.write and !rights.execute;
 
     if (is_decommit) {

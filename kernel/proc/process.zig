@@ -51,8 +51,8 @@ pub fn slabRefNow(comptime T: type, ptr: *T) SlabRef(T) {
 }
 
 pub const DmaMapping = struct {
-    device: *DeviceRegion,
-    shm: *SharedMemory,
+    device: SlabRef(DeviceRegion),
+    shm: SlabRef(SharedMemory),
     dma_base: u64,
     num_pages: u64,
     active: bool,
@@ -410,13 +410,7 @@ pub const Process = struct {
     /// faultBlock direct-delivery: the receiver thread is blocked in
     /// sysFaultRecv and cannot itself dequeue + write on resume, so the
     /// sender (the faulting thread's kernel context) does it.
-    fn writeFaultMessageInto(
-        receiver_proc: *Process,
-        buf_ptr: u64,
-        process_handle: u64,
-        thread_handle: u64,
-        faulted: *Thread,
-    ) void {
+    fn writeFaultMessageInto(receiver_proc: *Process, buf_ptr: u64, process_handle: u64, thread_handle: u64, faulted: *Thread) void {
         // Layout matches libz.FaultMessage. Size is arch-dependent.
         var msg: [arch.cpu.fault_msg_size]u8 = undefined;
         @as(*align(1) u64, @ptrCast(&msg[0])).* = process_handle;
@@ -1388,8 +1382,8 @@ pub const Process = struct {
     pub fn addDmaMapping(self: *Process, device: *DeviceRegion, shm: *SharedMemory, dma_base: u64, num_pages: u64) !void {
         if (self.num_dma_mappings >= MAX_DMA_MAPPINGS) return error.TooManyDmaMappings;
         self.dma_mappings[self.num_dma_mappings] = .{
-            .device = device,
-            .shm = shm,
+            .device = slabRefNow(DeviceRegion, device),
+            .shm = slabRefNow(SharedMemory, shm),
             .dma_base = dma_base,
             .num_pages = num_pages,
             .active = true,
@@ -1399,7 +1393,9 @@ pub const Process = struct {
 
     pub fn removeDmaMapping(self: *Process, device: *DeviceRegion, shm: *SharedMemory) ?DmaMapping {
         for (self.dma_mappings[0..self.num_dma_mappings], 0..) |*m, i| {
-            if (m.active and m.device == device and m.shm == shm) {
+            // Identity compares don't deref — `.ptr` here is a raw pointer
+            // equality check, which the analyzer exempts.
+            if (m.active and m.device.ptr == device and m.shm.ptr == shm) {
                 const mapping = m.*;
                 m.active = false;
                 if (i == self.num_dma_mappings - 1) {
@@ -1414,7 +1410,12 @@ pub const Process = struct {
     pub fn cleanupDmaMappings(self: *Process) void {
         for (self.dma_mappings[0..self.num_dma_mappings]) |*m| {
             if (m.active) {
-                arch.iommu.unmapDmaPages(m.device, m.dma_base, m.num_pages);
+                // Process teardown holds the only reference to these
+                // mappings; the device slot is pinned by the parent's
+                // perm table (the handle gets returned up-tree in
+                // cleanupPhase1's walk, which runs after this function).
+                // self-alive: teardown path, device slot pinned above.
+                arch.iommu.unmapDmaPages(m.device.ptr, m.dma_base, m.num_pages);
                 m.active = false;
             }
         }

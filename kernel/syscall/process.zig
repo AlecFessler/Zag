@@ -16,9 +16,11 @@ const Priority = zag.sched.thread.Priority;
 const Process = zag.proc.process.Process;
 const ProcessHandleRights = zag.perms.permissions.ProcessHandleRights;
 const ProcessRights = zag.perms.permissions.ProcessRights;
+const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
 const VAddr = zag.memory.address.VAddr;
 const VirtualMemoryManager = zag.memory.vmm.VirtualMemoryManager;
+const VmNode = zag.memory.vmm.VmNode;
 
 const E_BADADDR = errors.E_BADADDR;
 const E_BADCAP = errors.E_BADCAP;
@@ -52,11 +54,11 @@ pub fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_a
     // Verify the entire ELF buffer is backed by mapped VMM nodes with read rights.
     var check_addr = elf_ptr;
     while (check_addr < elf_end) {
-        const node = proc.vmm.findNode(VAddr.fromInt(check_addr)) orelse return E_BADADDR;
-        node._gen_lock.lock();
+        const node_ref: SlabRef(VmNode) = proc.vmm.findNode(VAddr.fromInt(check_addr)) orelse return E_BADADDR;
+        const node = node_ref.lock() catch return E_BADADDR;
         const readable = node.rights.read;
         const node_end = node.end();
-        node._gen_lock.unlock();
+        node_ref.unlock();
         if (!readable) return E_BADADDR;
         check_addr = node_end;
     }
