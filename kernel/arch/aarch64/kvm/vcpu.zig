@@ -260,7 +260,7 @@ fn vcpuEntryPoint() void {
     // self-alive: this is the vCPU's own thread entry — the process
     // that owns it (and its `vm`) is alive for the whole lifetime of
     // this function; teardown goes through vm.destroy() + deinit.
-    const vm_obj = thread.process.ptr.vm.?;
+    const vm_obj = thread.process.ptr.vm.?.ptr;
     const vcpu_obj = vcpuFromThread(vm_obj, thread).?;
 
     while (true) {
@@ -329,15 +329,15 @@ pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
     const E_BADCAP: i64 = -3;
     const E_BUSY: i64 = -11;
 
-    const vm_obj = proc.vm orelse return E_INVAL;
+    const vm_ref = proc.vm orelse return E_INVAL;
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
     const thread_ptr = entry.object.thread.lock() catch return E_BADCAP;
     defer entry.object.thread.unlock();
 
-    vm_obj._gen_lock.lock();
-    defer vm_obj._gen_lock.unlock();
+    const vm_obj = vm_ref.lock() catch return E_BADCAP;
+    defer vm_ref.unlock();
 
     const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse return E_BADCAP;
 
@@ -359,15 +359,15 @@ pub fn vcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     const E_BADADDR: i64 = -7;
     const E_BUSY: i64 = -11;
 
-    const vm_obj = proc.vm orelse return E_INVAL;
+    const vm_ref = proc.vm orelse return E_INVAL;
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
     const thread_ptr = entry.object.thread.lock() catch return E_BADCAP;
     defer entry.object.thread.unlock();
 
-    vm_obj._gen_lock.lock();
-    defer vm_obj._gen_lock.unlock();
+    const vm_obj = vm_ref.lock() catch return E_BADCAP;
+    defer vm_ref.unlock();
 
     const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse return E_BADCAP;
 
@@ -387,7 +387,12 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     const E_BADCAP: i64 = -3;
     const E_BADADDR: i64 = -7;
 
-    const vm_obj = proc.vm orelse return E_INVAL;
+    const vm_ref = proc.vm orelse return E_INVAL;
+    _ = vm_ref.lock() catch return E_INVAL;
+    vm_ref.unlock();
+    // self-alive: caller IS vm's owner proc.
+    const vm_obj = vm_ref.ptr;
+
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 

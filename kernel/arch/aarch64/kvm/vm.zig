@@ -341,7 +341,7 @@ pub fn vmCreate(proc: *Process, vcpu_count: u32, policy_ptr: u64) i64 {
         i += 1;
     }
 
-    proc.vm = vm_obj;
+    proc.vm = slabRefNow(Vm, vm_obj);
 
     const vm_handle_id = proc.insertPerm(PermissionEntry{
         .handle = 0,

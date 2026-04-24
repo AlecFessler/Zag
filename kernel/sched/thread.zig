@@ -176,7 +176,10 @@ pub const Thread = struct {
             // destroy the VM (killing vCPU threads) and deinit them so the
             // process can proceed to exit. Without this, blocked vCPU threads
             // keep num_threads > 0 and lastThreadExited is never called.
-            if (proc.vm) |vm_obj| {
+            if (proc.vm) |vm_ref| {
+                // self-alive: proc owns its VM by construction; Thread.deinit
+                // is the single teardown driver and has exclusive access.
+                const vm_obj = vm_ref.ptr;
                 // Check if all remaining threads are vCPU threads.
                 var all_vcpu = true;
                 proc._gen_lock.lock();

@@ -113,7 +113,7 @@ pub const Process = struct {
     // decide whether restoring the bit is semantically valid — we never
     // want to synthesize a right the sender didn't have to begin with.
     had_self_fault_handler: bool = true,
-    vm: ?*arch.vm.Vm = null,
+    vm: ?SlabRef(arch.vm.Vm) = null,
 
     pub const MAX_THREADS = 64;
     pub const MAX_CHILDREN = 64;
@@ -1312,8 +1312,10 @@ pub const Process = struct {
             self.fault_handler_proc = null;
         }
 
-        if (self.vm) |vm_obj| {
-            vm_obj.destroy();
+        if (self.vm) |vm_ref| {
+            // self-alive: self is being torn down; no other observer
+            // can race destroy of our own VM.
+            vm_ref.ptr.destroy();
             self.vm = null;
         }
 
