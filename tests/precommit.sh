@@ -2,6 +2,9 @@
 # Mega precommit: run the full cross-arch gauntlet before a commit.
 #
 # Stages:
+#   0. arch layering lint          (grep — arch-specific / generic boundaries)
+#   0b. dead-code report            (advisory — manual review)
+#   0c. gen-lock analyzer           (advisory — fat-pointer + bracketing invariants)
 #   1. x86-64 kernel test suite   (KVM on this dev PC)
 #   2. aarch64 kernel test suite  (KVM on the Pi 5 @ 192.168.86.106 via SSH)
 #   3. hyprvOS Linux boot          (x86-64, KVM on this PC)
@@ -72,6 +75,27 @@ stage_dead_code_report() {
     # Advisory only — output is manual-review (checks for @field/asm refs needed).
     python3 "$ZAG_ROOT/tools/dead_code.py" kernel 2>&1 | tail -20 || true
     echo "(advisory — see tools/dead_code.py kernel for full listing)"
+    return 0
+}
+
+stage_gen_lock_analyzer() {
+    echo ""
+    echo "=================================================="
+    echo "[0c] Gen-lock analyzer (fat-pointer invariants)"
+    echo "=================================================="
+    # Build the analyzer once (cheap — ReleaseFast is ~50ms to run) and
+    # print its summary. Advisory until task #8 clears the remaining
+    # false positives (analyzer's flow analysis synthesizes inlined-body
+    # line numbers that don't map back cleanly). Switch to gating once
+    # the summary reports 0 errors; treat any *new* category as
+    # immediate regression in the meantime.
+    if ! (cd "$ZAG_ROOT/tools/check_gen_lock" && zig build 2>&1); then
+        FAILURES+=("gen-lock analyzer build")
+        return 1
+    fi
+    local analyzer="$ZAG_ROOT/tools/check_gen_lock/zig-out/bin/check_gen_lock"
+    "$analyzer" 2>&1 | tail -8 || true
+    echo "(advisory — see tools/check_gen_lock/ for full trace)"
     return 0
 }
 
@@ -271,6 +295,7 @@ stage_kernel_perf() {
 
 stage_arch_layering_lint        || true
 stage_dead_code_report          || true
+stage_gen_lock_analyzer         || true
 stage_x86_kernel_tests          || true
 stage_aarch64_kernel_tests_pi   || true
 stage_hyprvos_x86_linux_boot    || true
