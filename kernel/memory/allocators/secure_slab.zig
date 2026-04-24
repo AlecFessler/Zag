@@ -158,6 +158,62 @@ pub fn SlabRef(comptime T: type) type {
     };
 }
 
+/// Lock-guarded cell for a `?SlabRef(T)`. Native 128-bit atomics would
+/// want `cmpxchg16b` on x86_64, which our kernel's CPU baseline does
+/// not mandate; a per-cell `SpinLock` gives the same observable
+/// semantics (consistent ptr+gen snapshot across cores) with no CPU
+/// feature dependency. Scheduler use is low-contention: writers are
+/// always the owning core; cross-core readers are identity-compare
+/// only and hit the lock briefly.
+///
+/// The cell stores `ptr: ?*T` + `gen: u32` separately under the lock,
+/// so there is no "empty bit pattern" constraint on the SlabRef
+/// layout — a null `ptr` plus any `gen` encodes empty.
+pub fn AtomicSlabRef(comptime T: type) type {
+    return struct {
+        const Self = @This();
+        const Ref = SlabRef(T);
+
+        lock: SpinLock = .{},
+        ptr: ?*T = null,
+        gen: u32 = 0,
+
+        pub fn load(self: *const Self, comptime _: std.builtin.AtomicOrder) ?Ref {
+            const mut: *Self = @constCast(self);
+            mut.lock.lock();
+            defer mut.lock.unlock();
+            const p = mut.ptr orelse return null;
+            return Ref.init(p, @intCast(mut.gen));
+        }
+
+        pub fn store(self: *Self, ref: ?Ref, comptime _: std.builtin.AtomicOrder) void {
+            self.lock.lock();
+            defer self.lock.unlock();
+            if (ref) |r| {
+                self.ptr = r.ptr;
+                self.gen = r.gen;
+            } else {
+                self.ptr = null;
+                self.gen = 0;
+            }
+        }
+
+        pub fn swap(self: *Self, ref: ?Ref, comptime _: std.builtin.AtomicOrder) ?Ref {
+            self.lock.lock();
+            defer self.lock.unlock();
+            const prev: ?Ref = if (self.ptr) |p| Ref.init(p, @intCast(self.gen)) else null;
+            if (ref) |r| {
+                self.ptr = r.ptr;
+                self.gen = r.gen;
+            } else {
+                self.ptr = null;
+                self.gen = 0;
+            }
+            return prev;
+        }
+    };
+}
+
 /// Out-of-band doubly-linked list entry. Sits in its own vaddr region
 /// separate from the slot pointers so a single OOB write from a T instance
 /// cannot corrupt both the address table and the freelist topology.
