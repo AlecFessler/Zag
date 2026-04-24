@@ -1,27 +1,33 @@
 //! Static analyzer for SecureSlab gen-lock coverage / scoping.
 //!
-//! Zig port of tools/check_gen_lock.py, using std.zig.Tokenizer / std.zig.Ast
-//! so the analyzer sees real tokens instead of raw source text — comment
-//! stripping, string-literal awareness, paren/brace depth, and decl
-//! boundaries all come from the tokenizer instead of hand-rolled regex.
+//! Uses std.zig.Tokenizer so the analyzer sees real tokens instead of
+//! raw source text — comment stripping, string-literal awareness,
+//! paren/brace depth, and decl boundaries all come from the tokenizer
+//! instead of hand-rolled regex.
 //!
-//! Design (same as the Python original):
+//! Design:
 //!
 //!   1. Discover slab-backed types — `pub const X = SecureSlab(T, N)`
-//!      exposes T. Also scan struct defs containing `_gen_lock: GenLock`
-//!      (the allocator stamp) for coverage parity with the Python tool.
+//!      exposes T. Struct defs containing `_gen_lock: GenLock` (the
+//!      allocator stamp) are also marked slab-backed for coverage.
 //!
 //!   2. Fat-pointer invariant — struct fields with type `*T` / `?*T` /
-//!      `[N]*T` / `[]*T` for slab-backed T are violations.
+//!      `[N]*T` / `[]*T` for slab-backed T are violations (must be
+//!      `SlabRef(T)`).
 //!
-//!   3. `.ptr` bypass — `<chain>.<slabref_field>.ptr` where <field> is a
-//!      known SlabRef-typed field. Exempted by inline or preceding
-//!      `// self-alive` comment; identity compares are also exempt.
+//!   3. `.ptr` bypass — `<chain>.<slabref_field>.ptr` where <field> is
+//!      a known SlabRef-typed field. Exempted by `// self-alive`
+//!      comment on the line or in the contiguous `//` block above;
+//!      identity compares are also exempt.
 //!
 //!   4. Per-entry gen-lock bracketing — every access to a slab-typed
-//!      local in a syscall / exception handler must be tight-preceded by
-//!      a lock and tight-followed by an unlock on the same ident. Defer-
-//!      unlock covering scope exit is also accepted.
+//!      local in a syscall / exception handler must be tight-preceded
+//!      by a lock and tight-followed by an unlock on the same ident.
+//!      Each function body walks ONCE with its own fresh ident env; at
+//!      call sites the callee's memoized per-param summary is folded
+//!      into the caller's event timeline at the real call-site source
+//!      line. Callee-internal locals stay internal to the callee — no
+//!      inline expansion, no synthetic line counter.
 //!
 //! Exit status nonzero iff any err-severity findings are emitted.
 
@@ -33,7 +39,6 @@ const ascii = std.ascii;
 const Allocator = std.mem.Allocator;
 const ArrayList = std.ArrayList;
 const StringHashMap = std.StringHashMap;
-const StringHashMapUnmanaged = std.StringHashMapUnmanaged;
 const Tokenizer = std.zig.Tokenizer;
 const TokenTag = std.zig.Token.Tag;
 
@@ -129,8 +134,6 @@ const PTR_BYPASS_EXEMPT_FILES = [_][]const u8{
 
 const TEST_FIXTURE_TYPES = [_][]const u8{"TestT"};
 
-const MAX_INLINE_DEPTH: u32 = 32;
-
 // -----------------------------------------------------------------
 // Small helper types
 // -----------------------------------------------------------------
@@ -195,11 +198,6 @@ fn lookupSlabReturnMethod(name: []const u8) ?[]const u8 {
         if (mem.eql(u8, e.name, name)) return e.ty;
     }
     return null;
-}
-
-fn isFatSlabReturn(name: []const u8) bool {
-    for (FAT_SLAB_RETURN_NAMES) |e| if (mem.eql(u8, e, name)) return true;
-    return false;
 }
 
 // -----------------------------------------------------------------
@@ -537,26 +535,26 @@ const Finding = struct {
     line_no: u32,
 };
 
-const Access = struct {
-    line_no: u32, // synthesized flat line number
-    col: u32, // 0-based col of the access dot
-    ident: []const u8, // borrowed from source
-    tail: []const u8, // borrowed from source
-    slab_type: []const u8, // borrowed
-    src_line: u32, // 1-based source line
-};
-
-const LockOp = struct {
-    line_no: u32,
-    ident: []const u8, // borrowed from source
-    op: LockOpKind,
-    src_line: u32,
-};
-const LockOpKind = enum {
+// One event in an ident's per-entry event timeline. Events come from the
+// entry body directly OR from folded callee summaries applied at the call
+// site; either way the src_line is the real caller-source line where the
+// event observably happened. seq is a per-entry monotonically-increasing
+// insertion counter so callee events folded at a single call site retain
+// their internal order for tight-bracket checking.
+const EventKind = enum {
+    access,
     lock,
     unlock,
-    lock_with_gen,
     defer_unlock,
+    lock_with_gen,
+};
+
+const Event = struct {
+    kind: EventKind,
+    src_line: u32, // 1-based real line in the caller's source file
+    seq: u32, // per-entry insertion order
+    tail: []const u8 = "", // method / field name for access events
+    slab_type: []const u8 = "",
 };
 
 // -----------------------------------------------------------------
@@ -583,12 +581,6 @@ fn rstrip(s: []const u8) []const u8 {
     var b: usize = s.len;
     while (b > 0 and ascii.isWhitespace(s[b - 1])) b -= 1;
     return s[0..b];
-}
-
-fn stripSemicolon(s: []const u8) []const u8 {
-    const t = trimAscii(s);
-    if (t.len > 0 and t[t.len - 1] == ';') return trimAscii(t[0 .. t.len - 1]);
-    return t;
 }
 
 // Remove trailing `orelse ...`, `.?`, `catch ...`, parenthesized casts.
@@ -1424,11 +1416,13 @@ fn buildFnIndex(
 // Gen-lock bracket analysis per entry point.
 // -----------------------------------------------------------------
 //
-// We replicate the Python `_walk_body` algorithm on a per-line basis
-// using the stripped source. Function inlining resolves callee bodies
-// via the (recv_type, fn_name) index and recurses into them. The synth
-// counter is shared across all inlined bodies so `line_no`s are
-// comparable for bracket_check.
+// Each entry walks its own body once with a fresh ident env. Call
+// sites look up the callee's memoized summary (see Summary below) and
+// fold its effects into the caller's per-ident event timeline at the
+// real source line of the call. Callee-internal locals never enter
+// the caller env — that was the old inline-expansion mode, whose
+// ident-scoping collisions caused ghost bracket failures on unrelated
+// function locals like `prev` or `restored_caller_ref`.
 
 const SlabEnv = struct {
     map: StringStringMap,
@@ -1446,18 +1440,6 @@ const SlabEnv = struct {
         self.map.deinit();
         self.fat.deinit();
         self.self_alive.deinit();
-    }
-    fn clone(self: *const SlabEnv, gpa: Allocator) !SlabEnv {
-        var out = SlabEnv.init(gpa);
-        var it = self.map.iterator();
-        while (it.next()) |kv| {
-            try out.map.put(kv.key_ptr.*, kv.value_ptr.*);
-        }
-        var fit = self.fat.set.keyIterator();
-        while (fit.next()) |k| try out.fat.add(k.*);
-        var sit = self.self_alive.set.keyIterator();
-        while (sit.next()) |k| try out.self_alive.add(k.*);
-        return out;
     }
 };
 
@@ -1495,6 +1477,47 @@ const Pool = struct {
     }
 };
 
+// -----------------------------------------------------------------
+// Function summary = what a function does with each of its slab-typed
+// params. Events from internal non-param locals are NOT part of the
+// summary — they only exist for the function's own internal bracket
+// check and never leak to callers. This is the key fix that kills the
+// previous inline-expansion ident-scoping false-positives.
+// -----------------------------------------------------------------
+
+// A callee event describes one effect on a specific param (or a locally-
+// created slab object returned to the caller). The caller remaps the
+// param index to its passed-in ident and folds the event into its own
+// timeline at the call-site's source line.
+const ParamEventKind = enum {
+    access,
+    lock,
+    unlock,
+    defer_unlock,
+    lock_with_gen,
+};
+
+const ParamEvent = struct {
+    kind: ParamEventKind,
+    param_idx: usize,
+    order: u32, // relative order within the callee body
+    tail: []const u8 = "",
+};
+
+const Summary = struct {
+    // Does the function acquire-then-release each param in a balanced way?
+    // (Unused for now — kept as a future optimization; the caller folds
+    // all events and bracket_check judges tightness.)
+    events: []ParamEvent, // owned
+    // Slab type per param position (empty string if that position isn't
+    // slab-typed). Indexed by param position.
+    param_types: [][]const u8, // owned
+    // Param names for debugging / callee sig alignment.
+    param_names: [][]const u8, // borrowed from source
+};
+
+const SummaryMap = std.HashMap(FnKey, *Summary, FnKeyContext, std.hash_map.default_max_load_percentage);
+
 const Ctx = struct {
     gpa: Allocator,
     pool: *Pool,
@@ -1502,10 +1525,7 @@ const Ctx = struct {
     tokens_per_file: []const []const Tok,
     slab_types: *const SlabTypeMap,
     fn_index: *FnIndex,
-
-    accesses: *StringHashMap(ArrayList(Access)),
-    lock_ops: *ArrayList(LockOp),
-    synth: *u32,
+    summaries: *SummaryMap,
 
     fn fileTokens(self: *const Ctx, sf: *const SourceFile) []const Tok {
         for (self.files, self.tokens_per_file) |f, toks| {
@@ -1514,20 +1534,6 @@ const Ctx = struct {
         return &.{};
     }
 };
-
-// Substitution from callee param name -> caller arg ident.
-const Sub = struct { from: []const u8, to: []const u8 };
-
-// `ident` is an identifier token on the line. After substitution, if
-// the ident equals sub.from, rename to sub.to. We operate in a scratch
-// buffer but simpler: rather than string-rewriting the whole line, we
-// apply the substitution at the point of ident recognition.
-fn applySubs(ident: []const u8, subs: []const Sub) []const u8 {
-    for (subs) |s| {
-        if (mem.eql(u8, ident, s.from)) return s.to;
-    }
-    return ident;
-}
 
 // Scan a line for atomic builtin call spans `@atomic*(` and `@cmpxchg*(` / `@fence(`,
 // returning [start, end) byte ranges (end past matching `)`).
@@ -1584,35 +1590,6 @@ fn isAtomicMethodAt(line: []const u8, start: usize) bool {
     };
     for (names) |n| if (mem.eql(u8, n, nm)) return true;
     return false;
-}
-
-// Test: does `line` contain the substring `word` as a bounded word (not
-// preceded/followed by ident chars)?
-fn containsWord(line: []const u8, word: []const u8) bool {
-    if (word.len == 0) return false;
-    var i: usize = 0;
-    while (i + word.len <= line.len) : (i += 1) {
-        if (!mem.eql(u8, line[i .. i + word.len], word)) continue;
-        if (i > 0 and isIdentChar(line[i - 1])) continue;
-        const after = i + word.len;
-        if (after < line.len and isIdentChar(line[after])) continue;
-        return true;
-    }
-    return false;
-}
-
-// Find the first occurrence of a word in line. Returns byte index or null.
-fn indexOfWord(line: []const u8, word: []const u8) ?usize {
-    if (word.len == 0) return null;
-    var i: usize = 0;
-    while (i + word.len <= line.len) : (i += 1) {
-        if (!mem.eql(u8, line[i .. i + word.len], word)) continue;
-        if (i > 0 and isIdentChar(line[i - 1])) continue;
-        const after = i + word.len;
-        if (after < line.len and isIdentChar(line[after])) continue;
-        return i;
-    }
-    return null;
 }
 
 // Does `line` contain `<name>\s*\(` — a call to `<name>`? Pure syntactic.
@@ -1958,68 +1935,235 @@ fn inferRhsType(
 // Walk one body
 // -----------------------------------------------------------------
 
-const VisitedKey = struct {
-    recv: []const u8,
-    name: []const u8,
-};
-const VisitedSet = std.HashMap(VisitedKey, void, VisitedKeyContext, std.hash_map.default_max_load_percentage);
-const VisitedKeyContext = struct {
-    pub fn hash(_: @This(), k: VisitedKey) u64 {
-        var h = std.hash.Wyhash.init(0);
-        h.update(k.recv);
-        h.update("|");
-        h.update(k.name);
-        return h.final();
-    }
-    pub fn eql(_: @This(), a: VisitedKey, b: VisitedKey) bool {
-        return mem.eql(u8, a.recv, b.recv) and mem.eql(u8, a.name, b.name);
-    }
+const WalkError = error{ OutOfMemory };
+
+// Per-ident event list. Each entry captures a real source line, so
+// error messages bottom out at the actual kernel line where the access
+// happened rather than at a synthetic counter.
+const EventList = ArrayList(Event);
+const EventMap = StringHashMap(EventList);
+
+// A shared scratch bag the line-walker threads through:
+//   * emit_map — the ident→events map we populate (owned by caller)
+//   * param_set — idents that are params of the function currently being
+//     walked. For summary builds, the walker only considers these idents
+//     observable. For entry walks, this is empty (all entry locals are
+//     observable).
+//   * emit_param_only — when true, non-param ident events are silently
+//     dropped (summary mode).
+const EmitCtx = struct {
+    events: *EventMap,
+    seq: *u32,
+    param_set: *const SliceSet,
+    emit_param_only: bool,
 };
 
-// Apply substitution: returns a NEW owned buffer with ident renames applied.
-fn applySubsToLine(gpa: Allocator, line: []const u8, subs: []const Sub) ![]u8 {
-    if (subs.len == 0) return gpa.dupe(u8, line);
-    var out = ArrayList(u8).empty;
-    errdefer out.deinit(gpa);
-    var i: usize = 0;
-    while (i < line.len) {
-        if (isIdentStart(line[i]) and (i == 0 or !isIdentChar(line[i - 1]))) {
-            var e = i;
-            while (e < line.len and isIdentChar(line[e])) e += 1;
-            const word = line[i..e];
-            var replaced = false;
-            for (subs) |s| {
-                if (mem.eql(u8, word, s.from)) {
-                    try out.appendSlice(gpa, s.to);
-                    replaced = true;
-                    break;
-                }
-            }
-            if (!replaced) try out.appendSlice(gpa, word);
-            i = e;
-        } else {
-            try out.append(gpa, line[i]);
-            i += 1;
-        }
-    }
-    return out.toOwnedSlice(gpa);
+fn emitEvent(
+    gpa: Allocator,
+    ec: *EmitCtx,
+    ident: []const u8,
+    kind: EventKind,
+    src_line: u32,
+    tail: []const u8,
+    slab_type: []const u8,
+) !void {
+    if (ec.emit_param_only and !ec.param_set.contains(ident)) return;
+    const gop = try ec.events.getOrPut(ident);
+    if (!gop.found_existing) gop.value_ptr.* = EventList.empty;
+    ec.seq.* += 1;
+    try gop.value_ptr.append(gpa, .{
+        .kind = kind,
+        .src_line = src_line,
+        .seq = ec.seq.*,
+        .tail = tail,
+        .slab_type = slab_type,
+    });
 }
 
-const WalkError = error{ OutOfMemory };
+// Summary build is memoized in ctx.summaries. Cycles return an empty
+// summary placeholder — any slab-typed param still gets listed so the
+// caller's summary lookup finds an entry and doesn't fall through to
+// the "treat call as a raw access" fallback.
+fn getOrBuildSummary(
+    ctx: *Ctx,
+    recv: []const u8,
+    name: []const u8,
+) WalkError!?*Summary {
+    const key = FnKey{ .recv = recv, .name = name };
+    if (ctx.summaries.get(key)) |s| return s;
+    const fi = ctx.fn_index.get(key) orelse return null;
+    // Install an empty placeholder first to break cycles cleanly.
+    const placeholder = try ctx.gpa.create(Summary);
+    placeholder.* = .{
+        .events = &[_]ParamEvent{},
+        .param_types = &[_][]const u8{},
+        .param_names = &[_][]const u8{},
+    };
+    try ctx.summaries.put(key, placeholder);
+
+    // Gather all params of the callee (including non-slab ones; we need
+    // positional alignment so caller arg[i] maps to callee param[i]).
+    const sf = fileByPath(ctx.files, fi.file_path) orelse return placeholder;
+    const toks = ctx.fileTokens(sf);
+    // Re-find the fn header by scanning tokens at fi.line.
+    var hdr: ?FnHeader = null;
+    for (toks, 0..) |t, ti| {
+        if (t.tag != .keyword_fn) continue;
+        var si = ti;
+        if (ti > 0 and toks[ti - 1].tag == .keyword_pub) si = ti - 1;
+        if (toks[si].line != fi.line) continue;
+        if (ti + 1 >= toks.len) continue;
+        if (!mem.eql(u8, tokSlice(sf, toks[ti + 1]), name)) continue;
+        hdr = parseFnHeaderAt(toks, si) orelse continue;
+        break;
+    }
+    if (hdr == null) return placeholder;
+    const params = try parseParamList(ctx.gpa, sf, toks, hdr.?.l_paren_idx, hdr.?.r_paren_idx);
+    defer ctx.gpa.free(params);
+
+    const param_types = try ctx.gpa.alloc([]const u8, params.len);
+    const param_names = try ctx.gpa.alloc([]const u8, params.len);
+
+    var param_set = SliceSet.init(ctx.gpa);
+    defer param_set.deinit();
+
+    var env = SlabEnv.init(ctx.gpa);
+    defer env.deinit();
+
+    for (params, 0..) |pp, pi| {
+        const interned = try ctx.pool.intern(pp.name);
+        param_names[pi] = interned;
+        const ty_opt = parseTypeRef(pp.type_str);
+        if (ty_opt) |ty| if (ctx.slab_types.contains(ty)) {
+            const ty_i = try ctx.pool.intern(ty);
+            param_types[pi] = ty_i;
+            try env.map.put(interned, ty_i);
+            if (mem.indexOf(u8, pp.type_str, "SlabRef") != null) try env.fat.add(interned);
+            try param_set.add(interned);
+            continue;
+        };
+        param_types[pi] = "";
+    }
+
+    var events_map = EventMap.init(ctx.gpa);
+    defer {
+        var it = events_map.valueIterator();
+        while (it.next()) |al| al.deinit(ctx.gpa);
+        events_map.deinit();
+    }
+    var seq: u32 = 0;
+    var ec = EmitCtx{
+        .events = &events_map,
+        .seq = &seq,
+        .param_set = &param_set,
+        .emit_param_only = true,
+    };
+
+    try walkBody(ctx, sf, fi.body_start_line, fi.body_end_line, &env, &ec);
+
+    // Materialize into ParamEvent list.
+    var events = ArrayList(ParamEvent).empty;
+    errdefer events.deinit(ctx.gpa);
+    // Flatten: iterate per-param so callers can match by position cheaply.
+    for (params, 0..) |pp, pi| {
+        if (param_types[pi].len == 0) continue;
+        const interned = try ctx.pool.intern(pp.name);
+        const lst_opt = events_map.getPtr(interned);
+        if (lst_opt == null) continue;
+        for (lst_opt.?.items) |ev| {
+            const tail_i = if (ev.tail.len > 0) try ctx.pool.intern(ev.tail) else "";
+            try events.append(ctx.gpa, .{
+                .kind = switch (ev.kind) {
+                    .access => .access,
+                    .lock => .lock,
+                    .unlock => .unlock,
+                    .defer_unlock => .defer_unlock,
+                    .lock_with_gen => .lock_with_gen,
+                },
+                .param_idx = pi,
+                .order = ev.seq,
+                .tail = tail_i,
+            });
+        }
+    }
+    // Sort by seq so caller folds events in the callee's source order.
+    std.sort.heap(ParamEvent, events.items, {}, lessParamEvent);
+
+    placeholder.events = try events.toOwnedSlice(ctx.gpa);
+    placeholder.param_types = param_types;
+    placeholder.param_names = param_names;
+    return placeholder;
+}
+
+fn lessParamEvent(_: void, a: ParamEvent, b: ParamEvent) bool {
+    return a.order < b.order;
+}
+
+// Fold a callee summary into the caller's events at call-site src_line.
+// `caller_args[i]` is the caller's arg at position i (null when the arg
+// isn't a plain ident). For each param-event on position i, if the
+// caller passed a tracked ident there, emit a matching caller-side
+// event. Non-tracked args cause the callee events on that param to be
+// silently dropped — the caller literally doesn't have a local of that
+// name to bracket-check.
+fn foldSummary(
+    ctx: *Ctx,
+    summary: *const Summary,
+    caller_args: []const ?[]const u8,
+    env: *const SlabEnv,
+    ec: *EmitCtx,
+    src_line: u32,
+) !void {
+    for (summary.events) |pe| {
+        if (pe.param_idx >= caller_args.len) continue;
+        const arg_opt = caller_args[pe.param_idx];
+        if (arg_opt == null) continue;
+        const arg = arg_opt.?;
+        const arg_ty = env.map.get(arg) orelse continue;
+        _ = arg_ty;
+        const kind: EventKind = switch (pe.kind) {
+            .access => .access,
+            .lock => .lock,
+            .unlock => .unlock,
+            .defer_unlock => .defer_unlock,
+            .lock_with_gen => .lock_with_gen,
+        };
+        const slab_ty = env.map.get(arg) orelse "";
+        try emitEvent(ctx.gpa, ec, arg, kind, src_line, pe.tail, slab_ty);
+    }
+}
+
+// -----------------------------------------------------------------
+// walkBody: drive the line-by-line scanner over a function body.
+//
+// Emits events through the EmitCtx. Responsibilities:
+//   * maintain env (decl-introduced locals and their slab types)
+//   * emit lock/unlock/defer-unlock events when it sees a lock op
+//   * emit access events for `.field` / `.method` references
+//   * at each call site, look up the callee summary and fold its
+//     effects into the caller's event timeline at the call-site line
+//
+// It does NOT recurse into callee bodies with the caller's env (that
+// was the inline-expansion mode; gone). Each function body walks once
+// with its OWN env; cross-function effects flow through summaries.
+// -----------------------------------------------------------------
 
 fn walkBody(
     ctx: *Ctx,
-    body_lines: []const []const u8,
-    body_raw_lines: []const []const u8, // for self-alive comment checks
-    body_first_line: u32,
-    src_file_rel: []const u8,
+    sf: *const SourceFile,
+    body_start_line: u32, // 1-based
+    body_end_line: u32, // 1-based, inclusive of closing brace line
     env: *SlabEnv,
-    visited: *VisitedSet,
-    depth: u32,
+    ec: *EmitCtx,
 ) WalkError!void {
     const gpa = ctx.gpa;
-    _ = src_file_rel;
-    _ = body_first_line;
+    if (body_start_line > body_end_line) return;
+    if (body_end_line > sf.stripped_lines.len) return;
+    const start_i: usize = body_start_line - 1;
+    const end_i: usize = body_end_line - 1;
+    if (start_i >= end_i) return;
+    const body_lines = sf.stripped_lines[start_i..end_i];
+    const raw_lines = sf.raw_lines[start_i..end_i];
 
     // Tracker for brace-depth-aware defers.
     const Pending = struct { ident: []const u8, fire_at_depth: i32 };
@@ -2027,38 +2171,25 @@ fn walkBody(
     defer pending_defers.deinit(gpa);
     var brace_depth: i32 = 0;
 
-    for (body_lines, 0..) |raw_line, rel| {
-        ctx.synth.* += 1;
-        const synth = ctx.synth.*;
-        const code = raw_line;
+    for (body_lines, 0..) |line, rel| {
+        const src_line: u32 = body_start_line + @as(u32, @intCast(rel));
+        const code = line;
 
         // for-loop captures: Process.threads is [MAX_THREADS]*Thread.
-        // Pattern: `for (<expr>) |<cap>`.
         if (mem.startsWith(u8, trimAscii(code), "for ") or mem.startsWith(u8, trimAscii(code), "for(")) {
-            // Find `) |` capture.
             if (mem.indexOf(u8, code, ") |")) |bp| {
                 const after = code[bp + 3 ..];
                 var e: usize = 0;
                 while (e < after.len and isIdentChar(after[e])) e += 1;
                 if (e > 0) {
                     const cap = after[0..e];
-                    // Walk array expression between `(` ... `)`.
                     if (mem.indexOfScalar(u8, code, '(')) |lp| {
                         if (bp > lp) {
                             const inner = trimAscii(code[lp + 1 .. bp]);
-                            // Take chain head up to `[` or `.`.
                             var p2: usize = 0;
                             while (p2 < inner.len and isIdentChar(inner[p2])) p2 += 1;
                             const head = inner[0..p2];
                             if (head.len > 0 and env.map.contains(head)) {
-                                // Tail fields. Deliberately naive split:
-                                // mirror the Python analyzer, which splits
-                                // on `.` without tracking bracket depth
-                                // and then strips trailing `[…]` from each
-                                // segment. A range literal inside `[a..b]`
-                                // therefore mis-segments the array expr —
-                                // known Python quirk we emulate to match
-                                // finding counts exactly.
                                 var segments = ArrayList([]const u8).empty;
                                 defer segments.deinit(gpa);
                                 var seg_start: usize = 0;
@@ -2072,12 +2203,9 @@ fn walkBody(
                                 if (seg_start <= inner.len) try segments.append(gpa, inner[seg_start..inner.len]);
                                 var tail_last: ?[]const u8 = null;
                                 if (segments.items.len > 1) {
-                                    const last = segments.items[segments.items.len - 1];
-                                    // Strip first `[` and everything after — we
-                                    // do NOT strip the trailing `]` if no `[`
-                                    // was found (Python: split("[",1)[0]).
-                                    var tt: []const u8 = last;
-                                    if (mem.indexOfScalar(u8, last, '[')) |b| tt = last[0..b];
+                                    const last_seg = segments.items[segments.items.len - 1];
+                                    var tt: []const u8 = last_seg;
+                                    if (mem.indexOfScalar(u8, last_seg, '[')) |b| tt = last_seg[0..b];
                                     tail_last = tt;
                                 }
                                 if (tail_last) |tl| {
@@ -2094,7 +2222,7 @@ fn walkBody(
             }
         }
 
-        // Decl parsing.
+        // Decl parsing (multi-line aware).
         const joined = try joinMultilineDecl(gpa, body_lines, rel);
         defer gpa.free(joined);
         if (parseDeclLine(joined)) |dp_raw| {
@@ -2103,7 +2231,6 @@ fn walkBody(
                 .ann = dp_raw.ann,
                 .rhs = dp_raw.rhs,
             };
-            // SlabRef-fat?
             var is_fat = mem.indexOf(u8, dp.ann, "SlabRef") != null or mem.indexOf(u8, dp.rhs, "SlabRef") != null;
             if (!is_fat) {
                 for (FAT_SLAB_RETURN_NAMES) |fn_name| {
@@ -2113,24 +2240,15 @@ fn walkBody(
                     }
                 }
             }
-
-            // Bare chain `A.B` where (A-type, B) ∈ FAT_YIELDING_FIELDS.
             if (!is_fat) {
                 const rhs_plain = stripPostfix(dp.rhs);
-                // match exact `X.Y`.
                 if (mem.indexOfScalar(u8, rhs_plain, '.')) |dotp| {
                     const head = rhs_plain[0..dotp];
                     const tail = rhs_plain[dotp + 1 ..];
                     var all_ident_h = head.len > 0;
-                    for (head) |c| if (!isIdentChar(c)) {
-                        all_ident_h = false;
-                        break;
-                    };
+                    for (head) |c| if (!isIdentChar(c)) { all_ident_h = false; break; };
                     var all_ident_t = tail.len > 0;
-                    for (tail) |c| if (!isIdentChar(c)) {
-                        all_ident_t = false;
-                        break;
-                    };
+                    for (tail) |c| if (!isIdentChar(c)) { all_ident_t = false; break; };
                     if (all_ident_h and all_ident_t) {
                         if (env.map.get(head)) |head_ty| {
                             if (isFatYieldingField(head_ty, tail)) is_fat = true;
@@ -2139,20 +2257,15 @@ fn walkBody(
                 }
             }
 
-            // `<fat_ident>.lock()` alias.
             var lock_alias_ref: ?[]const u8 = null;
             {
                 const rhs_plain = stripPostfix(dp.rhs);
-                // exact `X.lock()`.
                 if (mem.indexOfScalar(u8, rhs_plain, '.')) |dotp| {
                     const head = rhs_plain[0..dotp];
                     const tail = rhs_plain[dotp + 1 ..];
                     if (mem.eql(u8, tail, "lock()")) {
                         var all_ident_h = head.len > 0;
-                        for (head) |c| if (!isIdentChar(c)) {
-                            all_ident_h = false;
-                            break;
-                        };
+                        for (head) |c| if (!isIdentChar(c)) { all_ident_h = false; break; };
                         if (all_ident_h and env.fat.contains(head)) {
                             lock_alias_ref = head;
                         }
@@ -2160,7 +2273,6 @@ fn walkBody(
                 }
             }
 
-            // Resolve type.
             var resolved: ?[]const u8 = null;
             if (lock_alias_ref) |lr| {
                 if (env.map.get(lr)) |lrty| {
@@ -2178,18 +2290,14 @@ fn walkBody(
                 }
             }
             if (resolved == null) {
-                // fn-return type via fn_index.
-                // Match: leading `<name(.name)*>(<first_arg>`
                 const rhs_plain = stripPostfix(dp.rhs);
                 if (rhs_plain.len > 0 and isIdentStart(rhs_plain[0])) {
                     var pp: usize = 0;
                     while (pp < rhs_plain.len and (isIdentChar(rhs_plain[pp]) or rhs_plain[pp] == '.')) pp += 1;
                     if (pp < rhs_plain.len and rhs_plain[pp] == '(') {
                         const fq = rhs_plain[0..pp];
-                        // fn_name = part after last dot.
                         var fn_nm: []const u8 = fq;
                         if (mem.lastIndexOfScalar(u8, fq, '.')) |lastd| fn_nm = fq[lastd + 1 ..];
-                        // first arg ident.
                         var p2 = pp + 1;
                         while (p2 < rhs_plain.len and ascii.isWhitespace(rhs_plain[p2])) p2 += 1;
                         var e2 = p2;
@@ -2208,7 +2316,6 @@ fn walkBody(
                 }
             }
 
-            // Liveness tracking.
             var became_self_alive = false;
             for (SELF_ALIVE_HELPERS) |helper| {
                 if (containsCall(dp.rhs, helper)) {
@@ -2218,7 +2325,6 @@ fn walkBody(
                 }
             }
             if (!became_self_alive) {
-                // single-ident chain head in self_alive?
                 const chain_opt = try leadingChain(gpa, dp.rhs);
                 if (chain_opt) |chain| {
                     defer gpa.free(chain);
@@ -2243,14 +2349,12 @@ fn walkBody(
                 if (lock_alias_ref != null) try env.self_alive.add(dp.name);
             }
 
-            // Explicit self-alive comment.
             if (!became_self_alive) {
-                if (declHasSelfAlive(body_raw_lines, rel)) try env.self_alive.add(dp.name);
+                if (declHasSelfAlive(raw_lines, rel)) try env.self_alive.add(dp.name);
             }
         }
 
         // Refcount-pin detector.
-        // Pattern: `defer <ident>.releaseRef()` or `.decRef()`.
         {
             const t = trimAscii(code);
             if (mem.startsWith(u8, t, "defer ")) {
@@ -2267,7 +2371,7 @@ fn walkBody(
             }
         }
 
-        // Lock-op detection: `ident._gen_lock.<op>` first.
+        // Lock-op detection: `ident._gen_lock.<op>`.
         {
             const lg = "._gen_lock.";
             var pos: usize = 0;
@@ -2275,15 +2379,10 @@ fn walkBody(
                 const idx_opt = mem.indexOf(u8, code[pos..], lg);
                 if (idx_opt == null) break;
                 const idx = pos + idx_opt.?;
-                // walk back for ident.
                 var sidx: usize = idx;
                 while (sidx > 0 and isIdentChar(code[sidx - 1])) sidx -= 1;
-                if (sidx == idx) {
-                    pos = idx + lg.len;
-                    continue;
-                }
+                if (sidx == idx) { pos = idx + lg.len; continue; }
                 const ident = code[sidx..idx];
-                // op after prefix:
                 const op_start = idx + lg.len;
                 var op_end = op_start;
                 while (op_end < code.len and isIdentChar(code[op_end])) op_end += 1;
@@ -2292,41 +2391,14 @@ fn walkBody(
                 const is_unlock = mem.eql(u8, op_name, "unlock");
                 const is_lwg = mem.eql(u8, op_name, "lockWithGen");
                 if ((is_lock or is_unlock or is_lwg) and env.map.contains(ident)) {
-                    // Detect defer — find `defer <ident>._gen_lock.` earlier on same line.
-                    const is_defer = blk: {
-                        // Search for `defer <ident>._gen_lock.`.
-                        // Construct the pattern inline.
-                        var search_pos: usize = 0;
-                        while (search_pos < code.len) {
-                            const p = mem.indexOf(u8, code[search_pos..], "defer ") orelse break;
-                            const abs = search_pos + p;
-                            const rest = trimAscii(code[abs + 6 ..]);
-                            if (rest.len >= ident.len and
-                                mem.eql(u8, rest[0..ident.len], ident) and
-                                rest.len > ident.len and rest[ident.len] == '.')
-                            {
-                                // Matched.
-                                break :blk true;
-                            }
-                            search_pos = abs + 6;
-                        }
-                        break :blk false;
-                    };
-                    const op_kind: LockOpKind = if (is_defer and is_unlock)
+                    const is_defer = isDeferFor(code, ident);
+                    const kind: EventKind = if (is_defer and is_unlock)
                         .defer_unlock
-                    else if (is_lock)
-                        .lock
-                    else if (is_unlock)
-                        .unlock
-                    else
-                        .lock_with_gen;
+                    else if (is_lock) .lock
+                    else if (is_unlock) .unlock
+                    else .lock_with_gen;
                     const ident_i = try ctx.pool.intern(ident);
-                    try ctx.lock_ops.append(gpa, .{
-                        .line_no = synth,
-                        .ident = ident_i,
-                        .op = op_kind,
-                        .src_line = @intCast(rel),
-                    });
+                    try emitEvent(gpa, ec, ident_i, kind, src_line, "", env.map.get(ident) orelse "");
                     if (is_defer and is_unlock) {
                         try pending_defers.append(gpa, .{ .ident = ident_i, .fire_at_depth = brace_depth });
                     }
@@ -2339,7 +2411,6 @@ fn walkBody(
         {
             var pos: usize = 0;
             while (pos < code.len) {
-                // Find `.lock(` or `.unlock(`.
                 const lock_p = mem.indexOf(u8, code[pos..], ".lock(");
                 const unlock_p = mem.indexOf(u8, code[pos..], ".unlock(");
                 var hit: ?usize = null;
@@ -2356,62 +2427,31 @@ fn walkBody(
                 }
                 if (hit == null) break;
                 const at = hit.?;
-                // The `.` we found could be part of `.?.lock(` — in that case we want the ident before `.?`.
-                const eidx: usize = at;
-                // Check for `.?` before the lock.
                 var leader_end: usize = at;
                 if (at >= 2 and code[at - 2] == '.' and code[at - 1] == '?') {
                     leader_end = at - 2;
                 }
-                // ident chars backwards from leader_end.
                 var sidx: usize = leader_end;
                 while (sidx > 0 and isIdentChar(code[sidx - 1])) sidx -= 1;
-                if (sidx == leader_end) {
-                    pos = at + skip;
-                    continue;
-                }
+                if (sidx == leader_end) { pos = at + skip; continue; }
                 const ident = code[sidx..leader_end];
                 if (env.map.contains(ident) and env.fat.contains(ident)) {
-                    // Detect defer — search `defer <ident>(\.\?)?\.`.
-                    const is_defer = blk: {
-                        var sp: usize = 0;
-                        while (sp < code.len) {
-                            const p = mem.indexOf(u8, code[sp..], "defer ") orelse break;
-                            const abs = sp + p;
-                            const rest = trimAscii(code[abs + 6 ..]);
-                            if (rest.len >= ident.len and mem.eql(u8, rest[0..ident.len], ident)) {
-                                var k = ident.len;
-                                if (k + 2 <= rest.len and rest[k] == '.' and rest[k + 1] == '?') k += 2;
-                                if (k < rest.len and rest[k] == '.') break :blk true;
-                            }
-                            sp = abs + 6;
-                        }
-                        break :blk false;
-                    };
-                    const op_kind: LockOpKind = if (is_defer and mem.eql(u8, op_name, "unlock"))
+                    const is_defer = isDeferForFat(code, ident);
+                    const kind: EventKind = if (is_defer and mem.eql(u8, op_name, "unlock"))
                         .defer_unlock
-                    else if (mem.eql(u8, op_name, "lock"))
-                        .lock
-                    else
-                        .unlock;
+                    else if (mem.eql(u8, op_name, "lock")) .lock
+                    else .unlock;
                     const ident_i = try ctx.pool.intern(ident);
-                    try ctx.lock_ops.append(gpa, .{
-                        .line_no = synth,
-                        .ident = ident_i,
-                        .op = op_kind,
-                        .src_line = @intCast(rel),
-                    });
+                    try emitEvent(gpa, ec, ident_i, kind, src_line, "", env.map.get(ident) orelse "");
                     if (is_defer and mem.eql(u8, op_name, "unlock")) {
                         try pending_defers.append(gpa, .{ .ident = ident_i, .fire_at_depth = brace_depth });
                     }
                 }
-                _ = eidx;
                 pos = at + skip;
             }
         }
 
         // Access + call-site scanning.
-        // atomic spans.
         const atomic_spans = try atomicCallSpans(gpa, code);
         defer gpa.free(atomic_spans);
 
@@ -2421,22 +2461,14 @@ fn walkBody(
         var call_spans = ArrayList(AS).empty;
         defer call_spans.deinit(gpa);
 
-        // Walk every `<ident>[(.\?)].<tail>`.
         {
             var p: usize = 0;
             while (p < code.len) {
-                if (!isIdentStart(code[p])) {
-                    p += 1;
-                    continue;
-                }
-                if (p > 0 and (isIdentChar(code[p - 1]) or code[p - 1] == '.')) {
-                    p += 1;
-                    continue;
-                }
+                if (!isIdentStart(code[p])) { p += 1; continue; }
+                if (p > 0 and (isIdentChar(code[p - 1]) or code[p - 1] == '.')) { p += 1; continue; }
                 var e = p;
                 while (e < code.len and isIdentChar(code[e])) e += 1;
                 const ident = code[p..e];
-                // Optional `.?` then `.<tail>`.
                 var cursor = e;
                 if (cursor + 2 <= code.len and code[cursor] == '.' and code[cursor + 1] == '?') cursor += 2;
                 if (cursor < code.len and code[cursor] == '.') {
@@ -2444,20 +2476,13 @@ fn walkBody(
                     while (te < code.len and isIdentChar(code[te])) te += 1;
                     if (te > cursor + 1) {
                         const tail = code[cursor + 1 .. te];
-                        // Only care if ident in env.
                         if (env.map.contains(ident) and !mem.eql(u8, tail, "_gen_lock")) {
-                            // skip if inside atomic span.
                             var in_atomic = false;
                             for (atomic_spans) |sp| {
-                                if (p >= sp[0] and p < sp[1]) {
-                                    in_atomic = true;
-                                    break;
-                                }
+                                if (p >= sp[0] and p < sp[1]) { in_atomic = true; break; }
                             }
                             if (!in_atomic) {
-                                // Atomic method invocation at cursor?
                                 if (!isAtomicMethodAt(code, cursor)) {
-                                    // SlabRef .lock/.unlock on fat ident: already a lock op.
                                     const skip_as_lock =
                                         env.fat.contains(ident) and
                                         (mem.eql(u8, tail, "lock") or mem.eql(u8, tail, "unlock")) and
@@ -2480,259 +2505,192 @@ fn walkBody(
             }
         }
 
-        // Free-function calls passing slab ident as first arg:
-        // pattern `<name (.name)*>(<first_arg>` where first_arg ∈ env.
-        // We already handled receiver-style; now look for plain fn calls.
-        // For each occurrence in code of `<fn>\s*\(`, record first arg.
-        const Free = struct { fn_name: []const u8, first_arg: []const u8 };
+        // Free-fn calls passing slab ident as first arg.
+        const Free = struct { fn_name: []const u8, first_arg: []const u8, open_p: usize };
         var free_call_spans = ArrayList(Free).empty;
         defer free_call_spans.deinit(gpa);
         {
             var p: usize = 0;
             while (p < code.len) {
-                if (!isIdentStart(code[p])) {
-                    p += 1;
-                    continue;
-                }
-                if (p > 0 and (isIdentChar(code[p - 1]) or code[p - 1] == '.')) {
-                    p += 1;
-                    continue;
-                }
+                if (!isIdentStart(code[p])) { p += 1; continue; }
+                if (p > 0 and (isIdentChar(code[p - 1]) or code[p - 1] == '.')) { p += 1; continue; }
                 var e = p;
                 while (e < code.len and (isIdentChar(code[e]) or code[e] == '.')) e += 1;
                 const fq = code[p..e];
-                if (fq.len == 0 or !isIdentStart(fq[0])) {
-                    p = e + 1;
-                    continue;
-                }
-                if (fq[0] == '@' or mem.startsWith(u8, fq, "std.") or mem.eql(u8, fq, "return")) {
+                if (fq.len == 0 or !isIdentStart(fq[0])) { p = e + 1; continue; }
+                if (fq[0] == '@' or mem.startsWith(u8, fq, "std.") or isKeywordOrNotCall(fq)) {
                     p = e;
                     continue;
                 }
-                // Skip if whole fq is just `<ident>` (no dot); that's possibly a bare ident access already.
-                // But Python accepts bare `<helper>(...)` fn as a free call too, so keep.
-                // Must be followed by `(`.
                 var q = e;
                 while (q < code.len and ascii.isWhitespace(code[q])) q += 1;
-                if (q >= code.len or code[q] != '(') {
-                    p = e;
-                    continue;
-                }
-                // skip method-call style: chain.count(".") == 1 and head in env → it's a receiver-style.
+                if (q >= code.len or code[q] != '(') { p = e; continue; }
                 var dot_count: usize = 0;
-                for (fq) |c| if (c == '.') {
-                    dot_count += 1;
-                };
+                for (fq) |c| {
+                    if (c == '.') dot_count += 1;
+                }
                 const head = blk: {
                     if (mem.indexOfScalar(u8, fq, '.')) |d| break :blk fq[0..d];
                     break :blk fq;
                 };
-                if (env.map.contains(head) and dot_count == 1) {
-                    p = e;
-                    continue;
-                }
-                // First arg.
+                if (env.map.contains(head) and dot_count == 1) { p = e; continue; }
                 var ap = q + 1;
                 while (ap < code.len and ascii.isWhitespace(code[ap])) ap += 1;
                 var ae = ap;
                 while (ae < code.len and isIdentChar(code[ae])) ae += 1;
-                if (ae == ap) {
-                    p = e;
-                    continue;
-                }
+                if (ae == ap) { p = e; continue; }
                 const fa = code[ap..ae];
-                if (!env.map.contains(fa)) {
-                    p = e;
-                    continue;
-                }
-                // fn_name = last segment.
+                if (!env.map.contains(fa)) { p = e; continue; }
                 var fn_name = fq;
                 if (mem.lastIndexOfScalar(u8, fq, '.')) |ld| fn_name = fq[ld + 1 ..];
-                try free_call_spans.append(gpa, .{ .fn_name = fn_name, .first_arg = fa });
+                try free_call_spans.append(gpa, .{ .fn_name = fn_name, .first_arg = fa, .open_p = q });
                 p = e;
             }
         }
 
-        // Emit access entries.
+        // Emit direct accesses (no known callee summary involvement).
         for (access_spans.items) |as| {
             const ident_i = try ctx.pool.intern(as.ident);
             const tail_i = try ctx.pool.intern(as.tail);
-            const list = try ctx.accesses.getOrPut(ident_i);
-            if (!list.found_existing) list.value_ptr.* = ArrayList(Access).empty;
-            try list.value_ptr.append(gpa, .{
-                .line_no = synth,
-                .col = @intCast(as.start),
-                .ident = ident_i,
-                .tail = tail_i,
-                .slab_type = env.map.get(ident_i) orelse "",
-                .src_line = @intCast(rel + 1),
-            });
+            try emitEvent(gpa, ec, ident_i, .access, src_line, tail_i, env.map.get(ident_i) orelse "");
         }
 
-        // Inline method calls.
+        // Method call sites: .<name>(. Resolve via (recv_type, name).
         for (call_spans.items) |cs| {
             const recv_ty = env.map.get(cs.ident) orelse continue;
-            const key = FnKey{ .recv = recv_ty, .name = cs.tail };
-            const fi_opt = ctx.fn_index.get(key);
-            if (fi_opt == null) {
-                // Fallback: record call as access.
+            const summary_opt = try getOrBuildSummary(ctx, recv_ty, cs.tail);
+            if (summary_opt == null) {
+                // Unknown callee — treat as raw access on the ident.
                 const ident_i = try ctx.pool.intern(cs.ident);
                 const tail_i = try ctx.pool.intern(cs.tail);
-                const list = try ctx.accesses.getOrPut(ident_i);
-                if (!list.found_existing) list.value_ptr.* = ArrayList(Access).empty;
-                try list.value_ptr.append(gpa, .{
-                    .line_no = synth,
-                    .col = @intCast(cs.start),
-                    .ident = ident_i,
-                    .tail = tail_i,
-                    .slab_type = recv_ty,
-                    .src_line = @intCast(rel + 1),
-                });
+                try emitEvent(gpa, ec, ident_i, .access, src_line, tail_i, recv_ty);
                 continue;
             }
-            const fi = fi_opt.?;
-            if (visited.contains(.{ .recv = recv_ty, .name = cs.tail })) continue;
-            if (depth >= MAX_INLINE_DEPTH) continue;
-
-            // Extract caller args from `(` at cs.end.
-            const open_p = cs.end;
+            const summary = summary_opt.?;
+            // Parse args at cs.end.
             var caller_args = ArrayList(?[]const u8).empty;
             defer caller_args.deinit(gpa);
-            if (open_p < code.len and code[open_p] == '(') {
-                try parseCallArgs(gpa, code, open_p, &caller_args);
+            if (cs.end < code.len and code[cs.end] == '(') {
+                try parseCallArgs(gpa, ctx.pool, code, cs.end, &caller_args);
             }
-
-            // Build subs.
-            var subs = ArrayList(Sub).empty;
-            defer subs.deinit(gpa);
-            try subs.append(gpa, .{ .from = fi.first_param, .to = cs.ident });
-            for (fi.other_params, 0..) |pp, i| {
-                if (i >= caller_args.items.len) break;
-                if (caller_args.items[i]) |ca| {
-                    try subs.append(gpa, .{ .from = pp.name, .to = ca });
-                }
-            }
-
-            try inlineBody(ctx, fi, subs.items, env, visited, depth + 1, recv_ty, cs.tail, cs.ident);
+            // Pos 0 = receiver (cs.ident), interned so it survives past
+            // the scratch buffers parseCallArgs writes into; then args.
+            var all_args = ArrayList(?[]const u8).empty;
+            defer all_args.deinit(gpa);
+            try all_args.append(gpa, try ctx.pool.intern(cs.ident));
+            for (caller_args.items) |ca| try all_args.append(gpa, ca);
+            try foldSummary(ctx, summary, all_args.items, env, ec, src_line);
         }
 
-        // Inline free-function calls.
+        // Free-fn call sites.
         for (free_call_spans.items) |fc| {
             const recv_ty = env.map.get(fc.first_arg) orelse continue;
-            const key = FnKey{ .recv = recv_ty, .name = fc.fn_name };
-            const fi_opt = ctx.fn_index.get(key);
-            if (fi_opt == null) {
+            const summary_opt = try getOrBuildSummary(ctx, recv_ty, fc.fn_name);
+            if (summary_opt == null) {
                 const ident_i = try ctx.pool.intern(fc.first_arg);
                 const tail_i = try ctx.pool.intern(fc.fn_name);
-                const list = try ctx.accesses.getOrPut(ident_i);
-                if (!list.found_existing) list.value_ptr.* = ArrayList(Access).empty;
-                try list.value_ptr.append(gpa, .{
-                    .line_no = synth,
-                    .col = 0,
-                    .ident = ident_i,
-                    .tail = tail_i,
-                    .slab_type = recv_ty,
-                    .src_line = @intCast(rel + 1),
-                });
+                try emitEvent(gpa, ec, ident_i, .access, src_line, tail_i, recv_ty);
                 continue;
             }
-            const fi = fi_opt.?;
-            if (visited.contains(.{ .recv = recv_ty, .name = fc.fn_name })) continue;
-            if (depth >= MAX_INLINE_DEPTH) continue;
-
-            // Find the `(` matching this call.
-            var open_p: ?usize = null;
-            {
-                var pp: usize = 0;
-                while (pp < code.len) : (pp += 1) {
-                    const idx_opt = indexOfWord(code[pp..], fc.fn_name);
-                    if (idx_opt == null) break;
-                    const abs = pp + idx_opt.?;
-                    var q = abs + fc.fn_name.len;
-                    while (q < code.len and ascii.isWhitespace(code[q])) q += 1;
-                    if (q < code.len and code[q] == '(') {
-                        open_p = q;
-                        break;
-                    }
-                    pp = abs + fc.fn_name.len;
-                }
-            }
-
+            const summary = summary_opt.?;
             var caller_args = ArrayList(?[]const u8).empty;
             defer caller_args.deinit(gpa);
-            if (open_p) |op| try parseCallArgs(gpa, code, op, &caller_args);
-
-            var subs = ArrayList(Sub).empty;
-            defer subs.deinit(gpa);
-            if (caller_args.items.len > 0 and caller_args.items[0] != null and
-                mem.eql(u8, caller_args.items[0].?, fc.first_arg))
-            {
-                try subs.append(gpa, .{ .from = fi.first_param, .to = fc.first_arg });
-                for (fi.other_params, 0..) |pp, i| {
-                    const ci = i + 1;
-                    if (ci >= caller_args.items.len) break;
-                    if (caller_args.items[ci]) |ca| try subs.append(gpa, .{ .from = pp.name, .to = ca });
-                }
-            } else {
-                for (fi.other_params, 0..) |pp, i| {
-                    if (i >= caller_args.items.len) break;
-                    if (caller_args.items[i]) |ca| try subs.append(gpa, .{ .from = pp.name, .to = ca });
-                }
-            }
-
-            try inlineBody(ctx, fi, subs.items, env, visited, depth + 1, recv_ty, fc.fn_name, fc.first_arg);
+            try parseCallArgs(gpa, ctx.pool, code, fc.open_p, &caller_args);
+            try foldSummary(ctx, summary, caller_args.items, env, ec, src_line);
         }
 
         // End-of-line brace tracking + defer fires.
         var in_str = false;
         var esc = false;
         for (code) |c| {
-            if (esc) {
-                esc = false;
-                continue;
-            }
-            if (c == '\\' and in_str) {
-                esc = true;
-                continue;
-            }
-            if (c == '"') {
-                in_str = !in_str;
-                continue;
-            }
+            if (esc) { esc = false; continue; }
+            if (c == '\\' and in_str) { esc = true; continue; }
+            if (c == '"') { in_str = !in_str; continue; }
             if (in_str) continue;
             if (c == '{') brace_depth += 1;
             if (c == '}') brace_depth -= 1;
         }
-        // fire pending defers whose fire_at_depth > brace_depth.
         var i: isize = @as(isize, @intCast(pending_defers.items.len)) - 1;
         while (i >= 0) : (i -= 1) {
             const pd = pending_defers.items[@intCast(i)];
             if (brace_depth < pd.fire_at_depth) {
-                try ctx.lock_ops.append(gpa, .{
-                    .line_no = synth,
-                    .ident = pd.ident,
-                    .op = .unlock,
-                    .src_line = 0,
-                });
+                try emitEvent(gpa, ec, pd.ident, .unlock, src_line, "", env.map.get(pd.ident) orelse "");
                 _ = pending_defers.orderedRemove(@intCast(i));
             }
         }
     }
 
-    // End-of-body fire.
+    // End-of-body fire: any remaining pending defers release at the last
+    // body line — this matches the Python tool's behavior where an implicit
+    // scope exit at the closing brace releases the defer.
     while (pending_defers.items.len > 0) {
         const pd = pending_defers.pop().?;
-        try ctx.lock_ops.append(gpa, .{
-            .line_no = ctx.synth.*,
-            .ident = pd.ident,
-            .op = .unlock,
-            .src_line = 0,
-        });
+        try emitEvent(gpa, ec, pd.ident, .unlock, body_end_line, "", env.map.get(pd.ident) orelse "");
     }
 }
 
+// Zig keywords / pseudo-keywords that look like `name(` but aren't
+// function calls we can summarize. Filtering these out stops the
+// free-fn detector from treating `if (caller_ref)` as a call to a
+// helper named `if` — the old analyzer leaked this as a ghost access
+// event before inlining was turned off.
+fn isKeywordOrNotCall(fq: []const u8) bool {
+    const kws = [_][]const u8{
+        "return",  "if",      "while",    "for",   "switch",
+        "defer",   "errdefer","try",      "catch", "orelse",
+        "break",   "continue","comptime", "nosuspend",
+        "suspend", "resume",  "async",    "await", "inline",
+        "unreachable","and", "or",        "not",
+    };
+    for (kws) |k| if (mem.eql(u8, fq, k)) return true;
+    return false;
+}
+
+// Helper: detect `defer <ident>._gen_lock.` earlier on this line.
+fn isDeferFor(code: []const u8, ident: []const u8) bool {
+    var search_pos: usize = 0;
+    while (search_pos < code.len) {
+        const p = mem.indexOf(u8, code[search_pos..], "defer ") orelse break;
+        const abs = search_pos + p;
+        const rest = trimAscii(code[abs + 6 ..]);
+        if (rest.len >= ident.len and
+            mem.eql(u8, rest[0..ident.len], ident) and
+            rest.len > ident.len and rest[ident.len] == '.')
+        {
+            return true;
+        }
+        search_pos = abs + 6;
+    }
+    return false;
+}
+
+// Helper: detect `defer <ident>(\.\?)?\.`.
+fn isDeferForFat(code: []const u8, ident: []const u8) bool {
+    var sp: usize = 0;
+    while (sp < code.len) {
+        const p = mem.indexOf(u8, code[sp..], "defer ") orelse break;
+        const abs = sp + p;
+        const rest = trimAscii(code[abs + 6 ..]);
+        if (rest.len >= ident.len and mem.eql(u8, rest[0..ident.len], ident)) {
+            var k = ident.len;
+            if (k + 2 <= rest.len and rest[k] == '.' and rest[k + 1] == '?') k += 2;
+            if (k < rest.len and rest[k] == '.') return true;
+        }
+        sp = abs + 6;
+    }
+    return false;
+}
+
+// Parse the arg list starting at `open_paren_pos` (a '(' in `code`).
+// For each arg, extract the bare-ident form via argToIdent and push an
+// interned (pool-owned) slice or null into `out`. Interning matters
+// because the scratch buffer we accumulate each arg into is reused
+// across commas, and nothing in the caller chain keeps cur alive —
+// without the pool copy, slices would dangle the instant parseCallArgs
+// returns.
 fn parseCallArgs(
     gpa: Allocator,
+    pool: *Pool,
     code: []const u8,
     open_paren_pos: usize,
     out: *ArrayList(?[]const u8),
@@ -2751,18 +2709,23 @@ fn parseCallArgs(
             depth -= 1;
             if (depth == 0) {
                 if (trimAscii(cur.items).len > 0) {
-                    try out.append(gpa, argToIdent(cur.items));
+                    try out.append(gpa, try internArgIdent(pool, cur.items));
                 }
                 return;
             }
             try cur.append(gpa, c);
         } else if (c == ',' and depth == 1) {
-            try out.append(gpa, argToIdent(cur.items));
+            try out.append(gpa, try internArgIdent(pool, cur.items));
             cur.clearRetainingCapacity();
         } else {
             if (depth >= 1) try cur.append(gpa, c);
         }
     }
+}
+
+fn internArgIdent(pool: *Pool, bytes: []const u8) !?[]const u8 {
+    const id = argToIdent(bytes) orelse return null;
+    return try pool.intern(id);
 }
 
 fn argToIdent(s: []const u8) ?[]const u8 {
@@ -2773,66 +2736,6 @@ fn argToIdent(s: []const u8) ?[]const u8 {
     return t;
 }
 
-fn inlineBody(
-    ctx: *Ctx,
-    fi: *const FnInfo,
-    subs: []const Sub,
-    env: *SlabEnv,
-    visited: *VisitedSet,
-    new_depth: u32,
-    recv_ty: []const u8,
-    fn_name: []const u8,
-    recv_ident: []const u8,
-) WalkError!void {
-    const gpa = ctx.gpa;
-    // Find the source file.
-    const sf = fileByPath(ctx.files, fi.file_path) orelse return;
-    // Extract body lines range [body_start_line-1 .. body_end_line-1].
-    const start_i: usize = fi.body_start_line - 1;
-    const end_i: usize = fi.body_end_line - 1;
-    if (start_i > end_i or end_i >= sf.stripped_lines.len) return;
-    const n = end_i - start_i; // exclusive of the closing-brace line
-    // Apply substitutions to produce a rewritten per-line view.
-    // To keep substrings stable during the walk, we allocate a rewritten
-    // buffer per line and keep a matching raw view pointing at the same
-    // lines of sf.raw_lines (no substitution on raw — only needed for
-    // self-alive comment detection, which is position-insensitive to
-    // names).
-    var rewritten = try gpa.alloc([]u8, n);
-    defer {
-        for (rewritten) |r| gpa.free(r);
-        gpa.free(rewritten);
-    }
-    for (0..n) |l| {
-        rewritten[l] = try applySubsToLine(gpa, sf.stripped_lines[start_i + l], subs);
-    }
-    var rewritten_view = try gpa.alloc([]const u8, n);
-    defer gpa.free(rewritten_view);
-    for (0..n) |l| rewritten_view[l] = rewritten[l];
-    const raw_view = sf.raw_lines[start_i..end_i];
-
-    // Fork env.
-    var sub_env = try env.clone(gpa);
-    defer sub_env.deinit();
-    try sub_env.map.put(try ctx.pool.intern(recv_ident), recv_ty);
-
-    var new_visited = VisitedSet.init(gpa);
-    defer new_visited.deinit();
-    var vit = visited.keyIterator();
-    while (vit.next()) |k| try new_visited.put(k.*, {});
-    try new_visited.put(.{ .recv = recv_ty, .name = fn_name }, {});
-
-    try walkBody(
-        ctx,
-        rewritten_view,
-        raw_view,
-        fi.body_start_line,
-        sf.rel_path,
-        &sub_env,
-        &new_visited,
-        new_depth,
-    );
-}
 
 // -----------------------------------------------------------------
 // Bracket check & reporting
@@ -2845,30 +2748,23 @@ fn analyzeEntry(
     ctx_tokens: []const []const Tok,
     slab_types: *const SlabTypeMap,
     fn_index: *FnIndex,
+    summaries: *SummaryMap,
     entry: *const EntryPoint,
     out_env: *SlabEnv,
-    out_accesses: *StringHashMap(ArrayList(Access)),
-    out_lock_ops: *ArrayList(LockOp),
+    out_events: *EventMap,
 ) !void {
-    // Seed env from the fn header's params.
     const sf = fileByPath(ctx_files, entry.file_path) orelse return;
-    const toks_opt = blk: {
-        for (ctx_files, ctx_tokens) |f, t| if (f == sf) break :blk t;
-        break :blk &[_]Tok{};
-    };
-    _ = toks_opt;
-
-    // Find the function header token by scanning for a fn at entry.line.
     const toks = blk: {
         for (ctx_files, ctx_tokens) |f, t| if (f == sf) break :blk t;
         break :blk @as([]const Tok, &.{});
     };
+
+    // Find the function header.
     var hdr: ?FnHeader = null;
     for (toks, 0..) |t, ti| {
         if (t.tag != .keyword_fn) continue;
         var start_i = ti;
         if (ti > 0 and toks[ti - 1].tag == .keyword_pub) start_i = ti - 1;
-        // Name at ti+1.
         if (ti + 1 >= toks.len) continue;
         const name = tokSlice(sf, toks[ti + 1]);
         if (!mem.eql(u8, name, entry.name)) continue;
@@ -2880,7 +2776,7 @@ fn analyzeEntry(
 
     const is_syscall_entry = mem.startsWith(u8, entry.name, "sys");
 
-    // Parse param list and seed env.
+    // Seed env from the fn header params.
     const params = try parseParamList(gpa, sf, toks, hdr.?.l_paren_idx, hdr.?.r_paren_idx);
     defer gpa.free(params);
     for (params) |pp| {
@@ -2897,8 +2793,6 @@ fn analyzeEntry(
         }
     }
 
-    // Walk body.
-    var synth: u32 = 0;
     var ctx = Ctx{
         .gpa = gpa,
         .pool = pool,
@@ -2906,161 +2800,164 @@ fn analyzeEntry(
         .tokens_per_file = ctx_tokens,
         .slab_types = slab_types,
         .fn_index = fn_index,
-        .accesses = out_accesses,
-        .lock_ops = out_lock_ops,
-        .synth = &synth,
+        .summaries = summaries,
     };
-    const start_i: usize = entry.body_start_line - 1;
-    const end_i: usize = entry.body_end_line - 1;
-    if (start_i > end_i or end_i >= sf.stripped_lines.len) return;
-    const body = sf.stripped_lines[start_i..end_i];
-    const raw = sf.raw_lines[start_i..end_i];
-    // Need [][]const u8 view.
-    const view = try gpa.alloc([]const u8, body.len);
-    defer gpa.free(view);
-    for (body, 0..) |b, i| view[i] = b;
 
-    var visited = VisitedSet.init(gpa);
-    defer visited.deinit();
+    var seq: u32 = 0;
+    var empty_set = SliceSet.init(gpa);
+    defer empty_set.deinit();
+    var ec = EmitCtx{
+        .events = out_events,
+        .seq = &seq,
+        .param_set = &empty_set,
+        .emit_param_only = false,
+    };
 
-    try walkBody(
-        &ctx,
-        view,
-        raw,
-        entry.body_start_line,
-        sf.rel_path,
-        out_env,
-        &visited,
-        0,
-    );
+    try walkBody(&ctx, sf, entry.body_start_line, entry.body_end_line, out_env, &ec);
 }
 
 const CheckResult = struct {
     entry: *const EntryPoint,
     env: SlabEnv,
-    accesses: StringHashMap(ArrayList(Access)),
-    lock_ops: ArrayList(LockOp),
+    events: EventMap,
     findings: ArrayList(Finding),
 
     fn deinit(self: *CheckResult, gpa: Allocator) void {
-        var it = self.accesses.valueIterator();
+        var it = self.events.valueIterator();
         while (it.next()) |al| al.deinit(gpa);
-        self.accesses.deinit();
-        self.lock_ops.deinit(gpa);
+        self.events.deinit();
         for (self.findings.items) |f| gpa.free(f.message);
         self.findings.deinit(gpa);
         self.env.deinit();
     }
 };
 
+// Bracket check is event-based: for each ident with any access events,
+// locate the first access and verify the immediately-preceding event (by
+// insertion order within the entry's walk) is a lock/lock_with_gen or a
+// defer_unlock whose predecessor is a lock. Likewise verify the
+// immediately-following event is an unlock (or that a defer-unlock
+// covers).
+//
+// Line numbers reported back to the developer are REAL source lines
+// from the caller file — the new walker never generates synthetic ones.
 fn bracketCheck(gpa: Allocator, res: *CheckResult) !void {
-    // Iterate all idents with accesses.
-    var it = res.accesses.iterator();
+    var it = res.events.iterator();
     while (it.next()) |kv| {
         const ident = kv.key_ptr.*;
-        const accs = kv.value_ptr.items;
-        if (accs.len == 0) continue;
+        const events = kv.value_ptr.items;
+        if (events.len == 0) continue;
         if (res.env.self_alive.contains(ident)) continue;
 
-        const slab_ty = if (accs[0].slab_type.len > 0) accs[0].slab_type
-            else (res.env.map.get(ident) orelse "?");
-        // Dedup access line numbers.
-        var lines = ArrayList(u32).empty;
-        defer lines.deinit(gpa);
+        // Find access event indices and line set.
+        var access_idxs = ArrayList(usize).empty;
+        defer access_idxs.deinit(gpa);
+        var access_lines = ArrayList(u32).empty;
+        defer access_lines.deinit(gpa);
+        var slab_ty: []const u8 = res.env.map.get(ident) orelse "?";
+        for (events, 0..) |ev, ei| {
+            if (ev.kind == .access) {
+                try access_idxs.append(gpa, ei);
+                try access_lines.append(gpa, ev.src_line);
+                if (ev.slab_type.len > 0) slab_ty = ev.slab_type;
+            }
+        }
+        if (access_idxs.items.len == 0) continue;
+
+        // Sort & dedup lines for display.
+        std.sort.heap(u32, access_lines.items, {}, std.sort.asc(u32));
+        var uniq_lines = ArrayList(u32).empty;
+        defer uniq_lines.deinit(gpa);
         {
-            var seen = std.AutoHashMap(u32, void).init(gpa);
-            defer seen.deinit();
-            for (accs) |a| {
-                if (!seen.contains(a.line_no)) {
-                    try seen.put(a.line_no, {});
-                    try lines.append(gpa, a.line_no);
+            var last: u32 = 0;
+            for (access_lines.items) |l| {
+                if (uniq_lines.items.len == 0 or last != l) {
+                    try uniq_lines.append(gpa, l);
+                    last = l;
                 }
             }
         }
-        std.sort.heap(u32, lines.items, {}, std.sort.asc(u32));
-        const first = lines.items[0];
-        const last = lines.items[lines.items.len - 1];
 
-        // Filter lock ops for this ident.
-        var iops = ArrayList(LockOp).empty;
-        defer iops.deinit(gpa);
-        for (res.lock_ops.items) |op| if (mem.eql(u8, op.ident, ident)) try iops.append(gpa, op);
+        const first_idx = access_idxs.items[0];
+        const last_idx = access_idxs.items[access_idxs.items.len - 1];
+        const first_line = events[first_idx].src_line;
+        const last_line = events[last_idx].src_line;
 
-        if (iops.items.len == 0) {
-            // Format lines as `[a, b, c]` to match the Python output.
+        // Are there any lock/unlock/defer_unlock events on this ident?
+        var has_any_op = false;
+        for (events) |ev| if (ev.kind != .access) {
+            has_any_op = true;
+            break;
+        };
+
+        if (!has_any_op) {
             var lines_buf = ArrayList(u8).empty;
             defer lines_buf.deinit(gpa);
             try lines_buf.append(gpa, '[');
-            for (lines.items, 0..) |l, li| {
+            for (uniq_lines.items, 0..) |l, li| {
                 if (li > 0) try lines_buf.appendSlice(gpa, ", ");
                 try lines_buf.writer(gpa).print("{d}", .{l});
             }
             try lines_buf.append(gpa, ']');
             const msg = try std.fmt.allocPrint(gpa,
                 "{s} ({s}): {d} access(es) on lines {s} but no gen-lock op on this ident at all",
-                .{ ident, slab_ty, accs.len, lines_buf.items });
+                .{ ident, slab_ty, access_idxs.items.len, lines_buf.items });
             try res.findings.append(gpa, .{
                 .severity = .err,
                 .entry_name = res.entry.name,
                 .message = msg,
-                .line_no = first,
+                .line_no = first_line,
             });
             continue;
         }
 
-        // Acquire tight-preceding first access.
+        // Tight-preceding: the event immediately before first_idx (by
+        // insertion order) must be a lock/lock_with_gen. A defer_unlock
+        // in that slot is OK if the one before IT is a lock.
         var acq_ok = false;
-        for (iops.items) |op| {
-            if ((op.op == .lock or op.op == .lock_with_gen) and op.line_no == first -% 1) {
-                acq_ok = true;
-                break;
-            }
-            if (op.op == .defer_unlock and op.line_no == first -% 1) {
-                for (iops.items) |op2| {
-                    if ((op2.op == .lock or op2.op == .lock_with_gen) and op2.line_no == first -% 2) {
-                        acq_ok = true;
-                        break;
-                    }
-                }
-                if (acq_ok) break;
+        if (first_idx >= 1) {
+            const prev = events[first_idx - 1];
+            if (prev.kind == .lock or prev.kind == .lock_with_gen) acq_ok = true;
+            if (!acq_ok and prev.kind == .defer_unlock and first_idx >= 2) {
+                const pp = events[first_idx - 2];
+                if (pp.kind == .lock or pp.kind == .lock_with_gen) acq_ok = true;
             }
         }
         if (!acq_ok) {
-            // Nearest acquire before first.
+            // Nearest lock before first access (by src_line).
             var nearest: ?u32 = null;
-            for (iops.items) |op| {
-                if ((op.op == .lock or op.op == .lock_with_gen) and op.line_no < first) {
-                    if (nearest == null or op.line_no > nearest.?) nearest = op.line_no;
+            for (events) |ev| {
+                if ((ev.kind == .lock or ev.kind == .lock_with_gen) and ev.src_line < first_line) {
+                    if (nearest == null or ev.src_line > nearest.?) nearest = ev.src_line;
                 }
             }
             const severity: Severity = if (nearest == null) .err else .info;
-            const gap_str: ?u32 = if (nearest) |n| first - n else null;
             const msg = if (nearest) |n| try std.fmt.allocPrint(gpa,
                 "{s} ({s}): first access at L{d} not tight-preceded by lock (nearest acquire L{d}, gap={d})",
-                .{ ident, slab_ty, first, n, gap_str.? })
+                .{ ident, slab_ty, first_line, n, first_line - n })
             else try std.fmt.allocPrint(gpa,
                 "{s} ({s}): first access at L{d} not tight-preceded by lock (nearest acquire LNone, gap=None)",
-                .{ ident, slab_ty, first });
+                .{ ident, slab_ty, first_line });
             try res.findings.append(gpa, .{
                 .severity = severity,
                 .entry_name = res.entry.name,
                 .message = msg,
-                .line_no = first,
+                .line_no = first_line,
             });
         }
 
-        // Release tight-following last access.
+        // Tight-following: event immediately after last_idx must be
+        // unlock.
         var rel_ok = false;
-        for (iops.items) |op| {
-            if (op.op == .unlock and op.line_no == last + 1) {
-                rel_ok = true;
-                break;
-            }
+        if (last_idx + 1 < events.len) {
+            const next = events[last_idx + 1];
+            if (next.kind == .unlock) rel_ok = true;
         }
         if (!rel_ok) {
+            // Any defer_unlock anywhere before last_line covers.
             var has_defer = false;
-            for (iops.items) |op| {
-                if (op.op == .defer_unlock and op.line_no <= last) {
+            for (events) |ev| {
+                if (ev.kind == .defer_unlock and ev.src_line <= last_line) {
                     has_defer = true;
                     break;
                 }
@@ -3068,32 +2965,32 @@ fn bracketCheck(gpa: Allocator, res: *CheckResult) !void {
             if (has_defer) {
                 const msg = try std.fmt.allocPrint(gpa,
                     "{s} ({s}): last access L{d} relies on defer-unlock (no explicit unlock on L{d})",
-                    .{ ident, slab_ty, last, last + 1 });
+                    .{ ident, slab_ty, last_line, last_line + 1 });
                 try res.findings.append(gpa, .{
                     .severity = .info,
                     .entry_name = res.entry.name,
                     .message = msg,
-                    .line_no = last,
+                    .line_no = last_line,
                 });
             } else {
                 var nearest: ?u32 = null;
-                for (iops.items) |op| {
-                    if (op.op == .unlock and op.line_no > last) {
-                        if (nearest == null or op.line_no < nearest.?) nearest = op.line_no;
+                for (events) |ev| {
+                    if (ev.kind == .unlock and ev.src_line > last_line) {
+                        if (nearest == null or ev.src_line < nearest.?) nearest = ev.src_line;
                     }
                 }
                 const severity: Severity = if (nearest == null) .err else .info;
                 const msg = if (nearest) |n| try std.fmt.allocPrint(gpa,
                     "{s} ({s}): last access at L{d} not tight-followed by unlock (nearest release L{d}, gap={d})",
-                    .{ ident, slab_ty, last, n, n - last })
+                    .{ ident, slab_ty, last_line, n, n - last_line })
                 else try std.fmt.allocPrint(gpa,
                     "{s} ({s}): last access at L{d} not tight-followed by unlock (nearest release LNone, gap=None)",
-                    .{ ident, slab_ty, last });
+                    .{ ident, slab_ty, last_line });
                 try res.findings.append(gpa, .{
                     .severity = severity,
                     .entry_name = res.entry.name,
                     .message = msg,
-                    .line_no = last,
+                    .line_no = last_line,
                 });
             }
         }
@@ -3110,7 +3007,6 @@ const Args = struct {
     entry_filter: ?[]const u8 = null,
     list_slab_types: bool = false,
     list_methods: bool = false,
-    depth_stats: bool = false,
     print_help: bool = false,
 };
 
@@ -3128,8 +3024,6 @@ fn parseArgs(gpa: Allocator) !Args {
             args.list_slab_types = true;
         } else if (mem.eql(u8, a, "--list-methods")) {
             args.list_methods = true;
-        } else if (mem.eql(u8, a, "--depth-stats")) {
-            args.depth_stats = true;
         } else if (mem.eql(u8, a, "--help") or mem.eql(u8, a, "-h")) {
             args.print_help = true;
         } else if (mem.eql(u8, a, "--entry")) {
@@ -3160,7 +3054,6 @@ fn printHelp(w: *std.Io.Writer) !void {
         \\  --entry NAME          drill into a single handler
         \\  --list-slab-types     print discovered slab-backed types and exit
         \\  --list-methods        print discovered (receiver, method) pairs
-        \\  --depth-stats         show where MAX_INLINE_DEPTH blocked inlining
         \\  --help, -h            show this help
         \\
         \\Exit status is nonzero if any err-severity findings are emitted.
@@ -3369,16 +3262,27 @@ pub fn main() !u8 {
         results.deinit(gpa);
     }
 
+    var summaries = SummaryMap.init(gpa);
+    defer {
+        var sit = summaries.valueIterator();
+        while (sit.next()) |sp| {
+            const s = sp.*;
+            if (s.events.len > 0) gpa.free(s.events);
+            if (s.param_types.len > 0) gpa.free(s.param_types);
+            if (s.param_names.len > 0) gpa.free(s.param_names);
+            gpa.destroy(s);
+        }
+        summaries.deinit();
+    }
+
     for (entries.items) |*entry| {
         var env = SlabEnv.init(gpa);
-        var accesses = StringHashMap(ArrayList(Access)).init(gpa);
-        var lock_ops = ArrayList(LockOp).empty;
-        try analyzeEntry(gpa, &pool, files.items, tokens.items, &slab_types, &fn_index, entry, &env, &accesses, &lock_ops);
+        var events = EventMap.init(gpa);
+        try analyzeEntry(gpa, &pool, files.items, tokens.items, &slab_types, &fn_index, &summaries, entry, &env, &events);
         var res = CheckResult{
             .entry = entry,
             .env = env,
-            .accesses = accesses,
-            .lock_ops = lock_ops,
+            .events = events,
             .findings = ArrayList(Finding).empty,
         };
         try bracketCheck(gpa, &res);
@@ -3498,22 +3402,30 @@ fn printEntry(gpa: Allocator, w: *std.Io.Writer, res: *const CheckResult, verbos
     }
     try w.writeAll("\n");
     if (verbose) {
-        var itA = res.accesses.iterator();
+        var itA = res.events.iterator();
         while (itA.next()) |kv| {
             const ident = kv.key_ptr.*;
-            const accs = kv.value_ptr.items;
-            if (accs.len == 0) continue;
-            // compute first/last line and unique tails.
-            var min_l: u32 = accs[0].line_no;
-            var max_l: u32 = accs[0].line_no;
-            for (accs) |a| {
-                if (a.line_no < min_l) min_l = a.line_no;
-                if (a.line_no > max_l) max_l = a.line_no;
+            const evs = kv.value_ptr.items;
+            if (evs.len == 0) continue;
+            var n_access: usize = 0;
+            var min_l: u32 = std.math.maxInt(u32);
+            var max_l: u32 = 0;
+            for (evs) |e| {
+                if (e.kind != .access) continue;
+                n_access += 1;
+                if (e.src_line < min_l) min_l = e.src_line;
+                if (e.src_line > max_l) max_l = e.src_line;
             }
-            try w.print("      {s} accesses on L{d}..L{d} ({d} refs)\n", .{ ident, min_l, max_l, accs.len });
+            if (n_access == 0) continue;
+            try w.print("      {s} accesses on L{d}..L{d} ({d} refs)\n", .{ ident, min_l, max_l, n_access });
         }
-        for (res.lock_ops.items) |op| {
-            try w.print("      lock-op L{d}: {s}.{s}\n", .{ op.line_no, op.ident, lockOpName(op.op) });
+        var itB = res.events.iterator();
+        while (itB.next()) |kv| {
+            const ident = kv.key_ptr.*;
+            for (kv.value_ptr.items) |ev| {
+                if (ev.kind == .access) continue;
+                try w.print("      lock-op L{d}: {s}.{s}\n", .{ ev.src_line, ident, eventKindName(ev.kind) });
+            }
         }
     }
     for (res.findings.items) |f| {
@@ -3526,8 +3438,9 @@ fn printEntry(gpa: Allocator, w: *std.Io.Writer, res: *const CheckResult, verbos
     }
 }
 
-fn lockOpName(k: LockOpKind) []const u8 {
+fn eventKindName(k: EventKind) []const u8 {
     return switch (k) {
+        .access => "access",
         .lock => "lock",
         .unlock => "unlock",
         .lock_with_gen => "lockWithGen",

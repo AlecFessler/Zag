@@ -52,8 +52,16 @@ Exit status is nonzero if any err-severity findings are emitted.
 4. **Per-entry gen-lock bracketing.** For every kernel entry point —
    `pub fn sys*` in `kernel/syscall/`, exception/IRQ handlers in
    `kernel/arch/{x64,aarch64}/exceptions.zig`, and the scheduler tick —
-   the analyzer walks the function body (inlining resolvable callees up
-   to depth 32) and verifies that every access to a slab-typed local is:
+   the analyzer walks the function body ONCE with a fresh ident env.
+   At each call site, it looks up the callee's memoized per-param
+   **summary** — the list of (access / lock / unlock / defer_unlock)
+   events the callee performs on each of its slab-typed params — and
+   folds those events into the caller's per-ident event timeline at
+   the real source line of the call. Callee-internal locals never
+   enter the caller env; only param-keyed effects are visible across
+   the call boundary.
+
+   Each access to a slab-typed local must be:
    - tight-preceded by a `lock()` / `lockWithGen()` on the same ident,
    - tight-followed by an `unlock()`, OR a `defer <ident>.unlock()`
      covering the scope exit.
@@ -61,25 +69,24 @@ Exit status is nonzero if any err-severity findings are emitted.
      refcount-pinned via `defer x.releaseRef()` / `.decRef()`, or
      explicitly annotated with `// self-alive`) are exempt.
 
-## Parity with the Python implementation
+## Current finding totals
 
-The Zig port tracks the same observable behavior as the Python original
-on the current kernel tree:
+On the current kernel tree the analyzer reports:
 
-- 67 entry points analyzed.
-- 97 tracked slab-typed idents across all entries.
-- 16 err / 15 info findings.
-- 8 slab-backed types, 4 bare-pointer violations, 0 `.ptr` bypass sites.
+- 67 entry points analyzed, 97 tracked slab-typed idents.
+- 5 err / 1 info bracketing findings (all of them real source-line
+  references rather than synthetic counter lines).
+- 8 slab-backed types, 0 bare-pointer violations, 0 `.ptr` bypass
+  sites.
 
-Per-entry finding breakdowns match on 65 of 67 entries. Two entries
-(`sysIpcReply`, `sysThreadCreate`) differ by ±1 err that cancel out in
-the total. This is due to a bug in the Python analyzer's param-list
-regex (`PARAMS_RE = r"\(([^)]*)\)"`) which loses nested `)` inside
-generic type args (e.g. `SlabRef(T)`) and so under-indexes fns whose
-first param is a fat-pointer slice. The Zig port uses proper tokenized
-param parsing and indexes those fns correctly, which feeds slightly
-different inlining into the per-entry walk. See the commit log for
-detail.
+The pre-summary port of this tool reported 11 err / 15 info findings.
+Ten err / fourteen info of those were false positives caused by the
+old inline-expansion walker: helper-internal locals like `prev` or
+`restored_caller_ref` leaked into the caller's ident env, and their
+events at synthetic line numbers spanning thousands (e.g. "access at
+L5616 in a 400-line syscall") bore no relation to real source code.
+The summary-based walker drops all helper-internal locals and emits
+events at real source lines, so those ghost findings are gone.
 
 ## Directory layout
 
@@ -93,8 +100,7 @@ tools/check_gen_lock/
 
 ## Follow-up
 
-- `./test.sh pre-commit` still runs the Python analyzer; the Zig port is
-  not wired into CI yet. Keep running both while validating; swap the
-  pre-commit step to the Zig binary once the per-entry discrepancies are
-  investigated (they appear to favor the Zig tool, but confirm before
-  cutting over).
+- `./test.sh pre-commit` runs this tool (advisory stage). It runs in
+  ~1.7s on the current tree.
+- 5 err / 1 info remain; see the commit log for triage notes. They all
+  bottom out at real source lines — no synthetic counter math.

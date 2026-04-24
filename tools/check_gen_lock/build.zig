@@ -2,14 +2,12 @@ const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
-    // Debug is intentional here: the analyzer's HashMap iteration order
-    // interacts with per-entry finding counts in a handful of edge-case
-    // syscalls (notably sysThreadCreate / sysIpcReply). Debug gives a
-    // finding-count match against tools/check_gen_lock.py; ReleaseFast
-    // changes the hash probe sequence and drifts by 2 err. The tool is
-    // still fast enough at Debug (~2.4s on this tree).
+    // ReleaseFast — the summary-based walker is deterministic (per-fn
+    // summaries are memoized by (recv, name) and folded at real source
+    // lines, so HashMap iteration order no longer affects per-entry
+    // finding counts the way inlining did).
     const optimize = b.standardOptimizeOption(.{
-        .preferred_optimize_mode = .Debug,
+        .preferred_optimize_mode = .ReleaseFast,
     });
 
     const exe = b.addExecutable(.{
