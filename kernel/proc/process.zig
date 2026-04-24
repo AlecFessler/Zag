@@ -79,8 +79,14 @@ pub const Process = struct {
     fault_reason: FaultReason,
     restart_count: u16,
     perm_view_gen: u64 = 0,
-    handle_refcount: u32 = 0,
     cleanup_complete: bool = false,
+    /// True once cleanupPhase2 has run its teardown but the Process slab
+    /// slot is deliberately preserved as a `dead_process` tombstone
+    /// (§2.1.6: dead_process handles remain valid until explicit revoke).
+    /// The slot holds no useful state beyond this flag — all resources
+    /// are freed — but the slab slot + its live gen stay intact so the
+    /// parent's perm-table entry continues to resolve.
+    zombie: bool = false,
     fault_handler_proc: ?*Process = null,
     faulted_thread_slots: u64 = 0,
     suspended_thread_slots: u64 = 0,
@@ -183,7 +189,6 @@ pub const Process = struct {
             .expected_gen = object.currentGen(),
         };
         self.perm_count += 1;
-        _ = thread.handle_refcount.fetchAdd(1, .acq_rel);
         self.syncUserView();
     }
 
@@ -207,11 +212,6 @@ pub const Process = struct {
         }
         if (drop != 0) self.syncUserView();
         self.perm_lock.unlock();
-        var i: u32 = 0;
-        while (i < drop) {
-            thread.releaseRef();
-            i += 1;
-        }
     }
 
     /// Find the handle ID for a thread in this process's perm table.
@@ -233,20 +233,15 @@ pub const Process = struct {
     /// - target dies (cleanup unlinks itself from handler's list)
     pub fn releaseFaultHandler(self: *Process, target: *Process) void {
         // Clear all thread-handle slots in self.perm_table that belong to target.
-        var drained: [MAX_PERMS]*Thread = undefined;
-        var drained_n: usize = 0;
         self.perm_lock.lock();
         for (&self.perm_table) |*slot| {
             if (slot.object == .thread and slot.object.thread.process == target) {
-                drained[drained_n] = slot.object.thread;
-                drained_n += 1;
                 slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
             }
         }
         self.syncUserView();
         self.perm_lock.unlock();
-        for (drained[0..drained_n]) |t| t.releaseRef();
 
         // Clear target's pointer back to handler and restore fault_handler
         // bit on slot 0 — but only if the target originally had the bit.
@@ -644,14 +639,16 @@ pub const Process = struct {
         return self.getPermByHandleLocked(handle_id);
     }
 
-    /// Look up a handle and, if it references a thread, pin the *Thread
-    /// so it cannot be freed out from under the caller. Callers MUST
-    /// invoke `Thread.releaseRef` on the returned thread once they are
-    /// done operating on it. Returns the permission entry snapshot plus
-    /// the pinned thread pointer; returns null on handle-not-found or
-    /// when the entry is not a thread. Fixes red-team finding Cap-F2
-    /// (thread-handle TOCTOU UAF).
-    pub fn acquireThreadRef(self: *Process, handle_id: u64) ?struct {
+    /// Look up a handle that references a thread. Returns the permission
+    /// entry snapshot plus the thread pointer; returns null on
+    /// handle-not-found or when the entry is not a thread.
+    ///
+    /// *Unpinned*: the returned `*Thread` carries no liveness guarantee
+    /// after this function returns — a concurrent Thread.deinit on
+    /// another core can free the slot at any point. Callers that hold
+    /// the pointer across a yield / blocking call / fn return are
+    /// racing a UAF.
+    pub fn lookupThreadHandle(self: *Process, handle_id: u64) ?struct {
         entry: PermissionEntry,
         thread: *Thread,
     } {
@@ -659,9 +656,7 @@ pub const Process = struct {
         defer self.perm_lock.unlock();
         const entry = self.getPermByHandleLocked(handle_id) orelse return null;
         if (entry.object != .thread) return null;
-        const t = entry.object.thread;
-        _ = t.handle_refcount.fetchAdd(1, .acq_rel);
-        return .{ .entry = entry, .thread = t };
+        return .{ .entry = entry, .thread = entry.object.thread };
     }
 
     /// Look up a handle while the caller already holds perm_lock.
@@ -691,13 +686,6 @@ pub const Process = struct {
                 slot.handle = handle_id;
                 slot.expected_gen = entry_in.object.currentGen();
                 self.perm_count += 1;
-                // Increment refcount on referenced object
-                switch (entry_in.object) {
-                    .process => |p| _ = @atomicRmw(u32, &p.handle_refcount, .Add, 1, .acq_rel),
-                    .dead_process => |p| _ = @atomicRmw(u32, &p.handle_refcount, .Add, 1, .acq_rel),
-                    .thread => |t| _ = t.handle_refcount.fetchAdd(1, .acq_rel),
-                    else => {},
-                }
                 self.syncUserViewSlot(slot_index);
                 return handle_id;
             }
@@ -707,29 +695,13 @@ pub const Process = struct {
 
     pub fn removePerm(self: *Process, handle_id: u64) !void {
         if (handle_id == HANDLE_SELF) return error.CannotRevokeSelf;
-        var referenced_proc: ?*Process = null;
-        var referenced_thread: ?*Thread = null;
         self.perm_lock.lock();
         for (self.perm_table[1..], 1..) |*slot, slot_index| {
             if (slot.object != .empty and slot.handle == handle_id) {
-                switch (slot.object) {
-                    .process => |p| referenced_proc = p,
-                    .dead_process => |p| referenced_proc = p,
-                    .thread => |t| referenced_thread = t,
-                    else => {},
-                }
                 slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
                 self.perm_count -= 1;
                 self.syncUserViewSlot(slot_index);
                 self.perm_lock.unlock();
-                // Decrement refcount outside perm_lock to avoid lock ordering issues
-                if (referenced_proc) |p| {
-                    const prev = @atomicRmw(u32, &p.handle_refcount, .Sub, 1, .acq_rel);
-                    if (prev == 1 and p.cleanup_complete) {
-                        { const gen = p._gen_lock.currentGen(); slab_instance.destroy(p, gen) catch unreachable; }
-                    }
-                }
-                if (referenced_thread) |t| t.releaseRef();
                 return;
             }
         }
@@ -1178,13 +1150,9 @@ pub const Process = struct {
         self.cleanupDmaMappings();
         self.vmm.deinit();
 
-        // Slot 0 (HANDLE_SELF) is populated by initPermTable without going
-        // through insertPerm, so it never incremented our own handle_refcount
-        // on entry. Skip it here to keep the counter symmetric — otherwise
-        // a process with no external holders would underflow the u32 and
-        // cleanupPhase2's refcount==0 check would never fire, leaking the
-        // struct; and with external holders, we'd off-by-one the other way
-        // and destroy the struct prematurely.
+        // Drop perm-table entries. SharedMemory still has its own refcount
+        // (it manages backing pages, not slot lifetime); everything else
+        // has no lifetime bookkeeping on this path.
         for (self.perm_table[1..]) |*entry| {
             switch (entry.object) {
                 .shared_memory => |shm| shm.decRef(),
@@ -1196,26 +1164,11 @@ pub const Process = struct {
                         const core_id = @ctz(t.core_affinity orelse 0);
                         sched.unpinByRevoke(core_id);
                     }
-                    t.releaseRef();
                 },
-                .vm => {},
-                .process => |p| {
-                    const prev = @atomicRmw(u32, &p.handle_refcount, .Sub, 1, .acq_rel);
-                    if (prev == 1 and p.cleanup_complete) {
-                        { const gen = p._gen_lock.currentGen(); slab_instance.destroy(p, gen) catch unreachable; }
-                    }
-                },
-                .dead_process => |p| {
-                    const prev = @atomicRmw(u32, &p.handle_refcount, .Sub, 1, .acq_rel);
-                    if (prev == 1 and p.cleanup_complete) {
-                        { const gen = p._gen_lock.currentGen(); slab_instance.destroy(p, gen) catch unreachable; }
-                    }
-                },
-                .vm_reservation, .empty => {},
+                .vm, .process, .dead_process, .vm_reservation, .empty => {},
             }
             entry.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
         }
-        // Clear slot 0 without touching refcount.
         self.perm_table[0] = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
 
         arch.paging.freeUserAddrSpace(self.addr_space_root);
@@ -1238,11 +1191,12 @@ pub const Process = struct {
         if (self.restart_context) |*rc| rc.deinit();
 
         self.cleanup_complete = true;
-        // Only free if no external handles remain
-        if (@atomicLoad(u32, &self.handle_refcount, .acquire) == 0) {
-            const gen = self._gen_lock.currentGen();
-            slab_instance.destroy(self, gen) catch unreachable;
-        }
+        // Keep the slab slot alive as a dead_process tombstone. Any handle
+        // to this Process (parent's .dead_process entry, IPC-transferred
+        // handles) continues to resolve; the gen stays odd/live. The slot
+        // is leaked for now — a handle-counting scheme or GC sweep can
+        // reclaim it later. Correctness first, reclamation later.
+        @atomicStore(bool, &self.zombie, true, .release);
     }
 
     /// Convert a live `process` entry in `holder`'s perm table to
@@ -1363,7 +1317,6 @@ pub const Process = struct {
         proc.fault_reason = .none;
         proc.restart_count = 0;
         proc.perm_view_gen = 0;
-        proc.handle_refcount = 0;
         proc.cleanup_complete = false;
         proc.fault_handler_proc = null;
         proc.faulted_thread_slots = 0;
@@ -1499,7 +1452,6 @@ pub const Process = struct {
         proc.fault_reason = .none;
         proc.restart_count = 0;
         proc.perm_view_gen = 0;
-        proc.handle_refcount = 0;
         proc.cleanup_complete = false;
         proc.fault_handler_proc = null;
         proc.faulted_thread_slots = 0;

@@ -152,8 +152,6 @@ pub fn create(vm_obj: *Vm) !*VCpu {
     thread.pmu_state = null;
     thread.fpu_state = [_]u8{0} ** 576;
     thread.last_fpu_core = null;
-    thread.handle_refcount = std.atomic.Value(u32).init(0);
-    thread.teardown_done = false;
 
     thread.kernel_stack = try stack_mod.createKernel();
     errdefer stack_mod.destroyKernel(thread.kernel_stack, memory_init.kernel_addr_space_root);

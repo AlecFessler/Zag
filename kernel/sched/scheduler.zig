@@ -929,8 +929,6 @@ pub fn perCoreInit() void {
     idle_thread.pmu_state = null;
     idle_thread.fpu_state = [_]u8{0} ** 576;
     idle_thread.last_fpu_core = null;
-    idle_thread.handle_refcount = std.atomic.Value(u32).init(0);
-    idle_thread.teardown_done = false;
     if (@import("builtin").cpu.arch == .aarch64) {
         // aarch64 requires a concrete kernel stack and entry context for
         // the idle thread because every thread switch reseats SP_EL1 from

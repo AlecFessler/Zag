@@ -127,7 +127,6 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     const rights_err = checkRights(proc, thread_handle);
     if (rights_err) |e| return e;
     const target_thread = lookupThread(proc, thread_handle) orelse return E_BADCAP;
-    defer target_thread.releaseRef();
 
     var configs: [arch.pmu.pmu_max_counters]PmuCounterConfig = undefined;
     const slice = readConfigs(proc, configs_ptr, count, &configs) catch |err| return configErrToCode(err);
@@ -191,7 +190,6 @@ pub fn sysPmuRead(proc: *Process, thread_handle: u64, sample_ptr: u64) i64 {
     const rights_err = checkRights(proc, thread_handle);
     if (rights_err) |e| return e;
     const target_thread = lookupThread(proc, thread_handle) orelse return E_BADCAP;
-    defer target_thread.releaseRef();
 
     target_thread._gen_lock.lock();
     const target_proc = target_thread.process;
@@ -234,7 +232,6 @@ pub fn sysPmuReset(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     const rights_err = checkRights(proc, thread_handle);
     if (rights_err) |e| return e;
     const target_thread = lookupThread(proc, thread_handle) orelse return E_BADCAP;
-    defer target_thread.releaseRef();
 
     var configs: [arch.pmu.pmu_max_counters]PmuCounterConfig = undefined;
     const slice = readConfigs(proc, configs_ptr, count, &configs) catch |err| return configErrToCode(err);
@@ -273,7 +270,6 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
     const rights_err = checkRights(proc, thread_handle);
     if (rights_err) |e| return e;
     const target_thread = lookupThread(proc, thread_handle) orelse return E_BADCAP;
-    defer target_thread.releaseRef();
 
     target_thread._gen_lock.lock();
     const target_proc = target_thread.process;
@@ -319,10 +315,8 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
 // ── Internal helpers ────────────────────────────────────────────────────
 
 /// Look up a thread handle and verify the entry is actually a thread.
-/// Returns a pinned `*Thread` reference; callers MUST call `releaseRef`
-/// once they are done operating on the thread (red-team Cap-F2 fix).
 fn lookupThread(proc: *Process, thread_handle: u64) ?*Thread {
-    const pinned = proc.acquireThreadRef(thread_handle) orelse return null;
+    const pinned = proc.lookupThreadHandle(thread_handle) orelse return null;
     return pinned.thread;
 }
 

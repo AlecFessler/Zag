@@ -116,27 +116,6 @@ pub const Thread = struct {
     /// thread's regs need flushing from the source core's CPU before the
     /// destination core can safely `fxrstor`.
     last_fpu_core: ?u8 = null,
-    /// Count of outstanding external pins on this Thread struct. Protects
-    /// against concurrent-free races where a syscall looks up a thread
-    /// via a handle, drops perm_lock, and then dereferences the *Thread
-    /// while another core exits/destroys the same thread (red-team Cap-F2).
-    /// Bumped inside perm_lock by Process.insertPerm/insertThreadHandleAtSlot
-    /// and by acquireThreadRef lookups; decremented by Process.removePerm,
-    /// removeThreadHandle, and syscall releaseRef paths. Thread.deinit runs
-    /// the teardown unconditionally but defers `allocator.destroy` until
-    /// this counter hits zero (see `releaseRef`).
-    handle_refcount: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
-    /// Set by Thread.deinit once teardown has run. Any later refcount-zero
-    /// transition is responsible for the final `allocator.destroy`.
-    teardown_done: bool = false,
-
-    pub fn releaseRef(self: *Thread) void {
-        const prev = self.handle_refcount.fetchSub(1, .acq_rel);
-        if (prev == 1 and @atomicLoad(bool, &self.teardown_done, .acquire)) {
-            const gen = self._gen_lock.currentGen();
-            slab_instance.destroy(self, gen) catch unreachable;
-        }
-    }
 
     pub fn deinit(self: *Thread) void {
         const proc = self.process;
@@ -218,11 +197,8 @@ pub const Thread = struct {
             }
         }
 
-        @atomicStore(bool, &self.teardown_done, true, .release);
-        if (self.handle_refcount.load(.acquire) == 0) {
-            const gen = self._gen_lock.currentGen();
-            slab_instance.destroy(self, gen) catch unreachable;
-        }
+        const gen = self._gen_lock.currentGen();
+        slab_instance.destroy(self, gen) catch unreachable;
 
         if (is_last) proc.lastThreadExited();
     }
@@ -270,8 +246,6 @@ pub const Thread = struct {
         thread.fault_user_ctx = null;
         thread.pmu_state = null;
         thread.last_fpu_core = null;
-        thread.handle_refcount = std.atomic.Value(u32).init(0);
-        thread.teardown_done = false;
         arch.cpu.fpuStateInit(&thread.fpu_state);
 
         thread.kernel_stack = try stack_mod.createKernel();

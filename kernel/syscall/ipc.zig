@@ -164,7 +164,6 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                     target_proc.perm_lock.unlock();
 
                     if (!found_existing) {
-                        _ = @atomicRmw(u32, &proc_ptr.handle_refcount, .Add, 1, .acq_rel);
                         _ = target_proc.insertPerm(.{
                             .handle = 0,
                             .object = .{ .process = proc_ptr },
@@ -182,7 +181,6 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                             // death would restore the slot-0 bit using
                             // had_self_fault_handler while target never had
                             // the relationship reflected in its perm table.
-                            _ = @atomicRmw(u32, &proc_ptr.handle_refcount, .Sub, 1, .acq_rel);
 
                             // 1. Unlink sender from target's fault_handler_targets list.
                             target_proc.unlinkFaultHandlerTarget(sender_proc);
@@ -238,9 +236,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                     .object = .{ .process = proc_ptr },
                     .rights = granted_u16,
                 };
-                _ = @atomicRmw(u32, &proc_ptr.handle_refcount, .Add, 1, .acq_rel);
                 _ = target_proc.insertPerm(new_entry) catch {
-                    _ = @atomicRmw(u32, &proc_ptr.handle_refcount, .Sub, 1, .acq_rel);
                     return E_MAXCAP;
                 };
                 return E_OK;
@@ -262,10 +258,8 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                 .object = .{ .process = proc_ptr },
                 .rights = granted_u16,
             };
-            _ = @atomicRmw(u32, &proc_ptr.handle_refcount, .Add, 1, .acq_rel);
             sender_proc.perm_lock.unlock();
             _ = target_proc.insertPerm(new_entry) catch {
-                _ = @atomicRmw(u32, &proc_ptr.handle_refcount, .Sub, 1, .acq_rel);
                 return E_MAXCAP;
             };
             return E_OK;

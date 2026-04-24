@@ -530,9 +530,8 @@ pub fn sysFaultSetThreadMode(thread_handle: u64, mode: u64) i64 {
     if (mode > 2) return E_INVAL;
 
     const proc = sched.currentProc();
-    const pinned = proc.acquireThreadRef(thread_handle) orelse return E_BADCAP;
+    const pinned = proc.lookupThreadHandle(thread_handle) orelse return E_BADCAP;
     const target_thread = pinned.thread;
-    defer target_thread.releaseRef();
 
     // Verify caller holds fault_handler for the thread's owning process.
     // Two valid cases (§2.12.32):
