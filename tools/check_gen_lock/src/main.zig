@@ -2739,21 +2739,94 @@ fn walkBody(
                 if (at >= 2 and code[at - 2] == '.' and code[at - 1] == '?') {
                     leader_end = at - 2;
                 }
+                // Walk back through idents AND dots to capture full
+                // receiver chain. Plain-ident case still works (chain
+                // with no dots); chain case picks up patterns like
+                // `entry.object.thread.lock()` where the final segment
+                // is a known fat-yielding field.
                 var sidx: usize = leader_end;
-                while (sidx > 0 and isIdentChar(code[sidx - 1])) sidx -= 1;
+                while (sidx > 0) {
+                    const c = code[sidx - 1];
+                    if (isIdentChar(c) or c == '.') {
+                        sidx -= 1;
+                    } else break;
+                }
                 if (sidx == leader_end) { pos = at + skip; continue; }
-                const ident = code[sidx..leader_end];
-                if (env.map.contains(ident) and env.fat.contains(ident)) {
-                    const is_defer = isDeferForFat(code, ident);
-                    const kind: EventKind = if (is_defer and mem.eql(u8, op_name, "unlock"))
-                        .defer_unlock
-                    else if (mem.eql(u8, op_name, "lock")) .lock
-                    else .unlock;
-                    const ident_i = try ctx.pool.intern(ident);
-                    try emitEvent(gpa, ec, ident_i, kind, src_line, "", env.map.get(ident) orelse "");
-                    if (is_defer and mem.eql(u8, op_name, "unlock")) {
-                        try pending_defers.append(gpa, .{ .ident = ident_i, .fire_at_depth = brace_depth });
+                const full = code[sidx..leader_end];
+                // Plain-ident fast path.
+                if (mem.indexOfScalar(u8, full, '.') == null) {
+                    const ident = full;
+                    if (env.map.contains(ident) and env.fat.contains(ident)) {
+                        const is_defer = isDeferForFat(code, ident);
+                        const kind: EventKind = if (is_defer and mem.eql(u8, op_name, "unlock"))
+                            .defer_unlock
+                        else if (mem.eql(u8, op_name, "lock")) .lock
+                        else .unlock;
+                        const ident_i = try ctx.pool.intern(ident);
+                        try emitEvent(gpa, ec, ident_i, kind, src_line, "", env.map.get(ident) orelse "");
+                        if (is_defer and mem.eql(u8, op_name, "unlock")) {
+                            try pending_defers.append(gpa, .{ .ident = ident_i, .fire_at_depth = brace_depth });
+                        }
                     }
+                    pos = at + skip;
+                    continue;
+                }
+                // Chain case: last segment must be a known fat-yielding
+                // field (UNION_VARIANTS covers KernelObject slots like
+                // `.object.thread`, `.object.process`; FAT_YIELDING_FIELDS
+                // covers direct struct-field fat refs like `thread.process`,
+                // `vcpu.thread`). The slab type carried by the event comes
+                // from whichever table matched.
+                const last_seg_start = (mem.lastIndexOfScalar(u8, full, '.') orelse 0) + 1;
+                const last_seg = full[last_seg_start..];
+                var chain_slab_ty: []const u8 = "";
+                if (lookupUnionVariant(last_seg)) |ty| chain_slab_ty = ty;
+                if (chain_slab_ty.len == 0) {
+                    for (FAT_YIELDING_FIELDS) |e| {
+                        if (mem.eql(u8, e.field, last_seg)) {
+                            // Field can belong to multiple owners but all
+                            // our current entries yield the same slab type
+                            // per tail name (e.g. "process" always yields
+                            // Process). Resolve via DEFAULT_FIELD_CHAINS.
+                            for (DEFAULT_FIELD_CHAINS) |d| {
+                                if (mem.eql(u8, d.field, last_seg)) {
+                                    chain_slab_ty = d.ty;
+                                    break;
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                if (chain_slab_ty.len == 0) {
+                    pos = at + skip;
+                    continue;
+                }
+                // Chain as synthetic ident; different sites on different
+                // chains get distinct idents, but all carry the same
+                // slab_type so the pair extractor treats them as the
+                // same lock class. This is precisely what catches
+                // same-type-two-instance deadlocks (two `.lock()` calls
+                // on different chain expressions that both resolve to
+                // Thread — the classic two-lock self-deadlock).
+                const chain_i = try ctx.pool.intern(full);
+                const ty_i = try ctx.pool.intern(chain_slab_ty);
+                // `defer <chain>.unlock()` — detect by scanning for
+                // `defer ` before the chain start on the same line. This
+                // matters for the lock-order simulator: popping on the
+                // defer statement rather than at scope exit would make
+                // the chain's lock look released at the defer line,
+                // hiding any nested same-type acquire downstream.
+                const is_defer_chain = mem.indexOf(u8, code[0..sidx], "defer ") != null;
+                const kind: EventKind = if (mem.eql(u8, op_name, "lock"))
+                    .lock
+                else if (is_defer_chain)
+                    .defer_unlock
+                else
+                    .unlock;
+                try emitEvent(gpa, ec, chain_i, kind, src_line, "", ty_i);
+                if (is_defer_chain and mem.eql(u8, op_name, "unlock")) {
+                    try pending_defers.append(gpa, .{ .ident = chain_i, .fire_at_depth = brace_depth });
                 }
                 pos = at + skip;
             }
