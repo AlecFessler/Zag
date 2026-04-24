@@ -73,9 +73,8 @@ Exit status is nonzero if any err-severity findings are emitted.
 
 On the current kernel tree the analyzer reports:
 
-- 67 entry points analyzed, 97 tracked slab-typed idents.
-- 5 err / 1 info bracketing findings (all of them real source-line
-  references rather than synthetic counter lines).
+- 67 entry points analyzed, 101 tracked slab-typed idents.
+- 0 err / 0 info bracketing findings.
 - 8 slab-backed types, 0 bare-pointer violations, 0 `.ptr` bypass
   sites.
 
@@ -87,6 +86,18 @@ events at synthetic line numbers spanning thousands (e.g. "access at
 L5616 in a 400-line syscall") bore no relation to real source code.
 The summary-based walker drops all helper-internal locals and emits
 events at real source lines, so those ghost findings are gone.
+
+A follow-up pass closed the last five false positives:
+
+- Chained assignments `<ident> = <head>.<variant>` (where `<variant>`
+  is a KernelObject union-variant or a known fat-yielding field name)
+  now promote the LHS into `env.fat` even when `<head>` itself wasn't
+  in env — the four `target_proc_ref` sites in sysThread{Suspend,
+  Resume,Kill} / sysFaultSetThreadMode chain through such a ref.
+- `<slab_module>.destroy(<ident>, <gen>)` is recognized as terminal
+  (the allocator re-acquires the gen-lock internally); no access
+  event is emitted, so the bracket check doesn't demand an unlock
+  after destroy — fixes the sysPmuStop unlock-then-destroy pattern.
 
 ## Directory layout
 
@@ -102,5 +113,5 @@ tools/check_gen_lock/
 
 - `./test.sh pre-commit` runs this tool (advisory stage). It runs in
   ~1.7s on the current tree.
-- 5 err / 1 info remain; see the commit log for triage notes. They all
-  bottom out at real source lines — no synthetic counter math.
+- 0 err / 0 info on the current tree; safe to promote from advisory
+  to gating at the caller's discretion.

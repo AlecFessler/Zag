@@ -1705,6 +1705,20 @@ fn joinMultilineDecl(
     return buf.toOwnedSlice(gpa);
 }
 
+// Heuristic: does a leader ident look like a slab-allocator module?
+// Matches `<x>_slab`, `<x>Slab`, `<x>Allocator`, or exact `slab_instance`.
+// The destroy-after-unlock pattern (`<slab_module>.destroy(ident, gen)`)
+// reacquires the gen-lock internally, so the ident access at the call
+// site shouldn't require a tight-following unlock in the caller.
+fn leaderIsSlabModule(leader: []const u8) bool {
+    if (leader.len == 0) return false;
+    if (mem.eql(u8, leader, "slab_instance")) return true;
+    if (mem.endsWith(u8, leader, "_slab")) return true;
+    if (mem.endsWith(u8, leader, "Slab")) return true;
+    if (mem.endsWith(u8, leader, "Allocator")) return true;
+    return false;
+}
+
 // Heuristic: does the RHS indicate a fresh alloc?
 // - `<ident>_slab.create(`, `<ident>Slab.create(`, `<ident>Allocator.create(`,
 //   `slab_instance.create(`
@@ -2253,6 +2267,21 @@ fn walkBody(
                         if (env.map.get(head)) |head_ty| {
                             if (isFatYieldingField(head_ty, tail)) is_fat = true;
                         }
+                        // Even when <head> isn't in env.map — e.g.
+                        // `target_proc_ref = target.process` where `target`
+                        // came out of a chained `.lock()` whose return type
+                        // the analyzer didn't resolve — the tail segment
+                        // alone can identify a SlabRef-yielding field: every
+                        // KernelObject union variant is SlabRef(T), and
+                        // every FAT_YIELDING_FIELDS entry is too. Match the
+                        // tail lexically so chained assignments through
+                        // un-tracked intermediaries still land `is_fat=true`.
+                        if (!is_fat and lookupUnionVariant(tail) != null) is_fat = true;
+                        if (!is_fat) {
+                            for (FAT_YIELDING_FIELDS) |e| {
+                                if (mem.eql(u8, e.field, tail)) { is_fat = true; break; }
+                            }
+                        }
                     }
                 }
             }
@@ -2506,7 +2535,12 @@ fn walkBody(
         }
 
         // Free-fn calls passing slab ident as first arg.
-        const Free = struct { fn_name: []const u8, first_arg: []const u8, open_p: usize };
+        const Free = struct {
+            fn_name: []const u8,
+            leader: []const u8, // prefix before the last `.` in fq, or ""
+            first_arg: []const u8,
+            open_p: usize,
+        };
         var free_call_spans = ArrayList(Free).empty;
         defer free_call_spans.deinit(gpa);
         {
@@ -2542,8 +2576,17 @@ fn walkBody(
                 const fa = code[ap..ae];
                 if (!env.map.contains(fa)) { p = e; continue; }
                 var fn_name = fq;
-                if (mem.lastIndexOfScalar(u8, fq, '.')) |ld| fn_name = fq[ld + 1 ..];
-                try free_call_spans.append(gpa, .{ .fn_name = fn_name, .first_arg = fa, .open_p = q });
+                var leader: []const u8 = "";
+                if (mem.lastIndexOfScalar(u8, fq, '.')) |ld| {
+                    fn_name = fq[ld + 1 ..];
+                    leader = fq[0..ld];
+                }
+                try free_call_spans.append(gpa, .{
+                    .fn_name = fn_name,
+                    .leader = leader,
+                    .first_arg = fa,
+                    .open_p = q,
+                });
                 p = e;
             }
         }
@@ -2585,6 +2628,17 @@ fn walkBody(
         // Free-fn call sites.
         for (free_call_spans.items) |fc| {
             const recv_ty = env.map.get(fc.first_arg) orelse continue;
+            // `<slab_module>.destroy(<ident>, <gen>)` is the SecureSlab
+            // sink operation: the allocator re-acquires the gen-lock
+            // internally, and the caller is done with <ident>. Treat this
+            // as terminal — don't emit an access event, otherwise the
+            // bracket check will demand an unlock AFTER the destroy call
+            // (legitimately impossible, since the slot is freed). The
+            // lock/unlock surrounding the real mutation (before destroy)
+            // already stand on their own merits.
+            if (mem.eql(u8, fc.fn_name, "destroy") and leaderIsSlabModule(fc.leader)) {
+                continue;
+            }
             const summary_opt = try getOrBuildSummary(ctx, recv_ty, fc.fn_name);
             if (summary_opt == null) {
                 const ident_i = try ctx.pool.intern(fc.first_arg);
