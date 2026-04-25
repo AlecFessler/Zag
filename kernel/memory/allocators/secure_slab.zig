@@ -420,9 +420,13 @@ pub fn SecureSlab(
 
             // Gen-lock currently held. Bump to (expected_gen+1)<<1 | 0 and
             // release in one store: the new gen is even (freed) and the
-            // lock bit is clear. setGenRelease bypasses GenLock.unlock, so
-            // pop the lockdep entry by hand to keep the per-core held stack
-            // balanced.
+            // lock bit is clear. The atomic store releases the in-memory
+            // lock bit, but lockdep tracks acquires/releases on its own
+            // per-core held stack — the matching `debug.release` keeps that
+            // stack in sync, otherwise the entry stays held until the slot
+            // gets re-acquired and same-class / cycle false positives fire
+            // on the next sibling-slot destroy under the same critical
+            // section (e.g. `vmm.deinit` walking and freeing every node).
             debug.release(&ptr._gen_lock);
             ptr._gen_lock.setGenRelease(expected_gen + 1);
 
@@ -447,6 +451,19 @@ pub fn SecureSlab(
             // zeroes new pages); be explicit under second-touch reuse.
             @memset(slot_base[0..slot_stride], 0);
             const slot_ptr: *T = @ptrCast(@alignCast(slot_base));
+            // The whole-slot @memset above clobbers `_gen_lock.class`. The
+            // GenLock struct-default `"@unclassified"` only fills in for
+            // instances built via `.{}` literals; the slab's raw-bytes init
+            // path bypasses it entirely. Without this restore the class
+            // pointer stays NULL for the slot's lifetime — `zeroExceptGenLock`
+            // on subsequent destroys preserves whatever's already there.
+            // A NULL `class` page-faults the lockdep panic-printer (fixed
+            // alongside this) and, more importantly, makes every two slab-
+            // backed `_gen_lock` acquires falsely register as a same-class
+            // overlap (NULL == NULL), turning every nested slab access into
+            // a lockdep panic. Naming each slab's GenLock-class by T's
+            // typename keeps distinct slabs distinct in the detector.
+            slot_ptr._gen_lock.class = "SecureSlab(" ++ @typeName(T) ++ ")._gen_lock";
 
             const ptr_cell = bumpOne(&self.ptrs_bump, *T) orelse return error.SlabFull;
             ptr_cell.* = slot_ptr;

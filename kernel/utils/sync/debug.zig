@@ -163,19 +163,19 @@ pub fn assertNoLocksHeld(src: SrcLoc) void {
     arch.boot.printRaw(" depth=");
     printDecimal("", stack.depth);
     arch.boot.printRaw("\n  blocking call at ");
-    arch.boot.printRaw(src.file);
+    printSlice(src.file);
     arch.boot.printRaw(":");
     printDecimal("", src.line);
     arch.boot.printRaw(" in ");
-    arch.boot.printRaw(src.fn_name);
-    arch.boot.printRaw("\n  held lock class=\"");
-    printCStr(held.class);
-    arch.boot.printRaw("\" acquired at ");
-    arch.boot.printRaw(held.src.file);
+    printSlice(src.fn_name);
+    arch.boot.printRaw("\n  held lock class=");
+    printClass(held.class);
+    arch.boot.printRaw(" acquired at ");
+    printSlice(held.src.file);
     arch.boot.printRaw(":");
     printDecimal("", held.src.line);
     arch.boot.printRaw(" in ");
-    arch.boot.printRaw(held.src.fn_name);
+    printSlice(held.src.fn_name);
     arch.boot.printRaw("\n");
     @panic("lockdep: blocking call with locks held");
 }
@@ -194,62 +194,62 @@ fn handleOutcome(
             printDecimal("lockdep: recursive acquire core=", core_id);
             arch.boot.printRaw(" lock_ptr=0x");
             printHex(@intFromPtr(lock_ptr));
-            arch.boot.printRaw(" class=\"");
-            printCStr(class);
-            arch.boot.printRaw("\"\n  prior at ");
-            arch.boot.printRaw(prior.src.file);
+            arch.boot.printRaw(" class=");
+            printClass(class);
+            arch.boot.printRaw("\n  prior at ");
+            printSlice(prior.src.file);
             arch.boot.printRaw(":");
             printDecimal("", prior.src.line);
             arch.boot.printRaw(" in ");
-            arch.boot.printRaw(prior.src.fn_name);
+            printSlice(prior.src.fn_name);
             arch.boot.printRaw("\n  this at ");
-            arch.boot.printRaw(src.file);
+            printSlice(src.file);
             arch.boot.printRaw(":");
             printDecimal("", src.line);
             arch.boot.printRaw(" in ");
-            arch.boot.printRaw(src.fn_name);
+            printSlice(src.fn_name);
             arch.boot.printRaw("\n");
             @panic("lockdep: recursive acquire");
         },
         .panic_same_class => {
             const prior = outcome.prior.?;
             printDecimal("lockdep: same-class overlap core=", core_id);
-            arch.boot.printRaw(" class=\"");
-            printCStr(class);
-            arch.boot.printRaw("\"\n  outer at ");
-            arch.boot.printRaw(prior.src.file);
+            arch.boot.printRaw(" class=");
+            printClass(class);
+            arch.boot.printRaw("\n  outer at ");
+            printSlice(prior.src.file);
             arch.boot.printRaw(":");
             printDecimal("", prior.src.line);
             arch.boot.printRaw("\n  inner at ");
-            arch.boot.printRaw(src.file);
+            printSlice(src.file);
             arch.boot.printRaw(":");
             printDecimal("", src.line);
             arch.boot.printRaw("\n  fix: use lockPair / unlockPair to acquire same-class instances atomically\n");
             @panic("lockdep: same-class overlap");
         },
         .panic_irq_mode_mix => {
-            arch.boot.printRaw("lockdep: IRQ-mode mix on class=\"");
-            printCStr(class);
-            arch.boot.printRaw("\" core=");
+            arch.boot.printRaw("lockdep: IRQ-mode mix on class=");
+            printClass(class);
+            arch.boot.printRaw(" core=");
             printDecimal("", core_id);
             arch.boot.printRaw("\n  IRQ-handler acquire at ");
-            arch.boot.printRaw(outcome.irq_handler_src.file);
+            printSlice(outcome.irq_handler_src.file);
             arch.boot.printRaw(":");
             printDecimal("", outcome.irq_handler_src.line);
             arch.boot.printRaw(" in ");
-            arch.boot.printRaw(outcome.irq_handler_src.fn_name);
+            printSlice(outcome.irq_handler_src.fn_name);
             arch.boot.printRaw("\n  process-context acquire (IRQs ENABLED) at ");
-            arch.boot.printRaw(outcome.process_enabled_src.file);
+            printSlice(outcome.process_enabled_src.file);
             arch.boot.printRaw(":");
             printDecimal("", outcome.process_enabled_src.line);
             arch.boot.printRaw(" in ");
-            arch.boot.printRaw(outcome.process_enabled_src.fn_name);
+            printSlice(outcome.process_enabled_src.fn_name);
             arch.boot.printRaw("\n  triggering acquire at ");
-            arch.boot.printRaw(src.file);
+            printSlice(src.file);
             arch.boot.printRaw(":");
             printDecimal("", src.line);
             arch.boot.printRaw(" in ");
-            arch.boot.printRaw(src.fn_name);
+            printSlice(src.fn_name);
             arch.boot.printRaw("\n  fix: an IRQ landing while the process-context site holds this lock\n");
             arch.boot.printRaw("       will deadlock when the handler tries to take the same class.\n");
             arch.boot.printRaw("       Switch the process-context site to lockIrqSave/unlockIrqRestore.\n");
@@ -258,28 +258,28 @@ fn handleOutcome(
         .panic_cycle => {
             if (outcome.cycle_transitive) {
                 arch.boot.printRaw("lockdep: transitive cycle ");
-                printCStr(outcome.cycle_inner);
+                printClass(outcome.cycle_inner);
                 arch.boot.printRaw(" -> ... -> ");
-                printCStr(outcome.cycle_outer);
+                printClass(outcome.cycle_outer);
                 arch.boot.printRaw("\n  closing edge at ");
-                arch.boot.printRaw(src.file);
+                printSlice(src.file);
                 arch.boot.printRaw(":");
                 printDecimal("", src.line);
                 arch.boot.printRaw(" in ");
-                arch.boot.printRaw(src.fn_name);
+                printSlice(src.fn_name);
                 arch.boot.printRaw("\n  (intermediate path is in pair_registry; inspect with debugger)\n");
                 @panic("lockdep: transitive cycle");
             }
             arch.boot.printRaw("lockdep: AB-BA cycle ");
-            printCStr(outcome.cycle_inner);
+            printClass(outcome.cycle_inner);
             arch.boot.printRaw(" -> ");
-            printCStr(outcome.cycle_outer);
+            printClass(outcome.cycle_outer);
             arch.boot.printRaw("\n  prior A->B at ");
-            arch.boot.printRaw(outcome.cycle_prior_inner_src.file);
+            printSlice(outcome.cycle_prior_inner_src.file);
             arch.boot.printRaw(":");
             printDecimal("", outcome.cycle_prior_inner_src.line);
             arch.boot.printRaw("\n  this B->A at ");
-            arch.boot.printRaw(src.file);
+            printSlice(src.file);
             arch.boot.printRaw(":");
             printDecimal("", src.line);
             arch.boot.printRaw("\n");
@@ -288,8 +288,51 @@ fn handleOutcome(
     }
 }
 
-fn printCStr(s: [*:0]const u8) void {
+/// Lowest valid kernel-half virtual address on x86_64 / aarch64 TTBR1 layouts
+/// the kernel actually runs in. Anything below this — and anything in the
+/// canonical hole — is rejected by `printClass` / `printSlice` in favour of
+/// a `<null:0xPTR>` placeholder so a corrupt class-string pointer can't
+/// page-fault the panic printer (which would recurse through `handlePageFault`
+/// and obscure the original lockdep finding entirely).
+const KERNEL_HALF_BASE: usize = 0xffff_8000_0000_0000;
+
+/// Print a NUL-terminated lockdep class string. If the pointer is null or
+/// outside the kernel-half canonical range, prints `<null:0xPTR>` instead
+/// of walking memory from a junk address. The class field on `SpinLock` /
+/// `GenLock` is `[*:0]const u8` with no null wrapper — every panic-print
+/// site funnels through this helper so the formatter stays alive even when
+/// a held-stack entry was populated with an unintialized or recycled class
+/// pointer (the failure mode that turned 261/590 x86 tests into a recursive
+/// kernel page-fault hang).
+fn printClass(s: [*:0]const u8) void {
+    const addr = @intFromPtr(s);
+    if (addr < KERNEL_HALF_BASE) {
+        arch.boot.printRaw("<null:0x");
+        printHex(addr);
+        arch.boot.printRaw(">");
+        return;
+    }
+    arch.boot.printRaw("\"");
     arch.boot.printRaw(std.mem.span(s));
+    arch.boot.printRaw("\"");
+}
+
+/// Print a slice (e.g. `SrcLoc.file`, `SrcLoc.fn_name`). Same defense as
+/// `printClass`: if the slice's data pointer is null / non-canonical or its
+/// length is implausibly huge, fall back to `<null:0xPTR>` rather than
+/// dereferencing junk and recursing through the page-fault handler.
+fn printSlice(s: []const u8) void {
+    const addr = @intFromPtr(s.ptr);
+    // 4 KiB ceiling: every legitimate `SrcLoc.file` / `SrcLoc.fn_name` is a
+    // compile-time string literal well under a page; an undefined slice is
+    // overwhelmingly likely to have a junk length far above this.
+    if (addr < KERNEL_HALF_BASE or s.len > 4096) {
+        arch.boot.printRaw("<null:0x");
+        printHex(addr);
+        arch.boot.printRaw(">");
+        return;
+    }
+    arch.boot.printRaw(s);
 }
 
 fn printDecimal(prefix: []const u8, n: u64) void {
