@@ -48,6 +48,12 @@ var cores_online: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);
 /// Intel SDM Vol 3A, §11.4.4 "MP Initialization Example", Table 11-1 — INIT-SIPI-SIPI
 /// sequence with 10 ms delay between INIT and first SIPI.
 pub fn smpInit() !void {
+    // Write the BSP's IA32_TSC_AUX so its later `coreID()` calls can
+    // use the RDPID fast path. APs do the same in `coreInit` after
+    // they discover their core_id via the slow path. After every core
+    // has run, `enableRdpidFastPath()` below flips the global switch.
+    apic.writeTscAuxCoreId(apic.coreIDSlow());
+
     for (0..apic.coreCount()) |i| {
         gdt.initForCore(i);
     }
@@ -133,6 +139,11 @@ pub fn smpInit() !void {
             std.atomic.spinLoopHint();
         }
     }
+
+    // All online APs have run `writeTscAuxCoreId` on themselves before
+    // bumping `cores_online` (see coreInit below); the BSP did the same
+    // at the top of this function. Safe to flip the global RDPID flag.
+    apic.enableRdpidFastPath();
 }
 
 /// AP initialization entry point — corresponds to the "Typical AP Initialization Sequence"
@@ -148,7 +159,8 @@ fn coreInit() callconv(.c) noreturn {
         apic.enableSpuriousVector(@intFromEnum(interrupts.IntVecs.spurious));
     }
 
-    const core_id = apic.coreID();
+    const core_id = apic.coreIDSlow();
+    apic.writeTscAuxCoreId(core_id);
     gdt.loadGdt(core_id);
     cpu.ltr(gdt.TSS_OFFSET);
 
