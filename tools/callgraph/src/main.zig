@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const ast = @import("ast/index.zig");
+const entry = @import("entry.zig");
 const ir = @import("ir/parse.zig");
 const join = @import("join.zig");
 const server = @import("server.zig");
@@ -87,14 +88,33 @@ pub fn main() !void {
         const file_count = countDistinctFiles(arena_allocator, ast_fns) catch ast_fns.len;
         std.debug.print("ast: {d} functions across {d} files\n", .{ ast_fns.len, file_count });
 
+        const discovered = try entry.discover(
+            arena_allocator,
+            args.kernel_root,
+            args.arch,
+            ast_fns,
+            walk.asts,
+        );
+        printEntryStats(discovered);
+
         var stats: join.JoinStats = undefined;
-        const g = try join.buildGraphWithStats(arena_allocator, ir_graph, ast_fns, walk.asts, &stats);
+        const g = try join.buildGraphWithStats(
+            arena_allocator,
+            ir_graph,
+            ast_fns,
+            walk.asts,
+            discovered,
+            &stats,
+        );
         const pct: f64 = if (stats.ir_total == 0)
             0.0
         else
             100.0 * @as(f64, @floatFromInt(stats.matched)) / @as(f64, @floatFromInt(stats.ir_total));
         std.debug.print("join: {d} / {d} IR functions matched to AST ({d:.1} %)\n", .{
             stats.matched, stats.ir_total, pct,
+        });
+        std.debug.print("entry: {d} of {d} discovered entries matched IR functions\n", .{
+            g.entry_points.len, discovered.len,
         });
         break :blk g;
     };
@@ -106,6 +126,24 @@ fn countDistinctFiles(arena: std.mem.Allocator, fns: []const ast.AstFunction) !u
     var set = std.StringHashMap(void).init(arena);
     for (fns) |f| try set.put(f.file, {});
     return set.count();
+}
+
+fn printEntryStats(discovered: []const entry.Discovered) void {
+    var s: usize = 0;
+    var t: usize = 0;
+    var i: usize = 0;
+    var b: usize = 0;
+    var m: usize = 0;
+    for (discovered) |d| switch (d.kind) {
+        .syscall => s += 1,
+        .trap => t += 1,
+        .irq => i += 1,
+        .boot => b += 1,
+        .manual => m += 1,
+    };
+    std.debug.print("entry: discovered {d} syscalls, {d} traps, {d} IRQs, {d} boot, total {d}\n", .{
+        s, t, i, b, discovered.len,
+    });
 }
 
 /// Synthesizes a tiny graph with three functions and a couple of edges so the

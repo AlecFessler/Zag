@@ -21,17 +21,21 @@
 // Each EnrichedEdge gets `target_name` filled in from the resolved target
 // function's display name when possible.
 //
-// Entry-point heuristic: same path-suffix scan that lived inline in main.zig
-// in phase 1, moved here to keep main.zig small.
+// Entry-point marking: callers pass a `[]const entry.Discovered` produced
+// by `entry.discover` in main.zig. We index it by qualified name and stamp
+// `is_entry` / `entry_kind` on every matching `Function`, then emit one
+// `EntryPoint` per match (with the discovered label).
 
 const std = @import("std");
 
 const ast = @import("ast/index.zig");
 const branches = @import("ast/branches.zig");
+const entry_mod = @import("entry.zig");
 const types = @import("types.zig");
 
 const AstFunction = ast.AstFunction;
 const FileAst = ast.FileAst;
+const Discovered = entry_mod.Discovered;
 
 pub const JoinStats = struct {
     ir_total: usize,
@@ -44,7 +48,7 @@ pub fn buildGraph(
     ast_fns: []const AstFunction,
 ) !types.Graph {
     var stats: JoinStats = .{ .ir_total = 0, .matched = 0 };
-    return try buildGraphWithStats(arena, ir_graph, ast_fns, &.{}, &stats);
+    return try buildGraphWithStats(arena, ir_graph, ast_fns, &.{}, &.{}, &stats);
 }
 
 pub fn buildGraphWithStats(
@@ -52,6 +56,7 @@ pub fn buildGraphWithStats(
     ir_graph: types.IrGraph,
     ast_fns: []const AstFunction,
     file_asts: []const FileAst,
+    discovered: []const Discovered,
     stats_out: *JoinStats,
 ) !types.Graph {
     // Build a (file_abs, line) → AstFunction lookup. Use a string-keyed map
@@ -169,18 +174,10 @@ pub fn buildGraphWithStats(
         try attachIntra(arena, functions, ast_fns, file_asts, &realpath_cache);
     }
 
-    try applyEntryHeuristic(functions);
-
+    // Stamp `is_entry` / `entry_kind` on every function whose qualified name
+    // appears in the discovered set, and emit a corresponding EntryPoint.
     var entry_points = std.ArrayList(types.EntryPoint){};
-    for (functions) |f| {
-        if (f.is_entry) {
-            try entry_points.append(arena, .{
-                .fn_id = f.id,
-                .kind = f.entry_kind orelse .manual,
-                .label = f.name,
-            });
-        }
-    }
+    try markEntryPoints(arena, functions, discovered, &entry_points);
 
     stats_out.* = .{ .ir_total = ir_graph.functions.len, .matched = matched };
 
@@ -294,51 +291,30 @@ fn resolvePath(
     return resolved;
 }
 
-/// Heuristic entry-point detection. Real auto-discovery is phase 4; this is
-/// just enough to give the frontend something to render. Mark every function
-/// whose def_loc.file ends with one of a small set of dispatch/exception
-/// files; if that yields nothing, fall back to a name-substring scan.
-fn applyEntryHeuristic(functions: []types.Function) !void {
-    const path_suffixes = [_][]const u8{
-        "kernel/syscall/dispatch.zig",
-        "kernel/arch/x64/exceptions.zig",
-        "kernel/arch/x64/idt.zig",
-    };
-
-    var marked: usize = 0;
+/// Stamp `is_entry` and `entry_kind` on every function whose `name` (i.e. the
+/// AST qualified name we resolved during the join) matches a discovered entry,
+/// and emit one EntryPoint per match. Functions that the join failed to map
+/// to an AST entry keep their fallback IR-mangled name in `f.name`, which
+/// won't match anything in the discovered set — that's the correct behaviour.
+fn markEntryPoints(
+    arena: std.mem.Allocator,
+    functions: []types.Function,
+    discovered: []const Discovered,
+    out: *std.ArrayList(types.EntryPoint),
+) !void {
+    if (discovered.len == 0) return;
+    var by_name = std.StringHashMap(*const Discovered).init(arena);
+    for (discovered) |*d| try by_name.put(d.name, d);
     for (functions) |*f| {
-        for (path_suffixes) |suffix| {
-            if (std.mem.endsWith(u8, f.def_loc.file, suffix)) {
-                f.is_entry = true;
-                f.entry_kind = entryKindForFile(f.def_loc.file);
-                marked += 1;
-                break;
-            }
-        }
+        const d = by_name.get(f.name) orelse continue;
+        f.is_entry = true;
+        f.entry_kind = d.kind;
+        try out.append(arena, .{
+            .fn_id = f.id,
+            .kind = d.kind,
+            .label = d.label orelse f.name,
+        });
     }
-    if (marked > 0) return;
-
-    // Fallback — pick up to 5 by name substring.
-    const name_substrs = [_][]const u8{ "entry", "syscall", "handler" };
-    var picked: usize = 0;
-    for (functions) |*f| {
-        if (picked >= 5) break;
-        for (name_substrs) |needle| {
-            if (std.mem.indexOf(u8, f.mangled, needle) != null) {
-                f.is_entry = true;
-                f.entry_kind = .manual;
-                picked += 1;
-                break;
-            }
-        }
-    }
-}
-
-fn entryKindForFile(file: []const u8) types.EntryKind {
-    if (std.mem.endsWith(u8, file, "kernel/syscall/dispatch.zig")) return .syscall;
-    if (std.mem.endsWith(u8, file, "kernel/arch/x64/exceptions.zig")) return .trap;
-    if (std.mem.endsWith(u8, file, "kernel/arch/x64/idt.zig")) return .irq;
-    return .manual;
 }
 
 // ----------------------------------------------------------------- intra
