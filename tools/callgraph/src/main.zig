@@ -1,6 +1,8 @@
 const std = @import("std");
 
+const ast = @import("ast/index.zig");
 const ir = @import("ir/parse.zig");
+const join = @import("join.zig");
 const server = @import("server.zig");
 const types = @import("types.zig");
 
@@ -79,119 +81,30 @@ pub fn main() !void {
         try buildDemoGraph(arena_allocator)
     else blk: {
         const ir_graph = try ir.parse(&arena, args.ir_path);
-        break :blk try buildPhase1Graph(arena_allocator, ir_graph);
+
+        const ast_fns = try ast.walkKernel(arena_allocator, args.kernel_root);
+        const file_count = countDistinctFiles(arena_allocator, ast_fns) catch ast_fns.len;
+        std.debug.print("ast: {d} functions across {d} files\n", .{ ast_fns.len, file_count });
+
+        var stats: join.JoinStats = undefined;
+        const g = try join.buildGraphWithStats(arena_allocator, ir_graph, ast_fns, &stats);
+        const pct: f64 = if (stats.ir_total == 0)
+            0.0
+        else
+            100.0 * @as(f64, @floatFromInt(stats.matched)) / @as(f64, @floatFromInt(stats.ir_total));
+        std.debug.print("join: {d} / {d} IR functions matched to AST ({d:.1} %)\n", .{
+            stats.matched, stats.ir_total, pct,
+        });
+        break :blk g;
     };
 
     try server.serve(allocator, &graph, args.port);
 }
 
-/// Phase-1 transform: each IR function becomes a Function with mangled name as
-/// display name (demangling lands in phase 2). Outgoing edges from the IR
-/// graph are bucketed per `from` and converted to EnrichedEdges.
-fn buildPhase1Graph(
-    arena: std.mem.Allocator,
-    ir_graph: types.IrGraph,
-) !types.Graph {
-    // Bucket edges by `from` in a single pass.
-    var edges_by_fn = std.AutoHashMap(types.FnId, std.ArrayList(types.EnrichedEdge)).init(arena);
-    for (ir_graph.edges) |edge| {
-        const kind: types.EdgeKind = if (edge.indirect or edge.to == null)
-            .indirect
-        else
-            .direct;
-        const enriched = types.EnrichedEdge{
-            .to = edge.to,
-            .target_name = null,
-            .kind = kind,
-            .site = edge.site,
-        };
-        const gop = try edges_by_fn.getOrPut(edge.from);
-        if (!gop.found_existing) gop.value_ptr.* = .{};
-        try gop.value_ptr.append(arena, enriched);
-    }
-
-    var functions = try arena.alloc(types.Function, ir_graph.functions.len);
-    for (ir_graph.functions, 0..) |ir_fn, i| {
-        const callees: []types.EnrichedEdge = if (edges_by_fn.get(ir_fn.id)) |list|
-            try arena.dupe(types.EnrichedEdge, list.items)
-        else
-            &.{};
-        functions[i] = .{
-            .id = ir_fn.id,
-            .name = ir_fn.mangled,
-            .mangled = ir_fn.mangled,
-            .def_loc = ir_fn.def_loc orelse .{ .file = "<unknown>", .line = 0, .col = 0 },
-            .is_entry = false,
-            .entry_kind = null,
-            .callees = callees,
-        };
-    }
-
-    try applyEntryHeuristic(arena, functions);
-
-    var entry_points = std.ArrayList(types.EntryPoint){};
-    for (functions) |f| {
-        if (f.is_entry) {
-            try entry_points.append(arena, .{
-                .fn_id = f.id,
-                .kind = f.entry_kind orelse .manual,
-                .label = f.name,
-            });
-        }
-    }
-
-    return .{
-        .functions = functions,
-        .entry_points = try entry_points.toOwnedSlice(arena),
-    };
-}
-
-/// Heuristic entry-point detection. Real auto-discovery is phase 4; this is
-/// just enough to give the frontend something to render. Mark every function
-/// whose def_loc.file ends with one of a small set of dispatch/exception
-/// files; if that yields nothing, fall back to a name-substring scan.
-fn applyEntryHeuristic(arena: std.mem.Allocator, functions: []types.Function) !void {
-    _ = arena;
-    const path_suffixes = [_][]const u8{
-        "kernel/syscall/dispatch.zig",
-        "kernel/arch/x64/exceptions.zig",
-        "kernel/arch/x64/idt.zig",
-    };
-
-    var marked: usize = 0;
-    for (functions) |*f| {
-        for (path_suffixes) |suffix| {
-            if (std.mem.endsWith(u8, f.def_loc.file, suffix)) {
-                f.is_entry = true;
-                f.entry_kind = entryKindForFile(f.def_loc.file);
-                marked += 1;
-                break;
-            }
-        }
-    }
-    if (marked > 0) return;
-
-    // Fallback — pick up to 5 by name substring.
-    const name_substrs = [_][]const u8{ "entry", "syscall", "handler" };
-    var picked: usize = 0;
-    for (functions) |*f| {
-        if (picked >= 5) break;
-        for (name_substrs) |needle| {
-            if (std.mem.indexOf(u8, f.mangled, needle) != null) {
-                f.is_entry = true;
-                f.entry_kind = .manual;
-                picked += 1;
-                break;
-            }
-        }
-    }
-}
-
-fn entryKindForFile(file: []const u8) types.EntryKind {
-    if (std.mem.endsWith(u8, file, "kernel/syscall/dispatch.zig")) return .syscall;
-    if (std.mem.endsWith(u8, file, "kernel/arch/x64/exceptions.zig")) return .trap;
-    if (std.mem.endsWith(u8, file, "kernel/arch/x64/idt.zig")) return .irq;
-    return .manual;
+fn countDistinctFiles(arena: std.mem.Allocator, fns: []const ast.AstFunction) !usize {
+    var set = std.StringHashMap(void).init(arena);
+    for (fns) |f| try set.put(f.file, {});
+    return set.count();
 }
 
 /// Synthesizes a tiny graph with three functions and a couple of edges so the

@@ -225,17 +225,90 @@
     }
 
     #info pre.source {
-      background: var(--bg);
+      background: #1e1e1e;
       border: 1px solid var(--border);
-      border-radius: 4px;
-      padding: 10px;
+      border-radius: 0 0 4px 4px;
+      padding: 0;
+      margin: 0;
       overflow: auto;
       font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
       font-size: 12px;
-      line-height: 1.45;
-      color: var(--fg);
+      line-height: 1.4;
+      color: #e6e6e6;
+    }
+
+    .source_block {
+      border: 1px solid var(--border);
+      border-radius: 4px;
       max-height: 50vh;
-      margin: 0;
+      overflow-y: auto;
+      background: #1e1e1e;
+    }
+
+    .source_header {
+      background: var(--bg-elev-2);
+      border-bottom: 1px solid var(--border);
+      padding: 6px 8px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 11px;
+      color: var(--fg-dim);
+      user-select: text;
+      word-break: break-all;
+    }
+
+    .source_header .open_file {
+      color: var(--accent);
+      text-decoration: none;
+      cursor: text;
+      user-select: text;
+    }
+
+    .source_table {
+      width: 100%;
+      border-collapse: collapse;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .source_table td {
+      padding: 0;
+      vertical-align: top;
+      white-space: pre;
+    }
+
+    .source_gutter {
+      color: #6a6a6a;
+      text-align: right;
+      padding: 0 10px 0 8px;
+      user-select: none;
+      border-right: 1px solid #2e333d;
+      min-width: 3em;
+      background: #1a1a1a;
+    }
+
+    .source_code {
+      padding: 0 10px;
+      color: #e6e6e6;
+    }
+
+    .source_line.highlight .source_code,
+    .source_line.highlight .source_gutter {
+      background-color: rgba(255, 200, 0, 0.15);
+    }
+
+    .source_line.highlight .source_gutter {
+      color: #d8a050;
+    }
+
+    .source_error {
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--bg-elev-2);
+      color: var(--indirect, #f06060);
+      font-size: 12px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
     }
 
     #info .placeholder {
@@ -309,8 +382,9 @@
         <dl id="info_meta"></dl>
         <div id="info_source_wrap" style="display: none;">
           <dt style="color: var(--fg-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px;">Source</dt>
-          <pre class="source" id="info_source"></pre>
+          <div class="source_block" id="info_source"></div>
         </div>
+        <div class="source_error" id="info_source_error" style="display: none;"></div>
       </aside>
     </div>
   </div>

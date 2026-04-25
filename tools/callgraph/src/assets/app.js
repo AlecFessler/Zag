@@ -32,6 +32,7 @@
     infoMeta: document.getElementById("info_meta"),
     infoSourceWrap: document.getElementById("info_source_wrap"),
     infoSource: document.getElementById("info_source"),
+    infoSourceError: document.getElementById("info_source_error"),
     infoClose: document.getElementById("info_close"),
     status: document.getElementById("status"),
   };
@@ -418,9 +419,117 @@
     return [dt, dd];
   }
 
+  // Monotonic token so an in-flight fetch from a previous selection can't
+  // overwrite the source for the current one when responses arrive out of
+  // order.
+  let sourceFetchToken = 0;
+
+  function clearSource() {
+    sourceFetchToken += 1;
+    els.infoSource.innerHTML = "";
+    els.infoSourceWrap.style.display = "none";
+    els.infoSourceError.style.display = "none";
+    els.infoSourceError.textContent = "";
+  }
+
+  function showSourceError(msg) {
+    els.infoSourceWrap.style.display = "none";
+    els.infoSource.innerHTML = "";
+    els.infoSourceError.style.display = "block";
+    els.infoSourceError.textContent = "Could not load source: " + msg;
+  }
+
+  function renderSourceSnippet(file, startLine, lines, highlightLine) {
+    // Build header with selectable absolute path.
+    const block = els.infoSource;
+    block.innerHTML = "";
+
+    const header = document.createElement("div");
+    header.className = "source_header";
+    const link = document.createElement("span");
+    link.className = "open_file";
+    link.textContent = file;
+    link.title = "Path (selectable for copy)";
+    header.appendChild(link);
+    block.appendChild(header);
+
+    const pre = document.createElement("pre");
+    pre.className = "source";
+
+    const table = document.createElement("table");
+    table.className = "source_table";
+    const tbody = document.createElement("tbody");
+
+    for (let i = 0; i < lines.length; i += 1) {
+      const absLine = startLine + i;
+      const tr = document.createElement("tr");
+      tr.className = "source_line";
+      if (absLine === highlightLine) tr.classList.add("highlight");
+
+      const tdNum = document.createElement("td");
+      tdNum.className = "source_gutter";
+      tdNum.textContent = String(absLine);
+
+      const tdCode = document.createElement("td");
+      tdCode.className = "source_code";
+      // Render the line as plain text. Use a single trailing space when the
+      // line is empty so the row keeps the right height.
+      tdCode.textContent = lines[i].length === 0 ? " " : lines[i];
+
+      tr.appendChild(tdNum);
+      tr.appendChild(tdCode);
+      tbody.appendChild(tr);
+    }
+
+    table.appendChild(tbody);
+    pre.appendChild(table);
+    block.appendChild(pre);
+
+    els.infoSourceWrap.style.display = "block";
+    els.infoSourceError.style.display = "none";
+  }
+
+  async function fetchSource(file, start, end, highlightLine) {
+    if (!file) {
+      showSourceError("no file path on selection");
+      return;
+    }
+    if (start < 1) start = 1;
+    if (end < start) end = start;
+
+    const myToken = sourceFetchToken + 1;
+    sourceFetchToken = myToken;
+
+    const url = "/api/source?path=" + encodeURIComponent(file) +
+      "&start=" + start + "&end=" + end;
+
+    try {
+      const r = await fetch(url);
+      if (myToken !== sourceFetchToken) return; // superseded
+      if (!r.ok) {
+        showSourceError("HTTP " + r.status);
+        return;
+      }
+      const text = await r.text();
+      if (myToken !== sourceFetchToken) return;
+
+      // Server returns lines [start..end] separated by newlines. Trim a
+      // trailing newline so we don't render an extra blank row.
+      let body = text;
+      if (body.endsWith("\n")) body = body.slice(0, -1);
+      const lines = body.length === 0 ? [""] : body.split("\n");
+
+      renderSourceSnippet(file, start, lines, highlightLine);
+    } catch (err) {
+      if (myToken !== sourceFetchToken) return;
+      showSourceError(err && err.message ? err.message : String(err));
+    }
+  }
+
   function showNodePanel(d) {
     els.infoTitle.textContent = d.kind === "fn" ? "Function" : "Synthetic Node";
     els.infoMeta.innerHTML = "";
+    clearSource();
 
     if (d.kind === "fn") {
       const rows = [
@@ -438,6 +547,16 @@
         els.infoMeta.appendChild(pair[0]);
         els.infoMeta.appendChild(pair[1]);
       }
+
+      els.info.classList.add("visible");
+
+      // 15-line window starting at the def line so the user sees the
+      // signature plus a few lines of body.
+      if (d.file && d.line) {
+        const start = Math.max(1, d.line);
+        const end = start + 14;
+        fetchSource(d.file, start, end, d.line);
+      }
     } else {
       const rows = [
         metaRow("kind", d.kind),
@@ -447,16 +566,14 @@
         els.infoMeta.appendChild(pair[0]);
         els.infoMeta.appendChild(pair[1]);
       }
+      els.info.classList.add("visible");
     }
-
-    // Phase-2 source slot stays hidden but laid out for later.
-    els.infoSourceWrap.style.display = "none";
-    els.info.classList.add("visible");
   }
 
   function showEdgePanel(d) {
     els.infoTitle.textContent = "Call Site";
     els.infoMeta.innerHTML = "";
+    clearSource();
 
     const badge = document.createElement("span");
     badge.className = "badge";
@@ -472,14 +589,19 @@
       els.infoMeta.appendChild(pair[1]);
     }
 
-    // Phase-2 will fetch /api/source?path=<file>&start=<line-2>&end=<line+2>
-    // and render into infoSource. Slot stays hidden until then.
-    els.infoSourceWrap.style.display = "none";
     els.info.classList.add("visible");
+
+    // 11-line window centered on the call site.
+    if (d.file && d.line) {
+      const start = Math.max(1, d.line - 5);
+      const end = d.line + 5;
+      fetchSource(d.file, start, end, d.line);
+    }
   }
 
   function hidePanel() {
     els.info.classList.remove("visible");
+    clearSource();
   }
 
   // ------------------------------------------------------------------ events
