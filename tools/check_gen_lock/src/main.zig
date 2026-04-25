@@ -29,6 +29,18 @@
 //!      line. Callee-internal locals stay internal to the callee — no
 //!      inline expansion, no synthetic line counter.
 //!
+//!   5. Per-path release coverage — for every lock event in an entry
+//!      body, every reachable control-flow exit between the lock and
+//!      its release (return / return error / try error propagation /
+//!      break / continue / fall-through to scope-end) must be covered
+//!      by either an explicit unlock reached on the same path, a
+//!      `defer ref.unlock(...)` registered before the exit (depth-
+//!      aware), or — for error-flavor exits — an
+//!      `errdefer ref.unlock(...)`. `@panic`/`unreachable` are
+//!      treated as `noreturn` and impose no obligation. Branch-local
+//!      unlocks are pruned when control leaves the branch's scope, so
+//!      sibling branches (e.g. switch arms) cannot reuse them.
+//!
 //! Exit status nonzero iff any err-severity findings are emitted.
 
 const std = @import("std");
@@ -575,6 +587,14 @@ const Event = struct {
     // For folded callee events (cross-function summary apply) this stays
     // 0; the path checker treats unknown-depth as innermost-scope-safe.
     depth: i32 = 0,
+    // For lock events: true when the lock call appeared as the operand
+    // of a same-line `catch` (`x.lock() catch { ... }`). The catch
+    // block runs ONLY on the lock-failure path, where nothing was
+    // actually acquired — so exits inside that catch block don't
+    // need an unlock. The path-aware release checker uses this flag
+    // to skip exits at depth > lock.depth until execution falls back
+    // to lock.depth (i.e. past the catch-block's closing brace).
+    in_catch: bool = false,
 };
 
 // Function-exit (control-flow) events. Separate from the per-ident
@@ -591,6 +611,10 @@ const ExitKind = enum {
     break_stmt, // `break` (loop / labeled-block exit)
     continue_stmt, // `continue`
     panic_or_unreachable, // `@panic(...)` / `unreachable` — no unwinding required
+    scope_close, // synthetic: brace_depth dropped to this value at this
+                 // line. The path-aware release checker uses these to
+                 // prune branch-local unlocks whose containing scope has
+                 // exited (so sibling branches can't reuse them).
 };
 
 const ExitEvent = struct {
@@ -1562,6 +1586,7 @@ const ParamEventKind = enum {
     lock,
     unlock,
     defer_unlock,
+    errdefer_unlock,
     lock_with_gen,
 };
 
@@ -2054,6 +2079,33 @@ fn emitEvent(
     tail: []const u8,
     slab_type: []const u8,
 ) !void {
+    return emitEventDepth(gpa, ec, ident, kind, src_line, tail, slab_type, 0);
+}
+
+fn emitEventDepth(
+    gpa: Allocator,
+    ec: *EmitCtx,
+    ident: []const u8,
+    kind: EventKind,
+    src_line: u32,
+    tail: []const u8,
+    slab_type: []const u8,
+    depth: i32,
+) !void {
+    return emitEventDepthCatch(gpa, ec, ident, kind, src_line, tail, slab_type, depth, false);
+}
+
+fn emitEventDepthCatch(
+    gpa: Allocator,
+    ec: *EmitCtx,
+    ident: []const u8,
+    kind: EventKind,
+    src_line: u32,
+    tail: []const u8,
+    slab_type: []const u8,
+    depth: i32,
+    in_catch: bool,
+) !void {
     if (ec.emit_param_only and !ec.param_set.contains(ident)) return;
     const gop = try ec.events.getOrPut(ident);
     if (!gop.found_existing) gop.value_ptr.* = EventList.empty;
@@ -2064,6 +2116,47 @@ fn emitEvent(
         .seq = ec.seq.*,
         .tail = tail,
         .slab_type = slab_type,
+        .depth = depth,
+        .in_catch = in_catch,
+    });
+}
+
+// Detect that `code` contains a `.lock(` followed by a failure
+// handler (`catch` / `orelse`) that opens a multi-line BLOCK on the
+// same physical line. The block form (`x.lock() catch { ... }`) needs
+// the in_catch flag because the failure-path code lives at depth >
+// lock.depth and would otherwise look like a real path that should
+// release. The single-expression form (`x.lock() orelse return -2`)
+// has its failure-path exit suppressed in scanExits via the
+// `catch_no_block_pos` mechanism, so the lock event itself does NOT
+// need in_catch — none of the on-failure exits make it into the
+// timeline at all.
+fn lockHasCatchOnLine(code: []const u8) bool {
+    if (mem.indexOf(u8, code, ".lock(") == null) return false;
+    if (mem.indexOf(u8, code, " catch {") != null) return true;
+    if (mem.indexOf(u8, code, " catch{") != null) return true;
+    if (mem.indexOf(u8, code, " orelse {") != null) return true;
+    if (mem.indexOf(u8, code, " orelse{") != null) return true;
+    // Block form with `|err|` capture: `x.lock() catch |e| { ... }`.
+    if (mem.indexOf(u8, code, " catch |") != null and
+        mem.indexOf(u8, code, "{") != null) return true;
+    return false;
+}
+
+fn emitExit(
+    gpa: Allocator,
+    ec: *EmitCtx,
+    kind: ExitKind,
+    src_line: u32,
+    depth: i32,
+) !void {
+    const sink = ec.exits orelse return;
+    ec.seq.* += 1;
+    try sink.append(gpa, .{
+        .kind = kind,
+        .src_line = src_line,
+        .depth = depth,
+        .seq = ec.seq.*,
     });
 }
 
@@ -2174,6 +2267,7 @@ fn getOrBuildSummary(
                     .lock => .lock,
                     .unlock => .unlock,
                     .defer_unlock => .defer_unlock,
+                    .errdefer_unlock => .errdefer_unlock,
                     .lock_with_gen => .lock_with_gen,
                 },
                 .param_idx = pi,
@@ -2222,6 +2316,7 @@ fn foldSummary(
             .lock => .lock,
             .unlock => .unlock,
             .defer_unlock => .defer_unlock,
+            .errdefer_unlock => .errdefer_unlock,
             .lock_with_gen => .lock_with_gen,
         };
         const slab_ty = env.map.get(arg) orelse "";
@@ -2559,13 +2654,17 @@ fn walkBody(
                 const is_lwg = mem.eql(u8, op_name, "lockWithGen");
                 if ((is_lock or is_unlock or is_lwg) and env.map.contains(ident)) {
                     const is_defer = isDeferFor(code, ident);
+                    const is_errdefer = !is_defer and isErrdeferFor(code, ident);
                     const kind: EventKind = if (is_defer and is_unlock)
                         .defer_unlock
+                    else if (is_errdefer and is_unlock)
+                        .errdefer_unlock
                     else if (is_lock) .lock
                     else if (is_unlock) .unlock
                     else .lock_with_gen;
                     const ident_i = try ctx.pool.intern(ident);
-                    try emitEvent(gpa, ec, ident_i, kind, src_line, "", env.map.get(ident) orelse "");
+                    const in_catch = (kind == .lock or kind == .lock_with_gen) and lockHasCatchOnLine(code);
+                    try emitEventDepthCatch(gpa, ec, ident_i, kind, src_line, "", env.map.get(ident) orelse "", brace_depth, in_catch);
                     if (is_defer and is_unlock) {
                         try pending_defers.append(gpa, .{ .ident = ident_i, .fire_at_depth = brace_depth });
                     }
@@ -2617,12 +2716,16 @@ fn walkBody(
                     const ident = full;
                     if (env.map.contains(ident) and env.fat.contains(ident)) {
                         const is_defer = isDeferForFat(code, ident);
+                        const is_errdefer = !is_defer and isErrdeferForFat(code, ident);
                         const kind: EventKind = if (is_defer and mem.eql(u8, op_name, "unlock"))
                             .defer_unlock
+                        else if (is_errdefer and mem.eql(u8, op_name, "unlock"))
+                            .errdefer_unlock
                         else if (mem.eql(u8, op_name, "lock")) .lock
                         else .unlock;
                         const ident_i = try ctx.pool.intern(ident);
-                        try emitEvent(gpa, ec, ident_i, kind, src_line, "", env.map.get(ident) orelse "");
+                        const in_catch = kind == .lock and lockHasCatchOnLine(code);
+                        try emitEventDepthCatch(gpa, ec, ident_i, kind, src_line, "", env.map.get(ident) orelse "", brace_depth, in_catch);
                         if (is_defer and mem.eql(u8, op_name, "unlock")) {
                             try pending_defers.append(gpa, .{ .ident = ident_i, .fire_at_depth = brace_depth });
                         }
@@ -2676,14 +2779,23 @@ fn walkBody(
                 // defer statement rather than at scope exit would make
                 // the chain's lock look released at the defer line,
                 // hiding any nested same-type acquire downstream.
-                const is_defer_chain = mem.indexOf(u8, code[0..sidx], "defer ") != null;
+                // Distinguish `defer ` from `errdefer `. The `errdefer` form
+                // matches because it ends in `defer ` too — but the leading
+                // `err` is an identifier suffix, so test for it explicitly.
+                const has_defer_prefix = mem.indexOf(u8, code[0..sidx], "defer ") != null;
+                const has_errdefer_prefix = mem.indexOf(u8, code[0..sidx], "errdefer ") != null;
+                const is_defer_chain = has_defer_prefix and !has_errdefer_prefix;
+                const is_errdefer_chain = has_errdefer_prefix;
                 const kind: EventKind = if (mem.eql(u8, op_name, "lock"))
                     .lock
                 else if (is_defer_chain)
                     .defer_unlock
+                else if (is_errdefer_chain)
+                    .errdefer_unlock
                 else
                     .unlock;
-                try emitEvent(gpa, ec, chain_i, kind, src_line, "", ty_i);
+                const in_catch = kind == .lock and lockHasCatchOnLine(code);
+                try emitEventDepthCatch(gpa, ec, chain_i, kind, src_line, "", ty_i, brace_depth, in_catch);
                 if (is_defer_chain and mem.eql(u8, op_name, "unlock")) {
                     try pending_defers.append(gpa, .{ .ident = chain_i, .fire_at_depth = brace_depth });
                 }
@@ -2910,7 +3022,16 @@ fn walkBody(
             try foldSummary(ctx, summary, caller_args.items, env, ec, src_line);
         }
 
+        // Exit-event scan: run BEFORE end-of-line brace bookkeeping so
+        // the exit event records the depth INSIDE the block where it
+        // appears (a `return` on a line that closes its block via `}`
+        // still belongs to the inner depth). The path-aware release
+        // checker uses this depth to decide whether a still-active
+        // (err)defer at scope D ≤ exit-depth covers the exit.
+        try scanExits(gpa, ec, code, src_line, brace_depth);
+
         // End-of-line brace tracking + defer fires.
+        const depth_before = brace_depth;
         var in_str = false;
         var esc = false;
         for (code) |c| {
@@ -2921,11 +3042,20 @@ fn walkBody(
             if (c == '{') brace_depth += 1;
             if (c == '}') brace_depth -= 1;
         }
+        if (brace_depth < depth_before) {
+            // Emit scope-close markers for the per-path checker. We
+            // emit one marker at the FINAL depth — the checker treats
+            // it as "any branch_unlock at depth > brace_depth is now
+            // out of scope and must be pruned." This is sufficient
+            // because the checker's pruning step only cares about the
+            // shallowest depth reached.
+            try emitExit(gpa, ec, .scope_close, src_line, brace_depth);
+        }
         var i: isize = @as(isize, @intCast(pending_defers.items.len)) - 1;
         while (i >= 0) : (i -= 1) {
             const pd = pending_defers.items[@intCast(i)];
             if (brace_depth < pd.fire_at_depth) {
-                try emitEvent(gpa, ec, pd.ident, .unlock, src_line, "", env.map.get(pd.ident) orelse "");
+                try emitEventDepth(gpa, ec, pd.ident, .unlock, src_line, "", env.map.get(pd.ident) orelse "", brace_depth);
                 _ = pending_defers.orderedRemove(@intCast(i));
             }
         }
@@ -2936,7 +3066,188 @@ fn walkBody(
     // scope exit at the closing brace releases the defer.
     while (pending_defers.items.len > 0) {
         const pd = pending_defers.pop().?;
-        try emitEvent(gpa, ec, pd.ident, .unlock, body_end_line, "", env.map.get(pd.ident) orelse "");
+        try emitEventDepth(gpa, ec, pd.ident, .unlock, body_end_line, "", env.map.get(pd.ident) orelse "", brace_depth);
+    }
+}
+
+// Scan one stripped code line for control-flow exit markers and emit
+// an ExitEvent for each. The path-aware release checker consumes these
+// to decide whether each lock event is matched on every reachable
+// path. Recognized markers (in priority order):
+//
+//   * `return error.<X>` / `return ErrorSet.<X>` → return_error
+//   * `return` (with or without a value) → return_normal
+//   * `break` (`break :label`, `break <value>`) → break_stmt
+//   * `continue` → continue_stmt
+//   * `unreachable` / `@panic(...)` → panic_or_unreachable
+//   * any number of `try ` occurrences (each one is an implicit
+//     error-path exit on the contained expression's error union) →
+//     throw events, one per `try`
+//
+// `panic_or_unreachable` is recorded but the per-path checker treats
+// it as a no-op exit (the runtime aborts; no unwinding obligation).
+fn scanExits(
+    gpa: Allocator,
+    ec: *EmitCtx,
+    code: []const u8,
+    src_line: u32,
+    depth: i32,
+) !void {
+    if (ec.exits == null) return;
+    const t = trimAscii(code);
+    // Skip lines that are clearly comments / blank.
+    if (t.len == 0) return;
+
+    // First emit one throw per `try ` occurrence — these are
+    // independent of any return on the same line.
+    {
+        var pos: usize = 0;
+        while (pos < t.len) {
+            const idx_opt = mem.indexOf(u8, t[pos..], "try ");
+            if (idx_opt == null) break;
+            const abs = pos + idx_opt.?;
+            // Must be at start-of-token (preceded by whitespace, `(`, `[`,
+            // `{`, `,`, `=`, or beginning of string).
+            const ok_prev = abs == 0 or
+                ascii.isWhitespace(t[abs - 1]) or
+                t[abs - 1] == '(' or t[abs - 1] == '[' or
+                t[abs - 1] == '{' or t[abs - 1] == ',' or
+                t[abs - 1] == '=' or t[abs - 1] == '|';
+            if (ok_prev) {
+                try emitExit(gpa, ec, .throw, src_line, depth);
+            }
+            pos = abs + 4;
+        }
+    }
+
+    // Look for return / break / continue / unreachable / @panic
+    // tokens anywhere on the line at top-paren depth — covers both
+    // statement-leading uses and inline forms like `if (x) return y;`.
+    // We scan the line with crude tokenization (no string/char awareness
+    // beyond the comment-stripped view; the analyzer has already
+    // blanked comments and the test relies on Zig's syntactic uniformity).
+    //
+    // Exception: an exit token positioned AFTER `<expr>.lock() catch ` or
+    // `... orelse ` (no `{` opening a block) belongs to the failure-path
+    // operand — it only fires when the lock attempt fails. Suppress it;
+    // the path-aware checker would otherwise count the failure-path
+    // return as a leak even though no lock was acquired on that path.
+    const catch_no_block_pos: ?usize = blk: {
+        const handlers = [_]struct { kw: []const u8, len: usize }{
+            .{ .kw = "catch ", .len = 6 },
+            .{ .kw = "orelse ", .len = 7 },
+        };
+        var earliest: ?usize = null;
+        for (handlers) |h| {
+            var sp: usize = 0;
+            while (sp < t.len) {
+                const idx = mem.indexOf(u8, t[sp..], h.kw) orelse break;
+                const abs = sp + idx;
+                if (abs > 0 and isIdentChar(t[abs - 1])) {
+                    sp = abs + h.len;
+                    continue;
+                }
+                var look = abs + h.len;
+                // Optional `|err|` capture (only on `catch`).
+                if (look < t.len and t[look] == '|') {
+                    const close = mem.indexOfScalarPos(u8, t, look + 1, '|') orelse {
+                        sp = abs + h.len;
+                        continue;
+                    };
+                    look = close + 1;
+                    while (look < t.len and ascii.isWhitespace(t[look])) look += 1;
+                }
+                if (look < t.len and t[look] == '{') {
+                    // Block form — exits inside the block are visible at
+                    // depth+1 and handled by the in_catch_skip logic on
+                    // the lock event itself.
+                    sp = abs + h.len;
+                    continue;
+                }
+                if (earliest == null or look < earliest.?) earliest = look;
+                break;
+            }
+        }
+        break :blk earliest;
+    };
+
+    var p: usize = 0;
+    while (p < t.len) {
+        const c = t[p];
+        if (!isIdentStart(c) and c != '@') {
+            p += 1;
+            continue;
+        }
+        // Don't re-trigger inside the middle of an identifier.
+        if (p > 0 and isIdentChar(t[p - 1])) {
+            p += 1;
+            continue;
+        }
+        var e = p;
+        if (c == '@') {
+            e += 1;
+            while (e < t.len and isIdentChar(t[e])) e += 1;
+        } else {
+            while (e < t.len and isIdentChar(t[e])) e += 1;
+        }
+        const word = t[p..e];
+
+        const after_catch = catch_no_block_pos != null and p >= catch_no_block_pos.?;
+        if (mem.eql(u8, word, "return")) {
+            if (after_catch) {
+                p = e;
+                continue;
+            }
+            // Tail starts at `e`; check whether anywhere up to the
+            // statement terminator (`;` at this depth) we see `error.`
+            // — if so, this is an error-path return.
+            const tail = t[e..];
+            const is_err = mem.indexOf(u8, tail, "error.") != null;
+            const kind: ExitKind = if (is_err) .return_error else .return_normal;
+            try emitExit(gpa, ec, kind, src_line, depth);
+            // Don't `return` from scanExits — there could be a `try`
+            // earlier on the line that we already emitted; keep
+            // scanning so `if (try x()) return;` reports both.
+            p = e;
+            continue;
+        }
+        if (mem.eql(u8, word, "break")) {
+            if (after_catch) {
+                p = e;
+                continue;
+            }
+            try emitExit(gpa, ec, .break_stmt, src_line, depth);
+            p = e;
+            continue;
+        }
+        if (mem.eql(u8, word, "continue")) {
+            if (after_catch) {
+                p = e;
+                continue;
+            }
+            try emitExit(gpa, ec, .continue_stmt, src_line, depth);
+            p = e;
+            continue;
+        }
+        if (mem.eql(u8, word, "unreachable")) {
+            if (after_catch) {
+                p = e;
+                continue;
+            }
+            try emitExit(gpa, ec, .panic_or_unreachable, src_line, depth);
+            p = e;
+            continue;
+        }
+        if (mem.eql(u8, word, "@panic")) {
+            if (after_catch) {
+                p = e;
+                continue;
+            }
+            try emitExit(gpa, ec, .panic_or_unreachable, src_line, depth);
+            p = e;
+            continue;
+        }
+        p = e;
     }
 }
 
@@ -2963,6 +3274,12 @@ fn isDeferFor(code: []const u8, ident: []const u8) bool {
     while (search_pos < code.len) {
         const p = mem.indexOf(u8, code[search_pos..], "defer ") orelse break;
         const abs = search_pos + p;
+        // Reject `errdefer` — it ends in "defer " too but the leading
+        // `err` makes it a different keyword (only error-paths fire).
+        if (abs >= 3 and mem.eql(u8, code[abs - 3 .. abs], "err")) {
+            search_pos = abs + 6;
+            continue;
+        }
         const rest = trimAscii(code[abs + 6 ..]);
         if (rest.len >= ident.len and
             mem.eql(u8, rest[0..ident.len], ident) and
@@ -2971,6 +3288,25 @@ fn isDeferFor(code: []const u8, ident: []const u8) bool {
             return true;
         }
         search_pos = abs + 6;
+    }
+    return false;
+}
+
+// Helper: detect `errdefer <ident>._gen_lock.` earlier on this line.
+// Mirrors isDeferFor but matches `errdefer ` instead of `defer `.
+fn isErrdeferFor(code: []const u8, ident: []const u8) bool {
+    var search_pos: usize = 0;
+    while (search_pos < code.len) {
+        const p = mem.indexOf(u8, code[search_pos..], "errdefer ") orelse break;
+        const abs = search_pos + p;
+        const rest = trimAscii(code[abs + 9 ..]);
+        if (rest.len >= ident.len and
+            mem.eql(u8, rest[0..ident.len], ident) and
+            rest.len > ident.len and rest[ident.len] == '.')
+        {
+            return true;
+        }
+        search_pos = abs + 9;
     }
     return false;
 }
@@ -2994,12 +3330,18 @@ fn isOrderedDefer(code: []const u8, callsite_idx: usize) bool {
     return false;
 }
 
-// Helper: detect `defer <ident>(\.\?)?\.`.
+// Helper: detect `defer <ident>(\.\?)?\.`. Rejects `errdefer ` — that
+// keyword shares the trailing `defer ` text but only fires on error
+// paths and is reported as a separate event kind.
 fn isDeferForFat(code: []const u8, ident: []const u8) bool {
     var sp: usize = 0;
     while (sp < code.len) {
         const p = mem.indexOf(u8, code[sp..], "defer ") orelse break;
         const abs = sp + p;
+        if (abs >= 3 and mem.eql(u8, code[abs - 3 .. abs], "err")) {
+            sp = abs + 6;
+            continue;
+        }
         const rest = trimAscii(code[abs + 6 ..]);
         if (rest.len >= ident.len and mem.eql(u8, rest[0..ident.len], ident)) {
             var k = ident.len;
@@ -3007,6 +3349,23 @@ fn isDeferForFat(code: []const u8, ident: []const u8) bool {
             if (k < rest.len and rest[k] == '.') return true;
         }
         sp = abs + 6;
+    }
+    return false;
+}
+
+// Helper: detect `errdefer <ident>(\.\?)?\.`.
+fn isErrdeferForFat(code: []const u8, ident: []const u8) bool {
+    var sp: usize = 0;
+    while (sp < code.len) {
+        const p = mem.indexOf(u8, code[sp..], "errdefer ") orelse break;
+        const abs = sp + p;
+        const rest = trimAscii(code[abs + 9 ..]);
+        if (rest.len >= ident.len and mem.eql(u8, rest[0..ident.len], ident)) {
+            var k = ident.len;
+            if (k + 2 <= rest.len and rest[k] == '.' and rest[k + 1] == '?') k += 2;
+            if (k < rest.len and rest[k] == '.') return true;
+        }
+        sp = abs + 9;
     }
     return false;
 }
@@ -3082,6 +3441,7 @@ fn analyzeEntry(
     entry: *const EntryPoint,
     out_env: *SlabEnv,
     out_events: *EventMap,
+    out_exits: *ExitEventList,
 ) !void {
     const sf = fileByPath(ctx_files, entry.file_path) orelse return;
     const toks = blk: {
@@ -3152,6 +3512,7 @@ fn analyzeEntry(
         .seq = &seq,
         .param_set = &empty_set,
         .emit_param_only = false,
+        .exits = out_exits,
     };
 
     try walkBody(&ctx, sf, entry.body_start_line, entry.body_end_line, out_env, &ec);
@@ -3161,12 +3522,14 @@ const CheckResult = struct {
     entry: *const EntryPoint,
     env: SlabEnv,
     events: EventMap,
+    exit_events: ExitEventList,
     findings: ArrayList(Finding),
 
     fn deinit(self: *CheckResult, gpa: Allocator) void {
         var it = self.events.valueIterator();
         while (it.next()) |al| al.deinit(gpa);
         self.events.deinit();
+        self.exit_events.deinit(gpa);
         for (self.findings.items) |f| gpa.free(f.message);
         self.findings.deinit(gpa);
         self.env.deinit();
@@ -3259,7 +3622,7 @@ fn bracketCheck(gpa: Allocator, res: *CheckResult) !void {
         if (first_idx >= 1) {
             const prev = events[first_idx - 1];
             if (prev.kind == .lock or prev.kind == .lock_with_gen) acq_ok = true;
-            if (!acq_ok and prev.kind == .defer_unlock and first_idx >= 2) {
+            if (!acq_ok and (prev.kind == .defer_unlock or prev.kind == .errdefer_unlock) and first_idx >= 2) {
                 const pp = events[first_idx - 2];
                 if (pp.kind == .lock or pp.kind == .lock_with_gen) acq_ok = true;
             }
@@ -3298,7 +3661,7 @@ fn bracketCheck(gpa: Allocator, res: *CheckResult) !void {
             // Any defer_unlock anywhere before last_line covers.
             var has_defer = false;
             for (events) |ev| {
-                if (ev.kind == .defer_unlock and ev.src_line <= last_line) {
+                if ((ev.kind == .defer_unlock or ev.kind == .errdefer_unlock) and ev.src_line <= last_line) {
                     has_defer = true;
                     break;
                 }
@@ -3340,6 +3703,266 @@ fn bracketCheck(gpa: Allocator, res: *CheckResult) !void {
 
 
 // -----------------------------------------------------------------
+// Per-path release check
+//
+// The bracket check above verifies the linear (textual) order of
+// events: was the first access tight-preceded by a lock, was the last
+// access tight-followed by an unlock or covered by SOME defer-unlock
+// in the timeline. That misses two real leak shapes:
+//
+//   1. `const ptr = try ref.lockNoDefer();
+//       if (cond) return error.X;       // <- LEAK
+//       ref.unlock(ptr);`
+//
+//   2. `const ptr = try ref.lock();
+//       if (cond) return;                // covered by NOTHING
+//       ref.unlock(ptr);`
+//
+// Both have AN `.unlock` somewhere in the timeline so the existing
+// check is happy. Per-path coverage walks every reachable function
+// exit (return, return error, try-implicit-return, break, continue,
+// end-of-body) FROM each `lock` event and demands that on every such
+// path the lock is released — by an explicit `.unlock` reached on the
+// path, by a `.defer_unlock` registered before the exit at a depth
+// that still covers the exit, or by an `.errdefer_unlock` for the
+// subset of exits that propagate an error.
+//
+// Note: `panic_or_unreachable` exits don't unwind, so they're
+// effectively `noreturn` — the lock release obligation is dropped
+// (the runtime aborts). Similarly, breaks/continues that leave a loop
+// to a CONTAINING scope where the lock was registered fall back to
+// the same defer coverage rules — defers at any depth ≤ exit-depth
+// cover.
+// -----------------------------------------------------------------
+
+const ActiveDefer = struct {
+    kind: EventKind, // .defer_unlock or .errdefer_unlock
+    depth: i32,
+    register_seq: u32,
+    register_line: u32,
+};
+
+const BranchUnlock = struct {
+    depth: i32,
+    src_line: u32,
+};
+
+fn defersCover(
+    actives: []const ActiveDefer,
+    exit_kind: ExitKind,
+    exit_depth: i32,
+) bool {
+    for (actives) |ad| {
+        // Defer fires when scope at register-depth exits. An exit at
+        // depth >= ad.depth is inside the defer's protection.
+        if (exit_depth < ad.depth) continue;
+        if (ad.kind == .defer_unlock) return true;
+        if (ad.kind == .errdefer_unlock) {
+            switch (exit_kind) {
+                .return_error, .throw => return true,
+                else => {},
+            }
+        }
+    }
+    return false;
+}
+
+// A branch-local unlock at depth D covers subsequent exits ONLY while
+// execution stays at depth >= D. The path walker prunes branch unlocks
+// whose depth has been left behind: any later event at depth < bu.depth
+// means we exited bu's scope and bu no longer protects future paths.
+fn pruneBranchUnlocks(
+    actives: *ArrayList(BranchUnlock),
+    cur_depth: i32,
+) void {
+    var i: usize = 0;
+    while (i < actives.items.len) {
+        if (actives.items[i].depth > cur_depth) {
+            _ = actives.swapRemove(i);
+        } else {
+            i += 1;
+        }
+    }
+}
+
+fn anyBranchUnlockCovers(
+    actives: []const BranchUnlock,
+    exit_depth: i32,
+) bool {
+    for (actives) |bu| {
+        if (bu.depth <= exit_depth) return true;
+    }
+    return false;
+}
+
+fn exitKindLabel(k: ExitKind) []const u8 {
+    return switch (k) {
+        .return_normal => "return",
+        .return_error => "return error",
+        .throw => "try (error propagation)",
+        .break_stmt => "break",
+        .continue_stmt => "continue",
+        .panic_or_unreachable => "panic/unreachable",
+        .scope_close => "scope close",
+    };
+}
+
+fn pathReleaseCheck(gpa: Allocator, res: *CheckResult) !void {
+    // We need a global event stream ordered by seq. Per-ident events
+    // are stored in res.events; exit events live in res.exit_events.
+    // Walk the per-ident timeline of EACH ident, interleaving exit
+    // events by seq.
+    var it = res.events.iterator();
+    while (it.next()) |kv| {
+        const ident = kv.key_ptr.*;
+        const events = kv.value_ptr.items;
+        if (events.len == 0) continue;
+        if (res.env.self_alive.contains(ident)) continue;
+
+        // Skip idents with no lock events at all — the existing check
+        // already produces a finding for "access without lock".
+        var has_lock = false;
+        for (events) |ev| {
+            if (ev.kind == .lock or ev.kind == .lock_with_gen) {
+                has_lock = true;
+                break;
+            }
+        }
+        if (!has_lock) continue;
+
+        const slab_ty: []const u8 = blk: {
+            for (events) |ev| {
+                if (ev.slab_type.len > 0) break :blk ev.slab_type;
+            }
+            break :blk res.env.map.get(ident) orelse "?";
+        };
+
+        // For each lock event, scan forward.
+        var li: usize = 0;
+        while (li < events.len) : (li += 1) {
+            const lock_ev = events[li];
+            if (lock_ev.kind != .lock and lock_ev.kind != .lock_with_gen) continue;
+
+            var actives = ArrayList(ActiveDefer).empty;
+            defer actives.deinit(gpa);
+            // Branch-local unlocks: an unlock at depth D > lock.depth
+            // covers exits inside the same branch (depth >= D). When
+            // execution leaves D's scope (we observe an event at depth
+            // < D), the unlock is pruned — sibling branches DO need
+            // their own release.
+            var branch_unlocks = ArrayList(BranchUnlock).empty;
+            defer branch_unlocks.deinit(gpa);
+
+            // Walk forward, interleaving exit events by seq order.
+            var ev_i: usize = li + 1;
+            var ex_i: usize = 0;
+            // Skip exit events that occurred before this lock.
+            while (ex_i < res.exit_events.items.len and
+                res.exit_events.items[ex_i].seq < lock_ev.seq) : (ex_i += 1)
+            {}
+
+            // For `x.lock() catch ...` form: until execution returns to
+            // lock_ev.depth, exits inside the failure-path operand are
+            // suppressed (the lock was never acquired on that path).
+            var in_catch_skip: bool = lock_ev.in_catch;
+
+            outer: while (ev_i < events.len or ex_i < res.exit_events.items.len) {
+                const next_ev_seq: u32 = if (ev_i < events.len) events[ev_i].seq else std.math.maxInt(u32);
+                const next_ex_seq: u32 = if (ex_i < res.exit_events.items.len)
+                    res.exit_events.items[ex_i].seq
+                else
+                    std.math.maxInt(u32);
+                if (next_ev_seq <= next_ex_seq) {
+                    const ev = events[ev_i];
+                    ev_i += 1;
+                    if (in_catch_skip and ev.depth <= lock_ev.depth) {
+                        in_catch_skip = false;
+                    }
+                    pruneBranchUnlocks(&branch_unlocks, ev.depth);
+                    switch (ev.kind) {
+                        .lock, .lock_with_gen => {
+                            // Re-acquired without intervening release.
+                            // Treat as continuation; outer defers still
+                            // apply. (A re-lock at depth equal to the
+                            // original lock's depth is dubious in
+                            // practice but caught by the existing
+                            // tight-bracket check.)
+                        },
+                        .unlock => {
+                            if (ev.depth <= lock_ev.depth) {
+                                // Explicit release at the lock's own
+                                // depth (or shallower): the lock has
+                                // been discharged on the only sequential
+                                // path. Branch unlocks below this point
+                                // belong to a different lock instance.
+                                break :outer;
+                            } else {
+                                try branch_unlocks.append(gpa, .{
+                                    .depth = ev.depth,
+                                    .src_line = ev.src_line,
+                                });
+                            }
+                        },
+                        .defer_unlock, .errdefer_unlock => {
+                            try actives.append(gpa, .{
+                                .kind = ev.kind,
+                                .depth = ev.depth,
+                                .register_seq = ev.seq,
+                                .register_line = ev.src_line,
+                            });
+                        },
+                        .access => {},
+                    }
+                } else {
+                    const ex = res.exit_events.items[ex_i];
+                    ex_i += 1;
+                    // scope_close is purely a pruning trigger — not a
+                    // real exit. Apply prune (also prune in_catch_skip
+                    // when we drop back to the lock's depth) and
+                    // continue.
+                    if (ex.kind == .scope_close) {
+                        pruneBranchUnlocks(&branch_unlocks, ex.depth);
+                        if (in_catch_skip and ex.depth <= lock_ev.depth) {
+                            in_catch_skip = false;
+                        }
+                        continue;
+                    }
+                    if (ex.kind == .panic_or_unreachable) continue;
+                    if (in_catch_skip and ex.depth > lock_ev.depth) continue;
+                    if (in_catch_skip and ex.depth <= lock_ev.depth) {
+                        in_catch_skip = false;
+                    }
+                    pruneBranchUnlocks(&branch_unlocks, ex.depth);
+                    if (defersCover(actives.items, ex.kind, ex.depth)) continue;
+                    if (anyBranchUnlockCovers(branch_unlocks.items, ex.depth)) continue;
+                    const msg = try std.fmt.allocPrint(gpa,
+                        "{s} ({s}): lock at L{d} not released on path to {s} at L{d} (no unlock, no covering defer/errdefer)",
+                        .{ ident, slab_ty, lock_ev.src_line, exitKindLabel(ex.kind), ex.src_line });
+                    try res.findings.append(gpa, .{
+                        .severity = .err,
+                        .entry_name = res.entry.name,
+                        .message = msg,
+                        .line_no = ex.src_line,
+                    });
+                    // Continue scanning so multiple leaking paths in
+                    // the same body each surface as their own finding,
+                    // rather than only the first.
+                }
+            }
+            // No explicit fall-through-to-body-end check here: if the
+            // body's last reachable statement is an exit, the exit-
+            // events check already evaluated coverage. If the lock was
+            // released at its own depth via an explicit unlock, the
+            // walk broke out at that point. The remaining "implicit
+            // return at end of void function" case is rare for
+            // syscalls (which always return i64 explicitly); the
+            // existing tight-bracket check still complains if no
+            // unlock event exists at all on the timeline.
+        }
+    }
+}
+
+// -----------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------
 
@@ -3350,6 +3973,12 @@ const Args = struct {
     list_slab_types: bool = false,
     list_methods: bool = false,
     print_help: bool = false,
+    // Override the source root to scan. Used by the test harness so
+    // fixtures can stand in for real `kernel/` source without polluting
+    // the live tree. When set, the analyzer scans <override> instead of
+    // `<repo_root>/kernel/`. The relative-path stripping still uses the
+    // override directory as the "kernel root" for findRepoRoot purposes.
+    root_override: ?[]const u8 = null,
 };
 
 fn parseArgs(gpa: Allocator) !Args {
@@ -3370,6 +3999,8 @@ fn parseArgs(gpa: Allocator) !Args {
             args.print_help = true;
         } else if (mem.eql(u8, a, "--entry")) {
             if (it.next()) |val| args.entry_filter = val;
+        } else if (mem.eql(u8, a, "--root")) {
+            if (it.next()) |val| args.root_override = val;
         }
     }
     return args;
@@ -3389,11 +4020,21 @@ fn printHelp(w: *std.Io.Writer) !void {
         \\  - Per-entry-point gen-lock bracketing: every access to a slab-typed
         \\    local in a syscall / exception handler must be tight-preceded by
         \\    a lock and tight-followed by an unlock on the same ident.
+        \\  - Per-path release coverage: every lock event must be released on
+        \\    every reachable control-flow exit (return, return error, try
+        \\    error propagation, break, continue) — by an explicit unlock
+        \\    reached on that path, by a `defer ref.unlock(...)` registered
+        \\    before the exit, or (for error paths only) by an
+        \\    `errdefer ref.unlock(...)`. `@panic`/`unreachable` exits are
+        \\    treated as `noreturn` and impose no release obligation.
         \\
         \\Options:
         \\  --summary             one line per entry with finding counts
         \\  --verbose, -v         per-ident access and lock-op summary
         \\  --entry NAME          drill into a single handler
+        \\  --root DIR            scan DIR instead of <repo>/kernel/ (test
+        \\                        harness uses this to point at a fixture
+        \\                        tree shaped like a real kernel/ subtree)
         \\  --list-slab-types     print discovered slab-backed types and exit
         \\  --list-methods        print discovered (receiver, method) pairs
         \\  --help, -h            show this help
@@ -3447,10 +4088,25 @@ pub fn main() !u8 {
         return 0;
     }
 
-    const repo_root = try findRepoRoot(gpa);
-    defer gpa.free(repo_root);
-    const kernel_dir = try fs.path.join(gpa, &.{ repo_root, "kernel" });
-    defer gpa.free(kernel_dir);
+    const repo_root_owned: ?[]const u8 = if (args.root_override == null)
+        try findRepoRoot(gpa)
+    else blk: {
+        // Treat the override's parent directory as the synthetic repo
+        // root so rel paths are reported as `kernel/<file>` (matching
+        // the entry-discovery prefix `kernel/syscall/...`).
+        const parent_opt = fs.path.dirname(args.root_override.?);
+        if (parent_opt) |p| break :blk try gpa.dupe(u8, p);
+        break :blk try gpa.dupe(u8, ".");
+    };
+    defer if (repo_root_owned) |r| gpa.free(r);
+
+    const kernel_dir: []const u8 = if (args.root_override) |ov|
+        ov
+    else
+        try fs.path.join(gpa, &.{ repo_root_owned.?, "kernel" });
+    defer if (args.root_override == null) gpa.free(kernel_dir);
+
+    const repo_root: []const u8 = repo_root_owned.?;
 
     // Collect file list.
     var paths = ArrayList([]const u8).empty;
@@ -3620,14 +4276,17 @@ pub fn main() !u8 {
     for (entries.items) |*entry| {
         var env = SlabEnv.init(gpa);
         var events = EventMap.init(gpa);
-        try analyzeEntry(gpa, &pool, files.items, tokens.items, &slab_types, &fn_index, &summaries, entry, &env, &events);
+        var exit_events = ExitEventList.empty;
+        try analyzeEntry(gpa, &pool, files.items, tokens.items, &slab_types, &fn_index, &summaries, entry, &env, &events, &exit_events);
         var res = CheckResult{
             .entry = entry,
             .env = env,
             .events = events,
+            .exit_events = exit_events,
             .findings = ArrayList(Finding).empty,
         };
         try bracketCheck(gpa, &res);
+        try pathReleaseCheck(gpa, &res);
         try results.append(gpa, res);
     }
 
@@ -3787,5 +4446,6 @@ fn eventKindName(k: EventKind) []const u8 {
         .unlock => "unlock",
         .lock_with_gen => "lockWithGen",
         .defer_unlock => "defer-unlock",
+        .errdefer_unlock => "errdefer-unlock",
     };
 }
