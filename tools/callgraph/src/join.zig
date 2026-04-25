@@ -343,6 +343,26 @@ fn attachIntra(
         try file_line_to_ast.put(key, af);
     }
 
+    // Build the global qualified-name → fn-id index. branches.zig uses this
+    // to resolve `Foo.bar()` calls when the IR doesn't have an edge at the
+    // site (e.g. comptime arch-pruned arms). Functions that didn't join to
+    // an AST entry keep their fallback IR-mangled name in `f.name`; including
+    // those entries here is harmless — the resolver only hits keys that match
+    // an `<imported_module>.<rest>` candidate built from a known import.
+    var qname_index = branches.QNameIndex.init(arena);
+    for (functions) |*f| {
+        // First-write-wins to mirror the secondary index in buildGraphWithStats.
+        _ = try qname_index.getOrPutValue(f.name, f.id);
+    }
+
+    // Companion set of every AST-known qualified name. The IR drops inline
+    // and comptime functions; they still exist in the AST walker output, and
+    // resolving a call to one of them is more useful than `? indirect`.
+    var known_names = branches.KnownNames.init(arena);
+    for (ast_fns) |af| {
+        try known_names.put(af.qualified_name, {});
+    }
+
     // Build per-function call-site maps. For each EnrichedEdge in each
     // function, key by `<resolved_site_file>:<line>` and append a Callee.
     // We build a transient list of edges per function id and only convert
@@ -379,6 +399,16 @@ fn attachIntra(
             try sites.put(entry.key_ptr.*, try arena.dupe(types.Callee, entry.value_ptr.items));
         }
 
-        f.intra = branches.buildIntra(arena, resolved_def, af.fn_node, fa.tree, sites, target_arch) catch &.{};
+        f.intra = branches.buildIntra(
+            arena,
+            resolved_def,
+            af.fn_node,
+            fa.tree,
+            sites,
+            target_arch,
+            &fa.imports,
+            &qname_index,
+            &known_names,
+        ) catch &.{};
     }
 }

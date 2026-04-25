@@ -15,9 +15,25 @@
 // and `loop` records. Branches recursively nest through `arms[].seq` and
 // loops through `body`. Arms keep the calls in source order; the simplify
 // pass only removes branches, never reorders within a sequence.
+//
+// Comptime arch pruning (Apr 2026): `switch (builtin.cpu.arch)` and
+// `if (builtin.cpu.arch == .X)` resolve at compile time, so the IR only
+// emits one arm. The walker now mirrors that: the matched arm's body is
+// spliced inline, the others are dropped. This kills the noise where the
+// AST showed `? indirect: x64.foo` calls that the IR couldn't prove direct
+// because they were comptime-eliminated for the build's selected arch.
+//
+// Module-qualified call resolution (Apr 2026): when an `Foo.bar(...)` call
+// has no IR-resolved match at its site, we look up `Foo` in the file's
+// import table to build a candidate qname `<imports[Foo]>.bar`. If that
+// candidate hits the global qname index, we emit a resolved Callee. This
+// catches calls in the comptime-eliminated arch arm whose targets exist
+// elsewhere in the AST, plus generic `pmm.alloc` / `arch.foo` patterns
+// that previously fell through to `? indirect`.
 
 const std = @import("std");
 
+const walker = @import("walker.zig");
 const types = @import("../types.zig");
 
 const Atom = types.Atom;
@@ -27,10 +43,22 @@ const BranchKind = types.BranchKind;
 const Callee = types.Callee;
 const EdgeKind = types.EdgeKind;
 const FnId = types.FnId;
+const ImportTable = walker.ImportTable;
 const LoopAtom = types.LoopAtom;
 const SourceLoc = types.SourceLoc;
+const TargetArch = types.TargetArch;
 
 pub const CallSiteMap = std.StringHashMap([]const Callee);
+
+/// Global qualified-name → function-id index. Populated by join.zig from the
+/// IR-joined functions list. Used to turn `Foo.bar(...)` calls into resolved
+/// Callees with a navigable `to` target. The companion KnownNames set covers
+/// names that exist in the AST but not the IR (inline / comptime fns that
+/// the LLVM IR no longer carries) — a hit there resolves to a named direct
+/// call with `to=null`, which is still much better than the indirect synth
+/// fallback.
+pub const QNameIndex = std.StringHashMap(types.FnId);
+pub const KnownNames = std.StringHashMap(void);
 
 /// Hash key suitable for `CallSiteMap`. Caller owns the returned slice via
 /// the same arena passed to buildIntra.
@@ -42,6 +70,13 @@ pub fn callSiteKey(arena: std.mem.Allocator, file: []const u8, line: u32) ![]con
 /// std.zig.Ast node index of the fn_decl. `callsites` is keyed by
 /// `<file>:<line>` (use `callSiteKey`) and contains every IR-resolved
 /// callee originating from this function.
+///
+/// `imports` and `qname_index` are optional. When supplied, the walker uses
+/// them to resolve module-qualified call expressions (`Foo.bar()`) by
+/// looking up `Foo` in the file's import table and then qualifying against
+/// the global qname index. They also enable comptime arch-pruning of
+/// `switch (builtin.cpu.arch)` and `if (builtin.cpu.arch == .X)` constructs
+/// — without the imports we fall back to a source-text heuristic.
 pub fn buildIntra(
     arena: std.mem.Allocator,
     file: []const u8,
@@ -49,8 +84,10 @@ pub fn buildIntra(
     ast: *const std.zig.Ast,
     callsites: CallSiteMap,
     target_arch: types.TargetArch,
+    imports: ?*const ImportTable,
+    qname_index: ?*const QNameIndex,
+    known_names: ?*const KnownNames,
 ) ![]const Atom {
-    _ = target_arch; // wired through; logic added by import/arch-prune agent
     const node_idx: std.zig.Ast.Node.Index = @enumFromInt(fn_node);
 
     // The body of a fn_decl is the second node in node_and_node.
@@ -62,6 +99,10 @@ pub fn buildIntra(
         .ast = ast,
         .file = file,
         .callsites = callsites,
+        .target_arch = target_arch,
+        .imports = imports,
+        .qname_index = qname_index,
+        .known_names = known_names,
     };
 
     var seq = std.ArrayList(IrNode){};
@@ -112,6 +153,20 @@ const Ctx = struct {
     ast: *const std.zig.Ast,
     file: []const u8,
     callsites: CallSiteMap,
+    target_arch: TargetArch,
+    /// Per-file local-binding → resolved-module-path table. Used by emitCall
+    /// to resolve `Foo.bar()` chains and by emitSwitch / emitIf to detect
+    /// `builtin.cpu.arch` dispatch sites. Optional; when null, emit falls
+    /// back to source-text matching for the arch detect and skips the
+    /// module-qualified call resolution entirely.
+    imports: ?*const ImportTable,
+    /// Global qualified-name → fn-id map for cross-module call resolution.
+    /// Optional for the same reason as `imports`.
+    qname_index: ?*const QNameIndex,
+    /// Known qualified names (set). Catches AST-only names (inline / comptime
+    /// fns missing from the IR). On hit we still produce a named direct
+    /// Callee, just with `to=null`.
+    known_names: ?*const KnownNames,
     /// Defer / errdefer expression nodes accumulated at function scope.
     /// Walked at function-end so their calls show up in the sequence.
     defers: std.ArrayList(std.zig.Ast.Node.Index) = .{},
@@ -409,6 +464,45 @@ fn emitCall(
             }
         }
         if (best) |c| {
+            // Prefer a direct IR resolution. If the IR is indirect at this
+            // site, fall through to the AST import resolver — many indirect
+            // edges are inline-eliminated calls whose targets we can recover
+            // from the import table.
+            if (c.kind != .indirect) {
+                try out.append(ctx.arena, .{ .call = c });
+                return;
+            }
+        }
+    }
+
+    // No direct IR match. Try AST-side import resolution: when the call
+    // target is `Foo.bar(...)` and `Foo` is in the file's import table, we
+    // can build a global-qname candidate `<imports[Foo]>.bar` and resolve
+    // against the qname index. This catches calls the IR omitted because
+    // they were inlined or comptime-eliminated for the build's selected arch.
+    //
+    // TODO(self-method-resolution): `self.method()` calls don't resolve here
+    // — they need receiver-type tracking, which is out of scope for this
+    // commit. They keep falling through to the indirect fallback below.
+    if (try resolveByImports(ctx, call.ast.fn_expr, line, col)) |resolved| {
+        try out.append(ctx.arena, .{ .call = resolved });
+        return;
+    }
+
+    // Last-resort: use the IR's indirect record if there was one — at least
+    // it preserves the `to=null` site and any name the IR side filled in.
+    if (candidates_opt) |candidates| {
+        var best: ?Callee = null;
+        var best_dist: u32 = std.math.maxInt(u32);
+        for (candidates) |c| {
+            const cc: u32 = c.site.col;
+            const d: u32 = if (cc > col) cc - col else col - cc;
+            if (d < best_dist) {
+                best_dist = d;
+                best = c;
+            }
+        }
+        if (best) |c| {
             try out.append(ctx.arena, .{ .call = c });
             return;
         }
@@ -424,12 +518,124 @@ fn emitCall(
     } });
 }
 
+/// Module-qualified call resolver. Pulls the leftmost identifier of a
+/// `Foo.bar(...)` chain, looks it up in the file's import table, builds a
+/// `<imported_module>.<rest>` qname candidate, and asks the global qname
+/// index for a fn id. Returns null on any miss; the caller will fall back to
+/// the indirect synthesis path.
+fn resolveByImports(
+    ctx: *Ctx,
+    fn_expr: std.zig.Ast.Node.Index,
+    line: u32,
+    col: u32,
+) !?Callee {
+    const imports = ctx.imports orelse return null;
+
+    const tag = ctx.ast.nodeTag(fn_expr);
+
+    // Bare identifier call: `bareFn(...)`. The call may be a top-level fn
+    // declared in this same file (in which case `<file_module>.bareFn` hits
+    // the qname index) or a re-export bound to another module (in which case
+    // the import table maps `bareFn` directly to its resolved module path).
+    // Both lookups are cheap; try them in that order.
+    if (tag == .identifier) {
+        const ident = nodeSource(ctx, fn_expr);
+        if (ident.len == 0) return null;
+        // 1) Same-file top-level fn (dotted module path + ident).
+        const file_mod = try fileToDottedModule(ctx.arena, ctx.file);
+        if (file_mod.len > 0) {
+            const same_file_cand = try std.fmt.allocPrint(
+                ctx.arena,
+                "{s}.{s}",
+                .{ file_mod, ident },
+            );
+            if (try lookupCandidate(ctx, same_file_cand, line, col)) |c| return c;
+        }
+        // 2) Re-exported via the import table (`const X = some.module.X;`).
+        if (imports.get(ident)) |resolved| {
+            // resolved here is a module-path-style string already pointing at
+            // the target. Try the bare resolved string as the candidate.
+            if (try lookupCandidate(ctx, resolved, line, col)) |c| return c;
+        }
+        return null;
+    }
+
+    if (tag != .field_access) return null;
+
+    const chain = chainSource(ctx, fn_expr) orelse return null;
+    const dot = std.mem.indexOfScalar(u8, chain, '.') orelse return null;
+    const head = chain[0..dot];
+    const tail = chain[dot + 1 ..];
+    if (tail.len == 0) return null;
+
+    const resolved_head = imports.get(head) orelse return null;
+
+    // Special case: walker.zig strips `/usr/lib/zig/std/` from stdlib paths,
+    // so `std.fmt.X` lives in the qname index as `fmt.X` (not `std.fmt.X`).
+    // When the head resolves to "std", try the stdlib-form first.
+    if (std.mem.eql(u8, resolved_head, "std")) {
+        if (try lookupCandidate(ctx, tail, line, col)) |c| return c;
+    }
+
+    const candidate = try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ resolved_head, tail });
+    return try lookupCandidate(ctx, candidate, line, col);
+}
+
+/// Look `candidate` up in the qname index (preferred — gives us a `to` id)
+/// then in the known-names set (fallback — name only, `to=null`). Returns
+/// null on miss in both.
+fn lookupCandidate(
+    ctx: *Ctx,
+    candidate: []const u8,
+    line: u32,
+    col: u32,
+) !?Callee {
+    if (ctx.qname_index) |qi| {
+        if (qi.get(candidate)) |fn_id| {
+            return Callee{
+                .to = fn_id,
+                .name = try ctx.arena.dupe(u8, candidate),
+                .kind = .direct,
+                .site = .{ .file = ctx.file, .line = line, .col = col },
+            };
+        }
+    }
+    if (ctx.known_names) |kn| {
+        if (kn.contains(candidate)) {
+            return Callee{
+                .to = null,
+                .name = try ctx.arena.dupe(u8, candidate),
+                .kind = .direct,
+                .site = .{ .file = ctx.file, .line = line, .col = col },
+            };
+        }
+    }
+    return null;
+}
+
 fn emitIf(
     ctx: *Ctx,
     node: std.zig.Ast.Node.Index,
     out: *std.ArrayList(IrNode),
 ) !void {
     const ifn = ctx.ast.fullIf(node) orelse return;
+
+    // Comptime arch pruning: `if (builtin.cpu.arch == .x86_64) {…} else {…}`
+    // and the equivalent `!=` form. v1 only handles the direct `==` / `!=`
+    // form against a single arch tag; chained `or` (`.aarch64 or .arm`) is
+    // not detected.
+    if (classifyBuiltinCpuArchIf(ctx, ifn.ast.cond_expr)) |branch_match| {
+        const take_then = switch (branch_match.op) {
+            .eq => branch_match.arch == ctx.target_arch,
+            .neq => branch_match.arch != ctx.target_arch,
+        };
+        if (take_then) {
+            try walkExpr(ctx, ifn.ast.then_expr, out);
+        } else if (ifn.ast.else_expr.unwrap()) |else_node| {
+            try walkExpr(ctx, else_node, out);
+        }
+        return;
+    }
 
     // Calls inside the condition itself are part of the *enclosing* sequence
     // (they happen before the branch decides which arm runs).
@@ -493,6 +699,41 @@ fn emitSwitch(
 ) !void {
     const sw = ctx.ast.fullSwitch(node) orelse return;
 
+    // Comptime arch pruning: if the scrutinee is `builtin.cpu.arch`, we can
+    // pick exactly one arm — the one whose value matches target_arch — and
+    // splice its body into `out` as if it were the only path.
+    if (isBuiltinCpuArchScrutinee(ctx, sw.ast.condition)) {
+        const arch_tag = archTagFor(ctx.target_arch);
+        var matched_case: ?std.zig.Ast.Node.Index = null;
+        var has_explicit_match = false;
+        var else_case: ?std.zig.Ast.Node.Index = null;
+
+        for (sw.ast.cases) |case_node| {
+            const case = ctx.ast.fullSwitchCase(case_node) orelse continue;
+            if (case.ast.values.len == 0) {
+                else_case = case_node;
+                continue;
+            }
+            for (case.ast.values) |v| {
+                if (caseValueMatchesTag(ctx, v, arch_tag)) {
+                    matched_case = case_node;
+                    has_explicit_match = true;
+                    break;
+                }
+            }
+            if (has_explicit_match) break;
+        }
+
+        const chosen = matched_case orelse else_case;
+        if (chosen) |case_node| {
+            const case = ctx.ast.fullSwitchCase(case_node).?;
+            try walkExpr(ctx, case.ast.target_expr, out);
+            return;
+        }
+        // No matching arm and no else — fall through to the normal path
+        // (rare; conservatively keep the switch so calls aren't dropped).
+    }
+
     try walkExpr(ctx, sw.ast.condition, out);
 
     var arms = std.ArrayList(ArmIr){};
@@ -517,6 +758,147 @@ fn emitSwitch(
         .arms = try arms.toOwnedSlice(ctx.arena),
     };
     try out.append(ctx.arena, .{ .branch = branch });
+}
+
+// -------------------------------------------------------------- arch prune
+
+/// Test whether `node` is the source-level expression `builtin.cpu.arch`.
+/// We trust the file's import table when available — `head.cpu.arch` is the
+/// dispatch site iff `imports[head] == "builtin"`. When the table isn't
+/// available (callers that don't supply imports) we fall back to a literal
+/// source-text match, since the kernel uses exactly the spelling
+/// `builtin.cpu.arch` everywhere.
+fn isBuiltinCpuArchScrutinee(ctx: *Ctx, node: std.zig.Ast.Node.Index) bool {
+    const src = chainSource(ctx, node) orelse return false;
+    if (!std.mem.endsWith(u8, src, "cpu.arch")) return false;
+
+    if (ctx.imports) |imports| {
+        const dot1 = std.mem.indexOfScalar(u8, src, '.') orelse return false;
+        const head = src[0..dot1];
+        const resolved = imports.get(head) orelse return false;
+        return std.mem.eql(u8, resolved, "builtin");
+    }
+    // Fallback: match the canonical spelling used throughout the kernel.
+    return std.mem.eql(u8, src, "builtin.cpu.arch");
+}
+
+/// Slice the source span for an identifier or `.field_access` chain. Other
+/// node tags return null (the caller can decide how to handle).
+fn chainSource(ctx: *Ctx, node: std.zig.Ast.Node.Index) ?[]const u8 {
+    const tag = ctx.ast.nodeTag(node);
+    if (tag != .field_access and tag != .identifier) return null;
+    const first = ctx.ast.firstToken(node);
+    const last = ctx.ast.lastToken(node);
+    const start = ctx.ast.tokenStart(first);
+    const last_start = ctx.ast.tokenStart(last);
+    const last_slice = ctx.ast.tokenSlice(last);
+    const end: usize = @as(usize, last_start) + last_slice.len;
+    if (end <= start or end > ctx.ast.source.len) return null;
+    return ctx.ast.source[start..end];
+}
+
+/// Non-allocating module-path slice for a file path. Mirrors the rules in
+/// walker.filePathToModulePath (kernel root, /usr/lib/zig, /usr/lib/zig/std)
+/// but returns a slice into a static-ish form. Returns an empty slice if the
+/// path doesn't match any known root (the resolver then falls through).
+///
+/// Caveat: this returns the dotted module form by replacing `/` with `.` —
+/// since we need a fresh allocation for that. Callers pass the file path
+/// they got from emitCall (which is the resolved abs path). We re-allocate
+/// the dotted form into the arena, which is fine for the rare bare-ident
+/// resolution path.
+fn filePathToModulePathSlice(file: []const u8) []const u8 {
+    var rel: []const u8 = file;
+
+    const zig_std_prefix = "/usr/lib/zig/std/";
+    const zig_root_prefix = "/usr/lib/zig/";
+    if (std.mem.startsWith(u8, rel, zig_std_prefix)) {
+        rel = rel[zig_std_prefix.len..];
+    } else if (std.mem.startsWith(u8, rel, zig_root_prefix)) {
+        rel = rel[zig_root_prefix.len..];
+    } else if (std.mem.indexOf(u8, rel, "/kernel/")) |i| {
+        rel = rel[i + "/kernel/".len ..];
+    } else if (std.mem.startsWith(u8, rel, "kernel/")) {
+        rel = rel["kernel/".len..];
+    } else {
+        return "";
+    }
+
+    if (std.mem.endsWith(u8, rel, ".zig")) {
+        rel = rel[0 .. rel.len - ".zig".len];
+    }
+    return rel;
+}
+
+/// Allocating dotted-module-path form. Slashes become dots. Used when we
+/// need to construct a candidate qname against the global index.
+fn fileToDottedModule(arena: std.mem.Allocator, file: []const u8) ![]const u8 {
+    const rel = filePathToModulePathSlice(file);
+    if (rel.len == 0) return "";
+    const out = try arena.dupe(u8, rel);
+    for (out) |*c| {
+        if (c.* == '/') c.* = '.';
+    }
+    return out;
+}
+
+fn archTagFor(arch: TargetArch) []const u8 {
+    return switch (arch) {
+        .x86_64 => "x86_64",
+        .aarch64 => "aarch64",
+    };
+}
+
+/// Does the switch-case value source slice equal `.<tag>`? We accept a leading
+/// dot (enum-literal form `.x86_64`) — that's the form `builtin.cpu.arch`
+/// dispatch always uses in this codebase. Anything else is treated as
+/// non-matching, which conservatively keeps the arm.
+fn caseValueMatchesTag(
+    ctx: *Ctx,
+    value_node: std.zig.Ast.Node.Index,
+    tag: []const u8,
+) bool {
+    const src = nodeSource(ctx, value_node);
+    if (src.len < 2 or src[0] != '.') return false;
+    const trimmed = std.mem.trim(u8, src[1..], &std.ascii.whitespace);
+    return std.mem.eql(u8, trimmed, tag);
+}
+
+const ArchIfMatch = struct {
+    arch: TargetArch,
+    op: enum { eq, neq },
+};
+
+/// Classify an `if` condition as a `builtin.cpu.arch == .X` (or `!=`) form.
+/// Returns null on anything we don't recognize. v1 only accepts the direct
+/// equality / inequality form against a single arch tag — `or`-chains and
+/// inversions like `!(builtin.cpu.arch == .x86_64)` are not handled.
+fn classifyBuiltinCpuArchIf(ctx: *Ctx, cond_expr: std.zig.Ast.Node.Index) ?ArchIfMatch {
+    const tag = ctx.ast.nodeTag(cond_expr);
+    if (tag != .equal_equal and tag != .bang_equal) return null;
+    const data = ctx.ast.nodeData(cond_expr);
+    const lhs = data.node_and_node[0];
+    const rhs = data.node_and_node[1];
+
+    const lhs_is_arch = isBuiltinCpuArchScrutinee(ctx, lhs);
+    const rhs_is_arch = isBuiltinCpuArchScrutinee(ctx, rhs);
+    const tag_node: std.zig.Ast.Node.Index = if (lhs_is_arch) rhs else if (rhs_is_arch) lhs else return null;
+
+    const tag_src = nodeSource(ctx, tag_node);
+    if (tag_src.len < 2 or tag_src[0] != '.') return null;
+    const tag_name = std.mem.trim(u8, tag_src[1..], &std.ascii.whitespace);
+
+    const arch: TargetArch = if (std.mem.eql(u8, tag_name, "x86_64"))
+        .x86_64
+    else if (std.mem.eql(u8, tag_name, "aarch64"))
+        .aarch64
+    else
+        return null;
+
+    return .{
+        .arch = arch,
+        .op = if (tag == .equal_equal) .eq else .neq,
+    };
 }
 
 // ---------------------------------------------------------------- labels

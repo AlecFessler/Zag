@@ -31,12 +31,21 @@ pub const AstFunction = struct {
     fn_node: u32 = 0,
 };
 
+/// Per-file map: local binding name → resolved module path. Built by
+/// scanning each file's top-level `const X = @import(...)` /
+/// `const X = some.chain;` decls. The resolved path is in the same
+/// dotted module-path form the AST walker emits as `qualified_name`'s
+/// prefix (e.g. `memory.pmm`, `arch.dispatch`, `std`, `builtin`). Used by
+/// branches.zig to turn `Foo.bar(...)` calls into a global qname candidate.
+pub const ImportTable = std.StringHashMap([]const u8);
+
 /// Per-file parsed AST + source bytes. The branches builder needs both to
 /// resolve node tags, token locations, and slice condition source.
 pub const FileAst = struct {
     file: []const u8,
     source: [:0]const u8,
     tree: *std.zig.Ast,
+    imports: ImportTable,
 };
 
 pub const WalkResult = struct {
@@ -168,10 +177,14 @@ fn walkFile(
         try walkDecl(&ctx, decl, "");
     }
 
+    const imports = buildImportTable(arena, tree_box, abs_file, root_decls) catch
+        ImportTable.init(arena);
+
     try asts.append(arena, .{
         .file = abs_file,
         .source = src_buf,
         .tree = tree_box,
+        .imports = imports,
     });
 }
 
@@ -424,6 +437,235 @@ fn filePathToModulePath(arena: std.mem.Allocator, abs_file: []const u8) ![]const
         if (c.* == '/') c.* = '.';
     }
     return out;
+}
+
+// ---------------------------------------------------------------- imports
+
+/// Build the per-file ImportTable from a file's top-level decls. Recognizes:
+///   - `const X = @import("std");`               → "std"
+///   - `const X = @import("builtin");`           → "builtin"
+///   - `const X = @import("zag");`               → "zag"
+///   - `const X = @import("rel/path.zig");`      → resolved-relative module path
+///   - `const X = some.dotted.chain;`            → resolves chain through prior bindings
+///
+/// Two passes so chained derivations (`const X = zag.foo.bar;` after `const zag = @import("zag");`)
+/// resolve regardless of declaration order. Anything we can't resolve is
+/// silently dropped — branches.zig falls back to the raw call source for
+/// those.
+fn buildImportTable(
+    arena: std.mem.Allocator,
+    tree: *const std.zig.Ast,
+    abs_file: []const u8,
+    root_decls: []const std.zig.Ast.Node.Index,
+) !ImportTable {
+    var table = ImportTable.init(arena);
+
+    // Pass 1: direct @import(...) calls.
+    for (root_decls) |decl| {
+        const tag = tree.nodeTag(decl);
+        switch (tag) {
+            .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => {},
+            else => continue,
+        }
+        const vd = tree.fullVarDecl(decl) orelse continue;
+        const init_node = vd.ast.init_node.unwrap() orelse continue;
+        const name_token = vd.ast.mut_token + 1;
+        const name = tree.tokenSlice(name_token);
+
+        if (try resolveImportRhs(arena, tree, abs_file, init_node, &table)) |resolved| {
+            try table.put(try arena.dupe(u8, name), resolved);
+        }
+    }
+
+    // Pass 2: dotted-chain derivations. Re-iterate decls until no new
+    // resolutions happen — this lets `const X = zag.foo;` resolve even when
+    // declared before `const zag = @import("zag");`. Cap at 5 iterations to
+    // avoid pathological inputs.
+    var iter: u32 = 0;
+    while (iter < 5) {
+        var added: bool = false;
+        for (root_decls) |decl| {
+            const tag = tree.nodeTag(decl);
+            switch (tag) {
+                .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => {},
+                else => continue,
+            }
+            const vd = tree.fullVarDecl(decl) orelse continue;
+            const init_node = vd.ast.init_node.unwrap() orelse continue;
+            const name_token = vd.ast.mut_token + 1;
+            const name = tree.tokenSlice(name_token);
+            if (table.contains(name)) continue;
+
+            if (try resolveImportRhs(arena, tree, abs_file, init_node, &table)) |resolved| {
+                try table.put(try arena.dupe(u8, name), resolved);
+                added = true;
+            }
+        }
+        if (!added) break;
+        iter += 1;
+    }
+
+    return table;
+}
+
+/// Try to resolve the RHS of a top-level `const X = ...;` decl into a module
+/// path. Returns null if the RHS isn't a recognizable @import or dotted chain
+/// against a known binding.
+fn resolveImportRhs(
+    arena: std.mem.Allocator,
+    tree: *const std.zig.Ast,
+    abs_file: []const u8,
+    rhs: std.zig.Ast.Node.Index,
+    table: *const ImportTable,
+) !?[]const u8 {
+    const tag = tree.nodeTag(rhs);
+
+    // `@import("...")` — builtin_call_two with one arg.
+    if (tag == .builtin_call_two or tag == .builtin_call_two_comma) {
+        const data = tree.nodeData(rhs);
+        const builtin_tok = tree.nodeMainToken(rhs);
+        const builtin_name = tree.tokenSlice(builtin_tok);
+        if (!std.mem.eql(u8, builtin_name, "@import")) return null;
+        const arg_a = data.opt_node_and_opt_node[0].unwrap() orelse return null;
+        const arg_tag = tree.nodeTag(arg_a);
+        if (arg_tag != .string_literal) return null;
+        const str_tok = tree.nodeMainToken(arg_a);
+        const raw = tree.tokenSlice(str_tok);
+        // Strip surrounding quotes.
+        if (raw.len < 2) return null;
+        const inner = raw[1 .. raw.len - 1];
+        return try resolveImportPath(arena, abs_file, inner);
+    }
+    if (tag == .builtin_call or tag == .builtin_call_comma) {
+        const data = tree.nodeData(rhs);
+        const builtin_tok = tree.nodeMainToken(rhs);
+        const builtin_name = tree.tokenSlice(builtin_tok);
+        if (!std.mem.eql(u8, builtin_name, "@import")) return null;
+        const slice = tree.extraDataSlice(data.extra_range, std.zig.Ast.Node.Index);
+        if (slice.len != 1) return null;
+        const arg_tag = tree.nodeTag(slice[0]);
+        if (arg_tag != .string_literal) return null;
+        const str_tok = tree.nodeMainToken(slice[0]);
+        const raw = tree.tokenSlice(str_tok);
+        if (raw.len < 2) return null;
+        const inner = raw[1 .. raw.len - 1];
+        return try resolveImportPath(arena, abs_file, inner);
+    }
+
+    // Dotted chain: `field_access` — `lhs.field`. Walk down to the leftmost
+    // identifier; if that identifier resolves through `table`, prepend the
+    // resolved module path and append the trailing `.field` chain.
+    if (tag == .field_access or tag == .identifier) {
+        const chain = nodeChainSource(tree, rhs) orelse return null;
+        return try resolveDottedChain(arena, chain, table);
+    }
+
+    return null;
+}
+
+/// Slice source for an identifier or chain of `.field_access` nodes. Returns
+/// null if the node is anything else.
+fn nodeChainSource(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) ?[]const u8 {
+    const tag = tree.nodeTag(node);
+    if (tag != .field_access and tag != .identifier) return null;
+    const first_tok = tree.firstToken(node);
+    const last_tok = tree.lastToken(node);
+    const start = tree.tokenStart(first_tok);
+    const last_start = tree.tokenStart(last_tok);
+    const last_slice = tree.tokenSlice(last_tok);
+    const end: usize = @as(usize, last_start) + last_slice.len;
+    if (end <= start or end > tree.source.len) return null;
+    return tree.source[start..end];
+}
+
+/// Resolve a dotted chain `Head.rest.of.chain` against the given table. If
+/// `Head` is in the table, the result is `<table[Head]>.<rest.of.chain>`,
+/// with the special case that for `zag` we strip the leading `zag.` (the
+/// kernel's re-export root mirrors the kernel directory tree).
+fn resolveDottedChain(
+    arena: std.mem.Allocator,
+    chain: []const u8,
+    table: *const ImportTable,
+) !?[]const u8 {
+    const dot = std.mem.indexOfScalar(u8, chain, '.');
+    const head = if (dot) |d| chain[0..d] else chain;
+    const tail = if (dot) |d| chain[d + 1 ..] else "";
+
+    const resolved_head = table.get(head) orelse return null;
+
+    // Special case: `zag.<rest>` strips the `zag.` since zag is the
+    // self-referencing root re-export. A plain `zag` head keeps the
+    // resolved binding's value (which is also the literal "zag").
+    if (std.mem.eql(u8, resolved_head, "zag")) {
+        if (tail.len == 0) return try arena.dupe(u8, "zag");
+        return try arena.dupe(u8, tail);
+    }
+
+    if (tail.len == 0) return try arena.dupe(u8, resolved_head);
+    return try std.fmt.allocPrint(arena, "{s}.{s}", .{ resolved_head, tail });
+}
+
+/// Given an `@import("...")` argument string, produce the matching module
+/// path. Special cases for "std" / "builtin" / "zag" / package roots. For
+/// relative paths, resolve relative to the importing file's directory, strip
+/// the kernel-root prefix, and translate `/` to `.` (matching the IR-style
+/// module path filePathToModulePath emits).
+fn resolveImportPath(
+    arena: std.mem.Allocator,
+    abs_importing_file: []const u8,
+    import_arg: []const u8,
+) !?[]const u8 {
+    if (std.mem.eql(u8, import_arg, "std")) return try arena.dupe(u8, "std");
+    if (std.mem.eql(u8, import_arg, "builtin")) return try arena.dupe(u8, "builtin");
+    if (std.mem.eql(u8, import_arg, "zag")) return try arena.dupe(u8, "zag");
+
+    // Anything that doesn't end in .zig is a named package import (e.g.
+    // `@import("kprof")` resolved by build.zig). Best-effort: treat the bare
+    // name as the module path. Works for `kprof` and `build_options`.
+    if (!std.mem.endsWith(u8, import_arg, ".zig")) {
+        return try arena.dupe(u8, import_arg);
+    }
+
+    // Relative path — join against the importing file's dir, then strip the
+    // kernel prefix and turn into a dotted module path.
+    const dir = std.fs.path.dirname(abs_importing_file) orelse return null;
+    const joined = try std.fs.path.join(arena, &.{ dir, import_arg });
+    // Normalize `..` segments without hitting the filesystem.
+    const normalized = normalizePath(arena, joined) catch joined;
+    return filePathToModulePath(arena, normalized) catch null;
+}
+
+/// Normalize a path string by collapsing `.` and `..` segments. Doesn't touch
+/// the filesystem — purely textual.
+fn normalizePath(arena: std.mem.Allocator, path: []const u8) ![]const u8 {
+    var stack = std.ArrayList([]const u8){};
+    defer stack.deinit(arena);
+    var it = std.mem.tokenizeScalar(u8, path, '/');
+    while (it.next()) |seg| {
+        if (std.mem.eql(u8, seg, ".")) continue;
+        if (std.mem.eql(u8, seg, "..")) {
+            if (stack.items.len > 0) _ = stack.pop();
+            continue;
+        }
+        try stack.append(arena, seg);
+    }
+    var total: usize = 0;
+    for (stack.items) |s| total += s.len + 1;
+    const buf = try arena.alloc(u8, total + 1);
+    var w: usize = 0;
+    if (std.mem.startsWith(u8, path, "/")) {
+        buf[w] = '/';
+        w += 1;
+    }
+    for (stack.items, 0..) |s, i| {
+        if (i > 0) {
+            buf[w] = '/';
+            w += 1;
+        }
+        @memcpy(buf[w .. w + s.len], s);
+        w += s.len;
+    }
+    return buf[0..w];
 }
 
 test "filePathToModulePath kernel" {
