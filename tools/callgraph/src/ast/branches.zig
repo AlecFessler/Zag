@@ -59,6 +59,20 @@ pub const CallSiteMap = std.StringHashMap([]const Callee);
 /// fallback.
 pub const QNameIndex = std.StringHashMap(types.FnId);
 pub const KnownNames = std.StringHashMap(void);
+/// Global struct-qname → StructTypeInfo. Built by join.zig from the walker's
+/// struct_types output. The receiver-chain resolver walks each `.field`
+/// segment through this table until only the trailing method name remains.
+pub const StructTypeIndex = std.StringHashMap(*const types.StructTypeInfo);
+
+/// Per-fn fn-pointer parameter bindings. Maps an inline fn's parameter name
+/// (e.g. `ktrampoline`) to the qname of the function the caller passed
+/// (e.g. `main.kTrampoline`). Used by emitCall when an AST-only inline body
+/// invokes a parameter — instead of rendering as `? indirect: ktrampoline`,
+/// the param is looked up here and the call resolves to the bound fn directly.
+/// join.zig populates the table by an all-callers-agree pass: only when every
+/// call site to the inline fn passes the same `&fn` for a given parameter is
+/// the binding recorded.
+pub const ParamBindings = std.StringHashMap([]const u8);
 
 /// Hash key suitable for `CallSiteMap`. Caller owns the returned slice via
 /// the same arena passed to buildIntra.
@@ -92,8 +106,10 @@ pub fn buildIntra(
     imports: ?*const ImportTable,
     qname_index: ?*const QNameIndex,
     known_names: ?*const KnownNames,
+    struct_types: ?*const StructTypeIndex,
     receiver_name: []const u8,
     receiver_type: []const u8,
+    param_bindings: ?*const ParamBindings,
 ) ![]const Atom {
     const node_idx: std.zig.Ast.Node.Index = @enumFromInt(fn_node);
 
@@ -110,9 +126,15 @@ pub fn buildIntra(
         .imports = imports,
         .qname_index = qname_index,
         .known_names = known_names,
+        .struct_types = struct_types,
         .receiver_name = receiver_name,
         .receiver_type = receiver_type,
+        .param_bindings = param_bindings,
+        .locals_stack = .{},
     };
+    // Push the function-scope local frame. Subsequent block entries push
+    // additional frames; the `head`-lookup walk visits every active frame.
+    try ctx.locals_stack.append(arena, .{});
 
     var seq = std.ArrayList(IrNode){};
     try walkExpr(&ctx, body_node, &seq);
@@ -176,6 +198,11 @@ const Ctx = struct {
     /// fns missing from the IR). On hit we still produce a named direct
     /// Callee, just with `to=null`.
     known_names: ?*const KnownNames,
+    /// Global struct-qname → StructTypeInfo. Drives the receiver-chain
+    /// resolver: each `.field` segment of `self.x.y.method(...)` looks up the
+    /// current struct, finds the named field, and advances to the field's
+    /// type. Optional; when null we skip multi-step chain resolution.
+    struct_types: ?*const StructTypeIndex,
     /// Local binding name of the enclosing function's first parameter when it
     /// has a receiver-shaped type (e.g. `self`, `this`, `lock`). Empty when
     /// the function has no receiver — in that case `<name>.method()` calls
@@ -186,10 +213,28 @@ const Ctx = struct {
     /// Combined with the called method name to form a qname-index lookup
     /// candidate (`<receiver_type>.<method>`).
     receiver_type: []const u8,
+    /// Optional fn-pointer parameter bindings — only populated when the
+    /// enclosing fn is an AST-only inline whose call sites all pass the same
+    /// `&fn` for a given param. emitCall consults this *before* falling
+    /// through to the indirect synth path: a bare-identifier call whose
+    /// fn_expr matches a binding key resolves directly to the bound qname.
+    param_bindings: ?*const ParamBindings,
     /// Defer / errdefer expression nodes accumulated at function scope.
     /// Walked at function-end so their calls show up in the sequence.
     defers: std.ArrayList(std.zig.Ast.Node.Index) = .{},
+    /// Stack of local-binding scopes built up as we descend into blocks. The
+    /// top frame holds the current block's `const name: T = ...` / `var
+    /// name: T = ...` decls; head-lookup for receiver resolution scans every
+    /// active frame from top to bottom (innermost first).
+    locals_stack: std.ArrayList(LocalScope) = .{},
 };
+
+/// Per-block local-binding table. Populated as `walkBlockBody` iterates
+/// statements and drained when the frame is popped. Entries with `type_qname
+/// == ""` are still inserted so a later `local_var.method()` call can detect
+/// "binding exists but unresolvable" and fall through to indirect rather
+/// than mis-resolving via shadowed outer-scope names.
+const LocalScope = std.StringHashMapUnmanaged([]const u8);
 
 // ---------------------------------------------------------------------- walk
 
@@ -205,10 +250,16 @@ fn walkExpr(
     switch (tag) {
         .root => return,
 
-        // Block — iterate statements.
+        // Block — iterate statements. Push a fresh locals scope for the block
+        // so var/const decls inside don't leak into the parent scope, and so
+        // shadowed bindings are seen innermost-first by the receiver
+        // resolver. The function-scope frame is pushed by `buildIntra` and
+        // covers the outermost body block; nested blocks add their own frame.
         .block, .block_semicolon, .block_two, .block_two_semicolon => {
             var buf: [2]std.zig.Ast.Node.Index = undefined;
             const stmts = ctx.ast.blockStatements(&buf, node) orelse return;
+            const pushed = try pushLocalsScope(ctx);
+            defer popLocalsScope(ctx, pushed);
             for (stmts) |s| try walkExpr(ctx, s, out);
         },
 
@@ -274,12 +325,18 @@ fn walkExpr(
             try ctx.defers.append(ctx.arena, expr);
         },
 
-        // Var decls — descend into init expression.
+        // Var decls — descend into init expression and, when the decl has an
+        // explicit type annotation (`const x: Foo = ...;` / `var x: Bar =
+        // ...;`), register the binding in the innermost locals scope so a
+        // later `x.method()` call resolves through the receiver-chain path.
+        // Inferred-type decls (no `: T`) leave the binding type unresolved —
+        // pattern 4 (call-result types) is intentionally out of scope for v1.
         .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => {
             const vd = ctx.ast.fullVarDecl(node) orelse return;
             if (vd.ast.init_node.unwrap()) |init_node| {
                 try walkExpr(ctx, init_node, out);
             }
+            try recordLocalDecl(ctx, vd);
         },
 
         // Test/fn/proto decls — skip (handled elsewhere or n/a).
@@ -494,6 +551,17 @@ fn emitCall(
         }
     }
 
+    // Fn-pointer parameter substitution: when this fn is an AST-only inline
+    // whose all-callers-agree pass produced a binding for one of its params,
+    // a bare-identifier call to that param resolves directly to the bound fn.
+    // E.g. inside `pub inline fn kEntry(_, ktrampoline: *const fn (...) ...)`
+    // the body's `ktrampoline(boot_info)` becomes a direct call to
+    // `main.kTrampoline` (which is what `&kTrampoline` was passed in main.zig).
+    if (try resolveByParamBinding(ctx, call.ast.fn_expr, line, col)) |resolved| {
+        try out.append(ctx.arena, .{ .call = resolved });
+        return;
+    }
+
     // No direct IR match. Try AST-side import resolution: when the call
     // target is `Foo.bar(...)` and `Foo` is in the file's import table, we
     // can build a global-qname candidate `<imports[Foo]>.bar` and resolve
@@ -548,6 +616,26 @@ fn emitCall(
         .kind = .indirect,
         .site = .{ .file = ctx.file, .line = line, .col = col },
     } });
+}
+
+/// Fn-pointer parameter resolver. When the call's fn_expr is a bare
+/// identifier matching a key in `ctx.param_bindings`, the bound qname is
+/// looked up against the qname index / known-names set and emitted as a
+/// direct call. Returns null when there are no bindings, when the fn_expr
+/// isn't a bare identifier, or when the binding doesn't resolve to a known
+/// qname.
+fn resolveByParamBinding(
+    ctx: *Ctx,
+    fn_expr: std.zig.Ast.Node.Index,
+    line: u32,
+    col: u32,
+) !?Callee {
+    const bindings = ctx.param_bindings orelse return null;
+    if (ctx.ast.nodeTag(fn_expr) != .identifier) return null;
+    const ident = nodeSource(ctx, fn_expr);
+    if (ident.len == 0) return null;
+    const bound_qname = bindings.get(ident) orelse return null;
+    return try lookupCandidate(ctx, bound_qname, line, col);
 }
 
 /// Module-qualified call resolver. Pulls the leftmost identifier of a
@@ -613,43 +701,214 @@ fn resolveByImports(
     return try lookupCandidate(ctx, candidate, line, col);
 }
 
-/// Receiver-method resolver. Pulls a `<binding>.method(...)` chain and, if
-/// `<binding>` matches the enclosing function's recorded receiver binding
-/// name, builds `<receiver_type>.method` and looks it up in the qname index.
-/// Returns null when the call isn't shaped that way, when there's no
-/// receiver binding for this fn, or when the candidate doesn't hit the
-/// index.
+/// Receiver-method resolver. Handles three shapes:
+///
+///   * `self.method(...)`               — single-hop receiver call.
+///   * `self.f1.f2.method(...)`         — multi-hop chain through receiver
+///                                        struct's field-type table.
+///   * `localvar.method(...)` and       — same chain logic, where `localvar`
+///     `localvar.field.method(...)`       was bound by `const x: T = ...`
+///                                        / `var x: T = ...` with an
+///                                        explicit type annotation.
+///
+/// Every chain step must succeed against the field-type index; any miss
+/// yields null and the caller falls through to the existing indirect
+/// fallback (better to not resolve than mis-resolve).
+///
+/// Patterns intentionally NOT handled (TODO):
+///   * Receivers bound by call-result whose type would require return-type
+///     inference (`const lock = self.acquireLock(); lock.unlock();`).
+///   * Optional / error-union peels (`if (self.maybe_x) |x| x.method();`).
+///   * Tuple-field receivers and anonymous-struct field access.
 fn resolveByReceiver(
     ctx: *Ctx,
     fn_expr: std.zig.Ast.Node.Index,
     line: u32,
     col: u32,
 ) !?Callee {
-    if (ctx.receiver_name.len == 0) return null;
-    if (ctx.receiver_type.len == 0) return null;
-
     const tag = ctx.ast.nodeTag(fn_expr);
     if (tag != .field_access) return null;
 
     const chain = chainSource(ctx, fn_expr) orelse return null;
-    const dot = std.mem.indexOfScalar(u8, chain, '.') orelse return null;
-    const head = chain[0..dot];
-    const tail = chain[dot + 1 ..];
+    const first_dot = std.mem.indexOfScalar(u8, chain, '.') orelse return null;
+    const head = chain[0..first_dot];
+    const tail = chain[first_dot + 1 ..];
     if (tail.len == 0) return null;
 
-    if (!std.mem.eql(u8, head, ctx.receiver_name)) return null;
+    // Pick a starting type. Prefer the enclosing fn's receiver, then any
+    // matching local var with an explicit-typed binding. Locals shadow the
+    // receiver: a same-named binding inside the body wins, mirroring Zig's
+    // own scoping. If neither matches, give up — the call isn't a
+    // receiver-or-local chain.
+    var cur_type: []const u8 = "";
+    if (lookupLocal(ctx, head)) |t| {
+        cur_type = t;
+    } else if (ctx.receiver_name.len > 0 and std.mem.eql(u8, head, ctx.receiver_name)) {
+        cur_type = ctx.receiver_type;
+    } else {
+        return null;
+    }
+    if (cur_type.len == 0) return null;
 
-    // `tail` may itself be a chain (`self.field.method()`) — we only resolve
-    // the simple `<receiver>.<method>` form. Multi-step field chains require
-    // tracking field types, which is out of scope for v1.
-    if (std.mem.indexOfScalar(u8, tail, '.') != null) return null;
+    // Walk every dot-segment in `tail` except the last (which is the method
+    // name). At each step look up the current struct in the field-type
+    // index and advance to the named field's type.
+    var rest = tail;
+    while (std.mem.indexOfScalar(u8, rest, '.')) |dot_pos| {
+        const segment = rest[0..dot_pos];
+        rest = rest[dot_pos + 1 ..];
+        const struct_idx = ctx.struct_types orelse return null;
+        const sti_ptr = struct_idx.get(cur_type) orelse return null;
+        const next_type = findFieldType(sti_ptr.*, segment) orelse return null;
+        if (next_type.len == 0) return null;
+        cur_type = next_type;
+    }
+
+    if (rest.len == 0) return null;
 
     const candidate = try std.fmt.allocPrint(
         ctx.arena,
         "{s}.{s}",
-        .{ ctx.receiver_type, tail },
+        .{ cur_type, rest },
     );
     return try lookupCandidate(ctx, candidate, line, col);
+}
+
+/// Find a field's resolved type-qname in a StructTypeInfo. Returns null when
+/// the field isn't present; returns "" when the field is present but its
+/// type couldn't be resolved at walk time. The caller treats both as a
+/// resolution failure.
+fn findFieldType(info: types.StructTypeInfo, field_name: []const u8) ?[]const u8 {
+    for (info.fields) |f| {
+        if (std.mem.eql(u8, f.field_name, field_name)) return f.type_qname;
+    }
+    return null;
+}
+
+// ------------------------------------------------------------ locals stack
+
+/// Push a fresh locals scope. Returns true on success so the matching
+/// `popLocalsScope` knows to actually pop (we don't trust callers to handle
+/// errors mid-scope without leaking a frame).
+fn pushLocalsScope(ctx: *Ctx) !bool {
+    try ctx.locals_stack.append(ctx.arena, .{});
+    return true;
+}
+
+fn popLocalsScope(ctx: *Ctx, pushed: bool) void {
+    if (!pushed) return;
+    if (ctx.locals_stack.items.len == 0) return;
+    _ = ctx.locals_stack.pop();
+}
+
+/// Look up `name` in the locals stack, innermost-first. Returns the bound
+/// type qname when found (may be ""), null when no scope contains the name.
+fn lookupLocal(ctx: *Ctx, name: []const u8) ?[]const u8 {
+    if (ctx.locals_stack.items.len == 0) return null;
+    var i: usize = ctx.locals_stack.items.len;
+    while (i > 0) {
+        i -= 1;
+        if (ctx.locals_stack.items[i].get(name)) |v| return v;
+    }
+    return null;
+}
+
+/// Record a `const X: T = ...` / `var X: T = ...` decl in the innermost
+/// locals scope. Decls without an explicit type annotation are still
+/// recorded with an empty type-qname so `x.method()` shadowing an outer
+/// binding is suppressed (we know the binding exists; we just can't
+/// resolve through it yet — pattern 4 / call-return-type would).
+fn recordLocalDecl(ctx: *Ctx, vd: std.zig.Ast.full.VarDecl) !void {
+    if (ctx.locals_stack.items.len == 0) return;
+    const name_token = vd.ast.mut_token + 1;
+    const name = ctx.ast.tokenSlice(name_token);
+    if (name.len == 0) return;
+    const name_dup = try ctx.arena.dupe(u8, name);
+
+    var type_qname: []const u8 = "";
+    if (vd.ast.type_node.unwrap()) |type_node| {
+        type_qname = resolveLocalDeclType(ctx, type_node) catch "";
+    }
+
+    var top = &ctx.locals_stack.items[ctx.locals_stack.items.len - 1];
+    try top.put(ctx.arena, name_dup, type_qname);
+}
+
+/// Resolve a local var-decl's annotated type to a struct qname, mirroring
+/// the rules used for receiver and field types: strip pointer/optional/
+/// const decoration, then handle dotted-chain (via imports) and bare-name
+/// (same-file sibling) forms. Returns "" when the type isn't reducible.
+fn resolveLocalDeclType(ctx: *Ctx, type_node: std.zig.Ast.Node.Index) ![]const u8 {
+    const src = nodeSource(ctx, type_node);
+    if (src.len == 0) return "";
+    const stripped = stripPointerOptional(src);
+    if (stripped.len == 0) return "";
+
+    // Dotted chain — leftmost ident in the file's import table.
+    if (looksLikeDottedChain(stripped)) {
+        const imports = ctx.imports orelse return "";
+        const dot = std.mem.indexOfScalar(u8, stripped, '.') orelse return "";
+        const head = stripped[0..dot];
+        const tail = stripped[dot + 1 ..];
+        const resolved_head = imports.get(head) orelse return "";
+        if (tail.len == 0) return try ctx.arena.dupe(u8, resolved_head);
+        if (std.mem.eql(u8, resolved_head, "zag")) {
+            return try ctx.arena.dupe(u8, tail);
+        }
+        return try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ resolved_head, tail });
+    }
+
+    // Bare ident — try same-file sibling (`<file_module>.<ident>`). May or
+    // may not exist; the qname-lookup downstream will silently miss if not.
+    if (isBareIdent(stripped)) {
+        const file_mod = try fileToDottedModule(ctx.arena, ctx.file);
+        if (file_mod.len == 0) return "";
+        return try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ file_mod, stripped });
+    }
+
+    return "";
+}
+
+/// Strip leading pointer/optional/const decoration from a type source span.
+/// Mirrors walker.stripPointerOptional but lives here so branches.zig
+/// doesn't reach into the walker's private helpers.
+fn stripPointerOptional(src: []const u8) []const u8 {
+    var s = std.mem.trim(u8, src, &std.ascii.whitespace);
+    while (s.len > 0) {
+        if (s[0] == '*') {
+            s = std.mem.trim(u8, s[1..], &std.ascii.whitespace);
+            if (std.mem.startsWith(u8, s, "const ")) s = std.mem.trim(u8, s["const ".len..], &std.ascii.whitespace);
+            if (std.mem.startsWith(u8, s, "volatile ")) s = std.mem.trim(u8, s["volatile ".len..], &std.ascii.whitespace);
+            continue;
+        }
+        if (s[0] == '?') {
+            s = std.mem.trim(u8, s[1..], &std.ascii.whitespace);
+            continue;
+        }
+        if (s[0] == '[') return "";
+        break;
+    }
+    return s;
+}
+
+fn looksLikeDottedChain(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, s, '.') == null) return false;
+    return isIdentChars(s);
+}
+
+fn isBareIdent(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, s, '.') != null) return false;
+    return isIdentChars(s);
+}
+
+fn isIdentChars(s: []const u8) bool {
+    for (s) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or c == '_' or c == '.';
+        if (!ok) return false;
+    }
+    return true;
 }
 
 /// Look `candidate` up in the qname index (preferred — gives us a `to` id)

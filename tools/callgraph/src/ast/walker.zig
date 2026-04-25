@@ -20,6 +20,12 @@
 
 const std = @import("std");
 
+const types = @import("../types.zig");
+
+pub const FieldType = types.FieldType;
+pub const StructTypeInfo = types.StructTypeInfo;
+pub const ParamInfo = types.ParamInfo;
+
 pub const AstFunction = struct {
     name: []const u8,
     qualified_name: []const u8,
@@ -41,6 +47,11 @@ pub const AstFunction = struct {
     /// `kernel/utils/sync.zig`, this is `utils.sync.SpinLock`. Empty when the
     /// type isn't resolvable to a concrete container.
     receiver_type: []const u8 = "",
+    /// Parameter list in declaration order. Used by join.zig's all-callers-
+    /// agree pass to detect fn-pointer parameters and substitute their
+    /// statically-known argument values into the AST-only inline body's
+    /// intra. Empty when the proto had no params.
+    params: []const ParamInfo = &.{},
 };
 
 /// Per-file map: local binding name → resolved module path. Built by
@@ -63,6 +74,12 @@ pub const FileAst = struct {
 pub const WalkResult = struct {
     fns: []AstFunction,
     asts: []FileAst,
+    /// Per-struct field-type tables built while walking each container_decl.
+    /// Indexed by struct qname downstream in join.zig. Populated for every
+    /// container the walker descends into; structs whose fields all fail to
+    /// resolve are still emitted with an empty `fields` slice (cheaper than
+    /// gating the entry on having at least one resolvable field).
+    struct_types: []StructTypeInfo,
 };
 
 pub fn walkKernel(arena: std.mem.Allocator, kernel_root: []const u8) ![]AstFunction {
@@ -73,19 +90,21 @@ pub fn walkKernel(arena: std.mem.Allocator, kernel_root: []const u8) ![]AstFunct
 pub fn walkKernelFull(arena: std.mem.Allocator, kernel_root: []const u8) !WalkResult {
     var results = std.ArrayList(AstFunction){};
     var asts = std.ArrayList(FileAst){};
+    var struct_types = std.ArrayList(StructTypeInfo){};
 
     // Walk the kernel sources first.
-    try walkRoot(arena, kernel_root, &results, &asts);
+    try walkRoot(arena, kernel_root, &results, &asts, &struct_types);
 
     // Also walk the Zig stdlib + ubsan_rt so compiler-builtin functions
     // (`ubsan_rt.handler`, `fmt.format.X`, etc.) can be enriched too.
-    walkRoot(arena, "/usr/lib/zig", &results, &asts) catch |err| {
+    walkRoot(arena, "/usr/lib/zig", &results, &asts, &struct_types) catch |err| {
         std.debug.print("warning: skipping /usr/lib/zig walk: {s}\n", .{@errorName(err)});
     };
 
     return .{
         .fns = try results.toOwnedSlice(arena),
         .asts = try asts.toOwnedSlice(arena),
+        .struct_types = try struct_types.toOwnedSlice(arena),
     };
 }
 
@@ -94,6 +113,7 @@ fn walkRoot(
     root: []const u8,
     results: *std.ArrayList(AstFunction),
     asts: *std.ArrayList(FileAst),
+    struct_types: *std.ArrayList(StructTypeInfo),
 ) !void {
     const abs_root = std.fs.realpathAlloc(arena, root) catch |err| {
         std.debug.print("warning: could not resolve root '{s}': {s}\n", .{ root, @errorName(err) });
@@ -119,7 +139,7 @@ fn walkRoot(
         // Compose absolute file path.
         const abs_file = try std.fs.path.join(arena, &.{ abs_root, entry.path });
 
-        try walkFile(arena, abs_file, results, asts);
+        try walkFile(arena, abs_file, results, asts, struct_types);
     }
 }
 
@@ -128,6 +148,7 @@ fn walkFile(
     abs_file: []const u8,
     out: *std.ArrayList(AstFunction),
     asts: *std.ArrayList(FileAst),
+    struct_types: *std.ArrayList(StructTypeInfo),
 ) !void {
     const file = std.fs.openFileAbsolute(abs_file, .{}) catch |err| {
         std.debug.print("warning: skip {s}: {s}\n", .{ abs_file, @errorName(err) });
@@ -192,7 +213,14 @@ fn walkFile(
         .module_path = module_path,
         .imports = &imports,
         .out = out,
+        .struct_types = struct_types,
     };
+    // Collect any file-level field decls (rare; some files use the
+    // file-as-struct pattern with top-level fields) into a StructTypeInfo
+    // keyed by the file's module path. The receiver-type code already
+    // recognizes that pattern, so a chain like `self.field.method()` against
+    // a file-as-struct receiver can resolve through this table.
+    try collectFieldsForContainer(&ctx, ctx.module_path, root_decls, "");
     for (root_decls) |decl| {
         try walkDecl(&ctx, decl, "");
     }
@@ -215,6 +243,10 @@ const WalkCtx = struct {
     /// Pointer is stable for the life of the walk.
     imports: *const ImportTable,
     out: *std.ArrayList(AstFunction),
+    /// Output sink for struct field-type tables collected as the walker
+    /// descends into container_decls. Receiver-chain resolution in
+    /// branches.zig consults this via a qname-keyed index.
+    struct_types: *std.ArrayList(StructTypeInfo),
 };
 
 /// Walk a single decl node. `container_path` is the dotted chain of nesting
@@ -269,6 +301,14 @@ fn recurseIntoTypeExpr(
             try ctx.arena.dupe(u8, decl_name)
         else
             try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ container_path, decl_name });
+        // Compose the full qname (including module path) for the field-type
+        // index so cross-file lookups succeed.
+        const struct_qname = try std.fmt.allocPrint(
+            ctx.arena,
+            "{s}.{s}",
+            .{ ctx.module_path, new_container },
+        );
+        try collectFieldsForContainer(ctx, struct_qname, cd.ast.members, new_container);
         for (cd.ast.members) |member| {
             try walkDecl(ctx, member, new_container);
         }
@@ -276,6 +316,100 @@ fn recurseIntoTypeExpr(
     // We deliberately don't chase arbitrary expressions here — the common
     // case is `const Foo = struct { ... };` which the fullContainerDecl
     // probe handles.
+}
+
+/// Build and emit a StructTypeInfo for one container's members. `struct_qname`
+/// is the full dotted qname (`<module>.<container_path>` form) used to index
+/// the table downstream. `container_path` is the relative container chain
+/// inside the file — needed when a field type resolves to a same-file sibling
+/// (Case 3b in computeReceiver).
+fn collectFieldsForContainer(
+    ctx: *WalkCtx,
+    struct_qname: []const u8,
+    members: []const std.zig.Ast.Node.Index,
+    container_path: []const u8,
+) anyerror!void {
+    var fields = std.ArrayList(FieldType){};
+    for (members) |member| {
+        const tag = ctx.tree.nodeTag(member);
+        const is_field = switch (tag) {
+            .container_field, .container_field_init, .container_field_align => true,
+            else => false,
+        };
+        if (!is_field) continue;
+
+        const cf = ctx.tree.fullContainerField(member) orelse continue;
+        // Skip tuple-like fields (no real name we can match against).
+        if (cf.ast.tuple_like) continue;
+
+        const name_tok = cf.ast.main_token;
+        const field_name = ctx.tree.tokenSlice(name_tok);
+        if (field_name.len == 0) continue;
+
+        const type_node_opt = cf.ast.type_expr.unwrap() orelse continue;
+        const type_qname = resolveFieldTypeQname(ctx, type_node_opt, container_path) catch "";
+        try fields.append(ctx.arena, .{
+            .field_name = try ctx.arena.dupe(u8, field_name),
+            .type_qname = type_qname,
+        });
+    }
+    if (fields.items.len == 0) return;
+    try ctx.struct_types.append(ctx.arena, .{
+        .qname = try ctx.arena.dupe(u8, struct_qname),
+        .fields = try fields.toOwnedSlice(ctx.arena),
+    });
+}
+
+/// Resolve a field's type expression to a bare struct qname, mirroring the
+/// rules `computeReceiver` uses for first-param types. Empty string when the
+/// type isn't resolvable (anytype, anonymous struct expressions, generic
+/// params, slices/arrays, etc).
+fn resolveFieldTypeQname(
+    ctx: *WalkCtx,
+    type_node: std.zig.Ast.Node.Index,
+    container_path: []const u8,
+) ![]const u8 {
+    const src = nodeSourceSlice(ctx.tree, type_node);
+    if (src.len == 0) return "";
+    const stripped = stripPointerOptional(src);
+    if (stripped.len == 0) return "";
+
+    // `@This()` — same-container shortcut.
+    if (std.mem.eql(u8, stripped, "@This()")) {
+        return containerQName(ctx.arena, ctx.module_path, container_path);
+    }
+
+    // Bare type name matching the immediate-enclosing container's last
+    // segment — same-container self-reference.
+    const immediate = lastSegment(container_path);
+    if (immediate.len > 0 and std.mem.eql(u8, stripped, immediate)) {
+        return containerQName(ctx.arena, ctx.module_path, container_path);
+    }
+
+    // Bare type name matching the file's own last segment (file-as-struct).
+    if (container_path.len == 0) {
+        const file_seg = lastSegment(ctx.module_path);
+        if (file_seg.len > 0 and std.mem.eql(u8, stripped, file_seg)) {
+            return ctx.arena.dupe(u8, ctx.module_path);
+        }
+    }
+
+    // Dotted chain via the file's import table.
+    if (looksLikeDottedChain(stripped)) {
+        if (try resolveDottedChain(ctx.arena, stripped, ctx.imports)) |q| {
+            if (q.len > 0) return q;
+        }
+        return "";
+    }
+
+    // Bare unqualified type — try `<module_path>.<name>` as a same-file
+    // sibling. The downstream consumer (qname index lookup) will silently
+    // miss if the type doesn't actually exist there.
+    if (isBareIdent(stripped) and ctx.module_path.len > 0) {
+        return std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ ctx.module_path, stripped });
+    }
+
+    return "";
 }
 
 fn emitFn(
@@ -305,6 +439,8 @@ fn emitFn(
 
     const recv = computeReceiver(ctx, fn_proto, container_path);
 
+    const params = collectParams(ctx, fn_proto) catch &.{};
+
     try ctx.out.append(ctx.arena, .{
         .name = try ctx.arena.dupe(u8, name),
         .qualified_name = qualified,
@@ -315,6 +451,7 @@ fn emitFn(
         .fn_node = @intFromEnum(node),
         .receiver_name = recv.name,
         .receiver_type = recv.type_qname,
+        .params = params,
     });
 
     // Recurse into the body so nested struct decls and inner fns are picked up.
@@ -330,6 +467,46 @@ fn emitFn(
             try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ container_path, name });
         try walkBlock(ctx, body_node, inner_container);
     }
+}
+
+// ---------------------------------------------------------------- params
+
+/// Iterate the fn proto's parameters in declaration order and emit one
+/// ParamInfo per param. The `is_fn_ptr` heuristic matches a `fn (` substring
+/// in the type's source slice, which catches both `*const fn (...)` pointer
+/// types and bare `fn (...)` types. Anonymous (no-name) params and `anytype`
+/// produce ParamInfo with an empty name — kept in the slice so positional
+/// indexing into caller args still aligns. Skips when the proto has no params.
+fn collectParams(
+    ctx: *WalkCtx,
+    fn_proto: std.zig.Ast.full.FnProto,
+) ![]const ParamInfo {
+    var list = std.ArrayList(ParamInfo){};
+    var it = fn_proto.iterate(ctx.tree);
+    while (it.next()) |p| {
+        const name_slice: []const u8 = blk: {
+            const tok = p.name_token orelse break :blk "";
+            break :blk ctx.tree.tokenSlice(tok);
+        };
+        var is_fn_ptr = false;
+        if (p.type_expr) |te| {
+            const src = nodeSourceSlice(ctx.tree, te);
+            // Match `fn (` (Zig style) or `fn(` (no space) — both forms
+            // appear in the kernel. The substring check is good enough; we
+            // never falsely classify a non-fn type as a fn pointer because
+            // `fn` isn't a keyword usable in struct/integer/slice forms.
+            if (std.mem.indexOf(u8, src, "fn (") != null or
+                std.mem.indexOf(u8, src, "fn(") != null)
+            {
+                is_fn_ptr = true;
+            }
+        }
+        try list.append(ctx.arena, .{
+            .name = try ctx.arena.dupe(u8, name_slice),
+            .is_fn_ptr = is_fn_ptr,
+        });
+    }
+    return list.toOwnedSlice(ctx.arena);
 }
 
 // ---------------------------------------------------------------- receiver

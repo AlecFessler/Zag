@@ -168,3 +168,36 @@ pub const Graph = struct {
     functions: []Function,
     entry_points: []EntryPoint,
 };
+
+/// One field of a struct, with its resolved type qname when knowable. Used
+/// by the receiver-chain resolver to walk `self.field1.field2.method()`
+/// expressions through the field type chain.
+pub const FieldType = struct {
+    field_name: []const u8,
+    /// Qualified type name of the field, when resolvable. Pointer / optional /
+    /// const decoration is stripped — just the bare type qname. Empty when
+    /// unresolvable (e.g. comptime types, anonymous structs, generic params).
+    type_qname: []const u8,
+};
+
+/// Per-struct field-type table. The receiver-chain resolver looks up the
+/// enclosing receiver type, then walks each segment of `self.x.y.z.method()`
+/// through these tables until the final segment is the method name.
+pub const StructTypeInfo = struct {
+    /// Qualified name of the struct (e.g. `proc.process.Process`). Matches
+    /// the prefix that AstFunction.qualified_name uses for methods declared
+    /// inside the struct.
+    qname: []const u8,
+    fields: []const FieldType,
+};
+
+/// One entry per function parameter, in declaration order. Used by join.zig's
+/// all-callers-agree pass: when an AST-only inline fn has a fn-pointer
+/// parameter and every call site passes the same `&fn` argument, the
+/// parameter call inside the body is rewritten as a direct call to that fn.
+/// `is_fn_ptr` is a heuristic on the type source slice (`fn (` substring) —
+/// precise typing would require the compiler.
+pub const ParamInfo = struct {
+    name: []const u8,
+    is_fn_ptr: bool,
+};
