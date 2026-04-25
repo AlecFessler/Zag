@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const ast = @import("ast/index.zig");
+const commits = @import("commits.zig");
 const def_deps = @import("def_deps.zig");
 const entry = @import("entry.zig");
 const ir = @import("ir/parse.zig");
@@ -84,15 +85,7 @@ fn printHelp() !void {
     , .{});
 }
 
-const ArchSpec = struct {
-    /// Tag passed to root build.zig (`-Darch=`).
-    build_tag: []const u8,
-    /// Filename suffix produced by root build.zig (matches `@tagName(arch)`).
-    file_tag: []const u8,
-    /// Frontend-facing tag (matches `TargetArch.jsonStringify`).
-    api_tag: []const u8,
-    target_arch: types.TargetArch,
-};
+const ArchSpec = commits.ArchSpec;
 
 const arch_specs = [_]ArchSpec{
     .{ .build_tag = "x64", .file_tag = "x86_64", .api_tag = "x86_64", .target_arch = .x86_64 },
@@ -115,7 +108,13 @@ pub fn main() !void {
         var graphs = server.GraphMap.init(allocator);
         defer graphs.deinit();
         try graphs.put("x86_64", graph);
-        try server.serve(allocator, &graphs, "x86_64", args.port);
+        var registry = commits.Registry.init(
+            allocator,
+            args.build_root,
+            "/var/tmp/cg-worktrees",
+            &arch_specs,
+        );
+        try server.serve(allocator, &graphs, "x86_64", args.build_root, &registry, args.port);
         return;
     }
 
@@ -267,7 +266,13 @@ pub fn main() !void {
     }
     std.debug.print("); default={s}\n", .{default_arch});
 
-    try server.serve(allocator, &graphs, default_arch, args.port);
+    var registry = commits.Registry.init(
+        allocator,
+        args.build_root,
+        "/var/tmp/cg-worktrees",
+        &arch_specs,
+    );
+    try server.serve(allocator, &graphs, default_arch, args.build_root, &registry, args.port);
 }
 
 fn buildKernel(

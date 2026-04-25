@@ -14,6 +14,11 @@
   /** Whole /api/graph payload (the "currentGraph"), stashed for lookups
    *  during BFS. Updated whenever the arch picker changes. */
   let graph = null;
+  /** Per-arch cache of parsed /api/graph payloads. The server's call-graph
+   *  is fixed at startup (it parses IRs once), so a fetched graph stays
+   *  valid for the whole session — no need to re-fetch and re-parse on
+   *  every arch switch. Saves ≈20ms per swap on the harness. */
+  const archGraphCache = new Map();
   /** id -> function object index for O(1) lookup. Rebuilt on every graph
    *  swap (arch change). */
   const fnById = new Map();
@@ -125,10 +130,17 @@
     deadPanelBtn: document.getElementById("dead_panel_btn"),
     graph: document.getElementById("graph"),
     info: document.getElementById("info"),
+    infoResizeHandle: document.getElementById("info_resize_handle"),
     infoTitle: document.getElementById("info_title"),
     infoMeta: document.getElementById("info_meta"),
     infoSourceWrap: document.getElementById("info_source_wrap"),
     infoSource: document.getElementById("info_source"),
+    infoSourceB: document.getElementById("info_source_b"),
+    infoSourceSplit: document.getElementById("info_source_split"),
+    infoSourcePaneA: document.getElementById("info_source_pane_a"),
+    infoSourcePaneB: document.getElementById("info_source_pane_b"),
+    infoSourceLabelA: document.getElementById("info_source_label_a"),
+    infoSourceLabelB: document.getElementById("info_source_label_b"),
     infoSourceError: document.getElementById("info_source_error"),
     infoIntraWrap: document.getElementById("info_intra_wrap"),
     infoIntra: document.getElementById("info_intra"),
@@ -142,8 +154,20 @@
     listRows: document.getElementById("list_rows"),
     modeToggle: document.getElementById("mode_toggle"),
     traceView: document.getElementById("trace_view"),
+    traceViewWrap: document.getElementById("trace_view_wrap"),
+    traceViewB: document.getElementById("trace_view_b"),
+    tracePaneColA: document.getElementById("trace_pane_col_a"),
+    tracePaneColB: document.getElementById("trace_pane_col_b"),
+    traceLabelA: document.getElementById("trace_label_a"),
+    traceLabelB: document.getElementById("trace_label_b"),
+    diffChangesPanel: document.getElementById("diff_changes_panel"),
+    diffChangesList: document.getElementById("diff_changes_list"),
+    diffChangesCount: document.getElementById("diff_changes_count"),
     traceBreadcrumb: document.getElementById("trace_breadcrumb"),
     graphPane: document.getElementById("graph"),
+    compareMode: document.getElementById("compare_mode"),
+    compareCommit: document.getElementById("compare_commit"),
+    compareStatus: document.getElementById("compare_status"),
   };
 
   /** ID of the currently-selected entry-point function. */
@@ -262,6 +286,7 @@
    *  entry survives by name in the new graph, keep it as the focused entry.
    *  Otherwise pick the first visible entry. */
   async function fetchGraphForArch(archTag, preserveEntry) {
+    const _t0 = performance.now();
     setStatus("loading /api/graph (arch=" + archTag + ")...", true);
     let prevEntryName = null;
     if (preserveEntry && currentEntryFnId != null) {
@@ -269,20 +294,30 @@
       if (prevFn) prevEntryName = prevFn.name;
     }
 
-    try {
-      const r = await fetch("/api/graph?arch=" + encodeURIComponent(archTag));
-      if (!r.ok) throw new Error("HTTP " + r.status);
-      graph = await r.json();
+    const cached = archGraphCache.get(archTag);
+    if (cached) {
+      graph = cached;
       setStatus("graph loaded (" + archTag + ")", false);
-    } catch (err) {
-      console.error("graph fetch failed", err);
-      setStatus("graph fetch failed: " + err.message, true);
-      return;
+    } else {
+      try {
+        const r = await fetch("/api/graph?arch=" + encodeURIComponent(archTag));
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        graph = await r.json();
+        archGraphCache.set(archTag, graph);
+        setStatus("graph loaded (" + archTag + ")", false);
+      } catch (err) {
+        console.error("graph fetch failed", err);
+        setStatus("graph fetch failed: " + err.message, true);
+        return;
+      }
     }
+    const _t1 = performance.now();
 
     indexCurrentGraph();
+    const _t2 = performance.now();
 
     populateDropdown(graph.entry_points || []);
+    const _t3 = performance.now();
 
     // Try to preserve the prior entry by name.
     let nextEntryId = null;
@@ -302,6 +337,7 @@
     }
 
     onGraphReady();
+    const _t4 = performance.now();
 
     if (nextEntryId != null) {
       els.entrySelect.value = String(nextEntryId);
@@ -309,6 +345,15 @@
     } else {
       currentEntryFnId = null;
     }
+    const _t5 = performance.now();
+    window.__cgArchTimings = {
+      fetch_parse: _t1 - _t0,
+      index: _t2 - _t1,
+      populate: _t3 - _t2,
+      onGraphReady: _t4 - _t3,
+      render: _t5 - _t4,
+      total: _t5 - _t0,
+    };
   }
 
   /** Rebuild fnById from the current `graph` and re-wire trace.js. */
@@ -322,6 +367,7 @@
         isDebug: isDebug,
         getHideLibrary: function () { return hideLibrary; },
         getHideDebug: function () { return hideDebug; },
+        getDepth: function () { return parseInt(els.depthSlider.value, 10) || 4; },
         showNodePanel: showNodePanel,
       });
     }
@@ -404,16 +450,30 @@
       return ai - bi;
     });
 
+    // Diff-mode flags: prefix entries whose reachable subtree touches any
+    // file changed between live and the secondary commit. Empty set when
+    // compare is off, so the prefix is invisible in normal use.
+    const needsReview = (compareState && compareState.entryNeedsReview)
+      ? compareState.entryNeedsReview
+      : new Set();
+
     for (const kind of sorted) {
       const og = document.createElement("optgroup");
-      og.label = kind + " (" + groups.get(kind).length + ")";
       const items = groups.get(kind).slice().sort(function (a, b) {
         return (a.label || "").localeCompare(b.label || "");
       });
+      const flaggedInGroup = items.reduce(function (acc, e) {
+        return acc + (needsReview.has(e.fn_id) ? 1 : 0);
+      }, 0);
+      const labelSuffix = flaggedInGroup > 0
+        ? " (" + items.length + ", " + flaggedInGroup + " ●)"
+        : " (" + items.length + ")";
+      og.label = kind + labelSuffix;
       for (const e of items) {
         const opt = document.createElement("option");
         opt.value = String(e.fn_id);
-        opt.textContent = "[" + kind + "] " + (e.label || "(anon)");
+        const marker = needsReview.has(e.fn_id) ? "● " : "";
+        opt.textContent = marker + "[" + kind + "] " + (e.label || "(anon)");
         og.appendChild(opt);
       }
       els.entrySelect.appendChild(og);
@@ -664,7 +724,11 @@
   }
 
   function renderForEntry(entryFnId) {
+    const _t0 = performance.now();
     currentEntryFnId = entryFnId;
+    // Refresh the diff-changes summary; it filters by what's reachable
+    // from the current entry, so it changes whenever the entry changes.
+    if (typeof updateChangesPanel === "function") updateChangesPanel();
     // Trace mode owns its own rendering pipeline; only let the graph
     // builder run when the graph pane is the visible view.
     if (currentMode === "trace") {
@@ -676,26 +740,36 @@
     const includeIndirect = els.indirectToggle.checked;
 
     const elements = buildElements(entryFnId, depth, includeIndirect);
-
-    if (cy) {
-      cy.destroy();
-      cy = null;
-    }
+    const _t1 = performance.now();
 
     cgClearReady();
-    cy = cytoscape({
-      container: els.graph,
-      elements: elements,
-      style: cyStyle(),
-      // Construct without a layout, then register layoutstop, then run the
-      // layout explicitly. Done this way because with `animate: false` the
-      // layout in the constructor's options runs synchronously and emits
-      // `layoutstop` BEFORE we get a chance to subscribe — so the perf
-      // harness counter would never bump on small graphs.
-      wheelSensitivity: 0.6,
-      minZoom: 0.05,
-      maxZoom: 5.0,
-    });
+    if (cy) {
+      // Reuse existing instance: swap elements in a batch so the canvas
+      // and event engine stay alive. Cuts ≈10-15ms off arch/entry switches
+      // vs cy.destroy() + new cytoscape({...}). Events were wired on first
+      // creation and survive element swaps.
+      cy.batch(function () {
+        cy.elements().remove();
+        cy.add(elements);
+      });
+    } else {
+      cy = cytoscape({
+        container: els.graph,
+        elements: elements,
+        style: cyStyle(),
+        wheelSensitivity: 0.6,
+        minZoom: 0.05,
+        maxZoom: 5.0,
+      });
+      // Wire events once; they survive element swaps via cy reuse.
+      cy.on("tap", "node", function (evt) { showNodePanel(evt.target.data()); });
+      cy.on("tap", "edge", function (evt) { showEdgePanel(evt.target.data()); });
+      cy.on("tap", function (evt) {
+        // Background tap closes the panel.
+        if (evt.target === cy) hidePanel();
+      });
+    }
+    const _t3 = performance.now();
 
     if (elements.length === 0) {
       // No layout to run; signal immediately so the perf harness doesn't hang.
@@ -712,23 +786,21 @@
       layout.one("layoutstop", function () { cgSignalReady(); });
       layout.run();
     }
-
-    cy.on("tap", "node", function (evt) {
-      showNodePanel(evt.target.data());
-    });
-    cy.on("tap", "edge", function (evt) {
-      showEdgePanel(evt.target.data());
-    });
-    cy.on("tap", function (evt) {
-      // Background tap closes the panel.
-      if (evt.target === cy) hidePanel();
-    });
+    const _t4 = performance.now();
 
     // Initial fit-to-view: after the layout completes, fit the graph then
     // clamp zoom up to a level where node labels stay readable. For wide
     // entry points like kEntry, plain cy.fit() leaves you at ~0.1 zoom
     // where you only see the silhouette.
     fitWithMinZoom();
+    const _t5 = performance.now();
+    window.__cgRenderTimings = {
+      build_elements: _t1 - _t0,
+      cy_swap: _t3 - _t1,
+      layout_run: _t4 - _t3,
+      fit: _t5 - _t4,
+      total: _t5 - _t0,
+    };
   }
 
   // Refit + min-zoom guard. Call after any layout-changing operation or
@@ -766,6 +838,11 @@
   function clearSource() {
     sourceFetchToken += 1;
     els.infoSource.innerHTML = "";
+    if (els.infoSourceB) {
+      els.infoSourceB.innerHTML = "";
+      els.infoSourceB.style.display = "none";
+    }
+    if (els.infoSourceSplit) els.infoSourceSplit.classList.remove("compare_active");
     els.infoSourceWrap.style.display = "none";
     els.infoSourceError.style.display = "none";
     els.infoSourceError.textContent = "";
@@ -784,10 +861,92 @@
     els.infoSourceError.textContent = "Could not load source: " + msg;
   }
 
-  function renderSourceSnippet(file, startLine, lines, highlightLine) {
+  /** Render a tokenized source snippet into a target block.
+   *  diffOpts (optional): { hunks: [{old_start, old_count, start, count}],
+   *  side: "old" | "new" } — when present, lines whose absolute number
+   *  falls inside a hunk's add/remove range get a `.added` / `.removed`
+   *  class so CSS can tint them green/red. Inert when diffOpts is null
+   *  (compare off, or file has no hunks). */
+  /** Emit a plain-text fragment into a parent, but wrap any identifier
+   *  whose name matches a changed Definition in a clickable span.
+   *  Identifiers are matched as `[a-zA-Z_][a-zA-Z0-9_]*` runs. When
+   *  compare is off (or no matches found), the call degenerates to a
+   *  single text node. */
+  const IDENT_RE = /[A-Za-z_][A-Za-z0-9_]*/g;
+  function emitTextWithChangedIdents(parent, text) {
+    if (text.length === 0) return;
+    const byName = compareState && compareState.changedDefByName;
+    if (!byName || byName.size === 0) {
+      parent.appendChild(document.createTextNode(text));
+      return;
+    }
+    let cursor = 0;
+    let m;
+    IDENT_RE.lastIndex = 0;
+    while ((m = IDENT_RE.exec(text)) !== null) {
+      const def = byName.get(m[0]);
+      if (!def) continue;
+      if (m.index > cursor) {
+        parent.appendChild(document.createTextNode(text.slice(cursor, m.index)));
+      }
+      const a = document.createElement("span");
+      a.className = "tok_changed_dep";
+      a.textContent = m[0];
+      a.title = def.qualified_name + " — click to jump to def";
+      a.dataset.defid = String(def.id);
+      a.addEventListener("click", function (e) {
+        e.stopPropagation();
+        jumpToDef(def);
+      });
+      parent.appendChild(a);
+      cursor = m.index + m[0].length;
+    }
+    if (cursor < text.length) {
+      parent.appendChild(document.createTextNode(text.slice(cursor)));
+    }
+  }
+
+  /** Drill the source pane to a Definition's location. Loads the def's
+   *  full file and scrolls to its first line. The clicked def is the
+   *  one in the LIVE graph (since the source pane on side A shows live);
+   *  for the OLDER side, the secondary's matching def location applies
+   *  but we don't currently jump on the secondary. */
+  function jumpToDef(def) {
+    if (!def || !def.file) return;
+    setLastClickedFn(def.qualified_name || null);
+    fetchSource(def.file, 1, 10000000, def.line_start || 1);
+  }
+
+  function renderSourceSnippet(file, startLine, lines, highlightLine, tokens, targetBlock, diffOpts) {
     // Build header with selectable absolute path.
-    const block = els.infoSource;
+    const block = targetBlock || els.infoSource;
     block.innerHTML = "";
+
+    // Pre-compute, per absolute line on this side, whether the line is
+    // added (new side) or removed (old side). Lines not in any hunk are
+    // unchanged context.
+    let addedSet = null;
+    let removedSet = null;
+    if (diffOpts && diffOpts.hunks) {
+      addedSet = new Set();
+      removedSet = new Set();
+      const isOld = diffOpts.side === "old";
+      for (const h of diffOpts.hunks) {
+        if (isOld) {
+          // On the old side, the removed range is [old_start, old_start+old_count-1]
+          // (count==0 means pure insertion: nothing removed on this side).
+          for (let i = 0; i < h.old_count; i += 1) {
+            removedSet.add(h.old_start + i);
+          }
+        } else {
+          // On the new side, the added range is [start, start+count-1]
+          // (count==0 means pure deletion: nothing added on this side).
+          for (let i = 0; i < h.count; i += 1) {
+            addedSet.add(h.start + i);
+          }
+        }
+      }
+    }
 
     const header = document.createElement("div");
     header.className = "source_header";
@@ -805,11 +964,32 @@
     table.className = "source_table";
     const tbody = document.createElement("tbody");
 
+    // Group tokens by absolute line so we can paint each row independently.
+    // Tokens are byte-positioned server-side; for ASCII Zig source byte
+    // columns line up with JS string indices. Multi-byte UTF-8 in source
+    // would shift highlights but never crash — fine for now.
+    const tokensByLine = new Map();
+    if (tokens) {
+      for (const t of tokens) {
+        let arr = tokensByLine.get(t.line);
+        if (!arr) {
+          arr = [];
+          tokensByLine.set(t.line, arr);
+        }
+        arr.push(t);
+      }
+      for (const arr of tokensByLine.values()) {
+        arr.sort(function (a, b) { return a.col - b.col; });
+      }
+    }
+
     for (let i = 0; i < lines.length; i += 1) {
       const absLine = startLine + i;
       const tr = document.createElement("tr");
       tr.className = "source_line";
       if (absLine === highlightLine) tr.classList.add("highlight");
+      if (addedSet && addedSet.has(absLine)) tr.classList.add("added");
+      if (removedSet && removedSet.has(absLine)) tr.classList.add("removed");
 
       const tdNum = document.createElement("td");
       tdNum.className = "source_gutter";
@@ -817,9 +997,37 @@
 
       const tdCode = document.createElement("td");
       tdCode.className = "source_code";
-      // Render the line as plain text. Use a single trailing space when the
-      // line is empty so the row keeps the right height.
-      tdCode.textContent = lines[i].length === 0 ? " " : lines[i];
+      const lineText = lines[i];
+      const lineTokens = tokensByLine.get(absLine);
+      if (lineText.length === 0) {
+        // Single trailing space keeps row height consistent.
+        tdCode.textContent = " ";
+      } else if (!lineTokens || lineTokens.length === 0) {
+        // No tokenized highlights on this line. Still scan for changed-
+        // def identifier hits when compare is active.
+        emitTextWithChangedIdents(tdCode, lineText);
+      } else {
+        // Walk tokens left-to-right, emitting plain text for gaps and
+        // <span class="tok_X"> for highlighted regions. Text gaps get
+        // scanned for changed-def identifiers in compare mode so the
+        // user can see (and click through to) refs to changed types.
+        let cursor = 0;
+        for (const t of lineTokens) {
+          const startIdx = t.col - 1; // server is 1-indexed
+          if (startIdx < cursor) continue; // overlap; skip
+          if (startIdx > cursor) {
+            emitTextWithChangedIdents(tdCode, lineText.slice(cursor, startIdx));
+          }
+          const span = document.createElement("span");
+          span.className = "tok_" + t.kind;
+          span.textContent = lineText.slice(startIdx, startIdx + t.len);
+          tdCode.appendChild(span);
+          cursor = startIdx + t.len;
+        }
+        if (cursor < lineText.length) {
+          emitTextWithChangedIdents(tdCode, lineText.slice(cursor));
+        }
+      }
 
       tr.appendChild(tdNum);
       tr.appendChild(tdCode);
@@ -832,6 +1040,20 @@
 
     els.infoSourceWrap.style.display = "block";
     els.infoSourceError.style.display = "none";
+
+    // Scroll the source block so the highlighted line is at the top of
+    // the viewport. Done after the wrap is shown so layout has settled
+    // and the row has a real bounding rect to scroll to.
+    if (highlightLine != null) {
+      const row = block.querySelector(".source_line.highlight");
+      if (row) {
+        // scrollIntoView walks ancestors and scrolls each as needed.
+        // The .source_block scrollable container takes the row to its
+        // top edge with `block: "start"`; behavior:"instant" avoids the
+        // smooth-scroll jitter that's noticeable on big files.
+        row.scrollIntoView({ block: "start", behavior: "instant" });
+      }
+    }
   }
 
   async function fetchSource(file, start, end, highlightLine) {
@@ -855,19 +1077,145 @@
         showSourceError("HTTP " + r.status);
         return;
       }
-      const text = await r.text();
+      const payload = await r.json();
       if (myToken !== sourceFetchToken) return;
 
-      // Server returns lines [start..end] separated by newlines. Trim a
-      // trailing newline so we don't render an extra blank row.
-      let body = text;
-      if (body.endsWith("\n")) body = body.slice(0, -1);
-      const lines = body.length === 0 ? [""] : body.split("\n");
+      // payload: { lines: string[], tokens: {line,col,len,kind}[] }
+      // Non-.zig files come back with an empty tokens array (no
+      // highlight). lines never includes trailing newlines — server
+      // already strips them.
+      const lines = payload.lines && payload.lines.length > 0
+        ? payload.lines
+        : [""];
+      // Tint added lines green when compare is active and this file has
+      // hunks. Path lookup uses the same kernel-rooted convention as the
+      // changed-fn check (defLocToRepoRel).
+      const primaryDiffOpts = computeDiffOptsForPrimary(file);
+      renderSourceSnippet(
+        file, start, lines, highlightLine, payload.tokens || [],
+        els.infoSource, primaryDiffOpts,
+      );
 
-      renderSourceSnippet(file, start, lines, highlightLine);
+      // Side-by-side: if compare mode is active and the secondary commit
+      // has a function with the same name, fetch and render its source
+      // into #info_source_b. Path comes from the secondary's own def_loc
+      // (worktree-rooted), so no path translation is needed here.
+      maybeRenderSecondarySource(payload && payload.fn_name, highlightLine);
     } catch (err) {
       if (myToken !== sourceFetchToken) return;
       showSourceError(err && err.message ? err.message : String(err));
+    }
+  }
+
+  /** When compare is active: look up the same fn name in the secondary's
+   *  graph, fetch the source for that fn's def file, and render side-by-side.
+   *  fnName comes from the primary's selection — we don't trust the server
+   *  payload to carry it (older API didn't), so callers can pass it
+   *  explicitly via setLastFnName. */
+  let lastClickedFnName = null;
+  function setLastClickedFn(name) { lastClickedFnName = name || null; }
+
+  function clearSecondarySource() {
+    if (els.infoSourceB) els.infoSourceB.innerHTML = "";
+    if (els.infoSourcePaneB) els.infoSourcePaneB.style.display = "none";
+    if (els.infoSourceLabelA) els.infoSourceLabelA.style.display = "none";
+    if (els.infoSourceLabelB) els.infoSourceLabelB.style.display = "none";
+    if (els.infoSourceSplit) els.infoSourceSplit.classList.remove("compare_active");
+  }
+
+  /** Same label shape as the trace pane labels but smaller — sits above
+   *  each .source_block so the user always knows which side is live. */
+  function updateSourceLabel(labelEl, side, sha) {
+    if (!labelEl) return;
+    labelEl.style.display = "";
+    labelEl.classList.remove("live", "older");
+    labelEl.classList.add(side);
+    labelEl.innerHTML = "";
+    const tag = document.createElement("span");
+    tag.className = "pane_tag";
+    tag.textContent = side === "live" ? "LIVE" : "OLDER";
+    labelEl.appendChild(tag);
+    if (side === "older" && sha) {
+      const shaEl = document.createElement("span");
+      shaEl.className = "pane_sha";
+      shaEl.textContent = sha.slice(0, 7);
+      labelEl.appendChild(shaEl);
+    } else if (side === "live") {
+      const note = document.createElement("span");
+      note.className = "pane_subj";
+      note.textContent = "working tree";
+      labelEl.appendChild(note);
+    }
+  }
+
+  async function maybeRenderSecondarySource(_unused, highlightLine) {
+    if (!els.infoSourceB || !els.infoSourceSplit) return;
+    if (compareState.mode === "off") {
+      clearSecondarySource();
+      return;
+    }
+    const sec = secondarySha();
+    if (!sec) {
+      clearSecondarySource();
+      return;
+    }
+    const data = compareState.secGraphs.get(sec);
+    if (!data) {
+      clearSecondarySource();
+      return;
+    }
+    const name = lastClickedFnName;
+    if (!name) {
+      clearSecondarySource();
+      return;
+    }
+    const secFn = data.fnByName.get(name);
+    if (!secFn || !secFn.def_loc || !secFn.def_loc.file) {
+      // Function absent in the secondary commit — render a placeholder so
+      // the user sees that explicitly, instead of an empty pane.
+      els.infoSourceSplit.classList.add("compare_active");
+      els.infoSourcePaneB.style.display = "";
+      els.infoSourceB.innerHTML = "";
+      updateSourceLabel(els.infoSourceLabelA, "live", null);
+      updateSourceLabel(els.infoSourceLabelB, "older", sec);
+      const note = document.createElement("div");
+      note.className = "source_header";
+      note.textContent = `(no \`${name}\` in ${shortSha(sec)})`;
+      els.infoSourceB.appendChild(note);
+      return;
+    }
+    const file = secFn.def_loc.file;
+    const line = secFn.def_loc.line || 1;
+    try {
+      const url = "/api/source?path=" + encodeURIComponent(file) +
+        "&start=1&end=10000000";
+      const r = await fetch(url);
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const payload = await r.json();
+      const lines = payload.lines && payload.lines.length > 0
+        ? payload.lines
+        : [""];
+      els.infoSourceSplit.classList.add("compare_active");
+      els.infoSourcePaneB.style.display = "";
+      updateSourceLabel(els.infoSourceLabelA, "live", null);
+      updateSourceLabel(els.infoSourceLabelB, "older", sec);
+      // Tint removed lines red on the secondary side. The hunks are
+      // keyed by the file's path on the WORKING-TREE side; the
+      // secondary file may live under a different path (worktree
+      // mount), but it's the same repo-relative path. Use the secondary
+      // fn's repo-relative path for the lookup.
+      const secDiffOpts = computeDiffOptsForSecondary(file);
+      renderSourceSnippet(
+        file, 1, lines, line, payload.tokens || [],
+        els.infoSourceB, secDiffOpts,
+      );
+      // Mirror the primary's scroll-to-highlight on the secondary.
+      const row = els.infoSourceB.querySelector(".source_line.highlight");
+      if (row) row.scrollIntoView({ block: "start", behavior: "instant" });
+      void highlightLine; // not used; secondary has its own line
+    } catch (err) {
+      console.error("secondary source fetch failed", err);
+      clearSecondarySource();
     }
   }
 
@@ -1028,12 +1376,19 @@
 
       els.info.classList.add("visible");
 
-      // 80-line window starting at the def line — usually shows the
-      // entire function body. The source_block scrolls if longer.
+      // Remember the fn name so the side-by-side source can resolve the
+      // same function in the secondary commit's graph. fullName carries
+      // the qualified name (e.g. `sched.scheduler.wake`) — that's what
+      // fnByName maps in both panes.
+      setLastClickedFn(d.fullName || d.label || null);
+
+      // Load the whole file and scroll so the function def lands at the
+      // top of the source block. Lets the user read up/down freely
+      // without re-fetching, which matches the code-review usage of the
+      // pane. The server caps reads at SOURCE_MAX_BYTES (1 MB) and the
+      // tokenizer runs once per request — both fast on kernel files.
       if (d.file && d.line) {
-        const start = Math.max(1, d.line);
-        const end = start + 79;
-        fetchSource(d.file, start, end, d.line);
+        fetchSource(d.file, 1, 10_000_000, d.line);
       }
 
       // Render intra (call tree).
@@ -1471,6 +1826,60 @@
       });
     }
 
+    // Source pane resize handle. The user drags the left edge of #info to
+    // grow/shrink the source review area. Width persists in localStorage so
+    // each session opens at the size the user picked. The handle is purely
+    // pointer-driven; we don't fall back to keyboard since the slider for
+    // depth already has the keyboard role on the topbar.
+    if (els.infoResizeHandle && els.info) {
+      // Restore persisted width on load. Stored as integer pixels.
+      try {
+        const saved = parseInt(localStorage.getItem("infoWidth"), 10);
+        if (Number.isFinite(saved) && saved >= 320) {
+          els.info.style.flex = "0 0 " + saved + "px";
+        }
+      } catch (_e) {}
+
+      let dragStartX = 0;
+      let dragStartWidth = 0;
+      let dragging = false;
+
+      function onMove(e) {
+        if (!dragging) return;
+        // Pointer moves left → wider panel; right → narrower.
+        const dx = dragStartX - e.clientX;
+        const next = Math.max(320, Math.min(window.innerWidth - 240, dragStartWidth + dx));
+        els.info.style.flex = "0 0 " + next + "px";
+        // Cy lives in #graph; the flex re-layout shrinks/grows #graph and
+        // cytoscape needs `resize()` to recompute its canvas. Cheap enough
+        // to call every move; cytoscape no-ops if size hasn't changed.
+        if (cy) cy.resize();
+      }
+      function onUp() {
+        if (!dragging) return;
+        dragging = false;
+        document.body.classList.remove("cg_resizing");
+        els.infoResizeHandle.classList.remove("dragging");
+        document.removeEventListener("mousemove", onMove);
+        document.removeEventListener("mouseup", onUp);
+        // Persist final width.
+        try {
+          const m = /([0-9]+)px/.exec(els.info.style.flex || "");
+          if (m) localStorage.setItem("infoWidth", m[1]);
+        } catch (_e) {}
+      }
+      els.infoResizeHandle.addEventListener("mousedown", function (e) {
+        e.preventDefault();
+        dragging = true;
+        dragStartX = e.clientX;
+        dragStartWidth = els.info.getBoundingClientRect().width;
+        document.body.classList.add("cg_resizing");
+        els.infoResizeHandle.classList.add("dragging");
+        document.addEventListener("mousemove", onMove);
+        document.addEventListener("mouseup", onUp);
+      });
+    }
+
     // Mode toggle (Graph | Trace). Switching modes hides the other view's
     // container but does not reset the entry selection. Drill state is
     // preserved per-entry inside trace.js.
@@ -1521,6 +1930,959 @@
         cgSignalReady();
       }
     }
+  }
+
+  // ------------------------------------------------------------------ compare
+
+  // Diff/compare state. Mode=off: single-pane (current behavior).
+  //
+  // In v1, the primary pane always renders the live working tree (whatever
+  // currentArch points at) — the topbar's arch/entry/depth wiring is
+  // unchanged. The secondary pane shows ONE other commit's view:
+  //   mode=parent X → secondary shows X^ (parent of X)
+  //   mode=head   X → secondary shows X
+  // Both panes track the same selected entry (matched by qualified name; fn
+  // ids differ between builds). Drilling on the primary updates the secondary
+  // via traceMode.setOnRendered.
+  const compareState = {
+    mode: "off",
+    commits: [],
+    selectedSha: "",
+    statuses: {}, // sha -> { status, default_arch, arches, error }
+    pollTimer: null,
+    // Cache of secondary graph blobs and derived lookups: sha -> { graph,
+    // fnById, fnByName }. Only populated for shas in `ready` state.
+    secGraphs: new Map(),
+    // Set<fn_id> of entry-point fns whose reachable subtree contains at
+    // least one *changed* function (line range overlaps a diff hunk).
+    // The dropdown reads this to prefix flagged entries with "● ".
+    entryNeedsReview: new Set(),
+    // Set<fn_id> of fns in the live graph that themselves have changed
+    // source between live and the secondary commit. The trace renderer
+    // reads this (via tctx.isChangedFn) to mark each box with a diamond
+    // glyph + accent stripe so the user knows where to drill.
+    changedFnIds: new Set(),
+    // Mirror of changedFnIds keyed by qualified name. The secondary
+    // pane's fns have different fn ids (separate build), so we match by
+    // name on that side.
+    changedFnNames: new Set(),
+    // Set<fn_id> of fns whose REACHABLE SUBTREE contains at least one
+    // changed fn (including the fn itself). Computed by reverse-BFS
+    // from changedFnIds. The trace renderer uses this to mark
+    // depth-capped leaves as "drill to find diff" — without it, the
+    // dropdown might flag an entry whose actual changed code lies past
+    // the depth limit and the trace view shows nothing highlighted.
+    subtreeChangedFnIds: new Set(),
+    subtreeChangedFnNames: new Set(),
+    // Set<DefId> of Definitions whose line_start..line_end overlaps a
+    // diff hunk. Drives the def_deps extension of changedFnIds and the
+    // identifier highlighting in the source pane.
+    changedDefIds: new Set(),
+    // simpleName → Definition for changed defs. Source pane uses this
+    // to wrap matching identifiers in a clickable span. Multiple defs
+    // can share a simple name (across files); we keep the first one
+    // found and the resolver picks based on import context at click
+    // time.
+    changedDefByName: new Map(),
+    // Map<repoRelativePath, [{ old_start, old_count, start, count }, …]>.
+    // Populated by recomputeDiffSets so the source pane can tint each
+    // line as added/removed/unchanged. Empty when compare is off.
+    hunksByFile: new Map(),
+  };
+
+  function setCompareStatus(text, kind) {
+    if (!els.compareStatus) return;
+    els.compareStatus.textContent = text || "";
+    els.compareStatus.classList.remove("building", "ready", "errored");
+    if (kind) els.compareStatus.classList.add(kind);
+  }
+
+  async function fetchCommitsList() {
+    try {
+      const r = await fetch("/api/commits?limit=80");
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const j = await r.json();
+      compareState.commits = (j.commits || []);
+    } catch (err) {
+      console.error("/api/commits failed", err);
+      compareState.commits = [];
+    }
+  }
+
+  function populateCommitDropdown() {
+    if (!els.compareCommit) return;
+    els.compareCommit.innerHTML = "";
+    if (compareState.commits.length === 0) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "(no commits)";
+      els.compareCommit.appendChild(opt);
+      return;
+    }
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "(select commit)";
+    els.compareCommit.appendChild(placeholder);
+    for (const c of compareState.commits) {
+      const opt = document.createElement("option");
+      opt.value = c.sha;
+      // Show: short sha + truncated subject. Date is in the title for hover.
+      const subj = c.subject || "";
+      const truncated = subj.length > 60 ? subj.slice(0, 57) + "…" : subj;
+      opt.textContent = `${c.short}  ${truncated}`;
+      opt.title = `${c.short}\n${c.author}  ${c.date}\n${subj}`;
+      els.compareCommit.appendChild(opt);
+    }
+  }
+
+  /** Returns the parent sha for a given selected sha by walking the
+   * recent-commits list. Returns null if not found or no parent in list
+   * (e.g. user picked the very last commit in the dropdown). */
+  function parentShaOf(sha) {
+    const idx = compareState.commits.findIndex((c) => c.sha === sha);
+    if (idx < 0 || idx + 1 >= compareState.commits.length) return null;
+    return compareState.commits[idx + 1].sha;
+  }
+
+  /** Resolves the sha that should populate the secondary pane.
+   *  Returns null if compare is off or selection is incomplete. */
+  function secondarySha() {
+    if (compareState.mode === "off") return null;
+    const sel = compareState.selectedSha;
+    if (!sel) return null;
+    if (compareState.mode === "parent") {
+      return parentShaOf(sel);
+    }
+    return sel; // mode === "head"
+  }
+
+  function shasNeedingLoad() {
+    const s = secondarySha();
+    return s ? [s] : [];
+  }
+
+  async function triggerLoad(sha) {
+    try {
+      const r = await fetch("/api/load_commit?sha=" + encodeURIComponent(sha));
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const j = await r.json();
+      compareState.statuses[sha] = j;
+      return j;
+    } catch (err) {
+      console.error("load_commit failed for", sha, err);
+      compareState.statuses[sha] = { status: "errored", error: String(err), arches: [], default_arch: "" };
+      return compareState.statuses[sha];
+    }
+  }
+
+  async function refreshStatus(sha) {
+    try {
+      const r = await fetch("/api/load_commit/status?sha=" + encodeURIComponent(sha));
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const j = await r.json();
+      compareState.statuses[sha] = j;
+      return j;
+    } catch (err) {
+      console.error("load_commit/status failed for", sha, err);
+      return null;
+    }
+  }
+
+  function shortSha(sha) {
+    return sha ? sha.slice(0, 7) : "";
+  }
+
+  function recomputeCompareStatus() {
+    if (compareState.mode === "off") {
+      setCompareStatus("");
+      hideSecondaryPane();
+      recomputeDiffSets(); // clears the sets and refreshes trace/dropdown
+      return;
+    }
+    if (!compareState.selectedSha) {
+      setCompareStatus("select commit");
+      hideSecondaryPane();
+      recomputeDiffSets();
+      return;
+    }
+    const sec = secondarySha();
+    if (!sec) {
+      setCompareStatus("no parent commit available");
+      hideSecondaryPane();
+      recomputeDiffSets();
+      return;
+    }
+    const status = compareState.statuses[sec];
+    const secShort = shortSha(sec);
+    if (status && status.status === "errored") {
+      setCompareStatus(`error: ${status.error || "load failed"}`, "errored");
+      hideSecondaryPane();
+      return;
+    }
+    if (!status || status.status !== "ready") {
+      setCompareStatus(`loading ${secShort}…`, "building");
+      hideSecondaryPane();
+      return;
+    }
+    setCompareStatus(`ready: ${secShort}`, "ready");
+    showSecondaryPaneAndRender(sec);
+    // Compute "needs review" flags for the entry dropdown — fire and
+    // forget; the dropdown updates whenever the fetch returns. Repeated
+    // calls (mode flip, commit reselect) are cheap on a localhost server.
+    recomputeDiffSets();
+  }
+
+  /** Show the secondary trace pane and trigger a render. Idempotent. */
+  function showSecondaryPaneAndRender(sec) {
+    if (els.tracePaneColB) els.tracePaneColB.style.display = "";
+    if (els.tracePaneColA) updateTraceLabel(els.traceLabelA, "live", null);
+    if (els.tracePaneColB) updateTraceLabel(els.traceLabelB, "older", sec);
+    ensureSecGraph(sec).then(function () {
+      requestSecondaryRender();
+    });
+  }
+
+  function hideSecondaryPane() {
+    if (els.tracePaneColB) els.tracePaneColB.style.display = "none";
+    if (els.traceViewB) els.traceViewB.innerHTML = "";
+    // Hide the live label too — the user only sees one pane and doesn't
+    // need a label telling them so. The label reappears the next time
+    // compare is enabled.
+    if (els.traceLabelA) els.traceLabelA.style.display = "none";
+    if (els.traceLabelB) els.traceLabelB.style.display = "none";
+    // Source pane labels stick around until the next fn click otherwise.
+    // Clearing them here keeps the two panes' labelling state in sync
+    // with whether the user is in compare mode.
+    clearSecondarySource();
+  }
+
+  /** Populate a pane label with side-of-diff tag + sha + commit subject.
+   *  side="live" renders a green "LIVE" tag with no sha; side="older"
+   *  renders a red tag plus the short sha and subject from the recent-
+   *  commits list (when available). */
+  function updateTraceLabel(labelEl, side, sha) {
+    if (!labelEl) return;
+    labelEl.style.display = "";
+    labelEl.classList.remove("live", "older");
+    labelEl.classList.add(side);
+    labelEl.innerHTML = "";
+
+    const tag = document.createElement("span");
+    tag.className = "pane_tag";
+    tag.textContent = side === "live" ? "LIVE" : "OLDER";
+    labelEl.appendChild(tag);
+
+    if (side === "live") {
+      const note = document.createElement("span");
+      note.className = "pane_subj";
+      note.textContent = "working tree";
+      labelEl.appendChild(note);
+      return;
+    }
+
+    if (sha) {
+      const shaEl = document.createElement("span");
+      shaEl.className = "pane_sha";
+      shaEl.textContent = sha.slice(0, 7);
+      labelEl.appendChild(shaEl);
+      const commit = compareState.commits.find(function (c) { return c.sha === sha; });
+      if (commit && commit.subject) {
+        const subj = document.createElement("span");
+        subj.className = "pane_subj";
+        subj.textContent = commit.subject;
+        subj.title = commit.subject;
+        labelEl.appendChild(subj);
+      }
+    }
+  }
+
+  /** Fetch + cache the secondary graph blob for a sha. Reuses live arch
+   *  picker so the comparison is apples-to-apples (x86_64 vs x86_64). */
+  async function ensureSecGraph(sha) {
+    if (compareState.secGraphs.has(sha)) return compareState.secGraphs.get(sha);
+    try {
+      const url = "/api/graph?sha=" + encodeURIComponent(sha) +
+                  "&arch=" + encodeURIComponent(currentArch);
+      const r = await fetch(url);
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const g = await r.json();
+      const ix = new Map();
+      for (const fn of g.functions || []) ix.set(fn.id, fn);
+      const byName = window.traceMode ? window.traceMode.buildFnByName(ix) : new Map();
+      const entry = { graph: g, fnById: ix, fnByName: byName };
+      compareState.secGraphs.set(sha, entry);
+      return entry;
+    } catch (err) {
+      console.error("secondary graph fetch failed", err);
+      return null;
+    }
+  }
+
+  /** Re-run populateDropdown, preserving the user's current selection.
+   *  Used after `entryNeedsReview` updates so the dropdown can show the
+   *  "●" prefix on entries whose subtree touches a changed file. */
+  function repopulateEntriesPreservingSelection() {
+    if (!graph) return;
+    const saved = els.entrySelect.value;
+    populateDropdown(graph.entry_points || []);
+    if (saved) {
+      // value setter silently ignores ids that aren't options anymore.
+      els.entrySelect.value = saved;
+    }
+  }
+
+  /** Strip the kernel-root prefix from an absolute def_loc path so it
+   *  matches `git diff --name-only` output (which is repo-relative).
+   *  Heuristic: find the LAST `/kernel/` substring and slice from there.
+   *  Mirrors the trace-view shortenFile heuristic. Returns null if the
+   *  file is outside the kernel tree (e.g. /usr/lib/zig stdlib paths). */
+  function defLocToRepoRel(file) {
+    if (!file) return null;
+    const idx = file.lastIndexOf("/kernel/");
+    if (idx >= 0) return file.slice(idx + 1);
+    if (file.startsWith("kernel/")) return file;
+    return null;
+  }
+
+  /** Compute changed-fn sets for the current compare state.
+   *
+   *  A function is "changed" iff its source line range on the live side
+   *  overlaps any hunk in `git diff --unified=0 <sec>`. Line ranges come
+   *  from def_loc.line; we approximate the end-of-fn by the start of the
+   *  next fn in the same file (sorted), or +∞ for the last fn. This
+   *  tracks fn-level edits even when the file has unrelated changes
+   *  elsewhere — the dropdown only flags entries whose reachable subtree
+   *  contains a *changed fn*, not just a changed file.
+   *
+   *  Updates compareState.changedFnIds, .changedFnNames, .entryNeedsReview
+   *  in one shot, then repopulates the dropdown and rerenders the trace
+   *  so both panes pick up the updated `isChangedFn` predicate. */
+  function simpleName(qname) {
+    if (!qname) return "";
+    const idx = qname.lastIndexOf(".");
+    return idx >= 0 ? qname.slice(idx + 1) : qname;
+  }
+
+  async function recomputeDiffSets() {
+    const clear = function () {
+      compareState.changedFnIds = new Set();
+      compareState.changedFnNames = new Set();
+      compareState.changedDefIds = new Set();
+      compareState.changedDefByName = new Map();
+      compareState.entryNeedsReview = new Set();
+      compareState.hunksByFile = new Map();
+      repopulateEntriesPreservingSelection();
+      refreshTraceForDiff();
+    };
+    if (compareState.mode === "off" || !graph) { clear(); return; }
+    const sec = secondarySha();
+    if (!sec) { clear(); return; }
+
+    let hunksByFile;
+    try {
+      const r = await fetch("/api/diff_hunks?sha=" + encodeURIComponent(sec));
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const j = await r.json();
+      hunksByFile = new Map();
+      for (const f of (j.files || [])) {
+        hunksByFile.set(f.path, f.hunks || []);
+      }
+      compareState.hunksByFile = hunksByFile;
+    } catch (err) {
+      console.error("/api/diff_hunks failed", err);
+      return;
+    }
+
+    const changedFnIds = new Set();
+    const changedFnNames = new Set();
+    // Definitions whose source range overlaps a hunk. Computed alongside
+    // changedFnIds so we can extend the fn set with anything that
+    // depends on a changed def — the user's mental model is "a struct
+    // changed → every fn touching that struct should be flagged".
+    const changedDefIds = new Set();
+
+    if (hunksByFile.size > 0) {
+      // Bucket fns AND defs by repo-relative file path; we only care
+      // about files that have at least one hunk.
+      const fnsByFile = new Map();
+      for (const fn of (graph.functions || [])) {
+        const rel = defLocToRepoRel(fn.def_loc && fn.def_loc.file);
+        if (!rel || !hunksByFile.has(rel)) continue;
+        if (!fnsByFile.has(rel)) fnsByFile.set(rel, []);
+        fnsByFile.get(rel).push(fn);
+      }
+      const defsByFile = new Map();
+      for (const def of (graph.definitions || [])) {
+        const rel = defLocToRepoRel(def.file);
+        if (!rel || !hunksByFile.has(rel)) continue;
+        if (!defsByFile.has(rel)) defsByFile.set(rel, []);
+        defsByFile.get(rel).push(def);
+      }
+
+      for (const [path, fns] of fnsByFile.entries()) {
+        // Sort by def_loc.line so we can use the next fn's start as
+        // an upper bound for the current fn's range. The last fn in
+        // the file gets +∞ — a conservative end that may over-flag
+        // trailing helpers but never under-flags a real change.
+        fns.sort(function (a, b) {
+          return (a.def_loc.line || 0) - (b.def_loc.line || 0);
+        });
+        const hunks = hunksByFile.get(path);
+        for (let i = 0; i < fns.length; i += 1) {
+          const startLine = fns[i].def_loc.line || 0;
+          const endLine = i + 1 < fns.length
+            ? Math.max(startLine, (fns[i + 1].def_loc.line || 0) - 1)
+            : Infinity;
+          for (const h of hunks) {
+            const hstart = h.start;
+            // count=0 represents pure deletions; treat as a single
+            // boundary line so insert/delete-only hunks still count.
+            const span = h.count === 0 ? 1 : h.count;
+            const hend = hstart + span - 1;
+            if (hend < startLine) continue;
+            if (hstart > endLine) continue;
+            changedFnIds.add(fns[i].id);
+            if (fns[i].name) changedFnNames.add(fns[i].name);
+            if (fns[i].mangled) changedFnNames.add(fns[i].mangled);
+            break;
+          }
+        }
+      }
+
+      // Defs use their own line_start..line_end (the walker captured the
+      // full body extent). No "next def" trickery needed — defs don't
+      // overlap each other.
+      for (const [path, defs] of defsByFile.entries()) {
+        const hunks = hunksByFile.get(path);
+        for (const def of defs) {
+          const startLine = def.line_start || 0;
+          const endLine = def.line_end || startLine;
+          for (const h of hunks) {
+            const hstart = h.start;
+            const span = h.count === 0 ? 1 : h.count;
+            const hend = hstart + span - 1;
+            if (hend < startLine) continue;
+            if (hstart > endLine) continue;
+            changedDefIds.add(def.id);
+            break;
+          }
+        }
+      }
+
+      // Extend changedFnIds with any fn whose def_deps intersect
+      // changedDefIds. This is the "struct edit flags every fn that uses
+      // it" rule — the user's review-driven mental model.
+      if (changedDefIds.size > 0) {
+        for (const fn of (graph.functions || [])) {
+          const deps = fn.def_deps;
+          if (!deps || deps.length === 0) continue;
+          if (changedFnIds.has(fn.id)) continue;
+          for (const did of deps) {
+            if (changedDefIds.has(did)) {
+              changedFnIds.add(fn.id);
+              if (fn.name) changedFnNames.add(fn.name);
+              if (fn.mangled) changedFnNames.add(fn.mangled);
+              break;
+            }
+          }
+        }
+      }
+    }
+
+    compareState.changedFnIds = changedFnIds;
+    compareState.changedFnNames = changedFnNames;
+    compareState.changedDefIds = changedDefIds;
+
+    // Build simpleName → Definition map for source-pane ident highlight.
+    // We index by simpleName (last dotted segment of qualified_name) so a
+    // bare identifier in source like `Foo` matches the changed `<mod>.Foo`
+    // def. First-write-wins on simpleName collisions (rare; user is
+    // accepting some over-flagging when distinct defs share a name).
+    const byName = new Map();
+    for (const did of changedDefIds) {
+      const def = (graph.definitions || []).find(function (d) { return d.id === did; });
+      if (!def) continue;
+      const simple = simpleName(def.qualified_name);
+      if (!byName.has(simple)) byName.set(simple, def);
+    }
+    compareState.changedDefByName = byName;
+
+    // Compute the "subtree contains a changed fn" closure via reverse-
+    // BFS from changedFnIds. Without this, entries flagged in the
+    // dropdown look unhighlighted in the trace view when their actual
+    // changes are deeper than the depth slider — the trace view caps
+    // expansion, so changed leaves never render.
+    //
+    // Approach: build the reverse adjacency once (callee → callers),
+    // then BFS from every changedFnId following those reverse edges.
+    // Both the source and the target have to share id-space, so this
+    // operates on the LIVE graph only; the secondary pane uses the
+    // matching `changedSubtreeFnNames` mirror computed below.
+    const subtreeIds = new Set(changedFnIds);
+    const reverse = new Map(); // callee_id → [caller_id, ...]
+    for (const fn of (graph.functions || [])) {
+      for (const c of (fn.callees || [])) {
+        if (c.to == null) continue;
+        if (!reverse.has(c.to)) reverse.set(c.to, []);
+        reverse.get(c.to).push(fn.id);
+      }
+    }
+    {
+      const queue = Array.from(changedFnIds);
+      while (queue.length > 0) {
+        const id = queue.shift();
+        const callers = reverse.get(id);
+        if (!callers) continue;
+        for (const cid of callers) {
+          if (subtreeIds.has(cid)) continue;
+          subtreeIds.add(cid);
+          queue.push(cid);
+        }
+      }
+    }
+    compareState.subtreeChangedFnIds = subtreeIds;
+
+    // Mirror as qualified names for the secondary pane (different ids).
+    const subtreeNames = new Set();
+    for (const id of subtreeIds) {
+      const fn = fnById.get(id);
+      if (!fn) continue;
+      if (fn.name) subtreeNames.add(fn.name);
+      if (fn.mangled) subtreeNames.add(fn.mangled);
+    }
+    compareState.subtreeChangedFnNames = subtreeNames;
+
+    // Entry-needs-review: BFS from each entry over direct/dispatch
+    // callee edges; flagged if any reachable fn is in changedFnIds.
+    const flagged = new Set();
+    const entries = graph.entry_points || [];
+    for (const e of entries) {
+      const root = e.fn_id;
+      if (root == null) continue;
+      if (changedFnIds.has(root)) { flagged.add(root); continue; }
+      const visited = new Set([root]);
+      const queue = [root];
+      let hit = false;
+      while (queue.length > 0) {
+        const id = queue.shift();
+        const fn = fnById.get(id);
+        if (!fn) continue;
+        for (const c of (fn.callees || [])) {
+          const to = c.to;
+          if (to == null) continue;
+          if (visited.has(to)) continue;
+          visited.add(to);
+          if (changedFnIds.has(to)) { hit = true; break; }
+          queue.push(to);
+        }
+        if (hit) break;
+      }
+      if (hit) flagged.add(root);
+    }
+    compareState.entryNeedsReview = flagged;
+
+    repopulateEntriesPreservingSelection();
+    refreshTraceForDiff();
+  }
+
+  /** Build the diffOpts argument for renderSourceSnippet on the primary
+   *  (live / new) side. Returns null when compare is off, the file isn't
+   *  in the change set, or paths can't be resolved. */
+  function computeDiffOptsForPrimary(filePath) {
+    if (!compareState || compareState.mode === "off") return null;
+    if (!compareState.hunksByFile || compareState.hunksByFile.size === 0) return null;
+    const rel = defLocToRepoRel(filePath);
+    if (!rel) return null;
+    const hunks = compareState.hunksByFile.get(rel);
+    if (!hunks || hunks.length === 0) return null;
+    return { hunks: hunks, side: "new" };
+  }
+
+  /** Same, but for the secondary (older / commit) side. The secondary's
+   *  file path lives under /var/tmp/cg-worktrees/<sha>/... but its
+   *  repo-relative form is identical to the primary's, so the hunks
+   *  table can be keyed by the same path. */
+  function computeDiffOptsForSecondary(filePath) {
+    if (!compareState || compareState.mode === "off") return null;
+    if (!compareState.hunksByFile || compareState.hunksByFile.size === 0) return null;
+    const rel = secondaryPathToRepoRel(filePath);
+    if (!rel) return null;
+    const hunks = compareState.hunksByFile.get(rel);
+    if (!hunks || hunks.length === 0) return null;
+    return { hunks: hunks, side: "old" };
+  }
+
+  /** Strip the worktree prefix from a secondary-side path. Format is
+   *  always /var/tmp/cg-worktrees/<sha>/<repo-rel>; we slice past the
+   *  sha segment. Falls back to the kernel/-prefix heuristic when the
+   *  path doesn't follow the worktree convention. */
+  function secondaryPathToRepoRel(file) {
+    if (!file) return null;
+    const marker = "/cg-worktrees/";
+    const idx = file.indexOf(marker);
+    if (idx >= 0) {
+      const after = file.slice(idx + marker.length);
+      const slash = after.indexOf("/");
+      if (slash >= 0) return after.slice(slash + 1);
+    }
+    return defLocToRepoRel(file);
+  }
+
+  /** Push the updated isChangedFn predicate into traceMode and force a
+   *  re-render so the new diamond markers appear without requiring the
+   *  user to click anything. Inert when trace mode isn't visible. */
+  function refreshTraceForDiff() {
+    if (!window.traceMode) return;
+    const ids = compareState.changedFnIds;
+    const subtreeIds = compareState.subtreeChangedFnIds;
+    window.traceMode.setContext({
+      isChangedFn: function (fn) {
+        return fn != null && fn.id != null && ids.has(fn.id);
+      },
+      hasChangedDescendant: function (fn) {
+        return fn != null && fn.id != null && subtreeIds.has(fn.id);
+      },
+    });
+    if (currentMode === "trace") {
+      window.traceMode.invalidate();
+      window.traceMode.rerender();
+    }
+    updateChangesPanel();
+  }
+
+  /** Render the "changes in this entry" sticky panel above the primary
+   *  trace pane. Lists every fn reachable from currentEntryFnId that was
+   *  changed in the diff, sorted by file:line. Clicking a row drills the
+   *  trace to that fn (which mirrors to the secondary pane and pops the
+   *  source pane to the relevant file/line) so the user can scan-and-jump
+   *  rather than hunting through the tree for ◆ glyphs. */
+  function updateChangesPanel() {
+    if (!els.diffChangesPanel) return;
+    if (compareState.mode === "off" || compareState.changedFnIds.size === 0) {
+      els.diffChangesPanel.style.display = "none";
+      return;
+    }
+    if (currentEntryFnId == null) {
+      els.diffChangesPanel.style.display = "none";
+      return;
+    }
+
+    // BFS from currentEntryFnId over direct/dispatch callees, collecting
+    // any fn that's in changedFnIds. Mirrors the entry-needs-review BFS
+    // but produces a list, not just a hit/miss.
+    const root = currentEntryFnId;
+    const visited = new Set([root]);
+    const queue = [root];
+    const found = [];
+    if (compareState.changedFnIds.has(root)) {
+      const f = fnById.get(root);
+      if (f) found.push(f);
+    }
+    while (queue.length > 0) {
+      const id = queue.shift();
+      const fn = fnById.get(id);
+      if (!fn) continue;
+      for (const c of (fn.callees || [])) {
+        const to = c.to;
+        if (to == null) continue;
+        if (visited.has(to)) continue;
+        visited.add(to);
+        queue.push(to);
+        if (compareState.changedFnIds.has(to)) {
+          const tfn = fnById.get(to);
+          if (tfn) found.push(tfn);
+        }
+      }
+    }
+    // De-duplicate by qualified name; the IR can emit one Function per
+    // generic instantiation (same name, same def_loc) which would clutter
+    // the list with 8+ identical rows.
+    const seen = new Set();
+    const unique = [];
+    for (const f of found) {
+      const key = f.name || f.mangled || ("id:" + f.id);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      unique.push(f);
+    }
+    unique.sort(function (a, b) {
+      const fa = (a.def_loc && a.def_loc.file) || "";
+      const fb = (b.def_loc && b.def_loc.file) || "";
+      if (fa !== fb) return fa.localeCompare(fb);
+      return ((a.def_loc && a.def_loc.line) || 0) - ((b.def_loc && b.def_loc.line) || 0);
+    });
+
+    els.diffChangesPanel.style.display = "";
+    if (els.diffChangesCount) {
+      els.diffChangesCount.textContent = unique.length === 0
+        ? "(none reachable in this entry)"
+        : unique.length + " changed";
+    }
+    els.diffChangesList.innerHTML = "";
+    if (unique.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "diff_changes_empty";
+      empty.textContent = "No changed fns reachable from this entry.";
+      els.diffChangesList.appendChild(empty);
+      return;
+    }
+    for (const fn of unique) {
+      const row = document.createElement("div");
+      row.className = "diff_changes_row";
+      row.title = fn.name;
+
+      const glyph = document.createElement("span");
+      glyph.className = "glyph";
+      glyph.textContent = "◆";
+      row.appendChild(glyph);
+
+      const name = document.createElement("span");
+      name.className = "fn_name";
+      name.textContent = fn.name || fn.mangled || ("#" + fn.id);
+      row.appendChild(name);
+
+      const loc = document.createElement("span");
+      loc.className = "fn_loc";
+      loc.textContent = shortenFile(fn.def_loc && fn.def_loc.file) +
+        ":" + ((fn.def_loc && fn.def_loc.line) || 0);
+      row.appendChild(loc);
+
+      row.addEventListener("click", function () {
+        // Drill the trace to this fn (mirrors to secondary). Also fire
+        // showNodePanel so the source pane lands on the changed file.
+        if (window.traceMode && window.traceMode.pushDrillByName) {
+          window.traceMode.pushDrillByName(fn.name);
+        }
+        showNodePanel({
+          id: "n" + fn.id,
+          fullName: fn.name,
+          label: fn.name,
+          mangled: fn.mangled,
+          file: fn.def_loc ? fn.def_loc.file : "",
+          line: fn.def_loc ? fn.def_loc.line : 0,
+          col: fn.def_loc ? fn.def_loc.col : 0,
+          isEntry: !!fn.is_entry,
+          entryKind: fn.entry_kind || "",
+          kind: "fn",
+        });
+      });
+
+      els.diffChangesList.appendChild(row);
+    }
+  }
+
+
+  /** Render the secondary trace pane to mirror the primary's current
+   *  root. `rootNameOverride` lets the primary pass its actually-rendered
+   *  root (e.g. after a drill push); when omitted we fall back to the
+   *  selected entry, which matches the initial state before any drill. */
+  function requestSecondaryRender(rootNameOverride) {
+    if (compareState.mode === "off") return;
+    const sec = secondarySha();
+    if (!sec) return;
+    if (currentMode !== "trace") return;
+    const data = compareState.secGraphs.get(sec);
+    if (!data) return;
+    if (!els.traceViewB) return;
+    let rootName = rootNameOverride || null;
+    if (!rootName) {
+      if (currentEntryFnId == null) return;
+      const primaryFn = fnById.get(currentEntryFnId);
+      rootName = primaryFn ? primaryFn.name : null;
+    }
+    if (!window.traceMode || !window.traceMode.renderSecondary) return;
+    window.traceMode.renderSecondary({
+      view: els.traceViewB,
+      fnById: data.fnById,
+      fnByName: data.fnByName,
+      rootName: rootName,
+      depth: parseInt(els.depthSlider.value, 10) || 4,
+      helpers: {
+        isLibrary: isLibrary,
+        isDebug: isDebug,
+        getHideLibrary: function () { return hideLibrary; },
+        getHideDebug: function () { return hideDebug; },
+        // Secondary fn ids belong to a different build, so we match
+        // changes by qualified name instead. Mangled names are also
+        // stored so callee atoms with `mangled` resolution still match.
+        isChangedFn: function (fn) {
+          if (!fn) return false;
+          const names = compareState.changedFnNames;
+          if (fn.name && names.has(fn.name)) return true;
+          if (fn.mangled && names.has(fn.mangled)) return true;
+          return false;
+        },
+        hasChangedDescendant: function (fn) {
+          if (!fn) return false;
+          const names = compareState.subtreeChangedFnNames;
+          if (fn.name && names.has(fn.name)) return true;
+          if (fn.mangled && names.has(fn.mangled)) return true;
+          return false;
+        },
+      },
+    });
+  }
+
+  function startStatusPoll() {
+    if (compareState.pollTimer) return;
+    compareState.pollTimer = setInterval(async function () {
+      const need = shasNeedingLoad();
+      let allDone = true;
+      for (const sha of need) {
+        const cur = compareState.statuses[sha];
+        if (!cur || cur.status === "building") {
+          await refreshStatus(sha);
+          const after = compareState.statuses[sha];
+          if (!after || after.status === "building") allDone = false;
+        }
+      }
+      recomputeCompareStatus();
+      if (allDone) {
+        clearInterval(compareState.pollTimer);
+        compareState.pollTimer = null;
+      }
+    }, 1500);
+  }
+
+  async function activateCompare() {
+    const need = shasNeedingLoad();
+    if (need.length === 0) {
+      recomputeCompareStatus();
+      return;
+    }
+    setCompareStatus("starting builds…", "building");
+    // Kick off loads (server is single-flight per sha).
+    for (const sha of need) {
+      const cur = compareState.statuses[sha];
+      if (cur && cur.status === "ready") continue;
+      await triggerLoad(sha);
+    }
+    recomputeCompareStatus();
+    startStatusPoll();
+  }
+
+  function onCompareModeChange() {
+    const v = els.compareMode.value;
+    compareState.mode = v;
+    if (v === "off") {
+      els.compareCommit.style.display = "none";
+      // recomputeCompareStatus also clears the entry flags + repopulates
+      // the dropdown without markers.
+      recomputeCompareStatus();
+      return;
+    }
+    els.compareCommit.style.display = "";
+    if (compareState.commits.length === 0) {
+      fetchCommitsList().then(populateCommitDropdown).then(recomputeCompareStatus);
+    } else {
+      populateCommitDropdown();
+    }
+    recomputeCompareStatus();
+    if (compareState.selectedSha) activateCompare();
+  }
+
+  function onCompareCommitChange() {
+    compareState.selectedSha = els.compareCommit.value || "";
+    if (compareState.mode !== "off" && compareState.selectedSha) {
+      activateCompare();
+    } else {
+      recomputeCompareStatus();
+    }
+  }
+
+  // Probe-only debug hook: inject a "loaded" secondary commit by sha, mode,
+  // and a graph blob (typically the live one for end-to-end testing without
+  // running a real build). Inert in production — only the perf/probe
+  // harnesses call it. Lives on `window` because compareState is closure-
+  // private and the harness can't reach into it otherwise.
+  window.__cgInjectSecondary = function (opts) {
+    if (!opts || !opts.sha || !opts.graph) return false;
+    const ix = new Map();
+    for (const fn of opts.graph.functions || []) ix.set(fn.id, fn);
+    const byName = window.traceMode ? window.traceMode.buildFnByName(ix) : new Map();
+    compareState.secGraphs.set(opts.sha, { graph: opts.graph, fnById: ix, fnByName: byName });
+    compareState.statuses[opts.sha] = {
+      sha: opts.sha,
+      short: opts.sha.slice(0, 7),
+      status: "ready",
+      arches: [currentArch],
+      default_arch: currentArch,
+      error: null,
+    };
+    if (opts.mode) compareState.mode = opts.mode;
+    compareState.selectedSha = opts.sha;
+    if (els.compareMode && opts.mode) els.compareMode.value = opts.mode;
+    recomputeCompareStatus();
+    return true;
+  };
+
+  function wireCompareEvents() {
+    if (!els.compareMode || !els.compareCommit) return;
+    els.compareMode.addEventListener("change", onCompareModeChange);
+    els.compareCommit.addEventListener("change", onCompareCommitChange);
+    // Mirror primary trace renders into the secondary pane. Fires after
+    // every entry change, drill push/pop, and depth change.
+    if (window.traceMode && window.traceMode.setOnRendered) {
+      window.traceMode.setOnRendered(function (info) {
+        requestSecondaryRender(info && info.rootName);
+      });
+    }
+
+    // Secondary-pane drill gestures: dblclick to drill in, right-click
+    // dblclick to pop. Both gestures resolve a target fn in the
+    // SECONDARY graph (the data-fnid lives there), then drive the
+    // primary by qualified name. The primary's render callback will
+    // mirror the new root back to the secondary, so both panes stay
+    // in lockstep without the secondary needing its own drill state.
+    if (els.traceViewB) {
+      let lastRightClickB = 0;
+      const RIGHT_DBLCLICK_MS = 400;
+
+      els.traceViewB.addEventListener("contextmenu", function (e) {
+        e.preventDefault();
+        const now = Date.now();
+        if (now - lastRightClickB < RIGHT_DBLCLICK_MS) {
+          lastRightClickB = 0;
+          if (window.traceMode && window.traceMode.popDrill) {
+            window.traceMode.popDrill();
+          }
+        } else {
+          lastRightClickB = now;
+        }
+      });
+
+      els.traceViewB.addEventListener("dblclick", function (e) {
+        const box = e.target.closest && e.target.closest(".trace_box[data-fnid]");
+        if (!box) return;
+        const sec = secondarySha();
+        if (!sec) return;
+        const data = compareState.secGraphs.get(sec);
+        if (!data) return;
+        const secId = parseInt(box.getAttribute("data-fnid"), 10);
+        if (Number.isNaN(secId)) return;
+        const secFn = data.fnById.get(secId);
+        if (!secFn || !secFn.name) return;
+        // Don't drill if the matching primary fn isn't found — the
+        // primary couldn't render its body anyway. Flash the secondary
+        // box briefly so the user knows the gesture registered but the
+        // target was absent. (Cheap CSS class; same UX as the primary's
+        // breadcrumb-flash on overflowing pop.)
+        e.preventDefault();
+        e.stopPropagation();
+        const drilled = window.traceMode &&
+          window.traceMode.pushDrillByName &&
+          window.traceMode.pushDrillByName(secFn.name);
+        if (!drilled) {
+          box.classList.add("flash");
+          setTimeout(function () { box.classList.remove("flash"); }, 250);
+        }
+      });
+    }
+    // Pre-fetch the commit list so the dropdown is instant when the user
+    // flips compare on. Cheap (~50 commits over localhost).
+    fetchCommitsList().then(function () {
+      if (compareState.mode !== "off") populateCommitDropdown();
+    });
   }
 
   // ------------------------------------------------------------------ demo data
@@ -1762,6 +3124,7 @@
       return;
     }
     wireEvents();
+    wireCompareEvents();
     loadGraph();
   });
 })();

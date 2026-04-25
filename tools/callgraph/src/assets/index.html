@@ -114,6 +114,20 @@
       font-variant-numeric: tabular-nums;
     }
 
+    select#compare_commit {
+      min-width: 240px;
+      max-width: 360px;
+    }
+
+    .compare_status {
+      color: var(--fg-dim);
+      font-size: 11px;
+      min-width: 90px;
+    }
+    .compare_status.building { color: #f0c060; }
+    .compare_status.ready    { color: #6fd17a; }
+    .compare_status.errored  { color: var(--indirect); }
+
     /* ---- Body split -------------------------------------------------- */
     #body {
       display: flex;
@@ -155,18 +169,48 @@
     }
 
     /* ---- Side panel -------------------------------------------------- */
+    /* Default width tuned for source code review (~50% of a 1080p screen).
+       The drag handle on the left edge lets the user resize horizontally;
+       the chosen width persists in localStorage. min-width keeps the
+       metadata header readable; max-width is large but bounded so the
+       panel can't completely swallow the graph. */
     #info {
-      flex: 0 0 30%;
-      max-width: 480px;
-      min-width: 280px;
+      flex: 0 0 720px;
+      max-width: 90%;
+      min-width: 320px;
       background: var(--bg-elev);
       border-left: 1px solid var(--border);
       overflow-y: auto;
       padding: 16px;
       display: none;
+      position: relative;
     }
 
     #info.visible { display: block; }
+
+    /* Drag handle: thin strip on the left edge of #info. Hover/active
+       states give the user a visual hook; cursor flips to col-resize so
+       it's clear the strip is interactive. The handle itself is 6px wide
+       with a 4px hit area extension into the panel (negative margin) so
+       it's easy to grab without obscuring panel content. */
+    #info .resize_handle {
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 6px;
+      cursor: col-resize;
+      background: transparent;
+      transition: background 0.15s ease;
+      z-index: 5;
+    }
+    #info .resize_handle:hover,
+    #info .resize_handle.dragging {
+      background: var(--accent);
+    }
+    /* Disable text selection across the page while dragging so the cursor
+       doesn't keep selecting random source lines mid-drag. */
+    body.cg_resizing { user-select: none; cursor: col-resize; }
 
     #info header {
       display: flex;
@@ -245,8 +289,76 @@
       border: 1px solid var(--border);
       border-radius: 4px;
       max-height: 60vh;
-      overflow: auto;
+      /* `scroll` (not `auto`) keeps both bars visible whenever the content
+         exceeds either dimension. With `auto` the horizontal bar only
+         materialises after the user has scrolled to the bottom, which the
+         user found jarring during code review. */
+      overflow: scroll;
       background: #1e1e1e;
+      /* Firefox: forces the gutter for both axes so the layout doesn't
+         jump when a bar becomes needed. */
+      scrollbar-gutter: stable both-edges;
+    }
+
+    /* Side-by-side source for compare mode. The split is a flex row so
+       both halves grow equally; each .source_block is already a scroll
+       container so it brings its own scrollbars. The default state
+       (compare off) shows just the primary block at full width — the
+       secondary's `display:none` collapses it out of the flex row. */
+    .source_split {
+      display: flex;
+      flex-direction: row;
+      gap: 6px;
+      min-width: 0;
+    }
+    .source_split > .source_pane,
+    .source_split > .source_block {
+      flex: 1 1 0;
+      min-width: 0;
+    }
+    .source_split.compare_active > .source_pane {
+      max-width: 50%;
+    }
+    .source_pane {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      flex: 1 1 0;
+    }
+    .source_pane_label {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 3px 8px;
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-bottom: none;
+      border-radius: 4px 4px 0 0;
+      font-size: 11px;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--fg-dim);
+    }
+    .source_pane_label .pane_tag {
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 600;
+    }
+    .source_pane_label.live  .pane_tag { background: rgba(80, 180, 80, 0.20); color: #6fd17a; }
+    .source_pane_label.older .pane_tag { background: rgba(220, 80, 80, 0.20); color: #f06060; }
+    .source_pane_label .pane_sha {
+      color: var(--fg);
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .source_pane > .source_block {
+      border-radius: 0 0 4px 4px;
+    }
+    /* When the label is hidden, restore the rounded top corners. */
+    .source_pane > .source_block:first-child {
+      border-radius: 4px;
     }
 
     .source_header {
@@ -296,6 +408,29 @@
       color: #e6e6e6;
     }
 
+    /* Syntax highlight palette. Tag groupings come from the server-side
+       Zig tokenizer (see classifyTokenTag). Colors picked to harmonize
+       with the existing edge-kind palette so nothing screams. */
+    .source_code .tok_keyword     { color: #c586c0; }
+    .source_code .tok_builtin     { color: #4a9eff; }
+    .source_code .tok_string      { color: #ce9178; }
+    .source_code .tok_number      { color: #b5cea8; }
+    .source_code .tok_comment     { color: #6a9955; font-style: italic; }
+    .source_code .tok_doc_comment { color: #8a9a8a; font-style: italic; }
+
+    /* Identifier that resolves to a Definition whose source range
+       overlaps a hunk in the current diff. Underline + cursor pointer;
+       click drills the source pane to the def. Inert when compare is
+       off (no spans get emitted in that case). */
+    .source_code .tok_changed_dep {
+      text-decoration: underline dotted #f0c060;
+      text-underline-offset: 2px;
+      cursor: pointer;
+    }
+    .source_code .tok_changed_dep:hover {
+      background: rgba(240, 192, 96, 0.18);
+    }
+
     .source_line.highlight .source_code,
     .source_line.highlight .source_gutter {
       background-color: rgba(255, 200, 0, 0.15);
@@ -303,6 +438,40 @@
 
     .source_line.highlight .source_gutter {
       color: #d8a050;
+    }
+
+    /* Diff line tints. `added` (new side) is green, `removed` (old side)
+       is red. Both backgrounds are restrained so the syntax tokens stay
+       readable; the gutter takes a stronger tint and a +/- glyph so the
+       diff state is obvious without re-tinting code. */
+    .source_line.added .source_code,
+    .source_line.added .source_gutter {
+      background-color: rgba(80, 180, 80, 0.18);
+    }
+    .source_line.added .source_gutter {
+      color: #6fd17a;
+    }
+    .source_line.added .source_gutter::before {
+      content: "+ ";
+      color: #6fd17a;
+      opacity: 0.85;
+    }
+    .source_line.removed .source_code,
+    .source_line.removed .source_gutter {
+      background-color: rgba(220, 80, 80, 0.18);
+    }
+    .source_line.removed .source_gutter {
+      color: #f06060;
+    }
+    .source_line.removed .source_gutter::before {
+      content: "− ";
+      color: #f06060;
+      opacity: 0.85;
+    }
+    /* Highlight + diff: highlight wins on the gutter glyph slot. */
+    .source_line.highlight.added .source_gutter::before,
+    .source_line.highlight.removed .source_gutter::before {
+      content: "";
     }
 
     .source_error {
@@ -649,7 +818,25 @@
     }
 
     /* ---- Trace view ------------------------------------------------- */
-    #trace_view {
+    #trace_view_wrap {
+      flex: 1 1 auto;
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: row;
+      gap: 0;
+    }
+    .trace_pane_col {
+      flex: 1 1 0;
+      min-width: 0;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+    }
+    .trace_pane_col + .trace_pane_col {
+      border-left: 1px solid var(--border);
+    }
+    .trace_view_pane {
       flex: 1 1 auto;
       min-width: 0;
       min-height: 0;
@@ -660,6 +847,120 @@
       font-size: 12px;
       color: var(--fg);
     }
+    .trace_pane_label {
+      flex: 0 0 auto;
+      background: var(--bg-elev);
+      color: var(--fg-dim);
+      font-size: 11px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    /* Diff change list — sticky panel at the top of the primary trace
+       pane that lists every changed fn reachable from the current entry.
+       Click a row to drill the trace there and pop the source pane open
+       on the actual diff. Without this, the user has to scan the entire
+       tree for ◆ glyphs, which gets tedious on big entries. */
+    .diff_changes_panel {
+      flex: 0 0 auto;
+      max-height: 28vh;
+      display: flex;
+      flex-direction: column;
+      background: var(--bg-elev);
+      border-bottom: 1px solid var(--border);
+    }
+    .diff_changes_header {
+      flex: 0 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-bottom: 1px solid var(--border);
+    }
+    .diff_changes_title {
+      color: var(--fg-bright);
+      font-size: 11px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+    .diff_changes_count {
+      color: #f0c060;
+      font-size: 11px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+    }
+    .diff_changes_list {
+      flex: 1 1 auto;
+      min-height: 0;
+      overflow: auto;
+      padding: 4px 0;
+    }
+    .diff_changes_row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 3px 10px;
+      cursor: pointer;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 11px;
+      color: var(--fg);
+    }
+    .diff_changes_row:hover {
+      background: rgba(74, 158, 255, 0.10);
+    }
+    .diff_changes_row .glyph {
+      color: #f0c060;
+      flex: 0 0 auto;
+    }
+    .diff_changes_row .fn_name {
+      flex: 0 1 auto;
+      color: var(--fg-bright);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .diff_changes_row .fn_loc {
+      flex: 1 1 auto;
+      color: var(--fg-dim);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      text-align: right;
+    }
+    .diff_changes_empty {
+      color: var(--fg-dim);
+      font-style: italic;
+      padding: 6px 10px;
+      font-size: 11px;
+    }
+    .trace_pane_label .pane_tag {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 10px;
+      font-weight: 600;
+    }
+    .trace_pane_label.live  .pane_tag { background: rgba(80, 180, 80, 0.20); color: #6fd17a; }
+    .trace_pane_label.older .pane_tag { background: rgba(220, 80, 80, 0.20); color: #f06060; }
+    .trace_pane_label .pane_sha {
+      color: var(--fg);
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .trace_pane_label .pane_subj {
+      color: var(--fg-dim);
+      text-transform: none;
+      letter-spacing: 0;
+      font-style: italic;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
 
     .trace_box {
       border: 1px solid #888;
@@ -669,6 +970,12 @@
       background: rgba(255, 255, 255, 0.012);
       min-width: 0;
       overflow: hidden;
+      /* Off-screen subtrees (kEntry can produce thousands of nested boxes)
+         are taken out of layout/paint until they scroll into view. The
+         intrinsic-size hint reserves 0×56px per box so scrollbars stay
+         honest before the first measurement. */
+      content-visibility: auto;
+      contain-intrinsic-size: 0 56px;
     }
 
     .trace_header {
@@ -784,6 +1091,51 @@
       border-style: dotted;
     }
     .trace_box.trace_inlined .trace_title { color: #a0a8b3; }
+
+    /* Depth-capped callee — the body wasn't expanded because we hit the
+       depth limit. Double-click drills in to re-root the trace at this
+       function. The ▸ marker in the title is a visual cue. */
+    .trace_box.trace_capped {
+      cursor: pointer;
+      border-style: dashed;
+    }
+    .trace_box.trace_capped:hover {
+      background: rgba(74, 158, 255, 0.06);
+    }
+    .trace_box.trace_capped .trace_title { color: var(--accent); }
+
+    /* Secondary-pane dblclick fallback: when the user drills into a fn
+       that doesn't exist on the primary (added/deleted across the
+       diff), the primary can't follow. Briefly flash the box so the
+       gesture isn't silently swallowed. */
+    .trace_box.flash {
+      animation: trace_box_flash 250ms ease-out;
+    }
+    @keyframes trace_box_flash {
+      0%   { background: rgba(240, 96, 96, 0.20); }
+      100% { background: rgba(255, 255, 255, 0.012); }
+    }
+
+    /* Diff hints — two flavors.
+       trace_diffhint_direct: the fn ITSELF was changed in the diff. Bright
+         gold stripe + ◆ glyph in the title. Highest signal: drill in or
+         click through to source to read the actual change.
+       trace_diffhint_subtree: the fn or some descendant has changes
+         deeper in the call tree (often past the depth cap). Faint
+         dotted stripe so the user sees the trail to drill down without
+         confusing it with a direct change.
+       Inert when compare is off — predicates default to false. */
+    .trace_box.trace_diffhint_direct {
+      box-shadow: inset 4px 0 0 0 #f0c060;
+    }
+    .trace_box.trace_diffhint_direct > .trace_header > .trace_title::before {
+      content: "◆ ";
+      color: #f0c060;
+      font-size: 10px;
+    }
+    .trace_box.trace_diffhint_subtree {
+      box-shadow: inset 3px 0 0 0 rgba(240, 192, 96, 0.45);
+    }
 
     /* Branch — title row + columns under it.
        Columns use horizontal-scrolling flex (not grid) so that deeply-nested
@@ -909,6 +1261,19 @@
         <button class="mode_button active" data-mode="graph" type="button">Graph</button>
         <button class="mode_button" data-mode="trace" type="button">Trace</button>
       </div>
+
+      <div class="field" id="compare_field">
+        <label for="compare_mode">Compare:</label>
+        <select id="compare_mode">
+          <option value="off">off</option>
+          <option value="parent">X^ vs X</option>
+          <option value="head">X vs HEAD</option>
+        </select>
+        <select id="compare_commit" style="display: none;">
+          <option value="">(loading commits…)</option>
+        </select>
+        <span id="compare_status" class="compare_status"></span>
+      </div>
     </div>
 
     <div id="trace_breadcrumb" style="display: none;"></div>
@@ -926,9 +1291,26 @@
         </div>
       </div>
 
-      <div id="trace_view" style="display: none;"></div>
+      <div id="trace_view_wrap" class="trace_view_wrap" style="display: none;">
+        <div class="trace_pane_col" id="trace_pane_col_a">
+          <div class="trace_pane_label" id="trace_label_a" style="display: none;"></div>
+          <div class="diff_changes_panel" id="diff_changes_panel" style="display: none;">
+            <div class="diff_changes_header">
+              <span class="diff_changes_title">Changes in this entry</span>
+              <span class="diff_changes_count" id="diff_changes_count"></span>
+            </div>
+            <div class="diff_changes_list" id="diff_changes_list"></div>
+          </div>
+          <div id="trace_view" class="trace_view_pane"></div>
+        </div>
+        <div class="trace_pane_col" id="trace_pane_col_b" style="display: none;">
+          <div class="trace_pane_label" id="trace_label_b"></div>
+          <div id="trace_view_b" class="trace_view_pane trace_view_pane_b"></div>
+        </div>
+      </div>
 
       <aside id="info">
+        <div class="resize_handle" id="info_resize_handle" aria-label="Resize source pane" role="separator"></div>
         <header>
           <h2 id="info_title">Selection</h2>
           <button class="close" id="info_close" type="button" aria-label="Close panel">&times;</button>
@@ -936,7 +1318,16 @@
         <dl id="info_meta"></dl>
         <div id="info_source_wrap" style="display: none;">
           <dt style="color: var(--fg-dim); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px;">Source</dt>
-          <div class="source_block" id="info_source"></div>
+          <div class="source_split" id="info_source_split">
+            <div class="source_pane" id="info_source_pane_a">
+              <div class="source_pane_label" id="info_source_label_a" style="display: none;"></div>
+              <div class="source_block" id="info_source"></div>
+            </div>
+            <div class="source_pane" id="info_source_pane_b" style="display: none;">
+              <div class="source_pane_label" id="info_source_label_b"></div>
+              <div class="source_block source_block_b" id="info_source_b"></div>
+            </div>
+          </div>
         </div>
         <div class="source_error" id="info_source_error" style="display: none;"></div>
         <div class="intra_block" id="info_intra_wrap" style="display: none;">
