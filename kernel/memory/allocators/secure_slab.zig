@@ -179,15 +179,15 @@ pub fn AtomicSlabRef(comptime T: type) type {
 
         pub fn load(self: *const Self, comptime _: std.builtin.AtomicOrder) ?Ref {
             const mut: *Self = @constCast(self);
-            mut.lock.lock();
-            defer mut.lock.unlock();
+            const irq = mut.lock.lockIrqSave();
+            defer mut.lock.unlockIrqRestore(irq);
             const p = mut.ptr orelse return null;
             return Ref.init(p, @intCast(mut.gen));
         }
 
         pub fn store(self: *Self, ref: ?Ref, comptime _: std.builtin.AtomicOrder) void {
-            self.lock.lock();
-            defer self.lock.unlock();
+            const irq = self.lock.lockIrqSave();
+            defer self.lock.unlockIrqRestore(irq);
             if (ref) |r| {
                 self.ptr = r.ptr;
                 self.gen = r.gen;
@@ -198,8 +198,8 @@ pub fn AtomicSlabRef(comptime T: type) type {
         }
 
         pub fn swap(self: *Self, ref: ?Ref, comptime _: std.builtin.AtomicOrder) ?Ref {
-            self.lock.lock();
-            defer self.lock.unlock();
+            const irq = self.lock.lockIrqSave();
+            defer self.lock.unlockIrqRestore(irq);
             const prev: ?Ref = if (self.ptr) |p| Ref.init(p, @intCast(self.gen)) else null;
             if (ref) |r| {
                 self.ptr = r.ptr;
