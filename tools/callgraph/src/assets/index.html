@@ -625,6 +625,10 @@
         <label><input type="checkbox" id="include_indirect" checked /> include indirect</label>
       </div>
 
+      <div class="field">
+        <label title="Hides functions in /usr/lib/zig/ and __zig_* / __ubsan_* / compiler_rt.* infrastructure. Your kernel code is never hidden."><input type="checkbox" id="hide_library" checked /> hide stdlib/compiler <span style="color: var(--fg-dim); cursor: help;">(?)</span></label>
+      </div>
+
       <button id="fit_btn" type="button">fit to view</button>
       <button id="indirect_panel_btn" type="button">indirect calls</button>
       <button id="dead_panel_btn" type="button">dead code</button>

@@ -17,6 +17,35 @@
   const fnById = new Map();
   /** Current Cytoscape instance. Recreated on each entry-point switch. */
   let cy = null;
+  /** When true (default), hide Zig stdlib + compiler infrastructure from
+   *  every view. Persisted in localStorage so reload preserves the choice. */
+  let hideLibrary = (function () {
+    try {
+      return localStorage.getItem("hideLibrary") !== "false";
+    } catch (_e) {
+      return true;
+    }
+  })();
+
+  /** A function counts as "library" if it lives under /usr/lib/zig/ or its
+   *  mangled name is one of the compiler-synthesized / runtime prefixes.
+   *  See the spec at the top of this file for the full criteria. */
+  function isLibrary(fn) {
+    if (!fn) return false;
+    const file = (fn.def_loc && fn.def_loc.file) || "";
+    if (file.startsWith("/usr/lib/zig/")) return true;
+    const m = fn.mangled || "";
+    if (m.startsWith("__zig_")) return true;
+    if (m.startsWith("__ubsan_")) return true;
+    if (m.startsWith("ubsan_rt.")) return true;
+    if (m.startsWith("compiler_rt.")) return true;
+    return false;
+  }
+
+  /** True when the library filter is on AND fn is library. */
+  function isFiltered(fn) {
+    return hideLibrary && isLibrary(fn);
+  }
 
   // ------------------------------------------------------------------ DOM
 
@@ -25,6 +54,7 @@
     depthSlider: document.getElementById("depth_slider"),
     depthValue: document.getElementById("depth_value"),
     indirectToggle: document.getElementById("include_indirect"),
+    hideLibraryToggle: document.getElementById("hide_library"),
     fitBtn: document.getElementById("fit_btn"),
     indirectPanelBtn: document.getElementById("indirect_panel_btn"),
     deadPanelBtn: document.getElementById("dead_panel_btn"),
@@ -108,16 +138,34 @@
     for (const fn of graph.functions || []) fnById.set(fn.id, fn);
 
     populateDropdown(graph.entry_points || []);
-    if ((graph.entry_points || []).length > 0) {
-      els.entrySelect.value = String(graph.entry_points[0].fn_id);
-      renderForEntry(graph.entry_points[0].fn_id);
+    const firstId = firstVisibleEntryId(graph.entry_points || []);
+    if (firstId != null) {
+      els.entrySelect.value = String(firstId);
+      renderForEntry(firstId);
     }
+  }
+
+  /** First entry point that survives the library filter, or null. Used both
+   *  on initial load and when the user toggles the filter and we need to
+   *  pick a sensible default. */
+  function firstVisibleEntryId(entries) {
+    for (const e of entries) {
+      if (!hideLibrary || !isFiltered(fnById.get(e.fn_id))) return e.fn_id;
+    }
+    return null;
   }
 
   function populateDropdown(entries) {
     els.entrySelect.innerHTML = "";
 
-    if (entries.length === 0) {
+    // Drop library entry points when the filter is on. Entry discovery is
+    // tuned for kernel patterns so this should be empty in practice, but it
+    // keeps the dropdown honest if the heuristics ever pick something up.
+    const visibleEntries = entries.filter(function (e) {
+      return !hideLibrary || !isFiltered(fnById.get(e.fn_id));
+    });
+
+    if (visibleEntries.length === 0) {
       const opt = document.createElement("option");
       opt.value = "";
       opt.textContent = "(no entry points)";
@@ -127,7 +175,7 @@
 
     // Group by entry kind so the dropdown is navigable.
     const groups = new Map();
-    for (const e of entries) {
+    for (const e of visibleEntries) {
       const kind = e.kind || "manual";
       if (!groups.has(kind)) groups.set(kind, []);
       groups.get(kind).push(e);
@@ -170,6 +218,13 @@
 
     if (!fnById.has(entryFnId)) {
       console.warn("entry fn id not found in graph", entryFnId);
+      return elements;
+    }
+
+    // If the entry itself is library and the filter is on, render nothing.
+    // (In practice entry discovery shouldn't pick up library fns; this is a
+    // safety net so we never silently emit only synthetic nodes.)
+    if (isFiltered(fnById.get(entryFnId))) {
       return elements;
     }
 
@@ -240,6 +295,14 @@
             classes: "synthetic unresolved",
           });
         } else {
+          // Resolved direct/dispatch/vtable target. If the target is library
+          // infrastructure and the filter is on, drop both the edge and any
+          // expansion past it: the caller node simply has fewer outgoing
+          // edges. The user wanted their kernel code, not what Zig wires in.
+          const targetFn = fnById.get(c.to);
+          if (isFiltered(targetFn)) {
+            continue;
+          }
           targetNodeId = "n" + c.to;
           if (!visited.has(c.to) && fnById.has(c.to)) {
             queue.push({ id: c.to, depth: cur.depth + 1 });
@@ -402,9 +465,9 @@
         spacingFactor: 1.1,
         animate: false,
       },
-      wheelSensitivity: 0.2,
-      minZoom: 0.1,
-      maxZoom: 4,
+      wheelSensitivity: 0.6,
+      minZoom: 0.05,
+      maxZoom: 5.0,
     });
 
     cy.on("tap", "node", function (evt) {
@@ -417,6 +480,25 @@
       // Background tap closes the panel.
       if (evt.target === cy) hidePanel();
     });
+
+    // Initial fit-to-view: after the layout completes, fit the graph then
+    // clamp zoom up to a level where node labels stay readable. For wide
+    // entry points like kEntry, plain cy.fit() leaves you at ~0.1 zoom
+    // where you only see the silhouette.
+    fitWithMinZoom();
+  }
+
+  // Refit + min-zoom guard. Call after any layout-changing operation or
+  // when the user hits the fit button.
+  function fitWithMinZoom() {
+    if (!cy) return;
+    cy.fit(undefined, 50);
+    if (cy.zoom() < 0.7) {
+      cy.zoom({
+        level: 0.7,
+        renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 },
+      });
+    }
   }
 
   // ------------------------------------------------------------------ side panel
@@ -944,6 +1026,10 @@
     if (!graph || !graph.functions) return out;
     for (const f of graph.functions) {
       if (f.reachable === false) {
+        // Library functions are unreachable from kernel entry points by
+        // design — most of stdlib isn't used. Surfacing them here buries
+        // the genuinely interesting cases (kernel functions nothing calls).
+        if (isFiltered(f)) continue;
         const file = f.def_loc ? f.def_loc.file : "";
         const line = f.def_loc ? f.def_loc.line : 0;
         out.push({
@@ -1012,7 +1098,29 @@
     });
 
     els.fitBtn.addEventListener("click", function () {
-      if (cy) cy.fit(null, 30);
+      fitWithMinZoom();
+    });
+
+    // Keyboard shortcuts: +/= zoom in, - zoom out, 0/f refit. Centered on
+    // the current viewport center so the zoom feels anchored. Skip when
+    // the user is typing in the side-panel filter input.
+    document.addEventListener("keydown", function (e) {
+      const tag = e.target && e.target.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA") return;
+      if (!cy) return;
+      if (e.key === "+" || e.key === "=") {
+        cy.zoom({
+          level: cy.zoom() * 1.25,
+          renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 },
+        });
+      } else if (e.key === "-") {
+        cy.zoom({
+          level: cy.zoom() * 0.8,
+          renderedPosition: { x: cy.width() / 2, y: cy.height() / 2 },
+        });
+      } else if (e.key === "0" || e.key === "f") {
+        fitWithMinZoom();
+      }
     });
 
     els.infoClose.addEventListener("click", hidePanel);
