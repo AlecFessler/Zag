@@ -262,9 +262,17 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
 /// Decodes the faulting instruction, performs the port I/O, writes back
 /// the result (for reads), and advances RIP past the instruction.
 fn emulateVirtualBar(ctx: *cpu.Context, node_ref: SlabRef(VmNode), faulting_addr: u64, proc: anytype) void {
+    // Snapshot under the lock then release before any path that may call
+    // `proc.kill()`. `kill()` -> `performRestart` -> `vmm.{deinit,resetForRestart}`
+    // walks every VmNode and calls `freeVmNode`, which spins on `lockWithGen`
+    // for this same gen — holding the lock here while `kill()` runs would
+    // deadlock the killing thread on its own VmNode lock. The DeviceRegion
+    // pointer is stable for the kernel's lifetime and `start` is immutable
+    // for a virtual_bar node, so the snapshot is safe to use unlocked.
     const node = node_ref.lock() catch return;
-    defer node_ref.unlock();
     const device = node.deviceRegion().?;
+    const node_start_addr = node.start.addr;
+    node_ref.unlock();
 
     // Fetch instruction bytes from user RIP via the process page tables.
     const rip = ctx.rip;
@@ -294,7 +302,7 @@ fn emulateVirtualBar(ctx: *cpu.Context, node_ref: SlabRef(VmNode), faulting_addr
     };
 
     // Compute the port offset and validate bounds
-    const port_offset = faulting_addr - node.start.addr;
+    const port_offset = faulting_addr - node_start_addr;
     if (port_offset + op.size > device.access.port_io.port_count) {
         const reason: FaultReason = if (op.is_write) .invalid_write else .invalid_read;
         proc.kill(reason);

@@ -804,6 +804,21 @@ pub fn enqueueOnCore(core_index: u64, thread: *Thread) void {
 
     // IPI on thread ready: if the enqueued thread's priority exceeds the
     // currently running thread on this core, send an IPI to preempt immediately.
+    //
+    // §2.2.34: a `pinned_exclusive` thread becoming ready on its own pinned
+    // core must always preempt whatever else is running there. The race we
+    // close: the pinned thread blocks and releases the core, but
+    // `state.running_thread` may still read as the pinned thread on a
+    // remote waker because the pinned-release path updates `running_thread`
+    // under `rq_lock` (which the waker doesn't hold). The waker reads
+    // `running_thread`, sees equal priority, and elides the IPI — the
+    // pinned thread then sits in the rq until the next 2 ms tick.
+    // `pinnedOf(state) == thread` matches the slot installed in
+    // `pinExclusive`, which is stable across block/release, so race-free.
+    if (thread.pinned_exclusive and pinnedOf(state) == thread) {
+        arch.smp.triggerSchedulerInterrupt(target);
+        return;
+    }
     const running = runningOf(state);
     if (running) |r| {
         if (@intFromEnum(thread.priority) > @intFromEnum(r.priority)) {
