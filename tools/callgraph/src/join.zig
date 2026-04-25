@@ -48,7 +48,7 @@ pub fn buildGraph(
     ast_fns: []const AstFunction,
 ) !types.Graph {
     var stats: JoinStats = .{ .ir_total = 0, .matched = 0 };
-    return try buildGraphWithStats(arena, ir_graph, ast_fns, &.{}, &.{}, &stats);
+    return try buildGraphWithStats(arena, ir_graph, ast_fns, &.{}, &.{}, .x86_64, &stats);
 }
 
 pub fn buildGraphWithStats(
@@ -57,6 +57,7 @@ pub fn buildGraphWithStats(
     ast_fns: []const AstFunction,
     file_asts: []const FileAst,
     discovered: []const Discovered,
+    target_arch: types.TargetArch,
     stats_out: *JoinStats,
 ) !types.Graph {
     // Build a (file_abs, line) → AstFunction lookup. Use a string-keyed map
@@ -171,7 +172,7 @@ pub fn buildGraphWithStats(
     //   3) per function, a CallSiteMap keyed by `<file>:<line>` containing
     //      every Callee whose `from` matches this function's IR id.
     if (file_asts.len > 0) {
-        try attachIntra(arena, functions, ast_fns, file_asts, &realpath_cache);
+        try attachIntra(arena, functions, ast_fns, file_asts, &realpath_cache, target_arch);
     }
 
     // Stamp `is_entry` / `entry_kind` on every function whose qualified name
@@ -325,6 +326,7 @@ fn attachIntra(
     ast_fns: []const AstFunction,
     file_asts: []const FileAst,
     realpath_cache: *std.StringHashMap([]const u8),
+    target_arch: types.TargetArch,
 ) !void {
     // file (resolved abs path) -> FileAst
     var file_to_ast = std.StringHashMap(*const FileAst).init(arena);
@@ -377,6 +379,6 @@ fn attachIntra(
             try sites.put(entry.key_ptr.*, try arena.dupe(types.Callee, entry.value_ptr.items));
         }
 
-        f.intra = branches.buildIntra(arena, resolved_def, af.fn_node, fa.tree, sites) catch &.{};
+        f.intra = branches.buildIntra(arena, resolved_def, af.fn_node, fa.tree, sites, target_arch) catch &.{};
     }
 }

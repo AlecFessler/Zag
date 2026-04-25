@@ -33,6 +33,15 @@ pub const EntryKind = enum {
     }
 };
 
+pub const TargetArch = enum {
+    x86_64,
+    aarch64,
+
+    pub fn jsonStringify(self: TargetArch, jw: anytype) !void {
+        try jw.write(@tagName(self));
+    }
+};
+
 pub const IrFunction = struct {
     id: FnId,
     mangled: []const u8,

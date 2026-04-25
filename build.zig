@@ -313,7 +313,8 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&install_kernel.step);
 
     if (emit_ir) {
-        const install_ir = b.addInstallFile(kernel.getEmittedLlvmIr(), "kernel.ll");
+        const ir_name = b.fmt("kernel.{s}.ll", .{@tagName(arch)});
+        const install_ir = b.addInstallFile(kernel.getEmittedLlvmIr(), ir_name);
         install_ir.step.dependOn(&kernel.step);
         b.getInstallStep().dependOn(&install_ir.step);
     }

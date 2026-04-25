@@ -48,7 +48,9 @@ pub fn buildIntra(
     fn_node: u32,
     ast: *const std.zig.Ast,
     callsites: CallSiteMap,
+    target_arch: types.TargetArch,
 ) ![]const Atom {
+    _ = target_arch; // wired through; logic added by import/arch-prune agent
     const node_idx: std.zig.Ast.Node.Index = @enumFromInt(fn_node);
 
     // The body of a fn_decl is the second node in node_and_node.

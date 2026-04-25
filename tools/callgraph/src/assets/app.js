@@ -11,12 +11,18 @@
 
   // ------------------------------------------------------------------ state
 
-  /** Whole /api/graph payload, stashed for lookups during BFS. */
+  /** Whole /api/graph payload (the "currentGraph"), stashed for lookups
+   *  during BFS. Updated whenever the arch picker changes. */
   let graph = null;
-  /** id -> function object index for O(1) lookup. */
+  /** id -> function object index for O(1) lookup. Rebuilt on every graph
+   *  swap (arch change). */
   const fnById = new Map();
   /** Current Cytoscape instance. Recreated on each entry-point switch. */
   let cy = null;
+  /** List of arch tags loaded by the server, e.g. ["x86_64", "aarch64"]. */
+  let availableArches = [];
+  /** Currently-selected arch tag (matches a key in availableArches). */
+  let currentArch = null;
   /** When true (default), hide Zig stdlib + compiler infrastructure from
    *  every view. Persisted in localStorage so reload preserves the choice. */
   let hideLibrary = (function () {
@@ -60,6 +66,7 @@
   // ------------------------------------------------------------------ DOM
 
   const els = {
+    archPicker: document.getElementById("arch_picker"),
     entrySelect: document.getElementById("entry_select"),
     depthSlider: document.getElementById("depth_slider"),
     depthValue: document.getElementById("depth_value"),
@@ -129,29 +136,116 @@
 
   // ------------------------------------------------------------------ graph load
 
+  /** Boot path. Demo mode hardcodes a synthetic graph and skips arch
+   *  negotiation; otherwise we consult /api/arches first, then fetch the
+   *  graph for whichever arch the user (or localStorage) selected last. */
   async function loadGraph() {
     const params = new URLSearchParams(window.location.search);
     if (params.get("demo") === "1") {
       graph = demoGraph();
+      availableArches = ["x86_64"];
+      currentArch = "x86_64";
+      populateArchPicker();
+      indexCurrentGraph();
+      onGraphReady();
       setStatus("demo graph loaded", false);
-    } else {
-      setStatus("loading /api/graph...", true);
-      try {
-        const r = await fetch("/api/graph");
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        graph = await r.json();
-        setStatus("graph loaded", false);
-      } catch (err) {
-        console.error("graph fetch failed", err);
-        setStatus("graph fetch failed: " + err.message, true);
-        return;
-      }
+      return;
     }
 
+    setStatus("loading /api/arches...", true);
+    let archesResp;
+    try {
+      const r = await fetch("/api/arches");
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      archesResp = await r.json();
+    } catch (err) {
+      console.error("/api/arches fetch failed", err);
+      setStatus("/api/arches fetch failed: " + err.message, true);
+      return;
+    }
+
+    availableArches = (archesResp.arches || []).slice();
+    if (availableArches.length === 0) {
+      setStatus("server reported no loaded arches", true);
+      return;
+    }
+
+    // Pick initial arch: localStorage value if it's still loaded, else the
+    // server's default, else the first available.
+    let initial = null;
+    try {
+      const saved = localStorage.getItem("arch");
+      if (saved && availableArches.indexOf(saved) >= 0) initial = saved;
+    } catch (_e) {}
+    if (initial == null) {
+      initial = availableArches.indexOf(archesResp.default) >= 0
+        ? archesResp.default
+        : availableArches[0];
+    }
+    currentArch = initial;
+    populateArchPicker();
+
+    await fetchGraphForArch(currentArch, /*preserveEntry=*/false);
+  }
+
+  /** Fetch /api/graph?arch=<arch>, swap currentGraph, rebuild fnById,
+   *  re-render. When `preserveEntry` is true and the previously-selected
+   *  entry survives by name in the new graph, keep it as the focused entry.
+   *  Otherwise pick the first visible entry. */
+  async function fetchGraphForArch(archTag, preserveEntry) {
+    setStatus("loading /api/graph (arch=" + archTag + ")...", true);
+    let prevEntryName = null;
+    if (preserveEntry && currentEntryFnId != null) {
+      const prevFn = fnById.get(currentEntryFnId);
+      if (prevFn) prevEntryName = prevFn.name;
+    }
+
+    try {
+      const r = await fetch("/api/graph?arch=" + encodeURIComponent(archTag));
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      graph = await r.json();
+      setStatus("graph loaded (" + archTag + ")", false);
+    } catch (err) {
+      console.error("graph fetch failed", err);
+      setStatus("graph fetch failed: " + err.message, true);
+      return;
+    }
+
+    indexCurrentGraph();
+
+    populateDropdown(graph.entry_points || []);
+
+    // Try to preserve the prior entry by name.
+    let nextEntryId = null;
+    if (prevEntryName) {
+      for (const e of graph.entry_points || []) {
+        const fn = fnById.get(e.fn_id);
+        if (fn && fn.name === prevEntryName) {
+          if (!isFiltered(fn)) {
+            nextEntryId = e.fn_id;
+            break;
+          }
+        }
+      }
+    }
+    if (nextEntryId == null) {
+      nextEntryId = firstVisibleEntryId(graph.entry_points || []);
+    }
+
+    onGraphReady();
+
+    if (nextEntryId != null) {
+      els.entrySelect.value = String(nextEntryId);
+      renderForEntry(nextEntryId);
+    } else {
+      currentEntryFnId = null;
+    }
+  }
+
+  /** Rebuild fnById from the current `graph` and re-wire trace.js. */
+  function indexCurrentGraph() {
     fnById.clear();
     for (const fn of graph.functions || []) fnById.set(fn.id, fn);
-
-    // Wire trace.js with the shared lookups.
     if (window.traceMode) {
       window.traceMode.setContext({
         fnById: fnById,
@@ -159,16 +253,29 @@
         showNodePanel: showNodePanel,
       });
     }
+  }
 
-    populateDropdown(graph.entry_points || []);
-    const firstId = firstVisibleEntryId(graph.entry_points || []);
-
+  /** Apply persisted mode after a graph load. Call only after fnById and
+   *  the entry dropdown are wired. */
+  function onGraphReady() {
     // Apply persisted mode now that the DOM is wired and trace.js exists.
     setMode(currentMode);
+  }
 
-    if (firstId != null) {
-      els.entrySelect.value = String(firstId);
-      renderForEntry(firstId);
+  function populateArchPicker() {
+    if (!els.archPicker) return;
+    els.archPicker.innerHTML = "";
+    for (const a of availableArches) {
+      const opt = document.createElement("option");
+      opt.value = a;
+      opt.textContent = a;
+      els.archPicker.appendChild(opt);
+    }
+    els.archPicker.value = currentArch;
+    if (availableArches.length <= 1) {
+      els.archPicker.disabled = true;
+    } else {
+      els.archPicker.disabled = false;
     }
   }
 
@@ -1137,6 +1244,16 @@
   // ------------------------------------------------------------------ events
 
   function wireEvents() {
+    if (els.archPicker) {
+      els.archPicker.addEventListener("change", function () {
+        const next = els.archPicker.value;
+        if (!next || next === currentArch) return;
+        currentArch = next;
+        try { localStorage.setItem("arch", next); } catch (_e) {}
+        fetchGraphForArch(next, /*preserveEntry=*/true);
+      });
+    }
+
     els.entrySelect.addEventListener("change", function () {
       const v = parseInt(els.entrySelect.value, 10);
       if (!Number.isNaN(v)) renderForEntry(v);

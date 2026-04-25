@@ -10,11 +10,19 @@ const types = @import("types.zig");
 const verify = @import("verify.zig");
 
 const Args = struct {
+    /// Single-IR path (legacy, only used in --verify mode).
     ir_path: []const u8 = "zig-out/kernel.ll",
+    /// Directory containing kernel.<arch>.ll files. Defaults to
+    /// `<build-root>/zig-out`.
+    ir_dir: ?[]const u8 = null,
+    /// Path to the kernel repo root (for running `zig build`).
+    /// Defaults to "../.." relative to the callgraph tool dir.
+    build_root: []const u8 = "../..",
     kernel_root: []const u8 = "kernel",
     port: u16 = 8080,
     arch: []const u8 = "x64",
     verify: bool = false,
+    no_build: bool = false,
     demo_graph: bool = false,
 };
 
@@ -26,6 +34,10 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--ir")) {
             args.ir_path = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--ir-dir")) {
+            args.ir_dir = it.next() orelse return error.MissingValue;
+        } else if (std.mem.eql(u8, arg, "--build-root")) {
+            args.build_root = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--kernel-root")) {
             args.kernel_root = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--port")) {
@@ -35,6 +47,8 @@ fn parseArgs(allocator: std.mem.Allocator) !Args {
             args.arch = it.next() orelse return error.MissingValue;
         } else if (std.mem.eql(u8, arg, "--verify")) {
             args.verify = true;
+        } else if (std.mem.eql(u8, arg, "--no-build")) {
+            args.no_build = true;
         } else if (std.mem.eql(u8, arg, "--demo-graph")) {
             args.demo_graph = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -55,10 +69,13 @@ fn printHelp() !void {
         \\
         \\Usage: callgraph [options]
         \\
-        \\  --ir PATH           Path to kernel LLVM IR (.ll). Default: zig-out/kernel.ll
+        \\  --build-root PATH   Kernel repo root (defaults to ../..)
+        \\  --ir-dir PATH       Directory with kernel.<arch>.ll (defaults to <build-root>/zig-out)
+        \\  --ir PATH           Single-IR path used by --verify mode (default: zig-out/kernel.ll)
         \\  --kernel-root PATH  Kernel source root. Default: kernel
         \\  --port PORT         HTTP port. Default: 8080
-        \\  --arch x64|aarch64  Target arch (must match the IR). Default: x64
+        \\  --arch x64|aarch64  Target arch for --verify (default: x64)
+        \\  --no-build          Skip auto-build; reuse existing kernel.*.ll files
         \\  --verify            Run AST/IR diff and print discrepancies, then exit
         \\  --demo-graph        Skip IR parsing; serve a synthetic 3-function graph
         \\  --help              Show this help
@@ -66,15 +83,27 @@ fn printHelp() !void {
     , .{});
 }
 
+const ArchSpec = struct {
+    /// Tag passed to root build.zig (`-Darch=`).
+    build_tag: []const u8,
+    /// Filename suffix produced by root build.zig (matches `@tagName(arch)`).
+    file_tag: []const u8,
+    /// Frontend-facing tag (matches `TargetArch.jsonStringify`).
+    api_tag: []const u8,
+    target_arch: types.TargetArch,
+};
+
+const arch_specs = [_]ArchSpec{
+    .{ .build_tag = "x64", .file_tag = "x86_64", .api_tag = "x86_64", .target_arch = .x86_64 },
+    .{ .build_tag = "arm", .file_tag = "aarch64", .api_tag = "aarch64", .target_arch = .aarch64 },
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     const args = try parseArgs(allocator);
-    std.debug.print("callgraph: ir={s} kernel-root={s} arch={s} port={d}\n", .{
-        args.ir_path, args.kernel_root, args.arch, args.port,
-    });
 
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -82,90 +111,218 @@ pub fn main() !void {
 
     if (args.demo_graph) {
         const graph = try buildDemoGraph(arena_allocator);
-        try server.serve(allocator, &graph, args.port);
+        var graphs = server.GraphMap.init(allocator);
+        defer graphs.deinit();
+        try graphs.put("x86_64", graph);
+        try server.serve(allocator, &graphs, "x86_64", args.port);
         return;
     }
 
-    const ir_graph = try ir.parse(&arena, args.ir_path);
-
-    const walk = try ast.walkKernelFull(arena_allocator, args.kernel_root);
-    const ast_fns = walk.fns;
-    const file_count = countDistinctFiles(arena_allocator, ast_fns) catch ast_fns.len;
-    std.debug.print("ast: {d} functions across {d} files\n", .{ ast_fns.len, file_count });
-
     if (args.verify) {
-        // Verify mode short-circuits before the join + entry discovery so
-        // the diff sees the raw AST/IR sets without any reconciliation
-        // smoothing the numbers.
+        std.debug.print("callgraph: ir={s} kernel-root={s} arch={s} (verify)\n", .{
+            args.ir_path, args.kernel_root, args.arch,
+        });
+        const ir_graph = try ir.parse(&arena, args.ir_path);
+
+        const walk = try ast.walkKernelFull(arena_allocator, args.kernel_root);
+        const ast_fns = walk.fns;
+        const file_count = countDistinctFiles(arena_allocator, ast_fns) catch ast_fns.len;
+        std.debug.print("ast: {d} functions across {d} files\n", .{ ast_fns.len, file_count });
+
         var stdout_buf: [16 * 1024]u8 = undefined;
         var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
         try verify.run(allocator, &stdout_writer.interface, ir_graph, ast_fns, walk.asts);
         return;
     }
 
-    const discovered = try entry.discover(
-        arena_allocator,
-        args.kernel_root,
-        args.arch,
-        ast_fns,
-        walk.asts,
-    );
-    printEntryStats(discovered);
-
-    var stats: join.JoinStats = undefined;
-    var graph = try join.buildGraphWithStats(
-        arena_allocator,
-        ir_graph,
-        ast_fns,
-        walk.asts,
-        discovered,
-        &stats,
-    );
-    const pct: f64 = if (stats.ir_total == 0)
-        0.0
-    else
-        100.0 * @as(f64, @floatFromInt(stats.matched)) / @as(f64, @floatFromInt(stats.ir_total));
-    std.debug.print("join: {d} / {d} IR functions matched to AST ({d:.1} %)\n", .{
-        stats.matched, stats.ir_total, pct,
-    });
-    std.debug.print("entry: {d} of {d} discovered entries matched IR functions\n", .{
-        graph.entry_points.len, discovered.len,
+    std.debug.print("callgraph: build-root={s} kernel-root={s} port={d}\n", .{
+        args.build_root, args.kernel_root, args.port,
     });
 
-    const reach_stats = try reachability.compute(allocator, &graph);
-    const reach_pct: f64 = if (reach_stats.total == 0)
-        0.0
-    else
-        100.0 * @as(f64, @floatFromInt(reach_stats.reachable)) / @as(f64, @floatFromInt(reach_stats.total));
-    std.debug.print("reachability: {d} of {d} functions reachable from any entry point ({d:.1} %)\n", .{
-        reach_stats.reachable, reach_stats.total, reach_pct,
+    const ir_dir = args.ir_dir orelse blk: {
+        break :blk try std.fs.path.join(arena_allocator, &.{ args.build_root, "zig-out" });
+    };
+
+    // Run the kernel build for each arch unless --no-build.
+    if (!args.no_build) {
+        for (arch_specs) |spec| {
+            buildKernel(allocator, args.build_root, spec) catch |err| {
+                std.debug.print(
+                    "[build {s}] FAILED ({s}); continuing without this arch\n",
+                    .{ spec.api_tag, @errorName(err) },
+                );
+            };
+        }
+    }
+
+    // Walk AST once.
+    const walk = try ast.walkKernelFull(arena_allocator, args.kernel_root);
+    const ast_fns = walk.fns;
+    const file_count = countDistinctFiles(arena_allocator, ast_fns) catch ast_fns.len;
+    std.debug.print("ast: {d} functions across {d} files\n", .{ ast_fns.len, file_count });
+
+    // For each arch with an IR file present, build a Graph.
+    var graphs = server.GraphMap.init(allocator);
+    defer graphs.deinit();
+
+    var loaded_arches = std.ArrayList([]const u8){};
+    defer loaded_arches.deinit(allocator);
+
+    for (arch_specs) |spec| {
+        const ir_path = try std.fs.path.join(
+            arena_allocator,
+            &.{ ir_dir, try std.fmt.allocPrint(arena_allocator, "kernel.{s}.ll", .{spec.file_tag}) },
+        );
+        // Probe that the file exists before parsing.
+        std.fs.cwd().access(ir_path, .{}) catch {
+            std.debug.print("[arch {s}] no IR at {s}; skipping\n", .{ spec.api_tag, ir_path });
+            continue;
+        };
+
+        std.debug.print("[arch {s}] parsing {s}\n", .{ spec.api_tag, ir_path });
+        const ir_graph = ir.parse(&arena, ir_path) catch |err| {
+            std.debug.print(
+                "[arch {s}] IR parse failed: {s}; skipping\n",
+                .{ spec.api_tag, @errorName(err) },
+            );
+            continue;
+        };
+
+        const discovered = try entry.discover(
+            arena_allocator,
+            args.kernel_root,
+            spec.build_tag,
+            ast_fns,
+            walk.asts,
+        );
+
+        var stats: join.JoinStats = undefined;
+        var graph = try join.buildGraphWithStats(
+            arena_allocator,
+            ir_graph,
+            ast_fns,
+            walk.asts,
+            discovered,
+            spec.target_arch,
+            &stats,
+        );
+
+        const pct: f64 = if (stats.ir_total == 0)
+            0.0
+        else
+            100.0 * @as(f64, @floatFromInt(stats.matched)) / @as(f64, @floatFromInt(stats.ir_total));
+        std.debug.print(
+            "[arch {s}] join: {d}/{d} matched ({d:.1}%); entries: {d}/{d}\n",
+            .{ spec.api_tag, stats.matched, stats.ir_total, pct, graph.entry_points.len, discovered.len },
+        );
+
+        const reach_stats = try reachability.compute(allocator, &graph);
+        const reach_pct: f64 = if (reach_stats.total == 0)
+            0.0
+        else
+            100.0 * @as(f64, @floatFromInt(reach_stats.reachable)) / @as(f64, @floatFromInt(reach_stats.total));
+        std.debug.print(
+            "[arch {s}] reachability: {d}/{d} ({d:.1}%)\n",
+            .{ spec.api_tag, reach_stats.reachable, reach_stats.total, reach_pct },
+        );
+
+        try graphs.put(spec.api_tag, graph);
+        try loaded_arches.append(allocator, spec.api_tag);
+    }
+
+    if (graphs.count() == 0) {
+        std.debug.print("error: no IR files loaded; nothing to serve\n", .{});
+        std.process.exit(1);
+    }
+
+    // Default to x86_64 if loaded, else first available.
+    const default_arch: []const u8 = blk: {
+        if (graphs.contains("x86_64")) break :blk "x86_64";
+        break :blk loaded_arches.items[0];
+    };
+
+    std.debug.print("startup: {d} arches loaded (", .{loaded_arches.items.len});
+    for (loaded_arches.items, 0..) |a, i| {
+        if (i > 0) std.debug.print(", ", .{});
+        std.debug.print("{s}", .{a});
+    }
+    std.debug.print("); default={s}\n", .{default_arch});
+
+    try server.serve(allocator, &graphs, default_arch, args.port);
+}
+
+fn buildKernel(
+    allocator: std.mem.Allocator,
+    build_root: []const u8,
+    spec: ArchSpec,
+) !void {
+    const argv = [_][]const u8{
+        "zig",
+        "build",
+        "-Dprofile=test",
+        "-Demit_ir=true",
+    };
+    const arch_arg = try std.fmt.allocPrint(allocator, "-Darch={s}", .{spec.build_tag});
+    defer allocator.free(arch_arg);
+
+    var argv_full = std.ArrayList([]const u8){};
+    defer argv_full.deinit(allocator);
+    try argv_full.appendSlice(allocator, &argv);
+    try argv_full.append(allocator, arch_arg);
+
+    std.debug.print("[build {s}] running: zig build -Dprofile=test -Demit_ir=true {s} (cwd={s})\n", .{
+        spec.api_tag, arch_arg, build_root,
     });
 
-    try server.serve(allocator, &graph, args.port);
+    var child = std.process.Child.init(argv_full.items, allocator);
+    child.cwd = build_root;
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+    try child.spawn();
+
+    // Stream stdout/stderr lines to our stderr with a prefix. Use a thread
+    // for stderr so we don't deadlock on pipe-full.
+    const PrefixCtx = struct {
+        prefix: []const u8,
+        reader: std.fs.File,
+        fn run(self: *@This()) void {
+            var buf: [4096]u8 = undefined;
+            while (true) {
+                const n = self.reader.read(&buf) catch return;
+                if (n == 0) return;
+                std.debug.print("[{s}] {s}", .{ self.prefix, buf[0..n] });
+            }
+        }
+    };
+
+    var stdout_ctx = PrefixCtx{
+        .prefix = try std.fmt.allocPrint(allocator, "build {s}", .{spec.api_tag}),
+        .reader = child.stdout.?,
+    };
+    defer allocator.free(stdout_ctx.prefix);
+    var stderr_ctx = PrefixCtx{
+        .prefix = try std.fmt.allocPrint(allocator, "build {s}", .{spec.api_tag}),
+        .reader = child.stderr.?,
+    };
+    defer allocator.free(stderr_ctx.prefix);
+
+    const stderr_thread = try std.Thread.spawn(.{}, PrefixCtx.run, .{&stderr_ctx});
+    stdout_ctx.run();
+    stderr_thread.join();
+
+    const term = try child.wait();
+    switch (term) {
+        .Exited => |code| {
+            if (code != 0) return error.BuildFailed;
+        },
+        else => return error.BuildFailed,
+    }
 }
 
 fn countDistinctFiles(arena: std.mem.Allocator, fns: []const ast.AstFunction) !usize {
     var set = std.StringHashMap(void).init(arena);
     for (fns) |f| try set.put(f.file, {});
     return set.count();
-}
-
-fn printEntryStats(discovered: []const entry.Discovered) void {
-    var s: usize = 0;
-    var t: usize = 0;
-    var i: usize = 0;
-    var b: usize = 0;
-    var m: usize = 0;
-    for (discovered) |d| switch (d.kind) {
-        .syscall => s += 1,
-        .trap => t += 1,
-        .irq => i += 1,
-        .boot => b += 1,
-        .manual => m += 1,
-    };
-    std.debug.print("entry: discovered {d} syscalls, {d} traps, {d} IRQs, {d} boot, total {d}\n", .{
-        s, t, i, b, discovered.len,
-    });
 }
 
 /// Synthesizes a tiny graph with three functions and a couple of edges so the
