@@ -521,6 +521,17 @@ pub fn sysFaultReadMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64
     const target = entry.object.process.lock(@src()) catch return E_BADCAP;
     defer entry.object.process.unlock();
 
+    // Process slab slots are deliberately leaked as `dead_process` tombstones
+    // (process.zig:1404-1410), so SlabRef.lock alone can't tell us whether the
+    // target's resources have been torn down. cleanupPhase1 has already run
+    // freeUserAddrSpace + vmm.deinit by the time `alive` flips false; walking
+    // `addr_space_root` past that point reads freed (and PMM-reused) page
+    // tables. The holder's `.process` entry only converts to `.dead_process`
+    // for the parent and lazy IPC senders — every other holder of a
+    // fault_handler-bearing handle keeps its `.process` entry indefinitely
+    // (red-team PoC: tests/redteam/fault_readmem_dead_target_uaf.zig).
+    if (!target.alive) return E_BADCAP;
+
     // Read from target process's virtual address space via physmap.
     // Pre-fault both sides: demand-page the target page so debuggers can
     // read uncommitted-yet-reserved pages, and demand-page the caller's
@@ -570,6 +581,10 @@ pub fn sysFaultWriteMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i6
 
     const target = entry.object.process.lock(@src()) catch return E_BADCAP;
     defer entry.object.process.unlock();
+
+    // See sysFaultReadMem above — same liveness gap on dead-but-tombstoned
+    // targets; same one-line gate is the right thing here.
+    if (!target.alive) return E_BADCAP;
 
     // Write to target process's virtual address space via physmap (bypasses page perms).
     // Pre-fault both sides: demand-page the target page (even uncommitted
