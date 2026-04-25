@@ -149,6 +149,27 @@
   /** ID of the currently-selected entry-point function. */
   let currentEntryFnId = null;
 
+  // ---- Perf harness ready signal ----------------------------------------
+  // The harness in tools/callgraph/perf/ reads window.__cgReady (bool) and
+  // window.__cgRenderCount (int, bumped after each completed render) so it
+  // can wait for "next render after I clicked something". Inert metadata —
+  // no behavior change, no effect when no harness is watching.
+  if (typeof window.__cgRenderCount === "undefined") {
+    window.__cgRenderCount = 0;
+    window.__cgReady = false;
+  }
+  function cgSignalReady() {
+    window.__cgRenderCount += 1;
+    window.__cgReady = true;
+  }
+  function cgClearReady() {
+    window.__cgReady = false;
+  }
+  // Expose for trace.js (its render is synchronous so it bumps the counter
+  // directly when it finishes building the tree).
+  window.__cgSignalReady = cgSignalReady;
+  window.__cgClearReady = cgClearReady;
+
   // ------------------------------------------------------------------ utils
 
   function setStatus(text, persist) {
@@ -647,6 +668,7 @@
     // Trace mode owns its own rendering pipeline; only let the graph
     // builder run when the graph pane is the visible view.
     if (currentMode === "trace") {
+      cgClearReady();
       if (window.traceMode) window.traceMode.onEntryChange(entryFnId);
       return;
     }
@@ -660,22 +682,36 @@
       cy = null;
     }
 
+    cgClearReady();
     cy = cytoscape({
       container: els.graph,
       elements: elements,
       style: cyStyle(),
-      layout: {
+      // Construct without a layout, then register layoutstop, then run the
+      // layout explicitly. Done this way because with `animate: false` the
+      // layout in the constructor's options runs synchronously and emits
+      // `layoutstop` BEFORE we get a chance to subscribe — so the perf
+      // harness counter would never bump on small graphs.
+      wheelSensitivity: 0.6,
+      minZoom: 0.05,
+      maxZoom: 5.0,
+    });
+
+    if (elements.length === 0) {
+      // No layout to run; signal immediately so the perf harness doesn't hang.
+      cgSignalReady();
+    } else {
+      const layout = cy.layout({
         name: "breadthfirst",
         directed: true,
         roots: ["n" + entryFnId],
         padding: 30,
         spacingFactor: 1.1,
         animate: false,
-      },
-      wheelSensitivity: 0.6,
-      minZoom: 0.05,
-      maxZoom: 5.0,
-    });
+      });
+      layout.one("layoutstop", function () { cgSignalReady(); });
+      layout.run();
+    }
 
     cy.on("tap", "node", function (evt) {
       showNodePanel(evt.target.data());
@@ -1463,10 +1499,14 @@
     }
 
     if (mode === "trace") {
+      cgClearReady();
       if (els.graphPane) els.graphPane.style.display = "none";
       if (window.traceMode) {
         window.traceMode.show();
         if (currentEntryFnId != null) window.traceMode.onEntryChange(currentEntryFnId);
+        else cgSignalReady();
+      } else {
+        cgSignalReady();
       }
     } else {
       if (window.traceMode) window.traceMode.hide();
@@ -1475,6 +1515,10 @@
       // back from Trace mode).
       if (currentEntryFnId != null && !cy) {
         renderForEntry(currentEntryFnId);
+      } else {
+        // No work to do (graph already live or no entry) — signal so the
+        // perf harness doesn't hang waiting for a render that won't come.
+        cgSignalReady();
       }
     }
   }
