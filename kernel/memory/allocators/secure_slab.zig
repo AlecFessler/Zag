@@ -173,7 +173,7 @@ pub fn AtomicSlabRef(comptime T: type) type {
         const Self = @This();
         const Ref = SlabRef(T);
 
-        lock: SpinLock = .{},
+        lock: SpinLock = .{ .class = "AtomicSlabRef(" ++ @typeName(T) ++ ").lock" },
         ptr: ?*T = null,
         gen: u32 = 0,
 
@@ -269,7 +269,7 @@ pub fn SecureSlab(
 
         /// Allocator-internal lock guarding the freelist / cursors /
         /// bump pointers. Orthogonal to per-slot GenLocks.
-        lock: SpinLock = .{},
+        lock: SpinLock = .{ .class = "SecureSlab(" ++ @typeName(T) ++ ").lock" },
 
         pub const Ref = SlabRef(T);
 
@@ -662,7 +662,6 @@ const testing = std.testing;
 const TestT = extern struct {
     _gen_lock: GenLock = .{},
     value: u64 = 0,
-    pad: u64 = 0,
 };
 
 test "validateT accepts well-formed extern struct" {

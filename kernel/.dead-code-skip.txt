@@ -64,8 +64,6 @@ arch/aarch64/kvm/exit_box.zig:99-111    sha256:4aaf79bfc733b93af7c53e18fc6c0fa1a
 boot/protocol.zig:41-58    sha256:9882b3f612fe4d90fdb2562a1b3a666ca8ce0b6b5b0b5d0c6236a2d633e1cf4a
 sched/thread.zig:24-30    sha256:21414a3d1d38e08fb9a473e59f47cc74d237ec69778048a1b142cd0fed498a7d
 syscall/errors.zig:1-15    sha256:bed2afbcf6a6f8f39dd075a9c140de2f1142731ab555e169af50a005a203f654
-perms/permissions.zig:94-108    sha256:3aa4e6635b9e067668e5861f678ff3ccd7e374449aa479a3eb6a9fa458dbd988
-perms/permissions.zig:212-220    sha256:8a7a0bbeb8d975f1d8a2c773c372aa5971f9293008d5b84590d000855aee9773
 arch/aarch64/kvm/kvm.zig:37-37    sha256:fe537500b1198eb572e1b5b470913aab5c64ca22c453574cd6f377d2dfccb54d
 arch/aarch64/kvm/guest_memory.zig:76-85    sha256:277646cefa4d4bcc5d76fa7d11007a95848df1c66c08a4ecf737f52df835ff17
 kprof/kprof.zig:1-7    sha256:5e3abe0fd57384783fda05ca7a1ea2a640da43cd9d050a61d8033e5ea13c8e34
@@ -78,4 +76,5 @@ arch/aarch64/acpi.zig:247-254    sha256:7d11523e657eb90ed8d7aa5be8230f8061484459
 arch/aarch64/acpi.zig:264-271    sha256:85753a2d1b2b4864ee34db1209b5dfd5b5473f1acbb4851d8de95ccea6d37226
 arch/aarch64/acpi.zig:306-314    sha256:b6ed4d7edabc591ae58f5e84823f4fcd068078d82b7c0e50fe667dd16252a60b
 arch/x64/kvm/exit_box.zig:98-111    sha256:aa14a5bec8ca3b60c2ed25de130c0f28ffee30da5a1dc096fc65febafbaffa7b
-perms/permissions.zig:178-220    sha256:651b99b5e4e796777f766d819c436bd187b8f3ffb2947b517f3daac16066cd5d
+perms/permissions.zig:85-92    sha256:eb7086ea9cef2001d787fb2b83f7f28be3246923663d84163d09719c5f4a745c
+perms/permissions.zig:172-180    sha256:56263a9bef0b64bbce7b9d28591a7f21266d282c166a7d0bbda321d5fbddde2f

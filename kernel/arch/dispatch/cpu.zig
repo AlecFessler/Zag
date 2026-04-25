@@ -7,7 +7,6 @@ const x64 = zag.arch.x64;
 
 const BootInfo = zag.boot.protocol.BootInfo;
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
-const Process = zag.proc.process.Process;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 

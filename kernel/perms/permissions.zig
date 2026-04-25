@@ -29,13 +29,6 @@ pub const FaultReason = enum(u5) {
     _,
 };
 
-pub const CrashReason = FaultReason;
-
-pub const DeadProcessInfo = struct {
-    fault_reason: FaultReason,
-    restart_count: u16,
-};
-
 pub const ProcessRights = packed struct(u16) {
     spawn_thread: bool = false,
     spawn_process: bool = false,

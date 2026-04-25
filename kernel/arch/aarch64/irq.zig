@@ -28,10 +28,6 @@ const gic = zag.arch.aarch64.gic;
 
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 
-pub fn maskIrq(irq: u8) void {
-    gic.maskIrq(@as(u32, irq) + 32);
-}
-
 pub fn unmaskIrq(irq: u8) void {
     gic.unmaskIrq(@as(u32, irq) + 32);
 }

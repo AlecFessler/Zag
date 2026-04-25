@@ -8,8 +8,6 @@ const sched = zag.sched.scheduler;
 
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-const VAddr = zag.memory.address.VAddr;
-const VmReservationRights = zag.perms.permissions.VmReservationRights;
 
 const E_OK = errors.E_OK;
 const E_BADCAP = errors.E_BADCAP;

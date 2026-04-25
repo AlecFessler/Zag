@@ -20,7 +20,6 @@ const E_BADCAP = errors.E_BADCAP;
 const E_EXIST = errors.E_EXIST;
 const E_INVAL = errors.E_INVAL;
 const E_MAXCAP = errors.E_MAXCAP;
-const E_NOENT = errors.E_NOENT;
 const E_NOMEM = errors.E_NOMEM;
 const E_OK = errors.E_OK;
 const E_PERM = errors.E_PERM;

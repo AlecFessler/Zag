@@ -16,7 +16,6 @@ const Process = zag.proc.process.Process;
 const ProcessHandleRights = zag.perms.permissions.ProcessHandleRights;
 const SharedMemory = zag.memory.shared.SharedMemory;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-const State = zag.sched.thread.State;
 const SyscallResult = zag.syscall.dispatch.SyscallResult;
 const Thread = zag.sched.thread.Thread;
 const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;

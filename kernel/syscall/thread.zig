@@ -10,8 +10,6 @@ const process_mod = zag.proc.process;
 const sched = zag.sched.scheduler;
 
 const Priority = zag.sched.thread.Priority;
-const Process = zag.proc.process.Process;
-const State = zag.sched.thread.State;
 const Thread = zag.sched.thread.Thread;
 const ThreadHandleRights = zag.perms.permissions.ThreadHandleRights;
 const VAddr = zag.memory.address.VAddr;

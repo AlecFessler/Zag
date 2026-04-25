@@ -62,7 +62,6 @@ pub const IntVecs = enum(u8) {
 pub const VectorKind = enum {
     exception,
     external,
-    software,
 };
 
 const VectorEntry = struct {

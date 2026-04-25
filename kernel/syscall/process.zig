@@ -10,7 +10,6 @@ const pmm = zag.memory.pmm;
 const process_mod = zag.proc.process;
 const sched = zag.sched.scheduler;
 
-const PAddr = zag.memory.address.PAddr;
 const PermissionEntry = zag.perms.permissions.PermissionEntry;
 const Priority = zag.sched.thread.Priority;
 const Process = zag.proc.process.Process;
