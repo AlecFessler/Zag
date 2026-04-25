@@ -17,7 +17,7 @@ fn helper() void {
     while (true) syscall.thread_yield();
 }
 
-/// §2.2.34 — When a pinned thread becomes ready again (futex wake or IPC delivery), the kernel preempts whatever thread is running on the pinned core regardless of that thread's priority.
+/// §2.2.34 — When a pinned thread becomes ready again (futex wake or IPC delivery), the kernel immediately preempts whatever thread is running on the pinned core regardless of that thread's priority.
 ///
 /// Correctness check: pin main to core 0, block on futex, helper wakes us
 /// from another core. If preemption fires correctly, main resumes from
