@@ -94,6 +94,10 @@
       min-width: 280px;
     }
 
+    select#arch_picker {
+      min-width: 110px;
+    }
+
     button {
       cursor: pointer;
     }
@@ -663,17 +667,30 @@
       padding: 6px 8px;
       margin: 4px 0;
       background: rgba(255, 255, 255, 0.012);
+      min-width: 0;
+      overflow: hidden;
     }
 
     .trace_header {
       display: flex;
-      gap: 10px;
+      gap: 8px;
       align-items: baseline;
       font-weight: 600;
       letter-spacing: 0.01em;
+      min-width: 0;
     }
 
-    .trace_title { color: var(--fg-bright); flex: 0 0 auto; }
+    /* min-width: 0 on the flex container is the magic that lets the name
+       shrink and ellipsize. Without it flex children refuse to shrink below
+       their content's intrinsic size and overflow the parent column. */
+    .trace_title {
+      color: var(--fg-bright);
+      flex: 1 1 auto;
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
     .trace_title.clickable { cursor: pointer; color: var(--accent); }
     .trace_title.clickable:hover { text-decoration: underline; }
 
@@ -682,6 +699,8 @@
       font-size: 11px;
       font-weight: 400;
       margin-left: auto;
+      flex: 0 0 auto;
+      white-space: nowrap;
     }
 
     .trace_body { margin-top: 6px; }
@@ -731,12 +750,18 @@
 
     .trace_box.trace_unknown { border-color: #555; color: var(--fg-dim); }
 
-    /* Branch — title row + columns under it. */
+    /* Branch — title row + columns under it.
+       Columns use horizontal-scrolling flex (not grid) so that deeply-nested
+       3-arm switches and the 65-arm syscall dispatch keep each arm readable
+       at a fixed minimum width and scroll horizontally inside the parent
+       box. A grid with `1fr 1fr 1fr` would squeeze every arm to ~30% and
+       overflow names like `power.doShutdown` past their column. */
     .trace_branch {
       border: 1px dashed #3a4150;
       border-radius: 4px;
       padding: 6px;
       margin: 4px 0;
+      min-width: 0;
     }
     .trace_branch_head {
       display: flex;
@@ -752,26 +777,39 @@
       font-size: 11px;
     }
     .trace_branch_cols {
-      display: grid;
-      gap: 6px;
+      display: flex;
+      flex-wrap: nowrap;
+      gap: 8px;
       overflow-x: auto;
       padding-bottom: 4px;
+      align-items: stretch;
     }
     .trace_arm {
+      flex: 0 0 280px;
+      min-width: 280px;
+      display: flex;
+      flex-direction: column;
       border-left: 2px solid #3a4150;
       padding: 0 6px 6px 6px;
-      min-width: 0;
     }
     .trace_arm_label {
       color: #d8a050;
       font-size: 11px;
-      padding: 2px 0 4px 0;
+      padding: 2px 4px 4px 4px;
       letter-spacing: 0.02em;
       border-bottom: 1px dashed #3a4150;
       margin-bottom: 4px;
-      word-break: break-all;
+      font-style: italic;
+      max-width: 100%;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
-    .trace_arm_body { font-size: 12px; }
+    .trace_arm_body {
+      font-size: 12px;
+      flex: 1 1 auto;
+      min-width: 0;
+    }
 
     /* ---- Status / overlays ------------------------------------------ */
     #status {
@@ -796,6 +834,12 @@
   <div id="app">
     <div id="topbar">
       <h1>Zag Callgraph</h1>
+
+      <div class="field">
+        <label class="arch_label" for="arch_picker">arch:
+          <select id="arch_picker"></select>
+        </label>
+      </div>
 
       <div class="field">
         <label for="entry_select">Entry point:</label>

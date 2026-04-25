@@ -96,10 +96,29 @@
     return shortenFile(file) + ":" + line;
   }
 
+  function fullLoc(loc) {
+    if (!loc || !loc.file) return "";
+    const line = loc.line != null ? loc.line : 0;
+    return loc.file + ":" + line;
+  }
+
+  /** Strip the kernel-root prefix from a path so it displays as
+   *  `proc/process.zig:705` rather than `/home/alec/Zag/kernel/proc/...`.
+   *
+   *  Heuristic: find the LAST `/kernel/` substring and strip everything up
+   *  to and including it. Works for absolute paths originating in the Zag
+   *  worktree as well as relative paths that already start with `kernel/`.
+   *  Limitation: a source path with `/kernel/` baked in further down (e.g.
+   *  some forwarded shim file) would be over-stripped, but in practice the
+   *  callgraph IR never produces such paths.
+   *
+   *  Falls back to `/usr/lib/zig/` stripping for stdlib paths, then to the
+   *  raw input. */
   function shortenFile(file) {
     if (!file) return "";
-    const k = file.indexOf("/kernel/");
+    const k = file.lastIndexOf("/kernel/");
     if (k >= 0) return file.slice(k + 1);
+    if (file.startsWith("kernel/")) return file.slice("kernel/".length);
     const z = file.indexOf("/usr/lib/zig/");
     if (z >= 0) return file.slice(z + 1);
     return file;
@@ -316,6 +335,7 @@
       const locSpan = document.createElement("span");
       locSpan.className = "trace_loc";
       locSpan.textContent = fmtLoc(loc);
+      locSpan.title = fullLoc(loc);
       h.appendChild(locSpan);
     }
     return h;
@@ -376,11 +396,13 @@
     const name = document.createElement("span");
     name.className = "trace_title";
     name.textContent = label;
+    name.title = label;
     h.appendChild(name);
     if (site && site.file) {
       const locSpan = document.createElement("span");
       locSpan.className = "trace_loc";
       locSpan.textContent = fmtLoc(site);
+      locSpan.title = fullLoc(site);
       h.appendChild(locSpan);
     }
     box.appendChild(h);
@@ -403,13 +425,17 @@
       const locSpan = document.createElement("span");
       locSpan.className = "trace_loc";
       locSpan.textContent = fmtLoc(b.loc);
+      locSpan.title = fullLoc(b.loc);
       head.appendChild(locSpan);
     }
     wrap.appendChild(head);
 
+    // Columns flex horizontally with a fixed 280px min-width per arm and
+    // overflow-x:auto on the parent (see CSS). This keeps each arm
+    // readable even in 65-arm syscall switches, at the cost of a
+    // horizontal scrollbar.
     const cols = document.createElement("div");
     cols.className = "trace_branch_cols";
-    cols.style.gridTemplateColumns = "repeat(" + Math.max(arms.length, 1) + ", minmax(220px, 1fr))";
 
     for (const arm of arms) {
       const col = document.createElement("div");
@@ -417,7 +443,9 @@
 
       const lab = document.createElement("div");
       lab.className = "trace_arm_label";
-      lab.textContent = arm.label || "(arm)";
+      const labelText = arm.label || "(arm)";
+      lab.textContent = labelText;
+      lab.title = labelText;
       col.appendChild(lab);
 
       const armBody = document.createElement("div");
@@ -454,6 +482,7 @@
       const locSpan = document.createElement("span");
       locSpan.className = "trace_loc";
       locSpan.textContent = "@ " + fmtLoc(l.loc);
+      locSpan.title = fullLoc(l.loc);
       h.appendChild(locSpan);
     }
     box.appendChild(h);
