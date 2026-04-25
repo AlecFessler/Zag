@@ -197,6 +197,9 @@ fn handleRequest(
     if (std.mem.eql(u8, path, "/api/diff_hunks")) {
         return handleDiffHunks(allocator, request, query, state);
     }
+    if (std.mem.eql(u8, path, "/api/review_state")) {
+        return handleReviewState(allocator, request, query, state);
+    }
 
     return respondBytes(request, .not_found, "text/plain; charset=utf-8", "not found\n");
 }
@@ -990,6 +993,219 @@ fn handleDiffHunks(
     const blob = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(blob);
     return respondBytes(request, .ok, "application/json; charset=utf-8", blob);
+}
+
+// ---- Review state persistence --------------------------------------------
+
+/// On-disk schema for `<git_root>/.callgraph/review/<sha_a>..<sha_b>.json`.
+/// Each unit is keyed by a stable id: `<repo-rel-path>:<new_start>:<kind>`
+/// where kind is "a" for added or "r" for removed. Parent mode (X^ vs X)
+/// is the only mode that persists — both endpoints are immutable so unit
+/// ids never shift. Head mode skips the file entirely.
+const ReviewStateFile = struct {
+    schema: u32 = 1,
+    sha_a: []const u8,
+    sha_b: []const u8,
+    units: std.json.ArrayHashMap(ReviewUnit) = .{},
+};
+
+const ReviewUnit = struct {
+    reviewed: bool,
+    at: []const u8 = "",
+    by: []const u8 = "",
+};
+
+/// Body of a POST /api/review_state request: toggle one unit.
+const ReviewToggle = struct {
+    unit_id: []const u8,
+    reviewed: bool,
+    by: []const u8 = "",
+};
+
+fn handleReviewState(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    query: []const u8,
+    state: *const ServerState,
+) !void {
+    var sha_a: []const u8 = "";
+    var sha_b: []const u8 = "";
+    var it = std.mem.splitScalar(u8, query, '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        const key = pair[0..eq];
+        const val = pair[eq + 1 ..];
+        if (std.mem.eql(u8, key, "sha_a")) sha_a = val;
+        if (std.mem.eql(u8, key, "sha_b")) sha_b = val;
+    }
+    if (!isValidSha(sha_a) or !isValidSha(sha_b)) {
+        return respondBytes(
+            request,
+            .bad_request,
+            "text/plain; charset=utf-8",
+            "need sha_a and sha_b (parent mode only — full hex shas)\n",
+        );
+    }
+
+    const file_path = try reviewStateFilePath(allocator, state.git_root, sha_a, sha_b);
+    defer allocator.free(file_path);
+
+    if (request.head.method == .GET) {
+        return readReviewState(allocator, request, file_path, sha_a, sha_b);
+    }
+    if (request.head.method == .POST) {
+        return mergeReviewState(allocator, request, file_path, sha_a, sha_b);
+    }
+    return respondBytes(
+        request,
+        .method_not_allowed,
+        "text/plain; charset=utf-8",
+        "GET or POST only\n",
+    );
+}
+
+fn readReviewState(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    file_path: []const u8,
+    sha_a: []const u8,
+    sha_b: []const u8,
+) !void {
+    const contents = std.fs.cwd().readFileAlloc(allocator, file_path, 16 * 1024 * 1024) catch |err| switch (err) {
+        error.FileNotFound => {
+            // No state on disk yet — return an empty payload so the
+            // frontend can still render checkboxes (all unchecked).
+            const empty = ReviewStateFile{
+                .sha_a = sha_a,
+                .sha_b = sha_b,
+            };
+            const blob = try std.json.Stringify.valueAlloc(allocator, empty, .{});
+            defer allocator.free(blob);
+            return respondBytes(request, .ok, "application/json; charset=utf-8", blob);
+        },
+        else => return respondBytes(
+            request,
+            .internal_server_error,
+            "text/plain; charset=utf-8",
+            "failed to read review state\n",
+        ),
+    };
+    defer allocator.free(contents);
+    return respondBytes(request, .ok, "application/json; charset=utf-8", contents);
+}
+
+fn mergeReviewState(
+    allocator: std.mem.Allocator,
+    request: *std.http.Server.Request,
+    file_path: []const u8,
+    sha_a: []const u8,
+    sha_b: []const u8,
+) !void {
+    var read_buf: [16 * 1024]u8 = undefined;
+    var hdr_buf: [4 * 1024]u8 = undefined;
+    const reader = request.readerExpectContinue(&hdr_buf) catch
+        return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "missing body\n");
+    const body_len = reader.readSliceShort(&read_buf) catch
+        return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "failed to read body\n");
+    if (body_len == 0) return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "empty body\n");
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const aalloc = arena.allocator();
+
+    const parsed = std.json.parseFromSliceLeaky(ReviewToggle, aalloc, read_buf[0..body_len], .{
+        .ignore_unknown_fields = true,
+    }) catch
+        return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "invalid JSON body\n");
+
+    if (parsed.unit_id.len == 0) {
+        return respondBytes(request, .bad_request, "text/plain; charset=utf-8", "missing unit_id\n");
+    }
+
+    // Load existing file (if any), merge the toggle, write atomically.
+    var existing = ReviewStateFile{ .sha_a = sha_a, .sha_b = sha_b };
+    const existing_bytes = std.fs.cwd().readFileAlloc(aalloc, file_path, 16 * 1024 * 1024) catch null;
+    if (existing_bytes) |bytes| {
+        existing = std.json.parseFromSliceLeaky(ReviewStateFile, aalloc, bytes, .{
+            .ignore_unknown_fields = true,
+        }) catch existing;
+    }
+
+    // Stamp current time + reviewer.
+    var ts_buf: [32]u8 = undefined;
+    const now = std.time.timestamp();
+    const ts_str = std.fmt.bufPrint(&ts_buf, "{d}", .{now}) catch "";
+
+    const id_owned = try aalloc.dupe(u8, parsed.unit_id);
+    const at_owned = try aalloc.dupe(u8, ts_str);
+    const by_owned = try aalloc.dupe(u8, parsed.by);
+    try existing.units.map.put(aalloc, id_owned, .{
+        .reviewed = parsed.reviewed,
+        .at = at_owned,
+        .by = by_owned,
+    });
+
+    // Ensure parent dir exists, write atomically (write tmp + rename).
+    if (std.fs.path.dirname(file_path)) |dir| {
+        std.fs.cwd().makePath(dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => {
+                std.debug.print("mkdir {s} failed: {s}\n", .{ dir, @errorName(err) });
+                return respondBytes(
+                    request,
+                    .internal_server_error,
+                    "text/plain; charset=utf-8",
+                    "failed to create review dir\n",
+                );
+            },
+        };
+    }
+
+    const new_blob = try std.json.Stringify.valueAlloc(aalloc, existing, .{ .whitespace = .indent_2 });
+    const tmp_path = try std.fmt.allocPrint(aalloc, "{s}.tmp", .{file_path});
+    {
+        const f = std.fs.cwd().createFile(tmp_path, .{ .truncate = true }) catch |err| {
+            std.debug.print("create tmp {s} failed: {s}\n", .{ tmp_path, @errorName(err) });
+            return respondBytes(
+                request,
+                .internal_server_error,
+                "text/plain; charset=utf-8",
+                "failed to write review state\n",
+            );
+        };
+        defer f.close();
+        f.writeAll(new_blob) catch |err| {
+            std.debug.print("write tmp failed: {s}\n", .{@errorName(err)});
+            return respondBytes(
+                request,
+                .internal_server_error,
+                "text/plain; charset=utf-8",
+                "failed to write review state\n",
+            );
+        };
+    }
+    std.fs.cwd().rename(tmp_path, file_path) catch |err| {
+        std.debug.print("rename {s} → {s} failed: {s}\n", .{ tmp_path, file_path, @errorName(err) });
+        return respondBytes(
+            request,
+            .internal_server_error,
+            "text/plain; charset=utf-8",
+            "failed to install review state\n",
+        );
+    };
+
+    return respondBytes(request, .ok, "application/json; charset=utf-8", new_blob);
+}
+
+fn reviewStateFilePath(
+    allocator: std.mem.Allocator,
+    git_root: []const u8,
+    sha_a: []const u8,
+    sha_b: []const u8,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/.callgraph/review/{s}..{s}.json", .{
+        git_root, sha_a, sha_b,
+    });
 }
 
 // ---- Helpers --------------------------------------------------------------
