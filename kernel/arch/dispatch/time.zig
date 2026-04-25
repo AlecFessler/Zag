@@ -42,3 +42,15 @@ pub inline fn getMonotonicClock() Timer {
         else => unreachable,
     }
 }
+
+/// One-shot BSP-side init for the monotonic clock backend. On x86-64 this
+/// promotes `getMonotonicClock()` from HPET (MMIO, vm-exits) to invariant
+/// TSC (per-core register read) when the CPU advertises it. On aarch64
+/// CNTVCT_EL0 is the only backend, so this is a no-op.
+pub inline fn initMonotonicClock() void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.timers.initMonotonicClock(),
+        .aarch64 => {},
+        else => unreachable,
+    }
+}

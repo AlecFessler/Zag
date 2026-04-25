@@ -283,6 +283,7 @@ pub const Tsc = struct {
 pub fn getPreemptionTimer() Timer {
     if (apic.programLocalApicTimerTscDeadline(@intFromEnum(interrupts.IntVecs.sched))) {
         tsc_timer_instance = Tsc.init(&hpet_timer);
+        tsc_monotonic_ready = true;
         return tsc_timer_instance.timer();
     } else {
         lapic_timer_instance = Lapic.init(&hpet_timer, @intFromEnum(interrupts.IntVecs.sched));
@@ -290,10 +291,30 @@ pub fn getPreemptionTimer() Timer {
     }
 }
 
+/// Calibrate the TSC monotonic clock against the HPET so that
+/// `getMonotonicClock()` can return TSC instead of HPET. Must run on the
+/// BSP after `hpet_timer` is initialized but before any code path on the
+/// scheduler tick reads the monotonic clock — schedTimerHandler reads
+/// the clock for idle/busy accounting on every tick (regular preemption
+/// AND `triggerSchedulerInterrupt` IPIs), so a single HPET MMIO read
+/// (~15-20 µs vm-exit on KVM) per tick blows the §2.2.34 wake-to-pinned
+/// budget by orders of magnitude. Intel SDM Vol 3B §20.17.1 — "Invariant
+/// TSC" guarantees a constant rate across P/C states; QEMU exposes it as
+/// `-cpu host,+invtsc`. When invariant TSC isn't advertised, fall back
+/// to HPET so non-virtualized hardware without invariant TSC still gets
+/// a correct (if slow) clock.
+pub fn initMonotonicClock() void {
+    if (!cpu.hasPowerFeatureEdx(cpu.cpuidRaw(0x80000007, 0).edx, .constant_tsc)) return;
+    tsc_timer_instance = Tsc.init(&hpet_timer);
+    tsc_monotonic_ready = true;
+}
+
 pub fn getMonotonicClock() Timer {
+    if (tsc_monotonic_ready) return tsc_timer_instance.timer();
     return hpet_timer.timer();
 }
 
 var cached_freq_hz: ?u64 = null;
+var tsc_monotonic_ready: bool = false;
 
 pub var hpet_timer: Hpet = undefined;

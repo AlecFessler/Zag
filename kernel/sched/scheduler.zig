@@ -396,6 +396,54 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     // perCoreInit has set the idle thread.
     const preempted = state.running_thread.load(.acquire).?.ptr;
 
+    // §2.2.34 fast path: a pinned-exclusive thread became ready on its
+    // pinned core (typically via a remote `enqueueOnCore` IPI) and the
+    // current occupant is not itself pinned. Switch to the pinned thread
+    // *before* doing per-tick accounting and the per-core hardware-state
+    // sample. Each of those probes is a handful of µs of vm-exits on KVM
+    // (HPET MMIO read, RDMSR for IA32_PERF_STATUS / IA32_THERM_STATUS),
+    // and they easily blow the §2.2.34 wake-to-pinned budget (~100 helper
+    // iterations, i.e. <1 µs of wake latency on x86_64). The accounting
+    // and hardware-state sample run on the next regular preemption tick;
+    // they are sampled "at most one tick stale" by definition, so a
+    // skipped sample on a one-shot wake IPI doesn't violate any reader
+    // invariant. Skipping `last_tick_ns` update is safe: the next regular
+    // tick attributes the full elapsed delta to whichever thread is then
+    // running, which is the pinned thread we are about to dispatch.
+    if (!preempted.pinned_exclusive) {
+        const pinned = pinnedOf(state);
+        if (pinned != null and pinned.? != preempted and pinned.?.state == .ready) {
+            const pinned_t = pinned.?;
+            const idle_ref = state.idle_thread.load(.monotonic);
+            const preempted_is_idle = (idle_ref != null and preempted == idle_ref.?.ptr);
+
+            preempted.ctx = ctx.thread_ctx;
+            preempted.on_cpu.store(false, .release);
+            if (preempted.state == .running) {
+                preempted.state = .ready;
+                if (!preempted_is_idle) {
+                    // Non-idle thread getting bumped: requeue it so some
+                    // other core can pick it up. Skip migration for the
+                    // idle thread — it's per-core and does not belong on
+                    // any run queue. Falling out of running here without
+                    // requeuing is correct because `state.idle_thread`
+                    // still names this core's idle slot, and the next
+                    // non-pinned dispatch on this core will reach idle
+                    // again via `idleOf(state)`.
+                    migrateToEligibleCore(preempted, core_id);
+                }
+            }
+
+            pinned_t.state = .running;
+            pinned_t.on_cpu.store(true, .release);
+            setRunning(state, pinned_t);
+            armSchedTimer(state, SCHED_TIMESLICE_NS);
+            if (pinned_t == preempted) return;
+            switchToWithPmu(preempted, pinned_t);
+            return;
+        }
+    }
+
     // Idle/busy accounting hook (§6, §21). Attribute the elapsed time
     // since the previous tick to either `idle_ns` or `busy_ns` based on
     // whether the thread that just consumed the preceding timeslice was
@@ -895,7 +943,7 @@ pub fn pickRestartCore(thread: *Thread, current_core: u64) u64 {
             continue;
         }
         const state = &core_states[i];
-        const irq = state.rq_lock.lockIrqSave();
+        const irq = state.rq_lock.lockIrqSave(@src());
         const empty = state.rq.isEmpty();
         state.rq_lock.unlockIrqRestore(irq);
         if (empty) return i;
