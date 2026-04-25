@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const ast = @import("ast/index.zig");
+const def_deps = @import("def_deps.zig");
 const entry = @import("entry.zig");
 const ir = @import("ir/parse.zig");
 const join = @import("join.zig");
@@ -213,6 +214,13 @@ pub fn main() !void {
         // of the diff/review feature: every top-level non-fn declaration
         // becomes a reviewable Definition with an assigned id.
         graph.definitions = try ast.buildDefinitionList(arena_allocator, walk.definitions);
+
+        // Phase 2: walk each fn's tokens, resolve references against the
+        // def-qname index, and install Function.def_deps. Best-effort —
+        // unresolved refs are dropped silently.
+        def_deps.compute(arena_allocator, &graph, walk.asts, walk.aliases) catch |err| {
+            std.debug.print("[arch {s}] def_deps failed: {s}\n", .{ spec.api_tag, @errorName(err) });
+        };
 
         const pct: f64 = if (stats.ir_total == 0)
             0.0
