@@ -203,6 +203,7 @@ pub fn main() !void {
             ast_fns,
             walk.asts,
             walk.struct_types,
+            walk.aliases,
             discovered,
             spec.target_arch,
             &stats,

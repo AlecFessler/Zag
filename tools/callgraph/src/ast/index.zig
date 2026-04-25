@@ -4,6 +4,7 @@ pub const AstFunction = walker.AstFunction;
 pub const FileAst = walker.FileAst;
 pub const FieldType = walker.FieldType;
 pub const StructTypeInfo = walker.StructTypeInfo;
+pub const ReexportAlias = walker.ReexportAlias;
 pub const WalkResult = walker.WalkResult;
 pub const walkKernel = walker.walkKernel;
 pub const walkKernelFull = walker.walkKernelFull;

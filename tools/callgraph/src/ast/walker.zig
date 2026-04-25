@@ -25,6 +25,7 @@ const types = @import("../types.zig");
 pub const FieldType = types.FieldType;
 pub const StructTypeInfo = types.StructTypeInfo;
 pub const ParamInfo = types.ParamInfo;
+pub const ReexportAlias = types.ReexportAlias;
 
 pub const AstFunction = struct {
     name: []const u8,
@@ -80,6 +81,12 @@ pub const WalkResult = struct {
     /// resolve are still emitted with an empty `fields` slice (cheaper than
     /// gating the entry on having at least one resolvable field).
     struct_types: []StructTypeInfo,
+    /// Top-level `pub const X = some.dotted.chain;` re-export aliases. Built
+    /// in a post-walk pass against each file's import table. Indexed
+    /// downstream as `<file_module>.<X>` → resolved qname so the receiver-
+    /// chain resolver can rewrite candidates whose prefix is a re-export
+    /// (e.g. `utils.sync.SpinLock.lockIrqSave` → `utils.sync.spin_lock.SpinLock.lockIrqSave`).
+    aliases: []ReexportAlias,
 };
 
 pub fn walkKernel(arena: std.mem.Allocator, kernel_root: []const u8) ![]AstFunction {
@@ -101,11 +108,116 @@ pub fn walkKernelFull(arena: std.mem.Allocator, kernel_root: []const u8) !WalkRe
         std.debug.print("warning: skipping /usr/lib/zig walk: {s}\n", .{@errorName(err)});
     };
 
+    const aliases = try buildAliasIndex(arena, asts.items);
+
     return .{
         .fns = try results.toOwnedSlice(arena),
         .asts = try asts.toOwnedSlice(arena),
         .struct_types = try struct_types.toOwnedSlice(arena),
+        .aliases = aliases,
     };
+}
+
+/// Scan every parsed file's top-level decls. For each `pub const X = expr;`
+/// (or non-pub — both are visible to the qname-rewrite logic) where `expr` is
+/// a dotted chain that resolves through the file's import table, emit an
+/// alias entry. The key is `<file_module>.<X>` (the user-form qname) and the
+/// value is the resolved chain (the underlying-target qname).
+///
+/// Self-named index files (`<dir>/<dir>.zig`) get *two* alias entries: one
+/// keyed by the literal file module path (e.g. `utils.sync.sync.X`) and one
+/// keyed by the user-facing collapsed form (`utils.sync.X`). The collapsed
+/// form is the spelling that downstream candidates carry, since the rest of
+/// the receiver-resolver and the `zag.` strip both treat self-named index
+/// files as accessible without the duplicated segment.
+///
+/// Skipped:
+///   * RHS shapes that aren't a chain of `.field_access` / `identifier`
+///     nodes (e.g. struct expressions, calls, integer literals).
+///   * Chains whose head doesn't resolve through `imports` (drop silently).
+///
+/// First-write-wins on duplicate keys (rare; would require two files at the
+/// same module path emitting the same `pub const X`).
+fn buildAliasIndex(
+    arena: std.mem.Allocator,
+    files: []const FileAst,
+) ![]ReexportAlias {
+    var seen = std.StringHashMap(void).init(arena);
+    var out = std.ArrayList(ReexportAlias){};
+    for (files) |fa| {
+        const file_mod = filePathToModulePath(arena, fa.file) catch continue;
+        if (file_mod.len == 0) continue;
+        // Collapsed form for `<dir>/<dir>.zig` files: drop the final
+        // duplicate segment so `utils.sync.sync` becomes `utils.sync`.
+        // This matches how user-side imports through `zag.utils.sync` see
+        // these index files (the `zag.` strip + import-table resolution
+        // never produces the duplicated segment).
+        const collapsed_mod = collapseSelfNamedIndex(file_mod);
+        const root_decls = fa.tree.rootDecls();
+        for (root_decls) |decl| {
+            const tag = fa.tree.nodeTag(decl);
+            switch (tag) {
+                .global_var_decl, .local_var_decl, .simple_var_decl, .aligned_var_decl => {},
+                else => continue,
+            }
+            const vd = fa.tree.fullVarDecl(decl) orelse continue;
+            const init_node = vd.ast.init_node.unwrap() orelse continue;
+
+            // Only `.field_access` (dotted chains, length >= 2) qualify as a
+            // re-export — a bare `.identifier` RHS would be a single-token
+            // alias whose key would just shadow the import-table entry; the
+            // existing import-resolution code handles those without help.
+            const init_tag = fa.tree.nodeTag(init_node);
+            if (init_tag != .field_access) continue;
+
+            const chain = nodeChainSource(fa.tree, init_node) orelse continue;
+            const resolved = (resolveDottedChain(arena, chain, &fa.imports) catch continue) orelse continue;
+            if (resolved.len == 0) continue;
+
+            const name_token = vd.ast.mut_token + 1;
+            const name = fa.tree.tokenSlice(name_token);
+            if (name.len == 0) continue;
+
+            try emitAliasEntry(arena, &seen, &out, file_mod, name, resolved);
+            if (collapsed_mod.len != file_mod.len) {
+                try emitAliasEntry(arena, &seen, &out, collapsed_mod, name, resolved);
+            }
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// Append one alias entry, deduping by key. Skips self-aliasing and
+/// duplicate keys silently.
+fn emitAliasEntry(
+    arena: std.mem.Allocator,
+    seen: *std.StringHashMap(void),
+    out: *std.ArrayList(ReexportAlias),
+    module_path: []const u8,
+    name: []const u8,
+    target: []const u8,
+) !void {
+    const key = try std.fmt.allocPrint(arena, "{s}.{s}", .{ module_path, name });
+    if (std.mem.eql(u8, key, target)) return;
+    const gop = try seen.getOrPut(key);
+    if (gop.found_existing) return;
+    try out.append(arena, .{ .key = key, .target = target });
+}
+
+/// If `module_path` ends with a duplicated last-segment (`a.b.b` shape, the
+/// file-path translation of `<dir>/<dir>.zig`), return the collapsed form
+/// (`a.b`). Otherwise return the input unchanged. Pure-function — slices the
+/// input directly when possible.
+fn collapseSelfNamedIndex(module_path: []const u8) []const u8 {
+    // Find the last two segments. We need the path to have at least two
+    // dot-separated components for collapsing to apply.
+    const last_dot = std.mem.lastIndexOfScalar(u8, module_path, '.') orelse return module_path;
+    const last_seg = module_path[last_dot + 1 ..];
+    const prefix = module_path[0..last_dot];
+    const second_last_dot = std.mem.lastIndexOfScalar(u8, prefix, '.');
+    const second_last_seg = if (second_last_dot) |d| prefix[d + 1 ..] else prefix;
+    if (!std.mem.eql(u8, last_seg, second_last_seg)) return module_path;
+    return prefix;
 }
 
 fn walkRoot(
@@ -402,11 +514,20 @@ fn resolveFieldTypeQname(
         return "";
     }
 
-    // Bare unqualified type — try `<module_path>.<name>` as a same-file
-    // sibling. The downstream consumer (qname index lookup) will silently
-    // miss if the type doesn't actually exist there.
-    if (isBareIdent(stripped) and ctx.module_path.len > 0) {
-        return std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ ctx.module_path, stripped });
+    // Bare unqualified type that didn't match any same-file pattern. Before
+    // falling back to `<module_path>.<name>`, consult the file's import table
+    // — if `stripped` is the local binding for an `@import(...)` or a
+    // re-export alias, the import table already maps it to the resolved
+    // module path. Without this step `lock: SpinLock` (where `SpinLock` is
+    // `const SpinLock = zag.utils.sync.SpinLock;`) would resolve to the
+    // wrong same-file qname instead of `utils.sync.SpinLock`.
+    if (isBareIdent(stripped)) {
+        if (ctx.imports.get(stripped)) |q| {
+            return ctx.arena.dupe(u8, q);
+        }
+        if (ctx.module_path.len > 0) {
+            return std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ ctx.module_path, stripped });
+        }
     }
 
     return "";
@@ -603,19 +724,28 @@ fn computeReceiver(
         };
     }
 
-    // Case 3b: bare unqualified type — try `<module_path>.<name>` as a
-    // same-file sibling. If the type doesn't actually exist there, the
-    // resolver in branches.emitCall just falls back to indirect.
-    if (isBareIdent(stripped) and ctx.module_path.len > 0) {
-        const candidate = std.fmt.allocPrint(
-            ctx.arena,
-            "{s}.{s}",
-            .{ ctx.module_path, stripped },
-        ) catch return .{};
-        return .{
-            .name = ctx.arena.dupe(u8, binding) catch return .{},
-            .type_qname = candidate,
-        };
+    // Case 3b: bare unqualified type. Before falling back to a same-file
+    // sibling lookup, consult the import table — `self: *SpinLock` where
+    // `const SpinLock = zag.utils.sync.SpinLock;` should resolve through the
+    // import alias, not against `<module_path>.SpinLock`.
+    if (isBareIdent(stripped)) {
+        if (ctx.imports.get(stripped)) |q| {
+            return .{
+                .name = ctx.arena.dupe(u8, binding) catch return .{},
+                .type_qname = ctx.arena.dupe(u8, q) catch return .{},
+            };
+        }
+        if (ctx.module_path.len > 0) {
+            const candidate = std.fmt.allocPrint(
+                ctx.arena,
+                "{s}.{s}",
+                .{ ctx.module_path, stripped },
+            ) catch return .{};
+            return .{
+                .name = ctx.arena.dupe(u8, binding) catch return .{},
+                .type_qname = candidate,
+            };
+        }
     }
 
     return .{};
