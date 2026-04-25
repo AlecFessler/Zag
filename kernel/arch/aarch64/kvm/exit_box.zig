@@ -120,7 +120,8 @@ pub fn queueOrDeliver(box: *VmExitBox, vm_obj: *Vm, vcpu_obj: *VCpu) void {
         } else |_| {
             // Receiver slot freed; fall back to enqueuing the exit.
             box.lock.lock();
-            box.enqueueLocked(vcpu_obj.thread);
+            // self-alive: caller IS vcpu_obj.thread.
+            box.enqueueLocked(vcpu_obj.thread.ptr);
             box.lock.unlock();
         }
     } else {

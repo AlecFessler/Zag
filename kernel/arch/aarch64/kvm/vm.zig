@@ -507,7 +507,7 @@ fn kickRunningVcpus(vm_obj: *Vm) void {
 pub fn resolveVmHandle(proc: *Process, vm_handle: u64) ?*Vm {
     const entry = proc.getPermByHandle(vm_handle) orelse return null;
     return switch (entry.object) {
-        .vm => |v| v,
+        .vm => |r| r.ptr,
         else => null,
     };
 }

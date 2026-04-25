@@ -455,7 +455,12 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     const E_BADCAP: i64 = -3;
     const E_BADADDR: i64 = -7;
 
-    const vm_obj = proc.vm orelse return E_INVAL;
+    const vm_ref = proc.vm orelse return E_INVAL;
+    _ = vm_ref.lock() catch return E_INVAL;
+    vm_ref.unlock();
+    // self-alive: caller IS vm's owner proc.
+    const vm_obj = vm_ref.ptr;
+
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
