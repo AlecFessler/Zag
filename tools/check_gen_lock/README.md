@@ -73,7 +73,7 @@ Exit status is nonzero if any err-severity findings are emitted.
 
 On the current kernel tree the analyzer reports:
 
-- 67 entry points analyzed, 101 tracked slab-typed idents.
+- 67 entry points analyzed, 118 tracked slab-typed idents.
 - 0 err / 0 info bracketing findings.
 - 8 slab-backed types, 0 bare-pointer violations, 0 `.ptr` bypass
   sites.

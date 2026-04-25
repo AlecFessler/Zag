@@ -49,7 +49,7 @@ pub var irq_owners: [256]?IrqOwner = [_]?IrqOwner{null} ** 256;
 
 /// I/O APIC MMIO base virtual address. Set during ACPI parsing.
 var ioapic_base: u64 = 0;
-var ioapic_lock: SpinLock = .{};
+var ioapic_lock: SpinLock = .{ .class = "irq.ioapic_lock" };
 
 /// Sets up IDT gates for hardware IRQs, the spurious interrupt vector, the TLB
 /// shootdown IPI vector, and the scheduler timer vector.

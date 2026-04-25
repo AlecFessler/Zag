@@ -339,7 +339,7 @@ pub const Vgic = struct {
     /// across MMIO decode and SPI assertion. Linux uses an irq_lock per
     /// vgic_irq plus a dist lock; we serialise the entire distributor
     /// for simplicity, which is fine for the small SPI counts we cap to.
-    lock: SpinLock = .{},
+    lock: SpinLock = .{ .class = "Vgic.lock" },
 
     /// GICD_CTLR shadow (only ARE_NS + EnableGrp1NS bits are meaningful;
     /// the rest are RAZ/WI). GICv3 §12.9.4.
@@ -406,7 +406,7 @@ pub const VcpuState = struct {
     /// Per-vCPU lock guarding the SGI/PPI bitmaps and the LR shadow.
     /// Held across mmioRead/mmioWrite for any GICR access targeting this
     /// vCPU and across prepareEntry/saveExit.
-    lock: SpinLock = .{},
+    lock: SpinLock = .{ .class = "VcpuState.lock" },
 
     /// SGI/PPI enable bitmap (one u32 covers INTIDs 0..31). GICv3 §9.4.
     sgi_ppi_enabled: u32 = 0xFFFF, // SGIs reset enabled per §9.4.6.

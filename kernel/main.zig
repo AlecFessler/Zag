@@ -53,6 +53,7 @@ fn kMain(boot_info: *BootInfo) !void {
     const rs_ptr: [*]const u8 = @ptrFromInt(rs_virt.addr);
     try userspace_init.init(rs_ptr[0..boot_info.root_service.len]);
     try arch.smp.smpInit();
+    zag.utils.sync.debug.markSmpReady();
     sched.perCoreInit();
     try kprof_log.init();
     kprof_log.start();

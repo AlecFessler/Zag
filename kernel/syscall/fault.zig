@@ -362,16 +362,26 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
     src._gen_lock.unlock();
 
     {
+        // Filter by sib_mask BEFORE acquiring the gen-lock. We already hold
+        // pending_ref's gen-lock from the dequeue above; iterating every
+        // thread and locking each would re-acquire pending's own GenLock
+        // when its slot comes up (pending is still in src.threads — it
+        // hasn't been deinit'd yet) and trip the recursive-acquire check.
+        // pending's bit is in faulted_thread_slots, not suspended_thread_slots,
+        // so gating on sib_mask naturally skips it. slot_index == array
+        // index by construction (removeThread keeps the invariant); reading
+        // src.threads[i] without gen_lock is safe because lockWithGen
+        // detects stale slots and returns StaleHandle.
         var i: u64 = 0;
         while (i < src.num_threads) {
-            const t_ref = src.threads[i];
-            if (t_ref.lock()) |t| {
-                defer t_ref.unlock();
-                if ((sib_mask & (@as(u64, 1) << @intCast(t.slot_index))) != 0) {
+            if ((sib_mask & (@as(u64, 1) << @intCast(i))) != 0) {
+                const t_ref = src.threads[i];
+                if (t_ref.lock()) |t| {
+                    defer t_ref.unlock();
                     const target_core = if (t.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
                     sched.enqueueOnCore(target_core, t);
-                }
-            } else |_| {}
+                } else |_| {}
+            }
             i += 1;
         }
     }

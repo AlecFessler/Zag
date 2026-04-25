@@ -46,7 +46,7 @@ var page_caches: [MAX_CORES]PerCorePageCache = [_]PerCorePageCache{.{}} ** MAX_C
 
 pub const PhysicalMemoryManager = struct {
     buddy: *BuddyAllocator,
-    lock: SpinLock = .{},
+    lock: SpinLock = .{ .class = "PhysicalMemoryManager.lock" },
 
     pub fn init(buddy: *BuddyAllocator) PhysicalMemoryManager {
         return .{

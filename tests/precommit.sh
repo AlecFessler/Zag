@@ -70,12 +70,20 @@ stage_arch_layering_lint() {
 stage_dead_code_report() {
     echo ""
     echo "=================================================="
-    echo "[0b] Dead-code report (advisory)"
+    echo "[0b] Dead-code detector (gating)"
     echo "=================================================="
-    # Advisory only — output is manual-review (checks for @field/asm refs needed).
-    python3 "$ZAG_ROOT/tools/dead_code.py" kernel 2>&1 | tail -20 || true
-    echo "(advisory — see tools/dead_code.py kernel for full listing)"
-    return 0
+    # AST-based dead-code detector. Catches alias-chain dead exports
+    # (e.g. `pub const X = mod.X;` with no consumers) that the prior
+    # grep-based tool missed. Tool exits non-zero on any finding.
+    if ! (cd "$ZAG_ROOT/tools/dead_code_zig" && zig build 2>&1); then
+        FAILURES+=("dead-code detector build")
+        return 1
+    fi
+    local detector="$ZAG_ROOT/tools/dead_code_zig/zig-out/bin/dead_code_zig"
+    if ! (cd "$ZAG_ROOT" && "$detector" kernel); then
+        FAILURES+=("dead-code findings")
+        return 1
+    fi
 }
 
 stage_gen_lock_analyzer() {
@@ -142,32 +150,39 @@ stage_aarch64_kernel_tests_pi() {
     fi
 
     echo "Syncing artifacts to $PI_HOST..."
-    # Create target dirs on Pi (expands $HOME there).
-    ssh "$PI_HOST" "mkdir -p $PI_REMOTE_DIR/tests/bin $PI_REMOTE_DIR/img/efi/boot" || {
+    # Create target dirs on Pi (expands $HOME there). Wipe stale test ELFs
+    # so a removed test on this box doesn't keep running on the Pi (the
+    # equivalent of rsync --delete, scoped to the filename patterns we
+    # actually push).
+    ssh "$PI_HOST" "mkdir -p $PI_REMOTE_DIR/tests/bin $PI_REMOTE_DIR/img/efi/boot && rm -f $PI_REMOTE_DIR/tests/bin/s*.elf $PI_REMOTE_DIR/tests/bin/root_service.elf" || {
         FAILURES+=("ssh mkdir on Pi")
         return 1
     }
 
-    # Test ELFs.
-    if ! rsync -a --delete \
-        --include='s*.elf' --include='root_service.elf' --exclude='*' \
-        "$SCRIPT_DIR/tests/bin/" \
-        "$PI_HOST:zag-test/tests/bin/"; then
-        FAILURES+=("rsync test ELFs to Pi")
+    # Test ELFs. tar-over-ssh keeps the per-file filter (s*.elf +
+    # root_service.elf) without needing rsync on this box. The dev box
+    # only needs `tar` + `ssh`; rsync stays on the Pi runner side, which
+    # is fine because we don't call rsync there.
+    local elf_list
+    elf_list=$(cd "$SCRIPT_DIR/tests/bin" && ls s*.elf root_service.elf 2>/dev/null) || {
+        FAILURES+=("no aarch64 test ELFs to sync")
+        return 1
+    }
+    if ! tar -C "$SCRIPT_DIR/tests/bin" -cf - $elf_list \
+        | ssh "$PI_HOST" "tar -C zag-test/tests/bin -xf -"; then
+        FAILURES+=("tar/ssh test ELFs to Pi")
         return 1
     fi
 
     # Kernel + EFI loader.
-    if ! rsync -a \
-        "$ZAG_ROOT/zig-out/img/kernel.elf" \
+    if ! scp -q "$ZAG_ROOT/zig-out/img/kernel.elf" \
         "$PI_HOST:zag-test/img/kernel.elf"; then
-        FAILURES+=("rsync kernel.elf to Pi")
+        FAILURES+=("scp kernel.elf to Pi")
         return 1
     fi
-    if ! rsync -a \
-        "$ZAG_ROOT/zig-out/img/efi/boot/BOOTAA64.EFI" \
+    if ! scp -q "$ZAG_ROOT/zig-out/img/efi/boot/BOOTAA64.EFI" \
         "$PI_HOST:zag-test/img/efi/boot/BOOTAA64.EFI"; then
-        FAILURES+=("rsync BOOTAA64.EFI to Pi")
+        FAILURES+=("scp BOOTAA64.EFI to Pi")
         return 1
     fi
 
@@ -268,6 +283,18 @@ stage_redteam_regressions() {
     # `POC-<id>: PATCHED` marker, reusing the per-PoC run.sh pipeline.
     # SKIPPED outcomes (e.g. no VMX) are allowed; VULNERABLE or a
     # missing marker (kernel panic before AFTER) fails the gate.
+
+    # Stages 3 and 4 overwrite zig-out/img/kernel.elf with hyprvos
+    # builds (x86 then aarch64). run.sh copies whatever kernel.elf
+    # is present; without rebuilding, the PoCs would boot an aarch64
+    # kernel under x86 QEMU and die in the bootloader. Rebuild the
+    # x86 test-profile kernel before the red-team run.
+    clean_nvvars
+    if ! (cd "$ZAG_ROOT" && zig build -Dprofile=test 2>&1); then
+        FAILURES+=("red-team kernel rebuild")
+        return 1
+    fi
+
     if ! bash "$SCRIPT_DIR/redteam/run_all.sh"; then
         FAILURES+=("red-team regressions")
         return 1

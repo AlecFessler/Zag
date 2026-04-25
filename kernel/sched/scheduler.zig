@@ -11,6 +11,7 @@ const kprof_log = zag.kprof.log;
 const kprof_mode = zag.kprof.mode;
 const kprof_sample = zag.kprof.sample;
 const process_mod = zag.proc.process;
+const sync_debug = zag.utils.sync.debug;
 const thread_mod = zag.sched.thread;
 
 const ArchCpuContext = arch.cpu.ArchCpuContext;
@@ -175,7 +176,7 @@ const ExitedThread = struct {
 
 const PerCoreState = struct {
     rq: RunQueue = .{},
-    rq_lock: SpinLock = .{},
+    rq_lock: SpinLock = .{ .class = "PerCoreState.rq_lock" },
     running_thread: AtomicSlabRef(Thread) = .{},
     pinned_thread: AtomicSlabRef(Thread) = .{},
     timer: Timer = undefined,
@@ -609,6 +610,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
 }
 
 pub fn yield() void {
+    sync_debug.assertNoLocksHeld(@src());
     kprof.point(.sched_yield, 0);
     arch.smp.triggerSchedulerInterruptSelf();
 }
@@ -654,10 +656,27 @@ pub fn pinExclusive(thread: *Thread) i64 {
 /// Move all threads from a pinned core's run queue to other available cores.
 fn migrateThreadsOff(state: *PerCoreState, pinned_core: u64) void {
     const count = arch.smp.coreCount();
-    const irq = state.rq_lock.lockIrqSave();
-    defer state.rq_lock.unlockIrqRestore(irq);
 
-    while (state.rq.dequeue()) |t| {
+    // Drain the source rq into a local list before releasing source lock,
+    // so we never hold two PerCoreState.rq_lock instances at once. Reuse
+    // `thread.next` for chaining — the priority queue's dequeue() leaves
+    // it null, so we re-thread it as a SlabRef list while still under the
+    // source lock.
+    var head: ?SlabRef(Thread) = null;
+    {
+        const irq = state.rq_lock.lockIrqSave();
+        defer state.rq_lock.unlockIrqRestore(irq);
+        while (state.rq.dequeue()) |t| {
+            t.next = head;
+            head = SlabRef(Thread).init(t, t._gen_lock.currentGen());
+        }
+    }
+
+    while (head) |ref| {
+        const t = ref.ptr;
+        head = t.next;
+        t.next = null;
+
         // Find an unpinned core to enqueue this thread on
         var target: u64 = 0;
         while (target < count) {
@@ -818,6 +837,7 @@ fn pickCoreForThread(thread: *Thread, current_core: u64) ?u64 {
 /// The caller must have already set the current thread's state and saved ctx.
 /// Does NOT return to the caller — switches stack and jumps to the next thread.
 pub fn switchToNextReady() noreturn {
+    sync_debug.assertNoLocksHeld(@src());
     kprof.enter(.sched_switch);
     defer kprof.exit(.sched_switch);
     const core_id = arch.smp.coreID();

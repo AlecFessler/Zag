@@ -32,7 +32,7 @@ var bitmap: [word_count]u64 = init: {
     break :init b;
 };
 var hint: u16 = 0;
-var lock: SpinLock = .{};
+var lock: SpinLock = .{ .class = "pcid.lock" };
 
 pub fn allocate() ?u16 {
     const irq_state = lock.lockIrqSave();

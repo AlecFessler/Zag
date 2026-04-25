@@ -22,7 +22,7 @@ const E_NOENT: i64 = -10;
 pub const NotificationBox = struct {
     word: u64 = 0,
     waiters: ThreadPriorityQueue = .{},
-    lock: SpinLock = .{},
+    lock: SpinLock = .{ .class = "NotificationBox.lock" },
 
     /// Called from the IRQ handler path (interrupts disabled).
     /// Atomically ORs the badge bit into the notification word,

@@ -20,7 +20,7 @@ const FREELIST_CAP: usize = 512;
 var next_slot = std.atomic.Value(u64).init(0);
 var freelist_buf: [FREELIST_CAP]u64 = undefined;
 var freelist_top: usize = 0;
-var freelist_lock: SpinLock = .{};
+var freelist_lock: SpinLock = .{ .class = "stack.freelist_lock" };
 
 pub const Stack = struct {
     top: VAddr,

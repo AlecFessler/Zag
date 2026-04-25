@@ -22,7 +22,7 @@ const active = builtin.mode == .Debug and !builtin.is_test;
 
 const HELD_STACK_DEPTH: u8 = 8;
 const MAX_CORES: usize = 8;
-const PAIR_REGISTRY_CAPACITY: usize = 64;
+const PAIR_REGISTRY_CAPACITY: usize = 512;
 
 pub const Entry = struct {
     lock_ptr: *const anyopaque,
@@ -52,6 +52,9 @@ pub const CheckOutcome = struct {
     cycle_inner: [*:0]const u8 = "",
     cycle_prior_outer_src: SrcLoc = .{ .file = "", .fn_name = "", .line = 0, .column = 0, .module = "" },
     cycle_prior_inner_src: SrcLoc = .{ .file = "", .fn_name = "", .line = 0, .column = 0, .module = "" },
+    /// True when the cycle was detected via multi-hop BFS rather than a direct
+    /// inverse-pair lookup. In that case the prior srcs are not populated.
+    cycle_transitive: bool = false,
 };
 
 const PairEntry = struct {
@@ -146,6 +149,39 @@ const PairRegistry = struct {
             i += 1;
         }
     }
+
+    /// BFS the directed graph (outer -> inner) for a path from `start` to
+    /// `target`. Caller must hold the registry lock. Bounded by capacity.
+    fn pathExists(self: *PairRegistry, start: [*:0]const u8, target: [*:0]const u8) bool {
+        var visited: [PAIR_REGISTRY_CAPACITY][*:0]const u8 = undefined;
+        visited[0] = start;
+        var visited_count: usize = 1;
+        var head: usize = 0;
+        while (head < visited_count) {
+            const node = visited[head];
+            head += 1;
+            var k: usize = 0;
+            while (k < PAIR_REGISTRY_CAPACITY) {
+                const e = self.entries[k];
+                k += 1;
+                const outer = e.outer orelse continue;
+                if (outer != node) continue;
+                if (e.inner == target) return true;
+                var seen = false;
+                for (visited[0..visited_count]) |v| {
+                    if (v == e.inner) {
+                        seen = true;
+                        break;
+                    }
+                }
+                if (!seen and visited_count < PAIR_REGISTRY_CAPACITY) {
+                    visited[visited_count] = e.inner;
+                    visited_count += 1;
+                }
+            }
+        }
+        return false;
+    }
 };
 
 var held_stacks: [MAX_CORES]HeldStack align(64) = [_]HeldStack{.{}} ** MAX_CORES;
@@ -188,6 +224,14 @@ pub fn acquireOn(
                     .cycle_inner = held.class,
                     .cycle_prior_outer_src = prior.outer_src,
                     .cycle_prior_inner_src = prior.inner_src,
+                };
+            }
+            if (registry.pathExists(class, held.class)) {
+                return .{
+                    .result = .panic_cycle,
+                    .cycle_outer = class,
+                    .cycle_inner = held.class,
+                    .cycle_transitive = true,
                 };
             }
             registry.insert(held.class, class, held.src, src);
@@ -261,6 +305,39 @@ pub fn release(lock_ptr: *const anyopaque) void {
     _ = releaseOn(stack, lock_ptr);
 }
 
+/// Panic if the current core has any SpinLock held. Wire this into scheduler
+/// block/yield entry points: holding a SpinLock across a context switch can
+/// deadlock the kernel — the next thread spinning on the same lock won't
+/// observe the holder's release until the holder runs again.
+pub fn assertNoLocksHeld(src: SrcLoc) void {
+    if (!active) return;
+    if (@atomicLoad(u32, &smp_ready, .acquire) == 0) return;
+    const core_id = arch.smp.coreID();
+    if (core_id >= MAX_CORES) return;
+    const stack = &held_stacks[@intCast(core_id)];
+    if (stack.depth == 0) return;
+    const held = stack.entries[0];
+    printDecimal("lockdep: blocking call with locks held core=", core_id);
+    arch.boot.printRaw(" depth=");
+    printDecimal("", stack.depth);
+    arch.boot.printRaw("\n  blocking call at ");
+    arch.boot.printRaw(src.file);
+    arch.boot.printRaw(":");
+    printDecimal("", src.line);
+    arch.boot.printRaw(" in ");
+    arch.boot.printRaw(src.fn_name);
+    arch.boot.printRaw("\n  held lock class=\"");
+    printCStr(held.class);
+    arch.boot.printRaw("\" acquired at ");
+    arch.boot.printRaw(held.src.file);
+    arch.boot.printRaw(":");
+    printDecimal("", held.src.line);
+    arch.boot.printRaw(" in ");
+    arch.boot.printRaw(held.src.fn_name);
+    arch.boot.printRaw("\n");
+    @panic("lockdep: blocking call with locks held");
+}
+
 fn handleOutcome(
     outcome: CheckOutcome,
     core_id: u64,
@@ -309,6 +386,20 @@ fn handleOutcome(
             @panic("lockdep: same-class overlap");
         },
         .panic_cycle => {
+            if (outcome.cycle_transitive) {
+                arch.boot.printRaw("lockdep: transitive cycle ");
+                printCStr(outcome.cycle_inner);
+                arch.boot.printRaw(" -> ... -> ");
+                printCStr(outcome.cycle_outer);
+                arch.boot.printRaw("\n  closing edge at ");
+                arch.boot.printRaw(src.file);
+                arch.boot.printRaw(":");
+                printDecimal("", src.line);
+                arch.boot.printRaw(" in ");
+                arch.boot.printRaw(src.fn_name);
+                arch.boot.printRaw("\n  (intermediate path is in pair_registry; inspect with debugger)\n");
+                @panic("lockdep: transitive cycle");
+            }
             arch.boot.printRaw("lockdep: AB-BA cycle ");
             printCStr(outcome.cycle_inner);
             arch.boot.printRaw(" -> ");
@@ -471,6 +562,74 @@ test "acquireOn: AB then release A then BA succeeds (no overlap)" {
     _ = acquireOn(&stack, &reg, &lock_b, class_b, 0, makeSrc("a.zig", 30));
     const out = acquireOn(&stack, &reg, &lock_a, class_a, 0, makeSrc("a.zig", 40));
     try testing.expectEqual(CheckResult.panic_cycle, out.result);
+}
+
+test "acquireOn: 3-node transitive cycle A->B->C->A" {
+    var stacks: [3]HeldStack = .{ .{}, .{}, .{} };
+    var reg: PairRegistry = .{};
+    reg.clear();
+
+    const a: [*:0]const u8 = "A";
+    const b: [*:0]const u8 = "B";
+    const c: [*:0]const u8 = "C";
+    var locks: [3]u32 = .{ 0, 0, 0 };
+
+    // Core 0: A then B → registers A->B.
+    _ = acquireOn(&stacks[0], &reg, &locks[0], a, 0, makeSrc("x.zig", 1));
+    _ = acquireOn(&stacks[0], &reg, &locks[1], b, 0, makeSrc("x.zig", 2));
+
+    // Core 1: B then C → registers B->C.
+    _ = acquireOn(&stacks[1], &reg, &locks[1], b, 0, makeSrc("x.zig", 3));
+    _ = acquireOn(&stacks[1], &reg, &locks[2], c, 0, makeSrc("x.zig", 4));
+
+    // Core 2: C then A → would close cycle A->B->C->A.
+    _ = acquireOn(&stacks[2], &reg, &locks[2], c, 0, makeSrc("x.zig", 5));
+    const out = acquireOn(&stacks[2], &reg, &locks[0], a, 0, makeSrc("x.zig", 6));
+    try testing.expectEqual(CheckResult.panic_cycle, out.result);
+    try testing.expect(out.cycle_transitive);
+}
+
+test "acquireOn: 4-node transitive cycle A->B->C->D->A" {
+    var stacks: [4]HeldStack = .{ .{}, .{}, .{}, .{} };
+    var reg: PairRegistry = .{};
+    reg.clear();
+
+    const a: [*:0]const u8 = "A";
+    const b: [*:0]const u8 = "B";
+    const c: [*:0]const u8 = "C";
+    const d: [*:0]const u8 = "D";
+    var locks: [4]u32 = .{ 0, 0, 0, 0 };
+
+    _ = acquireOn(&stacks[0], &reg, &locks[0], a, 0, makeSrc("x.zig", 1));
+    _ = acquireOn(&stacks[0], &reg, &locks[1], b, 0, makeSrc("x.zig", 2));
+    _ = acquireOn(&stacks[1], &reg, &locks[1], b, 0, makeSrc("x.zig", 3));
+    _ = acquireOn(&stacks[1], &reg, &locks[2], c, 0, makeSrc("x.zig", 4));
+    _ = acquireOn(&stacks[2], &reg, &locks[2], c, 0, makeSrc("x.zig", 5));
+    _ = acquireOn(&stacks[2], &reg, &locks[3], d, 0, makeSrc("x.zig", 6));
+    _ = acquireOn(&stacks[3], &reg, &locks[3], d, 0, makeSrc("x.zig", 7));
+    const out = acquireOn(&stacks[3], &reg, &locks[0], a, 0, makeSrc("x.zig", 8));
+    try testing.expectEqual(CheckResult.panic_cycle, out.result);
+    try testing.expect(out.cycle_transitive);
+}
+
+test "acquireOn: long acyclic chain does not panic" {
+    var stacks: [3]HeldStack = .{ .{}, .{}, .{} };
+    var reg: PairRegistry = .{};
+    reg.clear();
+
+    const a: [*:0]const u8 = "A";
+    const b: [*:0]const u8 = "B";
+    const c: [*:0]const u8 = "C";
+    const d: [*:0]const u8 = "D";
+    var locks: [4]u32 = .{ 0, 0, 0, 0 };
+
+    _ = acquireOn(&stacks[0], &reg, &locks[0], a, 0, makeSrc("x.zig", 1));
+    _ = acquireOn(&stacks[0], &reg, &locks[1], b, 0, makeSrc("x.zig", 2));
+    _ = acquireOn(&stacks[1], &reg, &locks[1], b, 0, makeSrc("x.zig", 3));
+    _ = acquireOn(&stacks[1], &reg, &locks[2], c, 0, makeSrc("x.zig", 4));
+    _ = acquireOn(&stacks[2], &reg, &locks[2], c, 0, makeSrc("x.zig", 5));
+    const out = acquireOn(&stacks[2], &reg, &locks[3], d, 0, makeSrc("x.zig", 6));
+    try testing.expectEqual(CheckResult.ok, out.result);
 }
 
 test "acquireOn: AB-BA cycle detected" {

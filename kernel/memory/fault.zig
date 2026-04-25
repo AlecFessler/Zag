@@ -126,9 +126,20 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         arch.cpu.enableInterrupts();
         while (true) arch.cpu.halt();
     };
-    defer node_ref.unlock();
 
-    switch (node.kind) {
+    // Snapshot the node fields we need under the lock, then release it.
+    // `kill()` -> `performRestart` -> `vmm.resetForRestart` walks every
+    // VmNode and calls `freeVmNode`, which spins on `lockWithGen` for the
+    // matching gen — holding the lock here while kill() runs would
+    // deadlock the killing thread on its own VmNode lock (no other context
+    // holds it; the spin is its own).
+    const node_kind = node.kind;
+    const node_rights = node.rights;
+    const node_start = node.start;
+    const node_size = node.size;
+    node_ref.unlock();
+
+    switch (node_kind) {
         .shared_memory, .mmio => {
             const r = accessReason(is_write, is_exec);
             if (proc.faultBlock(thread, r, faulting_virt.addr, fault.rip, fault.user_ctx)) {
@@ -155,14 +166,14 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         },
         .private => {
             const rights_ok = blk: {
-                if (is_exec) break :blk node.rights.execute;
-                if (is_write) break :blk node.rights.write;
-                break :blk node.rights.read;
+                if (is_exec) break :blk node_rights.execute;
+                if (is_write) break :blk node_rights.write;
+                break :blk node_rights.read;
             };
 
             if (!rights_ok) {
-                const r2 = if (!node.rights.read and !node.rights.write and !node.rights.execute and node.size == paging.PAGE4K)
-                    guardPageReason(proc, node.start.addr)
+                const r2 = if (!node_rights.read and !node_rights.write and !node_rights.execute and node_size == paging.PAGE4K)
+                    guardPageReason(proc, node_start.addr)
                 else
                     accessReason(is_write, is_exec);
                 if (proc.faultBlock(thread, r2, faulting_virt.addr, fault.rip, fault.user_ctx)) {

@@ -40,7 +40,7 @@ const fr_bits = struct {
 /// Null until `setBase` is called during early boot.
 var base_addr: ?u64 = null;
 
-var print_lock = sync.SpinLock{};
+var print_lock = sync.SpinLock{ .class = "serial.print_lock" };
 
 /// Set the PL011 MMIO base address. Called by ACPI SPCR/DBG2 parsing
 /// during early boot before any serial output is needed.

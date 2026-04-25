@@ -35,7 +35,7 @@ pub const VmExitBox = struct {
     queue: ThreadPriorityQueue = .{},
     receiver: ?SlabRef(Thread) = null,
     pending: [MAX_VCPUS]bool = .{false} ** MAX_VCPUS,
-    lock: SpinLock = .{},
+    lock: SpinLock = .{ .class = "VmExitBox.lock" },
 
     /// Check if any exits are pending resolution.
     pub fn hasPendingExits(self: *VmExitBox) bool {

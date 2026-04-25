@@ -1532,7 +1532,7 @@ pub const Process = struct {
         proc.num_children = 0;
         proc.perm_table = undefined;
         proc.perm_count = 0;
-        proc.perm_lock = .{};
+        proc.perm_lock = .{ .class = "Process.perm_lock" };
         proc.handle_counter = 1;
         proc.perm_view_vaddr = VAddr.fromInt(0);
         proc.perm_view_phys = PAddr.fromInt(0);
@@ -1667,7 +1667,7 @@ pub const Process = struct {
         proc.num_children = 0;
         proc.perm_table = undefined;
         proc.perm_count = 0;
-        proc.perm_lock = .{};
+        proc.perm_lock = .{ .class = "Process.perm_lock" };
         proc.handle_counter = 1;
         proc.perm_view_vaddr = VAddr.fromInt(0);
         proc.perm_view_phys = PAddr.fromInt(0);

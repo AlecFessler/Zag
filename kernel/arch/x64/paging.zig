@@ -21,7 +21,7 @@ const VAddr = zag.memory.address.VAddr;
 /// Intel SDM Vol 3A, Section 5.10.5 "Propagation of Paging-Structure Changes to
 /// Multiple Processors" requires software to broadcast invalidations; this is
 /// implemented via IPI + INVLPG on each remote core.
-var shootdown_lock: SpinLock = .{};
+var shootdown_lock: SpinLock = .{ .class = "paging.shootdown_lock" };
 var shootdown_addr: u64 = 0;
 
 /// IPI handler for TLB shootdown: invalidate the requested address.

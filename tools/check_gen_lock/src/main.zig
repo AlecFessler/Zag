@@ -146,21 +146,6 @@ const LOCK_TYPE_NAMES = [_][]const u8{
     "GenLock",
 };
 
-// Blessed helpers for ordered same-type lock acquisition. A call like
-// `lockPair(a, b)` internally acquires `a` and `b` in a deterministic
-// address-ordered sequence, so the same-type nesting within that single
-// call is safe-by-construction — equivalent to Linux's
-// mutex_lock_nested / spin_lock_nested "subclass" annotation but
-// expressed as a helper name instead of a magic comment. The lock-order
-// cycle detector skips same-type pairs whose events share an
-// ordered_group id emitted by one of these helpers.
-const ORDERED_PAIR_LOCK_HELPERS = [_][]const u8{
-    "lockPair",
-};
-const ORDERED_PAIR_UNLOCK_HELPERS = [_][]const u8{
-    "unlockPair",
-};
-
 // -----------------------------------------------------------------
 // Small helper types
 // -----------------------------------------------------------------
@@ -573,6 +558,7 @@ const EventKind = enum {
     lock,
     unlock,
     defer_unlock,
+    errdefer_unlock,
     lock_with_gen,
 };
 
@@ -582,46 +568,40 @@ const Event = struct {
     seq: u32, // per-entry insertion order
     tail: []const u8 = "", // method / field name for access events
     slab_type: []const u8 = "",
-    // Non-zero when this lock/unlock event was emitted by an ordered-pair
-    // helper call (`lockPair`, `unlockPair`). Two lock events sharing the
-    // same non-zero group_id are treated as a single atomic ordered
-    // acquisition when the cycle detector considers same-type pairs —
-    // their mutual self-loop is suppressed because the helper enforces a
-    // deterministic address-order internally. Cross-type pairs from
-    // ordered groups still contribute normal edges; only the same-type
-    // self-loop between the group's members is elided.
-    group_id: u32 = 0,
-    // Pre-resolved lock class (interned). When non-empty, the pair
-    // extractor uses this verbatim instead of synthesizing a class from
-    // slab_type. Populated for plain SpinLock / struct-field locks
-    // where the class is `<OwnerStruct>.<field_name>`.
-    lock_class: []const u8 = "",
+    // For lock/unlock/defer_unlock/errdefer_unlock events, the brace depth
+    // at the source line where the op (or `defer`/`errdefer` keyword)
+    // appeared. Used by the per-path release checker to decide whether a
+    // (err)defer's protection scope still covers a given exit point.
+    // For folded callee events (cross-function summary apply) this stays
+    // 0; the path checker treats unknown-depth as innermost-scope-safe.
+    depth: i32 = 0,
 };
 
-// -----------------------------------------------------------------
-// Lock-ordering graph: pairs + cycles.
-// -----------------------------------------------------------------
-//
-// A LockClass is an interned string identifying a lock *type* — e.g.
-// "Process._gen_lock", "Thread._gen_lock". Instances of the same class
-// are interchangeable for graph purposes (two Process objects' gen-locks
-// share a class, same as Linux lockdep's lock_class).
-//
-// A LockPair (outer_class → inner_class) records that some function was
-// observed to hold `outer` when acquiring `inner`. A cycle in the
-// directed graph of pairs indicates a potential deadlock: thread A
-// holding outer→inner and thread B holding inner→outer can deadlock
-// regardless of which specific instances each thread acquires.
-
-const LockPair = struct {
-    outer: []const u8, // interned class
-    inner: []const u8, // interned class
-    file_rel: []const u8, // borrowed
-    line: u32, // call-site line where `inner` was acquired
-    entry_name: []const u8, // borrowed
-    outer_ident: []const u8, // borrowed
-    inner_ident: []const u8, // borrowed
+// Function-exit (control-flow) events. Separate from the per-ident
+// timeline because they don't bind to a particular slab ident — they
+// describe where control leaves the function (or an enclosing loop).
+// The per-path release checker walks the merged event timeline of an
+// ident together with these exit markers to decide whether each path
+// from a given lock event to the function exit is covered by either an
+// explicit unlock OR a still-in-scope (err)defer-unlock.
+const ExitKind = enum {
+    return_normal, // bare `return` or `return <value>` (non-error)
+    return_error, // `return error.X` — error-path exit
+    throw, // `try <expr>` — implicit error-path exit on the error union
+    break_stmt, // `break` (loop / labeled-block exit)
+    continue_stmt, // `continue`
+    panic_or_unreachable, // `@panic(...)` / `unreachable` — no unwinding required
 };
+
+const ExitEvent = struct {
+    kind: ExitKind,
+    src_line: u32,
+    depth: i32,
+    seq: u32,
+};
+
+const ExitEventList = ArrayList(ExitEvent);
+
 
 // -----------------------------------------------------------------
 // Helpers: typed string predicates
@@ -647,6 +627,19 @@ fn rstrip(s: []const u8) []const u8 {
     var b: usize = s.len;
     while (b > 0 and ascii.isWhitespace(s[b - 1])) b -= 1;
     return s[0..b];
+}
+
+// Strip `?`, `*`, `const ` to bottom out at the bare type identifier.
+fn typeNameFromFieldType(ft: []const u8) []const u8 {
+    var t = trimAscii(ft);
+    if (t.len == 0) return t;
+    if (t[0] == '?') t = trimAscii(t[1..]);
+    if (t.len == 0) return t;
+    if (t[0] == '*') t = trimAscii(t[1..]);
+    if (mem.startsWith(u8, t, "const ")) t = trimAscii(t["const ".len..]);
+    var e: usize = 0;
+    while (e < t.len and isIdentChar(t[e])) e += 1;
+    return t[0..e];
 }
 
 // Remove trailing `orelse ...`, `.?`, `catch ...`, parenthesized casts.
@@ -829,103 +822,6 @@ const StructField = struct {
     field_type: []const u8, // borrowed (stripped code slice of the type)
 };
 
-// Module-level `var/const <name>: <type> = ...` declarations. Used by
-// the lock-ordering analyzer to resolve locals like
-// `const state = &core_states[core_id];` — without this, the receiver
-// `state` is untyped and subsequent `state.rq_lock.lockIrqSave()` calls
-// can't classify.
-//
-// Scope for v3: keyed by bare name (not file-qualified). If two files
-// declare same-named globals the map takes last-wins. Internal to
-// each file's walks, this is almost always unique — cross-file access
-// goes through `module.name` which we don't normalize here.
-const ModuleGlobal = struct {
-    name: []const u8, // interned
-    bare_type: []const u8, // interned — e.g. "PerCoreState", "Vmm", "SpinLock"
-    is_array: bool, // true when the declared type is `[N]T`
-};
-
-fn scanModuleGlobals(
-    gpa: Allocator,
-    pool: *Pool,
-    sf: *const SourceFile,
-    toks: []const Tok,
-    out: *StringStringMap,
-) !void {
-    _ = gpa;
-    // Walk tokens at the file's top-level (brace_depth 0, paren_depth 0)
-    // looking for `pub? (var|const) <ident>: <type> ...`. The `: type`
-    // distinguishes typed globals from `const X = 42` style value decls
-    // (no type annotation) where inferring the type needs real
-    // type-checking — out of scope for v3. Missing an un-annotated
-    // global is fine; the lock-ordering analyzer just skips receivers
-    // it can't resolve.
-    var brace_depth: i32 = 0;
-    var paren_depth: i32 = 0;
-    var i: usize = 0;
-    while (i < toks.len) : (i += 1) {
-        const t = toks[i];
-        switch (t.tag) {
-            .l_brace => brace_depth += 1,
-            .r_brace => brace_depth -= 1,
-            .l_paren => paren_depth += 1,
-            .r_paren => paren_depth -= 1,
-            else => {},
-        }
-        if (brace_depth != 0 or paren_depth != 0) continue;
-        if (t.tag != .keyword_var and t.tag != .keyword_const) continue;
-        if (i + 3 >= toks.len) continue;
-        if (toks[i + 1].tag != .identifier) continue;
-        if (toks[i + 2].tag != .colon) continue;
-        const name = tokSlice(sf, toks[i + 1]);
-        // Collect the type expression from after `:` until the next
-        // top-level `=` or `;`.
-        const type_start_idx = i + 3;
-        var j: usize = type_start_idx;
-        var inner_paren: i32 = 0;
-        var inner_bracket: i32 = 0;
-        while (j < toks.len) : (j += 1) {
-            switch (toks[j].tag) {
-                .l_paren => inner_paren += 1,
-                .r_paren => inner_paren -= 1,
-                .l_bracket => inner_bracket += 1,
-                .r_bracket => inner_bracket -= 1,
-                else => {},
-            }
-            if (inner_paren == 0 and inner_bracket == 0) {
-                if (toks[j].tag == .equal or toks[j].tag == .semicolon) break;
-            }
-        }
-        if (j <= type_start_idx) continue;
-        const type_start_byte = toks[type_start_idx].start;
-        const type_end_byte = toks[j].start;
-        const type_text = trimAscii(sf.source[type_start_byte..type_end_byte]);
-        if (type_text.len == 0) continue;
-        // Strip leading `[N]` / `[_]` for array globals — element type
-        // is what matters when callers do `&global[idx]`.
-        var te = type_text;
-        if (te.len > 0 and te[0] == '[') {
-            if (mem.indexOfScalar(u8, te, ']')) |close| {
-                te = trimAscii(te[close + 1 ..]);
-            }
-        }
-        const bare = typeNameFromFieldType(te);
-        if (bare.len == 0) continue;
-        // Skip primitive / stdlib types — they don't own lock fields.
-        if (mem.eql(u8, bare, "bool") or
-            mem.eql(u8, bare, "u8") or mem.eql(u8, bare, "u16") or
-            mem.eql(u8, bare, "u32") or mem.eql(u8, bare, "u64") or
-            mem.eql(u8, bare, "usize") or
-            mem.eql(u8, bare, "i8") or mem.eql(u8, bare, "i16") or
-            mem.eql(u8, bare, "i32") or mem.eql(u8, bare, "i64") or
-            mem.eql(u8, bare, "isize") or
-            mem.startsWith(u8, bare, "std")) continue;
-        const name_i = try pool.intern(name);
-        const bare_i = try pool.intern(bare);
-        try out.put(name_i, bare_i);
-        i = j;
-    }
-}
 
 // Walks a file's tokens finding lines where a struct field appears at
 // brace-depth >= 1 and paren-depth == 0. For each such line, we emit
@@ -1674,25 +1570,6 @@ const ParamEvent = struct {
     param_idx: usize,
     order: u32, // relative order within the callee body
     tail: []const u8 = "",
-    // Mirrors Event.group_id — preserved through summary/fold so an
-    // ordered-pair helper call inside a helper function still
-    // suppresses the same-type self-loop when its caller replays the
-    // summary. group_id values are unique within one walk (callee's
-    // walk produces them), so folding into a caller where the caller
-    // has its own ordered_group_counter can't collide — we remap by
-    // adding a caller-side offset at fold time. For v1 we just preserve
-    // the callee's value; collisions across callees are rare enough
-    // that they'd appear as an accidental suppression, not a cycle
-    // false-positive — and the SCC still fires if any other site also
-    // establishes the same edge.
-    group_id: u32 = 0,
-    // Mirrors Event.lock_class. Required for plain SpinLock / non-
-    // gen-lock classifications to survive summary → fold: the callee
-    // resolves `<recv>.<field>.lock()` to a class like "Vmm.lock" and
-    // stamps that on the lock event; without preserving it through the
-    // summary the caller would fall back to `<slab_type>._gen_lock`
-    // synthesis and mis-classify the edge.
-    lock_class: []const u8 = "",
 };
 
 const Summary = struct {
@@ -1717,9 +1594,6 @@ const Ctx = struct {
     slab_types: *const SlabTypeMap,
     fn_index: *FnIndex,
     summaries: *SummaryMap,
-    lock_fields: *const LockFieldMap,
-    module_globals: *const StringStringMap,
-    field_types: *const StructFieldTypeMap,
 
     fn fileTokens(self: *const Ctx, sf: *const SourceFile) []const Tok {
         for (self.files, self.tokens_per_file) |f, toks| {
@@ -2164,6 +2038,11 @@ const EmitCtx = struct {
     seq: *u32,
     param_set: *const SliceSet,
     emit_param_only: bool,
+    // Optional sink for exit events. nullable because summary-builds
+    // don't have a meaningful path-check use for them (callers fold
+    // per-param events in linear order without re-establishing the
+    // callee's branch structure).
+    exits: ?*ExitEventList = null,
 };
 
 fn emitEvent(
@@ -2175,33 +2054,6 @@ fn emitEvent(
     tail: []const u8,
     slab_type: []const u8,
 ) !void {
-    return emitEventG(gpa, ec, ident, kind, src_line, tail, slab_type, 0);
-}
-
-fn emitEventG(
-    gpa: Allocator,
-    ec: *EmitCtx,
-    ident: []const u8,
-    kind: EventKind,
-    src_line: u32,
-    tail: []const u8,
-    slab_type: []const u8,
-    group_id: u32,
-) !void {
-    return emitEventGC(gpa, ec, ident, kind, src_line, tail, slab_type, group_id, "");
-}
-
-fn emitEventGC(
-    gpa: Allocator,
-    ec: *EmitCtx,
-    ident: []const u8,
-    kind: EventKind,
-    src_line: u32,
-    tail: []const u8,
-    slab_type: []const u8,
-    group_id: u32,
-    lock_class: []const u8,
-) !void {
     if (ec.emit_param_only and !ec.param_set.contains(ident)) return;
     const gop = try ec.events.getOrPut(ident);
     if (!gop.found_existing) gop.value_ptr.* = EventList.empty;
@@ -2212,8 +2064,6 @@ fn emitEventGC(
         .seq = ec.seq.*,
         .tail = tail,
         .slab_type = slab_type,
-        .group_id = group_id,
-        .lock_class = lock_class,
     });
 }
 
@@ -2329,8 +2179,6 @@ fn getOrBuildSummary(
                 .param_idx = pi,
                 .order = ev.seq,
                 .tail = tail_i,
-                .group_id = ev.group_id,
-                .lock_class = ev.lock_class,
             });
         }
     }
@@ -2377,7 +2225,7 @@ fn foldSummary(
             .lock_with_gen => .lock_with_gen,
         };
         const slab_ty = env.map.get(arg) orelse "";
-        try emitEventGC(ctx.gpa, ec, arg, kind, src_line, pe.tail, slab_ty, pe.group_id, pe.lock_class);
+        try emitEvent(ctx.gpa, ec, arg, kind, src_line, pe.tail, slab_ty);
     }
 }
 
@@ -2418,13 +2266,6 @@ fn walkBody(
     var pending_defers = ArrayList(Pending).empty;
     defer pending_defers.deinit(gpa);
     var brace_depth: i32 = 0;
-
-    // Monotonic group counter for ordered-pair helper calls within this
-    // body walk. Each call to `lockPair(a, b)` gets a unique non-zero
-    // group_id that's stamped into every lock event it emits; the cycle
-    // detector uses matching group_ids to suppress the same-type pair
-    // between the helper's argument locks.
-    var ordered_group_counter: u32 = 0;
 
     for (body_lines, 0..) |line, rel| {
         const src_line: u32 = body_start_line + @as(u32, @intCast(rel));
@@ -2673,33 +2514,6 @@ fn walkBody(
                     const bare_i = try ctx.pool.intern(bare);
                     try env.all_types.put(dp.name, bare_i);
                 }
-            } else {
-                // No annotation — try to resolve via module-global lookup
-                // of the RHS. Patterns we handle:
-                //   `&<name>`, `&<name>[...]`, `<name>`, `<name>[...]`
-                // each produces a local of (element) type <name>'s
-                // declared bare type. Covers scheduler-style per-core
-                // state slots and similar module-backed data.
-                const rhs_plain = stripPostfix(dp.rhs);
-                var start: usize = 0;
-                if (rhs_plain.len > 0 and rhs_plain[0] == '&') start = 1;
-                while (start < rhs_plain.len and ascii.isWhitespace(rhs_plain[start])) start += 1;
-                var end: usize = start;
-                while (end < rhs_plain.len and isIdentChar(rhs_plain[end])) end += 1;
-                if (end > start) {
-                    const lead = rhs_plain[start..end];
-                    // Accept if the only trailing content is `[...]` or
-                    // the string ends immediately — anything else (like
-                    // `.field`, `(`, `+`) means the RHS isn't a plain
-                    // global reference.
-                    const after = trimAscii(rhs_plain[end..]);
-                    const plain_ok = after.len == 0 or after[0] == '[';
-                    if (plain_ok) {
-                        if (ctx.module_globals.get(lead)) |mty| {
-                            try env.all_types.put(dp.name, mty);
-                        }
-                    }
-                }
             }
 
             if (!became_self_alive) {
@@ -2877,266 +2691,6 @@ fn walkBody(
             }
         }
 
-        // Generic lock-field scan: `<chain>.lock()` / `.unlock()` on a
-        // plain SpinLock (or any LOCK_TYPE_NAMES member) field. The
-        // receiver's owner type must resolve via env.all_types for the
-        // call to classify — unclassifiable calls are left alone (they
-        // won't contribute to the lock-order graph). Classification
-        // produces a class name like `"Vmm.lock"`, `"Process.perm_lock"`.
-        //
-        // This block explicitly SKIPS any call that's already handled by
-        // the earlier SlabRef / _gen_lock blocks — those emit events
-        // with the slab_type alone and the pair extractor synthesizes
-        // `"<Slab>._gen_lock"` from it. Double-emitting would produce
-        // ghost pairs.
-        //
-        // Both `.lock(` and `.lockIrqSave(` acquire; `.unlock(` and
-        // `.unlockIrqRestore(` release. The IRQ variants live on
-        // SpinLock and are the usual form in scheduler / IRQ paths.
-        {
-            const LockForm = struct {
-                tag: []const u8,
-                is_lock: bool,
-            };
-            const forms = [_]LockForm{
-                .{ .tag = ".lock(", .is_lock = true },
-                .{ .tag = ".lockIrqSave(", .is_lock = true },
-                .{ .tag = ".unlock(", .is_lock = false },
-                .{ .tag = ".unlockIrqRestore(", .is_lock = false },
-            };
-            var pos: usize = 0;
-            while (pos < code.len) {
-                var hit: ?usize = null;
-                var op_is_lock = false;
-                var skip: usize = 0;
-                for (forms) |f| {
-                    const fp = mem.indexOf(u8, code[pos..], f.tag) orelse continue;
-                    const abs = pos + fp;
-                    if (hit == null or abs < hit.?) {
-                        hit = abs;
-                        op_is_lock = f.is_lock;
-                        skip = f.tag.len;
-                    }
-                }
-                if (hit == null) break;
-                const at = hit.?;
-                // Walk back to extract the receiver chain (`a.b.c`).
-                // Stop at the first non-chain char (whitespace, paren,
-                // comma, operator, etc.).
-                var sidx: usize = at;
-                while (sidx > 0) {
-                    const c = code[sidx - 1];
-                    if (isIdentChar(c) or c == '.') {
-                        sidx -= 1;
-                    } else break;
-                }
-                if (sidx == at) {
-                    pos = at + skip;
-                    continue;
-                }
-                const full_chain = code[sidx..at]; // e.g. "self.lock"
-                // Split into (receiver, lock_field) at the LAST `.`.
-                const last_dot = mem.lastIndexOfScalar(u8, full_chain, '.') orelse {
-                    // Bare `foo.lock()` with no chain — can't classify
-                    // without knowing foo's type. Skip.
-                    pos = at + skip;
-                    continue;
-                };
-                const recv_chain = full_chain[0..last_dot];
-                const field_name = full_chain[last_dot + 1 ..];
-                // _gen_lock is handled by the slab block above; skip.
-                if (mem.eql(u8, field_name, "_gen_lock")) {
-                    pos = at + skip;
-                    continue;
-                }
-                // Resolve receiver's type. Walk segments left-to-right:
-                //   first segment: env.all_types (locals/params) or
-                //                  module_globals (file-scope vars);
-                //   each subsequent segment: field_types lookup on the
-                //                  current type.
-                // Segments may include `[...]` suffixes which we strip.
-                var recv_type: []const u8 = "";
-                {
-                    // Split recv_chain on '.' ignoring content inside `[]`.
-                    const SegParser = struct {
-                        fn next(s: []const u8, start: *usize) ?[]const u8 {
-                            if (start.* >= s.len) return null;
-                            var i: usize = start.*;
-                            var depth: i32 = 0;
-                            while (i < s.len) : (i += 1) {
-                                switch (s[i]) {
-                                    '[' => depth += 1,
-                                    ']' => depth -= 1,
-                                    '.' => if (depth == 0) {
-                                        const seg = s[start.*..i];
-                                        start.* = i + 1;
-                                        return seg;
-                                    },
-                                    else => {},
-                                }
-                            }
-                            const seg = s[start.*..];
-                            start.* = s.len;
-                            return seg;
-                        }
-                        fn stripSubscript(s: []const u8) []const u8 {
-                            if (mem.indexOfScalar(u8, s, '[')) |b| return s[0..b];
-                            return s;
-                        }
-                    };
-                    var scur: usize = 0;
-                    const first_raw = SegParser.next(recv_chain, &scur) orelse "";
-                    const first = SegParser.stripSubscript(first_raw);
-                    if (first.len > 0) {
-                        if (env.all_types.get(first)) |ty| {
-                            recv_type = ty;
-                        } else if (ctx.module_globals.get(first)) |ty| {
-                            recv_type = ty;
-                        }
-                    }
-                    while (recv_type.len > 0) {
-                        const seg_raw = SegParser.next(recv_chain, &scur) orelse break;
-                        const seg = SegParser.stripSubscript(seg_raw);
-                        if (seg.len == 0) {
-                            recv_type = "";
-                            break;
-                        }
-                        if (ctx.field_types.get(.{ .owner = recv_type, .field = seg })) |nt| {
-                            recv_type = nt;
-                        } else {
-                            recv_type = "";
-                            break;
-                        }
-                    }
-                }
-                if (recv_type.len == 0) {
-                    pos = at + skip;
-                    continue;
-                }
-                // Lookup (recv_type, field_name) in LockFieldMap.
-                const class_opt = ctx.lock_fields.get(.{ .owner = recv_type, .field = field_name });
-                if (class_opt == null) {
-                    pos = at + skip;
-                    continue;
-                }
-                // Skip if this ident is already being tracked via the
-                // slab block (its events are emitted above with a
-                // slab_type; the pair extractor will synthesize a class).
-                // In practice, slab-tracked idents use `_gen_lock` (already
-                // filtered) or SlabRef `.lock()` (which resolves on a fat
-                // ident where env.fat.contains). We can't easily detect
-                // overlap from here; rely on the `_gen_lock` skip + the
-                // fact that plain lock-field names (e.g. "rq_lock",
-                // "perm_lock", "lock") won't collide with the SlabRef form
-                // because SlabRef.lock() is a *method* call with an empty
-                // last segment, not a `<x>.lock` field access followed by
-                // `.lock()`.
-                const class = class_opt.?;
-                const recv_ident_i = try ctx.pool.intern(recv_chain);
-                const is_defer_plain = blk: {
-                    // `defer <chain>.lock()` / `defer <chain>.unlock()`:
-                    // detect a `defer ` token appearing before the
-                    // callsite on this line.
-                    if (mem.indexOf(u8, code[0..at], "defer ")) |_| break :blk !op_is_lock;
-                    break :blk false;
-                };
-                const kind: EventKind = if (op_is_lock)
-                    .lock
-                else if (is_defer_plain)
-                    .defer_unlock
-                else
-                    .unlock;
-                try emitEventGC(
-                    gpa,
-                    ec,
-                    recv_ident_i,
-                    kind,
-                    src_line,
-                    "",
-                    recv_type,
-                    0,
-                    class,
-                );
-                if (is_defer_plain) {
-                    try pending_defers.append(gpa, .{
-                        .ident = recv_ident_i,
-                        .fire_at_depth = brace_depth,
-                    });
-                }
-                pos = at + skip;
-            }
-        }
-
-        // Ordered-pair helper scan: `lockPair(a, b, ...)` /
-        // `unlockPair(a, b, ...)`. Each match emits a lock/unlock event
-        // for every fat-ref arg that's tracked in env, all sharing a
-        // fresh group_id so the cycle detector can tell they came from
-        // one atomic ordered acquisition.
-        {
-            const Scan = struct {
-                names: []const []const u8,
-                kind_lock: bool,
-            };
-            const scans = [_]Scan{
-                .{ .names = &ORDERED_PAIR_LOCK_HELPERS, .kind_lock = true },
-                .{ .names = &ORDERED_PAIR_UNLOCK_HELPERS, .kind_lock = false },
-            };
-            for (scans) |scan| {
-                for (scan.names) |helper| {
-                    var sp: usize = 0;
-                    while (sp < code.len) {
-                        const idx_opt = mem.indexOf(u8, code[sp..], helper);
-                        if (idx_opt == null) break;
-                        const idx = sp + idx_opt.?;
-                        // Start-of-ident boundary.
-                        if (idx > 0 and isIdentChar(code[idx - 1])) {
-                            sp = idx + helper.len;
-                            continue;
-                        }
-                        const after = idx + helper.len;
-                        if (after >= code.len or code[after] != '(') {
-                            sp = after;
-                            continue;
-                        }
-                        var caller_args = ArrayList(?[]const u8).empty;
-                        defer caller_args.deinit(gpa);
-                        try parseCallArgs(gpa, ctx.pool, code, after, &caller_args);
-                        ordered_group_counter += 1;
-                        const gid = ordered_group_counter;
-                        const is_defer = scan.kind_lock == false and isOrderedDefer(code, idx);
-                        for (caller_args.items) |ai_opt| {
-                            const ai = ai_opt orelse continue;
-                            if (!env.map.contains(ai)) continue;
-                            if (!env.fat.contains(ai)) continue;
-                            const ident_i = try ctx.pool.intern(ai);
-                            const kind: EventKind = if (scan.kind_lock)
-                                .lock
-                            else if (is_defer)
-                                .defer_unlock
-                            else
-                                .unlock;
-                            try emitEventG(
-                                gpa,
-                                ec,
-                                ident_i,
-                                kind,
-                                src_line,
-                                "",
-                                env.map.get(ident_i) orelse "",
-                                gid,
-                            );
-                            if (is_defer) {
-                                try pending_defers.append(gpa, .{
-                                    .ident = ident_i,
-                                    .fire_at_depth = brace_depth,
-                                });
-                            }
-                        }
-                        sp = after;
-                    }
-                }
-            }
-        }
 
         // Access + call-site scanning.
         const atomic_spans = try atomicCallSpans(gpa, code);
@@ -3525,9 +3079,6 @@ fn analyzeEntry(
     slab_types: *const SlabTypeMap,
     fn_index: *FnIndex,
     summaries: *SummaryMap,
-    lock_fields: *const LockFieldMap,
-    module_globals: *const StringStringMap,
-    field_types: *const StructFieldTypeMap,
     entry: *const EntryPoint,
     out_env: *SlabEnv,
     out_events: *EventMap,
@@ -3591,9 +3142,6 @@ fn analyzeEntry(
         .slab_types = slab_types,
         .fn_index = fn_index,
         .summaries = summaries,
-        .lock_fields = lock_fields,
-        .module_globals = module_globals,
-        .field_types = field_types,
     };
 
     var seq: u32 = 0;
@@ -3790,391 +3338,6 @@ fn bracketCheck(gpa: Allocator, res: *CheckResult) !void {
     }
 }
 
-// -----------------------------------------------------------------
-// Lock-field registry — maps (struct_name, field_name) → lock class
-// for every field whose declared type is one of LOCK_TYPE_NAMES.
-// -----------------------------------------------------------------
-
-const LockFieldKey = struct { owner: []const u8, field: []const u8 };
-const LockFieldCtx = struct {
-    pub fn hash(_: @This(), k: LockFieldKey) u64 {
-        var h = std.hash.Wyhash.init(0);
-        h.update(k.owner);
-        h.update("|");
-        h.update(k.field);
-        return h.final();
-    }
-    pub fn eql(_: @This(), a: LockFieldKey, b: LockFieldKey) bool {
-        return mem.eql(u8, a.owner, b.owner) and mem.eql(u8, a.field, b.field);
-    }
-};
-// Value is the lock CLASS name (interned): e.g. "Vmm.lock",
-// "Process.perm_lock". Stable across a run.
-const LockFieldMap = std.HashMap(
-    LockFieldKey,
-    []const u8,
-    LockFieldCtx,
-    std.hash_map.default_max_load_percentage,
-);
-
-fn typeNameFromFieldType(ft: []const u8) []const u8 {
-    // Strip trailing `= .{...}`, `,`, surrounding whitespace, pointer
-    // prefixes (`*`, `?`, `*const`) to bottom out at the bare type
-    // name. We only care about matching against LOCK_TYPE_NAMES.
-    var t = trimAscii(ft);
-    if (t.len == 0) return t;
-    if (t[0] == '?') t = trimAscii(t[1..]);
-    if (t.len == 0) return t;
-    if (t[0] == '*') t = trimAscii(t[1..]);
-    if (mem.startsWith(u8, t, "const ")) t = trimAscii(t["const ".len..]);
-    // Take leading identifier.
-    var e: usize = 0;
-    while (e < t.len and isIdentChar(t[e])) e += 1;
-    return t[0..e];
-}
-
-// Generic struct-field-type map: (owner, field) → bare type name. Used
-// by the lock-ordering analyzer to walk multi-segment receiver chains
-// like `a.b.c.lock()` segment-by-segment: start from `a`'s type,
-// look up `b` in that type's fields to get `b`'s type, repeat. Covers
-// every struct field — not just lock-typed ones — so the chain walk
-// can traverse through intermediate non-lock fields.
-const StructFieldTypeMap = std.HashMap(
-    LockFieldKey,
-    []const u8,
-    LockFieldCtx,
-    std.hash_map.default_max_load_percentage,
-);
-
-fn buildStructFieldTypeMap(
-    pool: *Pool,
-    struct_fields: []const StructField,
-    out: *StructFieldTypeMap,
-) !void {
-    for (struct_fields) |f| {
-        const bare = typeNameFromFieldType(f.field_type);
-        if (bare.len == 0) continue;
-        const owner_i = try pool.intern(f.struct_name);
-        const field_i = try pool.intern(f.field_name);
-        const ty_i = try pool.intern(bare);
-        // Last-wins for same (owner, field) — struct fields don't
-        // typically duplicate in practice.
-        try out.put(.{ .owner = owner_i, .field = field_i }, ty_i);
-    }
-}
-
-fn buildLockFieldMap(
-    gpa: Allocator,
-    pool: *Pool,
-    struct_fields: []const StructField,
-    out: *LockFieldMap,
-) !void {
-    _ = gpa;
-    for (struct_fields) |f| {
-        const bare = typeNameFromFieldType(f.field_type);
-        if (bare.len == 0) continue;
-        var is_lock = false;
-        for (LOCK_TYPE_NAMES) |lt| {
-            if (mem.eql(u8, bare, lt)) {
-                is_lock = true;
-                break;
-            }
-        }
-        if (!is_lock) continue;
-        const owner_i = try pool.intern(f.struct_name);
-        const field_i = try pool.intern(f.field_name);
-        var class_buf: [160]u8 = undefined;
-        const class_s = try std.fmt.bufPrint(&class_buf, "{s}.{s}", .{ owner_i, field_i });
-        const class_i = try pool.intern(class_s);
-        try out.put(.{ .owner = owner_i, .field = field_i }, class_i);
-    }
-}
-
-// -----------------------------------------------------------------
-// Lock-ordering analysis.
-// -----------------------------------------------------------------
-//
-// For each CheckResult (one entry-point walk) we already have a per-
-// ident event stream with lock/unlock/defer_unlock events that reflect
-// BOTH direct in-body lock ops and callee-effects folded in via
-// `foldSummary` at call sites. That stream, flattened and sorted by
-// seq (the global insertion counter the walker stamps on every event),
-// replays the function's observable lock-acquire behavior in source
-// order.
-//
-// Simulating a lock stack over the flattened stream yields every
-// ordered (outer → inner) pair the function introduces. Pairs emitted
-// by different entries all flow into a single global directed graph
-// whose nodes are lock CLASSES (interned strings like
-// "Process._gen_lock"). A cycle in this graph = a potential deadlock,
-// regardless of which specific instance each thread holds.
-//
-// Same-type self-edges are suppressed when both events belong to the
-// same non-zero `group_id` — that's our marker for an ordered-pair
-// helper call (`lockPair(a, b)`) which internally address-orders its
-// acquires.
-
-fn lockClassFor(pool: *Pool, slab_type: []const u8) ![]const u8 {
-    var buf: [128]u8 = undefined;
-    const printed = try std.fmt.bufPrint(&buf, "{s}._gen_lock", .{slab_type});
-    return pool.intern(printed);
-}
-
-fn flattenEventsBySeq(
-    gpa: Allocator,
-    events: *const EventMap,
-    out: *ArrayList(FlatEvent),
-) !void {
-    var it = events.iterator();
-    while (it.next()) |kv| {
-        const ident = kv.key_ptr.*;
-        for (kv.value_ptr.items) |ev| {
-            try out.append(gpa, .{ .ident = ident, .ev = ev });
-        }
-    }
-    std.sort.heap(FlatEvent, out.items, {}, lessFlatEvent);
-}
-
-const FlatEvent = struct {
-    ident: []const u8,
-    ev: Event,
-};
-
-fn lessFlatEvent(_: void, a: FlatEvent, b: FlatEvent) bool {
-    return a.ev.seq < b.ev.seq;
-}
-
-const HeldLock = struct {
-    ident: []const u8,
-    class: []const u8,
-    group_id: u32,
-    seq: u32,
-};
-
-fn collectLockPairsFromResult(
-    gpa: Allocator,
-    pool: *Pool,
-    res: *const CheckResult,
-    out: *ArrayList(LockPair),
-) !void {
-    var flat = ArrayList(FlatEvent).empty;
-    defer flat.deinit(gpa);
-    try flattenEventsBySeq(gpa, &res.events, &flat);
-
-    var held = ArrayList(HeldLock).empty;
-    defer held.deinit(gpa);
-
-    for (flat.items) |f| {
-        switch (f.ev.kind) {
-            .lock, .lock_with_gen => {
-                const new_class = if (f.ev.lock_class.len > 0)
-                    f.ev.lock_class
-                else blk: {
-                    if (f.ev.slab_type.len == 0) break :blk @as([]const u8, "");
-                    break :blk try lockClassFor(pool, f.ev.slab_type);
-                };
-                if (new_class.len == 0) continue;
-                for (held.items) |h| {
-                    // Ordered-pair suppression: same class + same non-zero
-                    // group = helper-enforced address-ordered acquire, not
-                    // a cycle edge.
-                    const same_class = mem.eql(u8, h.class, new_class);
-                    const same_group = h.group_id != 0 and h.group_id == f.ev.group_id;
-                    if (same_class and same_group) continue;
-                    try out.append(gpa, .{
-                        .outer = h.class,
-                        .inner = new_class,
-                        .file_rel = res.entry.file_rel,
-                        .line = f.ev.src_line,
-                        .entry_name = res.entry.name,
-                        .outer_ident = h.ident,
-                        .inner_ident = f.ident,
-                    });
-                }
-                try held.append(gpa, .{
-                    .ident = f.ident,
-                    .class = new_class,
-                    .group_id = f.ev.group_id,
-                    .seq = f.ev.seq,
-                });
-            },
-            .unlock => {
-                // Only plain `.unlock` actually releases the held slot —
-                // `.defer_unlock` is a marker at the `defer <ident>.unlock()`
-                // source line; the real release is a synthesized `.unlock`
-                // event the walker fires when the pending defer pops at
-                // scope exit. Popping on `.defer_unlock` too would release
-                // the held lock right at the defer line, which is wrong:
-                // callees that take further locks AFTER `defer ref.unlock()`
-                // would appear to be running with `ref` already released,
-                // and the resulting lock-pair graph would miss the real
-                // nested acquires.
-                var i: isize = @as(isize, @intCast(held.items.len)) - 1;
-                while (i >= 0) : (i -= 1) {
-                    if (mem.eql(u8, held.items[@intCast(i)].ident, f.ident)) {
-                        _ = held.orderedRemove(@intCast(i));
-                        break;
-                    }
-                }
-            },
-            .defer_unlock => {},
-            else => {},
-        }
-    }
-}
-
-// -----------------------------------------------------------------
-// Cycle detection via Tarjan's SCC.
-// -----------------------------------------------------------------
-
-const AdjList = ArrayList([]const u8);
-const AdjMap = StringHashMap(AdjList);
-
-fn buildGraph(
-    gpa: Allocator,
-    pairs: []const LockPair,
-    adj: *AdjMap,
-    nodes: *ArrayList([]const u8),
-) !void {
-    var seen_node = StringHashMap(void).init(gpa);
-    defer seen_node.deinit();
-    for (pairs) |p| {
-        if (!seen_node.contains(p.outer)) {
-            try seen_node.put(p.outer, {});
-            try nodes.append(gpa, p.outer);
-        }
-        if (!seen_node.contains(p.inner)) {
-            try seen_node.put(p.inner, {});
-            try nodes.append(gpa, p.inner);
-        }
-        const gop = try adj.getOrPut(p.outer);
-        if (!gop.found_existing) gop.value_ptr.* = AdjList.empty;
-        // Dedup successor entries.
-        var already = false;
-        for (gop.value_ptr.items) |e| {
-            if (mem.eql(u8, e, p.inner)) {
-                already = true;
-                break;
-            }
-        }
-        if (!already) try gop.value_ptr.append(gpa, p.inner);
-    }
-    // Ensure every node appears as a key even if it has no outgoing edges
-    // (Tarjan's iterates keys; isolated nodes are fine).
-    for (nodes.items) |n| {
-        const gop = try adj.getOrPut(n);
-        if (!gop.found_existing) gop.value_ptr.* = AdjList.empty;
-    }
-}
-
-const TarjanCtx = struct {
-    gpa: Allocator,
-    adj: *AdjMap,
-    index_map: StringHashMap(u32),
-    lowlink: StringHashMap(u32),
-    on_stack: StringHashMap(void),
-    stack: ArrayList([]const u8),
-    next_index: u32,
-    sccs: ArrayList([][]const u8),
-};
-
-fn tarjanStrongconnect(t: *TarjanCtx, v: []const u8) WalkError!void {
-    try t.index_map.put(v, t.next_index);
-    try t.lowlink.put(v, t.next_index);
-    t.next_index += 1;
-    try t.stack.append(t.gpa, v);
-    try t.on_stack.put(v, {});
-
-    const edges = t.adj.getPtr(v) orelse unreachable;
-    for (edges.items) |w| {
-        if (!t.index_map.contains(w)) {
-            try tarjanStrongconnect(t, w);
-            const wll = t.lowlink.get(w).?;
-            const vll = t.lowlink.get(v).?;
-            if (wll < vll) try t.lowlink.put(v, wll);
-        } else if (t.on_stack.contains(w)) {
-            const widx = t.index_map.get(w).?;
-            const vll = t.lowlink.get(v).?;
-            if (widx < vll) try t.lowlink.put(v, widx);
-        }
-    }
-
-    const vll = t.lowlink.get(v).?;
-    const vidx = t.index_map.get(v).?;
-    if (vll == vidx) {
-        var scc = ArrayList([]const u8).empty;
-        errdefer scc.deinit(t.gpa);
-        while (true) {
-            const w = t.stack.pop().?;
-            _ = t.on_stack.remove(w);
-            try scc.append(t.gpa, w);
-            if (mem.eql(u8, w, v)) break;
-        }
-        try t.sccs.append(t.gpa, try scc.toOwnedSlice(t.gpa));
-    }
-}
-
-fn findLockCycles(
-    gpa: Allocator,
-    pairs: []const LockPair,
-    out_cycles: *ArrayList([][]const u8),
-) !void {
-    var adj = AdjMap.init(gpa);
-    defer {
-        var it = adj.valueIterator();
-        while (it.next()) |v| v.deinit(gpa);
-        adj.deinit();
-    }
-    var nodes = ArrayList([]const u8).empty;
-    defer nodes.deinit(gpa);
-    try buildGraph(gpa, pairs, &adj, &nodes);
-
-    var t = TarjanCtx{
-        .gpa = gpa,
-        .adj = &adj,
-        .index_map = StringHashMap(u32).init(gpa),
-        .lowlink = StringHashMap(u32).init(gpa),
-        .on_stack = StringHashMap(void).init(gpa),
-        .stack = ArrayList([]const u8).empty,
-        .next_index = 0,
-        .sccs = ArrayList([][]const u8).empty,
-    };
-    defer {
-        t.index_map.deinit();
-        t.lowlink.deinit();
-        t.on_stack.deinit();
-        t.stack.deinit(gpa);
-        // Note: we transfer ownership of SCC slices to out_cycles, so we
-        // don't deinit sccs here — but cycles that didn't make the cut
-        // (size-1 with no self-loop) must be freed.
-    }
-
-    for (nodes.items) |n| {
-        if (!t.index_map.contains(n)) try tarjanStrongconnect(&t, n);
-    }
-
-    // Keep non-trivial SCCs (size > 1) and singletons with a self-loop.
-    for (t.sccs.items) |scc| {
-        var keep = scc.len > 1;
-        if (!keep and scc.len == 1) {
-            const n = scc[0];
-            if (adj.getPtr(n)) |succ| {
-                for (succ.items) |w| {
-                    if (mem.eql(u8, w, n)) {
-                        keep = true;
-                        break;
-                    }
-                }
-            }
-        }
-        if (keep) {
-            try out_cycles.append(gpa, scc);
-        } else {
-            gpa.free(scc);
-        }
-    }
-    t.sccs.deinit(gpa);
-}
 
 // -----------------------------------------------------------------
 // Main
@@ -4185,7 +3348,6 @@ const Args = struct {
     verbose: bool = false,
     entry_filter: ?[]const u8 = null,
     list_slab_types: bool = false,
-    list_lock_pairs: bool = false,
     list_methods: bool = false,
     print_help: bool = false,
 };
@@ -4204,8 +3366,6 @@ fn parseArgs(gpa: Allocator) !Args {
             args.list_slab_types = true;
         } else if (mem.eql(u8, a, "--list-methods")) {
             args.list_methods = true;
-        } else if (mem.eql(u8, a, "--list-lock-pairs")) {
-            args.list_lock_pairs = true;
         } else if (mem.eql(u8, a, "--help") or mem.eql(u8, a, "-h")) {
             args.print_help = true;
         } else if (mem.eql(u8, a, "--entry")) {
@@ -4438,44 +3598,6 @@ pub fn main() !u8 {
     var pool = Pool.init(gpa);
     defer pool.deinit();
 
-    // Build lock-field registry now that pool exists: every struct
-    // field whose declared type is in LOCK_TYPE_NAMES maps to a class
-    // name of the form "<OwnerStruct>.<field>".
-    var lock_fields = LockFieldMap.init(gpa);
-    defer lock_fields.deinit();
-    try buildLockFieldMap(gpa, &pool, struct_fields.items, &lock_fields);
-
-    // Struct field type map (owner.field → bare type) used for walking
-    // multi-segment receiver chains like `a.b.c.lock()` when resolving
-    // the owner of `c`'s lock field.
-    var field_types = StructFieldTypeMap.init(gpa);
-    defer field_types.deinit();
-    try buildStructFieldTypeMap(&pool, struct_fields.items, &field_types);
-
-    // Module-level globals. Every `var/const NAME: TYPE` at file scope
-    // contributes a NAME → element type entry; walks resolve locals
-    // that reference these globals (e.g. `const state =
-    // &core_states[i];`) so downstream lock-field accesses through
-    // those locals classify correctly.
-    var module_globals = StringStringMap.init(gpa);
-    defer module_globals.deinit();
-    for (files.items, tokens.items) |sf, t| {
-        try scanModuleGlobals(gpa, &pool, sf, t, &module_globals);
-    }
-    if (args.list_lock_pairs) {
-        try w.print("\nModule globals ({d}):\n", .{module_globals.count()});
-        var mit = module_globals.iterator();
-        while (mit.next()) |kv| {
-            try w.print("  {s} : {s}\n", .{ kv.key_ptr.*, kv.value_ptr.* });
-        }
-        try w.print("\nLock fields ({d}):\n", .{lock_fields.count()});
-        var lit = lock_fields.iterator();
-        while (lit.next()) |kv| {
-            try w.print("  {s}.{s} → {s}\n", .{ kv.key_ptr.owner, kv.key_ptr.field, kv.value_ptr.* });
-        }
-        try w.writeAll("\n");
-    }
-
     var results = ArrayList(CheckResult).empty;
     defer {
         for (results.items) |*r| r.deinit(gpa);
@@ -4498,7 +3620,7 @@ pub fn main() !u8 {
     for (entries.items) |*entry| {
         var env = SlabEnv.init(gpa);
         var events = EventMap.init(gpa);
-        try analyzeEntry(gpa, &pool, files.items, tokens.items, &slab_types, &fn_index, &summaries, &lock_fields, &module_globals, &field_types, entry, &env, &events);
+        try analyzeEntry(gpa, &pool, files.items, tokens.items, &slab_types, &fn_index, &summaries, entry, &env, &events);
         var res = CheckResult{
             .entry = entry,
             .env = env,
@@ -4565,201 +3687,11 @@ pub fn main() !u8 {
     }
     total_errs += @intCast(ptr_bypasses.items.len);
 
-    // Lock-ordering analysis.
-    var all_pairs = ArrayList(LockPair).empty;
-    defer all_pairs.deinit(gpa);
-    for (results.items) |*res| {
-        try collectLockPairsFromResult(gpa, &pool, res, &all_pairs);
-    }
-
-    // Widened lock-pair coverage: walk every slab-type method in the
-    // fn_index as if it were an entry point, *for pair collection only*.
-    // Bracket-check findings from these walks are discarded — those are
-    // already covered by the summary-fold pipeline from the real
-    // entries. What this adds is lock events on NON-PARAM receivers
-    // (`self.perm_lock`, `proc.vm`, etc.) that summaries can't carry
-    // upward because ParamEvent only tracks effects on params.
-    {
-        var fit = fn_index.iterator();
-        while (fit.next()) |kv| {
-            const fi = kv.value_ptr.*;
-            const fn_name = kv.key_ptr.name;
-
-            // Skip if already a primary entry (exact name + file).
-            var is_primary = false;
-            for (entries.items) |pe| {
-                if (mem.eql(u8, pe.name, fn_name) and
-                    mem.eql(u8, pe.file_rel, fi.file_rel))
-                {
-                    is_primary = true;
-                    break;
-                }
-            }
-            if (is_primary) continue;
-
-            const synth = EntryPoint{
-                .name = fn_name,
-                .file_path = fi.file_path,
-                .file_rel = fi.file_rel,
-                .line = fi.line,
-                .body_start_line = fi.body_start_line,
-                .body_end_line = fi.body_end_line,
-            };
-            var env = SlabEnv.init(gpa);
-            var events = EventMap.init(gpa);
-            analyzeEntry(
-                gpa, &pool, files.items, tokens.items,
-                &slab_types, &fn_index, &summaries,
-                &lock_fields, &module_globals, &field_types,
-                &synth, &env, &events,
-            ) catch {
-                // Best-effort cleanup on error.
-                var eit = events.valueIterator();
-                while (eit.next()) |al| al.deinit(gpa);
-                events.deinit();
-                env.deinit();
-                continue;
-            };
-            var synth_res = CheckResult{
-                .entry = &synth,
-                .env = env,
-                .events = events,
-                .findings = ArrayList(Finding).empty,
-            };
-            collectLockPairsFromResult(gpa, &pool, &synth_res, &all_pairs) catch {};
-            // CheckResult.deinit frees env, events, and findings.
-            synth_res.deinit(gpa);
-        }
-    }
-    if (args.list_lock_pairs) {
-        try w.writeAll("\n");
-        try w.print("Lock-ordering pairs ({d}):\n", .{all_pairs.items.len});
-        for (all_pairs.items) |p| {
-            try w.print("  {s} → {s}  at {s}:{d}  in {s}()  [{s} held, {s} acquired]\n", .{
-                p.outer, p.inner, p.file_rel, p.line, p.entry_name,
-                p.outer_ident, p.inner_ident,
-            });
-        }
-    }
-
-    // Same-type overlap: two locks of the same class held at once
-    // without going through a blessed ordered-pair helper. This is the
-    // textbook two-instance deadlock — thread A holds instance1 and
-    // waits on instance2; thread B holds instance2 and waits on
-    // instance1. The fix is `lockPair(a, b)` (kernel/utils/sync.zig),
-    // which acquires in stable address order and breaks the cycle.
-    var same_type_overlaps = ArrayList(LockPair).empty;
-    defer same_type_overlaps.deinit(gpa);
-    for (all_pairs.items) |p| {
-        if (!mem.eql(u8, p.outer, p.inner)) continue;
-        // Dedup against earlier same-type overlaps on (file, line, class).
-        var dup = false;
-        for (same_type_overlaps.items) |q| {
-            if (mem.eql(u8, p.file_rel, q.file_rel) and p.line == q.line and
-                mem.eql(u8, p.outer, q.outer))
-            {
-                dup = true;
-                break;
-            }
-        }
-        if (dup) continue;
-        try same_type_overlaps.append(gpa, p);
-    }
-    if (same_type_overlaps.items.len > 0) {
-        try w.writeAll("\n");
-        try w.print("Same-type lock overlap ({d} sites — require lockPair/unlockPair):\n", .{same_type_overlaps.items.len});
-        for (same_type_overlaps.items) |p| {
-            try w.print(
-                "  [ERR ] {s} held while acquiring another {s}  at {s}:{d}  in {s}()\n" ++
-                "          [{s} held, {s} acquired]  → wrap via `zag.utils.sync.lockPair(&a, &b)`\n",
-                .{
-                    p.outer, p.outer, p.file_rel, p.line, p.entry_name,
-                    p.outer_ident, p.inner_ident,
-                },
-            );
-        }
-    }
-    total_errs += @intCast(same_type_overlaps.items.len);
-
-    var cycles = ArrayList([][]const u8).empty;
-    defer {
-        for (cycles.items) |scc| gpa.free(scc);
-        cycles.deinit(gpa);
-    }
-    try findLockCycles(gpa, all_pairs.items, &cycles);
-
-    if (cycles.items.len > 0) {
-        try w.writeAll("\n");
-        try w.print("Lock-ordering cycles ({d}):\n", .{cycles.items.len});
-        for (cycles.items, 0..) |scc, ci| {
-            try w.print("  Cycle {d} ({d} classes):", .{ ci + 1, scc.len });
-            // Node list — keep it compact.
-            for (scc, 0..) |c, i| {
-                if (i > 0) try w.writeAll(" ⇄ ");
-                try w.print(" {s}", .{c});
-            }
-            try w.writeAll("\n");
-            // Representative edges inside this SCC. Dedup by
-            // (outer, inner) so we don't spam identical entries
-            // discovered from multiple entry walks.
-            const EdgeKey = struct {
-                fn matches(a: LockPair, b: LockPair) bool {
-                    return mem.eql(u8, a.outer, b.outer) and
-                        mem.eql(u8, a.inner, b.inner) and
-                        mem.eql(u8, a.file_rel, b.file_rel) and
-                        a.line == b.line;
-                }
-            };
-            var shown: usize = 0;
-            for (all_pairs.items, 0..) |p, pi| {
-                var in_o = false;
-                var in_i = false;
-                for (scc) |c| {
-                    if (mem.eql(u8, c, p.outer)) in_o = true;
-                    if (mem.eql(u8, c, p.inner)) in_i = true;
-                }
-                if (!(in_o and in_i)) continue;
-                // Dedup against earlier items in this SCC's listing.
-                var dup = false;
-                for (all_pairs.items[0..pi]) |q| {
-                    var inq_o = false;
-                    var inq_i = false;
-                    for (scc) |c| {
-                        if (mem.eql(u8, c, q.outer)) inq_o = true;
-                        if (mem.eql(u8, c, q.inner)) inq_i = true;
-                    }
-                    if (!(inq_o and inq_i)) continue;
-                    if (EdgeKey.matches(p, q)) {
-                        dup = true;
-                        break;
-                    }
-                }
-                if (dup) continue;
-                try w.print(
-                    "    [ERR ] {s} → {s}  at {s}:{d}  in {s}()\n",
-                    .{ p.outer, p.inner, p.file_rel, p.line, p.entry_name },
-                );
-                shown += 1;
-                if (shown >= 8) {
-                    try w.writeAll("    ... (additional edges suppressed)\n");
-                    break;
-                }
-            }
-        }
-        try w.print(
-            "  Resolution: establish a stable acquire order across all sites, or\n" ++
-            "  wrap same-type nestings in `lockPair(a, b)` for address-ordered acquire.\n",
-            .{},
-        );
-    }
-    total_errs += @intCast(cycles.items.len);
-
     try w.writeAll("\n");
     try w.print("Summary: {d} entries, {d} tracked idents, {d} err, {d} info\n", .{ results.items.len, total_tracked, total_errs, total_infos });
     try w.print("         {d} slab-backed types discovered\n", .{slab_types.inner.count()});
     try w.print("         {d} bare-pointer fat-pointer violations\n", .{bare_ptr.items.len});
     try w.print("         {d} `.ptr` bypass sites\n", .{ptr_bypasses.items.len});
-    try w.print("         {d} lock-ordering pairs, {d} cycles\n", .{ all_pairs.items.len, cycles.items.len });
 
     try w.flush();
     if (total_errs > 0) return 1;

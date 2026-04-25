@@ -47,6 +47,10 @@ RESULTS_DIR=$(mktemp -d)
 # Build all test ELFs
 echo "Building test ELFs ($ARCH)..."
 cd "$SCRIPT_DIR"
+# Clean stale ELFs from previous runs (e.g. tests removed/renumbered).
+# zig build only writes ELFs for current sources; leftovers would be
+# picked up by the run loop below and fail.
+rm -f "$BIN_DIR"/s*.elf
 if [ -n "$BUILD_ARCH_FLAG" ]; then
     zig build $BUILD_ARCH_FLAG 2>/dev/null
 else

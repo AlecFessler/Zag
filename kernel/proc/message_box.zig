@@ -37,7 +37,7 @@ pub const MessageBox = struct {
     /// (null if the message came from `ipc_send`, which has nothing to
     /// reply to). For faults this is always the faulted thread.
     pending_thread: ?SlabRef(Thread) = null,
-    lock: SpinLock = .{},
+    lock: SpinLock = .{ .class = "MessageBox.lock" },
 
     pub const State = enum(u8) { idle, receiving, pending_reply };
 

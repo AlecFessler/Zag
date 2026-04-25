@@ -52,7 +52,7 @@ const LAST_VMID: u8 = 255;
 /// `vmid: u8` and `vmid_generation: u64` fields works. The real `Vm` lives
 /// in `arch/aarch64/kvm/vm.zig`; keeping the coupling nominal rather than
 /// by import avoids a circular dependency with the VM object layer.
-var lock: SpinLock = .{};
+var lock: SpinLock = .{ .class = "vmid.lock" };
 
 /// Monotonically increasing generation counter. Starts at 1 so that a
 /// freshly zeroed `Vm` (generation == 0) is always considered stale and

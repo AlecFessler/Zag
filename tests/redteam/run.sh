@@ -13,7 +13,17 @@ ZAG_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 SRC="$1"
 
 cd "$SCRIPT_DIR"
-zig build "-Dsrc=$SRC" 2>&1
+
+# PoCs that spawn a child use @embedFile("zig-out/bin/child"); the child
+# source is named in a `// CHILD: <name>.zig` directive at the top of the
+# PoC. Forward it to the build as -Dchild=<name>.zig so build.zig also
+# compiles the child ELF.
+CHILD=$(awk '/^\/\/ CHILD:/ { print $3; exit }' "$SRC")
+if [ -n "$CHILD" ]; then
+    zig build "-Dsrc=$SRC" "-Dchild=$CHILD" 2>&1
+else
+    zig build "-Dsrc=$SRC" 2>&1
+fi
 
 WORKDIR=$(mktemp -d)
 trap "rm -rf $WORKDIR" EXIT

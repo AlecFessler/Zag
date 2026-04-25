@@ -18,13 +18,13 @@ const BUCKET_COUNT = 256;
 const MAX_TIMED_WAITERS = 64;
 
 const Bucket = struct {
-    lock: SpinLock = .{},
+    lock: SpinLock = .{ .class = "Bucket.lock" },
     pq: ThreadPriorityQueue = .{},
 };
 
 var buckets: [BUCKET_COUNT]Bucket = [_]Bucket{.{}} ** BUCKET_COUNT;
 
-var timed_lock: SpinLock = .{};
+var timed_lock: SpinLock = .{ .class = "futex.timed_lock" };
 var timed_waiters: [MAX_TIMED_WAITERS]?*Thread = [_]?*Thread{null} ** MAX_TIMED_WAITERS;
 
 fn bucketIdx(paddr: PAddr) usize {
@@ -421,16 +421,38 @@ fn releaseBucketLocks(lock_state: *const BucketLockState) void {
 pub fn expireTimedWaiters() void {
     const now_ns = arch.time.getMonotonicClock().now();
 
-    const irq = timed_lock.lockIrqSave();
+    // Phase 1: snapshot expired threads + clear their slots, all under
+    // timed_lock. Capturing the deadline lets phase 2 detect a thread that
+    // was woken and re-registered as a fresh waiter between phases.
+    //
+    // The split is required by lock-order: wait() and wake() acquire
+    // bucket.lock then timed_lock; if we held timed_lock here while
+    // taking bucket.lock, that would form an AB-BA cycle.
+    const Snapshot = struct { thread: *Thread, deadline: u64 };
+    var expired: [MAX_TIMED_WAITERS]Snapshot = undefined;
+    var expired_count: usize = 0;
+    {
+        const irq = timed_lock.lockIrqSave();
+        defer timed_lock.unlockIrqRestore(irq);
+        for (&timed_waiters) |*slot| {
+            const thread = slot.* orelse continue;
+            if (thread.futex_deadline_ns == 0 or now_ns < thread.futex_deadline_ns) continue;
+            expired[expired_count] = .{ .thread = thread, .deadline = thread.futex_deadline_ns };
+            expired_count += 1;
+            slot.* = null;
+        }
+    }
 
-    for (&timed_waiters) |*slot| {
-        const thread = slot.* orelse continue;
-        if (thread.futex_deadline_ns == 0 or now_ns < thread.futex_deadline_ns) continue;
+    // Phase 2: per-thread, take only bucket.lock (never timed_lock).
+    for (expired[0..expired_count]) |entry| {
+        const thread = entry.thread;
+        // Re-check deadline. If wake() ran between phases, deadline is now
+        // 0; if the thread was woken and made a new wait, deadline differs.
+        // In both cases this snapshot is stale — skip.
+        if (thread.futex_deadline_ns != entry.deadline) continue;
 
-        // Remove from all futex buckets this thread is waiting on.
         var removed: bool = false;
         if (thread.futex_bucket_count > 0) {
-            // Multi-address wait: remove from all buckets
             for (thread.futex_paddrs[0..thread.futex_bucket_count]) |pa| {
                 const bucket = &buckets[bucketIdx(pa)];
                 const birq = bucket.lock.lockIrqSave();
@@ -454,8 +476,5 @@ pub fn expireTimedWaiters() void {
                 arch.smp.coreID();
             sched.enqueueOnCore(target, thread);
         }
-        slot.* = null;
     }
-
-    timed_lock.unlockIrqRestore(irq);
 }

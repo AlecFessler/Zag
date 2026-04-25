@@ -36,7 +36,7 @@ var bitmap: [words]u64 = blk: {
     break :blk init_bitmap;
 };
 var hint: usize = 0;
-var lock: SpinLock = .{};
+var lock: SpinLock = .{ .class = "asid.lock" };
 
 pub fn allocate() ?u16 {
     const irq_state = lock.lockIrqSave();
