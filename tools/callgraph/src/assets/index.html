@@ -431,6 +431,30 @@
       background: rgba(240, 192, 96, 0.18);
     }
 
+    /* Per-review-unit checkbox in the source pane gutter. Drawn at the
+       first line of each contiguous +/- run when compare is active.
+       Click toggles the unit's reviewed state, persisted in parent mode
+       to <git_root>/.callgraph/review/<sha_a>..<sha_b>.json. */
+    .source_gutter .unit_checkbox {
+      margin-right: 4px;
+      vertical-align: middle;
+      cursor: pointer;
+      width: 11px;
+      height: 11px;
+      accent-color: #6fd17a;
+    }
+    .source_line.unit_reviewed.added .source_code,
+    .source_line.unit_reviewed.added .source_gutter {
+      background-color: rgba(80, 180, 80, 0.06);
+    }
+    .source_line.unit_reviewed.removed .source_code,
+    .source_line.unit_reviewed.removed .source_gutter {
+      background-color: rgba(220, 80, 80, 0.06);
+    }
+    .source_line.unit_reviewed .source_gutter {
+      opacity: 0.65;
+    }
+
     .source_line.highlight .source_code,
     .source_line.highlight .source_gutter {
       background-color: rgba(255, 200, 0, 0.15);

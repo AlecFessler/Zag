@@ -994,6 +994,56 @@
       const tdNum = document.createElement("td");
       tdNum.className = "source_gutter";
       tdNum.textContent = String(absLine);
+      // Review checkbox: drawn at the FIRST line of every unit whose
+      // start matches absLine on this pane's side. Click toggles the
+      // unit's reviewed state (POSTs to /api/review_state in parent
+      // mode, in-memory otherwise). When the unit is reviewed, the
+      // line(s) get a `.unit_reviewed` class so CSS can desaturate
+      // the diff tint and signal "I've looked at this".
+      const sideTag = diffOpts && diffOpts.side ? diffOpts.side : null;
+      if (sideTag === "new" || sideTag === "old") {
+        const fileRel = sideTag === "new" ?
+          defLocToRepoRel(file) :
+          secondaryPathToRepoRel(file);
+        if (fileRel && compareState.unitsByFileSide) {
+          const sideKey = sideTag === "new" ? "added" : "removed";
+          const unitsHere = unitsStartingAt(fileRel, sideKey, absLine);
+          if (unitsHere.length > 0) {
+            const u = unitsHere[0];
+            const cb = document.createElement("input");
+            cb.type = "checkbox";
+            cb.className = "unit_checkbox";
+            cb.dataset.unitId = u.id;
+            const rec = compareState.reviewed.get(u.id);
+            cb.checked = !!(rec && rec.reviewed);
+            if (rec && rec.at) {
+              const when = rec.at;
+              const who = rec.by || "";
+              cb.title = "reviewed" + (who ? " by " + who : "") +
+                " at " + when;
+            } else {
+              cb.title = "mark this " + u.kind + " hunk reviewed";
+            }
+            cb.addEventListener("click", function (e) {
+              e.stopPropagation();
+              toggleUnitReviewed(u.id, cb.checked);
+            });
+            tdNum.insertBefore(cb, tdNum.firstChild);
+            if (cb.checked) {
+              tr.classList.add("unit_reviewed");
+              // Also fade the trailing lines of the unit. We add the
+              // class on subsequent rows during the loop below by
+              // tracking `pendingReviewedLines`.
+            }
+          }
+        }
+        // Mark interior lines of any unit currently being-reviewed.
+        if (sideTag === "new" || sideTag === "old") {
+          if (isLineInsideReviewedUnit(file, sideTag, absLine)) {
+            tr.classList.add("unit_reviewed");
+          }
+        }
+      }
 
       const tdCode = document.createElement("td");
       tdCode.className = "source_code";
@@ -1064,6 +1114,10 @@
     if (start < 1) start = 1;
     if (end < start) end = start;
 
+    // Remember the fetch params so the review-toggle path can replay
+    // the same render in-place (no entry change, no scroll loss).
+    lastFetchedSource = { file: file, line: highlightLine };
+
     const myToken = sourceFetchToken + 1;
     sourceFetchToken = myToken;
 
@@ -1113,6 +1167,11 @@
    *  payload to carry it (older API didn't), so callers can pass it
    *  explicitly via setLastFnName. */
   let lastClickedFnName = null;
+  /// File + highlight line of the last fetchSource call. Lets us
+  /// re-trigger the same render in-place when reviewed-state changes
+  /// (gutter checkboxes need to flip without losing scroll position
+  /// or panel state). Updated alongside lastClickedFnName.
+  let lastFetchedSource = { file: null, line: null };
   function setLastClickedFn(name) { lastClickedFnName = name || null; }
 
   function clearSecondarySource() {
@@ -1988,6 +2047,28 @@
     // Populated by recomputeDiffSets so the source pane can tint each
     // line as added/removed/unchanged. Empty when compare is off.
     hunksByFile: new Map(),
+    // Review unit catalog derived from hunksByFile in recomputeDiffSets.
+    // Each unit: { id, kind: "added"|"removed", file, new_start,
+    // new_count, old_start, old_count }. Stable IDs follow the schema
+    // <file>:<new_start>:<a|r> so they can be persisted across sessions
+    // (parent mode only; head mode is in-memory).
+    units: [],
+    // Map<unit_id, {file, kind, new_start, new_count, old_start,
+    // old_count}> for quick lookup by id.
+    unitById: new Map(),
+    // Per-(file, side) → [unit] lookup. Side is "added" (new side, primary
+    // pane) or "removed" (old side, secondary pane). Source rendering
+    // walks this to draw a checkbox at the start of each unit.
+    unitsByFileSide: new Map(),
+    // Map<unit_id, {reviewed, at, by}>. Loaded from /api/review_state in
+    // parent mode (and on POST responses). Head mode keeps it
+    // in-memory (toggles persist within the session only). Missing entry
+    // means "not reviewed yet" — equivalent to {reviewed: false}.
+    reviewed: new Map(),
+    // True when persistent review state is available (parent mode with
+    // both shas being full hex commits). When false, toggles still work
+    // but only in-memory.
+    canPersistReview: false,
   };
 
   function setCompareStatus(text, kind) {
@@ -2393,6 +2474,15 @@
     compareState.changedFnNames = changedFnNames;
     compareState.changedDefIds = changedDefIds;
 
+    // Derive review-unit catalog from hunks. Each hunk yields up to two
+    // units: one "removed" (when old_count > 0) and one "added" (when
+    // new_count > 0). IDs are stable so the persistence file can key
+    // by them across sessions in parent mode.
+    rebuildUnitsFromHunks();
+    // Fetch persisted review state (parent mode only) — fire and forget;
+    // checkboxes update when the response arrives.
+    fetchReviewStateIfPersistable();
+
     // Build simpleName → Definition map for source-pane ident highlight.
     // We index by simpleName (last dotted segment of qualified_name) so a
     // bare identifier in source like `Foo` matches the changed `<mod>.Foo`
@@ -2526,6 +2616,192 @@
       if (slash >= 0) return after.slice(slash + 1);
     }
     return defLocToRepoRel(file);
+  }
+
+  // ---------------------------------------------------------------- review
+  //
+  // Each contiguous +/- hunk run becomes a "unit of review". The user
+  // checks a unit off in the source pane gutter or in the third panel,
+  // and the state persists across sessions (parent mode only — both
+  // shas have to be immutable for IDs to be stable). The schema lives
+  // at <git_root>/.callgraph/review/<sha_a>..<sha_b>.json.
+
+  /** True when the current secondary commit is a full hex sha AND the
+   *  primary side has one too. The frontend only knows the secondary
+   *  sha; for parent mode the "primary" side IS the selected commit
+   *  and the secondary is its parent — both are commits, both stable.
+   *  For head mode the primary is the live working tree and there's
+   *  no stable sha for it, so we can't persist. */
+  function reviewPair() {
+    if (compareState.mode === "parent") {
+      const sel = compareState.selectedSha;
+      const parent = parentShaOf(sel);
+      if (sel && parent) return { sha_a: parent, sha_b: sel };
+    }
+    return null;
+  }
+
+  function rebuildUnitsFromHunks() {
+    compareState.units = [];
+    compareState.unitById = new Map();
+    compareState.unitsByFileSide = new Map();
+    if (!compareState.hunksByFile) return;
+    for (const [path, hunks] of compareState.hunksByFile.entries()) {
+      for (const h of hunks) {
+        if (h.old_count > 0) {
+          const u = {
+            id: path + ":" + h.start + ":r",
+            kind: "removed",
+            file: path,
+            new_start: h.start,
+            new_count: h.count,
+            old_start: h.old_start,
+            old_count: h.old_count,
+          };
+          compareState.units.push(u);
+          compareState.unitById.set(u.id, u);
+          pushIntoFileSide(path, "removed", u);
+        }
+        if (h.count > 0) {
+          const u = {
+            id: path + ":" + h.start + ":a",
+            kind: "added",
+            file: path,
+            new_start: h.start,
+            new_count: h.count,
+            old_start: h.old_start,
+            old_count: h.old_count,
+          };
+          compareState.units.push(u);
+          compareState.unitById.set(u.id, u);
+          pushIntoFileSide(path, "added", u);
+        }
+      }
+    }
+  }
+
+  function pushIntoFileSide(file, side, unit) {
+    const key = file + ":" + side;
+    if (!compareState.unitsByFileSide.has(key)) {
+      compareState.unitsByFileSide.set(key, []);
+    }
+    compareState.unitsByFileSide.get(key).push(unit);
+  }
+
+  /** Lookup units that start exactly at `line` on `side` of file. Used
+   *  by the source render to draw a checkbox at that line. Returns
+   *  empty array when no unit matches. */
+  function unitsStartingAt(file, side, line) {
+    const key = file + ":" + side;
+    const list = compareState.unitsByFileSide.get(key);
+    if (!list) return [];
+    return list.filter(function (u) {
+      const start = side === "added" ? u.new_start : u.old_start;
+      return start === line;
+    });
+  }
+
+  /** True when `line` (on `sideTag` "new"|"old" of `filePath`) is inside
+   *  any unit whose reviewed state is true. Used by the source render
+   *  to apply `.unit_reviewed` to interior lines of reviewed units, so
+   *  the entire diff hunk visibly fades, not just the first row. */
+  function isLineInsideReviewedUnit(filePath, sideTag, line) {
+    const fileRel = sideTag === "new"
+      ? defLocToRepoRel(filePath)
+      : secondaryPathToRepoRel(filePath);
+    if (!fileRel) return false;
+    const sideKey = sideTag === "new" ? "added" : "removed";
+    const list = compareState.unitsByFileSide.get(fileRel + ":" + sideKey);
+    if (!list) return false;
+    for (const u of list) {
+      const start = sideKey === "added" ? u.new_start : u.old_start;
+      const count = sideKey === "added" ? u.new_count : u.old_count;
+      if (count === 0) continue;
+      if (line < start || line >= start + count) continue;
+      const rec = compareState.reviewed.get(u.id);
+      if (rec && rec.reviewed) return true;
+    }
+    return false;
+  }
+
+  async function fetchReviewStateIfPersistable() {
+    const pair = reviewPair();
+    compareState.canPersistReview = pair != null;
+    if (!pair) {
+      // Head mode: keep an empty in-memory state. We DON'T clobber an
+      // existing in-session reviewed map — it's session-only by design.
+      return;
+    }
+    try {
+      const url = "/api/review_state?sha_a=" + encodeURIComponent(pair.sha_a) +
+        "&sha_b=" + encodeURIComponent(pair.sha_b);
+      const r = await fetch(url);
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const j = await r.json();
+      compareState.reviewed = new Map();
+      const units = (j && j.units) || {};
+      for (const id of Object.keys(units)) {
+        compareState.reviewed.set(id, units[id]);
+      }
+      // Refresh whichever surfaces care about reviewed state.
+      if (typeof rerenderSourceForReview === "function") rerenderSourceForReview();
+    } catch (err) {
+      console.error("/api/review_state GET failed", err);
+    }
+  }
+
+  /** Toggle a unit's reviewed state. Updates compareState.reviewed
+   *  immediately for snappy UI, then POSTs to the server (parent mode
+   *  only — head mode is in-memory). On success the server response
+   *  is the new authoritative state; we fold it back in. */
+  async function toggleUnitReviewed(unitId, reviewed) {
+    const prior = compareState.reviewed.get(unitId);
+    compareState.reviewed.set(unitId, {
+      reviewed: !!reviewed,
+      at: prior ? prior.at : "",
+      by: prior ? prior.by : "",
+    });
+    rerenderSourceForReview();
+
+    if (!compareState.canPersistReview) return;
+    const pair = reviewPair();
+    if (!pair) return;
+    try {
+      const url = "/api/review_state?sha_a=" + encodeURIComponent(pair.sha_a) +
+        "&sha_b=" + encodeURIComponent(pair.sha_b);
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          unit_id: unitId,
+          reviewed: !!reviewed,
+          by: "",
+        }),
+      });
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const j = await r.json();
+      const units = (j && j.units) || {};
+      compareState.reviewed = new Map();
+      for (const id of Object.keys(units)) {
+        compareState.reviewed.set(id, units[id]);
+      }
+      rerenderSourceForReview();
+    } catch (err) {
+      console.error("/api/review_state POST failed", err);
+      // Roll back the optimistic update.
+      if (prior) compareState.reviewed.set(unitId, prior);
+      else compareState.reviewed.delete(unitId);
+      rerenderSourceForReview();
+    }
+  }
+
+  /** Re-render the currently-displayed source so checkbox state in the
+   *  gutter reflects the latest reviewed map. Cheaper to refetch the
+   *  same source than to traverse and patch checkboxes in place. */
+  function rerenderSourceForReview() {
+    if (!els.infoSource || els.infoSource.children.length === 0) return;
+    if (!lastFetchedSource.file) return;
+    fetchSource(lastFetchedSource.file, 1, 10000000, lastFetchedSource.line || 1);
   }
 
   /** Push the updated isChangedFn predicate into traceMode and force a
