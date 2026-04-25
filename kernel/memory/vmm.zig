@@ -954,10 +954,8 @@ pub const VirtualMemoryManager = struct {
     }
 
     pub fn resetForRestart(self: *VirtualMemoryManager) void {
-        arch.boot.print("K: rfR enter count={d}\n", .{self.count});
         self.lock.lock(@src());
         defer self.lock.unlock();
-        arch.boot.print("K: rfR locked\n", .{});
 
         // Walk from the end so removals can't shift nodes we haven't
         // visited yet. `.free` victims get removed outright; `.decommit`
@@ -968,16 +966,12 @@ pub const VirtualMemoryManager = struct {
             const node_ref = self.nodes[i];
             // self-alive: under vmm.lock.
             const node = node_ref.ptr;
-            arch.boot.print("K: rfR i={d} kind={d} policy={d} start=0x{x} size=0x{x}\n", .{ i, @intFromEnum(node.kind), @intFromEnum(node.restart_policy), node.start.addr, node.size });
             switch (node.restart_policy) {
                 .free => {
                     const free_phys = node.kind == .private;
                     unmapNodePages(node_ref, self.addr_space_root, free_phys);
-                    arch.boot.print("K: rfR i={d} unmapped\n", .{i});
                     self.removeAtIdx(i);
-                    arch.boot.print("K: rfR i={d} removed\n", .{i});
                     freeVmNode(node_ref);
-                    arch.boot.print("K: rfR i={d} freed\n", .{i});
                 },
                 .decommit => {
                     unmapNodePages(node_ref, self.addr_space_root, true);
@@ -985,7 +979,6 @@ pub const VirtualMemoryManager = struct {
                 .preserve => {},
             }
         }
-        arch.boot.print("K: rfR exit\n", .{});
     }
 
     // ── Internal helpers (locked) ──────────────────────────────────────

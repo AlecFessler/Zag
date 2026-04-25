@@ -581,7 +581,6 @@ pub const Process = struct {
     /// links into the queue, and the saved register snapshot lives in
     /// `thread.ctx.regs` (already populated by the exception entry stub).
     pub fn faultBlock(self: *Process, thread: *Thread, reason: FaultReason, fault_addr: u64, rip: u64, user_ctx: ?*ArchCpuContext) bool {
-        arch.boot.print("K: faultBlock reason={d} addr=0x{x}\n", .{ @intFromEnum(reason), fault_addr });
         const resolved = self.faultHandlerOf() orelse return false;
 
         // Stamp the fault payload onto the thread itself.
@@ -1052,8 +1051,6 @@ pub const Process = struct {
         };
 
         self.restart_count +%= 1;
-        arch.boot.print("K: performRestart pid={d} count={d}\n", .{ self.pid, self.restart_count });
-        arch.boot.print("K: pR pre msg_box\n", .{});
 
         // Preserve IPC wait list across restart. If there's a pending caller
         // (message was delivered but not replied to), re-enqueue it at the
@@ -1077,10 +1074,8 @@ pub const Process = struct {
             _ = self.msg_box.takeReceiverLocked();
         }
         self.msg_box.lock.unlock();
-        arch.boot.print("K: pR pre vmm.reset\n", .{});
 
         self.vmm.resetForRestart();
-        arch.boot.print("K: pR post vmm.reset\n", .{});
 
         // Clean up thread handles from own perm table and handler's perm table
         if (self.fault_handler_proc) |handler_ref| {
@@ -1133,7 +1128,6 @@ pub const Process = struct {
         }
         while (self.fault_box.dequeueLocked()) |_| {}
         self.fault_box.lock.unlock();
-        arch.boot.print("K: pR post fault_box drain\n", .{});
 
         // Snapshot thread-entry refs under perm_lock WITHOUT taking each
         // thread's gen-lock: the `perm_lock → Thread._gen_lock` edge
@@ -1161,7 +1155,6 @@ pub const Process = struct {
         self.suspended_thread_slots = 0;
         self.syncUserView();
         self.perm_lock.unlock();
-        arch.boot.print("K: pR post perm_lock release snapshot_len={d}\n", .{snapshot_len});
 
         // Process the snapshot after releasing perm_lock. Take each
         // thread's gen-lock individually to read priority / affinity —
@@ -1175,7 +1168,6 @@ pub const Process = struct {
                 }
             } else |_| {}
         }
-        arch.boot.print("K: pR post snapshot loop\n", .{});
 
         self.updateParentView();
 
@@ -1241,10 +1233,8 @@ pub const Process = struct {
     }
 
     fn updateParentView(self: *Process) void {
-        arch.boot.print("K: updateParentView pid={d} ENTER parent={any}\n", .{ self.pid, self.parent != null });
         const parent_ref = self.parent orelse return;
         const parent = parent_ref.lock(@src()) catch {
-            arch.boot.print("K: updateParentView pid={d} parent_lock_FAILED\n", .{self.pid});
             return;
         };
         defer parent_ref.unlock();
@@ -1256,7 +1246,6 @@ pub const Process = struct {
                 else => false,
             };
             if (matches) {
-                arch.boot.print("K: updateParentView pid={d} match_slot={d} rc={d}\n", .{ self.pid, idx, self.restart_count });
                 parent.syncUserView();
                 if (parent.perm_view_phys.addr != 0) {
                     const field0_pa = PAddr.fromInt(parent.perm_view_phys.addr + idx * @sizeOf(UserViewEntry) + @offsetOf(UserViewEntry, "field0"));
@@ -1265,7 +1254,6 @@ pub const Process = struct {
                 return;
             }
         }
-        arch.boot.print("K: updateParentView pid={d} NO_MATCH\n", .{self.pid});
     }
 
     fn cleanupIpcState(self: *Process) void {
