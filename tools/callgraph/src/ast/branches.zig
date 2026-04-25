@@ -63,6 +63,13 @@ pub const KnownNames = std.StringHashMap(void);
 /// struct_types output. The receiver-chain resolver walks each `.field`
 /// segment through this table until only the trailing method name remains.
 pub const StructTypeIndex = std.StringHashMap(*const types.StructTypeInfo);
+/// Re-export alias index. Maps a `<file_module>.<X>` user-form qname to the
+/// underlying chain target. Used by `lookupCandidate` to rewrite candidate
+/// prefixes whose path goes through a re-export — e.g. a candidate of
+/// `utils.sync.SpinLock.lockIrqSave` is rewritten to
+/// `utils.sync.spin_lock.SpinLock.lockIrqSave` (the form the qname index
+/// actually carries because that's where the source-level fn lives).
+pub const ReexportAliasIndex = std.StringHashMap([]const u8);
 
 /// Per-fn fn-pointer parameter bindings. Maps an inline fn's parameter name
 /// (e.g. `ktrampoline`) to the qname of the function the caller passed
@@ -110,6 +117,7 @@ pub fn buildIntra(
     receiver_name: []const u8,
     receiver_type: []const u8,
     param_bindings: ?*const ParamBindings,
+    aliases: ?*const ReexportAliasIndex,
 ) ![]const Atom {
     const node_idx: std.zig.Ast.Node.Index = @enumFromInt(fn_node);
 
@@ -130,6 +138,7 @@ pub fn buildIntra(
         .receiver_name = receiver_name,
         .receiver_type = receiver_type,
         .param_bindings = param_bindings,
+        .aliases = aliases,
         .locals_stack = .{},
     };
     // Push the function-scope local frame. Subsequent block entries push
@@ -219,6 +228,12 @@ const Ctx = struct {
     /// through to the indirect synth path: a bare-identifier call whose
     /// fn_expr matches a binding key resolves directly to the bound qname.
     param_bindings: ?*const ParamBindings,
+    /// Optional re-export alias index. Consulted by `lookupCandidate` when
+    /// the direct qname-index probe misses, so a candidate that goes through
+    /// a re-export prefix (e.g. `utils.sync.SpinLock.lockIrqSave`, where
+    /// `SpinLock` is `pub const SpinLock = spin_lock.SpinLock;`) gets
+    /// rewritten to the underlying form before retrying the lookup.
+    aliases: ?*const ReexportAliasIndex,
     /// Defer / errdefer expression nodes accumulated at function scope.
     /// Walked at function-end so their calls show up in the sequence.
     defers: std.ArrayList(std.zig.Ast.Node.Index) = .{},
@@ -858,9 +873,15 @@ fn resolveLocalDeclType(ctx: *Ctx, type_node: std.zig.Ast.Node.Index) ![]const u
         return try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ resolved_head, tail });
     }
 
-    // Bare ident — try same-file sibling (`<file_module>.<ident>`). May or
-    // may not exist; the qname-lookup downstream will silently miss if not.
+    // Bare ident — first try the file's import table, since `const T = ...;`
+    // may be an `@import(...)` or a re-export alias. Only fall through to
+    // the same-file sibling form if the import table has no entry.
     if (isBareIdent(stripped)) {
+        if (ctx.imports) |imports| {
+            if (imports.get(stripped)) |q| {
+                return try ctx.arena.dupe(u8, q);
+            }
+        }
         const file_mod = try fileToDottedModule(ctx.arena, ctx.file);
         if (file_mod.len == 0) return "";
         return try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ file_mod, stripped });
@@ -914,7 +935,38 @@ fn isIdentChars(s: []const u8) bool {
 /// Look `candidate` up in the qname index (preferred — gives us a `to` id)
 /// then in the known-names set (fallback — name only, `to=null`). Returns
 /// null on miss in both.
+///
+/// On miss, walks left-to-right through the candidate looking for the
+/// longest prefix that's a re-export alias key. If found, the prefix is
+/// rewritten to the alias's resolved target (preserving the suffix) and the
+/// lookup retries. Capped at 3 hops to avoid pathological alias chains.
 fn lookupCandidate(
+    ctx: *Ctx,
+    candidate: []const u8,
+    line: u32,
+    col: u32,
+) !?Callee {
+    if (try lookupCandidateDirect(ctx, candidate, line, col)) |c| return c;
+
+    // Alias-rewrite fallback. We try at most 3 hops, since a kernel re-export
+    // chain shouldn't realistically exceed a couple links and we don't want
+    // to thrash on a self-referential alias that slipped through.
+    if (ctx.aliases) |aliases| {
+        var current: []const u8 = candidate;
+        var hops: u32 = 0;
+        while (hops < 3) {
+            const rewritten = rewriteWithAlias(ctx.arena, current, aliases) catch null;
+            const r = rewritten orelse break;
+            if (try lookupCandidateDirect(ctx, r, line, col)) |c| return c;
+            current = r;
+            hops += 1;
+        }
+    }
+
+    return null;
+}
+
+fn lookupCandidateDirect(
     ctx: *Ctx,
     candidate: []const u8,
     line: u32,
@@ -938,6 +990,41 @@ fn lookupCandidate(
                 .kind = .direct,
                 .site = .{ .file = ctx.file, .line = line, .col = col },
             };
+        }
+    }
+    return null;
+}
+
+/// Find the longest dot-bounded prefix of `candidate` that's a key in the
+/// alias index, and rewrite the candidate by replacing that prefix with the
+/// alias's target. Returns null when no prefix matches.
+///
+/// We scan from longest to shortest by walking dot positions right-to-left
+/// — the first hit is the longest valid prefix. A prefix is "valid" only
+/// when it ends at a dot (so `utils.sync` matches but `utils.s` doesn't),
+/// preventing partial-segment collisions.
+fn rewriteWithAlias(
+    arena: std.mem.Allocator,
+    candidate: []const u8,
+    aliases: *const ReexportAliasIndex,
+) !?[]const u8 {
+    if (candidate.len == 0) return null;
+
+    // Try the whole candidate (rare; would only fire if the candidate equals
+    // an alias key with no method appended, which lookupCandidate's caller
+    // wouldn't pass — but supporting it keeps the function self-contained).
+    if (aliases.get(candidate)) |target| {
+        return try arena.dupe(u8, target);
+    }
+
+    var i: usize = candidate.len;
+    while (i > 0) {
+        i -= 1;
+        if (candidate[i] != '.') continue;
+        const prefix = candidate[0..i];
+        if (aliases.get(prefix)) |target| {
+            const suffix = candidate[i..]; // includes the leading dot
+            return try std.fmt.allocPrint(arena, "{s}{s}", .{ target, suffix });
         }
     }
     return null;

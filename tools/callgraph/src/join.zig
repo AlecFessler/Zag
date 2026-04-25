@@ -53,7 +53,7 @@ pub fn buildGraph(
     ast_fns: []const AstFunction,
 ) !types.Graph {
     var stats: JoinStats = .{ .ir_total = 0, .matched = 0 };
-    return try buildGraphWithStats(arena, ir_graph, ast_fns, &.{}, &.{}, &.{}, .x86_64, &stats);
+    return try buildGraphWithStats(arena, ir_graph, ast_fns, &.{}, &.{}, &.{}, &.{}, .x86_64, &stats);
 }
 
 pub fn buildGraphWithStats(
@@ -62,6 +62,7 @@ pub fn buildGraphWithStats(
     ast_fns: []const AstFunction,
     file_asts: []const FileAst,
     struct_types: []const types.StructTypeInfo,
+    aliases: []const types.ReexportAlias,
     discovered: []const Discovered,
     target_arch: types.TargetArch,
     stats_out: *JoinStats,
@@ -231,7 +232,7 @@ pub fn buildGraphWithStats(
     // branches.buildIntra, so call sites whose targets are AST-only
     // resolve to a real synthetic id rather than a `to=null` named leaf.
     if (file_asts.len > 0) {
-        try attachIntra(arena, functions, ast_fns, file_asts, struct_types, &realpath_cache, target_arch);
+        try attachIntra(arena, functions, ast_fns, file_asts, struct_types, aliases, &realpath_cache, target_arch);
     }
 
     // Stamp `is_entry` / `entry_kind` on every function whose qualified name
@@ -389,6 +390,7 @@ fn attachIntra(
     ast_fns: []const AstFunction,
     file_asts: []const FileAst,
     struct_types: []const types.StructTypeInfo,
+    aliases: []const types.ReexportAlias,
     realpath_cache: *std.StringHashMap([]const u8),
     target_arch: types.TargetArch,
 ) !void {
@@ -435,6 +437,17 @@ fn attachIntra(
     var struct_type_index = branches.StructTypeIndex.init(arena);
     for (struct_types) |*sti| {
         _ = try struct_type_index.getOrPutValue(sti.qname, sti);
+    }
+
+    // Re-export alias index. `lookupCandidate` consults this on a miss to
+    // rewrite a candidate qname whose path goes through a `pub const X = ...;`
+    // alias (e.g. `utils.sync.SpinLock` → `utils.sync.spin_lock.SpinLock`)
+    // before retrying the lookup. Without this, receiver-chain resolution
+    // through any aliased type stays indirect even though the field-type and
+    // qname-index entries are present.
+    var alias_index = branches.ReexportAliasIndex.init(arena);
+    for (aliases) |a| {
+        _ = try alias_index.getOrPutValue(a.key, a.target);
     }
 
     // qname → AstFunction lookup. Used by the all-callers-agree pass to
@@ -535,6 +548,7 @@ fn attachIntra(
             af.receiver_name,
             af.receiver_type,
             pb_opt,
+            &alias_index,
         ) catch &.{};
     }
 }

@@ -191,6 +191,20 @@ pub const StructTypeInfo = struct {
     fields: []const FieldType,
 };
 
+/// One re-export alias entry: a top-level `pub const X = some.dotted.chain;`
+/// decl whose RHS resolves through the file's import table. The key is the
+/// alias's qname in *user* form (`<file_module>.<X>`, e.g. `utils.sync.SpinLock`)
+/// and the value is the underlying qname the chain resolved to (e.g.
+/// `utils.sync.spin_lock.SpinLock`). The qname index downstream is populated
+/// from real fn-decl qnames, so a `lookupCandidate` against the user-form
+/// qname misses; consulting this table rewrites the prefix and retries.
+pub const ReexportAlias = struct {
+    /// User-form qname (`<file_module>.<X>`).
+    key: []const u8,
+    /// Underlying-target qname (the chain's resolution).
+    target: []const u8,
+};
+
 /// One entry per function parameter, in declaration order. Used by join.zig's
 /// all-callers-agree pass: when an AST-only inline fn has a fn-pointer
 /// parameter and every call site passes the same `&fn` argument, the
