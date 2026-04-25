@@ -12,7 +12,6 @@
 ///   - Section 2.4:   Commands (generic format in Figure 40)
 ///   - Section 3.3.1: MMIO Control and Status Registers
 ///   - Section 3.3.13: Command and Event Log Pointer Registers
-const std = @import("std");
 const zag = @import("zag");
 
 const arch_paging = zag.arch.x64.paging;
@@ -607,6 +606,3 @@ pub fn enableTranslation() void {
     translation_enabled = true;
 }
 
-pub fn isAvailable() bool {
-    return unit_count > 0;
-}

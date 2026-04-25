@@ -4,7 +4,6 @@
 ///   IOREGSEL at 0xFEC00000 (selects register index)
 ///   IOWIN at 0xFEC00010 (reads/writes selected register)
 /// Section 3.0: Register Description.
-const zag = @import("zag");
 
 /// Host interface supplied by the owning `Vm`. Lets the IOAPIC deliver
 /// a decoded interrupt into the LAPIC without importing `kvm/lapic.zig`

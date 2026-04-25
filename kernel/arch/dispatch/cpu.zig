@@ -13,14 +13,6 @@ const VAddr = zag.memory.address.VAddr;
 
 // --- Fault / context types ---------------------------------------------
 
-/// Number of general-purpose registers saved in a fault snapshot.
-/// x86-64: 15 (rax-r15 minus rsp). aarch64: 31 (x0-x30).
-pub const fault_gpr_count: usize = switch (builtin.cpu.arch) {
-    .x86_64 => x64.interrupts.fault_gpr_count,
-    .aarch64 => aarch64.interrupts.fault_gpr_count,
-    else => unreachable,
-};
-
 /// Size of the register portion of a FaultMessage: ip + flags + sp + GPRs.
 pub const fault_regs_size: usize = switch (builtin.cpu.arch) {
     .x86_64 => x64.interrupts.fault_regs_size,
@@ -246,14 +238,6 @@ pub inline fn userAccessEnd() void {
 
 // --- Interrupt controller (APIC / GIC) ---------------------------------
 
-pub fn maskIrq(irq: u8) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.irq.maskIrq(irq),
-        .aarch64 => aarch64.irq.maskIrq(irq),
-        else => unreachable,
-    }
-}
-
 pub fn unmaskIrq(irq: u8) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.irq.unmaskIrq(irq),
@@ -273,14 +257,6 @@ pub fn findIrqForDevice(device: *DeviceRegion) ?u8 {
 pub fn clearIrqPendingBit(irq_line: u8) void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.irq.clearIrqPendingBit(irq_line),
-        .aarch64 => {}, // stub
-        else => unreachable,
-    }
-}
-
-pub fn registerIrqOwner(irq_line: u8, proc: *Process, slot_index: u16) void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.irq.registerIrqOwner(irq_line, proc, slot_index),
         .aarch64 => {}, // stub
         else => unreachable,
     }
@@ -416,17 +392,6 @@ pub fn fpuClearTrap() void {
     switch (builtin.cpu.arch) {
         .x86_64 => x64.cpu.fpuClearTrap(),
         .aarch64 => aarch64.cpu.fpuClearTrap(),
-        else => unreachable,
-    }
-}
-
-/// Arm the FP-disable trap on the local core so the next user-mode FP
-/// access raises #NM (x64) / EC=0x07 (aarch64). Called from switchTo
-/// at every context switch out.
-pub fn fpuArmTrap() void {
-    switch (builtin.cpu.arch) {
-        .x86_64 => x64.cpu.fpuArmTrap(),
-        .aarch64 => aarch64.cpu.fpuArmTrap(),
         else => unreachable,
     }
 }

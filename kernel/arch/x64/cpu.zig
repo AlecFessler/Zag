@@ -112,13 +112,6 @@ pub const Context = packed struct {
     ss: u64,
 };
 
-/// Size of the per-thread FXSAVE save buffer used by the lazy-FPU
-/// machinery (`sched.fpu`). 512 bytes is the FXSAVE format; we
-/// allocate 576 in `Thread.fpu_state` to leave headroom matching the
-/// aarch64 layout, but the FXSAVE/FXRSTOR instructions only touch the
-/// first 512 bytes.
-pub const fxsave_size: u64 = 512;
-
 /// FXSAVE the local core's FP/SIMD state into the thread's lazy-FPU
 /// buffer. `area` must be 16-byte aligned (Thread.fpu_state is 64-byte
 /// aligned, so this is satisfied by construction).
@@ -449,39 +442,6 @@ pub fn halt() noreturn {
 /// 16-byte aligned minus 8 (simulates the return-address push by `call`).
 pub fn alignStack(stack_top: VAddr) VAddr {
     return VAddr.fromInt(std.mem.alignBackward(u64, stack_top.addr, 16) - 8);
-}
-
-pub fn qemuShutdown() noreturn {
-    // Drain COM1 before cutting power. `writeByte` in `serial.zig`
-    // only waits for the Transmit Holding Register to empty (LSR
-    // bit 5) between bytes — that guarantees the kernel never
-    // overwrites bytes the UART hasn't picked up yet, but the FINAL
-    // byte of the last `serial.print` is still shifting out when we
-    // return. Poking `0x604` here immediately powers off the VM, so
-    // without this wait QEMU cuts the chardev mid-shift and the
-    // tail of the line is lost. Test `s2_4_9` flaked on this for a
-    // long time — `[PASS] §2.4.9` would show up as a truncated
-    // `[PAS` in ~40% of runs.
-    //
-    // Wait for LSR bit 6 ("Transmitter Empty", TEMT) which is the
-    // strictly stronger signal: BOTH the THR AND the Transmitter
-    // Shift Register are empty, i.e. the wire is actually idle.
-    // COM1's LSR is at 0x3F8 + 5 = 0x3FD; drain is bounded so a
-    // wedged UART can't hang the shutdown path forever.
-    const com1_lsr: u16 = 0x3FD;
-    const transmitter_empty: u8 = 0b0100_0000;
-    var spins: u32 = 0;
-    while ((inb(com1_lsr) & transmitter_empty) == 0) {
-        spins += 1;
-        if (spins >= 10_000_000) break;
-    }
-
-    asm volatile ("outw %[val], %[port]"
-        :
-        : [val] "{ax}" (@as(u16, 0x2000)),
-          [port] "{dx}" (@as(u16, 0x604)),
-    );
-    unreachable;
 }
 
 /// Intel SDM Vol 3A, Section 2.5 "Control Registers" — CR3 holds the physical

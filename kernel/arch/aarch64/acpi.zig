@@ -33,7 +33,6 @@ const serial = zag.arch.aarch64.serial;
 const smp = zag.arch.aarch64.smp;
 
 const DeviceClass = zag.memory.device_region.DeviceClass;
-const Framebuffer = zag.boot.protocol.Framebuffer;
 const MemoryPerms = zag.perms.memory.MemoryPerms;
 const PAddr = zag.memory.address.PAddr;
 const PixelFormat = zag.boot.protocol.PixelFormat;

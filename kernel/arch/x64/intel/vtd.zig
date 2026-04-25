@@ -7,7 +7,6 @@
 /// Translation flow (Section 3.4):
 ///   DMA request with BDF → Root Table[Bus] → Context Table[Dev:Fn]
 ///   → Second-Stage Page Tables (4-level, 48-bit) → Host Physical Address
-const std = @import("std");
 const zag = @import("zag");
 
 const arch_paging = zag.arch.x64.paging;

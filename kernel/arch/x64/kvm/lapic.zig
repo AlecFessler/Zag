@@ -3,7 +3,6 @@
 /// APIC registers are memory-mapped at base 0xFEE00000, 4 KiB region.
 /// All registers are 32-bit, aligned on 128-bit (16-byte) boundaries.
 /// Table 13-1: Local APIC Register Address Map.
-const zag = @import("zag");
 
 /// Host interface supplied by the owning `Vm`. Lets the LAPIC notify the
 /// IOAPIC of a level-triggered EOI without importing `kvm/ioapic.zig`

@@ -1,5 +1,4 @@
 const std = @import("std");
-const builtin = @import("builtin");
 const zag = @import("zag");
 
 const bump = zag.memory.allocators.bump;

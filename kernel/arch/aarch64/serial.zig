@@ -48,17 +48,6 @@ pub fn setBase(addr: u64) void {
     base_addr = addr;
 }
 
-/// Return the current PL011 MMIO base virtual address, or null if
-/// `init`/`setBase` have not run yet. Used by `arch.earlyDebugChar`
-/// to route low-level debug writes through the kernel-VA mapping
-/// (which is global across all process page tables) instead of the
-/// raw physical address (which is only mapped while UEFI's TTBR0
-/// identity map is still in place — i.e., before the first user
-/// process is scheduled).
-pub fn getBase() ?u64 {
-    return base_addr;
-}
-
 /// Initialize the PL011 UART for transmit.
 ///
 /// Intentionally a no-op for now: the PL011 MMIO page is not yet mapped

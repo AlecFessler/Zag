@@ -12,8 +12,6 @@ const vcpu_mod = kvm.vcpu;
 const vm_mod = kvm.vm;
 
 const ArchCpuContext = zag.arch.x64.interrupts.ArchCpuContext;
-const KernelObject = zag.perms.permissions.KernelObject;
-const PAddr = zag.memory.address.PAddr;
 const Process = zag.proc.process.Process;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;

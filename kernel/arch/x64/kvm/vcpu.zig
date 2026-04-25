@@ -21,7 +21,6 @@ const PAddr = zag.memory.address.PAddr;
 const Process = zag.proc.process.Process;
 const SecureSlab = zag.memory.allocators.secure_slab.SecureSlab;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
-const SpinLock = zag.utils.sync.SpinLock;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 const Vm = vm_mod.Vm;

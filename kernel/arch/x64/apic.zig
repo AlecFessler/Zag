@@ -3,7 +3,6 @@ const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
 const interrupts = zag.arch.x64.interrupts;
-const paging = zag.arch.x64.paging;
 
 const LocalApic = zag.arch.x64.acpi.LocalApic;
 const VAddr = zag.memory.address.VAddr;

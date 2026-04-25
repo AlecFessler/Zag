@@ -13,7 +13,6 @@ const VAddr = zag.memory.address.VAddr;
 const STACK_RANGE_START: u64 = address.KernelVA.kernel_stacks.start;
 const STACK_RANGE_END: u64 = address.KernelVA.kernel_stacks.end;
 const SLOT_SIZE: u64 = address.KERNEL_STACK_SLOT_SIZE;
-const STACK_PAGES: u64 = address.KERNEL_STACK_PAGES;
 const MAX_SLOTS: u64 = (STACK_RANGE_END - STACK_RANGE_START) / SLOT_SIZE;
 
 const FREELIST_CAP: usize = 512;

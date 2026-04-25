@@ -3,7 +3,6 @@
 /// Detects CPU vendor at boot via CPUID and dispatches all VM operations
 /// to the appropriate backend. Follows the same pattern as iommu.zig
 /// (Intel VT-d vs AMD-Vi runtime dispatch).
-const std = @import("std");
 const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;

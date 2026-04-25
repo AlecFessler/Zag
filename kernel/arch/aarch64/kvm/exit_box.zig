@@ -25,12 +25,9 @@ const vm_hw = zag.arch.aarch64.vm;
 const vm_mod = kvm.vm;
 
 const ArchCpuContext = zag.arch.aarch64.interrupts.ArchCpuContext;
-const KernelObject = zag.perms.permissions.KernelObject;
-const PAddr = zag.memory.address.PAddr;
 const Process = zag.proc.process.Process;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const SpinLock = zag.utils.sync.SpinLock;
-const SyscallResult = zag.syscall.dispatch.SyscallResult;
 const Thread = zag.sched.thread.Thread;
 const ThreadPriorityQueue = zag.sched.thread.ThreadPriorityQueue;
 const VAddr = zag.memory.address.VAddr;

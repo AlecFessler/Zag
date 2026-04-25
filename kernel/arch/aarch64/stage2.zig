@@ -141,10 +141,6 @@ pub fn stage2MemAttrForIpa(guest_phys: u64) Stage2MemAttr {
 /// setup (VTCR_EL2) can cite a single source of truth.
 pub const STAGE2_T0SZ: u6 = 34;
 
-/// Number of stage-2 translation levels walked for our (T0SZ=34,
-/// SL0=0, 4KB granule) configuration. Level 2 → Level 3 = 2 levels.
-const STAGE2_LEVELS: usize = 2;
-
 /// Bit shifts per level, from leaf upwards. Matches the naming used by
 /// `kernel/arch/aarch64/paging.zig` for stage-1 (l0sh=12, l1sh=21, ...).
 const stage2_leaf_shift: u6 = 12; // level 3 (4 KiB leaf)

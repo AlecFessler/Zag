@@ -10,7 +10,6 @@ const kprof_dump = zag.kprof.dump;
 const kprof_log = zag.kprof.log;
 const kprof_mode = zag.kprof.mode;
 const kprof_sample = zag.kprof.sample;
-const memory_init = zag.memory.init;
 const process_mod = zag.proc.process;
 const thread_mod = zag.sched.thread;
 
@@ -24,8 +23,6 @@ const SpinLock = zag.utils.sync.SpinLock;
 const Thread = thread_mod.Thread;
 const ThreadAllocator = thread_mod.ThreadAllocator;
 const Timer = zag.arch.timer.Timer;
-const VCpuAllocator = arch.vm.VCpuAllocator;
-const VmAllocator = arch.vm.VmAllocator;
 
 
 pub var idle_process: *Process = undefined;

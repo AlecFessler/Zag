@@ -1,7 +1,5 @@
-const std = @import("std");
 const zag = @import("zag");
 
-const address = zag.memory.address;
 const cpu = zag.arch.x64.cpu;
 const fpu = zag.sched.fpu;
 const gdt = zag.arch.x64.gdt;
@@ -17,7 +15,6 @@ const serial = zag.arch.x64.serial;
 const FaultReason = zag.perms.permissions.FaultReason;
 const GateType = zag.arch.x64.idt.GateType;
 const PageFaultContext = zag.arch.x64.interrupts.PageFaultContext;
-const PAddr = zag.memory.address.PAddr;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
 const SlabRef = zag.memory.allocators.secure_slab.SlabRef;
 const VAddr = zag.memory.address.VAddr;

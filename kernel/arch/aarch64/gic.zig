@@ -47,7 +47,6 @@
 //! - ARM ARM DDI 0487: D13.2.83 (MPIDR_EL1)
 
 const std = @import("std");
-const zag = @import("zag");
 
 // ── GICD register offsets (IHI 0069H, Section 8.9 / IHI 0048B, Section 4.3) ──
 
@@ -196,15 +195,6 @@ const gicr_waker_children_asleep: u32 = 1 << 2;
 /// Maximum number of redistributors (one per core).
 const max_redist: usize = 256;
 
-/// Spurious interrupt ID returned by IAR when no pending interrupt.
-/// IHI 0069H, Section 12.11.1 / IHI 0048B, Section 4.4.4.
-///
-/// Note: GICC_AIAR (the aliased Group 1 IAR, GICv2 with Security
-/// Extensions) returns 1022 instead of 1023 when no Group 1 interrupt
-/// is pending (IHI 0048B §4.4.11). `isSpurious` handles both values;
-/// callers should use that helper rather than a bare equality check.
-pub const spurious_intid: u32 = 1023;
-
 /// True for either spurious interrupt encoding (1022 or 1023). The GIC
 /// spec reserves the top 8 INTIDs (1020-1023) as spurious / non-
 /// maskable hand-offs (IHI 0048B §2.2.1, IHI 0069H §2.2.1), so we
@@ -333,13 +323,6 @@ fn gicrRead(core_idx: usize, reg: GicrReg) u32 {
 fn gicrWrite(core_idx: usize, reg: GicrReg, val: u32) void {
     const ptr: *volatile u32 = @ptrFromInt(gicr_bases[core_idx] + @intFromEnum(reg));
     ptr.* = val;
-}
-
-fn gicrSgiRead(core_idx: usize, reg: GicrSgiReg) u32 {
-    // SGI_base frame is at RD_base + 0x10000.
-    // IHI 0069H, Section 9.1.
-    const ptr: *const volatile u32 = @ptrFromInt(gicr_bases[core_idx] + 0x10000 + @intFromEnum(reg));
-    return ptr.*;
 }
 
 fn gicrSgiWrite(core_idx: usize, reg: GicrSgiReg, val: u32) void {
@@ -1205,103 +1188,4 @@ pub fn unmaskIrq(intid: u32) void {
 
     // SPI — use distributor (same for v2 and v3).
     gicdWriteOffset(.isenabler0, reg_offset, bit);
-}
-
-/// Route an SPI to a specific core.
-///
-/// On GICv3: writes GICD_IROUTER<n> with MPIDR-format affinity.
-/// IHI 0069H, Section 8.9.13: GICD_IROUTER<n>.
-///
-/// On GICv2: writes GICD_ITARGETSR for the INTID's byte with a CPU bitmask.
-/// IHI 0048B, Section 4.3.12: GICD_ITARGETSR<n>, 8 bits per INTID.
-pub fn routeSpiToCore(intid: u32, target_core: u64) void {
-    if (intid < 32) return; // SGIs/PPIs are not routed via GICD_IROUTER/ITARGETSR.
-    if (gicd_base == 0) return;
-
-    if (gicv3) {
-        const offset = (intid - 32) * 8;
-        const ptr: *volatile u64 = @ptrFromInt(gicd_base + @intFromEnum(GicdReg.irouter0) + offset);
-        // For flat topology, target_core is the Aff0 value directly.
-        ptr.* = target_core & 0xFF;
-    } else {
-        // GICv2: each INTID has an 8-bit target field in GICD_ITARGETSR.
-        // Read-modify-write the containing 32-bit register.
-        // IHI 0048B, Section 4.3.12.
-        const reg_offset: u32 = (intid / 4) * 4;
-        const byte_pos: u5 = @intCast((intid % 4) * 8);
-        const addr = gicd_base + @intFromEnum(GicdReg.itargetsr0) + reg_offset;
-        const ptr: *volatile u32 = @ptrFromInt(addr);
-        const cpu_mask: u32 = @as(u32, 1) << @intCast(target_core & 0x7);
-        var val = ptr.*;
-        val &= ~(@as(u32, 0xFF) << byte_pos);
-        val |= cpu_mask << byte_pos;
-        ptr.* = val;
-    }
-}
-
-/// Set the priority of an interrupt.
-///
-/// Lower values = higher priority. Priority is 8 bits per INTID.
-///
-/// For SPIs: uses GICD_IPRIORITYR (same for v2/v3).
-/// For SGIs/PPIs:
-///   GICv3 — uses GICR_IPRIORITYR (IHI 0069H, Section 9.5.8).
-///   GICv2 — uses GICD_IPRIORITYR (banked per-CPU, IHI 0048B, Section 4.3.11).
-pub fn setPriority(intid: u32, priority: u8) void {
-    const byte_offset = intid;
-    const reg_offset = (byte_offset / 4) * 4;
-    const byte_pos: u5 = @intCast((byte_offset % 4) * 8);
-
-    if (intid < 32) {
-        if (gicv3) {
-            // SGI/PPI — use redistributor.
-            const core_idx: usize = @intCast(coreID());
-            const addr = gicr_bases[core_idx] + 0x10000 + @intFromEnum(GicrSgiReg.ipriorityr0) + reg_offset;
-            const ptr: *volatile u32 = @ptrFromInt(addr);
-            var val = ptr.*;
-            val &= ~(@as(u32, 0xFF) << byte_pos);
-            val |= @as(u32, priority) << byte_pos;
-            ptr.* = val;
-        } else {
-            // GICv2: GICD_IPRIORITYR0-7 is banked per-CPU for INTID 0-31.
-            const addr = gicd_base + @intFromEnum(GicdReg.ipriorityr0) + reg_offset;
-            const ptr: *volatile u32 = @ptrFromInt(addr);
-            var val = ptr.*;
-            val &= ~(@as(u32, 0xFF) << byte_pos);
-            val |= @as(u32, priority) << byte_pos;
-            ptr.* = val;
-        }
-        return;
-    }
-
-    // SPI — use distributor (same for v2 and v3).
-    const addr = gicd_base + @intFromEnum(GicdReg.ipriorityr0) + reg_offset;
-    const ptr: *volatile u32 = @ptrFromInt(addr);
-    var val = ptr.*;
-    val &= ~(@as(u32, 0xFF) << byte_pos);
-    val |= @as(u32, priority) << byte_pos;
-    ptr.* = val;
-}
-
-/// Configure an SPI as edge-triggered or level-sensitive.
-///
-/// IHI 0069H, Section 8.9.12 / IHI 0048B, Section 4.3.13:
-/// GICD_ICFGR<n>, 2 bits per INTID.
-/// Bit [1] of the 2-bit field: 0 = level-sensitive, 1 = edge-triggered.
-pub fn configureTrigger(intid: u32, edge_triggered: bool) void {
-    if (intid < 32) return; // SGI/PPI config is fixed or via GICR.
-    if (gicd_base == 0) return;
-
-    const reg_index = intid / 16;
-    const bit_offset: u5 = @intCast((intid % 16) * 2 + 1);
-    const reg_addr = gicd_base + @intFromEnum(GicdReg.icfgr0) + reg_index * 4;
-
-    const ptr: *volatile u32 = @ptrFromInt(reg_addr);
-    var val = ptr.*;
-    if (edge_triggered) {
-        val |= @as(u32, 1) << bit_offset;
-    } else {
-        val &= ~(@as(u32, 1) << bit_offset);
-    }
-    ptr.* = val;
 }

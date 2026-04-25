@@ -42,7 +42,6 @@
 //! - ARM ARM D13.2.37: ESR_EL1
 //! - ARM ARM D13.2.40: FAR_EL1
 
-const std = @import("std");
 const zag = @import("zag");
 
 const aarch64_paging = zag.arch.aarch64.paging;

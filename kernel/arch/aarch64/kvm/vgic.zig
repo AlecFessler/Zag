@@ -556,13 +556,6 @@ fn detectListRegs() void {
     num_lrs = count;
 }
 
-/// Public accessor for `num_lrs`, exposed so vcpu / test code can
-/// observe the detected list register count without reaching into
-/// the private module variable.
-pub fn listRegCount() u8 {
-    return num_lrs;
-}
-
 // ===========================================================================
 // Initialization
 // ===========================================================================
@@ -919,20 +912,6 @@ fn clearActiveState(state: *VcpuState, intid: u32) void {
     if (!bitTest(&state.dist.spi_edge, spi) and bitTest(&state.dist.spi_level, spi)) {
         bitSet(&state.dist.spi_pending, spi);
     }
-}
-
-/// Maintenance IRQ handler. Called from the kernel's EL1 IRQ path when
-/// ICH_HCR_EL2 maintenance interrupts fire while a guest is running.
-///
-/// In v1 we just set `needs_refill` and let the next saveExit (which
-/// runs unconditionally on every exit) drive the state machine. The
-/// presence of this hook lets the IRQ path avoid a panic on the
-/// maintenance INTID.
-///
-/// Reference: GICv3 §11.4 Maintenance interrupts, ARM ARM D13.8.49
-/// ICH_MISR_EL2.
-pub fn maintenanceIrq(state: *VcpuState) void {
-    state.needs_refill = true;
 }
 
 // ===========================================================================

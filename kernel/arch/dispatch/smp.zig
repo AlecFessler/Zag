@@ -1,11 +1,8 @@
 const builtin = @import("builtin");
-const std = @import("std");
 const zag = @import("zag");
 
 const aarch64 = zag.arch.aarch64;
 const x64 = zag.arch.x64;
-
-const Thread = zag.sched.thread.Thread;
 
 pub fn coreCount() u64 {
     return switch (builtin.cpu.arch) {

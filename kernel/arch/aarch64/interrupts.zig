@@ -51,7 +51,6 @@
 //! - ARM ARM D13.2.127: SPSR_EL1
 //! - ARM IHI 0055: AAPCS64 (calling convention)
 
-const std = @import("std");
 const zag = @import("zag");
 
 const cpu = zag.arch.aarch64.cpu;
@@ -60,7 +59,6 @@ const gic = zag.arch.aarch64.gic;
 const paging = zag.arch.aarch64.paging;
 const scheduler = zag.sched.scheduler;
 
-const PAddr = zag.memory.address.PAddr;
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
 

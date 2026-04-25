@@ -1,8 +1,6 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const secure_slab = zag.memory.allocators.secure_slab;
-
 const DeviceRegion = zag.memory.device_region.DeviceRegion;
 const Process = zag.proc.process.Process;
 const SharedMemory = zag.memory.shared.SharedMemory;
@@ -166,37 +164,6 @@ pub const KernelObject = union(enum) {
         };
     }
 
-    /// Spin-CAS-acquire the gen-lock on the backing slab slot, using
-    /// the gen captured inside the variant's SlabRef. On success the
-    /// caller holds exclusive access to the object and must pair this
-    /// with a `releaseLock` on the same variant. Returns `StaleHandle`
-    /// if the slot has been freed since issuance. No-op for variants
-    /// that do not reference a slab-allocated object.
-    pub fn acquireLock(self: @This()) secure_slab.AccessError!void {
-        switch (self) {
-            .process => |r| _ = try r.lock(),
-            .dead_process => |r| _ = try r.lock(),
-            .thread => |r| _ = try r.lock(),
-            .shared_memory => |r| _ = try r.lock(),
-            .device_region => |r| _ = try r.lock(),
-            .vm => |r| _ = try r.lock(),
-            .vm_reservation, .empty => {},
-        }
-    }
-
-    /// Release the gen-lock acquired via `acquireLock`. Must be paired
-    /// with a successful `acquireLock` on the same variant.
-    pub fn releaseLock(self: @This()) void {
-        switch (self) {
-            .process => |r| r.unlock(),
-            .dead_process => |r| r.unlock(),
-            .thread => |r| r.unlock(),
-            .shared_memory => |r| r.unlock(),
-            .device_region => |r| r.unlock(),
-            .vm => |r| r.unlock(),
-            .vm_reservation, .empty => {},
-        }
-    }
 };
 
 pub const UserViewEntryType = enum(u8) {

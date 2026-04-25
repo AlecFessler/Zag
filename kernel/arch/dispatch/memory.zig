@@ -1,5 +1,4 @@
 const builtin = @import("builtin");
-const std = @import("std");
 const zag = @import("zag");
 
 const aarch64 = zag.arch.aarch64;

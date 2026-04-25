@@ -2,7 +2,6 @@ const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
-const builtin = std.builtin;
 const debug_info = zag.utils.debug_info;
 
 pub fn panic(msg: []const u8, trace: ?*std.builtin.StackTrace, ret_addr: ?u64) noreturn {

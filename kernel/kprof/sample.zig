@@ -30,7 +30,6 @@ const zag = @import("zag");
 const arch = zag.arch.dispatch;
 
 const Kind = record.Kind;
-const Record = record.Record;
 
 /// Target number of cycles between samples. Kept modest so a short
 /// workload (e.g. tests/prof yield) produces enough samples to fill a

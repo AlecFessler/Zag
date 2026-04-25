@@ -1,6 +1,5 @@
 const mode = @import("mode.zig");
 const record = @import("record.zig");
-const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;

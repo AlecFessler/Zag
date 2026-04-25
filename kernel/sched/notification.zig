@@ -117,25 +117,4 @@ pub const NotificationBox = struct {
         return E_TIMEOUT;
     }
 
-    /// Called from cleanupPhase1 when a process dies.
-    /// Drains all waiters, waking each with E_NOENT.
-    pub fn cleanupOnDeath(self: *NotificationBox) void {
-        const irq = self.lock.lockIrqSave();
-        while (self.waiters.dequeue()) |thread| {
-            while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
-            // Store E_NOENT in the thread's deadline field so the waker
-            // can distinguish timeout from cleanup. The notification wait
-            // path checks the word; if zero after wake, it returns E_TIMEOUT.
-            // For cleanup, we want E_NOENT, so we set the word to a sentinel.
-            thread.futex_deadline_ns = @bitCast(E_NOENT);
-            thread.state = .ready;
-            const target_core = if (thread.core_affinity) |mask|
-                @as(u64, @ctz(mask))
-            else
-                arch.smp.coreID();
-            sched.enqueueOnCore(target_core, thread);
-        }
-        @atomicStore(u64, &self.word, 0, .monotonic);
-        self.lock.unlockIrqRestore(irq);
-    }
 };

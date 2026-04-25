@@ -43,7 +43,6 @@ const zag = @import("zag");
 // Module aliases — alphabetical
 const aarch64_paging = zag.arch.aarch64.paging;
 const cpu = zag.arch.aarch64.cpu;
-const exceptions = zag.arch.aarch64.exceptions;
 const gic = zag.arch.aarch64.gic;
 const memory_init = zag.memory.init;
 const paging = zag.memory.paging;
@@ -68,9 +67,6 @@ var mpidr_table: [MAX_CORES]u64 = [_]u64{0} ** MAX_CORES;
 
 /// Whether each MPIDR entry has been set by ACPI parsing.
 var mpidr_valid: [MAX_CORES]bool = [_]bool{false} ** MAX_CORES;
-
-/// Per-core stack top addresses (kernel VA), indexed by logical core ID.
-var core_stack_tops: [MAX_CORES]u64 = [_]u64{0} ** MAX_CORES;
 
 /// Number of secondary cores successfully brought online.
 var cores_online: std.atomic.Value(u32) = std.atomic.Value(u32).init(1);

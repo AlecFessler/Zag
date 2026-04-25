@@ -230,28 +230,6 @@ fn writeRt(vcpu_obj: *VCpu, rt: u5, value: u64) void {
     base[rt] = value;
 }
 
-/// Build the 16-bit packed (op0,op1,CRn,CRm,op2) sysreg key that
-/// `stage2.sysregPassthrough` / `isSecurityCriticalSysreg` use. Layout
-/// (matched exactly so policy lookups can share keys):
-///
-///   bits [15:14] Op0
-///   bits [13:11] Op1
-///   bits [10:7]  CRn
-///   bits [6:3]   CRm
-///   bits [2:0]   Op2
-pub fn packSysreg(op0: u2, op1: u3, crn: u4, crm: u4, op2: u3) u16 {
-    return (@as(u16, op0) << 14) |
-        (@as(u16, op1) << 11) |
-        (@as(u16, crn) << 7) |
-        (@as(u16, crm) << 3) |
-        @as(u16, op2);
-}
-
-/// Convenience wrapper used by the policy lookups below.
-pub fn packSysregTrap(trap: vm_hw.VmExitInfo.SysregTrap) u16 {
-    return packSysreg(trap.op0, trap.op1, trap.crn, trap.crm, trap.op2);
-}
-
 fn lookupIdReg(policy: *const vm_hw.VmPolicy, trap: vm_hw.VmExitInfo.SysregTrap) ?u64 {
     for (policy.id_reg_responses[0..policy.num_id_reg_responses]) |e| {
         if (e.op0 == @as(u8, trap.op0) and

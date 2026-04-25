@@ -1,5 +1,4 @@
 const builtin = @import("builtin");
-const std = @import("std");
 const zag = @import("zag");
 
 const aarch64 = zag.arch.aarch64;
@@ -22,18 +21,6 @@ const Thread = zag.sched.thread.Thread;
 pub const Vm = switch (builtin.cpu.arch) {
     .x86_64 => x64.kvm.vm.Vm,
     .aarch64 => aarch64.kvm.vm.Vm,
-    else => @compileError("unsupported arch for VM"),
-};
-
-pub const VmAllocator = switch (builtin.cpu.arch) {
-    .x86_64 => x64.kvm.vm.VmAllocator,
-    .aarch64 => aarch64.kvm.vm.VmAllocator,
-    else => @compileError("unsupported arch for VM"),
-};
-
-pub const VCpuAllocator = switch (builtin.cpu.arch) {
-    .x86_64 => x64.kvm.vcpu.VCpuAllocator,
-    .aarch64 => aarch64.kvm.vcpu.VCpuAllocator,
     else => @compileError("unsupported arch for VM"),
 };
 

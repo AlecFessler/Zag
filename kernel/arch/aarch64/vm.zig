@@ -49,8 +49,6 @@
 //!   LAPIC/IOAPIC → GICv3 virtual CPU interface (ICH_* sysregs) + emulated
 //!                  GICD/GICR MMIO pages (see arch/aarch64/kvm/vgic.zig)
 
-const std = @import("std");
-
 // ===========================================================================
 // Guest register state snapshot
 // ===========================================================================
@@ -286,23 +284,11 @@ pub const VmExitInfo = union(enum) {
         pub const FLAG_REG64: u8 = 1 << 4;
         pub const FLAG_ACQREL: u8 = 1 << 5;
 
-        pub fn isInstruction(self: Stage2Fault) bool {
-            return (self.flags & FLAG_IS_INSTRUCTION) != 0;
-        }
         pub fn isWrite(self: Stage2Fault) bool {
             return (self.flags & FLAG_IS_WRITE) != 0;
         }
         pub fn issValid(self: Stage2Fault) bool {
             return (self.flags & FLAG_ISS_VALID) != 0;
-        }
-        pub fn signExtend(self: Stage2Fault) bool {
-            return (self.flags & FLAG_SIGN_EXTEND) != 0;
-        }
-        pub fn reg64(self: Stage2Fault) bool {
-            return (self.flags & FLAG_REG64) != 0;
-        }
-        pub fn acqrel(self: Stage2Fault) bool {
-            return (self.flags & FLAG_ACQREL) != 0;
         }
     };
 

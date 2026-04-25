@@ -1,4 +1,3 @@
-const std = @import("std");
 const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;

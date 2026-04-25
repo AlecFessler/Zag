@@ -841,9 +841,3 @@ fn tlbiVae1is(vaddr: u64) void {
     isb();
 }
 
-/// TLBI VMALLE1IS -- TLB Invalidate All, EL1&0, Inner Shareable.
-/// ARM ARM D5.9 -- invalidates all stage 1 EL1&0 TLB entries across all
-/// cores in the inner shareable domain.
-fn tlbiVmalle1is() void {
-    asm volatile ("tlbi vmalle1is" ::: .{ .memory = true });
-}

@@ -223,15 +223,6 @@ pub fn clearIrqPendingBit(irq_line: u8) void {
     _ = @atomicRmw(u64, field0_ptr, .And, ~IRQ_PENDING_BIT, .release);
 }
 
-/// Register the IRQ owner info for a device. Called when a process receives
-/// a device handle with IRQ rights.
-pub fn registerIrqOwner(irq_line: u8, proc: *Process, slot_index: u16) void {
-    irq_owners[irq_line] = .{
-        .process = SlabRef(Process).init(proc, proc._gen_lock.currentGen()),
-        .slot_index = slot_index,
-    };
-}
-
 /// Intel SDM Vol 3A, §13.9 — spurious interrupt handler must return without EOI
 /// because the APIC does not set the ISR bit for spurious deliveries.
 fn spuriousHandler(ctx: *cpu.Context) void {
@@ -271,12 +262,6 @@ fn schedTimerHandler(ctx: *cpu.Context) void {
     sched_interrupt_ctx.thread_ctx = @ptrCast(ctx);
 
     sched.schedTimerHandler(sched_interrupt_ctx);
-}
-
-/// Set the I/O APIC MMIO base address. Called during ACPI parsing.
-pub fn setIoapicBase(phys_addr: u32) void {
-    const phys = PAddr.fromInt(@as(u64, phys_addr));
-    ioapic_base = VAddr.fromPAddr(phys, null).addr;
 }
 
 /// Mask an IRQ line by setting bit 16 (interrupt mask) of the low dword of

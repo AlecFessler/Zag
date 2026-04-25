@@ -22,7 +22,6 @@
 //! the source core to flush. See `migrateFlush`.
 
 const build_options = @import("build_options");
-const std = @import("std");
 const zag = @import("zag");
 
 const arch = zag.arch.dispatch;

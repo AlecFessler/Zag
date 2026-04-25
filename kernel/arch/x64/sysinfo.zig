@@ -38,7 +38,6 @@
 //!   * Intel SDM Vol 2 "CPUID":
 //!     - Leaf 0x16 "Processor Frequency Information"
 
-const std = @import("std");
 const zag = @import("zag");
 
 const cpu = zag.arch.x64.cpu;
