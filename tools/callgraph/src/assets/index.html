@@ -118,6 +118,10 @@
       min-width: 240px;
       max-width: 360px;
     }
+    select#compare_commit option.opt_incompatible {
+      color: var(--fg-dim);
+      font-style: italic;
+    }
 
     .compare_status {
       color: var(--fg-dim);
@@ -960,6 +964,42 @@
       font-style: italic;
       padding: 6px 10px;
       font-size: 11px;
+    }
+    .diff_changes_row .fn_badge {
+      flex: 0 0 auto;
+      color: var(--fg-dim);
+      font-size: 10px;
+      letter-spacing: 0.04em;
+    }
+    /* Sub-rows: each contributing hunk under a flagged fn. Indented so
+       the visual hierarchy reads "fn → its contributing changes" at a
+       glance. Click jumps the source pane to that hunk's start line. */
+    .diff_changes_subrow {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 2px 10px 2px 30px;
+      cursor: pointer;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 10.5px;
+      color: var(--fg-dim);
+    }
+    .diff_changes_subrow:hover {
+      background: rgba(74, 158, 255, 0.10);
+      color: var(--fg);
+    }
+    .diff_changes_subrow .subglyph {
+      flex: 0 0 12px;
+      text-align: center;
+      color: var(--fg-dim);
+    }
+    .diff_changes_subrow_own.diff_changes_subrow .subglyph { color: #6fd17a; }
+    .diff_changes_subrow_dep.diff_changes_subrow .subglyph { color: #b06ef0; }
+    .diff_changes_subrow .sublabel {
+      flex: 1 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
     }
     .trace_pane_label .pane_tag {
       display: inline-block;

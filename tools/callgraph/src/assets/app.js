@@ -2107,11 +2107,22 @@
     for (const c of compareState.commits) {
       const opt = document.createElement("option");
       opt.value = c.sha;
-      // Show: short sha + truncated subject. Date is in the title for hover.
+      // Show: short sha + truncated subject. Commits older than the
+      // -Demit_ir scaffold are tagged so the user knows they can't be
+      // loaded — the build would fail with "invalid option: -Demit_ir".
+      // The option stays selectable so the user can still see the tag
+      // and understand why it's unavailable; loading itself fails fast
+      // with a clear message ("commit predates the -Demit_ir build
+      // option") via the server preflight.
       const subj = c.subject || "";
       const truncated = subj.length > 60 ? subj.slice(0, 57) + "…" : subj;
-      opt.textContent = `${c.short}  ${truncated}`;
-      opt.title = `${c.short}\n${c.author}  ${c.date}\n${subj}`;
+      const compat = c.cg_compatible !== false; // default-true if absent
+      const prefix = compat ? "" : "[no cg] ";
+      opt.textContent = `${prefix}${c.short}  ${truncated}`;
+      opt.title = compat
+        ? `${c.short}\n${c.author}  ${c.date}\n${subj}`
+        : `${c.short}\n${c.author}  ${c.date}\n${subj}\n\nThis commit predates the -Demit_ir kernel build option (commit 207770e), so the callgraph tool can't review it.`;
+      if (!compat) opt.classList.add("opt_incompatible");
       els.compareCommit.appendChild(opt);
     }
   }
@@ -2888,6 +2899,140 @@
       return ((a.def_loc && a.def_loc.line) || 0) - ((b.def_loc && b.def_loc.line) || 0);
     });
 
+    // Pre-compute contributing units for each fn in `unique`. A unit
+    // contributes to a fn if either:
+    //   (a) it's an own-body unit — same file, hunk overlaps the fn's
+    //       line range (range computed via the same next-fn-start-1
+    //       approximation used in recomputeDiffSets), or
+    //   (b) it's a dep-def unit — the unit overlaps a Definition whose
+    //       DefId appears in fn.def_deps.
+    // We need a fn-end-line approximation up front so own-body matching
+    // works. Build it once per file — sort fns by line, use next.line-1
+    // (or +∞ for the last fn).
+    const fnEndLineByFnId = new Map();
+    {
+      const fnsByPath = new Map();
+      for (const f of (graph.functions || [])) {
+        const rel = defLocToRepoRel(f.def_loc && f.def_loc.file);
+        if (!rel) continue;
+        if (!fnsByPath.has(rel)) fnsByPath.set(rel, []);
+        fnsByPath.get(rel).push(f);
+      }
+      for (const list of fnsByPath.values()) {
+        list.sort(function (a, b) {
+          return (a.def_loc.line || 0) - (b.def_loc.line || 0);
+        });
+        for (let i = 0; i < list.length; i += 1) {
+          const startLine = list[i].def_loc.line || 0;
+          const endLine = i + 1 < list.length
+            ? Math.max(startLine, (list[i + 1].def_loc.line || 0) - 1)
+            : Number.MAX_SAFE_INTEGER;
+          fnEndLineByFnId.set(list[i].id, endLine);
+        }
+      }
+    }
+
+    // Quick lookup: defId → Definition record. Used to map dep-def
+    // contributors back to their source location.
+    const defById = new Map();
+    for (const def of (graph.definitions || [])) {
+      defById.set(def.id, def);
+    }
+
+    // For one fn, collect every unit that contributes. Returns an array
+    // of {kind, label, file, line, unit}. `unit` is null for the
+    // synthetic "containing def" placeholder when the def itself has no
+    // emitted units yet (rare — usually the def's range overlaps a hunk
+    // and we have units for it).
+    function gatherContributingFor(fn) {
+      const out = [];
+      const fnFileRel = defLocToRepoRel(fn.def_loc && fn.def_loc.file);
+      const fnStart = fn.def_loc ? (fn.def_loc.line || 0) : 0;
+      const fnEnd = fnEndLineByFnId.get(fn.id) || fnStart;
+
+      // (a) own-body units: any unit in fn's file with new_start within
+      //     [fnStart, fnEnd]. Use new_start because that's the line in
+      //     the post-edit file (which the user is reviewing).
+      if (fnFileRel) {
+        const units = compareState.units || [];
+        for (const u of units) {
+          if (u.file !== fnFileRel) continue;
+          const start = u.new_start || u.old_start || 0;
+          if (start < fnStart || start > fnEnd) continue;
+          out.push({
+            kind: u.kind === "added" ? "own+" : "own-",
+            label: shortenFile(u.file) + ":" + start,
+            file: u.file,
+            line: start,
+            side: u.kind,
+            unit: u,
+          });
+        }
+      }
+
+      // (b) dep-def units: for each def in fn.def_deps that's also in
+      //     changedDefIds, list every unit overlapping the def's range.
+      const deps = fn.def_deps || [];
+      for (const did of deps) {
+        if (!compareState.changedDefIds.has(did)) continue;
+        const def = defById.get(did);
+        if (!def) continue;
+        const defFile = def.file;
+        const defStart = def.line_start || 0;
+        const defEnd = def.line_end || defStart;
+        const defKind = (def.kind || "def");
+        const units = compareState.units || [];
+        let added = 0;
+        for (const u of units) {
+          if (u.file !== defFile) continue;
+          const start = u.new_start || u.old_start || 0;
+          if (start < defStart || start > defEnd) continue;
+          out.push({
+            kind: "dep " + defKind,
+            label: (def.name || "<def>") + " · " + shortenFile(defFile) + ":" + start,
+            file: defFile,
+            line: start,
+            side: u.kind,
+            unit: u,
+          });
+          added += 1;
+        }
+        // If the def is flagged but no fine-grained unit overlaps (rare —
+        // happens when the hunk granularity doesn't split cleanly along
+        // def boundaries), fall back to a single jump-to-def row.
+        if (added === 0) {
+          out.push({
+            kind: "dep " + defKind,
+            label: (def.name || "<def>") + " · " + shortenFile(defFile) + ":" + defStart,
+            file: defFile,
+            line: defStart,
+            side: "added",
+            unit: null,
+          });
+        }
+      }
+      // De-dupe by (file:line:side) so a unit doesn't appear twice when
+      // both halves of a paired (added+removed) hunk fall inside the
+      // same range.
+      const seenKey = new Set();
+      const deduped = [];
+      for (const c of out) {
+        const k = c.file + ":" + c.line + ":" + c.side;
+        if (seenKey.has(k)) continue;
+        seenKey.add(k);
+        deduped.push(c);
+      }
+      // Sort: own first, then dep; within each, by file then line.
+      deduped.sort(function (a, b) {
+        const aOwn = a.kind.startsWith("own") ? 0 : 1;
+        const bOwn = b.kind.startsWith("own") ? 0 : 1;
+        if (aOwn !== bOwn) return aOwn - bOwn;
+        if (a.file !== b.file) return a.file.localeCompare(b.file);
+        return a.line - b.line;
+      });
+      return deduped;
+    }
+
     els.diffChangesPanel.style.display = "";
     if (els.diffChangesCount) {
       els.diffChangesCount.textContent = unique.length === 0
@@ -2944,6 +3089,59 @@
       });
 
       els.diffChangesList.appendChild(row);
+
+      // Sub-rows: each contributing hunk is a button that jumps the
+      // source pane straight to the change. This is the "→ jump to
+      // hunks that flagged this fn" affordance — without it the user
+      // has to scroll the source pane manually after drilling, which
+      // is hard when the trigger is a struct edit elsewhere in the
+      // tree.
+      const contribs = gatherContributingFor(fn);
+      const ownCount = contribs.filter(function (c) { return c.kind.startsWith("own"); }).length;
+      const depCount = contribs.length - ownCount;
+      if (els.diffChangesCount && ownCount + depCount > 0) {
+        // Append per-fn count summary as a small badge after the loc
+        // (visible on this row only — the panel header already shows
+        // the total fn count).
+        const badge = document.createElement("span");
+        badge.className = "fn_badge";
+        const parts = [];
+        if (ownCount > 0) parts.push(ownCount + " own");
+        if (depCount > 0) parts.push(depCount + " dep");
+        badge.textContent = "(" + parts.join(", ") + ")";
+        row.insertBefore(badge, loc);
+      }
+      for (const c of contribs) {
+        const sub = document.createElement("div");
+        sub.className = "diff_changes_subrow diff_changes_subrow_" +
+          (c.kind.startsWith("own") ? "own" : "dep");
+        sub.title = c.kind + " · " + c.label;
+
+        const sg = document.createElement("span");
+        sg.className = "subglyph";
+        sg.textContent = c.kind === "own+" ? "+"
+          : c.kind === "own-" ? "−"
+          : "Δ";
+        sub.appendChild(sg);
+
+        const sl = document.createElement("span");
+        sl.className = "sublabel";
+        sl.textContent = c.label;
+        sub.appendChild(sl);
+
+        sub.addEventListener("click", function (ev) {
+          ev.stopPropagation();
+          // Jump source pane straight to this hunk. We bypass
+          // showNodePanel because the panel metadata (caller's name +
+          // file:line) is already correct from the parent fn row click;
+          // re-rendering it for every contributing-hunk click would
+          // strobe the metadata and reset the call-tree pane unnecessarily.
+          els.info.classList.add("visible");
+          fetchSource(c.file, 1, 10000000, c.line);
+        });
+
+        els.diffChangesList.appendChild(sub);
+      }
     }
   }
 
