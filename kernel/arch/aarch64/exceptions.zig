@@ -393,7 +393,7 @@ fn readFarEl1() u64 {
 fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
     const esr = readEsrEl1();
     const ec = extractEc(esr);
-    if (ec != .svc_aarch64) zag.arch.dispatch.boot.print("K: syncLowerEl ec={d} elr=0x{x}\n", .{ @intFromEnum(ec), ctx.elr_el1 });
+    if (ec != .svc_aarch64) serial.print("K: syncLowerEl ec={d} elr=0x{x}\n", .{ @intFromEnum(ec), ctx.elr_el1 });
 
     switch (ec) {
         // Lazy-FPU trap. CPACR_EL1.FPEN was clamped to 0b01 (trap EL0)
