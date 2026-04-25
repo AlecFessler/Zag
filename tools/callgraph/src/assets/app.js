@@ -163,6 +163,8 @@
     diffChangesPanel: document.getElementById("diff_changes_panel"),
     diffChangesList: document.getElementById("diff_changes_list"),
     diffChangesCount: document.getElementById("diff_changes_count"),
+    reviewProgressBar: document.getElementById("review_progress_bar"),
+    reviewProgressFill: document.getElementById("review_progress_fill"),
     traceBreadcrumb: document.getElementById("trace_breadcrumb"),
     graphPane: document.getElementById("graph"),
     compareMode: document.getElementById("compare_mode"),
@@ -297,6 +299,7 @@
     const cached = archGraphCache.get(archTag);
     if (cached) {
       graph = cached;
+      window.__cgGraph = graph;
       setStatus("graph loaded (" + archTag + ")", false);
     } else {
       try {
@@ -304,6 +307,7 @@
         if (!r.ok) throw new Error("HTTP " + r.status);
         graph = await r.json();
         archGraphCache.set(archTag, graph);
+        window.__cgGraph = graph;
         setStatus("graph loaded (" + archTag + ")", false);
       } catch (err) {
         console.error("graph fetch failed", err);
@@ -2003,7 +2007,9 @@
   // Both panes track the same selected entry (matched by qualified name; fn
   // ids differ between builds). Drilling on the primary updates the secondary
   // via traceMode.setOnRendered.
-  const compareState = {
+  // Exposed via window.__cgCompareState for in-page debugging probes.
+  // Read-only; mutations go through the regular code paths.
+  const compareState = window.__cgCompareState = {
     mode: "off",
     commits: [],
     selectedSha: "",
@@ -2808,8 +2814,11 @@
 
   /** Re-render the currently-displayed source so checkbox state in the
    *  gutter reflects the latest reviewed map. Cheaper to refetch the
-   *  same source than to traverse and patch checkboxes in place. */
+   *  same source than to traverse and patch checkboxes in place. Also
+   *  refreshes the review tracker so its progress counters and group
+   *  rollups reflect the toggle. */
   function rerenderSourceForReview() {
+    if (typeof updateChangesPanel === "function") updateChangesPanel();
     if (!els.infoSource || els.infoSource.children.length === 0) return;
     if (!lastFetchedSource.file) return;
     fetchSource(lastFetchedSource.file, 1, 10000000, lastFetchedSource.line || 1);
@@ -2837,12 +2846,18 @@
     updateChangesPanel();
   }
 
-  /** Render the "changes in this entry" sticky panel above the primary
-   *  trace pane. Lists every fn reachable from currentEntryFnId that was
-   *  changed in the diff, sorted by file:line. Clicking a row drills the
-   *  trace to that fn (which mirrors to the secondary pane and pops the
-   *  source pane to the relevant file/line) so the user can scan-and-jump
-   *  rather than hunting through the tree for ◆ glyphs. */
+  /** Render the review tracker above the primary trace pane. Lists
+   *  every reviewable Unit (diff hunk) reachable from the current entry,
+   *  grouped file → containing fn → unit. Each unit row carries a
+   *  checkbox bound to compareState.reviewed (server-persisted in parent
+   *  mode) plus a click-to-jump that scrolls the source pane to the
+   *  hunk's start line. File and fn group headers carry rollup
+   *  counters and a "mark all" button. The panel header shows overall
+   *  progress as "X of Y reviewed" plus a thin progress bar.
+   *
+   *  Rendering is recomputed in full on every call — cheap relative to
+   *  the rest of the diff path, and lets the source-gutter checkbox
+   *  toggles re-call this and stay in sync without per-row patching. */
   function updateChangesPanel() {
     if (!els.diffChangesPanel) return;
     if (compareState.mode === "off" || compareState.changedFnIds.size === 0) {
@@ -2855,8 +2870,7 @@
     }
 
     // BFS from currentEntryFnId over direct/dispatch callees, collecting
-    // any fn that's in changedFnIds. Mirrors the entry-needs-review BFS
-    // but produces a list, not just a hit/miss.
+    // any fn that's in changedFnIds.
     const root = currentEntryFnId;
     const visited = new Set([root]);
     const queue = [root];
@@ -2883,265 +2897,400 @@
     }
     // De-duplicate by qualified name; the IR can emit one Function per
     // generic instantiation (same name, same def_loc) which would clutter
-    // the list with 8+ identical rows.
-    const seen = new Set();
-    const unique = [];
+    // the list.
+    const seenFn = new Set();
+    const reachableFns = [];
     for (const f of found) {
       const key = f.name || f.mangled || ("id:" + f.id);
-      if (seen.has(key)) continue;
-      seen.add(key);
-      unique.push(f);
+      if (seenFn.has(key)) continue;
+      seenFn.add(key);
+      reachableFns.push(f);
     }
-    unique.sort(function (a, b) {
-      const fa = (a.def_loc && a.def_loc.file) || "";
-      const fb = (b.def_loc && b.def_loc.file) || "";
-      if (fa !== fb) return fa.localeCompare(fb);
-      return ((a.def_loc && a.def_loc.line) || 0) - ((b.def_loc && b.def_loc.line) || 0);
-    });
 
-    // Pre-compute contributing units for each fn in `unique`. A unit
-    // contributes to a fn if either:
-    //   (a) it's an own-body unit — same file, hunk overlaps the fn's
-    //       line range (range computed via the same next-fn-start-1
-    //       approximation used in recomputeDiffSets), or
-    //   (b) it's a dep-def unit — the unit overlaps a Definition whose
-    //       DefId appears in fn.def_deps.
-    // We need a fn-end-line approximation up front so own-body matching
-    // works. Build it once per file — sort fns by line, use next.line-1
-    // (or +∞ for the last fn).
+    // Build per-file fn line ranges via next-fn-start-1, used both for
+    // "own-body unit" matching and for inferring a unit's containing fn
+    // when grouping.
     const fnEndLineByFnId = new Map();
-    {
-      const fnsByPath = new Map();
-      for (const f of (graph.functions || [])) {
-        const rel = defLocToRepoRel(f.def_loc && f.def_loc.file);
-        if (!rel) continue;
-        if (!fnsByPath.has(rel)) fnsByPath.set(rel, []);
-        fnsByPath.get(rel).push(f);
-      }
-      for (const list of fnsByPath.values()) {
-        list.sort(function (a, b) {
-          return (a.def_loc.line || 0) - (b.def_loc.line || 0);
-        });
-        for (let i = 0; i < list.length; i += 1) {
-          const startLine = list[i].def_loc.line || 0;
-          const endLine = i + 1 < list.length
-            ? Math.max(startLine, (list[i + 1].def_loc.line || 0) - 1)
-            : Number.MAX_SAFE_INTEGER;
-          fnEndLineByFnId.set(list[i].id, endLine);
-        }
+    const fnsByPath = new Map();
+    for (const f of (graph.functions || [])) {
+      const rel = defLocToRepoRel(f.def_loc && f.def_loc.file);
+      if (!rel) continue;
+      if (!fnsByPath.has(rel)) fnsByPath.set(rel, []);
+      fnsByPath.get(rel).push(f);
+    }
+    for (const list of fnsByPath.values()) {
+      list.sort(function (a, b) {
+        return (a.def_loc.line || 0) - (b.def_loc.line || 0);
+      });
+      for (let i = 0; i < list.length; i += 1) {
+        const startLine = list[i].def_loc.line || 0;
+        const endLine = i + 1 < list.length
+          ? Math.max(startLine, (list[i + 1].def_loc.line || 0) - 1)
+          : Number.MAX_SAFE_INTEGER;
+        fnEndLineByFnId.set(list[i].id, endLine);
       }
     }
 
-    // Quick lookup: defId → Definition record. Used to map dep-def
-    // contributors back to their source location.
+    // defId → Definition record (line range + name) for resolving
+    // dep-def units back to their source label.
     const defById = new Map();
-    for (const def of (graph.definitions || [])) {
-      defById.set(def.id, def);
-    }
+    for (const def of (graph.definitions || [])) defById.set(def.id, def);
 
-    // For one fn, collect every unit that contributes. Returns an array
-    // of {kind, label, file, line, unit}. `unit` is null for the
-    // synthetic "containing def" placeholder when the def itself has no
-    // emitted units yet (rare — usually the def's range overlaps a hunk
-    // and we have units for it).
-    function gatherContributingFor(fn) {
-      const out = [];
+    // Walk reachable fns and collect every contributing unit. We attach
+    // unit → contributingFn pairs so the renderer can group under the
+    // fn each contribution is "for". A given unit can appear under
+    // multiple fns (e.g. a struct edit flags every dependent fn) — we
+    // record each (unit, fn) pair separately.
+    //
+    // Each contribution: { unit, kind, file, line, fn, dep } where
+    //   - unit is the unit record (may be null for synthetic "no unit
+    //     overlaps the def" fallbacks),
+    //   - kind ∈ {"added", "removed", "dep"},
+    //   - dep is the Definition record when kind === "dep".
+    const contribs = [];
+    for (const fn of reachableFns) {
       const fnFileRel = defLocToRepoRel(fn.def_loc && fn.def_loc.file);
       const fnStart = fn.def_loc ? (fn.def_loc.line || 0) : 0;
       const fnEnd = fnEndLineByFnId.get(fn.id) || fnStart;
 
-      // (a) own-body units: any unit in fn's file with new_start within
-      //     [fnStart, fnEnd]. Use new_start because that's the line in
-      //     the post-edit file (which the user is reviewing).
+      // Own-body units.
       if (fnFileRel) {
-        const units = compareState.units || [];
-        for (const u of units) {
+        for (const u of (compareState.units || [])) {
           if (u.file !== fnFileRel) continue;
-          const start = u.new_start || u.old_start || 0;
-          if (start < fnStart || start > fnEnd) continue;
-          out.push({
-            kind: u.kind === "added" ? "own+" : "own-",
-            label: shortenFile(u.file) + ":" + start,
-            file: u.file,
-            line: start,
-            side: u.kind,
+          const line = u.new_start || u.old_start || 0;
+          if (line < fnStart || line > fnEnd) continue;
+          contribs.push({
             unit: u,
+            kind: u.kind, // "added" | "removed"
+            file: u.file,
+            line: line,
+            fn: fn,
+            dep: null,
           });
         }
       }
 
-      // (b) dep-def units: for each def in fn.def_deps that's also in
-      //     changedDefIds, list every unit overlapping the def's range.
-      const deps = fn.def_deps || [];
-      for (const did of deps) {
+      // Dep-def units. Iterate fn.def_deps ∩ changedDefIds.
+      // Definition records store absolute paths (`/home/alec/Zag/...`),
+      // but units come from `git diff` output and are repo-relative
+      // (`kernel/...`). Normalize the def's path before matching.
+      for (const did of (fn.def_deps || [])) {
         if (!compareState.changedDefIds.has(did)) continue;
         const def = defById.get(did);
         if (!def) continue;
-        const defFile = def.file;
+        const defFileRel = defLocToRepoRel(def.file) || def.file;
         const defStart = def.line_start || 0;
         const defEnd = def.line_end || defStart;
-        const defKind = (def.kind || "def");
-        const units = compareState.units || [];
-        let added = 0;
-        for (const u of units) {
-          if (u.file !== defFile) continue;
-          const start = u.new_start || u.old_start || 0;
-          if (start < defStart || start > defEnd) continue;
-          out.push({
-            kind: "dep " + defKind,
-            label: (def.name || "<def>") + " · " + shortenFile(defFile) + ":" + start,
-            file: defFile,
-            line: start,
-            side: u.kind,
+        let matched = 0;
+        for (const u of (compareState.units || [])) {
+          if (u.file !== defFileRel) continue;
+          const line = u.new_start || u.old_start || 0;
+          if (line < defStart || line > defEnd) continue;
+          contribs.push({
             unit: u,
+            kind: "dep",
+            file: defFileRel,
+            line: line,
+            fn: fn,
+            dep: def,
           });
-          added += 1;
+          matched += 1;
         }
-        // If the def is flagged but no fine-grained unit overlaps (rare —
-        // happens when the hunk granularity doesn't split cleanly along
-        // def boundaries), fall back to a single jump-to-def row.
-        if (added === 0) {
-          out.push({
-            kind: "dep " + defKind,
-            label: (def.name || "<def>") + " · " + shortenFile(defFile) + ":" + defStart,
-            file: defFile,
-            line: defStart,
-            side: "added",
+        if (matched === 0) {
+          // Fallback row when no unit cleanly overlaps the def — still
+          // gives the user a jump target.
+          contribs.push({
             unit: null,
+            kind: "dep",
+            file: defFileRel,
+            line: defStart,
+            fn: fn,
+            dep: def,
           });
         }
       }
-      // De-dupe by (file:line:side) so a unit doesn't appear twice when
-      // both halves of a paired (added+removed) hunk fall inside the
-      // same range.
-      const seenKey = new Set();
-      const deduped = [];
-      for (const c of out) {
-        const k = c.file + ":" + c.line + ":" + c.side;
-        if (seenKey.has(k)) continue;
-        seenKey.add(k);
-        deduped.push(c);
-      }
-      // Sort: own first, then dep; within each, by file then line.
-      deduped.sort(function (a, b) {
-        const aOwn = a.kind.startsWith("own") ? 0 : 1;
-        const bOwn = b.kind.startsWith("own") ? 0 : 1;
-        if (aOwn !== bOwn) return aOwn - bOwn;
-        if (a.file !== b.file) return a.file.localeCompare(b.file);
-        return a.line - b.line;
-      });
-      return deduped;
+    }
+
+    if (contribs.length === 0) {
+      els.diffChangesPanel.style.display = "";
+      els.diffChangesList.innerHTML = "";
+      const empty = document.createElement("div");
+      empty.className = "diff_changes_empty";
+      empty.textContent = "No reviewable hunks reachable from this entry.";
+      els.diffChangesList.appendChild(empty);
+      if (els.diffChangesCount) els.diffChangesCount.textContent = "0 of 0";
+      if (els.reviewProgressBar) els.reviewProgressBar.style.display = "none";
+      return;
+    }
+
+    // Group by file → fn (under each contribution's fn, since the same
+    // dep unit can appear under multiple fns). Within fn, sort by line.
+    const grouped = new Map(); // file → Map(fnKey → { fn, contribs[] })
+    for (const c of contribs) {
+      if (!grouped.has(c.file)) grouped.set(c.file, new Map());
+      const fnMap = grouped.get(c.file);
+      const fnKey = c.fn.name || c.fn.mangled || ("id:" + c.fn.id);
+      if (!fnMap.has(fnKey)) fnMap.set(fnKey, { fn: c.fn, contribs: [] });
+      fnMap.get(fnKey).contribs.push(c);
+    }
+    // Compute total unique-unit count for the panel-level progress bar.
+    // A single unit shared across multiple fns counts once for the
+    // overall denominator; each row still has its own checkbox but they
+    // all bind to the same compareState.reviewed entry.
+    const allUnitIds = new Set();
+    for (const c of contribs) {
+      if (c.unit) allUnitIds.add(c.unit.id);
+    }
+    const totalUnique = allUnitIds.size;
+    let reviewedUnique = 0;
+    for (const id of allUnitIds) {
+      const r = compareState.reviewed.get(id);
+      if (r && r.reviewed) reviewedUnique += 1;
     }
 
     els.diffChangesPanel.style.display = "";
     if (els.diffChangesCount) {
-      els.diffChangesCount.textContent = unique.length === 0
-        ? "(none reachable in this entry)"
-        : unique.length + " changed";
+      els.diffChangesCount.textContent = reviewedUnique + " of " + totalUnique +
+        (totalUnique > 0
+          ? "  (" + Math.round(100 * reviewedUnique / totalUnique) + "%)"
+          : "");
+    }
+    if (els.reviewProgressBar) {
+      els.reviewProgressBar.style.display = totalUnique > 0 ? "" : "none";
+    }
+    if (els.reviewProgressFill) {
+      const pct = totalUnique > 0 ? (100 * reviewedUnique / totalUnique) : 0;
+      els.reviewProgressFill.style.width = pct.toFixed(1) + "%";
     }
     els.diffChangesList.innerHTML = "";
-    if (unique.length === 0) {
-      const empty = document.createElement("div");
-      empty.className = "diff_changes_empty";
-      empty.textContent = "No changed fns reachable from this entry.";
-      els.diffChangesList.appendChild(empty);
-      return;
-    }
-    for (const fn of unique) {
-      const row = document.createElement("div");
-      row.className = "diff_changes_row";
-      row.title = fn.name;
 
-      const glyph = document.createElement("span");
-      glyph.className = "glyph";
-      glyph.textContent = "◆";
-      row.appendChild(glyph);
-
-      const name = document.createElement("span");
-      name.className = "fn_name";
-      name.textContent = fn.name || fn.mangled || ("#" + fn.id);
-      row.appendChild(name);
-
-      const loc = document.createElement("span");
-      loc.className = "fn_loc";
-      loc.textContent = shortenFile(fn.def_loc && fn.def_loc.file) +
-        ":" + ((fn.def_loc && fn.def_loc.line) || 0);
-      row.appendChild(loc);
-
-      row.addEventListener("click", function () {
-        // Drill the trace to this fn (mirrors to secondary). Also fire
-        // showNodePanel so the source pane lands on the changed file.
-        if (window.traceMode && window.traceMode.pushDrillByName) {
-          window.traceMode.pushDrillByName(fn.name);
-        }
-        showNodePanel({
-          id: "n" + fn.id,
-          fullName: fn.name,
-          label: fn.name,
-          mangled: fn.mangled,
-          file: fn.def_loc ? fn.def_loc.file : "",
-          line: fn.def_loc ? fn.def_loc.line : 0,
-          col: fn.def_loc ? fn.def_loc.col : 0,
-          isEntry: !!fn.is_entry,
-          entryKind: fn.entry_kind || "",
-          kind: "fn",
-        });
+    // Render: file groups in alphabetical order, fn groups in line
+    // order within file, contribs in line order within fn.
+    const sortedFiles = Array.from(grouped.keys()).sort();
+    for (const file of sortedFiles) {
+      const fnMap = grouped.get(file);
+      const fnEntries = Array.from(fnMap.values());
+      fnEntries.sort(function (a, b) {
+        return (a.fn.def_loc.line || 0) - (b.fn.def_loc.line || 0);
       });
 
-      els.diffChangesList.appendChild(row);
-
-      // Sub-rows: each contributing hunk is a button that jumps the
-      // source pane straight to the change. This is the "→ jump to
-      // hunks that flagged this fn" affordance — without it the user
-      // has to scroll the source pane manually after drilling, which
-      // is hard when the trigger is a struct edit elsewhere in the
-      // tree.
-      const contribs = gatherContributingFor(fn);
-      const ownCount = contribs.filter(function (c) { return c.kind.startsWith("own"); }).length;
-      const depCount = contribs.length - ownCount;
-      if (els.diffChangesCount && ownCount + depCount > 0) {
-        // Append per-fn count summary as a small badge after the loc
-        // (visible on this row only — the panel header already shows
-        // the total fn count).
-        const badge = document.createElement("span");
-        badge.className = "fn_badge";
-        const parts = [];
-        if (ownCount > 0) parts.push(ownCount + " own");
-        if (depCount > 0) parts.push(depCount + " dep");
-        badge.textContent = "(" + parts.join(", ") + ")";
-        row.insertBefore(badge, loc);
+      // File-group rollup: count of unique units in this file group +
+      // how many are reviewed.
+      const fileUnitIds = new Set();
+      for (const fnEntry of fnEntries) {
+        for (const c of fnEntry.contribs) {
+          if (c.unit) fileUnitIds.add(c.unit.id);
+        }
       }
-      for (const c of contribs) {
-        const sub = document.createElement("div");
-        sub.className = "diff_changes_subrow diff_changes_subrow_" +
-          (c.kind.startsWith("own") ? "own" : "dep");
-        sub.title = c.kind + " · " + c.label;
+      let fileReviewed = 0;
+      for (const id of fileUnitIds) {
+        const r = compareState.reviewed.get(id);
+        if (r && r.reviewed) fileReviewed += 1;
+      }
+      const fileTotal = fileUnitIds.size;
 
-        const sg = document.createElement("span");
-        sg.className = "subglyph";
-        sg.textContent = c.kind === "own+" ? "+"
-          : c.kind === "own-" ? "−"
-          : "Δ";
-        sub.appendChild(sg);
+      const fileGroup = document.createElement("div");
+      fileGroup.className = "review_file_group";
 
-        const sl = document.createElement("span");
-        sl.className = "sublabel";
-        sl.textContent = c.label;
-        sub.appendChild(sl);
+      const fileHeader = document.createElement("div");
+      fileHeader.className = "review_file_header";
+      if (fileTotal > 0 && fileReviewed === fileTotal) {
+        fileHeader.classList.add("fully_reviewed");
+      }
+      const fileName = document.createElement("span");
+      fileName.className = "file_name";
+      fileName.textContent = shortenFile(file);
+      fileHeader.appendChild(fileName);
 
-        sub.addEventListener("click", function (ev) {
-          ev.stopPropagation();
-          // Jump source pane straight to this hunk. We bypass
-          // showNodePanel because the panel metadata (caller's name +
-          // file:line) is already correct from the parent fn row click;
-          // re-rendering it for every contributing-hunk click would
-          // strobe the metadata and reset the call-tree pane unnecessarily.
-          els.info.classList.add("visible");
-          fetchSource(c.file, 1, 10000000, c.line);
+      const fileProgress = document.createElement("span");
+      fileProgress.className = "file_progress";
+      fileProgress.textContent = fileReviewed + " of " + fileTotal;
+      fileHeader.appendChild(fileProgress);
+
+      const fileMarkBtn = document.createElement("button");
+      fileMarkBtn.className = "review_group_action";
+      fileMarkBtn.type = "button";
+      fileMarkBtn.textContent = (fileReviewed === fileTotal && fileTotal > 0)
+        ? "unmark file"
+        : "mark file";
+      fileMarkBtn.addEventListener("click", function (ev) {
+        ev.stopPropagation();
+        // Toggle direction: if any unit in the file is unreviewed, mark
+        // the rest reviewed; otherwise unmark all.
+        const targetState = !(fileTotal > 0 && fileReviewed === fileTotal);
+        for (const id of fileUnitIds) {
+          const cur = compareState.reviewed.get(id);
+          const isReviewed = !!(cur && cur.reviewed);
+          if (isReviewed !== targetState) toggleUnitReviewed(id, targetState);
+        }
+      });
+      fileHeader.appendChild(fileMarkBtn);
+
+      fileHeader.addEventListener("click", function () {
+        // Click on file header (outside the button) opens the file in
+        // the source pane at line 1 — handy for browsing context.
+        els.info.classList.add("visible");
+        fetchSource(file, 1, 10000000, 1);
+      });
+      fileGroup.appendChild(fileHeader);
+
+      for (const fnEntry of fnEntries) {
+        const fn = fnEntry.fn;
+        const cs = fnEntry.contribs.slice();
+        cs.sort(function (a, b) {
+          // Own units first, then dep, then by line.
+          if (a.kind === "dep" && b.kind !== "dep") return 1;
+          if (a.kind !== "dep" && b.kind === "dep") return -1;
+          return a.line - b.line;
         });
 
-        els.diffChangesList.appendChild(sub);
+        // Per-fn rollup: unique unit count + reviewed.
+        const fnUnitIds = new Set();
+        for (const c of cs) {
+          if (c.unit) fnUnitIds.add(c.unit.id);
+        }
+        let fnReviewed = 0;
+        for (const id of fnUnitIds) {
+          const r = compareState.reviewed.get(id);
+          if (r && r.reviewed) fnReviewed += 1;
+        }
+        const fnTotal = fnUnitIds.size;
+
+        const fnGroup = document.createElement("div");
+        fnGroup.className = "review_fn_group";
+
+        const fnHeader = document.createElement("div");
+        fnHeader.className = "review_fn_header";
+        if (fnTotal > 0 && fnReviewed === fnTotal) {
+          fnHeader.classList.add("fully_reviewed");
+        }
+        const fnName = document.createElement("span");
+        fnName.className = "fn_name";
+        fnName.textContent = fn.name || fn.mangled || ("#" + fn.id);
+        fnHeader.appendChild(fnName);
+
+        const fnProgress = document.createElement("span");
+        fnProgress.className = "fn_progress";
+        fnProgress.textContent = fnReviewed + " of " + fnTotal;
+        fnHeader.appendChild(fnProgress);
+
+        if (fnTotal > 0) {
+          const fnMarkBtn = document.createElement("button");
+          fnMarkBtn.className = "review_group_action";
+          fnMarkBtn.type = "button";
+          fnMarkBtn.textContent = fnReviewed === fnTotal ? "unmark fn" : "mark fn";
+          fnMarkBtn.addEventListener("click", function (ev) {
+            ev.stopPropagation();
+            const targetState = !(fnTotal > 0 && fnReviewed === fnTotal);
+            for (const id of fnUnitIds) {
+              const cur = compareState.reviewed.get(id);
+              const isReviewed = !!(cur && cur.reviewed);
+              if (isReviewed !== targetState) toggleUnitReviewed(id, targetState);
+            }
+          });
+          fnHeader.appendChild(fnMarkBtn);
+        }
+
+        fnHeader.addEventListener("click", function () {
+          // Click on fn header drills the trace and opens the fn's def
+          // line in source pane.
+          if (window.traceMode && window.traceMode.pushDrillByName) {
+            window.traceMode.pushDrillByName(fn.name);
+          }
+          showNodePanel({
+            id: "n" + fn.id,
+            fullName: fn.name,
+            label: fn.name,
+            mangled: fn.mangled,
+            file: fn.def_loc ? fn.def_loc.file : "",
+            line: fn.def_loc ? fn.def_loc.line : 0,
+            col: fn.def_loc ? fn.def_loc.col : 0,
+            isEntry: !!fn.is_entry,
+            entryKind: fn.entry_kind || "",
+            kind: "fn",
+          });
+        });
+        fnGroup.appendChild(fnHeader);
+
+        for (const c of cs) {
+          const row = document.createElement("div");
+          row.className = "review_unit_row";
+          const unitId = c.unit ? c.unit.id : null;
+          const rec = unitId ? compareState.reviewed.get(unitId) : null;
+          const isReviewed = !!(rec && rec.reviewed);
+          if (isReviewed) row.classList.add("unit_reviewed");
+
+          // Checkbox — only for real units. Synthetic dep-fallback rows
+          // (no overlapping unit) get an em-dash placeholder so the row
+          // visually aligns but isn't checkable.
+          if (unitId) {
+            const cb = document.createElement("input");
+            cb.type = "checkbox";
+            cb.className = "unit_checkbox";
+            cb.dataset.unitId = unitId;
+            cb.checked = isReviewed;
+            cb.addEventListener("click", function (ev) {
+              ev.stopPropagation();
+              toggleUnitReviewed(unitId, cb.checked);
+            });
+            row.appendChild(cb);
+          } else {
+            // Synthetic dep-fallback row (no overlapping unit). Use a
+            // distinct class so DOM queries targeting real checkboxes
+            // don't accidentally pick this up.
+            const placeholder = document.createElement("span");
+            placeholder.className = "unit_checkbox_placeholder";
+            row.appendChild(placeholder);
+          }
+
+          const glyph = document.createElement("span");
+          glyph.className = "unit_glyph " +
+            (c.kind === "added" ? "added" :
+             c.kind === "removed" ? "removed" : "dep");
+          glyph.textContent = c.kind === "added" ? "+"
+            : c.kind === "removed" ? "−"
+            : "Δ";
+          row.appendChild(glyph);
+
+          const label = document.createElement("span");
+          label.className = "unit_label";
+          if (c.kind === "dep") {
+            label.textContent = (c.dep && c.dep.name ? c.dep.name : "<def>") +
+              "  " + shortenFile(c.file) + ":" + c.line;
+          } else {
+            label.textContent = "line " + c.line;
+          }
+          row.appendChild(label);
+
+          if (c.kind === "dep") {
+            const via = document.createElement("span");
+            via.className = "unit_dep_via";
+            via.textContent = "[dep]";
+            row.appendChild(via);
+          }
+
+          const tooltipParts = [
+            c.kind === "added" ? "added hunk" :
+              c.kind === "removed" ? "removed hunk" :
+              "dep-def hunk via " + (c.dep && c.dep.name ? c.dep.name : "?"),
+            shortenFile(c.file) + ":" + c.line,
+          ];
+          if (rec && rec.at) {
+            tooltipParts.push("reviewed at " + rec.at);
+          }
+          row.title = tooltipParts.join(" · ");
+
+          row.addEventListener("click", function () {
+            // Click anywhere outside the checkbox jumps source pane.
+            els.info.classList.add("visible");
+            fetchSource(c.file, 1, 10000000, c.line);
+          });
+
+          fnGroup.appendChild(row);
+        }
+        fileGroup.appendChild(fnGroup);
       }
+      els.diffChangesList.appendChild(fileGroup);
     }
   }
 

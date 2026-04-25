@@ -895,8 +895,9 @@
        on the actual diff. Without this, the user has to scan the entire
        tree for ◆ glyphs, which gets tedious on big entries. */
     .diff_changes_panel {
-      flex: 0 0 auto;
-      max-height: 28vh;
+      flex: 1 1 50%;
+      min-height: 120px;
+      max-height: 60vh;
       display: flex;
       flex-direction: column;
       background: var(--bg-elev);
@@ -971,9 +972,150 @@
       font-size: 10px;
       letter-spacing: 0.04em;
     }
-    /* Sub-rows: each contributing hunk under a flagged fn. Indented so
-       the visual hierarchy reads "fn → its contributing changes" at a
-       glance. Click jumps the source pane to that hunk's start line. */
+    /* Review tracker rows. The panel renders three nested levels:
+       1. file group — "kernel/proc/process.zig 3 of 7" + "Mark all"
+       2. fn group   — "performRestart 1 of 4" + "Mark fn"
+       3. unit row   — checkbox + ± glyph + label + jump click
+       The hierarchy lets the user mark a whole fn or whole file done
+       in one click, scan progress at a glance, and still drill into
+       individual hunks. */
+    .review_progress_bar {
+      flex: 1 1 auto;
+      max-width: 180px;
+      height: 4px;
+      background: rgba(255, 255, 255, 0.05);
+      border-radius: 2px;
+      overflow: hidden;
+      position: relative;
+    }
+    .review_progress_fill {
+      position: absolute;
+      left: 0; top: 0; bottom: 0;
+      background: #6fd17a;
+      transition: width 120ms ease-out;
+    }
+    .review_file_group {
+      border-top: 1px solid var(--border);
+    }
+    .review_file_group:first-child { border-top: none; }
+    .review_file_header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 10px;
+      background: rgba(255, 255, 255, 0.02);
+      cursor: pointer;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 11px;
+      color: var(--fg-bright);
+    }
+    .review_file_header:hover { background: rgba(74, 158, 255, 0.06); }
+    .review_file_header .file_name {
+      flex: 0 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .review_file_header .file_progress {
+      flex: 1 1 auto;
+      text-align: right;
+      color: var(--fg-dim);
+      font-size: 10px;
+    }
+    .review_file_header.fully_reviewed .file_name { color: #6fd17a; }
+    .review_file_header.fully_reviewed .file_progress { color: #6fd17a; }
+    .review_group_action {
+      flex: 0 0 auto;
+      font-family: inherit;
+      font-size: 10px;
+      padding: 1px 6px;
+      background: rgba(255, 255, 255, 0.03);
+      color: var(--fg-dim);
+      border: 1px solid var(--border);
+      border-radius: 3px;
+      cursor: pointer;
+    }
+    .review_group_action:hover {
+      background: rgba(74, 158, 255, 0.10);
+      color: var(--fg-bright);
+    }
+    .review_fn_group { padding-left: 0; }
+    .review_fn_header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 3px 10px 3px 20px;
+      cursor: pointer;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 10.5px;
+      color: var(--fg);
+    }
+    .review_fn_header:hover { background: rgba(74, 158, 255, 0.06); }
+    .review_fn_header .fn_name {
+      flex: 0 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .review_fn_header.fully_reviewed .fn_name {
+      color: #6fd17a;
+      text-decoration: line-through;
+      text-decoration-color: rgba(111, 209, 122, 0.4);
+    }
+    .review_fn_header .fn_progress {
+      flex: 1 1 auto;
+      text-align: right;
+      color: var(--fg-dim);
+      font-size: 10px;
+    }
+    .review_fn_header.fully_reviewed .fn_progress { color: #6fd17a; }
+    .review_unit_row {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      padding: 2px 10px 2px 38px;
+      cursor: pointer;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 10.5px;
+      color: var(--fg-dim);
+    }
+    .review_unit_row:hover {
+      background: rgba(74, 158, 255, 0.10);
+      color: var(--fg);
+    }
+    .review_unit_row.unit_reviewed { opacity: 0.55; }
+    .review_unit_row .unit_checkbox {
+      flex: 0 0 auto;
+      width: 11px; height: 11px;
+      accent-color: #6fd17a;
+      margin: 0;
+      cursor: pointer;
+    }
+    .review_unit_row .unit_checkbox_placeholder {
+      flex: 0 0 11px;
+      width: 11px; height: 11px;
+    }
+    .review_unit_row .unit_glyph {
+      flex: 0 0 12px;
+      text-align: center;
+      font-weight: 600;
+    }
+    .review_unit_row .unit_glyph.added   { color: #6fd17a; }
+    .review_unit_row .unit_glyph.removed { color: #f06060; }
+    .review_unit_row .unit_glyph.dep     { color: #b06ef0; }
+    .review_unit_row .unit_label {
+      flex: 1 1 auto;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+    .review_unit_row .unit_dep_via {
+      flex: 0 0 auto;
+      color: var(--fg-dim);
+      font-size: 10px;
+      font-style: italic;
+    }
+    /* Legacy classes kept for any in-flight transitional rendering. */
     .diff_changes_subrow {
       display: flex;
       align-items: center;
@@ -1360,8 +1502,11 @@
           <div class="trace_pane_label" id="trace_label_a" style="display: none;"></div>
           <div class="diff_changes_panel" id="diff_changes_panel" style="display: none;">
             <div class="diff_changes_header">
-              <span class="diff_changes_title">Changes in this entry</span>
+              <span class="diff_changes_title">Review tracker</span>
               <span class="diff_changes_count" id="diff_changes_count"></span>
+              <span class="review_progress_bar" id="review_progress_bar" style="display: none;">
+                <span class="review_progress_fill" id="review_progress_fill"></span>
+              </span>
             </div>
             <div class="diff_changes_list" id="diff_changes_list"></div>
           </div>
