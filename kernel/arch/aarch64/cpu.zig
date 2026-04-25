@@ -54,6 +54,18 @@ pub fn enableInterrupts() void {
     asm volatile ("msr daifclr, #0x2");
 }
 
+/// Read PSTATE.DAIF without modifying it. Returns true if PSTATE.I (bit 7
+/// of DAIF) is clear — i.e., IRQs are currently unmasked. Used by lockdep
+/// to detect IRQ-vs-process context at lock acquire sites.
+/// ARM ARM D5.2.1 (PSTATE), DAIF mask layout.
+pub fn interruptsEnabled() bool {
+    var daif: u64 = undefined;
+    asm volatile ("mrs %[daif], daif"
+        : [daif] "=r" (daif),
+    );
+    return (daif & (1 << 7)) == 0;
+}
+
 pub fn saveAndDisableInterrupts() u64 {
     // Read DAIF, then set PSTATE.I to mask IRQs.
     var daif: u64 = undefined;

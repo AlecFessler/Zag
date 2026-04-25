@@ -8,6 +8,7 @@ const gdt = zag.arch.x64.gdt;
 const idt = zag.arch.x64.idt;
 const paging = zag.arch.x64.paging;
 const scheduler = zag.sched.scheduler;
+const sync_debug = zag.utils.sync.debug;
 
 const InterruptHandler = idt.interruptHandler;
 const PrivilegeLevel = zag.arch.x64.cpu.PrivilegeLevel;
@@ -327,6 +328,15 @@ pub fn switchTo(thread: *Thread) void {
     }
 
     apic.endOfInterrupt();
+
+    // lockdep: this asm `jmp interruptStubEpilogue` abandons the call stack
+    // the IRQ-handler dispatcher (`dispatchInterrupt`) was using; its
+    // `defer exitIrqContext` never executes. Re-balance the per-core IRQ
+    // depth here so the counter doesn't drift upward each time an
+    // IRQ-driven preemption produces a context switch. No-op when called
+    // from non-IRQ paths (the depth is already zero there).
+    sync_debug.resetIrqContextOnSwitch();
+
     asm volatile (
         \\movq %[new_stack], %%rsp
         \\jmp interruptStubEpilogue
@@ -526,9 +536,23 @@ pub fn applyFaultRegs(ctx: *ArchCpuContext, snapshot: FaultRegSnapshot) void {
 }
 
 export fn dispatchInterrupt(ctx: *cpu.Context) void {
-    if (vector_table[ctx.int_num].handler) |h| {
+    const entry = vector_table[ctx.int_num];
+    if (entry.handler) |h| {
+        // lockdep: an `external` vector is an asynchronous device/IPI/timer
+        // interrupt — the CPU auto-masked IFLAG on entry (Intel SDM Vol 3A
+        // §6.8.1) and the running thread was *interrupted*, not making a
+        // synchronous call into the kernel. That is the only state in which
+        // the IRQ-mode-mix detector should treat this acquire as "from an
+        // IRQ handler." `exception` vectors (#PF, #GP, #UD, syscall stub at
+        // 0x80) are synchronous — they execute on top of whatever IRQ-mode
+        // discipline the interrupted code already chose, and must NOT count
+        // as IRQ-handler context.
+        const is_async_irq = entry.kind == .external;
+        if (is_async_irq) sync_debug.enterIrqContext();
+        defer if (is_async_irq) sync_debug.exitIrqContext();
+
         h(ctx);
-        if (vector_table[@intCast(ctx.int_num)].kind == .external) {
+        if (is_async_irq) {
             apic.endOfInterrupt();
         }
         return;

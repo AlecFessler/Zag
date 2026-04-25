@@ -52,6 +52,7 @@ const kprof_dump = zag.kprof.dump;
 const pmu = zag.arch.aarch64.pmu;
 const scheduler = zag.sched.scheduler;
 const serial = zag.arch.aarch64.serial;
+const sync_debug = zag.utils.sync.debug;
 const syscall_dispatch = zag.syscall.dispatch;
 
 const ArchCpuContext = zag.arch.aarch64.interrupts.ArchCpuContext;
@@ -528,6 +529,15 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
 /// ICC_IAR1_EL1), dispatches to the registered device handler, and
 /// signals end-of-interrupt (ICC_EOIR1_EL1).
 fn handleIrqLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
+    // lockdep: hardware took the IRQ vector with PSTATE.I masked
+    // (ARM ARM D1.10.4 — async exceptions auto-mask on entry), so any
+    // lock acquired beneath here is in async-IRQ-handler context. The
+    // synchronous-exception siblings (handleSyncLowerEl / handleSyncCurrentEl)
+    // intentionally don't enter this state — they run on top of whatever
+    // IRQ discipline the interrupted code chose.
+    sync_debug.enterIrqContext();
+    defer sync_debug.exitIrqContext();
+
     const intid = gic.acknowledgeInterrupt();
 
     // INTIDs 1020-1023 are all spurious / reserved (IHI 0069H §2.2.1,
@@ -593,6 +603,12 @@ fn handleSyncCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
 /// Handler for IRQ from Current EL (kernel-mode).
 /// ARM ARM D1.10.2, offset 0x280.
 fn handleIrqCurrentEl(ctx: *ArchCpuContext) callconv(.c) void {
+    // lockdep: see handleIrqLowerEl. The kernel-mode IRQ vector is just as
+    // much an async-IRQ-handler entry — the interrupted code may have been
+    // holding any locks at all when the IRQ landed.
+    sync_debug.enterIrqContext();
+    defer sync_debug.exitIrqContext();
+
     const intid = gic.acknowledgeInterrupt();
 
     if (gic.isSpurious(intid)) return;

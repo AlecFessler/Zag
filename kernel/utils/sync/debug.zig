@@ -41,6 +41,7 @@ pub const CheckResult = enum {
     panic_recursive,
     panic_same_class,
     panic_cycle,
+    panic_irq_mode_mix,
 };
 
 pub const CheckOutcome = struct {
@@ -55,6 +56,13 @@ pub const CheckOutcome = struct {
     /// True when the cycle was detected via multi-hop BFS rather than a direct
     /// inverse-pair lookup. In that case the prior srcs are not populated.
     cycle_transitive: bool = false,
+    /// For panic_irq_mode_mix: src of the first IRQ-handler-context acquire of
+    /// this class. The IRQ handler is the side that imposes the discipline.
+    irq_handler_src: SrcLoc = .{ .file = "", .fn_name = "", .line = 0, .column = 0, .module = "" },
+    /// For panic_irq_mode_mix: src of the first process-context acquire that
+    /// took this class with IRQs *enabled* (i.e. without lockIrqSave). The
+    /// pair (irq_handler_src, process_enabled_src) is the deadlock vector.
+    process_enabled_src: SrcLoc = .{ .file = "", .fn_name = "", .line = 0, .column = 0, .module = "" },
 };
 
 const PairEntry = struct {
@@ -184,8 +192,199 @@ const PairRegistry = struct {
     }
 };
 
+/// Per-class IRQ-mode table. Each class is a string-pointer.
+///
+/// The genuine deadlock vector this catches: a lock class that an *async IRQ
+/// handler* takes (CPU auto-masks IRQs on entry, so the handler always runs
+/// with IRQs disabled) is *also* taken from process context with IRQs left
+/// enabled (i.e. plain `lock()`, not `lockIrqSave`). If an IRQ lands on a
+/// core that already holds the lock from process context, the handler will
+/// spin forever waiting for the lock the interrupted code can't release.
+///
+/// We classify each acquire into one of three states using per-core IRQ-
+/// handler-depth instrumentation:
+///   1. in IRQ handler          → safe to acquire; this side imposes discipline.
+///   2. process context, IRQs disabled  → caller used lockIrqSave (or is in a
+///                                        nested IRQ-disabled section); safe.
+///   3. process context, IRQs enabled   → must NOT mix with state (1).
+///
+/// A class observed in both (1) and (3) is the bug. Mixing (2) with anything
+/// is fine — `lockIrqSave` is the documented escape hatch for "this class
+/// might be taken by an IRQ handler too."
+const CLASS_TABLE_CAPACITY: usize = 256;
+
+const ClassEntry = struct {
+    class: ?[*:0]const u8 = null,
+    seen_in_irq_handler: bool = false,
+    seen_in_process_irqs_enabled: bool = false,
+    first_irq_handler_src: SrcLoc = .{ .file = "", .fn_name = "", .line = 0, .column = 0, .module = "" },
+    first_process_enabled_src: SrcLoc = .{ .file = "", .fn_name = "", .line = 0, .column = 0, .module = "" },
+};
+
+const ClassTable = struct {
+    entries: [CLASS_TABLE_CAPACITY]ClassEntry = [_]ClassEntry{.{}} ** CLASS_TABLE_CAPACITY,
+    lock: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+
+    fn acquireLock(self: *ClassTable) void {
+        while (self.lock.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn releaseLock(self: *ClassTable) void {
+        self.lock.store(0, .release);
+    }
+
+    fn hash(class: [*:0]const u8) usize {
+        const a: usize = @intFromPtr(class);
+        return (a ^ (a >> 17)) % CLASS_TABLE_CAPACITY;
+    }
+
+    /// Record an acquire and return whether this acquire produces a genuine
+    /// IRQ-mode mismatch. The mismatch fires only when the class has been
+    /// observed BOTH in an async IRQ handler AND in process context with
+    /// IRQs enabled — that is the exact deadlock vector.
+    ///
+    /// Process-context-with-IRQs-disabled (lockIrqSave) is the safe pattern
+    /// and is silently ignored.
+    fn record(
+        self: *ClassTable,
+        class: [*:0]const u8,
+        in_irq_handler: bool,
+        irqs_enabled: bool,
+        src: SrcLoc,
+    ) struct { mismatch: bool, irq_handler_src: SrcLoc, process_enabled_src: SrcLoc } {
+        const empty: SrcLoc = .{ .file = "", .fn_name = "", .line = 0, .column = 0, .module = "" };
+
+        // Three classifications:
+        //   in_irq_handler             → state 1
+        //   !in_irq_handler &&  irqs_enabled  → state 3
+        //   !in_irq_handler && !irqs_enabled  → state 2 (lockIrqSave) — no-op
+        if (!in_irq_handler and !irqs_enabled) {
+            return .{ .mismatch = false, .irq_handler_src = empty, .process_enabled_src = empty };
+        }
+
+        var idx = hash(class);
+        var probes: usize = 0;
+        while (probes < CLASS_TABLE_CAPACITY) {
+            const e = &self.entries[idx];
+            if (e.class == null) {
+                e.class = class;
+                if (in_irq_handler) {
+                    e.seen_in_irq_handler = true;
+                    e.first_irq_handler_src = src;
+                } else {
+                    // process context, IRQs enabled.
+                    e.seen_in_process_irqs_enabled = true;
+                    e.first_process_enabled_src = src;
+                }
+                return .{ .mismatch = false, .irq_handler_src = empty, .process_enabled_src = empty };
+            }
+            if (e.class.? == class) {
+                if (in_irq_handler) {
+                    if (!e.seen_in_irq_handler) {
+                        e.seen_in_irq_handler = true;
+                        e.first_irq_handler_src = src;
+                    }
+                    if (e.seen_in_process_irqs_enabled) {
+                        // Both sides now seen → mismatch. Always report the
+                        // recorded "first" src so order of detection is stable.
+                        return .{
+                            .mismatch = true,
+                            .irq_handler_src = e.first_irq_handler_src,
+                            .process_enabled_src = e.first_process_enabled_src,
+                        };
+                    }
+                } else {
+                    // process context, IRQs enabled.
+                    if (!e.seen_in_process_irqs_enabled) {
+                        e.seen_in_process_irqs_enabled = true;
+                        e.first_process_enabled_src = src;
+                    }
+                    if (e.seen_in_irq_handler) {
+                        return .{
+                            .mismatch = true,
+                            .irq_handler_src = e.first_irq_handler_src,
+                            .process_enabled_src = e.first_process_enabled_src,
+                        };
+                    }
+                }
+                return .{ .mismatch = false, .irq_handler_src = empty, .process_enabled_src = empty };
+            }
+            idx = (idx + 1) % CLASS_TABLE_CAPACITY;
+            probes += 1;
+        }
+        return .{ .mismatch = false, .irq_handler_src = empty, .process_enabled_src = empty };
+    }
+
+    fn clear(self: *ClassTable) void {
+        var i: usize = 0;
+        while (i < CLASS_TABLE_CAPACITY) {
+            self.entries[i] = .{};
+            i += 1;
+        }
+    }
+};
+
 var held_stacks: [MAX_CORES]HeldStack align(64) = [_]HeldStack{.{}} ** MAX_CORES;
 var pair_registry: PairRegistry = .{};
+var class_table: ClassTable = .{};
+
+/// Per-core async-IRQ-handler nesting depth. Single-writer (always the local
+/// core, between IRQ entry and IRQ exit on that same core), so a plain `u8`
+/// without atomics is sufficient — no other core ever writes this slot. Reads
+/// from `acquire()` happen on the same local core, so they observe the
+/// counter the local IRQ entry just wrote (program order). The counter
+/// counts NESTED IRQ entries, which on x86 is normally 0 or 1 (IRQs stay
+/// masked in handlers) but on aarch64 can climb if a handler explicitly
+/// re-enables IRQs.
+var irq_depth: [MAX_CORES]u8 align(64) = [_]u8{0} ** MAX_CORES;
+
+/// Increment the local core's IRQ-handler depth. Call at the very top of
+/// every async-IRQ entry point (NOT for synchronous exceptions like page
+/// faults, GP faults, syscalls). Paired with `exitIrqContext` at exit.
+pub fn enterIrqContext() void {
+    if (!active) return;
+    if (@atomicLoad(u32, &smp_ready, .acquire) == 0) return;
+    const core_id = arch.smp.coreID();
+    if (core_id >= MAX_CORES) return;
+    irq_depth[@intCast(core_id)] +%= 1;
+}
+
+/// Decrement the local core's IRQ-handler depth. Must mirror every prior
+/// `enterIrqContext` call on the same core in nesting order.
+pub fn exitIrqContext() void {
+    if (!active) return;
+    if (@atomicLoad(u32, &smp_ready, .acquire) == 0) return;
+    const core_id = arch.smp.coreID();
+    if (core_id >= MAX_CORES) return;
+    irq_depth[@intCast(core_id)] -%= 1;
+}
+
+/// Returns true if the current core is executing an async-IRQ handler.
+pub fn inIrqContext() bool {
+    if (!active) return false;
+    if (@atomicLoad(u32, &smp_ready, .acquire) == 0) return false;
+    const core_id = arch.smp.coreID();
+    if (core_id >= MAX_CORES) return false;
+    return irq_depth[@intCast(core_id)] != 0;
+}
+
+/// Reset this core's IRQ-handler depth to 0. Called from arch context-switch
+/// paths just before a noreturn jmp that abandons the current call stack —
+/// the matching `exitIrqContext` defers in the IRQ entry function would
+/// never run, so without this the counter would drift upward by one for
+/// every IRQ-driven preemption.
+///
+/// On non-IRQ context-switch paths (yield-from-syscall, IPC block, etc.)
+/// the depth is already 0 and this is a no-op.
+pub fn resetIrqContextOnSwitch() void {
+    if (!active) return;
+    if (@atomicLoad(u32, &smp_ready, .acquire) == 0) return;
+    const core_id = arch.smp.coreID();
+    if (core_id >= MAX_CORES) return;
+    irq_depth[@intCast(core_id)] = 0;
+}
 
 /// Pure check + mutate. Returns the outcome rather than panicking so that
 /// tests can drive the logic without a real arch.smp.coreID().
@@ -252,6 +451,32 @@ pub fn acquireOn(
     return .{};
 }
 
+/// Pure check on class IRQ-mode consistency. Returns panic_irq_mode_mix when
+/// the class has been observed BOTH from inside an async IRQ handler AND
+/// from process context with IRQs enabled — i.e. the genuine deadlock vector.
+///
+/// `in_irq_handler` is true iff the local core's IRQ-handler depth > 0;
+/// see `enterIrqContext` / `exitIrqContext`. `irqs_enabled` is the raw CPU
+/// flag, used only to distinguish "lockIrqSave from process context" (safe)
+/// from "plain lock() from process context" (the bug side).
+pub fn checkIrqModeOn(
+    table: *ClassTable,
+    class: [*:0]const u8,
+    in_irq_handler: bool,
+    irqs_enabled: bool,
+    src: SrcLoc,
+) CheckOutcome {
+    table.acquireLock();
+    defer table.releaseLock();
+    const r = table.record(class, in_irq_handler, irqs_enabled, src);
+    if (!r.mismatch) return .{};
+    return .{
+        .result = .panic_irq_mode_mix,
+        .irq_handler_src = r.irq_handler_src,
+        .process_enabled_src = r.process_enabled_src,
+    };
+}
+
 /// Pure release. Pops the matching entry; returns false if not found
 /// (caller may have migrated cores between acquire and release).
 pub fn releaseOn(stack: *HeldStack, lock_ptr: *const anyopaque) bool {
@@ -292,6 +517,19 @@ pub fn acquire(
     const core_id = arch.smp.coreID();
     if (core_id >= MAX_CORES) return;
     const stack = &held_stacks[@intCast(core_id)];
+
+    // IRQ-mode mix check: a class taken inside an async IRQ handler AND from
+    // process context with IRQs enabled is the textbook deadlock vector
+    // (handler spins on the lock the interrupted code holds). Run BEFORE
+    // acquireOn so we report the bug at first detection, before the held
+    // stack rolls forward and obscures the situation.
+    const in_irq = irq_depth[@intCast(core_id)] != 0;
+    const irqs_enabled = arch.cpu.interruptsEnabled();
+    const irq_outcome = checkIrqModeOn(&class_table, class, in_irq, irqs_enabled, src);
+    if (irq_outcome.result != .ok) {
+        handleOutcome(irq_outcome, core_id, lock_ptr, class, src);
+    }
+
     const outcome = acquireOn(stack, &pair_registry, lock_ptr, class, ordered_group, src);
     handleOutcome(outcome, core_id, lock_ptr, class, src);
 }
@@ -384,6 +622,34 @@ fn handleOutcome(
             printDecimal("", src.line);
             arch.boot.printRaw("\n  fix: use lockPair / unlockPair to acquire same-class instances atomically\n");
             @panic("lockdep: same-class overlap");
+        },
+        .panic_irq_mode_mix => {
+            arch.boot.printRaw("lockdep: IRQ-mode mix on class=\"");
+            printCStr(class);
+            arch.boot.printRaw("\" core=");
+            printDecimal("", core_id);
+            arch.boot.printRaw("\n  IRQ-handler acquire at ");
+            arch.boot.printRaw(outcome.irq_handler_src.file);
+            arch.boot.printRaw(":");
+            printDecimal("", outcome.irq_handler_src.line);
+            arch.boot.printRaw(" in ");
+            arch.boot.printRaw(outcome.irq_handler_src.fn_name);
+            arch.boot.printRaw("\n  process-context acquire (IRQs ENABLED) at ");
+            arch.boot.printRaw(outcome.process_enabled_src.file);
+            arch.boot.printRaw(":");
+            printDecimal("", outcome.process_enabled_src.line);
+            arch.boot.printRaw(" in ");
+            arch.boot.printRaw(outcome.process_enabled_src.fn_name);
+            arch.boot.printRaw("\n  triggering acquire at ");
+            arch.boot.printRaw(src.file);
+            arch.boot.printRaw(":");
+            printDecimal("", src.line);
+            arch.boot.printRaw(" in ");
+            arch.boot.printRaw(src.fn_name);
+            arch.boot.printRaw("\n  fix: an IRQ landing while the process-context site holds this lock\n");
+            arch.boot.printRaw("       will deadlock when the handler tries to take the same class.\n");
+            arch.boot.printRaw("       Switch the process-context site to lockIrqSave/unlockIrqRestore.\n");
+            @panic("lockdep: IRQ-mode mix");
         },
         .panic_cycle => {
             if (outcome.cycle_transitive) {
@@ -723,6 +989,100 @@ test "acquireOn: stack overflow degrades but still checks panics" {
     const out_overflow = acquireOn(&stack, &reg, &locks[HELD_STACK_DEPTH], class_a, 1, makeSrc("a.zig", 100));
     try testing.expectEqual(CheckResult.ok, out_overflow.result);
     try testing.expectEqual(@as(u8, HELD_STACK_DEPTH), stack.depth);
+}
+
+// `checkIrqModeOn` is driven by two booleans:
+//   `in_irq_handler` — local-core async-IRQ-handler-depth > 0
+//   `irqs_enabled`   — raw CPU interrupt-flag state at acquire time
+//
+// Three classifications:
+//   in_irq_handler==true                              → IRQ-handler context
+//   in_irq_handler==false && irqs_enabled==false      → lockIrqSave (safe)
+//   in_irq_handler==false && irqs_enabled==true       → process-irqs-enabled
+//
+// Mismatch ⇔ both "IRQ-handler" and "process-irqs-enabled" observed.
+test "checkIrqModeOn: only lockIrqSave (process, IRQs disabled) — no panic" {
+    var table: ClassTable = .{};
+    table.clear();
+    const a: [*:0]const u8 = "A";
+    const out1 = checkIrqModeOn(&table, a, false, false, makeSrc("x.zig", 1));
+    const out2 = checkIrqModeOn(&table, a, false, false, makeSrc("x.zig", 2));
+    try testing.expectEqual(CheckResult.ok, out1.result);
+    try testing.expectEqual(CheckResult.ok, out2.result);
+}
+
+test "checkIrqModeOn: IRQ handler then process-IRQs-enabled — panic" {
+    var table: ClassTable = .{};
+    table.clear();
+    const a: [*:0]const u8 = "A";
+    _ = checkIrqModeOn(&table, a, true, false, makeSrc("handler.zig", 11));
+    const out = checkIrqModeOn(&table, a, false, true, makeSrc("proc.zig", 22));
+    try testing.expectEqual(CheckResult.panic_irq_mode_mix, out.result);
+    try testing.expectEqual(@as(u32, 11), out.irq_handler_src.line);
+    try testing.expectEqual(@as(u32, 22), out.process_enabled_src.line);
+}
+
+test "checkIrqModeOn: process-IRQs-enabled then IRQ handler — panic" {
+    var table: ClassTable = .{};
+    table.clear();
+    const a: [*:0]const u8 = "A";
+    _ = checkIrqModeOn(&table, a, false, true, makeSrc("proc.zig", 33));
+    const out = checkIrqModeOn(&table, a, true, false, makeSrc("handler.zig", 44));
+    try testing.expectEqual(CheckResult.panic_irq_mode_mix, out.result);
+    try testing.expectEqual(@as(u32, 44), out.irq_handler_src.line);
+    try testing.expectEqual(@as(u32, 33), out.process_enabled_src.line);
+}
+
+test "checkIrqModeOn: IRQ handler twice — no panic" {
+    var table: ClassTable = .{};
+    table.clear();
+    const a: [*:0]const u8 = "A";
+    const out1 = checkIrqModeOn(&table, a, true, false, makeSrc("h.zig", 1));
+    const out2 = checkIrqModeOn(&table, a, true, false, makeSrc("h.zig", 2));
+    try testing.expectEqual(CheckResult.ok, out1.result);
+    try testing.expectEqual(CheckResult.ok, out2.result);
+}
+
+test "checkIrqModeOn: lockIrqSave + IRQ handler — no panic (handler-only side)" {
+    var table: ClassTable = .{};
+    table.clear();
+    const a: [*:0]const u8 = "A";
+    _ = checkIrqModeOn(&table, a, false, false, makeSrc("p.zig", 1));
+    const out = checkIrqModeOn(&table, a, true, false, makeSrc("h.zig", 2));
+    try testing.expectEqual(CheckResult.ok, out.result);
+}
+
+test "checkIrqModeOn: lockIrqSave + process-IRQs-enabled — no panic (no IRQ-handler side)" {
+    var table: ClassTable = .{};
+    table.clear();
+    const a: [*:0]const u8 = "A";
+    _ = checkIrqModeOn(&table, a, false, false, makeSrc("p.zig", 1));
+    const out = checkIrqModeOn(&table, a, false, true, makeSrc("p.zig", 2));
+    try testing.expectEqual(CheckResult.ok, out.result);
+}
+
+test "checkIrqModeOn: lockIrqSave + handler + process-IRQs-enabled — panic on the third" {
+    var table: ClassTable = .{};
+    table.clear();
+    const a: [*:0]const u8 = "A";
+    const out1 = checkIrqModeOn(&table, a, false, false, makeSrc("p.zig", 1));
+    try testing.expectEqual(CheckResult.ok, out1.result);
+    const out2 = checkIrqModeOn(&table, a, true, false, makeSrc("h.zig", 2));
+    try testing.expectEqual(CheckResult.ok, out2.result);
+    const out3 = checkIrqModeOn(&table, a, false, true, makeSrc("p.zig", 3));
+    try testing.expectEqual(CheckResult.panic_irq_mode_mix, out3.result);
+    try testing.expectEqual(@as(u32, 2), out3.irq_handler_src.line);
+    try testing.expectEqual(@as(u32, 3), out3.process_enabled_src.line);
+}
+
+test "checkIrqModeOn: distinct classes do not interfere" {
+    var table: ClassTable = .{};
+    table.clear();
+    const a: [*:0]const u8 = "A";
+    const b: [*:0]const u8 = "B";
+    _ = checkIrqModeOn(&table, a, true, false, makeSrc("x.zig", 1));
+    const out = checkIrqModeOn(&table, b, false, true, makeSrc("x.zig", 2));
+    try testing.expectEqual(CheckResult.ok, out.result);
 }
 
 test "PairRegistry: insert + contains + lookup" {

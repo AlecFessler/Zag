@@ -58,6 +58,7 @@ const fpu = zag.sched.fpu;
 const gic = zag.arch.aarch64.gic;
 const paging = zag.arch.aarch64.paging;
 const scheduler = zag.sched.scheduler;
+const sync_debug = zag.utils.sync.debug;
 
 const Thread = zag.sched.thread.Thread;
 const VAddr = zag.memory.address.VAddr;
@@ -235,6 +236,14 @@ pub fn switchTo(thread: *Thread) noreturn {
     if (new_root.addr != paging.getAddrSpaceRoot().addr) {
         paging.swapAddrSpace(new_root, proc.addr_space_id);
     }
+
+    // lockdep: this asm `eret` abandons the call stack the IRQ-handler
+    // entry function (handleIrq*El) was using; its `defer exitIrqContext`
+    // never executes. Re-balance the per-core IRQ depth here so the
+    // counter doesn't drift upward each time an IRQ-driven preemption
+    // produces a context switch. No-op when called from non-IRQ paths
+    // (the depth is already zero there).
+    sync_debug.resetIrqContextOnSwitch();
 
     // Lazy FPU: CPACR_EL1.FPEN should trap iff `thread` isn't the
     // current FPU owner on this core. Track the desired state in a

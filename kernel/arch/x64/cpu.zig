@@ -407,6 +407,18 @@ pub fn restoreInterrupts(saved_rflags: u64) void {
     }
 }
 
+/// Intel SDM Vol 2A, "PUSHFQ" — captures RFLAGS without modifying any state.
+/// Returns true if the IF bit (bit 9) is set, i.e., maskable interrupts are
+/// currently enabled on this core. Used by lockdep to detect IRQ-vs-process
+/// context at lock acquire sites.
+pub fn interruptsEnabled() bool {
+    var rflags: u64 = 0;
+    asm volatile ("pushfq; pop %[out]"
+        : [out] "={rax}" (rflags),
+    );
+    return (rflags & (1 << 9)) != 0;
+}
+
 /// Intel SDM Vol 2A, "PUSHFQ" / "CLI" — atomically captures RFLAGS (including
 /// IF bit 9) then clears the interrupt flag. Caller must pass the returned value
 /// to `restoreInterrupts` to re-arm interrupts only if they were previously enabled.

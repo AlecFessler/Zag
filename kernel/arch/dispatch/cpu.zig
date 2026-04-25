@@ -195,6 +195,14 @@ pub fn enableInterrupts() void {
     }
 }
 
+pub fn interruptsEnabled() bool {
+    return switch (builtin.cpu.arch) {
+        .x86_64 => x64.cpu.interruptsEnabled(),
+        .aarch64 => aarch64.cpu.interruptsEnabled(),
+        else => unreachable,
+    };
+}
+
 pub fn saveAndDisableInterrupts() u64 {
     return switch (builtin.cpu.arch) {
         .x86_64 => x64.cpu.saveAndDisableInterrupts(),
