@@ -1,1 +1,2 @@
 arch/aarch64/acpi.zig:120-127    sha256:c1e5434ddc9cbcc1e6ed3d213cdda69e7e20c95c2094c5d07edf8e518ce5ec6f
+arch/aarch64/kvm/regs.zig:1-end    sha256:1518b91d549c99ab70d3f1fdcf10a4f79e07bb6e558c34c1c225c385552ba8e0
