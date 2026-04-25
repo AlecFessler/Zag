@@ -111,12 +111,21 @@ pub const BranchAtom = struct {
     arms: []const ArmSeq,
 };
 
+/// A `while` or `for` loop. The body is the (already-simplified) atom
+/// sequence produced by walking the loop body inline. Trace mode renders
+/// this with a ↻ glyph + a border so the user sees execution may iterate.
+pub const LoopAtom = struct {
+    loc: SourceLoc,
+    body: []const Atom,
+};
+
 /// One element of a function's intra-procedural sequence. After the simplify
-/// pass each Atom is either a single call or a branch where the arms differ
-/// in their callee sets.
+/// pass each Atom is a call, a branch whose arms differ as sequences, or a
+/// loop wrapping its body.
 pub const Atom = union(enum) {
     call: Callee,
     branch: BranchAtom,
+    loop: LoopAtom,
 
     pub fn jsonStringify(self: Atom, jw: anytype) !void {
         try jw.beginObject();
@@ -128,6 +137,10 @@ pub const Atom = union(enum) {
             .branch => |b| {
                 try jw.objectField("branch");
                 try jw.write(b);
+            },
+            .loop => |l| {
+                try jw.objectField("loop");
+                try jw.write(l);
             },
         }
         try jw.endObject();

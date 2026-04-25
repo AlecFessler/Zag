@@ -2,18 +2,19 @@
 //
 // Walks a function's AST body, collects every call expression (preserving
 // order), tracks the if/switch branch structure that wraps them, and runs a
-// simplify pass that collapses any branch whose arms produce identical sets
-// of resolved callees.
+// simplify pass that collapses any branch whose arms produce identical
+// *sequences* of callees (same atoms, same order, recursively).
 //
-// Loops (`while`/`for`) are NOT branches for this purpose — their body is
-// inlined into the enclosing sequence, since whether we iterate or not
-// doesn't change which functions get called. `try` is just a Call (the
-// implicit error-return path generates no callees).
+// Loops (`while`/`for`) emit a `Loop { body: []Atom }` wrapping their
+// body's atoms — Trace mode renders the loop with a ↻ border so the user
+// sees execution iterates. Graph mode reads the same body, just rendered
+// linearly. `try` is just a Call (the implicit error-return path generates
+// no callees).
 //
-// The output is a flat `[]types.Atom` slice: a sequence of `call` records
-// and `branch` records, with branches recursively nested through their
-// `arms[].seq`. Arms keep the calls in source order; the simplify pass
-// only removes branches, never reorders within a sequence.
+// The output is a flat `[]types.Atom` slice: a sequence of `call`, `branch`,
+// and `loop` records. Branches recursively nest through `arms[].seq` and
+// loops through `body`. Arms keep the calls in source order; the simplify
+// pass only removes branches, never reorders within a sequence.
 
 const std = @import("std");
 
@@ -26,6 +27,7 @@ const BranchKind = types.BranchKind;
 const Callee = types.Callee;
 const EdgeKind = types.EdgeKind;
 const FnId = types.FnId;
+const LoopAtom = types.LoopAtom;
 const SourceLoc = types.SourceLoc;
 
 pub const CallSiteMap = std.StringHashMap([]const Callee);
@@ -84,6 +86,7 @@ pub fn buildIntra(
 const IrNode = union(enum) {
     call: Callee,
     branch: BranchIr,
+    loop: LoopIr,
 };
 
 const BranchIr = struct {
@@ -95,6 +98,11 @@ const BranchIr = struct {
 const ArmIr = struct {
     label: []const u8,
     seq: std.ArrayList(IrNode),
+};
+
+const LoopIr = struct {
+    loc: SourceLoc,
+    body: std.ArrayList(IrNode),
 };
 
 const Ctx = struct {
@@ -141,18 +149,42 @@ fn walkExpr(
             try emitSwitch(ctx, node, out);
         },
 
-        // Loops — inline body, no branch.
+        // Loops — emit a Loop { body: ... }. Calls in the cond/inputs run
+        // before the loop decides whether to iterate, so they belong to the
+        // enclosing sequence; the else arm runs when the loop completes
+        // normally, also enclosing. The `cont_expr` runs each iteration so
+        // it lives inside the body.
         .while_simple, .while_cont, .@"while" => {
             const w = ctx.ast.fullWhile(node).?;
             try walkExpr(ctx, w.ast.cond_expr, out);
-            try walkExpr(ctx, w.ast.then_expr, out);
+            var body = std.ArrayList(IrNode){};
+            try walkExpr(ctx, w.ast.then_expr, &body);
+            if (w.ast.cont_expr.unwrap()) |c| try walkExpr(ctx, c, &body);
+            const loc = ctx.ast.tokenLocation(0, w.ast.while_token);
+            try out.append(ctx.arena, .{ .loop = .{
+                .loc = .{
+                    .file = ctx.file,
+                    .line = @intCast(loc.line + 1),
+                    .col = @intCast(loc.column + 1),
+                },
+                .body = body,
+            } });
             if (w.ast.else_expr.unwrap()) |e| try walkExpr(ctx, e, out);
-            if (w.ast.cont_expr.unwrap()) |c| try walkExpr(ctx, c, out);
         },
         .for_simple, .@"for" => {
             const f = ctx.ast.fullFor(node).?;
             for (f.ast.inputs) |inp| try walkExpr(ctx, inp, out);
-            try walkExpr(ctx, f.ast.then_expr, out);
+            var body = std.ArrayList(IrNode){};
+            try walkExpr(ctx, f.ast.then_expr, &body);
+            const loc = ctx.ast.tokenLocation(0, f.ast.for_token);
+            try out.append(ctx.arena, .{ .loop = .{
+                .loc = .{
+                    .file = ctx.file,
+                    .line = @intCast(loc.line + 1),
+                    .col = @intCast(loc.column + 1),
+                },
+                .body = body,
+            } });
             if (f.ast.else_expr.unwrap()) |e| try walkExpr(ctx, e, out);
         },
 
@@ -559,21 +591,34 @@ fn toOneLine(arena: std.mem.Allocator, s: []const u8) ![]const u8 {
 
 // ---------------------------------------------------------------- simplify
 
-/// Recursively simplify a sequence of IrNode in place. For each branch:
-///   1) recurse into each arm's seq.
-///   2) compute the callee set of each arm.
-///   3) if all arms have identical sets, replace the branch with one arm's
-///      contents (the longest arm — it has the most context for rendering).
+/// Recursively simplify a sequence of IrNode in place.
+///
+/// Branch handling (changed Apr 2026):
+///   1) recurse into each arm's seq + each loop's body.
+///   2) compare arms as ordered sequences (seqEqualIr).
+///   3) if all arms are pairwise sequence-equal, replace the branch with
+///      one arm's contents (the longest arm — it has the most context for
+///      rendering).
+///
+/// The old rule compared callee *sets*, which dropped execution-order
+/// information that Trace mode needs (and that Graph mode is now slightly
+/// more accurate for too). The new sequence-equality rule keeps any branch
+/// whose arms differ in *what runs in what order*, even when the union of
+/// callees is identical.
 fn simplifySeq(arena: std.mem.Allocator, seq: *std.ArrayList(IrNode)) void {
     var i: usize = 0;
     while (i < seq.items.len) {
         switch (seq.items[i]) {
             .call => i += 1,
+            .loop => {
+                simplifySeq(arena, &seq.items[i].loop.body);
+                i += 1;
+            },
             .branch => {
                 for (seq.items[i].branch.arms) |*arm| {
                     simplifySeq(arena, &arm.seq);
                 }
-                if (allArmsSameCalleeSet(seq.items[i].branch.arms)) {
+                if (allArmsSameSequence(seq.items[i].branch.arms)) {
                     const arms = seq.items[i].branch.arms;
                     var pick: usize = 0;
                     for (arms, 0..) |a, j| {
@@ -596,51 +641,58 @@ fn simplifySeq(arena: std.mem.Allocator, seq: *std.ArrayList(IrNode)) void {
     }
 }
 
-fn allArmsSameCalleeSet(arms: []ArmIr) bool {
+fn allArmsSameSequence(arms: []ArmIr) bool {
     if (arms.len <= 1) return true;
-    var ref = std.AutoHashMap(SetKey, void).init(std.heap.page_allocator);
-    defer ref.deinit();
-    collectCallees(arms[0].seq.items, &ref) catch return false;
-
+    const ref = arms[0].seq.items;
     var i: usize = 1;
     while (i < arms.len) : (i += 1) {
-        var other = std.AutoHashMap(SetKey, void).init(std.heap.page_allocator);
-        defer other.deinit();
-        collectCallees(arms[i].seq.items, &other) catch return false;
-        if (!setEqual(&ref, &other)) return false;
+        if (!seqEqualIr(ref, arms[i].seq.items)) return false;
     }
     return true;
 }
 
-const SetKey = u64;
-
-fn calleeKey(c: Callee) SetKey {
-    if (c.to) |id| return @as(u64, id) | (@as(u64, 1) << 32);
-    var h = std.hash.Wyhash.init(0);
-    h.update(c.name);
-    return h.final() & 0xFFFF_FFFF;
+/// Structural sequence equality for IrNode lists. Calls compare by `to+kind`
+/// (or by name+kind when `to` is null). Branches compare arm-by-arm
+/// (labels ignored, arm order significant). Loops compare by body sequence.
+fn seqEqualIr(a: []const IrNode, b: []const IrNode) bool {
+    if (a.len != b.len) return false;
+    var i: usize = 0;
+    while (i < a.len) : (i += 1) {
+        if (!nodeEqualIr(a[i], b[i])) return false;
+    }
+    return true;
 }
 
-fn collectCallees(nodes: []const IrNode, into: *std.AutoHashMap(SetKey, void)) !void {
-    for (nodes) |n| {
-        switch (n) {
-            .call => |c| try into.put(calleeKey(c), {}),
-            .branch => |b| {
-                for (b.arms) |arm| {
-                    try collectCallees(arm.seq.items, into);
+fn nodeEqualIr(a: IrNode, b: IrNode) bool {
+    switch (a) {
+        .call => |ac| switch (b) {
+            .call => |bc| return calleeEqual(ac, bc),
+            else => return false,
+        },
+        .branch => |ab| switch (b) {
+            .branch => |bb| {
+                if (ab.kind != bb.kind) return false;
+                if (ab.arms.len != bb.arms.len) return false;
+                var i: usize = 0;
+                while (i < ab.arms.len) : (i += 1) {
+                    if (!seqEqualIr(ab.arms[i].seq.items, bb.arms[i].seq.items)) return false;
                 }
+                return true;
             },
-        }
+            else => return false,
+        },
+        .loop => |al| switch (b) {
+            .loop => |bl| return seqEqualIr(al.body.items, bl.body.items),
+            else => return false,
+        },
     }
 }
 
-fn setEqual(a: *std.AutoHashMap(SetKey, void), b: *std.AutoHashMap(SetKey, void)) bool {
-    if (a.count() != b.count()) return false;
-    var it = a.iterator();
-    while (it.next()) |e| {
-        if (!b.contains(e.key_ptr.*)) return false;
-    }
-    return true;
+fn calleeEqual(a: Callee, b: Callee) bool {
+    if (a.kind != b.kind) return false;
+    if (a.to != null and b.to != null) return a.to.? == b.to.?;
+    if (a.to == null and b.to == null) return std.mem.eql(u8, a.name, b.name);
+    return false;
 }
 
 // ---------------------------------------------------------------- lower
@@ -660,6 +712,10 @@ fn lowerNode(arena: std.mem.Allocator, n: IrNode) anyerror!Atom {
             .kind = b.kind,
             .loc = b.loc,
             .arms = try lowerArms(arena, b.arms),
+        } },
+        .loop => |l| .{ .loop = .{
+            .loc = l.loc,
+            .body = try lowerSeq(arena, l.body.items),
         } },
     };
 }

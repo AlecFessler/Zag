@@ -21,6 +21,7 @@ const Graph = types.Graph;
 
 const index_html = @embedFile("assets/index.html");
 const app_js = @embedFile("assets/app.js");
+const trace_js = @embedFile("assets/trace.js");
 const cytoscape_js = @embedFile("assets/cytoscape.min.js");
 
 const SOURCE_MAX_BYTES: usize = 1 * 1024 * 1024;
@@ -79,6 +80,9 @@ fn handleRequest(
     }
     if (std.mem.eql(u8, path, "/static/app.js")) {
         return respondBytes(request, .ok, "application/javascript; charset=utf-8", app_js);
+    }
+    if (std.mem.eql(u8, path, "/static/trace.js")) {
+        return respondBytes(request, .ok, "application/javascript; charset=utf-8", trace_js);
     }
     if (std.mem.eql(u8, path, "/static/cytoscape.min.js")) {
         return respondBytes(request, .ok, "application/javascript; charset=utf-8", cytoscape_js);

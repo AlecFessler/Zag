@@ -584,6 +584,195 @@
       padding: 8px 4px;
     }
 
+    /* ---- Mode toggle (Graph | Trace) -------------------------------- */
+    .mode_toggle {
+      display: inline-flex;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .mode_button {
+      background: var(--bg-elev-2);
+      color: var(--fg-dim);
+      border: 0;
+      padding: 4px 12px;
+      cursor: pointer;
+      font: inherit;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-size: 11px;
+    }
+    .mode_button + .mode_button {
+      border-left: 1px solid var(--border);
+    }
+    .mode_button.active {
+      background: var(--accent);
+      color: #fff;
+      font-weight: 600;
+    }
+    .mode_button:hover:not(.active) {
+      background: #2f3540;
+      color: var(--fg);
+    }
+
+    /* ---- Trace breadcrumb ------------------------------------------- */
+    #trace_breadcrumb {
+      flex: 0 0 auto;
+      padding: 6px 16px;
+      background: var(--bg-elev);
+      border-bottom: 1px solid var(--border);
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 12px;
+      color: var(--fg-dim);
+      min-height: 26px;
+      transition: background 0.18s ease;
+    }
+    #trace_breadcrumb.flash {
+      background: rgba(240, 96, 96, 0.18);
+    }
+    #trace_breadcrumb .crumb {
+      color: var(--accent);
+      cursor: pointer;
+    }
+    #trace_breadcrumb .crumb:hover { text-decoration: underline; }
+    #trace_breadcrumb .crumb.current {
+      color: var(--fg-bright);
+      font-weight: 600;
+      cursor: default;
+    }
+    #trace_breadcrumb .crumb_sep {
+      color: var(--fg-dim);
+    }
+
+    /* ---- Trace view ------------------------------------------------- */
+    #trace_view {
+      flex: 1 1 auto;
+      min-width: 0;
+      min-height: 0;
+      background: var(--bg);
+      overflow: auto;
+      padding: 14px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 12px;
+      color: var(--fg);
+    }
+
+    .trace_box {
+      border: 1px solid #888;
+      border-radius: 4px;
+      padding: 6px 8px;
+      margin: 4px 0;
+      background: rgba(255, 255, 255, 0.012);
+    }
+
+    .trace_header {
+      display: flex;
+      gap: 10px;
+      align-items: baseline;
+      font-weight: 600;
+      letter-spacing: 0.01em;
+    }
+
+    .trace_title { color: var(--fg-bright); flex: 0 0 auto; }
+    .trace_title.clickable { cursor: pointer; color: var(--accent); }
+    .trace_title.clickable:hover { text-decoration: underline; }
+
+    .trace_loc {
+      color: var(--fg-dim);
+      font-size: 11px;
+      font-weight: 400;
+      margin-left: auto;
+    }
+
+    .trace_body { margin-top: 6px; }
+
+    .trace_empty {
+      color: var(--fg-dim);
+      font-style: italic;
+      padding: 2px 0;
+    }
+
+    /* Per-edge-kind border colors mirror the Cytoscape palette. */
+    .trace_box.kind_direct          { border-color: #888; }
+    .trace_box.kind_dispatch_x64    { border-color: #4a9eff; }
+    .trace_box.kind_dispatch_aarch64{ border-color: #3ec9c9; }
+    .trace_box.kind_vtable          { border-color: #b06ef0; }
+    .trace_box.kind_indirect        { border-color: #f06060; border-style: dashed; }
+    .trace_box.kind_leaf_userspace  { border-color: #f0a050; border-style: dashed; }
+
+    .trace_box.entry {
+      border-color: #4a9eff;
+      border-width: 2px;
+      background: rgba(74, 158, 255, 0.06);
+    }
+
+    .trace_box.trace_indirect {
+      border-color: #f06060;
+      border-style: dashed;
+      color: #f06060;
+    }
+    .trace_box.trace_indirect .trace_title { color: #f06060; font-style: italic; }
+
+    .trace_box.trace_recursive {
+      border-color: #d8a050;
+    }
+    .trace_box.trace_recursive .trace_title { color: #d8a050; }
+
+    .trace_box.trace_library {
+      border-color: #555;
+      background: rgba(255, 255, 255, 0.02);
+    }
+    .trace_box.trace_library .trace_title { color: #888; font-style: italic; }
+
+    .trace_box.trace_loop {
+      border-color: #4caf75;
+    }
+    .trace_box.trace_loop > .trace_header > .trace_title { color: #4caf75; }
+
+    .trace_box.trace_unknown { border-color: #555; color: var(--fg-dim); }
+
+    /* Branch — title row + columns under it. */
+    .trace_branch {
+      border: 1px dashed #3a4150;
+      border-radius: 4px;
+      padding: 6px;
+      margin: 4px 0;
+    }
+    .trace_branch_head {
+      display: flex;
+      gap: 10px;
+      align-items: baseline;
+      margin-bottom: 4px;
+    }
+    .trace_branch_kw {
+      color: var(--accent);
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      font-size: 11px;
+    }
+    .trace_branch_cols {
+      display: grid;
+      gap: 6px;
+      overflow-x: auto;
+      padding-bottom: 4px;
+    }
+    .trace_arm {
+      border-left: 2px solid #3a4150;
+      padding: 0 6px 6px 6px;
+      min-width: 0;
+    }
+    .trace_arm_label {
+      color: #d8a050;
+      font-size: 11px;
+      padding: 2px 0 4px 0;
+      letter-spacing: 0.02em;
+      border-bottom: 1px dashed #3a4150;
+      margin-bottom: 4px;
+      word-break: break-all;
+    }
+    .trace_arm_body { font-size: 12px; }
+
     /* ---- Status / overlays ------------------------------------------ */
     #status {
       position: absolute;
@@ -632,7 +821,14 @@
       <button id="fit_btn" type="button">fit to view</button>
       <button id="indirect_panel_btn" type="button">indirect calls</button>
       <button id="dead_panel_btn" type="button">dead code</button>
+
+      <div class="mode_toggle" id="mode_toggle">
+        <button class="mode_button active" data-mode="graph" type="button">Graph</button>
+        <button class="mode_button" data-mode="trace" type="button">Trace</button>
+      </div>
     </div>
+
+    <div id="trace_breadcrumb" style="display: none;"></div>
 
     <div id="body">
       <div id="graph">
@@ -646,6 +842,8 @@
           <div><span class="swatch dashed" style="color: #f0a050"></span>leaf_userspace</div>
         </div>
       </div>
+
+      <div id="trace_view" style="display: none;"></div>
 
       <aside id="info">
         <header>
@@ -681,7 +879,10 @@
   <!-- The Zig backend serves the JS at /static/...; for local preview with
        `python3 -m http.server` in the assets dir the same files live at the
        root. We probe HEAD /static/cytoscape.min.js once and pick whichever
-       prefix returns 200, then inject the two scripts in order. -->
+       prefix returns 200, then inject the scripts in order:
+         1) cytoscape.min.js (Graph mode dependency)
+         2) trace.js         (defines window.traceMode before app.js binds it)
+         3) app.js           (Graph + mode-toggle wiring) -->
   <script>
     (function () {
       function inject(prefix) {
@@ -689,7 +890,12 @@
         s1.src = prefix + "cytoscape.min.js";
         s1.onload = function () {
           var s2 = document.createElement("script");
-          s2.src = prefix + "app.js";
+          s2.src = prefix + "trace.js";
+          s2.onload = function () {
+            var s3 = document.createElement("script");
+            s3.src = prefix + "app.js";
+            document.body.appendChild(s3);
+          };
           document.body.appendChild(s2);
         };
         document.body.appendChild(s1);

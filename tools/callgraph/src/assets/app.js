@@ -27,6 +27,16 @@
     }
   })();
 
+  /** "graph" | "trace". Persisted in localStorage so reload preserves it. */
+  let currentMode = (function () {
+    try {
+      const m = localStorage.getItem("mode");
+      return m === "trace" ? "trace" : "graph";
+    } catch (_e) {
+      return "graph";
+    }
+  })();
+
   /** A function counts as "library" if it lives under /usr/lib/zig/ or its
    *  mangled name is one of the compiler-synthesized / runtime prefixes.
    *  See the spec at the top of this file for the full criteria. */
@@ -75,6 +85,10 @@
     listFilter: document.getElementById("list_filter"),
     listSummary: document.getElementById("list_summary"),
     listRows: document.getElementById("list_rows"),
+    modeToggle: document.getElementById("mode_toggle"),
+    traceView: document.getElementById("trace_view"),
+    traceBreadcrumb: document.getElementById("trace_breadcrumb"),
+    graphPane: document.getElementById("graph"),
   };
 
   /** ID of the currently-selected entry-point function. */
@@ -137,8 +151,21 @@
     fnById.clear();
     for (const fn of graph.functions || []) fnById.set(fn.id, fn);
 
+    // Wire trace.js with the shared lookups.
+    if (window.traceMode) {
+      window.traceMode.setContext({
+        fnById: fnById,
+        isLibrary: isLibrary,
+        showNodePanel: showNodePanel,
+      });
+    }
+
     populateDropdown(graph.entry_points || []);
     const firstId = firstVisibleEntryId(graph.entry_points || []);
+
+    // Apply persisted mode now that the DOM is wired and trace.js exists.
+    setMode(currentMode);
+
     if (firstId != null) {
       els.entrySelect.value = String(firstId);
       renderForEntry(firstId);
@@ -443,6 +470,12 @@
 
   function renderForEntry(entryFnId) {
     currentEntryFnId = entryFnId;
+    // Trace mode owns its own rendering pipeline; only let the graph
+    // builder run when the graph pane is the visible view.
+    if (currentMode === "trace") {
+      if (window.traceMode) window.traceMode.onEntryChange(entryFnId);
+      return;
+    }
     const depth = parseInt(els.depthSlider.value, 10) || 4;
     const includeIndirect = els.indirectToggle.checked;
 
@@ -1188,6 +1221,49 @@
       els.listFilter.addEventListener("input", function () {
         renderListRows(listRows, els.listFilter.value);
       });
+    }
+
+    // Mode toggle (Graph | Trace). Switching modes hides the other view's
+    // container but does not reset the entry selection. Drill state is
+    // preserved per-entry inside trace.js.
+    if (els.modeToggle) {
+      const buttons = els.modeToggle.querySelectorAll(".mode_button");
+      buttons.forEach(function (btn) {
+        btn.addEventListener("click", function () {
+          const m = btn.getAttribute("data-mode");
+          if (m && m !== currentMode) setMode(m);
+        });
+      });
+    }
+  }
+
+  /** Show one mode + hide the other; wires/unwires trace.js as needed. */
+  function setMode(mode) {
+    currentMode = mode;
+    try { localStorage.setItem("mode", mode); } catch (_e) {}
+
+    // Toggle button active state.
+    if (els.modeToggle) {
+      els.modeToggle.querySelectorAll(".mode_button").forEach(function (btn) {
+        if (btn.getAttribute("data-mode") === mode) btn.classList.add("active");
+        else btn.classList.remove("active");
+      });
+    }
+
+    if (mode === "trace") {
+      if (els.graphPane) els.graphPane.style.display = "none";
+      if (window.traceMode) {
+        window.traceMode.show();
+        if (currentEntryFnId != null) window.traceMode.onEntryChange(currentEntryFnId);
+      }
+    } else {
+      if (window.traceMode) window.traceMode.hide();
+      if (els.graphPane) els.graphPane.style.display = "";
+      // Re-render graph if we have an entry but no live cy (e.g. coming
+      // back from Trace mode).
+      if (currentEntryFnId != null && !cy) {
+        renderForEntry(currentEntryFnId);
+      }
     }
   }
 
