@@ -4,8 +4,10 @@ const ast = @import("ast/index.zig");
 const entry = @import("entry.zig");
 const ir = @import("ir/parse.zig");
 const join = @import("join.zig");
+const reachability = @import("reachability.zig");
 const server = @import("server.zig");
 const types = @import("types.zig");
+const verify = @import("verify.zig");
 
 const Args = struct {
     ir_path: []const u8 = "zig-out/kernel.ll",
@@ -78,46 +80,66 @@ pub fn main() !void {
     defer arena.deinit();
     const arena_allocator = arena.allocator();
 
-    const graph = if (args.demo_graph)
-        try buildDemoGraph(arena_allocator)
-    else blk: {
-        const ir_graph = try ir.parse(&arena, args.ir_path);
+    if (args.demo_graph) {
+        const graph = try buildDemoGraph(arena_allocator);
+        try server.serve(allocator, &graph, args.port);
+        return;
+    }
 
-        const walk = try ast.walkKernelFull(arena_allocator, args.kernel_root);
-        const ast_fns = walk.fns;
-        const file_count = countDistinctFiles(arena_allocator, ast_fns) catch ast_fns.len;
-        std.debug.print("ast: {d} functions across {d} files\n", .{ ast_fns.len, file_count });
+    const ir_graph = try ir.parse(&arena, args.ir_path);
 
-        const discovered = try entry.discover(
-            arena_allocator,
-            args.kernel_root,
-            args.arch,
-            ast_fns,
-            walk.asts,
-        );
-        printEntryStats(discovered);
+    const walk = try ast.walkKernelFull(arena_allocator, args.kernel_root);
+    const ast_fns = walk.fns;
+    const file_count = countDistinctFiles(arena_allocator, ast_fns) catch ast_fns.len;
+    std.debug.print("ast: {d} functions across {d} files\n", .{ ast_fns.len, file_count });
 
-        var stats: join.JoinStats = undefined;
-        const g = try join.buildGraphWithStats(
-            arena_allocator,
-            ir_graph,
-            ast_fns,
-            walk.asts,
-            discovered,
-            &stats,
-        );
-        const pct: f64 = if (stats.ir_total == 0)
-            0.0
-        else
-            100.0 * @as(f64, @floatFromInt(stats.matched)) / @as(f64, @floatFromInt(stats.ir_total));
-        std.debug.print("join: {d} / {d} IR functions matched to AST ({d:.1} %)\n", .{
-            stats.matched, stats.ir_total, pct,
-        });
-        std.debug.print("entry: {d} of {d} discovered entries matched IR functions\n", .{
-            g.entry_points.len, discovered.len,
-        });
-        break :blk g;
-    };
+    if (args.verify) {
+        // Verify mode short-circuits before the join + entry discovery so
+        // the diff sees the raw AST/IR sets without any reconciliation
+        // smoothing the numbers.
+        var stdout_buf: [16 * 1024]u8 = undefined;
+        var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+        try verify.run(allocator, &stdout_writer.interface, ir_graph, ast_fns, walk.asts);
+        return;
+    }
+
+    const discovered = try entry.discover(
+        arena_allocator,
+        args.kernel_root,
+        args.arch,
+        ast_fns,
+        walk.asts,
+    );
+    printEntryStats(discovered);
+
+    var stats: join.JoinStats = undefined;
+    var graph = try join.buildGraphWithStats(
+        arena_allocator,
+        ir_graph,
+        ast_fns,
+        walk.asts,
+        discovered,
+        &stats,
+    );
+    const pct: f64 = if (stats.ir_total == 0)
+        0.0
+    else
+        100.0 * @as(f64, @floatFromInt(stats.matched)) / @as(f64, @floatFromInt(stats.ir_total));
+    std.debug.print("join: {d} / {d} IR functions matched to AST ({d:.1} %)\n", .{
+        stats.matched, stats.ir_total, pct,
+    });
+    std.debug.print("entry: {d} of {d} discovered entries matched IR functions\n", .{
+        graph.entry_points.len, discovered.len,
+    });
+
+    const reach_stats = try reachability.compute(allocator, &graph);
+    const reach_pct: f64 = if (reach_stats.total == 0)
+        0.0
+    else
+        100.0 * @as(f64, @floatFromInt(reach_stats.reachable)) / @as(f64, @floatFromInt(reach_stats.total));
+    std.debug.print("reachability: {d} of {d} functions reachable from any entry point ({d:.1} %)\n", .{
+        reach_stats.reachable, reach_stats.total, reach_pct,
+    });
 
     try server.serve(allocator, &graph, args.port);
 }

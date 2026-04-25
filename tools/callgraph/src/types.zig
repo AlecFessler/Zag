@@ -60,6 +60,13 @@ pub const Function = struct {
     entry_kind: ?EntryKind = null,
     callees: []EnrichedEdge,
     intra: []const Atom = &.{},
+    /// Whether this function is reachable from any discovered entry point
+    /// via a forward walk over IR call edges. Indirect, vtable, and
+    /// leaf_userspace edges are not traversed during the reach pass —
+    /// indirect/vtable because the target is unknown post-monomorphization,
+    /// leaf_userspace because it's a synthetic terminator. Defaults true so
+    /// graphs without computed reachability render as before.
+    reachable: bool = true,
 };
 
 pub const EnrichedEdge = struct {

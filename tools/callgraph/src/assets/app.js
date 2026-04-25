@@ -26,6 +26,8 @@
     depthValue: document.getElementById("depth_value"),
     indirectToggle: document.getElementById("include_indirect"),
     fitBtn: document.getElementById("fit_btn"),
+    indirectPanelBtn: document.getElementById("indirect_panel_btn"),
+    deadPanelBtn: document.getElementById("dead_panel_btn"),
     graph: document.getElementById("graph"),
     info: document.getElementById("info"),
     infoTitle: document.getElementById("info_title"),
@@ -37,7 +39,16 @@
     infoIntra: document.getElementById("info_intra"),
     infoClose: document.getElementById("info_close"),
     status: document.getElementById("status"),
+    listPanel: document.getElementById("list_panel"),
+    listTitle: document.getElementById("list_title"),
+    listClose: document.getElementById("list_close"),
+    listFilter: document.getElementById("list_filter"),
+    listSummary: document.getElementById("list_summary"),
+    listRows: document.getElementById("list_rows"),
   };
+
+  /** ID of the currently-selected entry-point function. */
+  let currentEntryFnId = null;
 
   // ------------------------------------------------------------------ utils
 
@@ -368,6 +379,7 @@
   }
 
   function renderForEntry(entryFnId) {
+    currentEntryFnId = entryFnId;
     const depth = parseInt(els.depthSlider.value, 10) || 4;
     const includeIndirect = els.indirectToggle.checked;
 
@@ -673,6 +685,17 @@
         badge.textContent = d.entryKind || "entry";
         rows.push(metaRow("entry", badge));
       }
+      // Unreachable badge — pulled from the original Function record so we
+      // see the field even if the graph BFS didn't actually traverse here.
+      const fnIdNum = parseInt(String(d.id || "").replace(/^n/, ""), 10);
+      const fnRec = !Number.isNaN(fnIdNum) ? fnById.get(fnIdNum) : null;
+      if (fnRec && fnRec.reachable === false) {
+        const badge = document.createElement("span");
+        badge.className = "badge unreachable";
+        badge.textContent = "unreachable";
+        badge.title = "Not reachable from any discovered entry point via direct/dispatch IR call edges";
+        rows.push(metaRow("status", badge));
+      }
       for (const pair of rows) {
         els.infoMeta.appendChild(pair[0]);
         els.infoMeta.appendChild(pair[1]);
@@ -742,6 +765,231 @@
     clearIntra();
   }
 
+  // ------------------------------------------------------------------ list panel
+
+  /** All rows currently rendered in the list panel, kept around for filtering. */
+  let listRows = [];
+  /** "indirect" or "dead" — used by the row click handler. */
+  let listMode = null;
+
+  function showListPanel(title, rows, mode) {
+    listMode = mode;
+    listRows = rows;
+    els.listTitle.textContent = title;
+    els.listFilter.value = "";
+    renderListRows(rows, "");
+    els.listPanel.classList.add("visible");
+  }
+
+  function hideListPanel() {
+    els.listPanel.classList.remove("visible");
+    listRows = [];
+    listMode = null;
+  }
+
+  function renderListRows(rows, filter) {
+    els.listRows.innerHTML = "";
+    const needle = (filter || "").toLowerCase();
+    let shown = 0;
+    for (const row of rows) {
+      if (needle && !row.searchKey.includes(needle)) continue;
+      shown += 1;
+      const li = document.createElement("li");
+      li.className = "list_row";
+
+      const marker = document.createElement("span");
+      marker.className = "marker" + (row.markerClass ? " " + row.markerClass : "");
+      marker.textContent = row.marker || "?";
+      li.appendChild(marker);
+
+      const name = document.createElement("span");
+      name.className = "row_name";
+      name.textContent = row.name;
+      li.appendChild(name);
+
+      if (row.loc) {
+        const loc = document.createElement("span");
+        loc.className = "row_loc";
+        loc.textContent = row.loc;
+        li.appendChild(loc);
+      }
+
+      if (row.kindTag) {
+        const kt = document.createElement("span");
+        kt.className = "kind_tag";
+        kt.textContent = row.kindTag;
+        li.appendChild(kt);
+      }
+
+      li.addEventListener("click", function () {
+        handleListRowClick(row);
+      });
+
+      els.listRows.appendChild(li);
+    }
+
+    if (shown === 0) {
+      const empty = document.createElement("li");
+      empty.className = "list_empty";
+      empty.textContent = needle ? "no matches" : "(empty)";
+      els.listRows.appendChild(empty);
+    }
+
+    els.listSummary.textContent = filter
+      ? shown + " of " + rows.length + " shown"
+      : rows.length + " total";
+  }
+
+  function handleListRowClick(row) {
+    if (listMode === "indirect") {
+      // Row knows the caller fn id and the call-site location.
+      if (row.callerFnId != null && cy) {
+        const node = cy.$id("n" + row.callerFnId);
+        if (node && node.length > 0) {
+          cy.animate({ center: { eles: node }, duration: 200 });
+          node.flashClass("cy_flash", 600);
+        }
+      }
+      if (row.site && row.site.file) {
+        const start = Math.max(1, (row.site.line || 1) - 5);
+        const end = (row.site.line || 1) + 5;
+        // Show edge-style metadata in the right-hand info panel.
+        showEdgePanel({
+          kind: row.kindTag || "indirect",
+          targetName: row.targetName || "(unresolved)",
+          file: row.site.file,
+          line: row.site.line,
+          col: row.site.col || 0,
+        });
+        fetchSource(row.site.file, start, end, row.site.line);
+      }
+      return;
+    }
+    if (listMode === "dead") {
+      // Synthesize a function-detail panel even though Cytoscape's BFS
+      // graph won't have this node (it's unreachable from the current
+      // entry by definition).
+      if (row.fn) {
+        showNodePanel({
+          id: "n" + row.fn.id,
+          fullName: row.fn.name,
+          label: row.fn.name,
+          mangled: row.fn.mangled,
+          file: row.fn.def_loc ? row.fn.def_loc.file : "",
+          line: row.fn.def_loc ? row.fn.def_loc.line : 0,
+          col: row.fn.def_loc ? row.fn.def_loc.col : 0,
+          isEntry: !!row.fn.is_entry,
+          entryKind: row.fn.entry_kind || "",
+          kind: "fn",
+        });
+      }
+    }
+  }
+
+  /// Collect every indirect-call site reachable from the current entry,
+  /// using the same BFS rules as the graph view (depth from the slider,
+  /// indirect-toggle ignored — we always include them when the user
+  /// explicitly opens this panel).
+  function collectIndirectCalls(entryFnId, depth) {
+    const out = [];
+    if (entryFnId == null || !fnById.has(entryFnId)) return out;
+    const visited = new Set();
+    const queue = [{ id: entryFnId, depth: 0 }];
+    while (queue.length > 0) {
+      const cur = queue.shift();
+      if (visited.has(cur.id)) continue;
+      visited.add(cur.id);
+      const fn = fnById.get(cur.id);
+      if (!fn) continue;
+      const callees = fn.callees || [];
+      for (const c of callees) {
+        const k = c.kind || "direct";
+        if (k === "indirect" || k === "vtable") {
+          const file = c.site ? c.site.file : "";
+          out.push({
+            marker: "?",
+            markerClass: "",
+            name: fn.name + "  ->  " + (c.target_name || "(unresolved)"),
+            loc: file
+              ? shortenFile(file) + ":" + (c.site.line || 0)
+              : "",
+            kindTag: "kind: " + k,
+            searchKey: (
+              fn.name + " " +
+              (c.target_name || "") + " " +
+              file + " " + k
+            ).toLowerCase(),
+            callerFnId: fn.id,
+            targetName: c.target_name || "",
+            site: c.site || null,
+          });
+        }
+        if (c.to != null && fnById.has(c.to)) {
+          if (cur.depth < depth && !visited.has(c.to)) {
+            queue.push({ id: c.to, depth: cur.depth + 1 });
+          }
+        }
+      }
+    }
+    // Sort: caller name ASC, then site line.
+    out.sort(function (a, b) {
+      if (a.name === b.name) return 0;
+      return a.name < b.name ? -1 : 1;
+    });
+    return out;
+  }
+
+  function collectDeadFunctions() {
+    const out = [];
+    if (!graph || !graph.functions) return out;
+    for (const f of graph.functions) {
+      if (f.reachable === false) {
+        const file = f.def_loc ? f.def_loc.file : "";
+        const line = f.def_loc ? f.def_loc.line : 0;
+        out.push({
+          marker: "x",
+          markerClass: "dead",
+          name: f.name,
+          loc: file ? shortenFile(file) + ":" + line : "",
+          kindTag: "",
+          searchKey: (f.name + " " + (f.mangled || "") + " " + file).toLowerCase(),
+          fn: f,
+        });
+      }
+    }
+    out.sort(function (a, b) {
+      if (a.name === b.name) return 0;
+      return a.name < b.name ? -1 : 1;
+    });
+    return out;
+  }
+
+  function shortenFile(file) {
+    if (!file) return "";
+    // Trim absolute prefix up through "/kernel/" or "/usr/lib/zig/" so
+    // rows fit on screen.
+    const k = file.indexOf("/kernel/");
+    if (k >= 0) return file.slice(k + 1);
+    const z = file.indexOf("/usr/lib/zig/");
+    if (z >= 0) return file.slice(z + 1);
+    return file;
+  }
+
+  function openIndirectPanel() {
+    if (currentEntryFnId == null) {
+      setStatus("pick an entry point first", false);
+      return;
+    }
+    const depth = parseInt(els.depthSlider.value, 10) || 4;
+    const rows = collectIndirectCalls(currentEntryFnId, depth);
+    showListPanel("Indirect calls (current entry, depth " + depth + ")", rows, "indirect");
+  }
+
+  function openDeadPanel() {
+    const rows = collectDeadFunctions();
+    showListPanel("Dead code  (unreachable from any entry)", rows, "dead");
+  }
+
   // ------------------------------------------------------------------ events
 
   function wireEvents() {
@@ -768,6 +1016,21 @@
     });
 
     els.infoClose.addEventListener("click", hidePanel);
+
+    if (els.indirectPanelBtn) {
+      els.indirectPanelBtn.addEventListener("click", openIndirectPanel);
+    }
+    if (els.deadPanelBtn) {
+      els.deadPanelBtn.addEventListener("click", openDeadPanel);
+    }
+    if (els.listClose) {
+      els.listClose.addEventListener("click", hideListPanel);
+    }
+    if (els.listFilter) {
+      els.listFilter.addEventListener("input", function () {
+        renderListRows(listRows, els.listFilter.value);
+      });
+    }
   }
 
   // ------------------------------------------------------------------ demo data

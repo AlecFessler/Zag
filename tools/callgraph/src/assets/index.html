@@ -455,6 +455,135 @@
       animation: intra_flash 0.6s ease-out;
     }
 
+    /* ---- Unreachable badge ---------------------------------------- */
+    .badge.unreachable {
+      background: #3a1f23;
+      border-color: #7a2a30;
+      color: #ff9b8c;
+    }
+
+    /* ---- List panel (indirect calls / dead code) ------------------ */
+    #list_panel {
+      flex: 0 0 32%;
+      max-width: 520px;
+      min-width: 320px;
+      background: var(--bg-elev);
+      border-left: 1px solid var(--border);
+      overflow-y: auto;
+      padding: 16px;
+      display: none;
+    }
+
+    #list_panel.visible { display: block; }
+
+    #list_panel header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+
+    #list_panel h2 {
+      margin: 0;
+      font-size: 13px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--fg-bright);
+    }
+
+    #list_panel .close {
+      background: transparent;
+      border: none;
+      color: var(--fg-dim);
+      font-size: 18px;
+      cursor: pointer;
+      padding: 0 6px;
+    }
+
+    #list_panel .filter_row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+
+    #list_panel input[type="text"] {
+      flex: 1 1 auto;
+      background: var(--bg-elev-2);
+      color: var(--fg);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      font: inherit;
+      padding: 4px 8px;
+      outline: none;
+    }
+    #list_panel input[type="text"]:focus { border-color: var(--accent); }
+
+    #list_panel .summary {
+      color: var(--fg-dim);
+      font-size: 11px;
+      margin-bottom: 8px;
+    }
+
+    .list_rows {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 12px;
+    }
+
+    .list_row {
+      display: flex;
+      gap: 8px;
+      align-items: baseline;
+      padding: 4px 6px;
+      border-left: 2px solid transparent;
+      cursor: pointer;
+      border-radius: 3px;
+    }
+    .list_row:hover {
+      background: rgba(74, 158, 255, 0.08);
+      border-left-color: var(--accent);
+    }
+
+    .list_row .marker {
+      flex: 0 0 auto;
+      color: var(--indirect);
+      font-weight: bold;
+      width: 1em;
+      text-align: center;
+    }
+    .list_row .marker.dead {
+      color: var(--fg-dim);
+    }
+
+    .list_row .row_name {
+      flex: 1 1 auto;
+      color: var(--fg);
+      word-break: break-all;
+    }
+
+    .list_row .row_loc {
+      flex: 0 0 auto;
+      color: var(--fg-dim);
+      font-size: 11px;
+    }
+
+    .list_row .kind_tag {
+      flex: 0 0 auto;
+      color: var(--fg-dim);
+      font-size: 10px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .list_empty {
+      color: var(--fg-dim);
+      font-style: italic;
+      padding: 8px 4px;
+    }
+
     /* ---- Status / overlays ------------------------------------------ */
     #status {
       position: absolute;
@@ -497,6 +626,8 @@
       </div>
 
       <button id="fit_btn" type="button">fit to view</button>
+      <button id="indirect_panel_btn" type="button">indirect calls</button>
+      <button id="dead_panel_btn" type="button">dead code</button>
     </div>
 
     <div id="body">
@@ -527,6 +658,18 @@
           <div class="intra_header">CALL TREE</div>
           <div class="intra_body" id="info_intra"></div>
         </div>
+      </aside>
+
+      <aside id="list_panel">
+        <header>
+          <h2 id="list_title">List</h2>
+          <button class="close" id="list_close" type="button" aria-label="Close panel">&times;</button>
+        </header>
+        <div class="filter_row">
+          <input type="text" id="list_filter" placeholder="filter..." />
+        </div>
+        <div class="summary" id="list_summary"></div>
+        <ul class="list_rows" id="list_rows"></ul>
       </aside>
     </div>
   </div>
