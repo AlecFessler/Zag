@@ -580,6 +580,12 @@ const Commit = struct {
     author: []const u8,
     date: []const u8,
     subject: []const u8,
+    /// True iff this commit's `build.zig` supports `-Demit_ir`. Commits
+    /// older than the callgraph scaffold lack the option, can't produce
+    /// IR, and so can't be reviewed via this tool. The dropdown uses
+    /// this to fade incompatible commits instead of letting the user
+    /// pick one and watch it fail with a generic build error.
+    cg_compatible: bool,
 };
 
 const CommitList = struct {
@@ -640,6 +646,17 @@ fn handleCommits(
         ),
     }
 
+    // Compute the set of commits that contain the `-Demit_ir` build
+    // option in their ancestry. Anything not in this set predates the
+    // callgraph tool's scaffold and would fail with `invalid option:
+    // -Demit_ir` if the user tried to load it.
+    var compat_set = try buildEmitIrCompatSet(allocator, state.git_root);
+    defer {
+        var it_keys = compat_set.keyIterator();
+        while (it_keys.next()) |k| allocator.free(k.*);
+        compat_set.deinit();
+    }
+
     var commit_list = std.ArrayList(Commit){};
     defer commit_list.deinit(allocator);
     var line_it = std.mem.splitScalar(u8, result.stdout, '\n');
@@ -657,6 +674,7 @@ fn handleCommits(
             .author = author,
             .date = date,
             .subject = subject,
+            .cg_compatible = compat_set.contains(sha),
         });
     }
 
@@ -664,6 +682,74 @@ fn handleCommits(
     const blob = try std.json.Stringify.valueAlloc(allocator, payload, .{});
     defer allocator.free(blob);
     return respondBytes(request, .ok, "application/json; charset=utf-8", blob);
+}
+
+/// Build a set of full SHAs whose tree contains the `-Demit_ir` option.
+/// Strategy: find the commit that introduced "emit_ir" in build.zig, then
+/// `git rev-list <introducing>~..HEAD` enumerates the introducing commit
+/// plus all descendants reachable from HEAD — exactly the commits whose
+/// trees carry the option. On any error returns an empty set; callers
+/// then mark every commit incompatible, which is wrong but safe (the user
+/// can still try to load and get the real error).
+fn buildEmitIrCompatSet(
+    allocator: std.mem.Allocator,
+    git_root: []const u8,
+) !std.StringHashMap(void) {
+    var set = std.StringHashMap(void).init(allocator);
+    errdefer {
+        var it = set.keyIterator();
+        while (it.next()) |k| allocator.free(k.*);
+        set.deinit();
+    }
+
+    // 1. Find the introducing commit. `-G"emit_ir"` matches commits whose
+    //    diff added/removed any line containing "emit_ir". The oldest
+    //    such commit (last line of default reverse-chronological output)
+    //    is the one that introduced the option.
+    const find_argv = [_][]const u8{
+        "git",          "log",      "-G",
+        "emit_ir",      "--format=%H", "--",
+        "build.zig",
+    };
+    const find_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &find_argv,
+        .cwd = git_root,
+        .max_output_bytes = 1024 * 1024,
+    }) catch return set;
+    defer allocator.free(find_result.stdout);
+    defer allocator.free(find_result.stderr);
+
+    var oldest: []const u8 = "";
+    var line_it = std.mem.splitScalar(u8, find_result.stdout, '\n');
+    while (line_it.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len > 0) oldest = trimmed;
+    }
+    if (oldest.len == 0) return set;
+
+    // 2. Enumerate `<introducing>~..HEAD`. Includes the introducing
+    //    commit and all descendants reachable from HEAD.
+    const range = try std.fmt.allocPrint(allocator, "{s}~..HEAD", .{oldest});
+    defer allocator.free(range);
+    const list_argv = [_][]const u8{ "git", "rev-list", range };
+    const list_result = std.process.Child.run(.{
+        .allocator = allocator,
+        .argv = &list_argv,
+        .cwd = git_root,
+        .max_output_bytes = 16 * 1024 * 1024,
+    }) catch return set;
+    defer allocator.free(list_result.stdout);
+    defer allocator.free(list_result.stderr);
+
+    var sha_it = std.mem.splitScalar(u8, list_result.stdout, '\n');
+    while (sha_it.next()) |raw| {
+        const sha = std.mem.trim(u8, raw, " \t\r");
+        if (sha.len == 0) continue;
+        const owned = try allocator.dupe(u8, sha);
+        try set.put(owned, {});
+    }
+    return set;
 }
 
 const LoadStatusJson = struct {
