@@ -244,8 +244,8 @@
     .source_block {
       border: 1px solid var(--border);
       border-radius: 4px;
-      max-height: 50vh;
-      overflow-y: auto;
+      max-height: 60vh;
+      overflow: auto;
       background: #1e1e1e;
     }
 
@@ -743,12 +743,29 @@
     }
     .trace_box.trace_library .trace_title { color: #888; font-style: italic; }
 
+    .trace_box.trace_debug {
+      border-color: #d8a050;
+      border-style: dashed;
+      background: rgba(216, 160, 80, 0.05);
+    }
+    .trace_box.trace_debug .trace_title { color: #d8a050; font-style: italic; }
+
     .trace_box.trace_loop {
       border-color: #4caf75;
     }
     .trace_box.trace_loop > .trace_header > .trace_title { color: #4caf75; }
 
     .trace_box.trace_unknown { border-color: #555; color: var(--fg-dim); }
+
+    /* Direct call whose IR target was dropped (e.g. inlined helpers). The
+       AST resolver still gave us a qualified name; we render it as a leaf
+       with a dimmer border than `kind_direct` and no red — it's not
+       genuinely indirect. */
+    .trace_box.trace_inlined {
+      border-color: #555;
+      border-style: dotted;
+    }
+    .trace_box.trace_inlined .trace_title { color: #a0a8b3; }
 
     /* Branch — title row + columns under it.
        Columns use horizontal-scrolling flex (not grid) so that deeply-nested
@@ -860,6 +877,10 @@
 
       <div class="field">
         <label title="Hides functions in /usr/lib/zig/ and __zig_* / __ubsan_* / compiler_rt.* infrastructure. Your kernel code is never hidden."><input type="checkbox" id="hide_library" checked /> hide stdlib/compiler <span style="color: var(--fg-dim); cursor: help;">(?)</span></label>
+      </div>
+
+      <div class="field">
+        <label title="Hide std.debug, kprof tracing, *.assert, kernel/panic.zig downstream, and kernel/utils/debug.zig calls. Your panic entry stays visible."><input type="checkbox" id="hide_debug" checked /> hide debug code <span style="color: var(--fg-dim); cursor: help;">(?)</span></label>
       </div>
 
       <button id="fit_btn" type="button">fit to view</button>

@@ -33,6 +33,18 @@
     }
   })();
 
+  /** When true (default), hide debug-only call sites: std.debug.*, kprof
+   *  tracing, *.assert helpers, panic helpers, kernel/utils/debug.zig and
+   *  the downstream of kernel/panic.zig (panic.panic itself stays visible).
+   *  Persisted in localStorage so reload preserves the choice. */
+  let hideDebug = (function () {
+    try {
+      return localStorage.getItem("hideDebug") !== "false";
+    } catch (_e) {
+      return true;
+    }
+  })();
+
   /** "graph" | "trace". Persisted in localStorage so reload preserves it. */
   let currentMode = (function () {
     try {
@@ -63,6 +75,41 @@
     return hideLibrary && isLibrary(fn);
   }
 
+  /** A function (or call atom with a `name`/`def_loc`) counts as "debug" if
+   *  any of: name/mangled is std.debug.*, name contains .assert, name starts
+   *  with kprof. or panic / contains .panic, name ends with `Panic`, defined
+   *  in kernel/utils/debug.zig, or defined in kernel/panic.zig (except for
+   *  `panic.panic` itself — we keep the user-visible panic entry).
+   *
+   *  Accepts either a Function record (with mangled/name/def_loc) or a call
+   *  atom (with .name and optionally .site/.def_loc — the call atom will
+   *  miss the def_loc; for atoms we lean on the name. */
+  function isDebug(fn) {
+    if (!fn) return false;
+    const name = fn.name || "";
+    const mangled = fn.mangled || "";
+    const file = (fn.def_loc && fn.def_loc.file) || "";
+
+    if (mangled.startsWith("std.debug.") || name.startsWith("std.debug.")) return true;
+    if (name.indexOf(".assert") >= 0) return true;
+    if (name.startsWith("kprof.")) return true;
+    if (name.startsWith("panic") || name.indexOf(".panic") >= 0) {
+      // Spare the user-visible panic entry: `panic.panic` is the entry the
+      // user wants to see. Filter only its downstream (caught by the
+      // kernel/panic.zig file rule below).
+      if (name !== "panic.panic") return true;
+    }
+    if (name.endsWith("Panic")) return true;
+    if (file.endsWith("kernel/utils/debug.zig")) return true;
+    if (file.endsWith("kernel/panic.zig") && name !== "panic.panic") return true;
+    return false;
+  }
+
+  /** True when the debug filter is on AND fn is debug. */
+  function isFilteredDebug(fn) {
+    return hideDebug && isDebug(fn);
+  }
+
   // ------------------------------------------------------------------ DOM
 
   const els = {
@@ -72,6 +119,7 @@
     depthValue: document.getElementById("depth_value"),
     indirectToggle: document.getElementById("include_indirect"),
     hideLibraryToggle: document.getElementById("hide_library"),
+    hideDebugToggle: document.getElementById("hide_debug"),
     fitBtn: document.getElementById("fit_btn"),
     indirectPanelBtn: document.getElementById("indirect_panel_btn"),
     deadPanelBtn: document.getElementById("dead_panel_btn"),
@@ -221,7 +269,7 @@
       for (const e of graph.entry_points || []) {
         const fn = fnById.get(e.fn_id);
         if (fn && fn.name === prevEntryName) {
-          if (!isFiltered(fn)) {
+          if (!isFiltered(fn) && !isFilteredDebug(fn)) {
             nextEntryId = e.fn_id;
             break;
           }
@@ -250,6 +298,9 @@
       window.traceMode.setContext({
         fnById: fnById,
         isLibrary: isLibrary,
+        isDebug: isDebug,
+        getHideLibrary: function () { return hideLibrary; },
+        getHideDebug: function () { return hideDebug; },
         showNodePanel: showNodePanel,
       });
     }
@@ -279,12 +330,15 @@
     }
   }
 
-  /** First entry point that survives the library filter, or null. Used both
-   *  on initial load and when the user toggles the filter and we need to
-   *  pick a sensible default. */
+  /** First entry point that survives the library + debug filters, or null.
+   *  Used on initial load and whenever toggling a filter forces us to pick
+   *  a new sensible default. */
   function firstVisibleEntryId(entries) {
     for (const e of entries) {
-      if (!hideLibrary || !isFiltered(fnById.get(e.fn_id))) return e.fn_id;
+      const fn = fnById.get(e.fn_id);
+      if (isFiltered(fn)) continue;
+      if (isFilteredDebug(fn)) continue;
+      return e.fn_id;
     }
     return null;
   }
@@ -292,11 +346,15 @@
   function populateDropdown(entries) {
     els.entrySelect.innerHTML = "";
 
-    // Drop library entry points when the filter is on. Entry discovery is
-    // tuned for kernel patterns so this should be empty in practice, but it
-    // keeps the dropdown honest if the heuristics ever pick something up.
+    // Drop library/debug entry points when the filter is on. Entry
+    // discovery is tuned for kernel patterns so this should be empty in
+    // practice, but it keeps the dropdown honest if the heuristics ever
+    // pick something up.
     const visibleEntries = entries.filter(function (e) {
-      return !hideLibrary || !isFiltered(fnById.get(e.fn_id));
+      const fn = fnById.get(e.fn_id);
+      if (isFiltered(fn)) return false;
+      if (isFilteredDebug(fn)) return false;
+      return true;
     });
 
     if (visibleEntries.length === 0) {
@@ -355,10 +413,14 @@
       return elements;
     }
 
-    // If the entry itself is library and the filter is on, render nothing.
-    // (In practice entry discovery shouldn't pick up library fns; this is a
-    // safety net so we never silently emit only synthetic nodes.)
+    // If the entry itself is library/debug and the filter is on, render
+    // nothing. (In practice entry discovery shouldn't pick up library/debug
+    // fns; this is a safety net so we never silently emit only synthetic
+    // nodes.)
     if (isFiltered(fnById.get(entryFnId))) {
+      return elements;
+    }
+    if (isFilteredDebug(fnById.get(entryFnId))) {
       return elements;
     }
 
@@ -429,12 +491,17 @@
             classes: "synthetic unresolved",
           });
         } else {
-          // Resolved direct/dispatch/vtable target. If the target is library
-          // infrastructure and the filter is on, drop both the edge and any
-          // expansion past it: the caller node simply has fewer outgoing
-          // edges. The user wanted their kernel code, not what Zig wires in.
+          // Resolved direct/dispatch/vtable target. If the target is
+          // library or debug infrastructure and the matching filter is on,
+          // drop both the edge and any expansion past it: the caller node
+          // simply has fewer outgoing edges. The user wanted their kernel
+          // code, not what Zig wires in or what their debug tracing
+          // generated.
           const targetFn = fnById.get(c.to);
           if (isFiltered(targetFn)) {
+            continue;
+          }
+          if (isFilteredDebug(targetFn)) {
             continue;
           }
           targetNodeId = "n" + c.to;
@@ -820,8 +887,8 @@
         }
       }
       if (c.site && c.site.file) {
-        const start = Math.max(1, (c.site.line || 1) - 5);
-        const end = (c.site.line || 1) + 5;
+        const start = Math.max(1, (c.site.line || 1) - 10);
+        const end = (c.site.line || 1) + 20;
         fetchSource(c.site.file, start, end, c.site.line);
       }
     });
@@ -925,11 +992,11 @@
 
       els.info.classList.add("visible");
 
-      // 15-line window starting at the def line so the user sees the
-      // signature plus a few lines of body.
+      // 80-line window starting at the def line — usually shows the
+      // entire function body. The source_block scrolls if longer.
       if (d.file && d.line) {
         const start = Math.max(1, d.line);
-        const end = start + 14;
+        const end = start + 79;
         fetchSource(d.file, start, end, d.line);
       }
 
@@ -1116,6 +1183,7 @@
     const out = [];
     if (entryFnId == null || !fnById.has(entryFnId)) return out;
     if (isFiltered(fnById.get(entryFnId))) return out;
+    if (isFilteredDebug(fnById.get(entryFnId))) return out;
     const visited = new Set();
     const queue = [{ id: entryFnId, depth: 0 }];
     while (queue.length > 0) {
@@ -1124,9 +1192,10 @@
       visited.add(cur.id);
       const fn = fnById.get(cur.id);
       if (!fn) continue;
-      // Skip indirect rows where the *caller* is library; vector tables in
-      // stdlib formatters etc. aren't interesting for kernel work.
-      const callerFiltered = isFiltered(fn);
+      // Skip indirect rows where the *caller* is library or debug; vector
+      // tables in stdlib formatters or debug tracing aren't interesting
+      // for kernel work.
+      const callerFiltered = isFiltered(fn) || isFilteredDebug(fn);
       const callees = fn.callees || [];
       for (const c of callees) {
         const k = c.kind || "direct";
@@ -1151,9 +1220,10 @@
           });
         }
         if (c.to != null && fnById.has(c.to)) {
-          // Don't descend into library callees — keeps the BFS frontier
-          // anchored to the user's kernel code.
+          // Don't descend into library/debug callees — keeps the BFS
+          // frontier anchored to the user's non-debug kernel code.
           if (isFiltered(fnById.get(c.to))) continue;
+          if (isFilteredDebug(fnById.get(c.to))) continue;
           if (cur.depth < depth && !visited.has(c.to)) {
             queue.push({ id: c.to, depth: cur.depth + 1 });
           }
@@ -1177,6 +1247,9 @@
         // design — most of stdlib isn't used. Surfacing them here buries
         // the genuinely interesting cases (kernel functions nothing calls).
         if (isFiltered(f)) continue;
+        // Debug helpers (asserts, kprof tracing, panic downstream) skew
+        // the dead-code list when the toggle is on.
+        if (isFilteredDebug(f)) continue;
         const file = f.def_loc ? f.def_loc.file : "";
         const line = f.def_loc ? f.def_loc.line : 0;
         out.push({
@@ -1233,6 +1306,35 @@
     );
   }
 
+  /** Repopulate the dropdown and re-render the current view after a
+   *  visibility filter (library or debug) toggle. Preserves the current
+   *  selection if it survives both filters; else falls back to the first
+   *  visible entry. In trace mode, prefer rerender() so the user keeps
+   *  their drill stack. */
+  function applyVisibilityFilters() {
+    populateDropdown(graph ? (graph.entry_points || []) : []);
+    let target = currentEntryFnId;
+    let entryStillValid = false;
+    if (target != null) {
+      const fn = fnById.get(target);
+      if (isFiltered(fn) || isFilteredDebug(fn)) target = null;
+      else entryStillValid = true;
+    }
+    if (target == null && graph) {
+      target = firstVisibleEntryId(graph.entry_points || []);
+    }
+    if (target != null) {
+      els.entrySelect.value = String(target);
+      if (currentMode === "trace" && entryStillValid && window.traceMode) {
+        // Keep the user's drill stack — the entry hasn't actually changed.
+        window.traceMode.rerender();
+      } else {
+        renderForEntry(target);
+      }
+    }
+    refreshOpenListPanel();
+  }
+
   /** Re-run whichever list panel is currently open. Called when the library
    *  filter is toggled so the visible counts/rows stay in sync. */
   function refreshOpenListPanel() {
@@ -1277,23 +1379,16 @@
       els.hideLibraryToggle.addEventListener("change", function () {
         hideLibrary = els.hideLibraryToggle.checked;
         try { localStorage.setItem("hideLibrary", hideLibrary ? "true" : "false"); } catch (_e) {}
-        // Repopulate the dropdown — entries themselves can be filtered.
-        // Preserve the current selection if it survives the filter; else
-        // fall back to the first visible entry.
-        populateDropdown(graph ? (graph.entry_points || []) : []);
-        let target = currentEntryFnId;
-        if (target != null) {
-          const fn = fnById.get(target);
-          if (hideLibrary && isFiltered(fn)) target = null;
-        }
-        if (target == null && graph) {
-          target = firstVisibleEntryId(graph.entry_points || []);
-        }
-        if (target != null) {
-          els.entrySelect.value = String(target);
-          renderForEntry(target);
-        }
-        refreshOpenListPanel();
+        applyVisibilityFilters();
+      });
+    }
+
+    if (els.hideDebugToggle) {
+      els.hideDebugToggle.checked = hideDebug;
+      els.hideDebugToggle.addEventListener("change", function () {
+        hideDebug = els.hideDebugToggle.checked;
+        try { localStorage.setItem("hideDebug", hideDebug ? "true" : "false"); } catch (_e) {}
+        applyVisibilityFilters();
       });
     }
 

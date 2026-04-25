@@ -29,8 +29,28 @@
   let ctx = {
     fnById: null,           // Map<fnId, fn>
     isLibrary: function () { return false; },
+    isDebug: function () { return false; },
+    getHideLibrary: function () { return true; },
+    getHideDebug: function () { return true; },
     showNodePanel: null,    // open the right-hand info panel for a fn
   };
+
+  /** name-or-mangled -> Function record index, rebuilt every time
+   *  setContext fires with a fresh fnById. Used for the name-fallback
+   *  lookup when a call atom has `to: null` but the resolver gave it a
+   *  qualified name (typical for fully-inlined helpers like
+   *  `arch.dispatch.cpu.kEntry`). */
+  let fnByName = new Map();
+
+  function rebuildFnByName(fnById) {
+    fnByName = new Map();
+    if (!fnById) return;
+    fnById.forEach(function (fn) {
+      if (!fn) return;
+      if (fn.name) fnByName.set(fn.name, fn);
+      if (fn.mangled && !fnByName.has(fn.mangled)) fnByName.set(fn.mangled, fn);
+    });
+  }
 
   // ------------------------------------------------------------------ state
 
@@ -134,8 +154,14 @@
   // ------------------------------------------------------------------ public api
 
   function setContext(c) {
-    if (c.fnById) ctx.fnById = c.fnById;
+    if (c.fnById) {
+      ctx.fnById = c.fnById;
+      rebuildFnByName(c.fnById);
+    }
     if (c.isLibrary) ctx.isLibrary = c.isLibrary;
+    if (c.isDebug) ctx.isDebug = c.isDebug;
+    if (c.getHideLibrary) ctx.getHideLibrary = c.getHideLibrary;
+    if (c.getHideDebug) ctx.getHideDebug = c.getHideDebug;
     if (c.showNodePanel) ctx.showNodePanel = c.showNodePanel;
   }
 
@@ -234,11 +260,28 @@
     // Build the entire tree as an in-memory subtree first, then attach in
     // one shot. Avoids per-node reflow on big trees (kEntry can produce
     // many thousands of nested boxes).
-    const visited = new Set([rootId]);
+    //
+    // Recursion guard: visited keys are node-identity strings (`id:N` for
+    // fns we expanded by id, `name:foo` for fns we expanded by name
+    // fallback). The string-keyed approach keeps name-resolved-but-id-null
+    // call atoms protected from infinite recursion the same way id-based
+    // expansion is.
+    const rootKey = nodeKeyFor(fn);
+    const visited = new Set([rootKey]);
     const tree = buildFnBox(fn, visited);
-    visited.delete(rootId);
+    visited.delete(rootKey);
 
     els.view.appendChild(tree);
+  }
+
+  /** Build the recursion-guard key for a Function record. Prefer `id` when
+   *  the IR knows the function; fall back to qualified name (so
+   *  name-resolved fns with `id == null` still get protected). */
+  function nodeKeyFor(fn) {
+    if (!fn) return "name:?";
+    if (fn.id != null) return "id:" + fn.id;
+    if (fn.name) return "name:" + fn.name;
+    return "name:?";
   }
 
   function renderBreadcrumb() {
@@ -355,30 +398,62 @@
   function buildCallBox(c, visited) {
     const kind = c.kind || "direct";
 
-    // Indirect / unresolved leaf.
-    if (c.to == null || (kind === "indirect" && c.to == null)) {
+    // Resolve the target function via two lookups:
+    //   1) `to` (id) — present when LLVM emitted a `define` for the callee.
+    //   2) `name` / `mangled` — name-fallback for inlined helpers etc.
+    //      The AST resolver attaches a qualified name to the call atom even
+    //      when the IR has no separate function record (e.g. `inline fn`s
+    //      get inlined into the caller). Without this fallback, trace mode
+    //      dead-ends at boxes like `arch.dispatch.cpu.kEntry` even though
+    //      we *do* have a function record under that name.
+    let fn = null;
+    if (c.to != null && ctx.fnById) fn = ctx.fnById.get(c.to) || null;
+    if (!fn && c.name) fn = fnByName.get(c.name) || null;
+    if (!fn && c.mangled) fn = fnByName.get(c.mangled) || null;
+
+    // Apply the debug filter *before* the indirect render so that a debug
+    // helper that happens to be reached indirectly still renders as a
+    // closed debug leaf (and we don't traverse callees).
+    if (fn && ctx.getHideDebug && ctx.getHideDebug() && ctx.isDebug && ctx.isDebug(fn)) {
+      return makeLeafBox("↓ debug: " + shortName(fn.name), c.site, "trace_debug");
+    }
+    if (!fn && ctx.getHideDebug && ctx.getHideDebug() && ctx.isDebug && ctx.isDebug(c)) {
+      return makeLeafBox("↓ debug: " + (c.name || "(debug)"), c.site, "trace_debug");
+    }
+
+    // Genuinely indirect: kind says so AND we have nothing resolved.
+    if (!fn && kind === "indirect") {
       return makeLeafBox("? indirect: " + (c.name || "(unresolved)"), c.site, "trace_indirect");
     }
 
-    const fn = ctx.fnById ? ctx.fnById.get(c.to) : null;
+    // Direct/dispatch/vtable target whose IR record we don't have. The
+    // most common case: a direct call to an `inline fn` that LLVM
+    // dropped. Render the qualified name as a leaf with a dimmer border
+    // (NOT red, NOT marked indirect — it's a known target).
     if (!fn) {
+      if (kind === "direct" && c.name) {
+        return makeLeafBox(c.name, c.site, "trace_inlined");
+      }
       return makeLeafBox("? " + (c.name || "(unknown)"), c.site, "trace_unknown");
     }
 
     // Library leaf.
-    if (ctx.isLibrary && ctx.isLibrary(fn)) {
+    if (ctx.isLibrary && ctx.isLibrary(fn) && ctx.getHideLibrary && ctx.getHideLibrary()) {
       return makeLeafBox("→ stdlib: " + shortName(fn.name), c.site, "trace_library");
     }
 
     // Recursion guard — fn already on the active call stack from this path.
-    if (visited.has(fn.id)) {
+    // Use a node-identity key (id-or-name) so name-fallback expansions are
+    // protected the same way id-based expansions are.
+    const key = nodeKeyFor(fn);
+    if (visited.has(key)) {
       return makeLeafBox("↻ recursive: " + shortName(fn.name), c.site, "trace_recursive");
     }
 
     // Recurse into the callee.
-    visited.add(fn.id);
+    visited.add(key);
     const inner = buildFnBox(fn, visited);
-    visited.delete(fn.id);
+    visited.delete(key);
 
     // Color-code the box border by edge kind so the user sees how the
     // call resolved (direct / dispatch_x64 / vtable / ...).
@@ -504,6 +579,13 @@
     return box;
   }
 
+  /** Re-run the current render without disturbing the drill stack. Useful
+   *  after a filter-toggle change (library/debug) where the user expects
+   *  the same drilled-into view, just with newly-filtered leaves. */
+  function rerender() {
+    render();
+  }
+
   // ------------------------------------------------------------------ export
   window.traceMode = {
     setContext: setContext,
@@ -511,5 +593,6 @@
     show: show,
     hide: hide,
     render: render,
+    rerender: rerender,
   };
 })();
