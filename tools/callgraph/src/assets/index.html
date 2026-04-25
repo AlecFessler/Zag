@@ -895,13 +895,26 @@
        on the actual diff. Without this, the user has to scan the entire
        tree for ◆ glyphs, which gets tedious on big entries. */
     .diff_changes_panel {
-      flex: 1 1 50%;
-      min-height: 120px;
-      max-height: 60vh;
+      /* As of the 3-column layout: the tracker is its own column.
+         Fill the full vertical space of the column so the user can
+         scroll through all units without competing with the trace view
+         for height. */
+      flex: 1 1 auto;
+      min-height: 0;
       display: flex;
       flex-direction: column;
       background: var(--bg-elev);
-      border-bottom: 1px solid var(--border);
+    }
+    .review_tracker_col {
+      /* Same flex weight as the trace columns so all three share the
+         available width evenly — the user explicitly wants the panes
+         the same size, not a slim tracker stacked on a wide trace. */
+      flex: 1 1 0;
+      min-width: 240px;
+      border-right: 1px solid var(--border);
+    }
+    .review_tracker_label {
+      color: #f0c060;
     }
     .diff_changes_header {
       flex: 0 0 auto;
@@ -1498,11 +1511,10 @@
       </div>
 
       <div id="trace_view_wrap" class="trace_view_wrap" style="display: none;">
-        <div class="trace_pane_col" id="trace_pane_col_a">
-          <div class="trace_pane_label" id="trace_label_a" style="display: none;"></div>
-          <div class="diff_changes_panel" id="diff_changes_panel" style="display: none;">
+        <div class="trace_pane_col review_tracker_col" id="review_tracker_col" style="display: none;">
+          <div class="trace_pane_label review_tracker_label" id="review_tracker_label">REVIEW TRACKER</div>
+          <div class="diff_changes_panel" id="diff_changes_panel">
             <div class="diff_changes_header">
-              <span class="diff_changes_title">Review tracker</span>
               <span class="diff_changes_count" id="diff_changes_count"></span>
               <span class="review_progress_bar" id="review_progress_bar" style="display: none;">
                 <span class="review_progress_fill" id="review_progress_fill"></span>
@@ -1510,6 +1522,9 @@
             </div>
             <div class="diff_changes_list" id="diff_changes_list"></div>
           </div>
+        </div>
+        <div class="trace_pane_col" id="trace_pane_col_a">
+          <div class="trace_pane_label" id="trace_label_a" style="display: none;"></div>
           <div id="trace_view" class="trace_view_pane"></div>
         </div>
         <div class="trace_pane_col" id="trace_pane_col_b" style="display: none;">

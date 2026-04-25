@@ -165,6 +165,7 @@
     diffChangesCount: document.getElementById("diff_changes_count"),
     reviewProgressBar: document.getElementById("review_progress_bar"),
     reviewProgressFill: document.getElementById("review_progress_fill"),
+    reviewTrackerCol: document.getElementById("review_tracker_col"),
     traceBreadcrumb: document.getElementById("trace_breadcrumb"),
     graphPane: document.getElementById("graph"),
     compareMode: document.getElementById("compare_mode"),
@@ -1110,13 +1111,14 @@
     }
   }
 
-  async function fetchSource(file, start, end, highlightLine) {
+  async function fetchSource(file, start, end, highlightLine, opts) {
     if (!file) {
       showSourceError("no file path on selection");
       return;
     }
     if (start < 1) start = 1;
     if (end < start) end = start;
+    opts = opts || {};
 
     // Remember the fetch params so the review-toggle path can replay
     // the same render in-place (no entry change, no scroll loss).
@@ -1158,7 +1160,16 @@
       // has a function with the same name, fetch and render its source
       // into #info_source_b. Path comes from the secondary's own def_loc
       // (worktree-rooted), so no path translation is needed here.
-      maybeRenderSecondarySource(payload && payload.fn_name, highlightLine);
+      //
+      // `opts.secondaryByFile = repoRelPath` overrides this default and
+      // shows the same file in the secondary commit instead — used by
+      // the review tracker so dep-unit clicks display the same hunk on
+      // both sides instead of jumping to the contributing fn's def.
+      if (opts.secondaryByFile) {
+        renderSecondarySourceByFile(opts.secondaryByFile, highlightLine);
+      } else {
+        maybeRenderSecondarySource(payload && payload.fn_name, highlightLine);
+      }
     } catch (err) {
       if (myToken !== sourceFetchToken) return;
       showSourceError(err && err.message ? err.message : String(err));
@@ -1208,6 +1219,66 @@
       note.className = "pane_subj";
       note.textContent = "working tree";
       labelEl.appendChild(note);
+    }
+  }
+
+  /** Render the same file (by repo-relative path) from the secondary
+   *  commit's worktree. Used by the review tracker's unit-row clicks,
+   *  where we want both panes to show the same hunk side-by-side
+   *  rather than the contributing fn's def_loc (which for dep units
+   *  lives in a different file entirely). The secondary worktree path
+   *  is built from the sha-keyed convention `/var/tmp/cg-worktrees/
+   *  <sha>/<repo-rel>` — symmetric with `secondaryPathToRepoRel`. */
+  async function renderSecondarySourceByFile(repoRelPath, highlightLine) {
+    if (!els.infoSourceB || !els.infoSourceSplit) return;
+    if (compareState.mode === "off") {
+      clearSecondarySource();
+      return;
+    }
+    const sec = secondarySha();
+    if (!sec) {
+      clearSecondarySource();
+      return;
+    }
+    if (!repoRelPath) {
+      clearSecondarySource();
+      return;
+    }
+    const secPath = "/var/tmp/cg-worktrees/" + sec + "/" + repoRelPath;
+    try {
+      const url = "/api/source?path=" + encodeURIComponent(secPath) +
+        "&start=1&end=10000000";
+      const r = await fetch(url);
+      if (!r.ok) {
+        // File missing in OLDER commit — render a clear placeholder.
+        els.infoSourceSplit.classList.add("compare_active");
+        els.infoSourcePaneB.style.display = "";
+        els.infoSourceB.innerHTML = "";
+        updateSourceLabel(els.infoSourceLabelA, "live", null);
+        updateSourceLabel(els.infoSourceLabelB, "older", sec);
+        const note = document.createElement("div");
+        note.className = "source_header";
+        note.textContent = `(${repoRelPath} not present in ${shortSha(sec)})`;
+        els.infoSourceB.appendChild(note);
+        return;
+      }
+      const payload = await r.json();
+      const lines = payload.lines && payload.lines.length > 0
+        ? payload.lines : [""];
+      els.infoSourceSplit.classList.add("compare_active");
+      els.infoSourcePaneB.style.display = "";
+      updateSourceLabel(els.infoSourceLabelA, "live", null);
+      updateSourceLabel(els.infoSourceLabelB, "older", sec);
+      const secDiffOpts = computeDiffOptsForSecondary(secPath);
+      renderSourceSnippet(
+        secPath, 1, lines, highlightLine || 1, payload.tokens || [],
+        els.infoSourceB, secDiffOpts,
+      );
+      const row = els.infoSourceB.querySelector(".source_line.highlight");
+      if (row) row.scrollIntoView({ block: "start", behavior: "instant" });
+    } catch (err) {
+      console.error("secondary source-by-file fetch failed", err);
+      clearSecondarySource();
     }
   }
 
@@ -2860,12 +2931,17 @@
    *  toggles re-call this and stay in sync without per-row patching. */
   function updateChangesPanel() {
     if (!els.diffChangesPanel) return;
+    const show = function (visible) {
+      if (els.reviewTrackerCol) {
+        els.reviewTrackerCol.style.display = visible ? "" : "none";
+      }
+    };
     if (compareState.mode === "off" || compareState.changedFnIds.size === 0) {
-      els.diffChangesPanel.style.display = "none";
+      show(false);
       return;
     }
     if (currentEntryFnId == null) {
-      els.diffChangesPanel.style.display = "none";
+      show(false);
       return;
     }
 
@@ -3012,7 +3088,7 @@
     }
 
     if (contribs.length === 0) {
-      els.diffChangesPanel.style.display = "";
+      show(true);
       els.diffChangesList.innerHTML = "";
       const empty = document.createElement("div");
       empty.className = "diff_changes_empty";
@@ -3048,7 +3124,7 @@
       if (r && r.reviewed) reviewedUnique += 1;
     }
 
-    els.diffChangesPanel.style.display = "";
+    show(true);
     if (els.diffChangesCount) {
       els.diffChangesCount.textContent = reviewedUnique + " of " + totalUnique +
         (totalUnique > 0
@@ -3127,10 +3203,10 @@
       fileHeader.appendChild(fileMarkBtn);
 
       fileHeader.addEventListener("click", function () {
-        // Click on file header (outside the button) opens the file in
-        // the source pane at line 1 — handy for browsing context.
+        // Click on file header opens the file in both panes (live +
+        // older) at line 1 — handy for browsing context.
         els.info.classList.add("visible");
-        fetchSource(file, 1, 10000000, 1);
+        fetchSource(file, 1, 10000000, 1, { secondaryByFile: file });
       });
       fileGroup.appendChild(fileHeader);
 
@@ -3282,8 +3358,15 @@
 
           row.addEventListener("click", function () {
             // Click anywhere outside the checkbox jumps source pane.
+            // Show the SAME repo-relative file on both sides — the
+            // user reviewing a hunk wants to compare the file's old
+            // and new state, not jump to the contributing fn's def
+            // (which for dep units lives in a different file).
             els.info.classList.add("visible");
-            fetchSource(c.file, 1, 10000000, c.line);
+            setLastClickedFn(c.fn.name || c.fn.mangled || null);
+            fetchSource(c.file, 1, 10000000, c.line, {
+              secondaryByFile: c.file,
+            });
           });
 
           fnGroup.appendChild(row);
