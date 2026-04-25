@@ -847,6 +847,76 @@ fn pickCoreForThread(thread: *Thread, current_core: u64) ?u64 {
     return null;
 }
 
+/// Pick a target core for a freshly-restarted thread. Used by
+/// `Process.performRestart` instead of always landing on the calling core.
+///
+/// Routing the new thread back to the calling core is what causes the
+/// recursive-restart starvation in §2.1.93: a tight `exit → performRestart`
+/// loop runs entirely on one core, and any thread already queued there
+/// (root, in the test) never gets dispatched. Spreading restart placement
+/// across cores breaks the loop without changing observable scheduling
+/// semantics for other call sites.
+///
+/// Affinity is honored when set. With no affinity, prefer (in order):
+///   1. an idle, non-pinned core whose run queue is empty
+///   2. any non-pinned core other than `current_core`
+///   3. `current_core` as a fallback
+pub fn pickRestartCore(thread: *Thread, current_core: u64) u64 {
+    const count = arch.smp.coreCount();
+    const pinned = pinned_cores.load(.acquire);
+
+    if (thread.core_affinity) |mask| {
+        // Respect affinity. Within the mask, prefer the first eligible
+        // core that isn't pinned and isn't the calling core; fall back
+        // to the calling core if it's the only eligible option.
+        var fallback: ?u64 = null;
+        var i: u64 = 0;
+        while (i < count) {
+            const bit = @as(u64, 1) << @intCast(i);
+            if (mask & bit != 0 and pinned & bit == 0) {
+                if (i != current_core) return i;
+                fallback = i;
+            }
+            i += 1;
+        }
+        return fallback orelse current_core;
+    }
+
+    // No affinity. Prefer an empty, non-pinned core other than the caller.
+    var i: u64 = 0;
+    while (i < count) {
+        if (i == current_core) {
+            i += 1;
+            continue;
+        }
+        const bit = @as(u64, 1) << @intCast(i);
+        if (pinned & bit != 0) {
+            i += 1;
+            continue;
+        }
+        const state = &core_states[i];
+        const irq = state.rq_lock.lockIrqSave();
+        const empty = state.rq.isEmpty();
+        state.rq_lock.unlockIrqRestore(irq);
+        if (empty) return i;
+        i += 1;
+    }
+
+    // No empty queue elsewhere; pick any non-pinned core other than caller.
+    i = 0;
+    while (i < count) {
+        if (i == current_core) {
+            i += 1;
+            continue;
+        }
+        const bit = @as(u64, 1) << @intCast(i);
+        if (pinned & bit == 0) return i;
+        i += 1;
+    }
+
+    return current_core;
+}
+
 /// Switch to the next ready thread on the current core's run queue.
 /// Called from IPC syscalls that block the current thread.
 /// The caller must have already set the current thread's state and saved ctx.

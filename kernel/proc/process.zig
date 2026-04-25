@@ -1191,7 +1191,13 @@ pub const Process = struct {
             } else |_| {}
         }
 
-        sched.enqueueOnCore(arch.smp.coreID(), thread);
+        // Spread restart placement away from the calling core. The
+        // exit → performRestart cycle runs in scheduler context (the
+        // outgoing thread's deinit at sched.handlePreemption); pinning
+        // the new thread on the calling core lets a fast restart loop
+        // starve everything else queued there. See `sched.pickRestartCore`.
+        const target_core = sched.pickRestartCore(thread, arch.smp.coreID());
+        sched.enqueueOnCore(target_core, thread);
     }
 
     fn updateParentView(self: *Process) void {
