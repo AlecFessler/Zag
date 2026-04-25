@@ -197,6 +197,22 @@ fn exceptionHandler(ctx: *cpu.Context) void {
         .double_fault => @panic("Double fault"),
         .machine_check => @panic("Machine check exception"),
         .non_maskable_interrupt => {
+            // lockdep blindspot: NMI is NOT wired into sync_debug.enterIrqContext.
+            // Safe today only because the sole NMI consumer (kprof_sample.onNmi)
+            // is intentionally lock-free (atomic-RMW BSS log emit, MSR-only
+            // counter rearm — see kprof/sample.zig).
+            //
+            // Before adding any lock-taking code to an NMI path:
+            //   1. Wrap the NMI handler body with sync_debug.enterIrqContext()
+            //      / exitIrqContext() (mirror the pattern in
+            //      arch/x64/interrupts.zig dispatchInterrupt).
+            //   2. Add sync_debug.resetIrqContextOnSwitch() on any NMI-driven
+            //      noreturn-jmp path (mirror arch/x64/interrupts.zig).
+            // Without that wiring, the IRQ-mode-mix detector misclassifies
+            // NMI-context acquires as state 2 (process + IRQs disabled =
+            // "lockIrqSave / safe") instead of state 1 (async-IRQ-handler
+            // context), and a class taken in both NMI and plain process
+            // context will deadlock without warning.
             if (kprof_sample.onNmi(ctx.rip, ctx.regs.rbp)) return;
             @panic("NMI");
         },
