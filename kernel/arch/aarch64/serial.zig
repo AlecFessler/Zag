@@ -63,6 +63,14 @@ pub fn setBase(addr: u64) void {
 /// the raw-PA writes are sufficient until then.
 pub fn init() void {}
 
+/// Lockless raw-bytes write. Used by panic / lockdep paths that must
+/// not recurse through `print_lock` (which is itself detector-instrumented).
+/// Silently returns if the base address has not yet been set.
+pub fn printRaw(s: []const u8) void {
+    const base = base_addr orelse return;
+    for (s) |b| writeByte(b, base);
+}
+
 /// Format and transmit a string over the PL011 UART.
 /// Silently returns if the base address has not yet been set (early boot
 /// before ACPI SPCR discovery).

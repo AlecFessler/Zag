@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const zag = @import("zag");
 
@@ -469,6 +470,7 @@ pub fn writeCr3(value: u64) void {
 /// byte (8-bit), word (16-bit), and doubleword (32-bit) variants of the x86
 /// port I/O instructions. Port address is supplied in DX; data in AL/AX/EAX.
 pub fn inb(port: u16) u8 {
+    if (builtin.cpu.arch != .x86_64) unreachable;
     return asm volatile (
         \\inb %[port], %[ret]
         : [ret] "={al}" (-> u8),
@@ -477,6 +479,7 @@ pub fn inb(port: u16) u8 {
 }
 
 pub fn outb(value: u8, port: u16) void {
+    if (builtin.cpu.arch != .x86_64) unreachable;
     asm volatile (
         \\outb %[value], %[port]
         :
@@ -486,6 +489,7 @@ pub fn outb(value: u8, port: u16) void {
 }
 
 pub fn inw(port: u16) u16 {
+    if (builtin.cpu.arch != .x86_64) unreachable;
     return asm volatile (
         \\inw %[port], %[ret]
         : [ret] "={ax}" (-> u16),
@@ -494,6 +498,7 @@ pub fn inw(port: u16) u16 {
 }
 
 pub fn outw(value: u16, port: u16) void {
+    if (builtin.cpu.arch != .x86_64) unreachable;
     asm volatile (
         \\outw %[value], %[port]
         :
@@ -503,6 +508,7 @@ pub fn outw(value: u16, port: u16) void {
 }
 
 pub fn ind(port: u16) u32 {
+    if (builtin.cpu.arch != .x86_64) unreachable;
     return asm volatile (
         \\inl %[port], %[ret]
         : [ret] "={eax}" (-> u32),
@@ -511,6 +517,7 @@ pub fn ind(port: u16) u32 {
 }
 
 pub fn outd(value: u32, port: u16) void {
+    if (builtin.cpu.arch != .x86_64) unreachable;
     asm volatile (
         \\outl %[value], %[port]
         :
