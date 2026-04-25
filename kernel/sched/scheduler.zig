@@ -1139,9 +1139,8 @@ pub fn perCoreInit() void {
     idle_thread.on_cpu = std.atomic.Value(bool).init(true);
     idle_thread.pinned_exclusive = false;
     idle_thread.futex_deadline_ns = 0;
-    idle_thread.futex_paddr = address.PAddr.fromInt(0);
     idle_thread.futex_wake_index = 0;
-    idle_thread.futex_paddrs = [_]address.PAddr{address.PAddr.fromInt(0)} ** 64;
+    idle_thread.futex_wait_nodes = null;
     idle_thread.futex_bucket_count = 0;
     idle_thread.ipc_server = null;
     idle_thread.slot_index = 0;

@@ -69,14 +69,17 @@ pub const Thread = struct {
     on_cpu: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     pinned_exclusive: bool = false,
     futex_deadline_ns: u64 = 0,
-    futex_paddr: PAddr = PAddr.fromInt(0),
     /// Index of the address that woke this thread from a multi-address futex wait.
     /// Set by wake() before waking; read by the thread after resuming.
     futex_wake_index: u8 = 0,
-    /// Physical addresses this thread is waiting on in a multi-address futex wait.
-    /// The thread is enqueued in all corresponding buckets simultaneously.
-    futex_paddrs: [64]PAddr = [_]PAddr{PAddr.fromInt(0)} ** 64,
-    /// Number of addresses in the current multi-address futex wait.
+    /// Pointer to the per-bucket WaitNode array on this thread's kernel
+    /// stack while it is blocked on one or more futex addresses. Each
+    /// bucket gets its own intrusive link slot, so multi-address waits
+    /// can't cross-pollute bucket chains via a shared `Thread.next`.
+    /// `null` whenever the thread is not blocked on a futex.
+    futex_wait_nodes: ?[*]zag.proc.futex.WaitNode = null,
+    /// Number of valid entries in `futex_wait_nodes`. 1 for single-addr
+    /// waits, up to MAX_FUTEX_ADDRS for multi-addr waits.
     futex_bucket_count: u8 = 0,
     ipc_server: ?SlabRef(Process) = null,
     slot_index: u8 = 0,
@@ -257,9 +260,8 @@ pub const Thread = struct {
         thread.on_cpu = std.atomic.Value(bool).init(false);
         thread.pinned_exclusive = false;
         thread.futex_deadline_ns = 0;
-        thread.futex_paddr = PAddr.fromInt(0);
         thread.futex_wake_index = 0;
-        thread.futex_paddrs = [_]PAddr{PAddr.fromInt(0)} ** 64;
+        thread.futex_wait_nodes = null;
         thread.futex_bucket_count = 0;
         thread.ipc_server = null;
         thread.slot_index = 0;

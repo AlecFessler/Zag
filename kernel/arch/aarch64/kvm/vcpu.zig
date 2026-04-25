@@ -142,9 +142,8 @@ pub fn create(vm_obj: *Vm) !*VCpu {
     thread.on_cpu = std.atomic.Value(bool).init(false);
     thread.pinned_exclusive = false;
     thread.futex_deadline_ns = 0;
-    thread.futex_paddr = PAddr.fromInt(0);
     thread.futex_wake_index = 0;
-    thread.futex_paddrs = [_]PAddr{PAddr.fromInt(0)} ** 64;
+    thread.futex_wait_nodes = null;
     thread.futex_bucket_count = 0;
     thread.ipc_server = null;
     thread.slot_index = 0;

@@ -350,7 +350,7 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
 
     // Off-CPU. If .ready, remove from run queue first to avoid dangling.
     sched.removeFromAnyRunQueue(target);
-    if (target.futex_paddr.addr != 0) futex.removeBlockedThread(target);
+    if (target.futex_bucket_count > 0) futex.removeBlockedThread(target);
     // If the target was .blocked inside ipc_call, it still has a back-
     // pointer into some other process's msg_box (either as the pending
     // reply target or queued on the wait list). deinit() does not walk
