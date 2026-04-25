@@ -3,6 +3,8 @@ const zag = @import("zag");
 
 const debug = zag.utils.sync.debug;
 
+const SrcLoc = debug.SrcLoc;
+
 pub const AccessError = error{
     StaleHandle,
 };
@@ -29,8 +31,8 @@ pub const GenLock = extern struct {
     /// Plain spin-acquire of the lock bit, regardless of generation.
     /// Used by internal kernel paths that already have a live *T from a
     /// pinned reference chain (no handle, no staleness concern).
-    pub fn lock(self: *GenLock) void {
-        debug.acquire(self, self.class, 0, @src());
+    pub fn lock(self: *GenLock, src: SrcLoc) void {
+        debug.acquire(self, self.class, 0, src);
         while (true) {
             const cur = self.word.load(.monotonic);
             if (cur & 1 == 0) {
@@ -52,12 +54,12 @@ pub const GenLock = extern struct {
     /// caller's `expected_gen` snapshot matches the slot's current gen.
     /// Returns `StaleHandle` if the slot has been freed (and possibly
     /// reallocated) since the handle was issued.
-    pub fn lockWithGen(self: *GenLock, expected_gen: u63) AccessError!void {
+    pub fn lockWithGen(self: *GenLock, expected_gen: u63, src: SrcLoc) AccessError!void {
         // Parity invariant: a live-handle gen is always odd. An even
         // expected_gen means the caller is holding a reference to a
         // freed slot — a bug at the issuance site, not a stale handle.
         std.debug.assert(expected_gen % 2 == 1);
-        debug.acquire(self, self.class, 0, @src());
+        debug.acquire(self, self.class, 0, src);
         const unlocked: u64 = (@as(u64, expected_gen) << 1) | 0;
         const locked: u64 = (@as(u64, expected_gen) << 1) | 1;
         while (true) {
@@ -137,8 +139,8 @@ pub fn SlabRef(comptime T: type) type {
         /// access to `self.ptr` until `unlock()`. On `StaleHandle` the
         /// slot was freed since this ref was minted — the caller must
         /// NOT touch `self.ptr`.
-        pub fn lock(self: Self) AccessError!*T {
-            try self.ptr._gen_lock.lockWithGen(@intCast(self.gen));
+        pub fn lock(self: Self, src: SrcLoc) AccessError!*T {
+            try self.ptr._gen_lock.lockWithGen(@intCast(self.gen), src);
             return self.ptr;
         }
 
@@ -167,7 +169,7 @@ const TestT = extern struct {
 test "genlock lock/unlock sequencing" {
     var gl: GenLock = .{};
     gl.setGenRelease(5); // pretend we just allocated gen=5
-    gl.lock();
+    gl.lock(@src());
     try testing.expect(gl.word.load(.monotonic) & 1 == 1);
     gl.unlock();
     try testing.expect(gl.word.load(.monotonic) & 1 == 0);
@@ -180,14 +182,14 @@ test "genlock lockWithGen rejects stale" {
     // Stale gen must still be odd — an even expected_gen would trip
     // the parity assert, not return StaleHandle (that's a caller bug,
     // not an ordinary stale-handle miss).
-    try testing.expectError(error.StaleHandle, gl.lockWithGen(3));
+    try testing.expectError(error.StaleHandle, gl.lockWithGen(3, @src()));
 }
 
 test "SlabRef lock / unlock round-trip on live slot" {
     var t: TestT = .{};
     t._gen_lock.setGenRelease(3); // pretend live at gen=3
     const ref = SlabRef(TestT).init(&t, 3);
-    const got = try ref.lock();
+    const got = try ref.lock(@src());
     try testing.expectEqual(&t, got);
     try testing.expect(t._gen_lock.word.load(.monotonic) & 1 == 1);
     ref.unlock();
@@ -198,5 +200,5 @@ test "SlabRef.lock rejects a stale ref" {
     var t: TestT = .{};
     t._gen_lock.setGenRelease(5); // slot has advanced to 5
     const stale = SlabRef(TestT).init(&t, 3); // caller captured gen=3
-    try testing.expectError(error.StaleHandle, stale.lock());
+    try testing.expectError(error.StaleHandle, stale.lock(@src()));
 }

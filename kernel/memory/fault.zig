@@ -50,7 +50,7 @@ fn accessReason(is_write: bool, is_exec: bool) FaultReason {
 fn guardPageReason(proc: anytype, node_start: u64) FaultReason {
     const above_ref: SlabRef(VmNode) = proc.vmm.findNode(VAddr.fromInt(node_start + paging.PAGE4K)) orelse
         return .stack_underflow;
-    const above = above_ref.lock() catch return .stack_underflow;
+    const above = above_ref.lock(@src()) catch return .stack_underflow;
     defer above_ref.unlock();
     if (above.rights.write) {
         return .stack_overflow;
@@ -114,7 +114,7 @@ pub fn handlePageFault(fault: *const PageFaultContext) void {
         arch.cpu.enableInterrupts();
         while (true) arch.cpu.halt();
     };
-    const node = node_ref.lock() catch {
+    const node = node_ref.lock(@src()) catch {
         // Node was freed out from under us (e.g. concurrent revoke).
         // Treat like "no mapping".
         if (proc.faultBlock(thread, .unmapped_access, faulting_virt.addr, fault.rip, fault.user_ctx)) {

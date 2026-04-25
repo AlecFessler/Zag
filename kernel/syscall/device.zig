@@ -35,7 +35,7 @@ pub fn sysMemMmioMap(device_handle: u64, vm_handle: u64, offset: u64) i64 {
     if (!vm_res.max_rights.read and !vm_res.max_rights.write) return E_PERM;
 
     const device_ref: SlabRef(DeviceRegion) = device_entry.object.device_region;
-    const device = device_ref.lock() catch return E_BADCAP;
+    const device = device_ref.lock(@src()) catch return E_BADCAP;
     defer device_ref.unlock();
 
     if (device.device_type == .port_io) {
@@ -100,7 +100,7 @@ pub fn sysIrqAck(device_handle: u64) i64 {
     if (!entry.deviceRights().irq) return E_PERM;
 
     // Look up the device's IRQ line, clear the pending bit, and unmask.
-    const device = entry.object.device_region.lock() catch return E_BADCAP;
+    const device = entry.object.device_region.lock(@src()) catch return E_BADCAP;
     defer entry.object.device_region.unlock();
     const irq_line = arch.cpu.findIrqForDevice(device) orelse return E_INVAL;
     arch.cpu.clearIrqPendingBit(irq_line);
@@ -134,7 +134,7 @@ pub fn sysMemDmaMap(device_handle: u64, shm_handle: u64) i64 {
         proc.perm_lock.unlock();
         return E_PERM;
     }
-    const device = dev_entry.object.device_region.lock() catch {
+    const device = dev_entry.object.device_region.lock(@src()) catch {
         proc.perm_lock.unlock();
         return E_BADCAP;
     };
@@ -153,7 +153,7 @@ pub fn sysMemDmaMap(device_handle: u64, shm_handle: u64) i64 {
         proc.perm_lock.unlock();
         return E_BADCAP;
     }
-    const shm = shm_entry.object.shared_memory.lock() catch {
+    const shm = shm_entry.object.shared_memory.lock(@src()) catch {
         proc.perm_lock.unlock();
         return E_BADCAP;
     };
@@ -203,7 +203,7 @@ pub fn sysMemDmaUnmap(device_handle: u64, shm_handle: u64) i64 {
         proc.perm_lock.unlock();
         return E_BADCAP;
     }
-    const device = dev_entry.object.device_region.lock() catch {
+    const device = dev_entry.object.device_region.lock(@src()) catch {
         proc.perm_lock.unlock();
         return E_BADCAP;
     };
@@ -217,7 +217,7 @@ pub fn sysMemDmaUnmap(device_handle: u64, shm_handle: u64) i64 {
         proc.perm_lock.unlock();
         return E_BADCAP;
     }
-    const shm = shm_entry.object.shared_memory.lock() catch {
+    const shm = shm_entry.object.shared_memory.lock(@src()) catch {
         proc.perm_lock.unlock();
         return E_BADCAP;
     };

@@ -131,10 +131,10 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     var configs: [arch.pmu.pmu_max_counters]PmuCounterConfig = undefined;
     const slice = readConfigs(proc, configs_ptr, count, &configs) catch |err| return configErrToCode(err);
 
-    const target_thread = target_ref.lock() catch return E_BADCAP;
+    const target_thread = target_ref.lock(@src()) catch return E_BADCAP;
     defer target_ref.unlock();
     const target_proc_ref = target_thread.process;
-    _ = target_proc_ref.lock() catch return E_BADCAP;
+    _ = target_proc_ref.lock(@src()) catch return E_BADCAP;
     defer target_proc_ref.unlock();
 
     // Self vs. remote programming. Writing MSRs on the caller's core only
@@ -171,7 +171,7 @@ pub fn sysPmuStart(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
         target_thread.pmu_state = alloc_result;
     }
     const state_ref = target_thread.pmu_state.?;
-    const state = state_ref.lock() catch return E_INVAL;
+    const state = state_ref.lock(@src()) catch return E_INVAL;
     defer state_ref.unlock();
     if (is_self) {
         arch.pmu.pmuStart(state, slice) catch return E_INVAL;
@@ -195,10 +195,10 @@ pub fn sysPmuRead(proc: *Process, thread_handle: u64, sample_ptr: u64) i64 {
     // write doesn't race the PmuState slot.
     var sample: PmuSample = .{};
     {
-        const target_thread = target_ref.lock() catch return E_BADCAP;
+        const target_thread = target_ref.lock(@src()) catch return E_BADCAP;
         defer target_ref.unlock();
         const target_proc_ref = target_thread.process;
-        _ = target_proc_ref.lock() catch return E_BADCAP;
+        _ = target_proc_ref.lock(@src()) catch return E_BADCAP;
         defer target_proc_ref.unlock();
 
         // §2.14.11 / §4.52.5: only .faulted or .suspended is legal.
@@ -208,7 +208,7 @@ pub fn sysPmuRead(proc: *Process, thread_handle: u64, sample_ptr: u64) i64 {
         }
 
         const state_ref = target_thread.pmu_state orelse return E_INVAL; // §4.52.6
-        const state = state_ref.lock() catch return E_INVAL;
+        const state = state_ref.lock(@src()) catch return E_INVAL;
         arch.pmu.pmuRead(state, &sample);
         state_ref.unlock();
     }
@@ -229,17 +229,17 @@ pub fn sysPmuReset(proc: *Process, thread_handle: u64, configs_ptr: u64, count: 
     var configs: [arch.pmu.pmu_max_counters]PmuCounterConfig = undefined;
     const slice = readConfigs(proc, configs_ptr, count, &configs) catch |err| return configErrToCode(err);
 
-    const target_thread = target_ref.lock() catch return E_BADCAP;
+    const target_thread = target_ref.lock(@src()) catch return E_BADCAP;
     defer target_ref.unlock();
     const target_proc_ref = target_thread.process;
-    _ = target_proc_ref.lock() catch return E_BADCAP;
+    _ = target_proc_ref.lock(@src()) catch return E_BADCAP;
     defer target_proc_ref.unlock();
 
     // §4.53.5: only .faulted is valid.
     if (target_thread.state != .faulted) return E_INVAL;
 
     const state_ref = target_thread.pmu_state orelse return E_INVAL; // §4.53.6
-    const state = state_ref.lock() catch return E_INVAL;
+    const state = state_ref.lock(@src()) catch return E_INVAL;
     defer state_ref.unlock();
     // Self vs. remote: a .faulted target can only be `currentThread()`
     // if the thread is handling its own fault (thread-level self-handler,
@@ -260,10 +260,10 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
     if (rights_err) |e| return e;
     const target_ref = lookupThread(proc, thread_handle) orelse return E_BADCAP;
 
-    const target_thread = target_ref.lock() catch return E_BADCAP;
+    const target_thread = target_ref.lock(@src()) catch return E_BADCAP;
     defer target_ref.unlock();
     const target_proc_ref = target_thread.process;
-    _ = target_proc_ref.lock() catch return E_BADCAP;
+    _ = target_proc_ref.lock(@src()) catch return E_BADCAP;
     defer target_proc_ref.unlock();
 
     // Self vs. remote: only touch hardware on the caller's core if the
@@ -284,7 +284,7 @@ pub fn sysPmuStop(proc: *Process, thread_handle: u64) i64 {
     }
 
     const state_ref = target_thread.pmu_state orelse return E_INVAL; // §4.54.5
-    const state = state_ref.lock() catch return E_INVAL;
+    const state = state_ref.lock(@src()) catch return E_INVAL;
     if (is_self) {
         arch.pmu.pmuStop(state);
     } else {

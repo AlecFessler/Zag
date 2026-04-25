@@ -67,9 +67,9 @@ pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
     // either mapping tears down shared leaf PTEs and pmm-frees frames
     // the device is still DMAing into. See
     // exploits/dma_map_race_iova_alias.
-    device._gen_lock.lock();
+    device._gen_lock.lock(@src());
     defer device._gen_lock.unlock();
-    shm._gen_lock.lock();
+    shm._gen_lock.lock(@src());
     defer shm._gen_lock.unlock();
 
     const base_dma = device.detail.pci.dma_cursor;
@@ -94,7 +94,7 @@ pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
 
 pub fn unmapDmaPages(device: *DeviceRegion, dma_base: u64, num_pages: u64) void {
     // Same per-device gen-lock as mapDmaPages.
-    device._gen_lock.lock();
+    device._gen_lock.lock(@src());
     defer device._gen_lock.unlock();
 
     var i: u64 = 0;

@@ -120,7 +120,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                 // (which protects fault_handler_proc per process.zig:87),
                 // nested with perm_lock for the slot-0 bit write.
                 if (granted_phr.fault_handler) {
-                    sender_proc._gen_lock.lock();
+                    sender_proc._gen_lock.lock(@src());
                     sender_proc.fault_handler_proc = process_mod.slabRefNow(Process, target_proc);
                     sender_proc.perm_lock.lock();
                     const self_rights = sender_proc.perm_table[0].processRights();
@@ -140,7 +140,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                     // restore sender's slot-0 fault_handler bit and clear
                     // fault_handler_proc so sender goes back to self-handling.
                     if (!target_proc.linkFaultHandlerTarget(sender_proc)) {
-                        sender_proc._gen_lock.lock();
+                        sender_proc._gen_lock.lock(@src());
                         sender_proc.fault_handler_proc = null;
                         sender_proc.perm_lock.lock();
                         const r = sender_proc.perm_table[0].processRights();
@@ -195,7 +195,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                             //    linkFaultHandlerTarget-failure rollback
                             //    above: under sender_proc.lock nested with
                             //    perm_lock.
-                            sender_proc._gen_lock.lock();
+                            sender_proc._gen_lock.lock(@src());
                             sender_proc.fault_handler_proc = null;
                             sender_proc.perm_lock.lock();
                             var rb_rights = sender_proc.perm_table[0].processRights();
@@ -220,14 +220,14 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                     // Snapshot the sender's thread list under sender_proc.lock,
                     // then release the lock before walking it (insertThreadHandle
                     // takes target_proc.perm_lock and we don't want to nest).
-                    sender_proc._gen_lock.lock();
+                    sender_proc._gen_lock.lock(@src());
                     const num_threads = sender_proc.num_threads;
                     var threads_copy: [Process.MAX_THREADS]SlabRef(Thread) = undefined;
                     @memcpy(threads_copy[0..num_threads], sender_proc.threads[0..num_threads]);
                     sender_proc._gen_lock.unlock();
 
                     for (threads_copy[0..num_threads]) |t_ref| {
-                        const t = t_ref.lock() catch continue;
+                        const t = t_ref.lock(@src()) catch continue;
                         defer t_ref.unlock();
                         _ = target_proc.insertThreadHandle(t, ThreadHandleRights.full) catch {};
                     }
@@ -361,7 +361,7 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
     if (target_entry.object != .process) return .{ .ret = E_BADCAP };
 
     // §2.6.30: lazily convert dead process entries on IPC attempt.
-    const target_proc = target_entry.object.process.lock() catch return .{ .ret = E_BADCAP };
+    const target_proc = target_entry.object.process.lock(@src()) catch return .{ .ret = E_BADCAP };
     const target_alive = target_proc.alive;
     target_entry.object.process.unlock();
     if (!target_alive) {
@@ -383,7 +383,7 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
 
     // Receiver is waiting — deliver directly
     const recv_ref = target_proc.msg_box.takeReceiverLocked();
-    const receiver = recv_ref.lock() catch {
+    const receiver = recv_ref.lock(@src()) catch {
         // Receiver slot got freed while blocked — treat as no receiver.
         target_proc.msg_box.lock.unlock();
         return .{ .ret = E_AGAIN };
@@ -441,7 +441,7 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
     if (target_entry.object != .process) return .{ .ret = E_BADCAP };
 
     // §2.6.30: lazily convert dead process entries on IPC attempt.
-    const target_proc = target_entry.object.process.lock() catch return .{ .ret = E_BADCAP };
+    const target_proc = target_entry.object.process.lock(@src()) catch return .{ .ret = E_BADCAP };
     const target_alive = target_proc.alive;
     target_entry.object.process.unlock();
     if (!target_alive) {
@@ -457,7 +457,7 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
     if (target_proc.msg_box.isReceiving()) {
         // Receiver is waiting — deliver and queue caller for reply.
         const recv_ref = target_proc.msg_box.takeReceiverLocked();
-        const receiver = recv_ref.lock() catch {
+        const receiver = recv_ref.lock(@src()) catch {
             // Receiver slot freed while blocked — fall back to enqueue path.
             target_proc.msg_box.enqueueLocked(thread);
             thread.ipc_server = process_mod.slabRefNow(Process, target_proc);
@@ -634,7 +634,7 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
     var reply_cap_err: i64 = E_OK;
     var caller_thread: ?*Thread = null;
     if (caller_ref) |cr| {
-        if (cr.lock()) |pc| {
+        if (cr.lock(@src())) |pc| {
             caller_thread = pc;
             if (reply_cap_transfer) {
                 const cap = getCapPayload(ctx, reply_word_count);

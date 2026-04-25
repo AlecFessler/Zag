@@ -237,7 +237,7 @@ fn pageFaultHandler(ctx: *cpu.Context) void {
         // Process is alive across this PF handler.
         const proc = thread.process.ptr;
         if (proc.vmm.findNode(VAddr.fromInt(faulting_addr))) |node_ref| {
-            const node = node_ref.lock() catch return;
+            const node = node_ref.lock(@src()) catch return;
             const is_virtual_bar = node.kind == .virtual_bar;
             node_ref.unlock();
             if (is_virtual_bar) {
@@ -269,7 +269,7 @@ fn emulateVirtualBar(ctx: *cpu.Context, node_ref: SlabRef(VmNode), faulting_addr
     // deadlock the killing thread on its own VmNode lock. The DeviceRegion
     // pointer is stable for the kernel's lifetime and `start` is immutable
     // for a virtual_bar node, so the snapshot is safe to use unlocked.
-    const node = node_ref.lock() catch return;
+    const node = node_ref.lock(@src()) catch return;
     const device = node.deviceRegion().?;
     const node_start_addr = node.start.addr;
     node_ref.unlock();

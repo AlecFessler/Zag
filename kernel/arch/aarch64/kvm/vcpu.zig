@@ -166,7 +166,7 @@ pub fn create(vm_obj: *Vm) !*VCpu {
     thread.ctx = interrupts.prepareThreadContext(kstack_top, null, &vcpuEntryPoint, @intFromPtr(vcpu_obj));
 
     // Add thread to process thread list.
-    proc._gen_lock.lock();
+    proc._gen_lock.lock(@src());
     if (proc.num_threads >= Process.MAX_THREADS) {
         proc._gen_lock.unlock();
         return error.MaxThreads;
@@ -334,10 +334,10 @@ pub fn vcpuRun(proc: *Process, thread_handle: u64) i64 {
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
-    const thread_ptr = entry.object.thread.lock() catch return E_BADCAP;
+    const thread_ptr = entry.object.thread.lock(@src()) catch return E_BADCAP;
     defer entry.object.thread.unlock();
 
-    const vm_obj = vm_ref.lock() catch return E_BADCAP;
+    const vm_obj = vm_ref.lock(@src()) catch return E_BADCAP;
     defer vm_ref.unlock();
 
     const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse return E_BADCAP;
@@ -367,10 +367,10 @@ pub fn vcpuSetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
-    const thread_ptr = entry.object.thread.lock() catch return E_BADCAP;
+    const thread_ptr = entry.object.thread.lock(@src()) catch return E_BADCAP;
     defer entry.object.thread.unlock();
 
-    const vm_obj = vm_ref.lock() catch return E_BADCAP;
+    const vm_obj = vm_ref.lock(@src()) catch return E_BADCAP;
     defer vm_ref.unlock();
 
     const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse return E_BADCAP;
@@ -392,7 +392,7 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     const E_BADADDR: i64 = -7;
 
     const vm_ref = proc.vm orelse return E_INVAL;
-    _ = vm_ref.lock() catch return E_INVAL;
+    _ = vm_ref.lock(@src()) catch return E_INVAL;
     vm_ref.unlock();
     // self-alive: caller IS vm's owner proc.
     const vm_obj = vm_ref.ptr;
@@ -400,12 +400,12 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
-    const thread_ptr = entry.object.thread.lock() catch return E_BADCAP;
+    const thread_ptr = entry.object.thread.lock(@src()) catch return E_BADCAP;
     defer entry.object.thread.unlock();
 
     // Resolve vcpu + snapshot state under vm_obj._gen_lock. Lock released
     // before the IPI/spin so we don't stall cross-core work on the VM.
-    vm_obj._gen_lock.lock();
+    vm_obj._gen_lock.lock(@src());
     const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse {
         vm_obj._gen_lock.unlock();
         return E_BADCAP;
@@ -427,7 +427,7 @@ pub fn vcpuGetState(proc: *Process, thread_handle: u64, state_ptr: u64) i64 {
         }
     }
 
-    vm_obj._gen_lock.lock();
+    vm_obj._gen_lock.lock(@src());
     const src_bytes = std.mem.asBytes(&vcpu_obj.guest_state);
     const write_ok = writeUserStruct(proc, state_ptr, src_bytes);
     vm_obj._gen_lock.unlock();
@@ -456,7 +456,7 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     const E_BADADDR: i64 = -7;
 
     const vm_ref = proc.vm orelse return E_INVAL;
-    _ = vm_ref.lock() catch return E_INVAL;
+    _ = vm_ref.lock(@src()) catch return E_INVAL;
     vm_ref.unlock();
     // self-alive: caller IS vm's owner proc.
     const vm_obj = vm_ref.ptr;
@@ -464,10 +464,10 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
     const entry = proc.getPermByHandle(thread_handle) orelse return E_BADCAP;
     if (entry.object != .thread) return E_BADCAP;
 
-    const thread_ptr = entry.object.thread.lock() catch return E_BADCAP;
+    const thread_ptr = entry.object.thread.lock(@src()) catch return E_BADCAP;
     defer entry.object.thread.unlock();
 
-    vm_obj._gen_lock.lock();
+    vm_obj._gen_lock.lock(@src());
     const vcpu_obj = vcpuFromThread(vm_obj, thread_ptr) orelse {
         vm_obj._gen_lock.unlock();
         return E_BADCAP;
@@ -490,7 +490,7 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
             gic.sendSchedulerIpi(core_id);
             while (thread_ptr.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
         }
-        vm_obj._gen_lock.lock();
+        vm_obj._gen_lock.lock(@src());
         injectInterrupt(&vcpu_obj.guest_state, interrupt);
         vm_obj._gen_lock.unlock();
         // Resume phase. Same aliased Thread slot; reuse the outer lock.
@@ -499,7 +499,7 @@ pub fn vcpuInterrupt(proc: *Process, thread_handle: u64, interrupt_ptr: u64) i64
         const target_core = if (thread_resumed.core_affinity) |mask| @as(u64, @ctz(mask)) else gic.coreID();
         sched.enqueueOnCore(target_core, thread_resumed);
     } else {
-        vm_obj._gen_lock.lock();
+        vm_obj._gen_lock.lock(@src());
         defer vm_obj._gen_lock.unlock();
         injectInterrupt(&vcpu_obj.guest_state, interrupt);
     }

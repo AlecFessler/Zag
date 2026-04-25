@@ -164,7 +164,7 @@ pub fn sysMemShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
     if (!vm_res.max_rights.shareable) return E_PERM;
 
     const shm_ref: SlabRef(SharedMemory) = shm_entry.object.shared_memory;
-    const shm = shm_ref.lock() catch return E_BADCAP;
+    const shm = shm_ref.lock(@src()) catch return E_BADCAP;
     defer shm_ref.unlock();
     const shm_rwx = shm_entry.rights & 0b111;
     const max_rwx: u16 =

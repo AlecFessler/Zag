@@ -117,7 +117,7 @@ pub fn queueOrDeliver(box: *VmExitBox, vm_obj: *Vm, vcpu_obj: *VCpu) void {
     if (box.isReceiving()) {
         const recv_ref = box.takeReceiverLocked();
         box.lock.unlock();
-        if (recv_ref.lock()) |receiver| {
+        if (recv_ref.lock(@src())) |receiver| {
             deliverExit(vm_obj, vcpu_obj, receiver);
             recv_ref.unlock();
         } else |_| {
@@ -208,7 +208,7 @@ pub fn vmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContext, vm_handle: 
         prefault_va += paging.PAGE4K;
     }
 
-    vm_obj._gen_lock.lock();
+    vm_obj._gen_lock.lock(@src());
     const box = vm_obj.exitBox();
     box.lock.lock();
 
@@ -234,7 +234,7 @@ pub fn vmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContext, vm_handle: 
     box.lock.unlock();
     vm_obj._gen_lock.unlock();
 
-    thread._gen_lock.lock();
+    thread._gen_lock.lock(@src());
     thread.state = .blocked;
     thread.ctx = ctx;
     thread._gen_lock.unlock();
@@ -255,10 +255,10 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
     // Find the vCPU by thread handle (check exit_token validity first)
     const entry = proc.getPermByHandle(exit_token) orelse return E_NOENT;
     if (entry.object != .thread) return E_NOENT;
-    const thread = entry.object.thread.lock() catch return E_NOENT;
+    const thread = entry.object.thread.lock(@src()) catch return E_NOENT;
     defer entry.object.thread.unlock();
 
-    vm_obj._gen_lock.lock();
+    vm_obj._gen_lock.lock(@src());
 
     // Find which vCPU this thread belongs to
     const vcpu_obj = vcpu_mod.vcpuFromThread(vm_obj, thread) orelse {
@@ -316,7 +316,7 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
     switch (raw_tag) {
         0 => {
             // resume_guest: payload is GuestState at offset 8
-            vm_obj._gen_lock.lock();
+            vm_obj._gen_lock.lock(@src());
             vcpu_obj.guest_state = std.mem.bytesAsValue(vm_hw.GuestState, action_buf[8..][0..@sizeOf(vm_hw.GuestState)]).*;
             vcpu_obj.storeState(.running);
             vm_obj._gen_lock.unlock();
@@ -331,7 +331,7 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
             // an attacker VMM could write an illegal vector directly into
             // VM_ENTRY_INTR_INFO and corrupt guest exception handling.
             if (interrupt.vector < 32) return E_INVAL;
-            vm_obj._gen_lock.lock();
+            vm_obj._gen_lock.lock(@src());
             vm_hw.injectInterrupt(&vcpu_obj.guest_state, interrupt);
             vcpu_obj.storeState(.running);
             vm_obj._gen_lock.unlock();
@@ -340,7 +340,7 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
         2 => {
             // inject_exception: payload is GuestException at offset 8
             const exception = std.mem.bytesAsValue(vm_hw.GuestException, action_buf[8..][0..@sizeOf(vm_hw.GuestException)]).*;
-            vm_obj._gen_lock.lock();
+            vm_obj._gen_lock.lock(@src());
             vm_hw.injectException(&vcpu_obj.guest_state, exception);
             vcpu_obj.storeState(.running);
             vm_obj._gen_lock.unlock();
@@ -358,14 +358,14 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
             const rights = payload[24];
             const result = vm_mod.guestMap(proc, vm_handle, host_vaddr, guest_addr, map_size, @as(u64, rights));
             if (result != 0) return result;
-            vm_obj._gen_lock.lock();
+            vm_obj._gen_lock.lock(@src());
             vcpu_obj.storeState(.running);
             vm_obj._gen_lock.unlock();
             resumeVcpuThread(thread);
         },
         4 => {
             // kill
-            vm_obj._gen_lock.lock();
+            vm_obj._gen_lock.lock(@src());
             vcpu_obj.storeState(.exited);
             vm_obj._gen_lock.unlock();
             // No inner thread._gen_lock — the outer `entry.object.thread`
@@ -383,7 +383,7 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
 fn deliverExitMessage(proc: *Process, vm_obj: *Vm, thread: *Thread, buf_ptr: u64) i64 {
     const E_BADADDR: i64 = -7;
 
-    vm_obj._gen_lock.lock();
+    vm_obj._gen_lock.lock(@src());
     defer vm_obj._gen_lock.unlock();
 
     const vcpu_obj = vcpu_mod.vcpuFromThread(vm_obj, thread) orelse return E_BADADDR;

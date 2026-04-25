@@ -139,7 +139,7 @@ pub const Thread = struct {
         // unreachable`. Take, null, release, then do the hardware clear
         // + slab destroy outside the lock.
         const maybe_state_ref = blk: {
-            proc._gen_lock.lock();
+            proc._gen_lock.lock(@src());
             defer proc._gen_lock.unlock();
             const s = self.pmu_state;
             self.pmu_state = null;
@@ -156,7 +156,7 @@ pub const Thread = struct {
         // Remove thread handle from own perm table and handler's perm table
         proc.removeThreadHandle(self);
         if (proc.fault_handler_proc) |handler_ref| {
-            if (handler_ref.lock()) |handler| {
+            if (handler_ref.lock(@src())) |handler| {
                 // Verify freshness then drop gen-lock bit; removeThreadHandle
                 // takes handler.perm_lock. The fault_handler relationship
                 // invariant keeps handler alive across the brief window.
@@ -184,7 +184,7 @@ pub const Thread = struct {
                 const vm_obj = vm_ref.ptr;
                 // Check if all remaining threads are vCPU threads.
                 var all_vcpu = true;
-                proc._gen_lock.lock();
+                proc._gen_lock.lock(@src());
                 // self-alive: proc._gen_lock held — threads[] stable.
                 for (proc.threads[0..proc.num_threads]) |t_ref| {
                     if (!arch.vm.threadIsVcpu(vm_obj, t_ref.ptr)) {
@@ -202,7 +202,7 @@ pub const Thread = struct {
                     // Deinit the vCPU threads. Each deinit calls removeThread;
                     // the last one triggers lastThreadExited -> process exit.
                     // Snapshot the list since deinit mutates it.
-                    proc._gen_lock.lock();
+                    proc._gen_lock.lock(@src());
                     var vcpu_threads: [Process.MAX_THREADS]SlabRef(Thread) = undefined;
                     var num_vcpu: u32 = 0;
                     for (proc.threads[0..proc.num_threads]) |t_ref| {
@@ -286,7 +286,7 @@ pub const Thread = struct {
         const entry_fn: *const fn () void = @ptrFromInt(entry.addr);
         thread.ctx = arch.cpu.prepareThreadContext(kstack_top, ustack_top, entry_fn, arg);
 
-        proc._gen_lock.lock();
+        proc._gen_lock.lock(@src());
         defer proc._gen_lock.unlock();
 
         if (proc.num_threads >= Process.MAX_THREADS) return error.MaxThreads;

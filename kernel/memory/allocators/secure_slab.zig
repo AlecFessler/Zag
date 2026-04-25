@@ -1,12 +1,12 @@
 const std = @import("std");
 const zag = @import("zag");
 
-const bump = zag.memory.allocators.bump;
-
 const arch = zag.arch.dispatch;
+const bump = zag.memory.allocators.bump;
 
 const Range = zag.utils.range.Range;
 const SpinLock = zag.utils.sync.SpinLock;
+const SrcLoc = std.builtin.SourceLocation;
 
 const INVALID_INDEX: u32 = std.math.maxInt(u32);
 const DEFAULT_WALK_BOUND: u32 = 256;
@@ -40,7 +40,8 @@ pub const GenLock = extern struct {
     /// Plain spin-acquire of the lock bit, regardless of generation.
     /// Used by internal kernel paths that already have a live *T from a
     /// pinned reference chain (no handle, no staleness concern).
-    pub fn lock(self: *GenLock) void {
+    pub fn lock(self: *GenLock, src: SrcLoc) void {
+        _ = src;
         while (true) {
             const cur = self.word.load(.monotonic);
             if (cur & 1 == 0) {
@@ -61,7 +62,8 @@ pub const GenLock = extern struct {
     /// caller's `expected_gen` snapshot matches the slot's current gen.
     /// Returns `StaleHandle` if the slot has been freed (and possibly
     /// reallocated) since the handle was issued.
-    pub fn lockWithGen(self: *GenLock, expected_gen: u63) AccessError!void {
+    pub fn lockWithGen(self: *GenLock, expected_gen: u63, src: SrcLoc) AccessError!void {
+        _ = src;
         // Parity invariant: a live-handle gen is always odd. An even
         // expected_gen means the caller is holding a reference to a
         // freed slot — a bug at the issuance site, not a stale handle.
@@ -142,8 +144,8 @@ pub fn SlabRef(comptime T: type) type {
         /// access to `self.ptr` until `unlock()`. On `StaleHandle` the
         /// slot was freed since this ref was minted — the caller must
         /// NOT touch `self.ptr`.
-        pub fn lock(self: Self) AccessError!*T {
-            try self.ptr._gen_lock.lockWithGen(@intCast(self.gen));
+        pub fn lock(self: Self, src: SrcLoc) AccessError!*T {
+            try self.ptr._gen_lock.lockWithGen(@intCast(self.gen), src);
             return self.ptr;
         }
 
@@ -327,32 +329,49 @@ pub fn SecureSlab(
         /// observer holds the ref, field access during init is
         /// self-alive and does not need lock/unlock bracketing.
         pub fn create(self: *Self) AllocError!Ref {
+            arch.boot.print("SS:c1\n", .{});
             self.lock.lock();
             defer self.lock.unlock();
+            arch.boot.print("SS:c2\n", .{});
 
             if (self.count_free == 0) {
+                arch.boot.print("SS:c3 grow\n", .{});
                 try self.growOne();
+                arch.boot.print("SS:c4 grew cf={d} ct={d}\n", .{ self.count_free, self.count_total });
             }
 
+            arch.boot.print("SS:c5\n", .{});
             const draw_pop = self.randStep();
+            arch.boot.print("SS:c6 dp={d}\n", .{draw_pop});
             const draw_push = self.randStep();
+            arch.boot.print("SS:c7\n", .{});
             self.pop_cursor = self.walkCursorLocked(self.pop_cursor, draw_pop);
+            arch.boot.print("SS:c8 pc={d}\n", .{self.pop_cursor});
 
             const popped = self.pop_cursor;
             const link = self.linkAt(popped);
             const next_after_pop = link.next;
 
+            arch.boot.print("SS:c9 popped={d}\n", .{popped});
             self.unlinkLocked(popped);
+            arch.boot.print("SS:cA\n", .{});
             self.pop_cursor = if (self.count_free == 0) INVALID_INDEX else next_after_pop;
             self.push_cursor = self.walkCursorLocked(self.push_cursor, draw_push);
+            arch.boot.print("SS:cB\n", .{});
 
             const slot_ptr = self.ptrAt(popped);
+            arch.boot.print("SS:cC slot=0x{x}\n", .{@intFromPtr(slot_ptr)});
             const prev_gen = slot_ptr._gen_lock.currentGen();
+            arch.boot.print("SS:cD prev_gen={d}\n", .{prev_gen});
             std.debug.assert(prev_gen % 2 == 0); // was freed (gen even)
             const new_gen: u63 = prev_gen + 1;
+            arch.boot.print("SS:cE new_gen={d}\n", .{new_gen});
             slot_ptr._gen_lock.setGenRelease(new_gen);
+            arch.boot.print("SS:cF\n", .{});
 
-            return Ref.init(slot_ptr, new_gen);
+            const ref = Ref.init(slot_ptr, new_gen);
+            arch.boot.print("SS:cG\n", .{});
+            return ref;
         }
 
         /// Atomically verify the caller's carried gen, acquire the
@@ -375,7 +394,7 @@ pub fn SecureSlab(
             // lockWithGen asserts this too; stating it here makes the
             // destroy-side contract explicit for readers.
             std.debug.assert(expected_gen % 2 == 1);
-            try ptr._gen_lock.lockWithGen(expected_gen);
+            try ptr._gen_lock.lockWithGen(expected_gen, @src());
             self.destroyLockedInner(ptr, expected_gen);
         }
 
@@ -683,7 +702,7 @@ test "randStep stays in [-N, N]" {
 test "genlock lock/unlock sequencing" {
     var gl: GenLock = .{};
     gl.setGenRelease(5); // pretend we just allocated gen=5
-    gl.lock();
+    gl.lock(@src());
     try testing.expect(gl.word.load(.monotonic) & 1 == 1);
     gl.unlock();
     try testing.expect(gl.word.load(.monotonic) & 1 == 0);
@@ -696,14 +715,14 @@ test "genlock lockWithGen rejects stale" {
     // Stale gen must still be odd — an even expected_gen would trip
     // the parity assert, not return StaleHandle (that's a caller bug,
     // not an ordinary stale-handle miss).
-    try testing.expectError(error.StaleHandle, gl.lockWithGen(3));
+    try testing.expectError(error.StaleHandle, gl.lockWithGen(3, @src()));
 }
 
 test "SlabRef lock / unlock round-trip on live slot" {
     var t: TestT = .{};
     t._gen_lock.setGenRelease(3); // pretend live at gen=3
     const ref = SlabRef(TestT).init(&t, 3);
-    const got = try ref.lock();
+    const got = try ref.lock(@src());
     try testing.expectEqual(&t, got);
     try testing.expect(t._gen_lock.word.load(.monotonic) & 1 == 1);
     ref.unlock();
@@ -714,5 +733,5 @@ test "SlabRef.lock rejects a stale ref" {
     var t: TestT = .{};
     t._gen_lock.setGenRelease(5); // slot has advanced to 5
     const stale = SlabRef(TestT).init(&t, 3); // caller captured gen=3
-    try testing.expectError(error.StaleHandle, stale.lock());
+    try testing.expectError(error.StaleHandle, stale.lock(@src()));
 }

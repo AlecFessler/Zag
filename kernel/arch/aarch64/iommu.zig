@@ -51,9 +51,9 @@ pub fn isAvailable() bool {
 }
 
 pub fn mapDmaPages(device: *DeviceRegion, shm: *SharedMemory) !u64 {
-    device._gen_lock.lock();
+    device._gen_lock.lock(@src());
     defer device._gen_lock.unlock();
-    shm._gen_lock.lock();
+    shm._gen_lock.lock(@src());
     defer shm._gen_lock.unlock();
 
     const base_dma = device.detail.pci.dma_cursor;

@@ -455,7 +455,7 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
                 // self-alive: currentThread() runs on this core.
                 const proc = thread.process.ptr;
                 if (proc.vmm.findNode(VAddr.fromInt(far))) |node_ref| {
-                    const node = node_ref.lock() catch return;
+                    const node = node_ref.lock(@src()) catch return;
                     const is_virtual_bar = node.kind == .virtual_bar;
                     node_ref.unlock();
                     if (is_virtual_bar) {
@@ -824,7 +824,7 @@ fn emulateVirtualBar(
     far: u64,
     proc: anytype,
 ) void {
-    const node = node_ref.lock() catch return;
+    const node = node_ref.lock(@src()) catch return;
     defer node_ref.unlock();
     const device = node.deviceRegion().?;
 

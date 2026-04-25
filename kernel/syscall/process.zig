@@ -54,7 +54,7 @@ pub fn sysProcCreate(elf_ptr: u64, elf_len: u64, perms_arg: u64, thread_rights_a
     var check_addr = elf_ptr;
     while (check_addr < elf_end) {
         const node_ref: SlabRef(VmNode) = proc.vmm.findNode(VAddr.fromInt(check_addr)) orelse return E_BADADDR;
-        const node = node_ref.lock() catch return E_BADADDR;
+        const node = node_ref.lock(@src()) catch return E_BADADDR;
         const readable = node.rights.read;
         const node_end = node.end();
         node_ref.unlock();

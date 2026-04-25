@@ -58,7 +58,7 @@ pub fn sysThreadCreate(entry_addr: u64, arg: u64, num_stack_pages_u64: u64) i64 
     // roll back the new thread and return E_MAXCAP so userspace observes
     // the failure instead of silently getting an unmanaged thread.
     if (proc.fault_handler_proc) |handler_ref| {
-        if (handler_ref.lock()) |handler| {
+        if (handler_ref.lock(@src())) |handler| {
             // Verify freshness then drop the gen-lock bit; insertThreadHandle
             // takes handler.perm_lock, and the fault_handler relationship
             // invariant keeps handler alive for the duration.
@@ -196,9 +196,9 @@ pub fn sysThreadSuspend(thread_handle: u64) i64 {
     const proc = sched.currentProc();
     const pinned = proc.lookupThreadHandle(thread_handle) orelse return E_BADCAP;
     if (!pinned.entry.threadHandleRights().@"suspend") return E_PERM;
-    const target = pinned.thread.lock() catch return E_BADCAP;
+    const target = pinned.thread.lock(@src()) catch return E_BADCAP;
     const target_proc_ref = target.process;
-    const target_proc = target_proc_ref.lock() catch {
+    const target_proc = target_proc_ref.lock(@src()) catch {
         pinned.thread.unlock();
         return E_BADCAP;
     };
@@ -273,9 +273,9 @@ pub fn sysThreadResume(thread_handle: u64) i64 {
     const proc = sched.currentProc();
     const pinned = proc.lookupThreadHandle(thread_handle) orelse return E_BADCAP;
     if (!pinned.entry.threadHandleRights().@"resume") return E_PERM;
-    const target = pinned.thread.lock() catch return E_BADCAP;
+    const target = pinned.thread.lock(@src()) catch return E_BADCAP;
     const target_proc_ref = target.process;
-    const target_proc = target_proc_ref.lock() catch {
+    const target_proc = target_proc_ref.lock(@src()) catch {
         pinned.thread.unlock();
         return E_BADCAP;
     };
@@ -304,9 +304,9 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
     const pinned = proc.lookupThreadHandle(thread_handle) orelse return E_BADCAP;
     if (!pinned.entry.threadHandleRights().kill) return E_PERM;
     const cur = sched.currentThread().?;
-    const target = pinned.thread.lock() catch return E_BADCAP;
+    const target = pinned.thread.lock(@src()) catch return E_BADCAP;
     const target_proc_ref = target.process;
-    const target_proc = target_proc_ref.lock() catch {
+    const target_proc = target_proc_ref.lock(@src()) catch {
         pinned.thread.unlock();
         return E_BADCAP;
     };
@@ -389,7 +389,7 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
     target_proc.msg_box.lock.unlock();
     process_mod.scrubFromFaultBoxPub(&target_proc.fault_box, target);
     if (target_proc.fault_handler_proc) |handler_ref| {
-        if (handler_ref.lock()) |handler| {
+        if (handler_ref.lock(@src())) |handler| {
             defer handler_ref.unlock();
             process_mod.scrubFromFaultBoxPub(&handler.fault_box, target);
         } else |_| {}

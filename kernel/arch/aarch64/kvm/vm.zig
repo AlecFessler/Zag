@@ -126,7 +126,7 @@ pub const Vm = struct {
         // the syscall that ended up here (vmCreate rollback or teardown
         // from process exit), so the slot is live — take the gen-lock
         // rather than reaching through `.ptr`.
-        if (self.owner.lock()) |proc| {
+        if (self.owner.lock(@src())) |proc| {
             proc.vm = null;
             self.owner.unlock();
         } else |_| {}
@@ -386,7 +386,7 @@ pub fn guestMap(proc: *Process, vm_handle: u64, host_vaddr: u64, guest_addr: u64
     // handler — see `Vm.tryHandleMmio`.
     if (guest_addr < vgic_mod.GICD_BASE + vgic_mod.GICD_SIZE and guest_end > vgic_mod.GICD_BASE) return E_INVAL;
 
-    vm_obj._gen_lock.lock();
+    vm_obj._gen_lock.lock(@src());
     defer vm_obj._gen_lock.unlock();
 
     const gicr_end = vgic_mod.GICR_BASE + vgic_mod.GICR_STRIDE * vm_obj.num_vcpus;
@@ -448,7 +448,7 @@ pub fn sysregPassthrough(proc: *Process, vm_handle: u64, sysreg_id: u32, allow_r
 
     // Serialize the HCR override RMW — multiple threads in the same
     // process could otherwise race on the VM's control block.
-    vm_obj._gen_lock.lock();
+    vm_obj._gen_lock.lock(@src());
     defer vm_obj._gen_lock.unlock();
 
     stage2.sysregPassthrough(vm_obj.arch_structures, sysreg_id, allow_read, allow_write) catch return E_PERM;
@@ -465,7 +465,7 @@ pub fn intcAssertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
 
     const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
     if (irq_num >= 24) return E_INVAL;
-    vm_obj._gen_lock.lock();
+    vm_obj._gen_lock.lock(@src());
     defer vm_obj._gen_lock.unlock();
     vgic_mod.assertSpi(&vm_obj.vgic, @intCast(irq_num + 32));
     kickRunningVcpus(vm_obj);
@@ -478,7 +478,7 @@ pub fn intcDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
 
     const vm_obj = resolveVmHandle(proc, vm_handle) orelse return E_BADCAP;
     if (irq_num >= 24) return E_INVAL;
-    vm_obj._gen_lock.lock();
+    vm_obj._gen_lock.lock(@src());
     defer vm_obj._gen_lock.unlock();
     vgic_mod.deassertSpi(&vm_obj.vgic, @intCast(irq_num + 32));
     kickRunningVcpus(vm_obj);
@@ -491,10 +491,10 @@ pub fn intcDeassertIrq(proc: *Process, vm_handle: u64, irq_num: u64) i64 {
 
 fn kickRunningVcpus(vm_obj: *Vm) void {
     for (vm_obj.vcpus[0..vm_obj.num_vcpus]) |vcpu_ref| {
-        const vcpu_obj = vcpu_ref.lock() catch continue;
+        const vcpu_obj = vcpu_ref.lock(@src()) catch continue;
         defer vcpu_ref.unlock();
         if (vcpu_obj.loadState() == .running) {
-            const thread = vcpu_obj.thread.lock() catch continue;
+            const thread = vcpu_obj.thread.lock(@src()) catch continue;
             defer vcpu_obj.thread.unlock();
             if (sched.coreRunning(thread)) |core_id| {
                 gic.sendSchedulerIpi(core_id);

@@ -138,7 +138,7 @@ fn faultRecvValidateBuf(proc: *Process, buf_ptr: u64) i64 {
     var check_addr = buf_ptr;
     while (check_addr < buf_end) {
         const node_ref: SlabRef(VmNode) = proc.vmm.findNode(VAddr.fromInt(check_addr)) orelse return E_BADADDR;
-        const node = node_ref.lock() catch return E_BADADDR;
+        const node = node_ref.lock(@src()) catch return E_BADADDR;
         const writable = node.rights.write;
         const node_end = node.end();
         node_ref.unlock();
@@ -265,7 +265,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
         var page = first_page;
         while (true) {
             const node_ref: SlabRef(VmNode) = proc.vmm.findNode(VAddr.fromInt(page)) orelse return E_BADADDR;
-            const node = node_ref.lock() catch return E_BADADDR;
+            const node = node_ref.lock(@src()) catch return E_BADADDR;
             const readable = node.rights.read;
             node_ref.unlock();
             if (!readable) return E_BADADDR;
@@ -288,7 +288,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
         return E_INVAL;
     };
 
-    const pending = pending_ref.lock() catch {
+    const pending = pending_ref.lock(@src()) catch {
         // Pending thread's slot was freed — drop the stale pending_reply.
         _ = proc.fault_box.endPendingReplyLocked();
         proc.fault_box.lock.unlock();
@@ -345,7 +345,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
 
     // §2.12.23: on ANY fault_reply, release all .suspended siblings before
     // applying the action on the faulting thread.
-    src._gen_lock.lock();
+    src._gen_lock.lock(@src());
     {
         var i: u64 = 0;
         // self-alive: src._gen_lock held — threads[] stable.
@@ -376,7 +376,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
         while (i < src.num_threads) {
             if ((sib_mask & (@as(u64, 1) << @intCast(i))) != 0) {
                 const t_ref = src.threads[i];
-                if (t_ref.lock()) |t| {
+                if (t_ref.lock(@src())) |t| {
                     defer t_ref.unlock();
                     const target_core = if (t.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
                     sched.enqueueOnCore(target_core, t);
@@ -391,7 +391,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
             // §2.12.24: kill ONLY the faulting thread. If it is the last
             // non-exited thread, Thread.deinit -> lastThreadExited drives
             // process exit/restart per §2.6.
-            src._gen_lock.lock();
+            src._gen_lock.lock(@src());
             pending.state = .exited;
             const faulted_bit = @as(u64, 1) << @intCast(pending.slot_index);
             src.faulted_thread_slots &= ~faulted_bit;
@@ -440,7 +440,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
             // to consume it via iret. Leaving a stale pointer would target
             // a previous frame on the next fault.
             pending.fault_user_ctx = null;
-            src._gen_lock.lock();
+            src._gen_lock.lock(@src());
             pending.state = .ready;
             const faulted_bit = @as(u64, 1) << @intCast(pending.slot_index);
             src.faulted_thread_slots &= ~faulted_bit;
@@ -475,7 +475,7 @@ pub fn sysFaultReadMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i64
     const buf_end = std.math.add(u64, buf_ptr, len) catch return E_BADADDR;
     if (!address.AddrSpacePartition.user.contains(buf_end -| 1)) return E_BADADDR;
 
-    const target = entry.object.process.lock() catch return E_BADCAP;
+    const target = entry.object.process.lock(@src()) catch return E_BADCAP;
     defer entry.object.process.unlock();
 
     // Read from target process's virtual address space via physmap.
@@ -525,7 +525,7 @@ pub fn sysFaultWriteMem(proc_handle: u64, vaddr: u64, buf_ptr: u64, len: u64) i6
     const buf_end = std.math.add(u64, buf_ptr, len) catch return E_BADADDR;
     if (!address.AddrSpacePartition.user.contains(buf_end -| 1)) return E_BADADDR;
 
-    const target = entry.object.process.lock() catch return E_BADCAP;
+    const target = entry.object.process.lock(@src()) catch return E_BADCAP;
     defer entry.object.process.unlock();
 
     // Write to target process's virtual address space via physmap (bypasses page perms).
@@ -576,7 +576,7 @@ pub fn sysFaultSetThreadMode(thread_handle: u64, mode: u64) i64 {
 
     const proc = sched.currentProc();
     const pinned = proc.lookupThreadHandle(thread_handle) orelse return E_BADCAP;
-    const target_thread = pinned.thread.lock() catch return E_BADCAP;
+    const target_thread = pinned.thread.lock(@src()) catch return E_BADCAP;
     defer pinned.thread.unlock();
 
     // Verify caller holds fault_handler for the thread's owning process.
@@ -585,7 +585,7 @@ pub fn sysFaultSetThreadMode(thread_handle: u64, mode: u64) i64 {
     //   2. Self-handling:    target_proc == proc AND proc's slot 0 has
     //                        the fault_handler ProcessRights bit set.
     const target_proc_ref = target_thread.process;
-    const target_proc = target_proc_ref.lock() catch return E_BADCAP;
+    const target_proc = target_proc_ref.lock(@src()) catch return E_BADCAP;
     const handler_ok = if (target_proc.fault_handler_proc) |h_ref|
         h_ref.ptr == proc
     else

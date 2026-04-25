@@ -186,7 +186,7 @@ fn deviceIrqHandler(ctx: *cpu.Context) void {
 /// then wake any futex waiters on that physical address.
 /// Called from the device IRQ handler (interrupts disabled).
 fn setIrqPendingBitForOwner(owner: IrqOwner) void {
-    const proc = owner.process.lock() catch return;
+    const proc = owner.process.lock(@src()) catch return;
     defer owner.process.unlock();
     if (proc.perm_view_phys.addr == 0) return;
 
@@ -209,7 +209,7 @@ fn setIrqPendingBitForOwner(owner: IrqOwner) void {
 /// Called from sysIrqAck after unmasking the IRQ line.
 pub fn clearIrqPendingBit(irq_line: u8) void {
     const owner = irq_owners[irq_line] orelse return;
-    const proc = owner.process.lock() catch return;
+    const proc = owner.process.lock(@src()) catch return;
     defer owner.process.unlock();
     if (proc.perm_view_phys.addr == 0) return;
 
