@@ -215,6 +215,10 @@ pub fn main() !void {
             "[arch {s}] join: {d}/{d} matched ({d:.1}%); entries: {d}/{d}\n",
             .{ spec.api_tag, stats.matched, stats.ir_total, pct, graph.entry_points.len, discovered.len },
         );
+        std.debug.print(
+            "[arch {s}] ast-only fns: {d} (no IR record; bodies served from AST walk)\n",
+            .{ spec.api_tag, stats.ast_only },
+        );
 
         const reach_stats = try reachability.compute(allocator, &graph);
         const reach_pct: f64 = if (reach_stats.total == 0)

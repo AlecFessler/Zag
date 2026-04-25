@@ -40,6 +40,11 @@ const Discovered = entry_mod.Discovered;
 pub const JoinStats = struct {
     ir_total: usize,
     matched: usize,
+    /// Number of AST-only Function records emitted (synthetic ids
+    /// `>= ir_total`). These represent functions LLVM inlined entirely so
+    /// the IR carries no `define` for them. Their intra tree is built from
+    /// the AST walk and lets Trace mode drill through inlined helpers.
+    ast_only: usize = 0,
 };
 
 pub fn buildGraph(
@@ -113,8 +118,17 @@ pub fn buildGraphWithStats(
         try gop.value_ptr.append(arena, enriched);
     }
 
-    // First pass: build Function records with resolved display names.
-    var functions = try arena.alloc(types.Function, ir_graph.functions.len);
+    // First pass: build Function records with resolved display names. We
+    // also track which AstFunction pointers got matched to an IR fn so the
+    // AST-only emission below can skip them.
+    //
+    // `matched_ast` is keyed by AstFunction pointer addr (cheap, unique per
+    // walker entry) and contains every AST fn that successfully joined to
+    // an IR record. Functions still in the AST after this pass are the
+    // candidates for the AST-only emission.
+    var matched_ast = std.AutoHashMap(*const AstFunction, void).init(arena);
+
+    var ir_functions = try arena.alloc(types.Function, ir_graph.functions.len);
     var matched: usize = 0;
     for (ir_graph.functions, 0..) |ir_fn, i| {
         var display_name: []const u8 = ir_fn.mangled;
@@ -126,6 +140,7 @@ pub fn buildGraphWithStats(
             if (ast_index.get(key)) |af| {
                 display_name = af.qualified_name;
                 matched += 1;
+                try matched_ast.put(af, {});
                 // Substitute resolved file in def_loc so the frontend's
                 // /api/source endpoint sees a path it can open.
                 def_loc = .{ .file = resolved, .line = loc.line, .col = loc.col };
@@ -135,6 +150,7 @@ pub fn buildGraphWithStats(
                 // builder, /api/source) see a coherent file:line.
                 display_name = af.qualified_name;
                 matched += 1;
+                try matched_ast.put(af, {});
                 def_loc = .{ .file = af.file, .line = af.line_start, .col = 0 };
             }
         }
@@ -143,7 +159,7 @@ pub fn buildGraphWithStats(
             try arena.dupe(types.EnrichedEdge, list.items)
         else
             &.{};
-        functions[i] = .{
+        ir_functions[i] = .{
             .id = ir_fn.id,
             .name = display_name,
             .mangled = ir_fn.mangled,
@@ -151,11 +167,55 @@ pub fn buildGraphWithStats(
             .is_entry = false,
             .entry_kind = null,
             .callees = callees,
+            .is_ast_only = false,
         };
     }
 
-    // Second pass: fill in EnrichedEdge.target_name from each resolved target's
-    // display name. Done after the first pass so callees see the joined names.
+    // Second pass: synthesize Function records for every AstFunction that
+    // didn't match an IR fn — typically `pub inline fn` helpers LLVM
+    // inlined entirely, plus comptime fns that left no IR `define`.
+    //
+    // Synthetic ids start at `ir_graph.functions.len` (callers can identify
+    // AST-only entries by id range or by the `is_ast_only` flag). The
+    // mangled field equals `name` since there's no real linkage symbol.
+    // No IR edges → empty `callees`; the intra tree carries the call info,
+    // built later in `attachIntra` via the import / qname / receiver-method
+    // resolvers.
+    //
+    // We skip AST fns under `/usr/lib/zig/` since the existing frontend
+    // library filter would hide them anyway and the JSON cost is wasted.
+    var ast_only_list = std.ArrayList(types.Function){};
+    var next_id: types.FnId = @intCast(ir_graph.functions.len);
+    for (ast_fns) |*af| {
+        if (matched_ast.contains(af)) continue;
+        if (std.mem.startsWith(u8, af.file, "/usr/lib/zig/")) continue;
+        if (af.fn_node == 0) continue;
+
+        try ast_only_list.append(arena, .{
+            .id = next_id,
+            .name = af.qualified_name,
+            .mangled = af.qualified_name,
+            .def_loc = .{ .file = af.file, .line = af.line_start, .col = 0 },
+            .is_entry = false,
+            .entry_kind = null,
+            .callees = &.{},
+            .is_ast_only = true,
+        });
+        next_id += 1;
+    }
+    const ast_only_count = ast_only_list.items.len;
+
+    // Concatenate IR-backed + AST-only into the final `functions` slice.
+    // Order: IR-backed first (preserves their existing ids), then AST-only
+    // (synthetic ids contiguous from `ir_graph.functions.len`).
+    var functions = try arena.alloc(types.Function, ir_functions.len + ast_only_count);
+    @memcpy(functions[0..ir_functions.len], ir_functions);
+    @memcpy(functions[ir_functions.len..], ast_only_list.items);
+
+    // Third pass: fill in EnrichedEdge.target_name from each resolved
+    // target's display name. Done after both Function passes so callees
+    // see the joined names. AST-only fns have no callees so this is a
+    // no-op for their slots.
     for (functions) |*f| {
         for (f.callees) |*e| {
             const to = e.to orelse continue;
@@ -164,13 +224,11 @@ pub fn buildGraphWithStats(
         }
     }
 
-    // Third pass: build intra-procedural branch trees for every function
-    // that has a corresponding AST entry. We need:
-    //   1) a file → FileAst lookup so we can get the parsed std.zig.Ast.
-    //   2) a (def_loc.file, def_loc.line) → AstFunction lookup so we know
-    //      the AST fn_decl node index.
-    //   3) per function, a CallSiteMap keyed by `<file>:<line>` containing
-    //      every Callee whose `from` matches this function's IR id.
+    // Fourth pass: build intra-procedural branch trees for every function
+    // we have an AST entry for. attachIntra builds the unified qname index
+    // (covering BOTH IR-backed and AST-only ids) before running
+    // branches.buildIntra, so call sites whose targets are AST-only
+    // resolve to a real synthetic id rather than a `to=null` named leaf.
     if (file_asts.len > 0) {
         try attachIntra(arena, functions, ast_fns, file_asts, &realpath_cache, target_arch);
     }
@@ -180,7 +238,11 @@ pub fn buildGraphWithStats(
     var entry_points = std.ArrayList(types.EntryPoint){};
     try markEntryPoints(arena, functions, discovered, &entry_points);
 
-    stats_out.* = .{ .ir_total = ir_graph.functions.len, .matched = matched };
+    stats_out.* = .{
+        .ir_total = ir_graph.functions.len,
+        .matched = matched,
+        .ast_only = ast_only_count,
+    };
 
     return .{
         .functions = functions,

@@ -703,6 +703,24 @@
       white-space: nowrap;
     }
 
+    /* AST-only badge — small pill next to the title indicating the function
+       was reconstructed from source because LLVM inlined every call site. */
+    .trace_badge {
+      color: var(--fg-dim);
+      font-size: 10px;
+      font-weight: 400;
+      padding: 1px 6px;
+      border: 1px dashed var(--fg-dim);
+      border-radius: 8px;
+      flex: 0 0 auto;
+      white-space: nowrap;
+      margin-left: 6px;
+    }
+
+    .trace_box.ast_only {
+      border-style: dashed;
+    }
+
     .trace_body { margin-top: 6px; }
 
     .trace_empty {

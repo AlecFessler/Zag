@@ -76,6 +76,14 @@ pub const Function = struct {
     /// leaf_userspace because it's a synthetic terminator. Defaults true so
     /// graphs without computed reachability render as before.
     reachable: bool = true,
+    /// True when this Function was synthesized from an AST-only walk: the
+    /// LLVM IR has no `define` for it because the compiler inlined every
+    /// call site (typical for `pub inline fn` helpers). The intra tree is
+    /// still useful for Trace mode — it lets the user drill from a caller's
+    /// `Foo.kEntry()` atom into kEntry's own body. The frontend uses this
+    /// flag to render a small visual marker so the user knows the box was
+    /// reconstructed from source rather than IR.
+    is_ast_only: bool = false,
 };
 
 pub const EnrichedEdge = struct {

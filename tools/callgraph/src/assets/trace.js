@@ -317,9 +317,15 @@
     box.className = "trace_box trace_fn";
     box.setAttribute("data-fnid", String(fn.id));
     if (fn.is_entry) box.classList.add("entry");
+    if (fn.is_ast_only) box.classList.add("ast_only");
 
     box.appendChild(buildHeader(shortName(fn.name), fn.def_loc, {
       fullName: fn.name,
+      // AST-only fns have no IR `define` because the compiler inlined every
+      // call site. The body shown here is reconstructed from the source AST,
+      // so we mark the header with a small "↪ inlined" badge so the user
+      // knows they're looking at a synthesized record.
+      badge: fn.is_ast_only ? "↪ inlined" : null,
       onClick: function () {
         if (ctx.showNodePanel) {
           ctx.showNodePanel({
@@ -373,6 +379,14 @@
       });
     }
     h.appendChild(name);
+
+    if (opts.badge) {
+      const badge = document.createElement("span");
+      badge.className = "trace_badge";
+      badge.textContent = opts.badge;
+      badge.title = "Inlined by the compiler — body reconstructed from source AST";
+      h.appendChild(badge);
+    }
 
     if (loc) {
       const locSpan = document.createElement("span");
