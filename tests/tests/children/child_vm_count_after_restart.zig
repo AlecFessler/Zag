@@ -69,12 +69,15 @@ pub fn main(perm_view_addr: u64) void {
         const base = vm.val2;
         const slot0: *volatile u64 = @ptrFromInt(base); // run counter
         const slot1: *volatile u64 = @ptrFromInt(base + 8); // vm_count_before_restart
-        const slot2: *volatile u64 = @ptrFromInt(base + 16); // vm_count_after_restart
         const slot3: *volatile u64 = @ptrFromInt(base + 24); // old_va
+        // Note: slot2 (base + 16, vm_count_after_restart) is intentionally
+        // left at the parent's initial value (0). The post-restart path
+        // writes `vm_count_after + 1` to slot2 (always >= 1), which is
+        // how the parent's `wait until slot2 != 0` distinguishes the
+        // restart write from the first-boot state.
         slot0.* = 1;
         slot1.* = vm_before + 1; // our new one included
         slot3.* = base;
-        slot2.* = 0xFFFF_FFFF_FFFF_FFFF; // sentinel; overwritten on restart
         _ = syscall.ipc_reply(&.{});
         _ = syscall.futex_wake(@ptrFromInt(base), 1);
 
