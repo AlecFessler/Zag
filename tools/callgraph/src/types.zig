@@ -84,6 +84,14 @@ pub const Function = struct {
     /// flag to render a small visual marker so the user knows the box was
     /// reconstructed from source rather than IR.
     is_ast_only: bool = false,
+    /// Definitions this function references, by DefId. Built by the
+    /// def_deps pass: walks each fn's signature + body for identifiers
+    /// and dotted chains, resolves them against the file's import table
+    /// + the global def-qname index, and records every successful match.
+    /// Used by the diff/review feature so a struct edit flags every fn
+    /// that depends on it, not just fns whose own line range was edited.
+    /// Empty when the pass hasn't run (e.g. older snapshots).
+    def_deps: []const DefId = &.{},
 };
 
 pub const EnrichedEdge = struct {
@@ -164,9 +172,58 @@ pub const Atom = union(enum) {
     }
 };
 
+pub const DefKind = enum {
+    /// Plain `const X = ...` not matching another shape (literal, alias).
+    constant,
+    /// `const X = struct { ... }`.
+    struct_,
+    /// `const X = union(enum) { ... }` or `const X = union { ... }`.
+    union_,
+    /// `const X = enum { ... }`.
+    enum_,
+    /// `const X = opaque { ... }`.
+    opaque_,
+    /// Top-level `var X = ...` (mutable global).
+    global_var,
+
+    pub fn jsonStringify(self: DefKind, jw: anytype) !void {
+        try jw.write(@tagName(self));
+    }
+};
+
+pub const DefId = u32;
+
+/// A reviewable top-level declaration that isn't a function: struct/union/
+/// enum/opaque type definitions, plain consts (`const FOO = 0x1234`), and
+/// top-level vars. Functions live in `Function`; this is everything else.
+///
+/// Line bounds cover the FULL declaration extent — for `pub const Foo =
+/// struct { ... };`, that's from the leading `pub` token through the
+/// trailing `;`. The diff hunks endpoint uses these bounds to flag a
+/// definition as changed when any hunk overlaps.
+pub const Definition = struct {
+    id: DefId,
+    name: []const u8,
+    /// Dotted qualified name in the same shape as Function.qualified_name:
+    /// `<module>.<container_path>.<name>`. Used for cross-file resolution
+    /// of `OtherFile.SomeType` references.
+    qualified_name: []const u8,
+    file: []const u8,
+    line_start: u32,
+    line_end: u32,
+    kind: DefKind,
+    is_pub: bool = false,
+};
+
 pub const Graph = struct {
     functions: []Function,
     entry_points: []EntryPoint,
+    /// Top-level non-function declarations that can be flagged as
+    /// "changed" when their source overlaps a diff hunk. Optional —
+    /// older clients ignore it; the diff feature reads it for
+    /// def-dep-aware change tracking. Empty array (not null) when
+    /// the walker found none.
+    definitions: []Definition = &.{},
 };
 
 /// One field of a struct, with its resolved type qname when knowable. Used

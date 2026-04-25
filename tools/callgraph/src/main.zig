@@ -209,6 +209,11 @@ pub fn main() !void {
             &stats,
         );
 
+        // Install the Definition catalog for this arch's graph. Phase 1
+        // of the diff/review feature: every top-level non-fn declaration
+        // becomes a reviewable Definition with an assigned id.
+        graph.definitions = try ast.buildDefinitionList(arena_allocator, walk.definitions);
+
         const pct: f64 = if (stats.ir_total == 0)
             0.0
         else

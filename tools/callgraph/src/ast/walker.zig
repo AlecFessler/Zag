@@ -26,6 +26,20 @@ pub const FieldType = types.FieldType;
 pub const StructTypeInfo = types.StructTypeInfo;
 pub const ParamInfo = types.ParamInfo;
 pub const ReexportAlias = types.ReexportAlias;
+pub const DefKind = types.DefKind;
+
+/// Walker-side mirror of `types.Definition`. Same fields minus the `id`,
+/// which `buildDefinitionList` assigns after the walk so ids stay packed
+/// and stable across IR loads.
+pub const AstDefinition = struct {
+    name: []const u8,
+    qualified_name: []const u8,
+    file: []const u8,
+    line_start: u32,
+    line_end: u32,
+    kind: DefKind,
+    is_pub: bool,
+};
 
 pub const AstFunction = struct {
     name: []const u8,
@@ -87,7 +101,38 @@ pub const WalkResult = struct {
     /// chain resolver can rewrite candidates whose prefix is a re-export
     /// (e.g. `utils.sync.SpinLock.lockIrqSave` → `utils.sync.spin_lock.SpinLock.lockIrqSave`).
     aliases: []ReexportAlias,
+    /// Top-level non-function declarations: struct/union/enum/opaque types,
+    /// plain consts, and globals. Used by the diff feature so a struct
+    /// edit flags every fn that depends on the struct, not just fns whose
+    /// own line range was edited. `qualified_name` mirrors AstFunction's
+    /// shape so cross-file resolution works against the same indexes.
+    definitions: []AstDefinition,
 };
+
+/// Convert the walker's AstDefinition records into the Graph's
+/// Definition records by assigning a fresh sequential id to each. Called
+/// once per arch's graph construction; ids are stable per-arch.
+pub fn buildDefinitionList(
+    arena: std.mem.Allocator,
+    ast_defs: []const AstDefinition,
+) ![]types.Definition {
+    var out = try arena.alloc(types.Definition, ast_defs.len);
+    var i: u32 = 0;
+    while (i < ast_defs.len) : (i += 1) {
+        const d = ast_defs[i];
+        out[i] = .{
+            .id = i,
+            .name = d.name,
+            .qualified_name = d.qualified_name,
+            .file = d.file,
+            .line_start = d.line_start,
+            .line_end = d.line_end,
+            .kind = d.kind,
+            .is_pub = d.is_pub,
+        };
+    }
+    return out;
+}
 
 pub fn walkKernel(arena: std.mem.Allocator, kernel_root: []const u8) ![]AstFunction {
     const r = try walkKernelFull(arena, kernel_root);
@@ -98,13 +143,14 @@ pub fn walkKernelFull(arena: std.mem.Allocator, kernel_root: []const u8) !WalkRe
     var results = std.ArrayList(AstFunction){};
     var asts = std.ArrayList(FileAst){};
     var struct_types = std.ArrayList(StructTypeInfo){};
+    var definitions = std.ArrayList(AstDefinition){};
 
     // Walk the kernel sources first.
-    try walkRoot(arena, kernel_root, &results, &asts, &struct_types);
+    try walkRoot(arena, kernel_root, &results, &asts, &struct_types, &definitions);
 
     // Also walk the Zig stdlib + ubsan_rt so compiler-builtin functions
     // (`ubsan_rt.handler`, `fmt.format.X`, etc.) can be enriched too.
-    walkRoot(arena, "/usr/lib/zig", &results, &asts, &struct_types) catch |err| {
+    walkRoot(arena, "/usr/lib/zig", &results, &asts, &struct_types, &definitions) catch |err| {
         std.debug.print("warning: skipping /usr/lib/zig walk: {s}\n", .{@errorName(err)});
     };
 
@@ -115,6 +161,7 @@ pub fn walkKernelFull(arena: std.mem.Allocator, kernel_root: []const u8) !WalkRe
         .asts = try asts.toOwnedSlice(arena),
         .struct_types = try struct_types.toOwnedSlice(arena),
         .aliases = aliases,
+        .definitions = try definitions.toOwnedSlice(arena),
     };
 }
 
@@ -226,6 +273,7 @@ fn walkRoot(
     results: *std.ArrayList(AstFunction),
     asts: *std.ArrayList(FileAst),
     struct_types: *std.ArrayList(StructTypeInfo),
+    definitions: *std.ArrayList(AstDefinition),
 ) !void {
     const abs_root = std.fs.realpathAlloc(arena, root) catch |err| {
         std.debug.print("warning: could not resolve root '{s}': {s}\n", .{ root, @errorName(err) });
@@ -251,7 +299,7 @@ fn walkRoot(
         // Compose absolute file path.
         const abs_file = try std.fs.path.join(arena, &.{ abs_root, entry.path });
 
-        try walkFile(arena, abs_file, results, asts, struct_types);
+        try walkFile(arena, abs_file, results, asts, struct_types, definitions);
     }
 }
 
@@ -261,6 +309,7 @@ fn walkFile(
     out: *std.ArrayList(AstFunction),
     asts: *std.ArrayList(FileAst),
     struct_types: *std.ArrayList(StructTypeInfo),
+    definitions: *std.ArrayList(AstDefinition),
 ) !void {
     const file = std.fs.openFileAbsolute(abs_file, .{}) catch |err| {
         std.debug.print("warning: skip {s}: {s}\n", .{ abs_file, @errorName(err) });
@@ -326,6 +375,7 @@ fn walkFile(
         .imports = &imports,
         .out = out,
         .struct_types = struct_types,
+        .definitions = definitions,
     };
     // Collect any file-level field decls (rare; some files use the
     // file-as-struct pattern with top-level fields) into a StructTypeInfo
@@ -359,6 +409,11 @@ const WalkCtx = struct {
     /// descends into container_decls. Receiver-chain resolution in
     /// branches.zig consults this via a qname-keyed index.
     struct_types: *std.ArrayList(StructTypeInfo),
+    /// Output sink for top-level non-fn declarations (struct/union/enum/
+    /// opaque type definitions, plain consts, top-level vars). Used by
+    /// the diff feature so a struct edit flags every fn that depends on
+    /// it, not just fns whose own line range was edited.
+    definitions: *std.ArrayList(AstDefinition),
 };
 
 /// Walk a single decl node. `container_path` is the dotted chain of nesting
@@ -381,7 +436,9 @@ fn walkDecl(ctx: *WalkCtx, node: std.zig.Ast.Node.Index, container_path: []const
 }
 
 /// If a var_decl's RHS is a struct/union/enum/opaque container, recurse into
-/// its members with an extended container path.
+/// its members with an extended container path. Also emits a Definition
+/// record so the diff feature can flag fns whose deps changed even when the
+/// fn body itself is unchanged.
 fn walkVarDecl(ctx: *WalkCtx, node: std.zig.Ast.Node.Index, container_path: []const u8) anyerror!void {
     const vd = ctx.tree.fullVarDecl(node) orelse return;
     const init_node = vd.ast.init_node.unwrap() orelse return;
@@ -390,12 +447,99 @@ fn walkVarDecl(ctx: *WalkCtx, node: std.zig.Ast.Node.Index, container_path: []co
     const name_token = vd.ast.mut_token + 1;
     const name = ctx.tree.tokenSlice(name_token);
 
+    // Emit the Definition entry first so source order is preserved in the
+    // output array. Skip pure import aliases — they're already captured in
+    // the file's ImportTable and don't represent reviewable code.
+    if (name.len > 0 and !isImportCall(ctx.tree, init_node)) {
+        emitDefinition(ctx, vd, node, name, init_node, container_path) catch {};
+    }
+
     // Recurse into the init expression looking for container_decls. The init
     // can be wrapped (e.g. `extern struct { ... }` is still a container_decl,
     // but `packed struct(u32) { ... }` is container_decl_arg). Other wrappers
     // (e.g. `if (x) struct {...} else struct {...}`) are rare enough we don't
     // chase them here.
     try recurseIntoTypeExpr(ctx, init_node, name, container_path);
+}
+
+/// Append a `Definition` record for one var_decl. Computes line bounds from
+/// the full node extent (including any leading `pub`/`extern` modifier and
+/// the trailing semicolon) so the diff hunks endpoint can flag the def as
+/// changed when any hunk overlaps. Kind is derived from the init expr:
+/// container_decl → struct/union/enum/opaque, else → constant.
+fn emitDefinition(
+    ctx: *WalkCtx,
+    vd: std.zig.Ast.full.VarDecl,
+    node: std.zig.Ast.Node.Index,
+    name: []const u8,
+    init_node: std.zig.Ast.Node.Index,
+    container_path: []const u8,
+) !void {
+    const first_tok = ctx.tree.firstToken(node);
+    const last_tok = ctx.tree.lastToken(node);
+    const start_loc = ctx.tree.tokenLocation(0, first_tok);
+    const end_loc = ctx.tree.tokenLocation(0, last_tok);
+    const line_start: u32 = @intCast(start_loc.line + 1);
+    const line_end: u32 = @intCast(end_loc.line + 1);
+
+    const qualified = if (container_path.len == 0)
+        try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ ctx.module_path, name })
+    else
+        try std.fmt.allocPrint(ctx.arena, "{s}.{s}.{s}", .{ ctx.module_path, container_path, name });
+
+    const kind = classifyDefKind(ctx.tree, vd, init_node);
+    const is_pub = vd.visib_token != null;
+
+    try ctx.definitions.append(ctx.arena, .{
+        .name = try ctx.arena.dupe(u8, name),
+        .qualified_name = qualified,
+        .file = ctx.file_abs,
+        .line_start = line_start,
+        .line_end = line_end,
+        .kind = kind,
+        .is_pub = is_pub,
+    });
+}
+
+/// Returns true when the var_decl's init is `@import("...")`. We skip
+/// these in the Definition output because they're already captured in
+/// the per-file ImportTable and reviewing the import statement itself
+/// has no code-review value (the actual reviewable change is in the
+/// imported module's contents).
+fn isImportCall(tree: *std.zig.Ast, init_node: std.zig.Ast.Node.Index) bool {
+    const tag = tree.nodeTag(init_node);
+    const is_builtin = switch (tag) {
+        .builtin_call,
+        .builtin_call_comma,
+        .builtin_call_two,
+        .builtin_call_two_comma,
+        => true,
+        else => false,
+    };
+    if (!is_builtin) return false;
+    const main_tok = tree.nodeMainToken(init_node);
+    const slice = tree.tokenSlice(main_tok);
+    return std.mem.eql(u8, slice, "@import");
+}
+
+fn classifyDefKind(
+    tree: *std.zig.Ast,
+    vd: std.zig.Ast.full.VarDecl,
+    init_node: std.zig.Ast.Node.Index,
+) types.DefKind {
+    if (tree.tokenTag(vd.ast.mut_token) == .keyword_var) return .global_var;
+
+    var buf: [2]std.zig.Ast.Node.Index = undefined;
+    if (tree.fullContainerDecl(&buf, init_node)) |cd| {
+        return switch (tree.tokenTag(cd.ast.main_token)) {
+            .keyword_struct => .struct_,
+            .keyword_union => .union_,
+            .keyword_enum => .enum_,
+            .keyword_opaque => .opaque_,
+            else => .constant,
+        };
+    }
+    return .constant;
 }
 
 /// Walk an expression node looking for container_decls and emit / recurse on
@@ -925,7 +1069,7 @@ fn walkBlock(
 /// Map an absolute source path to the IR-style module path. Strips the
 /// kernel-root prefix (or `/usr/lib/zig/[std/]` for compiler builtins),
 /// drops the trailing `.zig`, and replaces `/` with `.`.
-fn filePathToModulePath(arena: std.mem.Allocator, abs_file: []const u8) ![]const u8 {
+pub fn filePathToModulePath(arena: std.mem.Allocator, abs_file: []const u8) ![]const u8 {
     var rel: []const u8 = abs_file;
 
     const zig_std_prefix = "/usr/lib/zig/std/";
