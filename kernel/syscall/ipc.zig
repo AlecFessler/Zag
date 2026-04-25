@@ -41,7 +41,7 @@ fn parseIpcMetadata(raw: u64) IpcMetadata {
 }
 
 fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: u64, rights_val: u64) i64 {
-    sender_proc.perm_lock.lock();
+    sender_proc.perm_lock.lock(@src());
     const src_entry = sender_proc.getPermByHandleLocked(handle_val) orelse {
         sender_proc.perm_lock.unlock();
         return E_BADCAP;
@@ -122,7 +122,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                 if (granted_phr.fault_handler) {
                     sender_proc._gen_lock.lock(@src());
                     sender_proc.fault_handler_proc = process_mod.slabRefNow(Process, target_proc);
-                    sender_proc.perm_lock.lock();
+                    sender_proc.perm_lock.lock(@src());
                     const self_rights = sender_proc.perm_table[0].processRights();
                     sender_proc.had_self_fault_handler = self_rights.fault_handler;
                     var new_rights = self_rights;
@@ -142,7 +142,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                     if (!target_proc.linkFaultHandlerTarget(sender_proc)) {
                         sender_proc._gen_lock.lock(@src());
                         sender_proc.fault_handler_proc = null;
-                        sender_proc.perm_lock.lock();
+                        sender_proc.perm_lock.lock(@src());
                         const r = sender_proc.perm_table[0].processRights();
                         var rr = r;
                         rr.fault_handler = true;
@@ -154,7 +154,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                     }
 
                     // Check if target already has a handle to sender, add fault_handler bit
-                    target_proc.perm_lock.lock();
+                    target_proc.perm_lock.lock(@src());
                     var found_existing = false;
                     for (&target_proc.perm_table) |*slot| {
                         if (slot.object == .process and slot.object.process.ptr == proc_ptr) {
@@ -197,7 +197,7 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                             //    perm_lock.
                             sender_proc._gen_lock.lock(@src());
                             sender_proc.fault_handler_proc = null;
-                            sender_proc.perm_lock.lock();
+                            sender_proc.perm_lock.lock(@src());
                             var rb_rights = sender_proc.perm_table[0].processRights();
                             // Only restore the bit if the sender originally
                             // had it — mirrors releaseFaultHandler semantics
@@ -373,7 +373,7 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
     const rights_check = validateIpcSendRights(target_entry, meta, proc, ctx);
     if (rights_check != E_OK) return .{ .ret = rights_check };
 
-    target_proc.msg_box.lock.lock();
+    target_proc.msg_box.lock.lock(@src());
 
     if (!target_proc.msg_box.isReceiving()) {
         // No receiver waiting
@@ -452,7 +452,7 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
     const rights_check = validateIpcSendRights(target_entry, meta, proc, ctx);
     if (rights_check != E_OK) return .{ .ret = rights_check };
 
-    target_proc.msg_box.lock.lock();
+    target_proc.msg_box.lock.lock(@src());
 
     if (target_proc.msg_box.isReceiving()) {
         // Receiver is waiting — deliver and queue caller for reply.
@@ -531,7 +531,7 @@ pub fn sysIpcRecv(ctx: *ArchCpuContext) SyscallResult {
     const proc = thread.process.ptr;
     const blocking = (arch.syscall.getIpcMetadata(ctx) & 0x2) != 0;
 
-    proc.msg_box.lock.lock();
+    proc.msg_box.lock.lock(@src());
 
     // Must reply before receiving again.
     if (proc.msg_box.isPendingReply()) {
@@ -616,7 +616,7 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
         return .{ .ret = E_INVAL };
     }
 
-    proc.msg_box.lock.lock();
+    proc.msg_box.lock.lock(@src());
 
     if (!proc.msg_box.isPendingReply()) {
         proc.msg_box.lock.unlock();

@@ -181,14 +181,14 @@ pub fn AtomicSlabRef(comptime T: type) type {
 
         pub fn load(self: *const Self, comptime _: std.builtin.AtomicOrder) ?Ref {
             const mut: *Self = @constCast(self);
-            const irq = mut.lock.lockIrqSave();
+            const irq = mut.lock.lockIrqSave(@src());
             defer mut.lock.unlockIrqRestore(irq);
             const p = mut.ptr orelse return null;
             return Ref.init(p, @intCast(mut.gen));
         }
 
         pub fn store(self: *Self, ref: ?Ref, comptime _: std.builtin.AtomicOrder) void {
-            const irq = self.lock.lockIrqSave();
+            const irq = self.lock.lockIrqSave(@src());
             defer self.lock.unlockIrqRestore(irq);
             if (ref) |r| {
                 self.ptr = r.ptr;
@@ -200,7 +200,7 @@ pub fn AtomicSlabRef(comptime T: type) type {
         }
 
         pub fn swap(self: *Self, ref: ?Ref, comptime _: std.builtin.AtomicOrder) ?Ref {
-            const irq = self.lock.lockIrqSave();
+            const irq = self.lock.lockIrqSave(@src());
             defer self.lock.unlockIrqRestore(irq);
             const prev: ?Ref = if (self.ptr) |p| Ref.init(p, @intCast(self.gen)) else null;
             if (ref) |r| {
@@ -330,7 +330,7 @@ pub fn SecureSlab(
         /// self-alive and does not need lock/unlock bracketing.
         pub fn create(self: *Self) AllocError!Ref {
             arch.boot.print("SS:c1\n", .{});
-            self.lock.lock();
+            self.lock.lock(@src());
             defer self.lock.unlock();
             arch.boot.print("SS:c2\n", .{});
 
@@ -416,7 +416,7 @@ pub fn SecureSlab(
         /// Shared tail of `destroy` / `destroyLocked`. Caller has already
         /// established the slot's gen-lock is held at `expected_gen`.
         fn destroyLockedInner(self: *Self, ptr: *T, expected_gen: u63) void {
-            self.lock.lock();
+            self.lock.lock(@src());
             defer self.lock.unlock();
 
             // Defense-in-depth: clear every byte of T *except* `_gen_lock`

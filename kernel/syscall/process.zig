@@ -235,7 +235,7 @@ const ReservationCollection = struct {
 
 fn collectReservations(proc: *Process) ReservationCollection {
     var result = ReservationCollection{};
-    proc.perm_lock.lock();
+    proc.perm_lock.lock(@src());
     defer proc.perm_lock.unlock();
     for (proc.perm_table) |pe| {
         if (pe.object == .vm_reservation) {

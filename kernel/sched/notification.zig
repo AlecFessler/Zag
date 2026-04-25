@@ -30,7 +30,7 @@ pub const NotificationBox = struct {
     pub fn signal(self: *NotificationBox, badge_bit: u6) void {
         _ = @atomicRmw(u64, &self.word, .Or, @as(u64, 1) << badge_bit, .monotonic);
 
-        self.lock.lock();
+        self.lock.lock(@src());
         while (self.waiters.dequeue()) |thread| {
             while (thread.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
             thread.state = .ready;
@@ -48,7 +48,7 @@ pub const NotificationBox = struct {
     /// E_AGAIN for non-blocking with no notifications,
     /// E_TIMEOUT if the timeout expires.
     pub fn wait(self: *NotificationBox, thread: *Thread, timeout_ns: u64) i64 {
-        const irq = self.lock.lockIrqSave();
+        const irq = self.lock.lockIrqSave(@src());
 
         // Fast path: word is already non-zero.
         const w = @atomicLoad(u64, &self.word, .monotonic);
@@ -104,7 +104,7 @@ pub const NotificationBox = struct {
         }
 
         // Re-read and clear the notification word.
-        const irq2 = self.lock.lockIrqSave();
+        const irq2 = self.lock.lockIrqSave(@src());
         const w2 = @atomicLoad(u64, &self.word, .monotonic);
         if (w2 != 0) {
             @atomicStore(u64, &self.word, 0, .monotonic);

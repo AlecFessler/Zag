@@ -54,7 +54,7 @@ fn flushRemoteTlb(virt_addr: u64) void {
 
     const self_id = apic.coreID();
 
-    shootdown_lock.lock();
+    shootdown_lock.lock(@src());
     defer shootdown_lock.unlock();
 
     @atomicStore(u64, &shootdown_addr, virt_addr, .release);

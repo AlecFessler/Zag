@@ -613,7 +613,7 @@ pub fn assertSpi(vgic: *Vgic, intid: u32) void {
     const spi: u32 = intid - 32;
     if (spi >= MAX_SPIS) return;
 
-    const flags = vgic.lock.lockIrqSave();
+    const flags = vgic.lock.lockIrqSave(@src());
     defer vgic.lock.unlockIrqRestore(flags);
 
     if (bitTest(&vgic.spi_edge, spi)) {
@@ -639,7 +639,7 @@ pub fn deassertSpi(vgic: *Vgic, intid: u32) void {
     const spi: u32 = intid - 32;
     if (spi >= MAX_SPIS) return;
 
-    const flags = vgic.lock.lockIrqSave();
+    const flags = vgic.lock.lockIrqSave(@src());
     defer vgic.lock.unlockIrqRestore(flags);
 
     if (bitTest(&vgic.spi_edge, spi)) return;
@@ -669,7 +669,7 @@ pub fn injectInterrupt(vcpu_state: *VcpuState, interrupt: vm_hw.GuestInterrupt) 
         return;
     }
 
-    const flags = vcpu_state.lock.lockIrqSave();
+    const flags = vcpu_state.lock.lockIrqSave(@src());
     defer vcpu_state.lock.unlockIrqRestore(flags);
 
     // SGI / PPI — just latch the pending bit. Priority comes from the
@@ -741,7 +741,7 @@ fn refillLrsLocked(state: *VcpuState, dist: *Vgic) void {
     }
 
     // Pass 2: SPIs from the distributor. Take the lock briefly.
-    const dflags = dist.lock.lockIrqSave();
+    const dflags = dist.lock.lockIrqSave(@src());
     defer dist.lock.unlockIrqRestore(dflags);
 
     var word: u32 = 0;
@@ -785,7 +785,7 @@ fn refillLrsLocked(state: *VcpuState, dist: *Vgic) void {
 /// Reference: GICv3 §11.2 list registers, §12.5 system register interface,
 /// Linux vgic-v3.c vgic_v3_flush_hwstate.
 pub fn prepareEntry(state: *VcpuState) void {
-    const flags = state.lock.lockIrqSave();
+    const flags = state.lock.lockIrqSave(@src());
     defer state.lock.unlockIrqRestore(flags);
 
     refillLrsLocked(state, state.dist);
@@ -824,7 +824,7 @@ pub fn prepareEntry(state: *VcpuState) void {
 /// Reference: GICv3 §11.4 maintenance interrupts, §11.5 EOI handling,
 /// Linux vgic-v3.c vgic_v3_fold_lr_state.
 pub fn saveExit(state: *VcpuState) void {
-    const flags = state.lock.lockIrqSave();
+    const flags = state.lock.lockIrqSave(@src());
     defer state.lock.unlockIrqRestore(flags);
 
     // Snapshot ICH_LR*_EL2 / ICH_AP{0,1}R0_EL2 at EL2 via the
@@ -867,7 +867,7 @@ pub fn saveExit(state: *VcpuState) void {
             if (intid >= 32) {
                 const spi = intid - 32;
                 if (spi < MAX_SPIS) {
-                    const dflags = state.dist.lock.lockIrqSave();
+                    const dflags = state.dist.lock.lockIrqSave(@src());
                     bitSet(&state.dist.spi_pending, spi);
                     state.dist.lock.unlockIrqRestore(dflags);
                 }
@@ -904,7 +904,7 @@ fn clearActiveState(state: *VcpuState, intid: u32) void {
     }
     const spi = intid - 32;
     if (spi >= MAX_SPIS) return;
-    const dflags = state.dist.lock.lockIrqSave();
+    const dflags = state.dist.lock.lockIrqSave(@src());
     defer state.dist.lock.unlockIrqRestore(dflags);
     bitClear(&state.dist.spi_active, spi);
     // If the line is still asserted (level-sensitive), re-pend it so
@@ -950,7 +950,7 @@ pub fn mmioWrite(vgic: *Vgic, vcpu_state: *VcpuState, offset: u64, size: u8, val
 /// GICv3 §12.9 distributor read decode.
 fn distRead(vgic: *Vgic, offset: u64, size: u8) u64 {
     _ = size;
-    const flags = vgic.lock.lockIrqSave();
+    const flags = vgic.lock.lockIrqSave(@src());
     defer vgic.lock.unlockIrqRestore(flags);
 
     return switch (offset) {
@@ -983,7 +983,7 @@ fn distRead(vgic: *Vgic, offset: u64, size: u8) u64 {
 /// GICv3 §12.9 distributor write decode.
 fn distWrite(vgic: *Vgic, offset: u64, size: u8, value: u64) void {
     _ = size;
-    const flags = vgic.lock.lockIrqSave();
+    const flags = vgic.lock.lockIrqSave(@src());
     defer vgic.lock.unlockIrqRestore(flags);
 
     switch (offset) {
@@ -1139,7 +1139,7 @@ fn writeSpiRouter(vgic: *Vgic, byte_offset: u64, value: u64) void {
 /// frame pair (RD_base at offset 0; SGI_base at offset 0x10000).
 fn redistRead(state: *VcpuState, vgic: *Vgic, offset: u64, size: u8) u64 {
     _ = size;
-    const flags = state.lock.lockIrqSave();
+    const flags = state.lock.lockIrqSave(@src());
     defer state.lock.unlockIrqRestore(flags);
 
     return switch (offset) {
@@ -1181,7 +1181,7 @@ fn redistRead(state: *VcpuState, vgic: *Vgic, offset: u64, size: u8) u64 {
 fn redistWrite(state: *VcpuState, vgic: *Vgic, offset: u64, size: u8, value: u64) void {
     _ = size;
     _ = vgic;
-    const flags = state.lock.lockIrqSave();
+    const flags = state.lock.lockIrqSave(@src());
     defer state.lock.unlockIrqRestore(flags);
 
     const v32: u32 = @intCast(value & 0xFFFFFFFF);

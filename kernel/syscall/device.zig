@@ -120,7 +120,7 @@ pub fn sysMemDmaMap(device_handle: u64, shm_handle: u64) i64 {
     //
     // Lock ordering: perm_lock -> iommu locks is safe because no IOMMU
     // path reaches back into perm_lock.
-    proc.perm_lock.lock();
+    proc.perm_lock.lock(@src());
 
     const dev_entry = proc.getPermByHandleLocked(device_handle) orelse {
         proc.perm_lock.unlock();
@@ -193,7 +193,7 @@ pub fn sysMemDmaUnmap(device_handle: u64, shm_handle: u64) i64 {
     // slab reuse could hand out the same pointer to a different SHM
     // and falsely match an unrelated mapping. Look up + consume the
     // mapping with the SHM pinned by refcount.
-    proc.perm_lock.lock();
+    proc.perm_lock.lock(@src());
 
     const dev_entry = proc.getPermByHandleLocked(device_handle) orelse {
         proc.perm_lock.unlock();

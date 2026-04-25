@@ -162,7 +162,7 @@ pub fn removeFromAnyRunQueue(thread: *Thread) void {
     var i: u64 = 0;
     while (i < count) {
         const state = &core_states[i];
-        const irq = state.rq_lock.lockIrqSave();
+        const irq = state.rq_lock.lockIrqSave(@src());
         const removed = state.rq.remove(thread);
         state.rq_lock.unlockIrqRestore(irq);
         if (removed) return;
@@ -299,7 +299,7 @@ pub fn currentProc() *Process {
 pub fn perCoreReadAndResetAccounting(core_id: u64) struct { idle_ns: u64, busy_ns: u64 } {
     if (core_id >= MAX_CORES) return .{ .idle_ns = 0, .busy_ns = 0 };
     const state = &core_states[core_id];
-    const irq = state.rq_lock.lockIrqSave();
+    const irq = state.rq_lock.lockIrqSave(@src());
     defer state.rq_lock.unlockIrqRestore(irq);
     const idle = @atomicRmw(u64, &state.idle_ns, .Xchg, 0, .monotonic);
     const busy = @atomicRmw(u64, &state.busy_ns, .Xchg, 0, .monotonic);
@@ -371,7 +371,7 @@ fn tryStealWork(my_core_id: u64) ?*Thread {
 
         // Lock the candidate's home core and try to remove
         const victim_state = &core_states[best_core];
-        const irq = victim_state.rq_lock.lockIrqSave();
+        const irq = victim_state.rq_lock.lockIrqSave(@src());
         const removed = victim_state.rq.remove(steal_target);
         victim_state.rq_lock.unlockIrqRestore(irq);
 
@@ -456,12 +456,12 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
                 preempted.ctx = ctx.thread_ctx;
                 preempted.on_cpu.store(false, .release);
 
-                state.rq_lock.lock();
+                state.rq_lock.lock(@src());
                 var next = state.rq.dequeue();
                 if (next == null) {
                     state.rq_lock.unlock();
                     next = tryStealWork(core_id);
-                    state.rq_lock.lock();
+                    state.rq_lock.lock(@src());
                 }
                 if (next == null) {
                     next = idleOf(state);
@@ -481,12 +481,12 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
             preempted.on_cpu.store(false, .release);
             if (preempted.state == .running) preempted.state = .ready;
             if (preempted.state == .ready) enqueueOnCore(pinned_core, preempted);
-            state.rq_lock.lock();
+            state.rq_lock.lock(@src());
             var next = state.rq.dequeue();
             if (next == null) {
                 state.rq_lock.unlock();
                 next = tryStealWork(core_id);
-                state.rq_lock.lock();
+                state.rq_lock.lock(@src());
             }
             if (next == null) {
                 next = idleOf(state);
@@ -523,7 +523,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
         state.exited_thread = null;
     }
 
-    state.rq_lock.lock();
+    state.rq_lock.lock(@src());
 
     // Check if this core has a pinned_thread that is ready and not currently running
     if (pinnedOf(state)) |pinned| {
@@ -534,7 +534,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
                 // Migrate preempted thread to another core
                 state.rq_lock.unlock();
                 migrateToEligibleCore(preempted, core_id);
-                state.rq_lock.lock();
+                state.rq_lock.lock(@src());
             }
             pinned.state = .running;
             pinned.on_cpu.store(true, .release);
@@ -570,7 +570,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
                 // Thread shouldn't be on this core — find the right one
                 state.rq_lock.unlock();
                 enqueueOnCore(@ctz(aff), preempted);
-                state.rq_lock.lock();
+                state.rq_lock.lock(@src());
             } else {
                 state.rq.enqueue(preempted);
             }
@@ -585,7 +585,7 @@ pub fn schedTimerHandler(ctx: SchedInterruptContext) void {
     if (next == null) {
         state.rq_lock.unlock();
         next = tryStealWork(core_id);
-        state.rq_lock.lock();
+        state.rq_lock.lock(@src());
     }
 
     // Fall back to idle thread if nothing else is available
@@ -664,7 +664,7 @@ fn migrateThreadsOff(state: *PerCoreState, pinned_core: u64) void {
     // source lock.
     var head: ?SlabRef(Thread) = null;
     {
-        const irq = state.rq_lock.lockIrqSave();
+        const irq = state.rq_lock.lockIrqSave(@src());
         defer state.rq_lock.unlockIrqRestore(irq);
         while (state.rq.dequeue()) |t| {
             t.next = head;
@@ -798,7 +798,7 @@ pub fn enqueueOnCore(core_index: u64, thread: *Thread) void {
     }
 
     const state = &core_states[target];
-    const irq = state.rq_lock.lockIrqSave();
+    const irq = state.rq_lock.lockIrqSave(@src());
     state.rq.enqueue(thread);
     state.rq_lock.unlockIrqRestore(irq);
 
@@ -863,14 +863,14 @@ pub fn switchToNextReady() noreturn {
     // thread's identity (systems.md §run-queue "PMU Save/Restore Hooks").
     const outgoing: ?*Thread = runningOf(state);
 
-    state.rq_lock.lock();
+    state.rq_lock.lock(@src());
     var next = state.rq.dequeue();
 
     // Work stealing if local queue is empty
     if (next == null) {
         state.rq_lock.unlock();
         next = tryStealWork(core_id);
-        state.rq_lock.lock();
+        state.rq_lock.lock(@src());
     }
 
     // Fall back to idle thread
@@ -932,14 +932,14 @@ pub fn switchToThread(current: *Thread, target: *Thread, ctx: *ArchCpuContext, e
         enqueueOnCore(target_core, target);
         arch.smp.triggerSchedulerInterrupt(target_core);
         // Run next ready thread locally
-        state.rq_lock.lock();
+        state.rq_lock.lock(@src());
         var next = state.rq.dequeue();
 
         // Work stealing if local queue is empty
         if (next == null) {
             state.rq_lock.unlock();
             next = tryStealWork(current_core);
-            state.rq_lock.lock();
+            state.rq_lock.lock(@src());
         }
 
         // Fall back to idle thread

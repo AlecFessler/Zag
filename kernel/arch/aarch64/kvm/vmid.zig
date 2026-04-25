@@ -64,7 +64,7 @@ var next: u16 = FIRST_VMID;
 
 /// Assign a fresh (generation, vmid) pair to `vm`. Call from VM create.
 pub fn allocate(vm: anytype) void {
-    lock.lock();
+    lock.lock(@src());
     defer lock.unlock();
     assignLocked(vm);
 }
@@ -73,7 +73,7 @@ pub fn allocate(vm: anytype) void {
 /// older generation it is no longer valid — allocate a new one before the
 /// caller programs VTTBR_EL2.
 pub fn refresh(vm: anytype) void {
-    lock.lock();
+    lock.lock(@src());
     defer lock.unlock();
     if (vm.vmid_generation != generation or vm.vmid == HOST_VMID) {
         assignLocked(vm);

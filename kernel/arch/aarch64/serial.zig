@@ -84,7 +84,7 @@ pub fn print(comptime format: []const u8, args: anytype) void {
         args,
     ) catch @panic("Print would be truncated!");
 
-    print_lock.lock();
+    print_lock.lock(@src());
     defer print_lock.unlock();
 
     for (s) |b| {

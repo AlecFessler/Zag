@@ -151,7 +151,7 @@ pub fn sysMemShmMap(shm_handle: u64, vm_handle: u64, offset: u64) i64 {
     //
     // Lock ordering: perm_lock -> vmm.lock is safe because no code path
     // acquires vmm.lock before perm_lock.
-    proc.perm_lock.lock();
+    proc.perm_lock.lock(@src());
     defer proc.perm_lock.unlock();
 
     const shm_entry = proc.getPermByHandleLocked(shm_handle) orelse return E_BADCAP;

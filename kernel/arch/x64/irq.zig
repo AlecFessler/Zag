@@ -272,7 +272,7 @@ fn schedTimerHandler(ctx: *cpu.Context) void {
 pub fn maskIrq(irq_line: u8) void {
     if (ioapic_base == 0) return;
     const reg = @as(u32, 0x10) + @as(u32, irq_line) * 2;
-    const irq_state = ioapic_lock.lockIrqSave();
+    const irq_state = ioapic_lock.lockIrqSave(@src());
     const val = ioapicRead(reg);
     ioapicWrite(reg, val | (1 << 16));
     ioapic_lock.unlockIrqRestore(irq_state);
@@ -285,7 +285,7 @@ pub fn maskIrq(irq_line: u8) void {
 pub fn unmaskIrq(irq_line: u8) void {
     if (ioapic_base == 0) return;
     const reg = @as(u32, 0x10) + @as(u32, irq_line) * 2;
-    const irq_state = ioapic_lock.lockIrqSave();
+    const irq_state = ioapic_lock.lockIrqSave(@src());
     const val = ioapicRead(reg);
     ioapicWrite(reg, val & ~@as(u32, 1 << 16));
     ioapic_lock.unlockIrqRestore(irq_state);

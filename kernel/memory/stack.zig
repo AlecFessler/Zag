@@ -39,7 +39,7 @@ pub fn isKernelStackPage(vaddr: VAddr) KernelStackPage {
 }
 
 fn allocSlot() !u64 {
-    freelist_lock.lock();
+    freelist_lock.lock(@src());
     if (freelist_top > 0) {
         freelist_top -= 1;
         const slot = freelist_buf[freelist_top];
@@ -54,7 +54,7 @@ fn allocSlot() !u64 {
 }
 
 fn recycleSlot(slot: u64) void {
-    freelist_lock.lock();
+    freelist_lock.lock(@src());
     defer freelist_lock.unlock();
     if (freelist_top < FREELIST_CAP) {
         freelist_buf[freelist_top] = slot;

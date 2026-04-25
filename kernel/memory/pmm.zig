@@ -68,7 +68,7 @@ pub const PhysicalMemoryManager = struct {
                 return page;
             }
 
-            self.lock.lock();
+            self.lock.lock(@src());
             const bulk = self.buddy.allocBlock(paging.PAGE4K * CACHE_REFILL_PAGES) orelse {
                 const single = self.buddy.allocBlock(paging.PAGE4K);
                 self.lock.unlock();
@@ -87,7 +87,7 @@ pub const PhysicalMemoryManager = struct {
             return result;
         }
 
-        const irq = self.lock.lockIrqSave();
+        const irq = self.lock.lockIrqSave(@src());
         defer self.lock.unlockIrqRestore(irq);
         return self.buddy.allocBlock(paging.PAGE4K);
     }
@@ -109,7 +109,7 @@ pub const PhysicalMemoryManager = struct {
                 return;
             }
 
-            self.lock.lock();
+            self.lock.lock(@src());
             var i: u32 = 0;
             while (i < CACHE_MAX_PAGES / 2) {
                 const cached = cache.pop().?;
@@ -123,7 +123,7 @@ pub const PhysicalMemoryManager = struct {
             return;
         }
 
-        const irq = self.lock.lockIrqSave();
+        const irq = self.lock.lockIrqSave(@src());
         defer self.lock.unlockIrqRestore(irq);
         self.buddy.freeBlock(page[0..paging.PAGE4K]);
     }
@@ -133,7 +133,7 @@ pub const PhysicalMemoryManager = struct {
     /// the cache only holds single pages — and returns directly from
     /// the buddy allocator.
     pub fn allocBlock(self: *PhysicalMemoryManager, len: u64) ?[*]u8 {
-        const irq = self.lock.lockIrqSave();
+        const irq = self.lock.lockIrqSave(@src());
         defer self.lock.unlockIrqRestore(irq);
         return self.buddy.allocBlock(len);
     }
@@ -148,7 +148,7 @@ pub const PhysicalMemoryManager = struct {
             arch.memory.zeroPage(@ptrCast(&buf[offset]));
             offset += paging.PAGE4K;
         }
-        const irq = self.lock.lockIrqSave();
+        const irq = self.lock.lockIrqSave(@src());
         defer self.lock.unlockIrqRestore(irq);
         self.buddy.freeBlock(buf);
     }
@@ -186,7 +186,7 @@ pub var global_pmm: ?PhysicalMemoryManager = null;
 pub fn freePageCount() u64 {
     if (global_pmm == null) return 0;
     const pmm_ptr: *PhysicalMemoryManager = &global_pmm.?;
-    const irq = pmm_ptr.lock.lockIrqSave();
+    const irq = pmm_ptr.lock.lockIrqSave(@src());
     defer pmm_ptr.lock.unlockIrqRestore(irq);
 
     var total = pmm_ptr.buddy.free_pages;
@@ -208,7 +208,7 @@ pub fn freePageCount() u64 {
 pub fn totalPageCount() u64 {
     if (global_pmm == null) return 0;
     const pmm_ptr: *PhysicalMemoryManager = &global_pmm.?;
-    const irq = pmm_ptr.lock.lockIrqSave();
+    const irq = pmm_ptr.lock.lockIrqSave(@src());
     defer pmm_ptr.lock.unlockIrqRestore(irq);
     return pmm_ptr.buddy.total_pages;
 }

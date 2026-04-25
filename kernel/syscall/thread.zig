@@ -156,7 +156,7 @@ pub fn sysSetPriority(priority_raw: u64) i64 {
             if (pin_result >= 0) {
                 thread.priority = .pinned;
                 // Sync user view so thread entry field1 reflects pinned core
-                proc.perm_lock.lock();
+                proc.perm_lock.lock(@src());
                 proc.syncUserView();
                 proc.perm_lock.unlock();
                 return pin_result;
@@ -362,7 +362,7 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
         // self-alive: ipc_server was stored on the send/call path and
         // outlives the reply-wait we are tearing down now.
         const server = server_ref.ptr;
-        server.msg_box.lock.lock();
+        server.msg_box.lock.lock(@src());
         if (server.msg_box.isPendingReply() and
             server.msg_box.pending_thread != null and
             server.msg_box.pending_thread.?.ptr == target)
@@ -378,7 +378,7 @@ pub fn sysThreadKill(thread_handle: u64) i64 {
     // receiver (a dying recv()er), and from our own / handler's fault
     // boxes in case target was queued there for some reason. These are
     // cheap no-ops when the thread isn't actually in the box.
-    target_proc.msg_box.lock.lock();
+    target_proc.msg_box.lock.lock(@src());
     if (target_proc.msg_box.isReceiving() and
         target_proc.msg_box.receiver != null and
         target_proc.msg_box.receiver.?.ptr == target)

@@ -228,7 +228,7 @@ pub const VirtualMemoryManager = struct {
     }
 
     pub fn allocateAfterCursor(self: *VirtualMemoryManager, size: u64) !VAddr {
-        self.lock.lock();
+        self.lock.lock(@src());
         defer self.lock.unlock();
         const addr = try self.findFreeRange(size);
         if (addr.addr + size > self.range_start.addr) {
@@ -244,7 +244,7 @@ pub const VirtualMemoryManager = struct {
     }
 
     pub fn insertKernelNode(self: *VirtualMemoryManager, start: VAddr, size: u64, rights: VmReservationRights, policy: RestartPolicy) !void {
-        self.lock.lock();
+        self.lock.lock(@src());
         defer self.lock.unlock();
 
         const node_ref = try allocVmNode();
@@ -266,7 +266,7 @@ pub const VirtualMemoryManager = struct {
     }
 
     pub fn deinit(self: *VirtualMemoryManager) void {
-        self.lock.lock();
+        self.lock.lock(@src());
         defer self.lock.unlock();
 
         var i: usize = 0;
@@ -279,7 +279,7 @@ pub const VirtualMemoryManager = struct {
     }
 
     pub fn findNode(self: *VirtualMemoryManager, vaddr: VAddr) ?SlabRef(VmNode) {
-        self.lock.lock();
+        self.lock.lock(@src());
         defer self.lock.unlock();
         return self.findNodeLocked(vaddr);
     }
@@ -309,7 +309,7 @@ pub const VirtualMemoryManager = struct {
     pub fn reserve(self: *VirtualMemoryManager, hint: VAddr, size: u64, max_rights: VmReservationRights) !ReserveResult {
         if (!std.mem.isAligned(size, paging.PAGE4K) or size == 0) return error.InvalidSize;
 
-        self.lock.lock();
+        self.lock.lock(@src());
         defer self.lock.unlock();
 
         const chosen = blk: {
@@ -376,7 +376,7 @@ pub const VirtualMemoryManager = struct {
         const usable_size = @as(u64, num_pages) * paging.PAGE4K;
         const total = usable_size + 2 * paging.PAGE4K;
 
-        self.lock.lock();
+        self.lock.lock(@src());
         defer self.lock.unlock();
 
         const base_addr = try self.findFreeRange(total);
@@ -451,7 +451,7 @@ pub const VirtualMemoryManager = struct {
     }
 
     pub fn reclaimStack(self: *VirtualMemoryManager, stack: zag.memory.stack.Stack) void {
-        self.lock.lock();
+        self.lock.lock(@src());
         defer self.lock.unlock();
 
         if (self.findNodeLocked(stack.guard)) |underflow_ref| {
@@ -470,7 +470,7 @@ pub const VirtualMemoryManager = struct {
     }
 
     pub fn demandPage(self: *VirtualMemoryManager, fault_vaddr: VAddr, is_write: bool, is_exec: bool) !void {
-        self.lock.lock();
+        self.lock.lock(@src());
         defer self.lock.unlock();
 
         const node_ref = self.findNodeLocked(fault_vaddr) orelse return error.NoMapping;
@@ -522,7 +522,7 @@ pub const VirtualMemoryManager = struct {
         size: u64,
         new_rights: VmReservationRights,
     ) !void {
-        self.lock.lock();
+        self.lock.lock(@src());
         defer self.lock.unlock();
 
         const range_start = VAddr.fromInt(original_start.addr + offset);
@@ -566,7 +566,7 @@ pub const VirtualMemoryManager = struct {
         shm_ref: SlabRef(SharedMemory),
         rights: VmReservationRights,
     ) !void {
-        self.lock.lock();
+        self.lock.lock(@src());
         defer self.lock.unlock();
 
         // self-alive: caller holds shm._gen_lock across this call (see
@@ -644,7 +644,7 @@ pub const VirtualMemoryManager = struct {
         size: u64,
         max_rights: VmReservationRights,
     ) !void {
-        self.lock.lock();
+        self.lock.lock(@src());
         defer self.lock.unlock();
         _ = vm_handle;
         _ = original_size;
@@ -754,7 +754,7 @@ pub const VirtualMemoryManager = struct {
         write_combining: bool,
         rights: VmReservationRights,
     ) !void {
-        self.lock.lock();
+        self.lock.lock(@src());
         defer self.lock.unlock();
 
         // self-alive: caller (sysMemMmioMap) holds device._gen_lock across
@@ -836,7 +836,7 @@ pub const VirtualMemoryManager = struct {
         device_ref: SlabRef(DeviceRegion),
         rights: VmReservationRights,
     ) !void {
-        self.lock.lock();
+        self.lock.lock(@src());
         defer self.lock.unlock();
 
         // self-alive: caller (sysMemMmioMap) holds device._gen_lock across
@@ -886,7 +886,7 @@ pub const VirtualMemoryManager = struct {
         original_start: VAddr,
         original_size: u64,
     ) !void {
-        self.lock.lock();
+        self.lock.lock(@src());
         defer self.lock.unlock();
 
         const range_end_addr = original_start.addr + original_size;
@@ -915,7 +915,7 @@ pub const VirtualMemoryManager = struct {
     };
 
     pub fn revokeShmHandle(self: *VirtualMemoryManager, shm: *SharedMemory, reservations: []const ReservationInfo) void {
-        self.lock.lock();
+        self.lock.lock(@src());
         defer self.lock.unlock();
 
         var i: usize = 0;
@@ -934,7 +934,7 @@ pub const VirtualMemoryManager = struct {
     }
 
     pub fn revokeMmioHandle(self: *VirtualMemoryManager, device: *DeviceRegion, reservations: []const ReservationInfo) void {
-        self.lock.lock();
+        self.lock.lock(@src());
         defer self.lock.unlock();
 
         var i: usize = 0;
@@ -955,7 +955,7 @@ pub const VirtualMemoryManager = struct {
 
     pub fn resetForRestart(self: *VirtualMemoryManager) void {
         arch.boot.print("K: rfR enter count={d}\n", .{self.count});
-        self.lock.lock();
+        self.lock.lock(@src());
         defer self.lock.unlock();
         arch.boot.print("K: rfR locked\n", .{});
 

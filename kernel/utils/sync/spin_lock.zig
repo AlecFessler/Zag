@@ -4,12 +4,14 @@ const zag = @import("zag");
 const arch = zag.arch.dispatch;
 const debug = zag.utils.sync.debug;
 
+const SrcLoc = debug.SrcLoc;
+
 pub const SpinLock = struct {
     state: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     class: [*:0]const u8 = "@unclassified",
 
-    pub fn lock(self: *SpinLock) void {
-        debug.acquire(self, self.class, 0, .{ .file = "?", .fn_name = "?", .line = 0, .column = 0, .module = "?" });
+    pub fn lock(self: *SpinLock, src: SrcLoc) void {
+        debug.acquire(self, self.class, 0, src);
         while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
             std.atomic.spinLoopHint();
         }
@@ -21,9 +23,9 @@ pub const SpinLock = struct {
         self.state.store(0, .release);
     }
 
-    pub fn lockIrqSave(self: *SpinLock) u64 {
+    pub fn lockIrqSave(self: *SpinLock, src: SrcLoc) u64 {
         const state = arch.cpu.saveAndDisableInterrupts();
-        self.lock();
+        self.lock(src);
         return state;
     }
 

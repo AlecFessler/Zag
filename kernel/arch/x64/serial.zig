@@ -76,7 +76,7 @@ pub fn print(
         args,
     ) catch @panic("Print would be truncated!");
 
-    print_lock.lock();
+    print_lock.lock(@src());
     defer print_lock.unlock();
 
     for (s) |b| {

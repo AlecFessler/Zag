@@ -110,7 +110,7 @@ pub const VmReplyAction = union(enum) {
 /// Single home for "an exit happened, push it to userspace". Called by
 /// `exit_handler.handleExit` for every VMM-bound exit.
 pub fn queueOrDeliver(box: *VmExitBox, vm_obj: *Vm, vcpu_obj: *VCpu) void {
-    box.lock.lock();
+    box.lock.lock(@src());
     if (box.isReceiving()) {
         const recv_ref = box.takeReceiverLocked();
         box.lock.unlock();
@@ -119,7 +119,7 @@ pub fn queueOrDeliver(box: *VmExitBox, vm_obj: *Vm, vcpu_obj: *VCpu) void {
             recv_ref.unlock();
         } else |_| {
             // Receiver slot freed; fall back to enqueuing the exit.
-            box.lock.lock();
+            box.lock.lock(@src());
             // self-alive: caller IS vcpu_obj.thread.
             box.enqueueLocked(vcpu_obj.thread.ptr);
             box.lock.unlock();
@@ -145,7 +145,7 @@ fn deliverExit(vm_obj: *Vm, vcpu_obj: *VCpu, receiver: *Thread) void {
     for (vm_obj.vcpus[0..vm_obj.num_vcpus], 0..) |v, i| {
         if (v.ptr == vcpu_obj) {
             const box = vm_obj.exitBox();
-            box.lock.lock();
+            box.lock.lock(@src());
             box.markPendingLocked(@intCast(i));
             box.lock.unlock();
             break;
@@ -189,7 +189,7 @@ pub fn vmRecv(proc: *Process, thread: *Thread, ctx: *ArchCpuContext, vm_handle: 
 
     vm_obj._gen_lock.lock(@src());
     const box = vm_obj.exitBox();
-    box.lock.lock();
+    box.lock.lock(@src());
 
     if (box.queue.dequeue()) |exited_thread| {
         box.lock.unlock();
@@ -239,7 +239,7 @@ pub fn vmReply(proc: *Process, vm_handle: u64, exit_token: u64, action_ptr: u64)
     };
 
     const box = vm_obj.exitBox();
-    box.lock.lock();
+    box.lock.lock(@src());
 
     const vcpu_index = vcpuIndex(vm_obj, vcpu_obj) orelse {
         box.lock.unlock();
@@ -345,7 +345,7 @@ fn deliverExitMessage(proc: *Process, vm_obj: *Vm, thread: *Thread, buf_ptr: u64
 
     const vcpu_index = vcpuIndex(vm_obj, vcpu_obj) orelse return E_BADADDR;
     const box = vm_obj.exitBox();
-    box.lock.lock();
+    box.lock.lock(@src());
     box.markPendingLocked(vcpu_index);
     box.lock.unlock();
 

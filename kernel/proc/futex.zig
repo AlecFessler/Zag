@@ -40,7 +40,7 @@ fn removeWaiter(bucket: *Bucket, target: *Thread) bool {
 }
 
 fn addTimedWaiter(thread: *Thread) bool {
-    const irq = timed_lock.lockIrqSave();
+    const irq = timed_lock.lockIrqSave(@src());
     defer timed_lock.unlockIrqRestore(irq);
     for (&timed_waiters) |*slot| {
         if (slot.* == null) {
@@ -52,7 +52,7 @@ fn addTimedWaiter(thread: *Thread) bool {
 }
 
 fn removeTimedWaiter(thread: *Thread) void {
-    const irq = timed_lock.lockIrqSave();
+    const irq = timed_lock.lockIrqSave(@src());
     defer timed_lock.unlockIrqRestore(irq);
     for (&timed_waiters) |*slot| {
         if (slot.* == thread) {
@@ -69,14 +69,14 @@ pub fn removeBlockedThread(thread: *Thread) void {
         // Multi-address wait: remove from all buckets
         for (thread.futex_paddrs[0..thread.futex_bucket_count]) |pa| {
             const bucket = &buckets[bucketIdx(pa)];
-            const irq = bucket.lock.lockIrqSave();
+            const irq = bucket.lock.lockIrqSave(@src());
             _ = removeWaiter(bucket, thread);
             bucket.lock.unlockIrqRestore(irq);
         }
         thread.futex_bucket_count = 0;
     } else {
         const bucket = &buckets[bucketIdx(thread.futex_paddr)];
-        const irq = bucket.lock.lockIrqSave();
+        const irq = bucket.lock.lockIrqSave(@src());
         _ = removeWaiter(bucket, thread);
         bucket.lock.unlockIrqRestore(irq);
     }
@@ -93,7 +93,7 @@ pub fn wait(paddr: PAddr, expected: u64, timeout_ns: u64, thread: *Thread) i64 {
     const vaddr = VAddr.fromPAddr(paddr, null);
     const value_ptr: *const u64 = @ptrFromInt(vaddr.addr);
 
-    const irq = bucket.lock.lockIrqSave();
+    const irq = bucket.lock.lockIrqSave(@src());
 
     if (@atomicLoad(u64, value_ptr, .acquire) != expected) {
         bucket.lock.unlockIrqRestore(irq);
@@ -144,7 +144,7 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
     const bucket = &buckets[bucketIdx(paddr)];
     var woken: u32 = 0;
 
-    const irq = bucket.lock.lockIrqSave();
+    const irq = bucket.lock.lockIrqSave(@src());
 
     // Pop threads from the priority queue. Since multiple paddrs may hash to
     // the same bucket, we must check each thread's futex_paddr. Non-matching
@@ -209,7 +209,7 @@ fn removeFromOtherBuckets(thread: *Thread, except_paddr: PAddr) void {
         const idx = bucketIdx(pa);
         if (idx == except_idx) continue;
         const bucket = &buckets[idx];
-        const birq = bucket.lock.lockIrqSave();
+        const birq = bucket.lock.lockIrqSave(@src());
         _ = removeWaiter(bucket, thread);
         bucket.lock.unlockIrqRestore(birq);
     }
@@ -400,7 +400,7 @@ fn acquireBucketLocks(sorted: []const u8, addrs: []const PAddr) BucketLockState 
     for (sorted) |si| {
         const idx = bucketIdx(addrs[si]);
         if (idx == prev_idx) continue;
-        const irq = buckets[idx].lock.lockIrqSave();
+        const irq = buckets[idx].lock.lockIrqSave(@src());
         state.unique_indices[state.count] = idx;
         state.irq_states[state.count] = irq;
         state.count += 1;
@@ -432,7 +432,7 @@ pub fn expireTimedWaiters() void {
     var expired: [MAX_TIMED_WAITERS]Snapshot = undefined;
     var expired_count: usize = 0;
     {
-        const irq = timed_lock.lockIrqSave();
+        const irq = timed_lock.lockIrqSave(@src());
         defer timed_lock.unlockIrqRestore(irq);
         for (&timed_waiters) |*slot| {
             const thread = slot.* orelse continue;
@@ -455,13 +455,13 @@ pub fn expireTimedWaiters() void {
         if (thread.futex_bucket_count > 0) {
             for (thread.futex_paddrs[0..thread.futex_bucket_count]) |pa| {
                 const bucket = &buckets[bucketIdx(pa)];
-                const birq = bucket.lock.lockIrqSave();
+                const birq = bucket.lock.lockIrqSave(@src());
                 if (removeWaiter(bucket, thread)) removed = true;
                 bucket.lock.unlockIrqRestore(birq);
             }
         } else {
             const bucket = &buckets[bucketIdx(thread.futex_paddr)];
-            const birq = bucket.lock.lockIrqSave();
+            const birq = bucket.lock.lockIrqSave(@src());
             removed = removeWaiter(bucket, thread);
             bucket.lock.unlockIrqRestore(birq);
         }

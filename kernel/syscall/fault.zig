@@ -101,7 +101,7 @@ fn writeFaultMessage(proc: *Process, buf_ptr: u64, process_handle: u64, thread_h
 /// "not found in table" (which can happen if the source process is the
 /// handler itself, in which case process_handle = HANDLE_SELF = 0).
 fn lookupFaultHandles(handler: *Process, faulted: *Thread) struct { proc_h: u64, thread_h: u64 } {
-    handler.perm_lock.lock();
+    handler.perm_lock.lock(@src());
     defer handler.perm_lock.unlock();
     var proc_h: u64 = 0;
     var thread_h: u64 = 0;
@@ -122,7 +122,7 @@ fn lookupFaultHandles(handler: *Process, faulted: *Thread) struct { proc_h: u64,
 }
 
 fn faultHandlerCheck(proc: *Process) bool {
-    proc.perm_lock.lock();
+    proc.perm_lock.lock(@src());
     defer proc.perm_lock.unlock();
     if (proc.perm_table[0].processRights().fault_handler) return true;
     for (proc.perm_table[1..]) |slot| {
@@ -162,7 +162,7 @@ pub fn sysFaultRecv(ctx: *ArchCpuContext, buf_ptr: u64, blocking: u64) SyscallRe
     if (buf_check != E_OK) return .{ .ret = buf_check };
 
     while (true) {
-        proc.fault_box.lock.lock();
+        proc.fault_box.lock.lock(@src());
 
         if (proc.fault_box.isPendingReply()) {
             proc.fault_box.lock.unlock();
@@ -274,7 +274,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
         }
     }
 
-    proc.fault_box.lock.lock();
+    proc.fault_box.lock.lock(@src());
 
     if (!proc.fault_box.isPendingReply()) {
         proc.fault_box.lock.unlock();
@@ -321,7 +321,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
 
     // Apply FAULT_EXCLUDE_* flags to the pending thread's perm entry.
     if ((flags & (fault_exclude_next | fault_exclude_permanent)) != 0) {
-        proc.perm_lock.lock();
+        proc.perm_lock.lock(@src());
         for (&proc.perm_table) |*slot| {
             if (slot.object == .thread and slot.object.thread.ptr == pending) {
                 if ((flags & fault_exclude_next) != 0) {
@@ -407,7 +407,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
                 // send/call path; it outlives the reply-wait we are
                 // tearing down now.
                 const server = server_ref.ptr;
-                server.msg_box.lock.lock();
+                server.msg_box.lock.lock(@src());
                 if (server.msg_box.isPendingReply() and
                     server.msg_box.pending_thread != null and
                     server.msg_box.pending_thread.?.ptr == pending)
@@ -596,7 +596,7 @@ pub fn sysFaultSetThreadMode(thread_handle: u64, mode: u64) i64 {
     if (!handler_ok and !is_self_handler) return E_PERM;
 
     // Update exclude flags on the thread's perm entry in caller's table
-    proc.perm_lock.lock();
+    proc.perm_lock.lock(@src());
     defer proc.perm_lock.unlock();
     for (&proc.perm_table) |*slot| {
         if (slot.object == .thread and slot.object.thread.ptr == target_thread) {

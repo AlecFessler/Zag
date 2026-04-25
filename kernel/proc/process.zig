@@ -180,7 +180,7 @@ pub const Process = struct {
 
     /// Insert a thread handle at a specific slot (used for initial thread at slot 1).
     pub fn insertThreadHandleAtSlot(self: *Process, slot: usize, thread: *Thread, rights: ThreadHandleRights) void {
-        self.perm_lock.lock();
+        self.perm_lock.lock(@src());
         defer self.perm_lock.unlock();
         // Caller must guarantee the target slot is empty — initPermTable
         // leaves slots 1..MAX_PERMS-1 empty, which is why this works for
@@ -207,7 +207,7 @@ pub const Process = struct {
     /// hand back to the next syscall that takes a thread handle. Walking the
     /// whole table is O(MAX_PERMS) and thread exit is already not hot.
     pub fn removeThreadHandle(self: *Process, thread: *Thread) void {
-        self.perm_lock.lock();
+        self.perm_lock.lock(@src());
         var drop: u32 = 0;
         for (&self.perm_table) |*slot| {
             if (slot.object == .thread and slot.object.thread.ptr == thread) {
@@ -222,7 +222,7 @@ pub const Process = struct {
 
     /// Find the handle ID for a thread in this process's perm table.
     pub fn findThreadHandle(self: *Process, thread: *Thread) ?u64 {
-        self.perm_lock.lock();
+        self.perm_lock.lock(@src());
         defer self.perm_lock.unlock();
         for (self.perm_table) |slot| {
             if (slot.object == .thread and slot.object.thread.ptr == thread) {
@@ -239,7 +239,7 @@ pub const Process = struct {
     /// - target dies (cleanup unlinks itself from handler's list)
     pub fn releaseFaultHandler(self: *Process, target: *Process) void {
         // Clear all thread-handle slots in self.perm_table that belong to target.
-        self.perm_lock.lock();
+        self.perm_lock.lock(@src());
         for (&self.perm_table) |*slot| {
             // self-alive: iterating our own perm_table under perm_lock.
             // Identity compare — both .ptr accesses are analyzer-exempt
@@ -256,7 +256,7 @@ pub const Process = struct {
         // bit on slot 0 — but only if the target originally had the bit.
         // This prevents synthesizing a right that the sender didn't hold
         // at the moment of the fault_handler transfer.
-        target.perm_lock.lock();
+        target.perm_lock.lock(@src());
         target.fault_handler_proc = null;
         if (target.had_self_fault_handler) {
             var self_rights = target.perm_table[0].processRights();
@@ -269,7 +269,7 @@ pub const Process = struct {
         // Drain any fault-box state belonging to the target. The threads
         // are still alive — they'll be re-evaluated under self-handling
         // semantics below.
-        self.fault_box.lock.lock();
+        self.fault_box.lock.lock(@src());
         if (self.fault_box.isPendingReply()) {
             if (self.fault_box.pending_thread) |pt_ref| {
                 if (pt_ref.lock(@src())) |pt| {
@@ -335,7 +335,7 @@ pub const Process = struct {
             target.kill(.killed);
         } else {
             // Push the faulted threads onto target's own fault_box.
-            target.fault_box.lock.lock();
+            target.fault_box.lock.lock(@src());
             for (faulted_buf[0..faulted_n]) |t_ref| {
                 const t = t_ref.lock(@src()) catch continue;
                 defer t_ref.unlock();
@@ -349,7 +349,7 @@ pub const Process = struct {
                     } else |_| {
                         // Blocked receiver's slot was freed; drop the fault.
                     }
-                    target.fault_box.lock.lock();
+                    target.fault_box.lock.lock(@src());
                 } else {
                     target.fault_box.enqueueLocked(t);
                 }
@@ -471,7 +471,7 @@ pub const Process = struct {
     /// thread_handle) — both fields are looked up in `handler`'s perm
     /// table; either can be 0 (HANDLE_SELF / not present).
     fn lookupHandlesForFault(handler: *Process, faulted: *Thread) struct { proc_h: u64, thread_h: u64 } {
-        handler.perm_lock.lock();
+        handler.perm_lock.lock(@src());
         defer handler.perm_lock.unlock();
         var proc_h: u64 = 0;
         var thread_h: u64 = 0;
@@ -603,7 +603,7 @@ pub const Process = struct {
             // its user buffer (the receiver cannot dequeue itself on
             // wake-up because the kernel doesn't restart sysFaultRecv).
             // Otherwise enqueue and let the next fault_recv pick it up.
-            self.fault_box.lock.lock();
+            self.fault_box.lock.lock(@src());
             if (self.fault_box.isReceiving()) {
                 const r_ref = self.fault_box.takeReceiverLocked();
                 self.fault_box.beginPendingReplyLocked(thread);
@@ -633,7 +633,7 @@ pub const Process = struct {
         // the handler's table. If either is set, skip stop-all (only the
         // faulting thread enters .faulted). exclude_oneshot is consumed.
         var stop_all = true;
-        handler.perm_lock.lock();
+        handler.perm_lock.lock(@src());
         for (&handler.perm_table) |*slot| {
             if (slot.object == .thread and slot.object.thread.ptr == thread) {
                 if (slot.exclude_oneshot or slot.exclude_permanent) {
@@ -682,7 +682,7 @@ pub const Process = struct {
             }
         }
 
-        handler.fault_box.lock.lock();
+        handler.fault_box.lock.lock(@src());
         if (handler.fault_box.isReceiving()) {
             const r_ref = handler.fault_box.takeReceiverLocked();
             handler.fault_box.beginPendingReplyLocked(thread);
@@ -703,7 +703,7 @@ pub const Process = struct {
     }
 
     pub fn getPermByHandle(self: *Process, handle_id: u64) ?PermissionEntry {
-        self.perm_lock.lock();
+        self.perm_lock.lock(@src());
         defer self.perm_lock.unlock();
         return self.getPermByHandleLocked(handle_id);
     }
@@ -723,7 +723,7 @@ pub const Process = struct {
         entry: PermissionEntry,
         thread: SlabRef(Thread),
     } {
-        self.perm_lock.lock();
+        self.perm_lock.lock(@src());
         defer self.perm_lock.unlock();
         const entry = self.getPermByHandleLocked(handle_id) orelse return null;
         if (entry.object != .thread) return null;
@@ -745,7 +745,7 @@ pub const Process = struct {
     }
 
     pub fn insertPerm(self: *Process, entry_in: PermissionEntry) !u64 {
-        self.perm_lock.lock();
+        self.perm_lock.lock(@src());
         defer self.perm_lock.unlock();
         for (self.perm_table[1..], 1..) |*slot, slot_index| {
             if (slot.object == .empty) {
@@ -763,7 +763,7 @@ pub const Process = struct {
 
     pub fn removePerm(self: *Process, handle_id: u64) !void {
         if (handle_id == HANDLE_SELF) return error.CannotRevokeSelf;
-        self.perm_lock.lock();
+        self.perm_lock.lock(@src());
         for (self.perm_table[1..], 1..) |*slot, slot_index| {
             if (slot.object != .empty and slot.handle == handle_id) {
                 slot.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
@@ -869,7 +869,7 @@ pub const Process = struct {
                 // ipc_server we ourselves stored and must outlive the
                 // reply-wait state we're now draining.
                 const server = server_ref.ptr;
-                server.msg_box.lock.lock();
+                server.msg_box.lock.lock(@src());
                 if (server.msg_box.isPendingReply() and
                     server.msg_box.pending_thread != null and
                     server.msg_box.pending_thread.?.ptr == thread)
@@ -932,7 +932,7 @@ pub const Process = struct {
         // §2.3.4: clear the restart bit from slot 0 of our own permission
         // table and publish to the user view so userspace observes that the
         // capability is gone.
-        self.perm_lock.lock();
+        self.perm_lock.lock(@src());
         var self_rights = self.perm_table[0].processRights();
         self_rights.restart = false;
         self.perm_table[0].rights = @bitCast(self_rights);
@@ -1019,7 +1019,7 @@ pub const Process = struct {
         // (message was delivered but not replied to), re-enqueue it at the
         // head so the restarted process can recv it again. Drop the
         // receiver — that thread is dead with the rest of the process.
-        self.msg_box.lock.lock();
+        self.msg_box.lock.lock(@src());
         const restored_caller_ref: ?SlabRef(Thread) = if (self.msg_box.isPendingReply())
             self.msg_box.endPendingReplyLocked()
         else
@@ -1046,7 +1046,7 @@ pub const Process = struct {
         if (self.fault_handler_proc) |handler_ref| {
             if (handler_ref.lock(@src())) |handler| {
                 defer handler_ref.unlock();
-                handler.perm_lock.lock();
+                handler.perm_lock.lock(@src());
                 for (&handler.perm_table) |*slot| {
                     // self-alive: walking handler's perm_table under perm_lock.
                     // Identity compare — .ptr accesses are analyzer-exempt.
@@ -1062,7 +1062,7 @@ pub const Process = struct {
                 // pointing at our threads. The threads have already been
                 // deinit'd by the kill() path, so the queue holds dangling
                 // pointers — must scrub before the handler can recv again.
-                handler.fault_box.lock.lock();
+                handler.fault_box.lock.lock(@src());
                 if (handler.fault_box.isPendingReply()) {
                     if (handler.fault_box.pending_thread) |pt_ref| {
                         if (pt_ref.lock(@src())) |pt| {
@@ -1084,7 +1084,7 @@ pub const Process = struct {
 
         // Drain our own fault_box too — when self-handling, queued faulting
         // threads are our own dead threads.
-        self.fault_box.lock.lock();
+        self.fault_box.lock.lock(@src());
         if (self.fault_box.isPendingReply()) {
             _ = self.fault_box.endPendingReplyLocked();
         }
@@ -1105,7 +1105,7 @@ pub const Process = struct {
         // — it cannot grow past the set we iterate here.
         var thread_snapshot: [MAX_PERMS]SlabRef(Thread) = undefined;
         var snapshot_len: usize = 0;
-        self.perm_lock.lock();
+        self.perm_lock.lock(@src());
         for (&self.perm_table) |*entry| {
             if (entry.object == .vm_reservation) {
                 entry.* = .{ .handle = std.math.maxInt(u64), .object = .empty, .rights = 0 };
@@ -1202,7 +1202,7 @@ pub const Process = struct {
             return;
         };
         defer parent_ref.unlock();
-        parent.perm_lock.lock();
+        parent.perm_lock.lock(@src());
         defer parent.perm_lock.unlock();
         for (parent.perm_table[1..], 1..) |*slot, idx| {
             const matches = switch (slot.object) {
@@ -1223,7 +1223,7 @@ pub const Process = struct {
     }
 
     fn cleanupIpcState(self: *Process) void {
-        self.msg_box.lock.lock();
+        self.msg_box.lock.lock(@src());
 
         // Drain all queued waiters with E_NOENT.
         while (self.msg_box.dequeueLocked()) |w| {
@@ -1269,7 +1269,7 @@ pub const Process = struct {
                 // ourselves stored this ipc_server, and it outlives the
                 // reply state we're draining.
                 const server = server_ref.ptr;
-                server.msg_box.lock.lock();
+                server.msg_box.lock.lock(@src());
                 if (server.msg_box.isPendingReply() and
                     server.msg_box.pending_thread != null and
                     server.msg_box.pending_thread.?.ptr == thread)
@@ -1314,7 +1314,7 @@ pub const Process = struct {
                 // takes handler._gen_lock).
                 handler_ref.unlock();
                 handler.unlinkFaultHandlerTarget(self);
-                handler.fault_box.lock.lock();
+                handler.fault_box.lock.lock(@src());
                 // Drop pending_thread if it points at one of ours.
                 if (handler.fault_box.isPendingReply()) {
                     if (handler.fault_box.pending_thread) |pt_ref| {
@@ -1412,7 +1412,7 @@ pub const Process = struct {
     /// table to `dead_process`. A holder can have multiple handles to the
     /// same child (e.g. one from proc_create, another from cap transfer).
     pub fn convertToDeadProcess(holder: *Process, child: *Process) void {
-        holder.perm_lock.lock();
+        holder.perm_lock.lock(@src());
         defer holder.perm_lock.unlock();
         var converted = false;
         for (holder.perm_table[1..], 1..) |*slot, idx| {
@@ -1697,7 +1697,7 @@ pub const Process = struct {
 /// the wait queue. Used during thread teardown to avoid leaving dangling
 /// pointers in fault boxes.
 fn scrubFromFaultBox(box: *MessageBox, target: *Thread) void {
-    box.lock.lock();
+    box.lock.lock(@src());
     defer box.lock.unlock();
     if (box.isPendingReply() and
         box.pending_thread != null and
