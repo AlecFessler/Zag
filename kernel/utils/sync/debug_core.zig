@@ -317,6 +317,44 @@ pub const ClassTable = struct {
     }
 };
 
+/// Per-core async-IRQ-handler nesting depth. Slot at index `core_id` counts
+/// nested IRQ entries on that core. Single-writer per slot — only the local
+/// core ever writes its own slot, between IRQ entry and IRQ exit on that
+/// same core — so plain `u8` (no atomics) is sufficient.
+///
+/// Each step method out-of-bounds-guards on `core_id` so callers can pass
+/// the raw `arch.smp.coreID()` result without a separate bounds check.
+pub const IrqDepth = struct {
+    slots: [MAX_CORES]u8 = [_]u8{0} ** MAX_CORES,
+
+    /// Increment the slot at `core_id`. Wraps on overflow.
+    pub fn enter(self: *IrqDepth, core_id: usize) void {
+        if (core_id >= MAX_CORES) return;
+        self.slots[core_id] +%= 1;
+    }
+
+    /// Decrement the slot at `core_id`. Must mirror a prior `enter`.
+    pub fn exit(self: *IrqDepth, core_id: usize) void {
+        if (core_id >= MAX_CORES) return;
+        self.slots[core_id] -%= 1;
+    }
+
+    /// Reset `core_id`'s slot to 0. The IRQ-driven preemption paths that
+    /// `noreturn jmp` to a different thread's stack abandon the deferred
+    /// `exit` matching the IRQ-entry's `enter`; without this reset the
+    /// counter drifts upward by one for every such preemption.
+    pub fn reset(self: *IrqDepth, core_id: usize) void {
+        if (core_id >= MAX_CORES) return;
+        self.slots[core_id] = 0;
+    }
+
+    /// True iff `core_id`'s slot is non-zero.
+    pub fn inIrq(self: *const IrqDepth, core_id: usize) bool {
+        if (core_id >= MAX_CORES) return false;
+        return self.slots[core_id] != 0;
+    }
+};
+
 /// Pure check + mutate. Returns the outcome rather than panicking so that
 /// tests can drive the logic without a real arch.smp.coreID().
 pub fn acquireOn(
@@ -408,8 +446,24 @@ pub fn checkIrqModeOn(
     };
 }
 
-/// Pure release. Pops the matching entry; returns false if not found
-/// (caller may have migrated cores between acquire and release).
+/// Pop the matching `lock_ptr` from `stack`. Returns false if no entry
+/// matches — typically because the caller migrated cores between acquire
+/// and release, leaving the entry on the original core's stack.
+///
+/// The detector silently tolerates the cross-core-migration miss rather
+/// than panicking on it. That is safe ONLY because cross-core migration
+/// while holding a SpinLock is structurally prevented upstream: every
+/// yield / block / migration entry point in the scheduler calls
+/// `assertNoLocksHeld` first (kernel/sched/scheduler.zig:613 in `yield`,
+/// :855 in `switchToNextReady`), which panics if any SpinLock sits on
+/// the local stack. Migration-with-locks is therefore impossible at the
+/// scheduler boundary, and `releaseOn`'s "lock not on this stack" path
+/// is only reachable by a release of a lock that was never acquired.
+///
+/// If the upstream invariant is ever violated, the per-core held-stack
+/// integrity collapses and the detector's other panics (recursive,
+/// same-class, cycle) become unreliable. The fix is to find the missing
+/// `assertNoLocksHeld` call site, not to harden `releaseOn` here.
 pub fn releaseOn(stack: *HeldStack, lock_ptr: *const anyopaque) bool {
     var i: u8 = 0;
     while (i < stack.depth) {
@@ -1075,4 +1129,92 @@ test "property: back-edge after a topo-order DAG is built — cycle" {
     _ = acquireOn(&stack, &reg, locks[3], classes[3], 0, makeSrc("prop.zig", 100));
     const out = acquireOn(&stack, &reg, locks[1], classes[1], 0, makeSrc("prop.zig", 101));
     try testing.expectEqual(CheckResult.panic_cycle, out.result);
+}
+
+// ---------- IrqDepth tests ----------
+//
+// These exercise the per-core IRQ-handler-depth counter in isolation,
+// without needing a real `arch.smp.coreID()` — the wrappers in debug.zig
+// cast the coreID and forward to these step methods.
+
+test "IrqDepth: single-core balance — enter then exit returns to 0" {
+    var d: IrqDepth = .{};
+    try testing.expect(!d.inIrq(0));
+    d.enter(0);
+    try testing.expect(d.inIrq(0));
+    try testing.expectEqual(@as(u8, 1), d.slots[0]);
+    d.exit(0);
+    try testing.expect(!d.inIrq(0));
+    try testing.expectEqual(@as(u8, 0), d.slots[0]);
+}
+
+test "IrqDepth: nested IRQs increment and decrement in order" {
+    var d: IrqDepth = .{};
+    d.enter(0);
+    d.enter(0);
+    try testing.expectEqual(@as(u8, 2), d.slots[0]);
+    try testing.expect(d.inIrq(0));
+    d.exit(0);
+    try testing.expectEqual(@as(u8, 1), d.slots[0]);
+    try testing.expect(d.inIrq(0));
+    d.exit(0);
+    try testing.expectEqual(@as(u8, 0), d.slots[0]);
+    try testing.expect(!d.inIrq(0));
+}
+
+test "IrqDepth: per-core isolation — enter on core 0 doesn't touch core 1" {
+    var d: IrqDepth = .{};
+    d.enter(0);
+    try testing.expect(d.inIrq(0));
+    try testing.expect(!d.inIrq(1));
+    try testing.expectEqual(@as(u8, 1), d.slots[0]);
+    try testing.expectEqual(@as(u8, 0), d.slots[1]);
+}
+
+test "IrqDepth: reset collapses an unbalanced enter (the noreturn-jmp case)" {
+    // Simulate the bug `resetIrqContextOnSwitch` exists to fix: an IRQ
+    // entry called `enter`, but the matching `defer exit` never ran
+    // because a noreturn jmp abandoned the IRQ-entry's call stack.
+    var d: IrqDepth = .{};
+    d.enter(0);
+    d.reset(0);
+    try testing.expectEqual(@as(u8, 0), d.slots[0]);
+    try testing.expect(!d.inIrq(0));
+}
+
+test "IrqDepth: reset collapses multiple consecutive unbalanced enters" {
+    var d: IrqDepth = .{};
+    d.enter(0);
+    d.enter(0);
+    d.enter(0);
+    try testing.expectEqual(@as(u8, 3), d.slots[0]);
+    d.reset(0);
+    try testing.expectEqual(@as(u8, 0), d.slots[0]);
+    try testing.expect(!d.inIrq(0));
+}
+
+test "IrqDepth: reset only affects the targeted core" {
+    var d: IrqDepth = .{};
+    d.enter(0);
+    d.enter(1);
+    d.reset(0);
+    try testing.expectEqual(@as(u8, 0), d.slots[0]);
+    try testing.expectEqual(@as(u8, 1), d.slots[1]);
+    try testing.expect(!d.inIrq(0));
+    try testing.expect(d.inIrq(1));
+}
+
+test "IrqDepth: out-of-bounds core_id is silent no-op" {
+    var d: IrqDepth = .{};
+    d.enter(MAX_CORES);
+    d.enter(MAX_CORES + 5);
+    d.exit(MAX_CORES);
+    d.reset(MAX_CORES);
+    try testing.expect(!d.inIrq(MAX_CORES));
+    try testing.expect(!d.inIrq(MAX_CORES + 100));
+    var i: usize = 0;
+    while (i < MAX_CORES) {
+        try testing.expectEqual(@as(u8, 0), d.slots[i]);
+        i += 1;
+    }
 }

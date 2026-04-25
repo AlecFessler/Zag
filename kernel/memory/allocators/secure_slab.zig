@@ -3,10 +3,11 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const bump = zag.memory.allocators.bump;
+const debug = zag.utils.sync.debug;
 
 const Range = zag.utils.range.Range;
 const SpinLock = zag.utils.sync.SpinLock;
-const SrcLoc = std.builtin.SourceLocation;
+const SrcLoc = debug.SrcLoc;
 
 const INVALID_INDEX: u32 = std.math.maxInt(u32);
 const DEFAULT_WALK_BOUND: u32 = 256;
@@ -36,12 +37,13 @@ pub const AccessError = error{
 /// `lock()` which acquires whatever gen is current.
 pub const GenLock = extern struct {
     word: std.atomic.Value(u64) align(8) = .{ .raw = 0 },
+    class: [*:0]const u8 = "@unclassified",
 
     /// Plain spin-acquire of the lock bit, regardless of generation.
     /// Used by internal kernel paths that already have a live *T from a
     /// pinned reference chain (no handle, no staleness concern).
     pub fn lock(self: *GenLock, src: SrcLoc) void {
-        _ = src;
+        debug.acquire(self, self.class, 0, src);
         while (true) {
             const cur = self.word.load(.monotonic);
             if (cur & 1 == 0) {
@@ -54,6 +56,7 @@ pub const GenLock = extern struct {
     /// Release a lock acquired via `lock` or `lockWithGen`. Clears the
     /// lock bit without touching the generation counter.
     pub fn unlock(self: *GenLock) void {
+        debug.release(self);
         const prev = self.word.fetchAnd(~@as(u64, 1), .release);
         std.debug.assert(prev & 1 == 1);
     }
@@ -63,17 +66,20 @@ pub const GenLock = extern struct {
     /// Returns `StaleHandle` if the slot has been freed (and possibly
     /// reallocated) since the handle was issued.
     pub fn lockWithGen(self: *GenLock, expected_gen: u63, src: SrcLoc) AccessError!void {
-        _ = src;
         // Parity invariant: a live-handle gen is always odd. An even
         // expected_gen means the caller is holding a reference to a
         // freed slot — a bug at the issuance site, not a stale handle.
         std.debug.assert(expected_gen % 2 == 1);
+        debug.acquire(self, self.class, 0, src);
         const unlocked: u64 = (@as(u64, expected_gen) << 1) | 0;
         const locked: u64 = (@as(u64, expected_gen) << 1) | 1;
         while (true) {
             if (self.word.cmpxchgWeak(unlocked, locked, .acquire, .monotonic) == null) return;
             const cur = self.word.load(.monotonic);
-            if ((cur >> 1) != expected_gen) return error.StaleHandle;
+            if ((cur >> 1) != expected_gen) {
+                debug.release(self);
+                return error.StaleHandle;
+            }
             std.atomic.spinLoopHint();
         }
     }

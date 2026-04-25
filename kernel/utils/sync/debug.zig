@@ -43,15 +43,17 @@ var held_stacks: [MAX_CORES]HeldStack align(64) = [_]HeldStack{.{}} ** MAX_CORES
 var pair_registry: PairRegistry = .{};
 var class_table: ClassTable = .{};
 
-/// Per-core async-IRQ-handler nesting depth. Single-writer (always the local
-/// core, between IRQ entry and IRQ exit on that same core), so a plain `u8`
-/// without atomics is sufficient — no other core ever writes this slot. Reads
-/// from `acquire()` happen on the same local core, so they observe the
-/// counter the local IRQ entry just wrote (program order). The counter
-/// counts NESTED IRQ entries, which on x86 is normally 0 or 1 (IRQs stay
-/// masked in handlers) but on aarch64 can climb if a handler explicitly
-/// re-enables IRQs.
-var irq_depth: [MAX_CORES]u8 align(64) = [_]u8{0} ** MAX_CORES;
+/// Per-core async-IRQ-handler nesting depth. Single-writer per slot — only
+/// the local core ever writes its own slot, between IRQ entry and IRQ exit
+/// on that same core — so plain `u8` (no atomics) is sufficient. The
+/// counter counts NESTED IRQ entries, which on x86 is normally 0 or 1
+/// (IRQs stay masked in handlers) but on aarch64 can climb if a handler
+/// explicitly re-enables IRQs.
+///
+/// All step logic lives on `core.IrqDepth` for host-testability — see
+/// `debug_core.zig` `IrqDepth` tests. The wrappers below add the kernel-
+/// only gates (`active` flag, `smp_ready` ordering, coreID acquisition).
+var irq_depth: core.IrqDepth align(64) = .{};
 
 /// Increment the local core's IRQ-handler depth. Call at the very top of
 /// every async-IRQ entry point (NOT for synchronous exceptions like page
@@ -59,9 +61,7 @@ var irq_depth: [MAX_CORES]u8 align(64) = [_]u8{0} ** MAX_CORES;
 pub fn enterIrqContext() void {
     if (!active) return;
     if (@atomicLoad(u32, &smp_ready, .acquire) == 0) return;
-    const core_id = arch.smp.coreID();
-    if (core_id >= MAX_CORES) return;
-    irq_depth[@intCast(core_id)] +%= 1;
+    irq_depth.enter(@intCast(arch.smp.coreID()));
 }
 
 /// Decrement the local core's IRQ-handler depth. Must mirror every prior
@@ -69,18 +69,14 @@ pub fn enterIrqContext() void {
 pub fn exitIrqContext() void {
     if (!active) return;
     if (@atomicLoad(u32, &smp_ready, .acquire) == 0) return;
-    const core_id = arch.smp.coreID();
-    if (core_id >= MAX_CORES) return;
-    irq_depth[@intCast(core_id)] -%= 1;
+    irq_depth.exit(@intCast(arch.smp.coreID()));
 }
 
 /// Returns true if the current core is executing an async-IRQ handler.
 pub fn inIrqContext() bool {
     if (!active) return false;
     if (@atomicLoad(u32, &smp_ready, .acquire) == 0) return false;
-    const core_id = arch.smp.coreID();
-    if (core_id >= MAX_CORES) return false;
-    return irq_depth[@intCast(core_id)] != 0;
+    return irq_depth.inIrq(@intCast(arch.smp.coreID()));
 }
 
 /// Reset this core's IRQ-handler depth to 0. Called from arch context-switch
@@ -94,9 +90,7 @@ pub fn inIrqContext() bool {
 pub fn resetIrqContextOnSwitch() void {
     if (!active) return;
     if (@atomicLoad(u32, &smp_ready, .acquire) == 0) return;
-    const core_id = arch.smp.coreID();
-    if (core_id >= MAX_CORES) return;
-    irq_depth[@intCast(core_id)] = 0;
+    irq_depth.reset(@intCast(arch.smp.coreID()));
 }
 
 /// Set by the kernel boot path once `arch.smp.coreID()` is safe to call
@@ -126,7 +120,7 @@ pub fn acquire(
     // (handler spins on the lock the interrupted code holds). Run BEFORE
     // acquireOn so we report the bug at first detection, before the held
     // stack rolls forward and obscures the situation.
-    const in_irq = irq_depth[@intCast(core_id)] != 0;
+    const in_irq = irq_depth.inIrq(@intCast(core_id));
     const irqs_enabled = arch.cpu.interruptsEnabled();
     const irq_outcome = checkIrqModeOn(&class_table, class, in_irq, irqs_enabled, src);
     if (irq_outcome.result != .ok) {
@@ -150,6 +144,13 @@ pub fn release(lock_ptr: *const anyopaque) void {
 /// block/yield entry points: holding a SpinLock across a context switch can
 /// deadlock the kernel — the next thread spinning on the same lock won't
 /// observe the holder's release until the holder runs again.
+///
+/// This assertion is also load-bearing for `releaseOn` correctness. The
+/// per-core `HeldStack` design assumes acquire and release happen on the
+/// same core; by panicking on yield-with-locks here, migration-with-locks
+/// becomes structurally impossible upstream, which is why `releaseOn` can
+/// safely return false for "lock not on this stack" instead of panicking.
+/// See `releaseOn` in debug_core.zig for the full invariant chain.
 pub fn assertNoLocksHeld(src: SrcLoc) void {
     if (!active) return;
     if (@atomicLoad(u32, &smp_ready, .acquire) == 0) return;
