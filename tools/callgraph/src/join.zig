@@ -409,6 +409,8 @@ fn attachIntra(
             &fa.imports,
             &qname_index,
             &known_names,
+            af.receiver_name,
+            af.receiver_type,
         ) catch &.{};
     }
 }

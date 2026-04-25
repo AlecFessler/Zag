@@ -77,6 +77,11 @@ pub fn callSiteKey(arena: std.mem.Allocator, file: []const u8, line: u32) ![]con
 /// the global qname index. They also enable comptime arch-pruning of
 /// `switch (builtin.cpu.arch)` and `if (builtin.cpu.arch == .X)` constructs
 /// — without the imports we fall back to a source-text heuristic.
+///
+/// `receiver_name` / `receiver_type` are the enclosing function's first-param
+/// binding name and its resolved struct qname (when the param has a
+/// receiver-shaped type). Empty strings disable receiver-method resolution
+/// for this function.
 pub fn buildIntra(
     arena: std.mem.Allocator,
     file: []const u8,
@@ -87,6 +92,8 @@ pub fn buildIntra(
     imports: ?*const ImportTable,
     qname_index: ?*const QNameIndex,
     known_names: ?*const KnownNames,
+    receiver_name: []const u8,
+    receiver_type: []const u8,
 ) ![]const Atom {
     const node_idx: std.zig.Ast.Node.Index = @enumFromInt(fn_node);
 
@@ -103,6 +110,8 @@ pub fn buildIntra(
         .imports = imports,
         .qname_index = qname_index,
         .known_names = known_names,
+        .receiver_name = receiver_name,
+        .receiver_type = receiver_type,
     };
 
     var seq = std.ArrayList(IrNode){};
@@ -167,6 +176,16 @@ const Ctx = struct {
     /// fns missing from the IR). On hit we still produce a named direct
     /// Callee, just with `to=null`.
     known_names: ?*const KnownNames,
+    /// Local binding name of the enclosing function's first parameter when it
+    /// has a receiver-shaped type (e.g. `self`, `this`, `lock`). Empty when
+    /// the function has no receiver — in that case `<name>.method()` calls
+    /// fall through to indirect.
+    receiver_name: []const u8,
+    /// Qualified type name for `receiver_name`. E.g. `utils.sync.SpinLock` for
+    /// `self: *SpinLock` declared inside `const SpinLock = struct {...}`.
+    /// Combined with the called method name to form a qname-index lookup
+    /// candidate (`<receiver_type>.<method>`).
+    receiver_type: []const u8,
     /// Defer / errdefer expression nodes accumulated at function scope.
     /// Walked at function-end so their calls show up in the sequence.
     defers: std.ArrayList(std.zig.Ast.Node.Index) = .{},
@@ -480,11 +499,24 @@ fn emitCall(
     // can build a global-qname candidate `<imports[Foo]>.bar` and resolve
     // against the qname index. This catches calls the IR omitted because
     // they were inlined or comptime-eliminated for the build's selected arch.
-    //
-    // TODO(self-method-resolution): `self.method()` calls don't resolve here
-    // — they need receiver-type tracking, which is out of scope for this
-    // commit. They keep falling through to the indirect fallback below.
     if (try resolveByImports(ctx, call.ast.fn_expr, line, col)) |resolved| {
+        try out.append(ctx.arena, .{ .call = resolved });
+        return;
+    }
+
+    // Receiver-method resolution: when the call expression is
+    // `<binding>.method(...)` and `<binding>` matches the enclosing fn's
+    // first-param binding name, build `<receiver_type>.method` and look it
+    // up in the qname index. Resolves the bulk of `self.foo()` /
+    // `lock.lock()` / `slab.alloc()` patterns the IR drops via inlining.
+    //
+    // Patterns intentionally NOT handled (kept as ? indirect for now):
+    //   * `arr[0].method()` — receiver is an indexed expression.
+    //   * `(expr).method()` — parenthesized receiver.
+    //   * `func().method()` — call-result receiver.
+    //   * Local-variable receivers (`var x = makeFoo(); x.method();`).
+    //   * Optional/error-union peels (`if (x) |y| y.method();`).
+    if (try resolveByReceiver(ctx, call.ast.fn_expr, line, col)) |resolved| {
         try out.append(ctx.arena, .{ .call = resolved });
         return;
     }
@@ -578,6 +610,45 @@ fn resolveByImports(
     }
 
     const candidate = try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ resolved_head, tail });
+    return try lookupCandidate(ctx, candidate, line, col);
+}
+
+/// Receiver-method resolver. Pulls a `<binding>.method(...)` chain and, if
+/// `<binding>` matches the enclosing function's recorded receiver binding
+/// name, builds `<receiver_type>.method` and looks it up in the qname index.
+/// Returns null when the call isn't shaped that way, when there's no
+/// receiver binding for this fn, or when the candidate doesn't hit the
+/// index.
+fn resolveByReceiver(
+    ctx: *Ctx,
+    fn_expr: std.zig.Ast.Node.Index,
+    line: u32,
+    col: u32,
+) !?Callee {
+    if (ctx.receiver_name.len == 0) return null;
+    if (ctx.receiver_type.len == 0) return null;
+
+    const tag = ctx.ast.nodeTag(fn_expr);
+    if (tag != .field_access) return null;
+
+    const chain = chainSource(ctx, fn_expr) orelse return null;
+    const dot = std.mem.indexOfScalar(u8, chain, '.') orelse return null;
+    const head = chain[0..dot];
+    const tail = chain[dot + 1 ..];
+    if (tail.len == 0) return null;
+
+    if (!std.mem.eql(u8, head, ctx.receiver_name)) return null;
+
+    // `tail` may itself be a chain (`self.field.method()`) — we only resolve
+    // the simple `<receiver>.<method>` form. Multi-step field chains require
+    // tracking field types, which is out of scope for v1.
+    if (std.mem.indexOfScalar(u8, tail, '.') != null) return null;
+
+    const candidate = try std.fmt.allocPrint(
+        ctx.arena,
+        "{s}.{s}",
+        .{ ctx.receiver_type, tail },
+    );
     return try lookupCandidate(ctx, candidate, line, col);
 }
 

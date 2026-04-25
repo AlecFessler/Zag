@@ -29,6 +29,18 @@ pub const AstFunction = struct {
     is_pub: bool,
     /// AST node index of the fn_decl. 0 if not available (e.g., proto only).
     fn_node: u32 = 0,
+    /// Local binding name of the first parameter when it has a struct-receiver
+    /// shape (e.g. `self`, `this`, `lock`). Empty when there is no first param
+    /// or its shape isn't recognizable. Paired with `receiver_type` by the
+    /// resolver in `branches.emitCall` to turn `self.method()` calls into a
+    /// fully-qualified candidate.
+    receiver_name: []const u8 = "",
+    /// Qualified name of the first parameter's type, when it points at a
+    /// struct decl visible in the enclosing container chain. For
+    /// `self: *SpinLock` declared inside `const SpinLock = struct {...}` in
+    /// `kernel/utils/sync.zig`, this is `utils.sync.SpinLock`. Empty when the
+    /// type isn't resolvable to a concrete container.
+    receiver_type: []const u8 = "",
 };
 
 /// Per-file map: local binding name → resolved module path. Built by
@@ -166,19 +178,24 @@ fn walkFile(
     };
 
     const root_decls = tree_box.rootDecls();
+
+    // Import table is built before decl walking so emitFn's receiver-type
+    // resolver can look up dotted type expressions (`*sync.SpinLock`)
+    // through the file's imports while emitting AstFunction records.
+    const imports = buildImportTable(arena, tree_box, abs_file, root_decls) catch
+        ImportTable.init(arena);
+
     var ctx = WalkCtx{
         .arena = arena,
         .tree = tree_box,
         .file_abs = abs_file,
         .module_path = module_path,
+        .imports = &imports,
         .out = out,
     };
     for (root_decls) |decl| {
         try walkDecl(&ctx, decl, "");
     }
-
-    const imports = buildImportTable(arena, tree_box, abs_file, root_decls) catch
-        ImportTable.init(arena);
 
     try asts.append(arena, .{
         .file = abs_file,
@@ -193,6 +210,10 @@ const WalkCtx = struct {
     tree: *std.zig.Ast,
     file_abs: []const u8,
     module_path: []const u8,
+    /// File-local import table used by `computeReceiver` to resolve dotted
+    /// receiver-type expressions (e.g. `*sync.SpinLock`) into a qname.
+    /// Pointer is stable for the life of the walk.
+    imports: *const ImportTable,
     out: *std.ArrayList(AstFunction),
 };
 
@@ -282,6 +303,8 @@ fn emitFn(
 
     const is_pub = fn_proto.visib_token != null;
 
+    const recv = computeReceiver(ctx, fn_proto, container_path);
+
     try ctx.out.append(ctx.arena, .{
         .name = try ctx.arena.dupe(u8, name),
         .qualified_name = qualified,
@@ -290,6 +313,8 @@ fn emitFn(
         .line_end = line_end,
         .is_pub = is_pub,
         .fn_node = @intFromEnum(node),
+        .receiver_name = recv.name,
+        .receiver_type = recv.type_qname,
     });
 
     // Recurse into the body so nested struct decls and inner fns are picked up.
@@ -305,6 +330,189 @@ fn emitFn(
             try std.fmt.allocPrint(ctx.arena, "{s}.{s}", .{ container_path, name });
         try walkBlock(ctx, body_node, inner_container);
     }
+}
+
+// ---------------------------------------------------------------- receiver
+
+const ReceiverInfo = struct {
+    name: []const u8 = "",
+    type_qname: []const u8 = "",
+};
+
+/// Compute the receiver-binding name and resolved type qname for the first
+/// parameter of a function, when it has a struct-receiver shape. Used by
+/// `branches.emitCall` to resolve `<binding>.method()` calls. Cases handled:
+///
+///  1. `self: *T` / `self: T` / `self: *const T` / `self: ?*T` where T is the
+///     immediately-enclosing container's name — the canonical pattern for
+///     methods declared inside `const T = struct { ... }`.
+///  1b. File-as-struct: top-level functions of a file like `Io/Writer.zig`
+///      whose first param is `*Writer`. The file itself is a container, so
+///      the receiver type is the file's module path.
+///  2. `self: *@This()` — `@This()` resolves to the immediately-enclosing
+///     container (file or struct).
+///  3. Dotted chain (`*sync.SpinLock`) whose leftmost identifier is in the
+///     file's import table — the resolved chain is the receiver qname.
+///  3b. Bare unqualified type that doesn't match the immediate container —
+///      treated as a same-file sibling type. The resolver in
+///      `branches.emitCall` will silently miss the qname index lookup if
+///      the type doesn't actually exist there.
+///
+/// Anything else (anytype, `comptime T: type`, `[]Foo`, complex generic
+/// expressions) yields empty fields, leaving those calls to the indirect
+/// fallback.
+fn computeReceiver(
+    ctx: *WalkCtx,
+    fn_proto: std.zig.Ast.full.FnProto,
+    container_path: []const u8,
+) ReceiverInfo {
+    var it = fn_proto.iterate(ctx.tree);
+    const first = it.next() orelse return .{};
+
+    const name_tok = first.name_token orelse return .{};
+    const binding = ctx.tree.tokenSlice(name_tok);
+    if (binding.len == 0) return .{};
+
+    const type_node = first.type_expr orelse return .{};
+
+    const type_src = nodeSourceSlice(ctx.tree, type_node);
+    if (type_src.len == 0) return .{};
+
+    const stripped = stripPointerOptional(type_src);
+    if (stripped.len == 0) return .{};
+
+    // Case 2: `*@This()`.
+    if (std.mem.eql(u8, stripped, "@This()")) {
+        const qn = containerQName(ctx.arena, ctx.module_path, container_path) catch return .{};
+        if (qn.len == 0) return .{};
+        return .{
+            .name = ctx.arena.dupe(u8, binding) catch return .{},
+            .type_qname = qn,
+        };
+    }
+
+    // Case 1: bare type name matches the immediate-enclosing container's
+    // last segment.
+    const immediate = lastSegment(container_path);
+    if (immediate.len > 0 and std.mem.eql(u8, stripped, immediate)) {
+        const qn = containerQName(ctx.arena, ctx.module_path, container_path) catch return .{};
+        if (qn.len == 0) return .{};
+        return .{
+            .name = ctx.arena.dupe(u8, binding) catch return .{},
+            .type_qname = qn,
+        };
+    }
+
+    // Case 1b: file-as-struct. Top-level fns whose first param type matches
+    // the file's last path segment (e.g. `*Writer` in `Io/Writer.zig`).
+    if (container_path.len == 0) {
+        const file_seg = lastSegment(ctx.module_path);
+        if (file_seg.len > 0 and std.mem.eql(u8, stripped, file_seg)) {
+            return .{
+                .name = ctx.arena.dupe(u8, binding) catch return .{},
+                .type_qname = ctx.arena.dupe(u8, ctx.module_path) catch return .{},
+            };
+        }
+    }
+
+    // Case 3: dotted chain whose leftmost identifier resolves through imports.
+    if (looksLikeDottedChain(stripped)) {
+        const resolved = resolveDottedChain(ctx.arena, stripped, ctx.imports) catch null;
+        if (resolved) |q| if (q.len > 0) {
+            return .{
+                .name = ctx.arena.dupe(u8, binding) catch return .{},
+                .type_qname = q,
+            };
+        };
+    }
+
+    // Case 3b: bare unqualified type — try `<module_path>.<name>` as a
+    // same-file sibling. If the type doesn't actually exist there, the
+    // resolver in branches.emitCall just falls back to indirect.
+    if (isBareIdent(stripped) and ctx.module_path.len > 0) {
+        const candidate = std.fmt.allocPrint(
+            ctx.arena,
+            "{s}.{s}",
+            .{ ctx.module_path, stripped },
+        ) catch return .{};
+        return .{
+            .name = ctx.arena.dupe(u8, binding) catch return .{},
+            .type_qname = candidate,
+        };
+    }
+
+    return .{};
+}
+
+/// Slice the source text for an arbitrary node. Returns "" on out-of-range.
+fn nodeSourceSlice(tree: *const std.zig.Ast, node: std.zig.Ast.Node.Index) []const u8 {
+    const first = tree.firstToken(node);
+    const last = tree.lastToken(node);
+    const start = tree.tokenStart(first);
+    const last_start = tree.tokenStart(last);
+    const last_slice = tree.tokenSlice(last);
+    const end: usize = @as(usize, last_start) + last_slice.len;
+    if (end <= start or end > tree.source.len) return "";
+    return tree.source[start..end];
+}
+
+/// Strip leading pointer/optional/sentinel tokens from a type source span.
+/// Repeats until no more strippable prefix is found. Returns "" for slice/
+/// array forms (`[N]T`, `[]T`, `[*]T`) since their element-method calls
+/// can't be resolved through the receiver path anyway.
+fn stripPointerOptional(src: []const u8) []const u8 {
+    var s = std.mem.trim(u8, src, &std.ascii.whitespace);
+    while (s.len > 0) {
+        if (s[0] == '*') {
+            s = std.mem.trim(u8, s[1..], &std.ascii.whitespace);
+            if (std.mem.startsWith(u8, s, "const ")) s = std.mem.trim(u8, s["const ".len..], &std.ascii.whitespace);
+            if (std.mem.startsWith(u8, s, "volatile ")) s = std.mem.trim(u8, s["volatile ".len..], &std.ascii.whitespace);
+            continue;
+        }
+        if (s[0] == '?') {
+            s = std.mem.trim(u8, s[1..], &std.ascii.whitespace);
+            continue;
+        }
+        if (s[0] == '[') return "";
+        break;
+    }
+    return s;
+}
+
+/// Build the qname `<module_path>.<container_path>` (or just `<module_path>`
+/// when container_path is empty).
+fn containerQName(
+    arena: std.mem.Allocator,
+    module_path: []const u8,
+    container_path: []const u8,
+) ![]const u8 {
+    if (container_path.len == 0) return try arena.dupe(u8, module_path);
+    return try std.fmt.allocPrint(arena, "{s}.{s}", .{ module_path, container_path });
+}
+
+fn lastSegment(path: []const u8) []const u8 {
+    if (path.len == 0) return path;
+    const dot = std.mem.lastIndexOfScalar(u8, path, '.');
+    return if (dot) |d| path[d + 1 ..] else path;
+}
+
+fn looksLikeDottedChain(s: []const u8) bool {
+    if (s.len == 0) return false;
+    return std.mem.indexOfScalar(u8, s, '.') != null and isIdentChars(s);
+}
+
+fn isBareIdent(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, s, '.') != null) return false;
+    return isIdentChars(s);
+}
+
+fn isIdentChars(s: []const u8) bool {
+    for (s) |c| {
+        const ok = std.ascii.isAlphanumeric(c) or c == '_' or c == '.';
+        if (!ok) return false;
+    }
+    return true;
 }
 
 /// Descend an expression looking for container_decls. Handles the common
