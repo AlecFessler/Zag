@@ -245,6 +245,7 @@
       empty.className = "trace_empty";
       empty.textContent = "(no entry selected)";
       els.view.appendChild(empty);
+      if (typeof window.__cgSignalReady === "function") window.__cgSignalReady();
       return;
     }
 
@@ -254,6 +255,7 @@
       empty.className = "trace_empty";
       empty.textContent = "(function not in graph)";
       els.view.appendChild(empty);
+      if (typeof window.__cgSignalReady === "function") window.__cgSignalReady();
       return;
     }
 
@@ -272,6 +274,10 @@
     visited.delete(rootKey);
 
     els.view.appendChild(tree);
+
+    // Perf-harness ready signal (see app.js for the contract). Inert when
+    // no harness is watching.
+    if (typeof window.__cgSignalReady === "function") window.__cgSignalReady();
   }
 
   /** Build the recursion-guard key for a Function record. Prefer `id` when
