@@ -84,8 +84,8 @@ pub fn print(comptime format: []const u8, args: anytype) void {
         args,
     ) catch @panic("Print would be truncated!");
 
-    print_lock.lock(@src());
-    defer print_lock.unlock();
+    const irq = print_lock.lockIrqSave(@src());
+    defer print_lock.unlockIrqRestore(irq);
 
     for (s) |b| {
         writeByte(b, base);

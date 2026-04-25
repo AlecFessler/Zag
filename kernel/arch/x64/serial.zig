@@ -76,8 +76,8 @@ pub fn print(
         args,
     ) catch @panic("Print would be truncated!");
 
-    print_lock.lock(@src());
-    defer print_lock.unlock();
+    const irq = print_lock.lockIrqSave(@src());
+    defer print_lock.unlockIrqRestore(irq);
 
     for (s) |b| {
         writeByte(b, g_port);
