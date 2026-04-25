@@ -202,6 +202,7 @@ pub fn main() !void {
             ir_graph,
             ast_fns,
             walk.asts,
+            walk.struct_types,
             discovered,
             spec.target_arch,
             &stats,
