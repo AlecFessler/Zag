@@ -29,6 +29,20 @@ pub const SpinLock = struct {
         return state;
     }
 
+    /// `lockIrqSave` variant that tags the lockdep entry with a non-zero
+    /// `ordered_group`, opting out of the same-class overlap panic.
+    /// Caller must enforce a fixed acquisition order across every
+    /// instance sharing this group; otherwise the escape hides real
+    /// AB-BA deadlocks.
+    pub fn lockIrqSaveOrdered(self: *SpinLock, src: SrcLoc, ordered_group: u32) u64 {
+        const state = arch.cpu.saveAndDisableInterrupts();
+        debug.acquire(self, self.class, ordered_group, src);
+        while (self.state.cmpxchgWeak(0, 1, .acquire, .monotonic) != null) {
+            std.atomic.spinLoopHint();
+        }
+        return state;
+    }
+
     pub fn unlockIrqRestore(self: *SpinLock, state: u64) void {
         self.unlock();
         arch.cpu.restoreInterrupts(state);

@@ -17,6 +17,12 @@ pub const E_NORES: i64 = -14;
 const BUCKET_COUNT = 256;
 const MAX_TIMED_WAITERS = 64;
 
+/// `Bucket.lock` ordered_group. Multi-bucket waits and the wake-side
+/// cross-bucket cleanup both hold two `Bucket.lock` instances at once;
+/// `sortByBucket` (waits) and the `except_idx` skip in
+/// `removeFromOtherBuckets` (wake) keep acquisition AB-BA-free.
+const FUTEX_BUCKET_GROUP: u32 = 1;
+
 const Bucket = struct {
     lock: SpinLock = .{ .class = "Bucket.lock" },
     pq: ThreadPriorityQueue = .{},
@@ -144,7 +150,7 @@ pub fn wake(paddr: PAddr, count: u32) u64 {
     const bucket = &buckets[bucketIdx(paddr)];
     var woken: u32 = 0;
 
-    const irq = bucket.lock.lockIrqSave(@src());
+    const irq = bucket.lock.lockIrqSaveOrdered(@src(), FUTEX_BUCKET_GROUP);
 
     // Pop threads from the priority queue. Since multiple paddrs may hash to
     // the same bucket, we must check each thread's futex_paddr. Non-matching
@@ -209,7 +215,7 @@ fn removeFromOtherBuckets(thread: *Thread, except_paddr: PAddr) void {
         const idx = bucketIdx(pa);
         if (idx == except_idx) continue;
         const bucket = &buckets[idx];
-        const birq = bucket.lock.lockIrqSave(@src());
+        const birq = bucket.lock.lockIrqSaveOrdered(@src(), FUTEX_BUCKET_GROUP);
         _ = removeWaiter(bucket, thread);
         bucket.lock.unlockIrqRestore(birq);
     }
@@ -400,7 +406,7 @@ fn acquireBucketLocks(sorted: []const u8, addrs: []const PAddr) BucketLockState 
     for (sorted) |si| {
         const idx = bucketIdx(addrs[si]);
         if (idx == prev_idx) continue;
-        const irq = buckets[idx].lock.lockIrqSave(@src());
+        const irq = buckets[idx].lock.lockIrqSaveOrdered(@src(), FUTEX_BUCKET_GROUP);
         state.unique_indices[state.count] = idx;
         state.irq_states[state.count] = irq;
         state.count += 1;

@@ -420,7 +420,10 @@ pub fn SecureSlab(
 
             // Gen-lock currently held. Bump to (expected_gen+1)<<1 | 0 and
             // release in one store: the new gen is even (freed) and the
-            // lock bit is clear.
+            // lock bit is clear. setGenRelease bypasses GenLock.unlock, so
+            // pop the lockdep entry by hand to keep the per-core held stack
+            // balanced.
+            debug.release(&ptr._gen_lock);
             ptr._gen_lock.setGenRelease(expected_gen + 1);
 
             const idx = self.indexOf(ptr);
