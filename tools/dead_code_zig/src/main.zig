@@ -8,6 +8,44 @@
 //!   * a clean way to spot identifier chains (`foo.bar.baz`) and to
 //!     classify them as either a real use or an alias re-export.
 //!
+//! ## Skip file (hash-validated whitelist)
+//!
+//! Hardware-spec layouts (ACPI tables, register bitfields, GIC structs,
+//! reserved fields) are routinely flagged as dead — they're decoded
+//! lazily or used as memory layout templates rather than referenced by
+//! name. To suppress these without baking in heuristics or littering
+//! source with annotations, the tool auto-loads `<target>/.dead-code-skip.txt`
+//! (e.g. `kernel/.dead-code-skip.txt`). Override with `--skip <path>`.
+//!
+//! Format:
+//!
+//!     # comments allowed
+//!     <rel-path>:<start>-<end>    sha256:<hex>
+//!     <rel-path>:<start>-end      sha256:<hex>
+//!
+//! - `<rel-path>` is relative to the target dir (`kernel/foo/bar.zig`).
+//! - `<start>` and `<end>` are 1-indexed inclusive line numbers; `<end>`
+//!   may be the literal `end` to mean EOF.
+//! - The hash is over the byte content of lines `<start>`..`<end>` joined
+//!   by `\n` with a trailing `\n`, after normalizing CRLF/CR to LF.
+//!   Edits outside the range do NOT invalidate the entry.
+//!
+//! Behavior:
+//!
+//! - **Hit (hash matches):** every dead-code finding whose line falls
+//!   inside the range is silently dropped.
+//! - **Miss (hash mismatch):** the entry's findings are reported normally
+//!   AND an `INVALIDATED:` line is printed to stderr. The exit code is
+//!   nonzero even if there are no other findings — invalidation is a
+//!   hard error, forcing re-review.
+//! - **Path missing / bad range:** prints `MISSING:` / `BAD-RANGE:` and
+//!   exits nonzero.
+//!
+//! Use `--update-skip <rel-path>:<start>-<end>` to recompute the hash
+//! for an entry and rewrite it in the skip file (creating the file if
+//! needed). This is the "I just reviewed this range, lock it in"
+//! workflow.
+//!
 //! The headline win over the regex tool: re-export aliases like
 //!
 //!     // utils/sync/sync.zig
@@ -212,6 +250,46 @@ var g_field_uses: StringHashMap(void) = undefined;
 
 /// Repo root absolute path.
 var g_repo_root: []const u8 = "";
+
+// -----------------------------------------------------------------
+// Skip-file types and globals
+// -----------------------------------------------------------------
+
+const SkipStatus = enum {
+    /// Hash matches stored value — findings inside this range are silently dropped.
+    hit,
+    /// Hash mismatch — the range has drifted since last review.
+    invalidated,
+    /// Range refers to a file that no longer exists.
+    missing,
+    /// Range bounds are out of order, zero, or extend past EOF when end is numeric.
+    bad_range,
+};
+
+const SkipEntry = struct {
+    /// Path as written in the skip file (relative to target dir).
+    rel_path: []const u8,
+    start_line: u32,
+    /// Inclusive end line, or 0 to mean "to EOF".
+    end_line: u32,
+    /// True when the original token was `end`.
+    end_is_eof: bool,
+    /// Stored hex hash from the skip file (lowercase, no `sha256:` prefix).
+    stored_hash: []const u8,
+    /// Computed hex hash over current file content (empty if file missing).
+    current_hash: []const u8 = "",
+    status: SkipStatus = .hit,
+};
+
+/// Parsed skip entries (in load order).
+var g_skip_entries: ArrayList(SkipEntry) = .{};
+
+/// Absolute path of the loaded skip file (for stderr messages and --update-skip rewrites).
+var g_skip_file_path: []const u8 = "";
+
+/// Target directory (relative to repo root, e.g. "kernel"). Skip-entry paths are
+/// resolved against `<repo_root>/<target_rel>/<rel_path>`.
+var g_target_rel: []const u8 = "";
 
 // -----------------------------------------------------------------
 // Path / IO helpers
@@ -1453,6 +1531,428 @@ fn propagate() !void {
 }
 
 // -----------------------------------------------------------------
+// Skip file: hashing, parsing, IO
+// -----------------------------------------------------------------
+
+const Sha256 = std.crypto.hash.sha2.Sha256;
+
+/// Hex-encode a 32-byte SHA-256 digest into a 64-byte lowercase string.
+fn hexEncode(digest: [Sha256.digest_length]u8, out: *[Sha256.digest_length * 2]u8) void {
+    const tab = "0123456789abcdef";
+    for (digest, 0..) |b, i| {
+        out[i * 2] = tab[b >> 4];
+        out[i * 2 + 1] = tab[b & 0x0f];
+    }
+}
+
+/// Compute the canonical hash of the line range `[start..end]` (1-indexed,
+/// inclusive). End-of-line conventions are normalized to `\n` before hashing
+/// and the hashed buffer always terminates with a single `\n` so trailing-
+/// newline differences in the source file don't invalidate entries.
+///
+/// `end_is_eof = true` means "to EOF" regardless of `end_line`. Returns null
+/// if the range is invalid (start > end, start == 0, end past EOF when not eof).
+fn hashLineRange(
+    a: Allocator,
+    file_text: []const u8,
+    start_line: u32,
+    end_line: u32,
+    end_is_eof: bool,
+) !?[Sha256.digest_length * 2]u8 {
+    if (start_line == 0) return null;
+
+    // Walk the source, splitting on \n / \r\n / \r. Build a normalized
+    // byte buffer holding lines [start..end] joined by \n with trailing \n.
+    var buf: ArrayList(u8) = .{};
+    defer buf.deinit(a);
+
+    var line_no: u32 = 1;
+    var i: usize = 0;
+    var collected: u32 = 0;
+    while (i < file_text.len) {
+        // Find the end of this physical line and the start of the next.
+        var line_end = i;
+        while (line_end < file_text.len and file_text[line_end] != '\n' and file_text[line_end] != '\r') {
+            line_end += 1;
+        }
+        const content = file_text[i..line_end];
+
+        // Compute next-line start (skip exactly one \r, \n, or \r\n).
+        var next = line_end;
+        if (next < file_text.len) {
+            if (file_text[next] == '\r') {
+                next += 1;
+                if (next < file_text.len and file_text[next] == '\n') next += 1;
+            } else if (file_text[next] == '\n') {
+                next += 1;
+            }
+        }
+
+        const in_range = line_no >= start_line and (end_is_eof or line_no <= end_line);
+        if (in_range) {
+            try buf.appendSlice(a, content);
+            try buf.append(a, '\n');
+            collected += 1;
+        }
+
+        // Early stop once we've passed the end (numeric-end case only).
+        if (!end_is_eof and line_no >= end_line) break;
+
+        line_no += 1;
+        i = next;
+    }
+
+    // Validate range against actual file size.
+    if (end_is_eof) {
+        if (collected == 0) return null;
+    } else {
+        if (start_line > line_no or end_line < start_line) return null;
+        // line_no is the last line we visited. If end_line > line_no there
+        // weren't enough lines.
+        if (end_line > line_no) return null;
+    }
+
+    var digest: [Sha256.digest_length]u8 = undefined;
+    Sha256.hash(buf.items, &digest, .{});
+    var hex: [Sha256.digest_length * 2]u8 = undefined;
+    hexEncode(digest, &hex);
+    return hex;
+}
+
+/// Parse a single skip-file line into a SkipEntry. Returns null for blanks
+/// and comment lines. Returns an error for malformed entries (caller prints
+/// a diagnostic).
+fn parseSkipLine(a: Allocator, raw: []const u8) !?SkipEntry {
+    // Trim trailing whitespace + CR.
+    var line = raw;
+    while (line.len > 0 and (line[line.len - 1] == ' ' or line[line.len - 1] == '\t' or line[line.len - 1] == '\r')) {
+        line = line[0 .. line.len - 1];
+    }
+    while (line.len > 0 and (line[0] == ' ' or line[0] == '\t')) line = line[1..];
+    if (line.len == 0) return null;
+    if (line[0] == '#') return null;
+
+    // Split into "<path>:<range>" and "sha256:<hex>" by whitespace.
+    var split: usize = 0;
+    while (split < line.len and line[split] != ' ' and line[split] != '\t') split += 1;
+    if (split == line.len) return error.SkipEntryMalformed;
+    const left = line[0..split];
+    var right = line[split..];
+    while (right.len > 0 and (right[0] == ' ' or right[0] == '\t')) right = right[1..];
+
+    // Path:start-end
+    const colon = mem.lastIndexOfScalar(u8, left, ':') orelse return error.SkipEntryMalformed;
+    const rel_path = try a.dupe(u8, left[0..colon]);
+    const range = left[colon + 1 ..];
+    const dash = mem.indexOfScalar(u8, range, '-') orelse return error.SkipEntryMalformed;
+    const start_str = range[0..dash];
+    const end_str = range[dash + 1 ..];
+    if (start_str.len == 0 or end_str.len == 0) return error.SkipEntryMalformed;
+
+    const start_line = std.fmt.parseInt(u32, start_str, 10) catch return error.SkipEntryMalformed;
+    var end_line: u32 = 0;
+    var end_is_eof = false;
+    if (mem.eql(u8, end_str, "end")) {
+        end_is_eof = true;
+    } else {
+        end_line = std.fmt.parseInt(u32, end_str, 10) catch return error.SkipEntryMalformed;
+    }
+
+    // sha256:<hex>
+    const prefix = "sha256:";
+    if (!mem.startsWith(u8, right, prefix)) return error.SkipEntryMalformed;
+    const hex = right[prefix.len..];
+    if (hex.len != Sha256.digest_length * 2) return error.SkipEntryMalformed;
+    for (hex) |c| {
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f');
+        if (!ok) return error.SkipEntryMalformed;
+    }
+    const stored = try a.dupe(u8, hex);
+
+    return SkipEntry{
+        .rel_path = rel_path,
+        .start_line = start_line,
+        .end_line = end_line,
+        .end_is_eof = end_is_eof,
+        .stored_hash = stored,
+    };
+}
+
+/// Resolve a skip entry's relative path to an absolute path under the target dir.
+fn skipAbsPath(a: Allocator, rel: []const u8) ![]u8 {
+    // If the path already starts with the target prefix, treat it as
+    // already-resolved (so writing `kernel/...` works as well as `arch/...`).
+    if (g_target_rel.len > 0 and mem.startsWith(u8, rel, g_target_rel) and
+        rel.len > g_target_rel.len and rel[g_target_rel.len] == '/')
+    {
+        return joinPath(a, &.{ g_repo_root, rel });
+    }
+    return joinPath(a, &.{ g_repo_root, g_target_rel, rel });
+}
+
+/// Read the skip file, parse entries, and validate each against the current
+/// file content. Sets `g_skip_entries`, with `current_hash` and `status`
+/// populated for each. If the file does not exist, leaves the list empty
+/// and returns without error. Diagnostics (parse errors) print to stderr.
+fn loadSkipFile(a: Allocator, path: []const u8) !void {
+    const stderr = std.fs.File.stderr();
+    const f = fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer f.close();
+    const stat = try f.stat();
+    const text = try a.alloc(u8, stat.size);
+    _ = try f.readAll(text);
+
+    g_skip_file_path = try a.dupe(u8, path);
+
+    var line_no: u32 = 0;
+    var it = mem.splitScalar(u8, text, '\n');
+    while (it.next()) |raw| {
+        line_no += 1;
+        var entry = parseSkipLine(a, raw) catch {
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "skip: {s}:{d}: malformed entry, skipping\n", .{ path, line_no }) catch continue;
+            _ = stderr.write(msg) catch {};
+            continue;
+        } orelse continue;
+
+        try validateSkipEntry(a, &entry);
+        try g_skip_entries.append(a, entry);
+    }
+}
+
+/// Compute current_hash for an entry and set its status.
+fn validateSkipEntry(a: Allocator, entry: *SkipEntry) !void {
+    const abs = try skipAbsPath(a, entry.rel_path);
+    const file_or_err = fs.openFileAbsolute(abs, .{});
+    if (file_or_err) |file| {
+        defer file.close();
+        const stat = try file.stat();
+        const text = try a.alloc(u8, stat.size);
+        _ = try file.readAll(text);
+
+        const hex_opt = try hashLineRange(a, text, entry.start_line, entry.end_line, entry.end_is_eof);
+        if (hex_opt) |hex_buf| {
+            const hex = try a.dupe(u8, &hex_buf);
+            entry.current_hash = hex;
+            entry.status = if (mem.eql(u8, hex, entry.stored_hash)) .hit else .invalidated;
+        } else {
+            entry.current_hash = "";
+            entry.status = .bad_range;
+        }
+    } else |err| switch (err) {
+        error.FileNotFound => {
+            entry.current_hash = "";
+            entry.status = .missing;
+        },
+        else => return err,
+    }
+}
+
+/// True iff a `hit` skip entry covers `(rel_path, line)`.
+fn skipCovers(rel_path: []const u8, line: u32) bool {
+    // Strip the target-prefix from `rel_path` (which is repo-relative) so
+    // it matches the skip-file's target-relative form. Also accept the
+    // already-target-relative form so callers don't need to choose.
+    var rel = rel_path;
+    if (g_target_rel.len > 0 and mem.startsWith(u8, rel, g_target_rel) and
+        rel.len > g_target_rel.len and rel[g_target_rel.len] == '/')
+    {
+        rel = rel[g_target_rel.len + 1 ..];
+    }
+    for (g_skip_entries.items) |e| {
+        if (e.status != .hit) continue;
+        if (!mem.eql(u8, e.rel_path, rel)) continue;
+        if (line < e.start_line) continue;
+        if (!e.end_is_eof and line > e.end_line) continue;
+        return true;
+    }
+    return false;
+}
+
+/// Print INVALIDATED / MISSING / BAD-RANGE diagnostics for entries that need
+/// re-review. Returns true if any error-level entry was printed.
+fn reportSkipDiagnostics() !bool {
+    const stderr = std.fs.File.stderr();
+    var any = false;
+    var buf: [1024]u8 = undefined;
+    for (g_skip_entries.items) |e| {
+        switch (e.status) {
+            .hit => continue,
+            .invalidated => {
+                any = true;
+                const end_str = if (e.end_is_eof) "end" else null;
+                const msg1 = if (end_str) |es|
+                    try std.fmt.bufPrint(&buf, "INVALIDATED: {s}:{d}-{s}\n", .{ e.rel_path, e.start_line, es })
+                else
+                    try std.fmt.bufPrint(&buf, "INVALIDATED: {s}:{d}-{d}\n", .{ e.rel_path, e.start_line, e.end_line });
+                _ = stderr.write(msg1) catch {};
+                const msg2 = try std.fmt.bufPrint(&buf, "  stored:  sha256:{s}\n", .{e.stored_hash});
+                _ = stderr.write(msg2) catch {};
+                const msg3 = try std.fmt.bufPrint(&buf, "  current: sha256:{s}\n", .{e.current_hash});
+                _ = stderr.write(msg3) catch {};
+                const msg4 = if (end_str) |es|
+                    try std.fmt.bufPrint(&buf, "  The whitelisted range has changed since last review. Re-review and run\n  `dead_code_zig --update-skip {s}:{d}-{s}` to refresh.\n", .{ e.rel_path, e.start_line, es })
+                else
+                    try std.fmt.bufPrint(&buf, "  The whitelisted range has changed since last review. Re-review and run\n  `dead_code_zig --update-skip {s}:{d}-{d}` to refresh.\n", .{ e.rel_path, e.start_line, e.end_line });
+                _ = stderr.write(msg4) catch {};
+            },
+            .missing => {
+                any = true;
+                const msg = if (e.end_is_eof)
+                    try std.fmt.bufPrint(&buf, "MISSING: {s}:{d}-end\n  File not found under {s}/. Remove the entry or restore the file.\n", .{ e.rel_path, e.start_line, g_target_rel })
+                else
+                    try std.fmt.bufPrint(&buf, "MISSING: {s}:{d}-{d}\n  File not found under {s}/. Remove the entry or restore the file.\n", .{ e.rel_path, e.start_line, e.end_line, g_target_rel });
+                _ = stderr.write(msg) catch {};
+            },
+            .bad_range => {
+                any = true;
+                const msg = if (e.end_is_eof)
+                    try std.fmt.bufPrint(&buf, "BAD-RANGE: {s}:{d}-end\n  Range invalid (file empty or start past EOF).\n", .{ e.rel_path, e.start_line })
+                else
+                    try std.fmt.bufPrint(&buf, "BAD-RANGE: {s}:{d}-{d}\n  Range invalid (start > end, start == 0, or end past EOF).\n", .{ e.rel_path, e.start_line, e.end_line });
+                _ = stderr.write(msg) catch {};
+            },
+        }
+    }
+    return any;
+}
+
+/// Implement `--update-skip <rel-path>:<start>-<end>`. Reads the file,
+/// computes a fresh hash, and writes/updates the entry in the skip file.
+/// Returns nonzero exit code on parse errors or unreadable files.
+fn updateSkipEntry(a: Allocator, raw_arg: []const u8, skip_file: []const u8) !u8 {
+    const stderr = std.fs.File.stderr();
+
+    // Parse "<rel>:<start>-<end>".
+    const colon = mem.lastIndexOfScalar(u8, raw_arg, ':') orelse {
+        _ = stderr.write("--update-skip: expected <rel-path>:<start>-<end>\n") catch {};
+        return 2;
+    };
+    const rel_path = raw_arg[0..colon];
+    const range = raw_arg[colon + 1 ..];
+    const dash = mem.indexOfScalar(u8, range, '-') orelse {
+        _ = stderr.write("--update-skip: expected <start>-<end>\n") catch {};
+        return 2;
+    };
+    const start_str = range[0..dash];
+    const end_str = range[dash + 1 ..];
+    const start_line = std.fmt.parseInt(u32, start_str, 10) catch {
+        _ = stderr.write("--update-skip: bad start line\n") catch {};
+        return 2;
+    };
+    var end_line: u32 = 0;
+    var end_is_eof = false;
+    if (mem.eql(u8, end_str, "end")) {
+        end_is_eof = true;
+    } else {
+        end_line = std.fmt.parseInt(u32, end_str, 10) catch {
+            _ = stderr.write("--update-skip: bad end line (expected number or 'end')\n") catch {};
+            return 2;
+        };
+    }
+
+    // Hash the current file content for the range.
+    const abs = try skipAbsPath(a, rel_path);
+    const file = fs.openFileAbsolute(abs, .{}) catch {
+        var buf: [512]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "--update-skip: file not found: {s}\n", .{abs}) catch return 2;
+        _ = stderr.write(msg) catch {};
+        return 2;
+    };
+    defer file.close();
+    const stat = try file.stat();
+    const text = try a.alloc(u8, stat.size);
+    _ = try file.readAll(text);
+
+    const hex_opt = try hashLineRange(a, text, start_line, end_line, end_is_eof);
+    const hex_buf = hex_opt orelse {
+        _ = stderr.write("--update-skip: invalid range for that file\n") catch {};
+        return 2;
+    };
+    const new_hex = &hex_buf;
+
+    // Read existing skip-file content (or empty if absent).
+    var existing: []u8 = "";
+    if (fs.openFileAbsolute(skip_file, .{})) |sf| {
+        defer sf.close();
+        const sst = try sf.stat();
+        existing = try a.alloc(u8, sst.size);
+        _ = try sf.readAll(existing);
+    } else |err| switch (err) {
+        error.FileNotFound => existing = "",
+        else => return err,
+    }
+
+    // Build new content: replace the matching entry's line in place, or
+    // append. "Matching" means same `<rel-path>:<start>-<end>` left side.
+    var left_buf: [512]u8 = undefined;
+    const left = if (end_is_eof)
+        try std.fmt.bufPrint(&left_buf, "{s}:{d}-end", .{ rel_path, start_line })
+    else
+        try std.fmt.bufPrint(&left_buf, "{s}:{d}-{d}", .{ rel_path, start_line, end_line });
+
+    var out: ArrayList(u8) = .{};
+    var replaced = false;
+    var it = mem.splitScalar(u8, existing, '\n');
+    var first = true;
+    while (it.next()) |line| {
+        if (!first) try out.append(a, '\n');
+        first = false;
+        // Detect match: trimmed-leading line starts with `<left><ws>`.
+        var trimmed = line;
+        while (trimmed.len > 0 and (trimmed[0] == ' ' or trimmed[0] == '\t')) trimmed = trimmed[1..];
+        const matches = mem.startsWith(u8, trimmed, left) and
+            (trimmed.len == left.len or trimmed[left.len] == ' ' or trimmed[left.len] == '\t');
+        if (matches and !replaced) {
+            var rep_buf: [256]u8 = undefined;
+            const rep = try std.fmt.bufPrint(&rep_buf, "{s}    sha256:{s}", .{ left, new_hex });
+            try out.appendSlice(a, rep);
+            replaced = true;
+        } else {
+            try out.appendSlice(a, line);
+        }
+    }
+    if (!replaced) {
+        // Ensure trailing newline before append.
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') {
+            try out.append(a, '\n');
+        }
+        var rep_buf: [256]u8 = undefined;
+        const rep = try std.fmt.bufPrint(&rep_buf, "{s}    sha256:{s}\n", .{ left, new_hex });
+        try out.appendSlice(a, rep);
+    } else {
+        // Make sure file ends with newline.
+        if (out.items.len > 0 and out.items[out.items.len - 1] != '\n') {
+            try out.append(a, '\n');
+        }
+    }
+
+    // Write back atomically: temp then rename.
+    const tmp_path = try std.fmt.allocPrint(a, "{s}.tmp", .{skip_file});
+    {
+        const wf = try fs.createFileAbsolute(tmp_path, .{ .truncate = true });
+        defer wf.close();
+        try wf.writeAll(out.items);
+    }
+    try fs.renameAbsolute(tmp_path, skip_file);
+
+    var msg_buf: [512]u8 = undefined;
+    const action = if (replaced) "updated" else "added";
+    const msg = std.fmt.bufPrint(&msg_buf, "{s}: {s} (sha256:{s})\n", .{ action, left, new_hex }) catch return 0;
+    const stdout = std.fs.File.stdout();
+    _ = stdout.write(msg) catch {};
+    return 0;
+}
+
+/// Default skip-file path for a target dir: `<repo_root>/<target>/.dead-code-skip.txt`.
+fn defaultSkipPath(a: Allocator, target_rel: []const u8) ![]u8 {
+    return joinPath(a, &.{ g_repo_root, target_rel, ".dead-code-skip.txt" });
+}
+
+// -----------------------------------------------------------------
 // Main
 // -----------------------------------------------------------------
 
@@ -1461,9 +1961,48 @@ pub fn main() !void {
     defer g_arena_state.deinit();
     g_arena = g_arena_state.allocator();
 
-    var args = std.process.args();
-    _ = args.next(); // exe
-    const target_name: []const u8 = if (args.next()) |a| a else "kernel";
+    // Parse CLI: positional <target> + optional flags.
+    //   dead_code_zig <target>
+    //   dead_code_zig <target> --skip <path>
+    //   dead_code_zig --update-skip <relpath>:<start>-<end> [<target>]
+    var args_it = std.process.args();
+    _ = args_it.next(); // exe
+
+    var target_name: []const u8 = "kernel";
+    var target_set = false;
+    var skip_override: ?[]const u8 = null;
+    var update_arg: ?[]const u8 = null;
+
+    while (args_it.next()) |a| {
+        if (mem.eql(u8, a, "--skip")) {
+            const v = args_it.next() orelse {
+                const stderr = std.fs.File.stderr();
+                _ = stderr.write("--skip requires a path\n") catch {};
+                std.process.exit(2);
+            };
+            skip_override = try g_arena.dupe(u8, v);
+        } else if (mem.eql(u8, a, "--update-skip")) {
+            const v = args_it.next() orelse {
+                const stderr = std.fs.File.stderr();
+                _ = stderr.write("--update-skip requires <rel-path>:<start>-<end>\n") catch {};
+                std.process.exit(2);
+            };
+            update_arg = try g_arena.dupe(u8, v);
+        } else if (mem.startsWith(u8, a, "--")) {
+            const stderr = std.fs.File.stderr();
+            var buf: [256]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "unknown flag: {s}\n", .{a}) catch "unknown flag\n";
+            _ = stderr.write(msg) catch {};
+            std.process.exit(2);
+        } else if (!target_set) {
+            target_name = try g_arena.dupe(u8, a);
+            target_set = true;
+        } else {
+            const stderr = std.fs.File.stderr();
+            _ = stderr.write("unexpected positional argument\n") catch {};
+            std.process.exit(2);
+        }
+    }
 
     // Repo root = parent of the directory containing this exe? No — we're
     // run from the repo root by convention. Use the grandparent of
@@ -1471,6 +2010,22 @@ pub fn main() !void {
     var cwd_buf: [4096]u8 = undefined;
     const cwd = try std.fs.cwd().realpath(".", &cwd_buf);
     g_repo_root = try g_arena.dupe(u8, cwd);
+    g_target_rel = target_name;
+
+    // Resolve skip-file path (override > default).
+    const skip_path = if (skip_override) |p|
+        if (std.fs.path.isAbsolute(p)) try g_arena.dupe(u8, p) else try joinPath(g_arena, &.{ g_repo_root, p })
+    else
+        try defaultSkipPath(g_arena, target_name);
+
+    // --update-skip is a one-shot rewrite; no scan needed.
+    if (update_arg) |arg| {
+        const rc = try updateSkipEntry(g_arena, arg, skip_path);
+        std.process.exit(rc);
+    }
+
+    // Auto-load skip file if present, validate hashes.
+    try loadSkipFile(g_arena, skip_path);
 
     g_basename_index = StringHashMap(ArrayList(FileId)).init(g_arena);
     g_path_index = StringHashMap(FileId).init(g_arena);
@@ -1613,6 +2168,9 @@ pub fn main() !void {
         for (g_defs.items, 0..) |d, di| {
             if (d.file != fi) continue;
             if (g_live[di]) continue;
+            // Honor skip file: silently drop findings whose line falls inside
+            // a hash-validated `hit` range.
+            if (skipCovers(fe.rel_path, d.line)) continue;
             if (first_for_file) {
                 try w.print("=== {s} ===\n", .{fe.rel_path});
                 first_for_file = false;
@@ -1639,5 +2197,9 @@ pub fn main() !void {
     }
     try w.flush();
 
-    if (unused_total > 0) std.process.exit(1);
+    // Skip-file diagnostics (INVALIDATED / MISSING / BAD-RANGE) are a hard
+    // error: nonzero exit even if no other findings.
+    const skip_errors = try reportSkipDiagnostics();
+
+    if (unused_total > 0 or skip_errors) std.process.exit(1);
 }
