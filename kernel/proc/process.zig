@@ -39,6 +39,39 @@ pub const MAX_PERMS: usize = 128;
 pub const MAX_DMA_MAPPINGS: usize = 16;
 pub const HANDLE_SELF: u64 = 0;
 
+/// `Process._gen_lock` ordered_group for cross-process fault-handling
+/// paths.
+///
+/// `Process.faultBlock` (external-handler arm) holds the *handler*
+/// process's `_gen_lock` across the stop-all walk that locks the
+/// *faulting* process's own `_gen_lock`, and then dispatches to a
+/// receiver Thread blocked in `fault_recv` (which acquires the
+/// receiver's `Thread._gen_lock`).
+///
+/// Two distinct lockdep concerns this tag addresses:
+///
+///  1. Same-class overlap on `Process._gen_lock` — handler and self
+///     are distinct Process instances. handler is always resolved
+///     from `self.faultHandlerOf()`; the self-handling arm uses a
+///     separate code path. The inner stop-all walk is bounded and
+///     never blocks on userspace.
+///
+///  2. Cross-class edge insertion. With handler._gen_lock held we
+///     subsequently lock a fault_recv waiter (`Thread._gen_lock`),
+///     which would register a Process→Thread edge. `sysIpcReply`'s
+///     cap-transfer path registers the inverse Thread→Process edge.
+///     Neither pair is a real AB-BA at the instance level: handler
+///     is a fault-handler Process and r_ref is its blocked recv
+///     waiter; nothing in the kernel acquires these two specific
+///     instances in the opposite order. Tagging the outer Process
+///     acquire as ordered tells `debug_core.acquireOn` to skip the
+///     pair-registry edge insertion for any acquisition while this
+///     lock is held.
+///
+/// See `SpinLock.lockIrqSaveOrdered` and `kernel/proc/futex.zig`'s
+/// `FUTEX_BUCKET_GROUP` for the prior art.
+pub const FAULT_PROCESS_GENLOCK_GROUP: u32 = 1;
+
 /// Build a `SlabRef(T)` from a live pointer by sampling the slot's
 /// current gen. Callers use this at the moment they mint a handle
 /// (insertPerm, etc.) — the captured gen becomes the staleness baseline
@@ -625,7 +658,11 @@ pub const Process = struct {
         // External handler path (§2.12.10): possibly stop-all + enqueue on
         // handler's box.
         const handler_ref = resolved.ref.?;
-        const handler = handler_ref.lock(@src()) catch return false;
+        // Tagged with FAULT_PROCESS_GENLOCK_GROUP: we hold this
+        // across `self._gen_lock.lockOrdered` below so we can safely
+        // walk handler.perm_table and self.threads[] in turn. Both
+        // are Process._gen_lock instances on distinct processes.
+        const handler = handler_ref.lockOrdered(FAULT_PROCESS_GENLOCK_GROUP, @src()) catch return false;
         defer handler_ref.unlock();
         //
         // §2.12.11: before stop-all, check the faulting thread's
@@ -651,7 +688,10 @@ pub const Process = struct {
         // queues and IPI their cores after releasing proc.lock.
         var stopped: [MAX_THREADS]?SlabRef(Thread) = .{null} ** MAX_THREADS;
         var stopped_count: u32 = 0;
-        self._gen_lock.lock(@src());
+        // Tagged with FAULT_PROCESS_GENLOCK_GROUP: handler._gen_lock
+        // is held above. See the constant's doc comment for why this
+        // same-class overlap is not an AB-BA risk.
+        self._gen_lock.lockOrdered(FAULT_PROCESS_GENLOCK_GROUP, @src());
         if (stop_all) {
             // self-alive: self._gen_lock held, siblings can't be freed.
             for (self.threads[0..self.num_threads]) |sib_ref| {
@@ -860,7 +900,7 @@ pub const Process = struct {
             // deinit, otherwise the dangling pointer in the queue is a UAF
             // waiting to happen on the next dequeue.
             sched.removeFromAnyRunQueue(thread);
-            if (thread.futex_paddr.addr != 0) {
+            if (thread.futex_bucket_count > 0) {
                 futex.removeBlockedThread(thread);
             }
             if (thread.ipc_server) |server_ref| {
@@ -1546,6 +1586,17 @@ pub const Process = struct {
         proc.num_dma_mappings = 0;
         proc.msg_box = .{};
         proc.fault_box = .{};
+        // Override class strings so lockdep treats `msg_box.lock` and
+        // `fault_box.lock` as distinct classes. They never alias (one
+        // serves IPC, the other fault delivery) and routinely appear
+        // in opposite orderings against `Process._gen_lock`:
+        //   * sysIpcReply: msg_box.lock → Process._gen_lock (ipc.zig:151)
+        //   * faultBlock:  Process._gen_lock → fault_box.lock (process.zig:712)
+        // Without per-instance class identity these would register as
+        // an AB-BA cycle even though no single instance can be on both
+        // sides of the cycle.
+        proc.msg_box.lock.class = "MessageBox.msg_box.lock";
+        proc.fault_box.lock.class = "MessageBox.fault_box.lock";
         proc.fault_reason = .none;
         proc.restart_count = 0;
         proc.perm_view_gen = 0;
@@ -1681,6 +1732,17 @@ pub const Process = struct {
         proc.num_dma_mappings = 0;
         proc.msg_box = .{};
         proc.fault_box = .{};
+        // Override class strings so lockdep treats `msg_box.lock` and
+        // `fault_box.lock` as distinct classes. They never alias (one
+        // serves IPC, the other fault delivery) and routinely appear
+        // in opposite orderings against `Process._gen_lock`:
+        //   * sysIpcReply: msg_box.lock → Process._gen_lock (ipc.zig:151)
+        //   * faultBlock:  Process._gen_lock → fault_box.lock (process.zig:712)
+        // Without per-instance class identity these would register as
+        // an AB-BA cycle even though no single instance can be on both
+        // sides of the cycle.
+        proc.msg_box.lock.class = "MessageBox.msg_box.lock";
+        proc.fault_box.lock.class = "MessageBox.fault_box.lock";
         proc.fault_reason = .none;
         proc.restart_count = 0;
         proc.perm_view_gen = 0;

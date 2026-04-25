@@ -43,7 +43,23 @@ pub const GenLock = extern struct {
     /// Used by internal kernel paths that already have a live *T from a
     /// pinned reference chain (no handle, no staleness concern).
     pub fn lock(self: *GenLock, src: SrcLoc) void {
-        debug.acquire(self, self.class, 0, src);
+        self.lockOrdered(0, src);
+    }
+
+    /// `lock` variant that tags the lockdep entry with a non-zero
+    /// `ordered_group`. The tag opts out of two checks: same-class
+    /// overlap (lockdep treats every instance in the same group as
+    /// disjoint for the duration of the held window) and pair-edge
+    /// insertion against any other held lock (lockdep skips the
+    /// (held, acquiring) pair-registry entry when either side is
+    /// ordered, so cross-class cycle detection treats the ordered
+    /// acquisition as exempt). Mirrors `SpinLock.lockIrqSaveOrdered`
+    /// in spin_lock.zig and the futex `FUTEX_BUCKET_GROUP` site in
+    /// kernel/proc/futex.zig. Caller must enforce a fixed acquisition
+    /// order across every instance sharing this group; otherwise the
+    /// escape hides real AB-BA deadlocks.
+    pub fn lockOrdered(self: *GenLock, ordered_group: u32, src: SrcLoc) void {
+        debug.acquire(self, self.class, ordered_group, src);
         while (true) {
             const cur = self.word.load(.monotonic);
             if (cur & 1 == 0) {
@@ -66,11 +82,27 @@ pub const GenLock = extern struct {
     /// Returns `StaleHandle` if the slot has been freed (and possibly
     /// reallocated) since the handle was issued.
     pub fn lockWithGen(self: *GenLock, expected_gen: u63, src: SrcLoc) AccessError!void {
+        return self.lockWithGenOrdered(expected_gen, 0, src);
+    }
+
+    /// `lockWithGen` variant that tags the lockdep entry with a
+    /// non-zero `ordered_group`. Same semantics as `GenLock.lockOrdered`
+    /// — opts out of both same-class overlap and cross-class
+    /// pair-edge cycle detection for this acquisition. Mirrors
+    /// `SpinLock.lockIrqSaveOrdered`. Caller must enforce a fixed
+    /// acquisition order across every instance sharing this group;
+    /// otherwise the escape hides real AB-BA deadlocks.
+    pub fn lockWithGenOrdered(
+        self: *GenLock,
+        expected_gen: u63,
+        ordered_group: u32,
+        src: SrcLoc,
+    ) AccessError!void {
         // Parity invariant: a live-handle gen is always odd. An even
         // expected_gen means the caller is holding a reference to a
         // freed slot — a bug at the issuance site, not a stale handle.
         std.debug.assert(expected_gen % 2 == 1);
-        debug.acquire(self, self.class, 0, src);
+        debug.acquire(self, self.class, ordered_group, src);
         const unlocked: u64 = (@as(u64, expected_gen) << 1) | 0;
         const locked: u64 = (@as(u64, expected_gen) << 1) | 1;
         while (true) {
@@ -152,6 +184,18 @@ pub fn SlabRef(comptime T: type) type {
         /// NOT touch `self.ptr`.
         pub fn lock(self: Self, src: SrcLoc) AccessError!*T {
             try self.ptr._gen_lock.lockWithGen(@intCast(self.gen), src);
+            return self.ptr;
+        }
+
+        /// `lock` variant that tags the lockdep entry with a non-zero
+        /// `ordered_group`. Same semantics as `GenLock.lockOrdered` —
+        /// opts out of both same-class overlap and cross-class
+        /// pair-edge cycle detection for this acquisition. Mirrors
+        /// `SpinLock.lockIrqSaveOrdered`. Caller must enforce a
+        /// fixed acquisition order across every instance sharing this
+        /// group; otherwise the escape hides real AB-BA deadlocks.
+        pub fn lockOrdered(self: Self, ordered_group: u32, src: SrcLoc) AccessError!*T {
+            try self.ptr._gen_lock.lockWithGenOrdered(@intCast(self.gen), ordered_group, src);
             return self.ptr;
         }
 

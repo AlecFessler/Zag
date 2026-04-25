@@ -28,6 +28,43 @@ const E_MAXCAP = errors.E_MAXCAP;
 const E_OK = errors.E_OK;
 const E_PERM = errors.E_PERM;
 
+/// `Thread._gen_lock` ordered_group for the cap-transfer reply path.
+///
+/// `sysIpcReply` holds the *caller* thread's `_gen_lock` across
+/// `transferCapability`, which — on the HANDLE_SELF + fault_handler
+/// arm — both acquires `sender_proc._gen_lock` (a Process gen-lock)
+/// AND walks the replier's threads, locking each one briefly to
+/// insert a thread handle into the receiver's perm table.
+///
+/// Two distinct lockdep concerns this tag addresses:
+///
+///  1. Same-class overlap on `Thread._gen_lock` — caller-Thread lock
+///     overlaps with each per-iter walked-Thread lock. The threads
+///     belong to different processes and never alias; the inner lock
+///     is held only for one `insertThreadHandle` and never blocks on
+///     userspace.
+///
+///  2. Cross-class cycle Thread→Process registered here vs the
+///     Process→Thread edge `Process.faultBlock` (process.zig:638-717)
+///     registers when the external-handler arm acquires
+///     `handler._gen_lock` then dispatches to a fault_recv waiter
+///     Thread. The instances never alias — caller is a blocked IPC
+///     thread, handler is a fault-handler Process — and the inverse
+///     class-level pair is not a real AB-BA: per-instance, no single
+///     Process+Thread pair ever appears on both sides of the cycle.
+///
+/// Tagging the outer `caller_ref.lock` and the per-iter `t_ref.lock`
+/// with this group disables both same-class overlap panics and
+/// cross-class cycle/edge-insertion involving these acquisitions.
+/// `debug_core.acquireOn` skips the registry insert when either
+/// side of a (held, acquiring) pair is ordered, so the Thread→Process
+/// edge is never recorded and `Process.faultBlock`'s Process→Thread
+/// acquisition can complete without tripping a phantom AB-BA.
+///
+/// See `SpinLock.lockIrqSaveOrdered` and `kernel/proc/futex.zig`'s
+/// `FUTEX_BUCKET_GROUP` for the prior art.
+const REPLY_THREAD_GENLOCK_GROUP: u32 = 1;
+
 const IpcMetadata = struct {
     word_count: u3,
     cap_transfer: bool,
@@ -227,7 +264,14 @@ fn transferCapability(sender_proc: *Process, target_proc: *Process, handle_val: 
                     sender_proc._gen_lock.unlock();
 
                     for (threads_copy[0..num_threads]) |t_ref| {
-                        const t = t_ref.lock(@src()) catch continue;
+                        // Tagged with REPLY_THREAD_GENLOCK_GROUP: the
+                        // caller thread's `_gen_lock` is held by
+                        // `sysIpcReply` across this loop. Both locks
+                        // are `Thread._gen_lock` instances on
+                        // different threads in different processes;
+                        // see the constant's doc comment for why the
+                        // same-class overlap is not an AB-BA risk.
+                        const t = t_ref.lockOrdered(REPLY_THREAD_GENLOCK_GROUP, @src()) catch continue;
                         defer t_ref.unlock();
                         _ = target_proc.insertThreadHandle(t, ThreadHandleRights.full) catch {};
                     }
@@ -381,9 +425,12 @@ pub fn sysIpcSend(ctx: *ArchCpuContext) SyscallResult {
         return .{ .ret = E_AGAIN };
     }
 
-    // Receiver is waiting — deliver directly
+    // Receiver is waiting — deliver directly. Tagged with
+    // REPLY_THREAD_GENLOCK_GROUP because `transferCapability` below
+    // walks `proc.threads[]` and locks each one on the HANDLE_SELF +
+    // fault_handler arm — distinct `Thread._gen_lock` instances.
     const recv_ref = target_proc.msg_box.takeReceiverLocked();
-    const receiver = recv_ref.lock(@src()) catch {
+    const receiver = recv_ref.lockOrdered(REPLY_THREAD_GENLOCK_GROUP, @src()) catch {
         // Receiver slot got freed while blocked — treat as no receiver.
         target_proc.msg_box.lock.unlock();
         return .{ .ret = E_AGAIN };
@@ -456,8 +503,12 @@ pub fn sysIpcCall(ctx: *ArchCpuContext) SyscallResult {
 
     if (target_proc.msg_box.isReceiving()) {
         // Receiver is waiting — deliver and queue caller for reply.
+        // Tagged with REPLY_THREAD_GENLOCK_GROUP because
+        // `transferCapability` below walks `proc.threads[]` and locks
+        // each one on the HANDLE_SELF + fault_handler arm — distinct
+        // `Thread._gen_lock` instances.
         const recv_ref = target_proc.msg_box.takeReceiverLocked();
-        const receiver = recv_ref.lock(@src()) catch {
+        const receiver = recv_ref.lockOrdered(REPLY_THREAD_GENLOCK_GROUP, @src()) catch {
             // Receiver slot freed while blocked — fall back to enqueue path.
             target_proc.msg_box.enqueueLocked(thread);
             thread.ipc_server = process_mod.slabRefNow(Process, target_proc);
@@ -634,7 +685,13 @@ pub fn sysIpcReply(ctx: *ArchCpuContext) SyscallResult {
     var reply_cap_err: i64 = E_OK;
     var caller_thread: ?*Thread = null;
     if (caller_ref) |cr| {
-        if (cr.lock(@src())) |pc| {
+        // Tagged with REPLY_THREAD_GENLOCK_GROUP: `transferCapability`
+        // below may walk the *replier* process's threads on the
+        // HANDLE_SELF + fault_handler arm and lock each one briefly.
+        // Those are distinct `Thread._gen_lock` instances on different
+        // threads in different processes; see the constant's doc
+        // comment for why the same-class overlap is not an AB-BA risk.
+        if (cr.lockOrdered(REPLY_THREAD_GENLOCK_GROUP, @src())) |pc| {
             caller_thread = pc;
             if (reply_cap_transfer) {
                 const cap = getCapPayload(ctx, reply_word_count);

@@ -27,6 +27,33 @@ const E_NOENT = errors.E_NOENT;
 const E_OK = errors.E_OK;
 const E_PERM = errors.E_PERM;
 
+/// `MessageBox.fault_box.lock` ordered_group for the fault-reply
+/// path. `sysFaultReply` acquires `proc.fault_box.lock`, then locks
+/// the pending Thread's `_gen_lock`, then releases fault_box.lock,
+/// then later (on the FAULT_KILL branch) calls
+/// `process_mod.scrubFromFaultBoxPub` which re-acquires
+/// `fault_box.lock` while the Thread `_gen_lock` is still held. The
+/// two acquisitions of fault_box.lock are sequential (the first is
+/// released before the second is acquired), so no real AB-BA exists
+/// — but lockdep records a `(fault_box.lock → Thread)` edge from the
+/// first phase that would invert against the second's
+/// `(Thread → fault_box.lock)` and trip a phantom cycle panic.
+///
+/// Tagging the first acquire with this group disables pair-edge
+/// insertion against any held lock for that acquire, which keeps
+/// the registry clean of an inverse edge that does not represent a
+/// concurrent ordering.
+const FAULT_REPLY_BOX_GROUP: u32 = 1;
+
+/// `Thread._gen_lock` ordered_group for the fault-reply sibling walk.
+/// `sysFaultReply` holds `pending_ref` (the faulting Thread) across
+/// a sub-loop that locks each previously-suspended sibling Thread to
+/// re-enqueue it. All instances belong to the same Process and are
+/// distinct from `pending`; the inner per-iter critical section is
+/// just an enqueueOnCore call with no userspace blocking. Mirrors
+/// `REPLY_THREAD_GENLOCK_GROUP` in ipc.zig.
+const FAULT_REPLY_THREAD_GROUP: u32 = 2;
+
 /// FaultMessage userspace layout (arch.cpu.fault_msg_size bytes). Stable wire
 /// format shared with libz.FaultMessage:
 ///   0   process_handle: u64    handle ID of source process in handler's table
@@ -274,7 +301,15 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
         }
     }
 
-    proc.fault_box.lock.lock(@src());
+    // Tagged with FAULT_REPLY_BOX_GROUP: the FAULT_KILL branch below
+    // re-acquires fault_box.lock from `scrubFromFaultBoxPub` while
+    // still holding `pending_ref`'s gen-lock. The two acquisitions
+    // of fault_box.lock are sequential (the first is unlocked at
+    // line 320 before the second runs), but lockdep would otherwise
+    // pair-register `(fault_box.lock → Thread)` here and detect a
+    // phantom inverse cycle on the scrub side. See the constant's
+    // doc comment.
+    proc.fault_box.lock.lockOrdered(@src(), FAULT_REPLY_BOX_GROUP);
 
     if (!proc.fault_box.isPendingReply()) {
         proc.fault_box.lock.unlock();
@@ -288,7 +323,11 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
         return E_INVAL;
     };
 
-    const pending = pending_ref.lock(@src()) catch {
+    // Tagged with FAULT_REPLY_THREAD_GROUP: held across the sibling
+    // re-enqueue loop below (line ~430), which locks each suspended
+    // sibling Thread in turn — same `Thread._gen_lock` class,
+    // distinct instances. See the constant's doc comment.
+    const pending = pending_ref.lockOrdered(FAULT_REPLY_THREAD_GROUP, @src()) catch {
         // Pending thread's slot was freed — drop the stale pending_reply.
         _ = proc.fault_box.endPendingReplyLocked();
         proc.fault_box.lock.unlock();
@@ -376,7 +415,11 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
         while (i < src.num_threads) {
             if ((sib_mask & (@as(u64, 1) << @intCast(i))) != 0) {
                 const t_ref = src.threads[i];
-                if (t_ref.lock(@src())) |t| {
+                // Tagged with FAULT_REPLY_THREAD_GROUP: pending_ref
+                // (above) is held across this loop. See the
+                // constant's doc comment for why the same-class
+                // overlap is not an AB-BA risk.
+                if (t_ref.lockOrdered(FAULT_REPLY_THREAD_GROUP, @src())) |t| {
                     defer t_ref.unlock();
                     const target_core = if (t.core_affinity) |mask| @as(u64, @ctz(mask)) else arch.smp.coreID();
                     sched.enqueueOnCore(target_core, t);
@@ -399,7 +442,7 @@ pub fn sysFaultReply(ctx: *ArchCpuContext, fault_token: u64, action: u64, modifi
 
             while (pending.on_cpu.load(.acquire)) std.atomic.spinLoopHint();
             sched.removeFromAnyRunQueue(pending);
-            if (pending.futex_paddr.addr != 0) {
+            if (pending.futex_bucket_count > 0) {
                 futex.removeBlockedThread(pending);
             }
             if (pending.ipc_server) |server_ref| {

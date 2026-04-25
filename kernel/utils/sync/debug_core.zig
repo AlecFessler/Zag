@@ -384,25 +384,42 @@ pub fn acquireOn(
     while (j < stack.depth) {
         const held = stack.entries[j];
         if (held.class != class) {
-            if (registry.contains(class, held.class)) {
-                const prior = registry.lookup(class, held.class) orelse PairEntry{};
-                return .{
-                    .result = .panic_cycle,
-                    .cycle_outer = class,
-                    .cycle_inner = held.class,
-                    .cycle_prior_outer_src = prior.outer_src,
-                    .cycle_prior_inner_src = prior.inner_src,
-                };
+            // ordered_group escape extends to cross-class cycle
+            // detection: when *either* side of the (held, acquiring)
+            // pair is opt-in-ordered (non-zero ordered_group), the
+            // caller has guaranteed safe ordering across every
+            // instance involved in that group. Skip both the cycle
+            // check and the edge registration for that pair so the
+            // ordered acquisition does not pollute the registry with
+            // an edge that contradicts another path's ordering. The
+            // futex bucket group, the ipc-reply Thread/Process
+            // overlap, and the fault-block Process/Thread overlap
+            // all rely on this; without it, every same-class
+            // ordered_group acquisition would still register a
+            // distinct (held.class, class) pair edge against any
+            // non-ordered lock on the held stack and seed AB-BA
+            // panics on the inverse class-level pair.
+            if (held.ordered_group == 0 and ordered_group == 0) {
+                if (registry.contains(class, held.class)) {
+                    const prior = registry.lookup(class, held.class) orelse PairEntry{};
+                    return .{
+                        .result = .panic_cycle,
+                        .cycle_outer = class,
+                        .cycle_inner = held.class,
+                        .cycle_prior_outer_src = prior.outer_src,
+                        .cycle_prior_inner_src = prior.inner_src,
+                    };
+                }
+                if (registry.pathExists(class, held.class)) {
+                    return .{
+                        .result = .panic_cycle,
+                        .cycle_outer = class,
+                        .cycle_inner = held.class,
+                        .cycle_transitive = true,
+                    };
+                }
+                registry.insert(held.class, class, held.src, src);
             }
-            if (registry.pathExists(class, held.class)) {
-                return .{
-                    .result = .panic_cycle,
-                    .cycle_outer = class,
-                    .cycle_inner = held.class,
-                    .cycle_transitive = true,
-                };
-            }
-            registry.insert(held.class, class, held.src, src);
         }
         j += 1;
     }
@@ -562,6 +579,90 @@ test "acquireOn: same-class overlap with mismatched ordered_group panics" {
     _ = acquireOn(&stack, &reg, &lock_a, class_a, 7, makeSrc("a.zig", 10));
     const out = acquireOn(&stack, &reg, &lock_b, class_a, 9, makeSrc("a.zig", 20));
     try testing.expectEqual(CheckResult.panic_same_class, out.result);
+}
+
+test "acquireOn: cross-class cycle suppressed when held lock is ordered" {
+    // ordered_group on the held side signals manual ordering: skip
+    // pair-edge insertion and cycle-check entirely for that pair.
+    // Mirrors the kernel pattern of `Process._gen_lock` (held with
+    // FAULT_PROCESS_GENLOCK_GROUP) acquiring `Thread._gen_lock` on
+    // one site while the inverse Thread→Process appears on another.
+    var stack_a: HeldStack = .{};
+    var stack_b: HeldStack = .{};
+    var reg: PairRegistry = .{};
+    reg.clear();
+
+    const proc_class: [*:0]const u8 = "Process._gen_lock";
+    const thread_class: [*:0]const u8 = "Thread._gen_lock";
+    var proc_lock: u32 = 0;
+    var thread_lock: u32 = 0;
+    var proc_lock_2: u32 = 0;
+    var thread_lock_2: u32 = 0;
+
+    // Site 1: ordered Thread held, plain Process acquired.
+    // No edge inserted because the held side is ordered.
+    _ = acquireOn(&stack_a, &reg, &thread_lock, thread_class, 1, makeSrc("ipc.zig", 678));
+    const out1 = acquireOn(&stack_a, &reg, &proc_lock, proc_class, 0, makeSrc("ipc.zig", 151));
+    try testing.expectEqual(CheckResult.ok, out1.result);
+
+    // Site 2: ordered Process held, plain Thread acquired.
+    // The opposite class ordering would normally panic as a cycle
+    // because of site 1's edge — but no edge was inserted.
+    _ = acquireOn(&stack_b, &reg, &proc_lock_2, proc_class, 1, makeSrc("process.zig", 638));
+    const out2 = acquireOn(&stack_b, &reg, &thread_lock_2, thread_class, 0, makeSrc("process.zig", 717));
+    try testing.expectEqual(CheckResult.ok, out2.result);
+}
+
+test "acquireOn: cross-class cycle suppressed when acquiring lock is ordered" {
+    // Symmetric to the above: even when the held side is plain, an
+    // ordered_group on the acquiring side skips edge insertion. The
+    // ordered tag signals "the caller manages this lock's ordering"
+    // regardless of which side of the pair it's on.
+    var stack_a: HeldStack = .{};
+    var stack_b: HeldStack = .{};
+    var reg: PairRegistry = .{};
+    reg.clear();
+
+    const a_class: [*:0]const u8 = "A";
+    const b_class: [*:0]const u8 = "B";
+    var a1: u32 = 0;
+    var b1: u32 = 0;
+    var a2: u32 = 0;
+    var b2: u32 = 0;
+
+    // Site 1: plain A held, ordered B acquired. Skip edge insert.
+    _ = acquireOn(&stack_a, &reg, &a1, a_class, 0, makeSrc("x.zig", 1));
+    const out1 = acquireOn(&stack_a, &reg, &b1, b_class, 1, makeSrc("x.zig", 2));
+    try testing.expectEqual(CheckResult.ok, out1.result);
+
+    // Site 2: plain B held, plain A acquired. Would close cycle if
+    // the prior edge had been registered — but it wasn't.
+    _ = acquireOn(&stack_b, &reg, &b2, b_class, 0, makeSrc("y.zig", 1));
+    const out2 = acquireOn(&stack_b, &reg, &a2, a_class, 0, makeSrc("y.zig", 2));
+    try testing.expectEqual(CheckResult.ok, out2.result);
+}
+
+test "acquireOn: cross-class cycle still detected when both sides plain" {
+    // Regression guard: the ordered-side suppression must not weaken
+    // detection when neither side opted in. The classic AB-BA case
+    // remains a panic.
+    var stack_a: HeldStack = .{};
+    var stack_b: HeldStack = .{};
+    var reg: PairRegistry = .{};
+    reg.clear();
+
+    const a_class: [*:0]const u8 = "A";
+    const b_class: [*:0]const u8 = "B";
+    var a1: u32 = 0;
+    var b1: u32 = 0;
+    var a2: u32 = 0;
+    var b2: u32 = 0;
+
+    _ = acquireOn(&stack_a, &reg, &a1, a_class, 0, makeSrc("x.zig", 1));
+    _ = acquireOn(&stack_a, &reg, &b1, b_class, 0, makeSrc("x.zig", 2));
+    _ = acquireOn(&stack_b, &reg, &b2, b_class, 0, makeSrc("y.zig", 1));
+    const out = acquireOn(&stack_b, &reg, &a2, a_class, 0, makeSrc("y.zig", 2));
+    try testing.expectEqual(CheckResult.panic_cycle, out.result);
 }
 
 test "acquireOn: AB then release A then BA succeeds (no overlap)" {

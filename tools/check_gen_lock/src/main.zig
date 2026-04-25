@@ -63,7 +63,9 @@ const TokenTag = std.zig.Token.Tag;
 const LOCK_OPS = [_][]const u8{
     "lock",
     "unlock",
+    "lockOrdered",
     "lockWithGen",
+    "lockWithGenOrdered",
     "currentGen",
     "setGenRelease",
 };
@@ -2649,9 +2651,11 @@ fn walkBody(
                 var op_end = op_start;
                 while (op_end < code.len and isIdentChar(code[op_end])) op_end += 1;
                 const op_name = code[op_start..op_end];
-                const is_lock = mem.eql(u8, op_name, "lock");
+                const is_lock = mem.eql(u8, op_name, "lock") or
+                    mem.eql(u8, op_name, "lockOrdered");
                 const is_unlock = mem.eql(u8, op_name, "unlock");
-                const is_lwg = mem.eql(u8, op_name, "lockWithGen");
+                const is_lwg = mem.eql(u8, op_name, "lockWithGen") or
+                    mem.eql(u8, op_name, "lockWithGenOrdered");
                 if ((is_lock or is_unlock or is_lwg) and env.map.contains(ident)) {
                     const is_defer = isDeferFor(code, ident);
                     const is_errdefer = !is_defer and isErrdeferFor(code, ident);
@@ -2673,16 +2677,36 @@ fn walkBody(
             }
         }
 
-        // SlabRef form: `ident.lock()` / `ident.unlock()`.
+        // SlabRef form: `ident.lock()` / `ident.unlock()` /
+        // `ident.lockOrdered()`. The Ordered variant is a lockdep escape
+        // for genuinely-independent same-class instances; for lock-op
+        // tracking purposes it is identical to plain `lock`.
         {
             var pos: usize = 0;
             while (pos < code.len) {
                 const lock_p = mem.indexOf(u8, code[pos..], ".lock(");
                 const unlock_p = mem.indexOf(u8, code[pos..], ".unlock(");
+                const lock_ord_p = mem.indexOf(u8, code[pos..], ".lockOrdered(");
                 var hit: ?usize = null;
                 var op_name: []const u8 = "";
                 var skip: usize = 0;
-                if (lock_p != null and (unlock_p == null or lock_p.? < unlock_p.?)) {
+                // Pick whichever candidate appears earliest in the
+                // remaining slice. `.lock(` is a substring of
+                // `.lockOrdered(` so a naive `.lock(` match would
+                // misclassify the Ordered variant; preferring the
+                // earlier (and longer when tied) match keeps each
+                // call site classified exactly once.
+                var earliest: usize = std.math.maxInt(usize);
+                if (lock_p) |p| earliest = @min(earliest, p);
+                if (unlock_p) |p| earliest = @min(earliest, p);
+                if (lock_ord_p) |p| earliest = @min(earliest, p);
+                if (lock_ord_p != null and lock_ord_p.? == earliest) {
+                    hit = pos + lock_ord_p.?;
+                    op_name = "lock";
+                    skip = ".lockOrdered(".len;
+                } else if (lock_p != null and lock_p.? == earliest and
+                    (unlock_p == null or lock_p.? <= unlock_p.?))
+                {
                     hit = pos + lock_p.?;
                     op_name = "lock";
                     skip = ".lock(".len;
