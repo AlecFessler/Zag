@@ -975,6 +975,7 @@
   function collectIndirectCalls(entryFnId, depth) {
     const out = [];
     if (entryFnId == null || !fnById.has(entryFnId)) return out;
+    if (isFiltered(fnById.get(entryFnId))) return out;
     const visited = new Set();
     const queue = [{ id: entryFnId, depth: 0 }];
     while (queue.length > 0) {
@@ -983,10 +984,13 @@
       visited.add(cur.id);
       const fn = fnById.get(cur.id);
       if (!fn) continue;
+      // Skip indirect rows where the *caller* is library; vector tables in
+      // stdlib formatters etc. aren't interesting for kernel work.
+      const callerFiltered = isFiltered(fn);
       const callees = fn.callees || [];
       for (const c of callees) {
         const k = c.kind || "direct";
-        if (k === "indirect" || k === "vtable") {
+        if (!callerFiltered && (k === "indirect" || k === "vtable")) {
           const file = c.site ? c.site.file : "";
           out.push({
             marker: "?",
@@ -1007,6 +1011,9 @@
           });
         }
         if (c.to != null && fnById.has(c.to)) {
+          // Don't descend into library callees — keeps the BFS frontier
+          // anchored to the user's kernel code.
+          if (isFiltered(fnById.get(c.to))) continue;
           if (cur.depth < depth && !visited.has(c.to)) {
             queue.push({ id: c.to, depth: cur.depth + 1 });
           }
@@ -1068,12 +1075,30 @@
     }
     const depth = parseInt(els.depthSlider.value, 10) || 4;
     const rows = collectIndirectCalls(currentEntryFnId, depth);
-    showListPanel("Indirect calls (current entry, depth " + depth + ")", rows, "indirect");
+    const suffix = hideLibrary ? " — " + rows.length + " in your code" : "";
+    showListPanel(
+      "Indirect calls (current entry, depth " + depth + ")" + suffix,
+      rows,
+      "indirect",
+    );
   }
 
   function openDeadPanel() {
     const rows = collectDeadFunctions();
-    showListPanel("Dead code  (unreachable from any entry)", rows, "dead");
+    const suffix = hideLibrary ? " — " + rows.length + " in your code" : "";
+    showListPanel(
+      "Dead code  (unreachable from any entry)" + suffix,
+      rows,
+      "dead",
+    );
+  }
+
+  /** Re-run whichever list panel is currently open. Called when the library
+   *  filter is toggled so the visible counts/rows stay in sync. */
+  function refreshOpenListPanel() {
+    if (!els.listPanel || !els.listPanel.classList.contains("visible")) return;
+    if (listMode === "indirect") openIndirectPanel();
+    else if (listMode === "dead") openDeadPanel();
   }
 
   // ------------------------------------------------------------------ events
@@ -1096,6 +1121,31 @@
       const v = parseInt(els.entrySelect.value, 10);
       if (!Number.isNaN(v)) renderForEntry(v);
     });
+
+    if (els.hideLibraryToggle) {
+      els.hideLibraryToggle.checked = hideLibrary;
+      els.hideLibraryToggle.addEventListener("change", function () {
+        hideLibrary = els.hideLibraryToggle.checked;
+        try { localStorage.setItem("hideLibrary", hideLibrary ? "true" : "false"); } catch (_e) {}
+        // Repopulate the dropdown — entries themselves can be filtered.
+        // Preserve the current selection if it survives the filter; else
+        // fall back to the first visible entry.
+        populateDropdown(graph ? (graph.entry_points || []) : []);
+        let target = currentEntryFnId;
+        if (target != null) {
+          const fn = fnById.get(target);
+          if (hideLibrary && isFiltered(fn)) target = null;
+        }
+        if (target == null && graph) {
+          target = firstVisibleEntryId(graph.entry_points || []);
+        }
+        if (target != null) {
+          els.entrySelect.value = String(target);
+          renderForEntry(target);
+        }
+        refreshOpenListPanel();
+      });
+    }
 
     els.fitBtn.addEventListener("click", function () {
       fitWithMinZoom();
