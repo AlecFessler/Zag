@@ -82,12 +82,13 @@ pub fn main() !void {
     else blk: {
         const ir_graph = try ir.parse(&arena, args.ir_path);
 
-        const ast_fns = try ast.walkKernel(arena_allocator, args.kernel_root);
+        const walk = try ast.walkKernelFull(arena_allocator, args.kernel_root);
+        const ast_fns = walk.fns;
         const file_count = countDistinctFiles(arena_allocator, ast_fns) catch ast_fns.len;
         std.debug.print("ast: {d} functions across {d} files\n", .{ ast_fns.len, file_count });
 
         var stats: join.JoinStats = undefined;
-        const g = try join.buildGraphWithStats(arena_allocator, ir_graph, ast_fns, &stats);
+        const g = try join.buildGraphWithStats(arena_allocator, ir_graph, ast_fns, walk.asts, &stats);
         const pct: f64 = if (stats.ir_total == 0)
             0.0
         else

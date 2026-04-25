@@ -18,9 +18,11 @@
 const std = @import("std");
 
 const ast = @import("ast/index.zig");
+const branches = @import("ast/branches.zig");
 const types = @import("types.zig");
 
 const AstFunction = ast.AstFunction;
+const FileAst = ast.FileAst;
 
 pub const JoinStats = struct {
     ir_total: usize,
@@ -33,13 +35,14 @@ pub fn buildGraph(
     ast_fns: []const AstFunction,
 ) !types.Graph {
     var stats: JoinStats = .{ .ir_total = 0, .matched = 0 };
-    return try buildGraphWithStats(arena, ir_graph, ast_fns, &stats);
+    return try buildGraphWithStats(arena, ir_graph, ast_fns, &.{}, &stats);
 }
 
 pub fn buildGraphWithStats(
     arena: std.mem.Allocator,
     ir_graph: types.IrGraph,
     ast_fns: []const AstFunction,
+    file_asts: []const FileAst,
     stats_out: *JoinStats,
 ) !types.Graph {
     // Build a (file_abs, line) → AstFunction lookup. Use a string-keyed map
@@ -124,6 +127,17 @@ pub fn buildGraphWithStats(
         }
     }
 
+    // Third pass: build intra-procedural branch trees for every function
+    // that has a corresponding AST entry. We need:
+    //   1) a file → FileAst lookup so we can get the parsed std.zig.Ast.
+    //   2) a (def_loc.file, def_loc.line) → AstFunction lookup so we know
+    //      the AST fn_decl node index.
+    //   3) per function, a CallSiteMap keyed by `<file>:<line>` containing
+    //      every Callee whose `from` matches this function's IR id.
+    if (file_asts.len > 0) {
+        try attachIntra(arena, functions, ast_fns, file_asts, &realpath_cache);
+    }
+
     try applyEntryHeuristic(functions);
 
     var entry_points = std.ArrayList(types.EntryPoint){};
@@ -203,4 +217,68 @@ fn entryKindForFile(file: []const u8) types.EntryKind {
     if (std.mem.endsWith(u8, file, "kernel/arch/x64/exceptions.zig")) return .trap;
     if (std.mem.endsWith(u8, file, "kernel/arch/x64/idt.zig")) return .irq;
     return .manual;
+}
+
+// ----------------------------------------------------------------- intra
+
+fn attachIntra(
+    arena: std.mem.Allocator,
+    functions: []types.Function,
+    ast_fns: []const AstFunction,
+    file_asts: []const FileAst,
+    realpath_cache: *std.StringHashMap([]const u8),
+) !void {
+    // file (resolved abs path) -> FileAst
+    var file_to_ast = std.StringHashMap(*const FileAst).init(arena);
+    for (file_asts) |*fa| {
+        const resolved = try resolvePath(arena, realpath_cache, fa.file);
+        try file_to_ast.put(resolved, fa);
+    }
+
+    // (resolved file:line) -> AstFunction (with fn_node)
+    var file_line_to_ast = std.StringHashMap(*const AstFunction).init(arena);
+    for (ast_fns) |*af| {
+        const resolved = try resolvePath(arena, realpath_cache, af.file);
+        const key = try std.fmt.allocPrint(arena, "{s}:{d}", .{ resolved, af.line_start });
+        try file_line_to_ast.put(key, af);
+    }
+
+    // Build per-function call-site maps. For each EnrichedEdge in each
+    // function, key by `<resolved_site_file>:<line>` and append a Callee.
+    // We build a transient list of edges per function id and only convert
+    // for joined functions to avoid wasted work.
+    for (functions) |*f| {
+        // Skip if no def_loc file or it didn't match an AST fn.
+        const resolved_def = resolvePath(arena, realpath_cache, f.def_loc.file) catch f.def_loc.file;
+        const def_key = try std.fmt.allocPrint(arena, "{s}:{d}", .{ resolved_def, f.def_loc.line });
+        const af = file_line_to_ast.get(def_key) orelse continue;
+        if (af.fn_node == 0) continue;
+
+        // Find this file's parsed AST.
+        const fa = file_to_ast.get(resolved_def) orelse continue;
+
+        // Build the call-site map for this function.
+        var sites = branches.CallSiteMap.init(arena);
+        // Group callees by `<file>:<line>` so we can stash a slice per key.
+        var grouped = std.StringHashMap(std.ArrayList(types.Callee)).init(arena);
+        for (f.callees) |e| {
+            const site_file = resolvePath(arena, realpath_cache, e.site.file) catch e.site.file;
+            const k = try branches.callSiteKey(arena, site_file, e.site.line);
+            const callee = types.Callee{
+                .to = e.to,
+                .name = e.target_name orelse "?",
+                .kind = e.kind,
+                .site = .{ .file = site_file, .line = e.site.line, .col = e.site.col },
+            };
+            const gop = try grouped.getOrPut(k);
+            if (!gop.found_existing) gop.value_ptr.* = .{};
+            try gop.value_ptr.append(arena, callee);
+        }
+        var it = grouped.iterator();
+        while (it.next()) |entry| {
+            try sites.put(entry.key_ptr.*, try arena.dupe(types.Callee, entry.value_ptr.items));
+        }
+
+        f.intra = branches.buildIntra(arena, resolved_def, af.fn_node, fa.tree, sites) catch &.{};
+    }
 }

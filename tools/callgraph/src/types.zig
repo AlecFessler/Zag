@@ -59,6 +59,7 @@ pub const Function = struct {
     is_entry: bool = false,
     entry_kind: ?EntryKind = null,
     callees: []EnrichedEdge,
+    intra: []const Atom = &.{},
 };
 
 pub const EnrichedEdge = struct {
@@ -72,6 +73,58 @@ pub const EntryPoint = struct {
     fn_id: FnId,
     kind: EntryKind,
     label: []const u8,
+};
+
+/// One reference to a callee from inside a function. Uses the resolved IR
+/// edge — so target/kind reflect the IR truth, not AST guessing.
+pub const Callee = struct {
+    to: ?FnId,
+    name: []const u8,
+    kind: EdgeKind,
+    site: SourceLoc,
+};
+
+pub const BranchKind = enum {
+    if_else,
+    switch_,
+
+    pub fn jsonStringify(self: BranchKind, jw: anytype) !void {
+        try jw.write(@tagName(self));
+    }
+};
+
+pub const ArmSeq = struct {
+    label: []const u8,
+    seq: []const Atom,
+};
+
+pub const BranchAtom = struct {
+    kind: BranchKind,
+    loc: SourceLoc,
+    arms: []const ArmSeq,
+};
+
+/// One element of a function's intra-procedural sequence. After the simplify
+/// pass each Atom is either a single call or a branch where the arms differ
+/// in their callee sets.
+pub const Atom = union(enum) {
+    call: Callee,
+    branch: BranchAtom,
+
+    pub fn jsonStringify(self: Atom, jw: anytype) !void {
+        try jw.beginObject();
+        switch (self) {
+            .call => |c| {
+                try jw.objectField("call");
+                try jw.write(c);
+            },
+            .branch => |b| {
+                try jw.objectField("branch");
+                try jw.write(b);
+            },
+        }
+        try jw.endObject();
+    }
 };
 
 pub const Graph = struct {

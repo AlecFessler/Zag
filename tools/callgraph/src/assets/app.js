@@ -33,6 +33,8 @@
     infoSourceWrap: document.getElementById("info_source_wrap"),
     infoSource: document.getElementById("info_source"),
     infoSourceError: document.getElementById("info_source_error"),
+    infoIntraWrap: document.getElementById("info_intra_wrap"),
+    infoIntra: document.getElementById("info_intra"),
     infoClose: document.getElementById("info_close"),
     status: document.getElementById("status"),
   };
@@ -432,6 +434,12 @@
     els.infoSourceError.textContent = "";
   }
 
+  function clearIntra() {
+    if (!els.infoIntra) return;
+    els.infoIntra.innerHTML = "";
+    els.infoIntraWrap.style.display = "none";
+  }
+
   function showSourceError(msg) {
     els.infoSourceWrap.style.display = "none";
     els.infoSource.innerHTML = "";
@@ -526,10 +534,132 @@
     }
   }
 
+  // ------------------------------------------------------------------ intra (call tree)
+
+  function renderIntra(intra) {
+    if (!els.infoIntra || !els.infoIntraWrap) return;
+    els.infoIntra.innerHTML = "";
+    if (!intra || intra.length === 0) {
+      const empty = document.createElement("div");
+      empty.className = "intra_empty";
+      empty.textContent = "no outgoing calls";
+      els.infoIntra.appendChild(empty);
+      els.infoIntraWrap.style.display = "block";
+      return;
+    }
+    const list = document.createElement("ul");
+    list.className = "atom_list";
+    for (const atom of intra) {
+      list.appendChild(renderAtom(atom));
+    }
+    els.infoIntra.appendChild(list);
+    els.infoIntraWrap.style.display = "block";
+  }
+
+  function renderAtom(atom) {
+    if (atom.call) return renderCallAtom(atom.call);
+    if (atom.branch) return renderBranchAtom(atom.branch);
+    const li = document.createElement("li");
+    li.textContent = "(unknown atom)";
+    return li;
+  }
+
+  function renderCallAtom(c) {
+    const li = document.createElement("li");
+    li.className = "atom_call";
+
+    const name = document.createElement("span");
+    const kindClass = "kind_" + (c.kind || "direct");
+    name.className = "callee_name " + kindClass + (c.to == null ? " unresolved" : "");
+    name.textContent = c.to == null ? (c.name + " ?") : c.name;
+    name.title = c.to == null ? "(unresolved indirect target)" : c.name;
+
+    name.addEventListener("click", function () {
+      // If the target is in the current cy view, center + flash; else
+      // refresh source snippet to the call site.
+      if (c.to != null && cy) {
+        const node = cy.$id("n" + c.to);
+        if (node && node.length > 0) {
+          cy.animate({ center: { eles: node }, duration: 200 });
+          node.flashClass("cy_flash", 600);
+          return;
+        }
+      }
+      if (c.site && c.site.file) {
+        const start = Math.max(1, (c.site.line || 1) - 5);
+        const end = (c.site.line || 1) + 5;
+        fetchSource(c.site.file, start, end, c.site.line);
+      }
+    });
+
+    const loc = document.createElement("span");
+    loc.className = "callee_loc";
+    loc.textContent = c.site ? ("@line " + c.site.line) : "";
+
+    li.appendChild(name);
+    li.appendChild(loc);
+    return li;
+  }
+
+  function renderBranchAtom(b) {
+    const det = document.createElement("details");
+    det.className = "atom_branch";
+    det.open = true;
+
+    const summ = document.createElement("summary");
+    const kw = document.createElement("span");
+    kw.className = "branch_kw";
+    kw.textContent = b.kind === "if_else" ? "if / else" : "switch";
+    const loc = document.createElement("span");
+    loc.className = "branch_loc";
+    loc.textContent = b.loc ? ("@line " + b.loc.line) : "";
+    summ.appendChild(kw);
+    summ.appendChild(loc);
+
+    summ.addEventListener("click", function (e) {
+      // Default behavior toggles the details. Also pull source for context.
+      if (b.loc && b.loc.file) {
+        const start = Math.max(1, (b.loc.line || 1) - 1);
+        const end = (b.loc.line || 1) + 4;
+        fetchSource(b.loc.file, start, end, b.loc.line);
+      }
+      // Don't preventDefault — keep the toggle.
+      e.stopPropagation();
+    });
+
+    det.appendChild(summ);
+
+    for (const arm of (b.arms || [])) {
+      const armDiv = document.createElement("div");
+      armDiv.className = "arm";
+
+      const lab = document.createElement("div");
+      lab.className = "arm_label";
+      lab.textContent = arm.label || "(arm)";
+      armDiv.appendChild(lab);
+
+      if (arm.seq && arm.seq.length > 0) {
+        const sublist = document.createElement("ul");
+        sublist.className = "atom_list";
+        for (const a of arm.seq) sublist.appendChild(renderAtom(a));
+        armDiv.appendChild(sublist);
+      } else {
+        const noop = document.createElement("div");
+        noop.className = "intra_empty";
+        noop.textContent = "(no calls)";
+        armDiv.appendChild(noop);
+      }
+
+      det.appendChild(armDiv);
+    }
+    return det;
+  }
+
   function showNodePanel(d) {
     els.infoTitle.textContent = d.kind === "fn" ? "Function" : "Synthetic Node";
     els.infoMeta.innerHTML = "";
     clearSource();
+    clearIntra();
 
     if (d.kind === "fn") {
       const rows = [
@@ -557,6 +687,12 @@
         const end = start + 14;
         fetchSource(d.file, start, end, d.line);
       }
+
+      // Render intra (call tree).
+      const fnId = parseInt(String(d.id || "").replace(/^n/, ""), 10);
+      const lookupId = Number.isNaN(fnId) ? null : fnId;
+      const fn = lookupId != null ? fnById.get(lookupId) : null;
+      renderIntra(fn ? fn.intra : null);
     } else {
       const rows = [
         metaRow("kind", d.kind),
@@ -574,6 +710,7 @@
     els.infoTitle.textContent = "Call Site";
     els.infoMeta.innerHTML = "";
     clearSource();
+    clearIntra();
 
     const badge = document.createElement("span");
     badge.className = "badge";
@@ -602,6 +739,7 @@
   function hidePanel() {
     els.info.classList.remove("visible");
     clearSource();
+    clearIntra();
   }
 
   // ------------------------------------------------------------------ events

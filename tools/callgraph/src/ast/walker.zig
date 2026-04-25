@@ -27,27 +27,52 @@ pub const AstFunction = struct {
     line_start: u32,
     line_end: u32,
     is_pub: bool,
+    /// AST node index of the fn_decl. 0 if not available (e.g., proto only).
+    fn_node: u32 = 0,
+};
+
+/// Per-file parsed AST + source bytes. The branches builder needs both to
+/// resolve node tags, token locations, and slice condition source.
+pub const FileAst = struct {
+    file: []const u8,
+    source: [:0]const u8,
+    tree: *std.zig.Ast,
+};
+
+pub const WalkResult = struct {
+    fns: []AstFunction,
+    asts: []FileAst,
 };
 
 pub fn walkKernel(arena: std.mem.Allocator, kernel_root: []const u8) ![]AstFunction {
+    const r = try walkKernelFull(arena, kernel_root);
+    return r.fns;
+}
+
+pub fn walkKernelFull(arena: std.mem.Allocator, kernel_root: []const u8) !WalkResult {
     var results = std.ArrayList(AstFunction){};
+    var asts = std.ArrayList(FileAst){};
 
     // Walk the kernel sources first.
-    try walkRoot(arena, kernel_root, &results);
+    try walkRoot(arena, kernel_root, &results, &asts);
 
     // Also walk the Zig stdlib + ubsan_rt so compiler-builtin functions
     // (`ubsan_rt.handler`, `fmt.format.X`, etc.) can be enriched too.
-    walkRoot(arena, "/usr/lib/zig", &results) catch |err| {
+    walkRoot(arena, "/usr/lib/zig", &results, &asts) catch |err| {
         std.debug.print("warning: skipping /usr/lib/zig walk: {s}\n", .{@errorName(err)});
     };
 
-    return results.toOwnedSlice(arena);
+    return .{
+        .fns = try results.toOwnedSlice(arena),
+        .asts = try asts.toOwnedSlice(arena),
+    };
 }
 
 fn walkRoot(
     arena: std.mem.Allocator,
     root: []const u8,
     results: *std.ArrayList(AstFunction),
+    asts: *std.ArrayList(FileAst),
 ) !void {
     const abs_root = std.fs.realpathAlloc(arena, root) catch |err| {
         std.debug.print("warning: could not resolve root '{s}': {s}\n", .{ root, @errorName(err) });
@@ -73,7 +98,7 @@ fn walkRoot(
         // Compose absolute file path.
         const abs_file = try std.fs.path.join(arena, &.{ abs_root, entry.path });
 
-        try walkFile(arena, abs_file, results);
+        try walkFile(arena, abs_file, results, asts);
     }
 }
 
@@ -81,6 +106,7 @@ fn walkFile(
     arena: std.mem.Allocator,
     abs_file: []const u8,
     out: *std.ArrayList(AstFunction),
+    asts: *std.ArrayList(FileAst),
 ) !void {
     const file = std.fs.openFileAbsolute(abs_file, .{}) catch |err| {
         std.debug.print("warning: skip {s}: {s}\n", .{ abs_file, @errorName(err) });
@@ -111,14 +137,14 @@ fn walkFile(
         return;
     }
 
-    var tree = std.zig.Ast.parse(arena, src_buf, .zig) catch |err| {
+    const tree_box = try arena.create(std.zig.Ast);
+    tree_box.* = std.zig.Ast.parse(arena, src_buf, .zig) catch |err| {
         std.debug.print("warning: skip {s}: parse error {s}\n", .{ abs_file, @errorName(err) });
         return;
     };
     // Don't deinit; we let the arena own everything.
-    _ = &tree;
 
-    if (tree.errors.len != 0) {
+    if (tree_box.errors.len != 0) {
         // Report but continue — partial AST may still yield useful fns.
         // Don't spam: just log a single line with the error count.
         // (The first error is usually the most useful but rendering it
@@ -130,10 +156,10 @@ fn walkFile(
         return;
     };
 
-    const root_decls = tree.rootDecls();
+    const root_decls = tree_box.rootDecls();
     var ctx = WalkCtx{
         .arena = arena,
-        .tree = &tree,
+        .tree = tree_box,
         .file_abs = abs_file,
         .module_path = module_path,
         .out = out,
@@ -141,6 +167,12 @@ fn walkFile(
     for (root_decls) |decl| {
         try walkDecl(&ctx, decl, "");
     }
+
+    try asts.append(arena, .{
+        .file = abs_file,
+        .source = src_buf,
+        .tree = tree_box,
+    });
 }
 
 const WalkCtx = struct {
@@ -244,6 +276,7 @@ fn emitFn(
         .line_start = line_start,
         .line_end = line_end,
         .is_pub = is_pub,
+        .fn_node = @intFromEnum(node),
     });
 
     // Recurse into the body so nested struct decls and inner fns are picked up.

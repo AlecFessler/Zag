@@ -317,6 +317,144 @@
       font-size: 12px;
     }
 
+    /* ---- Intra (call-tree) block ---------------------------------- */
+    .intra_block {
+      margin-top: 14px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: #1e1e1e;
+      max-height: 50vh;
+      overflow-y: auto;
+    }
+
+    .intra_header {
+      background: var(--bg-elev-2);
+      border-bottom: 1px solid var(--border);
+      padding: 6px 10px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 11px;
+      color: var(--fg-dim);
+      letter-spacing: 0.05em;
+    }
+
+    .intra_body {
+      padding: 8px 10px 10px 10px;
+      font-family: ui-monospace, "SF Mono", "JetBrains Mono", Consolas, monospace;
+      font-size: 12px;
+      color: var(--fg);
+    }
+
+    .intra_body ul.atom_list {
+      list-style: none;
+      margin: 0;
+      padding: 0;
+    }
+
+    .intra_body li.atom_call {
+      padding: 2px 0 2px 0;
+      display: flex;
+      gap: 10px;
+      align-items: baseline;
+      border-left: 2px solid transparent;
+      padding-left: 6px;
+    }
+
+    .intra_body li.atom_call:hover {
+      background: rgba(74, 158, 255, 0.06);
+    }
+
+    .intra_body .callee_name {
+      color: var(--fg);
+      cursor: pointer;
+      flex: 1 1 auto;
+      word-break: break-all;
+    }
+
+    .intra_body .callee_name.kind_direct          { color: #d8dde6; }
+    .intra_body .callee_name.kind_dispatch_x64    { color: #4a9eff; }
+    .intra_body .callee_name.kind_dispatch_aarch64{ color: #3ec9c9; }
+    .intra_body .callee_name.kind_vtable          { color: #b06ef0; }
+    .intra_body .callee_name.kind_indirect        { color: #f06060; font-style: italic; }
+    .intra_body .callee_name.kind_leaf_userspace  { color: #f0a050; }
+
+    .intra_body .callee_name.unresolved {
+      color: #f06060;
+      font-style: italic;
+    }
+
+    .intra_body .callee_loc {
+      color: var(--fg-dim);
+      font-size: 11px;
+      flex: 0 0 auto;
+    }
+
+    .intra_body details.atom_branch {
+      margin: 4px 0;
+      border-left: 2px solid #3a4150;
+      padding-left: 8px;
+    }
+
+    .intra_body details.atom_branch > summary {
+      cursor: pointer;
+      color: var(--fg-dim);
+      list-style: none;
+      padding: 2px 0;
+    }
+
+    .intra_body details.atom_branch > summary::-webkit-details-marker {
+      display: none;
+    }
+
+    .intra_body details.atom_branch > summary::before {
+      content: "▸ ";
+      color: var(--fg-dim);
+      font-size: 10px;
+    }
+
+    .intra_body details.atom_branch[open] > summary::before {
+      content: "▾ ";
+    }
+
+    .intra_body details.atom_branch summary .branch_kw {
+      color: var(--accent);
+      font-weight: 600;
+    }
+
+    .intra_body details.atom_branch summary .branch_loc {
+      color: var(--fg-dim);
+      font-size: 11px;
+      margin-left: 6px;
+    }
+
+    .intra_body .arm {
+      margin: 4px 0 4px 8px;
+      border-left: 1px dashed #3a4150;
+      padding-left: 8px;
+    }
+
+    .intra_body .arm_label {
+      color: #d8a050;
+      font-size: 11px;
+      margin: 4px 0 2px 0;
+      letter-spacing: 0.02em;
+    }
+
+    .intra_body .intra_empty {
+      color: var(--fg-dim);
+      font-style: italic;
+      padding: 4px 0;
+    }
+
+    @keyframes intra_flash {
+      0%   { box-shadow: 0 0 0 0 rgba(255, 200, 0, 0.0); }
+      30%  { box-shadow: 0 0 0 6px rgba(255, 200, 0, 0.5); }
+      100% { box-shadow: 0 0 0 12px rgba(255, 200, 0, 0.0); }
+    }
+
+    .cy_flash {
+      animation: intra_flash 0.6s ease-out;
+    }
+
     /* ---- Status / overlays ------------------------------------------ */
     #status {
       position: absolute;
@@ -385,6 +523,10 @@
           <div class="source_block" id="info_source"></div>
         </div>
         <div class="source_error" id="info_source_error" style="display: none;"></div>
+        <div class="intra_block" id="info_intra_wrap" style="display: none;">
+          <div class="intra_header">CALL TREE</div>
+          <div class="intra_body" id="info_intra"></div>
+        </div>
       </aside>
     </div>
   </div>
