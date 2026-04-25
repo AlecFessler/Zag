@@ -329,48 +329,32 @@ pub fn SecureSlab(
         /// observer holds the ref, field access during init is
         /// self-alive and does not need lock/unlock bracketing.
         pub fn create(self: *Self) AllocError!Ref {
-            arch.boot.print("SS:c1\n", .{});
             self.lock.lock(@src());
             defer self.lock.unlock();
-            arch.boot.print("SS:c2\n", .{});
 
             if (self.count_free == 0) {
-                arch.boot.print("SS:c3 grow\n", .{});
                 try self.growOne();
-                arch.boot.print("SS:c4 grew cf={d} ct={d}\n", .{ self.count_free, self.count_total });
             }
 
-            arch.boot.print("SS:c5\n", .{});
             const draw_pop = self.randStep();
-            arch.boot.print("SS:c6 dp={d}\n", .{draw_pop});
             const draw_push = self.randStep();
-            arch.boot.print("SS:c7\n", .{});
             self.pop_cursor = self.walkCursorLocked(self.pop_cursor, draw_pop);
-            arch.boot.print("SS:c8 pc={d}\n", .{self.pop_cursor});
 
             const popped = self.pop_cursor;
             const link = self.linkAt(popped);
             const next_after_pop = link.next;
 
-            arch.boot.print("SS:c9 popped={d}\n", .{popped});
             self.unlinkLocked(popped);
-            arch.boot.print("SS:cA\n", .{});
             self.pop_cursor = if (self.count_free == 0) INVALID_INDEX else next_after_pop;
             self.push_cursor = self.walkCursorLocked(self.push_cursor, draw_push);
-            arch.boot.print("SS:cB\n", .{});
 
             const slot_ptr = self.ptrAt(popped);
-            arch.boot.print("SS:cC slot=0x{x}\n", .{@intFromPtr(slot_ptr)});
             const prev_gen = slot_ptr._gen_lock.currentGen();
-            arch.boot.print("SS:cD prev_gen={d}\n", .{prev_gen});
             std.debug.assert(prev_gen % 2 == 0); // was freed (gen even)
             const new_gen: u63 = prev_gen + 1;
-            arch.boot.print("SS:cE new_gen={d}\n", .{new_gen});
             slot_ptr._gen_lock.setGenRelease(new_gen);
-            arch.boot.print("SS:cF\n", .{});
 
             const ref = Ref.init(slot_ptr, new_gen);
-            arch.boot.print("SS:cG\n", .{});
             return ref;
         }
 
