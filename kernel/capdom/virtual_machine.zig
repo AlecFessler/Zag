@@ -112,9 +112,8 @@ pub fn createVirtualMachine(caller: *ExecutionContext, caps: u64, policy_pf: u64
     const policy_pf_obj = lookupPageFrame(domain, @truncate(policy_pf)) orelse
         return errors.E_BADCAP;
 
-    const new_vm = allocVm(domain, policy_pf_obj) catch |err| switch (err) {
-        error.NoDevice => return errors.E_NODEV,
-        else => return errors.E_NOMEM,
+    const new_vm = allocVm(domain, policy_pf_obj) catch {
+        return errors.E_NOMEM;
     };
 
     const vm_gen = new_vm._gen_lock.currentGen();

@@ -450,7 +450,7 @@ fn capsAreSubset(current: u16, requested: u16, type_tag: CapabilityType) bool {
 fn restartPolicyMonotone(current: u16, requested: u16, type_tag: CapabilityType) bool {
     const mask = restartPolicyMask(type_tag);
     if (mask == 0) return true;
-    const shift = @ctz(mask);
+    const shift: u4 = @intCast(@ctz(mask));
     const cur_val = (current & mask) >> shift;
     const req_val = (requested & mask) >> shift;
     return req_val <= cur_val;
