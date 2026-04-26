@@ -75,6 +75,12 @@ pub const IdcCaps = packed struct(u16) {
 const MAX_HANDLES_PER_DOMAIN = zag.caps.capability.MAX_HANDLES_PER_DOMAIN;
 const FREE_LIST_TAIL = zag.caps.capability.FREE_LIST_TAIL;
 
+/// Start of the per-domain VAR bump-allocator range. Placed at 64 GiB
+/// so it lives above the boot path's hand-mapped text/data/stack/
+/// cap_table regions (which top out near 0x80000000) but inside the
+/// 47-bit user half. v0 expedient — see `next_var_base` doc.
+pub const NEXT_VAR_BASE_START: u64 = 0x0000_0010_0000_0000;
+
 /// Maximum VARs bindable to a single capability domain. 512 × 8 bytes
 /// = 4 KiB inline. Coarse upper bound; well above realistic per-domain
 /// VAR counts (a domain with even a few dozen VARs is unusual).
@@ -144,6 +150,15 @@ pub const CapabilityDomain = struct {
 
     /// Number of populated entries in `vars`. Range 0..MAX_VARS_PER_DOMAIN.
     var_count: u16 = 0,
+
+    /// Bump pointer for VAR base allocation when the caller passes
+    /// `preferred_base = 0`. v0 sub-allocator: starts at 64 GiB (well
+    /// above the ELF segment / stack / cap_table region used by the
+    /// boot path) and grows upward. Spec §[var].create_var doesn't
+    /// pin layout; this just needs to avoid colliding with other
+    /// VARs and the boot-mapped text/stack/cap_table mappings that
+    /// don't have backing VARs.
+    next_var_base: u64 = NEXT_VAR_BASE_START,
 
     // ── Bound VM ─────────────────────────────────────────────────────
 
@@ -260,6 +275,7 @@ pub fn allocCapabilityDomain(
     cd.free_head = 3;
     cd.free_count = MAX_HANDLES_PER_DOMAIN - 3;
     cd.var_count = 0;
+    cd.next_var_base = NEXT_VAR_BASE_START;
     cd.vm = null;
     @memset(cd.vars[0..], null);
 

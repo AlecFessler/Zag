@@ -246,6 +246,15 @@ pub fn createVar(
         field1,
     ) catch return errors.E_FULL;
 
+    // v0 ABI extension: deliver field0 (base vaddr) in vreg 2 and
+    // field1 (page_count|sz|cch|cur_rwx|map|device) in vreg 3 alongside
+    // the slot in vreg 1. The runtime user-table mirror also carries
+    // these snapshots, but exposing them in registers lets a caller
+    // capture base/size without a second VA load on the hot create_var
+    // path.
+    dispatch.syscall.setSyscallVreg2(caller.ctx, field0);
+    dispatch.syscall.setSyscallVreg3(caller.ctx, field1);
+
     return @intCast(slot);
 }
 
@@ -274,7 +283,6 @@ pub fn mapPf(caller: *ExecutionContext, var_handle: u64, pairs: []const u64) i64
         const offset = pairs[i];
         const pf_handle = pairs[i + 1];
         if (!std.mem.isAligned(offset, sz_bytes)) return errors.E_INVAL;
-        if (offset >= var_size or offset + sz_bytes > var_size) return errors.E_INVAL;
 
         const pf_slot: u12 = @truncate(pf_handle & 0xFFF);
         const pf_kh = lookupHandle(domain, pf_slot, .page_frame) orelse
@@ -282,6 +290,12 @@ pub fn mapPf(caller: *ExecutionContext, var_handle: u64, pairs: []const u64) i64
         const pf: *PageFrame = @ptrCast(@alignCast(pf_kh.ref.ptr.?));
 
         if (@intFromEnum(pf.sz) < @intFromEnum(v.sz)) return errors.E_INVAL;
+
+        // Spec §[var].map_pf test 07: each pair's full range
+        // (pf.page_count × pf.sz) must fit within the VAR.
+        const pf_sz_bytes = pageSizeBytes(pf.sz);
+        const pair_bytes = @as(u64, pf.page_count) * pf_sz_bytes;
+        if (offset >= var_size or offset + pair_bytes > var_size) return errors.E_INVAL;
 
         const rc = mappingInstall(v, offset, pf);
         if (rc != 0) return rc;
@@ -651,24 +665,38 @@ fn destroyVar(v: *VAR) void {
     slab_instance.destroy(v, gen) catch {};
 }
 
-/// Linear-scan `domain.vars[0..var_count]` for a contiguous gap of
-/// `pages * sz` bytes at `preferred_base` or any base. Returns null on
-/// no space. Spec §[var].create_var (E_NOSPC).
+/// Allocate a contiguous VA range of `pages * sz` bytes for a new VAR.
+/// `preferred_base != 0` returns that base verbatim (the create_var
+/// caller is asking for a specific address; the per-domain overlap
+/// check still has the final say). Otherwise bump-allocate from
+/// `domain.next_var_base`, advancing past the allocated range and
+/// aligning to `sz`. Spec §[var].create_var (E_NOSPC).
+///
+/// v0: no recycling of freed ranges. Domains creating + deleting many
+/// VARs slowly leak VA space until the bump pointer hits user_aslr.end.
+/// The 47-bit user half from 64 GiB upward holds 16 TiB - 64 GiB ≈
+/// many test cycles before exhaustion; replaced by a real first-fit /
+/// freelist allocator once the test runner exercises that pressure.
 fn vaRangeAllocate(
     domain: *CapabilityDomain,
     pages: u32,
     sz: PageSize,
     preferred_base: VAddr,
 ) ?VAddr {
-    _ = domain;
-    _ = pages;
-    _ = sz;
     if (preferred_base.addr != 0) return preferred_base;
-    return .fromInt(dispatch.paging.user_aslr.start);
+
+    const sz_bytes = pageSizeBytes(sz);
+    const range_bytes = @as(u64, pages) * sz_bytes;
+    const aligned = std.mem.alignForward(u64, domain.next_var_base, sz_bytes);
+    const new_top = aligned + range_bytes;
+    if (new_top > dispatch.paging.user_aslr.end) return null;
+    domain.next_var_base = new_top;
+    return .fromInt(aligned);
 }
 
 /// Install a page_frame at offset, increments mapcnt, programs PTE or
-/// IOMMU PTE. Spec §[var].map_pf.
+/// IOMMU PTE. Spec §[var].map_pf — installs every page in the page
+/// frame contiguously starting at `offset`.
 fn mappingInstall(v: *VAR, offset: u64, pf: *PageFrame) i64 {
     const domain = v.domain;
     const slot_idx = handleSlotOf(v, domain);
@@ -678,25 +706,34 @@ fn mappingInstall(v: *VAR, offset: u64, pf: *PageFrame) i64 {
         0;
     const var_caps: VarCaps = @bitCast(caps_word);
     const perms = rwxToPerms(v.cur_rwx);
+    const pf_sz_bytes = pageSizeBytes(pf.sz);
 
-    if (var_caps.dma) {
-        const dev = v.device orelse return errors.E_INVAL;
-        dispatch.iommu.iommuMapPage(
-            dev,
-            v.base_vaddr.addr + offset,
-            pf.phys_base,
-            v.sz,
-            perms,
-        ) catch return errors.E_NOMEM;
-    } else {
-        dispatch.paging.mapPageSized(
-            domain.addr_space_root,
-            pf.phys_base,
-            .fromInt(v.base_vaddr.addr + offset),
-            v.sz,
-            v.cch,
-            perms,
-        ) catch return errors.E_NOMEM;
+    var p: u32 = 0;
+    while (p < pf.page_count) {
+        const off_p = offset + @as(u64, p) * pf_sz_bytes;
+        const phys_p = zag.memory.address.PAddr.fromInt(
+            pf.phys_base.addr + @as(u64, p) * pf_sz_bytes,
+        );
+        if (var_caps.dma) {
+            const dev = v.device orelse return errors.E_INVAL;
+            dispatch.iommu.iommuMapPage(
+                dev,
+                v.base_vaddr.addr + off_p,
+                phys_p,
+                v.sz,
+                perms,
+            ) catch return errors.E_NOMEM;
+        } else {
+            dispatch.paging.mapPageSized(
+                domain.addr_space_root,
+                phys_p,
+                .fromInt(v.base_vaddr.addr + off_p),
+                v.sz,
+                v.cch,
+                perms,
+            ) catch return errors.E_NOMEM;
+        }
+        p += 1;
     }
     incMapCntShim(pf);
     return 0;
