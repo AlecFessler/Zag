@@ -149,11 +149,20 @@ pub fn dispatch(caller: *anyopaque, syscall_word: u64, args: []const u64) i64 {
             arg(args, 3),
             arg(args, 4),
         ),
-        .map_pf => var_.mapPf(
-            caller,
-            arg(args, 0),
-            if (args.len > 1) args[1..] else &.{},
-        ),
+        .map_pf => blk: {
+            // Spec §[var].map_pf: syscall word bits 12-19 carry N, the
+            // number of (offset, page_frame) pairs. The pairs occupy
+            // vregs 2..2+2N-1 — args[1..1+2N]. Without this slice the
+            // handler sees uninitialized vregs as junk pairs.
+            const n: u64 = (syscall_word >> 12) & 0xFF;
+            const pair_words: usize = @intCast(n * 2);
+            const end_idx: usize = @min(1 + pair_words, args.len);
+            break :blk var_.mapPf(
+                caller,
+                arg(args, 0),
+                if (end_idx > 1) args[1..end_idx] else &.{},
+            );
+        },
         .map_mmio => var_.mapMmio(caller, arg(args, 0), arg(args, 1)),
         .unmap => var_.unmap(
             caller,

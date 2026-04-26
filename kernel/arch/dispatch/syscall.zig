@@ -42,6 +42,30 @@ pub fn setSyscallReturn(ctx: *ArchCpuContext, value: u64) void {
     }
 }
 
+/// Write syscall-return vreg 2 — used by handle-creating syscalls to
+/// deliver the new handle's field0 snapshot alongside the slot id in
+/// vreg 1. Reuses the same physical reg as `setEventSubcode` (rbx on
+/// x86-64; x1 on aarch64) since both ABIs back vreg 2 with the same
+/// register; the names disambiguate intent at the call site.
+pub fn setSyscallVreg2(ctx: *ArchCpuContext, value: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.setEventSubcode(ctx, value),
+        .aarch64 => aarch64.interrupts.setEventSubcode(ctx, value),
+        else => unreachable,
+    }
+}
+
+/// Write syscall-return vreg 3 — used by handle-creating syscalls to
+/// deliver the new handle's field1 snapshot. Same physical reg as
+/// `setEventAddr` (rdx on x86-64; x2 on aarch64); see `setSyscallVreg2`.
+pub fn setSyscallVreg3(ctx: *ArchCpuContext, value: u64) void {
+    switch (builtin.cpu.arch) {
+        .x86_64 => x64.interrupts.setEventAddr(ctx, value),
+        .aarch64 => aarch64.interrupts.setEventAddr(ctx, value),
+        else => unreachable,
+    }
+}
+
 /// Write event-state vreg 2 — the per-event-type sub-code (Spec
 /// §[event_state]). x86-64: rbx; aarch64: x1.
 pub fn setEventSubcode(ctx: *ArchCpuContext, value: u64) void {
