@@ -1,0 +1,203 @@
+// Spec §[reply_transfer] — test 04.
+//
+// "[test 04] returns E_INVAL if any reserved bits are set in [1] or any
+//  pair entry."
+//
+// Spec semantics
+//   The reply_transfer error ladder (per the reply_transfer_01 header
+//   ladder note plus the test 03 N-range gate):
+//     test 04a — [1] reserved bits set            → E_INVAL
+//     test 03  — N == 0 or N > 63                 → E_INVAL
+//     test 04b — pair entry reserved bits set     → E_INVAL
+//     test 09  — duplicate pair entry sources     → E_INVAL
+//     test 01  — [1] is not a valid reply handle  → E_BADCAP
+//   Test 04 has two firing points: the [1] reserved-bit check (an ABI-
+//   layer gate per §[syscall_abi]: "Bits not assigned by the invoked
+//   syscall must be zero on entry; the kernel returns E_INVAL if a
+//   reserved bit is set"), and the per-entry reserved-bit check inside
+//   §[handle_attachments] entry validation. Both paths must surface
+//   E_INVAL, and both are exercised below.
+//
+// Strategy
+//   Case A — reserved bit in [1].
+//     The reply-handle word [1] carries the 12-bit handle id in bits
+//     0-11; bits 12-63 are _reserved (§[capabilities]: "handle in the
+//     caller's table (bits 0-11; upper bits _reserved)"). Setting bit
+//     63 of [1] mirrors the reference pattern in reply_02 / ack_04 /
+//     sync_02 / delete_02. The reserved-bit gate is ABI-layer and so
+//     fires before any handle/cap resolution, even before the N-range
+//     check, so we can keep N = 1 in the syscall word and leave the
+//     pair-entry vregs untouched (the gate trips before the kernel
+//     reads any pair entry).
+//
+//     libz's `replyTransfer` wrapper @panics on N > 0 (the high-vreg
+//     pair-entry layout is unwired), so the call dispatches through
+//     `issueReg` directly with `extraCount(1)` in the syscall-word
+//     extra, and the reserved-bit-dirty handle in v1.
+//
+//   Case B — reserved bit in a pair entry.
+//     §[handle_attachments] defines the pair-entry layout as:
+//       bits  0-11: source handle id
+//       bits 12-15: _reserved        (low band, 4 bits)
+//       bits 16-31: caps
+//       bit     32: move
+//       bits 33-63: _reserved        (high band, 31 bits)
+//     The libz `PairEntry` packed struct mirrors this exactly. Build an
+//     otherwise-clean entry via `PairEntry.toU64()` (id = SLOT_SELF,
+//     caps = 0, move = false) and OR `1 << 12` into the encoded word
+//     to set the lowest reserved bit (`_reserved_lo` band, bit 12).
+//     Matches the reference pattern in handle_attachments_06.
+//
+//     With every other §[handle_attachments] gate cleared, only the
+//     pair-entry reserved-bit check can resolve the syscall with
+//     E_INVAL. The pair-entry reserved-bit check is documented to fire
+//     before the [1] handle-resolve check (per the reply_transfer_01
+//     ladder note), so we can use slot id 0 in [1] without minting a
+//     real reply handle: SLOT_SELF is valid in this domain but is not
+//     a reply handle, and the dirty-pair-entry gate trips first.
+//
+//     With N = 1 the lone entry occupies vreg 127, which per
+//     §[syscall_abi] lives at `[rsp + (127-13)*8] = [rsp + 912]` when
+//     the syscall executes. The libz wrapper @panics on this path, so
+//     the call is issued via inline asm with a 920-byte stack pad
+//     matching the shape used by handle_attachments_02/03/04/05/06.
+//
+//   Neutralize sibling gates so test 04 is the unique applicable check
+//   in each case:
+//     - test 03 (N range): N = 1 is in [1, 63]. cleared
+//     - test 09 (duplicate sources): N = 1 has no peers. cleared
+//     - test 01/02 (handle resolve / xfer cap): downstream of test 04
+//       in both firing paths. cleared
+//     - tests 05-08 (per-entry source/cap checks): downstream of the
+//       reserved-bit gate. cleared
+//
+// Action
+//   Case A:
+//     issueReg(.reply_transfer, extraCount(1), .{ .v1 = (1 << 63) })
+//   Case B:
+//     subq $920,%rsp
+//     movq dirty_entry, 912(%rsp)
+//     pushq word          ; word = num | (1 << 12)
+//     syscall
+//     addq $8 + 920, %rsp
+//
+// Assertions
+//   1: Case A — [1] with reserved bit 63 set returned something other
+//      than E_INVAL.
+//   2: Case B — pair entry with reserved bit 12 set returned something
+//      other than E_INVAL.
+
+const lib = @import("lib");
+
+const caps = lib.caps;
+const errors = lib.errors;
+const syscall = lib.syscall;
+const testing = lib.testing;
+
+const REPLY_TRANSFER_NUM: u64 = @intFromEnum(syscall.SyscallNum.reply_transfer);
+
+// Reserve 115 stack slots above the syscall word so vreg 127 reaches
+// `[rsp + 912]`. The pad covers vregs 14..127 (114 slots) plus the
+// syscall word at rsp+0 (1 slot), totalling 920 bytes — the smallest
+// 16-byte-aligned frame that satisfies the v3 vreg layout.
+const STACK_PAD_BYTES: u64 = 920;
+
+fn replyTransferWithOnePairAtV127(reply_handle: u64, entry: u64) syscall.Regs {
+    // Syscall word: bits 0-11 = syscall_num, bits 12-19 = pair_count = 1.
+    const word: u64 = (REPLY_TRANSFER_NUM & 0xFFF) | (@as(u64, 1) << 12);
+
+    var ov1: u64 = undefined;
+    var ov2: u64 = undefined;
+    var ov3: u64 = undefined;
+    var ov4: u64 = undefined;
+    var ov5: u64 = undefined;
+    var ov6: u64 = undefined;
+    var ov7: u64 = undefined;
+    var ov8: u64 = undefined;
+    var ov9: u64 = undefined;
+    var ov10: u64 = undefined;
+    var ov11: u64 = undefined;
+    var ov12: u64 = undefined;
+    var ov13: u64 = undefined;
+    asm volatile (
+        \\ subq %[pad], %%rsp
+        \\ movq %[entry], 912(%%rsp)
+        \\ pushq %%rcx
+        \\ syscall
+        \\ addq $8, %%rsp
+        \\ addq %[pad], %%rsp
+        : [v1] "={rax}" (ov1),
+          [v2] "={rbx}" (ov2),
+          [v3] "={rdx}" (ov3),
+          [v4] "={rbp}" (ov4),
+          [v5] "={rsi}" (ov5),
+          [v6] "={rdi}" (ov6),
+          [v7] "={r8}" (ov7),
+          [v8] "={r9}" (ov8),
+          [v9] "={r10}" (ov9),
+          [v10] "={r12}" (ov10),
+          [v11] "={r13}" (ov11),
+          [v12] "={r14}" (ov12),
+          [v13] "={r15}" (ov13),
+        : [word] "{rcx}" (word),
+          [pad] "i" (STACK_PAD_BYTES),
+          [entry] "r" (entry),
+          [iv1] "{rax}" (reply_handle),
+        : .{ .rcx = true, .r11 = true, .memory = true });
+
+    return .{
+        .v1 = ov1,
+        .v2 = ov2,
+        .v3 = ov3,
+        .v4 = ov4,
+        .v5 = ov5,
+        .v6 = ov6,
+        .v7 = ov7,
+        .v8 = ov8,
+        .v9 = ov9,
+        .v10 = ov10,
+        .v11 = ov11,
+        .v12 = ov12,
+        .v13 = ov13,
+    };
+}
+
+pub fn main(cap_table_base: u64) void {
+    _ = cap_table_base;
+
+    // Case A: reserved bit 63 of [1] set; low 12 bits = 0. The ABI-layer
+    // reserved-bit gate fires before N-range and before any handle
+    // resolution, so the pair-entry vregs need not be populated; the
+    // libz wrapper @panics on N > 0, so dispatch via issueReg directly
+    // with N = 1 in syscall-word bits 12-19.
+    const handle_with_reserved: u64 = @as(u64, 0) | (@as(u64, 1) << 63);
+    const a = syscall.issueReg(
+        .reply_transfer,
+        syscall.extraCount(1),
+        .{ .v1 = handle_with_reserved },
+    );
+    if (a.v1 != @intFromEnum(errors.Error.E_INVAL)) {
+        testing.fail(1);
+        return;
+    }
+
+    // Case B: clean [1], dirty pair entry. Build a clean entry that
+    // would satisfy tests 05-09 (id is a valid in-domain handle, caps
+    // = 0, move = false, no duplicates) and pollute a single reserved
+    // bit in the `_reserved_lo` band so test 04's pair-entry gate is
+    // the unique applicable check.
+    const clean_entry: u64 = (caps.PairEntry{
+        .id = caps.SLOT_SELF,
+        .caps = 0,
+        .move = false,
+    }).toU64();
+    const dirty_entry: u64 = clean_entry | (@as(u64, 1) << 12);
+
+    const b = replyTransferWithOnePairAtV127(0, dirty_entry);
+    if (b.v1 != @intFromEnum(errors.Error.E_INVAL)) {
+        testing.fail(2);
+        return;
+    }
+
+    testing.pass();
+}
