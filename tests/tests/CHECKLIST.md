@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 369.
-**Remaining:** 99.
+**Implemented:** 373.
+**Remaining:** 95.
 
 ## Convention
 
@@ -478,7 +478,7 @@ _§[device_irq] Device IRQ Delivery_
 - [ ] **11** — on success, when [1] has the `write` cap, modifications written to the event payload are applied to the target's EC state on reply; otherwise modifications are discarded.
 - [ ] **12** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## recv — 6/14
+## recv — 7/14
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid port handle.
 - [x] **02** — returns E_PERM if [1] does not have the `recv` cap.
@@ -486,7 +486,7 @@ _§[device_irq] Device IRQ Delivery_
 - [x] **04** — returns E_CLOSED if the port has no bind-cap holders, no event_routes targeting it, and no queued events.
 - [x] **05** — returns E_CLOSED when a recv is blocked on a port and the last bind-cap holder releases its handle while no event_routes target the port and no events are queued.
 - [x] **06** — returns E_FULL if the caller's handle table cannot accommodate the reply handle and pair_count attached handles.
-- [ ] **07** — on success, the syscall word's reply_handle_id is the slot id of a reply handle inserted into the caller's table referencing the dequeued sender.
+- [x] **07** — on success, the syscall word's reply_handle_id is the slot id of a reply handle inserted into the caller's table referencing the dequeued sender.
 - [ ] **08** — on success, the syscall word's event_type equals the event_type that triggered delivery.
 - [ ] **09** — on success when the sender attached N handles, the syscall word's pair_count = N and the next N table slots [tstart, tstart+N) contain the inserted handles per §[handle_attachments].
 - [ ] **10** — on success when the sender attached no handles, pair_count = 0.
@@ -495,11 +495,11 @@ _§[device_irq] Device IRQ Delivery_
 - [ ] **13** — when multiple senders are queued, the kernel selects the highest-priority sender; ties resolve FIFO.
 - [ ] **14** — on success, until the reply handle is consumed, the dequeued sender remains suspended; deleting the reply handle resolves the sender with E_ABANDONED.
 
-## handle_attachments — 0/10
+## handle_attachments — 1/10
 
 _§[handle_attachments] Handle Attachments_
 
-- [ ] **01** — returns E_PERM if `N > 0` and the port handle does not have the `xfer` cap.
+- [x] **01** — returns E_PERM if `N > 0` and the port handle does not have the `xfer` cap.
 - [ ] **02** — returns E_BADCAP if any entry's source handle id is not valid in the suspending EC's domain.
 - [ ] **03** — returns E_PERM if any entry's caps are not a subset of the source handle's current caps.
 - [ ] **04** — returns E_PERM if any entry with `move = 1` references a source handle that lacks the `move` cap.
@@ -587,11 +587,11 @@ _§[handle_attachments] Handle Attachments_
 - [ ] **09** — `timer_rearm` called on a currently-armed timer replaces the prior configuration; the prior pending fire does not occur and field0 reflects the reset to 0 rather than any partial fire.
 - [ ] **10** — when [1] is a valid handle, [1]'s field0 and field1 are refreshed from the kernel's authoritative state as a side effect, regardless of whether the call returns success or another error code.
 
-## timer_cancel — 1/9
+## timer_cancel — 3/9
 
 - [x] **01** — returns E_BADCAP if [1] is not a valid timer handle.
-- [ ] **02** — returns E_PERM if [1] does not have the `cancel` cap.
-- [ ] **03** — returns E_INVAL if [1].field1.arm = 0.
+- [x] **02** — returns E_PERM if [1] does not have the `cancel` cap.
+- [x] **03** — returns E_INVAL if [1].field1.arm = 0.
 - [ ] **04** — returns E_INVAL if any reserved bits are set in [1].
 - [ ] **05** — on success, the calling domain's copy of [1] has `field0 = u64::MAX` immediately on return; every other domain-local copy returns u64::MAX from a fresh `sync` within a bounded delay.
 - [ ] **06** — on success, [1].field1.arm becomes 0.
