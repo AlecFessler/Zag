@@ -157,6 +157,7 @@ const test_entries = [_]TestEntry{
     .{ .name = "idc_write_06", .path = "tests/idc_write_06.zig" },
     .{ .name = "idc_write_07", .path = "tests/idc_write_07.zig" },
     .{ .name = "idc_write_08", .path = "tests/idc_write_08.zig" },
+    .{ .name = "map_guest_01", .path = "tests/map_guest_01.zig" },
     .{ .name = "map_mmio_01", .path = "tests/map_mmio_01.zig" },
     .{ .name = "map_mmio_02", .path = "tests/map_mmio_02.zig" },
     .{ .name = "map_mmio_03", .path = "tests/map_mmio_03.zig" },

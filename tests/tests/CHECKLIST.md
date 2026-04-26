@@ -1,8 +1,8 @@
 # Spec v3 Test Implementation Checklist
 
 **Total:** 468 tests across 55 sections.  
-**Implemented:** 285.
-**Remaining:** 183.
+**Implemented:** 286.
+**Remaining:** 182.
 
 ## Convention
 
@@ -418,9 +418,9 @@ _§[device_irq] Device IRQ Delivery_
 - [ ] **11** — on success, the EC's affinity is set to `[3]`.
 - [ ] **12** — immediately after creation, an initial vm_exit event is delivered on `[4] exit_port` with zeroed guest state in the vregs and the initial-state sub-code.
 
-## map_guest — 0/7
+## map_guest — 1/7
 
-- [ ] **01** — returns E_BADCAP if [1] is not a valid VM handle.
+- [x] **01** — returns E_BADCAP if [1] is not a valid VM handle.
 - [ ] **02** — returns E_BADCAP if any [2 + 2i + 1] is not a valid page_frame handle.
 - [ ] **03** — returns E_INVAL if N is 0.
 - [ ] **04** — returns E_INVAL if any guest_addr is not aligned to its paired page_frame's `sz`.
