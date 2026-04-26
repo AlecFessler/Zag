@@ -3,7 +3,6 @@ const zag = @import("zag");
 
 const arch = zag.arch.dispatch;
 const debug_info = zag.utils.debug_info;
-const device_registry = zag.devices.registry;
 const kprof_log = zag.kprof.log;
 const memory = zag.memory.init;
 const sched = zag.sched.scheduler;
@@ -88,7 +87,10 @@ fn kMain(boot_info: *BootInfo) !void {
     arch.cpu.sysInfoInit();
     // TODO(spec-v3): wall-clock is now read directly via arch.time.readRtc()
     // in syscall/system.zig; no kernel-side wall_offset state remains.
-    device_registry.registerDisplayDevice(boot_info.framebuffer);
+    // TODO(spec-v3): zag.devices.registry / registerDisplayDevice was
+    // removed; framebuffer hand-off needs a new spec-v3 home (boot
+    // protocol → root service?).
+    _ = boot_info.framebuffer;
     try sched.globalInit();
     const rs_phys = PAddr.fromInt(@intFromPtr(boot_info.root_service.ptr));
     const rs_virt = VAddr.fromPAddr(rs_phys, null);
