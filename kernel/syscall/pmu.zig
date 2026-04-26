@@ -41,9 +41,10 @@ pub const PmuEvent = enum(u8) {
 /// backend uses it to decide whether to enable PMI delivery and seed
 /// the counter with a `(span - threshold)` preload so the next
 /// overflow fires at the requested cumulative count.
-pub const PmuCounterConfig = struct {
+pub const PmuCounterConfig = extern struct {
     event: PmuEvent,
     has_threshold: bool = false,
+    _pad: [6]u8 = .{0} ** 6,
     overflow_threshold: u64 = 0,
 };
 

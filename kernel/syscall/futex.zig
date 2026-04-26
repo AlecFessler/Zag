@@ -142,10 +142,7 @@ pub fn futexWaitChange(caller: *anyopaque, timeout_ns: u64, pairs: []const u64) 
         i += 1;
     }
 
-    // The current sched.futex.waitChange takes only addrs; the per-pair
-    // target compare from the spec is part of step 5's futex rework.
-    _ = targets;
-    return futex.waitChange(addrs[0..n], n, timeout_ns, @ptrCast(ec));
+    return futex.waitChange(addrs[0..n], targets[0..n], n, timeout_ns, @ptrCast(ec));
 }
 
 /// Wakes up to `count` ECs blocked in `futex_wait_val` or
