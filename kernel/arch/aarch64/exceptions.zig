@@ -426,27 +426,18 @@ fn handleSyncLowerEl(ctx: *ArchCpuContext) callconv(.c) void {
         },
 
         .svc_aarch64 => {
-            const result = syscall_dispatch.dispatch(ctx);
-            // IPC recv handlers may have already populated x0 with reply
-            // word 0 via copyIpcPayload; on aarch64 that register doubles
-            // as the syscall return, so we must not overwrite it here.
-            if (!result.skip_ret_write) {
-                ctx.regs.x0 = @bitCast(result.ret);
-                // x6 doubles as the IPC metadata register. On an error
-                // return from ipc_call/ipc_send the kernel never wrote a
-                // fresh meta, so x6 still holds the caller's *input*
-                // meta — which on aarch64 makes an errno in x0
-                // indistinguishable from a zero-word successful reply
-                // (both leave "x0 has a valid integer" plus "nonzero
-                // meta"). Zero x6 on the error path so userspace can
-                // unambiguously tell errno from reply payload. Never
-                // touch it on the success path: successful IPC handlers
-                // either set skip_ret_write (word_count>=1) or return
-                // E_OK after already writing fresh meta via
-                // setIpcMetadata (word_count==0).
-                if (result.ret < 0) ctx.regs.x6 = 0;
-            }
-            ctx.regs.x1 = result.ret2;
+            // Spec §[syscall_abi] aarch64 ABI:
+            //   - syscall_word at vreg 0 = `[sp_el0 + 0]` (user stack).
+            //   - args[0..31] map to vregs 1..31 = x0..x30. Registers
+            //     is an extern struct of 31 u64s declared in x0..x30
+            //     order so we point the slice straight at it.
+            //   - return: i64 → x0 (vreg 1).
+            const regs_ptr: [*]const u64 = @ptrCast(&ctx.regs);
+            const syscall_word: u64 = @as(*const u64, @ptrFromInt(ctx.sp_el0)).*;
+            const caller = scheduler.currentEc() orelse
+                @panic("syscall with no current EC");
+            const ret = syscall_dispatch.dispatch(caller, syscall_word, regs_ptr[0..31]);
+            ctx.regs.x0 = @bitCast(ret);
         },
 
         .data_abort_lower_el => {

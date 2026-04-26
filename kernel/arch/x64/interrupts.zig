@@ -282,11 +282,28 @@ pub fn updateScratchKernelRsp(core_id: u64, kernel_rsp: u64) void {
 }
 
 /// Syscall dispatch — exported so the SYSCALL asm entry can call it.
-/// Wraps the generic syscall.dispatch and writes results back to ctx.
+/// Wraps the generic syscall.dispatch and writes the i64 return into
+/// vreg 1 (rax). Spec §[syscall_abi] ABI:
+///   - syscall_word lives at user vreg 0 = `[ctx.rsp + 0]`. SMAP gates
+///     the read; STAC/CLAC bracket the user-stack load.
+///   - args[0..13] = vregs 1..13, in spec order: rax, rbx, rdx, rbp,
+///     rsi, rdi, r8, r9, r10, r12, r13, r14, r15. Stack-spilled vregs
+///     14..127 are not collected here — handlers that need them read
+///     them from `[ctx.rsp + (N-13)*8]` directly.
+///   - return: i64 → ctx.regs.rax (vreg 1).
 export fn syscallDispatch(ctx: *cpu.Context) void {
-    const result = zag.syscall.dispatch.dispatch(ctx);
-    ctx.regs.rax = @bitCast(result.ret);
-    ctx.regs.rdx = result.ret2;
+    const r = &ctx.regs;
+    var args: [13]u64 = .{
+        r.rax, r.rbx, r.rdx, r.rbp, r.rsi, r.rdi,
+        r.r8,  r.r9,  r.r10, r.r12, r.r13, r.r14, r.r15,
+    };
+    var syscall_word: u64 = undefined;
+    cpu.stac();
+    syscall_word = @as(*const u64, @ptrFromInt(ctx.rsp)).*;
+    cpu.clac();
+    const caller = scheduler.currentEc() orelse @panic("syscall with no current EC");
+    const ret = zag.syscall.dispatch.dispatch(caller, syscall_word, args[0..]);
+    r.rax = @bitCast(ret);
 }
 
 /// SYSCALL entry point. Builds an iret-compatible cpu.Context frame so
